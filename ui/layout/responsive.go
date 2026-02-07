@@ -72,19 +72,6 @@ func panelsFitCollapse(panels []PanelSpec, widths []int) bool {
 	return true
 }
 
-// visiblePanels returns the subset of panels where Visible is true.
-func visiblePanels(panels []PanelSpec) []PanelSpec {
-	result := make([]PanelSpec, 0, len(panels))
-
-	for _, p := range panels {
-		if p.Visible {
-			result = append(result, p)
-		}
-	}
-
-	return result
-}
-
 // columnCount returns the number of columns for a given layout mode, capped
 // by the number of visible panels.
 func columnCount(mode LayoutMode, panelCount int) int {

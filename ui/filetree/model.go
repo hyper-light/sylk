@@ -10,9 +10,11 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/adalundhe/sylk/core/lsp"
+	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -55,6 +57,21 @@ const footerToolbarOffset = 1
 // Derived from: separator(1) + hint line(1) = 2.
 const refsFooterHeight = 2
 
+// tabsChromeHeight is the vertical space consumed by the top section in
+// tabs mode when the filter is active (filter input moves to top).
+// Derived from: header(1) + title(1) + separator(1) + filter input(1) + divider(1) = 5.
+const tabsChromeHeight = 5
+
+// tabsFooterHeight is the vertical space consumed by the tabs-mode footer
+// when the filter is active (toggle badges move to bottom).
+// Derived from: divider(1) + toolbar(1) + divider(1) + hint line(1) = 4.
+const tabsFooterHeight = 4
+
+// tabsHintHeight is the vertical space consumed by the tabs-mode footer
+// when the filter is NOT active (hint line only).
+// Derived from: hint line(1) = 1.
+const tabsHintHeight = 1
+
 // newEntryFooterHeight is the vertical space consumed by the new-entry input.
 // Derived from: separator(1) + input line(1) = 2.
 const newEntryFooterHeight = 2
@@ -77,7 +94,20 @@ const (
 	viewReferences  // LSP references results.
 	viewDocSymbols  // LSP document symbol outline.
 	viewReplace     // Multi-file find and replace.
+	viewTabs        // Open tab list.
 )
+
+// tabFocusZone identifies which zone has focus in the tabs panel.
+type tabFocusZone int
+
+const (
+	tabFocusFilter  tabFocusZone = iota // The "/" filter input line.
+	tabFocusToggles                     // The [Aa] [ab] [.*] toggle badges.
+)
+
+// tabToggleOrder defines the Tab-cycling sequence for tab filter toggles.
+// Derived from: [Aa] → [ab] → [.*] (left to right).
+var tabToggleOrder = [toolbarToggleCount]toggleIndex{toggleCase, toggleWord, toggleRegex}
 
 // searchItemKind classifies entries in the search results list.
 type searchItemKind int
@@ -357,6 +387,20 @@ type Model struct {
 	symScroll   int
 	symNumWidth int // Digit width for line numbers.
 
+	// Tabs state (viewTabs mode).
+	tabPaths      []string        // Absolute paths of all open tabs.
+	tabFiltered   []int           // Indices into tabPaths matching current filter.
+	tabDupBases   map[string]bool // Base filenames that appear more than once (for disambiguation).
+	tabActive     string          // Path of the currently active tab (for highlight).
+	tabCursor     int             // Cursor within tabFiltered.
+	tabScroll     int
+	tabFilter       []rune               // Filter query typed after '/'.
+	tabFiltering    bool                 // true when the filter input is active.
+	tabToggleActive [toolbarToggleCount]bool // [Aa], [ab], [.*] toggles for tab filtering.
+	tabFocus        tabFocusZone         // Which zone has focus in tabs mode.
+	tabToggleCursor toggleIndex          // Which toggle badge is focused when tabFocus == tabFocusToggles.
+	tabCloseHover   int                  // Filtered index whose close icon is hovered (-1 = none).
+
 	// Replace state (viewReplace mode).
 	replaceInput []rune       // Replacement text input contents.
 	btnFlash     searchFocus  // Which replace button is flashing (focusBtnOne or focusBtnAll).
@@ -384,6 +428,15 @@ type Model struct {
 
 	// Font capability: true when Nerd Font symbols are available.
 	nerdFonts bool
+
+	// Git status decorations: maps relative path → visual state.
+	// Updated externally via SetGitStatus(). Nil means no git info available.
+	gitStatus map[string]git.GitFileState
+
+	// Tracked file set from git index: paths present here are tracked.
+	// Used to distinguish ignored files (not in gitStatus AND not tracked).
+	trackedSet  map[string]struct{}
+	trackedDirs map[string]struct{}
 }
 
 // Verify interface compliance at compile time.
@@ -396,12 +449,79 @@ var (
 // New creates a file tree Model with the given theme.
 func New(th *theme.Theme) *Model {
 	return &Model{
-		theme: th,
+		theme:         th,
+		tabCloseHover: -1,
 	}
 }
 
 // SetNerdFonts enables or disables Nerd Font icon rendering.
 func (m *Model) SetNerdFonts(available bool) { m.nerdFonts = available }
+
+// SetGitStatus replaces the git status decoration map and tracked-file sets.
+// Paths in all maps are relative to rootPath. Passing nil clears all decorations.
+func (m *Model) SetGitStatus(status map[string]git.GitFileState, tracked map[string]struct{}, trackedDirs map[string]struct{}) {
+	m.gitStatus = status
+	m.trackedSet = tracked
+	m.trackedDirs = trackedDirs
+}
+
+// gitStateForEntry returns the GitFileState for an entry by computing its
+// path relative to rootPath and looking it up in the status map. Falls back
+// to ancestor directory lookup for files inside ignored/untracked directories,
+// and uses the tracked set to detect ignored files.
+func (m *Model) gitStateForEntry(entry *Entry) git.GitFileState {
+	if m.gitStatus == nil {
+		return git.GitClean
+	}
+	rel, err := filepath.Rel(m.rootPath, entry.Path)
+	if err != nil {
+		return git.GitClean
+	}
+	if state, ok := m.gitStatus[rel]; ok {
+		return state
+	}
+	if inherited := m.inheritedGitState(rel); inherited != git.GitClean {
+		return inherited
+	}
+	return m.inferIgnored(rel, entry.IsDir)
+}
+
+// inheritedGitState walks up parent directories looking for the nearest
+// ancestor with a propagated Ignored or Untracked state. Only these two
+// states cascade to all children. Per-file states (Modified, Added,
+// Deleted, Conflict) do not propagate to siblings.
+func (m *Model) inheritedGitState(rel string) git.GitFileState {
+	for dir := filepath.Dir(rel); dir != "." && dir != ""; dir = filepath.Dir(dir) {
+		state, ok := m.gitStatus[dir]
+		if !ok {
+			continue
+		}
+		if state <= git.GitUntracked {
+			return state
+		}
+		return git.GitClean
+	}
+	return git.GitClean
+}
+
+// inferIgnored detects ignored files by checking the tracked set from the
+// git index. A file not in the status map AND not in the tracked set is
+// ignored. Directories use trackedDirs instead.
+func (m *Model) inferIgnored(rel string, isDir bool) git.GitFileState {
+	if m.trackedSet == nil {
+		return git.GitClean
+	}
+	if isDir {
+		if _, ok := m.trackedDirs[rel]; !ok {
+			return git.GitIgnored
+		}
+	} else {
+		if _, ok := m.trackedSet[rel]; !ok {
+			return git.GitIgnored
+		}
+	}
+	return git.GitClean
+}
 
 // ---------------------------------------------------------------------------
 // component.Component
@@ -416,7 +536,7 @@ func (m *Model) Init() tea.Cmd {
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
 	case msg.TickMsg:
-		if m.focused && (m.mode == viewSearch || m.newEntryActive || m.renameActive) {
+		if m.focused && (m.mode == viewSearch || m.newEntryActive || m.renameActive || m.tabFiltering) {
 			const blinkHalfPeriod = 530 * time.Millisecond
 			if typed.Time.Sub(m.lastBlinkAt) >= blinkHalfPeriod {
 				m.cursorBlink = !m.cursorBlink
@@ -454,6 +574,8 @@ func (m *Model) View() string {
 		return m.viewReferencesMode()
 	case viewDocSymbols:
 		return m.viewDocSymbolsMode()
+	case viewTabs:
+		return m.viewTabsMode()
 	default:
 		return m.viewTreeMode()
 	}
@@ -544,6 +666,8 @@ func (m *Model) activeScroll() *int {
 		return &m.refScroll
 	case viewDocSymbols:
 		return &m.symScroll
+	case viewTabs:
+		return &m.tabScroll
 	default:
 		return &m.scroll
 	}
@@ -558,6 +682,8 @@ func (m *Model) visibleItemCount() int {
 		return len(m.refItems)
 	case viewDocSymbols:
 		return len(m.symItems)
+	case viewTabs:
+		return len(m.tabFiltered)
 	default:
 		return len(m.entries)
 	}
@@ -587,6 +713,46 @@ func (m *Model) InReferencesMode() bool {
 // InDocSymbolsMode reports whether the file tree is showing document symbols.
 func (m *Model) InDocSymbolsMode() bool {
 	return m.mode == viewDocSymbols
+}
+
+// InTabsMode reports whether the file tree is showing the open tabs list.
+func (m *Model) InTabsMode() bool {
+	return m.mode == viewTabs
+}
+
+// TabCursorPath returns the absolute path of the tab under the cursor,
+// or empty string if no valid selection exists.
+func (m *Model) TabCursorPath() string {
+	if m.mode != viewTabs || m.tabCursor >= len(m.tabFiltered) {
+		return ""
+	}
+	idx := m.tabFiltered[m.tabCursor]
+	if idx >= len(m.tabPaths) {
+		return ""
+	}
+	return m.tabPaths[idx]
+}
+
+// ToggleTabFilter toggles the filter input in tabs mode.
+// If already filtering, exits the filter; otherwise enters it.
+func (m *Model) ToggleTabFilter() {
+	if m.mode != viewTabs {
+		return
+	}
+	if m.tabFiltering {
+		m.tabFiltering = false
+		m.tabFilter = nil
+		m.tabFocus = tabFocusFilter
+		m.tabFiltered = m.buildTabFiltered()
+		m.tabCursor = clampInt(m.tabCursor, 0, max(len(m.tabFiltered)-1, 0))
+		m.ensureTabCursorVisible()
+		return
+	}
+	m.tabFiltering = true
+	m.tabFilter = nil
+	m.tabFocus = tabFocusFilter
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
 }
 
 // SetReferences switches the panel to references mode, displaying the given
@@ -742,6 +908,191 @@ func (m *Model) ExitDocSymbols() {
 	m.symNumWidth = 0
 }
 
+// SetTabs switches the panel to tabs mode, displaying the given open tabs.
+// Snapshots tree state for restore on exit.
+func (m *Model) SetTabs(tabs []string, active string) {
+	if m.mode == viewSearch {
+		m.exitSearch()
+	}
+	if m.mode == viewReferences {
+		m.exitReferences()
+	}
+	if m.mode == viewDocSymbols {
+		m.ExitDocSymbols()
+	}
+	if m.mode != viewTabs {
+		m.savedEntries = make([]Entry, len(m.entries))
+		copy(m.savedEntries, m.entries)
+		m.savedCursor = m.cursor
+		m.savedScroll = m.scroll
+	}
+
+	m.tabPaths = tabs
+	m.tabActive = active
+	m.tabDupBases = buildDupBasenames(tabs)
+	m.tabFiltered = m.buildTabFiltered()
+	m.tabCursor = 0
+	m.tabScroll = 0
+	m.tabFilter = nil
+	m.tabFiltering = false
+	m.tabToggleActive = [toolbarToggleCount]bool{}
+	m.tabFocus = tabFocusFilter
+	m.tabToggleCursor = toggleCase
+	m.tabCloseHover = -1
+	m.mode = viewTabs
+
+	// Pre-select the active tab if present.
+	for i, fi := range m.tabFiltered {
+		if m.tabPaths[fi] == active {
+			m.tabCursor = i
+			m.ensureTabCursorVisible()
+			break
+		}
+	}
+}
+
+// ExitTabs restores the tree state from before tabs mode.
+func (m *Model) ExitTabs() {
+	m.entries = m.savedEntries
+	m.rebuildPathIndex()
+	m.cursor = m.savedCursor
+	m.scroll = m.savedScroll
+	m.mode = viewTree
+
+	m.savedEntries = nil
+	m.tabPaths = nil
+	m.tabFiltered = nil
+	m.tabDupBases = nil
+	m.tabActive = ""
+	m.tabCursor = 0
+	m.tabScroll = 0
+	m.tabFilter = nil
+	m.tabFiltering = false
+	m.tabToggleActive = [toolbarToggleCount]bool{}
+	m.tabFocus = tabFocusFilter
+	m.tabToggleCursor = toggleCase
+	m.tabCloseHover = -1
+}
+
+// buildDupBasenames returns a set of base filenames that appear more than
+// once in tabs, used to disambiguate entries by showing relative paths.
+func buildDupBasenames(tabs []string) map[string]bool {
+	counts := make(map[string]int, len(tabs))
+	for _, p := range tabs {
+		counts[filepath.Base(p)]++
+	}
+	dups := make(map[string]bool)
+	for base, n := range counts {
+		if n > 1 {
+			dups[base] = true
+		}
+	}
+	return dups
+}
+
+// buildTabFiltered returns indices into tabPaths matching the current filter.
+// When no filter is active, returns all indices.
+func (m *Model) buildTabFiltered() []int {
+	query := string(m.tabFilter)
+	if query == "" {
+		out := make([]int, 0, len(m.tabPaths))
+		for i := range m.tabPaths {
+			out = append(out, i)
+		}
+		return out
+	}
+
+	caseSensitive := m.tabToggleActive[toggleCase] || hasUpperCase(query)
+	wholeWord := m.tabToggleActive[toggleWord]
+	useRegex := m.tabToggleActive[toggleRegex]
+
+	var compiled *regexp.Regexp
+	if useRegex {
+		pattern := query
+		if !caseSensitive {
+			pattern = "(?i)" + pattern
+		}
+		compiled, _ = regexp.Compile(pattern)
+	}
+
+	out := make([]int, 0, len(m.tabPaths))
+	for i, p := range m.tabPaths {
+		name := filepath.Base(p)
+		if m.tabMatchesFilter(name, query, caseSensitive, wholeWord, useRegex, compiled) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// tabMatchesFilter checks whether a tab filename matches the current filter
+// query, respecting the active toggles (case sensitivity, whole word, regex).
+func (m *Model) tabMatchesFilter(name, query string, caseSensitive, wholeWord, useRegex bool, compiled *regexp.Regexp) bool {
+	if useRegex && compiled != nil {
+		if wholeWord {
+			return compiled.MatchString(name) && compiled.FindString(name) == name
+		}
+		return compiled.MatchString(name)
+	}
+	if !caseSensitive {
+		name = strings.ToLower(name)
+		query = strings.ToLower(query)
+	}
+	if wholeWord {
+		return name == query
+	}
+	return strings.Contains(name, query)
+}
+
+// ensureTabCursorVisible keeps the tab cursor within the visible window.
+func (m *Model) ensureTabCursorVisible() {
+	bh := m.bodyHeight()
+	if bh <= 0 {
+		return
+	}
+	if m.tabCursor < m.tabScroll {
+		m.tabScroll = m.tabCursor
+	}
+	if m.tabCursor >= m.tabScroll+bh {
+		m.tabScroll = m.tabCursor - bh + 1
+	}
+	maxScroll := max(len(m.tabFiltered)-bh, 0)
+	m.tabScroll = clampInt(m.tabScroll, 0, maxScroll)
+}
+
+// HoverAt updates hover state for the given content-relative coordinates.
+// Returns true if the visual state changed and a redraw is needed.
+func (m *Model) HoverAt(viewX, viewY int) bool {
+	if m.mode != viewTabs {
+		prev := m.tabCloseHover
+		m.tabCloseHover = -1
+		return prev != -1
+	}
+	top := treeChromeHeight
+	if m.tabFiltering {
+		top = tabsChromeHeight
+	}
+	bodyY := viewY - top
+	contentWidth := max(m.width, 1)
+	prev := m.tabCloseHover
+	if bodyY < 0 || viewX < contentWidth-2 {
+		m.tabCloseHover = -1
+		return prev != m.tabCloseHover
+	}
+	idx := m.tabScroll + bodyY
+	if idx < 0 || idx >= len(m.tabFiltered) {
+		m.tabCloseHover = -1
+		return prev != m.tabCloseHover
+	}
+	m.tabCloseHover = idx
+	return prev != m.tabCloseHover
+}
+
+// ClearTabCloseHover resets the close-icon hover state.
+func (m *Model) ClearTabCloseHover() {
+	m.tabCloseHover = -1
+}
+
 // ClickAt handles a left-click at the given content-relative coordinates.
 // viewX is the column offset within the panel content area; viewY is the
 // row offset (0 = first line inside the panel border).
@@ -755,6 +1106,8 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 		return m.clickReferencesMode(viewY)
 	case viewDocSymbols:
 		return m.clickDocSymbolsMode(viewY)
+	case viewTabs:
+		return m.clickTabsMode(viewX, viewY)
 	default:
 		return m.clickTreeMode(viewY)
 	}
@@ -1020,6 +1373,9 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 	if m.pendingNewEntry {
 		return m.handlePendingNewEntry(key)
 	}
+	if m.mode == viewTabs {
+		return m.handleTabsKey(key)
+	}
 	if m.mode == viewDocSymbols {
 		return m.handleDocSymbolsKey(key)
 	}
@@ -1266,6 +1622,302 @@ func (m *Model) clickDocSymbolsMode(viewY int) tea.Cmd {
 	}
 	m.symCursor = idx
 	return m.activateSymResult()
+}
+
+// ---------------------------------------------------------------------------
+// Tabs key handling
+// ---------------------------------------------------------------------------
+
+// handleTabsKey processes keys in tabs list mode.
+func (m *Model) handleTabsKey(key tea.KeyMsg) tea.Cmd {
+	if m.tabFiltering {
+		return m.handleTabsFilterKey(key)
+	}
+	ks := key.String()
+	if cmd, ok := m.handleTabToggleKey(ks); ok {
+		return cmd
+	}
+	switch ks {
+	case "esc", "q":
+		m.ExitTabs()
+	case "up", "k":
+		m.moveTabCursor(-1)
+	case "down", "j":
+		m.moveTabCursor(1)
+	case "enter":
+		return m.activateTabResult()
+	case "g":
+		m.tabCursor = 0
+		m.tabScroll = 0
+	case "G":
+		if len(m.tabFiltered) > 0 {
+			m.tabCursor = len(m.tabFiltered) - 1
+			m.ensureTabCursorVisible()
+		}
+	case "/":
+		m.tabFiltering = true
+		m.tabFilter = nil
+		m.tabFocus = tabFocusFilter
+		m.cursorBlink = true
+		m.lastBlinkAt = time.Now()
+	}
+	return nil
+}
+
+// handleTabsFilterKey processes keys while the tab filter input is active.
+// Dispatches to the focused zone (filter input or toggle badges).
+func (m *Model) handleTabsFilterKey(key tea.KeyMsg) tea.Cmd {
+	m.cursorBlink = true
+	m.lastBlinkAt = time.Now()
+	ks := key.String()
+
+	// Alt shortcuts for toggles work regardless of focus zone.
+	if cmd, ok := m.handleTabToggleKey(ks); ok {
+		return cmd
+	}
+
+	// Tab/Shift+Tab cycle between filter input and toggle badges.
+	switch ks {
+	case "tab":
+		m.advanceTabFocus()
+		return nil
+	case "shift+tab":
+		m.retreatTabFocus()
+		return nil
+	}
+
+	// Dispatch to the focused zone.
+	if m.tabFocus == tabFocusToggles {
+		return m.handleTabToggleInput(key)
+	}
+	return m.handleTabFilterInput(key)
+}
+
+// handleTabFilterInput processes keys for the "/" filter text input.
+func (m *Model) handleTabFilterInput(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case "esc":
+		m.tabFiltering = false
+		m.tabFilter = nil
+		m.tabFocus = tabFocusFilter
+		m.tabFiltered = m.buildTabFiltered()
+		m.tabCursor = clampInt(m.tabCursor, 0, max(len(m.tabFiltered)-1, 0))
+		m.ensureTabCursorVisible()
+	case "enter":
+		m.tabFiltering = false
+		m.tabFocus = tabFocusFilter
+		if len(m.tabFiltered) > 0 {
+			return m.activateTabResult()
+		}
+	case "backspace":
+		if len(m.tabFilter) > 0 {
+			m.tabFilter = m.tabFilter[:len(m.tabFilter)-1]
+			m.tabFiltered = m.buildTabFiltered()
+			m.tabCursor = clampInt(m.tabCursor, 0, max(len(m.tabFiltered)-1, 0))
+			m.ensureTabCursorVisible()
+		}
+	case "up":
+		m.moveTabCursor(-1)
+	case "down":
+		m.moveTabCursor(1)
+	default:
+		changed := false
+		for _, r := range key.Runes {
+			if !unicode.IsPrint(r) {
+				continue
+			}
+			if len(m.tabFilter) >= maxInputLen {
+				break
+			}
+			m.tabFilter = append(m.tabFilter, r)
+			changed = true
+		}
+		if changed {
+			m.tabFiltered = m.buildTabFiltered()
+			m.tabCursor = 0
+			m.tabScroll = 0
+		}
+	}
+	return nil
+}
+
+// tabToggleKeys maps key strings to their corresponding tab filter toggle.
+var tabToggleKeys = map[string]toggleIndex{
+	"alt+c": toggleCase,
+	"alt+w": toggleWord,
+	"alt+.": toggleRegex,
+}
+
+// handleTabToggleKey checks if a key string matches a tab filter toggle
+// shortcut and flips the toggle, triggering a refilter.
+func (m *Model) handleTabToggleKey(ks string) (tea.Cmd, bool) {
+	idx, ok := tabToggleKeys[ks]
+	if !ok {
+		return nil, false
+	}
+	m.tabToggleActive[idx] = !m.tabToggleActive[idx]
+	m.tabFiltered = m.buildTabFiltered()
+	m.tabCursor = clampInt(m.tabCursor, 0, max(len(m.tabFiltered)-1, 0))
+	m.ensureTabCursorVisible()
+	return nil, true
+}
+
+// handleTabToggleInput processes keys when the toggle badges zone has focus.
+// Left/Right moves the cursor across badges; Space flips the focused toggle.
+func (m *Model) handleTabToggleInput(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case "left":
+		m.moveTabToggleCursor(-1)
+	case "right":
+		m.moveTabToggleCursor(1)
+	case " ":
+		m.tabToggleActive[m.tabToggleCursor] = !m.tabToggleActive[m.tabToggleCursor]
+		m.tabFiltered = m.buildTabFiltered()
+		m.tabCursor = clampInt(m.tabCursor, 0, max(len(m.tabFiltered)-1, 0))
+		m.ensureTabCursorVisible()
+	case "esc":
+		m.tabFiltering = false
+		m.tabFilter = nil
+		m.tabFocus = tabFocusFilter
+		m.tabFiltered = m.buildTabFiltered()
+		m.tabCursor = clampInt(m.tabCursor, 0, max(len(m.tabFiltered)-1, 0))
+		m.ensureTabCursorVisible()
+	default:
+		// Printable runes switch focus back to filter input and insert.
+		if key.Type == tea.KeyRunes {
+			m.tabFocus = tabFocusFilter
+			return m.handleTabFilterInput(key)
+		}
+	}
+	return nil
+}
+
+// advanceTabFocus moves focus forward through the tabs panel zones.
+// Within the toggles zone, Tab advances to the next badge before cycling.
+func (m *Model) advanceTabFocus() {
+	if m.tabFocus == tabFocusToggles {
+		pos := tabToggleTabPos(m.tabToggleCursor)
+		if pos < toolbarToggleCount-1 {
+			m.tabToggleCursor = tabToggleOrder[pos+1]
+			return
+		}
+	}
+	switch m.tabFocus {
+	case tabFocusFilter:
+		m.tabFocus = tabFocusToggles
+		m.tabToggleCursor = tabToggleOrder[0]
+	case tabFocusToggles:
+		m.tabFocus = tabFocusFilter
+	}
+}
+
+// retreatTabFocus moves focus backward through the tabs panel zones.
+// Within the toggles zone, Shift+Tab retreats to the previous badge.
+func (m *Model) retreatTabFocus() {
+	if m.tabFocus == tabFocusToggles {
+		pos := tabToggleTabPos(m.tabToggleCursor)
+		if pos > 0 {
+			m.tabToggleCursor = tabToggleOrder[pos-1]
+			return
+		}
+	}
+	switch m.tabFocus {
+	case tabFocusFilter:
+		m.tabFocus = tabFocusToggles
+		m.tabToggleCursor = tabToggleOrder[toolbarToggleCount-1]
+	case tabFocusToggles:
+		m.tabFocus = tabFocusFilter
+	}
+}
+
+// moveTabToggleCursor moves the toggle cursor left or right, clamped.
+func (m *Model) moveTabToggleCursor(delta int) {
+	pos := tabToggleTabPos(m.tabToggleCursor)
+	next := clampInt(pos+delta, 0, toolbarToggleCount-1)
+	m.tabToggleCursor = tabToggleOrder[next]
+}
+
+// tabToggleTabPos returns the position of idx within tabToggleOrder.
+func tabToggleTabPos(idx toggleIndex) int {
+	for i, t := range tabToggleOrder {
+		if t == idx {
+			return i
+		}
+	}
+	return 0
+}
+
+// moveTabCursor moves the cursor within filtered tab items.
+func (m *Model) moveTabCursor(delta int) {
+	n := len(m.tabFiltered)
+	if n == 0 {
+		return
+	}
+	m.tabCursor = clampInt(m.tabCursor+delta, 0, n-1)
+	m.ensureTabCursorVisible()
+}
+
+// activateTabResult handles Enter on a tab entry.
+// Exits tabs mode and returns a FileOpenMsg for the selected tab.
+func (m *Model) activateTabResult() tea.Cmd {
+	if m.tabCursor >= len(m.tabFiltered) {
+		return nil
+	}
+	idx := m.tabFiltered[m.tabCursor]
+	if idx >= len(m.tabPaths) {
+		return nil
+	}
+	path := m.tabPaths[idx]
+	name := filepath.Base(path)
+	lang := langFromPath(path)
+
+	m.ExitTabs()
+
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     path,
+			Name:     name,
+			Language: lang,
+		}
+	}
+}
+
+// clickTabsMode handles clicks in tabs mode body area.
+func (m *Model) clickTabsMode(viewX, viewY int) tea.Cmd {
+	top := treeChromeHeight
+	if m.tabFiltering {
+		top = tabsChromeHeight
+	}
+	bodyY := viewY - top
+	if bodyY < 0 {
+		return nil
+	}
+	idx := m.tabScroll + bodyY
+	if idx < 0 || idx >= len(m.tabFiltered) {
+		return nil
+	}
+	m.tabCursor = idx
+	// Close icon occupies the last 2 columns ("✕" + " ").
+	contentWidth := max(m.width, 1)
+	if viewX >= contentWidth-2 {
+		return m.closeTabEntry(idx)
+	}
+	return m.activateTabResult()
+}
+
+// closeTabEntry emits a TabCloseRequestMsg for the tab at filteredIdx.
+func (m *Model) closeTabEntry(filteredIdx int) tea.Cmd {
+	if filteredIdx >= len(m.tabFiltered) {
+		return nil
+	}
+	pathIdx := m.tabFiltered[filteredIdx]
+	if pathIdx >= len(m.tabPaths) {
+		return nil
+	}
+	path := m.tabPaths[pathIdx]
+	return func() tea.Msg {
+		return msg.TabCloseRequestMsg{Path: path}
+	}
 }
 
 // handleSearchKey processes keys in search mode, dispatching to the
@@ -3463,6 +4115,232 @@ func (m *Model) renderDocSymbolsHint(contentWidth int) string {
 	return line
 }
 
+// ---------------------------------------------------------------------------
+// Tabs rendering
+// ---------------------------------------------------------------------------
+
+// viewTabsMode renders the open tabs list view.
+// Layout mirrors the search mode: filter input is at the top (below the
+// subtitle), with toggle badges at the bottom — both only when filtering.
+func (m *Model) viewTabsMode() string {
+	contentWidth := max(m.width, 1)
+	header := m.renderHeader(contentWidth)
+	bh := m.bodyHeight()
+	emptyLine := strings.Repeat(" ", contentWidth)
+
+	bodyLines := m.renderTabsBody(bh, contentWidth, emptyLine)
+	bodyLines = applyBounceShift(bodyLines, m.bounceOffset, bh, emptyLine)
+
+	var b strings.Builder
+	b.WriteString(header)
+	b.WriteByte('\n')
+	b.WriteString(m.renderTabsTitle(contentWidth))
+	if m.tabFiltering {
+		b.WriteByte('\n')
+		b.WriteString(m.renderTabsDivider(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderTabsFilterInput(contentWidth))
+	}
+	b.WriteByte('\n')
+	b.WriteString(m.renderTabsDivider(contentWidth))
+	for _, line := range bodyLines {
+		b.WriteByte('\n')
+		b.WriteString(line)
+	}
+	if m.tabFiltering {
+		b.WriteByte('\n')
+		b.WriteString(m.renderTabsDivider(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderTabsToolbar(contentWidth))
+		b.WriteByte('\n')
+		b.WriteString(m.renderTabsDivider(contentWidth))
+	}
+	b.WriteByte('\n')
+	b.WriteString(m.renderTabsHint(contentWidth))
+	return b.String()
+}
+
+// renderTabsTitle renders the subtitle line showing how many tabs are open.
+func (m *Model) renderTabsTitle(contentWidth int) string {
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	label := fmt.Sprintf(" %d open", len(m.tabPaths))
+	line := style.Render(label)
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderTabsBody renders the tab list body lines.
+func (m *Model) renderTabsBody(bh, contentWidth int, emptyLine string) []string {
+	if len(m.tabFiltered) == 0 {
+		lines := make([]string, bh)
+		style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+		if m.tabFiltering && len(m.tabFilter) > 0 {
+			lines[0] = style.Render("No matching tabs")
+		} else {
+			lines[0] = style.Render("No open tabs")
+		}
+		padCount := max(contentWidth-lipgloss.Width(lines[0]), 0)
+		if padCount > 0 {
+			lines[0] += strings.Repeat(" ", padCount)
+		}
+		for i := 1; i < bh; i++ {
+			lines[i] = emptyLine
+		}
+		return lines
+	}
+	start := clampInt(m.tabScroll, 0, max(len(m.tabFiltered)-1, 0))
+	end := min(start+bh, len(m.tabFiltered))
+	lines := make([]string, 0, bh)
+	for i := start; i < end; i++ {
+		lines = append(lines, m.renderTabEntry(i, contentWidth))
+	}
+	for range bh - (end - start) {
+		lines = append(lines, emptyLine)
+	}
+	return lines
+}
+
+// renderTabEntry renders a single tab entry with icon and filename.
+func (m *Model) renderTabEntry(filteredIdx, contentWidth int) string {
+	pathIdx := m.tabFiltered[filteredIdx]
+	path := m.tabPaths[pathIdx]
+	selected := filteredIdx == m.tabCursor && m.focused
+	active := path == m.tabActive
+
+	icon, iconColor := FileIcon(path, false, m.nerdFonts, m.theme)
+	nameColor := m.theme.Palette.Foreground
+
+	// Show relative path when multiple tabs share the same base name.
+	displayName := filepath.Base(path)
+	if m.tabDupBases[displayName] {
+		displayName = m.relativePath(path)
+	}
+
+	if active {
+		nameColor = m.theme.Palette.Accent
+		iconColor = m.theme.Palette.Accent
+	}
+
+	hoverClose := filteredIdx == m.tabCloseHover
+	closeColor := m.theme.Palette.Muted
+	if hoverClose {
+		closeColor = m.theme.Palette.Error
+	}
+	nameStyle := lipgloss.NewStyle().Foreground(nameColor)
+	iconStyle := lipgloss.NewStyle().Foreground(iconColor)
+	closeStyle := lipgloss.NewStyle().Foreground(closeColor)
+	padStyle := lipgloss.NewStyle()
+	if selected {
+		bg := m.theme.Palette.Selection
+		nameStyle = nameStyle.Background(bg)
+		iconStyle = iconStyle.Background(bg)
+		closeStyle = closeStyle.Background(bg)
+		padStyle = padStyle.Background(bg)
+	}
+
+	prefix := iconStyle.Render(" " + icon + " ")
+	prefixWidth := lipgloss.Width(prefix)
+	suffix := closeStyle.Render("✕") + padStyle.Render(" ")
+	suffixWidth := 2 // "✕" + " "
+
+	nameSpace := max(contentWidth-prefixWidth-suffixWidth, 0)
+	name := truncatePlain(displayName, nameSpace)
+	line := prefix + nameStyle.Render(name)
+
+	lineWidth := lipgloss.Width(line)
+	padCount := max(contentWidth-lineWidth-suffixWidth, 0)
+	if padCount > 0 {
+		line += padStyle.Render(strings.Repeat(" ", padCount))
+	}
+	line += suffix
+	return line
+}
+
+// renderTabsFilterInput renders the filter input line: " / query|".
+func (m *Model) renderTabsFilterInput(contentWidth int) string {
+	queryStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	prefix := lipgloss.NewStyle().
+		Foreground(m.theme.Palette.Muted).
+		Render("/ ")
+	prefixWidth := lipgloss.Width(prefix)
+
+	// Reserve 1 column for the cursor so layout is stable.
+	availableForQuery := max(contentWidth-prefixWidth-1, 0)
+
+	// Pre-truncate: show tail so recent keystrokes stay visible.
+	queryRunes := m.tabFilter
+	if len(queryRunes) > availableForQuery {
+		queryRunes = queryRunes[len(queryRunes)-availableForQuery:]
+	}
+
+	// Blinking cursor when the filter input is focused.
+	cursor := " "
+	if m.tabFocus == tabFocusFilter && m.cursorBlink {
+		cursor = cursorStyle.Render(" ")
+	}
+
+	line := prefix + queryStyle.Render(string(queryRunes)) + cursor
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderTabsHint renders the key hint footer for tabs mode.
+func (m *Model) renderTabsHint(contentWidth int) string {
+	keyStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	var hint string
+	if m.tabFiltering {
+		hint = " Esc clear  Enter open"
+	} else {
+		hint = " Esc close  / filter  Enter open"
+	}
+	line := keyStyle.Render(hint)
+	lineWidth := lipgloss.Width(line)
+	if pad := contentWidth - lineWidth; pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	return line
+}
+
+// renderTabsToolbar renders the toolbar line with [Aa] [ab] [.*] toggle badges
+// for tab filtering. The badges use tabToggleActive state.
+func (m *Model) renderTabsToolbar(contentWidth int) string {
+	var b strings.Builder
+	b.WriteByte(' ')
+	for i := range toolbarToggleCount {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(m.renderTabBadge(toggleIndex(i)))
+	}
+	line := b.String()
+	padCount := max(contentWidth-lipgloss.Width(line), 0)
+	if padCount > 0 {
+		line += strings.Repeat(" ", padCount)
+	}
+	return line
+}
+
+// renderTabBadge renders a single toggle badge for the tabs toolbar.
+func (m *Model) renderTabBadge(idx toggleIndex) string {
+	fg := m.theme.Palette.Muted
+	if m.tabToggleActive[idx] {
+		fg = m.theme.Palette.Primary
+	}
+	style := lipgloss.NewStyle().Foreground(fg)
+	if m.tabFocus == tabFocusToggles && m.tabToggleCursor == idx {
+		style = style.Background(m.theme.Palette.Selection)
+	}
+	return style.Render("[" + badgeLabels[idx] + "]")
+}
+
 // renderSearchBody renders the search results body lines for the given height.
 func (m *Model) renderSearchBody(bh, contentWidth int, emptyLine string) []string {
 	if len(m.searchItems) == 0 {
@@ -3575,6 +4453,12 @@ func (m *Model) renderSearchDivider(contentWidth int) string {
 func (m *Model) renderToolbarSeparator(contentWidth int) string {
 	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Subtle)
 	return style.Render(strings.Repeat("╌", contentWidth))
+}
+
+// renderTabsDivider renders a short-dash divider for the tabs panel.
+func (m *Model) renderTabsDivider(contentWidth int) string {
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
+	return style.Render(strings.Repeat("-", contentWidth))
 }
 
 // renderSearchToolbar renders the toolbar line with toggle badges [Aa] [ab] [.*].
@@ -4231,6 +5115,8 @@ func (m *Model) renderHeader(contentWidth int) string {
 		title = " References "
 	case viewDocSymbols:
 		title = " Symbols "
+	case viewTabs:
+		title = " Tabs "
 	}
 	text := headerStyle.Render(title)
 	textWidth := lipgloss.Width(text)
@@ -4247,7 +5133,7 @@ func (m *Model) renderEntry(idx, contentWidth int, entries []Entry, cursorIdx in
 	active := !entry.IsDir && entry.Path == m.activeFilePath
 
 	nameColor := m.theme.Palette.Foreground
-	icon, iconColor := m.fileIcon(entry)
+	icon, iconColor := FileIcon(entry.Path, entry.IsDir, m.nerdFonts, m.theme)
 	if entry.IsDir {
 		nameColor = m.theme.Palette.Primary
 		iconColor = m.theme.Palette.Muted
@@ -4257,6 +5143,14 @@ func (m *Model) renderEntry(idx, contentWidth int, entries []Entry, cursorIdx in
 			icon = iconDirClosed
 		}
 	}
+
+	// Git status: override name color and compute badge suffix.
+	badge, badgeColor := m.gitBadge(&entry)
+	if badgeColor != "" {
+		nameColor = badgeColor
+	}
+
+	// Active file overrides name color but preserves badge color.
 	if active {
 		nameColor = m.theme.Palette.Accent
 		iconColor = m.theme.Palette.Accent
@@ -4279,8 +5173,19 @@ func (m *Model) renderEntry(idx, contentWidth int, entries []Entry, cursorIdx in
 	prefix := iconStyle.Render(prefixStr)
 	prefixWidth := lipgloss.Width(prefix)
 
-	name := truncatePlain(entry.Name, max(contentWidth-prefixWidth, 0))
+	// Reserve space for badge when truncating the file name.
+	badgeWidth := len([]rune(badge))
+	name := truncatePlain(entry.Name, max(contentWidth-prefixWidth-badgeWidth, 0))
 	line := prefix + nameStyle.Render(name)
+
+	// Append badge with its own color (not overridden by active state).
+	if badge != "" {
+		badgeStyle := lipgloss.NewStyle().Foreground(badgeColor).Bold(true)
+		if selected {
+			badgeStyle = badgeStyle.Background(m.theme.Palette.Selection)
+		}
+		line += badgeStyle.Render(badge)
+	}
 
 	lineWidth := lipgloss.Width(line)
 	padCount := max(contentWidth-lineWidth, 0)
@@ -4291,18 +5196,40 @@ func (m *Model) renderEntry(idx, contentWidth int, entries []Entry, cursorIdx in
 	return line
 }
 
-// fileIcon returns an icon glyph and color for a file entry. When Nerd Fonts
+// gitBadge returns the badge suffix and color for a file tree entry based on
+// its git status. The returned color applies to both the badge and the entry
+// name. Returns ("", "") when no git decoration applies.
+func (m *Model) gitBadge(entry *Entry) (badge string, color lipgloss.Color) {
+	switch m.gitStateForEntry(entry) {
+	case git.GitIgnored:
+		return "", m.theme.Palette.Muted
+	case git.GitUntracked:
+		return " U", m.theme.Palette.Success
+	case git.GitAdded:
+		return " A", m.theme.Palette.Teal
+	case git.GitModified:
+		return " M", m.theme.Palette.Warning
+	case git.GitDeleted:
+		return " D", m.theme.Palette.Peach
+	case git.GitConflict:
+		return " !", m.theme.Palette.Error
+	default:
+		return "", ""
+	}
+}
+
+// FileIcon returns an icon glyph and color for a file path. When Nerd Fonts
 // are available, it uses go-devicons; otherwise it falls back to simple Unicode
 // glyphs colored with the theme palette.
-func (m *Model) fileIcon(entry Entry) (string, lipgloss.Color) {
-	if entry.IsDir {
-		return iconDir, m.theme.Palette.Muted
+func FileIcon(path string, isDir, nerdFonts bool, th *theme.Theme) (string, lipgloss.Color) {
+	if isDir {
+		return iconDir, th.Palette.Muted
 	}
-	if m.nerdFonts {
-		style := devicons.IconForPath(entry.Path)
+	if nerdFonts {
+		style := devicons.IconForPath(path)
 		return style.Icon, lipgloss.Color(style.Color)
 	}
-	return fallbackIcon(entry.Name), m.theme.Palette.Muted
+	return fallbackIcon(filepath.Base(path)), th.Palette.Muted
 }
 
 // fileCategory groups file extensions for fallback icon assignment.
@@ -4421,6 +5348,13 @@ func (m *Model) bodyHeight() int {
 		footer = refsFooterHeight
 	case viewDocSymbols:
 		footer = refsFooterHeight
+	case viewTabs:
+		if m.tabFiltering {
+			top = tabsChromeHeight
+			footer = tabsFooterHeight
+		} else {
+			footer = tabsHintHeight
+		}
 	}
 	if m.pendingNewEntry || m.newEntryActive || m.deleteConfirm || m.renameActive {
 		footer += newEntryFooterHeight

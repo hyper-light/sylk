@@ -19,6 +19,7 @@ type ParseResult struct {
 	Operator OperatorType
 	Motion   MotionType
 	TextObj  TextObjType
+	HasCount bool // true when the user explicitly typed a count prefix
 }
 
 // transitionFunc processes a rune and returns the next state plus whether
@@ -100,6 +101,7 @@ func (p *Parser) buildResult() *ParseResult {
 		Count:    c1 * c2,
 		Operator: p.op,
 		Motion:   m,
+		HasCount: p.count1 > 0 || p.count2 > 0,
 	}
 }
 

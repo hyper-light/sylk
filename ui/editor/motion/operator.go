@@ -18,6 +18,8 @@ const (
 	OpToggleCase
 	OpGotoDefinition
 	OpGotoReferences
+	OpNextTab
+	OpPrevTab
 )
 
 // EditResult carries the outcome of an operator execution.
@@ -46,6 +48,8 @@ var operatorTable = []operatorEntry{
 	{runes: []rune{'g', '~'}, op: OpToggleCase},
 	{runes: []rune{'g', 'd'}, op: OpGotoDefinition},
 	{runes: []rune{'g', 'r'}, op: OpGotoReferences},
+	{runes: []rune{'g', 't'}, op: OpNextTab},
+	{runes: []rune{'g', 'T'}, op: OpPrevTab},
 }
 
 // LookupOperator attempts to match the given rune sequence against known
@@ -76,6 +80,8 @@ func IsOperatorPrefix(runes []rune) bool {
 var standaloneOperators = map[OperatorType]bool{
 	OpGotoDefinition: true,
 	OpGotoReferences: true,
+	OpNextTab:        true,
+	OpPrevTab:        true,
 }
 
 // IsStandalone reports whether an operator completes without a motion.

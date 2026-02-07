@@ -140,11 +140,15 @@ func standaloneCmd(result *motion.ParseResult, state *EditorState) tea.Cmd {
 	op := result.Operator
 	line := state.CursorLine
 	col := state.CursorCol
+	count := result.Count
+	hasCount := result.HasCount
 	return func() tea.Msg {
 		return StandaloneResult{
 			Operator: op,
 			Line:     line,
 			Col:      col,
+			Count:    count,
+			HasCount: hasCount,
 		}
 	}
 }
@@ -156,6 +160,8 @@ type StandaloneResult struct {
 	Operator motion.OperatorType
 	Line     int
 	Col      int
+	Count    int  // count prefix (product of count1*count2, minimum 1)
+	HasCount bool // true when the user explicitly typed a count prefix
 }
 
 // executeNormalCommand applies a parsed motion/operator to the editor state.

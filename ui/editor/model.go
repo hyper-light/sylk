@@ -73,10 +73,11 @@ type Model struct {
 	modified bool
 
 	// Viewport.
-	scrollOffset int
-	bounceOffset int
-	width        int
-	height       int
+	scrollOffset  int
+	scrollLeftCol int // horizontal scroll offset in display columns
+	bounceOffset  int
+	width         int
+	height        int
 
 	// LSP diagnostics for the current file.
 	diagnostics []lsp.Diagnostic
@@ -182,6 +183,7 @@ func (m *Model) OpenFile(path, content, language string) {
 	m.highlightRanges = nil
 	m.jumpActive = false
 	m.scrollOffset = 0
+	m.scrollLeftCol = 0
 	m.DismissHover()
 	m.DismissSignatureHelp()
 
@@ -244,6 +246,7 @@ func (m *Model) View() string {
 		return m.statusLine.View(m.width)
 	}
 	m.adjustScroll(viewHeight)
+	m.adjustScrollX()
 	lines := m.renderVisibleLines(viewHeight)
 	for len(lines) < viewHeight {
 		lines = append(lines, m.renderTildeLine())
@@ -329,9 +332,137 @@ func (m *Model) ClearFile() {
 	m.highlightRanges = nil
 	m.jumpActive = false
 	m.scrollOffset = 0
+	m.scrollLeftCol = 0
 	m.DismissSignatureHelp()
 	m.buf = buffer.NewPieceTable("")
 	m.regions = nil
+}
+
+// ---------------------------------------------------------------------------
+// Detach / Attach — zero-copy state transfer for the tiered editor cache.
+// ---------------------------------------------------------------------------
+
+// Detach extracts the per-file state from the editor, returning it as a
+// WarmState suitable for caching. The editor is left in a cleared state.
+//
+// The JumpList is intentionally left in place (it is cross-file and global).
+// Highlights are NOT captured — they are regenerated on Attach.
+func (m *Model) Detach() *WarmState {
+	ws := &WarmState{
+		FilePath:     m.filePath,
+		Language:     m.language,
+		Modified:     m.modified,
+		Buf:          m.buf,
+		LineIndex:    m.lineIndex,
+		UndoTree:     m.undoTree,
+		Cursor:       m.state.Cursor,
+		CursorLine:   m.state.CursorLine,
+		CursorCol:    m.state.CursorCol,
+		ScrollOffset: m.scrollOffset,
+	}
+
+	// Reset the editor to an empty state, reusing ClearFile's pattern
+	// but also wiring state pointers so the editor remains consistent.
+	m.filePath = ""
+	m.language = ""
+	m.modified = false
+	m.lspDirty = false
+	m.lastEditAt = time.Time{}
+	m.diagnostics = nil
+	m.parseErrors = nil
+	m.highlightRanges = nil
+	m.jumpActive = false
+	m.scrollOffset = 0
+	m.scrollLeftCol = 0
+	m.DismissHover()
+	m.DismissSignatureHelp()
+
+	m.buf = buffer.NewPieceTable("")
+	m.lineIndex = buffer.NewLineIndex(m.buf)
+	m.undoTree = buffer.NewUndoTree(0)
+
+	m.state.Buffer = m.buf
+	m.state.LineIndex = m.lineIndex
+	m.state.UndoTree = m.undoTree
+	m.state.Cursor = 0
+	m.state.SyncCursorPos()
+
+	m.regions = nil
+	return ws
+}
+
+// AttachWarm restores a warm-tier cached state into the editor. The
+// PieceTable, LineIndex, and UndoTree are injected directly (O(1)).
+// Syntax highlighting is regenerated from the live PieceTable.
+func (m *Model) AttachWarm(ws *WarmState) {
+	m.filePath = ws.FilePath
+	m.language = ws.Language
+	m.modified = ws.Modified
+
+	m.buf = ws.Buf
+	m.lineIndex = ws.LineIndex
+	m.undoTree = ws.UndoTree
+
+	m.state.Buffer = m.buf
+	m.state.LineIndex = m.lineIndex
+	m.state.UndoTree = m.undoTree
+	m.state.Cursor = ws.Cursor
+	m.state.CursorLine = ws.CursorLine
+	m.state.CursorCol = ws.CursorCol
+
+	m.scrollOffset = ws.ScrollOffset
+
+	// Reset transient per-file state.
+	m.lspDirty = false
+	m.lastEditAt = time.Time{}
+	m.diagnostics = nil
+	m.parseErrors = nil
+	m.highlightRanges = nil
+	m.jumpActive = false
+	m.DismissHover()
+	m.DismissSignatureHelp()
+
+	// Regenerate highlights from the live buffer.
+	m.regions = m.highlighter.Highlight(m.buf.Content(), m.language)
+	m.collectParseErrors()
+	m.syncStatusLine()
+}
+
+// AttachCold restores a cold-tier cached state into the editor. The
+// PieceTable and LineIndex are rebuilt from the serialized content; the
+// UndoTree is injected directly, preserving full undo history.
+func (m *Model) AttachCold(cs *ColdState) {
+	m.filePath = cs.FilePath
+	m.language = cs.Language
+	m.modified = cs.Modified
+
+	m.buf = buffer.NewPieceTable(cs.Content)
+	m.lineIndex = buffer.NewLineIndex(m.buf)
+	m.undoTree = cs.UndoTree
+
+	m.state.Buffer = m.buf
+	m.state.LineIndex = m.lineIndex
+	m.state.UndoTree = m.undoTree
+	m.state.Cursor = cs.Cursor
+	m.state.CursorLine = cs.CursorLine
+	m.state.CursorCol = cs.CursorCol
+
+	m.scrollOffset = cs.ScrollOffset
+
+	// Reset transient per-file state.
+	m.lspDirty = false
+	m.lastEditAt = time.Time{}
+	m.diagnostics = nil
+	m.parseErrors = nil
+	m.highlightRanges = nil
+	m.jumpActive = false
+	m.DismissHover()
+	m.DismissSignatureHelp()
+
+	// Regenerate highlights from the rebuilt buffer.
+	m.regions = m.highlighter.Highlight(cs.Content, m.language)
+	m.collectParseErrors()
+	m.syncStatusLine()
 }
 
 // HasSelection reports whether any selection (keyboard or mouse) is active.
@@ -733,14 +864,25 @@ func (m *Model) layoutCompAndHover(viewHeight, cursorRow int, sig popupPlacement
 	return m.optimizedDualLayout(viewHeight, cursorRow, anchorRow, sig)
 }
 
-// sigHelpPlacement renders signature help and positions it above the cursor.
-func (m *Model) sigHelpPlacement(cursorRow int) popupPlacement {
+// sigHelpPlacement renders signature help and positions it above the anchor
+// line (the function call). The popup is suppressed when the anchor line is
+// not visible or there is insufficient room above it to display the hint.
+func (m *Model) sigHelpPlacement(_ int) popupPlacement {
 	if !m.sigHelpActive || !m.sigHelp.Active() {
+		return popupPlacement{}
+	}
+	anchor := m.sigHelp.AnchorLine()
+	viewHeight := m.viewportHeight()
+	if anchor < m.scrollOffset || anchor >= m.scrollOffset+viewHeight {
 		return popupPlacement{}
 	}
 	popup := m.sigHelp.View(m.width, m.theme)
 	p := newPopupPlacement(popup, 0)
-	p.start = max(cursorRow-p.height, 0)
+	anchorRow := m.contentLineToViewRow(anchor)
+	if anchorRow < p.height {
+		return popupPlacement{}
+	}
+	p.start = anchorRow - p.height
 	return p
 }
 
@@ -1889,7 +2031,7 @@ func (m *Model) ViewportToBufferPos(x, y int) (line, col int, ok bool) {
 	if line < 0 || line >= totalLines {
 		return 0, 0, false
 	}
-	screenCol := max(x-gutterW, 0)
+	screenCol := max(x-gutterW, 0) + m.scrollLeftCol
 	col = m.screenToBufferCol(line, screenCol)
 	return line, col, true
 }
@@ -1926,7 +2068,7 @@ func (m *Model) setCursorFromViewport(x, y int) {
 	line := y + m.scrollOffset
 	line = max(min(line, totalLines-1), 0)
 
-	screenCol := max(x-gutterW, 0)
+	screenCol := max(x-gutterW, 0) + m.scrollLeftCol
 	col := m.screenToBufferCol(line, screenCol)
 
 	trailingOffset := 1
@@ -2125,6 +2267,14 @@ func handleStandaloneResult(m *Model, incoming tea.Msg) (component.Component, te
 				Col:      sr.Col,
 			}
 		}
+	case motion.OpNextTab:
+		if sr.HasCount {
+			idx := sr.Count - 1
+			return m, func() tea.Msg { return msg.TabJumpMsg{Index: idx} }
+		}
+		return m, func() tea.Msg { return msg.TabNextMsg{} }
+	case motion.OpPrevTab:
+		return m, func() tea.Msg { return msg.TabPrevMsg{} }
 	}
 	return m, nil
 }
@@ -2421,27 +2571,6 @@ func dispatchVisual(m *Model, key tea.KeyMsg) (mode.Mode, tea.Cmd) {
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
-// MaxVisibleLineWidth returns the maximum display-column width of the
-// currently visible lines, including gutter. Used by the layout manager
-// to detect content cutoff and trigger a panel mode downgrade.
-func (m *Model) MaxVisibleLineWidth() int {
-	content := m.buf.Content()
-	contentLines := strings.Split(content, "\n")
-	totalLines := len(contentLines)
-	gutterW := m.gutterWidth(totalLines)
-	viewH := m.viewportHeight()
-
-	maxW := 0
-	for i := m.scrollOffset; i < totalLines && (i-m.scrollOffset) < viewH; i++ {
-		expanded, _ := expandTabs(contentLines[i], editorTabWidth)
-		lineW := gutterW + gutterPadding + len([]rune(expanded))
-		if lineW > maxW {
-			maxW = lineW
-		}
-	}
-	return maxW
-}
-
 func (m *Model) viewportHeight() int {
 	return max(m.height-statusLineHeight, 0)
 }
@@ -2453,6 +2582,31 @@ func (m *Model) adjustScroll(viewHeight int) {
 	}
 	if cursorLine >= m.scrollOffset+viewHeight {
 		m.scrollOffset = cursorLine - viewHeight + 1
+	}
+}
+
+// contentWidth returns the number of display columns available for text
+// content (total width minus gutter). Derived from current line count.
+func (m *Model) contentWidth() int {
+	gutterCols := m.gutterWidth(m.lineIndex.Count()) + gutterPadding
+	return max(m.width-gutterCols, 0)
+}
+
+// adjustScrollX ensures the cursor's display column falls within the
+// visible content window [scrollLeftCol, scrollLeftCol + contentWidth).
+func (m *Model) adjustScrollX() {
+	cw := m.contentWidth()
+	if cw <= 0 {
+		return
+	}
+	line := m.buf.Line(m.state.CursorLine)
+	_, colMap := expandTabs(line, editorTabWidth)
+	dc := safeMapCol(colMap, m.state.CursorCol)
+	if dc >= m.scrollLeftCol+cw {
+		m.scrollLeftCol = dc - cw + 1
+	}
+	if dc < m.scrollLeftCol {
+		m.scrollLeftCol = dc
 	}
 }
 
@@ -2491,16 +2645,35 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 		// Compute diagnostic underline ranges for this line.
 		ulRanges := m.diagnosticDisplayRanges(i, colMap)
 
+		// Horizontal scroll: clip display data to visible window.
+		vs := m.scrollLeftCol
+		if vs > 0 {
+			cw := m.contentWidth()
+			dr := []rune(displayLine)
+			if vs < len(dr) {
+				end := min(vs+cw, len(dr))
+				displayLine = string(dr[vs:end])
+			} else {
+				displayLine = ""
+			}
+			displayLineRunes = len([]rune(displayLine))
+			displayRegions = shiftClipRegions(displayRegions, vs, cw)
+			findSpans = shiftClipSpans(findSpans, vs, cw)
+			hlSpans = shiftClipSpans(hlSpans, vs, cw)
+			jumpSpans = shiftClipSpans(jumpSpans, vs, cw)
+			ulRanges = shiftClipUnderlines(ulRanges, vs, cw)
+		}
+
 		// Choose line rendering strategy; underlines apply to all paths.
 		switch {
 		case inSelection:
 			sc := 0
 			if i == selStartLine {
-				sc = safeMapCol(colMap, selStartCol)
+				sc = max(safeMapCol(colMap, selStartCol)-vs, 0)
 			}
 			ec := displayLineRunes
 			if i == selEndLine {
-				ec = safeMapCol(colMap, selEndCol+1)
+				ec = safeMapCol(colMap, selEndCol+1) - vs
 			}
 			if len(findSpans) > 0 {
 				result = append(result, m.renderSelectedLineWithMatches(
@@ -2512,19 +2685,19 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 		case len(findSpans) > 0:
 			curCol := -1
 			if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
-				curCol = safeMapCol(colMap, m.state.CursorCol)
+				curCol = safeMapCol(colMap, m.state.CursorCol) - vs
 			}
 			result = append(result, m.renderFindMatchLine(
 				i, displayLine, displayRegions, gutterWidth, defaultStyle, findSpans, curCol, ulRanges))
 		case len(jumpSpans) > 0:
 			curCol := -1
 			if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
-				curCol = safeMapCol(colMap, m.state.CursorCol)
+				curCol = safeMapCol(colMap, m.state.CursorCol) - vs
 			}
 			result = append(result, m.renderHighlightLine(
 				i, displayLine, displayRegions, gutterWidth, defaultStyle, jumpSpans, curCol, ulRanges))
 		case !m.overlayActive() && i == m.state.CursorLine && m.focused:
-			displayCol := safeMapCol(colMap, m.state.CursorCol)
+			displayCol := safeMapCol(colMap, m.state.CursorCol) - vs
 			curCol := -1
 			if m.cursorBlink {
 				curCol = displayCol
@@ -3086,6 +3259,52 @@ func filterUnderlines(uls []highlight.UnderlineRange, startCol, endCol int) []hi
 		result = append(result, clamped)
 	}
 	return result
+}
+
+// shiftClipRegions shifts highlight regions left by shift display columns and
+// clips them to [0, width). Regions that fall entirely outside are dropped.
+func shiftClipRegions(regions []highlight.HighlightRegion, shift, width int) []highlight.HighlightRegion {
+	out := make([]highlight.HighlightRegion, 0, len(regions))
+	for _, r := range regions {
+		s := max(r.StartCol-shift, 0)
+		e := min(r.EndCol-shift, width)
+		if s < e {
+			out = append(out, highlight.HighlightRegion{
+				StartCol: s,
+				EndCol:   e,
+				Category: r.Category,
+			})
+		}
+	}
+	return out
+}
+
+// shiftClipSpans shifts colSpans left by shift display columns and clips
+// them to [0, width). Spans that fall entirely outside are dropped.
+func shiftClipSpans(spans []colSpan, shift, width int) []colSpan {
+	out := make([]colSpan, 0, len(spans))
+	for _, sp := range spans {
+		s := max(sp.start-shift, 0)
+		e := min(sp.end-shift, width)
+		if s < e {
+			out = append(out, colSpan{start: s, end: e, isCurrent: sp.isCurrent})
+		}
+	}
+	return out
+}
+
+// shiftClipUnderlines shifts underline ranges left by shift display columns
+// and clips them to [0, width). Ranges that fall entirely outside are dropped.
+func shiftClipUnderlines(ranges []highlight.UnderlineRange, shift, width int) []highlight.UnderlineRange {
+	out := make([]highlight.UnderlineRange, 0, len(ranges))
+	for _, r := range ranges {
+		s := max(r.StartCol-shift, 0)
+		e := min(r.EndCol-shift, width)
+		if s < e {
+			out = append(out, highlight.UnderlineRange{StartCol: s, EndCol: e})
+		}
+	}
+	return out
 }
 
 

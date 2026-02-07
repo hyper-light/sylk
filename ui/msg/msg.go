@@ -5,6 +5,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/lsp"
+	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui/component"
 )
@@ -324,6 +325,27 @@ type LSPRenameMsg struct {
 	Err      error
 }
 
+// TabNextMsg requests switching to the next editor tab.
+type TabNextMsg struct{}
+
+// TabPrevMsg requests switching to the previous editor tab.
+type TabPrevMsg struct{}
+
+// TabJumpMsg requests switching to a specific tab by 0-indexed position.
+type TabJumpMsg struct{ Index int }
+
+// TabCloseRequestMsg requests closing the tab for the given file path.
+type TabCloseRequestMsg struct{ Path string }
+
+// EscDisambiguateTickMsg fires after the ESC disambiguation timeout to
+// flush a buffered standalone ESC when no follow-up rune arrived. The
+// Gen field matches the generation counter at buffer time so stale ticks
+// (from already-resolved ESC events) are silently ignored.
+type EscDisambiguateTickMsg struct{ Gen uint64 }
+
+// ChordBlockedExpireMsg signals that the blocked-chord hint should auto-dismiss.
+type ChordBlockedExpireMsg struct{}
+
 // ---------------------------------------------------------------------------
 // File tree
 // ---------------------------------------------------------------------------
@@ -398,4 +420,16 @@ type MultiFileReplaceDoneMsg struct {
 	FilesChanged  int
 	TotalReplaced int
 	Skipped       int // Files skipped (unsaved changes in editor).
+}
+
+// ---------------------------------------------------------------------------
+// Git status
+// ---------------------------------------------------------------------------
+
+// GitStatusMsg carries the resolved git status snapshot for the file tree.
+// Paths in all maps are relative to the repository root.
+type GitStatusMsg struct {
+	StatusMap   map[string]git.GitFileState
+	TrackedSet  map[string]struct{}
+	TrackedDirs map[string]struct{}
 }

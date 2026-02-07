@@ -82,7 +82,7 @@ func New(cfg Config) (*Academic, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-
+			
 	// Create skills registry and loader
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := skills.DefaultLoaderConfig()

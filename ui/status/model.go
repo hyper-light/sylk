@@ -40,6 +40,9 @@ type Model struct {
 	spinnerActive bool
 	statusText    string
 
+	// Persistent prompt (takes priority over flash; does not auto-clear).
+	prompt string
+
 	// Flash overlay
 	flash      string
 	flashTicks int
@@ -128,6 +131,22 @@ func (m *Model) SetFlash(text string) {
 	m.flashTicks = flashDurationTicks
 }
 
+// SetPrompt activates a persistent prompt that does not auto-dismiss.
+// It takes priority over flash messages and all other center-section content.
+func (m *Model) SetPrompt(text string) {
+	m.prompt = text
+}
+
+// ClearPrompt removes the active prompt.
+func (m *Model) ClearPrompt() {
+	m.prompt = ""
+}
+
+// HasPrompt reports whether a persistent prompt is active.
+func (m *Model) HasPrompt() bool {
+	return m.prompt != ""
+}
+
 // SetViewRingHint updates the pre-formatted ring indicator string.
 // Pass "" to clear the indicator when all panels are visible.
 func (m *Model) SetViewRingHint(hint string) {
@@ -192,6 +211,9 @@ func (m *Model) renderLeft() string {
 }
 
 func (m *Model) renderCenter() string {
+	if m.prompt != "" {
+		return m.theme.StatusWarning.Render(m.prompt)
+	}
 	if m.flash != "" {
 		return m.theme.StatusNormal.Render(m.flash)
 	}

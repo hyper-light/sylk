@@ -19,7 +19,6 @@ type Manager struct {
 	width        int
 	height       int
 	mode         LayoutMode
-	maxMode      LayoutMode // upper bound on mode selection; -1 = uncapped.
 	panels       []PanelSpec
 	candidates   []ModeCandidate
 	panelIndex   map[component.FocusID]PanelSpec
@@ -34,7 +33,6 @@ func NewManager(width, height int, panels []PanelSpec, candidates []ModeCandidat
 	m := &Manager{
 		width:        width,
 		height:       height,
-		maxMode:      -1,
 		panels:       panels,
 		candidates:   candidates,
 		panelIndex:   buildPanelIndex(panels),
@@ -72,27 +70,6 @@ func (m *Manager) Mode() LayoutMode {
 	defer m.mu.RUnlock()
 
 	return m.mode
-}
-
-// SetMaxMode caps the layout mode to at most the given value. Subsequent
-// calls to SetSize or recompute will not select a mode wider than this.
-// Use ClearMaxMode to remove the cap.
-func (m *Manager) SetMaxMode(mode LayoutMode) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.maxMode = mode
-	m.recompute()
-}
-
-// ClearMaxMode removes the mode cap set by SetMaxMode, allowing the layout
-// to select the widest mode that fits.
-func (m *Manager) ClearMaxMode() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.maxMode = -1
-	m.recompute()
 }
 
 // GetPanelSize returns the computed width and height for a panel by ID.
@@ -177,9 +154,6 @@ func (m *Manager) PanelAtX(x int) (component.FocusID, bool) {
 // dimension maps. Must be called with m.mu held.
 func (m *Manager) recompute() {
 	m.mode = modeForCandidates(m.width, m.candidates, m.panelIndex)
-	if m.maxMode >= 0 && m.mode > m.maxMode {
-		m.mode = m.maxMode
-	}
 	m.sizes = computePanelSizes(m.width, m.height, m.mode, m.candidates, m.panelIndex)
 	m.assignPanelDimensions()
 }

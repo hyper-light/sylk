@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/lsp"
+	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/bridge"
@@ -41,6 +43,7 @@ import (
 	"github.com/adalundhe/sylk/ui/search"
 	sessionpkg "github.com/adalundhe/sylk/ui/session"
 	"github.com/adalundhe/sylk/ui/status"
+	"github.com/adalundhe/sylk/ui/tabbar"
 	"github.com/adalundhe/sylk/ui/theme"
 )
 
@@ -71,23 +74,23 @@ const lspNotifyTimeout = 5 * time.Second
 // feeling responsive for intentional double-taps.
 const overlayToggleDebounce = 150 * time.Millisecond
 
+// tabArrowFlashTicks is the number of ticks the overflow arrow stays highlighted.
+// Derived from: 1 second / 16ms per tick ≈ 63 ticks.
+const tabArrowFlashTicks = 63
+
+// escDisambiguateTimeout is the maximum delay between a standalone ESC byte
+// and a follow-up rune before the ESC is flushed as a real Escape keypress.
+// Derived from: standard terminal practice — vim ttimeoutlen=50, tmux
+// escape-time=50. 50 ms balances fast ESC response with reliable Alt+key
+// detection across SSH and varied terminal emulators.
+const escDisambiguateTimeout = 50 * time.Millisecond
+
 // sourceAgentTUI identifies the TUI as the source agent for guide routing.
 const sourceAgentTUI = "tui"
 
 // ---------------------------------------------------------------------------
 // Overlay state
 // ---------------------------------------------------------------------------
-
-// editorSnapshot captures the state of the inline editor for one file,
-// allowing users to switch between files without losing unsaved edits.
-type editorSnapshot struct {
-	filePath     string
-	content      string
-	language     string
-	cursor       int
-	scrollOffset int
-	modified     bool
-}
 
 // overlayState tracks which overlay (if any) is currently active.
 type overlayState int
@@ -225,6 +228,7 @@ type AppModel struct {
 
 	// State
 	chord             chordState
+	chordBlocked      bool      // Chord triggered in edit mode (display-only, no cycling).
 	lastToggleKey     string    // Last overlay toggle key (debounce guard).
 	lastToggleAt      time.Time // When lastToggleKey was pressed.
 	leftRing          viewRing // Left slot cycling ring (Session/FileTree).
@@ -247,6 +251,16 @@ type AppModel struct {
 	editorMouseDown bool // Left button pressed inside the code panel.
 	editorDragging  bool // Actual drag motion detected after press.
 
+	// Tab bar drag-and-drop reordering.
+	tabDragIdx int // Tab index being dragged (-1 = none).
+
+	// Tab bar close-icon hover highlight.
+	tabHoverClose int // Tab index whose close icon is hovered (-1 = none).
+
+	// Overflow arrow flash counters (remaining ticks at 16ms each).
+	tabArrowFlashLeft  int
+	tabArrowFlashRight int
+
 	// Mouse hover tracking for LSP hover tooltips.
 	hoverMouseLine      int // last buffer line the mouse was over (-1 = none)
 	hoverMouseCol       int // last buffer col for LSP request precision
@@ -265,8 +279,19 @@ type AppModel struct {
 	// Command input tracking: true when ':' activated the input panel.
 	editCmdInput bool
 
-	// Per-file editor snapshots for multi-file editing within a session.
-	editSnapshots map[string]*editorSnapshot
+	// pendingClosePrompt is true while the status bar shows a save-before-close
+	// prompt. While active, handleKey intercepts y/n/esc to resolve it.
+	pendingClosePrompt bool
+
+	// Tiered LRU cache for background tab editor state (undo, buffer, cursor).
+	editorCache *editor.EditorCache
+
+	// Ordered list of open editor tab file paths.
+	tabOrder      []string
+	savedActiveTab string // Path of the active tab saved on exitEditMode for restore.
+
+	// Focus state saved when entering the tabs panel, restored on exit.
+	preTabsFocus component.FocusID
 
 	width  int
 	height int
@@ -274,6 +299,17 @@ type AppModel struct {
 
 	// Font detection result cached from New() to avoid repeated fc-list calls.
 	nerdFontsDetected bool
+
+	// Event-driven git status watcher. Nil when project root is not a git repo.
+	gitWatcher *git.StatusWatcher
+
+	// ESC disambiguation: buffer a standalone ESC for a short window so a
+	// follow-up rune can be merged into an Alt+rune KeyMsg. This mirrors
+	// vim's ttimeoutlen / tmux's escape-time mechanism.
+	escPending bool
+	escKey     tea.KeyMsg
+	escAt      time.Time
+	escGen     uint64
 }
 
 // viewRing tracks a cycling list of panels for a swappable layout slot.
@@ -370,7 +406,6 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		layout:           layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
 		focus:            layout.NewFocusManager(defaultTabOrder),
 		chat:             chat.New(th, cfg.ChatHistoryCapacity),
-		input:            inputpkg.New(th, cfg.InputHistoryCapacity),
 		statusBar:        status.New(th, deps.SessionManager),
 		sessionPanel:     sessionpkg.New(deps.SessionManager, th),
 		agentPanel:       agentpkg.New(th),
@@ -379,7 +414,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		fileTree:         filetree.New(th),
 		editorOverlay:    editor.New(th),
 		inlineEditor:     editor.New(th),
-		editSnapshots:    make(map[string]*editorSnapshot),
+		editorCache:      editor.NewEditorCache(editor.CacheConfig{}),
 		modalOverlay:     modal.New(th),
 		searchOverlay:    search.New(th, search.NewProviderRegistry()),
 		activityBridge:   bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
@@ -394,8 +429,11 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		bounceSpring:     harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
 		hoverMouseLine:   -1,
 		highlightLine:   -1,
+		tabDragIdx:      -1,
+		tabHoverClose:   -1,
 	}
 	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
+	app.input = inputpkg.New(th, cfg.InputHistoryCapacity, &tabCompleter{tabOrder: &app.tabOrder})
 	app.syncFocusState()
 
 	// Nerd Font detection: the font must be installed AND a fontconfig
@@ -403,6 +441,13 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	// resolve PUA codepoints to Symbols Nerd Font).
 	app.nerdFontsDetected = fonts.Detected()
 	app.fileTree.SetNerdFonts(app.nerdFontsDetected)
+
+	// Git status watcher for file tree decorations.
+	if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
+		if sw, err := git.NewStatusWatcher(gc); err == nil {
+			app.gitWatcher = sw
+		}
+	}
 
 	return app
 }
@@ -417,6 +462,10 @@ func (m *AppModel) Init() tea.Cmd {
 	if !m.nerdFontsDetected {
 		cmds = append(cmds, m.installNerdFontsCmd())
 	}
+	if m.gitWatcher != nil {
+		m.gitWatcher.Start(m.ctx)
+		cmds = append(cmds, m.gitWatchCmd())
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -427,6 +476,35 @@ func (m *AppModel) installNerdFontsCmd() tea.Cmd {
 	return func() tea.Msg {
 		err := fonts.InstallCtx(ctx)
 		return msg.NerdFontsResultMsg{Available: err == nil}
+	}
+}
+
+// gitWatchCmd returns a Cmd that blocks on the git status watcher channel,
+// returning the next status update as a GitStatusMsg. Returns nil when the
+// watcher is not active.
+func (m *AppModel) gitWatchCmd() tea.Cmd {
+	if m.gitWatcher == nil {
+		return nil
+	}
+	ch := m.gitWatcher.Events()
+	return func() tea.Msg {
+		update, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg.GitStatusMsg{
+			StatusMap:   update.StatusMap,
+			TrackedSet:  update.TrackedSet,
+			TrackedDirs: update.TrackedDirs,
+		}
+	}
+}
+
+// nudgeGitWatcher signals the watcher to refresh soon. Safe to call when
+// the watcher is nil (non-git projects).
+func (m *AppModel) nudgeGitWatcher() {
+	if m.gitWatcher != nil {
+		m.gitWatcher.Nudge()
 	}
 }
 
@@ -474,13 +552,16 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.FileOpenMsg:
 		return m, m.handleFileOpen(typed)
 	case msg.FileTreeEntryCreatedMsg:
+		m.nudgeGitWatcher()
 		if !typed.IsDir {
 			return m, func() tea.Msg { return msg.FileOpenMsg{Path: typed.Path} }
 		}
 		return m, nil
 	case msg.FileTreeEntryRenamedMsg:
+		m.nudgeGitWatcher()
 		return m, nil
 	case msg.FileTreeEntryDeletedMsg:
+		m.nudgeGitWatcher()
 		if m.codePanel.FilePath() == typed.Path {
 			m.codePanel.ClearFile()
 		}
@@ -489,6 +570,9 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.fileTree.SetActiveFile("")
 		return m, nil
+	case msg.GitStatusMsg:
+		m.fileTree.SetGitStatus(typed.StatusMap, typed.TrackedSet, typed.TrackedDirs)
+		return m, m.gitWatchCmd()
 	case msg.FileReplacedMsg:
 		return m, m.handleFileReplaced(typed)
 	case msg.MultiFileReplaceDoneMsg:
@@ -595,6 +679,27 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleLSPRename(typed)
 	case msg.LSPFormatMsg:
 		return m, m.handleLSPFormat(typed)
+	case msg.TabNextMsg:
+		return m, m.nextTab()
+	case msg.TabPrevMsg:
+		return m, m.prevTab()
+	case msg.TabJumpMsg:
+		return m, m.switchToTab(typed.Index)
+	case msg.TabCloseRequestMsg:
+		return m, m.closeTabByPath(typed.Path)
+	case msg.EscDisambiguateTickMsg:
+		if m.escPending && typed.Gen == m.escGen {
+			m.escPending = false
+			m.escGen++
+			return m.dispatchKey(m.escKey)
+		}
+		return m, nil
+	case msg.ChordBlockedExpireMsg:
+		if m.chordBlocked {
+			m.chord = chordNone
+			m.chordBlocked = false
+		}
+		return m, nil
 	case msg.NerdFontsResultMsg:
 		// Don't switch icon mode mid-session — the terminal won't render
 		// newly-installed Nerd Font glyphs until restarted. The install
@@ -664,7 +769,55 @@ func (m *AppModel) handleResize(sz tea.WindowSizeMsg) tea.Cmd {
 	return nil
 }
 
+// handleKey wraps dispatchKey with ESC/Alt disambiguation. Terminals encode
+// Alt+<rune> as ESC (0x1b) followed by the rune byte. When these arrive in a
+// single read, Bubble Tea correctly sets Key.Alt. When they arrive in
+// separate reads (SSH latency, slow terminals), Bubble Tea emits a standalone
+// KeyEscape followed by a KeyRunes — losing the Alt modifier. This layer
+// buffers a standalone ESC for up to escDisambiguateTimeout, and if a single
+// printable rune follows within that window it synthesises the correct
+// Alt+rune KeyMsg. The mechanism mirrors vim's ttimeoutlen and tmux's
+// escape-time.
 func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Resolve a previously buffered ESC.
+	if m.escPending {
+		m.escPending = false
+		m.escGen++
+
+		if time.Since(m.escAt) < escDisambiguateTimeout &&
+			key.Type == tea.KeyRunes && len(key.Runes) == 1 && !key.Alt {
+			// Synthesise Alt+rune from the buffered ESC + this rune.
+			synth := tea.KeyMsg(tea.Key{
+				Type:  tea.KeyRunes,
+				Runes: key.Runes,
+				Alt:   true,
+			})
+			return m.dispatchKey(synth)
+		}
+
+		// ESC followed by a non-rune key or after the timeout — flush ESC
+		// first so it takes effect (e.g. exit insert mode), then process the
+		// current key with updated state.
+		_, escCmd := m.dispatchKey(m.escKey)
+		model, keyCmd := m.dispatchKey(key)
+		return model, tea.Batch(escCmd, keyCmd)
+	}
+
+	// Buffer a standalone ESC for disambiguation.
+	if key.Type == tea.KeyEscape && !key.Alt {
+		m.escPending = true
+		m.escKey = key
+		m.escAt = time.Now()
+		gen := m.escGen
+		return m, tea.Tick(escDisambiguateTimeout, func(_ time.Time) tea.Msg {
+			return msg.EscDisambiguateTickMsg{Gen: gen}
+		})
+	}
+
+	return m.dispatchKey(key)
+}
+
+func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Ctrl+C / Ctrl+Shift+C: copy selection in edit mode, otherwise interrupt.
 	ks := key.String()
 	if ks == "ctrl+c" || ks == "ctrl+shift+c" {
@@ -683,6 +836,11 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, func() tea.Msg { return result }
 		}
 		return m, nil
+	}
+
+	// Save-before-close prompt intercepts all keys while active.
+	if m.pendingClosePrompt {
+		return m.handleSavePromptKey(key)
 	}
 
 	// Select all in the focused component (Alt+Shift+A).
@@ -749,6 +907,33 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Alt+1..9: jump to tab by number (1-indexed).
+	if len(ks) == 5 && ks[:4] == "alt+" && ks[4] >= '1' && ks[4] <= '9' {
+		return m, m.switchToTab(int(ks[4] - '1'))
+	}
+
+	// Alt+T toggles the tabs panel in the file tree (edit mode only).
+	if ks == "alt+t" && m.editMode {
+		return m, m.toggleTabsPanel()
+	}
+
+	// Alt+Enter closes a tab: cursor tab in tabs panel, or active tab in editor.
+	if ks == "alt+enter" && m.editMode {
+		if m.focus.Current() == component.FocusFileTree && m.fileTree.InTabsMode() {
+			if p := m.fileTree.TabCursorPath(); p != "" {
+				return m, m.closeTabByPath(p)
+			}
+			return m, nil
+		}
+		if m.focus.Current() == component.FocusCodeViewer {
+			idx := m.activeTabIndex()
+			if idx >= 0 {
+				return m, m.closeTab(idx)
+			}
+		}
+		return m, nil
+	}
+
 	// Alt+E toggles inline edit mode.
 	if key.String() == "alt+e" {
 		return m, m.toggleEditMode()
@@ -757,7 +942,7 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Escape: close references panel if active, abort command input,
 	// route to editor in edit mode, or double-tap to interrupt agent.
 	if key.String() == "esc" {
-		if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode()) && m.focus.Current() == component.FocusFileTree {
+		if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode() || m.fileTree.InTabsMode()) && m.focus.Current() == component.FocusFileTree {
 			m.fileTree.Update(key)
 			return m, nil
 		}
@@ -780,6 +965,13 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.lastEscTime = now
 		m.statusBar.SetFlash("Press Esc again to interrupt agent")
 		return m, nil
+	}
+
+	// Shift+Tab in edit mode normal: cycle to next tab.
+	if ks == "shift+tab" && m.editMode &&
+		m.focus.Current() == component.FocusCodeViewer &&
+		m.inlineEditor.IsNormalMode() && len(m.tabOrder) > 0 {
+		return m, m.nextTab()
 	}
 
 	// Colon in edit mode normal: activate command input panel.
@@ -839,7 +1031,8 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Alt+F toggles multi-file search when the file tree has focus.
+	// Alt+F toggles search/filter when the file tree has focus.
+	// In tabs mode it toggles the tab filter; otherwise multi-file search.
 	if ks == "alt+f" && m.focus.Current() == component.FocusFileTree {
 		now := time.Now()
 		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
@@ -848,7 +1041,11 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.lastToggleKey = ks
 		m.lastToggleAt = now
 		m.chord = chordNone
-		m.fileTree.ToggleSearch()
+		if m.fileTree.InTabsMode() {
+			m.fileTree.ToggleTabFilter()
+		} else {
+			m.fileTree.ToggleSearch()
+		}
 		return m, nil
 	}
 
@@ -875,6 +1072,12 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.lspFormatCmd(fp, flushContent, m.inlineEditor.EditGeneration())
 		}
+	}
+
+	// Alt+Shift+S: save the current editor buffer.
+	if ks == "alt+S" && m.editMode && m.focus.Current() == component.FocusCodeViewer {
+		m.saveEditorBuffer()
+		return m, nil
 	}
 
 	// Two-key chord: S then Left/Right (sessions), A then Left/Right (agents).
@@ -932,6 +1135,14 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 	m.fileTree.Update(tick)
 	m.tickScrollMomentum()
 	m.tickSwipeDecay()
+
+	// Decay tab arrow flash counters.
+	if m.tabArrowFlashLeft > 0 {
+		m.tabArrowFlashLeft--
+	}
+	if m.tabArrowFlashRight > 0 {
+		m.tabArrowFlashRight--
+	}
 
 	// Refresh ring hint so streaming activity badge stays current.
 	if !m.leftRing.empty() || !m.rightRing.empty() {
@@ -1688,18 +1899,11 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 	lspContent := content
 
 	if m.editMode {
-		// Close the previous document before switching.
 		oldPath := m.inlineEditor.FilePath()
-		if oldPath != "" && oldPath != o.Path {
-			m.lspDidCloseAsync(oldPath)
-		}
 
-		// Save current editor state before switching.
-		m.snapshotCurrentEditor()
-
-		// Restore from snapshot if available, otherwise load from disk.
-		if m.inlineEditor.FilePath() == o.Path {
-			// Already on this file — no switch needed, just jump.
+		// Already on this file — no switch needed, just jump.
+		if oldPath == o.Path {
+			m.appendTab(o.Path)
 			if o.Line > 0 {
 				targetLine := o.Line - 1
 				m.inlineEditor.GoToLine(targetLine)
@@ -1707,9 +1911,24 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 				m.setJumpMarker(targetLine, o.Col, o.EndCol)
 			}
 			return nil
-		} else if snap, ok := m.editSnapshots[o.Path]; ok {
-			m.restoreEditorSnapshot(snap)
-			lspContent = snap.content
+		}
+
+		// Close the previous LSP document before switching.
+		if oldPath != "" {
+			m.lspDidCloseAsync(oldPath)
+		}
+
+		// Detach current editor state into the tiered cache.
+		m.detachCurrentEditor()
+
+		// Track the new file in the tab bar and resize the editor
+		// so the tab bar doesn't push content past the panel bottom.
+		m.appendTab(o.Path)
+		m.resizeInlineEditor()
+
+		// Restore from cache if available, otherwise load from disk.
+		if m.restoreFromCache(o.Path) {
+			lspContent = m.inlineEditor.Content()
 		} else {
 			m.inlineEditor.OpenFile(o.Path, content, o.Language)
 		}
@@ -1782,7 +2001,7 @@ func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
 	lang := detectEditorLanguage(path)
 	m.inlineEditor.OpenFile(path, content, lang)
 	m.codePanel.SetContent(content, path, lang)
-	delete(m.editSnapshots, path)
+	m.editorCache.Delete(path)
 	return nil
 }
 
@@ -1846,7 +2065,13 @@ var chordDisplays = map[chordState]chordDisplay{
 }
 
 // chordHint returns a styled hint string when a chord is active, or "" when idle.
+// Blocked chords (edit mode) render as "Exit edit mode to <action>" instead of
+// the normal cycling hint, so chordBlocked hints are only rendered by
+// codePanelView (not overlayChordHint on other panels).
 func (m *AppModel) chordHint(th *theme.Theme) string {
+	if m.chordBlocked {
+		return ""
+	}
 	disp, ok := chordDisplays[m.chord]
 	if !ok {
 		return ""
@@ -1854,6 +2079,21 @@ func (m *AppModel) chordHint(th *theme.Theme) string {
 	labelStyle := lipgloss.NewStyle().Foreground(disp.color(&th.Palette)).Bold(true)
 	keyStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	return labelStyle.Render(disp.label) + keyStyle.Render("  "+disp.keys+"  any key to exit ")
+}
+
+// blockedChordHint returns a styled hint for a chord blocked by edit mode.
+// Returns "" when no blocked chord is active.
+func (m *AppModel) blockedChordHint(th *theme.Theme) string {
+	if !m.chordBlocked {
+		return ""
+	}
+	disp, ok := chordDisplays[m.chord]
+	if !ok {
+		return ""
+	}
+	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+	labelStyle := lipgloss.NewStyle().Foreground(disp.color(&th.Palette)).Bold(true)
+	return mutedStyle.Render("Exit edit mode to ") + labelStyle.Render(disp.label) + mutedStyle.Render("  (press any key to dismiss) ")
 }
 
 // handleChord processes two-key chord shortcuts: Alt+S then Left/Right for sessions,
@@ -1868,8 +2108,25 @@ var chordKeyMap = map[string]chordState{
 }
 
 func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
+	// Blocked chord: any key dismisses the hint.
+	if m.chordBlocked {
+		m.chord = chordNone
+		m.chordBlocked = false
+		return nil, true
+	}
+
 	// Chord triggers: toggle on if idle or switching, toggle off if repeated.
 	if target, ok := chordKeyMap[key.String()]; ok {
+		// Edit mode guard: chords are disabled while editing. Show the
+		// blocked hint bar so the user knows to exit first.
+		if m.editMode {
+			m.chord = target
+			m.chordBlocked = true
+			cmd := tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
+				return msg.ChordBlockedExpireMsg{}
+			})
+			return cmd, true
+		}
 		// Focus guard: some chords only activate with a specific pane focused.
 		if required, guarded := chordFocusGuard[target]; guarded && m.focus.Current() != required {
 			return nil, false
@@ -1887,15 +2144,6 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 			m.chord = chordNone
 		} else {
 			m.chord = target
-			// Dismiss find/replace bar — only one overlay at a time.
-			if m.editMode {
-				if m.inlineEditor.ReplaceActive() {
-					m.inlineEditor.CloseReplaceBar()
-				}
-				if m.inlineEditor.FindActive() {
-					m.inlineEditor.CloseFindBar()
-				}
-			}
 		}
 		return nil, true
 	}
@@ -1991,6 +2239,10 @@ func (m *AppModel) toggleEditMode() tea.Cmd {
 // Returns a Cmd that sends didOpen so the LSP client tracks the document
 // for subsequent didChange notifications. Idempotent if already tracked.
 func (m *AppModel) enterEditMode() tea.Cmd {
+	// Dismiss any active chord — chords are unsupported in edit mode.
+	m.chord = chordNone
+	m.chordBlocked = false
+
 	// Save ring state and focus.
 	m.savedLeftIdx = m.leftRing.index
 	m.savedRightIdx = m.rightRing.index
@@ -2007,23 +2259,41 @@ func (m *AppModel) enterEditMode() tea.Cmd {
 		m.leftRing.setTo(component.FocusCodeViewer)
 	}
 
-	// Load the editor with the current file, or leave empty for placeholder.
+	// Restore tab order from a previous edit session, or initialise from
+	// the code panel's current file.
 	var lspCmd tea.Cmd
-	if fp := m.codePanel.FilePath(); fp != "" {
+	if len(m.tabOrder) > 0 {
+		// Re-entering edit mode — restore the last-active tab.
+		idx := 0
+		for i, p := range m.tabOrder {
+			if p == m.savedActiveTab {
+				idx = i
+				break
+			}
+		}
+		fp := m.tabOrder[idx]
 		var content string
-		if snap, ok := m.editSnapshots[fp]; ok {
-			m.restoreEditorSnapshot(snap)
-			content = snap.content
+		if m.restoreFromCache(fp) {
+			content = m.inlineEditor.Content()
+		} else {
+			data, _ := os.ReadFile(fp)
+			content = string(data)
+			m.inlineEditor.OpenFile(fp, content, detectEditorLanguage(fp))
+		}
+		m.fileTree.SetActiveFile(fp)
+		m.fileTree.RevealPath(fp)
+		lspCmd = m.lspReopenCmd(fp, detectEditorLanguage(fp), content)
+	} else if fp := m.codePanel.FilePath(); fp != "" {
+		m.tabOrder = []string{fp}
+		var content string
+		if m.restoreFromCache(fp) {
+			content = m.inlineEditor.Content()
 		} else {
 			content = m.codePanel.Content()
 			m.inlineEditor.OpenFile(fp, content, m.codePanel.Language())
 		}
 		m.fileTree.SetActiveFile(fp)
 		m.fileTree.RevealPath(fp)
-
-		// Atomically close then re-open so the LSP document tracker
-		// is always in a clean state, regardless of whether a prior
-		// exitEditMode's async didClose has completed yet.
 		lspCmd = m.lspReopenCmd(fp, detectEditorLanguage(fp), content)
 	} else {
 		m.inlineEditor.ClearFile()
@@ -2031,7 +2301,7 @@ func (m *AppModel) enterEditMode() tea.Cmd {
 
 	// Size the editor to match the code panel slot.
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
-	m.inlineEditor.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
+	m.inlineEditor.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize-m.tabBarHeight(), 1))
 
 	m.editMode = true
 	m.statusBar.SetMode("EDIT")
@@ -2050,14 +2320,16 @@ func (m *AppModel) exitEditMode() {
 	// atomically by lspReopenCmd when the user re-enters edit mode, which
 	// avoids a race condition between async didClose and async didOpen.
 
-	// Save current editor state so re-entering edit mode restores it.
-	m.snapshotCurrentEditor()
+	// Capture content for the code panel before detaching the editor.
+	content := m.inlineEditor.Content()
+	fp := m.inlineEditor.FilePath()
+	lang := m.inlineEditor.Language()
 
-	m.codePanel.SetContent(
-		m.inlineEditor.Content(),
-		m.inlineEditor.FilePath(),
-		m.inlineEditor.Language(),
-	)
+	// Save current editor state so re-entering edit mode restores it.
+	m.savedActiveTab = fp
+	m.detachCurrentEditor()
+
+	m.codePanel.SetContent(content, fp, lang)
 
 	// Restore ring state.
 	m.leftRing.index = m.savedLeftIdx
@@ -2065,6 +2337,10 @@ func (m *AppModel) exitEditMode() {
 
 	m.editMode = false
 	m.editCmdInput = false
+	m.chord = chordNone
+	m.chordBlocked = false
+	// tabOrder is intentionally preserved so re-entering edit mode
+	// restores all previously open tabs.
 	m.statusBar.SetMode("CHAT")
 	m.input.SetPlaceholder("Type a message...")
 	m.focus.SetFocus(m.savedFocus)
@@ -2092,40 +2368,46 @@ func (m *AppModel) exitCmdInput() {
 	m.syncFocusState()
 }
 
-// snapshotCurrentEditor saves the inline editor's current state so it can
-// be restored when the user switches back to this file.
-func (m *AppModel) snapshotCurrentEditor() {
-	path := m.inlineEditor.FilePath()
-	if path == "" {
+// detachCurrentEditor extracts the current editor's per-file state and
+// stores it in the tiered cache. No-op if no file is loaded.
+func (m *AppModel) detachCurrentEditor() {
+	ws := m.inlineEditor.Detach()
+	if ws.FilePath == "" {
 		return
 	}
-	m.editSnapshots[path] = &editorSnapshot{
-		filePath:     path,
-		content:      m.inlineEditor.Content(),
-		language:     m.inlineEditor.Language(),
-		cursor:       m.inlineEditor.CursorPos(),
-		scrollOffset: m.inlineEditor.ScrollOffset(),
-		modified:     m.inlineEditor.Modified(),
-	}
+	m.editorCache.Put(ws)
 }
 
-// restoreEditorSnapshot loads a previously saved editor state, including
-// buffer content, cursor position, and scroll offset.
-func (m *AppModel) restoreEditorSnapshot(snap *editorSnapshot) {
-	m.inlineEditor.OpenFile(snap.filePath, snap.content, snap.language)
-	m.inlineEditor.RestoreState(snap.cursor, snap.scrollOffset)
+// restoreFromCache attempts to restore the editor from the tiered cache.
+// Returns true if the entry was found and restored, false otherwise.
+func (m *AppModel) restoreFromCache(path string) bool {
+	entry, ok := m.editorCache.Take(path)
+	if !ok {
+		return false
+	}
+	if entry.IsWarm() {
+		m.inlineEditor.AttachWarm(entry.Warm())
+		return true
+	}
+	m.inlineEditor.AttachCold(entry.Cold())
+	return true
 }
 
 // exCmdInfo describes a known ex command and its argument requirement.
 type exCmdInfo struct {
-	argHint string // Non-empty means the command requires an argument.
+	argHint     string // Non-empty means the command accepts an argument.
+	optionalArg bool   // When true, command is valid with or without the arg.
 }
 
 // knownExCommands maps command words to their validation info.
 var knownExCommands = map[string]exCmdInfo{
 	"w": {}, "q": {}, "wq": {}, "x": {}, "q!": {},
 	"symbols": {}, "format": {}, "fmt": {},
-	"rename": {argHint: "<newname>"},
+	"rename":   {argHint: "<newname>"},
+	"tabn":     {argHint: "[N]", optionalArg: true},
+	"tabp":     {},
+	"tabclose": {},
+	"tab":      {argHint: "<filename>"},
 }
 
 // validateExCommand checks the typed text against known commands.
@@ -2141,6 +2423,9 @@ func validateExCommand(text string) (known, valid bool, hint string) {
 	}
 	if info.argHint == "" {
 		return true, true, ""
+	}
+	if info.optionalArg {
+		return true, true, info.argHint
 	}
 	if hasArgs && strings.TrimSpace(args) != "" {
 		return true, true, ""
@@ -2181,17 +2466,16 @@ func (m *AppModel) handleExCommand(text string) tea.Cmd {
 	case "w":
 		m.saveEditorBuffer()
 	case "q":
-		if m.inlineEditor.Modified() {
-			m.statusBar.SetFlash("Unsaved changes (use :q! to discard)")
-			return nil
-		}
-		m.exitEditMode()
+		return m.closeCurrentTab(false)
 	case "wq", "x":
 		m.saveEditorBuffer()
-		m.exitEditMode()
+		return m.closeCurrentTab(false)
 	case "q!":
-		delete(m.editSnapshots, m.inlineEditor.FilePath())
-		m.exitEditMode()
+		return m.closeCurrentTab(true)
+	case "tabp":
+		return m.prevTab()
+	case "tabclose":
+		return m.closeCurrentTab(false)
 	case "symbols":
 		if fp := m.inlineEditor.FilePath(); fp != "" {
 			return m.lspDocumentSymbolCmd(fp)
@@ -2206,6 +2490,21 @@ func (m *AppModel) handleExCommand(text string) tea.Cmd {
 			return m.lspFormatCmd(fp, flushContent, m.inlineEditor.EditGeneration())
 		}
 	default:
+		if cmd == "tabn" || strings.HasPrefix(cmd, "tabn ") {
+			rest := strings.TrimSpace(strings.TrimPrefix(cmd, "tabn"))
+			if rest == "" {
+				return m.nextTab()
+			}
+			n, err := strconv.Atoi(rest)
+			if err != nil || n < 1 {
+				m.statusBar.SetFlash("Usage: :tabn [N]")
+				return nil
+			}
+			return m.switchToTab(n - 1)
+		}
+		if name, ok := strings.CutPrefix(cmd, "tab "); ok {
+			return m.handleTabCommand(strings.TrimSpace(name))
+		}
 		if newName, ok := strings.CutPrefix(cmd, "rename "); ok {
 			return m.handleRenameCommand(strings.TrimSpace(newName))
 		}
@@ -2239,6 +2538,53 @@ func (m *AppModel) handleRenameCommand(newName string) tea.Cmd {
 	return m.lspRenameCmd(fp, line, col, newName)
 }
 
+// tabCompleter provides tab-completion candidates from open tabs for the
+// :tab ex command. Implements input.CompletionProvider.
+type tabCompleter struct {
+	tabOrder *[]string
+}
+
+func (tc *tabCompleter) Name() string { return "tabs" }
+
+func (tc *tabCompleter) Complete(prefix string, limit int) []Candidate {
+	if tc.tabOrder == nil {
+		return nil
+	}
+	lower := strings.ToLower(prefix)
+	var out []Candidate
+	for _, p := range *tc.tabOrder {
+		base := filepath.Base(p)
+		if prefix == "" || strings.Contains(strings.ToLower(base), lower) {
+			out = append(out, Candidate{
+				Text:    base,
+				Display: base,
+			})
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// Candidate is an alias for the input completion candidate type.
+type Candidate = inputpkg.Candidate
+
+// handleTabCommand switches to an open tab matching the given filename.
+func (m *AppModel) handleTabCommand(name string) tea.Cmd {
+	if name == "" {
+		m.statusBar.SetFlash("Usage: :tab <filename>")
+		return nil
+	}
+	for i, p := range m.tabOrder {
+		if filepath.Base(p) == name {
+			return m.switchToTab(i)
+		}
+	}
+	m.statusBar.SetFlash("No open tab: " + name)
+	return nil
+}
+
 // saveEditorBuffer writes the inline editor buffer to disk.
 func (m *AppModel) saveEditorBuffer() {
 	path := m.inlineEditor.FilePath()
@@ -2254,7 +2600,7 @@ func (m *AppModel) saveEditorBuffer() {
 	m.inlineEditor.MarkSaved()
 	m.lspDidSaveAsync(path, content)
 	m.codePanel.SetContent(content, path, m.inlineEditor.Language())
-	m.snapshotCurrentEditor()
+	m.nudgeGitWatcher()
 	m.statusBar.SetFlash("Saved " + path)
 }
 
@@ -2262,9 +2608,368 @@ func (m *AppModel) saveEditorBuffer() {
 // switching between the inline editor and the read-only viewer.
 func (m *AppModel) codePanelView() string {
 	if m.editMode {
-		return m.inlineEditor.View()
+		content := m.inlineEditor.View()
+		bar := m.tabBarView()
+		if bar != "" {
+			content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
+		}
+		return m.overlayBlockedChord(content)
 	}
 	return m.codePanel.View()
+}
+
+// overlayBlockedChord prepends the blocked-chord hint bar to content when a
+// chord was triggered in edit mode. Trims content from the bottom so the total
+// line count stays within the panel's inner height.
+func (m *AppModel) overlayBlockedChord(content string) string {
+	th := m.config.Theme()
+	hint := m.blockedChordHint(th)
+	if hint == "" {
+		return content
+	}
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(w-panelBorderSize, 1)
+	innerH := max(h-panelBorderSize, 1)
+	hintWidth := lipgloss.Width(hint)
+	pad := max(innerW-hintWidth, 0)
+	divider := lipgloss.NewStyle().
+		Foreground(th.Palette.Border).
+		Render(strings.Repeat("\u2500", innerW))
+
+	lines := strings.Split(content, "\n")
+	maxContent := max(innerH-chordHintLines, 0)
+	if len(lines) > maxContent {
+		lines = lines[:maxContent]
+	}
+	return strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + strings.Join(lines, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Tab bar
+// ---------------------------------------------------------------------------
+
+// tabBarView renders the tab bar. Returns "" when there are no tabs.
+func (m *AppModel) tabBarView() string {
+	if len(m.tabOrder) == 0 {
+		return ""
+	}
+	return tabbar.View(m.tabBarConfig())
+}
+
+// appendTab adds a file path to the tab order if not already present.
+func (m *AppModel) appendTab(path string) {
+	for _, p := range m.tabOrder {
+		if p == path {
+			return
+		}
+	}
+	m.tabOrder = append(m.tabOrder, path)
+}
+
+// removeTab removes a file path from the tab order.
+func (m *AppModel) removeTab(path string) {
+	for i, p := range m.tabOrder {
+		if p == path {
+			m.tabOrder = append(m.tabOrder[:i], m.tabOrder[i+1:]...)
+			return
+		}
+	}
+}
+
+// activeTabIndex returns the index of the active file in tabOrder.
+func (m *AppModel) activeTabIndex() int {
+	current := m.inlineEditor.FilePath()
+	for i, p := range m.tabOrder {
+		if p == current {
+			return i
+		}
+	}
+	return 0
+}
+
+// handleTabBarClick processes a click on the tab bar: close-icon clicks close
+// the tab, other clicks begin a drag (and switch to the tab on release if no
+// reordering occurred).
+func (m *AppModel) handleTabBarClick(viewX int) (bool, tea.Cmd) {
+	cfg := m.tabBarConfig()
+	hit := tabbar.HitTest(cfg, viewX)
+	if hit.IsLeftNav {
+		m.tabArrowFlashLeft = tabArrowFlashTicks
+		return true, m.prevTab()
+	}
+	if hit.IsRightNav {
+		m.tabArrowFlashRight = tabArrowFlashTicks
+		return true, m.nextTab()
+	}
+	if hit.TabIndex < 0 || hit.TabIndex >= len(m.tabOrder) {
+		return true, nil
+	}
+	if hit.IsClose {
+		return true, m.closeTab(hit.TabIndex)
+	}
+	// Begin drag and immediately switch to the pressed tab.
+	m.tabDragIdx = hit.TabIndex
+	return true, m.switchToTab(hit.TabIndex)
+}
+
+// updateTabHoverClose updates the tab close-icon hover state from a motion event.
+func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
+	if m.tabBarHeight() == 0 || !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		m.tabHoverClose = -1
+		return
+	}
+	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+	if viewY >= m.tabBarHeight() {
+		m.tabHoverClose = -1
+		return
+	}
+	hit := tabbar.HitTest(m.tabBarConfig(), viewX)
+	if hit.IsClose {
+		m.tabHoverClose = hit.TabIndex
+	} else {
+		m.tabHoverClose = -1
+	}
+}
+
+// updateFileTreeTabHover updates the tab close-icon hover state in the
+// file tree's tabs panel from a mouse motion event.
+func (m *AppModel) updateFileTreeTabHover(mouse tea.MouseMsg) {
+	if !m.fileTree.InTabsMode() || !m.isFileTreeVisible() {
+		m.fileTree.ClearTabCloseHover()
+		return
+	}
+	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)
+	if treeW == 0 || treeH == 0 {
+		m.fileTree.ClearTabCloseHover()
+		return
+	}
+	treeX := m.fileTreePanelX()
+	innerH := max(treeH-panelBorderSize, 0)
+	contentLeft := treeX + 1
+	contentRight := treeX + treeW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if mouse.X < contentLeft || mouse.X >= contentRight ||
+		mouse.Y < contentTop || mouse.Y >= contentBottom {
+		m.fileTree.ClearTabCloseHover()
+		return
+	}
+	viewX := mouse.X - contentLeft
+	viewY := mouse.Y - contentTop
+	m.fileTree.HoverAt(viewX, viewY)
+}
+
+// tabBarConfig builds the tabbar.Config for the current state.
+func (m *AppModel) tabBarConfig() tabbar.Config {
+	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+
+	tabs := make([]tabbar.Tab, len(m.tabOrder))
+	currentPath := m.inlineEditor.FilePath()
+	activeIdx := 0
+	for i, path := range m.tabOrder {
+		modified := false
+		if path == currentPath {
+			activeIdx = i
+			modified = m.inlineEditor.Modified()
+		} else {
+			modified = m.editorCache.IsModified(path)
+		}
+		tabs[i] = tabbar.Tab{Path: path, Modified: modified}
+	}
+
+	return tabbar.Config{
+		Tabs:       tabs,
+		Active:     activeIdx,
+		Width:      innerW,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      m.config.Theme(),
+		FlashLeft:  m.tabArrowFlashLeft > 0,
+		FlashRight: m.tabArrowFlashRight > 0,
+		HoverClose: m.tabHoverClose,
+	}
+}
+
+// tabBarHeight returns the tab bar height (tabs + divider) when visible, 0 otherwise.
+func (m *AppModel) tabBarHeight() int {
+	if len(m.tabOrder) > 0 {
+		return tabbar.Height
+	}
+	return 0
+}
+
+// resizeInlineEditor re-applies the correct size to the inline editor,
+// accounting for the current tab bar visibility. Call after any tab mutation.
+func (m *AppModel) resizeInlineEditor() {
+	if !m.editMode {
+		return
+	}
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.inlineEditor.SetSize(
+		max(rightW-panelBorderSize, 1),
+		max(rightH-panelBorderSize-m.tabBarHeight(), 1),
+	)
+}
+
+// switchToTab switches the editor to the tab at the given index.
+func (m *AppModel) switchToTab(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(m.tabOrder) {
+		return nil
+	}
+	target := m.tabOrder[idx]
+	if target == m.inlineEditor.FilePath() {
+		return nil
+	}
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     target,
+			Name:     filepath.Base(target),
+			Language: detectEditorLanguage(target),
+		}
+	}
+}
+
+// nextTab switches to the next tab (wraps around).
+func (m *AppModel) nextTab() tea.Cmd {
+	if len(m.tabOrder) < 2 {
+		return nil
+	}
+	idx := (m.activeTabIndex() + 1) % len(m.tabOrder)
+	return m.switchToTab(idx)
+}
+
+// prevTab switches to the previous tab (wraps around).
+func (m *AppModel) prevTab() tea.Cmd {
+	if len(m.tabOrder) < 2 {
+		return nil
+	}
+	idx := (m.activeTabIndex() - 1 + len(m.tabOrder)) % len(m.tabOrder)
+	return m.switchToTab(idx)
+}
+
+// toggleTabsPanel toggles the tabs list view in the file tree panel.
+// When entering, saves current focus and focuses the file tree.
+// When exiting, restores the previously focused panel.
+func (m *AppModel) toggleTabsPanel() tea.Cmd {
+	if m.fileTree.InTabsMode() {
+		m.fileTree.ExitTabs()
+		m.focus.SetFocus(m.preTabsFocus)
+		m.syncFocusState()
+		return nil
+	}
+	m.preTabsFocus = m.focus.Current()
+	m.fileTree.SetTabs(m.tabOrder, m.inlineEditor.FilePath())
+	if !m.isFileTreeVisible() {
+		m.leftRing.setTo(component.FocusFileTree)
+	}
+	m.focus.SetFocus(component.FocusFileTree)
+	m.syncFocusState()
+	return nil
+}
+
+// handleSavePromptKey processes y/n/esc while the save-before-close prompt
+// is active. All other keys are swallowed until the prompt is resolved.
+func (m *AppModel) handleSavePromptKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "y":
+		m.statusBar.ClearPrompt()
+		m.pendingClosePrompt = false
+		m.saveEditorBuffer()
+		return m, m.closeCurrentTab(true)
+	case "n":
+		m.statusBar.ClearPrompt()
+		m.pendingClosePrompt = false
+		return m, m.closeCurrentTab(true)
+	case "esc":
+		m.statusBar.ClearPrompt()
+		m.pendingClosePrompt = false
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+// closeCurrentTab closes the current tab and switches to an adjacent one.
+// If it was the last tab, clears the editor to show the placeholder.
+func (m *AppModel) closeCurrentTab(discard bool) tea.Cmd {
+	if !discard && m.inlineEditor.Modified() {
+		m.pendingClosePrompt = true
+		name := filepath.Base(m.inlineEditor.FilePath())
+		m.statusBar.SetPrompt("Save changes to " + name + "? (y)es (n)o")
+		return nil
+	}
+
+	path := m.inlineEditor.FilePath()
+	idx := m.activeTabIndex()
+
+	m.removeTab(path)
+	m.editorCache.Delete(path)
+
+	// Last tab closed — show placeholder, stay in edit mode.
+	if len(m.tabOrder) == 0 {
+		m.inlineEditor.ClearFile()
+		m.resizeInlineEditor()
+		m.refreshTabsPanel()
+		return nil
+	}
+
+	// Resize in case tab bar visibility changed.
+	m.resizeInlineEditor()
+	m.refreshTabsPanel()
+
+	// Switch to adjacent tab: prefer same index (right), fallback left.
+	next := min(idx, len(m.tabOrder)-1)
+	return m.switchToTab(next)
+}
+
+// closeTab closes the tab at the given index. If it's the active tab, behaves
+// like closeCurrentTab(false). If it's a background tab, removes it silently.
+func (m *AppModel) closeTab(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(m.tabOrder) {
+		return nil
+	}
+
+	path := m.tabOrder[idx]
+	activeIdx := m.activeTabIndex()
+
+	// If closing the active tab, check for unsaved changes.
+	if idx == activeIdx {
+		return m.closeCurrentTab(false)
+	}
+
+	// Background tab with unsaved changes: switch to it and prompt.
+	if m.editorCache.IsModified(path) {
+		cmd := m.switchToTab(idx)
+		m.pendingClosePrompt = true
+		name := filepath.Base(path)
+		m.statusBar.SetPrompt("Save changes to " + name + "? (y)es (n)o")
+		return cmd
+	}
+
+	m.removeTab(path)
+	m.editorCache.Delete(path)
+	m.resizeInlineEditor()
+	m.refreshTabsPanel()
+	return nil
+}
+
+// closeTabByPath finds a tab by path and closes it.
+func (m *AppModel) closeTabByPath(path string) tea.Cmd {
+	for i, p := range m.tabOrder {
+		if p == path {
+			return m.closeTab(i)
+		}
+	}
+	return nil
+}
+
+// refreshTabsPanel updates the file tree's tabs panel if it is currently
+// visible, keeping it in sync with the app's tabOrder.
+func (m *AppModel) refreshTabsPanel() {
+	if m.fileTree.InTabsMode() {
+		m.fileTree.SetTabs(m.tabOrder, m.inlineEditor.FilePath())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2391,6 +3096,7 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	if m.editMode && m.inlineEditor.HoverActive() && isWheelEvent(mouse) {
 		if m.isInsideCodePanel(mouse.X, mouse.Y) {
 			vx, vy := m.editorViewCoords(mouse.X, mouse.Y)
+			vy -= m.tabBarHeight()
 			vy -= m.inlineEditor.FindBarHeight()
 			if m.inlineEditor.IsInsideHoverPopup(vx, vy) {
 				switch mouse.Button {
@@ -2408,7 +3114,9 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	// Some terminals send MouseButtonLeft for motion after a click-release
 	// instead of MouseButtonNone. Routing hover here ensures it works
 	// regardless of reported button, as long as we're not mid-drag.
-	if m.editMode && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown {
+	if m.editMode && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown && m.tabDragIdx < 0 {
+		m.updateTabHoverClose(mouse)
+		m.updateFileTreeTabHover(mouse)
 		return m.handleEditorMouseHover(mouse)
 	}
 
@@ -2858,6 +3566,19 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	if mouse.Action == tea.MouseActionRelease {
 		m.editorMouseDown = false
 		m.editorDragging = false
+		m.tabDragIdx = -1
+		return true, nil
+	}
+
+	// Tab bar drag: reorder tabs in real time as the cursor moves.
+	if mouse.Action == tea.MouseActionMotion && m.tabDragIdx >= 0 {
+		viewX, _ := m.editorViewCoords(mouse.X, mouse.Y)
+		cfg := m.tabBarConfig()
+		hit := tabbar.HitTest(cfg, viewX)
+		if hit.TabIndex >= 0 && hit.TabIndex != m.tabDragIdx {
+			m.tabOrder[m.tabDragIdx], m.tabOrder[hit.TabIndex] = m.tabOrder[hit.TabIndex], m.tabOrder[m.tabDragIdx]
+			m.tabDragIdx = hit.TabIndex
+		}
 		return true, nil
 	}
 
@@ -2865,6 +3586,7 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	// the panel bounds (clamp handled by the editor).
 	if mouse.Action == tea.MouseActionMotion && m.editorMouseDown {
 		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		viewY -= m.tabBarHeight()
 		viewY -= m.inlineEditor.FindBarHeight()
 		if !m.editorDragging {
 			m.inlineEditor.StartDragSelection()
@@ -2884,6 +3606,13 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	}
 
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+
+	// Tab bar click: when the tab bar is visible, clicks within it switch tabs.
+	if m.tabBarHeight() > 0 && viewY < m.tabBarHeight() {
+		return m.handleTabBarClick(viewX)
+	}
+	// Offset for tab bar so editor coordinates remain correct.
+	viewY -= m.tabBarHeight()
 
 	// When a search bar (find or replace) is open, clicks in its area
 	// toggle badges/buttons; clicks below are offset to content-local coords.
@@ -2987,6 +3716,7 @@ func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+	viewY -= m.tabBarHeight()
 	viewY -= m.inlineEditor.FindBarHeight()
 
 	// When the mouse is inside the popup, keep it stable so the user
@@ -3244,15 +3974,7 @@ func (m *AppModel) recalcLayout() {
 	mainHeight := m.height - inputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
 
-	// Clear mode cap before initial computation so the layout can
-	// upgrade to a wider mode when the terminal expands.
-	m.layout.ClearMaxMode()
 	m.layout.SetSize(m.width, mainHeight)
-
-	// In edit mode, check for content cutoff and force mode downgrade.
-	if m.editMode && m.inlineEditor.FilePath() != "" {
-		m.shrinkLayoutForEditorFit(mainHeight)
-	}
 
 	// Sync tab order and focus to the current layout mode so collapsed
 	// panels are excluded from keyboard navigation.
@@ -3281,7 +4003,7 @@ func (m *AppModel) recalcLayout() {
 	m.codePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 	m.knowledgePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 	if m.editMode {
-		m.inlineEditor.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+		m.inlineEditor.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize-m.tabBarHeight(), 1))
 	}
 
 	// Input: dynamic height based on content.
@@ -3294,26 +4016,6 @@ func (m *AppModel) recalcLayout() {
 	m.searchOverlay.SetSize(m.width, m.height)
 }
 
-// shrinkLayoutForEditorFit checks whether the editor's visible content
-// is wider than the code panel. If any line is cut off, it forces the
-// layout to a smaller mode and recomputes until the content fits or
-// SingleColumn is reached.
-func (m *AppModel) shrinkLayoutForEditorFit(mainHeight int) {
-	for {
-		rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
-		contentW := max(rightW-panelBorderSize, 1)
-		needed := m.inlineEditor.MaxVisibleLineWidth()
-		if needed <= contentW {
-			return // content fits
-		}
-		current := m.layout.Mode()
-		if current <= layout.SingleColumn {
-			return // already at smallest mode
-		}
-		m.layout.SetMaxMode(current - 1)
-		m.layout.SetSize(m.width, mainHeight)
-	}
-}
 
 // syncViewState rebuilds the dual view cycling rings for the current layout
 // mode, updates the focus tab order to match visible panels, and pushes the
