@@ -1,5 +1,7 @@
 package buffer
 
+import "sort"
+
 // LineInfo stores the offset and length of a single line within the buffer.
 type LineInfo struct {
 	Number   int // 0-indexed line number
@@ -8,7 +10,9 @@ type LineInfo struct {
 }
 
 // LineIndex maintains a cached mapping from line numbers to rune offsets.
-// The index is rebuilt after each edit by calling Rebuild.
+// The index is rebuilt after each edit by calling Rebuild, or updated
+// incrementally via IncrementalUpdate for edits that don't cross line
+// boundaries.
 type LineIndex struct {
 	lines []LineInfo
 }
@@ -53,6 +57,29 @@ func (li *LineIndex) Rebuild(pt *PieceTable) {
 	}
 }
 
+// IncrementalUpdate adjusts the line index in-place for an edit that does
+// not add or remove newlines. Returns false if a full Rebuild is needed
+// (i.e. the edit crosses line boundaries).
+func (li *LineIndex) IncrementalUpdate(meta EditMeta) bool {
+	if meta.HadNewline || len(li.lines) == 0 {
+		return false
+	}
+	// Binary search for the line containing the edit position.
+	lineIdx := sort.Search(len(li.lines), func(i int) bool {
+		return li.lines[i].StartPos > meta.Pos
+	}) - 1
+	if lineIdx < 0 {
+		lineIdx = 0
+	}
+	// Adjust the edited line's length.
+	li.lines[lineIdx].Length += meta.Delta
+	// Shift all subsequent lines' start positions.
+	for i := lineIdx + 1; i < len(li.lines); i++ {
+		li.lines[i].StartPos += meta.Delta
+	}
+	return true
+}
+
 // Get returns the LineInfo for the given 0-indexed line number.
 func (li *LineIndex) Get(lineNum int) (LineInfo, bool) {
 	if lineNum < 0 || lineNum >= len(li.lines) {
@@ -67,14 +94,20 @@ func (li *LineIndex) Count() int {
 }
 
 // PosToLineCol converts an absolute rune position to a (line, col) pair.
-// Both line and col are 0-indexed.
+// Both line and col are 0-indexed. Uses binary search: O(log N).
 func (li *LineIndex) PosToLineCol(pos int) (int, int) {
-	for i := len(li.lines) - 1; i >= 0; i-- {
-		if pos >= li.lines[i].StartPos {
-			return li.lines[i].Number, pos - li.lines[i].StartPos
-		}
+	n := len(li.lines)
+	if n == 0 {
+		return 0, 0
 	}
-	return 0, 0
+	// Find the last line whose StartPos <= pos.
+	idx := sort.Search(n, func(i int) bool {
+		return li.lines[i].StartPos > pos
+	}) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	return li.lines[idx].Number, pos - li.lines[idx].StartPos
 }
 
 // LineColToPos converts a (line, col) pair to an absolute rune position.

@@ -1284,10 +1284,12 @@ func (m *Model) acceptCompletion() {
 		return
 	}
 
+	m.undoTree.BeginGroup()
+
 	// Delete the typed prefix [startPos, cursor).
 	prefixLen := m.state.Cursor - startPos
 	if prefixLen > 0 {
-		old := m.substringAt(startPos, m.state.Cursor)
+		old := m.buf.Substring(startPos, m.state.Cursor)
 		m.buf.Delete(startPos, prefixLen)
 		m.undoTree.Record(buffer.EditOp{
 			Type:    buffer.EditDelete,
@@ -1303,6 +1305,7 @@ func (m *Model) acceptCompletion() {
 		Pos:  startPos,
 		Text: item.Word,
 	})
+	m.undoTree.EndGroup()
 	m.lineIndex.Rebuild(m.buf)
 	m.state.Cursor = startPos + len([]rune(item.Word))
 	m.state.SyncCursorPos()
@@ -1379,14 +1382,6 @@ func (m *Model) runeColToByteCol(lineInfo buffer.LineInfo, runeCol int) int {
 	return byteCol
 }
 
-// substringAt extracts a string from the buffer between two rune positions.
-func (m *Model) substringAt(start, end int) string {
-	runes := make([]rune, 0, end-start)
-	for i := start; i < end; i++ {
-		runes = append(runes, m.buf.RuneAt(i))
-	}
-	return string(runes)
-}
 
 // triggerCompletion starts the completion engine and returns a Cmd to
 // request LSP completion items for the current cursor position. Returns
@@ -1487,7 +1482,7 @@ func (m *Model) HandleCompletionClick(_, y int) bool {
 	// Replace the typed prefix with the clicked item.
 	prefixLen := m.state.Cursor - startPos
 	if prefixLen > 0 {
-		old := m.substringAt(startPos, m.state.Cursor)
+		old := m.buf.Substring(startPos, m.state.Cursor)
 		m.buf.Delete(startPos, prefixLen)
 		m.undoTree.Record(buffer.EditOp{
 			Type:    buffer.EditDelete,
@@ -1725,16 +1720,13 @@ func (m *Model) applySingleEdit(edit lsp.TextEdit) {
 
 	// Delete the replaced range.
 	if endPos > startPos {
-		old := m.substringAt(startPos, endPos)
+		old := m.buf.Substring(startPos, endPos)
 		m.buf.Delete(startPos, endPos-startPos)
 		m.undoTree.Record(buffer.EditOp{
 			Type:    buffer.EditDelete,
 			Pos:     startPos,
 			OldText: old,
 		})
-		// Rebuild line index between delete and insert so the insert
-		// position is correct after line shifts.
-		m.lineIndex.Rebuild(m.buf)
 	}
 
 	// Insert the new text.
@@ -1745,8 +1737,10 @@ func (m *Model) applySingleEdit(edit lsp.TextEdit) {
 			Pos:  startPos,
 			Text: edit.NewText,
 		})
-		m.lineIndex.Rebuild(m.buf)
 	}
+
+	// Single rebuild for the combined delete + insert effect.
+	m.lineIndex.Rebuild(m.buf)
 }
 
 // lspPositionToRune converts an LSP Position (line + UTF-16 character offset)
@@ -1756,7 +1750,7 @@ func (m *Model) lspPositionToRune(pos lsp.Position) int {
 	if !ok {
 		return m.buf.Length()
 	}
-	lineText := m.substringAt(info.StartPos, info.StartPos+info.Length)
+	lineText := m.buf.Substring(info.StartPos, info.StartPos+info.Length)
 	runeCol := lsp.UTF16ToRuneOffset(lineText, pos.Character)
 	return info.StartPos + min(runeCol, info.Length)
 }
@@ -1768,12 +1762,7 @@ func (m *Model) SelectedText() string {
 	if !hasSel {
 		return ""
 	}
-	length := end - start + 1
-	runes := make([]rune, length)
-	for i := range length {
-		runes[i] = m.buf.RuneAt(start + i)
-	}
-	return string(runes)
+	return m.buf.Substring(start, end+1)
 }
 
 // selectionRange returns the active visual-mode selection bounds.
@@ -3589,7 +3578,7 @@ func (m *Model) replaceCurrentMatch() {
 	if !ok {
 		return
 	}
-	old := m.substringAt(match.Start, match.End)
+	old := m.buf.Substring(match.Start, match.End)
 	replacement := m.computeReplacement(old)
 
 	m.undoTree.BeginGroup()
@@ -3619,7 +3608,7 @@ func (m *Model) replaceAllMatches() {
 	m.undoTree.BeginGroup()
 	for i := len(matches) - 1; i >= 0; i-- {
 		match := matches[i]
-		old := m.substringAt(match.Start, match.End)
+		old := m.buf.Substring(match.Start, match.End)
 		replacement := m.computeReplacement(old)
 		m.buf.Delete(match.Start, match.End-match.Start)
 		m.undoTree.Record(buffer.EditOp{Type: buffer.EditDelete, Pos: match.Start, OldText: old})

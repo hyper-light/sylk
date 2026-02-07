@@ -2,6 +2,8 @@
 // piece-table data structure. All positions are rune-indexed (Unicode-aware).
 package buffer
 
+import "slices"
+
 // Source indicates which buffer a piece references.
 type Source int
 
@@ -19,22 +21,36 @@ type Piece struct {
 	Length int // number of runes
 }
 
+// EditMeta describes the last mutation for incremental index updates.
+type EditMeta struct {
+	Pos        int  // rune position where the edit occurred
+	Delta      int  // positive for insert, negative for delete
+	HadNewline bool // whether the affected text contained '\n'
+}
+
 // PieceTable implements a two-buffer piece table for efficient text editing.
 // The original buffer is immutable; new text is appended to the add buffer.
 // Only the pieces slice is mutated during edits.
 type PieceTable struct {
-	original []rune
-	add      []rune
-	pieces   []Piece
-	version  uint64 // incremented on every Insert/Delete
+	original  []rune
+	add       []rune
+	pieces    []Piece
+	length    int    // cached total rune count
+	version   uint64 // incremented on every Insert/Delete
+	lastEdit  EditMeta
+	cachedStr string // cached Content() result
+	cachedVer uint64 // version when cachedStr was built
 }
 
 // NewPieceTable creates a PieceTable initialised with content.
 func NewPieceTable(content string) *PieceTable {
 	runes := []rune(content)
 	pt := &PieceTable{
-		original: runes,
-		add:      make([]rune, 0, len(runes)),
+		original:  runes,
+		add:       make([]rune, 0, len(runes)),
+		length:    len(runes),
+		cachedStr: content,
+		// cachedVer 0 matches initial version 0, so Content() hits cache.
 	}
 	if len(runes) > 0 {
 		pt.pieces = []Piece{{Source: Original, Offset: 0, Length: len(runes)}}
@@ -42,14 +58,8 @@ func NewPieceTable(content string) *PieceTable {
 	return pt
 }
 
-// Length returns the total number of runes across all pieces.
-func (pt *PieceTable) Length() int {
-	total := 0
-	for _, p := range pt.pieces {
-		total += p.Length
-	}
-	return total
-}
+// Length returns the total number of runes across all pieces. O(1).
+func (pt *PieceTable) Length() int { return pt.length }
 
 // Insert inserts text at the given rune position.
 func (pt *PieceTable) Insert(pos int, text string) {
@@ -63,7 +73,13 @@ func (pt *PieceTable) Insert(pos int, text string) {
 
 	idx, offset := pt.findPiece(pos)
 	pt.spliceInsert(idx, offset, newPiece)
+	pt.length += len(runes)
 	pt.version++
+	pt.lastEdit = EditMeta{
+		Pos:        pos,
+		Delta:      len(runes),
+		HadNewline: containsNewline(runes),
+	}
 }
 
 // Delete removes length runes starting at pos.
@@ -71,10 +87,19 @@ func (pt *PieceTable) Delete(pos, length int) {
 	if length <= 0 {
 		return
 	}
+	// Check for newlines before mutating pieces.
+	hadNL := pt.rangeHasNewline(pos, length)
+
 	startIdx, startOff := pt.findPiece(pos)
 	endIdx, endOff := pt.findPiece(pos + length)
 	pt.spliceDelete(startIdx, startOff, endIdx, endOff)
+	pt.length -= length
 	pt.version++
+	pt.lastEdit = EditMeta{
+		Pos:        pos,
+		Delta:      -length,
+		HadNewline: hadNL,
+	}
 }
 
 // Version returns a monotonically increasing counter that changes on every
@@ -84,11 +109,46 @@ func (pt *PieceTable) Version() uint64 {
 	return pt.version
 }
 
-// Content materialises the full text by walking all pieces.
+// LastEdit returns metadata about the most recent Insert or Delete.
+func (pt *PieceTable) LastEdit() EditMeta { return pt.lastEdit }
+
+// Content materialises the full text by walking all pieces. The result
+// is cached and returned in O(1) on repeated calls without intervening edits.
 func (pt *PieceTable) Content() string {
-	buf := make([]rune, 0, pt.Length())
+	if pt.version == pt.cachedVer {
+		return pt.cachedStr
+	}
+	buf := make([]rune, 0, pt.length)
 	for _, p := range pt.pieces {
 		buf = append(buf, pt.sourceSlice(p)...)
+	}
+	s := string(buf)
+	pt.cachedStr = s
+	pt.cachedVer = pt.version
+	return s
+}
+
+// Substring returns the text in the rune range [start, end).
+func (pt *PieceTable) Substring(start, end int) string {
+	if start >= end {
+		return ""
+	}
+	buf := make([]rune, 0, end-start)
+	pos := 0
+	for _, p := range pt.pieces {
+		pEnd := pos + p.Length
+		if pEnd <= start {
+			pos = pEnd
+			continue
+		}
+		if pos >= end {
+			break
+		}
+		src := pt.sourceBuffer(p.Source)
+		lo := max(start-pos, 0)
+		hi := min(end-pos, p.Length)
+		buf = append(buf, src[p.Offset+lo:p.Offset+hi]...)
+		pos = pEnd
 	}
 	return string(buf)
 }
@@ -104,7 +164,7 @@ func (pt *PieceTable) Line(n int) string {
 		}
 		if r == '\n' {
 			if lineNum == n {
-				return pt.substringRunes(lineStart, cur)
+				return pt.Substring(lineStart, cur)
 			}
 			lineNum++
 			lineStart = cur + 1
@@ -112,14 +172,14 @@ func (pt *PieceTable) Line(n int) string {
 		cur++
 	}
 	if lineNum == n {
-		return pt.substringRunes(lineStart, cur)
+		return pt.Substring(lineStart, cur)
 	}
 	return ""
 }
 
 // LineCount returns the number of lines (at least 1 for non-empty content).
 func (pt *PieceTable) LineCount() int {
-	if pt.Length() == 0 {
+	if pt.length == 0 {
 		return 0
 	}
 	count := 1
@@ -182,28 +242,33 @@ func (pt *PieceTable) findPiece(pos int) (int, int) {
 }
 
 // spliceInsert inserts newPiece into the piece list, splitting the piece at
-// (idx, offset) when necessary.
+// (idx, offset) when necessary. Adjacent same-source pieces are coalesced.
 func (pt *PieceTable) spliceInsert(idx, offset int, newPiece Piece) {
 	// Append at end.
 	if idx == len(pt.pieces) {
 		pt.pieces = append(pt.pieces, newPiece)
+		pt.tryCoalesce(len(pt.pieces) - 1)
 		return
 	}
 	target := pt.pieces[idx]
 	// Insert at the beginning of a piece.
 	if offset == 0 {
-		pt.insertPiecesAt(idx, newPiece)
+		pt.pieces = slices.Insert(pt.pieces, idx, newPiece)
+		pt.tryCoalesce(idx)
 		return
 	}
 	// Insert at the end of a piece.
 	if offset == target.Length {
-		pt.insertPiecesAt(idx+1, newPiece)
+		pt.pieces = slices.Insert(pt.pieces, idx+1, newPiece)
+		pt.tryCoalesce(idx + 1)
 		return
 	}
 	// Split target into left + newPiece + right.
 	left := Piece{Source: target.Source, Offset: target.Offset, Length: offset}
 	right := Piece{Source: target.Source, Offset: target.Offset + offset, Length: target.Length - offset}
-	pt.replacePieces(idx, 1, left, newPiece, right)
+	pt.pieces = slices.Replace(pt.pieces, idx, idx+1, left, newPiece, right)
+	// left/right derive from the original piece — they can't merge with the
+	// new Add-buffer piece, so coalescing is a no-op in the split case.
 }
 
 // spliceDelete removes the rune range described by the start/end piece
@@ -222,47 +287,68 @@ func (pt *PieceTable) spliceDelete(startIdx, startOff, endIdx, endOff int) {
 	if endIdx >= len(pt.pieces) {
 		end = len(pt.pieces)
 	}
-	pt.replacePieces(startIdx, end-startIdx, keep...)
+	pt.pieces = slices.Replace(pt.pieces, startIdx, end, keep...)
+	// Coalesce at the splice boundary.
+	if startIdx < len(pt.pieces) {
+		pt.tryCoalesce(startIdx)
+	}
 }
 
-// insertPiecesAt inserts one or more pieces before the given index.
-func (pt *PieceTable) insertPiecesAt(idx int, add ...Piece) {
-	result := make([]Piece, 0, len(pt.pieces)+len(add))
-	result = append(result, pt.pieces[:idx]...)
-	result = append(result, add...)
-	result = append(result, pt.pieces[idx:]...)
-	pt.pieces = result
+// tryCoalesce merges the piece at idx with its left and right neighbours
+// when they reference contiguous regions of the same source buffer.
+func (pt *PieceTable) tryCoalesce(idx int) {
+	// Merge with right neighbour first (may shift indices).
+	if idx+1 < len(pt.pieces) {
+		a, b := pt.pieces[idx], pt.pieces[idx+1]
+		if a.Source == b.Source && a.Offset+a.Length == b.Offset {
+			pt.pieces[idx].Length += b.Length
+			pt.pieces = slices.Delete(pt.pieces, idx+1, idx+2)
+		}
+	}
+	// Merge with left neighbour.
+	if idx > 0 && idx < len(pt.pieces) {
+		a, b := pt.pieces[idx-1], pt.pieces[idx]
+		if a.Source == b.Source && a.Offset+a.Length == b.Offset {
+			pt.pieces[idx-1].Length += b.Length
+			pt.pieces = slices.Delete(pt.pieces, idx, idx+1)
+		}
+	}
 }
 
-// replacePieces replaces count pieces starting at idx with the given pieces.
-func (pt *PieceTable) replacePieces(idx, count int, replacement ...Piece) {
-	result := make([]Piece, 0, len(pt.pieces)-count+len(replacement))
-	result = append(result, pt.pieces[:idx]...)
-	result = append(result, replacement...)
-	result = append(result, pt.pieces[idx+count:]...)
-	pt.pieces = result
-}
-
-// substringRunes extracts a rune substring [start, end) from the content.
-func (pt *PieceTable) substringRunes(start, end int) string {
-	buf := make([]rune, 0, end-start)
-	pos := 0
+// rangeHasNewline reports whether any rune in [pos, pos+length) is '\n'.
+func (pt *PieceTable) rangeHasNewline(pos, length int) bool {
+	end := pos + length
+	cur := 0
 	for _, p := range pt.pieces {
-		pEnd := pos + p.Length
-		if pEnd <= start {
-			pos = pEnd
+		pEnd := cur + p.Length
+		if pEnd <= pos {
+			cur = pEnd
 			continue
 		}
-		if pos >= end {
+		if cur >= end {
 			break
 		}
 		src := pt.sourceBuffer(p.Source)
-		lo := max(start-pos, 0)
-		hi := min(end-pos, p.Length)
-		buf = append(buf, src[p.Offset+lo:p.Offset+hi]...)
-		pos = pEnd
+		lo := max(pos-cur, 0)
+		hi := min(end-cur, p.Length)
+		for i := lo; i < hi; i++ {
+			if src[p.Offset+i] == '\n' {
+				return true
+			}
+		}
+		cur = pEnd
 	}
-	return string(buf)
+	return false
+}
+
+// containsNewline reports whether any rune in the slice is '\n'.
+func containsNewline(runes []rune) bool {
+	for _, r := range runes {
+		if r == '\n' {
+			return true
+		}
+	}
+	return false
 }
 
 // runeIterator returns a closure that yields runes in document order.

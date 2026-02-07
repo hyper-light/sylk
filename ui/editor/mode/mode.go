@@ -88,3 +88,13 @@ func (es *EditorState) ClampCursor(trailingOffset int) {
 	es.Cursor = max(min(es.Cursor, maxPos), 0)
 	es.SyncCursorPos()
 }
+
+// updateLineIndex applies an incremental line index update when possible,
+// falling back to a full rebuild when the edit crosses line boundaries.
+// Only correct for single-mutation operations — compound operations (e.g.
+// delete + insert) must use state.LineIndex.Rebuild directly.
+func updateLineIndex(state *EditorState) {
+	if !state.LineIndex.IncrementalUpdate(state.Buffer.LastEdit()) {
+		state.LineIndex.Rebuild(state.Buffer)
+	}
+}

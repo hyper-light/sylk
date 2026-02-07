@@ -100,7 +100,7 @@ func insertBackspace(state *EditorState) Mode {
 		Pos:     pos,
 		OldText: old,
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = pos
 	state.SyncCursorPos()
 	return ModeInsert
@@ -122,9 +122,9 @@ func currentLineIndent(state *EditorState) string {
 	if !ok {
 		return ""
 	}
+	lineRunes := []rune(state.Buffer.Substring(info.StartPos, info.StartPos+info.Length))
 	indentLen := 0
-	for i := range info.Length {
-		r := state.Buffer.RuneAt(info.StartPos + i)
+	for _, r := range lineRunes {
 		if r != ' ' && r != '\t' {
 			break
 		}
@@ -133,11 +133,7 @@ func currentLineIndent(state *EditorState) string {
 	if state.CursorCol < indentLen {
 		return ""
 	}
-	buf := make([]rune, indentLen)
-	for i := range indentLen {
-		buf[i] = state.Buffer.RuneAt(info.StartPos + i)
-	}
-	return string(buf)
+	return string(lineRunes[:indentLen])
 }
 
 func insertTab(state *EditorState) Mode {
@@ -204,7 +200,7 @@ func insertText(state *EditorState, text string) {
 		Pos:  pos,
 		Text: text,
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = pos + len([]rune(text))
 	state.SyncCursorPos()
 }
@@ -224,7 +220,7 @@ func insertBracketPair(state *EditorState, open, close rune) {
 		Pos:  pos,
 		Text: text,
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = pos + 1 // between the pair
 	state.SyncCursorPos()
 }
@@ -267,7 +263,7 @@ func deleteEmptyPair(state *EditorState) bool {
 		Pos:     pos,
 		OldText: old,
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = pos
 	state.SyncCursorPos()
 	return true

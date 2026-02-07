@@ -199,14 +199,14 @@ var operatorHandlerTable = map[motion.OperatorType]func(state *EditorState, star
 
 func opDelete(state *EditorState, start, end int) {
 	length := end - start + 1
-	old := substringFromBuffer(state.Buffer, start, end+1)
+	old := state.Buffer.Substring(start, end+1)
 	state.Buffer.Delete(start, length)
 	state.UndoTree.Record(buffer.EditOp{
 		Type:    buffer.EditDelete,
 		Pos:     start,
 		OldText: old,
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = start
 	state.ClampCursor(1)
 }
@@ -249,7 +249,7 @@ func insertLineBelow(state *EditorState) {
 		Pos:  pos,
 		Text: "\n",
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = pos + 1
 	state.SyncCursorPos()
 }
@@ -266,7 +266,7 @@ func insertLineAbove(state *EditorState) {
 		Pos:  pos,
 		Text: "\n",
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = pos
 	state.SyncCursorPos()
 }
@@ -328,10 +328,3 @@ func normalizeRange(a, b int) (int, int) {
 	return a, b
 }
 
-func substringFromBuffer(buf *buffer.PieceTable, start, end int) string {
-	runes := make([]rune, 0, end-start)
-	for i := start; i < end; i++ {
-		runes = append(runes, buf.RuneAt(i))
-	}
-	return string(runes)
-}

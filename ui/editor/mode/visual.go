@@ -236,14 +236,14 @@ func visualSwapAnchor(vm *VisualMode, state *EditorState) Mode {
 func visualDelete(vm *VisualMode, state *EditorState) Mode {
 	start, end := vm.State.CharRange()
 	length := end - start + 1
-	old := substringFromBuffer(state.Buffer, start, end+1)
+	old := state.Buffer.Substring(start, end+1)
 	state.Buffer.Delete(start, length)
 	state.UndoTree.Record(buffer.EditOp{
 		Type:    buffer.EditDelete,
 		Pos:     start,
 		OldText: old,
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = start
 	state.ClampCursor(1)
 	return ModeNormal
@@ -257,14 +257,14 @@ func visualYank(vm *VisualMode, state *EditorState) Mode {
 func visualChange(vm *VisualMode, state *EditorState) Mode {
 	start, end := vm.State.CharRange()
 	length := end - start + 1
-	old := substringFromBuffer(state.Buffer, start, end+1)
+	old := state.Buffer.Substring(start, end+1)
 	state.Buffer.Delete(start, length)
 	state.UndoTree.Record(buffer.EditOp{
 		Type:    buffer.EditDelete,
 		Pos:     start,
 		OldText: old,
 	})
-	state.LineIndex.Rebuild(state.Buffer)
+	updateLineIndex(state)
 	state.Cursor = start
 	state.SyncCursorPos()
 	return ModeInsert
@@ -340,27 +340,26 @@ func runeToggleCase(r rune) rune {
 func applyVisualCaseTransform(vm *VisualMode, state *EditorState, transform runeTransform) {
 	start, end := vm.State.CharRange()
 	length := end - start + 1
-	original := make([]rune, length)
-	for i := range length {
-		original[i] = state.Buffer.RuneAt(start + i)
-	}
+	original := []rune(state.Buffer.Substring(start, end+1))
 	transformed := make([]rune, length)
 	for i, r := range original {
 		transformed[i] = transform(r)
 	}
 	old := string(original)
+	state.UndoTree.BeginGroup()
 	state.Buffer.Delete(start, length)
-	state.Buffer.Insert(start, string(transformed))
 	state.UndoTree.Record(buffer.EditOp{
 		Type:    buffer.EditDelete,
 		Pos:     start,
 		OldText: old,
 	})
+	state.Buffer.Insert(start, string(transformed))
 	state.UndoTree.Record(buffer.EditOp{
 		Type: buffer.EditInsert,
 		Pos:  start,
 		Text: string(transformed),
 	})
+	state.UndoTree.EndGroup()
 	state.LineIndex.Rebuild(state.Buffer)
 	state.Cursor = start
 	state.ClampCursor(1)

@@ -2676,7 +2676,7 @@ func (m *AppModel) saveEditorBuffer() {
 		return
 	}
 	content := m.inlineEditor.Content()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := atomicWriteFile(path, []byte(content), 0o644); err != nil {
 		m.statusBar.SetFlash("Write failed: " + err.Error())
 		return
 	}
@@ -2686,6 +2686,40 @@ func (m *AppModel) saveEditorBuffer() {
 	m.nudgeGitWatcher()
 	m.refreshTabsModified()
 	m.statusBar.SetFlash("Saved " + path)
+}
+
+// atomicWriteFile writes data to a temporary file in the same directory as
+// path, then renames it into place. This prevents partial writes from
+// corrupting the target file on crash or power loss.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".sylk-save-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Ensure cleanup on any error path.
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename temp: %w", err)
+	}
+	tmpName = "" // prevent deferred cleanup after successful rename
+	return nil
 }
 
 // codePanelView returns the rendered view for the code panel slot,
