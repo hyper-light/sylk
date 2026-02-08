@@ -332,6 +332,11 @@ func (e *Engine) Render(width, maxHeight int, th *theme.Theme) string {
 	computedWidth := wordCol + kindBadgeWidth + rowPadding
 	stableWidth := max(computedWidth, e.sessionWidth)
 
+	// Clamp wordCol so rows fit within the available editor width.
+	if stableWidth > width {
+		wordCol = max(width-kindBadgeWidth-rowPadding, 1)
+	}
+
 	borderStyle := lipgloss.NewStyle().
 		Foreground(th.Palette.Border).
 		Background(th.Palette.Background)
@@ -349,7 +354,7 @@ func (e *Engine) Render(width, maxHeight int, th *theme.Theme) string {
 		Foreground(th.Palette.Background).
 		Background(th.Palette.Primary)
 
-	maxWidth := min(stableWidth, max(width, popupColWidth))
+	maxWidth := min(stableWidth, width)
 
 	// Use sessionRows (damped) so the popup height shrinks gradually.
 	stableRows := min(max(e.sessionRows, len(visible)), itemLimit)

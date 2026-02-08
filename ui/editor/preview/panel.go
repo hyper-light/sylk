@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/editor/highlight"
+	"github.com/adalundhe/sylk/ui/editor/hover"
 	"github.com/adalundhe/sylk/ui/theme"
 )
 
@@ -40,6 +42,8 @@ type Panel struct {
 	lastBlinkAt time.Time
 	theme       *theme.Theme
 	bounceOff   int
+	hoverPopup  *hover.Hover
+	hoverActive bool
 }
 
 // Compile-time interface checks.
@@ -55,6 +59,7 @@ func New(th *theme.Theme) *Panel {
 		theme:       th,
 		highlighter: highlight.NewHighlighter(th),
 		cursorBlink: true,
+		hoverPopup:  hover.New(),
 	}
 }
 
@@ -99,6 +104,9 @@ func (p *Panel) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 	// Any keystroke resets cursor to visible and restarts blink cycle.
 	p.cursorBlink = true
 	p.lastBlinkAt = time.Now()
+
+	// Dismiss hover on any keystroke (movement changes viewport context).
+	p.DismissHover()
 
 	switch km.String() {
 	// Vertical movement.
@@ -180,6 +188,7 @@ func (p *Panel) SetContent(content, filePath, language string) {
 	p.cursorLine = 0
 	p.cursorCol = 0
 	p.scrollX = 0
+	p.DismissHover()
 }
 
 // ClearFile resets the panel to an empty state.
@@ -194,6 +203,7 @@ func (p *Panel) ClearFile() {
 	p.cursorCol = 0
 	p.scrollX = 0
 	p.bounceOff = 0
+	p.DismissHover()
 }
 
 // FilePath returns the currently previewed file path.
@@ -298,10 +308,310 @@ func (p *Panel) View() string {
 		result = append(result, tilde+pad)
 	}
 
+	// Overlay hover popup if active.
+	if p.hoverActive && p.hoverPopup.Active() {
+		p.overlayHoverPopup(result)
+	}
+
 	// Apply bounce shift.
 	result = applyBounceShift(result, p.bounceOff, p.height)
 
 	return strings.Join(result, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Hover popup
+// ---------------------------------------------------------------------------
+
+// HoverActive reports whether the hover tooltip is visible.
+func (p *Panel) HoverActive() bool { return p.hoverActive }
+
+// DismissHover hides the hover tooltip.
+func (p *Panel) DismissHover() {
+	p.hoverPopup.Dismiss()
+	p.hoverActive = false
+}
+
+// ShowHover activates the hover tooltip at the given buffer position.
+func (p *Panel) ShowHover(content string, line, col int) {
+	p.hoverPopup.Show(content, line, col)
+	p.hoverActive = true
+}
+
+// SetHoverDefinition stores the qualified symbol name and package path
+// on the active hover tooltip for display in the footer.
+func (p *Panel) SetHoverDefinition(symbol, pkgPath string) {
+	if !p.hoverActive {
+		return
+	}
+	p.hoverPopup.SetDefinition(symbol, pkgPath)
+}
+
+// ScrollHoverDown scrolls the hover popup content down by one line.
+func (p *Panel) ScrollHoverDown() { p.hoverPopup.ScrollDown() }
+
+// ScrollHoverUp scrolls the hover popup content up by one line.
+func (p *Panel) ScrollHoverUp() { p.hoverPopup.ScrollUp() }
+
+// SetCursorFromViewport converts viewport-local (x, y) to a buffer position
+// and updates the cursor. Resets blink to visible.
+func (p *Panel) SetCursorFromViewport(x, y int) {
+	line, bufCol, ok := p.ViewportToBufferPos(x, y)
+	if !ok {
+		return
+	}
+	p.cursorLine = line
+	// Convert buffer column (rune index) to display column (post-tab-expansion).
+	if line >= 0 && line < len(p.lines) {
+		_, colMap := expandTabs(p.lines[line], tabWidth)
+		p.cursorCol = safeMapCol(colMap, bufCol)
+	} else {
+		p.cursorCol = bufCol
+	}
+	p.clampCursorCol()
+	p.cursorBlink = true
+	p.lastBlinkAt = time.Now()
+}
+
+// ViewportToBufferPos converts viewport-local (x, y) coordinates to a
+// buffer (line, col) position. Returns false when the position is outside
+// the file content.
+func (p *Panel) ViewportToBufferPos(x, y int) (line, col int, ok bool) {
+	totalLines := len(p.lines)
+	gw := gutterWidth(totalLines)
+	line = y + p.scrollOff
+	if line < 0 || line >= totalLines {
+		return 0, 0, false
+	}
+	screenCol := max(x-gw-1, 0) + p.scrollX // gutter + 1 space separator
+	col = p.screenToBufferCol(line, screenCol)
+	return line, col, true
+}
+
+// screenToBufferCol converts a display column (post-tab-expansion) to the
+// corresponding buffer column (rune index) for the given line.
+func (p *Panel) screenToBufferCol(lineIdx, screenCol int) int {
+	if lineIdx < 0 || lineIdx >= len(p.lines) {
+		return screenCol
+	}
+	runes := []rune(p.lines[lineIdx])
+	visCol := 0
+	for i, r := range runes {
+		charWidth := 1
+		if r == '\t' {
+			charWidth = tabWidth - (visCol % tabWidth)
+		}
+		if screenCol < visCol+charWidth {
+			return i
+		}
+		visCol += charWidth
+	}
+	return len(runes)
+}
+
+// IsWordCharAtPos reports whether the rune at (line, col) is a word
+// character (letter, digit, or underscore).
+func (p *Panel) IsWordCharAtPos(line, col int) bool {
+	if line < 0 || line >= len(p.lines) {
+		return false
+	}
+	runes := []rune(p.lines[line])
+	if col < 0 || col >= len(runes) {
+		return false
+	}
+	r := runes[col]
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+}
+
+// WordBoundsAt returns the start and end column of the word at (line, col).
+// If the position is not on a word character, returns (col, col).
+func (p *Panel) WordBoundsAt(line, col int) (start, end int) {
+	if line < 0 || line >= len(p.lines) {
+		return col, col
+	}
+	runes := []rune(p.lines[line])
+	if col < 0 || col >= len(runes) {
+		return col, col
+	}
+	isWord := func(c int) bool {
+		if c < 0 || c >= len(runes) {
+			return false
+		}
+		r := runes[c]
+		return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+	}
+	if !isWord(col) {
+		return col, col
+	}
+	start = col
+	for start > 0 && isWord(start-1) {
+		start--
+	}
+	end = col + 1
+	for end < len(runes) && isWord(end) {
+		end++
+	}
+	return start, end
+}
+
+// WordAt returns the word text at (line, col), or "" if not on a word.
+func (p *Panel) WordAt(line, col int) string {
+	start, end := p.WordBoundsAt(line, col)
+	if start == end {
+		return ""
+	}
+	runes := []rune(p.lines[line])
+	return string(runes[start:end])
+}
+
+// IsInsideHoverPopup reports whether viewport-local (x, y) falls within
+// the currently displayed hover popup.
+func (p *Panel) IsInsideHoverPopup(x, y int) bool {
+	if !p.hoverActive || !p.hoverPopup.Active() {
+		return false
+	}
+	startRow, col, height, width := p.hoverPlacement()
+	return y >= startRow && y < startRow+height && x >= col && x < col+width
+}
+
+// contentToViewCol converts a buffer (line, col) to a viewport visual column
+// (including gutter and separator, minus horizontal scroll).
+func (p *Panel) contentToViewCol(lineNum, col int) int {
+	totalLines := len(p.lines)
+	gw := gutterWidth(totalLines)
+	if lineNum < 0 || lineNum >= totalLines {
+		return gw + 1
+	}
+	_, colMap := expandTabs(p.lines[lineNum], tabWidth)
+	displayCol := safeMapCol(colMap, col)
+	return gw + 1 + max(displayCol-p.scrollX, 0)
+}
+
+// hoverPlacement computes the position and size of the hover popup
+// within the viewport. Returns (startRow, col, height, width).
+func (p *Panel) hoverPlacement() (startRow, col, height, width int) {
+	anchorLine := p.hoverPopup.AnchorLine()
+	anchorRow := anchorLine - p.scrollOff
+	viewHeight := p.height
+
+	spaceAbove := anchorRow
+	spaceBelow := viewHeight - anchorRow - 1
+	maxZone := max(spaceAbove, spaceBelow)
+
+	popup := p.hoverPopup.View(p.width, maxZone, p.theme)
+	if popup == "" {
+		return 0, 0, 0, 0
+	}
+	popupLines := strings.Split(popup, "\n")
+	height = len(popupLines)
+
+	for _, pl := range popupLines {
+		if w := lipgloss.Width(pl); w > width {
+			width = w
+		}
+	}
+
+	col = p.contentToViewCol(anchorLine, p.hoverPopup.AnchorCol())
+	col = max(col, 0)
+	if p.width > 0 && width > 0 {
+		col = min(col, max(p.width-width, 0))
+	}
+
+	// Place above anchor if room, otherwise below.
+	startRow = anchorRow - height
+	if startRow < 0 {
+		startRow = anchorRow + 1
+	}
+	return startRow, col, height, width
+}
+
+// overlayHoverPopup renders the hover tooltip and splices it into the
+// viewport lines at the correct position.
+func (p *Panel) overlayHoverPopup(lines []string) {
+	anchorLine := p.hoverPopup.AnchorLine()
+	anchorRow := anchorLine - p.scrollOff
+	if anchorRow < 0 || anchorRow >= p.height {
+		return
+	}
+
+	viewHeight := len(lines)
+	spaceAbove := anchorRow
+	spaceBelow := viewHeight - anchorRow - 1
+	maxZone := max(spaceAbove, spaceBelow)
+
+	popup := p.hoverPopup.View(p.width, maxZone, p.theme)
+	if popup == "" {
+		return
+	}
+	popupLines := strings.Split(popup, "\n")
+	popupHeight := len(popupLines)
+
+	popupWidth := 0
+	for _, pl := range popupLines {
+		if w := lipgloss.Width(pl); w > popupWidth {
+			popupWidth = w
+		}
+	}
+
+	col := p.contentToViewCol(anchorLine, p.hoverPopup.AnchorCol())
+	col = max(col, 0)
+	if p.width > 0 && popupWidth > 0 {
+		col = min(col, max(p.width-popupWidth, 0))
+	}
+
+	startRow := anchorRow - popupHeight
+	if startRow < 0 {
+		startRow = anchorRow + 1
+	}
+
+	for i, pLine := range popupLines {
+		row := startRow + i
+		if row < 0 || row >= len(lines) {
+			continue
+		}
+		original := lines[row]
+		left := truncateStyled(original, col)
+		right := skipStyledCols(original, col+popupWidth)
+		lines[row] = left + pLine + right
+	}
+}
+
+// skipStyledCols drops the first skip visible columns from a styled string
+// (containing ANSI escape sequences) and returns the remainder with a reset
+// prefix so subsequent styling is clean.
+func skipStyledCols(s string, skip int) string {
+	if skip <= 0 {
+		return s
+	}
+	vis := 0
+	i := 0
+	for i < len(s) && vis < skip {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSIEnd(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			i = j
+			continue
+		}
+		i++
+		vis++
+	}
+	if i >= len(s) {
+		return ""
+	}
+	return "\x1b[0m" + s[i:]
+}
+
+// isCSIEnd reports whether b is a CSI sequence terminator (ASCII letter or ~).
+func isCSIEnd(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~'
 }
 
 // ---------------------------------------------------------------------------

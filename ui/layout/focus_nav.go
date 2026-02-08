@@ -141,14 +141,16 @@ func navigateLeft(grid [][]PanelGroup, pos GridPos) component.FocusID {
 	return bottomRight(prevRow[len(prevRow)-1])
 }
 
-// navigateDown: sub-row+1 col=0 → next main-row first panel top-left.
+// navigateDown: sub-row+1 same-col → next main-row first panel top-left.
 // Wraps last row → first.
 func navigateDown(grid [][]PanelGroup, pos GridPos) component.FocusID {
 	pg := grid[pos.Row][pos.Col]
 
-	// Try moving to leftmost item of next sub-row.
+	// Try moving to same column of next sub-row.
 	if pos.SubRow+1 < len(pg.SubPanels) {
-		return pg.SubPanels[pos.SubRow+1][0]
+		next := pg.SubPanels[pos.SubRow+1]
+		col := min(pos.SubCol, len(next)-1)
+		return next[col]
 	}
 
 	// Exit panel: leftmost panel of next main row.
@@ -156,14 +158,16 @@ func navigateDown(grid [][]PanelGroup, pos GridPos) component.FocusID {
 	return topLeft(nextRow[0])
 }
 
-// navigateUp: sub-row-1 col=0 → previous main-row first panel top-left.
+// navigateUp: sub-row-1 same-col → previous main-row first panel top-left.
 // Wraps first row → last.
 func navigateUp(grid [][]PanelGroup, pos GridPos) component.FocusID {
 	pg := grid[pos.Row][pos.Col]
 
-	// Try moving to leftmost item of previous sub-row.
+	// Try moving to same column of previous sub-row.
 	if pos.SubRow > 0 {
-		return pg.SubPanels[pos.SubRow-1][0]
+		prev := pg.SubPanels[pos.SubRow-1]
+		col := min(pos.SubCol, len(prev)-1)
+		return prev[col]
 	}
 
 	// Exit panel: leftmost panel of previous main row.

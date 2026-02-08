@@ -53,6 +53,9 @@ func (s *SignatureHelp) Active() bool { return s.active }
 // AnchorLine returns the editor line this popup is anchored to.
 func (s *SignatureHelp) AnchorLine() int { return s.line }
 
+// AnchorCol returns the editor column this popup is anchored to.
+func (s *SignatureHelp) AnchorCol() int { return s.col }
+
 // View renders the signature popup as a bordered box with the active
 // parameter highlighted. Returns "" if inactive or no signatures.
 func (s *SignatureHelp) View(width int, th *theme.Theme) string {
@@ -62,6 +65,9 @@ func (s *SignatureHelp) View(width int, th *theme.Theme) string {
 
 	popupWidth := responsiveWidth(width)
 	innerWidth := popupWidth - 4 // 2 border chars + 2 padding chars
+	if innerWidth < 1 {
+		return ""
+	}
 
 	// Select active signature, clamped to valid range.
 	sigIdx := min(s.result.ActiveSignature, len(s.result.Signatures)-1)
@@ -136,19 +142,23 @@ func paramLabelOffsets(sigLabel string, param lsp.ParameterInformation) (int, in
 	return idx, idx + len(param.LabelString)
 }
 
-// responsiveWidth computes the popup width from the editor width.
+// responsiveWidth computes the popup width from the editor width,
+// clamped to never exceed the available space.
 func responsiveWidth(editorWidth int) int {
 	w := editorWidth * popupWidthFraction / popupWidthDivisor
-	return min(max(w, popupMinWidth), popupMaxCap)
+	return min(max(w, popupMinWidth), popupMaxCap, editorWidth)
 }
 
-// padToWidth pads styled content to fill innerWidth with background.
+// padToWidth truncates or pads styled content to exactly innerWidth.
 func padToWidth(content string, innerWidth int, bgStyle lipgloss.Style) string {
 	vis := lipgloss.Width(content)
-	if vis >= innerWidth {
-		return content
+	if vis > innerWidth {
+		return truncateStyled(content, innerWidth)
 	}
-	return content + bgStyle.Render(strings.Repeat(" ", innerWidth-vis))
+	if vis < innerWidth {
+		return content + bgStyle.Render(strings.Repeat(" ", innerWidth-vis))
+	}
+	return content
 }
 
 // truncate trims a string to at most maxWidth visible characters.
@@ -161,4 +171,39 @@ func truncate(s string, maxWidth int) string {
 		return string(runes[:maxWidth])
 	}
 	return string(runes[:maxWidth-3]) + "..."
+}
+
+// truncateStyled truncates a potentially ANSI-styled string to maxW visible
+// columns, preserving escape sequences and appending a reset.
+func truncateStyled(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	var b strings.Builder
+	col := 0
+	inEsc := false
+	for _, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			b.WriteRune(r)
+			continue
+		}
+		if inEsc {
+			b.WriteRune(r)
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		if col >= maxW {
+			break
+		}
+		b.WriteRune(r)
+		col++
+	}
+	b.WriteString("\x1b[0m")
+	return b.String()
 }

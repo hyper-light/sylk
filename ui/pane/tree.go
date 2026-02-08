@@ -171,6 +171,19 @@ func (n *Node) splitRecursive(target, newID PaneID, dir SplitDir) bool {
 	return n.Right.splitRecursive(target, newID, dir)
 }
 
+// InsertLeft wraps the entire tree as the right child of a new root node
+// and inserts newID as the left child. This ensures the new leaf is always
+// the leftmost pane regardless of existing tree structure.
+func (n *Node) InsertLeft(newID PaneID, dir SplitDir) {
+	existing := *n
+	n.Left = &Node{ID: newID}
+	n.Right = new(Node)
+	*n.Right = existing
+	n.ID = 0
+	n.Dir = dir
+	n.Ratio = defaultRatio
+}
+
 // Close removes the leaf with ID `target` from the tree. The target's
 // sibling replaces their parent node, effectively collapsing the split.
 // Returns the leftmost leaf ID of the sibling subtree (suitable as new
@@ -209,6 +222,93 @@ func (n *Node) rightmostLeaf() PaneID {
 		return n.ID
 	}
 	return n.Right.rightmostLeaf()
+}
+
+// ---------------------------------------------------------------------------
+// Ratio adjustment
+// ---------------------------------------------------------------------------
+
+// minRatio is the minimum value for a split ratio. Derived from: leaves need
+// at least ~10% of the parent's space to remain usable.
+const minRatio = 0.1
+
+// maxRatio is the maximum value for a split ratio (1 − minRatio).
+const maxRatio = 0.9
+
+// AdjustRatio adjusts the immediate parent split's ratio to grow (delta > 0)
+// or shrink (delta < 0) the leaf with the given ID. Returns false if the
+// leaf is the root or not found.
+func (n *Node) AdjustRatio(id PaneID, delta float64) bool {
+	parent, isLeft := n.findParent(id)
+	if parent == nil {
+		return false
+	}
+	// Left child: growing means increasing ratio (left gets more space).
+	// Right child: growing means decreasing ratio (right gets more space).
+	if isLeft {
+		parent.Ratio = clampRatio(parent.Ratio + delta)
+	} else {
+		parent.Ratio = clampRatio(parent.Ratio - delta)
+	}
+	return true
+}
+
+// Resize adjusts the nearest ancestor split whose direction matches the
+// given navigation direction. Uses the same walk-up algorithm as Navigate.
+// delta > 0 moves the divider in the specified direction; delta < 0 moves
+// it in the opposite direction. Returns false if no matching ancestor exists.
+func (n *Node) Resize(id PaneID, dir layout.Direction, delta float64) bool {
+	path := n.pathTo(id)
+	if len(path) == 0 {
+		return false
+	}
+
+	for i := len(path) - 1; i > 0; i-- {
+		ancestor := path[i-1]
+		child := path[i]
+		if ancestor.IsLeaf() {
+			continue
+		}
+
+		inLeft := ancestor.Left == child
+
+		var adjust float64
+		switch {
+		case dir == layout.DirRight && ancestor.Dir == SplitVertical && inLeft:
+			adjust = delta
+		case dir == layout.DirLeft && ancestor.Dir == SplitVertical && !inLeft:
+			adjust = -delta
+		case dir == layout.DirDown && ancestor.Dir == SplitHorizontal && inLeft:
+			adjust = delta
+		case dir == layout.DirUp && ancestor.Dir == SplitHorizontal && !inLeft:
+			adjust = -delta
+		default:
+			continue
+		}
+
+		ancestor.Ratio = clampRatio(ancestor.Ratio + adjust)
+		return true
+	}
+	return false
+}
+
+// Equalize sets all internal node ratios to defaultRatio (equal halves).
+// Uses an iterative stack traversal.
+func (n *Node) Equalize() {
+	stack := []*Node{n}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if cur.IsLeaf() {
+			continue
+		}
+		cur.Ratio = defaultRatio
+		stack = append(stack, cur.Left, cur.Right)
+	}
+}
+
+func clampRatio(r float64) float64 {
+	return max(minRatio, min(maxRatio, r))
 }
 
 // ---------------------------------------------------------------------------

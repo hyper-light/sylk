@@ -106,6 +106,9 @@ func (h *Hover) ScrollUp() { h.scrollOffset = max(h.scrollOffset-1, 0) }
 func (h *Hover) ContentHeight(width int, th *theme.Theme) int {
 	popupWidth := responsivePopupWidth(width)
 	innerWidth := popupWidth - 4 // 2 border chars + 2 padding chars
+	if innerWidth < 1 {
+		return 0
+	}
 	if h.renderedLines == nil || h.renderWidth != innerWidth {
 		styles := newHoverStyles(th)
 		h.renderedLines = renderMarkdown(h.content, innerWidth, styles, th)
@@ -164,10 +167,11 @@ func assembleScrollLines(content []string, showUp, showDown bool, above, below, 
 	return out
 }
 
-// responsivePopupWidth derives the popup width from the available editor width.
+// responsivePopupWidth derives the popup width from the available editor width,
+// clamped to never exceed the available space.
 func responsivePopupWidth(editorWidth int) int {
 	derived := editorWidth * popupWidthFraction / popupWidthDivisor
-	return max(min(derived, popupMaxCap), popupMinWidth)
+	return min(max(derived, popupMinWidth), popupMaxCap, editorWidth)
 }
 
 // View renders the hover popup as a styled string with markdown formatting,
@@ -181,6 +185,9 @@ func (h *Hover) View(width, maxLines int, th *theme.Theme) string {
 
 	popupWidth := responsivePopupWidth(width)
 	innerWidth := popupWidth - 4 // 2 border + 2 padding
+	if innerWidth < 1 {
+		return ""
+	}
 
 	// Render content lazily; invalidated by Show/Dismiss/SetDefinition.
 	if h.renderedLines == nil || h.renderWidth != innerWidth {
@@ -452,24 +459,87 @@ func visibleLength(line string) int {
 
 // wrapMarkdownLine splits a markdown line at word boundaries, keeping markdown
 // syntax intact within words. Uses visibleLength for width measurement.
+// Markdown tokens ([text](url), **bold**, `code`) are treated as atomic
+// units so internal spaces don't create invalid fragment breaks.
 func wrapMarkdownLine(line string, maxW int) []string {
-	words := strings.Fields(line)
-	if len(words) == 0 {
+	tokens := splitMarkdownTokens(line)
+	if len(tokens) == 0 {
 		return []string{""}
 	}
 	var lines []string
-	current := words[0]
-	for _, word := range words[1:] {
-		combined := current + " " + word
+	current := tokens[0]
+	for _, tok := range tokens[1:] {
+		combined := current + " " + tok
 		if visibleLength(combined) <= maxW {
 			current = combined
 			continue
 		}
 		lines = append(lines, current)
-		current = word
+		current = tok
 	}
 	lines = append(lines, current)
 	return lines
+}
+
+// splitMarkdownTokens splits a line into tokens for wrapping. Markdown
+// syntax blocks ([text](url), **bold**, `code`) are kept as single tokens
+// even when they contain internal spaces. Plain words are split on spaces.
+func splitMarkdownTokens(line string) []string {
+	runes := []rune(line)
+	var tokens []string
+	i := 0
+	for i < len(runes) {
+		for i < len(runes) && runes[i] == ' ' {
+			i++
+		}
+		if i >= len(runes) {
+			break
+		}
+		start := i
+		if end := markdownTokenEnd(runes, i); end > i {
+			i = end
+		} else {
+			for i < len(runes) && runes[i] != ' ' {
+				i++
+			}
+		}
+		tokens = append(tokens, string(runes[start:i]))
+	}
+	return tokens
+}
+
+// markdownTokenEnd returns the end index (exclusive) of a complete markdown
+// token starting at runes[i], or -1 if no markdown token starts there.
+func markdownTokenEnd(runes []rune, i int) int {
+	if runes[i] == '[' {
+		return linkTokenEnd(runes, i)
+	}
+	if i+1 < len(runes) && runes[i] == '*' && runes[i+1] == '*' {
+		end := indexDoubleRune(runes, '*', i+2)
+		if end > i {
+			return end + 2
+		}
+	}
+	if runes[i] == '`' {
+		end := indexRune(runes, '`', i+1)
+		if end > i {
+			return end + 1
+		}
+	}
+	return -1
+}
+
+// linkTokenEnd returns the end of a [text](url) link token, or -1.
+func linkTokenEnd(runes []rune, i int) int {
+	textEnd := indexRune(runes, ']', i+1)
+	if textEnd <= i || textEnd+1 >= len(runes) || runes[textEnd+1] != '(' {
+		return -1
+	}
+	urlEnd := indexRune(runes, ')', textEnd+2)
+	if urlEnd <= textEnd {
+		return -1
+	}
+	return urlEnd + 1
 }
 
 // renderInline processes inline markdown formatting in a single line.
@@ -598,12 +668,15 @@ func truncateStyled(s string, maxW int) string {
 	return b.String()
 }
 
-// padToVisualWidth right-pads a (possibly styled) string with spaces to
-// reach the desired visible width. Uses lipgloss.Width for ANSI awareness.
+// padToVisualWidth truncates or right-pads a (possibly styled) string to
+// exactly the desired visible width. Uses lipgloss.Width for ANSI awareness.
 func padToVisualWidth(s string, w int, bgStyle lipgloss.Style) string {
 	vis := lipgloss.Width(s)
-	if vis >= w {
-		return s
+	if vis > w {
+		return truncateStyled(s, w)
 	}
-	return s + bgStyle.Render(strings.Repeat(" ", w-vis))
+	if vis < w {
+		return s + bgStyle.Render(strings.Repeat(" ", w-vis))
+	}
+	return s
 }

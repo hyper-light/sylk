@@ -664,3 +664,119 @@ func TestDividersFourPane(t *testing.T) {
 		t.Fatalf("expected 1H + 2V dividers, got %dH + %dV", hCount, vCount)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// AdjustRatio
+// ---------------------------------------------------------------------------
+
+func TestAdjustRatioGrowLeftChild(t *testing.T) {
+	n := splitV(1, 2)
+	if !n.AdjustRatio(1, 0.1) {
+		t.Fatal("expected AdjustRatio to succeed")
+	}
+	if n.Ratio != 0.6 {
+		t.Fatalf("expected ratio 0.6, got %v", n.Ratio)
+	}
+}
+
+func TestAdjustRatioGrowRightChild(t *testing.T) {
+	n := splitV(1, 2)
+	if !n.AdjustRatio(2, 0.1) {
+		t.Fatal("expected AdjustRatio to succeed")
+	}
+	// Growing right child → ratio decreases.
+	if n.Ratio != 0.4 {
+		t.Fatalf("expected ratio 0.4, got %v", n.Ratio)
+	}
+}
+
+func TestAdjustRatioClamp(t *testing.T) {
+	n := splitV(1, 2)
+	n.Ratio = 0.85
+	n.AdjustRatio(1, 0.2) // Would be 1.05, clamped to 0.9.
+	if n.Ratio != maxRatio {
+		t.Fatalf("expected ratio %v (maxRatio), got %v", maxRatio, n.Ratio)
+	}
+}
+
+func TestAdjustRatioRootLeaf(t *testing.T) {
+	n := leaf(1)
+	if n.AdjustRatio(1, 0.1) {
+		t.Fatal("expected AdjustRatio on root leaf to return false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resize (directional)
+// ---------------------------------------------------------------------------
+
+func TestResizeRightFromLeftChild(t *testing.T) {
+	n := splitV(1, 2)
+	if !n.Resize(1, layout.DirRight, 0.1) {
+		t.Fatal("expected Resize to succeed")
+	}
+	if n.Ratio != 0.6 {
+		t.Fatalf("expected ratio 0.6, got %v", n.Ratio)
+	}
+}
+
+func TestResizeLeftFromRightChild(t *testing.T) {
+	n := splitV(1, 2)
+	if !n.Resize(2, layout.DirLeft, 0.1) {
+		t.Fatal("expected Resize to succeed")
+	}
+	// Pane 2 (right) grows left → ratio decreases.
+	if n.Ratio != 0.4 {
+		t.Fatalf("expected ratio 0.4, got %v", n.Ratio)
+	}
+}
+
+func TestResizeWalkUp(t *testing.T) {
+	// V(H(1,2), 3) — pane 1 is left child of H, which is left child of V.
+	// Resizing pane 1 rightward should adjust the V ancestor's ratio.
+	n := splitV(1, 3)
+	n.Left.Split(1, 2, SplitHorizontal, Rect{})
+	if !n.Resize(1, layout.DirRight, 0.1) {
+		t.Fatal("expected Resize to walk up to V ancestor")
+	}
+	if n.Ratio != 0.6 {
+		t.Fatalf("expected root ratio 0.6, got %v", n.Ratio)
+	}
+	// The H split should be unchanged.
+	if n.Left.Ratio != defaultRatio {
+		t.Fatalf("expected H split ratio unchanged at %v, got %v", defaultRatio, n.Left.Ratio)
+	}
+}
+
+func TestResizeNoMatchingAncestor(t *testing.T) {
+	// H(1, 2) — no vertical ancestor, so DirRight should fail.
+	n := splitH(1, 2)
+	if n.Resize(1, layout.DirRight, 0.1) {
+		t.Fatal("expected Resize to return false (no V ancestor)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Equalize
+// ---------------------------------------------------------------------------
+
+func TestEqualize(t *testing.T) {
+	n := splitV(1, 3)
+	n.Left.Split(1, 2, SplitHorizontal, Rect{})
+	n.Ratio = 0.7
+	n.Left.Ratio = 0.3
+
+	n.Equalize()
+
+	if n.Ratio != defaultRatio {
+		t.Fatalf("expected root ratio %v, got %v", defaultRatio, n.Ratio)
+	}
+	if n.Left.Ratio != defaultRatio {
+		t.Fatalf("expected left ratio %v, got %v", defaultRatio, n.Left.Ratio)
+	}
+}
+
+func TestEqualizeSingleLeaf(t *testing.T) {
+	n := leaf(1)
+	n.Equalize() // Should not panic.
+}

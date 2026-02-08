@@ -99,6 +99,10 @@ const sourceAgentTUI = "tui"
 // Derived from: 9 digit keys on the keyboard.
 const warpSlotCount = 9
 
+// ratioStep is the per-keypress adjustment to a split ratio.
+// Derived from: 5% per press gives 16 discrete positions between 0.1–0.9.
+const ratioStep = 0.05
+
 // WarpPoint stores a cursor position bookmark for instant teleportation.
 type WarpPoint struct {
 	Path     string // Absolute file path.
@@ -291,18 +295,20 @@ type AppModel struct {
 	tabDragIdx int // Tab index being dragged (-1 = none).
 
 	// Tab bar close-icon hover highlight.
-	tabHoverClose        int // Tab index whose close icon is hovered (-1 = none).
-	previewTabHoverClose int // Preview tab close icon hover (-1 = none).
+	tabHoverClose        int       // Tab index whose close icon is hovered (-1 = none).
+	tabHoverPane         pane.PaneID // Pane whose close icon is being hovered.
+	previewTabHoverClose int       // Preview tab close icon hover (-1 = none).
 
 	// Overflow arrow flash counters (remaining ticks at 16ms each).
 	tabArrowFlashLeft  int
 	tabArrowFlashRight int
 
 	// Mouse hover tracking for LSP hover tooltips.
-	hoverMouseLine      int // last buffer line the mouse was over (-1 = none)
-	hoverMouseCol       int // last buffer col for LSP request precision
-	hoverMouseWordStart int // start col of the word under cursor
+	hoverMouseLine      int  // last buffer line the mouse was over (-1 = none)
+	hoverMouseCol       int  // last buffer col for LSP request precision
+	hoverMouseWordStart int  // start col of the word under cursor
 	hoverPending        bool
+	hoverForPreview     bool // true when hover was triggered over the preview pane
 
 	// Pending hover definition: stashed when the definition response arrives
 	// before the hover content. Applied when the hover becomes active.
@@ -319,6 +325,9 @@ type AppModel struct {
 	// pendingClosePrompt is true while the status bar shows a save-before-close
 	// prompt. While active, handleKey intercepts y/n/esc to resolve it.
 	pendingClosePrompt bool
+	// pendingPaneClose is non-zero when the save prompt is for a pane close
+	// operation. The value is the PaneID being closed.
+	pendingPaneClose pane.PaneID
 
 	// Tiered LRU cache for background tab editor state (undo, buffer, cursor).
 	editorCache *editor.EditorCache
@@ -669,6 +678,7 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.hoverMouseCol = typed.Col
 		wordStart, _ := m.focusedEditor().WordBoundsAt(typed.Line, typed.Col)
 		m.hoverMouseWordStart = wordStart
+		m.hoverForPreview = false
 		m.pendingHoverSymbol = ""
 		m.pendingHoverPkgPath = ""
 		return m, tea.Batch(
@@ -678,6 +688,9 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.LSPMouseHoverTickMsg:
 		return m, m.handleMouseHoverTick(typed)
 	case msg.LSPHoverMsg:
+		if m.hoverForPreview {
+			return m, m.handlePreviewHoverMsg(typed)
+		}
 		// Discard stale hover responses if the mouse has moved to a different word.
 		wordStart, _ := m.focusedEditor().WordBoundsAt(typed.Line, typed.Col)
 		if typed.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
@@ -1193,6 +1206,17 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Alt+Shift+E: toggle between file explorer and last active editor pane.
+	if ks == "alt+E" && m.editMode {
+		if m.focus.Current() == component.FocusFileTree {
+			m.focusCodePanel()
+		} else {
+			m.focus.SetFocus(component.FocusFileTree)
+		}
+		m.syncFocusState()
+		return m, nil
+	}
+
 	// Alt+| (alt+shift+\): vertical split on focused editor pane.
 	if ks == "alt+|" && m.editMode && m.isEditorFocused() {
 		m.splitPane(pane.SplitVertical)
@@ -1208,6 +1232,30 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Alt+Shift+W: close focused pane.
 	if ks == "alt+W" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
 		m.closePane()
+		return m, nil
+	}
+
+	// Alt+]: grow focused pane (take space from sibling).
+	if ks == "alt+]" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+		if m.paneTree.AdjustRatio(m.focusedPane, ratioStep) {
+			m.resizeInlineEditor()
+		}
+		return m, nil
+	}
+
+	// Alt+[: shrink focused pane (give space to sibling).
+	if ks == "alt+[" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+		if m.paneTree.AdjustRatio(m.focusedPane, -ratioStep) {
+			m.resizeInlineEditor()
+		}
+		return m, nil
+	}
+
+	// Alt+=: equalize all split ratios.
+	if ks == "alt+=" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+		m.paneTree.Equalize()
+		m.resizeInlineEditor()
+		m.statusBar.SetFlash("Splits equalized")
 		return m, nil
 	}
 
@@ -1878,13 +1926,28 @@ func (m *AppModel) handleHoverDefinition(d msg.LSPDefinitionMsg) tea.Cmd {
 	loc := d.Locations[0]
 	filePath := lsp.FileURIToPath(loc.URI)
 
-	// Use the tracked hover position (works for both keyboard and mouse).
-	word := m.focusedEditor().WordAt(m.hoverMouseLine, m.hoverMouseCol)
+	// When hover is for preview, use the preview panel for word lookup.
+	var word string
+	if m.hoverForPreview {
+		word = m.previewPanel.WordAt(m.hoverMouseLine, m.hoverMouseCol)
+	} else {
+		word = m.focusedEditor().WordAt(m.hoverMouseLine, m.hoverMouseCol)
+	}
 
 	pkgName, pkgPath := defPackageInfo(filePath, m.config.ProjectRoot)
 	symbol := word
 	if pkgName != "" && word != "" {
 		symbol = pkgName + "." + word
+	}
+
+	if m.hoverForPreview {
+		if m.previewPanel.HoverActive() {
+			m.previewPanel.SetHoverDefinition(symbol, pkgPath)
+		} else {
+			m.pendingHoverSymbol = symbol
+			m.pendingHoverPkgPath = pkgPath
+		}
+		return nil
 	}
 
 	if m.focusedEditor().HoverActive() {
@@ -1893,6 +1956,26 @@ func (m *AppModel) handleHoverDefinition(d msg.LSPDefinitionMsg) tea.Cmd {
 		// Hover content hasn't arrived yet; stash for when it does.
 		m.pendingHoverSymbol = symbol
 		m.pendingHoverPkgPath = pkgPath
+	}
+	return nil
+}
+
+// handlePreviewHoverMsg processes an LSP hover response for the preview pane.
+func (m *AppModel) handlePreviewHoverMsg(h msg.LSPHoverMsg) tea.Cmd {
+	// Staleness check using preview panel methods.
+	wordStart, _ := m.previewPanel.WordBoundsAt(h.Line, h.Col)
+	if h.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+		return nil
+	}
+	if h.Err != nil || h.Result == nil || h.FilePath != m.previewPanel.FilePath() {
+		return nil
+	}
+	m.previewPanel.ShowHover(h.Result.Contents, h.Line, h.Col)
+	// Apply definition info that arrived before the hover content.
+	if m.previewPanel.HoverActive() && m.pendingHoverSymbol != "" {
+		m.previewPanel.SetHoverDefinition(m.pendingHoverSymbol, m.pendingHoverPkgPath)
+		m.pendingHoverSymbol = ""
+		m.pendingHoverPkgPath = ""
 	}
 	return nil
 }
@@ -2035,9 +2118,37 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 	if m.editMode {
 		oldPath := m.focusedEditor().FilePath()
 
-		// Already on this file — no switch needed, just jump.
+		// Already on this file in the focused pane — just jump.
 		if oldPath == o.Path {
 			m.appendTab(o.Path)
+			m.focusCodePanel()
+			m.syncFocusState()
+			if o.Line > 0 {
+				targetLine := o.Line - 1
+				if o.CursorCol > 0 {
+					m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
+				} else {
+					m.focusedEditor().GoToLine(targetLine)
+				}
+				m.codePanel.ScrollToLine(targetLine)
+				m.setJumpMarker(targetLine, o.Col, o.EndCol)
+			}
+			return nil
+		}
+
+		// Check if the file is already open in another pane.
+		if pid, _ := m.findPaneWithTab(o.Path); pid != 0 && pid != m.focusedPane {
+			m.focusedPane = pid
+			m.focusCodePanel()
+			m.syncFocusState()
+			// Switch to the tab within that pane.
+			ps := m.paneEditors[pid]
+			for i, p := range ps.tabOrder {
+				if p == o.Path {
+					m.switchToTab(i)
+					break
+				}
+			}
 			if o.Line > 0 {
 				targetLine := o.Line - 1
 				if o.CursorCol > 0 {
@@ -2070,6 +2181,10 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 		} else {
 			m.focusedEditor().OpenFile(o.Path, content, o.Language)
 		}
+
+		// Transfer focus to the editor pane receiving the file.
+		m.focusCodePanel()
+		m.syncFocusState()
 	}
 
 	if o.Line > 0 {
@@ -2942,9 +3057,9 @@ func (m *AppModel) paneTabBarConfig(id pane.PaneID, width int) tabbar.Config {
 	}
 
 	hasSplits := m.paneTree.LeafCount() > 1
-	isFocused := id == m.focusedPane
+	isFocused := id == m.focusedPane && m.isEditorFocused()
 	hoverClose := -1
-	if isFocused {
+	if id == m.tabHoverPane {
 		hoverClose = m.tabHoverClose
 	}
 
@@ -3044,19 +3159,24 @@ func (m *AppModel) handleFilePreview(o msg.FilePreviewMsg) tea.Cmd {
 		m.statusBar.SetFlash("Cannot preview: " + filepath.Base(o.Path))
 		return nil
 	}
+
+	// Close the LSP document for the previous preview file (unless it's
+	// also open in an editor tab).
+	oldPath := m.previewPanel.FilePath()
+	if oldPath != "" && oldPath != o.Path && !m.isFileOpenInEditor(oldPath) {
+		m.lspDidCloseAsync(oldPath)
+	}
+
 	content := string(data)
 	m.previewPanel.SetContent(content, o.Path, o.Language)
 
 	wasActive := m.hasPreview()
 	if !wasActive {
-		// Add preview leaf to the pane tree (left side of vertical split).
+		// Insert preview as the leftmost leaf at the root level so it's
+		// always the leftmost pane regardless of existing splits.
 		m.paneCounter++
 		m.previewPane = m.paneCounter
-		m.paneTree.Split(m.focusedPane, m.previewPane, pane.SplitVertical, pane.Rect{})
-		// Swap children so preview is on the left.
-		if !m.paneTree.IsLeaf() {
-			m.paneTree.Left, m.paneTree.Right = m.paneTree.Right, m.paneTree.Left
-		}
+		m.paneTree.InsertLeft(m.previewPane, pane.SplitVertical)
 	}
 
 	if o.Line > 0 {
@@ -3067,21 +3187,37 @@ func (m *AppModel) handleFilePreview(o msg.FilePreviewMsg) tea.Cmd {
 	if !wasActive {
 		m.recalcLayout()
 	}
-	return nil
+
+	// Notify LSP about the preview file so hover works. If the file is
+	// already open in an editor, the document tracker silently skips the
+	// duplicate open.
+	lang := detectEditorLanguage(o.Path)
+	return m.lspDidOpenCmd(o.Path, lang, content)
 }
 
 // dismissPreview closes the preview panel and restores the full code panel.
+// Focus moves to the last active editor pane when one exists.
 func (m *AppModel) dismissPreview() {
 	if !m.hasPreview() {
 		return
 	}
+	wasPreviewFocused := m.focus.Current() == pane.PaneFocusID(m.previewPane)
+	previewPath := m.previewPanel.FilePath()
+
 	// Remove preview leaf from the pane tree.
 	m.paneTree.Close(m.previewPane)
 	m.previewPane = 0
 	m.previewPanel.ClearFile()
 
-	if m.isPreviewFocused() {
-		if len(m.focusedTabOrder()) > 0 {
+	// Close the LSP document unless the file is also open in an editor tab.
+	if previewPath != "" && !m.isFileOpenInEditor(previewPath) {
+		m.lspDidCloseAsync(previewPath)
+	}
+
+	// Focus the last active editor pane. Fall back to file tree when
+	// no editor pane exists.
+	if wasPreviewFocused || !m.isEditorFocused() {
+		if len(m.paneEditors) > 0 {
 			m.focusCodePanel()
 		} else {
 			m.focus.SetFocus(component.FocusFileTree)
@@ -3089,6 +3225,19 @@ func (m *AppModel) dismissPreview() {
 	}
 	m.recalcLayout()
 	m.syncFocusState()
+}
+
+// isFileOpenInEditor reports whether the given file path is currently open
+// in any editor pane's tab order.
+func (m *AppModel) isFileOpenInEditor(path string) bool {
+	for _, ps := range m.paneEditors {
+		for _, tabPath := range ps.tabOrder {
+			if tabPath == path {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // splitPane splits the focused editor pane in the given direction, creating
@@ -3124,9 +3273,9 @@ func (m *AppModel) splitPane(dir pane.SplitDir) {
 	m.statusBar.SetFlash("Split pane")
 }
 
-// closePane closes the currently focused pane. The sibling subtree's
-// leftmost leaf receives focus. If only one pane remains (the root is
-// a leaf), this is a no-op.
+// closePane closes the currently focused pane. If the active editor has
+// unsaved modifications, a save prompt is shown first. The sibling subtree's
+// leftmost leaf receives focus. No-op if only one pane remains.
 func (m *AppModel) closePane() {
 	closingID := m.focusedPane
 
@@ -3136,7 +3285,22 @@ func (m *AppModel) closePane() {
 		return
 	}
 
-	// Detach all editors in the closing pane to cache.
+	// Check for unsaved modifications in the active editor.
+	ps := m.paneEditors[closingID]
+	if ps.editor.Modified() {
+		m.pendingPaneClose = closingID
+		m.pendingClosePrompt = true
+		name := filepath.Base(ps.editor.FilePath())
+		m.statusBar.SetPrompt("Save changes to " + name + " before closing pane? (y)es (n)o")
+		return
+	}
+
+	m.closePaneForce(closingID)
+}
+
+// closePaneForce unconditionally closes the pane with the given ID.
+// Detaches the editor to cache and collapses the tree node.
+func (m *AppModel) closePaneForce(closingID pane.PaneID) {
 	ps := m.paneEditors[closingID]
 	if ps.editor.FilePath() != "" {
 		ws := ps.editor.Detach()
@@ -3154,7 +3318,6 @@ func (m *AppModel) closePane() {
 	if _, isEditor := m.paneEditors[newFocus]; isEditor {
 		m.focusedPane = newFocus
 	} else {
-		// Fall back to any editor pane.
 		for id := range m.paneEditors {
 			m.focusedPane = id
 			break
@@ -3231,14 +3394,23 @@ func (m *AppModel) appendTab(path string) {
 	ps.tabOrder = append(ps.tabOrder, path)
 }
 
-// isExistingTab reports whether path is already in the tab order.
+// isExistingTab reports whether path is already open as a tab in any pane.
 func (m *AppModel) isExistingTab(path string) bool {
-	for _, p := range m.focusedTabOrder() {
-		if p == path {
-			return true
+	pid, _ := m.findPaneWithTab(path)
+	return pid != 0
+}
+
+// findPaneWithTab searches all editor panes for a tab matching the given
+// path. Returns the PaneID and tab index, or (0, -1) if not found.
+func (m *AppModel) findPaneWithTab(path string) (pane.PaneID, int) {
+	for id, ps := range m.paneEditors {
+		for i, p := range ps.tabOrder {
+			if p == path {
+				return id, i
+			}
 		}
 	}
-	return false
+	return 0, -1
 }
 
 // removeTab removes a file path from the tab order.
@@ -3289,14 +3461,59 @@ func (m *AppModel) handleTabBarClick(viewX int) (bool, tea.Cmd) {
 }
 
 // updateTabHoverClose updates the tab close-icon hover state from a motion event.
-// Handles split mode (preview left, editor right) and full-preview mode.
+// Handles multi-pane, split preview, and full-preview modes.
 func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 	m.tabHoverClose = -1
+	m.tabHoverPane = 0
 	m.previewTabHoverClose = -1
 
 	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
 		return
 	}
+
+	// Multi-pane mode: use tree-based hit testing.
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
+		if !ok || localY >= tabbar.Height {
+			return
+		}
+		if pid == m.previewPane {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.previewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Preview: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.IsClose {
+				m.previewTabHoverClose = hit.TabIndex
+			}
+			return
+		}
+		ps, exists := m.paneEditors[pid]
+		if !exists || len(ps.tabOrder) == 0 {
+			return
+		}
+		area := m.paneContentArea()
+		rects := m.paneTree.ComputeLayout(area)
+		r := rects[pid]
+		cfg := m.paneTabBarConfig(pid, r.W)
+		hit := tabbar.HitTest(cfg, localX)
+		if hit.IsClose {
+			m.tabHoverPane = pid
+			m.tabHoverClose = hit.TabIndex
+		}
+		return
+	}
+
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
 	if viewY >= tabbar.Height {
 		return
@@ -3330,6 +3547,7 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 	}
 	hit := tabbar.HitTest(m.tabBarConfig(), editorX)
 	if hit.IsClose {
+		m.tabHoverPane = m.focusedPane
 		m.tabHoverClose = hit.TabIndex
 	}
 }
@@ -3610,15 +3828,27 @@ func (m *AppModel) handleSavePromptKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "y":
 		m.statusBar.ClearPrompt()
 		m.pendingClosePrompt = false
+		if pid := m.pendingPaneClose; pid != 0 {
+			m.pendingPaneClose = 0
+			m.saveEditorBuffer()
+			m.closePaneForce(pid)
+			return m, nil
+		}
 		m.saveEditorBuffer()
 		return m, m.closeCurrentTab(true)
 	case "n":
 		m.statusBar.ClearPrompt()
 		m.pendingClosePrompt = false
+		if pid := m.pendingPaneClose; pid != 0 {
+			m.pendingPaneClose = 0
+			m.closePaneForce(pid)
+			return m, nil
+		}
 		return m, m.closeCurrentTab(true)
 	case "esc":
 		m.statusBar.ClearPrompt()
 		m.pendingClosePrompt = false
+		m.pendingPaneClose = 0
 		return m, nil
 	default:
 		return m, nil
@@ -3875,12 +4105,26 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	// Route wheel events to the hover popup when it is active and the
 	// cursor is over it, instead of scrolling the underlying panel.
 	if m.editMode && m.focusedEditor().HoverActive() && isWheelEvent(mouse) {
-		if m.isInsideCodePanel(mouse.X, mouse.Y) && !m.isInsidePreviewHalf(mouse.X) {
-			vx, vy := m.editorViewCoords(mouse.X, mouse.Y)
-			if pw := m.previewSplitWidth(); pw > 0 {
-				vx -= pw + 1 // offset past preview + divider
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			// Check preview hover popup scroll first.
+			if m.previewPanel.HoverActive() {
+				pvx, pvy := m.previewPaneLocalCoords(mouse.X, mouse.Y)
+				pvy -= tabbar.Height
+				if m.previewPanel.IsInsideHoverPopup(pvx, pvy) {
+					switch mouse.Button {
+					case tea.MouseButtonWheelUp:
+						m.previewPanel.ScrollHoverUp()
+					case tea.MouseButtonWheelDown:
+						m.previewPanel.ScrollHoverDown()
+					}
+					return nil
+				}
 			}
-			vy -= m.tabBarHeight()
+
+			vx, vy := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+			if len(m.focusedTabOrder()) > 0 {
+				vy -= tabbar.Height
+			}
 			vy -= m.focusedEditor().FindBarHeight()
 			if m.focusedEditor().IsInsideHoverPopup(vx, vy) {
 				switch mouse.Button {
@@ -3901,11 +4145,7 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	if m.editMode && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown && m.tabDragIdx < 0 {
 		m.updateTabHoverClose(mouse)
 		m.updateFileTreeTabHover(mouse)
-		// Skip LSP editor hover in full-preview mode (no editor tabs).
-		if !(m.hasPreview() && len(m.focusedTabOrder()) == 0) {
-			return m.handleEditorMouseHover(mouse)
-		}
-		return nil
+		return m.handleEditorMouseHover(mouse)
 	}
 
 	switch mouse.Button {
@@ -3913,13 +4153,13 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		if mouse.Alt {
 			m.applySwipeImpulse(mouse.X, -1)
 		} else {
-			m.applyScrollImpulse(mouse.X, -scrollImpulse)
+			m.applyScrollImpulse(mouse.X, mouse.Y, -scrollImpulse)
 		}
 	case tea.MouseButtonWheelDown:
 		if mouse.Alt {
 			m.applySwipeImpulse(mouse.X, 1)
 		} else {
-			m.applyScrollImpulse(mouse.X, scrollImpulse)
+			m.applyScrollImpulse(mouse.X, mouse.Y, scrollImpulse)
 		}
 	case tea.MouseButtonWheelLeft:
 		m.applySwipeImpulse(mouse.X, -1)
@@ -3961,7 +4201,7 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 // In SingleColumn mode PanelAtX has no candidates and always returns false,
 // so we fall back to the active leftRing panel. In TwoColumn/ThreeColumn
 // modes the fixed candidate IDs are mapped to the current ring occupant.
-func (m *AppModel) panelForScroll(x int) (component.FocusID, bool) {
+func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	mode := m.layout.Mode()
 
 	if mode == layout.SingleColumn {
@@ -3981,7 +4221,7 @@ func (m *AppModel) panelForScroll(x int) (component.FocusID, bool) {
 	// In edit mode, route scrolls within the code panel to the pane
 	// under the cursor using tree-based hit testing.
 	if resolved == component.FocusCodeViewer && m.editMode && m.paneTree != nil {
-		if pid, ok := m.hitTestPane(x); ok {
+		if pid, ok := m.hitTestPane(x, y); ok {
 			return pane.PaneFocusID(pid), true
 		}
 	}
@@ -4009,11 +4249,11 @@ func (m *AppModel) resolveRingPanel(id component.FocusID, mode layout.LayoutMode
 }
 
 // applyScrollImpulse adds displacement and velocity to the spring for the
-// panel at screen coordinate x. The velocity kick ensures the first frame
-// crosses an integer line boundary, giving immediate visual feedback.
+// panel at screen coordinates (x, y). The velocity kick ensures the first
+// frame crosses an integer line boundary, giving immediate visual feedback.
 // Switching panels resets the spring to avoid cross-panel drift.
-func (m *AppModel) applyScrollImpulse(x int, impulse float64) {
-	panelID, ok := m.panelForScroll(x)
+func (m *AppModel) applyScrollImpulse(x, y int, impulse float64) {
+	panelID, ok := m.panelForScroll(x, y)
 	if !ok {
 		return
 	}
@@ -4445,28 +4685,55 @@ func (m *AppModel) isInsidePreviewHalf(x int) bool {
 	return x >= contentLeft && x < contentLeft+pw
 }
 
-// hitTestPane returns the PaneID under screen coordinate x using the pane
-// tree's ComputeLayout. Converts screen x to content-local x before testing.
-func (m *AppModel) hitTestPane(screenX int) (pane.PaneID, bool) {
-	if m.paneTree == nil {
-		return 0, false
-	}
+// paneContentArea returns the inner area used by ComputeLayout for panes.
+func (m *AppModel) paneContentArea() pane.Rect {
 	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
 	innerW := max(rightW-panelBorderSize, 1)
 	innerH := max(rightH-panelBorderSize, 1)
 	contentH := max(innerH-1, 1) // minus status line
+	return pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+}
 
+// hitTestPane returns the PaneID under screen coordinates (screenX, screenY)
+// using the pane tree's ComputeLayout. Converts screen coords to content-local
+// before testing against pane rects.
+func (m *AppModel) hitTestPane(screenX, screenY int) (pane.PaneID, bool) {
+	if m.paneTree == nil {
+		return 0, false
+	}
 	codeX := m.codePanelX()
 	viewX := screenX - (codeX + 1) // skip left border
+	viewY := screenY - 1           // skip top border
 
-	area := pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+	area := m.paneContentArea()
 	rects := m.paneTree.ComputeLayout(area)
 	for id, r := range rects {
-		if viewX >= r.X && viewX < r.X+r.W {
+		if viewX >= r.X && viewX < r.X+r.W && viewY >= r.Y && viewY < r.Y+r.H {
 			return id, true
 		}
 	}
 	return 0, false
+}
+
+// paneViewCoords converts screen coordinates to pane-local coordinates.
+// Returns (paneID, localX, localY, ok). localX/localY are relative to the
+// pane's top-left corner within the code panel content area.
+func (m *AppModel) paneViewCoords(screenX, screenY int) (pane.PaneID, int, int, bool) {
+	if m.paneTree == nil {
+		return 0, 0, 0, false
+	}
+	codeX := m.codePanelX()
+	viewX := screenX - (codeX + 1)
+	viewY := screenY - 1
+
+	area := m.paneContentArea()
+	rects := m.paneTree.ComputeLayout(area)
+	for id, r := range rects {
+		if viewX >= r.X && viewX < r.X+r.W && viewY >= r.Y && viewY < r.Y+r.H {
+			return id, viewX - r.X, viewY - r.Y, true
+		}
+	}
+	return 0, 0, 0, false
 }
 
 // handleEditorMouse handles all left-button mouse actions (press, drag,
@@ -4503,6 +4770,9 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 					m.dismissPreview()
 					return true, nil
 				}
+			} else {
+				// Content click: position the cursor.
+				m.previewPanel.SetCursorFromViewport(viewX, viewY-tabbar.Height)
 			}
 			m.focus.SetFocus(pane.PaneFocusID(m.previewPane))
 			m.syncFocusState()
@@ -4512,11 +4782,14 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 
 	// Tab bar drag: reorder tabs in real time as the cursor moves.
 	if mouse.Action == tea.MouseActionMotion && m.tabDragIdx >= 0 {
-		viewX, _ := m.editorViewCoords(mouse.X, mouse.Y)
-		if pw := m.previewSplitWidth(); pw > 0 {
-			viewX -= pw + 1 // offset past preview + divider
+		viewX, _ := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+		r, hasPaneRect := m.focusedPaneRect()
+		var cfg tabbar.Config
+		if hasPaneRect {
+			cfg = m.paneTabBarConfig(m.focusedPane, r.W)
+		} else {
+			cfg = m.tabBarConfig()
 		}
-		cfg := m.tabBarConfig()
 		hit := tabbar.HitTest(cfg, viewX)
 		if hit.TabIndex >= 0 && hit.TabIndex != m.tabDragIdx {
 			m.focusedTabOrder()[m.tabDragIdx], m.focusedTabOrder()[hit.TabIndex] = m.focusedTabOrder()[hit.TabIndex], m.focusedTabOrder()[m.tabDragIdx]
@@ -4528,11 +4801,10 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	// Motion while dragging: extend selection even if the pointer left
 	// the panel bounds (clamp handled by the editor).
 	if mouse.Action == tea.MouseActionMotion && m.editorMouseDown {
-		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
-		if pw := m.previewSplitWidth(); pw > 0 {
-			viewX -= pw + 1 // offset past preview + divider
+		viewX, viewY := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+		if len(m.focusedTabOrder()) > 0 {
+			viewY -= tabbar.Height
 		}
-		viewY -= m.tabBarHeight()
 		viewY -= m.focusedEditor().FindBarHeight()
 		if !m.editorDragging {
 			m.focusedEditor().StartDragSelection()
@@ -4550,6 +4822,13 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
 		return false, nil
 	}
+
+	// Multi-pane mode: route via tree-based hit test.
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		return m.handleMultiPanePress(mouse)
+	}
+
+	// Single-pane / legacy preview-split path.
 
 	// In preview split mode, clicks on the preview half focus the preview
 	// panel. Tab bar close clicks dismiss the preview.
@@ -4573,12 +4852,139 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 				m.dismissPreview()
 				return true, nil
 			}
+		} else {
+			// Content click: position the cursor.
+			m.previewPanel.SetCursorFromViewport(viewX, viewY-tabbar.Height)
 		}
 		m.focus.SetFocus(pane.PaneFocusID(m.previewPane))
 		m.syncFocusState()
 		return true, nil
 	}
 
+	return m.handleEditorPaneClick(mouse)
+}
+
+// handleMultiPanePress routes a press event to the correct pane in multi-pane
+// mode using tree-based hit testing.
+func (m *AppModel) handleMultiPanePress(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
+	if !ok {
+		return false, nil
+	}
+
+	// Switch focus to the clicked pane.
+	m.focus.SetFocus(pane.PaneFocusID(pid))
+	m.syncFocusState()
+
+	// Preview pane click.
+	if pid == m.previewPane {
+		if localY < tabbar.Height {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.previewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Preview: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissPreview()
+				return true, nil
+			}
+		} else {
+			// Content click: position the cursor.
+			viewY := localY - tabbar.Height
+			m.previewPanel.SetCursorFromViewport(localX, viewY)
+		}
+		return true, nil
+	}
+
+	// Editor pane click.
+	ps, exists := m.paneEditors[pid]
+	if !exists {
+		return true, nil
+	}
+
+	// Tab bar click within pane.
+	if len(ps.tabOrder) > 0 && localY < tabbar.Height {
+		area := m.paneContentArea()
+		rects := m.paneTree.ComputeLayout(area)
+		r := rects[pid]
+		cfg := m.paneTabBarConfig(pid, r.W)
+		hit := tabbar.HitTest(cfg, localX)
+		if hit.IsLeftNav {
+			m.tabArrowFlashLeft = tabArrowFlashTicks
+			return true, m.prevTab()
+		}
+		if hit.IsRightNav {
+			m.tabArrowFlashRight = tabArrowFlashTicks
+			return true, m.nextTab()
+		}
+		if hit.TabIndex < 0 || hit.TabIndex >= len(ps.tabOrder) {
+			return true, nil
+		}
+		if hit.IsClose {
+			return true, m.closeTab(hit.TabIndex)
+		}
+		m.tabDragIdx = hit.TabIndex
+		return true, m.switchToTab(hit.TabIndex)
+	}
+
+	// Content click below tab bar.
+	viewX := localX
+	viewY := localY
+	if len(ps.tabOrder) > 0 {
+		viewY -= tabbar.Height
+	}
+
+	barH := ps.editor.ReplaceBarHeight()
+	if barH > 0 && viewY < barH {
+		ps.editor.HandleReplaceBarClick(viewX, viewY)
+		return true, nil
+	}
+	if barH == 0 {
+		barH = ps.editor.FindBarHeight()
+		if barH > 0 && viewY < barH {
+			ps.editor.HandleFindBarClick(viewX, viewY)
+			return true, nil
+		}
+	}
+	viewY -= barH
+
+	if cmd, handled := ps.editor.HandleHoverClick(viewX, viewY); handled {
+		return true, cmd
+	}
+	if ps.editor.HandleCompletionClick(viewX, viewY) {
+		return true, nil
+	}
+
+	ps.editor.ClickAt(viewX, viewY)
+	m.editorMouseDown = true
+	m.editorDragging = false
+
+	line := ps.editor.CursorLine()
+	col := ps.editor.CursorCol()
+	if ps.editor.IsWordCharAtPos(line, col) {
+		m.highlightLine = line
+		m.highlightCol = col
+		ps.editor.ClearHighlightRanges()
+		return true, tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+			return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+		})
+	}
+	ps.editor.ClearHighlightRanges()
+	return true, nil
+}
+
+// handleEditorPaneClick handles a click in the single editor pane (no splits).
+func (m *AppModel) handleEditorPaneClick(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
 
 	// In split mode, offset viewX to be relative to the editor half.
@@ -4671,6 +5077,58 @@ func (m *AppModel) editorViewCoords(screenX, screenY int) (int, int) {
 	return viewX, viewY
 }
 
+// focusedPaneRect returns the layout rectangle for the currently focused
+// editor pane. Returns a zero Rect and false when not in multi-pane mode.
+func (m *AppModel) focusedPaneRect() (pane.Rect, bool) {
+	if m.paneTree == nil || m.paneTree.IsLeaf() {
+		return pane.Rect{}, false
+	}
+	area := m.paneContentArea()
+	rects := m.paneTree.ComputeLayout(area)
+	r, ok := rects[m.focusedPane]
+	return r, ok
+}
+
+// focusedPaneLocalCoords converts screen coordinates to the focused pane's
+// local coordinates. In multi-pane mode, coordinates are relative to the
+// pane's top-left. In single-pane mode, falls back to editorViewCoords
+// with preview offset. Coordinates are clamped for drag safety.
+func (m *AppModel) focusedPaneLocalCoords(screenX, screenY int) (int, int) {
+	r, ok := m.focusedPaneRect()
+	if !ok {
+		viewX, viewY := m.editorViewCoords(screenX, screenY)
+		if pw := m.previewSplitWidth(); pw > 0 {
+			viewX -= pw + 1
+		}
+		return viewX, viewY
+	}
+	codeX := m.codePanelX()
+	viewX := screenX - (codeX + 1) - r.X
+	viewY := screenY - 1 - r.Y
+	viewX = max(0, min(viewX, r.W-1))
+	viewY = max(0, min(viewY, r.H-1))
+	return viewX, viewY
+}
+
+// previewPaneLocalCoords converts screen coordinates to the preview pane's
+// local coordinates. In multi-pane mode, uses the preview pane's rect from
+// ComputeLayout. In single-pane mode, uses the code panel's left half.
+func (m *AppModel) previewPaneLocalCoords(screenX, screenY int) (int, int) {
+	if m.paneTree != nil && !m.paneTree.IsLeaf() && m.hasPreview() {
+		area := m.paneContentArea()
+		rects := m.paneTree.ComputeLayout(area)
+		if r, ok := rects[m.previewPane]; ok {
+			codeX := m.codePanelX()
+			viewX := screenX - (codeX + 1) - r.X
+			viewY := screenY - 1 - r.Y
+			viewX = max(0, min(viewX, r.W-1))
+			viewY = max(0, min(viewY, r.H-1))
+			return viewX, viewY
+		}
+	}
+	return m.editorViewCoords(screenX, screenY)
+}
+
 // hoverDebounce delays before firing an LSP hover request.
 // Derived from: 150ms is responsive without flooding the server on fast swipes;
 // 50ms retrigger keeps the tooltip "following" the cursor between words.
@@ -4688,30 +5146,51 @@ const highlightDebounce = 100 * time.Millisecond
 // mouse moves to a new word in edit mode. Only triggers on word characters;
 // moving within the same word does not reset the debounce.
 func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
-	if !m.isInsideCodePanel(mouse.X, mouse.Y) || m.isInsidePreviewHalf(mouse.X) {
-		if m.focusedEditor().HoverActive() {
-			m.focusedEditor().DismissHover()
-		}
-		m.hoverMouseLine = -1
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		m.dismissAllHover()
 		return nil
 	}
-	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
-	if pw := m.previewSplitWidth(); pw > 0 {
-		viewX -= pw + 1 // offset past preview + divider
+
+	// Determine whether the mouse is over the preview pane.
+	overPreview := false
+	var viewX, viewY int
+
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		pid, lx, ly, ok := m.paneViewCoords(mouse.X, mouse.Y)
+		if !ok {
+			m.dismissAllHover()
+			return nil
+		}
+		if m.hasPreview() && pid == m.previewPane {
+			overPreview = true
+			viewX, viewY = lx, ly
+			// Account for tab bar height in the preview pane.
+			viewY -= tabbar.Height
+		} else if pid != m.focusedPane {
+			m.dismissAllHover()
+			return nil
+		}
+	} else if m.isInsidePreviewHalf(mouse.X) {
+		overPreview = true
 	}
-	viewY -= m.tabBarHeight()
+
+	if overPreview {
+		return m.handlePreviewMouseHover(mouse, viewX, viewY)
+	}
+
+	// Editor pane hover (original path).
+	viewX, viewY = m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+	if len(m.focusedTabOrder()) > 0 {
+		viewY -= tabbar.Height
+	}
 	viewY -= m.focusedEditor().FindBarHeight()
 
-	// When the mouse is inside the popup, keep it stable so the user
-	// can scroll with the wheel. Only "see through" to the buffer when
-	// the mouse is outside the popup bounds.
+	// Keep hover stable when the mouse is inside the popup.
 	if m.focusedEditor().HoverActive() && m.focusedEditor().IsInsideHoverPopup(viewX, viewY) {
 		return nil
 	}
 
-	// When the mouse crosses a non-hover overlay (signature help or
-	// completion) on its way to the hover tooltip, keep hover stable
-	// so it doesn't vanish mid-transit.
+	// Keep hover stable when crossing a non-hover overlay (signature/completion).
 	if m.focusedEditor().HoverActive() && m.focusedEditor().IsInsideOverlayPopup(viewX, viewY) {
 		return nil
 	}
@@ -4721,39 +5200,97 @@ func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
-	// Only fire hover on word characters (identifiers, not whitespace).
 	if !m.focusedEditor().IsWordCharAtPos(line, col) {
-		if m.focusedEditor().HoverActive() {
-			m.focusedEditor().DismissHover()
-		}
-		m.hoverMouseLine = -1
+		m.dismissAllHover()
 		return nil
 	}
 
-	// Compare by word boundary, not exact column — moving within the
-	// same identifier should not reset the debounce timer.
 	wordStart, _ := m.focusedEditor().WordBoundsAt(line, col)
-	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart {
+	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart && !m.hoverForPreview {
 		return nil
 	}
 
-	// Dismiss the current tooltip immediately so the user can see the
-	// source line they just moved to — especially when the old popup
-	// was overlaying that line.
 	debounce := hoverInitialDebounce
-	if m.focusedEditor().HoverActive() {
-		m.focusedEditor().DismissHover()
+	if m.focusedEditor().HoverActive() || m.previewPanel.HoverActive() {
+		m.dismissAllHover()
 		debounce = hoverRetriggerDebounce
 	}
 
 	m.hoverMouseLine = line
 	m.hoverMouseCol = col
 	m.hoverMouseWordStart = wordStart
+	m.hoverForPreview = false
 	m.pendingHoverSymbol = ""
 	m.pendingHoverPkgPath = ""
 	return tea.Tick(debounce, func(_ time.Time) tea.Msg {
 		return msg.LSPMouseHoverTickMsg{Line: line, Col: col}
 	})
+}
+
+// handlePreviewMouseHover handles hover detection when the mouse is over
+// the preview pane. Uses the preview panel's coordinate conversion and
+// word detection methods.
+func (m *AppModel) handlePreviewMouseHover(mouse tea.MouseMsg, viewX, viewY int) tea.Cmd {
+	if m.previewPanel.FilePath() == "" {
+		m.dismissAllHover()
+		return nil
+	}
+
+	// In single-pane mode, compute local coords from the code panel.
+	if m.paneTree == nil || m.paneTree.IsLeaf() {
+		vx, vy := m.editorViewCoords(mouse.X, mouse.Y)
+		viewX, viewY = vx, vy
+		// Account for tab bar in single-pane preview.
+		viewY -= tabbar.Height
+	}
+
+	// Keep hover stable when the mouse is inside the preview's hover popup.
+	if m.previewPanel.HoverActive() && m.previewPanel.IsInsideHoverPopup(viewX, viewY) {
+		return nil
+	}
+
+	line, col, ok := m.previewPanel.ViewportToBufferPos(viewX, viewY)
+	if !ok {
+		return nil
+	}
+
+	if !m.previewPanel.IsWordCharAtPos(line, col) {
+		m.dismissAllHover()
+		return nil
+	}
+
+	wordStart, _ := m.previewPanel.WordBoundsAt(line, col)
+	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart && m.hoverForPreview {
+		return nil
+	}
+
+	debounce := hoverInitialDebounce
+	if m.previewPanel.HoverActive() || m.focusedEditor().HoverActive() {
+		m.dismissAllHover()
+		debounce = hoverRetriggerDebounce
+	}
+
+	m.hoverMouseLine = line
+	m.hoverMouseCol = col
+	m.hoverMouseWordStart = wordStart
+	m.hoverForPreview = true
+	m.pendingHoverSymbol = ""
+	m.pendingHoverPkgPath = ""
+	return tea.Tick(debounce, func(_ time.Time) tea.Msg {
+		return msg.LSPMouseHoverTickMsg{Line: line, Col: col}
+	})
+}
+
+// dismissAllHover dismisses both editor and preview hover tooltips and
+// resets the hover tracking state.
+func (m *AppModel) dismissAllHover() {
+	if m.focusedEditor().HoverActive() {
+		m.focusedEditor().DismissHover()
+	}
+	if m.previewPanel.HoverActive() {
+		m.previewPanel.DismissHover()
+	}
+	m.hoverMouseLine = -1
 }
 
 // handleMouseHoverTick processes the debounced hover tick. If the mouse
@@ -4762,7 +5299,26 @@ func (m *AppModel) handleMouseHoverTick(tick msg.LSPMouseHoverTickMsg) tea.Cmd {
 	if !m.editMode {
 		return nil
 	}
-	// Check the mouse is still on the same word (by line + wordStart).
+
+	// When hover is for the preview pane, use preview panel methods.
+	if m.hoverForPreview {
+		wordStart, _ := m.previewPanel.WordBoundsAt(tick.Line, tick.Col)
+		if tick.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+			return nil
+		}
+		filePath := m.previewPanel.FilePath()
+		if filePath == "" {
+			return nil
+		}
+		m.pendingHoverSymbol = ""
+		m.pendingHoverPkgPath = ""
+		return tea.Batch(
+			m.lspHoverCmd(filePath, tick.Line, tick.Col),
+			m.lspDefinitionCmd(filePath, tick.Line, tick.Col, true),
+		)
+	}
+
+	// Editor pane hover.
 	wordStart, _ := m.focusedEditor().WordBoundsAt(tick.Line, tick.Col)
 	if tick.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
 		return nil
@@ -5539,9 +6095,18 @@ func (m *AppModel) syncFocusState() {
 	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
 	m.codePanel.SetFocused(current == component.FocusCodeViewer && !m.editMode && !m.hasPreview())
-	m.focusedEditor().SetFocused(m.isEditorFocused())
+	for id, ps := range m.paneEditors {
+		focused := current == pane.PaneFocusID(id)
+		ps.editor.SetFocused(focused)
+		if !focused {
+			ps.editor.DismissAllOverlays()
+		}
+	}
 	m.previewPanel.SetFocused(m.isPreviewFocused())
 	m.fileTree.SetFocused(current == component.FocusFileTree)
+
+	// Sync warp line display for the newly focused editor.
+	m.syncEditorWarpLines()
 
 	// Override the editor status line mode when preview is focused.
 	m.syncPreviewModeDisplay()
@@ -5550,7 +6115,8 @@ func (m *AppModel) syncFocusState() {
 // syncPreviewModeDisplay sets the editor status line to PREVIEW mode when
 // the preview panel is focused, and restores the editor's actual mode otherwise.
 func (m *AppModel) syncPreviewModeDisplay() {
-	if m.isPreviewFocused() {
+	browsing := m.hasPreview() && m.focus.Current() == component.FocusFileTree
+	if m.isPreviewFocused() || browsing {
 		m.focusedEditor().SetStatusMode(mode.ModePreview)
 		return
 	}

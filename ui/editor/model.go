@@ -287,7 +287,11 @@ func (m *Model) StatusLineView(width int) string {
 // message when no file is open.
 func (m *Model) renderPlaceholder() string {
 	const placeholder = "Open any file to edit."
-	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	color := m.theme.Palette.Muted
+	if m.focused {
+		color = m.theme.Palette.Primary
+	}
+	style := lipgloss.NewStyle().Foreground(color)
 
 	textWidth := lipgloss.Width(placeholder)
 	padLeft := max((m.width-textWidth)/2, 0)
@@ -649,6 +653,16 @@ func (m *Model) DismissSignatureHelp() {
 // SignatureHelpActive reports whether the signature popup is visible.
 func (m *Model) SignatureHelpActive() bool { return m.sigHelpActive }
 
+// DismissCompletion hides the completion popup.
+func (m *Model) DismissCompletion() { m.completionEngine.Dismiss() }
+
+// DismissAllOverlays dismisses hover, signature help, and completion popups.
+func (m *Model) DismissAllOverlays() {
+	m.DismissHover()
+	m.DismissSignatureHelp()
+	m.DismissCompletion()
+}
+
 // ---------------------------------------------------------------------------
 // Document Highlights
 // ---------------------------------------------------------------------------
@@ -842,10 +856,11 @@ type popupPlacement struct {
 	start   int    // first viewport row
 	height  int    // number of viewport rows occupied
 	width   int    // visual width in columns (derived from rendered content)
+	col     int    // visual column in the viewport line (0 = left edge)
 }
 
 // newPopupPlacement derives height and width from actual rendered content.
-func newPopupPlacement(content string, start int) popupPlacement {
+func newPopupPlacement(content string, start, col int) popupPlacement {
 	if content == "" {
 		return popupPlacement{}
 	}
@@ -855,6 +870,7 @@ func newPopupPlacement(content string, start int) popupPlacement {
 		start:   start,
 		height:  strings.Count(content, "\n") + 1,
 		width:   lipgloss.Width(firstLine),
+		col:     col,
 	}
 }
 
@@ -879,6 +895,21 @@ func layoutScore(compH, compItems, hoverH, hoverContentLines int) int {
 	compVisible := min(max(compH-completion.PopupChromeRows(), 0), compItems)
 	hoverVisible := min(max(hoverH-hover.BorderRows, 0), hoverContentLines)
 	return compVisible + hoverVisible
+}
+
+// contentToViewCol converts a buffer line/column to a visual column in
+// the viewport line (accounting for gutter width, tab expansion, and
+// horizontal scroll).
+func (m *Model) contentToViewCol(lineNum, col int) int {
+	totalLines := m.lineIndex.Count()
+	if lineNum < 0 || lineNum >= totalLines {
+		return m.gutterWidth(totalLines)
+	}
+	line := m.buf.Line(lineNum)
+	_, colMap := expandTabs(line, editorTabWidth)
+	displayCol := safeMapCol(colMap, col)
+	gutterW := m.gutterWidth(totalLines)
+	return gutterW + max(displayCol-m.scrollLeftCol, 0)
 }
 
 // popupLayout computes collision-free viewport positions for all active
@@ -925,7 +956,8 @@ func (m *Model) sigHelpPlacement(_ int) popupPlacement {
 		return popupPlacement{}
 	}
 	popup := m.sigHelp.View(m.width, m.theme)
-	p := newPopupPlacement(popup, 0)
+	col := m.contentToViewCol(anchor, m.sigHelp.AnchorCol())
+	p := newPopupPlacement(popup, 0, col)
 	anchorRow := m.contentLineToViewRow(anchor)
 	if anchorRow < p.height {
 		return popupPlacement{}
@@ -948,7 +980,8 @@ func (m *Model) completionPlacement(cursorRow, viewHeight int) popupPlacement {
 	if popup == "" {
 		return popupPlacement{}
 	}
-	return newPopupPlacement(popup, start)
+	col := m.contentToViewCol(m.state.CursorLine, m.completionEngine.StartCol())
+	return newPopupPlacement(popup, start, col)
 }
 
 // baseZones computes free intervals with only sig, cursor, and anchor
@@ -1169,7 +1202,8 @@ func (m *Model) renderComp(start, allocHeight int) popupPlacement {
 	if popup == "" {
 		return popupPlacement{}
 	}
-	return newPopupPlacement(popup, start)
+	col := m.contentToViewCol(m.state.CursorLine, m.completionEngine.StartCol())
+	return newPopupPlacement(popup, start, col)
 }
 
 // renderHover renders hover constrained to the allocated zone and height.
@@ -1178,7 +1212,8 @@ func (m *Model) renderHover(zone rowInterval, allocHeight, anchorRow int) popupP
 		return popupPlacement{}
 	}
 	popup := m.hoverPopup.View(m.width, allocHeight, m.theme)
-	p := newPopupPlacement(popup, 0)
+	col := m.contentToViewCol(m.hoverPopup.AnchorLine(), m.hoverPopup.AnchorCol())
+	p := newPopupPlacement(popup, 0, col)
 	p.start = hoverSlot(zone, anchorRow, p.height)
 	return p
 }
@@ -1276,23 +1311,69 @@ func preferAbove(distBelow, distAbove int) bool {
 // writes them into the viewport lines.
 func (m *Model) overlayPopups(lines []string, viewHeight int) []string {
 	sig, hover, comp := m.popupLayout(viewHeight)
-	applyPopupOverlay(lines, sig)
-	applyPopupOverlay(lines, hover)
-	applyPopupOverlay(lines, comp)
+	applyPopupOverlay(lines, sig, m.width)
+	applyPopupOverlay(lines, hover, m.width)
+	applyPopupOverlay(lines, comp, m.width)
 	return lines
 }
 
-// applyPopupOverlay stamps a popup's rendered lines onto the viewport.
-func applyPopupOverlay(lines []string, p popupPlacement) {
+// applyPopupOverlay splices a popup's rendered lines into the viewport at
+// the correct column, preserving text before and after the popup.
+func applyPopupOverlay(lines []string, p popupPlacement, lineWidth int) {
 	if p.content == "" {
 		return
 	}
+	// Clamp column so the popup stays within the viewport.
+	col := max(p.col, 0)
+	if lineWidth > 0 && p.width > 0 {
+		col = min(col, max(lineWidth-p.width, 0))
+	}
 	for i, pLine := range strings.Split(p.content, "\n") {
 		row := p.start + i
-		if row >= 0 && row < len(lines) {
-			lines[row] = pLine
+		if row < 0 || row >= len(lines) {
+			continue
 		}
+		original := lines[row]
+		left := truncateStyledLine(original, col)
+		right := skipStyledCols(original, col+p.width)
+		lines[row] = left + pLine + right
 	}
+}
+
+// skipStyledCols drops the first skip visible columns from a styled string
+// (containing ANSI escape sequences) and returns the remainder. Escape
+// sequences within the skipped region are discarded; the returned text
+// carries its own embedded ANSI styling.
+func skipStyledCols(s string, skip int) string {
+	if skip <= 0 {
+		return s
+	}
+	vis := 0
+	i := 0
+	for i < len(s) && vis < skip {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSIEnd(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			i = j
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(s[i:])
+		vis++
+		i += size
+	}
+	if i >= len(s) {
+		return ""
+	}
+	// Reset ANSI state so popup styling does not bleed into the remainder.
+	return "\x1b[0m" + s[i:]
 }
 
 // acceptCompletion replaces the current prefix with the selected completion
@@ -2743,7 +2824,9 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 				result = append(result, m.renderHighlightLine(
 					i, displayLine, displayRegions, gutterWidth, defaultStyle, hlSpans, curCol, ulRanges))
 			} else if wInfo, isWarp := m.warpLines[i]; isWarp {
-				warpSpan := []colSpan{{start: wInfo.StartCol, end: min(wInfo.EndCol, displayLineRunes)}}
+				ws := max(safeMapCol(colMap, wInfo.StartCol)-vs, 0)
+				we := min(safeMapCol(colMap, wInfo.EndCol)-vs, displayLineRunes)
+				warpSpan := []colSpan{{start: ws, end: we}}
 				result = append(result, m.renderWarpLine(
 					i, displayLine, displayRegions, gutterWidth, defaultStyle, warpSpan, curCol, ulRanges))
 			} else if curCol >= 0 {
@@ -2760,7 +2843,9 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 				i, displayLine, displayRegions, gutterWidth, defaultStyle, hlSpans, -1, ulRanges))
 		default:
 			if wInfo, isWarp := m.warpLines[i]; isWarp {
-				warpSpan := []colSpan{{start: wInfo.StartCol, end: min(wInfo.EndCol, displayLineRunes)}}
+				ws := max(safeMapCol(colMap, wInfo.StartCol)-vs, 0)
+				we := min(safeMapCol(colMap, wInfo.EndCol)-vs, displayLineRunes)
+				warpSpan := []colSpan{{start: ws, end: we}}
 				result = append(result, m.renderWarpLine(
 					i, displayLine, displayRegions, gutterWidth, defaultStyle, warpSpan, -1, ulRanges))
 			} else {
