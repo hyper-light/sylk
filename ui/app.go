@@ -6512,6 +6512,12 @@ func (m *AppModel) detectDirtySlots() {
 		}
 	}
 
+	// Preview panel: no view cache, so mark dirty whenever it is focused
+	// (cursor blink changes its output on every blink cycle).
+	if m.hasPreview() && m.isPreviewFocused() {
+		m.comp.MarkDirty(compositor.SlotRight)
+	}
+
 	// Left panel (session+agent): no viewDirty — always mark if main dirty.
 	// The compositor avoids re-rendering unless the slot is already dirty.
 }
@@ -7170,6 +7176,10 @@ func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
 	if m.hasPreview() && m.isPreviewFocused() {
 		m.previewPanel.ToggleBlink()
 		toggled = true
+	}
+	// Toggle find/replace bars in edit mode when active.
+	if m.editMode {
+		m.focusedEditor().ToggleBarBlink()
 	}
 
 	if toggled {

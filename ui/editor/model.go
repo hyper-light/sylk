@@ -21,13 +21,13 @@ import (
 	"github.com/adalundhe/sylk/ui/editor/buffer"
 	"github.com/adalundhe/sylk/ui/editor/completion"
 	"github.com/adalundhe/sylk/ui/editor/findbar"
-	"github.com/adalundhe/sylk/ui/editor/replacebar"
-	"github.com/adalundhe/sylk/ui/editor/search"
 	"github.com/adalundhe/sylk/ui/editor/highlight"
 	"github.com/adalundhe/sylk/ui/editor/hover"
 	"github.com/adalundhe/sylk/ui/editor/mode"
-	"github.com/adalundhe/sylk/ui/editor/signature"
 	"github.com/adalundhe/sylk/ui/editor/motion"
+	"github.com/adalundhe/sylk/ui/editor/replacebar"
+	"github.com/adalundhe/sylk/ui/editor/search"
+	"github.com/adalundhe/sylk/ui/editor/signature"
 	"github.com/adalundhe/sylk/ui/editor/statusline"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -126,10 +126,11 @@ type Model struct {
 	replaceActive bool
 
 	// Focus and cursor blink.
-	focused      bool
-	cursorBlink  bool      // current blink phase (true = visible)
-	lastBlinkAt  time.Time // timestamp of the last blink toggle
-	theme        *theme.Theme
+	focused     bool
+	cursorBlink bool      // current blink phase (true = visible)
+	lastBlinkAt time.Time // timestamp of the last blink toggle
+	barBlink    bool      // blink phase for find/replace bars
+	theme       *theme.Theme
 
 	// View cache: avoids re-rendering all visible lines when only
 	// the cursor blink state changed.
@@ -138,14 +139,14 @@ type Model struct {
 
 // viewCache stores cached renderVisibleLines output for the editor.
 type viewCache struct {
-	lines          []string // Cached rendered lines (before post-processing).
-	viewHeight     int      // Height the cache was rendered at.
-	scrollOffset   int      // Vertical scroll offset at render time.
-	scrollLeftCol  int      // Horizontal scroll offset at render time.
-	cursorLine     int      // Source line the cursor was on.
-	cursorRenderIdx int     // Index in lines[] of the cursor line.
-	valid          bool     // False when structural state changed.
-	cursorOK       bool     // False when only cursor blink changed.
+	lines           []string // Cached rendered lines (before post-processing).
+	viewHeight      int      // Height the cache was rendered at.
+	scrollOffset    int      // Vertical scroll offset at render time.
+	scrollLeftCol   int      // Horizontal scroll offset at render time.
+	cursorLine      int      // Source line the cursor was on.
+	cursorRenderIdx int      // Index in lines[] of the cursor line.
+	valid           bool     // False when structural state changed.
+	cursorOK        bool     // False when only cursor blink changed.
 
 	// Post-processing cache: stores the final ViewContent body output
 	// (after fitLine, applyBounceShift, overlayPopups, join).
@@ -180,23 +181,24 @@ func New(th *theme.Theme) *Model {
 	registry.Register(completion.BufferWordSource{})
 	registry.Register(lspSrc)
 	return &Model{
-		buf:         pt,
-		lineIndex:   li,
-		undoTree:    ut,
-		state:       st,
-		currentMode: mode.ModeNormal,
-		normalMode:  mode.NewNormalMode(th),
-		insertMode:  mode.NewInsertMode(th),
-		highlighter: highlight.NewHighlighter(th),
-		statusLine:  statusline.New(th),
+		buf:              pt,
+		lineIndex:        li,
+		undoTree:         ut,
+		state:            st,
+		currentMode:      mode.ModeNormal,
+		normalMode:       mode.NewNormalMode(th),
+		insertMode:       mode.NewInsertMode(th),
+		highlighter:      highlight.NewHighlighter(th),
+		statusLine:       statusline.New(th),
 		jumpList:         motion.NewJumpList(),
 		hoverPopup:       hover.New(),
 		sigHelp:          signature.New(),
 		completionEngine: completion.NewEngine(registry),
 		lspSource:        lspSrc,
 		cursorBlink:      true,
-		lastBlinkAt: time.Now(),
-		theme:       th,
+		barBlink:         true,
+		lastBlinkAt:      time.Now(),
+		theme:            th,
 	}
 }
 
@@ -273,11 +275,11 @@ func (m *Model) ViewContent() string {
 	barStr := ""
 	barH := 0
 	if m.replaceActive && m.replaceBar != nil {
-		barStr = m.replaceBar.View(m.width, m.theme, m.cursorBlink)
+		barStr = m.replaceBar.View(m.width, m.theme, m.barBlink)
 		barH = m.replaceBar.Height()
 		viewHeight -= barH
 	} else if m.findActive && m.findBar != nil {
-		barStr = m.findBar.View(m.width, m.theme, m.cursorBlink)
+		barStr = m.findBar.View(m.width, m.theme, m.barBlink)
 		barH = m.findBar.Height()
 		viewHeight -= barH
 	}
@@ -459,8 +461,8 @@ func (m *Model) renderPlaceholder() string {
 // component.Focusable
 // ---------------------------------------------------------------------------
 
-func (m *Model) ID() component.FocusID  { return component.FocusEditor }
-func (m *Model) Focused() bool           { return m.focused }
+func (m *Model) ID() component.FocusID { return component.FocusEditor }
+func (m *Model) Focused() bool         { return m.focused }
 func (m *Model) SetFocused(focused bool) {
 	if !focused && isVisualMode(m.currentMode) {
 		m.visualMode = nil
@@ -1639,7 +1641,6 @@ func (m *Model) runeColToByteCol(lineInfo buffer.LineInfo, runeCol int) int {
 	return byteCol
 }
 
-
 // triggerCompletion starts the completion engine and returns a Cmd to
 // request LSP completion items for the current cursor position. Returns
 // nil if no file is open or the prefix is empty.
@@ -2421,17 +2422,17 @@ func msgType(incoming tea.Msg) msgKind {
 type msgHandler func(m *Model, incoming tea.Msg) (component.Component, tea.Cmd)
 
 var msgHandlerTable = map[msgKind]msgHandler{
-	msgKindOpenEditor:    handleOpenEditor,
-	msgKindCloseEditor:   handleCloseEditor,
-	msgKindKeyMsg:        handleKeyMsg,
-	msgKindTickMsg:       handleTickMsg,
-	msgKindLSPDiagnostic: handleLSPDiagnostic,
-	msgKindLSPHover:      handleLSPHover,
+	msgKindOpenEditor:       handleOpenEditor,
+	msgKindCloseEditor:      handleCloseEditor,
+	msgKindKeyMsg:           handleKeyMsg,
+	msgKindTickMsg:          handleTickMsg,
+	msgKindLSPDiagnostic:    handleLSPDiagnostic,
+	msgKindLSPHover:         handleLSPHover,
 	msgKindLSPDefinition:    handleLSPDefinition,
 	msgKindStandaloneResult: handleStandaloneResult,
 	msgKindLSPCompletion:    handleLSPCompletion,
-	msgKindLSPDocHighlight:   handleLSPDocHighlight,
-	msgKindLSPSignatureHelp:  handleLSPSignatureHelp,
+	msgKindLSPDocHighlight:  handleLSPDocHighlight,
+	msgKindLSPSignatureHelp: handleLSPSignatureHelp,
 }
 
 func handleOpenEditor(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
@@ -2577,11 +2578,20 @@ func (m *Model) ToggleBlink() {
 	m.vc.cursorOK = false
 }
 
+// ToggleBarBlink flips the blink phase for the find/replace bars without
+// touching the main cursor blink. Safe to call even when bars are inactive.
+func (m *Model) ToggleBarBlink() {
+	if m.findActive || m.replaceActive {
+		m.barBlink = !m.barBlink
+	}
+}
+
 func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 	key := incoming.(tea.KeyMsg)
 
 	// Any keystroke resets cursor to visible and restarts blink cycle.
 	m.cursorBlink = true
+	m.barBlink = true
 	m.lastBlinkAt = time.Now()
 
 	// Hover interaction: scroll with j/k, go-to-definition with Enter,
@@ -3722,7 +3732,6 @@ func shiftClipUnderlines(ranges []highlight.UnderlineRange, shift, width int) []
 	}
 	return out
 }
-
 
 // ---------------------------------------------------------------------------
 // State sync helpers

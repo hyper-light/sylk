@@ -89,12 +89,12 @@ const iconFile = " "
 type viewMode int
 
 const (
-	viewTree       viewMode = iota
+	viewTree viewMode = iota
 	viewSearch
-	viewReferences  // LSP references results.
-	viewDocSymbols  // LSP document symbol outline.
-	viewReplace     // Multi-file find and replace.
-	viewTabs        // Open tab list.
+	viewReferences // LSP references results.
+	viewDocSymbols // LSP document symbol outline.
+	viewReplace    // Multi-file find and replace.
+	viewTabs       // Open tab list.
 )
 
 // tabFocusZone identifies which zone has focus in the tabs panel.
@@ -366,13 +366,13 @@ const iconFileActive = theme.IconModified
 // and an inline search bar activated by '/'.
 type Model struct {
 	// Tree state.
-	entries   []Entry
-	pathIndex map[string]int // path → entries index for O(1) lookups.
-	cursor    int
-	scroll    int
-	width     int
-	height    int
-	focused   bool
+	entries        []Entry
+	pathIndex      map[string]int // path → entries index for O(1) lookups.
+	cursor         int
+	scroll         int
+	width          int
+	height         int
+	focused        bool
 	bounceOffset   int
 	theme          *theme.Theme
 	activeFilePath string // Path of the file currently open in the code viewer.
@@ -393,18 +393,18 @@ type Model struct {
 	searchStale  bool          // True when a new scan is in-flight but no batch has arrived yet.
 
 	// Search performance: debounce, caching, pre-indexed scope.
-	searchVersion int        // Monotonic counter; gates stale debounce ticks.
-	searchCache   *fileCache // Session-scoped file content cache.
+	searchVersion int              // Monotonic counter; gates stale debounce ticks.
+	searchCache   *fileCache       // Session-scoped file content cache.
 	scopeIndex    map[string][]int // dir prefix → indices into searchSource.
 	scopeSorted   []string         // sorted keys of scopeIndex for binary search.
 
 	// Search toolbar state.
-	searchFocus    searchFocus        // Active focus zone within search footer.
-	toggleActive   [toggleCount]bool  // State of [Aa], [ab], [.*] toggles.
-	toggleCursor   toggleIndex        // Which badge is selected when focusToggles.
-	scopeQuery     []rune             // Path scope text input contents.
-	scopeCursor    int                // Rune-based insertion position within scopeQuery.
-	compiledRegexp *regexp.Regexp     // Cached compiled regex (nil if invalid/unused).
+	searchFocus    searchFocus       // Active focus zone within search footer.
+	toggleActive   [toggleCount]bool // State of [Aa], [ab], [.*] toggles.
+	toggleCursor   toggleIndex       // Which badge is selected when focusToggles.
+	scopeQuery     []rune            // Path scope text input contents.
+	scopeCursor    int               // Rune-based insertion position within scopeQuery.
+	compiledRegexp *regexp.Regexp    // Cached compiled regex (nil if invalid/unused).
 
 	// Cursor blink state for search inputs.
 	cursorBlink bool
@@ -433,26 +433,26 @@ type Model struct {
 	symNumWidth int // Digit width for line numbers.
 
 	// Tabs state (viewTabs mode).
-	tabPaths      []string        // Absolute paths of all open tabs.
-	tabModified   map[string]bool // Paths with unsaved changes.
-	tabFiltered   []int           // Indices into tabPaths matching current filter.
-	tabDupBases   map[string]bool // Base filenames that appear more than once (for disambiguation).
-	tabActive     string          // Path of the currently active tab (for highlight).
-	tabCursor     int             // Cursor within tabFiltered.
-	tabScroll     int
-	tabFilter       []rune               // Filter query typed after '/'.
-	tabFiltering    bool                 // true when the filter input is active.
+	tabPaths        []string        // Absolute paths of all open tabs.
+	tabModified     map[string]bool // Paths with unsaved changes.
+	tabFiltered     []int           // Indices into tabPaths matching current filter.
+	tabDupBases     map[string]bool // Base filenames that appear more than once (for disambiguation).
+	tabActive       string          // Path of the currently active tab (for highlight).
+	tabCursor       int             // Cursor within tabFiltered.
+	tabScroll       int
+	tabFilter       []rune                   // Filter query typed after '/'.
+	tabFiltering    bool                     // true when the filter input is active.
 	tabToggleActive [toolbarToggleCount]bool // [Aa], [ab], [.*] toggles for tab filtering.
-	tabFocus        tabFocusZone         // Which zone has focus in tabs mode.
-	tabToggleCursor toggleIndex          // Which toggle badge is focused when tabFocus == tabFocusToggles.
-	tabCloseHover   int                  // Filtered index whose close icon is hovered (-1 = none).
+	tabFocus        tabFocusZone             // Which zone has focus in tabs mode.
+	tabToggleCursor toggleIndex              // Which toggle badge is focused when tabFocus == tabFocusToggles.
+	tabCloseHover   int                      // Filtered index whose close icon is hovered (-1 = none).
 
 	// Replace state (viewReplace mode).
-	replaceInput []rune       // Replacement text input contents.
-	btnFlash     searchFocus  // Which replace button is flashing (focusBtnOne or focusBtnAll).
-	btnFlashAt   time.Time    // When the button flash started.
-	btnOneCol    int          // Absolute column of [→1] button start (for click handling).
-	btnAllCol    int          // Absolute column of [→*] button start (for click handling).
+	replaceInput []rune      // Replacement text input contents.
+	btnFlash     searchFocus // Which replace button is flashing (focusBtnOne or focusBtnAll).
+	btnFlashAt   time.Time   // When the button flash started.
+	btnOneCol    int         // Absolute column of [→1] button start (for click handling).
+	btnAllCol    int         // Absolute column of [→*] button start (for click handling).
 
 	// New-entry state: two-phase (pending chord → active input).
 	pendingNewEntry bool   // Alt+N pressed, waiting for F (file) or D (dir).
@@ -729,9 +729,9 @@ func (m *Model) Focused() bool {
 }
 
 // NeedsBlink reports whether the file tree has an active cursor that needs
-// periodic blink toggling (search, rename, new entry, or tab filter mode).
+// periodic blink toggling (search/replace, rename, new entry, or tab filter mode).
 func (m *Model) NeedsBlink() bool {
-	return m.focused && (m.mode == viewSearch || m.newEntryActive || m.renameActive || m.tabFiltering)
+	return m.focused && (m.mode == viewSearch || m.mode == viewReplace || m.newEntryActive || m.renameActive || m.tabFiltering)
 }
 
 // SetFocused sets the focus state.
@@ -2783,7 +2783,6 @@ func (m *Model) collapseOrParent() {
 	m.navigateToParent()
 }
 
-
 // navigateToParent moves cursor to the parent directory entry.
 func (m *Model) navigateToParent() {
 	parentIdx := m.findParent()
@@ -3478,7 +3477,6 @@ func (m *Model) clickReplaceMode(viewX, viewY int) tea.Cmd {
 	return nil
 }
 
-
 // refilter schedules a debounced search. Each call increments the version
 // counter and starts a timer; only the latest version actually runs the grep.
 // For short queries (below minSearchQueryLen), clears results immediately.
@@ -3500,7 +3498,6 @@ func (m *Model) refilter() tea.Cmd {
 		return searchTickMsg{version: version}
 	})
 }
-
 
 // buildMatchConfig constructs a matchConfig from the current toggle state
 // and query content, implementing smart-case behavior. Always pre-compiles
