@@ -10,9 +10,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// highlightDurationTicks is how many ticks a copied-entry highlight persists.
-// Derived from: 2 seconds at 16ms per tick ≈ 125 ticks.
-const highlightDurationTicks = 125
+// highlightDuration is how long a copied-entry highlight persists.
+const highlightDuration = 2 * time.Second
 
 // Model is the Bubble Tea model for the chat panel.
 // It displays a scrollable history of chat entries with virtual scrolling,
@@ -28,7 +27,7 @@ type Model struct {
 
 	// Transient highlight for copy feedback.
 	highlightID    string
-	highlightTicks int
+	highlightUntil time.Time
 
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache string
@@ -37,9 +36,9 @@ type Model struct {
 
 // Verify interface compliance at compile time.
 var (
-	_ component.Focusable  = (*Model)(nil)
-	_ component.Resizable  = (*Model)(nil)
-	_ component.Component  = (*Model)(nil)
+	_ component.Focusable = (*Model)(nil)
+	_ component.Resizable = (*Model)(nil)
+	_ component.Component = (*Model)(nil)
 )
 
 // New creates a chat Model with the given theme and history capacity.
@@ -65,16 +64,8 @@ func (m *Model) Init() tea.Cmd {
 // Update processes incoming messages and returns the updated component.
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
-	case msg.TickMsg:
-		prevHL := m.highlightTicks
-		prevFlash := m.viewport.EdgeFlashTicks()
-		m.tickHighlight()
-		m.viewport.TickEdgeFlash()
-		// Only mark dirty if tick actually changed visible state.
-		if (prevHL > 0 && prevHL != m.highlightTicks) ||
-			(prevFlash > 0 && prevFlash != m.viewport.EdgeFlashTicks()) {
-			m.viewDirty = true
-		}
+	case msg.DecorTickMsg:
+		m.handleDecorTick(typed.Time)
 		return m, nil
 	case msg.ActivityEventMsg:
 		m.viewDirty = true
@@ -309,7 +300,8 @@ func (m *Model) IsStreaming() bool { return m.accumulator != nil }
 // HasActiveAnimation reports whether any tick-driven animation is running
 // (highlight countdown or edge flash).
 func (m *Model) HasActiveAnimation() bool {
-	return m.highlightTicks > 0 || m.viewport.HasEdgeFlash()
+	now := time.Now()
+	return now.Before(m.highlightUntil) || m.viewport.HasEdgeFlash(now)
 }
 
 // EntryAtViewLine returns the chat entry visible at the given viewport-relative
@@ -330,7 +322,7 @@ func (m *Model) CopyTargetAtViewLine(y int) *CopyTarget {
 // When unfocused, no selection is created.
 func (m *Model) SetHighlight(entryID string, entryIndex, start, end int) {
 	m.highlightID = entryID
-	m.highlightTicks = highlightDurationTicks
+	m.highlightUntil = time.Now().Add(highlightDuration)
 	m.viewDirty = true
 	if m.focused {
 		m.viewport.SelectRegionContaining(entryIndex, start)
@@ -341,17 +333,27 @@ func (m *Model) SetHighlight(entryID string, entryIndex, start, end int) {
 // tickHighlight decrements the highlight countdown and clears when expired.
 // The selection is only cleared alongside the highlight when the chat panel
 // is not focused; otherwise the selection persists for continued navigation.
-func (m *Model) tickHighlight() {
-	if m.highlightTicks <= 0 {
+func (m *Model) tickHighlight(now time.Time) {
+	if m.highlightUntil.IsZero() || now.Before(m.highlightUntil) {
 		return
 	}
-	m.highlightTicks--
-	if m.highlightTicks == 0 {
-		m.highlightID = ""
-		m.viewport.SetHighlight("", 0, 0)
-		if !m.focused {
-			m.viewport.ClearSelection()
-		}
+	m.highlightID = ""
+	m.highlightUntil = time.Time{}
+	m.viewport.SetHighlight("", 0, 0)
+	if !m.focused {
+		m.viewport.ClearSelection()
+	}
+}
+
+func (m *Model) handleDecorTick(now time.Time) {
+	prevHL := !m.highlightUntil.IsZero() && now.Before(m.highlightUntil)
+	prevFlash := m.viewport.HasEdgeFlash(now)
+	m.tickHighlight(now)
+	m.viewport.TickEdgeFlash(now)
+	afterHL := !m.highlightUntil.IsZero() && now.Before(m.highlightUntil)
+	afterFlash := m.viewport.HasEdgeFlash(now)
+	if prevHL != afterHL || prevFlash != afterFlash {
+		m.viewDirty = true
 	}
 }
 

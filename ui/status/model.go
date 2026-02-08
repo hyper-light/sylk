@@ -3,6 +3,7 @@ package status
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -15,9 +16,11 @@ import (
 // separatorChar is the visual delimiter between status bar sections.
 const separatorChar = " | "
 
-// flashDurationTicks is how many ticks a flash message persists.
-// Derived from: 2 seconds at 16ms per tick ≈ 125 ticks.
-const flashDurationTicks = 125
+// flashDuration is how long a flash message persists.
+const flashDuration = 2 * time.Second
+
+// spinnerFrameInterval controls spinner frame rate (~10fps).
+const spinnerFrameInterval = 100 * time.Millisecond
 
 // droppedWarningPrefix is prepended to the dropped event count indicator.
 const droppedWarningPrefix = "dropped:"
@@ -39,13 +42,14 @@ type Model struct {
 	spinner       *Spinner
 	spinnerActive bool
 	statusText    string
+	lastSpin      time.Time
 
 	// Persistent prompt (takes priority over flash; does not auto-clear).
 	prompt string
 
 	// Flash overlay
 	flash      string
-	flashTicks int
+	flashUntil time.Time
 
 	// View ring indicator (pre-formatted by app, empty when no panels collapsed)
 	viewRingHint string
@@ -87,8 +91,8 @@ func (m *Model) Init() tea.Cmd {
 // Update processes messages and returns the updated model and an optional command.
 func (m *Model) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	switch v := raw.(type) {
-	case msg.TickMsg:
-		return m.handleTick()
+	case msg.DecorTickMsg:
+		return m.handleDecorTick(v.Time)
 	case msg.SessionEventMsg:
 		return m.handleSessionEvent(v)
 	case msg.StreamStartMsg:
@@ -145,7 +149,7 @@ func (m *Model) SetSize(width, _ int) {
 // The flash auto-clears after flashDurationTicks.
 func (m *Model) SetFlash(text string) {
 	m.flash = text
-	m.flashTicks = flashDurationTicks
+	m.flashUntil = time.Now().Add(flashDuration)
 	m.viewDirty = true
 }
 
@@ -176,23 +180,21 @@ func (m *Model) SetViewRingHint(hint string) {
 
 // -- Message handlers -------------------------------------------------------
 
-// IsAnimating reports whether any tick-driven animation is active
-// (spinner or flash countdown).
+// IsAnimating reports whether any decor-driven animation is active.
 func (m *Model) IsAnimating() bool {
-	return m.spinnerActive || m.flashTicks > 0
+	return m.spinnerActive || time.Now().Before(m.flashUntil)
 }
 
-func (m *Model) handleTick() (tea.Model, tea.Cmd) {
-	if m.spinnerActive {
+func (m *Model) handleDecorTick(now time.Time) (tea.Model, tea.Cmd) {
+	if m.spinnerActive && (m.lastSpin.IsZero() || now.Sub(m.lastSpin) >= spinnerFrameInterval) {
 		m.spinner.Tick()
+		m.lastSpin = now
 		m.viewDirty = true
 	}
-	if m.flashTicks > 0 {
-		m.flashTicks--
+	if !m.flashUntil.IsZero() && !now.Before(m.flashUntil) {
+		m.flash = ""
+		m.flashUntil = time.Time{}
 		m.viewDirty = true
-		if m.flashTicks == 0 {
-			m.flash = ""
-		}
 	}
 	return m, nil
 }

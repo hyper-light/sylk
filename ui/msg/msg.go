@@ -83,9 +83,9 @@ type GuideResponseMsg struct {
 
 // SubmitPromptMsg is sent when the user submits a prompt.
 type SubmitPromptMsg struct {
-	Text      string
+	Text        string
 	TargetAgent string // Empty for auto-routing, agent name for @agent syntax
-	SessionID string
+	SessionID   string
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +109,14 @@ type QuitConfirmMsg struct{}
 
 // TickMsg is sent periodically for scroll momentum, spinner animation, etc.
 type TickMsg struct {
+	Time time.Time
+	Gen  uint64 // Tick chain generation; stale ticks are dropped.
+}
+
+// DecorTickMsg is sent at a slower rate for low-frequency UI effects
+// (status spinner, chat highlight/edge flash, tab arrow flash).
+// Separated from TickMsg to keep 60fps physics while reducing idle CPU.
+type DecorTickMsg struct {
 	Time time.Time
 	Gen  uint64 // Tick chain generation; stale ticks are dropped.
 }

@@ -59,6 +59,10 @@ const tickFastInterval = 16 * time.Millisecond
 // Derived from: swipe decay timeout is 300ms; 200ms provides ≥1 sample.
 const tickSlowInterval = 200 * time.Millisecond
 
+// decorTickInterval drives low-frequency UI effects (spinners, flashes).
+// 100ms (~10fps) keeps visuals smooth while reducing idle CPU.
+const decorTickInterval = 100 * time.Millisecond
+
 // blinkHalfPeriod is the duration between cursor visibility toggles.
 // Derived from: standard terminal cursor blink rate (~530ms per phase).
 const blinkHalfPeriod = 530 * time.Millisecond
@@ -68,8 +72,8 @@ type tickRate int
 
 const (
 	tickIdle tickRate = iota // No tick scheduled.
-	tickSlow                // 200ms — swipe decay.
-	tickFast                // 16ms — scroll, bounce, flash, spinner.
+	tickSlow                 // 200ms — swipe decay.
+	tickFast                 // 16ms — scroll, bounce, flash, spinner.
 )
 
 // shutdownGrace is the grace period for goroutine shutdown.
@@ -95,9 +99,9 @@ const lspNotifyTimeout = 5 * time.Second
 // feeling responsive for intentional double-taps.
 const overlayToggleDebounce = 150 * time.Millisecond
 
-// tabArrowFlashTicks is the number of ticks the overflow arrow stays highlighted.
-// Derived from: 1 second / 16ms per tick ≈ 63 ticks.
-const tabArrowFlashTicks = 63
+// tabArrowFlashDuration is how long the overflow arrow stays highlighted.
+// Roughly matches the prior 63×16ms tick timing (~1.0s).
+const tabArrowFlashDuration = 1 * time.Second
 
 // escDisambiguateTimeout is the maximum delay between a standalone ESC byte
 // and a follow-up rune before the ESC is flushed as a real Escape keypress.
@@ -151,7 +155,6 @@ const (
 	overlaySearch                   // Command palette.
 	overlayFieldManual              // Field Manual help overlay.
 )
-
 
 // ---------------------------------------------------------------------------
 // Panel layout
@@ -260,8 +263,8 @@ type AppModel struct {
 	fileTree       *filetree.Model
 
 	// Overlay components
-	editorOverlay *editor.Model
-	modalOverlay  *modal.Model
+	editorOverlay      *editor.Model
+	modalOverlay       *modal.Model
 	searchOverlay      *search.Model
 	fieldManualOverlay *fieldmanual.Model
 	overlay            overlayState
@@ -286,20 +289,20 @@ type AppModel struct {
 
 	// State
 	chord             chordState
-	chordBlocked      bool      // Chord triggered in edit mode (display-only, no cycling).
-	lastToggleKey     string    // Last overlay toggle key (debounce guard).
-	lastToggleAt      time.Time // When lastToggleKey was pressed.
-	leftRing          viewRing // Left slot cycling ring (Session/FileTree).
-	rightRing         viewRing // Right slot cycling ring (Chat/Code).
-	collapseHintShown bool     // First-collapse flash shown once per session.
+	chordBlocked      bool             // Chord triggered in edit mode (display-only, no cycling).
+	lastToggleKey     string           // Last overlay toggle key (debounce guard).
+	lastToggleAt      time.Time        // When lastToggleKey was pressed.
+	leftRing          viewRing         // Left slot cycling ring (Session/FileTree).
+	rightRing         viewRing         // Right slot cycling ring (Chat/Code).
+	collapseHintShown bool             // First-collapse flash shown once per session.
 	scrollSpring      harmonica.Spring // Spring simulation for smooth scroll.
-	scroll            scrollState     // Current scroll animation state.
+	scroll            scrollState      // Current scroll animation state.
 	bounceSpring      harmonica.Spring // Underdamped spring for overscroll bounce.
-	bounce            bounceState     // Current bounce animation state.
-	swipe             swipeState      // Horizontal scroll accumulation for ring cycling.
+	bounce            bounceState      // Current bounce animation state.
+	swipe             swipeState       // Horizontal scroll accumulation for ring cycling.
 
 	// Inline editor (Alt+E edit mode).
-	editMode      bool              // Whether inline editing is active.
+	editMode       bool              // Whether inline editing is active.
 	savedLeftIdx   int               // Saved leftRing.index before edit mode.
 	savedRightIdx  int               // Saved rightRing.index before edit mode.
 	savedChatFocus component.FocusID // Last focused panel in chat mode.
@@ -315,17 +318,19 @@ type AppModel struct {
 	tabDropTarget     pane.PaneID // Pane highlighted as drop target (0 = none).
 
 	// Tab bar close-icon hover highlight.
-	tabHoverClose        int       // Tab index whose close icon is hovered (-1 = none).
+	tabHoverClose        int         // Tab index whose close icon is hovered (-1 = none).
 	tabHoverPane         pane.PaneID // Pane whose close icon is being hovered.
-	previewTabHoverClose int       // Preview tab close icon hover (-1 = none).
+	previewTabHoverClose int         // Preview tab close icon hover (-1 = none).
 
-	// Overflow arrow flash counters (remaining ticks at tickFastInterval each).
-	tabArrowFlashLeft  int
-	tabArrowFlashRight int
+	// Overflow arrow flash windows.
+	tabArrowFlashLeftUntil  time.Time
+	tabArrowFlashRightUntil time.Time
 
 	// Demand-driven tick chain state.
 	tickGen  uint64   // Generation counter; incremented on tick chain transitions.
 	tickRate tickRate // Current tick chain speed (idle/slow/fast).
+	decorGen uint64   // Generation counter for decor tick chain.
+	decorOn  bool     // Whether decor tick chain is active.
 
 	// Centralized cursor blink timer (one-shot at blinkHalfPeriod).
 	blinkGen uint64 // Generation counter; bumped on interactive events to reset blink.
@@ -346,11 +351,10 @@ type AppModel struct {
 	prevRightRing int               // Detect right ring cycling.
 	prevInputH    int               // Detect input height changes.
 
-
 	// Mouse hover tracking for LSP hover tooltips.
-	hoverMouseLine      int  // last buffer line the mouse was over (-1 = none)
-	hoverMouseCol       int  // last buffer col for LSP request precision
-	hoverMouseWordStart int  // start col of the word under cursor
+	hoverMouseLine      int // last buffer line the mouse was over (-1 = none)
+	hoverMouseCol       int // last buffer col for LSP request precision
+	hoverMouseWordStart int // start col of the word under cursor
 	hoverPending        bool
 	hoverForPreview     bool // true when hover was triggered over the preview pane
 
@@ -383,11 +387,11 @@ type AppModel struct {
 
 	// Pane tree: binary split tree tracking editor + preview layout.
 	// Each editor pane has its own editor.Model and tab order.
-	paneTree    *pane.Node                        // Split tree root (always non-nil in edit mode).
-	paneEditors map[pane.PaneID]*editorPaneState  // Per-pane editor state.
-	focusedPane pane.PaneID                       // Currently focused pane.
-	previewPane pane.PaneID                       // PaneID of the preview leaf (0 = no preview).
-	paneCounter pane.PaneID                       // Monotonic ID allocator for new panes.
+	paneTree    *pane.Node                       // Split tree root (always non-nil in edit mode).
+	paneEditors map[pane.PaneID]*editorPaneState // Per-pane editor state.
+	focusedPane pane.PaneID                      // Currently focused pane.
+	previewPane pane.PaneID                      // PaneID of the preview leaf (0 = no preview).
+	paneCounter pane.PaneID                      // Monotonic ID allocator for new panes.
 
 	// Warp points: numbered teleport bookmarks (nil = empty slot).
 	warpPoints [warpSlotCount]*WarpPoint
@@ -437,7 +441,7 @@ func (r *viewRing) cycle(delta int) {
 	if n == 0 {
 		return
 	}
-	r.index = ((r.index + delta) % n + n) % n
+	r.index = ((r.index+delta)%n + n) % n
 }
 
 // reset rebuilds the ring with new panels. If the previously active panel
@@ -501,36 +505,36 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	th := cfg.Theme()
 
 	app := &AppModel{
-		ctx:              appCtx,
-		cancel:           appCancel,
-		config:           cfg,
-		deps:             deps,
-		layout:           layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
-		focus:            layout.NewFocusManager(defaultTabOrder),
-		chat:             chat.New(th, cfg.ChatHistoryCapacity),
-		statusBar:        status.New(th, deps.SessionManager),
-		sessionPanel:     sessionpkg.New(deps.SessionManager, th),
-		agentPanel:       agentpkg.New(th),
-		codePanel:        codepkg.New(th),
-		knowledgePanel:   knowledgepkg.New(th),
-		fileTree:         filetree.New(th),
-		editorOverlay:    editor.New(th),
-		editorCache:      editor.NewEditorCache(editor.CacheConfig{}),
-		modalOverlay:     modal.New(th),
-		searchOverlay:      search.New(th, search.NewProviderRegistry()),
-		fieldManualOverlay: fieldmanual.New(th),
-		activityBridge:   bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
-		sessionBridge:    bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
-		streamBridge:     bridge.NewStreamBridge(deps.Scope),
-		guideBridge:      bridge.NewGuideBridge(deps.GuideBus, deps.Scope),
-		lspManager:       lsp.NewManager(deps.Scope),
-		lspInstalling:    make(map[lsp.ServerID]bool),
-		interruptHandler: interrupt.NewHandler(),
-		clipboard:        register.NewOSClipboard(),
-		scrollSpring:     harmonica.NewSpring(harmonica.FPS(scrollFPS), scrollFrequency, scrollDamping),
-		bounceSpring:     harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
-		hoverMouseLine:   -1,
-		highlightLine:   -1,
+		ctx:                  appCtx,
+		cancel:               appCancel,
+		config:               cfg,
+		deps:                 deps,
+		layout:               layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
+		focus:                layout.NewFocusManager(defaultTabOrder),
+		chat:                 chat.New(th, cfg.ChatHistoryCapacity),
+		statusBar:            status.New(th, deps.SessionManager),
+		sessionPanel:         sessionpkg.New(deps.SessionManager, th),
+		agentPanel:           agentpkg.New(th),
+		codePanel:            codepkg.New(th),
+		knowledgePanel:       knowledgepkg.New(th),
+		fileTree:             filetree.New(th),
+		editorOverlay:        editor.New(th),
+		editorCache:          editor.NewEditorCache(editor.CacheConfig{}),
+		modalOverlay:         modal.New(th),
+		searchOverlay:        search.New(th, search.NewProviderRegistry()),
+		fieldManualOverlay:   fieldmanual.New(th),
+		activityBridge:       bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
+		sessionBridge:        bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
+		streamBridge:         bridge.NewStreamBridge(deps.Scope),
+		guideBridge:          bridge.NewGuideBridge(deps.GuideBus, deps.Scope),
+		lspManager:           lsp.NewManager(deps.Scope),
+		lspInstalling:        make(map[lsp.ServerID]bool),
+		interruptHandler:     interrupt.NewHandler(),
+		clipboard:            register.NewOSClipboard(),
+		scrollSpring:         harmonica.NewSpring(harmonica.FPS(scrollFPS), scrollFrequency, scrollDamping),
+		bounceSpring:         harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
+		hoverMouseLine:       -1,
+		highlightLine:        -1,
 		tabDragIdx:           -1,
 		tabHoverClose:        -1,
 		previewTabHoverClose: -1,
@@ -661,12 +665,15 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 // needed after a non-tick dispatch. scheduleBlink is true only for
 // interactive events (key/mouse) that bumped blinkGen.
 func (m *AppModel) postDispatchCmds(dispatchCmd tea.Cmd, scheduleBlink bool) tea.Cmd {
-	cmds := make([]tea.Cmd, 0, 4)
+	cmds := make([]tea.Cmd, 0, 5)
 	if dispatchCmd != nil {
 		cmds = append(cmds, dispatchCmd)
 	}
 	if tc := m.ensureTickAfterDispatch(); tc != nil {
 		cmds = append(cmds, tc)
+	}
+	if dc := m.ensureDecorTickAfterDispatch(); dc != nil {
+		cmds = append(cmds, dc)
 	}
 	if scheduleBlink {
 		if bc := m.ensureBlinkAfterDispatch(); bc != nil {
@@ -721,6 +728,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleQuit()
 	case msg.TickMsg:
 		return m, m.handleTick(typed)
+	case msg.DecorTickMsg:
+		return m, m.handleDecorTick(typed)
 	case msg.BlinkMsg:
 		return m, m.handleBlink(typed)
 	case msg.LSPFlushMsg:
@@ -1420,18 +1429,6 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 		return nil
 	}
 
-	// Conditionally forward to components that have active animations.
-	// Cursor blink is handled by BlinkMsg; LSP flush by LSPFlushMsg.
-	if m.statusBar.IsAnimating() {
-		m.statusBar.Update(tick)
-		m.viewDirty = true
-	}
-	if m.chat.HasActiveAnimation() {
-		chatComp, _ := m.chat.Update(tick)
-		m.chat = chatComp.(*chat.Model)
-		m.viewDirty = true
-	}
-
 	// Scroll momentum and bounce.
 	if !m.scroll.settled() {
 		m.tickScrollMomentum()
@@ -1439,22 +1436,58 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 	}
 	m.tickSwipeDecay()
 
-	// Decay tab arrow flash counters.
-	if m.tabArrowFlashLeft > 0 {
-		m.tabArrowFlashLeft--
-		m.viewDirty = true
-	}
-	if m.tabArrowFlashRight > 0 {
-		m.tabArrowFlashRight--
-		m.viewDirty = true
+	return m.continueTickChain()
+}
+
+func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
+	if tick.Gen != m.decorGen {
+		return nil
 	}
 
-	// Only refresh ring hint during streaming (activity badge changes).
+	changed := false
+
+	// Status spinner + flash countdown.
+	if m.statusBar.IsAnimating() {
+		model, cmd := m.statusBar.Update(tick)
+		_ = cmd // status.Update never returns a cmd currently.
+		m.statusBar = model.(*status.Model)
+		changed = changed || m.statusBar.ViewDirty()
+	}
+
+	// Chat highlight / edge flash.
+	if m.chat.HasActiveAnimation() {
+		chatComp, _ := m.chat.Update(tick)
+		m.chat = chatComp.(*chat.Model)
+		changed = true
+	}
+
+	// Tab arrow flash expiry.
+	now := tick.Time
+	tabFlashChanged := false
+	if (m.tabArrowFlashLeftUntil != (time.Time{})) && !now.Before(m.tabArrowFlashLeftUntil) {
+		m.tabArrowFlashLeftUntil = time.Time{}
+		tabFlashChanged = true
+	}
+	if (m.tabArrowFlashRightUntil != (time.Time{})) && !now.Before(m.tabArrowFlashRightUntil) {
+		m.tabArrowFlashRightUntil = time.Time{}
+		tabFlashChanged = true
+	}
+	if tabFlashChanged {
+		changed = true
+		m.comp.MarkDirty(compositor.SlotRight)
+	}
+
+	// Refresh ring hint during streaming (activity badge changes) at decor rate.
 	if (!m.leftRing.empty() || !m.rightRing.empty()) && m.chat.IsStreaming() {
 		m.statusBar.SetViewRingHint(m.buildRingHint())
+		changed = true
 	}
 
-	return m.continueTickChain()
+	if changed {
+		m.viewDirty = true
+	}
+
+	return m.continueDecorTickChain()
 }
 
 func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
@@ -2404,10 +2437,10 @@ func (m *AppModel) handleModalClosed() tea.Cmd {
 type chordState int
 
 const (
-	chordNone     chordState = iota
-	chordSession             // Alt+S pressed, waiting for arrow.
-	chordAgent               // Alt+A pressed, waiting for arrow.
-	chordView // Alt+V pressed, waiting for arrow.
+	chordNone    chordState = iota
+	chordSession            // Alt+S pressed, waiting for arrow.
+	chordAgent              // Alt+A pressed, waiting for arrow.
+	chordView               // Alt+V pressed, waiting for arrow.
 )
 
 // chordArrowDelta maps arrow key strings (including alt-held variants) to
@@ -2434,9 +2467,9 @@ type chordDisplay struct {
 // chordDisplays maps chord states to their display properties.
 // Session select uses Primary (blue), Agent select uses Success (green).
 var chordDisplays = map[chordState]chordDisplay{
-	chordSession:  {"Session select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
-	chordAgent:    {"Agent select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Success }},
-	chordView:     {"View select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Accent }},
+	chordSession: {"Session select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
+	chordAgent:   {"Agent select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Success }},
+	chordView:    {"View select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Accent }},
 }
 
 // chordHint returns a styled hint string when a chord is active, or "" when idle.
@@ -3406,8 +3439,8 @@ func (m *AppModel) paneTabBarConfig(id pane.PaneID, width int) tabbar.Config {
 		Width:      width,
 		NerdFonts:  m.nerdFontsDetected,
 		Theme:      m.config.Theme(),
-		FlashLeft:  isFocused && m.tabArrowFlashLeft > 0,
-		FlashRight: isFocused && m.tabArrowFlashRight > 0,
+		FlashLeft:  isFocused && time.Now().Before(m.tabArrowFlashLeftUntil),
+		FlashRight: isFocused && time.Now().Before(m.tabArrowFlashRightUntil),
 		HoverClose: hoverClose,
 		Focused:    hasSplits && isFocused,
 		DimActive:  hasSplits && !isFocused,
@@ -3905,11 +3938,11 @@ func (m *AppModel) handleTabBarClick(viewX int) (bool, tea.Cmd) {
 	cfg := m.tabBarConfig()
 	hit := tabbar.HitTest(cfg, viewX)
 	if hit.IsLeftNav {
-		m.tabArrowFlashLeft = tabArrowFlashTicks
+		m.tabArrowFlashLeftUntil = time.Now().Add(tabArrowFlashDuration)
 		return true, m.prevTab()
 	}
 	if hit.IsRightNav {
-		m.tabArrowFlashRight = tabArrowFlashTicks
+		m.tabArrowFlashRightUntil = time.Now().Add(tabArrowFlashDuration)
 		return true, m.nextTab()
 	}
 	if hit.TabIndex < 0 || hit.TabIndex >= len(m.focusedTabOrder()) {
@@ -4099,8 +4132,8 @@ func (m *AppModel) tabBarConfig() tabbar.Config {
 		Width:      barWidth,
 		NerdFonts:  m.nerdFontsDetected,
 		Theme:      m.config.Theme(),
-		FlashLeft:  m.tabArrowFlashLeft > 0,
-		FlashRight: m.tabArrowFlashRight > 0,
+		FlashLeft:  time.Now().Before(m.tabArrowFlashLeftUntil),
+		FlashRight: time.Now().Before(m.tabArrowFlashRightUntil),
 		HoverClose: m.tabHoverClose,
 		Focused:    m.hasPreview() && m.isEditorFocused(),
 		DimActive:  m.hasPreview() && !m.isEditorFocused(),
@@ -5433,11 +5466,11 @@ func (m *AppModel) handleMultiPanePress(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		cfg := m.paneTabBarConfig(pid, r.W)
 		hit := tabbar.HitTest(cfg, localX)
 		if hit.IsLeftNav {
-			m.tabArrowFlashLeft = tabArrowFlashTicks
+			m.tabArrowFlashLeftUntil = time.Now().Add(tabArrowFlashDuration)
 			return true, m.prevTab()
 		}
 		if hit.IsRightNav {
-			m.tabArrowFlashRight = tabArrowFlashTicks
+			m.tabArrowFlashRightUntil = time.Now().Add(tabArrowFlashDuration)
 			return true, m.nextTab()
 		}
 		if hit.TabIndex < 0 || hit.TabIndex >= len(ps.tabOrder) {
@@ -5907,6 +5940,13 @@ func (m *AppModel) toggleFieldManual() {
 
 // propagate forwards a message to all components and collects commands.
 func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
+	// Skip global propagation for tick messages to avoid redundant work;
+	// fast ticks are handled centrally, decor ticks are dispatched explicitly.
+	switch raw.(type) {
+	case msg.TickMsg, msg.DecorTickMsg:
+		return nil
+	}
+
 	var cmds []tea.Cmd
 
 	chatComp, chatCmd := m.chat.Update(raw)
@@ -6046,7 +6086,6 @@ const inputMaxContentLines = 3
 // Derived from: 1 char per side × 2 sides = 2.
 const panelBorderSize = 2
 
-
 // leftPanelOverhead is the vertical space consumed by section chrome.
 // Derived from: 2 headers (1 line each) + 1 divider (1 line + 1 top padding) = 4.
 const leftPanelOverhead = 4
@@ -6150,7 +6189,6 @@ func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
 		ps.editor.SetSize(r.W, r.H-tbH+1)
 	}
 }
-
 
 // syncViewState rebuilds the dual view cycling rings for the current layout
 // mode, updates the focus tab order to match visible panels, and pushes the
@@ -6974,11 +7012,16 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 // needsFastTick reports whether any 60fps animation is active.
 func (m *AppModel) needsFastTick() bool {
 	return !m.scroll.settled() ||
-		!m.bounceSettled() ||
-		m.tabArrowFlashLeft > 0 ||
-		m.tabArrowFlashRight > 0 ||
-		m.chat.HasActiveAnimation() ||
-		m.statusBar.IsAnimating()
+		!m.bounceSettled()
+}
+
+// needsDecorTick reports whether low-frequency UI effects are active.
+func (m *AppModel) needsDecorTick() bool {
+	now := time.Now()
+	return m.chat.HasActiveAnimation() ||
+		m.statusBar.IsAnimating() ||
+		now.Before(m.tabArrowFlashLeftUntil) ||
+		now.Before(m.tabArrowFlashRightUntil)
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
@@ -7044,6 +7087,39 @@ func (m *AppModel) ensureTickAfterDispatch() tea.Cmd {
 	return nil
 }
 
+// ensureDecorTick starts the decor tick chain if needed.
+func (m *AppModel) ensureDecorTick() tea.Cmd {
+	if m.decorOn {
+		return nil
+	}
+	m.decorOn = true
+	m.decorGen++
+	gen := m.decorGen
+	return tea.Tick(decorTickInterval, func(t time.Time) tea.Msg {
+		return msg.DecorTickMsg{Time: t, Gen: gen}
+	})
+}
+
+// continueDecorTickChain schedules the next decor tick if effects remain.
+func (m *AppModel) continueDecorTickChain() tea.Cmd {
+	if !m.needsDecorTick() {
+		m.decorOn = false
+		return nil
+	}
+	gen := m.decorGen
+	return tea.Tick(decorTickInterval, func(t time.Time) tea.Msg {
+		return msg.DecorTickMsg{Time: t, Gen: gen}
+	})
+}
+
+// ensureDecorTickAfterDispatch starts decor ticking when needed.
+func (m *AppModel) ensureDecorTickAfterDispatch() tea.Cmd {
+	if m.needsDecorTick() {
+		return m.ensureDecorTick()
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Blink — one-shot cursor blink timer
 // ---------------------------------------------------------------------------
@@ -7075,7 +7151,7 @@ func (m *AppModel) blinkCmd() tea.Cmd {
 // the next blink. Stale blinks (from before a key/focus event) are dropped.
 func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
 	if blink.Gen != m.blinkGen {
-		return nil // Stale blink — state changed since scheduling.
+		return nil
 	}
 
 	toggled := false

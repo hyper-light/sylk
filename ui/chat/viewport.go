@@ -3,6 +3,7 @@ package chat
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
@@ -16,9 +17,9 @@ type selectionRegion struct {
 	end   int // Last line (exclusive, entry-relative).
 }
 
-// edgeFlashDurationTicks is how many ticks an edge flash persists.
-// Derived from: 1000ms at 16ms per tick ≈ 63 ticks.
-const edgeFlashDurationTicks = 63
+// edgeFlashDuration is how long an edge flash persists.
+// Roughly matches the prior 63×16ms tick timing (~1.0s).
+const edgeFlashDuration = 1 * time.Second
 
 // wrapBadgeWidth is the visible column width of the wrap indicator badge.
 // Derived from: space(1) + icon(1) + space(1) = 3.
@@ -28,20 +29,20 @@ const wrapBadgeWidth = 3
 // It references a History ring buffer and renders entries on demand with caching.
 // scrollOff tracks the number of rendered lines scrolled back from the bottom.
 type Viewport struct {
-	history     *History
-	theme       *theme.Theme
-	scrollOff   int  // Lines scrolled back from the bottom (0 = following).
-	viewHeight  int
-	viewWidth   int
-	following       bool // Auto-scroll to bottom on new content.
-	highlightID     string // Entry ID to highlight (empty = none).
-	highlightStart  int    // First entry-relative line to highlight (inclusive).
-	highlightEnd    int    // Last entry-relative line to highlight (exclusive).
-	selectedIndex   int    // Logical history index of selected entry (-1 = none).
-	selectedRegion  int    // Region index within the selected entry.
-	edgeFlash       int    // Edge flash direction: -1 = top, 0 = none, 1 = bottom.
-	edgeFlashTicks  int    // Remaining ticks for edge flash.
-	bounceOffset    int    // Visual line displacement from overscroll bounce.
+	history        *History
+	theme          *theme.Theme
+	scrollOff      int // Lines scrolled back from the bottom (0 = following).
+	viewHeight     int
+	viewWidth      int
+	following      bool      // Auto-scroll to bottom on new content.
+	highlightID    string    // Entry ID to highlight (empty = none).
+	highlightStart int       // First entry-relative line to highlight (inclusive).
+	highlightEnd   int       // Last entry-relative line to highlight (exclusive).
+	selectedIndex  int       // Logical history index of selected entry (-1 = none).
+	selectedRegion int       // Region index within the selected entry.
+	edgeFlash      int       // Edge flash direction: -1 = top, 0 = none, 1 = bottom.
+	edgeFlashUntil time.Time // Expiry time for edge flash.
+	bounceOffset   int       // Visual line displacement from overscroll bounce.
 }
 
 // NewViewport creates a Viewport bound to the given History.
@@ -176,7 +177,8 @@ func (vp *Viewport) advanceSelection(delta int) {
 func (vp *Viewport) crossEntryBoundary(delta int) {
 	nextEntry := vp.selectedIndex + delta
 	if nextEntry < 0 || nextEntry >= vp.history.Len() {
-		if vp.edgeFlash == delta && vp.edgeFlashTicks > 0 {
+		now := time.Now()
+		if vp.edgeFlash == delta && vp.edgeFlashActive(now) {
 			vp.wrapSelection(delta)
 			return
 		}
@@ -215,34 +217,31 @@ func (vp *Viewport) ClearSelection() {
 // flashEdge activates the edge flash in the given direction (-1 top, +1 bottom).
 func (vp *Viewport) flashEdge(direction int) {
 	vp.edgeFlash = direction
-	vp.edgeFlashTicks = edgeFlashDurationTicks
+	vp.edgeFlashUntil = time.Now().Add(edgeFlashDuration)
 }
 
 // clearEdgeFlash cancels any active edge flash.
 func (vp *Viewport) clearEdgeFlash() {
 	vp.edgeFlash = 0
-	vp.edgeFlashTicks = 0
+	vp.edgeFlashUntil = time.Time{}
 }
 
 // TickEdgeFlash decrements the edge flash countdown and clears when expired.
-func (vp *Viewport) TickEdgeFlash() {
-	if vp.edgeFlashTicks <= 0 {
+func (vp *Viewport) TickEdgeFlash(now time.Time) {
+	if vp.edgeFlashUntil.IsZero() || now.Before(vp.edgeFlashUntil) {
 		return
 	}
-	vp.edgeFlashTicks--
-	if vp.edgeFlashTicks == 0 {
-		vp.edgeFlash = 0
-	}
+	vp.edgeFlash = 0
+	vp.edgeFlashUntil = time.Time{}
 }
 
 // HasEdgeFlash reports whether an edge flash animation is active.
-func (vp *Viewport) HasEdgeFlash() bool {
-	return vp.edgeFlashTicks > 0
+func (vp *Viewport) HasEdgeFlash(now time.Time) bool {
+	return !vp.edgeFlashUntil.IsZero() && now.Before(vp.edgeFlashUntil)
 }
 
-// EdgeFlashTicks returns the remaining flash ticks for dirty-check comparison.
-func (vp *Viewport) EdgeFlashTicks() int {
-	return vp.edgeFlashTicks
+func (vp *Viewport) edgeFlashActive(now time.Time) bool {
+	return vp.edgeFlash != 0 && !vp.edgeFlashUntil.IsZero() && now.Before(vp.edgeFlashUntil)
 }
 
 // SelectRegionContaining sets the selection to the region of the given entry
@@ -388,7 +387,7 @@ func (vp *Viewport) View() string {
 // corner of the viewport when an edge flash is active. The icon shows the
 // direction the selection will wrap to on the next press.
 func (vp *Viewport) applyEdgeFlash(lines []string) []string {
-	if vp.edgeFlash == 0 || vp.edgeFlashTicks <= 0 || len(lines) == 0 {
+	if vp.edgeFlash == 0 || vp.edgeFlashUntil.IsZero() || len(lines) == 0 || time.Now().After(vp.edgeFlashUntil) {
 		return lines
 	}
 	// edgeFlash > 0: at bottom, will wrap to top → show ↑.
