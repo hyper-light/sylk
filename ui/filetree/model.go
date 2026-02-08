@@ -488,6 +488,10 @@ type Model struct {
 	// Used to distinguish ignored files (not in gitStatus AND not tracked).
 	trackedSet  map[string]struct{}
 	trackedDirs map[string]struct{}
+
+	// View cache: avoids re-rendering when no visible state changed.
+	viewCache string
+	viewDirty bool
 }
 
 // Verify interface compliance at compile time.
@@ -518,6 +522,7 @@ func (m *Model) SetGitStatus(status map[string]git.GitFileState, tracked map[str
 	m.gitStatus = status
 	m.trackedSet = tracked
 	m.trackedDirs = trackedDirs
+	m.viewDirty = true
 }
 
 // gitStateForEntry returns the GitFileState for an entry by computing its
@@ -591,19 +596,16 @@ func (m *Model) Init() tea.Cmd {
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
 	case msg.TickMsg:
-		if m.focused && (m.mode == viewSearch || m.newEntryActive || m.renameActive || m.tabFiltering) {
-			const blinkHalfPeriod = 530 * time.Millisecond
-			if typed.Time.Sub(m.lastBlinkAt) >= blinkHalfPeriod {
-				m.cursorBlink = !m.cursorBlink
-				m.lastBlinkAt = typed.Time
-			}
-		}
+		// Cursor blink is now driven by BlinkMsg, not the tick chain.
 		return m, nil
 	case tea.KeyMsg:
+		m.viewDirty = true
 		return m, m.handleKey(typed)
 	case searchTickMsg:
+		m.viewDirty = true
 		return m, m.handleSearchTick(typed)
 	case searchBatchMsg:
+		m.viewDirty = true
 		return m, m.handleSearchBatch(typed)
 	case previewTickMsg:
 		return m, m.handlePreviewTick(typed)
@@ -688,20 +690,25 @@ func searchWatchCmd(worker *SearchWorker) tea.Cmd {
 
 // View dispatches to the active view mode.
 func (m *Model) View() string {
+	if !m.viewDirty && m.viewCache != "" {
+		return m.viewCache
+	}
 	switch m.mode {
 	case viewSearch:
-		return m.viewSearchMode()
+		m.viewCache = m.viewSearchMode()
 	case viewReplace:
-		return m.viewReplaceMode()
+		m.viewCache = m.viewReplaceMode()
 	case viewReferences:
-		return m.viewReferencesMode()
+		m.viewCache = m.viewReferencesMode()
 	case viewDocSymbols:
-		return m.viewDocSymbolsMode()
+		m.viewCache = m.viewDocSymbolsMode()
 	case viewTabs:
-		return m.viewTabsMode()
+		m.viewCache = m.viewTabsMode()
 	default:
-		return m.viewTreeMode()
+		m.viewCache = m.viewTreeMode()
 	}
+	m.viewDirty = false
+	return m.viewCache
 }
 
 // ---------------------------------------------------------------------------
@@ -718,9 +725,36 @@ func (m *Model) Focused() bool {
 	return m.focused
 }
 
+// NeedsBlink reports whether the file tree has an active cursor that needs
+// periodic blink toggling (search, rename, new entry, or tab filter mode).
+func (m *Model) NeedsBlink() bool {
+	return m.focused && (m.mode == viewSearch || m.newEntryActive || m.renameActive || m.tabFiltering)
+}
+
 // SetFocused sets the focus state.
 func (m *Model) SetFocused(focused bool) {
 	m.focused = focused
+	if focused {
+		m.cursorBlink = true // Start with cursor visible on focus gain.
+	}
+	m.viewDirty = true
+}
+
+// ToggleBlink flips the cursor visibility. Called by the app's centralized
+// blink timer.
+func (m *Model) ToggleBlink() {
+	m.cursorBlink = !m.cursorBlink
+	m.viewDirty = true
+}
+
+// SetBlinkVisible ensures the cursor is steady-visible (not in the "off"
+// phase of a blink cycle). Called when idle timeout stops the blink chain.
+func (m *Model) SetBlinkVisible() {
+	if m.cursorBlink {
+		return
+	}
+	m.cursorBlink = true
+	m.viewDirty = true
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +766,7 @@ func (m *Model) SetSize(width, height int) {
 	m.width = max(width, 0)
 	m.height = max(height, 0)
 	m.clampScroll()
+	m.viewDirty = true
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +782,7 @@ func (m *Model) SetRoot(root string) {
 	m.rebuildPathIndex()
 	m.cursor = 0
 	m.scroll = 0
+	m.viewDirty = true
 }
 
 // SetEntries directly sets the flattened entry list (for mock/test seeding).
@@ -755,6 +791,7 @@ func (m *Model) SetEntries(entries []Entry) {
 	m.rebuildPathIndex()
 	m.cursor = 0
 	m.scroll = 0
+	m.viewDirty = true
 }
 
 // ScrollUp scrolls the view up by one line.
@@ -765,6 +802,7 @@ func (m *Model) ScrollUp() bool {
 		return false
 	}
 	(*scroll)--
+	m.viewDirty = true
 	return true
 }
 
@@ -777,6 +815,7 @@ func (m *Model) ScrollDown() bool {
 		return false
 	}
 	(*scroll)++
+	m.viewDirty = true
 	return true
 }
 
@@ -814,13 +853,18 @@ func (m *Model) visibleItemCount() int {
 
 // SetBounceOffset updates the visual bounce displacement for rendering.
 func (m *Model) SetBounceOffset(offset int) {
+	if m.bounceOffset == offset {
+		return
+	}
 	m.bounceOffset = offset
+	m.viewDirty = true
 }
 
 // SetActiveFile records the path of the currently open file so it can be
 // rendered with a distinct icon and color in the tree.
 func (m *Model) SetActiveFile(path string) {
 	m.activeFilePath = path
+	m.viewDirty = true
 }
 
 // InSearchMode reports whether the file tree is currently showing search results.
@@ -876,6 +920,7 @@ func (m *Model) ToggleTabFilter() {
 	m.tabFocus = tabFocusFilter
 	m.cursorBlink = true
 	m.lastBlinkAt = time.Now()
+	m.viewDirty = true
 }
 
 // SetReferences switches the panel to references mode, displaying the given
@@ -898,6 +943,7 @@ func (m *Model) SetReferences(title string, entries []ReferenceEntry) {
 	m.refCursor = 0
 	m.refScroll = 0
 	m.mode = viewReferences
+	m.viewDirty = true
 }
 
 // buildRefItems converts reference entries into a flat searchItem list grouped
@@ -985,6 +1031,7 @@ func (m *Model) SetDocumentSymbols(title, filePath string, entries []SymbolEntry
 	m.symCursor = 0
 	m.symScroll = 0
 	m.mode = viewDocSymbols
+	m.viewDirty = true
 }
 
 // buildSymItems converts symbol entries into a flat searchItem list.
@@ -1029,6 +1076,7 @@ func (m *Model) ExitDocSymbols() {
 	m.symCursor = 0
 	m.symScroll = 0
 	m.symNumWidth = 0
+	m.viewDirty = true
 }
 
 // SetTabs switches the panel to tabs mode, displaying the given open tabs.
@@ -1073,12 +1121,14 @@ func (m *Model) SetTabs(tabs []string, active string, modified map[string]bool) 
 			break
 		}
 	}
+	m.viewDirty = true
 }
 
 // UpdateTabModified refreshes which tabs have unsaved changes without
 // resetting cursor, scroll, or filter state.
 func (m *Model) UpdateTabModified(modified map[string]bool) {
 	m.tabModified = modified
+	m.viewDirty = true
 }
 
 // ExitTabs restores the tree state from before tabs mode.
@@ -1103,6 +1153,7 @@ func (m *Model) ExitTabs() {
 	m.tabFocus = tabFocusFilter
 	m.tabToggleCursor = toggleCase
 	m.tabCloseHover = -1
+	m.viewDirty = true
 }
 
 // buildDupBasenames returns a set of base filenames that appear more than
@@ -2415,6 +2466,7 @@ func (m *Model) EnterNewEntry(dir string, isDir bool) {
 	m.newEntryInput = nil
 	m.cursorBlink = true
 	m.lastBlinkAt = time.Now()
+	m.viewDirty = true
 }
 
 // exitNewEntry cancels the inline input without creating anything.
@@ -2902,17 +2954,19 @@ func (m *Model) exitReplace() {
 func (m *Model) ToggleSearch() {
 	if m.mode == viewSearch {
 		m.exitSearch()
-		return
+	} else {
+		m.enterSearch()
 	}
-	m.enterSearch()
+	m.viewDirty = true
 }
 
 func (m *Model) ToggleReplace() {
 	if m.mode == viewReplace {
 		m.exitReplace()
-		return
+	} else {
+		m.enterReplace()
 	}
-	m.enterReplace()
+	m.viewDirty = true
 }
 
 // InReplaceMode reports whether the file tree is in multi-file replace mode.

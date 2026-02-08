@@ -107,9 +107,23 @@ type QuitConfirmMsg struct{}
 // Periodic ticks
 // ---------------------------------------------------------------------------
 
-// TickMsg is sent periodically for cursor blink, spinner animation, etc.
+// TickMsg is sent periodically for scroll momentum, spinner animation, etc.
 type TickMsg struct {
 	Time time.Time
+	Gen  uint64 // Tick chain generation; stale ticks are dropped.
+}
+
+// BlinkMsg fires on a one-shot 530ms timer for cursor blink toggling.
+// Replaces polling-based blink (200ms tick that checks elapsed time).
+type BlinkMsg struct {
+	Gen uint64 // Generation counter; stale blinks are dropped.
+}
+
+// LSPFlushMsg fires on a one-shot 300ms timer to flush debounced LSP
+// didChange notifications. The Gen field matches the editor's editGeneration
+// at scheduling time so stale flushes (superseded by newer edits) are dropped.
+type LSPFlushMsg struct {
+	Gen int
 }
 
 // ---------------------------------------------------------------------------

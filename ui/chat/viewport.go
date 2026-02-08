@@ -235,6 +235,16 @@ func (vp *Viewport) TickEdgeFlash() {
 	}
 }
 
+// HasEdgeFlash reports whether an edge flash animation is active.
+func (vp *Viewport) HasEdgeFlash() bool {
+	return vp.edgeFlashTicks > 0
+}
+
+// EdgeFlashTicks returns the remaining flash ticks for dirty-check comparison.
+func (vp *Viewport) EdgeFlashTicks() int {
+	return vp.edgeFlashTicks
+}
+
 // SelectRegionContaining sets the selection to the region of the given entry
 // that contains the specified line. Prefers a code block region (1+) over
 // the full-message region (0). Used to align selection with copy-highlight.

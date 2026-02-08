@@ -53,6 +53,10 @@ type Model struct {
 	// Right section
 	tokens        *TokenDisplay
 	droppedEvents atomic.Int64
+
+	// View cache: avoids re-rendering when no visible state changed.
+	viewCache string
+	viewDirty bool
 }
 
 // New creates a status bar Model bound to the given theme and session manager.
@@ -67,7 +71,10 @@ func New(t *theme.Theme, mgr *session.Manager) *Model {
 }
 
 // SetMode updates the mode badge (e.g. "CHAT", "EDIT").
-func (m *Model) SetMode(mode string) { m.mode = mode }
+func (m *Model) SetMode(mode string) {
+	m.mode = mode
+	m.viewDirty = true
+}
 
 // Init satisfies tea.Model. The status bar requires no initial command.
 func (m *Model) Init() tea.Cmd {
@@ -97,6 +104,10 @@ func (m *Model) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 // View renders the status bar as a single styled line with horizontal
 // margins matching the panel borders above.
 func (m *Model) View() string {
+	if !m.viewDirty && m.viewCache != "" {
+		return m.viewCache
+	}
+
 	left := m.renderLeft()
 	center := m.renderCenter()
 	right := m.renderRight()
@@ -112,16 +123,19 @@ func (m *Model) View() string {
 	padding := m.theme.StatusBar.Render(repeatSpace(padWidth))
 	content := leftSection + padding + sep + right
 
-	return lipgloss.NewStyle().
+	m.viewCache = lipgloss.NewStyle().
 		Width(contentWidth).
 		MarginLeft(statusBarInset).
 		Render(content)
+	m.viewDirty = false
+	return m.viewCache
 }
 
 // SetSize updates the available width for the status bar.
 // Height is unused because the status bar is always one line.
 func (m *Model) SetSize(width, _ int) {
 	m.width = width
+	m.viewDirty = true
 }
 
 // SetFlash displays a temporary message in the center section.
@@ -129,17 +143,20 @@ func (m *Model) SetSize(width, _ int) {
 func (m *Model) SetFlash(text string) {
 	m.flash = text
 	m.flashTicks = flashDurationTicks
+	m.viewDirty = true
 }
 
 // SetPrompt activates a persistent prompt that does not auto-dismiss.
 // It takes priority over flash messages and all other center-section content.
 func (m *Model) SetPrompt(text string) {
 	m.prompt = text
+	m.viewDirty = true
 }
 
 // ClearPrompt removes the active prompt.
 func (m *Model) ClearPrompt() {
 	m.prompt = ""
+	m.viewDirty = true
 }
 
 // HasPrompt reports whether a persistent prompt is active.
@@ -151,16 +168,25 @@ func (m *Model) HasPrompt() bool {
 // Pass "" to clear the indicator when all panels are visible.
 func (m *Model) SetViewRingHint(hint string) {
 	m.viewRingHint = hint
+	m.viewDirty = true
 }
 
 // -- Message handlers -------------------------------------------------------
 
+// IsAnimating reports whether any tick-driven animation is active
+// (spinner or flash countdown).
+func (m *Model) IsAnimating() bool {
+	return m.spinnerActive || m.flashTicks > 0
+}
+
 func (m *Model) handleTick() (tea.Model, tea.Cmd) {
 	if m.spinnerActive {
 		m.spinner.Tick()
+		m.viewDirty = true
 	}
 	if m.flashTicks > 0 {
 		m.flashTicks--
+		m.viewDirty = true
 		if m.flashTicks == 0 {
 			m.flash = ""
 		}
@@ -169,8 +195,7 @@ func (m *Model) handleTick() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleSessionEvent(_ msg.SessionEventMsg) (tea.Model, tea.Cmd) {
-	// Session events just trigger a re-render; the active session is read
-	// directly from the manager in sessionLabel().
+	m.viewDirty = true
 	return m, nil
 }
 
@@ -178,23 +203,27 @@ func (m *Model) handleStreamStart(v msg.StreamStartMsg) (tea.Model, tea.Cmd) {
 	m.spinnerActive = true
 	m.spinner.Reset()
 	m.statusText = v.CorrelationID
+	m.viewDirty = true
 	return m, nil
 }
 
 func (m *Model) handleStreamComplete() (tea.Model, tea.Cmd) {
 	m.spinnerActive = false
 	m.statusText = ""
+	m.viewDirty = true
 	return m, nil
 }
 
 func (m *Model) handleStreamError(v msg.StreamErrorMsg) (tea.Model, tea.Cmd) {
 	m.spinnerActive = false
 	m.statusText = v.Err.Error()
+	m.viewDirty = true
 	return m, nil
 }
 
 func (m *Model) handleEventsDropped(v msg.EventsDroppedMsg) (tea.Model, tea.Cmd) {
 	m.droppedEvents.Add(v.Count)
+	m.viewDirty = true
 	return m, nil
 }
 

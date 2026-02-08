@@ -130,6 +130,22 @@ type Model struct {
 	cursorBlink  bool      // current blink phase (true = visible)
 	lastBlinkAt  time.Time // timestamp of the last blink toggle
 	theme        *theme.Theme
+
+	// View cache: avoids re-rendering all visible lines when only
+	// the cursor blink state changed.
+	vc viewCache
+}
+
+// viewCache stores cached renderVisibleLines output for the editor.
+type viewCache struct {
+	lines          []string // Cached rendered lines.
+	viewHeight     int      // Height the cache was rendered at.
+	scrollOffset   int      // Vertical scroll offset at render time.
+	scrollLeftCol  int      // Horizontal scroll offset at render time.
+	cursorLine     int      // Source line the cursor was on.
+	cursorRenderIdx int     // Index in lines[] of the cursor line.
+	valid          bool     // False when structural state changed.
+	cursorOK       bool     // False when only cursor blink changed.
 }
 
 // Compile-time interface checks.
@@ -214,9 +230,15 @@ func (m *Model) Init() tea.Cmd { return nil }
 
 // Update handles messages dispatched to the editor.
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
-	handler, ok := msgHandlerTable[msgType(incoming)]
+	kind := msgType(incoming)
+	handler, ok := msgHandlerTable[kind]
 	if !ok {
 		return m, nil
+	}
+	// Non-tick messages may change visual state → invalidate the full cache.
+	// Tick messages only toggle cursor blink → handled in handleTickMsg.
+	if kind != msgKindTickMsg {
+		m.vc.valid = false
 	}
 	return handler(m, incoming)
 }
@@ -257,7 +279,30 @@ func (m *Model) ViewContent() string {
 	}
 	m.adjustScroll(viewHeight)
 	m.adjustScrollX()
-	lines := m.renderVisibleLines(viewHeight)
+
+	// Detect scroll changes since the last cache snapshot.
+	scrollChanged := m.scrollOffset != m.vc.scrollOffset ||
+		m.scrollLeftCol != m.vc.scrollLeftCol
+
+	if !m.vc.valid || scrollChanged || m.vc.viewHeight != viewHeight {
+		// Full re-render: structure, scroll, or size changed.
+		m.vc.lines = m.renderVisibleLines(viewHeight)
+		m.vc.viewHeight = viewHeight
+		m.vc.scrollOffset = m.scrollOffset
+		m.vc.scrollLeftCol = m.scrollLeftCol
+		m.vc.cursorLine = m.state.CursorLine
+		m.vc.cursorRenderIdx = m.findCursorRenderIdx()
+		m.vc.valid = true
+		m.vc.cursorOK = true
+	} else if !m.vc.cursorOK {
+		// Cursor-only patch: re-render just the cursor line.
+		m.patchCursorLine()
+		m.vc.cursorOK = true
+	}
+
+	// Shallow clone — post-processing (tilde fill, fit, bounce, popup) mutates.
+	lines := slices.Clone(m.vc.lines)
+
 	for len(lines) < viewHeight {
 		lines = append(lines, m.renderTildeLine())
 	}
@@ -276,6 +321,34 @@ func (m *Model) ViewContent() string {
 		return barStr + "\n" + body
 	}
 	return body
+}
+
+// findCursorRenderIdx computes the index in vc.lines of the cursor line,
+// accounting for diagnostic virtual text lines above it.
+func (m *Model) findCursorRenderIdx() int {
+	idx := 0
+	for i := m.scrollOffset; i < m.state.CursorLine && i < m.scrollOffset+m.vc.viewHeight; i++ {
+		idx++ // The code line itself.
+		if _, ok := m.diagnosticForLine(i); ok {
+			idx++ // Diagnostic virtual line.
+		}
+	}
+	return idx
+}
+
+// patchCursorLine re-renders only the cursor line in the view cache.
+func (m *Model) patchCursorLine() {
+	ri := m.vc.cursorRenderIdx
+	if ri < 0 || ri >= len(m.vc.lines) {
+		m.vc.valid = false // Safety: fall back to full re-render.
+		return
+	}
+	ctx := m.buildRenderCtx()
+	if m.state.CursorLine >= ctx.totalLines {
+		m.vc.valid = false
+		return
+	}
+	m.vc.lines[ri] = m.renderOneLine(&ctx, m.state.CursorLine)
 }
 
 // StatusLineView renders the status line at the given width.
@@ -320,6 +393,10 @@ func (m *Model) SetFocused(focused bool) {
 		m.currentMode = mode.ModeNormal
 	}
 	m.focused = focused
+	if focused {
+		m.cursorBlink = true // Start with cursor visible on focus gain.
+	}
+	m.invalidateView()
 }
 
 // ---------------------------------------------------------------------------
@@ -561,11 +638,13 @@ func (m *Model) SetJumpMarker(line, startCol, endCol int) {
 	m.jumpStartCol = startCol
 	m.jumpEndCol = endCol
 	m.jumpActive = true
+	m.invalidateView()
 }
 
 // ClearJumpMarker removes the jump marker.
 func (m *Model) ClearJumpMarker() {
 	m.jumpActive = false
+	m.invalidateView()
 }
 
 // WarpLineInfo describes a warp point on a specific line.
@@ -579,6 +658,7 @@ type WarpLineInfo struct {
 // line numbers. Nil clears all.
 func (m *Model) SetWarpLines(lines map[int]WarpLineInfo) {
 	m.warpLines = lines
+	m.invalidateView()
 }
 
 // ---------------------------------------------------------------------------
@@ -670,11 +750,13 @@ func (m *Model) DismissAllOverlays() {
 // SetHighlightRanges replaces the current document highlight ranges.
 func (m *Model) SetHighlightRanges(ranges []lsp.DocumentHighlight) {
 	m.highlightRanges = ranges
+	m.invalidateView()
 }
 
 // ClearHighlightRanges removes all document highlight ranges.
 func (m *Model) ClearHighlightRanges() {
 	m.highlightRanges = nil
+	m.invalidateView()
 }
 
 // PushJump saves the current cursor position in the jump list so the user
@@ -1683,7 +1765,11 @@ func (m *Model) ScrollDown() bool {
 
 // SetBounceOffset updates the visual bounce displacement for rendering.
 func (m *Model) SetBounceOffset(offset int) {
+	if m.bounceOffset == offset {
+		return
+	}
 	m.bounceOffset = offset
+	m.invalidateView()
 }
 
 // clampCursorToViewport ensures the cursor line stays within the visible
@@ -2205,6 +2291,7 @@ func (m *Model) setCursorFromViewport(x, y int) {
 func (m *Model) SetSize(width, height int) {
 	m.width = width
 	m.height = height
+	m.invalidateView()
 }
 
 // ---------------------------------------------------------------------------
@@ -2401,18 +2488,26 @@ func handleCloseEditor(m *Model, _ tea.Msg) (component.Component, tea.Cmd) {
 	return m, nil
 }
 
-func handleTickMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
-	tick := incoming.(msg.TickMsg)
-	if !m.focused {
-		m.cursorBlink = true
-		m.lastBlinkAt = tick.Time
-		return m, nil
-	}
-	if tick.Time.Sub(m.lastBlinkAt) >= blinkHalfPeriod {
-		m.cursorBlink = !m.cursorBlink
-		m.lastBlinkAt = tick.Time
-	}
+func handleTickMsg(m *Model, _ tea.Msg) (component.Component, tea.Cmd) {
+	// Cursor blink is now driven by BlinkMsg, not the tick chain.
 	return m, nil
+}
+
+// ToggleBlink flips the cursor blink phase and marks the cursor line
+// for re-rendering. Called by the app's centralized blink timer.
+func (m *Model) ToggleBlink() {
+	m.cursorBlink = !m.cursorBlink
+	m.vc.cursorOK = false
+}
+
+// SetBlinkVisible ensures the cursor is steady-visible (not in the "off"
+// phase of a blink cycle). Called when idle timeout stops the blink chain.
+func (m *Model) SetBlinkVisible() {
+	if m.cursorBlink {
+		return // Already visible (cursorBlink true = cursor shown).
+	}
+	m.cursorBlink = true
+	m.vc.cursorOK = false
 }
 
 func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
@@ -2728,14 +2823,28 @@ func (m *Model) adjustScrollX() {
 	}
 }
 
-func (m *Model) renderVisibleLines(viewHeight int) []string {
+// renderLineCtx holds shared state for a renderVisibleLines pass so that
+// renderOneLine can be called individually for cursor-only patching.
+type renderLineCtx struct {
+	contentLines []string
+	totalLines   int
+	gutterWidth  int
+	defaultStyle lipgloss.Style
+	hasSelection bool
+	selStartLine int
+	selStartCol  int
+	selEndLine   int
+	selEndCol    int
+}
+
+// buildRenderCtx computes the shared rendering context once per pass.
+func (m *Model) buildRenderCtx() renderLineCtx {
 	content := m.buf.Content()
 	contentLines := strings.Split(content, "\n")
 	totalLines := len(contentLines)
 	gutterWidth := m.gutterWidth(totalLines)
 	defaultStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 
-	// Pre-compute selection range (keyboard visual or mouse).
 	var selStartLine, selStartCol, selEndLine, selEndCol int
 	hasSelection, selStart, selEnd := m.selectionRange()
 	if hasSelection {
@@ -2743,122 +2852,144 @@ func (m *Model) renderVisibleLines(viewHeight int) []string {
 		selEndLine, selEndCol = m.lineIndex.PosToLineCol(selEnd)
 	}
 
+	return renderLineCtx{
+		contentLines: contentLines,
+		totalLines:   totalLines,
+		gutterWidth:  gutterWidth,
+		defaultStyle: defaultStyle,
+		hasSelection: hasSelection,
+		selStartLine: selStartLine,
+		selStartCol:  selStartCol,
+		selEndLine:   selEndLine,
+		selEndCol:    selEndCol,
+	}
+}
+
+// renderOneLine renders a single source line into a styled string.
+// Extracted from renderVisibleLines so it can be called individually for
+// cursor-only patching.
+func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
+	var regions []highlight.HighlightRegion
+	if i < len(m.regions) {
+		regions = m.regions[i]
+	}
+
+	// Pre-expand tabs and remap all columns to display space.
+	displayLine, colMap := expandTabs(ctx.contentLines[i], editorTabWidth)
+	displayRegions := remapRegions(regions, colMap)
+	displayLineRunes := len([]rune(displayLine))
+	inSelection := ctx.hasSelection && i >= ctx.selStartLine && i <= ctx.selEndLine
+	findSpans := m.findMatchSpans(i, len([]rune(ctx.contentLines[i])), colMap)
+	hlSpans := m.highlightSpansForLine(i, colMap)
+	jumpSpans := m.jumpMarkerSpansForLine(i, colMap)
+
+	// Compute diagnostic underline ranges for this line.
+	ulRanges := m.diagnosticDisplayRanges(i, colMap)
+
+	// Horizontal scroll: clip display data to visible window.
+	vs := m.scrollLeftCol
+	if vs > 0 {
+		cw := m.contentWidth()
+		dr := []rune(displayLine)
+		if vs < len(dr) {
+			end := min(vs+cw, len(dr))
+			displayLine = string(dr[vs:end])
+		} else {
+			displayLine = ""
+		}
+		displayLineRunes = len([]rune(displayLine))
+		displayRegions = shiftClipRegions(displayRegions, vs, cw)
+		findSpans = shiftClipSpans(findSpans, vs, cw)
+		hlSpans = shiftClipSpans(hlSpans, vs, cw)
+		jumpSpans = shiftClipSpans(jumpSpans, vs, cw)
+		ulRanges = shiftClipUnderlines(ulRanges, vs, cw)
+	}
+
+	// Choose line rendering strategy; underlines apply to all paths.
+	switch {
+	case inSelection:
+		sc := 0
+		if i == ctx.selStartLine {
+			sc = max(safeMapCol(colMap, ctx.selStartCol)-vs, 0)
+		}
+		ec := displayLineRunes
+		if i == ctx.selEndLine {
+			ec = safeMapCol(colMap, ctx.selEndCol+1) - vs
+		}
+		if len(findSpans) > 0 {
+			return m.renderSelectedLineWithMatches(
+				i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, sc, ec, findSpans, ulRanges)
+		}
+		return m.renderSelectedLine(
+			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, sc, ec, ulRanges)
+	case len(findSpans) > 0:
+		curCol := -1
+		if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
+			curCol = safeMapCol(colMap, m.state.CursorCol) - vs
+		}
+		return m.renderFindMatchLine(
+			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, findSpans, curCol, ulRanges)
+	case len(jumpSpans) > 0:
+		curCol := -1
+		if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
+			curCol = safeMapCol(colMap, m.state.CursorCol) - vs
+		}
+		return m.renderHighlightLine(
+			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, jumpSpans, curCol, ulRanges)
+	case !m.overlayActive() && i == m.state.CursorLine && m.focused:
+		displayCol := safeMapCol(colMap, m.state.CursorCol) - vs
+		curCol := -1
+		if m.cursorBlink {
+			curCol = displayCol
+		}
+		if len(hlSpans) > 0 {
+			return m.renderHighlightLine(
+				i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, hlSpans, curCol, ulRanges)
+		}
+		if wInfo, isWarp := m.warpLines[i]; isWarp {
+			ws := max(safeMapCol(colMap, wInfo.StartCol)-vs, 0)
+			we := min(safeMapCol(colMap, wInfo.EndCol)-vs, displayLineRunes)
+			warpSpan := []colSpan{{start: ws, end: we}}
+			return m.renderWarpLine(
+				i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, warpSpan, curCol, ulRanges)
+		}
+		if curCol >= 0 {
+			return m.applyCursor(
+				displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, displayCol, ulRanges)
+		}
+		gutter := m.renderGutter(i, ctx.gutterWidth)
+		lineText := highlight.RenderLineWithUnderlines(
+			displayLine, displayRegions, m.theme.Syntax, ctx.defaultStyle, ulRanges)
+		return gutter + lineText
+	case len(hlSpans) > 0:
+		return m.renderHighlightLine(
+			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, hlSpans, -1, ulRanges)
+	default:
+		if wInfo, isWarp := m.warpLines[i]; isWarp {
+			ws := max(safeMapCol(colMap, wInfo.StartCol)-vs, 0)
+			we := min(safeMapCol(colMap, wInfo.EndCol)-vs, displayLineRunes)
+			warpSpan := []colSpan{{start: ws, end: we}}
+			return m.renderWarpLine(
+				i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, warpSpan, -1, ulRanges)
+		}
+		gutter := m.renderGutter(i, ctx.gutterWidth)
+		lineText := highlight.RenderLineWithUnderlines(
+			displayLine, displayRegions, m.theme.Syntax, ctx.defaultStyle, ulRanges)
+		return gutter + lineText
+	}
+}
+
+func (m *Model) renderVisibleLines(viewHeight int) []string {
+	ctx := m.buildRenderCtx()
+
 	// Track rendered lines (code + virtual text) against viewHeight.
 	result := make([]string, 0, viewHeight)
-	for i := m.scrollOffset; i < totalLines && len(result) < viewHeight; i++ {
-		var regions []highlight.HighlightRegion
-		if i < len(m.regions) {
-			regions = m.regions[i]
-		}
-
-		// Pre-expand tabs and remap all columns to display space.
-		displayLine, colMap := expandTabs(contentLines[i], editorTabWidth)
-		displayRegions := remapRegions(regions, colMap)
-		displayLineRunes := len([]rune(displayLine))
-		inSelection := hasSelection && i >= selStartLine && i <= selEndLine
-		findSpans := m.findMatchSpans(i, len([]rune(contentLines[i])), colMap)
-		hlSpans := m.highlightSpansForLine(i, colMap)
-		jumpSpans := m.jumpMarkerSpansForLine(i, colMap)
-
-		// Compute diagnostic underline ranges for this line.
-		ulRanges := m.diagnosticDisplayRanges(i, colMap)
-
-		// Horizontal scroll: clip display data to visible window.
-		vs := m.scrollLeftCol
-		if vs > 0 {
-			cw := m.contentWidth()
-			dr := []rune(displayLine)
-			if vs < len(dr) {
-				end := min(vs+cw, len(dr))
-				displayLine = string(dr[vs:end])
-			} else {
-				displayLine = ""
-			}
-			displayLineRunes = len([]rune(displayLine))
-			displayRegions = shiftClipRegions(displayRegions, vs, cw)
-			findSpans = shiftClipSpans(findSpans, vs, cw)
-			hlSpans = shiftClipSpans(hlSpans, vs, cw)
-			jumpSpans = shiftClipSpans(jumpSpans, vs, cw)
-			ulRanges = shiftClipUnderlines(ulRanges, vs, cw)
-		}
-
-		// Choose line rendering strategy; underlines apply to all paths.
-		switch {
-		case inSelection:
-			sc := 0
-			if i == selStartLine {
-				sc = max(safeMapCol(colMap, selStartCol)-vs, 0)
-			}
-			ec := displayLineRunes
-			if i == selEndLine {
-				ec = safeMapCol(colMap, selEndCol+1) - vs
-			}
-			if len(findSpans) > 0 {
-				result = append(result, m.renderSelectedLineWithMatches(
-					i, displayLine, displayRegions, gutterWidth, defaultStyle, sc, ec, findSpans, ulRanges))
-			} else {
-				result = append(result, m.renderSelectedLine(
-					i, displayLine, displayRegions, gutterWidth, defaultStyle, sc, ec, ulRanges))
-			}
-		case len(findSpans) > 0:
-			curCol := -1
-			if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
-				curCol = safeMapCol(colMap, m.state.CursorCol) - vs
-			}
-			result = append(result, m.renderFindMatchLine(
-				i, displayLine, displayRegions, gutterWidth, defaultStyle, findSpans, curCol, ulRanges))
-		case len(jumpSpans) > 0:
-			curCol := -1
-			if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
-				curCol = safeMapCol(colMap, m.state.CursorCol) - vs
-			}
-			result = append(result, m.renderHighlightLine(
-				i, displayLine, displayRegions, gutterWidth, defaultStyle, jumpSpans, curCol, ulRanges))
-		case !m.overlayActive() && i == m.state.CursorLine && m.focused:
-			displayCol := safeMapCol(colMap, m.state.CursorCol) - vs
-			curCol := -1
-			if m.cursorBlink {
-				curCol = displayCol
-			}
-			if len(hlSpans) > 0 {
-				result = append(result, m.renderHighlightLine(
-					i, displayLine, displayRegions, gutterWidth, defaultStyle, hlSpans, curCol, ulRanges))
-			} else if wInfo, isWarp := m.warpLines[i]; isWarp {
-				ws := max(safeMapCol(colMap, wInfo.StartCol)-vs, 0)
-				we := min(safeMapCol(colMap, wInfo.EndCol)-vs, displayLineRunes)
-				warpSpan := []colSpan{{start: ws, end: we}}
-				result = append(result, m.renderWarpLine(
-					i, displayLine, displayRegions, gutterWidth, defaultStyle, warpSpan, curCol, ulRanges))
-			} else if curCol >= 0 {
-				result = append(result, m.applyCursor(
-					displayLine, displayRegions, gutterWidth, defaultStyle, displayCol, ulRanges))
-			} else {
-				gutter := m.renderGutter(i, gutterWidth)
-				lineText := highlight.RenderLineWithUnderlines(
-					displayLine, displayRegions, m.theme.Syntax, defaultStyle, ulRanges)
-				result = append(result, gutter+lineText)
-			}
-		case len(hlSpans) > 0:
-			result = append(result, m.renderHighlightLine(
-				i, displayLine, displayRegions, gutterWidth, defaultStyle, hlSpans, -1, ulRanges))
-		default:
-			if wInfo, isWarp := m.warpLines[i]; isWarp {
-				ws := max(safeMapCol(colMap, wInfo.StartCol)-vs, 0)
-				we := min(safeMapCol(colMap, wInfo.EndCol)-vs, displayLineRunes)
-				warpSpan := []colSpan{{start: ws, end: we}}
-				result = append(result, m.renderWarpLine(
-					i, displayLine, displayRegions, gutterWidth, defaultStyle, warpSpan, -1, ulRanges))
-			} else {
-				gutter := m.renderGutter(i, gutterWidth)
-				lineText := highlight.RenderLineWithUnderlines(
-					displayLine, displayRegions, m.theme.Syntax, defaultStyle, ulRanges)
-				result = append(result, gutter+lineText)
-			}
-		}
+	for i := m.scrollOffset; i < ctx.totalLines && len(result) < viewHeight; i++ {
+		result = append(result, m.renderOneLine(&ctx, i))
 
 		// Append diagnostic virtual text line below if space remains.
 		if diag, ok := m.diagnosticForLine(i); ok && len(result) < viewHeight {
-			result = append(result, m.renderDiagnosticVirtualLine(diag, gutterWidth, m.width))
+			result = append(result, m.renderDiagnosticVirtualLine(diag, ctx.gutterWidth, m.width))
 		}
 	}
 	return result
@@ -3737,6 +3868,12 @@ func (m *Model) computeReplacement(matchedText string) string {
 	return compiled.ReplaceAllString(matchedText, m.replaceBar.Replacement())
 }
 
+// invalidateView marks the view cache as stale so the next ViewContent()
+// performs a full re-render of all visible lines.
+func (m *Model) invalidateView() {
+	m.vc.valid = false
+}
+
 // markModified updates the editor's modified/lspDirty/editGeneration state
 // after a buffer mutation.
 func (m *Model) markModified() {
@@ -3746,6 +3883,7 @@ func (m *Model) markModified() {
 	m.lastEditAt = time.Now()
 	m.rehighlight()
 	m.syncStatusLine()
+	m.invalidateView()
 }
 
 // ---------------------------------------------------------------------------

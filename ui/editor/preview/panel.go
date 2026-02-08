@@ -69,7 +69,12 @@ func New(th *theme.Theme) *Panel {
 
 func (p *Panel) ID() component.FocusID  { return component.FocusPreview }
 func (p *Panel) Focused() bool           { return p.focused }
-func (p *Panel) SetFocused(focused bool) { p.focused = focused }
+func (p *Panel) SetFocused(focused bool) {
+	p.focused = focused
+	if focused {
+		p.cursorBlink = true
+	}
+}
 
 // ---------------------------------------------------------------------------
 // component.Resizable
@@ -83,17 +88,19 @@ func (p *Panel) SetSize(w, h int) { p.width = w; p.height = h }
 
 func (p *Panel) Init() tea.Cmd { return nil }
 
-// HandleTick toggles the cursor blink state on each half-period.
-func (p *Panel) HandleTick(t time.Time) {
-	if !p.focused {
-		p.cursorBlink = true
-		p.lastBlinkAt = t
-		return
-	}
-	if t.Sub(p.lastBlinkAt) >= blinkHalfPeriod {
-		p.cursorBlink = !p.cursorBlink
-		p.lastBlinkAt = t
-	}
+// HandleTick is retained for interface compatibility. Cursor blink is now
+// driven by the app's centralized BlinkMsg timer.
+func (p *Panel) HandleTick(_ time.Time) {}
+
+// ToggleBlink flips the cursor visibility. Called by the app's centralized
+// blink timer.
+func (p *Panel) ToggleBlink() {
+	p.cursorBlink = !p.cursorBlink
+}
+
+// SetBlinkVisible ensures the cursor is steady-visible.
+func (p *Panel) SetBlinkVisible() {
+	p.cursorBlink = true
 }
 
 func (p *Panel) Update(msg tea.Msg) (component.Component, tea.Cmd) {

@@ -49,6 +49,10 @@ type Model struct {
 	// Receives the raw line text and returns a styled string plus an
 	// optional hint displayed after the text in muted style.
 	lineStyler func(text string) (styled string, hint string)
+
+	// View cache: avoids re-rendering when no visible state changed.
+	viewCache string
+	viewDirty bool
 }
 
 // Compile-time interface checks.
@@ -74,13 +78,22 @@ func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) 
 // SetLineStyler sets an optional styling function for line 0 text.
 // The function returns styled text and an optional hint string.
 // Pass nil to clear.
-func (m *Model) SetLineStyler(fn func(string) (string, string)) { m.lineStyler = fn }
+func (m *Model) SetLineStyler(fn func(string) (string, string)) {
+	m.lineStyler = fn
+	m.viewDirty = true
+}
 
 // SetPlaceholder changes the idle text shown when the input is empty.
-func (m *Model) SetPlaceholder(text string) { m.placeholder = text }
+func (m *Model) SetPlaceholder(text string) {
+	m.placeholder = text
+	m.viewDirty = true
+}
 
 // SetText replaces the input content and positions the cursor at the end.
-func (m *Model) SetText(s string) { m.setText(s) }
+func (m *Model) SetText(s string) {
+	m.setText(s)
+	m.viewDirty = true
+}
 
 // Clear resets the input content to empty.
 func (m *Model) Clear() {
@@ -89,6 +102,7 @@ func (m *Model) Clear() {
 	m.cursorCol = 0
 	m.scrollOff = 0
 	m.completer.Dismiss()
+	m.viewDirty = true
 }
 
 // SelectAll marks all input content as selected.
@@ -137,6 +151,7 @@ func (m *Model) Init() tea.Cmd { return nil }
 func (m *Model) Update(raw tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := raw.(type) {
 	case tea.KeyMsg:
+		m.viewDirty = true
 		return m.handleKey(typed)
 	case msg.TickMsg:
 		m.advanceBlink(typed.Time)
@@ -148,6 +163,10 @@ func (m *Model) Update(raw tea.Msg) (component.Component, tea.Cmd) {
 
 // View renders the input area.
 func (m *Model) View() string {
+	if !m.viewDirty && m.viewCache != "" {
+		return m.viewCache
+	}
+
 	style := m.borderStyle()
 
 	body := m.renderBody()
@@ -166,7 +185,9 @@ func (m *Model) View() string {
 		}
 	}
 
-	return style.Width(m.contentWidth()).Render(body)
+	m.viewCache = style.Width(m.contentWidth()).Render(body)
+	m.viewDirty = false
+	return m.viewCache
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +203,7 @@ func (m *Model) Focused() bool { return m.focused }
 // SetFocused sets the focus state, resetting the cursor blink on focus gain.
 func (m *Model) SetFocused(focused bool) {
 	m.focused = focused
+	m.viewDirty = true
 	if focused {
 		m.resetBlink()
 	}
@@ -195,6 +217,7 @@ func (m *Model) SetFocused(focused bool) {
 func (m *Model) SetSize(width, height int) {
 	m.width = width
 	m.height = height
+	m.viewDirty = true
 }
 
 // LineCount returns the number of content lines currently in the input.
@@ -208,13 +231,26 @@ func (m *Model) LineCount() int {
 
 // advanceBlink toggles cursor visibility when the blink interval has elapsed.
 func (m *Model) advanceBlink(now time.Time) {
-	if !m.focused {
+	// Cursor blink is now driven by BlinkMsg, not the tick chain.
+	// Retained as no-op for interface compatibility.
+	_ = now
+}
+
+// ToggleBlink flips the cursor visibility. Called by the app's centralized
+// blink timer.
+func (m *Model) ToggleBlink() {
+	m.cursorVisible = !m.cursorVisible
+	m.viewDirty = true
+}
+
+// SetBlinkVisible ensures the cursor is steady-visible (not in the "off"
+// phase of a blink cycle). Called when idle timeout stops the blink chain.
+func (m *Model) SetBlinkVisible() {
+	if m.cursorVisible {
 		return
 	}
-	if now.Sub(m.lastBlinkAt) >= blinkInterval {
-		m.cursorVisible = !m.cursorVisible
-		m.lastBlinkAt = now
-	}
+	m.cursorVisible = true
+	m.viewDirty = true
 }
 
 // resetBlink makes the cursor visible and resets the blink timer.

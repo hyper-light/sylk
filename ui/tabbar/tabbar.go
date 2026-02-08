@@ -40,6 +40,11 @@ type Config struct {
 	// that this sub-panel has focus (mirrors the sectionHeader pattern
 	// used by the session/agent sub-panels).
 	Focused bool
+
+	// DimActive renders the active tab with muted colors (same as
+	// inactive tabs) instead of Primary+bold. Used in multi-pane
+	// setups so only the focused pane's active tab stands out.
+	DimActive bool
 }
 
 // Height is the number of lines the tab bar occupies (tabs + divider).
@@ -223,7 +228,7 @@ func renderTab(cfg Config, t Tab, active, hoverClose bool, budget int) string {
 	name = truncateName(name, nameSpace)
 
 	// Build styles.
-	nameStyle, iconSt, closeGapSt, closeGlyphSt := tabStyles(cfg.Theme, iconColor, active, hoverClose, t.Modified)
+	nameStyle, iconSt, closeGapSt, closeGlyphSt := tabStyles(cfg.Theme, iconColor, active && !cfg.DimActive, hoverClose, t.Modified)
 
 	closeGlyph := "✕"
 	if t.Modified {

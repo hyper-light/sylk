@@ -29,6 +29,10 @@ type Model struct {
 	// Transient highlight for copy feedback.
 	highlightID    string
 	highlightTicks int
+
+	// View cache: avoids re-rendering when no visible state changed.
+	viewCache string
+	viewDirty bool
 }
 
 // Verify interface compliance at compile time.
@@ -62,20 +66,33 @@ func (m *Model) Init() tea.Cmd {
 func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	switch typed := incoming.(type) {
 	case msg.TickMsg:
+		prevHL := m.highlightTicks
+		prevFlash := m.viewport.EdgeFlashTicks()
 		m.tickHighlight()
 		m.viewport.TickEdgeFlash()
+		// Only mark dirty if tick actually changed visible state.
+		if (prevHL > 0 && prevHL != m.highlightTicks) ||
+			(prevFlash > 0 && prevFlash != m.viewport.EdgeFlashTicks()) {
+			m.viewDirty = true
+		}
 		return m, nil
 	case msg.ActivityEventMsg:
+		m.viewDirty = true
 		return m, m.handleActivity(typed)
 	case msg.StreamStartMsg:
+		m.viewDirty = true
 		return m, m.handleStreamStart(typed)
 	case msg.StreamChunkMsg:
+		m.viewDirty = true
 		return m, m.handleStreamChunk(typed)
 	case msg.StreamCompleteMsg:
+		m.viewDirty = true
 		return m, m.handleStreamComplete(typed)
 	case msg.StreamErrorMsg:
+		m.viewDirty = true
 		return m, m.handleStreamError(typed)
 	case tea.KeyMsg:
+		m.viewDirty = true
 		return m, m.handleKey(typed)
 	default:
 		return m, nil
@@ -84,7 +101,12 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 
 // View renders the chat viewport.
 func (m *Model) View() string {
-	return m.viewport.View()
+	if !m.viewDirty && m.viewCache != "" {
+		return m.viewCache
+	}
+	m.viewCache = m.viewport.View()
+	m.viewDirty = false
+	return m.viewCache
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +126,7 @@ func (m *Model) Focused() bool {
 // SetFocused sets the focus state. Selection is cleared on blur.
 func (m *Model) SetFocused(focused bool) {
 	m.focused = focused
+	m.viewDirty = true
 	if !focused {
 		m.viewport.ClearSelection()
 	}
@@ -117,6 +140,7 @@ func (m *Model) SetFocused(focused bool) {
 func (m *Model) SetSize(width, height int) {
 	m.width = max(width, 0)
 	m.height = max(height, 0)
+	m.viewDirty = true
 	m.viewport.SetSize(m.width, m.height)
 }
 
@@ -253,22 +277,37 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 // ScrollUp scrolls the chat viewport up by one line.
 // Returns true if the scroll was applied, false if at boundary.
 func (m *Model) ScrollUp() bool {
-	return m.viewport.ScrollUp()
+	if m.viewport.ScrollUp() {
+		m.viewDirty = true
+		return true
+	}
+	return false
 }
 
 // ScrollDown scrolls the chat viewport down by one line.
 // Returns true if the scroll was applied, false if at boundary.
 func (m *Model) ScrollDown() bool {
-	return m.viewport.ScrollDown()
+	if m.viewport.ScrollDown() {
+		m.viewDirty = true
+		return true
+	}
+	return false
 }
 
 // SetBounceOffset updates the visual bounce displacement for rendering.
 func (m *Model) SetBounceOffset(offset int) {
 	m.viewport.SetBounceOffset(offset)
+	m.viewDirty = true
 }
 
 // IsStreaming reports whether a response is currently being streamed.
 func (m *Model) IsStreaming() bool { return m.accumulator != nil }
+
+// HasActiveAnimation reports whether any tick-driven animation is running
+// (highlight countdown or edge flash).
+func (m *Model) HasActiveAnimation() bool {
+	return m.highlightTicks > 0 || m.viewport.HasEdgeFlash()
+}
 
 // EntryAtViewLine returns the chat entry visible at the given viewport-relative
 // line (0 = top visible line). Returns nil if out of bounds.
@@ -289,6 +328,7 @@ func (m *Model) CopyTargetAtViewLine(y int) *CopyTarget {
 func (m *Model) SetHighlight(entryID string, entryIndex, start, end int) {
 	m.highlightID = entryID
 	m.highlightTicks = highlightDurationTicks
+	m.viewDirty = true
 	if m.focused {
 		m.viewport.SelectRegionContaining(entryIndex, start)
 	}

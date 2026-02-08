@@ -50,9 +50,26 @@ import (
 	"github.com/adalundhe/sylk/ui/theme"
 )
 
-// tickInterval is the period between TickMsg emissions.
-// Derived from 60fps cursor blink / spinner cadence (~16ms).
-const tickInterval = 16 * time.Millisecond
+// tickFastInterval drives 60fps animations (scroll momentum, bounce, flash).
+// Derived from: 1000ms / 60fps ≈ 16ms.
+const tickFastInterval = 16 * time.Millisecond
+
+// tickSlowInterval drives transient slow-rate work (swipe decay).
+// Derived from: swipe decay timeout is 300ms; 200ms provides ≥1 sample.
+const tickSlowInterval = 200 * time.Millisecond
+
+// blinkHalfPeriod is the duration between cursor visibility toggles.
+// Derived from: standard terminal cursor blink rate (~530ms per phase).
+const blinkHalfPeriod = 530 * time.Millisecond
+
+// tickRate classifies the current tick chain speed.
+type tickRate int
+
+const (
+	tickIdle tickRate = iota // No tick scheduled.
+	tickSlow                // 200ms — swipe decay.
+	tickFast                // 16ms — scroll, bounce, flash, spinner.
+)
 
 // shutdownGrace is the grace period for goroutine shutdown.
 // Derived from: once contexts are cancelled, goroutines exit within ms.
@@ -301,9 +318,23 @@ type AppModel struct {
 	tabHoverPane         pane.PaneID // Pane whose close icon is being hovered.
 	previewTabHoverClose int       // Preview tab close icon hover (-1 = none).
 
-	// Overflow arrow flash counters (remaining ticks at 16ms each).
+	// Overflow arrow flash counters (remaining ticks at tickFastInterval each).
 	tabArrowFlashLeft  int
 	tabArrowFlashRight int
+
+	// Demand-driven tick chain state.
+	tickGen  uint64   // Generation counter; incremented on tick chain transitions.
+	tickRate tickRate // Current tick chain speed (idle/slow/fast).
+
+	// Centralized cursor blink timer (one-shot at blinkHalfPeriod).
+	blinkGen uint64 // Generation counter; bumped on interactive events to reset blink.
+
+	// One-shot LSP flush timer (fires lspDebounceInterval after last edit).
+	lspFlushGen int // editGeneration at last scheduled flush; prevents duplicates.
+
+	// App-level view cache: skips the full View() cascade when nothing changed.
+	viewCache string
+	viewDirty bool
 
 	// Mouse hover tracking for LSP hover tooltips.
 	hoverMouseLine      int  // last buffer line the mouse was over (-1 = none)
@@ -522,12 +553,16 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	return app
 }
 
-// Init starts all event bridges, the tick timer, and background LSP provisioning.
+// Init starts all event bridges, the tick/blink timers, and background LSP provisioning.
 func (m *AppModel) Init() tea.Cmd {
+	m.viewDirty = true
 	cmds := []tea.Cmd{
 		m.startBridges(),
-		m.tickCmd(),
+		m.ensureTick(false),
 		m.provisionLSPServers(),
+	}
+	if bc := m.ensureBlinkAfterDispatch(); bc != nil {
+		cmds = append(cmds, bc)
 	}
 	if !m.nerdFontsDetected {
 		cmds = append(cmds, m.installNerdFontsCmd())
@@ -578,8 +613,69 @@ func (m *AppModel) nudgeGitWatcher() {
 	}
 }
 
-// Update dispatches incoming messages to the appropriate handler.
+// Update dispatches incoming messages and ensures the tick/blink/LSP-flush
+// chains are running at the appropriate speed for the current activity level.
 func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
+	_, cmd := m.dispatch(raw)
+
+	switch raw.(type) {
+	case msg.TickMsg:
+		// Tick chain self-manages via continueTickChain in handleTick.
+		// viewDirty set by handleTick when visual work occurred.
+		return m, cmd
+	case msg.BlinkMsg:
+		// Blink chain self-manages via handleBlink.
+		// viewDirty set by handleBlink when blink toggled.
+		return m, cmd
+	case msg.LSPFlushMsg:
+		// One-shot timer; no view change.
+		return m, cmd
+	case tea.KeyMsg, tea.MouseMsg:
+		// Interactive events reset blink phase.
+		m.viewDirty = true
+		m.blinkGen++
+		return m, m.postDispatchCmds(cmd, true)
+	default:
+		// Background messages (git, LSP, streaming, etc.) may change visual
+		// state but must NOT reset the blink cycle or schedule new blink
+		// timers — otherwise each background message creates a 530ms timer,
+		// causing duplicate blink chains and burning CPU at idle.
+		m.viewDirty = true
+		return m, m.postDispatchCmds(cmd, false)
+	}
+}
+
+// postDispatchCmds collects tick, blink, and LSP-flush commands that may be
+// needed after a non-tick dispatch. scheduleBlink is true only for
+// interactive events (key/mouse) that bumped blinkGen.
+func (m *AppModel) postDispatchCmds(dispatchCmd tea.Cmd, scheduleBlink bool) tea.Cmd {
+	cmds := make([]tea.Cmd, 0, 4)
+	if dispatchCmd != nil {
+		cmds = append(cmds, dispatchCmd)
+	}
+	if tc := m.ensureTickAfterDispatch(); tc != nil {
+		cmds = append(cmds, tc)
+	}
+	if scheduleBlink {
+		if bc := m.ensureBlinkAfterDispatch(); bc != nil {
+			cmds = append(cmds, bc)
+		}
+	}
+	if lf := m.ensureLSPFlush(); lf != nil {
+		cmds = append(cmds, lf)
+	}
+	switch len(cmds) {
+	case 0:
+		return nil
+	case 1:
+		return cmds[0]
+	default:
+		return tea.Batch(cmds...)
+	}
+}
+
+// dispatch is the main message handler.
+func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	switch typed := raw.(type) {
 	case tea.WindowSizeMsg:
 		return m, m.handleResize(typed)
@@ -613,6 +709,10 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleQuit()
 	case msg.TickMsg:
 		return m, m.handleTick(typed)
+	case msg.BlinkMsg:
+		return m, m.handleBlink(typed)
+	case msg.LSPFlushMsg:
+		return m, m.handleLSPFlush(typed)
 	case msg.FocusPanelMsg:
 		return m, m.handleFocusPanel(typed)
 	case msg.OpenEditorMsg:
@@ -796,10 +896,15 @@ func (m *AppModel) View() string {
 	if !m.ready {
 		return ""
 	}
+	if !m.viewDirty && m.viewCache != "" {
+		return m.viewCache
+	}
 
 	// Full-screen overlay takes over everything.
 	if m.overlay == overlayEditor {
-		return m.editorOverlay.View()
+		m.viewCache = m.editorOverlay.View()
+		m.viewDirty = false
+		return m.viewCache
 	}
 
 	// Base layout.
@@ -810,16 +915,24 @@ func (m *AppModel) View() string {
 
 	// Partial overlays render on top of the base.
 	if m.overlay == overlayModal && m.modalOverlay.Active() {
-		return m.modalOverlay.View()
+		m.viewCache = m.modalOverlay.View()
+		m.viewDirty = false
+		return m.viewCache
 	}
 	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
-		return m.searchOverlay.View()
+		m.viewCache = m.searchOverlay.View()
+		m.viewDirty = false
+		return m.viewCache
 	}
 	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
-		return m.fieldManualOverlay.View()
+		m.viewCache = m.fieldManualOverlay.View()
+		m.viewDirty = false
+		return m.viewCache
 	}
 
-	return base
+	m.viewCache = base
+	m.viewDirty = false
+	return m.viewCache
 }
 
 // Shutdown gracefully stops all bridges and waits for goroutine cleanup.
@@ -1303,43 +1416,46 @@ func (m *AppModel) handleQuit() tea.Cmd {
 }
 
 func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
-	// Forward tick to status bar, input (cursor blink), editor (cursor blink),
-	// and chat (highlight).
-	m.statusBar.Update(tick)
-	comp, _ := m.input.Update(tick)
-	m.input = comp.(*inputpkg.Model)
-	chatComp, _ := m.chat.Update(tick)
-	m.chat = chatComp.(*chat.Model)
-	if m.editMode {
-		m.focusedEditor().Update(tick)
+	// Drop ticks from invalidated chains (e.g., after slow→fast upgrade).
+	if tick.Gen != m.tickGen {
+		return nil
 	}
-	if m.hasPreview() {
-		m.previewPanel.HandleTick(tick.Time)
+
+	// Conditionally forward to components that have active animations.
+	// Cursor blink is handled by BlinkMsg; LSP flush by LSPFlushMsg.
+	if m.statusBar.IsAnimating() {
+		m.statusBar.Update(tick)
+		m.viewDirty = true
 	}
-	m.fileTree.Update(tick)
-	m.tickScrollMomentum()
+	if m.chat.HasActiveAnimation() {
+		chatComp, _ := m.chat.Update(tick)
+		m.chat = chatComp.(*chat.Model)
+		m.viewDirty = true
+	}
+
+	// Scroll momentum and bounce.
+	if !m.scroll.settled() {
+		m.tickScrollMomentum()
+		m.viewDirty = true
+	}
 	m.tickSwipeDecay()
 
 	// Decay tab arrow flash counters.
 	if m.tabArrowFlashLeft > 0 {
 		m.tabArrowFlashLeft--
+		m.viewDirty = true
 	}
 	if m.tabArrowFlashRight > 0 {
 		m.tabArrowFlashRight--
+		m.viewDirty = true
 	}
 
-	// Refresh ring hint so streaming activity badge stays current.
-	if !m.leftRing.empty() || !m.rightRing.empty() {
+	// Only refresh ring hint during streaming (activity badge changes).
+	if (!m.leftRing.empty() || !m.rightRing.empty()) && m.chat.IsStreaming() {
 		m.statusBar.SetViewRingHint(m.buildRingHint())
 	}
 
-	// Flush debounced LSP didChange when the editor has pending edits.
-	if m.editMode && m.focusedEditor().LSPDirty() && time.Since(m.focusedEditor().LastEditAt()) >= lspDebounceInterval {
-		m.focusedEditor().ClearLSPDirty()
-		return tea.Batch(m.tickCmd(), m.lspDidChangeCmd(m.focusedEditor().FilePath(), m.focusedEditor().Content()))
-	}
-
-	return m.tickCmd()
+	return m.continueTickChain()
 }
 
 func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
@@ -3295,6 +3411,7 @@ func (m *AppModel) paneTabBarConfig(id pane.PaneID, width int) tabbar.Config {
 		FlashRight: isFocused && m.tabArrowFlashRight > 0,
 		HoverClose: hoverClose,
 		Focused:    hasSplits && isFocused,
+		DimActive:  hasSplits && !isFocused,
 	}
 }
 
@@ -3325,6 +3442,7 @@ func (m *AppModel) previewTabBarViewSized(width int) string {
 		Theme:      m.config.Theme(),
 		HoverClose: m.previewTabHoverClose,
 		Focused:    hasSplits && m.isPreviewFocused(),
+		DimActive:  hasSplits && !m.isPreviewFocused(),
 	}
 	return tabbar.View(cfg)
 }
@@ -3354,6 +3472,7 @@ func (m *AppModel) previewTabBarConfig() tabbar.Config {
 		Theme:      th,
 		HoverClose: m.previewTabHoverClose,
 		Focused:    len(m.focusedTabOrder()) > 0 && m.isPreviewFocused(),
+		DimActive:  len(m.focusedTabOrder()) > 0 && !m.isPreviewFocused(),
 	}
 }
 
@@ -3985,6 +4104,7 @@ func (m *AppModel) tabBarConfig() tabbar.Config {
 		FlashRight: m.tabArrowFlashRight > 0,
 		HoverClose: m.tabHoverClose,
 		Focused:    m.hasPreview() && m.isEditorFocused(),
+		DimActive:  m.hasPreview() && !m.isEditorFocused(),
 	}
 }
 
@@ -4346,7 +4466,7 @@ func (m *AppModel) tabModifiedSet() map[string]bool {
 // ---------------------------------------------------------------------------
 
 // scrollFPS is the simulation frame rate for the spring.
-// Derived from: tickInterval (16ms) ≈ 60 FPS.
+// Derived from: tickFastInterval (16ms) ≈ 60 FPS.
 const scrollFPS = 60
 
 // scrollFrequency is the spring's angular frequency (rad/s).
@@ -6685,13 +6805,183 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 }
 
 // ---------------------------------------------------------------------------
-// Tick
+// Tick — demand-driven tick chain
 // ---------------------------------------------------------------------------
 
-func (m *AppModel) tickCmd() tea.Cmd {
-	return tea.Tick(tickInterval, func(t time.Time) tea.Msg {
-		return msg.TickMsg{Time: t}
+// needsFastTick reports whether any 60fps animation is active.
+func (m *AppModel) needsFastTick() bool {
+	return !m.scroll.settled() ||
+		!m.bounceSettled() ||
+		m.tabArrowFlashLeft > 0 ||
+		m.tabArrowFlashRight > 0 ||
+		m.chat.HasActiveAnimation() ||
+		m.statusBar.IsAnimating()
+}
+
+// needsSlowTick reports whether any non-blink, non-LSP debounce needs
+// slow-rate ticking. Cursor blink is handled by BlinkMsg; LSP flush by
+// LSPFlushMsg.
+func (m *AppModel) needsSlowTick() bool {
+	return m.swipe.accum != 0 // Swipe decay pending.
+}
+
+// ensureTick starts or upgrades the tick chain. Returns a tea.Cmd only when
+// a new chain must be scheduled; nil if the current chain already covers it.
+func (m *AppModel) ensureTick(fast bool) tea.Cmd {
+	if fast && m.tickRate != tickFast {
+		m.tickGen++
+		m.tickRate = tickFast
+		return m.tickCmdWith(tickFastInterval)
+	}
+	if m.tickRate == tickIdle {
+		m.tickGen++
+		if fast {
+			m.tickRate = tickFast
+			return m.tickCmdWith(tickFastInterval)
+		}
+		m.tickRate = tickSlow
+		return m.tickCmdWith(tickSlowInterval)
+	}
+	return nil
+}
+
+// tickCmdWith schedules a one-shot tick at the given interval, tagged with
+// the current generation to detect stale chains.
+func (m *AppModel) tickCmdWith(d time.Duration) tea.Cmd {
+	gen := m.tickGen
+	return tea.Tick(d, func(t time.Time) tea.Msg {
+		return msg.TickMsg{Time: t, Gen: gen}
 	})
+}
+
+// continueTickChain returns the next tick command at the appropriate
+// interval, or nil to let the chain stop when nothing needs ticking.
+func (m *AppModel) continueTickChain() tea.Cmd {
+	if m.needsFastTick() {
+		m.tickRate = tickFast
+		return m.tickCmdWith(tickFastInterval)
+	}
+	if m.needsSlowTick() {
+		m.tickRate = tickSlow
+		return m.tickCmdWith(tickSlowInterval)
+	}
+	m.tickRate = tickIdle
+	return nil
+}
+
+// ensureTickAfterDispatch starts or upgrades the tick chain if the
+// dispatch changed state that requires ticking.
+func (m *AppModel) ensureTickAfterDispatch() tea.Cmd {
+	if m.needsFastTick() {
+		return m.ensureTick(true)
+	}
+	if m.needsSlowTick() {
+		return m.ensureTick(false)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Blink — one-shot cursor blink timer
+// ---------------------------------------------------------------------------
+
+// needsBlink reports whether any component has a cursor that needs blinking.
+func (m *AppModel) needsBlink() bool {
+	if m.editMode {
+		return true
+	}
+	if m.focus.Current() == component.FocusInput {
+		return true
+	}
+	if m.hasPreview() && m.isPreviewFocused() {
+		return true
+	}
+	return m.fileTree.NeedsBlink()
+}
+
+// blinkCmd schedules a one-shot blink timer at blinkHalfPeriod, tagged with
+// the current generation to detect stale timers.
+func (m *AppModel) blinkCmd() tea.Cmd {
+	gen := m.blinkGen
+	return tea.Tick(blinkHalfPeriod, func(_ time.Time) tea.Msg {
+		return msg.BlinkMsg{Gen: gen}
+	})
+}
+
+// handleBlink toggles cursor blink on all active components and schedules
+// the next blink. Stale blinks (from before a key/focus event) are dropped.
+func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
+	if blink.Gen != m.blinkGen {
+		return nil // Stale blink — state changed since scheduling.
+	}
+
+	toggled := false
+	if m.editMode && m.focusedEditor().Focused() {
+		m.focusedEditor().ToggleBlink()
+		toggled = true
+	}
+	if m.focus.Current() == component.FocusInput {
+		m.input.ToggleBlink()
+		toggled = true
+	}
+	if m.fileTree.NeedsBlink() {
+		m.fileTree.ToggleBlink()
+		toggled = true
+	}
+	if m.hasPreview() && m.isPreviewFocused() {
+		m.previewPanel.ToggleBlink()
+		toggled = true
+	}
+
+	if toggled {
+		m.viewDirty = true
+	}
+	if !m.needsBlink() {
+		return nil
+	}
+	return m.blinkCmd()
+}
+
+// ensureBlinkAfterDispatch starts a blink chain if any component needs
+// cursor blinking. The generation counter ensures at most one chain runs.
+func (m *AppModel) ensureBlinkAfterDispatch() tea.Cmd {
+	if m.needsBlink() {
+		return m.blinkCmd()
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// LSP flush — one-shot debounced didChange
+// ---------------------------------------------------------------------------
+
+// ensureLSPFlush schedules a one-shot LSP flush timer if the editor has
+// pending changes that haven't been scheduled yet (by editGeneration).
+func (m *AppModel) ensureLSPFlush() tea.Cmd {
+	if !m.editMode || !m.focusedEditor().LSPDirty() {
+		return nil
+	}
+	gen := m.focusedEditor().EditGeneration()
+	if gen == m.lspFlushGen {
+		return nil // Already scheduled for this generation.
+	}
+	m.lspFlushGen = gen
+	return tea.Tick(lspDebounceInterval, func(_ time.Time) tea.Msg {
+		return msg.LSPFlushMsg{Gen: gen}
+	})
+}
+
+// handleLSPFlush fires the debounced LSP didChange notification if the
+// editor is still dirty at the same generation as when the timer was scheduled.
+func (m *AppModel) handleLSPFlush(flush msg.LSPFlushMsg) tea.Cmd {
+	if !m.editMode || !m.focusedEditor().LSPDirty() {
+		return nil
+	}
+	if m.focusedEditor().EditGeneration() != flush.Gen {
+		return nil // Stale — more edits happened; a newer flush is pending.
+	}
+	m.focusedEditor().ClearLSPDirty()
+	return m.lspDidChangeCmd(m.focusedEditor().FilePath(), m.focusedEditor().Content())
 }
 
 // ---------------------------------------------------------------------------
