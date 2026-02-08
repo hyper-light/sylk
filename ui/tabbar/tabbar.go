@@ -35,6 +35,11 @@ type Config struct {
 	// HoverClose is the index of the tab whose close icon is being
 	// hovered, or -1 when no close icon is hovered.
 	HoverClose int
+
+	// Focused highlights the divider line in Secondary color to indicate
+	// that this sub-panel has focus (mirrors the sectionHeader pattern
+	// used by the session/agent sub-panels).
+	Focused bool
 }
 
 // Height is the number of lines the tab bar occupies (tabs + divider).
@@ -293,6 +298,16 @@ func truncateName(name string, maxWidth int) string {
 	return b.String()
 }
 
+// dividerLineStyle returns the style for the divider line, using Secondary
+// color when the sub-panel is focused and Border color otherwise.
+func dividerLineStyle(cfg Config) lipgloss.Style {
+	color := cfg.Theme.Palette.Border
+	if cfg.Focused {
+		color = cfg.Theme.Palette.Secondary
+	}
+	return lipgloss.NewStyle().Foreground(color)
+}
+
 // renderDivider renders the bottom border line with a gap under the active tab.
 func renderDivider(cfg Config, widths []int) string {
 	total := sumWidths(widths, len(cfg.Tabs))
@@ -300,7 +315,7 @@ func renderDivider(cfg Config, widths []int) string {
 		return renderOverflowDivider(cfg)
 	}
 
-	lineStyle := lipgloss.NewStyle().Foreground(cfg.Theme.Palette.Border)
+	lineStyle := dividerLineStyle(cfg)
 
 	// Compute the start and end column of the active tab.
 	// The separator " │ " has its flanking spaces visually belonging to the
@@ -340,7 +355,7 @@ func renderDivider(cfg Config, widths []int) string {
 // renderOverflowDivider renders a divider with a gap under the active tab
 // in overflow mode, matching the layout produced by renderOverflow.
 func renderOverflowDivider(cfg Config) string {
-	lineStyle := lipgloss.NewStyle().Foreground(cfg.Theme.Palette.Border)
+	lineStyle := dividerLineStyle(cfg)
 	lo, hi := VisibleRange(cfg)
 
 	// Walk the same layout as renderOverflow to find the active tab bounds.

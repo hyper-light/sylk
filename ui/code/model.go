@@ -78,8 +78,6 @@ type Model struct {
 	bounceOffset     int           // Visual line displacement from overscroll bounce.
 	selection        textSelection // Mouse-driven text selection state.
 	diagnostics      []lsp.Diagnostic // LSP diagnostics for the current file.
-	focusOverride    *component.FocusID // When set, ID() returns this instead of FocusCodeViewer.
-	cursorVisible    bool               // When true, render a block cursor at cursorLine.
 }
 
 // Compile-time interface checks.
@@ -304,11 +302,7 @@ func (m *Model) renderViewLine(b *strings.Builder, lineIdx, gutterWidth, content
 		lb.WriteByte(' ')
 	}
 
-	styledLine := m.styledLine(lineIdx)
-	if m.cursorVisible && m.focused && lineIdx == m.cursorLine {
-		styledLine = m.overlayBlockCursor(styledLine, lineIdx)
-	}
-	lb.WriteString(styledLine)
+	lb.WriteString(m.styledLine(lineIdx))
 
 	line := lb.String()
 	visWidth := lipgloss.Width(line)
@@ -373,51 +367,6 @@ func (m *Model) lineLen(idx int) int {
 	return 0
 }
 
-// overlayBlockCursor renders a block cursor on the first character of the line.
-// The cursor uses reverse video (Primary background, Background foreground) for
-// the first character cell, with the rest of the line rendered normally.
-func (m *Model) overlayBlockCursor(styledLine string, lineIdx int) string {
-	raw := m.lineAt(lineIdx)
-	cursorStyle := lipgloss.NewStyle().
-		Background(m.theme.Palette.Primary).
-		Foreground(m.theme.Palette.Background)
-
-	if len(raw) == 0 {
-		return cursorStyle.Render(" ") + styledLine
-	}
-
-	// Extract the first rune and render it with cursor styling.
-	firstRune, size := utf8.DecodeRuneInString(raw)
-	_ = size
-	cursorChar := cursorStyle.Render(string(firstRune))
-
-	// Rebuild the rest of the line from highlight cache (skip first rune).
-	regions := m.regionsAt(lineIdx)
-	if len(raw) > size {
-		rest := m.highlighter.HighlightLine(raw[size:], lineIdx, shiftRegionsBack(regions, size))
-		return cursorChar + rest
-	}
-	return cursorChar
-}
-
-// shiftRegionsBack returns regions adjusted by subtracting offset from their byte positions.
-// Regions that end before offset are excluded; regions that start before offset are clamped.
-func shiftRegionsBack(regions []HighlightRegion, offset int) []HighlightRegion {
-	shifted := make([]HighlightRegion, 0, len(regions))
-	for _, r := range regions {
-		if r.EndCol <= offset {
-			continue
-		}
-		sr := HighlightRegion{
-			StartCol: max(r.StartCol-offset, 0),
-			EndCol:   r.EndCol - offset,
-			Category: r.Category,
-		}
-		shifted = append(shifted, sr)
-	}
-	return shifted
-}
-
 // ---------------------------------------------------------------------------
 // Diagnostic rendering
 // ---------------------------------------------------------------------------
@@ -479,25 +428,7 @@ func truncateVisible(s string, maxWidth int) string {
 
 // ID returns the focus identifier for this code viewer instance.
 // Returns the focusOverride if set, otherwise FocusCodeViewer.
-func (m *Model) ID() component.FocusID {
-	if m.focusOverride != nil {
-		return *m.focusOverride
-	}
-	return component.FocusCodeViewer
-}
-
-// SetFocusID overrides the FocusID returned by ID(). Used for the preview
-// panel, which is a code.Model instance that reports FocusPreview.
-func (m *Model) SetFocusID(id component.FocusID) {
-	m.focusOverride = &id
-}
-
-// SetCursorVisible enables or disables the visible block cursor. When enabled,
-// a cursor is rendered at cursorLine for visual continuity in preview mode.
-func (m *Model) SetCursorVisible(v bool) {
-	m.cursorVisible = v
-}
-
+func (m *Model) ID() component.FocusID { return component.FocusCodeViewer }
 
 // Focused returns whether the code viewer has focus.
 func (m *Model) Focused() bool { return m.focused }

@@ -35,12 +35,12 @@ func (fm *FocusManager) IsFocused(id component.FocusID) bool {
 	return fm.current == id
 }
 
-// SetFocus moves focus directly to the specified ID, provided it
-// exists in the tab order.
+// SetFocus moves focus directly to the specified ID. The target does
+// not need to be in the tab order — this allows spatial navigation
+// and programmatic focus changes to reach panels (like preview)
+// that are excluded from the Tab/Shift+Tab cycle.
 func (fm *FocusManager) SetFocus(id component.FocusID) {
-	if fm.indexOf(id) >= 0 {
-		fm.current = id
-	}
+	fm.current = id
 }
 
 // Next advances focus to the next panel in the tab order, wrapping

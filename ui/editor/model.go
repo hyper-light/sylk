@@ -223,6 +223,13 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 
 // View renders the editor viewport and status line.
 func (m *Model) View() string {
+	return m.ViewContent() + "\n" + m.StatusLineView(m.width)
+}
+
+// ViewContent renders the editor viewport (find/replace bar + code lines)
+// without the status line. Used by the split preview layout so the status
+// line can be rendered at full width below the split.
+func (m *Model) ViewContent() string {
 	if m.filePath == "" {
 		return m.renderPlaceholder()
 	}
@@ -244,9 +251,9 @@ func (m *Model) View() string {
 
 	if viewHeight <= 0 {
 		if barStr != "" {
-			return barStr + "\n" + m.statusLine.View(m.width)
+			return barStr
 		}
-		return m.statusLine.View(m.width)
+		return ""
 	}
 	m.adjustScroll(viewHeight)
 	m.adjustScrollX()
@@ -266,9 +273,14 @@ func (m *Model) View() string {
 
 	body := strings.Join(lines, "\n")
 	if barStr != "" {
-		return barStr + "\n" + body + "\n" + m.statusLine.View(m.width)
+		return barStr + "\n" + body
 	}
-	return body + "\n" + m.statusLine.View(m.width)
+	return body
+}
+
+// StatusLineView renders the status line at the given width.
+func (m *Model) StatusLineView(width int) string {
+	return m.statusLine.View(width)
 }
 
 // renderPlaceholder renders a vertically and horizontally centered placeholder
@@ -281,8 +293,9 @@ func (m *Model) renderPlaceholder() string {
 	padLeft := max((m.width-textWidth)/2, 0)
 	centeredLine := strings.Repeat(" ", padLeft) + style.Render(placeholder)
 
-	lines := make([]string, m.height)
-	midRow := m.height / 2
+	vh := m.viewportHeight()
+	lines := make([]string, vh)
+	midRow := vh / 2
 	for i := range lines {
 		if i == midRow {
 			lines[i] = centeredLine
