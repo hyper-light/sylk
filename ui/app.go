@@ -2408,11 +2408,11 @@ func (m *AppModel) enterEditMode() tea.Cmd {
 		m.inlineEditor.ClearFile()
 	}
 
-	// Size the editor to match the code panel slot.
-	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
-	m.inlineEditor.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize-m.tabBarHeight(), 1))
-
 	m.editMode = true
+
+	// Size the editor to match the code panel slot. resizeInlineEditor
+	// handles all states (split preview, full preview, editor-only).
+	m.resizeInlineEditor()
 	m.fileTree.SetEditMode(true)
 	m.statusBar.SetMode("EDIT")
 	m.input.SetPlaceholder(":")
