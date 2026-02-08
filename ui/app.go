@@ -2456,7 +2456,6 @@ func (m *AppModel) exitEditMode() {
 
 	m.editMode = false
 	m.fileTree.SetEditMode(false)
-	m.dismissPreview()
 	m.editCmdInput = false
 	m.chord = chordNone
 	m.chordBlocked = false

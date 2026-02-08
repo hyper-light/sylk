@@ -19,6 +19,10 @@ const (
 	FocusFileTree
 	FocusFieldManual
 	FocusPreview
+
+	// FocusPaneBase is the starting FocusID for dynamically allocated
+	// editor panes. Each pane gets FocusPaneBase + FocusID(paneID).
+	FocusPaneBase FocusID = 1000
 )
 
 // Component defines the contract for all TUI sub-models.
