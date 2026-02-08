@@ -42,6 +42,7 @@ import (
 	"github.com/adalundhe/sylk/ui/layout"
 	"github.com/adalundhe/sylk/ui/modal"
 	"github.com/adalundhe/sylk/ui/msg"
+	"github.com/adalundhe/sylk/ui/pane"
 	"github.com/adalundhe/sylk/ui/search"
 	sessionpkg "github.com/adalundhe/sylk/ui/session"
 	"github.com/adalundhe/sylk/ui/status"
@@ -321,9 +322,13 @@ type AppModel struct {
 	savedActiveTab string // Path of the active tab saved on exitEditMode for restore.
 
 	// Preview panel (read-only file preview, rendered in code panel slot).
-	previewPanel  *preview.Panel // Independent read-only preview sub-panel.
-	previewActive bool           // Whether a preview is currently displayed.
-	previewPath   string         // File path currently being previewed.
+	previewPanel *preview.Panel // Independent read-only preview sub-panel.
+
+	// Pane tree: binary split tree tracking editor + preview layout.
+	paneTree    *pane.Node // Split tree root (always non-nil in edit mode).
+	editorPane  pane.PaneID // PaneID of the main editor leaf.
+	previewPane pane.PaneID // PaneID of the preview leaf (0 = no preview).
+	paneCounter pane.PaneID // Monotonic ID allocator for new panes.
 
 	// Warp points: numbered teleport bookmarks (nil = empty slot).
 	warpPoints [warpSlotCount]*WarpPoint
@@ -474,6 +479,9 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	}
 
 	app.previewPanel = preview.New(th)
+	app.paneCounter = 1
+	app.editorPane = 1
+	app.paneTree = pane.NewLeaf(1)
 
 	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
 	app.input = inputpkg.New(th, cfg.InputHistoryCapacity, &tabCompleter{tabOrder: &app.tabOrder})
@@ -595,7 +603,7 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.FileOpenMsg:
 		// Dismiss preview only when opening a NEW file (not already a tab).
 		// Tab switches (shift+tab) should keep the preview visible.
-		if m.previewActive && !m.isExistingTab(typed.Path) {
+		if m.hasPreview() && !m.isExistingTab(typed.Path) {
 			m.dismissPreview()
 		}
 		return m, m.handleFileOpen(typed)
@@ -1229,7 +1237,7 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 	if m.editMode {
 		m.inlineEditor.Update(tick)
 	}
-	if m.previewActive {
+	if m.hasPreview() {
 		m.previewPanel.HandleTick(tick.Time)
 	}
 	m.fileTree.Update(tick)
@@ -2766,10 +2774,10 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 // switching between the inline editor, the read-only viewer, and the
 // preview panel (full or split).
 func (m *AppModel) codePanelView() string {
-	if m.previewActive && m.editMode && len(m.tabOrder) > 0 {
+	if m.hasPreview() && m.editMode && len(m.tabOrder) > 0 {
 		return m.splitCodePanelView()
 	}
-	if m.previewActive && m.editMode {
+	if m.hasPreview() && m.editMode {
 		return m.fullPreviewPanelView()
 	}
 	if m.editMode {
@@ -2854,7 +2862,7 @@ func (m *AppModel) previewTabBarConfig() tabbar.Config {
 
 	return tabbar.Config{
 		Tabs: []tabbar.Tab{{
-			Path:        m.previewPath,
+			Path:        m.previewPanel.FilePath(),
 			Modified:    false,
 			LabelPrefix: "Preview: ",
 		}},
@@ -2870,7 +2878,7 @@ func (m *AppModel) previewTabBarConfig() tabbar.Config {
 // previewTabBarView renders the tab bar for the preview panel with a single
 // "Preview: filename" tab.
 func (m *AppModel) previewTabBarView() string {
-	if m.previewPath == "" {
+	if m.previewPanel.FilePath() == "" {
 		return ""
 	}
 	return tabbar.View(m.previewTabBarConfig())
@@ -2882,7 +2890,7 @@ func (m *AppModel) previewTabBarView() string {
 
 // handleFilePreview loads a file into the preview panel (read-only).
 func (m *AppModel) handleFilePreview(o msg.FilePreviewMsg) tea.Cmd {
-	if o.Path == m.previewPath && m.previewActive {
+	if o.Path == m.previewPanel.FilePath() && m.hasPreview() {
 		return nil // Already showing this file.
 	}
 
@@ -2893,18 +2901,25 @@ func (m *AppModel) handleFilePreview(o msg.FilePreviewMsg) tea.Cmd {
 	}
 	content := string(data)
 	m.previewPanel.SetContent(content, o.Path, o.Language)
-	m.previewPath = o.Path
 
-	wasActive := m.previewActive
-	m.previewActive = true
+	wasActive := m.hasPreview()
+	if !wasActive {
+		// Add preview leaf to the pane tree (left side of vertical split).
+		m.paneCounter++
+		m.previewPane = m.paneCounter
+		m.paneTree.Split(m.editorPane, m.previewPane, pane.SplitVertical, pane.Rect{})
+		// Swap children so preview is on the left.
+		if !m.paneTree.IsLeaf() {
+			m.paneTree.Left, m.paneTree.Right = m.paneTree.Right, m.paneTree.Left
+		}
+	}
 
 	if o.Line > 0 {
 		m.previewPanel.ScrollToLine(o.Line - 1)
 	}
 
-	// Recompute layout only when transitioning into preview or changing
-	// between full/split states.
-	if !wasActive || (len(m.tabOrder) > 0) != (len(m.tabOrder) > 0) {
+	// Recompute layout when transitioning into preview.
+	if !wasActive {
 		m.recalcLayout()
 	}
 	return nil
@@ -2912,11 +2927,12 @@ func (m *AppModel) handleFilePreview(o msg.FilePreviewMsg) tea.Cmd {
 
 // dismissPreview closes the preview panel and restores the full code panel.
 func (m *AppModel) dismissPreview() {
-	if !m.previewActive {
+	if !m.hasPreview() {
 		return
 	}
-	m.previewActive = false
-	m.previewPath = ""
+	// Remove preview leaf from the pane tree.
+	m.paneTree.Close(m.previewPane)
+	m.previewPane = 0
 	m.previewPanel.ClearFile()
 
 	if m.focus.IsFocused(component.FocusPreview) {
@@ -2933,7 +2949,7 @@ func (m *AppModel) dismissPreview() {
 // openFromPreview promotes the previewed file to an editor tab.
 // Closes the preview and opens the file via the standard FileOpenMsg pipeline.
 func (m *AppModel) openFromPreview() tea.Cmd {
-	path := m.previewPath
+	path := m.previewPanel.FilePath()
 	lang := m.previewPanel.Language()
 	m.dismissPreview()
 
@@ -3064,7 +3080,7 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 	}
 
 	// Full preview mode: entire code panel is preview.
-	if m.previewActive && m.editMode && len(m.tabOrder) == 0 {
+	if m.hasPreview() && m.editMode && len(m.tabOrder) == 0 {
 		hit := tabbar.HitTest(m.previewTabBarConfig(), viewX)
 		if hit.IsClose {
 			m.previewTabHoverClose = hit.TabIndex
@@ -3073,7 +3089,7 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 	}
 
 	// Split mode: preview on left half.
-	if m.previewActive && m.isInsidePreviewHalf(mouse.X) {
+	if m.hasPreview() && m.isInsidePreviewHalf(mouse.X) {
 		hit := tabbar.HitTest(m.previewTabBarConfig(), viewX)
 		if hit.IsClose {
 			m.previewTabHoverClose = hit.TabIndex
@@ -3131,7 +3147,7 @@ func (m *AppModel) tabBarConfig() tabbar.Config {
 
 	// In split mode the editor tab bar occupies only the right half.
 	barWidth := innerW
-	if m.previewActive && m.editMode && len(m.tabOrder) > 0 {
+	if m.hasPreview() && m.editMode && len(m.tabOrder) > 0 {
 		dividerWidth := 1
 		previewW := (innerW - dividerWidth) / 2
 		barWidth = innerW - dividerWidth - previewW
@@ -3160,7 +3176,7 @@ func (m *AppModel) tabBarConfig() tabbar.Config {
 		FlashLeft:  m.tabArrowFlashLeft > 0,
 		FlashRight: m.tabArrowFlashRight > 0,
 		HoverClose: m.tabHoverClose,
-		Focused:    m.previewActive && m.focus.IsFocused(component.FocusCodeViewer),
+		Focused:    m.hasPreview() && m.focus.IsFocused(component.FocusCodeViewer),
 	}
 }
 
@@ -3416,7 +3432,7 @@ func (m *AppModel) closeCurrentTab(discard bool) tea.Cmd {
 		m.refreshTabsPanel()
 		// In split mode, transition focus to the preview sub-panel
 		// since the editor sub-panel no longer has content.
-		if m.previewActive {
+		if m.hasPreview() {
 			m.focus.SetFocus(component.FocusPreview)
 			m.syncFocusState()
 		}
@@ -3663,7 +3679,7 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		m.updateTabHoverClose(mouse)
 		m.updateFileTreeTabHover(mouse)
 		// Skip LSP editor hover in full-preview mode (no editor tabs).
-		if !(m.previewActive && len(m.tabOrder) == 0) {
+		if !(m.hasPreview() && len(m.tabOrder) == 0) {
 			return m.handleEditorMouseHover(mouse)
 		}
 		return nil
@@ -4122,10 +4138,15 @@ func (m *AppModel) codePanelX() int {
 	}
 }
 
+// hasPreview reports whether a preview pane is currently active.
+func (m *AppModel) hasPreview() bool {
+	return m.previewPane != 0
+}
+
 // previewSplitWidth returns the preview half width in split mode.
 // Returns 0 when not in split mode or preview is inactive.
 func (m *AppModel) previewSplitWidth() int {
-	if !m.previewActive || !m.editMode || len(m.tabOrder) == 0 {
+	if !m.hasPreview() || !m.editMode || len(m.tabOrder) == 0 {
 		return 0
 	}
 	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
@@ -4160,14 +4181,14 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 
 	// Full-preview mode: all code panel clicks route to the preview.
 	// Only split mode needs the per-half routing below.
-	if m.previewActive && len(m.tabOrder) == 0 {
+	if m.hasPreview() && len(m.tabOrder) == 0 {
 		if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
 			viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
 			if viewY < tabbar.Height {
 				codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
 				cfg := tabbar.Config{
 					Tabs: []tabbar.Tab{{
-						Path:        m.previewPath,
+						Path:        m.previewPanel.FilePath(),
 						Modified:    false,
 						LabelPrefix: "Preview: ",
 					}},
@@ -4236,7 +4257,7 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		if viewY < tabbar.Height {
 			cfg := tabbar.Config{
 				Tabs: []tabbar.Tab{{
-					Path:        m.previewPath,
+					Path:        m.previewPanel.FilePath(),
 					Modified:    false,
 					LabelPrefix: "Preview: ",
 				}},
@@ -4717,7 +4738,7 @@ func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
 	innerW := max(rightW-panelBorderSize, 1)
 	innerH := max(rightH-panelBorderSize, 1)
 
-	if m.previewActive && m.editMode && len(m.tabOrder) > 0 {
+	if m.hasPreview() && m.editMode && len(m.tabOrder) > 0 {
 		// Split mode: preview left, editor right, status line below.
 		dividerWidth := 1
 		previewW := (innerW - dividerWidth) / 2
@@ -4730,7 +4751,7 @@ func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
 		m.inlineEditor.SetSize(editorW, contentH+1)
 		return
 	}
-	if m.previewActive && m.editMode {
+	if m.hasPreview() && m.editMode {
 		// Full preview mode: preview fills the entire code panel.
 		m.previewPanel.SetSize(innerW, max(innerH-tabbar.Height, 1))
 		return
@@ -4865,7 +4886,7 @@ func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.F
 		}
 	}
 	// In full-preview mode (no editor tabs), nothing to tab to in code column.
-	if m.previewActive && m.editMode && len(m.tabOrder) == 0 {
+	if m.hasPreview() && m.editMode && len(m.tabOrder) == 0 {
 		return order
 	}
 	return append(order, component.FocusCodeViewer)
@@ -5148,7 +5169,7 @@ func (m *AppModel) syncFocusState() {
 	m.input.SetFocused(current == component.FocusInput)
 	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
-	m.codePanel.SetFocused(current == component.FocusCodeViewer && !m.editMode && !m.previewActive)
+	m.codePanel.SetFocused(current == component.FocusCodeViewer && !m.editMode && !m.hasPreview())
 	m.inlineEditor.SetFocused(current == component.FocusCodeViewer && m.editMode)
 	m.previewPanel.SetFocused(current == component.FocusPreview)
 	m.fileTree.SetFocused(current == component.FocusFileTree)
@@ -5266,11 +5287,11 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 // matching what codePanelView() actually renders.
 func (m *AppModel) codePanelGroup() layout.PanelGroup {
 	switch {
-	case m.previewActive && m.editMode && len(m.tabOrder) > 0:
+	case m.hasPreview() && m.editMode && len(m.tabOrder) > 0:
 		return layout.PanelGroup{SubPanels: [][]component.FocusID{
 			{component.FocusPreview, component.FocusCodeViewer},
 		}}
-	case m.previewActive && m.editMode:
+	case m.hasPreview() && m.editMode:
 		return layout.PanelGroup{SubPanels: [][]component.FocusID{
 			{component.FocusPreview},
 		}}
