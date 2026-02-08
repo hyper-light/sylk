@@ -92,10 +92,9 @@ func (p *Panel) Init() tea.Cmd { return nil }
 // driven by the app's centralized BlinkMsg timer.
 func (p *Panel) HandleTick(_ time.Time) {}
 
-// ToggleBlink flips the cursor visibility. Called by the app's centralized
-// blink timer.
-func (p *Panel) ToggleBlink() {
-	p.cursorBlink = !p.cursorBlink
+// SetBlinkPhase sets the cursor blink phase.
+func (p *Panel) SetBlinkPhase(visible bool) {
+	p.cursorBlink = visible
 }
 
 func (p *Panel) Update(msg tea.Msg) (component.Component, tea.Cmd) {

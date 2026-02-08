@@ -333,7 +333,8 @@ type AppModel struct {
 	decorOn  bool     // Whether decor tick chain is active.
 
 	// Centralized cursor blink timer (one-shot at blinkHalfPeriod).
-	blinkGen uint64 // Generation counter; bumped on interactive events to reset blink.
+	blinkGen   uint64    // Generation counter; bumped on interactive events to reset blink.
+	blinkEpoch time.Time // Wall-clock reference: cursor visible at epoch, phase derived from elapsed time.
 
 	// One-shot LSP flush timer (fires lspDebounceInterval after last edit).
 	lspFlushGen int // editGeneration at last scheduled flush; prevents duplicates.
@@ -572,6 +573,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 // Init starts all event bridges, the tick/blink timers, and background LSP provisioning.
 func (m *AppModel) Init() tea.Cmd {
 	m.viewDirty = true
+	m.blinkEpoch = time.Now()
 	cmds := []tea.Cmd{
 		m.startBridges(),
 		m.ensureTick(false),
@@ -650,6 +652,7 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		// Interactive events reset blink phase.
 		m.viewDirty = true
 		m.blinkGen++
+		m.blinkEpoch = time.Now()
 		return m, m.postDispatchCmds(cmd, true)
 	default:
 		// Background messages (git, LSP, streaming, etc.) may change visual
@@ -7144,45 +7147,67 @@ func (m *AppModel) needsBlink() bool {
 	return m.fileTree.NeedsBlink()
 }
 
-// blinkCmd schedules a one-shot blink timer at blinkHalfPeriod, tagged with
-// the current generation to detect stale timers.
-func (m *AppModel) blinkCmd() tea.Cmd {
-	gen := m.blinkGen
-	return tea.Tick(blinkHalfPeriod, func(_ time.Time) tea.Msg {
-		return msg.BlinkMsg{Gen: gen}
-	})
+// blinkPhase computes whether the cursor should be visible based on
+// the wall clock. Phase 0 (visible) starts at blinkEpoch; each
+// blinkHalfPeriod the phase alternates. Using the clock instead of
+// toggle state prevents phase inversion from delayed messages.
+func (m *AppModel) blinkPhase() bool {
+	elapsed := time.Since(m.blinkEpoch)
+	phase := int(elapsed/blinkHalfPeriod) % 2
+	return phase == 0 // 0 = visible, 1 = invisible
 }
 
-// handleBlink toggles cursor blink on all active components and schedules
+// nextBlinkDeadline returns the absolute time of the next phase boundary.
+func (m *AppModel) nextBlinkDeadline() time.Time {
+	elapsed := time.Since(m.blinkEpoch)
+	periods := elapsed/blinkHalfPeriod + 1
+	return m.blinkEpoch.Add(periods * blinkHalfPeriod)
+}
+
+// blinkCmd schedules a timer targeting the next phase boundary.
+// The goroutine sleeps until the absolute deadline, compensating for
+// View() latency and message queue delay.
+func (m *AppModel) blinkCmd() tea.Cmd {
+	gen := m.blinkGen
+	deadline := m.nextBlinkDeadline()
+	return func() tea.Msg {
+		if d := time.Until(deadline); d > 0 {
+			time.Sleep(d)
+		}
+		return msg.BlinkMsg{Gen: gen, Deadline: deadline}
+	}
+}
+
+// handleBlink sets cursor blink phase from the wall clock and schedules
 // the next blink. Stale blinks (from before a key/focus event) are dropped.
 func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
 	if blink.Gen != m.blinkGen {
 		return nil
 	}
 
-	toggled := false
+	visible := m.blinkPhase()
+	changed := false
 	if m.editMode && m.focusedEditor().Focused() {
-		m.focusedEditor().ToggleBlink()
-		toggled = true
+		m.focusedEditor().SetBlinkPhase(visible)
+		changed = true
 	}
 	if m.focus.Current() == component.FocusInput {
-		m.input.ToggleBlink()
-		toggled = true
+		m.input.SetBlinkPhase(visible)
+		changed = true
 	}
 	if m.fileTree.NeedsBlink() {
-		m.fileTree.ToggleBlink()
-		toggled = true
+		m.fileTree.SetBlinkPhase(visible)
+		changed = true
 	}
 	if m.hasPreview() && m.isPreviewFocused() {
-		m.previewPanel.ToggleBlink()
-		toggled = true
+		m.previewPanel.SetBlinkPhase(visible)
+		changed = true
 	}
-	// Toggle find/replace bars in edit mode when active.
 	if m.editMode {
-		m.focusedEditor().ToggleBarBlink()
+		m.focusedEditor().SetBarBlinkPhase(visible)
 	}
 
-	if toggled {
+	if changed {
 		m.viewDirty = true
 	}
 	if !m.needsBlink() {

@@ -743,10 +743,12 @@ func (m *Model) SetFocused(focused bool) {
 	m.viewDirty = true
 }
 
-// ToggleBlink flips the cursor visibility. Called by the app's centralized
-// blink timer.
-func (m *Model) ToggleBlink() {
-	m.cursorBlink = !m.cursorBlink
+// SetBlinkPhase sets the cursor blink phase. Only marks dirty on change.
+func (m *Model) SetBlinkPhase(visible bool) {
+	if m.cursorBlink == visible {
+		return
+	}
+	m.cursorBlink = visible
 	m.viewDirty = true
 }
 

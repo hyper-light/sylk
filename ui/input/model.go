@@ -239,10 +239,12 @@ func (m *Model) advanceBlink(now time.Time) {
 	_ = now
 }
 
-// ToggleBlink flips the cursor visibility. Called by the app's centralized
-// blink timer.
-func (m *Model) ToggleBlink() {
-	m.cursorVisible = !m.cursorVisible
+// SetBlinkPhase sets the cursor blink phase. Only marks dirty on change.
+func (m *Model) SetBlinkPhase(visible bool) {
+	if m.cursorVisible == visible {
+		return
+	}
+	m.cursorVisible = visible
 	m.viewDirty = true
 }
 

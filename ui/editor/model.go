@@ -2571,18 +2571,23 @@ func handleTickMsg(m *Model, _ tea.Msg) (component.Component, tea.Cmd) {
 // ViewDirty reports whether View() would produce new output.
 func (m *Model) ViewDirty() bool { return !m.vc.valid || !m.vc.cursorOK }
 
-// ToggleBlink flips the cursor blink phase and marks the cursor line
-// for re-rendering. Called by the app's centralized blink timer.
-func (m *Model) ToggleBlink() {
-	m.cursorBlink = !m.cursorBlink
+// SetBlinkPhase sets the cursor blink phase to the given value and marks the
+// cursor line for re-rendering if the phase changed. Called by the app's
+// wall-clock blink system, which computes the correct phase from elapsed time
+// to prevent phase inversion from delayed messages.
+func (m *Model) SetBlinkPhase(visible bool) {
+	if m.cursorBlink == visible {
+		return
+	}
+	m.cursorBlink = visible
 	m.vc.cursorOK = false
 }
 
-// ToggleBarBlink flips the blink phase for the find/replace bars without
-// touching the main cursor blink. Safe to call even when bars are inactive.
-func (m *Model) ToggleBarBlink() {
+// SetBarBlinkPhase sets the blink phase for the find/replace bars.
+// Safe to call even when bars are inactive.
+func (m *Model) SetBarBlinkPhase(visible bool) {
 	if m.findActive || m.replaceActive {
-		m.barBlink = !m.barBlink
+		m.barBlink = visible
 	}
 }
 

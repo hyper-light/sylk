@@ -121,10 +121,12 @@ type DecorTickMsg struct {
 	Gen  uint64 // Tick chain generation; stale ticks are dropped.
 }
 
-// BlinkMsg fires on a one-shot 530ms timer for cursor blink toggling.
-// Replaces polling-based blink (200ms tick that checks elapsed time).
+// BlinkMsg fires on a one-shot timer at the next phase boundary.
+// The handler computes the correct blink phase from the wall clock,
+// so delayed messages cannot cause phase inversion.
 type BlinkMsg struct {
-	Gen uint64 // Generation counter; stale blinks are dropped.
+	Gen      uint64    // Generation counter; stale blinks are dropped.
+	Deadline time.Time // Absolute time this blink was targeted at.
 }
 
 // LSPFlushMsg fires on a one-shot 300ms timer to flush debounced LSP
