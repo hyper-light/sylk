@@ -292,7 +292,9 @@ type AppModel struct {
 	editorDragging  bool // Actual drag motion detected after press.
 
 	// Tab bar drag-and-drop reordering.
-	tabDragIdx int // Tab index being dragged (-1 = none).
+	tabDragIdx        int         // Tab index being dragged (-1 = none).
+	tabDragSourcePane pane.PaneID // Pane the drag originated from (0 = none).
+	tabDropTarget     pane.PaneID // Pane highlighted as drop target (0 = none).
 
 	// Tab bar close-icon hover highlight.
 	tabHoverClose        int       // Tab index whose close icon is hovered (-1 = none).
@@ -2963,6 +2965,14 @@ func (m *AppModel) composePanes(area pane.Rect) string {
 
 	th := m.config.Theme()
 	divStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+	dropDivStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary)
+
+	// Determine drop-target rect for divider highlighting.
+	var dropRect pane.Rect
+	hasDropTarget := m.tabDropTarget != 0
+	if hasDropTarget {
+		dropRect = rects[m.tabDropTarget]
+	}
 
 	// Render each leaf pane into a block of lines.
 	leafLines := make(map[pane.PaneID][]string, len(leaves))
@@ -2995,13 +3005,17 @@ func (m *AppModel) composePanes(area pane.Rect) string {
 			segs = append(segs, seg{r.X, line})
 		}
 
-		// Divider segments.
+		// Divider segments (highlight dividers adjacent to the drop target).
 		for _, d := range dividers {
+			style := divStyle
+			if hasDropTarget && isDividerAdjacentToRect(d, dropRect) {
+				style = dropDivStyle
+			}
 			switch {
 			case d.Dir == pane.SplitVertical && y >= d.Y && y < d.Y+d.Len:
-				segs = append(segs, seg{d.X, divStyle.Render("│")})
+				segs = append(segs, seg{d.X, style.Render("│")})
 			case d.Dir == pane.SplitHorizontal && y == d.Y:
-				segs = append(segs, seg{d.X, divStyle.Render(strings.Repeat("─", d.Len))})
+				segs = append(segs, seg{d.X, style.Render(strings.Repeat("─", d.Len))})
 			}
 		}
 
@@ -3017,12 +3031,28 @@ func (m *AppModel) composePanes(area pane.Rect) string {
 	return strings.Join(rows, "\n")
 }
 
+// isDividerAdjacentToRect reports whether a divider segment borders the given rect.
+func isDividerAdjacentToRect(d pane.Divider, r pane.Rect) bool {
+	if d.Dir == pane.SplitVertical {
+		adjacent := d.X == r.X-1 || d.X == r.X+r.W
+		overlaps := d.Y < r.Y+r.H && d.Y+d.Len > r.Y
+		return adjacent && overlaps
+	}
+	adjacent := d.Y == r.Y-1 || d.Y == r.Y+r.H
+	overlaps := d.X < r.X+r.W && d.X+d.Len > r.X
+	return adjacent && overlaps
+}
+
 // renderLeafPane renders a single pane (editor or preview) as a sized block.
 // The returned string has exactly r.H lines, each r.W visual columns wide.
 func (m *AppModel) renderLeafPane(id pane.PaneID, r pane.Rect) string {
 	sizer := lipgloss.NewStyle().
 		Width(r.W).MaxWidth(r.W).
 		Height(r.H).MaxHeight(r.H)
+
+	if id == m.tabDropTarget {
+		return m.renderDropTargetPane(id, r, sizer)
+	}
 
 	if id == m.previewPane {
 		bar := m.previewTabBarViewSized(r.W)
@@ -3037,6 +3067,198 @@ func (m *AppModel) renderLeafPane(id pane.PaneID, r pane.Rect) string {
 		content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
 	}
 	return sizer.Render(content)
+}
+
+// dropOverlayAlpha is the blend factor for the drop-target background tint.
+// Derived from: 15% matches VS Code's drag-and-drop overlay opacity.
+const dropOverlayAlpha = 0.15
+
+// renderDropTargetPane renders an editor pane as a drop target: the tab bar
+// stays normal, content backgrounds are tinted with a blended overlay color,
+// and a centered "Drop tab here" label is composited on top.
+func (m *AppModel) renderDropTargetPane(id pane.PaneID, r pane.Rect, sizer lipgloss.Style) string {
+	ps := m.paneEditors[id]
+	if ps == nil {
+		return sizer.Render("")
+	}
+	bar := m.paneTabBarView(id, r.W)
+	content := ps.editor.ViewContent()
+	if bar != "" {
+		content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
+	}
+	sized := sizer.Render(content)
+	lines := strings.Split(sized, "\n")
+
+	// Compute overlay background by blending base bg with Primary.
+	th := m.config.Theme()
+	tr, tg, tb := blendColors(th.Palette.Background, th.Palette.Primary, dropOverlayAlpha)
+	bgCode := fmt.Sprintf("\x1b[48;2;%d;%d;%dm", tr, tg, tb)
+
+	// Tint content lines below the tab bar.
+	barH := tabbar.Height
+	if bar == "" {
+		barH = 0
+	}
+	for i := barH; i < len(lines); i++ {
+		lines[i] = tintLineBg(lines[i], bgCode)
+	}
+
+	// Overlay centered "Drop tab here" indicator.
+	label := lipgloss.NewStyle().
+		Foreground(th.Palette.Background).
+		Background(th.Palette.Primary).
+		Bold(true).
+		Padding(0, 1).
+		Render("Drop tab here")
+
+	centerY := barH + (r.H-barH)/2
+	labelW := lipgloss.Width(label)
+	centerX := max((r.W-labelW)/2, 0)
+
+	if centerY >= 0 && centerY < len(lines) {
+		orig := lines[centerY]
+		left := truncateStyledN(orig, centerX)
+		right := skipStyledN(orig, centerX+labelW)
+		// Re-insert tint background after the reset so the overlay
+		// continues past the label to the end of the line.
+		const resetSeq = "\x1b[0m"
+		if strings.HasPrefix(right, resetSeq) {
+			right = resetSeq + bgCode + right[len(resetSeq):]
+		}
+		lines[centerY] = left + label + right
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// tintLineBg replaces all ANSI background colors in a line with bgCode,
+// producing a semi-transparent overlay effect where foreground content
+// remains visible but backgrounds are uniformly tinted.
+func tintLineBg(s string, bgCode string) string {
+	var out strings.Builder
+	out.Grow(len(s) + len(s)/4)
+	out.WriteString(bgCode)
+
+	i := 0
+	for i < len(s) {
+		if s[i] != '\x1b' || i+1 >= len(s) || s[i+1] != '[' {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+		// Find end of CSI sequence.
+		j := i + 2
+		for j < len(s) && !isCSITerminator(s[j]) {
+			j++
+		}
+		if j >= len(s) {
+			out.WriteString(s[i:])
+			break
+		}
+		j++ // include terminator
+		out.WriteString(s[i:j])
+		// After any SGR sequence (m-terminated), re-insert our bg override.
+		if s[j-1] == 'm' {
+			out.WriteString(bgCode)
+		}
+		i = j
+	}
+	out.WriteString("\x1b[0m")
+	return out.String()
+}
+
+// blendColors blends two hex colors at the given alpha (0.0–1.0).
+func blendColors(base, overlay lipgloss.Color, alpha float64) (uint8, uint8, uint8) {
+	br, bg, bb := parseHexColor(string(base))
+	or, og, ob := parseHexColor(string(overlay))
+	r := uint8(float64(br) + alpha*float64(int(or)-int(br)))
+	g := uint8(float64(bg) + alpha*float64(int(og)-int(bg)))
+	b := uint8(float64(bb) + alpha*float64(int(ob)-int(bb)))
+	return r, g, b
+}
+
+// parseHexColor parses a "#RRGGBB" string into RGB components.
+func parseHexColor(hex string) (uint8, uint8, uint8) {
+	hex = strings.TrimPrefix(hex, "#")
+	if len(hex) != 6 {
+		return 0, 0, 0
+	}
+	r, _ := strconv.ParseUint(hex[0:2], 16, 8)
+	g, _ := strconv.ParseUint(hex[2:4], 16, 8)
+	b, _ := strconv.ParseUint(hex[4:6], 16, 8)
+	return uint8(r), uint8(g), uint8(b)
+}
+
+// truncateStyledN truncates a potentially ANSI-styled string to maxW visible
+// columns, preserving escape sequences and appending a reset.
+func truncateStyledN(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	var b strings.Builder
+	col := 0
+	inEsc := false
+	for _, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			b.WriteRune(r)
+			continue
+		}
+		if inEsc {
+			b.WriteRune(r)
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		if col >= maxW {
+			break
+		}
+		b.WriteRune(r)
+		col++
+	}
+	b.WriteString("\x1b[0m")
+	return b.String()
+}
+
+// skipStyledN drops the first skip visible columns from a styled string
+// and returns the remainder with a reset prefix.
+func skipStyledN(s string, skip int) string {
+	if skip <= 0 {
+		return s
+	}
+	vis := 0
+	i := 0
+	for i < len(s) && vis < skip {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSITerminator(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			i = j
+			continue
+		}
+		i++
+		vis++
+	}
+	if i >= len(s) {
+		return ""
+	}
+	return "\x1b[0m" + s[i:]
+}
+
+// isCSITerminator reports whether b is the final byte of a CSI sequence.
+func isCSITerminator(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
 // paneTabBarConfig builds the tabbar.Config for a specific editor pane.
@@ -3424,6 +3646,129 @@ func (m *AppModel) removeTab(path string) {
 	}
 }
 
+// appendTabToPane adds path to the given pane's tab order if not already present.
+func (m *AppModel) appendTabToPane(pid pane.PaneID, path string) {
+	ps := m.paneEditors[pid]
+	if ps == nil || slices.Contains(ps.tabOrder, path) {
+		return
+	}
+	ps.tabOrder = append(ps.tabOrder, path)
+}
+
+// openFileCmd returns a tea.Cmd that emits a FileOpenMsg for the given path.
+func (m *AppModel) openFileCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     path,
+			Name:     filepath.Base(path),
+			Language: detectEditorLanguage(path),
+		}
+	}
+}
+
+// finalizeCrossPaneDrop executes a cross-pane tab drop if one is pending.
+// Returns nil if no cross-pane drop occurred.
+func (m *AppModel) finalizeCrossPaneDrop() tea.Cmd {
+	if m.tabDragIdx < 0 || m.tabDropTarget == 0 {
+		return nil
+	}
+	if m.tabDragSourcePane == m.previewPane {
+		return m.movePreviewToPane(m.tabDropTarget)
+	}
+	return m.moveTabToPane(m.tabDragSourcePane, m.tabDragIdx, m.tabDropTarget)
+}
+
+// moveTabToPane transfers tab at srcIdx from srcPID to dstPID.
+func (m *AppModel) moveTabToPane(srcPID pane.PaneID, srcIdx int, dstPID pane.PaneID) tea.Cmd {
+	srcPS := m.paneEditors[srcPID]
+	if srcPS == nil || srcIdx >= len(srcPS.tabOrder) {
+		return nil
+	}
+	path := srcPS.tabOrder[srcIdx]
+
+	// Transfer: remove from source, append to target.
+	srcPS.tabOrder = slices.Delete(srcPS.tabOrder, srcIdx, srcIdx+1)
+	m.appendTabToPane(dstPID, path)
+
+	// Handle source pane post-removal.
+	m.reconcileSourcePane(srcPID, path)
+
+	// Focus target pane and open the file.
+	m.focusedPane = dstPID
+	m.focusCodePanel()
+	m.syncFocusState()
+	m.resizeInlineEditor()
+	return m.openFileCmd(path)
+}
+
+// movePreviewToPane promotes the previewed file to an editor tab in dstPID.
+func (m *AppModel) movePreviewToPane(dstPID pane.PaneID) tea.Cmd {
+	path := m.previewPanel.FilePath()
+	if path == "" {
+		return nil
+	}
+	m.appendTabToPane(dstPID, path)
+	m.dismissPreview()
+
+	m.focusedPane = dstPID
+	m.focusCodePanel()
+	m.syncFocusState()
+	m.resizeInlineEditor()
+	return m.openFileCmd(path)
+}
+
+// reconcileSourcePane adjusts the source pane after a tab was removed.
+// If empty, closes the pane. If the active tab was removed, switches to adjacent.
+func (m *AppModel) reconcileSourcePane(srcPID pane.PaneID, removedPath string) {
+	srcPS := m.paneEditors[srcPID]
+	if len(srcPS.tabOrder) == 0 {
+		m.closePaneForce(srcPID)
+		return
+	}
+	if srcPS.editor.FilePath() != removedPath {
+		return
+	}
+	nextIdx := min(m.tabDragIdx, len(srcPS.tabOrder)-1)
+	m.switchPaneToTab(srcPID, nextIdx)
+}
+
+// switchPaneToTab detaches the current editor in the given pane and loads
+// the tab at the specified index from that pane's tab order.
+func (m *AppModel) switchPaneToTab(pid pane.PaneID, idx int) {
+	ps := m.paneEditors[pid]
+	if ps == nil || idx < 0 || idx >= len(ps.tabOrder) {
+		return
+	}
+	if ps.editor.FilePath() != "" {
+		ws := ps.editor.Detach()
+		m.editorCache.Put(ws)
+	}
+	m.loadFileIntoPane(pid, ps.tabOrder[idx])
+}
+
+// loadFileIntoPane loads a file into the specified pane's editor, using
+// the tiered cache if available, otherwise reading from disk.
+func (m *AppModel) loadFileIntoPane(pid pane.PaneID, path string) {
+	ps := m.paneEditors[pid]
+	if ps == nil {
+		return
+	}
+	entry, ok := m.editorCache.Take(path)
+	if ok && entry.IsWarm() {
+		ps.editor.AttachWarm(entry.Warm())
+		return
+	}
+	if ok {
+		ps.editor.AttachCold(entry.Cold())
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	ps.editor.OpenFile(path, string(data), detectEditorLanguage(path))
+}
+
 // activeTabIndex returns the index of the active file in tabOrder.
 func (m *AppModel) activeTabIndex() int {
 	current := m.focusedEditor().FilePath()
@@ -3457,7 +3802,29 @@ func (m *AppModel) handleTabBarClick(viewX int) (bool, tea.Cmd) {
 	}
 	// Begin drag and immediately switch to the pressed tab.
 	m.tabDragIdx = hit.TabIndex
+	m.tabDragSourcePane = m.focusedPane
 	return true, m.switchToTab(hit.TabIndex)
+}
+
+// handleTabDragReorder performs intra-pane tab reordering during a drag.
+func (m *AppModel) handleTabDragReorder(localX int) (bool, tea.Cmd) {
+	ps := m.paneEditors[m.tabDragSourcePane]
+	if ps == nil {
+		return true, nil
+	}
+	r, hasPaneRect := m.focusedPaneRect()
+	var cfg tabbar.Config
+	if hasPaneRect {
+		cfg = m.paneTabBarConfig(m.tabDragSourcePane, r.W)
+	} else {
+		cfg = m.tabBarConfig()
+	}
+	hit := tabbar.HitTest(cfg, localX)
+	if hit.TabIndex >= 0 && hit.TabIndex != m.tabDragIdx && hit.TabIndex < len(ps.tabOrder) {
+		ps.tabOrder[m.tabDragIdx], ps.tabOrder[hit.TabIndex] = ps.tabOrder[hit.TabIndex], ps.tabOrder[m.tabDragIdx]
+		m.tabDragIdx = hit.TabIndex
+	}
+	return true, nil
 }
 
 // updateTabHoverClose updates the tab close-icon hover state from a motion event.
@@ -4741,10 +5108,13 @@ func (m *AppModel) paneViewCoords(screenX, screenY int) (pane.PaneID, int, int, 
 func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	// Release always clears tracking, even outside the panel.
 	if mouse.Action == tea.MouseActionRelease {
+		cmd := m.finalizeCrossPaneDrop()
 		m.editorMouseDown = false
 		m.editorDragging = false
 		m.tabDragIdx = -1
-		return true, nil
+		m.tabDragSourcePane = 0
+		m.tabDropTarget = 0
+		return true, cmd
 	}
 
 	// Full-preview mode: all code panel clicks route to the preview.
@@ -4780,22 +5150,36 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		return true, nil
 	}
 
-	// Tab bar drag: reorder tabs in real time as the cursor moves.
+	// Tab bar drag: reorder within pane or detect cross-pane drop target.
 	if mouse.Action == tea.MouseActionMotion && m.tabDragIdx >= 0 {
+		m.tabDropTarget = 0
+
+		// Multi-pane tree mode: use tree-based hit testing.
+		if m.paneTree != nil && !m.paneTree.IsLeaf() {
+			pid, localX, _, ok := m.paneViewCoords(mouse.X, mouse.Y)
+			if !ok {
+				return true, nil
+			}
+			if pid == m.tabDragSourcePane && pid != m.previewPane {
+				return m.handleTabDragReorder(localX)
+			}
+			if pid != m.tabDragSourcePane && pid != m.previewPane {
+				if _, isEditor := m.paneEditors[pid]; isEditor {
+					m.tabDropTarget = pid
+				}
+			}
+			return true, nil
+		}
+
+		// Legacy split mode: preview-to-editor detection.
+		if m.tabDragSourcePane == m.previewPane && !m.isInsidePreviewHalf(mouse.X) {
+			m.tabDropTarget = m.focusedPane
+			return true, nil
+		}
+
+		// Single-pane intra-pane reorder (existing behavior).
 		viewX, _ := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
-		r, hasPaneRect := m.focusedPaneRect()
-		var cfg tabbar.Config
-		if hasPaneRect {
-			cfg = m.paneTabBarConfig(m.focusedPane, r.W)
-		} else {
-			cfg = m.tabBarConfig()
-		}
-		hit := tabbar.HitTest(cfg, viewX)
-		if hit.TabIndex >= 0 && hit.TabIndex != m.tabDragIdx {
-			m.focusedTabOrder()[m.tabDragIdx], m.focusedTabOrder()[hit.TabIndex] = m.focusedTabOrder()[hit.TabIndex], m.focusedTabOrder()[m.tabDragIdx]
-			m.tabDragIdx = hit.TabIndex
-		}
-		return true, nil
+		return m.handleTabDragReorder(viewX)
 	}
 
 	// Motion while dragging: extend selection even if the pointer left
@@ -4852,6 +5236,11 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 				m.dismissPreview()
 				return true, nil
 			}
+			// Begin preview tab drag.
+			if hit.TabIndex >= 0 {
+				m.tabDragIdx = 0
+				m.tabDragSourcePane = m.previewPane
+			}
 		} else {
 			// Content click: position the cursor.
 			m.previewPanel.SetCursorFromViewport(viewX, viewY-tabbar.Height)
@@ -4898,6 +5287,11 @@ func (m *AppModel) handleMultiPanePress(mouse tea.MouseMsg) (bool, tea.Cmd) {
 				m.dismissPreview()
 				return true, nil
 			}
+			// Begin preview tab drag.
+			if hit.TabIndex >= 0 {
+				m.tabDragIdx = 0
+				m.tabDragSourcePane = m.previewPane
+			}
 		} else {
 			// Content click: position the cursor.
 			viewY := localY - tabbar.Height
@@ -4934,6 +5328,7 @@ func (m *AppModel) handleMultiPanePress(mouse tea.MouseMsg) (bool, tea.Cmd) {
 			return true, m.closeTab(hit.TabIndex)
 		}
 		m.tabDragIdx = hit.TabIndex
+		m.tabDragSourcePane = pid
 		return true, m.switchToTab(hit.TabIndex)
 	}
 
