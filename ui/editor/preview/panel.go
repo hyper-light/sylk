@@ -148,12 +148,12 @@ func (p *Panel) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 	case "h", "left":
 		p.cursorCol = max(p.cursorCol-1, 0)
 	case "l", "right":
-		p.cursorCol = min(p.cursorCol+1, max(p.lineRuneLen(p.cursorLine)-1, 0))
+		p.cursorCol = min(p.cursorCol+1, max(p.displayLineLen(p.cursorLine)-1, 0))
 	case "0":
 		p.cursorCol = 0
 		p.scrollX = 0
 	case "$":
-		p.cursorCol = max(p.lineRuneLen(p.cursorLine)-1, 0)
+		p.cursorCol = max(p.displayLineLen(p.cursorLine)-1, 0)
 	case "w":
 		p.cursorCol = p.nextWordBoundary(p.cursorLine, p.cursorCol)
 	case "b":
@@ -333,18 +333,19 @@ func (p *Panel) clampCursor() {
 	p.cursorLine = min(p.cursorLine, max(len(p.lines)-1, 0))
 }
 
-// clampCursorCol ensures cursorCol is within the current line's bounds.
+// clampCursorCol ensures cursorCol is within the current line's display bounds.
 func (p *Panel) clampCursorCol() {
-	maxCol := max(p.lineRuneLen(p.cursorLine)-1, 0)
+	maxCol := max(p.displayLineLen(p.cursorLine)-1, 0)
 	p.cursorCol = min(p.cursorCol, maxCol)
 }
 
-// lineRuneLen returns the rune length of the given line index.
-func (p *Panel) lineRuneLen(lineIdx int) int {
+// displayLineLen returns the display width (after tab expansion) of the line.
+func (p *Panel) displayLineLen(lineIdx int) int {
 	if lineIdx < 0 || lineIdx >= len(p.lines) {
 		return 0
 	}
-	return len([]rune(p.lines[lineIdx]))
+	display, _ := expandTabs(p.lines[lineIdx], tabWidth)
+	return len([]rune(display))
 }
 
 // ensureCursorVisible adjusts scrollX so the cursor column is within the
@@ -369,12 +370,13 @@ func (p *Panel) contentWidth() int {
 	return max(p.width-gw-1, 1) // gutter + 1 space separator
 }
 
-// nextWordBoundary returns the column of the next word start after col.
+// nextWordBoundary returns the display column of the next word start after col.
 func (p *Panel) nextWordBoundary(lineIdx, col int) int {
 	if lineIdx < 0 || lineIdx >= len(p.lines) {
 		return col
 	}
-	runes := []rune(p.lines[lineIdx])
+	display, _ := expandTabs(p.lines[lineIdx], tabWidth)
+	runes := []rune(display)
 	n := len(runes)
 	i := min(col, n-1)
 	if i < 0 {
@@ -391,12 +393,13 @@ func (p *Panel) nextWordBoundary(lineIdx, col int) int {
 	return min(i, max(n-1, 0))
 }
 
-// prevWordBoundary returns the column of the previous word start before col.
+// prevWordBoundary returns the display column of the previous word start before col.
 func (p *Panel) prevWordBoundary(lineIdx, col int) int {
 	if lineIdx < 0 || lineIdx >= len(p.lines) {
 		return 0
 	}
-	runes := []rune(p.lines[lineIdx])
+	display, _ := expandTabs(p.lines[lineIdx], tabWidth)
+	runes := []rune(display)
 	i := min(col-1, len(runes)-1)
 	if i <= 0 {
 		return 0
