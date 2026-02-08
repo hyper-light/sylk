@@ -346,6 +346,7 @@ type AppModel struct {
 	prevRightRing int               // Detect right ring cycling.
 	prevInputH    int               // Detect input height changes.
 
+
 	// Mouse hover tracking for LSP hover tooltips.
 	hoverMouseLine      int  // last buffer line the mouse was over (-1 = none)
 	hoverMouseCol       int  // last buffer col for LSP request precision
@@ -6044,6 +6045,7 @@ const inputMaxContentLines = 3
 // panelBorderSize is the space consumed by a rounded border on each axis.
 // Derived from: 1 char per side × 2 sides = 2.
 const panelBorderSize = 2
+
 
 // leftPanelOverhead is the vertical space consumed by section chrome.
 // Derived from: 2 headers (1 line each) + 1 divider (1 line + 1 top padding) = 4.
