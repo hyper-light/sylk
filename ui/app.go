@@ -642,8 +642,8 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		// viewDirty set by handleTick when visual work occurred.
 		return m, cmd
 	case msg.BlinkMsg:
-		// Blink chain self-manages via handleBlink.
-		// viewDirty set by handleBlink when blink toggled.
+		// Blink chain self-manages via handleBlink. Phase sync and
+		// viewDirty are handled by syncBlinkPhase in View().
 		return m, cmd
 	case msg.LSPFlushMsg:
 		// One-shot timer; no view change.
@@ -934,6 +934,11 @@ func (m *AppModel) View() string {
 	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
 		return m.fieldManualOverlay.View()
 	}
+
+	// Sync blink phase from wall clock before dirty detection.
+	// This ensures every render shows the correct cursor phase,
+	// regardless of timer jitter or message ordering.
+	m.syncBlinkPhase()
 
 	// Fast path: nothing dirty.
 	if !m.viewDirty && m.comp.HasCache() {
@@ -7178,37 +7183,48 @@ func (m *AppModel) blinkCmd() tea.Cmd {
 	}
 }
 
-// handleBlink sets cursor blink phase from the wall clock and schedules
-// the next blink. Stale blinks (from before a key/focus event) are dropped.
-func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
-	if blink.Gen != m.blinkGen {
-		return nil
+// syncBlinkPhase computes the correct cursor phase from the wall clock
+// and pushes it to all active components. Components short-circuit when
+// the phase hasn't changed, so this is O(1) in the common case.
+// Called from View() before the fast-path cache check.
+func (m *AppModel) syncBlinkPhase() {
+	if !m.needsBlink() {
+		return
 	}
-
 	visible := m.blinkPhase()
 	changed := false
 	if m.editMode && m.focusedEditor().Focused() {
-		m.focusedEditor().SetBlinkPhase(visible)
-		changed = true
-	}
-	if m.focus.Current() == component.FocusInput {
-		m.input.SetBlinkPhase(visible)
-		changed = true
-	}
-	if m.fileTree.NeedsBlink() {
-		m.fileTree.SetBlinkPhase(visible)
-		changed = true
-	}
-	if m.hasPreview() && m.isPreviewFocused() {
-		m.previewPanel.SetBlinkPhase(visible)
-		changed = true
-	}
-	if m.editMode {
+		if m.focusedEditor().SetBlinkPhase(visible) {
+			changed = true
+		}
 		m.focusedEditor().SetBarBlinkPhase(visible)
 	}
-
+	if m.focus.Current() == component.FocusInput {
+		if m.input.SetBlinkPhase(visible) {
+			changed = true
+		}
+	}
+	if m.fileTree.NeedsBlink() {
+		if m.fileTree.SetBlinkPhase(visible) {
+			changed = true
+		}
+	}
+	if m.hasPreview() && m.isPreviewFocused() {
+		if m.previewPanel.SetBlinkPhase(visible) {
+			changed = true
+		}
+	}
 	if changed {
 		m.viewDirty = true
+	}
+}
+
+// handleBlink schedules the next blink timer. Phase sync happens in
+// View() via syncBlinkPhase, which sets viewDirty only when the phase
+// actually changed — avoiding wasted renders on early/jittered timers.
+func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
+	if blink.Gen != m.blinkGen {
+		return nil
 	}
 	if !m.needsBlink() {
 		return nil

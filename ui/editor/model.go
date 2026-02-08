@@ -157,6 +157,12 @@ type viewCache struct {
 	postBody    string   // strings.Join(postLines, "\n").
 	postBounce  int      // bounceOffset at cache time.
 	postValid   bool     // False when post-processing must re-run.
+
+	// Cached visual width of the cursor line. Stable across blink
+	// states (only ANSI codes change, not character content), avoiding
+	// repeated lipgloss.Width ANSI parsing in the splice fast path.
+	cursorVisWidth int  // Visual column count from last fitLine on cursor line.
+	cursorWidthOK  bool // True when cursorVisWidth is valid for current cursor line.
 }
 
 // Compile-time interface checks.
@@ -307,7 +313,8 @@ func (m *Model) ViewContent() string {
 		m.vc.cursorRenderIdx = m.findCursorRenderIdx()
 		m.vc.valid = true
 		m.vc.cursorOK = true
-		m.vc.postValid = false // Force full post-processing.
+		m.vc.postValid = false    // Force full post-processing.
+		m.vc.cursorWidthOK = false // Invalidate cached cursor line width.
 	} else if !m.vc.cursorOK {
 		// Cursor-only patch: re-render just the cursor line.
 		m.patchCursorLine()
@@ -373,8 +380,10 @@ func (m *Model) splicePostCursorLine(barStr string, viewHeight int) string {
 		return body
 	}
 
-	// Fit the single patched line.
-	fitted := m.fitLine(m.vc.lines[ri])
+	// Fit the single patched line. Use cached visual width when available:
+	// cursor blink only changes ANSI codes (reverse video), not character
+	// content, so lipgloss.Width is stable across blink states.
+	fitted := m.fitLineCached(m.vc.lines[ri])
 
 	// Splice into cached postBody at the precomputed byte offset.
 	oldLine := m.vc.postLines[ri]
@@ -2572,15 +2581,15 @@ func handleTickMsg(m *Model, _ tea.Msg) (component.Component, tea.Cmd) {
 func (m *Model) ViewDirty() bool { return !m.vc.valid || !m.vc.cursorOK }
 
 // SetBlinkPhase sets the cursor blink phase to the given value and marks the
-// cursor line for re-rendering if the phase changed. Called by the app's
-// wall-clock blink system, which computes the correct phase from elapsed time
-// to prevent phase inversion from delayed messages.
-func (m *Model) SetBlinkPhase(visible bool) {
+// cursor line for re-rendering if the phase changed. Returns true if the
+// phase actually changed.
+func (m *Model) SetBlinkPhase(visible bool) bool {
 	if m.cursorBlink == visible {
-		return
+		return false
 	}
 	m.cursorBlink = visible
 	m.vc.cursorOK = false
+	return true
 }
 
 // SetBarBlinkPhase sets the blink phase for the find/replace bars.
@@ -3992,6 +4001,7 @@ func (m *Model) computeReplacement(matchedText string) string {
 func (m *Model) invalidateView() {
 	m.vc.valid = false
 	m.vc.postValid = false
+	m.vc.cursorWidthOK = false
 }
 
 // markModified updates the editor's modified/lspDirty/editGeneration state
@@ -4055,6 +4065,32 @@ func (m *Model) fitLine(line string) string {
 		return line
 	}
 	visWidth := lipgloss.Width(line)
+	switch {
+	case visWidth > m.width:
+		return truncateStyledLine(line, m.width)
+	case visWidth < m.width:
+		return line + strings.Repeat(" ", m.width-visWidth)
+	default:
+		return line
+	}
+}
+
+// fitLineCached is like fitLine but reuses the cached visual width for
+// the cursor line. Cursor blink only changes ANSI codes (reverse video),
+// not character content, so lipgloss.Width returns the same value across
+// blink states. Falls back to fitLine on cache miss.
+func (m *Model) fitLineCached(line string) string {
+	if m.width <= 0 {
+		return line
+	}
+	var visWidth int
+	if m.vc.cursorWidthOK {
+		visWidth = m.vc.cursorVisWidth
+	} else {
+		visWidth = lipgloss.Width(line)
+		m.vc.cursorVisWidth = visWidth
+		m.vc.cursorWidthOK = true
+	}
 	switch {
 	case visWidth > m.width:
 		return truncateStyledLine(line, m.width)

@@ -130,7 +130,9 @@ func (c *Compositor) HasCache() bool { return c.hasCache }
 func (c *Compositor) CachedFrame() string { return c.joined }
 
 // Compose rebuilds dirty sections of the frame and returns the joined string.
+// Skips the O(n) strings.Join when no section was actually modified.
 func (c *Compositor) Compose() string {
+	dirty := c.mainDirty || c.inputDirty || c.statusDirty
 	if c.mainDirty {
 		c.spliceMain()
 		c.mainDirty = false
@@ -143,7 +145,9 @@ func (c *Compositor) Compose() string {
 		c.spliceVertical(c.statusStart, SlotStatus)
 		c.statusDirty = false
 	}
-	c.joined = strings.Join(c.lines, "\n")
+	if dirty {
+		c.joined = strings.Join(c.lines, "\n")
+	}
 	c.hasCache = true
 	return c.joined
 }

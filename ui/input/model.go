@@ -240,12 +240,14 @@ func (m *Model) advanceBlink(now time.Time) {
 }
 
 // SetBlinkPhase sets the cursor blink phase. Only marks dirty on change.
-func (m *Model) SetBlinkPhase(visible bool) {
+// Returns true if the phase actually changed.
+func (m *Model) SetBlinkPhase(visible bool) bool {
 	if m.cursorVisible == visible {
-		return
+		return false
 	}
 	m.cursorVisible = visible
 	m.viewDirty = true
+	return true
 }
 
 // resetBlink makes the cursor visible and resets the blink timer.

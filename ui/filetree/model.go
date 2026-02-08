@@ -743,13 +743,18 @@ func (m *Model) SetFocused(focused bool) {
 	m.viewDirty = true
 }
 
-// SetBlinkPhase sets the cursor blink phase. Only marks dirty on change.
-func (m *Model) SetBlinkPhase(visible bool) {
+// SetBlinkPhase sets the cursor blink phase. Only marks dirty when the
+// tree is in a mode that actually renders the cursor (search, replace,
+// rename, new entry, or tab filter). Returns true if phase changed.
+func (m *Model) SetBlinkPhase(visible bool) bool {
 	if m.cursorBlink == visible {
-		return
+		return false
 	}
 	m.cursorBlink = visible
-	m.viewDirty = true
+	if m.NeedsBlink() {
+		m.viewDirty = true
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
