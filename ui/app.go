@@ -314,8 +314,13 @@ type AppModel struct {
 	editorCache *editor.EditorCache
 
 	// Ordered list of open editor tab file paths.
-	tabOrder      []string
+	tabOrder       []string
 	savedActiveTab string // Path of the active tab saved on exitEditMode for restore.
+
+	// Preview panel (read-only file preview, rendered in code panel slot).
+	previewPanel  *codepkg.Model // Second code.Model instance for preview.
+	previewActive bool           // Whether a preview is currently displayed.
+	previewPath   string         // File path currently being previewed.
 
 	// Warp points: numbered teleport bookmarks (nil = empty slot).
 	warpPoints [warpSlotCount]*WarpPoint
@@ -463,6 +468,12 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		tabDragIdx:      -1,
 		tabHoverClose:   -1,
 	}
+
+	// Preview panel: a second code.Model that reports FocusPreview and shows a cursor.
+	app.previewPanel = codepkg.New(th)
+	app.previewPanel.SetFocusID(component.FocusPreview)
+	app.previewPanel.SetCursorVisible(true)
+
 	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
 	app.input = inputpkg.New(th, cfg.InputHistoryCapacity, &tabCompleter{tabOrder: &app.tabOrder})
 	app.syncFocusState()
@@ -581,7 +592,13 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.CloseEditorMsg:
 		return m, m.handleCloseEditor()
 	case msg.FileOpenMsg:
+		// Dismiss any active preview when a file is opened for editing.
+		if m.previewActive {
+			m.dismissPreview()
+		}
 		return m, m.handleFileOpen(typed)
+	case msg.FilePreviewMsg:
+		return m, m.handleFilePreview(typed)
 	case msg.FileTreeEntryCreatedMsg:
 		m.nudgeGitWatcher()
 		if !typed.IsDir {
@@ -2387,6 +2404,7 @@ func (m *AppModel) enterEditMode() tea.Cmd {
 	m.inlineEditor.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize-m.tabBarHeight(), 1))
 
 	m.editMode = true
+	m.fileTree.SetEditMode(true)
 	m.statusBar.SetMode("EDIT")
 	m.input.SetPlaceholder(":")
 	m.focus.SetFocus(component.FocusCodeViewer)
@@ -2419,6 +2437,8 @@ func (m *AppModel) exitEditMode() {
 	m.rightRing.index = m.savedRightIdx
 
 	m.editMode = false
+	m.fileTree.SetEditMode(false)
+	m.dismissPreview()
 	m.editCmdInput = false
 	m.chord = chordNone
 	m.chordBlocked = false
@@ -2723,8 +2743,15 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 }
 
 // codePanelView returns the rendered view for the code panel slot,
-// switching between the inline editor and the read-only viewer.
+// switching between the inline editor, the read-only viewer, and the
+// preview panel (full or split).
 func (m *AppModel) codePanelView() string {
+	if m.previewActive && m.editMode && len(m.tabOrder) > 0 {
+		return m.splitCodePanelView()
+	}
+	if m.previewActive && m.editMode {
+		return m.fullPreviewPanelView()
+	}
 	if m.editMode {
 		content := m.inlineEditor.View()
 		bar := m.tabBarView()
@@ -2734,6 +2761,155 @@ func (m *AppModel) codePanelView() string {
 		return m.overlayBlockedChord(content)
 	}
 	return m.codePanel.View()
+}
+
+// fullPreviewPanelView renders the preview panel with its tab bar when no
+// editor tabs are open.
+func (m *AppModel) fullPreviewPanelView() string {
+	bar := m.previewTabBarView()
+	content := m.previewPanel.View()
+	if bar != "" {
+		return lipgloss.JoinVertical(lipgloss.Left, bar, content)
+	}
+	return content
+}
+
+// splitCodePanelView renders the preview (left) and editor (right) side by
+// side with a vertical divider. Follows the session/agent sub-panel pattern.
+func (m *AppModel) splitCodePanelView() string {
+	th := m.config.Theme()
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+
+	// Split: half to preview, 1 char divider, rest to editor.
+	// Derived from: 1 divider char, remaining space split evenly.
+	dividerWidth := 1
+	previewW := (innerW - dividerWidth) / 2
+	editorW := innerW - dividerWidth - previewW
+
+	// Left side: preview tab bar + content.
+	previewBar := m.previewTabBarView()
+	previewContent := m.previewPanel.View()
+	leftSide := lipgloss.JoinVertical(lipgloss.Left, previewBar, previewContent)
+	leftSide = lipgloss.NewStyle().Width(previewW).MaxWidth(previewW).Render(leftSide)
+
+	// Right side: editor tab bar + content.
+	editorBar := m.tabBarView()
+	editorContent := m.inlineEditor.View()
+	rightSide := lipgloss.JoinVertical(lipgloss.Left, editorBar, editorContent)
+	rightSide = lipgloss.NewStyle().Width(editorW).MaxWidth(editorW).Render(rightSide)
+
+	// Vertical divider spanning full inner height.
+	dividerStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+	dividerLines := make([]string, innerH)
+	for i := range dividerLines {
+		dividerLines[i] = dividerStyle.Render("│")
+	}
+	divider := strings.Join(dividerLines, "\n")
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, leftSide, divider, rightSide)
+}
+
+// previewTabBarView renders the tab bar for the preview panel with a single
+// "Preview: filename" tab.
+func (m *AppModel) previewTabBarView() string {
+	if m.previewPath == "" {
+		return ""
+	}
+	th := m.config.Theme()
+	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+
+	// In split mode, preview gets half the width.
+	barWidth := innerW
+	if len(m.tabOrder) > 0 {
+		dividerWidth := 1
+		barWidth = (innerW - dividerWidth) / 2
+	}
+
+	cfg := tabbar.Config{
+		Tabs: []tabbar.Tab{{
+			Path:        m.previewPath,
+			Modified:    false,
+			LabelPrefix: "Preview: ",
+		}},
+		Active:     0,
+		Width:      barWidth,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      th,
+		HoverClose: -1,
+	}
+	return tabbar.View(cfg)
+}
+
+// ---------------------------------------------------------------------------
+// Preview panel handlers
+// ---------------------------------------------------------------------------
+
+// handleFilePreview loads a file into the preview panel (read-only).
+func (m *AppModel) handleFilePreview(o msg.FilePreviewMsg) tea.Cmd {
+	if o.Path == m.previewPath && m.previewActive {
+		return nil // Already showing this file.
+	}
+
+	data, err := os.ReadFile(o.Path)
+	if err != nil {
+		m.statusBar.SetFlash("Cannot preview: " + filepath.Base(o.Path))
+		return nil
+	}
+	content := string(data)
+	m.previewPanel.SetContent(content, o.Path, o.Language)
+	m.previewPath = o.Path
+
+	wasActive := m.previewActive
+	m.previewActive = true
+
+	if o.Line > 0 {
+		m.previewPanel.ScrollToLine(o.Line - 1)
+	}
+
+	// Recompute layout only when transitioning into preview or changing
+	// between full/split states.
+	if !wasActive || (len(m.tabOrder) > 0) != (len(m.tabOrder) > 0) {
+		m.recalcLayout()
+	}
+	return nil
+}
+
+// dismissPreview closes the preview panel and restores the full code panel.
+func (m *AppModel) dismissPreview() {
+	if !m.previewActive {
+		return
+	}
+	m.previewActive = false
+	m.previewPath = ""
+	m.previewPanel.ClearFile()
+
+	if m.focus.IsFocused(component.FocusPreview) {
+		if len(m.tabOrder) > 0 {
+			m.focus.SetFocus(component.FocusCodeViewer)
+		} else {
+			m.focus.SetFocus(component.FocusFileTree)
+		}
+	}
+	m.recalcLayout()
+	m.syncFocusState()
+}
+
+// openFromPreview promotes the previewed file to an editor tab.
+// Closes the preview and opens the file via the standard FileOpenMsg pipeline.
+func (m *AppModel) openFromPreview() tea.Cmd {
+	path := m.previewPath
+	lang := m.previewPanel.Language()
+	m.dismissPreview()
+
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     path,
+			Language: lang,
+		}
+	}
 }
 
 // overlayBlockedChord prepends the blocked-chord hint bar to content when a
@@ -3376,8 +3552,11 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	// Route wheel events to the hover popup when it is active and the
 	// cursor is over it, instead of scrolling the underlying panel.
 	if m.editMode && m.inlineEditor.HoverActive() && isWheelEvent(mouse) {
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+		if m.isInsideCodePanel(mouse.X, mouse.Y) && !m.isInsidePreviewHalf(mouse.X) {
 			vx, vy := m.editorViewCoords(mouse.X, mouse.Y)
+			if pw := m.previewSplitWidth(); pw > 0 {
+				vx -= pw + 1 // offset past preview + divider
+			}
 			vy -= m.tabBarHeight()
 			vy -= m.inlineEditor.FindBarHeight()
 			if m.inlineEditor.IsInsideHoverPopup(vx, vy) {
@@ -3396,10 +3575,13 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	// Some terminals send MouseButtonLeft for motion after a click-release
 	// instead of MouseButtonNone. Routing hover here ensures it works
 	// regardless of reported button, as long as we're not mid-drag.
+	// In full-preview mode (no editor tabs), skip editor hover entirely.
 	if m.editMode && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown && m.tabDragIdx < 0 {
-		m.updateTabHoverClose(mouse)
-		m.updateFileTreeTabHover(mouse)
-		return m.handleEditorMouseHover(mouse)
+		if !(m.previewActive && len(m.tabOrder) == 0) {
+			m.updateTabHoverClose(mouse)
+			m.updateFileTreeTabHover(mouse)
+			return m.handleEditorMouseHover(mouse)
+		}
 	}
 
 	switch mouse.Button {
@@ -3470,7 +3652,15 @@ func (m *AppModel) panelForScroll(x int) (component.FocusID, bool) {
 		return 0, false
 	}
 
-	return m.resolveRingPanel(panelID, mode), true
+	resolved := m.resolveRingPanel(panelID, mode)
+
+	// In preview split mode, route scrolls over the preview half to the
+	// preview panel instead of the editor.
+	if resolved == component.FocusCodeViewer && m.isInsidePreviewHalf(x) {
+		return component.FocusPreview, true
+	}
+
+	return resolved, true
 }
 
 // resolveRingPanel maps a fixed candidate panel ID to the actual panel
@@ -3547,6 +3737,7 @@ func (m *AppModel) tickScrollMomentum() {
 	if m.editMode {
 		m.inlineEditor.SetBounceOffset(codeBounce)
 	}
+	m.previewPanel.SetBounceOffset(m.bounceOffset(component.FocusPreview))
 	m.fileTree.SetBounceOffset(m.bounceOffset(component.FocusFileTree))
 }
 
@@ -3580,6 +3771,11 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 			return m.chat.ScrollUp()
 		}
 		return m.chat.ScrollDown()
+	case component.FocusPreview:
+		if direction < 0 {
+			return m.previewPanel.ScrollUp()
+		}
+		return m.previewPanel.ScrollDown()
 	case component.FocusCodeViewer:
 		if m.editMode {
 			if direction < 0 {
@@ -3841,6 +4037,31 @@ func (m *AppModel) codePanelX() int {
 	}
 }
 
+// previewSplitWidth returns the preview half width in split mode.
+// Returns 0 when not in split mode or preview is inactive.
+func (m *AppModel) previewSplitWidth() int {
+	if !m.previewActive || !m.editMode || len(m.tabOrder) == 0 {
+		return 0
+	}
+	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	// Derived from: 1 divider char, remaining space split evenly.
+	dividerWidth := 1
+	return (innerW - dividerWidth) / 2
+}
+
+// isInsidePreviewHalf reports whether screen x falls within the preview
+// half of the code panel in split view.
+func (m *AppModel) isInsidePreviewHalf(x int) bool {
+	pw := m.previewSplitWidth()
+	if pw == 0 {
+		return false
+	}
+	codeX := m.codePanelX()
+	contentLeft := codeX + 1 // skip left border
+	return x >= contentLeft && x < contentLeft+pw
+}
+
 // handleEditorMouse handles all left-button mouse actions (press, drag,
 // release) inside the code panel during edit mode. Returns (consumed, cmd).
 func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
@@ -3852,9 +4073,42 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		return true, nil
 	}
 
+	// Full-preview mode: all code panel clicks route to the preview.
+	// Only split mode needs the per-half routing below.
+	if m.previewActive && len(m.tabOrder) == 0 {
+		if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
+			viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+			if viewY < tabbar.Height {
+				codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+				cfg := tabbar.Config{
+					Tabs: []tabbar.Tab{{
+						Path:        m.previewPath,
+						Modified:    false,
+						LabelPrefix: "Preview: ",
+					}},
+					Active:    0,
+					Width:     max(codeW-panelBorderSize, 1),
+					NerdFonts: m.nerdFontsDetected,
+					Theme:     m.config.Theme(),
+				}
+				hit := tabbar.HitTest(cfg, viewX)
+				if hit.TabIndex >= 0 && hit.IsClose {
+					m.dismissPreview()
+					return true, nil
+				}
+			}
+			m.focus.SetFocus(component.FocusPreview)
+			m.syncFocusState()
+		}
+		return true, nil
+	}
+
 	// Tab bar drag: reorder tabs in real time as the cursor moves.
 	if mouse.Action == tea.MouseActionMotion && m.tabDragIdx >= 0 {
 		viewX, _ := m.editorViewCoords(mouse.X, mouse.Y)
+		if pw := m.previewSplitWidth(); pw > 0 {
+			viewX -= pw + 1 // offset past preview + divider
+		}
 		cfg := m.tabBarConfig()
 		hit := tabbar.HitTest(cfg, viewX)
 		if hit.TabIndex >= 0 && hit.TabIndex != m.tabDragIdx {
@@ -3868,6 +4122,9 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	// the panel bounds (clamp handled by the editor).
 	if mouse.Action == tea.MouseActionMotion && m.editorMouseDown {
 		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		if pw := m.previewSplitWidth(); pw > 0 {
+			viewX -= pw + 1 // offset past preview + divider
+		}
 		viewY -= m.tabBarHeight()
 		viewY -= m.inlineEditor.FindBarHeight()
 		if !m.editorDragging {
@@ -3887,7 +4144,41 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		return false, nil
 	}
 
+	// In preview split mode, clicks on the preview half focus the preview
+	// panel. Tab bar close clicks dismiss the preview.
+	if m.isInsidePreviewHalf(mouse.X) {
+		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		if viewY < tabbar.Height {
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.previewPath,
+					Modified:    false,
+					LabelPrefix: "Preview: ",
+				}},
+				Active:     0,
+				Width:      m.previewSplitWidth(),
+				NerdFonts:  m.nerdFontsDetected,
+				Theme:      m.config.Theme(),
+				HoverClose: -1,
+			}
+			hit := tabbar.HitTest(cfg, viewX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissPreview()
+				return true, nil
+			}
+		}
+		m.focus.SetFocus(component.FocusPreview)
+		m.syncFocusState()
+		return true, nil
+	}
+
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+
+	// In split mode, offset viewX to be relative to the editor half.
+	if pw := m.previewSplitWidth(); pw > 0 {
+		dividerWidth := 1
+		viewX -= pw + dividerWidth
+	}
 
 	// Tab bar click: when the tab bar is visible, clicks within it switch tabs.
 	if m.tabBarHeight() > 0 && viewY < m.tabBarHeight() {
@@ -3990,7 +4281,7 @@ const highlightDebounce = 100 * time.Millisecond
 // mouse moves to a new word in edit mode. Only triggers on word characters;
 // moving within the same word does not reset the debounce.
 func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
-	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) || m.isInsidePreviewHalf(mouse.X) {
 		if m.inlineEditor.HoverActive() {
 			m.inlineEditor.DismissHover()
 		}
@@ -3998,6 +4289,9 @@ func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+	if pw := m.previewSplitWidth(); pw > 0 {
+		viewX -= pw + 1 // offset past preview + divider
+	}
 	viewY -= m.tabBarHeight()
 	viewY -= m.inlineEditor.FindBarHeight()
 
@@ -4197,6 +4491,22 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		comp, cmd := m.agentPanel.Update(key)
 		m.agentPanel = comp.(*agentpkg.Model)
 		return cmd
+	case component.FocusPreview:
+		// Preview is read-only. Only scroll navigation and close/open actions.
+		switch key.String() {
+		case "alt+enter":
+			m.dismissPreview()
+			return nil
+		case "enter":
+			return m.openFromPreview()
+		default:
+			// Forward scroll keys (j/k/g/G/pgup/pgdn/arrows/ctrl+d/ctrl+u)
+			// to the preview panel's built-in key table. Non-matching keys
+			// are silently dropped (read-only).
+			comp, cmd := m.previewPanel.Update(key)
+			m.previewPanel = comp.(*codepkg.Model)
+			return cmd
+		}
 	case component.FocusCodeViewer:
 		if m.editMode {
 			wasMod := m.inlineEditor.Modified()
@@ -4303,9 +4613,7 @@ func (m *AppModel) recalcLayout() {
 	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
 	m.codePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 	m.knowledgePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
-	if m.editMode {
-		m.inlineEditor.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize-m.tabBarHeight(), 1))
-	}
+	m.resizeCodePanelForPreview(rightW, rightH)
 
 	// Input: dynamic height based on content.
 	m.input.SetSize(m.width, inputH)
@@ -4316,6 +4624,32 @@ func (m *AppModel) recalcLayout() {
 	m.modalOverlay.SetSize(m.width, m.height)
 	m.searchOverlay.SetSize(m.width, m.height)
 	m.fieldManualOverlay.SetSize(m.width, m.height)
+}
+
+// resizeCodePanelForPreview computes sizes for the preview and editor
+// sub-panels within the code panel slot. Handles three cases: split view,
+// full preview, and editor-only.
+func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+
+	if m.previewActive && m.editMode && len(m.tabOrder) > 0 {
+		// Split mode: preview left, editor right.
+		dividerWidth := 1
+		previewW := (innerW - dividerWidth) / 2
+		editorW := innerW - dividerWidth - previewW
+		m.previewPanel.SetSize(previewW, max(innerH-tabbar.Height, 1))
+		m.inlineEditor.SetSize(editorW, max(innerH-m.tabBarHeight(), 1))
+		return
+	}
+	if m.previewActive && m.editMode {
+		// Full preview mode: preview fills the entire code panel.
+		m.previewPanel.SetSize(innerW, max(innerH-tabbar.Height, 1))
+		return
+	}
+	if m.editMode {
+		m.inlineEditor.SetSize(innerW, max(innerH-m.tabBarHeight(), 1))
+	}
 }
 
 
@@ -4391,14 +4725,14 @@ func (m *AppModel) syncViewState() {
 func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 	switch mode {
 	case layout.FourColumn:
-		return []component.FocusID{
+		order := []component.FocusID{
 			component.FocusInput,
 			component.FocusChat,
 			component.FocusSessionPanel,
 			component.FocusAgentPanel,
 			component.FocusFileTree,
-			component.FocusCodeViewer,
 		}
+		return m.appendCodePanelFocus(order)
 	case layout.ThreeColumn:
 		left := m.leftRing.current()
 		order := []component.FocusID{
@@ -4409,8 +4743,7 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 		if left == component.FocusSessionPanel {
 			order = append(order, component.FocusAgentPanel)
 		}
-		order = append(order, component.FocusCodeViewer)
-		return order
+		return m.appendCodePanelFocus(order)
 	case layout.TwoColumn:
 		left := m.leftRing.current()
 		right := m.rightRing.current()
@@ -4422,7 +4755,7 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 		if left == component.FocusSessionPanel {
 			order = append(order, component.FocusAgentPanel)
 		}
-		return order
+		return m.appendCodePanelFocus(order)
 	default:
 		// SingleColumn: Input + whatever the left ring shows.
 		active := m.leftRing.current()
@@ -4430,8 +4763,25 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 		if active == component.FocusSessionPanel {
 			order = append(order, component.FocusAgentPanel)
 		}
-		return order
+		return m.appendCodePanelFocus(order)
 	}
+}
+
+// appendCodePanelFocus appends the visible code-column panels to the focus
+// order, matching what codePanelView() actually renders:
+//   - Split (preview + editor with tabs): Preview then CodeViewer
+//   - Full preview (no tabs):             Preview only
+//   - Editor or code viewer:              CodeViewer only
+func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.FocusID {
+	switch {
+	case m.previewActive && m.editMode && len(m.tabOrder) > 0:
+		order = append(order, component.FocusPreview, component.FocusCodeViewer)
+	case m.previewActive && m.editMode:
+		order = append(order, component.FocusPreview)
+	default:
+		order = append(order, component.FocusCodeViewer)
+	}
+	return order
 }
 
 // panelDisplayNames maps panel IDs to short labels for the status bar ring.
@@ -4680,166 +5030,137 @@ func (m *AppModel) syncFocusState() {
 	m.input.SetFocused(current == component.FocusInput)
 	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
-	m.codePanel.SetFocused(current == component.FocusCodeViewer)
+	m.codePanel.SetFocused(current == component.FocusCodeViewer && !m.editMode && !m.previewActive)
 	m.inlineEditor.SetFocused(current == component.FocusCodeViewer && m.editMode)
+	m.previewPanel.SetFocused(current == component.FocusPreview)
 	m.fileTree.SetFocused(current == component.FocusFileTree)
+
+	// Override the editor status line mode when preview is focused.
+	m.syncPreviewModeDisplay(current)
+}
+
+// syncPreviewModeDisplay sets the editor status line to PREVIEW mode when
+// the preview panel is focused, and restores the editor's actual mode otherwise.
+func (m *AppModel) syncPreviewModeDisplay(current component.FocusID) {
+	if current == component.FocusPreview {
+		m.inlineEditor.SetStatusMode(mode.ModePreview)
+		return
+	}
+	if current == component.FocusCodeViewer && m.editMode {
+		m.inlineEditor.RestoreStatusMode()
+	}
 }
 
 // spatialFocusTarget resolves an alt+shift+arrow key to the panel it should
-// navigate to. Left/right cycle through panels in column-major order (sub-panels
-// grouped with their column) so there is no visual zig-zag. Up/down move to the
-// leftmost panel of the adjacent grid row (wrapping at edges).
+// navigate to. Delegates to the generic layout.Navigate algorithm over a
+// hierarchical panel grid built from the current layout mode and state.
 func (m *AppModel) spatialFocusTarget(key string) (component.FocusID, bool) {
-	current := m.focus.Current()
+	dir, ok := keyToDirection(key)
+	if !ok {
+		return 0, false
+	}
+	grid := m.buildPanelGrid()
+	pos, ok := layout.FindInGrid(grid, m.focus.Current())
+	if !ok {
+		return 0, false
+	}
+	return layout.Navigate(grid, pos, dir)
+}
 
+// keyToDirection maps an alt+shift+arrow key string to a layout.Direction.
+func keyToDirection(key string) (layout.Direction, bool) {
 	switch key {
-	case "alt+shift+right", "alt+shift+left":
-		cycle := m.buildFocusCycle()
-		idx := -1
-		for i, id := range cycle {
-			if id == current {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			return 0, false
-		}
-		n := len(cycle)
-		if key == "alt+shift+right" {
-			return cycle[(idx+1)%n], true
-		}
-		return cycle[(idx-1+n)%n], true
-
-	case "alt+shift+up", "alt+shift+down":
-		grid := m.buildFocusGrid()
-		if len(grid) == 0 {
-			return 0, false
-		}
-		row := -1
-		for r, panels := range grid {
-			for _, id := range panels {
-				if id == current {
-					row = r
-					break
-				}
-			}
-			if row >= 0 {
-				break
-			}
-		}
-		if row < 0 {
-			return 0, false
-		}
-		n := len(grid)
-		if key == "alt+shift+up" {
-			return grid[(row-1+n)%n][0], true
-		}
-		return grid[(row+1)%n][0], true
+	case "alt+shift+right":
+		return layout.DirRight, true
+	case "alt+shift+left":
+		return layout.DirLeft, true
+	case "alt+shift+down":
+		return layout.DirDown, true
+	case "alt+shift+up":
+		return layout.DirUp, true
 	}
 	return 0, false
 }
 
-// buildFocusCycle returns panels in column-major order for left/right cycling.
-// Sub-panels within the same visual column (e.g. Sessions + Agents) are grouped
-// together so cycling visits each column fully before moving to the next.
-//
-//	FourColumn:  Sessions, Agents, FileTree, Chat, Code, Input
-//	ThreeColumn: <left>, [Agents], Chat, Code, Input
-//	TwoColumn:   <left>, [Agents], <right>, Input
-//	SingleColumn: <left>, [Agents], Input
-func (m *AppModel) buildFocusCycle() []component.FocusID {
-	cycle := make([]component.FocusID, 0, 8)
+// buildPanelGrid returns the visible panels as a hierarchical grid of
+// layout.PanelGroup entries. Only panels actually rendered on screen are
+// included. Sub-panels (e.g. Sessions+Agents, Preview+Editor) are encoded
+// within their parent PanelGroup's sub-grid.
+func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
+	pg := func(id component.FocusID) layout.PanelGroup {
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{{id}}}
+	}
+
+	leftSubs := func() layout.PanelGroup {
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{
+			{component.FocusSessionPanel},
+			{component.FocusAgentPanel},
+		}}
+	}
+
+	var top []layout.PanelGroup
 
 	switch m.layout.Mode() {
 	case layout.FourColumn:
-		cycle = append(cycle,
-			component.FocusSessionPanel, component.FocusAgentPanel,
-			component.FocusFileTree, component.FocusChat, component.FocusCodeViewer,
-		)
+		top = []layout.PanelGroup{
+			leftSubs(),
+			pg(component.FocusFileTree),
+			pg(component.FocusChat),
+			m.codePanelGroup(),
+		}
 	case layout.ThreeColumn:
 		left := m.leftRing.current()
-		cycle = append(cycle, left)
 		if left == component.FocusSessionPanel {
-			cycle = append(cycle, component.FocusAgentPanel)
+			top = append(top, leftSubs())
+		} else {
+			top = append(top, pg(left))
 		}
-		cycle = append(cycle, component.FocusChat, component.FocusCodeViewer)
+		top = append(top, pg(component.FocusChat), m.codePanelGroup())
 	case layout.TwoColumn:
 		left := m.leftRing.current()
 		right := m.rightRing.current()
-		cycle = append(cycle, left)
 		if left == component.FocusSessionPanel {
-			cycle = append(cycle, component.FocusAgentPanel)
+			top = append(top, leftSubs())
+		} else {
+			top = append(top, pg(left))
 		}
-		cycle = append(cycle, right)
+		if right == component.FocusCodeViewer {
+			top = append(top, m.codePanelGroup())
+		} else {
+			top = append(top, pg(right))
+		}
 	default: // SingleColumn
 		active := m.leftRing.current()
-		cycle = append(cycle, active)
-		if active == component.FocusSessionPanel {
-			cycle = append(cycle, component.FocusAgentPanel)
+		switch {
+		case active == component.FocusSessionPanel:
+			top = append(top, leftSubs())
+		case active == component.FocusCodeViewer:
+			top = append(top, m.codePanelGroup())
+		default:
+			top = append(top, pg(active))
 		}
 	}
 
-	cycle = append(cycle, component.FocusInput)
-	return cycle
+	return [][]layout.PanelGroup{top, {pg(component.FocusInput)}}
 }
 
-// buildFocusGrid returns the visible panels arranged in rows (left-to-right)
-// based on the current layout mode and ring state. The grid matches the
-// visual layout: AgentPanel occupies a separate row within the left column
-// (when the sessions view is active), and Input is always the last row.
-//
-//	FourColumn:
-//	  Row 0: Sessions, FileTree, Chat, CodeViewer
-//	  Row 1: Agents
-//	  Row 2: Input
-//
-//	ThreeColumn:
-//	  Row 0: <left-ring>, Chat, CodeViewer
-//	  Row 1: [Agents]
-//	  Row N: Input
-//
-//	TwoColumn:
-//	  Row 0: <left-ring>, <right-ring>
-//	  Row 1: [Agents]
-//	  Row N: Input
-//
-//	SingleColumn:
-//	  Row 0: <left-ring>
-//	  Row 1: [Agents]
-//	  Row N: Input
-func (m *AppModel) buildFocusGrid() [][]component.FocusID {
-	var top []component.FocusID
-	showAgents := false
-
-	switch m.layout.Mode() {
-	case layout.FourColumn:
-		top = []component.FocusID{
-			component.FocusSessionPanel, component.FocusFileTree,
-			component.FocusChat, component.FocusCodeViewer,
-		}
-		showAgents = true
-	case layout.ThreeColumn:
-		left := m.leftRing.current()
-		top = []component.FocusID{left, component.FocusChat, component.FocusCodeViewer}
-		showAgents = left == component.FocusSessionPanel
-	case layout.TwoColumn:
-		left := m.leftRing.current()
-		right := m.rightRing.current()
-		top = []component.FocusID{left, right}
-		showAgents = left == component.FocusSessionPanel
-	default: // SingleColumn
-		active := m.leftRing.current()
-		top = []component.FocusID{active}
-		showAgents = active == component.FocusSessionPanel
+// codePanelGroup returns the PanelGroup for the code column, with sub-panels
+// matching what codePanelView() actually renders.
+func (m *AppModel) codePanelGroup() layout.PanelGroup {
+	switch {
+	case m.previewActive && m.editMode && len(m.tabOrder) > 0:
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{
+			{component.FocusPreview, component.FocusCodeViewer},
+		}}
+	case m.previewActive && m.editMode:
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{
+			{component.FocusPreview},
+		}}
+	default:
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{
+			{component.FocusCodeViewer},
+		}}
 	}
-
-	grid := [][]component.FocusID{top}
-	if showAgents {
-		grid = append(grid, []component.FocusID{component.FocusAgentPanel})
-	}
-	grid = append(grid, []component.FocusID{component.FocusInput})
-	return grid
 }
 
 // ---------------------------------------------------------------------------

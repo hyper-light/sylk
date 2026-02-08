@@ -262,6 +262,15 @@ const maxFileCacheSize = 128 << 20
 // ticks so only the latest query triggers a grep.
 type searchTickMsg struct{ version int }
 
+// previewTickMsg fires after the preview debounce interval. If the version
+// still matches, a FilePreviewMsg is emitted for the current cursor entry.
+type previewTickMsg struct{ version int }
+
+// previewDebounceInterval is the delay after cursor movement before emitting
+// a FilePreviewMsg. Prevents reading files on rapid j/j/j/j navigation.
+// Derived from: 50ms is fast enough to feel instant yet batches bursts.
+const previewDebounceInterval = 50 * time.Millisecond
+
 // cachedFile holds a pre-read, pre-split file's lines for reuse across
 // multiple queries within a single search session.
 type cachedFile struct {
@@ -466,6 +475,11 @@ type Model struct {
 	// Font capability: true when Nerd Font symbols are available.
 	nerdFonts bool
 
+	// Preview state: when editMode is true, cursor movement on files emits
+	// debounced FilePreviewMsg events to populate the preview panel.
+	editMode       bool // true when the app is in edit mode.
+	previewVersion int  // Monotonic counter; gates stale preview debounce ticks.
+
 	// Git status decorations: maps relative path → visual state.
 	// Updated externally via SetGitStatus(). Nil means no git info available.
 	gitStatus map[string]git.GitFileState
@@ -493,6 +507,10 @@ func New(th *theme.Theme) *Model {
 
 // SetNerdFonts enables or disables Nerd Font icon rendering.
 func (m *Model) SetNerdFonts(available bool) { m.nerdFonts = available }
+
+// SetEditMode sets whether the app is in edit mode. When true, cursor
+// movement on files emits debounced preview events.
+func (m *Model) SetEditMode(on bool) { m.editMode = on }
 
 // SetGitStatus replaces the git status decoration map and tracked-file sets.
 // Paths in all maps are relative to rootPath. Passing nil clears all decorations.
@@ -587,6 +605,8 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 		return m, m.handleSearchTick(typed)
 	case searchBatchMsg:
 		return m, m.handleSearchBatch(typed)
+	case previewTickMsg:
+		return m, m.handlePreviewTick(typed)
 	default:
 		return m, nil
 	}
@@ -1531,7 +1551,7 @@ func (m *Model) handleTreeKey(key tea.KeyMsg) tea.Cmd {
 	case "alt+backspace", "alt+delete":
 		return m.requestDelete()
 	}
-	return nil
+	return m.schedulePreview()
 }
 
 // handleReferencesKey processes keys in references mode.
@@ -2280,6 +2300,45 @@ func (m *Model) activateEntry() tea.Cmd {
 
 	return func() tea.Msg {
 		return msg.FileOpenMsg{
+			Path:     entry.Path,
+			Name:     entry.Name,
+			Language: langFromPath(entry.Path),
+		}
+	}
+}
+
+// schedulePreview bumps the preview version and returns a debounced tick command.
+// Only fires when edit mode is active and the cursor is on a file.
+func (m *Model) schedulePreview() tea.Cmd {
+	if !m.editMode || m.cursor >= len(m.entries) {
+		return nil
+	}
+	entry := &m.entries[m.cursor]
+	if entry.IsDir {
+		return nil
+	}
+	m.previewVersion++
+	version := m.previewVersion
+	return tea.Tick(previewDebounceInterval, func(time.Time) tea.Msg {
+		return previewTickMsg{version: version}
+	})
+}
+
+// handlePreviewTick emits a FilePreviewMsg if the version is still current
+// and the cursor is on a file.
+func (m *Model) handlePreviewTick(tick previewTickMsg) tea.Cmd {
+	if tick.version != m.previewVersion {
+		return nil
+	}
+	if m.cursor >= len(m.entries) {
+		return nil
+	}
+	entry := &m.entries[m.cursor]
+	if entry.IsDir {
+		return nil
+	}
+	return func() tea.Msg {
+		return msg.FilePreviewMsg{
 			Path:     entry.Path,
 			Name:     entry.Name,
 			Language: langFromPath(entry.Path),

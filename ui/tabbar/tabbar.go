@@ -14,8 +14,9 @@ import (
 
 // Tab represents a single open file tab.
 type Tab struct {
-	Path     string
-	Modified bool
+	Path        string
+	Modified    bool
+	LabelPrefix string // Optional prefix (e.g. "Preview: "). Empty = show filename only.
 }
 
 // Config holds rendering parameters for the tab bar.
@@ -109,7 +110,7 @@ func iconDisplayWidth(cfg Config, t Tab) int {
 
 // naturalWidth returns the display width of a tab at its full name.
 func naturalWidth(cfg Config, t Tab) int {
-	name := filepath.Base(t.Path)
+	name := t.LabelPrefix + filepath.Base(t.Path)
 	return padWidth + iconDisplayWidth(cfg, t) + iconGap + runewidth.StringWidth(name) + closeWidth
 }
 
@@ -205,7 +206,7 @@ func renderTabs(cfg Config, widths []int) string {
 // renderTab renders a single tab within the given width budget.
 func renderTab(cfg Config, t Tab, active, hoverClose bool, budget int) string {
 	icon, iconColor := filetree.FileIcon(t.Path, false, cfg.NerdFonts, cfg.Theme)
-	name := filepath.Base(t.Path)
+	name := t.LabelPrefix + filepath.Base(t.Path)
 
 	// Determine available display columns for the name.
 	iconW := runewidth.StringWidth(icon)

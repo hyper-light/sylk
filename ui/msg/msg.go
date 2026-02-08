@@ -366,6 +366,16 @@ type FileOpenMsg struct {
 	CursorCol int // If > 0, position cursor at this 0-indexed column after line jump.
 }
 
+// FilePreviewMsg requests displaying a file in preview mode (read-only).
+// Distinguished from FileOpenMsg, which opens the file for editing.
+type FilePreviewMsg struct {
+	Path     string
+	Name     string
+	Language string
+	Line     int // 0 = top, >0 = scroll to this 1-based line.
+	Col      int // 0-indexed column for positioning.
+}
+
 // FileTreeNewFileMsg requests creation of a new file in the given directory.
 type FileTreeNewFileMsg struct {
 	Dir string // Parent directory for the new file.

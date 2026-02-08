@@ -312,6 +312,13 @@ func (m *Model) SetFocused(focused bool) {
 // CurrentMode returns the active editor mode (Normal, Insert, etc.).
 func (m *Model) CurrentMode() mode.Mode { return m.currentMode }
 
+// SetStatusMode overrides the mode displayed in the status line without
+// changing the editor's actual operating mode. Used for PREVIEW display.
+func (m *Model) SetStatusMode(md mode.Mode) { m.statusLine.SetMode(md) }
+
+// RestoreStatusMode resets the status line to show the editor's actual mode.
+func (m *Model) RestoreStatusMode() { m.statusLine.SetMode(m.currentMode) }
+
 // Content materializes and returns the full buffer text.
 func (m *Model) Content() string { return m.buf.Content() }
 

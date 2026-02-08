@@ -19,6 +19,7 @@ const (
 	ModeReplace
 	ModeCmdline
 	ModeOperatorPending
+	ModePreview
 )
 
 // ModeChangeMsg is emitted when the editor switches modes.
@@ -44,6 +45,7 @@ var modeInfoTable = map[Mode]ModeInfo{
 	ModeReplace:         {Mode: ModeReplace, Name: "REPLACE", Icon: theme.IconReplace},
 	ModeCmdline:         {Mode: ModeCmdline, Name: "COMMAND", Icon: theme.IconCommand},
 	ModeOperatorPending: {Mode: ModeOperatorPending, Name: "OP-PEND", Icon: theme.IconNormal},
+	ModePreview:         {Mode: ModePreview, Name: "PREVIEW", Icon: theme.IconPreview},
 }
 
 // ModeName returns the human-readable name for a mode.

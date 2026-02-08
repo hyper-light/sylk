@@ -27,6 +27,7 @@ type Theme struct {
 	StatusNormal  lipgloss.Style
 	StatusWarning lipgloss.Style
 	StatusError   lipgloss.Style
+	StatusPreview lipgloss.Style
 
 	// Session panel
 	SessionActive   lipgloss.Style
@@ -94,6 +95,10 @@ func New(p Palette) *Theme {
 
 		StatusError: lipgloss.NewStyle().
 			Foreground(p.Error).
+			Bold(true),
+
+		StatusPreview: lipgloss.NewStyle().
+			Foreground(p.Primary).
 			Bold(true),
 
 		SessionActive: lipgloss.NewStyle().

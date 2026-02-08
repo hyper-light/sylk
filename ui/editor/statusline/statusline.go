@@ -139,6 +139,7 @@ var modeStyleTable = map[mode.Mode]func(th *theme.Theme) lipgloss.Style{
 	mode.ModeVisualBlock: visualStyle,
 	mode.ModeReplace:     replaceStyle,
 	mode.ModeCmdline:     cmdlineStyle,
+	mode.ModePreview:     previewStyle,
 }
 
 // modeStyle returns the lipgloss style for the current mode.
@@ -155,3 +156,4 @@ func insertStyle(th *theme.Theme) lipgloss.Style   { return th.StatusWarning }
 func visualStyle(th *theme.Theme) lipgloss.Style   { return th.StatusWarning }
 func replaceStyle(th *theme.Theme) lipgloss.Style  { return th.StatusError }
 func cmdlineStyle(th *theme.Theme) lipgloss.Style  { return th.StatusNormal }
+func previewStyle(th *theme.Theme) lipgloss.Style  { return th.StatusPreview }

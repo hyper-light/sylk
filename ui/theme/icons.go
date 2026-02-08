@@ -40,6 +40,7 @@ const (
 	IconVisual  = "V"
 	IconReplace = "R"
 	IconCommand = ":"
+	IconPreview = "P"
 
 	// Search
 	IconSearch = "/"
