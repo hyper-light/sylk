@@ -585,3 +585,82 @@ func TestFourPaneGrid(t *testing.T) {
 		t.Fatalf("expected 2 cols per row, got %v", grid)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Dividers
+// ---------------------------------------------------------------------------
+
+func TestDividersSingleLeaf(t *testing.T) {
+	n := leaf(1)
+	divs := n.Dividers(Rect{0, 0, 80, 24})
+	if len(divs) != 0 {
+		t.Fatalf("expected 0 dividers, got %d", len(divs))
+	}
+}
+
+func TestDividersVerticalSplit(t *testing.T) {
+	n := splitV(1, 2)
+	area := Rect{0, 0, 81, 24}
+	divs := n.Dividers(area)
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divider, got %d", len(divs))
+	}
+	d := divs[0]
+	if d.Dir != SplitVertical {
+		t.Fatalf("expected vertical divider, got %d", d.Dir)
+	}
+	// With ratio 0.5, leftW = (81-1)*0.5 = 40. Divider at X=40.
+	if d.X != 40 {
+		t.Fatalf("expected X=40, got %d", d.X)
+	}
+	if d.Y != 0 || d.Len != 24 {
+		t.Fatalf("expected Y=0 Len=24, got Y=%d Len=%d", d.Y, d.Len)
+	}
+}
+
+func TestDividersHorizontalSplit(t *testing.T) {
+	n := splitH(1, 2)
+	area := Rect{0, 0, 80, 25}
+	divs := n.Dividers(area)
+	if len(divs) != 1 {
+		t.Fatalf("expected 1 divider, got %d", len(divs))
+	}
+	d := divs[0]
+	if d.Dir != SplitHorizontal {
+		t.Fatalf("expected horizontal divider, got %d", d.Dir)
+	}
+	// With ratio 0.5, topH = (25-1)*0.5 = 12. Divider at Y=12.
+	if d.Y != 12 {
+		t.Fatalf("expected Y=12, got %d", d.Y)
+	}
+	if d.X != 0 || d.Len != 80 {
+		t.Fatalf("expected X=0 Len=80, got X=%d Len=%d", d.X, d.Len)
+	}
+}
+
+func TestDividersFourPane(t *testing.T) {
+	// H(V(1,2), V(3,4)) — 3 dividers total.
+	n := NewLeaf(PaneID(1))
+	n.Split(1, 3, SplitHorizontal, Rect{}) // H(1, 3)
+	n.Split(1, 2, SplitVertical, Rect{})   // H(V(1,2), 3)
+	n.Split(3, 4, SplitVertical, Rect{})   // H(V(1,2), V(3,4))
+
+	area := Rect{0, 0, 81, 25}
+	divs := n.Dividers(area)
+	if len(divs) != 3 {
+		t.Fatalf("expected 3 dividers, got %d", len(divs))
+	}
+
+	// Should have 1 horizontal + 2 vertical dividers.
+	var hCount, vCount int
+	for _, d := range divs {
+		if d.Dir == SplitHorizontal {
+			hCount++
+		} else {
+			vCount++
+		}
+	}
+	if hCount != 1 || vCount != 2 {
+		t.Fatalf("expected 1H + 2V dividers, got %dH + %dV", hCount, vCount)
+	}
+}

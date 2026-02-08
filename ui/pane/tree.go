@@ -243,6 +243,55 @@ func (n *Node) computeLayout(area Rect, out map[PaneID]Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Dividers
+// ---------------------------------------------------------------------------
+
+// Divider describes a split divider line between two child subtrees.
+type Divider struct {
+	X, Y int      // Top-left position of the divider.
+	Len  int      // Length in characters (height for vertical, width for horizontal).
+	Dir  SplitDir // SplitVertical → column of │, SplitHorizontal → row of ─.
+}
+
+// Dividers returns the positions of all split dividers in the tree for the
+// given root area. Uses an explicit stack (no recursion).
+func (n *Node) Dividers(area Rect) []Divider {
+	type entry struct {
+		node *Node
+		area Rect
+	}
+	stack := []entry{{n, area}}
+	var out []Divider
+
+	for len(stack) > 0 {
+		e := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if e.node.IsLeaf() {
+			continue
+		}
+
+		a := e.area
+		if e.node.Dir == SplitVertical {
+			leftW := int(float64(a.W-dividerSize) * e.node.Ratio)
+			divX := a.X + leftW
+			out = append(out, Divider{X: divX, Y: a.Y, Len: a.H, Dir: SplitVertical})
+			rightW := a.W - dividerSize - leftW
+			stack = append(stack, entry{e.node.Left, Rect{a.X, a.Y, leftW, a.H}})
+			stack = append(stack, entry{e.node.Right, Rect{divX + dividerSize, a.Y, rightW, a.H}})
+		} else {
+			topH := int(float64(a.H-dividerSize) * e.node.Ratio)
+			divY := a.Y + topH
+			out = append(out, Divider{X: a.X, Y: divY, Len: a.W, Dir: SplitHorizontal})
+			bottomH := a.H - dividerSize - topH
+			stack = append(stack, entry{e.node.Left, Rect{a.X, a.Y, a.W, topH}})
+			stack = append(stack, entry{e.node.Right, Rect{a.X, divY + dividerSize, a.W, bottomH}})
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
 // Traversal
 // ---------------------------------------------------------------------------
 
@@ -337,8 +386,7 @@ func (n *Node) ToSubGrid() [][]component.FocusID {
 }
 
 // FocusID returns the component.FocusID for this leaf node.
-// For the preview pane, callers should check PaneKind and return
-// component.FocusPreview instead — this always returns the dynamic ID.
+// All panes (editor and preview) use dynamic IDs: FocusPaneBase + PaneID.
 func (n *Node) FocusID() component.FocusID {
 	return PaneFocusID(n.ID)
 }
