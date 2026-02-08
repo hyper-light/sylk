@@ -25,17 +25,16 @@ const (
 	FocusPaneBase FocusID = 1000
 )
 
-// Component defines the contract for all TUI sub-models.
-// Each component is independently testable.
+// Component defines the behavioral contract for all TUI sub-models.
+// Rendering (View) is intentionally excluded: each component has its own
+// View signature with component-specific parameters (e.g. cursorVisible),
+// and View is never called through this interface.
 type Component interface {
 	// Init returns an initial command to run.
 	Init() tea.Cmd
 
 	// Update processes a message and returns the updated component and a command.
 	Update(msg tea.Msg) (Component, tea.Cmd)
-
-	// View renders the component to a string.
-	View() string
 }
 
 // Focusable extends Component with focus management.

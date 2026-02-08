@@ -491,19 +491,23 @@ func (n *Node) FocusID() component.FocusID {
 	return PaneFocusID(n.ID)
 }
 
-// mergeColumns concatenates the columns of two grids. If the grids have
-// different row counts, the shorter grid's rows are repeated to match.
+// mergeColumns concatenates the columns of two grids. When the grids have
+// different row counts, rows beyond the shorter grid's length contain only
+// the taller grid's columns (ragged). This avoids duplicating FocusIDs,
+// which would break FindInGrid (first-match semantics).
 func mergeColumns(left, right [][]component.FocusID) [][]component.FocusID {
 	lr := len(left)
 	rr := len(right)
 	rows := max(lr, rr)
 	out := make([][]component.FocusID, rows)
 	for i := range rows {
-		li := min(i, lr-1)
-		ri := min(i, rr-1)
-		row := make([]component.FocusID, 0, len(left[li])+len(right[ri]))
-		row = append(row, left[li]...)
-		row = append(row, right[ri]...)
+		var row []component.FocusID
+		if i < lr {
+			row = append(row, left[i]...)
+		}
+		if i < rr {
+			row = append(row, right[i]...)
+		}
 		out[i] = row
 	}
 	return out

@@ -406,10 +406,6 @@ type Model struct {
 	scopeCursor    int               // Rune-based insertion position within scopeQuery.
 	compiledRegexp *regexp.Regexp    // Cached compiled regex (nil if invalid/unused).
 
-	// Cursor blink state for search inputs.
-	cursorBlink bool
-	lastBlinkAt time.Time
-
 	// Snapshot of tree state before entering search or references, restored on exit.
 	savedEntries []Entry
 	savedCursor  int
@@ -490,8 +486,9 @@ type Model struct {
 	trackedDirs map[string]struct{}
 
 	// View cache: avoids re-rendering when no visible state changed.
-	viewCache string
-	viewDirty bool
+	viewCache      string
+	viewDirty      bool
+	lastBlinkPhase bool // Blink phase at last render; invalidates viewCache on change.
 }
 
 // Verify interface compliance at compile time.
@@ -692,23 +689,30 @@ func searchWatchCmd(worker *SearchWorker) tea.Cmd {
 // ViewDirty reports whether View() would produce new output.
 func (m *Model) ViewDirty() bool { return m.viewDirty }
 
-func (m *Model) View() string {
+func (m *Model) View(cursorVisible bool) string {
+	if !m.focused {
+		cursorVisible = false
+	}
+	if cursorVisible != m.lastBlinkPhase {
+		m.viewDirty = true
+		m.lastBlinkPhase = cursorVisible
+	}
 	if !m.viewDirty && m.viewCache != "" {
 		return m.viewCache
 	}
 	switch m.mode {
 	case viewSearch:
-		m.viewCache = m.viewSearchMode()
+		m.viewCache = m.viewSearchMode(cursorVisible)
 	case viewReplace:
-		m.viewCache = m.viewReplaceMode()
+		m.viewCache = m.viewReplaceMode(cursorVisible)
 	case viewReferences:
 		m.viewCache = m.viewReferencesMode()
 	case viewDocSymbols:
 		m.viewCache = m.viewDocSymbolsMode()
 	case viewTabs:
-		m.viewCache = m.viewTabsMode()
+		m.viewCache = m.viewTabsMode(cursorVisible)
 	default:
-		m.viewCache = m.viewTreeMode()
+		m.viewCache = m.viewTreeMode(cursorVisible)
 	}
 	m.viewDirty = false
 	return m.viewCache
@@ -737,24 +741,7 @@ func (m *Model) NeedsBlink() bool {
 // SetFocused sets the focus state.
 func (m *Model) SetFocused(focused bool) {
 	m.focused = focused
-	if focused {
-		m.cursorBlink = true // Start with cursor visible on focus gain.
-	}
 	m.viewDirty = true
-}
-
-// SetBlinkPhase sets the cursor blink phase. Only marks dirty when the
-// tree is in a mode that actually renders the cursor (search, replace,
-// rename, new entry, or tab filter). Returns true if phase changed.
-func (m *Model) SetBlinkPhase(visible bool) bool {
-	if m.cursorBlink == visible {
-		return false
-	}
-	m.cursorBlink = visible
-	if m.NeedsBlink() {
-		m.viewDirty = true
-	}
-	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -918,8 +905,7 @@ func (m *Model) ToggleTabFilter() {
 	m.tabFiltering = true
 	m.tabFilter = nil
 	m.tabFocus = tabFocusFilter
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 	m.viewDirty = true
 }
 
@@ -1840,8 +1826,6 @@ func (m *Model) handleTabsKey(key tea.KeyMsg) tea.Cmd {
 		m.tabFiltering = true
 		m.tabFilter = nil
 		m.tabFocus = tabFocusFilter
-		m.cursorBlink = true
-		m.lastBlinkAt = time.Now()
 	}
 	return nil
 }
@@ -1849,8 +1833,7 @@ func (m *Model) handleTabsKey(key tea.KeyMsg) tea.Cmd {
 // handleTabsFilterKey processes keys while the tab filter input is active.
 // Dispatches to the focused zone (filter input or toggle badges).
 func (m *Model) handleTabsFilterKey(key tea.KeyMsg) tea.Cmd {
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 	ks := key.String()
 
 	// Alt shortcuts for toggles work regardless of focus zone.
@@ -2105,8 +2088,7 @@ func (m *Model) closeTabEntry(filteredIdx int) tea.Cmd {
 // handleSearchKey processes keys in search mode, dispatching to the
 // appropriate focus zone handler.
 func (m *Model) handleSearchKey(key tea.KeyMsg) tea.Cmd {
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 	switch key.String() {
 	case "ctrl+u":
 		m.exitSearch()
@@ -2423,8 +2405,7 @@ func (m *Model) requestRename() tea.Cmd {
 	m.renamePath = entry.Path
 	m.renameIsDir = entry.IsDir
 	m.renameInput = []rune(entry.Name)
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 	return nil
 }
 
@@ -2464,8 +2445,7 @@ func (m *Model) EnterNewEntry(dir string, isDir bool) {
 	m.newEntryIsDir = isDir
 	m.newEntryDir = dir
 	m.newEntryInput = nil
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 	m.viewDirty = true
 }
 
@@ -2478,8 +2458,7 @@ func (m *Model) exitNewEntry() {
 
 // handleNewEntryKey processes keys while the new-entry input is active.
 func (m *Model) handleNewEntryKey(key tea.KeyMsg) tea.Cmd {
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 
 	switch key.String() {
 	case "escape":
@@ -2688,8 +2667,7 @@ func (m *Model) exitRename() {
 
 // handleRenameKey processes keys while the rename input is active.
 func (m *Model) handleRenameKey(key tea.KeyMsg) tea.Cmd {
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 
 	switch key.String() {
 	case "escape":
@@ -2874,8 +2852,7 @@ func (m *Model) enterSearch() {
 	m.searchScroll = 0
 	m.searchNumWidth = 0
 	m.searchDone = true
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 
 	// Create async search worker.
 	m.searchWorker = NewSearchWorker()
@@ -2974,8 +2951,7 @@ func (m *Model) InReplaceMode() bool { return m.mode == viewReplace }
 // handleReplaceKey processes keys in replace mode. It reuses the search
 // infrastructure for match display and navigation, adding replace actions.
 func (m *Model) handleReplaceKey(key tea.KeyMsg) tea.Cmd {
-	m.cursorBlink = true
-	m.lastBlinkAt = time.Now()
+
 	switch key.String() {
 	case "ctrl+u":
 		m.exitReplace()
@@ -3944,7 +3920,7 @@ func (m *Model) readDir(dirPath string, depth int) []Entry {
 // ---------------------------------------------------------------------------
 
 // viewTreeMode renders the normal tree view with header, entries, and search hint.
-func (m *Model) viewTreeMode() string {
+func (m *Model) viewTreeMode(cursorVisible bool) string {
 	contentWidth := max(m.width, 1)
 	header := m.renderHeader(contentWidth)
 	bh := m.bodyHeight()
@@ -3998,12 +3974,12 @@ func (m *Model) viewTreeMode() string {
 		b.WriteByte('\n')
 		b.WriteString(m.renderToolbarSeparator(contentWidth))
 		b.WriteByte('\n')
-		b.WriteString(m.renderRenameInput(contentWidth))
+		b.WriteString(m.renderRenameInput(contentWidth, cursorVisible))
 	} else if m.newEntryActive {
 		b.WriteByte('\n')
 		b.WriteString(m.renderToolbarSeparator(contentWidth))
 		b.WriteByte('\n')
-		b.WriteString(m.renderNewEntryInput(contentWidth))
+		b.WriteString(m.renderNewEntryInput(contentWidth, cursorVisible))
 	}
 	return b.String()
 }
@@ -4014,7 +3990,7 @@ func (m *Model) viewTreeMode() string {
 
 // viewSearchMode renders the header, search bar, divider, search results,
 // and toolbar.
-func (m *Model) viewSearchMode() string {
+func (m *Model) viewSearchMode(cursorVisible bool) string {
 	contentWidth := max(m.width, 1)
 	header := m.renderHeader(contentWidth)
 	bh := m.bodyHeight()
@@ -4027,11 +4003,11 @@ func (m *Model) viewSearchMode() string {
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteByte('\n')
-	b.WriteString(m.renderSearchBar(contentWidth))
+	b.WriteString(m.renderSearchBar(contentWidth, cursorVisible))
 	b.WriteByte('\n')
 	b.WriteString(m.renderToolbarSeparator(contentWidth))
 	b.WriteByte('\n')
-	b.WriteString(m.renderScopeLine(contentWidth))
+	b.WriteString(m.renderScopeLine(contentWidth, cursorVisible))
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchDivider(contentWidth))
 	for _, line := range bodyLines {
@@ -4053,7 +4029,7 @@ func (m *Model) viewSearchMode() string {
 
 // viewReplaceMode renders the header, search bar, replace bar, divider,
 // search results, and toolbar.
-func (m *Model) viewReplaceMode() string {
+func (m *Model) viewReplaceMode(cursorVisible bool) string {
 	contentWidth := max(m.width, 1)
 	header := m.renderHeader(contentWidth)
 	bh := m.bodyHeight()
@@ -4066,13 +4042,13 @@ func (m *Model) viewReplaceMode() string {
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteByte('\n')
-	b.WriteString(m.renderSearchBar(contentWidth))
+	b.WriteString(m.renderSearchBar(contentWidth, cursorVisible))
 	b.WriteByte('\n')
-	b.WriteString(m.renderReplaceBar(contentWidth))
+	b.WriteString(m.renderReplaceBar(contentWidth, cursorVisible))
 	b.WriteByte('\n')
 	b.WriteString(m.renderToolbarSeparator(contentWidth))
 	b.WriteByte('\n')
-	b.WriteString(m.renderScopeLine(contentWidth))
+	b.WriteString(m.renderScopeLine(contentWidth, cursorVisible))
 	b.WriteByte('\n')
 	b.WriteString(m.renderSearchDivider(contentWidth))
 	for _, line := range bodyLines {
@@ -4090,7 +4066,7 @@ func (m *Model) viewReplaceMode() string {
 
 // renderReplaceBar renders the replacement text input line with a prefix
 // and blinking cursor, matching the style of the search bar.
-func (m *Model) renderReplaceBar(contentWidth int) string {
+func (m *Model) renderReplaceBar(contentWidth int, cursorVisible bool) string {
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
@@ -4112,7 +4088,7 @@ func (m *Model) renderReplaceBar(contentWidth int) string {
 
 	// Show blinking cursor only when this input has focus.
 	cursor := " "
-	if m.searchFocus == focusReplace && m.cursorBlink {
+	if m.searchFocus == focusReplace && cursorVisible {
 		cursor = cursorStyle.Render(" ")
 	}
 
@@ -4308,7 +4284,7 @@ func (m *Model) renderDocSymbolsHint(contentWidth int) string {
 // viewTabsMode renders the open tabs list view.
 // Layout mirrors the search mode: filter input is at the top (below the
 // subtitle), with toggle badges at the bottom — both only when filtering.
-func (m *Model) viewTabsMode() string {
+func (m *Model) viewTabsMode(cursorVisible bool) string {
 	contentWidth := max(m.width, 1)
 	header := m.renderHeader(contentWidth)
 	bh := m.bodyHeight()
@@ -4325,7 +4301,7 @@ func (m *Model) viewTabsMode() string {
 		b.WriteByte('\n')
 		b.WriteString(m.renderTabsDivider(contentWidth))
 		b.WriteByte('\n')
-		b.WriteString(m.renderTabsFilterInput(contentWidth))
+		b.WriteString(m.renderTabsFilterInput(contentWidth, cursorVisible))
 	}
 	b.WriteByte('\n')
 	b.WriteString(m.renderTabsDivider(contentWidth))
@@ -4454,7 +4430,7 @@ func (m *Model) renderTabEntry(filteredIdx, contentWidth int) string {
 }
 
 // renderTabsFilterInput renders the filter input line: " / query|".
-func (m *Model) renderTabsFilterInput(contentWidth int) string {
+func (m *Model) renderTabsFilterInput(contentWidth int, cursorVisible bool) string {
 	queryStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
@@ -4474,7 +4450,7 @@ func (m *Model) renderTabsFilterInput(contentWidth int) string {
 
 	// Blinking cursor when the filter input is focused.
 	cursor := " "
-	if m.tabFocus == tabFocusFilter && m.cursorBlink {
+	if m.tabFocus == tabFocusFilter && cursorVisible {
 		cursor = cursorStyle.Render(" ")
 	}
 
@@ -4580,7 +4556,7 @@ func (m *Model) renderPopulatedSearchBody(bh, contentWidth int, emptyLine string
 
 // renderSearchBar renders the search input line with a blinking block cursor
 // that stays visible regardless of which search element has keyboard focus.
-func (m *Model) renderSearchBar(contentWidth int) string {
+func (m *Model) renderSearchBar(contentWidth int, cursorVisible bool) string {
 	queryStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
@@ -4609,7 +4585,7 @@ func (m *Model) renderSearchBar(contentWidth int) string {
 
 	// Show blinking cursor only when this input has focus.
 	cursor := " "
-	if m.searchFocus == focusQuery && m.cursorBlink {
+	if m.searchFocus == focusQuery && cursorVisible {
 		cursor = cursorStyle.Render(" ")
 	}
 
@@ -4686,7 +4662,7 @@ func (m *Model) renderSearchToolbar(contentWidth int) string {
 // renderScopeLine renders " In: <text>  [re]" with the [re] badge pinned
 // to the far right. The scope text scrolls within a fixed-width region
 // so the badge never shifts.
-func (m *Model) renderScopeLine(contentWidth int) string {
+func (m *Model) renderScopeLine(contentWidth int, cursorVisible bool) string {
 	badge := m.renderGlobBadge()
 	badgeW := lipgloss.Width(badge)
 
@@ -4696,7 +4672,7 @@ func (m *Model) renderScopeLine(contentWidth int) string {
 	const trailingSpace = 1
 	scopeRegion := max(contentWidth-leadingSpace-gapBeforeBadge-badgeW-trailingSpace, 0)
 
-	scopeStr := m.renderScopeInput(scopeRegion)
+	scopeStr := m.renderScopeInput(scopeRegion, cursorVisible)
 
 	var b strings.Builder
 	b.Grow(contentWidth)
@@ -4824,7 +4800,7 @@ func (m *Model) replaceButtonStyle(btn searchFocus) lipgloss.Style {
 
 // renderScopeInput renders the "In: " prefix plus a cursor-aware scrollable
 // text region. The cursor position determines which portion of text is visible.
-func (m *Model) renderScopeInput(availableWidth int) string {
+func (m *Model) renderScopeInput(availableWidth int, cursorVisible bool) string {
 	prefixStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
@@ -4870,7 +4846,7 @@ func (m *Model) renderScopeInput(availableWidth int) string {
 
 	// Render cursor: blinking block when focused, plain text otherwise.
 	var cursorRendered string
-	if m.searchFocus == focusScope && m.cursorBlink {
+	if m.searchFocus == focusScope && cursorVisible {
 		cursorRendered = cursorStyle.Render(cursorChar)
 	} else {
 		cursorRendered = textStyle.Render(cursorChar)
@@ -4881,7 +4857,7 @@ func (m *Model) renderScopeInput(availableWidth int) string {
 
 // renderRenameInput renders the inline rename input with a blinking cursor,
 // pre-filled with the current entry name.
-func (m *Model) renderRenameInput(contentWidth int) string {
+func (m *Model) renderRenameInput(contentWidth int, cursorVisible bool) string {
 	labelStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
@@ -4897,7 +4873,7 @@ func (m *Model) renderRenameInput(contentWidth int) string {
 	}
 
 	cursor := " "
-	if m.cursorBlink {
+	if cursorVisible {
 		cursor = cursorStyle.Render(" ")
 	}
 
@@ -4941,7 +4917,7 @@ func (m *Model) renderNewEntryHint(contentWidth int) string {
 
 // renderNewEntryInput renders the inline input line for creating a new file
 // or directory, including a label prefix and blinking cursor.
-func (m *Model) renderNewEntryInput(contentWidth int) string {
+func (m *Model) renderNewEntryInput(contentWidth int, cursorVisible bool) string {
 	labelStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	textStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
@@ -4961,7 +4937,7 @@ func (m *Model) renderNewEntryInput(contentWidth int) string {
 	}
 
 	cursor := " "
-	if m.cursorBlink {
+	if cursorVisible {
 		cursor = cursorStyle.Render(" ")
 	}
 

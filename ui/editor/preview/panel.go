@@ -20,9 +20,6 @@ import (
 
 const tabWidth = 4
 
-// blinkHalfPeriod is the duration between cursor visibility toggles.
-const blinkHalfPeriod = 530 * time.Millisecond
-
 // Panel is a read-only file viewer for the preview sub-panel.
 type Panel struct {
 	content     string
@@ -37,10 +34,8 @@ type Panel struct {
 	scrollX     int
 	width       int
 	height      int
-	focused     bool
-	cursorBlink bool
-	lastBlinkAt time.Time
-	theme       *theme.Theme
+	focused bool
+	theme   *theme.Theme
 	bounceOff   int
 	hoverPopup  *hover.Hover
 	hoverActive bool
@@ -58,7 +53,6 @@ func New(th *theme.Theme) *Panel {
 	return &Panel{
 		theme:       th,
 		highlighter: highlight.NewHighlighter(th),
-		cursorBlink: true,
 		hoverPopup:  hover.New(),
 	}
 }
@@ -71,9 +65,6 @@ func (p *Panel) ID() component.FocusID  { return component.FocusPreview }
 func (p *Panel) Focused() bool           { return p.focused }
 func (p *Panel) SetFocused(focused bool) {
 	p.focused = focused
-	if focused {
-		p.cursorBlink = true
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -92,23 +83,11 @@ func (p *Panel) Init() tea.Cmd { return nil }
 // driven by the app's centralized BlinkMsg timer.
 func (p *Panel) HandleTick(_ time.Time) {}
 
-// SetBlinkPhase sets the cursor blink phase. Returns true if changed.
-func (p *Panel) SetBlinkPhase(visible bool) bool {
-	if p.cursorBlink == visible {
-		return false
-	}
-	p.cursorBlink = visible
-	return true
-}
-
 func (p *Panel) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 	km, ok := msg.(tea.KeyMsg)
 	if !ok {
 		return p, nil
 	}
-	// Any keystroke resets cursor to visible and restarts blink cycle.
-	p.cursorBlink = true
-	p.lastBlinkAt = time.Now()
 
 	// Dismiss hover on any keystroke (movement changes viewport context).
 	p.DismissHover()
@@ -251,7 +230,7 @@ func (p *Panel) Close() { p.highlighter.Close() }
 
 // View renders the visible portion of the file with line numbers, syntax
 // highlighting, and a block cursor.
-func (p *Panel) View() string {
+func (p *Panel) View(cursorVisible bool) string {
 	if len(p.lines) == 0 {
 		return p.renderPlaceholder()
 	}
@@ -288,7 +267,7 @@ func (p *Panel) View() string {
 		styled := highlight.RenderLine(display, regions, p.theme.Syntax, defaultStyle)
 
 		// Overlay block cursor when focused and blink phase is visible.
-		if p.focused && p.cursorBlink && i == p.cursorLine {
+		if p.focused && cursorVisible && i == p.cursorLine {
 			col := p.cursorCol - p.scrollX
 			styled = overlayCursorAt(display, regions, col, p.theme.Syntax, defaultStyle, cursorBg)
 		}
@@ -374,8 +353,6 @@ func (p *Panel) SetCursorFromViewport(x, y int) {
 		p.cursorCol = bufCol
 	}
 	p.clampCursorCol()
-	p.cursorBlink = true
-	p.lastBlinkAt = time.Now()
 }
 
 // ViewportToBufferPos converts viewport-local (x, y) coordinates to a

@@ -336,6 +336,10 @@ type AppModel struct {
 	blinkGen   uint64    // Generation counter; bumped on interactive events to reset blink.
 	blinkEpoch time.Time // Wall-clock reference: cursor visible at epoch, phase derived from elapsed time.
 
+	cursorVisible     bool // Computed once per frame in View().
+	lastRenderedPhase bool // Phase at last render; drives dirty detection.
+	blinkDirty        bool // True when phase changed this frame; drives slot marking.
+
 	// One-shot LSP flush timer (fires lspDebounceInterval after last edit).
 	lspFlushGen int // editGeneration at last scheduled flush; prevents duplicates.
 
@@ -643,7 +647,7 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case msg.BlinkMsg:
 		// Blink chain self-manages via handleBlink. Phase sync and
-		// viewDirty are handled by syncBlinkPhase in View().
+		// viewDirty are handled by centralized blink logic in View().
 		return m, cmd
 	case msg.LSPFlushMsg:
 		// One-shot timer; no view change.
@@ -921,9 +925,21 @@ func (m *AppModel) View() string {
 		return ""
 	}
 
+	// Compute cursor visibility once per frame from wall clock.
+	if m.needsBlink() {
+		m.cursorVisible = m.blinkPhase()
+		if m.cursorVisible != m.lastRenderedPhase {
+			m.lastRenderedPhase = m.cursorVisible
+			m.viewDirty = true
+			m.blinkDirty = true
+		}
+	} else {
+		m.cursorVisible = true
+	}
+
 	// Full-screen overlays bypass the compositor entirely.
 	if m.overlay == overlayEditor {
-		return m.editorOverlay.View()
+		return m.editorOverlay.View(m.cursorVisible)
 	}
 	if m.overlay == overlayModal && m.modalOverlay.Active() {
 		return m.modalOverlay.View()
@@ -934,11 +950,6 @@ func (m *AppModel) View() string {
 	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
 		return m.fieldManualOverlay.View()
 	}
-
-	// Sync blink phase from wall clock before dirty detection.
-	// This ensures every render shows the correct cursor phase,
-	// regardless of timer jitter or message ordering.
-	m.syncBlinkPhase()
 
 	// Fast path: nothing dirty.
 	if !m.viewDirty && m.comp.HasCache() {
@@ -3081,7 +3092,7 @@ func (m *AppModel) codePanelView() string {
 	// Full preview mode: preview active, single editor pane with no tabs.
 	if m.hasPreview() && len(m.paneEditors) == 1 && len(m.focusedTabOrder()) == 0 {
 		bar := m.previewTabBarView()
-		content := m.previewPanel.View()
+		content := m.previewPanel.View(m.cursorVisible)
 		if bar != "" {
 			return lipgloss.JoinVertical(lipgloss.Left, bar, content)
 		}
@@ -3090,7 +3101,7 @@ func (m *AppModel) codePanelView() string {
 
 	// Single editor pane, no splits: direct render (no compositing overhead).
 	if m.paneTree.IsLeaf() {
-		content := m.focusedEditor().View()
+		content := m.focusedEditor().View(m.cursorVisible)
 		bar := m.tabBarView()
 		if bar != "" {
 			content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
@@ -3212,13 +3223,13 @@ func (m *AppModel) renderLeafPane(id pane.PaneID, r pane.Rect) string {
 
 	if id == m.previewPane {
 		bar := m.previewTabBarViewSized(r.W)
-		content := m.previewPanel.View()
+		content := m.previewPanel.View(m.cursorVisible)
 		return sizer.Render(lipgloss.JoinVertical(lipgloss.Left, bar, content))
 	}
 
 	ps := m.paneEditors[id]
 	bar := m.paneTabBarView(id, r.W)
-	content := ps.editor.ViewContent()
+	content := ps.editor.ViewContent(m.cursorVisible)
 	if bar != "" {
 		content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
 	}
@@ -3238,7 +3249,7 @@ func (m *AppModel) renderDropTargetPane(id pane.PaneID, r pane.Rect, sizer lipgl
 		return sizer.Render("")
 	}
 	bar := m.paneTabBarView(id, r.W)
-	content := ps.editor.ViewContent()
+	content := ps.editor.ViewContent(m.cursorVisible)
 	if bar != "" {
 		content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
 	}
@@ -6526,6 +6537,27 @@ func (m *AppModel) detectDirtySlots() {
 		m.comp.MarkDirty(compositor.SlotRight)
 	}
 
+	// Blink phase changed: mark the slot(s) owning the active cursor.
+	if m.blinkDirty {
+		m.blinkDirty = false
+		if m.editMode {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+		if m.focus.Current() == component.FocusInput {
+			m.comp.MarkDirty(compositor.SlotInput)
+		}
+		if m.fileTree.NeedsBlink() {
+			if m.layout.Mode() == layout.FourColumn {
+				m.comp.MarkDirty(compositor.SlotCenterLeft)
+			} else {
+				m.comp.MarkDirty(compositor.SlotLeft)
+			}
+		}
+		if m.hasPreview() && m.isPreviewFocused() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+	}
+
 	// Left panel (session+agent): no viewDirty — always mark if main dirty.
 	// The compositor avoids re-rendering unless the slot is already dirty.
 }
@@ -6552,7 +6584,7 @@ func (m *AppModel) renderDirtySlots() {
 	}
 	if m.comp.IsDirty(compositor.SlotInput) {
 		m.comp.SetSlotLines(compositor.SlotInput,
-			compositor.SplitLines(m.input.View()))
+			compositor.SplitLines(m.input.View(m.cursorVisible)))
 	}
 	if m.comp.IsDirty(compositor.SlotStatus) {
 		m.comp.SetSlotLines(compositor.SlotStatus,
@@ -6576,7 +6608,7 @@ func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
 
 // renderSlotCenterLeft renders the bordered file tree for the center-left slot.
 func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
-	return m.renderPanel(m.fileTree.View(), component.FocusFileTree, th)
+	return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 }
 
 // renderSlotCenter renders the bordered chat for the center slot.
@@ -6610,7 +6642,7 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	case component.FocusCodeViewer:
 		return m.renderCodePanelBordered(th)
 	case component.FocusFileTree:
-		content := m.overlayChordHint(m.fileTree.View(), active, th)
+		content := m.overlayChordHint(m.fileTree.View(m.cursorVisible), active, th)
 		return m.renderPanel(content, active, th)
 	default:
 		content := m.overlayChordHint(m.panelContent(active), active, th)
@@ -6622,7 +6654,7 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 // Session gets the composite left panel with border; FileTree gets a standard panel.
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
 	if id == component.FocusFileTree {
-		return m.renderPanel(m.fileTree.View(), component.FocusFileTree, th)
+		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 	}
 	return m.renderLeftPanelBordered(th)
 }
@@ -6635,7 +6667,7 @@ func (m *AppModel) panelContent(id component.FocusID) string {
 	case component.FocusCodeViewer:
 		return m.codePanelView()
 	case component.FocusFileTree:
-		return m.fileTree.View()
+		return m.fileTree.View(m.cursorVisible)
 	default:
 		return ""
 	}
@@ -7183,45 +7215,9 @@ func (m *AppModel) blinkCmd() tea.Cmd {
 	}
 }
 
-// syncBlinkPhase computes the correct cursor phase from the wall clock
-// and pushes it to all active components. Components short-circuit when
-// the phase hasn't changed, so this is O(1) in the common case.
-// Called from View() before the fast-path cache check.
-func (m *AppModel) syncBlinkPhase() {
-	if !m.needsBlink() {
-		return
-	}
-	visible := m.blinkPhase()
-	changed := false
-	if m.editMode && m.focusedEditor().Focused() {
-		if m.focusedEditor().SetBlinkPhase(visible) {
-			changed = true
-		}
-		m.focusedEditor().SetBarBlinkPhase(visible)
-	}
-	if m.focus.Current() == component.FocusInput {
-		if m.input.SetBlinkPhase(visible) {
-			changed = true
-		}
-	}
-	if m.fileTree.NeedsBlink() {
-		if m.fileTree.SetBlinkPhase(visible) {
-			changed = true
-		}
-	}
-	if m.hasPreview() && m.isPreviewFocused() {
-		if m.previewPanel.SetBlinkPhase(visible) {
-			changed = true
-		}
-	}
-	if changed {
-		m.viewDirty = true
-	}
-}
-
 // handleBlink schedules the next blink timer. Phase sync happens in
-// View() via syncBlinkPhase, which sets viewDirty only when the phase
-// actually changed — avoiding wasted renders on early/jittered timers.
+// View() via centralized blink logic, which sets viewDirty only when
+// the phase actually changed — avoiding wasted renders on early/jittered timers.
 func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
 	if blink.Gen != m.blinkGen {
 		return nil

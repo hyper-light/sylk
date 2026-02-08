@@ -467,7 +467,10 @@ func TestToSubGridHorizontalSplit(t *testing.T) {
 }
 
 func TestToSubGridNestedMixed(t *testing.T) {
-	// V(1, H(2, 3)) → [[P1, P2], [P1, P3]] via mergeColumns.
+	// V(1, H(2, 3)) → [[P1, P2], [P3]] — ragged grid. The left subtree
+	// (leaf 1) has 1 row while the right subtree (H(2,3)) has 2 rows.
+	// Row 1 contains only the right subtree's second row to avoid
+	// duplicating P1, which would break FindInGrid first-match semantics.
 	n := splitV(1, 2)
 	n.Split(2, 3, SplitHorizontal, Rect{})
 	grid := n.ToSubGrid()
@@ -479,9 +482,9 @@ func TestToSubGridNestedMixed(t *testing.T) {
 	if len(grid[0]) != 2 || grid[0][0] != PaneFocusID(1) || grid[0][1] != PaneFocusID(2) {
 		t.Fatalf("row 0: expected [P1, P2], got %v", grid[0])
 	}
-	// Row 1: [P1, P3] (P1 repeated from shorter left grid).
-	if len(grid[1]) != 2 || grid[1][0] != PaneFocusID(1) || grid[1][1] != PaneFocusID(3) {
-		t.Fatalf("row 1: expected [P1, P3], got %v", grid[1])
+	// Row 1: [P3] — ragged, only the right subtree's second row.
+	if len(grid[1]) != 1 || grid[1][0] != PaneFocusID(3) {
+		t.Fatalf("row 1: expected [P3], got %v", grid[1])
 	}
 }
 

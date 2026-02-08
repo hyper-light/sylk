@@ -43,9 +43,6 @@ const editorTabWidth = 4
 // line at the bottom of the editor viewport.
 const statusLineHeight = 1
 
-// blinkHalfPeriod is the duration between cursor visibility toggles.
-const blinkHalfPeriod = 530 * time.Millisecond
-
 // Model is the root editor component. It composes the piece-table buffer,
 // vim-mode handling, syntax highlighting, and status line into a single
 // full-screen overlay.
@@ -125,12 +122,9 @@ type Model struct {
 	replaceBar    *replacebar.ReplaceBar
 	replaceActive bool
 
-	// Focus and cursor blink.
-	focused     bool
-	cursorBlink bool      // current blink phase (true = visible)
-	lastBlinkAt time.Time // timestamp of the last blink toggle
-	barBlink    bool      // blink phase for find/replace bars
-	theme       *theme.Theme
+	// Focus state.
+	focused bool
+	theme   *theme.Theme
 
 	// View cache: avoids re-rendering all visible lines when only
 	// the cursor blink state changed.
@@ -147,6 +141,7 @@ type viewCache struct {
 	cursorRenderIdx int      // Index in lines[] of the cursor line.
 	valid           bool     // False when structural state changed.
 	cursorOK        bool     // False when only cursor blink changed.
+	lastPhase       bool     // Cursor phase at last render; invalidates cursorOK on change.
 
 	// Post-processing cache: stores the final ViewContent body output
 	// (after fitLine, applyBounceShift, overlayPopups, join).
@@ -201,9 +196,6 @@ func New(th *theme.Theme) *Model {
 		sigHelp:          signature.New(),
 		completionEngine: completion.NewEngine(registry),
 		lspSource:        lspSrc,
-		cursorBlink:      true,
-		barBlink:         true,
-		lastBlinkAt:      time.Now(),
 		theme:            th,
 	}
 }
@@ -263,16 +255,22 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 }
 
 // View renders the editor viewport and status line.
-func (m *Model) View() string {
-	return m.ViewContent() + "\n" + m.StatusLineView(m.width)
+func (m *Model) View(cursorVisible bool) string {
+	return m.ViewContent(cursorVisible) + "\n" + m.StatusLineView(m.width)
 }
 
 // ViewContent renders the editor viewport (find/replace bar + code lines)
 // without the status line. Used by the split preview layout so the status
 // line can be rendered at full width below the split.
-func (m *Model) ViewContent() string {
+func (m *Model) ViewContent(cursorVisible bool) string {
 	if m.filePath == "" {
 		return m.renderPlaceholder()
+	}
+
+	// Invalidate cursor cache when blink phase changes.
+	if cursorVisible != m.vc.lastPhase {
+		m.vc.cursorOK = false
+		m.vc.lastPhase = cursorVisible
 	}
 
 	viewHeight := m.viewportHeight()
@@ -281,11 +279,11 @@ func (m *Model) ViewContent() string {
 	barStr := ""
 	barH := 0
 	if m.replaceActive && m.replaceBar != nil {
-		barStr = m.replaceBar.View(m.width, m.theme, m.barBlink)
+		barStr = m.replaceBar.View(m.width, m.theme, cursorVisible)
 		barH = m.replaceBar.Height()
 		viewHeight -= barH
 	} else if m.findActive && m.findBar != nil {
-		barStr = m.findBar.View(m.width, m.theme, m.barBlink)
+		barStr = m.findBar.View(m.width, m.theme, cursorVisible)
 		barH = m.findBar.Height()
 		viewHeight -= barH
 	}
@@ -305,7 +303,7 @@ func (m *Model) ViewContent() string {
 
 	if !m.vc.valid || scrollChanged || m.vc.viewHeight != viewHeight {
 		// Full re-render: structure, scroll, or size changed.
-		m.vc.lines = m.renderVisibleLines(viewHeight)
+		m.vc.lines = m.renderVisibleLines(viewHeight, cursorVisible)
 		m.vc.viewHeight = viewHeight
 		m.vc.scrollOffset = m.scrollOffset
 		m.vc.scrollLeftCol = m.scrollLeftCol
@@ -317,7 +315,7 @@ func (m *Model) ViewContent() string {
 		m.vc.cursorWidthOK = false // Invalidate cached cursor line width.
 	} else if !m.vc.cursorOK {
 		// Cursor-only patch: re-render just the cursor line.
-		m.patchCursorLine()
+		m.patchCursorLine(cursorVisible)
 		m.vc.cursorOK = true
 
 		// Fast path: if post cache is valid and bounce unchanged, splice
@@ -422,13 +420,14 @@ func (m *Model) findCursorRenderIdx() int {
 // patchCursorLine re-renders only the cursor line in the view cache.
 // Uses buildPatchCtx to avoid splitting the full buffer — only the cursor
 // line content is materialized via LineIndex + PieceTable.Substring.
-func (m *Model) patchCursorLine() {
+func (m *Model) patchCursorLine(cursorVisible bool) {
 	ri := m.vc.cursorRenderIdx
 	if ri < 0 || ri >= len(m.vc.lines) {
 		m.vc.valid = false // Safety: fall back to full re-render.
 		return
 	}
 	ctx := m.buildPatchCtx()
+	ctx.cursorVisible = cursorVisible
 	if m.state.CursorLine >= ctx.totalLines {
 		m.vc.valid = false
 		return
@@ -478,9 +477,6 @@ func (m *Model) SetFocused(focused bool) {
 		m.currentMode = mode.ModeNormal
 	}
 	m.focused = focused
-	if focused {
-		m.cursorBlink = true // Start with cursor visible on focus gain.
-	}
 	m.invalidateView()
 }
 
@@ -2580,33 +2576,8 @@ func handleTickMsg(m *Model, _ tea.Msg) (component.Component, tea.Cmd) {
 // ViewDirty reports whether View() would produce new output.
 func (m *Model) ViewDirty() bool { return !m.vc.valid || !m.vc.cursorOK }
 
-// SetBlinkPhase sets the cursor blink phase to the given value and marks the
-// cursor line for re-rendering if the phase changed. Returns true if the
-// phase actually changed.
-func (m *Model) SetBlinkPhase(visible bool) bool {
-	if m.cursorBlink == visible {
-		return false
-	}
-	m.cursorBlink = visible
-	m.vc.cursorOK = false
-	return true
-}
-
-// SetBarBlinkPhase sets the blink phase for the find/replace bars.
-// Safe to call even when bars are inactive.
-func (m *Model) SetBarBlinkPhase(visible bool) {
-	if m.findActive || m.replaceActive {
-		m.barBlink = visible
-	}
-}
-
 func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 	key := incoming.(tea.KeyMsg)
-
-	// Any keystroke resets cursor to visible and restarts blink cycle.
-	m.cursorBlink = true
-	m.barBlink = true
-	m.lastBlinkAt = time.Now()
 
 	// Hover interaction: scroll with j/k, go-to-definition with Enter,
 	// dismiss with Esc or any other key.
@@ -2929,6 +2900,7 @@ type renderLineCtx struct {
 	selStartCol  int
 	selEndLine   int
 	selEndCol    int
+	cursorVisible bool // Current blink phase (true = cursor shown).
 }
 
 // buildRenderCtx computes the shared rendering context once per pass.
@@ -3053,14 +3025,14 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, sc, ec, ulRanges)
 	case len(findSpans) > 0:
 		curCol := -1
-		if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
+		if !m.overlayActive() && i == m.state.CursorLine && m.focused && ctx.cursorVisible {
 			curCol = safeMapCol(colMap, m.state.CursorCol) - vs
 		}
 		return m.renderFindMatchLine(
 			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, findSpans, curCol, ulRanges)
 	case len(jumpSpans) > 0:
 		curCol := -1
-		if !m.overlayActive() && i == m.state.CursorLine && m.focused && m.cursorBlink {
+		if !m.overlayActive() && i == m.state.CursorLine && m.focused && ctx.cursorVisible {
 			curCol = safeMapCol(colMap, m.state.CursorCol) - vs
 		}
 		return m.renderHighlightLine(
@@ -3068,7 +3040,7 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 	case !m.overlayActive() && i == m.state.CursorLine && m.focused:
 		displayCol := safeMapCol(colMap, m.state.CursorCol) - vs
 		curCol := -1
-		if m.cursorBlink {
+		if ctx.cursorVisible {
 			curCol = displayCol
 		}
 		if len(hlSpans) > 0 {
@@ -3108,8 +3080,9 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 	}
 }
 
-func (m *Model) renderVisibleLines(viewHeight int) []string {
+func (m *Model) renderVisibleLines(viewHeight int, cursorVisible bool) []string {
 	ctx := m.buildRenderCtx()
+	ctx.cursorVisible = cursorVisible
 
 	// Track rendered lines (code + virtual text) against viewHeight.
 	result := make([]string, 0, viewHeight)

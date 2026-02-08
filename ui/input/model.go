@@ -2,7 +2,6 @@ package input
 
 import (
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,10 +16,6 @@ import (
 // Derived from: 3 lines of user input before the box scrolls internally.
 const defaultMaxHeight = 3
 
-// blinkInterval is the cursor blink period.
-// Derived from: standard terminal cursor blink rate (~530ms).
-const blinkInterval = 530 * time.Millisecond
-
 // Model is the prompt input component.
 type Model struct {
 	lines     [][]rune // Content as lines of runes
@@ -31,10 +26,6 @@ type Model struct {
 
 	// Selection state.
 	allSelected bool // Ctrl+A select-all active.
-
-	// Cursor blink state
-	cursorVisible bool
-	lastBlinkAt   time.Time
 
 	history   *InputHistory
 	completer *Completer
@@ -51,8 +42,9 @@ type Model struct {
 	lineStyler func(text string) (styled string, hint string)
 
 	// View cache: avoids re-rendering when no visible state changed.
-	viewCache string
-	viewDirty bool
+	viewCache      string
+	viewDirty      bool
+	lastBlinkPhase bool // Blink phase at last render; invalidates viewCache on change.
 }
 
 // Compile-time interface checks.
@@ -64,11 +56,9 @@ var (
 // New creates a Model with the given theme, history capacity, and completion providers.
 func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) *Model {
 	return &Model{
-		lines:         [][]rune{nil},
-		maxHeight:     defaultMaxHeight,
-		cursorVisible: true,
-		lastBlinkAt:   time.Now(),
-		history:       NewInputHistory(historyCapacity),
+		lines:     [][]rune{nil},
+		maxHeight: defaultMaxHeight,
+		history:   NewInputHistory(historyCapacity),
 		completer:     NewCompleter(providers...),
 		theme:         th,
 		placeholder:   "Type a message...",
@@ -153,9 +143,6 @@ func (m *Model) Update(raw tea.Msg) (component.Component, tea.Cmd) {
 	case tea.KeyMsg:
 		m.viewDirty = true
 		return m.handleKey(typed)
-	case msg.TickMsg:
-		m.advanceBlink(typed.Time)
-		return m, nil
 	default:
 		return m, nil
 	}
@@ -165,14 +152,18 @@ func (m *Model) Update(raw tea.Msg) (component.Component, tea.Cmd) {
 // ViewDirty reports whether View() would produce new output.
 func (m *Model) ViewDirty() bool { return m.viewDirty }
 
-func (m *Model) View() string {
+func (m *Model) View(cursorVisible bool) string {
+	if cursorVisible != m.lastBlinkPhase {
+		m.viewDirty = true
+		m.lastBlinkPhase = cursorVisible
+	}
 	if !m.viewDirty && m.viewCache != "" {
 		return m.viewCache
 	}
 
 	style := m.borderStyle()
 
-	body := m.renderBody()
+	body := m.renderBody(cursorVisible)
 	popup := m.completer.View(m.contentWidth())
 
 	if popup != "" {
@@ -203,13 +194,10 @@ func (m *Model) ID() component.FocusID { return component.FocusInput }
 // Focused reports whether this component currently has focus.
 func (m *Model) Focused() bool { return m.focused }
 
-// SetFocused sets the focus state, resetting the cursor blink on focus gain.
+// SetFocused sets the focus state.
 func (m *Model) SetFocused(focused bool) {
 	m.focused = focused
 	m.viewDirty = true
-	if focused {
-		m.resetBlink()
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -226,34 +214,6 @@ func (m *Model) SetSize(width, height int) {
 // LineCount returns the number of content lines currently in the input.
 func (m *Model) LineCount() int {
 	return len(m.lines)
-}
-
-// ---------------------------------------------------------------------------
-// Cursor blink
-// ---------------------------------------------------------------------------
-
-// advanceBlink toggles cursor visibility when the blink interval has elapsed.
-func (m *Model) advanceBlink(now time.Time) {
-	// Cursor blink is now driven by BlinkMsg, not the tick chain.
-	// Retained as no-op for interface compatibility.
-	_ = now
-}
-
-// SetBlinkPhase sets the cursor blink phase. Only marks dirty on change.
-// Returns true if the phase actually changed.
-func (m *Model) SetBlinkPhase(visible bool) bool {
-	if m.cursorVisible == visible {
-		return false
-	}
-	m.cursorVisible = visible
-	m.viewDirty = true
-	return true
-}
-
-// resetBlink makes the cursor visible and resets the blink timer.
-func (m *Model) resetBlink() {
-	m.cursorVisible = true
-	m.lastBlinkAt = time.Now()
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +256,6 @@ var normalKeys = []keyEntry{
 
 // handleKey dispatches a key message through the appropriate table.
 func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
-	m.resetBlink()
-
 	// Bracketed paste: replace selection if active, then insert.
 	if k.Paste && len(k.Runes) > 0 {
 		m.clearSelectionContent()
@@ -680,7 +638,7 @@ func (m *Model) contentWidth() int {
 }
 
 // renderBody renders the visible lines with cursor and placeholder.
-func (m *Model) renderBody() string {
+func (m *Model) renderBody(cursorVisible bool) string {
 	if m.isEmpty() && !m.focused {
 		return m.theme.Placeholder.Render(m.placeholder)
 	}
@@ -691,7 +649,7 @@ func (m *Model) renderBody() string {
 	var b strings.Builder
 	for i, line := range visible {
 		absRow := m.scrollOff + i
-		rendered := m.renderLine(line, absRow)
+		rendered := m.renderLine(line, absRow, cursorVisible)
 		b.WriteString(rendered)
 		if i < len(visible)-1 {
 			b.WriteByte('\n')
@@ -701,13 +659,13 @@ func (m *Model) renderBody() string {
 }
 
 // renderLine renders a single line, highlighting @agent prefix and showing the cursor.
-func (m *Model) renderLine(line []rune, absRow int) string {
+func (m *Model) renderLine(line []rune, absRow int, cursorVisible bool) string {
 	lineStr := string(line)
 	needsCursor := m.focused && absRow == m.cursorRow
 
 	// Apply custom line styler or default @agent highlighting on line 0.
 	if absRow == 0 && m.lineStyler != nil {
-		return m.renderStyledLine(line, needsCursor)
+		return m.renderStyledLine(line, needsCursor, cursorVisible)
 	}
 	if absRow == 0 {
 		lineStr = m.highlightAgentPrefix(lineStr)
@@ -716,15 +674,15 @@ func (m *Model) renderLine(line []rune, absRow int) string {
 	if !needsCursor {
 		return lineStr
 	}
-	return m.renderCursor(line, lineStr)
+	return m.renderCursor(line, lineStr, cursorVisible)
 }
 
 // renderStyledLine applies the lineStyler and appends any hint text.
-func (m *Model) renderStyledLine(line []rune, needsCursor bool) string {
+func (m *Model) renderStyledLine(line []rune, needsCursor bool, cursorVisible bool) string {
 	hintStyle := m.theme.Placeholder
 
 	if needsCursor {
-		styled, hint := m.renderStyledCursor(line, m.lineStyler)
+		styled, hint := m.renderStyledCursor(line, m.lineStyler, cursorVisible)
 		if hint != "" {
 			return styled + hintStyle.Render(" "+hint)
 		}
@@ -740,12 +698,12 @@ func (m *Model) renderStyledLine(line []rune, needsCursor bool) string {
 // renderStyledCursor combines a line styler with cursor rendering by
 // applying the style to segments before and after the cursor separately.
 // Returns the rendered text and any hint from the styler.
-func (m *Model) renderStyledCursor(line []rune, styler func(string) (string, string)) (string, string) {
+func (m *Model) renderStyledCursor(line []rune, styler func(string) (string, string), cursorVisible bool) (string, string) {
 	// Use the full text to get the hint (styler may vary hint by content).
 	_, hint := styler(string(line))
 	textStyler := func(s string) string { r, _ := styler(s); return r }
 
-	if !m.cursorVisible {
+	if !cursorVisible {
 		return textStyler(string(line)), hint
 	}
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
@@ -761,8 +719,8 @@ func (m *Model) renderStyledCursor(line []rune, styler func(string) (string, str
 // renderCursor inserts a visible block cursor at the cursor position.
 // When the cursor is in the invisible phase of its blink, the text
 // renders without the reverse-video highlight.
-func (m *Model) renderCursor(line []rune, lineStr string) string {
-	if !m.cursorVisible {
+func (m *Model) renderCursor(line []rune, lineStr string, cursorVisible bool) string {
+	if !cursorVisible {
 		return lineStr
 	}
 	cursorStyle := lipgloss.NewStyle().Reverse(true)

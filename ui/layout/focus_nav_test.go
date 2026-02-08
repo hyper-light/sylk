@@ -457,6 +457,66 @@ func TestNavigate_FourColumnLayout(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Navigate — ragged code panel (preview + horizontal editor split)
+// ---------------------------------------------------------------------------
+
+func TestNavigate_RaggedCodePanel(t *testing.T) {
+	// Mimics FourColumn where the code panel has a preview (E) alongside a
+	// horizontal editor split (F over G). The pane tree produces:
+	//   V(preview, H(editor1, editor2)) → [[E, F], [G]]  (ragged)
+	//
+	// Row 0: [Left([A],[B]), FileTree(C), Chat(D), Code([E,F],[G])]
+	// Row 1: [Input(H)]
+	grid := [][]PanelGroup{
+		{
+			pgSubs([]component.FocusID{idA}, []component.FocusID{idB}),
+			pg(idC),
+			pg(idD),
+			pgSubs([]component.FocusID{idE, idF}, []component.FocusID{idG}),
+		},
+		{pg(idH)},
+	}
+
+	tests := []struct {
+		from component.FocusID
+		dir  Direction
+		want component.FocusID
+		desc string
+	}{
+		// Right: full cycle visits all panes including ragged sub-row
+		{idD, DirRight, idE, "Chat→Preview"},
+		{idE, DirRight, idF, "Preview→Editor1"},
+		{idF, DirRight, idG, "Editor1→Editor2 (sub-row wrap)"},
+		{idG, DirRight, idH, "Editor2→Input (exit code panel)"},
+		{idH, DirRight, idA, "Input→Sessions (wrap)"},
+
+		// Left: reverse cycle
+		{idH, DirLeft, idG, "Input→Editor2"},
+		{idG, DirLeft, idF, "Editor2→Editor1 (sub-row wrap)"},
+		{idF, DirLeft, idE, "Editor1→Preview"},
+		{idE, DirLeft, idD, "Preview→Chat (exit code panel)"},
+
+		// Down within code panel
+		{idE, DirDown, idG, "Preview↓Editor2"},
+		{idF, DirDown, idG, "Editor1↓Editor2"},
+		{idG, DirDown, idH, "Editor2↓Input (exit)"},
+
+		// Up within code panel
+		{idG, DirUp, idE, "Editor2↑Preview"},
+		{idF, DirUp, idH, "Editor1↑Input (exit wrap)"},
+		{idE, DirUp, idH, "Preview↑Input (exit wrap)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			got := navFrom(t, grid, tt.from, tt.dir)
+			if got != tt.want {
+				t.Errorf("got %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Navigate — SingleColumn with sub-rows only
 // ---------------------------------------------------------------------------
 
