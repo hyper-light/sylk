@@ -29,6 +29,7 @@ import (
 	"github.com/adalundhe/sylk/ui/chat"
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/component"
+	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/editor"
 	"github.com/adalundhe/sylk/ui/editor/mode"
 	"github.com/adalundhe/sylk/ui/editor/preview"
@@ -332,9 +333,18 @@ type AppModel struct {
 	// One-shot LSP flush timer (fires lspDebounceInterval after last edit).
 	lspFlushGen int // editGeneration at last scheduled flush; prevents duplicates.
 
-	// App-level view cache: skips the full View() cascade when nothing changed.
-	viewCache string
+	// Frame compositor: line-level cached composition.
+	comp      compositor.Compositor
 	viewDirty bool
+
+	// Compositor dirty-detection state.
+	prevFocusGrp  compositor.SlotID // Border group of previous focus.
+	prevOverlay   overlayState      // Detect overlay transitions.
+	prevEditMode  bool              // Detect edit mode transitions.
+	prevChord     chordState        // Detect chord hint changes.
+	prevLeftRing  int               // Detect left ring cycling.
+	prevRightRing int               // Detect right ring cycling.
+	prevInputH    int               // Detect input height changes.
 
 	// Mouse hover tracking for LSP hover tooltips.
 	hoverMouseLine      int  // last buffer line the mouse was over (-1 = none)
@@ -525,6 +535,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		previewTabHoverClose: -1,
 	}
 
+	app.comp = compositor.New()
 	app.previewPanel = preview.New(th)
 	app.paneCounter = 1
 	app.focusedPane = 1
@@ -891,48 +902,35 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// View renders the complete TUI layout.
+// View renders the complete TUI layout using the frame compositor.
 func (m *AppModel) View() string {
 	if !m.ready {
 		return ""
 	}
-	if !m.viewDirty && m.viewCache != "" {
-		return m.viewCache
-	}
 
-	// Full-screen overlay takes over everything.
+	// Full-screen overlays bypass the compositor entirely.
 	if m.overlay == overlayEditor {
-		m.viewCache = m.editorOverlay.View()
-		m.viewDirty = false
-		return m.viewCache
+		return m.editorOverlay.View()
 	}
-
-	// Base layout.
-	main := m.renderMainArea()
-	inputView := m.input.View()
-	statusView := m.statusBar.View()
-	base := lipgloss.JoinVertical(lipgloss.Left, main, inputView, statusView)
-
-	// Partial overlays render on top of the base.
 	if m.overlay == overlayModal && m.modalOverlay.Active() {
-		m.viewCache = m.modalOverlay.View()
-		m.viewDirty = false
-		return m.viewCache
+		return m.modalOverlay.View()
 	}
 	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
-		m.viewCache = m.searchOverlay.View()
-		m.viewDirty = false
-		return m.viewCache
+		return m.searchOverlay.View()
 	}
 	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
-		m.viewCache = m.fieldManualOverlay.View()
-		m.viewDirty = false
-		return m.viewCache
+		return m.fieldManualOverlay.View()
 	}
 
-	m.viewCache = base
+	// Fast path: nothing dirty.
+	if !m.viewDirty && m.comp.HasCache() {
+		return m.comp.CachedFrame()
+	}
+
+	m.detectDirtySlots()
+	m.renderDirtySlots()
 	m.viewDirty = false
-	return m.viewCache
+	return m.comp.Compose()
 }
 
 // Shutdown gracefully stops all bridges and waits for goroutine cleanup.
@@ -6103,6 +6101,10 @@ func (m *AppModel) recalcLayout() {
 	m.modalOverlay.SetSize(m.width, m.height)
 	m.searchOverlay.SetSize(m.width, m.height)
 	m.fieldManualOverlay.SetSize(m.width, m.height)
+
+	// Compositor: rebuild frame structure (full invalidation).
+	m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
+	m.prevInputH = inputH
 }
 
 // resizeCodePanelForPreview computes sizes for all panes within the code
@@ -6347,6 +6349,219 @@ func (m *AppModel) buildRingHint() string {
 
 	parts = append(parts, dimStyle.Render("\u25b6"))
 	return strings.Join(parts, " ")
+}
+
+// compositorColumns returns the slot IDs for the current layout mode's columns.
+func (m *AppModel) compositorColumns() []compositor.SlotID {
+	switch m.layout.Mode() {
+	case layout.FourColumn:
+		return []compositor.SlotID{
+			compositor.SlotLeft, compositor.SlotCenterLeft,
+			compositor.SlotCenter, compositor.SlotRight,
+		}
+	case layout.ThreeColumn:
+		return []compositor.SlotID{
+			compositor.SlotLeft, compositor.SlotCenter, compositor.SlotRight,
+		}
+	case layout.TwoColumn:
+		return []compositor.SlotID{compositor.SlotLeft, compositor.SlotRight}
+	default:
+		return []compositor.SlotID{compositor.SlotLeft}
+	}
+}
+
+// focusBorderGroup maps the current focus to the compositor slot whose
+// border would change color on focus transitions.
+func (m *AppModel) focusBorderGroup() compositor.SlotID {
+	fid := m.focus.Current()
+	switch fid {
+	case component.FocusSessionPanel, component.FocusAgentPanel:
+		return compositor.SlotLeft
+	case component.FocusFileTree:
+		if m.layout.Mode() == layout.FourColumn {
+			return compositor.SlotCenterLeft
+		}
+		return compositor.SlotLeft
+	case component.FocusChat:
+		return compositor.SlotCenter
+	case component.FocusCodeViewer:
+		return compositor.SlotRight
+	case component.FocusInput:
+		return compositor.SlotInput
+	default:
+		if pane.IsPaneFocus(fid) {
+			return compositor.SlotRight
+		}
+		return compositor.SlotCenter
+	}
+}
+
+// detectDirtySlots checks component dirty state and state transitions,
+// marking the appropriate compositor slots for re-rendering.
+func (m *AppModel) detectDirtySlots() {
+	// Overlay transitions: full invalidation.
+	if m.overlay != m.prevOverlay {
+		m.comp.InvalidateAll()
+		m.prevOverlay = m.overlay
+		return
+	}
+
+	// Edit mode transitions: code panel changes completely.
+	if m.editMode != m.prevEditMode {
+		m.comp.InvalidateAll()
+		m.prevEditMode = m.editMode
+		return
+	}
+
+	// Input height change: requires full recomposition.
+	inputH := m.inputHeight()
+	if inputH != m.prevInputH {
+		mainHeight := m.height - inputH - statusBarHeight
+		mainHeight = max(mainHeight, 1)
+		m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
+		m.prevInputH = inputH
+		return
+	}
+
+	// Focus border group change: mark old + new groups dirty.
+	curGrp := m.focusBorderGroup()
+	if curGrp != m.prevFocusGrp {
+		m.comp.MarkDirty(m.prevFocusGrp)
+		m.comp.MarkDirty(curGrp)
+		m.prevFocusGrp = curGrp
+	}
+
+	// Chord state change: mark affected slot dirty.
+	if m.chord != m.prevChord {
+		m.comp.MarkDirty(compositor.SlotCenter)
+		m.prevChord = m.chord
+	}
+
+	// Ring cycling: mark affected slot dirty.
+	if m.leftRing.index != m.prevLeftRing {
+		m.comp.MarkDirty(compositor.SlotLeft)
+		m.prevLeftRing = m.leftRing.index
+	}
+	if m.rightRing.index != m.prevRightRing {
+		m.comp.MarkDirty(compositor.SlotRight)
+		m.prevRightRing = m.rightRing.index
+	}
+
+	// Component dirty checks.
+	if m.chat.ViewDirty() {
+		m.comp.MarkDirty(compositor.SlotCenter)
+	}
+	if m.fileTree.ViewDirty() {
+		if m.layout.Mode() == layout.FourColumn {
+			m.comp.MarkDirty(compositor.SlotCenterLeft)
+		} else {
+			m.comp.MarkDirty(compositor.SlotLeft)
+		}
+	}
+	if m.input.ViewDirty() {
+		m.comp.MarkDirty(compositor.SlotInput)
+	}
+	if m.statusBar.ViewDirty() {
+		m.comp.MarkDirty(compositor.SlotStatus)
+	}
+
+	// Editor dirty check.
+	if m.editMode {
+		if ps := m.paneEditors[m.focusedPane]; ps != nil && ps.editor.ViewDirty() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+	}
+
+	// Left panel (session+agent): no viewDirty — always mark if main dirty.
+	// The compositor avoids re-rendering unless the slot is already dirty.
+}
+
+// renderDirtySlots re-renders only the compositor slots that are dirty.
+func (m *AppModel) renderDirtySlots() {
+	th := m.config.Theme()
+
+	if m.comp.IsDirty(compositor.SlotLeft) {
+		m.comp.SetSlotLines(compositor.SlotLeft,
+			compositor.SplitLines(m.renderSlotLeft(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotCenterLeft) {
+		m.comp.SetSlotLines(compositor.SlotCenterLeft,
+			compositor.SplitLines(m.renderSlotCenterLeft(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotCenter) {
+		m.comp.SetSlotLines(compositor.SlotCenter,
+			compositor.SplitLines(m.renderSlotCenter(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotRight) {
+		m.comp.SetSlotLines(compositor.SlotRight,
+			compositor.SplitLines(m.renderSlotRight(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotInput) {
+		m.comp.SetSlotLines(compositor.SlotInput,
+			compositor.SplitLines(m.input.View()))
+	}
+	if m.comp.IsDirty(compositor.SlotStatus) {
+		m.comp.SetSlotLines(compositor.SlotStatus,
+			compositor.SplitLines(m.statusBar.View()))
+	}
+}
+
+// renderSlotLeft renders the bordered content for the left column slot.
+// In FourColumn mode this is always the session+agent panel. In collapsed
+// modes the left ring determines which panel occupies this slot.
+func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
+	switch m.layout.Mode() {
+	case layout.FourColumn:
+		return m.renderLeftPanelBordered(th)
+	case layout.SingleColumn:
+		return m.renderSingleColumnSlot(th)
+	default:
+		return m.renderLeftSlot(m.leftRing.current(), th)
+	}
+}
+
+// renderSlotCenterLeft renders the bordered file tree for the center-left slot.
+func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
+	return m.renderPanel(m.fileTree.View(), component.FocusFileTree, th)
+}
+
+// renderSlotCenter renders the bordered chat for the center slot.
+func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
+	return m.renderPanel(
+		m.overlayChordHint(m.chat.View(), component.FocusChat, th),
+		component.FocusChat, th)
+}
+
+// renderSlotRight renders the bordered code panel for the right slot.
+// In TwoColumn mode the right ring may show chat instead of code.
+func (m *AppModel) renderSlotRight(th *theme.Theme) string {
+	if m.layout.Mode() == layout.TwoColumn {
+		right := m.rightRing.current()
+		if right == component.FocusCodeViewer {
+			return m.renderCodePanelBordered(th)
+		}
+		content := m.overlayChordHint(m.panelContent(right), right, th)
+		return m.renderPanel(content, right, th)
+	}
+	return m.renderCodePanelBordered(th)
+}
+
+// renderSingleColumnSlot renders the single visible panel in SingleColumn mode.
+func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
+	active := m.leftRing.current()
+	switch active {
+	case component.FocusSessionPanel:
+		content := m.overlayChordHint(m.renderLeftPanel(th), active, th)
+		return m.borderLeftPanel(content, th)
+	case component.FocusCodeViewer:
+		return m.renderCodePanelBordered(th)
+	case component.FocusFileTree:
+		content := m.overlayChordHint(m.fileTree.View(), active, th)
+		return m.renderPanel(content, active, th)
+	default:
+		content := m.overlayChordHint(m.panelContent(active), active, th)
+		return m.renderPanel(content, active, th)
+	}
 }
 
 func (m *AppModel) renderMainArea() string {

@@ -162,6 +162,9 @@ func (m *Model) Update(raw tea.Msg) (component.Component, tea.Cmd) {
 }
 
 // View renders the input area.
+// ViewDirty reports whether View() would produce new output.
+func (m *Model) ViewDirty() bool { return m.viewDirty }
+
 func (m *Model) View() string {
 	if !m.viewDirty && m.viewCache != "" {
 		return m.viewCache
@@ -240,16 +243,6 @@ func (m *Model) advanceBlink(now time.Time) {
 // blink timer.
 func (m *Model) ToggleBlink() {
 	m.cursorVisible = !m.cursorVisible
-	m.viewDirty = true
-}
-
-// SetBlinkVisible ensures the cursor is steady-visible (not in the "off"
-// phase of a blink cycle). Called when idle timeout stops the blink chain.
-func (m *Model) SetBlinkVisible() {
-	if m.cursorVisible {
-		return
-	}
-	m.cursorVisible = true
 	m.viewDirty = true
 }
 

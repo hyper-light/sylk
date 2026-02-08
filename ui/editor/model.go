@@ -2493,20 +2493,13 @@ func handleTickMsg(m *Model, _ tea.Msg) (component.Component, tea.Cmd) {
 	return m, nil
 }
 
+// ViewDirty reports whether View() would produce new output.
+func (m *Model) ViewDirty() bool { return !m.vc.valid || !m.vc.cursorOK }
+
 // ToggleBlink flips the cursor blink phase and marks the cursor line
 // for re-rendering. Called by the app's centralized blink timer.
 func (m *Model) ToggleBlink() {
 	m.cursorBlink = !m.cursorBlink
-	m.vc.cursorOK = false
-}
-
-// SetBlinkVisible ensures the cursor is steady-visible (not in the "off"
-// phase of a blink cycle). Called when idle timeout stops the blink chain.
-func (m *Model) SetBlinkVisible() {
-	if m.cursorBlink {
-		return // Already visible (cursorBlink true = cursor shown).
-	}
-	m.cursorBlink = true
 	m.vc.cursorOK = false
 }
 

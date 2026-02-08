@@ -59,6 +59,9 @@ type Model struct {
 	viewDirty bool
 }
 
+// ViewDirty reports whether View() would produce new output.
+func (m *Model) ViewDirty() bool { return m.viewDirty }
+
 // New creates a status bar Model bound to the given theme and session manager.
 func New(t *theme.Theme, mgr *session.Manager) *Model {
 	return &Model{

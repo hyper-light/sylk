@@ -98,11 +98,6 @@ func (p *Panel) ToggleBlink() {
 	p.cursorBlink = !p.cursorBlink
 }
 
-// SetBlinkVisible ensures the cursor is steady-visible.
-func (p *Panel) SetBlinkVisible() {
-	p.cursorBlink = true
-}
-
 func (p *Panel) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 	km, ok := msg.(tea.KeyMsg)
 	if !ok {

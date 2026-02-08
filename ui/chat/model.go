@@ -100,6 +100,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 }
 
 // View renders the chat viewport.
+// ViewDirty reports whether View() would produce new output.
+func (m *Model) ViewDirty() bool { return m.viewDirty }
+
 func (m *Model) View() string {
 	if !m.viewDirty && m.viewCache != "" {
 		return m.viewCache

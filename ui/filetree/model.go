@@ -689,6 +689,9 @@ func searchWatchCmd(worker *SearchWorker) tea.Cmd {
 }
 
 // View dispatches to the active view mode.
+// ViewDirty reports whether View() would produce new output.
+func (m *Model) ViewDirty() bool { return m.viewDirty }
+
 func (m *Model) View() string {
 	if !m.viewDirty && m.viewCache != "" {
 		return m.viewCache
@@ -744,16 +747,6 @@ func (m *Model) SetFocused(focused bool) {
 // blink timer.
 func (m *Model) ToggleBlink() {
 	m.cursorBlink = !m.cursorBlink
-	m.viewDirty = true
-}
-
-// SetBlinkVisible ensures the cursor is steady-visible (not in the "off"
-// phase of a blink cycle). Called when idle timeout stops the blink chain.
-func (m *Model) SetBlinkVisible() {
-	if m.cursorBlink {
-		return
-	}
-	m.cursorBlink = true
 	m.viewDirty = true
 }
 
