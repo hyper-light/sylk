@@ -6564,60 +6564,6 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	}
 }
 
-func (m *AppModel) renderMainArea() string {
-	layoutMode := m.layout.Mode()
-	th := m.config.Theme()
-
-	switch layoutMode {
-	case layout.FourColumn:
-		leftView := m.renderLeftPanelBordered(th)
-		treeView := m.renderPanel(m.fileTree.View(), component.FocusFileTree, th)
-		chatView := m.renderPanel(
-			m.overlayChordHint(m.chat.View(), component.FocusChat, th),
-			component.FocusChat, th)
-		codeView := m.renderCodePanelBordered(th)
-		return m.layout.RenderColumns(leftView, treeView, chatView, codeView)
-
-	case layout.ThreeColumn:
-		left := m.leftRing.current()
-		leftView := m.renderLeftSlot(left, th)
-		chatView := m.renderPanel(
-			m.overlayChordHint(m.chat.View(), component.FocusChat, th),
-			component.FocusChat, th)
-		codeView := m.renderCodePanelBordered(th)
-		return m.layout.RenderColumns(leftView, chatView, codeView)
-
-	case layout.TwoColumn:
-		left := m.leftRing.current()
-		right := m.rightRing.current()
-		leftView := m.renderLeftSlot(left, th)
-		var rightView string
-		if right == component.FocusCodeViewer {
-			rightView = m.renderCodePanelBordered(th)
-		} else {
-			content := m.overlayChordHint(m.panelContent(right), right, th)
-			rightView = m.renderPanel(content, right, th)
-		}
-		return m.layout.RenderColumns(leftView, rightView)
-
-	default:
-		active := m.leftRing.current()
-		if active == component.FocusSessionPanel {
-			content := m.overlayChordHint(m.renderLeftPanel(th), active, th)
-			return m.borderLeftPanel(content, th)
-		}
-		if active == component.FocusCodeViewer {
-			return m.renderCodePanelBordered(th)
-		}
-		if active == component.FocusFileTree {
-			content := m.overlayChordHint(m.fileTree.View(), active, th)
-			return m.renderPanel(content, active, th)
-		}
-		content := m.overlayChordHint(m.panelContent(active), active, th)
-		return m.renderPanel(content, active, th)
-	}
-}
-
 // renderLeftSlot renders the left column for the given panel ID.
 // Session gets the composite left panel with border; FileTree gets a standard panel.
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {

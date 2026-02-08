@@ -138,7 +138,7 @@ type Model struct {
 
 // viewCache stores cached renderVisibleLines output for the editor.
 type viewCache struct {
-	lines          []string // Cached rendered lines.
+	lines          []string // Cached rendered lines (before post-processing).
 	viewHeight     int      // Height the cache was rendered at.
 	scrollOffset   int      // Vertical scroll offset at render time.
 	scrollLeftCol  int      // Horizontal scroll offset at render time.
@@ -146,6 +146,16 @@ type viewCache struct {
 	cursorRenderIdx int     // Index in lines[] of the cursor line.
 	valid          bool     // False when structural state changed.
 	cursorOK       bool     // False when only cursor blink changed.
+
+	// Post-processing cache: stores the final ViewContent body output
+	// (after fitLine, applyBounceShift, overlayPopups, join).
+	// On cursor-only blinks, we patch one line and splice instead of
+	// re-running the full post-processing pipeline.
+	postLines   []string // Fitted lines (post fitLine + bounce + popups).
+	postOffsets []int    // Byte offset of each postLine in postBody.
+	postBody    string   // strings.Join(postLines, "\n").
+	postBounce  int      // bounceOffset at cache time.
+	postValid   bool     // False when post-processing must re-run.
 }
 
 // Compile-time interface checks.
@@ -235,10 +245,11 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-	// Non-tick messages may change visual state → invalidate the full cache.
+	// Non-tick messages may change visual state → invalidate caches.
 	// Tick messages only toggle cursor blink → handled in handleTickMsg.
 	if kind != msgKindTickMsg {
 		m.vc.valid = false
+		m.vc.postValid = false
 	}
 	return handler(m, incoming)
 }
@@ -294,33 +305,94 @@ func (m *Model) ViewContent() string {
 		m.vc.cursorRenderIdx = m.findCursorRenderIdx()
 		m.vc.valid = true
 		m.vc.cursorOK = true
+		m.vc.postValid = false // Force full post-processing.
 	} else if !m.vc.cursorOK {
 		// Cursor-only patch: re-render just the cursor line.
 		m.patchCursorLine()
 		m.vc.cursorOK = true
+
+		// Fast path: if post cache is valid and bounce unchanged, splice
+		// only the patched cursor line into the cached output.
+		if m.vc.postValid && m.bounceOffset == m.vc.postBounce {
+			return m.splicePostCursorLine(barStr, viewHeight)
+		}
+		// Bounce changed or post cache invalid — fall through to full post.
 	}
 
-	// Shallow clone — post-processing (tilde fill, fit, bounce, popup) mutates.
+	// Full post-processing: clone, tilde fill, fit, bounce, popups, join.
+	body := m.buildPostOutput(viewHeight)
+	if barStr != "" {
+		return barStr + "\n" + body
+	}
+	return body
+}
+
+// buildPostOutput runs the full post-processing pipeline and caches the result.
+func (m *Model) buildPostOutput(viewHeight int) string {
 	lines := slices.Clone(m.vc.lines)
 
 	for len(lines) < viewHeight {
 		lines = append(lines, m.renderTildeLine())
 	}
-	// Fit each line to panel width (truncate or pad).
 	for i, line := range lines {
 		lines[i] = m.fitLine(line)
 	}
-	// Apply bounce shift for overscroll feedback.
 	lines = applyBounceShift(lines, m.bounceOffset, viewHeight)
-
-	// Overlay all active popups with collision detection.
 	lines = m.overlayPopups(lines, viewHeight)
 
-	body := strings.Join(lines, "\n")
-	if barStr != "" {
-		return barStr + "\n" + body
+	// Cache post-processed state for cursor-only splice on next blink.
+	m.vc.postLines = lines
+	m.vc.postBody = strings.Join(lines, "\n")
+	m.vc.postBounce = m.bounceOffset
+	m.vc.postValid = true
+
+	// Precompute byte offsets for each line in postBody.
+	m.vc.postOffsets = make([]int, len(lines))
+	offset := 0
+	for i, line := range lines {
+		m.vc.postOffsets[i] = offset
+		offset += len(line) + 1 // +1 for "\n" separator.
 	}
-	return body
+
+	return m.vc.postBody
+}
+
+// splicePostCursorLine patches the cached post-processed output with the
+// newly rendered cursor line. Runs fitLine on the one changed line and
+// splices it at the cached byte offset. Cost: O(1 line + frame_size memcpy).
+func (m *Model) splicePostCursorLine(barStr string, viewHeight int) string {
+	ri := m.vc.cursorRenderIdx
+	if ri < 0 || ri >= len(m.vc.postLines) || ri >= len(m.vc.postOffsets) {
+		// Safety fallback: full post-processing.
+		body := m.buildPostOutput(viewHeight)
+		if barStr != "" {
+			return barStr + "\n" + body
+		}
+		return body
+	}
+
+	// Fit the single patched line.
+	fitted := m.fitLine(m.vc.lines[ri])
+
+	// Splice into cached postBody at the precomputed byte offset.
+	oldLine := m.vc.postLines[ri]
+	start := m.vc.postOffsets[ri]
+	end := start + len(oldLine)
+
+	m.vc.postLines[ri] = fitted
+	m.vc.postBody = m.vc.postBody[:start] + fitted + m.vc.postBody[end:]
+
+	// Update byte offsets if the new line has a different length.
+	if delta := len(fitted) - len(oldLine); delta != 0 {
+		for i := ri + 1; i < len(m.vc.postOffsets); i++ {
+			m.vc.postOffsets[i] += delta
+		}
+	}
+
+	if barStr != "" {
+		return barStr + "\n" + m.vc.postBody
+	}
+	return m.vc.postBody
 }
 
 // findCursorRenderIdx computes the index in vc.lines of the cursor line,
@@ -337,13 +409,15 @@ func (m *Model) findCursorRenderIdx() int {
 }
 
 // patchCursorLine re-renders only the cursor line in the view cache.
+// Uses buildPatchCtx to avoid splitting the full buffer — only the cursor
+// line content is materialized via LineIndex + PieceTable.Substring.
 func (m *Model) patchCursorLine() {
 	ri := m.vc.cursorRenderIdx
 	if ri < 0 || ri >= len(m.vc.lines) {
 		m.vc.valid = false // Safety: fall back to full re-render.
 		return
 	}
-	ctx := m.buildRenderCtx()
+	ctx := m.buildPatchCtx()
 	if m.state.CursorLine >= ctx.totalLines {
 		m.vc.valid = false
 		return
@@ -2819,7 +2893,10 @@ func (m *Model) adjustScrollX() {
 // renderLineCtx holds shared state for a renderVisibleLines pass so that
 // renderOneLine can be called individually for cursor-only patching.
 type renderLineCtx struct {
-	contentLines []string
+	// lineAt returns the content of line i. For full renders this indexes
+	// into a pre-split slice; for cursor-only patching it uses
+	// LineIndex + PieceTable.Substring to avoid splitting the entire buffer.
+	lineAt       func(i int) string
 	totalLines   int
 	gutterWidth  int
 	defaultStyle lipgloss.Style
@@ -2831,6 +2908,7 @@ type renderLineCtx struct {
 }
 
 // buildRenderCtx computes the shared rendering context once per pass.
+// This splits the full buffer into lines — used for full viewport renders.
 func (m *Model) buildRenderCtx() renderLineCtx {
 	content := m.buf.Content()
 	contentLines := strings.Split(content, "\n")
@@ -2846,7 +2924,40 @@ func (m *Model) buildRenderCtx() renderLineCtx {
 	}
 
 	return renderLineCtx{
-		contentLines: contentLines,
+		lineAt:       func(i int) string { return contentLines[i] },
+		totalLines:   totalLines,
+		gutterWidth:  gutterWidth,
+		defaultStyle: defaultStyle,
+		hasSelection: hasSelection,
+		selStartLine: selStartLine,
+		selStartCol:  selStartCol,
+		selEndLine:   selEndLine,
+		selEndCol:    selEndCol,
+	}
+}
+
+// buildPatchCtx computes a minimal rendering context for cursor-only patching.
+// Uses LineIndex + PieceTable.Substring instead of splitting the full buffer.
+func (m *Model) buildPatchCtx() renderLineCtx {
+	totalLines := m.lineIndex.Count()
+	gutterWidth := m.gutterWidth(totalLines)
+	defaultStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Foreground)
+
+	var selStartLine, selStartCol, selEndLine, selEndCol int
+	hasSelection, selStart, selEnd := m.selectionRange()
+	if hasSelection {
+		selStartLine, selStartCol = m.lineIndex.PosToLineCol(selStart)
+		selEndLine, selEndCol = m.lineIndex.PosToLineCol(selEnd)
+	}
+
+	return renderLineCtx{
+		lineAt: func(i int) string {
+			info, ok := m.lineIndex.Get(i)
+			if !ok {
+				return ""
+			}
+			return m.buf.Substring(info.StartPos, info.StartPos+info.Length)
+		},
 		totalLines:   totalLines,
 		gutterWidth:  gutterWidth,
 		defaultStyle: defaultStyle,
@@ -2868,11 +2979,12 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 	}
 
 	// Pre-expand tabs and remap all columns to display space.
-	displayLine, colMap := expandTabs(ctx.contentLines[i], editorTabWidth)
+	rawLine := ctx.lineAt(i)
+	displayLine, colMap := expandTabs(rawLine, editorTabWidth)
 	displayRegions := remapRegions(regions, colMap)
 	displayLineRunes := len([]rune(displayLine))
 	inSelection := ctx.hasSelection && i >= ctx.selStartLine && i <= ctx.selEndLine
-	findSpans := m.findMatchSpans(i, len([]rune(ctx.contentLines[i])), colMap)
+	findSpans := m.findMatchSpans(i, len([]rune(rawLine)), colMap)
 	hlSpans := m.highlightSpansForLine(i, colMap)
 	jumpSpans := m.jumpMarkerSpansForLine(i, colMap)
 
@@ -3865,6 +3977,7 @@ func (m *Model) computeReplacement(matchedText string) string {
 // performs a full re-render of all visible lines.
 func (m *Model) invalidateView() {
 	m.vc.valid = false
+	m.vc.postValid = false
 }
 
 // markModified updates the editor's modified/lspDirty/editGeneration state

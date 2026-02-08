@@ -24,9 +24,15 @@ const statusDebounce = 150 * time.Millisecond
 // debounce timer (e.g. rebase touching hundreds of refs).
 const statusMaxDebounce = 1 * time.Second
 
-// statusFallback is the periodic safety-net interval for catching external
+// statusFallbackBase is the starting fallback interval for catching external
 // working-tree changes not detected by .git/ watching or Nudge.
-const statusFallback = 5 * time.Second
+const statusFallbackBase = 5 * time.Second
+
+// statusFallbackMax is the ceiling for adaptive backoff. When repeated
+// fallback refreshes find no changes, the interval doubles each time up
+// to this cap. Derived from: 60s is long enough that idle CPU is negligible,
+// short enough that external edits are still detected within a minute.
+const statusFallbackMax = 60 * time.Second
 
 // statusChanSize is the buffer size for the output channel.
 // Buffered so the watcher never blocks on a slow consumer.
@@ -135,17 +141,23 @@ func addDirRecursive(fsw *fsnotify.Watcher, root string) {
 // =============================================================================
 
 // loop is the main event loop. It debounces triggers from fsnotify events,
-// nudge signals, and a periodic fallback timer. Refresh runs asynchronously
+// nudge signals, and an adaptive fallback timer. Refresh runs asynchronously
 // so the loop never blocks on slow git operations.
+//
+// The fallback uses exponential backoff: when a refresh finds no changes the
+// interval doubles (up to statusFallbackMax). Any real trigger (fsnotify or
+// nudge) resets it to statusFallbackBase.
 func (w *StatusWatcher) loop(ctx context.Context) {
 	defer close(w.out)
 	defer w.fsw.Close()
 
-	fallback := time.NewTicker(statusFallback)
-	defer fallback.Stop()
+	// Adaptive fallback timer (one-shot, re-armed after each refresh).
+	fallbackInterval := statusFallbackBase
+	fallback := time.NewTimer(0) // fire immediately for initial load
+	fallbackFromEvent := true    // first refresh is event-driven (initial load)
 
-	debounce := time.NewTimer(0) // fire immediately for initial load
-	debounceActive := true
+	debounce := newStoppedTimer()
+	debounceActive := false
 
 	// maxWindow enforces the statusMaxDebounce ceiling. It fires once after
 	// the first trigger, forcing a refresh even if events keep resetting the
@@ -157,11 +169,18 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 	refreshDone := make(chan StatusUpdate, 1)
 	inFlight := false
 
+	// Change detection for adaptive backoff. Tracks fingerprints of
+	// the previous refresh result.
+	prevStatusLen   := -1
+	prevStatusHash  := uint64(0)
+	prevTrackedLen  := -1
+
 	for {
 		select {
 		case <-ctx.Done():
 			drainTimer(debounce)
 			drainTimer(maxWindow)
+			drainTimer(fallback)
 			return
 
 		case ev, ok := <-w.fsw.Events:
@@ -169,14 +188,22 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 				return
 			}
 			w.watchNewRefDir(ev)
+			fallbackFromEvent = true
+			fallbackInterval = statusFallbackBase // reset backoff
 			arm(debounce, &debounceActive, maxWindow, &maxWindowActive)
 
 		case <-w.nudgeCh:
+			fallbackFromEvent = true
+			fallbackInterval = statusFallbackBase // reset backoff
 			arm(debounce, &debounceActive, maxWindow, &maxWindowActive)
 
 		case <-fallback.C:
 			if !debounceActive && !inFlight {
+				fallbackFromEvent = false
 				arm(debounce, &debounceActive, maxWindow, &maxWindowActive)
+			} else {
+				// Re-arm fallback since we skipped this cycle.
+				fallback.Reset(fallbackInterval)
 			}
 
 		case <-debounce.C:
@@ -199,6 +226,29 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 
 		case update := <-refreshDone:
 			inFlight = false
+
+			// Adaptive backoff: if this was a fallback-initiated refresh
+			// and neither StatusMap nor TrackedSet changed, double the
+			// fallback interval to reduce idle CPU.
+			curStatusLen := len(update.StatusMap)
+			curStatusHash := statusHash(update.StatusMap)
+			curTrackedLen := len(update.TrackedSet)
+			unchanged := curStatusLen == prevStatusLen &&
+				curStatusHash == prevStatusHash &&
+				curTrackedLen == prevTrackedLen
+			if !fallbackFromEvent && unchanged {
+				fallbackInterval = min(fallbackInterval*2, statusFallbackMax)
+			} else {
+				fallbackInterval = statusFallbackBase
+			}
+			prevStatusLen = curStatusLen
+			prevStatusHash = curStatusHash
+			prevTrackedLen = curTrackedLen
+
+			// Re-arm fallback for the next cycle.
+			drainTimer(fallback)
+			fallback.Reset(fallbackInterval)
+
 			// Drop-oldest: if the channel is full, discard the stale value.
 			select {
 			case <-w.out:
@@ -297,6 +347,29 @@ func (w *StatusWatcher) watchNewRefDir(ev fsnotify.Event) {
 		return
 	}
 	_ = w.fsw.Add(ev.Name)
+}
+
+// statusHash computes an order-independent fingerprint of a status map.
+// Each entry is hashed independently (FNV-1a of path+state), then all
+// per-entry hashes are XOR'd together. XOR is commutative, so Go's
+// non-deterministic map iteration order does not affect the result.
+// Collisions are benign (they only delay backoff by one cycle).
+func statusHash(m map[string]GitFileState) uint64 {
+	const fnvBasis = 14695981039346656037
+	const fnvPrime = 1099511628211
+
+	var combined uint64
+	for path, state := range m {
+		h := uint64(fnvBasis)
+		for i := range len(path) {
+			h ^= uint64(path[i])
+			h *= fnvPrime
+		}
+		h ^= uint64(state)
+		h *= fnvPrime
+		combined ^= h
+	}
+	return combined
 }
 
 // =============================================================================
