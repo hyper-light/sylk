@@ -923,10 +923,18 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.loadGitBranchesCmd())
+		if m.commitTree != nil {
+			_, doneCmd := m.commitTree.Update(committree.CommitDoneMsg{OK: true, Message: typed.message})
+			cmds = append(cmds, doneCmd)
+		}
 		return m, tea.Batch(cmds...)
 
 	case commitFailedMsg:
 		m.statusBar.SetFlash(typed.reason)
+		if m.commitTree != nil {
+			_, doneCmd := m.commitTree.Update(committree.CommitDoneMsg{OK: false, Message: typed.reason})
+			return m, doneCmd
+		}
 		return m, nil
 
 	case gitStatsLoadedMsg:
@@ -6842,6 +6850,12 @@ func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
 		m.syncStagedFiles()
 	}
 
+	if m.commitTree != nil {
+		ctComp, ctCmd := m.commitTree.Update(raw)
+		m.commitTree = ctComp.(*committree.Model)
+		cmds = appendCmd(cmds, ctCmd)
+	}
+
 	return tea.Batch(cmds...)
 }
 
@@ -8275,6 +8289,9 @@ func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
 	}
 	if !m.needsBlink() {
 		return nil
+	}
+	if m.commitTree != nil {
+		m.commitTree.AdvanceSpinner()
 	}
 	return m.blinkCmd()
 }

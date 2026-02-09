@@ -3,12 +3,16 @@ package committree
 import (
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// commitFlashDuration is how long the success message stays visible.
+const commitFlashDuration = 3 * time.Second
 
 // Compile-time interface assertions.
 var (
@@ -61,11 +65,30 @@ const (
 	branchActionDelete
 )
 
+// commitPhase tracks the inline commit lifecycle.
+type commitPhase int
+
+const (
+	commitIdle       commitPhase = iota // text input or no input
+	commitInProgress                    // async commit running
+	commitSucceeded                     // brief success flash
+)
+
 // CommitRequestMsg is emitted when the user confirms a commit in the expanded
 // card's inline input.
 type CommitRequestMsg struct {
 	Message string
 }
+
+// CommitDoneMsg is sent by the app after a commit succeeds or fails, so the
+// commit tree can update its inline display.
+type CommitDoneMsg struct {
+	OK      bool
+	Message string // success: commit subject; failure: error reason
+}
+
+// commitDismissMsg is an internal timer message to clear the success flash.
+type commitDismissMsg struct{}
 
 // ---------------------------------------------------------------------------
 // Model
@@ -97,8 +120,10 @@ type Model struct {
 
 	// Commit input state (HEAD branch expanded card).
 	commitInputActive bool
+	commitPhase       commitPhase
 	commitMsg         string
 	commitCursor      int
+	commitSpinner     int // spinner frame index
 
 	// Commit view state.
 	nodes       []TreeNode
@@ -149,12 +174,18 @@ func (m *Model) SetSize(width, height int) {
 func (m *Model) Init() tea.Cmd { return nil }
 
 func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
-	km, ok := msg.(tea.KeyMsg)
-	if !ok || !m.focused {
+	switch typed := msg.(type) {
+	case CommitDoneMsg:
+		return m, m.handleCommitDone(typed)
+	case commitDismissMsg:
+		m.handleCommitDismiss()
 		return m, nil
+	case tea.KeyMsg:
+		if m.focused {
+			return m, m.handleKey(typed)
+		}
 	}
-	cmd := m.handleKey(km)
-	return m, cmd
+	return m, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -307,9 +338,18 @@ func (m *Model) SetHasStagedFiles(staged bool) {
 	m.viewDirty = true
 }
 
-// NeedsBlink reports whether the commit input cursor needs blinking.
+// NeedsBlink reports whether the commit input cursor or spinner needs ticking.
 func (m *Model) NeedsBlink() bool {
-	return m.focused && m.commitInputActive
+	return m.focused && (m.commitInputActive || m.commitPhase == commitInProgress)
+}
+
+// AdvanceSpinner advances the commit spinner frame and marks the view dirty.
+// Called from the blink tick so the spinner animates.
+func (m *Model) AdvanceSpinner() {
+	if m.commitPhase == commitInProgress {
+		m.commitSpinner++
+		m.viewDirty = true
+	}
 }
 
 // SetBounceOffset updates the visual bounce displacement for rendering.
@@ -413,8 +453,10 @@ func (m *Model) buildExpansion(cursorVisible bool) *branchExpansion {
 		selectedActionID: m.expandedActionID(),
 		hasStagedFiles:   m.hasStagedFiles,
 		commitInput:      m.commitInputActive,
+		commitPhase:      m.commitPhase,
 		commitMsg:        m.commitMsg,
 		commitCursor:     m.commitCursor,
+		commitSpinner:    m.commitSpinner,
 		cursorVisible:    cursorVisible,
 	}
 }
@@ -586,21 +628,26 @@ func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
 
 // handleCommitInputKey processes keys when the commit message input is active.
 func (m *Model) handleCommitInputKey(km tea.KeyMsg) tea.Cmd {
+	// During progress or success flash, only esc cancels.
+	if m.commitPhase != commitIdle {
+		if km.String() == "esc" {
+			m.clearCommitInput()
+		}
+		return nil
+	}
+
 	switch km.String() {
 	case "enter":
 		msg := strings.TrimSpace(m.commitMsg)
 		if msg == "" {
 			return nil
 		}
-		m.commitInputActive = false
-		m.commitMsg = ""
-		m.commitCursor = 0
+		m.commitPhase = commitInProgress
+		m.commitSpinner = 0
 		m.viewDirty = true
 		return func() tea.Msg { return CommitRequestMsg{Message: msg} }
-	case "esc":
-		m.commitInputActive = false
-		m.commitMsg = ""
-		m.commitCursor = 0
+	case "esc", "tab", "shift+tab":
+		m.clearCommitInput()
 	case "backspace":
 		if m.commitCursor > 0 {
 			runes := []rune(m.commitMsg)
@@ -633,6 +680,45 @@ func (m *Model) handleCommitInputKey(km tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+// clearCommitInput resets the commit input state and returns focus to the
+// action badges.
+func (m *Model) clearCommitInput() {
+	m.commitInputActive = false
+	m.commitPhase = commitIdle
+	m.commitMsg = ""
+	m.commitCursor = 0
+	m.commitSpinner = 0
+	m.viewDirty = true
+}
+
+// handleCommitDone processes the result of an async commit operation.
+func (m *Model) handleCommitDone(done CommitDoneMsg) tea.Cmd {
+	if !done.OK {
+		// On failure, return to input so user can retry.
+		m.commitPhase = commitIdle
+		m.viewDirty = true
+		return nil
+	}
+	m.commitPhase = commitSucceeded
+	m.commitMsg = done.Message
+	m.viewDirty = true
+	return m.commitDismissCmd()
+}
+
+// handleCommitDismiss clears the success flash after the timer fires.
+func (m *Model) handleCommitDismiss() {
+	if m.commitPhase == commitSucceeded {
+		m.clearCommitInput()
+	}
+}
+
+// commitDismissCmd schedules auto-dismissal of the success flash.
+func (m *Model) commitDismissCmd() tea.Cmd {
+	return tea.Tick(commitFlashDuration, func(time.Time) tea.Msg {
+		return commitDismissMsg{}
+	})
+}
+
 // insertCommitRunes inserts runes at the current cursor position in the
 // commit message.
 func (m *Model) insertCommitRunes(inserted []rune) {
@@ -652,9 +738,7 @@ func (m *Model) expandBranch() {
 		return
 	}
 	m.expandedIdx = m.branchIdx
-	m.commitInputActive = false
-	m.commitMsg = ""
-	m.commitCursor = 0
+	m.clearCommitInput()
 	m.expandedAction = branchActionSwitch
 }
 
@@ -662,9 +746,7 @@ func (m *Model) expandBranch() {
 func (m *Model) collapseBranch() {
 	m.expandedIdx = -1
 	m.expandedAction = 0
-	m.commitInputActive = false
-	m.commitMsg = ""
-	m.commitCursor = 0
+	m.clearCommitInput()
 }
 
 // executeExpandedAction runs the selected action on the expanded branch.

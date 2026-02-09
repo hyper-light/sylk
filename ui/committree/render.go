@@ -153,13 +153,15 @@ type workingTreeState struct {
 // branchExpansion holds the rendering state for an expanded branch card.
 type branchExpansion struct {
 	wt               workingTreeState
-	defaultBranch    string // name of the repository default branch
-	selectedActionID int    // resolved action ID (not index)
-	hasStagedFiles   bool   // uncommitted tab has staged files
-	commitInput      bool   // commit message input is active
-	commitMsg        string // current commit message text
-	commitCursor     int    // cursor position in commit message
-	cursorVisible    bool   // blink phase: true = show cursor
+	defaultBranch    string      // name of the repository default branch
+	selectedActionID int         // resolved action ID (not index)
+	hasStagedFiles   bool        // uncommitted tab has staged files
+	commitInput      bool        // commit message input is active
+	commitPhase      commitPhase // idle / in-progress / succeeded
+	commitMsg        string      // current commit message text
+	commitCursor     int         // cursor position in commit message
+	commitSpinner    int         // spinner frame index
+	cursorVisible    bool        // blink phase: true = show cursor
 }
 
 // switchEnabled reports whether the Switch action is usable.
@@ -348,12 +350,35 @@ func renderActionBadge(label string, accent lipgloss.Color, enabled, selected bo
 	return st.Render("[" + label + "]")
 }
 
-// buildCommitInputLine renders the inline commit message input row:
+// spinnerFrames are the braille spinner glyphs used during commit progress.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// buildCommitInputLine renders the inline commit input row. The content
+// depends on the commit phase:
 //
-//	" Message ▏some commit text"
-//
-// The cursor is shown as a thin bar (▏) when cursorVisible is true.
+//	idle:        " Message: ▏some commit text"
+//	in-progress: " ⠹ Committing..."
+//	succeeded:   " ✓ Committed"
 func buildCommitInputLine(exp *branchExpansion, width int, p theme.Palette) string {
+	switch exp.commitPhase {
+	case commitInProgress:
+		spinSt := lipgloss.NewStyle().Foreground(p.Primary)
+		textSt := lipgloss.NewStyle().Foreground(p.Muted)
+		frame := spinnerFrames[exp.commitSpinner%len(spinnerFrames)]
+		return " " + spinSt.Render(frame) + " " + textSt.Render("Committing...")
+
+	case commitSucceeded:
+		iconSt := lipgloss.NewStyle().Foreground(p.Success)
+		textSt := lipgloss.NewStyle().Foreground(p.Success)
+		return " " + iconSt.Render("✓") + " " + textSt.Render("Committed")
+
+	default:
+		return buildCommitIdleLine(exp, width, p)
+	}
+}
+
+// buildCommitIdleLine renders the text input row with a blinking cursor.
+func buildCommitIdleLine(exp *branchExpansion, width int, p theme.Palette) string {
 	labelSt := lipgloss.NewStyle().Foreground(p.Muted)
 	textSt := lipgloss.NewStyle().Foreground(p.Foreground)
 	cursorSt := lipgloss.NewStyle().Foreground(p.Primary)
@@ -378,9 +403,7 @@ func buildCommitInputLine(exp *branchExpansion, width int, p theme.Palette) stri
 	content := label + textSt.Render(before) + cursorGlyph + textSt.Render(after)
 
 	if vis := lipgloss.Width(content); vis > width {
-		// Scroll: show tail of text so cursor stays visible.
-		// Recompute with only the portion that fits.
-		avail := max(width-labelWidth-1, 0) // 1 for cursor glyph
+		avail := max(width-labelWidth-1, 0)
 		if len([]rune(before)) > avail {
 			trimmed := string([]rune(before)[len([]rune(before))-avail:])
 			content = label + textSt.Render(trimmed) + cursorGlyph + textSt.Render(after)
