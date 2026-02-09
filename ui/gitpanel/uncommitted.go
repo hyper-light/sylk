@@ -108,16 +108,16 @@ func renderUncommittedEntry(e uncommittedEntry, staging StagingState, selected b
 		excludedStyle = excludedStyle.Background(bg)
 	}
 
-	// Build staging icon prefix (2 cols when present: glyph + space).
+	// Staging icon column — always 2 chars wide for alignment.
 	var iconPrefix string
-	iconWidth := 0
+	const iconWidth = 2
 	switch staging {
 	case StagingStaged:
 		iconPrefix = stagedStyle.Render("\u2713") + padStyle.Render(" ")
-		iconWidth = 2
 	case StagingExcluded:
 		iconPrefix = excludedStyle.Render("\u2715") + padStyle.Render(" ")
-		iconWidth = 2
+	default:
+		iconPrefix = padStyle.Render("  ")
 	}
 
 	badge := badgeStyle.Render("[" + e.status + "]")

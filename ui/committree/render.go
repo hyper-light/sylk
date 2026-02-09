@@ -90,95 +90,441 @@ func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isLast bo
 	return lines
 }
 
-// branchNodeHeight is the number of terminal rows consumed per branch node.
-// Derived from: top border(1) + header(1) + subject(1) + bottom border(1) + trunk/blank(1) = 5.
-const branchNodeHeight = 5
+// =============================================================================
+// Branch Tree Layout
+// =============================================================================
+//
+// Offshoot branches are rendered side-by-side in rows (max 2 per row).
+// The default branch is rendered as a wider, centered card at the bottom.
+// A vertical trunk line connects all rows through merge lines.
+//
+// Layout (2 offshoots + primary):
+//
+//	╭────────────────╮ ╭────────────────╮
+//	│ feat/a   1w ago│ │ feat/b   3d ago│
+//	│  abc90  Fix X  │ │  def56  Fix Y  │
+//	╰────────────────╯ ╰────────────────╯
+//	      ╰──────────┬──────────╯
+//	                 │
+//	    ╭────────────┴───────────────╮
+//	    │ ● main               2h ago│
+//	    │   ghi90  Merge feature     │
+//	    ╰────────────────────────────╯
 
-// Layout proportions for branch tree cards. Offshoot branches are narrower
-// than the HEAD branch to visually emphasize the primary branch.
+// branchRowHeight is the number of terminal rows per visual row.
+// Derived from: card(4) + merge/connector(1) + trunk/blank(1) = 6.
+const branchRowHeight = 6
+
+// Layout constants for branch tree rendering.
 const (
-	offshootWidthPct   = 55 // offshoot card width as percentage of panel
-	headWidthPct       = 70 // HEAD card width as percentage of panel
+	branchCardGap      = 3  // gap between side-by-side cards (includes trunk)
+	maxBranchCols      = 2  // max offshoot cards per row
 	minBranchCardWidth = 24 // minimum usable card width
+	primaryWidthPct    = 70 // primary card width as percentage of panel
+	offshootWidthPct   = 55 // single-column offshoot width as percentage
 )
 
-// renderBranchNode renders a single branch as a centered bordered card
-// connected by a vertical trunk line through the card borders.
-//
-// Layout (first, offshoot):
-//
-//	        ╭─────────────────────────╮
-//	        │ feature/xyz       1w ago│
-//	        │   abc9012  Fix edge     │
-//	        ╰───────────┬─────────────╯
-//	                    │
-//
-// Layout (middle, offshoot):
-//
-//	        ╭───────────┴─────────────╮
-//	        │ bugfix/abc        3d ago│
-//	        │   def5678  Fix login    │
-//	        ╰───────────┬─────────────╯
-//	                    │
-//
-// Layout (last, HEAD — wider, centered):
-//
-//	    ╭───────────────┴─────────────────╮
-//	    │ ● main                    2h ago│
-//	    │   ghi9012  Merge feature        │
-//	    ╰─────────────────────────────────╯
-//
-func renderBranchNode(b BranchNode, selected bool, width int, th *theme.Theme, isFirst, isLast bool) []string {
-	p := th.Palette
+// branchCols returns how many offshoot cards fit side-by-side.
+func branchCols(width int) int {
+	return clampInt((width+branchCardGap)/(minBranchCardWidth+branchCardGap), 1, maxBranchCols)
+}
 
-	// Card width: HEAD is wider than offshoots.
-	pct := offshootWidthPct
-	if b.IsHead {
-		pct = headWidthPct
+// offshootCardWidth returns the width of each offshoot card.
+func offshootCardWidth(width, cols int) int {
+	if cols <= 1 {
+		return clampInt(width*offshootWidthPct/100, minBranchCardWidth, width)
 	}
-	cardWidth := clampInt(width*pct/100, minBranchCardWidth, width)
+	totalGap := (cols - 1) * branchCardGap
+	return max((width-totalGap)/cols, minBranchCardWidth)
+}
 
-	const borderCols = 2
-	innerWidth := max(cardWidth-borderCols, 0)
+// primaryCardWidth returns the width of the primary branch card.
+func primaryCardWidth(width int) int {
+	return clampInt(width*primaryWidthPct/100, minBranchCardWidth, width)
+}
 
-	// Center the card horizontally.
-	leftPad := max((width-cardWidth)/2, 0)
+// workingTreeState holds the working tree dirty/conflicts flags, used by all
+// cards for dot color and by expanded cards for action enablement.
+type workingTreeState struct {
+	dirty     bool
+	conflicts bool
+}
 
-	// Trunk position within the inner border content.
-	trunkAbs := width / 2
-	trunkInner := trunkAbs - leftPad - 1
+// branchExpansion holds the rendering state for an expanded branch card.
+type branchExpansion struct {
+	wt               workingTreeState
+	defaultBranch    string // name of the repository default branch
+	selectedActionID int    // resolved action ID (not index)
+	hasStagedFiles   bool   // uncommitted tab has staged files
+	commitInput      bool   // commit message input is active
+	commitMsg        string // current commit message text
+	commitCursor     int    // cursor position in commit message
+	cursorVisible    bool   // blink phase: true = show cursor
+}
 
-	// Border color: primary when selected, muted otherwise.
+// switchEnabled reports whether the Switch action is usable.
+func (e *branchExpansion) switchEnabled(isHead bool) bool {
+	return !isHead && !e.wt.dirty && !e.wt.conflicts
+}
+
+// deleteEnabled reports whether the Delete action is usable.
+// Delete is allowed regardless of dirty state, but never for the HEAD or
+// default branch.
+func (e *branchExpansion) deleteEnabled(name string, isHead bool) bool {
+	return !isHead && name != e.defaultBranch
+}
+
+// deleteVisible reports whether the Delete badge should be shown at all.
+// The default branch never shows a delete option.
+func (e *branchExpansion) deleteVisible(name string) bool {
+	return name != e.defaultBranch
+}
+
+// switchBlockedReason returns a human-readable reason why Switch is blocked,
+// or empty if it is not blocked.
+func (e *branchExpansion) switchBlockedReason(isHead bool) string {
+	switch {
+	case isHead:
+		return ""
+	case e.wt.conflicts:
+		return "resolve conflicts first"
+	case e.wt.dirty:
+		return "commit or stash changes first"
+	default:
+		return ""
+	}
+}
+
+// commitBlockedReason returns a human-readable reason why Commit is blocked,
+// or empty if it is not blocked.
+func (e *branchExpansion) commitBlockedReason(isHead bool) string {
+	if !isHead {
+		return ""
+	}
+	if !e.hasStagedFiles {
+		return "stage files in uncommitted tab"
+	}
+	return ""
+}
+
+// actionBlockedReason returns the reason for whichever action is currently
+// blocked, preferring the commit reason for HEAD and the switch reason
+// for non-HEAD branches.
+func (e *branchExpansion) actionBlockedReason(isHead bool) string {
+	if r := e.commitBlockedReason(isHead); r != "" {
+		return r
+	}
+	return e.switchBlockedReason(isHead)
+}
+
+// buildBranchCard returns the rendered lines for a single branch card.
+// Normal cards produce 4 lines; expanded cards produce 6–7 depending on
+// whether a blocked-reason line is needed.
+func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palette,
+	trunkInner int, hasTrunkTop, hasTrunkBot bool,
+	expanded bool, exp *branchExpansion, wt workingTreeState) []string {
+
 	borderColor := p.Border
 	if selected {
 		borderColor = p.Primary
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
-	trunkSt := lipgloss.NewStyle().Foreground(p.Border)
 
-	// Card content padded to exact inner width.
-	header := padContent(buildBranchHeaderLine(b, innerWidth, p), innerWidth)
+	header := padContent(buildBranchHeaderLine(b, innerWidth, p, wt), innerWidth)
 	subject := padContent(buildBranchSubjectLine(b, innerWidth, p), innerWidth)
 
-	// Borders with trunk connectors (┴ top, ┬ bottom).
-	top := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInner, !isFirst)
-	bottom := buildCardBorder("╰", "╯", innerWidth, bSt, trunkInner, !isLast)
+	// Arrow icon on the right edge of the subject line: ▸ collapsed, ▾ expanded.
+	arrowSt := lipgloss.NewStyle().Foreground(p.Muted)
+	arrow := "▸"
+	if expanded {
+		arrow = "▾"
+	}
+	if innerWidth >= 3 {
+		subject = truncateStyled(subject, innerWidth-2) + " " + arrowSt.Render(arrow)
+	}
+
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInner, hasTrunkTop)
+
+	lines := []string{
+		topBorder,
+		bSt.Render("│") + header + bSt.Render("│"),
+		bSt.Render("│") + subject + bSt.Render("│"),
+	}
+
+	if expanded && exp != nil {
+		mutedSt := lipgloss.NewStyle().Foreground(p.Muted)
+		divider := bSt.Render("├") + mutedSt.Render(strings.Repeat("╌", innerWidth)) + bSt.Render("┤")
+		content := bSt.Render("│") + padContent(buildExpContentLine(b, exp, innerWidth, p), innerWidth) + bSt.Render("│")
+		lines = append(lines, divider, content)
+
+		// Reason line when an action is blocked.
+		if reason := exp.actionBlockedReason(b.IsHead); reason != "" {
+			reasonSt := lipgloss.NewStyle().Foreground(p.Warning)
+			reasonLine := bSt.Render("│") + padContent(" "+reasonSt.Render(reason), innerWidth) + bSt.Render("│")
+			lines = append(lines, reasonLine)
+		}
+
+		// Commit input line (HEAD only, shown after selecting [Commit]).
+		if exp.commitInput && b.IsHead {
+			inputLine := bSt.Render("│") + padContent(buildCommitInputLine(exp, innerWidth, p), innerWidth) + bSt.Render("│")
+			lines = append(lines, inputLine)
+		}
+	}
+
+	var botBorder string
+	if hasTrunkBot {
+		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInner, true)
+	} else {
+		botBorder = bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
+	}
+	lines = append(lines, botBorder)
+
+	return lines
+}
+
+// buildExpContentLine renders the single expanded info row:
+//
+//	" N commits  [Switch]  [Delete]"
+//	" N commits  [dirty]  [Switch]  [Delete]"
+//
+// Left-aligned with 1-space indent. Stats and actions on a single line.
+func buildExpContentLine(b BranchNode, exp *branchExpansion, width int, p theme.Palette) string {
+	countStyle := lipgloss.NewStyle().Foreground(p.Foreground)
+	count := itoa(b.CommitCount)
+	if b.CommitCountCapped {
+		count += "+"
+	}
+	text := " " + countStyle.Render(count+" commits")
+
+	if b.IsHead {
+		if exp.wt.conflicts {
+			st := lipgloss.NewStyle().Foreground(p.Error)
+			text += "  " + st.Render("[conflicts]")
+		} else if exp.wt.dirty {
+			st := lipgloss.NewStyle().Foreground(p.Warning)
+			text += "  " + st.Render("[dirty]")
+		}
+	}
+
+	// [Commit] badge — HEAD only, enabled when staged files exist.
+	if b.IsHead {
+		commitEn := exp.hasStagedFiles
+		commitLabel := renderActionBadge("Commit", p.Secondary, commitEn, exp.selectedActionID == branchActionCommit, p)
+		text += "  " + commitLabel
+	}
+
+	// [Switch] badge — hidden for HEAD (already on this branch).
+	if !b.IsHead {
+		switchEn := exp.switchEnabled(b.IsHead)
+		switchLabel := renderActionBadge("Switch", p.Success, switchEn, exp.selectedActionID == branchActionSwitch, p)
+		text += "  " + switchLabel
+	}
+
+	// [Delete] badge — hidden for HEAD and default branch.
+	if !b.IsHead && exp.deleteVisible(b.Name) {
+		deleteEn := exp.deleteEnabled(b.Name, b.IsHead)
+		deleteLabel := renderActionBadge("Delete", p.Error, deleteEn, exp.selectedActionID == branchActionDelete, p)
+		text += " " + deleteLabel
+	}
+
+	return text
+}
+
+// renderActionBadge renders a single [Label] badge with appropriate styling.
+// accent is the semantic color for the action (e.g. Success for Switch, Error
+// for Delete). Four visual states:
+//   - enabled + selected:  accent foreground, bold
+//   - enabled + unselected: muted text
+//   - disabled + selected:  muted text with selection background
+//   - disabled + unselected: muted text
+func renderActionBadge(label string, accent lipgloss.Color, enabled, selected bool, p theme.Palette) string {
+	st := lipgloss.NewStyle().Foreground(p.Muted)
+	switch {
+	case enabled && selected:
+		st = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	case selected:
+		st = lipgloss.NewStyle().Foreground(p.Muted).Background(p.Selection)
+	}
+	return st.Render("[" + label + "]")
+}
+
+// buildCommitInputLine renders the inline commit message input row:
+//
+//	" Message ▏some commit text"
+//
+// The cursor is shown as a thin bar (▏) when cursorVisible is true.
+func buildCommitInputLine(exp *branchExpansion, width int, p theme.Palette) string {
+	labelSt := lipgloss.NewStyle().Foreground(p.Muted)
+	textSt := lipgloss.NewStyle().Foreground(p.Foreground)
+	cursorSt := lipgloss.NewStyle().Foreground(p.Primary)
+
+	label := labelSt.Render(" Message: ")
+	labelWidth := lipgloss.Width(label)
+
+	runes := []rune(exp.commitMsg)
+	cursor := clampInt(exp.commitCursor, 0, len(runes))
+
+	before := string(runes[:cursor])
+	after := ""
+	if cursor < len(runes) {
+		after = string(runes[cursor:])
+	}
+
+	var cursorGlyph string
+	if exp.cursorVisible {
+		cursorGlyph = cursorSt.Render("▏")
+	}
+
+	content := label + textSt.Render(before) + cursorGlyph + textSt.Render(after)
+
+	if vis := lipgloss.Width(content); vis > width {
+		// Scroll: show tail of text so cursor stays visible.
+		// Recompute with only the portion that fits.
+		avail := max(width-labelWidth-1, 0) // 1 for cursor glyph
+		if len([]rune(before)) > avail {
+			trimmed := string([]rune(before)[len([]rune(before))-avail:])
+			content = label + textSt.Render(trimmed) + cursorGlyph + textSt.Render(after)
+		}
+		content = truncateStyled(content, width)
+	}
+
+	return content
+}
+
+// renderOffshootRow renders a row of 1–2 offshoot branch cards side by side.
+// selectedCol is the selected card index within this row (-1 if none).
+// expandedCol is the expanded card index within this row (-1 if none).
+func renderOffshootRow(row []BranchNode, selectedCol, expandedCol int, exp *branchExpansion, cardWidth, width int, th *theme.Theme, hasTrunkAbove bool, wt workingTreeState) []string {
+	p := th.Palette
+	cols := len(row)
+	trunkPos := width / 2
+	trunkSt := lipgloss.NewStyle().Foreground(p.Border)
+
+	// Compute card positions (centered group).
+	totalContent := cols*cardWidth + max(cols-1, 0)*branchCardGap
+	leftMargin := max((width-totalContent)/2, 0)
+
+	const borderCols = 2
+	innerWidth := max(cardWidth-borderCols, 0)
+
+	cardLefts := make([]int, cols)
+	cardCenters := make([]int, cols)
+	for i := range cols {
+		cardLefts[i] = leftMargin + i*(cardWidth+branchCardGap)
+		cardCenters[i] = cardLefts[i] + cardWidth/2
+	}
+
+	// Build each card's lines (variable height).
+	cardSlices := make([][]string, cols)
+	maxCardHeight := 0
+	for i, b := range row {
+		selected := i == selectedCol
+		isExpanded := i == expandedCol
+		hasTrunkBot := cols == 1
+		trunkInner := trunkPos - cardLefts[i] - 1
+		cardSlices[i] = buildBranchCard(b, selected, innerWidth, p,
+			trunkInner, hasTrunkAbove && cols == 1, hasTrunkBot,
+			isExpanded, exp, wt)
+		maxCardHeight = max(maxCardHeight, len(cardSlices[i]))
+	}
+
+	// Merge card lines horizontally with trunk in gap.
+	// When one card is shorter (not expanded) and a sibling is expanded,
+	// draw a vertical connector from the shorter card's center down to
+	// the merge line so the tree graphic stays connected.
+	lines := make([]string, 0, maxCardHeight+2)
+	for lineIdx := range maxCardHeight {
+		var buf strings.Builder
+		for i := range cols {
+			target := cardLefts[i]
+			current := lipgloss.Width(buf.String())
+			for current < target {
+				if hasTrunkAbove && cols > 1 && current == trunkPos {
+					buf.WriteString(trunkSt.Render("│"))
+				} else {
+					buf.WriteByte(' ')
+				}
+				current++
+			}
+			if lineIdx < len(cardSlices[i]) {
+				buf.WriteString(cardSlices[i][lineIdx])
+			} else {
+				// Shorter card — draw vertical connector at card center.
+				centerOff := cardWidth / 2
+				buf.WriteString(strings.Repeat(" ", centerOff))
+				buf.WriteString(trunkSt.Render("│"))
+				buf.WriteString(strings.Repeat(" ", max(cardWidth-centerOff-1, 0)))
+			}
+		}
+		lines = append(lines, padLine(buf.String(), width))
+	}
+
+	// Merge line (or trunk for single card).
+	if cols == 1 {
+		trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
+		lines = append(lines, padLine(trunk, width))
+	} else {
+		lines = append(lines, renderMergeLine(cardCenters, trunkPos, width, th))
+	}
+
+	// Trunk line.
+	trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
+	lines = append(lines, padLine(trunk, width))
+
+	return lines
+}
+
+// renderPrimaryRow renders the primary branch card centered.
+func renderPrimaryRow(b BranchNode, selected, expanded bool, exp *branchExpansion, width int, th *theme.Theme, hasOffshoots bool, wt workingTreeState) []string {
+	p := th.Palette
+	cardWidth := primaryCardWidth(width)
+	const borderCols = 2
+	innerWidth := max(cardWidth-borderCols, 0)
+	leftPad := max((width-cardWidth)/2, 0)
+	trunkInner := width/2 - leftPad - 1
+
+	cardLines := buildBranchCard(b, selected, innerWidth, p,
+		trunkInner, hasOffshoots, false,
+		expanded, exp, wt)
 
 	pad := strings.Repeat(" ", leftPad)
+	blank := strings.Repeat(" ", max(width, 0))
 
-	// Trunk connector between nodes (blank for last).
-	var trunkLine string
-	if !isLast {
-		trunkLine = strings.Repeat(" ", trunkAbs) + trunkSt.Render("│")
+	lines := make([]string, 0, len(cardLines)+2)
+	for _, cl := range cardLines {
+		lines = append(lines, padLine(pad+cl, width))
+	}
+	// Pad to at least branchRowHeight.
+	for len(lines) < branchRowHeight {
+		lines = append(lines, blank)
 	}
 
-	return []string{
-		padLine(pad+top, width),
-		padLine(pad+bSt.Render("│")+header+bSt.Render("│"), width),
-		padLine(pad+bSt.Render("│")+subject+bSt.Render("│"), width),
-		padLine(pad+bottom, width),
-		padLine(trunkLine, width),
+	return lines
+}
+
+// renderMergeLine draws a horizontal connector from the leftmost card center
+// to the rightmost card center, with ┬ at the trunk position.
+func renderMergeLine(centers []int, trunkPos, width int, th *theme.Theme) string {
+	st := lipgloss.NewStyle().Foreground(th.Palette.Border)
+	leftC := centers[0]
+	rightC := centers[len(centers)-1]
+
+	var raw strings.Builder
+	for col := leftC; col <= rightC; col++ {
+		switch col {
+		case leftC:
+			raw.WriteString("╰")
+		case rightC:
+			raw.WriteString("╯")
+		case trunkPos:
+			raw.WriteString("┬")
+		default:
+			raw.WriteString("─")
+		}
 	}
+
+	leftPad := strings.Repeat(" ", leftC)
+	return padLine(leftPad+st.Render(raw.String()), width)
 }
 
 // buildCardBorder constructs a horizontal border with an optional trunk connector.
@@ -212,10 +558,19 @@ func clampInt(v, lo, hi int) int {
 }
 
 // buildBranchHeaderLine assembles: ● branchName          2h ago
-func buildBranchHeaderLine(b BranchNode, availWidth int, p theme.Palette) string {
+// The dot color reflects working tree state for the HEAD branch:
+// conflicts → red, dirty → yellow, clean → primary.
+func buildBranchHeaderLine(b BranchNode, availWidth int, p theme.Palette, wt workingTreeState) string {
 	markerStyle := lipgloss.NewStyle().Foreground(p.Muted)
 	if b.IsHead {
-		markerStyle = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+		switch {
+		case wt.conflicts:
+			markerStyle = lipgloss.NewStyle().Foreground(p.Error).Bold(true)
+		case wt.dirty:
+			markerStyle = lipgloss.NewStyle().Foreground(p.Warning).Bold(true)
+		default:
+			markerStyle = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+		}
 	}
 	marker := markerStyle.Render(commitMarker)
 
@@ -401,4 +756,45 @@ func truncateStyled(s string, maxWidth int) string {
 		out.WriteString("\x1b[0m")
 	}
 	return out.String()
+}
+
+// applyBounceShift displaces rendered lines by offset rows to produce an
+// overscroll bounce effect. Positive offset shifts content up (bottom bounce),
+// negative shifts down (top bounce).
+func applyBounceShift(lines []string, offset, maxLines int, emptyLine string) []string {
+	if offset == 0 || maxLines <= 0 {
+		return lines
+	}
+	absOffset := offset
+	if absOffset < 0 {
+		absOffset = -absOffset
+	}
+	absOffset = min(absOffset, maxLines)
+
+	result := make([]string, maxLines)
+
+	if offset > 0 {
+		// Bottom bounce: shift content up, pad bottom with empty lines.
+		shift := min(absOffset, len(lines))
+		copied := copy(result, lines[shift:])
+		for i := copied; i < maxLines; i++ {
+			result[i] = emptyLine
+		}
+	} else {
+		// Top bounce: empty lines at top, content fills remaining space.
+		for i := range absOffset {
+			result[i] = emptyLine
+		}
+		remaining := maxLines - absOffset
+		src := lines
+		if len(src) > remaining {
+			src = src[:remaining]
+		}
+		copy(result[absOffset:], src)
+		for i := absOffset + len(src); i < maxLines; i++ {
+			result[i] = emptyLine
+		}
+	}
+
+	return result
 }

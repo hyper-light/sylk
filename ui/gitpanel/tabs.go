@@ -12,6 +12,7 @@ import (
 var tabLabels = [tabCount]string{
 	TabCommits:     "Commits",
 	TabBranches:    "Branches",
+	TabTags:        "Tags",
 	TabUncommitted: "Uncommitted",
 }
 

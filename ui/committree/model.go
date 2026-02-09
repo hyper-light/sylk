@@ -40,6 +40,33 @@ type BranchSelectedMsg struct {
 	Name string
 }
 
+// BranchSwitchMsg is emitted when the user selects Switch in an expanded card.
+type BranchSwitchMsg struct {
+	Name string
+}
+
+// BranchDeleteMsg is emitted when the user selects Delete in an expanded card.
+type BranchDeleteMsg struct {
+	Name string
+}
+
+// ---------------------------------------------------------------------------
+// Branch expansion
+// ---------------------------------------------------------------------------
+
+// branchAction identifies an action button in an expanded card.
+const (
+	branchActionCommit = iota // HEAD only: commit staged changes
+	branchActionSwitch
+	branchActionDelete
+)
+
+// CommitRequestMsg is emitted when the user confirms a commit in the expanded
+// card's inline input.
+type CommitRequestMsg struct {
+	Message string
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -55,22 +82,39 @@ type Model struct {
 	mode viewMode
 
 	// Branch view state.
-	branches       []BranchNode
-	branchIdx      int
+	branches        []BranchNode
+	branchIdx       int
 	branchScrollOff int
-	activeBranch   string // Branch being viewed in commit mode.
+	activeBranch    string // Branch being viewed in commit mode.
+	defaultBranch   string // Repository default branch name.
+
+	// Expansion state.
+	expandedIdx      int  // Flat branch index of expanded card, -1 = none.
+	expandedAction   int  // Selected action within visible actions list.
+	workingDirty     bool // Working tree has uncommitted changes.
+	workingConflicts bool // Working tree has merge conflicts.
+	hasStagedFiles   bool // Uncommitted tab has files marked StagingStaged.
+
+	// Commit input state (HEAD branch expanded card).
+	commitInputActive bool
+	commitMsg         string
+	commitCursor      int
 
 	// Commit view state.
 	nodes       []TreeNode
 	selectedIdx int
 	scrollOff   int
+
+	// Visual bounce offset from overscroll physics.
+	bounceOffset int
 }
 
 // New creates a Model with the given theme.
 func New(th *theme.Theme) *Model {
 	return &Model{
-		theme:     th,
-		viewDirty: true,
+		theme:       th,
+		viewDirty:   true,
+		expandedIdx: -1,
 	}
 }
 
@@ -118,12 +162,29 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 // SetBranches populates the branch tree view and resets to branch mode.
-// Branches are sorted so that the HEAD branch appears last (bottom of the
-// tree) and other branches are ordered newest-first above it.
-func (m *Model) SetBranches(branches []BranchNode) {
+// The default branch (detected from the repository) is placed last (bottom
+// of the tree) and other branches are ordered newest-first above it.
+func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
+	// Remember the currently selected and expanded branch names so we can
+	// restore them after the data refresh (reloads happen on every git
+	// status change).
+	var prevName, expandedName string
+	if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
+		prevName = m.branches[m.branchIdx].Name
+	}
+	if m.expandedIdx >= 0 && m.expandedIdx < len(m.branches) {
+		expandedName = m.branches[m.expandedIdx].Name
+	}
+	prevAction := m.expandedAction
+	prevScroll := m.branchScrollOff
+
+	m.defaultBranch = defaultBranch
+
 	slices.SortStableFunc(branches, func(a, b BranchNode) int {
-		if a.IsHead != b.IsHead {
-			if a.IsHead {
+		ap := a.Name == defaultBranch
+		bp := b.Name == defaultBranch
+		if ap != bp {
+			if ap {
 				return 1
 			}
 			return -1
@@ -132,11 +193,43 @@ func (m *Model) SetBranches(branches []BranchNode) {
 	})
 
 	m.branches = branches
+
+	// Restore selection to the previously selected branch if still present.
 	m.branchIdx = max(len(branches)-1, 0)
-	m.branchScrollOff = 0
+	if prevName != "" {
+		for i, b := range m.branches {
+			if b.Name == prevName {
+				m.branchIdx = i
+				break
+			}
+		}
+	}
+
+	// Restore expanded card if the branch still exists.
+	m.expandedIdx = -1
+	m.expandedAction = 0
+	if expandedName != "" {
+		for i, b := range m.branches {
+			if b.Name == expandedName {
+				m.expandedIdx = i
+				m.expandedAction = prevAction
+				break
+			}
+		}
+	}
+
+	m.branchScrollOff = prevScroll
 	m.mode = viewBranches
 	m.viewDirty = true
 	m.ensureBranchVisible()
+}
+
+// SetWorkingTreeStatus updates the working tree dirty/conflicts flags used
+// to determine whether branch actions (switch, delete) are enabled.
+func (m *Model) SetWorkingTreeStatus(dirty, conflicts bool) {
+	m.workingDirty = dirty
+	m.workingConflicts = conflicts
+	m.viewDirty = true
 }
 
 // SetNodes replaces the commit data for the current branch drill-down.
@@ -204,6 +297,30 @@ func (m *Model) ScrollDown() bool {
 	return true
 }
 
+// SetHasStagedFiles updates whether the uncommitted tab has files marked
+// for staging. This controls the [Commit] badge accent color.
+func (m *Model) SetHasStagedFiles(staged bool) {
+	if m.hasStagedFiles == staged {
+		return
+	}
+	m.hasStagedFiles = staged
+	m.viewDirty = true
+}
+
+// NeedsBlink reports whether the commit input cursor needs blinking.
+func (m *Model) NeedsBlink() bool {
+	return m.focused && m.commitInputActive
+}
+
+// SetBounceOffset updates the visual bounce displacement for rendering.
+func (m *Model) SetBounceOffset(offset int) {
+	if m.bounceOffset == offset {
+		return
+	}
+	m.bounceOffset = offset
+	m.viewDirty = true
+}
+
 // ViewDirty reports whether View() would produce new output.
 func (m *Model) ViewDirty() bool {
 	if m.viewDirty {
@@ -218,34 +335,88 @@ func (m *Model) ViewDirty() bool {
 // ---------------------------------------------------------------------------
 
 func (m *Model) View(cursorVisible bool) string {
-	_ = cursorVisible
 	switch m.mode {
 	case viewCommits:
 		return m.viewCommitCards()
 	default:
-		return m.viewBranchTree()
+		return m.viewBranchTree(cursorVisible)
 	}
 }
 
-// viewBranchTree renders the branch tree view.
-func (m *Model) viewBranchTree() string {
+// viewBranchTree renders the branch tree view with side-by-side offshoot cards.
+func (m *Model) viewBranchTree(cursorVisible bool) string {
 	if len(m.branches) == 0 {
 		return m.renderPlaceholder("No branches")
 	}
 
-	visible := m.branchVisibleRange()
+	cols := m.effectiveCols()
+	cardWidth := offshootCardWidth(m.width, cols)
+	oc := m.offshootCount()
+	offRows := m.offshootRowCount()
+	totalRows := m.totalBranchRows()
+	visRows := m.visibleBranchRows()
+	endRow := min(m.branchScrollOff+visRows, totalRows)
+
+	wt := m.buildWorkingTreeState()
+	exp := m.buildExpansion(cursorVisible)
 	lines := make([]string, 0, m.height)
 
-	lastIdx := len(m.branches) - 1
-	for _, idx := range visible {
-		selected := idx == m.branchIdx
-		isFirst := idx == 0
-		isLast := idx == lastIdx
-		nodeLines := renderBranchNode(m.branches[idx], selected, m.width, m.theme, isFirst, isLast)
-		lines = append(lines, nodeLines...)
+	for rowIdx := m.branchScrollOff; rowIdx < endRow; rowIdx++ {
+		if rowIdx < offRows {
+			// Offshoot row.
+			rowStart := rowIdx * cols
+			rowEnd := min(rowStart+cols, oc)
+			row := m.branches[rowStart:rowEnd]
+
+			selectedCol := -1
+			if m.branchIdx >= rowStart && m.branchIdx < rowEnd {
+				selectedCol = m.branchIdx - rowStart
+			}
+
+			expandedCol := -1
+			if m.expandedIdx >= rowStart && m.expandedIdx < rowEnd {
+				expandedCol = m.expandedIdx - rowStart
+			}
+
+			hasTrunkAbove := rowIdx > 0
+			rowLines := renderOffshootRow(row, selectedCol, expandedCol, exp, cardWidth, m.width, m.theme, hasTrunkAbove, wt)
+			lines = append(lines, rowLines...)
+		} else {
+			// Primary row (always last).
+			primary := m.branches[len(m.branches)-1]
+			selected := m.branchIdx == oc
+			expanded := m.expandedIdx == oc
+			rowLines := renderPrimaryRow(primary, selected, expanded, exp, m.width, m.theme, oc > 0, wt)
+			lines = append(lines, rowLines...)
+		}
 	}
 
 	return m.padViewport(lines)
+}
+
+// buildWorkingTreeState returns the working tree state for rendering.
+func (m *Model) buildWorkingTreeState() workingTreeState {
+	return workingTreeState{
+		dirty:     m.workingDirty,
+		conflicts: m.workingConflicts,
+	}
+}
+
+// buildExpansion returns the current expansion state for rendering.
+func (m *Model) buildExpansion(cursorVisible bool) *branchExpansion {
+	if m.expandedIdx < 0 {
+		return nil
+	}
+	return &branchExpansion{
+		wt:               m.buildWorkingTreeState(),
+		defaultBranch:    m.defaultBranch,
+		selectedActionID: m.expandedActionID(),
+		hasStagedFiles:   m.hasStagedFiles,
+		commitInput:      m.commitInputActive,
+		commitMsg:        m.commitMsg,
+		commitCursor:     m.commitCursor,
+		cursorVisible:    cursorVisible,
+	}
 }
 
 // viewCommitCards renders the commit cards view (existing behavior).
@@ -269,9 +440,10 @@ func (m *Model) viewCommitCards() string {
 }
 
 // padViewport pads lines to fill the viewport height with tilde filler,
-// and truncates if over.
+// truncates if over, and applies bounce offset.
 func (m *Model) padViewport(lines []string) string {
 	tildeStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	emptyLine := strings.Repeat(" ", max(m.width, 0))
 	for len(lines) < m.height {
 		tilde := tildeStyle.Render("~")
 		pad := strings.Repeat(" ", max(m.width-1, 0))
@@ -280,6 +452,7 @@ func (m *Model) padViewport(lines []string) string {
 	if len(lines) > m.height {
 		lines = lines[:m.height]
 	}
+	lines = applyBounceShift(lines, m.bounceOffset, m.height, emptyLine)
 	return strings.Join(lines, "\n")
 }
 
@@ -297,24 +470,41 @@ func (m *Model) handleKey(km tea.KeyMsg) tea.Cmd {
 }
 
 // handleBranchKey processes keys in branch tree view.
+// Navigation is grid-based: j/k move between rows, h/l move within a row.
+// When a card is expanded, h/l move between actions, enter executes.
 func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 	if len(m.branches) == 0 {
 		return nil
 	}
 
+	// Expanded card: route to action handler.
+	if m.expandedIdx >= 0 {
+		return m.handleExpandedKey(km)
+	}
+
 	switch km.String() {
 	case "j", "down", "shift+down":
-		m.branchIdx = min(m.branchIdx+1, len(m.branches)-1)
+		m.moveBranchDown()
 	case "k", "up", "shift+up":
-		m.branchIdx = max(m.branchIdx-1, 0)
+		m.moveBranchUp()
+	case "l", "right":
+		m.moveBranchRight()
+	case "h", "left":
+		m.moveBranchLeft()
 	case "g":
 		m.branchIdx = 0
 	case "G":
 		m.branchIdx = len(m.branches) - 1
 	case "ctrl+d":
-		m.branchIdx = min(m.branchIdx+m.halfPage(), len(m.branches)-1)
+		for range m.halfBranchPage() {
+			m.moveBranchDown()
+		}
 	case "ctrl+u":
-		m.branchIdx = max(m.branchIdx-m.halfPage(), 0)
+		for range m.halfBranchPage() {
+			m.moveBranchUp()
+		}
+	case "shift+tab":
+		m.expandBranch()
 	case "enter":
 		return m.enterBranch()
 	default:
@@ -324,6 +514,260 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 	m.ensureBranchVisible()
 	m.viewDirty = true
 	return nil
+}
+
+// expandedVisibleActions returns the ordered action IDs for the currently
+// expanded branch. HEAD shows [Commit]; default shows [Switch];
+// other branches show [Switch, Delete].
+func (m *Model) expandedVisibleActions() []int {
+	if m.expandedIdx < 0 || m.expandedIdx >= len(m.branches) {
+		return nil
+	}
+	b := m.branches[m.expandedIdx]
+	if b.IsHead {
+		return []int{branchActionCommit}
+	}
+	if b.Name == m.defaultBranch {
+		return []int{branchActionSwitch}
+	}
+	return []int{branchActionSwitch, branchActionDelete}
+}
+
+// expandedActionID returns the action ID for the current selection index.
+func (m *Model) expandedActionID() int {
+	actions := m.expandedVisibleActions()
+	if m.expandedAction >= 0 && m.expandedAction < len(actions) {
+		return actions[m.expandedAction]
+	}
+	return -1
+}
+
+// handleExpandedKey processes keys when a branch card is expanded.
+// Tab cycles between action badges; space/enter triggers the focused action;
+// shift+tab or esc collapses the card. When the commit input is active,
+// keys route to the inline text input.
+func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
+	if m.commitInputActive {
+		return m.handleCommitInputKey(km)
+	}
+
+	actionMax := len(m.expandedVisibleActions())
+	if actionMax == 0 {
+		return nil
+	}
+
+	switch km.String() {
+	case "h", "left":
+		m.expandedAction = max(m.expandedAction-1, 0)
+	case "l", "right":
+		m.expandedAction = min(m.expandedAction+1, actionMax-1)
+	case "tab":
+		m.expandedAction = (m.expandedAction + 1) % actionMax
+	case "shift+tab":
+		m.collapseBranch()
+	case "enter", " ":
+		return m.executeExpandedAction()
+	case "esc", "q":
+		m.collapseBranch()
+	case "j", "down":
+		m.collapseBranch()
+		m.moveBranchDown()
+		m.ensureBranchVisible()
+	case "k", "up":
+		m.collapseBranch()
+		m.moveBranchUp()
+		m.ensureBranchVisible()
+	default:
+		return nil
+	}
+	m.viewDirty = true
+	return nil
+}
+
+// handleCommitInputKey processes keys when the commit message input is active.
+func (m *Model) handleCommitInputKey(km tea.KeyMsg) tea.Cmd {
+	switch km.String() {
+	case "enter":
+		msg := strings.TrimSpace(m.commitMsg)
+		if msg == "" {
+			return nil
+		}
+		m.commitInputActive = false
+		m.commitMsg = ""
+		m.commitCursor = 0
+		m.viewDirty = true
+		return func() tea.Msg { return CommitRequestMsg{Message: msg} }
+	case "esc":
+		m.commitInputActive = false
+		m.commitMsg = ""
+		m.commitCursor = 0
+	case "backspace":
+		if m.commitCursor > 0 {
+			runes := []rune(m.commitMsg)
+			runes = append(runes[:m.commitCursor-1], runes[m.commitCursor:]...)
+			m.commitMsg = string(runes)
+			m.commitCursor--
+		}
+	case "delete":
+		runes := []rune(m.commitMsg)
+		if m.commitCursor < len(runes) {
+			runes = append(runes[:m.commitCursor], runes[m.commitCursor+1:]...)
+			m.commitMsg = string(runes)
+		}
+	case "left":
+		m.commitCursor = max(m.commitCursor-1, 0)
+	case "right":
+		m.commitCursor = min(m.commitCursor+1, len([]rune(m.commitMsg)))
+	case "home", "ctrl+a":
+		m.commitCursor = 0
+	case "end", "ctrl+e":
+		m.commitCursor = len([]rune(m.commitMsg))
+	case " ":
+		m.insertCommitRunes([]rune{' '})
+	default:
+		if km.Type == tea.KeyRunes {
+			m.insertCommitRunes(km.Runes)
+		}
+	}
+	m.viewDirty = true
+	return nil
+}
+
+// insertCommitRunes inserts runes at the current cursor position in the
+// commit message.
+func (m *Model) insertCommitRunes(inserted []rune) {
+	runes := []rune(m.commitMsg)
+	newRunes := make([]rune, 0, len(runes)+len(inserted))
+	newRunes = append(newRunes, runes[:m.commitCursor]...)
+	newRunes = append(newRunes, inserted...)
+	newRunes = append(newRunes, runes[m.commitCursor:]...)
+	m.commitMsg = string(newRunes)
+	m.commitCursor += len(inserted)
+}
+
+// expandBranch toggles expansion on the currently selected branch card.
+func (m *Model) expandBranch() {
+	if m.expandedIdx == m.branchIdx {
+		m.collapseBranch()
+		return
+	}
+	m.expandedIdx = m.branchIdx
+	m.commitInputActive = false
+	m.commitMsg = ""
+	m.commitCursor = 0
+	m.expandedAction = branchActionSwitch
+}
+
+// collapseBranch closes any expanded card.
+func (m *Model) collapseBranch() {
+	m.expandedIdx = -1
+	m.expandedAction = 0
+	m.commitInputActive = false
+	m.commitMsg = ""
+	m.commitCursor = 0
+}
+
+// executeExpandedAction runs the selected action on the expanded branch.
+func (m *Model) executeExpandedAction() tea.Cmd {
+	actionID := m.expandedActionID()
+	if actionID < 0 {
+		return nil
+	}
+	if m.expandedIdx < 0 || m.expandedIdx >= len(m.branches) {
+		return nil
+	}
+
+	b := m.branches[m.expandedIdx]
+	name := b.Name
+
+	switch actionID {
+	case branchActionCommit:
+		// Activate commit input; don't collapse.
+		m.commitInputActive = true
+		m.commitMsg = ""
+		m.commitCursor = 0
+		m.viewDirty = true
+		return nil
+	case branchActionSwitch:
+		if b.IsHead || m.workingDirty || m.workingConflicts {
+			return nil
+		}
+	case branchActionDelete:
+		if b.IsHead || name == m.defaultBranch {
+			return nil
+		}
+	}
+
+	m.collapseBranch()
+	m.viewDirty = true
+
+	switch actionID {
+	case branchActionSwitch:
+		return func() tea.Msg { return BranchSwitchMsg{Name: name} }
+	case branchActionDelete:
+		return func() tea.Msg { return BranchDeleteMsg{Name: name} }
+	}
+	return nil
+}
+
+// moveBranchDown moves to the same column in the next row.
+func (m *Model) moveBranchDown() {
+	cols := m.effectiveCols()
+	oc := m.offshootCount()
+
+	if m.branchIdx >= oc {
+		return // already on primary
+	}
+	next := m.branchIdx + cols
+	if next >= oc {
+		m.branchIdx = oc // move to primary
+	} else {
+		m.branchIdx = next
+	}
+}
+
+// moveBranchUp moves to the same column in the previous row.
+func (m *Model) moveBranchUp() {
+	cols := m.effectiveCols()
+	oc := m.offshootCount()
+
+	if m.branchIdx == oc && oc > 0 {
+		// On primary, move to first item of last offshoot row.
+		lastRowStart := ((oc - 1) / cols) * cols
+		m.branchIdx = lastRowStart
+		return
+	}
+	if m.branchIdx < cols {
+		return // already on first row
+	}
+	m.branchIdx -= cols
+}
+
+// moveBranchRight moves to the next card in the same row.
+func (m *Model) moveBranchRight() {
+	cols := m.effectiveCols()
+	oc := m.offshootCount()
+	if m.branchIdx >= oc {
+		return // primary is a single card
+	}
+	rowStart := (m.branchIdx / cols) * cols
+	rowEnd := min(rowStart+cols, oc)
+	if m.branchIdx+1 < rowEnd {
+		m.branchIdx++
+	}
+}
+
+// moveBranchLeft moves to the previous card in the same row.
+func (m *Model) moveBranchLeft() {
+	cols := m.effectiveCols()
+	oc := m.offshootCount()
+	if m.branchIdx >= oc {
+		return // primary is a single card
+	}
+	rowStart := (m.branchIdx / cols) * cols
+	if m.branchIdx > rowStart {
+		m.branchIdx--
+	}
 }
 
 // handleCommitKey processes keys in commit cards view.
@@ -405,11 +849,8 @@ func (m *Model) halfPage() int {
 	return max(m.height/h/2, 1)
 }
 
-// activeNodeHeight returns the row height per entry for the active view.
+// activeNodeHeight returns the row height per entry for the commit view.
 func (m *Model) activeNodeHeight() int {
-	if m.mode == viewBranches {
-		return branchNodeHeight
-	}
 	return nodeHeight
 }
 
@@ -460,14 +901,59 @@ func (m *Model) selectionCmd() tea.Cmd {
 // Navigation helpers (branch view)
 // ---------------------------------------------------------------------------
 
-func (m *Model) ensureBranchVisible() {
-	if m.branchIdx < m.branchScrollOff {
-		m.branchScrollOff = m.branchIdx
-		return
+// branchRow returns the visual row index for a flat branch index.
+// Offshoot branches (indices 0..offshootCount-1) are arranged in rows of
+// effectiveCols; the primary branch occupies the final row.
+func (m *Model) branchRow(idx int) int {
+	oc := m.offshootCount()
+	if idx >= oc {
+		return m.offshootRowCount() // primary is always the last row
 	}
-	vis := m.visibleNodeCount()
-	if m.branchIdx >= m.branchScrollOff+vis {
-		m.branchScrollOff = m.branchIdx - vis + 1
+	return idx / m.effectiveCols()
+}
+
+// effectiveCols returns the number of offshoot columns for the current width
+// and branch count.
+func (m *Model) effectiveCols() int {
+	return min(branchCols(m.width), max(m.offshootCount(), 1))
+}
+
+// offshootCount returns the number of non-primary branches.
+func (m *Model) offshootCount() int {
+	return max(len(m.branches)-1, 0)
+}
+
+// offshootRowCount returns how many visual rows the offshoots occupy.
+func (m *Model) offshootRowCount() int {
+	oc := m.offshootCount()
+	cols := m.effectiveCols()
+	return (oc + cols - 1) / cols
+}
+
+// totalBranchRows returns the total visual row count (offshoots + primary).
+func (m *Model) totalBranchRows() int {
+	if len(m.branches) == 0 {
+		return 0
+	}
+	return m.offshootRowCount() + 1
+}
+
+// visibleBranchRows returns how many branch rows fit in the viewport.
+func (m *Model) visibleBranchRows() int {
+	return max(m.height/branchRowHeight, 1)
+}
+
+// halfBranchPage returns the number of rows for a half-page scroll.
+func (m *Model) halfBranchPage() int {
+	return max(m.visibleBranchRows()/2, 1)
+}
+
+func (m *Model) ensureBranchVisible() {
+	row := m.branchRow(m.branchIdx)
+	if row < m.branchScrollOff {
+		m.branchScrollOff = row
+	} else if row >= m.branchScrollOff+m.visibleBranchRows() {
+		m.branchScrollOff = row - m.visibleBranchRows() + 1
 	}
 	m.clampBranchScroll()
 }
@@ -478,17 +964,7 @@ func (m *Model) clampBranchScroll() {
 }
 
 func (m *Model) branchMaxScroll() int {
-	return max(len(m.branches)-m.visibleNodeCount(), 0)
-}
-
-func (m *Model) branchVisibleRange() []int {
-	count := m.visibleNodeCount()
-	endIdx := min(m.branchScrollOff+count, len(m.branches))
-	indices := make([]int, 0, endIdx-m.branchScrollOff)
-	for i := m.branchScrollOff; i < endIdx; i++ {
-		indices = append(indices, i)
-	}
-	return indices
+	return max(m.totalBranchRows()-m.visibleBranchRows(), 0)
 }
 
 // ---------------------------------------------------------------------------

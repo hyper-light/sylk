@@ -664,6 +664,14 @@ func (m *AppModel) nudgeGitWatcher() {
 	}
 }
 
+// syncStagedFiles pushes the git panel's staged-files state to the commit tree
+// so the [Commit] badge reflects current staging.
+func (m *AppModel) syncStagedFiles() {
+	if m.commitTree != nil && m.gitPanel != nil {
+		m.commitTree.SetHasStagedFiles(m.gitPanel.HasAnyStagedFiles())
+	}
+}
+
 // Update dispatches incoming messages and ensures the tick/blink/LSP-flush
 // chains are running at the appropriate speed for the current activity level.
 func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
@@ -816,7 +824,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	case gitBranchesLoadedMsg:
 		if m.commitTree != nil {
-			m.commitTree.SetBranches(typed.branches)
+			m.commitTree.SetBranches(typed.branches, typed.defaultBranch)
+			m.commitTree.SetWorkingTreeStatus(typed.dirty, typed.conflicts)
 		}
 		return m, nil
 	case gitBranchCommitsLoadedMsg:
@@ -834,6 +843,92 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.loadBranchCommitsCmd(typed.Name)
 		}
 		return m, nil
+
+	case gitpanel.BranchCheckedOutMsg:
+		m.statusBar.SetFlash("Switched to " + typed.Name)
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case gitpanel.BranchCheckoutBlockedMsg:
+		m.statusBar.SetFlash(typed.Reason)
+		return m, nil
+
+	case committree.BranchSwitchMsg:
+		if m.gitClient != nil {
+			gc := m.gitClient
+			name := typed.Name
+			return m, func() tea.Msg {
+				if err := gc.CheckoutBranch(name); err != nil {
+					return gitpanel.BranchCheckoutBlockedMsg{Reason: err.Error()}
+				}
+				return gitpanel.BranchCheckedOutMsg{Name: name}
+			}
+		}
+		return m, nil
+
+	case committree.BranchDeleteMsg:
+		if m.gitClient != nil {
+			gc := m.gitClient
+			name := typed.Name
+			return m, func() tea.Msg {
+				if err := gc.DeleteBranch(name); err != nil {
+					return branchDeleteFailedMsg{reason: err.Error()}
+				}
+				return branchDeletedMsg{name: name}
+			}
+		}
+		return m, nil
+
+	case branchDeletedMsg:
+		m.statusBar.SetFlash("Deleted branch " + typed.name)
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case branchDeleteFailedMsg:
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
+	case committree.CommitRequestMsg:
+		if m.gitClient != nil && m.gitPanel != nil {
+			gc := m.gitClient
+			paths := m.gitPanel.StagedFilePaths()
+			message := typed.Message
+			return m, func() tea.Msg {
+				if len(paths) == 0 {
+					return commitFailedMsg{reason: "no files staged"}
+				}
+				if err := gc.CommitFiles(paths, message); err != nil {
+					return commitFailedMsg{reason: err.Error()}
+				}
+				return commitSucceededMsg{message: message}
+			}
+		}
+		return m, nil
+
+	case commitSucceededMsg:
+		m.statusBar.SetFlash("Committed: " + typed.message)
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case commitFailedMsg:
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
 	case gitStatsLoadedMsg:
 		if m.commitTree != nil {
 			m.commitTree.UpdateStats(typed.stats)
@@ -2905,7 +3000,10 @@ func (m *AppModel) exitEditMode() {
 // gitBranchesLoadedMsg carries branch data loaded asynchronously for the
 // commit tree panel's branch view.
 type gitBranchesLoadedMsg struct {
-	branches []committree.BranchNode
+	branches      []committree.BranchNode
+	defaultBranch string
+	dirty         bool // working tree has uncommitted changes
+	conflicts     bool // working tree has merge conflicts
 }
 
 // gitBranchCommitsLoadedMsg carries commit data for a single branch,
@@ -2920,6 +3018,11 @@ type gitStatsLoadedMsg struct {
 	stats map[string][2]int // hash → [additions, deletions]
 }
 
+type branchDeletedMsg struct{ name string }
+type branchDeleteFailedMsg struct{ reason string }
+type commitSucceededMsg struct{ message string }
+type commitFailedMsg struct{ reason string }
+
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.
 func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
@@ -2929,6 +3032,20 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 		if err != nil {
 			return gitBranchesLoadedMsg{}
 		}
+		defaultBranch := gc.DefaultBranch()
+
+		// Working tree status.
+		statuses, _ := gc.UncommittedFileStatuses()
+		dirty := len(statuses) > 0
+		var conflicts bool
+		for _, s := range statuses {
+			if s == "!" {
+				conflicts = true
+				break
+			}
+		}
+
+		const commitLimit = 1000
 		nodes := make([]committree.BranchNode, len(branches))
 		for i, b := range branches {
 			nodes[i] = committree.BranchNode{
@@ -2939,8 +3056,19 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 				AuthorTime: b.AuthorTime,
 				IsHead:     b.IsHead,
 			}
+			count, capped, cErr := gc.CountBranchCommits(b.Name, commitLimit)
+			if cErr == nil {
+				nodes[i].CommitCount = count
+				nodes[i].CommitCountCapped = capped
+			}
 		}
-		return gitBranchesLoadedMsg{branches: nodes}
+
+		return gitBranchesLoadedMsg{
+			branches:      nodes,
+			defaultBranch: defaultBranch,
+			dirty:         dirty,
+			conflicts:     conflicts,
+		}
 	}
 }
 
@@ -5427,6 +5555,9 @@ func (m *AppModel) tickScrollMomentum() {
 		m.previewPanel.SetBounceOffset(m.bounceOffset(pane.PaneFocusID(m.previewPane)))
 	}
 	m.fileTree.SetBounceOffset(m.bounceOffset(component.FocusFileTree))
+	if m.commitTree != nil {
+		m.commitTree.SetBounceOffset(m.bounceOffset(component.FocusCommitTree))
+	}
 }
 
 // settled reports whether the spring is close enough to target to stop.
@@ -6708,6 +6839,7 @@ func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
 		gitComp, gitCmd := m.gitPanel.Update(raw)
 		m.gitPanel = gitComp.(*gitpanel.Model)
 		cmds = appendCmd(cmds, gitCmd)
+		m.syncStagedFiles()
 	}
 
 	return tea.Batch(cmds...)
@@ -6754,6 +6886,7 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 	case component.FocusGitPanel:
 		comp, cmd := m.gitPanel.Update(key)
 		m.gitPanel = comp.(*gitpanel.Model)
+		m.syncStagedFiles()
 		return cmd
 	case component.FocusCommitTree:
 		comp, cmd := m.commitTree.Update(key)
@@ -8094,6 +8227,9 @@ func (m *AppModel) needsBlink() bool {
 		return true
 	}
 	if m.gitMode && m.gitPanel.NeedsBlink() {
+		return true
+	}
+	if m.gitMode && m.commitTree != nil && m.commitTree.NeedsBlink() {
 		return true
 	}
 	return m.fileTree.NeedsBlink()

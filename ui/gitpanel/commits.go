@@ -25,9 +25,31 @@ func (e commitEntry) FilterText() string  { return e.shortHash + " " + e.subject
 func (e commitEntry) SortKey() string     { return e.subject }
 func (e commitEntry) SortTime() time.Time { return e.time }
 
+// commitColWidths holds pre-computed max column widths for aligned rendering.
+type commitColWidths struct {
+	author int // max author name character width
+}
+
 // commitsTab holds the list state for the Commits tab.
 type commitsTab struct {
 	listState
+	colWidths commitColWidths
+}
+
+// computeColWidths scans all entries and records the widest author column
+// so every row can be padded to the same alignment.
+func (ct *commitsTab) computeColWidths() {
+	var maxAuthor int
+	for _, e := range ct.entries {
+		ce, ok := e.(commitEntry)
+		if !ok {
+			continue
+		}
+		if aw := len(ce.author); aw > maxAuthor {
+			maxAuthor = aw
+		}
+	}
+	ct.colWidths = commitColWidths{author: maxAuthor}
 }
 
 // loadCommits fetches commits from the git client and converts them to
@@ -59,7 +81,7 @@ func loadCommits(gc *git.GitClient) []commitEntry {
 // highlighting when selected.
 //
 // Format: shortHash  subject (truncated)  author  relativeTime
-func renderCommitEntry(e commitEntry, selected bool, width int, th *theme.Theme) string {
+func renderCommitEntry(e commitEntry, selected bool, width int, th *theme.Theme, cols commitColWidths) string {
 	p := th.Palette
 
 	hashStyle := lipgloss.NewStyle().Foreground(p.Primary)
@@ -81,15 +103,20 @@ func renderCommitEntry(e commitEntry, selected bool, width int, th *theme.Theme)
 	}
 
 	hash := hashStyle.Render(e.shortHash)
+
+	// Author padded to fixed column width.
 	author := authorStyle.Render(e.author)
+	if pad := cols.author - len(e.author); pad > 0 {
+		author += padStyle.Render(strings.Repeat(" ", pad))
+	}
+
 	relTime := timeStyle.Render(relativeTime(e.time))
 
-	// Calculate space for subject: width - hash(7) - separators(6) - author - time
+	// Subject fills remaining space after fixed-width columns.
 	hashWidth := len(e.shortHash)
-	authorWidth := lipgloss.Width(author)
 	timeWidth := lipgloss.Width(relTime)
 	separators := 6 // two-space gaps between columns
-	fixedWidth := hashWidth + authorWidth + timeWidth + separators
+	fixedWidth := hashWidth + cols.author + timeWidth + separators
 	subjectWidth := width - fixedWidth
 
 	subject := e.subject

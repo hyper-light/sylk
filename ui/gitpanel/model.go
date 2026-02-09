@@ -18,15 +18,26 @@ var (
 	_ component.Component = (*Model)(nil)
 )
 
-// GitTab identifies one of the three tabs in the git explorer.
+// GitTab identifies one of the tabs in the git explorer.
 type GitTab int
 
 const (
 	TabCommits     GitTab = iota
 	TabBranches
+	TabTags
 	TabUncommitted
 	tabCount // sentinel: total tab count
 )
+
+// -------------------------------------------------------------------------
+// Public messages (handled by the parent)
+// -------------------------------------------------------------------------
+
+// BranchCheckedOutMsg is emitted after a successful branch checkout.
+type BranchCheckedOutMsg struct{ Name string }
+
+// BranchCheckoutBlockedMsg is emitted when checkout is blocked.
+type BranchCheckoutBlockedMsg struct{ Reason string }
 
 // -------------------------------------------------------------------------
 // Async load messages
@@ -34,7 +45,12 @@ const (
 
 type commitsLoadedMsg struct{ entries []commitEntry }
 type branchesLoadedMsg struct{ entries []branchEntry }
+type tagsLoadedMsg struct{ entries []tagEntry }
 type uncommittedLoadedMsg struct{ entries []uncommittedEntry }
+type checkoutResultMsg struct {
+	name string
+	err  error
+}
 
 // -------------------------------------------------------------------------
 // Model
@@ -53,6 +69,7 @@ type Model struct {
 
 	commits     commitsTab
 	branches    branchesTab
+	tags        tagsTab
 	uncommitted uncommittedTab
 }
 
@@ -67,6 +84,7 @@ func New(th *theme.Theme, gc *git.GitClient) *Model {
 	// Initialize sort defaults (newest first).
 	m.commits.sortMode = sortAgeDesc
 	m.branches.sortMode = sortAgeDesc
+	m.tags.sortMode = sortAgeDesc
 	m.uncommitted.sortMode = sortAlphaAsc
 
 	return m
@@ -117,10 +135,25 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 		m.setBranchEntries(typed.entries)
 		return m, nil
 
+	case tagsLoadedMsg:
+		m.viewDirty = true
+		m.setTagEntries(typed.entries)
+		return m, nil
+
 	case uncommittedLoadedMsg:
 		m.viewDirty = true
 		m.setUncommittedEntries(typed.entries)
 		return m, nil
+
+	case checkoutResultMsg:
+		if typed.err != nil {
+			return m, func() tea.Msg {
+				return BranchCheckoutBlockedMsg{Reason: typed.err.Error()}
+			}
+		}
+		return m, func() tea.Msg {
+			return BranchCheckedOutMsg{Name: typed.name}
+		}
 	}
 
 	return m, nil
@@ -137,6 +170,7 @@ func (m *Model) LoadData() tea.Cmd {
 	return tea.Batch(
 		func() tea.Msg { return commitsLoadedMsg{entries: loadCommits(gc)} },
 		func() tea.Msg { return branchesLoadedMsg{entries: loadBranches(gc)} },
+		func() tea.Msg { return tagsLoadedMsg{entries: loadTags(gc)} },
 		func() tea.Msg { return uncommittedLoadedMsg{entries: loadUncommitted(gc)} },
 	)
 }
@@ -148,6 +182,7 @@ func (m *Model) setCommitEntries(raw []commitEntry) {
 	for i, e := range raw {
 		ls.entries[i] = e
 	}
+	m.commits.computeColWidths()
 	ls.rebuildFiltered()
 }
 
@@ -158,18 +193,45 @@ func (m *Model) setBranchEntries(raw []branchEntry) {
 	for i, e := range raw {
 		ls.entries[i] = e
 	}
+	m.branches.computeColWidths()
 	ls.rebuildFiltered()
 }
 
-// setUncommittedEntries populates the uncommitted tab with loaded data
-// and initializes the parallel staging states slice.
-func (m *Model) setUncommittedEntries(raw []uncommittedEntry) {
-	ls := &m.uncommitted.listState
+// setTagEntries populates the tags tab with loaded data.
+func (m *Model) setTagEntries(raw []tagEntry) {
+	ls := &m.tags.listState
 	ls.entries = make([]listEntry, len(raw))
 	for i, e := range raw {
 		ls.entries[i] = e
 	}
-	m.uncommitted.stagingStates = make([]StagingState, len(raw))
+	m.tags.computeColWidths()
+	ls.rebuildFiltered()
+}
+
+// setUncommittedEntries populates the uncommitted tab with loaded data
+// and preserves staging states for files that are still present.
+func (m *Model) setUncommittedEntries(raw []uncommittedEntry) {
+	// Build lookup from old entries so we can restore staging states.
+	prev := make(map[string]StagingState, len(m.uncommitted.stagingStates))
+	for i, s := range m.uncommitted.stagingStates {
+		if s == StagingDefault || i >= len(m.uncommitted.entries) {
+			continue
+		}
+		if ue, ok := m.uncommitted.entries[i].(uncommittedEntry); ok {
+			prev[ue.path] = s
+		}
+	}
+
+	ls := &m.uncommitted.listState
+	ls.entries = make([]listEntry, len(raw))
+	states := make([]StagingState, len(raw))
+	for i, e := range raw {
+		ls.entries[i] = e
+		if s, ok := prev[e.path]; ok {
+			states[i] = s
+		}
+	}
+	m.uncommitted.stagingStates = states
 	ls.rebuildFiltered()
 }
 
@@ -287,10 +349,96 @@ func (m *Model) cycleTab() {
 	m.activeTab = GitTab((int(m.activeTab) + 1) % int(tabCount))
 }
 
-// selectEntry handles enter on the currently selected entry. Returns nil
-// for now; the parent can intercept selection messages in a follow-up.
+// selectEntry handles enter on the currently selected entry.
 func (m *Model) selectEntry() tea.Cmd {
-	return nil
+	if m.activeTab != TabBranches {
+		return nil
+	}
+	return m.checkoutSelectedBranch()
+}
+
+// checkoutSelectedBranch attempts to checkout the selected branch.
+// Returns a blocked message if the working tree is dirty or conflicted,
+// or if the branch is already checked out.
+func (m *Model) checkoutSelectedBranch() tea.Cmd {
+	ls := &m.branches.listState
+	if len(ls.filtered) == 0 {
+		return nil
+	}
+
+	idx := ls.filtered[ls.cursor]
+	entry, ok := ls.entries[idx].(branchEntry)
+	if !ok {
+		return nil
+	}
+
+	if entry.isHead {
+		return nil // already on this branch
+	}
+
+	// Check if working tree blocks checkout.
+	if m.headHasConflicts() {
+		return func() tea.Msg {
+			return BranchCheckoutBlockedMsg{Reason: "resolve conflicts before switching branches"}
+		}
+	}
+	if m.headHasUncommitted() {
+		return func() tea.Msg {
+			return BranchCheckoutBlockedMsg{Reason: "commit or stash changes before switching branches"}
+		}
+	}
+
+	gc := m.gitClient
+	name := entry.name
+	return func() tea.Msg {
+		return checkoutResultMsg{name: name, err: gc.CheckoutBranch(name)}
+	}
+}
+
+// headHasConflicts reports whether the HEAD branch entry has merge conflicts.
+func (m *Model) headHasConflicts() bool {
+	for _, e := range m.branches.entries {
+		if be, ok := e.(branchEntry); ok && be.isHead {
+			return be.hasConflicts
+		}
+	}
+	return false
+}
+
+// headHasUncommitted reports whether the HEAD branch entry has uncommitted changes.
+func (m *Model) headHasUncommitted() bool {
+	for _, e := range m.branches.entries {
+		if be, ok := e.(branchEntry); ok && be.isHead {
+			return be.uncommitted
+		}
+	}
+	return false
+}
+
+// HasAnyStagedFiles reports whether any uncommitted file is marked StagingStaged.
+func (m *Model) HasAnyStagedFiles() bool {
+	for _, s := range m.uncommitted.stagingStates {
+		if s == StagingStaged {
+			return true
+		}
+	}
+	return false
+}
+
+// StagedFilePaths returns the paths of all uncommitted files marked StagingStaged.
+func (m *Model) StagedFilePaths() []string {
+	var paths []string
+	for i, s := range m.uncommitted.stagingStates {
+		if s != StagingStaged {
+			continue
+		}
+		if i < len(m.uncommitted.entries) {
+			if ue, ok := m.uncommitted.entries[i].(uncommittedEntry); ok {
+				paths = append(paths, ue.path)
+			}
+		}
+	}
+	return paths
 }
 
 // ToggleSearch activates or deactivates the filter bar on the active tab.
@@ -340,6 +488,8 @@ func (m *Model) activeListState() *listState {
 	switch m.activeTab {
 	case TabBranches:
 		return &m.branches.listState
+	case TabTags:
+		return &m.tags.listState
 	case TabUncommitted:
 		return &m.uncommitted.listState
 	default:
@@ -421,9 +571,12 @@ func (m *Model) renderEntries(ls *listState, height int) []string {
 func (m *Model) renderSingleEntry(entry listEntry, entryIdx int, selected bool) string {
 	switch e := entry.(type) {
 	case commitEntry:
-		return renderCommitEntry(e, selected, m.width, m.theme)
+		return renderCommitEntry(e, selected, m.width, m.theme, m.commits.colWidths)
 	case branchEntry:
-		return renderBranchEntry(e, selected, m.width, m.theme)
+		dirtyTree := m.headHasUncommitted() || m.headHasConflicts()
+		return renderBranchEntry(e, selected, m.width, m.theme, m.branches.colWidths, dirtyTree)
+	case tagEntry:
+		return renderTagEntry(e, selected, m.width, m.theme, m.tags.colWidths)
 	case uncommittedEntry:
 		staging := StagingDefault
 		if entryIdx < len(m.uncommitted.stagingStates) {

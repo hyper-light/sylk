@@ -18,12 +18,14 @@ type TreeNode struct {
 
 // BranchNode represents a single branch in the branch tree view.
 type BranchNode struct {
-	Name       string    // Short branch name (e.g., "main").
-	Hash       string    // Tip commit full hash.
-	ShortHash  string    // Tip commit abbreviated hash.
-	Subject    string    // Tip commit message first line.
-	AuthorTime time.Time // Tip commit author time.
-	IsHead     bool      // True if this is the current branch (HEAD).
+	Name              string    // Short branch name (e.g., "main").
+	Hash              string    // Tip commit full hash.
+	ShortHash         string    // Tip commit abbreviated hash.
+	Subject           string    // Tip commit message first line.
+	AuthorTime        time.Time // Tip commit author time.
+	IsHead            bool      // True if this is the current branch (HEAD).
+	CommitCount       int       // Number of commits reachable from tip.
+	CommitCountCapped bool      // True if CommitCount hit the counting limit.
 }
 
 // relativeTime formats a time.Time as a human-readable relative duration.

@@ -42,6 +42,9 @@ var (
 
 	// ErrCacheDisabled indicates caching is disabled.
 	ErrCacheDisabled = errors.New("cache is disabled")
+
+	// ErrDeleteCheckedOut indicates an attempt to delete the checked-out branch.
+	ErrDeleteCheckedOut = errors.New("cannot delete the checked-out branch")
 )
 
 // =============================================================================

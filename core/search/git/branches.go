@@ -2,6 +2,7 @@ package git
 
 import (
 	"io"
+	"strings"
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
@@ -249,4 +250,270 @@ func treeCommitFromObject(co *object.Commit, branchMap map[string]string) TreeCo
 		IsMerge:      len(co.ParentHashes) > 1,
 		Branch:       branchMap[hash],
 	}
+}
+
+// =============================================================================
+// DefaultBranch
+// =============================================================================
+
+// DefaultBranch returns the name of the repository's default branch.
+// Detection strategy (first match wins):
+//  1. refs/remotes/origin/HEAD symbolic reference target
+//  2. Local branch named "main"
+//  3. Local branch named "master"
+//  4. The currently checked-out branch (HEAD)
+//
+// Returns an empty string if the repository has no branches.
+func (c *GitClient) DefaultBranch() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo || c.repo == nil {
+		return ""
+	}
+
+	// Strategy 1: origin/HEAD symbolic ref.
+	if name := c.defaultFromOriginHead(); name != "" {
+		return name
+	}
+
+	// Strategy 2+3: well-known names.
+	if c.branchExists("main") {
+		return "main"
+	}
+	if c.branchExists("master") {
+		return "master"
+	}
+
+	// Strategy 4: current HEAD branch.
+	ref, err := c.repo.Head()
+	if err != nil {
+		return ""
+	}
+	return ref.Name().Short()
+}
+
+// defaultFromOriginHead extracts the default branch from the origin/HEAD
+// symbolic reference. Returns empty string if unavailable.
+func (c *GitClient) defaultFromOriginHead() string {
+	ref, err := c.repo.Reference(
+		plumbing.ReferenceName("refs/remotes/origin/HEAD"), false,
+	)
+	if err != nil || ref.Type() != plumbing.SymbolicReference {
+		return ""
+	}
+	target := ref.Target().String()
+	return strings.TrimPrefix(target, "refs/remotes/origin/")
+}
+
+// branchExists checks whether a local branch with the given name exists.
+func (c *GitClient) branchExists(name string) bool {
+	_, err := c.repo.Reference(plumbing.NewBranchReferenceName(name), true)
+	return err == nil
+}
+
+// =============================================================================
+// Checkout
+// =============================================================================
+
+// CheckoutBranch switches the working tree to the named local branch.
+// Uses a write lock because it mutates HEAD and the working tree.
+// Returns ErrNotGitRepo if not a git repository.
+func (c *GitClient) CheckoutBranch(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	return wt.Checkout(&gogit.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(name),
+	})
+}
+
+// =============================================================================
+// Delete
+// =============================================================================
+
+// DeleteBranch removes a local branch reference.
+// Returns ErrDeleteCheckedOut if the branch is currently checked out.
+// Returns ErrNotGitRepo if not a git repository.
+func (c *GitClient) DeleteBranch(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+
+	// Prevent deleting the currently checked-out branch.
+	head, err := c.repo.Head()
+	if err == nil && head.Name().Short() == name {
+		return ErrDeleteCheckedOut
+	}
+
+	// Remove the branch reference.
+	refName := plumbing.NewBranchReferenceName(name)
+	if err := c.repo.Storer.RemoveReference(refName); err != nil {
+		return err
+	}
+
+	// Remove branch config entry (best-effort; may not exist).
+	_ = c.repo.DeleteBranch(name)
+
+	return nil
+}
+
+// =============================================================================
+// Commit Count
+// =============================================================================
+
+// CountBranchCommits returns the number of commits reachable from a branch tip.
+// If the count reaches limit, iteration stops early and capped is true.
+// Limit ≤ 0 means unlimited (count all commits).
+func (c *GitClient) CountBranchCommits(name string, limit int) (count int, capped bool, err error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return 0, false, ErrNotGitRepo
+	}
+
+	ref, err := c.repo.Reference(plumbing.NewBranchReferenceName(name), true)
+	if err != nil {
+		return 0, false, err
+	}
+
+	iter, err := c.repo.Log(&gogit.LogOptions{
+		From:  ref.Hash(),
+		Order: gogit.LogOrderCommitterTime,
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	defer iter.Close()
+
+	_ = iter.ForEach(func(_ *object.Commit) error {
+		count++
+		if limit > 0 && count >= limit {
+			return io.EOF
+		}
+		return nil
+	})
+
+	capped = limit > 0 && count >= limit
+	return count, capped, nil
+}
+
+// =============================================================================
+// Commit
+// =============================================================================
+
+// CommitFiles stages the given file paths and creates a commit with the
+// provided message. Uses a write lock because it mutates the index and HEAD.
+// Returns ErrNotGitRepo if not a git repository.
+func (c *GitClient) CommitFiles(paths []string, message string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	for _, p := range paths {
+		if _, err := wt.Add(p); err != nil {
+			return err
+		}
+	}
+
+	_, err = wt.Commit(message, &gogit.CommitOptions{})
+	return err
+}
+
+// =============================================================================
+// Tags
+// =============================================================================
+
+// TagInfo represents metadata about a git tag.
+type TagInfo struct {
+	Name       string    // Short tag name.
+	Hash       string    // Full commit hash the tag points to.
+	ShortHash  string    // Abbreviated commit hash (7 chars).
+	Subject    string    // First line of the tagged commit (or tag message for annotated).
+	AuthorTime time.Time // Author time of the tagged commit.
+	Annotated  bool      // True if this is an annotated tag.
+}
+
+// ListTags returns metadata for all tags in the repository.
+// Returns ErrNotGitRepo if not a git repository.
+func (c *GitClient) ListTags() ([]TagInfo, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo || c.repo == nil {
+		return nil, ErrNotGitRepo
+	}
+
+	iter, err := c.repo.Tags()
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	var tags []TagInfo
+	_ = iter.ForEach(func(ref *plumbing.Reference) error {
+		info := c.tagInfoFromRef(ref)
+		tags = append(tags, info)
+		return nil
+	})
+
+	return tags, nil
+}
+
+// tagInfoFromRef builds a TagInfo from a tag reference.
+// Handles both lightweight tags (point directly to a commit) and
+// annotated tags (point to a tag object which references a commit).
+func (c *GitClient) tagInfoFromRef(ref *plumbing.Reference) TagInfo {
+	name := ref.Name().Short()
+	hash := ref.Hash()
+
+	info := TagInfo{
+		Name:      name,
+		Hash:      hash.String(),
+		ShortHash: hash.String()[:7],
+	}
+
+	// Try annotated tag first.
+	tagObj, err := c.repo.TagObject(hash)
+	if err == nil {
+		info.Annotated = true
+		info.Subject = extractSubject(tagObj.Message)
+		info.AuthorTime = tagObj.Tagger.When
+		// Resolve to the commit hash for display.
+		if commit, err := tagObj.Commit(); err == nil {
+			info.Hash = commit.Hash.String()
+			info.ShortHash = commit.Hash.String()[:7]
+		}
+		return info
+	}
+
+	// Lightweight tag — resolve directly to commit.
+	commit, err := c.repo.CommitObject(hash)
+	if err == nil {
+		info.Subject = extractSubject(commit.Message)
+		info.AuthorTime = commit.Author.When
+	}
+
+	return info
 }
