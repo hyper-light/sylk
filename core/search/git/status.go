@@ -243,6 +243,47 @@ func propagatePath(m map[string]GitFileState, path string, state GitFileState) {
 }
 
 // =============================================================================
+// UncommittedFileStatuses
+// =============================================================================
+
+// UncommittedFileStatuses returns all files with uncommitted changes,
+// mapped to their single-character status code (M, A, D, ?, !).
+// Uses the go-git native API (no exec).
+func (c *GitClient) UncommittedFileStatuses() (map[string]string, error) {
+	wts, err := c.WorktreeStatus()
+	if err != nil {
+		return nil, err
+	}
+	return flattenWorkingTreeStatus(wts), nil
+}
+
+// flattenWorkingTreeStatus converts categorized file lists into a flat
+// map from path to single-character status code.
+func flattenWorkingTreeStatus(wts *WorkingTreeStatus) map[string]string {
+	total := len(wts.Modified) + len(wts.Added) + len(wts.Deleted) +
+		len(wts.Untracked) + len(wts.Conflict)
+	m := make(map[string]string, total)
+
+	for _, p := range wts.Modified {
+		m[p] = "M"
+	}
+	for _, p := range wts.Added {
+		m[p] = "A"
+	}
+	for _, p := range wts.Deleted {
+		m[p] = "D"
+	}
+	for _, p := range wts.Untracked {
+		m[p] = "?"
+	}
+	for _, p := range wts.Conflict {
+		m[p] = "!"
+	}
+
+	return m
+}
+
+// =============================================================================
 // BuildTrackedDirs
 // =============================================================================
 

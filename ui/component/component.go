@@ -19,6 +19,8 @@ const (
 	FocusFileTree
 	FocusFieldManual
 	FocusPreview
+	FocusGitPanel
+	FocusCommitTree
 
 	// FocusPaneBase is the starting FocusID for dynamically allocated
 	// editor panes. Each pane gets FocusPaneBase + FocusID(paneID).

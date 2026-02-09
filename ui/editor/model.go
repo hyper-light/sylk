@@ -758,12 +758,14 @@ func (m *Model) ShowHoverAt(contents string, line, col int) {
 	}
 	m.hoverPopup.Show(contents, line, col)
 	m.hoverActive = true
+	m.vc.valid = false // Invalidate view cache so the new popup renders.
 }
 
 // DismissHover hides the hover tooltip.
 func (m *Model) DismissHover() {
 	m.hoverPopup.Dismiss()
 	m.hoverActive = false
+	m.vc.valid = false // Invalidate view cache so the dismissed popup re-renders.
 }
 
 // HoverActive reports whether the hover tooltip is visible.
@@ -2059,6 +2061,7 @@ func (m *Model) ClickAt(x, y int) {
 		m.DismissSignatureHelp()
 	}
 	m.setCursorFromViewport(x, y)
+	m.vc.valid = false
 	m.syncStatusLine()
 	if hadSelection {
 		m.clearSelectionSearch()
@@ -2070,6 +2073,7 @@ func (m *Model) ClickAt(x, y int) {
 func (m *Model) StartDragSelection() {
 	m.visualMode = mode.NewVisualMode(m.theme, m.state.Cursor, mode.VisualChar)
 	m.currentMode = mode.ModeVisual
+	m.vc.valid = false
 	m.syncStatusLine()
 	m.recomputeSelectionSearch()
 }
@@ -2082,6 +2086,7 @@ func (m *Model) ExtendDragSelection(x, y int) {
 	}
 	m.setCursorFromViewport(x, y)
 	m.visualMode.State.CursorPos = m.state.Cursor
+	m.vc.valid = false
 	m.syncStatusLine()
 	m.recomputeSelectionSearch()
 }

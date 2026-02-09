@@ -1234,7 +1234,11 @@ func (m *Model) HoverAt(viewX, viewY int) bool {
 	if m.mode != viewTabs {
 		prev := m.tabCloseHover
 		m.tabCloseHover = -1
-		return prev != -1
+		changed := prev != -1
+		if changed {
+			m.viewDirty = true
+		}
+		return changed
 	}
 	top := treeChromeHeight
 	if m.tabFiltering {
@@ -1245,19 +1249,31 @@ func (m *Model) HoverAt(viewX, viewY int) bool {
 	prev := m.tabCloseHover
 	if bodyY < 0 || viewX < contentWidth-2 {
 		m.tabCloseHover = -1
+		if prev != m.tabCloseHover {
+			m.viewDirty = true
+		}
 		return prev != m.tabCloseHover
 	}
 	idx := m.tabScroll + bodyY
 	if idx < 0 || idx >= len(m.tabFiltered) {
 		m.tabCloseHover = -1
+		if prev != m.tabCloseHover {
+			m.viewDirty = true
+		}
 		return prev != m.tabCloseHover
 	}
 	m.tabCloseHover = idx
+	if prev != m.tabCloseHover {
+		m.viewDirty = true
+	}
 	return prev != m.tabCloseHover
 }
 
 // ClearTabCloseHover resets the close-icon hover state.
 func (m *Model) ClearTabCloseHover() {
+	if m.tabCloseHover != -1 {
+		m.viewDirty = true
+	}
 	m.tabCloseHover = -1
 }
 

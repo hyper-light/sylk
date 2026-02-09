@@ -494,6 +494,47 @@ func renderOverflow(cfg Config) string {
 	return b.String()
 }
 
+// TabBounds returns the (startX, width) of the tab at index i.
+// Returns (0, 0) when i is out of range or the bar is empty.
+func TabBounds(cfg Config, i int) (startX, tabW int) {
+	if len(cfg.Tabs) == 0 || cfg.Width < 1 || i < 0 || i >= len(cfg.Tabs) {
+		return 0, 0
+	}
+	cfg.Active = clampActive(cfg)
+	widths := resolveWidths(cfg)
+	total := sumWidths(widths, len(cfg.Tabs))
+	if total > cfg.Width {
+		return tabBoundsOverflow(cfg, i)
+	}
+	pos := 0
+	for j := range i {
+		pos += widths[j] + separatorWidth
+	}
+	return pos, widths[i]
+}
+
+// tabBoundsOverflow computes tab bounds in overflow mode.
+func tabBoundsOverflow(cfg Config, i int) (startX, tabW int) {
+	lo, hi := VisibleRange(cfg)
+	if i < lo || i > hi {
+		return 0, 0
+	}
+	pos := 0
+	if lo > 0 {
+		pos += overflowIndicatorWidth
+	}
+	for j := lo; j <= i; j++ {
+		if j > lo {
+			pos += separatorWidth
+		}
+		if j == i {
+			return pos, naturalWidth(cfg, cfg.Tabs[j])
+		}
+		pos += naturalWidth(cfg, cfg.Tabs[j])
+	}
+	return 0, 0
+}
+
 // HitResult describes what was clicked in the tab bar.
 type HitResult struct {
 	TabIndex   int  // -1 if nothing was hit.

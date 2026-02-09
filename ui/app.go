@@ -28,6 +28,7 @@ import (
 	"github.com/adalundhe/sylk/ui/bridge"
 	"github.com/adalundhe/sylk/ui/chat"
 	codepkg "github.com/adalundhe/sylk/ui/code"
+	"github.com/adalundhe/sylk/ui/committree"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/editor"
@@ -37,10 +38,12 @@ import (
 	"github.com/adalundhe/sylk/ui/fieldmanual"
 	"github.com/adalundhe/sylk/ui/filetree"
 	"github.com/adalundhe/sylk/ui/fonts"
+	"github.com/adalundhe/sylk/ui/gitpanel"
 	inputpkg "github.com/adalundhe/sylk/ui/input"
 	"github.com/adalundhe/sylk/ui/interrupt"
 	knowledgepkg "github.com/adalundhe/sylk/ui/knowledge"
 	"github.com/adalundhe/sylk/ui/layout"
+	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
 	"github.com/adalundhe/sylk/ui/modal"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/pane"
@@ -308,6 +311,17 @@ type AppModel struct {
 	savedChatFocus component.FocusID // Last focused panel in chat mode.
 	savedEditFocus component.FocusID // Last focused panel in edit mode.
 
+	// Git mode (Alt+G).
+	gitMode          bool              // Whether git mode is active.
+	gitClient        *git.GitClient    // Git client for data loading (nil if not a repo).
+	gitPanel         *gitpanel.Model   // Git explorer panel (left slot in git mode).
+	commitTree       *committree.Model // Commit tree visualization (right slot in git mode).
+	savedGitLeftIdx  int               // Saved leftRing.index before git mode.
+	savedGitRightIdx int               // Saved rightRing.index before git mode.
+	savedGitFocus    component.FocusID // Last focused panel in git mode.
+	preGitEditMode   bool              // Whether edit mode was active before entering git mode.
+	prevGitMode      bool              // Detect git mode transitions for dirty detection.
+
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
 	editorDragging  bool // Actual drag motion detected after press.
@@ -355,6 +369,7 @@ type AppModel struct {
 	prevLeftRing  int               // Detect left ring cycling.
 	prevRightRing int               // Detect right ring cycling.
 	prevInputH    int               // Detect input height changes.
+	prevHoverKey  [5]int            // Detect tab hover state changes.
 
 	// Mouse hover tracking for LSP hover tooltips.
 	hoverMouseLine      int // last buffer line the mouse was over (-1 = none)
@@ -389,6 +404,14 @@ type AppModel struct {
 
 	// Preview panel (read-only file preview, rendered in code panel slot).
 	previewPanel *preview.Panel // Independent read-only preview sub-panel.
+
+	// Markdown preview (rendered markdown split-right of the source editor).
+	mdPreviewPane          pane.PaneID         // PaneID of the markdown viewer (0 = none).
+	mdPreviewPanel         *markdownpkg.Panel  // Rendered markdown viewer panel.
+	mdPreviewTabHoverClose int                 // Close hover on markdown preview tab (-1).
+	mdTooltipTab           int                 // Tab index showing "View" tooltip (-1 = none).
+	mdTooltipPane          pane.PaneID         // Pane whose tab shows the tooltip.
+	mdTooltipX             int                 // Local X of tooltip for overlay placement.
 
 	// Pane tree: binary split tree tracking editor + preview layout.
 	// Each editor pane has its own editor.Model and tab order.
@@ -540,13 +563,16 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		bounceSpring:         harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
 		hoverMouseLine:       -1,
 		highlightLine:        -1,
-		tabDragIdx:           -1,
-		tabHoverClose:        -1,
-		previewTabHoverClose: -1,
+		tabDragIdx:             -1,
+		tabHoverClose:          -1,
+		previewTabHoverClose:   -1,
+		mdPreviewTabHoverClose: -1,
+		mdTooltipTab:           -1,
 	}
 
 	app.comp = compositor.New()
 	app.previewPanel = preview.New(th)
+	app.mdPreviewPanel = markdownpkg.New(th)
 	app.paneCounter = 1
 	app.focusedPane = 1
 	app.paneTree = pane.NewLeaf(1)
@@ -566,6 +592,9 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 
 	// Git status watcher for file tree decorations.
 	if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
+		app.gitClient = gc
+		app.gitPanel = gitpanel.New(th, gc)
+		app.commitTree = committree.New(th)
 		if sw, err := git.NewStatusWatcher(gc); err == nil {
 			app.gitWatcher = sw
 		}
@@ -778,6 +807,31 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.GitStatusMsg:
 		m.fileTree.SetGitStatus(typed.StatusMap, typed.TrackedSet, typed.TrackedDirs)
 		return m, m.gitWatchCmd()
+	case gitBranchesLoadedMsg:
+		if m.commitTree != nil {
+			m.commitTree.SetBranches(typed.branches)
+		}
+		return m, nil
+	case gitBranchCommitsLoadedMsg:
+		if m.commitTree != nil {
+			m.commitTree.SetNodes(typed.nodes)
+			hashes := make([]string, len(typed.nodes))
+			for i, n := range typed.nodes {
+				hashes[i] = n.Hash
+			}
+			return m, m.loadGitStatsCmd(hashes)
+		}
+		return m, nil
+	case committree.BranchSelectedMsg:
+		if m.gitMode && m.gitClient != nil {
+			return m, m.loadBranchCommitsCmd(typed.Name)
+		}
+		return m, nil
+	case gitStatsLoadedMsg:
+		if m.commitTree != nil {
+			m.commitTree.UpdateStats(typed.stats)
+		}
+		return m, nil
 	case msg.FileReplacedMsg:
 		return m, m.handleFileReplaced(typed)
 	case msg.MultiFileReplaceDoneMsg:
@@ -1162,6 +1216,10 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.dismissPreview()
 			return m, nil
 		}
+		if m.mdPreviewPane != 0 && m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane) {
+			m.dismissMarkdownPreview()
+			return m, nil
+		}
 		if m.focus.Current() == component.FocusFileTree && m.fileTree.InTabsMode() {
 			if p := m.fileTree.TabCursorPath(); p != "" {
 				return m, m.closeTabByPath(p)
@@ -1175,6 +1233,11 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+	}
+
+	// Alt+G toggles git mode.
+	if key.String() == "alt+g" {
+		return m, m.toggleGitMode()
 	}
 
 	// Alt+E toggles inline edit mode.
@@ -1203,6 +1266,11 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.editMode && m.isEditorFocused() {
 			comp, cmd := m.focusedEditor().Update(key)
 			m.paneEditors[m.focusedPane].editor = comp.(*editor.Model)
+			return m, cmd
+		}
+		if m.gitMode && m.focus.Current() == component.FocusCommitTree && m.commitTree.InCommitView() {
+			comp, cmd := m.commitTree.Update(key)
+			m.commitTree = comp.(*committree.Model)
 			return m, cmd
 		}
 		now := time.Now()
@@ -1289,7 +1357,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Alt+F toggles search/filter when the file tree has focus.
+	// Alt+F toggles search/filter when the file tree or git panel has focus.
 	// In tabs mode it toggles the tab filter; otherwise multi-file search.
 	if ks == "alt+f" && m.focus.Current() == component.FocusFileTree {
 		now := time.Now()
@@ -1304,6 +1372,19 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.fileTree.ToggleSearch()
 		}
+		return m, nil
+	}
+
+	// Alt+F toggles search/filter when the git explorer panel has focus.
+	if ks == "alt+f" && m.gitMode && m.focus.Current() == component.FocusGitPanel && m.gitPanel != nil {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.gitPanel.ToggleSearch()
 		return m, nil
 	}
 
@@ -1368,6 +1449,16 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Alt+_ (alt+shift+-): horizontal split on focused editor pane.
 	if ks == "alt+_" && m.editMode && m.isEditorFocused() {
 		m.splitPane(pane.SplitHorizontal)
+		return m, nil
+	}
+
+	// Alt+Shift+M: toggle markdown preview for the active file.
+	if ks == "alt+M" && m.editMode && m.isEditorFocused() {
+		if m.mdPreviewPane != 0 {
+			m.dismissMarkdownPreview()
+		} else if isMarkdownFile(m.focusedEditor().FilePath()) {
+			m.openMarkdownPreview(m.focusedEditor().FilePath())
+		}
 		return m, nil
 	}
 
@@ -2257,6 +2348,12 @@ var extToLSPLanguage = map[string]string{
 	".ml":   "ocaml",
 }
 
+// isMarkdownFile reports whether path has a markdown extension.
+func isMarkdownFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".md" || ext == ".markdown"
+}
+
 // detectEditorLanguage returns the LSP language ID for a file path.
 func detectEditorLanguage(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))
@@ -2655,6 +2752,10 @@ func (m *AppModel) cycleRing(ring *viewRing, delta int) {
 
 // toggleEditMode switches between inline editing and read-only code viewing.
 func (m *AppModel) toggleEditMode() tea.Cmd {
+	// If git mode is active, exit it first — modes are mutually exclusive.
+	if m.gitMode {
+		m.exitGitMode()
+	}
 	if m.editMode {
 		m.exitEditMode()
 		return nil
@@ -2788,6 +2889,191 @@ func (m *AppModel) exitEditMode() {
 	m.focus.SetFocus(m.savedChatFocus)
 	m.syncFocusState()
 	m.statusBar.SetFlash("View mode")
+}
+
+// ---------------------------------------------------------------------------
+// Git mode (Alt+G)
+// ---------------------------------------------------------------------------
+
+// gitBranchesLoadedMsg carries branch data loaded asynchronously for the
+// commit tree panel's branch view.
+type gitBranchesLoadedMsg struct {
+	branches []committree.BranchNode
+}
+
+// gitBranchCommitsLoadedMsg carries commit data for a single branch,
+// loaded when the user drills into a branch.
+type gitBranchCommitsLoadedMsg struct {
+	branch string
+	nodes  []committree.TreeNode
+}
+
+// gitStatsLoadedMsg carries diff stats loaded asynchronously for commit nodes.
+type gitStatsLoadedMsg struct {
+	stats map[string][2]int // hash → [additions, deletions]
+}
+
+// loadGitBranchesCmd returns a tea.Cmd that loads all local branches
+// via go-git and converts them to BranchNode data for the commit tree panel.
+func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		branches, err := gc.ListBranches()
+		if err != nil {
+			return gitBranchesLoadedMsg{}
+		}
+		nodes := make([]committree.BranchNode, len(branches))
+		for i, b := range branches {
+			nodes[i] = committree.BranchNode{
+				Name:       b.Name,
+				Hash:       b.Hash,
+				ShortHash:  b.ShortHash,
+				Subject:    b.Subject,
+				AuthorTime: b.AuthorTime,
+				IsHead:     b.IsHead,
+			}
+		}
+		return gitBranchesLoadedMsg{branches: nodes}
+	}
+}
+
+// loadBranchCommitsCmd returns a tea.Cmd that loads commits for a single
+// branch via go-git and converts them to TreeNode data.
+func (m *AppModel) loadBranchCommitsCmd(branchName string) tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		commits, err := gc.ListCommitsForBranch(branchName, commitTreeLoadLimit)
+		if err != nil {
+			return gitBranchCommitsLoadedMsg{branch: branchName}
+		}
+		nodes := make([]committree.TreeNode, len(commits))
+		for i, c := range commits {
+			nodes[i] = committree.TreeNode{
+				Hash:       c.Hash,
+				ShortHash:  c.ShortHash,
+				Subject:    c.Subject,
+				Branch:     c.Branch,
+				Author:     c.Author,
+				AuthorTime: c.AuthorTime,
+				Parents:    c.ParentHashes,
+				IsMerge:    c.IsMerge,
+			}
+		}
+		return gitBranchCommitsLoadedMsg{branch: branchName, nodes: nodes}
+	}
+}
+
+// loadGitStatsCmd returns a tea.Cmd that loads diff stats for the given
+// commit hashes via go-git's commit.Stats(). Runs in the background so the
+// tree can display immediately while stats populate asynchronously.
+func (m *AppModel) loadGitStatsCmd(hashes []string) tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		stats := make(map[string][2]int, len(hashes))
+		for _, h := range hashes {
+			add, del, err := gc.GetCommitStats(h)
+			if err != nil {
+				continue
+			}
+			stats[h] = [2]int{add, del}
+		}
+		return gitStatsLoadedMsg{stats: stats}
+	}
+}
+
+// commitTreeLoadLimit is the maximum number of commits to load for the tree.
+// Derived from: typical visible viewport ≈ 15–20 nodes; 500 provides ample
+// scroll depth without excessive memory or load time.
+const commitTreeLoadLimit = 500
+
+// toggleGitMode switches between git mode and the previous mode.
+func (m *AppModel) toggleGitMode() tea.Cmd {
+	if m.gitPanel == nil {
+		m.statusBar.SetFlash("Not a git repository")
+		return nil
+	}
+	if m.gitMode {
+		m.exitGitMode()
+		return nil
+	}
+	return m.enterGitMode()
+}
+
+// enterGitMode activates git mode, displaying the git explorer and commit tree.
+func (m *AppModel) enterGitMode() tea.Cmd {
+	// If edit mode is active, exit it first and remember for restore.
+	m.preGitEditMode = m.editMode
+	if m.editMode {
+		m.exitEditMode()
+	}
+
+	// Save ring state and current focus.
+	m.savedGitLeftIdx = m.leftRing.index
+	m.savedGitRightIdx = m.rightRing.index
+	m.savedChatFocus = m.focus.Current()
+
+	m.gitMode = true
+
+	// Position rings so git panels are visible.
+	switch m.layout.Mode() {
+	case layout.ThreeColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+	case layout.TwoColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+		m.rightRing.setTo(component.FocusCodeViewer)
+	case layout.SingleColumn:
+		m.leftRing.setTo(component.FocusCodeViewer)
+	}
+
+	// Size git components to their panel slots.
+	m.resizeGitPanels()
+
+	m.statusBar.SetMode("GIT")
+	m.input.SetPlaceholder("git>")
+
+	m.syncViewState()
+	m.focus.SetFocus(component.FocusGitPanel)
+	m.syncFocusState()
+	m.statusBar.SetFlash("Git mode")
+
+	return tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
+}
+
+// exitGitMode deactivates git mode and returns to the previous mode.
+func (m *AppModel) exitGitMode() {
+	m.savedGitFocus = m.focus.Current()
+
+	// Restore ring state.
+	m.leftRing.index = m.savedGitLeftIdx
+	m.rightRing.index = m.savedGitRightIdx
+
+	m.gitMode = false
+	m.statusBar.SetMode("CHAT")
+	m.input.SetPlaceholder("Type a message...")
+
+	m.syncViewState()
+
+	if m.preGitEditMode {
+		m.preGitEditMode = false
+		m.enterEditMode()
+		return
+	}
+
+	m.focus.SetFocus(m.savedChatFocus)
+	m.syncFocusState()
+	m.statusBar.SetFlash("View mode")
+}
+
+// resizeGitPanels sizes the git panel and commit tree to their layout slots.
+func (m *AppModel) resizeGitPanels() {
+	if m.gitPanel == nil {
+		return
+	}
+	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)
+	m.gitPanel.SetSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
+
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.commitTree.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 }
 
 // enterCmdInput activates the input panel for ex command entry,
@@ -3099,6 +3385,17 @@ func (m *AppModel) codePanelView() string {
 		return content
 	}
 
+	// Full markdown preview mode: mdPreview active, sole editor has no tabs.
+	if m.isFullMdPreview() {
+		rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+		bar := m.mdPreviewTabBar(max(rightW-panelBorderSize, 1))
+		content := m.mdPreviewPanel.View()
+		if bar != "" {
+			return lipgloss.JoinVertical(lipgloss.Left, bar, content)
+		}
+		return content
+	}
+
 	// Single editor pane, no splits: direct render (no compositing overhead).
 	if m.paneTree.IsLeaf() {
 		content := m.focusedEditor().View(m.cursorVisible)
@@ -3106,6 +3403,7 @@ func (m *AppModel) codePanelView() string {
 		if bar != "" {
 			content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
 		}
+		content = m.overlayMdTooltipOnContent(content)
 		return m.overlayBlockedChord(content)
 	}
 
@@ -3117,6 +3415,17 @@ func (m *AppModel) codePanelView() string {
 
 	area := pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
 	content := m.composePanes(area)
+
+	// Overlay markdown tooltip in multi-pane mode.
+	if m.mdTooltipTab >= 0 && m.mdTooltipPane != 0 {
+		rects := m.paneTree.ComputeLayout(area)
+		if pr, ok := rects[m.mdTooltipPane]; ok {
+			rows := m.mdTooltipRows()
+			lines := strings.Split(content, "\n")
+			overlayMdTooltipRows(lines, rows, pr.X+m.mdTooltipX, pr.Y+tabbar.Height-1)
+			content = strings.Join(lines, "\n")
+		}
+	}
 
 	statusLine := m.focusedEditor().StatusLineView(innerW)
 	return m.overlayBlockedChord(lipgloss.JoinVertical(lipgloss.Left, content, statusLine))
@@ -3224,6 +3533,12 @@ func (m *AppModel) renderLeafPane(id pane.PaneID, r pane.Rect) string {
 	if id == m.previewPane {
 		bar := m.previewTabBarViewSized(r.W)
 		content := m.previewPanel.View(m.cursorVisible)
+		return sizer.Render(lipgloss.JoinVertical(lipgloss.Left, bar, content))
+	}
+
+	if id == m.mdPreviewPane {
+		bar := m.mdPreviewTabBar(r.W)
+		content := m.mdPreviewPanel.View()
 		return sizer.Render(lipgloss.JoinVertical(lipgloss.Left, bar, content))
 	}
 
@@ -3619,6 +3934,95 @@ func (m *AppModel) dismissPreview() {
 	m.syncFocusState()
 }
 
+// ---------------------------------------------------------------------------
+// Markdown preview (rendered markdown split-right of the source editor)
+// ---------------------------------------------------------------------------
+
+// openMarkdownPreview splits the focused pane to the right and displays the
+// rendered markdown content. If the markdown preview is already open, the
+// content is updated in place.
+func (m *AppModel) openMarkdownPreview(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		m.statusBar.SetFlash("Cannot preview: " + filepath.Base(path))
+		return
+	}
+	content := string(data)
+
+	// Already open — just refresh content.
+	if m.mdPreviewPane != 0 {
+		m.mdPreviewPanel.SetContent(content, path)
+		return
+	}
+
+	// Compute the focused pane area for size checking.
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+	contentH := max(innerH-1, 1)
+	area := pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+	rects := m.paneTree.ComputeLayout(area)
+	focusedRect := rects[m.focusedPane]
+
+	m.paneCounter++
+	m.mdPreviewPane = m.paneCounter
+
+	if !m.paneTree.Split(m.focusedPane, m.mdPreviewPane, pane.SplitVertical, focusedRect) {
+		m.paneCounter--
+		m.mdPreviewPane = 0
+		m.statusBar.SetFlash("Pane too small to split")
+		return
+	}
+
+	m.mdPreviewPanel.SetContent(content, path)
+	m.mdPreviewPanel.SetFocusID(pane.PaneFocusID(m.mdPreviewPane))
+	m.resizeInlineEditor()
+	m.syncViewState()
+	m.statusBar.SetFlash("Markdown preview")
+}
+
+// dismissMarkdownPreview closes the markdown preview pane and restores layout.
+func (m *AppModel) dismissMarkdownPreview() {
+	if m.mdPreviewPane == 0 {
+		return
+	}
+	wasFocused := m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane)
+	m.paneTree.Close(m.mdPreviewPane)
+	m.mdPreviewPane = 0
+	m.mdPreviewPanel.ClearFile()
+
+	if wasFocused {
+		m.focusCodePanel()
+	}
+	m.resizeInlineEditor()
+	m.syncViewState()
+	m.syncFocusState()
+}
+
+// mdPreviewTabBar renders a single tab for the markdown preview pane.
+func (m *AppModel) mdPreviewTabBar(width int) string {
+	if m.mdPreviewPanel.FilePath() == "" {
+		return ""
+	}
+	hasSplits := m.paneTree.LeafCount() > 1
+	isFocused := m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane)
+	cfg := tabbar.Config{
+		Tabs: []tabbar.Tab{{
+			Path:        m.mdPreviewPanel.FilePath(),
+			Modified:    false,
+			LabelPrefix: "Markdown: ",
+		}},
+		Active:     0,
+		Width:      width,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      m.config.Theme(),
+		HoverClose: m.mdPreviewTabHoverClose,
+		Focused:    hasSplits && isFocused,
+		DimActive:  hasSplits && !isFocused,
+	}
+	return tabbar.View(cfg)
+}
+
 // isFileOpenInEditor reports whether the given file path is currently open
 // in any editor pane's tab order.
 func (m *AppModel) isFileOpenInEditor(path string) bool {
@@ -3677,6 +4081,12 @@ func (m *AppModel) closePane() {
 		return
 	}
 
+	// If the focused pane is the markdown preview, delegate to dismissMarkdownPreview.
+	if closingID == m.mdPreviewPane {
+		m.dismissMarkdownPreview()
+		return
+	}
+
 	// Check for unsaved modifications in the active editor.
 	ps := m.paneEditors[closingID]
 	if ps.editor.Modified() {
@@ -3687,6 +4097,26 @@ func (m *AppModel) closePane() {
 		return
 	}
 
+	// If this is the last editor pane and a markdown preview is active,
+	// clear the editor content so the preview takes the full panel.
+	if m.mdPreviewPane != 0 && len(m.paneEditors) == 1 {
+		ps := m.paneEditors[closingID]
+		if ps != nil && ps.editor.FilePath() != "" {
+			ws := ps.editor.Detach()
+			m.editorCache.Put(ws)
+		}
+		if ps != nil {
+			ps.editor.ClearFile()
+			ps.tabOrder = nil
+		}
+		m.focus.SetFocus(pane.PaneFocusID(m.mdPreviewPane))
+		m.resizeInlineEditor()
+		m.syncViewState()
+		m.syncFocusState()
+		m.statusBar.SetFlash("Closed pane")
+		return
+	}
+
 	m.closePaneForce(closingID)
 }
 
@@ -3694,7 +4124,7 @@ func (m *AppModel) closePane() {
 // Detaches the editor to cache and collapses the tree node.
 func (m *AppModel) closePaneForce(closingID pane.PaneID) {
 	ps := m.paneEditors[closingID]
-	if ps.editor.FilePath() != "" {
+	if ps != nil && ps.editor.FilePath() != "" {
 		ws := ps.editor.Detach()
 		m.editorCache.Put(ws)
 	}
@@ -3735,6 +4165,20 @@ func (m *AppModel) openFromPreview() tea.Cmd {
 			Language: lang,
 		}
 	}
+}
+
+// overlayMdTooltipOnContent overlays the markdown "Preview" tooltip on the
+// rendered code panel content when a markdown tab is being hovered.
+func (m *AppModel) overlayMdTooltipOnContent(content string) string {
+	if m.mdTooltipTab < 0 || m.mdTooltipPane == 0 {
+		return content
+	}
+	rows := m.mdTooltipRows()
+	lines := strings.Split(content, "\n")
+	// The divider sits at row 1 (second row of the 2-row tab bar).
+	// Place the tooltip starting on row 2 (first content row below the divider).
+	overlayMdTooltipRows(lines, rows, m.mdTooltipX, tabbar.Height-1)
+	return strings.Join(lines, "\n")
 }
 
 // overlayBlockedChord prepends the blocked-chord hint bar to content when a
@@ -4000,9 +4444,17 @@ func (m *AppModel) handleTabDragReorder(localX int) (bool, tea.Cmd) {
 // updateTabHoverClose updates the tab close-icon hover state from a motion event.
 // Handles multi-pane, split preview, and full-preview modes.
 func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
+	// Save tooltip state — restored if the mouse is still inside the tooltip.
+	savedTooltipTab := m.mdTooltipTab
+	savedTooltipPane := m.mdTooltipPane
+	savedTooltipX := m.mdTooltipX
+
 	m.tabHoverClose = -1
 	m.tabHoverPane = 0
 	m.previewTabHoverClose = -1
+	m.mdPreviewTabHoverClose = -1
+	m.mdTooltipTab = -1
+	m.mdTooltipPane = 0
 
 	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
 		return
@@ -4011,7 +4463,18 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 	// Multi-pane mode: use tree-based hit testing.
 	if m.paneTree != nil && !m.paneTree.IsLeaf() {
 		pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
-		if !ok || localY >= tabbar.Height {
+		if !ok {
+			return
+		}
+		// Mouse is below the tab bar — check if it's inside the tooltip.
+		if localY >= tabbar.Height {
+			if savedTooltipTab >= 0 && savedTooltipPane == pid &&
+				localY < tabbar.Height+mdTooltipHeight &&
+				localX >= savedTooltipX && localX < savedTooltipX+mdTooltipWidth {
+				m.mdTooltipTab = savedTooltipTab
+				m.mdTooltipPane = savedTooltipPane
+				m.mdTooltipX = savedTooltipX
+			}
 			return
 		}
 		if pid == m.previewPane {
@@ -4035,6 +4498,27 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 			}
 			return
 		}
+		if pid == m.mdPreviewPane {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.mdPreviewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Markdown: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.IsClose {
+				m.mdPreviewTabHoverClose = hit.TabIndex
+			}
+			return
+		}
 		ps, exists := m.paneEditors[pid]
 		if !exists || len(ps.tabOrder) == 0 {
 			return
@@ -4048,11 +4532,20 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 			m.tabHoverPane = pid
 			m.tabHoverClose = hit.TabIndex
 		}
+		m.updateMdTooltip(pid, hit, cfg)
 		return
 	}
 
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
 	if viewY >= tabbar.Height {
+		// Preserve tooltip if mouse is inside its bounds.
+		if savedTooltipTab >= 0 && savedTooltipPane == m.focusedPane &&
+			viewY < m.tabBarHeight()+mdTooltipHeight &&
+			viewX >= savedTooltipX && viewX < savedTooltipX+mdTooltipWidth {
+			m.mdTooltipTab = savedTooltipTab
+			m.mdTooltipPane = savedTooltipPane
+			m.mdTooltipX = savedTooltipX
+		}
 		return
 	}
 
@@ -4082,10 +4575,83 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 	if pw := m.previewSplitWidth(); pw > 0 {
 		editorX -= pw + 1 // offset past preview + divider
 	}
-	hit := tabbar.HitTest(m.tabBarConfig(), editorX)
+	cfg := m.tabBarConfig()
+	hit := tabbar.HitTest(cfg, editorX)
 	if hit.IsClose {
 		m.tabHoverPane = m.focusedPane
 		m.tabHoverClose = hit.TabIndex
+	}
+	m.updateMdTooltip(m.focusedPane, hit, cfg)
+}
+
+// updateMdTooltip sets the markdown tooltip state when hovering a markdown
+// file tab (not the close icon).
+func (m *AppModel) updateMdTooltip(pid pane.PaneID, hit tabbar.HitResult, cfg tabbar.Config) {
+	if hit.TabIndex < 0 || hit.IsClose {
+		return
+	}
+	ps := m.paneEditors[pid]
+	if ps == nil || hit.TabIndex >= len(ps.tabOrder) {
+		return
+	}
+	path := ps.tabOrder[hit.TabIndex]
+	if !isMarkdownFile(path) {
+		return
+	}
+	startX, _ := tabbar.TabBounds(cfg, hit.TabIndex)
+	m.mdTooltipTab = hit.TabIndex
+	m.mdTooltipPane = pid
+	m.mdTooltipX = startX
+}
+
+// mdTooltipRows returns the 3 rows (top border, content, bottom border) of
+// the markdown "Preview" tooltip popup.
+func (m *AppModel) mdTooltipRows() [3]string {
+	th := m.config.Theme()
+	border := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg).
+		Foreground(th.Palette.Border)
+	icon := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg).
+		Foreground(th.Palette.Accent)
+	label := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg).
+		Foreground(th.Palette.Primary).
+		Bold(true)
+	pad := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg)
+
+	inner := mdTooltipWidth - 2 // subtract left+right border columns
+	topBot := border.Render("╭") + border.Render(strings.Repeat("─", inner)) + border.Render("╮")
+	bottom := border.Render("╰") + border.Render(strings.Repeat("─", inner)) + border.Render("╯")
+	content := border.Render("│") + pad.Render(" ") + icon.Render("◇") + label.Render("  Preview ") + pad.Render(" ") + border.Render("│")
+	return [3]string{topBot, content, bottom}
+}
+
+// mdTooltipWidth is the visual width of the tooltip.
+// Derived from: "│" (1) + " " (1) + "◇" (1) + "  Preview " (10) + " " (1) + "│" (1) = 15.
+const mdTooltipWidth = 15
+
+// mdTooltipHeight is the number of rows the tooltip occupies.
+const mdTooltipHeight = 3
+
+// overlayMdTooltipRows splices the 3-row tooltip popup into content lines
+// below the hovered markdown tab. dividerRow is the tab bar divider row index.
+func overlayMdTooltipRows(lines []string, rows [3]string, col, dividerRow int) {
+	startRow := dividerRow + 1
+	for i, tooltipRow := range rows {
+		row := startRow + i
+		if row < 0 || row >= len(lines) {
+			continue
+		}
+		orig := lines[row]
+		origW := lipgloss.Width(orig)
+		if col >= origW {
+			continue
+		}
+		left := truncateStyledN(orig, col)
+		right := skipStyledN(orig, col+mdTooltipWidth)
+		lines[row] = left + tooltipRow + right
 	}
 }
 
@@ -4759,6 +5325,10 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	// In edit mode, route scrolls within the code panel to the pane
 	// under the cursor using tree-based hit testing.
 	if resolved == component.FocusCodeViewer && m.editMode && m.paneTree != nil {
+		// Full markdown preview mode: all scrolls go to the mdPreview.
+		if m.isFullMdPreview() {
+			return pane.PaneFocusID(m.mdPreviewPane), true
+		}
 		if pid, ok := m.hitTestPane(x, y); ok {
 			return pane.PaneFocusID(pid), true
 		}
@@ -4878,11 +5448,23 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		}
 		return m.chat.ScrollDown()
 	case component.FocusCodeViewer:
+		if m.gitMode && m.commitTree != nil {
+			if direction < 0 {
+				return m.commitTree.ScrollUp()
+			}
+			return m.commitTree.ScrollDown()
+		}
 		if direction < 0 {
 			return m.codePanel.ScrollUp()
 		}
 		return m.codePanel.ScrollDown()
 	case component.FocusFileTree:
+		if m.gitMode && m.gitPanel != nil {
+			if direction < 0 {
+				return m.gitPanel.ScrollUp()
+			}
+			return m.gitPanel.ScrollDown()
+		}
 		if direction < 0 {
 			return m.fileTree.ScrollUp()
 		}
@@ -4894,6 +5476,22 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 			return m.agentPanel.ScrollUp()
 		}
 		return m.agentPanel.ScrollDown()
+	case component.FocusGitPanel:
+		if m.gitPanel == nil {
+			return true
+		}
+		if direction < 0 {
+			return m.gitPanel.ScrollUp()
+		}
+		return m.gitPanel.ScrollDown()
+	case component.FocusCommitTree:
+		if m.commitTree == nil {
+			return true
+		}
+		if direction < 0 {
+			return m.commitTree.ScrollUp()
+		}
+		return m.commitTree.ScrollDown()
 	default:
 		if !pane.IsPaneFocus(panelID) {
 			return true
@@ -4904,6 +5502,12 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 				return m.previewPanel.ScrollUp(1)
 			}
 			return m.previewPanel.ScrollDown(1)
+		}
+		if pid == m.mdPreviewPane {
+			if direction < 0 {
+				return m.mdPreviewPanel.ScrollUp(1)
+			}
+			return m.mdPreviewPanel.ScrollDown(1)
 		}
 		if ps, ok := m.paneEditors[pid]; ok {
 			if direction < 0 {
@@ -5154,6 +5758,12 @@ func (m *AppModel) hasPreview() bool {
 	return m.previewPane != 0
 }
 
+// isFullMdPreview reports whether the markdown preview is taking the full
+// code panel (the sole editor pane has no tabs).
+func (m *AppModel) isFullMdPreview() bool {
+	return m.mdPreviewPane != 0 && len(m.paneEditors) == 1 && len(m.focusedTabOrder()) == 0
+}
+
 // focusedEditor returns the editor for the currently focused pane.
 func (m *AppModel) focusedEditor() *editor.Model {
 	return m.paneEditors[m.focusedPane].editor
@@ -5321,6 +5931,35 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		return true, nil
 	}
 
+	// Full markdown preview mode: all code panel clicks route to the mdPreview.
+	if m.isFullMdPreview() {
+		if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
+			viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+			if viewY < tabbar.Height {
+				codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+				cfg := tabbar.Config{
+					Tabs: []tabbar.Tab{{
+						Path:        m.mdPreviewPanel.FilePath(),
+						Modified:    false,
+						LabelPrefix: "Markdown: ",
+					}},
+					Active:    0,
+					Width:     max(codeW-panelBorderSize, 1),
+					NerdFonts: m.nerdFontsDetected,
+					Theme:     m.config.Theme(),
+				}
+				hit := tabbar.HitTest(cfg, viewX)
+				if hit.TabIndex >= 0 && hit.IsClose {
+					m.dismissMarkdownPreview()
+					return true, nil
+				}
+			}
+			m.focus.SetFocus(pane.PaneFocusID(m.mdPreviewPane))
+			m.syncFocusState()
+		}
+		return true, nil
+	}
+
 	// Tab bar drag: reorder within pane or detect cross-pane drop target.
 	if mouse.Action == tea.MouseActionMotion && m.tabDragIdx >= 0 {
 		m.tabDropTarget = 0
@@ -5471,10 +6110,48 @@ func (m *AppModel) handleMultiPanePress(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		return true, nil
 	}
 
+	// Markdown preview pane click.
+	if pid == m.mdPreviewPane {
+		if localY < tabbar.Height {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.mdPreviewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Markdown: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissMarkdownPreview()
+			}
+		}
+		return true, nil
+	}
+
 	// Editor pane click.
 	ps, exists := m.paneEditors[pid]
 	if !exists {
 		return true, nil
+	}
+
+	// Check for markdown tooltip click (within the 3-row tooltip area).
+	if m.mdTooltipTab >= 0 && m.mdTooltipPane == pid && localY >= tabbar.Height && localY < tabbar.Height+mdTooltipHeight {
+		if localX >= m.mdTooltipX && localX < m.mdTooltipX+mdTooltipWidth {
+			if m.mdTooltipTab < len(ps.tabOrder) {
+				path := ps.tabOrder[m.mdTooltipTab]
+				m.openMarkdownPreview(path)
+				m.mdTooltipTab = -1
+				m.mdTooltipPane = 0
+			}
+			return true, nil
+		}
 	}
 
 	// Tab bar click within pane.
@@ -5563,6 +6240,20 @@ func (m *AppModel) handleEditorPaneClick(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	if m.tabBarHeight() > 0 && viewY < m.tabBarHeight() {
 		return m.handleTabBarClick(viewX)
 	}
+
+	// Markdown tooltip click (within the 3-row tooltip area).
+	if m.mdTooltipTab >= 0 && m.mdTooltipPane == m.focusedPane && viewY >= m.tabBarHeight() && viewY < m.tabBarHeight()+mdTooltipHeight {
+		if viewX >= m.mdTooltipX && viewX < m.mdTooltipX+mdTooltipWidth {
+			tabOrder := m.focusedTabOrder()
+			if m.mdTooltipTab < len(tabOrder) {
+				m.openMarkdownPreview(tabOrder[m.mdTooltipTab])
+				m.mdTooltipTab = -1
+				m.mdTooltipPane = 0
+			}
+			return true, nil
+		}
+	}
+
 	// Offset for tab bar so editor coordinates remain correct.
 	viewY -= m.tabBarHeight()
 
@@ -5763,6 +6454,7 @@ func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
 
 	line, col, ok := m.focusedEditor().ViewportToBufferPos(viewX, viewY)
 	if !ok {
+		m.dismissAllHover()
 		return nil
 	}
 
@@ -5817,6 +6509,7 @@ func (m *AppModel) handlePreviewMouseHover(mouse tea.MouseMsg, viewX, viewY int)
 
 	line, col, ok := m.previewPanel.ViewportToBufferPos(viewX, viewY)
 	if !ok {
+		m.dismissAllHover()
 		return nil
 	}
 
@@ -5999,6 +6692,12 @@ func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
 	m.fileTree = treeComp.(*filetree.Model)
 	cmds = appendCmd(cmds, treeCmd)
 
+	if m.gitPanel != nil {
+		gitComp, gitCmd := m.gitPanel.Update(raw)
+		m.gitPanel = gitComp.(*gitpanel.Model)
+		cmds = appendCmd(cmds, gitCmd)
+	}
+
 	return tea.Batch(cmds...)
 }
 
@@ -6040,6 +6739,14 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		comp, cmd := m.knowledgePanel.Update(key)
 		m.knowledgePanel = comp.(*knowledgepkg.Model)
 		return cmd
+	case component.FocusGitPanel:
+		comp, cmd := m.gitPanel.Update(key)
+		m.gitPanel = comp.(*gitpanel.Model)
+		return cmd
+	case component.FocusCommitTree:
+		comp, cmd := m.commitTree.Update(key)
+		m.commitTree = comp.(*committree.Model)
+		return cmd
 	default:
 		if !pane.IsPaneFocus(focused) {
 			return nil
@@ -6055,6 +6762,16 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 				return m.openFromPreview()
 			default:
 				_, cmd := m.previewPanel.Update(key)
+				return cmd
+			}
+		}
+		if pid == m.mdPreviewPane {
+			switch key.String() {
+			case "alt+enter", "q":
+				m.dismissMarkdownPreview()
+				return nil
+			default:
+				_, cmd := m.mdPreviewPanel.Update(key)
 				return cmd
 			}
 		}
@@ -6152,6 +6869,12 @@ func (m *AppModel) recalcLayout() {
 	m.knowledgePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 	m.resizeCodePanelForPreview(rightW, rightH)
 
+	// Git mode panels reuse file tree and code viewer slot dimensions.
+	if m.gitPanel != nil {
+		m.gitPanel.SetSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
+		m.commitTree.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	}
+
 	// Input: dynamic height based on content.
 	m.input.SetSize(m.width, inputH)
 	m.statusBar.SetSize(m.width, statusBarHeight)
@@ -6182,6 +6905,12 @@ func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
 		return
 	}
 
+	// Full markdown preview mode: mdPreview active, sole editor has no tabs.
+	if m.isFullMdPreview() {
+		m.mdPreviewPanel.SetSize(innerW, max(innerH-tabbar.Height, 1))
+		return
+	}
+
 	// Single editor pane, no splits.
 	if m.paneTree.IsLeaf() {
 		m.focusedEditor().SetSize(innerW, max(innerH-m.tabBarHeight(), 1))
@@ -6196,6 +6925,10 @@ func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
 	for id, r := range rects {
 		if id == m.previewPane {
 			m.previewPanel.SetSize(r.W, r.H-tabbar.Height)
+			continue
+		}
+		if id == m.mdPreviewPane {
+			m.mdPreviewPanel.SetSize(r.W, max(r.H-tabbar.Height, 1))
 			continue
 		}
 		ps := m.paneEditors[id]
@@ -6256,6 +6989,20 @@ func (m *AppModel) syncViewState() {
 		if !m.leftRing.empty() {
 			if !m.leftRing.setTo(component.FocusCodeViewer) {
 				m.leftRing.setTo(component.FocusFileTree)
+			}
+		}
+	}
+
+	// When git mode is active, pin rings to the file tree slot (git panel)
+	// and code viewer slot (commit tree). The render functions check gitMode
+	// to swap what actually renders in those slots.
+	if m.gitMode {
+		if !m.rightRing.empty() {
+			m.rightRing.setTo(component.FocusCodeViewer)
+		}
+		if !m.leftRing.empty() {
+			if !m.leftRing.setTo(component.FocusFileTree) {
+				m.leftRing.setTo(component.FocusCodeViewer)
 			}
 		}
 	}
@@ -6329,10 +7076,37 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 // FocusCodeViewer. Preview-only mode (no editor tabs) skips the tab order
 // since Tab cannot meaningfully target a read-only preview.
 func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.FocusID {
+	// Git mode: replace FileTree slot with FocusGitPanel, CodeViewer slot
+	// with FocusCommitTree. Both are always in the tab order.
+	if m.gitMode {
+		for i, id := range order {
+			switch id {
+			case component.FocusFileTree:
+				order[i] = component.FocusGitPanel
+			case component.FocusCodeViewer:
+				order[i] = component.FocusCommitTree
+			}
+		}
+		if !slices.Contains(order, component.FocusCommitTree) {
+			order = append(order, component.FocusCommitTree)
+		}
+		return order
+	}
 	if m.editMode {
 		// Full-preview mode: nothing to tab to in the code column.
 		if m.hasPreview() && len(m.focusedTabOrder()) == 0 {
 			return order
+		}
+		// Full markdown preview mode: tab to the mdPreview pane.
+		if m.isFullMdPreview() {
+			fid := pane.PaneFocusID(m.mdPreviewPane)
+			for i, id := range order {
+				if id == component.FocusCodeViewer {
+					order[i] = fid
+					return order
+				}
+			}
+			return append(order, fid)
 		}
 		fid := pane.PaneFocusID(m.focusedPane)
 		// Replace any FocusCodeViewer entry injected by the ring.
@@ -6359,6 +7133,8 @@ var panelDisplayNames = map[component.FocusID]string{
 	component.FocusCodeViewer:   "Code",
 	component.FocusSessionPanel: "Sess",
 	component.FocusFileTree:     "Tree",
+	component.FocusGitPanel:     "Git",
+	component.FocusCommitTree:   "Tree",
 }
 
 // buildRingHint returns the formatted ring indicator string for the status bar.
@@ -6443,8 +7219,13 @@ func (m *AppModel) focusBorderGroup() compositor.SlotID {
 		return compositor.SlotLeft
 	case component.FocusChat:
 		return compositor.SlotCenter
-	case component.FocusCodeViewer:
+	case component.FocusCodeViewer, component.FocusCommitTree:
 		return compositor.SlotRight
+	case component.FocusGitPanel:
+		if m.layout.Mode() == layout.FourColumn {
+			return compositor.SlotCenterLeft
+		}
+		return compositor.SlotLeft
 	case component.FocusInput:
 		return compositor.SlotInput
 	default:
@@ -6469,6 +7250,13 @@ func (m *AppModel) detectDirtySlots() {
 	if m.editMode != m.prevEditMode {
 		m.comp.InvalidateAll()
 		m.prevEditMode = m.editMode
+		return
+	}
+
+	// Git mode transitions: panels swap completely.
+	if m.gitMode != m.prevGitMode {
+		m.comp.InvalidateAll()
+		m.prevGitMode = m.gitMode
 		return
 	}
 
@@ -6506,6 +7294,13 @@ func (m *AppModel) detectDirtySlots() {
 		m.prevRightRing = m.rightRing.index
 	}
 
+	// Tab hover state change: close icon highlight, markdown tooltip.
+	hoverKey := [5]int{m.tabHoverClose, int(m.tabHoverPane), m.previewTabHoverClose, m.mdPreviewTabHoverClose, m.mdTooltipTab}
+	if hoverKey != m.prevHoverKey {
+		m.comp.MarkDirty(compositor.SlotRight)
+		m.prevHoverKey = hoverKey
+	}
+
 	// Component dirty checks.
 	if m.chat.ViewDirty() {
 		m.comp.MarkDirty(compositor.SlotCenter)
@@ -6527,6 +7322,20 @@ func (m *AppModel) detectDirtySlots() {
 	// Editor dirty check.
 	if m.editMode {
 		if ps := m.paneEditors[m.focusedPane]; ps != nil && ps.editor.ViewDirty() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+	}
+
+	// Git mode dirty checks.
+	if m.gitMode && m.gitPanel != nil {
+		if m.gitPanel.ViewDirty() {
+			if m.layout.Mode() == layout.FourColumn {
+				m.comp.MarkDirty(compositor.SlotCenterLeft)
+			} else {
+				m.comp.MarkDirty(compositor.SlotLeft)
+			}
+		}
+		if m.commitTree.ViewDirty() {
 			m.comp.MarkDirty(compositor.SlotRight)
 		}
 	}
@@ -6607,7 +7416,11 @@ func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
 }
 
 // renderSlotCenterLeft renders the bordered file tree for the center-left slot.
+// In git mode, renders the git explorer panel instead.
 func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
+	if m.gitMode {
+		return m.renderGitPanelBordered(th)
+	}
 	return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 }
 
@@ -6620,7 +7433,11 @@ func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
 
 // renderSlotRight renders the bordered code panel for the right slot.
 // In TwoColumn mode the right ring may show chat instead of code.
+// In git mode, renders the commit tree instead of the code panel.
 func (m *AppModel) renderSlotRight(th *theme.Theme) string {
+	if m.gitMode {
+		return m.renderGitCommitTreeBordered(th)
+	}
 	if m.layout.Mode() == layout.TwoColumn {
 		right := m.rightRing.current()
 		if right == component.FocusCodeViewer {
@@ -6635,6 +7452,17 @@ func (m *AppModel) renderSlotRight(th *theme.Theme) string {
 // renderSingleColumnSlot renders the single visible panel in SingleColumn mode.
 func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	active := m.leftRing.current()
+
+	// In git mode, map FileTree→GitPanel, CodeViewer→CommitTree.
+	if m.gitMode {
+		switch active {
+		case component.FocusFileTree:
+			return m.renderGitPanelBordered(th)
+		case component.FocusCodeViewer:
+			return m.renderGitCommitTreeBordered(th)
+		}
+	}
+
 	switch active {
 	case component.FocusSessionPanel:
 		content := m.overlayChordHint(m.renderLeftPanel(th), active, th)
@@ -6652,8 +7480,12 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 
 // renderLeftSlot renders the left column for the given panel ID.
 // Session gets the composite left panel with border; FileTree gets a standard panel.
+// In git mode, FileTree slot renders the git explorer instead.
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
 	if id == component.FocusFileTree {
+		if m.gitMode {
+			return m.renderGitPanelBordered(th)
+		}
 		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 	}
 	return m.renderLeftPanelBordered(th)
@@ -6665,9 +7497,19 @@ func (m *AppModel) panelContent(id component.FocusID) string {
 	case component.FocusChat:
 		return m.chat.View()
 	case component.FocusCodeViewer:
+		if m.gitMode {
+			return m.commitTree.View(m.cursorVisible)
+		}
 		return m.codePanelView()
 	case component.FocusFileTree:
+		if m.gitMode {
+			return m.gitPanel.View(m.cursorVisible)
+		}
 		return m.fileTree.View(m.cursorVisible)
+	case component.FocusGitPanel:
+		return m.gitPanel.View(m.cursorVisible)
+	case component.FocusCommitTree:
+		return m.commitTree.View(m.cursorVisible)
 	default:
 		return ""
 	}
@@ -6823,6 +7665,38 @@ func (m *AppModel) renderCodePanelBordered(th *theme.Theme) string {
 		Render(content)
 }
 
+// renderGitPanelBordered renders the git explorer panel using the FileTree slot
+// dimensions with border highlight based on FocusGitPanel focus state.
+func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
+	content := m.gitPanel.View(m.cursorVisible)
+	w, h := m.layout.GetPanelSize(component.FocusFileTree)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusGitPanel {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderGitCommitTreeBordered renders the commit tree panel using the CodeViewer
+// slot dimensions with border highlight based on FocusCommitTree focus state.
+func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
+	content := m.commitTree.View(m.cursorVisible)
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusCommitTree {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
 func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.Theme) string {
 	w, h := m.layout.GetPanelSize(id)
 	border := th.InactiveBorder
@@ -6865,7 +7739,14 @@ func (m *AppModel) syncFocusState() {
 		}
 	}
 	m.previewPanel.SetFocused(m.isPreviewFocused())
+	m.mdPreviewPanel.SetFocused(m.mdPreviewPane != 0 && current == pane.PaneFocusID(m.mdPreviewPane))
 	m.fileTree.SetFocused(current == component.FocusFileTree)
+
+	// Git mode panels.
+	if m.gitPanel != nil {
+		m.gitPanel.SetFocused(current == component.FocusGitPanel)
+		m.commitTree.SetFocused(current == component.FocusCommitTree)
+	}
 
 	// Sync warp line display for the newly focused editor.
 	m.syncEditorWarpLines()
@@ -6923,8 +7804,23 @@ func keyToDirection(key string) (layout.Direction, bool) {
 // included. Sub-panels (e.g. Sessions+Agents, Preview+Editor) are encoded
 // within their parent PanelGroup's sub-grid.
 func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
+	// gitResolve translates slot-based focus IDs to git-panel IDs when
+	// git mode is active, so spatial navigation finds the correct panels.
+	gitResolve := func(id component.FocusID) component.FocusID {
+		if !m.gitMode {
+			return id
+		}
+		switch id {
+		case component.FocusFileTree:
+			return component.FocusGitPanel
+		case component.FocusCodeViewer:
+			return component.FocusCommitTree
+		}
+		return id
+	}
+
 	pg := func(id component.FocusID) layout.PanelGroup {
-		return layout.PanelGroup{SubPanels: [][]component.FocusID{{id}}}
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{{gitResolve(id)}}}
 	}
 
 	leftSubs := func() layout.PanelGroup {
@@ -6986,8 +7882,12 @@ func (m *AppModel) codePanelGroup() layout.PanelGroup {
 	if m.editMode && m.paneTree != nil {
 		return layout.PanelGroup{SubPanels: m.paneTree.ToSubGrid()}
 	}
+	id := component.FocusCodeViewer
+	if m.gitMode {
+		id = component.FocusCommitTree
+	}
 	return layout.PanelGroup{SubPanels: [][]component.FocusID{
-		{component.FocusCodeViewer},
+		{id},
 	}}
 }
 
@@ -7179,6 +8079,9 @@ func (m *AppModel) needsBlink() bool {
 		return true
 	}
 	if m.hasPreview() && m.isPreviewFocused() {
+		return true
+	}
+	if m.gitMode && m.gitPanel.NeedsBlink() {
 		return true
 	}
 	return m.fileTree.NeedsBlink()
