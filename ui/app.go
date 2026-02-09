@@ -2959,6 +2959,11 @@ func (m *AppModel) loadBranchCommitsCmd(branchName string) tea.Cmd {
 				IsMerge:    c.IsMerge,
 			}
 		}
+		// Ensure the tip commit always shows the viewed branch name,
+		// even when buildBranchMap mapped it to a different branch.
+		if len(nodes) > 0 {
+			nodes[0].Branch = branchName
+		}
 		return gitBranchCommitsLoadedMsg{branch: branchName, nodes: nodes}
 	}
 }
