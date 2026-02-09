@@ -1,6 +1,7 @@
 package committree
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/adalundhe/sylk/ui/component"
@@ -117,12 +118,25 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 // ---------------------------------------------------------------------------
 
 // SetBranches populates the branch tree view and resets to branch mode.
+// Branches are sorted so that the HEAD branch appears last (bottom of the
+// tree) and other branches are ordered newest-first above it.
 func (m *Model) SetBranches(branches []BranchNode) {
+	slices.SortStableFunc(branches, func(a, b BranchNode) int {
+		if a.IsHead != b.IsHead {
+			if a.IsHead {
+				return 1
+			}
+			return -1
+		}
+		return b.AuthorTime.Compare(a.AuthorTime)
+	})
+
 	m.branches = branches
-	m.branchIdx = 0
+	m.branchIdx = max(len(branches)-1, 0)
 	m.branchScrollOff = 0
 	m.mode = viewBranches
 	m.viewDirty = true
+	m.ensureBranchVisible()
 }
 
 // SetNodes replaces the commit data for the current branch drill-down.
@@ -223,9 +237,9 @@ func (m *Model) viewBranchTree() string {
 	lines := make([]string, 0, m.height)
 
 	lastIdx := len(m.branches) - 1
-	for vi, idx := range visible {
+	for _, idx := range visible {
 		selected := idx == m.branchIdx
-		isFirst := vi == 0
+		isFirst := idx == 0
 		isLast := idx == lastIdx
 		nodeLines := renderBranchNode(m.branches[idx], selected, m.width, m.theme, isFirst, isLast)
 		lines = append(lines, nodeLines...)

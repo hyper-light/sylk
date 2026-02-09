@@ -91,111 +91,124 @@ func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isLast bo
 }
 
 // branchNodeHeight is the number of terminal rows consumed per branch node.
-// Derived from: trunk spacer(1) + angled arm(1) + card (4 lines) = 6.
-const branchNodeHeight = 6
+// Derived from: top border(1) + header(1) + subject(1) + bottom border(1) + trunk/blank(1) = 5.
+const branchNodeHeight = 5
 
-// trunkCols is the column width of the tree trunk + arm indent.
-// Layout: col0 = trunk glyph, col1-3 = arm/indent (4 total).
-const trunkCols = 4
+// Layout proportions for branch tree cards. Offshoot branches are narrower
+// than the HEAD branch to visually emphasize the primary branch.
+const (
+	offshootWidthPct   = 55 // offshoot card width as percentage of panel
+	headWidthPct       = 70 // HEAD card width as percentage of panel
+	minBranchCardWidth = 24 // minimum usable card width
+)
 
-// renderBranchNode renders a single branch as a bordered card connected
-// to a vertical trunk via an angled arm, forming a visual tree.
+// renderBranchNode renders a single branch as a centered bordered card
+// connected by a vertical trunk line through the card borders.
 //
-// Layout (first + non-last):
+// Layout (first, offshoot):
 //
-//	├──╮
-//	│  ╭──────────────────────────────╮
-//	│  │ ● main             2h ago   │
-//	│  │   abc1234  Fix cursor blink │
-//	│  ╰──────────────────────────────╯
-//	│
+//	        ╭─────────────────────────╮
+//	        │ feature/xyz       1w ago│
+//	        │   abc9012  Fix edge     │
+//	        ╰───────────┬─────────────╯
+//	                    │
 //
-// Layout (middle):
+// Layout (middle, offshoot):
 //
-//	│
-//	├──╮
-//	│  ╭──────────────────────────────╮
-//	│  │ ● ivf              3d ago   │
-//	│  │   def5678  Add new thing    │
-//	│  ╰──────────────────────────────╯
+//	        ╭───────────┴─────────────╮
+//	        │ bugfix/abc        3d ago│
+//	        │   def5678  Fix login    │
+//	        ╰───────────┬─────────────╯
+//	                    │
 //
-// Layout (last):
+// Layout (last, HEAD — wider, centered):
 //
-//	│
-//	╰──╮
-//	   ╭──────────────────────────────╮
-//	   │ ● feature/xyz       1w ago  │
-//	   │   abc9012  Fix edge case    │
-//	   ╰──────────────────────────────╯
+//	    ╭───────────────┴─────────────────╮
+//	    │ ● main                    2h ago│
+//	    │   ghi9012  Merge feature        │
+//	    ╰─────────────────────────────────╯
 //
 func renderBranchNode(b BranchNode, selected bool, width int, th *theme.Theme, isFirst, isLast bool) []string {
 	p := th.Palette
 
-	armColor := p.Border
-	if selected {
-		armColor = p.Primary
+	// Card width: HEAD is wider than offshoots.
+	pct := offshootWidthPct
+	if b.IsHead {
+		pct = headWidthPct
 	}
-	armStyle := lipgloss.NewStyle().Foreground(armColor)
-	trunkStyle := lipgloss.NewStyle().Foreground(p.Border)
+	cardWidth := clampInt(width*pct/100, minBranchCardWidth, width)
 
-	// Card area excludes the trunk prefix columns.
-	cardWidth := max(width-trunkCols, 0)
 	const borderCols = 2
 	innerWidth := max(cardWidth-borderCols, 0)
 
-	header := buildBranchHeaderLine(b, innerWidth, p)
-	subject := buildBranchSubjectLine(b, innerWidth, p)
+	// Center the card horizontally.
+	leftPad := max((width-cardWidth)/2, 0)
 
+	// Trunk position within the inner border content.
+	trunkAbs := width / 2
+	trunkInner := trunkAbs - leftPad - 1
+
+	// Border color: primary when selected, muted otherwise.
 	borderColor := p.Border
 	if selected {
 		borderColor = p.Primary
 	}
+	bSt := lipgloss.NewStyle().Foreground(borderColor)
+	trunkSt := lipgloss.NewStyle().Foreground(p.Border)
 
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Width(innerWidth)
+	// Card content padded to exact inner width.
+	header := padContent(buildBranchHeaderLine(b, innerWidth, p), innerWidth)
+	subject := padContent(buildBranchSubjectLine(b, innerWidth, p), innerWidth)
 
-	rendered := boxStyle.Render(header + "\n" + subject)
-	cardLines := strings.Split(rendered, "\n")
+	// Borders with trunk connectors (┴ top, ┬ bottom).
+	top := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInner, !isFirst)
+	bottom := buildCardBorder("╰", "╯", innerWidth, bSt, trunkInner, !isLast)
 
-	lines := make([]string, 0, branchNodeHeight)
-	blankIndent := strings.Repeat(" ", trunkCols)
+	pad := strings.Repeat(" ", leftPad)
 
-	// Line 0: trunk spacer (blank for first node, │ otherwise).
-	if isFirst {
-		lines = append(lines, padLine("", width))
-	} else {
-		lines = append(lines, padLine(trunkStyle.Render("│"), width))
+	// Trunk connector between nodes (blank for last).
+	var trunkLine string
+	if !isLast {
+		trunkLine = strings.Repeat(" ", trunkAbs) + trunkSt.Render("│")
 	}
 
-	// Line 1: angled arm (├──╮ or ╰──╮).
-	if isLast {
-		lines = append(lines, padLine(armStyle.Render("╰──╮"), width))
-	} else {
-		lines = append(lines, padLine(armStyle.Render("├──╮"), width))
+	return []string{
+		padLine(pad+top, width),
+		padLine(pad+bSt.Render("│")+header+bSt.Render("│"), width),
+		padLine(pad+bSt.Render("│")+subject+bSt.Render("│"), width),
+		padLine(pad+bottom, width),
+		padLine(trunkLine, width),
 	}
+}
 
-	// Lines 2-5: card with trunk prefix (│ + space) or blank indent.
-	for _, cl := range cardLines {
-		var prefix string
-		if isLast {
-			prefix = blankIndent
-		} else {
-			prefix = trunkStyle.Render("│") + strings.Repeat(" ", trunkCols-1)
-		}
-		lines = append(lines, padLine(prefix+cl, width))
+// buildCardBorder constructs a horizontal border with an optional trunk connector.
+// For top borders (left="╭") inserts ┴; for bottom borders (left="╰") inserts ┬.
+func buildCardBorder(left, right string, innerWidth int, bSt lipgloss.Style, trunkPos int, hasTrunk bool) string {
+	if !hasTrunk || trunkPos < 0 || trunkPos >= innerWidth {
+		return bSt.Render(left + strings.Repeat("─", innerWidth) + right)
 	}
+	connector := "┬"
+	if left == "╭" {
+		connector = "┴"
+	}
+	return bSt.Render(left + strings.Repeat("─", trunkPos) + connector + strings.Repeat("─", innerWidth-trunkPos-1) + right)
+}
 
-	// Clamp to exactly branchNodeHeight.
-	for len(lines) < branchNodeHeight {
-		lines = append(lines, strings.Repeat(" ", max(width, 0)))
+// padContent pads styled content to exactly width visible columns.
+func padContent(content string, width int) string {
+	vis := lipgloss.Width(content)
+	if vis < width {
+		return content + strings.Repeat(" ", width-vis)
 	}
-	if len(lines) > branchNodeHeight {
-		lines = lines[:branchNodeHeight]
+	if vis > width {
+		return truncateStyled(content, width)
 	}
+	return content
+}
 
-	return lines
+// clampInt constrains v to the range [lo, hi].
+func clampInt(v, lo, hi int) int {
+	return max(min(v, hi), lo)
 }
 
 // buildBranchHeaderLine assembles: ● branchName          2h ago
