@@ -72,6 +72,7 @@ const (
 	commitIdle       commitPhase = iota // text input or no input
 	commitInProgress                    // async commit running
 	commitSucceeded                     // brief success flash
+	commitFailed                        // brief error flash
 )
 
 // CommitRequestMsg is emitted when the user confirms a commit in the expanded
@@ -694,10 +695,10 @@ func (m *Model) clearCommitInput() {
 // handleCommitDone processes the result of an async commit operation.
 func (m *Model) handleCommitDone(done CommitDoneMsg) tea.Cmd {
 	if !done.OK {
-		// On failure, return to input so user can retry.
-		m.commitPhase = commitIdle
+		m.commitPhase = commitFailed
+		m.commitMsg = done.Message
 		m.viewDirty = true
-		return nil
+		return m.commitDismissCmd()
 	}
 	m.commitPhase = commitSucceeded
 	m.commitMsg = done.Message
@@ -705,9 +706,9 @@ func (m *Model) handleCommitDone(done CommitDoneMsg) tea.Cmd {
 	return m.commitDismissCmd()
 }
 
-// handleCommitDismiss clears the success flash after the timer fires.
+// handleCommitDismiss clears the flash after the timer fires.
 func (m *Model) handleCommitDismiss() {
-	if m.commitPhase == commitSucceeded {
+	if m.commitPhase == commitSucceeded || m.commitPhase == commitFailed {
 		m.clearCommitInput()
 	}
 }

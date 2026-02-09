@@ -259,17 +259,15 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 		content := bSt.Render("│") + padContent(buildExpContentLine(b, exp, innerWidth, p), innerWidth) + bSt.Render("│")
 		lines = append(lines, divider, content)
 
-		// Reason line when an action is blocked.
-		if reason := exp.actionBlockedReason(b.IsHead); reason != "" {
-			reasonSt := lipgloss.NewStyle().Foreground(p.Warning)
-			reasonLine := bSt.Render("│") + padContent(" "+reasonSt.Render(reason), innerWidth) + bSt.Render("│")
-			lines = append(lines, reasonLine)
-		}
-
 		// Commit input line (HEAD only, shown after selecting [Commit]).
+		// While visible, suppresses the blocked-reason line.
 		if exp.commitInput && b.IsHead {
 			inputLine := bSt.Render("│") + padContent(buildCommitInputLine(exp, innerWidth, p), innerWidth) + bSt.Render("│")
 			lines = append(lines, inputLine)
+		} else if reason := exp.actionBlockedReason(b.IsHead); reason != "" {
+			reasonSt := lipgloss.NewStyle().Foreground(p.Warning)
+			reasonLine := bSt.Render("│") + padContent(" "+reasonSt.Render(reason), innerWidth) + bSt.Render("│")
+			lines = append(lines, reasonLine)
 		}
 	}
 
@@ -359,6 +357,7 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 //	idle:        " Message: ▏some commit text"
 //	in-progress: " ⠹ Committing..."
 //	succeeded:   " ✓ Committed"
+//	failed:      " ✕ error reason"
 func buildCommitInputLine(exp *branchExpansion, width int, p theme.Palette) string {
 	switch exp.commitPhase {
 	case commitInProgress:
@@ -371,6 +370,14 @@ func buildCommitInputLine(exp *branchExpansion, width int, p theme.Palette) stri
 		iconSt := lipgloss.NewStyle().Foreground(p.Success)
 		textSt := lipgloss.NewStyle().Foreground(p.Success)
 		return " " + iconSt.Render("✓") + " " + textSt.Render("Committed")
+
+	case commitFailed:
+		iconSt := lipgloss.NewStyle().Foreground(p.Error)
+		textSt := lipgloss.NewStyle().Foreground(p.Error)
+		// Truncate error to fit within the card.
+		const prefix = 4 // " ✕ " = icon + spaces
+		errMsg := truncateSubject(exp.commitMsg, max(width-prefix, 0))
+		return " " + iconSt.Render("✕") + " " + textSt.Render(errMsg)
 
 	default:
 		return buildCommitIdleLine(exp, width, p)
