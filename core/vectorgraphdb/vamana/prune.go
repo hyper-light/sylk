@@ -48,7 +48,7 @@ func RobustPruneBatch(
 	}
 
 	dots := make([]float32, n)
-	BatchDotProducts(pVec, candidateVecs, n, dots)
+	BatchDotProductsFlat(pVec, candidateVecs, n, dots)
 
 	scored := make([]candidate, n)
 	for i, cid := range candidates {

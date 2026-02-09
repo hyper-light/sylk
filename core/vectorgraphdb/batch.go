@@ -10,12 +10,12 @@ import (
 type BatchProgress func(completed, total int)
 
 type BatchStore struct {
-	db   *VectorGraphDB
-	hnsw HNSWInserter
+	db          *VectorGraphDB
+	vectorIndex VectorIndexInserter
 }
 
-func NewBatchStore(db *VectorGraphDB, hnswIndex HNSWInserter) *BatchStore {
-	return &BatchStore{db: db, hnsw: hnswIndex}
+func NewBatchStore(db *VectorGraphDB, vectorIndex VectorIndexInserter) *BatchStore {
+	return &BatchStore{db: db, vectorIndex: vectorIndex}
 }
 
 func (bs *BatchStore) BatchInsertNodes(nodes []*GraphNode, embeddings [][]float32) error {
@@ -31,7 +31,7 @@ func (bs *BatchStore) BatchInsertNodesWithProgress(nodes []*GraphNode, embedding
 		return err
 	}
 
-	return bs.insertNodesHNSW(nodes, embeddings, progress)
+	return bs.insertNodesToVectorIndex(nodes, embeddings, progress)
 }
 
 func (bs *BatchStore) insertNodesToDB(nodes []*GraphNode, embeddings [][]float32, progress BatchProgress) error {
@@ -128,13 +128,13 @@ func (bs *BatchStore) insertNodeBatchRow(nodeStmt, vecStmt *sql.Stmt, node *Grap
 	return nil
 }
 
-func (bs *BatchStore) insertNodesHNSW(nodes []*GraphNode, embeddings [][]float32, progress BatchProgress) error {
-	if bs.hnsw == nil {
+func (bs *BatchStore) insertNodesToVectorIndex(nodes []*GraphNode, embeddings [][]float32, progress BatchProgress) error {
+	if bs.vectorIndex == nil {
 		return nil
 	}
 
 	for i, node := range nodes {
-		if err := bs.insertNodeHNSW(node, embeddings[i]); err != nil {
+		if err := bs.insertNodeToVectorIndex(node, embeddings[i]); err != nil {
 			return err
 		}
 		bs.reportProgress(progress, i+1, len(nodes))
@@ -142,9 +142,9 @@ func (bs *BatchStore) insertNodesHNSW(nodes []*GraphNode, embeddings [][]float32
 	return nil
 }
 
-func (bs *BatchStore) insertNodeHNSW(node *GraphNode, embedding []float32) error {
-	if err := bs.hnsw.Insert(node.ID, embedding, node.Domain, node.NodeType); err != nil {
-		return fmt.Errorf("hnsw insert %s: %w", node.ID, err)
+func (bs *BatchStore) insertNodeToVectorIndex(node *GraphNode, embedding []float32) error {
+	if err := bs.vectorIndex.Insert(node.ID, embedding, node.Domain, node.NodeType); err != nil {
+		return fmt.Errorf("vector index insert %s: %w", node.ID, err)
 	}
 	return nil
 }
@@ -224,7 +224,7 @@ func (bs *BatchStore) BatchDeleteNodesWithProgress(ids []string, progress BatchP
 	if err := bs.deleteNodesFromDB(ids, progress); err != nil {
 		return err
 	}
-	return bs.deleteNodesHNSW(ids)
+	return bs.deleteNodesFromVectorIndex(ids)
 }
 
 func (bs *BatchStore) deleteNodesFromDB(ids []string, progress BatchProgress) error {
@@ -256,12 +256,12 @@ func (bs *BatchStore) executeNodeDeletes(tx *sql.Tx, ids []string, progress Batc
 	return nil
 }
 
-func (bs *BatchStore) deleteNodesHNSW(ids []string) error {
-	if bs.hnsw == nil {
+func (bs *BatchStore) deleteNodesFromVectorIndex(ids []string) error {
+	if bs.vectorIndex == nil {
 		return nil
 	}
 	for _, id := range ids {
-		bs.hnsw.Delete(id)
+		bs.vectorIndex.Delete(id)
 	}
 	return nil
 }

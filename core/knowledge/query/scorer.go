@@ -310,6 +310,22 @@ type HybridScorerConfig struct {
 	UpdateConfig *handoff.UpdateConfig
 }
 
+// snapshot returns a shallow copy of the config with cloned mutable fields.
+// The returned config is safe to read concurrently while the original is mutated.
+func (c *HybridScorerConfig) snapshot() *HybridScorerConfig {
+	disabled := make(map[SignalType]bool, len(c.DisabledSignals))
+	for k, v := range c.DisabledSignals {
+		disabled[k] = v
+	}
+	return &HybridScorerConfig{
+		Weights:          c.Weights.Clone(),
+		Blender:          c.Blender,
+		ColdStartEnabled: c.ColdStartEnabled,
+		DisabledSignals:  disabled,
+		UpdateConfig:     c.UpdateConfig,
+	}
+}
+
 // DefaultHybridScorerConfig returns a default configuration.
 func DefaultHybridScorerConfig() *HybridScorerConfig {
 	return &HybridScorerConfig{
@@ -422,14 +438,14 @@ func (hs *HybridScorer) Score(
 	}
 
 	hs.mu.RLock()
-	config := hs.config
+	configSnapshot := hs.config.snapshot()
 	hs.mu.RUnlock()
 
 	now := time.Now().UTC()
 	scored := make([]ScoreResult, 0, len(results))
 
 	for _, result := range results {
-		scoreResult, err := hs.scoreResult(ctx, result, d, now, config)
+		scoreResult, err := hs.scoreResult(ctx, result, d, now, configSnapshot)
 		if err != nil {
 			// Log error but continue with other results
 			scoreResult = ScoreResult{

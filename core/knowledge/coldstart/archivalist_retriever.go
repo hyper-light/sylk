@@ -11,7 +11,7 @@ import (
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/knowledge/memory"
-	"github.com/adalundhe/sylk/core/vectorgraphdb/hnsw"
+	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana"
 )
 
 // =============================================================================
@@ -673,7 +673,7 @@ func (ar *ArchivalistRetriever) ApplyCrossSessionDecayDirect(score float64, even
 }
 
 // Ensure CosineSimilarityVectors is available (compile-time check)
-var _ = hnsw.CosineSimilarityVectors
+var _ = vamana.CosineSimilarity
 
 // =============================================================================
 // AE.5.7 LoadCrossSessionState Implementation

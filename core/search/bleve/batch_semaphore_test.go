@@ -178,9 +178,13 @@ func TestBatchSemaphore_GoroutineCount(t *testing.T) {
 	t.Logf("Goroutines - Baseline: %d, Peak: %d, Final: %d",
 		baselineGoroutines, peakGoroutines, finalGoroutines)
 
-	// The peak should not be dramatically higher than baseline + numBatches
-	// This tests that we don't have unbounded goroutine creation
-	maxExpectedPeak := baselineGoroutines + numBatches + maxConcurrent + 20
+	// IndexBatch is parallel: each call spawns min(NumCPU, docsPerBatch) errgroup
+	// workers, each of which may spawn a batch commit goroutine. Bleve also has
+	// internal goroutines (introducer, persister, merger) that scale with load.
+	const docsPerBatch = 3
+	workersPerBatch := min(runtime.NumCPU(), docsPerBatch)
+	// 1 parent (g.Wait) + workersPerBatch (errgroup) + workersPerBatch (commit goroutines)
+	maxExpectedPeak := baselineGoroutines + numBatches*(1+2*workersPerBatch) + maxConcurrent
 	if peakGoroutines > maxExpectedPeak {
 		t.Errorf("Peak goroutines %d exceeded expected max %d",
 			peakGoroutines, maxExpectedPeak)
@@ -340,8 +344,8 @@ func TestBatchSemaphore_DefaultLimit(t *testing.T) {
 	}
 
 	semCap := cap(mgr.batchSem)
-	if semCap != DefaultMaxConcurrentBatches {
-		t.Errorf("Semaphore capacity = %d, want %d", semCap, DefaultMaxConcurrentBatches)
+	if semCap != defaultMaxConcurrentBatches() {
+		t.Errorf("Semaphore capacity = %d, want %d", semCap, defaultMaxConcurrentBatches())
 	}
 }
 

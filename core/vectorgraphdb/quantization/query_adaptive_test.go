@@ -255,7 +255,7 @@ func TestNewQueryProfile(t *testing.T) {
 		{"standard 128/4", 128, 4, false},
 		{"standard 256/8", 256, 8, false},
 		{"standard 512/16", 512, 16, false},
-		{"standard 768/32", 768, 32, false},
+		{"standard 1024/32", 1024, 32, false},
 		{"zero dim", 0, 4, true},
 		{"zero subspaces", 128, 0, true},
 		{"negative dim", -128, 4, true},
@@ -306,7 +306,7 @@ func TestQueryProfileSubspaceDimension(t *testing.T) {
 		{128, 4, 32},
 		{256, 8, 32},
 		{512, 16, 32},
-		{768, 32, 24},
+		{1024, 32, 32},
 		{768, 24, 32},
 		{64, 8, 8},
 	}
@@ -984,7 +984,7 @@ func TestWeightingStrategyString(t *testing.T) {
 // =============================================================================
 
 func BenchmarkQueryAdaptiveDistance(b *testing.B) {
-	pq := createQueryAdaptiveBenchmarkPQ(b, 768, 32)
+	pq := createQueryAdaptiveBenchmarkPQ(b, 1024, 32)
 	if pq == nil {
 		b.Skip("Could not create benchmark PQ")
 	}
@@ -995,7 +995,7 @@ func BenchmarkQueryAdaptiveDistance(b *testing.B) {
 		b.Fatalf("NewQueryAdaptiveDistance error: %v", err)
 	}
 
-	query := make([]float32, 768)
+	query := make([]float32, 1024)
 	for i := range query {
 		query[i] = float32(i) * 0.001
 	}
@@ -1017,7 +1017,7 @@ func BenchmarkQueryAdaptiveDistance(b *testing.B) {
 }
 
 func BenchmarkWeightedDistanceTableComputation(b *testing.B) {
-	pq := createQueryAdaptiveBenchmarkPQ(b, 768, 32)
+	pq := createQueryAdaptiveBenchmarkPQ(b, 1024, 32)
 	if pq == nil {
 		b.Skip("Could not create benchmark PQ")
 	}
@@ -1028,7 +1028,7 @@ func BenchmarkWeightedDistanceTableComputation(b *testing.B) {
 		b.Fatalf("NewQueryAdaptiveDistance error: %v", err)
 	}
 
-	query := make([]float32, 768)
+	query := make([]float32, 1024)
 	for i := range query {
 		query[i] = float32(i) * 0.001
 	}

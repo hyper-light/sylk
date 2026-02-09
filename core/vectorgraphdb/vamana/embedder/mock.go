@@ -17,12 +17,20 @@ func NewMockEmbedder(dimension int) *MockEmbedder {
 	return &MockEmbedder{dimension: dimension}
 }
 
+func NewDefaultMockEmbedder() *MockEmbedder {
+	return &MockEmbedder{dimension: EmbeddingDimension}
+}
+
 func NewMockEmbedderWithLatency(dimension int, latency time.Duration) *MockEmbedder {
 	return &MockEmbedder{dimension: dimension, latency: latency}
 }
 
 func (m *MockEmbedder) Dimension() int {
 	return m.dimension
+}
+
+func (m *MockEmbedder) MaxInputBytes() int {
+	return m.dimension * 4
 }
 
 func (m *MockEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {

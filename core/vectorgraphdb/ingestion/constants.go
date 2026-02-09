@@ -163,55 +163,7 @@ const (
 )
 
 // =============================================================================
-// Language Extensions (derived from common programming language file extensions)
+// Language Extensions
 // =============================================================================
-
-// SupportedLanguages maps file extensions to language names.
-// These must match the tree-sitter grammar names.
-var SupportedLanguages = map[string]string{
-	".go":    "go",
-	".rs":    "rust",
-	".py":    "python",
-	".pyi":   "python",
-	".js":    "javascript",
-	".mjs":   "javascript",
-	".cjs":   "javascript",
-	".jsx":   "javascript",
-	".ts":    "typescript",
-	".mts":   "typescript",
-	".tsx":   "tsx",
-	".java":  "java",
-	".c":     "c",
-	".h":     "c",
-	".cpp":   "cpp",
-	".cc":    "cpp",
-	".cxx":   "cpp",
-	".hpp":   "cpp",
-	".hxx":   "cpp",
-	".rb":    "ruby",
-	".rake":  "ruby",
-	".swift": "swift",
-	".kt":    "kotlin",
-	".kts":   "kotlin",
-	".json":  "json",
-	".yaml":  "yaml",
-	".yml":   "yaml",
-	".toml":  "toml",
-	".html":  "html",
-	".css":   "css",
-	".bash":  "bash",
-	".sh":    "bash",
-	".md":    "markdown",
-}
-
-// IsSupportedExtension returns true if the extension is supported.
-func IsSupportedExtension(ext string) bool {
-	_, ok := SupportedLanguages[ext]
-	return ok
-}
-
-// GetLanguage returns the language name for the given extension.
-// Returns empty string if not supported.
-func GetLanguage(ext string) string {
-	return SupportedLanguages[ext]
-}
+// GetLanguage, IsSupportedExtension, and ClassifyFile are in classify.go.
+// The authoritative extension map is extensionMap in classify.go.

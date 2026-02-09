@@ -8,6 +8,7 @@ import (
 	"github.com/blevesearch/bleve/v2"
 	blevesearch "github.com/blevesearch/bleve/v2/search"
 	"github.com/blevesearch/bleve/v2/search/highlight/highlighter/ansi"
+	"github.com/blevesearch/bleve/v2/search/query"
 )
 
 // =============================================================================
@@ -96,10 +97,21 @@ func (bs *BleveSearcher) executeSearch(ctx context.Context, textQuery string, li
 	return bs.convertResults(bleveResult), nil
 }
 
+// searchableFields are the document fields searched by multi-field queries.
+// Matches the fields configured in core/search/bleve.SearchableFields.
+var searchableFields = []string{"content", "symbols", "comments"}
+
 // buildRequest constructs a Bleve SearchRequest from the query parameters.
+// Uses explicit per-field queries instead of the _all composite field.
 func (bs *BleveSearcher) buildRequest(textQuery string, limit int) *bleve.SearchRequest {
-	query := bleve.NewQueryStringQuery(textQuery)
-	req := bleve.NewSearchRequestOptions(query, limit, 0, false)
+	disjuncts := make([]query.Query, len(searchableFields))
+	for i, field := range searchableFields {
+		mq := bleve.NewMatchQuery(textQuery)
+		mq.SetField(field)
+		disjuncts[i] = mq
+	}
+
+	req := bleve.NewSearchRequestOptions(bleve.NewDisjunctionQuery(disjuncts...), limit, 0, false)
 	req.Fields = []string{"*"}
 	req.Highlight = bleve.NewHighlightWithStyle(ansi.Name)
 	return req

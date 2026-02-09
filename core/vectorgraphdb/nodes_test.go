@@ -668,8 +668,8 @@ func TestNodeStoreInsertHNSWFailureRollback(t *testing.T) {
 	if hnswInsertErr.NodeID != "node1" {
 		t.Errorf("NodeID = %s, want node1", hnswInsertErr.NodeID)
 	}
-	if !errors.Is(hnswInsertErr.HNSWErr, hnswErr) {
-		t.Errorf("HNSWErr = %v, want %v", hnswInsertErr.HNSWErr, hnswErr)
+	if !errors.Is(hnswInsertErr.IndexErr, hnswErr) {
+		t.Errorf("HNSWErr = %v, want %v", hnswInsertErr.IndexErr, hnswErr)
 	}
 	if hnswInsertErr.RollbackFailed {
 		t.Error("RollbackFailed should be false")
@@ -777,39 +777,39 @@ func TestNodeStoreInsertPartialFailureWithConditionalHNSW(t *testing.T) {
 	}
 }
 
-func TestHNSWInsertErrorMessage(t *testing.T) {
+func TestVectorIndexInsertErrorMessage(t *testing.T) {
 	// Test error message with successful rollback
-	err1 := &HNSWInsertError{
+	err1 := &VectorIndexInsertError{
 		NodeID:         "test-node",
-		HNSWErr:        errors.New("index capacity exceeded"),
+		IndexErr:       errors.New("index capacity exceeded"),
 		RollbackFailed: false,
 	}
-	expected1 := "HNSW insert failed for node test-node (rolled back): index capacity exceeded"
+	expected1 := "vector index insert failed for node test-node (rolled back): index capacity exceeded"
 	if err1.Error() != expected1 {
 		t.Errorf("Error() = %q, want %q", err1.Error(), expected1)
 	}
 
 	// Test error message with failed rollback
-	err2 := &HNSWInsertError{
+	err2 := &VectorIndexInsertError{
 		NodeID:         "test-node",
-		HNSWErr:        errors.New("index capacity exceeded"),
+		IndexErr:       errors.New("index capacity exceeded"),
 		RollbackFailed: true,
 		RollbackErr:    errors.New("database locked"),
 	}
-	expected2 := "HNSW insert failed for node test-node: index capacity exceeded; rollback also failed: database locked"
+	expected2 := "vector index insert failed for node test-node: index capacity exceeded; rollback also failed: database locked"
 	if err2.Error() != expected2 {
 		t.Errorf("Error() = %q, want %q", err2.Error(), expected2)
 	}
 }
 
-func TestHNSWInsertErrorUnwrap(t *testing.T) {
-	originalErr := errors.New("original HNSW error")
-	hnswErr := &HNSWInsertError{
-		NodeID:  "test-node",
-		HNSWErr: originalErr,
+func TestVectorIndexInsertErrorUnwrap(t *testing.T) {
+	originalErr := errors.New("original vector index error")
+	indexErr := &VectorIndexInsertError{
+		NodeID:   "test-node",
+		IndexErr: originalErr,
 	}
 
-	if !errors.Is(hnswErr, originalErr) {
+	if !errors.Is(indexErr, originalErr) {
 		t.Error("errors.Is should return true for wrapped error")
 	}
 }

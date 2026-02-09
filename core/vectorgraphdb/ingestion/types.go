@@ -18,10 +18,12 @@ type FileInfo struct {
 }
 
 type MappedFile struct {
-	Path string
-	Data []byte
-	Lang string
-	Size int64
+	Path        string
+	Data        []byte
+	Lang        string
+	DocType     string   // from ClassifyFile: "source_code", "markdown", "config", "note", "web_content"
+	Size        int64
+	ContentHash [32]byte // SHA-256 of Data, computed during read phase.
 }
 
 // ParsedFile holds the result of parsing a single file.
@@ -91,6 +93,24 @@ type ParseError struct {
 }
 
 // =============================================================================
+// Parse Cache Interface
+// =============================================================================
+
+// ParseCacheLookup provides content-hash-keyed lookup for parse results.
+// Defined as an interface here to avoid import cycles (implementation in core/boot).
+type ParseCacheLookup interface {
+	LookupParse(contentHash [32]byte) *ParseCacheEntry
+	StoreParse(contentHash [32]byte, entry *ParseCacheEntry)
+}
+
+// ParseCacheEntry holds cached parse results for a single file.
+type ParseCacheEntry struct {
+	Symbols []Symbol
+	Imports []Import
+	Lines   int
+}
+
+// =============================================================================
 // CodeGraph - In-Memory Representation
 // =============================================================================
 
@@ -118,11 +138,13 @@ type CodeGraph struct {
 
 // FileNode represents a file in the code graph.
 type FileNode struct {
-	ID        uint32
-	Path      string
-	Lang      string
-	LineCount int
-	ByteCount int64
+	ID          uint32
+	Path        string
+	Lang        string
+	DocType     string   // from ClassifyFile, propagated through aggregation
+	LineCount   int
+	ByteCount   int64
+	ContentHash [32]byte // SHA-256 from MappedFile, propagated for cache lookups.
 }
 
 // SymbolNode represents a symbol in the code graph.
@@ -173,23 +195,19 @@ func (k EdgeKind) String() string {
 // Result Types
 // =============================================================================
 
-// IngestionResult holds the results and metrics of an ingestion.
 type IngestionResult struct {
-	Graph *CodeGraph
-
-	// Metrics
+	Graph          *CodeGraph
 	TotalFiles     int
 	TotalSymbols   int
 	TotalLines     int
 	TotalBytes     int64
 	TotalDuration  time.Duration
 	PhaseDurations PhaseDurations
-
-	// Errors (non-fatal)
-	ParseErrors []FileParseError
+	VectorResult   *VectorResult
+	ParseErrors    []FileParseError
+	MappedFiles    []MappedFile // Populated when Config.RetainContent is true.
 }
 
-// PhaseDurations holds timing for each ingestion phase.
 type PhaseDurations struct {
 	Discovery time.Duration
 	Mmap      time.Duration
@@ -197,6 +215,13 @@ type PhaseDurations struct {
 	Aggregate time.Duration
 	Persist   time.Duration
 	Index     time.Duration
+	Vector    time.Duration
+}
+
+type VectorResult struct {
+	SymbolCount    int
+	EmbedderSource string
+	DiskSizeBytes  int64
 }
 
 // FileParseError represents a file that failed to parse.
@@ -209,28 +234,49 @@ type FileParseError struct {
 // Configuration
 // =============================================================================
 
-// Config holds ingestion configuration.
 type Config struct {
-	// Root path to scan
-	RootPath string
-
-	// Gitignore patterns (compiled)
+	RootPath       string
 	IgnorePatterns []string
+	SQLitePath     string
+	BlevePath      string
+	Workers        int
+	SkipPersist    bool
+	SkipBleve      bool
+	VectorConfig   *VectorConfig
+	Discovery      *DiscoveryOptions // Nil uses defaults (existing behavior).
+	RetainContent  bool              // When true, MappedFile data is kept in IngestionResult.
+	IncludePaths   map[string]bool   // When non-nil, only these absolute paths proceed past discovery.
+	ParseCache     ParseCacheLookup  // When non-nil, cache-aware parsing skips unchanged files.
+}
 
-	// SQLite database path (for VectorGraphDB)
-	SQLitePath string
+// DiscoveryOptions controls file discovery behavior.
+// Zero-value preserves existing defaults for backward compatibility.
+type DiscoveryOptions struct {
+	// IncludeAllExtensions bypasses the IsSupportedExtension filter.
+	// Files without tree-sitter grammars still enter the graph as FileNodes
+	// with LineCount computed from raw content.
+	IncludeAllExtensions bool
 
-	// Bleve index path
-	BlevePath string
+	// SkipDefaultPatterns disables appendDefaultPatterns
+	// (vendor/, node_modules/, go.sum, *.lock, build/, dist/).
+	SkipDefaultPatterns bool
 
-	// Worker count (derived from CPU count if 0)
-	Workers int
+	// MaxFileSizeOverride overrides MaxFileSizeBytes when > 0.
+	MaxFileSizeOverride int64
 
-	// Skip persistence (for testing)
-	SkipPersist bool
+	// IncludeDotDirs allows dot-prefixed directories.
+	// VCS directories (.git, .hg, .svn, .bzr) are always skipped.
+	IncludeDotDirs bool
 
-	// Skip Bleve (only persist to SQLite)
-	SkipBleve bool
+	// IncludeVendorDirs allows vendor/, build/, dist/, target/, out/,
+	// node_modules/, __pycache__/, and venv/ directories.
+	IncludeVendorDirs bool
+}
+
+type VectorConfig struct {
+	StorageDir        string
+	EnableHighQuality bool
+	BatchSize         int
 }
 
 // WithDefaults applies default values to the config.

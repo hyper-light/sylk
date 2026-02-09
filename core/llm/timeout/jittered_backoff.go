@@ -60,12 +60,14 @@ func (jb *JitteredBackoff) Next() time.Duration {
 // calculateBackoff computes base * 2^attempt, capped at max.
 func (jb *JitteredBackoff) calculateBackoff() time.Duration {
 	multiplier := math.Pow(2, float64(jb.attempt))
-	backoff := time.Duration(float64(jb.config.Base) * multiplier)
+	backoffFloat := float64(jb.config.Base) * multiplier
 
-	if backoff > jb.config.Max {
+	// Compare as float64 before converting to time.Duration to prevent
+	// int64 overflow when attempt is large (e.g., 2^99 * base > MaxInt64).
+	if backoffFloat >= float64(jb.config.Max) {
 		return jb.config.Max
 	}
-	return backoff
+	return time.Duration(backoffFloat)
 }
 
 // applyJitter applies uniform jitter to the backoff duration.

@@ -1,0 +1,8264 @@
+package ui
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/harmonica"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
+
+	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/boot"
+	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/detect"
+	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/lsp"
+	"github.com/adalundhe/sylk/core/search/git"
+	"github.com/adalundhe/sylk/core/session"
+	agentpkg "github.com/adalundhe/sylk/ui/agent"
+	"github.com/adalundhe/sylk/ui/bridge"
+	"github.com/adalundhe/sylk/ui/chat"
+	codepkg "github.com/adalundhe/sylk/ui/code"
+	"github.com/adalundhe/sylk/ui/committree"
+	"github.com/adalundhe/sylk/ui/component"
+	"github.com/adalundhe/sylk/ui/compositor"
+	"github.com/adalundhe/sylk/ui/editor"
+	"github.com/adalundhe/sylk/ui/editor/mode"
+	"github.com/adalundhe/sylk/ui/editor/preview"
+	"github.com/adalundhe/sylk/ui/editor/register"
+	"github.com/adalundhe/sylk/ui/fieldmanual"
+	"github.com/adalundhe/sylk/ui/filetree"
+	"github.com/adalundhe/sylk/ui/fonts"
+	"github.com/adalundhe/sylk/ui/gitpanel"
+	inputpkg "github.com/adalundhe/sylk/ui/input"
+	"github.com/adalundhe/sylk/ui/interrupt"
+	knowledgepkg "github.com/adalundhe/sylk/ui/knowledge"
+	"github.com/adalundhe/sylk/ui/layout"
+	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
+	"github.com/adalundhe/sylk/ui/modal"
+	"github.com/adalundhe/sylk/ui/msg"
+	"github.com/adalundhe/sylk/ui/pane"
+	"github.com/adalundhe/sylk/ui/search"
+	sessionpkg "github.com/adalundhe/sylk/ui/session"
+	"github.com/adalundhe/sylk/ui/status"
+	"github.com/adalundhe/sylk/ui/tabbar"
+	"github.com/adalundhe/sylk/ui/theme"
+)
+
+// tickFastInterval drives 60fps animations (scroll momentum, bounce, flash).
+// Derived from: 1000ms / 60fps ≈ 16ms.
+const tickFastInterval = 16 * time.Millisecond
+
+// tickSlowInterval drives transient slow-rate work (swipe decay).
+// Derived from: swipe decay timeout is 300ms; 200ms provides ≥1 sample.
+const tickSlowInterval = 200 * time.Millisecond
+
+// decorTickInterval drives low-frequency UI effects (spinners, flashes).
+// 100ms (~10fps) keeps visuals smooth while reducing idle CPU.
+const decorTickInterval = 100 * time.Millisecond
+
+// blinkHalfPeriod is the duration between cursor visibility toggles.
+// Derived from: standard terminal cursor blink rate (~530ms per phase).
+const blinkHalfPeriod = 530 * time.Millisecond
+
+// tickRate classifies the current tick chain speed.
+type tickRate int
+
+const (
+	tickIdle tickRate = iota // No tick scheduled.
+	tickSlow                 // 200ms — swipe decay.
+	tickFast                 // 16ms — scroll, bounce, flash, spinner.
+)
+
+// shutdownGrace is the grace period for goroutine shutdown.
+// Derived from: once contexts are cancelled, goroutines exit within ms.
+const shutdownGrace = 1 * time.Second
+
+// shutdownHard is the hard deadline for goroutine shutdown after force cancel.
+const shutdownHard = 2 * time.Second
+
+// lspDebounceInterval is the delay after the last keystroke before sending
+// a didChange notification. Derived from: typical typing speed ~5 chars/sec
+// = 200ms between keystrokes; 300ms batches rapid edits while staying
+// responsive. Standard for LSP clients (VSCode uses 300ms).
+const lspDebounceInterval = 300 * time.Millisecond
+
+// lspNotifyTimeout bounds fire-and-forget LSP notifications (didSave, didClose).
+// Derived from: these are thin JSON-RPC writes to a local process; 5s is ample.
+const lspNotifyTimeout = 5 * time.Second
+
+// overlayToggleDebounce prevents hold-to-repeat from rapidly toggling
+// overlay elements (chord hints, find bar). Derived from: typical terminal
+// key repeat starts at ~30ms intervals; 150ms absorbs repeats while still
+// feeling responsive for intentional double-taps.
+const overlayToggleDebounce = 150 * time.Millisecond
+
+// tabArrowFlashDuration is how long the overflow arrow stays highlighted.
+// Roughly matches the prior 63×16ms tick timing (~1.0s).
+const tabArrowFlashDuration = 1 * time.Second
+
+// escDisambiguateTimeout is the maximum delay between a standalone ESC byte
+// and a follow-up rune before the ESC is flushed as a real Escape keypress.
+// Derived from: standard terminal practice — vim ttimeoutlen=50, tmux
+// escape-time=50. 50 ms balances fast ESC response with reliable Alt+key
+// detection across SSH and varied terminal emulators.
+const escDisambiguateTimeout = 50 * time.Millisecond
+
+// sourceAgentTUI identifies the TUI as the source agent for guide routing.
+const sourceAgentTUI = "tui"
+
+// ---------------------------------------------------------------------------
+// Warp points
+// ---------------------------------------------------------------------------
+
+// warpSlotCount is the number of warp point slots (Alt+1 through Alt+9).
+// Derived from: 9 digit keys on the keyboard.
+const warpSlotCount = 9
+
+// ratioStep is the per-keypress adjustment to a split ratio.
+// Derived from: 5% per press gives 16 discrete positions between 0.1–0.9.
+const ratioStep = 0.05
+
+// WarpPoint stores a cursor position bookmark for instant teleportation.
+type WarpPoint struct {
+	Path     string // Absolute file path.
+	Line     int    // 0-indexed line number.
+	Col      int    // 0-indexed column (rune offset).
+	StartCol int    // 0-indexed start of symbol at cursor (rune offset).
+	EndCol   int    // 0-indexed end of symbol at cursor (exclusive, rune offset).
+}
+
+// shiftDigitSlot maps shifted digit characters to warp slot indices.
+// Derived from: US keyboard Shift+1..9 produces !@#$%^&*(.
+var shiftDigitSlot = map[byte]int{
+	'!': 0, '@': 1, '#': 2, '$': 3, '%': 4,
+	'^': 5, '&': 6, '*': 7, '(': 8,
+}
+
+// ---------------------------------------------------------------------------
+// Overlay state
+// ---------------------------------------------------------------------------
+
+// overlayState tracks which overlay (if any) is currently active.
+type overlayState int
+
+const (
+	overlayNone        overlayState = iota
+	overlayEditor                   // Full-screen editor.
+	overlayModal                    // Modal dialog stack.
+	overlaySearch                   // Command palette.
+	overlayFieldManual              // Field Manual help overlay.
+)
+
+// ---------------------------------------------------------------------------
+// Panel layout
+// ---------------------------------------------------------------------------
+
+// defaultPanels defines the initial panel layout with flex-grow weights and
+// collapse thresholds. CollapseWidth is the minimum allocated width before
+// the panel is hidden; breakpoints are derived from flex-grow distribution.
+//
+// Collapse order: FileTree first, then Code, then Session. Chat never collapses.
+var defaultPanels = []layout.PanelSpec{
+	{ID: component.FocusSessionPanel, MinWidth: layout.DefaultMinPanelWidth, FlexGrow: 1, CollapseWidth: sessionCollapseWidth, Visible: true},
+	{ID: component.FocusFileTree, MinWidth: layout.DefaultMinPanelWidth, FlexGrow: 1, CollapseWidth: fileTreeCollapseWidth, Visible: true},
+	{ID: component.FocusChat, MinWidth: layout.DefaultMinPanelWidth, FlexGrow: 2, Visible: true},
+	{ID: component.FocusCodeViewer, MinWidth: layout.DefaultMinPanelWidth, FlexGrow: 2, CollapseWidth: codeCollapseWidth, Visible: true},
+}
+
+// sessionCollapseWidth is derived from: 36 content + 2 border + 2 pad + 4 header.
+const sessionCollapseWidth = 44
+
+// fileTreeCollapseWidth is derived from: 30 content + 2 border + 2 pad + 4 indent.
+const fileTreeCollapseWidth = 38
+
+// codeCollapseWidth is derived from: 56 content + 4 gutter + 1 sep + 2 border + 3 pad.
+// At this width, common code lines (≤56 chars) display without truncation.
+const codeCollapseWidth = 66
+
+// defaultModeCandidates defines explicit column assignments per layout mode,
+// evaluated from widest to narrowest. The first candidate whose panels all
+// meet their CollapseWidth threshold wins.
+var defaultModeCandidates = []layout.ModeCandidate{
+	{Mode: layout.FourColumn, Columns: []component.FocusID{
+		component.FocusSessionPanel, component.FocusFileTree, component.FocusChat, component.FocusCodeViewer,
+	}},
+	{Mode: layout.ThreeColumn, Columns: []component.FocusID{
+		component.FocusSessionPanel, component.FocusChat, component.FocusCodeViewer,
+	}},
+	{Mode: layout.TwoColumn, Columns: []component.FocusID{
+		component.FocusSessionPanel, component.FocusChat,
+	}},
+	// SingleColumn uses Chat as the anchor so all ring-swapped panels
+	// inherit the full terminal width via findSharedColumnDims.
+	{Mode: layout.SingleColumn, Columns: []component.FocusID{
+		component.FocusChat,
+	}},
+}
+
+// defaultTabOrder defines the focus cycling order.
+var defaultTabOrder = []component.FocusID{
+	component.FocusInput,
+	component.FocusChat,
+	component.FocusSessionPanel,
+	component.FocusAgentPanel,
+	component.FocusCodeViewer,
+}
+
+// ---------------------------------------------------------------------------
+// Dependencies
+// ---------------------------------------------------------------------------
+
+// Deps holds all core system references needed by the TUI.
+// The caller (cmd.go) is responsible for constructing and providing these.
+type Deps struct {
+	ActivityBus    *events.ActivityEventBus
+	SessionManager *session.Manager
+	GuideBus       guide.EventBus
+	StreamManager  *guide.StreamManager
+	Scope          *concurrency.GoroutineScope
+}
+
+// ---------------------------------------------------------------------------
+// AppModel
+// ---------------------------------------------------------------------------
+
+// editorPaneState holds the per-pane state for an editor leaf in the
+// split tree. Each pane has its own editor.Model and tab order.
+type editorPaneState struct {
+	editor   *editor.Model
+	tabOrder []string
+}
+
+// AppModel is the root Bubble Tea model that composes all TUI components.
+type AppModel struct {
+	// Lifecycle context — cancelled on Shutdown to abort in-flight Cmds.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Configuration
+	config Config
+
+	// Core dependencies
+	deps Deps
+
+	// Layout
+	layout *layout.Manager
+	focus  *layout.FocusManager
+
+	// Panel components
+	chat           *chat.Model
+	input          *inputpkg.Model
+	statusBar      *status.Model
+	sessionPanel   *sessionpkg.Model
+	agentPanel     *agentpkg.Model
+	codePanel      *codepkg.Model
+	knowledgePanel *knowledgepkg.Model
+	fileTree       *filetree.Model
+
+	// Overlay components
+	editorOverlay      *editor.Model
+	modalOverlay       *modal.Model
+	searchOverlay      *search.Model
+	fieldManualOverlay *fieldmanual.Model
+	overlay            overlayState
+
+	// Bridges
+	activityBridge *bridge.ActivityBridge
+	sessionBridge  *bridge.SessionBridge
+	streamBridge   *bridge.StreamBridge
+	guideBridge    *bridge.GuideBridge
+	lspBridge      *bridge.LSPBridge
+
+	// LSP
+	lspManager    *lsp.Manager
+	lspInstalling map[lsp.ServerID]bool // Tracks in-progress on-demand installs.
+
+	// Interrupt
+	interruptHandler *interrupt.Handler
+	lastEscTime      time.Time
+
+	// Clipboard
+	clipboard register.ClipboardProvider
+
+	// State
+	chord             chordState
+	chordBlocked      bool             // Chord triggered in edit mode (display-only, no cycling).
+	lastToggleKey     string           // Last overlay toggle key (debounce guard).
+	lastToggleAt      time.Time        // When lastToggleKey was pressed.
+	leftRing          viewRing         // Left slot cycling ring (Session/FileTree).
+	rightRing         viewRing         // Right slot cycling ring (Chat/Code).
+	collapseHintShown bool             // First-collapse flash shown once per session.
+	scrollSpring      harmonica.Spring // Spring simulation for smooth scroll.
+	scroll            scrollState      // Current scroll animation state.
+	bounceSpring      harmonica.Spring // Underdamped spring for overscroll bounce.
+	bounce            bounceState      // Current bounce animation state.
+	swipe             swipeState       // Horizontal scroll accumulation for ring cycling.
+
+	// Inline editor (Alt+E edit mode).
+	editMode       bool              // Whether inline editing is active.
+	savedLeftIdx   int               // Saved leftRing.index before edit mode.
+	savedRightIdx  int               // Saved rightRing.index before edit mode.
+	savedChatFocus component.FocusID // Last focused panel in chat mode.
+	savedEditFocus component.FocusID // Last focused panel in edit mode.
+
+	// Git mode (Alt+G).
+	gitMode          bool              // Whether git mode is active.
+	gitClient        *git.GitClient    // Git client for data loading (nil if not a repo).
+	gitPanel         *gitpanel.Model   // Git explorer panel (left slot in git mode).
+	commitTree       *committree.Model // Commit tree visualization (right slot in git mode).
+	savedGitLeftIdx  int               // Saved leftRing.index before git mode.
+	savedGitRightIdx int               // Saved rightRing.index before git mode.
+	savedGitFocus    component.FocusID // Last focused panel in git mode.
+	preGitEditMode   bool              // Whether edit mode was active before entering git mode.
+	prevGitMode      bool              // Detect git mode transitions for dirty detection.
+
+	// Mouse drag tracking for inline editor selection.
+	editorMouseDown bool // Left button pressed inside the code panel.
+	editorDragging  bool // Actual drag motion detected after press.
+
+	// Tab bar drag-and-drop reordering.
+	tabDragIdx        int         // Tab index being dragged (-1 = none).
+	tabDragSourcePane pane.PaneID // Pane the drag originated from (0 = none).
+	tabDropTarget     pane.PaneID // Pane highlighted as drop target (0 = none).
+
+	// Tab bar close-icon hover highlight.
+	tabHoverClose        int         // Tab index whose close icon is hovered (-1 = none).
+	tabHoverPane         pane.PaneID // Pane whose close icon is being hovered.
+	previewTabHoverClose int         // Preview tab close icon hover (-1 = none).
+
+	// Overflow arrow flash windows.
+	tabArrowFlashLeftUntil  time.Time
+	tabArrowFlashRightUntil time.Time
+
+	// Demand-driven tick chain state.
+	tickGen  uint64   // Generation counter; incremented on tick chain transitions.
+	tickRate tickRate // Current tick chain speed (idle/slow/fast).
+	decorGen uint64   // Generation counter for decor tick chain.
+	decorOn  bool     // Whether decor tick chain is active.
+
+	// Centralized cursor blink timer (one-shot at blinkHalfPeriod).
+	blinkGen   uint64    // Generation counter; bumped on interactive events to reset blink.
+	blinkEpoch time.Time // Wall-clock reference: cursor visible at epoch, phase derived from elapsed time.
+
+	cursorVisible     bool // Computed once per frame in View().
+	lastRenderedPhase bool // Phase at last render; drives dirty detection.
+	blinkDirty        bool // True when phase changed this frame; drives slot marking.
+
+	// One-shot LSP flush timer (fires lspDebounceInterval after last edit).
+	lspFlushGen int // editGeneration at last scheduled flush; prevents duplicates.
+
+	// Frame compositor: line-level cached composition.
+	comp      compositor.Compositor
+	viewDirty bool
+
+	// Compositor dirty-detection state.
+	prevFocusGrp  compositor.SlotID // Border group of previous focus.
+	prevOverlay   overlayState      // Detect overlay transitions.
+	prevEditMode  bool              // Detect edit mode transitions.
+	prevChord     chordState        // Detect chord hint changes.
+	prevLeftRing  int               // Detect left ring cycling.
+	prevRightRing int               // Detect right ring cycling.
+	prevInputH    int               // Detect input height changes.
+	prevHoverKey  [5]int            // Detect tab hover state changes.
+
+	// Mouse hover tracking for LSP hover tooltips.
+	hoverMouseLine      int // last buffer line the mouse was over (-1 = none)
+	hoverMouseCol       int // last buffer col for LSP request precision
+	hoverMouseWordStart int // start col of the word under cursor
+	hoverPending        bool
+	hoverForPreview     bool // true when hover was triggered over the preview pane
+
+	// Pending hover definition: stashed when the definition response arrives
+	// before the hover content. Applied when the hover becomes active.
+	pendingHoverSymbol  string
+	pendingHoverPkgPath string
+
+	// Document highlight tracking (cursor-rest symbol highlighting).
+	highlightLine int // last line a highlight debounce was scheduled for
+	highlightCol  int // last col a highlight debounce was scheduled for
+
+	// Command input tracking: true when ':' activated the input panel.
+	editCmdInput bool
+
+	// pendingClosePrompt is true while the status bar shows a save-before-close
+	// prompt. While active, handleKey intercepts y/n/esc to resolve it.
+	pendingClosePrompt bool
+	// pendingPaneClose is non-zero when the save prompt is for a pane close
+	// operation. The value is the PaneID being closed.
+	pendingPaneClose pane.PaneID
+
+	// Tiered LRU cache for background tab editor state (undo, buffer, cursor).
+	editorCache *editor.EditorCache
+
+	savedActiveTab string // Path of the active tab saved on exitEditMode for restore.
+
+	// Preview panel (read-only file preview, rendered in code panel slot).
+	previewPanel *preview.Panel // Independent read-only preview sub-panel.
+
+	// Markdown preview (rendered markdown split-right of the source editor).
+	mdPreviewPane          pane.PaneID         // PaneID of the markdown viewer (0 = none).
+	mdPreviewPanel         *markdownpkg.Panel  // Rendered markdown viewer panel.
+	mdPreviewTabHoverClose int                 // Close hover on markdown preview tab (-1).
+	mdTooltipTab           int                 // Tab index showing "View" tooltip (-1 = none).
+	mdTooltipPane          pane.PaneID         // Pane whose tab shows the tooltip.
+	mdTooltipX             int                 // Local X of tooltip for overlay placement.
+
+	// Pane tree: binary split tree tracking editor + preview layout.
+	// Each editor pane has its own editor.Model and tab order.
+	paneTree    *pane.Node                       // Split tree root (always non-nil in edit mode).
+	paneEditors map[pane.PaneID]*editorPaneState // Per-pane editor state.
+	focusedPane pane.PaneID                      // Currently focused pane.
+	previewPane pane.PaneID                      // PaneID of the preview leaf (0 = no preview).
+	paneCounter pane.PaneID                      // Monotonic ID allocator for new panes.
+
+	// Warp points: numbered teleport bookmarks (nil = empty slot).
+	warpPoints [warpSlotCount]*WarpPoint
+
+	// Focus state saved when entering the tabs panel, restored on exit.
+	preTabsFocus component.FocusID
+
+	width  int
+	height int
+	ready  bool
+
+	// Font detection result cached from New() to avoid repeated fc-list calls.
+	nerdFontsDetected bool
+
+	// Event-driven git status watcher. Nil when project root is not a git repo.
+	gitWatcher *git.StatusWatcher
+
+	// ESC disambiguation: buffer a standalone ESC for a short window so a
+	// follow-up rune can be merged into an Alt+rune KeyMsg. This mirrors
+	// vim's ttimeoutlen / tmux's escape-time mechanism.
+	escPending bool
+	escKey     tea.KeyMsg
+	escAt      time.Time
+	escGen     uint64
+}
+
+// viewRing tracks a cycling list of panels for a swappable layout slot.
+// leftRing holds panels sharing a left column; rightRing holds panels sharing a right column.
+type viewRing struct {
+	panels []component.FocusID
+	index  int
+}
+
+// current returns the panel that currently occupies the slot.
+// Returns 0 (invalid) when the ring is empty.
+func (r *viewRing) current() component.FocusID {
+	if len(r.panels) == 0 {
+		return 0
+	}
+	return r.panels[r.index]
+}
+
+// cycle advances the ring by delta (positive = right, negative = left)
+// using wrapping modular arithmetic.
+func (r *viewRing) cycle(delta int) {
+	n := len(r.panels)
+	if n == 0 {
+		return
+	}
+	r.index = ((r.index+delta)%n + n) % n
+}
+
+// reset rebuilds the ring with new panels. If the previously active panel
+// is present in the new ring, it remains selected; otherwise index resets to 0.
+func (r *viewRing) reset(panels []component.FocusID) {
+	prev := r.current()
+	r.panels = panels
+	r.index = 0
+	for i, p := range panels {
+		if p == prev {
+			r.index = i
+			return
+		}
+	}
+}
+
+// setTo positions the ring on the given panel. Returns true if found.
+func (r *viewRing) setTo(id component.FocusID) bool {
+	for i, p := range r.panels {
+		if p == id {
+			r.index = i
+			return true
+		}
+	}
+	return false
+}
+
+// empty reports whether the ring has no panels to cycle.
+func (r *viewRing) empty() bool { return len(r.panels) == 0 }
+
+// scrollState tracks the spring-driven scroll animation.
+type scrollState struct {
+	pos     float64           // Smooth position (fractional line offset).
+	vel     float64           // Current spring velocity.
+	target  float64           // Target position (accumulated from wheel events).
+	applied int               // Lines actually dispatched to the panel.
+	panel   component.FocusID // Which panel is being scrolled.
+}
+
+// bounceState tracks the overscroll bounce animation for a single panel.
+type bounceState struct {
+	pos   float64           // Current visual offset (fractional lines).
+	vel   float64           // Current spring velocity.
+	panel component.FocusID // Which panel is bouncing.
+}
+
+// swipeState tracks horizontal scroll accumulation for ring cycling.
+type swipeState struct {
+	accum         float64   // Accumulated horizontal ticks (+right, -left).
+	stamp         time.Time // Time of last horizontal scroll event.
+	cooldownUntil time.Time // Events are ignored until this time (post-cycle dead zone).
+}
+
+// New creates a root AppModel from configuration and dependencies.
+func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
+	// Ensure managed LSP binaries are discoverable before any server
+	// selection occurs. Must precede NewManager / selector creation.
+	lsp.EnsureManagedBinOnPath()
+
+	appCtx, appCancel := context.WithCancel(ctx)
+	th := cfg.Theme()
+
+	app := &AppModel{
+		ctx:                  appCtx,
+		cancel:               appCancel,
+		config:               cfg,
+		deps:                 deps,
+		layout:               layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
+		focus:                layout.NewFocusManager(defaultTabOrder),
+		chat:                 chat.New(th, cfg.ChatHistoryCapacity),
+		statusBar:            status.New(th, deps.SessionManager),
+		sessionPanel:         sessionpkg.New(deps.SessionManager, th),
+		agentPanel:           agentpkg.New(th),
+		codePanel:            codepkg.New(th),
+		knowledgePanel:       knowledgepkg.New(th),
+		fileTree:             filetree.New(th),
+		editorOverlay:        editor.New(th),
+		editorCache:          editor.NewEditorCache(editor.CacheConfig{}),
+		modalOverlay:         modal.New(th),
+		searchOverlay:        search.New(th, search.NewProviderRegistry()),
+		fieldManualOverlay:   fieldmanual.New(th),
+		activityBridge:       bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
+		sessionBridge:        bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
+		streamBridge:         bridge.NewStreamBridge(deps.Scope),
+		guideBridge:          bridge.NewGuideBridge(deps.GuideBus, deps.Scope),
+		lspManager:           lsp.NewManager(deps.Scope),
+		lspInstalling:        make(map[lsp.ServerID]bool),
+		interruptHandler:     interrupt.NewHandler(),
+		clipboard:            register.NewOSClipboard(),
+		scrollSpring:         harmonica.NewSpring(harmonica.FPS(scrollFPS), scrollFrequency, scrollDamping),
+		bounceSpring:         harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
+		hoverMouseLine:       -1,
+		highlightLine:        -1,
+		tabDragIdx:             -1,
+		tabHoverClose:          -1,
+		previewTabHoverClose:   -1,
+		mdPreviewTabHoverClose: -1,
+		mdTooltipTab:           -1,
+	}
+
+	app.comp = compositor.New()
+	app.previewPanel = preview.New(th)
+	app.mdPreviewPanel = markdownpkg.New(th)
+	app.paneCounter = 1
+	app.focusedPane = 1
+	app.paneTree = pane.NewLeaf(1)
+	app.paneEditors = map[pane.PaneID]*editorPaneState{
+		1: {editor: editor.New(th)},
+	}
+
+	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
+	app.input = inputpkg.New(th, cfg.InputHistoryCapacity, &tabCompleter{tabOrderFn: app.focusedTabOrder})
+	app.syncFocusState()
+
+	// Nerd Font detection: the font must be installed AND a fontconfig
+	// fallback snippet must be in place (so VTE terminals like Terminator
+	// resolve PUA codepoints to Symbols Nerd Font).
+	app.nerdFontsDetected = fonts.Detected()
+	app.fileTree.SetNerdFonts(app.nerdFontsDetected)
+
+	// Git status watcher for file tree decorations.
+	if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
+		app.gitClient = gc
+		app.gitPanel = gitpanel.New(th, gc)
+		app.commitTree = committree.New(th)
+		if sw, err := git.NewStatusWatcher(gc); err == nil {
+			app.gitWatcher = sw
+		}
+	}
+
+	return app
+}
+
+// Init starts all event bridges, the tick/blink timers, and background LSP provisioning.
+func (m *AppModel) Init() tea.Cmd {
+	m.viewDirty = true
+	m.blinkEpoch = time.Now()
+	cmds := []tea.Cmd{
+		m.startBridges(),
+		m.ensureTick(false),
+		m.provisionLSPServers(),
+	}
+	if bc := m.ensureBlinkAfterDispatch(); bc != nil {
+		cmds = append(cmds, bc)
+	}
+	if !m.nerdFontsDetected {
+		cmds = append(cmds, m.installNerdFontsCmd())
+	}
+	if m.gitWatcher != nil {
+		m.gitWatcher.Start(m.ctx)
+		cmds = append(cmds, m.gitWatchCmd())
+	}
+	return tea.Batch(cmds...)
+}
+
+// installNerdFontsCmd returns a Cmd that downloads and installs Nerd Font
+// symbols in the background, cancellable via the app context.
+func (m *AppModel) installNerdFontsCmd() tea.Cmd {
+	ctx := m.ctx
+	return func() tea.Msg {
+		err := fonts.InstallCtx(ctx)
+		return msg.NerdFontsResultMsg{Available: err == nil}
+	}
+}
+
+// gitWatchCmd returns a Cmd that blocks on the git status watcher channel,
+// returning the next status update as a GitStatusMsg. Returns nil when the
+// watcher is not active.
+func (m *AppModel) gitWatchCmd() tea.Cmd {
+	if m.gitWatcher == nil {
+		return nil
+	}
+	ch := m.gitWatcher.Events()
+	return func() tea.Msg {
+		update, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg.GitStatusMsg{
+			StatusMap:   update.StatusMap,
+			TrackedSet:  update.TrackedSet,
+			TrackedDirs: update.TrackedDirs,
+		}
+	}
+}
+
+// nudgeGitWatcher signals the watcher to refresh soon. Safe to call when
+// the watcher is nil (non-git projects).
+func (m *AppModel) nudgeGitWatcher() {
+	if m.gitWatcher != nil {
+		m.gitWatcher.Nudge()
+	}
+}
+
+// Update dispatches incoming messages and ensures the tick/blink/LSP-flush
+// chains are running at the appropriate speed for the current activity level.
+func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
+	_, cmd := m.dispatch(raw)
+
+	switch raw.(type) {
+	case msg.TickMsg:
+		// Tick chain self-manages via continueTickChain in handleTick.
+		// viewDirty set by handleTick when visual work occurred.
+		return m, cmd
+	case msg.BlinkMsg:
+		// Blink chain self-manages via handleBlink. Phase sync and
+		// viewDirty are handled by centralized blink logic in View().
+		return m, cmd
+	case msg.LSPFlushMsg:
+		// One-shot timer; no view change.
+		return m, cmd
+	case tea.KeyMsg, tea.MouseMsg:
+		// Interactive events reset blink phase.
+		m.viewDirty = true
+		m.blinkGen++
+		m.blinkEpoch = time.Now()
+		return m, m.postDispatchCmds(cmd, true)
+	default:
+		// Background messages (git, LSP, streaming, etc.) may change visual
+		// state but must NOT reset the blink cycle or schedule new blink
+		// timers — otherwise each background message creates a 530ms timer,
+		// causing duplicate blink chains and burning CPU at idle.
+		m.viewDirty = true
+		return m, m.postDispatchCmds(cmd, false)
+	}
+}
+
+// postDispatchCmds collects tick, blink, and LSP-flush commands that may be
+// needed after a non-tick dispatch. scheduleBlink is true only for
+// interactive events (key/mouse) that bumped blinkGen.
+func (m *AppModel) postDispatchCmds(dispatchCmd tea.Cmd, scheduleBlink bool) tea.Cmd {
+	cmds := make([]tea.Cmd, 0, 5)
+	if dispatchCmd != nil {
+		cmds = append(cmds, dispatchCmd)
+	}
+	if tc := m.ensureTickAfterDispatch(); tc != nil {
+		cmds = append(cmds, tc)
+	}
+	if dc := m.ensureDecorTickAfterDispatch(); dc != nil {
+		cmds = append(cmds, dc)
+	}
+	if scheduleBlink {
+		if bc := m.ensureBlinkAfterDispatch(); bc != nil {
+			cmds = append(cmds, bc)
+		}
+	}
+	if lf := m.ensureLSPFlush(); lf != nil {
+		cmds = append(cmds, lf)
+	}
+	switch len(cmds) {
+	case 0:
+		return nil
+	case 1:
+		return cmds[0]
+	default:
+		return tea.Batch(cmds...)
+	}
+}
+
+// dispatch is the main message handler.
+func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
+	switch typed := raw.(type) {
+	case tea.WindowSizeMsg:
+		return m, m.handleResize(typed)
+	case tea.KeyMsg:
+		return m.handleKey(typed)
+	case tea.MouseMsg:
+		return m, m.handleMouse(typed)
+	case msg.SubmitPromptMsg:
+		if m.editCmdInput {
+			m.editCmdInput = false
+			m.input.SetLineStyler(nil)
+			exCmd := m.handleExCommand(typed.Text)
+			if m.editMode {
+				m.focusCodePanel()
+				m.syncFocusState()
+			}
+			return m, exCmd
+		}
+		if m.editMode {
+			exCmd := m.handleExCommand(typed.Text)
+			if m.editMode {
+				m.focusCodePanel()
+				m.syncFocusState()
+			}
+			return m, exCmd
+		}
+		return m, m.handleSubmit(typed)
+	case msg.InterruptMsg:
+		return m, m.handleInterrupt()
+	case msg.QuitConfirmMsg:
+		return m, m.handleQuit()
+	case msg.TickMsg:
+		return m, m.handleTick(typed)
+	case msg.DecorTickMsg:
+		return m, m.handleDecorTick(typed)
+	case msg.BlinkMsg:
+		return m, m.handleBlink(typed)
+	case msg.LSPFlushMsg:
+		return m, m.handleLSPFlush(typed)
+	case msg.FocusPanelMsg:
+		return m, m.handleFocusPanel(typed)
+	case msg.OpenEditorMsg:
+		return m, m.handleOpenEditor(typed)
+	case msg.CloseEditorMsg:
+		return m, m.handleCloseEditor()
+	case msg.FileOpenMsg:
+		// Dismiss preview only when opening a NEW file (not already a tab).
+		// Tab switches (shift+tab) should keep the preview visible.
+		if m.hasPreview() && !m.isExistingTab(typed.Path) {
+			m.dismissPreview()
+		}
+		return m, m.handleFileOpen(typed)
+	case msg.FilePreviewMsg:
+		return m, m.handleFilePreview(typed)
+	case msg.FileTreeEntryCreatedMsg:
+		m.nudgeGitWatcher()
+		if !typed.IsDir {
+			return m, func() tea.Msg { return msg.FileOpenMsg{Path: typed.Path} }
+		}
+		return m, nil
+	case msg.FileTreeEntryRenamedMsg:
+		m.nudgeGitWatcher()
+		return m, nil
+	case msg.FileTreeEntryDeletedMsg:
+		m.nudgeGitWatcher()
+		if m.codePanel.FilePath() == typed.Path {
+			m.codePanel.ClearFile()
+		}
+		if m.focusedEditor().FilePath() == typed.Path {
+			m.focusedEditor().ClearFile()
+		}
+		m.fileTree.SetActiveFile("")
+		return m, nil
+	case msg.GitStatusMsg:
+		m.fileTree.SetGitStatus(typed.StatusMap, typed.TrackedSet, typed.TrackedDirs)
+		cmds := []tea.Cmd{m.gitWatchCmd()}
+		if m.gitMode {
+			cmds = append(cmds, m.gitPanel.LoadData(), m.loadGitBranchesCmd())
+			if m.commitTree.InCommitView() {
+				cmds = append(cmds, m.loadBranchCommitsCmd(m.commitTree.ActiveBranch()))
+			}
+		}
+		return m, tea.Batch(cmds...)
+	case gitBranchesLoadedMsg:
+		if m.commitTree != nil {
+			m.commitTree.SetBranches(typed.branches)
+		}
+		return m, nil
+	case gitBranchCommitsLoadedMsg:
+		if m.commitTree != nil {
+			m.commitTree.SetNodes(typed.nodes)
+			hashes := make([]string, len(typed.nodes))
+			for i, n := range typed.nodes {
+				hashes[i] = n.Hash
+			}
+			return m, m.loadGitStatsCmd(hashes)
+		}
+		return m, nil
+	case committree.BranchSelectedMsg:
+		if m.gitMode && m.gitClient != nil {
+			return m, m.loadBranchCommitsCmd(typed.Name)
+		}
+		return m, nil
+	case gitStatsLoadedMsg:
+		if m.commitTree != nil {
+			m.commitTree.UpdateStats(typed.stats)
+		}
+		return m, nil
+	case msg.FileReplacedMsg:
+		return m, m.handleFileReplaced(typed)
+	case msg.MultiFileReplaceDoneMsg:
+		return m, m.handleMultiFileReplaceDone(typed)
+	case msg.GuideResponseMsg:
+		return m, m.handleGuideResponse(typed)
+	case modal.ModalClosedMsg:
+		return m, m.handleModalClosed()
+	case msg.LSPDiagnosticMsg:
+		return m, m.handleLSPDiagnostic(typed)
+	case msg.LSPProvisionDoneMsg:
+		if typed.Err == nil {
+			detect.ClearCache()
+		}
+		return m, nil
+	case msg.LSPServerMissingMsg:
+		return m, m.handleLSPServerMissing(typed)
+	case msg.LSPServerInstalledMsg:
+		return m, m.handleLSPServerInstalled(typed)
+	case mode.StandaloneResult:
+		// Forward standalone operator results (gd) to the inline editor.
+		_, cmd := m.focusedEditor().Update(typed)
+		return m, cmd
+	case msg.LSPHoverRequestMsg:
+		// Sync hover tracking so the staleness check in LSPHoverMsg passes
+		// regardless of whether hover was triggered by K or mouse.
+		m.hoverMouseLine = typed.Line
+		m.hoverMouseCol = typed.Col
+		wordStart, _ := m.focusedEditor().WordBoundsAt(typed.Line, typed.Col)
+		m.hoverMouseWordStart = wordStart
+		m.hoverForPreview = false
+		m.pendingHoverSymbol = ""
+		m.pendingHoverPkgPath = ""
+		return m, tea.Batch(
+			m.lspHoverCmd(typed.FilePath, typed.Line, typed.Col),
+			m.lspDefinitionCmd(typed.FilePath, typed.Line, typed.Col, true),
+		)
+	case msg.LSPMouseHoverTickMsg:
+		return m, m.handleMouseHoverTick(typed)
+	case msg.LSPHoverMsg:
+		if m.hoverForPreview {
+			return m, m.handlePreviewHoverMsg(typed)
+		}
+		// Discard stale hover responses if the mouse has moved to a different word.
+		wordStart, _ := m.focusedEditor().WordBoundsAt(typed.Line, typed.Col)
+		if typed.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+			return m, nil
+		}
+		m.focusedEditor().Update(typed)
+		// Apply definition info that arrived before the hover content.
+		if m.focusedEditor().HoverActive() && m.pendingHoverSymbol != "" {
+			m.focusedEditor().SetHoverDefinition(m.pendingHoverSymbol, m.pendingHoverPkgPath)
+			m.pendingHoverSymbol = ""
+			m.pendingHoverPkgPath = ""
+		}
+		return m, nil
+	case msg.LSPDefinitionRequestMsg:
+		return m, m.lspDefinitionCmd(typed.FilePath, typed.Line, typed.Col, typed.ForHover)
+	case msg.LSPDefinitionMsg:
+		if typed.ForHover {
+			return m, m.handleHoverDefinition(typed)
+		}
+		_, cmd := m.focusedEditor().Update(typed)
+		return m, cmd
+	case msg.LSPCompletionRequestMsg:
+		// Flush pending didChange so the server sees the latest buffer content.
+		var flushContent string
+		if m.focusedEditor().LSPDirty() {
+			m.focusedEditor().ClearLSPDirty()
+			flushContent = m.focusedEditor().Content()
+		}
+		return m, m.lspCompletionCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
+	case msg.LSPCompletionMsg:
+		m.focusedEditor().Update(typed)
+		return m, nil
+	case msg.LSPSignatureHelpRequestMsg:
+		// Flush pending didChange so the server sees the trigger character.
+		var flushContent string
+		if m.focusedEditor().LSPDirty() {
+			m.focusedEditor().ClearLSPDirty()
+			flushContent = m.focusedEditor().Content()
+		}
+		return m, m.lspSignatureHelpCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
+	case msg.LSPSignatureHelpMsg:
+		m.focusedEditor().Update(typed)
+		return m, nil
+	case msg.LSPDocHighlightTickMsg:
+		return m, m.handleDocHighlightTick(typed)
+	case msg.LSPDocumentHighlightMsg:
+		m.focusedEditor().Update(typed)
+		return m, nil
+	case msg.LSPReferencesRequestMsg:
+		return m, m.lspReferencesCmd(typed.FilePath, typed.Line, typed.Col)
+	case msg.LSPReferencesMsg:
+		return m, m.handleLSPReferences(typed)
+	case msg.LSPDocumentSymbolMsg:
+		return m, m.handleLSPDocumentSymbol(typed)
+	case msg.LSPFormatRequestMsg:
+		var flushContent string
+		if m.focusedEditor().LSPDirty() {
+			m.focusedEditor().ClearLSPDirty()
+			flushContent = m.focusedEditor().Content()
+		}
+		return m, m.lspFormatCmd(typed.FilePath, flushContent, m.focusedEditor().EditGeneration())
+	case msg.LSPPrepareRenameMsg:
+		return m, m.handleLSPPrepareRename(typed)
+	case msg.LSPRenameMsg:
+		return m, m.handleLSPRename(typed)
+	case msg.LSPFormatMsg:
+		return m, m.handleLSPFormat(typed)
+	case msg.TabNextMsg:
+		return m, m.nextTab()
+	case msg.TabPrevMsg:
+		return m, m.prevTab()
+	case msg.TabJumpMsg:
+		return m, m.switchToTab(typed.Index)
+	case msg.TabCloseRequestMsg:
+		return m, m.closeTabByPath(typed.Path)
+	case msg.EscDisambiguateTickMsg:
+		if m.escPending && typed.Gen == m.escGen {
+			m.escPending = false
+			m.escGen++
+			return m.dispatchKey(m.escKey)
+		}
+		return m, nil
+	case msg.ChordBlockedExpireMsg:
+		if m.chordBlocked {
+			m.chord = chordNone
+			m.chordBlocked = false
+		}
+		return m, nil
+	case msg.NerdFontsResultMsg:
+		// Don't switch icon mode mid-session — the terminal won't render
+		// newly-installed Nerd Font glyphs until restarted. The install
+		// takes effect on the next app launch.
+		return m, nil
+	default:
+		return m, m.propagate(raw)
+	}
+}
+
+// View renders the complete TUI layout using the frame compositor.
+func (m *AppModel) View() string {
+	if !m.ready {
+		return ""
+	}
+
+	// Compute cursor visibility once per frame from wall clock.
+	if m.needsBlink() {
+		m.cursorVisible = m.blinkPhase()
+		if m.cursorVisible != m.lastRenderedPhase {
+			m.lastRenderedPhase = m.cursorVisible
+			m.viewDirty = true
+			m.blinkDirty = true
+		}
+	} else {
+		m.cursorVisible = true
+	}
+
+	// Full-screen overlays bypass the compositor entirely.
+	if m.overlay == overlayEditor {
+		return m.editorOverlay.View(m.cursorVisible)
+	}
+	if m.overlay == overlayModal && m.modalOverlay.Active() {
+		return m.modalOverlay.View()
+	}
+	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
+		return m.searchOverlay.View()
+	}
+	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
+		return m.fieldManualOverlay.View()
+	}
+
+	// Fast path: nothing dirty.
+	if !m.viewDirty && m.comp.HasCache() {
+		return m.comp.CachedFrame()
+	}
+
+	m.detectDirtySlots()
+	m.renderDirtySlots()
+	m.viewDirty = false
+	return m.comp.Compose()
+}
+
+// Shutdown gracefully stops all bridges and waits for goroutine cleanup.
+func (m *AppModel) Shutdown() error {
+	m.cancel() // Cancel all in-flight Cmd contexts first.
+	m.activityBridge.Stop()
+	m.sessionBridge.Stop()
+	m.streamBridge.Stop()
+	m.guideBridge.Stop()
+	m.lspBridge.Stop()
+	_ = m.lspManager.Shutdown()
+	return m.deps.Scope.Shutdown(shutdownGrace, shutdownHard)
+}
+
+// PushModal adds a modal to the overlay stack and activates the modal overlay.
+func (m *AppModel) PushModal(content modal.ModalContent) {
+	m.modalOverlay.Push(content)
+	m.overlay = overlayModal
+}
+
+// ---------------------------------------------------------------------------
+// Message handlers
+// ---------------------------------------------------------------------------
+
+func (m *AppModel) handleResize(sz tea.WindowSizeMsg) tea.Cmd {
+	m.width = sz.Width
+	m.height = sz.Height
+	m.ready = true
+
+	m.recalcLayout()
+	return nil
+}
+
+// handleKey wraps dispatchKey with ESC/Alt disambiguation. Terminals encode
+// Alt+<rune> as ESC (0x1b) followed by the rune byte. When these arrive in a
+// single read, Bubble Tea correctly sets Key.Alt. When they arrive in
+// separate reads (SSH latency, slow terminals), Bubble Tea emits a standalone
+// KeyEscape followed by a KeyRunes — losing the Alt modifier. This layer
+// buffers a standalone ESC for up to escDisambiguateTimeout, and if a single
+// printable rune follows within that window it synthesises the correct
+// Alt+rune KeyMsg. The mechanism mirrors vim's ttimeoutlen and tmux's
+// escape-time.
+func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Resolve a previously buffered ESC.
+	if m.escPending {
+		m.escPending = false
+		m.escGen++
+
+		if time.Since(m.escAt) < escDisambiguateTimeout &&
+			key.Type == tea.KeyRunes && len(key.Runes) == 1 && !key.Alt {
+			// Synthesise Alt+rune from the buffered ESC + this rune.
+			synth := tea.KeyMsg(tea.Key{
+				Type:  tea.KeyRunes,
+				Runes: key.Runes,
+				Alt:   true,
+			})
+			return m.dispatchKey(synth)
+		}
+
+		// ESC followed by a non-rune key or after the timeout — flush ESC
+		// first so it takes effect (e.g. exit insert mode), then process the
+		// current key with updated state.
+		_, escCmd := m.dispatchKey(m.escKey)
+		model, keyCmd := m.dispatchKey(key)
+		return model, tea.Batch(escCmd, keyCmd)
+	}
+
+	// Buffer a standalone ESC for disambiguation.
+	if key.Type == tea.KeyEscape && !key.Alt {
+		m.escPending = true
+		m.escKey = key
+		m.escAt = time.Now()
+		gen := m.escGen
+		return m, tea.Tick(escDisambiguateTimeout, func(_ time.Time) tea.Msg {
+			return msg.EscDisambiguateTickMsg{Gen: gen}
+		})
+	}
+
+	return m.dispatchKey(key)
+}
+
+func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Ctrl+C / Ctrl+Shift+C: copy selection in edit mode, otherwise interrupt.
+	ks := key.String()
+	if ks == "ctrl+c" || ks == "ctrl+shift+c" {
+		if m.editMode && m.focusedEditor().HasSelection() {
+			text := m.focusedEditor().SelectedText()
+			if err := m.clipboard.Set(text); err != nil {
+				m.statusBar.SetFlash("Copy failed")
+			} else {
+				m.statusBar.SetFlash("Copied!")
+			}
+			m.focusedEditor().ClearSelection()
+			return m, nil
+		}
+		if ks == "ctrl+c" {
+			result := m.interruptHandler.HandleCtrlC()
+			return m, func() tea.Msg { return result }
+		}
+		return m, nil
+	}
+
+	// Save-before-close prompt intercepts all keys while active.
+	if m.pendingClosePrompt {
+		return m.handleSavePromptKey(key)
+	}
+
+	// Select all in the focused component (Alt+Shift+A).
+	if key.String() == "alt+A" {
+		switch {
+		case m.editMode && m.isEditorFocused():
+			m.focusedEditor().SelectAll()
+		case m.focus.Current() == component.FocusInput:
+			m.input.SelectAll()
+		}
+		return m, nil
+	}
+
+	// Ctrl+X / Ctrl+Shift+X: cut selection to clipboard.
+	if ks == "ctrl+x" || ks == "ctrl+shift+x" {
+		var text string
+		switch {
+		case m.editMode && m.isEditorFocused():
+			text = m.focusedEditor().CutSelection()
+		case m.focus.Current() == component.FocusInput && m.input.HasSelection():
+			text = m.input.CutSelection()
+		}
+		if text != "" {
+			if err := m.clipboard.Set(text); err != nil {
+				m.statusBar.SetFlash("Cut failed")
+			} else {
+				m.statusBar.SetFlash("Cut!")
+			}
+		}
+		return m, nil
+	}
+
+	// Undo in the editor (Alt+Z, only when editor is focused).
+	if key.String() == "alt+z" && m.editMode && m.isEditorFocused() {
+		m.focusedEditor().Undo()
+		return m, nil
+	}
+
+	// Redo in the editor (Alt+Shift+Z, only when editor is focused).
+	if key.String() == "alt+Z" && m.editMode && m.isEditorFocused() {
+		m.focusedEditor().Redo()
+		return m, nil
+	}
+
+	// Alt+R: find references for symbol under cursor (edit mode).
+	if ks == "alt+r" && m.editMode && m.isEditorFocused() {
+		fp := m.focusedEditor().FilePath()
+		if fp != "" {
+			return m, m.lspReferencesCmd(fp, m.focusedEditor().CursorLine(), m.focusedEditor().CursorCol())
+		}
+		return m, nil
+	}
+
+	// Alt+Shift+. (alt+>): toggle document symbols for current file (edit mode).
+	if ks == "alt+>" && m.editMode {
+		if m.fileTree.InDocSymbolsMode() {
+			m.fileTree.ExitDocSymbols()
+			return m, nil
+		}
+		fp := m.focusedEditor().FilePath()
+		if fp != "" {
+			return m, m.lspDocumentSymbolCmd(fp)
+		}
+		return m, nil
+	}
+
+	// Alt+1..9: set or teleport warp point.
+	if len(ks) == 5 && ks[:4] == "alt+" && ks[4] >= '1' && ks[4] <= '9' {
+		idx := int(ks[4] - '1')
+		if m.warpPoints[idx] != nil {
+			return m, m.teleportToWarp(idx)
+		}
+		if m.editMode {
+			m.setWarpPoint(idx)
+		}
+		return m, nil
+	}
+
+	// Alt+Shift+1..9: clear warp point.
+	if len(ks) == 5 && ks[:4] == "alt+" {
+		if idx, ok := shiftDigitSlot[ks[4]]; ok {
+			m.clearWarpPoint(idx)
+			return m, nil
+		}
+	}
+
+	// Alt+T toggles the tabs panel in the file tree (edit mode only).
+	if ks == "alt+t" && m.editMode {
+		return m, m.toggleTabsPanel()
+	}
+
+	// Alt+Enter: dismiss preview when preview focused, close tab otherwise.
+	if ks == "alt+enter" && m.editMode {
+		if m.isPreviewFocused() {
+			m.dismissPreview()
+			return m, nil
+		}
+		if m.mdPreviewPane != 0 && m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane) {
+			m.dismissMarkdownPreview()
+			return m, nil
+		}
+		if m.focus.Current() == component.FocusFileTree && m.fileTree.InTabsMode() {
+			if p := m.fileTree.TabCursorPath(); p != "" {
+				return m, m.closeTabByPath(p)
+			}
+			return m, nil
+		}
+		if m.isEditorFocused() {
+			idx := m.activeTabIndex()
+			if idx >= 0 {
+				return m, m.closeTab(idx)
+			}
+		}
+		return m, nil
+	}
+
+	// Alt+G toggles git mode.
+	if key.String() == "alt+g" {
+		return m, m.toggleGitMode()
+	}
+
+	// Alt+E toggles inline edit mode.
+	if key.String() == "alt+e" {
+		return m, m.toggleEditMode()
+	}
+
+	// Alt+H toggles the Field Manual help overlay.
+	if key.String() == "alt+h" {
+		m.toggleFieldManual()
+		return m, nil
+	}
+
+	// Escape: close references panel if active, abort command input,
+	// route to editor in edit mode, or double-tap to interrupt agent.
+	// When an overlay is active, skip — overlays handle their own Esc.
+	if key.String() == "esc" && m.overlay == overlayNone {
+		if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode() || m.fileTree.InTabsMode()) && m.focus.Current() == component.FocusFileTree {
+			m.fileTree.Update(key)
+			return m, nil
+		}
+		if m.editCmdInput {
+			m.exitCmdInput()
+			return m, nil
+		}
+		if m.editMode && m.isEditorFocused() {
+			comp, cmd := m.focusedEditor().Update(key)
+			m.paneEditors[m.focusedPane].editor = comp.(*editor.Model)
+			return m, cmd
+		}
+		if m.gitMode && m.focus.Current() == component.FocusCommitTree && m.commitTree.InCommitView() {
+			comp, cmd := m.commitTree.Update(key)
+			m.commitTree = comp.(*committree.Model)
+			return m, cmd
+		}
+		now := time.Now()
+		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
+			m.lastEscTime = time.Time{}
+			m.streamBridge.Stop()
+			m.statusBar.SetFlash("Agent interrupted")
+			return m, nil
+		}
+		m.lastEscTime = now
+		m.statusBar.SetFlash("Press Esc again to interrupt agent")
+		return m, nil
+	}
+
+	// Shift+Tab in edit mode: cycle to next tab.
+	if ks == "shift+tab" && m.editMode &&
+		m.isEditorFocused() &&
+		len(m.focusedTabOrder()) > 0 {
+		return m, m.nextTab()
+	}
+
+	// Colon in edit mode normal: activate command input panel.
+	if key.String() == ":" && m.editMode &&
+		m.isEditorFocused() &&
+		m.focusedEditor().IsNormalMode() {
+		m.enterCmdInput()
+		return m, nil
+	}
+
+	// Overlay key capture: active overlays consume all keys.
+	if m.overlay == overlayEditor {
+		comp, cmd := m.editorOverlay.Update(key)
+		m.editorOverlay = comp.(*editor.Model)
+		return m, cmd
+	}
+	if m.overlay == overlayModal && m.modalOverlay.Active() {
+		comp, cmd := m.modalOverlay.Update(key)
+		m.modalOverlay = comp.(*modal.Model)
+		return m, cmd
+	}
+	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
+		comp, cmd := m.searchOverlay.Update(key)
+		m.searchOverlay = comp.(*search.Model)
+		return m, cmd
+	}
+	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
+		comp, cmd := m.fieldManualOverlay.Update(key)
+		m.fieldManualOverlay = comp.(*fieldmanual.Model)
+		if !m.fieldManualOverlay.Visible() {
+			m.overlay = overlayNone
+		}
+		return m, cmd
+	}
+	// Ctrl+P toggles the search overlay (unless the editor completion popup
+	// is active, where Ctrl+P navigates to the previous item).
+	if key.String() == "ctrl+p" && !m.focusedEditor().CompletionActive() {
+		m.toggleSearch()
+		return m, nil
+	}
+
+	// Alt+F toggles the in-file find bar when the editor has focus.
+	if ks == "alt+f" && m.editMode && m.isEditorFocused() {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone // dismiss chord hint — only one overlay at a time
+		m.focusedEditor().ToggleFindBar()
+		return m, nil
+	}
+
+	// Alt+Shift+R toggles the in-file find-and-replace bar when the editor has focus.
+	if ks == "alt+R" && m.editMode && m.isEditorFocused() {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.focusedEditor().ToggleReplaceBar()
+		return m, nil
+	}
+
+	// Alt+F toggles search/filter when the file tree or git panel has focus.
+	// In tabs mode it toggles the tab filter; otherwise multi-file search.
+	if ks == "alt+f" && m.focus.Current() == component.FocusFileTree {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		if m.fileTree.InTabsMode() {
+			m.fileTree.ToggleTabFilter()
+		} else {
+			m.fileTree.ToggleSearch()
+		}
+		return m, nil
+	}
+
+	// Alt+F toggles search/filter when the git explorer panel has focus.
+	if ks == "alt+f" && m.gitMode && m.focus.Current() == component.FocusGitPanel && m.gitPanel != nil {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.gitPanel.ToggleSearch()
+		return m, nil
+	}
+
+	// Alt+Shift+R toggles multi-file replace when the file tree has focus.
+	if ks == "alt+R" && m.focus.Current() == component.FocusFileTree {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.fileTree.ToggleReplace()
+		return m, nil
+	}
+
+	// Alt+Shift+F triggers LSP formatting when the editor has focus.
+	if ks == "alt+F" && m.editMode && m.isEditorFocused() {
+		if fp := m.focusedEditor().FilePath(); fp != "" {
+			var flushContent string
+			if m.focusedEditor().LSPDirty() {
+				m.focusedEditor().ClearLSPDirty()
+				flushContent = m.focusedEditor().Content()
+			}
+			return m, m.lspFormatCmd(fp, flushContent, m.focusedEditor().EditGeneration())
+		}
+	}
+
+	// Alt+Shift+S: save the current editor buffer.
+	if ks == "alt+S" && m.editMode && m.isEditorFocused() {
+		m.saveEditorBuffer()
+		return m, nil
+	}
+
+	// Ctrl+Left/Right in edit mode: pagination-aware tab navigation.
+	if m.editMode && len(m.focusedTabOrder()) > 1 {
+		if ks == "ctrl+left" {
+			return m, m.tabNavLeft()
+		}
+		if ks == "ctrl+right" {
+			return m, m.tabNavRight()
+		}
+	}
+
+	// Alt+Shift+E: toggle between file explorer and last active editor pane.
+	if ks == "alt+E" && m.editMode {
+		if m.focus.Current() == component.FocusFileTree {
+			m.focusCodePanel()
+		} else {
+			m.focus.SetFocus(component.FocusFileTree)
+		}
+		m.syncFocusState()
+		return m, nil
+	}
+
+	// Alt+| (alt+shift+\): vertical split on focused editor pane.
+	if ks == "alt+|" && m.editMode && m.isEditorFocused() {
+		m.splitPane(pane.SplitVertical)
+		return m, nil
+	}
+
+	// Alt+_ (alt+shift+-): horizontal split on focused editor pane.
+	if ks == "alt+_" && m.editMode && m.isEditorFocused() {
+		m.splitPane(pane.SplitHorizontal)
+		return m, nil
+	}
+
+	// Alt+Shift+M: toggle markdown preview for the active file.
+	if ks == "alt+M" && m.editMode && m.isEditorFocused() {
+		if m.mdPreviewPane != 0 {
+			m.dismissMarkdownPreview()
+		} else if isMarkdownFile(m.focusedEditor().FilePath()) {
+			m.openMarkdownPreview(m.focusedEditor().FilePath())
+		}
+		return m, nil
+	}
+
+	// Alt+Shift+W: close focused pane.
+	if ks == "alt+W" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+		m.closePane()
+		return m, nil
+	}
+
+	// Alt+]: grow focused pane (take space from sibling).
+	if ks == "alt+]" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+		if m.paneTree.AdjustRatio(m.focusedPane, ratioStep) {
+			m.resizeInlineEditor()
+		}
+		return m, nil
+	}
+
+	// Alt+[: shrink focused pane (give space to sibling).
+	if ks == "alt+[" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+		if m.paneTree.AdjustRatio(m.focusedPane, -ratioStep) {
+			m.resizeInlineEditor()
+		}
+		return m, nil
+	}
+
+	// Alt+=: equalize all split ratios.
+	if ks == "alt+=" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+		m.paneTree.Equalize()
+		m.resizeInlineEditor()
+		m.statusBar.SetFlash("Splits equalized")
+		return m, nil
+	}
+
+	// Two-key chord: S then Left/Right (sessions), A then Left/Right (agents).
+	if cmd, handled := m.handleChord(key); handled {
+		return m, cmd
+	}
+
+	// Alt+Shift+arrow moves focus spatially between panels.
+	if target, ok := m.spatialFocusTarget(key.String()); ok {
+		m.focus.SetFocus(target)
+		m.syncFocusState()
+		return m, nil
+	}
+
+	// Delegate to focused component.
+	return m, m.propagateToFocused(key)
+}
+
+func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
+	// Push a user entry to chat.
+	entry := &chat.ChatEntry{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Source:    chat.SourceUser,
+		Content:   submit.Text,
+		Height:    -1,
+	}
+	m.chat.PushEntry(entry)
+
+	// Route through Guide bus.
+	return m.publishRouteRequest(submit)
+}
+
+func (m *AppModel) handleInterrupt() tea.Cmd {
+	// First Ctrl+C: clear input or cancel active stream.
+	m.streamBridge.Stop()
+	return nil
+}
+
+func (m *AppModel) handleQuit() tea.Cmd {
+	return tea.Quit
+}
+
+func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
+	// Drop ticks from invalidated chains (e.g., after slow→fast upgrade).
+	if tick.Gen != m.tickGen {
+		return nil
+	}
+
+	// Scroll momentum and bounce.
+	if !m.scroll.settled() {
+		m.tickScrollMomentum()
+		m.viewDirty = true
+	}
+	m.tickSwipeDecay()
+
+	return m.continueTickChain()
+}
+
+func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
+	if tick.Gen != m.decorGen {
+		return nil
+	}
+
+	changed := false
+
+	// Status spinner + flash countdown.
+	if m.statusBar.IsAnimating() {
+		model, cmd := m.statusBar.Update(tick)
+		_ = cmd // status.Update never returns a cmd currently.
+		m.statusBar = model.(*status.Model)
+		changed = changed || m.statusBar.ViewDirty()
+	}
+
+	// Chat highlight / edge flash.
+	if m.chat.HasActiveAnimation() {
+		chatComp, _ := m.chat.Update(tick)
+		m.chat = chatComp.(*chat.Model)
+		changed = true
+	}
+
+	// Tab arrow flash expiry.
+	now := tick.Time
+	tabFlashChanged := false
+	if (m.tabArrowFlashLeftUntil != (time.Time{})) && !now.Before(m.tabArrowFlashLeftUntil) {
+		m.tabArrowFlashLeftUntil = time.Time{}
+		tabFlashChanged = true
+	}
+	if (m.tabArrowFlashRightUntil != (time.Time{})) && !now.Before(m.tabArrowFlashRightUntil) {
+		m.tabArrowFlashRightUntil = time.Time{}
+		tabFlashChanged = true
+	}
+	if tabFlashChanged {
+		changed = true
+		m.comp.MarkDirty(compositor.SlotRight)
+	}
+
+	// Refresh ring hint during streaming (activity badge changes) at decor rate.
+	if (!m.leftRing.empty() || !m.rightRing.empty()) && m.chat.IsStreaming() {
+		m.statusBar.SetViewRingHint(m.buildRingHint())
+		changed = true
+	}
+
+	if changed {
+		m.viewDirty = true
+	}
+
+	return m.continueDecorTickChain()
+}
+
+func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
+	m.focus.SetFocus(fp.Target)
+	m.syncFocusState()
+	return nil
+}
+
+func (m *AppModel) handleOpenEditor(o msg.OpenEditorMsg) tea.Cmd {
+	comp, cmd := m.editorOverlay.Update(o)
+	m.editorOverlay = comp.(*editor.Model)
+	m.editorOverlay.SetSize(m.width, m.height)
+	m.overlay = overlayEditor
+
+	// Notify LSP that the document was opened (fire-and-forget).
+	if o.FilePath != "" {
+		lang := detectEditorLanguage(o.FilePath)
+		lspCmd := m.lspDidOpenCmd(o.FilePath, lang, o.Content)
+		return tea.Batch(cmd, lspCmd)
+	}
+	return cmd
+}
+
+func (m *AppModel) handleLSPDiagnostic(d msg.LSPDiagnosticMsg) tea.Cmd {
+	// Forward to all views that render diagnostics.
+	m.editorOverlay.Update(d)
+	m.focusedEditor().Update(d)
+	m.codePanel.SetDiagnostics(d.FilePath, d.Diagnostics)
+	return nil
+}
+
+// handleLSPServerMissing triggers on-demand installation when a language
+// server binary is missing. De-duplicates by server ID.
+func (m *AppModel) handleLSPServerMissing(d msg.LSPServerMissingMsg) tea.Cmd {
+	sid := lsp.ServerID(d.ServerID)
+	if m.lspInstalling[sid] {
+		return nil // install already in progress
+	}
+	m.lspInstalling[sid] = true
+	m.statusBar.SetFlash("Installing " + d.ServerName + "…")
+	return m.installLSPServerCmd(d)
+}
+
+// handleLSPServerInstalled handles the result of an on-demand server install.
+// On success, clears the detect cache and re-sends didOpen for the file that
+// triggered the install.
+func (m *AppModel) handleLSPServerInstalled(d msg.LSPServerInstalledMsg) tea.Cmd {
+	delete(m.lspInstalling, lsp.ServerID(d.ServerID))
+	if d.Err != nil {
+		m.statusBar.SetFlash(d.ServerName + " install failed: " + d.Err.Error())
+		return nil
+	}
+	detect.ClearCache()
+	m.statusBar.SetFlash(d.ServerName + " installed")
+	return m.lspDidOpenCmd(d.FilePath, d.LanguageID, d.Content)
+}
+
+// installLSPServerCmd returns a Cmd that installs a single language server
+// binary in the background and reports the result.
+func (m *AppModel) installLSPServerCmd(d msg.LSPServerMissingMsg) tea.Cmd {
+	appCtx := m.ctx
+	return func() tea.Msg {
+		installer, err := lsp.NewInstaller()
+		if err != nil {
+			return msg.LSPServerInstalledMsg{
+				ServerID:   d.ServerID,
+				ServerName: d.ServerName,
+				FilePath:   d.FilePath,
+				LanguageID: d.LanguageID,
+				Content:    d.Content,
+				Err:        err,
+			}
+		}
+		ctx, cancel := context.WithTimeout(appCtx, lsp.ProvisionTimeout)
+		defer cancel()
+		err = installer.EnsureServer(ctx, lsp.ServerID(d.ServerID))
+		return msg.LSPServerInstalledMsg{
+			ServerID:   d.ServerID,
+			ServerName: d.ServerName,
+			FilePath:   d.FilePath,
+			LanguageID: d.LanguageID,
+			Content:    d.Content,
+			Err:        err,
+		}
+	}
+}
+
+// provisionLSPServers kicks off background LSP server detection and installation.
+func (m *AppModel) provisionLSPServers() tea.Cmd {
+	root := m.config.ProjectRoot
+	scope := m.deps.Scope
+	return func() tea.Msg {
+		installer, err := lsp.NewInstaller()
+		if err != nil {
+			return msg.LSPProvisionDoneMsg{Err: err}
+		}
+		_ = scope.Go("lsp.provision", lsp.ProvisionTimeout, func(ctx context.Context) error {
+			return installer.Provision(ctx, root)
+		})
+		return msg.LSPProvisionDoneMsg{}
+	}
+}
+
+// lspDidOpenCmd returns a Cmd that notifies the LSP manager about a file open.
+// If no server is available but one could be installed, returns an
+// LSPServerMissingMsg to trigger on-demand installation.
+func (m *AppModel) lspDidOpenCmd(filePath, languageID, content string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		err := mgr.NotifyDidOpen(ctx, root, filePath, languageID, content)
+		if err != nil {
+			return nil
+		}
+		// SuggestServer returns a disabled-but-installable server for this
+		// file type. If NotifyDidOpen started a client successfully the
+		// server is enabled and SuggestServer returns nil.
+		suggested := mgr.SuggestServer(root, filePath)
+		if suggested != nil {
+			return msg.LSPServerMissingMsg{
+				ServerID:   string(suggested.ID),
+				ServerName: suggested.Name,
+				FilePath:   filePath,
+				LanguageID: languageID,
+				Content:    content,
+			}
+		}
+		return nil
+	}
+}
+
+// lspDidChangeCmd returns a Cmd that sends a didChange notification.
+func (m *AppModel) lspDidChangeCmd(filePath, content string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		_ = mgr.NotifyDidChange(ctx, root, filePath, content)
+		return nil
+	}
+}
+
+// lspDidSaveAsync sends a didSave notification as a tracked background goroutine.
+func (m *AppModel) lspDidSaveAsync(filePath, content string) {
+	if filePath == "" {
+		return
+	}
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	_ = m.deps.Scope.Go("lsp.didSave", lspNotifyTimeout, func(ctx context.Context) error {
+		return mgr.NotifyDidSave(ctx, root, filePath, content)
+	})
+}
+
+// lspDidCloseAsync sends a didClose notification as a tracked background goroutine.
+func (m *AppModel) lspDidCloseAsync(filePath string) {
+	if filePath == "" {
+		return
+	}
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	_ = m.deps.Scope.Go("lsp.didClose", lspNotifyTimeout, func(ctx context.Context) error {
+		return mgr.NotifyDidClose(ctx, root, filePath)
+	})
+}
+
+// lspReopenCmd returns a Cmd that atomically closes then re-opens a document
+// in the LSP client. This avoids the race between async didClose (from
+// exitEditMode) and async didOpen (from enterEditMode) where didOpen could
+// run first, be silently rejected because the document is still tracked,
+// and then didClose removes it — leaving the document permanently untracked.
+func (m *AppModel) lspReopenCmd(filePath, languageID, content string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		// Close first so the document tracker drops the stale entry.
+		_ = mgr.NotifyDidClose(ctx, root, filePath)
+
+		// Now open — guaranteed to succeed because we just closed.
+		err := mgr.NotifyDidOpen(ctx, root, filePath, languageID, content)
+		if err != nil {
+			return nil
+		}
+
+		suggested := mgr.SuggestServer(root, filePath)
+		if suggested != nil {
+			return msg.LSPServerMissingMsg{
+				ServerID:   string(suggested.ID),
+				ServerName: suggested.Name,
+				FilePath:   filePath,
+				LanguageID: languageID,
+				Content:    content,
+			}
+		}
+		return nil
+	}
+}
+
+// lspHoverCmd returns a Cmd that requests hover information from the LSP.
+func (m *AppModel) lspHoverCmd(filePath string, line, col int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		result, err := mgr.Hover(ctx, root, filePath, line, col)
+		return msg.LSPHoverMsg{
+			FilePath: filePath,
+			Line:     line,
+			Col:      col,
+			Result:   result,
+			Err:      err,
+		}
+	}
+}
+
+// lspDocumentHighlightCmd returns a Cmd that requests document highlights from the LSP.
+func (m *AppModel) lspDocumentHighlightCmd(filePath string, line, col int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		highlights, err := mgr.DocumentHighlight(ctx, root, filePath, line, col)
+		return msg.LSPDocumentHighlightMsg{
+			FilePath:   filePath,
+			Line:       line,
+			Col:        col,
+			Highlights: highlights,
+			Err:        err,
+		}
+	}
+}
+
+// lspDefinitionCmd returns a Cmd that requests definition locations from the LSP.
+// When forHover is true, the result decorates the hover tooltip instead of navigating.
+func (m *AppModel) lspDefinitionCmd(filePath string, line, col int, forHover bool) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		locs, err := mgr.Definition(ctx, root, filePath, line, col)
+		return msg.LSPDefinitionMsg{
+			FilePath:  filePath,
+			Locations: locs,
+			Err:       err,
+			ForHover:  forHover,
+		}
+	}
+}
+
+// lspReferencesCmd returns a Cmd that requests all references of the symbol
+// at the given position. Results include the declaration and are enriched
+// with line preview text by reading from disk.
+func (m *AppModel) lspReferencesCmd(filePath string, line, col int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		locs, err := mgr.References(ctx, root, filePath, line, col, true)
+		return msg.LSPReferencesMsg{
+			FilePath:  filePath,
+			Line:      line,
+			Col:       col,
+			Locations: locs,
+			Err:       err,
+		}
+	}
+}
+
+// handleLSPReferences builds reference entries and displays them in the file
+// tree panel's references mode.
+func (m *AppModel) handleLSPReferences(r msg.LSPReferencesMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("References: " + r.Err.Error())
+		return nil
+	}
+	if len(r.Locations) == 0 {
+		m.statusBar.SetFlash("No references found")
+		return nil
+	}
+
+	symbol := m.focusedEditor().WordAt(r.Line, r.Col)
+	entries := m.buildReferenceEntries(r.Locations)
+	m.fileTree.SetReferences(symbol, entries)
+
+	m.focus.SetFocus(component.FocusFileTree)
+	m.syncFocusState()
+	return nil
+}
+
+// buildReferenceEntries converts LSP locations to display entries, reading
+// line preview text from disk and making paths relative to the project root.
+func (m *AppModel) buildReferenceEntries(locs []lsp.Location) []filetree.ReferenceEntry {
+	entries := make([]filetree.ReferenceEntry, 0, len(locs))
+	for _, loc := range locs {
+		absPath := lsp.FileURIToPath(loc.URI)
+		relPath, err := filepath.Rel(m.config.ProjectRoot, absPath)
+		if err != nil {
+			relPath = absPath
+		}
+		preview := readLineFromFile(absPath, loc.Range.Start.Line)
+		entries = append(entries, filetree.ReferenceEntry{
+			FilePath: relPath,
+			AbsPath:  absPath,
+			Line:     loc.Range.Start.Line,
+			Col:      loc.Range.Start.Character,
+			Preview:  preview,
+		})
+	}
+	return entries
+}
+
+// readLineFromFile reads a single line (0-indexed) from a file on disk.
+// Returns the trimmed line content, or "" on error.
+func readLineFromFile(path string, lineNum int) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	if lineNum < 0 || lineNum >= len(lines) {
+		return ""
+	}
+	return strings.TrimSpace(lines[lineNum])
+}
+
+// ---------------------------------------------------------------------------
+// LSP Document Symbols
+// ---------------------------------------------------------------------------
+
+// lspDocumentSymbolCmd returns a Cmd that requests document symbols for the
+// given file. Results arrive as msg.LSPDocumentSymbolMsg.
+func (m *AppModel) lspDocumentSymbolCmd(filePath string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		syms, err := mgr.DocumentSymbol(ctx, root, filePath)
+		return msg.LSPDocumentSymbolMsg{
+			FilePath: filePath,
+			Symbols:  syms,
+			Err:      err,
+		}
+	}
+}
+
+// lspFormatCmd sends a textDocument/formatting request to the language server.
+// If flushContent is non-empty, a didChange notification is sent first so the
+// server formats the latest buffer content.
+func (m *AppModel) lspFormatCmd(filePath, flushContent string, editGen int) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	tabSize := m.focusedEditor().TabWidth()
+	return func() tea.Msg {
+		if flushContent != "" {
+			_ = mgr.NotifyDidChange(ctx, root, filePath, flushContent)
+		}
+		edits, err := mgr.Format(ctx, root, filePath, tabSize, false)
+		return msg.LSPFormatMsg{
+			FilePath:       filePath,
+			Edits:          edits,
+			Err:            err,
+			EditGeneration: editGen,
+		}
+	}
+}
+
+// handleLSPFormat applies formatting edits from the language server.
+func (m *AppModel) handleLSPFormat(r msg.LSPFormatMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Format: " + r.Err.Error())
+		return nil
+	}
+	m.statusBar.SetFlash(m.applyFormatEdits(r))
+	return nil
+}
+
+// applyFormatEdits validates and applies formatting edits, returning a
+// status message. Separated from handleLSPFormat to keep CC < 4.
+func (m *AppModel) applyFormatEdits(r msg.LSPFormatMsg) string {
+	if r.EditGeneration != m.focusedEditor().EditGeneration() {
+		return "Format: buffer changed, discarding"
+	}
+	if len(r.Edits) == 0 {
+		return "Already formatted"
+	}
+	return fmt.Sprintf("Formatted (%d edits)", m.focusedEditor().ApplyTextEdits(r.Edits))
+}
+
+// handleLSPDocumentSymbol displays document symbols in the file tree panel.
+func (m *AppModel) handleLSPDocumentSymbol(r msg.LSPDocumentSymbolMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Symbols: " + r.Err.Error())
+		return nil
+	}
+	if len(r.Symbols) == 0 {
+		m.statusBar.SetFlash("No symbols found")
+		return nil
+	}
+	title := filepath.Base(r.FilePath)
+	entries := flattenSymbols(r.Symbols, 0)
+	m.fileTree.SetDocumentSymbols(title, r.FilePath, entries)
+	m.focus.SetFocus(component.FocusFileTree)
+	m.syncFocusState()
+	return nil
+}
+
+// flattenSymbols recursively converts hierarchical DocumentSymbol trees into a
+// flat, depth-annotated SymbolEntry list for display in the file tree panel.
+func flattenSymbols(syms []lsp.DocumentSymbol, depth int) []filetree.SymbolEntry {
+	var result []filetree.SymbolEntry
+	for _, s := range syms {
+		result = append(result, filetree.SymbolEntry{
+			Name:   s.Name,
+			Kind:   s.Kind,
+			Line:   s.SelectionRange.Start.Line,
+			Col:    s.SelectionRange.Start.Character,
+			Detail: s.Detail,
+			Depth:  depth,
+		})
+		result = append(result, flattenSymbols(s.Children, depth+1)...)
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// LSP Rename
+// ---------------------------------------------------------------------------
+
+// lspPrepareRenameCmd sends a textDocument/prepareRename request.
+func (m *AppModel) lspPrepareRenameCmd(filePath string, line, col int, newName string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		result, err := mgr.PrepareRename(ctx, root, filePath, line, col)
+		return msg.LSPPrepareRenameMsg{
+			FilePath: filePath,
+			Line:     line,
+			Col:      col,
+			NewName:  newName,
+			Result:   result,
+			Err:      err,
+		}
+	}
+}
+
+// lspRenameCmd sends a textDocument/rename request.
+func (m *AppModel) lspRenameCmd(filePath string, line, col int, newName string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		edit, err := mgr.Rename(ctx, root, filePath, line, col, newName)
+		return msg.LSPRenameMsg{
+			FilePath: filePath,
+			NewName:  newName,
+			Edit:     edit,
+			Err:      err,
+		}
+	}
+}
+
+// handleLSPPrepareRename processes the prepareRename response and either
+// proceeds with the rename or shows an error.
+func (m *AppModel) handleLSPPrepareRename(r msg.LSPPrepareRenameMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Rename: " + r.Err.Error())
+		return nil
+	}
+	if r.Result == nil {
+		m.statusBar.SetFlash("Cannot rename symbol at cursor")
+		return nil
+	}
+	return m.lspRenameCmd(r.FilePath, r.Line, r.Col, r.NewName)
+}
+
+// handleLSPRename applies the workspace edit from a rename response.
+func (m *AppModel) handleLSPRename(r msg.LSPRenameMsg) tea.Cmd {
+	if r.Err != nil {
+		m.statusBar.SetFlash("Rename: " + r.Err.Error())
+		return nil
+	}
+	if r.Edit == nil || len(r.Edit.FileEdits) == 0 {
+		m.statusBar.SetFlash("Rename: no changes")
+		return nil
+	}
+	n := m.applyWorkspaceEdit(r.Edit)
+	m.statusBar.SetFlash(fmt.Sprintf("Renamed to %s in %d file(s)", r.NewName, n))
+	return nil
+}
+
+// applyWorkspaceEdit applies a workspace edit across files. Open editor
+// buffers are edited in-place (with undo support); other files are
+// modified on disk. Returns the number of files changed.
+func (m *AppModel) applyWorkspaceEdit(edit *lsp.WorkspaceEdit) int {
+	editorPath := m.focusedEditor().FilePath()
+	changed := 0
+	for path, edits := range edit.FileEdits {
+		if path == editorPath {
+			m.focusedEditor().ApplyTextEdits(edits)
+			changed++
+			continue
+		}
+		if applyEditsToFile(path, edits) {
+			changed++
+		}
+	}
+	return changed
+}
+
+// applyEditsToFile reads a file, applies text edits, and writes it back.
+// Edits are applied in reverse order to preserve earlier offsets.
+func applyEditsToFile(path string, edits []lsp.TextEdit) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(data), "\n")
+
+	// Sort edits reverse by position so earlier offsets remain valid.
+	sorted := make([]lsp.TextEdit, len(edits))
+	copy(sorted, edits)
+	slices.SortFunc(sorted, func(a, b lsp.TextEdit) int {
+		if a.Range.Start.Line != b.Range.Start.Line {
+			return b.Range.Start.Line - a.Range.Start.Line
+		}
+		return b.Range.Start.Character - a.Range.Start.Character
+	})
+
+	for _, edit := range sorted {
+		lines = spliceLines(lines, edit)
+	}
+
+	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644) == nil
+}
+
+// spliceLines applies a single text edit to a line slice.
+func spliceLines(lines []string, edit lsp.TextEdit) []string {
+	startLine := edit.Range.Start.Line
+	endLine := edit.Range.End.Line
+	if startLine >= len(lines) {
+		return lines
+	}
+	if endLine >= len(lines) {
+		endLine = len(lines) - 1
+	}
+
+	startCol := clampCol(lines[startLine], edit.Range.Start.Character)
+	endCol := clampCol(lines[endLine], edit.Range.End.Character)
+
+	prefix := lines[startLine][:startCol]
+	suffix := lines[endLine][endCol:]
+	replacement := prefix + edit.NewText + suffix
+
+	newLines := strings.Split(replacement, "\n")
+
+	// Splice: replace lines[startLine..endLine] with newLines.
+	result := make([]string, 0, len(lines)-((endLine-startLine)+1)+len(newLines))
+	result = append(result, lines[:startLine]...)
+	result = append(result, newLines...)
+	result = append(result, lines[endLine+1:]...)
+	return result
+}
+
+// clampCol clamps a column index to the valid range for a line.
+func clampCol(line string, col int) int {
+	if col < 0 {
+		return 0
+	}
+	if col > len(line) {
+		return len(line)
+	}
+	return col
+}
+
+// handleHoverDefinition stores the definition symbol and package path on the
+// active hover tooltip. If the hover content hasn't arrived yet, stashes
+// the info so it can be applied when the hover activates.
+func (m *AppModel) handleHoverDefinition(d msg.LSPDefinitionMsg) tea.Cmd {
+	if d.Err != nil || len(d.Locations) == 0 {
+		return nil
+	}
+	loc := d.Locations[0]
+	filePath := lsp.FileURIToPath(loc.URI)
+
+	// When hover is for preview, use the preview panel for word lookup.
+	var word string
+	if m.hoverForPreview {
+		word = m.previewPanel.WordAt(m.hoverMouseLine, m.hoverMouseCol)
+	} else {
+		word = m.focusedEditor().WordAt(m.hoverMouseLine, m.hoverMouseCol)
+	}
+
+	pkgName, pkgPath := defPackageInfo(filePath, m.config.ProjectRoot)
+	symbol := word
+	if pkgName != "" && word != "" {
+		symbol = pkgName + "." + word
+	}
+
+	if m.hoverForPreview {
+		if m.previewPanel.HoverActive() {
+			m.previewPanel.SetHoverDefinition(symbol, pkgPath)
+		} else {
+			m.pendingHoverSymbol = symbol
+			m.pendingHoverPkgPath = pkgPath
+		}
+		return nil
+	}
+
+	if m.focusedEditor().HoverActive() {
+		m.focusedEditor().SetHoverDefinition(symbol, pkgPath)
+	} else {
+		// Hover content hasn't arrived yet; stash for when it does.
+		m.pendingHoverSymbol = symbol
+		m.pendingHoverPkgPath = pkgPath
+	}
+	return nil
+}
+
+// handlePreviewHoverMsg processes an LSP hover response for the preview pane.
+func (m *AppModel) handlePreviewHoverMsg(h msg.LSPHoverMsg) tea.Cmd {
+	// Staleness check using preview panel methods.
+	wordStart, _ := m.previewPanel.WordBoundsAt(h.Line, h.Col)
+	if h.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+		return nil
+	}
+	if h.Err != nil || h.Result == nil || h.FilePath != m.previewPanel.FilePath() {
+		return nil
+	}
+	m.previewPanel.ShowHover(h.Result.Contents, h.Line, h.Col)
+	// Apply definition info that arrived before the hover content.
+	if m.previewPanel.HoverActive() && m.pendingHoverSymbol != "" {
+		m.previewPanel.SetHoverDefinition(m.pendingHoverSymbol, m.pendingHoverPkgPath)
+		m.pendingHoverSymbol = ""
+		m.pendingHoverPkgPath = ""
+	}
+	return nil
+}
+
+// defPackageInfo extracts a Go package name and clean display path from a
+// definition file path. Strips module versions and GOROOT/GOMODCACHE prefixes.
+func defPackageInfo(filePath, projectRoot string) (pkgName, displayPath string) {
+	// Local project file.
+	if rel, err := filepath.Rel(projectRoot, filePath); err == nil && !strings.HasPrefix(rel, "..") {
+		dir := filepath.Dir(rel)
+		if dir == "." {
+			dir = filepath.Base(projectRoot)
+		}
+		return filepath.Base(dir), dir
+	}
+
+	// Go module cache: .../pkg/mod/github.com/foo/bar@v1.0.0/pkg/file.go
+	if idx := strings.Index(filePath, "/pkg/mod/"); idx >= 0 {
+		modRel := filePath[idx+len("/pkg/mod/"):]
+		dir := filepath.Dir(modRel)
+		dir = stripModVersion(dir)
+		return filepath.Base(dir), dir
+	}
+
+	// Go standard library: .../go/src/context/context.go
+	if idx := strings.Index(filePath, "/src/"); idx >= 0 {
+		srcRel := filePath[idx+len("/src/"):]
+		dir := filepath.Dir(srcRel)
+		return filepath.Base(dir), dir
+	}
+
+	// Fallback.
+	dir := filepath.Dir(filePath)
+	return filepath.Base(dir), dir
+}
+
+// stripModVersion removes @version suffixes from Go module path components.
+func stripModVersion(path string) string {
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		if at := strings.Index(p, "@"); at >= 0 {
+			parts[i] = p[:at]
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// lspCompletionCmd returns a Cmd that requests completion items from the LSP.
+// If flushContent is non-empty, a didChange notification is sent first so
+// the server sees the latest buffer content before the request arrives.
+func (m *AppModel) lspCompletionCmd(filePath string, line, col int, flushContent string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		if flushContent != "" {
+			_ = mgr.NotifyDidChange(ctx, root, filePath, flushContent)
+		}
+		items, err := mgr.Completion(ctx, root, filePath, line, col)
+		return msg.LSPCompletionMsg{
+			FilePath: filePath,
+			Items:    items,
+			Err:      err,
+		}
+	}
+}
+
+// lspSignatureHelpCmd returns a Cmd that requests signature help from the LSP.
+// If flushContent is non-empty, a didChange notification is sent first so
+// the server sees the trigger character before the request arrives.
+func (m *AppModel) lspSignatureHelpCmd(filePath string, line, col int, flushContent string) tea.Cmd {
+	mgr := m.lspManager
+	root := m.config.ProjectRoot
+	ctx := m.ctx
+	return func() tea.Msg {
+		if flushContent != "" {
+			_ = mgr.NotifyDidChange(ctx, root, filePath, flushContent)
+		}
+		result, err := mgr.SignatureHelp(ctx, root, filePath, line, col)
+		return msg.LSPSignatureHelpMsg{
+			FilePath: filePath,
+			Line:     line,
+			Col:      col,
+			Result:   result,
+			Err:      err,
+		}
+	}
+}
+
+// extToLSPLanguage maps file extensions to LSP language identifiers.
+var extToLSPLanguage = map[string]string{
+	".go":   "go",
+	".ts":   "typescript",
+	".tsx":  "typescriptreact",
+	".js":   "javascript",
+	".jsx":  "javascriptreact",
+	".py":   "python",
+	".rs":   "rust",
+	".c":    "c",
+	".h":    "c",
+	".cpp":  "cpp",
+	".hpp":  "cpp",
+	".rb":   "ruby",
+	".java": "java",
+	".yaml": "yaml",
+	".yml":  "yaml",
+	".tf":   "terraform",
+	".lua":  "lua",
+	".zig":  "zig",
+	".ml":   "ocaml",
+}
+
+// isMarkdownFile reports whether path has a markdown extension.
+func isMarkdownFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".md" || ext == ".markdown"
+}
+
+// detectEditorLanguage returns the LSP language ID for a file path.
+func detectEditorLanguage(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if lang, ok := extToLSPLanguage[ext]; ok {
+		return lang
+	}
+	return ""
+}
+
+// handleFileOpen reads a file from disk and displays it in the code viewer.
+// Always marks the file as active in the tree regardless of read success so
+// the explorer highlights it immediately.
+func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
+	m.fileTree.SetActiveFile(o.Path)
+	m.fileTree.RevealPath(o.Path)
+
+	data, err := os.ReadFile(o.Path)
+	if err != nil {
+		m.statusBar.SetFlash("Cannot open: " + o.Name)
+		return nil
+	}
+	content := string(data)
+	m.codePanel.SetContent(content, o.Path, o.Language)
+
+	// Track which content the LSP should analyze.
+	lspContent := content
+
+	if m.editMode {
+		oldPath := m.focusedEditor().FilePath()
+
+		// Already on this file in the focused pane — just jump.
+		if oldPath == o.Path {
+			m.appendTab(o.Path)
+			m.focusCodePanel()
+			m.syncFocusState()
+			if o.Line > 0 {
+				targetLine := o.Line - 1
+				if o.CursorCol > 0 {
+					m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
+				} else {
+					m.focusedEditor().GoToLine(targetLine)
+				}
+				m.codePanel.ScrollToLine(targetLine)
+				m.setJumpMarker(targetLine, o.Col, o.EndCol)
+			}
+			return nil
+		}
+
+		// Check if the file is already open in another pane.
+		if pid, _ := m.findPaneWithTab(o.Path); pid != 0 && pid != m.focusedPane {
+			m.focusedPane = pid
+			m.focusCodePanel()
+			m.syncFocusState()
+			// Switch to the tab within that pane.
+			ps := m.paneEditors[pid]
+			for i, p := range ps.tabOrder {
+				if p == o.Path {
+					m.switchToTab(i)
+					break
+				}
+			}
+			if o.Line > 0 {
+				targetLine := o.Line - 1
+				if o.CursorCol > 0 {
+					m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
+				} else {
+					m.focusedEditor().GoToLine(targetLine)
+				}
+				m.codePanel.ScrollToLine(targetLine)
+				m.setJumpMarker(targetLine, o.Col, o.EndCol)
+			}
+			return nil
+		}
+
+		// Close the previous LSP document before switching.
+		if oldPath != "" {
+			m.lspDidCloseAsync(oldPath)
+		}
+
+		// Detach current editor state into the tiered cache.
+		m.detachCurrentEditor()
+
+		// Track the new file in the tab bar and resize the editor
+		// so the tab bar doesn't push content past the panel bottom.
+		m.appendTab(o.Path)
+		m.resizeInlineEditor()
+
+		// Restore from cache if available, otherwise load from disk.
+		if m.restoreFromCache(o.Path) {
+			lspContent = m.focusedEditor().Content()
+		} else {
+			m.focusedEditor().OpenFile(o.Path, content, o.Language)
+		}
+
+		// Transfer focus to the editor pane receiving the file.
+		m.focusCodePanel()
+		m.syncFocusState()
+	}
+
+	if o.Line > 0 {
+		targetLine := o.Line - 1
+		m.codePanel.ScrollToLine(targetLine)
+		if m.editMode {
+			if o.CursorCol > 0 {
+				m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
+			} else {
+				m.focusedEditor().GoToLine(targetLine)
+			}
+			m.setJumpMarker(targetLine, o.Col, o.EndCol)
+		}
+	}
+
+	m.syncEditorWarpLines()
+	return m.lspDidOpenCmd(o.Path, detectEditorLanguage(o.Path), lspContent)
+}
+
+// setJumpMarker activates the visual jump marker on the inline editor when
+// column info is available. When endCol is 0, derives bounds from the word
+// at the given column.
+func (m *AppModel) setJumpMarker(line, col, endCol int) {
+	if col <= 0 && endCol <= 0 {
+		return
+	}
+	startCol, ec := col, endCol
+	if ec <= startCol {
+		startCol, ec = m.focusedEditor().WordBoundsAt(line, col)
+	}
+	if ec > startCol {
+		m.focusedEditor().SetJumpMarker(line, startCol, ec)
+	}
+}
+
+func (m *AppModel) handleCloseEditor() tea.Cmd {
+	comp, cmd := m.editorOverlay.Update(msg.CloseEditorMsg{})
+	m.editorOverlay = comp.(*editor.Model)
+	m.overlay = overlayNone
+	return cmd
+}
+
+// handleFileReplaced reloads the editor buffer when a multi-file replace
+// modified the currently open file on disk (only if there are no unsaved changes).
+func (m *AppModel) handleFileReplaced(r msg.FileReplacedMsg) tea.Cmd {
+	if !m.editMode || m.focusedEditor().FilePath() != r.Path {
+		return nil
+	}
+	if m.focusedEditor().Modified() {
+		return nil
+	}
+	return m.reloadEditorFromDisk(r.Path)
+}
+
+// handleMultiFileReplaceDone flashes a status message after multi-file replace-all.
+func (m *AppModel) handleMultiFileReplaceDone(r msg.MultiFileReplaceDoneMsg) tea.Cmd {
+	status := fmt.Sprintf("Replaced %d occurrences in %d files", r.TotalReplaced, r.FilesChanged)
+	if r.Skipped > 0 {
+		status += fmt.Sprintf(" (%d skipped)", r.Skipped)
+	}
+	m.statusBar.SetFlash(status)
+	return nil
+}
+
+// reloadEditorFromDisk reads the file from disk and reloads the editor buffer.
+func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	content := string(data)
+	lang := detectEditorLanguage(path)
+	m.focusedEditor().OpenFile(path, content, lang)
+	m.codePanel.SetContent(content, path, lang)
+	m.editorCache.Delete(path)
+	return nil
+}
+
+func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
+	entry := &chat.ChatEntry{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Source:    chat.SourceAgent,
+		AgentID:   r.AgentID,
+		Content:   r.Content,
+		Height:    -1,
+	}
+	m.chat.PushEntry(entry)
+	return nil
+}
+
+func (m *AppModel) handleModalClosed() tea.Cmd {
+	if !m.modalOverlay.Active() {
+		m.overlay = overlayNone
+	}
+	return nil
+}
+
+// chordState tracks which chord prefix is pending.
+type chordState int
+
+const (
+	chordNone    chordState = iota
+	chordSession            // Alt+S pressed, waiting for arrow.
+	chordAgent              // Alt+A pressed, waiting for arrow.
+	chordView               // Alt+V pressed, waiting for arrow.
+)
+
+// chordArrowDelta maps arrow key strings (including alt-held variants) to
+// a cycle direction. The alt+arrow variants handle the common case where the
+// user still holds Alt from the prefix key when pressing the arrow.
+var chordArrowDelta = map[string]int{
+	"left":      -1,
+	"right":     1,
+	"alt+left":  -1,
+	"alt+right": 1,
+}
+
+// chordFocusGuard restricts specific chords to a required focused pane.
+// Chords not listed here are global (activate regardless of focus).
+var chordFocusGuard = map[chordState]component.FocusID{}
+
+// chordDisplay holds the label, key hints, and color for a chord hint overlay.
+type chordDisplay struct {
+	label string
+	keys  string
+	color func(*theme.Palette) lipgloss.Color
+}
+
+// chordDisplays maps chord states to their display properties.
+// Session select uses Primary (blue), Agent select uses Success (green).
+var chordDisplays = map[chordState]chordDisplay{
+	chordSession: {"Session select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
+	chordAgent:   {"Agent select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Success }},
+	chordView:    {"View select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Accent }},
+}
+
+// chordHint returns a styled hint string when a chord is active, or "" when idle.
+// Blocked chords (edit mode) render as "Exit edit mode to <action>" instead of
+// the normal cycling hint, so chordBlocked hints are only rendered by
+// codePanelView (not overlayChordHint on other panels).
+func (m *AppModel) chordHint(th *theme.Theme) string {
+	if m.chordBlocked {
+		return ""
+	}
+	disp, ok := chordDisplays[m.chord]
+	if !ok {
+		return ""
+	}
+	labelStyle := lipgloss.NewStyle().Foreground(disp.color(&th.Palette)).Bold(true)
+	keyStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+	return labelStyle.Render(disp.label) + keyStyle.Render("  "+disp.keys+"  any key to exit ")
+}
+
+// blockedChordHint returns a styled hint for a chord blocked by edit mode.
+// Returns "" when no blocked chord is active.
+func (m *AppModel) blockedChordHint(th *theme.Theme) string {
+	if !m.chordBlocked {
+		return ""
+	}
+	disp, ok := chordDisplays[m.chord]
+	if !ok {
+		return ""
+	}
+	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+	labelStyle := lipgloss.NewStyle().Foreground(disp.color(&th.Palette)).Bold(true)
+	return mutedStyle.Render("Exit edit mode to ") + labelStyle.Render(disp.label) + mutedStyle.Render("  (press any key to dismiss) ")
+}
+
+// handleChord processes two-key chord shortcuts: Alt+S then Left/Right for sessions,
+// Alt+A then Left/Right for agents. The chord stays active while arrows are pressed,
+// allowing repeated cycling. Any non-arrow key cancels the chord and falls
+// through to normal handling. Returns (cmd, true) if consumed.
+// chordKeyMap maps chord trigger keys to their chord state.
+var chordKeyMap = map[string]chordState{
+	"alt+s": chordSession,
+	"alt+a": chordAgent,
+	"alt+v": chordView,
+}
+
+func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
+	// Blocked chord: any key dismisses the hint.
+	if m.chordBlocked {
+		m.chord = chordNone
+		m.chordBlocked = false
+		return nil, true
+	}
+
+	// Chord triggers: toggle on if idle or switching, toggle off if repeated.
+	if target, ok := chordKeyMap[key.String()]; ok {
+		// Edit mode guard: chords are disabled while editing. Show the
+		// blocked hint bar so the user knows to exit first.
+		if m.editMode {
+			m.chord = target
+			m.chordBlocked = true
+			cmd := tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
+				return msg.ChordBlockedExpireMsg{}
+			})
+			return cmd, true
+		}
+		// Focus guard: some chords only activate with a specific pane focused.
+		if required, guarded := chordFocusGuard[target]; guarded && m.focus.Current() != required {
+			return nil, false
+		}
+		// Debounce: absorb key-repeat to prevent rapid toggle cycling.
+		ks := key.String()
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return nil, true
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+
+		if m.chord == target {
+			m.chord = chordNone
+		} else {
+			m.chord = target
+		}
+		return nil, true
+	}
+
+	if m.chord == chordNone {
+		return nil, false
+	}
+
+	// Active chord: arrow keys cycle, anything else cancels.
+	if delta, ok := chordArrowDelta[key.String()]; ok {
+		return m.dispatchChordCycle(m.chord, delta), true
+	}
+
+	m.chord = chordNone
+	return nil, true
+}
+
+// dispatchChordCycle routes a completed chord to the target panel.
+func (m *AppModel) dispatchChordCycle(chord chordState, delta int) tea.Cmd {
+	switch chord {
+	case chordSession:
+		if delta < 0 {
+			return m.sessionPanel.CyclePrev()
+		}
+		return m.sessionPanel.CycleNext()
+	case chordAgent:
+		if delta < 0 {
+			m.agentPanel.CyclePrev()
+		} else {
+			m.agentPanel.CycleNext()
+		}
+	case chordView:
+		m.cycleViewSlot(delta)
+	}
+	return nil
+}
+
+// cycleViewSlot dispatches Alt+V cycling to the appropriate ring(s).
+// Two active rings: both cycle in lockstep so the panel pair toggles as a unit.
+// One active ring: direction is forward/backward within that ring.
+func (m *AppModel) cycleViewSlot(delta int) {
+	bothActive := !m.leftRing.empty() && !m.rightRing.empty()
+	if bothActive {
+		// Paired cycling: both rings advance together so
+		// the two-panel layout toggles as a unit.
+		current := m.focus.Current()
+		oldLeft := m.leftRing.current()
+		oldRight := m.rightRing.current()
+		m.leftRing.cycle(delta)
+		m.rightRing.cycle(delta)
+		switch current {
+		case oldLeft:
+			m.focus.SetFocus(m.leftRing.current())
+		case oldRight:
+			m.focus.SetFocus(m.rightRing.current())
+		}
+		m.syncViewState()
+		return
+	}
+	if !m.leftRing.empty() {
+		m.cycleRing(&m.leftRing, delta)
+	}
+	if !m.rightRing.empty() {
+		m.cycleRing(&m.rightRing, delta)
+	}
+}
+
+// cycleRing advances a single ring by delta, transferring focus if needed.
+func (m *AppModel) cycleRing(ring *viewRing, delta int) {
+	oldPanel := ring.current()
+	ring.cycle(delta)
+	newPanel := ring.current()
+	if m.focus.Current() == oldPanel {
+		m.focus.SetFocus(newPanel)
+	}
+	m.syncViewState()
+}
+
+// ---------------------------------------------------------------------------
+// Edit mode (Alt+E)
+// ---------------------------------------------------------------------------
+
+// toggleEditMode switches between inline editing and read-only code viewing.
+func (m *AppModel) toggleEditMode() tea.Cmd {
+	// If git mode is active, exit it first — modes are mutually exclusive.
+	if m.gitMode {
+		m.exitGitMode()
+	}
+	if m.editMode {
+		m.exitEditMode()
+		return nil
+	}
+	return m.enterEditMode()
+}
+
+// enterEditMode activates inline vim editing in the code panel slot.
+// Returns a Cmd that sends didOpen so the LSP client tracks the document
+// for subsequent didChange notifications. Idempotent if already tracked.
+func (m *AppModel) enterEditMode() tea.Cmd {
+	// Dismiss any active chord — chords are unsupported in edit mode.
+	m.chord = chordNone
+	m.chordBlocked = false
+
+	// Save ring state and chat-mode focus.
+	m.savedLeftIdx = m.leftRing.index
+	m.savedRightIdx = m.rightRing.index
+	m.savedChatFocus = m.focus.Current()
+
+	// Ensure the code panel is visible.
+	switch m.layout.Mode() {
+	case layout.ThreeColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+	case layout.TwoColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+		m.rightRing.setTo(component.FocusCodeViewer)
+	case layout.SingleColumn:
+		m.leftRing.setTo(component.FocusCodeViewer)
+	}
+
+	// Restore tab order from a previous edit session, or initialise from
+	// the code panel's current file.
+	var lspCmd tea.Cmd
+	if len(m.focusedTabOrder()) > 0 {
+		// Re-entering edit mode — restore the last-active tab.
+		idx := 0
+		for i, p := range m.focusedTabOrder() {
+			if p == m.savedActiveTab {
+				idx = i
+				break
+			}
+		}
+		fp := m.focusedTabOrder()[idx]
+		var content string
+		if m.restoreFromCache(fp) {
+			content = m.focusedEditor().Content()
+		} else {
+			data, _ := os.ReadFile(fp)
+			content = string(data)
+			m.focusedEditor().OpenFile(fp, content, detectEditorLanguage(fp))
+		}
+		m.fileTree.SetActiveFile(fp)
+		m.fileTree.RevealPath(fp)
+		lspCmd = m.lspReopenCmd(fp, detectEditorLanguage(fp), content)
+	} else if fp := m.codePanel.FilePath(); fp != "" {
+		m.setFocusedTabOrder([]string{fp})
+		var content string
+		if m.restoreFromCache(fp) {
+			content = m.focusedEditor().Content()
+		} else {
+			content = m.codePanel.Content()
+			m.focusedEditor().OpenFile(fp, content, m.codePanel.Language())
+		}
+		m.fileTree.SetActiveFile(fp)
+		m.fileTree.RevealPath(fp)
+		lspCmd = m.lspReopenCmd(fp, detectEditorLanguage(fp), content)
+	} else {
+		m.focusedEditor().ClearFile()
+	}
+
+	m.editMode = true
+
+	// Size the editor to match the code panel slot. resizeInlineEditor
+	// handles all states (split preview, full preview, editor-only).
+	m.resizeInlineEditor()
+	m.fileTree.SetEditMode(true)
+	m.statusBar.SetMode("EDIT")
+	m.input.SetPlaceholder(":")
+
+	// Rebuild tab order for edit mode first, then restore focus.
+	// savedEditFocus preserves the last focused pane's dynamic ID
+	// across chat→edit toggles. Falls back to focused editor pane.
+	m.syncViewState()
+	target := m.savedEditFocus
+	if !pane.IsPaneFocus(target) || !m.paneTree.Contains(pane.PaneIDFromFocus(target)) {
+		target = pane.PaneFocusID(m.focusedPane)
+	}
+	m.focus.SetFocus(target)
+	m.syncFocusState()
+	m.statusBar.SetFlash("Edit mode")
+	return lspCmd
+}
+
+// exitEditMode deactivates inline editing and syncs content back to the
+// code viewer.
+func (m *AppModel) exitEditMode() {
+	// NOTE: We do NOT call lspDidCloseAsync here. The close is handled
+	// atomically by lspReopenCmd when the user re-enters edit mode, which
+	// avoids a race condition between async didClose and async didOpen.
+
+	// Capture content for the code panel before detaching the editor.
+	content := m.focusedEditor().Content()
+	fp := m.focusedEditor().FilePath()
+	lang := m.focusedEditor().Language()
+
+	// Save current editor state so re-entering edit mode restores it.
+	m.savedActiveTab = fp
+	m.savedEditFocus = m.focus.Current()
+	m.detachCurrentEditor()
+
+	m.codePanel.SetContent(content, fp, lang)
+
+	// Restore ring state.
+	m.leftRing.index = m.savedLeftIdx
+	m.rightRing.index = m.savedRightIdx
+
+	m.editMode = false
+	m.fileTree.SetEditMode(false)
+	m.editCmdInput = false
+	m.chord = chordNone
+	m.chordBlocked = false
+	// tabOrder is intentionally preserved so re-entering edit mode
+	// restores all previously open tabs.
+	m.statusBar.SetMode("CHAT")
+	m.input.SetPlaceholder("Type a message...")
+
+	// Rebuild tab order for chat mode first, then restore focus.
+	// This ensures savedChatFocus is evaluated against the fresh tab order.
+	m.syncViewState()
+	m.focus.SetFocus(m.savedChatFocus)
+	m.syncFocusState()
+	m.statusBar.SetFlash("View mode")
+}
+
+// ---------------------------------------------------------------------------
+// Git mode (Alt+G)
+// ---------------------------------------------------------------------------
+
+// gitBranchesLoadedMsg carries branch data loaded asynchronously for the
+// commit tree panel's branch view.
+type gitBranchesLoadedMsg struct {
+	branches []committree.BranchNode
+}
+
+// gitBranchCommitsLoadedMsg carries commit data for a single branch,
+// loaded when the user drills into a branch.
+type gitBranchCommitsLoadedMsg struct {
+	branch string
+	nodes  []committree.TreeNode
+}
+
+// gitStatsLoadedMsg carries diff stats loaded asynchronously for commit nodes.
+type gitStatsLoadedMsg struct {
+	stats map[string][2]int // hash → [additions, deletions]
+}
+
+// loadGitBranchesCmd returns a tea.Cmd that loads all local branches
+// via go-git and converts them to BranchNode data for the commit tree panel.
+func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		branches, err := gc.ListBranches()
+		if err != nil {
+			return gitBranchesLoadedMsg{}
+		}
+		nodes := make([]committree.BranchNode, len(branches))
+		for i, b := range branches {
+			nodes[i] = committree.BranchNode{
+				Name:       b.Name,
+				Hash:       b.Hash,
+				ShortHash:  b.ShortHash,
+				Subject:    b.Subject,
+				AuthorTime: b.AuthorTime,
+				IsHead:     b.IsHead,
+			}
+		}
+		return gitBranchesLoadedMsg{branches: nodes}
+	}
+}
+
+// loadBranchCommitsCmd returns a tea.Cmd that loads commits for a single
+// branch via go-git and converts them to TreeNode data.
+func (m *AppModel) loadBranchCommitsCmd(branchName string) tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		commits, err := gc.ListCommitsForBranch(branchName, commitTreeLoadLimit)
+		if err != nil {
+			return gitBranchCommitsLoadedMsg{branch: branchName}
+		}
+		nodes := make([]committree.TreeNode, len(commits))
+		for i, c := range commits {
+			nodes[i] = committree.TreeNode{
+				Hash:       c.Hash,
+				ShortHash:  c.ShortHash,
+				Subject:    c.Subject,
+				Branch:     c.Branch,
+				Author:     c.Author,
+				AuthorTime: c.AuthorTime,
+				Parents:    c.ParentHashes,
+				IsMerge:    c.IsMerge,
+			}
+		}
+		// Ensure the tip commit always shows the viewed branch name,
+		// even when buildBranchMap mapped it to a different branch.
+		if len(nodes) > 0 {
+			nodes[0].Branch = branchName
+		}
+		return gitBranchCommitsLoadedMsg{branch: branchName, nodes: nodes}
+	}
+}
+
+// loadGitStatsCmd returns a tea.Cmd that loads diff stats for the given
+// commit hashes via go-git's commit.Stats(). Runs in the background so the
+// tree can display immediately while stats populate asynchronously.
+func (m *AppModel) loadGitStatsCmd(hashes []string) tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		stats := make(map[string][2]int, len(hashes))
+		for _, h := range hashes {
+			add, del, err := gc.GetCommitStats(h)
+			if err != nil {
+				continue
+			}
+			stats[h] = [2]int{add, del}
+		}
+		return gitStatsLoadedMsg{stats: stats}
+	}
+}
+
+// commitTreeLoadLimit is the maximum number of commits to load for the tree.
+// Derived from: typical visible viewport ≈ 15–20 nodes; 500 provides ample
+// scroll depth without excessive memory or load time.
+const commitTreeLoadLimit = 500
+
+// toggleGitMode switches between git mode and the previous mode.
+func (m *AppModel) toggleGitMode() tea.Cmd {
+	if m.gitPanel == nil {
+		m.statusBar.SetFlash("Not a git repository")
+		return nil
+	}
+	if m.gitMode {
+		m.exitGitMode()
+		return nil
+	}
+	return m.enterGitMode()
+}
+
+// enterGitMode activates git mode, displaying the git explorer and commit tree.
+func (m *AppModel) enterGitMode() tea.Cmd {
+	// If edit mode is active, exit it first and remember for restore.
+	m.preGitEditMode = m.editMode
+	if m.editMode {
+		m.exitEditMode()
+	}
+
+	// Save ring state and current focus.
+	m.savedGitLeftIdx = m.leftRing.index
+	m.savedGitRightIdx = m.rightRing.index
+	m.savedChatFocus = m.focus.Current()
+
+	m.gitMode = true
+
+	// Position rings so git panels are visible.
+	switch m.layout.Mode() {
+	case layout.ThreeColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+	case layout.TwoColumn:
+		m.leftRing.setTo(component.FocusFileTree)
+		m.rightRing.setTo(component.FocusCodeViewer)
+	case layout.SingleColumn:
+		m.leftRing.setTo(component.FocusCodeViewer)
+	}
+
+	// Size git components to their panel slots.
+	m.resizeGitPanels()
+
+	m.statusBar.SetMode("GIT")
+	m.input.SetPlaceholder("git>")
+
+	m.syncViewState()
+	m.focus.SetFocus(component.FocusGitPanel)
+	m.syncFocusState()
+	m.statusBar.SetFlash("Git mode")
+
+	return tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
+}
+
+// exitGitMode deactivates git mode and returns to the previous mode.
+func (m *AppModel) exitGitMode() {
+	m.savedGitFocus = m.focus.Current()
+
+	// Restore ring state.
+	m.leftRing.index = m.savedGitLeftIdx
+	m.rightRing.index = m.savedGitRightIdx
+
+	m.gitMode = false
+	m.statusBar.SetMode("CHAT")
+	m.input.SetPlaceholder("Type a message...")
+
+	m.syncViewState()
+
+	if m.preGitEditMode {
+		m.preGitEditMode = false
+		m.enterEditMode()
+		return
+	}
+
+	m.focus.SetFocus(m.savedChatFocus)
+	m.syncFocusState()
+	m.statusBar.SetFlash("View mode")
+}
+
+// resizeGitPanels sizes the git panel and commit tree to their layout slots.
+func (m *AppModel) resizeGitPanels() {
+	if m.gitPanel == nil {
+		return
+	}
+	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)
+	m.gitPanel.SetSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
+
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.commitTree.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+}
+
+// enterCmdInput activates the input panel for ex command entry,
+// pre-filling it with ":" and switching focus.
+func (m *AppModel) enterCmdInput() {
+	m.editCmdInput = true
+	m.input.SetText(":")
+	m.input.SetLineStyler(m.cmdLineStyler())
+	m.focus.SetFocus(component.FocusInput)
+	m.syncFocusState()
+}
+
+// exitCmdInput aborts command input and returns focus to the code panel.
+func (m *AppModel) exitCmdInput() {
+	m.editCmdInput = false
+	m.input.SetLineStyler(nil)
+	m.input.Clear()
+	m.focusCodePanel()
+	m.syncFocusState()
+}
+
+// detachCurrentEditor extracts the current editor's per-file state and
+// stores it in the tiered cache. No-op if no file is loaded.
+func (m *AppModel) detachCurrentEditor() {
+	ws := m.focusedEditor().Detach()
+	if ws.FilePath == "" {
+		return
+	}
+	m.editorCache.Put(ws)
+}
+
+// restoreFromCache attempts to restore the editor from the tiered cache.
+// Returns true if the entry was found and restored, false otherwise.
+func (m *AppModel) restoreFromCache(path string) bool {
+	entry, ok := m.editorCache.Take(path)
+	if !ok {
+		return false
+	}
+	if entry.IsWarm() {
+		m.focusedEditor().AttachWarm(entry.Warm())
+		return true
+	}
+	m.focusedEditor().AttachCold(entry.Cold())
+	return true
+}
+
+// exCmdInfo describes a known ex command and its argument requirement.
+type exCmdInfo struct {
+	argHint     string // Non-empty means the command accepts an argument.
+	optionalArg bool   // When true, command is valid with or without the arg.
+}
+
+// knownExCommands maps command words to their validation info.
+var knownExCommands = map[string]exCmdInfo{
+	"w": {}, "q": {}, "wq": {}, "x": {}, "q!": {},
+	"symbols": {}, "format": {}, "fmt": {},
+	"rename":   {argHint: "<newname>"},
+	"tabn":     {argHint: "[N]", optionalArg: true},
+	"tabp":     {},
+	"tabclose": {},
+	"tab":      {argHint: "<filename>"},
+}
+
+// validateExCommand checks the typed text against known commands.
+// Returns: known (command word recognized), valid (ready to execute), hint.
+func validateExCommand(text string) (known, valid bool, hint string) {
+	cmd := strings.TrimPrefix(strings.TrimSpace(text), ":")
+	cmd = strings.TrimSpace(cmd)
+
+	word, args, hasArgs := strings.Cut(cmd, " ")
+	info, ok := knownExCommands[word]
+	if !ok {
+		return false, false, ""
+	}
+	if info.argHint == "" {
+		return true, true, ""
+	}
+	if info.optionalArg {
+		return true, true, info.argHint
+	}
+	if hasArgs && strings.TrimSpace(args) != "" {
+		return true, true, ""
+	}
+	return true, false, info.argHint
+}
+
+// cmdLineStyler returns a line styler that colors command text green when
+// valid, red when recognized but incomplete, and returns a hint for
+// incomplete commands.
+func (m *AppModel) cmdLineStyler() func(string) (string, string) {
+	th := m.config.Theme()
+	validStyle := lipgloss.NewStyle().Foreground(th.Palette.Success)
+	invalidStyle := lipgloss.NewStyle().Foreground(th.Palette.Error)
+	return func(text string) (string, string) {
+		known, valid, hint := validateExCommand(text)
+		if !known {
+			return text, ""
+		}
+		if valid {
+			return validStyle.Render(text), ""
+		}
+		return invalidStyle.Render(text), hint
+	}
+}
+
+// handleExCommand processes a vim ex command entered in the input panel
+// during edit mode. Supported: :w (save), :q (quit), :wq (save+quit),
+// :q! (force quit).
+func (m *AppModel) handleExCommand(text string) tea.Cmd {
+	cmd := strings.TrimSpace(text)
+
+	// Strip leading ':' if present.
+	cmd = strings.TrimPrefix(cmd, ":")
+	cmd = strings.TrimSpace(cmd)
+
+	switch cmd {
+	case "w":
+		m.saveEditorBuffer()
+	case "q":
+		return m.closeCurrentTab(false)
+	case "wq", "x":
+		m.saveEditorBuffer()
+		return m.closeCurrentTab(false)
+	case "q!":
+		return m.closeCurrentTab(true)
+	case "tabp":
+		return m.prevTab()
+	case "tabclose":
+		return m.closeCurrentTab(false)
+	case "symbols":
+		if fp := m.focusedEditor().FilePath(); fp != "" {
+			return m.lspDocumentSymbolCmd(fp)
+		}
+	case "format", "fmt":
+		if fp := m.focusedEditor().FilePath(); fp != "" {
+			var flushContent string
+			if m.focusedEditor().LSPDirty() {
+				m.focusedEditor().ClearLSPDirty()
+				flushContent = m.focusedEditor().Content()
+			}
+			return m.lspFormatCmd(fp, flushContent, m.focusedEditor().EditGeneration())
+		}
+	default:
+		if cmd == "tabn" || strings.HasPrefix(cmd, "tabn ") {
+			rest := strings.TrimSpace(strings.TrimPrefix(cmd, "tabn"))
+			if rest == "" {
+				return m.nextTab()
+			}
+			n, err := strconv.Atoi(rest)
+			if err != nil || n < 1 {
+				m.statusBar.SetFlash("Usage: :tabn [N]")
+				return nil
+			}
+			return m.switchToTab(n - 1)
+		}
+		if name, ok := strings.CutPrefix(cmd, "tab "); ok {
+			return m.handleTabCommand(strings.TrimSpace(name))
+		}
+		if newName, ok := strings.CutPrefix(cmd, "rename "); ok {
+			return m.handleRenameCommand(strings.TrimSpace(newName))
+		}
+		m.statusBar.SetFlash("Unknown command: :" + cmd)
+	}
+	return nil
+}
+
+// handleRenameCommand initiates an LSP rename for the symbol under the cursor.
+func (m *AppModel) handleRenameCommand(newName string) tea.Cmd {
+	if newName == "" {
+		m.statusBar.SetFlash("Usage: :rename <newname>")
+		return nil
+	}
+	fp := m.focusedEditor().FilePath()
+	if fp == "" {
+		return nil
+	}
+	line := m.focusedEditor().CursorLine()
+	col := m.focusedEditor().CursorCol()
+
+	// Flush pending edits so the server sees the latest buffer.
+	if m.focusedEditor().LSPDirty() {
+		m.focusedEditor().ClearLSPDirty()
+		_ = m.lspManager.NotifyDidChange(m.ctx, m.config.ProjectRoot, fp, m.focusedEditor().Content())
+	}
+
+	if m.lspManager.PrepareRenameSupported(m.config.ProjectRoot, fp) {
+		return m.lspPrepareRenameCmd(fp, line, col, newName)
+	}
+	return m.lspRenameCmd(fp, line, col, newName)
+}
+
+// tabCompleter provides tab-completion candidates from open tabs for the
+// :tab ex command. Implements input.CompletionProvider.
+type tabCompleter struct {
+	tabOrderFn func() []string
+}
+
+func (tc *tabCompleter) Name() string { return "tabs" }
+
+func (tc *tabCompleter) Complete(prefix string, limit int) []Candidate {
+	tabs := tc.tabOrderFn()
+	if len(tabs) == 0 {
+		return nil
+	}
+	lower := strings.ToLower(prefix)
+	var out []Candidate
+	for _, p := range tabs {
+		base := filepath.Base(p)
+		if prefix == "" || strings.Contains(strings.ToLower(base), lower) {
+			out = append(out, Candidate{
+				Text:    base,
+				Display: base,
+			})
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// Candidate is an alias for the input completion candidate type.
+type Candidate = inputpkg.Candidate
+
+// handleTabCommand switches to an open tab matching the given filename.
+func (m *AppModel) handleTabCommand(name string) tea.Cmd {
+	if name == "" {
+		m.statusBar.SetFlash("Usage: :tab <filename>")
+		return nil
+	}
+	for i, p := range m.focusedTabOrder() {
+		if filepath.Base(p) == name {
+			return m.switchToTab(i)
+		}
+	}
+	m.statusBar.SetFlash("No open tab: " + name)
+	return nil
+}
+
+// saveEditorBuffer writes the inline editor buffer to disk.
+func (m *AppModel) saveEditorBuffer() {
+	path := m.focusedEditor().FilePath()
+	if path == "" {
+		m.statusBar.SetFlash("No file path")
+		return
+	}
+	content := m.focusedEditor().Content()
+	if err := atomicWriteFile(path, []byte(content), 0o644); err != nil {
+		m.statusBar.SetFlash("Write failed: " + err.Error())
+		return
+	}
+	m.focusedEditor().MarkSaved()
+	m.lspDidSaveAsync(path, content)
+	m.codePanel.SetContent(content, path, m.focusedEditor().Language())
+	m.nudgeGitWatcher()
+	m.refreshTabsModified()
+	m.statusBar.SetFlash("Saved " + path)
+}
+
+// atomicWriteFile writes data to a temporary file in the same directory as
+// path, then renames it into place. This prevents partial writes from
+// corrupting the target file on crash or power loss.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".sylk-save-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Ensure cleanup on any error path.
+	defer func() {
+		if tmpName != "" {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename temp: %w", err)
+	}
+	tmpName = "" // prevent deferred cleanup after successful rename
+	return nil
+}
+
+// codePanelView returns the rendered view for the code panel slot.
+// Handles read-only viewer, single-pane editor, full preview, and
+// multi-pane compositing (iterative, not recursive).
+func (m *AppModel) codePanelView() string {
+	if !m.editMode {
+		return m.codePanel.View()
+	}
+
+	// Full preview mode: preview active, single editor pane with no tabs.
+	if m.hasPreview() && len(m.paneEditors) == 1 && len(m.focusedTabOrder()) == 0 {
+		bar := m.previewTabBarView()
+		content := m.previewPanel.View(m.cursorVisible)
+		if bar != "" {
+			return lipgloss.JoinVertical(lipgloss.Left, bar, content)
+		}
+		return content
+	}
+
+	// Full markdown preview mode: mdPreview active, sole editor has no tabs.
+	if m.isFullMdPreview() {
+		rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+		bar := m.mdPreviewTabBar(max(rightW-panelBorderSize, 1))
+		content := m.mdPreviewPanel.View()
+		if bar != "" {
+			return lipgloss.JoinVertical(lipgloss.Left, bar, content)
+		}
+		return content
+	}
+
+	// Single editor pane, no splits: direct render (no compositing overhead).
+	if m.paneTree.IsLeaf() {
+		content := m.focusedEditor().View(m.cursorVisible)
+		bar := m.tabBarView()
+		if bar != "" {
+			content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
+		}
+		content = m.overlayMdTooltipOnContent(content)
+		return m.overlayBlockedChord(content)
+	}
+
+	// Multi-pane: iterative compositing via pre-computed layout.
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+	contentH := max(innerH-1, 1) // Reserve 1 row for status line.
+
+	area := pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+	content := m.composePanes(area)
+
+	// Overlay markdown tooltip in multi-pane mode.
+	if m.mdTooltipTab >= 0 && m.mdTooltipPane != 0 {
+		rects := m.paneTree.ComputeLayout(area)
+		if pr, ok := rects[m.mdTooltipPane]; ok {
+			rows := m.mdTooltipRows()
+			lines := strings.Split(content, "\n")
+			overlayMdTooltipRows(lines, rows, pr.X+m.mdTooltipX, pr.Y+tabbar.Height-1)
+			content = strings.Join(lines, "\n")
+		}
+	}
+
+	statusLine := m.focusedEditor().StatusLineView(innerW)
+	return m.overlayBlockedChord(lipgloss.JoinVertical(lipgloss.Left, content, statusLine))
+}
+
+// composePanes renders all panes in the tree and composites them into a
+// single string using iterative row-by-row assembly. Divider characters
+// are placed at positions computed from the tree structure.
+func (m *AppModel) composePanes(area pane.Rect) string {
+	rects := m.paneTree.ComputeLayout(area)
+	dividers := m.paneTree.Dividers(area)
+	leaves := m.paneTree.Leaves()
+
+	th := m.config.Theme()
+	divStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+	dropDivStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary)
+
+	// Determine drop-target rect for divider highlighting.
+	var dropRect pane.Rect
+	hasDropTarget := m.tabDropTarget != 0
+	if hasDropTarget {
+		dropRect = rects[m.tabDropTarget]
+	}
+
+	// Render each leaf pane into a block of lines.
+	leafLines := make(map[pane.PaneID][]string, len(leaves))
+	for _, id := range leaves {
+		r := rects[id]
+		leafLines[id] = strings.Split(m.renderLeafPane(id, r), "\n")
+	}
+
+	// Build output row by row.
+	type seg struct {
+		x int
+		s string
+	}
+	rows := make([]string, area.H)
+	for y := range area.H {
+		var segs []seg
+
+		// Pane content segments.
+		for _, id := range leaves {
+			r := rects[id]
+			if y < r.Y || y >= r.Y+r.H {
+				continue
+			}
+			lineIdx := y - r.Y
+			lines := leafLines[id]
+			line := ""
+			if lineIdx < len(lines) {
+				line = lines[lineIdx]
+			}
+			segs = append(segs, seg{r.X, line})
+		}
+
+		// Divider segments (highlight dividers adjacent to the drop target).
+		for _, d := range dividers {
+			style := divStyle
+			if hasDropTarget && isDividerAdjacentToRect(d, dropRect) {
+				style = dropDivStyle
+			}
+			switch {
+			case d.Dir == pane.SplitVertical && y >= d.Y && y < d.Y+d.Len:
+				segs = append(segs, seg{d.X, style.Render("│")})
+			case d.Dir == pane.SplitHorizontal && y == d.Y:
+				segs = append(segs, seg{d.X, style.Render(strings.Repeat("─", d.Len))})
+			}
+		}
+
+		// Sort by X and concatenate.
+		slices.SortFunc(segs, func(a, b seg) int { return a.x - b.x })
+		var b strings.Builder
+		for _, s := range segs {
+			b.WriteString(s.s)
+		}
+		rows[y] = b.String()
+	}
+
+	return strings.Join(rows, "\n")
+}
+
+// isDividerAdjacentToRect reports whether a divider segment borders the given rect.
+func isDividerAdjacentToRect(d pane.Divider, r pane.Rect) bool {
+	if d.Dir == pane.SplitVertical {
+		adjacent := d.X == r.X-1 || d.X == r.X+r.W
+		overlaps := d.Y < r.Y+r.H && d.Y+d.Len > r.Y
+		return adjacent && overlaps
+	}
+	adjacent := d.Y == r.Y-1 || d.Y == r.Y+r.H
+	overlaps := d.X < r.X+r.W && d.X+d.Len > r.X
+	return adjacent && overlaps
+}
+
+// renderLeafPane renders a single pane (editor or preview) as a sized block.
+// The returned string has exactly r.H lines, each r.W visual columns wide.
+func (m *AppModel) renderLeafPane(id pane.PaneID, r pane.Rect) string {
+	sizer := lipgloss.NewStyle().
+		Width(r.W).MaxWidth(r.W).
+		Height(r.H).MaxHeight(r.H)
+
+	if id == m.tabDropTarget {
+		return m.renderDropTargetPane(id, r, sizer)
+	}
+
+	if id == m.previewPane {
+		bar := m.previewTabBarViewSized(r.W)
+		content := m.previewPanel.View(m.cursorVisible)
+		return sizer.Render(lipgloss.JoinVertical(lipgloss.Left, bar, content))
+	}
+
+	if id == m.mdPreviewPane {
+		bar := m.mdPreviewTabBar(r.W)
+		content := m.mdPreviewPanel.View()
+		return sizer.Render(lipgloss.JoinVertical(lipgloss.Left, bar, content))
+	}
+
+	ps := m.paneEditors[id]
+	bar := m.paneTabBarView(id, r.W)
+	content := ps.editor.ViewContent(m.cursorVisible)
+	if bar != "" {
+		content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
+	}
+	return sizer.Render(content)
+}
+
+// dropOverlayAlpha is the blend factor for the drop-target background tint.
+// Derived from: 15% matches VS Code's drag-and-drop overlay opacity.
+const dropOverlayAlpha = 0.15
+
+// renderDropTargetPane renders an editor pane as a drop target: the tab bar
+// stays normal, content backgrounds are tinted with a blended overlay color,
+// and a centered "Drop tab here" label is composited on top.
+func (m *AppModel) renderDropTargetPane(id pane.PaneID, r pane.Rect, sizer lipgloss.Style) string {
+	ps := m.paneEditors[id]
+	if ps == nil {
+		return sizer.Render("")
+	}
+	bar := m.paneTabBarView(id, r.W)
+	content := ps.editor.ViewContent(m.cursorVisible)
+	if bar != "" {
+		content = lipgloss.JoinVertical(lipgloss.Left, bar, content)
+	}
+	sized := sizer.Render(content)
+	lines := strings.Split(sized, "\n")
+
+	// Compute overlay background by blending base bg with Primary.
+	th := m.config.Theme()
+	tr, tg, tb := blendColors(th.Palette.Background, th.Palette.Primary, dropOverlayAlpha)
+	bgCode := fmt.Sprintf("\x1b[48;2;%d;%d;%dm", tr, tg, tb)
+
+	// Tint content lines below the tab bar.
+	barH := tabbar.Height
+	if bar == "" {
+		barH = 0
+	}
+	for i := barH; i < len(lines); i++ {
+		lines[i] = tintLineBg(lines[i], bgCode)
+	}
+
+	// Overlay centered "Drop tab here" indicator.
+	label := lipgloss.NewStyle().
+		Foreground(th.Palette.Background).
+		Background(th.Palette.Primary).
+		Bold(true).
+		Padding(0, 1).
+		Render("Drop tab here")
+
+	centerY := barH + (r.H-barH)/2
+	labelW := lipgloss.Width(label)
+	centerX := max((r.W-labelW)/2, 0)
+
+	if centerY >= 0 && centerY < len(lines) {
+		orig := lines[centerY]
+		left := truncateStyledN(orig, centerX)
+		right := skipStyledN(orig, centerX+labelW)
+		// Re-insert tint background after the reset so the overlay
+		// continues past the label to the end of the line.
+		const resetSeq = "\x1b[0m"
+		if strings.HasPrefix(right, resetSeq) {
+			right = resetSeq + bgCode + right[len(resetSeq):]
+		}
+		lines[centerY] = left + label + right
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// tintLineBg replaces all ANSI background colors in a line with bgCode,
+// producing a semi-transparent overlay effect where foreground content
+// remains visible but backgrounds are uniformly tinted.
+func tintLineBg(s string, bgCode string) string {
+	var out strings.Builder
+	out.Grow(len(s) + len(s)/4)
+	out.WriteString(bgCode)
+
+	i := 0
+	for i < len(s) {
+		if s[i] != '\x1b' || i+1 >= len(s) || s[i+1] != '[' {
+			out.WriteByte(s[i])
+			i++
+			continue
+		}
+		// Find end of CSI sequence.
+		j := i + 2
+		for j < len(s) && !isCSITerminator(s[j]) {
+			j++
+		}
+		if j >= len(s) {
+			out.WriteString(s[i:])
+			break
+		}
+		j++ // include terminator
+		out.WriteString(s[i:j])
+		// After any SGR sequence (m-terminated), re-insert our bg override.
+		if s[j-1] == 'm' {
+			out.WriteString(bgCode)
+		}
+		i = j
+	}
+	out.WriteString("\x1b[0m")
+	return out.String()
+}
+
+// blendColors blends two hex colors at the given alpha (0.0–1.0).
+func blendColors(base, overlay lipgloss.Color, alpha float64) (uint8, uint8, uint8) {
+	br, bg, bb := parseHexColor(string(base))
+	or, og, ob := parseHexColor(string(overlay))
+	r := uint8(float64(br) + alpha*float64(int(or)-int(br)))
+	g := uint8(float64(bg) + alpha*float64(int(og)-int(bg)))
+	b := uint8(float64(bb) + alpha*float64(int(ob)-int(bb)))
+	return r, g, b
+}
+
+// parseHexColor parses a "#RRGGBB" string into RGB components.
+func parseHexColor(hex string) (uint8, uint8, uint8) {
+	hex = strings.TrimPrefix(hex, "#")
+	if len(hex) != 6 {
+		return 0, 0, 0
+	}
+	r, _ := strconv.ParseUint(hex[0:2], 16, 8)
+	g, _ := strconv.ParseUint(hex[2:4], 16, 8)
+	b, _ := strconv.ParseUint(hex[4:6], 16, 8)
+	return uint8(r), uint8(g), uint8(b)
+}
+
+// truncateStyledN truncates a potentially ANSI-styled string to maxW visible
+// columns, preserving escape sequences and appending a reset.
+func truncateStyledN(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxW {
+		return s
+	}
+	var b strings.Builder
+	col := 0
+	inEsc := false
+	for _, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			b.WriteRune(r)
+			continue
+		}
+		if inEsc {
+			b.WriteRune(r)
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		if col >= maxW {
+			break
+		}
+		b.WriteRune(r)
+		col++
+	}
+	b.WriteString("\x1b[0m")
+	return b.String()
+}
+
+// skipStyledN drops the first skip visible columns from a styled string
+// and returns the remainder with a reset prefix.
+func skipStyledN(s string, skip int) string {
+	if skip <= 0 {
+		return s
+	}
+	vis := 0
+	i := 0
+	for i < len(s) && vis < skip {
+		if s[i] == '\x1b' {
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSITerminator(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			i = j
+			continue
+		}
+		i++
+		vis++
+	}
+	if i >= len(s) {
+		return ""
+	}
+	return "\x1b[0m" + s[i:]
+}
+
+// isCSITerminator reports whether b is the final byte of a CSI sequence.
+func isCSITerminator(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// paneTabBarConfig builds the tabbar.Config for a specific editor pane.
+func (m *AppModel) paneTabBarConfig(id pane.PaneID, width int) tabbar.Config {
+	ps := m.paneEditors[id]
+	tabs := make([]tabbar.Tab, len(ps.tabOrder))
+	currentPath := ps.editor.FilePath()
+	activeIdx := 0
+	for i, path := range ps.tabOrder {
+		modified := false
+		if path == currentPath {
+			activeIdx = i
+			modified = ps.editor.Modified()
+		} else {
+			modified = m.editorCache.IsModified(path)
+		}
+		tabs[i] = tabbar.Tab{Path: path, Modified: modified}
+	}
+
+	hasSplits := m.paneTree.LeafCount() > 1
+	isFocused := id == m.focusedPane && m.isEditorFocused()
+	hoverClose := -1
+	if id == m.tabHoverPane {
+		hoverClose = m.tabHoverClose
+	}
+
+	return tabbar.Config{
+		Tabs:       tabs,
+		Active:     activeIdx,
+		Width:      width,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      m.config.Theme(),
+		FlashLeft:  isFocused && time.Now().Before(m.tabArrowFlashLeftUntil),
+		FlashRight: isFocused && time.Now().Before(m.tabArrowFlashRightUntil),
+		HoverClose: hoverClose,
+		Focused:    hasSplits && isFocused,
+		DimActive:  hasSplits && !isFocused,
+	}
+}
+
+// paneTabBarView renders the tab bar for a specific editor pane.
+func (m *AppModel) paneTabBarView(id pane.PaneID, width int) string {
+	ps := m.paneEditors[id]
+	if len(ps.tabOrder) == 0 {
+		return ""
+	}
+	return tabbar.View(m.paneTabBarConfig(id, width))
+}
+
+// previewTabBarViewSized renders the preview tab bar at the given width.
+func (m *AppModel) previewTabBarViewSized(width int) string {
+	if m.previewPanel.FilePath() == "" {
+		return ""
+	}
+	hasSplits := m.paneTree.LeafCount() > 1
+	cfg := tabbar.Config{
+		Tabs: []tabbar.Tab{{
+			Path:        m.previewPanel.FilePath(),
+			Modified:    false,
+			LabelPrefix: "Preview: ",
+		}},
+		Active:     0,
+		Width:      width,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      m.config.Theme(),
+		HoverClose: m.previewTabHoverClose,
+		Focused:    hasSplits && m.isPreviewFocused(),
+		DimActive:  hasSplits && !m.isPreviewFocused(),
+	}
+	return tabbar.View(cfg)
+}
+
+// previewTabBarConfig returns the tabbar.Config for the preview tab bar.
+func (m *AppModel) previewTabBarConfig() tabbar.Config {
+	th := m.config.Theme()
+	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+
+	// In split mode, preview gets half the width.
+	barWidth := innerW
+	if len(m.focusedTabOrder()) > 0 {
+		dividerWidth := 1
+		barWidth = (innerW - dividerWidth) / 2
+	}
+
+	return tabbar.Config{
+		Tabs: []tabbar.Tab{{
+			Path:        m.previewPanel.FilePath(),
+			Modified:    false,
+			LabelPrefix: "Preview: ",
+		}},
+		Active:     0,
+		Width:      barWidth,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      th,
+		HoverClose: m.previewTabHoverClose,
+		Focused:    len(m.focusedTabOrder()) > 0 && m.isPreviewFocused(),
+		DimActive:  len(m.focusedTabOrder()) > 0 && !m.isPreviewFocused(),
+	}
+}
+
+// previewTabBarView renders the tab bar for the preview panel with a single
+// "Preview: filename" tab.
+func (m *AppModel) previewTabBarView() string {
+	if m.previewPanel.FilePath() == "" {
+		return ""
+	}
+	return tabbar.View(m.previewTabBarConfig())
+}
+
+// ---------------------------------------------------------------------------
+// Preview panel handlers
+// ---------------------------------------------------------------------------
+
+// handleFilePreview loads a file into the preview panel (read-only).
+func (m *AppModel) handleFilePreview(o msg.FilePreviewMsg) tea.Cmd {
+	if o.Path == m.previewPanel.FilePath() && m.hasPreview() {
+		return nil // Already showing this file.
+	}
+
+	data, err := os.ReadFile(o.Path)
+	if err != nil {
+		m.statusBar.SetFlash("Cannot preview: " + filepath.Base(o.Path))
+		return nil
+	}
+
+	// Close the LSP document for the previous preview file (unless it's
+	// also open in an editor tab).
+	oldPath := m.previewPanel.FilePath()
+	if oldPath != "" && oldPath != o.Path && !m.isFileOpenInEditor(oldPath) {
+		m.lspDidCloseAsync(oldPath)
+	}
+
+	content := string(data)
+	m.previewPanel.SetContent(content, o.Path, o.Language)
+
+	wasActive := m.hasPreview()
+	if !wasActive {
+		// Insert preview as the leftmost leaf at the root level so it's
+		// always the leftmost pane regardless of existing splits.
+		m.paneCounter++
+		m.previewPane = m.paneCounter
+		m.paneTree.InsertLeft(m.previewPane, pane.SplitVertical)
+	}
+
+	if o.Line > 0 {
+		m.previewPanel.ScrollToLine(o.Line - 1)
+	}
+
+	// Recompute layout when transitioning into preview.
+	if !wasActive {
+		m.recalcLayout()
+	}
+
+	// Notify LSP about the preview file so hover works. If the file is
+	// already open in an editor, the document tracker silently skips the
+	// duplicate open.
+	lang := detectEditorLanguage(o.Path)
+	return m.lspDidOpenCmd(o.Path, lang, content)
+}
+
+// dismissPreview closes the preview panel and restores the full code panel.
+// Focus moves to the last active editor pane when one exists.
+func (m *AppModel) dismissPreview() {
+	if !m.hasPreview() {
+		return
+	}
+	wasPreviewFocused := m.focus.Current() == pane.PaneFocusID(m.previewPane)
+	previewPath := m.previewPanel.FilePath()
+
+	// Remove preview leaf from the pane tree.
+	m.paneTree.Close(m.previewPane)
+	m.previewPane = 0
+	m.previewPanel.ClearFile()
+
+	// Close the LSP document unless the file is also open in an editor tab.
+	if previewPath != "" && !m.isFileOpenInEditor(previewPath) {
+		m.lspDidCloseAsync(previewPath)
+	}
+
+	// Focus the last active editor pane. Fall back to file tree when
+	// no editor pane exists.
+	if wasPreviewFocused || !m.isEditorFocused() {
+		if len(m.paneEditors) > 0 {
+			m.focusCodePanel()
+		} else {
+			m.focus.SetFocus(component.FocusFileTree)
+		}
+	}
+	m.recalcLayout()
+	m.syncFocusState()
+}
+
+// ---------------------------------------------------------------------------
+// Markdown preview (rendered markdown split-right of the source editor)
+// ---------------------------------------------------------------------------
+
+// openMarkdownPreview splits the focused pane to the right and displays the
+// rendered markdown content. If the markdown preview is already open, the
+// content is updated in place.
+func (m *AppModel) openMarkdownPreview(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		m.statusBar.SetFlash("Cannot preview: " + filepath.Base(path))
+		return
+	}
+	content := string(data)
+
+	// Already open — just refresh content.
+	if m.mdPreviewPane != 0 {
+		m.mdPreviewPanel.SetContent(content, path)
+		return
+	}
+
+	// Compute the focused pane area for size checking.
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+	contentH := max(innerH-1, 1)
+	area := pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+	rects := m.paneTree.ComputeLayout(area)
+	focusedRect := rects[m.focusedPane]
+
+	m.paneCounter++
+	m.mdPreviewPane = m.paneCounter
+
+	if !m.paneTree.Split(m.focusedPane, m.mdPreviewPane, pane.SplitVertical, focusedRect) {
+		m.paneCounter--
+		m.mdPreviewPane = 0
+		m.statusBar.SetFlash("Pane too small to split")
+		return
+	}
+
+	m.mdPreviewPanel.SetContent(content, path)
+	m.mdPreviewPanel.SetFocusID(pane.PaneFocusID(m.mdPreviewPane))
+	m.resizeInlineEditor()
+	m.syncViewState()
+	m.statusBar.SetFlash("Markdown preview")
+}
+
+// dismissMarkdownPreview closes the markdown preview pane and restores layout.
+func (m *AppModel) dismissMarkdownPreview() {
+	if m.mdPreviewPane == 0 {
+		return
+	}
+	wasFocused := m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane)
+	m.paneTree.Close(m.mdPreviewPane)
+	m.mdPreviewPane = 0
+	m.mdPreviewPanel.ClearFile()
+
+	if wasFocused {
+		m.focusCodePanel()
+	}
+	m.resizeInlineEditor()
+	m.syncViewState()
+	m.syncFocusState()
+}
+
+// mdPreviewTabBar renders a single tab for the markdown preview pane.
+func (m *AppModel) mdPreviewTabBar(width int) string {
+	if m.mdPreviewPanel.FilePath() == "" {
+		return ""
+	}
+	hasSplits := m.paneTree.LeafCount() > 1
+	isFocused := m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane)
+	cfg := tabbar.Config{
+		Tabs: []tabbar.Tab{{
+			Path:        m.mdPreviewPanel.FilePath(),
+			Modified:    false,
+			LabelPrefix: "Markdown: ",
+		}},
+		Active:     0,
+		Width:      width,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      m.config.Theme(),
+		HoverClose: m.mdPreviewTabHoverClose,
+		Focused:    hasSplits && isFocused,
+		DimActive:  hasSplits && !isFocused,
+	}
+	return tabbar.View(cfg)
+}
+
+// isFileOpenInEditor reports whether the given file path is currently open
+// in any editor pane's tab order.
+func (m *AppModel) isFileOpenInEditor(path string) bool {
+	for _, ps := range m.paneEditors {
+		for _, tabPath := range ps.tabOrder {
+			if tabPath == path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// splitPane splits the focused editor pane in the given direction, creating
+// a new empty editor pane. The original pane becomes Left/Top and the new
+// pane becomes Right/Bottom. If the split would violate minimum pane size,
+// the operation is silently ignored.
+func (m *AppModel) splitPane(dir pane.SplitDir) {
+	// Compute the current area of the focused pane for size checking.
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+	contentH := max(innerH-1, 1) // minus status line
+	area := pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+	rects := m.paneTree.ComputeLayout(area)
+	focusedRect := rects[m.focusedPane]
+
+	m.paneCounter++
+	newID := m.paneCounter
+
+	if !m.paneTree.Split(m.focusedPane, newID, dir, focusedRect) {
+		m.paneCounter--
+		m.statusBar.SetFlash("Pane too small to split")
+		return
+	}
+
+	// Create a new empty editor for the new pane.
+	th := m.config.Theme()
+	m.paneEditors[newID] = &editorPaneState{editor: editor.New(th)}
+
+	// Resize all panes to their new layout rects.
+	m.resizeInlineEditor()
+	m.syncViewState()
+	m.statusBar.SetFlash("Split pane")
+}
+
+// closePane closes the currently focused pane. If the active editor has
+// unsaved modifications, a save prompt is shown first. The sibling subtree's
+// leftmost leaf receives focus. No-op if only one pane remains.
+func (m *AppModel) closePane() {
+	closingID := m.focusedPane
+
+	// If the focused pane is the preview, delegate to dismissPreview.
+	if closingID == m.previewPane {
+		m.dismissPreview()
+		return
+	}
+
+	// If the focused pane is the markdown preview, delegate to dismissMarkdownPreview.
+	if closingID == m.mdPreviewPane {
+		m.dismissMarkdownPreview()
+		return
+	}
+
+	// Check for unsaved modifications in the active editor.
+	ps := m.paneEditors[closingID]
+	if ps.editor.Modified() {
+		m.pendingPaneClose = closingID
+		m.pendingClosePrompt = true
+		name := filepath.Base(ps.editor.FilePath())
+		m.statusBar.SetPrompt("Save changes to " + name + " before closing pane? (y)es (n)o")
+		return
+	}
+
+	// If this is the last editor pane and a markdown preview is active,
+	// clear the editor content so the preview takes the full panel.
+	if m.mdPreviewPane != 0 && len(m.paneEditors) == 1 {
+		ps := m.paneEditors[closingID]
+		if ps != nil && ps.editor.FilePath() != "" {
+			ws := ps.editor.Detach()
+			m.editorCache.Put(ws)
+		}
+		if ps != nil {
+			ps.editor.ClearFile()
+			ps.tabOrder = nil
+		}
+		m.focus.SetFocus(pane.PaneFocusID(m.mdPreviewPane))
+		m.resizeInlineEditor()
+		m.syncViewState()
+		m.syncFocusState()
+		m.statusBar.SetFlash("Closed pane")
+		return
+	}
+
+	m.closePaneForce(closingID)
+}
+
+// closePaneForce unconditionally closes the pane with the given ID.
+// Detaches the editor to cache and collapses the tree node.
+func (m *AppModel) closePaneForce(closingID pane.PaneID) {
+	ps := m.paneEditors[closingID]
+	if ps != nil && ps.editor.FilePath() != "" {
+		ws := ps.editor.Detach()
+		m.editorCache.Put(ws)
+	}
+
+	newFocus, ok := m.paneTree.Close(closingID)
+	if !ok {
+		return
+	}
+	delete(m.paneEditors, closingID)
+
+	// Move focus to the sibling. If the sibling is the preview pane,
+	// find the nearest editor pane instead (focusedPane must be an editor).
+	if _, isEditor := m.paneEditors[newFocus]; isEditor {
+		m.focusedPane = newFocus
+	} else {
+		for id := range m.paneEditors {
+			m.focusedPane = id
+			break
+		}
+	}
+	m.focusCodePanel()
+	m.resizeInlineEditor()
+	m.syncViewState()
+	m.syncFocusState()
+	m.statusBar.SetFlash("Closed pane")
+}
+
+// openFromPreview promotes the previewed file to an editor tab.
+// Closes the preview and opens the file via the standard FileOpenMsg pipeline.
+func (m *AppModel) openFromPreview() tea.Cmd {
+	path := m.previewPanel.FilePath()
+	lang := m.previewPanel.Language()
+	m.dismissPreview()
+
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     path,
+			Language: lang,
+		}
+	}
+}
+
+// overlayMdTooltipOnContent overlays the markdown "Preview" tooltip on the
+// rendered code panel content when a markdown tab is being hovered.
+func (m *AppModel) overlayMdTooltipOnContent(content string) string {
+	if m.mdTooltipTab < 0 || m.mdTooltipPane == 0 {
+		return content
+	}
+	rows := m.mdTooltipRows()
+	lines := strings.Split(content, "\n")
+	// The divider sits at row 1 (second row of the 2-row tab bar).
+	// Place the tooltip starting on row 2 (first content row below the divider).
+	overlayMdTooltipRows(lines, rows, m.mdTooltipX, tabbar.Height-1)
+	return strings.Join(lines, "\n")
+}
+
+// overlayBlockedChord prepends the blocked-chord hint bar to content when a
+// chord was triggered in edit mode. Trims content from the bottom so the total
+// line count stays within the panel's inner height.
+func (m *AppModel) overlayBlockedChord(content string) string {
+	th := m.config.Theme()
+	hint := m.blockedChordHint(th)
+	if hint == "" {
+		return content
+	}
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(w-panelBorderSize, 1)
+	innerH := max(h-panelBorderSize, 1)
+	hintWidth := lipgloss.Width(hint)
+	pad := max(innerW-hintWidth, 0)
+	divider := lipgloss.NewStyle().
+		Foreground(th.Palette.Border).
+		Render(strings.Repeat("\u2500", innerW))
+
+	lines := strings.Split(content, "\n")
+	maxContent := max(innerH-chordHintLines, 0)
+	if len(lines) > maxContent {
+		lines = lines[:maxContent]
+	}
+	return strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + strings.Join(lines, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Tab bar
+// ---------------------------------------------------------------------------
+
+// tabBarView renders the tab bar. Returns "" when there are no tabs.
+func (m *AppModel) tabBarView() string {
+	if len(m.focusedTabOrder()) == 0 {
+		return ""
+	}
+	return tabbar.View(m.tabBarConfig())
+}
+
+// appendTab adds a file path to the tab order if not already present.
+func (m *AppModel) appendTab(path string) {
+	for _, p := range m.focusedTabOrder() {
+		if p == path {
+			return
+		}
+	}
+	ps := m.paneEditors[m.focusedPane]
+	ps.tabOrder = append(ps.tabOrder, path)
+}
+
+// isExistingTab reports whether path is already open as a tab in any pane.
+func (m *AppModel) isExistingTab(path string) bool {
+	pid, _ := m.findPaneWithTab(path)
+	return pid != 0
+}
+
+// findPaneWithTab searches all editor panes for a tab matching the given
+// path. Returns the PaneID and tab index, or (0, -1) if not found.
+func (m *AppModel) findPaneWithTab(path string) (pane.PaneID, int) {
+	for id, ps := range m.paneEditors {
+		for i, p := range ps.tabOrder {
+			if p == path {
+				return id, i
+			}
+		}
+	}
+	return 0, -1
+}
+
+// removeTab removes a file path from the tab order.
+func (m *AppModel) removeTab(path string) {
+	ps := m.paneEditors[m.focusedPane]
+	for i, p := range ps.tabOrder {
+		if p == path {
+			ps.tabOrder = slices.Delete(ps.tabOrder, i, i+1)
+			return
+		}
+	}
+}
+
+// appendTabToPane adds path to the given pane's tab order if not already present.
+func (m *AppModel) appendTabToPane(pid pane.PaneID, path string) {
+	ps := m.paneEditors[pid]
+	if ps == nil || slices.Contains(ps.tabOrder, path) {
+		return
+	}
+	ps.tabOrder = append(ps.tabOrder, path)
+}
+
+// openFileCmd returns a tea.Cmd that emits a FileOpenMsg for the given path.
+func (m *AppModel) openFileCmd(path string) tea.Cmd {
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     path,
+			Name:     filepath.Base(path),
+			Language: detectEditorLanguage(path),
+		}
+	}
+}
+
+// finalizeCrossPaneDrop executes a cross-pane tab drop if one is pending.
+// Returns nil if no cross-pane drop occurred.
+func (m *AppModel) finalizeCrossPaneDrop() tea.Cmd {
+	if m.tabDragIdx < 0 || m.tabDropTarget == 0 {
+		return nil
+	}
+	if m.tabDragSourcePane == m.previewPane {
+		return m.movePreviewToPane(m.tabDropTarget)
+	}
+	return m.moveTabToPane(m.tabDragSourcePane, m.tabDragIdx, m.tabDropTarget)
+}
+
+// moveTabToPane transfers tab at srcIdx from srcPID to dstPID.
+func (m *AppModel) moveTabToPane(srcPID pane.PaneID, srcIdx int, dstPID pane.PaneID) tea.Cmd {
+	srcPS := m.paneEditors[srcPID]
+	if srcPS == nil || srcIdx >= len(srcPS.tabOrder) {
+		return nil
+	}
+	path := srcPS.tabOrder[srcIdx]
+
+	// Transfer: remove from source, append to target.
+	srcPS.tabOrder = slices.Delete(srcPS.tabOrder, srcIdx, srcIdx+1)
+	m.appendTabToPane(dstPID, path)
+
+	// Handle source pane post-removal.
+	m.reconcileSourcePane(srcPID, path)
+
+	// Focus target pane and open the file.
+	m.focusedPane = dstPID
+	m.focusCodePanel()
+	m.syncFocusState()
+	m.resizeInlineEditor()
+	return m.openFileCmd(path)
+}
+
+// movePreviewToPane promotes the previewed file to an editor tab in dstPID.
+func (m *AppModel) movePreviewToPane(dstPID pane.PaneID) tea.Cmd {
+	path := m.previewPanel.FilePath()
+	if path == "" {
+		return nil
+	}
+	m.appendTabToPane(dstPID, path)
+	m.dismissPreview()
+
+	m.focusedPane = dstPID
+	m.focusCodePanel()
+	m.syncFocusState()
+	m.resizeInlineEditor()
+	return m.openFileCmd(path)
+}
+
+// reconcileSourcePane adjusts the source pane after a tab was removed.
+// If empty, closes the pane. If the active tab was removed, switches to adjacent.
+func (m *AppModel) reconcileSourcePane(srcPID pane.PaneID, removedPath string) {
+	srcPS := m.paneEditors[srcPID]
+	if len(srcPS.tabOrder) == 0 {
+		m.closePaneForce(srcPID)
+		return
+	}
+	if srcPS.editor.FilePath() != removedPath {
+		return
+	}
+	nextIdx := min(m.tabDragIdx, len(srcPS.tabOrder)-1)
+	m.switchPaneToTab(srcPID, nextIdx)
+}
+
+// switchPaneToTab detaches the current editor in the given pane and loads
+// the tab at the specified index from that pane's tab order.
+func (m *AppModel) switchPaneToTab(pid pane.PaneID, idx int) {
+	ps := m.paneEditors[pid]
+	if ps == nil || idx < 0 || idx >= len(ps.tabOrder) {
+		return
+	}
+	if ps.editor.FilePath() != "" {
+		ws := ps.editor.Detach()
+		m.editorCache.Put(ws)
+	}
+	m.loadFileIntoPane(pid, ps.tabOrder[idx])
+}
+
+// loadFileIntoPane loads a file into the specified pane's editor, using
+// the tiered cache if available, otherwise reading from disk.
+func (m *AppModel) loadFileIntoPane(pid pane.PaneID, path string) {
+	ps := m.paneEditors[pid]
+	if ps == nil {
+		return
+	}
+	entry, ok := m.editorCache.Take(path)
+	if ok && entry.IsWarm() {
+		ps.editor.AttachWarm(entry.Warm())
+		return
+	}
+	if ok {
+		ps.editor.AttachCold(entry.Cold())
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	ps.editor.OpenFile(path, string(data), detectEditorLanguage(path))
+}
+
+// activeTabIndex returns the index of the active file in tabOrder.
+func (m *AppModel) activeTabIndex() int {
+	current := m.focusedEditor().FilePath()
+	for i, p := range m.focusedTabOrder() {
+		if p == current {
+			return i
+		}
+	}
+	return 0
+}
+
+// handleTabBarClick processes a click on the tab bar: close-icon clicks close
+// the tab, other clicks begin a drag (and switch to the tab on release if no
+// reordering occurred).
+func (m *AppModel) handleTabBarClick(viewX int) (bool, tea.Cmd) {
+	cfg := m.tabBarConfig()
+	hit := tabbar.HitTest(cfg, viewX)
+	if hit.IsLeftNav {
+		m.tabArrowFlashLeftUntil = time.Now().Add(tabArrowFlashDuration)
+		return true, m.prevTab()
+	}
+	if hit.IsRightNav {
+		m.tabArrowFlashRightUntil = time.Now().Add(tabArrowFlashDuration)
+		return true, m.nextTab()
+	}
+	if hit.TabIndex < 0 || hit.TabIndex >= len(m.focusedTabOrder()) {
+		return true, nil
+	}
+	if hit.IsClose {
+		return true, m.closeTab(hit.TabIndex)
+	}
+	// Begin drag and immediately switch to the pressed tab.
+	m.tabDragIdx = hit.TabIndex
+	m.tabDragSourcePane = m.focusedPane
+	return true, m.switchToTab(hit.TabIndex)
+}
+
+// handleTabDragReorder performs intra-pane tab reordering during a drag.
+func (m *AppModel) handleTabDragReorder(localX int) (bool, tea.Cmd) {
+	ps := m.paneEditors[m.tabDragSourcePane]
+	if ps == nil {
+		return true, nil
+	}
+	r, hasPaneRect := m.focusedPaneRect()
+	var cfg tabbar.Config
+	if hasPaneRect {
+		cfg = m.paneTabBarConfig(m.tabDragSourcePane, r.W)
+	} else {
+		cfg = m.tabBarConfig()
+	}
+	hit := tabbar.HitTest(cfg, localX)
+	if hit.TabIndex >= 0 && hit.TabIndex != m.tabDragIdx && hit.TabIndex < len(ps.tabOrder) {
+		ps.tabOrder[m.tabDragIdx], ps.tabOrder[hit.TabIndex] = ps.tabOrder[hit.TabIndex], ps.tabOrder[m.tabDragIdx]
+		m.tabDragIdx = hit.TabIndex
+	}
+	return true, nil
+}
+
+// updateTabHoverClose updates the tab close-icon hover state from a motion event.
+// Handles multi-pane, split preview, and full-preview modes.
+func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
+	// Save tooltip state — restored if the mouse is still inside the tooltip.
+	savedTooltipTab := m.mdTooltipTab
+	savedTooltipPane := m.mdTooltipPane
+	savedTooltipX := m.mdTooltipX
+
+	m.tabHoverClose = -1
+	m.tabHoverPane = 0
+	m.previewTabHoverClose = -1
+	m.mdPreviewTabHoverClose = -1
+	m.mdTooltipTab = -1
+	m.mdTooltipPane = 0
+
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return
+	}
+
+	// Multi-pane mode: use tree-based hit testing.
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
+		if !ok {
+			return
+		}
+		// Mouse is below the tab bar — check if it's inside the tooltip.
+		if localY >= tabbar.Height {
+			if savedTooltipTab >= 0 && savedTooltipPane == pid &&
+				localY < tabbar.Height+mdTooltipHeight &&
+				localX >= savedTooltipX && localX < savedTooltipX+mdTooltipWidth {
+				m.mdTooltipTab = savedTooltipTab
+				m.mdTooltipPane = savedTooltipPane
+				m.mdTooltipX = savedTooltipX
+			}
+			return
+		}
+		if pid == m.previewPane {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.previewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Preview: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.IsClose {
+				m.previewTabHoverClose = hit.TabIndex
+			}
+			return
+		}
+		if pid == m.mdPreviewPane {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.mdPreviewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Markdown: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.IsClose {
+				m.mdPreviewTabHoverClose = hit.TabIndex
+			}
+			return
+		}
+		ps, exists := m.paneEditors[pid]
+		if !exists || len(ps.tabOrder) == 0 {
+			return
+		}
+		area := m.paneContentArea()
+		rects := m.paneTree.ComputeLayout(area)
+		r := rects[pid]
+		cfg := m.paneTabBarConfig(pid, r.W)
+		hit := tabbar.HitTest(cfg, localX)
+		if hit.IsClose {
+			m.tabHoverPane = pid
+			m.tabHoverClose = hit.TabIndex
+		}
+		m.updateMdTooltip(pid, hit, cfg)
+		return
+	}
+
+	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+	if viewY >= tabbar.Height {
+		// Preserve tooltip if mouse is inside its bounds.
+		if savedTooltipTab >= 0 && savedTooltipPane == m.focusedPane &&
+			viewY < m.tabBarHeight()+mdTooltipHeight &&
+			viewX >= savedTooltipX && viewX < savedTooltipX+mdTooltipWidth {
+			m.mdTooltipTab = savedTooltipTab
+			m.mdTooltipPane = savedTooltipPane
+			m.mdTooltipX = savedTooltipX
+		}
+		return
+	}
+
+	// Full preview mode: entire code panel is preview.
+	if m.hasPreview() && m.editMode && len(m.focusedTabOrder()) == 0 {
+		hit := tabbar.HitTest(m.previewTabBarConfig(), viewX)
+		if hit.IsClose {
+			m.previewTabHoverClose = hit.TabIndex
+		}
+		return
+	}
+
+	// Split mode: preview on left half.
+	if m.hasPreview() && m.isInsidePreviewHalf(mouse.X) {
+		hit := tabbar.HitTest(m.previewTabBarConfig(), viewX)
+		if hit.IsClose {
+			m.previewTabHoverClose = hit.TabIndex
+		}
+		return
+	}
+
+	// Editor tab bar (right half in split mode, or full panel without preview).
+	if m.tabBarHeight() == 0 {
+		return
+	}
+	editorX := viewX
+	if pw := m.previewSplitWidth(); pw > 0 {
+		editorX -= pw + 1 // offset past preview + divider
+	}
+	cfg := m.tabBarConfig()
+	hit := tabbar.HitTest(cfg, editorX)
+	if hit.IsClose {
+		m.tabHoverPane = m.focusedPane
+		m.tabHoverClose = hit.TabIndex
+	}
+	m.updateMdTooltip(m.focusedPane, hit, cfg)
+}
+
+// updateMdTooltip sets the markdown tooltip state when hovering a markdown
+// file tab (not the close icon).
+func (m *AppModel) updateMdTooltip(pid pane.PaneID, hit tabbar.HitResult, cfg tabbar.Config) {
+	if hit.TabIndex < 0 || hit.IsClose {
+		return
+	}
+	ps := m.paneEditors[pid]
+	if ps == nil || hit.TabIndex >= len(ps.tabOrder) {
+		return
+	}
+	path := ps.tabOrder[hit.TabIndex]
+	if !isMarkdownFile(path) {
+		return
+	}
+	startX, _ := tabbar.TabBounds(cfg, hit.TabIndex)
+	m.mdTooltipTab = hit.TabIndex
+	m.mdTooltipPane = pid
+	m.mdTooltipX = startX
+}
+
+// mdTooltipRows returns the 3 rows (top border, content, bottom border) of
+// the markdown "Preview" tooltip popup.
+func (m *AppModel) mdTooltipRows() [3]string {
+	th := m.config.Theme()
+	border := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg).
+		Foreground(th.Palette.Border)
+	icon := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg).
+		Foreground(th.Palette.Accent)
+	label := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg).
+		Foreground(th.Palette.Primary).
+		Bold(true)
+	pad := lipgloss.NewStyle().
+		Background(th.Palette.PopupBg)
+
+	inner := mdTooltipWidth - 2 // subtract left+right border columns
+	topBot := border.Render("╭") + border.Render(strings.Repeat("─", inner)) + border.Render("╮")
+	bottom := border.Render("╰") + border.Render(strings.Repeat("─", inner)) + border.Render("╯")
+	content := border.Render("│") + pad.Render(" ") + icon.Render("◇") + label.Render("  Preview ") + pad.Render(" ") + border.Render("│")
+	return [3]string{topBot, content, bottom}
+}
+
+// mdTooltipWidth is the visual width of the tooltip.
+// Derived from: "│" (1) + " " (1) + "◇" (1) + "  Preview " (10) + " " (1) + "│" (1) = 15.
+const mdTooltipWidth = 15
+
+// mdTooltipHeight is the number of rows the tooltip occupies.
+const mdTooltipHeight = 3
+
+// overlayMdTooltipRows splices the 3-row tooltip popup into content lines
+// below the hovered markdown tab. dividerRow is the tab bar divider row index.
+func overlayMdTooltipRows(lines []string, rows [3]string, col, dividerRow int) {
+	startRow := dividerRow + 1
+	for i, tooltipRow := range rows {
+		row := startRow + i
+		if row < 0 || row >= len(lines) {
+			continue
+		}
+		orig := lines[row]
+		origW := lipgloss.Width(orig)
+		if col >= origW {
+			continue
+		}
+		left := truncateStyledN(orig, col)
+		right := skipStyledN(orig, col+mdTooltipWidth)
+		lines[row] = left + tooltipRow + right
+	}
+}
+
+// updateFileTreeTabHover updates the tab close-icon hover state in the
+// file tree's tabs panel from a mouse motion event.
+func (m *AppModel) updateFileTreeTabHover(mouse tea.MouseMsg) {
+	if !m.fileTree.InTabsMode() || !m.isFileTreeVisible() {
+		m.fileTree.ClearTabCloseHover()
+		return
+	}
+	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)
+	if treeW == 0 || treeH == 0 {
+		m.fileTree.ClearTabCloseHover()
+		return
+	}
+	treeX := m.fileTreePanelX()
+	innerH := max(treeH-panelBorderSize, 0)
+	contentLeft := treeX + 1
+	contentRight := treeX + treeW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if mouse.X < contentLeft || mouse.X >= contentRight ||
+		mouse.Y < contentTop || mouse.Y >= contentBottom {
+		m.fileTree.ClearTabCloseHover()
+		return
+	}
+	viewX := mouse.X - contentLeft
+	viewY := mouse.Y - contentTop
+	m.fileTree.HoverAt(viewX, viewY)
+}
+
+// tabBarConfig builds the tabbar.Config for the current state.
+func (m *AppModel) tabBarConfig() tabbar.Config {
+	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+
+	// In split mode the editor tab bar occupies only the right half.
+	barWidth := innerW
+	if m.hasPreview() && m.editMode && len(m.focusedTabOrder()) > 0 {
+		dividerWidth := 1
+		previewW := (innerW - dividerWidth) / 2
+		barWidth = innerW - dividerWidth - previewW
+	}
+
+	tabs := make([]tabbar.Tab, len(m.focusedTabOrder()))
+	currentPath := m.focusedEditor().FilePath()
+	activeIdx := 0
+	for i, path := range m.focusedTabOrder() {
+		modified := false
+		if path == currentPath {
+			activeIdx = i
+			modified = m.focusedEditor().Modified()
+		} else {
+			modified = m.editorCache.IsModified(path)
+		}
+		tabs[i] = tabbar.Tab{Path: path, Modified: modified}
+	}
+
+	return tabbar.Config{
+		Tabs:       tabs,
+		Active:     activeIdx,
+		Width:      barWidth,
+		NerdFonts:  m.nerdFontsDetected,
+		Theme:      m.config.Theme(),
+		FlashLeft:  time.Now().Before(m.tabArrowFlashLeftUntil),
+		FlashRight: time.Now().Before(m.tabArrowFlashRightUntil),
+		HoverClose: m.tabHoverClose,
+		Focused:    m.hasPreview() && m.isEditorFocused(),
+		DimActive:  m.hasPreview() && !m.isEditorFocused(),
+	}
+}
+
+// tabBarHeight returns the tab bar height (tabs + divider) when visible, 0 otherwise.
+func (m *AppModel) tabBarHeight() int {
+	if len(m.focusedTabOrder()) > 0 {
+		return tabbar.Height
+	}
+	return 0
+}
+
+// resizeInlineEditor re-applies the correct size to the inline editor,
+// accounting for the current tab bar visibility and preview split.
+// Call after any tab mutation.
+func (m *AppModel) resizeInlineEditor() {
+	if !m.editMode {
+		return
+	}
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	// Delegate to resizeCodePanelForPreview which handles split-mode sizing.
+	m.resizeCodePanelForPreview(rightW, rightH)
+}
+
+// switchToTab switches the editor to the tab at the given index.
+func (m *AppModel) switchToTab(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(m.focusedTabOrder()) {
+		return nil
+	}
+	target := m.focusedTabOrder()[idx]
+	if target == m.focusedEditor().FilePath() {
+		return nil
+	}
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:     target,
+			Name:     filepath.Base(target),
+			Language: detectEditorLanguage(target),
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Warp point methods
+// ---------------------------------------------------------------------------
+
+// setWarpPoint stores the current editor position as warp point idx (0-indexed).
+func (m *AppModel) setWarpPoint(idx int) {
+	fp := m.focusedEditor().FilePath()
+	if fp == "" {
+		return
+	}
+	line := m.focusedEditor().CursorLine()
+	col := m.focusedEditor().CursorCol()
+	startCol, endCol := m.focusedEditor().WordBoundsAt(line, col)
+	if startCol == endCol {
+		// Cursor not on a word — highlight just the single character.
+		endCol = col + 1
+		startCol = col
+	}
+	m.warpPoints[idx] = &WarpPoint{
+		Path:     fp,
+		Line:     line,
+		Col:      col,
+		StartCol: startCol,
+		EndCol:   endCol,
+	}
+	m.syncEditorWarpLines()
+}
+
+// clearWarpPoint removes warp point idx (0-indexed).
+func (m *AppModel) clearWarpPoint(idx int) {
+	m.warpPoints[idx] = nil
+	m.syncEditorWarpLines()
+}
+
+// teleportToWarp navigates to the warp point at idx via FileOpenMsg.
+func (m *AppModel) teleportToWarp(idx int) tea.Cmd {
+	wp := m.warpPoints[idx]
+	if wp == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		return msg.FileOpenMsg{
+			Path:      wp.Path,
+			Name:      filepath.Base(wp.Path),
+			Language:  detectEditorLanguage(wp.Path),
+			Line:      wp.Line + 1, // FileOpenMsg uses 1-based line.
+			CursorCol: wp.Col,
+		}
+	}
+}
+
+// syncEditorWarpLines updates the editor's warp line indicators to reflect
+// the current warp points for the active file.
+func (m *AppModel) syncEditorWarpLines() {
+	fp := m.focusedEditor().FilePath()
+	if fp == "" {
+		m.focusedEditor().SetWarpLines(nil)
+		return
+	}
+	var warpMap map[int]editor.WarpLineInfo
+	for i, wp := range m.warpPoints {
+		if wp == nil || wp.Path != fp {
+			continue
+		}
+		if warpMap == nil {
+			warpMap = make(map[int]editor.WarpLineInfo)
+		}
+		warpMap[wp.Line] = editor.WarpLineInfo{
+			Slot:     i + 1, // 1-indexed slot number for display.
+			StartCol: wp.StartCol,
+			EndCol:   wp.EndCol,
+		}
+	}
+	m.focusedEditor().SetWarpLines(warpMap)
+}
+
+// nextTab switches to the next tab (wraps around).
+func (m *AppModel) nextTab() tea.Cmd {
+	if len(m.focusedTabOrder()) < 2 {
+		return nil
+	}
+	idx := (m.activeTabIndex() + 1) % len(m.focusedTabOrder())
+	return m.switchToTab(idx)
+}
+
+// prevTab switches to the previous tab (wraps around).
+func (m *AppModel) prevTab() tea.Cmd {
+	if len(m.focusedTabOrder()) < 2 {
+		return nil
+	}
+	idx := (m.activeTabIndex() - 1 + len(m.focusedTabOrder())) % len(m.focusedTabOrder())
+	return m.switchToTab(idx)
+}
+
+// tabNavRight navigates to the next tab. When the active tab is at the
+// right edge of the visible window, it page-jumps to the first tab on
+// the next visible page instead of stepping by one.
+func (m *AppModel) tabNavRight() tea.Cmd {
+	n := len(m.focusedTabOrder())
+	if n < 2 {
+		return nil
+	}
+	active := m.activeTabIndex()
+	cfg := m.tabBarConfig()
+	_, hi := tabbar.VisibleRange(cfg)
+
+	// All tabs visible or not at right edge: simple step.
+	if hi >= n-1 || active < hi {
+		return m.switchToTab((active + 1) % n)
+	}
+
+	// At right edge of overflow window — page forward.
+	// Simulate centering on hi+1 to find the new visible page.
+	cfg.Active = hi + 1
+	newLo, _ := tabbar.VisibleRange(cfg)
+	return m.switchToTab(newLo)
+}
+
+// tabNavLeft navigates to the previous tab. When the active tab is at the
+// left edge of the visible window, it page-jumps to the last tab on the
+// previous visible page instead of stepping by one.
+func (m *AppModel) tabNavLeft() tea.Cmd {
+	n := len(m.focusedTabOrder())
+	if n < 2 {
+		return nil
+	}
+	active := m.activeTabIndex()
+	cfg := m.tabBarConfig()
+	lo, _ := tabbar.VisibleRange(cfg)
+
+	// All tabs visible or not at left edge: simple step.
+	if lo <= 0 || active > lo {
+		return m.switchToTab((active - 1 + n) % n)
+	}
+
+	// At left edge of overflow window — page backward.
+	// Simulate centering on lo-1 to find the new visible page.
+	cfg.Active = lo - 1
+	_, newHi := tabbar.VisibleRange(cfg)
+	return m.switchToTab(newHi)
+}
+
+// toggleTabsPanel toggles the tabs list view in the file tree panel.
+// When entering, saves current focus and focuses the file tree.
+// When exiting, restores the previously focused panel.
+func (m *AppModel) toggleTabsPanel() tea.Cmd {
+	if m.fileTree.InTabsMode() {
+		m.fileTree.ExitTabs()
+		m.focus.SetFocus(m.preTabsFocus)
+		m.syncFocusState()
+		return nil
+	}
+	m.preTabsFocus = m.focus.Current()
+	m.fileTree.SetTabs(m.focusedTabOrder(), m.focusedEditor().FilePath(), m.tabModifiedSet())
+	if !m.isFileTreeVisible() {
+		m.leftRing.setTo(component.FocusFileTree)
+	}
+	m.focus.SetFocus(component.FocusFileTree)
+	m.syncFocusState()
+	return nil
+}
+
+// handleSavePromptKey processes y/n/esc while the save-before-close prompt
+// is active. All other keys are swallowed until the prompt is resolved.
+func (m *AppModel) handleSavePromptKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "y":
+		m.statusBar.ClearPrompt()
+		m.pendingClosePrompt = false
+		if pid := m.pendingPaneClose; pid != 0 {
+			m.pendingPaneClose = 0
+			m.saveEditorBuffer()
+			m.closePaneForce(pid)
+			return m, nil
+		}
+		m.saveEditorBuffer()
+		return m, m.closeCurrentTab(true)
+	case "n":
+		m.statusBar.ClearPrompt()
+		m.pendingClosePrompt = false
+		if pid := m.pendingPaneClose; pid != 0 {
+			m.pendingPaneClose = 0
+			m.closePaneForce(pid)
+			return m, nil
+		}
+		return m, m.closeCurrentTab(true)
+	case "esc":
+		m.statusBar.ClearPrompt()
+		m.pendingClosePrompt = false
+		m.pendingPaneClose = 0
+		return m, nil
+	default:
+		return m, nil
+	}
+}
+
+// closeCurrentTab closes the current tab and switches to an adjacent one.
+// If it was the last tab, clears the editor to show the placeholder.
+func (m *AppModel) closeCurrentTab(discard bool) tea.Cmd {
+	if !discard && m.focusedEditor().Modified() {
+		m.pendingClosePrompt = true
+		name := filepath.Base(m.focusedEditor().FilePath())
+		m.statusBar.SetPrompt("Save changes to " + name + "? (y)es (n)o")
+		return nil
+	}
+
+	path := m.focusedEditor().FilePath()
+	idx := m.activeTabIndex()
+
+	m.removeTab(path)
+	m.editorCache.Delete(path)
+
+	// Clear the editor so the subsequent detachCurrentEditor (in
+	// handleFileOpen) sees an empty file path and skips re-caching
+	// the discarded state.
+	if discard {
+		m.focusedEditor().ClearFile()
+	}
+
+	// Last tab closed — show placeholder, stay in edit mode.
+	if len(m.focusedTabOrder()) == 0 {
+		m.focusedEditor().ClearFile()
+		m.resizeInlineEditor()
+		m.refreshTabsPanel()
+		// In split mode, transition focus to the preview sub-panel
+		// since the editor sub-panel no longer has content.
+		if m.hasPreview() {
+			m.focus.SetFocus(pane.PaneFocusID(m.previewPane))
+			m.syncFocusState()
+		}
+		return nil
+	}
+
+	// Resize in case tab bar visibility changed.
+	m.resizeInlineEditor()
+	m.refreshTabsPanel()
+
+	// Switch to adjacent tab: prefer same index (right), fallback left.
+	next := min(idx, len(m.focusedTabOrder())-1)
+	return m.switchToTab(next)
+}
+
+// closeTab closes the tab at the given index. If it's the active tab, behaves
+// like closeCurrentTab(false). If it's a background tab, removes it silently.
+func (m *AppModel) closeTab(idx int) tea.Cmd {
+	if idx < 0 || idx >= len(m.focusedTabOrder()) {
+		return nil
+	}
+
+	path := m.focusedTabOrder()[idx]
+	activeIdx := m.activeTabIndex()
+
+	// If closing the active tab, check for unsaved changes.
+	if idx == activeIdx {
+		return m.closeCurrentTab(false)
+	}
+
+	// Background tab with unsaved changes: switch to it and prompt.
+	if m.editorCache.IsModified(path) {
+		cmd := m.switchToTab(idx)
+		m.pendingClosePrompt = true
+		name := filepath.Base(path)
+		m.statusBar.SetPrompt("Save changes to " + name + "? (y)es (n)o")
+		return cmd
+	}
+
+	m.removeTab(path)
+	m.editorCache.Delete(path)
+	m.resizeInlineEditor()
+	m.refreshTabsPanel()
+	return nil
+}
+
+// closeTabByPath finds a tab by path and closes it.
+func (m *AppModel) closeTabByPath(path string) tea.Cmd {
+	for i, p := range m.focusedTabOrder() {
+		if p == path {
+			return m.closeTab(i)
+		}
+	}
+	return nil
+}
+
+// refreshTabsPanel updates the file tree's tabs panel if it is currently
+// visible, keeping it in sync with the app's tabOrder.
+func (m *AppModel) refreshTabsPanel() {
+	if m.fileTree.InTabsMode() {
+		m.fileTree.SetTabs(m.focusedTabOrder(), m.focusedEditor().FilePath(), m.tabModifiedSet())
+	}
+}
+
+// refreshTabsModified updates the modified indicators in the tabs panel
+// without resetting cursor, scroll, or filter state.
+func (m *AppModel) refreshTabsModified() {
+	if m.fileTree.InTabsMode() {
+		m.fileTree.UpdateTabModified(m.tabModifiedSet())
+	}
+}
+
+// tabModifiedSet returns a set of paths with unsaved changes.
+func (m *AppModel) tabModifiedSet() map[string]bool {
+	currentPath := m.focusedEditor().FilePath()
+	mod := make(map[string]bool, len(m.focusedTabOrder()))
+	for _, path := range m.focusedTabOrder() {
+		if path == currentPath {
+			if m.focusedEditor().Modified() {
+				mod[path] = true
+			}
+		} else if m.editorCache.IsModified(path) {
+			mod[path] = true
+		}
+	}
+	return mod
+}
+
+// ---------------------------------------------------------------------------
+// Spring-based scroll
+// ---------------------------------------------------------------------------
+
+// scrollFPS is the simulation frame rate for the spring.
+// Derived from: tickFastInterval (16ms) ≈ 60 FPS.
+const scrollFPS = 60
+
+// scrollFrequency is the spring's angular frequency (rad/s).
+// Higher values produce snappier response; lower values produce smoother easing.
+// Derived from: settling in ~8 frames at 60fps ≈ 130ms of visible easing.
+const scrollFrequency = 30.0
+
+// scrollDamping is the spring's damping ratio.
+// 1.0 = critically damped (fastest approach without overshoot).
+// Derived from: critically damped to prevent scroll bounce-back.
+const scrollDamping = 1.0
+
+// scrollImpulse is the target displacement per mouse wheel tick.
+// Derived from: 3 lines per detent, matching common editor defaults.
+const scrollImpulse = 3.0
+
+// scrollKick is the velocity boost per unit of impulse.
+// Each wheel event adds impulse * scrollKick to the spring velocity,
+// so the first frame crosses an integer boundary immediately.
+// Derived from: v₀ = 3 × 15 = 45; with ω=30, B = v₀ + ω(x₀−x_eq) = 45−90 = −45 < 0,
+// guaranteeing monotonic approach without overshoot.
+const scrollKick = 15.0
+
+// scrollMaxLead is the maximum distance the target can lead the current position.
+// Prevents runaway accumulation from rapid scrolling.
+// Derived from: comfortable coast of ~1 second ≈ 30 lines.
+const scrollMaxLead = 30.0
+
+// scrollSettlePos is the position threshold for considering the spring settled.
+// Derived from: less than half a rendered line of residual error.
+const scrollSettlePos = 0.01
+
+// scrollSettleVel is the velocity threshold for considering the spring settled.
+// Derived from: negligible motion per frame at 60fps.
+const scrollSettleVel = 0.01
+
+// ---------------------------------------------------------------------------
+// Bounce-back spring (overscroll rubber band)
+// ---------------------------------------------------------------------------
+
+// bounceDamping is the bounce spring's damping ratio.
+// < 1.0 = underdamped: overshoots equilibrium, producing visible oscillation.
+// Derived from: 0.5 produces ~1 visible bounce-back. Low enough for a
+// visible elastic effect, high enough that the tail doesn't oscillate
+// through integer rounding boundaries (which causes flicker).
+const bounceDamping = 0.5
+
+// bounceFrequency is the bounce spring's angular frequency (rad/s).
+// Derived from: at 60fps with damping=0.5, frequency=14.5 settles in
+// ~22 frames (~375ms). omega_d = 14.5 * sqrt(1 - 0.25) = 12.56 rad/s.
+const bounceFrequency = 14.5
+
+// bounceImpulse is the velocity added to the bounce spring per boundary hit.
+// Derived from: peak displacement ≈ impulse / omega_d = 6.0 / 14.21 ≈ 0.42
+// lines per hit. With 3-5 rapid hits per gesture, accumulates to ~1.3-2.1 lines.
+const bounceImpulse = 6.0
+
+// bounceMaxLines is the maximum visual displacement in lines.
+// Derived from: 2 lines keeps content visually stable at the boundary while
+// still producing a noticeable rubber-band effect.
+const bounceMaxLines = 2.0
+
+// bounceMaxVel is the maximum velocity the bounce spring can accumulate.
+// Derived from: bounceMaxLines * omega_d = 2.0 * 12.56 ≈ 25.0, ensuring
+// peak displacement never exceeds bounceMaxLines.
+const bounceMaxVel = 25.0
+
+// bounceSettleThreshold is the combined position+velocity threshold for
+// considering the bounce settled.
+// Derived from: less than 1% of a rendered line, letting the spring's
+// natural exponential decay fully ease the bounce to rest.
+const bounceSettleThreshold = 0.01
+
+// ---------------------------------------------------------------------------
+// Horizontal swipe (ring cycling)
+// ---------------------------------------------------------------------------
+
+// swipeThreshold is the accumulated horizontal scroll ticks required to
+// trigger a ring cycle.
+// Derived from: 6 ticks requires a deliberate gesture (trackpads emit
+// 10-20 events per swipe), preventing accidental triggers.
+const swipeThreshold = 6.0
+
+// swipeDecay is the duration after which stale swipe accumulation resets.
+// Derived from: 300ms is long enough for a continuous trackpad gesture
+// but short enough that separate flicks don't combine.
+const swipeDecay = 300 * time.Millisecond
+
+// swipeCooldown is the dead period after a cycle fires during which
+// further swipe events are ignored. Prevents the tail end of a single
+// scroll gesture from immediately triggering a second cycle.
+// Derived from: 500ms exceeds a typical trackpad gesture duration (~300ms)
+// while feeling responsive for intentional repeated swipes.
+const swipeCooldown = 500 * time.Millisecond
+
+// handleMouse routes mouse wheel events to the panel under the cursor
+// using spring-based scrolling, handles click-to-copy on chat messages,
+// and handles text selection in the code panel.
+// Mouse events are consumed when a full-screen overlay is active.
+func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
+	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
+		switch mouse.Button {
+		case tea.MouseButtonWheelUp:
+			m.searchOverlay.ScrollUp()
+		case tea.MouseButtonWheelDown:
+			m.searchOverlay.ScrollDown()
+		}
+		return nil
+	}
+	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
+		switch mouse.Button {
+		case tea.MouseButtonWheelUp:
+			m.fieldManualOverlay.ScrollUp()
+		case tea.MouseButtonWheelDown:
+			m.fieldManualOverlay.ScrollDown()
+		}
+		return nil
+	}
+	if m.overlay == overlayModal {
+		return nil
+	}
+
+	// Route wheel events to the hover popup when it is active and the
+	// cursor is over it, instead of scrolling the underlying panel.
+	if m.editMode && m.focusedEditor().HoverActive() && isWheelEvent(mouse) {
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			// Check preview hover popup scroll first.
+			if m.previewPanel.HoverActive() {
+				pvx, pvy := m.previewPaneLocalCoords(mouse.X, mouse.Y)
+				pvy -= tabbar.Height
+				if m.previewPanel.IsInsideHoverPopup(pvx, pvy) {
+					switch mouse.Button {
+					case tea.MouseButtonWheelUp:
+						m.previewPanel.ScrollHoverUp()
+					case tea.MouseButtonWheelDown:
+						m.previewPanel.ScrollHoverDown()
+					}
+					return nil
+				}
+			}
+
+			vx, vy := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+			if len(m.focusedTabOrder()) > 0 {
+				vy -= tabbar.Height
+			}
+			vy -= m.focusedEditor().FindBarHeight()
+			if m.focusedEditor().IsInsideHoverPopup(vx, vy) {
+				switch mouse.Button {
+				case tea.MouseButtonWheelUp:
+					m.focusedEditor().ScrollHoverUp()
+				case tea.MouseButtonWheelDown:
+					m.focusedEditor().ScrollHoverDown()
+				}
+				return nil
+			}
+		}
+	}
+
+	// Handle motion events for hover before button-specific routing.
+	// Some terminals send MouseButtonLeft for motion after a click-release
+	// instead of MouseButtonNone. Routing hover here ensures it works
+	// regardless of reported button, as long as we're not mid-drag.
+	if m.editMode && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown && m.tabDragIdx < 0 {
+		m.updateTabHoverClose(mouse)
+		m.updateFileTreeTabHover(mouse)
+		return m.handleEditorMouseHover(mouse)
+	}
+
+	switch mouse.Button {
+	case tea.MouseButtonWheelUp:
+		if mouse.Alt {
+			m.applySwipeImpulse(mouse.X, -1)
+		} else {
+			m.applyScrollImpulse(mouse.X, mouse.Y, -scrollImpulse)
+		}
+	case tea.MouseButtonWheelDown:
+		if mouse.Alt {
+			m.applySwipeImpulse(mouse.X, 1)
+		} else {
+			m.applyScrollImpulse(mouse.X, mouse.Y, scrollImpulse)
+		}
+	case tea.MouseButtonWheelLeft:
+		m.applySwipeImpulse(mouse.X, -1)
+	case tea.MouseButtonWheelRight:
+		m.applySwipeImpulse(mouse.X, 1)
+	case tea.MouseButtonLeft:
+		return m.handleLeftClick(mouse)
+	}
+	return nil
+}
+
+// isWheelEvent reports whether the mouse event is a scroll wheel action.
+func isWheelEvent(mouse tea.MouseMsg) bool {
+	return mouse.Button == tea.MouseButtonWheelUp ||
+		mouse.Button == tea.MouseButtonWheelDown
+}
+
+// handleLeftClick dispatches left-button events to the file tree,
+// inline editor (in edit mode), and chat panels.
+func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
+	// Edit mode: handle press, drag, and release in the code panel.
+	if m.editMode {
+		if consumed, cmd := m.handleEditorMouse(mouse); consumed {
+			return cmd
+		}
+	}
+
+	if mouse.Action != tea.MouseActionPress {
+		return nil
+	}
+	if cmd := m.handleFileTreeClick(mouse.X, mouse.Y); cmd != nil {
+		return cmd
+	}
+	return m.handleChatClick(mouse.X, mouse.Y)
+}
+
+// panelForScroll resolves the panel under screen coordinate x, accounting
+// for ring-swapped panels that PanelAtX doesn't know about.
+// In SingleColumn mode PanelAtX has no candidates and always returns false,
+// so we fall back to the active leftRing panel. In TwoColumn/ThreeColumn
+// modes the fixed candidate IDs are mapped to the current ring occupant.
+func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
+	mode := m.layout.Mode()
+
+	if mode == layout.SingleColumn {
+		if m.leftRing.empty() {
+			return 0, false
+		}
+		return m.leftRing.current(), true
+	}
+
+	panelID, ok := m.layout.PanelAtX(x)
+	if !ok {
+		return 0, false
+	}
+
+	resolved := m.resolveRingPanel(panelID, mode)
+
+	// In edit mode, route scrolls within the code panel to the pane
+	// under the cursor using tree-based hit testing.
+	if resolved == component.FocusCodeViewer && m.editMode && m.paneTree != nil {
+		// Full markdown preview mode: all scrolls go to the mdPreview.
+		if m.isFullMdPreview() {
+			return pane.PaneFocusID(m.mdPreviewPane), true
+		}
+		if pid, ok := m.hitTestPane(x, y); ok {
+			return pane.PaneFocusID(pid), true
+		}
+	}
+
+	return resolved, true
+}
+
+// resolveRingPanel maps a fixed candidate panel ID to the actual panel
+// currently showing in that slot due to ring cycling.
+func (m *AppModel) resolveRingPanel(id component.FocusID, mode layout.LayoutMode) component.FocusID {
+	switch mode {
+	case layout.ThreeColumn:
+		if id == component.FocusSessionPanel && !m.leftRing.empty() {
+			return m.leftRing.current()
+		}
+	case layout.TwoColumn:
+		if id == component.FocusSessionPanel && !m.leftRing.empty() {
+			return m.leftRing.current()
+		}
+		if id == component.FocusChat && !m.rightRing.empty() {
+			return m.rightRing.current()
+		}
+	}
+	return id
+}
+
+// applyScrollImpulse adds displacement and velocity to the spring for the
+// panel at screen coordinates (x, y). The velocity kick ensures the first
+// frame crosses an integer line boundary, giving immediate visual feedback.
+// Switching panels resets the spring to avoid cross-panel drift.
+func (m *AppModel) applyScrollImpulse(x, y int, impulse float64) {
+	panelID, ok := m.panelForScroll(x, y)
+	if !ok {
+		return
+	}
+	// In edit mode, scroll the inline editor instead of the code viewer.
+	// The spring pipeline dispatches to editor.ScrollUp/ScrollDown via scrollOneLine.
+	if panelID != m.scroll.panel {
+		m.scroll = scrollState{panel: panelID}
+		m.bounce = bounceState{panel: panelID}
+	}
+	m.scroll.target += impulse
+	m.scroll.vel += impulse * scrollKick
+
+	// Cap target lead to prevent runaway coast.
+	m.scroll.target = clampFloat(m.scroll.target,
+		m.scroll.pos-scrollMaxLead,
+		m.scroll.pos+scrollMaxLead,
+	)
+	// Cap velocity to prevent overshoot (B ≤ 0 condition for critically damped).
+	maxVel := scrollFrequency * math.Abs(m.scroll.target-m.scroll.pos)
+	m.scroll.vel = clampFloat(m.scroll.vel, -maxVel, maxVel)
+}
+
+// tickScrollMomentum advances the scroll spring by one frame and applies
+// resulting scroll lines. Boundary hits feed the bounce spring.
+func (m *AppModel) tickScrollMomentum() {
+	s := &m.scroll
+	if !s.settled() {
+		s.pos, s.vel = m.scrollSpring.Update(s.pos, s.vel, s.target)
+
+		// Snap when close enough to prevent asymptotic crawl.
+		if s.settled() {
+			s.pos = s.target
+			s.vel = 0
+		}
+
+		newApplied := int(math.Round(s.pos))
+		m.applyScrollDelta(s.panel, newApplied-s.applied)
+		s.applied = newApplied
+	}
+
+	m.tickBounce()
+
+	// Push bounce offset to panels for rendering.
+	m.chat.SetBounceOffset(m.bounceOffset(component.FocusChat))
+	m.codePanel.SetBounceOffset(m.bounceOffset(component.FocusCodeViewer))
+	// Push pane-specific bounce offsets.
+	for id, ps := range m.paneEditors {
+		ps.editor.SetBounceOffset(m.bounceOffset(pane.PaneFocusID(id)))
+	}
+	if m.previewPane != 0 {
+		m.previewPanel.SetBounceOffset(m.bounceOffset(pane.PaneFocusID(m.previewPane)))
+	}
+	m.fileTree.SetBounceOffset(m.bounceOffset(component.FocusFileTree))
+}
+
+// settled reports whether the spring is close enough to target to stop.
+func (s *scrollState) settled() bool {
+	return math.Abs(s.pos-s.target) < scrollSettlePos &&
+		math.Abs(s.vel) < scrollSettleVel
+}
+
+// applyScrollDelta dispatches individual line scrolls. When a boundary is
+// hit, the remaining delta is converted into bounce impulse.
+func (m *AppModel) applyScrollDelta(panelID component.FocusID, delta int) {
+	direction := 1
+	if delta < 0 {
+		direction = -1
+		delta = -delta
+	}
+	for range delta {
+		if !m.scrollOneLine(panelID, direction) {
+			m.applyBounceImpulse(panelID, direction)
+		}
+	}
+}
+
+// scrollOneLine scrolls the identified panel by one line in the given direction.
+// Returns true if the scroll was consumed, false if the panel hit a boundary.
+func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool {
+	switch panelID {
+	case component.FocusChat:
+		if direction < 0 {
+			return m.chat.ScrollUp()
+		}
+		return m.chat.ScrollDown()
+	case component.FocusCodeViewer:
+		if m.gitMode && m.commitTree != nil {
+			if direction < 0 {
+				return m.commitTree.ScrollUp()
+			}
+			return m.commitTree.ScrollDown()
+		}
+		if direction < 0 {
+			return m.codePanel.ScrollUp()
+		}
+		return m.codePanel.ScrollDown()
+	case component.FocusFileTree:
+		if m.gitMode && m.gitPanel != nil {
+			if direction < 0 {
+				return m.gitPanel.ScrollUp()
+			}
+			return m.gitPanel.ScrollDown()
+		}
+		if direction < 0 {
+			return m.fileTree.ScrollUp()
+		}
+		return m.fileTree.ScrollDown()
+	case component.FocusSessionPanel:
+		// Left column contains both session and agent panels; scroll goes to agent
+		// only when it has scrollable content (expanded/detail views).
+		if direction < 0 {
+			return m.agentPanel.ScrollUp()
+		}
+		return m.agentPanel.ScrollDown()
+	case component.FocusGitPanel:
+		if m.gitPanel == nil {
+			return true
+		}
+		if direction < 0 {
+			return m.gitPanel.ScrollUp()
+		}
+		return m.gitPanel.ScrollDown()
+	case component.FocusCommitTree:
+		if m.commitTree == nil {
+			return true
+		}
+		if direction < 0 {
+			return m.commitTree.ScrollUp()
+		}
+		return m.commitTree.ScrollDown()
+	default:
+		if !pane.IsPaneFocus(panelID) {
+			return true
+		}
+		pid := pane.PaneIDFromFocus(panelID)
+		if pid == m.previewPane {
+			if direction < 0 {
+				return m.previewPanel.ScrollUp(1)
+			}
+			return m.previewPanel.ScrollDown(1)
+		}
+		if pid == m.mdPreviewPane {
+			if direction < 0 {
+				return m.mdPreviewPanel.ScrollUp(1)
+			}
+			return m.mdPreviewPanel.ScrollDown(1)
+		}
+		if ps, ok := m.paneEditors[pid]; ok {
+			if direction < 0 {
+				return ps.editor.ScrollUp()
+			}
+			return ps.editor.ScrollDown()
+		}
+	}
+	return true
+}
+
+// applyBounceImpulse adds velocity to the bounce spring when a scroll
+// boundary is hit. Switching panels resets the bounce state.
+func (m *AppModel) applyBounceImpulse(panelID component.FocusID, direction int) {
+	if panelID != m.bounce.panel {
+		m.bounce = bounceState{panel: panelID}
+	}
+	m.bounce.vel += float64(direction) * bounceImpulse
+	m.bounce.vel = clampFloat(m.bounce.vel, -bounceMaxVel, bounceMaxVel)
+}
+
+// tickBounce advances the bounce spring by one frame toward equilibrium (pos=0).
+// The underdamped spring naturally oscillates past 0, creating the bounce-back.
+func (m *AppModel) tickBounce() {
+	b := &m.bounce
+	if m.bounceSettled() {
+		b.pos = 0
+		b.vel = 0
+		return
+	}
+
+	b.pos, b.vel = m.bounceSpring.Update(b.pos, b.vel, 0)
+	b.pos = clampFloat(b.pos, -bounceMaxLines, bounceMaxLines)
+
+	if m.bounceSettled() {
+		b.pos = 0
+		b.vel = 0
+	}
+}
+
+// bounceSettled reports whether the bounce spring is close enough to
+// equilibrium (pos=0, vel=0) to stop.
+func (m *AppModel) bounceSettled() bool {
+	return math.Abs(m.bounce.pos) < bounceSettleThreshold &&
+		math.Abs(m.bounce.vel) < bounceSettleThreshold
+}
+
+// bounceOffset returns the integer line displacement for the given panel.
+// Positive = content shifted up (bouncing off bottom boundary).
+// Negative = content shifted down (bouncing off top boundary).
+func (m *AppModel) bounceOffset(panelID component.FocusID) int {
+	if m.bounce.panel != panelID {
+		return 0
+	}
+	return int(math.Round(m.bounce.pos))
+}
+
+// clampFloat constrains v to [lo, hi].
+func clampFloat(v, lo, hi float64) float64 {
+	return math.Max(lo, math.Min(v, hi))
+}
+
+// ---------------------------------------------------------------------------
+// Horizontal swipe (ring cycling via mouse wheel)
+// ---------------------------------------------------------------------------
+
+// applySwipeImpulse accumulates horizontal scroll delta and triggers a
+// view slot cycle (identical to Alt+V chord) when the accumulated magnitude
+// reaches swipeThreshold. In TwoColumn mode both rings cycle in lockstep;
+// in other modes the single active ring cycles.
+func (m *AppModel) applySwipeImpulse(x int, delta float64) {
+	now := time.Now()
+	if now.Before(m.swipe.cooldownUntil) {
+		return
+	}
+	if m.leftRing.empty() && m.rightRing.empty() {
+		return
+	}
+	m.swipe.accum += delta
+	m.swipe.stamp = now
+	if math.Abs(m.swipe.accum) >= swipeThreshold {
+		direction := 1
+		if m.swipe.accum < 0 {
+			direction = -1
+		}
+		m.cycleViewSlot(direction)
+		m.swipe.accum = 0
+		m.swipe.cooldownUntil = now.Add(swipeCooldown)
+	}
+}
+
+// tickSwipeDecay resets stale swipe accumulation after swipeDecay elapses
+// since the last horizontal scroll event.
+func (m *AppModel) tickSwipeDecay() {
+	if m.swipe.accum != 0 && time.Since(m.swipe.stamp) > swipeDecay {
+		m.swipe.accum = 0
+	}
+}
+
+// isFileTreeVisible reports whether the FileTree panel is currently rendered on screen.
+func (m *AppModel) isFileTreeVisible() bool {
+	if m.layout.Mode() == layout.FourColumn {
+		return true
+	}
+	return m.leftRing.current() == component.FocusFileTree
+}
+
+// fileTreePanelX returns the screen X offset of the file tree panel's left edge.
+func (m *AppModel) fileTreePanelX() int {
+	if m.layout.Mode() == layout.FourColumn {
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		return leftW
+	}
+	return 0
+}
+
+// handleFileTreeClick dispatches a click inside the file tree panel, activating
+// the entry or search result at the clicked row.
+func (m *AppModel) handleFileTreeClick(x, y int) tea.Cmd {
+	if !m.isFileTreeVisible() {
+		return nil
+	}
+	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)
+	if treeW == 0 || treeH == 0 {
+		return nil
+	}
+
+	treeX := m.fileTreePanelX()
+	innerH := max(treeH-panelBorderSize, 0)
+
+	contentLeft := treeX + 1
+	contentRight := treeX + treeW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight {
+		return nil
+	}
+	if y < contentTop || y >= contentBottom {
+		return nil
+	}
+
+	viewX := x - contentLeft
+	viewY := y - contentTop
+	return m.fileTree.ClickAt(viewX, viewY)
+}
+
+// isChatVisible reports whether the Chat panel is currently rendered on screen.
+func (m *AppModel) isChatVisible() bool {
+	mode := m.layout.Mode()
+	if mode >= layout.ThreeColumn {
+		return true
+	}
+	if mode == layout.TwoColumn {
+		return m.rightRing.current() == component.FocusChat
+	}
+	return m.leftRing.current() == component.FocusChat
+}
+
+// handleChatClick copies the content of the chat entry at the clicked
+// position to the system clipboard.
+func (m *AppModel) handleChatClick(x, y int) tea.Cmd {
+	if !m.isChatVisible() {
+		return nil
+	}
+	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
+	if chatW == 0 || chatH == 0 {
+		return nil
+	}
+
+	chatX := m.chatPanelX()
+	innerH := max(chatH-panelBorderSize, 0)
+
+	// Content area within the bordered chat panel.
+	contentLeft := chatX + 1
+	contentRight := chatX + chatW - 1
+
+	// Chord hint pushes viewport content down by 2 lines when active.
+	chordOffset := 0
+	if m.chord != chordNone {
+		chordOffset = 2
+	}
+	viewportTop := 1 + chordOffset // 1 = top border
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight {
+		return nil
+	}
+	if y < viewportTop || y >= contentBottom {
+		return nil
+	}
+
+	viewportLine := y - viewportTop
+	target := m.chat.CopyTargetAtViewLine(viewportLine)
+	if target == nil {
+		return nil
+	}
+
+	if err := m.clipboard.Set(target.Content); err != nil {
+		m.statusBar.SetFlash("Copy failed")
+		return nil
+	}
+	m.chat.SetHighlight(target.EntryID, target.EntryIndex, target.HighlightStart, target.HighlightEnd)
+	m.statusBar.SetFlash("Copied!")
+	return nil
+}
+
+// chatPanelX returns the X coordinate where the chat panel starts,
+// based on the current layout mode.
+func (m *AppModel) chatPanelX() int {
+	mode := m.layout.Mode()
+	if mode == layout.FourColumn {
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		treeW, _ := m.layout.GetPanelSize(component.FocusFileTree)
+		return leftW + treeW
+	}
+	if mode >= layout.TwoColumn {
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		return leftW
+	}
+	return 0
+}
+
+// codePanelX returns the X coordinate where the code panel starts,
+// based on the current layout mode.
+func (m *AppModel) codePanelX() int {
+	mode := m.layout.Mode()
+	switch mode {
+	case layout.FourColumn:
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		treeW, _ := m.layout.GetPanelSize(component.FocusFileTree)
+		chatW, _ := m.layout.GetPanelSize(component.FocusChat)
+		return leftW + treeW + chatW
+	case layout.ThreeColumn:
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		chatW, _ := m.layout.GetPanelSize(component.FocusChat)
+		return leftW + chatW
+	case layout.TwoColumn:
+		leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+		return leftW
+	default:
+		return 0
+	}
+}
+
+// hasPreview reports whether a preview pane is currently active.
+func (m *AppModel) hasPreview() bool {
+	return m.previewPane != 0
+}
+
+// isFullMdPreview reports whether the markdown preview is taking the full
+// code panel (the sole editor pane has no tabs).
+func (m *AppModel) isFullMdPreview() bool {
+	return m.mdPreviewPane != 0 && len(m.paneEditors) == 1 && len(m.focusedTabOrder()) == 0
+}
+
+// focusedEditor returns the editor for the currently focused pane.
+func (m *AppModel) focusedEditor() *editor.Model {
+	return m.paneEditors[m.focusedPane].editor
+}
+
+// focusedTabOrder returns the tab order for the currently focused pane.
+func (m *AppModel) focusedTabOrder() []string {
+	return m.paneEditors[m.focusedPane].tabOrder
+}
+
+// setFocusedTabOrder replaces the tab order for the currently focused pane.
+func (m *AppModel) setFocusedTabOrder(to []string) {
+	m.paneEditors[m.focusedPane].tabOrder = to
+}
+
+// paneEditor returns the editor for the given pane ID.
+func (m *AppModel) paneEditor(id pane.PaneID) *editor.Model {
+	return m.paneEditors[id].editor
+}
+
+// paneTabOrder returns the tab order for the given pane ID.
+func (m *AppModel) paneTabOrder(id pane.PaneID) []string {
+	return m.paneEditors[id].tabOrder
+}
+
+// allTabOrders returns all open file paths across all editor panes.
+func (m *AppModel) allTabOrders() []string {
+	var all []string
+	for _, ps := range m.paneEditors {
+		all = append(all, ps.tabOrder...)
+	}
+	return all
+}
+
+// anyPaneHasTabs reports whether any editor pane has open tabs.
+func (m *AppModel) anyPaneHasTabs() bool {
+	for _, ps := range m.paneEditors {
+		if len(ps.tabOrder) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// previewSplitWidth returns the preview half width in split mode.
+// Returns 0 when not in split mode or preview is inactive.
+func (m *AppModel) previewSplitWidth() int {
+	if !m.hasPreview() || !m.editMode || len(m.focusedTabOrder()) == 0 {
+		return 0
+	}
+	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	// Derived from: 1 divider char, remaining space split evenly.
+	dividerWidth := 1
+	return (innerW - dividerWidth) / 2
+}
+
+// isInsidePreviewHalf reports whether screen x falls within the preview
+// half of the code panel in split view.
+func (m *AppModel) isInsidePreviewHalf(x int) bool {
+	pw := m.previewSplitWidth()
+	if pw == 0 {
+		return false
+	}
+	codeX := m.codePanelX()
+	contentLeft := codeX + 1 // skip left border
+	return x >= contentLeft && x < contentLeft+pw
+}
+
+// paneContentArea returns the inner area used by ComputeLayout for panes.
+func (m *AppModel) paneContentArea() pane.Rect {
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+	contentH := max(innerH-1, 1) // minus status line
+	return pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+}
+
+// hitTestPane returns the PaneID under screen coordinates (screenX, screenY)
+// using the pane tree's ComputeLayout. Converts screen coords to content-local
+// before testing against pane rects.
+func (m *AppModel) hitTestPane(screenX, screenY int) (pane.PaneID, bool) {
+	if m.paneTree == nil {
+		return 0, false
+	}
+	codeX := m.codePanelX()
+	viewX := screenX - (codeX + 1) // skip left border
+	viewY := screenY - 1           // skip top border
+
+	area := m.paneContentArea()
+	rects := m.paneTree.ComputeLayout(area)
+	for id, r := range rects {
+		if viewX >= r.X && viewX < r.X+r.W && viewY >= r.Y && viewY < r.Y+r.H {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// paneViewCoords converts screen coordinates to pane-local coordinates.
+// Returns (paneID, localX, localY, ok). localX/localY are relative to the
+// pane's top-left corner within the code panel content area.
+func (m *AppModel) paneViewCoords(screenX, screenY int) (pane.PaneID, int, int, bool) {
+	if m.paneTree == nil {
+		return 0, 0, 0, false
+	}
+	codeX := m.codePanelX()
+	viewX := screenX - (codeX + 1)
+	viewY := screenY - 1
+
+	area := m.paneContentArea()
+	rects := m.paneTree.ComputeLayout(area)
+	for id, r := range rects {
+		if viewX >= r.X && viewX < r.X+r.W && viewY >= r.Y && viewY < r.Y+r.H {
+			return id, viewX - r.X, viewY - r.Y, true
+		}
+	}
+	return 0, 0, 0, false
+}
+
+// handleEditorMouse handles all left-button mouse actions (press, drag,
+// release) inside the code panel during edit mode. Returns (consumed, cmd).
+func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	// Release always clears tracking, even outside the panel.
+	if mouse.Action == tea.MouseActionRelease {
+		cmd := m.finalizeCrossPaneDrop()
+		m.editorMouseDown = false
+		m.editorDragging = false
+		m.tabDragIdx = -1
+		m.tabDragSourcePane = 0
+		m.tabDropTarget = 0
+		return true, cmd
+	}
+
+	// Full-preview mode: all code panel clicks route to the preview.
+	// Only split mode needs the per-half routing below.
+	if m.hasPreview() && len(m.focusedTabOrder()) == 0 {
+		if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
+			viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+			if viewY < tabbar.Height {
+				codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+				cfg := tabbar.Config{
+					Tabs: []tabbar.Tab{{
+						Path:        m.previewPanel.FilePath(),
+						Modified:    false,
+						LabelPrefix: "Preview: ",
+					}},
+					Active:    0,
+					Width:     max(codeW-panelBorderSize, 1),
+					NerdFonts: m.nerdFontsDetected,
+					Theme:     m.config.Theme(),
+				}
+				hit := tabbar.HitTest(cfg, viewX)
+				if hit.TabIndex >= 0 && hit.IsClose {
+					m.dismissPreview()
+					return true, nil
+				}
+			} else {
+				// Content click: position the cursor.
+				m.previewPanel.SetCursorFromViewport(viewX, viewY-tabbar.Height)
+			}
+			m.focus.SetFocus(pane.PaneFocusID(m.previewPane))
+			m.syncFocusState()
+		}
+		return true, nil
+	}
+
+	// Full markdown preview mode: all code panel clicks route to the mdPreview.
+	if m.isFullMdPreview() {
+		if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
+			viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+			if viewY < tabbar.Height {
+				codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+				cfg := tabbar.Config{
+					Tabs: []tabbar.Tab{{
+						Path:        m.mdPreviewPanel.FilePath(),
+						Modified:    false,
+						LabelPrefix: "Markdown: ",
+					}},
+					Active:    0,
+					Width:     max(codeW-panelBorderSize, 1),
+					NerdFonts: m.nerdFontsDetected,
+					Theme:     m.config.Theme(),
+				}
+				hit := tabbar.HitTest(cfg, viewX)
+				if hit.TabIndex >= 0 && hit.IsClose {
+					m.dismissMarkdownPreview()
+					return true, nil
+				}
+			}
+			m.focus.SetFocus(pane.PaneFocusID(m.mdPreviewPane))
+			m.syncFocusState()
+		}
+		return true, nil
+	}
+
+	// Tab bar drag: reorder within pane or detect cross-pane drop target.
+	if mouse.Action == tea.MouseActionMotion && m.tabDragIdx >= 0 {
+		m.tabDropTarget = 0
+
+		// Multi-pane tree mode: use tree-based hit testing.
+		if m.paneTree != nil && !m.paneTree.IsLeaf() {
+			pid, localX, _, ok := m.paneViewCoords(mouse.X, mouse.Y)
+			if !ok {
+				return true, nil
+			}
+			if pid == m.tabDragSourcePane && pid != m.previewPane {
+				return m.handleTabDragReorder(localX)
+			}
+			if pid != m.tabDragSourcePane && pid != m.previewPane {
+				if _, isEditor := m.paneEditors[pid]; isEditor {
+					m.tabDropTarget = pid
+				}
+			}
+			return true, nil
+		}
+
+		// Legacy split mode: preview-to-editor detection.
+		if m.tabDragSourcePane == m.previewPane && !m.isInsidePreviewHalf(mouse.X) {
+			m.tabDropTarget = m.focusedPane
+			return true, nil
+		}
+
+		// Single-pane intra-pane reorder (existing behavior).
+		viewX, _ := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+		return m.handleTabDragReorder(viewX)
+	}
+
+	// Motion while dragging: extend selection even if the pointer left
+	// the panel bounds (clamp handled by the editor).
+	if mouse.Action == tea.MouseActionMotion && m.editorMouseDown {
+		viewX, viewY := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+		if len(m.focusedTabOrder()) > 0 {
+			viewY -= tabbar.Height
+		}
+		viewY -= m.focusedEditor().FindBarHeight()
+		if !m.editorDragging {
+			m.focusedEditor().StartDragSelection()
+			m.editorDragging = true
+		}
+		m.focusedEditor().ExtendDragSelection(viewX, viewY)
+		return true, nil
+	}
+
+	// Press: must be inside the code panel.
+	if mouse.Action != tea.MouseActionPress {
+		return false, nil
+	}
+
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return false, nil
+	}
+
+	// Multi-pane mode: route via tree-based hit test.
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		return m.handleMultiPanePress(mouse)
+	}
+
+	// Single-pane / legacy preview-split path.
+
+	// In preview split mode, clicks on the preview half focus the preview
+	// panel. Tab bar close clicks dismiss the preview.
+	if m.isInsidePreviewHalf(mouse.X) {
+		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		if viewY < tabbar.Height {
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.previewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Preview: ",
+				}},
+				Active:     0,
+				Width:      m.previewSplitWidth(),
+				NerdFonts:  m.nerdFontsDetected,
+				Theme:      m.config.Theme(),
+				HoverClose: -1,
+			}
+			hit := tabbar.HitTest(cfg, viewX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissPreview()
+				return true, nil
+			}
+			// Begin preview tab drag.
+			if hit.TabIndex >= 0 {
+				m.tabDragIdx = 0
+				m.tabDragSourcePane = m.previewPane
+			}
+		} else {
+			// Content click: position the cursor.
+			m.previewPanel.SetCursorFromViewport(viewX, viewY-tabbar.Height)
+		}
+		m.focus.SetFocus(pane.PaneFocusID(m.previewPane))
+		m.syncFocusState()
+		return true, nil
+	}
+
+	return m.handleEditorPaneClick(mouse)
+}
+
+// handleMultiPanePress routes a press event to the correct pane in multi-pane
+// mode using tree-based hit testing.
+func (m *AppModel) handleMultiPanePress(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
+	if !ok {
+		return false, nil
+	}
+
+	// Switch focus to the clicked pane.
+	m.focus.SetFocus(pane.PaneFocusID(pid))
+	m.syncFocusState()
+
+	// Preview pane click.
+	if pid == m.previewPane {
+		if localY < tabbar.Height {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.previewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Preview: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissPreview()
+				return true, nil
+			}
+			// Begin preview tab drag.
+			if hit.TabIndex >= 0 {
+				m.tabDragIdx = 0
+				m.tabDragSourcePane = m.previewPane
+			}
+		} else {
+			// Content click: position the cursor.
+			viewY := localY - tabbar.Height
+			m.previewPanel.SetCursorFromViewport(localX, viewY)
+		}
+		return true, nil
+	}
+
+	// Markdown preview pane click.
+	if pid == m.mdPreviewPane {
+		if localY < tabbar.Height {
+			area := m.paneContentArea()
+			rects := m.paneTree.ComputeLayout(area)
+			r := rects[pid]
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.mdPreviewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Markdown: ",
+				}},
+				Active:    0,
+				Width:     r.W,
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, localX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissMarkdownPreview()
+			}
+		}
+		return true, nil
+	}
+
+	// Editor pane click.
+	ps, exists := m.paneEditors[pid]
+	if !exists {
+		return true, nil
+	}
+
+	// Check for markdown tooltip click (within the 3-row tooltip area).
+	if m.mdTooltipTab >= 0 && m.mdTooltipPane == pid && localY >= tabbar.Height && localY < tabbar.Height+mdTooltipHeight {
+		if localX >= m.mdTooltipX && localX < m.mdTooltipX+mdTooltipWidth {
+			if m.mdTooltipTab < len(ps.tabOrder) {
+				path := ps.tabOrder[m.mdTooltipTab]
+				m.openMarkdownPreview(path)
+				m.mdTooltipTab = -1
+				m.mdTooltipPane = 0
+			}
+			return true, nil
+		}
+	}
+
+	// Tab bar click within pane.
+	if len(ps.tabOrder) > 0 && localY < tabbar.Height {
+		area := m.paneContentArea()
+		rects := m.paneTree.ComputeLayout(area)
+		r := rects[pid]
+		cfg := m.paneTabBarConfig(pid, r.W)
+		hit := tabbar.HitTest(cfg, localX)
+		if hit.IsLeftNav {
+			m.tabArrowFlashLeftUntil = time.Now().Add(tabArrowFlashDuration)
+			return true, m.prevTab()
+		}
+		if hit.IsRightNav {
+			m.tabArrowFlashRightUntil = time.Now().Add(tabArrowFlashDuration)
+			return true, m.nextTab()
+		}
+		if hit.TabIndex < 0 || hit.TabIndex >= len(ps.tabOrder) {
+			return true, nil
+		}
+		if hit.IsClose {
+			return true, m.closeTab(hit.TabIndex)
+		}
+		m.tabDragIdx = hit.TabIndex
+		m.tabDragSourcePane = pid
+		return true, m.switchToTab(hit.TabIndex)
+	}
+
+	// Content click below tab bar.
+	viewX := localX
+	viewY := localY
+	if len(ps.tabOrder) > 0 {
+		viewY -= tabbar.Height
+	}
+
+	barH := ps.editor.ReplaceBarHeight()
+	if barH > 0 && viewY < barH {
+		ps.editor.HandleReplaceBarClick(viewX, viewY)
+		return true, nil
+	}
+	if barH == 0 {
+		barH = ps.editor.FindBarHeight()
+		if barH > 0 && viewY < barH {
+			ps.editor.HandleFindBarClick(viewX, viewY)
+			return true, nil
+		}
+	}
+	viewY -= barH
+
+	if cmd, handled := ps.editor.HandleHoverClick(viewX, viewY); handled {
+		return true, cmd
+	}
+	if ps.editor.HandleCompletionClick(viewX, viewY) {
+		return true, nil
+	}
+
+	ps.editor.ClickAt(viewX, viewY)
+	m.editorMouseDown = true
+	m.editorDragging = false
+
+	line := ps.editor.CursorLine()
+	col := ps.editor.CursorCol()
+	if ps.editor.IsWordCharAtPos(line, col) {
+		m.highlightLine = line
+		m.highlightCol = col
+		ps.editor.ClearHighlightRanges()
+		return true, tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+			return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+		})
+	}
+	ps.editor.ClearHighlightRanges()
+	return true, nil
+}
+
+// handleEditorPaneClick handles a click in the single editor pane (no splits).
+func (m *AppModel) handleEditorPaneClick(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+
+	// In split mode, offset viewX to be relative to the editor half.
+	if pw := m.previewSplitWidth(); pw > 0 {
+		dividerWidth := 1
+		viewX -= pw + dividerWidth
+	}
+
+	// Tab bar click: when the tab bar is visible, clicks within it switch tabs.
+	if m.tabBarHeight() > 0 && viewY < m.tabBarHeight() {
+		return m.handleTabBarClick(viewX)
+	}
+
+	// Markdown tooltip click (within the 3-row tooltip area).
+	if m.mdTooltipTab >= 0 && m.mdTooltipPane == m.focusedPane && viewY >= m.tabBarHeight() && viewY < m.tabBarHeight()+mdTooltipHeight {
+		if viewX >= m.mdTooltipX && viewX < m.mdTooltipX+mdTooltipWidth {
+			tabOrder := m.focusedTabOrder()
+			if m.mdTooltipTab < len(tabOrder) {
+				m.openMarkdownPreview(tabOrder[m.mdTooltipTab])
+				m.mdTooltipTab = -1
+				m.mdTooltipPane = 0
+			}
+			return true, nil
+		}
+	}
+
+	// Offset for tab bar so editor coordinates remain correct.
+	viewY -= m.tabBarHeight()
+
+	// When a search bar (find or replace) is open, clicks in its area
+	// toggle badges/buttons; clicks below are offset to content-local coords.
+	barH := m.focusedEditor().ReplaceBarHeight()
+	if barH > 0 && viewY < barH {
+		m.focusedEditor().HandleReplaceBarClick(viewX, viewY)
+		return true, nil
+	}
+	if barH == 0 {
+		barH = m.focusedEditor().FindBarHeight()
+		if barH > 0 && viewY < barH {
+			m.focusedEditor().HandleFindBarClick(viewX, viewY)
+			return true, nil
+		}
+	}
+	viewY -= barH
+
+	// When the hover popup is visible, clicks on it trigger go-to-definition.
+	if cmd, ok := m.focusedEditor().HandleHoverClick(viewX, viewY); ok {
+		return true, cmd
+	}
+
+	// When the completion popup is visible, clicks on it select an item
+	// instead of moving the cursor.
+	if m.focusedEditor().HandleCompletionClick(viewX, viewY) {
+		return true, nil
+	}
+
+	m.focusedEditor().ClickAt(viewX, viewY)
+	m.editorMouseDown = true
+	m.editorDragging = false
+
+	// Schedule document highlight debounce after click places cursor on a word.
+	line := m.focusedEditor().CursorLine()
+	col := m.focusedEditor().CursorCol()
+	if m.focusedEditor().IsWordCharAtPos(line, col) {
+		m.highlightLine = line
+		m.highlightCol = col
+		m.focusedEditor().ClearHighlightRanges()
+		return true, tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+			return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+		})
+	}
+	m.focusedEditor().ClearHighlightRanges()
+	return true, nil
+}
+
+// isInsideCodePanel reports whether screen coordinates (x, y) fall within
+// the content area of the code panel.
+func (m *AppModel) isInsideCodePanel(x, y int) bool {
+	codeW, codeH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	if codeW == 0 || codeH == 0 {
+		return false
+	}
+	codeX := m.codePanelX()
+	innerH := max(codeH-panelBorderSize, 0)
+
+	contentLeft := codeX + 1
+	contentRight := codeX + codeW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	return x >= contentLeft && x < contentRight && y >= contentTop && y < contentBottom
+}
+
+// editorViewCoords converts screen coordinates to content-local viewport
+// coordinates for the code panel. Coordinates are clamped to [0, max).
+func (m *AppModel) editorViewCoords(screenX, screenY int) (int, int) {
+	codeW, codeH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	codeX := m.codePanelX()
+	innerW := max(codeW-panelBorderSize, 0)
+	innerH := max(codeH-panelBorderSize, 0)
+
+	viewX := max(min(screenX-(codeX+1), innerW-1), 0)
+	viewY := max(min(screenY-1, innerH-1), 0)
+	return viewX, viewY
+}
+
+// focusedPaneRect returns the layout rectangle for the currently focused
+// editor pane. Returns a zero Rect and false when not in multi-pane mode.
+func (m *AppModel) focusedPaneRect() (pane.Rect, bool) {
+	if m.paneTree == nil || m.paneTree.IsLeaf() {
+		return pane.Rect{}, false
+	}
+	area := m.paneContentArea()
+	rects := m.paneTree.ComputeLayout(area)
+	r, ok := rects[m.focusedPane]
+	return r, ok
+}
+
+// focusedPaneLocalCoords converts screen coordinates to the focused pane's
+// local coordinates. In multi-pane mode, coordinates are relative to the
+// pane's top-left. In single-pane mode, falls back to editorViewCoords
+// with preview offset. Coordinates are clamped for drag safety.
+func (m *AppModel) focusedPaneLocalCoords(screenX, screenY int) (int, int) {
+	r, ok := m.focusedPaneRect()
+	if !ok {
+		viewX, viewY := m.editorViewCoords(screenX, screenY)
+		if pw := m.previewSplitWidth(); pw > 0 {
+			viewX -= pw + 1
+		}
+		return viewX, viewY
+	}
+	codeX := m.codePanelX()
+	viewX := screenX - (codeX + 1) - r.X
+	viewY := screenY - 1 - r.Y
+	viewX = max(0, min(viewX, r.W-1))
+	viewY = max(0, min(viewY, r.H-1))
+	return viewX, viewY
+}
+
+// previewPaneLocalCoords converts screen coordinates to the preview pane's
+// local coordinates. In multi-pane mode, uses the preview pane's rect from
+// ComputeLayout. In single-pane mode, uses the code panel's left half.
+func (m *AppModel) previewPaneLocalCoords(screenX, screenY int) (int, int) {
+	if m.paneTree != nil && !m.paneTree.IsLeaf() && m.hasPreview() {
+		area := m.paneContentArea()
+		rects := m.paneTree.ComputeLayout(area)
+		if r, ok := rects[m.previewPane]; ok {
+			codeX := m.codePanelX()
+			viewX := screenX - (codeX + 1) - r.X
+			viewY := screenY - 1 - r.Y
+			viewX = max(0, min(viewX, r.W-1))
+			viewY = max(0, min(viewY, r.H-1))
+			return viewX, viewY
+		}
+	}
+	return m.editorViewCoords(screenX, screenY)
+}
+
+// hoverDebounce delays before firing an LSP hover request.
+// Derived from: 150ms is responsive without flooding the server on fast swipes;
+// 50ms retrigger keeps the tooltip "following" the cursor between words.
+const (
+	hoverInitialDebounce   = 350 * time.Millisecond // first hover when no tooltip is showing
+	hoverRetriggerDebounce = 50 * time.Millisecond  // re-trigger when moving between words
+)
+
+// highlightDebounce is the delay before firing a documentHighlight request
+// after the cursor comes to rest on a symbol.
+// Derived from: 100ms feels snappy while still batching rapid j/k navigation.
+const highlightDebounce = 100 * time.Millisecond
+
+// handleEditorMouseHover fires a debounced LSP hover request when the
+// mouse moves to a new word in edit mode. Only triggers on word characters;
+// moving within the same word does not reset the debounce.
+func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		m.dismissAllHover()
+		return nil
+	}
+
+	// Determine whether the mouse is over the preview pane.
+	overPreview := false
+	var viewX, viewY int
+
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		pid, lx, ly, ok := m.paneViewCoords(mouse.X, mouse.Y)
+		if !ok {
+			m.dismissAllHover()
+			return nil
+		}
+		if m.hasPreview() && pid == m.previewPane {
+			overPreview = true
+			viewX, viewY = lx, ly
+			// Account for tab bar height in the preview pane.
+			viewY -= tabbar.Height
+		} else if pid != m.focusedPane {
+			m.dismissAllHover()
+			return nil
+		}
+	} else if m.isInsidePreviewHalf(mouse.X) {
+		overPreview = true
+	}
+
+	if overPreview {
+		return m.handlePreviewMouseHover(mouse, viewX, viewY)
+	}
+
+	// Editor pane hover (original path).
+	viewX, viewY = m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+	if len(m.focusedTabOrder()) > 0 {
+		viewY -= tabbar.Height
+	}
+	viewY -= m.focusedEditor().FindBarHeight()
+
+	// Keep hover stable when the mouse is inside the popup.
+	if m.focusedEditor().HoverActive() && m.focusedEditor().IsInsideHoverPopup(viewX, viewY) {
+		return nil
+	}
+
+	// Keep hover stable when crossing a non-hover overlay (signature/completion).
+	if m.focusedEditor().HoverActive() && m.focusedEditor().IsInsideOverlayPopup(viewX, viewY) {
+		return nil
+	}
+
+	line, col, ok := m.focusedEditor().ViewportToBufferPos(viewX, viewY)
+	if !ok {
+		m.dismissAllHover()
+		return nil
+	}
+
+	if !m.focusedEditor().IsWordCharAtPos(line, col) {
+		m.dismissAllHover()
+		return nil
+	}
+
+	wordStart, _ := m.focusedEditor().WordBoundsAt(line, col)
+	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart && !m.hoverForPreview {
+		return nil
+	}
+
+	debounce := hoverInitialDebounce
+	if m.focusedEditor().HoverActive() || m.previewPanel.HoverActive() {
+		m.dismissAllHover()
+		debounce = hoverRetriggerDebounce
+	}
+
+	m.hoverMouseLine = line
+	m.hoverMouseCol = col
+	m.hoverMouseWordStart = wordStart
+	m.hoverForPreview = false
+	m.pendingHoverSymbol = ""
+	m.pendingHoverPkgPath = ""
+	return tea.Tick(debounce, func(_ time.Time) tea.Msg {
+		return msg.LSPMouseHoverTickMsg{Line: line, Col: col}
+	})
+}
+
+// handlePreviewMouseHover handles hover detection when the mouse is over
+// the preview pane. Uses the preview panel's coordinate conversion and
+// word detection methods.
+func (m *AppModel) handlePreviewMouseHover(mouse tea.MouseMsg, viewX, viewY int) tea.Cmd {
+	if m.previewPanel.FilePath() == "" {
+		m.dismissAllHover()
+		return nil
+	}
+
+	// In single-pane mode, compute local coords from the code panel.
+	if m.paneTree == nil || m.paneTree.IsLeaf() {
+		vx, vy := m.editorViewCoords(mouse.X, mouse.Y)
+		viewX, viewY = vx, vy
+		// Account for tab bar in single-pane preview.
+		viewY -= tabbar.Height
+	}
+
+	// Keep hover stable when the mouse is inside the preview's hover popup.
+	if m.previewPanel.HoverActive() && m.previewPanel.IsInsideHoverPopup(viewX, viewY) {
+		return nil
+	}
+
+	line, col, ok := m.previewPanel.ViewportToBufferPos(viewX, viewY)
+	if !ok {
+		m.dismissAllHover()
+		return nil
+	}
+
+	if !m.previewPanel.IsWordCharAtPos(line, col) {
+		m.dismissAllHover()
+		return nil
+	}
+
+	wordStart, _ := m.previewPanel.WordBoundsAt(line, col)
+	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart && m.hoverForPreview {
+		return nil
+	}
+
+	debounce := hoverInitialDebounce
+	if m.previewPanel.HoverActive() || m.focusedEditor().HoverActive() {
+		m.dismissAllHover()
+		debounce = hoverRetriggerDebounce
+	}
+
+	m.hoverMouseLine = line
+	m.hoverMouseCol = col
+	m.hoverMouseWordStart = wordStart
+	m.hoverForPreview = true
+	m.pendingHoverSymbol = ""
+	m.pendingHoverPkgPath = ""
+	return tea.Tick(debounce, func(_ time.Time) tea.Msg {
+		return msg.LSPMouseHoverTickMsg{Line: line, Col: col}
+	})
+}
+
+// dismissAllHover dismisses both editor and preview hover tooltips and
+// resets the hover tracking state.
+func (m *AppModel) dismissAllHover() {
+	if m.focusedEditor().HoverActive() {
+		m.focusedEditor().DismissHover()
+	}
+	if m.previewPanel.HoverActive() {
+		m.previewPanel.DismissHover()
+	}
+	m.hoverMouseLine = -1
+}
+
+// handleMouseHoverTick processes the debounced hover tick. If the mouse
+// is still on the same word, fires parallel LSP hover and definition requests.
+func (m *AppModel) handleMouseHoverTick(tick msg.LSPMouseHoverTickMsg) tea.Cmd {
+	if !m.editMode {
+		return nil
+	}
+
+	// When hover is for the preview pane, use preview panel methods.
+	if m.hoverForPreview {
+		wordStart, _ := m.previewPanel.WordBoundsAt(tick.Line, tick.Col)
+		if tick.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+			return nil
+		}
+		filePath := m.previewPanel.FilePath()
+		if filePath == "" {
+			return nil
+		}
+		m.pendingHoverSymbol = ""
+		m.pendingHoverPkgPath = ""
+		return tea.Batch(
+			m.lspHoverCmd(filePath, tick.Line, tick.Col),
+			m.lspDefinitionCmd(filePath, tick.Line, tick.Col, true),
+		)
+	}
+
+	// Editor pane hover.
+	wordStart, _ := m.focusedEditor().WordBoundsAt(tick.Line, tick.Col)
+	if tick.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
+		return nil
+	}
+	filePath := m.focusedEditor().FilePath()
+	if filePath == "" {
+		return nil
+	}
+	m.pendingHoverSymbol = ""
+	m.pendingHoverPkgPath = ""
+	return tea.Batch(
+		m.lspHoverCmd(filePath, tick.Line, tick.Col),
+		m.lspDefinitionCmd(filePath, tick.Line, tick.Col, true),
+	)
+}
+
+// handleDocHighlightTick processes the debounced document highlight tick.
+// If the cursor is still on the same position and in normal mode, fires
+// the LSP documentHighlight request.
+func (m *AppModel) handleDocHighlightTick(tick msg.LSPDocHighlightTickMsg) tea.Cmd {
+	if !m.editMode {
+		return nil
+	}
+	if m.focusedEditor().CursorLine() != tick.Line || m.focusedEditor().CursorCol() != tick.Col {
+		return nil
+	}
+	if !m.focusedEditor().IsWordCharAtPos(tick.Line, tick.Col) {
+		return nil
+	}
+	filePath := m.focusedEditor().FilePath()
+	if filePath == "" {
+		return nil
+	}
+	return m.lspDocumentHighlightCmd(filePath, tick.Line, tick.Col)
+}
+
+func (m *AppModel) toggleSearch() {
+	if m.searchOverlay.Visible() {
+		m.searchOverlay.Hide()
+		m.overlay = overlayNone
+	} else {
+		// Kill residual scroll/bounce momentum so it doesn't affect the
+		// overlay or resume unexpectedly when the overlay closes.
+		m.scroll = scrollState{}
+		m.bounce = bounceState{}
+		m.chat.SetBounceOffset(0)
+		m.codePanel.SetBounceOffset(0)
+		m.fileTree.SetBounceOffset(0)
+		m.searchOverlay.Show()
+		m.overlay = overlaySearch
+	}
+}
+
+func (m *AppModel) toggleFieldManual() {
+	if m.fieldManualOverlay.Visible() {
+		m.fieldManualOverlay.Hide()
+		m.overlay = overlayNone
+	} else {
+		m.scroll = scrollState{}
+		m.bounce = bounceState{}
+		m.chat.SetBounceOffset(0)
+		m.codePanel.SetBounceOffset(0)
+		m.fileTree.SetBounceOffset(0)
+		m.fieldManualOverlay.Show()
+		m.overlay = overlayFieldManual
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Message propagation
+// ---------------------------------------------------------------------------
+
+// propagate forwards a message to all components and collects commands.
+func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
+	// Skip global propagation for tick messages to avoid redundant work;
+	// fast ticks are handled centrally, decor ticks are dispatched explicitly.
+	switch raw.(type) {
+	case msg.TickMsg, msg.DecorTickMsg:
+		return nil
+	}
+
+	var cmds []tea.Cmd
+
+	chatComp, chatCmd := m.chat.Update(raw)
+	m.chat = chatComp.(*chat.Model)
+	cmds = appendCmd(cmds, chatCmd)
+
+	inputComp, inputCmd := m.input.Update(raw)
+	m.input = inputComp.(*inputpkg.Model)
+	cmds = appendCmd(cmds, inputCmd)
+
+	_, statusCmd := m.statusBar.Update(raw)
+	cmds = appendCmd(cmds, statusCmd)
+
+	sessionComp, sessionCmd := m.sessionPanel.Update(raw)
+	m.sessionPanel = sessionComp.(*sessionpkg.Model)
+	cmds = appendCmd(cmds, sessionCmd)
+
+	agentComp, agentCmd := m.agentPanel.Update(raw)
+	m.agentPanel = agentComp.(*agentpkg.Model)
+	cmds = appendCmd(cmds, agentCmd)
+
+	codeComp, codeCmd := m.codePanel.Update(raw)
+	m.codePanel = codeComp.(*codepkg.Model)
+	cmds = appendCmd(cmds, codeCmd)
+
+	knowledgeComp, knowledgeCmd := m.knowledgePanel.Update(raw)
+	m.knowledgePanel = knowledgeComp.(*knowledgepkg.Model)
+	cmds = appendCmd(cmds, knowledgeCmd)
+
+	treeComp, treeCmd := m.fileTree.Update(raw)
+	m.fileTree = treeComp.(*filetree.Model)
+	cmds = appendCmd(cmds, treeCmd)
+
+	if m.gitPanel != nil {
+		gitComp, gitCmd := m.gitPanel.Update(raw)
+		m.gitPanel = gitComp.(*gitpanel.Model)
+		cmds = appendCmd(cmds, gitCmd)
+	}
+
+	return tea.Batch(cmds...)
+}
+
+// propagateToFocused sends a key message only to the currently focused component.
+func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
+	focused := m.focus.Current()
+
+	switch focused {
+	case component.FocusInput:
+		prevLines := m.input.LineCount()
+		comp, cmd := m.input.Update(key)
+		m.input = comp.(*inputpkg.Model)
+		if m.input.LineCount() != prevLines {
+			m.recalcLayout()
+		}
+		return cmd
+	case component.FocusChat:
+		comp, cmd := m.chat.Update(key)
+		m.chat = comp.(*chat.Model)
+		return cmd
+	case component.FocusSessionPanel:
+		comp, cmd := m.sessionPanel.Update(key)
+		m.sessionPanel = comp.(*sessionpkg.Model)
+		return cmd
+	case component.FocusAgentPanel:
+		comp, cmd := m.agentPanel.Update(key)
+		m.agentPanel = comp.(*agentpkg.Model)
+		return cmd
+	case component.FocusCodeViewer:
+		// Non-edit mode: route to read-only code viewer.
+		comp, cmd := m.codePanel.Update(key)
+		m.codePanel = comp.(*codepkg.Model)
+		return cmd
+	case component.FocusFileTree:
+		comp, cmd := m.fileTree.Update(key)
+		m.fileTree = comp.(*filetree.Model)
+		return cmd
+	case component.FocusKnowledge:
+		comp, cmd := m.knowledgePanel.Update(key)
+		m.knowledgePanel = comp.(*knowledgepkg.Model)
+		return cmd
+	case component.FocusGitPanel:
+		comp, cmd := m.gitPanel.Update(key)
+		m.gitPanel = comp.(*gitpanel.Model)
+		return cmd
+	case component.FocusCommitTree:
+		comp, cmd := m.commitTree.Update(key)
+		m.commitTree = comp.(*committree.Model)
+		return cmd
+	default:
+		if !pane.IsPaneFocus(focused) {
+			return nil
+		}
+		pid := pane.PaneIDFromFocus(focused)
+		if pid == m.previewPane {
+			// Preview is read-only. Only scroll navigation and close/open actions.
+			switch key.String() {
+			case "alt+enter":
+				m.dismissPreview()
+				return nil
+			case "enter":
+				return m.openFromPreview()
+			default:
+				_, cmd := m.previewPanel.Update(key)
+				return cmd
+			}
+		}
+		if pid == m.mdPreviewPane {
+			switch key.String() {
+			case "alt+enter", "q":
+				m.dismissMarkdownPreview()
+				return nil
+			default:
+				_, cmd := m.mdPreviewPanel.Update(key)
+				return cmd
+			}
+		}
+		ps, ok := m.paneEditors[pid]
+		if !ok {
+			return nil
+		}
+		wasMod := ps.editor.Modified()
+		comp, cmd := ps.editor.Update(key)
+		ps.editor = comp.(*editor.Model)
+		if ps.editor.Modified() != wasMod {
+			m.refreshTabsModified()
+		}
+		line := ps.editor.CursorLine()
+		col := ps.editor.CursorCol()
+		if ps.editor.IsWordCharAtPos(line, col) {
+			m.highlightLine = line
+			m.highlightCol = col
+			hlCmd := tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+				return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+			})
+			return tea.Batch(cmd, hlCmd)
+		}
+		ps.editor.ClearHighlightRanges()
+		return cmd
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------
+
+// statusBarHeight is the fixed height of the status bar (1 line).
+const statusBarHeight = 1
+
+// inputBorderSize is the vertical space consumed by the input border.
+// Derived from: 1 char top + 1 char bottom = 2.
+const inputBorderSize = 2
+
+// inputMinContentLines is the minimum visible content lines in the input.
+const inputMinContentLines = 1
+
+// inputMaxContentLines is the maximum visible content lines before the input scrolls.
+// Derived from: user requirement of 3 visible lines.
+const inputMaxContentLines = 3
+
+// panelBorderSize is the space consumed by a rounded border on each axis.
+// Derived from: 1 char per side × 2 sides = 2.
+const panelBorderSize = 2
+
+// leftPanelOverhead is the vertical space consumed by section chrome.
+// Derived from: 2 headers (1 line each) + 1 divider (1 line + 1 top padding) = 4.
+const leftPanelOverhead = 4
+
+// inputHeight returns the current rendered height of the input area
+// based on its content line count, clamped to [min, max] + border.
+func (m *AppModel) inputHeight() int {
+	lines := clampInt(m.input.LineCount(), inputMinContentLines, inputMaxContentLines)
+	return lines + inputBorderSize
+}
+
+func (m *AppModel) recalcLayout() {
+	// Reserve space for input (dynamic) and status bar.
+	inputH := m.inputHeight()
+	mainHeight := m.height - inputH - statusBarHeight
+	mainHeight = max(mainHeight, 1)
+
+	m.layout.SetSize(m.width, mainHeight)
+
+	// Sync tab order and focus to the current layout mode so collapsed
+	// panels are excluded from keyboard navigation.
+	m.syncViewState()
+
+	// Center panel: chat. Subtract border so content fits inside renderPanel().
+	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
+	m.chat.SetSize(max(chatW-panelBorderSize, 1), max(chatH-panelBorderSize, 1))
+
+	// Left panel: split between session (top) and agent (bottom).
+	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
+	innerLeftW := max(leftW-panelBorderSize, 1)
+	innerLeftH := max(leftH-panelBorderSize, 1)
+	contentH := max(innerLeftH-leftPanelOverhead, 2)
+	sessionH := contentH / 2
+	agentH := contentH - sessionH
+	m.sessionPanel.SetSize(innerLeftW, sessionH)
+	m.agentPanel.SetSize(innerLeftW, agentH)
+
+	// File tree panel.
+	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)
+	m.fileTree.SetSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
+
+	// Right panel: code viewer (and knowledge, same dimensions).
+	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.codePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	m.knowledgePanel.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	m.resizeCodePanelForPreview(rightW, rightH)
+
+	// Git mode panels reuse file tree and code viewer slot dimensions.
+	if m.gitPanel != nil {
+		m.gitPanel.SetSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
+		m.commitTree.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	}
+
+	// Input: dynamic height based on content.
+	m.input.SetSize(m.width, inputH)
+	m.statusBar.SetSize(m.width, statusBarHeight)
+
+	// Overlays get full terminal dimensions.
+	m.editorOverlay.SetSize(m.width, m.height)
+	m.modalOverlay.SetSize(m.width, m.height)
+	m.searchOverlay.SetSize(m.width, m.height)
+	m.fieldManualOverlay.SetSize(m.width, m.height)
+
+	// Compositor: rebuild frame structure (full invalidation).
+	m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
+	m.prevInputH = inputH
+}
+
+// resizeCodePanelForPreview computes sizes for all panes within the code
+// panel slot using the pane tree's ComputeLayout.
+func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
+	if !m.editMode {
+		return
+	}
+	innerW := max(rightW-panelBorderSize, 1)
+	innerH := max(rightH-panelBorderSize, 1)
+
+	// Full preview mode: preview active, single editor pane with no tabs.
+	if m.hasPreview() && len(m.paneEditors) == 1 && len(m.focusedTabOrder()) == 0 {
+		m.previewPanel.SetSize(innerW, max(innerH-tabbar.Height, 1))
+		return
+	}
+
+	// Full markdown preview mode: mdPreview active, sole editor has no tabs.
+	if m.isFullMdPreview() {
+		m.mdPreviewPanel.SetSize(innerW, max(innerH-tabbar.Height, 1))
+		return
+	}
+
+	// Single editor pane, no splits.
+	if m.paneTree.IsLeaf() {
+		m.focusedEditor().SetSize(innerW, max(innerH-m.tabBarHeight(), 1))
+		return
+	}
+
+	// Multi-pane: compute layout and apply sizes.
+	contentH := max(innerH-1, 1) // Reserve status line row.
+	area := pane.Rect{X: 0, Y: 0, W: innerW, H: contentH}
+	rects := m.paneTree.ComputeLayout(area)
+
+	for id, r := range rects {
+		if id == m.previewPane {
+			m.previewPanel.SetSize(r.W, r.H-tabbar.Height)
+			continue
+		}
+		if id == m.mdPreviewPane {
+			m.mdPreviewPanel.SetSize(r.W, max(r.H-tabbar.Height, 1))
+			continue
+		}
+		ps := m.paneEditors[id]
+		tbH := 0
+		if len(ps.tabOrder) > 0 {
+			tbH = tabbar.Height
+		}
+		// +1 because editor.viewportHeight() subtracts 1 for the status
+		// line, which is rendered separately at the bottom.
+		ps.editor.SetSize(r.W, r.H-tbH+1)
+	}
+}
+
+// syncViewState rebuilds the dual view cycling rings for the current layout
+// mode, updates the focus tab order to match visible panels, and pushes the
+// ring indicator to the status bar. Called on layout recompute and after cycling.
+func (m *AppModel) syncViewState() {
+	mode := m.layout.Mode()
+	wasEmpty := m.leftRing.empty() && m.rightRing.empty()
+
+	// Rebuild rings per mode (see plan table).
+	switch mode {
+	case layout.FourColumn:
+		m.leftRing.reset(nil)
+		m.rightRing.reset(nil)
+	case layout.ThreeColumn:
+		m.leftRing.reset([]component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusFileTree,
+		})
+		m.rightRing.reset(nil)
+	case layout.TwoColumn:
+		m.leftRing.reset([]component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusFileTree,
+		})
+		m.rightRing.reset([]component.FocusID{
+			component.FocusChat,
+			component.FocusCodeViewer,
+		})
+	default:
+		m.leftRing.reset([]component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusChat,
+			component.FocusFileTree,
+			component.FocusCodeViewer,
+		})
+		m.rightRing.reset(nil)
+	}
+
+	// When edit mode is active, ensure CodeViewer is visible in the
+	// ring that contains it. For the left ring, prefer CodeViewer
+	// (SingleColumn) or fall back to FileTree for navigation.
+	if m.editMode {
+		if !m.rightRing.empty() {
+			m.rightRing.setTo(component.FocusCodeViewer)
+		}
+		if !m.leftRing.empty() {
+			if !m.leftRing.setTo(component.FocusCodeViewer) {
+				m.leftRing.setTo(component.FocusFileTree)
+			}
+		}
+	}
+
+	// When git mode is active, pin rings to the file tree slot (git panel)
+	// and code viewer slot (commit tree). The render functions check gitMode
+	// to swap what actually renders in those slots.
+	if m.gitMode {
+		if !m.rightRing.empty() {
+			m.rightRing.setTo(component.FocusCodeViewer)
+		}
+		if !m.leftRing.empty() {
+			if !m.leftRing.setTo(component.FocusFileTree) {
+				m.leftRing.setTo(component.FocusCodeViewer)
+			}
+		}
+	}
+
+	// First-collapse flash: show once when panels first collapse.
+	nowActive := !m.leftRing.empty() || !m.rightRing.empty()
+	if wasEmpty && nowActive && !m.collapseHintShown {
+		m.statusBar.SetFlash("Panel collapsed \u2014 Alt+V \u2190/\u2192 to cycle views")
+		m.collapseHintShown = true
+	}
+
+	// Update tab order based on mode + which panels the rings are showing.
+	order := m.tabOrderForView(mode)
+	m.focus.SetTabOrder(order)
+	m.syncFocusState()
+
+	// Push ring indicator to the status bar.
+	m.statusBar.SetViewRingHint(m.buildRingHint())
+}
+
+// tabOrderForView returns the focus cycling order for the current mode and
+// ring state. Ring-active panels replace fixed panels in the order.
+func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
+	switch mode {
+	case layout.FourColumn:
+		order := []component.FocusID{
+			component.FocusInput,
+			component.FocusChat,
+			component.FocusSessionPanel,
+			component.FocusAgentPanel,
+			component.FocusFileTree,
+		}
+		return m.appendCodePanelFocus(order)
+	case layout.ThreeColumn:
+		left := m.leftRing.current()
+		order := []component.FocusID{
+			component.FocusInput,
+			component.FocusChat,
+			left,
+		}
+		if left == component.FocusSessionPanel {
+			order = append(order, component.FocusAgentPanel)
+		}
+		return m.appendCodePanelFocus(order)
+	case layout.TwoColumn:
+		left := m.leftRing.current()
+		right := m.rightRing.current()
+		order := []component.FocusID{
+			component.FocusInput,
+			right,
+			left,
+		}
+		if left == component.FocusSessionPanel {
+			order = append(order, component.FocusAgentPanel)
+		}
+		return m.appendCodePanelFocus(order)
+	default:
+		// SingleColumn: Input + whatever the left ring shows.
+		active := m.leftRing.current()
+		order := []component.FocusID{component.FocusInput, active}
+		if active == component.FocusSessionPanel {
+			order = append(order, component.FocusAgentPanel)
+		}
+		return m.appendCodePanelFocus(order)
+	}
+}
+
+// appendCodePanelFocus appends the code panel's focus target to the tab
+// order. In edit mode, this is the focused pane's dynamic ID (replacing
+// any FocusCodeViewer entry from ring state). In non-edit mode, this is
+// FocusCodeViewer. Preview-only mode (no editor tabs) skips the tab order
+// since Tab cannot meaningfully target a read-only preview.
+func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.FocusID {
+	// Git mode: replace FileTree slot with FocusGitPanel, CodeViewer slot
+	// with FocusCommitTree. Both are always in the tab order.
+	if m.gitMode {
+		for i, id := range order {
+			switch id {
+			case component.FocusFileTree:
+				order[i] = component.FocusGitPanel
+			case component.FocusCodeViewer:
+				order[i] = component.FocusCommitTree
+			}
+		}
+		if !slices.Contains(order, component.FocusCommitTree) {
+			order = append(order, component.FocusCommitTree)
+		}
+		return order
+	}
+	if m.editMode {
+		// Full-preview mode: nothing to tab to in the code column.
+		if m.hasPreview() && len(m.focusedTabOrder()) == 0 {
+			return order
+		}
+		// Full markdown preview mode: tab to the mdPreview pane.
+		if m.isFullMdPreview() {
+			fid := pane.PaneFocusID(m.mdPreviewPane)
+			for i, id := range order {
+				if id == component.FocusCodeViewer {
+					order[i] = fid
+					return order
+				}
+			}
+			return append(order, fid)
+		}
+		fid := pane.PaneFocusID(m.focusedPane)
+		// Replace any FocusCodeViewer entry injected by the ring.
+		for i, id := range order {
+			if id == component.FocusCodeViewer {
+				order[i] = fid
+				return order
+			}
+		}
+		return append(order, fid)
+	}
+	// Non-edit mode: use FocusCodeViewer.
+	for _, id := range order {
+		if id == component.FocusCodeViewer {
+			return order
+		}
+	}
+	return append(order, component.FocusCodeViewer)
+}
+
+// panelDisplayNames maps panel IDs to short labels for the status bar ring.
+var panelDisplayNames = map[component.FocusID]string{
+	component.FocusChat:         "Chat",
+	component.FocusCodeViewer:   "Code",
+	component.FocusSessionPanel: "Sess",
+	component.FocusFileTree:     "Tree",
+	component.FocusGitPanel:     "Git",
+	component.FocusCommitTree:   "Tree",
+}
+
+// buildRingHint returns the formatted ring indicator string for the status bar.
+// Returns "" when both rings are empty (FourColumn).
+// When both rings are active, shows: ◀ Sess ● Tree ○ | Chat ● Code ○ ▶
+func (m *AppModel) buildRingHint() string {
+	if m.leftRing.empty() && m.rightRing.empty() {
+		return ""
+	}
+	th := m.config.Theme()
+	currentStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
+	activeStyle := lipgloss.NewStyle().Foreground(th.Palette.Warning).Bold(true)
+	dimStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+
+	renderRing := func(ring *viewRing) []string {
+		var items []string
+		for i, pid := range ring.panels {
+			name := panelDisplayNames[pid]
+			var indicator string
+			switch {
+			case i == ring.index:
+				indicator = currentStyle.Render(name + " \u25cf")
+			case pid == component.FocusChat && m.chat.IsStreaming():
+				indicator = activeStyle.Render(name + " \u2731")
+			default:
+				indicator = dimStyle.Render(name + " \u25cb")
+			}
+			items = append(items, indicator)
+		}
+		return items
+	}
+
+	var parts []string
+	parts = append(parts, dimStyle.Render("\u25c0"))
+
+	if !m.leftRing.empty() {
+		parts = append(parts, renderRing(&m.leftRing)...)
+	}
+
+	if !m.leftRing.empty() && !m.rightRing.empty() {
+		parts = append(parts, dimStyle.Render("|"))
+	}
+
+	if !m.rightRing.empty() {
+		parts = append(parts, renderRing(&m.rightRing)...)
+	}
+
+	parts = append(parts, dimStyle.Render("\u25b6"))
+	return strings.Join(parts, " ")
+}
+
+// compositorColumns returns the slot IDs for the current layout mode's columns.
+func (m *AppModel) compositorColumns() []compositor.SlotID {
+	switch m.layout.Mode() {
+	case layout.FourColumn:
+		return []compositor.SlotID{
+			compositor.SlotLeft, compositor.SlotCenterLeft,
+			compositor.SlotCenter, compositor.SlotRight,
+		}
+	case layout.ThreeColumn:
+		return []compositor.SlotID{
+			compositor.SlotLeft, compositor.SlotCenter, compositor.SlotRight,
+		}
+	case layout.TwoColumn:
+		return []compositor.SlotID{compositor.SlotLeft, compositor.SlotRight}
+	default:
+		return []compositor.SlotID{compositor.SlotLeft}
+	}
+}
+
+// focusBorderGroup maps the current focus to the compositor slot whose
+// border would change color on focus transitions.
+func (m *AppModel) focusBorderGroup() compositor.SlotID {
+	fid := m.focus.Current()
+	switch fid {
+	case component.FocusSessionPanel, component.FocusAgentPanel:
+		return compositor.SlotLeft
+	case component.FocusFileTree:
+		if m.layout.Mode() == layout.FourColumn {
+			return compositor.SlotCenterLeft
+		}
+		return compositor.SlotLeft
+	case component.FocusChat:
+		return compositor.SlotCenter
+	case component.FocusCodeViewer, component.FocusCommitTree:
+		return compositor.SlotRight
+	case component.FocusGitPanel:
+		if m.layout.Mode() == layout.FourColumn {
+			return compositor.SlotCenterLeft
+		}
+		return compositor.SlotLeft
+	case component.FocusInput:
+		return compositor.SlotInput
+	default:
+		if pane.IsPaneFocus(fid) {
+			return compositor.SlotRight
+		}
+		return compositor.SlotCenter
+	}
+}
+
+// detectDirtySlots checks component dirty state and state transitions,
+// marking the appropriate compositor slots for re-rendering.
+func (m *AppModel) detectDirtySlots() {
+	// Overlay transitions: full invalidation.
+	if m.overlay != m.prevOverlay {
+		m.comp.InvalidateAll()
+		m.prevOverlay = m.overlay
+		return
+	}
+
+	// Edit mode transitions: code panel changes completely.
+	if m.editMode != m.prevEditMode {
+		m.comp.InvalidateAll()
+		m.prevEditMode = m.editMode
+		return
+	}
+
+	// Git mode transitions: panels swap completely.
+	if m.gitMode != m.prevGitMode {
+		m.comp.InvalidateAll()
+		m.prevGitMode = m.gitMode
+		return
+	}
+
+	// Input height change: requires full recomposition.
+	inputH := m.inputHeight()
+	if inputH != m.prevInputH {
+		mainHeight := m.height - inputH - statusBarHeight
+		mainHeight = max(mainHeight, 1)
+		m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
+		m.prevInputH = inputH
+		return
+	}
+
+	// Focus border group change: mark old + new groups dirty.
+	curGrp := m.focusBorderGroup()
+	if curGrp != m.prevFocusGrp {
+		m.comp.MarkDirty(m.prevFocusGrp)
+		m.comp.MarkDirty(curGrp)
+		m.prevFocusGrp = curGrp
+	}
+
+	// Chord state change: mark affected slot dirty.
+	if m.chord != m.prevChord {
+		m.comp.MarkDirty(compositor.SlotCenter)
+		m.prevChord = m.chord
+	}
+
+	// Ring cycling: mark affected slot dirty.
+	if m.leftRing.index != m.prevLeftRing {
+		m.comp.MarkDirty(compositor.SlotLeft)
+		m.prevLeftRing = m.leftRing.index
+	}
+	if m.rightRing.index != m.prevRightRing {
+		m.comp.MarkDirty(compositor.SlotRight)
+		m.prevRightRing = m.rightRing.index
+	}
+
+	// Tab hover state change: close icon highlight, markdown tooltip.
+	hoverKey := [5]int{m.tabHoverClose, int(m.tabHoverPane), m.previewTabHoverClose, m.mdPreviewTabHoverClose, m.mdTooltipTab}
+	if hoverKey != m.prevHoverKey {
+		m.comp.MarkDirty(compositor.SlotRight)
+		m.prevHoverKey = hoverKey
+	}
+
+	// Component dirty checks.
+	if m.chat.ViewDirty() {
+		m.comp.MarkDirty(compositor.SlotCenter)
+	}
+	if m.fileTree.ViewDirty() {
+		if m.layout.Mode() == layout.FourColumn {
+			m.comp.MarkDirty(compositor.SlotCenterLeft)
+		} else {
+			m.comp.MarkDirty(compositor.SlotLeft)
+		}
+	}
+	if m.input.ViewDirty() {
+		m.comp.MarkDirty(compositor.SlotInput)
+	}
+	if m.statusBar.ViewDirty() {
+		m.comp.MarkDirty(compositor.SlotStatus)
+	}
+
+	// Editor dirty check.
+	if m.editMode {
+		if ps := m.paneEditors[m.focusedPane]; ps != nil && ps.editor.ViewDirty() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+	}
+
+	// Git mode dirty checks.
+	if m.gitMode && m.gitPanel != nil {
+		if m.gitPanel.ViewDirty() {
+			if m.layout.Mode() == layout.FourColumn {
+				m.comp.MarkDirty(compositor.SlotCenterLeft)
+			} else {
+				m.comp.MarkDirty(compositor.SlotLeft)
+			}
+		}
+		if m.commitTree.ViewDirty() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+	}
+
+	// Preview panel: no view cache, so mark dirty whenever it is focused
+	// (cursor blink changes its output on every blink cycle).
+	if m.hasPreview() && m.isPreviewFocused() {
+		m.comp.MarkDirty(compositor.SlotRight)
+	}
+
+	// Blink phase changed: mark the slot(s) owning the active cursor.
+	if m.blinkDirty {
+		m.blinkDirty = false
+		if m.editMode {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+		if m.focus.Current() == component.FocusInput {
+			m.comp.MarkDirty(compositor.SlotInput)
+		}
+		if m.fileTree.NeedsBlink() {
+			if m.layout.Mode() == layout.FourColumn {
+				m.comp.MarkDirty(compositor.SlotCenterLeft)
+			} else {
+				m.comp.MarkDirty(compositor.SlotLeft)
+			}
+		}
+		if m.hasPreview() && m.isPreviewFocused() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+	}
+
+	// Left panel (session+agent): no viewDirty — always mark if main dirty.
+	// The compositor avoids re-rendering unless the slot is already dirty.
+}
+
+// renderDirtySlots re-renders only the compositor slots that are dirty.
+func (m *AppModel) renderDirtySlots() {
+	th := m.config.Theme()
+
+	if m.comp.IsDirty(compositor.SlotLeft) {
+		m.comp.SetSlotLines(compositor.SlotLeft,
+			compositor.SplitLines(m.renderSlotLeft(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotCenterLeft) {
+		m.comp.SetSlotLines(compositor.SlotCenterLeft,
+			compositor.SplitLines(m.renderSlotCenterLeft(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotCenter) {
+		m.comp.SetSlotLines(compositor.SlotCenter,
+			compositor.SplitLines(m.renderSlotCenter(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotRight) {
+		m.comp.SetSlotLines(compositor.SlotRight,
+			compositor.SplitLines(m.renderSlotRight(th)))
+	}
+	if m.comp.IsDirty(compositor.SlotInput) {
+		m.comp.SetSlotLines(compositor.SlotInput,
+			compositor.SplitLines(m.input.View(m.cursorVisible)))
+	}
+	if m.comp.IsDirty(compositor.SlotStatus) {
+		m.comp.SetSlotLines(compositor.SlotStatus,
+			compositor.SplitLines(m.statusBar.View()))
+	}
+}
+
+// renderSlotLeft renders the bordered content for the left column slot.
+// In FourColumn mode this is always the session+agent panel. In collapsed
+// modes the left ring determines which panel occupies this slot.
+func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
+	switch m.layout.Mode() {
+	case layout.FourColumn:
+		return m.renderLeftPanelBordered(th)
+	case layout.SingleColumn:
+		return m.renderSingleColumnSlot(th)
+	default:
+		return m.renderLeftSlot(m.leftRing.current(), th)
+	}
+}
+
+// renderSlotCenterLeft renders the bordered file tree for the center-left slot.
+// In git mode, renders the git explorer panel instead.
+func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
+	if m.gitMode {
+		return m.renderGitPanelBordered(th)
+	}
+	return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
+}
+
+// renderSlotCenter renders the bordered chat for the center slot.
+func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
+	return m.renderPanel(
+		m.overlayChordHint(m.chat.View(), component.FocusChat, th),
+		component.FocusChat, th)
+}
+
+// renderSlotRight renders the bordered code panel for the right slot.
+// In TwoColumn mode the right ring may show chat instead of code.
+// In git mode, renders the commit tree instead of the code panel.
+func (m *AppModel) renderSlotRight(th *theme.Theme) string {
+	if m.gitMode {
+		return m.renderGitCommitTreeBordered(th)
+	}
+	if m.layout.Mode() == layout.TwoColumn {
+		right := m.rightRing.current()
+		if right == component.FocusCodeViewer {
+			return m.renderCodePanelBordered(th)
+		}
+		content := m.overlayChordHint(m.panelContent(right), right, th)
+		return m.renderPanel(content, right, th)
+	}
+	return m.renderCodePanelBordered(th)
+}
+
+// renderSingleColumnSlot renders the single visible panel in SingleColumn mode.
+func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
+	active := m.leftRing.current()
+
+	// In git mode, map FileTree→GitPanel, CodeViewer→CommitTree.
+	if m.gitMode {
+		switch active {
+		case component.FocusFileTree:
+			return m.renderGitPanelBordered(th)
+		case component.FocusCodeViewer:
+			return m.renderGitCommitTreeBordered(th)
+		}
+	}
+
+	switch active {
+	case component.FocusSessionPanel:
+		content := m.overlayChordHint(m.renderLeftPanel(th), active, th)
+		return m.borderLeftPanel(content, th)
+	case component.FocusCodeViewer:
+		return m.renderCodePanelBordered(th)
+	case component.FocusFileTree:
+		content := m.overlayChordHint(m.fileTree.View(m.cursorVisible), active, th)
+		return m.renderPanel(content, active, th)
+	default:
+		content := m.overlayChordHint(m.panelContent(active), active, th)
+		return m.renderPanel(content, active, th)
+	}
+}
+
+// renderLeftSlot renders the left column for the given panel ID.
+// Session gets the composite left panel with border; FileTree gets a standard panel.
+// In git mode, FileTree slot renders the git explorer instead.
+func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
+	if id == component.FocusFileTree {
+		if m.gitMode {
+			return m.renderGitPanelBordered(th)
+		}
+		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
+	}
+	return m.renderLeftPanelBordered(th)
+}
+
+// panelContent returns the raw view content for a swappable panel.
+func (m *AppModel) panelContent(id component.FocusID) string {
+	switch id {
+	case component.FocusChat:
+		return m.chat.View()
+	case component.FocusCodeViewer:
+		if m.gitMode {
+			return m.commitTree.View(m.cursorVisible)
+		}
+		return m.codePanelView()
+	case component.FocusFileTree:
+		if m.gitMode {
+			return m.gitPanel.View(m.cursorVisible)
+		}
+		return m.fileTree.View(m.cursorVisible)
+	case component.FocusGitPanel:
+		return m.gitPanel.View(m.cursorVisible)
+	case component.FocusCommitTree:
+		return m.commitTree.View(m.cursorVisible)
+	default:
+		return ""
+	}
+}
+
+// chordHintLines is the number of lines consumed by the chord hint overlay
+// (label row + divider row).
+const chordHintLines = 2
+
+// overlayChordHint prepends the chord hint bar to content when a chord is active.
+// The content is trimmed from the bottom so the total line count stays within
+// the panel's inner height budget, preventing border clipping from MaxHeight.
+func (m *AppModel) overlayChordHint(content string, panelID component.FocusID, th *theme.Theme) string {
+	hint := m.chordHint(th)
+	if hint == "" {
+		return content
+	}
+	w, h := m.layout.GetPanelSize(panelID)
+	innerW := max(w-panelBorderSize, 1)
+	innerH := max(h-panelBorderSize, 1)
+	hintWidth := lipgloss.Width(hint)
+	pad := max(innerW-hintWidth, 0)
+	divider := lipgloss.NewStyle().
+		Foreground(th.Palette.Border).
+		Render(strings.Repeat("\u2500", innerW))
+
+	// Trim content from the bottom to make room for the hint + divider,
+	// keeping total output within innerH lines.
+	lines := strings.Split(content, "\n")
+	maxContent := max(innerH-chordHintLines, 0)
+	if len(lines) > maxContent {
+		lines = lines[:maxContent]
+	}
+
+	return strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + strings.Join(lines, "\n")
+}
+
+// isLeftPanelFocused returns true when either sub-section of the left panel has focus.
+func (m *AppModel) isLeftPanelFocused() bool {
+	return m.focus.IsFocused(component.FocusSessionPanel) || m.focus.IsFocused(component.FocusAgentPanel)
+}
+
+// renderLeftPanelBordered wraps the left panel content in a border that activates
+// when either sessions or agents is focused.
+func (m *AppModel) renderLeftPanelBordered(th *theme.Theme) string {
+	return m.borderLeftPanel(m.renderLeftPanel(th), th)
+}
+
+// borderLeftPanel wraps arbitrary content in the left panel's border frame.
+func (m *AppModel) borderLeftPanel(content string, th *theme.Theme) string {
+	w, h := m.layout.GetPanelSize(component.FocusSessionPanel)
+	border := th.InactiveBorder
+	if m.isLeftPanelFocused() {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderLeftPanel stacks sessions and agents with line-extended headers and a divider.
+func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
+	leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+	innerW := max(leftW-panelBorderSize, 1)
+
+	sessionsFocused := m.focus.IsFocused(component.FocusSessionPanel)
+	agentsFocused := m.focus.IsFocused(component.FocusAgentPanel)
+
+	dividerStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
+	divider := lipgloss.NewStyle().PaddingTop(1).Render(
+		dividerStyle.Render(strings.Repeat("─", innerW)),
+	)
+
+	return strings.Join([]string{
+		sectionHeader("Sessions", innerW, sessionsFocused, th),
+		m.sessionPanel.View(),
+		divider,
+		sectionHeader("Agents", innerW, agentsFocused, th),
+		m.agentPanel.View(),
+	}, "\n")
+}
+
+// sectionHeader renders a label followed by a trailing line.
+// When focused, the label uses Primary color to indicate the active sub-section.
+func sectionHeader(label string, width int, focused bool, th *theme.Theme) string {
+	labelColor := th.Palette.Muted
+	lineColor := th.Palette.Border
+	if focused {
+		labelColor = th.Palette.Secondary
+	}
+	headerStyle := lipgloss.NewStyle().Foreground(labelColor).Bold(true)
+	lineStyle := lipgloss.NewStyle().Foreground(lineColor)
+
+	text := headerStyle.Render(" " + label + " ")
+	textWidth := lipgloss.Width(text)
+	lineWidth := max(width-textWidth, 0)
+
+	return text + lineStyle.Render(strings.Repeat("─", lineWidth))
+}
+
+// isCodePanelFocused returns true when any sub-panel of the code column
+// (editor, preview, or read-only code viewer) currently has focus.
+func (m *AppModel) isCodePanelFocused() bool {
+	c := m.focus.Current()
+	return c == component.FocusCodeViewer || pane.IsPaneFocus(c)
+}
+
+// isEditorFocused returns true when an editor pane has focus (edit mode).
+func (m *AppModel) isEditorFocused() bool {
+	c := m.focus.Current()
+	if !pane.IsPaneFocus(c) {
+		return false
+	}
+	pid := pane.PaneIDFromFocus(c)
+	_, ok := m.paneEditors[pid]
+	return ok
+}
+
+// isPreviewFocused returns true when the preview pane has focus.
+func (m *AppModel) isPreviewFocused() bool {
+	if m.previewPane == 0 {
+		return false
+	}
+	return m.focus.Current() == pane.PaneFocusID(m.previewPane)
+}
+
+// focusCodePanel sets focus to the code panel: in edit mode, the focused
+// pane's dynamic ID; otherwise the static FocusCodeViewer.
+func (m *AppModel) focusCodePanel() {
+	if m.editMode {
+		m.focus.SetFocus(pane.PaneFocusID(m.focusedPane))
+		return
+	}
+	m.focus.SetFocus(component.FocusCodeViewer)
+}
+
+// renderCodePanelBordered wraps the code panel content in a border that
+// activates when either the editor or preview sub-panel is focused
+// (mirrors renderLeftPanelBordered for the session/agent sub-panels).
+func (m *AppModel) renderCodePanelBordered(th *theme.Theme) string {
+	content := m.codePanelView()
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	border := th.InactiveBorder
+	if m.isCodePanelFocused() {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderGitPanelBordered renders the git explorer panel using the FileTree slot
+// dimensions with border highlight based on FocusGitPanel focus state.
+func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
+	content := m.gitPanel.View(m.cursorVisible)
+	w, h := m.layout.GetPanelSize(component.FocusFileTree)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusGitPanel {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderGitCommitTreeBordered renders the commit tree panel using the CodeViewer
+// slot dimensions with border highlight based on FocusCommitTree focus state.
+func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
+	content := m.commitTree.View(m.cursorVisible)
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusCommitTree {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.Theme) string {
+	w, h := m.layout.GetPanelSize(id)
+	border := th.InactiveBorder
+	if m.focus.IsFocused(id) {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// ---------------------------------------------------------------------------
+// Focus
+// ---------------------------------------------------------------------------
+
+func (m *AppModel) syncFocusState() {
+	current := m.focus.Current()
+
+	// Track which editor pane has focus. When focus moves to a different
+	// editor pane, update focusedPane so all helpers route correctly.
+	if pane.IsPaneFocus(current) {
+		pid := pane.PaneIDFromFocus(current)
+		if _, ok := m.paneEditors[pid]; ok {
+			m.focusedPane = pid
+		}
+	}
+
+	m.chat.SetFocused(current == component.FocusChat)
+	m.input.SetFocused(current == component.FocusInput)
+	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
+	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
+	m.codePanel.SetFocused(current == component.FocusCodeViewer && !m.editMode && !m.hasPreview())
+	for id, ps := range m.paneEditors {
+		focused := current == pane.PaneFocusID(id)
+		ps.editor.SetFocused(focused)
+		if !focused {
+			ps.editor.DismissAllOverlays()
+		}
+	}
+	m.previewPanel.SetFocused(m.isPreviewFocused())
+	m.mdPreviewPanel.SetFocused(m.mdPreviewPane != 0 && current == pane.PaneFocusID(m.mdPreviewPane))
+	m.fileTree.SetFocused(current == component.FocusFileTree)
+
+	// Git mode panels.
+	if m.gitPanel != nil {
+		m.gitPanel.SetFocused(current == component.FocusGitPanel)
+		m.commitTree.SetFocused(current == component.FocusCommitTree)
+	}
+
+	// Sync warp line display for the newly focused editor.
+	m.syncEditorWarpLines()
+
+	// Override the editor status line mode when preview is focused.
+	m.syncPreviewModeDisplay()
+}
+
+// syncPreviewModeDisplay sets the editor status line to PREVIEW mode when
+// the preview panel is focused, and restores the editor's actual mode otherwise.
+func (m *AppModel) syncPreviewModeDisplay() {
+	browsing := m.hasPreview() && m.focus.Current() == component.FocusFileTree
+	if m.isPreviewFocused() || browsing {
+		m.focusedEditor().SetStatusMode(mode.ModePreview)
+		return
+	}
+	if m.isEditorFocused() {
+		m.focusedEditor().RestoreStatusMode()
+	}
+}
+
+// spatialFocusTarget resolves an alt+shift+arrow key to the panel it should
+// navigate to. Delegates to the generic layout.Navigate algorithm over a
+// hierarchical panel grid built from the current layout mode and state.
+func (m *AppModel) spatialFocusTarget(key string) (component.FocusID, bool) {
+	dir, ok := keyToDirection(key)
+	if !ok {
+		return 0, false
+	}
+	grid := m.buildPanelGrid()
+	pos, ok := layout.FindInGrid(grid, m.focus.Current())
+	if !ok {
+		return 0, false
+	}
+	return layout.Navigate(grid, pos, dir)
+}
+
+// keyToDirection maps an alt+shift+arrow key string to a layout.Direction.
+func keyToDirection(key string) (layout.Direction, bool) {
+	switch key {
+	case "alt+shift+right":
+		return layout.DirRight, true
+	case "alt+shift+left":
+		return layout.DirLeft, true
+	case "alt+shift+down":
+		return layout.DirDown, true
+	case "alt+shift+up":
+		return layout.DirUp, true
+	}
+	return 0, false
+}
+
+// buildPanelGrid returns the visible panels as a hierarchical grid of
+// layout.PanelGroup entries. Only panels actually rendered on screen are
+// included. Sub-panels (e.g. Sessions+Agents, Preview+Editor) are encoded
+// within their parent PanelGroup's sub-grid.
+func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
+	// gitResolve translates slot-based focus IDs to git-panel IDs when
+	// git mode is active, so spatial navigation finds the correct panels.
+	gitResolve := func(id component.FocusID) component.FocusID {
+		if !m.gitMode {
+			return id
+		}
+		switch id {
+		case component.FocusFileTree:
+			return component.FocusGitPanel
+		case component.FocusCodeViewer:
+			return component.FocusCommitTree
+		}
+		return id
+	}
+
+	pg := func(id component.FocusID) layout.PanelGroup {
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{{gitResolve(id)}}}
+	}
+
+	leftSubs := func() layout.PanelGroup {
+		return layout.PanelGroup{SubPanels: [][]component.FocusID{
+			{component.FocusSessionPanel},
+			{component.FocusAgentPanel},
+		}}
+	}
+
+	var top []layout.PanelGroup
+
+	switch m.layout.Mode() {
+	case layout.FourColumn:
+		top = []layout.PanelGroup{
+			leftSubs(),
+			pg(component.FocusFileTree),
+			pg(component.FocusChat),
+			m.codePanelGroup(),
+		}
+	case layout.ThreeColumn:
+		left := m.leftRing.current()
+		if left == component.FocusSessionPanel {
+			top = append(top, leftSubs())
+		} else {
+			top = append(top, pg(left))
+		}
+		top = append(top, pg(component.FocusChat), m.codePanelGroup())
+	case layout.TwoColumn:
+		left := m.leftRing.current()
+		right := m.rightRing.current()
+		if left == component.FocusSessionPanel {
+			top = append(top, leftSubs())
+		} else {
+			top = append(top, pg(left))
+		}
+		if right == component.FocusCodeViewer {
+			top = append(top, m.codePanelGroup())
+		} else {
+			top = append(top, pg(right))
+		}
+	default: // SingleColumn
+		active := m.leftRing.current()
+		switch {
+		case active == component.FocusSessionPanel:
+			top = append(top, leftSubs())
+		case active == component.FocusCodeViewer:
+			top = append(top, m.codePanelGroup())
+		default:
+			top = append(top, pg(active))
+		}
+	}
+
+	return [][]layout.PanelGroup{top, {pg(component.FocusInput)}}
+}
+
+// codePanelGroup returns the PanelGroup for the code column, with sub-panels
+// derived from the pane tree for spatial navigation.
+func (m *AppModel) codePanelGroup() layout.PanelGroup {
+	if m.editMode && m.paneTree != nil {
+		return layout.PanelGroup{SubPanels: m.paneTree.ToSubGrid()}
+	}
+	id := component.FocusCodeViewer
+	if m.gitMode {
+		id = component.FocusCommitTree
+	}
+	return layout.PanelGroup{SubPanels: [][]component.FocusID{
+		{id},
+	}}
+}
+
+// ---------------------------------------------------------------------------
+// Bridges
+// ---------------------------------------------------------------------------
+
+func (m *AppModel) startBridges() tea.Cmd {
+	return func() tea.Msg {
+		return bridgeReadyMsg{}
+	}
+}
+
+// bridgeReadyMsg is an internal message signaling that bridges should be started.
+type bridgeReadyMsg struct{}
+
+// StartBridges connects all event bridges to the running tea.Program.
+// This must be called after tea.NewProgram is created.
+func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
+	bridges := []bridge.Bridge{
+		m.activityBridge,
+		m.sessionBridge,
+		m.streamBridge,
+		m.guideBridge,
+		m.lspBridge,
+	}
+	for _, b := range bridges {
+		if err := b.Start(program); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Guide integration
+// ---------------------------------------------------------------------------
+
+func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
+	req := &guide.RouteRequest{
+		CorrelationID: uuid.New().String(),
+		Input:         submit.Text,
+		SourceAgentID: sourceAgentTUI,
+		TargetAgentID: submit.TargetAgent,
+		SessionID:     submit.SessionID,
+		Timestamp:     time.Now(),
+	}
+
+	busMsg := guide.NewRequestMessage("", req)
+
+	return func() tea.Msg {
+		err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg)
+		if err != nil {
+			return msg.StreamErrorMsg{
+				SessionID:     submit.SessionID,
+				CorrelationID: req.CorrelationID,
+				Err:           err,
+			}
+		}
+		return nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tick — demand-driven tick chain
+// ---------------------------------------------------------------------------
+
+// needsFastTick reports whether any 60fps animation is active.
+func (m *AppModel) needsFastTick() bool {
+	return !m.scroll.settled() ||
+		!m.bounceSettled()
+}
+
+// needsDecorTick reports whether low-frequency UI effects are active.
+func (m *AppModel) needsDecorTick() bool {
+	now := time.Now()
+	return m.chat.HasActiveAnimation() ||
+		m.statusBar.IsAnimating() ||
+		now.Before(m.tabArrowFlashLeftUntil) ||
+		now.Before(m.tabArrowFlashRightUntil)
+}
+
+// needsSlowTick reports whether any non-blink, non-LSP debounce needs
+// slow-rate ticking. Cursor blink is handled by BlinkMsg; LSP flush by
+// LSPFlushMsg.
+func (m *AppModel) needsSlowTick() bool {
+	return m.swipe.accum != 0 // Swipe decay pending.
+}
+
+// ensureTick starts or upgrades the tick chain. Returns a tea.Cmd only when
+// a new chain must be scheduled; nil if the current chain already covers it.
+func (m *AppModel) ensureTick(fast bool) tea.Cmd {
+	if fast && m.tickRate != tickFast {
+		m.tickGen++
+		m.tickRate = tickFast
+		return m.tickCmdWith(tickFastInterval)
+	}
+	if m.tickRate == tickIdle {
+		m.tickGen++
+		if fast {
+			m.tickRate = tickFast
+			return m.tickCmdWith(tickFastInterval)
+		}
+		m.tickRate = tickSlow
+		return m.tickCmdWith(tickSlowInterval)
+	}
+	return nil
+}
+
+// tickCmdWith schedules a one-shot tick at the given interval, tagged with
+// the current generation to detect stale chains.
+func (m *AppModel) tickCmdWith(d time.Duration) tea.Cmd {
+	gen := m.tickGen
+	return tea.Tick(d, func(t time.Time) tea.Msg {
+		return msg.TickMsg{Time: t, Gen: gen}
+	})
+}
+
+// continueTickChain returns the next tick command at the appropriate
+// interval, or nil to let the chain stop when nothing needs ticking.
+func (m *AppModel) continueTickChain() tea.Cmd {
+	if m.needsFastTick() {
+		m.tickRate = tickFast
+		return m.tickCmdWith(tickFastInterval)
+	}
+	if m.needsSlowTick() {
+		m.tickRate = tickSlow
+		return m.tickCmdWith(tickSlowInterval)
+	}
+	m.tickRate = tickIdle
+	return nil
+}
+
+// ensureTickAfterDispatch starts or upgrades the tick chain if the
+// dispatch changed state that requires ticking.
+func (m *AppModel) ensureTickAfterDispatch() tea.Cmd {
+	if m.needsFastTick() {
+		return m.ensureTick(true)
+	}
+	if m.needsSlowTick() {
+		return m.ensureTick(false)
+	}
+	return nil
+}
+
+// ensureDecorTick starts the decor tick chain if needed.
+func (m *AppModel) ensureDecorTick() tea.Cmd {
+	if m.decorOn {
+		return nil
+	}
+	m.decorOn = true
+	m.decorGen++
+	gen := m.decorGen
+	return tea.Tick(decorTickInterval, func(t time.Time) tea.Msg {
+		return msg.DecorTickMsg{Time: t, Gen: gen}
+	})
+}
+
+// continueDecorTickChain schedules the next decor tick if effects remain.
+func (m *AppModel) continueDecorTickChain() tea.Cmd {
+	if !m.needsDecorTick() {
+		m.decorOn = false
+		return nil
+	}
+	gen := m.decorGen
+	return tea.Tick(decorTickInterval, func(t time.Time) tea.Msg {
+		return msg.DecorTickMsg{Time: t, Gen: gen}
+	})
+}
+
+// ensureDecorTickAfterDispatch starts decor ticking when needed.
+func (m *AppModel) ensureDecorTickAfterDispatch() tea.Cmd {
+	if m.needsDecorTick() {
+		return m.ensureDecorTick()
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Blink — one-shot cursor blink timer
+// ---------------------------------------------------------------------------
+
+// needsBlink reports whether any component has a cursor that needs blinking.
+func (m *AppModel) needsBlink() bool {
+	if m.editMode {
+		return true
+	}
+	if m.focus.Current() == component.FocusInput {
+		return true
+	}
+	if m.hasPreview() && m.isPreviewFocused() {
+		return true
+	}
+	if m.gitMode && m.gitPanel.NeedsBlink() {
+		return true
+	}
+	return m.fileTree.NeedsBlink()
+}
+
+// blinkPhase computes whether the cursor should be visible based on
+// the wall clock. Phase 0 (visible) starts at blinkEpoch; each
+// blinkHalfPeriod the phase alternates. Using the clock instead of
+// toggle state prevents phase inversion from delayed messages.
+func (m *AppModel) blinkPhase() bool {
+	elapsed := time.Since(m.blinkEpoch)
+	phase := int(elapsed/blinkHalfPeriod) % 2
+	return phase == 0 // 0 = visible, 1 = invisible
+}
+
+// nextBlinkDeadline returns the absolute time of the next phase boundary.
+func (m *AppModel) nextBlinkDeadline() time.Time {
+	elapsed := time.Since(m.blinkEpoch)
+	periods := elapsed/blinkHalfPeriod + 1
+	return m.blinkEpoch.Add(periods * blinkHalfPeriod)
+}
+
+// blinkCmd schedules a timer targeting the next phase boundary.
+// The goroutine sleeps until the absolute deadline, compensating for
+// View() latency and message queue delay.
+func (m *AppModel) blinkCmd() tea.Cmd {
+	gen := m.blinkGen
+	deadline := m.nextBlinkDeadline()
+	return func() tea.Msg {
+		if d := time.Until(deadline); d > 0 {
+			time.Sleep(d)
+		}
+		return msg.BlinkMsg{Gen: gen, Deadline: deadline}
+	}
+}
+
+// handleBlink schedules the next blink timer. Phase sync happens in
+// View() via centralized blink logic, which sets viewDirty only when
+// the phase actually changed — avoiding wasted renders on early/jittered timers.
+func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
+	if blink.Gen != m.blinkGen {
+		return nil
+	}
+	if !m.needsBlink() {
+		return nil
+	}
+	return m.blinkCmd()
+}
+
+// ensureBlinkAfterDispatch starts a blink chain if any component needs
+// cursor blinking. The generation counter ensures at most one chain runs.
+func (m *AppModel) ensureBlinkAfterDispatch() tea.Cmd {
+	if m.needsBlink() {
+		return m.blinkCmd()
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// LSP flush — one-shot debounced didChange
+// ---------------------------------------------------------------------------
+
+// ensureLSPFlush schedules a one-shot LSP flush timer if the editor has
+// pending changes that haven't been scheduled yet (by editGeneration).
+func (m *AppModel) ensureLSPFlush() tea.Cmd {
+	if !m.editMode || !m.focusedEditor().LSPDirty() {
+		return nil
+	}
+	gen := m.focusedEditor().EditGeneration()
+	if gen == m.lspFlushGen {
+		return nil // Already scheduled for this generation.
+	}
+	m.lspFlushGen = gen
+	return tea.Tick(lspDebounceInterval, func(_ time.Time) tea.Msg {
+		return msg.LSPFlushMsg{Gen: gen}
+	})
+}
+
+// handleLSPFlush fires the debounced LSP didChange notification if the
+// editor is still dirty at the same generation as when the timer was scheduled.
+func (m *AppModel) handleLSPFlush(flush msg.LSPFlushMsg) tea.Cmd {
+	if !m.editMode || !m.focusedEditor().LSPDirty() {
+		return nil
+	}
+	if m.focusedEditor().EditGeneration() != flush.Gen {
+		return nil // Stale — more edits happened; a newer flush is pending.
+	}
+	m.focusedEditor().ClearLSPDirty()
+	return m.lspDidChangeCmd(m.focusedEditor().FilePath(), m.focusedEditor().Content())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// appendCmd appends a non-nil command to the slice.
+// clampInt constrains v to [lo, hi].
+func clampInt(v, lo, hi int) int {
+	return max(lo, min(v, hi))
+}
+
+func appendCmd(cmds []tea.Cmd, cmd tea.Cmd) []tea.Cmd {
+	if cmd != nil {
+		return append(cmds, cmd)
+	}
+	return cmds
+}
+
+// programAdapter wraps a *tea.Program to satisfy bridge.TeaProgram.
+// This adapter exists because bridge.TeaProgram.Send uses `any` to avoid
+// importing bubbletea in the bridge package, while tea.Program.Send
+// uses the named type tea.Msg.
+type programAdapter struct {
+	program *tea.Program
+}
+
+func (a *programAdapter) Send(m any) {
+	a.program.Send(m)
+}
+
+// Run creates and runs the Bubble Tea program. This is the main entry point.
+func Run(ctx context.Context, cfg Config, deps Deps) error {
+	// Resolve project root: explicit → git root → CWD.
+	root := cfg.ProjectRoot
+	if root == "" {
+		cwd, _ := os.Getwd()
+		if gitRoot, err := boot.FindGitRoot(cwd); err == nil {
+			root = gitRoot
+		} else {
+			root = cwd
+		}
+		cfg.ProjectRoot = root
+	}
+
+	app := New(ctx, cfg, deps)
+	app.fileTree.SetRoot(root)
+
+	p := tea.NewProgram(
+		app,
+		tea.WithAltScreen(),
+		tea.WithMouseAllMotion(),
+		tea.WithContext(ctx),
+	)
+
+	adapter := &programAdapter{program: p}
+
+	// Start bridges with the program reference via adapter.
+	if err := app.StartBridges(adapter); err != nil {
+		return err
+	}
+
+	// In mock mode, seed data and start the mock agent.
+	if cfg.MockMode {
+		seedMockData(deps)
+		mock := NewMockAgent(deps.GuideBus, deps.ActivityBus, adapter, deps.Scope)
+		if err := mock.Start(); err != nil {
+			return err
+		}
+		defer mock.Stop()
+	}
+
+	_, err := p.Run()
+	if err != nil {
+		return err
+	}
+
+	return app.Shutdown()
+}

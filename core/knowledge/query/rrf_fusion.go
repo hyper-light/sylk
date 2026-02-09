@@ -19,7 +19,7 @@ type QueryWeights struct {
 	// TextWeight is the weight applied to text search (Bleve) results.
 	TextWeight float64 `json:"text_weight"`
 
-	// SemanticWeight is the weight applied to semantic search (HNSW) results.
+	// SemanticWeight is the weight applied to semantic search (vector) results.
 	SemanticWeight float64 `json:"semantic_weight"`
 
 	// GraphWeight is the weight applied to graph traversal results.
@@ -407,7 +407,7 @@ func (rrf *RRFFusion) determineSource(entry *fusionEntry) Source {
 		return SourceBleve
 	}
 	if hasSemantic {
-		return SourceHNSW
+		return SourceVector
 	}
 	if hasGraph {
 		return SourceGraph

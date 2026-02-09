@@ -11,17 +11,17 @@ import (
 )
 
 type UnifiedResolver struct {
-	db          *vectorgraphdb.VectorGraphDB
-	hnsw        HNSWSimilaritySearcher
-	embedder    Embedder
-	intentCache *IntentCache
-	firewall    *HallucinationFirewall
-	freshness   *FreshnessTracker
-	provenance  *ProvenanceTracker
-	trust       *TrustHierarchy
-	conflicts   *ConflictDetector
-	scorer      *ContextQualityScorer
-	prompter    *LLMContextBuilder
+	db             *vectorgraphdb.VectorGraphDB
+	vectorSearcher VectorSimilaritySearcher
+	embedder       Embedder
+	intentCache    *IntentCache
+	firewall       *HallucinationFirewall
+	freshness      *FreshnessTracker
+	provenance     *ProvenanceTracker
+	trust          *TrustHierarchy
+	conflicts      *ConflictDetector
+	scorer         *ContextQualityScorer
+	prompter       *LLMContextBuilder
 }
 
 type ResolveOptions struct {
@@ -171,7 +171,7 @@ func (e *ResolverError) Unwrap() error {
 // Returns an error if the database is nil or config is invalid.
 func NewUnifiedResolver(
 	db *vectorgraphdb.VectorGraphDB,
-	hnsw HNSWSimilaritySearcher,
+	vectorSearcher VectorSimilaritySearcher,
 	embedder Embedder,
 	config ResolverConfig,
 ) (*UnifiedResolver, error) {
@@ -182,21 +182,21 @@ func NewUnifiedResolver(
 	freshness := NewFreshnessTracker(db, DefaultDecayConfig())
 	provenance := NewProvenanceTracker(db)
 	trust := NewTrustHierarchy(db, provenance, freshness)
-	conflicts := NewConflictDetector(db, hnsw, DefaultConflictDetectorConfig())
+	conflicts := NewConflictDetector(db, vectorSearcher, DefaultConflictDetectorConfig())
 	scorer := NewContextQualityScorer(db, DefaultQualityWeights(), freshness, trust)
 	prompter := NewLLMContextBuilder(scorer, trust, conflicts, provenance)
 
 	return &UnifiedResolver{
-		db:          db,
-		hnsw:        hnsw,
-		embedder:    embedder,
-		intentCache: NewIntentCache(config.CacheTTL, config.CacheMaxSize),
-		freshness:   freshness,
-		provenance:  provenance,
-		trust:       trust,
-		conflicts:   conflicts,
-		scorer:      scorer,
-		prompter:    prompter,
+		db:             db,
+		vectorSearcher: vectorSearcher,
+		embedder:       embedder,
+		intentCache:    NewIntentCache(config.CacheTTL, config.CacheMaxSize),
+		freshness:      freshness,
+		provenance:     provenance,
+		trust:          trust,
+		conflicts:      conflicts,
+		scorer:         scorer,
+		prompter:       prompter,
 	}, nil
 }
 
@@ -332,7 +332,7 @@ func (r *UnifiedResolver) generateEmbedding(ctx context.Context, query string, m
 	defer func() { metrics.Embedding = time.Since(start) }()
 
 	if r.embedder == nil {
-		return make([]float32, 768), nil
+		return make([]float32, 1024), nil
 	}
 
 	return r.embedder.Embed(query)
@@ -347,18 +347,18 @@ func (r *UnifiedResolver) executeSearch(
 	start := time.Now()
 	defer func() { metrics.VectorSearch = time.Since(start) }()
 
-	if r.hnsw == nil {
+	if r.vectorSearcher == nil {
 		return nil
 	}
 
 	domains := r.selectDomains(opts.Domains, intent)
-	filter := &vectorgraphdb.HNSWSearchFilter{
+	filter := &vectorgraphdb.VectorIndexSearchFilter{
 		Domains:       domains,
 		MinSimilarity: 0.5,
 	}
 
-	hnswResults := r.hnsw.Search(embedding, 50, filter)
-	return r.convertResults(hnswResults)
+	searchResults := r.vectorSearcher.Search(embedding, 50, filter)
+	return r.convertResults(searchResults)
 }
 
 var intentToDomains = map[QueryIntent][]vectorgraphdb.Domain{
@@ -383,18 +383,18 @@ func (r *UnifiedResolver) selectDomains(requested []vectorgraphdb.Domain, intent
 	return allDomains
 }
 
-func (r *UnifiedResolver) convertResults(hnswResults []vectorgraphdb.HNSWSearchResult) []vectorgraphdb.SearchResult {
+func (r *UnifiedResolver) convertResults(searchResults []vectorgraphdb.VectorIndexSearchResult) []vectorgraphdb.SearchResult {
 	ns := vectorgraphdb.NewNodeStore(r.db, nil)
-	results := make([]vectorgraphdb.SearchResult, 0, len(hnswResults))
+	results := make([]vectorgraphdb.SearchResult, 0, len(searchResults))
 
-	for _, hr := range hnswResults {
-		node, err := ns.GetNode(hr.ID)
+	for _, sr := range searchResults {
+		node, err := ns.GetNode(sr.ID)
 		if err != nil {
 			continue
 		}
 		results = append(results, vectorgraphdb.SearchResult{
 			Node:       node,
-			Similarity: hr.Similarity,
+			Similarity: sr.Similarity,
 		})
 	}
 

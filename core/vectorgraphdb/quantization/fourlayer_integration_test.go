@@ -715,7 +715,7 @@ func TestFourLayerPipeline_EndToEnd(t *testing.T) {
 		t.Skip("skipping end-to-end test in short mode")
 	}
 
-	const dim = 128 // Realistic for small embeddings (reduced from 768)
+	const dim = 128 // Realistic for small embeddings (reduced from 1024)
 	const numDB = 5000
 	const numQueries = 100
 	const k = 10

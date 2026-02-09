@@ -210,7 +210,7 @@ func TestDefaultSchemaConfig_ContentFieldUsesCodeAnalyzer(t *testing.T) {
 
 	require.NotNil(t, field)
 	assert.Equal(t, "code", field.Analyzer)
-	assert.True(t, field.IncludeInAll)
+	assert.False(t, field.IncludeInAll)
 }
 
 func TestDefaultSchemaConfig_PathFieldUsesKeywordAnalyzer(t *testing.T) {

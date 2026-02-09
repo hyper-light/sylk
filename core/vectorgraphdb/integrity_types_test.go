@@ -106,7 +106,7 @@ func TestStandardChecksCompleteness(t *testing.T) {
 		"orphaned_vectors",
 		"orphaned_edges_source",
 		"orphaned_edges_target",
-		"invalid_hnsw_entry",
+		"invalid_vector_index_meta",
 		"dimension_mismatch",
 		"superseded_cycle",
 		"orphaned_provenance",
@@ -157,13 +157,13 @@ func TestStandardChecksHaveRequiredFields(t *testing.T) {
 
 func TestStandardChecksSeverities(t *testing.T) {
 	expectedSeverities := map[string]Severity{
-		"orphaned_vectors":      SeverityError,
-		"orphaned_edges_source": SeverityError,
-		"orphaned_edges_target": SeverityError,
-		"invalid_hnsw_entry":    SeverityCritical,
-		"dimension_mismatch":    SeverityCritical,
-		"superseded_cycle":      SeverityError,
-		"orphaned_provenance":   SeverityWarning,
+		"orphaned_vectors":          SeverityError,
+		"orphaned_edges_source":     SeverityError,
+		"orphaned_edges_target":     SeverityError,
+		"invalid_vector_index_meta": SeverityCritical,
+		"dimension_mismatch":        SeverityCritical,
+		"superseded_cycle":          SeverityError,
+		"orphaned_provenance":       SeverityWarning,
 	}
 
 	for _, check := range StandardChecks() {
@@ -226,8 +226,7 @@ func TestDimensionMismatchUsesConstant(t *testing.T) {
 		t.Fatal("expected to find dimension_mismatch check")
 	}
 
-	// The query should contain the EmbeddingDimension constant value
-	expectedSubstring := "768"
+	expectedSubstring := "1024"
 	if len(check.Query) == 0 {
 		t.Fatal("dimension_mismatch query is empty")
 	}
@@ -444,7 +443,7 @@ func TestChecksWithRepair(t *testing.T) {
 		"orphaned_vectors",
 		"orphaned_edges_source",
 		"orphaned_edges_target",
-		"invalid_hnsw_entry",
+		"invalid_vector_index_meta",
 		"orphaned_provenance",
 	}
 

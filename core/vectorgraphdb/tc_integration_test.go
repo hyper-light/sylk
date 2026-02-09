@@ -51,7 +51,7 @@ func setupTCQueryEngine(t *testing.T) (*TCQueryEngine, *VectorGraphDB, string) {
 	tcIndex := relations.NewVersionedIntervalIndex(graph, tcData)
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 1.0},
 		{ID: "B", Similarity: 0.9},
 		{ID: "C", Similarity: 0.8},

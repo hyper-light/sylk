@@ -18,7 +18,7 @@ func TestQueryEngineHybridQuery(t *testing.T) {
 	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 0.95},
 		{ID: "B", Similarity: 0.8},
 		{ID: "C", Similarity: 0.4},
@@ -53,7 +53,7 @@ func TestQueryEngineHybridQueryWithOptions(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "B", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.9, 0.2, 0.1})
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 0.9},
 		{ID: "B", Similarity: 0.3},
 	})
@@ -92,7 +92,7 @@ func TestQueryEngineQueryByContext(t *testing.T) {
 	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 0.9},
 		{ID: "B", Similarity: 0.85},
 	})
@@ -126,7 +126,7 @@ func TestQueryEngineSemanticExpand(t *testing.T) {
 
 	mock := newMockHNSWSearcher()
 	mock.addVector("A", []float32{1, 0.1, 0.1})
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 1.0},
 		{ID: "B", Similarity: 0.9},
 	})
@@ -178,7 +178,7 @@ func TestQueryEngineRelatedInDomain(t *testing.T) {
 
 	mock := newMockHNSWSearcher()
 	mock.addVector("A", []float32{1, 0.1, 0.1})
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 1.0, Domain: DomainCode},
 		{ID: "B", Similarity: 0.9, Domain: DomainCode},
 	})
@@ -209,7 +209,7 @@ func TestQueryEngineCrossDomainQuery(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "hist1", Domain: DomainHistory, NodeType: NodeTypeSession}, []float32{0.9, 0.2, 0.1})
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "code1", Similarity: 0.9, Domain: DomainCode},
 		{ID: "hist1", Similarity: 0.8, Domain: DomainHistory},
 	})
@@ -244,7 +244,7 @@ func TestQueryEngineResultOrdering(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "C", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{0.3, 0.3, 0.9})
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 0.9},
 		{ID: "B", Similarity: 0.5},
 		{ID: "C", Similarity: 0.3},
@@ -272,7 +272,7 @@ func TestQueryEngineEmptyVectorSearch(t *testing.T) {
 	defer cleanupDB(db, path)
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{})
+	mock.setResults([]VectorIndexSearchResult{})
 	mock.addVector("A", []float32{1, 0.1, 0.1})
 
 	vs := NewVectorSearcher(db, mock)
@@ -298,7 +298,7 @@ func TestQueryEngineDefaultWeights(t *testing.T) {
 	ns.InsertNode(&GraphNode{ID: "A", Domain: DomainCode, NodeType: NodeTypeFile}, []float32{1, 0.1, 0.1})
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{{ID: "A", Similarity: 0.9}})
+	mock.setResults([]VectorIndexSearchResult{{ID: "A", Similarity: 0.9}})
 	mock.addVector("A", []float32{1, 0.1, 0.1})
 
 	vs := NewVectorSearcher(db, mock)
@@ -328,7 +328,7 @@ func TestQueryEngineHybridScoring(t *testing.T) {
 	es.InsertEdge(&GraphEdge{SourceID: "A", TargetID: "B", EdgeType: EdgeTypeCalls})
 
 	mock := newMockHNSWSearcher()
-	mock.setResults([]HNSWSearchResult{
+	mock.setResults([]VectorIndexSearchResult{
 		{ID: "A", Similarity: 1.0},
 		{ID: "B", Similarity: 0.5},
 	})
@@ -375,11 +375,11 @@ func TestQueryEngineBatchLoading(t *testing.T) {
 		es.InsertEdge(&GraphEdge{SourceID: nodeID(i), TargetID: nodeID(i + 1), EdgeType: EdgeTypeCalls})
 	}
 
-	// Setup mock HNSW with results
+	// Setup mock vector index with results
 	mock := newMockHNSWSearcher()
-	results := make([]HNSWSearchResult, nodeCount)
+	results := make([]VectorIndexSearchResult, nodeCount)
 	for i := 0; i < nodeCount; i++ {
-		results[i] = HNSWSearchResult{ID: nodeID(i), Similarity: float64(nodeCount-i) / float64(nodeCount)}
+		results[i] = VectorIndexSearchResult{ID: nodeID(i), Similarity: float64(nodeCount-i) / float64(nodeCount)}
 	}
 	mock.setResults(results)
 	mock.addVector(nodeID(0), []float32{1, 0.1, 0.1})

@@ -34,17 +34,17 @@ func TestDefaultConstants(t *testing.T) {
 }
 
 func TestCompressionRatio(t *testing.T) {
-	// Verify that 768-dim vectors with 32 subspaces achieve 32x compression
-	vectorDim := 768
+	// Verify that 1024-dim vectors with 32 subspaces achieve 128x compression
+	vectorDim := 1024
 	numSubspaces := DefaultNumSubspaces
 	bytesPerFloat := 4
 
-	originalSize := vectorDim * bytesPerFloat // 768 * 4 = 3072 bytes
+	originalSize := vectorDim * bytesPerFloat // 1024 * 4 = 4096 bytes
 	compressedSize := numSubspaces            // 32 bytes (one uint8 per subspace)
 
 	compressionRatio := originalSize / compressedSize
-	if compressionRatio != 96 {
-		t.Errorf("compression ratio = %d, want 96 (3072 bytes -> 32 bytes)", compressionRatio)
+	if compressionRatio != 128 {
+		t.Errorf("compression ratio = %d, want 128 (4096 bytes -> 32 bytes)", compressionRatio)
 	}
 }
 
@@ -291,18 +291,18 @@ func TestNewProductQuantizer(t *testing.T) {
 		checkFunc   func(t *testing.T, pq *ProductQuantizer)
 	}{
 		{
-			name:      "768-dim with default config",
-			vectorDim: 768,
+			name:      "1024-dim with default config",
+			vectorDim: 1024,
 			config:    DefaultProductQuantizerConfig(),
 			checkFunc: func(t *testing.T, pq *ProductQuantizer) {
-				if pq.VectorDim() != 768 {
-					t.Errorf("VectorDim() = %d, want 768", pq.VectorDim())
+				if pq.VectorDim() != 1024 {
+					t.Errorf("VectorDim() = %d, want 1024", pq.VectorDim())
 				}
 				if pq.NumSubspaces() != 32 {
 					t.Errorf("NumSubspaces() = %d, want 32", pq.NumSubspaces())
 				}
-				if pq.SubspaceDim() != 24 {
-					t.Errorf("SubspaceDim() = %d, want 24", pq.SubspaceDim())
+				if pq.SubspaceDim() != 32 {
+					t.Errorf("SubspaceDim() = %d, want 32", pq.SubspaceDim())
 				}
 				if pq.CentroidsPerSubspace() != 256 {
 					t.Errorf("CentroidsPerSubspace() = %d, want 256", pq.CentroidsPerSubspace())
@@ -333,7 +333,7 @@ func TestNewProductQuantizer(t *testing.T) {
 		},
 		{
 			name:      "zero config uses defaults",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config:    ProductQuantizerConfig{},
 			checkFunc: func(t *testing.T, pq *ProductQuantizer) {
 				if pq.NumSubspaces() != DefaultNumSubspaces {
@@ -358,7 +358,7 @@ func TestNewProductQuantizer(t *testing.T) {
 		},
 		{
 			name:      "invalid num subspaces negative",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config: ProductQuantizerConfig{
 				NumSubspaces:         -1,
 				CentroidsPerSubspace: 256,
@@ -367,7 +367,7 @@ func TestNewProductQuantizer(t *testing.T) {
 		},
 		{
 			name:      "invalid centroids zero",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config: ProductQuantizerConfig{
 				NumSubspaces:         32,
 				CentroidsPerSubspace: 0,
@@ -381,7 +381,7 @@ func TestNewProductQuantizer(t *testing.T) {
 		},
 		{
 			name:      "invalid centroids negative",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config: ProductQuantizerConfig{
 				NumSubspaces:         32,
 				CentroidsPerSubspace: -1,
@@ -390,7 +390,7 @@ func TestNewProductQuantizer(t *testing.T) {
 		},
 		{
 			name:      "invalid centroids too large",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config: ProductQuantizerConfig{
 				NumSubspaces:         32,
 				CentroidsPerSubspace: 257,
@@ -421,7 +421,7 @@ func TestNewProductQuantizer(t *testing.T) {
 		},
 		{
 			name:      "single subspace",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config: ProductQuantizerConfig{
 				NumSubspaces:         1,
 				CentroidsPerSubspace: 256,
@@ -430,14 +430,14 @@ func TestNewProductQuantizer(t *testing.T) {
 				if pq.NumSubspaces() != 1 {
 					t.Errorf("NumSubspaces() = %d, want 1", pq.NumSubspaces())
 				}
-				if pq.SubspaceDim() != 768 {
-					t.Errorf("SubspaceDim() = %d, want 768", pq.SubspaceDim())
+				if pq.SubspaceDim() != 1024 {
+					t.Errorf("SubspaceDim() = %d, want 1024", pq.SubspaceDim())
 				}
 			},
 		},
 		{
 			name:      "boundary centroids 256",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config: ProductQuantizerConfig{
 				NumSubspaces:         32,
 				CentroidsPerSubspace: 256,
@@ -450,7 +450,7 @@ func TestNewProductQuantizer(t *testing.T) {
 		},
 		{
 			name:      "boundary centroids 1",
-			vectorDim: 768,
+			vectorDim: 1024,
 			config: ProductQuantizerConfig{
 				NumSubspaces:         32,
 				CentroidsPerSubspace: 1,
@@ -492,7 +492,7 @@ func TestNewProductQuantizer(t *testing.T) {
 }
 
 func TestProductQuantizerIsTrained(t *testing.T) {
-	pq, err := NewProductQuantizer(768, DefaultProductQuantizerConfig())
+	pq, err := NewProductQuantizer(1024, DefaultProductQuantizerConfig())
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
@@ -504,7 +504,7 @@ func TestProductQuantizerIsTrained(t *testing.T) {
 }
 
 func TestProductQuantizerCentroidsNotTrained(t *testing.T) {
-	pq, err := NewProductQuantizer(768, DefaultProductQuantizerConfig())
+	pq, err := NewProductQuantizer(1024, DefaultProductQuantizerConfig())
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
@@ -620,9 +620,9 @@ func TestPQCodeMemorySize(t *testing.T) {
 	}
 }
 
-func TestProductQuantizer768DimCompression(t *testing.T) {
-	// Verify the advertised 32x compression for 768-dim vectors
-	pq, err := NewProductQuantizer(768, DefaultProductQuantizerConfig())
+func TestProductQuantizer1024DimCompression(t *testing.T) {
+	// Verify the advertised 128x compression for 1024-dim vectors
+	pq, err := NewProductQuantizer(1024, DefaultProductQuantizerConfig())
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
@@ -630,20 +630,20 @@ func TestProductQuantizer768DimCompression(t *testing.T) {
 	originalBytes := pq.VectorDim() * 4  // float32 = 4 bytes
 	compressedBytes := pq.NumSubspaces() // uint8 = 1 byte per subspace
 
-	// 768 * 4 = 3072 bytes original
+	// 1024 * 4 = 4096 bytes original
 	// 32 bytes compressed
-	// Compression ratio = 3072 / 32 = 96
+	// Compression ratio = 4096 / 32 = 128
 
-	if originalBytes != 3072 {
-		t.Errorf("original size = %d bytes, want 3072", originalBytes)
+	if originalBytes != 4096 {
+		t.Errorf("original size = %d bytes, want 4096", originalBytes)
 	}
 	if compressedBytes != 32 {
 		t.Errorf("compressed size = %d bytes, want 32", compressedBytes)
 	}
 
 	ratio := originalBytes / compressedBytes
-	if ratio != 96 {
-		t.Errorf("compression ratio = %d:1, want 96:1", ratio)
+	if ratio != 128 {
+		t.Errorf("compression ratio = %d:1, want 128:1", ratio)
 	}
 }
 
@@ -1985,7 +1985,7 @@ func BenchmarkKmeansppInit(b *testing.B) {
 }
 
 func BenchmarkTrainSubspace(b *testing.B) {
-	pq, _ := NewProductQuantizer(768, DefaultProductQuantizerConfig())
+	pq, _ := NewProductQuantizer(1024, DefaultProductQuantizerConfig())
 
 	// Create test data
 	rng := rand.New(rand.NewSource(42))
@@ -2780,7 +2780,7 @@ func TestSubspaceExtraction_NaiveVsBatch(t *testing.T) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, err := NewProductQuantizer(768, config)
+	pq, err := NewProductQuantizer(1024, config)
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
@@ -2790,7 +2790,7 @@ func TestSubspaceExtraction_NaiveVsBatch(t *testing.T) {
 	numVectors := 1000
 	vectors := make([][]float32, numVectors)
 	for i := range vectors {
-		vectors[i] = make([]float32, 768)
+		vectors[i] = make([]float32, 1024)
 		for j := range vectors[i] {
 			vectors[i][j] = rng.Float32()*2 - 1 // [-1, 1]
 		}
@@ -2966,8 +2966,8 @@ func BenchmarkSubspaceExtraction_Naive(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
-	vectors := generateTrainingVectors(1000, 768, 42)
+	pq, _ := NewProductQuantizer(1024, config)
+	vectors := generateTrainingVectors(1000, 1024, 42)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -2981,8 +2981,8 @@ func BenchmarkSubspaceExtraction_Batch(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
-	vectors := generateTrainingVectors(1000, 768, 42)
+	pq, _ := NewProductQuantizer(1024, config)
+	vectors := generateTrainingVectors(1000, 1024, 42)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -2996,8 +2996,8 @@ func BenchmarkSubspaceExtraction_Allocations(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
-	vectors := generateTrainingVectors(1000, 768, 42)
+	pq, _ := NewProductQuantizer(1024, config)
+	vectors := generateTrainingVectors(1000, 1024, 42)
 
 	b.Run("Naive", func(b *testing.B) {
 		b.ReportAllocs()
@@ -3083,8 +3083,8 @@ func BenchmarkExtractSubspace(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
-	vectors := generateTrainingVectors(1000, 768, 42)
+	pq, _ := NewProductQuantizer(1024, config)
+	vectors := generateTrainingVectors(1000, 1024, 42)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -3443,7 +3443,7 @@ func TestComputeDistanceTable_BLASvsScalar(t *testing.T) {
 	}{
 		{"small_4x8", 32, 4, 8, 100},
 		{"medium_8x16", 64, 8, 16, 200},
-		{"typical_32x256", 768, 32, 256, 3000},
+		{"typical_32x256", 1024, 32, 256, 3000},
 		{"large_subspace_16x64", 256, 16, 64, 1000},
 	}
 
@@ -4349,10 +4349,10 @@ func BenchmarkProductQuantizer_Encode(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
 	// Train
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		Seed:            12345,
@@ -4373,10 +4373,10 @@ func BenchmarkProductQuantizer_ComputeDistanceTable(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
 	// Train
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		Seed:            12345,
@@ -4419,7 +4419,7 @@ func BenchmarkDistanceTable_BLAS(b *testing.B) {
 	}{
 		{"small_32d_4x8", 32, 4, 8},
 		{"medium_128d_8x32", 128, 8, 32},
-		{"typical_768d_32x256", 768, 32, 256},
+		{"typical_1024d_32x256", 1024, 32, 256},
 		{"large_1536d_48x256", 1536, 48, 256},
 	}
 
@@ -4462,7 +4462,7 @@ func BenchmarkDistanceTable_Scalar(b *testing.B) {
 	}{
 		{"small_32d_4x8", 32, 4, 8},
 		{"medium_128d_8x32", 128, 8, 32},
-		{"typical_768d_32x256", 768, 32, 256},
+		{"typical_1024d_32x256", 1024, 32, 256},
 		{"large_1536d_48x256", 1536, 48, 256},
 	}
 
@@ -4501,9 +4501,9 @@ func BenchmarkDistanceTable_Comparison(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{MaxIterations: 20, Seed: 12345, MinSamplesRatio: 10.0}
 	pq.TrainWithConfig(context.Background(), vectors, trainConfig)
 
@@ -4529,10 +4529,10 @@ func BenchmarkProductQuantizer_AsymmetricDistance(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
 	// Train
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		Seed:            12345,
@@ -4555,10 +4555,10 @@ func BenchmarkProductQuantizer_EncodeBatch_100(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
 	// Train
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		Seed:            12345,
@@ -4579,10 +4579,10 @@ func BenchmarkProductQuantizer_AsymmetricDistanceBatch_1000(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
 	// Train
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		Seed:            12345,
@@ -4607,7 +4607,7 @@ func BenchmarkProductQuantizer_AsymmetricDistanceBatch_1000(b *testing.B) {
 // =============================================================================
 
 func TestProductQuantizer_MarshalBinary_NotTrained(t *testing.T) {
-	pq, err := NewProductQuantizer(768, DefaultProductQuantizerConfig())
+	pq, err := NewProductQuantizer(1024, DefaultProductQuantizerConfig())
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
@@ -4704,18 +4704,18 @@ func TestProductQuantizer_Serialization_RoundTrip(t *testing.T) {
 }
 
 func TestProductQuantizer_Serialization_LargeQuantizer(t *testing.T) {
-	// Test serialization with larger dimensions (768-dim, 32 subspaces, 256 centroids)
+	// Test serialization with larger dimensions (1024-dim, 32 subspaces, 256 centroids)
 	config := ProductQuantizerConfig{
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, err := NewProductQuantizer(768, config)
+	pq, err := NewProductQuantizer(1024, config)
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
 
 	// Train using parallel training for performance
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		NumRestarts:     2, // Reduce restarts for faster test
@@ -4731,7 +4731,7 @@ func TestProductQuantizer_Serialization_LargeQuantizer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalBinary() error = %v", err)
 	}
-	t.Logf("Serialized 768-dim, 32 subspaces, 256 centroids: %d bytes", len(data))
+	t.Logf("Serialized 1024-dim, 32 subspaces, 256 centroids: %d bytes", len(data))
 
 	// Deserialize
 	pq2 := &ProductQuantizer{}
@@ -5163,8 +5163,8 @@ func TestProductQuantizer_SearchAccuracy_RecallReport(t *testing.T) {
 
 func TestProductQuantizer_Compression_VerifyRatio(t *testing.T) {
 	// Verify compression ratio
-	// 768-dim float32 (3072 bytes) -> 32-byte PQCode
-	// Expected: 96x compression
+	// 1024-dim float32 (4096 bytes) -> 32-byte PQCode
+	// Expected: 128x compression
 
 	tests := []struct {
 		name             string
@@ -5174,11 +5174,11 @@ func TestProductQuantizer_Compression_VerifyRatio(t *testing.T) {
 		expectedRatio    int
 	}{
 		{
-			name:             "768-dim with 32 subspaces",
-			vectorDim:        768,
+			name:             "1024-dim with 32 subspaces",
+			vectorDim:        1024,
 			numSubspaces:     32,
 			expectedCodeSize: 32,
-			expectedRatio:    96, // 768*4 / 32 = 96
+			expectedRatio:    128, // 1024*4 / 32 = 128
 		},
 		{
 			name:             "512-dim with 64 subspaces",
@@ -5186,13 +5186,6 @@ func TestProductQuantizer_Compression_VerifyRatio(t *testing.T) {
 			numSubspaces:     64,
 			expectedCodeSize: 64,
 			expectedRatio:    32, // 512*4 / 64 = 32
-		},
-		{
-			name:             "1024-dim with 32 subspaces",
-			vectorDim:        1024,
-			numSubspaces:     32,
-			expectedCodeSize: 32,
-			expectedRatio:    128, // 1024*4 / 32 = 128
 		},
 	}
 
@@ -5224,13 +5217,13 @@ func TestProductQuantizer_Compression_ActualMemory(t *testing.T) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, err := NewProductQuantizer(768, config)
+	pq, err := NewProductQuantizer(1024, config)
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
 
 	// Train using parallel for performance
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		NumRestarts:     2,
@@ -5250,7 +5243,7 @@ func TestProductQuantizer_Compression_ActualMemory(t *testing.T) {
 	// Measure code size using MarshalBinary
 	codeBytes, _ := code.MarshalBinary()
 
-	originalSize := 768 * 4 // 3072 bytes
+	originalSize := 1024 * 4 // 4096 bytes
 	compressedSize := len(codeBytes)
 
 	t.Logf("Original vector size: %d bytes", originalSize)
@@ -5269,13 +5262,13 @@ func TestProductQuantizer_Compression_BatchStorage(t *testing.T) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, err := NewProductQuantizer(768, config)
+	pq, err := NewProductQuantizer(1024, config)
 	if err != nil {
 		t.Fatalf("failed to create ProductQuantizer: %v", err)
 	}
 
 	// Train using parallel for performance
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		NumRestarts:     2,
@@ -5291,8 +5284,8 @@ func TestProductQuantizer_Compression_BatchStorage(t *testing.T) {
 	codes, _ := pq.EncodeBatch(vectors[:numVectors], 4)
 
 	// Calculate storage
-	originalStorage := numVectors * 768 * 4 // float32 vectors
-	compressedStorage := numVectors * 32    // PQ codes
+	originalStorage := numVectors * 1024 * 4 // float32 vectors
+	compressedStorage := numVectors * 32     // PQ codes
 
 	t.Logf("Storing %d vectors:", numVectors)
 	t.Logf("  Original: %d bytes (%.2f MB)", originalStorage, float64(originalStorage)/(1024*1024))
@@ -5315,9 +5308,9 @@ func BenchmarkProductQuantizer_MarshalBinary(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		NumRestarts:     2,
@@ -5337,9 +5330,9 @@ func BenchmarkProductQuantizer_UnmarshalBinary(b *testing.B) {
 		NumSubspaces:         32,
 		CentroidsPerSubspace: 256,
 	}
-	pq, _ := NewProductQuantizer(768, config)
+	pq, _ := NewProductQuantizer(1024, config)
 
-	vectors := generateTrainingVectors(3000, 768, 42)
+	vectors := generateTrainingVectors(3000, 1024, 42)
 	trainConfig := TrainConfig{
 		MaxIterations:   20,
 		NumRestarts:     2,
@@ -5630,7 +5623,7 @@ func TestEncodeBatch_GoldenTest_DifferentConfigurations(t *testing.T) {
 		{"small_4x8", 32, 4, 8, false},
 		{"medium_8x32", 64, 8, 32, false},
 		{"large_16x64", 128, 16, 64, false},
-		{"max_16x128", 256, 16, 128, true}, // Reduced from 768/32/256 for faster CI
+		{"max_16x128", 256, 16, 128, true}, // Reduced from 1024/32/256 for faster CI
 	}
 
 	for _, cfg := range configs {

@@ -1,0 +1,99 @@
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/session"
+	"github.com/adalundhe/sylk/ui"
+	"github.com/spf13/cobra"
+)
+
+var (
+	tuiTheme string
+	tuiMock  bool
+)
+
+var tuiCmd = &cobra.Command{
+	Use:   "tui",
+	Short: "Launch the interactive terminal UI",
+	Long:  `Launch Sylk's terminal UI with multi-agent chat, session management, and code viewing.`,
+	RunE:  runTUI,
+}
+
+func init() {
+	rootCmd.AddCommand(tuiCmd)
+	tuiCmd.Flags().StringVar(&tuiTheme, "theme", "dark", "Color theme (dark or light)")
+	tuiCmd.Flags().BoolVar(&tuiMock, "mock", false, "Run with mock backend (no real agents)")
+}
+
+func runTUI(_ *cobra.Command, _ []string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	deps, cleanup, err := bootstrapDeps(ctx)
+	if err != nil {
+		return fmt.Errorf("bootstrap: %w", err)
+	}
+	defer cleanup()
+
+	cfg := ui.DefaultConfig()
+	cfg.ThemeMode = parseThemeMode(tuiTheme)
+	cfg.MockMode = tuiMock
+
+	return ui.Run(ctx, cfg, deps)
+}
+
+// activityBusBuffer is the channel size for the activity event bus.
+const activityBusBuffer = 1000
+
+// bootstrapDeps initializes the core systems needed by the TUI.
+// Returns a Deps struct and a cleanup function.
+func bootstrapDeps(ctx context.Context) (ui.Deps, func(), error) {
+	// TUI goroutines are infrastructure, not agent workloads.
+	// A nil budget skips agent-level budget tracking.
+	scope := concurrency.NewGoroutineScope(ctx, "tui", nil)
+	// TUI infrastructure goroutines (LSP readloops, bridges, fan-in) must
+	// survive for the entire editing session. The default 5m max lifetime
+	// would kill these, breaking diagnostics, hover, and references.
+	scope.SetMaxLifetime(24 * time.Hour)
+
+	activityBus := events.NewActivityEventBus(activityBusBuffer)
+	activityBus.Start()
+
+	sessionMgr := session.NewManager(session.ManagerConfig{
+		Scope: scope,
+	})
+
+	guideBus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	streamMgr := guide.NewStreamManager(guide.DefaultStreamConfig())
+
+	cleanup := func() {
+		_ = guideBus.Close()
+		activityBus.Close()
+	}
+
+	deps := ui.Deps{
+		ActivityBus:    activityBus,
+		SessionManager: sessionMgr,
+		GuideBus:       guideBus,
+		StreamManager:  streamMgr,
+		Scope:          scope,
+	}
+
+	return deps, cleanup, nil
+}
+
+// parseThemeMode converts a theme flag string to a ThemeMode.
+func parseThemeMode(s string) ui.ThemeMode {
+	if s == "light" {
+		return ui.ThemeLight
+	}
+	return ui.ThemeDark
+}

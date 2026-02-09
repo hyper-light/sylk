@@ -269,8 +269,8 @@ func (v *SessionScopedView) executeSearch(query []float32, k int) []SearchResult
 
 // searchSnapshot searches the frozen snapshot.
 func (v *SessionScopedView) searchSnapshot(query []float32, k int) []SearchResult {
-	hnswResults := v.snapshot.Search(query, k, nil)
-	return v.convertResults(hnswResults)
+	snapshotResults := v.snapshot.Search(query, k, nil)
+	return v.convertResults(snapshotResults)
 }
 
 // searchLiveIndex searches the live index.
@@ -279,8 +279,8 @@ func (v *SessionScopedView) searchLiveIndex(query []float32, k int) []SearchResu
 		return nil
 	}
 
-	hnswResults := v.liveIndex.Search(query, k, nil)
-	results := v.convertLiveResults(hnswResults)
+	indexResults := v.liveIndex.Search(query, k, nil)
+	results := v.convertLiveResults(indexResults)
 
 	if v.isolation == IsolationSessionLocal {
 		return v.filterSearchResults(results)

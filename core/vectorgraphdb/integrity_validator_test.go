@@ -19,14 +19,6 @@ func setupValidatorTestDB(t *testing.T) (*VectorGraphDB, string) {
 		t.Fatalf("failed to open db: %v", err)
 	}
 
-	// Create hnsw_nodes table for testing (not in main schema)
-	_, err = db.DB().Exec(`CREATE TABLE IF NOT EXISTS hnsw_nodes (
-		node_id TEXT PRIMARY KEY
-	)`)
-	if err != nil {
-		t.Fatalf("failed to create hnsw_nodes table: %v", err)
-	}
-
 	return db, dbPath
 }
 
@@ -44,14 +36,6 @@ func setupValidatorTestDBNoFK(t *testing.T) (*VectorGraphDB, string) {
 	_, err = db.DB().Exec(`PRAGMA foreign_keys = OFF`)
 	if err != nil {
 		t.Fatalf("failed to disable foreign keys: %v", err)
-	}
-
-	// Create hnsw_nodes table for testing (not in main schema)
-	_, err = db.DB().Exec(`CREATE TABLE IF NOT EXISTS hnsw_nodes (
-		node_id TEXT PRIMARY KEY
-	)`)
-	if err != nil {
-		t.Fatalf("failed to create hnsw_nodes table: %v", err)
 	}
 
 	return db, dbPath
@@ -137,7 +121,7 @@ func TestValidateAllReturnsViolations(t *testing.T) {
 
 	// Insert an orphaned vector (no corresponding node) - FK disabled
 	_, err := db.DB().Exec(`INSERT INTO vectors (node_id, embedding, magnitude, dimensions, domain, node_type)
-		VALUES ('orphan1', X'00000000', 1.0, 768, 0, 0)`)
+		VALUES ('orphan1', X'00000000', 1.0, 1024, 0, 0)`)
 	if err != nil {
 		t.Fatalf("failed to insert orphaned vector: %v", err)
 	}
@@ -355,20 +339,20 @@ func TestRunCheckWithOrphanedEdgesTarget(t *testing.T) {
 	}
 }
 
-func TestRunCheckWithInvalidHNSWEntry(t *testing.T) {
+func TestRunCheckWithInvalidVectorIndexMeta(t *testing.T) {
 	db, path := setupValidatorTestDB(t)
 	defer cleanupDB(db, path)
 
-	// Insert an HNSW entry pointing to non-existent node
-	_, err := db.DB().Exec(`INSERT INTO hnsw_nodes (node_id) VALUES ('nonexistent_node')`)
+	// Insert a vector_index_meta entry pointing to non-existent node
+	_, err := db.DB().Exec(`INSERT INTO vector_index_meta (key, value) VALUES ('node:nonexistent_node', 'test')`)
 	if err != nil {
-		t.Fatalf("failed to insert hnsw_nodes entry: %v", err)
+		t.Fatalf("failed to insert vector_index_meta entry: %v", err)
 	}
 
 	cfg := DefaultIntegrityConfig()
 	v := NewIntegrityValidator(db, cfg, slog.Default())
 
-	check, _ := GetCheckByName("invalid_hnsw_entry")
+	check, _ := GetCheckByName("invalid_vector_index_meta")
 	violations, err := v.runCheck(check)
 	if err != nil {
 		t.Fatalf("runCheck: %v", err)

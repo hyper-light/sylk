@@ -158,7 +158,7 @@ func buildCodeField() *mapping.FieldMapping {
 		Analyzer:     "code",
 		Store:        true,
 		Index:        true,
-		IncludeInAll: true,
+		IncludeInAll: false,
 	})
 }
 
@@ -170,7 +170,7 @@ func buildSymbolField() *mapping.FieldMapping {
 		Analyzer:     "symbol",
 		Store:        true,
 		Index:        true,
-		IncludeInAll: true,
+		IncludeInAll: false,
 	})
 }
 
@@ -182,7 +182,7 @@ func buildCommentField() *mapping.FieldMapping {
 		Analyzer:     "comment",
 		Store:        true,
 		Index:        true,
-		IncludeInAll: true,
+		IncludeInAll: false,
 	})
 }
 

@@ -36,7 +36,7 @@ func (dq *DomainQuery) WithExcludedDomains(domains ...domain.Domain) *DomainQuer
 
 // Build constructs a Bleve query combining text search with domain filtering.
 func (dq *DomainQuery) Build() query.Query {
-	textQuery := bleve.NewQueryStringQuery(dq.TextQuery)
+	textQuery := NewMultiFieldTextQuery(dq.TextQuery)
 
 	if len(dq.AllowedDomains) == 0 && len(dq.ExcludeDomains) == 0 {
 		return textQuery
@@ -104,7 +104,7 @@ func BuildDomainExcludeQuery(textQuery string, excludeDomains []domain.Domain) q
 // Optimized for the common case of querying a single agent's domain.
 func BuildSingleDomainQuery(textQuery string, d domain.Domain) query.Query {
 	boolQuery := bleve.NewBooleanQuery()
-	boolQuery.AddMust(bleve.NewQueryStringQuery(textQuery))
+	boolQuery.AddMust(NewMultiFieldTextQuery(textQuery))
 
 	termQuery := bleve.NewTermQuery(d.String())
 	termQuery.SetField(DomainFieldName)

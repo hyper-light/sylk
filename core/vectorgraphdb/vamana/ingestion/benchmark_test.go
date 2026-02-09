@@ -195,7 +195,7 @@ func runIngestionPipeline(t *testing.T, tmpDir string, symbols []symbolInfo) pip
 	stats.serializeTime = time.Since(serializeStart)
 
 	embedStart := time.Now()
-	mock := embedder.NewMockEmbedder(768)
+	mock := embedder.NewDefaultMockEmbedder()
 	embeddings, err := mock.EmbedBatch(context.Background(), texts)
 	if err != nil {
 		t.Fatalf("EmbedBatch failed: %v", err)
@@ -206,7 +206,7 @@ func runIngestionPipeline(t *testing.T, tmpDir string, symbols []symbolInfo) pip
 
 	vectorStore, err := storage.CreateVectorStore(
 		filepath.Join(tmpDir, "vectors.bin"),
-		768,
+		vectorgraphdb.EmbeddingDimension,
 		len(symbols),
 	)
 	if err != nil {
@@ -284,7 +284,7 @@ func verifyIngestion(t *testing.T, tmpDir string, symbols []symbolInfo, stats pi
 	sampleCount := min(100, len(symbols))
 	verified := 0
 
-	mock := embedder.NewMockEmbedder(768)
+	mock := embedder.NewDefaultMockEmbedder()
 
 	for i := range sampleCount {
 		idx := i * len(symbols) / sampleCount
@@ -352,10 +352,11 @@ func verifyIngestion(t *testing.T, tmpDir string, symbols []symbolInfo, stats pi
 	}
 
 	bytesPerSymbol := float64(stats.diskSize) / float64(stats.symbolCount)
-	if bytesPerSymbol > 3300 {
-		t.Logf("WARNING: Disk usage %.0f bytes/symbol exceeds 3.3KB target", bytesPerSymbol)
+	// 1024d vectors = 4096 bytes + overhead ≈ 4.3KB target
+	if bytesPerSymbol > 4400 {
+		t.Logf("WARNING: Disk usage %.0f bytes/symbol exceeds 4.4KB target", bytesPerSymbol)
 	} else {
-		t.Logf("PASS: Disk usage %.0f bytes/symbol within 3.3KB target", bytesPerSymbol)
+		t.Logf("PASS: Disk usage %.0f bytes/symbol within 4.4KB target", bytesPerSymbol)
 	}
 
 	t.Logf("Disk size: %.2f MB", float64(stats.diskSize)/(1024*1024))

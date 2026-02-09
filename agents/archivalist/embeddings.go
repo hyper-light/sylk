@@ -51,7 +51,7 @@ type EmbeddingStoreConfig struct {
 func DefaultEmbeddingStoreConfig() EmbeddingStoreConfig {
 	return EmbeddingStoreConfig{
 		MaxInMemory: 10000,
-		Dimension:   1536, // OpenAI/Voyage default
+		Dimension:   1536,
 	}
 }
 

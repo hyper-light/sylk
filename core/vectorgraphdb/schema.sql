@@ -76,7 +76,7 @@ CREATE TABLE vectors (
     node_id TEXT PRIMARY KEY,
     embedding BLOB NOT NULL,
     magnitude REAL NOT NULL,
-    dimensions INTEGER NOT NULL DEFAULT 768,
+    dimensions INTEGER NOT NULL DEFAULT 1024,
     domain INTEGER NOT NULL,
     node_type INTEGER NOT NULL,
 
@@ -120,18 +120,14 @@ CREATE TABLE conflicts (
 );
 
 -- =============================================================================
--- HNSW INDEX PERSISTENCE
+-- VECTOR INDEX PERSISTENCE (IVF+BBQ+Vamana)
+-- Note: The main vector index persistence is handled by the vamana/storage
+-- package which uses its own optimized binary file format for graph edges,
+-- centroids, and BBQ quantization data. These tables are for metadata only.
 -- =============================================================================
-CREATE TABLE hnsw_meta (
+CREATE TABLE vector_index_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-
-CREATE TABLE hnsw_edges (
-    source_id TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    level INTEGER NOT NULL,
-    PRIMARY KEY (source_id, target_id, level)
 );
 
 -- =============================================================================
@@ -185,5 +181,5 @@ CREATE INDEX IF NOT EXISTS idx_vectors_domain_type ON vectors(domain, node_type)
 CREATE INDEX IF NOT EXISTS idx_provenance_node ON provenance(node_id);
 CREATE INDEX IF NOT EXISTS idx_conflicts_unresolved ON conflicts(resolved) WHERE resolved = FALSE;
 
-CREATE INDEX IF NOT EXISTS idx_hnsw_edges_level ON hnsw_edges(level, source_id);
+-- Note: Vector index graph edges are stored in binary format, not SQL tables
 CREATE INDEX IF NOT EXISTS idx_chunks_node ON academic_chunks(node_id);

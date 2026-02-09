@@ -10,7 +10,7 @@ const (
 	DefaultEfSearch    = 50
 	DefaultLevelMult   = 0.36067977499789996
 
-	EmbeddingDimension = 768
+	EmbeddingDimension = 1024
 
 	DefaultMaxNodes          = 100000
 	DefaultStaleThreshold    = 30 * 24 * time.Hour

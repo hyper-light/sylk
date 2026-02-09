@@ -1,0 +1,6 @@
+[submodule "vendor/go-llama.cpp"]
+	path = vendor/go-llama.cpp
+	url = https://github.com/go-skynet/go-llama.cpp.git
+[submodule "third_party/go-llama.cpp"]
+	path = third_party/go-llama.cpp
+	url = https://github.com/go-skynet/go-llama.cpp.git

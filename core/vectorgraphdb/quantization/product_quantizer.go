@@ -22,7 +22,7 @@ import (
 // =============================================================================
 
 const (
-	// DefaultNumSubspaces splits 768-dim vectors into 32 24-dim subspaces.
+	// DefaultNumSubspaces splits 1024-dim vectors into 32 32-dim subspaces.
 	// This provides a good balance between compression ratio and accuracy.
 	DefaultNumSubspaces = 32
 
@@ -40,8 +40,8 @@ const (
 // =============================================================================
 
 // PQCode represents a product-quantized vector as a sequence of centroid indices.
-// For a 768-dimensional vector with 32 subspaces, this provides 32x compression
-// (768 * 4 bytes = 3072 bytes down to 32 bytes).
+// For a 1024-dimensional vector with 32 subspaces, this provides 128x compression
+// (1024 * 4 bytes = 4096 bytes down to 32 bytes).
 type PQCode []uint8
 
 // NewPQCode creates a new PQCode with the specified number of subspaces.
@@ -950,6 +950,11 @@ func (pq *ProductQuantizer) TrainParallelWithConfig(ctx context.Context, vectors
 
 	// Initialize centroids array
 	pq.centroids = make([][][]float32, pq.numSubspaces)
+
+	// Divide CPU budget: concurrent subspaces share the worker pool.
+	// Each subspace's KMeans gets its fair share to prevent goroutine multiplication.
+	concurrentSubspaces := min(pq.numSubspaces, workers)
+	kmConfig.Workers = max(1, workers/concurrentSubspaces)
 
 	// Use semaphore to limit parallelism
 	sem := make(chan struct{}, workers)

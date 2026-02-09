@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"errors"
 	"os"
 	"slices"
 	"sync"
@@ -83,30 +85,45 @@ func (r *fileReader) worker(ctx context.Context, workChan <-chan FileInfo, wg *s
 	}
 }
 
+// errBinaryFile is returned when a file is detected as binary.
+// readSingleFile silently drops these files (not a parse error).
+var errBinaryFile = errors.New("binary file")
+
 // readSingleFile reads a single file and adds it to results.
 func (r *fileReader) readSingleFile(f FileInfo) {
 	mapped, err := readFileToMapped(f)
 	if err != nil {
-		r.errors.Append(FileParseError{Path: f.Path, Error: err.Error()})
+		if err != errBinaryFile {
+			r.errors.Append(FileParseError{Path: f.Path, Error: err.Error()})
+		}
 		return
 	}
 	r.results.Append(mapped)
 }
 
 // readFileToMapped reads a file and returns a MappedFile.
+// Binary detection is performed here on the already-read data,
+// eliminating the redundant file open that isBinaryFile required.
 func readFileToMapped(f FileInfo) (MappedFile, error) {
 	data, err := os.ReadFile(f.Path)
 	if err != nil {
 		return MappedFile{}, err
 	}
 
-	ext := extractExtension(f.Path)
+	headerLen := min(len(data), binarySniffSize)
+	if bytes.IndexByte(data[:headerLen], 0) >= 0 {
+		return MappedFile{}, errBinaryFile
+	}
+
+	fc := ClassifyFile(f.Path, data[:headerLen])
 
 	return MappedFile{
-		Path: f.Path,
-		Data: data,
-		Lang: GetLanguage(ext),
-		Size: f.Size,
+		Path:        f.Path,
+		Data:        data,
+		Lang:        fc.Lang,
+		DocType:     fc.DocType,
+		Size:        f.Size,
+		ContentHash: sha256.Sum256(data),
 	}, nil
 }
 

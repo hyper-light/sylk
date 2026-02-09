@@ -1,0 +1,169 @@
+package compositor
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestSetStructureResetsCache(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 3, 1, 1)
+
+	if c.HasCache() {
+		t.Fatal("expected no cache after SetStructure")
+	}
+	if !c.IsDirty(SlotLeft) {
+		t.Fatal("expected main dirty after SetStructure")
+	}
+	if !c.IsDirty(SlotInput) {
+		t.Fatal("expected input dirty after SetStructure")
+	}
+	if !c.IsDirty(SlotStatus) {
+		t.Fatal("expected status dirty after SetStructure")
+	}
+}
+
+func TestSingleColumnCompose(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 2, 1, 1)
+
+	c.SetSlotLines(SlotCenter, []string{"chat-line-0", "chat-line-1"})
+	c.SetSlotLines(SlotInput, []string{"input-line"})
+	c.SetSlotLines(SlotStatus, []string{"status-line"})
+
+	got := c.Compose()
+	want := "chat-line-0\nchat-line-1\ninput-line\nstatus-line"
+	if got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+	if !c.HasCache() {
+		t.Fatal("expected cache after Compose")
+	}
+}
+
+func TestTwoColumnSplice(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 0, 0)
+
+	c.SetSlotLines(SlotLeft, []string{"L0", "L1"})
+	c.SetSlotLines(SlotRight, []string{"R0", "R1"})
+
+	got := c.Compose()
+	want := "L0R0\nL1R1"
+	if got != want {
+		t.Fatalf("got: %q, want: %q", got, want)
+	}
+}
+
+func TestPartialDirty(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 1, 1)
+
+	c.SetSlotLines(SlotLeft, []string{"L0", "L1"})
+	c.SetSlotLines(SlotRight, []string{"R0", "R1"})
+	c.SetSlotLines(SlotInput, []string{"inp"})
+	c.SetSlotLines(SlotStatus, []string{"sts"})
+	c.Compose()
+
+	// Update only left column.
+	c.SetSlotLines(SlotLeft, []string{"X0", "X1"})
+
+	// Main should be dirty, input/status should not.
+	if !c.IsDirty(SlotLeft) {
+		t.Fatal("expected main dirty")
+	}
+	if c.IsDirty(SlotInput) {
+		t.Fatal("expected input clean")
+	}
+	if c.IsDirty(SlotStatus) {
+		t.Fatal("expected status clean")
+	}
+
+	got := c.Compose()
+	want := "X0R0\nX1R1\ninp\nsts"
+	if got != want {
+		t.Fatalf("got: %q, want: %q", got, want)
+	}
+}
+
+func TestInvalidateAll(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 1, 1, 1)
+	c.SetSlotLines(SlotCenter, []string{"c"})
+	c.SetSlotLines(SlotInput, []string{"i"})
+	c.SetSlotLines(SlotStatus, []string{"s"})
+	c.Compose()
+
+	c.InvalidateAll()
+	if !c.IsDirty(SlotCenter) || !c.IsDirty(SlotInput) || !c.IsDirty(SlotStatus) {
+		t.Fatal("expected all dirty after InvalidateAll")
+	}
+	if c.HasCache() {
+		t.Fatal("expected no cache after InvalidateAll")
+	}
+}
+
+func TestFourColumnSplice(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotLeft, SlotCenterLeft, SlotCenter, SlotRight}, 2, 0, 0)
+
+	c.SetSlotLines(SlotLeft, []string{"A0", "A1"})
+	c.SetSlotLines(SlotCenterLeft, []string{"B0", "B1"})
+	c.SetSlotLines(SlotCenter, []string{"C0", "C1"})
+	c.SetSlotLines(SlotRight, []string{"D0", "D1"})
+
+	got := c.Compose()
+	want := "A0B0C0D0\nA1B1C1D1"
+	if got != want {
+		t.Fatalf("got: %q, want: %q", got, want)
+	}
+}
+
+func TestSplitLines(t *testing.T) {
+	got := SplitLines("a\nb\nc")
+	if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+		t.Fatalf("unexpected: %v", got)
+	}
+}
+
+func TestCachedFrameReturnsSame(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 1, 0, 0)
+	c.SetSlotLines(SlotCenter, []string{"hello"})
+	first := c.Compose()
+	second := c.CachedFrame()
+	if first != second {
+		t.Fatalf("CachedFrame mismatch: %q vs %q", first, second)
+	}
+}
+
+func TestMarkDirty(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 1, 1, 1)
+	c.SetSlotLines(SlotCenter, []string{"c"})
+	c.SetSlotLines(SlotInput, []string{"i"})
+	c.SetSlotLines(SlotStatus, []string{"s"})
+	c.Compose()
+
+	c.MarkDirty(SlotInput)
+	if !c.IsDirty(SlotInput) {
+		t.Fatal("expected input dirty")
+	}
+	if c.IsDirty(SlotCenter) {
+		t.Fatal("expected main clean")
+	}
+}
+
+func TestMissingSlotProducesEmptyLines(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 0, 0)
+
+	// Only set left, right is missing.
+	c.SetSlotLines(SlotLeft, []string{"L0", "L1"})
+
+	got := c.Compose()
+	lines := strings.Split(got, "\n")
+	if lines[0] != "L0" || lines[1] != "L1" {
+		t.Fatalf("unexpected: %v", lines)
+	}
+}

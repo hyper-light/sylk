@@ -52,41 +52,102 @@ const (
 )
 
 // OpType represents the type of operation recorded in a WAL entry.
+// Values are non-contiguous to allow grouped semantic ranges.
 type OpType uint8
 
 const (
-	// OpInsert records a vector insertion operation.
-	OpInsert OpType = iota
+	// IVF vector operations (0–3).
+	OpInsert     OpType = 0
+	OpDelete     OpType = 1
+	OpCheckpoint OpType = 2
+	OpCompact    OpType = 3
 
-	// OpDelete records a vector deletion operation.
-	OpDelete
+	// Session storage operations (16–22).
+	OpNodeInsert   OpType = 16
+	OpNodeDelete   OpType = 17
+	OpEdgeInsert   OpType = 18
+	OpEdgeUpdate   OpType = 19
+	OpEdgeDelete   OpType = 20
+	OpVectorInsert   OpType = 21
+	OpDocInsert      OpType = 22
+	OpChunkRefInsert OpType = 23
 
-	// OpCheckpoint records a checkpoint marker for recovery.
-	OpCheckpoint
+	// Commit bracketing operations (32–36).
+	OpCommitBegin OpType = 32
+	OpCommitNode  OpType = 33
+	OpCommitEdge  OpType = 34
+	OpCommitIndex OpType = 35
+	OpCommitEnd   OpType = 36
 
-	// OpCompact records a compaction event.
-	OpCompact
+	// Version markers (48–50).
+	OpVersionCheckpoint OpType = 48
+	OpSessionCommit     OpType = 49
+	OpShardSeal         OpType = 50
 )
 
-// String returns the string representation of an OpType.
-func (op OpType) String() string {
-	switch op {
-	case OpInsert:
-		return "Insert"
-	case OpDelete:
-		return "Delete"
-	case OpCheckpoint:
-		return "Checkpoint"
-	case OpCompact:
-		return "Compact"
-	default:
-		return "Unknown"
+// opNames maps OpType → human-readable name. Indexed by uint8(OpType).
+// Zero-value entries ("") denote unknown/invalid ops.
+var opNames = [256]string{
+	OpInsert:     "Insert",
+	OpDelete:     "Delete",
+	OpCheckpoint: "Checkpoint",
+	OpCompact:    "Compact",
+
+	OpNodeInsert:   "NodeInsert",
+	OpNodeDelete:   "NodeDelete",
+	OpEdgeInsert:   "EdgeInsert",
+	OpEdgeUpdate:   "EdgeUpdate",
+	OpEdgeDelete:   "EdgeDelete",
+	OpVectorInsert: "VectorInsert",
+	OpDocInsert:      "DocInsert",
+	OpChunkRefInsert: "ChunkRefInsert",
+
+	OpCommitBegin: "CommitBegin",
+	OpCommitNode:  "CommitNode",
+	OpCommitEdge:  "CommitEdge",
+	OpCommitIndex: "CommitIndex",
+	OpCommitEnd:   "CommitEnd",
+
+	OpVersionCheckpoint: "VersionCheckpoint",
+	OpSessionCommit:     "SessionCommit",
+	OpShardSeal:         "ShardSeal",
+}
+
+// validOps marks known OpType values. Derived from opNames at init.
+var validOps [256]bool
+
+func init() {
+	for i, name := range opNames {
+		validOps[i] = name != ""
 	}
+}
+
+// String returns the human-readable name for the OpType, or "Unknown".
+func (op OpType) String() string {
+	if name := opNames[op]; name != "" {
+		return name
+	}
+	return "Unknown"
 }
 
 // Valid returns true if the OpType is a known operation type.
 func (op OpType) Valid() bool {
-	return op <= OpCompact
+	return validOps[op]
+}
+
+// IsSessionOp returns true if the OpType is a session storage operation.
+func (op OpType) IsSessionOp() bool {
+	return op >= OpNodeInsert && op <= OpChunkRefInsert && validOps[op]
+}
+
+// IsCommitOp returns true if the OpType is a commit bracketing operation.
+func (op OpType) IsCommitOp() bool {
+	return op >= OpCommitBegin && op <= OpCommitEnd && validOps[op]
+}
+
+// IsMarker returns true if the OpType is a version marker.
+func (op OpType) IsMarker() bool {
+	return op >= OpVersionCheckpoint && op <= OpShardSeal && validOps[op]
 }
 
 // Errors returned by WAL operations.

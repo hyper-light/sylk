@@ -384,7 +384,7 @@ func (v *VectorGraphDB) GetSchemaVersion() (int, error) {
 // WithProtection wraps VectorGraphDB with full protection mechanisms.
 // It creates a ProtectedVectorDB with the provided vector index, snapshot manager,
 // and protection configuration. The caller is responsible for providing properly
-// initialized dependencies to avoid circular imports with the hnsw package.
+// initialized dependencies to avoid circular imports with the vector index package.
 func (v *VectorGraphDB) WithProtection(
 	vectorIndex VectorIndex,
 	snapshotMgr SnapshotManager,

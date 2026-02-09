@@ -8,8 +8,8 @@ package vamana
 // a single interface suitable for complete index implementations.
 //
 // Implementations must be safe for concurrent use from multiple goroutines.
-// The interface is designed as a drop-in replacement for HNSW index consumers
-// in the vectorgraphdb package.
+// The interface provides the primary vector search capability for the
+// vectorgraphdb package.
 type VamanaIndex interface {
 	VamanaInserter
 	VamanaSearcher

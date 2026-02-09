@@ -15,11 +15,16 @@ import (
 // File Discovery
 // =============================================================================
 
-// DiscoverFiles finds all parseable files in the given root directory.
+// DiscoverFiles finds files in the given root directory.
 // Uses parallel directory traversal for performance.
 // Respects gitignore patterns and skips hidden directories.
-func DiscoverFiles(ctx context.Context, root string, ignorePatterns []string) ([]FileInfo, error) {
-	matcher, err := compileIgnorePatterns(ignorePatterns)
+// Pass nil for opts to use existing default behavior.
+func DiscoverFiles(ctx context.Context, root string, ignorePatterns []string, opts *DiscoveryOptions) ([]FileInfo, error) {
+	if opts == nil {
+		opts = &DiscoveryOptions{}
+	}
+
+	matcher, err := compileIgnorePatterns(ignorePatterns, opts.SkipDefaultPatterns)
 	if err != nil {
 		return nil, err
 	}
@@ -27,6 +32,7 @@ func DiscoverFiles(ctx context.Context, root string, ignorePatterns []string) ([
 	d := &discoverer{
 		root:    root,
 		matcher: matcher,
+		opts:    opts,
 		files:   NewAccumulator[FileInfo](EstimateCapacity(100000).Files), // Pre-allocate for 1M LOC
 	}
 
@@ -37,6 +43,7 @@ func DiscoverFiles(ctx context.Context, root string, ignorePatterns []string) ([
 type discoverer struct {
 	root    string
 	matcher *ignoreMatcher
+	opts    *DiscoveryOptions
 	files   *Accumulator[FileInfo]
 }
 
@@ -69,7 +76,7 @@ func (d *discoverer) scanParallel(ctx context.Context, entries []fs.DirEntry) er
 			break
 		}
 
-		if shouldSkipEntry(entry) {
+		if d.shouldSkipTopLevel(entry) {
 			continue
 		}
 
@@ -132,7 +139,7 @@ func (d *discoverer) visitPath(path string, entry fs.DirEntry) error {
 
 // handleDirectory decides whether to skip a directory.
 func (d *discoverer) handleDirectory(relPath, name string) error {
-	if shouldSkipDirName(name) {
+	if d.shouldSkipDir(name) {
 		return fs.SkipDir
 	}
 
@@ -153,10 +160,9 @@ func (d *discoverer) handleFile(path, relPath string) error {
 	return nil
 }
 
-// processFile adds a file to the accumulator if it's parseable.
+// processFile adds a file to the accumulator if it passes filters.
 func (d *discoverer) processFile(path string) {
-	ext := extractExtension(path)
-	if !IsSupportedExtension(ext) {
+	if !d.opts.IncludeAllExtensions && !IsSupportedExtension(extractExtension(path)) {
 		return
 	}
 
@@ -165,7 +171,11 @@ func (d *discoverer) processFile(path string) {
 		return
 	}
 
-	if info.Size() > MaxFileSizeBytes {
+	maxSize := int64(MaxFileSizeBytes)
+	if d.opts.MaxFileSizeOverride > 0 {
+		maxSize = d.opts.MaxFileSizeOverride
+	}
+	if info.Size() > maxSize {
 		return
 	}
 
@@ -195,8 +205,10 @@ type ignoreMatcher struct {
 }
 
 // compileIgnorePatterns compiles gitignore patterns into matchers.
-func compileIgnorePatterns(patterns []string) (*ignoreMatcher, error) {
-	patterns = appendDefaultPatterns(patterns)
+func compileIgnorePatterns(patterns []string, skipDefaults bool) (*ignoreMatcher, error) {
+	if !skipDefaults {
+		patterns = appendDefaultPatterns(patterns)
+	}
 
 	compiled := make([]glob.Glob, 0, len(patterns))
 	for _, pattern := range patterns {
@@ -258,25 +270,37 @@ func (m *ignoreMatcher) matches(path string) bool {
 // Helper Functions
 // =============================================================================
 
-// shouldSkipEntry returns true if the entry should be skipped entirely.
-func shouldSkipEntry(entry fs.DirEntry) bool {
-	name := entry.Name()
-	return shouldSkipDirName(name) || strings.HasPrefix(name, ".")
+// shouldSkipTopLevel returns true if a top-level entry should be skipped.
+func (d *discoverer) shouldSkipTopLevel(entry fs.DirEntry) bool {
+	return d.shouldSkipDir(entry.Name())
 }
 
-// shouldSkipDirName returns true if the directory name should be skipped.
-func shouldSkipDirName(name string) bool {
+// shouldSkipDir returns true if a directory with the given name should be skipped.
+// VCS directories are always skipped. Dot-dirs and vendor-style dirs respect options.
+func (d *discoverer) shouldSkipDir(name string) bool {
 	switch name {
 	case ".git", ".hg", ".svn", ".bzr":
 		return true
-	case "node_modules", "vendor", "__pycache__", ".venv", "venv":
-		return true
-	case "dist", "build", "target", "out":
-		return true
-	default:
-		return strings.HasPrefix(name, ".")
 	}
+
+	if strings.HasPrefix(name, ".") {
+		return !d.opts.IncludeDotDirs
+	}
+
+	switch name {
+	case "node_modules", "vendor", "__pycache__", ".venv", "venv",
+		"dist", "build", "target", "out":
+		return !d.opts.IncludeVendorDirs
+	}
+
+	return false
 }
+
+// binarySniffSize is the number of bytes to read for binary detection.
+// Derived from POSIX file(1) and Go's net/http.DetectContentType.
+// Binary detection itself is performed in readFileToMapped (mmap.go)
+// on already-read data, eliminating a redundant file open.
+const binarySniffSize = 512
 
 // extractExtension extracts the file extension including the dot.
 func extractExtension(path string) string {

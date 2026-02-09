@@ -99,6 +99,31 @@ func (c *CommitInfo) Date() time.Time {
 }
 
 // =============================================================================
+// BranchInfo
+// =============================================================================
+
+// BranchInfo represents metadata about a local git branch.
+type BranchInfo struct {
+	// Name is the short branch name (e.g. "main").
+	Name string
+
+	// Hash is the full 40-character commit hash of the branch tip.
+	Hash string
+
+	// ShortHash is the abbreviated commit hash (7 characters).
+	ShortHash string
+
+	// Subject is the first line of the tip commit message.
+	Subject string
+
+	// AuthorTime is when the tip commit was authored.
+	AuthorTime time.Time
+
+	// IsHead is true if this is the currently checked-out branch.
+	IsHead bool
+}
+
+// =============================================================================
 // BlameLine and BlameResult
 // =============================================================================
 

@@ -8,23 +8,23 @@ import (
 )
 
 // =============================================================================
-// Mock HNSW Searcher for Hybrid Query Tests
+// Mock Vector Index Searcher for Hybrid Query Tests
 // =============================================================================
 
-type hybridTestHNSWSearcher struct {
-	results []HNSWSearchResult
+type hybridTestVectorIndexSearcher struct {
+	results []VectorIndexSearchResult
 	vectors map[string][]float32
 }
 
-func newHybridTestHNSWSearcher() *hybridTestHNSWSearcher {
-	return &hybridTestHNSWSearcher{
-		results: []HNSWSearchResult{},
+func newHybridTestVectorIndexSearcher() *hybridTestVectorIndexSearcher {
+	return &hybridTestVectorIndexSearcher{
+		results: []VectorIndexSearchResult{},
 		vectors: make(map[string][]float32),
 	}
 }
 
-func (m *hybridTestHNSWSearcher) Search(query []float32, k int, filter *HNSWSearchFilter) []HNSWSearchResult {
-	var results []HNSWSearchResult
+func (m *hybridTestVectorIndexSearcher) Search(query []float32, k int, filter *VectorIndexSearchFilter) []VectorIndexSearchResult {
+	var results []VectorIndexSearchResult
 
 	for _, r := range m.results {
 		if filter != nil {
@@ -71,15 +71,15 @@ func (m *hybridTestHNSWSearcher) Search(query []float32, k int, filter *HNSWSear
 	return results
 }
 
-func (m *hybridTestHNSWSearcher) GetVector(id string) ([]float32, error) {
+func (m *hybridTestVectorIndexSearcher) GetVector(id string) ([]float32, error) {
 	if v, ok := m.vectors[id]; ok {
 		return v, nil
 	}
 	return nil, ErrNodeNotFound
 }
 
-func (m *hybridTestHNSWSearcher) addResult(id string, similarity float64, domain Domain, nodeType NodeType) {
-	m.results = append(m.results, HNSWSearchResult{
+func (m *hybridTestVectorIndexSearcher) addResult(id string, similarity float64, domain Domain, nodeType NodeType) {
+	m.results = append(m.results, VectorIndexSearchResult{
 		ID:         id,
 		Similarity: similarity,
 		Domain:     domain,
@@ -87,8 +87,15 @@ func (m *hybridTestHNSWSearcher) addResult(id string, similarity float64, domain
 	})
 }
 
-func (m *hybridTestHNSWSearcher) setVector(id string, vector []float32) {
+func (m *hybridTestVectorIndexSearcher) setVector(id string, vector []float32) {
 	m.vectors[id] = vector
+}
+
+// Backward compatibility aliases
+type hybridTestHNSWSearcher = hybridTestVectorIndexSearcher
+
+func newHybridTestHNSWSearcher() *hybridTestVectorIndexSearcher {
+	return newHybridTestVectorIndexSearcher()
 }
 
 // =============================================================================

@@ -4,7 +4,7 @@
 // both in-memory and disk-based deployments.
 //
 // Key algorithm concepts:
-//   - Single-layer graph: Unlike HNSW, Vamana uses one graph layer with all nodes
+//   - Single-layer graph: Vamana uses one graph layer with all nodes for simplicity
 //   - RNG pruning: Alpha parameter controls neighbor diversity vs proximity tradeoff
 //   - Greedy search: Beam search from medoid entry point to find nearest neighbors
 //   - R parameter: Maximum out-degree (connections per node)

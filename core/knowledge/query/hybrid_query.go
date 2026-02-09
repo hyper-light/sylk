@@ -107,7 +107,7 @@ type HybridQuery struct {
 	// Text search query for Bleve full-text search
 	TextQuery string `json:"text_query,omitempty"`
 
-	// Semantic vector for HNSW similarity search
+	// Semantic vector for vector similarity search
 	SemanticVector []float32 `json:"semantic_vector,omitempty"`
 
 	// Graph pattern for traversal-based search

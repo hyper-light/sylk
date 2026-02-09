@@ -49,8 +49,8 @@ func TestDomainQuery_Build_NoFilters(t *testing.T) {
 	dq := NewDomainQuery("test query")
 	q := dq.Build()
 
-	_, isQueryString := q.(*query.QueryStringQuery)
-	assert.True(t, isQueryString, "should return QueryStringQuery when no filters")
+	_, isDisjunction := q.(*query.DisjunctionQuery)
+	assert.True(t, isDisjunction, "should return DisjunctionQuery when no filters")
 }
 
 func TestDomainQuery_Build_SingleAllowedDomain(t *testing.T) {
@@ -94,18 +94,18 @@ func TestDomainQuery_Build_BothAllowedAndExcluded(t *testing.T) {
 	require.NotNil(t, boolQ)
 }
 
-func TestBuildDomainQuery_NoDomainsReturnsQueryString(t *testing.T) {
+func TestBuildDomainQuery_NoDomainsReturnsDisjunction(t *testing.T) {
 	q := BuildDomainQuery("test", nil)
 
-	_, isQueryString := q.(*query.QueryStringQuery)
-	assert.True(t, isQueryString)
+	_, isDisjunction := q.(*query.DisjunctionQuery)
+	assert.True(t, isDisjunction)
 }
 
-func TestBuildDomainQuery_EmptyDomainsReturnsQueryString(t *testing.T) {
+func TestBuildDomainQuery_EmptyDomainsReturnsDisjunction(t *testing.T) {
 	q := BuildDomainQuery("test", []domain.Domain{})
 
-	_, isQueryString := q.(*query.QueryStringQuery)
-	assert.True(t, isQueryString)
+	_, isDisjunction := q.(*query.DisjunctionQuery)
+	assert.True(t, isDisjunction)
 }
 
 func TestBuildDomainQuery_WithDomains(t *testing.T) {
@@ -118,8 +118,8 @@ func TestBuildDomainQuery_WithDomains(t *testing.T) {
 func TestBuildDomainExcludeQuery_NoDomains(t *testing.T) {
 	q := BuildDomainExcludeQuery("test", nil)
 
-	_, isQueryString := q.(*query.QueryStringQuery)
-	assert.True(t, isQueryString)
+	_, isDisjunction := q.(*query.DisjunctionQuery)
+	assert.True(t, isDisjunction)
 }
 
 func TestBuildDomainExcludeQuery_WithDomains(t *testing.T) {
@@ -227,10 +227,10 @@ func TestDomainQuery_ModifyAfterBuild(t *testing.T) {
 	dq.WithAllowedDomains(domain.DomainLibrarian)
 	q2 := dq.Build()
 
-	_, isQueryString := q1.(*query.QueryStringQuery)
+	_, isDisjunction := q1.(*query.DisjunctionQuery)
 	_, isBool := q2.(*query.BooleanQuery)
 
-	assert.True(t, isQueryString)
+	assert.True(t, isDisjunction)
 	assert.True(t, isBool)
 }
 

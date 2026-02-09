@@ -74,16 +74,20 @@ func isDigit(r rune) bool {
 	return r >= '0' && r <= '9'
 }
 
-// HNSWSimilaritySearcher interface for similarity search.
-type HNSWSimilaritySearcher interface {
-	Search(query []float32, k int, filter *vectorgraphdb.HNSWSearchFilter) []vectorgraphdb.HNSWSearchResult
+// VectorSimilaritySearcher interface for similarity search.
+type VectorSimilaritySearcher interface {
+	Search(query []float32, k int, filter *vectorgraphdb.VectorIndexSearchFilter) []vectorgraphdb.VectorIndexSearchResult
 	GetVector(id string) ([]float32, error)
 }
+
+// HNSWSimilaritySearcher is an alias for VectorSimilaritySearcher for backward compatibility.
+// Deprecated: Use VectorSimilaritySearcher instead.
+type HNSWSimilaritySearcher = VectorSimilaritySearcher
 
 // ConflictDetector detects contradictions between stored information.
 type ConflictDetector struct {
 	db              *vectorgraphdb.VectorGraphDB
-	hnsw            HNSWSimilaritySearcher
+	vectorSearcher  VectorSimilaritySearcher
 	semanticThresh  float64
 	contentAnalyzer ContentAnalyzer
 	conflictsMu     sync.RWMutex
@@ -107,12 +111,12 @@ func DefaultConflictDetectorConfig() ConflictDetectorConfig {
 // NewConflictDetector creates a new ConflictDetector.
 func NewConflictDetector(
 	db *vectorgraphdb.VectorGraphDB,
-	hnsw HNSWSimilaritySearcher,
+	vectorSearcher VectorSimilaritySearcher,
 	config ConflictDetectorConfig,
 ) *ConflictDetector {
 	return &ConflictDetector{
 		db:              db,
-		hnsw:            hnsw,
+		vectorSearcher:  vectorSearcher,
 		semanticThresh:  config.SemanticThreshold,
 		contentAnalyzer: &DefaultContentAnalyzer{},
 		conflicts:       make(map[string]*Conflict),
@@ -135,18 +139,18 @@ func (d *ConflictDetector) DetectOnInsert(
 	return d.analyzeForConflicts(node, similarNodes)
 }
 
-func (d *ConflictDetector) findSimilarNodes(embedding []float32) []vectorgraphdb.HNSWSearchResult {
-	if d.hnsw == nil {
+func (d *ConflictDetector) findSimilarNodes(embedding []float32) []vectorgraphdb.VectorIndexSearchResult {
+	if d.vectorSearcher == nil {
 		return nil
 	}
-	return d.hnsw.Search(embedding, 10, &vectorgraphdb.HNSWSearchFilter{
+	return d.vectorSearcher.Search(embedding, 10, &vectorgraphdb.VectorIndexSearchFilter{
 		MinSimilarity: d.semanticThresh,
 	})
 }
 
 func (d *ConflictDetector) analyzeForConflicts(
 	newNode *vectorgraphdb.GraphNode,
-	similar []vectorgraphdb.HNSWSearchResult,
+	similar []vectorgraphdb.VectorIndexSearchResult,
 ) ([]*Conflict, error) {
 	conflicts := make([]*Conflict, 0)
 	ns := vectorgraphdb.NewNodeStore(d.db, nil)
@@ -160,7 +164,7 @@ func (d *ConflictDetector) analyzeForConflicts(
 	return conflicts, nil
 }
 
-func (d *ConflictDetector) analyzeNodePair(newNode *vectorgraphdb.GraphNode, s vectorgraphdb.HNSWSearchResult, ns *vectorgraphdb.NodeStore) *Conflict {
+func (d *ConflictDetector) analyzeNodePair(newNode *vectorgraphdb.GraphNode, s vectorgraphdb.VectorIndexSearchResult, ns *vectorgraphdb.NodeStore) *Conflict {
 	if s.ID == newNode.ID {
 		return nil
 	}

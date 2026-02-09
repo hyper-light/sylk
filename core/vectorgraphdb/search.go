@@ -18,40 +18,41 @@ type SearchOptions struct {
 	Limit         int
 }
 
-// HNSWSearchResult represents a search result from HNSW index.
-type HNSWSearchResult struct {
+// VectorIndexSearchResult represents a search result from the vector index.
+type VectorIndexSearchResult struct {
 	ID         string
 	Similarity float64
 	Domain     Domain
 	NodeType   NodeType
 }
 
-// HNSWSearchFilter configures HNSW search filtering.
-type HNSWSearchFilter struct {
+// VectorIndexSearchFilter configures vector search filtering.
+type VectorIndexSearchFilter struct {
 	Domains       []Domain
 	NodeTypes     []NodeType
 	MinSimilarity float64
 }
 
-// HNSWSearcher interface for vector search operations.
-type HNSWSearcher interface {
-	Search(query []float32, k int, filter *HNSWSearchFilter) []HNSWSearchResult
+// VectorIndexSearcher interface for vector search operations.
+// Implementations include IVF+BBQ+Vamana index.
+type VectorIndexSearcher interface {
+	Search(query []float32, k int, filter *VectorIndexSearchFilter) []VectorIndexSearchResult
 	GetVector(id string) ([]float32, error)
 }
 
 // VectorSearcher provides vector similarity search capabilities.
 type VectorSearcher struct {
-	db        *VectorGraphDB
-	hnsw      HNSWSearcher
-	nodeStore *NodeStore // Cached instance for reuse
+	db          *VectorGraphDB
+	vectorIndex VectorIndexSearcher
+	nodeStore   *NodeStore // Cached instance for reuse
 }
 
 // NewVectorSearcher creates a new VectorSearcher.
-func NewVectorSearcher(db *VectorGraphDB, hnswIndex HNSWSearcher) *VectorSearcher {
+func NewVectorSearcher(db *VectorGraphDB, vectorIndex VectorIndexSearcher) *VectorSearcher {
 	return &VectorSearcher{
-		db:        db,
-		hnsw:      hnswIndex,
-		nodeStore: NewNodeStore(db, nil), // Create once and reuse
+		db:          db,
+		vectorIndex: vectorIndex,
+		nodeStore:   NewNodeStore(db, nil), // Create once and reuse
 	}
 }
 
@@ -70,23 +71,23 @@ func (vs *VectorSearcher) Search(query []float32, opts *SearchOptions) ([]Search
 	}
 
 	filter := vs.buildFilter(opts)
-	hnswResults := vs.hnsw.Search(query, opts.Limit, filter)
+	indexResults := vs.vectorIndex.Search(query, opts.Limit, filter)
 
-	return vs.loadNodes(hnswResults, opts.MinSimilarity)
+	return vs.loadNodes(indexResults, opts.MinSimilarity)
 }
 
-func (vs *VectorSearcher) buildFilter(opts *SearchOptions) *HNSWSearchFilter {
-	return &HNSWSearchFilter{
+func (vs *VectorSearcher) buildFilter(opts *SearchOptions) *VectorIndexSearchFilter {
+	return &VectorIndexSearchFilter{
 		Domains:       opts.Domains,
 		NodeTypes:     opts.NodeTypes,
 		MinSimilarity: opts.MinSimilarity,
 	}
 }
 
-func (vs *VectorSearcher) loadNodes(hnswResults []HNSWSearchResult, minSim float64) ([]SearchResult, error) {
+func (vs *VectorSearcher) loadNodes(indexResults []VectorIndexSearchResult, minSim float64) ([]SearchResult, error) {
 	// Filter by minimum similarity first
-	filtered := make([]HNSWSearchResult, 0, len(hnswResults))
-	for _, hr := range hnswResults {
+	filtered := make([]VectorIndexSearchResult, 0, len(indexResults))
+	for _, hr := range indexResults {
 		if hr.Similarity >= minSim {
 			filtered = append(filtered, hr)
 		}
@@ -133,16 +134,16 @@ func (vs *VectorSearcher) loadNodes(hnswResults []HNSWSearchResult, minSim float
 }
 
 // loadNodesFallback loads nodes individually when batch loading fails.
-func (vs *VectorSearcher) loadNodesFallback(hnswResults []HNSWSearchResult, ns *NodeStore) ([]SearchResult, error) {
-	results := make([]SearchResult, 0, len(hnswResults))
-	for _, hr := range hnswResults {
-		node, err := ns.GetNode(hr.ID)
+func (vs *VectorSearcher) loadNodesFallback(indexResults []VectorIndexSearchResult, ns *NodeStore) ([]SearchResult, error) {
+	results := make([]SearchResult, 0, len(indexResults))
+	for _, ir := range indexResults {
+		node, err := ns.GetNode(ir.ID)
 		if err != nil {
 			continue
 		}
 		results = append(results, SearchResult{
 			Node:       node,
-			Similarity: hr.Similarity,
+			Similarity: ir.Similarity,
 		})
 	}
 	return results, nil
@@ -150,6 +151,7 @@ func (vs *VectorSearcher) loadNodesFallback(hnswResults []HNSWSearchResult, ns *
 
 // SearchByDomain performs search filtered to a specific domain.
 func (vs *VectorSearcher) SearchByDomain(query []float32, domain Domain, limit int) ([]SearchResult, error) {
+
 	return vs.Search(query, &SearchOptions{
 		Domains: []Domain{domain},
 		Limit:   limit,
@@ -167,7 +169,7 @@ func (vs *VectorSearcher) SearchByNodeType(query []float32, nodeTypes []NodeType
 // SearchMultiDomain performs search across multiple domains with per-domain limits.
 func (vs *VectorSearcher) SearchMultiDomain(query []float32, limits map[Domain]int) (map[Domain][]SearchResult, error) {
 	results := make(map[Domain][]SearchResult)
-
+		
 	for domain, limit := range limits {
 		domainResults, err := vs.SearchByDomain(query, domain, limit)
 		if err != nil {
@@ -188,7 +190,7 @@ func (vs *VectorSearcher) FindSimilar(nodeID string, limit int) ([]SearchResult,
 }
 
 func (vs *VectorSearcher) getNodeVector(nodeID string) ([]float32, error) {
-	vector, err := vs.hnsw.GetVector(nodeID)
+	vector, err := vs.vectorIndex.GetVector(nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("get vector: %w", err)
 	}
