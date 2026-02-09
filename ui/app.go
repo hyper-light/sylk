@@ -806,7 +806,14 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case msg.GitStatusMsg:
 		m.fileTree.SetGitStatus(typed.StatusMap, typed.TrackedSet, typed.TrackedDirs)
-		return m, m.gitWatchCmd()
+		cmds := []tea.Cmd{m.gitWatchCmd()}
+		if m.gitMode {
+			cmds = append(cmds, m.gitPanel.LoadData(), m.loadGitBranchesCmd())
+			if m.commitTree.InCommitView() {
+				cmds = append(cmds, m.loadBranchCommitsCmd(m.commitTree.ActiveBranch()))
+			}
+		}
+		return m, tea.Batch(cmds...)
 	case gitBranchesLoadedMsg:
 		if m.commitTree != nil {
 			m.commitTree.SetBranches(typed.branches)
