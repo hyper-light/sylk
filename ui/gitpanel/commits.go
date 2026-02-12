@@ -2,6 +2,7 @@ package gitpanel
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,129 +14,184 @@ import (
 
 // commitEntry represents a single commit in the commits list.
 type commitEntry struct {
-	hash      string
-	shortHash string
-	subject   string
-	author    string
-	time      time.Time
-	isMerge   bool
+	hash            string
+	shortHash       string
+	subject         string
+	author          string
+	time            time.Time
+	isMerge         bool
+	isHead          bool // true for the HEAD commit (first in git log output)
+	isDefaultBranch bool // true for the default branch tip commit
+
+	additions, deletions                   int
+	filesAdded, filesModified, filesDeleted int
+	hasFileStats bool // true when file-level stats are populated
+	hasLineStats bool // true when line-level stats are populated
 }
 
 func (e commitEntry) FilterText() string  { return e.shortHash + " " + e.subject + " " + e.author }
 func (e commitEntry) SortKey() string     { return e.subject }
 func (e commitEntry) SortTime() time.Time { return e.time }
 
-// commitColWidths holds pre-computed max column widths for aligned rendering.
-type commitColWidths struct {
-	author int // max author name character width
-}
-
 // commitsTab holds the list state for the Commits tab.
 type commitsTab struct {
 	listState
-	colWidths commitColWidths
+	statsLoading bool              // true while async stat load is in flight
+	statsEpoch   time.Time         // animation epoch for stat spinners
+	statsLevel   git.DiffStatLevel // highest level loaded into entries
 }
 
-// computeColWidths scans all entries and records the widest author column
-// so every row can be padded to the same alignment.
-func (ct *commitsTab) computeColWidths() {
-	var maxAuthor int
-	for _, e := range ct.entries {
-		ce, ok := e.(commitEntry)
-		if !ok {
-			continue
-		}
-		if aw := len(ce.author); aw > maxAuthor {
-			maxAuthor = aw
-		}
-	}
-	ct.colWidths = commitColWidths{author: maxAuthor}
-}
-
-// loadCommits fetches commits from the git client and converts them to
-// commitEntry values.
-func loadCommits(gc *git.GitClient) []commitEntry {
-	const maxCommits = 500
-
-	infos, err := gc.GetAllCommits(maxCommits)
+// loadCommitsPage fetches a page of commits from the git client.
+// skip is the number of commits to skip; pageSize is the page size.
+// statLevel controls whether diff stats are computed inline.
+// Returns (entries, hasMore). isHead is only true for the very first
+// commit when skip == 0.
+func loadCommitsPage(gc *git.GitClient, defaultTipHash string, skip, pageSize int, statLevel git.DiffStatLevel) ([]commitEntry, bool) {
+	infos, hasMore, err := gc.GetAllCommitsPage(skip, pageSize)
 	if err != nil {
-		return nil
+		return nil, false
+	}
+
+	hashes := make([]string, len(infos))
+	for i, ci := range infos {
+		hashes[i] = ci.Hash
+	}
+
+	// Fetch stats only at the requested level.
+	var lineSummaries map[string]git.DiffSummary
+	var fileSummaries map[string]git.FileSummary
+	switch statLevel {
+	case git.DiffStatLines:
+		lineSummaries = gc.GetCommitDiffSummaries(hashes)
+	case git.DiffStatFiles:
+		fileSummaries = gc.GetCommitFileSummaries(hashes)
 	}
 
 	entries := make([]commitEntry, 0, len(infos))
-	for _, ci := range infos {
-		entries = append(entries, commitEntry{
-			hash:      ci.Hash,
-			shortHash: ci.ShortHash,
-			subject:   ci.Subject,
-			author:    ci.Author,
-			time:      ci.AuthorTime,
-			isMerge:   ci.IsMergeCommit(),
-		})
+	for i, ci := range infos {
+		ce := commitEntry{
+			hash:            ci.Hash,
+			shortHash:       ci.ShortHash,
+			subject:         ci.Subject,
+			author:          ci.Author,
+			time:            ci.AuthorTime,
+			isMerge:         ci.IsMergeCommit(),
+			isHead:          skip == 0 && i == 0,
+			isDefaultBranch: ci.Hash == defaultTipHash,
+		}
+		if ds, ok := lineSummaries[ci.Hash]; ok {
+			ce.additions = ds.Additions
+			ce.deletions = ds.Deletions
+			ce.filesAdded = ds.FilesAdded
+			ce.filesModified = ds.FilesModified
+			ce.filesDeleted = ds.FilesDeleted
+			ce.hasFileStats = true
+			ce.hasLineStats = true
+		} else if fs, ok := fileSummaries[ci.Hash]; ok {
+			ce.filesAdded = fs.FilesAdded
+			ce.filesModified = fs.FilesModified
+			ce.filesDeleted = fs.FilesDeleted
+			ce.hasFileStats = true
+		}
+		entries = append(entries, ce)
 	}
 
-	return entries
+	return entries, hasMore
 }
 
-// renderCommitEntry renders a single commit row with per-segment background
-// highlighting when selected.
-//
-// Format: shortHash  subject (truncated)  author  relativeTime
-func renderCommitEntry(e commitEntry, selected bool, width int, th *theme.Theme, cols commitColWidths) string {
+// renderCommitCell renders a single column cell for a commit entry.
+func renderCommitCell(e commitEntry, colID ColumnID, width int, selected bool, th *theme.Theme) string {
 	p := th.Palette
+	padStyle := cellPadStyle(selected, p)
 
-	hashStyle := lipgloss.NewStyle().Foreground(p.Primary)
-	if e.isMerge {
-		hashStyle = lipgloss.NewStyle().Foreground(p.Secondary)
+	switch colID {
+	case "hash":
+		style := lipgloss.NewStyle().Foreground(p.Primary)
+		if e.isHead {
+			style = lipgloss.NewStyle().Foreground(p.Secondary).Bold(true)
+		} else if e.isDefaultBranch {
+			style = lipgloss.NewStyle().Foreground(p.Teal).Bold(true)
+		} else if e.isMerge {
+			style = lipgloss.NewStyle().Foreground(p.Secondary)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(" "+e.shortHash, width, style)
+
+	case "subject":
+		style := lipgloss.NewStyle().Foreground(p.Foreground)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(e.subject, width, style)
+
+	case "author":
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(e.author, width, style)
+
+	case "time":
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(relativeTime(e.time), width, style)
+
+	case "changed":
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.additions+e.deletions), width, style)
+
+	case "added":
+		style := lipgloss.NewStyle().Foreground(p.Success)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.additions), width, style)
+
+	case "removed":
+		style := lipgloss.NewStyle().Foreground(p.Error)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.deletions), width, style)
+
+	case "files":
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesAdded+e.filesModified+e.filesDeleted), width, style)
+
+	case "files_added":
+		style := lipgloss.NewStyle().Foreground(p.Success)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesAdded), width, style)
+
+	case "files_modified":
+		style := lipgloss.NewStyle().Foreground(p.Warning)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesModified), width, style)
+
+	case "files_deleted":
+		style := lipgloss.NewStyle().Foreground(p.Error)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesDeleted), width, style)
+
+	default:
+		return padStyle.Render(strings.Repeat(" ", width))
 	}
-	authorStyle := lipgloss.NewStyle().Foreground(p.Muted)
-	timeStyle := lipgloss.NewStyle().Foreground(p.Muted)
-	subjectStyle := lipgloss.NewStyle().Foreground(p.Foreground)
-	padStyle := lipgloss.NewStyle()
-
-	if selected {
-		bg := p.Selection
-		hashStyle = hashStyle.Background(bg)
-		authorStyle = authorStyle.Background(bg)
-		timeStyle = timeStyle.Background(bg)
-		subjectStyle = subjectStyle.Background(bg)
-		padStyle = padStyle.Background(bg)
-	}
-
-	hash := hashStyle.Render(e.shortHash)
-
-	// Author padded to fixed column width.
-	author := authorStyle.Render(e.author)
-	if pad := cols.author - len(e.author); pad > 0 {
-		author += padStyle.Render(strings.Repeat(" ", pad))
-	}
-
-	relTime := timeStyle.Render(relativeTime(e.time))
-
-	// Subject fills remaining space after fixed-width columns.
-	hashWidth := len(e.shortHash)
-	timeWidth := lipgloss.Width(relTime)
-	separators := 6 // two-space gaps between columns
-	fixedWidth := hashWidth + cols.author + timeWidth + separators
-	subjectWidth := width - fixedWidth
-
-	subject := e.subject
-	if subjectWidth > 0 {
-		subject = truncateString(subject, subjectWidth)
-	} else {
-		subject = ""
-	}
-
-	sep := padStyle.Render("  ")
-	content := hash + sep + subjectStyle.Render(subject) + sep + author + sep + relTime
-
-	lineWidth := lipgloss.Width(content)
-	padCount := max(width-lineWidth, 0)
-	if padCount > 0 {
-		content += padStyle.Render(strings.Repeat(" ", padCount))
-	}
-
-	return content
 }
 
 // relativeTime formats a time as a human-friendly relative duration.
@@ -183,13 +239,12 @@ func truncateString(s string, maxWidth int) string {
 	return string(runes[:maxWidth-1]) + "\u2026"
 }
 
-// padToWidthPlain pads a rendered string with spaces to fill width, without
-// applying any style to the padding (caller applies background).
-func padToWidthPlain(content string, width int) string {
-	contentWidth := lipgloss.Width(content)
-	if contentWidth >= width {
-		return content
+// cellPadStyle returns a plain padding style, with selection background
+// when the row is selected.
+func cellPadStyle(selected bool, p theme.Palette) lipgloss.Style {
+	s := lipgloss.NewStyle()
+	if selected {
+		s = s.Background(p.Selection)
 	}
-
-	return content + strings.Repeat(" ", width-contentWidth)
+	return s
 }

@@ -1,6 +1,7 @@
 package gitpanel
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -12,8 +13,9 @@ import (
 
 // uncommittedEntry represents a single file with uncommitted changes.
 type uncommittedEntry struct {
-	path   string
-	status string // status code: M, A, D, ?, !
+	path    string
+	status  string // status code: M, A, D, ?, !
+	staging StagingState
 }
 
 func (e uncommittedEntry) FilterText() string  { return e.path }
@@ -33,16 +35,18 @@ const (
 // uncommittedTab holds the list state for the Uncommitted files tab.
 type uncommittedTab struct {
 	listState
-	stagingStates  []StagingState // parallel to listState.entries
-	optionsFocused bool           // focus on [All] options bar
+	stagingStates  []StagingState     // parallel to listState.entries
+	optionsFocused bool               // focus on [All] options bar
+	allEntries     []uncommittedEntry // full cached set from initial LoadData
+	allStaging     []StagingState     // staging states parallel to allEntries
 }
 
 // allStaged returns true when every entry is in StagingStaged state.
 func (ut *uncommittedTab) allStaged() bool {
-	if len(ut.stagingStates) == 0 {
+	if len(ut.allStaging) == 0 {
 		return false
 	}
-	for _, s := range ut.stagingStates {
+	for _, s := range ut.allStaging {
 		if s != StagingStaged {
 			return false
 		}
@@ -51,21 +55,32 @@ func (ut *uncommittedTab) allStaged() bool {
 }
 
 // toggleAll sets all staging states to StagingStaged, or back to
-// StagingDefault if all are already staged.
+// StagingDefault if all are already staged. Propagates to allStaging
+// so the state survives window eviction.
 func (ut *uncommittedTab) toggleAll() {
 	target := StagingStaged
 	if ut.allStaged() {
 		target = StagingDefault
 	}
+	for i := range ut.allStaging {
+		ut.allStaging[i] = target
+	}
 	for i := range ut.stagingStates {
 		ut.stagingStates[i] = target
+	}
+	// Sync entry staging fields for sort consistency.
+	for i := range ut.entries {
+		if ue, ok := ut.entries[i].(uncommittedEntry); ok {
+			ue.staging = target
+			ut.entries[i] = ue
+		}
 	}
 }
 
 // loadUncommitted fetches uncommitted files with real status codes
 // from the git client using the go-git native API.
 func loadUncommitted(gc *git.GitClient) []uncommittedEntry {
-	statuses, err := gc.UncommittedFileStatuses()
+	statuses, _, err := gc.UncommittedFileStatuses()
 	if err != nil {
 		return nil
 	}
@@ -78,72 +93,64 @@ func loadUncommitted(gc *git.GitClient) []uncommittedEntry {
 		})
 	}
 
+	// Stable default order: sort by path so map iteration randomness
+	// doesn't cause visible reordering across reloads.
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].path < entries[j].path
+	})
+
 	return entries
 }
 
-// renderUncommittedEntry renders a single uncommitted file row with
-// per-segment background highlighting and optional staging icon.
-//
-// Layout (default):  [M] path/to/file.go
-// Layout (staged):   ✓ [M] path/to/file.go
-// Layout (excluded): ✕ [M] path/to/file.go
-func renderUncommittedEntry(e uncommittedEntry, staging StagingState, selected bool, width int, th *theme.Theme) string {
+// renderUncommittedCell renders a single column cell for an uncommitted entry.
+func renderUncommittedCell(e uncommittedEntry, staging StagingState, colID ColumnID, width int, selected bool, th *theme.Theme) string {
 	p := th.Palette
+	padStyle := cellPadStyle(selected, p)
 
-	badgeColor := statusBadgeColor(e.status, p)
-	badgeStyle := lipgloss.NewStyle().Foreground(badgeColor)
-	pathStyle := lipgloss.NewStyle().Foreground(p.Foreground)
-	padStyle := lipgloss.NewStyle()
+	switch colID {
+	case "icon":
+		return renderStagingIcon(staging, width, selected, p)
 
-	// Staging icon styles.
-	stagedStyle := lipgloss.NewStyle().Foreground(p.Success)
-	excludedStyle := lipgloss.NewStyle().Foreground(p.Error)
+	case "status":
+		color := statusBadgeColor(e.status, p)
+		style := lipgloss.NewStyle().Foreground(color)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell("["+e.status+"]", width, style)
 
-	if selected {
-		bg := p.Selection
-		badgeStyle = badgeStyle.Background(bg)
-		pathStyle = pathStyle.Background(bg)
-		padStyle = padStyle.Background(bg)
-		stagedStyle = stagedStyle.Background(bg)
-		excludedStyle = excludedStyle.Background(bg)
+	case "path":
+		style := lipgloss.NewStyle().Foreground(p.Foreground)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(e.path, width, style)
+
+	default:
+		return padStyle.Render(strings.Repeat(" ", width))
 	}
+}
 
-	// Staging icon column — always 2 chars wide for alignment.
-	var iconPrefix string
-	const iconWidth = 2
+// renderStagingIcon renders the staging state icon cell.
+func renderStagingIcon(staging StagingState, width int, selected bool, p theme.Palette) string {
+	padStyle := cellPadStyle(selected, p)
+
 	switch staging {
 	case StagingStaged:
-		iconPrefix = stagedStyle.Render("\u2713") + padStyle.Render(" ")
+		style := lipgloss.NewStyle().Foreground(p.Success)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(" \u2713", width, style)
 	case StagingExcluded:
-		iconPrefix = excludedStyle.Render("\u2715") + padStyle.Render(" ")
+		style := lipgloss.NewStyle().Foreground(p.Error)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(" \u2715", width, style)
 	default:
-		iconPrefix = padStyle.Render("  ")
+		return padStyle.Render(strings.Repeat(" ", width))
 	}
-
-	badge := badgeStyle.Render("[" + e.status + "]")
-	badgeWidth := lipgloss.Width(badge)
-
-	// Available width for the path after icon + badge + spaces.
-	const separator = 1
-	pathWidth := width - iconWidth - badgeWidth - separator
-
-	path := e.path
-	if pathWidth > 0 {
-		path = truncateString(path, pathWidth)
-	} else {
-		path = ""
-	}
-
-	sep := padStyle.Render(" ")
-	content := iconPrefix + badge + sep + pathStyle.Render(path)
-
-	lineWidth := lipgloss.Width(content)
-	padCount := max(width-lineWidth, 0)
-	if padCount > 0 {
-		content += padStyle.Render(strings.Repeat(" ", padCount))
-	}
-
-	return content
 }
 
 // renderOptionsBar renders the staging options row for the uncommitted tab.

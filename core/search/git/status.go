@@ -45,11 +45,12 @@ const (
 // WorkingTreeStatus holds categorized file paths from git status output.
 // All paths are relative to the repository root.
 type WorkingTreeStatus struct {
-	Modified  []string // Staged or unstaged modifications.
-	Added     []string // Staged additions (A in index).
-	Deleted   []string // Deleted in worktree or staged for deletion.
-	Untracked []string // Untracked files/directories.
-	Conflict  []string // Unmerged conflict entries.
+	Modified       []string // Staged or unstaged modifications.
+	Added          []string // Staged additions (A in index).
+	Deleted        []string // Deleted in worktree or staged for deletion.
+	Untracked      []string // Untracked files/directories.
+	Conflict       []string // Unmerged conflict entries.
+	HasIndexStaged bool     // True when any file has staged changes in the index.
 }
 
 // =============================================================================
@@ -137,8 +138,22 @@ func classifyGoGitStatus(s gogit.Status) *WorkingTreeStatus {
 
 	for path, fs := range s {
 		classifyFileStatus(path, fs, result)
+		if !result.HasIndexStaged && isStagedCode(fs.Staging) {
+			result.HasIndexStaged = true
+		}
 	}
 	return result
+}
+
+// isStagedCode reports whether a go-git StatusCode represents a change staged
+// in the index (as opposed to unmodified, untracked, or zero-value).
+func isStagedCode(code gogit.StatusCode) bool {
+	switch code {
+	case gogit.Added, gogit.Modified, gogit.Deleted, gogit.Renamed, gogit.Copied:
+		return true
+	default:
+		return false
+	}
 }
 
 // classifyFileStatus categorizes a single go-git FileStatus entry into the
@@ -249,12 +264,12 @@ func propagatePath(m map[string]GitFileState, path string, state GitFileState) {
 // UncommittedFileStatuses returns all files with uncommitted changes,
 // mapped to their single-character status code (M, A, D, ?, !).
 // Uses the go-git native API (no exec).
-func (c *GitClient) UncommittedFileStatuses() (map[string]string, error) {
+func (c *GitClient) UncommittedFileStatuses() (map[string]string, bool, error) {
 	wts, err := c.WorktreeStatus()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return flattenWorkingTreeStatus(wts), nil
+	return flattenWorkingTreeStatus(wts), wts.HasIndexStaged, nil
 }
 
 // flattenWorkingTreeStatus converts categorized file lists into a flat

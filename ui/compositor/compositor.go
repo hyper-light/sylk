@@ -32,10 +32,13 @@ type Compositor struct {
 	inputStart  int
 	statusStart int
 
-	// Dirty flags per section.
+	// Section-level dirty flags (control spliceMain / spliceVertical).
 	mainDirty   bool
 	inputDirty  bool
 	statusDirty bool
+
+	// Per-slot dirty flags (control which components re-render).
+	slotDirty map[SlotID]bool
 
 	// Cached joined string.
 	joined   string
@@ -46,6 +49,7 @@ type Compositor struct {
 func New() Compositor {
 	return Compositor{
 		slotLines: make(map[SlotID][]string),
+		slotDirty: make(map[SlotID]bool),
 	}
 }
 
@@ -59,11 +63,17 @@ func (c *Compositor) SetStructure(colSlots []SlotID, mainH, inputH, statusH int)
 	c.inputStart = mainH
 	c.statusStart = mainH + inputH
 
-	// Full invalidation.
+	// Full invalidation — section + per-slot.
 	clear(c.slotLines)
 	c.mainDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
+	c.slotDirty = make(map[SlotID]bool, len(colSlots)+2)
+	for _, id := range colSlots {
+		c.slotDirty[id] = true
+	}
+	c.slotDirty[SlotInput] = true
+	c.slotDirty[SlotStatus] = true
 	c.hasCache = false
 	c.joined = ""
 }
@@ -72,6 +82,7 @@ func (c *Compositor) SetStructure(colSlots []SlotID, mainH, inputH, statusH int)
 // appropriate section dirty.
 func (c *Compositor) SetSlotLines(id SlotID, lines []string) {
 	c.slotLines[id] = lines
+	c.slotDirty[id] = true
 	switch id {
 	case SlotInput:
 		c.inputDirty = true
@@ -83,8 +94,10 @@ func (c *Compositor) SetSlotLines(id SlotID, lines []string) {
 	c.hasCache = false
 }
 
-// MarkDirty marks a specific slot's section as needing recomposition.
+// MarkDirty marks a specific slot as needing re-rendering and its
+// section as needing recomposition.
 func (c *Compositor) MarkDirty(id SlotID) {
+	c.slotDirty[id] = true
 	switch id {
 	case SlotInput:
 		c.inputDirty = true
@@ -96,16 +109,9 @@ func (c *Compositor) MarkDirty(id SlotID) {
 	c.hasCache = false
 }
 
-// IsDirty returns whether a slot's section needs recomposition.
+// IsDirty returns whether a specific slot needs re-rendering.
 func (c *Compositor) IsDirty(id SlotID) bool {
-	switch id {
-	case SlotInput:
-		return c.inputDirty
-	case SlotStatus:
-		return c.statusDirty
-	default:
-		return c.mainDirty
-	}
+	return c.slotDirty[id]
 }
 
 // IsSlotCached returns true if the slot has been rendered at least once.
@@ -114,12 +120,17 @@ func (c *Compositor) IsSlotCached(id SlotID) bool {
 	return ok
 }
 
-// InvalidateAll marks every section dirty (used on overlay transitions,
-// edit-mode toggles, etc.).
+// InvalidateAll marks every section and slot dirty (used on overlay
+// transitions, edit-mode toggles, etc.).
 func (c *Compositor) InvalidateAll() {
 	c.mainDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
+	for _, id := range c.colSlots {
+		c.slotDirty[id] = true
+	}
+	c.slotDirty[SlotInput] = true
+	c.slotDirty[SlotStatus] = true
 	c.hasCache = false
 }
 
@@ -145,6 +156,8 @@ func (c *Compositor) Compose() string {
 		c.spliceVertical(c.statusStart, SlotStatus)
 		c.statusDirty = false
 	}
+	// Clear per-slot dirty flags.
+	clear(c.slotDirty)
 	if dirty {
 		c.joined = strings.Join(c.lines, "\n")
 	}

@@ -2,7 +2,6 @@ package gitpanel
 
 import (
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -18,14 +17,12 @@ import (
 type filterFocusZone int
 
 const (
-	focusEntries     filterFocusZone = iota // list entries (normal navigation)
-	focusFilter                             // filter text input
-	focusToggles                            // case/word/regex toggle badges
-	focusSortToggles                        // sort mode badges
+	focusEntries      filterFocusZone = iota // list entries (normal navigation)
+	focusFilter                              // filter text input
+	focusToggles                             // case/word/regex toggle badges
+	focusHeader                              // column header row
+	focusGearDropdown                        // column visibility dropdown
 )
-
-// filterFocusZoneCount is the total number of focus zones (derived, not magic).
-const filterFocusZoneCount = int(focusSortToggles) + 1
 
 // toggleIndex identifies a filter toggle badge.
 type toggleIndex int
@@ -37,17 +34,6 @@ const (
 	toggleCount                    // sentinel: total toggle count
 )
 
-// sortMode identifies the active sort ordering.
-type sortMode int
-
-const (
-	sortAgeDesc  sortMode = iota // newest first (default)
-	sortAgeAsc                   // oldest first
-	sortAlphaAsc                 // A-Z
-	sortAlphaDesc                // Z-A
-	sortModeCount                // sentinel: total sort mode count
-)
-
 // listEntry is the common interface that every tab's entry type must satisfy.
 type listEntry interface {
 	FilterText() string  // text to match against filter
@@ -55,7 +41,38 @@ type listEntry interface {
 	SortTime() time.Time // for age sorting
 }
 
-// listState holds the shared scrollable-list + filter state used by all three
+// minListLoadingBarDuration is the minimum time the bottom loading bar stays
+// visible. Prevents flicker when pages load faster than a few spinner frames.
+// Derived from: 5 spinner frames × 80ms = 400ms ≈ half a braille cycle.
+const minListLoadingBarDuration = 400 * time.Millisecond
+
+// headerState holds column header interaction state.
+type headerState struct {
+	cursor   int // focused visible-column index
+	dragFrom int // column being dragged (-1 = none); must init to -1
+	dragX    int // current X during drag
+
+	gearOpen   bool // visibility dropdown active
+	gearCursor int  // cursor in dropdown
+
+	// Divider drag-resize state.
+	resizing       bool  // true while dragging a divider
+	resizeDivIdx   int   // index into VisibleColumns of the left column
+	resizeStartX   int   // X at drag start
+	resizeSnapshot []int // widths of all visible columns at drag start
+	resizeVisMap   []int // vis index → full Columns slice index
+
+	// Hover state: visible column index of the divider under the mouse,
+	// or -1 when not hovering a divider.
+	hoverDivider int
+}
+
+// newHeaderState returns a properly initialized headerState.
+func newHeaderState() headerState {
+	return headerState{dragFrom: -1, hoverDivider: -1}
+}
+
+// listState holds the shared scrollable-list + filter state used by all four
 // tabs. Each tab embeds one of these.
 type listState struct {
 	entries  []listEntry
@@ -69,12 +86,129 @@ type listState struct {
 	toggleCursor toggleIndex
 	filterFocus  filterFocusZone
 
-	sortMode   sortMode
-	sortCursor sortMode // focused badge (independent of active sort)
+	// Column layout (set per-tab, holds sort state).
+	columns *ColumnLayout
+
+	// Header interaction state.
+	header headerState
+
+	// Pagination state.
+	hasMore         bool      // more pages available after window
+	loadingMore     bool      // true while a forward "load more" page is in flight
+	loadingEpoch    time.Time // start time for spinner animation
+	loadingBarUntil time.Time // minimum display deadline for loading bar
+
+	// Initial load indicator: true from LoadData() until first page arrives.
+	initialLoading bool
+
+	// Sliding window: entries holds at most 2×listPageSize entries.
+	// windowStart is the absolute index of entries[0] in the full data set.
+	windowStart int  // absolute offset of first loaded entry
+	loadingPrev bool // true while a backward page is in flight
 }
 
-// rebuildFiltered applies the current filter query, toggles, and sort mode to
-// produce the filtered index slice.
+// showLoadingBar reports whether a loading bar should be visible.
+// True while a page (forward or backward) is in flight OR until the
+// minimum display time elapses.
+func (ls *listState) showLoadingBar() bool {
+	return ls.loadingMore || ls.loadingPrev || time.Now().Before(ls.loadingBarUntil)
+}
+
+// showLoadingPrev reports whether the loading bar should appear at the top
+// (backward page fetch in progress).
+func (ls *listState) showLoadingPrev() bool {
+	return ls.loadingPrev || (ls.windowStart > 0 && time.Now().Before(ls.loadingBarUntil) && !ls.loadingMore)
+}
+
+// needsLoadMore reports whether the cursor is near enough to the bottom
+// that the next page should be fetched.
+func (ls *listState) needsLoadMore(height int) bool {
+	return ls.hasMore && !ls.loadingMore && ls.cursor >= len(ls.filtered)-height
+}
+
+// needsScrollLoadMore reports whether the scroll position is near enough
+// to the bottom that the next page should be fetched.
+func (ls *listState) needsScrollLoadMore(height int) bool {
+	return ls.hasMore && !ls.loadingMore && ls.scrollOff+height >= len(ls.filtered)-height
+}
+
+// resetPagination clears all pagination state for a full reload.
+func (ls *listState) resetPagination() {
+	ls.hasMore = false
+	ls.loadingMore = false
+	ls.loadingPrev = false
+	ls.loadingEpoch = time.Time{}
+	ls.loadingBarUntil = time.Time{}
+	ls.windowStart = 0
+}
+
+// needsLoadPrev reports whether a backward page fetch is needed.
+func (ls *listState) needsLoadPrev() bool {
+	return ls.windowStart > 0 && !ls.loadingMore && !ls.loadingPrev &&
+		ls.scrollOff == 0
+}
+
+// maxWindowEntries is the maximum entries kept in the sliding window
+// (current page + previous page).
+const maxWindowEntries = 2 * listPageSize
+
+// evictOldEntries trims entries from the front when the window exceeds
+// 2 pages. Cursor and scroll are adjusted to preserve the user's position.
+func (ls *listState) evictOldEntries() {
+	if len(ls.entries) <= maxWindowEntries {
+		return
+	}
+
+	// Remember the absolute index under the cursor.
+	cursorAbs := ls.cursorAbsoluteIdx()
+
+	evicted := len(ls.entries) - maxWindowEntries
+	remaining := make([]listEntry, maxWindowEntries)
+	copy(remaining, ls.entries[evicted:])
+	ls.entries = remaining
+	ls.windowStart += evicted
+
+	ls.rebuildFiltered()
+	ls.restoreCursorAbsolute(cursorAbs)
+}
+
+// evictNewEntries trims entries from the back when the window exceeds
+// 2 pages (used after prepending a backward page).
+func (ls *listState) evictNewEntries() {
+	if len(ls.entries) <= maxWindowEntries {
+		return
+	}
+	ls.entries = ls.entries[:maxWindowEntries]
+	// Entries trimmed from the end → hasMore is true since data exists beyond.
+	ls.hasMore = true
+}
+
+// cursorAbsoluteIdx returns the absolute entry index (relative to the full
+// data set) that the cursor currently points to.
+func (ls *listState) cursorAbsoluteIdx() int {
+	if ls.cursor < len(ls.filtered) {
+		return ls.filtered[ls.cursor] + ls.windowStart
+	}
+	return ls.windowStart
+}
+
+// restoreCursorAbsolute sets the cursor to the filtered entry closest to
+// the given absolute index.
+func (ls *listState) restoreCursorAbsolute(absIdx int) {
+	relIdx := absIdx - ls.windowStart
+	for i, fi := range ls.filtered {
+		if fi >= relIdx {
+			ls.cursor = i
+			ls.clampCursor()
+			return
+		}
+	}
+	ls.cursor = max(len(ls.filtered)-1, 0)
+	ls.clampCursor()
+}
+
+// rebuildFiltered applies the current filter query, toggles, and column sort
+// to produce the filtered index slice.
 func (ls *listState) rebuildFiltered() {
 	ls.filtered = ls.filtered[:0]
 
@@ -190,28 +324,13 @@ func isWordChar(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }
 
-// applySortOrder sorts the filtered indices according to the active sort mode.
+// applySortOrder sorts the filtered indices using the column layout's active
+// sort function.
 func (ls *listState) applySortOrder() {
-	entries := ls.entries
-
-	sort.SliceStable(ls.filtered, func(i, j int) bool {
-		a, b := entries[ls.filtered[i]], entries[ls.filtered[j]]
-		return ls.sortLess(a, b)
-	})
-}
-
-// sortLess returns true when a should appear before b under the active sort.
-func (ls *listState) sortLess(a, b listEntry) bool {
-	switch ls.sortMode {
-	case sortAgeAsc:
-		return a.SortTime().Before(b.SortTime())
-	case sortAlphaAsc:
-		return a.SortKey() < b.SortKey()
-	case sortAlphaDesc:
-		return a.SortKey() > b.SortKey()
-	default: // sortAgeDesc
-		return a.SortTime().After(b.SortTime())
+	if ls.columns == nil {
+		return
 	}
+	ls.columns.ApplySortToFiltered(ls.entries, ls.filtered)
 }
 
 // clampCursor ensures cursor and scrollOff remain within valid bounds.
@@ -271,8 +390,10 @@ func (ls *listState) handleFilterKey(key tea.KeyMsg) bool {
 		return ls.handleFilterInputKey(key)
 	case focusToggles:
 		return ls.handleToggleKey(key)
-	case focusSortToggles:
-		return ls.handleSortToggleKey(key)
+	case focusHeader:
+		return ls.handleHeaderKey(key)
+	case focusGearDropdown:
+		return ls.handleGearDropdownKey(key)
 	default:
 		return ls.handleFilterEntriesKey(key)
 	}
@@ -285,8 +406,8 @@ func (ls *listState) handleFilterInputKey(key tea.KeyMsg) bool {
 		ls.filterFocus = focusToggles
 		ls.toggleCursor = 0
 	case "shift+tab":
-		ls.filterFocus = focusSortToggles
-		ls.sortCursor = sortModeCount - 1
+		ls.filterFocus = focusHeader
+		ls.header.cursor = lastHeaderCol(ls.columns.VisibleColumns())
 	case "esc":
 		ls.deactivateFilter()
 	case "enter", "down":
@@ -314,7 +435,7 @@ func (ls *listState) handleFilterInputKey(key tea.KeyMsg) bool {
 
 // handleToggleKey processes keys directed at the filter toggle badges.
 // Tab/right advance through individual badges; after the last badge,
-// focus moves to sort toggles. Shift+tab/left reverse; before the first
+// focus moves to the header row. Shift+tab/left reverse; before the first
 // badge, focus returns to the filter input.
 func (ls *listState) handleToggleKey(key tea.KeyMsg) bool {
 	switch key.String() {
@@ -322,8 +443,8 @@ func (ls *listState) handleToggleKey(key tea.KeyMsg) bool {
 		if ls.toggleCursor < toggleCount-1 {
 			ls.toggleCursor++
 		} else {
-			ls.filterFocus = focusSortToggles
-			ls.sortCursor = 0
+			ls.filterFocus = focusHeader
+			ls.header.cursor = firstHeaderCol(ls.columns.VisibleColumns())
 		}
 	case "shift+tab", "left", "h":
 		if ls.toggleCursor > 0 {
@@ -342,31 +463,196 @@ func (ls *listState) handleToggleKey(key tea.KeyMsg) bool {
 	return true
 }
 
-// handleSortToggleKey processes keys directed at the sort mode badges.
-// Tab/right move the sort cursor between badges; enter/space activates
-// the focused badge. After the last badge, focus moves to entries.
-// Shift+tab/left reverse; before the first badge, focus returns to
-// filter toggles (at their last badge).
-func (ls *listState) handleSortToggleKey(key tea.KeyMsg) bool {
+// handleHeaderKey processes keys directed at the column header row.
+// Cursor positions 0..vis-1 are columns; position vis is the gear icon.
+// Navigation between columns uses Tab/Shift+Tab only (not arrows).
+func (ls *listState) handleHeaderKey(key tea.KeyMsg) bool {
+	vis := ls.columns.VisibleColumns()
+	if len(vis) == 0 {
+		return false
+	}
+
 	switch key.String() {
-	case "tab", "right", "l":
-		if ls.sortCursor < sortModeCount-1 {
-			ls.sortCursor++
+	case "tab":
+		if ls.header.cursor >= len(vis) {
+			// Past gear icon — exit header.
+			if ls.filterActive {
+				ls.filterFocus = focusFilter
+			} else {
+				ls.filterFocus = focusEntries
+			}
 		} else {
-			ls.filterFocus = focusFilter
-		}
-	case "shift+tab", "left", "h":
-		if ls.sortCursor > 0 {
-			ls.sortCursor--
-		} else {
-			ls.filterFocus = focusToggles
-			ls.toggleCursor = toggleCount - 1
+			ls.header.cursor = nextHeaderCol(vis, ls.header.cursor)
 		}
 	case "enter", " ":
-		ls.sortMode = ls.sortCursor
-		ls.rebuildFiltered()
+		if ls.header.cursor >= len(vis) {
+			// Toggle gear dropdown.
+			if ls.header.gearOpen {
+				ls.header.gearOpen = false
+			} else {
+				ls.header.gearOpen = true
+				ls.header.gearCursor = 0
+				ls.filterFocus = focusGearDropdown
+			}
+		} else {
+			ls.cycleSortOnHeaderCursor()
+		}
+	case "shift+left":
+		ls.reorderHeaderColumn(-1)
+	case "shift+right":
+		ls.reorderHeaderColumn(1)
+	case "shift+tab":
+		if ls.header.cursor >= len(vis) {
+			// At gear icon — go to last navigable column.
+			last := lastHeaderCol(vis)
+			if last < len(vis) {
+				ls.header.cursor = last
+			} else {
+				ls.exitHeaderBack()
+			}
+		} else {
+			prev := prevHeaderCol(vis, ls.header.cursor)
+			if prev >= 0 {
+				ls.header.cursor = prev
+			} else {
+				ls.exitHeaderBack()
+			}
+		}
 	case "esc":
-		ls.deactivateFilter()
+		ls.filterFocus = focusEntries
+	default:
+		return false
+	}
+	return true
+}
+
+// exitHeaderBack moves focus out of the header to the previous zone.
+func (ls *listState) exitHeaderBack() {
+	if ls.filterActive {
+		ls.filterFocus = focusToggles
+		ls.toggleCursor = toggleCount - 1
+	} else {
+		ls.filterFocus = focusEntries
+	}
+}
+
+// firstHeaderCol returns the index of the first visible column with a
+// non-empty label, or len(vis) if none exist (gear icon position).
+func firstHeaderCol(vis []ColumnState) int {
+	for i, c := range vis {
+		if c.Def.Label != "" {
+			return i
+		}
+	}
+	return len(vis)
+}
+
+// lastHeaderCol returns the index of the last visible column with a
+// non-empty label, or len(vis) if none exist (gear icon position).
+func lastHeaderCol(vis []ColumnState) int {
+	for i := len(vis) - 1; i >= 0; i-- {
+		if vis[i].Def.Label != "" {
+			return i
+		}
+	}
+	return len(vis)
+}
+
+// nextHeaderCol returns the index of the next navigable visible column
+// after from, or len(vis) for the gear icon position.
+func nextHeaderCol(vis []ColumnState, from int) int {
+	for i := from + 1; i < len(vis); i++ {
+		if vis[i].Def.Label != "" {
+			return i
+		}
+	}
+	return len(vis)
+}
+
+// prevHeaderCol returns the index of the previous navigable visible column
+// before from, or -1 if none.
+func prevHeaderCol(vis []ColumnState, from int) int {
+	for i := from - 1; i >= 0; i-- {
+		if vis[i].Def.Label != "" {
+			return i
+		}
+	}
+	return -1
+}
+
+// cycleSortOnHeaderCursor cycles sorting on the column under the header cursor.
+func (ls *listState) cycleSortOnHeaderCursor() {
+	vis := ls.columns.VisibleColumns()
+	if ls.header.cursor >= len(vis) {
+		return
+	}
+	ls.columns.CycleSort(vis[ls.header.cursor].Def.ID)
+	ls.rebuildFiltered()
+}
+
+// reorderHeaderColumn moves the column under the header cursor by delta
+// positions (-1 = left, +1 = right) within the full Columns slice.
+func (ls *listState) reorderHeaderColumn(delta int) {
+	vis := ls.columns.VisibleColumns()
+	if ls.header.cursor >= len(vis) {
+		return
+	}
+
+	// Find the full-slice index of the visible column at cursor.
+	colID := vis[ls.header.cursor].Def.ID
+	fullIdx := -1
+	for i, c := range ls.columns.Columns {
+		if c.Def.ID == colID {
+			fullIdx = i
+			break
+		}
+	}
+	if fullIdx < 0 {
+		return
+	}
+
+	newIdx := clamp(fullIdx+delta, 0, len(ls.columns.Columns)-1)
+	ls.columns.Reorder(fullIdx, newIdx)
+
+	// Adjust header cursor to track the moved column.
+	newVis := ls.columns.VisibleColumns()
+	for i, c := range newVis {
+		if c.Def.ID == colID {
+			ls.header.cursor = i
+			break
+		}
+	}
+}
+
+// handleGearDropdownKey processes keys when the gear dropdown is open.
+// The cursor indexes into the dropdown-visible columns (excludes decorative
+// empty-label columns).
+func (ls *listState) handleGearDropdownKey(key tea.KeyMsg) bool {
+	indices := ls.columns.dropdownIndices()
+	n := len(indices)
+	if n == 0 {
+		return false
+	}
+
+	switch key.String() {
+	case "up", "k":
+		if ls.header.gearCursor > 0 {
+			ls.header.gearCursor--
+		} else {
+			// At top — close dropdown.
+			ls.header.gearOpen = false
+			ls.filterFocus = focusHeader
+		}
+	case "down", "j":
+		ls.header.gearCursor = min(ls.header.gearCursor+1, n-1)
+	case "enter", " ":
+		colIdx := indices[ls.header.gearCursor]
+		col := ls.columns.Columns[colIdx]
+		ls.columns.ToggleVisibility(col.Def.ID)
+		ls.rebuildFiltered()
+	case "esc", "tab":
+		ls.header.gearOpen = false
+		ls.filterFocus = focusHeader
 	default:
 		return false
 	}
@@ -378,10 +664,11 @@ func (ls *listState) handleSortToggleKey(key tea.KeyMsg) bool {
 func (ls *listState) handleFilterEntriesKey(key tea.KeyMsg) bool {
 	switch key.String() {
 	case "tab":
-		ls.filterFocus = focusFilter
+		ls.filterFocus = focusHeader
+		ls.header.cursor = firstHeaderCol(ls.columns.VisibleColumns())
 	case "shift+tab":
-		ls.filterFocus = focusSortToggles
-		ls.sortCursor = sortModeCount - 1
+		ls.filterFocus = focusHeader
+		ls.header.cursor = lastHeaderCol(ls.columns.VisibleColumns())
 	case "up", "k":
 		ls.moveUp(1)
 	case "down", "j":
@@ -406,7 +693,6 @@ func (ls *listState) deactivateFilter() {
 func (ls *listState) activateFilter() {
 	ls.filterActive = true
 	ls.filterFocus = focusFilter
-	ls.sortCursor = ls.sortMode
 }
 
 // -------------------------------------------------------------------------
@@ -470,28 +756,6 @@ func renderFilterToggles(ls *listState, width int, th *theme.Theme) string {
 		ti := toggleIndex(i)
 		style := badgeStyle(p, ls.toggleActive[ti], ls.filterFocus == focusToggles && ls.toggleCursor == ti)
 		b.WriteString(style.Render("[" + labels[ti] + "]"))
-	}
-
-	return padToWidth(b.String(), width, p)
-}
-
-// renderSortToggles renders the sort mode radio badges on a separate line.
-func renderSortToggles(ls *listState, width int, th *theme.Theme) string {
-	p := th.Palette
-
-	labels := [sortModeCount]string{"t\u2193", "t\u2191", "A\u2193", "A\u2191"}
-	var b strings.Builder
-	b.WriteByte(' ')
-
-	for i := range sortModeCount {
-		if i > 0 {
-			b.WriteByte(' ')
-		}
-		sm := sortMode(i)
-		active := ls.sortMode == sm
-		focused := ls.filterFocus == focusSortToggles && ls.sortCursor == sm
-		style := badgeStyle(p, active, focused)
-		b.WriteString(style.Render("[" + labels[sm] + "]"))
 	}
 
 	return padToWidth(b.String(), width, p)

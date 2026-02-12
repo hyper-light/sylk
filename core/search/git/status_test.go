@@ -133,6 +133,9 @@ func TestClassifyGoGitStatus_Mixed(t *testing.T) {
 	assertContains(t, "Deleted", result.Deleted, "deleted.go")
 	assertContains(t, "Untracked", result.Untracked, "untracked.go")
 	assertContains(t, "Conflict", result.Conflict, "conflict.go")
+	if !result.HasIndexStaged {
+		t.Error("HasIndexStaged: expected true (added.go has Staging=Added)")
+	}
 }
 
 func TestClassifyGoGitStatus_Empty(t *testing.T) {
@@ -142,6 +145,30 @@ func TestClassifyGoGitStatus_Empty(t *testing.T) {
 	assertEmpty(t, "Deleted", result.Deleted)
 	assertEmpty(t, "Untracked", result.Untracked)
 	assertEmpty(t, "Conflict", result.Conflict)
+	if result.HasIndexStaged {
+		t.Error("HasIndexStaged: expected false for empty status")
+	}
+}
+
+func TestClassifyGoGitStatus_IndexStagedModification(t *testing.T) {
+	s := gogit.Status{
+		"staged_mod.go": {Staging: gogit.Modified, Worktree: gogit.Unmodified},
+	}
+	result := classifyGoGitStatus(s)
+	if !result.HasIndexStaged {
+		t.Error("HasIndexStaged: expected true (staged_mod.go has Staging=Modified)")
+	}
+}
+
+func TestClassifyGoGitStatus_OnlyWorktreeChanges(t *testing.T) {
+	s := gogit.Status{
+		"unstaged.go": {Staging: gogit.Unmodified, Worktree: gogit.Modified},
+		"new.go":      {Worktree: gogit.Untracked},
+	}
+	result := classifyGoGitStatus(s)
+	if result.HasIndexStaged {
+		t.Error("HasIndexStaged: expected false (only worktree changes)")
+	}
 }
 
 // =============================================================================

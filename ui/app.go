@@ -593,7 +593,8 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	// Git status watcher for file tree decorations.
 	if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
 		app.gitClient = gc
-		app.gitPanel = gitpanel.New(th, gc)
+		configPath := filepath.Join(cfg.ProjectRoot, ".sylk", "config.yaml")
+		app.gitPanel = gitpanel.New(th, gc, configPath)
 		app.commitTree = committree.New(th)
 		if sw, err := git.NewStatusWatcher(gc); err == nil {
 			app.gitWatcher = sw
@@ -689,8 +690,21 @@ func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.LSPFlushMsg:
 		// One-shot timer; no view change.
 		return m, cmd
-	case tea.KeyMsg, tea.MouseMsg:
+	case tea.KeyMsg:
 		// Interactive events reset blink phase.
+		m.viewDirty = true
+		m.blinkGen++
+		m.blinkEpoch = time.Now()
+		return m, m.postDispatchCmds(cmd, true)
+	case tea.MouseMsg:
+		typed := raw.(tea.MouseMsg)
+		if typed.Action == tea.MouseActionMotion {
+			// Motion events: let components set their own dirty flags.
+			// Don't reset blink or schedule blink timers — mouse movement
+			// should not interfere with cursor blink cadence.
+			m.viewDirty = true
+			return m, m.postDispatchCmds(cmd, false)
+		}
 		m.viewDirty = true
 		m.blinkGen++
 		m.blinkEpoch = time.Now()
@@ -818,7 +832,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitMode {
 			cmds = append(cmds, m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 			if m.commitTree.InCommitView() {
-				cmds = append(cmds, m.loadBranchCommitsCmd(m.commitTree.ActiveBranch()))
+				defaultBranch := m.commitTree.GetDefaultBranch()
+				cmds = append(cmds, m.loadBranchCommitsAndStatsCmd(m.commitTree.ActiveBranch(), defaultBranch))
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -826,21 +841,16 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.commitTree != nil {
 			m.commitTree.SetBranches(typed.branches, typed.defaultBranch)
 			m.commitTree.SetWorkingTreeStatus(typed.dirty, typed.conflicts)
-		}
-		return m, nil
-	case gitBranchCommitsLoadedMsg:
-		if m.commitTree != nil {
-			m.commitTree.SetNodes(typed.nodes)
-			hashes := make([]string, len(typed.nodes))
-			for i, n := range typed.nodes {
-				hashes[i] = n.Hash
-			}
-			return m, m.loadGitStatsCmd(hashes)
+			m.commitTree.SetHasIndexStaged(typed.hasIndexStaged)
 		}
 		return m, nil
 	case committree.BranchSelectedMsg:
 		if m.gitMode && m.gitClient != nil {
-			return m, m.loadBranchCommitsCmd(typed.Name)
+			defaultBranch := ""
+			if m.commitTree != nil {
+				defaultBranch = m.commitTree.GetDefaultBranch()
+			}
+			return m, m.loadBranchCommitsAndStatsCmd(typed.Name, defaultBranch)
 		}
 		return m, nil
 
@@ -937,9 +947,16 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case gitStatsLoadedMsg:
+	case gitBranchFullyLoadedMsg:
 		if m.commitTree != nil {
-			m.commitTree.UpdateStats(typed.stats)
+			m.commitTree.SetNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
+		}
+		return m, nil
+	case committree.LoadMoreMsg:
+		return m, m.loadMoreCommitsCmd()
+	case gitMoreCommitsLoadedMsg:
+		if m.commitTree != nil && typed.branch == m.commitTree.ActiveBranch() {
+			m.commitTree.AppendNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
 		}
 		return m, nil
 	case msg.FileReplacedMsg:
@@ -1365,6 +1382,12 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// route to editor in edit mode, or double-tap to interrupt agent.
 	// When an overlay is active, skip — overlays handle their own Esc.
 	if key.String() == "esc" && m.overlay == overlayNone {
+		// Git panel: close gear dropdown or exit header focus.
+		if m.gitMode && m.gitPanel != nil && m.focus.Current() == component.FocusGitPanel {
+			comp, cmd := m.gitPanel.Update(key)
+			m.gitPanel = comp.(*gitpanel.Model)
+			return m, cmd
+		}
 		if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode() || m.fileTree.InTabsMode()) && m.focus.Current() == component.FocusFileTree {
 			m.fileTree.Update(key)
 			return m, nil
@@ -1607,6 +1630,14 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Git tab navigation shortcuts (must precede spatial focus so
+	// Alt+Shift+Left/Right reaches tab cycling when the git panel is focused).
+	if m.gitMode && m.gitPanel != nil {
+		if cmd, handled := m.handleGitTabShortcut(ks); handled {
+			return m, cmd
+		}
+	}
+
 	// Alt+Shift+arrow moves focus spatially between panels.
 	if target, ok := m.spatialFocusTarget(key.String()); ok {
 		m.focus.SetFocus(target)
@@ -1656,7 +1687,20 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 	}
 	m.tickSwipeDecay()
 
-	return m.continueTickChain()
+	// Drain pending commands from scroll-triggered pagination.
+	var cmds []tea.Cmd
+	if m.gitPanel != nil {
+		if cmd := m.gitPanel.DrainCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	if m.commitTree != nil {
+		if cmd := m.commitTree.DrainCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	cmds = append(cmds, m.continueTickChain())
+	return tea.Batch(cmds...)
 }
 
 func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
@@ -1700,6 +1744,23 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	// Refresh ring hint during streaming (activity badge changes) at decor rate.
 	if (!m.leftRing.empty() || !m.rightRing.empty()) && m.chat.IsStreaming() {
 		m.statusBar.SetViewRingHint(m.buildRingHint())
+		changed = true
+	}
+
+	// Commit tree loading spinner (time-based, redraws each decor tick).
+	if m.commitTree != nil && m.commitTree.NeedsDecorTick() {
+		m.comp.MarkDirty(compositor.SlotRight)
+		changed = true
+	}
+
+	// Git panel loading bar (time-based, redraws each decor tick).
+	if m.gitMode && m.gitPanel != nil && m.gitPanel.NeedsDecorTick() {
+		m.gitPanel.MarkViewDirty()
+		if m.layout.Mode() == layout.FourColumn {
+			m.comp.MarkDirty(compositor.SlotCenterLeft)
+		} else {
+			m.comp.MarkDirty(compositor.SlotLeft)
+		}
 		changed = true
 	}
 
@@ -3008,22 +3069,29 @@ func (m *AppModel) exitEditMode() {
 // gitBranchesLoadedMsg carries branch data loaded asynchronously for the
 // commit tree panel's branch view.
 type gitBranchesLoadedMsg struct {
-	branches      []committree.BranchNode
-	defaultBranch string
-	dirty         bool // working tree has uncommitted changes
-	conflicts     bool // working tree has merge conflicts
+	branches       []committree.BranchNode
+	defaultBranch  string
+	dirty          bool // working tree has uncommitted changes
+	conflicts      bool // working tree has merge conflicts
+	hasIndexStaged bool // git index has staged changes (via git add)
 }
 
-// gitBranchCommitsLoadedMsg carries commit data for a single branch,
-// loaded when the user drills into a branch.
-type gitBranchCommitsLoadedMsg struct {
-	branch string
-	nodes  []committree.TreeNode
+// gitBranchFullyLoadedMsg carries commit nodes with their diff stats,
+// loaded atomically so the UI can transition from spinner to data in one step.
+type gitBranchFullyLoadedMsg struct {
+	branch  string
+	nodes   []committree.TreeNode
+	stats   map[string][2]int
+	hasMore bool
 }
 
-// gitStatsLoadedMsg carries diff stats loaded asynchronously for commit nodes.
-type gitStatsLoadedMsg struct {
-	stats map[string][2]int // hash → [additions, deletions]
+// gitMoreCommitsLoadedMsg carries an additional page of commits appended
+// during infinite scroll.
+type gitMoreCommitsLoadedMsg struct {
+	branch  string
+	nodes   []committree.TreeNode
+	stats   map[string][2]int
+	hasMore bool
 }
 
 type branchDeletedMsg struct{ name string }
@@ -3043,7 +3111,7 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 		defaultBranch := gc.DefaultBranch()
 
 		// Working tree status.
-		statuses, _ := gc.UncommittedFileStatuses()
+		statuses, hasIndexStaged, _ := gc.UncommittedFileStatuses()
 		dirty := len(statuses) > 0
 		var conflicts bool
 		for _, s := range statuses {
@@ -3072,67 +3140,131 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 		}
 
 		return gitBranchesLoadedMsg{
-			branches:      nodes,
-			defaultBranch: defaultBranch,
-			dirty:         dirty,
-			conflicts:     conflicts,
+			branches:       nodes,
+			defaultBranch:  defaultBranch,
+			dirty:          dirty,
+			conflicts:      conflicts,
+			hasIndexStaged: hasIndexStaged,
 		}
 	}
 }
 
-// loadBranchCommitsCmd returns a tea.Cmd that loads commits for a single
-// branch via go-git and converts them to TreeNode data.
-func (m *AppModel) loadBranchCommitsCmd(branchName string) tea.Cmd {
+// loadBranchCommitsAndStatsCmd loads the first page of commits and their diff
+// stats, returning a gitBranchFullyLoadedMsg so the UI transitions atomically
+// from loading spinner to fully populated commit list (no pop-in).
+func (m *AppModel) loadBranchCommitsAndStatsCmd(branchName, defaultBranch string) tea.Cmd {
 	gc := m.gitClient
 	return func() tea.Msg {
-		commits, err := gc.ListCommitsForBranch(branchName, commitTreeLoadLimit)
+		commits, hasMore, err := gc.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
 		if err != nil {
-			return gitBranchCommitsLoadedMsg{branch: branchName}
+			return gitBranchFullyLoadedMsg{branch: branchName}
 		}
-		nodes := make([]committree.TreeNode, len(commits))
-		for i, c := range commits {
-			nodes[i] = committree.TreeNode{
-				Hash:       c.Hash,
-				ShortHash:  c.ShortHash,
-				Subject:    c.Subject,
-				Branch:     c.Branch,
-				Author:     c.Author,
-				AuthorTime: c.AuthorTime,
-				Parents:    c.ParentHashes,
-				IsMerge:    c.IsMerge,
-			}
-		}
-		// Ensure the tip commit always shows the viewed branch name,
-		// even when buildBranchMap mapped it to a different branch.
+		nodes := commitsToTreeNodes(commits)
+		// Only the tip commit carries the branch label.
 		if len(nodes) > 0 {
 			nodes[0].Branch = branchName
 		}
-		return gitBranchCommitsLoadedMsg{branch: branchName, nodes: nodes}
+		stats := loadStatsForNodes(gc, nodes)
+		return gitBranchFullyLoadedMsg{
+			branch:  branchName,
+			nodes:   nodes,
+			stats:   stats,
+			hasMore: hasMore,
+		}
 	}
 }
 
-// loadGitStatsCmd returns a tea.Cmd that loads diff stats for the given
-// commit hashes via go-git's commit.Stats(). Runs in the background so the
-// tree can display immediately while stats populate asynchronously.
-func (m *AppModel) loadGitStatsCmd(hashes []string) tea.Cmd {
+// loadMoreCommitsCmd loads the next page of commits for infinite scroll,
+// starting after the last loaded commit hash.
+func (m *AppModel) loadMoreCommitsCmd() tea.Cmd {
+	if m.commitTree == nil {
+		return nil
+	}
+	branch := m.commitTree.ActiveBranch()
+	lastHash := m.commitTree.LastHash()
+	defaultBranch := m.commitTree.GetDefaultBranch()
 	gc := m.gitClient
 	return func() tea.Msg {
-		stats := make(map[string][2]int, len(hashes))
-		for _, h := range hashes {
-			add, del, err := gc.GetCommitStats(h)
-			if err != nil {
-				continue
-			}
-			stats[h] = [2]int{add, del}
+		commits, hasMore, err := gc.ListBranchOnlyCommits(branch, defaultBranch, lastHash, commitPageSize)
+		if err != nil || len(commits) == 0 {
+			return gitMoreCommitsLoadedMsg{branch: branch}
 		}
-		return gitStatsLoadedMsg{stats: stats}
+		nodes := commitsToTreeNodes(commits)
+		stats := loadStatsForNodes(gc, nodes)
+		return gitMoreCommitsLoadedMsg{
+			branch:  branch,
+			nodes:   nodes,
+			stats:   stats,
+			hasMore: hasMore,
+		}
 	}
 }
 
-// commitTreeLoadLimit is the maximum number of commits to load for the tree.
-// Derived from: typical visible viewport ≈ 15–20 nodes; 500 provides ample
-// scroll depth without excessive memory or load time.
-const commitTreeLoadLimit = 500
+// commitsToTreeNodes converts git TreeCommits to UI TreeNodes.
+func commitsToTreeNodes(commits []git.TreeCommit) []committree.TreeNode {
+	nodes := make([]committree.TreeNode, len(commits))
+	for i, c := range commits {
+		nodes[i] = committree.TreeNode{
+			Hash:       c.Hash,
+			ShortHash:  c.ShortHash,
+			Subject:    c.Subject,
+			Branch:     c.Branch,
+			Author:     c.Author,
+			AuthorTime: c.AuthorTime,
+			Parents:    c.ParentHashes,
+			IsMerge:    c.IsMerge,
+		}
+	}
+	return nodes
+}
+
+// loadStatsForNodes fetches diff stats for each node's commit hash.
+func loadStatsForNodes(gc *git.GitClient, nodes []committree.TreeNode) map[string][2]int {
+	stats := make(map[string][2]int, len(nodes))
+	for _, n := range nodes {
+		add, del, err := gc.GetCommitStats(n.Hash)
+		if err != nil {
+			continue
+		}
+		stats[n.Hash] = [2]int{add, del}
+	}
+	return stats
+}
+
+// commitPageSize is the number of commits per page.
+// Derived from: typical viewport shows ~8 nodes; 3× provides comfortable
+// scroll depth per page while keeping load times snappy.
+const commitPageSize = 25
+
+// handleGitTabShortcut processes git-panel tab jump shortcuts.
+// Returns (cmd, true) if the key was handled.
+func (m *AppModel) handleGitTabShortcut(ks string) (tea.Cmd, bool) {
+	switch ks {
+	case "alt+c":
+		m.gitPanel.SetActiveTab(gitpanel.TabCommits)
+		m.focusGitPanel()
+		return nil, true
+	case "alt+b":
+		m.gitPanel.SetActiveTab(gitpanel.TabBranches)
+		m.focusGitPanel()
+		return nil, true
+	case "alt+t":
+		m.gitPanel.SetActiveTab(gitpanel.TabTags)
+		m.focusGitPanel()
+		return nil, true
+	case "alt+u":
+		m.gitPanel.SetActiveTab(gitpanel.TabUncommitted)
+		m.focusGitPanel()
+		return nil, true
+	}
+	return nil, false
+}
+
+// focusGitPanel sets focus to the git panel and syncs focus state.
+func (m *AppModel) focusGitPanel() {
+	m.focus.SetFocus(component.FocusGitPanel)
+	m.syncFocusState()
+}
 
 // toggleGitMode switches between git mode and the previous mode.
 func (m *AppModel) toggleGitMode() tea.Cmd {
@@ -5400,6 +5532,24 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		return m.handleEditorMouseHover(mouse)
 	}
 
+	// Git mode: track divider hover for resize cursor feedback.
+	if m.gitMode && m.gitPanel != nil && mouse.Action == tea.MouseActionMotion && !m.gitPanel.IsDragging() {
+		panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
+		panelX := m.fileTreePanelX()
+		contentLeft := panelX + 1
+		contentRight := panelX + panelW - 1
+		contentTop := 1
+		contentBottom := 1 + max(panelH-panelBorderSize, 0)
+		if mouse.X >= contentLeft && mouse.X < contentRight &&
+			mouse.Y >= contentTop && mouse.Y < contentBottom {
+			viewX := mouse.X - contentLeft
+			viewY := mouse.Y - contentTop
+			m.gitPanel.HandleMouseHover(viewX, viewY)
+		} else {
+			m.gitPanel.ClearHover()
+		}
+	}
+
 	switch mouse.Button {
 	case tea.MouseButtonWheelUp:
 		if mouse.Alt {
@@ -5439,9 +5589,34 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Git mode: forward motion/release during column drag operations.
+	if m.gitMode && m.gitPanel != nil && m.gitPanel.IsDragging() {
+		viewX := mouse.X - m.fileTreePanelX() - 1
+		if mouse.Action == tea.MouseActionMotion {
+			m.gitPanel.HandleMouseMotion(viewX)
+			return nil
+		}
+		if mouse.Action == tea.MouseActionRelease {
+			m.gitPanel.HandleMouseRelease()
+			return nil
+		}
+	}
+
 	if mouse.Action != tea.MouseActionPress {
 		return nil
 	}
+
+	// Git mode: route to git panel and commit tree.
+	if m.gitMode {
+		if cmd := m.handleGitPanelClick(mouse.X, mouse.Y); cmd != nil {
+			return cmd
+		}
+		if cmd := m.handleCommitTreeClick(mouse.X, mouse.Y); cmd != nil {
+			return cmd
+		}
+		return nil
+	}
+
 	if cmd := m.handleFileTreeClick(mouse.X, mouse.Y); cmd != nil {
 		return cmd
 	}
@@ -5804,6 +5979,68 @@ func (m *AppModel) handleFileTreeClick(x, y int) tea.Cmd {
 	viewX := x - contentLeft
 	viewY := y - contentTop
 	return m.fileTree.ClickAt(viewX, viewY)
+}
+
+// handleGitPanelClick dispatches a click inside the git panel (occupies the
+// FileTree slot in git mode).
+func (m *AppModel) handleGitPanelClick(x, y int) tea.Cmd {
+	if m.gitPanel == nil {
+		return nil
+	}
+	panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
+	if panelW == 0 || panelH == 0 {
+		return nil
+	}
+	panelX := m.fileTreePanelX()
+	innerH := max(panelH-panelBorderSize, 0)
+
+	contentLeft := panelX + 1
+	contentRight := panelX + panelW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight || y < contentTop || y >= contentBottom {
+		// Click outside git panel — close any open gear dropdown.
+		m.gitPanel.CloseDropdown()
+		return nil
+	}
+
+	viewX := x - contentLeft
+	viewY := y - contentTop
+	m.focus.SetFocus(component.FocusGitPanel)
+	m.syncFocusState()
+	cmd := m.gitPanel.ClickAt(viewX, viewY)
+	return cmd
+}
+
+// handleCommitTreeClick dispatches a click inside the commit tree panel
+// (occupies the CodeViewer slot in git mode).
+func (m *AppModel) handleCommitTreeClick(x, y int) tea.Cmd {
+	if m.commitTree == nil {
+		return nil
+	}
+	panelW, panelH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	if panelW == 0 || panelH == 0 {
+		return nil
+	}
+	panelX := m.codePanelX()
+	innerH := max(panelH-panelBorderSize, 0)
+
+	contentLeft := panelX + 1
+	contentRight := panelX + panelW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight || y < contentTop || y >= contentBottom {
+		return nil
+	}
+
+	viewX := x - contentLeft
+	viewY := y - contentTop
+	m.focus.SetFocus(component.FocusCommitTree)
+	m.syncFocusState()
+	cmd := m.commitTree.ClickAt(viewX, viewY)
+	return cmd
 }
 
 // isChatVisible reports whether the Chat panel is currently rendered on screen.
@@ -8126,7 +8363,9 @@ func (m *AppModel) needsDecorTick() bool {
 	return m.chat.HasActiveAnimation() ||
 		m.statusBar.IsAnimating() ||
 		now.Before(m.tabArrowFlashLeftUntil) ||
-		now.Before(m.tabArrowFlashRightUntil)
+		now.Before(m.tabArrowFlashRightUntil) ||
+		(m.commitTree != nil && m.commitTree.NeedsDecorTick()) ||
+		(m.gitMode && m.gitPanel != nil && m.gitPanel.NeedsDecorTick())
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs

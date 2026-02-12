@@ -7,7 +7,9 @@ import (
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/utils/merkletrie"
 )
 
 // ListBranches returns metadata for all local branches.
@@ -72,6 +74,43 @@ func branchInfoFromRef(c *GitClient, ref *plumbing.Reference, headBranch string)
 	return info
 }
 
+// BranchTipHash returns the full commit hash of the named local branch tip.
+// O(1) reference lookup — no branch enumeration.
+func (c *GitClient) BranchTipHash(name string) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return "", ErrNotGitRepo
+	}
+
+	ref, err := c.repo.Reference(plumbing.NewBranchReferenceName(name), true)
+	if err != nil {
+		return "", err
+	}
+	return ref.Hash().String(), nil
+}
+
+// DiffStatLevel specifies the granularity of diff statistics to compute.
+type DiffStatLevel int
+
+const (
+	DiffStatNone  DiffStatLevel = iota // no stats needed
+	DiffStatFiles                      // file-level only (DiffTree + Action)
+	DiffStatLines                      // full line-level (Patch)
+)
+
+// DiffSummary holds line-level and file-level change statistics for a commit.
+type DiffSummary struct {
+	Additions, Deletions                   int
+	FilesAdded, FilesModified, FilesDeleted int
+}
+
+// FileSummary holds file-level change counts without line-level detail.
+type FileSummary struct {
+	FilesAdded, FilesModified, FilesDeleted int
+}
+
 // GetCommitStats returns the total additions and deletions for a commit.
 // Returns ErrNotGitRepo if not a git repository.
 // Returns ErrCommitNotFound if the commit does not exist.
@@ -104,6 +143,245 @@ func (c *GitClient) GetCommitStats(hash string) (additions, deletions int, err e
 	}
 
 	return additions, deletions, nil
+}
+
+// GetCommitDiffSummary returns line and file change statistics for a commit.
+// For root commits (no parent), diffs against an empty tree.
+// Returns ErrNotGitRepo if not a git repository.
+// Returns ErrCommitNotFound if the commit does not exist.
+func (c *GitClient) GetCommitDiffSummary(hash string) (DiffSummary, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return DiffSummary{}, ErrNotGitRepo
+	}
+
+	return c.diffSummaryForHash(hash)
+}
+
+// GetCommitDiffSummaries returns diff summaries for multiple commits under a
+// single read lock. Hashes that fail to resolve are silently skipped.
+func (c *GitClient) GetCommitDiffSummaries(hashes []string) map[string]DiffSummary {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make(map[string]DiffSummary, len(hashes))
+	if !c.isRepo {
+		return out
+	}
+
+	for _, h := range hashes {
+		if ds, err := c.diffSummaryForHash(h); err == nil {
+			out[h] = ds
+		}
+	}
+	return out
+}
+
+// GetCommitFileSummaries returns file-level change counts for multiple commits
+// under a single read lock, using DiffTree + Action (no Patch/blob reads).
+// Hashes that fail to resolve are silently skipped.
+func (c *GitClient) GetCommitFileSummaries(hashes []string) map[string]FileSummary {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make(map[string]FileSummary, len(hashes))
+	if !c.isRepo {
+		return out
+	}
+
+	for _, h := range hashes {
+		if fs, err := c.fileSummaryForHash(h); err == nil {
+			out[h] = fs
+		}
+	}
+	return out
+}
+
+// fileSummaryForHash resolves a hash and computes file-level stats.
+// Checks the cache for existing file or line-level results first.
+// Caller must hold at least an RLock on c.mu.
+func (c *GitClient) fileSummaryForHash(hash string) (FileSummary, error) {
+	// Check line-level cache (superset of file-level).
+	if val, ok := c.diffCache.Get("line:" + hash); ok {
+		ds := val.(DiffSummary)
+		return FileSummary{ds.FilesAdded, ds.FilesModified, ds.FilesDeleted}, nil
+	}
+	// Check file-level cache.
+	if val, ok := c.diffCache.Get("file:" + hash); ok {
+		return val.(FileSummary), nil
+	}
+
+	resolved, err := c.resolveCommitHash(hash)
+	if err != nil {
+		return FileSummary{}, err
+	}
+
+	commit, err := c.repo.CommitObject(resolved)
+	if err != nil {
+		return FileSummary{}, ErrCommitNotFound
+	}
+
+	fs, err := c.fileSummaryFromCommit(commit)
+	if err != nil {
+		return FileSummary{}, err
+	}
+
+	c.diffCache.Set("file:"+hash, fs, 1)
+	return fs, nil
+}
+
+// fileSummaryFromCommit computes file-level stats using DiffTree + Action.
+// No Patch() call — no blob reads.
+// Caller must hold at least an RLock on c.mu.
+func (c *GitClient) fileSummaryFromCommit(commit *object.Commit) (FileSummary, error) {
+	parentTree, err := firstParentTree(c, commit)
+	if err != nil {
+		return FileSummary{}, err
+	}
+
+	commitTree, err := commit.Tree()
+	if err != nil {
+		return FileSummary{}, err
+	}
+
+	changes, err := object.DiffTree(parentTree, commitTree)
+	if err != nil {
+		return FileSummary{}, err
+	}
+
+	var fs FileSummary
+	for _, ch := range changes {
+		action, aErr := ch.Action()
+		if aErr != nil {
+			continue
+		}
+		switch action {
+		case merkletrie.Insert:
+			fs.FilesAdded++
+		case merkletrie.Delete:
+			fs.FilesDeleted++
+		case merkletrie.Modify:
+			fs.FilesModified++
+		}
+	}
+	return fs, nil
+}
+
+// diffSummaryForHash resolves a hash string and computes its diff summary.
+// Caller must hold at least an RLock on c.mu.
+func (c *GitClient) diffSummaryForHash(hash string) (DiffSummary, error) {
+	if val, ok := c.diffCache.Get("line:" + hash); ok {
+		return val.(DiffSummary), nil
+	}
+
+	resolved, err := c.resolveCommitHash(hash)
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	commit, err := c.repo.CommitObject(resolved)
+	if err != nil {
+		return DiffSummary{}, ErrCommitNotFound
+	}
+
+	ds, err := c.diffSummaryFromCommit(commit)
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	c.diffCache.Set("line:"+hash, ds, 1)
+	c.diffCache.Set("file:"+hash, FileSummary{ds.FilesAdded, ds.FilesModified, ds.FilesDeleted}, 1)
+	return ds, nil
+}
+
+// diffSummaryFromCommit computes a DiffSummary by diffing the commit against
+// its first parent (or an empty tree for root commits).
+// Caller must hold at least an RLock on c.mu.
+func (c *GitClient) diffSummaryFromCommit(commit *object.Commit) (DiffSummary, error) {
+	parentTree, err := firstParentTree(c, commit)
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	commitTree, err := commit.Tree()
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	changes, err := object.DiffTree(parentTree, commitTree)
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	patch, err := changes.Patch()
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	return diffSummaryFromPatch(patch), nil
+}
+
+// firstParentTree returns the tree of a commit's first parent.
+// Returns (nil, nil) for root commits (no parents).
+func firstParentTree(c *GitClient, commit *object.Commit) (*object.Tree, error) {
+	if len(commit.ParentHashes) == 0 {
+		return nil, nil
+	}
+
+	parent, err := c.repo.CommitObject(commit.ParentHashes[0])
+	if err != nil {
+		return nil, err
+	}
+
+	return parent.Tree()
+}
+
+// diffSummaryFromPatch accumulates file and line statistics from a patch.
+func diffSummaryFromPatch(patch *object.Patch) DiffSummary {
+	var ds DiffSummary
+	for _, fp := range patch.FilePatches() {
+		classifyFilePatch(fp, &ds)
+		for _, chunk := range fp.Chunks() {
+			n := chunkLineCount(chunk)
+			switch chunk.Type() {
+			case fdiff.Add:
+				ds.Additions += n
+			case fdiff.Delete:
+				ds.Deletions += n
+			}
+		}
+	}
+	return ds
+}
+
+// classifyFilePatch increments the appropriate file counter on ds.
+// The degenerate case (from==nil && to==nil) is skipped.
+func classifyFilePatch(fp fdiff.FilePatch, ds *DiffSummary) {
+	from, to := fp.Files()
+	switch {
+	case from == nil && to != nil:
+		ds.FilesAdded++
+	case from != nil && to == nil:
+		ds.FilesDeleted++
+	case from != nil && to != nil:
+		ds.FilesModified++
+	}
+}
+
+// chunkLineCount counts the lines in a diff chunk.
+// Matches go-git's getFileStatsFromFilePatches logic.
+func chunkLineCount(chunk fdiff.Chunk) int {
+	s := chunk.Content()
+	if len(s) == 0 {
+		return 0
+	}
+	n := strings.Count(s, "\n")
+	if s[len(s)-1] != '\n' {
+		n++
+	}
+	return n
 }
 
 // =============================================================================
@@ -168,9 +446,11 @@ func (c *GitClient) ListCommitsForTree(limit int) ([]TreeCommit, error) {
 	return commits, nil
 }
 
-// ListCommitsForBranch returns commits reachable from a single named branch.
-// Results are ordered newest-first. Limit ≤ 0 means return all.
-// Returns ErrNotGitRepo if not a git repository.
+// ListCommitsForBranch returns commits on a single branch using first-parent
+// traversal. This follows only the first parent at each step, matching
+// `git log --first-parent`, so commits from merged branches are excluded.
+// Results are ordered newest-first (branch tip is index 0).
+// Limit ≤ 0 means return all. Returns ErrNotGitRepo if not a git repository.
 func (c *GitClient) ListCommitsForBranch(branchName string, limit int) ([]TreeCommit, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -191,28 +471,150 @@ func (c *GitClient) ListCommitsForBranch(branchName string, limit int) ([]TreeCo
 		return nil, err
 	}
 
-	iter, err := c.repo.Log(&gogit.LogOptions{
-		From:  ref.Hash(),
-		Order: gogit.LogOrderCommitterTime,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
+	// Walk the first-parent chain from the branch tip.
+	hash := ref.Hash()
 	var commits []TreeCommit
-	err = iter.ForEach(func(co *object.Commit) error {
+	for {
 		if limit > 0 && len(commits) >= limit {
-			return io.EOF
+			break
+		}
+		co, err := c.repo.CommitObject(hash)
+		if err != nil {
+			break
 		}
 		commits = append(commits, treeCommitFromObject(co, branchMap))
-		return nil
-	})
-	if err != nil && err != io.EOF {
-		return nil, err
+		if len(co.ParentHashes) == 0 {
+			break // root commit
+		}
+		hash = co.ParentHashes[0] // first parent only
 	}
 
 	return commits, nil
+}
+
+// ListBranchOnlyCommits returns a page of commits unique to a branch by
+// walking the first-parent chain and stopping at the merge-base with
+// baseBranch. When branchName equals baseBranch (or baseBranch is empty),
+// the full first-parent history is returned.
+//
+// afterHash provides cursor-based pagination: when empty the walk starts
+// from the branch tip; when non-empty the walk starts from that commit's
+// first parent, skipping already-loaded commits in O(1).
+//
+// Returns (commits, hasMore, error). hasMore is true when more pages
+// remain beyond the returned page. pageSize ≤ 0 means return all.
+func (c *GitClient) ListBranchOnlyCommits(branchName, baseBranch, afterHash string, pageSize int) ([]TreeCommit, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return nil, false, ErrNotGitRepo
+	}
+
+	branchRef, err := c.repo.Reference(plumbing.NewBranchReferenceName(branchName), true)
+	if err != nil {
+		return nil, false, err
+	}
+
+	branchMap, err := c.buildBranchMap()
+	if err != nil {
+		return nil, false, err
+	}
+
+	stopAt := c.mergeBaseStopSet(branchRef.Hash(), branchName, baseBranch)
+
+	// Determine walk start: branch tip for first page, afterHash's first
+	// parent for subsequent pages.
+	startHash := branchRef.Hash()
+	if afterHash != "" {
+		afterCommit, aErr := c.repo.CommitObject(plumbing.NewHash(afterHash))
+		if aErr != nil {
+			return nil, false, aErr
+		}
+		if len(afterCommit.ParentHashes) == 0 {
+			return nil, false, nil
+		}
+		startHash = afterCommit.ParentHashes[0]
+	}
+
+	// Request one extra commit to detect whether more pages exist.
+	fetchLimit := pageSize
+	if pageSize > 0 {
+		fetchLimit = pageSize + 1
+	}
+	commits := c.walkFirstParent(startHash, branchMap, fetchLimit, stopAt)
+
+	hasMore := pageSize > 0 && len(commits) > pageSize
+	if hasMore {
+		commits = commits[:pageSize]
+	}
+	return commits, hasMore, nil
+}
+
+// mergeBaseStopSet computes the set of merge-base hashes where the
+// first-parent walk should stop. Returns nil when no filtering should
+// occur (default branch, same tip, orphan, or any resolution error).
+func (c *GitClient) mergeBaseStopSet(branchHash plumbing.Hash, branchName, baseBranch string) map[plumbing.Hash]struct{} {
+	if baseBranch == "" || branchName == baseBranch {
+		return nil
+	}
+	bases := c.computeMergeBases(branchHash, baseBranch)
+	if len(bases) == 0 {
+		return nil
+	}
+	stopAt := make(map[plumbing.Hash]struct{}, len(bases))
+	for _, b := range bases {
+		stopAt[b.Hash] = struct{}{}
+	}
+	return stopAt
+}
+
+// computeMergeBases returns the merge-base commits between branchHash and the
+// named base branch. Returns nil on any error or when tips are identical.
+func (c *GitClient) computeMergeBases(branchHash plumbing.Hash, baseBranch string) []*object.Commit {
+	baseRef, err := c.repo.Reference(plumbing.NewBranchReferenceName(baseBranch), true)
+	if err != nil {
+		return nil
+	}
+	if branchHash == baseRef.Hash() {
+		return nil
+	}
+	branchTip, err := c.repo.CommitObject(branchHash)
+	if err != nil {
+		return nil
+	}
+	baseTip, err := c.repo.CommitObject(baseRef.Hash())
+	if err != nil {
+		return nil
+	}
+	bases, _ := branchTip.MergeBase(baseTip)
+	return bases
+}
+
+// walkFirstParent traverses the first-parent chain from startHash, collecting
+// TreeCommits. Stops at the limit, root commit, or any hash in stopAt
+// (which is excluded from results). Safe to call with a nil stopAt map.
+func (c *GitClient) walkFirstParent(startHash plumbing.Hash, branchMap map[string]string, limit int, stopAt map[plumbing.Hash]struct{}) []TreeCommit {
+	var commits []TreeCommit
+	hash := startHash
+	for {
+		if limit > 0 && len(commits) >= limit {
+			break
+		}
+		if _, stop := stopAt[hash]; stop {
+			break
+		}
+		co, err := c.repo.CommitObject(hash)
+		if err != nil {
+			break
+		}
+		commits = append(commits, treeCommitFromObject(co, branchMap))
+		if len(co.ParentHashes) == 0 {
+			break
+		}
+		hash = co.ParentHashes[0]
+	}
+	return commits
 }
 
 // buildBranchMap returns a map from full commit hash to branch short name.

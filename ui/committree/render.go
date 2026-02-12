@@ -47,41 +47,46 @@ func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isLast bo
 	const borderCols = 2
 	innerWidth := max(width-borderCols, 0)
 
-	// Build the two content lines for the card.
-	header := buildHeaderLine(n, innerWidth, p)
-	subject := buildSubjectLine(n, innerWidth, p)
-	content := header + "\n" + subject
-
 	// Select border color based on selection state.
 	borderColor := p.Border
 	if selected {
 		borderColor = p.Primary
 	}
+	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
-	boxStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(borderColor).
-		Width(innerWidth)
+	// Build the two content lines, padded to innerWidth.
+	header := padContent(buildHeaderLine(n, innerWidth, p), innerWidth)
+	subject := padContent(buildSubjectLine(n, innerWidth, p), innerWidth)
 
-	rendered := boxStyle.Render(content)
-	cardLines := strings.Split(rendered, "\n")
+	// Build border and content lines directly — avoids lipgloss.Border().Render().
+	topBorder := bSt.Render("╭" + strings.Repeat("─", innerWidth) + "╮")
+	botBorder := bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
 
-	// Build edge connector line (or blank for the last node).
-	edgeStyle := lipgloss.NewStyle().Foreground(p.Border)
+	// Edge connector line (or blank for the last node).
 	var connector string
 	if !isLast {
-		connector = "  " + edgeStyle.Render(edgeGlyph)
+		edgeSt := lipgloss.NewStyle().Foreground(p.Border)
+		connector = "  " + edgeSt.Render(edgeGlyph)
 	}
 
-	lines := make([]string, 0, nodeHeight)
-	for _, cl := range cardLines {
-		lines = append(lines, padLine(cl, width))
+	// All card lines are exactly width visual columns; connector needs padding.
+	connectorVis := 0
+	if connector != "" {
+		connectorVis = 3 // "  │"
 	}
-	lines = append(lines, padLine(connector, width))
+	blank := strings.Repeat(" ", max(width, 0))
+
+	lines := []string{
+		topBorder,
+		bSt.Render("│") + header + bSt.Render("│"),
+		bSt.Render("│") + subject + bSt.Render("│"),
+		botBorder,
+		padRight(connector, connectorVis, width),
+	}
 
 	// Clamp to exactly nodeHeight lines.
 	for len(lines) < nodeHeight {
-		lines = append(lines, strings.Repeat(" ", max(width, 0)))
+		lines = append(lines, blank)
 	}
 	if len(lines) > nodeHeight {
 		lines = lines[:nodeHeight]
@@ -162,6 +167,8 @@ type branchExpansion struct {
 	commitCursor     int         // cursor position in commit message
 	commitSpinner    int         // spinner frame index
 	cursorVisible    bool        // blink phase: true = show cursor
+	deleteConfirm    bool        // delete confirmation prompt is active
+	deleteConfirmYes bool        // true = (y)es highlighted, false = (n)o highlighted
 }
 
 // switchEnabled reports whether the Switch action is usable.
@@ -209,14 +216,17 @@ func (e *branchExpansion) commitBlockedReason(isHead bool) string {
 	return ""
 }
 
-// actionBlockedReason returns the reason for whichever action is currently
-// blocked, preferring the commit reason for HEAD and the switch reason
-// for non-HEAD branches.
+// actionBlockedReason returns the reason the currently selected action is
+// blocked, or empty if the selected action is not blocked.
 func (e *branchExpansion) actionBlockedReason(isHead bool) string {
-	if r := e.commitBlockedReason(isHead); r != "" {
-		return r
+	switch e.selectedActionID {
+	case branchActionCommit:
+		return e.commitBlockedReason(isHead)
+	case branchActionSwitch:
+		return e.switchBlockedReason(isHead)
+	default:
+		return ""
 	}
-	return e.switchBlockedReason(isHead)
 }
 
 // buildBranchCard returns the rendered lines for a single branch card.
@@ -259,9 +269,11 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 		content := bSt.Render("│") + padContent(buildExpContentLine(b, exp, innerWidth, p), innerWidth) + bSt.Render("│")
 		lines = append(lines, divider, content)
 
-		// Commit input line (HEAD only, shown after selecting [Commit]).
-		// While visible, suppresses the blocked-reason line.
-		if exp.commitInput && b.IsHead {
+		// Inline prompts: delete confirmation, commit input, or blocked reason.
+		if exp.deleteConfirm {
+			confirmLine := bSt.Render("│") + padContent(buildDeleteConfirmLine(exp.deleteConfirmYes, innerWidth, p), innerWidth) + bSt.Render("│")
+			lines = append(lines, confirmLine)
+		} else if exp.commitInput && b.IsHead {
 			inputLine := bSt.Render("│") + padContent(buildCommitInputLine(exp, innerWidth, p), innerWidth) + bSt.Render("│")
 			lines = append(lines, inputLine)
 		} else if reason := exp.actionBlockedReason(b.IsHead); reason != "" {
@@ -332,17 +344,14 @@ func buildExpContentLine(b BranchNode, exp *branchExpansion, width int, p theme.
 
 // renderActionBadge renders a single [Label] badge with appropriate styling.
 // accent is the semantic color for the action (e.g. Success for Switch, Error
-// for Delete). Four visual states:
-//   - enabled + selected:  accent foreground, bold
-//   - enabled + unselected: muted text
-//   - disabled + selected:  muted text with selection background
-//   - disabled + unselected: muted text
+// for Delete). Disabled+selected shows muted with selection background so the
+// user can see the cursor position.
 func renderActionBadge(label string, accent lipgloss.Color, enabled, selected bool, p theme.Palette) string {
 	st := lipgloss.NewStyle().Foreground(p.Muted)
 	switch {
 	case enabled && selected:
 		st = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	case selected:
+	case !enabled && selected:
 		st = lipgloss.NewStyle().Foreground(p.Muted).Background(p.Selection)
 	}
 	return st.Render("[" + label + "]")
@@ -354,6 +363,31 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // buildCommitInputLine renders the inline commit input row. The content
 // depends on the commit phase:
 //
+// buildDeleteConfirmLine renders the inline delete confirmation prompt with
+// toggleable (y)es / (n)o options. The selected option is highlighted with
+// its semantic color (green for yes, red for no); the unselected option is muted.
+//
+//	" Delete this branch?  (y)es  (n)o"
+func buildDeleteConfirmLine(yesSelected bool, width int, p theme.Palette) string {
+	promptSt := lipgloss.NewStyle().Foreground(p.Muted)
+
+	yesMuted := lipgloss.NewStyle().Foreground(p.Muted)
+	yesAccent := lipgloss.NewStyle().Foreground(p.Success).Bold(true)
+	noMuted := lipgloss.NewStyle().Foreground(p.Muted)
+	noAccent := lipgloss.NewStyle().Foreground(p.Error).Bold(true)
+
+	var yes, no string
+	if yesSelected {
+		yes = yesAccent.Render("(y)") + yesAccent.Render("es")
+		no = noMuted.Render("(n)") + noMuted.Render("o")
+	} else {
+		yes = yesMuted.Render("(y)") + yesMuted.Render("es")
+		no = noAccent.Render("(n)") + noAccent.Render("o")
+	}
+
+	return " " + promptSt.Render("Delete this branch?") + "  " + yes + "  " + no
+}
+
 //	idle:        " Message: ▏some commit text"
 //	in-progress: " ⠹ Committing..."
 //	succeeded:   " ✓ Committed"
@@ -421,21 +455,18 @@ func buildCommitIdleLine(exp *branchExpansion, width int, p theme.Palette) strin
 	return content
 }
 
-// renderOffshootRow renders a row of 1–2 offshoot branch cards side by side.
-// selectedCol is the selected card index within this row (-1 if none).
-// expandedCol is the expanded card index within this row (-1 if none).
-func renderOffshootRow(row []BranchNode, selectedCol, expandedCol int, exp *branchExpansion, cardWidth, width int, th *theme.Theme, hasTrunkAbove bool, wt workingTreeState) []string {
+// composeOffshootRow composites pre-rendered card line slices into a row
+// with trunk connectors and merge lines. cardSlices contains one entry per
+// card in the row, already rendered by buildBranchCard (possibly cached).
+func composeOffshootRow(cardSlices [][]string, cardWidth, width int, th *theme.Theme, hasTrunkAbove bool) []string {
 	p := th.Palette
-	cols := len(row)
+	cols := len(cardSlices)
 	trunkPos := width / 2
 	trunkSt := lipgloss.NewStyle().Foreground(p.Border)
 
 	// Compute card positions (centered group).
 	totalContent := cols*cardWidth + max(cols-1, 0)*branchCardGap
 	leftMargin := max((width-totalContent)/2, 0)
-
-	const borderCols = 2
-	innerWidth := max(cardWidth-borderCols, 0)
 
 	cardLefts := make([]int, cols)
 	cardCenters := make([]int, cols)
@@ -444,37 +475,30 @@ func renderOffshootRow(row []BranchNode, selectedCol, expandedCol int, exp *bran
 		cardCenters[i] = cardLefts[i] + cardWidth/2
 	}
 
-	// Build each card's lines (variable height).
-	cardSlices := make([][]string, cols)
-	maxCardHeight := 0
-	for i, b := range row {
-		selected := i == selectedCol
-		isExpanded := i == expandedCol
-		hasTrunkBot := cols == 1
-		trunkInner := trunkPos - cardLefts[i] - 1
-		cardSlices[i] = buildBranchCard(b, selected, innerWidth, p,
-			trunkInner, hasTrunkAbove && cols == 1, hasTrunkBot,
-			isExpanded, exp, wt)
-		maxCardHeight = max(maxCardHeight, len(cardSlices[i]))
-	}
-
 	// Merge card lines horizontally with trunk in gap.
 	// When one card is shorter (not expanded) and a sibling is expanded,
 	// draw a vertical connector from the shorter card's center down to
 	// the merge line so the tree graphic stays connected.
+	maxCardHeight := 0
+	for _, cs := range cardSlices {
+		maxCardHeight = max(maxCardHeight, len(cs))
+	}
+
 	lines := make([]string, 0, maxCardHeight+2)
 	for lineIdx := range maxCardHeight {
 		var buf strings.Builder
+		// Track visual column position directly — card lines are always
+		// exactly cardWidth columns, so we avoid lipgloss.Width entirely.
+		col := 0
 		for i := range cols {
 			target := cardLefts[i]
-			current := lipgloss.Width(buf.String())
-			for current < target {
-				if hasTrunkAbove && cols > 1 && current == trunkPos {
+			for col < target {
+				if hasTrunkAbove && cols > 1 && col == trunkPos {
 					buf.WriteString(trunkSt.Render("│"))
 				} else {
 					buf.WriteByte(' ')
 				}
-				current++
+				col++
 			}
 			if lineIdx < len(cardSlices[i]) {
 				buf.WriteString(cardSlices[i][lineIdx])
@@ -485,44 +509,40 @@ func renderOffshootRow(row []BranchNode, selectedCol, expandedCol int, exp *bran
 				buf.WriteString(trunkSt.Render("│"))
 				buf.WriteString(strings.Repeat(" ", max(cardWidth-centerOff-1, 0)))
 			}
+			col += cardWidth
 		}
-		lines = append(lines, padLine(buf.String(), width))
+		lines = append(lines, padRight(buf.String(), col, width))
 	}
 
 	// Merge line (or trunk for single card).
+	trunkVis := trunkPos + 1
 	if cols == 1 {
 		trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
-		lines = append(lines, padLine(trunk, width))
+		lines = append(lines, padRight(trunk, trunkVis, width))
 	} else {
 		lines = append(lines, renderMergeLine(cardCenters, trunkPos, width, th))
 	}
 
 	// Trunk line.
 	trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
-	lines = append(lines, padLine(trunk, width))
+	lines = append(lines, padRight(trunk, trunkVis, width))
 
 	return lines
 }
 
-// renderPrimaryRow renders the primary branch card centered.
-func renderPrimaryRow(b BranchNode, selected, expanded bool, exp *branchExpansion, width int, th *theme.Theme, hasOffshoots bool, wt workingTreeState) []string {
-	p := th.Palette
+// composePrimaryRow composes a pre-rendered primary branch card into a row
+// with centering and padding. cardLines are already rendered by buildBranchCard
+// (possibly cached).
+func composePrimaryRow(cardLines []string, width int) []string {
 	cardWidth := primaryCardWidth(width)
-	const borderCols = 2
-	innerWidth := max(cardWidth-borderCols, 0)
 	leftPad := max((width-cardWidth)/2, 0)
-	trunkInner := width/2 - leftPad - 1
-
-	cardLines := buildBranchCard(b, selected, innerWidth, p,
-		trunkInner, hasOffshoots, false,
-		expanded, exp, wt)
-
-	pad := strings.Repeat(" ", leftPad)
 	blank := strings.Repeat(" ", max(width, 0))
 
+	vis := leftPad + cardWidth
+	pad := strings.Repeat(" ", leftPad)
 	lines := make([]string, 0, len(cardLines)+2)
 	for _, cl := range cardLines {
-		lines = append(lines, padLine(pad+cl, width))
+		lines = append(lines, padRight(pad+cl, vis, width))
 	}
 	// Pad to at least branchRowHeight.
 	for len(lines) < branchRowHeight {
@@ -554,7 +574,8 @@ func renderMergeLine(centers []int, trunkPos, width int, th *theme.Theme) string
 	}
 
 	leftPad := strings.Repeat(" ", leftC)
-	return padLine(leftPad+st.Render(raw.String()), width)
+	vis := rightC + 1
+	return padRight(leftPad+st.Render(raw.String()), vis, width)
 }
 
 // buildCardBorder constructs a horizontal border with an optional trunk connector.
@@ -739,9 +760,9 @@ func truncateSubject(subject string, maxWidth int) string {
 	return string(runes[:maxWidth-ellipsisLen]) + ellipsis
 }
 
-// padLine pads or truncates a single styled line to exactly width visible columns.
-func padLine(line string, width int) string {
-	vis := lipgloss.Width(line)
+// padRight pads or truncates a styled line to exactly width visible columns.
+// vis is the caller-computed visible column count, avoiding lipgloss.Width.
+func padRight(line string, vis, width int) string {
 	switch {
 	case vis < width:
 		return line + strings.Repeat(" ", width-vis)
@@ -750,6 +771,11 @@ func padLine(line string, width int) string {
 	default:
 		return line
 	}
+}
+
+// padLine pads or truncates a single styled line to exactly width visible columns.
+func padLine(line string, width int) string {
+	return padRight(line, lipgloss.Width(line), width)
 }
 
 // truncateStyled truncates a styled string to maxWidth visible columns.

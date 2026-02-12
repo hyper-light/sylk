@@ -1,6 +1,7 @@
 package gitpanel
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,58 +14,38 @@ import (
 // branchEntry represents a single branch in the branches list.
 type branchEntry struct {
 	name         string
+	hash         string // full commit hash for stat lookups
 	shortHash    string
 	subject      string
 	time         time.Time
 	isHead       bool
 	uncommitted  bool // working tree has uncommitted changes (HEAD only)
 	hasConflicts bool // working tree has merge conflicts (HEAD only)
+
+	additions, deletions                   int
+	filesAdded, filesModified, filesDeleted int
+	hasFileStats bool // true when file-level stats are populated
+	hasLineStats bool // true when line-level stats are populated
 }
 
 func (e branchEntry) FilterText() string  { return e.name + " " + e.subject }
 func (e branchEntry) SortKey() string     { return e.name }
 func (e branchEntry) SortTime() time.Time { return e.time }
 
-// branchColWidths holds pre-computed max column widths for aligned rendering.
-type branchColWidths struct {
-	prefix int // max badge+space width
-	name   int // max branch name character width
-}
-
 // branchesTab holds the list state for the Branches tab.
 type branchesTab struct {
 	listState
-	colWidths branchColWidths
-}
-
-// computeColWidths scans all entries and records the widest prefix and name
-// columns so every row can be padded to the same alignment.
-func (bt *branchesTab) computeColWidths() {
-	var maxPrefix, maxName int
-	for _, e := range bt.entries {
-		be, ok := e.(branchEntry)
-		if !ok {
-			continue
-		}
-		pw := 1 // leading space for clean / non-HEAD
-		if be.hasConflicts {
-			pw = len("[conflicts]") + 1
-		} else if be.uncommitted {
-			pw = len("[dirty]") + 1
-		}
-		if pw > maxPrefix {
-			maxPrefix = pw
-		}
-		if nw := len(be.name); nw > maxName {
-			maxName = nw
-		}
-	}
-	bt.colWidths = branchColWidths{prefix: maxPrefix, name: maxName}
+	allEntries   []branchEntry     // full cached set from initial LoadData
+	dirtyTree    bool              // cached: HEAD has uncommitted or conflicts
+	statsLoading bool              // true while async stat load is in flight
+	statsEpoch   time.Time         // animation epoch for stat spinners
+	statsLevel   git.DiffStatLevel // highest level loaded into entries
 }
 
 // loadBranches fetches branches from the git client and converts them to
 // branchEntry values. The HEAD branch is annotated with working tree state.
-func loadBranches(gc *git.GitClient) []branchEntry {
+// statLevel controls whether diff stats are computed inline.
+func loadBranches(gc *git.GitClient, statLevel git.DiffStatLevel) []branchEntry {
 	infos, err := gc.ListBranches()
 	if err != nil {
 		return nil
@@ -72,7 +53,7 @@ func loadBranches(gc *git.GitClient) []branchEntry {
 
 	// Check working tree status to annotate the HEAD branch.
 	var dirty, conflicts bool
-	statuses, sErr := gc.UncommittedFileStatuses()
+	statuses, _, sErr := gc.UncommittedFileStatuses()
 	if sErr == nil {
 		dirty = len(statuses) > 0
 		for _, s := range statuses {
@@ -83,10 +64,26 @@ func loadBranches(gc *git.GitClient) []branchEntry {
 		}
 	}
 
+	hashes := make([]string, len(infos))
+	for i, bi := range infos {
+		hashes[i] = bi.Hash
+	}
+
+	// Fetch stats only at the requested level.
+	var lineSummaries map[string]git.DiffSummary
+	var fileSummaries map[string]git.FileSummary
+	switch statLevel {
+	case git.DiffStatLines:
+		lineSummaries = gc.GetCommitDiffSummaries(hashes)
+	case git.DiffStatFiles:
+		fileSummaries = gc.GetCommitFileSummaries(hashes)
+	}
+
 	entries := make([]branchEntry, 0, len(infos))
 	for _, bi := range infos {
 		e := branchEntry{
 			name:      bi.Name,
+			hash:      bi.Hash,
 			shortHash: bi.ShortHash,
 			subject:   bi.Subject,
 			time:      bi.AuthorTime,
@@ -96,109 +93,166 @@ func loadBranches(gc *git.GitClient) []branchEntry {
 			e.uncommitted = dirty
 			e.hasConflicts = conflicts
 		}
+		if ds, ok := lineSummaries[bi.Hash]; ok {
+			e.additions = ds.Additions
+			e.deletions = ds.Deletions
+			e.filesAdded = ds.FilesAdded
+			e.filesModified = ds.FilesModified
+			e.filesDeleted = ds.FilesDeleted
+			e.hasFileStats = true
+			e.hasLineStats = true
+		} else if fs, ok := fileSummaries[bi.Hash]; ok {
+			e.filesAdded = fs.FilesAdded
+			e.filesModified = fs.FilesModified
+			e.filesDeleted = fs.FilesDeleted
+			e.hasFileStats = true
+		}
 		entries = append(entries, e)
 	}
 
 	return entries
 }
 
-// renderBranchEntry renders a single branch row with per-segment background
-// highlighting when selected.
-//
-// Layout: [badge] name  shortHash  subject  relativeTime
-//
-// Status badge on the left (HEAD only):
-//   - [dirty]     in Warning — uncommitted changes
-//   - [conflicts] in Error   — merge conflicts
-//   - (space)                — clean or non-HEAD
-//
-// The HEAD branch name is rendered in Primary color.
-func renderBranchEntry(e branchEntry, selected bool, width int, th *theme.Theme, cols branchColWidths, dirtyTree bool) string {
+// renderBranchCell renders a single column cell for a branch entry.
+func renderBranchCell(e branchEntry, colID ColumnID, width int, selected bool, th *theme.Theme, dirtyTree bool) string {
 	p := th.Palette
+	padStyle := cellPadStyle(selected, p)
+	greyOut := dirtyTree && !e.isHead
 
-	nameStyle := lipgloss.NewStyle().Foreground(p.Foreground).Bold(true)
-	if e.isHead {
-		nameStyle = nameStyle.Foreground(p.Primary)
+	switch colID {
+	case "status":
+		return renderBranchBadge(e, width, selected, p)
+
+	case "name":
+		style := lipgloss.NewStyle().Foreground(p.Foreground).Bold(true)
+		if e.isHead {
+			style = style.Foreground(p.Primary)
+		}
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(" "+e.name, width, style)
+
+	case "hash":
+		style := lipgloss.NewStyle().Foreground(p.Primary)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(e.shortHash, width, style)
+
+	case "subject":
+		style := lipgloss.NewStyle().Foreground(p.Subtext)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(e.subject, width, style)
+
+	case "time":
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(relativeTime(e.time), width, style)
+
+	case "changed":
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.additions+e.deletions), width, style)
+
+	case "added":
+		style := lipgloss.NewStyle().Foreground(p.Success)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.additions), width, style)
+
+	case "removed":
+		style := lipgloss.NewStyle().Foreground(p.Error)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.deletions), width, style)
+
+	case "files":
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesAdded+e.filesModified+e.filesDeleted), width, style)
+
+	case "files_added":
+		style := lipgloss.NewStyle().Foreground(p.Success)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesAdded), width, style)
+
+	case "files_modified":
+		style := lipgloss.NewStyle().Foreground(p.Warning)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesModified), width, style)
+
+	case "files_deleted":
+		style := lipgloss.NewStyle().Foreground(p.Error)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(strconv.Itoa(e.filesDeleted), width, style)
+
+	default:
+		return padStyle.Render(strings.Repeat(" ", width))
 	}
+}
 
-	hashStyle := lipgloss.NewStyle().Foreground(p.Primary)
-	subjectStyle := lipgloss.NewStyle().Foreground(p.Subtext)
-	timeStyle := lipgloss.NewStyle().Foreground(p.Muted)
-	padStyle := lipgloss.NewStyle()
+// renderBranchBadge renders the status badge cell for a branch entry.
+func renderBranchBadge(e branchEntry, width int, selected bool, p theme.Palette) string {
+	padStyle := cellPadStyle(selected, p)
 
-	if selected {
-		bg := p.Selection
-		nameStyle = nameStyle.Background(bg)
-		hashStyle = hashStyle.Background(bg)
-		subjectStyle = subjectStyle.Background(bg)
-		timeStyle = timeStyle.Background(bg)
-		padStyle = padStyle.Background(bg)
-	}
-
-	// Grey out non-HEAD branches when checkout is blocked.
-	if dirtyTree && !e.isHead {
-		nameStyle = nameStyle.Foreground(p.Muted)
-		hashStyle = hashStyle.Foreground(p.Muted)
-		subjectStyle = subjectStyle.Foreground(p.Muted)
-		timeStyle = timeStyle.Foreground(p.Muted)
-	}
-
-	// Status badge on the left, padded to fixed column width.
-	var prefix string
-	var actualPrefixW int
 	if e.hasConflicts {
-		bSt := lipgloss.NewStyle().Foreground(p.Error)
+		style := lipgloss.NewStyle().Foreground(p.Error)
 		if selected {
-			bSt = bSt.Background(p.Selection)
+			style = style.Background(p.Selection)
 		}
-		prefix = bSt.Render("[conflicts]") + padStyle.Render(" ")
-		actualPrefixW = len("[conflicts]") + 1
-	} else if e.uncommitted {
-		bSt := lipgloss.NewStyle().Foreground(p.Warning)
+		return fitCell("[conflicts]", width, style)
+	}
+	if e.uncommitted {
+		style := lipgloss.NewStyle().Foreground(p.Warning)
 		if selected {
-			bSt = bSt.Background(p.Selection)
+			style = style.Background(p.Selection)
 		}
-		prefix = bSt.Render("[dirty]") + padStyle.Render(" ")
-		actualPrefixW = len("[dirty]") + 1
-	} else {
-		prefix = padStyle.Render(" ")
-		actualPrefixW = 1
-	}
-	if pad := cols.prefix - actualPrefixW; pad > 0 {
-		prefix += padStyle.Render(strings.Repeat(" ", pad))
+		return fitCell("[dirty]", width, style)
 	}
 
-	// Name padded to fixed column width.
-	name := nameStyle.Render(e.name)
-	if pad := cols.name - len(e.name); pad > 0 {
-		name += padStyle.Render(strings.Repeat(" ", pad))
-	}
-
-	hash := hashStyle.Render(e.shortHash)
-	relTime := timeStyle.Render(relativeTime(e.time))
-
-	// Subject fills remaining space after fixed-width columns.
-	hashWidth := len(e.shortHash)
-	timeWidth := lipgloss.Width(relTime)
-	separators := 6 // two-space gaps between columns
-	fixedWidth := cols.prefix + cols.name + hashWidth + timeWidth + separators
-	subjectWidth := width - fixedWidth
-
-	subject := e.subject
-	if subjectWidth > 0 {
-		subject = truncateString(subject, subjectWidth)
-	} else {
-		subject = ""
-	}
-
-	sep := padStyle.Render("  ")
-	content := prefix + name + sep + hash + sep + subjectStyle.Render(subject) + sep + relTime
-
-	lineWidth := lipgloss.Width(content)
-	padCount := max(width-lineWidth, 0)
-	if padCount > 0 {
-		content += padStyle.Render(strings.Repeat(" ", padCount))
-	}
-
-	return content
+	return padStyle.Render(strings.Repeat(" ", width))
 }

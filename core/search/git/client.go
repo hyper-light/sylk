@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/dgraph-io/ristretto"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 )
@@ -40,10 +41,11 @@ var (
 // GitClient provides operations on a git repository.
 // It wraps go-git/v5 for repository operations and provides thread-safe access.
 type GitClient struct {
-	repoPath string
-	repo     *gogit.Repository
-	mu       sync.RWMutex
-	isRepo   bool
+	repoPath  string
+	repo      *gogit.Repository
+	mu        sync.RWMutex
+	isRepo    bool
+	diffCache *ristretto.Cache
 }
 
 // NewGitClient creates a new GitClient for the given repository path.
@@ -59,9 +61,16 @@ func NewGitClient(repoPath string) (*GitClient, error) {
 		return nil, fmt.Errorf("failed to resolve path: %w", err)
 	}
 
+	cache, _ := ristretto.NewCache(&ristretto.Config{
+		NumCounters: 20000, // ~10x expected max entries
+		MaxCost:     2048,  // max 2048 cached summaries
+		BufferItems: 64,
+	})
+
 	client := &GitClient{
-		repoPath: absPath,
-		isRepo:   false,
+		repoPath:  absPath,
+		isRepo:    false,
+		diffCache: cache,
 	}
 
 	client.initRepository(absPath)
@@ -114,6 +123,11 @@ func (c *GitClient) Repository() *gogit.Repository {
 func (c *GitClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.diffCache != nil {
+		c.diffCache.Close()
+		c.diffCache = nil
+	}
 
 	c.repo = nil
 	c.isRepo = false

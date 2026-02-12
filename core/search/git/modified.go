@@ -283,6 +283,49 @@ func (c *GitClient) GetAllCommits(limit int) ([]*CommitInfo, error) {
 	return c.getAllCommitsInternal(limit)
 }
 
+// GetAllCommitsPage returns a page of commits starting at skip.
+// Returns (commits, hasMore, error). hasMore is true when additional pages
+// exist beyond this one. Results are ordered from newest to oldest.
+func (c *GitClient) GetAllCommitsPage(skip, limit int) ([]*CommitInfo, bool, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return nil, false, ErrNotGitRepo
+	}
+
+	if !c.hasHead() {
+		return []*CommitInfo{}, false, nil
+	}
+
+	// Fetch one extra to detect whether more pages exist.
+	fetchLimit := limit + 1
+	args := []string{
+		"log",
+		"--format=%H|%h|%an|%ae|%ai|%cn|%ce|%ci|%s|%P",
+		"-n", formatInt(fetchLimit),
+	}
+	if skip > 0 {
+		args = append(args, "--skip", formatInt(skip))
+	}
+
+	output, err := c.runGitCommand(args...)
+	if err != nil {
+		return nil, false, err
+	}
+
+	commits, err := c.parseCommitLogNoFiles(output)
+	if err != nil {
+		return nil, false, err
+	}
+
+	hasMore := len(commits) > limit
+	if hasMore {
+		commits = commits[:limit]
+	}
+	return commits, hasMore, nil
+}
+
 // getAllCommitsInternal retrieves all commits without locking.
 func (c *GitClient) getAllCommitsInternal(limit int) ([]*CommitInfo, error) {
 	// Check if HEAD exists (repo has commits)
