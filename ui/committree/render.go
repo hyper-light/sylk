@@ -1030,18 +1030,32 @@ var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarDiff:   {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
 }
 
+// toolbarCellWidths returns the visual width of each button cell.
+// Used by both the renderer and hit-tester for consistent layout.
+func toolbarCellWidths(buttons []int) []int {
+	widths := make([]int, len(buttons))
+	for i, id := range buttons {
+		def := toolbarDefs[id]
+		widths[i] = lipgloss.Width(" " + def.icon + " " + def.label + " ")
+	}
+	return widths
+}
+
 // renderToolbarButtons renders a right-aligned toolbar as two rows:
 // a horizontal divider with ┬ separators, and a content row with │
 // separators. The panel border provides the right and bottom edges.
-func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, width int, p theme.Palette) string {
+// hoverIdx highlights a button on mouse hover (-1 = no hover).
+func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx int, modeLabel string, width int, p theme.Palette) string {
 	if len(buttons) == 0 {
 		empty := strings.Repeat(" ", max(width, 0))
 		return empty + "\n" + empty
 	}
 
 	bSt := lipgloss.NewStyle().Foreground(p.Border)
+	labelSt := lipgloss.NewStyle().Foreground(p.Muted)
+	widths := toolbarCellWidths(buttons)
 
-	// Measure each button's inner content width (pad + icon + space + label + pad).
+	// Measure each button's inner content with styling.
 	type btnMeasure struct {
 		inner string // styled content (no separators)
 		width int    // visible column width including padding
@@ -1051,45 +1065,134 @@ func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, width in
 	for i, id := range buttons {
 		def := toolbarDefs[id]
 		selected := focused && i == selectedIdx
+		hovered := i == hoverIdx && !selected
 		fg := p.Muted
-		if selected {
+		if selected || hovered {
 			fg = def.accent(p)
 		}
 		text := lipgloss.NewStyle().Foreground(fg).Bold(selected).Render(def.icon + " " + def.label)
 		padded := " " + text + " "
-		cells[i] = btnMeasure{inner: padded, width: lipgloss.Width(padded)}
-		totalInner += cells[i].width
+		cells[i] = btnMeasure{inner: padded, width: widths[i]}
+		totalInner += widths[i]
 	}
 
 	// Total button group width: separators + cell widths.
 	// Left separator │ before first button, │ between buttons; right edge = panel border.
-	groupWidth := len(buttons) + totalInner // len(buttons) │ chars + cell widths
+	groupWidth := len(buttons) + totalInner
 	leftPad := max(width-groupWidth, 0)
 
 	// Row 1: top border spanning only the button group width.
 	var div strings.Builder
-	for i, c := range cells {
+	for i := range cells {
 		if i == 0 {
 			div.WriteString("╭")
 		} else {
 			div.WriteString("┬")
 		}
-		div.WriteString(strings.Repeat("─", c.width))
+		div.WriteString(strings.Repeat("─", widths[i]))
 	}
 	row1 := strings.Repeat(" ", leftPad) + bSt.Render(div.String())
-	row1Vis := lipgloss.Width(row1)
-	if row1Vis < width {
+	if row1Vis := lipgloss.Width(row1); row1Vis < width {
 		row1 += strings.Repeat(" ", width-row1Vis)
 	}
 
-	// Row 2: button content with │ separators.
+	// Row 2: mode label on the left, button content with │ separators on the right.
 	var content strings.Builder
-	content.WriteString(strings.Repeat(" ", leftPad))
+	styledLabel := labelSt.Render(" " + modeLabel)
+	labelWidth := lipgloss.Width(styledLabel)
+	content.WriteString(styledLabel)
+	content.WriteString(strings.Repeat(" ", max(leftPad-labelWidth, 0)))
 	for _, c := range cells {
 		content.WriteString(bSt.Render("│"))
 		content.WriteString(c.inner)
 	}
 	row2 := content.String()
+	if vis := lipgloss.Width(row2); vis < width {
+		row2 += strings.Repeat(" ", width-vis)
+	}
+
+	return row1 + "\n" + row2
+}
+
+// renderCreateInputToolbar renders the toolbar with a branch name input on
+// the left and buttons on the right. The Create button is highlighted to
+// show it triggered the input. No separate top divider for the input area.
+func renderCreateInputToolbar(buttons []int, name string, cursor int, cursorVisible bool, width int, p theme.Palette) string {
+	bSt := lipgloss.NewStyle().Foreground(p.Border)
+	widths := toolbarCellWidths(buttons)
+
+	// Measure button group (same as renderToolbarButtons).
+	type btnMeasure struct {
+		inner string
+		width int
+	}
+	cells := make([]btnMeasure, len(buttons))
+	totalInner := 0
+	for i, id := range buttons {
+		def := toolbarDefs[id]
+		// Highlight the Create button to show it's the active action.
+		active := id == toolbarCreate
+		fg := p.Muted
+		if active {
+			fg = def.accent(p)
+		}
+		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
+		padded := " " + text + " "
+		cells[i] = btnMeasure{inner: padded, width: widths[i]}
+		totalInner += widths[i]
+	}
+	groupWidth := len(buttons) + totalInner
+	leftPad := max(width-groupWidth, 0)
+
+	// Row 1: top border spans only the button group (same as normal toolbar).
+	var div strings.Builder
+	for i := range cells {
+		if i == 0 {
+			div.WriteString("╭")
+		} else {
+			div.WriteString("┬")
+		}
+		div.WriteString(strings.Repeat("─", widths[i]))
+	}
+	row1 := strings.Repeat(" ", leftPad) + bSt.Render(div.String())
+	if row1Vis := lipgloss.Width(row1); row1Vis < width {
+		row1 += strings.Repeat(" ", width-row1Vis)
+	}
+
+	// Row 2: input field on the left, buttons on the right.
+	labelSt := lipgloss.NewStyle().Foreground(p.Foreground)
+	textSt := lipgloss.NewStyle().Foreground(p.Foreground)
+	cursorSt := lipgloss.NewStyle().Foreground(p.Primary)
+
+	label := labelSt.Render(" Name: ")
+
+	runes := []rune(name)
+	cur := min(max(cursor, 0), len(runes))
+	before := textSt.Render(string(runes[:cur]))
+	after := textSt.Render(string(runes[cur:]))
+
+	curGlyph := ""
+	if cursorVisible {
+		curGlyph = cursorSt.Render("▏")
+	}
+
+	inputContent := label + before + curGlyph + after
+	inputVis := lipgloss.Width(inputContent)
+
+	// Build button group for row 2.
+	var btnContent strings.Builder
+	for _, c := range cells {
+		btnContent.WriteString(bSt.Render("│"))
+		btnContent.WriteString(c.inner)
+	}
+	btnStr := btnContent.String()
+
+	// Pad input to fill the space left of the buttons.
+	if inputVis < leftPad {
+		inputContent += strings.Repeat(" ", leftPad-inputVis)
+	}
+
+	row2 := inputContent + btnStr
 	if vis := lipgloss.Width(row2); vis < width {
 		row2 += strings.Repeat(" ", width-vis)
 	}

@@ -118,8 +118,13 @@ const (
 	toolbarDiff          // Commit view: show diff for selected commit.
 )
 
-// CreateBranchMsg is emitted when the user activates the Create toolbar button.
-type CreateBranchMsg struct{}
+// CreateBranchRequestMsg is emitted when the user confirms a branch name
+// in the create input. ParentBranch is the currently selected branch whose
+// tip commit the new branch points at.
+type CreateBranchRequestMsg struct {
+	Name         string
+	ParentBranch string
+}
 
 // MergeBranchMsg is emitted when the user activates the Merge toolbar button.
 type MergeBranchMsg struct {
@@ -201,14 +206,21 @@ type Model struct {
 	// Toolbar state.
 	toolbarFocused bool // True when tab-focus is on the toolbar, not card actions.
 	toolbarAction  int  // Selected toolbar button index.
+	hoverButtonIdx int  // Toolbar button under mouse, -1 = none.
+
+	// Create branch input state (toolbar Create action).
+	createInputActive bool
+	createBranchName  string
+	createCursor      int
 }
 
 // New creates a Model with the given theme.
 func New(th *theme.Theme) *Model {
 	return &Model{
-		theme:       th,
-		viewDirty:   true,
-		expandedIdx: -1,
+		theme:          th,
+		viewDirty:      true,
+		expandedIdx:    -1,
+		hoverButtonIdx: -1,
 	}
 }
 
@@ -476,6 +488,11 @@ func (m *Model) InCommitView() bool {
 	return m.mode == viewCommits
 }
 
+// InCreateInput reports whether the create branch input is active.
+func (m *Model) InCreateInput() bool {
+	return m.createInputActive
+}
+
 // ScrollUp scrolls the active view up by one node.
 func (m *Model) ScrollUp() bool {
 	off := m.activeScrollOff()
@@ -538,7 +555,7 @@ func (m *Model) SetHasIndexStaged(staged bool) {
 // NeedsBlink reports whether the commit input cursor or commit progress
 // spinner needs blink-rate ticking.
 func (m *Model) NeedsBlink() bool {
-	return m.focused && (m.commitInputActive || m.commitPhase == commitInProgress)
+	return m.focused && (m.commitInputActive || m.commitPhase == commitInProgress || m.createInputActive)
 }
 
 // NeedsDecorTick reports whether the loading spinner or loading bar needs
@@ -582,6 +599,11 @@ func (m *Model) ViewDirty() bool {
 // viewX is the column offset within the panel content area; viewY is the
 // row offset (0 = first line inside the panel border).
 func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
+	// Toolbar region: last toolbarHeight rows of the panel.
+	ch := m.contentHeight()
+	if viewY >= ch && viewY < ch+toolbarHeight {
+		return m.clickToolbar(viewX, viewY-ch)
+	}
 	switch m.mode {
 	case viewLoading:
 		return nil // absorb clicks during loading
@@ -843,6 +865,79 @@ func (m *Model) clickActionBadge(screenX, cardLeft, cardWidth int) tea.Cmd {
 }
 
 // ---------------------------------------------------------------------------
+// Toolbar hover and click
+// ---------------------------------------------------------------------------
+
+// HandleToolbarHover updates the hovered toolbar button from mouse position.
+// viewX, viewY are content-relative coordinates within the full panel.
+func (m *Model) HandleToolbarHover(viewX, viewY int) {
+	ch := m.contentHeight()
+	// Only the button content row (second toolbar row) is interactive.
+	if viewY != ch+1 || m.createInputActive {
+		m.setHoverButton(-1)
+		return
+	}
+	m.setHoverButton(m.toolbarButtonAtX(viewX))
+}
+
+// ClearHover resets hover state when the mouse leaves the panel.
+func (m *Model) ClearHover() {
+	m.setHoverButton(-1)
+}
+
+// setHoverButton updates hoverButtonIdx, marking dirty only on change.
+func (m *Model) setHoverButton(idx int) {
+	if m.hoverButtonIdx == idx {
+		return
+	}
+	m.hoverButtonIdx = idx
+	m.viewDirty = true
+}
+
+// toolbarButtonAtX returns the toolbar button index at the given X coordinate,
+// or -1 if no button is hit. Uses the same layout math as renderToolbarButtons.
+func (m *Model) toolbarButtonAtX(viewX int) int {
+	buttons := m.toolbarButtons()
+	if len(buttons) == 0 {
+		return -1
+	}
+
+	widths := toolbarCellWidths(buttons)
+	totalInner := 0
+	for _, w := range widths {
+		totalInner += w
+	}
+	groupWidth := len(buttons) + totalInner
+	leftPad := max(m.width-groupWidth, 0)
+
+	x := leftPad
+	for i, w := range widths {
+		x++ // │ separator
+		if viewX >= x && viewX < x+w {
+			return i
+		}
+		x += w
+	}
+	return -1
+}
+
+// clickToolbar handles a click within the toolbar area.
+// localY is relative to the toolbar top (0 = border row, 1 = content row).
+func (m *Model) clickToolbar(viewX, localY int) tea.Cmd {
+	if localY != 1 || m.createInputActive {
+		return nil
+	}
+	idx := m.toolbarButtonAtX(viewX)
+	if idx < 0 {
+		return nil
+	}
+	m.toolbarFocused = true
+	m.toolbarAction = idx
+	m.viewDirty = true
+	return m.executeToolbarAction()
+}
+
+// ---------------------------------------------------------------------------
 // View
 // ---------------------------------------------------------------------------
 
@@ -856,12 +951,19 @@ func (m *Model) View(cursorVisible bool) string {
 	default:
 		content = m.viewBranchTree(cursorVisible)
 	}
-	return content + "\n" + m.toolbarView()
+	return content + "\n" + m.toolbarView(cursorVisible)
 }
 
 // toolbarView renders the bottom toolbar bar with mode-aware buttons.
-func (m *Model) toolbarView() string {
-	return renderToolbarButtons(m.toolbarButtons(), m.toolbarAction, m.toolbarFocused, m.width, m.theme.Palette)
+func (m *Model) toolbarView(cursorVisible bool) string {
+	if m.createInputActive {
+		return renderCreateInputToolbar(m.toolbarButtons(), m.createBranchName, m.createCursor, cursorVisible, m.width, m.theme.Palette)
+	}
+	label := "Branches"
+	if m.mode == viewCommits {
+		label = "Commits"
+	}
+	return renderToolbarButtons(m.toolbarButtons(), m.toolbarAction, m.toolbarFocused, m.hoverButtonIdx, label, m.width, m.theme.Palette)
 }
 
 // viewBranchTree renders the branch tree view with side-by-side offshoot cards.
@@ -1009,7 +1111,7 @@ func (m *Model) viewLoadingSpinner() string {
 }
 
 // renderLoadingBar returns a single line with a centered animated spinner,
-// used as a bottom overlay during infinite scroll page loads. Time-based
+// used as a top overlay during infinite scroll page loads. Time-based
 // animation driven by the decor tick (100ms).
 func (m *Model) renderLoadingBar() string {
 	elapsed := time.Since(m.loadingEpoch)
@@ -1065,7 +1167,7 @@ func (m *Model) padViewport(lines []string) string {
 		lines = lines[:ch]
 	}
 	if m.showLoadingBar() && len(lines) > 0 {
-		lines[len(lines)-1] = m.renderLoadingBar()
+		lines[0] = m.renderLoadingBar()
 	}
 	lines = applyBounceShift(lines, m.bounceOffset, ch, emptyLine)
 	return strings.Join(lines, "\n")
@@ -1079,7 +1181,7 @@ func (m *Model) handleKey(km tea.KeyMsg) tea.Cmd {
 	switch m.mode {
 	case viewLoading:
 		if km.String() == "esc" {
-			m.exitToBranches()
+			m.ExitToBranches()
 		}
 		return nil
 	case viewCommits:
@@ -1094,6 +1196,9 @@ func (m *Model) handleKey(km tea.KeyMsg) tea.Cmd {
 // When a card is expanded, h/l move between actions, enter executes.
 // Tab cycles through toolbar buttons; enter executes when toolbar is focused.
 func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
+	if m.createInputActive {
+		return m.handleCreateInputKey(km)
+	}
 	if len(m.branches) == 0 {
 		return nil
 	}
@@ -1491,6 +1596,93 @@ func (m *Model) insertCommitRunes(inserted []rune) {
 	m.commitCursor += len(inserted)
 }
 
+// ---------------------------------------------------------------------------
+// Create branch input
+// ---------------------------------------------------------------------------
+
+// activateCreateInput opens the inline branch name input on the toolbar row.
+func (m *Model) activateCreateInput() {
+	m.createInputActive = true
+	m.createBranchName = ""
+	m.createCursor = 0
+	m.viewDirty = true
+}
+
+// clearCreateInput closes the create branch input and returns focus to toolbar.
+func (m *Model) clearCreateInput() {
+	m.createInputActive = false
+	m.createBranchName = ""
+	m.createCursor = 0
+	m.viewDirty = true
+}
+
+// insertCreateRunes inserts runes at the current cursor position in the
+// branch name input.
+func (m *Model) insertCreateRunes(inserted []rune) {
+	runes := []rune(m.createBranchName)
+	newRunes := make([]rune, 0, len(runes)+len(inserted))
+	newRunes = append(newRunes, runes[:m.createCursor]...)
+	newRunes = append(newRunes, inserted...)
+	newRunes = append(newRunes, runes[m.createCursor:]...)
+	m.createBranchName = string(newRunes)
+	m.createCursor += len(inserted)
+}
+
+// selectedBranchName returns the name of the currently selected branch.
+func (m *Model) selectedBranchName() string {
+	if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
+		return m.branches[m.branchIdx].Name
+	}
+	return ""
+}
+
+// handleCreateInputKey processes keys when the create branch input is active.
+func (m *Model) handleCreateInputKey(km tea.KeyMsg) tea.Cmd {
+	switch km.String() {
+	case "enter":
+		name := strings.TrimSpace(m.createBranchName)
+		if name == "" {
+			return nil
+		}
+		parent := m.selectedBranchName()
+		m.clearCreateInput()
+		return func() tea.Msg {
+			return CreateBranchRequestMsg{Name: name, ParentBranch: parent}
+		}
+	case "esc":
+		m.clearCreateInput()
+	case "backspace":
+		if m.createCursor > 0 {
+			runes := []rune(m.createBranchName)
+			runes = append(runes[:m.createCursor-1], runes[m.createCursor:]...)
+			m.createBranchName = string(runes)
+			m.createCursor--
+		}
+	case "delete":
+		runes := []rune(m.createBranchName)
+		if m.createCursor < len(runes) {
+			runes = append(runes[:m.createCursor], runes[m.createCursor+1:]...)
+			m.createBranchName = string(runes)
+		}
+	case "left":
+		m.createCursor = max(m.createCursor-1, 0)
+	case "right":
+		m.createCursor = min(m.createCursor+1, len([]rune(m.createBranchName)))
+	case "home", "ctrl+a":
+		m.createCursor = 0
+	case "end", "ctrl+e":
+		m.createCursor = len([]rune(m.createBranchName))
+	case " ":
+		m.insertCreateRunes([]rune{'-'})
+	default:
+		if km.Type == tea.KeyRunes {
+			m.insertCreateRunes(km.Runes)
+		}
+	}
+	m.viewDirty = true
+	return nil
+}
+
 // toggleExpandedSubview opens or closes the sub-view (confirmation prompt,
 // commit input) for the currently selected action badge. Actions without a
 // sub-view (Switch) are no-ops.
@@ -1607,14 +1799,15 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 	}
 	switch buttons[m.toolbarAction] {
 	case toolbarCreate:
-		return func() tea.Msg { return CreateBranchMsg{} }
+		m.activateCreateInput()
+		return nil
 	case toolbarMerge:
 		if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
 			name := m.branches[m.branchIdx].Name
 			return func() tea.Msg { return MergeBranchMsg{Name: name} }
 		}
 	case toolbarBack:
-		m.exitToBranches()
+		m.ExitToBranches()
 		return nil
 	case toolbarDiff:
 		if hash := m.SelectedHash(); hash != "" {
@@ -1688,7 +1881,7 @@ func (m *Model) moveBranchLeft() {
 // Tab/shift+tab cycle through toolbar buttons; enter executes when focused.
 func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 	if km.String() == "esc" {
-		m.exitToBranches()
+		m.ExitToBranches()
 		return nil
 	}
 
@@ -1794,8 +1987,8 @@ func (m *Model) enterBranch() tea.Cmd {
 	}
 }
 
-// exitToBranches transitions back to the branch tree view.
-func (m *Model) exitToBranches() {
+// ExitToBranches transitions back to the branch tree view.
+func (m *Model) ExitToBranches() {
 	m.mode = viewBranches
 	m.activeBranch = ""
 	m.nodes = nil

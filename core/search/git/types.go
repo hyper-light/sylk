@@ -45,6 +45,9 @@ var (
 
 	// ErrDeleteCheckedOut indicates an attempt to delete the checked-out branch.
 	ErrDeleteCheckedOut = errors.New("cannot delete the checked-out branch")
+
+	// ErrBranchExists indicates an attempt to create a branch that already exists.
+	ErrBranchExists = errors.New("branch already exists")
 )
 
 // =============================================================================

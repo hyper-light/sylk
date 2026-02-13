@@ -935,6 +935,38 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
+	case committree.CreateBranchRequestMsg:
+		if m.gitClient != nil {
+			gc := m.gitClient
+			name := typed.Name
+			parent := typed.ParentBranch
+			return m, func() tea.Msg {
+				tipHash, err := gc.BranchTipHash(parent)
+				if err != nil {
+					return branchCreateFailedMsg{reason: err.Error()}
+				}
+				if err := gc.CreateBranch(name, tipHash); err != nil {
+					return branchCreateFailedMsg{reason: err.Error()}
+				}
+				return branchCreatedMsg{name: name}
+			}
+		}
+		return m, nil
+
+	case branchCreatedMsg:
+		m.statusBar.SetFlash("Created branch " + typed.name)
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case branchCreateFailedMsg:
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
 	case committree.CommitRequestMsg:
 		if m.gitClient != nil && m.gitPanel != nil {
 			gc := m.gitClient
@@ -980,8 +1012,13 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case gitBranchFullyLoadedMsg:
-		if m.commitTree != nil {
-			m.commitTree.SetNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
+		if m.commitTree != nil && typed.branch == m.commitTree.ActiveBranch() {
+			if len(typed.nodes) == 0 {
+				m.commitTree.ExitToBranches()
+				m.statusBar.SetFlash("No commits found for " + typed.branch)
+			} else {
+				m.commitTree.SetNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
+			}
 		}
 		return m, nil
 	case committree.LoadMoreMsg:
@@ -1433,7 +1470,8 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.paneEditors[m.focusedPane].editor = comp.(*editor.Model)
 			return m, cmd
 		}
-		if m.viewMode == ViewGit && m.focus.Current() == component.FocusCommitTree && m.commitTree.InCommitView() {
+		if m.viewMode == ViewGit && m.focus.Current() == component.FocusCommitTree &&
+			(m.commitTree.InCommitView() || m.commitTree.InCreateInput()) {
 			comp, cmd := m.commitTree.Update(key)
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
@@ -3236,6 +3274,8 @@ type gitBranchDAGLoadedMsg struct {
 
 type branchDeletedMsg struct{ name string }
 type branchDeleteFailedMsg struct{ reason string }
+type branchCreatedMsg struct{ name string }
+type branchCreateFailedMsg struct{ reason string }
 type commitSucceededMsg struct{ message string }
 type commitFailedMsg struct{ reason string }
 
@@ -3296,31 +3336,12 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 	}
 }
 
-// loadBranchCommitsAndStatsCmd loads commits and their diff stats. It tries
-// DAG mode first (full merge structure); if the branch has more than
-// dagCommitLimit unique commits, falls back to flat first-parent pagination.
+// loadBranchCommitsAndStatsCmd loads the first page of commits with diff
+// stats for a branch. Uses flat first-parent pagination for fast initial
+// display. Subsequent pages are loaded on demand via loadMoreCommitsCmd.
 func (m *AppModel) loadBranchCommitsAndStatsCmd(branchName, defaultBranch string) tea.Cmd {
 	gc := m.gitClient
 	return func() tea.Msg {
-		// Try DAG mode first.
-		dagCommits, err := gc.ListBranchDAGCommits(branchName, defaultBranch, git.DagCommitLimit)
-		if err == nil && len(dagCommits) > 0 {
-			nodes := commitsToTreeNodes(dagCommits)
-			if len(nodes) > 0 {
-				nodes[0].Branch = branchName
-			}
-			graphRows, maxLane := committree.AssignLanes(nodes)
-			stats := loadStatsForNodes(gc, nodes)
-			return gitBranchDAGLoadedMsg{
-				branch:       branchName,
-				nodes:        nodes,
-				stats:        stats,
-				graphRows:    graphRows,
-				maxGraphLane: maxLane,
-			}
-		}
-
-		// Fallback to flat first-parent.
 		commits, hasMore, err := gc.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
 		if err != nil {
 			return gitBranchFullyLoadedMsg{branch: branchName}
@@ -5713,6 +5734,24 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Git mode: track toolbar button hover for commit tree panel.
+	if m.viewMode == ViewGit && m.commitTree != nil && mouse.Action == tea.MouseActionMotion {
+		panelW, panelH := m.layout.GetPanelSize(component.FocusCodeViewer)
+		panelX := m.codePanelX()
+		contentLeft := panelX + 1
+		contentRight := panelX + panelW - 1
+		contentTop := 1
+		contentBottom := 1 + max(panelH-panelBorderSize, 0)
+		if mouse.X >= contentLeft && mouse.X < contentRight &&
+			mouse.Y >= contentTop && mouse.Y < contentBottom {
+			viewX := mouse.X - contentLeft
+			viewY := mouse.Y - contentTop
+			m.commitTree.HandleToolbarHover(viewX, viewY)
+		} else {
+			m.commitTree.ClearHover()
+		}
+	}
+
 	switch mouse.Button {
 	case tea.MouseButtonWheelUp:
 		if mouse.Alt {
@@ -7791,7 +7830,14 @@ func (m *AppModel) focusBorderGroup() compositor.SlotID {
 		}
 		return compositor.SlotLeft
 	case component.FocusChat:
-		return compositor.SlotCenter
+		switch m.layout.Mode() {
+		case layout.TwoColumn:
+			return compositor.SlotRight
+		case layout.SingleColumn:
+			return compositor.SlotLeft
+		default:
+			return compositor.SlotCenter
+		}
 	case component.FocusCodeViewer, component.FocusCommitTree:
 		return compositor.SlotRight
 	case component.FocusGitPanel:
@@ -7877,7 +7923,14 @@ func (m *AppModel) detectDirtySlots() {
 
 	// Component dirty checks.
 	if m.chat.ViewDirty() {
-		m.comp.MarkDirty(compositor.SlotCenter)
+		switch m.layout.Mode() {
+		case layout.TwoColumn:
+			m.comp.MarkDirty(compositor.SlotRight)
+		case layout.SingleColumn:
+			m.comp.MarkDirty(compositor.SlotLeft)
+		default:
+			m.comp.MarkDirty(compositor.SlotCenter)
+		}
 	}
 	if m.fileTree.ViewDirty() {
 		if m.layout.Mode() == layout.FourColumn {

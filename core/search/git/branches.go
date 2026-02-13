@@ -727,6 +727,37 @@ func (c *GitClient) CheckoutBranch(name string) error {
 }
 
 // =============================================================================
+// Create
+// =============================================================================
+
+// CreateBranch creates a new local branch pointing at the given commit hash.
+// Returns ErrNotGitRepo if not a git repository.
+// Returns ErrBranchExists if a branch with the given name already exists.
+func (c *GitClient) CreateBranch(name, atCommitHash string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+
+	refName := plumbing.NewBranchReferenceName(name)
+
+	// Verify branch does not already exist.
+	if _, err := c.repo.Reference(refName, true); err == nil {
+		return ErrBranchExists
+	}
+
+	// Validate the target commit exists.
+	hash := plumbing.NewHash(atCommitHash)
+	if _, err := c.repo.CommitObject(hash); err != nil {
+		return err
+	}
+
+	return c.repo.Storer.SetReference(plumbing.NewHashReference(refName, hash))
+}
+
+// =============================================================================
 // Delete
 // =============================================================================
 
