@@ -154,6 +154,11 @@ type Model struct {
 	selectedIdx int
 	scrollOff   int
 
+	// DAG visualization state.
+	graphRows    []GraphRow // parallel to m.nodes, one per commit
+	maxGraphLane int        // widest lane index (for gutter width)
+	dagMode      bool       // true when viewing full DAG (vs flat first-parent)
+
 	// Visual bounce offset from overscroll physics.
 	bounceOffset int
 
@@ -325,6 +330,7 @@ func (m *Model) SetNodes(nodes []TreeNode) {
 
 // SetNodesWithStats atomically replaces commit data and applies diff stats,
 // transitioning from the loading spinner to the commit view in one frame.
+// Clears any DAG state — this is the flat first-parent mode path.
 func (m *Model) SetNodesWithStats(nodes []TreeNode, stats map[string][2]int, hasMore bool) {
 	applyStats(nodes, stats)
 	m.nodes = nodes
@@ -333,6 +339,29 @@ func (m *Model) SetNodesWithStats(nodes []TreeNode, stats map[string][2]int, has
 	m.hasMore = hasMore
 	m.loadingMore = false
 	m.lastHash = lastNodeHash(nodes)
+	m.graphRows = nil
+	m.maxGraphLane = 0
+	m.dagMode = false
+	m.mode = viewCommits
+	m.invalidateNodeCache()
+	m.viewDirty = true
+}
+
+// SetDAGNodesWithStats atomically sets commit data with full DAG graph layout,
+// transitioning from the loading spinner to the DAG commit view in one frame.
+// DAG mode disables pagination (all branch-unique commits loaded at once).
+func (m *Model) SetDAGNodesWithStats(nodes []TreeNode, stats map[string][2]int,
+	graphRows []GraphRow, maxLane int) {
+	applyStats(nodes, stats)
+	m.nodes = nodes
+	m.selectedIdx = 0
+	m.scrollOff = 0
+	m.hasMore = false
+	m.loadingMore = false
+	m.lastHash = lastNodeHash(nodes)
+	m.graphRows = graphRows
+	m.maxGraphLane = maxLane
+	m.dagMode = true
 	m.mode = viewCommits
 	m.invalidateNodeCache()
 	m.viewDirty = true
@@ -944,7 +973,8 @@ func (m *Model) renderLoadingBar() string {
 	return strings.Repeat(" ", leftPad) + content + strings.Repeat(" ", rightPad)
 }
 
-// viewCommitCards renders the commit cards view. Individual nodes are cached
+// viewCommitCards renders the commit cards view with centered cards and trunk
+// connectors matching the branch tree layout. Individual nodes are cached
 // and only re-rendered when their inputs change (typically 0-2 per frame).
 func (m *Model) viewCommitCards() string {
 	if len(m.nodes) == 0 {
@@ -957,8 +987,9 @@ func (m *Model) viewCommitCards() string {
 	lastIdx := len(m.nodes) - 1
 	for _, idx := range visible {
 		selected := idx == m.selectedIdx
+		isFirst := idx == 0
 		isLast := idx == lastIdx && !m.hasMore
-		nodeLines := m.getCachedNode(idx, m.nodes[idx], selected, isLast)
+		nodeLines := m.getCachedNode(idx, m.nodes[idx], selected, isFirst, isLast, nil, 0)
 		lines = append(lines, nodeLines...)
 	}
 
@@ -1559,6 +1590,9 @@ func (m *Model) exitToBranches() {
 	m.hasMore = false
 	m.loadingMore = false
 	m.lastHash = ""
+	m.graphRows = nil
+	m.maxGraphLane = 0
+	m.dagMode = false
 	m.viewDirty = true
 }
 

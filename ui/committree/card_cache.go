@@ -112,7 +112,13 @@ type nodeCacheKey struct {
 	relTime   string
 	selected  bool
 	width     int
+	isFirst   bool
 	isLast    bool
+
+	// DAG graph gutter fields (zero-valued in flat mode).
+	commitLane  int
+	maxLane     int
+	laneGlyphs [maxGraphLanes]LaneGlyph // fixed-size for comparable struct
 }
 
 // nodeCacheEntry pairs a key with its rendered output.
@@ -129,7 +135,8 @@ func (m *Model) invalidateNodeCache() {
 
 // getCachedNode returns cached node lines if the key matches, otherwise
 // renders the node, stores it in the cache, and returns fresh lines.
-func (m *Model) getCachedNode(idx int, n TreeNode, selected, isLast bool) []string {
+// graph is nil in flat/centered mode; non-nil in DAG mode.
+func (m *Model) getCachedNode(idx int, n TreeNode, selected, isFirst, isLast bool, graph *GraphRow, maxLane int) []string {
 	key := nodeCacheKey{
 		shortHash: n.ShortHash,
 		subject:   n.Subject,
@@ -141,7 +148,16 @@ func (m *Model) getCachedNode(idx int, n TreeNode, selected, isLast bool) []stri
 		relTime:   relativeTime(n.AuthorTime),
 		selected:  selected,
 		width:     m.width,
+		isFirst:   isFirst,
 		isLast:    isLast,
+	}
+
+	if graph != nil {
+		key.commitLane = graph.CommitLane
+		key.maxLane = maxLane
+		for i := 0; i < len(graph.Lanes) && i < maxGraphLanes; i++ {
+			key.laneGlyphs[i] = graph.Lanes[i]
+		}
 	}
 
 	// Grow cache slice if needed.
@@ -154,7 +170,7 @@ func (m *Model) getCachedNode(idx int, n TreeNode, selected, isLast bool) []stri
 		return entry.lines
 	}
 
-	lines := renderNode(n, selected, m.width, m.theme, isLast)
+	lines := renderNode(n, selected, m.width, m.theme, isFirst, isLast, graph, maxLane)
 	entry.valid = true
 	entry.key = key
 	entry.lines = lines

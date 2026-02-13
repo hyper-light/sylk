@@ -1,6 +1,7 @@
 package git
 
 import (
+	"container/heap"
 	"io"
 	"strings"
 	"time"
@@ -112,6 +113,7 @@ type FileSummary struct {
 }
 
 // GetCommitStats returns the total additions and deletions for a commit.
+// Uses the cached diffSummaryForHash path to avoid expensive Patch() calls.
 // Returns ErrNotGitRepo if not a git repository.
 // Returns ErrCommitNotFound if the commit does not exist.
 func (c *GitClient) GetCommitStats(hash string) (additions, deletions int, err error) {
@@ -122,27 +124,12 @@ func (c *GitClient) GetCommitStats(hash string) (additions, deletions int, err e
 		return 0, 0, ErrNotGitRepo
 	}
 
-	resolved, err := c.resolveCommitHash(hash)
+	ds, err := c.diffSummaryForHash(hash)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	commit, err := c.repo.CommitObject(resolved)
-	if err != nil {
-		return 0, 0, ErrCommitNotFound
-	}
-
-	stats, err := commit.Stats()
-	if err != nil {
-		return 0, 0, err
-	}
-
-	for _, s := range stats {
-		additions += s.Addition
-		deletions += s.Deletion
-	}
-
-	return additions, deletions, nil
+	return ds.Additions, ds.Deletions, nil
 }
 
 // GetCommitDiffSummary returns line and file change statistics for a commit.
@@ -1010,6 +997,156 @@ func (c *GitClient) CommitFiles(paths []string, message string) error {
 	_, err = wt.Commit(message, &gogit.CommitOptions{})
 	return err
 }
+
+// =============================================================================
+// DAG — Full Branch History with Merge Structure
+// =============================================================================
+
+// DagCommitLimit caps the number of commits fetched in DAG mode.
+// Derived from: 500 commits × ~200B ≈ 100KB — well within memory bounds.
+// Beyond this limit, falls back to flat first-parent view.
+const DagCommitLimit = 500
+
+// ListBranchDAGCommits returns all commits unique to a branch (following ALL
+// parents), topologically sorted (newest first). This preserves merge structure
+// for DAG visualization. Falls back to nil when the branch has more than
+// DagCommitLimit unique commits.
+// Caller must hold NO lock — this acquires RLock internally.
+func (c *GitClient) ListBranchDAGCommits(branchName, baseBranch string, limit int) ([]TreeCommit, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return nil, ErrNotGitRepo
+	}
+
+	branchRef, err := c.repo.Reference(plumbing.NewBranchReferenceName(branchName), true)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build base reachable set (empty if same branch or no base).
+	baseSet := c.dagBaseSet(branchRef.Hash(), branchName, baseBranch)
+
+	collected := c.collectBranchDAG(branchRef.Hash(), baseSet, limit)
+	if len(collected) == 0 {
+		return nil, nil
+	}
+
+	sorted := topoSortDAG(collected, branchRef.Hash())
+
+	branchMap, _ := c.buildBranchMap()
+	result := make([]TreeCommit, len(sorted))
+	for i, co := range sorted {
+		result[i] = treeCommitFromObject(co, branchMap)
+	}
+	return result, nil
+}
+
+// dagBaseSet builds the exclusion set for DAG collection.
+// Returns nil when no filtering should occur (same branch, empty base, errors).
+func (c *GitClient) dagBaseSet(branchHash plumbing.Hash, branchName, baseBranch string) map[plumbing.Hash]struct{} {
+	if baseBranch == "" || branchName == baseBranch {
+		return nil
+	}
+	baseRef, err := c.repo.Reference(plumbing.NewBranchReferenceName(baseBranch), true)
+	if err != nil {
+		return nil
+	}
+	if branchHash == baseRef.Hash() {
+		return nil
+	}
+	return c.reachableSet(baseRef.Hash())
+}
+
+// collectBranchDAG performs BFS from branchHash following ALL parents,
+// skipping any hash in baseSet, collecting up to limit commits.
+func (c *GitClient) collectBranchDAG(branchHash plumbing.Hash, baseSet map[plumbing.Hash]struct{}, limit int) map[plumbing.Hash]*object.Commit {
+	result := make(map[plumbing.Hash]*object.Commit, min(limit, 64))
+	queue := []plumbing.Hash{branchHash}
+
+	for len(queue) > 0 {
+		h := queue[0]
+		queue = queue[1:]
+		if _, seen := result[h]; seen {
+			continue
+		}
+		if _, inBase := baseSet[h]; inBase {
+			continue
+		}
+		co, err := c.repo.CommitObject(h)
+		if err != nil {
+			continue
+		}
+		result[h] = co
+		if len(result) >= limit {
+			break
+		}
+		for _, ph := range co.ParentHashes {
+			queue = append(queue, ph)
+		}
+	}
+	return result
+}
+
+// topoSortDAG performs Kahn's algorithm on the DAG subset, using a max-heap
+// keyed by committer time (newest first) for deterministic output order.
+func topoSortDAG(commits map[plumbing.Hash]*object.Commit, tipHash plumbing.Hash) []*object.Commit {
+	// Compute in-degree within the DAG subset.
+	inDeg := make(map[plumbing.Hash]int, len(commits))
+	for h := range commits {
+		inDeg[h] = 0
+	}
+	for _, co := range commits {
+		for _, ph := range co.ParentHashes {
+			if _, ok := commits[ph]; ok {
+				inDeg[ph]++
+			}
+		}
+	}
+
+	// Seed the heap with zero in-degree nodes.
+	h := &commitHeap{}
+	heap.Init(h)
+	for hash, deg := range inDeg {
+		if deg == 0 {
+			heap.Push(h, commits[hash])
+		}
+	}
+
+	result := make([]*object.Commit, 0, len(commits))
+	for h.Len() > 0 {
+		co := heap.Pop(h).(*object.Commit)
+		result = append(result, co)
+		for _, ph := range co.ParentHashes {
+			if _, ok := commits[ph]; !ok {
+				continue
+			}
+			inDeg[ph]--
+			if inDeg[ph] == 0 {
+				heap.Push(h, commits[ph])
+			}
+		}
+	}
+	return result
+}
+
+// commitHeap is a max-heap of commits ordered by committer time (newest first),
+// with hash as tiebreaker for determinism.
+type commitHeap []*object.Commit
+
+func (h commitHeap) Len() int { return len(h) }
+func (h commitHeap) Less(i, j int) bool {
+	ti := h[i].Committer.When
+	tj := h[j].Committer.When
+	if !ti.Equal(tj) {
+		return ti.After(tj) // newest first
+	}
+	return h[i].Hash.String() < h[j].Hash.String()
+}
+func (h commitHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *commitHeap) Push(x any)         { *h = append(*h, x.(*object.Commit)) }
+func (h *commitHeap) Pop() any           { old := *h; n := len(old); x := old[n-1]; old[n-1] = nil; *h = old[:n-1]; return x }
 
 // =============================================================================
 // Tags

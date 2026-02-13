@@ -22,77 +22,217 @@ const edgeGlyph = "│"
 // ellipsis is appended when a string is truncated to fit available width.
 const ellipsis = "..."
 
-// renderNode renders a single commit card with a tree connector below it.
-// Selected cards use Primary border; unselected use a muted border.
+// laneColors is the palette of colors assigned to graph lanes.
+// Cycled by lane index mod len. Chosen for contrast and consistency
+// with the Catppuccin-based theme palette.
+var laneColors = []func(theme.Palette) lipgloss.Color{
+	func(p theme.Palette) lipgloss.Color { return p.Primary },    // blue
+	func(p theme.Palette) lipgloss.Color { return p.Secondary },  // mauve
+	func(p theme.Palette) lipgloss.Color { return p.Success },    // green
+	func(p theme.Palette) lipgloss.Color { return p.Warning },    // yellow
+	func(p theme.Palette) lipgloss.Color { return p.Teal },       // teal
+	func(p theme.Palette) lipgloss.Color { return p.Peach },      // peach
+	func(p theme.Palette) lipgloss.Color { return p.Lavender },   // lavender
+}
+
+// laneColorForIdx returns the color for a given lane index.
+func laneColorForIdx(idx int, p theme.Palette) lipgloss.Color {
+	return laneColors[idx%len(laneColors)](p)
+}
+
+// renderNode renders a single commit card centered in the panel with trunk
+// connectors matching the branch tree card layout. When graph is non-nil,
+// falls back to the full-width DAG gutter layout.
 //
-// Layout (selected):
+// Centered layout (no graph):
 //
-//	╭──────────────────────────────────────────╮
-//	│ ● abc1234 (main)       +12 -3    2h ago │
-//	│   Add git mode scaffolding               │
-//	╰──────────────────────────────────────────╯
-//	  │
-//
-// Layout (unselected):
-//
-//	╭──────────────────────────────────────────╮
-//	│ ● def5678              +245 -0    3d ago │
-//	│   Fix bug in parser                      │
-//	╰──────────────────────────────────────────╯
-//	  │
-func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isLast bool) []string {
+//	           ╭──────────────────────────╮
+//	           │ ● abc1234  +12 -3  2h ago│
+//	           │   Add git mode scaffoldin│
+//	           ╰────────────┬─────────────╯
+//	                        │
+//	           ╭────────────┴─────────────╮
+//	           │ ● def5678       3h ago   │
+//	           │   Fix edge case          │
+//	           ╰──────────────────────────╯
+func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isFirst, isLast bool, graph *GraphRow, maxLane int) []string {
+	if graph != nil {
+		return renderNodeDAG(n, selected, width, th, isLast, graph, maxLane)
+	}
+
 	p := th.Palette
-
-	// Border consumes 2 columns (left + right border characters).
+	cardWidth := primaryCardWidth(width)
 	const borderCols = 2
-	innerWidth := max(width-borderCols, 0)
+	innerWidth := max(cardWidth-borderCols, 0)
+	leftPad := max((width-cardWidth)/2, 0)
+	trunkPos := width / 2
+	trunkInner := trunkPos - leftPad - 1
 
-	// Select border color based on selection state.
 	borderColor := p.Border
 	if selected {
 		borderColor = p.Rosewater
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
-	// Build the two content lines, padded to innerWidth.
 	header := padContent(buildHeaderLine(n, innerWidth, p), innerWidth)
 	subject := padContent(buildSubjectLine(n, innerWidth, p), innerWidth)
 
-	// Build border and content lines directly — avoids lipgloss.Border().Render().
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInner, !isFirst)
+	botBorder := buildCardBorder("╰", "╯", innerWidth, bSt, trunkInner, !isLast)
+
+	pad := strings.Repeat(" ", leftPad)
+	vis := leftPad + cardWidth
+
+	trunkSt := lipgloss.NewStyle().Foreground(p.Border)
+	var trunkLine string
+	if !isLast {
+		trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
+		trunkLine = padRight(trunk, trunkPos+1, width)
+	} else {
+		trunkLine = strings.Repeat(" ", max(width, 0))
+	}
+
+	return []string{
+		padRight(pad+topBorder, vis, width),
+		padRight(pad+bSt.Render("│")+header+bSt.Render("│"), vis, width),
+		padRight(pad+bSt.Render("│")+subject+bSt.Render("│"), vis, width),
+		padRight(pad+botBorder, vis, width),
+		trunkLine,
+	}
+}
+
+// renderNodeDAG renders a commit card with a DAG graph gutter prepended.
+func renderNodeDAG(n TreeNode, selected bool, width int, th *theme.Theme, isLast bool, graph *GraphRow, maxLane int) []string {
+	p := th.Palette
+	gutterWidth := (maxLane + 1) * laneWidth
+	const borderCols = 2
+	cardWidth := max(width-gutterWidth, borderCols+1)
+	innerWidth := max(cardWidth-borderCols, 0)
+
+	borderColor := p.Border
+	if selected {
+		borderColor = p.Rosewater
+	}
+	bSt := lipgloss.NewStyle().Foreground(borderColor)
+
+	header := padContent(buildHeaderLine(n, innerWidth, p), innerWidth)
+	subject := padContent(buildSubjectLine(n, innerWidth, p), innerWidth)
+
 	topBorder := bSt.Render("╭" + strings.Repeat("─", innerWidth) + "╮")
 	botBorder := bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
 
-	// Edge connector line (or blank for the last node).
 	var connector string
 	if !isLast {
 		edgeSt := lipgloss.NewStyle().Foreground(p.Border)
 		connector = "  " + edgeSt.Render(edgeGlyph)
 	}
-
-	// All card lines are exactly width visual columns; connector needs padding.
 	connectorVis := 0
 	if connector != "" {
-		connectorVis = 3 // "  │"
+		connectorVis = 3
 	}
-	blank := strings.Repeat(" ", max(width, 0))
+	blank := strings.Repeat(" ", max(cardWidth, 0))
 
-	lines := []string{
+	cardLines := []string{
 		topBorder,
 		bSt.Render("│") + header + bSt.Render("│"),
 		bSt.Render("│") + subject + bSt.Render("│"),
 		botBorder,
-		padRight(connector, connectorVis, width),
+		padRight(connector, connectorVis, cardWidth),
+	}
+	for len(cardLines) < nodeHeight {
+		cardLines = append(cardLines, blank)
+	}
+	if len(cardLines) > nodeHeight {
+		cardLines = cardLines[:nodeHeight]
 	}
 
-	// Clamp to exactly nodeHeight lines.
-	for len(lines) < nodeHeight {
-		lines = append(lines, blank)
+	lines := make([]string, nodeHeight)
+	for lineIdx := range nodeHeight {
+		gutter := renderGraphGutter(*graph, lineIdx, maxLane, p)
+		lines[lineIdx] = padLine(gutter+cardLines[lineIdx], width)
 	}
-	if len(lines) > nodeHeight {
-		lines = lines[:nodeHeight]
-	}
-
 	return lines
+}
+
+// renderGraphGutter renders the gutter segment for a single line of a card.
+// lineIdx ranges 0..nodeHeight-1 corresponding to:
+//
+//	0: top border    — │ for active lanes, space at commit lane
+//	1: header line   — ● at commit lane, │ elsewhere, ╮─ for merges
+//	2: subject line  — │ for all active lanes
+//	3: bottom border — │ for all active lanes
+//	4: connector     — │ for continuing lanes
+func renderGraphGutter(row GraphRow, lineIdx int, maxLane int, p theme.Palette) string {
+	var buf strings.Builder
+	lanes := row.Lanes
+	cols := maxLane + 1
+
+	for lane := range cols {
+		glyph := LaneEmpty
+		if lane < len(lanes) {
+			glyph = lanes[lane]
+		}
+		color := laneColorForIdx(lane, p)
+		st := lipgloss.NewStyle().Foreground(color)
+
+		ch := renderLaneCell(glyph, lane, row.CommitLane, lineIdx, st, p)
+		buf.WriteString(ch)
+		// Pad to laneWidth (glyph is 1 col, pad with space).
+		for i := 1; i < laneWidth; i++ {
+			buf.WriteByte(' ')
+		}
+	}
+	return buf.String()
+}
+
+// renderLaneCell returns the single-character glyph for a lane cell.
+func renderLaneCell(glyph LaneGlyph, lane, commitLane, lineIdx int, st lipgloss.Style, p theme.Palette) string {
+	switch glyph {
+	case LaneCommit:
+		return renderCommitLaneCell(lane, commitLane, lineIdx, st)
+	case LanePass:
+		return st.Render("│")
+	case LaneMergeRight:
+		return renderMergeCell(lineIdx, st)
+	case LaneBranchLeft:
+		return renderBranchCell(lineIdx, st)
+	case LaneHoriz:
+		return renderHorizCell(lineIdx, st)
+	default:
+		return " "
+	}
+}
+
+// renderCommitLaneCell renders the cell at the commit's own lane.
+func renderCommitLaneCell(lane, commitLane, lineIdx int, st lipgloss.Style) string {
+	if lane == commitLane && lineIdx == 1 {
+		return st.Render(commitMarker)
+	}
+	return st.Render("│")
+}
+
+// renderMergeCell renders a merge-right (╮) on the header line, │ elsewhere.
+func renderMergeCell(lineIdx int, st lipgloss.Style) string {
+	if lineIdx == 1 {
+		return st.Render("╮")
+	}
+	return st.Render("│")
+}
+
+// renderBranchCell renders a branch-left (╰) on the connector line, │ elsewhere.
+func renderBranchCell(lineIdx int, st lipgloss.Style) string {
+	if lineIdx == 4 {
+		return st.Render("╰")
+	}
+	return st.Render("│")
+}
+
+// renderHorizCell renders a horizontal connector (─) on the header line, space elsewhere.
+func renderHorizCell(lineIdx int, st lipgloss.Style) string {
+	if lineIdx == 1 {
+		return st.Render("─")
+	}
+	return " "
 }
 
 // =============================================================================

@@ -947,6 +947,11 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case gitBranchDAGLoadedMsg:
+		if m.commitTree != nil {
+			m.commitTree.SetDAGNodesWithStats(typed.nodes, typed.stats, typed.graphRows, typed.maxGraphLane)
+		}
+		return m, nil
 	case gitBranchFullyLoadedMsg:
 		if m.commitTree != nil {
 			m.commitTree.SetNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
@@ -3094,6 +3099,16 @@ type gitMoreCommitsLoadedMsg struct {
 	hasMore bool
 }
 
+// gitBranchDAGLoadedMsg carries a full DAG of branch-unique commits with
+// graph layout data, loaded atomically.
+type gitBranchDAGLoadedMsg struct {
+	branch       string
+	nodes        []committree.TreeNode
+	stats        map[string][2]int
+	graphRows    []committree.GraphRow
+	maxGraphLane int
+}
+
 type branchDeletedMsg struct{ name string }
 type branchDeleteFailedMsg struct{ reason string }
 type commitSucceededMsg struct{ message string }
@@ -3156,18 +3171,36 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 	}
 }
 
-// loadBranchCommitsAndStatsCmd loads the first page of commits and their diff
-// stats, returning a gitBranchFullyLoadedMsg so the UI transitions atomically
-// from loading spinner to fully populated commit list (no pop-in).
+// loadBranchCommitsAndStatsCmd loads commits and their diff stats. It tries
+// DAG mode first (full merge structure); if the branch has more than
+// dagCommitLimit unique commits, falls back to flat first-parent pagination.
 func (m *AppModel) loadBranchCommitsAndStatsCmd(branchName, defaultBranch string) tea.Cmd {
 	gc := m.gitClient
 	return func() tea.Msg {
+		// Try DAG mode first.
+		dagCommits, err := gc.ListBranchDAGCommits(branchName, defaultBranch, git.DagCommitLimit)
+		if err == nil && len(dagCommits) > 0 {
+			nodes := commitsToTreeNodes(dagCommits)
+			if len(nodes) > 0 {
+				nodes[0].Branch = branchName
+			}
+			graphRows, maxLane := committree.AssignLanes(nodes)
+			stats := loadStatsForNodes(gc, nodes)
+			return gitBranchDAGLoadedMsg{
+				branch:       branchName,
+				nodes:        nodes,
+				stats:        stats,
+				graphRows:    graphRows,
+				maxGraphLane: maxLane,
+			}
+		}
+
+		// Fallback to flat first-parent.
 		commits, hasMore, err := gc.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
 		if err != nil {
 			return gitBranchFullyLoadedMsg{branch: branchName}
 		}
 		nodes := commitsToTreeNodes(commits)
-		// Only the tip commit carries the branch label.
 		if len(nodes) > 0 {
 			nodes[0].Branch = branchName
 		}
@@ -3225,15 +3258,17 @@ func commitsToTreeNodes(commits []git.TreeCommit) []committree.TreeNode {
 	return nodes
 }
 
-// loadStatsForNodes fetches diff stats for each node's commit hash.
+// loadStatsForNodes fetches diff stats for all node hashes in a single batch
+// under one read lock, leveraging the ristretto cache for repeated lookups.
 func loadStatsForNodes(gc *git.GitClient, nodes []committree.TreeNode) map[string][2]int {
-	stats := make(map[string][2]int, len(nodes))
-	for _, n := range nodes {
-		add, del, err := gc.GetCommitStats(n.Hash)
-		if err != nil {
-			continue
-		}
-		stats[n.Hash] = [2]int{add, del}
+	hashes := make([]string, len(nodes))
+	for i, n := range nodes {
+		hashes[i] = n.Hash
+	}
+	summaries := gc.GetCommitDiffSummaries(hashes)
+	stats := make(map[string][2]int, len(summaries))
+	for h, ds := range summaries {
+		stats[h] = [2]int{ds.Additions, ds.Deletions}
 	}
 	return stats
 }
