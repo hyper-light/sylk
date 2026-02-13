@@ -154,8 +154,9 @@ type Model struct {
 	branches        []BranchNode
 	branchIdx       int
 	branchScrollOff int
-	activeBranch    string // Branch being viewed in commit mode.
-	defaultBranch   string // Repository default branch name.
+	activeBranch    string            // Branch being viewed in commit mode.
+	defaultBranch   string            // Repository default branch name.
+	branchParents   map[string]string // child → parent branch name.
 
 	// Expansion state.
 	expandedIdx      int  // Flat branch index of expanded card, -1 = none.
@@ -221,7 +222,14 @@ func New(th *theme.Theme) *Model {
 		viewDirty:      true,
 		expandedIdx:    -1,
 		hoverButtonIdx: -1,
+		branchParents:  make(map[string]string),
 	}
+}
+
+// RecordBranchParent stores a parent relationship so the branch tree
+// can display child branches beneath their parent after reload.
+func (m *Model) RecordBranchParent(child, parent string) {
+	m.branchParents[child] = parent
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +304,15 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 
 	m.defaultBranch = defaultBranch
 
+	// Apply known parent relationships from UI-initiated branch creation.
+	for i := range branches {
+		if p, ok := m.branchParents[branches[i].Name]; ok {
+			branches[i].Parent = p
+		}
+	}
+
+	// Sort: default branch last, then group children immediately after
+	// their parent. First do a time-based sort, then reorder children.
 	slices.SortStableFunc(branches, func(a, b BranchNode) int {
 		ap := a.Name == defaultBranch
 		bp := b.Name == defaultBranch
@@ -307,6 +324,7 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 		}
 		return b.AuthorTime.Compare(a.AuthorTime)
 	})
+	branches = groupChildrenAfterParent(branches)
 
 	m.branches = branches
 
@@ -2127,6 +2145,34 @@ func (m *Model) selectionCmd() tea.Cmd {
 	return func() tea.Msg {
 		return SelectionMsg{Hash: hash}
 	}
+}
+
+// groupChildrenAfterParent reorders branches so that children appear
+// immediately after their parent. Preserves relative order otherwise.
+func groupChildrenAfterParent(branches []BranchNode) []BranchNode {
+	// Build parent → children index.
+	children := make(map[string][]BranchNode)
+	hasParent := make(map[string]bool, len(branches))
+	for _, b := range branches {
+		if b.Parent != "" {
+			children[b.Parent] = append(children[b.Parent], b)
+			hasParent[b.Name] = true
+		}
+	}
+	if len(children) == 0 {
+		return branches
+	}
+
+	// Emit each root-level branch followed by its children.
+	out := make([]BranchNode, 0, len(branches))
+	for _, b := range branches {
+		if hasParent[b.Name] {
+			continue // will be emitted after its parent
+		}
+		out = append(out, b)
+		out = append(out, children[b.Name]...)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

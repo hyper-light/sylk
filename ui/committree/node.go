@@ -28,6 +28,7 @@ type BranchNode struct {
 	CommitCountCapped bool      // True if CommitCount hit the counting limit.
 	BehindCount       int       // Commits in default branch not reachable from tip.
 	BehindCountCapped bool      // True if BehindCount hit the counting limit.
+	Parent            string    // Parent branch name (empty for root/default).
 }
 
 // relativeTime formats a time.Time as a human-readable relative duration.

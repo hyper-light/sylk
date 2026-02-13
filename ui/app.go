@@ -937,6 +937,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case committree.CreateBranchRequestMsg:
 		if m.gitClient != nil {
+			m.commitTree.RecordBranchParent(typed.Name, typed.ParentBranch)
 			gc := m.gitClient
 			name := typed.Name
 			parent := typed.ParentBranch
