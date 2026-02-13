@@ -24,6 +24,8 @@ type branchEntry struct {
 
 	commitCount       int  // commits unique to this branch vs. default
 	commitCountCapped bool // true if count hit the counting limit
+	behindCount       int  // commits in default not reachable from this branch
+	behindCountCapped bool // true if behind count hit the counting limit
 
 	additions, deletions                   int
 	filesAdded, filesModified, filesDeleted int
@@ -112,6 +114,8 @@ func loadBranches(gc *git.GitClient, statLevel git.DiffStatLevel) []branchEntry 
 		if bc, ok := commitCounts[bi.Name]; ok {
 			e.commitCount = bc.Count
 			e.commitCountCapped = bc.Capped
+			e.behindCount = bc.Behind
+			e.behindCountCapped = bc.BehindCapped
 		}
 		if ds, ok := lineSummaries[bi.Hash]; ok {
 			e.additions = ds.Additions
@@ -187,6 +191,13 @@ func renderBranchCell(e branchEntry, colID ColumnID, width int, selected bool, t
 		text := strconv.Itoa(e.commitCount)
 		if e.commitCountCapped {
 			text += "+"
+		}
+		if e.behindCount > 0 {
+			behind := strconv.Itoa(e.behindCount)
+			if e.behindCountCapped {
+				behind += "+"
+			}
+			text += " -" + behind
 		}
 		style := lipgloss.NewStyle().Foreground(p.Muted)
 		if greyOut {

@@ -26,6 +26,8 @@ type BranchNode struct {
 	IsHead            bool      // True if this is the current branch (HEAD).
 	CommitCount       int       // Number of commits reachable from tip.
 	CommitCountCapped bool      // True if CommitCount hit the counting limit.
+	BehindCount       int       // Commits in default branch not reachable from tip.
+	BehindCountCapped bool      // True if BehindCount hit the counting limit.
 }
 
 // relativeTime formats a time.Time as a human-readable relative duration.

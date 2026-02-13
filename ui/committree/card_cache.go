@@ -8,8 +8,10 @@ type cardCacheKey struct {
 	name       string
 	shortHash  string
 	subject    string
-	commitCount int
-	capped     bool
+	commitCount  int
+	capped       bool
+	behindCount  int
+	behindCapped bool
 	isHead     bool
 	relTime    string // rendered relative time (changes ~1/min)
 
@@ -56,8 +58,10 @@ func buildCardCacheKey(b BranchNode, selected bool, innerWidth, trunkInner int,
 		name:        b.Name,
 		shortHash:   b.ShortHash,
 		subject:     b.Subject,
-		commitCount: b.CommitCount,
-		capped:      b.CommitCountCapped,
+		commitCount:  b.CommitCount,
+		capped:       b.CommitCountCapped,
+		behindCount:  b.BehindCount,
+		behindCapped: b.BehindCountCapped,
 		isHead:      b.IsHead,
 		relTime:     relativeTime(b.AuthorTime),
 		selected:    selected,

@@ -832,10 +832,13 @@ func (c *GitClient) reachableSet(from plumbing.Hash) map[plumbing.Hash]struct{} 
 	return set
 }
 
-// BranchOnlyCount holds the result of a per-branch unique commit count.
+// BranchOnlyCount holds the result of a per-branch unique commit count,
+// including both ahead (unique to branch) and behind (unique to base).
 type BranchOnlyCount struct {
-	Count  int
-	Capped bool
+	Count        int
+	Capped       bool
+	Behind       int
+	BehindCapped bool
 }
 
 // CountBranchOnlyCommitsBatch counts unique commits for multiple branches
@@ -880,8 +883,13 @@ func (c *GitClient) CountBranchOnlyCommitsBatch(branchNames []string, baseBranch
 			result[name] = BranchOnlyCount{}
 			continue
 		}
-		cnt, cap := c.countExcluding(ref.Hash(), baseSet, limit)
-		result[name] = BranchOnlyCount{Count: cnt, Capped: cap}
+		branchSet := c.reachableSet(ref.Hash())
+		ahead, aheadCap := c.countExcluding(ref.Hash(), baseSet, limit)
+		behind, behindCap := c.countExcluding(baseHash, branchSet, limit)
+		result[name] = BranchOnlyCount{
+			Count: ahead, Capped: aheadCap,
+			Behind: behind, BehindCapped: behindCap,
+		}
 	}
 	return result
 }

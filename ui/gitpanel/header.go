@@ -70,7 +70,7 @@ func renderHeaderRow(ls *listState, width int, th *theme.Theme) string {
 		// Active sort indicators keep their accent color regardless of
 		// hover/focus state; inactive indicators follow the label style.
 		if isSortActive(col.Def, ls.columns.SortKeys) {
-			sortStyle := lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+			sortStyle := lipgloss.NewStyle().Foreground(p.Secondary).Bold(true)
 			b.WriteString(fitHeaderCellSplit(truncLabel, indicator, col.Width, style, sortStyle))
 		} else {
 			cellText := truncLabel + indicator

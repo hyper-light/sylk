@@ -50,7 +50,7 @@ func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isLast bo
 	// Select border color based on selection state.
 	borderColor := p.Border
 	if selected {
-		borderColor = p.Primary
+		borderColor = p.Rosewater
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
@@ -238,7 +238,7 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 
 	borderColor := p.Border
 	if selected {
-		borderColor = p.Primary
+		borderColor = p.Rosewater
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
@@ -307,6 +307,15 @@ func buildExpContentLine(b BranchNode, exp *branchExpansion, width int, p theme.
 		count += "+"
 	}
 	text := " " + countStyle.Render(count+" commits")
+
+	if b.BehindCount > 0 {
+		behind := itoa(b.BehindCount)
+		if b.BehindCountCapped {
+			behind += "+"
+		}
+		behindStyle := lipgloss.NewStyle().Foreground(p.Warning)
+		text += "  " + behindStyle.Render(behind+" behind")
+	}
 
 	if b.IsHead {
 		if exp.wt.conflicts {

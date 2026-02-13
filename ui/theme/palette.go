@@ -17,9 +17,10 @@ type Palette struct {
 	Accent    lipgloss.Color
 
 	// Extended accent (syntax highlighting differentiation)
-	Peach    lipgloss.Color
-	Teal     lipgloss.Color
-	Lavender lipgloss.Color
+	Peach     lipgloss.Color
+	Teal      lipgloss.Color
+	Lavender  lipgloss.Color
+	Rosewater lipgloss.Color
 
 	// Semantic
 	Success lipgloss.Color
@@ -51,9 +52,10 @@ var DarkPalette = Palette{
 	Secondary: lipgloss.Color("#cba6f7"),
 	Accent:    lipgloss.Color("#f5c2e7"),
 
-	Peach:    lipgloss.Color("#fab387"),
-	Teal:     lipgloss.Color("#94e2d5"),
-	Lavender: lipgloss.Color("#b4befe"),
+	Peach:     lipgloss.Color("#fab387"),
+	Teal:      lipgloss.Color("#94e2d5"),
+	Lavender:  lipgloss.Color("#b4befe"),
+	Rosewater: lipgloss.Color("#89dceb"),
 
 	Success: lipgloss.Color("#a6e3a1"),
 	Warning: lipgloss.Color("#f9e2af"),
@@ -93,9 +95,10 @@ var LightPalette = Palette{
 	Secondary: lipgloss.Color("#8839ef"),
 	Accent:    lipgloss.Color("#ea76cb"),
 
-	Peach:    lipgloss.Color("#fe640b"),
-	Teal:     lipgloss.Color("#179299"),
-	Lavender: lipgloss.Color("#7287fd"),
+	Peach:     lipgloss.Color("#fe640b"),
+	Teal:      lipgloss.Color("#179299"),
+	Lavender:  lipgloss.Color("#7287fd"),
+	Rosewater: lipgloss.Color("#dc8a78"),
 
 	Success: lipgloss.Color("#40a02b"),
 	Warning: lipgloss.Color("#df8e1d"),

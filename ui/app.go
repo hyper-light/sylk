@@ -3141,6 +3141,8 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 			if bc, ok := commitCounts[b.Name]; ok {
 				nodes[i].CommitCount = bc.Count
 				nodes[i].CommitCountCapped = bc.Capped
+				nodes[i].BehindCount = bc.Behind
+				nodes[i].BehindCountCapped = bc.BehindCapped
 			}
 		}
 
