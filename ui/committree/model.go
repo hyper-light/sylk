@@ -996,17 +996,19 @@ func (m *Model) viewCommitCards() string {
 	return m.padViewport(lines)
 }
 
-// padViewport pads lines to fill the viewport height with tilde filler,
-// truncates if over, and applies bounce offset. When a page load is in
-// flight, overlays a loading bar on the last line (no layout shift).
+// padViewport vertically centers lines within the viewport height and
+// applies bounce offset. When a page load is in flight, overlays a
+// loading bar on the last line (no layout shift).
 func (m *Model) padViewport(lines []string) string {
 	emptyLine := strings.Repeat(" ", max(m.width, 0))
 	if len(lines) < m.height {
-		tildeLine := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted).Render("~") +
-			strings.Repeat(" ", max(m.width-1, 0))
-		for len(lines) < m.height {
-			lines = append(lines, tildeLine)
+		topPad := (m.height - len(lines)) / 2
+		centered := make([]string, m.height)
+		for i := range centered {
+			centered[i] = emptyLine
 		}
+		copy(centered[topPad:], lines)
+		lines = centered
 	}
 	if len(lines) > m.height {
 		lines = lines[:m.height]

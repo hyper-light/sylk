@@ -304,15 +304,14 @@ type AppModel struct {
 	bounce            bounceState      // Current bounce animation state.
 	swipe             swipeState       // Horizontal scroll accumulation for ring cycling.
 
-	// Inline editor (Alt+E edit mode).
-	editMode       bool              // Whether inline editing is active.
+	// View mode state machine — exactly one of ViewChat/ViewEdit/ViewGit.
+	viewMode       ViewMode
 	savedLeftIdx   int               // Saved leftRing.index before edit mode.
 	savedRightIdx  int               // Saved rightRing.index before edit mode.
 	savedChatFocus component.FocusID // Last focused panel in chat mode.
 	savedEditFocus component.FocusID // Last focused panel in edit mode.
 
-	// Git mode (Alt+G).
-	gitMode          bool              // Whether git mode is active.
+	// Git mode resources.
 	gitClient        *git.GitClient    // Git client for data loading (nil if not a repo).
 	gitPanel         *gitpanel.Model   // Git explorer panel (left slot in git mode).
 	commitTree       *committree.Model // Commit tree visualization (right slot in git mode).
@@ -320,9 +319,8 @@ type AppModel struct {
 	savedGitRightIdx int               // Saved rightRing.index before git mode.
 	savedGitFocus    component.FocusID // Last focused panel in git mode.
 	preGitEditMode   bool              // Whether edit mode was active before entering git mode.
-	prevGitMode      bool              // Detect git mode transitions for dirty detection.
+	prevGitMode      ViewMode          // Detect git mode transitions for dirty detection.
 	gitDataLoaded    bool              // True after first LoadData; skips reload on cycling.
-	ringMode         string            // Current view mode from ring position: "CHAT", "EDIT", "GIT".
 
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
@@ -507,6 +505,27 @@ func isGitPanel(id component.FocusID) bool {
 	return id == component.FocusGitPanel || id == component.FocusCommitTree
 }
 
+// ViewMode is the current top-level UI mode. Exactly one is active at a time.
+type ViewMode int
+
+const (
+	ViewChat ViewMode = iota // Default: chat + panels.
+	ViewEdit                 // Inline vim editor active.
+	ViewGit                  // Git explorer + commit tree.
+)
+
+// String returns the status bar label for this mode.
+func (v ViewMode) String() string {
+	switch v {
+	case ViewEdit:
+		return "EDIT"
+	case ViewGit:
+		return "GIT"
+	default:
+		return "CHAT"
+	}
+}
+
 // scrollState tracks the spring-driven scroll animation.
 type scrollState struct {
 	pos     float64           // Smooth position (fractional line offset).
@@ -575,7 +594,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		previewTabHoverClose:   -1,
 		mdPreviewTabHoverClose: -1,
 		mdTooltipTab:           -1,
-		ringMode:               "CHAT",
+		viewMode:               ViewChat,
 	}
 
 	app.comp = compositor.New()
@@ -773,15 +792,15 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.editCmdInput = false
 			m.input.SetLineStyler(nil)
 			exCmd := m.handleExCommand(typed.Text)
-			if m.editMode {
+			if m.viewMode == ViewEdit {
 				m.focusCodePanel()
 				m.syncFocusState()
 			}
 			return m, exCmd
 		}
-		if m.editMode {
+		if m.viewMode == ViewEdit {
 			exCmd := m.handleExCommand(typed.Text)
-			if m.editMode {
+			if m.viewMode == ViewEdit {
 				m.focusCodePanel()
 				m.syncFocusState()
 			}
@@ -837,7 +856,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.GitStatusMsg:
 		m.fileTree.SetGitStatus(typed.StatusMap, typed.TrackedSet, typed.TrackedDirs)
 		cmds := []tea.Cmd{m.gitWatchCmd()}
-		if m.gitMode {
+		if m.viewMode == ViewGit {
 			cmds = append(cmds, m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 			if m.commitTree.InCommitView() {
 				defaultBranch := m.commitTree.GetDefaultBranch()
@@ -853,7 +872,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case committree.BranchSelectedMsg:
-		if m.gitMode && m.gitClient != nil {
+		if m.viewMode == ViewGit && m.gitClient != nil {
 			defaultBranch := ""
 			if m.commitTree != nil {
 				defaultBranch = m.commitTree.GetDefaultBranch()
@@ -1239,7 +1258,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Ctrl+C / Ctrl+Shift+C: copy selection in edit mode, otherwise interrupt.
 	ks := key.String()
 	if ks == "ctrl+c" || ks == "ctrl+shift+c" {
-		if m.editMode && m.focusedEditor().HasSelection() {
+		if m.viewMode == ViewEdit && m.focusedEditor().HasSelection() {
 			text := m.focusedEditor().SelectedText()
 			if err := m.clipboard.Set(text); err != nil {
 				m.statusBar.SetFlash("Copy failed")
@@ -1264,7 +1283,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Select all in the focused component (Alt+Shift+A).
 	if key.String() == "alt+A" {
 		switch {
-		case m.editMode && m.isEditorFocused():
+		case m.viewMode == ViewEdit && m.isEditorFocused():
 			m.focusedEditor().SelectAll()
 		case m.focus.Current() == component.FocusInput:
 			m.input.SelectAll()
@@ -1276,7 +1295,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if ks == "ctrl+x" || ks == "ctrl+shift+x" {
 		var text string
 		switch {
-		case m.editMode && m.isEditorFocused():
+		case m.viewMode == ViewEdit && m.isEditorFocused():
 			text = m.focusedEditor().CutSelection()
 		case m.focus.Current() == component.FocusInput && m.input.HasSelection():
 			text = m.input.CutSelection()
@@ -1292,19 +1311,19 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Undo in the editor (Alt+Z, only when editor is focused).
-	if key.String() == "alt+z" && m.editMode && m.isEditorFocused() {
+	if key.String() == "alt+z" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		m.focusedEditor().Undo()
 		return m, nil
 	}
 
 	// Redo in the editor (Alt+Shift+Z, only when editor is focused).
-	if key.String() == "alt+Z" && m.editMode && m.isEditorFocused() {
+	if key.String() == "alt+Z" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		m.focusedEditor().Redo()
 		return m, nil
 	}
 
 	// Alt+R: find references for symbol under cursor (edit mode).
-	if ks == "alt+r" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+r" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		fp := m.focusedEditor().FilePath()
 		if fp != "" {
 			return m, m.lspReferencesCmd(fp, m.focusedEditor().CursorLine(), m.focusedEditor().CursorCol())
@@ -1313,7 +1332,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+Shift+. (alt+>): toggle document symbols for current file (edit mode).
-	if ks == "alt+>" && m.editMode {
+	if ks == "alt+>" && m.viewMode == ViewEdit {
 		if m.fileTree.InDocSymbolsMode() {
 			m.fileTree.ExitDocSymbols()
 			return m, nil
@@ -1331,7 +1350,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.warpPoints[idx] != nil {
 			return m, m.teleportToWarp(idx)
 		}
-		if m.editMode {
+		if m.viewMode == ViewEdit {
 			m.setWarpPoint(idx)
 		}
 		return m, nil
@@ -1346,12 +1365,12 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+T toggles the tabs panel in the file tree (edit mode only).
-	if ks == "alt+t" && m.editMode {
+	if ks == "alt+t" && m.viewMode == ViewEdit {
 		return m, m.toggleTabsPanel()
 	}
 
 	// Alt+Enter: dismiss preview when preview focused, close tab otherwise.
-	if ks == "alt+enter" && m.editMode {
+	if ks == "alt+enter" && m.viewMode == ViewEdit {
 		if m.isPreviewFocused() {
 			m.dismissPreview()
 			return m, nil
@@ -1396,7 +1415,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// When an overlay is active, skip — overlays handle their own Esc.
 	if key.String() == "esc" && m.overlay == overlayNone {
 		// Git panel: close gear dropdown or exit header focus.
-		if m.gitMode && m.gitPanel != nil && m.focus.Current() == component.FocusGitPanel {
+		if m.viewMode == ViewGit && m.gitPanel != nil && m.focus.Current() == component.FocusGitPanel {
 			comp, cmd := m.gitPanel.Update(key)
 			m.gitPanel = comp.(*gitpanel.Model)
 			return m, cmd
@@ -1409,12 +1428,12 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.exitCmdInput()
 			return m, nil
 		}
-		if m.editMode && m.isEditorFocused() {
+		if m.viewMode == ViewEdit && m.isEditorFocused() {
 			comp, cmd := m.focusedEditor().Update(key)
 			m.paneEditors[m.focusedPane].editor = comp.(*editor.Model)
 			return m, cmd
 		}
-		if m.gitMode && m.focus.Current() == component.FocusCommitTree && m.commitTree.InCommitView() {
+		if m.viewMode == ViewGit && m.focus.Current() == component.FocusCommitTree && m.commitTree.InCommitView() {
 			comp, cmd := m.commitTree.Update(key)
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
@@ -1432,14 +1451,14 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Shift+Tab in edit mode: cycle to next tab.
-	if ks == "shift+tab" && m.editMode &&
+	if ks == "shift+tab" && m.viewMode == ViewEdit &&
 		m.isEditorFocused() &&
 		len(m.focusedTabOrder()) > 0 {
 		return m, m.nextTab()
 	}
 
 	// Colon in edit mode normal: activate command input panel.
-	if key.String() == ":" && m.editMode &&
+	if key.String() == ":" && m.viewMode == ViewEdit &&
 		m.isEditorFocused() &&
 		m.focusedEditor().IsNormalMode() {
 		m.enterCmdInput()
@@ -1478,7 +1497,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+F toggles the in-file find bar when the editor has focus.
-	if ks == "alt+f" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+f" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		now := time.Now()
 		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
 			return m, nil
@@ -1491,7 +1510,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+Shift+R toggles the in-file find-and-replace bar when the editor has focus.
-	if ks == "alt+R" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+R" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		now := time.Now()
 		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
 			return m, nil
@@ -1522,7 +1541,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+F toggles search/filter when the git explorer panel has focus.
-	if ks == "alt+f" && m.gitMode && m.focus.Current() == component.FocusGitPanel && m.gitPanel != nil {
+	if ks == "alt+f" && m.viewMode == ViewGit && m.focus.Current() == component.FocusGitPanel && m.gitPanel != nil {
 		now := time.Now()
 		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
 			return m, nil
@@ -1548,7 +1567,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+Shift+F triggers LSP formatting when the editor has focus.
-	if ks == "alt+F" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+F" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		if fp := m.focusedEditor().FilePath(); fp != "" {
 			var flushContent string
 			if m.focusedEditor().LSPDirty() {
@@ -1560,13 +1579,13 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+Shift+S: save the current editor buffer.
-	if ks == "alt+S" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+S" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		m.saveEditorBuffer()
 		return m, nil
 	}
 
 	// Ctrl+Left/Right in edit mode: pagination-aware tab navigation.
-	if m.editMode && len(m.focusedTabOrder()) > 1 {
+	if m.viewMode == ViewEdit && len(m.focusedTabOrder()) > 1 {
 		if ks == "ctrl+left" {
 			return m, m.tabNavLeft()
 		}
@@ -1576,7 +1595,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+Shift+E: toggle between file explorer and last active editor pane.
-	if ks == "alt+E" && m.editMode {
+	if ks == "alt+E" && m.viewMode == ViewEdit {
 		if m.focus.Current() == component.FocusFileTree {
 			m.focusCodePanel()
 		} else {
@@ -1587,19 +1606,19 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+| (alt+shift+\): vertical split on focused editor pane.
-	if ks == "alt+|" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+|" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		m.splitPane(pane.SplitVertical)
 		return m, nil
 	}
 
 	// Alt+_ (alt+shift+-): horizontal split on focused editor pane.
-	if ks == "alt+_" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+_" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		m.splitPane(pane.SplitHorizontal)
 		return m, nil
 	}
 
 	// Alt+Shift+M: toggle markdown preview for the active file.
-	if ks == "alt+M" && m.editMode && m.isEditorFocused() {
+	if ks == "alt+M" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		if m.mdPreviewPane != 0 {
 			m.dismissMarkdownPreview()
 		} else if isMarkdownFile(m.focusedEditor().FilePath()) {
@@ -1609,13 +1628,13 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+Shift+W: close focused pane.
-	if ks == "alt+W" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+	if ks == "alt+W" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
 		m.closePane()
 		return m, nil
 	}
 
 	// Alt+]: grow focused pane (take space from sibling).
-	if ks == "alt+]" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+	if ks == "alt+]" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
 		if m.paneTree.AdjustRatio(m.focusedPane, ratioStep) {
 			m.resizeInlineEditor()
 		}
@@ -1623,7 +1642,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+[: shrink focused pane (give space to sibling).
-	if ks == "alt+[" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+	if ks == "alt+[" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
 		if m.paneTree.AdjustRatio(m.focusedPane, -ratioStep) {
 			m.resizeInlineEditor()
 		}
@@ -1631,7 +1650,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Alt+=: equalize all split ratios.
-	if ks == "alt+=" && m.editMode && m.paneTree != nil && !m.paneTree.IsLeaf() {
+	if ks == "alt+=" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
 		m.paneTree.Equalize()
 		m.resizeInlineEditor()
 		m.statusBar.SetFlash("Splits equalized")
@@ -1645,7 +1664,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Git tab navigation shortcuts (must precede spatial focus so
 	// Alt+Shift+Left/Right reaches tab cycling when the git panel is focused).
-	if m.gitMode && m.gitPanel != nil {
+	if m.viewMode == ViewGit && m.gitPanel != nil {
 		if cmd, handled := m.handleGitTabShortcut(ks); handled {
 			return m, cmd
 		}
@@ -1767,7 +1786,7 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	}
 
 	// Git panel loading bar (time-based, redraws each decor tick).
-	if m.gitMode && m.gitPanel != nil && m.gitPanel.NeedsDecorTick() {
+	if m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick() {
 		m.gitPanel.MarkViewDirty()
 		if m.layout.Mode() == layout.FourColumn {
 			m.comp.MarkDirty(compositor.SlotCenterLeft)
@@ -2565,7 +2584,7 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 	// Track which content the LSP should analyze.
 	lspContent := content
 
-	if m.editMode {
+	if m.viewMode == ViewEdit {
 		oldPath := m.focusedEditor().FilePath()
 
 		// Already on this file in the focused pane — just jump.
@@ -2640,7 +2659,7 @@ func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
 	if o.Line > 0 {
 		targetLine := o.Line - 1
 		m.codePanel.ScrollToLine(targetLine)
-		if m.editMode {
+		if m.viewMode == ViewEdit {
 			if o.CursorCol > 0 {
 				m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
 			} else {
@@ -2680,7 +2699,7 @@ func (m *AppModel) handleCloseEditor() tea.Cmd {
 // handleFileReplaced reloads the editor buffer when a multi-file replace
 // modified the currently open file on disk (only if there are no unsaved changes).
 func (m *AppModel) handleFileReplaced(r msg.FileReplacedMsg) tea.Cmd {
-	if !m.editMode || m.focusedEditor().FilePath() != r.Path {
+	if m.viewMode != ViewEdit || m.focusedEditor().FilePath() != r.Path {
 		return nil
 	}
 	if m.focusedEditor().Modified() {
@@ -2789,7 +2808,7 @@ func (m *AppModel) chordHint(th *theme.Theme) string {
 	return labelStyle.Render(disp.label) + keyStyle.Render("  "+disp.keys+"  any key to exit ")
 }
 
-// blockedChordHint returns a styled hint for a chord blocked by edit mode.
+// blockedChordHint returns a styled hint for a chord blocked by the current mode.
 // Returns "" when no blocked chord is active.
 func (m *AppModel) blockedChordHint(th *theme.Theme) string {
 	if !m.chordBlocked {
@@ -2801,7 +2820,11 @@ func (m *AppModel) blockedChordHint(th *theme.Theme) string {
 	}
 	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	labelStyle := lipgloss.NewStyle().Foreground(disp.color(&th.Palette)).Bold(true)
-	return mutedStyle.Render("Exit edit mode to ") + labelStyle.Render(disp.label) + mutedStyle.Render("  (press any key to dismiss) ")
+	mode := "edit"
+	if m.viewMode == ViewGit {
+		mode = "git"
+	}
+	return mutedStyle.Render("Exit "+mode+" mode to ") + labelStyle.Render(disp.label) + mutedStyle.Render("  (press any key to dismiss) ")
 }
 
 // handleChord processes two-key chord shortcuts: Alt+S then Left/Right for sessions,
@@ -2825,9 +2848,9 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 
 	// Chord triggers: toggle on if idle or switching, toggle off if repeated.
 	if target, ok := chordKeyMap[key.String()]; ok {
-		// Edit mode guard: non-view chords are disabled while editing.
-		// chordView is allowed so the user can cycle to git mode.
-		if m.editMode && target != chordView {
+		// Mode guard: non-view chords are disabled in edit/git mode.
+		// chordView is allowed so the user can cycle between modes.
+		if m.viewMode != ViewChat && target != chordView {
 			m.chord = target
 			m.chordBlocked = true
 			cmd := tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
@@ -2936,18 +2959,18 @@ func (m *AppModel) cycleRing(ring *viewRing, delta int, preFocus component.Focus
 }
 
 // ringTargetMode determines the view mode implied by current ring positions.
-func (m *AppModel) ringTargetMode() string {
+func (m *AppModel) ringTargetMode() ViewMode {
 	if isGitPanel(m.leftRing.current()) || isGitPanel(m.rightRing.current()) {
-		return "GIT"
+		return ViewGit
 	}
 	active := m.leftRing.current()
 	if !m.rightRing.empty() {
 		active = m.rightRing.current()
 	}
 	if active == component.FocusCodeViewer {
-		return "EDIT"
+		return ViewEdit
 	}
-	return "CHAT"
+	return ViewChat
 }
 
 // syncModeForRing detects mode transitions (CHAT / EDIT / GIT) after a
@@ -2955,37 +2978,37 @@ func (m *AppModel) ringTargetMode() string {
 // focus. preFocus is the focus captured before the ring advanced.
 func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 	target := m.ringTargetMode()
-	if target == m.ringMode {
+	if target == m.viewMode {
 		return nil
 	}
-	old := m.ringMode
-	m.ringMode = target
+	old := m.viewMode
+	m.viewMode = target
 
 	// Save outgoing focus.
 	switch old {
-	case "GIT":
+	case ViewGit:
 		m.savedGitFocus = preFocus
-	case "EDIT":
+	case ViewEdit:
 		m.savedEditFocus = preFocus
 	default:
 		m.savedChatFocus = preFocus
 	}
 
 	// Exit old mode.
-	if old == "GIT" {
-		m.gitMode = false
+	if old == ViewGit {
+		m.viewMode = ViewChat
 		m.input.SetPlaceholder("Type a message...")
 	}
 
 	// Enter new mode and restore incoming focus.
 	var cmd tea.Cmd
 	switch target {
-	case "GIT":
-		if m.editMode {
+	case ViewGit:
+		if m.viewMode == ViewEdit {
 			m.preGitEditMode = true
 			m.exitEditMode()
 		}
-		m.gitMode = true
+		m.viewMode = ViewGit
 		m.resizeGitPanels()
 		m.input.SetPlaceholder("git>")
 		if m.savedGitFocus != 0 {
@@ -2995,15 +3018,15 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 			m.gitDataLoaded = true
 			cmd = tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 		}
-	case "EDIT":
-		if old == "GIT" && m.preGitEditMode {
+	case ViewEdit:
+		if old == ViewGit && m.preGitEditMode {
 			m.preGitEditMode = false
 			cmd = m.enterEditMode()
 		} else if m.savedEditFocus != 0 {
 			m.focus.SetFocus(m.savedEditFocus)
 		}
 	default: // CHAT
-		if old == "GIT" && m.preGitEditMode {
+		if old == ViewGit && m.preGitEditMode {
 			m.preGitEditMode = false
 		}
 		if m.savedChatFocus != 0 {
@@ -3011,7 +3034,7 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 		}
 	}
 
-	m.statusBar.SetMode(target)
+	m.statusBar.SetMode(target.String())
 	return cmd
 }
 
@@ -3021,15 +3044,17 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 
 // toggleEditMode switches between inline editing and read-only code viewing.
 func (m *AppModel) toggleEditMode() tea.Cmd {
-	// If git mode is active, exit it first — modes are mutually exclusive.
-	if m.gitMode {
+	switch m.viewMode {
+	case ViewGit:
+		m.preGitEditMode = false
 		m.exitGitMode()
-	}
-	if m.editMode {
+		return m.enterEditMode()
+	case ViewEdit:
 		m.exitEditMode()
 		return nil
+	default:
+		return m.enterEditMode()
 	}
-	return m.enterEditMode()
 }
 
 // enterEditMode activates inline vim editing in the code panel slot.
@@ -3098,8 +3123,8 @@ func (m *AppModel) enterEditMode() tea.Cmd {
 		m.focusedEditor().ClearFile()
 	}
 
-	m.editMode = true
-	m.ringMode = "EDIT"
+	m.viewMode = ViewEdit
+	m.viewMode = ViewEdit
 
 	// Size the editor to match the code panel slot. resizeInlineEditor
 	// handles all states (split preview, full preview, editor-only).
@@ -3145,8 +3170,8 @@ func (m *AppModel) exitEditMode() {
 	m.leftRing.index = m.savedLeftIdx
 	m.rightRing.index = m.savedRightIdx
 
-	m.editMode = false
-	m.ringMode = "CHAT"
+	m.viewMode = ViewChat
+	m.viewMode = ViewChat
 	m.fileTree.SetEditMode(false)
 	m.editCmdInput = false
 	// Preserve chordView — it's allowed across mode transitions.
@@ -3414,9 +3439,8 @@ func (m *AppModel) toggleGitMode() tea.Cmd {
 		m.statusBar.SetFlash("Not a git repository")
 		return nil
 	}
-	if m.gitMode {
-		m.exitGitMode()
-		return nil
+	if m.viewMode == ViewGit {
+		return m.exitGitMode()
 	}
 	return m.enterGitMode()
 }
@@ -3424,8 +3448,8 @@ func (m *AppModel) toggleGitMode() tea.Cmd {
 // enterGitMode activates git mode, displaying the git explorer and commit tree.
 func (m *AppModel) enterGitMode() tea.Cmd {
 	// If edit mode is active, exit it first and remember for restore.
-	m.preGitEditMode = m.editMode
-	if m.editMode {
+	m.preGitEditMode = m.viewMode == ViewEdit
+	if m.viewMode == ViewEdit {
 		m.exitEditMode()
 	}
 
@@ -3434,8 +3458,8 @@ func (m *AppModel) enterGitMode() tea.Cmd {
 	m.savedGitRightIdx = m.rightRing.index
 	m.savedChatFocus = m.focus.Current()
 
-	m.gitMode = true
-	m.ringMode = "GIT"
+	m.viewMode = ViewGit
+	m.viewMode = ViewGit
 
 	// Size git components to their panel slots.
 	m.resizeGitPanels()
@@ -3462,15 +3486,16 @@ func (m *AppModel) enterGitMode() tea.Cmd {
 }
 
 // exitGitMode deactivates git mode and returns to the previous mode.
-func (m *AppModel) exitGitMode() {
+// Returns a Cmd when edit mode is restored (LSP reopen).
+func (m *AppModel) exitGitMode() tea.Cmd {
 	m.savedGitFocus = m.focus.Current()
 
 	// Restore ring state.
 	m.leftRing.index = m.savedGitLeftIdx
 	m.rightRing.index = m.savedGitRightIdx
 
-	m.gitMode = false
-	m.ringMode = "CHAT"
+	m.viewMode = ViewChat
+	m.viewMode = ViewChat
 	m.statusBar.SetMode("CHAT")
 	m.input.SetPlaceholder("Type a message...")
 
@@ -3478,13 +3503,13 @@ func (m *AppModel) exitGitMode() {
 
 	if m.preGitEditMode {
 		m.preGitEditMode = false
-		m.enterEditMode() // enterEditMode sets ringMode = "EDIT"
-		return
+		return m.enterEditMode()
 	}
 
 	m.focus.SetFocus(m.savedChatFocus)
 	m.syncFocusState()
 	m.statusBar.SetFlash("View mode")
+	return nil
 }
 
 // resizeGitPanels sizes the git panel and commit tree to their layout slots.
@@ -3794,7 +3819,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 // Handles read-only viewer, single-pane editor, full preview, and
 // multi-pane compositing (iterative, not recursive).
 func (m *AppModel) codePanelView() string {
-	if !m.editMode {
+	if m.viewMode != ViewEdit {
 		return m.codePanel.View()
 	}
 
@@ -4605,8 +4630,8 @@ func (m *AppModel) overlayMdTooltipOnContent(content string) string {
 }
 
 // overlayBlockedChord prepends the blocked-chord hint bar to content when a
-// chord was triggered in edit mode. Trims content from the bottom so the total
-// line count stays within the panel's inner height.
+// chord was triggered in a non-chat mode. Trims content from the bottom so
+// the total line count stays within the panel's inner height.
 func (m *AppModel) overlayBlockedChord(content string) string {
 	th := m.config.Theme()
 	hint := m.blockedChordHint(th)
@@ -4973,7 +4998,7 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 	}
 
 	// Full preview mode: entire code panel is preview.
-	if m.hasPreview() && m.editMode && len(m.focusedTabOrder()) == 0 {
+	if m.hasPreview() && m.viewMode == ViewEdit && len(m.focusedTabOrder()) == 0 {
 		hit := tabbar.HitTest(m.previewTabBarConfig(), viewX)
 		if hit.IsClose {
 			m.previewTabHoverClose = hit.TabIndex
@@ -5114,7 +5139,7 @@ func (m *AppModel) tabBarConfig() tabbar.Config {
 
 	// In split mode the editor tab bar occupies only the right half.
 	barWidth := innerW
-	if m.hasPreview() && m.editMode && len(m.focusedTabOrder()) > 0 {
+	if m.hasPreview() && m.viewMode == ViewEdit && len(m.focusedTabOrder()) > 0 {
 		dividerWidth := 1
 		previewW := (innerW - dividerWidth) / 2
 		barWidth = innerW - dividerWidth - previewW
@@ -5160,7 +5185,7 @@ func (m *AppModel) tabBarHeight() int {
 // accounting for the current tab bar visibility and preview split.
 // Call after any tab mutation.
 func (m *AppModel) resizeInlineEditor() {
-	if !m.editMode {
+	if m.viewMode != ViewEdit {
 		return
 	}
 	rightW, rightH := m.layout.GetPanelSize(component.FocusCodeViewer)
@@ -5631,7 +5656,7 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 
 	// Route wheel events to the hover popup when it is active and the
 	// cursor is over it, instead of scrolling the underlying panel.
-	if m.editMode && m.focusedEditor().HoverActive() && isWheelEvent(mouse) {
+	if m.viewMode == ViewEdit && m.focusedEditor().HoverActive() && isWheelEvent(mouse) {
 		if m.isInsideCodePanel(mouse.X, mouse.Y) {
 			// Check preview hover popup scroll first.
 			if m.previewPanel.HoverActive() {
@@ -5669,14 +5694,14 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	// Some terminals send MouseButtonLeft for motion after a click-release
 	// instead of MouseButtonNone. Routing hover here ensures it works
 	// regardless of reported button, as long as we're not mid-drag.
-	if m.editMode && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown && m.tabDragIdx < 0 {
+	if m.viewMode == ViewEdit && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown && m.tabDragIdx < 0 {
 		m.updateTabHoverClose(mouse)
 		m.updateFileTreeTabHover(mouse)
 		return m.handleEditorMouseHover(mouse)
 	}
 
 	// Git mode: track divider hover for resize cursor feedback.
-	if m.gitMode && m.gitPanel != nil && mouse.Action == tea.MouseActionMotion && !m.gitPanel.IsDragging() {
+	if m.viewMode == ViewGit && m.gitPanel != nil && mouse.Action == tea.MouseActionMotion && !m.gitPanel.IsDragging() {
 		panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
 		panelX := m.fileTreePanelX()
 		contentLeft := panelX + 1
@@ -5726,14 +5751,14 @@ func isWheelEvent(mouse tea.MouseMsg) bool {
 // inline editor (in edit mode), and chat panels.
 func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 	// Edit mode: handle press, drag, and release in the code panel.
-	if m.editMode {
+	if m.viewMode == ViewEdit {
 		if consumed, cmd := m.handleEditorMouse(mouse); consumed {
 			return cmd
 		}
 	}
 
 	// Git mode: forward motion/release during column drag operations.
-	if m.gitMode && m.gitPanel != nil && m.gitPanel.IsDragging() {
+	if m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.IsDragging() {
 		viewX := mouse.X - m.fileTreePanelX() - 1
 		if mouse.Action == tea.MouseActionMotion {
 			m.gitPanel.HandleMouseMotion(viewX)
@@ -5750,7 +5775,7 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 	}
 
 	// Git mode: route to git panel and commit tree.
-	if m.gitMode {
+	if m.viewMode == ViewGit {
 		if cmd := m.handleGitPanelClick(mouse.X, mouse.Y); cmd != nil {
 			return cmd
 		}
@@ -5790,7 +5815,7 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 
 	// In edit mode, route scrolls within the code panel to the pane
 	// under the cursor using tree-based hit testing.
-	if resolved == component.FocusCodeViewer && m.editMode && m.paneTree != nil {
+	if resolved == component.FocusCodeViewer && m.viewMode == ViewEdit && m.paneTree != nil {
 		// Full markdown preview mode: all scrolls go to the mdPreview.
 		if m.isFullMdPreview() {
 			return pane.PaneFocusID(m.mdPreviewPane), true
@@ -5917,7 +5942,7 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		}
 		return m.chat.ScrollDown()
 	case component.FocusCodeViewer:
-		if m.gitMode && m.commitTree != nil {
+		if m.viewMode == ViewGit && m.commitTree != nil {
 			if direction < 0 {
 				return m.commitTree.ScrollUp()
 			}
@@ -5928,7 +5953,7 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		}
 		return m.codePanel.ScrollDown()
 	case component.FocusFileTree:
-		if m.gitMode && m.gitPanel != nil {
+		if m.viewMode == ViewGit && m.gitPanel != nil {
 			if direction < 0 {
 				return m.gitPanel.ScrollUp()
 			}
@@ -6343,7 +6368,7 @@ func (m *AppModel) anyPaneHasTabs() bool {
 // previewSplitWidth returns the preview half width in split mode.
 // Returns 0 when not in split mode or preview is inactive.
 func (m *AppModel) previewSplitWidth() int {
-	if !m.hasPreview() || !m.editMode || len(m.focusedTabOrder()) == 0 {
+	if !m.hasPreview() || m.viewMode != ViewEdit || len(m.focusedTabOrder()) == 0 {
 		return 0
 	}
 	rightW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
@@ -7087,7 +7112,7 @@ func (m *AppModel) dismissAllHover() {
 // handleMouseHoverTick processes the debounced hover tick. If the mouse
 // is still on the same word, fires parallel LSP hover and definition requests.
 func (m *AppModel) handleMouseHoverTick(tick msg.LSPMouseHoverTickMsg) tea.Cmd {
-	if !m.editMode {
+	if m.viewMode != ViewEdit {
 		return nil
 	}
 
@@ -7130,7 +7155,7 @@ func (m *AppModel) handleMouseHoverTick(tick msg.LSPMouseHoverTickMsg) tea.Cmd {
 // If the cursor is still on the same position and in normal mode, fires
 // the LSP documentHighlight request.
 func (m *AppModel) handleDocHighlightTick(tick msg.LSPDocHighlightTickMsg) tea.Cmd {
-	if !m.editMode {
+	if m.viewMode != ViewEdit {
 		return nil
 	}
 	if m.focusedEditor().CursorLine() != tick.Line || m.focusedEditor().CursorCol() != tick.Col {
@@ -7433,7 +7458,7 @@ func (m *AppModel) recalcLayout() {
 // resizeCodePanelForPreview computes sizes for all panes within the code
 // panel slot using the pane tree's ComputeLayout.
 func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
-	if !m.editMode {
+	if m.viewMode != ViewEdit {
 		return
 	}
 	innerW := max(rightW-panelBorderSize, 1)
@@ -7538,7 +7563,7 @@ func (m *AppModel) syncViewState() {
 	// When edit mode is active, ensure CodeViewer is visible in the
 	// ring that contains it. For the left ring, prefer CodeViewer
 	// (SingleColumn) or fall back to FileTree for navigation.
-	if m.editMode {
+	if m.viewMode == ViewEdit {
 		if !m.rightRing.empty() {
 			m.rightRing.setTo(component.FocusCodeViewer)
 		}
@@ -7620,7 +7645,7 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.FocusID {
 	// Git mode: replace FileTree slot with FocusGitPanel, CodeViewer slot
 	// with FocusCommitTree. Both are always in the tab order.
-	if m.gitMode {
+	if m.viewMode == ViewGit {
 		for i, id := range order {
 			switch id {
 			case component.FocusFileTree:
@@ -7634,7 +7659,7 @@ func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.F
 		}
 		return order
 	}
-	if m.editMode {
+	if m.viewMode == ViewEdit {
 		// Full-preview mode: nothing to tab to in the code column.
 		if m.hasPreview() && len(m.focusedTabOrder()) == 0 {
 			return order
@@ -7789,16 +7814,16 @@ func (m *AppModel) detectDirtySlots() {
 	}
 
 	// Edit mode transitions: code panel changes completely.
-	if m.editMode != m.prevEditMode {
+	if m.viewMode == ViewEdit != m.prevEditMode {
 		m.comp.InvalidateAll()
-		m.prevEditMode = m.editMode
+		m.prevEditMode = m.viewMode == ViewEdit
 		return
 	}
 
 	// Git mode transitions: panels swap completely.
-	if m.gitMode != m.prevGitMode {
+	if (m.viewMode == ViewGit) != (m.prevGitMode == ViewGit) {
 		m.comp.InvalidateAll()
-		m.prevGitMode = m.gitMode
+		m.prevGitMode = m.viewMode
 		return
 	}
 
@@ -7863,14 +7888,14 @@ func (m *AppModel) detectDirtySlots() {
 	}
 
 	// Editor dirty check.
-	if m.editMode {
+	if m.viewMode == ViewEdit {
 		if ps := m.paneEditors[m.focusedPane]; ps != nil && ps.editor.ViewDirty() {
 			m.comp.MarkDirty(compositor.SlotRight)
 		}
 	}
 
 	// Git mode dirty checks.
-	if m.gitMode && m.gitPanel != nil {
+	if m.viewMode == ViewGit && m.gitPanel != nil {
 		if m.gitPanel.ViewDirty() {
 			if m.layout.Mode() == layout.FourColumn {
 				m.comp.MarkDirty(compositor.SlotCenterLeft)
@@ -7892,7 +7917,7 @@ func (m *AppModel) detectDirtySlots() {
 	// Blink phase changed: mark the slot(s) owning the active cursor.
 	if m.blinkDirty {
 		m.blinkDirty = false
-		if m.editMode {
+		if m.viewMode == ViewEdit {
 			m.comp.MarkDirty(compositor.SlotRight)
 		}
 		if m.focus.Current() == component.FocusInput {
@@ -7961,7 +7986,7 @@ func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
 // renderSlotCenterLeft renders the bordered file tree for the center-left slot.
 // In git mode, renders the git explorer panel instead.
 func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
-	if m.gitMode {
+	if m.viewMode == ViewGit {
 		return m.renderGitPanelBordered(th)
 	}
 	return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
@@ -7990,7 +8015,7 @@ func (m *AppModel) renderSlotRight(th *theme.Theme) string {
 			return m.renderPanel(content, right, th)
 		}
 	}
-	if m.gitMode {
+	if m.viewMode == ViewGit {
 		return m.renderGitCommitTreeBordered(th)
 	}
 	return m.renderCodePanelBordered(th)
@@ -8039,12 +8064,12 @@ func (m *AppModel) panelContent(id component.FocusID) string {
 	case component.FocusChat:
 		return m.chat.View()
 	case component.FocusCodeViewer:
-		if m.gitMode {
+		if m.viewMode == ViewGit {
 			return m.commitTree.View(m.cursorVisible)
 		}
 		return m.codePanelView()
 	case component.FocusFileTree:
-		if m.gitMode {
+		if m.viewMode == ViewGit {
 			return m.gitPanel.View(m.cursorVisible)
 		}
 		return m.fileTree.View(m.cursorVisible)
@@ -8183,7 +8208,7 @@ func (m *AppModel) isPreviewFocused() bool {
 // focusCodePanel sets focus to the code panel: in edit mode, the focused
 // pane's dynamic ID; otherwise the static FocusCodeViewer.
 func (m *AppModel) focusCodePanel() {
-	if m.editMode {
+	if m.viewMode == ViewEdit {
 		m.focus.SetFocus(pane.PaneFocusID(m.focusedPane))
 		return
 	}
@@ -8228,7 +8253,7 @@ func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
 // renderGitCommitTreeBordered renders the commit tree panel using the CodeViewer
 // slot dimensions with border highlight based on FocusCommitTree focus state.
 func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
-	content := m.overlayChordHint(m.commitTree.View(m.cursorVisible), component.FocusCodeViewer, th)
+	content := m.overlayBlockedChord(m.overlayChordHint(m.commitTree.View(m.cursorVisible), component.FocusCodeViewer, th))
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
 	border := th.InactiveBorder
 	if m.focus.Current() == component.FocusCommitTree {
@@ -8274,7 +8299,7 @@ func (m *AppModel) syncFocusState() {
 	m.input.SetFocused(current == component.FocusInput)
 	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
-	m.codePanel.SetFocused(current == component.FocusCodeViewer && !m.editMode && !m.hasPreview())
+	m.codePanel.SetFocused(current == component.FocusCodeViewer && m.viewMode != ViewEdit && !m.hasPreview())
 	for id, ps := range m.paneEditors {
 		focused := current == pane.PaneFocusID(id)
 		ps.editor.SetFocused(focused)
@@ -8351,7 +8376,7 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 	// gitResolve translates slot-based focus IDs to git-panel IDs when
 	// git mode is active, so spatial navigation finds the correct panels.
 	gitResolve := func(id component.FocusID) component.FocusID {
-		if !m.gitMode {
+		if m.viewMode != ViewGit {
 			return id
 		}
 		switch id {
@@ -8423,11 +8448,11 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 // codePanelGroup returns the PanelGroup for the code column, with sub-panels
 // derived from the pane tree for spatial navigation.
 func (m *AppModel) codePanelGroup() layout.PanelGroup {
-	if m.editMode && m.paneTree != nil {
+	if m.viewMode == ViewEdit && m.paneTree != nil {
 		return layout.PanelGroup{SubPanels: m.paneTree.ToSubGrid()}
 	}
 	id := component.FocusCodeViewer
-	if m.gitMode {
+	if m.viewMode == ViewGit {
 		id = component.FocusCommitTree
 	}
 	return layout.PanelGroup{SubPanels: [][]component.FocusID{
@@ -8513,7 +8538,7 @@ func (m *AppModel) needsDecorTick() bool {
 		now.Before(m.tabArrowFlashLeftUntil) ||
 		now.Before(m.tabArrowFlashRightUntil) ||
 		(m.commitTree != nil && m.commitTree.NeedsDecorTick()) ||
-		(m.gitMode && m.gitPanel != nil && m.gitPanel.NeedsDecorTick())
+		(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick())
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
@@ -8618,7 +8643,7 @@ func (m *AppModel) ensureDecorTickAfterDispatch() tea.Cmd {
 
 // needsBlink reports whether any component has a cursor that needs blinking.
 func (m *AppModel) needsBlink() bool {
-	if m.editMode {
+	if m.viewMode == ViewEdit {
 		return true
 	}
 	if m.focus.Current() == component.FocusInput {
@@ -8627,10 +8652,10 @@ func (m *AppModel) needsBlink() bool {
 	if m.hasPreview() && m.isPreviewFocused() {
 		return true
 	}
-	if m.gitMode && m.gitPanel.NeedsBlink() {
+	if m.viewMode == ViewGit && m.gitPanel.NeedsBlink() {
 		return true
 	}
-	if m.gitMode && m.commitTree != nil && m.commitTree.NeedsBlink() {
+	if m.viewMode == ViewGit && m.commitTree != nil && m.commitTree.NeedsBlink() {
 		return true
 	}
 	return m.fileTree.NeedsBlink()
@@ -8699,7 +8724,7 @@ func (m *AppModel) ensureBlinkAfterDispatch() tea.Cmd {
 // ensureLSPFlush schedules a one-shot LSP flush timer if the editor has
 // pending changes that haven't been scheduled yet (by editGeneration).
 func (m *AppModel) ensureLSPFlush() tea.Cmd {
-	if !m.editMode || !m.focusedEditor().LSPDirty() {
+	if m.viewMode != ViewEdit || !m.focusedEditor().LSPDirty() {
 		return nil
 	}
 	gen := m.focusedEditor().EditGeneration()
@@ -8715,7 +8740,7 @@ func (m *AppModel) ensureLSPFlush() tea.Cmd {
 // handleLSPFlush fires the debounced LSP didChange notification if the
 // editor is still dirty at the same generation as when the timer was scheduled.
 func (m *AppModel) handleLSPFlush(flush msg.LSPFlushMsg) tea.Cmd {
-	if !m.editMode || !m.focusedEditor().LSPDirty() {
+	if m.viewMode != ViewEdit || !m.focusedEditor().LSPDirty() {
 		return nil
 	}
 	if m.focusedEditor().EditGeneration() != flush.Gen {
