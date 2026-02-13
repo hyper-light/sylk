@@ -1010,3 +1010,89 @@ func applyBounceShift(lines []string, offset, maxLines int, emptyLine string) []
 
 	return result
 }
+
+// ---------------------------------------------------------------------------
+// Toolbar rendering
+// ---------------------------------------------------------------------------
+
+// toolbarButtonDef maps a toolbar button ID to its icon and label.
+type toolbarButtonDef struct {
+	icon   string
+	label  string
+	accent func(theme.Palette) lipgloss.Color
+}
+
+// toolbarDefs maps button IDs to their display properties.
+var toolbarDefs = map[int]toolbarButtonDef{
+	toolbarCreate: {icon: "＋", label: "Create", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarMerge:  {icon: "⇞", label: "Merge", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
+	toolbarBack:   {icon: "←", label: "Back", accent: func(p theme.Palette) lipgloss.Color { return p.Foreground }},
+	toolbarDiff:   {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
+}
+
+// renderToolbarButtons renders a right-aligned toolbar as two rows:
+// a horizontal divider with ┬ separators, and a content row with │
+// separators. The panel border provides the right and bottom edges.
+func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, width int, p theme.Palette) string {
+	if len(buttons) == 0 {
+		empty := strings.Repeat(" ", max(width, 0))
+		return empty + "\n" + empty
+	}
+
+	bSt := lipgloss.NewStyle().Foreground(p.Border)
+
+	// Measure each button's inner content width (pad + icon + space + label + pad).
+	type btnMeasure struct {
+		inner string // styled content (no separators)
+		width int    // visible column width including padding
+	}
+	cells := make([]btnMeasure, len(buttons))
+	totalInner := 0
+	for i, id := range buttons {
+		def := toolbarDefs[id]
+		selected := focused && i == selectedIdx
+		fg := p.Muted
+		if selected {
+			fg = def.accent(p)
+		}
+		text := lipgloss.NewStyle().Foreground(fg).Bold(selected).Render(def.icon + " " + def.label)
+		padded := " " + text + " "
+		cells[i] = btnMeasure{inner: padded, width: lipgloss.Width(padded)}
+		totalInner += cells[i].width
+	}
+
+	// Total button group width: separators + cell widths.
+	// Left separator │ before first button, │ between buttons; right edge = panel border.
+	groupWidth := len(buttons) + totalInner // len(buttons) │ chars + cell widths
+	leftPad := max(width-groupWidth, 0)
+
+	// Row 1: top border spanning only the button group width.
+	var div strings.Builder
+	for i, c := range cells {
+		if i == 0 {
+			div.WriteString("╭")
+		} else {
+			div.WriteString("┬")
+		}
+		div.WriteString(strings.Repeat("─", c.width))
+	}
+	row1 := strings.Repeat(" ", leftPad) + bSt.Render(div.String())
+	row1Vis := lipgloss.Width(row1)
+	if row1Vis < width {
+		row1 += strings.Repeat(" ", width-row1Vis)
+	}
+
+	// Row 2: button content with │ separators.
+	var content strings.Builder
+	content.WriteString(strings.Repeat(" ", leftPad))
+	for _, c := range cells {
+		content.WriteString(bSt.Render("│"))
+		content.WriteString(c.inner)
+	}
+	row2 := content.String()
+	if vis := lipgloss.Width(row2); vis < width {
+		row2 += strings.Repeat(" ", width-vis)
+	}
+
+	return row1 + "\n" + row2
+}

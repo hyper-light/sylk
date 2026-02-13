@@ -19,6 +19,11 @@ const commitFlashDuration = 3 * time.Second
 // Derived from: 5 spinner frames × 80ms = 400ms ≈ half a braille cycle.
 const minLoadingBarDuration = 400 * time.Millisecond
 
+// toolbarHeight is the number of terminal rows reserved for the bottom toolbar.
+// Derived from: top border(1) + content(1) = 2.
+// The panel border provides the right and bottom edges.
+const toolbarHeight = 2
+
 // Compile-time interface assertions.
 var (
 	_ component.Focusable = (*Model)(nil)
@@ -102,6 +107,31 @@ type CommitDoneMsg struct {
 type commitDismissMsg struct{}
 
 // ---------------------------------------------------------------------------
+// Toolbar buttons
+// ---------------------------------------------------------------------------
+
+// toolbarButton identifies a toolbar button in the bottom bar.
+const (
+	toolbarCreate = iota // Branch view: create a new branch.
+	toolbarMerge         // Branch view: merge selected branch.
+	toolbarBack          // Commit view: return to branch tree.
+	toolbarDiff          // Commit view: show diff for selected commit.
+)
+
+// CreateBranchMsg is emitted when the user activates the Create toolbar button.
+type CreateBranchMsg struct{}
+
+// MergeBranchMsg is emitted when the user activates the Merge toolbar button.
+type MergeBranchMsg struct {
+	Name string
+}
+
+// DiffRequestMsg is emitted when the user activates the Diff toolbar button.
+type DiffRequestMsg struct {
+	Hash string
+}
+
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
@@ -167,6 +197,10 @@ type Model struct {
 
 	// Per-node rendering cache indexed by commit node index.
 	nodeCache []nodeCacheEntry
+
+	// Toolbar state.
+	toolbarFocused bool // True when tab-focus is on the toolbar, not card actions.
+	toolbarAction  int  // Selected toolbar button index.
 }
 
 // New creates a Model with the given theme.
@@ -563,6 +597,10 @@ func (m *Model) clickCommitView(viewY int) tea.Cmd {
 	if len(m.nodes) == 0 {
 		return nil
 	}
+	viewY -= m.viewTopPad()
+	if viewY < 0 {
+		return nil
+	}
 	idx := m.scrollOff + viewY/nodeHeight
 	if idx < 0 || idx >= len(m.nodes) {
 		return nil
@@ -628,6 +666,10 @@ func (m *Model) branchCardHeight(flatIdx int) int {
 // Clicking an action badge on an expanded card executes that action.
 func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 	if len(m.branches) == 0 {
+		return nil
+	}
+	viewY -= m.viewTopPad()
+	if viewY < 0 {
 		return nil
 	}
 
@@ -805,14 +847,21 @@ func (m *Model) clickActionBadge(screenX, cardLeft, cardWidth int) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 func (m *Model) View(cursorVisible bool) string {
+	var content string
 	switch m.mode {
 	case viewLoading:
-		return m.viewLoadingSpinner()
+		content = m.viewLoadingSpinner()
 	case viewCommits:
-		return m.viewCommitCards()
+		content = m.viewCommitCards()
 	default:
-		return m.viewBranchTree(cursorVisible)
+		content = m.viewBranchTree(cursorVisible)
 	}
+	return content + "\n" + m.toolbarView()
+}
+
+// toolbarView renders the bottom toolbar bar with mode-aware buttons.
+func (m *Model) toolbarView() string {
+	return renderToolbarButtons(m.toolbarButtons(), m.toolbarAction, m.toolbarFocused, m.width, m.theme.Palette)
 }
 
 // viewBranchTree renders the branch tree view with side-by-side offshoot cards.
@@ -941,9 +990,10 @@ func (m *Model) viewLoadingSpinner() string {
 	msg := spinSt.Render(frame) + " " + textSt.Render("Loading commits...")
 	msgWidth := lipgloss.Width(msg)
 
-	lines := make([]string, m.height)
+	ch := m.contentHeight()
+	lines := make([]string, ch)
 	emptyLine := strings.Repeat(" ", max(m.width, 0))
-	midRow := m.height / 2
+	midRow := ch / 2
 	leftPad := max((m.width-msgWidth)/2, 0)
 	rightPad := max(m.width-leftPad-msgWidth, 0)
 	centeredLine := strings.Repeat(" ", leftPad) + msg + strings.Repeat(" ", rightPad)
@@ -1000,23 +1050,24 @@ func (m *Model) viewCommitCards() string {
 // applies bounce offset. When a page load is in flight, overlays a
 // loading bar on the last line (no layout shift).
 func (m *Model) padViewport(lines []string) string {
+	ch := m.contentHeight()
 	emptyLine := strings.Repeat(" ", max(m.width, 0))
-	if len(lines) < m.height {
-		topPad := (m.height - len(lines)) / 2
-		centered := make([]string, m.height)
+	if len(lines) < ch {
+		topPad := (ch - len(lines)) / 2
+		centered := make([]string, ch)
 		for i := range centered {
 			centered[i] = emptyLine
 		}
 		copy(centered[topPad:], lines)
 		lines = centered
 	}
-	if len(lines) > m.height {
-		lines = lines[:m.height]
+	if len(lines) > ch {
+		lines = lines[:ch]
 	}
 	if m.showLoadingBar() && len(lines) > 0 {
 		lines[len(lines)-1] = m.renderLoadingBar()
 	}
-	lines = applyBounceShift(lines, m.bounceOffset, m.height, emptyLine)
+	lines = applyBounceShift(lines, m.bounceOffset, ch, emptyLine)
 	return strings.Join(lines, "\n")
 }
 
@@ -1041,6 +1092,7 @@ func (m *Model) handleKey(km tea.KeyMsg) tea.Cmd {
 // handleBranchKey processes keys in branch tree view.
 // Navigation is grid-based: j/k move between rows, h/l move within a row.
 // When a card is expanded, h/l move between actions, enter executes.
+// Tab cycles through toolbar buttons; enter executes when toolbar is focused.
 func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 	if len(m.branches) == 0 {
 		return nil
@@ -1049,6 +1101,11 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 	// Expanded card: route to action handler.
 	if m.expandedIdx >= 0 {
 		return m.handleExpandedKey(km)
+	}
+
+	// Toolbar-focused: handle toolbar keys before navigation.
+	if m.toolbarFocused {
+		return m.handleBranchToolbarKey(km)
 	}
 
 	switch km.String() {
@@ -1072,6 +1129,11 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 		for range m.halfBranchPage() {
 			m.moveBranchUp()
 		}
+	case "tab":
+		m.toolbarFocused = true
+		m.toolbarAction = 0
+		m.viewDirty = true
+		return nil
 	case "shift+tab":
 		m.expandBranch()
 	case "enter":
@@ -1081,6 +1143,42 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 	}
 
 	m.ensureBranchVisible()
+	m.viewDirty = true
+	return nil
+}
+
+// handleBranchToolbarKey processes keys when the toolbar is focused in
+// branch view (no expanded card). Navigation keys exit toolbar focus.
+func (m *Model) handleBranchToolbarKey(km tea.KeyMsg) tea.Cmd {
+	buttons := m.toolbarButtons()
+
+	switch km.String() {
+	case "tab":
+		next := m.toolbarAction + 1
+		if next >= len(buttons) {
+			m.toolbarFocused = false
+		} else {
+			m.toolbarAction = next
+		}
+	case "shift+tab":
+		if m.toolbarAction > 0 {
+			m.toolbarAction--
+		} else {
+			m.toolbarFocused = false
+		}
+	case "h", "left":
+		m.toolbarAction = max(m.toolbarAction-1, 0)
+	case "l", "right":
+		m.toolbarAction = min(m.toolbarAction+1, len(buttons)-1)
+	case "enter", " ":
+		m.viewDirty = true
+		return m.executeToolbarAction()
+	case "esc", "q":
+		m.toolbarFocused = false
+	default:
+		m.toolbarFocused = false
+		return m.handleBranchKey(km)
+	}
 	m.viewDirty = true
 	return nil
 }
@@ -1148,15 +1246,18 @@ func (m *Model) prevAction(from int) int {
 }
 
 // handleExpandedKey processes keys when a branch card is expanded.
-// Tab cycles between action badges; space/enter triggers the focused action;
-// shift+tab or esc collapses the card. When the commit input is active,
-// keys route to the inline text input.
+// Tab cycles between card action badges and toolbar buttons;
+// space/enter triggers the focused action; shift+tab or esc collapses the
+// card. When the commit input is active, keys route to the inline text input.
 func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
 	if m.deleteConfirmActive {
 		return m.handleDeleteConfirmKey(km)
 	}
 	if m.commitInputActive {
 		return m.handleCommitInputKey(km)
+	}
+	if m.toolbarFocused {
+		return m.handleExpandedToolbarKey(km)
 	}
 
 	actionMax := len(m.expandedVisibleActions())
@@ -1172,9 +1273,11 @@ func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
 	case "tab":
 		next := m.expandedAction + 1
 		if next >= actionMax {
-			next = 0
+			m.toolbarFocused = true
+			m.toolbarAction = 0
+		} else {
+			m.expandedAction = next
 		}
-		m.expandedAction = next
 	case "shift+tab":
 		m.collapseBranch()
 	case "enter":
@@ -1182,6 +1285,44 @@ func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
 	case " ":
 		return m.toggleExpandedSubview()
 	case "esc", "q":
+		m.collapseBranch()
+	case "j", "down":
+		m.collapseBranch()
+		m.moveBranchDown()
+		m.ensureBranchVisible()
+	case "k", "up":
+		m.collapseBranch()
+		m.moveBranchUp()
+		m.ensureBranchVisible()
+	default:
+		return nil
+	}
+	m.viewDirty = true
+	return nil
+}
+
+// handleExpandedToolbarKey processes keys when toolbar is focused within
+// an expanded branch card. Tab wraps back to card actions.
+func (m *Model) handleExpandedToolbarKey(km tea.KeyMsg) tea.Cmd {
+	buttons := m.toolbarButtons()
+
+	switch km.String() {
+	case "tab":
+		next := m.toolbarAction + 1
+		if next >= len(buttons) {
+			m.toolbarFocused = false
+			m.expandedAction = 0
+		} else {
+			m.toolbarAction = next
+		}
+	case "h", "left":
+		m.toolbarAction = max(m.toolbarAction-1, 0)
+	case "l", "right":
+		m.toolbarAction = min(m.toolbarAction+1, len(buttons)-1)
+	case "enter", " ":
+		m.viewDirty = true
+		return m.executeToolbarAction()
+	case "shift+tab", "esc", "q":
 		m.collapseBranch()
 	case "j", "down":
 		m.collapseBranch()
@@ -1406,6 +1547,7 @@ func (m *Model) expandBranch() {
 func (m *Model) collapseBranch() {
 	m.expandedIdx = -1
 	m.expandedAction = 0
+	m.toolbarFocused = false
 	m.deleteConfirmActive = false
 	m.deleteConfirmYes = false
 	m.clearCommitInput()
@@ -1453,6 +1595,31 @@ func (m *Model) executeExpandedAction() tea.Cmd {
 	switch actionID {
 	case branchActionSwitch:
 		return func() tea.Msg { return BranchSwitchMsg{Name: name} }
+	}
+	return nil
+}
+
+// executeToolbarAction emits the message for the currently selected toolbar button.
+func (m *Model) executeToolbarAction() tea.Cmd {
+	buttons := m.toolbarButtons()
+	if m.toolbarAction < 0 || m.toolbarAction >= len(buttons) {
+		return nil
+	}
+	switch buttons[m.toolbarAction] {
+	case toolbarCreate:
+		return func() tea.Msg { return CreateBranchMsg{} }
+	case toolbarMerge:
+		if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
+			name := m.branches[m.branchIdx].Name
+			return func() tea.Msg { return MergeBranchMsg{Name: name} }
+		}
+	case toolbarBack:
+		m.exitToBranches()
+		return nil
+	case toolbarDiff:
+		if hash := m.SelectedHash(); hash != "" {
+			return func() tea.Msg { return DiffRequestMsg{Hash: hash} }
+		}
 	}
 	return nil
 }
@@ -1518,6 +1685,7 @@ func (m *Model) moveBranchLeft() {
 }
 
 // handleCommitKey processes keys in commit cards view.
+// Tab/shift+tab cycle through toolbar buttons; enter executes when focused.
 func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 	if km.String() == "esc" {
 		m.exitToBranches()
@@ -1528,6 +1696,23 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
+	switch km.String() {
+	case "tab":
+		m.cycleCommitToolbar(1)
+		m.viewDirty = true
+		return nil
+	case "shift+tab":
+		m.cycleCommitToolbar(-1)
+		m.viewDirty = true
+		return nil
+	case "enter":
+		if m.toolbarFocused {
+			m.viewDirty = true
+			return m.executeToolbarAction()
+		}
+	}
+
+	m.toolbarFocused = false
 	prev := m.selectedIdx
 
 	switch km.String() {
@@ -1564,6 +1749,30 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// cycleCommitToolbar advances toolbar focus by delta (+1 or -1).
+// Exits toolbar focus when tabbing past the last or before the first button.
+func (m *Model) cycleCommitToolbar(delta int) {
+	buttons := m.toolbarButtons()
+	if len(buttons) == 0 {
+		return
+	}
+	if !m.toolbarFocused {
+		m.toolbarFocused = true
+		if delta > 0 {
+			m.toolbarAction = 0
+		} else {
+			m.toolbarAction = len(buttons) - 1
+		}
+		return
+	}
+	next := m.toolbarAction + delta
+	if next >= len(buttons) || next < 0 {
+		m.toolbarFocused = false
+		return
+	}
+	m.toolbarAction = next
+}
+
 // enterBranch transitions to the loading view and emits BranchSelectedMsg
 // so the app can start fetching commits + stats.
 func (m *Model) enterBranch() tea.Cmd {
@@ -1576,6 +1785,7 @@ func (m *Model) enterBranch() tea.Cmd {
 	m.hasMore = false
 	m.loadingMore = false
 	m.lastHash = ""
+	m.toolbarFocused = false
 	m.mode = viewLoading
 	m.viewDirty = true
 	name := branch.Name
@@ -1595,6 +1805,7 @@ func (m *Model) exitToBranches() {
 	m.graphRows = nil
 	m.maxGraphLane = 0
 	m.dagMode = false
+	m.toolbarFocused = false
 	m.viewDirty = true
 }
 
@@ -1612,7 +1823,7 @@ func (m *Model) moveUp(n int) {
 
 func (m *Model) halfPage() int {
 	h := m.activeNodeHeight()
-	return max(m.height/h/2, 1)
+	return max(m.contentHeight()/h/2, 1)
 }
 
 // activeNodeHeight returns the row height per entry for the commit view.
@@ -1663,9 +1874,49 @@ func (m *Model) showLoadingBar() bool {
 	return m.loadingMore || time.Now().Before(m.loadingBarUntil)
 }
 
+// contentHeight returns the viewport height available for cards/branches,
+// excluding the toolbar row.
+func (m *Model) contentHeight() int {
+	return max(m.height-toolbarHeight, 0)
+}
+
+// viewTopPad returns the vertical centering offset applied by padViewport.
+// Click handlers must subtract this from viewY to map screen coordinates
+// to content coordinates.
+func (m *Model) viewTopPad() int {
+	ch := m.contentHeight()
+	var cl int
+	switch m.mode {
+	case viewCommits:
+		cl = len(m.commitVisibleRange()) * nodeHeight
+	default:
+		totalRows := m.totalBranchRows()
+		endRow := min(m.branchScrollOff+m.visibleBranchRows(), totalRows)
+		for rowIdx := m.branchScrollOff; rowIdx < endRow; rowIdx++ {
+			cl += m.branchRowLines(rowIdx)
+		}
+	}
+	if cl >= ch {
+		return 0
+	}
+	return (ch - cl) / 2
+}
+
+// toolbarButtons returns the toolbar button IDs for the current view mode.
+func (m *Model) toolbarButtons() []int {
+	switch m.mode {
+	case viewBranches:
+		return []int{toolbarCreate, toolbarMerge}
+	case viewCommits:
+		return []int{toolbarBack, toolbarDiff}
+	default:
+		return nil
+	}
+}
+
 func (m *Model) visibleNodeCount() int {
 	h := m.activeNodeHeight()
-	return max(m.height/h, 1)
+	return max(m.contentHeight()/h, 1)
 }
 
 func (m *Model) commitVisibleRange() []int {
@@ -1728,7 +1979,7 @@ func (m *Model) totalBranchRows() int {
 
 // visibleBranchRows returns how many branch rows fit in the viewport.
 func (m *Model) visibleBranchRows() int {
-	return max(m.height/branchRowHeight, 1)
+	return max(m.contentHeight()/branchRowHeight, 1)
 }
 
 // halfBranchPage returns the number of rows for a half-page scroll.
@@ -1780,14 +2031,15 @@ func (m *Model) activeMaxScroll() int {
 // ---------------------------------------------------------------------------
 
 func (m *Model) renderPlaceholder(msg string) string {
-	lines := make([]string, m.height)
+	ch := m.contentHeight()
+	lines := make([]string, ch)
 	emptyLine := strings.Repeat(" ", max(m.width, 0))
 
 	msgStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	text := msgStyle.Render(msg)
 	textWidth := lipgloss.Width(text)
 
-	midRow := m.height / 2
+	midRow := ch / 2
 	leftPad := max((m.width-textWidth)/2, 0)
 	rightPad := max(m.width-leftPad-textWidth, 0)
 	centeredLine := strings.Repeat(" ", leftPad) + text + strings.Repeat(" ", rightPad)

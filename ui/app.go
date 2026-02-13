@@ -3459,7 +3459,6 @@ func (m *AppModel) enterGitMode() tea.Cmd {
 	m.savedChatFocus = m.focus.Current()
 
 	m.viewMode = ViewGit
-	m.viewMode = ViewGit
 
 	// Size git components to their panel slots.
 	m.resizeGitPanels()
@@ -3467,15 +3466,9 @@ func (m *AppModel) enterGitMode() tea.Cmd {
 	m.statusBar.SetMode("GIT")
 	m.input.SetPlaceholder("git>")
 
-	// Rebuild rings (syncViewState substitutes git panel IDs in the rings),
-	// then position them so the git panel is active.
+	// Rebuild rings — syncViewState positions git panels in the rings
+	// and builds the ring hint with correct panel labels.
 	m.syncViewState()
-	if !m.leftRing.empty() {
-		m.leftRing.setTo(component.FocusGitPanel)
-	}
-	if !m.rightRing.empty() {
-		m.rightRing.setTo(component.FocusCommitTree)
-	}
 	m.focus.SetFocus(component.FocusGitPanel)
 	m.syncFocusState()
 	m.statusBar.SetFlash("Git mode")
@@ -3494,7 +3487,6 @@ func (m *AppModel) exitGitMode() tea.Cmd {
 	m.leftRing.index = m.savedGitLeftIdx
 	m.rightRing.index = m.savedGitRightIdx
 
-	m.viewMode = ViewChat
 	m.viewMode = ViewChat
 	m.statusBar.SetMode("CHAT")
 	m.input.SetPlaceholder("Type a message...")
@@ -4638,21 +4630,24 @@ func (m *AppModel) overlayBlockedChord(content string) string {
 	if hint == "" {
 		return content
 	}
-	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	w, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
 	innerW := max(w-panelBorderSize, 1)
-	innerH := max(h-panelBorderSize, 1)
 	hintWidth := lipgloss.Width(hint)
 	pad := max(innerW-hintWidth, 0)
 	divider := lipgloss.NewStyle().
 		Foreground(th.Palette.Border).
 		Render(strings.Repeat("\u2500", innerW))
 
+	// Replace the first two lines instead of prepending (no layout shift).
 	lines := strings.Split(content, "\n")
-	maxContent := max(innerH-chordHintLines, 0)
-	if len(lines) > maxContent {
-		lines = lines[:maxContent]
+	hintLine := strings.Repeat(" ", pad) + hint
+	if len(lines) >= chordHintLines {
+		lines[0] = hintLine
+		lines[1] = divider
+	} else {
+		lines = append([]string{hintLine, divider}, lines...)
 	}
-	return strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + strings.Join(lines, "\n")
+	return strings.Join(lines, "\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -7574,6 +7569,17 @@ func (m *AppModel) syncViewState() {
 		}
 	}
 
+	// When git mode is active, position rings on git panels so the
+	// ring hint shows "Git" and "Tree" instead of chat-mode panels.
+	if m.viewMode == ViewGit {
+		if !m.leftRing.empty() {
+			m.leftRing.setTo(component.FocusGitPanel)
+		}
+		if !m.rightRing.empty() {
+			m.rightRing.setTo(component.FocusCommitTree)
+		}
+	}
+
 	// First-collapse flash: show once when panels first collapse.
 	nowActive := !m.leftRing.empty() || !m.rightRing.empty()
 	if wasEmpty && nowActive && !m.collapseHintShown {
@@ -8094,24 +8100,25 @@ func (m *AppModel) overlayChordHint(content string, panelID component.FocusID, t
 	if hint == "" {
 		return content
 	}
-	w, h := m.layout.GetPanelSize(panelID)
+	w, _ := m.layout.GetPanelSize(panelID)
 	innerW := max(w-panelBorderSize, 1)
-	innerH := max(h-panelBorderSize, 1)
 	hintWidth := lipgloss.Width(hint)
 	pad := max(innerW-hintWidth, 0)
 	divider := lipgloss.NewStyle().
 		Foreground(th.Palette.Border).
 		Render(strings.Repeat("\u2500", innerW))
 
-	// Trim content from the bottom to make room for the hint + divider,
-	// keeping total output within innerH lines.
+	// Replace the first two lines of content with hint + divider
+	// so the remaining content stays in place (no layout shift).
 	lines := strings.Split(content, "\n")
-	maxContent := max(innerH-chordHintLines, 0)
-	if len(lines) > maxContent {
-		lines = lines[:maxContent]
+	hintLine := strings.Repeat(" ", pad) + hint
+	if len(lines) >= chordHintLines {
+		lines[0] = hintLine
+		lines[1] = divider
+	} else {
+		lines = append([]string{hintLine, divider}, lines...)
 	}
-
-	return strings.Repeat(" ", pad) + hint + "\n" + divider + "\n" + strings.Join(lines, "\n")
+	return strings.Join(lines, "\n")
 }
 
 // isLeftPanelFocused returns true when either sub-section of the left panel has focus.
