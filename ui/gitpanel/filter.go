@@ -65,11 +65,14 @@ type headerState struct {
 	// Hover state: visible column index of the divider under the mouse,
 	// or -1 when not hovering a divider.
 	hoverDivider int
+	// Hover state: visible column index under the mouse, or -1 when not
+	// hovering any column header.
+	hoverColumn int
 }
 
 // newHeaderState returns a properly initialized headerState.
 func newHeaderState() headerState {
-	return headerState{dragFrom: -1, hoverDivider: -1}
+	return headerState{dragFrom: -1, hoverDivider: -1, hoverColumn: -1}
 }
 
 // listState holds the shared scrollable-list + filter state used by all four

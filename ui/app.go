@@ -3122,6 +3122,12 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 		}
 
 		const commitLimit = 1000
+		branchNames := make([]string, len(branches))
+		for i, b := range branches {
+			branchNames[i] = b.Name
+		}
+		commitCounts := gc.CountBranchOnlyCommitsBatch(branchNames, defaultBranch, commitLimit)
+
 		nodes := make([]committree.BranchNode, len(branches))
 		for i, b := range branches {
 			nodes[i] = committree.BranchNode{
@@ -3132,10 +3138,9 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 				AuthorTime: b.AuthorTime,
 				IsHead:     b.IsHead,
 			}
-			count, capped, cErr := gc.CountBranchCommits(b.Name, commitLimit)
-			if cErr == nil {
-				nodes[i].CommitCount = count
-				nodes[i].CommitCountCapped = capped
+			if bc, ok := commitCounts[b.Name]; ok {
+				nodes[i].CommitCount = bc.Count
+				nodes[i].CommitCountCapped = bc.Capped
 			}
 		}
 
@@ -6010,6 +6015,7 @@ func (m *AppModel) handleGitPanelClick(x, y int) tea.Cmd {
 	m.focus.SetFocus(component.FocusGitPanel)
 	m.syncFocusState()
 	cmd := m.gitPanel.ClickAt(viewX, viewY)
+	m.syncStagedFiles()
 	return cmd
 }
 

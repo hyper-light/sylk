@@ -1106,21 +1106,31 @@ func (m *Model) clickHeader(viewX int) tea.Cmd {
 	return nil
 }
 
-// ClearHover resets the divider hover state when the mouse leaves the panel.
+// ClearHover resets the hover state when the mouse leaves the panel.
 func (m *Model) ClearHover() {
 	ls := m.activeListState()
+	dirty := false
 	if ls.header.hoverDivider != -1 {
 		ls.header.hoverDivider = -1
+		dirty = true
+	}
+	if ls.header.hoverColumn != -1 {
+		ls.header.hoverColumn = -1
+		dirty = true
+	}
+	if dirty {
 		m.viewDirty = true
 	}
 }
 
-// HandleMouseHover updates divider hover state from a mouse motion event.
-// viewX and viewY are content-relative coordinates within the panel.
+// HandleMouseHover updates divider and column hover state from a mouse motion
+// event. viewX and viewY are content-relative coordinates within the panel.
 func (m *Model) HandleMouseHover(viewX, viewY int) {
 	ls := m.activeListState()
-	old := ls.header.hoverDivider
+	oldDiv := ls.header.hoverDivider
+	oldCol := ls.header.hoverColumn
 	ls.header.hoverDivider = -1
+	ls.header.hoverColumn = -1
 
 	// Header row is at chromeTopHeight-2; the dashed divider below it at
 	// chromeTopHeight-1 also counts so hover feedback matches click targets.
@@ -1128,10 +1138,12 @@ func (m *Model) HandleMouseHover(viewX, viewY int) {
 		col := clickHeaderColumn(ls, viewX, m.width)
 		if col <= -3 {
 			ls.header.hoverDivider = -(col + 3)
+		} else if col >= 0 {
+			ls.header.hoverColumn = col
 		}
 	}
 
-	if ls.header.hoverDivider != old {
+	if ls.header.hoverDivider != oldDiv || ls.header.hoverColumn != oldCol {
 		m.viewDirty = true
 	}
 }

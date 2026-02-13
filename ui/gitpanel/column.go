@@ -910,6 +910,13 @@ func branchColumnDefs() []*ColumnDef {
 			Measure:  func(e listEntry) int { return len(relativeTime(e.SortTime())) },
 		},
 		{
+			ID: "commits", Label: "Commits", Strategy: WidthMaxContent,
+			Hideable: true, DefaultHidden: true,
+			SortAsc:  sortIntAsc(branchCommits),
+			SortDesc: sortIntDesc(branchCommits),
+			Measure:  func(e listEntry) int { return branchCommitWidth(e) },
+		},
+		{
 			ID: "changed", Label: "Changed", Strategy: WidthMaxContent,
 			Hideable: true, DefaultHidden: true,
 			SortAsc:  sortIntAsc(branchChanged),
@@ -1001,6 +1008,27 @@ func branchBadgeWidth(e listEntry) int {
 		return len("[dirty]") + 1
 	}
 	return 1
+}
+
+// branchCommits extracts the commit count from a branchEntry, or 0.
+func branchCommits(e listEntry) int {
+	if be, ok := e.(branchEntry); ok {
+		return be.commitCount
+	}
+	return 0
+}
+
+// branchCommitWidth returns the display width of the commit count cell.
+func branchCommitWidth(e listEntry) int {
+	be, ok := e.(branchEntry)
+	if !ok {
+		return 1
+	}
+	w := intWidth(be.commitCount)
+	if be.commitCountCapped {
+		w++ // "+" suffix
+	}
+	return w
 }
 
 // branchSubject extracts the subject from a branchEntry, or empty string.

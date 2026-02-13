@@ -776,6 +776,166 @@ func (c *GitClient) DeleteBranch(name string) error {
 // Commit Count
 // =============================================================================
 
+// CountBranchOnlyCommits returns the number of commits reachable from a
+// branch tip that are NOT reachable from the base branch tip (equivalent to
+// `git rev-list branch ^base --count`). This correctly handles merges of
+// the base into the branch and vice versa.
+// When branchName equals baseBranch (or baseBranch is empty), the full
+// reachable history is counted.
+// If the count reaches limit, iteration stops early and capped is true.
+// Limit <= 0 means unlimited.
+func (c *GitClient) CountBranchOnlyCommits(branchName, baseBranch string, limit int) (count int, capped bool, err error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return 0, false, ErrNotGitRepo
+	}
+
+	branchRef, err := c.repo.Reference(plumbing.NewBranchReferenceName(branchName), true)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if baseBranch == "" || branchName == baseBranch {
+		return c.countAllFrom(branchRef.Hash(), limit)
+	}
+
+	baseRef, err := c.repo.Reference(plumbing.NewBranchReferenceName(baseBranch), true)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if branchRef.Hash() == baseRef.Hash() {
+		return 0, false, nil
+	}
+
+	baseSet := c.reachableSet(baseRef.Hash())
+	cnt, cap := c.countExcluding(branchRef.Hash(), baseSet, limit)
+	return cnt, cap, nil
+}
+
+// reachableSet returns the set of all commit hashes reachable from the
+// given starting hash (following all parents, not just first-parent).
+func (c *GitClient) reachableSet(from plumbing.Hash) map[plumbing.Hash]struct{} {
+	iter, err := c.repo.Log(&gogit.LogOptions{From: from})
+	if err != nil {
+		return nil
+	}
+	defer iter.Close()
+
+	set := make(map[plumbing.Hash]struct{}, 256)
+	_ = iter.ForEach(func(co *object.Commit) error {
+		set[co.Hash] = struct{}{}
+		return nil
+	})
+	return set
+}
+
+// BranchOnlyCount holds the result of a per-branch unique commit count.
+type BranchOnlyCount struct {
+	Count  int
+	Capped bool
+}
+
+// CountBranchOnlyCommitsBatch counts unique commits for multiple branches
+// against the same base branch, building the base reachable set only once.
+// This is O(base_history + sum(branch_deltas)) instead of
+// O(branches * base_history) when calling CountBranchOnlyCommits per branch.
+func (c *GitClient) CountBranchOnlyCommitsBatch(branchNames []string, baseBranch string, limit int) map[string]BranchOnlyCount {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return nil
+	}
+
+	result := make(map[string]BranchOnlyCount, len(branchNames))
+
+	// Build the base reachable set once.
+	var baseSet map[plumbing.Hash]struct{}
+	var baseHash plumbing.Hash
+	if baseBranch != "" {
+		baseRef, err := c.repo.Reference(plumbing.NewBranchReferenceName(baseBranch), true)
+		if err != nil {
+			return result
+		}
+		baseHash = baseRef.Hash()
+		baseSet = c.reachableSet(baseHash)
+	}
+
+	for _, name := range branchNames {
+		ref, err := c.repo.Reference(plumbing.NewBranchReferenceName(name), true)
+		if err != nil {
+			continue
+		}
+		if baseBranch == "" || name == baseBranch {
+			cnt, cap, cErr := c.countAllFrom(ref.Hash(), limit)
+			if cErr == nil {
+				result[name] = BranchOnlyCount{Count: cnt, Capped: cap}
+			}
+			continue
+		}
+		if ref.Hash() == baseHash {
+			result[name] = BranchOnlyCount{}
+			continue
+		}
+		cnt, cap := c.countExcluding(ref.Hash(), baseSet, limit)
+		result[name] = BranchOnlyCount{Count: cnt, Capped: cap}
+	}
+	return result
+}
+
+// countExcluding counts commits reachable from start that are not in excludeSet.
+// Caller must hold at least an RLock on c.mu.
+func (c *GitClient) countExcluding(start plumbing.Hash, excludeSet map[plumbing.Hash]struct{}, limit int) (int, bool) {
+	seen := make(map[plumbing.Hash]struct{}, 64)
+	queue := []plumbing.Hash{start}
+	count := 0
+	for len(queue) > 0 {
+		hash := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[hash]; ok {
+			continue
+		}
+		seen[hash] = struct{}{}
+		if _, inBase := excludeSet[hash]; inBase {
+			continue
+		}
+		count++
+		if limit > 0 && count >= limit {
+			return count, true
+		}
+		co, err := c.repo.CommitObject(hash)
+		if err != nil {
+			continue
+		}
+		for _, ph := range co.ParentHashes {
+			queue = append(queue, ph)
+		}
+	}
+	return count, false
+}
+
+// countAllFrom counts all commits reachable from hash (full history).
+func (c *GitClient) countAllFrom(hash plumbing.Hash, limit int) (int, bool, error) {
+	iter, err := c.repo.Log(&gogit.LogOptions{From: hash})
+	if err != nil {
+		return 0, false, err
+	}
+	defer iter.Close()
+
+	count := 0
+	_ = iter.ForEach(func(_ *object.Commit) error {
+		count++
+		if limit > 0 && count >= limit {
+			return io.EOF
+		}
+		return nil
+	})
+	return count, limit > 0 && count >= limit, nil
+}
+
 // CountBranchCommits returns the number of commits reachable from a branch tip.
 // If the count reaches limit, iteration stops early and capped is true.
 // Limit ≤ 0 means unlimited (count all commits).

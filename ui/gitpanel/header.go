@@ -44,10 +44,14 @@ func renderHeaderRow(ls *listState, width int, th *theme.Theme) string {
 			b.WriteString(ds.Render(" \u2502 ")) // " │ "
 		}
 
-		// Determine focus: empty-label columns inherit from their owner.
-		isFocused := headerFocused && owners[i] == ls.header.cursor
+		// Determine focus and hover: empty-label columns inherit from owner.
+		ownerIdx := owners[i]
+		isFocused := headerFocused && ownerIdx == ls.header.cursor
+		isHovered := ls.header.hoverColumn >= 0 && ownerIdx == ls.header.hoverColumn
+		highlighted := isFocused || isHovered
+
 		style := lipgloss.NewStyle().Foreground(p.Muted).Bold(true)
-		if isFocused {
+		if highlighted {
 			style = style.Foreground(p.Foreground)
 		}
 
@@ -59,14 +63,19 @@ func renderHeaderRow(ls *listState, width int, th *theme.Theme) string {
 
 		label := col.Def.Label
 		indicator := sortIndicator(col.Def, ls.columns.SortKeys)
-
-		// Truncate the label only, preserving the sort indicator so that
-		// the sort arrow is always visible even on narrow columns.
 		indicatorW := len([]rune(indicator))
 		labelSpace := max(col.Width-indicatorW, 0)
-		cellText := truncateString(label, labelSpace) + indicator
+		truncLabel := truncateString(label, labelSpace)
 
-		b.WriteString(fitHeaderCell(cellText, col.Width, style))
+		// Active sort indicators keep their accent color regardless of
+		// hover/focus state; inactive indicators follow the label style.
+		if isSortActive(col.Def, ls.columns.SortKeys) {
+			sortStyle := lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+			b.WriteString(fitHeaderCellSplit(truncLabel, indicator, col.Width, style, sortStyle))
+		} else {
+			cellText := truncLabel + indicator
+			b.WriteString(fitHeaderCell(cellText, col.Width, style))
+		}
 	}
 
 	// Gear icon flush-right with divider separator.
@@ -85,6 +94,16 @@ func renderHeaderRow(ls *listState, width int, th *theme.Theme) string {
 	content += strings.Repeat(" ", padCount) + gearDiv + gear
 
 	return content
+}
+
+// isSortActive reports whether the column has an active sort key.
+func isSortActive(def *ColumnDef, sortKeys []SortKey) bool {
+	for _, sk := range sortKeys {
+		if sk.Col == def.ID {
+			return true
+		}
+	}
+	return false
 }
 
 // sortIndicator returns the sort indicator suffix for a column header.
@@ -341,6 +360,21 @@ func fitHeaderCell(text string, width int, style lipgloss.Style) string {
 	}
 	text = truncateString(text, width)
 	rendered := style.Render(text)
+	if actual := lipgloss.Width(rendered); actual < width {
+		rendered += strings.Repeat(" ", width-actual)
+	}
+	return rendered
+}
+
+// fitHeaderCellSplit renders a header cell where the label and suffix use
+// different styles. The total cell is exactly width columns, with unstyled
+// padding after the suffix.
+func fitHeaderCellSplit(label, suffix string, width int, labelStyle, suffixStyle lipgloss.Style) string {
+	if width <= 0 {
+		return ""
+	}
+	label = truncateString(label, max(width-len([]rune(suffix)), 0))
+	rendered := labelStyle.Render(label) + suffixStyle.Render(suffix)
 	if actual := lipgloss.Width(rendered); actual < width {
 		rendered += strings.Repeat(" ", width-actual)
 	}

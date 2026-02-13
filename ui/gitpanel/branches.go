@@ -22,6 +22,9 @@ type branchEntry struct {
 	uncommitted  bool // working tree has uncommitted changes (HEAD only)
 	hasConflicts bool // working tree has merge conflicts (HEAD only)
 
+	commitCount       int  // commits unique to this branch vs. default
+	commitCountCapped bool // true if count hit the counting limit
+
 	additions, deletions                   int
 	filesAdded, filesModified, filesDeleted int
 	hasFileStats bool // true when file-level stats are populated
@@ -41,6 +44,9 @@ type branchesTab struct {
 	statsEpoch   time.Time         // animation epoch for stat spinners
 	statsLevel   git.DiffStatLevel // highest level loaded into entries
 }
+
+// branchCommitLimit is the maximum commits counted per branch before capping.
+const branchCommitLimit = 1000
 
 // loadBranches fetches branches from the git client and converts them to
 // branchEntry values. The HEAD branch is annotated with working tree state.
@@ -79,6 +85,16 @@ func loadBranches(gc *git.GitClient, statLevel git.DiffStatLevel) []branchEntry 
 		fileSummaries = gc.GetCommitFileSummaries(hashes)
 	}
 
+	defaultBranch := gc.DefaultBranch()
+
+	// Count unique commits per branch in a single batch (builds the base
+	// reachable set once instead of once per branch).
+	branchNames := make([]string, len(infos))
+	for i, bi := range infos {
+		branchNames[i] = bi.Name
+	}
+	commitCounts := gc.CountBranchOnlyCommitsBatch(branchNames, defaultBranch, branchCommitLimit)
+
 	entries := make([]branchEntry, 0, len(infos))
 	for _, bi := range infos {
 		e := branchEntry{
@@ -92,6 +108,10 @@ func loadBranches(gc *git.GitClient, statLevel git.DiffStatLevel) []branchEntry 
 		if bi.IsHead {
 			e.uncommitted = dirty
 			e.hasConflicts = conflicts
+		}
+		if bc, ok := commitCounts[bi.Name]; ok {
+			e.commitCount = bc.Count
+			e.commitCountCapped = bc.Capped
 		}
 		if ds, ok := lineSummaries[bi.Hash]; ok {
 			e.additions = ds.Additions
@@ -162,6 +182,20 @@ func renderBranchCell(e branchEntry, colID ColumnID, width int, selected bool, t
 			style = style.Background(p.Selection)
 		}
 		return fitCell(relativeTime(e.time), width, style)
+
+	case "commits":
+		text := strconv.Itoa(e.commitCount)
+		if e.commitCountCapped {
+			text += "+"
+		}
+		style := lipgloss.NewStyle().Foreground(p.Muted)
+		if greyOut {
+			style = style.Foreground(p.Muted)
+		}
+		if selected {
+			style = style.Background(p.Selection)
+		}
+		return fitCell(text, width, style)
 
 	case "changed":
 		style := lipgloss.NewStyle().Foreground(p.Muted)
