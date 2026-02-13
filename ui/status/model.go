@@ -181,8 +181,10 @@ func (m *Model) SetViewRingHint(hint string) {
 // -- Message handlers -------------------------------------------------------
 
 // IsAnimating reports whether any decor-driven animation is active.
+// Uses m.flash rather than time-based check to guarantee the clearing
+// tick fires even when the flash deadline and the tick align exactly.
 func (m *Model) IsAnimating() bool {
-	return m.spinnerActive || time.Now().Before(m.flashUntil)
+	return m.spinnerActive || m.flash != ""
 }
 
 func (m *Model) handleDecorTick(now time.Time) (tea.Model, tea.Cmd) {
@@ -236,7 +238,7 @@ func (m *Model) handleEventsDropped(v msg.EventsDroppedMsg) (tea.Model, tea.Cmd)
 
 func (m *Model) renderLeft() string {
 	modeStyle := m.theme.StatusNormal
-	modeBadge := modeStyle.Render(m.mode)
+	modeBadge := modeStyle.Width(4).Render(m.mode)
 
 	session := m.sessionLabel()
 	sessionRendered := m.theme.StatusBar.Render(session)

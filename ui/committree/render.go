@@ -22,6 +22,11 @@ const edgeGlyph = "│"
 // ellipsis is appended when a string is truncated to fit available width.
 const ellipsis = "..."
 
+// minLayoutGap is the minimum gap between left-aligned and right-aligned
+// segments in a card content line. Ensures readability when content fills
+// the card width.
+const minLayoutGap = 2
+
 // laneColors is the palette of colors assigned to graph lanes.
 // Cycled by lane index mod len. Chosen for contrast and consistency
 // with the Catppuccin-based theme palette.
@@ -757,6 +762,19 @@ func clampInt(v, lo, hi int) int {
 	return max(min(v, hi), lo)
 }
 
+// layoutLine arranges a left-aligned and right-aligned styled segment
+// within a fixed-width line. When both segments cannot fit with the
+// minimum gap, the left segment is truncated. The right segment is
+// never truncated — it represents fixed metadata (time, author, stats).
+func layoutLine(left, right string, width int) string {
+	rw := lipgloss.Width(right)
+	maxLeft := width - rw - minLayoutGap
+	left = truncateStyled(left, max(maxLeft, 0))
+	lw := lipgloss.Width(left)
+	gap := max(width-lw-rw, minLayoutGap)
+	return left + strings.Repeat(" ", gap) + right
+}
+
 // buildBranchHeaderLine assembles: ● branchName          2h ago
 // The dot color reflects working tree state for the HEAD branch:
 // conflicts → red, dirty → yellow, clean → primary.
@@ -807,61 +825,50 @@ func buildBranchSubjectLine(b BranchNode, availWidth int, p theme.Palette) strin
 	return strings.Repeat(" ", indent) + hash + "  " + subjectStyle.Render(subject)
 }
 
-// buildHeaderLine assembles the styled header content:
+// buildHeaderLine assembles the commit card header:
 //
-//	● abc1234 (main)  +12 -3  2h ago
+//	● abc1234 (main)          2h ago
+//
+// Left: marker + hash + optional branch tag.
+// Right: relative time.
+// Matches the branch card header layout (identifier + time).
 func buildHeaderLine(n TreeNode, availWidth int, p theme.Palette) string {
-	markerStyle := commitMarkerStyle(n, p)
-	marker := markerStyle.Render(commitMarker)
+	marker := commitMarkerStyle(n, p).Render(commitMarker)
+	hash := lipgloss.NewStyle().Foreground(p.Muted).Render(n.ShortHash)
 
-	hashStyle := lipgloss.NewStyle().Foreground(p.Muted)
-	hash := hashStyle.Render(n.ShortHash)
-
-	stats := formatStats(n.Additions, n.Deletions, &p)
-
-	timeStyle := lipgloss.NewStyle().Foreground(p.Muted)
-	ts := timeStyle.Render(relativeTime(n.AuthorTime))
-
-	// Right side: stats + gap + time.
-	right := stats + "  " + ts
-	rightWidth := lipgloss.Width(right)
-
-	// Left side: marker + space + hash + optional branch.
 	left := marker + " " + hash
 	if n.Branch != "" {
 		branchStyle := lipgloss.NewStyle().Foreground(p.Secondary).Bold(true)
 		left += " " + branchStyle.Render("("+n.Branch+")")
 	}
-	leftWidth := lipgloss.Width(left)
 
-	// Gap fills the space between left and right.
-	// Minimum gap of 2 characters for readability.
-	const minGap = 2
-	gap := max(availWidth-leftWidth-rightWidth, minGap)
+	ts := lipgloss.NewStyle().Foreground(p.Muted).Render(relativeTime(n.AuthorTime))
 
-	return left + strings.Repeat(" ", gap) + right
+	return layoutLine(left, ts, availWidth)
 }
 
-// buildSubjectLine renders the commit subject indented to align with the
-// header text (past the marker glyph).
+// buildSubjectLine renders the commit card subject line:
+//
+//	  Fix login bug          +12 -3  John Doe
+//
+// Left: indented subject text (truncates to fit).
+// Right: diff stats + author name (grouped, never truncated).
 func buildSubjectLine(n TreeNode, availWidth int, p theme.Palette) string {
-	// Indent by marker width + space = 2 columns to align with hash.
 	const indent = 2
 	subjectStyle := lipgloss.NewStyle().Foreground(p.Foreground)
 
-	// Right-align the author name.
-	authorStyle := lipgloss.NewStyle().Foreground(p.Muted)
-	author := authorStyle.Render(n.Author)
-	authorWidth := lipgloss.Width(author)
+	stats := formatStats(n.Additions, n.Deletions, &p)
+	author := lipgloss.NewStyle().Foreground(p.Muted).Render(n.Author)
+	right := stats + "  " + author
 
-	subjectMax := max(availWidth-indent-authorWidth-2, 0)
+	// Compute max subject width from remaining space after right side + gap.
+	rightWidth := lipgloss.Width(right)
+	subjectMax := max(availWidth-indent-rightWidth-minLayoutGap, 0)
 	subject := truncateSubject(n.Subject, subjectMax)
 
 	left := strings.Repeat(" ", indent) + subjectStyle.Render(subject)
-	leftWidth := lipgloss.Width(left)
 
-	gap := max(availWidth-leftWidth-authorWidth, 1)
-	return left + strings.Repeat(" ", gap) + author
+	return layoutLine(left, right, availWidth)
 }
 
 // commitMarkerStyle returns the style for the commit marker glyph.

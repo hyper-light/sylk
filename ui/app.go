@@ -321,6 +321,8 @@ type AppModel struct {
 	savedGitFocus    component.FocusID // Last focused panel in git mode.
 	preGitEditMode   bool              // Whether edit mode was active before entering git mode.
 	prevGitMode      bool              // Detect git mode transitions for dirty detection.
+	gitDataLoaded    bool              // True after first LoadData; skips reload on cycling.
+	ringMode         string            // Current view mode from ring position: "CHAT", "EDIT", "GIT".
 
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
@@ -500,6 +502,11 @@ func (r *viewRing) setTo(id component.FocusID) bool {
 // empty reports whether the ring has no panels to cycle.
 func (r *viewRing) empty() bool { return len(r.panels) == 0 }
 
+// isGitPanel reports whether the given focus ID is a git-specific panel.
+func isGitPanel(id component.FocusID) bool {
+	return id == component.FocusGitPanel || id == component.FocusCommitTree
+}
+
 // scrollState tracks the spring-driven scroll animation.
 type scrollState struct {
 	pos     float64           // Smooth position (fractional line offset).
@@ -568,6 +575,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		previewTabHoverClose:   -1,
 		mdPreviewTabHoverClose: -1,
 		mdTooltipTab:           -1,
+		ringMode:               "CHAT",
 	}
 
 	app.comp = compositor.New()
@@ -2817,9 +2825,9 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 
 	// Chord triggers: toggle on if idle or switching, toggle off if repeated.
 	if target, ok := chordKeyMap[key.String()]; ok {
-		// Edit mode guard: chords are disabled while editing. Show the
-		// blocked hint bar so the user knows to exit first.
-		if m.editMode {
+		// Edit mode guard: non-view chords are disabled while editing.
+		// chordView is allowed so the user can cycle to git mode.
+		if m.editMode && target != chordView {
 			m.chord = target
 			m.chordBlocked = true
 			cmd := tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
@@ -2876,7 +2884,7 @@ func (m *AppModel) dispatchChordCycle(chord chordState, delta int) tea.Cmd {
 			m.agentPanel.CycleNext()
 		}
 	case chordView:
-		m.cycleViewSlot(delta)
+		return m.cycleViewSlot(delta)
 	}
 	return nil
 }
@@ -2884,42 +2892,127 @@ func (m *AppModel) dispatchChordCycle(chord chordState, delta int) tea.Cmd {
 // cycleViewSlot dispatches Alt+V cycling to the appropriate ring(s).
 // Two active rings: both cycle in lockstep so the panel pair toggles as a unit.
 // One active ring: direction is forward/backward within that ring.
-func (m *AppModel) cycleViewSlot(delta int) {
+func (m *AppModel) cycleViewSlot(delta int) tea.Cmd {
+	// Capture pre-cycle focus so syncGitModeForRing can save it
+	// for the outgoing view before the ring changes focus.
+	preFocus := m.focus.Current()
+
 	bothActive := !m.leftRing.empty() && !m.rightRing.empty()
 	if bothActive {
-		// Paired cycling: both rings advance together so
-		// the two-panel layout toggles as a unit.
-		current := m.focus.Current()
 		oldLeft := m.leftRing.current()
 		oldRight := m.rightRing.current()
 		m.leftRing.cycle(delta)
 		m.rightRing.cycle(delta)
-		switch current {
+		switch preFocus {
 		case oldLeft:
 			m.focus.SetFocus(m.leftRing.current())
 		case oldRight:
 			m.focus.SetFocus(m.rightRing.current())
 		}
+		cmd := m.syncModeForRing(preFocus)
 		m.syncViewState()
-		return
+		return cmd
 	}
 	if !m.leftRing.empty() {
-		m.cycleRing(&m.leftRing, delta)
+		return m.cycleRing(&m.leftRing, delta, preFocus)
 	}
 	if !m.rightRing.empty() {
-		m.cycleRing(&m.rightRing, delta)
+		return m.cycleRing(&m.rightRing, delta, preFocus)
 	}
+	return nil
 }
 
 // cycleRing advances a single ring by delta, transferring focus if needed.
-func (m *AppModel) cycleRing(ring *viewRing, delta int) {
+func (m *AppModel) cycleRing(ring *viewRing, delta int, preFocus component.FocusID) tea.Cmd {
 	oldPanel := ring.current()
 	ring.cycle(delta)
 	newPanel := ring.current()
 	if m.focus.Current() == oldPanel {
 		m.focus.SetFocus(newPanel)
 	}
+	cmd := m.syncModeForRing(preFocus)
 	m.syncViewState()
+	return cmd
+}
+
+// ringTargetMode determines the view mode implied by current ring positions.
+func (m *AppModel) ringTargetMode() string {
+	if isGitPanel(m.leftRing.current()) || isGitPanel(m.rightRing.current()) {
+		return "GIT"
+	}
+	active := m.leftRing.current()
+	if !m.rightRing.empty() {
+		active = m.rightRing.current()
+	}
+	if active == component.FocusCodeViewer {
+		return "EDIT"
+	}
+	return "CHAT"
+}
+
+// syncModeForRing detects mode transitions (CHAT / EDIT / GIT) after a
+// ring cycle and symmetrically saves outgoing focus / restores incoming
+// focus. preFocus is the focus captured before the ring advanced.
+func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
+	target := m.ringTargetMode()
+	if target == m.ringMode {
+		return nil
+	}
+	old := m.ringMode
+	m.ringMode = target
+
+	// Save outgoing focus.
+	switch old {
+	case "GIT":
+		m.savedGitFocus = preFocus
+	case "EDIT":
+		m.savedEditFocus = preFocus
+	default:
+		m.savedChatFocus = preFocus
+	}
+
+	// Exit old mode.
+	if old == "GIT" {
+		m.gitMode = false
+		m.input.SetPlaceholder("Type a message...")
+	}
+
+	// Enter new mode and restore incoming focus.
+	var cmd tea.Cmd
+	switch target {
+	case "GIT":
+		if m.editMode {
+			m.preGitEditMode = true
+			m.exitEditMode()
+		}
+		m.gitMode = true
+		m.resizeGitPanels()
+		m.input.SetPlaceholder("git>")
+		if m.savedGitFocus != 0 {
+			m.focus.SetFocus(m.savedGitFocus)
+		}
+		if !m.gitDataLoaded {
+			m.gitDataLoaded = true
+			cmd = tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
+		}
+	case "EDIT":
+		if old == "GIT" && m.preGitEditMode {
+			m.preGitEditMode = false
+			cmd = m.enterEditMode()
+		} else if m.savedEditFocus != 0 {
+			m.focus.SetFocus(m.savedEditFocus)
+		}
+	default: // CHAT
+		if old == "GIT" && m.preGitEditMode {
+			m.preGitEditMode = false
+		}
+		if m.savedChatFocus != 0 {
+			m.focus.SetFocus(m.savedChatFocus)
+		}
+	}
+
+	m.statusBar.SetMode(target)
+	return cmd
 }
 
 // ---------------------------------------------------------------------------
@@ -2943,9 +3036,11 @@ func (m *AppModel) toggleEditMode() tea.Cmd {
 // Returns a Cmd that sends didOpen so the LSP client tracks the document
 // for subsequent didChange notifications. Idempotent if already tracked.
 func (m *AppModel) enterEditMode() tea.Cmd {
-	// Dismiss any active chord — chords are unsupported in edit mode.
-	m.chord = chordNone
-	m.chordBlocked = false
+	// Dismiss non-view chords — chordView is allowed in edit mode.
+	if m.chord != chordView {
+		m.chord = chordNone
+		m.chordBlocked = false
+	}
 
 	// Save ring state and chat-mode focus.
 	m.savedLeftIdx = m.leftRing.index
@@ -3004,6 +3099,7 @@ func (m *AppModel) enterEditMode() tea.Cmd {
 	}
 
 	m.editMode = true
+	m.ringMode = "EDIT"
 
 	// Size the editor to match the code panel slot. resizeInlineEditor
 	// handles all states (split preview, full preview, editor-only).
@@ -3050,10 +3146,14 @@ func (m *AppModel) exitEditMode() {
 	m.rightRing.index = m.savedRightIdx
 
 	m.editMode = false
+	m.ringMode = "CHAT"
 	m.fileTree.SetEditMode(false)
 	m.editCmdInput = false
-	m.chord = chordNone
-	m.chordBlocked = false
+	// Preserve chordView — it's allowed across mode transitions.
+	if m.chord != chordView {
+		m.chord = chordNone
+		m.chordBlocked = false
+	}
 	// tabOrder is intentionally preserved so re-entering edit mode
 	// restores all previously open tabs.
 	m.statusBar.SetMode("CHAT")
@@ -3335,17 +3435,7 @@ func (m *AppModel) enterGitMode() tea.Cmd {
 	m.savedChatFocus = m.focus.Current()
 
 	m.gitMode = true
-
-	// Position rings so git panels are visible.
-	switch m.layout.Mode() {
-	case layout.ThreeColumn:
-		m.leftRing.setTo(component.FocusFileTree)
-	case layout.TwoColumn:
-		m.leftRing.setTo(component.FocusFileTree)
-		m.rightRing.setTo(component.FocusCodeViewer)
-	case layout.SingleColumn:
-		m.leftRing.setTo(component.FocusCodeViewer)
-	}
+	m.ringMode = "GIT"
 
 	// Size git components to their panel slots.
 	m.resizeGitPanels()
@@ -3353,11 +3443,21 @@ func (m *AppModel) enterGitMode() tea.Cmd {
 	m.statusBar.SetMode("GIT")
 	m.input.SetPlaceholder("git>")
 
+	// Rebuild rings (syncViewState substitutes git panel IDs in the rings),
+	// then position them so the git panel is active.
 	m.syncViewState()
+	if !m.leftRing.empty() {
+		m.leftRing.setTo(component.FocusGitPanel)
+	}
+	if !m.rightRing.empty() {
+		m.rightRing.setTo(component.FocusCommitTree)
+	}
 	m.focus.SetFocus(component.FocusGitPanel)
 	m.syncFocusState()
 	m.statusBar.SetFlash("Git mode")
 
+	// Alt+G always force-reloads; mark loaded so cycling skips reloads.
+	m.gitDataLoaded = true
 	return tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 }
 
@@ -3370,6 +3470,7 @@ func (m *AppModel) exitGitMode() {
 	m.rightRing.index = m.savedGitRightIdx
 
 	m.gitMode = false
+	m.ringMode = "CHAT"
 	m.statusBar.SetMode("CHAT")
 	m.input.SetPlaceholder("Type a message...")
 
@@ -3377,7 +3478,7 @@ func (m *AppModel) exitGitMode() {
 
 	if m.preGitEditMode {
 		m.preGitEditMode = false
-		m.enterEditMode()
+		m.enterEditMode() // enterEditMode sets ringMode = "EDIT"
 		return
 	}
 
@@ -7389,24 +7490,38 @@ func (m *AppModel) syncViewState() {
 	wasEmpty := m.leftRing.empty() && m.rightRing.empty()
 
 	// Rebuild rings per mode (see plan table).
+	// In git mode, FourColumn gets a ring so Alt+V can cycle between panels.
 	switch mode {
 	case layout.FourColumn:
-		m.leftRing.reset(nil)
+		m.leftRing.reset([]component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusFileTree,
+			component.FocusChat,
+			component.FocusCodeViewer,
+			component.FocusGitPanel,
+			component.FocusCommitTree,
+		})
 		m.rightRing.reset(nil)
 	case layout.ThreeColumn:
 		m.leftRing.reset([]component.FocusID{
 			component.FocusSessionPanel,
 			component.FocusFileTree,
+			component.FocusGitPanel,
 		})
-		m.rightRing.reset(nil)
+		m.rightRing.reset([]component.FocusID{
+			component.FocusCodeViewer,
+			component.FocusCommitTree,
+		})
 	case layout.TwoColumn:
 		m.leftRing.reset([]component.FocusID{
 			component.FocusSessionPanel,
 			component.FocusFileTree,
+			component.FocusGitPanel,
 		})
 		m.rightRing.reset([]component.FocusID{
 			component.FocusChat,
 			component.FocusCodeViewer,
+			component.FocusCommitTree,
 		})
 	default:
 		m.leftRing.reset([]component.FocusID{
@@ -7414,6 +7529,8 @@ func (m *AppModel) syncViewState() {
 			component.FocusChat,
 			component.FocusFileTree,
 			component.FocusCodeViewer,
+			component.FocusGitPanel,
+			component.FocusCommitTree,
 		})
 		m.rightRing.reset(nil)
 	}
@@ -7428,20 +7545,6 @@ func (m *AppModel) syncViewState() {
 		if !m.leftRing.empty() {
 			if !m.leftRing.setTo(component.FocusCodeViewer) {
 				m.leftRing.setTo(component.FocusFileTree)
-			}
-		}
-	}
-
-	// When git mode is active, pin rings to the file tree slot (git panel)
-	// and code viewer slot (commit tree). The render functions check gitMode
-	// to swap what actually renders in those slots.
-	if m.gitMode {
-		if !m.rightRing.empty() {
-			m.rightRing.setTo(component.FocusCodeViewer)
-		}
-		if !m.leftRing.empty() {
-			if !m.leftRing.setTo(component.FocusFileTree) {
-				m.leftRing.setTo(component.FocusCodeViewer)
 			}
 		}
 	}
@@ -7571,7 +7674,7 @@ var panelDisplayNames = map[component.FocusID]string{
 	component.FocusChat:         "Chat",
 	component.FocusCodeViewer:   "Code",
 	component.FocusSessionPanel: "Sess",
-	component.FocusFileTree:     "Tree",
+	component.FocusFileTree:     "Files",
 	component.FocusGitPanel:     "Git",
 	component.FocusCommitTree:   "Tree",
 }
@@ -7717,9 +7820,10 @@ func (m *AppModel) detectDirtySlots() {
 		m.prevFocusGrp = curGrp
 	}
 
-	// Chord state change: mark affected slot dirty.
+	// Chord state change: the chord hint overlay can appear on any content
+	// slot depending on layout mode, so invalidate all slots.
 	if m.chord != m.prevChord {
-		m.comp.MarkDirty(compositor.SlotCenter)
+		m.comp.InvalidateAll()
 		m.prevChord = m.chord
 	}
 
@@ -7871,19 +7975,23 @@ func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
 }
 
 // renderSlotRight renders the bordered code panel for the right slot.
-// In TwoColumn mode the right ring may show chat instead of code.
-// In git mode, renders the commit tree instead of the code panel.
+// In TwoColumn mode the right ring may show chat, commit tree, or code.
+// In git mode (non-TwoColumn), renders the commit tree instead of the code panel.
 func (m *AppModel) renderSlotRight(th *theme.Theme) string {
-	if m.gitMode {
-		return m.renderGitCommitTreeBordered(th)
-	}
 	if m.layout.Mode() == layout.TwoColumn {
 		right := m.rightRing.current()
-		if right == component.FocusCodeViewer {
+		switch right {
+		case component.FocusCodeViewer:
 			return m.renderCodePanelBordered(th)
+		case component.FocusCommitTree:
+			return m.renderGitCommitTreeBordered(th)
+		default:
+			content := m.overlayChordHint(m.panelContent(right), right, th)
+			return m.renderPanel(content, right, th)
 		}
-		content := m.overlayChordHint(m.panelContent(right), right, th)
-		return m.renderPanel(content, right, th)
+	}
+	if m.gitMode {
+		return m.renderGitCommitTreeBordered(th)
 	}
 	return m.renderCodePanelBordered(th)
 }
@@ -7891,16 +7999,6 @@ func (m *AppModel) renderSlotRight(th *theme.Theme) string {
 // renderSingleColumnSlot renders the single visible panel in SingleColumn mode.
 func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	active := m.leftRing.current()
-
-	// In git mode, map FileTree→GitPanel, CodeViewer→CommitTree.
-	if m.gitMode {
-		switch active {
-		case component.FocusFileTree:
-			return m.renderGitPanelBordered(th)
-		case component.FocusCodeViewer:
-			return m.renderGitCommitTreeBordered(th)
-		}
-	}
 
 	switch active {
 	case component.FocusSessionPanel:
@@ -7911,6 +8009,10 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	case component.FocusFileTree:
 		content := m.overlayChordHint(m.fileTree.View(m.cursorVisible), active, th)
 		return m.renderPanel(content, active, th)
+	case component.FocusGitPanel:
+		return m.renderGitPanelBordered(th)
+	case component.FocusCommitTree:
+		return m.renderGitCommitTreeBordered(th)
 	default:
 		content := m.overlayChordHint(m.panelContent(active), active, th)
 		return m.renderPanel(content, active, th)
@@ -7918,16 +8020,17 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 }
 
 // renderLeftSlot renders the left column for the given panel ID.
-// Session gets the composite left panel with border; FileTree gets a standard panel.
-// In git mode, FileTree slot renders the git explorer instead.
+// Session gets the composite left panel with border; FileTree and GitPanel
+// get their respective panel renderers.
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
-	if id == component.FocusFileTree {
-		if m.gitMode {
-			return m.renderGitPanelBordered(th)
-		}
+	switch id {
+	case component.FocusFileTree:
 		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
+	case component.FocusGitPanel:
+		return m.renderGitPanelBordered(th)
+	default:
+		return m.renderLeftPanelBordered(th)
 	}
-	return m.renderLeftPanelBordered(th)
 }
 
 // panelContent returns the raw view content for a swappable panel.
@@ -8091,7 +8194,7 @@ func (m *AppModel) focusCodePanel() {
 // activates when either the editor or preview sub-panel is focused
 // (mirrors renderLeftPanelBordered for the session/agent sub-panels).
 func (m *AppModel) renderCodePanelBordered(th *theme.Theme) string {
-	content := m.codePanelView()
+	content := m.overlayChordHint(m.codePanelView(), component.FocusCodeViewer, th)
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
 	border := th.InactiveBorder
 	if m.isCodePanelFocused() {
@@ -8106,6 +8209,8 @@ func (m *AppModel) renderCodePanelBordered(th *theme.Theme) string {
 
 // renderGitPanelBordered renders the git explorer panel using the FileTree slot
 // dimensions with border highlight based on FocusGitPanel focus state.
+// The chord hint overlay is intentionally omitted here — in git mode,
+// the overlay only appears on the commit tree (right side).
 func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
 	content := m.gitPanel.View(m.cursorVisible)
 	w, h := m.layout.GetPanelSize(component.FocusFileTree)
@@ -8123,7 +8228,7 @@ func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
 // renderGitCommitTreeBordered renders the commit tree panel using the CodeViewer
 // slot dimensions with border highlight based on FocusCommitTree focus state.
 func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
-	content := m.commitTree.View(m.cursorVisible)
+	content := m.overlayChordHint(m.commitTree.View(m.cursorVisible), component.FocusCodeViewer, th)
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
 	border := th.InactiveBorder
 	if m.focus.Current() == component.FocusCommitTree {
