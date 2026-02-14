@@ -117,6 +117,10 @@ type nodeCacheKey struct {
 	isFirst   bool
 	isLast    bool
 
+	// Diff selection overlay state.
+	diffActive bool
+	diffIdx    int
+
 	// DAG graph gutter fields (zero-valued in flat mode).
 	commitLane  int
 	maxLane     int
@@ -138,20 +142,22 @@ func (m *Model) invalidateNodeCache() {
 // getCachedNode returns cached node lines if the key matches, otherwise
 // renders the node, stores it in the cache, and returns fresh lines.
 // graph is nil in flat/centered mode; non-nil in DAG mode.
-func (m *Model) getCachedNode(idx int, n TreeNode, selected, isFirst, isLast bool, graph *GraphRow, maxLane int) []string {
+func (m *Model) getCachedNode(idx int, n TreeNode, selected, isFirst, isLast bool, graph *GraphRow, maxLane int, diff diffOverlay) []string {
 	key := nodeCacheKey{
-		shortHash: n.ShortHash,
-		subject:   n.Subject,
-		author:    n.Author,
-		branch:    n.Branch,
-		isMerge:   n.IsMerge,
-		additions: n.Additions,
-		deletions: n.Deletions,
-		relTime:   relativeTime(n.AuthorTime),
-		selected:  selected,
-		width:     m.width,
-		isFirst:   isFirst,
-		isLast:    isLast,
+		shortHash:  n.ShortHash,
+		subject:    n.Subject,
+		author:     n.Author,
+		branch:     n.Branch,
+		isMerge:    n.IsMerge,
+		additions:  n.Additions,
+		deletions:  n.Deletions,
+		relTime:    relativeTime(n.AuthorTime),
+		selected:   selected,
+		width:      m.width,
+		isFirst:    isFirst,
+		isLast:     isLast,
+		diffActive: diff.active,
+		diffIdx:    diff.idx,
 	}
 
 	if graph != nil {
@@ -172,7 +178,7 @@ func (m *Model) getCachedNode(idx int, n TreeNode, selected, isFirst, isLast boo
 		return entry.lines
 	}
 
-	lines := renderNode(n, selected, m.width, m.theme, isFirst, isLast, graph, maxLane)
+	lines := renderNode(n, selected, m.width, m.theme, isFirst, isLast, graph, maxLane, diff)
 	entry.valid = true
 	entry.key = key
 	entry.lines = lines
@@ -231,6 +237,10 @@ type commitCardCacheKey struct {
 	trunkInnerBot int
 	hasTrunkTop   bool
 	hasTrunkBot   bool
+
+	// Diff selection overlay state.
+	diffActive bool
+	diffIdx    int
 }
 
 // commitCardCacheEntry pairs a key with its rendered output.
@@ -248,7 +258,8 @@ func (m *Model) invalidateCommitCardCache() {
 // getCachedCommitCard returns cached card lines if the key matches, otherwise
 // renders the card, stores it in the cache, and returns fresh lines.
 func (m *Model) getCachedCommitCard(cacheIdx int, n TreeNode, selected bool,
-	innerWidth, trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool) []string {
+	innerWidth, trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool,
+	diff diffOverlay) []string {
 
 	key := commitCardCacheKey{
 		shortHash:     n.ShortHash,
@@ -265,6 +276,8 @@ func (m *Model) getCachedCommitCard(cacheIdx int, n TreeNode, selected bool,
 		trunkInnerBot: trunkInnerBot,
 		hasTrunkTop:   hasTrunkTop,
 		hasTrunkBot:   hasTrunkBot,
+		diffActive:    diff.active,
+		diffIdx:       diff.idx,
 	}
 
 	for len(m.commitCardCache) <= cacheIdx {
@@ -277,7 +290,7 @@ func (m *Model) getCachedCommitCard(cacheIdx int, n TreeNode, selected bool,
 	}
 
 	lines := renderCommitCard(n, selected, innerWidth, m.theme.Palette,
-		trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot)
+		trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot, diff)
 
 	entry.valid = true
 	entry.key = key

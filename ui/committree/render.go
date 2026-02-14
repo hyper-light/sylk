@@ -28,6 +28,41 @@ const ellipsis = "..."
 // the card width.
 const minLayoutGap = 2
 
+// diffSelection records one commit chosen in diff selection mode.
+type diffSelection struct {
+	hash    string
+	nodeIdx int
+}
+
+// diffOverlay carries the diff-mode visual state for a single card.
+// When active is true, the card's border is colored and an icon is shown.
+type diffOverlay struct {
+	active bool
+	idx    int // selection index: determines color + icon
+}
+
+// diffSelectionColors maps selection index to a palette color accessor.
+// The array length defines the maximum number of simultaneous selections.
+var diffSelectionColors = [...]func(theme.Palette) lipgloss.Color{
+	func(p theme.Palette) lipgloss.Color { return p.Primary },   // blue
+	func(p theme.Palette) lipgloss.Color { return p.Success },   // green
+	func(p theme.Palette) lipgloss.Color { return p.Peach },     // peach
+	func(p theme.Palette) lipgloss.Color { return p.Secondary }, // mauve
+	func(p theme.Palette) lipgloss.Color { return p.Teal },      // teal
+	func(p theme.Palette) lipgloss.Color { return p.Warning },   // yellow
+	func(p theme.Palette) lipgloss.Color { return p.Lavender },  // lavender
+	func(p theme.Palette) lipgloss.Color { return p.Accent },    // pink
+}
+
+// diffSelectionIcons are the circled-number glyphs shown in the top-left
+// corner of diff-selected cards, indexed by selection order.
+var diffSelectionIcons = [...]string{"①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧"}
+
+// diffColorForIdx returns the border color for a given diff selection index.
+func diffColorForIdx(idx int, p theme.Palette) lipgloss.Color {
+	return diffSelectionColors[idx%len(diffSelectionColors)](p)
+}
+
 // laneColors is the palette of colors assigned to graph lanes.
 // Cycled by lane index mod len. Chosen for contrast and consistency
 // with the Catppuccin-based theme palette.
@@ -61,9 +96,9 @@ func laneColorForIdx(idx int, p theme.Palette) lipgloss.Color {
 //	           │ ● def5678       3h ago   │
 //	           │   Fix edge case          │
 //	           ╰──────────────────────────╯
-func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isFirst, isLast bool, graph *GraphRow, maxLane int) []string {
+func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isFirst, isLast bool, graph *GraphRow, maxLane int, diff diffOverlay) []string {
 	if graph != nil {
-		return renderNodeDAG(n, selected, width, th, isLast, graph, maxLane)
+		return renderNodeDAG(n, selected, width, th, isLast, graph, maxLane, diff)
 	}
 
 	p := th.Palette
@@ -75,16 +110,26 @@ func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isFirst, 
 	trunkInner := trunkPos - leftPad - 1
 
 	borderColor := p.Border
-	if selected {
+	switch {
+	case selected:
 		borderColor = p.Rosewater
+	case diff.active:
+		borderColor = diffColorForIdx(diff.idx, p)
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
 	header := padContent(buildHeaderLine(n, innerWidth, p), innerWidth)
 	subject := padContent(buildSubjectLine(n, innerWidth, p), innerWidth)
 
-	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInner, !isFirst)
-	botBorder := buildCardBorder("╰", "╯", innerWidth, bSt, trunkInner, !isLast)
+	var icon string
+	var iconSt lipgloss.Style
+	if diff.active {
+		icon = diffSelectionIcons[diff.idx%len(diffSelectionIcons)]
+		iconSt = lipgloss.NewStyle().Foreground(diffColorForIdx(diff.idx, p))
+	}
+
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInner, !isFirst, icon, iconSt)
+	botBorder := buildCardBorder("╰", "╯", innerWidth, bSt, trunkInner, !isLast, "", lipgloss.Style{})
 
 	pad := strings.Repeat(" ", leftPad)
 	vis := leftPad + cardWidth
@@ -108,7 +153,7 @@ func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isFirst, 
 }
 
 // renderNodeDAG renders a commit card with a DAG graph gutter prepended.
-func renderNodeDAG(n TreeNode, selected bool, width int, th *theme.Theme, isLast bool, graph *GraphRow, maxLane int) []string {
+func renderNodeDAG(n TreeNode, selected bool, width int, th *theme.Theme, isLast bool, graph *GraphRow, maxLane int, diff diffOverlay) []string {
 	p := th.Palette
 	gutterWidth := (maxLane + 1) * laneWidth
 	const borderCols = 2
@@ -116,15 +161,25 @@ func renderNodeDAG(n TreeNode, selected bool, width int, th *theme.Theme, isLast
 	innerWidth := max(cardWidth-borderCols, 0)
 
 	borderColor := p.Border
-	if selected {
+	switch {
+	case selected:
 		borderColor = p.Rosewater
+	case diff.active:
+		borderColor = diffColorForIdx(diff.idx, p)
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
 	header := padContent(buildHeaderLine(n, innerWidth, p), innerWidth)
 	subject := padContent(buildSubjectLine(n, innerWidth, p), innerWidth)
 
-	topBorder := bSt.Render("╭" + strings.Repeat("─", innerWidth) + "╮")
+	var topBorder string
+	if diff.active && innerWidth > 0 {
+		icon := diffSelectionIcons[diff.idx%len(diffSelectionIcons)]
+		iconSt := lipgloss.NewStyle().Foreground(diffColorForIdx(diff.idx, p))
+		topBorder = iconSt.Render(icon) + bSt.Render(strings.Repeat("─", innerWidth)+"╮")
+	} else {
+		topBorder = bSt.Render("╭" + strings.Repeat("─", innerWidth) + "╮")
+	}
 	botBorder := bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
 
 	var connector string
@@ -430,7 +485,7 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 		subject = truncateStyled(subject, innerWidth-2) + " " + arrowSt.Render(arrow)
 	}
 
-	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop)
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop, "", lipgloss.Style{})
 
 	lines := []string{
 		topBorder,
@@ -465,7 +520,7 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 
 	var botBorder string
 	if hasTrunkBot {
-		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInnerBot, true)
+		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInnerBot, true, "", lipgloss.Style{})
 	} else {
 		botBorder = bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
 	}
@@ -628,16 +683,17 @@ func buildExpStatsLine(b BranchNode, exp *branchExpansion, p theme.Palette) stri
 // renderExpActionBadge renders a single action badge with appropriate
 // styling based on the action type and current expansion state.
 func renderExpActionBadge(actionID int, b BranchNode, exp *branchExpansion, p theme.Palette) string {
+	highlighted := exp.selectedActionID == actionID
 	switch actionID {
 	case branchActionCommit:
 		return renderActionBadge("Commit", p.Secondary, exp.hasStagedFiles,
-			exp.selectedActionID == branchActionCommit, p)
+			highlighted, highlighted && exp.commitInput, p)
 	case branchActionSwitch:
 		return renderActionBadge("Switch", p.Success, exp.switchEnabled(b.IsHead),
-			exp.selectedActionID == branchActionSwitch, p)
+			highlighted, false, p)
 	case branchActionDelete:
 		return renderActionBadge("Delete", p.Error, exp.deleteEnabled(b.Name, b.IsHead),
-			exp.selectedActionID == branchActionDelete, p)
+			highlighted, highlighted && exp.deleteConfirm, p)
 	default:
 		return ""
 	}
@@ -765,14 +821,16 @@ const commitInputLabelWidth = 10
 
 // renderActionBadge renders a single [Label] badge with appropriate styling.
 // accent is the semantic color for the action (e.g. Success for Switch, Error
-// for Delete). Disabled+selected shows muted with selection background so the
-// user can see the cursor position.
-func renderActionBadge(label string, accent lipgloss.Color, enabled, selected bool, p theme.Palette) string {
+// for Delete). highlighted means the cursor is on this badge; active means the
+// action is engaged (e.g. commit input or delete confirm visible). Bold only
+// applies when active. Disabled+highlighted shows muted with selection
+// background so the user can see the cursor position.
+func renderActionBadge(label string, accent lipgloss.Color, enabled, highlighted, active bool, p theme.Palette) string {
 	st := lipgloss.NewStyle().Foreground(p.Muted)
 	switch {
-	case enabled && selected:
-		st = lipgloss.NewStyle().Foreground(accent).Bold(true)
-	case !enabled && selected:
+	case enabled && highlighted:
+		st = lipgloss.NewStyle().Foreground(accent).Bold(active)
+	case !enabled && highlighted:
 		st = lipgloss.NewStyle().Foreground(p.Muted).Background(p.Selection)
 	}
 	return st.Render("[" + label + "]")
@@ -1107,7 +1165,12 @@ func mergeConnector(up, down, left, right bool) string {
 
 // buildCardBorder constructs a horizontal border with an optional trunk connector.
 // For top borders (left="╭") inserts ┴; for bottom borders (left="╰") inserts ┬.
-func buildCardBorder(left, right string, innerWidth int, bSt lipgloss.Style, trunkPos int, hasTrunk bool) string {
+// When icon is non-empty and this is a top border, the icon replaces the first
+// dash after the corner, rendered with iconSt for a distinct color.
+func buildCardBorder(left, right string, innerWidth int, bSt lipgloss.Style, trunkPos int, hasTrunk bool, icon string, iconSt lipgloss.Style) string {
+	if icon != "" && left == "╭" && innerWidth > 0 {
+		return buildCardBorderWithIcon(left, right, innerWidth, bSt, trunkPos, hasTrunk, icon, iconSt)
+	}
 	if !hasTrunk || trunkPos < 0 || trunkPos >= innerWidth {
 		return bSt.Render(left + strings.Repeat("─", innerWidth) + right)
 	}
@@ -1116,6 +1179,18 @@ func buildCardBorder(left, right string, innerWidth int, bSt lipgloss.Style, tru
 		connector = "┴"
 	}
 	return bSt.Render(left + strings.Repeat("─", trunkPos) + connector + strings.Repeat("─", innerWidth-trunkPos-1) + right)
+}
+
+// buildCardBorderWithIcon renders a top border with a colored icon glyph
+// replacing the left corner character (╭). The inner dashes remain at full
+// width so the card dimensions are unchanged.
+func buildCardBorderWithIcon(left, right string, innerWidth int, bSt lipgloss.Style, trunkPos int, hasTrunk bool, icon string, iconSt lipgloss.Style) string {
+	connector := "┴"
+	if !hasTrunk || trunkPos < 0 || trunkPos >= innerWidth {
+		return iconSt.Render(icon) + bSt.Render(strings.Repeat("─", innerWidth)+right)
+	}
+	return iconSt.Render(icon) +
+		bSt.Render(strings.Repeat("─", trunkPos)+connector+strings.Repeat("─", innerWidth-trunkPos-1)+right)
 }
 
 // renderCommitCard produces a 4-line card for a commit in the DAG
@@ -1130,22 +1205,33 @@ func buildCardBorder(left, right string, innerWidth int, bSt lipgloss.Style, tru
 //	│   Fix login bug  John Doe│
 //	╰────────────┬─────────────╯
 func renderCommitCard(n TreeNode, selected bool, innerWidth int, p theme.Palette,
-	trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool) []string {
+	trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool,
+	diff diffOverlay) []string {
 
 	borderColor := p.Border
-	if selected {
+	switch {
+	case selected:
 		borderColor = p.Rosewater
+	case diff.active:
+		borderColor = diffColorForIdx(diff.idx, p)
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
 	header := padContent(buildHeaderLine(n, innerWidth, p), innerWidth)
 	subject := padContent(buildSubjectLine(n, innerWidth, p), innerWidth)
 
-	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop)
+	var icon string
+	var iconSt lipgloss.Style
+	if diff.active {
+		icon = diffSelectionIcons[diff.idx%len(diffSelectionIcons)]
+		iconSt = lipgloss.NewStyle().Foreground(diffColorForIdx(diff.idx, p))
+	}
+
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop, icon, iconSt)
 
 	var botBorder string
 	if hasTrunkBot {
-		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInnerBot, true)
+		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInnerBot, true, "", lipgloss.Style{})
 	} else {
 		botBorder = bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
 	}
@@ -1452,7 +1538,9 @@ func toolbarCellWidths(buttons []int) []int {
 // a horizontal divider with ┬ separators, and a content row with │
 // separators. The panel border provides the right and bottom edges.
 // hoverIdx highlights a button on mouse hover (-1 = no hover).
-func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx int, modeLabel string, width int, p theme.Palette) string {
+// activeIdx marks a button as toggled on (-1 = none active); active buttons
+// render with bold + accent to distinguish them from merely focused buttons.
+func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx int, activeIdx int, modeLabel string, width int, p theme.Palette) string {
 	if len(buttons) == 0 {
 		empty := strings.Repeat(" ", max(width, 0))
 		return empty + "\n" + empty
@@ -1471,13 +1559,14 @@ func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx
 	totalInner := 0
 	for i, id := range buttons {
 		def := toolbarDefs[id]
+		active := i == activeIdx
 		selected := focused && i == selectedIdx
-		hovered := i == hoverIdx && !selected
+		hovered := i == hoverIdx && !selected && !active
 		fg := p.Muted
-		if selected || hovered {
+		if active || selected || hovered {
 			fg = def.accent(p)
 		}
-		text := lipgloss.NewStyle().Foreground(fg).Bold(selected).Render(def.icon + " " + def.label)
+		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
 		padded := " " + text + " "
 		cells[i] = btnMeasure{inner: padded, width: widths[i]}
 		totalInner += widths[i]
