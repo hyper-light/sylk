@@ -1076,10 +1076,16 @@ func renderMergeLine(centers []int, mergeTarget int, mergeAboveCols []int, width
 func mergeConnector(up, down, left, right bool) string {
 	switch {
 	case up && down:
-		if !left && !right {
+		switch {
+		case left && right:
+			return "┼"
+		case right:
+			return "├"
+		case left:
+			return "┤"
+		default:
 			return "│"
 		}
-		return "┼"
 	case up && !left && !right:
 		return "│"
 	case up && left && right:
@@ -1110,6 +1116,46 @@ func buildCardBorder(left, right string, innerWidth int, bSt lipgloss.Style, tru
 		connector = "┴"
 	}
 	return bSt.Render(left + strings.Repeat("─", trunkPos) + connector + strings.Repeat("─", innerWidth-trunkPos-1) + right)
+}
+
+// renderCommitCard produces a 4-line card for a commit in the DAG
+// trunk-and-offshoots layout. The card has trunk connectors in its top/bottom
+// borders matching the branch tree card style. Used for both trunk and
+// offshoot commit cards.
+//
+// Layout (4 lines):
+//
+//	╭────────────┴─────────────╮
+//	│ ● abc1234  +12 -3  2h ago│
+//	│   Fix login bug  John Doe│
+//	╰────────────┬─────────────╯
+func renderCommitCard(n TreeNode, selected bool, innerWidth int, p theme.Palette,
+	trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool) []string {
+
+	borderColor := p.Border
+	if selected {
+		borderColor = p.Rosewater
+	}
+	bSt := lipgloss.NewStyle().Foreground(borderColor)
+
+	header := padContent(buildHeaderLine(n, innerWidth, p), innerWidth)
+	subject := padContent(buildSubjectLine(n, innerWidth, p), innerWidth)
+
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop)
+
+	var botBorder string
+	if hasTrunkBot {
+		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInnerBot, true)
+	} else {
+		botBorder = bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
+	}
+
+	return []string{
+		topBorder,
+		bSt.Render("│") + header + bSt.Render("│"),
+		bSt.Render("│") + subject + bSt.Render("│"),
+		botBorder,
+	}
 }
 
 // padContent pads styled content to exactly width visible columns.

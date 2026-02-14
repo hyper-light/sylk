@@ -40,6 +40,15 @@ const (
 	viewCommits                  // Commit cards for a single branch.
 )
 
+// dagSection groups one trunk commit with its offshoot rows above it.
+// The trunk commit is on the first-parent chain; offshoots are commits
+// reachable from merge second-parents that are not on the trunk.
+type dagSection struct {
+	trunkIdx int     // index into m.nodes
+	offIdxs  []int   // offshoot node indices (topo order, newest first)
+	offRows  [][]int // offIdxs grouped into grid rows
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -203,6 +212,11 @@ type Model struct {
 	maxGraphLane int        // widest lane index (for gutter width)
 	dagMode      bool       // true when viewing full DAG (vs flat first-parent)
 
+	// Trunk-and-offshoots DAG layout (recomputed on data/resize change).
+	dagSections    []dagSection // one per trunk commit, newest-first
+	dagSelectedRow int          // selected visual row in DAG view
+	dagSelectedCol int          // column within offshoot row (-1 = trunk)
+
 	// Visual bounce offset from overscroll physics.
 	bounceOffset int
 
@@ -211,6 +225,9 @@ type Model struct {
 
 	// Per-node rendering cache indexed by commit node index.
 	nodeCache []nodeCacheEntry
+
+	// Per-commit-card rendering cache for DAG trunk/offshoot cards.
+	commitCardCache []commitCardCacheEntry
 
 	// Toolbar state.
 	toolbarFocused bool // True when tab-focus is on the toolbar, not card actions.
@@ -260,7 +277,9 @@ func (m *Model) SetSize(width, height int) {
 	if width != m.width {
 		m.invalidateCardCache()
 		m.invalidateNodeCache()
+		m.invalidateCommitCardCache()
 		defer m.recomputeOffshootLayout()
+		defer m.recomputeCommitLayout()
 	}
 	m.width = max(width, 0)
 	m.height = max(height, 0)
@@ -417,8 +436,10 @@ func (m *Model) SetNodesWithStats(nodes []TreeNode, stats map[string][2]int, has
 	m.graphRows = nil
 	m.maxGraphLane = 0
 	m.dagMode = false
+	m.dagSections = m.dagSections[:0]
 	m.mode = viewCommits
 	m.invalidateNodeCache()
+	m.invalidateCommitCardCache()
 	m.viewDirty = true
 }
 
@@ -437,8 +458,12 @@ func (m *Model) SetDAGNodesWithStats(nodes []TreeNode, stats map[string][2]int,
 	m.graphRows = graphRows
 	m.maxGraphLane = maxLane
 	m.dagMode = true
+	m.dagSelectedRow = 0
+	m.dagSelectedCol = -1 // trunk
 	m.mode = viewCommits
 	m.invalidateNodeCache()
+	m.invalidateCommitCardCache()
+	m.recomputeCommitLayout()
 	m.viewDirty = true
 }
 
@@ -648,6 +673,11 @@ func (m *Model) clickCommitView(viewY int) tea.Cmd {
 	if len(m.nodes) == 0 {
 		return nil
 	}
+
+	if m.dagMode && len(m.dagSections) > 0 {
+		return m.clickCommitDAGView(viewY)
+	}
+
 	viewY -= m.viewTopPad()
 	if viewY < 0 {
 		return nil
@@ -662,6 +692,66 @@ func (m *Model) clickCommitView(viewY int) tea.Cmd {
 	m.viewDirty = true
 	if m.selectedIdx != prev {
 		return m.selectionCmd()
+	}
+	return nil
+}
+
+// clickCommitDAGView maps a click Y coordinate to a section/row in DAG mode.
+func (m *Model) clickCommitDAGView(viewY int) tea.Cmd {
+	viewY -= m.viewTopPad()
+	if viewY < 0 {
+		return nil
+	}
+
+	// Walk visual rows from scroll offset, accumulating heights.
+	y := 0
+	visRow := 0
+	for _, sec := range m.dagSections {
+		// Offshoot rows.
+		for range sec.offRows {
+			rowIdx := visRow
+			if rowIdx < m.scrollOff {
+				visRow++
+				continue
+			}
+			// Offshoot row height: card(4) + merge line(1) + connector(1) = 6.
+			rh := branchRowHeight
+			if viewY >= y && viewY < y+rh {
+				prev := m.selectedIdx
+				m.dagSelectedRow = rowIdx
+				// Pick column from X — simplified: use first col.
+				m.dagSelectedCol = 0
+				m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+				m.viewDirty = true
+				if m.selectedIdx != prev {
+					return m.selectionCmd()
+				}
+				return nil
+			}
+			y += rh
+			visRow++
+		}
+
+		// Trunk row.
+		rowIdx := visRow
+		if rowIdx < m.scrollOff {
+			visRow++
+			continue
+		}
+		rh := branchRowHeight
+		if viewY >= y && viewY < y+rh {
+			prev := m.selectedIdx
+			m.dagSelectedRow = rowIdx
+			m.dagSelectedCol = -1
+			m.selectedIdx = sec.trunkIdx
+			m.viewDirty = true
+			if m.selectedIdx != prev {
+				return m.selectionCmd()
+			}
+			return nil
+		}
+		y += rh
+		visRow++
 	}
 	return nil
 }
@@ -1316,6 +1406,10 @@ func (m *Model) viewCommitCards() string {
 		return m.renderPlaceholder("Loading commits...")
 	}
 
+	if m.dagMode && len(m.dagSections) > 0 {
+		return m.viewCommitDAG()
+	}
+
 	visible := m.commitVisibleRange()
 	lines := make([]string, 0, m.height)
 
@@ -1329,6 +1423,124 @@ func (m *Model) viewCommitCards() string {
 	}
 
 	return m.padViewport(lines)
+}
+
+// viewCommitDAG renders the commit DAG with trunk-and-offshoots layout.
+// Trunk commits are centered primary cards; merge offshoots appear as
+// side-by-side grid rows above each merge point.
+func (m *Model) viewCommitDAG() string {
+	cols := m.dagEffectiveCols()
+	cardWidth := offshootCardWidth(m.width, cols)
+	trunkPos := m.width / 2
+	const borderCols = 2
+
+	lines := make([]string, 0, m.height)
+	cacheIdx := 0
+
+	selectedNode := m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+
+	// Scroll: skip dagScrollOff visual rows.
+	visRow := 0
+	for si, sec := range m.dagSections {
+		isLastSection := si == len(m.dagSections)-1
+
+		// Offshoot rows above this merge point.
+		for ri, offRow := range sec.offRows {
+			if visRow < m.scrollOff {
+				visRow++
+				cacheIdx += len(offRow)
+				continue
+			}
+			if len(lines) >= m.contentHeight() {
+				return m.padViewport(lines)
+			}
+
+			rowCols := len(offRow)
+			innerWidth := max(cardWidth-borderCols, 0)
+
+			// All offshoots merge to the trunk.
+			mergeTarget := trunkPos
+			hasTrunkAbove := ri > 0 || (si > 0)
+
+			colIndices := make([]int, rowCols)
+			cardSlices := make([][]string, rowCols)
+			for i, nodeIdx := range offRow {
+				colIndices[i] = i
+				n := m.nodes[nodeIdx]
+				selected := nodeIdx == selectedNode
+
+				cardCenter := innerWidth / 2
+				// Offshoot cards connect downward to the merge line (hasTrunkBot).
+				// They only have a top connector if a trunk line passes through
+				// the card position itself (not just the gap).
+				hasTrunkBot := true
+				trunkInnerBot := cardCenter
+
+				cardSlices[i] = m.getCachedCommitCard(cacheIdx, n, selected,
+					innerWidth, cardCenter, trunkInnerBot, false, hasTrunkBot)
+				cacheIdx++
+			}
+
+			rowLines := composeOffshootRow(cardSlices, colIndices, cardWidth, cols, m.width, m.theme, hasTrunkAbove, mergeTarget, nil)
+			lines = append(lines, rowLines...)
+			visRow++
+		}
+
+		// Trunk card.
+		if visRow < m.scrollOff {
+			visRow++
+			cacheIdx++
+			continue
+		}
+		if len(lines) >= m.contentHeight() {
+			return m.padViewport(lines)
+		}
+
+		n := m.nodes[sec.trunkIdx]
+		selected := sec.trunkIdx == selectedNode
+		primaryCW := primaryCardWidth(m.width)
+		innerWidth := max(primaryCW-borderCols, 0)
+		leftPad := trunkAlignedMargin(m.width, primaryCW)
+		trunkInner := trunkPos - leftPad - 1
+
+		hasTrunkTop := si > 0 || len(sec.offRows) > 0
+		hasTrunkBot := !isLastSection
+		trunkInnerTop := trunkInner
+		trunkInnerBot := trunkInner
+
+		cardLines := m.getCachedCommitCard(cacheIdx, n, selected,
+			innerWidth, trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot)
+		cacheIdx++
+
+		// Compose trunk card with centering and a trunk connector below.
+		pad := strings.Repeat(" ", leftPad)
+		vis := leftPad + primaryCW
+		for _, cl := range cardLines {
+			lines = append(lines, padRight(pad+cl, vis, m.width))
+		}
+		// Trunk connector line between sections.
+		if hasTrunkBot {
+			trunkSt := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
+			trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
+			lines = append(lines, padRight(trunk, trunkPos+1, m.width))
+		} else {
+			lines = append(lines, strings.Repeat(" ", max(m.width, 0)))
+		}
+		visRow++
+	}
+
+	return m.padViewport(lines)
+}
+
+// dagEffectiveCols returns the max offshoot cards per row in DAG mode.
+func (m *Model) dagEffectiveCols() int {
+	maxInRow := 0
+	for _, sec := range m.dagSections {
+		for _, row := range sec.offRows {
+			maxInRow = max(maxInRow, len(row))
+		}
+	}
+	return max(maxInRow, 1)
 }
 
 // padViewport vertically centers lines within the viewport height and
@@ -2076,6 +2288,11 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 	}
 
 	m.toolbarFocused = false
+
+	if m.dagMode && len(m.dagSections) > 0 {
+		return m.handleCommitDAGKey(km)
+	}
+
 	prev := m.selectedIdx
 
 	switch km.String() {
@@ -2110,6 +2327,50 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 		cmds = append(cmds, func() tea.Msg { return LoadMoreMsg{} })
 	}
 	return tea.Batch(cmds...)
+}
+
+// handleCommitDAGKey processes keys when in DAG trunk-and-offshoots mode.
+func (m *Model) handleCommitDAGKey(km tea.KeyMsg) tea.Cmd {
+	prev := m.selectedIdx
+
+	switch km.String() {
+	case "j", "down", "shift+down":
+		m.moveCommitDAGDown()
+	case "k", "up", "shift+up":
+		m.moveCommitDAGUp()
+	case "l", "right":
+		m.moveCommitDAGRight()
+	case "h", "left":
+		m.moveCommitDAGLeft()
+	case "g":
+		m.dagSelectedRow = 0
+		m.dagSelectedCol = -1
+		m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+		m.ensureDAGVisible()
+	case "G":
+		m.dagSelectedRow = max(m.dagTotalRows()-1, 0)
+		m.dagSelectedCol = -1
+		m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+		m.ensureDAGVisible()
+	case "ctrl+d":
+		visRows := max(m.contentHeight()/branchRowHeight/2, 1)
+		for range visRows {
+			m.moveCommitDAGDown()
+		}
+	case "ctrl+u":
+		visRows := max(m.contentHeight()/branchRowHeight/2, 1)
+		for range visRows {
+			m.moveCommitDAGUp()
+		}
+	default:
+		return nil
+	}
+
+	m.viewDirty = true
+	if m.selectedIdx != prev {
+		return m.selectionCmd()
+	}
+	return nil
 }
 
 // cycleCommitToolbar advances toolbar focus by delta (+1 or -1).
@@ -2168,6 +2429,9 @@ func (m *Model) ExitToBranches() {
 	m.graphRows = nil
 	m.maxGraphLane = 0
 	m.dagMode = false
+	m.dagSections = m.dagSections[:0]
+	m.dagSelectedRow = 0
+	m.dagSelectedCol = -1
 	m.toolbarFocused = false
 	m.viewDirty = true
 }
@@ -2251,7 +2515,11 @@ func (m *Model) viewTopPad() int {
 	var cl int
 	switch m.mode {
 	case viewCommits:
-		cl = len(m.commitVisibleRange()) * nodeHeight
+		if m.dagMode && len(m.dagSections) > 0 {
+			cl = m.dagTotalRows() * branchRowHeight
+		} else {
+			cl = len(m.commitVisibleRange()) * nodeHeight
+		}
 	default:
 		endRow := m.visibleEndRow()
 		for rowIdx := m.branchScrollOff; rowIdx < endRow; rowIdx++ {
@@ -2508,6 +2776,209 @@ func (m *Model) offRowConnectors(rowIdx int) int {
 }
 
 // ---------------------------------------------------------------------------
+// Commit DAG layout
+// ---------------------------------------------------------------------------
+
+// recomputeCommitLayout builds the trunk-and-offshoots section layout from
+// the current DAG nodes. The first-parent chain forms the trunk; merge
+// second-parents contribute offshoot commits grouped into grid rows above
+// each merge point.
+func (m *Model) recomputeCommitLayout() {
+	if !m.dagMode || len(m.nodes) == 0 {
+		m.dagSections = m.dagSections[:0]
+		return
+	}
+
+	// Build hash→index map.
+	hashIdx := make(map[string]int, len(m.nodes))
+	for i, n := range m.nodes {
+		hashIdx[n.Hash] = i
+	}
+
+	// Walk first-parent chain from the first node to build the trunk set.
+	trunkSet := make(map[int]bool, len(m.nodes))
+	trunkOrder := make([]int, 0, len(m.nodes))
+	cur := 0
+	for {
+		trunkSet[cur] = true
+		trunkOrder = append(trunkOrder, cur)
+		n := m.nodes[cur]
+		if len(n.Parents) == 0 {
+			break
+		}
+		next, ok := hashIdx[n.Parents[0]]
+		if !ok {
+			break
+		}
+		cur = next
+	}
+
+	// For each merge on the trunk, BFS from second parents to collect
+	// non-trunk offshoot indices.
+	cols := branchCols(m.width)
+	m.dagSections = m.dagSections[:0]
+	for _, ti := range trunkOrder {
+		n := m.nodes[ti]
+		sec := dagSection{trunkIdx: ti}
+		if n.IsMerge && len(n.Parents) > 1 {
+			// BFS from second parents.
+			visited := make(map[int]bool)
+			queue := make([]int, 0, len(n.Parents)-1)
+			for _, ph := range n.Parents[1:] {
+				if pi, ok := hashIdx[ph]; ok && !trunkSet[pi] {
+					queue = append(queue, pi)
+					visited[pi] = true
+				}
+			}
+			for len(queue) > 0 {
+				ci := queue[0]
+				queue = queue[1:]
+				sec.offIdxs = append(sec.offIdxs, ci)
+				for _, ph := range m.nodes[ci].Parents {
+					if pi, ok := hashIdx[ph]; ok && !trunkSet[pi] && !visited[pi] {
+						visited[pi] = true
+						queue = append(queue, pi)
+					}
+				}
+			}
+			// Group offshoots into grid rows.
+			for start := 0; start < len(sec.offIdxs); start += cols {
+				end := min(start+cols, len(sec.offIdxs))
+				sec.offRows = append(sec.offRows, sec.offIdxs[start:end])
+			}
+		}
+		m.dagSections = append(m.dagSections, sec)
+	}
+}
+
+// dagTotalRows returns the total number of visual rows across all sections.
+// Each section contributes len(offRows) offshoot rows + 1 trunk row.
+func (m *Model) dagTotalRows() int {
+	total := 0
+	for _, sec := range m.dagSections {
+		total += len(sec.offRows) + 1
+	}
+	return total
+}
+
+// dagRowAt maps a linear visual row index to (sectionIdx, localRow).
+// localRow < len(sec.offRows) means offshoot row; localRow == len(sec.offRows)
+// means the trunk card. Returns (-1, -1) if out of range.
+func (m *Model) dagRowAt(rowIdx int) (secIdx, localRow int) {
+	pos := 0
+	for si, sec := range m.dagSections {
+		sectionRows := len(sec.offRows) + 1
+		if rowIdx < pos+sectionRows {
+			return si, rowIdx - pos
+		}
+		pos += sectionRows
+	}
+	return -1, -1
+}
+
+// dagNodeIdxAt returns the node index for a given visual row and column.
+// col == -1 is the trunk; col >= 0 indexes into the offshoot row.
+func (m *Model) dagNodeIdxAt(row, col int) int {
+	si, lr := m.dagRowAt(row)
+	if si < 0 {
+		return 0
+	}
+	sec := m.dagSections[si]
+	if lr >= len(sec.offRows) || col < 0 {
+		return sec.trunkIdx
+	}
+	offRow := sec.offRows[lr]
+	if len(offRow) == 0 {
+		return sec.trunkIdx
+	}
+	return offRow[clampInt(col, 0, len(offRow)-1)]
+}
+
+// moveCommitDAGDown moves selection down one visual row.
+func (m *Model) moveCommitDAGDown() {
+	total := m.dagTotalRows()
+	if m.dagSelectedRow+1 < total {
+		m.dagSelectedRow++
+		// If entering a trunk row, set col to -1; if entering offshoot, clamp col.
+		si, lr := m.dagRowAt(m.dagSelectedRow)
+		if si >= 0 {
+			sec := m.dagSections[si]
+			if lr >= len(sec.offRows) {
+				m.dagSelectedCol = -1
+			} else {
+				offRow := sec.offRows[lr]
+				m.dagSelectedCol = clampInt(max(m.dagSelectedCol, 0), 0, len(offRow)-1)
+			}
+		}
+	}
+	m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+	m.ensureDAGVisible()
+}
+
+// moveCommitDAGUp moves selection up one visual row.
+func (m *Model) moveCommitDAGUp() {
+	if m.dagSelectedRow > 0 {
+		m.dagSelectedRow--
+		si, lr := m.dagRowAt(m.dagSelectedRow)
+		if si >= 0 {
+			sec := m.dagSections[si]
+			if lr >= len(sec.offRows) {
+				m.dagSelectedCol = -1
+			} else {
+				offRow := sec.offRows[lr]
+				m.dagSelectedCol = clampInt(max(m.dagSelectedCol, 0), 0, len(offRow)-1)
+			}
+		}
+	}
+	m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+	m.ensureDAGVisible()
+}
+
+// moveCommitDAGRight moves selection right within an offshoot row.
+func (m *Model) moveCommitDAGRight() {
+	si, lr := m.dagRowAt(m.dagSelectedRow)
+	if si < 0 {
+		return
+	}
+	sec := m.dagSections[si]
+	if lr >= len(sec.offRows) {
+		return // trunk row, single card
+	}
+	offRow := sec.offRows[lr]
+	if m.dagSelectedCol+1 < len(offRow) {
+		m.dagSelectedCol++
+	}
+	m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+}
+
+// moveCommitDAGLeft moves selection left within an offshoot row.
+func (m *Model) moveCommitDAGLeft() {
+	if m.dagSelectedCol > 0 {
+		m.dagSelectedCol--
+	}
+	m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
+}
+
+// ensureDAGVisible scrolls the DAG view so the selected row is visible.
+func (m *Model) ensureDAGVisible() {
+	// Estimate rows per viewport using branchRowHeight.
+	visRows := max(m.contentHeight()/branchRowHeight, 1)
+	if m.dagSelectedRow < m.scrollOff {
+		m.scrollOff = m.dagSelectedRow
+	} else if m.dagSelectedRow >= m.scrollOff+visRows {
+		m.scrollOff = m.dagSelectedRow - visRows + 1
+	}
+	m.clampDAGScroll()
+}
+
+// clampDAGScroll constrains the DAG scroll offset.
+func (m *Model) clampDAGScroll() {
+	visRows := max(m.contentHeight()/branchRowHeight, 1)
+	maxScroll := max(m.dagTotalRows()-visRows, 0)
+	m.scrollOff = clampInt(m.scrollOff, 0, maxScroll)
+}
+
+// ---------------------------------------------------------------------------
 // Navigation helpers (branch view)
 // ---------------------------------------------------------------------------
 
@@ -2609,6 +3080,10 @@ func (m *Model) activeScrollOff() *int {
 // activeMaxScroll returns the max scroll for the active view.
 func (m *Model) activeMaxScroll() int {
 	if m.mode == viewCommits {
+		if m.dagMode && len(m.dagSections) > 0 {
+			visRows := max(m.contentHeight()/branchRowHeight, 1)
+			return max(m.dagTotalRows()-visRows, 0)
+		}
 		return m.commitMaxScroll()
 	}
 	return m.branchMaxScroll()

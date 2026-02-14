@@ -207,3 +207,80 @@ func (m *Model) getCachedCard(flatIdx int, b BranchNode, selected bool,
 	entry.lines = lines
 	return lines
 }
+
+// =========================================================================
+// Commit card cache (DAG trunk/offshoot cards)
+// =========================================================================
+
+// commitCardCacheKey captures all inputs affecting a commit card's rendered
+// output in the DAG trunk-and-offshoots view. Two keys are equal if and only
+// if the corresponding cards would render identically.
+type commitCardCacheKey struct {
+	shortHash string
+	subject   string
+	author    string
+	branch    string
+	isMerge   bool
+	additions int
+	deletions int
+	relTime   string
+
+	selected      bool
+	innerWidth    int
+	trunkInnerTop int
+	trunkInnerBot int
+	hasTrunkTop   bool
+	hasTrunkBot   bool
+}
+
+// commitCardCacheEntry pairs a key with its rendered output.
+type commitCardCacheEntry struct {
+	valid bool
+	key   commitCardCacheKey
+	lines []string
+}
+
+// invalidateCommitCardCache clears all cached commit card entries.
+func (m *Model) invalidateCommitCardCache() {
+	m.commitCardCache = m.commitCardCache[:0]
+}
+
+// getCachedCommitCard returns cached card lines if the key matches, otherwise
+// renders the card, stores it in the cache, and returns fresh lines.
+func (m *Model) getCachedCommitCard(cacheIdx int, n TreeNode, selected bool,
+	innerWidth, trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool) []string {
+
+	key := commitCardCacheKey{
+		shortHash:     n.ShortHash,
+		subject:       n.Subject,
+		author:        n.Author,
+		branch:        n.Branch,
+		isMerge:       n.IsMerge,
+		additions:     n.Additions,
+		deletions:     n.Deletions,
+		relTime:       relativeTime(n.AuthorTime),
+		selected:      selected,
+		innerWidth:    innerWidth,
+		trunkInnerTop: trunkInnerTop,
+		trunkInnerBot: trunkInnerBot,
+		hasTrunkTop:   hasTrunkTop,
+		hasTrunkBot:   hasTrunkBot,
+	}
+
+	for len(m.commitCardCache) <= cacheIdx {
+		m.commitCardCache = append(m.commitCardCache, commitCardCacheEntry{})
+	}
+
+	entry := &m.commitCardCache[cacheIdx]
+	if entry.valid && entry.key == key {
+		return entry.lines
+	}
+
+	lines := renderCommitCard(n, selected, innerWidth, m.theme.Palette,
+		trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot)
+
+	entry.valid = true
+	entry.key = key
+	entry.lines = lines
+	return lines
+}

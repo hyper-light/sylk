@@ -860,7 +860,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 			if m.commitTree.InCommitView() {
 				defaultBranch := m.commitTree.GetDefaultBranch()
-				cmds = append(cmds, m.loadBranchCommitsAndStatsCmd(m.commitTree.ActiveBranch(), defaultBranch))
+				cmds = append(cmds, m.loadBranchDAGCmd(m.commitTree.ActiveBranch(), defaultBranch))
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -877,7 +877,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			if m.commitTree != nil {
 				defaultBranch = m.commitTree.GetDefaultBranch()
 			}
-			return m, m.loadBranchCommitsAndStatsCmd(typed.Name, defaultBranch)
+			return m, m.loadBranchDAGCmd(typed.Name, defaultBranch)
 		}
 		return m, nil
 
@@ -3361,6 +3361,52 @@ func (m *AppModel) loadBranchCommitsAndStatsCmd(branchName, defaultBranch string
 			stats:   stats,
 			hasMore: hasMore,
 		}
+	}
+}
+
+// loadBranchDAGCmd loads the full DAG of branch-unique commits with graph
+// layout. Falls back to flat first-parent mode if the DAG exceeds the limit.
+func (m *AppModel) loadBranchDAGCmd(branchName, defaultBranch string) tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		commits, err := gc.ListBranchDAGCommits(branchName, defaultBranch, git.DagCommitLimit)
+		if err != nil || len(commits) == 0 {
+			// Fall back to flat first-parent pagination.
+			return m.loadBranchCommitsAndStatsFallback(gc, branchName, defaultBranch)
+		}
+		nodes := commitsToTreeNodes(commits)
+		if len(nodes) > 0 {
+			nodes[0].Branch = branchName
+		}
+		graphRows, maxLane := committree.AssignLanes(nodes)
+		stats := loadStatsForNodes(gc, nodes)
+		return gitBranchDAGLoadedMsg{
+			branch:       branchName,
+			nodes:        nodes,
+			stats:        stats,
+			graphRows:    graphRows,
+			maxGraphLane: maxLane,
+		}
+	}
+}
+
+// loadBranchCommitsAndStatsFallback is the flat-mode fallback used when DAG
+// loading fails or exceeds limits. Called from within the DAG cmd goroutine.
+func (m *AppModel) loadBranchCommitsAndStatsFallback(gc *git.GitClient, branchName, defaultBranch string) tea.Msg {
+	commits, hasMore, err := gc.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
+	if err != nil {
+		return gitBranchFullyLoadedMsg{branch: branchName}
+	}
+	nodes := commitsToTreeNodes(commits)
+	if len(nodes) > 0 {
+		nodes[0].Branch = branchName
+	}
+	stats := loadStatsForNodes(gc, nodes)
+	return gitBranchFullyLoadedMsg{
+		branch:  branchName,
+		nodes:   nodes,
+		stats:   stats,
+		hasMore: hasMore,
 	}
 }
 
