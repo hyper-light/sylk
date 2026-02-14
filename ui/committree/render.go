@@ -69,7 +69,7 @@ func renderNode(n TreeNode, selected bool, width int, th *theme.Theme, isFirst, 
 	cardWidth := primaryCardWidth(width)
 	const borderCols = 2
 	innerWidth := max(cardWidth-borderCols, 0)
-	leftPad := max((width-cardWidth)/2, 0)
+	leftPad := trunkAlignedMargin(width, cardWidth)
 	trunkPos := width / 2
 	trunkInner := trunkPos - leftPad - 1
 
@@ -273,6 +273,14 @@ const (
 	offshootWidthPct   = 55 // single-column offshoot width as percentage
 )
 
+// trunkAlignedMargin returns the left margin that centers contentWidth within
+// panelWidth such that margin + contentWidth/2 == panelWidth/2. This avoids
+// the off-by-one that (panelWidth - contentWidth) / 2 produces when the two
+// widths have different parities.
+func trunkAlignedMargin(panelWidth, contentWidth int) int {
+	return max(panelWidth/2-contentWidth/2, 0)
+}
+
 // branchCols returns how many offshoot cards fit side-by-side.
 // Derived from: cols * minBranchCardWidth + (cols-1) * branchCardGap <= width.
 func branchCols(width int) int {
@@ -374,6 +382,27 @@ func (e *branchExpansion) actionBlockedReason(isHead bool) string {
 	}
 }
 
+// wrapText performs word-boundary wrapping of text into lines of at most
+// maxWidth visible columns. Words that exceed maxWidth are placed on their
+// own line (padContent will truncate them).
+func wrapText(text string, maxWidth int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	var lines []string
+	line := words[0]
+	for _, w := range words[1:] {
+		if len(line)+1+len(w) > maxWidth {
+			lines = append(lines, line)
+			line = w
+		} else {
+			line += " " + w
+		}
+	}
+	return append(lines, line)
+}
+
 // buildBranchCard returns the rendered lines for a single branch card.
 // Normal cards produce 4 lines; expanded cards produce 6–7 depending on
 // whether a blocked-reason line is needed.
@@ -411,8 +440,10 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 	if expanded && exp != nil {
 		mutedSt := lipgloss.NewStyle().Foreground(p.Muted)
 		divider := bSt.Render("├") + mutedSt.Render(strings.Repeat("╌", innerWidth)) + bSt.Render("┤")
-		content := bSt.Render("│") + padContent(buildExpContentLine(b, exp, innerWidth, p), innerWidth) + bSt.Render("│")
-		lines = append(lines, divider, content)
+		lines = append(lines, divider)
+		for _, cl := range buildExpandedLines(b, exp, innerWidth, p) {
+			lines = append(lines, bSt.Render("│")+padContent(cl, innerWidth)+bSt.Render("│"))
+		}
 
 		// Inline prompts: delete confirmation, commit input, or blocked reason.
 		if exp.deleteConfirm {
@@ -423,8 +454,11 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 			lines = append(lines, inputLine)
 		} else if reason := exp.actionBlockedReason(b.IsHead); reason != "" {
 			reasonSt := lipgloss.NewStyle().Foreground(p.Warning)
-			reasonLine := bSt.Render("│") + padContent(" "+reasonSt.Render(reason), innerWidth) + bSt.Render("│")
-			lines = append(lines, reasonLine)
+			// Word-wrap the reason text to fit the card (1-col indent).
+			for _, wl := range wrapText(reason, innerWidth-1) {
+				rl := bSt.Render("│") + padContent(" "+reasonSt.Render(wl), innerWidth) + bSt.Render("│")
+				lines = append(lines, rl)
+			}
 		}
 	}
 
@@ -439,13 +473,128 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 	return lines
 }
 
-// buildExpContentLine renders the single expanded info row:
-//
-//	" N commits  [Switch]  [Delete]"
-//	" N commits  [dirty]  [Switch]  [Delete]"
-//
-// Left-aligned with 1-space indent. Stats and actions on a single line.
-func buildExpContentLine(b BranchNode, exp *branchExpansion, width int, p theme.Palette) string {
+// visibleActions returns the ordered action IDs for a branch card.
+// HEAD shows [Commit]; default shows [Switch]; others show [Switch, Delete].
+func visibleActions(b BranchNode, defaultBranch string) []int {
+	if b.IsHead {
+		return []int{branchActionCommit}
+	}
+	if defaultBranch == b.Name {
+		return []int{branchActionSwitch}
+	}
+	return []int{branchActionSwitch, branchActionDelete}
+}
+
+// badgePlacement describes the position of one action badge in the
+// expanded card's flow layout.
+type badgePlacement struct {
+	line int // line offset relative to first badge line
+	x    int // column offset within card content
+	w    int // visual width of badge label
+}
+
+// computeBadgeLayout flows badges left-to-right within width, wrapping to
+// new lines when the next badge would exceed the available space.
+// firstLineStart is the column where badge placement begins on line 0
+// (typically the stats text width). Wrapped lines start at column 1.
+// Returns per-badge placements and the number of lines occupied (≥1 when
+// actions is non-empty, 0 when empty).
+func computeBadgeLayout(actions []int, width, firstLineStart int) ([]badgePlacement, int) {
+	if len(actions) == 0 {
+		return nil, 0
+	}
+	placements := make([]badgePlacement, 0, len(actions))
+	line := 0
+	x := firstLineStart
+	for _, actionID := range actions {
+		gap := actionBadgeGap(actionID)
+		bw := len(actionBadgeLabel(actionID))
+		if x > 1 && x+gap+bw > width {
+			line++
+			x = 1
+		}
+		// No leading gap at line start — badges sit flush left.
+		if x <= 1 {
+			gap = 0
+		}
+		x += gap
+		placements = append(placements, badgePlacement{line: line, x: x, w: bw})
+		x += bw
+	}
+	return placements, line + 1
+}
+
+// buildExpandedLines renders the expanded card content lines. Badges are
+// placed on the stats line when they all fit; otherwise they move to a
+// dedicated line below stats, wrapping within that line only if needed.
+func buildExpandedLines(b BranchNode, exp *branchExpansion, innerWidth int, p theme.Palette) []string {
+	statsLine := buildExpStatsLine(b, exp, p)
+	statsWidth := lipgloss.Width(statsLine)
+
+	actions := visibleActions(b, exp.defaultBranch)
+	if len(actions) == 0 {
+		return []string{statsLine}
+	}
+
+	// Try placing all badges on the stats line.
+	placements, badgeLineCount := computeBadgeLayout(actions, innerWidth, statsWidth)
+	badgesInline := badgeLineCount == 1
+
+	if !badgesInline {
+		// Badges don't all fit on the stats line — move them to their
+		// own row and allow wrapping within that dedicated row.
+		const badgeIndent = 1
+		placements, badgeLineCount = computeBadgeLayout(actions, innerWidth, badgeIndent)
+	}
+
+	lines := make([]string, 0, 1+badgeLineCount)
+
+	if badgesInline {
+		// Single output line: stats + badges.
+		lines = append(lines, renderBadgeLine(statsLine, statsWidth, placements, 0, actions, b, exp, p))
+	} else {
+		// Stats on their own line, dashed divider, then badges.
+		mutedSt := lipgloss.NewStyle().Foreground(p.Muted)
+		divider := mutedSt.Render(strings.Repeat("-", innerWidth))
+		lines = append(lines, statsLine)
+		lines = append(lines, divider)
+		for li := range badgeLineCount {
+			lines = append(lines, renderBadgeLine("", 0, placements, li, actions, b, exp, p))
+		}
+		lines = append(lines, divider)
+	}
+
+	debugLogExpandedLines(lines, innerWidth)
+
+	return lines
+}
+
+// renderBadgeLine builds a single line containing badge renders at their
+// computed placements. prefix is prepended (e.g. statsLine for inline mode).
+func renderBadgeLine(prefix string, prefixWidth int, placements []badgePlacement, lineIdx int, actions []int, b BranchNode, exp *branchExpansion, p theme.Palette) string {
+	var buf strings.Builder
+	col := 0
+	if prefix != "" {
+		buf.WriteString(prefix)
+		col = prefixWidth
+	}
+	for pi, bp := range placements {
+		if bp.line != lineIdx {
+			continue
+		}
+		if bp.x > col {
+			buf.WriteString(strings.Repeat(" ", bp.x-col))
+			col = bp.x
+		}
+		buf.WriteString(renderExpActionBadge(actions[pi], b, exp, p))
+		col += bp.w
+	}
+	return buf.String()
+}
+
+// buildExpStatsLine renders the stats portion of the expanded content:
+// commit count, optional behind count, and optional dirty/conflicts status.
+func buildExpStatsLine(b BranchNode, exp *branchExpansion, p theme.Palette) string {
 	countStyle := lipgloss.NewStyle().Foreground(p.Foreground)
 	count := itoa(b.CommitCount)
 	if b.CommitCountCapped {
@@ -472,28 +621,25 @@ func buildExpContentLine(b BranchNode, exp *branchExpansion, width int, p theme.
 		}
 	}
 
-	// [Commit] badge — HEAD only, enabled when staged files exist.
-	if b.IsHead {
-		commitEn := exp.hasStagedFiles
-		commitLabel := renderActionBadge("Commit", p.Secondary, commitEn, exp.selectedActionID == branchActionCommit, p)
-		text += "  " + commitLabel
-	}
-
-	// [Switch] badge — hidden for HEAD (already on this branch).
-	if !b.IsHead {
-		switchEn := exp.switchEnabled(b.IsHead)
-		switchLabel := renderActionBadge("Switch", p.Success, switchEn, exp.selectedActionID == branchActionSwitch, p)
-		text += "  " + switchLabel
-	}
-
-	// [Delete] badge — hidden for HEAD and default branch.
-	if !b.IsHead && exp.deleteVisible(b.Name) {
-		deleteEn := exp.deleteEnabled(b.Name, b.IsHead)
-		deleteLabel := renderActionBadge("Delete", p.Error, deleteEn, exp.selectedActionID == branchActionDelete, p)
-		text += " " + deleteLabel
-	}
-
 	return text
+}
+
+// renderExpActionBadge renders a single action badge with appropriate
+// styling based on the action type and current expansion state.
+func renderExpActionBadge(actionID int, b BranchNode, exp *branchExpansion, p theme.Palette) string {
+	switch actionID {
+	case branchActionCommit:
+		return renderActionBadge("Commit", p.Secondary, exp.hasStagedFiles,
+			exp.selectedActionID == branchActionCommit, p)
+	case branchActionSwitch:
+		return renderActionBadge("Switch", p.Success, exp.switchEnabled(b.IsHead),
+			exp.selectedActionID == branchActionSwitch, p)
+	case branchActionDelete:
+		return renderActionBadge("Delete", p.Error, exp.deleteEnabled(b.Name, b.IsHead),
+			exp.selectedActionID == branchActionDelete, p)
+	default:
+		return ""
+	}
 }
 
 // actionBadgeLabel returns the bracket-wrapped label for an action ID.
@@ -543,6 +689,10 @@ func actionLinePrefixWidth(b BranchNode, dirty, conflicts bool) int {
 	return w
 }
 
+// cardActionLine is the card line index where action badges start.
+// Derived from: top(0) + header(1) + subject(2) + divider(3) → actions(4).
+const cardActionLine = 4
+
 // cardHitKind identifies the type of clickable region in an expanded card.
 type cardHitKind int
 
@@ -562,29 +712,51 @@ type cardHitRegion struct {
 	Idx  int         // action index (hitActionBadge only)
 }
 
-// Card line indices for expanded branch cards, derived from buildBranchCard:
-// [0] top border, [1] header, [2] subject, [3] divider → [4] actions.
-const (
-	cardActionLine  = 4 // action badges line
-	cardSubviewLine = 5 // delete confirm / commit input / blocked reason
-)
-
 // Delete confirm layout constants shared between rendering and click detection.
 const (
-	deleteConfirmPrompt   = "Delete this branch?"
-	deleteConfirmYesLabel = "(y)es"
-	deleteConfirmNoLabel  = "(n)o"
-	deleteConfirmGap      = 2
+	deleteConfirmPromptFull    = "Delete this branch?"
+	deleteConfirmPromptCompact = "Delete?"
+	deleteConfirmYesLabel      = "(y)es"
+	deleteConfirmNoLabel       = "(n)o"
+	deleteConfirmGap           = 2
+	deleteConfirmGapCompact    = 1
 )
 
-// deleteConfirmYesStart returns the X offset where "(y)es" begins.
-func deleteConfirmYesStart() int {
-	return 1 + len(deleteConfirmPrompt) + deleteConfirmGap
+// deleteConfirmLayout holds the adaptive positions for the confirm line.
+type deleteConfirmLayout struct {
+	prompt   string
+	gap      int
+	yesStart int
+	noStart  int
 }
 
-// deleteConfirmNoStart returns the X offset where "(n)o" begins.
-func deleteConfirmNoStart() int {
-	return deleteConfirmYesStart() + len(deleteConfirmYesLabel) + deleteConfirmGap
+// computeDeleteConfirmLayout picks the prompt and gap that fit the card width,
+// returning the X offsets for (y)es and (n)o.
+func computeDeleteConfirmLayout(width int) deleteConfirmLayout {
+	// Try full layout first: " Delete this branch?  (y)es  (n)o"
+	full := tryDeleteLayout(deleteConfirmPromptFull, deleteConfirmGap, width)
+	if full.yesStart > 0 {
+		return full
+	}
+	// Compact layout: " Delete? (y)es (n)o"
+	return tryDeleteLayout(deleteConfirmPromptCompact, deleteConfirmGapCompact, width)
+}
+
+// tryDeleteLayout checks if the prompt+gap+labels fit within width.
+// Returns a layout with yesStart=0 if it doesn't fit.
+func tryDeleteLayout(prompt string, gap, width int) deleteConfirmLayout {
+	yesStart := 1 + len(prompt) + gap
+	noStart := yesStart + len(deleteConfirmYesLabel) + gap
+	totalWidth := noStart + len(deleteConfirmNoLabel)
+	if totalWidth > width {
+		return deleteConfirmLayout{}
+	}
+	return deleteConfirmLayout{
+		prompt:   prompt,
+		gap:      gap,
+		yesStart: yesStart,
+		noStart:  noStart,
+	}
 }
 
 // commitInputLabelWidth is the visual width of the " Message: " label.
@@ -612,29 +784,30 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // depends on the commit phase:
 //
 // buildDeleteConfirmLine renders the inline delete confirmation prompt with
-// toggleable (y)es / (n)o options. The selected option is highlighted with
-// its semantic color (green for yes, red for no); the unselected option is muted.
+// toggleable (y)es / (n)o options. The prompt adapts to the card width:
+// full ("Delete this branch?") when space allows, compact ("Delete?") otherwise.
 //
-//	" Delete this branch?  (y)es  (n)o"
+//	wide:   " Delete this branch?  (y)es  (n)o"
+//	narrow: " Delete? (y)es (n)o"
 func buildDeleteConfirmLine(yesSelected bool, width int, p theme.Palette) string {
+	lay := computeDeleteConfirmLayout(width)
 	promptSt := lipgloss.NewStyle().Foreground(p.Muted)
 
-	yesMuted := lipgloss.NewStyle().Foreground(p.Muted)
 	yesAccent := lipgloss.NewStyle().Foreground(p.Success).Bold(true)
-	noMuted := lipgloss.NewStyle().Foreground(p.Muted)
 	noAccent := lipgloss.NewStyle().Foreground(p.Error).Bold(true)
+	muted := lipgloss.NewStyle().Foreground(p.Muted)
 
 	var yes, no string
 	if yesSelected {
-		yes = yesAccent.Render("(y)") + yesAccent.Render("es")
-		no = noMuted.Render("(n)") + noMuted.Render("o")
+		yes = yesAccent.Render("(y)es")
+		no = muted.Render("(n)o")
 	} else {
-		yes = yesMuted.Render("(y)") + yesMuted.Render("es")
-		no = noAccent.Render("(n)") + noAccent.Render("o")
+		yes = muted.Render("(y)es")
+		no = noAccent.Render("(n)o")
 	}
 
-	gap := strings.Repeat(" ", deleteConfirmGap)
-	return " " + promptSt.Render(deleteConfirmPrompt) + gap + yes + gap + no
+	gap := strings.Repeat(" ", lay.gap)
+	return " " + promptSt.Render(lay.prompt) + gap + yes + gap + no
 }
 
 //	idle:        " Message: ▏some commit text"
@@ -718,7 +891,7 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 
 	// Compute card positions using fixed grid so columns align across rows.
 	totalContent := gridCols*cardWidth + max(gridCols-1, 0)*branchCardGap
-	leftMargin := max((width-totalContent)/2, 0)
+	leftMargin := trunkAlignedMargin(width, totalContent)
 
 	cardLefts := make([]int, cols)
 	cardCenters := make([]int, cols)
@@ -740,7 +913,7 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 		for i := range cols {
 			target := cardLefts[i]
 			for col < target {
-				if hasTrunkAbove && cols > 1 && col == trunkPos {
+				if hasTrunkAbove && col == trunkPos {
 					buf.WriteString(trunkSt.Render("│"))
 				} else {
 					buf.WriteByte(' ')
@@ -758,33 +931,61 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 			}
 			col += cardWidth
 		}
-		lines = append(lines, padRight(buf.String(), col, width))
+		// Fill remaining space, drawing trunk at trunkPos if needed.
+		for col < width {
+			if hasTrunkAbove && col == trunkPos {
+				buf.WriteString(trunkSt.Render("│"))
+			} else {
+				buf.WriteByte(' ')
+			}
+			col++
+		}
+		lines = append(lines, buf.String())
 	}
 
 	// For off-center single cards, draw a vertical connector from the
 	// card's center down to the merge line so the tree stays connected.
 	if cols == 1 && cardCenters[0] != mergeTarget {
 		center := cardCenters[0]
-		connector := strings.Repeat(" ", center) + trunkSt.Render("│")
-		lines = append(lines, padRight(connector, center+1, width))
+		var connBuf strings.Builder
+		for c := range width {
+			if c == center || (hasTrunkAbove && c == trunkPos) {
+				connBuf.WriteString(trunkSt.Render("│"))
+			} else {
+				connBuf.WriteByte(' ')
+			}
+		}
+		lines = append(lines, connBuf.String())
 	}
 
 	// Merge line: connects card center(s) to the merge target.
 	// When a single card is centered on the target, a simple vertical
 	// suffices; otherwise draw a horizontal merge connector.
-	targetVis := mergeTarget + 1
 	if cols == 1 && cardCenters[0] == mergeTarget {
-		line := strings.Repeat(" ", mergeTarget) + trunkSt.Render("│")
-		lines = append(lines, padRight(line, targetVis, width))
+		lines = append(lines, buildConnectorLine(mergeTarget, trunkPos, hasTrunkAbove, width, trunkSt))
 	} else {
 		lines = append(lines, renderMergeLine(cardCenters, mergeTarget, width, th))
 	}
 
 	// Vertical connector below the merge line.
-	connector := strings.Repeat(" ", mergeTarget) + trunkSt.Render("│")
-	lines = append(lines, padRight(connector, targetVis, width))
+	lines = append(lines, buildConnectorLine(mergeTarget, trunkPos, hasTrunkAbove, width, trunkSt))
 
 	return lines
+}
+
+// buildConnectorLine draws a vertical connector at target, optionally also
+// drawing the trunk at trunkPos when hasTrunkAbove is true. The line is
+// padded to exactly width columns.
+func buildConnectorLine(target, trunkPos int, hasTrunkAbove bool, width int, trunkSt lipgloss.Style) string {
+	var buf strings.Builder
+	for c := range width {
+		if c == target || (hasTrunkAbove && c == trunkPos) {
+			buf.WriteString(trunkSt.Render("│"))
+		} else {
+			buf.WriteByte(' ')
+		}
+	}
+	return buf.String()
 }
 
 // composePrimaryRow composes a pre-rendered primary branch card into a row
@@ -792,7 +993,7 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 // (possibly cached).
 func composePrimaryRow(cardLines []string, width int) []string {
 	cardWidth := primaryCardWidth(width)
-	leftPad := max((width-cardWidth)/2, 0)
+	leftPad := trunkAlignedMargin(width, cardWidth)
 	blank := strings.Repeat(" ", max(width, 0))
 
 	vis := leftPad + cardWidth

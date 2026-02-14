@@ -818,7 +818,35 @@ func (c *GitClient) CreateBranch(name, atCommitHash string) error {
 		return err
 	}
 
-	return c.repo.Storer.SetReference(plumbing.NewHashReference(refName, hash))
+	if err := c.repo.Storer.SetReference(plumbing.NewHashReference(refName, hash)); err != nil {
+		return err
+	}
+
+	// Write a reflog entry so branchCreatedTime returns a stable timestamp.
+	// go-git does not write reflogs automatically; without this, the fallback
+	// is the ref file's mtime, which changes on every commit.
+	_ = c.writeInitialReflog(name, hash)
+
+	return nil
+}
+
+// writeInitialReflog creates a reflog file for a newly created branch with
+// a single "branch: Created" entry. The reflog timestamp is used by
+// branchCreatedTime to provide a stable creation time that survives
+// subsequent ref updates.
+func (c *GitClient) writeInitialReflog(name string, hash plumbing.Hash) error {
+	logPath := filepath.Join(c.repoPath, ".git", "logs", "refs", "heads", name)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return err
+	}
+
+	ts := time.Now()
+	// Standard reflog format: <old> <new> <name> <<email>> <unix> <tz>\t<msg>
+	entry := plumbing.ZeroHash.String() + " " + hash.String() +
+		" sylk <sylk@localhost> " + strconv.FormatInt(ts.Unix(), 10) +
+		" +0000\tbranch: Created\n"
+
+	return os.WriteFile(logPath, []byte(entry), 0o644)
 }
 
 // =============================================================================

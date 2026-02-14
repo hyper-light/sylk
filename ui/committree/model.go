@@ -159,11 +159,12 @@ type Model struct {
 	branchParents   map[string]string // child → parent branch name.
 
 	// Depth-aware offshoot layout (recomputed on data/resize change).
-	offRows    [][]int // offRows[rowIdx] = flat offshoot indices in that row
-	offRowOf   []int   // offRowOf[flatIdx] = row index for offshoot
-	offColOf   []int   // offColOf[flatIdx] = sequential position within row (navigation)
-	offGridCol []int   // offGridCol[flatIdx] = grid column for rendering alignment
-	offDepth   []int   // offDepth[flatIdx] = depth tier (0 = child of default)
+	offRows      [][]int // offRows[rowIdx] = flat offshoot indices in that row
+	offRowOf     []int   // offRowOf[flatIdx] = row index for offshoot
+	offColOf     []int   // offColOf[flatIdx] = sequential position within row (navigation)
+	offGridCol   []int   // offGridCol[flatIdx] = grid column for rendering alignment
+	offDepth     []int   // offDepth[flatIdx] = depth tier (0 = child of default)
+	offExtraConn []bool  // offExtraConn[rowIdx] = row has extra off-center connector line
 
 	// Expansion state.
 	expandedIdx      int  // Flat branch index of expanded card, -1 = none.
@@ -319,8 +320,9 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 		}
 	}
 
-	// Sort: default branch last, then group children immediately after
-	// their parent. First do a time-based sort, then reorder children.
+	// Sort: default branch last, newest-first by AuthorTime. Sibling
+	// ordering within depth tiers is handled by recomputeOffshootLayout
+	// (which uses CreatedTime for stable ordering when reflogs exist).
 	slices.SortStableFunc(branches, func(a, b BranchNode) int {
 		ap := a.Name == defaultBranch
 		bp := b.Name == defaultBranch
@@ -330,7 +332,7 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 			}
 			return -1
 		}
-		return b.AuthorTime.Compare(a.AuthorTime)
+		return b.AuthorTime.Compare(a.AuthorTime) // newest first
 	})
 	branches = groupChildrenAfterParent(branches)
 
@@ -665,42 +667,53 @@ func (m *Model) clickCommitView(viewY int) tea.Cmd {
 }
 
 // branchRowLines returns the height (in terminal rows) of a rendered branch
-// row, accounting for expanded cards that are taller than branchRowHeight.
+// row, accounting for expanded cards and off-center connector lines.
 func (m *Model) branchRowLines(rowIdx int) int {
 	if rowIdx >= len(m.offRows) {
-		// Primary row: card height + padding to branchRowHeight minimum.
-		oc := m.offshootCount()
-		cardH := m.branchCardHeight(oc) // primary is at flat index = offshootCount
-		return max(cardH, branchRowHeight)
+		return max(m.branchCardHeight(m.offshootCount()), branchRowHeight)
 	}
-
-	// Offshoot row: tallest card in this row + 2 connector lines.
 	tallest := 0
 	for _, fi := range m.offRows[rowIdx] {
 		tallest = max(tallest, m.branchCardHeight(fi))
 	}
-	return tallest + 2 // +2 for merge/trunk connector lines
+	return tallest + m.offRowConnectors(rowIdx)
 }
 
 // branchCardHeight returns the rendered line count for a single branch card.
-// Normal cards: 4 lines. Expanded: 6–7 depending on inline prompts.
+// Normal cards: 4 lines. Expanded: base + divider + stats + badge lines +
+// optional subview, where badge lines vary with card width.
 func (m *Model) branchCardHeight(flatIdx int) int {
 	const baseLines = 4 // top border + header + subject + bottom border
 	if m.expandedIdx != flatIdx {
 		return baseLines
 	}
-	// Expanded: +2 for divider + action line.
-	h := baseLines + 2
-	// Optional extra line (delete confirm / commit input / blocked reason).
 	b := m.branches[flatIdx]
+	actions := visibleActions(b, m.defaultBranch)
+	innerWidth := m.expandedCardInnerWidth()
+	statsWidth := actionLinePrefixWidth(b, m.workingDirty, m.workingConflicts)
+	_, badgeLineCount := computeBadgeLayout(actions, innerWidth, statsWidth)
+	badgesInline := badgeLineCount <= 1
+	if !badgesInline {
+		const badgeIndent = 1
+		_, badgeLineCount = computeBadgeLayout(actions, innerWidth, badgeIndent)
+	}
+	// divider(1) + content lines. Always at least the stats line.
+	contentLines := max(badgeLineCount, 1)
+	if !badgesInline {
+		contentLines += 3 // stats + top divider + bottom divider
+	}
+	h := baseLines + 1 + contentLines
+	// Optional subview line (delete confirm / commit input / blocked reason).
 	if m.deleteConfirmActive {
 		h++
 	} else if m.commitInputActive && b.IsHead {
 		h++
 	} else {
 		exp := m.buildExpansion(false)
-		if exp != nil && exp.actionBlockedReason(b.IsHead) != "" {
-			h++
+		if exp != nil {
+			if reason := exp.actionBlockedReason(b.IsHead); reason != "" {
+				h += len(wrapText(reason, m.expandedCardInnerWidth()-1))
+			}
 		}
 	}
 	return h
@@ -710,6 +723,7 @@ func (m *Model) branchCardHeight(flatIdx int) int {
 // Clicking an already-selected card toggles the expansion dropdown.
 // Clicking an action badge on an expanded card executes that action.
 func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
+	m.debugLogClick(viewX, viewY)
 	if len(m.branches) == 0 {
 		return nil
 	}
@@ -750,7 +764,7 @@ func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 		row := m.offRows[targetRow]
 		cardW = offshootCardWidth(m.width, cols)
 		totalGrid := cols*cardW + max(cols-1, 0)*branchCardGap
-		leftMargin := max((m.width-totalGrid)/2, 0)
+		leftMargin := trunkAlignedMargin(m.width, totalGrid)
 
 		hitIdx := -1
 		for i, flatIdx := range row {
@@ -769,7 +783,7 @@ func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 	} else if targetRow == offRows {
 		// Primary branch — check X bounds same as offshoots.
 		cardW = primaryCardWidth(m.width)
-		cardLeft = max((m.width-cardW)/2, 0)
+		cardLeft = trunkAlignedMargin(m.width, cardW)
 		if viewX < cardLeft || viewX >= cardLeft+cardW {
 			return nil
 		}
@@ -783,8 +797,9 @@ func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 	// both X and Y coordinates to prevent cross-line interference.
 	if m.expandedIdx == targetIdx {
 		cardH := m.branchCardHeight(targetIdx)
+		localX := viewX - cardLeft - 1 // -1 for left border "│"
+		m.debugLogCardHit(targetIdx, localY, localX, cardLeft, cardW, cardH)
 		if localY >= 3 && localY < cardH {
-			localX := viewX - cardLeft - 1 // -1 for left border "│"
 			if localX >= 0 {
 				for _, r := range m.expandedHitRegions() {
 					if localY == r.Y && localX >= r.XMin && localX < r.XMax {
@@ -849,52 +864,73 @@ func (m *Model) expandedCardInnerWidth() int {
 }
 
 // expandedHitRegions computes all clickable regions for the currently expanded
-// branch card. Returns nil if no card is expanded.
+// branch card. Badge positions and the subview line are derived dynamically
+// from computeBadgeLayout so they stay correct when badges wrap.
 func (m *Model) expandedHitRegions() []cardHitRegion {
 	if m.expandedIdx < 0 || m.expandedIdx >= len(m.branches) {
 		return nil
 	}
 	b := m.branches[m.expandedIdx]
-	var regions []cardHitRegion
+	actions := visibleActions(b, m.defaultBranch)
+	innerWidth := m.expandedCardInnerWidth()
+	statsWidth := actionLinePrefixWidth(b, m.workingDirty, m.workingConflicts)
 
-	// Action badges at cardActionLine.
-	x := actionLinePrefixWidth(b, m.workingDirty, m.workingConflicts)
-	for i, actionID := range m.expandedVisibleActions() {
-		x += actionBadgeGap(actionID)
-		badgeW := len(actionBadgeLabel(actionID))
+	// Mirror buildExpandedLines: try inline first, if badges overflow
+	// move them all to a dedicated row below stats.
+	placements, badgeLineCount := computeBadgeLayout(actions, innerWidth, statsWidth)
+	badgesInline := badgeLineCount <= 1
+	if !badgesInline {
+		const badgeIndent = 1
+		placements, badgeLineCount = computeBadgeLayout(actions, innerWidth, badgeIndent)
+	}
+
+	// When badges are inline, they start at cardActionLine (stats line).
+	// When on a dedicated row, stats + top divider precede badges.
+	badgeBaseLine := cardActionLine
+	if !badgesInline {
+		badgeBaseLine = cardActionLine + 2 // stats + top divider
+	}
+
+	var regions []cardHitRegion
+	for i, bp := range placements {
 		regions = append(regions, cardHitRegion{
-			Y:    cardActionLine,
-			XMin: x,
-			XMax: x + badgeW,
+			Y:    badgeBaseLine + bp.line,
+			XMin: bp.x,
+			XMax: bp.x + bp.w,
 			Kind: hitActionBadge,
 			Idx:  i,
 		})
-		x += badgeW
 	}
 
-	// Sub-view regions at cardSubviewLine.
+	// Total content lines: stats + dividers + badge lines.
+	totalContentLines := badgeLineCount
+	if !badgesInline {
+		totalContentLines += 3 // stats + top divider + bottom divider
+	}
+
+	// Sub-view line sits immediately after the last content line.
+	subviewLine := cardActionLine + totalContentLines
 	if m.deleteConfirmActive {
-		yesStart := deleteConfirmYesStart()
-		noStart := deleteConfirmNoStart()
+		lay := computeDeleteConfirmLayout(innerWidth)
 		regions = append(regions,
 			cardHitRegion{
-				Y:    cardSubviewLine,
-				XMin: yesStart,
-				XMax: yesStart + len(deleteConfirmYesLabel),
+				Y:    subviewLine,
+				XMin: lay.yesStart,
+				XMax: lay.yesStart + len(deleteConfirmYesLabel),
 				Kind: hitDeleteYes,
 			},
 			cardHitRegion{
-				Y:    cardSubviewLine,
-				XMin: noStart,
-				XMax: noStart + len(deleteConfirmNoLabel),
+				Y:    subviewLine,
+				XMin: lay.noStart,
+				XMax: lay.noStart + len(deleteConfirmNoLabel),
 				Kind: hitDeleteNo,
 			},
 		)
 	} else if m.commitInputActive && m.commitPhase == commitIdle {
 		regions = append(regions, cardHitRegion{
-			Y:    cardSubviewLine,
+			Y:    subviewLine,
 			XMin: commitInputLabelWidth,
-			XMax: m.expandedCardInnerWidth(),
+			XMax: innerWidth,
 			Kind: hitCommitInput,
 		})
 	}
@@ -1037,9 +1073,7 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 	cardWidth := offshootCardWidth(m.width, cols)
 	oc := m.offshootCount()
 	offRows := m.offshootRowCount()
-	totalRows := m.totalBranchRows()
-	visRows := m.visibleBranchRows()
-	endRow := min(m.branchScrollOff+visRows, totalRows)
+	endRow := m.visibleEndRow()
 	trunkPos := m.width / 2
 
 	const borderCols = 2
@@ -1087,7 +1121,7 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 
 			// Use fixed grid for consistent column alignment across rows.
 			totalGrid := cols*cardWidth + max(cols-1, 0)*branchCardGap
-			leftMargin := max((m.width-totalGrid)/2, 0)
+			leftMargin := trunkAlignedMargin(m.width, totalGrid)
 			innerWidth := max(cardWidth-borderCols, 0)
 
 			// Merge target: trunk for depth 0, parent's card center for depth > 0.
@@ -1146,7 +1180,7 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 
 			primaryCW := primaryCardWidth(m.width)
 			innerWidth := max(primaryCW-borderCols, 0)
-			leftPad := max((m.width-primaryCW)/2, 0)
+			leftPad := trunkAlignedMargin(m.width, primaryCW)
 			trunkInner := trunkPos - leftPad - 1
 
 			hasTrunkTop := oc > 0
@@ -1412,20 +1446,12 @@ func (m *Model) handleBranchToolbarKey(km tea.KeyMsg) tea.Cmd {
 }
 
 // expandedVisibleActions returns the ordered action IDs for the currently
-// expanded branch. HEAD shows [Commit]; default shows [Switch];
-// other branches show [Switch, Delete].
+// expanded branch. Delegates to visibleActions for the pure logic.
 func (m *Model) expandedVisibleActions() []int {
 	if m.expandedIdx < 0 || m.expandedIdx >= len(m.branches) {
 		return nil
 	}
-	b := m.branches[m.expandedIdx]
-	if b.IsHead {
-		return []int{branchActionCommit}
-	}
-	if b.Name == m.defaultBranch {
-		return []int{branchActionSwitch}
-	}
-	return []int{branchActionSwitch, branchActionDelete}
+	return visibleActions(m.branches[m.expandedIdx], m.defaultBranch)
 }
 
 // expandedActionID returns the action ID for the current selection index.
@@ -2201,8 +2227,7 @@ func (m *Model) viewTopPad() int {
 	case viewCommits:
 		cl = len(m.commitVisibleRange()) * nodeHeight
 	default:
-		totalRows := m.totalBranchRows()
-		endRow := min(m.branchScrollOff+m.visibleBranchRows(), totalRows)
+		endRow := m.visibleEndRow()
 		for rowIdx := m.branchScrollOff; rowIdx < endRow; rowIdx++ {
 			cl += m.branchRowLines(rowIdx)
 		}
@@ -2303,6 +2328,7 @@ func (m *Model) recomputeOffshootLayout() {
 		m.offColOf = m.offColOf[:0]
 		m.offGridCol = m.offGridCol[:0]
 		m.offDepth = m.offDepth[:0]
+		m.offExtraConn = m.offExtraConn[:0]
 		return
 	}
 	cols := branchCols(m.width)
@@ -2404,6 +2430,55 @@ func (m *Model) recomputeOffshootLayout() {
 			m.offDepth[flatIdx] = depths[flatIdx]
 		}
 	}
+
+	// Precompute which rows have an extra off-center connector line.
+	// composeOffshootRow adds an extra vertical connector for single-card
+	// rows whose card center doesn't align with the merge target.
+	m.offExtraConn = m.offExtraConn[:0]
+	effCols := m.effectiveCols()
+	cardWidth := offshootCardWidth(m.width, effCols)
+	for _, row := range m.offRows {
+		m.offExtraConn = append(m.offExtraConn,
+			len(row) == 1 && m.offshootCardCenter(row[0], effCols, cardWidth) != m.offshootMergeTarget(row[0], effCols, cardWidth))
+	}
+
+	// Row count may have changed — clamp scroll so it doesn't point past
+	// the last row (SetSize clamps before the deferred recompute runs).
+	m.clampBranchScroll()
+}
+
+// offshootCardCenter returns the horizontal center column of an offshoot card.
+func (m *Model) offshootCardCenter(flatIdx, cols, cardWidth int) int {
+	totalGrid := cols*cardWidth + max(cols-1, 0)*branchCardGap
+	leftMargin := trunkAlignedMargin(m.width, totalGrid)
+	gc := m.offGridCol[flatIdx]
+	return leftMargin + gc*(cardWidth+branchCardGap) + cardWidth/2
+}
+
+// offshootMergeTarget returns the column the merge line connects to for
+// the given offshoot's row. Depth 0 merges to the trunk; deeper rows
+// merge to their parent's card center.
+func (m *Model) offshootMergeTarget(flatIdx, cols, cardWidth int) int {
+	if m.offDepth[flatIdx] == 0 {
+		return m.width / 2
+	}
+	parentName := m.branches[flatIdx].Parent
+	for pi := range m.offshootCount() {
+		if m.branches[pi].Name == parentName {
+			return m.offshootCardCenter(pi, cols, cardWidth)
+		}
+	}
+	return m.width / 2
+}
+
+// offRowConnectors returns the number of connector lines below card content
+// in an offshoot row. Usually 2 (merge + trunk); single off-center cards
+// get an extra vertical connector (3 total).
+func (m *Model) offRowConnectors(rowIdx int) int {
+	if rowIdx < len(m.offExtraConn) && m.offExtraConn[rowIdx] {
+		return 3
+	}
+	return 2
 }
 
 // ---------------------------------------------------------------------------
@@ -2447,6 +2522,21 @@ func (m *Model) totalBranchRows() int {
 		return 0
 	}
 	return m.offshootRowCount() + 1
+}
+
+// visibleEndRow returns the exclusive end row index that fits in the viewport
+// starting from branchScrollOff, using actual row heights.
+func (m *Model) visibleEndRow() int {
+	ch := m.contentHeight()
+	total := m.totalBranchRows()
+	accumulated := 0
+	for end := m.branchScrollOff; end < total; end++ {
+		accumulated += m.branchRowLines(end)
+		if accumulated >= ch {
+			return end + 1
+		}
+	}
+	return total
 }
 
 // visibleBranchRows returns how many branch rows fit in the viewport.
