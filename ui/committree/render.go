@@ -1517,10 +1517,12 @@ type toolbarButtonDef struct {
 
 // toolbarDefs maps button IDs to their display properties.
 var toolbarDefs = map[int]toolbarButtonDef{
-	toolbarCreate: {icon: "＋", label: "Create", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
-	toolbarMerge:  {icon: "⇞", label: "Merge", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
-	toolbarBack:   {icon: "←", label: "Back", accent: func(p theme.Palette) lipgloss.Color { return p.Foreground }},
-	toolbarDiff:   {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
+	toolbarCreate:     {icon: "＋", label: "Create", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarMerge:      {icon: "⇞", label: "Merge", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
+	toolbarBack:       {icon: "←", label: "Back", accent: func(p theme.Palette) lipgloss.Color { return p.Foreground }},
+	toolbarDiff:       {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
+	toolbarDiffOk:     {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarDiffCancel: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 }
 
 // toolbarCellWidths returns the visual width of each button cell.
@@ -1561,9 +1563,11 @@ func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx
 		def := toolbarDefs[id]
 		active := i == activeIdx
 		selected := focused && i == selectedIdx
-		hovered := i == hoverIdx && !selected && !active
+		hovered := i == hoverIdx
 		fg := p.Muted
-		if active || selected || hovered {
+		if hovered || selected {
+			fg = p.Foreground
+		} else if active {
 			fg = def.accent(p)
 		}
 		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
@@ -1608,6 +1612,132 @@ func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx
 	}
 
 	return row1 + "\n" + row2
+}
+
+// renderDiffToolbar renders the diff-mode toolbar: left buttons (or hint text)
+// on the left, right buttons on the right. Uses a unified index space where
+// indices 0..len(left)-1 are left buttons and len(left).. are right buttons.
+func renderDiffToolbar(leftButtons, rightButtons []int, selectedIdx int, focused bool,
+	hoverIdx int, activeIdx int, hint string, width int, p theme.Palette) string {
+
+	bSt := lipgloss.NewStyle().Foreground(p.Border)
+
+	// Measure right button group.
+	type btnMeasure struct {
+		inner string
+		width int
+	}
+	rWidths := toolbarCellWidths(rightButtons)
+	rCells := make([]btnMeasure, len(rightButtons))
+	rTotalInner := 0
+	leftCount := len(leftButtons)
+	for i, id := range rightButtons {
+		def := toolbarDefs[id]
+		uIdx := leftCount + i
+		active := uIdx == activeIdx
+		selected := focused && uIdx == selectedIdx
+		hovered := uIdx == hoverIdx
+		fg := p.Muted
+		if hovered || selected {
+			fg = p.Foreground
+		} else if active {
+			fg = def.accent(p)
+		}
+		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
+		padded := " " + text + " "
+		rCells[i] = btnMeasure{inner: padded, width: rWidths[i]}
+		rTotalInner += rWidths[i]
+	}
+	rGroupWidth := len(rightButtons) + rTotalInner
+
+	// Measure left button group (if present).
+	var lCells []btnMeasure
+	var lWidths []int
+	if len(leftButtons) > 0 {
+		lWidths = toolbarCellWidths(leftButtons)
+		lCells = make([]btnMeasure, len(leftButtons))
+		for i, id := range leftButtons {
+			def := toolbarDefs[id]
+			uIdx := i
+			selected := focused && uIdx == selectedIdx
+			hovered := uIdx == hoverIdx
+			fg := p.Muted
+			if hovered || selected {
+				fg = def.accent(p)
+			}
+			text := lipgloss.NewStyle().Foreground(fg).Render(def.icon + " " + def.label)
+			padded := " " + text + " "
+			lCells[i] = btnMeasure{inner: padded, width: lWidths[i]}
+		}
+	}
+
+	rightLeftPad := max(width-rGroupWidth, 0)
+
+	// Row 1: top borders for left group (left-aligned) and right group (right-aligned).
+	var row1 strings.Builder
+	if len(lCells) > 0 {
+		var lDiv strings.Builder
+		for i, w := range lWidths {
+			if i > 0 {
+				lDiv.WriteString("┬")
+			}
+			lDiv.WriteString(strings.Repeat("─", w))
+		}
+		lDiv.WriteString("╮")
+		lBorder := bSt.Render(lDiv.String())
+		row1.WriteString(lBorder)
+		lBorderVis := lipgloss.Width(lBorder)
+		gap := max(rightLeftPad-lBorderVis, 0)
+		row1.WriteString(strings.Repeat(" ", gap))
+	} else {
+		row1.WriteString(strings.Repeat(" ", rightLeftPad))
+	}
+	var rDiv strings.Builder
+	for i, w := range rWidths {
+		if i == 0 {
+			rDiv.WriteString("╭")
+		} else {
+			rDiv.WriteString("┬")
+		}
+		rDiv.WriteString(strings.Repeat("─", w))
+	}
+	row1.WriteString(bSt.Render(rDiv.String()))
+	row1Str := row1.String()
+	if vis := lipgloss.Width(row1Str); vis < width {
+		row1Str += strings.Repeat(" ", width-vis)
+	}
+
+	// Row 2: left content + gap + right content.
+	var row2 strings.Builder
+	if len(lCells) > 0 {
+		for i, c := range lCells {
+			if i > 0 {
+				row2.WriteString(bSt.Render("│"))
+			}
+			row2.WriteString(c.inner)
+		}
+		row2.WriteString(bSt.Render("│"))
+		leftContentVis := lipgloss.Width(row2.String())
+		gap := max(rightLeftPad-leftContentVis, 0)
+		row2.WriteString(strings.Repeat(" ", gap))
+	} else {
+		// Render hint text on the left.
+		labelSt := lipgloss.NewStyle().Foreground(p.Muted)
+		styledHint := labelSt.Render(" " + hint)
+		hintVis := lipgloss.Width(styledHint)
+		row2.WriteString(styledHint)
+		row2.WriteString(strings.Repeat(" ", max(rightLeftPad-hintVis, 0)))
+	}
+	for _, c := range rCells {
+		row2.WriteString(bSt.Render("│"))
+		row2.WriteString(c.inner)
+	}
+	row2Str := row2.String()
+	if vis := lipgloss.Width(row2Str); vis < width {
+		row2Str += strings.Repeat(" ", width-vis)
+	}
+
+	return row1Str + "\n" + row2Str
 }
 
 // renderCreateInputToolbar renders the toolbar with a branch name input on

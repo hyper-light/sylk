@@ -121,10 +121,12 @@ type commitDismissMsg struct{}
 
 // toolbarButton identifies a toolbar button in the bottom bar.
 const (
-	toolbarCreate = iota // Branch view: create a new branch.
-	toolbarMerge         // Branch view: merge selected branch.
-	toolbarBack          // Commit view: return to branch tree.
-	toolbarDiff          // Commit view: show diff for selected commit.
+	toolbarCreate     = iota // Branch view: create a new branch.
+	toolbarMerge             // Branch view: merge selected branch.
+	toolbarBack              // Commit view: return to branch tree.
+	toolbarDiff              // Commit view: show diff for selected commit.
+	toolbarDiffOk            // Diff mode: confirm diff.
+	toolbarDiffCancel        // Diff mode: cancel diff.
 )
 
 // CreateBranchRequestMsg is emitted when the user confirms a branch name
@@ -143,6 +145,11 @@ type MergeBranchMsg struct {
 // DiffRequestMsg is emitted when the user activates the Diff toolbar button.
 type DiffRequestMsg struct {
 	Hash string
+}
+
+// DiffCompareMsg is emitted when the user confirms a multi-commit diff via Ok.
+type DiffCompareMsg struct {
+	Hashes []string // ordered by selection
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +436,9 @@ func (m *Model) SetNodes(nodes []TreeNode) {
 // SetNodesWithStats atomically replaces commit data and applies diff stats,
 // transitioning from the loading spinner to the commit view in one frame.
 // Clears any DAG state — this is the flat first-parent mode path.
+// Preserves the selected commit across reloads when the hash still exists.
 func (m *Model) SetNodesWithStats(nodes []TreeNode, stats map[string][2]int, hasMore bool) {
+	prevHash := m.SelectedHash()
 	applyStats(nodes, stats)
 	m.nodes = nodes
 	m.selectedIdx = 0
@@ -442,6 +451,8 @@ func (m *Model) SetNodesWithStats(nodes []TreeNode, stats map[string][2]int, has
 	m.dagMode = false
 	m.dagSections = m.dagSections[:0]
 	m.mode = viewCommits
+	m.restoreSelectionByHash(prevHash)
+	m.ensureVisible()
 	m.invalidateNodeCache()
 	m.invalidateCommitCardCache()
 	m.viewDirty = true
@@ -450,8 +461,10 @@ func (m *Model) SetNodesWithStats(nodes []TreeNode, stats map[string][2]int, has
 // SetDAGNodesWithStats atomically sets commit data with full DAG graph layout,
 // transitioning from the loading spinner to the DAG commit view in one frame.
 // DAG mode disables pagination (all branch-unique commits loaded at once).
+// Preserves the selected commit across reloads when the hash still exists.
 func (m *Model) SetDAGNodesWithStats(nodes []TreeNode, stats map[string][2]int,
 	graphRows []GraphRow, maxLane int) {
+	prevHash := m.SelectedHash()
 	applyStats(nodes, stats)
 	m.nodes = nodes
 	m.selectedIdx = 0
@@ -468,6 +481,9 @@ func (m *Model) SetDAGNodesWithStats(nodes []TreeNode, stats map[string][2]int,
 	m.invalidateNodeCache()
 	m.invalidateCommitCardCache()
 	m.recomputeCommitLayout()
+	m.restoreSelectionByHash(prevHash)
+	m.restoreDAGSelection()
+	m.ensureDAGVisible()
 	m.viewDirty = true
 }
 
@@ -666,20 +682,28 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 	case viewLoading:
 		return nil // absorb clicks during loading
 	case viewCommits:
-		return m.clickCommitView(viewY)
+		return m.clickCommitView(viewX, viewY)
 	default:
 		return m.clickBranchView(viewX, viewY)
 	}
 }
 
-// clickCommitView maps a click Y coordinate to a commit node index.
-func (m *Model) clickCommitView(viewY int) tea.Cmd {
+// clickCommitView maps a click coordinate to a commit node index.
+// Only registers a hit when viewX falls within the card bounds.
+func (m *Model) clickCommitView(viewX, viewY int) tea.Cmd {
 	if len(m.nodes) == 0 {
 		return nil
 	}
 
 	if m.dagMode && len(m.dagSections) > 0 {
-		return m.clickCommitDAGView(viewY)
+		return m.clickCommitDAGView(viewX, viewY)
+	}
+
+	// Bounds-check X against the centered card area.
+	cardWidth := primaryCardWidth(m.width)
+	leftPad := trunkAlignedMargin(m.width, cardWidth)
+	if viewX < leftPad || viewX >= leftPad+cardWidth {
+		return nil
 	}
 
 	viewY -= m.viewTopPad()
@@ -703,31 +727,51 @@ func (m *Model) clickCommitView(viewY int) tea.Cmd {
 	return nil
 }
 
-// clickCommitDAGView maps a click Y coordinate to a section/row in DAG mode.
-func (m *Model) clickCommitDAGView(viewY int) tea.Cmd {
+// clickCommitDAGView maps a click coordinate to a section/row in DAG mode.
+// Only registers a hit when viewX falls within a card's bounds.
+func (m *Model) clickCommitDAGView(viewX, viewY int) tea.Cmd {
 	viewY -= m.viewTopPad()
 	if viewY < 0 {
 		return nil
 	}
+
+	cols := m.dagEffectiveCols()
+	offCardWidth := offshootCardWidth(m.width, cols)
+	totalGrid := cols*offCardWidth + max(cols-1, 0)*branchCardGap
+	gridMargin := trunkAlignedMargin(m.width, totalGrid)
+
+	trunkCardW := primaryCardWidth(m.width)
+	trunkLeft := trunkAlignedMargin(m.width, trunkCardW)
 
 	// Walk visual rows from scroll offset, accumulating heights.
 	y := 0
 	visRow := 0
 	for _, sec := range m.dagSections {
 		// Offshoot rows.
-		for range sec.offRows {
+		for _, offRow := range sec.offRows {
 			rowIdx := visRow
 			if rowIdx < m.scrollOff {
 				visRow++
 				continue
 			}
-			// Offshoot row height: card(4) + merge line(1) + connector(1) = 6.
 			rh := branchRowHeight
 			if viewY >= y && viewY < y+rh {
+				// Hit-test X against each card in this offshoot row.
+				hitCol := -1
+				for colPos, nodeIdx := range offRow {
+					_ = nodeIdx
+					cl := gridMargin + colPos*(offCardWidth+branchCardGap)
+					if viewX >= cl && viewX < cl+offCardWidth {
+						hitCol = colPos
+						break
+					}
+				}
+				if hitCol < 0 {
+					return nil
+				}
 				prev := m.selectedIdx
 				m.dagSelectedRow = rowIdx
-				// Pick column from X — simplified: use first col.
-				m.dagSelectedCol = 0
+				m.dagSelectedCol = hitCol
 				m.selectedIdx = m.dagNodeIdxAt(m.dagSelectedRow, m.dagSelectedCol)
 				m.viewDirty = true
 				if m.diffMode {
@@ -742,7 +786,7 @@ func (m *Model) clickCommitDAGView(viewY int) tea.Cmd {
 			visRow++
 		}
 
-		// Trunk row: card(4) + connector(1) = nodeHeight (5).
+		// Trunk row: check X against centered primary card.
 		rowIdx := visRow
 		if rowIdx < m.scrollOff {
 			visRow++
@@ -750,6 +794,9 @@ func (m *Model) clickCommitDAGView(viewY int) tea.Cmd {
 		}
 		rh := nodeHeight
 		if viewY >= y && viewY < y+rh {
+			if viewX < trunkLeft || viewX >= trunkLeft+trunkCardW {
+				return nil
+			}
 			prev := m.selectedIdx
 			m.dagSelectedRow = rowIdx
 			m.dagSelectedCol = -1
@@ -1090,27 +1137,43 @@ func (m *Model) setHoverButton(idx int) {
 	m.viewDirty = true
 }
 
-// toolbarButtonAtX returns the toolbar button index at the given X coordinate,
-// or -1 if no button is hit. Uses the same layout math as renderToolbarButtons.
+// toolbarButtonAtX returns the unified toolbar button index at the given X
+// coordinate, or -1 if no button is hit. In diff mode, indices 0..len(left)-1
+// map to left buttons, len(left)..len(left)+len(right)-1 map to right buttons.
 func (m *Model) toolbarButtonAtX(viewX int) int {
-	buttons := m.toolbarButtons()
-	if len(buttons) == 0 {
-		return -1
+	left := m.diffToolbarLeftButtons()
+	right := m.toolbarButtons()
+
+	// Hit-test left button group (left-aligned, no leading border).
+	// Layout: content₀ │ content₁ │
+	if len(left) > 0 {
+		lWidths := toolbarCellWidths(left)
+		x := 0
+		for i, w := range lWidths {
+			if viewX >= x && viewX < x+w {
+				return i
+			}
+			x += w + 1 // cell width + │ separator
+		}
 	}
 
-	widths := toolbarCellWidths(buttons)
+	// Hit-test right button group (right-aligned).
+	if len(right) == 0 {
+		return -1
+	}
+	rWidths := toolbarCellWidths(right)
 	totalInner := 0
-	for _, w := range widths {
+	for _, w := range rWidths {
 		totalInner += w
 	}
-	groupWidth := len(buttons) + totalInner
+	groupWidth := len(right) + totalInner
 	leftPad := max(m.width-groupWidth, 0)
 
 	x := leftPad
-	for i, w := range widths {
+	for i, w := range rWidths {
 		x++ // │ separator
 		if viewX >= x && viewX < x+w {
-			return i
+			return len(left) + i
 		}
 		x += w
 	}
@@ -1163,6 +1226,16 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 	if m.createInputActive {
 		return renderCreateInputToolbar(m.toolbarButtons(), m.createBranchName, m.createCursor, cursorVisible, m.width, m.theme.Palette)
 	}
+	if m.diffMode {
+		left := m.diffToolbarLeftButtons()
+		right := m.toolbarButtons()
+		hint := ""
+		if len(left) == 0 {
+			hint = "Select 2+ commits to diff"
+		}
+		return renderDiffToolbar(left, right, m.toolbarAction, m.toolbarFocused,
+			m.hoverButtonIdx, m.toolbarActiveIdx(), hint, m.width, m.theme.Palette)
+	}
 	label := "Branches"
 	if m.mode == viewCommits {
 		label = "Commits"
@@ -1172,13 +1245,15 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 
 // toolbarActiveIdx returns the index of the currently toggled-on toolbar
 // button, or -1 if none. Only the Diff button supports toggle state.
+// In diff mode the index is offset by the left button count.
 func (m *Model) toolbarActiveIdx() int {
 	if !m.diffMode {
 		return -1
 	}
+	leftCount := len(m.diffToolbarLeftButtons())
 	for i, id := range m.toolbarButtons() {
 		if id == toolbarDiff {
-			return i
+			return leftCount + i
 		}
 	}
 	return -1
@@ -2205,13 +2280,17 @@ func (m *Model) executeExpandedAction() tea.Cmd {
 	return nil
 }
 
-// executeToolbarAction emits the message for the currently selected toolbar button.
+// executeToolbarAction emits the message for the currently selected toolbar
+// button. toolbarAction uses the unified index space: left buttons first,
+// then right buttons.
 func (m *Model) executeToolbarAction() tea.Cmd {
-	buttons := m.toolbarButtons()
-	if m.toolbarAction < 0 || m.toolbarAction >= len(buttons) {
+	left := m.diffToolbarLeftButtons()
+	right := m.toolbarButtons()
+	all := slices.Concat(left, right)
+	if m.toolbarAction < 0 || m.toolbarAction >= len(all) {
 		return nil
 	}
-	switch buttons[m.toolbarAction] {
+	switch all[m.toolbarAction] {
 	case toolbarCreate:
 		m.activateCreateInput()
 		return nil
@@ -2229,6 +2308,13 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		} else {
 			m.enterDiffMode()
 		}
+		return nil
+	case toolbarDiffOk:
+		hashes := m.DiffSelections()
+		m.exitDiffMode()
+		return func() tea.Msg { return DiffCompareMsg{Hashes: hashes} }
+	case toolbarDiffCancel:
+		m.exitDiffMode()
 		return nil
 	}
 	return nil
@@ -2325,17 +2411,13 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 
 	switch km.String() {
 	case "tab":
-		if !m.diffMode {
-			m.cycleCommitToolbar(1)
-			m.viewDirty = true
-			return nil
-		}
+		m.cycleCommitToolbar(1)
+		m.viewDirty = true
+		return nil
 	case "shift+tab":
-		if !m.diffMode {
-			m.cycleCommitToolbar(-1)
-			m.viewDirty = true
-			return nil
-		}
+		m.cycleCommitToolbar(-1)
+		m.viewDirty = true
+		return nil
 	case "enter", " ":
 		if m.toolbarFocused {
 			m.viewDirty = true
@@ -2431,9 +2513,12 @@ func (m *Model) handleCommitDAGKey(km tea.KeyMsg) tea.Cmd {
 
 // cycleCommitToolbar advances toolbar focus by delta (+1 or -1).
 // Exits toolbar focus when tabbing past the last or before the first button.
+// Uses the unified index space (left buttons + right buttons).
 func (m *Model) cycleCommitToolbar(delta int) {
-	buttons := m.toolbarButtons()
-	if len(buttons) == 0 {
+	left := m.diffToolbarLeftButtons()
+	right := m.toolbarButtons()
+	total := len(left) + len(right)
+	if total == 0 {
 		return
 	}
 	if !m.toolbarFocused {
@@ -2441,12 +2526,12 @@ func (m *Model) cycleCommitToolbar(delta int) {
 		if delta > 0 {
 			m.toolbarAction = 0
 		} else {
-			m.toolbarAction = len(buttons) - 1
+			m.toolbarAction = total - 1
 		}
 		return
 	}
 	next := m.toolbarAction + delta
-	if next >= len(buttons) || next < 0 {
+	if next >= total || next < 0 {
 		m.toolbarFocused = false
 		return
 	}
@@ -2583,6 +2668,52 @@ func (m *Model) toggleDiffSelection() {
 }
 
 // ---------------------------------------------------------------------------
+// Selection restoration
+// ---------------------------------------------------------------------------
+
+// restoreSelectionByHash finds a commit hash in the current node list and
+// sets selectedIdx to its position. Falls back to 0 if not found.
+func (m *Model) restoreSelectionByHash(hash string) {
+	if hash == "" {
+		return
+	}
+	for i, n := range m.nodes {
+		if n.Hash == hash {
+			m.selectedIdx = i
+			return
+		}
+	}
+}
+
+// restoreDAGSelection reverse-maps selectedIdx to dagSelectedRow/dagSelectedCol.
+// Must be called after recomputeCommitLayout and restoreSelectionByHash.
+func (m *Model) restoreDAGSelection() {
+	if len(m.dagSections) == 0 {
+		return
+	}
+	target := m.selectedIdx
+	row := 0
+	for _, sec := range m.dagSections {
+		for _, offRow := range sec.offRows {
+			for col, nodeIdx := range offRow {
+				if nodeIdx == target {
+					m.dagSelectedRow = row
+					m.dagSelectedCol = col
+					return
+				}
+			}
+			row++
+		}
+		if sec.trunkIdx == target {
+			m.dagSelectedRow = row
+			m.dagSelectedCol = -1
+			return
+		}
+		row++
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Navigation helpers (commit view)
 // ---------------------------------------------------------------------------
 
@@ -2679,6 +2810,7 @@ func (m *Model) viewTopPad() int {
 }
 
 // toolbarButtons returns the toolbar button IDs for the current view mode.
+// In diff mode these are the right-side buttons only.
 func (m *Model) toolbarButtons() []int {
 	switch m.mode {
 	case viewBranches:
@@ -2688,6 +2820,15 @@ func (m *Model) toolbarButtons() []int {
 	default:
 		return nil
 	}
+}
+
+// diffToolbarLeftButtons returns the left-side diff toolbar buttons.
+// Returns nil when not in diff mode or fewer than 2 commits are selected.
+func (m *Model) diffToolbarLeftButtons() []int {
+	if !m.diffMode || len(m.diffSelections) < 2 {
+		return nil
+	}
+	return []int{toolbarDiffOk, toolbarDiffCancel}
 }
 
 func (m *Model) visibleNodeCount() int {
