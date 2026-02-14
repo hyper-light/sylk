@@ -1109,6 +1109,13 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 		offNameIdx[m.branches[i].Name] = i
 	}
 
+	// Track active merge connector columns from rows above. When sibling
+	// rows wrap, the merge target connector must pass through subsequent
+	// sibling rows' card area. A column is "consumed" when a card in the
+	// current row has its center at that position (it enters the card's
+	// top border via hasTrunkTop).
+	activeMergeCols := map[int]struct{}{}
+
 	for rowIdx := m.branchScrollOff; rowIdx < endRow; rowIdx++ {
 		if rowIdx < offRows {
 			// Offshoot row — build cards via cache, compose into row.
@@ -1134,6 +1141,20 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 				}
 			}
 
+			// Consume merge columns that enter a card in this row
+			// (the card's top border handles the connector via hasTrunkTop).
+			for _, flatIdx := range row {
+				gc := m.offGridCol[flatIdx]
+				center := leftMargin + gc*(cardWidth+branchCardGap) + cardWidth/2
+				delete(activeMergeCols, center)
+			}
+
+			// Build merge-above columns for pass-through.
+			mergeAboveCols := make([]int, 0, len(activeMergeCols))
+			for col := range activeMergeCols {
+				mergeAboveCols = append(mergeAboveCols, col)
+			}
+
 			colIndices := make([]int, rowCols)
 			cardSlices := make([][]string, rowCols)
 			for i, flatIdx := range row {
@@ -1148,17 +1169,19 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 				cardCenter := innerWidth / 2
 				trunkAtCard := trunkPos - cardLeft - 1
 
-				hasTrunkTop := hasChildAbove[b.Name]
+				// Top connector: children merge into card center;
+				// trunk from previous depth-0 row enters at trunkAtCard.
+				childAbove := hasChildAbove[b.Name]
+				hasTrunkTop := childAbove || hasTrunkAbove
 				trunkInnerTop := cardCenter
-				if !hasTrunkTop {
+				if !childAbove {
 					trunkInnerTop = trunkAtCard
 				}
 
-				hasTrunkBot := m.offDepth[flatIdx] > 0
+				// Bottom connector: all offshoots connect to the
+				// merge line below at their card center.
+				hasTrunkBot := true
 				trunkInnerBot := cardCenter
-				if !hasTrunkBot {
-					trunkInnerBot = trunkAtCard
-				}
 
 				var cardExp *branchExpansion
 				if isExpanded {
@@ -1169,8 +1192,11 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 					isExpanded, cardExp, wt)
 			}
 
-			rowLines := composeOffshootRow(cardSlices, colIndices, cardWidth, cols, m.width, m.theme, hasTrunkAbove, mergeTarget)
+			rowLines := composeOffshootRow(cardSlices, colIndices, cardWidth, cols, m.width, m.theme, hasTrunkAbove, mergeTarget, mergeAboveCols)
 			lines = append(lines, rowLines...)
+
+			// This row's merge target is now active going down.
+			activeMergeCols[mergeTarget] = struct{}{}
 		} else {
 			// Primary row — build card via cache, compose into row.
 			flatIdx := oc

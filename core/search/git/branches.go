@@ -1101,13 +1101,17 @@ func (c *GitClient) CountBranchCommits(name string, limit int) (count int, cappe
 const inferWalkLimit = 200
 
 // InferBranchParents determines parent-child relationships between branches
-// by walking the commit graph. For each non-default branch, it walks the
-// first-parent chain looking for another branch's tip commit — the same
-// topology visible in `git log --graph --all --decorate`. The first foreign
-// tip found determines the parent:
-//   - Non-default branch tip → that branch is the parent.
-//   - Default branch tip → child of default (no entry).
-//   - No tip found within walk limit → child of default (no entry).
+// using merge-base topology. For each non-default branch B, it finds the
+// non-default branch A whose merge-base with B is:
+//
+//  1. NOT equal to MergeBase(B, default) — this filters siblings that both
+//     forked from the same point on the default branch.
+//  2. Closest to B's tip on the first-parent chain — this selects the most
+//     direct parent when multiple candidates exist.
+//
+// Complexity: O(n) MergeBase calls against default + O(n²) pairwise calls +
+// O(n × walkLimit) for first-parent position maps. go-git's object cache
+// absorbs shared history, keeping actual I/O proportional to unique commits.
 //
 // Returns child name → parent name. Only branches with a detected
 // non-default parent appear in the map.
@@ -1119,97 +1123,151 @@ func (c *GitClient) InferBranchParents(branches []BranchInfo, defaultBranch stri
 		return nil
 	}
 
-	// Multiple branches may share a tip (e.g. freshly created branch).
-	tipsAt := make(map[plumbing.Hash][]string, len(branches))
-	for _, b := range branches {
-		h := plumbing.NewHash(b.Hash)
-		tipsAt[h] = append(tipsAt[h], b.Name)
-	}
-
-	// Identify HEAD for shared-tip resolution: when two branches point to
-	// the same commit, HEAD is the established branch (parent).
-	headBranch := ""
-	for _, b := range branches {
-		if b.IsHead {
-			headBranch = b.Name
-			break
-		}
-	}
-
-	parents := make(map[string]string, len(branches))
-	for _, a := range branches {
-		if a.Name == defaultBranch {
+	// Load tip commit objects for all branches.
+	tips := make([]*object.Commit, len(branches))
+	defaultIdx := -1
+	for i, b := range branches {
+		co, err := c.repo.CommitObject(plumbing.NewHash(b.Hash))
+		if err != nil {
 			continue
 		}
-		if p := c.ancestorBranchTip(plumbing.NewHash(a.Hash), a.Name, defaultBranch, headBranch, tipsAt); p != "" {
-			parents[a.Name] = p
+		tips[i] = co
+		if b.Name == defaultBranch {
+			defaultIdx = i
 		}
 	}
+	if defaultIdx < 0 || tips[defaultIdx] == nil {
+		return nil
+	}
+
+	// Phase 1: compute each branch's merge-base with the default branch.
+	// This establishes the "fork point from default" used to distinguish
+	// siblings (same fork point) from parent-child (different fork point).
+	defaultBase := make([]plumbing.Hash, len(branches))
+	for i := range branches {
+		if i == defaultIdx || tips[i] == nil {
+			continue
+		}
+		bases, _ := tips[i].MergeBase(tips[defaultIdx])
+		if len(bases) > 0 {
+			defaultBase[i] = bases[0].Hash
+		}
+	}
+
+	// Phase 2: for each non-default branch, build a first-parent position
+	// map and find the closest non-default branch via pairwise merge-base.
+	parents := make(map[string]string, len(branches))
+	for i, b := range branches {
+		if i == defaultIdx || tips[i] == nil {
+			continue
+		}
+
+		// Build position map: commit hash → distance from tip on B's
+		// first-parent chain. Used to rank candidate parents by proximity.
+		chainPos := c.firstParentPositions(tips[i].Hash)
+
+		// Position of B's fork from default. Candidates must have their
+		// merge-base strictly closer to B's tip than this threshold —
+		// anything at or beyond this point is shared with default.
+		defForkPos := inferWalkLimit + 1
+		if p, ok := chainPos[defaultBase[i]]; ok {
+			defForkPos = p
+		}
+
+		bestIdx := -1
+		bestPos := defForkPos // upper bound: must be in B's unique portion
+
+		for j := range branches {
+			if j == i || j == defaultIdx || tips[j] == nil {
+				continue
+			}
+			bases, _ := tips[i].MergeBase(tips[j])
+			if len(bases) == 0 {
+				continue
+			}
+			mb := bases[0].Hash
+
+			// Candidate parent: merge-base must lie on B's first-parent
+			// chain, strictly closer to tip than the default fork point.
+			pos, ok := chainPos[mb]
+			if !ok || pos >= defForkPos {
+				continue
+			}
+			// When the merge-base equals either branch's tip, one
+			// branch is a prefix of the other on the first-parent
+			// chain. Only the older branch can be the parent.
+			if (mb == tips[j].Hash || mb == tips[i].Hash) &&
+				!branchOlder(branches[j], branches[i]) {
+				continue
+			}
+			if pos < bestPos || (pos == bestPos && branchOlder(branches[j], branches[bestIdx])) {
+				bestIdx = j
+				bestPos = pos
+			}
+		}
+
+		if bestIdx >= 0 {
+			parents[b.Name] = branches[bestIdx].Name
+		}
+	}
+	breakCycles(parents)
 	return parents
 }
 
-// ancestorBranchTip walks the first-parent chain from hash, looking for a
-// commit that is another branch's tip. At step 0 (shared tip), only HEAD
-// qualifies as parent — this resolves directionality for freshly created
-// branches. At step 1+, any non-default foreign tip qualifies.
-func (c *GitClient) ancestorBranchTip(hash plumbing.Hash, self, defaultBranch, headBranch string, tipsAt map[plumbing.Hash][]string) string {
+// breakCycles removes edges that form cycles in the parent map.
+// For each cycle, the edge whose child was created earliest is removed
+// (that branch is more likely a true root among the cycle members).
+func breakCycles(parents map[string]string) {
+	for child := range parents {
+		visited := map[string]struct{}{child: {}}
+		cur := parents[child]
+		for cur != "" {
+			if _, cycle := visited[cur]; cycle {
+				delete(parents, child)
+				break
+			}
+			visited[cur] = struct{}{}
+			cur = parents[cur]
+		}
+	}
+}
+
+// firstParentPositions walks the first-parent chain from hash and returns a
+// map of commit hash → position (0 = tip, 1 = first parent, etc.). Bounded
+// by inferWalkLimit to prevent unbounded growth.
+func (c *GitClient) firstParentPositions(hash plumbing.Hash) map[plumbing.Hash]int {
+	positions := make(map[plumbing.Hash]int, inferWalkLimit)
 	for step := range inferWalkLimit {
 		co, err := c.repo.CommitObject(hash)
 		if err != nil {
-			return ""
+			break
 		}
-		if step == 0 {
-			// Shared tip: HEAD is the parent (git checkout -b).
-			if p := matchHeadTip(tipsAt[hash], self, defaultBranch, headBranch); p != "" {
-				return p
-			}
-		} else {
-			parent, stop := matchParentTip(tipsAt[hash], self, defaultBranch)
-			if parent != "" {
-				return parent
-			}
-			if stop {
-				return ""
-			}
-		}
+		positions[hash] = step
 		if len(co.ParentHashes) == 0 {
-			return ""
+			break
 		}
 		hash = co.ParentHashes[0]
 	}
-	return ""
+	return positions
 }
 
-// matchHeadTip checks if HEAD occupies the same commit as self. Returns
-// HEAD's name if it's a valid non-default parent, or "" otherwise.
-func matchHeadTip(names []string, self, defaultBranch, headBranch string) string {
-	if self == headBranch || headBranch == defaultBranch {
-		return ""
+// branchOlder returns true if a was created before b, using CreatedTime from
+// reflog. Falls back to AuthorTime (tip commit) when reflog is unavailable,
+// preferring the older timestamp. Final tiebreak: lexicographic name order
+// for determinism.
+func branchOlder(a, b BranchInfo) bool {
+	ta := a.CreatedTime
+	if ta.IsZero() {
+		ta = a.AuthorTime
 	}
-	for _, name := range names {
-		if name == headBranch {
-			return name
-		}
+	tb := b.CreatedTime
+	if tb.IsZero() {
+		tb = b.AuthorTime
 	}
-	return ""
-}
-
-// matchParentTip scans branch names at a commit for a non-self, non-default
-// parent. Returns (name, false) if found, or ("", true) if the default branch
-// occupies this commit (signals walk termination).
-func matchParentTip(names []string, self, defaultBranch string) (string, bool) {
-	hitDefault := false
-	for _, name := range names {
-		if name == self {
-			continue
-		}
-		if name == defaultBranch {
-			hitDefault = true
-			continue
-		}
-		return name, false
+	if !ta.Equal(tb) {
+		return ta.Before(tb)
 	}
-	return "", hitDefault
+	return a.Name < b.Name
 }
 
 // =============================================================================

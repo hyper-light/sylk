@@ -2,6 +2,7 @@ package committree
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/adalundhe/sylk/ui/theme"
@@ -883,7 +884,9 @@ func buildCommitIdleLine(exp *branchExpansion, width int, p theme.Palette) strin
 // hasTrunkAbove draws a trunk │ in the card gap when a depth-0 row above
 // produced a trunk line. mergeTarget is the column position the merge line
 // connects to: trunkPos for depth-0 rows, parent's card center for depth > 0.
-func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, gridCols, width int, th *theme.Theme, hasTrunkAbove bool, mergeTarget int) []string {
+// mergeAboveCols lists column positions with active merge connectors from
+// sibling rows above that must pass through this row's card area.
+func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, gridCols, width int, th *theme.Theme, hasTrunkAbove bool, mergeTarget int, mergeAboveCols []int) []string {
 	p := th.Palette
 	cols := len(cardSlices)
 	trunkPos := width / 2
@@ -913,7 +916,7 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 		for i := range cols {
 			target := cardLefts[i]
 			for col < target {
-				if hasTrunkAbove && col == trunkPos {
+				if (hasTrunkAbove && col == trunkPos) || slices.Contains(mergeAboveCols, col) {
 					buf.WriteString(trunkSt.Render("│"))
 				} else {
 					buf.WriteByte(' ')
@@ -933,7 +936,7 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 		}
 		// Fill remaining space, drawing trunk at trunkPos if needed.
 		for col < width {
-			if hasTrunkAbove && col == trunkPos {
+			if (hasTrunkAbove && col == trunkPos) || slices.Contains(mergeAboveCols, col) {
 				buf.WriteString(trunkSt.Render("│"))
 			} else {
 				buf.WriteByte(' ')
@@ -949,7 +952,7 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 		center := cardCenters[0]
 		var connBuf strings.Builder
 		for c := range width {
-			if c == center || (hasTrunkAbove && c == trunkPos) {
+			if c == center || (hasTrunkAbove && c == trunkPos) || slices.Contains(mergeAboveCols, c) {
 				connBuf.WriteString(trunkSt.Render("│"))
 			} else {
 				connBuf.WriteByte(' ')
@@ -962,24 +965,25 @@ func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, grid
 	// When a single card is centered on the target, a simple vertical
 	// suffices; otherwise draw a horizontal merge connector.
 	if cols == 1 && cardCenters[0] == mergeTarget {
-		lines = append(lines, buildConnectorLine(mergeTarget, trunkPos, hasTrunkAbove, width, trunkSt))
+		lines = append(lines, buildConnectorLine(mergeTarget, trunkPos, hasTrunkAbove, mergeAboveCols, width, trunkSt))
 	} else {
-		lines = append(lines, renderMergeLine(cardCenters, mergeTarget, width, th))
+		lines = append(lines, renderMergeLine(cardCenters, mergeTarget, mergeAboveCols, width, th))
 	}
 
 	// Vertical connector below the merge line.
-	lines = append(lines, buildConnectorLine(mergeTarget, trunkPos, hasTrunkAbove, width, trunkSt))
+	lines = append(lines, buildConnectorLine(mergeTarget, trunkPos, hasTrunkAbove, mergeAboveCols, width, trunkSt))
 
 	return lines
 }
 
 // buildConnectorLine draws a vertical connector at target, optionally also
-// drawing the trunk at trunkPos when hasTrunkAbove is true. The line is
-// padded to exactly width columns.
-func buildConnectorLine(target, trunkPos int, hasTrunkAbove bool, width int, trunkSt lipgloss.Style) string {
+// drawing the trunk at trunkPos when hasTrunkAbove is true. extraCols are
+// additional column positions that need pass-through connectors. The line
+// is padded to exactly width columns.
+func buildConnectorLine(target, trunkPos int, hasTrunkAbove bool, extraCols []int, width int, trunkSt lipgloss.Style) string {
 	var buf strings.Builder
 	for c := range width {
-		if c == target || (hasTrunkAbove && c == trunkPos) {
+		if c == target || (hasTrunkAbove && c == trunkPos) || slices.Contains(extraCols, c) {
 			buf.WriteString(trunkSt.Render("│"))
 		} else {
 			buf.WriteByte(' ')
@@ -1012,7 +1016,9 @@ func composePrimaryRow(cardLines []string, width int) []string {
 
 // renderMergeLine draws a horizontal connector from the leftmost card center
 // to the rightmost card center, with ┬ at the trunk position.
-func renderMergeLine(centers []int, trunkPos, width int, th *theme.Theme) string {
+// mergeAboveCols are column positions with active connectors from sibling
+// rows above; they pass through the merge line as vertical connectors.
+func renderMergeLine(centers []int, mergeTarget int, mergeAboveCols []int, width int, th *theme.Theme) string {
 	st := lipgloss.NewStyle().Foreground(th.Palette.Border)
 
 	centerSet := make(map[int]struct{}, len(centers))
@@ -1020,34 +1026,54 @@ func renderMergeLine(centers []int, trunkPos, width int, th *theme.Theme) string
 		centerSet[c] = struct{}{}
 	}
 
-	// Span must include all card centers AND the trunk.
-	leftmost := trunkPos
-	rightmost := trunkPos
+	// Span must include all card centers AND the merge target.
+	leftmost := mergeTarget
+	rightmost := mergeTarget
 	for _, c := range centers {
 		leftmost = min(leftmost, c)
 		rightmost = max(rightmost, c)
 	}
 
+	// Build three sections: pre-span, span, post-span.
+	var buf strings.Builder
+
+	// Pre-span: spaces with merge-above pass-through.
+	for col := range leftmost {
+		if slices.Contains(mergeAboveCols, col) {
+			buf.WriteString(st.Render("│"))
+		} else {
+			buf.WriteByte(' ')
+		}
+	}
+
+	// Span: merge bar with merge-above intersections.
 	var raw strings.Builder
 	for col := leftmost; col <= rightmost; col++ {
 		_, isCenter := centerSet[col]
-		isTrunk := col == trunkPos
-		raw.WriteString(mergeConnector(isCenter, isTrunk, col == leftmost, col == rightmost))
+		isMergeTarget := col == mergeTarget
+		isMergeAbove := slices.Contains(mergeAboveCols, col)
+		up := isCenter || isMergeAbove
+		down := isMergeTarget || isMergeAbove
+		left := col > leftmost
+		right := col < rightmost
+		raw.WriteString(mergeConnector(up, down, left, right))
+	}
+	buf.WriteString(st.Render(raw.String()))
+
+	// Post-span: spaces with merge-above pass-through.
+	for col := rightmost + 1; col < width; col++ {
+		if slices.Contains(mergeAboveCols, col) {
+			buf.WriteString(st.Render("│"))
+		} else {
+			buf.WriteByte(' ')
+		}
 	}
 
-	leftPad := strings.Repeat(" ", leftmost)
-	vis := rightmost + 1
-	return padRight(leftPad+st.Render(raw.String()), vis, width)
+	return buf.String()
 }
 
 // mergeConnector returns the box-drawing character for a merge line position.
-// up = card center above, down = trunk below, left/right = not at edge.
-func mergeConnector(isCenter, isTrunk, isLeftEdge, isRightEdge bool) string {
-	up := isCenter
-	down := isTrunk
-	left := !isLeftEdge
-	right := !isRightEdge
-
+func mergeConnector(up, down, left, right bool) string {
 	switch {
 	case up && down:
 		if !left && !right {
