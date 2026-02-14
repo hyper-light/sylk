@@ -658,18 +658,19 @@ func (m *Model) clickCommitView(viewY int) tea.Cmd {
 // branchRowLines returns the height (in terminal rows) of a rendered branch
 // row, accounting for expanded cards that are taller than branchRowHeight.
 func (m *Model) branchRowLines(rowIdx int) int {
+	oc := m.offshootCount()
 	orc := m.offshootRowCount()
 	cols := m.effectiveCols()
 
 	if rowIdx >= orc {
 		// Primary row: card height + padding to branchRowHeight minimum.
-		cardH := m.branchCardHeight(orc) // primary is at flat index = orc
+		cardH := m.branchCardHeight(oc) // primary is at flat index = offshootCount
 		return max(cardH, branchRowHeight)
 	}
 
 	// Offshoot row: tallest card in this row + 2 connector lines.
 	rowStart := rowIdx * cols
-	rowEnd := min(rowStart+cols, orc)
+	rowEnd := min(rowStart+cols, oc)
 	tallest := 0
 	for i := rowStart; i < rowEnd; i++ {
 		tallest = max(tallest, m.branchCardHeight(i))
@@ -776,16 +777,19 @@ func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 	}
 
 	// If clicking the expanded card's expansion area (divider, action line,
-	// confirm/input, bottom border), handle it without toggling expansion.
+	// confirm/input, bottom border), test against computed hit regions with
+	// both X and Y coordinates to prevent cross-line interference.
 	if m.expandedIdx == targetIdx {
 		cardH := m.branchCardHeight(targetIdx)
 		if localY >= 3 && localY < cardH {
-			if localY == 4 {
-				if cmd := m.clickActionBadge(viewX, cardLeft, cardW); cmd != nil {
-					return cmd
+			localX := viewX - cardLeft - 1 // -1 for left border "│"
+			if localX >= 0 {
+				for _, r := range m.expandedHitRegions() {
+					if localY == r.Y && localX >= r.XMin && localX < r.XMax {
+						return m.handleCardHit(r, localX)
+					}
 				}
 			}
-			// Absorb click in expansion area.
 			m.viewDirty = true
 			return nil
 		}
@@ -806,79 +810,112 @@ func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 	return nil
 }
 
-// clickActionBadge maps a click X coordinate on the expanded action line
-// to a specific action badge and executes it. Returns nil if the click
-// didn't land on a badge.
-func (m *Model) clickActionBadge(screenX, cardLeft, cardWidth int) tea.Cmd {
+// clickActionBadge selects the badge at the given action index and executes
+// or toggles its sub-view. Switch executes immediately; Commit/Delete toggle
+// their inline sub-views.
+func (m *Model) clickActionBadge(idx int) tea.Cmd {
+	// Clear stale sub-view state when switching to a different action,
+	// so toggleExpandedSubview starts fresh instead of toggling off
+	// a sub-view that belonged to the previous action.
+	if m.expandedAction != idx {
+		m.deleteConfirmActive = false
+		m.deleteConfirmYes = false
+		m.clearCommitInput()
+	}
+	m.expandedAction = idx
+	m.viewDirty = true
+
+	actionID := m.expandedActionID()
+	if !m.isActionEnabled(actionID) {
+		return nil
+	}
+	if actionID == branchActionSwitch {
+		return m.executeExpandedAction()
+	}
+	m.toggleExpandedSubview()
+	return nil
+}
+
+// expandedCardInnerWidth returns the inner content width of the expanded card.
+func (m *Model) expandedCardInnerWidth() int {
+	oc := m.offshootCount()
+	const borderCols = 2
+	if m.expandedIdx >= oc {
+		return max(primaryCardWidth(m.width)-borderCols, 0)
+	}
+	return max(offshootCardWidth(m.width, m.effectiveCols())-borderCols, 0)
+}
+
+// expandedHitRegions computes all clickable regions for the currently expanded
+// branch card. Returns nil if no card is expanded.
+func (m *Model) expandedHitRegions() []cardHitRegion {
 	if m.expandedIdx < 0 || m.expandedIdx >= len(m.branches) {
 		return nil
 	}
 	b := m.branches[m.expandedIdx]
+	var regions []cardHitRegion
 
-	// The action line content starts after the left border character.
-	// Reconstruct badge positions by measuring the same segments as
-	// buildExpContentLine. All X positions are relative to the card left edge.
-	localX := screenX - cardLeft - 1 // -1 for left border "│"
-	if localX < 0 {
-		return nil
-	}
-
-	// Walk the action line to find badge X ranges.
-	// Prefix: " N commits" (+ optional status badge for HEAD).
-	count := itoa(b.CommitCount)
-	if b.CommitCountCapped {
-		count += "+"
-	}
-	x := 1 + len(count+" commits") // leading space + count text
-
-	if b.IsHead {
-		if m.workingConflicts {
-			x += 2 + len("[conflicts]")
-		} else if m.workingDirty {
-			x += 2 + len("[dirty]")
-		}
-	}
-
-	// Check each visible action badge.
-	actions := m.expandedVisibleActions()
-	for i, actionID := range actions {
-		gap := 2
-		if actionID == branchActionDelete {
-			gap = 1
-		}
-		x += gap
-		var label string
-		switch actionID {
-		case branchActionCommit:
-			label = "[Commit]"
-		case branchActionSwitch:
-			label = "[Switch]"
-		case branchActionDelete:
-			label = "[Delete]"
-		}
-		badgeW := len(label)
-		if localX >= x && localX < x+badgeW {
-			alreadySelected := m.expandedAction == i
-			m.expandedAction = i
-			m.viewDirty = true
-			if !m.isActionEnabled(actionID) {
-				return nil
-			}
-			if alreadySelected {
-				return m.toggleExpandedSubview()
-			}
-			// Close any open sub-view from a previously selected action.
-			m.deleteConfirmActive = false
-			m.deleteConfirmYes = false
-			if m.commitInputActive {
-				m.clearCommitInput()
-			}
-			return nil
-		}
+	// Action badges at cardActionLine.
+	x := actionLinePrefixWidth(b, m.workingDirty, m.workingConflicts)
+	for i, actionID := range m.expandedVisibleActions() {
+		x += actionBadgeGap(actionID)
+		badgeW := len(actionBadgeLabel(actionID))
+		regions = append(regions, cardHitRegion{
+			Y:    cardActionLine,
+			XMin: x,
+			XMax: x + badgeW,
+			Kind: hitActionBadge,
+			Idx:  i,
+		})
 		x += badgeW
-		_ = i
 	}
 
+	// Sub-view regions at cardSubviewLine.
+	if m.deleteConfirmActive {
+		yesStart := deleteConfirmYesStart()
+		noStart := deleteConfirmNoStart()
+		regions = append(regions,
+			cardHitRegion{
+				Y:    cardSubviewLine,
+				XMin: yesStart,
+				XMax: yesStart + len(deleteConfirmYesLabel),
+				Kind: hitDeleteYes,
+			},
+			cardHitRegion{
+				Y:    cardSubviewLine,
+				XMin: noStart,
+				XMax: noStart + len(deleteConfirmNoLabel),
+				Kind: hitDeleteNo,
+			},
+		)
+	} else if m.commitInputActive && m.commitPhase == commitIdle {
+		regions = append(regions, cardHitRegion{
+			Y:    cardSubviewLine,
+			XMin: commitInputLabelWidth,
+			XMax: m.expandedCardInnerWidth(),
+			Kind: hitCommitInput,
+		})
+	}
+
+	return regions
+}
+
+// handleCardHit dispatches a click on a resolved hit region.
+func (m *Model) handleCardHit(r cardHitRegion, localX int) tea.Cmd {
+	switch r.Kind {
+	case hitActionBadge:
+		return m.clickActionBadge(r.Idx)
+	case hitDeleteYes:
+		m.deleteConfirmYes = true
+		m.viewDirty = true
+	case hitDeleteNo:
+		m.deleteConfirmYes = false
+		m.viewDirty = true
+	case hitCommitInput:
+		runes := []rune(m.commitMsg)
+		m.commitCursor = clampInt(localX-commitInputLabelWidth, 0, len(runes))
+		m.viewDirty = true
+	}
 	return nil
 }
 
@@ -1369,9 +1406,10 @@ func (m *Model) prevAction(from int) int {
 }
 
 // handleExpandedKey processes keys when a branch card is expanded.
-// Tab cycles between card action badges and toolbar buttons;
-// space/enter triggers the focused action; shift+tab or esc collapses the
-// card. When the commit input is active, keys route to the inline text input.
+// Tab/shift+tab cycle between card action badges (wrapping); they do NOT
+// escape to the toolbar. Space/enter triggers the focused action; esc
+// collapses the card. When the commit input is active, keys route to the
+// inline text input.
 func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
 	if m.deleteConfirmActive {
 		return m.handleDeleteConfirmKey(km)
@@ -1394,13 +1432,7 @@ func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
 	case "l", "right":
 		m.expandedAction = m.nextAction(m.expandedAction)
 	case "tab":
-		next := m.expandedAction + 1
-		if next >= actionMax {
-			m.toolbarFocused = true
-			m.toolbarAction = 0
-		} else {
-			m.expandedAction = next
-		}
+		m.expandedAction = (m.expandedAction + 1) % actionMax
 	case "shift+tab":
 		m.collapseBranch()
 	case "enter":
@@ -1410,13 +1442,9 @@ func (m *Model) handleExpandedKey(km tea.KeyMsg) tea.Cmd {
 	case "esc", "q":
 		m.collapseBranch()
 	case "j", "down":
-		m.collapseBranch()
-		m.moveBranchDown()
-		m.ensureBranchVisible()
+		return m.toggleExpandedSubview()
 	case "k", "up":
 		m.collapseBranch()
-		m.moveBranchUp()
-		m.ensureBranchVisible()
 	default:
 		return nil
 	}
@@ -1430,14 +1458,11 @@ func (m *Model) handleExpandedToolbarKey(km tea.KeyMsg) tea.Cmd {
 	buttons := m.toolbarButtons()
 
 	switch km.String() {
-	case "tab":
-		next := m.toolbarAction + 1
-		if next >= len(buttons) {
-			m.toolbarFocused = false
-			m.expandedAction = 0
-		} else {
-			m.toolbarAction = next
-		}
+	case "tab", "shift+tab":
+		// Return focus to card actions — tab is constrained to
+		// card options while a card is expanded.
+		m.toolbarFocused = false
+		m.expandedAction = 0
 	case "h", "left":
 		m.toolbarAction = max(m.toolbarAction-1, 0)
 	case "l", "right":
@@ -1445,7 +1470,7 @@ func (m *Model) handleExpandedToolbarKey(km tea.KeyMsg) tea.Cmd {
 	case "enter", " ":
 		m.viewDirty = true
 		return m.executeToolbarAction()
-	case "shift+tab", "esc", "q":
+	case "esc", "q":
 		m.collapseBranch()
 	case "j", "down":
 		m.collapseBranch()
@@ -1482,7 +1507,9 @@ func (m *Model) handleCommitInputKey(km tea.KeyMsg) tea.Cmd {
 		m.commitSpinner = 0
 		m.viewDirty = true
 		return func() tea.Msg { return CommitRequestMsg{Message: msg} }
-	case "esc", "tab", "shift+tab":
+	case "shift+tab":
+		m.collapseBranch()
+	case "esc", "tab", "up":
 		m.clearCommitInput()
 	case "backspace":
 		if m.commitCursor > 0 {
@@ -1523,7 +1550,9 @@ func (m *Model) handleDeleteConfirmKey(km tea.KeyMsg) tea.Cmd {
 	switch km.String() {
 	case "left", "right":
 		m.deleteConfirmYes = !m.deleteConfirmYes
-	case "tab", "shift+tab":
+	case "shift+tab":
+		m.collapseBranch()
+	case "k", "up", "tab":
 		m.deleteConfirmActive = false
 		m.deleteConfirmYes = false
 	case "y":
@@ -2148,7 +2177,8 @@ func (m *Model) selectionCmd() tea.Cmd {
 }
 
 // groupChildrenAfterParent reorders branches so that children appear
-// immediately after their parent. Preserves relative order otherwise.
+// immediately before their parent. In the visual layout offshoots are
+// displayed top-to-bottom, so "before" means "above" on screen.
 func groupChildrenAfterParent(branches []BranchNode) []BranchNode {
 	// Build parent → children index.
 	children := make(map[string][]BranchNode)
@@ -2163,14 +2193,14 @@ func groupChildrenAfterParent(branches []BranchNode) []BranchNode {
 		return branches
 	}
 
-	// Emit each root-level branch followed by its children.
+	// Emit children before their parent so they appear above.
 	out := make([]BranchNode, 0, len(branches))
 	for _, b := range branches {
 		if hasParent[b.Name] {
-			continue // will be emitted after its parent
+			continue // emitted before its parent
 		}
-		out = append(out, b)
 		out = append(out, children[b.Name]...)
+		out = append(out, b)
 	}
 	return out
 }

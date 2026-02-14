@@ -496,6 +496,100 @@ func buildExpContentLine(b BranchNode, exp *branchExpansion, width int, p theme.
 	return text
 }
 
+// actionBadgeLabel returns the bracket-wrapped label for an action ID.
+func actionBadgeLabel(actionID int) string {
+	switch actionID {
+	case branchActionCommit:
+		return "[Commit]"
+	case branchActionSwitch:
+		return "[Switch]"
+	case branchActionDelete:
+		return "[Delete]"
+	default:
+		return ""
+	}
+}
+
+// actionBadgeGap returns the column gap before an action badge.
+func actionBadgeGap(actionID int) int {
+	if actionID == branchActionDelete {
+		return 1
+	}
+	return 2
+}
+
+// actionLinePrefixWidth computes the column width of the non-badge prefix
+// on the expanded content line: " N commits" + optional behind + optional status.
+func actionLinePrefixWidth(b BranchNode, dirty, conflicts bool) int {
+	count := itoa(b.CommitCount)
+	if b.CommitCountCapped {
+		count += "+"
+	}
+	w := 1 + len(count+" commits")
+	if b.BehindCount > 0 {
+		behind := itoa(b.BehindCount)
+		if b.BehindCountCapped {
+			behind += "+"
+		}
+		w += 2 + len(behind+" behind")
+	}
+	if b.IsHead {
+		if conflicts {
+			w += 2 + len("[conflicts]")
+		} else if dirty {
+			w += 2 + len("[dirty]")
+		}
+	}
+	return w
+}
+
+// cardHitKind identifies the type of clickable region in an expanded card.
+type cardHitKind int
+
+const (
+	hitActionBadge cardHitKind = iota
+	hitDeleteYes
+	hitDeleteNo
+	hitCommitInput
+)
+
+// cardHitRegion describes a single clickable area within an expanded card.
+type cardHitRegion struct {
+	Y    int         // card line index (0-indexed from top border)
+	XMin int         // left column (inclusive), relative to content start (after left │)
+	XMax int         // right column (exclusive)
+	Kind cardHitKind
+	Idx  int         // action index (hitActionBadge only)
+}
+
+// Card line indices for expanded branch cards, derived from buildBranchCard:
+// [0] top border, [1] header, [2] subject, [3] divider → [4] actions.
+const (
+	cardActionLine  = 4 // action badges line
+	cardSubviewLine = 5 // delete confirm / commit input / blocked reason
+)
+
+// Delete confirm layout constants shared between rendering and click detection.
+const (
+	deleteConfirmPrompt   = "Delete this branch?"
+	deleteConfirmYesLabel = "(y)es"
+	deleteConfirmNoLabel  = "(n)o"
+	deleteConfirmGap      = 2
+)
+
+// deleteConfirmYesStart returns the X offset where "(y)es" begins.
+func deleteConfirmYesStart() int {
+	return 1 + len(deleteConfirmPrompt) + deleteConfirmGap
+}
+
+// deleteConfirmNoStart returns the X offset where "(n)o" begins.
+func deleteConfirmNoStart() int {
+	return deleteConfirmYesStart() + len(deleteConfirmYesLabel) + deleteConfirmGap
+}
+
+// commitInputLabelWidth is the visual width of the " Message: " label.
+const commitInputLabelWidth = 10
+
 // renderActionBadge renders a single [Label] badge with appropriate styling.
 // accent is the semantic color for the action (e.g. Success for Switch, Error
 // for Delete). Disabled+selected shows muted with selection background so the
@@ -539,7 +633,8 @@ func buildDeleteConfirmLine(yesSelected bool, width int, p theme.Palette) string
 		no = noAccent.Render("(n)") + noAccent.Render("o")
 	}
 
-	return " " + promptSt.Render("Delete this branch?") + "  " + yes + "  " + no
+	gap := strings.Repeat(" ", deleteConfirmGap)
+	return " " + promptSt.Render(deleteConfirmPrompt) + gap + yes + gap + no
 }
 
 //	idle:        " Message: ▏some commit text"

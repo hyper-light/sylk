@@ -185,7 +185,7 @@ func renderGearDropdown(ls *listState, dropW int, th *theme.Theme) []string {
 		}
 
 		contentStyle := lipgloss.NewStyle().Foreground(fg).Background(bg)
-		inner := fitHeaderCell(" "+check+" "+col.Def.Label, innerW, contentStyle)
+		inner := fitCell(" "+check+" "+col.Def.Label, innerW, contentStyle)
 		line := borderStyle.Render("\u2502") + inner + borderStyle.Render("\u2502")
 		lines = append(lines, line)
 	}
