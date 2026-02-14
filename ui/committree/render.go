@@ -268,15 +268,15 @@ const branchRowHeight = 6
 // Layout constants for branch tree rendering.
 const (
 	branchCardGap      = 3  // gap between side-by-side cards (includes trunk)
-	maxBranchCols      = 2  // max offshoot cards per row
 	minBranchCardWidth = 24 // minimum usable card width
 	primaryWidthPct    = 70 // primary card width as percentage of panel
 	offshootWidthPct   = 55 // single-column offshoot width as percentage
 )
 
 // branchCols returns how many offshoot cards fit side-by-side.
+// Derived from: cols * minBranchCardWidth + (cols-1) * branchCardGap <= width.
 func branchCols(width int) int {
-	return clampInt((width+branchCardGap)/(minBranchCardWidth+branchCardGap), 1, maxBranchCols)
+	return max((width+branchCardGap)/(minBranchCardWidth+branchCardGap), 1)
 }
 
 // offshootCardWidth returns the width of each offshoot card.
@@ -378,7 +378,7 @@ func (e *branchExpansion) actionBlockedReason(isHead bool) string {
 // Normal cards produce 4 lines; expanded cards produce 6–7 depending on
 // whether a blocked-reason line is needed.
 func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palette,
-	trunkInner int, hasTrunkTop, hasTrunkBot bool,
+	trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool,
 	expanded bool, exp *branchExpansion, wt workingTreeState) []string {
 
 	borderColor := p.Border
@@ -400,7 +400,7 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 		subject = truncateStyled(subject, innerWidth-2) + " " + arrowSt.Render(arrow)
 	}
 
-	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInner, hasTrunkTop)
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop)
 
 	lines := []string{
 		topBorder,
@@ -430,7 +430,7 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 
 	var botBorder string
 	if hasTrunkBot {
-		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInner, true)
+		botBorder = buildCardBorder("╰", "╯", innerWidth, bSt, trunkInnerBot, true)
 	} else {
 		botBorder = bSt.Render("╰" + strings.Repeat("─", innerWidth) + "╯")
 	}
@@ -705,29 +705,29 @@ func buildCommitIdleLine(exp *branchExpansion, width int, p theme.Palette) strin
 }
 
 // composeOffshootRow composites pre-rendered card line slices into a row
-// with trunk connectors and merge lines. cardSlices contains one entry per
-// card in the row, already rendered by buildBranchCard (possibly cached).
-func composeOffshootRow(cardSlices [][]string, cardWidth, width int, th *theme.Theme, hasTrunkAbove bool) []string {
+// with merge lines and connectors. cardSlices contains one entry per card
+// in the row, already rendered by buildBranchCard (possibly cached).
+// hasTrunkAbove draws a trunk │ in the card gap when a depth-0 row above
+// produced a trunk line. mergeTarget is the column position the merge line
+// connects to: trunkPos for depth-0 rows, parent's card center for depth > 0.
+func composeOffshootRow(cardSlices [][]string, colIndices []int, cardWidth, gridCols, width int, th *theme.Theme, hasTrunkAbove bool, mergeTarget int) []string {
 	p := th.Palette
 	cols := len(cardSlices)
 	trunkPos := width / 2
 	trunkSt := lipgloss.NewStyle().Foreground(p.Border)
 
-	// Compute card positions (centered group).
-	totalContent := cols*cardWidth + max(cols-1, 0)*branchCardGap
+	// Compute card positions using fixed grid so columns align across rows.
+	totalContent := gridCols*cardWidth + max(gridCols-1, 0)*branchCardGap
 	leftMargin := max((width-totalContent)/2, 0)
 
 	cardLefts := make([]int, cols)
 	cardCenters := make([]int, cols)
-	for i := range cols {
-		cardLefts[i] = leftMargin + i*(cardWidth+branchCardGap)
+	for i, ci := range colIndices {
+		cardLefts[i] = leftMargin + ci*(cardWidth+branchCardGap)
 		cardCenters[i] = cardLefts[i] + cardWidth/2
 	}
 
 	// Merge card lines horizontally with trunk in gap.
-	// When one card is shorter (not expanded) and a sibling is expanded,
-	// draw a vertical connector from the shorter card's center down to
-	// the merge line so the tree graphic stays connected.
 	maxCardHeight := 0
 	for _, cs := range cardSlices {
 		maxCardHeight = max(maxCardHeight, len(cs))
@@ -736,8 +736,6 @@ func composeOffshootRow(cardSlices [][]string, cardWidth, width int, th *theme.T
 	lines := make([]string, 0, maxCardHeight+2)
 	for lineIdx := range maxCardHeight {
 		var buf strings.Builder
-		// Track visual column position directly — card lines are always
-		// exactly cardWidth columns, so we avoid lipgloss.Width entirely.
 		col := 0
 		for i := range cols {
 			target := cardLefts[i]
@@ -763,18 +761,28 @@ func composeOffshootRow(cardSlices [][]string, cardWidth, width int, th *theme.T
 		lines = append(lines, padRight(buf.String(), col, width))
 	}
 
-	// Merge line (or trunk for single card).
-	trunkVis := trunkPos + 1
-	if cols == 1 {
-		trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
-		lines = append(lines, padRight(trunk, trunkVis, width))
-	} else {
-		lines = append(lines, renderMergeLine(cardCenters, trunkPos, width, th))
+	// For off-center single cards, draw a vertical connector from the
+	// card's center down to the merge line so the tree stays connected.
+	if cols == 1 && cardCenters[0] != mergeTarget {
+		center := cardCenters[0]
+		connector := strings.Repeat(" ", center) + trunkSt.Render("│")
+		lines = append(lines, padRight(connector, center+1, width))
 	}
 
-	// Trunk line.
-	trunk := strings.Repeat(" ", trunkPos) + trunkSt.Render("│")
-	lines = append(lines, padRight(trunk, trunkVis, width))
+	// Merge line: connects card center(s) to the merge target.
+	// When a single card is centered on the target, a simple vertical
+	// suffices; otherwise draw a horizontal merge connector.
+	targetVis := mergeTarget + 1
+	if cols == 1 && cardCenters[0] == mergeTarget {
+		line := strings.Repeat(" ", mergeTarget) + trunkSt.Render("│")
+		lines = append(lines, padRight(line, targetVis, width))
+	} else {
+		lines = append(lines, renderMergeLine(cardCenters, mergeTarget, width, th))
+	}
+
+	// Vertical connector below the merge line.
+	connector := strings.Repeat(" ", mergeTarget) + trunkSt.Render("│")
+	lines = append(lines, padRight(connector, targetVis, width))
 
 	return lines
 }
@@ -805,26 +813,63 @@ func composePrimaryRow(cardLines []string, width int) []string {
 // to the rightmost card center, with ┬ at the trunk position.
 func renderMergeLine(centers []int, trunkPos, width int, th *theme.Theme) string {
 	st := lipgloss.NewStyle().Foreground(th.Palette.Border)
-	leftC := centers[0]
-	rightC := centers[len(centers)-1]
 
-	var raw strings.Builder
-	for col := leftC; col <= rightC; col++ {
-		switch col {
-		case leftC:
-			raw.WriteString("╰")
-		case rightC:
-			raw.WriteString("╯")
-		case trunkPos:
-			raw.WriteString("┬")
-		default:
-			raw.WriteString("─")
-		}
+	centerSet := make(map[int]struct{}, len(centers))
+	for _, c := range centers {
+		centerSet[c] = struct{}{}
 	}
 
-	leftPad := strings.Repeat(" ", leftC)
-	vis := rightC + 1
+	// Span must include all card centers AND the trunk.
+	leftmost := trunkPos
+	rightmost := trunkPos
+	for _, c := range centers {
+		leftmost = min(leftmost, c)
+		rightmost = max(rightmost, c)
+	}
+
+	var raw strings.Builder
+	for col := leftmost; col <= rightmost; col++ {
+		_, isCenter := centerSet[col]
+		isTrunk := col == trunkPos
+		raw.WriteString(mergeConnector(isCenter, isTrunk, col == leftmost, col == rightmost))
+	}
+
+	leftPad := strings.Repeat(" ", leftmost)
+	vis := rightmost + 1
 	return padRight(leftPad+st.Render(raw.String()), vis, width)
+}
+
+// mergeConnector returns the box-drawing character for a merge line position.
+// up = card center above, down = trunk below, left/right = not at edge.
+func mergeConnector(isCenter, isTrunk, isLeftEdge, isRightEdge bool) string {
+	up := isCenter
+	down := isTrunk
+	left := !isLeftEdge
+	right := !isRightEdge
+
+	switch {
+	case up && down:
+		if !left && !right {
+			return "│"
+		}
+		return "┼"
+	case up && !left && !right:
+		return "│"
+	case up && left && right:
+		return "┴"
+	case up && right:
+		return "╰"
+	case up && left:
+		return "╯"
+	case down && left && right:
+		return "┬"
+	case down && right:
+		return "╭"
+	case down && left:
+		return "╮"
+	default:
+		return "─"
+	}
 }
 
 // buildCardBorder constructs a horizontal border with an optional trunk connector.
@@ -897,13 +942,7 @@ func buildBranchHeaderLine(b BranchNode, availWidth int, p theme.Palette, wt wor
 	ts := timeStyle.Render(relativeTime(b.AuthorTime))
 
 	left := marker + " " + name
-	leftWidth := lipgloss.Width(left)
-	rightWidth := lipgloss.Width(ts)
-
-	const minGap = 2
-	gap := max(availWidth-leftWidth-rightWidth, minGap)
-
-	return left + strings.Repeat(" ", gap) + ts
+	return layoutLine(left, ts, availWidth)
 }
 
 // buildBranchSubjectLine assembles: (indent) shortHash  subject

@@ -125,6 +125,10 @@ type BranchInfo struct {
 	// AuthorTime is when the tip commit was authored.
 	AuthorTime time.Time
 
+	// CreatedTime is when the branch ref was first created, derived from
+	// the first reflog entry. Zero if the reflog is unavailable.
+	CreatedTime time.Time
+
 	// IsHead is true if this is the currently checked-out branch.
 	IsHead bool
 }

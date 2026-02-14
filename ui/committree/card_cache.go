@@ -20,10 +20,11 @@ type cardCacheKey struct {
 	expanded bool
 
 	// Layout parameters.
-	innerWidth  int
-	trunkInner  int
-	hasTrunkTop bool
-	hasTrunkBot bool
+	innerWidth     int
+	trunkInnerTop  int
+	trunkInnerBot  int
+	hasTrunkTop    bool
+	hasTrunkBot    bool
 
 	// Working tree state.
 	dirty     bool
@@ -51,27 +52,28 @@ type cardCacheEntry struct {
 }
 
 // buildCardCacheKey constructs a cache key from all rendering inputs.
-func buildCardCacheKey(b BranchNode, selected bool, innerWidth, trunkInner int,
+func buildCardCacheKey(b BranchNode, selected bool, innerWidth, trunkInnerTop, trunkInnerBot int,
 	hasTrunkTop, hasTrunkBot, expanded bool, exp *branchExpansion, wt workingTreeState) cardCacheKey {
 
 	k := cardCacheKey{
-		name:        b.Name,
-		shortHash:   b.ShortHash,
-		subject:     b.Subject,
-		commitCount:  b.CommitCount,
-		capped:       b.CommitCountCapped,
-		behindCount:  b.BehindCount,
-		behindCapped: b.BehindCountCapped,
-		isHead:      b.IsHead,
-		relTime:     relativeTime(b.AuthorTime),
-		selected:    selected,
-		expanded:    expanded,
-		innerWidth:  innerWidth,
-		trunkInner:  trunkInner,
-		hasTrunkTop: hasTrunkTop,
-		hasTrunkBot: hasTrunkBot,
-		dirty:       wt.dirty,
-		conflicts:   wt.conflicts,
+		name:          b.Name,
+		shortHash:     b.ShortHash,
+		subject:       b.Subject,
+		commitCount:   b.CommitCount,
+		capped:        b.CommitCountCapped,
+		behindCount:   b.BehindCount,
+		behindCapped:  b.BehindCountCapped,
+		isHead:        b.IsHead,
+		relTime:       relativeTime(b.AuthorTime),
+		selected:      selected,
+		expanded:      expanded,
+		innerWidth:    innerWidth,
+		trunkInnerTop: trunkInnerTop,
+		trunkInnerBot: trunkInnerBot,
+		hasTrunkTop:   hasTrunkTop,
+		hasTrunkBot:   hasTrunkBot,
+		dirty:         wt.dirty,
+		conflicts:     wt.conflicts,
 	}
 
 	if expanded && exp != nil {
@@ -180,10 +182,10 @@ func (m *Model) getCachedNode(idx int, n TreeNode, selected, isFirst, isLast boo
 // getCachedCard returns cached card lines if the key matches, otherwise
 // renders the card, stores it in the cache, and returns fresh lines.
 func (m *Model) getCachedCard(flatIdx int, b BranchNode, selected bool,
-	innerWidth, trunkInner int, hasTrunkTop, hasTrunkBot, expanded bool,
+	innerWidth, trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot, expanded bool,
 	exp *branchExpansion, wt workingTreeState) []string {
 
-	key := buildCardCacheKey(b, selected, innerWidth, trunkInner,
+	key := buildCardCacheKey(b, selected, innerWidth, trunkInnerTop, trunkInnerBot,
 		hasTrunkTop, hasTrunkBot, expanded, exp, wt)
 
 	// Grow cache slice if needed.
@@ -197,7 +199,7 @@ func (m *Model) getCachedCard(flatIdx int, b BranchNode, selected bool,
 	}
 
 	lines := buildBranchCard(b, selected, innerWidth, m.theme.Palette,
-		trunkInner, hasTrunkTop, hasTrunkBot,
+		trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot,
 		expanded, exp, wt)
 
 	entry.valid = true

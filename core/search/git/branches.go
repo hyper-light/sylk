@@ -3,6 +3,9 @@ package git
 import (
 	"container/heap"
 	"io"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,7 +75,68 @@ func branchInfoFromRef(c *GitClient, ref *plumbing.Reference, headBranch string)
 		info.AuthorTime = commit.Author.When
 	}
 
+	info.CreatedTime = c.branchCreatedTime(name)
+
 	return info
+}
+
+// branchCreatedTime returns the time the branch ref was created.
+// It first checks the reflog (first entry timestamp). If the reflog is
+// unavailable (e.g. branch created by go-git which doesn't write reflogs),
+// it falls back to the loose ref file's modification time.
+// Returns zero time if neither source is available.
+func (c *GitClient) branchCreatedTime(name string) time.Time {
+	// Try reflog first — most accurate source.
+	if t := c.branchReflogCreatedTime(name); !t.IsZero() {
+		return t
+	}
+	// Fall back to the loose ref file's mtime.
+	refPath := filepath.Join(c.repoPath, ".git", "refs", "heads", name)
+	fi, err := os.Stat(refPath)
+	if err != nil {
+		return time.Time{}
+	}
+	return fi.ModTime()
+}
+
+// branchReflogCreatedTime reads the first reflog entry for the named branch
+// and returns its timestamp.
+func (c *GitClient) branchReflogCreatedTime(name string) time.Time {
+	reflogPath := filepath.Join(c.repoPath, ".git", "logs", "refs", "heads", name)
+	f, err := os.Open(reflogPath)
+	if err != nil {
+		return time.Time{}
+	}
+	defer f.Close()
+
+	// Read enough of the first line to extract the timestamp.
+	var buf [512]byte
+	n, _ := f.Read(buf[:])
+	if n == 0 {
+		return time.Time{}
+	}
+
+	line := string(buf[:n])
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+
+	// Reflog format: <old> <new> <name> <<email>> <unix_ts> <tz>\t<msg>
+	// Find the closing '>' of the email, then parse the Unix timestamp.
+	gt := strings.LastIndex(line, "> ")
+	if gt < 0 {
+		return time.Time{}
+	}
+	rest := line[gt+2:]
+	sp := strings.IndexByte(rest, ' ')
+	if sp < 0 {
+		return time.Time{}
+	}
+	ts, err := strconv.ParseInt(rest[:sp], 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(ts, 0)
 }
 
 // BranchTipHash returns the full commit hash of the named local branch tip.
@@ -997,6 +1061,127 @@ func (c *GitClient) CountBranchCommits(name string, limit int) (count int, cappe
 
 	capped = limit > 0 && count >= limit
 	return count, capped, nil
+}
+
+// =============================================================================
+// Branch Parent Inference
+// =============================================================================
+
+// inferWalkLimit caps the first-parent walk depth per branch during parent
+// inference. Derived from: typical feature branches have < 100 commits;
+// 200 provides comfortable headroom without unbounded growth.
+const inferWalkLimit = 200
+
+// InferBranchParents determines parent-child relationships between branches
+// by walking the commit graph. For each non-default branch, it walks the
+// first-parent chain looking for another branch's tip commit — the same
+// topology visible in `git log --graph --all --decorate`. The first foreign
+// tip found determines the parent:
+//   - Non-default branch tip → that branch is the parent.
+//   - Default branch tip → child of default (no entry).
+//   - No tip found within walk limit → child of default (no entry).
+//
+// Returns child name → parent name. Only branches with a detected
+// non-default parent appear in the map.
+func (c *GitClient) InferBranchParents(branches []BranchInfo, defaultBranch string) map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo || len(branches) < 2 {
+		return nil
+	}
+
+	// Multiple branches may share a tip (e.g. freshly created branch).
+	tipsAt := make(map[plumbing.Hash][]string, len(branches))
+	for _, b := range branches {
+		h := plumbing.NewHash(b.Hash)
+		tipsAt[h] = append(tipsAt[h], b.Name)
+	}
+
+	// Identify HEAD for shared-tip resolution: when two branches point to
+	// the same commit, HEAD is the established branch (parent).
+	headBranch := ""
+	for _, b := range branches {
+		if b.IsHead {
+			headBranch = b.Name
+			break
+		}
+	}
+
+	parents := make(map[string]string, len(branches))
+	for _, a := range branches {
+		if a.Name == defaultBranch {
+			continue
+		}
+		if p := c.ancestorBranchTip(plumbing.NewHash(a.Hash), a.Name, defaultBranch, headBranch, tipsAt); p != "" {
+			parents[a.Name] = p
+		}
+	}
+	return parents
+}
+
+// ancestorBranchTip walks the first-parent chain from hash, looking for a
+// commit that is another branch's tip. At step 0 (shared tip), only HEAD
+// qualifies as parent — this resolves directionality for freshly created
+// branches. At step 1+, any non-default foreign tip qualifies.
+func (c *GitClient) ancestorBranchTip(hash plumbing.Hash, self, defaultBranch, headBranch string, tipsAt map[plumbing.Hash][]string) string {
+	for step := range inferWalkLimit {
+		co, err := c.repo.CommitObject(hash)
+		if err != nil {
+			return ""
+		}
+		if step == 0 {
+			// Shared tip: HEAD is the parent (git checkout -b).
+			if p := matchHeadTip(tipsAt[hash], self, defaultBranch, headBranch); p != "" {
+				return p
+			}
+		} else {
+			parent, stop := matchParentTip(tipsAt[hash], self, defaultBranch)
+			if parent != "" {
+				return parent
+			}
+			if stop {
+				return ""
+			}
+		}
+		if len(co.ParentHashes) == 0 {
+			return ""
+		}
+		hash = co.ParentHashes[0]
+	}
+	return ""
+}
+
+// matchHeadTip checks if HEAD occupies the same commit as self. Returns
+// HEAD's name if it's a valid non-default parent, or "" otherwise.
+func matchHeadTip(names []string, self, defaultBranch, headBranch string) string {
+	if self == headBranch || headBranch == defaultBranch {
+		return ""
+	}
+	for _, name := range names {
+		if name == headBranch {
+			return name
+		}
+	}
+	return ""
+}
+
+// matchParentTip scans branch names at a commit for a non-self, non-default
+// parent. Returns (name, false) if found, or ("", true) if the default branch
+// occupies this commit (signals walk termination).
+func matchParentTip(names []string, self, defaultBranch string) (string, bool) {
+	hitDefault := false
+	for _, name := range names {
+		if name == self {
+			continue
+		}
+		if name == defaultBranch {
+			hitDefault = true
+			continue
+		}
+		return name, false
+	}
+	return "", hitDefault
 }
 
 // =============================================================================

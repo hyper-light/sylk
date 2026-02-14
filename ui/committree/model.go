@@ -158,6 +158,13 @@ type Model struct {
 	defaultBranch   string            // Repository default branch name.
 	branchParents   map[string]string // child → parent branch name.
 
+	// Depth-aware offshoot layout (recomputed on data/resize change).
+	offRows    [][]int // offRows[rowIdx] = flat offshoot indices in that row
+	offRowOf   []int   // offRowOf[flatIdx] = row index for offshoot
+	offColOf   []int   // offColOf[flatIdx] = sequential position within row (navigation)
+	offGridCol []int   // offGridCol[flatIdx] = grid column for rendering alignment
+	offDepth   []int   // offDepth[flatIdx] = depth tier (0 = child of default)
+
 	// Expansion state.
 	expandedIdx      int  // Flat branch index of expanded card, -1 = none.
 	expandedAction   int  // Selected action within visible actions list.
@@ -252,6 +259,7 @@ func (m *Model) SetSize(width, height int) {
 	if width != m.width {
 		m.invalidateCardCache()
 		m.invalidateNodeCache()
+		defer m.recomputeOffshootLayout()
 	}
 	m.width = max(width, 0)
 	m.height = max(height, 0)
@@ -327,6 +335,7 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 	branches = groupChildrenAfterParent(branches)
 
 	m.branches = branches
+	m.recomputeOffshootLayout()
 
 	// Restore selection to the previously selected branch if still present.
 	// On first load (no prevName), default to the HEAD branch.
@@ -658,22 +667,17 @@ func (m *Model) clickCommitView(viewY int) tea.Cmd {
 // branchRowLines returns the height (in terminal rows) of a rendered branch
 // row, accounting for expanded cards that are taller than branchRowHeight.
 func (m *Model) branchRowLines(rowIdx int) int {
-	oc := m.offshootCount()
-	orc := m.offshootRowCount()
-	cols := m.effectiveCols()
-
-	if rowIdx >= orc {
+	if rowIdx >= len(m.offRows) {
 		// Primary row: card height + padding to branchRowHeight minimum.
+		oc := m.offshootCount()
 		cardH := m.branchCardHeight(oc) // primary is at flat index = offshootCount
 		return max(cardH, branchRowHeight)
 	}
 
 	// Offshoot row: tallest card in this row + 2 connector lines.
-	rowStart := rowIdx * cols
-	rowEnd := min(rowStart+cols, oc)
 	tallest := 0
-	for i := rowStart; i < rowEnd; i++ {
-		tallest = max(tallest, m.branchCardHeight(i))
+	for _, fi := range m.offRows[rowIdx] {
+		tallest = max(tallest, m.branchCardHeight(fi))
 	}
 	return tallest + 2 // +2 for merge/trunk connector lines
 }
@@ -742,28 +746,26 @@ func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 	cardW := 0
 
 	if targetRow < offRows {
-		// Offshoot row.
+		// Offshoot row — use grid-based positioning matching render.
+		row := m.offRows[targetRow]
 		cardW = offshootCardWidth(m.width, cols)
-		totalContent := cols*cardW + max(cols-1, 0)*branchCardGap
-		leftMargin := max((m.width-totalContent)/2, 0)
+		totalGrid := cols*cardW + max(cols-1, 0)*branchCardGap
+		leftMargin := max((m.width-totalGrid)/2, 0)
 
-		col := -1
-		for c := range cols {
-			cl := leftMargin + c*(cardW+branchCardGap)
+		hitIdx := -1
+		for i, flatIdx := range row {
+			ci := m.offGridCol[flatIdx]
+			cl := leftMargin + ci*(cardW+branchCardGap)
 			if viewX >= cl && viewX < cl+cardW {
-				col = c
+				hitIdx = i
 				cardLeft = cl
 				break
 			}
 		}
-		if col < 0 {
+		if hitIdx < 0 {
 			return nil
 		}
-		idx := targetRow*cols + col
-		if idx >= oc {
-			return nil
-		}
-		targetIdx = idx
+		targetIdx = row[hitIdx]
 	} else if targetRow == offRows {
 		// Primary branch — check X bounds same as offshoots.
 		cardW = primaryCardWidth(m.width)
@@ -986,6 +988,9 @@ func (m *Model) clickToolbar(viewX, localY int) tea.Cmd {
 	if idx < 0 {
 		return nil
 	}
+	if m.expandedIdx >= 0 {
+		m.collapseBranch()
+	}
 	m.toolbarFocused = true
 	m.toolbarAction = idx
 	m.viewDirty = true
@@ -1043,37 +1048,94 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 	exp := m.buildExpansion(cursorVisible)
 	lines := make([]string, 0, m.height)
 
+	// Precompute which branches have a child offshoot above them.
+	hasChildAbove := make(map[string]bool, oc)
+	for i := range oc {
+		if m.offDepth[i] > 0 {
+			hasChildAbove[m.branches[i].Parent] = true
+		}
+	}
+
+	// Precompute which rows have a trunk line above them. A trunk line
+	// exists above row R if any row before R connects to the trunk
+	// (depth 0 row with a merge line). Depth > 0 rows never produce
+	// trunk lines, so their presence doesn't set the flag.
+	trunkAbove := make([]bool, offRows)
+	seenTrunk := false
+	for r := range offRows {
+		trunkAbove[r] = seenTrunk
+		if m.offDepth[m.offRows[r][0]] == 0 {
+			seenTrunk = true
+		}
+	}
+
+	// Build name→flat-index map for parent position lookup.
+	offNameIdx := make(map[string]int, oc)
+	for i := range oc {
+		offNameIdx[m.branches[i].Name] = i
+	}
+
 	for rowIdx := m.branchScrollOff; rowIdx < endRow; rowIdx++ {
 		if rowIdx < offRows {
 			// Offshoot row — build cards via cache, compose into row.
-			rowStart := rowIdx * cols
-			rowEnd := min(rowStart+cols, oc)
-			hasTrunkAbove := rowIdx > 0
+			row := m.offRows[rowIdx]
+			rowCols := len(row)
+			hasTrunkAbove := trunkAbove[rowIdx]
 
-			totalContent := len(m.branches[rowStart:rowEnd])*cardWidth + max(len(m.branches[rowStart:rowEnd])-1, 0)*branchCardGap
-			leftMargin := max((m.width-totalContent)/2, 0)
+			// All cards in a row share the same depth tier.
+			rowDepth := m.offDepth[row[0]]
+
+			// Use fixed grid for consistent column alignment across rows.
+			totalGrid := cols*cardWidth + max(cols-1, 0)*branchCardGap
+			leftMargin := max((m.width-totalGrid)/2, 0)
 			innerWidth := max(cardWidth-borderCols, 0)
 
-			cardSlices := make([][]string, rowEnd-rowStart)
-			for i := range rowEnd - rowStart {
-				flatIdx := rowStart + i
+			// Merge target: trunk for depth 0, parent's card center for depth > 0.
+			mergeTarget := trunkPos
+			if rowDepth > 0 {
+				parentName := m.branches[row[0]].Parent
+				if pi, ok := offNameIdx[parentName]; ok {
+					parentGridCol := m.offGridCol[pi]
+					mergeTarget = leftMargin + parentGridCol*(cardWidth+branchCardGap) + cardWidth/2
+				}
+			}
+
+			colIndices := make([]int, rowCols)
+			cardSlices := make([][]string, rowCols)
+			for i, flatIdx := range row {
+				ci := m.offGridCol[flatIdx]
+				colIndices[i] = ci
 				b := m.branches[flatIdx]
 				selected := flatIdx == m.branchIdx
 				isExpanded := flatIdx == m.expandedIdx
-				hasTrunkBot := (rowEnd - rowStart) == 1
-				cardLeft := leftMargin + i*(cardWidth+branchCardGap)
-				trunkInner := trunkPos - cardLeft - 1
+				cardLeft := leftMargin + ci*(cardWidth+branchCardGap)
+
+				// Determine top/bottom border connectors.
+				cardCenter := innerWidth / 2
+				trunkAtCard := trunkPos - cardLeft - 1
+
+				hasTrunkTop := hasChildAbove[b.Name]
+				trunkInnerTop := cardCenter
+				if !hasTrunkTop {
+					trunkInnerTop = trunkAtCard
+				}
+
+				hasTrunkBot := m.offDepth[flatIdx] > 0
+				trunkInnerBot := cardCenter
+				if !hasTrunkBot {
+					trunkInnerBot = trunkAtCard
+				}
 
 				var cardExp *branchExpansion
 				if isExpanded {
 					cardExp = exp
 				}
 				cardSlices[i] = m.getCachedCard(flatIdx, b, selected,
-					innerWidth, trunkInner, hasTrunkAbove && (rowEnd-rowStart) == 1, hasTrunkBot,
+					innerWidth, trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot,
 					isExpanded, cardExp, wt)
 			}
 
-			rowLines := composeOffshootRow(cardSlices, cardWidth, m.width, m.theme, hasTrunkAbove)
+			rowLines := composeOffshootRow(cardSlices, colIndices, cardWidth, cols, m.width, m.theme, hasTrunkAbove, mergeTarget)
 			lines = append(lines, rowLines...)
 		} else {
 			// Primary row — build card via cache, compose into row.
@@ -1087,12 +1149,18 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 			leftPad := max((m.width-primaryCW)/2, 0)
 			trunkInner := trunkPos - leftPad - 1
 
+			hasTrunkTop := oc > 0
+			trunkInnerTop := trunkInner
+			if hasChildAbove[primary.Name] {
+				trunkInnerTop = innerWidth / 2
+			}
+
 			var cardExp *branchExpansion
 			if isExpanded {
 				cardExp = exp
 			}
 			cardLines := m.getCachedCard(flatIdx, primary, selected,
-				innerWidth, trunkInner, oc > 0, false,
+				innerWidth, trunkInnerTop, trunkInner, hasTrunkTop, false,
 				isExpanded, cardExp, wt)
 
 			rowLines := composePrimaryRow(cardLines, m.width)
@@ -1866,61 +1934,64 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 
 // moveBranchDown moves to the same column in the next row.
 func (m *Model) moveBranchDown() {
-	cols := m.effectiveCols()
 	oc := m.offshootCount()
-
 	if m.branchIdx >= oc {
 		return // already on primary
 	}
-	next := m.branchIdx + cols
-	if next >= oc {
+	row := m.offRowOf[m.branchIdx]
+	col := m.offColOf[m.branchIdx]
+	if row+1 >= len(m.offRows) {
 		m.branchIdx = oc // move to primary
-	} else {
-		m.branchIdx = next
+		return
 	}
+	nextRow := m.offRows[row+1]
+	m.branchIdx = nextRow[min(col, len(nextRow)-1)]
 }
 
 // moveBranchUp moves to the same column in the previous row.
 func (m *Model) moveBranchUp() {
-	cols := m.effectiveCols()
 	oc := m.offshootCount()
-
-	if m.branchIdx == oc && oc > 0 {
+	if m.branchIdx == oc && len(m.offRows) > 0 {
 		// On primary, move to first item of last offshoot row.
-		lastRowStart := ((oc - 1) / cols) * cols
-		m.branchIdx = lastRowStart
+		lastRow := m.offRows[len(m.offRows)-1]
+		m.branchIdx = lastRow[0]
 		return
 	}
-	if m.branchIdx < cols {
+	if m.branchIdx >= len(m.offRowOf) {
+		return
+	}
+	row := m.offRowOf[m.branchIdx]
+	if row == 0 {
 		return // already on first row
 	}
-	m.branchIdx -= cols
+	col := m.offColOf[m.branchIdx]
+	prevRow := m.offRows[row-1]
+	m.branchIdx = prevRow[min(col, len(prevRow)-1)]
 }
 
 // moveBranchRight moves to the next card in the same row.
 func (m *Model) moveBranchRight() {
-	cols := m.effectiveCols()
 	oc := m.offshootCount()
-	if m.branchIdx >= oc {
+	if m.branchIdx >= oc || m.branchIdx >= len(m.offColOf) {
 		return // primary is a single card
 	}
-	rowStart := (m.branchIdx / cols) * cols
-	rowEnd := min(rowStart+cols, oc)
-	if m.branchIdx+1 < rowEnd {
-		m.branchIdx++
+	row := m.offRows[m.offRowOf[m.branchIdx]]
+	col := m.offColOf[m.branchIdx]
+	if col+1 < len(row) {
+		m.branchIdx = row[col+1]
 	}
 }
 
 // moveBranchLeft moves to the previous card in the same row.
 func (m *Model) moveBranchLeft() {
-	cols := m.effectiveCols()
 	oc := m.offshootCount()
-	if m.branchIdx >= oc {
+	if m.branchIdx >= oc || m.branchIdx >= len(m.offColOf) {
 		return // primary is a single card
 	}
-	rowStart := (m.branchIdx / cols) * cols
-	if m.branchIdx > rowStart {
-		m.branchIdx--
+	col := m.offColOf[m.branchIdx]
+	if col > 0 {
+		row := m.offRows[m.offRowOf[m.branchIdx]]
+		m.branchIdx = row[col-1]
 	}
 }
 
@@ -2176,33 +2247,163 @@ func (m *Model) selectionCmd() tea.Cmd {
 	}
 }
 
-// groupChildrenAfterParent reorders branches so that children appear
-// immediately before their parent. In the visual layout offshoots are
-// displayed top-to-bottom, so "before" means "above" on screen.
+// groupChildrenAfterParent ensures each child branch appears above (lower
+// index than) its parent. Only moves children that are currently below their
+// parent; children already above are left in their time-sorted position.
+// This avoids displacing children of the default branch (always last) from
+// their natural sort order.
 func groupChildrenAfterParent(branches []BranchNode) []BranchNode {
-	// Build parent → children index.
-	children := make(map[string][]BranchNode)
-	hasParent := make(map[string]bool, len(branches))
+	parentOf := make(map[string]string, len(branches))
 	for _, b := range branches {
 		if b.Parent != "" {
-			children[b.Parent] = append(children[b.Parent], b)
-			hasParent[b.Name] = true
+			parentOf[b.Name] = b.Parent
 		}
 	}
-	if len(children) == 0 {
+	if len(parentOf) == 0 {
 		return branches
 	}
 
-	// Emit children before their parent so they appear above.
-	out := make([]BranchNode, 0, len(branches))
-	for _, b := range branches {
-		if hasParent[b.Name] {
-			continue // emitted before its parent
+	out := slices.Clone(branches)
+	// Bound iterations to len(out)² to guard against circular parents.
+	limit := len(out) * len(out)
+	for range limit {
+		idx := make(map[string]int, len(out))
+		for i, b := range out {
+			idx[b.Name] = i
 		}
-		out = append(out, children[b.Name]...)
-		out = append(out, b)
+		moved := false
+		for ci, b := range out {
+			pi, ok := idx[parentOf[b.Name]]
+			if !ok || ci <= pi {
+				continue
+			}
+			// Child is below parent — move child to parent's position.
+			child := out[ci]
+			out = slices.Delete(out, ci, ci+1)
+			out = slices.Insert(out, pi, child)
+			moved = true
+			break
+		}
+		if !moved {
+			break
+		}
 	}
 	return out
+}
+
+// recomputeOffshootLayout builds a depth-aware row assignment for offshoots.
+// Children (higher depth) occupy rows above their parents. Within each depth
+// tier branches fill rows up to branchCols columns. O(n) compute, O(1)
+// row/column lookup via offRowOf/offColOf.
+func (m *Model) recomputeOffshootLayout() {
+	oc := m.offshootCount()
+	if oc == 0 {
+		m.offRows = m.offRows[:0]
+		m.offRowOf = m.offRowOf[:0]
+		m.offColOf = m.offColOf[:0]
+		m.offGridCol = m.offGridCol[:0]
+		m.offDepth = m.offDepth[:0]
+		return
+	}
+	cols := branchCols(m.width)
+
+	// 1. Compute child depth for each offshoot.
+	//    depth 0 = parent is default/external/missing
+	//    depth N+1 = parent is an offshoot with depth N
+	offNames := make(map[string]int, oc)
+	for i := range oc {
+		offNames[m.branches[i].Name] = i
+	}
+	depths := make([]int, oc)
+	memo := make(map[int]int, oc)
+	var depthOf func(int) int
+	depthOf = func(i int) int {
+		if d, ok := memo[i]; ok {
+			return d
+		}
+		memo[i] = 0 // cycle guard
+		parent := m.branches[i].Parent
+		if pi, ok := offNames[parent]; ok {
+			d := depthOf(pi) + 1
+			memo[i] = d
+			depths[i] = d
+			return d
+		}
+		return 0
+	}
+	maxDepth := 0
+	for i := range oc {
+		d := depthOf(i)
+		depths[i] = d
+		maxDepth = max(maxDepth, d)
+	}
+
+	// 2. Group by depth, sorted oldest-first within each tier so
+	//    the leftmost card in a row is the oldest branch.
+	groups := make([][]int, maxDepth+1)
+	for i := range oc {
+		groups[depths[i]] = append(groups[depths[i]], i)
+	}
+	for _, group := range groups {
+		slices.SortStableFunc(group, func(a, b int) int {
+			ta := m.branches[a].CreatedTime
+			tb := m.branches[b].CreatedTime
+			if ta.IsZero() {
+				ta = m.branches[a].AuthorTime
+			}
+			if tb.IsZero() {
+				tb = m.branches[b].AuthorTime
+			}
+			return ta.Compare(tb)
+		})
+	}
+
+	// 3. Build rows: highest depth (children) first → topmost rows.
+	//    Grid columns are sequential within each row, matching the
+	//    sorted order (oldest left, newest right).
+	gridCol := make([]int, oc)
+	m.offRows = m.offRows[:0]
+	for d := maxDepth; d >= 0; d-- {
+		group := groups[d]
+		for start := 0; start < len(group); start += cols {
+			end := min(start+cols, len(group))
+			rowGroup := group[start:end]
+			m.offRows = append(m.offRows, rowGroup)
+			for i, fi := range rowGroup {
+				gridCol[fi] = i
+			}
+		}
+	}
+
+	// 5. Build reverse maps.
+	if cap(m.offRowOf) >= oc {
+		m.offRowOf = m.offRowOf[:oc]
+	} else {
+		m.offRowOf = make([]int, oc)
+	}
+	if cap(m.offColOf) >= oc {
+		m.offColOf = m.offColOf[:oc]
+	} else {
+		m.offColOf = make([]int, oc)
+	}
+	if cap(m.offGridCol) >= oc {
+		m.offGridCol = m.offGridCol[:oc]
+	} else {
+		m.offGridCol = make([]int, oc)
+	}
+	if cap(m.offDepth) >= oc {
+		m.offDepth = m.offDepth[:oc]
+	} else {
+		m.offDepth = make([]int, oc)
+	}
+	for ri, row := range m.offRows {
+		for ci, flatIdx := range row {
+			m.offRowOf[flatIdx] = ri
+			m.offColOf[flatIdx] = ci
+			m.offGridCol[flatIdx] = gridCol[flatIdx]
+			m.offDepth[flatIdx] = depths[flatIdx]
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2210,20 +2411,24 @@ func groupChildrenAfterParent(branches []BranchNode) []BranchNode {
 // ---------------------------------------------------------------------------
 
 // branchRow returns the visual row index for a flat branch index.
-// Offshoot branches (indices 0..offshootCount-1) are arranged in rows of
-// effectiveCols; the primary branch occupies the final row.
+// Offshoot rows are looked up from the precomputed layout; the primary
+// branch occupies the final row after all offshoots.
 func (m *Model) branchRow(idx int) int {
-	oc := m.offshootCount()
-	if idx >= oc {
-		return m.offshootRowCount() // primary is always the last row
+	if idx >= len(m.offRowOf) {
+		return len(m.offRows) // primary is always the last row
 	}
-	return idx / m.effectiveCols()
+	return m.offRowOf[idx]
 }
 
-// effectiveCols returns the number of offshoot columns for the current width
-// and branch count.
+// effectiveCols returns the widest offshoot row size, used for card width
+// and grid positioning. Cards expand to fill the space based on the actual
+// maximum branches in any single row, not the total offshoot count.
 func (m *Model) effectiveCols() int {
-	return min(branchCols(m.width), max(m.offshootCount(), 1))
+	maxInRow := 0
+	for _, row := range m.offRows {
+		maxInRow = max(maxInRow, len(row))
+	}
+	return max(maxInRow, 1)
 }
 
 // offshootCount returns the number of non-primary branches.
@@ -2233,9 +2438,7 @@ func (m *Model) offshootCount() int {
 
 // offshootRowCount returns how many visual rows the offshoots occupy.
 func (m *Model) offshootRowCount() int {
-	oc := m.offshootCount()
-	cols := m.effectiveCols()
-	return (oc + cols - 1) / cols
+	return len(m.offRows)
 }
 
 // totalBranchRows returns the total visual row count (offshoots + primary).

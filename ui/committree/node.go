@@ -23,6 +23,7 @@ type BranchNode struct {
 	ShortHash         string    // Tip commit abbreviated hash.
 	Subject           string    // Tip commit message first line.
 	AuthorTime        time.Time // Tip commit author time.
+	CreatedTime       time.Time // Branch ref creation time (from reflog).
 	IsHead            bool      // True if this is the current branch (HEAD).
 	CommitCount       int       // Number of commits reachable from tip.
 	CommitCountCapped bool      // True if CommitCount hit the counting limit.

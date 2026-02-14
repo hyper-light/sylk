@@ -3308,16 +3308,19 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 			branchNames[i] = b.Name
 		}
 		commitCounts := gc.CountBranchOnlyCommitsBatch(branchNames, defaultBranch, commitLimit)
+		inferredParents := gc.InferBranchParents(branches, defaultBranch)
 
 		nodes := make([]committree.BranchNode, len(branches))
 		for i, b := range branches {
 			nodes[i] = committree.BranchNode{
-				Name:       b.Name,
-				Hash:       b.Hash,
-				ShortHash:  b.ShortHash,
-				Subject:    b.Subject,
-				AuthorTime: b.AuthorTime,
-				IsHead:     b.IsHead,
+				Name:        b.Name,
+				Hash:        b.Hash,
+				ShortHash:   b.ShortHash,
+				Subject:     b.Subject,
+				AuthorTime:  b.AuthorTime,
+				CreatedTime: b.CreatedTime,
+				IsHead:      b.IsHead,
+				Parent:      inferredParents[b.Name],
 			}
 			if bc, ok := commitCounts[b.Name]; ok {
 				nodes[i].CommitCount = bc.Count

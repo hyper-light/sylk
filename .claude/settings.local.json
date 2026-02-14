@@ -75,7 +75,8 @@
       "Bash(comm:*)",
       "Bash(/tmp/analyze_view_calls.sh:*)",
       "Bash(bash:*)",
-      "Bash(git log:*)"
+      "Bash(git log:*)",
+      "Bash(git -C /home/ada/Projects/sylk diff --stat HEAD)"
     ]
   }
 }
