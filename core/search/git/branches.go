@@ -2,6 +2,7 @@ package git
 
 import (
 	"container/heap"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -852,6 +853,25 @@ func (c *GitClient) writeInitialReflog(name string, hash plumbing.Hash) error {
 // =============================================================================
 // Delete
 // =============================================================================
+
+// MergeBranch merges sourceBranch into targetBranch.
+// The target branch is checked out first, then the source is merged in.
+// Uses the git CLI for full merge support (fast-forward and 3-way).
+func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+
+	if _, err := c.runGitCommand("checkout", targetBranch); err != nil {
+		return fmt.Errorf("checkout %s: %w", targetBranch, err)
+	}
+
+	_, err := c.runGitCommand("merge", sourceBranch, "--no-edit")
+	return err
+}
 
 // DeleteBranch removes a local branch reference.
 // Returns ErrDeleteCheckedOut if the branch is currently checked out.

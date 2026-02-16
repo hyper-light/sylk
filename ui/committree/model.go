@@ -127,6 +127,8 @@ const (
 	toolbarDiff              // Commit view: show diff for selected commit.
 	toolbarDiffOk            // Diff mode: confirm diff.
 	toolbarDiffCancel        // Diff mode: cancel diff.
+	toolbarMergeOk           // Merge mode: confirm merge.
+	toolbarMergeAbort        // Merge mode: abort merge.
 )
 
 // CreateBranchRequestMsg is emitted when the user confirms a branch name
@@ -156,6 +158,14 @@ type DiffCompareMsg struct {
 // via Ok. Hashes are the tip commit hashes; Names are the branch names used
 // as pane title labels instead of short hashes.
 type BranchDiffCompareMsg struct {
+	Hashes []string // Tip commit hashes (for diff computation).
+	Names  []string // Branch names (for pane titles).
+}
+
+// MergeDiffCompareMsg is emitted when the user confirms a merge selection via
+// Ok. Hashes are the tip commit hashes; Names are the branch names used as
+// pane title labels.
+type MergeDiffCompareMsg struct {
 	Hashes []string // Tip commit hashes (for diff computation).
 	Names  []string // Branch names (for pane titles).
 }
@@ -247,6 +257,10 @@ type Model struct {
 	// Diff selection mode state.
 	diffMode       bool
 	diffSelections []diffSelection
+
+	// Merge selection mode state.
+	mergeMode       bool
+	mergeSelections []diffSelection
 
 	// Toolbar state.
 	toolbarFocused bool // True when tab-focus is on the toolbar, not card actions.
@@ -1248,12 +1262,14 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 	if m.createInputActive {
 		return renderCreateInputToolbar(m.toolbarButtons(), m.createBranchName, m.createCursor, cursorVisible, m.width, m.theme.Palette)
 	}
-	if m.diffMode {
+	if m.diffMode || m.mergeMode {
 		left := m.diffToolbarLeftButtons()
 		right := m.toolbarButtons()
 		hint := ""
 		if len(left) == 0 {
-			if m.mode == viewBranches {
+			if m.mergeMode {
+				hint = "Select 2 branches to merge"
+			} else if m.mode == viewBranches {
 				hint = "Select 2+ branches to diff"
 			} else {
 				hint = "Select 2+ commits to diff"
@@ -1270,15 +1286,19 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 }
 
 // toolbarActiveIdx returns the index of the currently toggled-on toolbar
-// button, or -1 if none. Only the Diff button supports toggle state.
-// In diff mode the index is offset by the left button count.
+// button, or -1 if none. Diff and Merge buttons support toggle state.
+// The index is offset by the left button count.
 func (m *Model) toolbarActiveIdx() int {
-	if !m.diffMode {
+	if !m.diffMode && !m.mergeMode {
 		return -1
 	}
 	leftCount := len(m.diffToolbarLeftButtons())
+	target := toolbarDiff
+	if m.mergeMode {
+		target = toolbarMerge
+	}
 	for i, id := range m.toolbarButtons() {
-		if id == toolbarDiff {
+		if id == target {
 			return leftCount + i
 		}
 	}
@@ -1412,7 +1432,7 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 				}
 				cardSlices[i] = m.getCachedCard(flatIdx, b, selected,
 					innerWidth, trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot,
-					isExpanded, cardExp, wt, m.diffOverlayForBranch(flatIdx))
+					isExpanded, cardExp, wt, m.branchOverlay(flatIdx))
 			}
 
 			rowLines := composeOffshootRow(cardSlices, colIndices, cardWidth, cols, m.width, m.theme, hasTrunkAbove, mergeTarget, mergeAboveCols)
@@ -1444,7 +1464,7 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 			}
 			cardLines := m.getCachedCard(flatIdx, primary, selected,
 				innerWidth, trunkInnerTop, trunkInner, hasTrunkTop, false,
-				isExpanded, cardExp, wt, m.diffOverlayForBranch(flatIdx))
+				isExpanded, cardExp, wt, m.branchOverlay(flatIdx))
 
 			rowLines := composePrimaryRow(cardLines, m.width)
 			lines = append(lines, rowLines...)
@@ -1734,13 +1754,21 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
-	// Diff mode (not toolbar-focused): Enter/Space toggle selection, Esc exits.
-	if m.diffMode && !m.toolbarFocused && m.expandedIdx < 0 {
+	// Diff/merge mode (not toolbar-focused): Enter/Space toggle selection, Esc exits.
+	if (m.diffMode || m.mergeMode) && !m.toolbarFocused && m.expandedIdx < 0 {
 		switch km.String() {
 		case "enter", " ":
-			m.toggleBranchDiffSelection()
+			if m.mergeMode {
+				m.toggleMergeSelection()
+			} else {
+				m.toggleBranchDiffSelection()
+			}
 		case "esc":
-			m.exitBranchDiffMode()
+			if m.mergeMode {
+				m.exitMergeMode()
+			} else {
+				m.exitBranchDiffMode()
+			}
 		case "j", "down", "shift+down":
 			m.moveBranchDown()
 		case "k", "up", "shift+up":
@@ -2361,16 +2389,21 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		if m.diffMode {
 			m.exitBranchDiffMode()
 		}
+		if m.mergeMode {
+			m.exitMergeMode()
+		}
 		m.activateCreateInput()
 		return nil
 	case toolbarMerge:
 		if m.diffMode {
 			m.exitBranchDiffMode()
 		}
-		if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
-			name := m.branches[m.branchIdx].Name
-			return func() tea.Msg { return MergeBranchMsg{Name: name} }
+		if m.mergeMode {
+			m.exitMergeMode()
+		} else {
+			m.enterMergeMode()
 		}
+		return nil
 	case toolbarBack:
 		if m.diffMode {
 			m.exitDiffMode()
@@ -2378,6 +2411,9 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		m.ExitToBranches()
 		return nil
 	case toolbarDiff:
+		if m.mergeMode {
+			m.exitMergeMode()
+		}
 		if m.mode == viewBranches {
 			if m.diffMode {
 				m.exitBranchDiffMode()
@@ -2408,6 +2444,14 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		} else {
 			m.exitDiffMode()
 		}
+		return nil
+	case toolbarMergeOk:
+		hashes := m.MergeHashes()
+		names := m.MergeNames()
+		m.exitMergeMode()
+		return func() tea.Msg { return MergeDiffCompareMsg{Hashes: hashes, Names: names} }
+	case toolbarMergeAbort:
+		m.exitMergeMode()
 		return nil
 	}
 	return nil
@@ -2872,6 +2916,124 @@ func (m *Model) BranchDiffHashes() []string {
 	return hashes
 }
 
+// MergeHashes returns the merge selection tip commit hashes in order.
+func (m *Model) MergeHashes() []string {
+	hashes := make([]string, len(m.mergeSelections))
+	for i, ds := range m.mergeSelections {
+		hashes[i] = ds.hash
+	}
+	return hashes
+}
+
+// MergeNames returns the merge selection branch names in order.
+func (m *Model) MergeNames() []string {
+	names := make([]string, len(m.mergeSelections))
+	for i, ds := range m.mergeSelections {
+		if ds.nodeIdx >= 0 && ds.nodeIdx < len(m.branches) {
+			names[i] = m.branches[ds.nodeIdx].Name
+		}
+	}
+	return names
+}
+
+// ---------------------------------------------------------------------------
+// Merge selection mode
+// ---------------------------------------------------------------------------
+
+// maxMergeSelections is the maximum number of branches that can be selected
+// in merge mode. Derived from: a merge operation always involves exactly 2
+// branches (source and target).
+const maxMergeSelections = 2
+
+// InMergeMode reports whether the model is in merge selection mode.
+func (m *Model) InMergeMode() bool {
+	return m.mergeMode
+}
+
+// enterMergeMode activates merge selection mode, adding the currently selected
+// branch as selection #1. Unfocuses the toolbar so navigation keys work.
+func (m *Model) enterMergeMode() {
+	m.mergeMode = true
+	m.mergeSelections = m.mergeSelections[:0]
+	if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
+		m.mergeSelections = append(m.mergeSelections, diffSelection{
+			hash:    m.branches[m.branchIdx].Hash,
+			nodeIdx: m.branchIdx,
+		})
+	}
+	m.toolbarFocused = false
+	m.invalidateCardCache()
+	m.viewDirty = true
+}
+
+// exitMergeMode deactivates merge selection mode and restores the cursor to
+// the first selected branch.
+func (m *Model) exitMergeMode() {
+	if len(m.mergeSelections) > 0 {
+		m.branchIdx = m.mergeSelections[0].nodeIdx
+	}
+	m.mergeMode = false
+	m.mergeSelections = m.mergeSelections[:0]
+	m.toolbarFocused = false
+	m.invalidateCardCache()
+	m.ensureBranchVisible()
+	m.viewDirty = true
+}
+
+// toggleMergeSelection adds or removes the currently selected branch from
+// the merge selection list. Capped at maxMergeSelections.
+func (m *Model) toggleMergeSelection() {
+	if m.branchIdx < 0 || m.branchIdx >= len(m.branches) {
+		return
+	}
+	for i, ds := range m.mergeSelections {
+		if ds.nodeIdx == m.branchIdx {
+			m.mergeSelections = append(m.mergeSelections[:i], m.mergeSelections[i+1:]...)
+			if len(m.mergeSelections) == 0 {
+				m.exitMergeMode()
+				return
+			}
+			m.invalidateCardCache()
+			m.viewDirty = true
+			return
+		}
+	}
+	if len(m.mergeSelections) >= maxMergeSelections {
+		return
+	}
+	m.mergeSelections = append(m.mergeSelections, diffSelection{
+		hash:    m.branches[m.branchIdx].Hash,
+		nodeIdx: m.branchIdx,
+	})
+	m.invalidateCardCache()
+	m.viewDirty = true
+}
+
+// mergeOverlayForBranch returns the overlay state for a branch in merge mode.
+func (m *Model) mergeOverlayForBranch(branchIdx int) diffOverlay {
+	if !m.mergeMode {
+		return diffOverlay{}
+	}
+	for i, ds := range m.mergeSelections {
+		if ds.nodeIdx == branchIdx {
+			return diffOverlay{active: true, idx: i}
+		}
+	}
+	return diffOverlay{}
+}
+
+// branchOverlay returns the active overlay for a branch card, dispatching to
+// diff or merge mode as appropriate.
+func (m *Model) branchOverlay(branchIdx int) diffOverlay {
+	if m.diffMode {
+		return m.diffOverlayForBranch(branchIdx)
+	}
+	if m.mergeMode {
+		return m.mergeOverlayForBranch(branchIdx)
+	}
+	return diffOverlay{}
+}
+
 // ---------------------------------------------------------------------------
 // Selection restoration
 // ---------------------------------------------------------------------------
@@ -3030,6 +3192,12 @@ func (m *Model) toolbarButtons() []int {
 // diffToolbarLeftButtons returns the left-side diff toolbar buttons.
 // Returns nil when not in diff mode or fewer than 2 commits are selected.
 func (m *Model) diffToolbarLeftButtons() []int {
+	if m.mergeMode {
+		if len(m.mergeSelections) >= maxMergeSelections {
+			return []int{toolbarMergeOk, toolbarMergeAbort}
+		}
+		return nil
+	}
 	if !m.diffMode || len(m.diffSelections) < 2 {
 		return nil
 	}

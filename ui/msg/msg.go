@@ -479,6 +479,11 @@ type DiffViewDataMsg struct {
 	Mode  int // CompareMode (int to avoid import cycle)
 }
 
+// MergeDiffViewDataMsg carries computed diff pairs for a merge diff view.
+type MergeDiffViewDataMsg struct {
+	Pairs []DiffViewPair
+}
+
 // DiffViewPair is a wire-format diff pair for the message layer.
 type DiffViewPair struct {
 	FromHash  string

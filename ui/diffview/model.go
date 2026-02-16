@@ -536,7 +536,7 @@ func (m *Model) composeDiffPanes(area pane.Rect) string {
 // buildPairData computes PairData for a single pair.
 func (m *Model) buildPairData(pair DiffPair) PairData {
 	blocks := BuildFileBlocks(pair.Files)
-	highlights := buildFileHighlights(blocks, m.highlighter)
+	highlights := BuildFileHighlights(blocks, m.highlighter)
 	pathIndex := make(map[string]int, len(blocks))
 	for j, fb := range blocks {
 		pathIndex[fb.Path] = j
@@ -566,7 +566,7 @@ func (m *Model) loadAllPairs() {
 	for i, pair := range m.pairs {
 		m.pairData[i] = m.buildPairData(pair)
 	}
-	m.unionFiles = buildUnionFileList(m.pairData)
+	m.unionFiles = BuildUnionFileList(m.pairData)
 	m.selectFirstFile()
 	m.buildPaneTree()
 	m.sizePanes()
@@ -588,7 +588,7 @@ func (m *Model) ReloadPairs(pairs []DiffPair, mode CompareMode) {
 	for i, pair := range m.pairs {
 		m.pairData[i] = m.buildPairData(pair)
 	}
-	m.unionFiles = buildUnionFileList(m.pairData)
+	m.unionFiles = BuildUnionFileList(m.pairData)
 
 	m.restoreTabs(savedTabs, savedPath, savedActiveIdx)
 	m.buildPaneTree()
@@ -695,9 +695,9 @@ func collectUnionEntries(pairData []PairData) (map[string]*UnionFileEntry, []str
 	return entries, order
 }
 
-// buildUnionFileList deduplicates file paths across all pairs and aggregates
+// BuildUnionFileList deduplicates file paths across all pairs and aggregates
 // stats. Preserves first-seen order.
-func buildUnionFileList(pairData []PairData) []UnionFileEntry {
+func BuildUnionFileList(pairData []PairData) []UnionFileEntry {
 	entries, order := collectUnionEntries(pairData)
 	result := make([]UnionFileEntry, len(order))
 	for i, path := range order {
@@ -816,7 +816,7 @@ func (m *Model) rebuildAllPanes() {
 func (m *Model) maxLineNoForSelectedFile() (maxOld, maxNew int) {
 	for _, pd := range m.pairData {
 		if idx, ok := pd.PathIndex[m.selectedPath]; ok {
-			o, n := maxLineNoForFile(pd.Blocks[idx])
+			o, n := MaxLineNoForFile(pd.Blocks[idx])
 			maxOld = max(maxOld, o)
 			maxNew = max(maxNew, n)
 		}

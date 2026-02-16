@@ -51,7 +51,7 @@ func (fp *FileDiffPane) View(
 	if fp.width <= 0 || fp.height <= 0 {
 		return ""
 	}
-	header := renderPairPaneHeader(pair, pd, selectedPath, fp.width, p, focused)
+	header := RenderPairPaneHeader(pair, pd, selectedPath, fp.width, p, focused)
 	body := fp.renderContentBody(p)
 	return header + "\n" + body
 }
@@ -93,7 +93,7 @@ func (fp *FileDiffPane) RebuildForPath(
 	defaultSt lipgloss.Style,
 	p theme.Palette,
 ) {
-	fb, fh, ok := lookupPathInPair(selectedPath, pd)
+	fb, fh, ok := LookupPathInPair(selectedPath, pd)
 	if !ok {
 		fp.setNoChanges()
 		return
@@ -103,16 +103,16 @@ func (fp *FileDiffPane) RebuildForPath(
 }
 
 // lookupPathInPair finds the file block and highlight for a path in a pair.
-func lookupPathInPair(path string, pd PairData) (FileBlock, FileHighlight, bool) {
+func LookupPathInPair(path string, pd PairData) (FileBlock, FileHighlight, bool) {
 	idx, ok := pd.PathIndex[path]
 	if !ok || path == "" {
 		return FileBlock{}, FileHighlight{}, false
 	}
-	return pd.Blocks[idx], safeHighlight(pd.Highlights, idx), true
+	return pd.Blocks[idx], SafeHighlight(pd.Highlights, idx), true
 }
 
 // safeHighlight returns the highlight at idx, or an empty one if out of bounds.
-func safeHighlight(highlights []FileHighlight, idx int) FileHighlight {
+func SafeHighlight(highlights []FileHighlight, idx int) FileHighlight {
 	if idx < len(highlights) {
 		return highlights[idx]
 	}
@@ -171,9 +171,9 @@ func (fp *FileDiffPane) renderDiff(
 	defaultSt lipgloss.Style, p theme.Palette,
 ) {
 	if sideBySide {
-		fp.renderedLines, fp.hunkStarts = renderSideBySide(fb.Lines, fh, fp.width, maxOld, maxNew, syntaxStyles, defaultSt, p)
+		fp.renderedLines, fp.hunkStarts = RenderSideBySide(fb.Lines, fh, fp.width, maxOld, maxNew, syntaxStyles, defaultSt, p)
 	} else {
-		fp.renderedLines, fp.hunkStarts = renderUnified(fb.Lines, fh, fp.width, maxOld, maxNew, syntaxStyles, defaultSt, p)
+		fp.renderedLines, fp.hunkStarts = RenderUnified(fb.Lines, fh, fp.width, maxOld, maxNew, syntaxStyles, defaultSt, p)
 	}
 	fp.totalLines = len(fp.renderedLines)
 	fp.clampScroll()
@@ -243,7 +243,7 @@ func (fp *FileDiffPane) jumpPrevHunk() {
 }
 
 // maxLineNoForFile returns the highest line numbers in a single file block.
-func maxLineNoForFile(fb FileBlock) (maxOld, maxNew int) {
+func MaxLineNoForFile(fb FileBlock) (maxOld, maxNew int) {
 	for _, al := range fb.Lines {
 		maxOld = max(maxOld, al.OldLineNo)
 		maxNew = max(maxNew, al.NewLineNo)

@@ -29,7 +29,7 @@ type FileHighlight struct {
 
 // buildFileHighlights runs syntax highlighting on each file block's old and
 // new side content. Returns one FileHighlight per block.
-func buildFileHighlights(blocks []FileBlock, hl *codepkg.Highlighter) []FileHighlight {
+func BuildFileHighlights(blocks []FileBlock, hl *codepkg.Highlighter) []FileHighlight {
 	highlights := make([]FileHighlight, len(blocks))
 	for i, fb := range blocks {
 		if fb.Binary {

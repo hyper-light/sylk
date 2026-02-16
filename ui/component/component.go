@@ -23,6 +23,8 @@ const (
 	FocusCommitTree
 	FocusDiffView
 	FocusDiffFileList
+	FocusMergeDiffView
+	FocusMergeDiffFileList
 
 	// FocusPaneBase is the starting FocusID for dynamically allocated
 	// editor panes. Each pane gets FocusPaneBase + FocusID(paneID).

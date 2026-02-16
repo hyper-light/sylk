@@ -1533,6 +1533,8 @@ var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarDiff:       {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.HoverAccent }},
 	toolbarDiffOk:     {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	toolbarDiffCancel: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	toolbarMergeOk:    {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarMergeAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 }
 
 // toolbarCellWidths returns the visual width of each button cell.

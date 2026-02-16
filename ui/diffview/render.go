@@ -16,7 +16,7 @@ import (
 // renderPairPaneHeader renders a pane header showing the pair's hash range
 // and per-file stats for the selected file within this pair. When focused,
 // the hash text uses Primary+bold and the rule uses BorderActive.
-func renderPairPaneHeader(pair DiffPair, pd PairData, selectedPath string, width int, p theme.Palette, focused bool) string {
+func RenderPairPaneHeader(pair DiffPair, pd PairData, selectedPath string, width int, p theme.Palette, focused bool) string {
 	hashSt := lipgloss.NewStyle().Foreground(p.Muted)
 	ruleSt := lipgloss.NewStyle().Foreground(p.Border)
 	if focused {
@@ -33,7 +33,7 @@ func renderPairPaneHeader(pair DiffPair, pd PairData, selectedPath string, width
 	ruleLen := max(width-hashW-statsW, 0)
 	rule := ruleSt.Render(strings.Repeat("\u2500", ruleLen))
 
-	return clampLine(hashText+rule+statsStr, width)
+	return ClampLine(hashText+rule+statsStr, width)
 }
 
 // renderPairStats builds the "+N -M" stats string for the selected file
@@ -44,12 +44,12 @@ func renderPairStats(pd PairData, selectedPath string, p theme.Palette) string {
 		noChangeSt := lipgloss.NewStyle().Foreground(p.Muted).Italic(true)
 		return noChangeSt.Render("no changes")
 	}
-	return formatAddDel(pd.Blocks[idx].Additions, pd.Blocks[idx].Deletions, p)
+	return FormatAddDel(pd.Blocks[idx].Additions, pd.Blocks[idx].Deletions, p)
 }
 
 // formatAddDel formats additions and deletions as styled "+N -M" text.
 // Returns an empty string when both counts are zero.
-func formatAddDel(additions, deletions int, p theme.Palette) string {
+func FormatAddDel(additions, deletions int, p theme.Palette) string {
 	addSt := lipgloss.NewStyle().Foreground(p.Success)
 	delSt := lipgloss.NewStyle().Foreground(p.Error)
 	var parts []string
@@ -110,7 +110,7 @@ func rowOrFill(rows []string, idx int, fill string) string {
 // highlighting foreground, diff background tinting, char-level annotation
 // highlighting, and per-side wrapping. Long lines wrap independently within
 // each half. Returns rendered lines and hunk separator output positions.
-func renderSideBySide(
+func RenderSideBySide(
 	lines []AlignedLine,
 	fh FileHighlight,
 	width int,
@@ -138,7 +138,7 @@ func renderSideBySide(
 		if al.Kind == DiffLineHunkSep {
 			hunkStarts = append(hunkStarts, len(result))
 			line := strings.Repeat(" ", sideWidth) + divider + strings.Repeat(" ", sideWidth)
-			result = append(result, clampLine(line, width))
+			result = append(result, ClampLine(line, width))
 			continue
 		}
 		oldGutter := renderGutter(al.OldLineNo, gw, gutterSt)
@@ -217,9 +217,9 @@ func assembleSBSRows(
 		og, ng := gutterForRow(r, oldGutter, newGutter, emptyGutter)
 		oldContent := rowOrFill(oldRows, r, emptyFill)
 		newContent := rowOrFill(newRows, r, emptyFill)
-		oldSide := clampLine(og+" "+oldContent, sideWidth)
-		newSide := clampLine(ng+" "+newContent, sideWidth)
-		result[r] = clampLine(oldSide+divider+newSide, width)
+		oldSide := ClampLine(og+" "+oldContent, sideWidth)
+		newSide := ClampLine(ng+" "+newContent, sideWidth)
+		result[r] = ClampLine(oldSide+divider+newSide, width)
 	}
 	return result
 }
@@ -232,7 +232,7 @@ func assembleSBSRows(
 // highlighting foreground, diff background tinting, char-level annotation
 // highlighting, and line wrapping. Returns rendered lines and hunk separator
 // output positions.
-func renderUnified(
+func RenderUnified(
 	lines []AlignedLine,
 	fh FileHighlight,
 	width int,
@@ -348,7 +348,7 @@ func formatUnifiedRows(rows []string, g1, g2, contGutter string, width int) []st
 		if i > 0 {
 			left, right = contGutter, contGutter
 		}
-		out[i] = clampLine(left+" "+right+" "+content, width)
+		out[i] = ClampLine(left+" "+right+" "+content, width)
 	}
 	return out
 }
@@ -357,8 +357,8 @@ func formatUnifiedRows(rows []string, g1, g2, contGutter string, width int) []st
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// clampLine truncates a styled line to width and pads with spaces if short.
-func clampLine(s string, width int) string {
+// ClampLine truncates a styled line to width and pads with spaces if short.
+func ClampLine(s string, width int) string {
 	s = truncateStyledLine(s, width)
 	if vis := lipgloss.Width(s); vis < width {
 		s += strings.Repeat(" ", width-vis)

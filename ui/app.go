@@ -35,6 +35,7 @@ import (
 	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/editor"
 	"github.com/adalundhe/sylk/ui/editor/mode"
+	"github.com/adalundhe/sylk/ui/mergediff"
 	"github.com/adalundhe/sylk/ui/editor/preview"
 	"github.com/adalundhe/sylk/ui/editor/register"
 	"github.com/adalundhe/sylk/ui/fieldmanual"
@@ -330,6 +331,12 @@ type AppModel struct {
 	diffViewActive bool            // True while diff view is displayed.
 	diffHashes     []string        // Saved commit hashes for mode switching.
 	diffLabels     []string        // Branch names for pane titles (nil for commit diffs).
+
+	// Merge diff view overlay (replaces commit tree when active).
+	mergeDiffView       *mergediff.Model // Merge diff view (nil when inactive).
+	mergeDiffViewActive bool             // True while merge diff view is displayed.
+	mergeHashes         []string         // Saved merge commit hashes.
+	mergeLabels         []string         // Branch names for merge pane titles.
 
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
@@ -967,6 +974,32 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
+	case mergeBranchDoneMsg:
+		m.exitMergeDiffView()
+		flash := "Merged " + typed.source + " → " + typed.target
+		if typed.deleted {
+			flash += " (deleted " + typed.source + ")"
+		}
+		if typed.deleteErr != "" {
+			flash += " (delete failed: " + typed.deleteErr + ")"
+		}
+		m.statusBar.SetFlash(flash)
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case mergeBranchFailedMsg:
+		if m.mergeDiffView != nil {
+			m.mergeDiffView.SetMergeError("Merge failed: " + typed.reason)
+		} else {
+			m.statusBar.SetFlash("Merge failed: " + typed.reason)
+		}
+		return m, nil
+
 	case committree.CreateBranchRequestMsg:
 		if m.gitClient != nil {
 			m.commitTree.RecordBranchParent(typed.Name, typed.ParentBranch)
@@ -1101,6 +1134,36 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.fetchDiffDataCmd(m.diffHashes, typed.Mode)
 		}
 		return m, nil
+
+	case committree.MergeDiffCompareMsg:
+		m.mergeHashes = typed.Hashes
+		m.mergeLabels = typed.Names
+		m.setMergeDiffLoading(true)
+		return m, m.fetchMergeDiffDataCmd(typed.Hashes, typed.Names)
+
+	case msg.MergeDiffViewDataMsg:
+		pairs := make([]diffview.DiffPair, len(typed.Pairs))
+		for i, p := range typed.Pairs {
+			pairs[i] = diffview.DiffPair{
+				FromHash:  p.FromHash,
+				ToHash:    p.ToHash,
+				FromShort: p.FromShort,
+				ToShort:   p.ToShort,
+				Files:     p.Files,
+				TotalAdd:  p.TotalAdd,
+				TotalDel:  p.TotalDel,
+			}
+		}
+		m.setMergeDiffLoading(false)
+		m.enterMergeDiffView(pairs)
+		return m, nil
+
+	case mergediff.ExitMergeDiffViewMsg:
+		m.exitMergeDiffView()
+		return m, nil
+
+	case mergediff.MergeBranchMsg:
+		return m, m.executeMergeBranch(typed.DeleteSource)
 
 	case msg.FileReplacedMsg:
 		return m, m.handleFileReplaced(typed)
@@ -1575,6 +1638,18 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
 		}
+		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList && m.mergeDiffView.FileSearchActive() {
+			m.mergeDiffView.UpdateFileList("esc")
+			return m, nil
+		}
+		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList {
+			m.exitMergeDiffView()
+			return m, nil
+		}
+		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.isMergeDiffPaneFocused() {
+			cmd := m.mergeDiffView.Update(key)
+			return m, cmd
+		}
 		if m.diffViewActive && m.diffView != nil && m.focus.Current() == component.FocusDiffFileList && m.diffView.FileSearchActive() {
 			m.diffView.UpdateFileList("esc")
 			return m, nil
@@ -1699,6 +1774,32 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.lastToggleAt = now
 		m.chord = chordNone
 		m.gitPanel.ToggleSearch()
+		return m, nil
+	}
+
+	// Alt+F toggles file search when the merge diff file list has focus.
+	if ks == "alt+f" && m.mergeDiffViewActive && m.focus.Current() == component.FocusMergeDiffFileList && m.mergeDiffView != nil {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.mergeDiffView.ToggleFileSearch()
+		return m, nil
+	}
+
+	// Alt+F toggles the in-file find bar when a merge diff pane has focus.
+	if ks == "alt+f" && m.mergeDiffViewActive && m.isMergeDiffPaneFocused() && m.mergeDiffView != nil {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.mergeDiffView.ToggleFindBar()
 		return m, nil
 	}
 
@@ -1963,6 +2064,13 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	// Diff view loading spinner (frame-counter, advanced each decor tick).
 	if m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick() {
 		m.diffView.AdvanceSpinner()
+		m.comp.MarkDirty(compositor.SlotRight)
+		changed = true
+	}
+
+	// Merge diff view loading spinner.
+	if m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick() {
+		m.mergeDiffView.AdvanceSpinner()
 		m.comp.MarkDirty(compositor.SlotRight)
 		changed = true
 	}
@@ -3751,6 +3859,10 @@ func shortHash(h string) string {
 // When an established (non-loading) diff view already exists, pairs and
 // mode are reloaded in place to preserve open tabs and the active tab.
 func (m *AppModel) enterDiffView(pairs []diffview.DiffPair, mode diffview.CompareMode) {
+	// Exit any active merge diff view first.
+	if m.mergeDiffViewActive {
+		m.exitMergeDiffView()
+	}
 	if m.diffViewActive && m.diffView != nil && len(m.diffView.OpenTabs()) > 0 {
 		m.diffView.ReloadPairs(pairs, mode)
 		m.syncViewState()
@@ -3805,6 +3917,138 @@ func (m *AppModel) setDiffLoading(loading bool) {
 	}
 	if m.diffView != nil {
 		m.diffView.SetLoading(loading)
+		m.viewDirty = true
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Merge diff view
+// ---------------------------------------------------------------------------
+
+// fetchMergeDiffDataCmd fetches diff data for a merge selection.
+func (m *AppModel) fetchMergeDiffDataCmd(hashes, labels []string) tea.Cmd {
+	gc := m.gitClient
+	if gc == nil || len(hashes) < 2 {
+		return nil
+	}
+	hashToLabel := make(map[string]string, len(hashes))
+	for i, h := range hashes {
+		if i < len(labels) {
+			hashToLabel[h] = labels[i]
+		}
+	}
+	return func() tea.Msg {
+		fromTo := buildDiffPairs(hashes, CompareModeChain)
+		pairs := make([]msg.DiffViewPair, len(fromTo))
+		var wg sync.WaitGroup
+		wg.Add(len(fromTo))
+		for i, ft := range fromTo {
+			go func() {
+				defer wg.Done()
+				pairs[i] = fetchOneDiffPair(gc, ft)
+			}()
+		}
+		wg.Wait()
+		for i := range pairs {
+			if lbl, ok := hashToLabel[pairs[i].FromHash]; ok {
+				pairs[i].FromShort = lbl
+			}
+			if lbl, ok := hashToLabel[pairs[i].ToHash]; ok {
+				pairs[i].ToShort = lbl
+			}
+		}
+		return msg.MergeDiffViewDataMsg{Pairs: pairs}
+	}
+}
+
+// enterMergeDiffView creates the merge diff view model.
+func (m *AppModel) enterMergeDiffView(pairs []diffview.DiffPair) {
+	// Exit any active diff view first.
+	if m.diffViewActive {
+		m.exitDiffView()
+	}
+	if m.mergeDiffView != nil {
+		m.mergeDiffView.Close()
+	}
+	m.mergeDiffView = mergediff.New(pairs, m.config.Theme(), m.nerdFontsDetected)
+	m.mergeDiffViewActive = true
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.mergeDiffView.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
+	lw, lh := m.layout.GetPanelSize(component.FocusFileTree)
+	m.mergeDiffView.SetFileListSize(max(lw-panelBorderSize, 1), max(lh-panelBorderSize, 1))
+	m.mergeDiffView.SetFocused(true)
+	m.syncViewState()
+	m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
+	m.syncFocusState()
+	m.viewDirty = true
+}
+
+// exitMergeDiffView clears the merge diff view and restores commit tree focus.
+func (m *AppModel) exitMergeDiffView() {
+	if m.mergeDiffView != nil {
+		m.mergeDiffView.Close()
+	}
+	m.mergeDiffViewActive = false
+	m.mergeDiffView = nil
+	m.focus.SetFocus(component.FocusCommitTree)
+	m.syncViewState()
+	m.viewDirty = true
+}
+
+// executeMergeBranch performs a git merge using the stored branch labels.
+// mergeLabels[0] is the source branch, mergeLabels[1] is the target branch.
+func (m *AppModel) executeMergeBranch(deleteSource bool) tea.Cmd {
+	gc := m.gitClient
+	if gc == nil || len(m.mergeLabels) < 2 {
+		m.statusBar.SetFlash("Merge requires two branches")
+		return nil
+	}
+	source := m.mergeLabels[0]
+	target := m.mergeLabels[1]
+	if m.mergeDiffView != nil {
+		m.mergeDiffView.SetMerging("Merging — " + source + " to " + target)
+	}
+
+	return func() tea.Msg {
+		if err := gc.MergeBranch(source, target); err != nil {
+			return mergeBranchFailedMsg{reason: err.Error()}
+		}
+		if deleteSource {
+			if err := gc.DeleteBranch(source); err != nil {
+				return mergeBranchDoneMsg{source: source, target: target, deleteErr: err.Error()}
+			}
+		}
+		return mergeBranchDoneMsg{source: source, target: target, deleted: deleteSource}
+	}
+}
+
+// mergeBranchDoneMsg signals a successful merge.
+type mergeBranchDoneMsg struct {
+	source    string
+	target    string
+	deleted   bool
+	deleteErr string // Non-empty if merge succeeded but delete failed.
+}
+
+// mergeBranchFailedMsg signals a failed merge.
+type mergeBranchFailedMsg struct {
+	reason string
+}
+
+// setMergeDiffLoading sets or clears loading on the merge diff view.
+func (m *AppModel) setMergeDiffLoading(loading bool) {
+	if loading && m.mergeDiffView == nil {
+		if m.diffViewActive {
+			m.exitDiffView()
+		}
+		m.mergeDiffView = mergediff.New(nil, m.config.Theme(), m.nerdFontsDetected)
+		m.mergeDiffViewActive = true
+		w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+		m.mergeDiffView.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
+		m.syncViewState()
+	}
+	if m.mergeDiffView != nil {
+		m.mergeDiffView.SetLoading(loading)
 		m.viewDirty = true
 	}
 }
@@ -6126,6 +6370,20 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Merge diff view: forward motion events for toolbar hover tracking.
+	if m.mergeDiffViewActive && m.mergeDiffView != nil && mouse.Action == tea.MouseActionMotion {
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			panelX := m.codePanelX()
+			viewX := mouse.X - panelX - 1
+			viewY := mouse.Y - 1
+			localMouse := tea.MouseMsg{
+				X: viewX, Y: viewY,
+				Action: mouse.Action, Button: mouse.Button,
+			}
+			m.mergeDiffView.Update(localMouse)
+		}
+	}
+
 	// Diff view: forward motion events for toolbar hover tracking.
 	if m.diffViewActive && m.diffView != nil && mouse.Action == tea.MouseActionMotion {
 		if m.isInsideCodePanel(mouse.X, mouse.Y) {
@@ -6141,8 +6399,8 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	}
 
 	// Git mode: track toolbar button hover for commit tree panel.
-	// Skip when diff view is active — its toolbar handles hover directly.
-	if m.viewMode == ViewGit && !m.diffViewActive && m.commitTree != nil && mouse.Action == tea.MouseActionMotion {
+	// Skip when diff/merge diff view is active — their toolbars handle hover directly.
+	if m.viewMode == ViewGit && !m.diffViewActive && !m.mergeDiffViewActive && m.commitTree != nil && mouse.Action == tea.MouseActionMotion {
 		panelW, panelH := m.layout.GetPanelSize(component.FocusCodeViewer)
 		panelX := m.codePanelX()
 		contentLeft := panelX + 1
@@ -6215,6 +6473,29 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
+	// Merge diff view: route left-click events to file list and panes.
+	if m.mergeDiffViewActive && m.mergeDiffView != nil && mouse.Button == tea.MouseButtonLeft {
+		m.handleMergeDiffFileListClick(mouse.X, mouse.Y)
+
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			panelX := m.codePanelX()
+			viewX := mouse.X - panelX - 1
+			viewY := mouse.Y - 1
+			isPaneClick := m.mergeDiffView.IsPaneClick(viewY)
+			localMouse := tea.MouseMsg{
+				X: viewX, Y: viewY,
+				Action: mouse.Action, Button: mouse.Button,
+			}
+			cmd := m.mergeDiffView.Update(localMouse)
+			if isPaneClick {
+				m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
+				m.syncFocusState()
+			}
+			return cmd
+		}
+		return nil
+	}
+
 	// Diff view: route left-click events to the diff file list and diff panes.
 	// Wheel events are routed via applyScrollImpulse → scrollOneLine.
 	if m.diffViewActive && m.diffView != nil && mouse.Button == tea.MouseButtonLeft {
@@ -6266,6 +6547,10 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 // so we fall back to the active leftRing panel. In TwoColumn/ThreeColumn
 // modes the fixed candidate IDs are mapped to the current ring occupant.
 func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
+	// When merge diff view is active, route scrolls to its focused pane.
+	if m.mergeDiffViewActive && m.mergeDiffView != nil && m.isInsideCodePanel(x, y) {
+		return pane.PaneFocusID(m.mergeDiffView.FocusedPane()), true
+	}
 	// When diff view is active, route scrolls to the diff view's focused pane.
 	if m.diffViewActive && m.diffView != nil && m.isInsideCodePanel(x, y) {
 		return pane.PaneFocusID(m.diffView.FocusedPane()), true
@@ -6274,6 +6559,12 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	mode := m.layout.Mode()
 
 	if mode == layout.SingleColumn {
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			if !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree {
+				return component.FocusMergeDiffFileList, true
+			}
+			return component.FocusMergeDiffView, true
+		}
 		if m.diffViewActive && m.diffView != nil {
 			// File-tree ring slot → diff file list; everything else → diff pane.
 			if !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree {
@@ -6294,6 +6585,10 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 
 	resolved := m.resolveRingPanel(panelID, mode)
 
+	// Merge diff view: route file-tree slot scrolls to the merge diff file list.
+	if m.mergeDiffViewActive && m.mergeDiffView != nil && resolved == component.FocusFileTree {
+		return component.FocusMergeDiffFileList, true
+	}
 	// Diff view: route file-tree slot scrolls to the diff file list.
 	if m.diffViewActive && m.diffView != nil && resolved == component.FocusFileTree {
 		return component.FocusDiffFileList, true
@@ -6405,6 +6700,14 @@ func (m *AppModel) tickScrollMomentum() {
 		// File list bounce: separate from pane bounce.
 		m.diffView.SetFileListBounceOffset(m.bounceOffset(component.FocusDiffFileList))
 	}
+	if m.mergeDiffView != nil {
+		paneBO := m.bounceOffset(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
+		if paneBO == 0 {
+			paneBO = m.bounceOffset(component.FocusMergeDiffView)
+		}
+		m.mergeDiffView.SetBounceOffset(paneBO)
+		m.mergeDiffView.SetFileListBounceOffset(m.bounceOffset(component.FocusMergeDiffFileList))
+	}
 }
 
 // settled reports whether the spring is close enough to target to stop.
@@ -6437,6 +6740,22 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 			return m.chat.ScrollUp()
 		}
 		return m.chat.ScrollDown()
+	case component.FocusMergeDiffFileList:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			if direction < 0 {
+				return m.mergeDiffView.ScrollFileListUp()
+			}
+			return m.mergeDiffView.ScrollFileListDown()
+		}
+		return true
+	case component.FocusMergeDiffView:
+		if m.mergeDiffView != nil {
+			if direction < 0 {
+				return m.mergeDiffView.ScrollUp()
+			}
+			return m.mergeDiffView.ScrollDown()
+		}
+		return true
 	case component.FocusDiffFileList:
 		if m.diffViewActive && m.diffView != nil {
 			if direction < 0 {
@@ -6454,6 +6773,12 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		}
 		return true
 	case component.FocusCodeViewer:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			if direction < 0 {
+				return m.mergeDiffView.ScrollUp()
+			}
+			return m.mergeDiffView.ScrollDown()
+		}
 		if m.diffViewActive && m.diffView != nil {
 			if direction < 0 {
 				return m.diffView.ScrollUp()
@@ -6507,6 +6832,13 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 	default:
 		if !pane.IsPaneFocus(panelID) {
 			return true
+		}
+		// Merge diff sub-pane scroll.
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			if direction < 0 {
+				return m.mergeDiffView.ScrollUp()
+			}
+			return m.mergeDiffView.ScrollDown()
 		}
 		// Diff sub-pane scroll.
 		if m.diffViewActive && m.diffView != nil {
@@ -6734,6 +7066,33 @@ func (m *AppModel) handleDiffFileListClick(x, y int) {
 	m.focus.SetFocus(component.FocusDiffFileList)
 	m.syncFocusState()
 	m.diffView.ClickFileList(localY)
+}
+
+// handleMergeDiffFileListClick dispatches a click inside the merge diff file list.
+func (m *AppModel) handleMergeDiffFileListClick(x, y int) {
+	if m.mergeDiffView == nil {
+		return
+	}
+	panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
+	if panelW == 0 || panelH == 0 {
+		return
+	}
+	panelX := m.fileTreePanelX()
+	innerH := max(panelH-panelBorderSize, 0)
+
+	contentLeft := panelX + 1
+	contentRight := panelX + panelW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight || y < contentTop || y >= contentBottom {
+		return
+	}
+
+	localY := y - contentTop
+	m.focus.SetFocus(component.FocusMergeDiffFileList)
+	m.syncFocusState()
+	m.mergeDiffView.ClickFileList(localY)
 }
 
 // handleCommitTreeClick dispatches a click inside the commit tree panel
@@ -7866,6 +8225,19 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		comp, cmd := m.commitTree.Update(key)
 		m.commitTree = comp.(*committree.Model)
 		return cmd
+	case component.FocusMergeDiffView:
+		if m.mergeDiffView != nil {
+			cmd := m.mergeDiffView.Update(key)
+			m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
+			m.syncFocusState()
+			return cmd
+		}
+		return nil
+	case component.FocusMergeDiffFileList:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			m.mergeDiffView.UpdateFileList(key.String())
+		}
+		return nil
 	case component.FocusDiffView:
 		if m.diffView != nil {
 			cmd := m.diffView.Update(key)
@@ -7882,6 +8254,13 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 	default:
 		if !pane.IsPaneFocus(focused) {
 			return nil
+		}
+		// Merge diff sub-pane: route keys to the merge diff view.
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			cmd := m.mergeDiffView.Update(key)
+			m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
+			m.syncFocusState()
+			return cmd
 		}
 		// Diff sub-pane: route keys to the diff view.
 		if m.diffViewActive && m.diffView != nil {
@@ -8018,6 +8397,10 @@ func (m *AppModel) recalcLayout() {
 	if m.diffView != nil {
 		m.diffView.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 		m.diffView.SetFileListSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
+	}
+	if m.mergeDiffView != nil {
+		m.mergeDiffView.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+		m.mergeDiffView.SetFileListSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
 	}
 
 	// Input: dynamic height based on content.
@@ -8176,6 +8559,15 @@ func (m *AppModel) syncViewState() {
 		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusDiffFileList)
 	}
 
+	// When the merge diff view is active, replace commit tree and git panel
+	// with merge-diff-specific panels.
+	if m.mergeDiffViewActive {
+		replaceInRing(&m.leftRing, component.FocusCommitTree, component.FocusMergeDiffView)
+		replaceInRing(&m.rightRing, component.FocusCommitTree, component.FocusMergeDiffView)
+		replaceInRing(&m.leftRing, component.FocusGitPanel, component.FocusMergeDiffFileList)
+		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusMergeDiffFileList)
+	}
+
 	// First-collapse flash: show once when panels first collapse.
 	nowActive := !m.leftRing.empty() || !m.rightRing.empty()
 	if wasEmpty && nowActive && !m.collapseHintShown {
@@ -8253,20 +8645,29 @@ func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.F
 		for i, id := range order {
 			switch id {
 			case component.FocusFileTree:
-				if m.diffViewActive {
+				if m.mergeDiffViewActive {
+					order[i] = component.FocusMergeDiffFileList
+				} else if m.diffViewActive {
 					order[i] = component.FocusDiffFileList
 				} else {
 					order[i] = component.FocusGitPanel
 				}
-			case component.FocusCodeViewer, component.FocusDiffView:
-				if m.diffViewActive && m.diffView != nil {
+			case component.FocusCodeViewer, component.FocusDiffView, component.FocusMergeDiffView:
+				if m.mergeDiffViewActive && m.mergeDiffView != nil {
+					order[i] = pane.PaneFocusID(m.mergeDiffView.FocusedPane())
+				} else if m.diffViewActive && m.diffView != nil {
 					order[i] = pane.PaneFocusID(m.diffView.FocusedPane())
 				} else {
 					order[i] = component.FocusCommitTree
 				}
 			}
 		}
-		if m.diffViewActive && m.diffView != nil {
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			fid := pane.PaneFocusID(m.mergeDiffView.FocusedPane())
+			if !slices.Contains(order, fid) {
+				order = append(order, fid)
+			}
+		} else if m.diffViewActive && m.diffView != nil {
 			fid := pane.PaneFocusID(m.diffView.FocusedPane())
 			if !slices.Contains(order, fid) {
 				order = append(order, fid)
@@ -8557,6 +8958,20 @@ func (m *AppModel) detectDirtySlots() {
 		}
 	}
 
+	// Merge diff view dirty check.
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		if m.mergeDiffView.ViewDirty() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+		if m.mergeDiffView.FileListDirty() {
+			if m.layout.Mode() == layout.FourColumn {
+				m.comp.MarkDirty(compositor.SlotCenterLeft)
+			} else {
+				m.comp.MarkDirty(compositor.SlotLeft)
+			}
+		}
+	}
+
 	// Preview panel: no view cache, so mark dirty whenever it is focused
 	// (cursor blink changes its output on every blink cycle).
 	if m.hasPreview() && m.isPreviewFocused() {
@@ -8635,6 +9050,9 @@ func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
 // renderSlotCenterLeft renders the bordered file tree for the center-left slot.
 // In git mode, renders the git explorer panel instead.
 func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.renderMergeDiffFileListBordered(th)
+	}
 	if m.diffViewActive && m.diffView != nil {
 		return m.renderDiffFileListBordered(th)
 	}
@@ -8655,6 +9073,9 @@ func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
 // In TwoColumn mode the right ring may show chat, commit tree, or code.
 // In git mode (non-TwoColumn), renders the commit tree instead of the code panel.
 func (m *AppModel) renderSlotRight(th *theme.Theme) string {
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.renderMergeDiffViewBordered(th)
+	}
 	if m.diffViewActive {
 		return m.renderDiffViewBordered(th)
 	}
@@ -8687,6 +9108,9 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	case component.FocusCodeViewer:
 		return m.renderCodePanelBordered(th)
 	case component.FocusFileTree:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			return m.renderMergeDiffFileListBordered(th)
+		}
 		if m.diffViewActive && m.diffView != nil {
 			return m.renderDiffFileListBordered(th)
 		}
@@ -8696,6 +9120,16 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 		return m.renderGitPanelBordered(th)
 	case component.FocusCommitTree:
 		return m.renderGitCommitTreeBordered(th)
+	case component.FocusMergeDiffView:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			return m.renderMergeDiffViewBordered(th)
+		}
+		return m.renderCodePanelBordered(th)
+	case component.FocusMergeDiffFileList:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			return m.renderMergeDiffFileListBordered(th)
+		}
+		return m.renderGitPanelBordered(th)
 	case component.FocusDiffView:
 		if m.diffViewActive && m.diffView != nil {
 			return m.renderDiffViewBordered(th)
@@ -8707,6 +9141,9 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 		}
 		return m.renderGitPanelBordered(th)
 	default:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			return m.renderMergeDiffViewBordered(th)
+		}
 		if m.diffViewActive && m.diffView != nil {
 			return m.renderDiffViewBordered(th)
 		}
@@ -8721,12 +9158,20 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
 	switch id {
 	case component.FocusFileTree:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			return m.renderMergeDiffFileListBordered(th)
+		}
 		if m.diffViewActive && m.diffView != nil {
 			return m.renderDiffFileListBordered(th)
 		}
 		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 	case component.FocusGitPanel:
 		return m.renderGitPanelBordered(th)
+	case component.FocusMergeDiffFileList:
+		if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			return m.renderMergeDiffFileListBordered(th)
+		}
+		return m.renderLeftPanelBordered(th)
 	case component.FocusDiffFileList:
 		if m.diffViewActive && m.diffView != nil {
 			return m.renderDiffFileListBordered(th)
@@ -8989,6 +9434,41 @@ func (m *AppModel) renderDiffViewBordered(th *theme.Theme) string {
 		Render(content)
 }
 
+// renderMergeDiffFileListBordered renders the merge diff file list sidebar.
+func (m *AppModel) renderMergeDiffFileListBordered(th *theme.Theme) string {
+	content := m.mergeDiffView.FileListView(m.cursorVisible)
+	w, h := m.layout.GetPanelSize(component.FocusFileTree)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusMergeDiffFileList {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderMergeDiffViewBordered renders the merge diff view.
+func (m *AppModel) renderMergeDiffViewBordered(th *theme.Theme) string {
+	content := m.overlayBlockedChord(m.overlayChordHint(m.mergeDiffView.View(m.cursorVisible), component.FocusCodeViewer, th))
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	border := th.InactiveBorder
+	if m.isMergeDiffPaneFocused() {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// isMergeDiffPaneFocused reports whether the focused component is a merge diff pane.
+func (m *AppModel) isMergeDiffPaneFocused() bool {
+	return m.mergeDiffViewActive && m.mergeDiffView != nil && pane.IsPaneFocus(m.focus.Current())
+}
+
 func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.Theme) string {
 	w, h := m.layout.GetPanelSize(id)
 	border := th.InactiveBorder
@@ -9011,9 +9491,10 @@ func (m *AppModel) syncFocusState() {
 
 	// Track which editor pane has focus. When focus moves to a different
 	// editor pane, update focusedPane so all helpers route correctly.
-	// Skip when diff view is active — diff panes share the same PaneID
-	// namespace (starting from 1) and would falsely match editor entries.
-	if pane.IsPaneFocus(current) && !m.diffViewActive {
+	// Skip when diff view or merge diff view is active — their panes share
+	// the same PaneID namespace (starting from 1) and would falsely match
+	// editor entries.
+	if pane.IsPaneFocus(current) && !m.diffViewActive && !m.mergeDiffViewActive {
 		pid := pane.PaneIDFromFocus(current)
 		if _, ok := m.paneEditors[pid]; ok {
 			m.focusedPane = pid
@@ -9026,10 +9507,10 @@ func (m *AppModel) syncFocusState() {
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
 	m.codePanel.SetFocused(current == component.FocusCodeViewer && m.viewMode != ViewEdit && !m.hasPreview())
 	for id, ps := range m.paneEditors {
-		// When diff view is active, diff pane IDs overlap with editor pane
-		// IDs (both start from 1). Force all editors unfocused to prevent
-		// false matches — diff focus is handled by the diff view block below.
-		focused := current == pane.PaneFocusID(id) && !m.diffViewActive
+		// When diff/merge diff view is active, pane IDs overlap with editor
+		// pane IDs (both start from 1). Force all editors unfocused to prevent
+		// false matches — focus is handled by the respective view block below.
+		focused := current == pane.PaneFocusID(id) && !m.diffViewActive && !m.mergeDiffViewActive
 		ps.editor.SetFocused(focused)
 		if !focused {
 			ps.editor.DismissAllOverlays()
@@ -9053,6 +9534,15 @@ func (m *AppModel) syncFocusState() {
 		}
 		m.diffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusDiffView)
 		m.diffView.SetFileListFocused(current == component.FocusDiffFileList)
+	}
+
+	// Merge diff view panels — same pattern as diff view above.
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		if pane.IsPaneFocus(current) {
+			m.mergeDiffView.SetFocusedPane(pane.PaneIDFromFocus(current))
+		}
+		m.mergeDiffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusMergeDiffView)
+		m.mergeDiffView.SetFileListFocused(current == component.FocusMergeDiffFileList)
 	}
 
 	// Sync warp line display for the newly focused editor.
@@ -9119,6 +9609,9 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 		}
 		switch id {
 		case component.FocusFileTree:
+			if m.mergeDiffViewActive {
+				return component.FocusMergeDiffFileList
+			}
 			if m.diffViewActive {
 				return component.FocusDiffFileList
 			}
@@ -9166,7 +9659,7 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 		} else {
 			top = append(top, pg(left))
 		}
-		if right == component.FocusCodeViewer || right == component.FocusDiffView {
+		if right == component.FocusCodeViewer || right == component.FocusDiffView || right == component.FocusMergeDiffView {
 			top = append(top, m.codePanelGroup())
 		} else {
 			top = append(top, pg(right))
@@ -9176,7 +9669,7 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 		switch {
 		case active == component.FocusSessionPanel:
 			top = append(top, leftSubs())
-		case active == component.FocusCodeViewer || active == component.FocusDiffView:
+		case active == component.FocusCodeViewer || active == component.FocusDiffView || active == component.FocusMergeDiffView:
 			top = append(top, m.codePanelGroup())
 		default:
 			top = append(top, pg(active))
@@ -9191,6 +9684,11 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 func (m *AppModel) codePanelGroup() layout.PanelGroup {
 	if m.viewMode == ViewEdit && m.paneTree != nil {
 		return layout.PanelGroup{SubPanels: m.paneTree.ToSubGrid()}
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		if dt := m.mergeDiffView.PaneTree(); dt != nil {
+			return layout.PanelGroup{SubPanels: dt.ToSubGrid()}
+		}
 	}
 	if m.diffViewActive && m.diffView != nil {
 		if dt := m.diffView.PaneTree(); dt != nil {
@@ -9285,7 +9783,8 @@ func (m *AppModel) needsDecorTick() bool {
 		now.Before(m.tabArrowFlashRightUntil) ||
 		(m.commitTree != nil && m.commitTree.NeedsDecorTick()) ||
 		(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick()) ||
-		(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick())
+		(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick()) ||
+		(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick())
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
