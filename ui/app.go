@@ -30,6 +30,7 @@ import (
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/committree"
 	"github.com/adalundhe/sylk/ui/component"
+	"github.com/adalundhe/sylk/ui/diffview"
 	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/editor"
 	"github.com/adalundhe/sylk/ui/editor/mode"
@@ -297,7 +298,8 @@ type AppModel struct {
 	lastToggleAt      time.Time        // When lastToggleKey was pressed.
 	leftRing          viewRing         // Left slot cycling ring (Session/FileTree).
 	rightRing         viewRing         // Right slot cycling ring (Chat/Code).
-	collapseHintShown bool             // First-collapse flash shown once per session.
+	collapseHintShown    bool          // First-collapse flash shown once per session.
+	pendingUncommittedAll bool         // Alt+U pressed; next 'a' focuses [All].
 	scrollSpring      harmonica.Spring // Spring simulation for smooth scroll.
 	scroll            scrollState      // Current scroll animation state.
 	bounceSpring      harmonica.Spring // Underdamped spring for overscroll bounce.
@@ -321,6 +323,11 @@ type AppModel struct {
 	preGitEditMode   bool              // Whether edit mode was active before entering git mode.
 	prevGitMode      ViewMode          // Detect git mode transitions for dirty detection.
 	gitDataLoaded    bool              // True after first LoadData; skips reload on cycling.
+
+	// Diff view overlay (replaces commit tree when active).
+	diffView       *diffview.Model // Diff view component (nil when inactive).
+	diffViewActive bool            // True while diff view is displayed.
+	diffHashes     []string        // Saved commit hashes for mode switching.
 
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
@@ -500,9 +507,32 @@ func (r *viewRing) setTo(id component.FocusID) bool {
 // empty reports whether the ring has no panels to cycle.
 func (r *viewRing) empty() bool { return len(r.panels) == 0 }
 
+// replaceInRing swaps the first occurrence of old with new in the ring's panels.
+func replaceInRing(ring *viewRing, old, new component.FocusID) {
+	for i, p := range ring.panels {
+		if p == old {
+			ring.panels[i] = new
+			return
+		}
+	}
+}
+
 // isGitPanel reports whether the given focus ID is a git-specific panel.
 func isGitPanel(id component.FocusID) bool {
-	return id == component.FocusGitPanel || id == component.FocusCommitTree
+	return id == component.FocusGitPanel || id == component.FocusCommitTree || id == component.FocusDiffView || id == component.FocusDiffFileList
+}
+
+// isDiffPaneFocused reports whether the current focus is the diff view panel
+// or any of its sub-panes.
+func (m *AppModel) isDiffPaneFocused() bool {
+	cur := m.focus.Current()
+	if cur == component.FocusDiffView {
+		return true
+	}
+	if m.diffViewActive && pane.IsPaneFocus(cur) {
+		return true
+	}
+	return false
 }
 
 // ViewMode is the current top-level UI mode. Exactly one is active at a time.
@@ -1029,6 +1059,42 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.commitTree.AppendNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
 		}
 		return m, nil
+
+	case committree.DiffCompareMsg:
+		m.diffHashes = typed.Hashes
+		return m, m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
+
+	case msg.DiffViewDataMsg:
+		pairs := make([]diffview.DiffPair, len(typed.Pairs))
+		for i, p := range typed.Pairs {
+			pairs[i] = diffview.DiffPair{
+				FromHash:  p.FromHash,
+				ToHash:    p.ToHash,
+				FromShort: p.FromShort,
+				ToShort:   p.ToShort,
+				Files:     p.Files,
+				TotalAdd:  p.TotalAdd,
+				TotalDel:  p.TotalDel,
+			}
+		}
+		m.enterDiffView(pairs, diffview.CompareMode(typed.Mode))
+		return m, nil
+
+	case diffview.ExitDiffViewMsg:
+		m.exitDiffView()
+		return m, nil
+
+	case diffview.FocusFileListMsg:
+		m.focus.SetFocus(component.FocusDiffFileList)
+		m.syncFocusState()
+		return m, nil
+
+	case diffview.ChangeCompareModeMsg:
+		if len(m.diffHashes) >= 2 {
+			return m, m.fetchDiffDataCmd(m.diffHashes, typed.Mode)
+		}
+		return m, nil
+
 	case msg.FileReplacedMsg:
 		return m, m.handleFileReplaced(typed)
 	case msg.MultiFileReplaceDoneMsg:
@@ -1318,6 +1384,16 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSavePromptKey(key)
 	}
 
+	// Alt+Shift+U then A → focus [All] on the Uncommitted tab.
+	// Must precede Select-all so Alt+A doesn't get consumed.
+	if m.pendingUncommittedAll {
+		m.pendingUncommittedAll = false
+		if (ks == "a" || ks == "A" || ks == "alt+a" || ks == "alt+A") && m.gitPanel != nil {
+			m.gitPanel.FocusUncommittedOptions()
+			return m, nil
+		}
+	}
+
 	// Select all in the focused component (Alt+Shift+A).
 	if key.String() == "alt+A" {
 		switch {
@@ -1432,13 +1508,28 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Alt+G toggles git mode.
-	if key.String() == "alt+g" {
-		return m, m.toggleGitMode()
+	// Alt+C switches to chat mode.
+	if key.String() == "alt+c" {
+		return m, m.switchToChatMode()
 	}
 
-	// Alt+E toggles inline edit mode.
+	// Alt+G switches to git mode.
+	if key.String() == "alt+g" {
+		if m.viewMode == ViewGit {
+			return m, nil
+		}
+		if m.gitPanel == nil {
+			m.statusBar.SetFlash("Not a git repository")
+			return m, nil
+		}
+		return m, m.enterGitMode()
+	}
+
+	// Alt+E switches to edit mode.
 	if key.String() == "alt+e" {
+		if m.viewMode == ViewEdit {
+			return m, nil
+		}
 		return m, m.toggleEditMode()
 	}
 
@@ -1476,6 +1567,16 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			comp, cmd := m.commitTree.Update(key)
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
+		}
+		if m.diffViewActive && m.diffView != nil {
+			if m.focus.Current() == component.FocusDiffFileList {
+				m.exitDiffView()
+				return m, nil
+			}
+			if m.isDiffPaneFocused() {
+				cmd := m.diffView.Update(key)
+				return m, cmd
+			}
 		}
 		now := time.Now()
 		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
@@ -3058,6 +3159,7 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 			cmd = tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 		}
 	case ViewEdit:
+		m.viewMode = ViewEdit
 		if old == ViewGit && m.preGitEditMode {
 			m.preGitEditMode = false
 			cmd = m.enterEditMode()
@@ -3075,6 +3177,24 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 
 	m.statusBar.SetMode(target.String())
 	return cmd
+}
+
+// ---------------------------------------------------------------------------
+// Chat mode (Alt+C)
+// ---------------------------------------------------------------------------
+
+// switchToChatMode exits git or edit mode to return to chat mode.
+// No-op if already in chat mode.
+func (m *AppModel) switchToChatMode() tea.Cmd {
+	switch m.viewMode {
+	case ViewGit:
+		return m.exitGitMode()
+	case ViewEdit:
+		m.exitEditMode()
+		return nil
+	default:
+		return nil
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3469,6 +3589,121 @@ func loadStatsForNodes(gc *git.GitClient, nodes []committree.TreeNode) map[strin
 	return stats
 }
 
+// ---------------------------------------------------------------------------
+// Diff view helpers
+// ---------------------------------------------------------------------------
+
+// Compare mode aliases for use in app.go (avoid repeating package prefix).
+const (
+	CompareModeChain    = diffview.CompareModeChain
+	CompareModeAllFirst = diffview.CompareModeAllFirst
+	CompareModePairs    = diffview.CompareModePairs
+)
+
+// fetchDiffDataCmd launches an async diff fetch for the given hashes and mode.
+func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) tea.Cmd {
+	gc := m.gitClient
+	if gc == nil || len(hashes) < 2 {
+		return nil
+	}
+	return func() tea.Msg {
+		fromTo := buildDiffPairs(hashes, mode)
+		pairs := make([]msg.DiffViewPair, len(fromTo))
+		for i, ft := range fromTo {
+			files, _ := gc.GetDiff(ft[0], ft[1])
+			totalAdd, totalDel := 0, 0
+			for _, f := range files {
+				totalAdd += f.Additions
+				totalDel += f.Deletions
+			}
+			fromInfo, _ := gc.GetCommit(ft[0])
+			toInfo, _ := gc.GetCommit(ft[1])
+			fromShort, toShort := shortHash(ft[0]), shortHash(ft[1])
+			if fromInfo != nil {
+				fromShort = fromInfo.ShortHash
+			}
+			if toInfo != nil {
+				toShort = toInfo.ShortHash
+			}
+			pairs[i] = msg.DiffViewPair{
+				FromHash:  ft[0],
+				ToHash:    ft[1],
+				FromShort: fromShort,
+				ToShort:   toShort,
+				Files:     files,
+				TotalAdd:  totalAdd,
+				TotalDel:  totalDel,
+			}
+		}
+		return msg.DiffViewDataMsg{Pairs: pairs, Mode: int(mode)}
+	}
+}
+
+// buildDiffPairs produces (from, to) hash pairs based on compare mode.
+func buildDiffPairs(hashes []string, mode diffview.CompareMode) [][2]string {
+	if len(hashes) < 2 {
+		return nil
+	}
+	switch mode {
+	case CompareModeAllFirst:
+		pairs := make([][2]string, len(hashes)-1)
+		for i := 1; i < len(hashes); i++ {
+			pairs[i-1] = [2]string{hashes[0], hashes[i]}
+		}
+		return pairs
+	case CompareModePairs:
+		pairs := make([][2]string, 0, len(hashes)/2)
+		for i := 0; i+1 < len(hashes); i += 2 {
+			pairs = append(pairs, [2]string{hashes[i], hashes[i+1]})
+		}
+		return pairs
+	default: // Chain
+		pairs := make([][2]string, len(hashes)-1)
+		for i := 0; i+1 < len(hashes); i++ {
+			pairs[i] = [2]string{hashes[i], hashes[i+1]}
+		}
+		return pairs
+	}
+}
+
+// shortHash returns the first 7 characters of a hash.
+func shortHash(h string) string {
+	if len(h) > 7 {
+		return h[:7]
+	}
+	return h
+}
+
+// enterDiffView creates the diff view model and activates it.
+func (m *AppModel) enterDiffView(pairs []diffview.DiffPair, mode diffview.CompareMode) {
+	m.diffView = diffview.New(pairs, mode, m.config.Theme())
+	m.diffViewActive = true
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.diffView.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
+	lw, lh := m.layout.GetPanelSize(component.FocusFileTree)
+	m.diffView.SetFileListSize(max(lw-panelBorderSize, 1), max(lh-panelBorderSize, 1))
+	m.diffView.SetFocused(true)
+	// syncViewState rebuilds rings, tab order, and calls syncFocusState.
+	// Focus must be set AFTER so that SetTabOrder (which includes the diff
+	// pane ID via appendCodePanelFocus) preserves the diff pane focus.
+	m.syncViewState()
+	m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+	m.syncFocusState()
+	m.viewDirty = true
+}
+
+// exitDiffView clears the diff view and restores commit tree focus.
+func (m *AppModel) exitDiffView() {
+	if m.diffView != nil {
+		m.diffView.Close()
+	}
+	m.diffViewActive = false
+	m.diffView = nil
+	m.focus.SetFocus(component.FocusCommitTree)
+	m.syncViewState()
+	m.viewDirty = true
+}
+
 // commitPageSize is the number of commits per page.
 // Derived from: typical viewport shows ~8 nodes; 3× provides comfortable
 // scroll depth per page while keeping load times snappy.
@@ -3478,21 +3713,22 @@ const commitPageSize = 25
 // Returns (cmd, true) if the key was handled.
 func (m *AppModel) handleGitTabShortcut(ks string) (tea.Cmd, bool) {
 	switch ks {
-	case "alt+c":
+	case "alt+C":
 		m.gitPanel.SetActiveTab(gitpanel.TabCommits)
 		m.focusGitPanel()
 		return nil, true
-	case "alt+b":
+	case "alt+B":
 		m.gitPanel.SetActiveTab(gitpanel.TabBranches)
 		m.focusGitPanel()
 		return nil, true
-	case "alt+t":
+	case "alt+T":
 		m.gitPanel.SetActiveTab(gitpanel.TabTags)
 		m.focusGitPanel()
 		return nil, true
-	case "alt+u":
+	case "alt+U":
 		m.gitPanel.SetActiveTab(gitpanel.TabUncommitted)
 		m.focusGitPanel()
+		m.pendingUncommittedAll = true
 		return nil, true
 	}
 	return nil, false
@@ -5767,7 +6003,8 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 	}
 
 	// Git mode: track divider hover for resize cursor feedback.
-	if m.viewMode == ViewGit && m.gitPanel != nil && mouse.Action == tea.MouseActionMotion && !m.gitPanel.IsDragging() {
+	// Skip when diff view is active — the left panel shows the file list.
+	if m.viewMode == ViewGit && !m.diffViewActive && m.gitPanel != nil && mouse.Action == tea.MouseActionMotion && !m.gitPanel.IsDragging() {
 		panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
 		panelX := m.fileTreePanelX()
 		contentLeft := panelX + 1
@@ -5784,8 +6021,23 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Diff view: forward motion events for toolbar hover tracking.
+	if m.diffViewActive && m.diffView != nil && mouse.Action == tea.MouseActionMotion {
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			panelX := m.codePanelX()
+			viewX := mouse.X - panelX - 1
+			viewY := mouse.Y - 1
+			localMouse := tea.MouseMsg{
+				X: viewX, Y: viewY,
+				Action: mouse.Action, Button: mouse.Button,
+			}
+			m.diffView.Update(localMouse)
+		}
+	}
+
 	// Git mode: track toolbar button hover for commit tree panel.
-	if m.viewMode == ViewGit && m.commitTree != nil && mouse.Action == tea.MouseActionMotion {
+	// Skip when diff view is active — its toolbar handles hover directly.
+	if m.viewMode == ViewGit && !m.diffViewActive && m.commitTree != nil && mouse.Action == tea.MouseActionMotion {
 		panelW, panelH := m.layout.GetPanelSize(component.FocusCodeViewer)
 		panelX := m.codePanelX()
 		contentLeft := panelX + 1
@@ -5858,6 +6110,26 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
+	// Diff view: route left-click events to the diff view component.
+	// Wheel events are handled by applyScrollImpulse above.
+	if m.diffViewActive && m.diffView != nil && mouse.Button == tea.MouseButtonLeft {
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			panelX := m.codePanelX()
+			viewX := mouse.X - panelX - 1
+			viewY := mouse.Y - 1
+			localMouse := tea.MouseMsg{
+				X: viewX, Y: viewY,
+				Action: mouse.Action, Button: mouse.Button,
+			}
+			cmd := m.diffView.Update(localMouse)
+			// Sync app-level focus AFTER the diff view processes the click,
+			// so pane changes and toolbar actions are reflected correctly.
+			m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+			m.syncFocusState()
+			return cmd
+		}
+	}
+
 	// Git mode: route to git panel and commit tree.
 	if m.viewMode == ViewGit {
 		if cmd := m.handleGitPanelClick(mouse.X, mouse.Y); cmd != nil {
@@ -5881,9 +6153,17 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 // so we fall back to the active leftRing panel. In TwoColumn/ThreeColumn
 // modes the fixed candidate IDs are mapped to the current ring occupant.
 func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
+	// When diff view is active, route scrolls to the diff view's focused pane.
+	if m.diffViewActive && m.diffView != nil && m.isInsideCodePanel(x, y) {
+		return pane.PaneFocusID(m.diffView.FocusedPane()), true
+	}
+
 	mode := m.layout.Mode()
 
 	if mode == layout.SingleColumn {
+		if m.diffViewActive {
+			return component.FocusDiffView, true
+		}
 		if m.leftRing.empty() {
 			return 0, false
 		}
@@ -6025,7 +6305,25 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 			return m.chat.ScrollUp()
 		}
 		return m.chat.ScrollDown()
+	case component.FocusDiffView:
+		if m.diffView != nil {
+			if direction < 0 {
+				m.diffView.Update(tea.KeyMsg{Type: tea.KeyUp})
+			} else {
+				m.diffView.Update(tea.KeyMsg{Type: tea.KeyDown})
+			}
+			return true
+		}
+		return true
 	case component.FocusCodeViewer:
+		if m.diffViewActive && m.diffView != nil {
+			if direction < 0 {
+				m.diffView.Update(tea.KeyMsg{Type: tea.KeyUp})
+			} else {
+				m.diffView.Update(tea.KeyMsg{Type: tea.KeyDown})
+			}
+			return true
+		}
 		if m.viewMode == ViewGit && m.commitTree != nil {
 			if direction < 0 {
 				return m.commitTree.ScrollUp()
@@ -6072,6 +6370,15 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		return m.commitTree.ScrollDown()
 	default:
 		if !pane.IsPaneFocus(panelID) {
+			return true
+		}
+		// Diff sub-pane scroll.
+		if m.diffViewActive && m.diffView != nil {
+			if direction < 0 {
+				m.diffView.Update(tea.KeyMsg{Type: tea.KeyUp})
+			} else {
+				m.diffView.Update(tea.KeyMsg{Type: tea.KeyDown})
+			}
 			return true
 		}
 		pid := pane.PaneIDFromFocus(panelID)
@@ -7396,9 +7703,39 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		comp, cmd := m.commitTree.Update(key)
 		m.commitTree = comp.(*committree.Model)
 		return cmd
+	case component.FocusDiffView:
+		if m.diffView != nil {
+			cmd := m.diffView.Update(key)
+			m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+			m.syncFocusState()
+			return cmd
+		}
+		return nil
+	case component.FocusDiffFileList:
+		if m.diffViewActive && m.diffView != nil {
+			switch key.String() {
+			case "tab":
+				m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+				m.syncFocusState()
+				return nil
+			default:
+				m.diffView.UpdateFileList(key.String())
+				return nil
+			}
+		}
+		return nil
 	default:
 		if !pane.IsPaneFocus(focused) {
 			return nil
+		}
+		// Diff sub-pane: route keys to the diff view.
+		if m.diffViewActive && m.diffView != nil {
+			cmd := m.diffView.Update(key)
+			// Re-sync app-level focus after the diff view processes the key,
+			// since ]f/[f and other actions may change the focused pane.
+			m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+			m.syncFocusState()
+			return cmd
 		}
 		pid := pane.PaneIDFromFocus(focused)
 		if pid == m.previewPane {
@@ -7522,6 +7859,10 @@ func (m *AppModel) recalcLayout() {
 	if m.gitPanel != nil {
 		m.gitPanel.SetSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
 		m.commitTree.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+	}
+	if m.diffView != nil {
+		m.diffView.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+		m.diffView.SetFileListSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
 	}
 
 	// Input: dynamic height based on content.
@@ -7660,13 +8001,24 @@ func (m *AppModel) syncViewState() {
 
 	// When git mode is active, position rings on git panels so the
 	// ring hint shows "Git" and "Tree" instead of chat-mode panels.
+	// Skip if the ring is already on a git panel — this allows
+	// single-column cycling between GitPanel and CommitTree.
 	if m.viewMode == ViewGit {
-		if !m.leftRing.empty() {
+		if !m.leftRing.empty() && !isGitPanel(m.leftRing.current()) {
 			m.leftRing.setTo(component.FocusGitPanel)
 		}
-		if !m.rightRing.empty() {
+		if !m.rightRing.empty() && !isGitPanel(m.rightRing.current()) {
 			m.rightRing.setTo(component.FocusCommitTree)
 		}
+	}
+
+	// When the diff view is active, replace commit tree and git panel with
+	// diff-specific panels so Alt+V cycling and the ring hint show them.
+	if m.diffViewActive {
+		replaceInRing(&m.leftRing, component.FocusCommitTree, component.FocusDiffView)
+		replaceInRing(&m.rightRing, component.FocusCommitTree, component.FocusDiffView)
+		replaceInRing(&m.leftRing, component.FocusGitPanel, component.FocusDiffFileList)
+		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusDiffFileList)
 	}
 
 	// First-collapse flash: show once when panels first collapse.
@@ -7738,19 +8090,36 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 // FocusCodeViewer. Preview-only mode (no editor tabs) skips the tab order
 // since Tab cannot meaningfully target a read-only preview.
 func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.FocusID {
-	// Git mode: replace FileTree slot with FocusGitPanel, CodeViewer slot
-	// with FocusCommitTree. Both are always in the tab order.
+	// Git mode: replace FileTree/CodeViewer with git-specific panels.
+	// When the diff view is active, use diff-specific IDs instead so
+	// that SetTabOrder preserves focus on diff sub-panes (matching the
+	// edit-mode pattern where the focused editor pane ID is in the order).
 	if m.viewMode == ViewGit {
 		for i, id := range order {
 			switch id {
 			case component.FocusFileTree:
-				order[i] = component.FocusGitPanel
-			case component.FocusCodeViewer:
-				order[i] = component.FocusCommitTree
+				if m.diffViewActive {
+					order[i] = component.FocusDiffFileList
+				} else {
+					order[i] = component.FocusGitPanel
+				}
+			case component.FocusCodeViewer, component.FocusDiffView:
+				if m.diffViewActive && m.diffView != nil {
+					order[i] = pane.PaneFocusID(m.diffView.FocusedPane())
+				} else {
+					order[i] = component.FocusCommitTree
+				}
 			}
 		}
-		if !slices.Contains(order, component.FocusCommitTree) {
-			order = append(order, component.FocusCommitTree)
+		if m.diffViewActive && m.diffView != nil {
+			fid := pane.PaneFocusID(m.diffView.FocusedPane())
+			if !slices.Contains(order, fid) {
+				order = append(order, fid)
+			}
+		} else {
+			if !slices.Contains(order, component.FocusCommitTree) {
+				order = append(order, component.FocusCommitTree)
+			}
 		}
 		return order
 	}
@@ -7797,6 +8166,8 @@ var panelDisplayNames = map[component.FocusID]string{
 	component.FocusFileTree:     "Files",
 	component.FocusGitPanel:     "Git",
 	component.FocusCommitTree:   "Tree",
+	component.FocusDiffView:      "Diff",
+	component.FocusDiffFileList:  "Files",
 }
 
 // buildRingHint returns the formatted ring indicator string for the status bar.
@@ -7888,9 +8259,9 @@ func (m *AppModel) focusBorderGroup() compositor.SlotID {
 		default:
 			return compositor.SlotCenter
 		}
-	case component.FocusCodeViewer, component.FocusCommitTree:
+	case component.FocusCodeViewer, component.FocusCommitTree, component.FocusDiffView:
 		return compositor.SlotRight
-	case component.FocusGitPanel:
+	case component.FocusGitPanel, component.FocusDiffFileList:
 		if m.layout.Mode() == layout.FourColumn {
 			return compositor.SlotCenterLeft
 		}
@@ -8003,8 +8374,8 @@ func (m *AppModel) detectDirtySlots() {
 		}
 	}
 
-	// Git mode dirty checks.
-	if m.viewMode == ViewGit && m.gitPanel != nil {
+	// Git mode dirty checks — skip when diff view is overlaying.
+	if m.viewMode == ViewGit && !m.diffViewActive && m.gitPanel != nil {
 		if m.gitPanel.ViewDirty() {
 			if m.layout.Mode() == layout.FourColumn {
 				m.comp.MarkDirty(compositor.SlotCenterLeft)
@@ -8014,6 +8385,20 @@ func (m *AppModel) detectDirtySlots() {
 		}
 		if m.commitTree.ViewDirty() {
 			m.comp.MarkDirty(compositor.SlotRight)
+		}
+	}
+
+	// Diff view dirty check.
+	if m.diffViewActive && m.diffView != nil {
+		if m.diffView.ViewDirty() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+		if m.diffView.FileListDirty() {
+			if m.layout.Mode() == layout.FourColumn {
+				m.comp.MarkDirty(compositor.SlotCenterLeft)
+			} else {
+				m.comp.MarkDirty(compositor.SlotLeft)
+			}
 		}
 	}
 
@@ -8095,6 +8480,9 @@ func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
 // renderSlotCenterLeft renders the bordered file tree for the center-left slot.
 // In git mode, renders the git explorer panel instead.
 func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
+	if m.diffViewActive && m.diffView != nil {
+		return m.renderDiffFileListBordered(th)
+	}
 	if m.viewMode == ViewGit {
 		return m.renderGitPanelBordered(th)
 	}
@@ -8112,6 +8500,9 @@ func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
 // In TwoColumn mode the right ring may show chat, commit tree, or code.
 // In git mode (non-TwoColumn), renders the commit tree instead of the code panel.
 func (m *AppModel) renderSlotRight(th *theme.Theme) string {
+	if m.diffViewActive {
+		return m.renderDiffViewBordered(th)
+	}
 	if m.layout.Mode() == layout.TwoColumn {
 		right := m.rightRing.current()
 		switch right {
@@ -8147,7 +8538,20 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 		return m.renderGitPanelBordered(th)
 	case component.FocusCommitTree:
 		return m.renderGitCommitTreeBordered(th)
+	case component.FocusDiffView:
+		if m.diffViewActive && m.diffView != nil {
+			return m.renderDiffViewBordered(th)
+		}
+		return m.renderCodePanelBordered(th)
+	case component.FocusDiffFileList:
+		if m.diffViewActive && m.diffView != nil {
+			return m.renderDiffFileListBordered(th)
+		}
+		return m.renderGitPanelBordered(th)
 	default:
+		if m.diffViewActive && m.diffView != nil {
+			return m.renderDiffViewBordered(th)
+		}
 		content := m.overlayChordHint(m.panelContent(active), active, th)
 		return m.renderPanel(content, active, th)
 	}
@@ -8162,6 +8566,11 @@ func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string 
 		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 	case component.FocusGitPanel:
 		return m.renderGitPanelBordered(th)
+	case component.FocusDiffFileList:
+		if m.diffViewActive && m.diffView != nil {
+			return m.renderDiffFileListBordered(th)
+		}
+		return m.renderLeftPanelBordered(th)
 	default:
 		return m.renderLeftPanelBordered(th)
 	}
@@ -8186,6 +8595,11 @@ func (m *AppModel) panelContent(id component.FocusID) string {
 		return m.gitPanel.View(m.cursorVisible)
 	case component.FocusCommitTree:
 		return m.commitTree.View(m.cursorVisible)
+	case component.FocusDiffFileList:
+		if m.diffView != nil {
+			return m.diffView.FileListView()
+		}
+		return ""
 	default:
 		return ""
 	}
@@ -8297,7 +8711,12 @@ func (m *AppModel) isCodePanelFocused() bool {
 }
 
 // isEditorFocused returns true when an editor pane has focus (edit mode).
+// Returns false when the diff view is active because diff pane IDs share
+// the same namespace and would falsely match editor entries.
 func (m *AppModel) isEditorFocused() bool {
+	if m.diffViewActive {
+		return false
+	}
 	c := m.focus.Current()
 	if !pane.IsPaneFocus(c) {
 		return false
@@ -8344,10 +8763,11 @@ func (m *AppModel) renderCodePanelBordered(th *theme.Theme) string {
 
 // renderGitPanelBordered renders the git explorer panel using the FileTree slot
 // dimensions with border highlight based on FocusGitPanel focus state.
-// The chord hint overlay is intentionally omitted here — in git mode,
-// the overlay only appears on the commit tree (right side).
 func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
 	content := m.gitPanel.View(m.cursorVisible)
+	if m.layout.Mode() == layout.SingleColumn {
+		content = m.overlayChordHint(content, component.FocusFileTree, th)
+	}
 	w, h := m.layout.GetPanelSize(component.FocusFileTree)
 	border := th.InactiveBorder
 	if m.focus.Current() == component.FocusGitPanel {
@@ -8367,6 +8787,38 @@ func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
 	border := th.InactiveBorder
 	if m.focus.Current() == component.FocusCommitTree {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderDiffFileListBordered renders the diff file list sidebar using the
+// FileTree slot dimensions with border highlight based on FocusDiffFileList.
+func (m *AppModel) renderDiffFileListBordered(th *theme.Theme) string {
+	content := m.diffView.FileListView()
+	w, h := m.layout.GetPanelSize(component.FocusFileTree)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusDiffFileList {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderDiffViewBordered renders the diff view using the CodeViewer slot
+// dimensions with border highlight based on FocusDiffView focus state.
+func (m *AppModel) renderDiffViewBordered(th *theme.Theme) string {
+	content := m.overlayBlockedChord(m.overlayChordHint(m.diffView.View(m.cursorVisible), component.FocusCodeViewer, th))
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	border := th.InactiveBorder
+	if m.isDiffPaneFocused() {
 		border = th.ActiveBorder
 	}
 	return border.
@@ -8398,7 +8850,9 @@ func (m *AppModel) syncFocusState() {
 
 	// Track which editor pane has focus. When focus moves to a different
 	// editor pane, update focusedPane so all helpers route correctly.
-	if pane.IsPaneFocus(current) {
+	// Skip when diff view is active — diff panes share the same PaneID
+	// namespace (starting from 1) and would falsely match editor entries.
+	if pane.IsPaneFocus(current) && !m.diffViewActive {
 		pid := pane.PaneIDFromFocus(current)
 		if _, ok := m.paneEditors[pid]; ok {
 			m.focusedPane = pid
@@ -8411,7 +8865,10 @@ func (m *AppModel) syncFocusState() {
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
 	m.codePanel.SetFocused(current == component.FocusCodeViewer && m.viewMode != ViewEdit && !m.hasPreview())
 	for id, ps := range m.paneEditors {
-		focused := current == pane.PaneFocusID(id)
+		// When diff view is active, diff pane IDs overlap with editor pane
+		// IDs (both start from 1). Force all editors unfocused to prevent
+		// false matches — diff focus is handled by the diff view block below.
+		focused := current == pane.PaneFocusID(id) && !m.diffViewActive
 		ps.editor.SetFocused(focused)
 		if !focused {
 			ps.editor.DismissAllOverlays()
@@ -8425,6 +8882,16 @@ func (m *AppModel) syncFocusState() {
 	if m.gitPanel != nil {
 		m.gitPanel.SetFocused(current == component.FocusGitPanel)
 		m.commitTree.SetFocused(current == component.FocusCommitTree)
+	}
+
+	// Diff view panels — mirrors the editor pane loop above: syncFocusState
+	// is the single source of truth for diff focus, just as it is for editors.
+	if m.diffViewActive && m.diffView != nil {
+		if pane.IsPaneFocus(current) {
+			m.diffView.SetFocusedPane(pane.PaneIDFromFocus(current))
+		}
+		m.diffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusDiffView)
+		m.diffView.SetFileListFocused(current == component.FocusDiffFileList)
 	}
 
 	// Sync warp line display for the newly focused editor.
@@ -8491,6 +8958,9 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 		}
 		switch id {
 		case component.FocusFileTree:
+			if m.diffViewActive {
+				return component.FocusDiffFileList
+			}
 			return component.FocusGitPanel
 		case component.FocusCodeViewer:
 			return component.FocusCommitTree
@@ -8535,7 +9005,7 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 		} else {
 			top = append(top, pg(left))
 		}
-		if right == component.FocusCodeViewer {
+		if right == component.FocusCodeViewer || right == component.FocusDiffView {
 			top = append(top, m.codePanelGroup())
 		} else {
 			top = append(top, pg(right))
@@ -8545,7 +9015,7 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 		switch {
 		case active == component.FocusSessionPanel:
 			top = append(top, leftSubs())
-		case active == component.FocusCodeViewer:
+		case active == component.FocusCodeViewer || active == component.FocusDiffView:
 			top = append(top, m.codePanelGroup())
 		default:
 			top = append(top, pg(active))
@@ -8560,6 +9030,11 @@ func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
 func (m *AppModel) codePanelGroup() layout.PanelGroup {
 	if m.viewMode == ViewEdit && m.paneTree != nil {
 		return layout.PanelGroup{SubPanels: m.paneTree.ToSubGrid()}
+	}
+	if m.diffViewActive && m.diffView != nil {
+		if dt := m.diffView.PaneTree(); dt != nil {
+			return layout.PanelGroup{SubPanels: dt.ToSubGrid()}
+		}
 	}
 	id := component.FocusCodeViewer
 	if m.viewMode == ViewGit {

@@ -1520,7 +1520,7 @@ var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarCreate:     {icon: "＋", label: "Create", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	toolbarMerge:      {icon: "⇞", label: "Merge", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
 	toolbarBack:       {icon: "←", label: "Back", accent: func(p theme.Palette) lipgloss.Color { return p.Foreground }},
-	toolbarDiff:       {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
+	toolbarDiff:       {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.HoverAccent }},
 	toolbarDiffOk:     {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	toolbarDiffCancel: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 }
@@ -1563,11 +1563,9 @@ func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx
 		def := toolbarDefs[id]
 		active := i == activeIdx
 		selected := focused && i == selectedIdx
-		hovered := i == hoverIdx
+		hovered := i == hoverIdx && !selected && !active
 		fg := p.Muted
-		if hovered || selected {
-			fg = p.Foreground
-		} else if active {
+		if active || selected || hovered {
 			fg = def.accent(p)
 		}
 		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
@@ -1638,9 +1636,7 @@ func renderDiffToolbar(leftButtons, rightButtons []int, selectedIdx int, focused
 		selected := focused && uIdx == selectedIdx
 		hovered := uIdx == hoverIdx
 		fg := p.Muted
-		if hovered || selected {
-			fg = p.Foreground
-		} else if active {
+		if active || selected || hovered {
 			fg = def.accent(p)
 		}
 		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)

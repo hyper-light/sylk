@@ -1183,7 +1183,19 @@ func (m *Model) toolbarButtonAtX(viewX int) int {
 // clickToolbar handles a click within the toolbar area.
 // localY is relative to the toolbar top (0 = border row, 1 = content row).
 func (m *Model) clickToolbar(viewX, localY int) tea.Cmd {
-	if localY != 1 || m.createInputActive {
+	if localY != 1 {
+		return nil
+	}
+	if m.createInputActive {
+		idx := m.toolbarButtonAtX(viewX)
+		left := m.diffToolbarLeftButtons()
+		right := m.toolbarButtons()
+		all := slices.Concat(left, right)
+		if idx >= 0 && idx < len(all) && all[idx] == toolbarCreate {
+			m.clearCreateInput()
+			m.toolbarFocused = false
+			m.viewDirty = true
+		}
 		return nil
 	}
 	idx := m.toolbarButtonAtX(viewX)
@@ -1194,9 +1206,11 @@ func (m *Model) clickToolbar(viewX, localY int) tea.Cmd {
 		m.collapseBranch()
 	}
 	if m.toolbarFocused && m.toolbarAction == idx {
+		// Re-clicking the focused button clears focus and executes its
+		// action (e.g. toggle diff mode off).
 		m.toolbarFocused = false
 		m.viewDirty = true
-		return nil
+		return m.executeToolbarAction()
 	}
 	m.toolbarFocused = true
 	m.toolbarAction = idx
@@ -2630,10 +2644,16 @@ func (m *Model) enterDiffMode() {
 
 // exitDiffMode deactivates diff selection mode and clears all selections.
 func (m *Model) exitDiffMode() {
+	if len(m.diffSelections) > 0 {
+		m.selectedIdx = m.diffSelections[0].nodeIdx
+		m.restoreDAGSelection()
+	}
 	m.diffMode = false
 	m.diffSelections = m.diffSelections[:0]
+	m.toolbarFocused = false
 	m.invalidateNodeCache()
 	m.invalidateCommitCardCache()
+	m.ensureVisible()
 	m.viewDirty = true
 }
 

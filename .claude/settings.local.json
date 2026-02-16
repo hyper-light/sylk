@@ -77,7 +77,11 @@
       "Bash(bash:*)",
       "Bash(git log:*)",
       "Bash(git -C /home/ada/Projects/sylk diff --stat HEAD)",
-      "Bash(go mod edit:*)"
+      "Bash(go mod edit:*)",
+      "Bash(git -C /home/ada/Projects/sylk log --oneline -20)",
+      "Bash(git -C /home/ada/Projects/sylk show a8b7086 --stat)",
+      "Bash(git -C /home/ada/Projects/sylk show a8b7086)",
+      "Bash(git -C /home/ada/Projects/sylk diff HEAD core/search/git/diff.go)"
     ]
   }
 }

@@ -468,3 +468,24 @@ type GitStatusMsg struct {
 	TrackedSet  map[string]struct{}
 	TrackedDirs map[string]struct{}
 }
+
+// ---------------------------------------------------------------------------
+// Diff view
+// ---------------------------------------------------------------------------
+
+// DiffViewDataMsg carries computed diff pairs from the background fetch.
+type DiffViewDataMsg struct {
+	Pairs []DiffViewPair
+	Mode  int // CompareMode (int to avoid import cycle)
+}
+
+// DiffViewPair is a wire-format diff pair for the message layer.
+type DiffViewPair struct {
+	FromHash  string
+	ToHash    string
+	FromShort string
+	ToShort   string
+	Files     []git.FileDiff
+	TotalAdd  int
+	TotalDel  int
+}

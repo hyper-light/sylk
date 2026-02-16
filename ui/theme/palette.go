@@ -28,6 +28,10 @@ type Palette struct {
 	Error   lipgloss.Color
 	Info    lipgloss.Color
 
+	// Interaction
+	HoverAccent    lipgloss.Color // Neon accent for hovered/focused interactive elements.
+	HoverAccentDim lipgloss.Color // Darker shade of HoverAccent for hover feedback.
+
 	// UI elements
 	Border       lipgloss.Color
 	BorderActive lipgloss.Color
@@ -35,6 +39,12 @@ type Palette struct {
 	Selection    lipgloss.Color // Background for persistent entry selection.
 	PopupBg      lipgloss.Color // Background for floating popups (darker than base).
 	WarpBg       lipgloss.Color // Subtle background for warp-pointed lines.
+
+	// Diff backgrounds
+	DiffAddBg   lipgloss.Color // Subtle green tint for addition lines.
+	DiffDelBg   lipgloss.Color // Subtle red tint for deletion lines.
+	DiffAddChar lipgloss.Color // Stronger green for char-level additions.
+	DiffDelChar lipgloss.Color // Stronger red for char-level deletions.
 
 	// Agent-specific (indexed by type hash for consistency)
 	AgentColors []lipgloss.Color
@@ -62,12 +72,20 @@ var DarkPalette = Palette{
 	Error:   lipgloss.Color("#f38ba8"),
 	Info:    lipgloss.Color("#89dceb"),
 
+	HoverAccent:    lipgloss.Color("#bf5fff"), // neon purple – hover/focus interactive elements
+	HoverAccentDim: lipgloss.Color("#8839ef"), // dark purple – hover feedback on interactive elements
+
 	Border:       lipgloss.Color("#45475a"),
 	BorderActive: lipgloss.Color("#89b4fa"),
 	Highlight:    lipgloss.Color("#45475a"), // surface1 – prominent transient copy feedback
 	Selection:    lipgloss.Color("#313244"), // surface0 – subtle persistent selection
 	PopupBg:      lipgloss.Color("#181825"), // mantle – darker than base for floating popups
 	WarpBg:       lipgloss.Color("#2a2040"), // dark purple tint – subtle warp line background
+
+	DiffAddBg:   lipgloss.Color("#1e2b25"), // subtle green tint over base for addition lines
+	DiffDelBg:   lipgloss.Color("#2b1e24"), // subtle red tint over base for deletion lines
+	DiffAddChar: lipgloss.Color("#243d30"), // moderate green for char-level additions
+	DiffDelChar: lipgloss.Color("#3d2430"), // moderate red for char-level deletions
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#89b4fa"), // blue - engineer
@@ -105,12 +123,20 @@ var LightPalette = Palette{
 	Error:   lipgloss.Color("#d20f39"),
 	Info:    lipgloss.Color("#04a5e5"),
 
+	HoverAccent:    lipgloss.Color("#7b2fbe"), // neon purple – hover/focus interactive elements
+	HoverAccentDim: lipgloss.Color("#5c1f99"), // dark purple – hover feedback on interactive elements
+
 	Border:       lipgloss.Color("#bcc0cc"),
 	BorderActive: lipgloss.Color("#1e66f5"),
 	Highlight:    lipgloss.Color("#dce0e8"), // crust – prominent transient copy feedback
 	Selection:    lipgloss.Color("#e6e9ef"), // mantle – subtle persistent selection
 	PopupBg:      lipgloss.Color("#dce0e8"), // crust – lighter than base for floating popups
 	WarpBg:       lipgloss.Color("#e8dff5"), // light purple tint – subtle warp line background
+
+	DiffAddBg:   lipgloss.Color("#e4f0e4"), // subtle green tint over base for addition lines
+	DiffDelBg:   lipgloss.Color("#f0e4e4"), // subtle red tint over base for deletion lines
+	DiffAddChar: lipgloss.Color("#c0dcc0"), // moderate green for char-level additions
+	DiffDelChar: lipgloss.Color("#dcc0c0"), // moderate red for char-level deletions
 
 	AgentColors: []lipgloss.Color{
 		lipgloss.Color("#1e66f5"), // blue

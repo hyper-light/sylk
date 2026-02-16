@@ -794,6 +794,15 @@ func (m *Model) SetActiveTab(tab GitTab) {
 	}
 }
 
+// FocusUncommittedOptions moves focus to the [All] options bar on the
+// Uncommitted tab. No-op if the tab is not active.
+func (m *Model) FocusUncommittedOptions() {
+	if m.activeTab == TabUncommitted {
+		m.uncommitted.optionsFocused = true
+		m.viewDirty = true
+	}
+}
+
 // selectEntry handles enter on the currently selected entry.
 func (m *Model) selectEntry() tea.Cmd {
 	if m.activeTab != TabBranches {
