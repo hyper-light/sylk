@@ -530,11 +530,8 @@ func renderEntryRow(uf UnionFileEntry, isCursor, isActive bool, width int, p the
 
 // renderUnionFileEntry renders a single file list entry:
 // [cursor] [status] icon name          +N -M
-func renderUnionFileEntry(uf UnionFileEntry, isCursor, isActive bool, width int, focused bool, p theme.Palette) string {
+func renderUnionFileEntry(uf UnionFileEntry, isCursor, isActive bool, width int, _ bool, p theme.Palette) string {
 	row := renderEntryRow(uf, isCursor, isActive, width, p)
-	if isCursor && focused {
-		row = lipgloss.NewStyle().Background(p.Selection).Render(row)
-	}
 	return padLine(row, width)
 }
 

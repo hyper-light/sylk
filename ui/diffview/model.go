@@ -192,12 +192,16 @@ func (m *Model) AdvanceSpinner() {
 // spinnerFrames are the braille spinner glyphs used during loading.
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// spinnerColor is the light sky blue used for the loading spinner glyph.
+// CSS "lightskyblue" (#87CEFA).
+var spinnerColor = lipgloss.Color("#87CEFA")
+
 // renderLoadingSpinner renders a centered "Loading diffs…" spinner
 // block of the given height. Uses the frame counter advanced by
 // AdvanceSpinner on each decor tick.
 func (m *Model) renderLoadingSpinner(height int) string {
 	frame := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
-	spinSt := lipgloss.NewStyle().Foreground(m.theme.Palette.Info)
+	spinSt := lipgloss.NewStyle().Foreground(spinnerColor)
 	textSt := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	label := spinSt.Render(frame) + " " + textSt.Render("Loading diffs…")
 	labelW := lipgloss.Width(label)
@@ -533,6 +537,81 @@ func (m *Model) loadAllPairs() {
 	m.buildPaneTree()
 	m.sizePanes()
 	m.rebuildAllPanes()
+}
+
+// ReloadPairs replaces pair data and mode while preserving open tabs and
+// the active tab selection. Tabs whose paths no longer exist in the new
+// union file list are pruned. If the previously selected path survives,
+// it stays selected; otherwise the first surviving tab is activated.
+func (m *Model) ReloadPairs(pairs []DiffPair, mode CompareMode) {
+	savedTabs := m.openTabs
+	savedPath := m.selectedPath
+	savedActiveIdx := m.activeTabIdx
+
+	m.pairs = pairs
+	m.mode = mode
+	m.pairData = make([]PairData, len(m.pairs))
+	for i, pair := range m.pairs {
+		m.pairData[i] = m.buildPairData(pair)
+	}
+	m.unionFiles = buildUnionFileList(m.pairData)
+
+	m.restoreTabs(savedTabs, savedPath, savedActiveIdx)
+	m.buildPaneTree()
+	m.sizePanes()
+	m.rebuildAllPanes()
+}
+
+// restoreTabs re-applies saved tabs, pruning any that no longer exist in
+// the union file list, and resolves the selected path and file cursor.
+func (m *Model) restoreTabs(savedTabs []string, savedPath string, savedActiveIdx int) {
+	pathSet := m.unionFilePathSet()
+	m.openTabs = pruneToSet(savedTabs, pathSet)
+
+	if len(m.openTabs) == 0 {
+		m.selectFirstFile()
+		return
+	}
+
+	m.activeTabIdx = resolveActiveTab(m.openTabs, savedPath, savedActiveIdx)
+	m.selectedPath = m.openTabs[m.activeTabIdx]
+	m.selectedFile = m.findUnionFileIdx(m.selectedPath)
+	if m.selectedFile < 0 {
+		m.selectedFile = 0
+	}
+	m.fileListDirty = true
+}
+
+// unionFilePathSet builds a set of paths from the union file list.
+func (m *Model) unionFilePathSet() map[string]struct{} {
+	set := make(map[string]struct{}, len(m.unionFiles))
+	for _, uf := range m.unionFiles {
+		set[uf.Path] = struct{}{}
+	}
+	return set
+}
+
+// pruneToSet filters paths to only those present in the set,
+// preserving order.
+func pruneToSet(paths []string, set map[string]struct{}) []string {
+	result := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := set[p]; ok {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// resolveActiveTab picks the best active tab index after pruning.
+// Prefers the tab matching savedPath; falls back to clamped savedActiveIdx.
+func resolveActiveTab(tabs []string, savedPath string, savedActiveIdx int) int {
+	for i, t := range tabs {
+		if t == savedPath {
+			return i
+		}
+	}
+	return min(savedActiveIdx, len(tabs)-1)
 }
 
 // mergeIntoEntry merges a file block's stats into an existing union entry.
@@ -879,17 +958,46 @@ func (m *Model) scrollFocusedPane(action func(*FileDiffPane)) {
 	}
 }
 
-// enterToolbarForward enters the toolbar and advances the button selection.
-func (m *Model) enterToolbarForward() {
-	m.toolbarFocused = true
-	m.toolbarAction = (m.toolbarAction + 1) % toolbarButtonCount
+// tabForward cycles Tab through file tabs then toolbar options.
+// Order: tab0 → tab1 → … → tabN → toolbar0 → … → toolbarN → tab0.
+func (m *Model) tabForward() {
+	if m.toolbarFocused {
+		if m.toolbarAction+1 < toolbarButtonCount {
+			m.toolbarAction++
+		} else {
+			m.toolbarFocused = false
+			m.switchToTab(0)
+		}
+		m.viewDirty = true
+		return
+	}
+	if m.activeTabIdx+1 < len(m.openTabs) {
+		m.switchToTab(m.activeTabIdx + 1)
+	} else {
+		m.toolbarFocused = true
+		m.toolbarAction = 0
+	}
 	m.viewDirty = true
 }
 
-// enterToolbarBackward enters the toolbar and retreats the button selection.
-func (m *Model) enterToolbarBackward() {
-	m.toolbarFocused = true
-	m.toolbarAction = (m.toolbarAction - 1 + toolbarButtonCount) % toolbarButtonCount
+// tabBackward cycles Shift+Tab in reverse through toolbar then file tabs.
+func (m *Model) tabBackward() {
+	if m.toolbarFocused {
+		if m.toolbarAction > 0 {
+			m.toolbarAction--
+		} else {
+			m.toolbarFocused = false
+			m.switchToTab(max(len(m.openTabs)-1, 0))
+		}
+		m.viewDirty = true
+		return
+	}
+	if m.activeTabIdx > 0 {
+		m.switchToTab(m.activeTabIdx - 1)
+	} else {
+		m.toolbarFocused = true
+		m.toolbarAction = toolbarButtonCount - 1
+	}
 	m.viewDirty = true
 }
 
@@ -913,11 +1021,8 @@ var diffKeyActions = map[string]func(*Model) tea.Cmd{
 	"[f":     func(m *Model) tea.Cmd { m.focusPrevPane(); return nil },
 	"]t":     func(m *Model) tea.Cmd { m.nextTab(); return nil },
 	"[t":     func(m *Model) tea.Cmd { m.prevTab(); return nil },
-	"tab":    func(m *Model) tea.Cmd { m.enterToolbarForward(); return nil },
-	"shift+tab": func(m *Model) tea.Cmd {
-		m.enterToolbarBackward()
-		return nil
-	},
+	"tab":       func(m *Model) tea.Cmd { m.tabForward(); return nil },
+	"shift+tab": func(m *Model) tea.Cmd { m.tabBackward(); return nil },
 	"t":   func(m *Model) tea.Cmd { m.toggleViewMode(); return nil },
 	"m":   func(m *Model) tea.Cmd { return m.cycleCompareMode() },
 	"q":   func(m *Model) tea.Cmd { return exitDiffViewCmd },
@@ -948,17 +1053,27 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 // toolbarKeyActions maps key strings to actions when toolbar is focused.
+// Vertical scroll keys are included so that scrolling the focused pane
+// still works while the toolbar is selected.
 var toolbarKeyActions = map[string]func(*Model) tea.Cmd{
-	"tab":       func(m *Model) tea.Cmd { m.advanceToolbarAction(); return nil },
+	"tab":       func(m *Model) tea.Cmd { m.tabForward(); return nil },
 	"l":         func(m *Model) tea.Cmd { m.advanceToolbarAction(); return nil },
 	"right":     func(m *Model) tea.Cmd { m.advanceToolbarAction(); return nil },
-	"shift+tab": func(m *Model) tea.Cmd { m.retreatToolbarAction(); return nil },
+	"shift+tab": func(m *Model) tea.Cmd { m.tabBackward(); return nil },
 	"h":         func(m *Model) tea.Cmd { m.retreatToolbarAction(); return nil },
 	"left":      func(m *Model) tea.Cmd { m.retreatToolbarAction(); return nil },
 	"esc":       func(m *Model) tea.Cmd { m.toolbarFocused = false; m.viewDirty = true; return nil },
 	"enter":     func(m *Model) tea.Cmd { return m.activateToolbarButton(m.toolbarAction) },
 	" ":         func(m *Model) tea.Cmd { return m.activateToolbarButton(m.toolbarAction) },
 	"q":         func(m *Model) tea.Cmd { return exitDiffViewCmd },
+	"j":         func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollDown(1) }); return nil },
+	"down":      func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollDown(1) }); return nil },
+	"k":         func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollUp(1) }); return nil },
+	"up":        func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollUp(1) }); return nil },
+	"pgdown":    func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollDown(fp.viewportHeight() / 2) }); return nil },
+	"ctrl+d":    func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollDown(fp.viewportHeight() / 2) }); return nil },
+	"pgup":      func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollUp(fp.viewportHeight() / 2) }); return nil },
+	"ctrl+u":    func(m *Model) tea.Cmd { m.scrollFocusedPane(func(fp *FileDiffPane) { fp.scrollUp(fp.viewportHeight() / 2) }); return nil },
 }
 
 // advanceToolbarAction moves to the next toolbar button.
@@ -1179,12 +1294,14 @@ func (m *Model) paneAtY(viewY int) *FileDiffPane {
 }
 
 // focusPaneAtY sets focus to the pane at the given view Y coordinate.
+// Clears toolbar focus so scroll keys route to the pane, not the toolbar.
 func (m *Model) focusPaneAtY(viewY int) {
 	id, ok := m.findPaneAtY(viewY)
 	if !ok || id == m.focusedPane {
 		return
 	}
 	m.focusedPane = id
+	m.toolbarFocused = false
 	m.viewDirty = true
 	m.fileListDirty = true
 }
@@ -1284,8 +1401,10 @@ func (m *Model) findAdjacentLeaf(delta int) (pane.PaneID, bool) {
 }
 
 // applyPaneFocus changes focus to the given pane and marks dirty flags.
+// Clears toolbar focus so scroll keys route to the pane, not the toolbar.
 func (m *Model) applyPaneFocus(id pane.PaneID) {
 	m.focusedPane = id
+	m.toolbarFocused = false
 	m.viewDirty = true
 	m.fileListDirty = true
 	m.rebuildFindIfActive()

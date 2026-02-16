@@ -3720,8 +3720,18 @@ func shortHash(h string) string {
 	return h
 }
 
-// enterDiffView creates the diff view model and activates it.
+// enterDiffView creates or updates the diff view model.
+// When an established (non-loading) diff view already exists, pairs and
+// mode are reloaded in place to preserve open tabs and the active tab.
 func (m *AppModel) enterDiffView(pairs []diffview.DiffPair, mode diffview.CompareMode) {
+	if m.diffViewActive && m.diffView != nil && len(m.diffView.OpenTabs()) > 0 {
+		m.diffView.ReloadPairs(pairs, mode)
+		m.syncViewState()
+		m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+		m.syncFocusState()
+		m.viewDirty = true
+		return
+	}
 	if m.diffView != nil {
 		m.diffView.Close()
 	}
