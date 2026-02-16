@@ -9,110 +9,62 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// renderDiffHeader renders the pinned header: hash range + total stats + divider.
-func renderDiffHeader(pair DiffPair, width int, p theme.Palette) string {
+// ---------------------------------------------------------------------------
+// Pair pane header
+// ---------------------------------------------------------------------------
+
+// renderPairPaneHeader renders a pane header showing the pair's hash range
+// and per-file stats for the selected file within this pair. When focused,
+// the hash text uses Primary+bold and the rule uses BorderActive.
+func renderPairPaneHeader(pair DiffPair, pd PairData, selectedPath string, width int, p theme.Palette, focused bool) string {
 	hashSt := lipgloss.NewStyle().Foreground(p.Muted)
-	addSt := lipgloss.NewStyle().Foreground(p.Success)
-	delSt := lipgloss.NewStyle().Foreground(p.Error)
-	divSt := lipgloss.NewStyle().Foreground(p.Border)
-
-	hashText := hashSt.Render(pair.FromShort + " → " + pair.ToShort)
-	stats := addSt.Render(fmt.Sprintf("+%d", pair.TotalAdd)) + " " +
-		delSt.Render(fmt.Sprintf("-%d", pair.TotalDel))
-
-	hashW := lipgloss.Width(hashText)
-	statsW := lipgloss.Width(stats)
-	gap := max(width-hashW-statsW-2, 0) // 1 space padding each side
-
-	row := " " + hashText + strings.Repeat(" ", gap) + stats + " "
-	row = clampLine(row, width)
-
-	divider := divSt.Render(strings.Repeat("─", width))
-	return row + "\n" + divider
-}
-
-// renderFileBlockHeader renders a file's header: name + horizontal rule + stats.
-func renderFileBlockHeader(fb FileBlock, width int, p theme.Palette) string {
-	nameSt := lipgloss.NewStyle().Bold(true)
 	ruleSt := lipgloss.NewStyle().Foreground(p.Border)
-	addSt := lipgloss.NewStyle().Foreground(p.Success)
-	delSt := lipgloss.NewStyle().Foreground(p.Error)
-
-	// Color filename by status.
-	switch fb.Status {
-	case "A":
-		nameSt = nameSt.Foreground(p.Success)
-	case "M":
-		nameSt = nameSt.Foreground(p.Warning)
-	case "D":
-		nameSt = nameSt.Foreground(p.Error)
-	case "R", "C":
-		nameSt = nameSt.Foreground(p.Teal)
-	default:
-		nameSt = nameSt.Foreground(p.Foreground)
+	if focused {
+		hashSt = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+		ruleSt = lipgloss.NewStyle().Foreground(p.BorderActive)
 	}
 
-	displayName := fb.Path
-	if fb.OldPath != "" && fb.OldPath != fb.Path {
-		displayName = fb.OldPath + " → " + fb.Path
-	}
+	hashText := hashSt.Render(" " + pair.FromShort + " \u2192 " + pair.ToShort + " ")
+	hashW := lipgloss.Width(hashText)
 
-	name := nameSt.Render(" " + displayName + " ")
-	nameW := lipgloss.Width(name)
-
-	var statsStr string
-	if fb.Additions > 0 {
-		statsStr += addSt.Render(fmt.Sprintf("+%d", fb.Additions))
-	}
-	if fb.Deletions > 0 {
-		if statsStr != "" {
-			statsStr += " "
-		}
-		statsStr += delSt.Render(fmt.Sprintf("-%d", fb.Deletions))
-	}
-	statsStr += " "
+	statsStr := renderPairStats(pd, selectedPath, p) + " "
 	statsW := lipgloss.Width(statsStr)
 
-	ruleLen := max(width-nameW-statsW, 0)
-	rule := ruleSt.Render(strings.Repeat("─", ruleLen))
+	ruleLen := max(width-hashW-statsW, 0)
+	rule := ruleSt.Render(strings.Repeat("\u2500", ruleLen))
 
-	return clampLine(name+rule+statsStr, width)
+	return clampLine(hashText+rule+statsStr, width)
 }
 
-// renderFocusedFileBlockHeader renders a file header with a focus accent:
-// BorderActive colored rule and Primary foreground for the filename.
-func renderFocusedFileBlockHeader(fb FileBlock, width int, p theme.Palette) string {
-	nameSt := lipgloss.NewStyle().Bold(true).Foreground(p.Primary)
-	ruleSt := lipgloss.NewStyle().Foreground(p.BorderActive)
+// renderPairStats builds the "+N -M" stats string for the selected file
+// within a pair, or "no changes" if the file is absent from the pair.
+func renderPairStats(pd PairData, selectedPath string, p theme.Palette) string {
+	idx, ok := pd.PathIndex[selectedPath]
+	if !ok {
+		noChangeSt := lipgloss.NewStyle().Foreground(p.Muted).Italic(true)
+		return noChangeSt.Render("no changes")
+	}
+	return formatAddDel(pd.Blocks[idx].Additions, pd.Blocks[idx].Deletions, p)
+}
+
+// formatAddDel formats additions and deletions as styled "+N -M" text.
+// Returns an empty string when both counts are zero.
+func formatAddDel(additions, deletions int, p theme.Palette) string {
 	addSt := lipgloss.NewStyle().Foreground(p.Success)
 	delSt := lipgloss.NewStyle().Foreground(p.Error)
-
-	displayName := fb.Path
-	if fb.OldPath != "" && fb.OldPath != fb.Path {
-		displayName = fb.OldPath + " → " + fb.Path
+	var parts []string
+	if additions > 0 {
+		parts = append(parts, addSt.Render(fmt.Sprintf("+%d", additions)))
 	}
-
-	name := nameSt.Render(" " + displayName + " ")
-	nameW := lipgloss.Width(name)
-
-	var statsStr string
-	if fb.Additions > 0 {
-		statsStr += addSt.Render(fmt.Sprintf("+%d", fb.Additions))
+	if deletions > 0 {
+		parts = append(parts, delSt.Render(fmt.Sprintf("-%d", deletions)))
 	}
-	if fb.Deletions > 0 {
-		if statsStr != "" {
-			statsStr += " "
-		}
-		statsStr += delSt.Render(fmt.Sprintf("-%d", fb.Deletions))
-	}
-	statsStr += " "
-	statsW := lipgloss.Width(statsStr)
-
-	ruleLen := max(width-nameW-statsW, 0)
-	rule := ruleSt.Render(strings.Repeat("─", ruleLen))
-
-	return clampLine(name+rule+statsStr, width)
+	return strings.Join(parts, " ")
 }
+
+// ---------------------------------------------------------------------------
+// Gutter helpers
+// ---------------------------------------------------------------------------
 
 // gutterWidth returns the column width needed for line numbers.
 func gutterWidth(maxLine int) int {
@@ -121,6 +73,38 @@ func gutterWidth(maxLine int) int {
 	}
 	return int(math.Log10(float64(maxLine))) + 1
 }
+
+// renderGutter formats a line number in a fixed-width gutter.
+// Returns spaces if lineNo is 0 (absent side).
+func renderGutter(lineNo, width int, style lipgloss.Style) string {
+	if lineNo == 0 {
+		return strings.Repeat(" ", width)
+	}
+	s := fmt.Sprintf("%*d", width, lineNo)
+	return style.Render(s)
+}
+
+// gutterForRow returns the old and new gutter strings for a given wrapped
+// row index. Row 0 uses the real gutters; continuation rows use emptyGutter.
+func gutterForRow(r int, oldGutter, newGutter, emptyGutter string) (string, string) {
+	if r == 0 {
+		return oldGutter, newGutter
+	}
+	return emptyGutter, emptyGutter
+}
+
+// rowOrFill returns the content at idx from rows, or fill when idx is
+// out of range.
+func rowOrFill(rows []string, idx int, fill string) string {
+	if idx < len(rows) {
+		return rows[idx]
+	}
+	return fill
+}
+
+// ---------------------------------------------------------------------------
+// Side-by-side rendering
+// ---------------------------------------------------------------------------
 
 // renderSideBySide renders aligned lines in side-by-side mode with syntax
 // highlighting foreground, diff background tinting, char-level annotation
@@ -136,10 +120,10 @@ func renderSideBySide(
 	p theme.Palette,
 ) ([]string, []int) {
 	gw := max(gutterWidth(maxOldLine), gutterWidth(maxNewLine))
-	divider := lipgloss.NewStyle().Foreground(p.Border).Render("│")
+	divider := lipgloss.NewStyle().Foreground(p.Border).Render("\u2502")
 
 	// Each side: gutter + space + content.
-	// Layout: [old_gutter] [old_content] │ [new_gutter] [new_content]
+	// Layout: [old_gutter] [old_content] | [new_gutter] [new_content]
 	sideWidth := (width - 1) / 2 // -1 for center divider
 	contentWidth := max(sideWidth-gw-1, 1)
 
@@ -157,70 +141,92 @@ func renderSideBySide(
 			result = append(result, clampLine(line, width))
 			continue
 		}
-
 		oldGutter := renderGutter(al.OldLineNo, gw, gutterSt)
 		newGutter := renderGutter(al.NewLineNo, gw, gutterSt)
-
-		var oldRows, newRows []string
-
-		switch al.Kind {
-		case DiffLineContext:
-			oldRows = wrapContextContent(
-				al.OldText, fh.OldRegions[al.OldLineNo],
-				syntaxStyles, defaultSt, contentWidth,
-			)
-			newRows = wrapContextContent(
-				al.NewText, fh.NewRegions[al.NewLineNo],
-				syntaxStyles, defaultSt, contentWidth,
-			)
-
-		case DiffLineDeleted:
-			oldRows = wrapDiffContent(
-				al.OldText, fh.OldRegions[al.OldLineNo], al.OldAnnotations,
-				syntaxStyles, defaultSt, p.DiffDelBg, p.DiffDelChar, contentWidth,
-			)
-
-		case DiffLineAdded:
-			newRows = wrapDiffContent(
-				al.NewText, fh.NewRegions[al.NewLineNo], al.NewAnnotations,
-				syntaxStyles, defaultSt, p.DiffAddBg, p.DiffAddChar, contentWidth,
-			)
-
-		case DiffLineModified:
-			oldRows = wrapDiffContent(
-				al.OldText, fh.OldRegions[al.OldLineNo], al.OldAnnotations,
-				syntaxStyles, defaultSt, p.DiffDelBg, p.DiffDelChar, contentWidth,
-			)
-			newRows = wrapDiffContent(
-				al.NewText, fh.NewRegions[al.NewLineNo], al.NewAnnotations,
-				syntaxStyles, defaultSt, p.DiffAddBg, p.DiffAddChar, contentWidth,
-			)
-		}
-
-		rowCount := max(len(oldRows), len(newRows))
-		for r := range rowCount {
-			og, ng := emptyGutter, emptyGutter
-			if r == 0 {
-				og = oldGutter
-				ng = newGutter
-			}
-
-			oldContent, newContent := emptyFill, emptyFill
-			if r < len(oldRows) {
-				oldContent = oldRows[r]
-			}
-			if r < len(newRows) {
-				newContent = newRows[r]
-			}
-
-			oldSide := clampLine(og+" "+oldContent, sideWidth)
-			newSide := clampLine(ng+" "+newContent, sideWidth)
-
-			result = append(result, clampLine(oldSide+divider+newSide, width))
-		}
+		oldRows := sbsOldSide(al, fh, syntaxStyles, defaultSt, p, contentWidth)
+		newRows := sbsNewSide(al, fh, syntaxStyles, defaultSt, p, contentWidth)
+		result = append(result, assembleSBSRows(oldRows, newRows, oldGutter, newGutter, emptyGutter, emptyFill, sideWidth, divider, width)...)
 	}
 	return result, hunkStarts
 }
+
+// sbsOldSide wraps the old (left) side content for a single aligned line.
+// Returns nil for Added lines which have no old-side content.
+func sbsOldSide(
+	al AlignedLine,
+	fh FileHighlight,
+	syntaxStyles map[theme.SyntaxCategory]lipgloss.Style,
+	defaultSt lipgloss.Style,
+	p theme.Palette,
+	contentWidth int,
+) []string {
+	if al.Kind == DiffLineContext {
+		return wrapContextContent(
+			al.OldText, fh.OldRegions[al.OldLineNo],
+			syntaxStyles, defaultSt, contentWidth,
+		)
+	}
+	if al.Kind == DiffLineAdded {
+		return nil
+	}
+	// Deleted or Modified — old side uses deletion colors.
+	return wrapDiffContent(
+		al.OldText, fh.OldRegions[al.OldLineNo], al.OldAnnotations,
+		syntaxStyles, defaultSt, p.DiffDelBg, p.DiffDelChar, contentWidth,
+	)
+}
+
+// sbsNewSide wraps the new (right) side content for a single aligned line.
+// Returns nil for Deleted lines which have no new-side content.
+func sbsNewSide(
+	al AlignedLine,
+	fh FileHighlight,
+	syntaxStyles map[theme.SyntaxCategory]lipgloss.Style,
+	defaultSt lipgloss.Style,
+	p theme.Palette,
+	contentWidth int,
+) []string {
+	if al.Kind == DiffLineContext {
+		return wrapContextContent(
+			al.NewText, fh.NewRegions[al.NewLineNo],
+			syntaxStyles, defaultSt, contentWidth,
+		)
+	}
+	if al.Kind == DiffLineDeleted {
+		return nil
+	}
+	// Added or Modified — new side uses addition colors.
+	return wrapDiffContent(
+		al.NewText, fh.NewRegions[al.NewLineNo], al.NewAnnotations,
+		syntaxStyles, defaultSt, p.DiffAddBg, p.DiffAddChar, contentWidth,
+	)
+}
+
+// assembleSBSRows combines wrapped old and new rows into full-width
+// side-by-side lines, padding shorter sides with empty fill.
+func assembleSBSRows(
+	oldRows, newRows []string,
+	oldGutter, newGutter, emptyGutter, emptyFill string,
+	sideWidth int,
+	divider string,
+	width int,
+) []string {
+	rowCount := max(len(oldRows), len(newRows))
+	result := make([]string, rowCount)
+	for r := range rowCount {
+		og, ng := gutterForRow(r, oldGutter, newGutter, emptyGutter)
+		oldContent := rowOrFill(oldRows, r, emptyFill)
+		newContent := rowOrFill(newRows, r, emptyFill)
+		oldSide := clampLine(og+" "+oldContent, sideWidth)
+		newSide := clampLine(ng+" "+newContent, sideWidth)
+		result[r] = clampLine(oldSide+divider+newSide, width)
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Unified rendering
+// ---------------------------------------------------------------------------
 
 // renderUnified renders aligned lines in unified diff mode with syntax
 // highlighting foreground, diff background tinting, char-level annotation
@@ -247,66 +253,109 @@ func renderUnified(
 	for _, al := range lines {
 		if al.Kind == DiffLineHunkSep {
 			hunkStarts = append(hunkStarts, len(result))
-			result = append(result, strings.Repeat(" ", width))
-			continue
 		}
-
-		switch al.Kind {
-		case DiffLineContext:
-			og := renderGutter(al.OldLineNo, gw, gutterSt)
-			ng := renderGutter(al.NewLineNo, gw, gutterSt)
-			rows := wrapContextContent(
-				al.OldText, fh.OldRegions[al.OldLineNo],
-				syntaxStyles, defaultSt, contentWidth,
-			)
-			appendUnifiedRows(&result, rows, og, ng, emptyGutter, width)
-
-		case DiffLineDeleted:
-			og := renderGutter(al.OldLineNo, gw, gutterSt)
-			rows := wrapDiffContent(
-				al.OldText, fh.OldRegions[al.OldLineNo], al.OldAnnotations,
-				syntaxStyles, defaultSt, p.DiffDelBg, p.DiffDelChar, contentWidth,
-			)
-			appendUnifiedRows(&result, rows, og, emptyGutter, emptyGutter, width)
-
-		case DiffLineAdded:
-			ng := renderGutter(al.NewLineNo, gw, gutterSt)
-			rows := wrapDiffContent(
-				al.NewText, fh.NewRegions[al.NewLineNo], al.NewAnnotations,
-				syntaxStyles, defaultSt, p.DiffAddBg, p.DiffAddChar, contentWidth,
-			)
-			appendUnifiedRows(&result, rows, emptyGutter, ng, emptyGutter, width)
-
-		case DiffLineModified:
-			og := renderGutter(al.OldLineNo, gw, gutterSt)
-			oldRows := wrapDiffContent(
-				al.OldText, fh.OldRegions[al.OldLineNo], al.OldAnnotations,
-				syntaxStyles, defaultSt, p.DiffDelBg, p.DiffDelChar, contentWidth,
-			)
-			appendUnifiedRows(&result, oldRows, og, emptyGutter, emptyGutter, width)
-
-			ng := renderGutter(al.NewLineNo, gw, gutterSt)
-			newRows := wrapDiffContent(
-				al.NewText, fh.NewRegions[al.NewLineNo], al.NewAnnotations,
-				syntaxStyles, defaultSt, p.DiffAddBg, p.DiffAddChar, contentWidth,
-			)
-			appendUnifiedRows(&result, newRows, emptyGutter, ng, emptyGutter, width)
-		}
+		result = append(result, renderUnifiedAlignedLine(al, fh, gw, gutterSt, syntaxStyles, defaultSt, emptyGutter, p, contentWidth, width)...)
 	}
 	return result, hunkStarts
 }
 
-// appendUnifiedRows appends wrapped content rows to the result slice.
+// renderUnifiedAlignedLine renders a single aligned line (including hunk
+// separators) into one or more display rows for unified mode.
+func renderUnifiedAlignedLine(
+	al AlignedLine,
+	fh FileHighlight,
+	gw int,
+	gutterSt lipgloss.Style,
+	syntaxStyles map[theme.SyntaxCategory]lipgloss.Style,
+	defaultSt lipgloss.Style,
+	emptyGutter string,
+	p theme.Palette,
+	contentWidth, width int,
+) []string {
+	if al.Kind == DiffLineHunkSep {
+		return []string{strings.Repeat(" ", width)}
+	}
+	old := unifiedOldLines(al, fh, gw, gutterSt, syntaxStyles, defaultSt, emptyGutter, p, contentWidth, width)
+	new := unifiedNewLines(al, fh, gw, gutterSt, syntaxStyles, defaultSt, emptyGutter, p, contentWidth, width)
+	return append(old, new...)
+}
+
+// unifiedOldLines renders the old-side portion of an aligned line for
+// unified mode. Returns nil for Added lines which have no old-side content.
+// Context lines emit both gutters on the old-side row.
+func unifiedOldLines(
+	al AlignedLine,
+	fh FileHighlight,
+	gw int,
+	gutterSt lipgloss.Style,
+	syntaxStyles map[theme.SyntaxCategory]lipgloss.Style,
+	defaultSt lipgloss.Style,
+	emptyGutter string,
+	p theme.Palette,
+	contentWidth, width int,
+) []string {
+	if al.Kind == DiffLineContext {
+		og := renderGutter(al.OldLineNo, gw, gutterSt)
+		ng := renderGutter(al.NewLineNo, gw, gutterSt)
+		rows := wrapContextContent(
+			al.OldText, fh.OldRegions[al.OldLineNo],
+			syntaxStyles, defaultSt, contentWidth,
+		)
+		return formatUnifiedRows(rows, og, ng, emptyGutter, width)
+	}
+	if al.Kind == DiffLineAdded {
+		return nil
+	}
+	// Deleted or Modified — old side uses deletion colors.
+	og := renderGutter(al.OldLineNo, gw, gutterSt)
+	rows := wrapDiffContent(
+		al.OldText, fh.OldRegions[al.OldLineNo], al.OldAnnotations,
+		syntaxStyles, defaultSt, p.DiffDelBg, p.DiffDelChar, contentWidth,
+	)
+	return formatUnifiedRows(rows, og, emptyGutter, emptyGutter, width)
+}
+
+// unifiedNewLines renders the new-side portion of an aligned line for
+// unified mode. Returns nil for Context and Deleted lines.
+func unifiedNewLines(
+	al AlignedLine,
+	fh FileHighlight,
+	gw int,
+	gutterSt lipgloss.Style,
+	syntaxStyles map[theme.SyntaxCategory]lipgloss.Style,
+	defaultSt lipgloss.Style,
+	emptyGutter string,
+	p theme.Palette,
+	contentWidth, width int,
+) []string {
+	if al.Kind != DiffLineAdded && al.Kind != DiffLineModified {
+		return nil
+	}
+	ng := renderGutter(al.NewLineNo, gw, gutterSt)
+	rows := wrapDiffContent(
+		al.NewText, fh.NewRegions[al.NewLineNo], al.NewAnnotations,
+		syntaxStyles, defaultSt, p.DiffAddBg, p.DiffAddChar, contentWidth,
+	)
+	return formatUnifiedRows(rows, emptyGutter, ng, emptyGutter, width)
+}
+
+// formatUnifiedRows formats wrapped content rows with gutter prefixes.
 // The first row uses g1 and g2 as gutters; continuation rows use contGutter.
-func appendUnifiedRows(result *[]string, rows []string, g1, g2, contGutter string, width int) {
+func formatUnifiedRows(rows []string, g1, g2, contGutter string, width int) []string {
+	out := make([]string, len(rows))
 	for i, content := range rows {
 		left, right := g1, g2
 		if i > 0 {
 			left, right = contGutter, contGutter
 		}
-		*result = append(*result, clampLine(left+" "+right+" "+content, width))
+		out[i] = clampLine(left+" "+right+" "+content, width)
 	}
+	return out
 }
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 // clampLine truncates a styled line to width and pads with spaces if short.
 func clampLine(s string, width int) string {
@@ -315,16 +364,6 @@ func clampLine(s string, width int) string {
 		s += strings.Repeat(" ", width-vis)
 	}
 	return s
-}
-
-// renderGutter formats a line number in a fixed-width gutter.
-// Returns spaces if lineNo is 0 (absent side).
-func renderGutter(lineNo, width int, style lipgloss.Style) string {
-	if lineNo == 0 {
-		return strings.Repeat(" ", width)
-	}
-	s := fmt.Sprintf("%*d", width, lineNo)
-	return style.Render(s)
 }
 
 // byteOffsetToRuneOffset converts a byte offset to a rune index.
@@ -337,19 +376,4 @@ func byteOffsetToRuneOffset(s string, byteOff int) int {
 		runeIdx++
 	}
 	return runeIdx
-}
-
-// maxLineNo returns the highest line number across all aligned lines.
-func maxLineNo(blocks []FileBlock) (maxOld, maxNew int) {
-	for _, fb := range blocks {
-		for _, al := range fb.Lines {
-			if al.OldLineNo > maxOld {
-				maxOld = al.OldLineNo
-			}
-			if al.NewLineNo > maxNew {
-				maxNew = al.NewLineNo
-			}
-		}
-	}
-	return
 }

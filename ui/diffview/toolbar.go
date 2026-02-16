@@ -43,6 +43,154 @@ func tbCellWidth(id int) int {
 	return lipgloss.Width(" " + def.icon + " " + def.label + " ")
 }
 
+// btnCell is a styled toolbar button cell with its rendered content and width.
+type btnCell struct {
+	inner string
+	width int
+}
+
+// sbsToActiveIdx converts the side-by-side flag to the active button index
+// within the right group (0 for side-by-side, 1 for unified).
+func sbsToActiveIdx(sideBySide bool) int {
+	if sideBySide {
+		return 0
+	}
+	return 1
+}
+
+// isHighlighted returns true when any of the three state flags is set.
+func isHighlighted(active, selected, hovered bool) bool {
+	if active {
+		return true
+	}
+	if selected {
+		return true
+	}
+	return hovered
+}
+
+// accentOrMuted returns the button's accent color when highlighted,
+// or the muted palette color otherwise.
+func accentOrMuted(id int, highlighted bool, p theme.Palette) lipgloss.Color {
+	if highlighted {
+		return tbDefs[id].accent(p)
+	}
+	return p.Muted
+}
+
+// buildToolbarCells builds styled button cells for a group of toolbar buttons.
+func buildToolbarCells(ids []int, offset, activeInGroup int, focused bool,
+	selectedIdx, hoverIdx int, p theme.Palette) []btnCell {
+
+	cells := make([]btnCell, len(ids))
+	for i, id := range ids {
+		def := tbDefs[id]
+		uIdx := offset + i
+		active := i == activeInGroup
+		selected := focused && uIdx == selectedIdx
+		fg := accentOrMuted(id, isHighlighted(active, selected, uIdx == hoverIdx), p)
+		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
+		cells[i] = btnCell{inner: " " + text + " ", width: tbCellWidth(id)}
+	}
+	return cells
+}
+
+// cellWidths extracts the width of each button cell into an int slice.
+func cellWidths(cells []btnCell) []int {
+	ws := make([]int, len(cells))
+	for i, c := range cells {
+		ws[i] = c.width
+	}
+	return ws
+}
+
+// sumWidths returns the total width of all button cells.
+func sumWidths(cells []btnCell) int {
+	total := 0
+	for _, c := range cells {
+		total += c.width
+	}
+	return total
+}
+
+// buildLeftBorder builds the top border for the left button group:
+// no left edge, ┬ separators between buttons, ╮ right cap.
+func buildLeftBorder(widths []int) string {
+	var b strings.Builder
+	for i, w := range widths {
+		if i > 0 {
+			b.WriteString("┬")
+		}
+		b.WriteString(strings.Repeat("─", w))
+	}
+	b.WriteString("╮")
+	return b.String()
+}
+
+// buildRightBorder builds the top border for the right button group:
+// ╭ left cap, ┬ separators between buttons.
+func buildRightBorder(widths []int) string {
+	var b strings.Builder
+	for i, w := range widths {
+		if i == 0 {
+			b.WriteString("╭")
+		} else {
+			b.WriteString("┬")
+		}
+		b.WriteString(strings.Repeat("─", w))
+	}
+	return b.String()
+}
+
+// padToWidth appends spaces to s until it reaches the given visual width.
+func padToWidth(s string, width int) string {
+	if vis := lipgloss.Width(s); vis < width {
+		return s + strings.Repeat(" ", width-vis)
+	}
+	return s
+}
+
+// renderToolbarBorderRow builds the top border row with left and right groups
+// separated by a gap.
+func renderToolbarBorderRow(lWidths, rWidths []int, width int, bSt lipgloss.Style) string {
+	left := bSt.Render(buildLeftBorder(lWidths))
+	right := bSt.Render(buildRightBorder(rWidths))
+	gap := max(width-lipgloss.Width(left)-lipgloss.Width(right), 0)
+	return padToWidth(left+strings.Repeat(" ", gap)+right, width)
+}
+
+// joinCellsSep joins button cells with a separator between them (no leading separator).
+func joinCellsSep(cells []btnCell, sep string) string {
+	var b strings.Builder
+	for i, c := range cells {
+		if i > 0 {
+			b.WriteString(sep)
+		}
+		b.WriteString(c.inner)
+	}
+	return b.String()
+}
+
+// prefixedCells joins button cells with a separator before each cell.
+func prefixedCells(cells []btnCell, sep string) string {
+	var b strings.Builder
+	for _, c := range cells {
+		b.WriteString(sep)
+		b.WriteString(c.inner)
+	}
+	return b.String()
+}
+
+// renderToolbarContentRow builds the content row with left and right button
+// groups separated by a gap.
+func renderToolbarContentRow(lCells, rCells []btnCell, rGroupWidth, width int, bSt lipgloss.Style) string {
+	sep := bSt.Render("│")
+	left := joinCellsSep(lCells, sep) + sep
+	gap := max(width-lipgloss.Width(left)-rGroupWidth, 0)
+	right := prefixedCells(rCells, sep)
+	return padToWidth(left+strings.Repeat(" ", gap)+right, width)
+}
+
 // renderToolbar renders the diff view toolbar with two groups:
 // left (compare modes, no left edge) and right (view mode toggle + close).
 // Matches the committree renderDiffToolbar pattern: left group has no left
@@ -51,111 +199,80 @@ func renderToolbar(mode CompareMode, sideBySide bool, focused bool,
 	selectedIdx int, hoverIdx int, width int, p theme.Palette) string {
 
 	bSt := lipgloss.NewStyle().Foreground(p.Border)
-
 	leftIDs := []int{tbChain, tbAllFirst, tbPairs}
 	rightIDs := []int{tbSBS, tbUnified, tbClose}
 
-	// Determine active buttons.
-	leftActive := int(mode) // 0=chain, 1=allFirst, 2=pairs
-	var rightActive int
-	if sideBySide {
-		rightActive = 0 // tbSBS index within right group
-	} else {
-		rightActive = 1 // tbUnified index within right group
-	}
+	lCells := buildToolbarCells(leftIDs, 0, int(mode), focused, selectedIdx, hoverIdx, p)
+	rCells := buildToolbarCells(rightIDs, len(leftIDs), sbsToActiveIdx(sideBySide), focused, selectedIdx, hoverIdx, p)
 
-	// Measure button groups.
-	type btnCell struct {
-		inner string
-		width int
-	}
+	lWidths := cellWidths(lCells)
+	rWidths := cellWidths(rCells)
 
-	buildCells := func(ids []int, offset int, activeInGroup int) ([]btnCell, []int, int) {
-		cells := make([]btnCell, len(ids))
-		widths := make([]int, len(ids))
-		total := 0
-		for i, id := range ids {
-			def := tbDefs[id]
-			w := tbCellWidth(id)
-			uIdx := offset + i
-			active := i == activeInGroup
-			selected := focused && uIdx == selectedIdx
-			hovered := uIdx == hoverIdx
-			fg := p.Muted
-			if active || selected || hovered {
-				fg = def.accent(p)
-			}
-			text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
-			padded := " " + text + " "
-			cells[i] = btnCell{inner: padded, width: w}
-			widths[i] = w
-			total += w
+	row1 := renderToolbarBorderRow(lWidths, rWidths, width, bSt)
+	row2 := renderToolbarContentRow(lCells, rCells, len(rCells)+sumWidths(rCells), width, bSt)
+	return row1 + "\n" + row2
+}
+
+// sepWidth returns 1 when a separator should precede a button at the given
+// index, or 0 otherwise. With leadingSep every button gets a separator;
+// without it only buttons after the first do.
+func sepWidth(leadingSep bool, idx int) int {
+	if leadingSep || idx > 0 {
+		return 1
+	}
+	return 0
+}
+
+// buttonSpans returns the visual column span of each button including its
+// preceding separator (if any).
+func buttonSpans(ids []int, leadingSep bool) []int {
+	spans := make([]int, len(ids))
+	for i, id := range ids {
+		spans[i] = tbCellWidth(id) + sepWidth(leadingSep, i)
+	}
+	return spans
+}
+
+// sumInts returns the sum of all values in the slice.
+func sumInts(vals []int) int {
+	total := 0
+	for _, v := range vals {
+		total += v
+	}
+	return total
+}
+
+// hitInSpans returns the index of the span that contains the relative
+// position relX, or -1 if relX falls outside all spans.
+func hitInSpans(spans []int, relX int) int {
+	col := 0
+	for i, w := range spans {
+		col += w
+		if relX < col {
+			return i
 		}
-		return cells, widths, total
 	}
+	return -1
+}
 
-	lCells, lWidths, _ := buildCells(leftIDs, 0, leftActive)
-	rCells, rWidths, rTotal := buildCells(rightIDs, len(leftIDs), rightActive)
+// rightGroupStart computes the starting column of the right button group.
+func rightGroupStart(leftIDs, rightIDs []int, width int) int {
+	lGroupWidth := sumInts(buttonSpans(leftIDs, false)) + 1 // +1 for trailing cap │
+	rGroupWidth := sumInts(buttonSpans(rightIDs, true))
+	return max(width-rGroupWidth, lGroupWidth)
+}
 
-	// Group widths: separators between + caps + cell widths.
-	rGroupWidth := len(rCells) + rTotal
-
-	// Row 1: left group top border (no left edge, right cap ╮),
-	// gap, right group top border (left cap ╭).
-	var lDiv strings.Builder
-	for i, w := range lWidths {
-		if i > 0 {
-			lDiv.WriteString("┬")
-		}
-		lDiv.WriteString(strings.Repeat("─", w))
+// hitRightGroup tests whether column x falls within the right button group
+// and returns the unified button index, or -1.
+func hitRightGroup(ids []int, offset, startCol, x int) int {
+	if x < startCol {
+		return -1
 	}
-	lDiv.WriteString("╮")
-	leftBorderStr := bSt.Render(lDiv.String())
-	leftBorderVis := lipgloss.Width(leftBorderStr)
-
-	var rDiv strings.Builder
-	for i, w := range rWidths {
-		if i == 0 {
-			rDiv.WriteString("╭")
-		} else {
-			rDiv.WriteString("┬")
-		}
-		rDiv.WriteString(strings.Repeat("─", w))
+	idx := hitInSpans(buttonSpans(ids, true), x-startCol)
+	if idx >= 0 {
+		return offset + idx
 	}
-	rightBorderStr := bSt.Render(rDiv.String())
-	rightBorderVis := lipgloss.Width(rightBorderStr)
-
-	row1Gap := max(width-leftBorderVis-rightBorderVis, 0)
-	row1Final := leftBorderStr + strings.Repeat(" ", row1Gap) + rightBorderStr
-	if vis := lipgloss.Width(row1Final); vis < width {
-		row1Final += strings.Repeat(" ", width-vis)
-	}
-
-	// Row 2: left buttons (no left separator, │ between, │ after last),
-	// gap, right buttons (│ before each).
-	var row2 strings.Builder
-	for i, c := range lCells {
-		if i > 0 {
-			row2.WriteString(bSt.Render("│"))
-		}
-		row2.WriteString(c.inner)
-	}
-	row2.WriteString(bSt.Render("│"))
-	leftContentVis := lipgloss.Width(row2.String())
-
-	row2Gap := max(width-leftContentVis-rGroupWidth, 0)
-	row2.WriteString(strings.Repeat(" ", row2Gap))
-
-	for _, c := range rCells {
-		row2.WriteString(bSt.Render("│"))
-		row2.WriteString(c.inner)
-	}
-	row2Final := row2.String()
-	if vis := lipgloss.Width(row2Final); vis < width {
-		row2Final += strings.Repeat(" ", width-vis)
-	}
-
-	return row1Final + "\n" + row2Final
+	return -1
 }
 
 // toolbarHitTest returns the unified button index for a click at column x,
@@ -164,41 +281,9 @@ func toolbarHitTest(mode CompareMode, sideBySide bool, width int, x int) int {
 	leftIDs := []int{tbChain, tbAllFirst, tbPairs}
 	rightIDs := []int{tbSBS, tbUnified, tbClose}
 
-	// Left group starts at column 0, no left separator.
-	col := 0
-	for i, id := range leftIDs {
-		w := tbCellWidth(id)
-		if i > 0 {
-			w++ // +1 for │ separator between buttons
-		}
-		if x >= col && x < col+w {
-			return i
-		}
-		col += w
+	idx := hitInSpans(buttonSpans(leftIDs, false), x)
+	if idx >= 0 {
+		return idx
 	}
-	col++ // right cap │
-
-	// Right group: calculate start position.
-	lTotal := 0
-	for _, id := range leftIDs {
-		lTotal += tbCellWidth(id)
-	}
-	lGroupWidth := len(leftIDs) + lTotal // (len-1) seps + 1 cap + cells
-	rTotal := 0
-	for _, id := range rightIDs {
-		rTotal += tbCellWidth(id)
-	}
-	rGroupWidth := len(rightIDs) + rTotal
-	rStart := max(width-rGroupWidth, lGroupWidth)
-
-	col = rStart
-	for i, id := range rightIDs {
-		w := tbCellWidth(id) + 1 // +1 for │ separator
-		if x >= col && x < col+w {
-			return len(leftIDs) + i
-		}
-		col += w
-	}
-
-	return -1
+	return hitRightGroup(rightIDs, len(leftIDs), rightGroupStart(leftIDs, rightIDs, width), x)
 }

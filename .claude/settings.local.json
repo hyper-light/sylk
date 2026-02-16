@@ -81,7 +81,13 @@
       "Bash(git -C /home/ada/Projects/sylk log --oneline -20)",
       "Bash(git -C /home/ada/Projects/sylk show a8b7086 --stat)",
       "Bash(git -C /home/ada/Projects/sylk show a8b7086)",
-      "Bash(git -C /home/ada/Projects/sylk diff HEAD core/search/git/diff.go)"
+      "Bash(git -C /home/ada/Projects/sylk diff HEAD core/search/git/diff.go)",
+      "Bash(go install:*)",
+      "Bash(gocyclo:*)",
+      "Bash(export PATH=\"$HOME/go/bin:$PATH\")",
+      "Bash(~/go/bin/gocyclo -over 3 ./ui/diffview/align.go)",
+      "Bash(~/go/bin/gocyclo:*)",
+      "Bash(gofmt:*)"
     ]
   }
 }

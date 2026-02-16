@@ -68,12 +68,46 @@ type FileBlock struct {
 	Lines []AlignedLine
 }
 
+// PairData holds pre-computed file blocks, highlights, and a path index
+// for a single diff pair.
+type PairData struct {
+	Blocks     []FileBlock
+	Highlights []FileHighlight
+	PathIndex  map[string]int // file path → index in Blocks
+}
+
+// UnionFileEntry represents a file that appears in at least one diff pair,
+// with aggregated stats across all pairs.
+type UnionFileEntry struct {
+	Path      string
+	OldPath   string
+	Status    string // highest-priority status across pairs
+	Additions int    // sum of additions across all pairs
+	Deletions int    // sum of deletions across all pairs
+	PairCount int    // number of pairs containing this file
+}
+
+// statusPriority maps git diff status codes to a priority level.
+// Higher values take precedence when merging across pairs.
+var statusPriority = map[string]int{
+	"":  0,
+	"M": 1,
+	"R": 2,
+	"C": 3,
+	"A": 4,
+	"D": 5,
+}
+
+// higherPriorityStatus returns the status with the higher priority.
+func higherPriorityStatus(a, b string) string {
+	if statusPriority[a] >= statusPriority[b] {
+		return a
+	}
+	return b
+}
+
 // ExitDiffViewMsg is emitted when the user closes the diff view.
 type ExitDiffViewMsg struct{}
-
-// FocusFileListMsg is emitted when the diff view wants to cycle focus
-// to the file list sidebar (Tab from toolbar).
-type FocusFileListMsg struct{}
 
 // ChangeCompareModeMsg is emitted when the user cycles compare mode (m key).
 // App.go re-fetches diffs with the new pairing logic.

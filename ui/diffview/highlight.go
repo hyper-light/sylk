@@ -42,6 +42,21 @@ func buildFileHighlights(blocks []FileBlock, hl *codepkg.Highlighter) []FileHigh
 	return highlights
 }
 
+// collectSideLines extracts old-side or new-side numbered lines from aligned
+// lines. The pickLine function selects the appropriate line number and text
+// from each AlignedLine; lines with lineNo <= 0 (including hunk separators)
+// are skipped.
+func collectSideLines(lines []AlignedLine, pickLine func(AlignedLine) (int, string)) []numberedLine {
+	var out []numberedLine
+	for _, al := range lines {
+		lineNo, text := pickLine(al)
+		if lineNo > 0 {
+			out = append(out, numberedLine{lineNo, text})
+		}
+	}
+	return out
+}
+
 // highlightFileBlock reconstructs old and new side content from aligned lines,
 // runs the highlighter on each side, and returns per-line-number regions.
 func highlightFileBlock(fb FileBlock, language string, hl *codepkg.Highlighter) FileHighlight {
@@ -50,23 +65,34 @@ func highlightFileBlock(fb FileBlock, language string, hl *codepkg.Highlighter) 
 		NewRegions: make(map[int][]codepkg.HighlightRegion),
 	}
 
-	// Collect old-side and new-side lines in order with their line numbers.
-	var oldLines, newLines []numberedLine
-	for _, al := range fb.Lines {
-		if al.Kind == DiffLineHunkSep {
-			continue
-		}
-		if al.OldLineNo > 0 {
-			oldLines = append(oldLines, numberedLine{al.OldLineNo, al.OldText})
-		}
-		if al.NewLineNo > 0 {
-			newLines = append(newLines, numberedLine{al.NewLineNo, al.NewText})
-		}
-	}
+	oldLines := collectSideLines(fb.Lines, func(al AlignedLine) (int, string) {
+		return al.OldLineNo, al.OldText
+	})
+	newLines := collectSideLines(fb.Lines, func(al AlignedLine) (int, string) {
+		return al.NewLineNo, al.NewText
+	})
 
 	highlightSide(oldLines, language, hl, fh.OldRegions)
 	highlightSide(newLines, language, hl, fh.NewRegions)
 	return fh
+}
+
+// extractTexts returns the text field from each numbered line.
+func extractTexts(lines []numberedLine) []string {
+	texts := make([]string, len(lines))
+	for i, nl := range lines {
+		texts[i] = nl.text
+	}
+	return texts
+}
+
+// storeRegions maps highlight regions back to their original line numbers.
+func storeRegions(lines []numberedLine, allRegions [][]codepkg.HighlightRegion, out map[int][]codepkg.HighlightRegion) {
+	for i, nl := range lines {
+		if i < len(allRegions) {
+			out[nl.lineNo] = allRegions[i]
+		}
+	}
 }
 
 // highlightSide reconstructs content from numbered lines, runs the highlighter,
@@ -75,18 +101,9 @@ func highlightSide(lines []numberedLine, language string, hl *codepkg.Highlighte
 	if len(lines) == 0 {
 		return
 	}
-	texts := make([]string, len(lines))
-	for i, nl := range lines {
-		texts[i] = nl.text
-	}
-	content := strings.Join(texts, "\n")
+	content := strings.Join(extractTexts(lines), "\n")
 	allRegions := hl.HighlightContent(content, language)
-
-	for i, nl := range lines {
-		if i < len(allRegions) && len(allRegions[i]) > 0 {
-			out[nl.lineNo] = allRegions[i]
-		}
-	}
+	storeRegions(lines, allRegions, out)
 }
 
 // numberedLine is a helper type used only within highlightFileBlock.
@@ -99,14 +116,20 @@ type numberedLine = struct {
 // Language detection (extension → grammar name)
 // ---------------------------------------------------------------------------
 
+// extractExtension returns the file extension (without the dot) from a path,
+// or empty string if none exists.
+func extractExtension(filePath string) string {
+	dot := strings.LastIndex(filePath, ".")
+	if dot < 0 {
+		return ""
+	}
+	return filePath[dot+1:]
+}
+
 // langFromPath returns the tree-sitter grammar name for a file path.
 // Uses a direct extension map to avoid importing core/treesitter.
 func langFromPath(filePath string) string {
-	dot := strings.LastIndex(filePath, ".")
-	if dot < 0 || dot == len(filePath)-1 {
-		return ""
-	}
-	ext := filePath[dot+1:]
+	ext := extractExtension(filePath)
 	lang, ok := extToLang[ext]
 	if !ok {
 		return ""
@@ -213,6 +236,45 @@ func displayWidthRuneLimit(runes []rune, maxWidth int) int {
 	return len(runes)
 }
 
+// lookupStyle returns the syntax style for a category, falling back to defaultSt.
+func lookupStyle(styles map[theme.SyntaxCategory]lipgloss.Style, cat theme.SyntaxCategory, defaultSt lipgloss.Style) lipgloss.Style {
+	if s, ok := styles[cat]; ok {
+		return s
+	}
+	return defaultSt
+}
+
+// appendRegionSegment appends a gap segment (if needed) and the region segment
+// for a single highlight region. Returns the updated cursor position and
+// segments slice.
+func appendRegionSegment(
+	segments []diffSegment,
+	cursor, start, end int,
+	style, defaultSt lipgloss.Style,
+) ([]diffSegment, int) {
+	if cursor < start {
+		segments = append(segments, diffSegment{cursor, start, defaultSt, false})
+	}
+	segments = append(segments, diffSegment{start, end, style, false})
+	return segments, end
+}
+
+// clampRegion clamps a highlight region to [0, lineLen] and returns the
+// clamped start, end, and whether the region has positive width.
+func clampRegion(r codepkg.HighlightRegion, lineLen int) (int, int, bool) {
+	start := clampIdx(r.StartCol, lineLen)
+	end := clampIdx(r.EndCol, lineLen)
+	return start, end, start < end
+}
+
+// appendTrailingGap adds a gap segment from cursor to lineLen if needed.
+func appendTrailingGap(segments []diffSegment, cursor, lineLen int, defaultSt lipgloss.Style) []diffSegment {
+	if cursor < lineLen {
+		segments = append(segments, diffSegment{cursor, lineLen, defaultSt, false})
+	}
+	return segments
+}
+
 // buildBaseSegments creates rendering segments from highlight regions.
 // Gaps between regions use defaultSt. Mirrors code.Highlighter.buildSegments.
 func buildBaseSegments(
@@ -224,25 +286,14 @@ func buildBaseSegments(
 	segments := make([]diffSegment, 0, len(regions)*2+1)
 	cursor := 0
 	for _, r := range regions {
-		start := clampIdx(r.StartCol, lineLen)
-		end := clampIdx(r.EndCol, lineLen)
-		if start >= end {
+		start, end, ok := clampRegion(r, lineLen)
+		if !ok {
 			continue
 		}
-		if cursor < start {
-			segments = append(segments, diffSegment{cursor, start, defaultSt, false})
-		}
-		style := defaultSt
-		if s, ok := styles[r.Category]; ok {
-			style = s
-		}
-		segments = append(segments, diffSegment{start, end, style, false})
-		cursor = end
+		style := lookupStyle(styles, r.Category, defaultSt)
+		segments, cursor = appendRegionSegment(segments, cursor, start, end, style, defaultSt)
 	}
-	if cursor < lineLen {
-		segments = append(segments, diffSegment{cursor, lineLen, defaultSt, false})
-	}
-	return segments
+	return appendTrailingGap(segments, cursor, lineLen, defaultSt)
 }
 
 // markAnnotations splits segments at char-annotation boundaries, setting
@@ -258,90 +309,120 @@ func markAnnotations(segments []diffSegment, annotations []CharAnnotation) []dif
 	return result
 }
 
+// annotationOverlaps reports whether a segment and annotation overlap.
+func annotationOverlaps(seg diffSegment, a CharAnnotation) bool {
+	return seg.end > a.Start && seg.start < a.End
+}
+
+// splitSegAtOverlap splits a segment at a single overlapping annotation,
+// appending the pre-overlap gap and the overlap portion. Returns the updated
+// result slice and the remaining segment tail. The consumed flag indicates
+// whether the segment was fully consumed.
+func splitSegAtOverlap(result []diffSegment, seg diffSegment, a CharAnnotation) ([]diffSegment, diffSegment, bool) {
+	if seg.start < a.Start {
+		result = append(result, diffSegment{seg.start, a.Start, seg.style, seg.inAnnotation})
+		seg.start = a.Start
+	}
+	overlapEnd := min(seg.end, a.End)
+	result = append(result, diffSegment{seg.start, overlapEnd, seg.style, true})
+	seg.start = overlapEnd
+	return result, seg, seg.start >= seg.end
+}
+
+// applySingleAnnotation processes one annotation against the current segment.
+// Returns the updated result, remaining segment, and whether the segment was
+// fully consumed.
+func applySingleAnnotation(result []diffSegment, seg diffSegment, a CharAnnotation) ([]diffSegment, diffSegment, bool) {
+	if !annotationOverlaps(seg, a) {
+		return result, seg, false
+	}
+	return splitSegAtOverlap(result, seg, a)
+}
+
 // splitSegAtAnnotations splits a single segment at all annotation boundaries.
 func splitSegAtAnnotations(result []diffSegment, seg diffSegment, annotations []CharAnnotation) []diffSegment {
-	// For each annotation, split the segment. Since char annotations in a
-	// diff line are non-overlapping (exactly one range from prefix/suffix
-	// diffing), a single pass suffices.
 	for _, a := range annotations {
-		if seg.end <= a.Start || seg.start >= a.End {
-			continue
-		}
-		// Segment overlaps with annotation.
-		if seg.start < a.Start {
-			result = append(result, diffSegment{seg.start, a.Start, seg.style, seg.inAnnotation})
-			seg.start = a.Start
-		}
-		overlapEnd := min(seg.end, a.End)
-		result = append(result, diffSegment{seg.start, overlapEnd, seg.style, true})
-		seg.start = overlapEnd
-		if seg.start >= seg.end {
+		var consumed bool
+		result, seg, consumed = applySingleAnnotation(result, seg, a)
+		if consumed {
 			return result
 		}
 	}
-	result = append(result, seg)
-	return result
+	return append(result, seg)
+}
+
+// segmentBg returns the background color for a diff segment: charBg for
+// annotated portions, lineBg otherwise.
+func segmentBg(seg diffSegment, lineBg, charBg lipgloss.Color) lipgloss.Color {
+	if seg.inAnnotation {
+		return charBg
+	}
+	return lineBg
+}
+
+// renderDiffSegment writes a single segment with the given background to the builder.
+func renderDiffSegment(b *strings.Builder, runes []rune, seg diffSegment, bg lipgloss.Color) {
+	end := min(seg.end, len(runes))
+	style := seg.style.Background(bg)
+	b.WriteString(style.Render(string(runes[seg.start:end])))
+}
+
+// isEmptySegment reports whether a segment contributes no visible runes.
+func isEmptySegment(seg diffSegment, runeCount int) bool {
+	return seg.start >= seg.end || seg.start >= runeCount
+}
+
+// joinSegmentsDiff writes all diff segments to a builder with per-segment backgrounds.
+func joinSegmentsDiff(runes []rune, segments []diffSegment, lineBg, charBg lipgloss.Color) string {
+	var b strings.Builder
+	b.Grow(len(runes) * 4)
+	for _, seg := range segments {
+		if isEmptySegment(seg, len(runes)) {
+			continue
+		}
+		renderDiffSegment(&b, runes, seg, segmentBg(seg, lineBg, charBg))
+	}
+	return b.String()
+}
+
+// padStyledToWidth appends space padding to reach the target width using the given style.
+func padStyledToWidth(s string, width int, padStyle lipgloss.Style) string {
+	vis := lipgloss.Width(s)
+	if vis >= width {
+		return s
+	}
+	return s + padStyle.Render(strings.Repeat(" ", width-vis))
 }
 
 // renderDiffSegments renders segments with syntax foreground and diff background.
 // inAnnotation segments use charBg; others use lineBg. Truncates and pads to
 // exact width.
 func renderDiffSegments(runes []rune, segments []diffSegment, lineBg, charBg lipgloss.Color, width int) string {
-	var b strings.Builder
-	b.Grow(len(runes) * 4)
-
-	for _, seg := range segments {
-		if seg.start >= seg.end || seg.start >= len(runes) {
-			continue
-		}
-		end := min(seg.end, len(runes))
-		bg := lineBg
-		if seg.inAnnotation {
-			bg = charBg
-		}
-		style := seg.style.Background(bg)
-		b.WriteString(style.Render(string(runes[seg.start:end])))
-	}
-
-	result := b.String()
-
-	// Truncate to exact width (tab expansion can overshoot).
+	result := joinSegmentsDiff(runes, segments, lineBg, charBg)
 	result = truncateStyledLine(result, width)
-
-	// Pad remaining width with line background.
-	vis := lipgloss.Width(result)
-	if vis < width {
-		padSt := lipgloss.NewStyle().Background(lineBg)
-		result += padSt.Render(strings.Repeat(" ", width-vis))
-	}
-	return result
+	return padStyledToWidth(result, width, lipgloss.NewStyle().Background(lineBg))
 }
 
-// renderPlainSegments renders segments with syntax foreground and no background.
-// Used for context (unchanged) lines. Truncates and pads to exact width.
-func renderPlainSegments(runes []rune, segments []diffSegment, width int) string {
+// joinSegmentsPlain writes all segments to a builder with syntax foreground only.
+func joinSegmentsPlain(runes []rune, segments []diffSegment) string {
 	var b strings.Builder
 	b.Grow(len(runes) * 3)
-
 	for _, seg := range segments {
-		if seg.start >= seg.end || seg.start >= len(runes) {
+		if isEmptySegment(seg, len(runes)) {
 			continue
 		}
 		end := min(seg.end, len(runes))
 		b.WriteString(seg.style.Render(string(runes[seg.start:end])))
 	}
+	return b.String()
+}
 
-	result := b.String()
-
-	// Truncate to exact width (tab expansion can overshoot).
+// renderPlainSegments renders segments with syntax foreground and no background.
+// Used for context (unchanged) lines. Truncates and pads to exact width.
+func renderPlainSegments(runes []rune, segments []diffSegment, width int) string {
+	result := joinSegmentsPlain(runes, segments)
 	result = truncateStyledLine(result, width)
-
-	// Pad remaining width.
-	vis := lipgloss.Width(result)
-	if vis < width {
-		result += strings.Repeat(" ", width-vis)
-	}
-	return result
+	return padStyledToWidth(result, width, lipgloss.NewStyle())
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +453,14 @@ func expandDiffTabs(line string) (string, []int) {
 	return buf.String(), colMap
 }
 
+// remapOneRegion converts a single byte-offset highlight region to display
+// columns. Returns the remapped region and whether it has positive width.
+func remapOneRegion(r codepkg.HighlightRegion, rawText string, colMap []int) (codepkg.HighlightRegion, bool) {
+	startCol := safeColMap(colMap, byteOffsetToRuneOffset(rawText, r.StartCol))
+	endCol := safeColMap(colMap, byteOffsetToRuneOffset(rawText, r.EndCol))
+	return codepkg.HighlightRegion{StartCol: startCol, EndCol: endCol, Category: r.Category}, startCol < endCol
+}
+
 // remapByteRegions converts byte-offset highlight regions to display-column
 // regions using the column map from tab expansion.
 func remapByteRegions(
@@ -379,25 +468,21 @@ func remapByteRegions(
 	rawText string,
 	colMap []int,
 ) []codepkg.HighlightRegion {
-	if len(regions) == 0 {
-		return nil
-	}
 	out := make([]codepkg.HighlightRegion, 0, len(regions))
 	for _, r := range regions {
-		// Byte offset → rune index → display column.
-		startRune := byteOffsetToRuneOffset(rawText, r.StartCol)
-		endRune := byteOffsetToRuneOffset(rawText, r.EndCol)
-		startCol := safeColMap(colMap, startRune)
-		endCol := safeColMap(colMap, endRune)
-		if startCol < endCol {
-			out = append(out, codepkg.HighlightRegion{
-				StartCol: startCol,
-				EndCol:   endCol,
-				Category: r.Category,
-			})
+		if mapped, ok := remapOneRegion(r, rawText, colMap); ok {
+			out = append(out, mapped)
 		}
 	}
 	return out
+}
+
+// remapOneAnnotation converts a single byte-offset char annotation to display
+// columns. Returns the remapped annotation and whether it has positive width.
+func remapOneAnnotation(a CharAnnotation, rawText string, colMap []int) (CharAnnotation, bool) {
+	startCol := safeColMap(colMap, byteOffsetToRuneOffset(rawText, a.Start))
+	endCol := safeColMap(colMap, byteOffsetToRuneOffset(rawText, a.End))
+	return CharAnnotation{Start: startCol, End: endCol}, startCol < endCol
 }
 
 // remapByteAnnotations converts byte-offset char annotations to display-column
@@ -407,17 +492,10 @@ func remapByteAnnotations(
 	rawText string,
 	colMap []int,
 ) []CharAnnotation {
-	if len(annotations) == 0 {
-		return nil
-	}
 	out := make([]CharAnnotation, 0, len(annotations))
 	for _, a := range annotations {
-		startRune := byteOffsetToRuneOffset(rawText, a.Start)
-		endRune := byteOffsetToRuneOffset(rawText, a.End)
-		startCol := safeColMap(colMap, startRune)
-		endCol := safeColMap(colMap, endRune)
-		if startCol < endCol {
-			out = append(out, CharAnnotation{Start: startCol, End: endCol})
+		if mapped, ok := remapOneAnnotation(a, rawText, colMap); ok {
+			out = append(out, mapped)
 		}
 	}
 	return out
@@ -450,6 +528,22 @@ func clampIdx(idx, max int) int {
 // Line wrapping
 // ---------------------------------------------------------------------------
 
+// accumulateChunks walks runes accumulating display widths and emitting
+// chunk boundaries whenever the accumulated width would exceed maxWidth.
+func accumulateChunks(runes []rune, maxWidth int) [][2]int {
+	var chunks [][2]int
+	start, w := 0, 0
+	for i, r := range runes {
+		rw := runewidth.RuneWidth(r)
+		if w+rw > maxWidth {
+			chunks = append(chunks, [2]int{start, i})
+			start, w = i, 0
+		}
+		w += rw
+	}
+	return append(chunks, [2]int{start, len(runes)})
+}
+
 // splitRunesByWidth splits runes into chunks that each fit within maxWidth
 // display columns. Returns [start, end) rune indices for each chunk.
 // Always returns at least one chunk.
@@ -457,20 +551,7 @@ func splitRunesByWidth(runes []rune, maxWidth int) [][2]int {
 	if len(runes) == 0 || maxWidth <= 0 {
 		return [][2]int{{0, 0}}
 	}
-	var chunks [][2]int
-	start := 0
-	w := 0
-	for i, r := range runes {
-		rw := runewidth.RuneWidth(r)
-		if w+rw > maxWidth && i > start {
-			chunks = append(chunks, [2]int{start, i})
-			start = i
-			w = 0
-		}
-		w += rw
-	}
-	chunks = append(chunks, [2]int{start, len(runes)})
-	return chunks
+	return accumulateChunks(runes, maxWidth)
 }
 
 // clipRegions clips highlight regions to a rune range [start, end) and shifts
@@ -566,6 +647,77 @@ func wrapContextContent(
 // ANSI-aware truncation
 // ---------------------------------------------------------------------------
 
+// isCSIStart reports whether position j in s begins a CSI bracket sequence.
+func isCSIStart(s string, j int) bool {
+	return j < len(s) && s[j] == '['
+}
+
+// scanToCSIEnd advances j past CSI parameter bytes until a final byte or end
+// of string is reached. Returns the index of the final byte (or len(s)).
+func scanToCSIEnd(s string, j int) int {
+	for j < len(s) && !isCSIEnd(s[j]) {
+		j++
+	}
+	return j
+}
+
+// advancePastFinalByte returns j+1 if j is within bounds (skipping the CSI
+// final byte), or j if at end of string.
+func advancePastFinalByte(s string, j int) int {
+	if j < len(s) {
+		return j + 1
+	}
+	return j
+}
+
+// skipCSISequence scans past a CSI escape sequence starting at position i
+// in the string s. Assumes s[i] == '\x1b'. Returns the index immediately
+// after the sequence's final byte.
+func skipCSISequence(s string, i int) int {
+	j := i + 1
+	if !isCSIStart(s, j) {
+		return j
+	}
+	return advancePastFinalByte(s, scanToCSIEnd(s, j+1))
+}
+
+// truncateVisibleRunes scans non-escape runes in s starting at byte index i,
+// appending them to buf until visWidth would exceed w. Returns the final byte
+// index and accumulated visible width.
+func truncateVisibleRunes(buf *strings.Builder, s string, i, visWidth, w int) (int, int) {
+	r, size := utf8.DecodeRuneInString(s[i:])
+	rw := runewidth.RuneWidth(r)
+	if visWidth+rw > w {
+		return len(s), visWidth // signal stop by returning past end
+	}
+	buf.WriteString(s[i : i+size])
+	return i + size, visWidth + rw
+}
+
+// needsTruncation reports whether the styled string exceeds the target width.
+func needsTruncation(s string, w int) bool {
+	return w > 0 && lipgloss.Width(s) > w
+}
+
+// truncateStyledCore walks the string scanning escape sequences and visible
+// runes, stopping when the visible width reaches w.
+func truncateStyledCore(s string, w int) string {
+	var buf strings.Builder
+	visWidth := 0
+	i := 0
+	for i < len(s) {
+		if s[i] == '\x1b' {
+			j := skipCSISequence(s, i)
+			buf.WriteString(s[i:j])
+			i = j
+			continue
+		}
+		i, visWidth = truncateVisibleRunes(&buf, s, i, visWidth, w)
+	}
+	buf.WriteString("\x1b[0m")
+	return buf.String()
+}
+
 // truncateStyledLine clips a styled string (with ANSI escape codes) to fit
 // within the given visual width. Accounts for wide characters (CJK, emoji)
 // using go-runewidth. ANSI CSI sequences are preserved and a reset is appended.
@@ -573,39 +725,10 @@ func truncateStyledLine(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
-	if lipgloss.Width(s) <= w {
+	if !needsTruncation(s, w) {
 		return s
 	}
-	var buf strings.Builder
-	visWidth := 0
-	i := 0
-	for i < len(s) {
-		if s[i] == '\x1b' {
-			j := i + 1
-			if j < len(s) && s[j] == '[' {
-				j++
-				for j < len(s) && !isCSIEnd(s[j]) {
-					j++
-				}
-				if j < len(s) {
-					j++
-				}
-			}
-			buf.WriteString(s[i:j])
-			i = j
-			continue
-		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		rw := runewidth.RuneWidth(r)
-		if visWidth+rw > w {
-			break
-		}
-		buf.WriteString(s[i : i+size])
-		visWidth += rw
-		i += size
-	}
-	buf.WriteString("\x1b[0m")
-	return buf.String()
+	return truncateStyledCore(s, w)
 }
 
 // isCSIEnd reports whether b is a CSI sequence final byte (0x40–0x7E).

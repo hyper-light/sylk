@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -1062,6 +1063,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case committree.DiffCompareMsg:
 		m.diffHashes = typed.Hashes
+		m.setDiffLoading(true)
 		return m, m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
 
 	case msg.DiffViewDataMsg:
@@ -1077,6 +1079,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				TotalDel:  p.TotalDel,
 			}
 		}
+		m.setDiffLoading(false)
 		m.enterDiffView(pairs, diffview.CompareMode(typed.Mode))
 		return m, nil
 
@@ -1084,13 +1087,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.exitDiffView()
 		return m, nil
 
-	case diffview.FocusFileListMsg:
-		m.focus.SetFocus(component.FocusDiffFileList)
-		m.syncFocusState()
-		return m, nil
-
 	case diffview.ChangeCompareModeMsg:
 		if len(m.diffHashes) >= 2 {
+			m.setDiffLoading(true)
 			return m, m.fetchDiffDataCmd(m.diffHashes, typed.Mode)
 		}
 		return m, nil
@@ -1568,15 +1567,17 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
 		}
-		if m.diffViewActive && m.diffView != nil {
-			if m.focus.Current() == component.FocusDiffFileList {
-				m.exitDiffView()
-				return m, nil
-			}
-			if m.isDiffPaneFocused() {
-				cmd := m.diffView.Update(key)
-				return m, cmd
-			}
+		if m.diffViewActive && m.diffView != nil && m.focus.Current() == component.FocusDiffFileList && m.diffView.FileSearchActive() {
+			m.diffView.UpdateFileList("esc")
+			return m, nil
+		}
+		if m.diffViewActive && m.diffView != nil && m.focus.Current() == component.FocusDiffFileList {
+			m.exitDiffView()
+			return m, nil
+		}
+		if m.diffViewActive && m.diffView != nil && m.isDiffPaneFocused() {
+			cmd := m.diffView.Update(key)
+			return m, cmd
 		}
 		now := time.Now()
 		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
@@ -1690,6 +1691,32 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.lastToggleAt = now
 		m.chord = chordNone
 		m.gitPanel.ToggleSearch()
+		return m, nil
+	}
+
+	// Alt+F toggles file search when the diff file list has focus.
+	if ks == "alt+f" && m.diffViewActive && m.focus.Current() == component.FocusDiffFileList && m.diffView != nil {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.diffView.ToggleFileSearch()
+		return m, nil
+	}
+
+	// Alt+F toggles the in-file find bar when a diff pane has focus.
+	if ks == "alt+f" && m.diffViewActive && m.isDiffPaneFocused() && m.diffView != nil {
+		now := time.Now()
+		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			return m, nil
+		}
+		m.lastToggleKey = ks
+		m.lastToggleAt = now
+		m.chord = chordNone
+		m.diffView.ToggleFindBar()
 		return m, nil
 	}
 
@@ -1921,6 +1948,13 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 
 	// Commit tree loading spinner (time-based, redraws each decor tick).
 	if m.commitTree != nil && m.commitTree.NeedsDecorTick() {
+		m.comp.MarkDirty(compositor.SlotRight)
+		changed = true
+	}
+
+	// Diff view loading spinner (frame-counter, advanced each decor tick).
+	if m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick() {
+		m.diffView.AdvanceSpinner()
 		m.comp.MarkDirty(compositor.SlotRight)
 		changed = true
 	}
@@ -3601,6 +3635,7 @@ const (
 )
 
 // fetchDiffDataCmd launches an async diff fetch for the given hashes and mode.
+// Diff pairs are computed concurrently via a WaitGroup.
 func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) tea.Cmd {
 	gc := m.gitClient
 	if gc == nil || len(hashes) < 2 {
@@ -3609,33 +3644,44 @@ func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) 
 	return func() tea.Msg {
 		fromTo := buildDiffPairs(hashes, mode)
 		pairs := make([]msg.DiffViewPair, len(fromTo))
+		var wg sync.WaitGroup
+		wg.Add(len(fromTo))
 		for i, ft := range fromTo {
-			files, _ := gc.GetDiff(ft[0], ft[1])
-			totalAdd, totalDel := 0, 0
-			for _, f := range files {
-				totalAdd += f.Additions
-				totalDel += f.Deletions
-			}
-			fromInfo, _ := gc.GetCommit(ft[0])
-			toInfo, _ := gc.GetCommit(ft[1])
-			fromShort, toShort := shortHash(ft[0]), shortHash(ft[1])
-			if fromInfo != nil {
-				fromShort = fromInfo.ShortHash
-			}
-			if toInfo != nil {
-				toShort = toInfo.ShortHash
-			}
-			pairs[i] = msg.DiffViewPair{
-				FromHash:  ft[0],
-				ToHash:    ft[1],
-				FromShort: fromShort,
-				ToShort:   toShort,
-				Files:     files,
-				TotalAdd:  totalAdd,
-				TotalDel:  totalDel,
-			}
+			go func() {
+				defer wg.Done()
+				pairs[i] = fetchOneDiffPair(gc, ft)
+			}()
 		}
+		wg.Wait()
 		return msg.DiffViewDataMsg{Pairs: pairs, Mode: int(mode)}
+	}
+}
+
+// fetchOneDiffPair fetches diff data for a single (from, to) hash pair.
+func fetchOneDiffPair(gc *git.GitClient, ft [2]string) msg.DiffViewPair {
+	files, _ := gc.GetDiff(ft[0], ft[1])
+	totalAdd, totalDel := 0, 0
+	for _, f := range files {
+		totalAdd += f.Additions
+		totalDel += f.Deletions
+	}
+	fromInfo, _ := gc.GetCommit(ft[0])
+	toInfo, _ := gc.GetCommit(ft[1])
+	fromShort, toShort := shortHash(ft[0]), shortHash(ft[1])
+	if fromInfo != nil {
+		fromShort = fromInfo.ShortHash
+	}
+	if toInfo != nil {
+		toShort = toInfo.ShortHash
+	}
+	return msg.DiffViewPair{
+		FromHash:  ft[0],
+		ToHash:    ft[1],
+		FromShort: fromShort,
+		ToShort:   toShort,
+		Files:     files,
+		TotalAdd:  totalAdd,
+		TotalDel:  totalDel,
 	}
 }
 
@@ -3676,7 +3722,10 @@ func shortHash(h string) string {
 
 // enterDiffView creates the diff view model and activates it.
 func (m *AppModel) enterDiffView(pairs []diffview.DiffPair, mode diffview.CompareMode) {
-	m.diffView = diffview.New(pairs, mode, m.config.Theme())
+	if m.diffView != nil {
+		m.diffView.Close()
+	}
+	m.diffView = diffview.New(pairs, mode, m.config.Theme(), m.nerdFontsDetected)
 	m.diffViewActive = true
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
 	m.diffView.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
@@ -3702,6 +3751,25 @@ func (m *AppModel) exitDiffView() {
 	m.focus.SetFocus(component.FocusCommitTree)
 	m.syncViewState()
 	m.viewDirty = true
+}
+
+// setDiffLoading sets or clears the loading state on the active diff view.
+// When no diff view exists yet, activates the diff view in loading mode.
+func (m *AppModel) setDiffLoading(loading bool) {
+	if loading && m.diffView == nil {
+		// Create a placeholder diff view in loading state so the spinner
+		// is visible while the first fetch runs.
+		m.diffView = diffview.New(nil, diffview.CompareModeChain,
+			m.config.Theme(), m.nerdFontsDetected)
+		m.diffViewActive = true
+		w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+		m.diffView.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
+		m.syncViewState()
+	}
+	if m.diffView != nil {
+		m.diffView.SetLoading(loading)
+		m.viewDirty = true
+	}
 }
 
 // commitPageSize is the number of commits per page.
@@ -6110,24 +6178,32 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 
-	// Diff view: route left-click events to the diff view component.
+	// Diff view: route left-click events to the diff file list and diff panes.
 	// Wheel events are handled by applyScrollImpulse above.
 	if m.diffViewActive && m.diffView != nil && mouse.Button == tea.MouseButtonLeft {
+		// Diff file list (left panel, occupies the FileTree slot).
+		m.handleDiffFileListClick(mouse.X, mouse.Y)
+
+		// Diff panes / tab bar / toolbar (right panel).
 		if m.isInsideCodePanel(mouse.X, mouse.Y) {
 			panelX := m.codePanelX()
 			viewX := mouse.X - panelX - 1
 			viewY := mouse.Y - 1
+			isPaneClick := m.diffView.IsPaneClick(viewY)
 			localMouse := tea.MouseMsg{
 				X: viewX, Y: viewY,
 				Action: mouse.Action, Button: mouse.Button,
 			}
 			cmd := m.diffView.Update(localMouse)
-			// Sync app-level focus AFTER the diff view processes the click,
-			// so pane changes and toolbar actions are reflected correctly.
-			m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
-			m.syncFocusState()
+			// Only update app-level pane focus for clicks in the pane content
+			// area — tab bar and toolbar clicks should not steal pane focus.
+			if isPaneClick {
+				m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+				m.syncFocusState()
+			}
 			return cmd
 		}
+		return nil
 	}
 
 	// Git mode: route to git panel and commit tree.
@@ -6571,6 +6647,35 @@ func (m *AppModel) handleGitPanelClick(x, y int) tea.Cmd {
 	cmd := m.gitPanel.ClickAt(viewX, viewY)
 	m.syncStagedFiles()
 	return cmd
+}
+
+// handleDiffFileListClick dispatches a click inside the diff file list panel
+// (occupies the FileTree slot when the diff view is active). Sets focus and
+// opens the clicked file as a tab if the click falls within the panel bounds.
+func (m *AppModel) handleDiffFileListClick(x, y int) {
+	if m.diffView == nil {
+		return
+	}
+	panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
+	if panelW == 0 || panelH == 0 {
+		return
+	}
+	panelX := m.fileTreePanelX()
+	innerH := max(panelH-panelBorderSize, 0)
+
+	contentLeft := panelX + 1
+	contentRight := panelX + panelW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight || y < contentTop || y >= contentBottom {
+		return
+	}
+
+	localY := y - contentTop
+	m.focus.SetFocus(component.FocusDiffFileList)
+	m.syncFocusState()
+	m.diffView.ClickFileList(localY)
 }
 
 // handleCommitTreeClick dispatches a click inside the commit tree panel
@@ -7713,15 +7818,7 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		return nil
 	case component.FocusDiffFileList:
 		if m.diffViewActive && m.diffView != nil {
-			switch key.String() {
-			case "tab":
-				m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
-				m.syncFocusState()
-				return nil
-			default:
-				m.diffView.UpdateFileList(key.String())
-				return nil
-			}
+			m.diffView.UpdateFileList(key.String())
 		}
 		return nil
 	default:
@@ -8597,7 +8694,7 @@ func (m *AppModel) panelContent(id component.FocusID) string {
 		return m.commitTree.View(m.cursorVisible)
 	case component.FocusDiffFileList:
 		if m.diffView != nil {
-			return m.diffView.FileListView()
+			return m.diffView.FileListView(m.cursorVisible)
 		}
 		return ""
 	default:
@@ -8799,7 +8896,7 @@ func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
 // renderDiffFileListBordered renders the diff file list sidebar using the
 // FileTree slot dimensions with border highlight based on FocusDiffFileList.
 func (m *AppModel) renderDiffFileListBordered(th *theme.Theme) string {
-	content := m.diffView.FileListView()
+	content := m.diffView.FileListView(m.cursorVisible)
 	w, h := m.layout.GetPanelSize(component.FocusFileTree)
 	border := th.InactiveBorder
 	if m.focus.Current() == component.FocusDiffFileList {
@@ -9123,7 +9220,8 @@ func (m *AppModel) needsDecorTick() bool {
 		now.Before(m.tabArrowFlashLeftUntil) ||
 		now.Before(m.tabArrowFlashRightUntil) ||
 		(m.commitTree != nil && m.commitTree.NeedsDecorTick()) ||
-		(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick())
+		(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick()) ||
+		(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick())
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
