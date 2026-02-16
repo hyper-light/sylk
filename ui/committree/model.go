@@ -2358,14 +2358,23 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 	}
 	switch all[m.toolbarAction] {
 	case toolbarCreate:
+		if m.diffMode {
+			m.exitBranchDiffMode()
+		}
 		m.activateCreateInput()
 		return nil
 	case toolbarMerge:
+		if m.diffMode {
+			m.exitBranchDiffMode()
+		}
 		if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
 			name := m.branches[m.branchIdx].Name
 			return func() tea.Msg { return MergeBranchMsg{Name: name} }
 		}
 	case toolbarBack:
+		if m.diffMode {
+			m.exitDiffMode()
+		}
 		m.ExitToBranches()
 		return nil
 	case toolbarDiff:
@@ -2738,6 +2747,10 @@ func (m *Model) toggleDiffSelection() {
 	for i, ds := range m.diffSelections {
 		if ds.hash == hash {
 			m.diffSelections = append(m.diffSelections[:i], m.diffSelections[i+1:]...)
+			if len(m.diffSelections) == 0 {
+				m.exitDiffMode()
+				return
+			}
 			m.invalidateNodeCache()
 			m.invalidateCommitCardCache()
 			m.viewDirty = true
@@ -2818,6 +2831,10 @@ func (m *Model) toggleBranchDiffSelection() {
 	for i, ds := range m.diffSelections {
 		if ds.nodeIdx == m.branchIdx {
 			m.diffSelections = append(m.diffSelections[:i], m.diffSelections[i+1:]...)
+			if len(m.diffSelections) == 0 {
+				m.exitBranchDiffMode()
+				return
+			}
 			m.invalidateCardCache()
 			m.viewDirty = true
 			return

@@ -803,6 +803,16 @@ func (m *Model) FocusUncommittedOptions() {
 	}
 }
 
+// ToggleUncommittedAll focuses the [All] options bar and toggles the
+// staging state of all entries. No-op if the tab is not active.
+func (m *Model) ToggleUncommittedAll() {
+	if m.activeTab == TabUncommitted {
+		m.uncommitted.optionsFocused = true
+		m.uncommitted.toggleAll()
+		m.viewDirty = true
+	}
+}
+
 // selectEntry handles enter on the currently selected entry.
 func (m *Model) selectEntry() tea.Cmd {
 	if m.activeTab != TabBranches {

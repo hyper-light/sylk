@@ -1528,7 +1528,7 @@ type toolbarButtonDef struct {
 // toolbarDefs maps button IDs to their display properties.
 var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarCreate:     {icon: "＋", label: "Create", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
-	toolbarMerge:      {icon: "⇞", label: "Merge", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
+	toolbarMerge:      {icon: "⇞", label: "Merge", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
 	toolbarBack:       {icon: "←", label: "Back", accent: func(p theme.Palette) lipgloss.Color { return p.Foreground }},
 	toolbarDiff:       {icon: "⊟", label: "Diff", accent: func(p theme.Palette) lipgloss.Color { return p.HoverAccent }},
 	toolbarDiffOk:     {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},

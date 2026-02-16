@@ -1391,12 +1391,12 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSavePromptKey(key)
 	}
 
-	// Alt+Shift+U then A → focus [All] on the Uncommitted tab.
+	// Alt+Shift+U then A → toggle [All] on the Uncommitted tab.
 	// Must precede Select-all so Alt+A doesn't get consumed.
 	if m.pendingUncommittedAll {
 		m.pendingUncommittedAll = false
 		if (ks == "a" || ks == "A" || ks == "alt+a" || ks == "alt+A") && m.gitPanel != nil {
-			m.gitPanel.FocusUncommittedOptions()
+			m.gitPanel.ToggleUncommittedAll()
 			return m, nil
 		}
 	}
