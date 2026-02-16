@@ -464,11 +464,14 @@ func wrapText(text string, maxWidth int) []string {
 // whether a blocked-reason line is needed.
 func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palette,
 	trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot bool,
-	expanded bool, exp *branchExpansion, wt workingTreeState) []string {
+	expanded bool, exp *branchExpansion, wt workingTreeState, diff diffOverlay) []string {
 
 	borderColor := p.Border
-	if selected {
+	switch {
+	case selected:
 		borderColor = p.Rosewater
+	case diff.active:
+		borderColor = diffColorForIdx(diff.idx, p)
 	}
 	bSt := lipgloss.NewStyle().Foreground(borderColor)
 
@@ -485,7 +488,14 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 		subject = truncateStyled(subject, innerWidth-2) + " " + arrowSt.Render(arrow)
 	}
 
-	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop, "", lipgloss.Style{})
+	var icon string
+	var iconSt lipgloss.Style
+	if diff.active {
+		icon = diffSelectionIcons[diff.idx%len(diffSelectionIcons)]
+		iconSt = lipgloss.NewStyle().Foreground(diffColorForIdx(diff.idx, p))
+	}
+
+	topBorder := buildCardBorder("╭", "╮", innerWidth, bSt, trunkInnerTop, hasTrunkTop, icon, iconSt)
 
 	lines := []string{
 		topBorder,

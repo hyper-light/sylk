@@ -72,6 +72,9 @@ type Model struct {
 	toolbarAction  int
 	hoverBtnIdx    int
 	viewDirty      bool
+	bounceOffset   int // Pane content bounce (rubber-band at scroll boundaries).
+
+	fileListBounceOffset int // File list bounce (separate from pane bounce).
 
 	highlighter  *codepkg.Highlighter
 	syntaxStyles map[theme.SyntaxCategory]lipgloss.Style
@@ -264,11 +267,42 @@ func (m *Model) View(cursorVisible bool) string {
 	}
 
 	tabBarStr := m.renderTabBarIfOpen()
-	area := pane.Rect{X: 0, Y: 0, W: m.width, H: m.viewportHeight()}
+	vpH := m.viewportHeight()
+	area := pane.Rect{X: 0, Y: 0, W: m.width, H: vpH}
 	content := m.composeDiffPanes(area)
+	if m.bounceOffset != 0 {
+		content = applyBounceShift(content, m.bounceOffset, vpH)
+	}
 	findBarStr := m.renderFindBarSection(cursorVisible)
 	middle := joinWithNewline(content, findBarStr)
 	return m.assembleViewParts(tabBarStr, middle, toolbar)
+}
+
+// applyBounceShift shifts rendered content by offset lines for the bounce
+// rubber-band effect. Positive offset shifts content down (padding at top),
+// negative offset shifts content up (trimming from top).
+func applyBounceShift(content string, offset, viewHeight int) string {
+	lines := strings.Split(content, "\n")
+	absOffset := offset
+	if absOffset < 0 {
+		absOffset = -absOffset
+	}
+	absOffset = min(absOffset, viewHeight)
+
+	if offset > 0 {
+		shift := min(absOffset, len(lines))
+		lines = lines[shift:]
+	} else {
+		pad := make([]string, absOffset, absOffset+len(lines))
+		lines = append(pad, lines...)
+	}
+	for len(lines) < viewHeight {
+		lines = append(lines, "")
+	}
+	if len(lines) > viewHeight {
+		lines = lines[:viewHeight]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // joinWithNewline joins two strings with a newline separator.
@@ -1463,6 +1497,79 @@ func (m *Model) SetFocusedPane(id pane.PaneID) {
 
 // FocusedPane returns the currently focused pane ID.
 func (m *Model) FocusedPane() pane.PaneID { return m.focusedPane }
+
+// ScrollUp scrolls the focused diff pane up by one line.
+// Returns false at the top boundary (for bounce physics).
+func (m *Model) ScrollUp() bool {
+	fp := m.focusedFileDiffPane()
+	if fp == nil {
+		return true
+	}
+	if fp.scrollOffset <= 0 {
+		return false
+	}
+	fp.scrollUp(1)
+	m.viewDirty = true
+	return true
+}
+
+// ScrollDown scrolls the focused diff pane down by one line.
+// Returns false at the bottom boundary (for bounce physics).
+func (m *Model) ScrollDown() bool {
+	fp := m.focusedFileDiffPane()
+	if fp == nil {
+		return true
+	}
+	if fp.scrollOffset >= fp.maxScroll() {
+		return false
+	}
+	fp.scrollDown(1)
+	m.viewDirty = true
+	return true
+}
+
+// ScrollFileListUp moves the file list cursor up by one entry without
+// opening the file. Returns false at the top boundary (for bounce physics).
+func (m *Model) ScrollFileListUp() bool {
+	if m.selectedFile <= 0 {
+		return false
+	}
+	m.selectedFile--
+	m.fileListDirty = true
+	return true
+}
+
+// ScrollFileListDown moves the file list cursor down by one entry without
+// opening the file. Returns false at the top boundary (for bounce physics).
+func (m *Model) ScrollFileListDown() bool {
+	if m.selectedFile+1 >= m.visibleFileCount() {
+		return false
+	}
+	m.selectedFile++
+	m.fileListDirty = true
+	return true
+}
+
+// SetBounceOffset updates the visual bounce displacement for rendering.
+func (m *Model) SetBounceOffset(offset int) {
+	if m.bounceOffset == offset {
+		return
+	}
+	m.bounceOffset = offset
+	m.viewDirty = true
+}
+
+// BounceOffset returns the current bounce offset.
+func (m *Model) BounceOffset() int { return m.bounceOffset }
+
+// SetFileListBounceOffset updates the file list bounce displacement.
+func (m *Model) SetFileListBounceOffset(offset int) {
+	if m.fileListBounceOffset == offset {
+		return
+	}
+	m.fileListBounceOffset = offset
+	m.fileListDirty = true
+}
 
 // Mode returns the current compare mode.
 func (m *Model) Mode() CompareMode { return m.mode }

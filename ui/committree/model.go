@@ -152,6 +152,14 @@ type DiffCompareMsg struct {
 	Hashes []string // ordered by selection
 }
 
+// BranchDiffCompareMsg is emitted when the user confirms a multi-branch diff
+// via Ok. Hashes are the tip commit hashes; Names are the branch names used
+// as pane title labels instead of short hashes.
+type BranchDiffCompareMsg struct {
+	Hashes []string // Tip commit hashes (for diff computation).
+	Names  []string // Branch names (for pane titles).
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -1245,7 +1253,11 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 		right := m.toolbarButtons()
 		hint := ""
 		if len(left) == 0 {
-			hint = "Select 2+ commits to diff"
+			if m.mode == viewBranches {
+				hint = "Select 2+ branches to diff"
+			} else {
+				hint = "Select 2+ commits to diff"
+			}
 		}
 		return renderDiffToolbar(left, right, m.toolbarAction, m.toolbarFocused,
 			m.hoverButtonIdx, m.toolbarActiveIdx(), hint, m.width, m.theme.Palette)
@@ -1400,7 +1412,7 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 				}
 				cardSlices[i] = m.getCachedCard(flatIdx, b, selected,
 					innerWidth, trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot,
-					isExpanded, cardExp, wt)
+					isExpanded, cardExp, wt, m.diffOverlayForBranch(flatIdx))
 			}
 
 			rowLines := composeOffshootRow(cardSlices, colIndices, cardWidth, cols, m.width, m.theme, hasTrunkAbove, mergeTarget, mergeAboveCols)
@@ -1432,7 +1444,7 @@ func (m *Model) viewBranchTree(cursorVisible bool) string {
 			}
 			cardLines := m.getCachedCard(flatIdx, primary, selected,
 				innerWidth, trunkInnerTop, trunkInner, hasTrunkTop, false,
-				isExpanded, cardExp, wt)
+				isExpanded, cardExp, wt, m.diffOverlayForBranch(flatIdx))
 
 			rowLines := composePrimaryRow(cardLines, m.width)
 			lines = append(lines, rowLines...)
@@ -1719,6 +1731,46 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 		return m.handleCreateInputKey(km)
 	}
 	if len(m.branches) == 0 {
+		return nil
+	}
+
+	// Diff mode (not toolbar-focused): Enter/Space toggle selection, Esc exits.
+	if m.diffMode && !m.toolbarFocused && m.expandedIdx < 0 {
+		switch km.String() {
+		case "enter", " ":
+			m.toggleBranchDiffSelection()
+		case "esc":
+			m.exitBranchDiffMode()
+		case "j", "down", "shift+down":
+			m.moveBranchDown()
+		case "k", "up", "shift+up":
+			m.moveBranchUp()
+		case "l", "right":
+			m.moveBranchRight()
+		case "h", "left":
+			m.moveBranchLeft()
+		case "g":
+			m.branchIdx = 0
+		case "G":
+			m.branchIdx = len(m.branches) - 1
+		case "ctrl+d":
+			for range m.halfBranchPage() {
+				m.moveBranchDown()
+			}
+		case "ctrl+u":
+			for range m.halfBranchPage() {
+				m.moveBranchUp()
+			}
+		case "tab":
+			m.toolbarFocused = true
+			m.toolbarAction = 0
+			m.viewDirty = true
+			return nil
+		default:
+			return nil
+		}
+		m.ensureBranchVisible()
+		m.viewDirty = true
 		return nil
 	}
 
@@ -2317,18 +2369,36 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		m.ExitToBranches()
 		return nil
 	case toolbarDiff:
-		if m.diffMode {
-			m.exitDiffMode()
+		if m.mode == viewBranches {
+			if m.diffMode {
+				m.exitBranchDiffMode()
+			} else {
+				m.enterBranchDiffMode()
+			}
 		} else {
-			m.enterDiffMode()
+			if m.diffMode {
+				m.exitDiffMode()
+			} else {
+				m.enterDiffMode()
+			}
 		}
 		return nil
 	case toolbarDiffOk:
+		if m.mode == viewBranches {
+			hashes := m.BranchDiffHashes()
+			names := m.BranchDiffSelections()
+			m.exitBranchDiffMode()
+			return func() tea.Msg { return BranchDiffCompareMsg{Hashes: hashes, Names: names} }
+		}
 		hashes := m.DiffSelections()
 		m.exitDiffMode()
 		return func() tea.Msg { return DiffCompareMsg{Hashes: hashes} }
 	case toolbarDiffCancel:
-		m.exitDiffMode()
+		if m.mode == viewBranches {
+			m.exitBranchDiffMode()
+		} else {
+			m.exitDiffMode()
+		}
 		return nil
 	}
 	return nil
@@ -2687,6 +2757,104 @@ func (m *Model) toggleDiffSelection() {
 	m.viewDirty = true
 }
 
+// diffOverlayForBranch returns the diff overlay state for a branch index.
+// Unlike diffOverlayFor (which matches by hash), this matches by nodeIdx so
+// sibling branches sharing a tip commit are treated independently.
+func (m *Model) diffOverlayForBranch(branchIdx int) diffOverlay {
+	if !m.diffMode {
+		return diffOverlay{}
+	}
+	for i, ds := range m.diffSelections {
+		if ds.nodeIdx == branchIdx {
+			return diffOverlay{active: true, idx: i}
+		}
+	}
+	return diffOverlay{}
+}
+
+// ---------------------------------------------------------------------------
+// Branch diff selection mode
+// ---------------------------------------------------------------------------
+
+// enterBranchDiffMode activates diff selection mode for branches, adding the
+// currently selected branch as selection #1.
+func (m *Model) enterBranchDiffMode() {
+	m.diffMode = true
+	m.diffSelections = m.diffSelections[:0]
+	if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
+		b := m.branches[m.branchIdx]
+		m.diffSelections = append(m.diffSelections, diffSelection{
+			hash:    b.Hash,
+			nodeIdx: m.branchIdx,
+		})
+	}
+	m.toolbarFocused = false
+	m.invalidateCardCache()
+	m.viewDirty = true
+}
+
+// exitBranchDiffMode deactivates branch diff selection mode and restores the
+// cursor to the first selected branch.
+func (m *Model) exitBranchDiffMode() {
+	if len(m.diffSelections) > 0 {
+		m.branchIdx = m.diffSelections[0].nodeIdx
+	}
+	m.diffMode = false
+	m.diffSelections = m.diffSelections[:0]
+	m.toolbarFocused = false
+	m.invalidateCardCache()
+	m.ensureBranchVisible()
+	m.viewDirty = true
+}
+
+// toggleBranchDiffSelection adds or removes the currently selected branch
+// from the diff selection list. Matches by branch index (not hash) so that
+// sibling branches sharing a tip commit are treated independently.
+func (m *Model) toggleBranchDiffSelection() {
+	if m.branchIdx < 0 || m.branchIdx >= len(m.branches) {
+		return
+	}
+	// Remove if already selected (match by index, not hash).
+	for i, ds := range m.diffSelections {
+		if ds.nodeIdx == m.branchIdx {
+			m.diffSelections = append(m.diffSelections[:i], m.diffSelections[i+1:]...)
+			m.invalidateCardCache()
+			m.viewDirty = true
+			return
+		}
+	}
+	// Append if below capacity.
+	if len(m.diffSelections) >= len(diffSelectionColors) {
+		return
+	}
+	m.diffSelections = append(m.diffSelections, diffSelection{
+		hash:    m.branches[m.branchIdx].Hash,
+		nodeIdx: m.branchIdx,
+	})
+	m.invalidateCardCache()
+	m.viewDirty = true
+}
+
+// BranchDiffSelections returns the branch names in selection order.
+func (m *Model) BranchDiffSelections() []string {
+	names := make([]string, len(m.diffSelections))
+	for i, ds := range m.diffSelections {
+		if ds.nodeIdx >= 0 && ds.nodeIdx < len(m.branches) {
+			names[i] = m.branches[ds.nodeIdx].Name
+		}
+	}
+	return names
+}
+
+// BranchDiffHashes returns the tip commit hashes in selection order.
+func (m *Model) BranchDiffHashes() []string {
+	hashes := make([]string, len(m.diffSelections))
+	for i, ds := range m.diffSelections {
+		hashes[i] = ds.hash
+	}
+	return hashes
+}
+
 // ---------------------------------------------------------------------------
 // Selection restoration
 // ---------------------------------------------------------------------------
@@ -2834,7 +3002,7 @@ func (m *Model) viewTopPad() int {
 func (m *Model) toolbarButtons() []int {
 	switch m.mode {
 	case viewBranches:
-		return []int{toolbarCreate, toolbarMerge}
+		return []int{toolbarCreate, toolbarMerge, toolbarDiff}
 	case viewCommits:
 		return []int{toolbarBack, toolbarDiff}
 	default:

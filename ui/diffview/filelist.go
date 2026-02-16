@@ -422,14 +422,25 @@ func (m *Model) resolveEntryIdx(visibleIdx int) int {
 
 // renderVisibleEntries renders file entries in the [start, end) range.
 func (m *Model) renderVisibleEntries(start, end, width int, p theme.Palette) []string {
+	openSet := m.openTabSet()
 	entries := make([]string, 0, end-start)
 	for i := start; i < end; i++ {
 		uf := m.unionFiles[m.resolveEntryIdx(i)]
-		isCursor := i == m.selectedFile
+		isCursor := i == m.selectedFile && m.fileListFocused
 		isActive := uf.Path == m.selectedPath
-		entries = append(entries, renderUnionFileEntry(uf, isCursor, isActive, width, m.fileListFocused, p))
+		_, isOpen := openSet[uf.Path]
+		entries = append(entries, renderUnionFileEntry(uf, isCursor, isActive, isOpen, width, p))
 	}
 	return entries
+}
+
+// openTabSet returns the set of file paths currently open as tabs.
+func (m *Model) openTabSet() map[string]struct{} {
+	set := make(map[string]struct{}, len(m.openTabs))
+	for _, p := range m.openTabs {
+		set[p] = struct{}{}
+	}
+	return set
 }
 
 // renderFileEntries renders the visible file entries, padded to entryH lines.
@@ -446,10 +457,55 @@ func (m *Model) renderFileEntries(entryH int, width int, p theme.Palette) string
 	for len(entries) < entryH {
 		entries = append(entries, blank)
 	}
+
+	// Apply bounce shift for rubber-band visual at scroll boundaries.
+	if m.fileListBounceOffset != 0 {
+		entries = applyBounceShiftLines(entries, m.fileListBounceOffset, entryH, blank)
+	}
+
 	return strings.Join(entries, "\n")
 }
 
-// padLine pads a line to width with trailing spaces.
+// applyBounceShiftLines shifts rendered lines by offset for the bounce
+// rubber-band effect. Positive offset shifts content up (bottom overscroll),
+// negative offset shifts content down (top overscroll). blankLine fills
+// exposed space so every line spans the full panel width.
+func applyBounceShiftLines(lines []string, offset, viewHeight int, blankLine string) []string {
+	if offset == 0 || viewHeight <= 0 {
+		return lines
+	}
+	absOffset := offset
+	if absOffset < 0 {
+		absOffset = -absOffset
+	}
+	absOffset = min(absOffset, viewHeight)
+
+	result := make([]string, viewHeight)
+	if offset > 0 {
+		// Bottom bounce: shift content up, pad bottom with blank lines.
+		shift := min(absOffset, len(lines))
+		copied := copy(result, lines[shift:])
+		for i := copied; i < viewHeight; i++ {
+			result[i] = blankLine
+		}
+	} else {
+		// Top bounce: blank lines at top, content fills remaining space.
+		for i := range absOffset {
+			result[i] = blankLine
+		}
+		remaining := viewHeight - absOffset
+		src := lines
+		if len(src) > remaining {
+			src = src[:remaining]
+		}
+		copy(result[absOffset:], src)
+		for i := absOffset + len(src); i < viewHeight; i++ {
+			result[i] = blankLine
+		}
+	}
+	return result
+}
+
 func padLine(s string, width int) string {
 	if vis := lipgloss.Width(s); vis < width {
 		s += strings.Repeat(" ", width-vis)
@@ -466,73 +522,135 @@ func clampInt(v, lo, hi int) int {
 // File entry rendering
 // ---------------------------------------------------------------------------
 
-// renderEntryCursorPrefix renders the cursor prefix for a file entry.
-func renderEntryCursorPrefix(isCursor bool, p theme.Palette) string {
-	if isCursor {
-		return lipgloss.NewStyle().Foreground(p.Primary).Render(" > ")
-	}
-	return "   "
-}
-
 // renderEntryStats builds the "+N -M " stats string for a file entry.
-func renderEntryStats(uf UnionFileEntry, p theme.Palette) string {
+func renderEntryStats(uf UnionFileEntry, bg lipgloss.Color, hasBg bool, p theme.Palette) string {
 	parts := make([]string, 0, 2)
+	addSt := lipgloss.NewStyle().Foreground(p.Success)
+	delSt := lipgloss.NewStyle().Foreground(p.Error)
+	if hasBg {
+		addSt = addSt.Background(bg)
+		delSt = delSt.Background(bg)
+	}
 	if uf.Additions > 0 {
-		parts = append(parts, lipgloss.NewStyle().Foreground(p.Success).Render(fmt.Sprintf("+%d", uf.Additions)))
+		parts = append(parts, addSt.Render(fmt.Sprintf("+%d", uf.Additions)))
 	}
 	if uf.Deletions > 0 {
-		parts = append(parts, lipgloss.NewStyle().Foreground(p.Error).Render(fmt.Sprintf("-%d", uf.Deletions)))
+		parts = append(parts, delSt.Render(fmt.Sprintf("-%d", uf.Deletions)))
 	}
-	return strings.Join(parts, " ") + " "
+	spaceSt := lipgloss.NewStyle()
+	if hasBg {
+		spaceSt = spaceSt.Background(bg)
+	}
+	sep := spaceSt.Render(" ")
+	return strings.Join(parts, sep) + sep
 }
 
-// renderEntryName renders the file name, truncated to fit, with active styling.
-func renderEntryName(uf UnionFileEntry, isActive bool, nameW int, p theme.Palette) string {
+// renderUnionFileEntry renders a single file list entry with file-tree-style
+// highlighting: cursor row gets a full-width Selection background; open-tab
+// files get Accent foreground; the active file gets Accent foreground.
+// [cursor] [status] icon name          +N -M
+func renderUnionFileEntry(uf UnionFileEntry, isCursor, isActive, isOpen bool, width int, p theme.Palette) string {
+	// Determine name and icon colors based on state priority.
+	nameColor := p.Foreground
+	iconEntry := devicons.IconForPath(filepath.Base(uf.Path))
+	iconColor := lipgloss.Color(iconEntry.Color)
+
+	// Open-tab files: Accent color for name + icon (like file tree active).
+	if isOpen {
+		nameColor = p.Accent
+		iconColor = p.Accent
+	}
+
+	// The active viewing file uses the same Accent treatment.
+	if isActive {
+		nameColor = p.Accent
+		iconColor = p.Accent
+	}
+
+	// Build the selection background for cursor row.
+	hasBg := isCursor
+	bg := p.Selection
+
+	// Cursor prefix.
+	prefixSt := lipgloss.NewStyle()
+	if hasBg {
+		prefixSt = prefixSt.Background(bg)
+	}
+	var prefix string
+	if isCursor {
+		prefix = prefixSt.Foreground(p.Primary).Render(" > ")
+	} else {
+		prefix = prefixSt.Render("   ")
+	}
+
+	// Status badge.
+	badgeColor := fileStatusColor(uf.Status, p)
+	badgeSt := lipgloss.NewStyle().Foreground(badgeColor).Bold(true)
+	if hasBg {
+		badgeSt = badgeSt.Background(bg)
+	}
+	badge := badgeSt.Render(uf.Status)
+
+	// Separator.
+	sepSt := lipgloss.NewStyle()
+	if hasBg {
+		sepSt = sepSt.Background(bg)
+	}
+	sep := sepSt.Render(" ")
+
+	// Icon.
+	iconSt := lipgloss.NewStyle().Foreground(iconColor)
+	if hasBg {
+		iconSt = iconSt.Background(bg)
+	}
+	iconStr := iconSt.Render(iconEntry.Icon)
+
+	// Stats.
+	statsStr := renderEntryStats(uf, bg, hasBg, p)
+	statsW := lipgloss.Width(statsStr)
+
+	// Compute available width for the file name.
+	prefixW := lipgloss.Width(prefix) + lipgloss.Width(badge) + 1 + lipgloss.Width(iconStr) + 1
+	nameW := max(width-prefixW-statsW, 1)
+
+	// File name.
 	name := filepath.Base(uf.Path)
 	if lipgloss.Width(name) > nameW {
 		name = name[:max(nameW-1, 0)] + "..."
 	}
-	nameSt := lipgloss.NewStyle().Foreground(p.Foreground)
-	if isActive {
-		nameSt = nameSt.Foreground(p.Primary).Bold(true)
+	nameSt := lipgloss.NewStyle().Foreground(nameColor)
+	if hasBg {
+		nameSt = nameSt.Background(bg)
 	}
-	return nameSt.Render(name)
-}
 
-// renderEntryRow renders the full entry row without selection highlight.
-func renderEntryRow(uf UnionFileEntry, isCursor, isActive bool, width int, p theme.Palette) string {
+	// Assemble the row.
 	var b strings.Builder
-
-	b.WriteString(renderEntryCursorPrefix(isCursor, p))
-
-	badgeColor := fileStatusColor(uf.Status, p)
-	badge := lipgloss.NewStyle().Foreground(badgeColor).Bold(true).Render(uf.Status)
+	b.WriteString(prefix)
 	b.WriteString(badge)
-	b.WriteString(" ")
+	b.WriteString(sep)
+	b.WriteString(iconStr)
+	b.WriteString(sep)
+	b.WriteString(nameSt.Render(name))
 
-	icon := devicons.IconForPath(filepath.Base(uf.Path))
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(icon.Color)).Render(icon.Icon))
-	b.WriteString(" ")
-
-	statsStr := renderEntryStats(uf, p)
-	statsW := lipgloss.Width(statsStr)
-	prefixW := lipgloss.Width(b.String())
-	nameW := max(width-prefixW-statsW, 1)
-
-	b.WriteString(renderEntryName(uf, isActive, nameW, p))
-
-	gap := max(width-lipgloss.Width(b.String())-statsW, 0)
-	b.WriteString(strings.Repeat(" ", gap))
+	lineW := lipgloss.Width(b.String())
+	gap := max(width-lineW-statsW, 0)
+	padSt := lipgloss.NewStyle()
+	if hasBg {
+		padSt = padSt.Background(bg)
+	}
+	if gap > 0 {
+		b.WriteString(padSt.Render(strings.Repeat(" ", gap)))
+	}
 	b.WriteString(statsStr)
 
-	return b.String()
-}
+	// Pad trailing space to full width with selection background.
+	row := b.String()
+	if vis := lipgloss.Width(row); vis < width {
+		b.WriteString(padSt.Render(strings.Repeat(" ", width-vis)))
+		row = b.String()
+	}
 
-// renderUnionFileEntry renders a single file list entry:
-// [cursor] [status] icon name          +N -M
-func renderUnionFileEntry(uf UnionFileEntry, isCursor, isActive bool, width int, _ bool, p theme.Palette) string {
-	row := renderEntryRow(uf, isCursor, isActive, width, p)
-	return padLine(row, width)
+	return row
 }
 
 // fileStatusColor returns the palette color for a git diff status code.

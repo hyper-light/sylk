@@ -329,6 +329,7 @@ type AppModel struct {
 	diffView       *diffview.Model // Diff view component (nil when inactive).
 	diffViewActive bool            // True while diff view is displayed.
 	diffHashes     []string        // Saved commit hashes for mode switching.
+	diffLabels     []string        // Branch names for pane titles (nil for commit diffs).
 
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
@@ -1063,6 +1064,13 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case committree.DiffCompareMsg:
 		m.diffHashes = typed.Hashes
+		m.diffLabels = nil
+		m.setDiffLoading(true)
+		return m, m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
+
+	case committree.BranchDiffCompareMsg:
+		m.diffHashes = typed.Hashes
+		m.diffLabels = typed.Names
 		m.setDiffLoading(true)
 		return m, m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
 
@@ -3641,6 +3649,14 @@ func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) 
 	if gc == nil || len(hashes) < 2 {
 		return nil
 	}
+	// Build hash→label map for branch name overrides (nil when unused).
+	var hashToLabel map[string]string
+	if len(m.diffLabels) == len(hashes) {
+		hashToLabel = make(map[string]string, len(hashes))
+		for i, h := range hashes {
+			hashToLabel[h] = m.diffLabels[i]
+		}
+	}
 	return func() tea.Msg {
 		fromTo := buildDiffPairs(hashes, mode)
 		pairs := make([]msg.DiffViewPair, len(fromTo))
@@ -3653,6 +3669,17 @@ func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) 
 			}()
 		}
 		wg.Wait()
+		// Override short labels with branch names when available.
+		if hashToLabel != nil {
+			for i := range pairs {
+				if lbl, ok := hashToLabel[pairs[i].FromHash]; ok {
+					pairs[i].FromShort = lbl
+				}
+				if lbl, ok := hashToLabel[pairs[i].ToHash]; ok {
+					pairs[i].ToShort = lbl
+				}
+			}
+		}
 		return msg.DiffViewDataMsg{Pairs: pairs, Mode: int(mode)}
 	}
 }
@@ -6189,7 +6216,7 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 	}
 
 	// Diff view: route left-click events to the diff file list and diff panes.
-	// Wheel events are handled by applyScrollImpulse above.
+	// Wheel events are routed via applyScrollImpulse → scrollOneLine.
 	if m.diffViewActive && m.diffView != nil && mouse.Button == tea.MouseButtonLeft {
 		// Diff file list (left panel, occupies the FileTree slot).
 		m.handleDiffFileListClick(mouse.X, mouse.Y)
@@ -6247,7 +6274,11 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	mode := m.layout.Mode()
 
 	if mode == layout.SingleColumn {
-		if m.diffViewActive {
+		if m.diffViewActive && m.diffView != nil {
+			// File-tree ring slot → diff file list; everything else → diff pane.
+			if !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree {
+				return component.FocusDiffFileList, true
+			}
 			return component.FocusDiffView, true
 		}
 		if m.leftRing.empty() {
@@ -6262,6 +6293,11 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	}
 
 	resolved := m.resolveRingPanel(panelID, mode)
+
+	// Diff view: route file-tree slot scrolls to the diff file list.
+	if m.diffViewActive && m.diffView != nil && resolved == component.FocusFileTree {
+		return component.FocusDiffFileList, true
+	}
 
 	// In edit mode, route scrolls within the code panel to the pane
 	// under the cursor using tree-based hit testing.
@@ -6359,6 +6395,16 @@ func (m *AppModel) tickScrollMomentum() {
 	if m.commitTree != nil {
 		m.commitTree.SetBounceOffset(m.bounceOffset(component.FocusCommitTree))
 	}
+	if m.diffView != nil {
+		// Diff pane bounce: match the dynamic pane-level ID from panelForScroll.
+		paneBO := m.bounceOffset(pane.PaneFocusID(m.diffView.FocusedPane()))
+		if paneBO == 0 {
+			paneBO = m.bounceOffset(component.FocusDiffView)
+		}
+		m.diffView.SetBounceOffset(paneBO)
+		// File list bounce: separate from pane bounce.
+		m.diffView.SetFileListBounceOffset(m.bounceOffset(component.FocusDiffFileList))
+	}
 }
 
 // settled reports whether the spring is close enough to target to stop.
@@ -6391,24 +6437,28 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 			return m.chat.ScrollUp()
 		}
 		return m.chat.ScrollDown()
+	case component.FocusDiffFileList:
+		if m.diffViewActive && m.diffView != nil {
+			if direction < 0 {
+				return m.diffView.ScrollFileListUp()
+			}
+			return m.diffView.ScrollFileListDown()
+		}
+		return true
 	case component.FocusDiffView:
 		if m.diffView != nil {
 			if direction < 0 {
-				m.diffView.Update(tea.KeyMsg{Type: tea.KeyUp})
-			} else {
-				m.diffView.Update(tea.KeyMsg{Type: tea.KeyDown})
+				return m.diffView.ScrollUp()
 			}
-			return true
+			return m.diffView.ScrollDown()
 		}
 		return true
 	case component.FocusCodeViewer:
 		if m.diffViewActive && m.diffView != nil {
 			if direction < 0 {
-				m.diffView.Update(tea.KeyMsg{Type: tea.KeyUp})
-			} else {
-				m.diffView.Update(tea.KeyMsg{Type: tea.KeyDown})
+				return m.diffView.ScrollUp()
 			}
-			return true
+			return m.diffView.ScrollDown()
 		}
 		if m.viewMode == ViewGit && m.commitTree != nil {
 			if direction < 0 {
@@ -6461,11 +6511,9 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		// Diff sub-pane scroll.
 		if m.diffViewActive && m.diffView != nil {
 			if direction < 0 {
-				m.diffView.Update(tea.KeyMsg{Type: tea.KeyUp})
-			} else {
-				m.diffView.Update(tea.KeyMsg{Type: tea.KeyDown})
+				return m.diffView.ScrollUp()
 			}
-			return true
+			return m.diffView.ScrollDown()
 		}
 		pid := pane.PaneIDFromFocus(panelID)
 		if pid == m.previewPane {
@@ -8639,6 +8687,9 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	case component.FocusCodeViewer:
 		return m.renderCodePanelBordered(th)
 	case component.FocusFileTree:
+		if m.diffViewActive && m.diffView != nil {
+			return m.renderDiffFileListBordered(th)
+		}
 		content := m.overlayChordHint(m.fileTree.View(m.cursorVisible), active, th)
 		return m.renderPanel(content, active, th)
 	case component.FocusGitPanel:
@@ -8670,6 +8721,9 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
 	switch id {
 	case component.FocusFileTree:
+		if m.diffViewActive && m.diffView != nil {
+			return m.renderDiffFileListBordered(th)
+		}
 		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 	case component.FocusGitPanel:
 		return m.renderGitPanelBordered(th)

@@ -30,6 +30,10 @@ type cardCacheKey struct {
 	dirty     bool
 	conflicts bool
 
+	// Diff selection overlay state.
+	diffActive bool
+	diffIdx    int
+
 	// Expansion state (only meaningful when expanded=true).
 	selectedActionID int
 	hasStagedFiles   bool
@@ -53,7 +57,7 @@ type cardCacheEntry struct {
 
 // buildCardCacheKey constructs a cache key from all rendering inputs.
 func buildCardCacheKey(b BranchNode, selected bool, innerWidth, trunkInnerTop, trunkInnerBot int,
-	hasTrunkTop, hasTrunkBot, expanded bool, exp *branchExpansion, wt workingTreeState) cardCacheKey {
+	hasTrunkTop, hasTrunkBot, expanded bool, exp *branchExpansion, wt workingTreeState, diff diffOverlay) cardCacheKey {
 
 	k := cardCacheKey{
 		name:          b.Name,
@@ -74,6 +78,8 @@ func buildCardCacheKey(b BranchNode, selected bool, innerWidth, trunkInnerTop, t
 		hasTrunkBot:   hasTrunkBot,
 		dirty:         wt.dirty,
 		conflicts:     wt.conflicts,
+		diffActive:    diff.active,
+		diffIdx:       diff.idx,
 	}
 
 	if expanded && exp != nil {
@@ -189,10 +195,10 @@ func (m *Model) getCachedNode(idx int, n TreeNode, selected, isFirst, isLast boo
 // renders the card, stores it in the cache, and returns fresh lines.
 func (m *Model) getCachedCard(flatIdx int, b BranchNode, selected bool,
 	innerWidth, trunkInnerTop, trunkInnerBot int, hasTrunkTop, hasTrunkBot, expanded bool,
-	exp *branchExpansion, wt workingTreeState) []string {
+	exp *branchExpansion, wt workingTreeState, diff diffOverlay) []string {
 
 	key := buildCardCacheKey(b, selected, innerWidth, trunkInnerTop, trunkInnerBot,
-		hasTrunkTop, hasTrunkBot, expanded, exp, wt)
+		hasTrunkTop, hasTrunkBot, expanded, exp, wt, diff)
 
 	// Grow cache slice if needed.
 	for len(m.cardCache) <= flatIdx {
@@ -206,7 +212,7 @@ func (m *Model) getCachedCard(flatIdx int, b BranchNode, selected bool,
 
 	lines := buildBranchCard(b, selected, innerWidth, m.theme.Palette,
 		trunkInnerTop, trunkInnerBot, hasTrunkTop, hasTrunkBot,
-		expanded, exp, wt)
+		expanded, exp, wt, diff)
 
 	entry.valid = true
 	entry.key = key
