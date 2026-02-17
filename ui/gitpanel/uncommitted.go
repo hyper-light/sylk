@@ -90,10 +90,10 @@ func (ut *uncommittedTab) toggleAll() {
 
 // loadUncommitted fetches uncommitted files with real status codes
 // from the git client using the go-git native API.
-func loadUncommitted(gc *git.GitClient) []uncommittedEntry {
+func loadUncommitted(gc *git.GitClient) ([]uncommittedEntry, error) {
 	statuses, _, err := gc.UncommittedFileStatuses()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	entries := make([]uncommittedEntry, 0, len(statuses))
@@ -110,7 +110,7 @@ func loadUncommitted(gc *git.GitClient) []uncommittedEntry {
 		return entries[i].path < entries[j].path
 	})
 
-	return entries
+	return entries, nil
 }
 
 // renderUncommittedCell renders a single column cell for an uncommitted entry.

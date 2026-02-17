@@ -69,7 +69,10 @@ type commitsLoadedMsg struct {
 }
 type branchesLoadedMsg struct{ allEntries []branchEntry }
 type tagsLoadedMsg struct{ allEntries []tagEntry }
-type uncommittedLoadedMsg struct{ allEntries []uncommittedEntry }
+type uncommittedLoadedMsg struct {
+	allEntries []uncommittedEntry
+	err        error // non-nil when the status read failed; entries should be kept as-is.
+}
 type checkoutResultMsg struct {
 	name string
 	err  error
@@ -228,6 +231,11 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 		return m, nil
 
 	case uncommittedLoadedMsg:
+		if typed.err != nil {
+			// Transient error (e.g. index locked during a git operation).
+			// Keep existing entries to avoid a visible flash.
+			return m, nil
+		}
 		m.viewDirty = true
 		m.setUncommittedEntries(typed.allEntries)
 		return m, nil
@@ -331,7 +339,10 @@ func (m *Model) LoadData() tea.Cmd {
 		},
 		func() tea.Msg { return branchesLoadedMsg{allEntries: loadBranches(gc, branchStatLevel)} },
 		func() tea.Msg { return tagsLoadedMsg{allEntries: loadTags(gc)} },
-		func() tea.Msg { return uncommittedLoadedMsg{allEntries: loadUncommitted(gc)} },
+		func() tea.Msg {
+			entries, err := loadUncommitted(gc)
+			return uncommittedLoadedMsg{allEntries: entries, err: err}
+		},
 	)
 }
 
