@@ -215,6 +215,8 @@ type Model struct {
 	loadingMore     bool      // true while a "load more" page is in flight
 	lastHash        string    // hash of the last loaded commit (cursor for next page)
 	pendingCmd      tea.Cmd   // scroll-triggered pagination cmd for parent to drain
+	loadingMessage  string    // custom loading message (empty = default)
+	prevMode        viewMode  // mode before SetLoadingMessage, for restore
 
 	// Commit input state (HEAD branch expanded card).
 	commitInputActive bool
@@ -645,6 +647,24 @@ func (m *Model) SetHasIndexStaged(staged bool) {
 		return
 	}
 	m.hasIndexStaged = staged
+	m.viewDirty = true
+}
+
+// SetLoadingMessage switches to the loading spinner with a custom message.
+// The previous view mode is saved so ClearLoadingMessage can restore it.
+func (m *Model) SetLoadingMessage(msg string) {
+	m.loadingMessage = msg
+	m.prevMode = m.mode
+	m.loadingEpoch = time.Now()
+	m.mode = viewLoading
+	m.viewDirty = true
+}
+
+// ClearLoadingMessage clears the custom loading message and restores the
+// view mode that was active before SetLoadingMessage.
+func (m *Model) ClearLoadingMessage() {
+	m.loadingMessage = ""
+	m.mode = m.prevMode
 	m.viewDirty = true
 }
 
@@ -1515,7 +1535,11 @@ func (m *Model) viewLoadingSpinner() string {
 	frame := spinnerFrames[int(elapsed/spinnerFramePeriod)%len(spinnerFrames)]
 	spinSt := lipgloss.NewStyle().Foreground(m.theme.Palette.Primary)
 	textSt := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
-	msg := spinSt.Render(frame) + " " + textSt.Render("Loading commits...")
+	label := "Loading commits..."
+	if m.loadingMessage != "" {
+		label = m.loadingMessage
+	}
+	msg := spinSt.Render(frame) + " " + textSt.Render(label)
 	msgWidth := lipgloss.Width(msg)
 
 	ch := m.contentHeight()

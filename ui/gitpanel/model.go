@@ -50,6 +50,15 @@ type BranchCheckedOutMsg struct{ Name string }
 // BranchCheckoutBlockedMsg is emitted when checkout is blocked.
 type BranchCheckoutBlockedMsg struct{ Reason string }
 
+// StashRequestMsg is emitted when the user triggers a stash from the options bar.
+type StashRequestMsg struct {
+	Paths []string
+	Count int
+}
+
+// UnstashRequestMsg is emitted when the user triggers an unstash.
+type UnstashRequestMsg struct{}
+
 // -------------------------------------------------------------------------
 // Async load messages
 // -------------------------------------------------------------------------
@@ -667,7 +676,7 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 			if m.activeTab == TabUncommitted && prevFocus == focusHeader &&
 				ls.filterFocus == focusEntries && key.String() == "tab" {
 				ls.filterFocus = focusEntries
-				m.uncommitted.optionsFocused = true
+				m.uncommitted.optionFocus = optionAll
 			}
 			// Gear dropdown toggle may have changed visible stat columns.
 			if prevFocus == focusGearDropdown {
@@ -686,7 +695,7 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // not consumed by the filter handler).
 func (m *Model) handleNavigationKey(key tea.KeyMsg) tea.Cmd {
 	// Handle uncommitted options bar focus.
-	if m.activeTab == TabUncommitted && m.uncommitted.optionsFocused {
+	if m.activeTab == TabUncommitted && m.uncommitted.optionFocus != optionNone {
 		return m.handleOptionsKey(key)
 	}
 
@@ -731,20 +740,57 @@ func (m *Model) handleNavigationKey(key tea.KeyMsg) tea.Cmd {
 }
 
 // handleOptionsKey processes keys when focus is on the uncommitted
-// options bar ([All] badge).
+// options bar ([All] / [Stash] / [Unstash] badges).
 func (m *Model) handleOptionsKey(key tea.KeyMsg) tea.Cmd {
 	switch key.String() {
 	case "enter", " ":
-		m.uncommitted.toggleAll()
-	case "tab", "shift+tab", "esc":
-		m.uncommitted.optionsFocused = false
-	case "j", "down":
-		m.uncommitted.optionsFocused = false
-	case "k", "up":
-		m.uncommitted.optionsFocused = false
+		switch m.uncommitted.optionFocus {
+		case optionAll:
+			m.uncommitted.toggleAll()
+		case optionStash:
+			return m.triggerStash()
+		case optionUnstash:
+			return m.triggerUnstash()
+		}
+	case "l", "right", "tab":
+		m.uncommitted.optionFocus = m.nextOptionBadge(m.uncommitted.optionFocus)
+	case "h", "left", "shift+tab":
+		m.uncommitted.optionFocus = m.prevOptionBadge(m.uncommitted.optionFocus)
+	case "esc", "k", "up":
+		m.uncommitted.optionFocus = optionNone
 		m.uncommitted.moveUp(0) // keep cursor in place
+	case "j", "down":
+		m.uncommitted.optionFocus = optionNone
 	}
 	return nil
+}
+
+// nextOptionBadge returns the next badge in the options bar, wrapping to
+// optionNone (exit). The sequence is All → Stash → Unstash (if visible) → exit.
+func (m *Model) nextOptionBadge(cur optionFocus) optionFocus {
+	switch cur {
+	case optionAll:
+		return optionStash
+	case optionStash:
+		if m.uncommitted.hasStash {
+			return optionUnstash
+		}
+		return optionNone
+	default:
+		return optionNone
+	}
+}
+
+// prevOptionBadge returns the previous badge, wrapping to optionNone (exit).
+func (m *Model) prevOptionBadge(cur optionFocus) optionFocus {
+	switch cur {
+	case optionUnstash:
+		return optionStash
+	case optionStash:
+		return optionAll
+	default:
+		return optionNone
+	}
 }
 
 // toggleUncommittedStaging cycles the staging state of the selected
@@ -798,7 +844,7 @@ func (m *Model) SetActiveTab(tab GitTab) {
 // Uncommitted tab. No-op if the tab is not active.
 func (m *Model) FocusUncommittedOptions() {
 	if m.activeTab == TabUncommitted {
-		m.uncommitted.optionsFocused = true
+		m.uncommitted.optionFocus = optionAll
 		m.viewDirty = true
 	}
 }
@@ -807,7 +853,7 @@ func (m *Model) FocusUncommittedOptions() {
 // staging state of all entries. No-op if the tab is not active.
 func (m *Model) ToggleUncommittedAll() {
 	if m.activeTab == TabUncommitted {
-		m.uncommitted.optionsFocused = true
+		m.uncommitted.optionFocus = optionAll
 		m.uncommitted.toggleAll()
 		m.viewDirty = true
 	}
@@ -904,6 +950,76 @@ func (m *Model) StagedFilePaths() []string {
 		}
 	}
 	return paths
+}
+
+// allUncommittedPaths returns the paths of all uncommitted files.
+func (m *Model) allUncommittedPaths() []string {
+	paths := make([]string, len(m.uncommitted.allEntries))
+	for i, e := range m.uncommitted.allEntries {
+		paths[i] = e.path
+	}
+	return paths
+}
+
+// triggerStash collects staged (or all) paths and emits a StashRequestMsg.
+func (m *Model) triggerStash() tea.Cmd {
+	paths := m.StagedFilePaths()
+	if len(paths) == 0 {
+		paths = m.allUncommittedPaths()
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	count := len(paths)
+	return func() tea.Msg {
+		return StashRequestMsg{Paths: paths, Count: count}
+	}
+}
+
+// triggerUnstash emits an UnstashRequestMsg.
+func (m *Model) triggerUnstash() tea.Cmd {
+	return func() tea.Msg { return UnstashRequestMsg{} }
+}
+
+// StashAll stages all files and triggers a stash. Intended for the
+// alt+shift+u+s keybind from the app layer.
+func (m *Model) StashAll() tea.Cmd {
+	if m.activeTab != TabUncommitted {
+		return nil
+	}
+	if !m.uncommitted.allStaged() {
+		m.uncommitted.toggleAll()
+	}
+	m.uncommitted.optionFocus = optionStash
+	m.viewDirty = true
+	return m.triggerStash()
+}
+
+// TriggerUnstash triggers an unstash from the app layer (alt+shift+u+p keybind).
+func (m *Model) TriggerUnstash() tea.Cmd {
+	if m.activeTab != TabUncommitted {
+		return nil
+	}
+	if !m.uncommitted.hasStash {
+		return nil
+	}
+	m.uncommitted.optionFocus = optionUnstash
+	m.viewDirty = true
+	return m.triggerUnstash()
+}
+
+// SetHasStash updates whether git has stashed changes, controlling the
+// [Unstash] badge visibility.
+func (m *Model) SetHasStash(has bool) {
+	if m.uncommitted.hasStash == has {
+		return
+	}
+	m.uncommitted.hasStash = has
+	// If unstash badge disappears while focused, move focus to stash.
+	if !has && m.uncommitted.optionFocus == optionUnstash {
+		m.uncommitted.optionFocus = optionStash
+	}
+	m.viewDirty = true
 }
 
 // ToggleSearch activates or deactivates the filter bar on the active tab.
@@ -1043,10 +1159,18 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 	entryHeight := max(m.height-chromeTopHeight-bottomCount-optionsCount, 0)
 
 	// Options bar click (uncommitted tab only, below entries).
+	// Layout: " [All] [Stash] [Unstash]"
+	//          1    5 7     13 15      23
 	if m.activeTab == TabUncommitted {
 		if viewY == chromeTopHeight+entryHeight+1 { // +1 skips the divider
-			m.uncommitted.toggleAll()
 			m.viewDirty = true
+			if m.uncommitted.hasStash && viewX >= 15 && viewX <= 23 {
+				return m.triggerUnstash()
+			}
+			if viewX >= 7 && viewX <= 13 {
+				return m.triggerStash()
+			}
+			m.uncommitted.toggleAll()
 			return nil
 		}
 	}

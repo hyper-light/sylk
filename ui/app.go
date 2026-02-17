@@ -909,6 +909,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.commitTree.SetWorkingTreeStatus(typed.dirty, typed.conflicts)
 			m.commitTree.SetHasIndexStaged(typed.hasIndexStaged)
 		}
+		if m.gitPanel != nil {
+			m.gitPanel.SetHasStash(typed.hasStash)
+		}
 		return m, nil
 	case committree.BranchSelectedMsg:
 		if m.viewMode == ViewGit && m.gitClient != nil {
@@ -1070,6 +1073,74 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			_, doneCmd := m.commitTree.Update(committree.CommitDoneMsg{OK: false, Message: typed.reason})
 			return m, doneCmd
 		}
+		return m, nil
+
+	case gitpanel.StashRequestMsg:
+		if m.gitClient != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage(fmt.Sprintf("Stashing %d files...", typed.Count))
+			gc := m.gitClient
+			paths := typed.Paths
+			count := typed.Count
+			return m, func() tea.Msg {
+				if err := gc.StashFiles(paths); err != nil {
+					return stashFailedMsg{reason: err.Error()}
+				}
+				return stashSucceededMsg{count: count}
+			}
+		}
+		return m, nil
+
+	case stashSucceededMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash(fmt.Sprintf("Stashed %d files", typed.count))
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case stashFailedMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
+	case gitpanel.UnstashRequestMsg:
+		if m.gitClient != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Unstashing files...")
+			gc := m.gitClient
+			return m, func() tea.Msg {
+				if err := gc.UnstashFiles(); err != nil {
+					return unstashFailedMsg{reason: err.Error()}
+				}
+				return unstashSucceededMsg{}
+			}
+		}
+		return m, nil
+
+	case unstashSucceededMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash("Unstashed files")
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case unstashFailedMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
 	case gitBranchDAGLoadedMsg:
@@ -1454,13 +1525,20 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSavePromptKey(key)
 	}
 
-	// Alt+Shift+U then A → toggle [All] on the Uncommitted tab.
+	// Alt+Shift+U then A/S/P → toggle [All], stash, or unstash.
 	// Must precede Select-all so Alt+A doesn't get consumed.
 	if m.pendingUncommittedAll {
 		m.pendingUncommittedAll = false
-		if (ks == "a" || ks == "A" || ks == "alt+a" || ks == "alt+A") && m.gitPanel != nil {
-			m.gitPanel.ToggleUncommittedAll()
-			return m, nil
+		if m.gitPanel != nil {
+			switch {
+			case ks == "a" || ks == "A" || ks == "alt+a" || ks == "alt+A":
+				m.gitPanel.ToggleUncommittedAll()
+				return m, nil
+			case ks == "s" || ks == "S" || ks == "alt+s" || ks == "alt+S":
+				return m, m.gitPanel.StashAll()
+			case ks == "p" || ks == "P" || ks == "alt+p" || ks == "alt+P":
+				return m, m.gitPanel.TriggerUnstash()
+			}
 		}
 	}
 
@@ -3513,6 +3591,7 @@ type gitBranchesLoadedMsg struct {
 	dirty          bool // working tree has uncommitted changes
 	conflicts      bool // working tree has merge conflicts
 	hasIndexStaged bool // git index has staged changes (via git add)
+	hasStash       bool // stash list is non-empty
 }
 
 // gitBranchFullyLoadedMsg carries commit nodes with their diff stats,
@@ -3549,6 +3628,10 @@ type branchCreatedMsg struct{ name string }
 type branchCreateFailedMsg struct{ reason string }
 type commitSucceededMsg struct{ message string }
 type commitFailedMsg struct{ reason string }
+type stashSucceededMsg struct{ count int }
+type stashFailedMsg struct{ reason string }
+type unstashSucceededMsg struct{}
+type unstashFailedMsg struct{ reason string }
 
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.
@@ -3606,6 +3689,7 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 			dirty:          dirty,
 			conflicts:      conflicts,
 			hasIndexStaged: hasIndexStaged,
+			hasStash:       gc.HasStash(),
 		}
 	}
 }

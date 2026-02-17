@@ -32,13 +32,24 @@ const (
 	stagingStateCount                   // sentinel for cycling
 )
 
+// optionFocus tracks which badge in the options bar is focused.
+type optionFocus int8
+
+const (
+	optionNone    optionFocus = iota // no options bar focus
+	optionAll                        // [All] badge focused
+	optionStash                      // [Stash] badge focused
+	optionUnstash                    // [Unstash] badge focused
+)
+
 // uncommittedTab holds the list state for the Uncommitted files tab.
 type uncommittedTab struct {
 	listState
-	stagingStates  []StagingState     // parallel to listState.entries
-	optionsFocused bool               // focus on [All] options bar
-	allEntries     []uncommittedEntry // full cached set from initial LoadData
-	allStaging     []StagingState     // staging states parallel to allEntries
+	stagingStates []StagingState     // parallel to listState.entries
+	optionFocus   optionFocus        // which options badge is focused
+	hasStash      bool               // true when git stash list is non-empty
+	allEntries    []uncommittedEntry // full cached set from initial LoadData
+	allStaging    []StagingState     // staging states parallel to allEntries
 }
 
 // allStaged returns true when every entry is in StagingStaged state.
@@ -154,13 +165,17 @@ func renderStagingIcon(staging StagingState, width int, selected bool, p theme.P
 }
 
 // renderOptionsBar renders the staging options row for the uncommitted tab.
-// Contains [All] toggle to stage all files.
+// Contains [All] toggle, [Stash] action, and conditionally [Unstash].
 func renderOptionsBar(ut *uncommittedTab, width int, th *theme.Theme) string {
 	p := th.Palette
 	allActive := ut.allStaged()
-	style := badgeStyle(p, allActive, ut.optionsFocused)
-	badge := style.Render("[All]")
-	content := " " + badge
+	allStyle := badgeStyle(p, allActive, ut.optionFocus == optionAll)
+	stashStyle := badgeStyle(p, false, ut.optionFocus == optionStash)
+	content := " " + allStyle.Render("[All]") + " " + stashStyle.Render("[Stash]")
+	if ut.hasStash {
+		unstashStyle := badgeStyle(p, false, ut.optionFocus == optionUnstash)
+		content += " " + unstashStyle.Render("[Unstash]")
+	}
 	return padToWidth(content, width, p)
 }
 

@@ -87,7 +87,10 @@
       "Bash(export PATH=\"$HOME/go/bin:$PATH\")",
       "Bash(~/go/bin/gocyclo -over 3 ./ui/diffview/align.go)",
       "Bash(~/go/bin/gocyclo:*)",
-      "Bash(gofmt:*)"
+      "Bash(gofmt:*)",
+      "Bash(GOFLAGS='' go build:*)",
+      "Bash(git submodule update:*)",
+      "Bash(chmod:*)"
     ]
   }
 }

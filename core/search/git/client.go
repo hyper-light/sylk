@@ -299,6 +299,45 @@ func (c *GitClient) fileExists(path string) bool {
 	return err == nil
 }
 
+// StashFiles stashes the specified files using git stash push.
+// If no paths are given, the call is a no-op.
+func (c *GitClient) StashFiles(paths []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	args := []string{"stash", "push", "-m", "sylk: stash", "--"}
+	args = append(args, paths...)
+	_, err := c.runGitCommand(args...)
+	return err
+}
+
+// UnstashFiles pops the most recent stash entry.
+func (c *GitClient) UnstashFiles() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+	_, err := c.runGitCommand("stash", "pop")
+	return err
+}
+
+// HasStash reports whether the stash list is non-empty.
+func (c *GitClient) HasStash() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.isRepo {
+		return false
+	}
+	out, err := c.runGitCommand("stash", "list")
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
 // IsValidCommit checks if a commit reference is valid.
 func (c *GitClient) IsValidCommit(ref string) bool {
 	_, err := c.runGitCommand("rev-parse", "--verify", ref+"^{commit}")
