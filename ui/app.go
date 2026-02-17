@@ -1152,6 +1152,74 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
+	case committree.PullBranchMsg:
+		if m.gitClient != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Pulling " + typed.Name + "...")
+			gc := m.gitClient
+			name := typed.Name
+			return m, func() tea.Msg {
+				if err := gc.PullBranch(name, ""); err != nil {
+					return pullFailedMsg{reason: err.Error()}
+				}
+				return pullSucceededMsg{name: name}
+			}
+		}
+		return m, nil
+
+	case pullSucceededMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash("Pulled branch " + typed.name)
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case pullFailedMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
+	case committree.PushBranchMsg:
+		if m.gitClient != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Pushing " + typed.Name + "...")
+			gc := m.gitClient
+			name := typed.Name
+			return m, func() tea.Msg {
+				if err := gc.PushBranch(name, ""); err != nil {
+					return pushFailedMsg{reason: err.Error()}
+				}
+				return pushSucceededMsg{name: name}
+			}
+		}
+		return m, nil
+
+	case pushSucceededMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash("Pushed branch " + typed.name)
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case pushFailedMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
 	case gitBranchDAGLoadedMsg:
 		if m.commitTree != nil {
 			m.commitTree.SetDAGNodesWithStats(typed.nodes, typed.stats, typed.graphRows, typed.maxGraphLane)
@@ -3651,6 +3719,10 @@ type stashSucceededMsg struct{ count int }
 type stashFailedMsg struct{ reason string }
 type unstashSucceededMsg struct{}
 type unstashFailedMsg struct{ reason string }
+type pullSucceededMsg struct{ name string }
+type pullFailedMsg struct{ reason string }
+type pushSucceededMsg struct{ name string }
+type pushFailedMsg struct{ reason string }
 
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.

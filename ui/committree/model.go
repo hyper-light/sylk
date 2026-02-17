@@ -129,6 +129,8 @@ const (
 	toolbarDiffCancel        // Diff mode: cancel diff.
 	toolbarMergeOk           // Merge mode: confirm merge.
 	toolbarMergeAbort        // Merge mode: abort merge.
+	toolbarPull              // Branch view: pull highlighted branch from remote.
+	toolbarPush              // Branch view: push highlighted branch to remote.
 )
 
 // CreateBranchRequestMsg is emitted when the user confirms a branch name
@@ -141,6 +143,16 @@ type CreateBranchRequestMsg struct {
 
 // MergeBranchMsg is emitted when the user activates the Merge toolbar button.
 type MergeBranchMsg struct {
+	Name string
+}
+
+// PullBranchMsg is emitted when the user activates the Pull toolbar button.
+type PullBranchMsg struct {
+	Name string
+}
+
+// PushBranchMsg is emitted when the user activates the Push toolbar button.
+type PushBranchMsg struct {
 	Name string
 }
 
@@ -1244,6 +1256,13 @@ func (m *Model) clickToolbar(viewX, localY int) tea.Cmd {
 	if idx < 0 {
 		return nil
 	}
+	// Resolve the button ID to check enabled state.
+	left := m.diffToolbarLeftButtons()
+	right := m.toolbarButtons()
+	all := slices.Concat(left, right)
+	if idx < len(all) && !m.isToolbarButtonEnabled(all[idx]) {
+		return nil
+	}
 	if m.expandedIdx >= 0 {
 		m.collapseBranch()
 	}
@@ -1302,7 +1321,8 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 	if m.mode == viewCommits {
 		label = "Commits"
 	}
-	return renderToolbarButtons(m.toolbarButtons(), m.toolbarAction, m.toolbarFocused, m.hoverButtonIdx, m.toolbarActiveIdx(), label, m.width, m.theme.Palette)
+	buttons := m.toolbarButtons()
+	return renderToolbarButtons(buttons, m.toolbarAction, m.toolbarFocused, m.hoverButtonIdx, m.toolbarActiveIdx(), m.disabledToolbarSet(buttons), label, m.width, m.theme.Palette)
 }
 
 // toolbarActiveIdx returns the index of the currently toggled-on toolbar
@@ -1858,8 +1878,13 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 			m.moveBranchUp()
 		}
 	case "tab":
+		buttons := m.toolbarButtons()
+		first := m.firstEnabledToolbar(buttons)
+		if first < 0 {
+			return nil
+		}
 		m.toolbarFocused = true
-		m.toolbarAction = 0
+		m.toolbarAction = first
 		m.viewDirty = true
 		return nil
 	case "shift+tab":
@@ -1882,22 +1907,27 @@ func (m *Model) handleBranchToolbarKey(km tea.KeyMsg) tea.Cmd {
 
 	switch km.String() {
 	case "tab":
-		next := m.toolbarAction + 1
-		if next >= len(buttons) {
+		next := m.nextEnabledToolbar(m.toolbarAction, +1, buttons)
+		if next < 0 {
 			m.toolbarFocused = false
 		} else {
 			m.toolbarAction = next
 		}
 	case "shift+tab":
-		if m.toolbarAction > 0 {
-			m.toolbarAction--
-		} else {
+		next := m.nextEnabledToolbar(m.toolbarAction, -1, buttons)
+		if next < 0 {
 			m.toolbarFocused = false
+		} else {
+			m.toolbarAction = next
 		}
 	case "h", "left":
-		m.toolbarAction = max(m.toolbarAction-1, 0)
+		if prev := m.nextEnabledToolbar(m.toolbarAction, -1, buttons); prev >= 0 {
+			m.toolbarAction = prev
+		}
 	case "l", "right":
-		m.toolbarAction = min(m.toolbarAction+1, len(buttons)-1)
+		if next := m.nextEnabledToolbar(m.toolbarAction, +1, buttons); next >= 0 {
+			m.toolbarAction = next
+		}
 	case "enter", " ":
 		m.viewDirty = true
 		return m.executeToolbarAction()
@@ -1909,6 +1939,37 @@ func (m *Model) handleBranchToolbarKey(km tea.KeyMsg) tea.Cmd {
 	}
 	m.viewDirty = true
 	return nil
+}
+
+// nextEnabledToolbar returns the next enabled toolbar index from `from` in the
+// given direction (+1 or -1), skipping disabled buttons. Returns -1 if none.
+func (m *Model) nextEnabledToolbar(from, delta int, buttons []int) int {
+	for i := from + delta; i >= 0 && i < len(buttons); i += delta {
+		if m.isToolbarButtonEnabled(buttons[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+// firstEnabledToolbar returns the index of the first enabled button, or -1.
+func (m *Model) firstEnabledToolbar(buttons []int) int {
+	for i, id := range buttons {
+		if m.isToolbarButtonEnabled(id) {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastEnabledToolbar returns the index of the last enabled button, or -1.
+func (m *Model) lastEnabledToolbar(buttons []int) int {
+	for i := len(buttons) - 1; i >= 0; i-- {
+		if m.isToolbarButtonEnabled(buttons[i]) {
+			return i
+		}
+	}
+	return -1
 }
 
 // expandedVisibleActions returns the ordered action IDs for the currently
@@ -2024,9 +2085,13 @@ func (m *Model) handleExpandedToolbarKey(km tea.KeyMsg) tea.Cmd {
 		m.toolbarFocused = false
 		m.expandedAction = 0
 	case "h", "left":
-		m.toolbarAction = max(m.toolbarAction-1, 0)
+		if prev := m.nextEnabledToolbar(m.toolbarAction, -1, buttons); prev >= 0 {
+			m.toolbarAction = prev
+		}
 	case "l", "right":
-		m.toolbarAction = min(m.toolbarAction+1, len(buttons)-1)
+		if next := m.nextEnabledToolbar(m.toolbarAction, +1, buttons); next >= 0 {
+			m.toolbarAction = next
+		}
 	case "enter", " ":
 		m.viewDirty = true
 		return m.executeToolbarAction()
@@ -2235,6 +2300,36 @@ func (m *Model) insertCreateRunes(inserted []rune) {
 	m.createCursor += len(inserted)
 }
 
+// isToolbarButtonEnabled reports whether a toolbar button ID is currently
+// usable. Pull and Merge are disabled when the working tree is dirty.
+func (m *Model) isToolbarButtonEnabled(buttonID int) bool {
+	switch buttonID {
+	case toolbarPull, toolbarMerge:
+		return !m.workingDirty && !m.workingConflicts
+	}
+	return true
+}
+
+// disabledToolbarSet returns the set of toolbar-index positions that are
+// disabled, given a slice of button IDs.
+func (m *Model) disabledToolbarSet(buttons []int) map[int]bool {
+	var s map[int]bool
+	for i, id := range buttons {
+		if !m.isToolbarButtonEnabled(id) {
+			if s == nil {
+				s = make(map[int]bool, len(buttons))
+			}
+			s[i] = true
+		}
+	}
+	return s
+}
+
+// HighlightedBranch returns the name of the currently highlighted branch.
+func (m *Model) HighlightedBranch() string {
+	return m.selectedBranchName()
+}
+
 // selectedBranchName returns the name of the currently selected branch.
 func (m *Model) selectedBranchName() string {
 	if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
@@ -2408,6 +2503,9 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 	if m.toolbarAction < 0 || m.toolbarAction >= len(all) {
 		return nil
 	}
+	if !m.isToolbarButtonEnabled(all[m.toolbarAction]) {
+		return nil
+	}
 	switch all[m.toolbarAction] {
 	case toolbarCreate:
 		if m.diffMode {
@@ -2477,6 +2575,18 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 	case toolbarMergeAbort:
 		m.exitMergeMode()
 		return nil
+	case toolbarPull:
+		name := m.selectedBranchName()
+		if name == "" {
+			return nil
+		}
+		return func() tea.Msg { return PullBranchMsg{Name: name} }
+	case toolbarPush:
+		name := m.selectedBranchName()
+		if name == "" {
+			return nil
+		}
+		return func() tea.Msg { return PushBranchMsg{Name: name} }
 	}
 	return nil
 }
@@ -2678,21 +2788,27 @@ func (m *Model) handleCommitDAGKey(km tea.KeyMsg) tea.Cmd {
 func (m *Model) cycleCommitToolbar(delta int) {
 	left := m.diffToolbarLeftButtons()
 	right := m.toolbarButtons()
-	total := len(left) + len(right)
-	if total == 0 {
+	all := slices.Concat(left, right)
+	if len(all) == 0 {
 		return
 	}
 	if !m.toolbarFocused {
 		m.toolbarFocused = true
+		var start int
 		if delta > 0 {
-			m.toolbarAction = 0
+			start = m.firstEnabledToolbar(all)
 		} else {
-			m.toolbarAction = total - 1
+			start = m.lastEnabledToolbar(all)
 		}
+		if start < 0 {
+			m.toolbarFocused = false
+			return
+		}
+		m.toolbarAction = start
 		return
 	}
-	next := m.toolbarAction + delta
-	if next >= total || next < 0 {
+	next := m.nextEnabledToolbar(m.toolbarAction, delta, all)
+	if next < 0 {
 		m.toolbarFocused = false
 		return
 	}
@@ -3205,7 +3321,7 @@ func (m *Model) viewTopPad() int {
 func (m *Model) toolbarButtons() []int {
 	switch m.mode {
 	case viewBranches:
-		return []int{toolbarCreate, toolbarMerge, toolbarDiff}
+		return []int{toolbarCreate, toolbarMerge, toolbarPull, toolbarPush, toolbarDiff}
 	case viewCommits:
 		return []int{toolbarBack, toolbarDiff}
 	default:

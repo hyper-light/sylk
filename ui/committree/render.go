@@ -1535,6 +1535,8 @@ var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarDiffCancel: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 	toolbarMergeOk:    {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	toolbarMergeAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	toolbarPull:       {icon: "↓", label: "Pull", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
+	toolbarPush:       {icon: "↑", label: "Push", accent: func(p theme.Palette) lipgloss.Color { return p.Lavender }},
 }
 
 // toolbarCellWidths returns the visual width of each button cell.
@@ -1554,7 +1556,7 @@ func toolbarCellWidths(buttons []int) []int {
 // hoverIdx highlights a button on mouse hover (-1 = no hover).
 // activeIdx marks a button as toggled on (-1 = none active); active buttons
 // render with bold + accent to distinguish them from merely focused buttons.
-func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx int, activeIdx int, modeLabel string, width int, p theme.Palette) string {
+func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx int, activeIdx int, disabled map[int]bool, modeLabel string, width int, p theme.Palette) string {
 	if len(buttons) == 0 {
 		empty := strings.Repeat(" ", max(width, 0))
 		return empty + "\n" + empty
@@ -1577,10 +1579,12 @@ func renderToolbarButtons(buttons []int, selectedIdx int, focused bool, hoverIdx
 		selected := focused && i == selectedIdx
 		hovered := i == hoverIdx && !selected && !active
 		fg := p.Muted
-		if active || selected || hovered {
+		if disabled[i] {
+			fg = p.Subtle
+		} else if active || selected || hovered {
 			fg = def.accent(p)
 		}
-		text := lipgloss.NewStyle().Foreground(fg).Bold(active).Render(def.icon + " " + def.label)
+		text := lipgloss.NewStyle().Foreground(fg).Bold(active && !disabled[i]).Render(def.icon + " " + def.label)
 		padded := " " + text + " "
 		cells[i] = btnMeasure{inner: padded, width: widths[i]}
 		totalInner += widths[i]

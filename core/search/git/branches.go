@@ -910,6 +910,38 @@ func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
 	return err
 }
 
+// PullBranch fetches and merges the named branch from the given remote.
+// If remoteName is empty, "origin" is used as the default.
+func (c *GitClient) PullBranch(branchName, remoteName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+	if remoteName == "" {
+		remoteName = "origin"
+	}
+	_, err := c.runGitCommand("pull", remoteName, branchName)
+	return err
+}
+
+// PushBranch pushes the named branch to the given remote.
+// If remoteName is empty, "origin" is used as the default.
+func (c *GitClient) PushBranch(branchName, remoteName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+	if remoteName == "" {
+		remoteName = "origin"
+	}
+	_, err := c.runGitCommand("push", remoteName, branchName)
+	return err
+}
+
 // DeleteBranch removes a local branch reference.
 // Returns ErrDeleteCheckedOut if the branch is currently checked out.
 // Returns ErrNotGitRepo if not a git repository.
