@@ -903,6 +903,15 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, tea.Batch(cmds...)
+	case gitQuickStatusMsg:
+		if m.commitTree != nil {
+			m.commitTree.SetWorkingTreeStatus(typed.dirty, typed.conflicts)
+			m.commitTree.SetHasIndexStaged(typed.hasIndexStaged)
+		}
+		if m.gitPanel != nil {
+			m.gitPanel.SetHasStash(typed.hasStash)
+		}
+		return m, nil
 	case gitBranchesLoadedMsg:
 		if m.commitTree != nil {
 			m.commitTree.SetBranches(typed.branches, typed.defaultBranch)
@@ -930,7 +939,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitPanel != nil {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
-		cmds = append(cmds, m.loadGitBranchesCmd())
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
 		return m, tea.Batch(cmds...)
 
 	case gitpanel.BranchCheckoutBlockedMsg:
@@ -1060,7 +1069,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitPanel != nil {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
-		cmds = append(cmds, m.loadGitBranchesCmd())
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
 		if m.commitTree != nil {
 			_, doneCmd := m.commitTree.Update(committree.CommitDoneMsg{OK: true, Message: typed.message})
 			cmds = append(cmds, doneCmd)
@@ -1100,7 +1109,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitPanel != nil {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
-		cmds = append(cmds, m.loadGitBranchesCmd())
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
 		return m, tea.Batch(cmds...)
 
 	case stashFailedMsg:
@@ -1133,7 +1142,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitPanel != nil {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
-		cmds = append(cmds, m.loadGitBranchesCmd())
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
 		return m, tea.Batch(cmds...)
 
 	case unstashFailedMsg:
@@ -3583,6 +3592,16 @@ func (m *AppModel) exitEditMode() {
 // Git mode (Alt+G)
 // ---------------------------------------------------------------------------
 
+// gitQuickStatusMsg carries lightweight working-tree + stash state so that
+// UI elements (commit button, unstash badge) can update without waiting for
+// the full branch enumeration in loadGitBranchesCmd.
+type gitQuickStatusMsg struct {
+	dirty          bool
+	conflicts      bool
+	hasIndexStaged bool
+	hasStash       bool
+}
+
 // gitBranchesLoadedMsg carries branch data loaded asynchronously for the
 // commit tree panel's branch view.
 type gitBranchesLoadedMsg struct {
@@ -3686,6 +3705,30 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 		return gitBranchesLoadedMsg{
 			branches:       nodes,
 			defaultBranch:  defaultBranch,
+			dirty:          dirty,
+			conflicts:      conflicts,
+			hasIndexStaged: hasIndexStaged,
+			hasStash:       gc.HasStash(),
+		}
+	}
+}
+
+// quickGitStatusCmd returns a tea.Cmd that checks only working-tree dirty
+// state, index staging, and stash presence. Runs in O(index-scan) time
+// without the expensive branch enumeration and commit counting.
+func (m *AppModel) quickGitStatusCmd() tea.Cmd {
+	gc := m.gitClient
+	return func() tea.Msg {
+		statuses, hasIndexStaged, _ := gc.UncommittedFileStatuses()
+		dirty := len(statuses) > 0
+		var conflicts bool
+		for _, s := range statuses {
+			if s == "!" {
+				conflicts = true
+				break
+			}
+		}
+		return gitQuickStatusMsg{
 			dirty:          dirty,
 			conflicts:      conflicts,
 			hasIndexStaged: hasIndexStaged,

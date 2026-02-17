@@ -131,6 +131,10 @@ type BranchInfo struct {
 
 	// IsHead is true if this is the currently checked-out branch.
 	IsHead bool
+
+	// BirthHash is the commit hash at branch creation (from reflog <new> field).
+	// Empty if unavailable (e.g., cloned repo without local reflog).
+	BirthHash string
 }
 
 // =============================================================================

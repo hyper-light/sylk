@@ -77,6 +77,7 @@ func branchInfoFromRef(c *GitClient, ref *plumbing.Reference, headBranch string)
 	}
 
 	info.CreatedTime = c.branchCreatedTime(name)
+	info.BirthHash = c.branchReflogBirthHash(name)
 
 	return info
 }
@@ -138,6 +139,42 @@ func (c *GitClient) branchReflogCreatedTime(name string) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(ts, 0)
+}
+
+// branchReflogBirthHash reads the first reflog entry for the named branch and
+// returns the <new> hash if <old> is the zero hash (confirming a creation
+// entry). Returns empty string if the reflog is unavailable or the first
+// entry is not a creation entry (e.g., truncated reflog).
+func (c *GitClient) branchReflogBirthHash(name string) string {
+	reflogPath := filepath.Join(c.repoPath, ".git", "logs", "refs", "heads", name)
+	f, err := os.Open(reflogPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	var buf [512]byte
+	n, _ := f.Read(buf[:])
+	if n == 0 {
+		return ""
+	}
+
+	line := string(buf[:n])
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+
+	// Reflog format: <old> <new> <name> <<email>> <unix_ts> <tz>\t<msg>
+	fields := strings.SplitN(line, " ", 3)
+	if len(fields) < 2 {
+		return ""
+	}
+
+	oldHash, newHash := fields[0], fields[1]
+	if oldHash != plumbing.ZeroHash.String() {
+		return ""
+	}
+	return newHash
 }
 
 // BranchTipHash returns the full commit hash of the named local branch tip.
@@ -1121,17 +1158,21 @@ func (c *GitClient) CountBranchCommits(name string, limit int) (count int, cappe
 const inferWalkLimit = 200
 
 // InferBranchParents determines parent-child relationships between branches
-// using merge-base topology. For each non-default branch B, it finds the
-// non-default branch A whose merge-base with B is:
+// using a two-phase approach: birth-hash inference (primary) and first-parent
+// chain intersection (fallback for branches without reflogs).
 //
-//  1. NOT equal to MergeBase(B, default) — this filters siblings that both
-//     forked from the same point on the default branch.
-//  2. Closest to B's tip on the first-parent chain — this selects the most
-//     direct parent when multiple candidates exist.
+// Birth-hash: For each branch B with a birth hash from the reflog, find the
+// branch whose first-parent chain contains B's birth hash at the smallest
+// position (closest to tip). If the best match is the default branch, B is
+// top-level. This is merge-resilient because the birth commit never changes.
 //
-// Complexity: O(n) MergeBase calls against default + O(n²) pairwise calls +
-// O(n × walkLimit) for first-parent position maps. go-git's object cache
-// absorbs shared history, keeping actual I/O proportional to unique commits.
+// Topology fallback: For branches without a birth hash (cloned repos, missing
+// reflogs), find the non-default branch whose first-parent chain intersects
+// B's chain at the smallest position within B's unique portion (before where
+// B's chain meets default).
+//
+// Complexity: O(n × walkLimit) for first-parent position maps + O(n²) for
+// pairwise chain intersection checks.
 //
 // Returns child name → parent name. Only branches with a detected
 // non-default parent appear in the map.
@@ -1143,95 +1184,176 @@ func (c *GitClient) InferBranchParents(branches []BranchInfo, defaultBranch stri
 		return nil
 	}
 
-	// Load tip commit objects for all branches.
-	tips := make([]*object.Commit, len(branches))
 	defaultIdx := -1
 	for i, b := range branches {
-		co, err := c.repo.CommitObject(plumbing.NewHash(b.Hash))
-		if err != nil {
-			continue
-		}
-		tips[i] = co
 		if b.Name == defaultBranch {
 			defaultIdx = i
+			break
 		}
 	}
-	if defaultIdx < 0 || tips[defaultIdx] == nil {
+	if defaultIdx < 0 {
 		return nil
 	}
 
-	// Phase 1: compute each branch's merge-base with the default branch.
-	// This establishes the "fork point from default" used to distinguish
-	// siblings (same fork point) from parent-child (different fork point).
-	defaultBase := make([]plumbing.Hash, len(branches))
-	for i := range branches {
-		if i == defaultIdx || tips[i] == nil {
-			continue
-		}
-		bases, _ := tips[i].MergeBase(tips[defaultIdx])
-		if len(bases) > 0 {
-			defaultBase[i] = bases[0].Hash
-		}
+	// Build first-parent chain positions for ALL branches (including default).
+	chainPos := make([]map[plumbing.Hash]int, len(branches))
+	for i, b := range branches {
+		chainPos[i] = c.firstParentPositions(plumbing.NewHash(b.Hash))
+	}
+	if len(chainPos[defaultIdx]) == 0 {
+		return nil
 	}
 
-	// Phase 2: for each non-default branch, build a first-parent position
-	// map and find the closest non-default branch via pairwise merge-base.
 	parents := make(map[string]string, len(branches))
 	for i, b := range branches {
-		if i == defaultIdx || tips[i] == nil {
+		if i == defaultIdx || len(chainPos[i]) == 0 {
 			continue
 		}
 
-		// Build position map: commit hash → distance from tip on B's
-		// first-parent chain. Used to rank candidate parents by proximity.
-		chainPos := c.firstParentPositions(tips[i].Hash)
-
-		// Position of B's fork from default. Candidates must have their
-		// merge-base strictly closer to B's tip than this threshold —
-		// anything at or beyond this point is shared with default.
-		defForkPos := inferWalkLimit + 1
-		if p, ok := chainPos[defaultBase[i]]; ok {
-			defForkPos = p
+		// Phase 1: birth-hash inference.
+		if p := birthParent(i, b, branches, chainPos, defaultIdx); p >= 0 {
+			parents[b.Name] = branches[p].Name
+			continue
 		}
 
-		bestIdx := -1
-		bestPos := defForkPos // upper bound: must be in B's unique portion
-
-		for j := range branches {
-			if j == i || j == defaultIdx || tips[j] == nil {
-				continue
-			}
-			bases, _ := tips[i].MergeBase(tips[j])
-			if len(bases) == 0 {
-				continue
-			}
-			mb := bases[0].Hash
-
-			// Candidate parent: merge-base must lie on B's first-parent
-			// chain, strictly closer to tip than the default fork point.
-			pos, ok := chainPos[mb]
-			if !ok || pos >= defForkPos {
-				continue
-			}
-			// When the merge-base equals either branch's tip, one
-			// branch is a prefix of the other on the first-parent
-			// chain. Only the older branch can be the parent.
-			if (mb == tips[j].Hash || mb == tips[i].Hash) &&
-				!branchOlder(branches[j], branches[i]) {
-				continue
-			}
-			if pos < bestPos || (pos == bestPos && branchOlder(branches[j], branches[bestIdx])) {
-				bestIdx = j
-				bestPos = pos
-			}
+		// Phase 2: topology fallback (branch has unique commits off default).
+		defForkPos := firstParentForkPos(chainPos[i], chainPos[defaultIdx])
+		if p := topoParent(i, defForkPos, branches, chainPos, defaultIdx); p >= 0 {
+			parents[b.Name] = branches[p].Name
+			continue
 		}
 
-		if bestIdx >= 0 {
-			parents[b.Name] = branches[bestIdx].Name
+		// Phase 3: ownership fallback (branch tip is on default's chain but
+		// may fall within another branch's owned range).
+		if p := ownershipParent(i, branches, chainPos, defaultIdx); p >= 0 {
+			parents[b.Name] = branches[p].Name
 		}
 	}
 	breakCycles(parents)
 	return parents
+}
+
+// firstParentForkPos returns the position on the branch's first-parent chain
+// where it first intersects the default branch's first-parent chain. This is
+// the "fork point" — commits at this position or beyond are shared with
+// default and should not be used to establish parent-child relationships.
+//
+// Unlike merge-base (which considers all parents and shifts after merges),
+// first-parent intersection is stable across 3-way merges (the merge
+// commit's first parent stays on default's original line) and correctly
+// flattens for ff-merges (the entire merged chain becomes default's line).
+func firstParentForkPos(branchChain, defaultChain map[plumbing.Hash]int) int {
+	best := inferWalkLimit + 1
+	for hash, pos := range branchChain {
+		if _, onDefault := defaultChain[hash]; onDefault && pos < best {
+			best = pos
+		}
+	}
+	return best
+}
+
+// birthParent finds the parent of branch i using its birth hash.
+// Returns the index of the best parent branch, or -1 if no birth hash is
+// available or the branch was forked from default (top-level).
+//
+// Key invariant: if the birth hash is on default's first-parent chain, the
+// branch is unconditionally top-level. Sibling branches forked from default
+// after the birth point also contain the birth hash at a closer position,
+// but that does not make them the parent.
+func birthParent(i int, b BranchInfo, branches []BranchInfo,
+	chainPos []map[plumbing.Hash]int, defaultIdx int) int {
+
+	if b.BirthHash == "" {
+		return -1
+	}
+	bh := plumbing.NewHash(b.BirthHash)
+
+	// If the birth hash is anywhere on default's first-parent chain,
+	// this branch was forked from default → top-level.
+	if _, onDefault := chainPos[defaultIdx][bh]; onDefault {
+		return -1
+	}
+
+	best, bestPos := -1, inferWalkLimit+1
+	for j := range branches {
+		if j == i || j == defaultIdx || len(chainPos[j]) == 0 {
+			continue
+		}
+		pos, ok := chainPos[j][bh]
+		if !ok {
+			continue
+		}
+		if pos < bestPos || (pos == bestPos && best >= 0 && branchOlder(branches[j], branches[best])) {
+			best, bestPos = j, pos
+		}
+	}
+	return best
+}
+
+// topoParent finds the parent of branch i using first-parent chain
+// intersection (fallback for branches without a birth hash). Returns the
+// index of the best parent branch, or -1 if none found.
+func topoParent(i, defForkPos int, branches []BranchInfo,
+	chainPos []map[plumbing.Hash]int, defaultIdx int) int {
+
+	best, bestPos := -1, defForkPos
+	for j := range branches {
+		if j == i || j == defaultIdx || len(chainPos[j]) == 0 {
+			continue
+		}
+		if !branchOlder(branches[j], branches[i]) {
+			continue
+		}
+
+		pos := firstParentForkPos(chainPos[i], chainPos[j])
+		if pos >= defForkPos {
+			continue
+		}
+		if pos < bestPos || (pos == bestPos && best >= 0 && branchOlder(branches[j], branches[best])) {
+			best, bestPos = j, pos
+		}
+	}
+	return best
+}
+
+// ownershipParent finds the parent of branch i by checking which non-default
+// branch "owns" i's tip commit. Branch j owns a commit if it appears on j's
+// first-parent chain between j's tip (exclusive) and j's birth hash
+// (exclusive). This handles branches without reflogs whose tip sits on the
+// default chain but was actually forked from a feature branch.
+//
+// Among valid candidates, picks the one with the tightest owned range
+// (smallest birthPos on j's chain), then branchOlder as tiebreak.
+func ownershipParent(i int, branches []BranchInfo,
+	chainPos []map[plumbing.Hash]int, defaultIdx int) int {
+
+	tipHash := plumbing.NewHash(branches[i].Hash)
+
+	best, bestBirthPos := -1, inferWalkLimit+1
+	for j := range branches {
+		if j == i || j == defaultIdx || len(chainPos[j]) == 0 {
+			continue
+		}
+		if branches[j].BirthHash == "" {
+			continue
+		}
+
+		tipPos, onChain := chainPos[j][tipHash]
+		if !onChain || tipPos == 0 {
+			continue
+		}
+
+		birthHash := plumbing.NewHash(branches[j].BirthHash)
+		birthPos, hasBirth := chainPos[j][birthHash]
+		if !hasBirth || tipPos >= birthPos {
+			continue
+		}
+
+		if birthPos < bestBirthPos || (birthPos == bestBirthPos && best >= 0 && branchOlder(branches[j], branches[best])) {
+			best, bestBirthPos = j, birthPos
+		}
+	}
+	return best
 }
 
 // breakCycles removes edges that form cycles in the parent map.

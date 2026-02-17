@@ -90,7 +90,12 @@
       "Bash(gofmt:*)",
       "Bash(GOFLAGS='' go build:*)",
       "Bash(git submodule update:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(git fsck:*)",
+      "Bash(while read _ _ hash)",
+      "Bash(do echo \"=== $hash ===\")",
+      "Bash(git diff-tree:*)",
+      "Bash(git apply:*)"
     ]
   }
 }
