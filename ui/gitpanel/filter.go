@@ -103,6 +103,9 @@ type listState struct {
 
 	// Initial load indicator: true from LoadData() until first page arrives.
 	initialLoading bool
+	// loadedOnce is set after the first data delivery. Prevents re-showing
+	// the initial spinner on subsequent LoadData() calls for empty tabs.
+	loadedOnce bool
 
 	// Sliding window: entries holds at most 2×listPageSize entries.
 	// windowStart is the absolute index of entries[0] in the full data set.

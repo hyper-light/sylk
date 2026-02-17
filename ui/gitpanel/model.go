@@ -308,7 +308,7 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 func (m *Model) LoadData() tea.Cmd {
 	now := time.Now()
 	setLoading := func(ls *listState) {
-		if len(ls.entries) == 0 {
+		if len(ls.entries) == 0 && !ls.loadedOnce {
 			ls.initialLoading = true
 		}
 		ls.loadingEpoch = now
@@ -353,6 +353,7 @@ func defaultBranchTipHash(gc *git.GitClient) string {
 func (m *Model) setCommitEntries(raw []commitEntry, hasMore bool) {
 	ls := &m.commits.listState
 	ls.initialLoading = false
+	ls.loadedOnce = true
 	ls.resetPagination()
 	ls.entries = make([]listEntry, len(raw))
 	for i, e := range raw {
@@ -381,6 +382,7 @@ func (m *Model) setBranchEntries(all []branchEntry) {
 	m.branches.dirtyTree = branchesDirtyTree(all)
 	ls := &m.branches.listState
 	ls.initialLoading = false
+	ls.loadedOnce = true
 	ls.resetPagination()
 
 	page := sliceBranchPage(all, 0, listPageSize)
@@ -421,6 +423,7 @@ func (m *Model) setTagEntries(all []tagEntry) {
 	m.tags.allEntries = all
 	ls := &m.tags.listState
 	ls.initialLoading = false
+	ls.loadedOnce = true
 	ls.resetPagination()
 
 	page := sliceTagPage(all, 0, listPageSize)
@@ -468,6 +471,7 @@ func (m *Model) setUncommittedEntries(all []uncommittedEntry) {
 
 	ls := &m.uncommitted.listState
 	ls.initialLoading = false
+	ls.loadedOnce = true
 	ls.resetPagination()
 
 	page := sliceUncommittedPage(all, 0, listPageSize)
