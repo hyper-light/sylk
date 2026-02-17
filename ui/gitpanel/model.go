@@ -302,16 +302,21 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 
 // LoadData returns a tea.Cmd that loads the first page of commits and
 // full data for branches, tags, and uncommitted files asynchronously.
+// Only shows the loading spinner for tabs with no existing entries;
+// tabs with data are refreshed silently to prevent flicker from
+// redundant loads (e.g. GitStatusMsg arriving after an explicit reload).
 func (m *Model) LoadData() tea.Cmd {
 	now := time.Now()
-	m.commits.initialLoading = true
-	m.commits.loadingEpoch = now
-	m.branches.initialLoading = true
-	m.branches.loadingEpoch = now
-	m.tags.initialLoading = true
-	m.tags.loadingEpoch = now
-	m.uncommitted.initialLoading = true
-	m.uncommitted.loadingEpoch = now
+	setLoading := func(ls *listState) {
+		if len(ls.entries) == 0 {
+			ls.initialLoading = true
+		}
+		ls.loadingEpoch = now
+	}
+	setLoading(&m.commits.listState)
+	setLoading(&m.branches.listState)
+	setLoading(&m.tags.listState)
+	setLoading(&m.uncommitted.listState)
 
 	gc := m.gitClient
 	commitStatLevel := m.commits.columns.StatLevel()
