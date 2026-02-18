@@ -50,6 +50,9 @@ type BranchCheckedOutMsg struct{ Name string }
 // BranchCheckoutBlockedMsg is emitted when checkout is blocked.
 type BranchCheckoutBlockedMsg struct{ Reason string }
 
+// CommitCheckedOutMsg is emitted after a successful commit checkout (detached HEAD).
+type CommitCheckedOutMsg struct{ Hash string }
+
 // StashRequestMsg is emitted when the user triggers a stash from the options bar.
 type StashRequestMsg struct {
 	Paths []string
@@ -75,6 +78,11 @@ type uncommittedLoadedMsg struct {
 }
 type checkoutResultMsg struct {
 	name string
+	err  error
+}
+
+type commitCheckoutResultMsg struct {
+	hash string
 	err  error
 }
 
@@ -298,6 +306,16 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 		}
 		return m, func() tea.Msg {
 			return BranchCheckedOutMsg{Name: typed.name}
+		}
+
+	case commitCheckoutResultMsg:
+		if typed.err != nil {
+			return m, func() tea.Msg {
+				return BranchCheckoutBlockedMsg{Reason: typed.err.Error()}
+			}
+		}
+		return m, func() tea.Msg {
+			return CommitCheckedOutMsg{Hash: typed.hash}
 		}
 	}
 
@@ -881,10 +899,13 @@ func (m *Model) ToggleUncommittedAll() {
 
 // selectEntry handles enter on the currently selected entry.
 func (m *Model) selectEntry() tea.Cmd {
-	if m.activeTab != TabBranches {
-		return nil
+	switch m.activeTab {
+	case TabBranches:
+		return m.checkoutSelectedBranch()
+	case TabCommits:
+		return m.checkoutSelectedCommit()
 	}
-	return m.checkoutSelectedBranch()
+	return nil
 }
 
 // checkoutSelectedBranch attempts to checkout the selected branch.
@@ -922,6 +943,41 @@ func (m *Model) checkoutSelectedBranch() tea.Cmd {
 	name := entry.name
 	return func() tea.Msg {
 		return checkoutResultMsg{name: name, err: gc.CheckoutBranch(name)}
+	}
+}
+
+// checkoutSelectedCommit attempts to checkout the selected commit (detached HEAD).
+func (m *Model) checkoutSelectedCommit() tea.Cmd {
+	ls := &m.commits.listState
+	if len(ls.filtered) == 0 {
+		return nil
+	}
+
+	idx := ls.filtered[ls.cursor]
+	entry, ok := ls.entries[idx].(commitEntry)
+	if !ok {
+		return nil
+	}
+
+	if entry.isHead {
+		return nil // already at this commit
+	}
+
+	if m.headHasConflicts() {
+		return func() tea.Msg {
+			return BranchCheckoutBlockedMsg{Reason: "resolve conflicts before checking out"}
+		}
+	}
+	if m.headHasUncommitted() {
+		return func() tea.Msg {
+			return BranchCheckoutBlockedMsg{Reason: "commit or stash changes before checking out"}
+		}
+	}
+
+	gc := m.gitBus
+	hash := entry.hash
+	return func() tea.Msg {
+		return commitCheckoutResultMsg{hash: hash, err: gc.CheckoutCommit(hash)}
 	}
 }
 

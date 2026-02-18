@@ -98,6 +98,9 @@ var invokeTable = map[string]invokeEntry{
 	"checkout_branch": {op: OpCheckoutBranch, params: []string{"name"}, fn: func(b *GitBus, p map[string]any) (any, error) {
 		return nil, b.CheckoutBranch(str(p, "name"))
 	}},
+	"checkout_commit": {op: OpCheckoutCommit, params: []string{"commit_hash"}, fn: func(b *GitBus, p map[string]any) (any, error) {
+		return nil, b.CheckoutCommit(str(p, "commit_hash"))
+	}},
 	"create_branch": {op: OpCreateBranch, params: []string{"name", "at_commit_hash"}, fn: func(b *GitBus, p map[string]any) (any, error) {
 		return nil, b.CreateBranch(str(p, "name"), str(p, "at_commit_hash"))
 	}},
