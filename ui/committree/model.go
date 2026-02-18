@@ -131,6 +131,14 @@ const (
 	toolbarMergeAbort        // Merge mode: abort merge.
 	toolbarPull              // Branch view: pull highlighted branch from remote.
 	toolbarPush              // Branch view: push highlighted branch to remote.
+	toolbarReset             // Commit view: enter reset mode.
+	toolbarResetHard         // Reset mode: hard reset.
+	toolbarResetMixed        // Reset mode: mixed reset.
+	toolbarResetSoft         // Reset mode: soft reset.
+	toolbarResetAbort        // Reset mode: cancel.
+	toolbarRevert            // Commit view: revert selected commit.
+	toolbarRevertOk          // Revert mode: confirm revert.
+	toolbarRevertAbort       // Revert mode: cancel revert.
 )
 
 // CreateBranchRequestMsg is emitted when the user confirms a branch name
@@ -180,6 +188,18 @@ type BranchDiffCompareMsg struct {
 type MergeDiffCompareMsg struct {
 	Hashes []string // Tip commit hashes (for diff computation).
 	Names  []string // Branch names (for pane titles).
+}
+
+// ResetRequestMsg is emitted when the user selects a reset mode (hard/mixed/soft)
+// on a target commit.
+type ResetRequestMsg struct {
+	Hash string
+	Mode string // "hard", "mixed", "soft"
+}
+
+// RevertRequestMsg is emitted when the user activates the Revert toolbar button.
+type RevertRequestMsg struct {
+	Hash string
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +295,12 @@ type Model struct {
 	// Merge selection mode state.
 	mergeMode       bool
 	mergeSelections []diffSelection
+
+	// Reset mode state.
+	resetMode bool
+
+	// Revert mode state.
+	revertMode bool
 
 	// Toolbar state.
 	toolbarFocused bool // True when tab-focus is on the toolbar, not card actions.
@@ -1301,7 +1327,7 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 	if m.createInputActive {
 		return renderCreateInputToolbar(m.toolbarButtons(), m.createBranchName, m.createCursor, cursorVisible, m.width, m.theme.Palette)
 	}
-	if m.diffMode || m.mergeMode {
+	if m.diffMode || m.mergeMode || m.resetMode || m.revertMode {
 		left := m.diffToolbarLeftButtons()
 		right := m.toolbarButtons()
 		hint := ""
@@ -1329,13 +1355,19 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 // button, or -1 if none. Diff and Merge buttons support toggle state.
 // The index is offset by the left button count.
 func (m *Model) toolbarActiveIdx() int {
-	if !m.diffMode && !m.mergeMode {
+	if !m.diffMode && !m.mergeMode && !m.resetMode && !m.revertMode {
 		return -1
 	}
 	leftCount := len(m.diffToolbarLeftButtons())
 	target := toolbarDiff
 	if m.mergeMode {
 		target = toolbarMerge
+	}
+	if m.resetMode {
+		target = toolbarReset
+	}
+	if m.revertMode {
+		target = toolbarRevert
 	}
 	for i, id := range m.toolbarButtons() {
 		if id == target {
@@ -2306,6 +2338,9 @@ func (m *Model) isToolbarButtonEnabled(buttonID int) bool {
 	switch buttonID {
 	case toolbarPull, toolbarMerge:
 		return !m.workingDirty && !m.workingConflicts
+	case toolbarReset, toolbarResetHard, toolbarResetMixed, toolbarResetSoft,
+		toolbarRevert, toolbarRevertOk:
+		return !m.workingConflicts
 	}
 	return true
 }
@@ -2530,7 +2565,67 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		if m.diffMode {
 			m.exitDiffMode()
 		}
+		if m.resetMode {
+			m.exitResetMode()
+		}
+		if m.revertMode {
+			m.exitRevertMode()
+		}
 		m.ExitToBranches()
+		return nil
+	case toolbarReset:
+		if m.diffMode {
+			m.exitDiffMode()
+		}
+		if m.resetMode {
+			m.exitResetMode()
+		} else {
+			m.enterResetMode()
+		}
+		return nil
+	case toolbarResetHard:
+		hash := m.SelectedHash()
+		m.exitResetMode()
+		if hash == "" {
+			return nil
+		}
+		return func() tea.Msg { return ResetRequestMsg{Hash: hash, Mode: "hard"} }
+	case toolbarResetMixed:
+		hash := m.SelectedHash()
+		m.exitResetMode()
+		if hash == "" {
+			return nil
+		}
+		return func() tea.Msg { return ResetRequestMsg{Hash: hash, Mode: "mixed"} }
+	case toolbarResetSoft:
+		hash := m.SelectedHash()
+		m.exitResetMode()
+		if hash == "" {
+			return nil
+		}
+		return func() tea.Msg { return ResetRequestMsg{Hash: hash, Mode: "soft"} }
+	case toolbarResetAbort:
+		m.exitResetMode()
+		return nil
+	case toolbarRevert:
+		if m.resetMode {
+			m.exitResetMode()
+		}
+		if m.revertMode {
+			m.exitRevertMode()
+		} else {
+			m.enterRevertMode()
+		}
+		return nil
+	case toolbarRevertOk:
+		hash := m.SelectedHash()
+		m.exitRevertMode()
+		if hash == "" {
+			return nil
+		}
+		return func() tea.Msg { return RevertRequestMsg{Hash: hash} }
+	case toolbarRevertAbort:
+		m.exitRevertMode()
 		return nil
 	case toolbarDiff:
 		if m.mergeMode {
@@ -2657,8 +2752,16 @@ func (m *Model) moveBranchLeft() {
 // handleCommitKey processes keys in commit cards view.
 // Tab/shift+tab cycle through toolbar buttons; enter executes when focused.
 func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
-	// In diff mode, Esc exits diff selection instead of returning to branches.
+	// Esc exits the active mode before returning to branches.
 	if km.String() == "esc" {
+		if m.revertMode {
+			m.exitRevertMode()
+			return nil
+		}
+		if m.resetMode {
+			m.exitResetMode()
+			return nil
+		}
 		if m.diffMode {
 			m.exitDiffMode()
 			return nil
@@ -2853,6 +2956,8 @@ func (m *Model) ExitToBranches() {
 	m.toolbarFocused = false
 	m.diffMode = false
 	m.diffSelections = m.diffSelections[:0]
+	m.resetMode = false
+	m.revertMode = false
 	m.viewDirty = true
 }
 
@@ -2917,6 +3022,34 @@ func (m *Model) exitDiffMode() {
 	m.invalidateNodeCache()
 	m.invalidateCommitCardCache()
 	m.ensureVisible()
+	m.viewDirty = true
+}
+
+// enterResetMode activates reset mode, showing reset sub-buttons.
+func (m *Model) enterResetMode() {
+	m.resetMode = true
+	m.toolbarFocused = false
+	m.viewDirty = true
+}
+
+// exitResetMode deactivates reset mode.
+func (m *Model) exitResetMode() {
+	m.resetMode = false
+	m.toolbarFocused = false
+	m.viewDirty = true
+}
+
+// enterRevertMode activates revert confirmation mode.
+func (m *Model) enterRevertMode() {
+	m.revertMode = true
+	m.toolbarFocused = false
+	m.viewDirty = true
+}
+
+// exitRevertMode deactivates revert confirmation mode.
+func (m *Model) exitRevertMode() {
+	m.revertMode = false
+	m.toolbarFocused = false
 	m.viewDirty = true
 }
 
@@ -3323,15 +3456,23 @@ func (m *Model) toolbarButtons() []int {
 	case viewBranches:
 		return []int{toolbarCreate, toolbarMerge, toolbarPull, toolbarPush, toolbarDiff}
 	case viewCommits:
-		return []int{toolbarBack, toolbarDiff}
+		return []int{toolbarBack, toolbarReset, toolbarRevert, toolbarDiff}
 	default:
 		return nil
 	}
 }
 
-// diffToolbarLeftButtons returns the left-side diff toolbar buttons.
-// Returns nil when not in diff mode or fewer than 2 commits are selected.
+// diffToolbarLeftButtons returns the left-side toolbar buttons.
+// In reset mode, shows hard/mixed/soft/abort immediately.
+// In merge mode, shows ok/abort when selections are complete.
+// In diff mode, shows ok/cancel when 2+ commits are selected.
 func (m *Model) diffToolbarLeftButtons() []int {
+	if m.resetMode {
+		return []int{toolbarResetHard, toolbarResetMixed, toolbarResetSoft, toolbarResetAbort}
+	}
+	if m.revertMode {
+		return []int{toolbarRevertOk, toolbarRevertAbort}
+	}
 	if m.mergeMode {
 		if len(m.mergeSelections) >= maxMergeSelections {
 			return []int{toolbarMergeOk, toolbarMergeAbort}

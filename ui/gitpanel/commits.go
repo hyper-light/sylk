@@ -46,7 +46,7 @@ type commitsTab struct {
 // statLevel controls whether diff stats are computed inline.
 // Returns (entries, hasMore). isHead is only true for the very first
 // commit when skip == 0.
-func loadCommitsPage(gc *git.GitClient, defaultTipHash string, skip, pageSize int, statLevel git.DiffStatLevel) ([]commitEntry, bool) {
+func loadCommitsPage(gc *git.GitBus, defaultTipHash string, skip, pageSize int, statLevel git.DiffStatLevel) ([]commitEntry, bool) {
 	infos, hasMore, err := gc.GetAllCommitsPage(skip, pageSize)
 	if err != nil {
 		return nil, false

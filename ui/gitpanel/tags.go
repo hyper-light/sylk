@@ -30,7 +30,7 @@ type tagsTab struct {
 }
 
 // loadTags fetches tags from the git client and converts them to tagEntry values.
-func loadTags(gc *git.GitClient) []tagEntry {
+func loadTags(gc *git.GitBus) []tagEntry {
 	infos, err := gc.ListTags()
 	if err != nil {
 		return nil

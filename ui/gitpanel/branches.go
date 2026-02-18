@@ -53,7 +53,7 @@ const branchCommitLimit = 1000
 // loadBranches fetches branches from the git client and converts them to
 // branchEntry values. The HEAD branch is annotated with working tree state.
 // statLevel controls whether diff stats are computed inline.
-func loadBranches(gc *git.GitClient, statLevel git.DiffStatLevel) []branchEntry {
+func loadBranches(gc *git.GitBus, statLevel git.DiffStatLevel) []branchEntry {
 	infos, err := gc.ListBranches()
 	if err != nil {
 		return nil

@@ -97,7 +97,8 @@
       "Bash(git diff-tree:*)",
       "Bash(git apply:*)",
       "Bash(GONOSUMCHECK=*:*)",
-      "Bash(GOFLAGS=-mod=mod go get:*)"
+      "Bash(GOFLAGS=-mod=mod go get:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }

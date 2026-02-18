@@ -1537,6 +1537,14 @@ var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarMergeAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 	toolbarPull:       {icon: "↓", label: "Pull", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
 	toolbarPush:       {icon: "↑", label: "Push", accent: func(p theme.Palette) lipgloss.Color { return p.Lavender }},
+	toolbarReset:      {icon: "⟲", label: "Reset", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
+	toolbarResetHard:  {icon: "↩", label: "Hard", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
+	toolbarResetMixed: {icon: "⇠", label: "Mixed", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
+	toolbarResetSoft:  {icon: "⇜", label: "Soft", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarResetAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	toolbarRevert:      {icon: "↶", label: "Revert", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
+	toolbarRevertOk:    {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarRevertAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 }
 
 // toolbarCellWidths returns the visual width of each button cell.
