@@ -126,7 +126,7 @@ type Model struct {
 	height    int
 
 	theme      *theme.Theme
-	gitClient  *git.GitClient
+	gitBus     *git.GitBus
 	configPath string
 	viewDirty  bool
 
@@ -142,10 +142,10 @@ type Model struct {
 
 // New creates a new git panel model. configPath is the path to the YAML
 // config file for persisting column layout.
-func New(th *theme.Theme, gc *git.GitClient, configPath string) *Model {
+func New(th *theme.Theme, bus *git.GitBus, configPath string) *Model {
 	m := &Model{
 		theme:      th,
-		gitClient:  gc,
+		gitBus:     bus,
 		configPath: configPath,
 		viewDirty:  true,
 	}
@@ -326,7 +326,7 @@ func (m *Model) LoadData() tea.Cmd {
 	setLoading(&m.tags.listState)
 	setLoading(&m.uncommitted.listState)
 
-	gc := m.gitClient
+	gc := m.gitBus
 	commitStatLevel := m.commits.columns.StatLevel()
 	branchStatLevel := m.branches.columns.StatLevel()
 	m.commits.statsLevel = commitStatLevel
@@ -348,7 +348,7 @@ func (m *Model) LoadData() tea.Cmd {
 
 // defaultBranchTipHash returns the full commit hash of the default branch tip,
 // or an empty string if unavailable. Uses O(1) reference lookup.
-func defaultBranchTipHash(gc *git.GitClient) string {
+func defaultBranchTipHash(gc *git.GitBus) string {
 	name := gc.DefaultBranch()
 	if name == "" {
 		return ""
@@ -918,7 +918,7 @@ func (m *Model) checkoutSelectedBranch() tea.Cmd {
 		}
 	}
 
-	gc := m.gitClient
+	gc := m.gitBus
 	name := entry.name
 	return func() tea.Msg {
 		return checkoutResultMsg{name: name, err: gc.CheckoutBranch(name)}
@@ -1605,7 +1605,7 @@ func collectBranchHashes(entries []branchEntry) []string {
 // loadCommitStatsCmd returns an async command that fetches stats for the
 // currently loaded commit entries.
 func (m *Model) loadCommitStatsCmd(level git.DiffStatLevel) tea.Cmd {
-	gc := m.gitClient
+	gc := m.gitBus
 	hashes := collectCommitHashes(&m.commits.listState)
 	return func() tea.Msg {
 		if level >= git.DiffStatLines {
@@ -1624,7 +1624,7 @@ func (m *Model) loadCommitStatsCmd(level git.DiffStatLevel) tea.Cmd {
 // loadBranchStatsCmd returns an async command that fetches stats for all
 // cached branch entries (full set, not just the current window).
 func (m *Model) loadBranchStatsCmd(level git.DiffStatLevel) tea.Cmd {
-	gc := m.gitClient
+	gc := m.gitBus
 	hashes := collectBranchHashes(m.branches.allEntries)
 	return func() tea.Msg {
 		if level >= git.DiffStatLines {
@@ -2012,7 +2012,7 @@ func (m *Model) loadMoreCmd() tea.Cmd {
 // loadMoreCommitsCmd returns an async command that fetches the next page
 // of commits from the git client.
 func (m *Model) loadMoreCommitsCmd() tea.Cmd {
-	gc := m.gitClient
+	gc := m.gitBus
 	// Skip is the absolute offset past all loaded entries (window start + window size).
 	skip := m.commits.windowStart + len(m.commits.entries)
 	defaultTipHash := defaultBranchTipHash(gc)
@@ -2080,7 +2080,7 @@ func (m *Model) loadPrevCmd() tea.Cmd {
 
 // loadPrevCommitsCmd fetches the page before the current window from git.
 func (m *Model) loadPrevCommitsCmd() tea.Cmd {
-	gc := m.gitClient
+	gc := m.gitBus
 	ws := m.commits.windowStart
 	start := max(ws-listPageSize, 0)
 	count := ws - start

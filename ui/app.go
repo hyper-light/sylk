@@ -316,7 +316,9 @@ type AppModel struct {
 	savedEditFocus component.FocusID // Last focused panel in edit mode.
 
 	// Git mode resources.
-	gitClient        *git.GitClient    // Git client for data loading (nil if not a repo).
+	gitClient        *git.GitClient    // Git client for StatusWatcher and direct low-level use (nil if not a repo).
+	gitBus           *git.GitBus       // All operations route through the bus.
+	gitBridge        *bridge.GitBridge // Forwards mutation events to Bubble Tea.
 	gitPanel         *gitpanel.Model   // Git explorer panel (left slot in git mode).
 	commitTree       *committree.Model // Commit tree visualization (right slot in git mode).
 	savedGitLeftIdx  int               // Saved leftRing.index before git mode.
@@ -659,8 +661,10 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	// Git status watcher for file tree decorations.
 	if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
 		app.gitClient = gc
+		app.gitBus = git.NewGitBus(gc)
+		app.gitBridge = bridge.NewGitBridge(app.gitBus, deps.Scope)
 		configPath := filepath.Join(cfg.ProjectRoot, ".sylk", "config.yaml")
-		app.gitPanel = gitpanel.New(th, gc, configPath)
+		app.gitPanel = gitpanel.New(th, app.gitBus, configPath)
 		app.commitTree = committree.New(th)
 		if sw, err := git.NewStatusWatcher(gc); err == nil {
 			app.gitWatcher = sw
@@ -923,7 +927,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case committree.BranchSelectedMsg:
-		if m.viewMode == ViewGit && m.gitClient != nil {
+		if m.viewMode == ViewGit && m.gitBus != nil {
 			defaultBranch := ""
 			if m.commitTree != nil {
 				defaultBranch = m.commitTree.GetDefaultBranch()
@@ -947,11 +951,11 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case committree.BranchSwitchMsg:
-		if m.gitClient != nil {
-			gc := m.gitClient
+		if m.gitBus != nil {
+			bus := m.gitBus
 			name := typed.Name
 			return m, func() tea.Msg {
-				if err := gc.CheckoutBranch(name); err != nil {
+				if err := bus.CheckoutBranch(name); err != nil {
 					return gitpanel.BranchCheckoutBlockedMsg{Reason: err.Error()}
 				}
 				return gitpanel.BranchCheckedOutMsg{Name: name}
@@ -960,11 +964,11 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case committree.BranchDeleteMsg:
-		if m.gitClient != nil {
-			gc := m.gitClient
+		if m.gitBus != nil {
+			bus := m.gitBus
 			name := typed.Name
 			return m, func() tea.Msg {
-				if err := gc.DeleteBranch(name); err != nil {
+				if err := bus.DeleteBranch(name); err != nil {
 					return branchDeleteFailedMsg{reason: err.Error()}
 				}
 				return branchDeletedMsg{name: name}
@@ -1013,17 +1017,17 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case committree.CreateBranchRequestMsg:
-		if m.gitClient != nil {
+		if m.gitBus != nil {
 			m.commitTree.RecordBranchParent(typed.Name, typed.ParentBranch)
-			gc := m.gitClient
+			bus := m.gitBus
 			name := typed.Name
 			parent := typed.ParentBranch
 			return m, func() tea.Msg {
-				tipHash, err := gc.BranchTipHash(parent)
+				tipHash, err := bus.BranchTipHash(parent)
 				if err != nil {
 					return branchCreateFailedMsg{reason: err.Error()}
 				}
-				if err := gc.CreateBranch(name, tipHash); err != nil {
+				if err := bus.CreateBranch(name, tipHash); err != nil {
 					return branchCreateFailedMsg{reason: err.Error()}
 				}
 				return branchCreatedMsg{name: name}
@@ -1046,15 +1050,15 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case committree.CommitRequestMsg:
-		if m.gitClient != nil && m.gitPanel != nil {
-			gc := m.gitClient
+		if m.gitBus != nil && m.gitPanel != nil {
+			bus := m.gitBus
 			paths := m.gitPanel.StagedFilePaths()
 			message := typed.Message
 			return m, func() tea.Msg {
 				if len(paths) == 0 {
 					return commitFailedMsg{reason: "no files staged"}
 				}
-				if err := gc.CommitFiles(paths, message); err != nil {
+				if err := bus.CommitFiles(paths, message); err != nil {
 					return commitFailedMsg{reason: err.Error()}
 				}
 				return commitSucceededMsg{message: message}
@@ -1085,13 +1089,13 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case gitpanel.StashRequestMsg:
-		if m.gitClient != nil && m.commitTree != nil {
+		if m.gitBus != nil && m.commitTree != nil {
 			m.commitTree.SetLoadingMessage(fmt.Sprintf("Stashing %d files...", typed.Count))
-			gc := m.gitClient
+			bus := m.gitBus
 			paths := typed.Paths
 			count := typed.Count
 			return m, func() tea.Msg {
-				if err := gc.StashFiles(paths); err != nil {
+				if err := bus.StashFiles(paths); err != nil {
 					return stashFailedMsg{reason: err.Error()}
 				}
 				return stashSucceededMsg{count: count}
@@ -1120,11 +1124,11 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case gitpanel.UnstashRequestMsg:
-		if m.gitClient != nil && m.commitTree != nil {
+		if m.gitBus != nil && m.commitTree != nil {
 			m.commitTree.SetLoadingMessage("Unstashing files...")
-			gc := m.gitClient
+			bus := m.gitBus
 			return m, func() tea.Msg {
-				if err := gc.UnstashFiles(); err != nil {
+				if err := bus.UnstashFiles(); err != nil {
 					return unstashFailedMsg{reason: err.Error()}
 				}
 				return unstashSucceededMsg{}
@@ -1153,12 +1157,12 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case committree.PullBranchMsg:
-		if m.gitClient != nil && m.commitTree != nil {
+		if m.gitBus != nil && m.commitTree != nil {
 			m.commitTree.SetLoadingMessage("Pulling " + typed.Name + "...")
-			gc := m.gitClient
+			bus := m.gitBus
 			name := typed.Name
 			return m, func() tea.Msg {
-				if err := gc.PullBranch(name, ""); err != nil {
+				if err := bus.PullBranch(name, ""); err != nil {
 					return pullFailedMsg{reason: err.Error()}
 				}
 				return pullSucceededMsg{name: name}
@@ -1187,12 +1191,12 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case committree.PushBranchMsg:
-		if m.gitClient != nil && m.commitTree != nil {
+		if m.gitBus != nil && m.commitTree != nil {
 			m.commitTree.SetLoadingMessage("Pushing " + typed.Name + "...")
-			gc := m.gitClient
+			bus := m.gitBus
 			name := typed.Name
 			return m, func() tea.Msg {
-				if err := gc.PushBranch(name, ""); err != nil {
+				if err := bus.PushBranch(name, ""); err != nil {
 					return pushFailedMsg{reason: err.Error()}
 				}
 				return pushSucceededMsg{name: name}
@@ -1218,6 +1222,12 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
+	case msg.GitOpEventMsg:
+		if typed.Err == nil {
+			m.nudgeGitWatcher()
+		}
 		return m, nil
 
 	case gitBranchDAGLoadedMsg:
@@ -1505,6 +1515,9 @@ func (m *AppModel) Shutdown() error {
 	m.streamBridge.Stop()
 	m.guideBridge.Stop()
 	m.lspBridge.Stop()
+	if m.gitBridge != nil {
+		m.gitBridge.Stop()
+	}
 	_ = m.lspManager.Shutdown()
 	return m.deps.Scope.Shutdown(shutdownGrace, shutdownHard)
 }
@@ -3727,16 +3740,16 @@ type pushFailedMsg struct{ reason string }
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.
 func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
-	gc := m.gitClient
+	bus := m.gitBus
 	return func() tea.Msg {
-		branches, err := gc.ListBranches()
+		branches, err := bus.ListBranches()
 		if err != nil {
 			return gitBranchesLoadedMsg{}
 		}
-		defaultBranch := gc.DefaultBranch()
+		defaultBranch := bus.DefaultBranch()
 
 		// Working tree status.
-		statuses, hasIndexStaged, _ := gc.UncommittedFileStatuses()
+		statuses, hasIndexStaged, _ := bus.UncommittedFileStatuses()
 		dirty := len(statuses) > 0
 		var conflicts bool
 		for _, s := range statuses {
@@ -3751,8 +3764,8 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 		for i, b := range branches {
 			branchNames[i] = b.Name
 		}
-		commitCounts := gc.CountBranchOnlyCommitsBatch(branchNames, defaultBranch, commitLimit)
-		inferredParents := gc.InferBranchParents(branches, defaultBranch)
+		commitCounts := bus.CountBranchOnlyCommitsBatch(branchNames, defaultBranch, commitLimit)
+		inferredParents := bus.InferBranchParents(branches, defaultBranch)
 
 		nodes := make([]committree.BranchNode, len(branches))
 		for i, b := range branches {
@@ -3780,7 +3793,7 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 			dirty:          dirty,
 			conflicts:      conflicts,
 			hasIndexStaged: hasIndexStaged,
-			hasStash:       gc.HasStash(),
+			hasStash:       bus.HasStash(),
 		}
 	}
 }
@@ -3789,9 +3802,9 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 // state, index staging, and stash presence. Runs in O(index-scan) time
 // without the expensive branch enumeration and commit counting.
 func (m *AppModel) quickGitStatusCmd() tea.Cmd {
-	gc := m.gitClient
+	bus := m.gitBus
 	return func() tea.Msg {
-		statuses, hasIndexStaged, _ := gc.UncommittedFileStatuses()
+		statuses, hasIndexStaged, _ := bus.UncommittedFileStatuses()
 		dirty := len(statuses) > 0
 		var conflicts bool
 		for _, s := range statuses {
@@ -3804,7 +3817,7 @@ func (m *AppModel) quickGitStatusCmd() tea.Cmd {
 			dirty:          dirty,
 			conflicts:      conflicts,
 			hasIndexStaged: hasIndexStaged,
-			hasStash:       gc.HasStash(),
+			hasStash:       bus.HasStash(),
 		}
 	}
 }
@@ -3813,9 +3826,9 @@ func (m *AppModel) quickGitStatusCmd() tea.Cmd {
 // stats for a branch. Uses flat first-parent pagination for fast initial
 // display. Subsequent pages are loaded on demand via loadMoreCommitsCmd.
 func (m *AppModel) loadBranchCommitsAndStatsCmd(branchName, defaultBranch string) tea.Cmd {
-	gc := m.gitClient
+	bus := m.gitBus
 	return func() tea.Msg {
-		commits, hasMore, err := gc.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
+		commits, hasMore, err := bus.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
 		if err != nil {
 			return gitBranchFullyLoadedMsg{branch: branchName}
 		}
@@ -3823,7 +3836,7 @@ func (m *AppModel) loadBranchCommitsAndStatsCmd(branchName, defaultBranch string
 		if len(nodes) > 0 {
 			nodes[0].Branch = branchName
 		}
-		stats := loadStatsForNodes(gc, nodes)
+		stats := loadStatsForNodes(bus, nodes)
 		return gitBranchFullyLoadedMsg{
 			branch:  branchName,
 			nodes:   nodes,
@@ -3836,19 +3849,19 @@ func (m *AppModel) loadBranchCommitsAndStatsCmd(branchName, defaultBranch string
 // loadBranchDAGCmd loads the full DAG of branch-unique commits with graph
 // layout. Falls back to flat first-parent mode if the DAG exceeds the limit.
 func (m *AppModel) loadBranchDAGCmd(branchName, defaultBranch string) tea.Cmd {
-	gc := m.gitClient
+	bus := m.gitBus
 	return func() tea.Msg {
-		commits, err := gc.ListBranchDAGCommits(branchName, defaultBranch, git.DagCommitLimit)
+		commits, err := bus.ListBranchDAGCommits(branchName, defaultBranch, git.DagCommitLimit)
 		if err != nil || len(commits) == 0 {
 			// Fall back to flat first-parent pagination.
-			return m.loadBranchCommitsAndStatsFallback(gc, branchName, defaultBranch)
+			return m.loadBranchCommitsAndStatsFallback(bus, branchName, defaultBranch)
 		}
 		nodes := commitsToTreeNodes(commits)
 		if len(nodes) > 0 {
 			nodes[0].Branch = branchName
 		}
 		graphRows, maxLane := committree.AssignLanes(nodes)
-		stats := loadStatsForNodes(gc, nodes)
+		stats := loadStatsForNodes(bus, nodes)
 		return gitBranchDAGLoadedMsg{
 			branch:       branchName,
 			nodes:        nodes,
@@ -3861,8 +3874,8 @@ func (m *AppModel) loadBranchDAGCmd(branchName, defaultBranch string) tea.Cmd {
 
 // loadBranchCommitsAndStatsFallback is the flat-mode fallback used when DAG
 // loading fails or exceeds limits. Called from within the DAG cmd goroutine.
-func (m *AppModel) loadBranchCommitsAndStatsFallback(gc *git.GitClient, branchName, defaultBranch string) tea.Msg {
-	commits, hasMore, err := gc.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
+func (m *AppModel) loadBranchCommitsAndStatsFallback(bus *git.GitBus, branchName, defaultBranch string) tea.Msg {
+	commits, hasMore, err := bus.ListBranchOnlyCommits(branchName, defaultBranch, "", commitPageSize)
 	if err != nil {
 		return gitBranchFullyLoadedMsg{branch: branchName}
 	}
@@ -3870,7 +3883,7 @@ func (m *AppModel) loadBranchCommitsAndStatsFallback(gc *git.GitClient, branchNa
 	if len(nodes) > 0 {
 		nodes[0].Branch = branchName
 	}
-	stats := loadStatsForNodes(gc, nodes)
+	stats := loadStatsForNodes(bus, nodes)
 	return gitBranchFullyLoadedMsg{
 		branch:  branchName,
 		nodes:   nodes,
@@ -3888,14 +3901,14 @@ func (m *AppModel) loadMoreCommitsCmd() tea.Cmd {
 	branch := m.commitTree.ActiveBranch()
 	lastHash := m.commitTree.LastHash()
 	defaultBranch := m.commitTree.GetDefaultBranch()
-	gc := m.gitClient
+	bus := m.gitBus
 	return func() tea.Msg {
-		commits, hasMore, err := gc.ListBranchOnlyCommits(branch, defaultBranch, lastHash, commitPageSize)
+		commits, hasMore, err := bus.ListBranchOnlyCommits(branch, defaultBranch, lastHash, commitPageSize)
 		if err != nil || len(commits) == 0 {
 			return gitMoreCommitsLoadedMsg{branch: branch}
 		}
 		nodes := commitsToTreeNodes(commits)
-		stats := loadStatsForNodes(gc, nodes)
+		stats := loadStatsForNodes(bus, nodes)
 		return gitMoreCommitsLoadedMsg{
 			branch:  branch,
 			nodes:   nodes,
@@ -3925,12 +3938,12 @@ func commitsToTreeNodes(commits []git.TreeCommit) []committree.TreeNode {
 
 // loadStatsForNodes fetches diff stats for all node hashes in a single batch
 // under one read lock, leveraging the ristretto cache for repeated lookups.
-func loadStatsForNodes(gc *git.GitClient, nodes []committree.TreeNode) map[string][2]int {
+func loadStatsForNodes(bus *git.GitBus, nodes []committree.TreeNode) map[string][2]int {
 	hashes := make([]string, len(nodes))
 	for i, n := range nodes {
 		hashes[i] = n.Hash
 	}
-	summaries := gc.GetCommitDiffSummaries(hashes)
+	summaries := bus.GetCommitDiffSummaries(hashes)
 	stats := make(map[string][2]int, len(summaries))
 	for h, ds := range summaries {
 		stats[h] = [2]int{ds.Additions, ds.Deletions}
@@ -3952,8 +3965,8 @@ const (
 // fetchDiffDataCmd launches an async diff fetch for the given hashes and mode.
 // Diff pairs are computed concurrently via a WaitGroup.
 func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) tea.Cmd {
-	gc := m.gitClient
-	if gc == nil || len(hashes) < 2 {
+	bus := m.gitBus
+	if bus == nil || len(hashes) < 2 {
 		return nil
 	}
 	// Build hash→label map for branch name overrides (nil when unused).
@@ -3972,7 +3985,7 @@ func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) 
 		for i, ft := range fromTo {
 			go func() {
 				defer wg.Done()
-				pairs[i] = fetchOneDiffPair(gc, ft)
+				pairs[i] = fetchOneDiffPair(bus, ft)
 			}()
 		}
 		wg.Wait()
@@ -3992,15 +4005,15 @@ func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) 
 }
 
 // fetchOneDiffPair fetches diff data for a single (from, to) hash pair.
-func fetchOneDiffPair(gc *git.GitClient, ft [2]string) msg.DiffViewPair {
-	files, _ := gc.GetDiff(ft[0], ft[1])
+func fetchOneDiffPair(bus *git.GitBus, ft [2]string) msg.DiffViewPair {
+	files, _ := bus.GetDiff(ft[0], ft[1])
 	totalAdd, totalDel := 0, 0
 	for _, f := range files {
 		totalAdd += f.Additions
 		totalDel += f.Deletions
 	}
-	fromInfo, _ := gc.GetCommit(ft[0])
-	toInfo, _ := gc.GetCommit(ft[1])
+	fromInfo, _ := bus.GetCommit(ft[0])
+	toInfo, _ := bus.GetCommit(ft[1])
 	fromShort, toShort := shortHash(ft[0]), shortHash(ft[1])
 	if fromInfo != nil {
 		fromShort = fromInfo.ShortHash
@@ -4126,8 +4139,8 @@ func (m *AppModel) setDiffLoading(loading bool) {
 
 // fetchMergeDiffDataCmd fetches diff data for a merge selection.
 func (m *AppModel) fetchMergeDiffDataCmd(hashes, labels []string) tea.Cmd {
-	gc := m.gitClient
-	if gc == nil || len(hashes) < 2 {
+	bus := m.gitBus
+	if bus == nil || len(hashes) < 2 {
 		return nil
 	}
 	hashToLabel := make(map[string]string, len(hashes))
@@ -4144,7 +4157,7 @@ func (m *AppModel) fetchMergeDiffDataCmd(hashes, labels []string) tea.Cmd {
 		for i, ft := range fromTo {
 			go func() {
 				defer wg.Done()
-				pairs[i] = fetchOneDiffPair(gc, ft)
+				pairs[i] = fetchOneDiffPair(bus, ft)
 			}()
 		}
 		wg.Wait()
@@ -4197,8 +4210,8 @@ func (m *AppModel) exitMergeDiffView() {
 // executeMergeBranch performs a git merge using the stored branch labels.
 // mergeLabels[0] is the source branch, mergeLabels[1] is the target branch.
 func (m *AppModel) executeMergeBranch(deleteSource bool) tea.Cmd {
-	gc := m.gitClient
-	if gc == nil || len(m.mergeLabels) < 2 {
+	bus := m.gitBus
+	if bus == nil || len(m.mergeLabels) < 2 {
 		m.statusBar.SetFlash("Merge requires two branches")
 		return nil
 	}
@@ -4209,11 +4222,11 @@ func (m *AppModel) executeMergeBranch(deleteSource bool) tea.Cmd {
 	}
 
 	return func() tea.Msg {
-		if err := gc.MergeBranch(source, target); err != nil {
+		if err := bus.MergeBranch(source, target); err != nil {
 			return mergeBranchFailedMsg{reason: err.Error()}
 		}
 		if deleteSource {
-			if err := gc.DeleteBranch(source); err != nil {
+			if err := bus.DeleteBranch(source); err != nil {
 				return mergeBranchDoneMsg{source: source, target: target, deleteErr: err.Error()}
 			}
 		}
@@ -9932,6 +9945,11 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 	}
 	for _, b := range bridges {
 		if err := b.Start(program); err != nil {
+			return err
+		}
+	}
+	if m.gitBridge != nil {
+		if err := m.gitBridge.Start(program); err != nil {
 			return err
 		}
 	}
