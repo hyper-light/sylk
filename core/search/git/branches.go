@@ -839,6 +839,33 @@ func (c *GitClient) CheckoutBranch(name string) error {
 	})
 }
 
+// CheckoutCommit checks out a specific commit by hash, resulting in a
+// detached HEAD state. Supports both full and abbreviated hashes.
+func (c *GitClient) CheckoutCommit(commitHash string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+
+	hash, err := c.resolveCommitHash(commitHash)
+	if err != nil {
+		return fmt.Errorf("resolve commit: %w", err)
+	}
+
+	if _, err := c.repo.CommitObject(hash); err != nil {
+		return fmt.Errorf("commit not found: %w", err)
+	}
+
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	return wt.Checkout(&gogit.CheckoutOptions{Hash: hash})
+}
+
 // =============================================================================
 // Create
 // =============================================================================
