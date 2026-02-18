@@ -22,7 +22,6 @@ const (
 	OpListBranches       // list_branches
 	OpBranchTipHash      // branch_tip_hash
 	OpCheckoutBranch     // checkout_branch
-	OpCheckoutCommit     // checkout_commit
 	OpCreateBranch       // create_branch
 	OpDeleteBranch       // delete_branch
 	OpMergeBranch        // merge_branch
@@ -112,7 +111,6 @@ var opNames = [opCount]string{
 	OpListBranches:       "list_branches",
 	OpBranchTipHash:      "branch_tip_hash",
 	OpCheckoutBranch:     "checkout_branch",
-	OpCheckoutCommit:     "checkout_commit",
 	OpCreateBranch:       "create_branch",
 	OpDeleteBranch:       "delete_branch",
 	OpMergeBranch:        "merge_branch",
@@ -207,8 +205,7 @@ var opCategories = [opCount]string{
 	OpGetHeadCommit: "ref", OpDefaultBranch: "ref",
 
 	OpListBranches: "branch", OpBranchTipHash: "branch",
-	OpCheckoutBranch: "branch", OpCheckoutCommit: "branch",
-	OpCreateBranch: "branch",
+	OpCheckoutBranch: "branch", OpCreateBranch: "branch",
 	OpDeleteBranch: "branch", OpMergeBranch: "branch",
 	OpListTags: "branch", OpInferBranchParents: "branch",
 
@@ -256,7 +253,7 @@ func OpCategory(op GitOp) string {
 // mutatingBits is a compile-time bitset marking mutating operations.
 // A single uint64 suffices because opCount < 64.
 const mutatingBits uint64 = 1<<OpClose |
-	1<<OpCheckoutBranch | 1<<OpCheckoutCommit | 1<<OpCreateBranch | 1<<OpDeleteBranch | 1<<OpMergeBranch |
+	1<<OpCheckoutBranch | 1<<OpCreateBranch | 1<<OpDeleteBranch | 1<<OpMergeBranch |
 	1<<OpCommitFiles |
 	1<<OpStashFiles | 1<<OpUnstashFiles |
 	1<<OpPullBranch | 1<<OpPushBranch |

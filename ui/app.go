@@ -946,16 +946,6 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
 		return m, tea.Batch(cmds...)
 
-	case gitpanel.CommitCheckedOutMsg:
-		m.statusBar.SetFlash("Checked out " + typed.Hash[:min(len(typed.Hash), 8)])
-		m.nudgeGitWatcher()
-		var cmds []tea.Cmd
-		if m.gitPanel != nil {
-			cmds = append(cmds, m.gitPanel.LoadData())
-		}
-		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
 	case gitpanel.BranchCheckoutBlockedMsg:
 		m.statusBar.SetFlash(typed.Reason)
 		return m, nil
@@ -1308,33 +1298,6 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
-		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case committree.CommitCheckoutRequestMsg:
-		if m.gitBus != nil {
-			bus := m.gitBus
-			hash := typed.Hash
-			return m, func() tea.Msg {
-				if err := bus.CheckoutCommit(hash); err != nil {
-					return commitCheckoutFailedMsg{reason: err.Error()}
-				}
-				return commitCheckoutSucceededMsg{hash: hash}
-			}
-		}
-		return m, nil
-
-	case commitCheckoutSucceededMsg:
-		m.statusBar.SetFlash("Checked out " + typed.hash[:min(len(typed.hash), 8)])
-		m.nudgeGitWatcher()
-		var cmds []tea.Cmd
-		if m.gitPanel != nil {
-			cmds = append(cmds, m.gitPanel.LoadData())
-		}
-		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case commitCheckoutFailedMsg:
 		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
@@ -3854,8 +3817,6 @@ type resetSucceededMsg struct{ mode string }
 type resetFailedMsg struct{ reason string }
 type revertSucceededMsg struct{ hash string }
 type revertFailedMsg struct{ reason string }
-type commitCheckoutSucceededMsg struct{ hash string }
-type commitCheckoutFailedMsg struct{ reason string }
 
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.

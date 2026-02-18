@@ -197,11 +197,6 @@ type ResetRequestMsg struct {
 	Mode string // "hard", "mixed", "soft"
 }
 
-// CommitCheckoutRequestMsg is emitted when the user presses Enter on a commit.
-type CommitCheckoutRequestMsg struct {
-	Hash string
-}
-
 // RevertRequestMsg is emitted when the user activates the Revert toolbar button.
 type RevertRequestMsg struct {
 	Hash string
@@ -2801,11 +2796,6 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 		if m.toolbarFocused {
 			m.viewDirty = true
 			return m.executeToolbarAction()
-		}
-		// Non-toolbar Enter: checkout the selected commit.
-		hash := m.SelectedHash()
-		if hash != "" {
-			return func() tea.Msg { return CommitCheckoutRequestMsg{Hash: hash} }
 		}
 	}
 

@@ -70,11 +70,6 @@ func (b *GitBus) CheckoutBranch(name string) error {
 	return dispatchVoid(b, OpCheckoutBranch, name, func() error { return b.client.CheckoutBranch(name) })
 }
 
-func (b *GitBus) CheckoutCommit(commitHash string) error {
-	return dispatchVoid(b, OpCheckoutCommit, commitHash,
-		func() error { return b.client.CheckoutCommit(commitHash) })
-}
-
 func (b *GitBus) CreateBranch(name, atCommitHash string) error {
 	return dispatchVoid(b, OpCreateBranch, [2]string{name, atCommitHash},
 		func() error { return b.client.CreateBranch(name, atCommitHash) })
