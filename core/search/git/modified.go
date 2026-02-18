@@ -1,9 +1,13 @@
 package git
 
 import (
-	"strconv"
-	"strings"
+	"io"
+	"sort"
 	"time"
+
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // =============================================================================
@@ -71,34 +75,40 @@ func (c *GitClient) ListModifiedFilesSinceCommit(commitHash string) ([]string, e
 	return c.getModifiedSinceCommit(commitHash)
 }
 
-// getModifiedSinceCommit uses git diff to find changed files.
+// getModifiedSinceCommit uses go-git DiffTree to find files changed between
+// the given commit and HEAD.
 func (c *GitClient) getModifiedSinceCommit(commitHash string) ([]string, error) {
-	output, err := c.runGitCommand("diff", "--name-only", commitHash+"..HEAD")
+	fromCommit, err := c.resolveCommit(commitHash)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.parseFileList(output), nil
-}
-
-// parseFileList parses newline-separated file list from git output.
-func (c *GitClient) parseFileList(output string) []string {
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return []string{}
+	headRef, err := c.repo.Head()
+	if err != nil {
+		return nil, wrapHeadError(err)
 	}
 
-	lines := strings.Split(output, "\n")
-	files := make([]string, 0, len(lines))
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			files = append(files, line)
-		}
+	headCommit, err := c.repo.CommitObject(headRef.Hash())
+	if err != nil {
+		return nil, err
 	}
 
-	return files
+	fromTree, err := fromCommit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	headTree, err := headCommit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err := object.DiffTree(fromTree, headTree)
+	if err != nil {
+		return nil, err
+	}
+
+	return pathsFromChanges(changes), nil
 }
 
 // =============================================================================
@@ -118,113 +128,44 @@ func (c *GitClient) GetCommitsSince(since time.Time) ([]*CommitInfo, error) {
 	return c.getCommitsSinceInternal(since)
 }
 
-// getCommitsSinceInternal retrieves commits since a time without locking.
+// getCommitsSinceInternal retrieves commits since a time using go-git Log.
+// Includes FilesChanged per commit.
+//
+// Git stores timestamps at second granularity. go-git's Since filter uses
+// time.Before() which compares at nanosecond precision. We truncate to
+// second precision so commits created at the same second are included,
+// matching git CLI's --since behavior.
 func (c *GitClient) getCommitsSinceInternal(since time.Time) ([]*CommitInfo, error) {
-	// Check if HEAD exists (repo has commits)
 	if !c.hasHead() {
 		return []*CommitInfo{}, nil
 	}
 
-	sinceStr := since.Format(time.RFC3339)
-
-	output, err := c.runGitCommand(
-		"log",
-		"--format=%H|%h|%an|%ae|%ai|%cn|%ce|%ci|%s|%P",
-		"--since="+sinceStr,
-	)
+	truncated := since.Truncate(time.Second)
+	iter, err := c.repo.Log(&gogit.LogOptions{
+		Since: &truncated,
+		Order: gogit.LogOrderCommitterTime,
+	})
 	if err != nil {
 		return nil, err
 	}
+	defer iter.Close()
 
-	return c.parseCommitLog(output)
-}
-
-// hasHead checks if the repository has any commits.
-func (c *GitClient) hasHead() bool {
-	_, err := c.runGitCommand("rev-parse", "--verify", "HEAD")
-	return err == nil
-}
-
-// parseCommitLog parses the git log output into CommitInfo structs.
-func (c *GitClient) parseCommitLog(output string) ([]*CommitInfo, error) {
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return []*CommitInfo{}, nil
-	}
-
-	lines := strings.Split(output, "\n")
-	commits := make([]*CommitInfo, 0, len(lines))
-
-	for _, line := range lines {
-		commit, err := c.parseCommitLine(line)
-		if err != nil {
-			continue // Skip malformed lines
-		}
-		commits = append(commits, commit)
+	var commits []*CommitInfo
+	err = iter.ForEach(func(commit *object.Commit) error {
+		commits = append(commits, convertCommitToInfo(commit))
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return commits, nil
 }
 
-// parseCommitLine parses a single log line into CommitInfo.
-func (c *GitClient) parseCommitLine(line string) (*CommitInfo, error) {
-	parts := strings.SplitN(line, "|", 10)
-	if len(parts) < 10 {
-		return nil, ErrInvalidCommit
-	}
-
-	commit := &CommitInfo{
-		Hash:           parts[0],
-		ShortHash:      parts[1],
-		Author:         parts[2],
-		AuthorEmail:    parts[3],
-		Committer:      parts[5],
-		CommitterEmail: parts[6],
-		Subject:        parts[8],
-	}
-
-	if err := c.parseCommitTimes(commit, parts[4], parts[7]); err != nil {
-		return nil, err
-	}
-
-	c.parseParentHashes(commit, parts[9])
-	c.addFilesToCommit(commit)
-
-	return commit, nil
-}
-
-// parseCommitTimes parses author and commit times.
-func (c *GitClient) parseCommitTimes(commit *CommitInfo, authorTime, commitTime string) error {
-	at, err := time.Parse("2006-01-02 15:04:05 -0700", authorTime)
-	if err == nil {
-		commit.AuthorTime = at
-	}
-
-	ct, err := time.Parse("2006-01-02 15:04:05 -0700", commitTime)
-	if err == nil {
-		commit.CommitTime = ct
-	}
-
-	return nil
-}
-
-// parseParentHashes extracts parent commit hashes.
-func (c *GitClient) parseParentHashes(commit *CommitInfo, parents string) {
-	parents = strings.TrimSpace(parents)
-	if parents == "" {
-		commit.ParentHashes = []string{}
-		return
-	}
-
-	commit.ParentHashes = strings.Split(parents, " ")
-}
-
-// addFilesToCommit populates FilesChanged for a commit.
-func (c *GitClient) addFilesToCommit(commit *CommitInfo) {
-	files, err := c.getFilesInCommitInternal(commit.Hash)
-	if err == nil {
-		commit.FilesChanged = files
-	}
+// hasHead checks if the repository has any commits.
+func (c *GitClient) hasHead() bool {
+	_, err := c.repo.Head()
+	return err == nil
 }
 
 // =============================================================================
@@ -247,22 +188,30 @@ func (c *GitClient) GetFilesInCommit(commitHash string) ([]string, error) {
 	return c.getFilesInCommitInternal(commitHash)
 }
 
-// getFilesInCommitInternal gets files without locking.
-// Uses --root to handle initial commits without parents.
+// getFilesInCommitInternal gets files changed in a commit via DiffTree
+// between the commit and its first parent (or empty tree for root commits).
 func (c *GitClient) getFilesInCommitInternal(commitHash string) ([]string, error) {
-	output, err := c.runGitCommand(
-		"diff-tree",
-		"--no-commit-id",
-		"--name-only",
-		"-r",
-		"--root",
-		commitHash,
-	)
+	commit, err := c.resolveCommit(commitHash)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.parseFileList(output), nil
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	parentTree, err := firstParentTree(c, commit)
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err := object.DiffTree(parentTree, tree)
+	if err != nil {
+		return nil, err
+	}
+
+	return pathsFromChanges(changes), nil
 }
 
 // =============================================================================
@@ -298,105 +247,77 @@ func (c *GitClient) GetAllCommitsPage(skip, limit int) ([]*CommitInfo, bool, err
 		return []*CommitInfo{}, false, nil
 	}
 
-	// Fetch one extra to detect whether more pages exist.
+	iter, err := c.repo.Log(&gogit.LogOptions{
+		Order: gogit.LogOrderCommitterTime,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	defer iter.Close()
+
+	// Skip the first 'skip' commits.
+	for range skip {
+		if _, err := iter.Next(); err != nil {
+			if err == io.EOF {
+				return []*CommitInfo{}, false, nil
+			}
+			return nil, false, err
+		}
+	}
+
+	// Fetch limit+1 to detect whether more pages exist.
 	fetchLimit := limit + 1
-	args := []string{
-		"log",
-		"--format=%H|%h|%an|%ae|%ai|%cn|%ce|%ci|%s|%P",
-		"-n", formatInt(fetchLimit),
-	}
-	if skip > 0 {
-		args = append(args, "--skip", formatInt(skip))
-	}
-
-	output, err := c.runGitCommand(args...)
-	if err != nil {
-		return nil, false, err
-	}
-
-	commits, err := c.parseCommitLogNoFiles(output)
-	if err != nil {
-		return nil, false, err
+	commits := make([]*CommitInfo, 0, fetchLimit)
+	for range fetchLimit {
+		commit, err := iter.Next()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, false, err
+		}
+		commits = append(commits, convertCommitToInfoLight(commit))
 	}
 
 	hasMore := len(commits) > limit
 	if hasMore {
 		commits = commits[:limit]
 	}
+
 	return commits, hasMore, nil
 }
 
-// getAllCommitsInternal retrieves all commits without locking.
+// getAllCommitsInternal retrieves all commits using go-git Log.
+// Does not populate FilesChanged for performance.
 func (c *GitClient) getAllCommitsInternal(limit int) ([]*CommitInfo, error) {
-	// Check if HEAD exists (repo has commits)
 	if !c.hasHead() {
 		return []*CommitInfo{}, nil
 	}
 
-	args := []string{
-		"log",
-		"--format=%H|%h|%an|%ae|%ai|%cn|%ce|%ci|%s|%P",
-	}
-
-	if limit > 0 {
-		args = append(args, "-n", formatInt(limit))
-	}
-
-	output, err := c.runGitCommand(args...)
+	iter, err := c.repo.Log(&gogit.LogOptions{
+		Order: gogit.LogOrderCommitterTime,
+	})
 	if err != nil {
 		return nil, err
 	}
+	defer iter.Close()
 
-	return c.parseCommitLogNoFiles(output)
-}
-
-// formatInt converts an int to string.
-func formatInt(n int) string {
-	return strconv.Itoa(n)
-}
-
-// parseCommitLogNoFiles parses log without adding files.
-func (c *GitClient) parseCommitLogNoFiles(output string) ([]*CommitInfo, error) {
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return []*CommitInfo{}, nil
-	}
-
-	lines := strings.Split(output, "\n")
-	commits := make([]*CommitInfo, 0, len(lines))
-
-	for _, line := range lines {
-		commit, err := c.parseCommitLineNoFiles(line)
-		if err != nil {
-			continue
+	var commits []*CommitInfo
+	n := 0
+	err = iter.ForEach(func(commit *object.Commit) error {
+		if limit > 0 && n >= limit {
+			return io.EOF
 		}
-		commits = append(commits, commit)
+		commits = append(commits, convertCommitToInfoLight(commit))
+		n++
+		return nil
+	})
+	// io.EOF from ForEach is expected (our limit or end of log).
+	if err != nil && err != io.EOF {
+		return nil, err
 	}
 
 	return commits, nil
-}
-
-// parseCommitLineNoFiles parses a commit line without files.
-func (c *GitClient) parseCommitLineNoFiles(line string) (*CommitInfo, error) {
-	parts := strings.SplitN(line, "|", 10)
-	if len(parts) < 10 {
-		return nil, ErrInvalidCommit
-	}
-
-	commit := &CommitInfo{
-		Hash:           parts[0],
-		ShortHash:      parts[1],
-		Author:         parts[2],
-		AuthorEmail:    parts[3],
-		Committer:      parts[5],
-		CommitterEmail: parts[6],
-		Subject:        parts[8],
-	}
-
-	_ = c.parseCommitTimes(commit, parts[4], parts[7])
-	c.parseParentHashes(commit, parts[9])
-
-	return commit, nil
 }
 
 // =============================================================================
@@ -416,67 +337,27 @@ func (c *GitClient) GetUncommittedFiles() ([]string, error) {
 	return c.getUncommittedFilesInternal()
 }
 
-// getUncommittedFilesInternal gets uncommitted files without locking.
+// getUncommittedFilesInternal gets uncommitted files via go-git Worktree.Status().
 func (c *GitClient) getUncommittedFilesInternal() ([]string, error) {
-	output, err := c.runGitCommand("status", "--porcelain")
+	wt, err := c.repo.Worktree()
 	if err != nil {
 		return nil, err
 	}
 
-	return c.parseStatusOutput(output, false), nil
-}
-
-// parseStatusOutput parses git status --porcelain output.
-// If untrackedOnly is true, only returns untracked files.
-func (c *GitClient) parseStatusOutput(output string, untrackedOnly bool) []string {
-	// Only trim trailing whitespace to preserve leading status characters
-	output = strings.TrimRight(output, " \t\n\r")
-	if output == "" {
-		return []string{}
+	status, err := wt.Status()
+	if err != nil {
+		return nil, err
 	}
 
-	lines := strings.Split(output, "\n")
-	files := make([]string, 0, len(lines))
-
-	for _, line := range lines {
-		file := c.parseStatusLine(line, untrackedOnly)
-		if file != "" {
-			files = append(files, file)
+	files := make([]string, 0, len(status))
+	for path, fs := range status {
+		if fs.Worktree != gogit.Unmodified || fs.Staging != gogit.Unmodified {
+			files = append(files, path)
 		}
 	}
 
-	return files
-}
-
-// parseStatusLine extracts file path from a status line.
-// Git porcelain format: "XY filename" where X is index status, Y is work tree status.
-func (c *GitClient) parseStatusLine(line string, untrackedOnly bool) string {
-	if len(line) < 4 {
-		return ""
-	}
-
-	// Status is first 2 characters
-	status := line[:2]
-
-	// Path starts after "XY " (index 3)
-	// Handle renamed files which have format "XY oldname -> newname"
-	pathPart := line[3:]
-	path := strings.TrimSpace(pathPart)
-
-	// For renamed files, extract the new name
-	if idx := strings.Index(path, " -> "); idx >= 0 {
-		path = path[idx+4:]
-	}
-
-	if untrackedOnly {
-		if status == "??" {
-			return path
-		}
-		return ""
-	}
-
-	// Return any file with changes
-	return path
+	sort.Strings(files)
+	return files, nil
 }
 
 // =============================================================================
@@ -496,13 +377,86 @@ func (c *GitClient) GetUntrackedFiles() ([]string, error) {
 	return c.getUntrackedFilesInternal()
 }
 
-// getUntrackedFilesInternal gets untracked files without locking.
-// Uses -u to show individual untracked files in directories.
+// getUntrackedFilesInternal gets untracked files via go-git Worktree.Status().
 func (c *GitClient) getUntrackedFilesInternal() ([]string, error) {
-	output, err := c.runGitCommand("status", "--porcelain", "-u")
+	wt, err := c.repo.Worktree()
 	if err != nil {
 		return nil, err
 	}
 
-	return c.parseStatusOutput(output, true), nil
+	status, err := wt.Status()
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]string, 0)
+	for path, fs := range status {
+		if fs.Worktree == gogit.Untracked {
+			files = append(files, path)
+		}
+	}
+
+	sort.Strings(files)
+	return files, nil
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+// resolveCommit resolves a commit reference (full hash, short hash, or symbolic
+// ref) to a go-git Commit object.
+func (c *GitClient) resolveCommit(ref string) (*object.Commit, error) {
+	hash, err := c.repo.ResolveRevision(plumbing.Revision(ref))
+	if err != nil {
+		return nil, ErrInvalidCommit
+	}
+
+	commit, err := c.repo.CommitObject(*hash)
+	if err != nil {
+		return nil, ErrInvalidCommit
+	}
+
+	return commit, nil
+}
+
+// pathsFromChanges extracts file paths from a set of tree changes.
+// For modifications and additions the destination path is used;
+// for deletions the source path is used.
+func pathsFromChanges(changes object.Changes) []string {
+	paths := make([]string, 0, len(changes))
+	for _, ch := range changes {
+		name := changePath(ch)
+		if name != "" {
+			paths = append(paths, name)
+		}
+	}
+	return paths
+}
+
+// changePath returns the effective path of a change.
+func changePath(ch *object.Change) string {
+	if ch.To.Name != "" {
+		return ch.To.Name
+	}
+	return ch.From.Name
+}
+
+// convertCommitToInfoLight converts a go-git Commit to CommitInfo without
+// populating FilesChanged. Used by bulk listing operations where per-commit
+// file stats are not needed.
+func convertCommitToInfoLight(commit *object.Commit) *CommitInfo {
+	return &CommitInfo{
+		Hash:           commit.Hash.String(),
+		ShortHash:      commit.Hash.String()[:7],
+		Author:         commit.Author.Name,
+		AuthorEmail:    commit.Author.Email,
+		AuthorTime:     commit.Author.When,
+		Committer:      commit.Committer.Name,
+		CommitterEmail: commit.Committer.Email,
+		CommitTime:     commit.Committer.When,
+		Message:        commit.Message,
+		Subject:        extractSubject(commit.Message),
+		ParentHashes:   extractParentHashes(commit),
+	}
 }

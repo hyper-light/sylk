@@ -28,9 +28,6 @@ var (
 	// ErrInvalidCommitHash indicates an invalid commit hash format.
 	ErrInvalidCommitHash = errors.New("invalid commit hash")
 
-	// ErrGitNotAvailable indicates git is not available in the environment.
-	ErrGitNotAvailable = errors.New("git is not available")
-
 	// ErrContextCanceled indicates the operation was canceled.
 	ErrContextCanceled = errors.New("operation canceled")
 

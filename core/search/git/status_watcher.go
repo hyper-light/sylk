@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,15 +83,33 @@ func NewStatusWatcher(client *GitClient) (*StatusWatcher, error) {
 	}, nil
 }
 
-// resolveGitDir uses git rev-parse to find the actual .git directory,
-// handling worktrees where .git is a file pointing elsewhere.
+// resolveGitDir finds the actual .git directory using pure filesystem logic,
+// handling worktrees where .git is a file containing "gitdir: <path>".
 func resolveGitDir(client *GitClient) (string, error) {
-	output, err := client.runGitCommand("rev-parse", "--git-dir")
+	dotGit := filepath.Join(client.repoPath, ".git")
+
+	fi, err := os.Stat(dotGit)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolve .git: %w", err)
 	}
 
-	dir := strings.TrimSpace(output)
+	if fi.IsDir() {
+		return dotGit, nil
+	}
+
+	// Worktree: .git is a file containing "gitdir: <path>".
+	data, err := os.ReadFile(dotGit)
+	if err != nil {
+		return "", fmt.Errorf("read .git file: %w", err)
+	}
+
+	line := strings.TrimSpace(string(data))
+	const prefix = "gitdir: "
+	if !strings.HasPrefix(line, prefix) {
+		return "", fmt.Errorf("malformed .git file: missing %q prefix", prefix)
+	}
+
+	dir := strings.TrimPrefix(line, prefix)
 	if !filepath.IsAbs(dir) {
 		dir = filepath.Join(client.repoPath, dir)
 	}

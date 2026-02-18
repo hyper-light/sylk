@@ -9131,6 +9131,10 @@ func (m *AppModel) detectDirtySlots() {
 
 	// Git mode dirty checks — skip when diff view is overlaying.
 	if m.viewMode == ViewGit && !m.diffViewActive && m.gitPanel != nil {
+		// Keep commit tree staged-files state in sync every frame.
+		// syncStagedFiles is cheap (iterates a small slice) and ensures
+		// the [Commit] badge reacts immediately to staging changes.
+		m.syncStagedFiles()
 		if m.gitPanel.ViewDirty() {
 			if m.layout.Mode() == layout.FourColumn {
 				m.comp.MarkDirty(compositor.SlotCenterLeft)

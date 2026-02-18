@@ -95,7 +95,9 @@
       "Bash(while read _ _ hash)",
       "Bash(do echo \"=== $hash ===\")",
       "Bash(git diff-tree:*)",
-      "Bash(git apply:*)"
+      "Bash(git apply:*)",
+      "Bash(GONOSUMCHECK=*:*)",
+      "Bash(GOFLAGS=-mod=mod go get:*)"
     ]
   }
 }

@@ -2,12 +2,32 @@ package git
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
+	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
+	"github.com/go-git/go-git/v5/plumbing/format/index"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/storer"
+	godiff "github.com/go-git/go-git/v5/utils/diff"
+
+	dmp "github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// Diff status constants matching git's status output.
+// =============================================================================
+// Diff status constants
+// =============================================================================
+
 const (
 	DiffStatusAdded    = "A"
 	DiffStatusModified = "M"
@@ -19,6 +39,14 @@ const (
 // hunkHeaderRegex matches diff hunk headers like "@@ -1,3 +1,4 @@".
 var hunkHeaderRegex = regexp.MustCompile(`^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@`)
 
+// binaryDetectLen is the number of leading bytes inspected for NUL to
+// classify a file as binary. Matches git's heuristic.
+const binaryDetectLen = 8000
+
+// =============================================================================
+// Commit-to-Commit Diff
+// =============================================================================
+
 // GetDiff returns diff between two commits.
 func (c *GitClient) GetDiff(fromHash, toHash string) ([]FileDiff, error) {
 	c.mu.RLock()
@@ -28,14 +56,34 @@ func (c *GitClient) GetDiff(fromHash, toHash string) ([]FileDiff, error) {
 		return nil, ErrNotGitRepo
 	}
 
-	output, err := c.runGitCommand("diff", "--raw", "-M", "-C", fromHash, toHash)
+	fromTree, err := c.resolveTreeFromRef(fromHash)
 	if err != nil {
 		return nil, err
 	}
 
-	files := parseRawDiffOutput(output)
-	return c.enrichDiffsWithHunks(files, fromHash, toHash)
+	toTree, err := c.resolveTreeFromRef(toHash)
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err := object.DiffTreeWithOptions(
+		context.Background(), fromTree, toTree, object.DefaultDiffTreeOptions,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	patch, err := changes.Patch()
+	if err != nil {
+		return nil, err
+	}
+
+	return fileDiffsFromPatch(patch), nil
 }
+
+// =============================================================================
+// Working Tree Diff (index vs working directory)
+// =============================================================================
 
 // GetWorkingTreeDiff returns diff of unstaged changes.
 func (c *GitClient) GetWorkingTreeDiff() ([]FileDiff, error) {
@@ -46,14 +94,66 @@ func (c *GitClient) GetWorkingTreeDiff() ([]FileDiff, error) {
 		return nil, ErrNotGitRepo
 	}
 
-	output, err := c.runGitCommand("diff", "--raw", "-M", "-C")
+	wt, err := c.repo.Worktree()
 	if err != nil {
 		return nil, err
 	}
 
-	files := parseRawDiffOutput(output)
-	return c.enrichWorkingTreeDiffs(files)
+	status, err := wt.Status()
+	if err != nil {
+		return nil, err
+	}
+
+	idx, err := c.repo.Storer.Index()
+	if err != nil {
+		return nil, err
+	}
+	idxMap := indexEntryMap(idx)
+
+	var diffs []FileDiff
+	for path, fs := range status {
+		if fs.Worktree != gogit.Modified && fs.Worktree != gogit.Deleted {
+			continue
+		}
+
+		fd := c.workingTreeFileDiff(path, fs.Worktree, idxMap)
+		diffs = append(diffs, fd)
+	}
+
+	sort.Slice(diffs, func(i, j int) bool { return diffs[i].Path < diffs[j].Path })
+	return diffs, nil
 }
+
+// workingTreeFileDiff builds a FileDiff for a single working tree change.
+func (c *GitClient) workingTreeFileDiff(path string, wtStatus gogit.StatusCode, idxMap map[string]*index.Entry) FileDiff {
+	fd := FileDiff{Path: path}
+
+	switch wtStatus {
+	case gogit.Modified:
+		fd.Status = DiffStatusModified
+	case gogit.Deleted:
+		fd.Status = DiffStatusDeleted
+	}
+
+	oldContent := readBlobFromIndexMap(c.repo.Storer, idxMap, path)
+	var newContent string
+	if wtStatus != gogit.Deleted {
+		newContent, _ = readDiskFile(c.repoPath, path)
+	}
+
+	if isBinary(oldContent) || isBinary(newContent) {
+		fd.Binary = true
+		return fd
+	}
+
+	fd.Hunks = buildHunksFromText(path, oldContent, newContent)
+	fd.Additions, fd.Deletions = countChanges(fd.Hunks)
+	return fd
+}
+
+// =============================================================================
+// Staged Diff (HEAD vs index)
+// =============================================================================
 
 // GetStagedDiff returns diff of staged changes.
 func (c *GitClient) GetStagedDiff() ([]FileDiff, error) {
@@ -64,14 +164,78 @@ func (c *GitClient) GetStagedDiff() ([]FileDiff, error) {
 		return nil, ErrNotGitRepo
 	}
 
-	output, err := c.runGitCommand("diff", "--raw", "-M", "-C", "--cached")
+	wt, err := c.repo.Worktree()
 	if err != nil {
 		return nil, err
 	}
 
-	files := parseRawDiffOutput(output)
-	return c.enrichStagedDiffs(files)
+	status, err := wt.Status()
+	if err != nil {
+		return nil, err
+	}
+
+	headTree, _ := c.headTree() // nil for empty repos
+
+	idx, err := c.repo.Storer.Index()
+	if err != nil {
+		return nil, err
+	}
+	idxMap := indexEntryMap(idx)
+
+	var diffs []FileDiff
+	for path, fs := range status {
+		if fs.Staging == gogit.Unmodified || fs.Staging == gogit.Untracked {
+			continue
+		}
+
+		fd := c.stagedFileDiff(path, fs.Staging, headTree, idxMap)
+		diffs = append(diffs, fd)
+	}
+
+	sort.Slice(diffs, func(i, j int) bool { return diffs[i].Path < diffs[j].Path })
+	return diffs, nil
 }
+
+// stagedFileDiff builds a FileDiff for a single staged change.
+func (c *GitClient) stagedFileDiff(path string, stagingStatus gogit.StatusCode, headTree *object.Tree, idxMap map[string]*index.Entry) FileDiff {
+	fd := FileDiff{Path: path}
+
+	switch stagingStatus {
+	case gogit.Added:
+		fd.Status = DiffStatusAdded
+	case gogit.Modified:
+		fd.Status = DiffStatusModified
+	case gogit.Deleted:
+		fd.Status = DiffStatusDeleted
+	case gogit.Renamed:
+		fd.Status = DiffStatusRenamed
+	case gogit.Copied:
+		fd.Status = DiffStatusCopied
+	}
+
+	var oldContent string
+	if headTree != nil && stagingStatus != gogit.Added {
+		oldContent = readBlobFromTree(headTree, path)
+	}
+
+	var newContent string
+	if stagingStatus != gogit.Deleted {
+		newContent = readBlobFromIndexMap(c.repo.Storer, idxMap, path)
+	}
+
+	if isBinary(oldContent) || isBinary(newContent) {
+		fd.Binary = true
+		return fd
+	}
+
+	fd.Hunks = buildHunksFromText(path, oldContent, newContent)
+	fd.Additions, fd.Deletions = countChanges(fd.Hunks)
+	return fd
+}
+
+// =============================================================================
+// Single File Diff
+// =============================================================================
 
 // GetFileDiff returns diff for a specific file between commits.
 // Returns nil if the file was not changed.
@@ -88,199 +252,309 @@ func (c *GitClient) GetFileDiff(path, fromHash, toHash string) (*FileDiff, error
 
 // getFileDiffInternal performs the file diff without locking.
 func (c *GitClient) getFileDiffInternal(path, fromHash, toHash string) (*FileDiff, error) {
-	output, err := c.runGitCommand("diff", "--raw", "-M", "-C", fromHash, toHash, "--", path)
+	fromTree, err := c.resolveTreeFromRef(fromHash)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.extractFirstDiff(output, fromHash, toHash)
-}
-
-// extractFirstDiff extracts the first diff from raw output.
-func (c *GitClient) extractFirstDiff(output, fromHash, toHash string) (*FileDiff, error) {
-	files := parseRawDiffOutput(output)
-	if len(files) == 0 {
-		return nil, nil
-	}
-
-	diffs, err := c.enrichDiffsWithHunks(files, fromHash, toHash)
-	if err != nil || len(diffs) == 0 {
+	toTree, err := c.resolveTreeFromRef(toHash)
+	if err != nil {
 		return nil, err
 	}
 
-	return &diffs[0], nil
-}
-
-// parseRawDiffOutput parses git diff --raw output.
-func parseRawDiffOutput(output string) []FileDiff {
-	if strings.TrimSpace(output) == "" {
-		return []FileDiff{}
+	changes, err := object.DiffTreeWithOptions(
+		context.Background(), fromTree, toTree, object.DefaultDiffTreeOptions,
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	var diffs []FileDiff
-	scanner := bufio.NewScanner(strings.NewReader(output))
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if diff := parseRawDiffLine(line); diff != nil {
-			diffs = append(diffs, *diff)
+	// Find the change for the specified path (check both From and To names
+	// to handle renames).
+	for _, ch := range changes {
+		if ch.To.Name != path && ch.From.Name != path {
+			continue
 		}
+
+		patch, err := ch.Patch()
+		if err != nil {
+			return nil, err
+		}
+
+		fps := patch.FilePatches()
+		if len(fps) == 0 {
+			return nil, nil
+		}
+
+		fd := fileDiffFromFilePatch(fps[0])
+		return &fd, nil
+	}
+
+	return nil, nil
+}
+
+// =============================================================================
+// Patch → FileDiff Conversion
+// =============================================================================
+
+// fileDiffsFromPatch converts a go-git Patch to a slice of FileDiff.
+func fileDiffsFromPatch(patch *object.Patch) []FileDiff {
+	fps := patch.FilePatches()
+	diffs := make([]FileDiff, 0, len(fps))
+
+	for _, fp := range fps {
+		diffs = append(diffs, fileDiffFromFilePatch(fp))
 	}
 
 	return diffs
 }
 
-// parseRawDiffLine parses a single line from git diff --raw output.
-func parseRawDiffLine(line string) *FileDiff {
-	if !strings.HasPrefix(line, ":") {
+// fileDiffFromFilePatch converts a single go-git FilePatch to our FileDiff.
+func fileDiffFromFilePatch(fp fdiff.FilePatch) FileDiff {
+	from, to := fp.Files()
+
+	fd := FileDiff{
+		Binary: fp.IsBinary(),
+	}
+
+	switch {
+	case from == nil && to != nil:
+		fd.Status = DiffStatusAdded
+		fd.Path = to.Path()
+	case from != nil && to == nil:
+		fd.Status = DiffStatusDeleted
+		fd.Path = from.Path()
+	case from != nil && to != nil:
+		fd.Path = to.Path()
+		if from.Path() != to.Path() {
+			fd.Status = DiffStatusRenamed
+			fd.OldPath = from.Path()
+		} else {
+			fd.Status = DiffStatusModified
+		}
+	}
+
+	if !fp.IsBinary() {
+		fd.Hunks = hunksFromFilePatch(fp)
+		fd.Additions, fd.Deletions = countChanges(fd.Hunks)
+	}
+
+	return fd
+}
+
+// hunksFromFilePatch encodes a single FilePatch as unified diff and parses
+// it back into our DiffHunk representation. This reuses go-git's battle-tested
+// UnifiedEncoder and our existing hunk parser.
+func hunksFromFilePatch(fp fdiff.FilePatch) []DiffHunk {
+	if len(fp.Chunks()) == 0 {
 		return nil
 	}
 
-	parts, status := splitRawDiffLine(line)
-	if parts == nil {
+	p := &singlePatch{fp: fp}
+	var buf bytes.Buffer
+	enc := fdiff.NewUnifiedEncoder(&buf, fdiff.DefaultContextLines)
+	if err := enc.Encode(p); err != nil {
 		return nil
 	}
 
-	return buildFileDiff(parts, status)
+	return parseHunksFromOutput(buf.String())
 }
 
-// splitRawDiffLine splits a raw diff line into its components.
-// Returns nil if the line is invalid.
-func splitRawDiffLine(line string) ([]string, string) {
-	parts := strings.SplitN(line, "\t", 3)
-	if len(parts) < 2 {
-		return nil, ""
+// =============================================================================
+// Text Diff Helpers
+// =============================================================================
+
+// buildHunksFromText generates diff hunks from raw old/new file content using
+// the Myers diff algorithm (via go-git's diff.Do) and the UnifiedEncoder.
+func buildHunksFromText(path, oldContent, newContent string) []DiffHunk {
+	if oldContent == newContent {
+		return nil
 	}
 
-	metaParts := strings.Fields(parts[0])
-	if len(metaParts) < 5 {
-		return nil, ""
+	diffs := godiff.Do(oldContent, newContent)
+	chunks := chunksFromDiffs(diffs)
+
+	if len(chunks) == 0 {
+		return nil
 	}
 
-	return parts, metaParts[4]
+	// Build a synthetic FilePatch so we can use the UnifiedEncoder.
+	var from, to fdiff.File
+	if oldContent != "" {
+		from = &localFile{path: path, mode: filemode.Regular}
+	}
+	if newContent != "" {
+		to = &localFile{path: path, mode: filemode.Regular}
+	}
+
+	fp := &localFilePatch{from: from, to: to, chunks: chunks}
+	return hunksFromFilePatch(fp)
 }
 
-// buildFileDiff creates a FileDiff from parsed components.
-func buildFileDiff(parts []string, status string) *FileDiff {
-	diff := &FileDiff{
-		Status: extractStatusLetter(status),
+// chunksFromDiffs converts diffmatchpatch diffs to fdiff.Chunk objects.
+func chunksFromDiffs(diffs []dmp.Diff) []fdiff.Chunk {
+	chunks := make([]fdiff.Chunk, 0, len(diffs))
+	for _, d := range diffs {
+		var op fdiff.Operation
+		switch d.Type {
+		case dmp.DiffEqual:
+			op = fdiff.Equal
+		case dmp.DiffInsert:
+			op = fdiff.Add
+		case dmp.DiffDelete:
+			op = fdiff.Delete
+		}
+		chunks = append(chunks, &localChunk{content: d.Text, op: op})
 	}
-
-	assignPaths(diff, parts)
-	return diff
+	return chunks
 }
 
-// assignPaths assigns paths to the diff based on number of parts.
-func assignPaths(diff *FileDiff, parts []string) {
-	if len(parts) == 3 {
-		diff.OldPath = parts[1]
-		diff.Path = parts[2]
-	} else {
-		diff.Path = parts[1]
+// =============================================================================
+// Tree & Blob Helpers
+// =============================================================================
+
+// resolveTreeFromRef resolves a commit reference to its tree.
+func (c *GitClient) resolveTreeFromRef(ref string) (*object.Tree, error) {
+	commit, err := c.resolveCommit(ref)
+	if err != nil {
+		return nil, err
 	}
+	return commit.Tree()
 }
 
-// extractStatusLetter extracts the single letter status from git's status.
-func extractStatusLetter(status string) string {
-	if len(status) == 0 {
+// headTree returns the HEAD commit's tree. Returns (nil, nil) for empty repos.
+func (c *GitClient) headTree() (*object.Tree, error) {
+	ref, err := c.repo.Head()
+	if err != nil {
+		return nil, nil
+	}
+
+	commit, err := c.repo.CommitObject(ref.Hash())
+	if err != nil {
+		return nil, err
+	}
+
+	return commit.Tree()
+}
+
+// readBlobFromTree reads file content from a tree. Returns "" if not found.
+func readBlobFromTree(tree *object.Tree, path string) string {
+	if tree == nil {
 		return ""
 	}
-	// Status can be like "R100" for renames with 100% similarity
-	return string(status[0])
-}
-
-// enrichDiffsWithHunks adds hunk information to file diffs.
-func (c *GitClient) enrichDiffsWithHunks(files []FileDiff, fromHash, toHash string) ([]FileDiff, error) {
-	if len(files) == 0 {
-		return files, nil
-	}
-
-	for i := range files {
-		if err := c.addHunksToFileDiff(&files[i], fromHash, toHash); err != nil {
-			continue // Skip files that fail to get hunks
-		}
-	}
-
-	return files, nil
-}
-
-// enrichWorkingTreeDiffs adds hunk information for working tree diffs.
-func (c *GitClient) enrichWorkingTreeDiffs(files []FileDiff) ([]FileDiff, error) {
-	if len(files) == 0 {
-		return files, nil
-	}
-
-	for i := range files {
-		if err := c.addWorkingTreeHunks(&files[i]); err != nil {
-			continue
-		}
-	}
-
-	return files, nil
-}
-
-// enrichStagedDiffs adds hunk information for staged diffs.
-func (c *GitClient) enrichStagedDiffs(files []FileDiff) ([]FileDiff, error) {
-	if len(files) == 0 {
-		return files, nil
-	}
-
-	for i := range files {
-		if err := c.addStagedHunks(&files[i]); err != nil {
-			continue
-		}
-	}
-
-	return files, nil
-}
-
-// addHunksToFileDiff adds hunk information to a single file diff.
-func (c *GitClient) addHunksToFileDiff(diff *FileDiff, fromHash, toHash string) error {
-	output, err := c.runGitCommand("diff", fromHash, toHash, "--", diff.Path)
+	f, err := tree.File(path)
 	if err != nil {
-		return err
+		return ""
 	}
-
-	diff.Hunks, diff.Binary = parseDiffHunks(output)
-	diff.Additions, diff.Deletions = countChanges(diff.Hunks)
-	return nil
-}
-
-// addWorkingTreeHunks adds hunks for working tree changes.
-func (c *GitClient) addWorkingTreeHunks(diff *FileDiff) error {
-	output, err := c.runGitCommand("diff", "--", diff.Path)
+	content, err := f.Contents()
 	if err != nil {
-		return err
+		return ""
 	}
-
-	diff.Hunks, diff.Binary = parseDiffHunks(output)
-	diff.Additions, diff.Deletions = countChanges(diff.Hunks)
-	return nil
+	return content
 }
 
-// addStagedHunks adds hunks for staged changes.
-func (c *GitClient) addStagedHunks(diff *FileDiff) error {
-	output, err := c.runGitCommand("diff", "--cached", "--", diff.Path)
+// readBlobFromIndexMap reads file content from the index via a pre-built map.
+// Returns "" if the entry is not found.
+func readBlobFromIndexMap(storer storer.EncodedObjectStorer, idxMap map[string]*index.Entry, path string) string {
+	entry, ok := idxMap[path]
+	if !ok {
+		return ""
+	}
+	return readBlobByHash(storer, entry.Hash)
+}
+
+// readBlobByHash reads blob content by its hash. Returns "" on error.
+func readBlobByHash(storer storer.EncodedObjectStorer, hash plumbing.Hash) string {
+	blob, err := object.GetBlob(storer, hash)
 	if err != nil {
-		return err
+		return ""
 	}
-
-	diff.Hunks, diff.Binary = parseDiffHunks(output)
-	diff.Additions, diff.Deletions = countChanges(diff.Hunks)
-	return nil
+	reader, err := blob.Reader()
+	if err != nil {
+		return ""
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
-// parseDiffHunks parses unified diff output into hunks.
-// Returns the hunks and whether the file is binary.
-func parseDiffHunks(output string) ([]DiffHunk, bool) {
-	if strings.Contains(output, "Binary files") {
-		return nil, true
+// readDiskFile reads file content from the working directory.
+func readDiskFile(repoPath, path string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(repoPath, path))
+	if err != nil {
+		return "", err
 	}
-
-	return parseHunksFromOutput(output), false
+	return string(data), nil
 }
 
-// parseHunksFromOutput parses diff output into a slice of hunks.
+// indexEntryMap builds a lookup map from path → index entry.
+func indexEntryMap(idx *index.Index) map[string]*index.Entry {
+	m := make(map[string]*index.Entry, len(idx.Entries))
+	for _, e := range idx.Entries {
+		m[e.Name] = e
+	}
+	return m
+}
+
+// isBinary reports whether content is binary by checking for NUL bytes
+// in the first binaryDetectLen bytes. Matches git's heuristic.
+func isBinary(content string) bool {
+	end := len(content)
+	if end > binaryDetectLen {
+		end = binaryDetectLen
+	}
+	return strings.Contains(content[:end], "\x00")
+}
+
+// =============================================================================
+// Local fdiff Interface Implementations
+// =============================================================================
+
+// singlePatch wraps a single FilePatch as a Patch for encoding.
+type singlePatch struct{ fp fdiff.FilePatch }
+
+func (p *singlePatch) FilePatches() []fdiff.FilePatch { return []fdiff.FilePatch{p.fp} }
+func (p *singlePatch) Message() string                { return "" }
+
+// localChunk implements fdiff.Chunk.
+type localChunk struct {
+	content string
+	op      fdiff.Operation
+}
+
+func (c *localChunk) Content() string      { return c.content }
+func (c *localChunk) Type() fdiff.Operation { return c.op }
+
+// localFile implements fdiff.File.
+type localFile struct {
+	hash plumbing.Hash
+	mode filemode.FileMode
+	path string
+}
+
+func (f *localFile) Hash() plumbing.Hash      { return f.hash }
+func (f *localFile) Mode() filemode.FileMode   { return f.mode }
+func (f *localFile) Path() string              { return f.path }
+
+// localFilePatch implements fdiff.FilePatch.
+type localFilePatch struct {
+	isBinary   bool
+	from, to   fdiff.File
+	chunks     []fdiff.Chunk
+}
+
+func (fp *localFilePatch) IsBinary() bool                  { return fp.isBinary }
+func (fp *localFilePatch) Files() (fdiff.File, fdiff.File) { return fp.from, fp.to }
+func (fp *localFilePatch) Chunks() []fdiff.Chunk           { return fp.chunks }
+
+// =============================================================================
+// Hunk Parsing (retained from original — used by all diff paths)
+// =============================================================================
+
+// parseHunksFromOutput parses unified diff output into a slice of hunks.
 func parseHunksFromOutput(output string) []DiffHunk {
 	var hunks []DiffHunk
 	var currentHunk *DiffHunk
@@ -322,14 +596,12 @@ func parseHunkHeader(line string) *DiffHunk {
 		return nil
 	}
 
-	hunk := &DiffHunk{
+	return &DiffHunk{
 		OldStart: parseIntOrDefault(matches[1], 1),
 		OldLines: parseIntOrDefault(matches[2], 1),
 		NewStart: parseIntOrDefault(matches[3], 1),
 		NewLines: parseIntOrDefault(matches[4], 1),
 	}
-
-	return hunk
 }
 
 // parseIntOrDefault parses an integer string or returns a default value.
@@ -373,24 +645,12 @@ func countChanges(hunks []DiffHunk) (additions, deletions int) {
 // countHunkChanges counts additions and deletions in a single hunk.
 func countHunkChanges(hunk DiffHunk) (additions, deletions int) {
 	for _, line := range hunk.Lines {
-		additions += countAddition(line)
-		deletions += countDeletion(line)
+		if len(line) > 0 && line[0] == '+' {
+			additions++
+		}
+		if len(line) > 0 && line[0] == '-' {
+			deletions++
+		}
 	}
 	return
-}
-
-// countAddition returns 1 if line is an addition, 0 otherwise.
-func countAddition(line string) int {
-	if len(line) > 0 && line[0] == '+' {
-		return 1
-	}
-	return 0
-}
-
-// countDeletion returns 1 if line is a deletion, 0 otherwise.
-func countDeletion(line string) int {
-	if len(line) > 0 && line[0] == '-' {
-		return 1
-	}
-	return 0
 }

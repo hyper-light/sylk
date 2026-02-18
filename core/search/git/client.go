@@ -4,11 +4,9 @@
 package git
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,14 +22,11 @@ import (
 
 // Common errors returned by GitClient operations.
 var (
-	ErrNotGitRepository = errors.New("not a git repository")
-	ErrPathNotFound     = errors.New("path not found")
-	ErrInvalidCommit    = errors.New("invalid commit reference")
-	ErrGitNotInstalled  = errors.New("git is not installed or not in PATH")
-	ErrEmptyPath        = errors.New("repository path cannot be empty")
-	ErrNotGitRepo       = errors.New("path is not a git repository")
-	ErrNoHead           = errors.New("repository has no HEAD reference")
-	ErrRemoteNotFound   = errors.New("remote not found")
+	ErrInvalidCommit  = errors.New("invalid commit reference")
+	ErrEmptyPath      = errors.New("repository path cannot be empty")
+	ErrNotGitRepo     = errors.New("path is not a git repository")
+	ErrNoHead         = errors.New("repository has no HEAD reference")
+	ErrRemoteNotFound = errors.New("remote not found")
 )
 
 // =============================================================================
@@ -245,52 +240,6 @@ func extractRemoteURL(remote *gogit.Remote) string {
 	return cfg.URLs[0]
 }
 
-// =============================================================================
-// Legacy Command-Line Methods (for backward compatibility)
-// =============================================================================
-
-// isGitRepository checks if the path is inside a git repository using CLI.
-func (c *GitClient) isGitRepository() bool {
-	_, err := c.runGitCommand("rev-parse", "--git-dir")
-	return err == nil
-}
-
-// runGitCommand executes a git command and returns the output.
-func (c *GitClient) runGitCommand(args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = c.repoPath
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
-		return "", c.parseGitError(err, stderr.String())
-	}
-
-	return stdout.String(), nil
-}
-
-// parseGitError converts git command errors into appropriate error types.
-func (c *GitClient) parseGitError(err error, stderr string) error {
-	if strings.Contains(stderr, "not a git repository") {
-		return ErrNotGitRepository
-	}
-	if strings.Contains(stderr, "does not exist") || strings.Contains(stderr, "no such path") {
-		return ErrPathNotFound
-	}
-	if strings.Contains(stderr, "unknown revision") || strings.Contains(stderr, "bad revision") {
-		return ErrInvalidCommit
-	}
-
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return fmt.Errorf("git command failed: %s", strings.TrimSpace(stderr))
-	}
-
-	return err
-}
 
 // fileExists checks if a file exists at the given path.
 func (c *GitClient) fileExists(path string) bool {
@@ -299,56 +248,25 @@ func (c *GitClient) fileExists(path string) bool {
 	return err == nil
 }
 
-// StashFiles stashes the specified files using git stash push.
-// If no paths are given, the call is a no-op.
-func (c *GitClient) StashFiles(paths []string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.isRepo {
-		return ErrNotGitRepo
-	}
-	if len(paths) == 0 {
-		return nil
-	}
-	args := []string{"stash", "push", "-m", "sylk: stash", "--"}
-	args = append(args, paths...)
-	_, err := c.runGitCommand(args...)
-	return err
-}
 
-// UnstashFiles pops the most recent stash entry.
-func (c *GitClient) UnstashFiles() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.isRepo {
-		return ErrNotGitRepo
-	}
-	_, err := c.runGitCommand("stash", "pop")
-	return err
-}
-
-// HasStash reports whether the stash list is non-empty.
-func (c *GitClient) HasStash() bool {
+// IsValidCommit checks if a commit reference is valid.
+// Resolves full hashes, short hashes, and symbolic refs via go-git.
+func (c *GitClient) IsValidCommit(ref string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if !c.isRepo {
 		return false
 	}
-	out, err := c.runGitCommand("stash", "list")
-	return err == nil && strings.TrimSpace(out) != ""
-}
-
-// IsValidCommit checks if a commit reference is valid.
-func (c *GitClient) IsValidCommit(ref string) bool {
-	_, err := c.runGitCommand("rev-parse", "--verify", ref+"^{commit}")
+	_, err := c.repo.ResolveRevision(plumbing.Revision(ref))
 	return err == nil
 }
 
 // GetHeadCommit returns the current HEAD commit hash.
 func (c *GitClient) GetHeadCommit() (string, error) {
-	output, err := c.runGitCommand("rev-parse", "HEAD")
-	if err != nil {
-		return "", err
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.isRepo {
+		return "", ErrNotGitRepo
 	}
-	return strings.TrimSpace(output), nil
+	return c.getHeadHash()
 }

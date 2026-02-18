@@ -11,6 +11,7 @@ import (
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 	fdiff "github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -893,7 +894,7 @@ func (c *GitClient) writeInitialReflog(name string, hash plumbing.Hash) error {
 
 // MergeBranch merges sourceBranch into targetBranch.
 // The target branch is checked out first, then the source is merged in.
-// Uses the git CLI for full merge support (fast-forward and 3-way).
+// Supports fast-forward and full 3-way merge via treeMerge3.
 func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -902,16 +903,138 @@ func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
 		return ErrNotGitRepo
 	}
 
-	if _, err := c.runGitCommand("checkout", targetBranch); err != nil {
+	// Checkout the target branch.
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	targetRef := plumbing.NewBranchReferenceName(targetBranch)
+	if err := wt.Checkout(&gogit.CheckoutOptions{Branch: targetRef}); err != nil {
 		return fmt.Errorf("checkout %s: %w", targetBranch, err)
 	}
 
-	_, err := c.runGitCommand("merge", sourceBranch, "--no-edit")
-	return err
+	// Resolve both branches to commits.
+	sourceRef := plumbing.NewBranchReferenceName(sourceBranch)
+	sourceHash, err := c.repo.ResolveRevision(plumbing.Revision(sourceRef))
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", sourceBranch, err)
+	}
+
+	sourceCommit, err := c.repo.CommitObject(*sourceHash)
+	if err != nil {
+		return err
+	}
+
+	targetHead, err := c.repo.Head()
+	if err != nil {
+		return wrapHeadError(err)
+	}
+
+	targetCommit, err := c.repo.CommitObject(targetHead.Hash())
+	if err != nil {
+		return err
+	}
+
+	// Already up to date: target is descendant of source (or equal).
+	isAncestor, err := sourceCommit.IsAncestor(targetCommit)
+	if err != nil {
+		return err
+	}
+	if isAncestor {
+		return nil // Already merged.
+	}
+
+	// Fast-forward: target is ancestor of source.
+	isFF, err := targetCommit.IsAncestor(sourceCommit)
+	if err != nil {
+		return err
+	}
+
+	if isFF {
+		// Update ref and reset worktree.
+		ref := plumbing.NewHashReference(targetRef, sourceCommit.Hash)
+		if err := c.repo.Storer.SetReference(ref); err != nil {
+			return err
+		}
+		return wt.Reset(&gogit.ResetOptions{
+			Commit: sourceCommit.Hash,
+			Mode:   gogit.HardReset,
+		})
+	}
+
+	// Non-fast-forward: 3-way merge.
+	bases, err := targetCommit.MergeBase(sourceCommit)
+	if err != nil {
+		return err
+	}
+	if len(bases) == 0 {
+		return fmt.Errorf("no common ancestor between %s and %s", targetBranch, sourceBranch)
+	}
+
+	baseTree, err := bases[0].Tree()
+	if err != nil {
+		return err
+	}
+
+	targetTree, err := targetCommit.Tree()
+	if err != nil {
+		return err
+	}
+
+	sourceTree, err := sourceCommit.Tree()
+	if err != nil {
+		return err
+	}
+
+	result, err := treeMerge3(c.repo.Storer, baseTree, targetTree, sourceTree)
+	if err != nil {
+		return err
+	}
+
+	if result.HasConflicts() {
+		// Write conflict-marked files to worktree for manual resolution.
+		if err := c.writeConflictsToWorktree(result.Conflicts); err != nil {
+			return err
+		}
+		return ErrMergeConflict
+	}
+
+	// Create merge commit with two parents.
+	now := time.Now()
+	sig := defaultSignature(now)
+	msg := fmt.Sprintf("Merge branch '%s' into %s\n", sourceBranch, targetBranch)
+
+	mergeHash, err := storeCommitObj(
+		c.repo.Storer, result.TreeHash,
+		[]plumbing.Hash{targetCommit.Hash, sourceCommit.Hash},
+		sig, sig, msg,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Update branch ref and reset worktree.
+	ref := plumbing.NewHashReference(targetRef, mergeHash)
+	if err := c.repo.Storer.SetReference(ref); err != nil {
+		return err
+	}
+
+	// Also update HEAD symbolic target.
+	headRef := plumbing.NewSymbolicReference(plumbing.HEAD, targetRef)
+	if err := c.repo.Storer.SetReference(headRef); err != nil {
+		return err
+	}
+
+	return wt.Reset(&gogit.ResetOptions{
+		Commit: mergeHash,
+		Mode:   gogit.HardReset,
+	})
 }
 
 // PullBranch fetches and merges the named branch from the given remote.
 // If remoteName is empty, "origin" is used as the default.
+// Supports both fast-forward and 3-way merge via fetch + treeMerge3.
 func (c *GitClient) PullBranch(branchName, remoteName string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -922,8 +1045,144 @@ func (c *GitClient) PullBranch(branchName, remoteName string) error {
 	if remoteName == "" {
 		remoteName = "origin"
 	}
-	_, err := c.runGitCommand("pull", remoteName, branchName)
-	return err
+
+	// Phase 1: Fetch from remote.
+	remote, err := c.repo.Remote(remoteName)
+	if err != nil {
+		return fmt.Errorf("remote %s: %w", remoteName, err)
+	}
+
+	refSpec := config.RefSpec(
+		"refs/heads/" + branchName + ":refs/remotes/" + remoteName + "/" + branchName,
+	)
+	err = remote.Fetch(&gogit.FetchOptions{
+		RemoteName: remoteName,
+		RefSpecs:   []config.RefSpec{refSpec},
+		Force:      true,
+	})
+	if err != nil && err != gogit.NoErrAlreadyUpToDate {
+		return fmt.Errorf("fetch: %w", err)
+	}
+
+	// Phase 2: Resolve the remote tracking ref.
+	remoteRefName := plumbing.NewRemoteReferenceName(remoteName, branchName)
+	remoteRef, err := c.repo.Reference(remoteRefName, true)
+	if err != nil {
+		return fmt.Errorf("resolve remote ref: %w", err)
+	}
+
+	remoteCommit, err := c.repo.CommitObject(remoteRef.Hash())
+	if err != nil {
+		return err
+	}
+
+	// Phase 3: Resolve local HEAD.
+	headRef, err := c.repo.Head()
+	if err != nil {
+		return wrapHeadError(err)
+	}
+
+	localCommit, err := c.repo.CommitObject(headRef.Hash())
+	if err != nil {
+		return err
+	}
+
+	// Already up to date.
+	if localCommit.Hash == remoteCommit.Hash {
+		return nil
+	}
+
+	isAncestor, err := remoteCommit.IsAncestor(localCommit)
+	if err != nil {
+		return err
+	}
+	if isAncestor {
+		return nil // Remote is behind local.
+	}
+
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	// Fast-forward check.
+	isFF, err := localCommit.IsAncestor(remoteCommit)
+	if err != nil {
+		return err
+	}
+
+	localRef := headRef.Name()
+
+	if isFF {
+		ref := plumbing.NewHashReference(localRef, remoteCommit.Hash)
+		if err := c.repo.Storer.SetReference(ref); err != nil {
+			return err
+		}
+		return wt.Reset(&gogit.ResetOptions{
+			Commit: remoteCommit.Hash,
+			Mode:   gogit.HardReset,
+		})
+	}
+
+	// Non-fast-forward: 3-way merge.
+	bases, err := localCommit.MergeBase(remoteCommit)
+	if err != nil {
+		return err
+	}
+	if len(bases) == 0 {
+		return fmt.Errorf("no common ancestor between local and remote %s/%s", remoteName, branchName)
+	}
+
+	baseTree, err := bases[0].Tree()
+	if err != nil {
+		return err
+	}
+
+	localTree, err := localCommit.Tree()
+	if err != nil {
+		return err
+	}
+
+	remoteTree, err := remoteCommit.Tree()
+	if err != nil {
+		return err
+	}
+
+	result, err := treeMerge3(c.repo.Storer, baseTree, localTree, remoteTree)
+	if err != nil {
+		return err
+	}
+
+	if result.HasConflicts() {
+		if err := c.writeConflictsToWorktree(result.Conflicts); err != nil {
+			return err
+		}
+		return ErrMergeConflict
+	}
+
+	// Create merge commit.
+	now := time.Now()
+	sig := defaultSignature(now)
+	msg := fmt.Sprintf("Merge remote-tracking branch '%s/%s'\n", remoteName, branchName)
+
+	mergeHash, err := storeCommitObj(
+		c.repo.Storer, result.TreeHash,
+		[]plumbing.Hash{localCommit.Hash, remoteCommit.Hash},
+		sig, sig, msg,
+	)
+	if err != nil {
+		return err
+	}
+
+	ref := plumbing.NewHashReference(localRef, mergeHash)
+	if err := c.repo.Storer.SetReference(ref); err != nil {
+		return err
+	}
+
+	return wt.Reset(&gogit.ResetOptions{
+		Commit: mergeHash,
+		Mode:   gogit.HardReset,
+	})
 }
 
 // PushBranch pushes the named branch to the given remote.
@@ -938,7 +1197,23 @@ func (c *GitClient) PushBranch(branchName, remoteName string) error {
 	if remoteName == "" {
 		remoteName = "origin"
 	}
-	_, err := c.runGitCommand("push", remoteName, branchName)
+
+	remote, err := c.repo.Remote(remoteName)
+	if err != nil {
+		return fmt.Errorf("remote %s: %w", remoteName, err)
+	}
+
+	refSpec := config.RefSpec(
+		"refs/heads/" + branchName + ":refs/heads/" + branchName,
+	)
+
+	err = remote.Push(&gogit.PushOptions{
+		RemoteName: remoteName,
+		RefSpecs:   []config.RefSpec{refSpec},
+	})
+	if err == gogit.NoErrAlreadyUpToDate {
+		return nil
+	}
 	return err
 }
 
