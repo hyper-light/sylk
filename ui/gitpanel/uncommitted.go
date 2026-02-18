@@ -90,7 +90,7 @@ func (ut *uncommittedTab) toggleAll() {
 
 // loadUncommitted fetches uncommitted files with real status codes
 // from the git client using the go-git native API.
-func loadUncommitted(gc *git.GitBus) ([]uncommittedEntry, error) {
+func loadUncommitted(gc *git.GitClient) ([]uncommittedEntry, error) {
 	statuses, _, err := gc.UncommittedFileStatuses()
 	if err != nil {
 		return nil, err

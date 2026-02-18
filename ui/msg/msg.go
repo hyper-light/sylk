@@ -469,15 +469,6 @@ type GitStatusMsg struct {
 	TrackedDirs map[string]struct{}
 }
 
-// GitOpEventMsg carries a completed git mutation event from the GitBridge.
-// Only emitted for mutating operations (commit, checkout, merge, etc.).
-type GitOpEventMsg struct {
-	Op       string        // Operation name (e.g. "checkout_branch").
-	Err      error         // nil on success.
-	Duration time.Duration // Wall-clock time of the operation.
-	Params   any           // Operation-specific parameters for context.
-}
-
 // ---------------------------------------------------------------------------
 // Diff view
 // ---------------------------------------------------------------------------
