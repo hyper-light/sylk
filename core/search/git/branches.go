@@ -47,13 +47,15 @@ func (c *GitClient) listBranchesInternal() ([]BranchInfo, error) {
 	defer iter.Close()
 
 	var branches []BranchInfo
-	err = iter.ForEach(func(ref *plumbing.Reference) error {
-		info := branchInfoFromRef(c, ref, headBranch)
-		branches = append(branches, info)
-		return nil
-	})
-	if err != nil {
-		return nil, err
+	for {
+		ref, nextErr := iter.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, nextErr
+		}
+		branches = append(branches, branchInfoFromRef(c, ref, headBranch))
 	}
 
 	return branches, nil
@@ -521,16 +523,18 @@ func (c *GitClient) ListCommitsForTree(limit int) ([]TreeCommit, error) {
 	defer iter.Close()
 
 	var commits []TreeCommit
-	err = iter.ForEach(func(co *object.Commit) error {
+	for {
 		if limit > 0 && len(commits) >= limit {
-			return io.EOF
+			break
 		}
-		tc := treeCommitFromObject(co, branchMap)
-		commits = append(commits, tc)
-		return nil
-	})
-	if err != nil && err != io.EOF {
-		return nil, err
+		co, err := iter.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		commits = append(commits, treeCommitFromObject(co, branchMap))
 	}
 
 	return commits, nil
@@ -718,10 +722,16 @@ func (c *GitClient) buildBranchMap() (map[string]string, error) {
 	defer iter.Close()
 
 	m := make(map[string]string)
-	_ = iter.ForEach(func(ref *plumbing.Reference) error {
+	for {
+		ref, err := iter.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
 		m[ref.Hash().String()] = ref.Name().Short()
-		return nil
-	})
+	}
 	return m, nil
 }
 
@@ -903,7 +913,6 @@ func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
 		return ErrNotGitRepo
 	}
 
-	// Checkout the target branch.
 	wt, err := c.repo.Worktree()
 	if err != nil {
 		return err
@@ -914,62 +923,72 @@ func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
 		return fmt.Errorf("checkout %s: %w", targetBranch, err)
 	}
 
-	// Resolve both branches to commits.
-	sourceRef := plumbing.NewBranchReferenceName(sourceBranch)
-	sourceHash, err := c.repo.ResolveRevision(plumbing.Revision(sourceRef))
-	if err != nil {
-		return fmt.Errorf("resolve %s: %w", sourceBranch, err)
-	}
-
-	sourceCommit, err := c.repo.CommitObject(*sourceHash)
+	sourceCommit, err := c.resolveBranchCommit(sourceBranch)
 	if err != nil {
 		return err
 	}
 
-	targetHead, err := c.repo.Head()
-	if err != nil {
-		return wrapHeadError(err)
-	}
-
-	targetCommit, err := c.repo.CommitObject(targetHead.Hash())
+	targetCommit, err := c.headCommit()
 	if err != nil {
 		return err
 	}
 
-	// Already up to date: target is descendant of source (or equal).
-	isAncestor, err := sourceCommit.IsAncestor(targetCommit)
+	msg := fmt.Sprintf("Merge branch '%s' into %s\n", sourceBranch, targetBranch)
+	return c.mergeCommits(wt, targetRef, targetCommit, sourceCommit, msg)
+}
+
+// resolveBranchCommit resolves a branch name to its tip commit object.
+func (c *GitClient) resolveBranchCommit(branch string) (*object.Commit, error) {
+	ref := plumbing.NewBranchReferenceName(branch)
+	hash, err := c.repo.ResolveRevision(plumbing.Revision(ref))
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", branch, err)
+	}
+	return c.repo.CommitObject(*hash)
+}
+
+// headCommit returns the commit object at HEAD.
+func (c *GitClient) headCommit() (*object.Commit, error) {
+	headRef, err := c.repo.Head()
+	if err != nil {
+		return nil, wrapHeadError(err)
+	}
+	return c.repo.CommitObject(headRef.Hash())
+}
+
+// mergeCommits performs the merge of sourceCommit into localCommit at localRef.
+// Handles already-up-to-date, fast-forward, and 3-way merge cases.
+func (c *GitClient) mergeCommits(wt *gogit.Worktree, localRef plumbing.ReferenceName, localCommit, sourceCommit *object.Commit, msg string) error {
+	// Already up to date: source is ancestor of local.
+	isAncestor, err := sourceCommit.IsAncestor(localCommit)
 	if err != nil {
 		return err
 	}
 	if isAncestor {
-		return nil // Already merged.
+		return nil
 	}
 
-	// Fast-forward: target is ancestor of source.
-	isFF, err := targetCommit.IsAncestor(sourceCommit)
+	// Fast-forward: local is ancestor of source.
+	isFF, err := localCommit.IsAncestor(sourceCommit)
 	if err != nil {
 		return err
 	}
-
 	if isFF {
-		// Update ref and reset worktree.
-		ref := plumbing.NewHashReference(targetRef, sourceCommit.Hash)
-		if err := c.repo.Storer.SetReference(ref); err != nil {
-			return err
-		}
-		return wt.Reset(&gogit.ResetOptions{
-			Commit: sourceCommit.Hash,
-			Mode:   gogit.HardReset,
-		})
+		return c.updateRefAndReset(wt, localRef, sourceCommit.Hash)
 	}
 
 	// Non-fast-forward: 3-way merge.
-	bases, err := targetCommit.MergeBase(sourceCommit)
+	return c.threewayMerge(wt, localRef, localCommit, sourceCommit, msg)
+}
+
+// threewayMerge performs a full 3-way merge between local and source commits.
+func (c *GitClient) threewayMerge(wt *gogit.Worktree, localRef plumbing.ReferenceName, localCommit, sourceCommit *object.Commit, msg string) error {
+	bases, err := localCommit.MergeBase(sourceCommit)
 	if err != nil {
 		return err
 	}
 	if len(bases) == 0 {
-		return fmt.Errorf("no common ancestor between %s and %s", targetBranch, sourceBranch)
+		return fmt.Errorf("no common ancestor between %s and %s", localRef.Short(), sourceCommit.Hash.String()[:7])
 	}
 
 	baseTree, err := bases[0].Tree()
@@ -977,7 +996,7 @@ func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
 		return err
 	}
 
-	targetTree, err := targetCommit.Tree()
+	localTree, err := localCommit.Tree()
 	if err != nil {
 		return err
 	}
@@ -987,47 +1006,39 @@ func (c *GitClient) MergeBranch(sourceBranch, targetBranch string) error {
 		return err
 	}
 
-	result, err := treeMerge3(c.repo.Storer, baseTree, targetTree, sourceTree)
+	result, err := treeMerge3(c.repo.Storer, baseTree, localTree, sourceTree)
 	if err != nil {
 		return err
 	}
 
 	if result.HasConflicts() {
-		// Write conflict-marked files to worktree for manual resolution.
 		if err := c.writeConflictsToWorktree(result.Conflicts); err != nil {
 			return err
 		}
 		return ErrMergeConflict
 	}
 
-	// Create merge commit with two parents.
-	now := time.Now()
-	sig := defaultSignature(now)
-	msg := fmt.Sprintf("Merge branch '%s' into %s\n", sourceBranch, targetBranch)
-
+	sig := defaultSignature(time.Now())
 	mergeHash, err := storeCommitObj(
 		c.repo.Storer, result.TreeHash,
-		[]plumbing.Hash{targetCommit.Hash, sourceCommit.Hash},
+		[]plumbing.Hash{localCommit.Hash, sourceCommit.Hash},
 		sig, sig, msg,
 	)
 	if err != nil {
 		return err
 	}
 
-	// Update branch ref and reset worktree.
-	ref := plumbing.NewHashReference(targetRef, mergeHash)
+	return c.updateRefAndReset(wt, localRef, mergeHash)
+}
+
+// updateRefAndReset updates a branch ref and resets the worktree to that hash.
+func (c *GitClient) updateRefAndReset(wt *gogit.Worktree, refName plumbing.ReferenceName, hash plumbing.Hash) error {
+	ref := plumbing.NewHashReference(refName, hash)
 	if err := c.repo.Storer.SetReference(ref); err != nil {
 		return err
 	}
-
-	// Also update HEAD symbolic target.
-	headRef := plumbing.NewSymbolicReference(plumbing.HEAD, targetRef)
-	if err := c.repo.Storer.SetReference(headRef); err != nil {
-		return err
-	}
-
 	return wt.Reset(&gogit.ResetOptions{
-		Commit: mergeHash,
+		Commit: hash,
 		Mode:   gogit.HardReset,
 	})
 }
@@ -1046,7 +1057,40 @@ func (c *GitClient) PullBranch(branchName, remoteName string) error {
 		remoteName = "origin"
 	}
 
-	// Phase 1: Fetch from remote.
+	if err := c.fetchBranch(branchName, remoteName); err != nil {
+		return err
+	}
+
+	remoteCommit, err := c.resolveRemoteCommit(branchName, remoteName)
+	if err != nil {
+		return err
+	}
+
+	localCommit, err := c.headCommit()
+	if err != nil {
+		return err
+	}
+
+	if localCommit.Hash == remoteCommit.Hash {
+		return nil
+	}
+
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return err
+	}
+
+	headRef, err := c.repo.Head()
+	if err != nil {
+		return wrapHeadError(err)
+	}
+
+	msg := fmt.Sprintf("Merge remote-tracking branch '%s/%s'\n", remoteName, branchName)
+	return c.mergeCommits(wt, headRef.Name(), localCommit, remoteCommit, msg)
+}
+
+// fetchBranch fetches a single branch from the named remote.
+func (c *GitClient) fetchBranch(branchName, remoteName string) error {
 	remote, err := c.repo.Remote(remoteName)
 	if err != nil {
 		return fmt.Errorf("remote %s: %w", remoteName, err)
@@ -1063,126 +1107,17 @@ func (c *GitClient) PullBranch(branchName, remoteName string) error {
 	if err != nil && err != gogit.NoErrAlreadyUpToDate {
 		return fmt.Errorf("fetch: %w", err)
 	}
+	return nil
+}
 
-	// Phase 2: Resolve the remote tracking ref.
+// resolveRemoteCommit resolves the remote tracking ref to a commit object.
+func (c *GitClient) resolveRemoteCommit(branchName, remoteName string) (*object.Commit, error) {
 	remoteRefName := plumbing.NewRemoteReferenceName(remoteName, branchName)
 	remoteRef, err := c.repo.Reference(remoteRefName, true)
 	if err != nil {
-		return fmt.Errorf("resolve remote ref: %w", err)
+		return nil, fmt.Errorf("resolve remote ref: %w", err)
 	}
-
-	remoteCommit, err := c.repo.CommitObject(remoteRef.Hash())
-	if err != nil {
-		return err
-	}
-
-	// Phase 3: Resolve local HEAD.
-	headRef, err := c.repo.Head()
-	if err != nil {
-		return wrapHeadError(err)
-	}
-
-	localCommit, err := c.repo.CommitObject(headRef.Hash())
-	if err != nil {
-		return err
-	}
-
-	// Already up to date.
-	if localCommit.Hash == remoteCommit.Hash {
-		return nil
-	}
-
-	isAncestor, err := remoteCommit.IsAncestor(localCommit)
-	if err != nil {
-		return err
-	}
-	if isAncestor {
-		return nil // Remote is behind local.
-	}
-
-	wt, err := c.repo.Worktree()
-	if err != nil {
-		return err
-	}
-
-	// Fast-forward check.
-	isFF, err := localCommit.IsAncestor(remoteCommit)
-	if err != nil {
-		return err
-	}
-
-	localRef := headRef.Name()
-
-	if isFF {
-		ref := plumbing.NewHashReference(localRef, remoteCommit.Hash)
-		if err := c.repo.Storer.SetReference(ref); err != nil {
-			return err
-		}
-		return wt.Reset(&gogit.ResetOptions{
-			Commit: remoteCommit.Hash,
-			Mode:   gogit.HardReset,
-		})
-	}
-
-	// Non-fast-forward: 3-way merge.
-	bases, err := localCommit.MergeBase(remoteCommit)
-	if err != nil {
-		return err
-	}
-	if len(bases) == 0 {
-		return fmt.Errorf("no common ancestor between local and remote %s/%s", remoteName, branchName)
-	}
-
-	baseTree, err := bases[0].Tree()
-	if err != nil {
-		return err
-	}
-
-	localTree, err := localCommit.Tree()
-	if err != nil {
-		return err
-	}
-
-	remoteTree, err := remoteCommit.Tree()
-	if err != nil {
-		return err
-	}
-
-	result, err := treeMerge3(c.repo.Storer, baseTree, localTree, remoteTree)
-	if err != nil {
-		return err
-	}
-
-	if result.HasConflicts() {
-		if err := c.writeConflictsToWorktree(result.Conflicts); err != nil {
-			return err
-		}
-		return ErrMergeConflict
-	}
-
-	// Create merge commit.
-	now := time.Now()
-	sig := defaultSignature(now)
-	msg := fmt.Sprintf("Merge remote-tracking branch '%s/%s'\n", remoteName, branchName)
-
-	mergeHash, err := storeCommitObj(
-		c.repo.Storer, result.TreeHash,
-		[]plumbing.Hash{localCommit.Hash, remoteCommit.Hash},
-		sig, sig, msg,
-	)
-	if err != nil {
-		return err
-	}
-
-	ref := plumbing.NewHashReference(localRef, mergeHash)
-	if err := c.repo.Storer.SetReference(ref); err != nil {
-		return err
-	}
-
-	return wt.Reset(&gogit.ResetOptions{
-		Commit: mergeHash,
-		Mode:   gogit.HardReset,
-	})
+	return c.repo.CommitObject(remoteRef.Hash())
 }
 
 // PushBranch pushes the named branch to the given remote.
@@ -1299,10 +1234,16 @@ func (c *GitClient) reachableSet(from plumbing.Hash) map[plumbing.Hash]struct{} 
 	defer iter.Close()
 
 	set := make(map[plumbing.Hash]struct{}, 256)
-	_ = iter.ForEach(func(co *object.Commit) error {
+	for {
+		co, err := iter.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil
+		}
 		set[co.Hash] = struct{}{}
-		return nil
-	})
+	}
 	return set
 }
 
@@ -1408,13 +1349,19 @@ func (c *GitClient) countAllFrom(hash plumbing.Hash, limit int) (int, bool, erro
 	defer iter.Close()
 
 	count := 0
-	_ = iter.ForEach(func(_ *object.Commit) error {
+	for {
+		_, err := iter.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, false, err
+		}
 		count++
 		if limit > 0 && count >= limit {
-			return io.EOF
+			break
 		}
-		return nil
-	})
+	}
 	return count, limit > 0 && count >= limit, nil
 }
 
@@ -1443,13 +1390,19 @@ func (c *GitClient) CountBranchCommits(name string, limit int) (count int, cappe
 	}
 	defer iter.Close()
 
-	_ = iter.ForEach(func(_ *object.Commit) error {
+	for {
+		_, nextErr := iter.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return 0, false, nextErr
+		}
 		count++
 		if limit > 0 && count >= limit {
-			return io.EOF
+			break
 		}
-		return nil
-	})
+	}
 
 	capped = limit > 0 && count >= limit
 	return count, capped, nil
@@ -1930,11 +1883,16 @@ func (c *GitClient) ListTags() ([]TagInfo, error) {
 	defer iter.Close()
 
 	var tags []TagInfo
-	_ = iter.ForEach(func(ref *plumbing.Reference) error {
-		info := c.tagInfoFromRef(ref)
-		tags = append(tags, info)
-		return nil
-	})
+	for {
+		ref, err := iter.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		tags = append(tags, c.tagInfoFromRef(ref))
+	}
 
 	return tags, nil
 }

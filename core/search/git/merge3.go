@@ -3,15 +3,18 @@ package git
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/epiclabs-io/diff3"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/storer"
 	"github.com/go-git/go-git/v5/storage"
 	"github.com/go-git/go-git/v5/utils/merkletrie"
 )
@@ -20,14 +23,8 @@ import (
 // Errors
 // =============================================================================
 
-var (
-	// ErrMergeConflict indicates the merge produced conflicts.
-	ErrMergeConflict = errors.New("merge conflict")
-
-	// ErrDeleteModifyConflict indicates one side deleted a file while
-	// the other modified it.
-	ErrDeleteModifyConflict = errors.New("delete/modify conflict")
-)
+// ErrMergeConflict indicates the merge produced conflicts.
+var ErrMergeConflict = errors.New("merge conflict")
 
 // =============================================================================
 // Types
@@ -126,8 +123,15 @@ func treeMerge3(s storage.Storer, base, ours, theirs *object.Tree) (*TreeMergeRe
 	}
 
 	// Index changes by path.
-	oursMap := indexChangesByPath(oursChanges)
-	theirsMap := indexChangesByPath(theirsChanges)
+	oursMap, err := indexChangesByPath(oursChanges)
+	if err != nil {
+		return nil, err
+	}
+
+	theirsMap, err := indexChangesByPath(theirsChanges)
+	if err != nil {
+		return nil, err
+	}
 
 	// Collect all unique changed paths.
 	allPaths := mergeKeys(oursMap, theirsMap)
@@ -143,35 +147,18 @@ func treeMerge3(s storage.Storer, base, ours, theirs *object.Tree) (*TreeMergeRe
 
 		switch {
 		case oursChanged && !theirsChanged:
-			// Only ours changed — take ours.
 			builder.apply(oc)
 
 		case !oursChanged && theirsChanged:
-			// Only theirs changed — take theirs.
 			builder.apply(tc)
 
 		case oursChanged && theirsChanged:
-			// Both sides changed this path.
-			c, err := resolveDoubleChange(s, base, oc, tc, path)
+			c, err := mergeDoubleChange(s, base, oc, tc, path, builder)
 			if err != nil {
 				return nil, err
 			}
 			if c != nil {
 				conflicts = append(conflicts, *c)
-				// For content conflicts, store the conflict-marked
-				// version in the tree so it can be written to worktree.
-				if c.MergedContent != "" {
-					hash, err := storeBlob(s, []byte(c.MergedContent))
-					if err != nil {
-						return nil, err
-					}
-					builder.set(path, hash, filemode.Regular)
-				}
-			} else {
-				// Clean merge of double change — ours and theirs
-				// produced the same result or were merged cleanly.
-				// The builder already has the correct state from
-				// resolveDoubleChange side effects.
 			}
 		}
 	}
@@ -191,12 +178,12 @@ func treeMerge3(s storage.Storer, base, ours, theirs *object.Tree) (*TreeMergeRe
 // Change Resolution
 // =============================================================================
 
-// resolveDoubleChange handles the case where both ours and theirs
-// modified the same path. Returns nil conflict if cleanly resolved.
-// When clean, applies the result to the builder via side effect on the
-// changeAction (modifying oc to carry the merged blob).
-func resolveDoubleChange(s storage.Storer, base *object.Tree, oc, tc *changeAction, path string) (*MergeConflict, error) {
-	// Both deleted — clean.
+// mergeDoubleChange handles the case where both ours and theirs modified
+// the same path. Returns nil conflict if cleanly resolved. On clean merge,
+// applies the result to the builder. On conflict, stores conflict-marked
+// content in the builder and returns the conflict descriptor.
+func mergeDoubleChange(s storage.Storer, base *object.Tree, oc, tc *changeAction, path string, builder *treeBuilder) (*MergeConflict, error) {
+	// Both deleted — clean, no builder action needed.
 	if oc.action == merkletrie.Delete && tc.action == merkletrie.Delete {
 		return nil, nil
 	}
@@ -206,31 +193,49 @@ func resolveDoubleChange(s storage.Storer, base *object.Tree, oc, tc *changeActi
 
 	// One deleted, the other modified/inserted — delete/modify conflict.
 	if oc.action == merkletrie.Delete || tc.action == merkletrie.Delete {
-		return &MergeConflict{
-			Path:       path,
-			Type:       DeleteModifyConflict,
-			BaseHash:   blobHashFromEntry(base, path),
-			OursHash:   oursHash,
-			TheirsHash: theirsHash,
-		}, nil
+		return deleteModifyConflict(base, path, oursHash, theirsHash), nil
 	}
 
-	// Both changed — check if they arrived at the same result.
+	// Both changed to identical result — take ours, clean.
 	if oursHash == theirsHash {
-		// Identical change — take ours (or theirs, same thing).
+		builder.apply(oc)
 		return nil, nil
 	}
 
 	// Different changes — attempt 3-way text merge.
+	return textMerge3(s, base, oc, path, oursHash, theirsHash, builder)
+}
+
+// deleteModifyConflict constructs a MergeConflict for delete/modify scenarios.
+func deleteModifyConflict(base *object.Tree, path string, oursHash, theirsHash plumbing.Hash) *MergeConflict {
+	return &MergeConflict{
+		Path:       path,
+		Type:       DeleteModifyConflict,
+		BaseHash:   blobHashFromEntry(base, path),
+		OursHash:   oursHash,
+		TheirsHash: theirsHash,
+	}
+}
+
+// textMerge3 performs a 3-way text merge for a single file where both sides
+// modified differently. On clean merge, stores the result and applies to
+// builder. On conflict, stores conflict-marked content and returns the conflict.
+func textMerge3(s storage.Storer, base *object.Tree, oc *changeAction, path string, oursHash, theirsHash plumbing.Hash, builder *treeBuilder) (*MergeConflict, error) {
 	baseContent, err := treeFileContent(base, path)
 	if err != nil {
 		return nil, err
 	}
 
-	oursContent := readBlobByHash(s, oursHash)
-	theirsContent := readBlobByHash(s, theirsHash)
+	oursContent, err := readBlobContent(s, oursHash)
+	if err != nil {
+		return nil, fmt.Errorf("read ours blob %s: %w", path, err)
+	}
 
-	// Binary check — if any version is binary, report binary conflict.
+	theirsContent, err := readBlobContent(s, theirsHash)
+	if err != nil {
+		return nil, fmt.Errorf("read theirs blob %s: %w", path, err)
+	}
+
 	if isBinary(baseContent) || isBinary(oursContent) || isBinary(theirsContent) {
 		return &MergeConflict{
 			Path:       path,
@@ -241,44 +246,78 @@ func resolveDoubleChange(s storage.Storer, base *object.Tree, oc, tc *changeActi
 		}, nil
 	}
 
-	// 3-way text merge. diff3.Merge expects (a=ours, o=base, b=theirs).
-	result, err := diff3.Merge(
-		strings.NewReader(oursContent),
-		strings.NewReader(baseContent),
-		strings.NewReader(theirsContent),
-		true,  // detailed conflict markers
-		"ours", "theirs",
-	)
+	merged, hasConflicts, err := diff3Merge(oursContent, baseContent, theirsContent)
 	if err != nil {
 		return nil, err
 	}
 
-	merged, err := io.ReadAll(result.Result)
-	if err != nil {
-		return nil, err
-	}
+	baseHash := blobHashFromEntry(base, path)
 
-	mergedStr := string(merged)
-
-	if result.Conflicts {
+	if hasConflicts {
+		mergedStr := string(merged)
+		hash, err := storeBlob(s, merged)
+		if err != nil {
+			return nil, err
+		}
+		builder.set(path, hash, filemode.Regular)
 		return &MergeConflict{
 			Path:          path,
 			Type:          ContentConflict,
-			BaseHash:      blobHashFromEntry(base, path),
+			BaseHash:      baseHash,
 			OursHash:      oursHash,
 			TheirsHash:    theirsHash,
 			MergedContent: mergedStr,
 		}, nil
 	}
 
-	// Clean merge — store the merged blob and update oc to point to it.
+	// Clean merge — store blob and apply to builder.
 	mergedHash, err := storeBlob(s, merged)
 	if err != nil {
 		return nil, err
 	}
-
 	oc.mergedHash = &mergedHash
+	builder.apply(oc)
 	return nil, nil
+}
+
+// diff3Merge performs a 3-way text merge and returns the merged bytes and
+// whether conflicts were detected.
+func diff3Merge(ours, base, theirs string) ([]byte, bool, error) {
+	result, err := diff3.Merge(
+		strings.NewReader(ours),
+		strings.NewReader(base),
+		strings.NewReader(theirs),
+		true, "ours", "theirs",
+	)
+	if err != nil {
+		return nil, false, err
+	}
+
+	merged, err := io.ReadAll(result.Result)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return merged, result.Conflicts, nil
+}
+
+// readBlobContent reads blob content by hash. Returns an error if the blob
+// cannot be read (unlike readBlobByHash in diff.go which silently returns "").
+func readBlobContent(s storer.EncodedObjectStorer, hash plumbing.Hash) (string, error) {
+	blob, err := object.GetBlob(s, hash)
+	if err != nil {
+		return "", fmt.Errorf("get blob: %w", err)
+	}
+	reader, err := blob.Reader()
+	if err != nil {
+		return "", fmt.Errorf("blob reader: %w", err)
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", fmt.Errorf("read blob: %w", err)
+	}
+	return string(data), nil
 }
 
 // =============================================================================
@@ -294,14 +333,17 @@ type changeAction struct {
 }
 
 // indexChangesByPath creates a map from file path to changeAction.
-func indexChangesByPath(changes object.Changes) map[string]*changeAction {
+func indexChangesByPath(changes object.Changes) (map[string]*changeAction, error) {
 	m := make(map[string]*changeAction, len(changes))
 	for _, ch := range changes {
 		path := changePath(ch)
-		action, _ := ch.Action()
+		action, err := ch.Action()
+		if err != nil {
+			return nil, fmt.Errorf("action for %s: %w", path, err)
+		}
 		m[path] = &changeAction{change: ch, action: action}
 	}
-	return m
+	return m, nil
 }
 
 // mergeKeys returns the sorted union of keys from two maps.
@@ -319,19 +361,8 @@ func mergeKeys(a, b map[string]*changeAction) []string {
 		keys = append(keys, k)
 	}
 
-	// Sort for deterministic tree construction.
-	sortStrings(keys)
+	slices.Sort(keys)
 	return keys
-}
-
-// sortStrings sorts a string slice in place.
-func sortStrings(s []string) {
-	// Insertion sort — typically small lists (number of changed files).
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j-1] > s[j]; j-- {
-			s[j-1], s[j] = s[j], s[j-1]
-		}
-	}
 }
 
 // =============================================================================

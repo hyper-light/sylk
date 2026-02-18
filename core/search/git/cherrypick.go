@@ -36,49 +36,12 @@ func (c *GitClient) CherryPick(commitHash string) error {
 		return ErrNotGitRepo
 	}
 
-	// Resolve the commit to cherry-pick.
 	pickCommit, err := c.resolveCommit(commitHash)
 	if err != nil {
 		return fmt.Errorf("resolve commit: %w", err)
 	}
 
-	// Get the commit's first parent as the merge base.
-	var baseTree *object.Tree
-	if len(pickCommit.ParentHashes) > 0 {
-		parent, err := c.repo.CommitObject(pickCommit.ParentHashes[0])
-		if err != nil {
-			return err
-		}
-		baseTree, err = parent.Tree()
-		if err != nil {
-			return err
-		}
-	}
-	// If no parents (root commit), baseTree stays nil → empty tree.
-
-	pickTree, err := pickCommit.Tree()
-	if err != nil {
-		return err
-	}
-
-	// Get current HEAD.
-	headRef, err := c.repo.Head()
-	if err != nil {
-		return wrapHeadError(err)
-	}
-
-	headCommit, err := c.repo.CommitObject(headRef.Hash())
-	if err != nil {
-		return err
-	}
-
-	headTree, err := headCommit.Tree()
-	if err != nil {
-		return err
-	}
-
-	// 3-way merge: base=parent, ours=HEAD, theirs=picked commit.
-	result, err := treeMerge3(c.repo.Storer, baseTree, headTree, pickTree)
+	result, err := c.cherryPickMerge(pickCommit)
 	if err != nil {
 		return err
 	}
@@ -90,12 +53,49 @@ func (c *GitClient) CherryPick(commitHash string) error {
 		return ErrCherryPickConflict
 	}
 
-	// Create new commit preserving original authorship.
-	now := time.Now()
-	committer := defaultSignature(now)
+	return c.commitCherryPick(pickCommit, result.TreeHash)
+}
 
+// cherryPickMerge performs the 3-way merge for a cherry-pick.
+func (c *GitClient) cherryPickMerge(pickCommit *object.Commit) (*TreeMergeResult, error) {
+	baseTree, err := commitParentTree(c, pickCommit)
+	if err != nil {
+		return nil, err
+	}
+
+	pickTree, err := pickCommit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	headRef, err := c.repo.Head()
+	if err != nil {
+		return nil, wrapHeadError(err)
+	}
+
+	headCommit, err := c.repo.CommitObject(headRef.Hash())
+	if err != nil {
+		return nil, err
+	}
+
+	headTree, err := headCommit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	return treeMerge3(c.repo.Storer, baseTree, headTree, pickTree)
+}
+
+// commitCherryPick creates the new commit and updates HEAD.
+func (c *GitClient) commitCherryPick(pickCommit *object.Commit, treeHash plumbing.Hash) error {
+	headRef, err := c.repo.Head()
+	if err != nil {
+		return wrapHeadError(err)
+	}
+
+	committer := defaultSignature(time.Now())
 	newHash, err := storeCommitObj(
-		c.repo.Storer, result.TreeHash,
+		c.repo.Storer, treeHash,
 		[]plumbing.Hash{headRef.Hash()},
 		pickCommit.Author, committer,
 		pickCommit.Message,
@@ -104,14 +104,11 @@ func (c *GitClient) CherryPick(commitHash string) error {
 		return err
 	}
 
-	// Update HEAD.
-	headName := headRef.Name()
-	ref := plumbing.NewHashReference(headName, newHash)
+	ref := plumbing.NewHashReference(headRef.Name(), newHash)
 	if err := c.repo.Storer.SetReference(ref); err != nil {
 		return err
 	}
 
-	// Reset worktree to new commit.
 	wt, err := c.repo.Worktree()
 	if err != nil {
 		return err

@@ -1,6 +1,7 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -217,7 +218,11 @@ func (c *GitClient) applyChange(ch *object.Change, stashTree *object.Tree) error
 
 	// Deletion: stash recorded a file removal.
 	if ch.To.Name == "" {
-		return os.Remove(fullPath)
+		err := os.Remove(fullPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // Already absent — no-op.
+		}
+		return err
 	}
 
 	// Addition or modification: write blob content to disk.
@@ -248,34 +253,45 @@ func (c *GitClient) resetPathsToTree(tree *object.Tree, paths []string) error {
 	}
 
 	for _, p := range paths {
-		fullPath := filepath.Join(c.repoPath, p)
-
-		f, err := tree.File(p)
-		if err != nil {
-			// File didn't exist in HEAD — remove it.
-			_ = os.Remove(fullPath)
-			continue
+		if err := c.resetSinglePath(wt, tree, p); err != nil {
+			return fmt.Errorf("reset %s: %w", p, err)
 		}
+	}
 
-		content, err := f.Contents()
-		if err != nil {
-			return err
-		}
+	return nil
+}
 
-		dir := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
+// resetSinglePath restores a single file to its state in the given tree.
+func (c *GitClient) resetSinglePath(wt *gogit.Worktree, tree *object.Tree, path string) error {
+	fullPath := filepath.Join(c.repoPath, path)
 
-		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
-			return err
+	f, err := tree.File(path)
+	if err != nil {
+		// File didn't exist in HEAD — remove it from disk and index.
+		rmErr := os.Remove(fullPath)
+		if rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return rmErr
 		}
+		return nil
+	}
 
-		// Update index to match HEAD.
-		if _, err := wt.Add(p); err != nil {
-			// Non-fatal: index update failure doesn't block stash.
-			continue
-		}
+	content, err := f.Contents()
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		return err
+	}
+
+	// Update index to match HEAD.
+	if _, err := wt.Add(path); err != nil {
+		return fmt.Errorf("index add: %w", err)
 	}
 
 	return nil
@@ -298,10 +314,10 @@ func appendStashReflog(gitDir string, oldHash, newHash plumbing.Hash, sig object
 		return err
 	}
 
-	ts := sig.When
 	entry := oldHash.String() + " " + newHash.String() +
 		" " + sig.Name + " <" + sig.Email + "> " +
-		strconv.FormatInt(ts.Unix(), 10) + " +0000\t" + msg + "\n"
+		strconv.FormatInt(sig.When.Unix(), 10) + " " +
+		formatTZOffset(sig.When) + "\t" + msg + "\n"
 
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -311,6 +327,19 @@ func appendStashReflog(gitDir string, oldHash, newHash plumbing.Hash, sig object
 
 	_, err = f.WriteString(entry)
 	return err
+}
+
+// formatTZOffset returns the timezone offset in git reflog format (e.g. "+0530", "-0800").
+func formatTZOffset(t time.Time) string {
+	_, offset := t.Zone()
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	hours := offset / 3600
+	minutes := (offset % 3600) / 60
+	return sign + fmt.Sprintf("%02d%02d", hours, minutes)
 }
 
 // popStashRef removes the most recent stash entry. If no previous entries

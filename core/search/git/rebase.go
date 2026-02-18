@@ -3,7 +3,7 @@ package git
 import (
 	"errors"
 	"fmt"
-	"io"
+	"slices"
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
@@ -19,20 +19,15 @@ var ErrRebaseConflict = errors.New("rebase conflict")
 // Algorithm:
 //  1. Find the merge base between HEAD and onto
 //  2. Collect commits from HEAD back to (not including) the merge base
+//     via first-parent chain walk (not log iteration)
 //  3. Reverse them to replay order (oldest first)
-//  4. Detach HEAD at the onto commit
-//  5. For each commit, perform a cherry-pick-style 3-way merge:
-//     - base = commit's first parent tree
-//     - ours = current rebase HEAD tree
-//     - theirs = commit's tree
-//  6. Create new commits preserving original authorship
-//  7. Update the original branch ref to the final rebased commit
-//  8. Re-attach HEAD to the original branch
+//  4. For each commit, cherry-pick onto the current tip
+//  5. Update the original branch ref to the final rebased commit
+//  6. Re-attach HEAD to the original branch
 //
 // On conflict at any step, the conflicting files are written to the
 // worktree and ErrRebaseConflict is returned. The branch ref is NOT
-// updated on conflict — the worktree is left in a detached state for
-// manual resolution.
+// updated on conflict.
 func (c *GitClient) Rebase(ontoBranch string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -41,153 +36,141 @@ func (c *GitClient) Rebase(ontoBranch string) error {
 		return ErrNotGitRepo
 	}
 
-	// Resolve current HEAD.
 	headRef, err := c.repo.Head()
 	if err != nil {
 		return wrapHeadError(err)
 	}
 
-	originalBranch := headRef.Name()
 	headCommit, err := c.repo.CommitObject(headRef.Hash())
 	if err != nil {
 		return err
 	}
 
-	// Resolve onto branch.
+	ontoCommit, err := c.resolveOnto(ontoBranch)
+	if err != nil {
+		return err
+	}
+
+	mergeBase, err := findMergeBase(headCommit, ontoCommit, ontoBranch)
+	if err != nil {
+		return err
+	}
+
+	// HEAD is ancestor of onto → fast-forward.
+	return c.rebaseFromBase(headRef.Name(), headCommit, ontoCommit, mergeBase)
+}
+
+// resolveOnto resolves the onto branch name to a commit object.
+func (c *GitClient) resolveOnto(ontoBranch string) (*object.Commit, error) {
 	ontoRefName := plumbing.NewBranchReferenceName(ontoBranch)
 	ontoHash, err := c.repo.ResolveRevision(plumbing.Revision(ontoRefName))
 	if err != nil {
-		return fmt.Errorf("resolve %s: %w", ontoBranch, err)
+		return nil, fmt.Errorf("resolve %s: %w", ontoBranch, err)
 	}
+	return c.repo.CommitObject(*ontoHash)
+}
 
-	ontoCommit, err := c.repo.CommitObject(*ontoHash)
+// findMergeBase returns the first merge base between head and onto.
+func findMergeBase(head, onto *object.Commit, ontoBranch string) (*object.Commit, error) {
+	bases, err := head.MergeBase(onto)
 	if err != nil {
-		return err
-	}
-
-	// Find merge base.
-	bases, err := headCommit.MergeBase(ontoCommit)
-	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(bases) == 0 {
-		return fmt.Errorf("no common ancestor between HEAD and %s", ontoBranch)
+		return nil, fmt.Errorf("no common ancestor between HEAD and %s", ontoBranch)
 	}
+	return bases[0], nil
+}
 
-	mergeBase := bases[0]
-
-	// Already up to date: HEAD is ancestor of onto (nothing to replay).
-	isAncestor, err := headCommit.IsAncestor(ontoCommit)
+// rebaseFromBase performs the rebase given the resolved commits and merge base.
+func (c *GitClient) rebaseFromBase(originalBranch plumbing.ReferenceName, head, onto, mergeBase *object.Commit) error {
+	isAncestor, err := head.IsAncestor(onto)
 	if err != nil {
 		return err
 	}
 	if isAncestor {
-		// Fast-forward HEAD to onto.
-		wt, err := c.repo.Worktree()
-		if err != nil {
-			return err
-		}
-		ref := plumbing.NewHashReference(originalBranch, ontoCommit.Hash)
-		if err := c.repo.Storer.SetReference(ref); err != nil {
-			return err
-		}
-		return wt.Reset(&gogit.ResetOptions{
-			Commit: ontoCommit.Hash,
-			Mode:   gogit.HardReset,
-		})
+		return c.fastForwardBranch(originalBranch, onto.Hash)
 	}
 
-	// Collect commits to replay: walk from HEAD back to merge base.
-	toReplay, err := c.collectReplayCommits(headCommit, mergeBase)
+	toReplay, err := c.collectReplayCommits(head, mergeBase)
+	if err != nil {
+		return err
+	}
+	if len(toReplay) == 0 {
+		return nil
+	}
+
+	finalHash, err := c.replayAll(toReplay, onto.Hash)
 	if err != nil {
 		return err
 	}
 
-	if len(toReplay) == 0 {
-		return nil // Nothing to replay.
-	}
+	return c.finishRebase(originalBranch, finalHash)
+}
 
-	// Replay commits onto the onto tip.
-	currentHash := ontoCommit.Hash
-
-	for _, commit := range toReplay {
-		newHash, err := c.replayCommit(commit, currentHash)
-		if err != nil {
-			if errors.Is(err, ErrRebaseConflict) {
-				// Leave worktree in conflicted state. Don't update branch.
-				return err
-			}
-			return fmt.Errorf("replay %s: %w", commit.Hash.String()[:7], err)
-		}
-		currentHash = newHash
-	}
-
-	// Update original branch ref to the final rebased commit.
-	ref := plumbing.NewHashReference(originalBranch, currentHash)
+// fastForwardBranch updates the branch ref and resets the worktree.
+func (c *GitClient) fastForwardBranch(branch plumbing.ReferenceName, hash plumbing.Hash) error {
+	ref := plumbing.NewHashReference(branch, hash)
 	if err := c.repo.Storer.SetReference(ref); err != nil {
 		return err
 	}
-
-	// Re-attach HEAD to the original branch.
-	symRef := plumbing.NewSymbolicReference(plumbing.HEAD, originalBranch)
-	if err := c.repo.Storer.SetReference(symRef); err != nil {
-		return err
-	}
-
-	// Reset worktree to final state.
 	wt, err := c.repo.Worktree()
 	if err != nil {
 		return err
 	}
 	return wt.Reset(&gogit.ResetOptions{
-		Commit: currentHash,
+		Commit: hash,
 		Mode:   gogit.HardReset,
 	})
 }
 
-// collectReplayCommits walks from head back to (not including) base,
-// returns the commits in replay order (oldest first).
+// collectReplayCommits walks the first-parent chain from head back to
+// (not including) base and returns the commits in replay order (oldest first).
+//
+// Uses explicit first-parent traversal instead of repo.Log to avoid
+// collecting commits from merged branches in non-linear histories.
 func (c *GitClient) collectReplayCommits(head, base *object.Commit) ([]*object.Commit, error) {
-	iter, err := c.repo.Log(&gogit.LogOptions{
-		From:  head.Hash,
-		Order: gogit.LogOrderCommitterTime,
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-
 	var commits []*object.Commit
-	err = iter.ForEach(func(commit *object.Commit) error {
-		if commit.Hash == base.Hash {
-			return io.EOF // Stop — don't include the base.
+	current := head
+
+	for current.Hash != base.Hash {
+		commits = append(commits, current)
+		if len(current.ParentHashes) == 0 {
+			return nil, fmt.Errorf("merge base %s not reachable via first-parent chain", base.Hash.String()[:7])
 		}
-		commits = append(commits, commit)
-		return nil
-	})
-	if err != nil && err != io.EOF {
-		return nil, err
+		parent, err := c.repo.CommitObject(current.ParentHashes[0])
+		if err != nil {
+			return nil, err
+		}
+		current = parent
 	}
 
-	// Reverse to replay order (oldest first).
-	reverseCommits(commits)
+	slices.Reverse(commits)
 	return commits, nil
+}
+
+// replayAll replays a slice of commits onto currentHash sequentially.
+// Returns the final commit hash after all replays.
+func (c *GitClient) replayAll(commits []*object.Commit, currentHash plumbing.Hash) (plumbing.Hash, error) {
+	for _, commit := range commits {
+		newHash, err := c.replayCommit(commit, currentHash)
+		if err != nil {
+			if errors.Is(err, ErrRebaseConflict) {
+				return plumbing.ZeroHash, err
+			}
+			return plumbing.ZeroHash, fmt.Errorf("replay %s: %w", commit.Hash.String()[:7], err)
+		}
+		currentHash = newHash
+	}
+	return currentHash, nil
 }
 
 // replayCommit applies a single commit's changes onto parentHash,
 // creating a new commit. Returns the new commit hash.
 func (c *GitClient) replayCommit(commit *object.Commit, parentHash plumbing.Hash) (plumbing.Hash, error) {
-	// Get the commit's first parent tree (merge base for this cherry-pick).
-	var baseTree *object.Tree
-	if len(commit.ParentHashes) > 0 {
-		parent, err := c.repo.CommitObject(commit.ParentHashes[0])
-		if err != nil {
-			return plumbing.ZeroHash, err
-		}
-		baseTree, err = parent.Tree()
-		if err != nil {
-			return plumbing.ZeroHash, err
-		}
+	baseTree, err := commitParentTree(c, commit)
+	if err != nil {
+		return plumbing.ZeroHash, err
 	}
 
 	commitTree, err := commit.Tree()
@@ -195,7 +178,6 @@ func (c *GitClient) replayCommit(commit *object.Commit, parentHash plumbing.Hash
 		return plumbing.ZeroHash, err
 	}
 
-	// Get the current rebase HEAD tree (ours).
 	parentCommit, err := c.repo.CommitObject(parentHash)
 	if err != nil {
 		return plumbing.ZeroHash, err
@@ -206,7 +188,6 @@ func (c *GitClient) replayCommit(commit *object.Commit, parentHash plumbing.Hash
 		return plumbing.ZeroHash, err
 	}
 
-	// 3-way merge.
 	result, err := treeMerge3(c.repo.Storer, baseTree, oursTree, commitTree)
 	if err != nil {
 		return plumbing.ZeroHash, err
@@ -219,10 +200,7 @@ func (c *GitClient) replayCommit(commit *object.Commit, parentHash plumbing.Hash
 		return plumbing.ZeroHash, ErrRebaseConflict
 	}
 
-	// Create new commit preserving original author.
-	now := time.Now()
-	committer := defaultSignature(now)
-
+	committer := defaultSignature(time.Now())
 	return storeCommitObj(
 		c.repo.Storer, result.TreeHash,
 		[]plumbing.Hash{parentHash},
@@ -231,9 +209,38 @@ func (c *GitClient) replayCommit(commit *object.Commit, parentHash plumbing.Hash
 	)
 }
 
-// reverseCommits reverses a slice of commits in place.
-func reverseCommits(s []*object.Commit) {
-	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
-		s[i], s[j] = s[j], s[i]
+// commitParentTree returns the tree of a commit's first parent.
+// Returns nil for root commits (no parents).
+func commitParentTree(c *GitClient, commit *object.Commit) (*object.Tree, error) {
+	if len(commit.ParentHashes) == 0 {
+		return nil, nil
 	}
+	parent, err := c.repo.CommitObject(commit.ParentHashes[0])
+	if err != nil {
+		return nil, err
+	}
+	return parent.Tree()
+}
+
+// finishRebase updates the branch ref and re-attaches HEAD after a
+// successful rebase.
+func (c *GitClient) finishRebase(originalBranch plumbing.ReferenceName, finalHash plumbing.Hash) error {
+	ref := plumbing.NewHashReference(originalBranch, finalHash)
+	if err := c.repo.Storer.SetReference(ref); err != nil {
+		return err
+	}
+
+	symRef := plumbing.NewSymbolicReference(plumbing.HEAD, originalBranch)
+	if err := c.repo.Storer.SetReference(symRef); err != nil {
+		return err
+	}
+
+	wt, err := c.repo.Worktree()
+	if err != nil {
+		return err
+	}
+	return wt.Reset(&gogit.ResetOptions{
+		Commit: finalHash,
+		Mode:   gogit.HardReset,
+	})
 }

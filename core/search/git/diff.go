@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -116,7 +117,10 @@ func (c *GitClient) GetWorkingTreeDiff() ([]FileDiff, error) {
 			continue
 		}
 
-		fd := c.workingTreeFileDiff(path, fs.Worktree, idxMap)
+		fd, err := c.workingTreeFileDiff(path, fs.Worktree, idxMap)
+		if err != nil {
+			return nil, err
+		}
 		diffs = append(diffs, fd)
 	}
 
@@ -125,7 +129,7 @@ func (c *GitClient) GetWorkingTreeDiff() ([]FileDiff, error) {
 }
 
 // workingTreeFileDiff builds a FileDiff for a single working tree change.
-func (c *GitClient) workingTreeFileDiff(path string, wtStatus gogit.StatusCode, idxMap map[string]*index.Entry) FileDiff {
+func (c *GitClient) workingTreeFileDiff(path string, wtStatus gogit.StatusCode, idxMap map[string]*index.Entry) (FileDiff, error) {
 	fd := FileDiff{Path: path}
 
 	switch wtStatus {
@@ -138,17 +142,21 @@ func (c *GitClient) workingTreeFileDiff(path string, wtStatus gogit.StatusCode, 
 	oldContent := readBlobFromIndexMap(c.repo.Storer, idxMap, path)
 	var newContent string
 	if wtStatus != gogit.Deleted {
-		newContent, _ = readDiskFile(c.repoPath, path)
+		var err error
+		newContent, err = readDiskFile(c.repoPath, path)
+		if err != nil {
+			return FileDiff{}, fmt.Errorf("read %s: %w", path, err)
+		}
 	}
 
 	if isBinary(oldContent) || isBinary(newContent) {
 		fd.Binary = true
-		return fd
+		return fd, nil
 	}
 
 	fd.Hunks = buildHunksFromText(path, oldContent, newContent)
 	fd.Additions, fd.Deletions = countChanges(fd.Hunks)
-	return fd
+	return fd, nil
 }
 
 // =============================================================================

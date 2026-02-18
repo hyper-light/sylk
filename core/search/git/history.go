@@ -88,24 +88,25 @@ func (c *GitClient) collectCommits(iter object.CommitIter, path string, opts Fil
 	var commits []*CommitInfo
 	count := 0
 
-	err := iter.ForEach(func(commit *object.Commit) error {
+	for {
 		if opts.Limit > 0 && count >= opts.Limit {
-			return io.EOF
+			break
+		}
+		commit, err := iter.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
 		}
 
 		if !c.commitTouchesFile(commit, path, opts.FollowRenames) {
-			return nil
+			continue
 		}
 
 		info := convertCommitToInfo(commit)
 		commits = append(commits, info)
 		count++
-
-		return nil
-	})
-
-	if err != nil && err != io.EOF {
-		return nil, err
 	}
 
 	return commits, nil
@@ -241,25 +242,18 @@ func (c *GitClient) resolveShortHash(shortHash string) (plumbing.Hash, error) {
 
 // findMatchingCommit finds a commit matching the short hash prefix.
 func findMatchingCommit(iter object.CommitIter, prefix string) (plumbing.Hash, error) {
-	var found plumbing.Hash
-
-	err := iter.ForEach(func(commit *object.Commit) error {
-		if hasMatchingPrefix(commit.Hash.String(), prefix) {
-			found = commit.Hash
-			return io.EOF
+	for {
+		commit, err := iter.Next()
+		if err == io.EOF {
+			return plumbing.ZeroHash, ErrCommitNotFound
 		}
-		return nil
-	})
-
-	if err != nil && err != io.EOF {
-		return plumbing.ZeroHash, err
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+		if hasMatchingPrefix(commit.Hash.String(), prefix) {
+			return commit.Hash, nil
+		}
 	}
-
-	if found.IsZero() {
-		return plumbing.ZeroHash, ErrCommitNotFound
-	}
-
-	return found, nil
 }
 
 // hasMatchingPrefix checks if hash starts with prefix.
@@ -373,14 +367,18 @@ func (c *GitClient) collectTrackedFiles(commit *object.Commit) ([]string, error)
 	}
 
 	var files []string
+	iter := tree.Files()
+	defer iter.Close()
 
-	err = tree.Files().ForEach(func(file *object.File) error {
+	for {
+		file, nextErr := iter.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, nextErr
+		}
 		files = append(files, file.Name)
-		return nil
-	})
-
-	if err != nil {
-		return nil, err
 	}
 
 	return files, nil

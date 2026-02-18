@@ -151,12 +151,15 @@ func (c *GitClient) getCommitsSinceInternal(since time.Time) ([]*CommitInfo, err
 	defer iter.Close()
 
 	var commits []*CommitInfo
-	err = iter.ForEach(func(commit *object.Commit) error {
+	for {
+		commit, nextErr := iter.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, nextErr
+		}
 		commits = append(commits, convertCommitToInfo(commit))
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 
 	return commits, nil
@@ -303,18 +306,18 @@ func (c *GitClient) getAllCommitsInternal(limit int) ([]*CommitInfo, error) {
 	defer iter.Close()
 
 	var commits []*CommitInfo
-	n := 0
-	err = iter.ForEach(func(commit *object.Commit) error {
-		if limit > 0 && n >= limit {
-			return io.EOF
+	for {
+		if limit > 0 && len(commits) >= limit {
+			break
+		}
+		commit, nextErr := iter.Next()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, nextErr
 		}
 		commits = append(commits, convertCommitToInfoLight(commit))
-		n++
-		return nil
-	})
-	// io.EOF from ForEach is expected (our limit or end of log).
-	if err != nil && err != io.EOF {
-		return nil, err
 	}
 
 	return commits, nil
