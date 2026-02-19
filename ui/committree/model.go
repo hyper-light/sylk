@@ -361,8 +361,9 @@ type Model struct {
 	cherryPickMode       bool
 	cherryPickSelections []diffSelection
 	cherryPickTarget     string // Selected target branch name.
-	branchPickerActive   bool   // Target branch dropdown open.
-	branchPickerCursor   int
+	branchPickerActive   bool     // Target branch dropdown open.
+	branchPickerCursor   int      // Highlighted item index.
+	branchPickerScroll   int      // Scroll offset for the picker list.
 	branchPickerItems    []string // Available branch names.
 	branchPickerFilter   string   // Typing filter for branch picker.
 
@@ -555,9 +556,12 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 
 	m.branchScrollOff = prevScroll
 	m.invalidateCardCache()
-	// Preserve commit view if the user drilled into a branch; only reset
-	// to branches when no drill-down is active.
-	if m.mode != viewCommits {
+	// Preserve active views; only reset to branches when no drill-down,
+	// picker, or plan is active.
+	switch m.mode {
+	case viewCommits, viewBranchPick, viewRebasePlan:
+		// Keep the current view.
+	default:
 		m.mode = viewBranches
 	}
 	m.viewDirty = true
@@ -3355,6 +3359,7 @@ func (m *Model) openBranchPicker() {
 	}
 	m.branchPickerActive = true
 	m.branchPickerCursor = 0
+	m.branchPickerScroll = 0
 	m.branchPickerFilter = ""
 	m.branchPickPrevMode = m.mode
 	m.mode = viewBranchPick
