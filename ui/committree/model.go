@@ -382,6 +382,14 @@ type Model struct {
 	rebaseCursor     int
 	rebaseSelAnchor  int    // Multi-select anchor; -1 = no selection.
 	rebaseOnto       string // Target branch name for rebase.
+	rebasePlanScroll int    // Scroll offset for visible entries.
+
+	// Rebase plan filter/sort state.
+	rebaseFilterActive bool   // Filter bar captures key input.
+	rebaseFilterQuery  []rune // Filter text; empty = show all.
+	rebaseFiltered     []int  // Sorted+filtered visible entry indices; nil = identity.
+	rebaseSortCol      int    // Sort column: -1=none, 0=action, 1=hash, 2=subject.
+	rebaseSortDir      int    // 0=none, 1=asc, 2=desc.
 
 	// Toolbar state.
 	toolbarFocused bool // True when tab-focus is on the toolbar, not card actions.
@@ -720,6 +728,13 @@ func (m *Model) InCommitView() bool {
 	return m.mode == viewCommits
 }
 
+// NeedsEscRouting reports whether the committree currently has layered state
+// that requires Esc to be routed to it (rebase plan, branch picker, conflict
+// mode, etc.) rather than handled by the app-level Esc dispatcher.
+func (m *Model) NeedsEscRouting() bool {
+	return m.mode == viewRebasePlan || m.mode == viewBranchPick || m.conflictMode
+}
+
 // InCreateInput reports whether the create branch input is active.
 func (m *Model) InCreateInput() bool {
 	return m.createInputActive
@@ -858,7 +873,7 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 	case viewLoading:
 		return nil // absorb clicks during loading
 	case viewRebasePlan:
-		return m.clickRebasePlanView(viewY)
+		return m.clickRebasePlanView(viewX, viewY)
 	case viewCommits:
 		return m.clickCommitView(viewX, viewY)
 	default:
@@ -3449,6 +3464,12 @@ func (m *Model) EnterRebasePlan(onto string, entries []rebasePlanEntry) {
 	m.rebasePlan = entries
 	m.rebaseCursor = 0
 	m.rebaseSelAnchor = -1
+	m.rebasePlanScroll = 0
+	m.rebaseFilterActive = false
+	m.rebaseFilterQuery = m.rebaseFilterQuery[:0]
+	m.rebaseFiltered = nil
+	m.rebaseSortCol = -1
+	m.rebaseSortDir = 0
 	m.toolbarFocused = false
 	m.viewDirty = true
 }
@@ -3459,6 +3480,12 @@ func (m *Model) ExitRebasePlan() {
 	m.rebasePlan = nil
 	m.rebaseCursor = 0
 	m.rebaseSelAnchor = -1
+	m.rebasePlanScroll = 0
+	m.rebaseFilterActive = false
+	m.rebaseFilterQuery = m.rebaseFilterQuery[:0]
+	m.rebaseFiltered = nil
+	m.rebaseSortCol = -1
+	m.rebaseSortDir = 0
 	m.rebaseOnto = ""
 	m.toolbarFocused = false
 	m.viewDirty = true
@@ -3638,21 +3665,175 @@ func (m *Model) rebaseSelRange() (int, int) {
 }
 
 // setRebaseAction sets the action for all entries in the current selection.
+// Translates visible indices to original plan indices when a filter is active.
 func (m *Model) setRebaseAction(action int) {
 	lo, hi := m.rebaseSelRange()
 	for i := lo; i <= hi; i++ {
-		m.rebasePlan[i].action = action
+		m.rebasePlan[m.rebaseOrigIdx(i)].action = action
 	}
 	m.viewDirty = true
 }
 
-// cycleRebaseAction cycles the action forward or backward for all selected entries.
+// cycleRebaseAction cycles the action for all selected entries uniformly.
+// The topmost selected entry's action is cycled by delta, and the resulting
+// action is applied to every entry in the selection so mixed-status ranges
+// converge to a single action.
 func (m *Model) cycleRebaseAction(delta int) {
 	lo, hi := m.rebaseSelRange()
 	n := len(rebaseActionNames)
+	base := m.rebasePlan[m.rebaseOrigIdx(lo)].action
+	next := (base + delta + n) % n
 	for i := lo; i <= hi; i++ {
-		m.rebasePlan[i].action = (m.rebasePlan[i].action + delta + n) % n
+		m.rebasePlan[m.rebaseOrigIdx(i)].action = next
 	}
+	m.viewDirty = true
+}
+
+// rebaseVisibleLen returns the number of currently visible rebase entries.
+func (m *Model) rebaseVisibleLen() int {
+	if m.rebaseFiltered != nil {
+		return len(m.rebaseFiltered)
+	}
+	return len(m.rebasePlan)
+}
+
+// rebaseOrigIdx translates a visible-list index to the original rebasePlan index.
+func (m *Model) rebaseOrigIdx(visIdx int) int {
+	if m.rebaseFiltered != nil && visIdx < len(m.rebaseFiltered) {
+		return m.rebaseFiltered[visIdx]
+	}
+	return visIdx
+}
+
+// rebaseHeaderLines is the number of fixed rows above entry lines:
+// title(1) + divider(1) + search(1) + divider(1) + column headers(1) + dashed divider(1).
+const rebaseHeaderLines = 6
+
+// rebaseContentRows returns the number of rows available for entry lines.
+func (m *Model) rebaseContentRows() int {
+	return max(m.contentHeight()-rebaseHeaderLines, 1)
+}
+
+// Column widths for the rebase plan table. The action column holds the
+// longest label ("reword" = 6 chars), padded to 8. Hash is 7 chars + 1
+// padding. Subject fills the remaining space.
+const (
+	rebaseColPrefixW = 2 // cursor/selection indicator ("▸ " or "│ " or "  ")
+	rebaseColActionW = 8 // "reword" (6) padded to 8
+	rebaseColHashW   = 8 // 7-char hash + 1 padding
+	rebaseColSepW    = 3 // " │ "
+)
+
+// rebaseSubjectW returns the available width for the subject column.
+func (m *Model) rebaseSubjectW() int {
+	fixed := rebaseColPrefixW + rebaseColActionW + rebaseColSepW + rebaseColHashW + rebaseColSepW
+	return max(m.width-fixed, 1)
+}
+
+// rebuildRebaseFiltered rebuilds the filtered+sorted index list.
+func (m *Model) rebuildRebaseFiltered() {
+	// Step 1: filter.
+	hasFilter := len(m.rebaseFilterQuery) > 0
+	hasSorting := m.rebaseSortCol >= 0 && m.rebaseSortDir > 0
+
+	if !hasFilter && !hasSorting {
+		m.rebaseFiltered = nil
+		return
+	}
+
+	var indices []int
+	if hasFilter {
+		needle := strings.ToLower(string(m.rebaseFilterQuery))
+		for i, entry := range m.rebasePlan {
+			if strings.Contains(strings.ToLower(entry.subject), needle) ||
+				strings.Contains(strings.ToLower(entry.hash), needle) ||
+				strings.Contains(strings.ToLower(entry.author), needle) {
+				indices = append(indices, i)
+			}
+		}
+	} else {
+		indices = make([]int, len(m.rebasePlan))
+		for i := range indices {
+			indices[i] = i
+		}
+	}
+
+	// Step 2: sort.
+	if hasSorting {
+		col, dir := m.rebaseSortCol, m.rebaseSortDir
+		slices.SortStableFunc(indices, func(a, b int) int {
+			ea, eb := m.rebasePlan[a], m.rebasePlan[b]
+			cmp := m.rebaseSortCmp(ea, eb, col)
+			if dir == 2 { // descending
+				cmp = -cmp
+			}
+			return cmp
+		})
+	}
+
+	m.rebaseFiltered = indices
+}
+
+// rebaseSortCmp compares two rebase entries by the given column.
+// Returns -1, 0, or 1 following the cmp convention.
+func (m *Model) rebaseSortCmp(a, b rebasePlanEntry, col int) int {
+	switch col {
+	case 0: // action
+		return a.action - b.action
+	case 1: // hash
+		return strings.Compare(a.hash, b.hash)
+	default: // subject
+		return strings.Compare(strings.ToLower(a.subject), strings.ToLower(b.subject))
+	}
+}
+
+// cycleRebaseSort cycles the sort state for a column: none → asc → desc → none.
+func (m *Model) cycleRebaseSort(col int) {
+	if m.rebaseSortCol == col {
+		m.rebaseSortDir = (m.rebaseSortDir + 1) % 3
+		if m.rebaseSortDir == 0 {
+			m.rebaseSortCol = -1
+		}
+	} else {
+		m.rebaseSortCol = col
+		m.rebaseSortDir = 1 // ascending
+	}
+	m.rebuildRebaseFiltered()
+	m.rebaseCursor = 0
+	m.rebasePlanScroll = 0
+	m.rebaseSelAnchor = -1
+	m.viewDirty = true
+}
+
+// ensureRebaseCursorVisible clamps the cursor and scroll so the cursor
+// is within the visible window.
+func (m *Model) ensureRebaseCursorVisible() {
+	n := m.rebaseVisibleLen()
+	if n == 0 {
+		m.rebaseCursor = 0
+		m.rebasePlanScroll = 0
+		return
+	}
+	m.rebaseCursor = max(min(m.rebaseCursor, n-1), 0)
+
+	visible := m.rebaseContentRows()
+	if m.rebaseCursor < m.rebasePlanScroll {
+		m.rebasePlanScroll = m.rebaseCursor
+	} else if m.rebaseCursor >= m.rebasePlanScroll+visible {
+		m.rebasePlanScroll = m.rebaseCursor - visible + 1
+	}
+	maxScroll := max(n-visible, 0)
+	m.rebasePlanScroll = max(min(m.rebasePlanScroll, maxScroll), 0)
+}
+
+// deactivateRebaseFilter clears the filter and returns focus to entries.
+func (m *Model) deactivateRebaseFilter() {
+	m.rebaseFilterActive = false
+	m.rebaseFilterQuery = m.rebaseFilterQuery[:0]
+	m.rebuildRebaseFiltered()
+	m.rebaseCursor = 0
+	m.rebasePlanScroll = 0
+	m.rebaseSelAnchor = -1
 	m.viewDirty = true
 }
 
@@ -3662,8 +3843,26 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
-	switch km.String() {
+	// When filter input is active, route all typing there.
+	if m.rebaseFilterActive {
+		return m.handleRebaseFilterKey(km)
+	}
+
+	n := m.rebaseVisibleLen()
+	ks := km.String()
+
+	switch ks {
 	case "esc":
+		// Layered escape: toolbar → filter → multi-select → exit.
+		if m.toolbarFocused {
+			m.toolbarFocused = false
+			m.viewDirty = true
+			return nil
+		}
+		if len(m.rebaseFilterQuery) > 0 {
+			m.deactivateRebaseFilter()
+			return nil
+		}
 		if m.rebaseSelAnchor >= 0 {
 			m.rebaseSelAnchor = -1
 			m.viewDirty = true
@@ -3675,9 +3874,10 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseSelAnchor < 0 {
 			m.rebaseSelAnchor = m.rebaseCursor
 		}
-		if m.rebaseCursor < len(m.rebasePlan)-1 {
+		if m.rebaseCursor < n-1 {
 			m.rebaseCursor++
 		}
+		m.ensureRebaseCursorVisible()
 		m.viewDirty = true
 		return nil
 	case "shift+up":
@@ -3687,13 +3887,15 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseCursor > 0 {
 			m.rebaseCursor--
 		}
+		m.ensureRebaseCursorVisible()
 		m.viewDirty = true
 		return nil
 	case "j", "down":
 		m.rebaseSelAnchor = -1
-		if m.rebaseCursor < len(m.rebasePlan)-1 {
+		if m.rebaseCursor < n-1 {
 			m.rebaseCursor++
 		}
+		m.ensureRebaseCursorVisible()
 		m.viewDirty = true
 		return nil
 	case "k", "up":
@@ -3701,23 +3903,33 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseCursor > 0 {
 			m.rebaseCursor--
 		}
+		m.ensureRebaseCursorVisible()
 		m.viewDirty = true
 		return nil
 	case "J":
+		// Reorder disabled when filter/sort is active.
+		if m.rebaseFiltered != nil {
+			return nil
+		}
 		m.rebaseSelAnchor = -1
-		if m.rebaseCursor < len(m.rebasePlan)-1 {
+		if m.rebaseCursor < n-1 {
 			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor+1] =
 				m.rebasePlan[m.rebaseCursor+1], m.rebasePlan[m.rebaseCursor]
 			m.rebaseCursor++
+			m.ensureRebaseCursorVisible()
 			m.viewDirty = true
 		}
 		return nil
 	case "K":
+		if m.rebaseFiltered != nil {
+			return nil
+		}
 		m.rebaseSelAnchor = -1
 		if m.rebaseCursor > 0 {
 			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor-1] =
 				m.rebasePlan[m.rebaseCursor-1], m.rebasePlan[m.rebaseCursor]
 			m.rebaseCursor--
+			m.ensureRebaseCursorVisible()
 			m.viewDirty = true
 		}
 		return nil
@@ -3749,6 +3961,11 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 	case "h", "left":
 		m.cycleRebaseAction(-1)
 		return nil
+	case "/", "alt+f":
+		m.rebaseFilterActive = true
+		m.toolbarFocused = false
+		m.viewDirty = true
+		return nil
 	case "tab":
 		m.cycleCommitToolbar(1)
 		m.viewDirty = true
@@ -3761,13 +3978,75 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-// clickRebasePlanView handles clicks on the rebase plan. Clicking an entry
-// within the selection cycles actions for all selected; clicking outside
-// selects the clicked entry and clears multi-select.
-func (m *Model) clickRebasePlanView(viewY int) tea.Cmd {
-	// Layout: header(1) + blank(1) + entries.
-	idx := viewY - 2
-	if idx < 0 || idx >= len(m.rebasePlan) {
+// handleRebaseFilterKey processes keys when the rebase plan filter input
+// is active. Matches the gitpanel filter pattern: Esc clears and deactivates,
+// Enter keeps the filter and returns focus to entries, Backspace on empty
+// deactivates.
+func (m *Model) handleRebaseFilterKey(km tea.KeyMsg) tea.Cmd {
+	switch km.String() {
+	case "esc":
+		m.deactivateRebaseFilter()
+		return nil
+	case "enter", "down":
+		m.rebaseFilterActive = false
+		m.viewDirty = true
+		return nil
+	case "backspace":
+		if len(m.rebaseFilterQuery) > 0 {
+			m.rebaseFilterQuery = m.rebaseFilterQuery[:len(m.rebaseFilterQuery)-1]
+			m.rebuildRebaseFiltered()
+			m.rebaseCursor = 0
+			m.rebasePlanScroll = 0
+			m.rebaseSelAnchor = -1
+			m.viewDirty = true
+		} else {
+			m.deactivateRebaseFilter()
+		}
+		return nil
+	default:
+		if km.Type == tea.KeyRunes {
+			m.rebaseFilterQuery = append(m.rebaseFilterQuery, km.Runes...)
+			m.rebuildRebaseFiltered()
+			m.rebaseCursor = 0
+			m.rebasePlanScroll = 0
+			m.rebaseSelAnchor = -1
+			m.viewDirty = true
+		} else if km.Type == tea.KeySpace {
+			m.rebaseFilterQuery = append(m.rebaseFilterQuery, ' ')
+			m.rebuildRebaseFiltered()
+			m.rebaseCursor = 0
+			m.rebasePlanScroll = 0
+			m.rebaseSelAnchor = -1
+			m.viewDirty = true
+		}
+		return nil
+	}
+}
+
+// clickRebasePlanView handles clicks on the rebase plan.
+// viewY == 4 is the column header row (click to sort).
+// viewY >= rebaseHeaderLines is the entry area.
+// Clicks on other header rows (title, dividers, search bar) are ignored.
+func (m *Model) clickRebasePlanView(viewX, viewY int) tea.Cmd {
+	// Column header row: sort on click.
+	const headerRow = 4 // title(0) + div(1) + search(2) + div(3) + header(4)
+	if viewY == headerRow {
+		col := m.rebaseHeaderColAt(viewX)
+		if col >= 0 {
+			m.cycleRebaseSort(col)
+		}
+		return nil
+	}
+
+	// Clicks above the entry area (title, dividers, search, dash-divider)
+	// are not entry clicks regardless of scroll offset.
+	if viewY < rebaseHeaderLines {
+		return nil
+	}
+
+	// Entry rows.
+	idx := viewY - rebaseHeaderLines + m.rebasePlanScroll
+	if idx >= m.rebaseVisibleLen() {
 		return nil
 	}
 	lo, hi := m.rebaseSelRange()
@@ -3776,9 +4055,30 @@ func (m *Model) clickRebasePlanView(viewY int) tea.Cmd {
 	} else {
 		m.rebaseSelAnchor = -1
 		m.rebaseCursor = idx
+		m.ensureRebaseCursorVisible()
 		m.viewDirty = true
 	}
 	return nil
+}
+
+// rebaseHeaderColAt maps an X coordinate on the header row to a column index:
+// 0=action, 1=hash, 2=subject, or -1 for prefix/separator regions.
+func (m *Model) rebaseHeaderColAt(x int) int {
+	actionEnd := rebaseColPrefixW + rebaseColActionW
+	sep1End := actionEnd + rebaseColSepW
+	hashEnd := sep1End + rebaseColHashW
+	sep2End := hashEnd + rebaseColSepW
+
+	switch {
+	case x >= rebaseColPrefixW && x < actionEnd:
+		return 0
+	case x >= sep1End && x < hashEnd:
+		return 1
+	case x >= sep2End:
+		return 2
+	default:
+		return -1
+	}
 }
 
 // cherryPickOverlayFor returns the overlay state for a commit in cherry-pick mode.
@@ -4783,6 +5083,8 @@ func (m *Model) activeScrollOff() *int {
 		return &m.scrollOff
 	case viewBranchPick:
 		return &m.branchPickerScroll
+	case viewRebasePlan:
+		return &m.rebasePlanScroll
 	default:
 		return &m.branchScrollOff
 	}
@@ -4802,6 +5104,9 @@ func (m *Model) activeMaxScroll() int {
 		headerLines := 4 // title + border + filter/hint + border
 		visible := max(m.contentHeight()-headerLines, 1)
 		return max(len(items)-visible, 0)
+	case viewRebasePlan:
+		visible := m.rebaseContentRows()
+		return max(m.rebaseVisibleLen()-visible, 0)
 	default:
 		return m.branchMaxScroll()
 	}

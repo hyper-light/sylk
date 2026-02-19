@@ -1884,6 +1884,15 @@ var rebaseActionColors = [...]func(theme.Palette) lipgloss.Color{
 }
 
 // viewRebasePlan renders the interactive rebase plan editor.
+// Layout matches the gitpanel table pattern:
+//
+//	Row 0: Title
+//	Row 1: Divider (─)
+//	Row 2: Search hint/bar
+//	Row 3: Divider (─)
+//	Row 4: Column headers with sort indicators
+//	Row 5: Dashed divider (┄)
+//	Row 6+: Entry rows (scrolled)
 func (m *Model) viewRebasePlan() string {
 	if len(m.rebasePlan) == 0 {
 		return ""
@@ -1891,38 +1900,69 @@ func (m *Model) viewRebasePlan() string {
 
 	p := m.theme.Palette
 	ch := m.contentHeight()
+	bSt := lipgloss.NewStyle().Foreground(p.Border)
+	divider := bSt.Render(strings.Repeat("\u2500", max(m.width, 1)))     // ─
+	dashDiv := bSt.Render(strings.Repeat("\u2504", max(m.width, 1)))     // ┄
+	sepStr := bSt.Render(" \u2502 ")                                      // " │ "
 	var lines []string
 
-	// Header.
-	header := fmt.Sprintf(" Interactive rebase onto %s (%d commits)", m.rebaseOnto, len(m.rebasePlan))
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Foreground)
-	lines = append(lines, headerStyle.Render(header))
-	lines = append(lines, "")
+	// Row 0: Title.
+	titleText := fmt.Sprintf(" Interactive rebase onto %s (%d commits)",
+		m.rebaseOnto, len(m.rebasePlan))
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Foreground)
+	lines = append(lines, rebasePadLine(titleStyle.Render(titleText), m.width))
 
+	// Row 1: Divider.
+	lines = append(lines, divider)
+
+	// Row 2: Search bar or hint (matching gitpanel style).
+	if m.rebaseFilterActive {
+		lines = append(lines, m.renderRebaseFilterBar())
+	} else if len(m.rebaseFilterQuery) > 0 {
+		// Show applied filter with match count.
+		n := m.rebaseVisibleLen()
+		text := lipgloss.NewStyle().Foreground(p.Foreground).
+			Render("/ "+string(m.rebaseFilterQuery)) +
+			lipgloss.NewStyle().Foreground(p.Muted).
+				Render(fmt.Sprintf(" (%d)", n))
+		lines = append(lines, rebasePadLine(text, m.width))
+	} else {
+		text := lipgloss.NewStyle().Foreground(p.Muted).Render("/ search")
+		lines = append(lines, rebasePadLine(text, m.width))
+	}
+
+	// Row 3: Divider.
+	lines = append(lines, divider)
+
+	// Row 4: Column headers with sort indicators and │ separators.
+	lines = append(lines, m.renderRebaseHeader(sepStr))
+
+	// Row 5: Dashed divider.
+	lines = append(lines, dashDiv)
+
+	// Entry rows (scrolled window).
 	arrowStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Primary)
 	selLo, selHi := m.rebaseSelRange()
 	hasMultiSel := m.rebaseSelAnchor >= 0
 
-	for i, entry := range m.rebasePlan {
-		isCursor := i == m.rebaseCursor
-		inSelection := hasMultiSel && i >= selLo && i <= selHi
+	visLen := m.rebaseVisibleLen()
+	visRows := m.rebaseContentRows()
+	scrollEnd := min(m.rebasePlanScroll+visRows, visLen)
+	subjectW := m.rebaseSubjectW()
+
+	for vi := m.rebasePlanScroll; vi < scrollEnd; vi++ {
+		origIdx := m.rebaseOrigIdx(vi)
+		entry := m.rebasePlan[origIdx]
+
+		isCursor := vi == m.rebaseCursor
+		inSelection := hasMultiSel && vi >= selLo && vi <= selHi
 
 		// Cursor arrow, selection bar, or blank prefix.
 		prefix := "  "
 		if isCursor {
-			prefix = arrowStyle.Render("▸") + " "
+			prefix = arrowStyle.Render("\u25b8") + " " // ▸
 		} else if inSelection {
-			prefix = arrowStyle.Render("│") + " "
-		}
-
-		// Determine visual connector for squash/fixup groups.
-		connector := "  "
-		if entry.action == 2 || entry.action == 3 { // squash or fixup
-			if i+1 < len(m.rebasePlan) && (m.rebasePlan[i+1].action == 2 || m.rebasePlan[i+1].action == 3) {
-				connector = "├ "
-			} else {
-				connector = "└ "
-			}
+			prefix = arrowStyle.Render("\u2502") + " " // │
 		}
 
 		actionIdx := entry.action
@@ -1930,29 +1970,19 @@ func (m *Model) viewRebasePlan() string {
 			actionIdx = 0
 		}
 
-		actionLabel := rebaseActionNames[actionIdx]
 		actionColor := rebaseActionColors[actionIdx](p)
-		actionStyle := lipgloss.NewStyle().Foreground(actionColor).Width(8)
-
+		actionStyle := lipgloss.NewStyle().Foreground(actionColor)
 		hashStyle := lipgloss.NewStyle().Foreground(p.Accent)
-		subjectFg := p.Foreground
-		if inSelection && !isCursor {
-			subjectFg = p.Subtle
-		}
-		subjectStyle := lipgloss.NewStyle().Foreground(subjectFg)
+		subjectStyle := lipgloss.NewStyle().Foreground(p.Foreground)
 
-		line := prefix + connector + actionStyle.Render(actionLabel) + " " +
-			hashStyle.Render(entry.hash) + " " +
-			subjectStyle.Render(truncateSubject(entry.subject, m.width-27))
+		actionCell := rebaseFitCell(rebaseActionNames[actionIdx], rebaseColActionW, actionStyle)
+		hashCell := rebaseFitCell(entry.hash, rebaseColHashW, hashStyle)
+		subjectCell := rebaseFitCell(
+			truncateSubject(entry.subject, subjectW), subjectW, subjectStyle)
 
+		line := prefix + actionCell + sepStr + hashCell + sepStr + subjectCell
 		lines = append(lines, line)
 	}
-
-	// Help text.
-	lines = append(lines, "")
-	help := " p:pick  r:reword  s:squash  f:fixup  e:edit  d:drop  J/K:move  Shift+↑↓:select"
-	helpStyle := lipgloss.NewStyle().Foreground(p.Subtle)
-	lines = append(lines, helpStyle.Render(help))
 
 	// Pad to fill content height.
 	for len(lines) < ch {
@@ -1963,6 +1993,123 @@ func (m *Model) viewRebasePlan() string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// renderRebaseFilterBar renders the active filter input line matching
+// the gitpanel style: "/ " prefix (muted) + query + block cursor.
+func (m *Model) renderRebaseFilterBar() string {
+	p := m.theme.Palette
+	prefix := lipgloss.NewStyle().Foreground(p.Muted).Render("/ ")
+	queryStyle := lipgloss.NewStyle().Foreground(p.Foreground)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	queryStr := string(m.rebaseFilterQuery)
+	prefixW := lipgloss.Width(prefix)
+	avail := max(m.width-prefixW-1, 0)
+	qRunes := []rune(queryStr)
+	if len(qRunes) > avail {
+		queryStr = string(qRunes[len(qRunes)-avail:])
+	}
+
+	line := prefix + queryStyle.Render(queryStr) + cursorStyle.Render(" ")
+	return rebasePadLine(line, m.width)
+}
+
+// renderRebaseHeader renders the column header row with sort indicators
+// and │ separators, matching the gitpanel header style.
+func (m *Model) renderRebaseHeader(sep string) string {
+	p := m.theme.Palette
+
+	type hdrCol struct {
+		label string
+		width int
+		col   int // sort column index
+	}
+	cols := []hdrCol{
+		{"Action", rebaseColActionW, 0},
+		{"Hash", rebaseColHashW, 1},
+		{"Subject", m.rebaseSubjectW(), 2},
+	}
+
+	hdrStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Muted)
+	activeStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Foreground)
+	sortStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Secondary)
+
+	var b strings.Builder
+	// Prefix padding to align with entry prefix.
+	b.WriteString(strings.Repeat(" ", rebaseColPrefixW))
+
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(sep)
+		}
+
+		indicator := rebaseSortIndicator(c.col, m.rebaseSortCol, m.rebaseSortDir)
+		indicatorW := len([]rune(indicator))
+		labelSpace := max(c.width-indicatorW, 0)
+
+		label := c.label
+		if len([]rune(label)) > labelSpace {
+			label = string([]rune(label)[:labelSpace])
+		}
+
+		isActive := m.rebaseSortCol == c.col && m.rebaseSortDir > 0
+		ls := hdrStyle
+		if isActive {
+			ls = activeStyle
+		}
+
+		// Label + indicator, then right-pad to column width (gitpanel pattern).
+		indStyle := hdrStyle
+		if isActive {
+			indStyle = sortStyle
+		}
+		cell := ls.Render(label) + indStyle.Render(indicator)
+		if actual := lipgloss.Width(cell); actual < c.width {
+			cell += strings.Repeat(" ", c.width-actual)
+		}
+		b.WriteString(cell)
+	}
+
+	return b.String()
+}
+
+// rebaseSortIndicator returns the sort indicator suffix for a column.
+// Active column shows ▲ or ▼; inactive sortable columns show ↕.
+func rebaseSortIndicator(col, activeCol, activeDir int) string {
+	if col == activeCol && activeDir > 0 {
+		if activeDir == 1 {
+			return " \u25b2" // ▲
+		}
+		return " \u25bc" // ▼
+	}
+	return " \u2195" // ↕
+}
+
+// rebaseFitCell renders text into a cell of exactly the given width,
+// truncating if too long and padding with spaces if too short.
+func rebaseFitCell(text string, width int, style lipgloss.Style) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) > width {
+		text = string(runes[:width])
+	}
+	rendered := style.Render(text)
+	if pad := width - lipgloss.Width(rendered); pad > 0 {
+		rendered += strings.Repeat(" ", pad)
+	}
+	return rendered
+}
+
+// rebasePadLine pads a rendered line to exactly the given width.
+func rebasePadLine(line string, width int) string {
+	w := lipgloss.Width(line)
+	if w < width {
+		line += strings.Repeat(" ", width-w)
+	}
+	return line
 }
 
 // viewBranchPicker renders a full-window branch list for target selection.

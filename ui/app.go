@@ -2066,7 +2066,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		if m.viewMode == ViewGit && m.focus.Current() == component.FocusCommitTree &&
-			(m.commitTree.InCommitView() || m.commitTree.InCreateInput()) {
+			(m.commitTree.InCommitView() || m.commitTree.InCreateInput() || m.commitTree.NeedsEscRouting()) {
 			comp, cmd := m.commitTree.Update(key)
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
