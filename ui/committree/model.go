@@ -2,6 +2,7 @@ package committree
 
 import (
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -3458,45 +3459,27 @@ func (m *Model) ExitRebasePlan() {
 func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 	items := m.filteredBranchItems()
 
+	// DEBUG: log every key press in the branch picker.
+	if f, err := os.OpenFile("/tmp/sylk-picker-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		fmt.Fprintf(f, "key=%q items=%d filter=%q cursor=%d toolbarFocused=%v cherryPickMode=%v selections=%d branchPickerActive=%v mode=%d\n",
+			km.String(), len(items), m.branchPickerFilter, m.branchPickerCursor, m.toolbarFocused, m.cherryPickMode, len(m.cherryPickSelections), m.branchPickerActive, m.mode)
+		f.Close()
+	}
+
 	switch km.String() {
-	case "tab":
-		m.cyclePickerToolbar(1)
-		m.viewDirty = true
-		return nil
-	case "shift+tab":
-		m.cyclePickerToolbar(-1)
-		m.viewDirty = true
-		return nil
-	case "esc":
-		if m.toolbarFocused {
-			m.toolbarFocused = false
-			m.viewDirty = true
-			return nil
-		}
-		m.closeBranchPicker()
-		if m.cherryPickMode {
-			m.exitCherryPickMode()
-		}
-		return nil
 	case "j", "down":
-		m.toolbarFocused = false
 		if m.branchPickerCursor < len(items)-1 {
 			m.branchPickerCursor++
 		}
 		m.viewDirty = true
 		return nil
 	case "k", "up":
-		m.toolbarFocused = false
 		if m.branchPickerCursor > 0 {
 			m.branchPickerCursor--
 		}
 		m.viewDirty = true
 		return nil
-	case "enter", " ":
-		if m.toolbarFocused {
-			m.viewDirty = true
-			return m.executeToolbarAction()
-		}
+	case "enter":
 		if len(items) == 0 {
 			return nil
 		}
@@ -3525,39 +3508,6 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 		m.EnterRebasePlan(selected, plan)
 		return nil
 
-	case "g":
-		m.toolbarFocused = false
-		m.branchPickerCursor = 0
-		m.viewDirty = true
-		return nil
-	case "G":
-		m.toolbarFocused = false
-		if len(items) > 0 {
-			m.branchPickerCursor = len(items) - 1
-		}
-		m.viewDirty = true
-		return nil
-	case "ctrl+d":
-		m.toolbarFocused = false
-		half := max(m.contentHeight()/2, 1)
-		for range half {
-			if m.branchPickerCursor < len(items)-1 {
-				m.branchPickerCursor++
-			}
-		}
-		m.viewDirty = true
-		return nil
-	case "ctrl+u":
-		m.toolbarFocused = false
-		half := max(m.contentHeight()/2, 1)
-		for range half {
-			if m.branchPickerCursor > 0 {
-				m.branchPickerCursor--
-			}
-		}
-		m.viewDirty = true
-		return nil
-
 	case "backspace":
 		if len(m.branchPickerFilter) > 0 {
 			m.branchPickerFilter = m.branchPickerFilter[:len(m.branchPickerFilter)-1]
@@ -3573,37 +3523,6 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
-}
-
-// cyclePickerToolbar cycles toolbar focus within the branch picker view.
-func (m *Model) cyclePickerToolbar(delta int) {
-	left := m.diffToolbarLeftButtons()
-	right := m.toolbarButtons()
-	all := slices.Concat(left, right)
-	if len(all) == 0 {
-		return
-	}
-	if !m.toolbarFocused {
-		m.toolbarFocused = true
-		var start int
-		if delta > 0 {
-			start = m.firstEnabledToolbar(all)
-		} else {
-			start = m.lastEnabledToolbar(all)
-		}
-		if start < 0 {
-			m.toolbarFocused = false
-			return
-		}
-		m.toolbarAction = start
-		return
-	}
-	next := m.nextEnabledToolbar(m.toolbarAction, delta, all)
-	if next < 0 {
-		m.toolbarFocused = false
-		return
-	}
-	m.toolbarAction = next
 }
 
 // handleRebasePlanKey processes keys in the interactive rebase plan editor.
