@@ -1966,9 +1966,13 @@ func (m *Model) viewBranchPicker() string {
 	}
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Primary).Padding(0, 1)
 
-	// Build header lines.
+	// Build header lines: title, border, filter, border.
+	bSt := lipgloss.NewStyle().Foreground(p.Border)
+	divider := bSt.Render(strings.Repeat("─", max(m.width, 1)))
+
 	var lines []string
 	lines = append(lines, titleStyle.Render(title))
+	lines = append(lines, divider)
 	if m.branchPickerFilterActive {
 		filterStyle := lipgloss.NewStyle().Foreground(p.Foreground).Padding(0, 1)
 		lines = append(lines, filterStyle.Render("/ "+m.branchPickerFilter+"_"))
@@ -1979,7 +1983,7 @@ func (m *Model) viewBranchPicker() string {
 		hintStyle := lipgloss.NewStyle().Foreground(p.Muted).Padding(0, 1)
 		lines = append(lines, hintStyle.Render("/ filter"))
 	}
-	lines = append(lines, "") // blank separator line
+	lines = append(lines, divider)
 
 	if len(items) == 0 {
 		empty := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 2).Render("(no matching branches)")
