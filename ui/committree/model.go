@@ -4715,10 +4715,7 @@ func (m *Model) activeMaxScroll() int {
 		return m.commitMaxScroll()
 	case viewBranchPick:
 		items := m.filteredBranchItems()
-		headerLines := 2 // title + blank separator
-		if m.branchPickerFilter != "" {
-			headerLines = 3 // title + filter + blank separator
-		}
+		headerLines := 3 // title + filter/hint + blank separator
 		visible := max(m.contentHeight()-headerLines, 1)
 		return max(len(items)-visible, 0)
 	default:
