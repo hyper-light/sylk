@@ -2,7 +2,6 @@ package committree
 
 import (
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -456,11 +455,6 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 		m.handleCommitDismiss()
 		return m, nil
 	case tea.KeyMsg:
-		f, _ := os.OpenFile("/tmp/sylk-tab-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if f != nil {
-			fmt.Fprintf(f, "Update key=%q focused=%v mode=%d branchPickerActive=%v\n", typed.String(), m.focused, m.mode, m.branchPickerActive)
-			f.Close()
-		}
 		if m.focused {
 			return m, m.handleKey(typed)
 		}
@@ -3109,11 +3103,16 @@ func (m *Model) handleCommitDAGKey(km tea.KeyMsg) tea.Cmd {
 
 // cycleCommitToolbar advances toolbar focus by delta (+1 or -1).
 // Exits toolbar focus when tabbing past the last or before the first button.
-// Uses the unified index space (left buttons + right buttons).
+// When left action buttons (Ok/Abort) are present, Tab cycles only through
+// those buttons. Otherwise, cycles through the right-side buttons.
 func (m *Model) cycleCommitToolbar(delta int) {
 	left := m.diffToolbarLeftButtons()
-	right := m.toolbarButtons()
-	all := slices.Concat(left, right)
+	var all []int
+	if len(left) > 0 {
+		all = left
+	} else {
+		all = m.toolbarButtons()
+	}
 	if len(all) == 0 {
 		return
 	}
@@ -3479,21 +3478,8 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 
 	switch ks {
 	case "tab":
-		f, _ := os.OpenFile("/tmp/sylk-tab-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if f != nil {
-			left := m.diffToolbarLeftButtons()
-			right := m.toolbarButtons()
-			fmt.Fprintf(f, "TAB: toolbarFocused=%v toolbarAction=%d left=%v right=%v cherryPickMode=%v selections=%d\n",
-				m.toolbarFocused, m.toolbarAction, left, right, m.cherryPickMode, len(m.cherryPickSelections))
-			f.Close()
-		}
 		m.hoverButtonIdx = -1
 		m.cycleCommitToolbar(1)
-		f2, _ := os.OpenFile("/tmp/sylk-tab-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if f2 != nil {
-			fmt.Fprintf(f2, "TAB after: toolbarFocused=%v toolbarAction=%d\n", m.toolbarFocused, m.toolbarAction)
-			f2.Close()
-		}
 		m.viewDirty = true
 		return nil
 	case "shift+tab":
