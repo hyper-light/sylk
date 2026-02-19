@@ -1986,8 +1986,11 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 				m.moveBranchUp()
 			}
 		case "tab":
-			m.toolbarFocused = true
-			m.toolbarAction = 0
+			m.cycleCommitToolbar(1)
+			m.viewDirty = true
+			return nil
+		case "shift+tab":
+			m.cycleCommitToolbar(-1)
 			m.viewDirty = true
 			return nil
 		default:
@@ -2003,9 +2006,42 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 		return m.handleExpandedKey(km)
 	}
 
-	// Toolbar-focused: handle toolbar keys before navigation.
+	// Toolbar-focused: handle toolbar keys.
 	if m.toolbarFocused {
-		return m.handleBranchToolbarKey(km)
+		switch km.String() {
+		case "tab":
+			m.cycleCommitToolbar(1)
+			m.viewDirty = true
+			return nil
+		case "shift+tab":
+			m.cycleCommitToolbar(-1)
+			m.viewDirty = true
+			return nil
+		case "h", "left":
+			m.cycleCommitToolbar(-1)
+			if !m.toolbarFocused {
+				m.toolbarFocused = true // left/right don't exit focus
+			}
+			m.viewDirty = true
+			return nil
+		case "l", "right":
+			m.cycleCommitToolbar(1)
+			if !m.toolbarFocused {
+				m.toolbarFocused = true // left/right don't exit focus
+			}
+			m.viewDirty = true
+			return nil
+		case "enter", " ":
+			m.viewDirty = true
+			return m.executeToolbarAction()
+		case "esc", "q":
+			m.toolbarFocused = false
+			m.viewDirty = true
+			return nil
+		default:
+			m.toolbarFocused = false
+			return m.handleBranchKey(km)
+		}
 	}
 
 	switch km.String() {
@@ -2048,47 +2084,6 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 	}
 
 	m.ensureBranchVisible()
-	m.viewDirty = true
-	return nil
-}
-
-// handleBranchToolbarKey processes keys when the toolbar is focused in
-// branch view (no expanded card). Navigation keys exit toolbar focus.
-func (m *Model) handleBranchToolbarKey(km tea.KeyMsg) tea.Cmd {
-	buttons := m.toolbarButtons()
-
-	switch km.String() {
-	case "tab":
-		next := m.nextEnabledToolbar(m.toolbarAction, +1, buttons)
-		if next < 0 {
-			m.toolbarFocused = false
-		} else {
-			m.toolbarAction = next
-		}
-	case "shift+tab":
-		next := m.nextEnabledToolbar(m.toolbarAction, -1, buttons)
-		if next < 0 {
-			m.toolbarFocused = false
-		} else {
-			m.toolbarAction = next
-		}
-	case "h", "left":
-		if prev := m.nextEnabledToolbar(m.toolbarAction, -1, buttons); prev >= 0 {
-			m.toolbarAction = prev
-		}
-	case "l", "right":
-		if next := m.nextEnabledToolbar(m.toolbarAction, +1, buttons); next >= 0 {
-			m.toolbarAction = next
-		}
-	case "enter", " ":
-		m.viewDirty = true
-		return m.executeToolbarAction()
-	case "esc", "q":
-		m.toolbarFocused = false
-	default:
-		m.toolbarFocused = false
-		return m.handleBranchKey(km)
-	}
 	m.viewDirty = true
 	return nil
 }
