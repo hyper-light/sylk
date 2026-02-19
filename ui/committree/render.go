@@ -1900,14 +1900,19 @@ func (m *Model) viewRebasePlan() string {
 	lines = append(lines, "")
 
 	arrowStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Primary)
+	selLo, selHi := m.rebaseSelRange()
+	hasMultiSel := m.rebaseSelAnchor >= 0
 
 	for i, entry := range m.rebasePlan {
-		selected := i == m.rebaseCursor
+		isCursor := i == m.rebaseCursor
+		inSelection := hasMultiSel && i >= selLo && i <= selHi
 
-		// Cursor arrow or blank prefix.
+		// Cursor arrow, selection bar, or blank prefix.
 		prefix := "  "
-		if selected {
+		if isCursor {
 			prefix = arrowStyle.Render("▸") + " "
+		} else if inSelection {
+			prefix = arrowStyle.Render("│") + " "
 		}
 
 		// Determine visual connector for squash/fixup groups.
@@ -1930,7 +1935,11 @@ func (m *Model) viewRebasePlan() string {
 		actionStyle := lipgloss.NewStyle().Foreground(actionColor).Width(8)
 
 		hashStyle := lipgloss.NewStyle().Foreground(p.Accent)
-		subjectStyle := lipgloss.NewStyle().Foreground(p.Foreground)
+		subjectFg := p.Foreground
+		if inSelection && !isCursor {
+			subjectFg = p.Subtle
+		}
+		subjectStyle := lipgloss.NewStyle().Foreground(subjectFg)
 
 		line := prefix + connector + actionStyle.Render(actionLabel) + " " +
 			hashStyle.Render(entry.hash) + " " +
@@ -1941,7 +1950,7 @@ func (m *Model) viewRebasePlan() string {
 
 	// Help text.
 	lines = append(lines, "")
-	help := " p:pick  r:reword  s:squash  f:fixup  e:edit  d:drop  J/K:move"
+	help := " p:pick  r:reword  s:squash  f:fixup  e:edit  d:drop  J/K:move  Shift+↑↓:select"
 	helpStyle := lipgloss.NewStyle().Foreground(p.Subtle)
 	lines = append(lines, helpStyle.Render(help))
 

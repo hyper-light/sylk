@@ -380,6 +380,7 @@ type Model struct {
 	// Interactive rebase plan state.
 	rebasePlan       []rebasePlanEntry
 	rebaseCursor     int
+	rebaseSelAnchor  int    // Multi-select anchor; -1 = no selection.
 	rebaseOnto       string // Target branch name for rebase.
 
 	// Toolbar state.
@@ -3447,6 +3448,7 @@ func (m *Model) EnterRebasePlan(onto string, entries []rebasePlanEntry) {
 	m.rebaseOnto = onto
 	m.rebasePlan = entries
 	m.rebaseCursor = 0
+	m.rebaseSelAnchor = -1
 	m.toolbarFocused = false
 	m.viewDirty = true
 }
@@ -3456,6 +3458,7 @@ func (m *Model) ExitRebasePlan() {
 	m.mode = viewCommits
 	m.rebasePlan = nil
 	m.rebaseCursor = 0
+	m.rebaseSelAnchor = -1
 	m.rebaseOnto = ""
 	m.toolbarFocused = false
 	m.viewDirty = true
@@ -3621,6 +3624,38 @@ func (m *Model) confirmBranchPicker(selected string) tea.Cmd {
 	return nil
 }
 
+// rebaseSelRange returns the inclusive [lo, hi] range of selected entries.
+// When no multi-select is active, both equal the cursor.
+func (m *Model) rebaseSelRange() (int, int) {
+	if m.rebaseSelAnchor < 0 {
+		return m.rebaseCursor, m.rebaseCursor
+	}
+	lo, hi := m.rebaseSelAnchor, m.rebaseCursor
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	return lo, hi
+}
+
+// setRebaseAction sets the action for all entries in the current selection.
+func (m *Model) setRebaseAction(action int) {
+	lo, hi := m.rebaseSelRange()
+	for i := lo; i <= hi; i++ {
+		m.rebasePlan[i].action = action
+	}
+	m.viewDirty = true
+}
+
+// cycleRebaseAction cycles the action forward or backward for all selected entries.
+func (m *Model) cycleRebaseAction(delta int) {
+	lo, hi := m.rebaseSelRange()
+	n := len(rebaseActionNames)
+	for i := lo; i <= hi; i++ {
+		m.rebasePlan[i].action = (m.rebasePlan[i].action + delta + n) % n
+	}
+	m.viewDirty = true
+}
+
 // handleRebasePlanKey processes keys in the interactive rebase plan editor.
 func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 	if len(m.rebasePlan) == 0 {
@@ -3629,21 +3664,47 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 
 	switch km.String() {
 	case "esc":
+		if m.rebaseSelAnchor >= 0 {
+			m.rebaseSelAnchor = -1
+			m.viewDirty = true
+			return nil
+		}
 		m.ExitRebasePlan()
 		return nil
-	case "j", "down":
+	case "shift+down":
+		if m.rebaseSelAnchor < 0 {
+			m.rebaseSelAnchor = m.rebaseCursor
+		}
 		if m.rebaseCursor < len(m.rebasePlan)-1 {
 			m.rebaseCursor++
-			m.viewDirty = true
 		}
+		m.viewDirty = true
 		return nil
-	case "k", "up":
+	case "shift+up":
+		if m.rebaseSelAnchor < 0 {
+			m.rebaseSelAnchor = m.rebaseCursor
+		}
 		if m.rebaseCursor > 0 {
 			m.rebaseCursor--
-			m.viewDirty = true
 		}
+		m.viewDirty = true
+		return nil
+	case "j", "down":
+		m.rebaseSelAnchor = -1
+		if m.rebaseCursor < len(m.rebasePlan)-1 {
+			m.rebaseCursor++
+		}
+		m.viewDirty = true
+		return nil
+	case "k", "up":
+		m.rebaseSelAnchor = -1
+		if m.rebaseCursor > 0 {
+			m.rebaseCursor--
+		}
+		m.viewDirty = true
 		return nil
 	case "J":
+		m.rebaseSelAnchor = -1
 		if m.rebaseCursor < len(m.rebasePlan)-1 {
 			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor+1] =
 				m.rebasePlan[m.rebaseCursor+1], m.rebasePlan[m.rebaseCursor]
@@ -3652,6 +3713,7 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	case "K":
+		m.rebaseSelAnchor = -1
 		if m.rebaseCursor > 0 {
 			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor-1] =
 				m.rebasePlan[m.rebaseCursor-1], m.rebasePlan[m.rebaseCursor]
@@ -3660,40 +3722,32 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	case "p":
-		m.rebasePlan[m.rebaseCursor].action = 0 // Pick
-		m.viewDirty = true
+		m.setRebaseAction(0)
 		return nil
 	case "r":
-		m.rebasePlan[m.rebaseCursor].action = 1 // Reword
-		m.viewDirty = true
+		m.setRebaseAction(1)
 		return nil
 	case "s":
-		m.rebasePlan[m.rebaseCursor].action = 2 // Squash
-		m.viewDirty = true
+		m.setRebaseAction(2)
 		return nil
 	case "f":
-		m.rebasePlan[m.rebaseCursor].action = 3 // Fixup
-		m.viewDirty = true
+		m.setRebaseAction(3)
 		return nil
 	case "e":
-		m.rebasePlan[m.rebaseCursor].action = 4 // Edit
-		m.viewDirty = true
+		m.setRebaseAction(4)
 		return nil
 	case "d":
-		m.rebasePlan[m.rebaseCursor].action = 5 // Drop
-		m.viewDirty = true
+		m.setRebaseAction(5)
 		return nil
 	case "l", "right", "enter", " ":
 		if m.toolbarFocused {
 			m.viewDirty = true
 			return m.executeToolbarAction()
 		}
-		m.rebasePlan[m.rebaseCursor].action = (m.rebasePlan[m.rebaseCursor].action + 1) % len(rebaseActionNames)
-		m.viewDirty = true
+		m.cycleRebaseAction(1)
 		return nil
 	case "h", "left":
-		m.rebasePlan[m.rebaseCursor].action = (m.rebasePlan[m.rebaseCursor].action + len(rebaseActionNames) - 1) % len(rebaseActionNames)
-		m.viewDirty = true
+		m.cycleRebaseAction(-1)
 		return nil
 	case "tab":
 		m.cycleCommitToolbar(1)
@@ -3708,19 +3762,22 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 }
 
 // clickRebasePlanView handles clicks on the rebase plan. Clicking an entry
-// selects it; clicking the already-selected entry cycles its action.
+// within the selection cycles actions for all selected; clicking outside
+// selects the clicked entry and clears multi-select.
 func (m *Model) clickRebasePlanView(viewY int) tea.Cmd {
 	// Layout: header(1) + blank(1) + entries.
 	idx := viewY - 2
 	if idx < 0 || idx >= len(m.rebasePlan) {
 		return nil
 	}
-	if idx == m.rebaseCursor {
-		m.rebasePlan[idx].action = (m.rebasePlan[idx].action + 1) % len(rebaseActionNames)
+	lo, hi := m.rebaseSelRange()
+	if idx >= lo && idx <= hi {
+		m.cycleRebaseAction(1)
 	} else {
+		m.rebaseSelAnchor = -1
 		m.rebaseCursor = idx
+		m.viewDirty = true
 	}
-	m.viewDirty = true
 	return nil
 }
 
