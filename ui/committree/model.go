@@ -3306,8 +3306,13 @@ func (m *Model) SetBranchPickerItems(items []string) {
 	m.branchPickerItems = items
 }
 
-// openBranchPicker opens the branch picker dropdown.
+// openBranchPicker opens the branch picker dropdown, populating
+// available branches from the already-loaded branch list.
 func (m *Model) openBranchPicker() {
+	m.branchPickerItems = m.branchPickerItems[:0]
+	for _, b := range m.branches {
+		m.branchPickerItems = append(m.branchPickerItems, b.Name)
+	}
 	m.branchPickerActive = true
 	m.branchPickerCursor = 0
 	m.branchPickerFilter = ""
