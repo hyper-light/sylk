@@ -1899,8 +1899,16 @@ func (m *Model) viewRebasePlan() string {
 	lines = append(lines, headerStyle.Render(header))
 	lines = append(lines, "")
 
+	arrowStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Primary)
+
 	for i, entry := range m.rebasePlan {
 		selected := i == m.rebaseCursor
+
+		// Cursor arrow or blank prefix.
+		prefix := "  "
+		if selected {
+			prefix = arrowStyle.Render("▸") + " "
+		}
 
 		// Determine visual connector for squash/fixup groups.
 		connector := "  "
@@ -1924,13 +1932,9 @@ func (m *Model) viewRebasePlan() string {
 		hashStyle := lipgloss.NewStyle().Foreground(p.Accent)
 		subjectStyle := lipgloss.NewStyle().Foreground(p.Foreground)
 
-		line := connector + actionStyle.Render(actionLabel) + " " +
+		line := prefix + connector + actionStyle.Render(actionLabel) + " " +
 			hashStyle.Render(entry.hash) + " " +
-			subjectStyle.Render(truncateSubject(entry.subject, m.width-25))
-
-		if selected {
-			line = lipgloss.NewStyle().Bold(true).Reverse(true).Render(line)
-		}
+			subjectStyle.Render(truncateSubject(entry.subject, m.width-27))
 
 		lines = append(lines, line)
 	}
