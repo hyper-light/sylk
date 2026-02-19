@@ -1800,8 +1800,10 @@ func (c *GitClient) dagBaseSet(branchHash plumbing.Hash, branchName, baseBranch 
 	return c.reachableSet(baseRef.Hash())
 }
 
-// collectBranchDAG performs BFS from branchHash following ALL parents,
-// skipping any hash in baseSet, collecting up to limit commits.
+// collectBranchDAG performs BFS from branchHash following first parents only,
+// skipping any hash in baseSet, collecting up to limit commits. Following
+// only first parents avoids pulling in commits from merged-in branches
+// (which belong to their own branch view).
 func (c *GitClient) collectBranchDAG(branchHash plumbing.Hash, baseSet map[plumbing.Hash]struct{}, limit int) map[plumbing.Hash]*object.Commit {
 	result := make(map[plumbing.Hash]*object.Commit, min(limit, 64))
 	queue := []plumbing.Hash{branchHash}
@@ -1823,8 +1825,8 @@ func (c *GitClient) collectBranchDAG(branchHash plumbing.Hash, baseSet map[plumb
 		if len(result) >= limit {
 			break
 		}
-		for _, ph := range co.ParentHashes {
-			queue = append(queue, ph)
+		if len(co.ParentHashes) > 0 {
+			queue = append(queue, co.ParentHashes[0])
 		}
 	}
 	return result
