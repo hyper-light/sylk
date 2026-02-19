@@ -1969,9 +1969,13 @@ func (m *Model) viewBranchPicker() string {
 	// Build header lines.
 	var lines []string
 	lines = append(lines, titleStyle.Render(title))
-	if m.branchPickerFilter != "" {
+	if m.branchPickerFilterActive || m.branchPickerFilter != "" {
 		filterStyle := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 1)
-		lines = append(lines, filterStyle.Render("filter: "+m.branchPickerFilter))
+		cursor := ""
+		if m.branchPickerFilterActive {
+			cursor = "_"
+		}
+		lines = append(lines, filterStyle.Render("/ "+m.branchPickerFilter+cursor))
 	}
 	lines = append(lines, "") // blank separator line
 
@@ -2002,7 +2006,7 @@ func (m *Model) viewBranchPicker() string {
 	for i := start; i < end; i++ {
 		prefix := "  "
 		style := lipgloss.NewStyle().Foreground(p.Foreground).Padding(0, 1)
-		if i == m.branchPickerCursor {
+		if i == m.branchPickerCursor && !m.toolbarFocused {
 			prefix = "▸ "
 			style = lipgloss.NewStyle().Bold(true).Foreground(p.Primary).Padding(0, 1)
 		}

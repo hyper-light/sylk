@@ -1349,14 +1349,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case committree.CherryPickRequestMsg:
 		if m.gitBus != nil && m.commitTree != nil {
-			hashes, target := typed.Hashes, typed.TargetBranch
-			if len(hashes) == 0 {
-				m.statusBar.SetFlash("Cherry-pick: no commits selected")
-				return m, nil
-			}
-			m.statusBar.SetFlash(fmt.Sprintf("Cherry-pick: %d commits → %s", len(hashes), target))
 			m.commitTree.SetLoadingMessage("Cherry-picking...")
 			bus := m.gitBus
+			hashes, target := typed.Hashes, typed.TargetBranch
 			return m, func() tea.Msg {
 				status, err := bus.CherryPickSequence(hashes, target)
 				if err != nil {

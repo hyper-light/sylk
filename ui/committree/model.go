@@ -2,7 +2,6 @@ package committree
 
 import (
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -362,11 +361,12 @@ type Model struct {
 	cherryPickMode       bool
 	cherryPickSelections []diffSelection
 	cherryPickTarget     string // Selected target branch name.
-	branchPickerActive   bool     // Target branch dropdown open.
-	branchPickerCursor   int      // Highlighted item index.
-	branchPickerScroll   int      // Scroll offset for the picker list.
-	branchPickerItems    []string // Available branch names.
-	branchPickerFilter   string   // Typing filter for branch picker.
+	branchPickerActive       bool     // Target branch dropdown open.
+	branchPickerCursor       int      // Highlighted item index.
+	branchPickerScroll       int      // Scroll offset for the picker list.
+	branchPickerItems        []string // Available branch names.
+	branchPickerFilter       string   // Typing filter for branch picker.
+	branchPickerFilterActive bool     // Filter input is active (/ or alt+f).
 
 	// Conflict resolution mode state.
 	conflictMode    bool
@@ -3300,6 +3300,7 @@ func (m *Model) exitCherryPickMode() {
 		m.mode = m.branchPickPrevMode
 	}
 	m.branchPickerFilter = ""
+	m.branchPickerFilterActive = false
 	m.toolbarFocused = false
 	m.invalidateNodeCache()
 	m.invalidateCommitCardCache()
@@ -3362,8 +3363,10 @@ func (m *Model) openBranchPicker() {
 	m.branchPickerCursor = 0
 	m.branchPickerScroll = 0
 	m.branchPickerFilter = ""
+	m.branchPickerFilterActive = false
 	m.branchPickPrevMode = m.mode
 	m.mode = viewBranchPick
+	m.toolbarFocused = false
 	m.viewDirty = true
 }
 
@@ -3371,6 +3374,7 @@ func (m *Model) openBranchPicker() {
 func (m *Model) closeBranchPicker() {
 	m.branchPickerActive = false
 	m.branchPickerFilter = ""
+	m.branchPickerFilterActive = false
 	m.mode = m.branchPickPrevMode
 	m.viewDirty = true
 }
@@ -3456,58 +3460,119 @@ func (m *Model) ExitRebasePlan() {
 }
 
 // handleBranchPickerKey processes keys when the branch picker dropdown is open.
+// Filter is activated with / or alt+f (matching other panels). Navigation uses
+// j/k, Tab cycles the toolbar, Enter confirms the highlighted branch.
 func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
-	items := m.filteredBranchItems()
-
-	// DEBUG: log every key press in the branch picker.
-	if f, err := os.OpenFile("/tmp/sylk-picker-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-		fmt.Fprintf(f, "key=%q items=%d filter=%q cursor=%d toolbarFocused=%v cherryPickMode=%v selections=%d branchPickerActive=%v mode=%d\n",
-			km.String(), len(items), m.branchPickerFilter, m.branchPickerCursor, m.toolbarFocused, m.cherryPickMode, len(m.cherryPickSelections), m.branchPickerActive, m.mode)
-		f.Close()
+	// When the filter input is active, route typing there.
+	if m.branchPickerFilterActive {
+		return m.handlePickerFilterKey(km)
 	}
 
-	switch km.String() {
+	items := m.filteredBranchItems()
+	ks := km.String()
+
+	switch ks {
+	case "tab":
+		m.cycleCommitToolbar(1)
+		m.viewDirty = true
+		return nil
+	case "shift+tab":
+		m.cycleCommitToolbar(-1)
+		m.viewDirty = true
+		return nil
+	case "esc":
+		if m.toolbarFocused {
+			m.toolbarFocused = false
+			m.viewDirty = true
+			return nil
+		}
+		if m.branchPickerFilter != "" {
+			m.branchPickerFilter = ""
+			m.branchPickerCursor = 0
+			m.viewDirty = true
+			return nil
+		}
+		m.closeBranchPicker()
+		if m.cherryPickMode {
+			m.exitCherryPickMode()
+		}
+		return nil
+	case "enter", " ":
+		if m.toolbarFocused {
+			m.viewDirty = true
+			return m.executeToolbarAction()
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		return m.confirmBranchPicker(items[m.branchPickerCursor])
 	case "j", "down":
+		m.toolbarFocused = false
 		if m.branchPickerCursor < len(items)-1 {
 			m.branchPickerCursor++
 		}
 		m.viewDirty = true
 		return nil
 	case "k", "up":
+		m.toolbarFocused = false
 		if m.branchPickerCursor > 0 {
 			m.branchPickerCursor--
 		}
 		m.viewDirty = true
 		return nil
-	case "enter":
-		if len(items) == 0 {
-			return nil
-		}
-		selected := items[m.branchPickerCursor]
-		m.closeBranchPicker()
-
-		if m.cherryPickMode {
-			// Confirm cherry-pick with selected branch.
-			hashes := m.CherryPickSelections()
-			m.exitCherryPickMode()
-			return func() tea.Msg {
-				return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
-			}
-		}
-
-		// Rebase: generate default plan and enter plan view.
-		plan := make([]rebasePlanEntry, len(m.nodes))
-		for i, n := range m.nodes {
-			plan[i] = rebasePlanEntry{
-				action:  0, // Pick
-				hash:    n.Hash[:min(len(n.Hash), 7)],
-				subject: n.Subject,
-				author:  n.Author,
-			}
-		}
-		m.EnterRebasePlan(selected, plan)
+	case "g":
+		m.toolbarFocused = false
+		m.branchPickerCursor = 0
+		m.viewDirty = true
 		return nil
+	case "G":
+		m.toolbarFocused = false
+		if len(items) > 0 {
+			m.branchPickerCursor = len(items) - 1
+		}
+		m.viewDirty = true
+		return nil
+	case "ctrl+d":
+		m.toolbarFocused = false
+		half := max(m.contentHeight()/2, 1)
+		for range half {
+			if m.branchPickerCursor < len(items)-1 {
+				m.branchPickerCursor++
+			}
+		}
+		m.viewDirty = true
+		return nil
+	case "ctrl+u":
+		m.toolbarFocused = false
+		half := max(m.contentHeight()/2, 1)
+		for range half {
+			if m.branchPickerCursor > 0 {
+				m.branchPickerCursor--
+			}
+		}
+		m.viewDirty = true
+		return nil
+	case "/", "alt+f":
+		m.branchPickerFilterActive = true
+		m.toolbarFocused = false
+		m.viewDirty = true
+		return nil
+	}
+	return nil
+}
 
+// handlePickerFilterKey processes keys when the branch picker filter input is active.
+func (m *Model) handlePickerFilterKey(km tea.KeyMsg) tea.Cmd {
+	switch km.String() {
+	case "esc":
+		m.branchPickerFilterActive = false
+		m.viewDirty = true
+		return nil
+	case "enter":
+		m.branchPickerFilterActive = false
+		m.branchPickerCursor = 0
+		m.viewDirty = true
+		return nil
 	case "backspace":
 		if len(m.branchPickerFilter) > 0 {
 			m.branchPickerFilter = m.branchPickerFilter[:len(m.branchPickerFilter)-1]
@@ -3523,6 +3588,33 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
+}
+
+// confirmBranchPicker confirms the selected branch and dispatches the
+// appropriate action (cherry-pick or rebase plan).
+func (m *Model) confirmBranchPicker(selected string) tea.Cmd {
+	m.closeBranchPicker()
+
+	if m.cherryPickMode {
+		hashes := m.CherryPickSelections()
+		m.exitCherryPickMode()
+		return func() tea.Msg {
+			return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
+		}
+	}
+
+	// Rebase: generate default plan and enter plan view.
+	plan := make([]rebasePlanEntry, len(m.nodes))
+	for i, n := range m.nodes {
+		plan[i] = rebasePlanEntry{
+			action:  0, // Pick
+			hash:    n.Hash[:min(len(n.Hash), 7)],
+			subject: n.Subject,
+			author:  n.Author,
+		}
+	}
+	m.EnterRebasePlan(selected, plan)
+	return nil
 }
 
 // handleRebasePlanKey processes keys in the interactive rebase plan editor.
@@ -4602,22 +4694,36 @@ func (m *Model) branchMaxScroll() int {
 
 // activeScrollOff returns a pointer to the scroll offset for the active view.
 func (m *Model) activeScrollOff() *int {
-	if m.mode == viewCommits {
+	switch m.mode {
+	case viewCommits:
 		return &m.scrollOff
+	case viewBranchPick:
+		return &m.branchPickerScroll
+	default:
+		return &m.branchScrollOff
 	}
-	return &m.branchScrollOff
 }
 
 // activeMaxScroll returns the max scroll for the active view.
 func (m *Model) activeMaxScroll() int {
-	if m.mode == viewCommits {
+	switch m.mode {
+	case viewCommits:
 		if m.dagMode && len(m.dagSections) > 0 {
 			visRows := max(m.contentHeight()/branchRowHeight, 1)
 			return max(m.dagTotalRows()-visRows, 0)
 		}
 		return m.commitMaxScroll()
+	case viewBranchPick:
+		items := m.filteredBranchItems()
+		headerLines := 2 // title + blank separator
+		if m.branchPickerFilter != "" {
+			headerLines = 3 // title + filter + blank separator
+		}
+		visible := max(m.contentHeight()-headerLines, 1)
+		return max(len(items)-visible, 0)
+	default:
+		return m.branchMaxScroll()
 	}
-	return m.branchMaxScroll()
 }
 
 // ---------------------------------------------------------------------------
