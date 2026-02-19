@@ -126,6 +126,9 @@ type Model struct {
 	focused bool
 	theme   *theme.Theme
 
+	// Conflict marker hunks detected in the file.
+	conflictHunks []ConflictHunk
+
 	// View cache: avoids re-rendering all visible lines when only
 	// the cursor blink state changed.
 	vc viewCache
@@ -228,6 +231,7 @@ func (m *Model) OpenFile(path, content, language string) {
 
 	m.regions = m.highlighter.Highlight(content, language)
 	m.collectParseErrors()
+	m.DetectConflictHunks()
 	m.syncStatusLine()
 }
 
@@ -740,6 +744,164 @@ type WarpLineInfo struct {
 func (m *Model) SetWarpLines(lines map[int]WarpLineInfo) {
 	m.warpLines = lines
 	m.invalidateView()
+}
+
+// ---------------------------------------------------------------------------
+// Conflict Hunks
+// ---------------------------------------------------------------------------
+
+// ConflictHunk describes a merge conflict region in the file.
+type ConflictHunk struct {
+	StartLine   int    // 0-indexed line of <<<<<<<
+	DivLine     int    // 0-indexed line of =======
+	EndLine     int    // 0-indexed line of >>>>>>>
+	OursLabel   string // Label after <<<<<<<
+	TheirsLabel string // Label after >>>>>>>
+}
+
+// ConflictResolvedMsg is emitted when all conflict markers are removed from a file.
+type ConflictResolvedMsg struct {
+	Path string
+}
+
+// DetectConflictHunks scans the buffer for merge conflict markers and
+// updates the conflictHunks field. Call after file load and after edits.
+func (m *Model) DetectConflictHunks() {
+	m.conflictHunks = m.conflictHunks[:0]
+	lineCount := m.lineIndex.Count()
+
+	var current *ConflictHunk
+	for i := range lineCount {
+		line := m.buf.Line(i)
+		switch {
+		case strings.HasPrefix(line, "<<<<<<<"):
+			label := strings.TrimSpace(strings.TrimPrefix(line, "<<<<<<<"))
+			current = &ConflictHunk{StartLine: i, OursLabel: label}
+		case current != nil && strings.HasPrefix(line, "======="):
+			current.DivLine = i
+		case current != nil && strings.HasPrefix(line, ">>>>>>>"):
+			label := strings.TrimSpace(strings.TrimPrefix(line, ">>>>>>>"))
+			current.TheirsLabel = label
+			current.EndLine = i
+			m.conflictHunks = append(m.conflictHunks, *current)
+			current = nil
+		}
+	}
+}
+
+// HasConflicts reports whether the file has any detected conflict hunks.
+func (m *Model) HasConflicts() bool {
+	return len(m.conflictHunks) > 0
+}
+
+// ConflictHunks returns the detected conflict hunks.
+func (m *Model) ConflictHunks() []ConflictHunk {
+	return m.conflictHunks
+}
+
+// ConflictHunkAtLine returns the hunk containing the given line, or nil.
+func (m *Model) ConflictHunkAtLine(line int) *ConflictHunk {
+	for i := range m.conflictHunks {
+		h := &m.conflictHunks[i]
+		if line >= h.StartLine && line <= h.EndLine {
+			return h
+		}
+	}
+	return nil
+}
+
+// AcceptOurs removes the theirs section and all markers from the hunk.
+func (m *Model) AcceptOurs(hunk *ConflictHunk) {
+	m.deleteConflictLines(hunk, false)
+}
+
+// AcceptTheirs removes the ours section and all markers from the hunk.
+func (m *Model) AcceptTheirs(hunk *ConflictHunk) {
+	m.deleteConflictLines(hunk, true)
+}
+
+// AcceptBoth keeps both sections, removing only the marker lines.
+func (m *Model) AcceptBoth(hunk *ConflictHunk) {
+	// Delete markers bottom-up to preserve line numbers.
+	m.deleteLine(hunk.EndLine)   // >>>>>>>
+	m.deleteLine(hunk.DivLine)   // =======
+	m.deleteLine(hunk.StartLine) // <<<<<<<
+	m.DetectConflictHunks()
+}
+
+// deleteConflictLines removes one side of a conflict. If theirs is true,
+// keeps theirs and removes ours+markers; otherwise keeps ours.
+func (m *Model) deleteConflictLines(hunk *ConflictHunk, keepTheirs bool) {
+	if keepTheirs {
+		// Delete ours section + start marker, then end marker + div.
+		// Work bottom-up.
+		m.deleteLine(hunk.EndLine)
+		for i := hunk.DivLine; i >= hunk.StartLine; i-- {
+			m.deleteLine(i)
+		}
+	} else {
+		// Delete theirs section + end marker, then div + keep ours.
+		for i := hunk.EndLine; i >= hunk.DivLine; i-- {
+			m.deleteLine(i)
+		}
+		m.deleteLine(hunk.StartLine)
+	}
+	m.DetectConflictHunks()
+}
+
+// deleteLine deletes a single line from the buffer using the undo tree.
+func (m *Model) deleteLine(lineNum int) {
+	lineCount := m.lineIndex.Count()
+	if lineNum < 0 || lineNum >= lineCount {
+		return
+	}
+	info, _ := m.lineIndex.Get(lineNum)
+	startOff := info.StartPos
+	var endOff int
+	if lineNum+1 < lineCount {
+		nextInfo, _ := m.lineIndex.Get(lineNum + 1)
+		endOff = nextInfo.StartPos
+	} else {
+		endOff = m.buf.Length()
+	}
+	if endOff <= startOff {
+		return
+	}
+	m.buf.Delete(startOff, endOff-startOff)
+	m.lineIndex.Rebuild(m.buf)
+	m.modified = true
+}
+
+// ConflictLineKind reports the conflict role of a line for rendering.
+// Returns: "ours", "theirs", "marker", or "" (not in a conflict).
+func (m *Model) ConflictLineKind(line int) string {
+	for _, h := range m.conflictHunks {
+		if line < h.StartLine || line > h.EndLine {
+			continue
+		}
+		switch {
+		case line == h.StartLine || line == h.DivLine || line == h.EndLine:
+			return "marker"
+		case line > h.StartLine && line < h.DivLine:
+			return "ours"
+		case line > h.DivLine && line < h.EndLine:
+			return "theirs"
+		}
+	}
+	return ""
+}
+
+// conflictBgColor returns a background tint color for lines inside a conflict
+// hunk: green for ours, red for theirs, empty for markers and non-conflict.
+func (m *Model) conflictBgColor(lineNum int) (lipgloss.Color, bool) {
+	switch m.ConflictLineKind(lineNum) {
+	case "ours":
+		return m.theme.Palette.DiffAddBg, true
+	case "theirs":
+		return m.theme.Palette.DiffDelBg, true
+	default:
+		return "", false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2833,7 +2995,51 @@ func (m *Model) dispatchKey(key tea.KeyMsg) (mode.Mode, tea.Cmd) {
 }
 
 func dispatchNormal(m *Model, key tea.KeyMsg) (mode.Mode, tea.Cmd) {
+	// Intercept conflict resolution keys on marker lines.
+	if cmd := m.handleConflictKey(key); cmd != nil {
+		return m.currentMode, cmd
+	}
 	return m.normalMode.HandleKey(key, m.state)
+}
+
+// handleConflictKey checks if the cursor is on a conflict marker line and
+// handles o/t/b quick actions. Returns nil if not applicable.
+func (m *Model) handleConflictKey(key tea.KeyMsg) tea.Cmd {
+	if len(m.conflictHunks) == 0 {
+		return nil
+	}
+	hunk := m.ConflictHunkAtLine(m.state.CursorLine)
+	if hunk == nil {
+		return nil
+	}
+	kind := m.ConflictLineKind(m.state.CursorLine)
+	if kind != "marker" {
+		return nil
+	}
+	switch key.String() {
+	case "o":
+		m.AcceptOurs(hunk)
+		m.rehighlightAndSync()
+		return m.emitConflictResolved()
+	case "t":
+		m.AcceptTheirs(hunk)
+		m.rehighlightAndSync()
+		return m.emitConflictResolved()
+	case "b":
+		m.AcceptBoth(hunk)
+		m.rehighlightAndSync()
+		return m.emitConflictResolved()
+	}
+	return nil
+}
+
+// emitConflictResolved emits ConflictResolvedMsg if all conflicts are gone.
+func (m *Model) emitConflictResolved() tea.Cmd {
+	if !m.HasConflicts() {
+		path := m.filePath
+		return func() tea.Msg { return ConflictResolvedMsg{Path: path} }
+	}
+	return nil
 }
 
 func dispatchInsert(m *Model, key tea.KeyMsg) (mode.Mode, tea.Cmd) {
@@ -3064,6 +3270,12 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 				displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, displayCol, ulRanges)
 		}
 		gutter := m.renderGutter(i, ctx.gutterWidth)
+		if bg, ok := m.conflictBgColor(i); ok {
+			fullRange := []highlight.UnderlineRange{{StartCol: 0, EndCol: displayLineRunes}}
+			lineText := highlight.RenderLineWithBgRanges(
+				displayLine, displayRegions, m.theme.Syntax, ctx.defaultStyle, fullRange, bg)
+			return gutter + lineText
+		}
 		lineText := highlight.RenderLineWithUnderlines(
 			displayLine, displayRegions, m.theme.Syntax, ctx.defaultStyle, ulRanges)
 		return gutter + lineText
@@ -3079,6 +3291,12 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 				i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, warpSpan, -1, ulRanges)
 		}
 		gutter := m.renderGutter(i, ctx.gutterWidth)
+		if bg, ok := m.conflictBgColor(i); ok {
+			fullRange := []highlight.UnderlineRange{{StartCol: 0, EndCol: displayLineRunes}}
+			lineText := highlight.RenderLineWithBgRanges(
+				displayLine, displayRegions, m.theme.Syntax, ctx.defaultStyle, fullRange, bg)
+			return gutter + lineText
+		}
 		lineText := highlight.RenderLineWithUnderlines(
 			displayLine, displayRegions, m.theme.Syntax, ctx.defaultStyle, ulRanges)
 		return gutter + lineText
@@ -3318,6 +3536,26 @@ var severitySign = map[lsp.DiagnosticSeverity]string{
 }
 
 func (m *Model) renderGutter(lineNum, gutterWidth int) string {
+	// Conflict marker gutter indicators.
+	if kind := m.ConflictLineKind(lineNum); kind == "marker" {
+		var sign string
+		line := m.buf.Line(lineNum)
+		switch {
+		case strings.HasPrefix(line, "<<<<<<<"):
+			sign = "◄"
+		case strings.HasPrefix(line, "======="):
+			sign = "═"
+		case strings.HasPrefix(line, ">>>>>>>"):
+			sign = "►"
+		}
+		if sign != "" {
+			color := m.theme.Palette.Warning
+			signStyle := lipgloss.NewStyle().Foreground(color).Bold(true)
+			numStr := fmt.Sprintf("%*s", gutterWidth-gutterPadding, sign)
+			return signStyle.Render(numStr) + strings.Repeat(" ", gutterPadding)
+		}
+	}
+
 	// Check for diagnostic on this line (0-based lineNum matches LSP 0-based lines).
 	if diag, ok := m.diagnosticForLine(lineNum); ok {
 		sign := severitySign[diag.Severity]
@@ -3747,6 +3985,12 @@ func (m *Model) syncStatusLine() {
 func (m *Model) rehighlight() {
 	m.regions = m.highlighter.Highlight(m.buf.Content(), m.language)
 	m.collectParseErrors()
+}
+
+// rehighlightAndSync rehighlights and invalidates the view cache.
+func (m *Model) rehighlightAndSync() {
+	m.rehighlight()
+	m.invalidateView()
 }
 
 // collectParseErrors extracts syntax errors from the current parse tree.

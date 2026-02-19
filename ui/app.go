@@ -1338,6 +1338,150 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
+	// --- Sequencer operations (cherry-pick, rebase, merge) ---
+
+	case committree.CherryPickRequestMsg:
+		if m.gitBus != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Cherry-picking...")
+			bus := m.gitBus
+			hashes, target := typed.Hashes, typed.TargetBranch
+			return m, func() tea.Msg {
+				status, err := bus.CherryPickSequence(hashes, target)
+				if err != nil {
+					return sequencerFailedMsg{reason: err.Error()}
+				}
+				return sequencerResultMsg{status: status}
+			}
+		}
+		return m, nil
+
+	case committree.RebaseStartMsg:
+		if m.gitBus != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Rebasing...")
+			bus := m.gitBus
+			onto := typed.OntoBranch
+			plan := make([]git.RebasePlanEntry, len(typed.Plan))
+			for i, p := range typed.Plan {
+				plan[i] = git.RebasePlanEntry{Action: git.RebaseAction(p.Action), Hash: p.Hash}
+			}
+			return m, func() tea.Msg {
+				status, err := bus.RebaseInteractive(onto, plan)
+				if err != nil {
+					return sequencerFailedMsg{reason: err.Error()}
+				}
+				return sequencerResultMsg{status: status}
+			}
+		}
+		return m, nil
+
+	case committree.SequencerContinueMsg:
+		if m.gitBus != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Continuing...")
+			bus := m.gitBus
+			return m, func() tea.Msg {
+				status, err := bus.SequencerContinue()
+				if err != nil {
+					return sequencerFailedMsg{reason: err.Error()}
+				}
+				return sequencerResultMsg{status: status}
+			}
+		}
+		return m, nil
+
+	case committree.SequencerBypassMsg:
+		if m.gitBus != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Bypassing...")
+			bus := m.gitBus
+			return m, func() tea.Msg {
+				status, err := bus.SequencerBypass()
+				if err != nil {
+					return sequencerFailedMsg{reason: err.Error()}
+				}
+				return sequencerResultMsg{status: status}
+			}
+		}
+		return m, nil
+
+	case committree.SequencerAbortMsg:
+		if m.gitBus != nil && m.commitTree != nil {
+			m.commitTree.SetLoadingMessage("Aborting...")
+			bus := m.gitBus
+			return m, func() tea.Msg {
+				if err := bus.SequencerAbort(); err != nil {
+					return sequencerAbortFailedMsg{reason: err.Error()}
+				}
+				return sequencerAbortedMsg{}
+			}
+		}
+		return m, nil
+
+	case sequencerResultMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		status := typed.status
+		if status.State == git.SeqConflict {
+			paths := make([]string, len(status.Conflicts))
+			for i, c := range status.Conflicts {
+				paths[i] = c.Path
+			}
+			if m.commitTree != nil {
+				m.commitTree.EnterConflictMode(
+					int(status.Op), status.TotalSteps, status.CurrentStep,
+					status.Subject, paths,
+				)
+			}
+			m.statusBar.SetFlash("Conflict at step " + fmt.Sprintf("%d/%d", status.CurrentStep+1, status.TotalSteps))
+			return m, nil
+		}
+		// Completed or advanced — refresh everything.
+		m.statusBar.SetFlash("Sequencer completed")
+		if m.commitTree != nil {
+			m.commitTree.ExitConflictMode()
+		}
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case sequencerFailedMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+			m.commitTree.ExitConflictMode()
+		}
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
+	case sequencerAbortedMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+			m.commitTree.ExitConflictMode()
+		}
+		m.statusBar.SetFlash("Sequencer aborted")
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
+
+	case sequencerAbortFailedMsg:
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash(typed.reason)
+		return m, nil
+
+	case editor.ConflictResolvedMsg:
+		if m.commitTree != nil && m.commitTree.InConflictMode() {
+			m.commitTree.MarkConflictResolved(typed.Path)
+		}
+		return m, nil
+
 	case msg.GitOpEventMsg:
 		if typed.Err == nil {
 			m.nudgeGitWatcher()
@@ -3856,6 +4000,11 @@ type revertSucceededMsg struct{ hash string }
 type revertFailedMsg struct{ reason string }
 type commitCheckoutSucceededMsg struct{ hash string }
 type commitCheckoutFailedMsg struct{ reason string }
+
+type sequencerResultMsg struct{ status *git.SequencerStatus }
+type sequencerFailedMsg struct{ reason string }
+type sequencerAbortedMsg struct{}
+type sequencerAbortFailedMsg struct{ reason string }
 
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.

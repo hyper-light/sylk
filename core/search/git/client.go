@@ -41,6 +41,7 @@ type GitClient struct {
 	mu        sync.RWMutex
 	isRepo    bool
 	diffCache *ristretto.Cache
+	sequencer *sequencer
 }
 
 // NewGitClient creates a new GitClient for the given repository path.

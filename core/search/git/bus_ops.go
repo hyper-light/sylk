@@ -92,6 +92,15 @@ const (
 	OpReset      // reset
 	OpRevert     // revert
 
+	// Sequencer operations.
+	OpCherryPickSequence // cherry_pick_sequence
+	OpRebaseInteractive  // rebase_interactive
+	OpMergeSequence      // merge_sequence
+	OpSequencerContinue  // sequencer_continue
+	OpSequencerBypass    // sequencer_bypass
+	OpSequencerAbort     // sequencer_abort
+	OpSequencerStatus    // sequencer_status
+
 	opCount // unexported sentinel — must remain last
 )
 
@@ -171,6 +180,14 @@ var opNames = [opCount]string{
 	OpRebase:     "rebase",
 	OpReset:      "reset",
 	OpRevert:     "revert",
+
+	OpCherryPickSequence: "cherry_pick_sequence",
+	OpRebaseInteractive:  "rebase_interactive",
+	OpMergeSequence:      "merge_sequence",
+	OpSequencerContinue:  "sequencer_continue",
+	OpSequencerBypass:    "sequencer_bypass",
+	OpSequencerAbort:     "sequencer_abort",
+	OpSequencerStatus:    "sequencer_status",
 }
 
 // opByName is the inverse of opNames, built at init time.
@@ -243,6 +260,11 @@ var opCategories = [opCount]string{
 
 	OpCherryPick: "advanced", OpRebase: "advanced",
 	OpReset: "advanced", OpRevert: "advanced",
+
+	OpCherryPickSequence: "sequencer", OpRebaseInteractive: "sequencer",
+	OpMergeSequence: "sequencer", OpSequencerContinue: "sequencer",
+	OpSequencerBypass: "sequencer", OpSequencerAbort: "sequencer",
+	OpSequencerStatus: "sequencer",
 }
 
 // OpCategory returns the category of the operation (e.g. "branch", "commit").
@@ -253,20 +275,36 @@ func OpCategory(op GitOp) string {
 	return "unknown"
 }
 
-// mutatingBits is a compile-time bitset marking mutating operations.
-// A single uint64 suffices because opCount < 64.
-const mutatingBits uint64 = 1<<OpClose |
-	1<<OpCheckoutBranch | 1<<OpCheckoutCommit | 1<<OpCreateBranch | 1<<OpDeleteBranch | 1<<OpMergeBranch |
-	1<<OpCommitFiles |
-	1<<OpStashFiles | 1<<OpUnstashFiles |
-	1<<OpPullBranch | 1<<OpPushBranch |
-	1<<OpCherryPick | 1<<OpRebase |
-	1<<OpReset | 1<<OpRevert
+// mutatingOps lists all operations that modify repository state.
+// Used by IsMutating to build a runtime bitset.
+var mutatingOps = [...]GitOp{
+	OpClose,
+	OpCheckoutBranch, OpCheckoutCommit, OpCreateBranch, OpDeleteBranch, OpMergeBranch,
+	OpCommitFiles,
+	OpStashFiles, OpUnstashFiles,
+	OpPullBranch, OpPushBranch,
+	OpCherryPick, OpRebase, OpReset, OpRevert,
+	OpCherryPickSequence, OpRebaseInteractive, OpMergeSequence,
+	OpSequencerContinue, OpSequencerBypass, OpSequencerAbort,
+}
+
+// mutatingBits is a bitset built at init time from mutatingOps.
+var mutatingBits [2]uint64
+
+func init() {
+	for _, op := range mutatingOps {
+		word := int(op) / 64
+		bit := uint(op) % 64
+		mutatingBits[word] |= 1 << bit
+	}
+}
 
 // IsMutating returns true if the operation modifies repository state.
 func IsMutating(op GitOp) bool {
 	if op < 0 || op >= opCount {
 		return false
 	}
-	return mutatingBits&(1<<op) != 0
+	word := int(op) / 64
+	bit := uint(op) % 64
+	return mutatingBits[word]&(1<<bit) != 0
 }

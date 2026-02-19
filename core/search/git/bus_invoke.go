@@ -284,6 +284,29 @@ var invokeTable = map[string]invokeEntry{
 	"revert": {op: OpRevert, params: []string{"commit_hash"}, fn: func(b *GitBus, p map[string]any) (any, error) {
 		return nil, b.Revert(str(p, "commit_hash"))
 	}},
+
+	// Sequencer
+	"cherry_pick_sequence": {op: OpCherryPickSequence, params: []string{"hashes", "target_branch"}, fn: func(b *GitBus, p map[string]any) (any, error) {
+		return b.CherryPickSequence(strSlice(p, "hashes"), str(p, "target_branch"))
+	}},
+	"rebase_interactive": {op: OpRebaseInteractive, params: []string{"onto_branch", "plan"}, fn: func(b *GitBus, p map[string]any) (any, error) {
+		return b.RebaseInteractive(str(p, "onto_branch"), rebasePlanSlice(p, "plan"))
+	}},
+	"merge_sequence": {op: OpMergeSequence, params: []string{"source_branch", "target_branch"}, fn: func(b *GitBus, p map[string]any) (any, error) {
+		return b.MergeSequence(str(p, "source_branch"), str(p, "target_branch"))
+	}},
+	"sequencer_continue": {op: OpSequencerContinue, fn: func(b *GitBus, _ map[string]any) (any, error) {
+		return b.SequencerContinue()
+	}},
+	"sequencer_bypass": {op: OpSequencerBypass, fn: func(b *GitBus, _ map[string]any) (any, error) {
+		return b.SequencerBypass()
+	}},
+	"sequencer_abort": {op: OpSequencerAbort, fn: func(b *GitBus, _ map[string]any) (any, error) {
+		return nil, b.SequencerAbort()
+	}},
+	"sequencer_status": {op: OpSequencerStatus, fn: func(b *GitBus, _ map[string]any) (any, error) {
+		return b.GetSequencerStatus(), nil
+	}},
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +361,25 @@ func strSlice(p map[string]any, key string) []string {
 		for _, elem := range v {
 			if s, ok := elem.(string); ok {
 				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func rebasePlanSlice(p map[string]any, key string) []RebasePlanEntry {
+	switch v := p[key].(type) {
+	case []RebasePlanEntry:
+		return v
+	case []any:
+		out := make([]RebasePlanEntry, 0, len(v))
+		for _, elem := range v {
+			if m, ok := elem.(map[string]any); ok {
+				out = append(out, RebasePlanEntry{
+					Action: RebaseAction(intVal(m, "action")),
+					Hash:   str(m, "hash"),
+				})
 			}
 		}
 		return out

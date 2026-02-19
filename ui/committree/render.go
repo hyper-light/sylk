@@ -1542,9 +1542,18 @@ var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarResetMixed: {icon: "⇠", label: "Mixed", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
 	toolbarResetSoft:  {icon: "⇜", label: "Soft", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	toolbarResetAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
-	toolbarRevert:      {icon: "↶", label: "Revert", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
-	toolbarRevertOk:    {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
-	toolbarRevertAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	toolbarRevert:          {icon: "↶", label: "Revert", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
+	toolbarRevertOk:        {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarRevertAbort:     {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	toolbarCherryPick:      {icon: "🍒", label: "Pick", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
+	toolbarCherryPickOk:    {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarCherryPickAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	toolbarRebase:          {icon: "⇄", label: "Rebase", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
+	toolbarConflictContinue: {icon: "▶", label: "Continue", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarConflictBypass:   {icon: "⏭", label: "Bypass", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
+	toolbarConflictAbort:    {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	toolbarRebasePlanOk:    {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
+	toolbarRebasePlanAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 }
 
 // toolbarCellWidths returns the visual width of each button cell.
@@ -1844,4 +1853,126 @@ func renderCreateInputToolbar(buttons []int, name string, cursor int, cursorVisi
 	}
 
 	return row1 + "\n" + row2
+}
+
+// =============================================================================
+// Rebase Plan View
+// =============================================================================
+
+// rebaseActionNames returns the short label for a rebase action.
+var rebaseActionNames = [...]string{"pick", "reword", "squash", "fixup", "edit", "drop"}
+
+// rebaseActionColors maps rebase action to color accessor.
+var rebaseActionColors = [...]func(theme.Palette) lipgloss.Color{
+	func(p theme.Palette) lipgloss.Color { return p.Primary },   // pick: blue
+	func(p theme.Palette) lipgloss.Color { return p.Warning },   // reword: yellow
+	func(p theme.Palette) lipgloss.Color { return p.Secondary }, // squash: mauve
+	func(p theme.Palette) lipgloss.Color { return p.Teal },      // fixup: teal
+	func(p theme.Palette) lipgloss.Color { return p.Peach },     // edit: peach
+	func(p theme.Palette) lipgloss.Color { return p.Error },     // drop: red
+}
+
+// viewRebasePlan renders the interactive rebase plan editor.
+func (m *Model) viewRebasePlan() string {
+	if len(m.rebasePlan) == 0 {
+		return ""
+	}
+
+	p := m.theme.Palette
+	ch := m.contentHeight()
+	var lines []string
+
+	// Header.
+	header := fmt.Sprintf(" Interactive rebase onto %s (%d commits)", m.rebaseOnto, len(m.rebasePlan))
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Foreground)
+	lines = append(lines, headerStyle.Render(header))
+	lines = append(lines, "")
+
+	for i, entry := range m.rebasePlan {
+		selected := i == m.rebaseCursor
+
+		// Determine visual connector for squash/fixup groups.
+		connector := "  "
+		if entry.action == 2 || entry.action == 3 { // squash or fixup
+			if i+1 < len(m.rebasePlan) && (m.rebasePlan[i+1].action == 2 || m.rebasePlan[i+1].action == 3) {
+				connector = "├ "
+			} else {
+				connector = "└ "
+			}
+		}
+
+		actionIdx := entry.action
+		if actionIdx >= len(rebaseActionNames) {
+			actionIdx = 0
+		}
+
+		actionLabel := rebaseActionNames[actionIdx]
+		actionColor := rebaseActionColors[actionIdx](p)
+		actionStyle := lipgloss.NewStyle().Foreground(actionColor).Width(8)
+
+		hashStyle := lipgloss.NewStyle().Foreground(p.Accent)
+		subjectStyle := lipgloss.NewStyle().Foreground(p.Foreground)
+
+		line := connector + actionStyle.Render(actionLabel) + " " +
+			hashStyle.Render(entry.hash) + " " +
+			subjectStyle.Render(truncateSubject(entry.subject, m.width-25))
+
+		if selected {
+			line = lipgloss.NewStyle().Bold(true).Reverse(true).Render(line)
+		}
+
+		lines = append(lines, line)
+	}
+
+	// Help text.
+	lines = append(lines, "")
+	help := " p:pick  r:reword  s:squash  f:fixup  e:edit  d:drop  J/K:move"
+	helpStyle := lipgloss.NewStyle().Foreground(p.Subtle)
+	lines = append(lines, helpStyle.Render(help))
+
+	// Pad to fill content height.
+	for len(lines) < ch {
+		lines = append(lines, "")
+	}
+	if len(lines) > ch {
+		lines = lines[:ch]
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// viewBranchPicker renders the branch picker dropdown overlay.
+func (m *Model) viewBranchPicker() string {
+	items := m.filteredBranchItems()
+	p := m.theme.Palette
+
+	maxVisible := min(8, len(items))
+	if maxVisible == 0 {
+		return lipgloss.NewStyle().Foreground(p.Subtle).Render(" (no matching branches)")
+	}
+
+	// Scroll window around cursor.
+	start := 0
+	if m.branchPickerCursor >= maxVisible {
+		start = m.branchPickerCursor - maxVisible + 1
+	}
+	end := min(start+maxVisible, len(items))
+
+	var lines []string
+	for i := start; i < end; i++ {
+		prefix := "  "
+		style := lipgloss.NewStyle().Foreground(p.Foreground)
+		if i == m.branchPickerCursor {
+			prefix = "▸ "
+			style = style.Bold(true).Foreground(p.Primary)
+		}
+		lines = append(lines, style.Render(prefix+items[i]))
+	}
+
+	if m.branchPickerFilter != "" {
+		filterLine := lipgloss.NewStyle().Foreground(p.Subtle).Render(" filter: " + m.branchPickerFilter)
+		lines = append([]string{filterLine}, lines...)
+	}
+
+	return strings.Join(lines, "\n")
 }

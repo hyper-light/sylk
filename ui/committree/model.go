@@ -1,6 +1,7 @@
 package committree
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -35,10 +36,19 @@ var (
 type viewMode int
 
 const (
-	viewBranches viewMode = iota // Branch tree (default).
-	viewLoading                  // Spinner while loading commits+stats.
-	viewCommits                  // Commit cards for a single branch.
+	viewBranches   viewMode = iota // Branch tree (default).
+	viewLoading                    // Spinner while loading commits+stats.
+	viewCommits                    // Commit cards for a single branch.
+	viewRebasePlan                 // Interactive rebase plan editor.
 )
+
+// rebasePlanEntry describes one entry in the interactive rebase plan editor.
+type rebasePlanEntry struct {
+	action  int    // Maps to git.RebaseAction constants (0=pick..5=drop).
+	hash    string // Short commit hash.
+	subject string // First line of commit message.
+	author  string // Author name.
+}
 
 // dagSection groups one trunk commit with its offshoot rows above it.
 // The trunk commit is on the first-parent chain; offshoots are commits
@@ -139,6 +149,15 @@ const (
 	toolbarRevert            // Commit view: revert selected commit.
 	toolbarRevertOk          // Revert mode: confirm revert.
 	toolbarRevertAbort       // Revert mode: cancel revert.
+	toolbarCherryPick        // Commit view: enter cherry-pick mode.
+	toolbarCherryPickOk      // Cherry-pick mode: confirm.
+	toolbarCherryPickAbort   // Cherry-pick mode: cancel.
+	toolbarRebase            // Commit view: enter interactive rebase.
+	toolbarConflictContinue  // Conflict mode: continue after resolution.
+	toolbarConflictBypass    // Conflict mode: bypass (commit as-is).
+	toolbarConflictAbort     // Conflict mode: abort operation.
+	toolbarRebasePlanOk      // Rebase plan: confirm plan.
+	toolbarRebasePlanAbort   // Rebase plan: cancel.
 )
 
 // CreateBranchRequestMsg is emitted when the user confirms a branch name
@@ -206,6 +225,34 @@ type CommitCheckoutRequestMsg struct {
 type RevertRequestMsg struct {
 	Hash string
 }
+
+// CherryPickRequestMsg is emitted when the user confirms cherry-pick.
+type CherryPickRequestMsg struct {
+	Hashes       []string
+	TargetBranch string
+}
+
+// RebaseStartMsg is emitted when the user confirms an interactive rebase plan.
+type RebaseStartMsg struct {
+	OntoBranch string
+	Plan       []RebasePlanItem
+}
+
+// RebasePlanItem describes one step in the interactive rebase plan.
+type RebasePlanItem struct {
+	Action  int    // Maps to git.RebaseAction
+	Hash    string
+	Subject string
+}
+
+// SequencerContinueMsg requests the app continue the sequencer.
+type SequencerContinueMsg struct{}
+
+// SequencerBypassMsg requests the app bypass the current conflict.
+type SequencerBypassMsg struct{}
+
+// SequencerAbortMsg requests the app abort the sequencer.
+type SequencerAbortMsg struct{}
 
 // ---------------------------------------------------------------------------
 // Model
@@ -306,6 +353,29 @@ type Model struct {
 
 	// Revert mode state.
 	revertMode bool
+
+	// Cherry-pick mode state.
+	cherryPickMode       bool
+	cherryPickSelections []diffSelection
+	cherryPickTarget     string // Selected target branch name.
+	branchPickerActive   bool   // Target branch dropdown open.
+	branchPickerCursor   int
+	branchPickerItems    []string // Available branch names.
+	branchPickerFilter   string   // Typing filter for branch picker.
+
+	// Conflict resolution mode state.
+	conflictMode    bool
+	conflictOp      int // SequencerOp that caused the conflict.
+	conflictTotal   int
+	conflictCurrent int
+	conflictSubject string   // Subject of the conflicting commit.
+	conflictFiles   []string // Paths with conflicts.
+	conflictResolved map[string]bool // path → resolved.
+
+	// Interactive rebase plan state.
+	rebasePlan       []rebasePlanEntry
+	rebaseCursor     int
+	rebaseOnto       string // Target branch name for rebase.
 
 	// Toolbar state.
 	toolbarFocused bool // True when tab-focus is on the toolbar, not card actions.
@@ -1321,10 +1391,18 @@ func (m *Model) View(cursorVisible bool) string {
 		content = m.viewLoadingSpinner()
 	case viewCommits:
 		content = m.viewCommitCards()
+	case viewRebasePlan:
+		content = m.viewRebasePlan()
 	default:
 		content = m.viewBranchTree(cursorVisible)
 	}
-	return content + "\n" + m.toolbarView(cursorVisible)
+
+	toolbar := m.toolbarView(cursorVisible)
+	if m.branchPickerActive {
+		toolbar = m.viewBranchPicker() + "\n" + toolbar
+	}
+
+	return content + "\n" + toolbar
 }
 
 // toolbarView renders the bottom toolbar bar with mode-aware buttons.
@@ -1332,7 +1410,9 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 	if m.createInputActive {
 		return renderCreateInputToolbar(m.toolbarButtons(), m.createBranchName, m.createCursor, cursorVisible, m.width, m.theme.Palette)
 	}
-	if m.diffMode || m.mergeMode || m.resetMode || m.revertMode {
+	hasLeftButtons := m.diffMode || m.mergeMode || m.resetMode || m.revertMode ||
+		m.cherryPickMode || m.conflictMode || m.mode == viewRebasePlan
+	if hasLeftButtons {
 		left := m.diffToolbarLeftButtons()
 		right := m.toolbarButtons()
 		hint := ""
@@ -1344,6 +1424,12 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 			} else {
 				hint = "Select 2+ commits to diff"
 			}
+		}
+		if m.cherryPickMode && len(left) > 0 {
+			hint = fmt.Sprintf("%d selected", len(m.cherryPickSelections))
+		}
+		if m.conflictMode {
+			hint = fmt.Sprintf("Step %d/%d: %s", m.conflictCurrent+1, m.conflictTotal, m.conflictSubject)
 		}
 		return renderDiffToolbar(left, right, m.toolbarAction, m.toolbarFocused,
 			m.hoverButtonIdx, m.toolbarActiveIdx(), hint, m.width, m.theme.Palette)
@@ -1360,7 +1446,7 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 // button, or -1 if none. Diff and Merge buttons support toggle state.
 // The index is offset by the left button count.
 func (m *Model) toolbarActiveIdx() int {
-	if !m.diffMode && !m.mergeMode && !m.resetMode && !m.revertMode {
+	if !m.diffMode && !m.mergeMode && !m.resetMode && !m.revertMode && !m.cherryPickMode {
 		return -1
 	}
 	leftCount := len(m.diffToolbarLeftButtons())
@@ -1373,6 +1459,9 @@ func (m *Model) toolbarActiveIdx() int {
 	}
 	if m.revertMode {
 		target = toolbarRevert
+	}
+	if m.cherryPickMode {
+		target = toolbarCherryPick
 	}
 	for i, id := range m.toolbarButtons() {
 		if id == target {
@@ -1818,6 +1907,8 @@ func (m *Model) handleKey(km tea.KeyMsg) tea.Cmd {
 		return nil
 	case viewCommits:
 		return m.handleCommitKey(km)
+	case viewRebasePlan:
+		return m.handleRebasePlanKey(km)
 	default:
 		return m.handleBranchKey(km)
 	}
@@ -2346,6 +2437,14 @@ func (m *Model) isToolbarButtonEnabled(buttonID int) bool {
 	case toolbarReset, toolbarResetHard, toolbarResetMixed, toolbarResetSoft,
 		toolbarRevert, toolbarRevertOk:
 		return !m.workingConflicts
+	case toolbarCherryPick:
+		return !m.workingConflicts
+	case toolbarCherryPickOk:
+		return len(m.cherryPickSelections) > 0
+	case toolbarConflictContinue:
+		return m.AllConflictsResolved()
+	case toolbarRebase:
+		return !m.workingConflicts
 	}
 	return true
 }
@@ -2687,6 +2786,49 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 			return nil
 		}
 		return func() tea.Msg { return PushBranchMsg{Name: name} }
+
+	case toolbarCherryPick:
+		if m.cherryPickMode {
+			m.exitCherryPickMode()
+		} else {
+			m.enterCherryPickMode()
+		}
+		return nil
+	case toolbarCherryPickOk:
+		if m.branchPickerActive {
+			// Branch picker is open — confirm selection happens via branch picker keys.
+			return nil
+		}
+		// Open branch picker.
+		m.openBranchPicker()
+		return nil
+	case toolbarCherryPickAbort:
+		m.exitCherryPickMode()
+		return nil
+
+	case toolbarRebase:
+		// Open branch picker for rebase onto target.
+		m.openBranchPicker()
+		return nil
+
+	case toolbarConflictContinue:
+		return func() tea.Msg { return SequencerContinueMsg{} }
+	case toolbarConflictBypass:
+		return func() tea.Msg { return SequencerBypassMsg{} }
+	case toolbarConflictAbort:
+		return func() tea.Msg { return SequencerAbortMsg{} }
+
+	case toolbarRebasePlanOk:
+		plan := make([]RebasePlanItem, len(m.rebasePlan))
+		for i, e := range m.rebasePlan {
+			plan[i] = RebasePlanItem{Action: e.action, Hash: e.hash, Subject: e.subject}
+		}
+		onto := m.rebaseOnto
+		m.ExitRebasePlan()
+		return func() tea.Msg { return RebaseStartMsg{OntoBranch: onto, Plan: plan} }
+	case toolbarRebasePlanAbort:
+		m.ExitRebasePlan()
+		return nil
 	}
 	return nil
 }
@@ -2759,6 +2901,14 @@ func (m *Model) moveBranchLeft() {
 func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 	// Esc exits the active mode before returning to branches.
 	if km.String() == "esc" {
+		if m.branchPickerActive {
+			m.closeBranchPicker()
+			return nil
+		}
+		if m.cherryPickMode {
+			m.exitCherryPickMode()
+			return nil
+		}
 		if m.revertMode {
 			m.exitRevertMode()
 			return nil
@@ -2775,8 +2925,22 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
+	// Branch picker handles its own keys when active.
+	if m.branchPickerActive {
+		return m.handleBranchPickerKey(km)
+	}
+
 	if len(m.nodes) == 0 {
 		return nil
+	}
+
+	// In cherry-pick mode, Enter/Space toggle selection.
+	if m.cherryPickMode && !m.toolbarFocused {
+		switch km.String() {
+		case "enter", " ":
+			m.toggleCherryPickSelection()
+			return nil
+		}
 	}
 
 	// In diff mode, Enter/Space toggle the current commit's selection.
@@ -3061,6 +3225,336 @@ func (m *Model) exitRevertMode() {
 	m.revertMode = false
 	m.toolbarFocused = false
 	m.viewDirty = true
+}
+
+// enterCherryPickMode activates cherry-pick selection mode, adding the
+// current commit as the first selection.
+func (m *Model) enterCherryPickMode() {
+	m.cherryPickMode = true
+	m.cherryPickSelections = m.cherryPickSelections[:0]
+	if hash := m.SelectedHash(); hash != "" {
+		m.cherryPickSelections = append(m.cherryPickSelections, diffSelection{
+			hash:    hash,
+			nodeIdx: m.selectedIdx,
+		})
+	}
+	m.toolbarFocused = false
+	m.invalidateNodeCache()
+	m.invalidateCommitCardCache()
+	m.viewDirty = true
+}
+
+// exitCherryPickMode deactivates cherry-pick mode and clears state.
+func (m *Model) exitCherryPickMode() {
+	if len(m.cherryPickSelections) > 0 {
+		m.selectedIdx = m.cherryPickSelections[0].nodeIdx
+		m.restoreDAGSelection()
+	}
+	m.cherryPickMode = false
+	m.cherryPickSelections = m.cherryPickSelections[:0]
+	m.cherryPickTarget = ""
+	m.branchPickerActive = false
+	m.branchPickerFilter = ""
+	m.toolbarFocused = false
+	m.invalidateNodeCache()
+	m.invalidateCommitCardCache()
+	m.ensureVisible()
+	m.viewDirty = true
+}
+
+// toggleCherryPickSelection adds or removes the current commit from cherry-pick.
+func (m *Model) toggleCherryPickSelection() {
+	hash := m.SelectedHash()
+	if hash == "" {
+		return
+	}
+	for i, ds := range m.cherryPickSelections {
+		if ds.hash == hash {
+			m.cherryPickSelections = append(m.cherryPickSelections[:i], m.cherryPickSelections[i+1:]...)
+			if len(m.cherryPickSelections) == 0 {
+				m.exitCherryPickMode()
+			}
+			m.invalidateNodeCache()
+			m.invalidateCommitCardCache()
+			m.viewDirty = true
+			return
+		}
+	}
+	if len(m.cherryPickSelections) >= len(diffSelectionColors) {
+		return
+	}
+	m.cherryPickSelections = append(m.cherryPickSelections, diffSelection{
+		hash:    hash,
+		nodeIdx: m.selectedIdx,
+	})
+	m.invalidateNodeCache()
+	m.invalidateCommitCardCache()
+	m.viewDirty = true
+}
+
+// CherryPickSelections returns the hashes of cherry-pick-selected commits.
+func (m *Model) CherryPickSelections() []string {
+	hashes := make([]string, len(m.cherryPickSelections))
+	for i, ds := range m.cherryPickSelections {
+		hashes[i] = ds.hash
+	}
+	return hashes
+}
+
+// SetBranchPickerItems sets the available branches for the picker.
+func (m *Model) SetBranchPickerItems(items []string) {
+	m.branchPickerItems = items
+}
+
+// openBranchPicker opens the branch picker dropdown.
+func (m *Model) openBranchPicker() {
+	m.branchPickerActive = true
+	m.branchPickerCursor = 0
+	m.branchPickerFilter = ""
+	m.viewDirty = true
+}
+
+// closeBranchPicker closes the branch picker dropdown.
+func (m *Model) closeBranchPicker() {
+	m.branchPickerActive = false
+	m.branchPickerFilter = ""
+	m.viewDirty = true
+}
+
+// filteredBranchItems returns branches matching the current filter.
+func (m *Model) filteredBranchItems() []string {
+	if m.branchPickerFilter == "" {
+		return m.branchPickerItems
+	}
+	filter := strings.ToLower(m.branchPickerFilter)
+	var filtered []string
+	for _, name := range m.branchPickerItems {
+		if strings.Contains(strings.ToLower(name), filter) {
+			filtered = append(filtered, name)
+		}
+	}
+	return filtered
+}
+
+// EnterConflictMode enters conflict resolution mode with the given state.
+func (m *Model) EnterConflictMode(op, total, current int, subject string, files []string) {
+	m.conflictMode = true
+	m.conflictOp = op
+	m.conflictTotal = total
+	m.conflictCurrent = current
+	m.conflictSubject = subject
+	m.conflictFiles = files
+	m.conflictResolved = make(map[string]bool, len(files))
+	m.toolbarFocused = false
+	m.viewDirty = true
+}
+
+// ExitConflictMode leaves conflict resolution mode.
+func (m *Model) ExitConflictMode() {
+	m.conflictMode = false
+	m.conflictFiles = nil
+	m.conflictResolved = nil
+	m.toolbarFocused = false
+	m.viewDirty = true
+}
+
+// MarkConflictResolved marks a file as resolved in conflict mode.
+func (m *Model) MarkConflictResolved(path string) {
+	if m.conflictResolved != nil {
+		m.conflictResolved[path] = true
+		m.viewDirty = true
+	}
+}
+
+// AllConflictsResolved reports whether all conflict files are resolved.
+func (m *Model) AllConflictsResolved() bool {
+	for _, f := range m.conflictFiles {
+		if !m.conflictResolved[f] {
+			return false
+		}
+	}
+	return true
+}
+
+// InConflictMode reports whether the model is in conflict resolution mode.
+func (m *Model) InConflictMode() bool {
+	return m.conflictMode
+}
+
+// EnterRebasePlan sets up the interactive rebase plan editor.
+func (m *Model) EnterRebasePlan(onto string, entries []rebasePlanEntry) {
+	m.mode = viewRebasePlan
+	m.rebaseOnto = onto
+	m.rebasePlan = entries
+	m.rebaseCursor = 0
+	m.toolbarFocused = false
+	m.viewDirty = true
+}
+
+// ExitRebasePlan returns to the commit view.
+func (m *Model) ExitRebasePlan() {
+	m.mode = viewCommits
+	m.rebasePlan = nil
+	m.rebaseCursor = 0
+	m.rebaseOnto = ""
+	m.toolbarFocused = false
+	m.viewDirty = true
+}
+
+// handleBranchPickerKey processes keys when the branch picker dropdown is open.
+func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
+	items := m.filteredBranchItems()
+
+	switch km.String() {
+	case "j", "down":
+		if m.branchPickerCursor < len(items)-1 {
+			m.branchPickerCursor++
+		}
+		m.viewDirty = true
+		return nil
+	case "k", "up":
+		if m.branchPickerCursor > 0 {
+			m.branchPickerCursor--
+		}
+		m.viewDirty = true
+		return nil
+	case "enter":
+		if len(items) == 0 {
+			return nil
+		}
+		selected := items[m.branchPickerCursor]
+		m.closeBranchPicker()
+
+		if m.cherryPickMode {
+			// Confirm cherry-pick with selected branch.
+			hashes := m.CherryPickSelections()
+			m.exitCherryPickMode()
+			return func() tea.Msg {
+				return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
+			}
+		}
+
+		// Rebase: generate default plan and enter plan view.
+		plan := make([]rebasePlanEntry, len(m.nodes))
+		for i, n := range m.nodes {
+			plan[i] = rebasePlanEntry{
+				action:  0, // Pick
+				hash:    n.Hash[:min(len(n.Hash), 7)],
+				subject: n.Subject,
+				author:  n.Author,
+			}
+		}
+		m.EnterRebasePlan(selected, plan)
+		return nil
+
+	case "backspace":
+		if len(m.branchPickerFilter) > 0 {
+			m.branchPickerFilter = m.branchPickerFilter[:len(m.branchPickerFilter)-1]
+			m.branchPickerCursor = 0
+			m.viewDirty = true
+		}
+		return nil
+	default:
+		if len(km.String()) == 1 && km.String()[0] >= ' ' {
+			m.branchPickerFilter += km.String()
+			m.branchPickerCursor = 0
+			m.viewDirty = true
+		}
+		return nil
+	}
+}
+
+// handleRebasePlanKey processes keys in the interactive rebase plan editor.
+func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
+	if len(m.rebasePlan) == 0 {
+		return nil
+	}
+
+	switch km.String() {
+	case "esc":
+		m.ExitRebasePlan()
+		return nil
+	case "j", "down":
+		if m.rebaseCursor < len(m.rebasePlan)-1 {
+			m.rebaseCursor++
+			m.viewDirty = true
+		}
+		return nil
+	case "k", "up":
+		if m.rebaseCursor > 0 {
+			m.rebaseCursor--
+			m.viewDirty = true
+		}
+		return nil
+	case "J":
+		if m.rebaseCursor < len(m.rebasePlan)-1 {
+			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor+1] =
+				m.rebasePlan[m.rebaseCursor+1], m.rebasePlan[m.rebaseCursor]
+			m.rebaseCursor++
+			m.viewDirty = true
+		}
+		return nil
+	case "K":
+		if m.rebaseCursor > 0 {
+			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor-1] =
+				m.rebasePlan[m.rebaseCursor-1], m.rebasePlan[m.rebaseCursor]
+			m.rebaseCursor--
+			m.viewDirty = true
+		}
+		return nil
+	case "p":
+		m.rebasePlan[m.rebaseCursor].action = 0 // Pick
+		m.viewDirty = true
+		return nil
+	case "r":
+		m.rebasePlan[m.rebaseCursor].action = 1 // Reword
+		m.viewDirty = true
+		return nil
+	case "s":
+		m.rebasePlan[m.rebaseCursor].action = 2 // Squash
+		m.viewDirty = true
+		return nil
+	case "f":
+		m.rebasePlan[m.rebaseCursor].action = 3 // Fixup
+		m.viewDirty = true
+		return nil
+	case "e":
+		m.rebasePlan[m.rebaseCursor].action = 4 // Edit
+		m.viewDirty = true
+		return nil
+	case "d":
+		m.rebasePlan[m.rebaseCursor].action = 5 // Drop
+		m.viewDirty = true
+		return nil
+	case "tab":
+		m.cycleCommitToolbar(1)
+		m.viewDirty = true
+		return nil
+	case "shift+tab":
+		m.cycleCommitToolbar(-1)
+		m.viewDirty = true
+		return nil
+	case "enter", " ":
+		if m.toolbarFocused {
+			m.viewDirty = true
+			return m.executeToolbarAction()
+		}
+		return nil
+	}
+	return nil
+}
+
+// cherryPickOverlayFor returns the overlay state for a commit in cherry-pick mode.
+func (m *Model) cherryPickOverlayFor(hash string) diffOverlay {
+	if !m.cherryPickMode {
+		return diffOverlay{}
+	}
+	for i, ds := range m.cherryPickSelections {
+		if ds.hash == hash {
+			return diffOverlay{active: true, idx: i}
+		}
+	}
+	return diffOverlay{}
 }
 
 // toggleDiffSelection adds or removes the currently selected commit from
@@ -3462,11 +3956,16 @@ func (m *Model) viewTopPad() int {
 // toolbarButtons returns the toolbar button IDs for the current view mode.
 // In diff mode these are the right-side buttons only.
 func (m *Model) toolbarButtons() []int {
+	if m.conflictMode {
+		return nil // Conflict mode uses left buttons only.
+	}
 	switch m.mode {
 	case viewBranches:
 		return []int{toolbarCreate, toolbarMerge, toolbarPull, toolbarPush, toolbarDiff}
 	case viewCommits:
-		return []int{toolbarBack, toolbarReset, toolbarRevert, toolbarDiff}
+		return []int{toolbarBack, toolbarReset, toolbarRevert, toolbarCherryPick, toolbarRebase, toolbarDiff}
+	case viewRebasePlan:
+		return nil // Rebase plan uses left buttons only.
 	default:
 		return nil
 	}
@@ -3477,6 +3976,15 @@ func (m *Model) toolbarButtons() []int {
 // In merge mode, shows ok/abort when selections are complete.
 // In diff mode, shows ok/cancel when 2+ commits are selected.
 func (m *Model) diffToolbarLeftButtons() []int {
+	if m.conflictMode {
+		return []int{toolbarConflictContinue, toolbarConflictBypass, toolbarConflictAbort}
+	}
+	if m.mode == viewRebasePlan {
+		return []int{toolbarRebasePlanOk, toolbarRebasePlanAbort}
+	}
+	if m.cherryPickMode {
+		return []int{toolbarCherryPickOk, toolbarCherryPickAbort}
+	}
 	if m.resetMode {
 		return []int{toolbarResetHard, toolbarResetMixed, toolbarResetSoft, toolbarResetAbort}
 	}

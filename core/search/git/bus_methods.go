@@ -355,3 +355,42 @@ func (b *GitBus) Revert(commitHash string) error {
 	return dispatchVoid(b, OpRevert, commitHash,
 		func() error { return b.client.Revert(commitHash) })
 }
+
+// ---------------------------------------------------------------------------
+// Sequencer operations
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) CherryPickSequence(hashes []string, targetBranch string) (*SequencerStatus, error) {
+	return dispatch(b, OpCherryPickSequence, [2]any{hashes, targetBranch},
+		func() (*SequencerStatus, error) { return b.client.CherryPickSequence(hashes, targetBranch) })
+}
+
+func (b *GitBus) RebaseInteractive(ontoBranch string, plan []RebasePlanEntry) (*SequencerStatus, error) {
+	return dispatch(b, OpRebaseInteractive, [2]any{ontoBranch, plan},
+		func() (*SequencerStatus, error) { return b.client.RebaseInteractive(ontoBranch, plan) })
+}
+
+func (b *GitBus) MergeSequence(sourceBranch, targetBranch string) (*SequencerStatus, error) {
+	return dispatch(b, OpMergeSequence, [2]string{sourceBranch, targetBranch},
+		func() (*SequencerStatus, error) { return b.client.MergeSequence(sourceBranch, targetBranch) })
+}
+
+func (b *GitBus) SequencerContinue() (*SequencerStatus, error) {
+	return dispatch(b, OpSequencerContinue, nil,
+		func() (*SequencerStatus, error) { return b.client.SequencerContinue() })
+}
+
+func (b *GitBus) SequencerBypass() (*SequencerStatus, error) {
+	return dispatch(b, OpSequencerBypass, nil,
+		func() (*SequencerStatus, error) { return b.client.SequencerBypass() })
+}
+
+func (b *GitBus) SequencerAbort() error {
+	return dispatchVoid(b, OpSequencerAbort, nil,
+		func() error { return b.client.SequencerAbort() })
+}
+
+func (b *GitBus) GetSequencerStatus() *SequencerStatus {
+	return dispatchPure(b, OpSequencerStatus, nil,
+		func() *SequencerStatus { return b.client.GetSequencerStatus() })
+}
