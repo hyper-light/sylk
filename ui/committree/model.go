@@ -3464,15 +3464,12 @@ func (m *Model) EnterRebasePlan(onto string, entries []rebasePlanEntry) {
 	m.rebasePlan = entries
 	m.rebaseCursor = 0
 	m.rebaseSelAnchor = -1
-<<<<<<<<< ours
 	m.rebasePlanScroll = 0
 	m.rebaseFilterActive = false
 	m.rebaseFilterQuery = m.rebaseFilterQuery[:0]
 	m.rebaseFiltered = nil
 	m.rebaseSortCol = -1
 	m.rebaseSortDir = 0
-=========
->>>>>>>>> theirs
 	m.toolbarFocused = false
 	m.viewDirty = true
 }
@@ -3483,15 +3480,12 @@ func (m *Model) ExitRebasePlan() {
 	m.rebasePlan = nil
 	m.rebaseCursor = 0
 	m.rebaseSelAnchor = -1
-<<<<<<<<< ours
 	m.rebasePlanScroll = 0
 	m.rebaseFilterActive = false
 	m.rebaseFilterQuery = m.rebaseFilterQuery[:0]
 	m.rebaseFiltered = nil
 	m.rebaseSortCol = -1
 	m.rebaseSortDir = 0
-=========
->>>>>>>>> theirs
 	m.rebaseOnto = ""
 	m.toolbarFocused = false
 	m.viewDirty = true
@@ -3671,49 +3665,30 @@ func (m *Model) rebaseSelRange() (int, int) {
 }
 
 // setRebaseAction sets the action for all entries in the current selection.
-<<<<<<<<< ours
 // Translates visible indices to original plan indices when a filter is active.
-=========
->>>>>>>>> theirs
 func (m *Model) setRebaseAction(action int) {
 	lo, hi := m.rebaseSelRange()
 	for i := lo; i <= hi; i++ {
-<<<<<<<<< ours
 		m.rebasePlan[m.rebaseOrigIdx(i)].action = action
-=========
-		m.rebasePlan[i].action = action
->>>>>>>>> theirs
 	}
 	m.viewDirty = true
 }
 
-<<<<<<<<< ours
 // cycleRebaseAction cycles the action for all selected entries uniformly.
 // The topmost selected entry's action is cycled by delta, and the resulting
 // action is applied to every entry in the selection so mixed-status ranges
 // converge to a single action.
-=========
-// cycleRebaseAction cycles the action forward or backward for all selected entries.
->>>>>>>>> theirs
 func (m *Model) cycleRebaseAction(delta int) {
 	lo, hi := m.rebaseSelRange()
 	n := len(rebaseActionNames)
-<<<<<<<<< ours
 	base := m.rebasePlan[m.rebaseOrigIdx(lo)].action
 	next := (base + delta + n) % n
-=========
->>>>>>>>> theirs
 	for i := lo; i <= hi; i++ {
-<<<<<<<<< ours
 		m.rebasePlan[m.rebaseOrigIdx(i)].action = next
-=========
-		m.rebasePlan[i].action = (m.rebasePlan[i].action + delta + n) % n
->>>>>>>>> theirs
 	}
 	m.viewDirty = true
 }
 
-<<<<<<<<< ours
 // rebaseVisibleLen returns the number of currently visible rebase entries.
 func (m *Model) rebaseVisibleLen() int {
 	if m.rebaseFiltered != nil {
@@ -3862,8 +3837,6 @@ func (m *Model) deactivateRebaseFilter() {
 	m.viewDirty = true
 }
 
-=========
->>>>>>>>> theirs
 // handleRebasePlanKey processes keys in the interactive rebase plan editor.
 func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 	if len(m.rebasePlan) == 0 {
@@ -3880,7 +3853,6 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 
 	switch ks {
 	case "esc":
-<<<<<<<<< ours
 		// Layered escape: toolbar → filter → multi-select → exit.
 		if m.toolbarFocused {
 			m.toolbarFocused = false
@@ -3891,8 +3863,6 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 			m.deactivateRebaseFilter()
 			return nil
 		}
-=========
->>>>>>>>> theirs
 		if m.rebaseSelAnchor >= 0 {
 			m.rebaseSelAnchor = -1
 			m.viewDirty = true
@@ -3904,17 +3874,12 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseSelAnchor < 0 {
 			m.rebaseSelAnchor = m.rebaseCursor
 		}
-<<<<<<<<< ours
+
 		if m.rebaseCursor < n-1 {
-=========
-		if m.rebaseCursor < len(m.rebasePlan)-1 {
->>>>>>>>> theirs
 			m.rebaseCursor++
 		}
-<<<<<<<<< ours
+
 		m.ensureRebaseCursorVisible()
-=========
->>>>>>>>> theirs
 		m.viewDirty = true
 		return nil
 	case "shift+up":
@@ -3924,25 +3889,16 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseCursor > 0 {
 			m.rebaseCursor--
 		}
-<<<<<<<<< ours
+
 		m.ensureRebaseCursorVisible()
-=========
->>>>>>>>> theirs
 		m.viewDirty = true
 		return nil
 	case "j", "down":
 		m.rebaseSelAnchor = -1
-<<<<<<<<< ours
 		if m.rebaseCursor < n-1 {
-=========
-		if m.rebaseCursor < len(m.rebasePlan)-1 {
->>>>>>>>> theirs
 			m.rebaseCursor++
 		}
-<<<<<<<<< ours
 		m.ensureRebaseCursorVisible()
-=========
->>>>>>>>> theirs
 		m.viewDirty = true
 		return nil
 	case "k", "up":
@@ -3950,26 +3906,17 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseCursor > 0 {
 			m.rebaseCursor--
 		}
-<<<<<<<<< ours
 		m.ensureRebaseCursorVisible()
-=========
->>>>>>>>> theirs
 		m.viewDirty = true
 		return nil
 	case "J":
-<<<<<<<<< ours
 		// Reorder disabled when filter/sort is active.
 		if m.rebaseFiltered != nil {
 			return nil
 		}
-=========
->>>>>>>>> theirs
 		m.rebaseSelAnchor = -1
-<<<<<<<<< ours
 		if m.rebaseCursor < n-1 {
-=========
-		if m.rebaseCursor < len(m.rebasePlan)-1 {
->>>>>>>>> theirs
+
 			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor+1] =
 				m.rebasePlan[m.rebaseCursor+1], m.rebasePlan[m.rebaseCursor]
 			m.rebaseCursor++
@@ -3978,12 +3925,9 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	case "K":
-<<<<<<<<< ours
 		if m.rebaseFiltered != nil {
 			return nil
 		}
-=========
->>>>>>>>> theirs
 		m.rebaseSelAnchor = -1
 		if m.rebaseCursor > 0 {
 			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor-1] =
@@ -4020,14 +3964,11 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		return nil
 	case "h", "left":
 		m.cycleRebaseAction(-1)
-<<<<<<<<< ours
 		return nil
 	case "/", "alt+f":
 		m.rebaseFilterActive = true
 		m.toolbarFocused = false
 		m.viewDirty = true
-=========
->>>>>>>>> theirs
 		return nil
 	case "tab":
 		m.cycleCommitToolbar(1)
@@ -4041,7 +3982,6 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-<<<<<<<<< ours
 // handleRebaseFilterKey processes keys when the rebase plan filter input
 // is active. Matches the gitpanel filter pattern: Esc clears and deactivates,
 // Enter keeps the filter and returns focus to entries, Backspace on empty
@@ -4050,15 +3990,6 @@ func (m *Model) handleRebaseFilterKey(km tea.KeyMsg) tea.Cmd {
 	switch km.String() {
 	case "esc":
 		m.deactivateRebaseFilter()
-=========
-// clickRebasePlanView handles clicks on the rebase plan. Clicking an entry
-// within the selection cycles actions for all selected; clicking outside
-// selects the clicked entry and clears multi-select.
-func (m *Model) clickRebasePlanView(viewY int) tea.Cmd {
-	// Layout: header(1) + blank(1) + entries.
-	idx := viewY - 2
-	if idx < 0 || idx >= len(m.rebasePlan) {
->>>>>>>>> theirs
 		return nil
 	case "enter", "down":
 		m.rebaseFilterActive = false
@@ -4094,7 +4025,6 @@ func (m *Model) clickRebasePlanView(viewY int) tea.Cmd {
 		}
 		return nil
 	}
-<<<<<<<<< ours
 }
 
 // clickRebasePlanView handles clicks on the rebase plan.
@@ -4123,18 +4053,13 @@ func (m *Model) clickRebasePlanView(viewX, viewY int) tea.Cmd {
 	if idx >= m.rebaseVisibleLen() {
 		return nil
 	}
-=========
->>>>>>>>> theirs
 	lo, hi := m.rebaseSelRange()
 	if idx >= lo && idx <= hi {
 		m.cycleRebaseAction(1)
 	} else {
 		m.rebaseSelAnchor = -1
 		m.rebaseCursor = idx
-<<<<<<<<< ours
 		m.ensureRebaseCursorVisible()
-=========
->>>>>>>>> theirs
 		m.viewDirty = true
 	}
 	return nil

@@ -1945,18 +1945,11 @@ func (m *Model) viewRebasePlan() string {
 	selLo, selHi := m.rebaseSelRange()
 	hasMultiSel := m.rebaseSelAnchor >= 0
 
-<<<<<<<<< ours
 	visLen := m.rebaseVisibleLen()
 	visRows := m.rebaseContentRows()
 	scrollEnd := min(m.rebasePlanScroll+visRows, visLen)
 	subjectW := m.rebaseSubjectW()
-=========
-	for i, entry := range m.rebasePlan {
-		isCursor := i == m.rebaseCursor
-		inSelection := hasMultiSel && i >= selLo && i <= selHi
->>>>>>>>> theirs
 
-<<<<<<<<< ours
 	for vi := m.rebasePlanScroll; vi < scrollEnd; vi++ {
 		origIdx := m.rebaseOrigIdx(vi)
 		entry := m.rebasePlan[origIdx]
@@ -1964,22 +1957,12 @@ func (m *Model) viewRebasePlan() string {
 		isCursor := vi == m.rebaseCursor
 		inSelection := hasMultiSel && vi >= selLo && vi <= selHi
 
-=========
->>>>>>>>> theirs
 		// Cursor arrow, selection bar, or blank prefix.
 		prefix := "  "
 		if isCursor {
-<<<<<<<<< ours
 			prefix = arrowStyle.Render("\u25b8") + " " // ▸
-=========
-			prefix = arrowStyle.Render("▸") + " "
->>>>>>>>> theirs
 		} else if inSelection {
-<<<<<<<<< ours
 			prefix = arrowStyle.Render("\u2502") + " " // │
-=========
-			prefix = arrowStyle.Render("│") + " "
->>>>>>>>> theirs
 		}
 
 		actionIdx := entry.action
@@ -2004,16 +1987,7 @@ func (m *Model) viewRebasePlan() string {
 		line := prefix + actionCell + sepStr + hashCell + sepStr + subjectCell
 		lines = append(lines, line)
 	}
-
-<<<<<<<<< ours
-=========
-	// Help text.
-	lines = append(lines, "")
-	help := " p:pick  r:reword  s:squash  f:fixup  e:edit  d:drop  J/K:move  Shift+↑↓:select"
-	helpStyle := lipgloss.NewStyle().Foreground(p.Subtle)
-	lines = append(lines, helpStyle.Render(help))
-
->>>>>>>>> theirs
+	
 	// Pad to fill content height.
 	for len(lines) < ch {
 		lines = append(lines, "")
