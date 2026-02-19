@@ -542,6 +542,9 @@ func buildBranchCard(b BranchNode, selected bool, innerWidth int, p theme.Palett
 // visibleActions returns the ordered action IDs for a branch card.
 // HEAD shows [Commit]; default shows [Switch]; others show [Switch, Delete].
 func visibleActions(b BranchNode, defaultBranch string) []int {
+	if b.IsDetached {
+		return nil // No card actions for detached HEAD.
+	}
 	if b.IsHead {
 		return []int{branchActionCommit}
 	}
@@ -1290,20 +1293,28 @@ func layoutLine(left, right string, width int) string {
 func buildBranchHeaderLine(b BranchNode, availWidth int, p theme.Palette, wt workingTreeState) string {
 	markerStyle := lipgloss.NewStyle().Foreground(p.Muted)
 	if b.IsHead {
+		headColor := p.Primary
+		if b.IsDetached {
+			headColor = p.Warning
+		}
 		switch {
 		case wt.conflicts:
 			markerStyle = lipgloss.NewStyle().Foreground(p.Error).Bold(true)
 		case wt.dirty:
 			markerStyle = lipgloss.NewStyle().Foreground(p.Warning).Bold(true)
 		default:
-			markerStyle = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+			markerStyle = lipgloss.NewStyle().Foreground(headColor).Bold(true)
 		}
 	}
 	marker := markerStyle.Render(commitMarker)
 
 	nameStyle := lipgloss.NewStyle().Foreground(p.Foreground).Bold(true)
 	if b.IsHead {
-		nameStyle = nameStyle.Foreground(p.Primary)
+		color := p.Primary
+		if b.IsDetached {
+			color = p.Warning
+		}
+		nameStyle = nameStyle.Foreground(color)
 	}
 	name := nameStyle.Render(b.Name)
 
@@ -1941,27 +1952,49 @@ func (m *Model) viewRebasePlan() string {
 	return strings.Join(lines, "\n")
 }
 
-// viewBranchPicker renders the branch picker dropdown overlay.
+// viewBranchPicker renders a full-window branch list for target selection.
 func (m *Model) viewBranchPicker() string {
 	items := m.filteredBranchItems()
 	p := m.theme.Palette
 
-	maxVisible := min(8, len(items))
-	if maxVisible == 0 {
-		return lipgloss.NewStyle().Foreground(p.Subtle).Render(" (no matching branches)")
+	// Title.
+	title := "Select Target Branch"
+	if m.cherryPickMode {
+		title = "Cherry-Pick Target Branch"
 	}
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Primary).Padding(0, 1)
+
+	// Filter indicator.
+	var header []string
+	header = append(header, titleStyle.Render(title))
+	if m.branchPickerFilter != "" {
+		filterStyle := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 1)
+		header = append(header, filterStyle.Render("filter: "+m.branchPickerFilter))
+	}
+	header = append(header, "") // blank separator line
+
+	if len(items) == 0 {
+		empty := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 2).Render("(no matching branches)")
+		header = append(header, empty)
+		return strings.Join(header, "\n")
+	}
+
+	// Available height for the branch list (reserve for header + toolbar).
+	headerLines := len(header)
+	maxVisible := max(m.height-headerLines-2, 1)
 
 	// Scroll window around cursor.
 	start := 0
-	if m.branchPickerCursor >= maxVisible {
+	if m.branchPickerCursor >= start+maxVisible {
 		start = m.branchPickerCursor - maxVisible + 1
 	}
 	end := min(start+maxVisible, len(items))
 
 	var lines []string
+	lines = append(lines, header...)
 	for i := start; i < end; i++ {
 		prefix := "  "
-		style := lipgloss.NewStyle().Foreground(p.Foreground)
+		style := lipgloss.NewStyle().Foreground(p.Foreground).Padding(0, 1)
 		if i == m.branchPickerCursor {
 			prefix = "▸ "
 			style = style.Bold(true).Foreground(p.Primary)
@@ -1969,9 +2002,10 @@ func (m *Model) viewBranchPicker() string {
 		lines = append(lines, style.Render(prefix+items[i]))
 	}
 
-	if m.branchPickerFilter != "" {
-		filterLine := lipgloss.NewStyle().Foreground(p.Subtle).Render(" filter: " + m.branchPickerFilter)
-		lines = append([]string{filterLine}, lines...)
+	// Scroll indicator.
+	if len(items) > maxVisible {
+		info := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 2)
+		lines = append(lines, info.Render(fmt.Sprintf("  %d/%d branches", m.branchPickerCursor+1, len(items))))
 	}
 
 	return strings.Join(lines, "\n")

@@ -25,6 +25,7 @@ type BranchNode struct {
 	AuthorTime        time.Time // Tip commit author time.
 	CreatedTime       time.Time // Branch ref creation time (from reflog).
 	IsHead            bool      // True if this is the current branch (HEAD).
+	IsDetached        bool      // True when HEAD is detached (no branch checked out).
 	CommitCount       int       // Number of commits reachable from tip.
 	CommitCountCapped bool      // True if CommitCount hit the counting limit.
 	BehindCount       int       // Commits in default branch not reachable from tip.

@@ -40,6 +40,7 @@ const (
 	viewLoading                    // Spinner while loading commits+stats.
 	viewCommits                    // Commit cards for a single branch.
 	viewRebasePlan                 // Interactive rebase plan editor.
+	viewBranchPick                 // Full-window branch picker for cherry-pick/rebase target.
 )
 
 // rebasePlanEntry describes one entry in the interactive rebase plan editor.
@@ -166,6 +167,7 @@ const (
 type CreateBranchRequestMsg struct {
 	Name         string
 	ParentBranch string
+	AtHash       string // Non-empty when creating from detached HEAD.
 }
 
 // MergeBranchMsg is emitted when the user activates the Merge toolbar button.
@@ -266,7 +268,8 @@ type Model struct {
 	viewDirty bool
 	theme     *theme.Theme
 
-	mode viewMode
+	mode               viewMode
+	branchPickPrevMode viewMode // Saved mode to restore after branch pick.
 
 	// Branch view state.
 	branches        []BranchNode
@@ -491,6 +494,13 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 	// ordering within depth tiers is handled by recomputeOffshootLayout
 	// (which uses CreatedTime for stable ordering when reflogs exist).
 	slices.SortStableFunc(branches, func(a, b BranchNode) int {
+		// Detached HEAD always sorts first.
+		if a.IsDetached != b.IsDetached {
+			if a.IsDetached {
+				return -1
+			}
+			return 1
+		}
 		ap := a.Name == defaultBranch
 		bp := b.Name == defaultBranch
 		if ap != bp {
@@ -1393,15 +1403,13 @@ func (m *Model) View(cursorVisible bool) string {
 		content = m.viewCommitCards()
 	case viewRebasePlan:
 		content = m.viewRebasePlan()
+	case viewBranchPick:
+		content = m.viewBranchPicker()
 	default:
 		content = m.viewBranchTree(cursorVisible)
 	}
 
 	toolbar := m.toolbarView(cursorVisible)
-	if m.branchPickerActive {
-		toolbar = m.viewBranchPicker() + "\n" + toolbar
-	}
-
 	return content + "\n" + toolbar
 }
 
@@ -1426,7 +1434,11 @@ func (m *Model) toolbarView(cursorVisible bool) string {
 			}
 		}
 		if m.cherryPickMode && len(left) > 0 {
-			hint = fmt.Sprintf("%d selected", len(m.cherryPickSelections))
+			if m.mode == viewBranchPick {
+				hint = "Select target branch"
+			} else {
+				hint = fmt.Sprintf("%d selected", len(m.cherryPickSelections))
+			}
 		}
 		if m.conflictMode {
 			hint = fmt.Sprintf("Step %d/%d: %s", m.conflictCurrent+1, m.conflictTotal, m.conflictSubject)
@@ -1909,6 +1921,8 @@ func (m *Model) handleKey(km tea.KeyMsg) tea.Cmd {
 		return m.handleCommitKey(km)
 	case viewRebasePlan:
 		return m.handleRebasePlanKey(km)
+	case viewBranchPick:
+		return m.handleBranchPickerKey(km)
 	default:
 		return m.handleBranchKey(km)
 	}
@@ -2429,11 +2443,15 @@ func (m *Model) insertCreateRunes(inserted []rune) {
 }
 
 // isToolbarButtonEnabled reports whether a toolbar button ID is currently
-// usable. Pull and Merge are disabled when the working tree is dirty.
+// usable. Pull, Merge, and Push are disabled when the working tree is dirty
+// or the selected branch is a synthetic detached HEAD entry.
 func (m *Model) isToolbarButtonEnabled(buttonID int) bool {
+	detached := m.selectedBranchIsDetached()
 	switch buttonID {
 	case toolbarPull, toolbarMerge:
-		return !m.workingDirty && !m.workingConflicts
+		return !detached && !m.workingDirty && !m.workingConflicts
+	case toolbarPush:
+		return !detached
 	case toolbarReset, toolbarResetHard, toolbarResetMixed, toolbarResetSoft,
 		toolbarRevert, toolbarRevertOk:
 		return !m.workingConflicts
@@ -2477,6 +2495,15 @@ func (m *Model) selectedBranchName() string {
 	return ""
 }
 
+// selectedBranchIsDetached reports whether the currently selected branch
+// is a synthetic detached HEAD entry.
+func (m *Model) selectedBranchIsDetached() bool {
+	if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
+		return m.branches[m.branchIdx].IsDetached
+	}
+	return false
+}
+
 // handleCreateInputKey processes keys when the create branch input is active.
 func (m *Model) handleCreateInputKey(km tea.KeyMsg) tea.Cmd {
 	switch km.String() {
@@ -2486,9 +2513,13 @@ func (m *Model) handleCreateInputKey(km tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 		parent := m.selectedBranchName()
+		var atHash string
+		if m.selectedBranchIsDetached() {
+			atHash = m.branches[m.branchIdx].Hash
+		}
 		m.clearCreateInput()
 		return func() tea.Msg {
-			return CreateBranchRequestMsg{Name: name, ParentBranch: parent}
+			return CreateBranchRequestMsg{Name: name, ParentBranch: parent, AtHash: atHash}
 		}
 	case "esc":
 		m.clearCreateInput()
@@ -2796,8 +2827,18 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		return nil
 	case toolbarCherryPickOk:
 		if m.branchPickerActive {
-			// Branch picker is open — confirm selection happens via branch picker keys.
-			return nil
+			// Confirm currently highlighted branch.
+			items := m.filteredBranchItems()
+			if len(items) == 0 {
+				return nil
+			}
+			selected := items[m.branchPickerCursor]
+			m.closeBranchPicker()
+			hashes := m.CherryPickSelections()
+			m.exitCherryPickMode()
+			return func() tea.Msg {
+				return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
+			}
 		}
 		// Open branch picker.
 		m.openBranchPicker()
@@ -2901,10 +2942,6 @@ func (m *Model) moveBranchLeft() {
 func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 	// Esc exits the active mode before returning to branches.
 	if km.String() == "esc" {
-		if m.branchPickerActive {
-			m.closeBranchPicker()
-			return nil
-		}
 		if m.cherryPickMode {
 			m.exitCherryPickMode()
 			return nil
@@ -2923,11 +2960,6 @@ func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
 		}
 		m.ExitToBranches()
 		return nil
-	}
-
-	// Branch picker handles its own keys when active.
-	if m.branchPickerActive {
-		return m.handleBranchPickerKey(km)
 	}
 
 	if len(m.nodes) == 0 {
@@ -3253,7 +3285,10 @@ func (m *Model) exitCherryPickMode() {
 	m.cherryPickMode = false
 	m.cherryPickSelections = m.cherryPickSelections[:0]
 	m.cherryPickTarget = ""
-	m.branchPickerActive = false
+	if m.branchPickerActive {
+		m.branchPickerActive = false
+		m.mode = m.branchPickPrevMode
+	}
 	m.branchPickerFilter = ""
 	m.toolbarFocused = false
 	m.invalidateNodeCache()
@@ -3316,13 +3351,16 @@ func (m *Model) openBranchPicker() {
 	m.branchPickerActive = true
 	m.branchPickerCursor = 0
 	m.branchPickerFilter = ""
+	m.branchPickPrevMode = m.mode
+	m.mode = viewBranchPick
 	m.viewDirty = true
 }
 
-// closeBranchPicker closes the branch picker dropdown.
+// closeBranchPicker closes the branch picker and restores the previous view.
 func (m *Model) closeBranchPicker() {
 	m.branchPickerActive = false
 	m.branchPickerFilter = ""
+	m.mode = m.branchPickPrevMode
 	m.viewDirty = true
 }
 
@@ -3969,8 +4007,8 @@ func (m *Model) toolbarButtons() []int {
 		return []int{toolbarCreate, toolbarMerge, toolbarPull, toolbarPush, toolbarDiff}
 	case viewCommits:
 		return []int{toolbarBack, toolbarReset, toolbarRevert, toolbarCherryPick, toolbarRebase, toolbarDiff}
-	case viewRebasePlan:
-		return nil // Rebase plan uses left buttons only.
+	case viewRebasePlan, viewBranchPick:
+		return nil // These views use left buttons only.
 	default:
 		return nil
 	}

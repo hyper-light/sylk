@@ -1028,16 +1028,23 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case committree.CreateBranchRequestMsg:
 		if m.gitBus != nil {
-			m.commitTree.RecordBranchParent(typed.Name, typed.ParentBranch)
+			if typed.AtHash == "" {
+				m.commitTree.RecordBranchParent(typed.Name, typed.ParentBranch)
+			}
 			bus := m.gitBus
-			name := typed.Name
-			parent := typed.ParentBranch
+			name, parent, atHash := typed.Name, typed.ParentBranch, typed.AtHash
 			return m, func() tea.Msg {
-				tipHash, err := bus.BranchTipHash(parent)
-				if err != nil {
-					return branchCreateFailedMsg{reason: err.Error()}
+				var hash string
+				if atHash != "" {
+					hash = atHash
+				} else {
+					var err error
+					hash, err = bus.BranchTipHash(parent)
+					if err != nil {
+						return branchCreateFailedMsg{reason: err.Error()}
+					}
 				}
-				if err := bus.CreateBranch(name, tipHash); err != nil {
+				if err := bus.CreateBranch(name, hash); err != nil {
 					return branchCreateFailedMsg{reason: err.Error()}
 				}
 				return branchCreatedMsg{name: name}
@@ -4056,6 +4063,11 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 			}
 		}
 
+		// Detect detached HEAD: no branch has IsHead=true.
+		if detached := buildDetachedNode(bus, nodes); detached != nil {
+			nodes = append([]committree.BranchNode{*detached}, nodes...)
+		}
+
 		return gitBranchesLoadedMsg{
 			branches:       nodes,
 			defaultBranch:  defaultBranch,
@@ -4065,6 +4077,33 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 			hasStash:       bus.HasStash(),
 		}
 	}
+}
+
+// buildDetachedNode returns a synthetic BranchNode if HEAD is detached
+// (no branch has IsHead=true). Returns nil if HEAD is on a branch.
+func buildDetachedNode(bus *git.GitBus, nodes []committree.BranchNode) *committree.BranchNode {
+	for _, n := range nodes {
+		if n.IsHead {
+			return nil
+		}
+	}
+	hash, err := bus.GetHead()
+	if err != nil {
+		return nil
+	}
+	short := hash[:min(len(hash), 7)]
+	node := committree.BranchNode{
+		Name:       "(detached) " + short,
+		Hash:       hash,
+		ShortHash:  short,
+		IsHead:     true,
+		IsDetached: true,
+	}
+	if ci, err := bus.GetCommit(hash); err == nil {
+		node.Subject = ci.Subject
+		node.AuthorTime = ci.AuthorTime
+	}
+	return &node
 }
 
 // quickGitStatusCmd returns a tea.Cmd that checks only working-tree dirty
