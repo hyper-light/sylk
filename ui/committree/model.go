@@ -856,6 +856,8 @@ func (m *Model) ClickAt(viewX, viewY int) tea.Cmd {
 	switch m.mode {
 	case viewLoading:
 		return nil // absorb clicks during loading
+	case viewRebasePlan:
+		return m.clickRebasePlanView(viewY)
 	case viewCommits:
 		return m.clickCommitView(viewX, viewY)
 	default:
@@ -3681,6 +3683,18 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		m.rebasePlan[m.rebaseCursor].action = 5 // Drop
 		m.viewDirty = true
 		return nil
+	case "l", "right", "enter", " ":
+		if m.toolbarFocused {
+			m.viewDirty = true
+			return m.executeToolbarAction()
+		}
+		m.rebasePlan[m.rebaseCursor].action = (m.rebasePlan[m.rebaseCursor].action + 1) % len(rebaseActionNames)
+		m.viewDirty = true
+		return nil
+	case "h", "left":
+		m.rebasePlan[m.rebaseCursor].action = (m.rebasePlan[m.rebaseCursor].action + len(rebaseActionNames) - 1) % len(rebaseActionNames)
+		m.viewDirty = true
+		return nil
 	case "tab":
 		m.cycleCommitToolbar(1)
 		m.viewDirty = true
@@ -3689,13 +3703,24 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		m.cycleCommitToolbar(-1)
 		m.viewDirty = true
 		return nil
-	case "enter", " ":
-		if m.toolbarFocused {
-			m.viewDirty = true
-			return m.executeToolbarAction()
-		}
+	}
+	return nil
+}
+
+// clickRebasePlanView handles clicks on the rebase plan. Clicking an entry
+// selects it; clicking the already-selected entry cycles its action.
+func (m *Model) clickRebasePlanView(viewY int) tea.Cmd {
+	// Layout: header(1) + blank(1) + entries.
+	idx := viewY - 2
+	if idx < 0 || idx >= len(m.rebasePlan) {
 		return nil
 	}
+	if idx == m.rebaseCursor {
+		m.rebasePlan[idx].action = (m.rebasePlan[idx].action + 1) % len(rebaseActionNames)
+	} else {
+		m.rebaseCursor = idx
+	}
+	m.viewDirty = true
 	return nil
 }
 
