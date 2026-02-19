@@ -1545,7 +1545,7 @@ var toolbarDefs = map[int]toolbarButtonDef{
 	toolbarRevert:          {icon: "↶", label: "Revert", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
 	toolbarRevertOk:        {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	toolbarRevertAbort:     {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
-	toolbarCherryPick:      {icon: "🍒", label: "Pick", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
+	toolbarCherryPick:      {icon: "∴", label: "Pick", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
 	toolbarCherryPickOk:    {icon: "✓", label: "Ok", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	toolbarCherryPickAbort: {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 	toolbarRebase:          {icon: "⇄", label: "Rebase", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
