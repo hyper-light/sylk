@@ -2008,7 +2008,7 @@ func (m *Model) viewBranchPicker() string {
 	for i := start; i < end; i++ {
 		prefix := "  "
 		style := lipgloss.NewStyle().Foreground(p.Foreground).Padding(0, 1)
-		if i == m.branchPickerCursor && !m.toolbarFocused {
+		if i == m.branchPickerCursor {
 			prefix = "▸ "
 			style = lipgloss.NewStyle().Bold(true).Foreground(p.Primary).Padding(0, 1)
 		}
