@@ -98,7 +98,9 @@
       "Bash(git apply:*)",
       "Bash(GONOSUMCHECK=*:*)",
       "Bash(GOFLAGS=-mod=mod go get:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(/tmp/test_infer.go:*)",
+      "Bash(/home/ada/Projects/sylk/core/search/git/infer_debug2_test.go:*)"
     ]
   }
 }

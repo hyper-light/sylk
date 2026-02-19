@@ -1953,6 +1953,7 @@ func (m *Model) viewRebasePlan() string {
 }
 
 // viewBranchPicker renders a full-window branch list for target selection.
+// The list fills the full panel height so the toolbar sits at the bottom.
 func (m *Model) viewBranchPicker() string {
 	items := m.filteredBranchItems()
 	p := m.theme.Palette
@@ -1964,7 +1965,7 @@ func (m *Model) viewBranchPicker() string {
 	}
 	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(p.Primary).Padding(0, 1)
 
-	// Filter indicator.
+	// Build header lines.
 	var header []string
 	header = append(header, titleStyle.Render(title))
 	if m.branchPickerFilter != "" {
@@ -1973,39 +1974,56 @@ func (m *Model) viewBranchPicker() string {
 	}
 	header = append(header, "") // blank separator line
 
+	// Reserve 1 line for the toolbar (rendered separately by View()).
+	contentHeight := max(m.height-1, 1)
+	headerLines := len(header)
+
 	if len(items) == 0 {
 		empty := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 2).Render("(no matching branches)")
 		header = append(header, empty)
+		used := headerLines + 1
+		for used < contentHeight {
+			header = append(header, "")
+			used++
+		}
 		return strings.Join(header, "\n")
 	}
 
-	// Available height for the branch list (reserve for header + toolbar).
-	headerLines := len(header)
-	maxVisible := max(m.height-headerLines-2, 1)
+	// Available height for the branch list body.
+	maxVisible := max(contentHeight-headerLines, 1)
 
 	// Scroll window around cursor.
-	start := 0
+	start := m.branchPickerScroll
+	if m.branchPickerCursor < start {
+		start = m.branchPickerCursor
+	}
 	if m.branchPickerCursor >= start+maxVisible {
 		start = m.branchPickerCursor - maxVisible + 1
 	}
+	m.branchPickerScroll = start
 	end := min(start+maxVisible, len(items))
 
 	var lines []string
 	lines = append(lines, header...)
 	for i := start; i < end; i++ {
 		prefix := "  "
-		style := lipgloss.NewStyle().Foreground(p.Foreground).Padding(0, 1)
+		style := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 1)
 		if i == m.branchPickerCursor {
 			prefix = "▸ "
-			style = style.Bold(true).Foreground(p.Primary)
+			style = lipgloss.NewStyle().Bold(true).Foreground(p.Primary).Padding(0, 1)
 		}
 		lines = append(lines, style.Render(prefix+items[i]))
 	}
 
-	// Scroll indicator.
+	// Scroll indicator when list is truncated.
 	if len(items) > maxVisible {
 		info := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 2)
 		lines = append(lines, info.Render(fmt.Sprintf("  %d/%d branches", m.branchPickerCursor+1, len(items))))
+	}
+
+	// Pad to fill the panel so the toolbar stays at the bottom.
+	for len(lines) < contentHeight {
+		lines = append(lines, "")
 	}
 
 	return strings.Join(lines, "\n")

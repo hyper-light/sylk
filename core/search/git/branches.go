@@ -1566,6 +1566,11 @@ func birthParent(i int, b BranchInfo, branches []BranchInfo,
 		if j == i || j == defaultIdx || len(chainPos[j]) == 0 {
 			continue
 		}
+		// A candidate parent must be older; a newer branch that happens
+		// to contain the birth hash is a child, not a parent.
+		if !branchOlder(branches[j], branches[i]) {
+			continue
+		}
 		pos, ok := chainPos[j][bh]
 		if !ok {
 			continue
@@ -1622,6 +1627,11 @@ func ownershipParent(i int, branches []BranchInfo,
 			continue
 		}
 		if branches[j].BirthHash == "" {
+			continue
+		}
+		// A candidate parent must be older; a newer branch extending
+		// from i is i's child, not its parent.
+		if !branchOlder(branches[j], branches[i]) {
 			continue
 		}
 
