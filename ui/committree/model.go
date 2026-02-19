@@ -2,6 +2,7 @@ package committree
 
 import (
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -2831,6 +2832,12 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		}
 		return nil
 	case toolbarCherryPickOk:
+		f, _ := os.OpenFile("/tmp/sylk-cp-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if f != nil {
+			fmt.Fprintf(f, "CherryPickOk: pickerActive=%v selections=%d mode=%d\n",
+				m.branchPickerActive, len(m.cherryPickSelections), m.mode)
+			f.Close()
+		}
 		if m.branchPickerActive {
 			// Confirm currently highlighted branch.
 			items := m.filteredBranchItems()
@@ -2849,6 +2856,12 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		m.openBranchPicker()
 		return nil
 	case toolbarCherryPickAbort:
+		f2, _ := os.OpenFile("/tmp/sylk-cp-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if f2 != nil {
+			fmt.Fprintf(f2, "CherryPickAbort: pickerActive=%v mode=%d\n",
+				m.branchPickerActive, m.mode)
+			f2.Close()
+		}
 		m.exitCherryPickMode()
 		return nil
 
@@ -3500,6 +3513,12 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	case "enter", " ":
+		f, _ := os.OpenFile("/tmp/sylk-cp-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if f != nil {
+			fmt.Fprintf(f, "BranchPicker Enter: toolbarFocused=%v toolbarAction=%d items=%d cursor=%d\n",
+				m.toolbarFocused, m.toolbarAction, len(items), m.branchPickerCursor)
+			f.Close()
+		}
 		if m.toolbarFocused {
 			m.viewDirty = true
 			return m.executeToolbarAction()
