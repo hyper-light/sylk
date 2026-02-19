@@ -3473,10 +3473,12 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 
 	switch ks {
 	case "tab":
+		m.hoverButtonIdx = -1
 		m.cycleCommitToolbar(1)
 		m.viewDirty = true
 		return nil
 	case "shift+tab":
+		m.hoverButtonIdx = -1
 		m.cycleCommitToolbar(-1)
 		m.viewDirty = true
 		return nil

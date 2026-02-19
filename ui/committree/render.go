@@ -1970,15 +1970,12 @@ func (m *Model) viewBranchPicker() string {
 	var lines []string
 	lines = append(lines, titleStyle.Render(title))
 	if m.branchPickerFilterActive {
-		// Active filter input with cursor.
 		filterStyle := lipgloss.NewStyle().Foreground(p.Foreground).Padding(0, 1)
 		lines = append(lines, filterStyle.Render("/ "+m.branchPickerFilter+"_"))
 	} else if m.branchPickerFilter != "" {
-		// Applied filter (inactive input).
 		filterStyle := lipgloss.NewStyle().Foreground(p.Subtle).Padding(0, 1)
 		lines = append(lines, filterStyle.Render("/ "+m.branchPickerFilter))
 	} else {
-		// Hint showing filter is available.
 		hintStyle := lipgloss.NewStyle().Foreground(p.Muted).Padding(0, 1)
 		lines = append(lines, hintStyle.Render("/ filter"))
 	}
