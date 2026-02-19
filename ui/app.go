@@ -327,6 +327,7 @@ type AppModel struct {
 	preGitEditMode   bool              // Whether edit mode was active before entering git mode.
 	prevGitMode      ViewMode          // Detect git mode transitions for dirty detection.
 	gitDataLoaded    bool              // True after first LoadData; skips reload on cycling.
+	branchLoadEpoch  uint64            // Monotonic counter; rejects stale gitBranchesLoadedMsg.
 
 	// Diff view overlay (replaces commit tree when active).
 	diffView       *diffview.Model // Diff view component (nil when inactive).
@@ -917,6 +918,10 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case gitBranchesLoadedMsg:
+		// Reject stale results from earlier concurrent loads.
+		if typed.epoch < m.branchLoadEpoch {
+			return m, nil
+		}
 		if m.commitTree != nil {
 			m.commitTree.SetBranches(typed.branches, typed.defaultBranch)
 			m.commitTree.SetWorkingTreeStatus(typed.dirty, typed.conflicts)
@@ -3951,6 +3956,7 @@ type gitQuickStatusMsg struct {
 // gitBranchesLoadedMsg carries branch data loaded asynchronously for the
 // commit tree panel's branch view.
 type gitBranchesLoadedMsg struct {
+	epoch          uint64 // must match AppModel.branchLoadEpoch to be applied
 	branches       []committree.BranchNode
 	defaultBranch  string
 	dirty          bool // working tree has uncommitted changes
@@ -4016,11 +4022,13 @@ type sequencerAbortFailedMsg struct{ reason string }
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.
 func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
+	m.branchLoadEpoch++
+	epoch := m.branchLoadEpoch
 	bus := m.gitBus
 	return func() tea.Msg {
 		branches, err := bus.ListBranches()
 		if err != nil {
-			return gitBranchesLoadedMsg{}
+			return gitBranchesLoadedMsg{epoch: epoch}
 		}
 		defaultBranch := bus.DefaultBranch()
 
@@ -4069,6 +4077,7 @@ func (m *AppModel) loadGitBranchesCmd() tea.Cmd {
 		}
 
 		return gitBranchesLoadedMsg{
+			epoch:          epoch,
 			branches:       nodes,
 			defaultBranch:  defaultBranch,
 			dirty:          dirty,
