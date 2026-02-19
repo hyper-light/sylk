@@ -361,9 +361,8 @@ type Model struct {
 	cherryPickMode       bool
 	cherryPickSelections []diffSelection
 	cherryPickTarget     string // Selected target branch name.
-	branchPickerActive   bool     // Target branch dropdown open.
-	branchPickerCursor   int      // Highlighted item index.
-	branchPickerScroll   int      // Scroll offset for the picker list.
+	branchPickerActive   bool   // Target branch dropdown open.
+	branchPickerCursor   int
 	branchPickerItems    []string // Available branch names.
 	branchPickerFilter   string   // Typing filter for branch picker.
 
@@ -485,8 +484,13 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 	m.defaultBranch = defaultBranch
 
 	// Apply known parent relationships from UI-initiated branch creation.
+	// Only fill in when inference left the parent empty; inferred parents
+	// are derived from the current topology and take precedence.
 	for i := range branches {
-		if p, ok := m.branchParents[branches[i].Name]; ok {
+		if branches[i].Parent != "" {
+			continue
+		}
+		if p, ok := m.branchParents[branches[i].Name]; ok && p != branches[i].Name {
 			branches[i].Parent = p
 		}
 	}
@@ -510,10 +514,7 @@ func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
 			}
 			return -1
 		}
-		if c := b.AuthorTime.Compare(a.AuthorTime); c != 0 { // newest first
-			return c
-		}
-		return strings.Compare(a.Name, b.Name) // deterministic tiebreaker
+		return b.AuthorTime.Compare(a.AuthorTime) // newest first
 	})
 	branches = groupChildrenAfterParent(branches)
 
@@ -2831,7 +2832,18 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		return nil
 	case toolbarCherryPickOk:
 		if m.branchPickerActive {
-			return m.confirmBranchPicker(m.filteredBranchItems())
+			// Confirm currently highlighted branch.
+			items := m.filteredBranchItems()
+			if len(items) == 0 {
+				return nil
+			}
+			selected := items[m.branchPickerCursor]
+			m.closeBranchPicker()
+			hashes := m.CherryPickSelections()
+			m.exitCherryPickMode()
+			return func() tea.Msg {
+				return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
+			}
 		}
 		// Open branch picker.
 		m.openBranchPicker()
@@ -3343,7 +3355,6 @@ func (m *Model) openBranchPicker() {
 	}
 	m.branchPickerActive = true
 	m.branchPickerCursor = 0
-	m.branchPickerScroll = 0
 	m.branchPickerFilter = ""
 	m.branchPickPrevMode = m.mode
 	m.mode = viewBranchPick
@@ -3438,15 +3449,8 @@ func (m *Model) ExitRebasePlan() {
 	m.viewDirty = true
 }
 
-// handleBranchPickerKey processes keys when the branch picker is active.
-// Supports navigation, enter to confirm, esc to abort, tab for toolbar, and
-// type-ahead filtering.
+// handleBranchPickerKey processes keys when the branch picker dropdown is open.
 func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
-	// Toolbar-focused: delegate to picker toolbar navigation.
-	if m.toolbarFocused {
-		return m.handlePickerToolbarKey(km)
-	}
-
 	items := m.filteredBranchItems()
 
 	switch km.String() {
@@ -3462,41 +3466,35 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 		}
 		m.viewDirty = true
 		return nil
-	case "g":
-		m.branchPickerCursor = 0
-		m.viewDirty = true
-		return nil
-	case "G":
-		if len(items) > 0 {
-			m.branchPickerCursor = len(items) - 1
-		}
-		m.viewDirty = true
-		return nil
-	case "ctrl+d":
-		half := max((m.height-4)/2, 1)
-		m.branchPickerCursor = min(m.branchPickerCursor+half, len(items)-1)
-		m.viewDirty = true
-		return nil
-	case "ctrl+u":
-		half := max((m.height-4)/2, 1)
-		m.branchPickerCursor = max(m.branchPickerCursor-half, 0)
-		m.viewDirty = true
-		return nil
 	case "enter":
-		return m.confirmBranchPicker(items)
-	case "esc":
-		if m.cherryPickMode {
-			m.exitCherryPickMode()
-		} else {
-			m.closeBranchPicker()
+		if len(items) == 0 {
+			return nil
 		}
+		selected := items[m.branchPickerCursor]
+		m.closeBranchPicker()
+
+		if m.cherryPickMode {
+			// Confirm cherry-pick with selected branch.
+			hashes := m.CherryPickSelections()
+			m.exitCherryPickMode()
+			return func() tea.Msg {
+				return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
+			}
+		}
+
+		// Rebase: generate default plan and enter plan view.
+		plan := make([]rebasePlanEntry, len(m.nodes))
+		for i, n := range m.nodes {
+			plan[i] = rebasePlanEntry{
+				action:  0, // Pick
+				hash:    n.Hash[:min(len(n.Hash), 7)],
+				subject: n.Subject,
+				author:  n.Author,
+			}
+		}
+		m.EnterRebasePlan(selected, plan)
 		return nil
-	case "tab":
-		m.toolbarFocused = true
-		buttons := m.diffToolbarLeftButtons()
-		m.toolbarAction = m.firstEnabledToolbar(buttons)
-		m.viewDirty = true
-		return nil
+
 	case "backspace":
 		if len(m.branchPickerFilter) > 0 {
 			m.branchPickerFilter = m.branchPickerFilter[:len(m.branchPickerFilter)-1]
@@ -3512,80 +3510,6 @@ func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
-}
-
-// confirmBranchPicker confirms the currently highlighted branch and dispatches
-// the appropriate action (cherry-pick or rebase).
-func (m *Model) confirmBranchPicker(items []string) tea.Cmd {
-	if len(items) == 0 {
-		return nil
-	}
-	selected := items[m.branchPickerCursor]
-	m.closeBranchPicker()
-
-	if m.cherryPickMode {
-		hashes := m.CherryPickSelections()
-		m.exitCherryPickMode()
-		return func() tea.Msg {
-			return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
-		}
-	}
-
-	// Rebase: generate default plan and enter plan view.
-	plan := make([]rebasePlanEntry, len(m.nodes))
-	for i, n := range m.nodes {
-		plan[i] = rebasePlanEntry{
-			action:  0, // Pick
-			hash:    n.Hash[:min(len(n.Hash), 7)],
-			subject: n.Subject,
-			author:  n.Author,
-		}
-	}
-	m.EnterRebasePlan(selected, plan)
-	return nil
-}
-
-// handlePickerToolbarKey processes keys when the toolbar is focused during the
-// branch picker view. h/l/tab navigate buttons, enter executes, esc/other
-// returns focus to the picker list.
-func (m *Model) handlePickerToolbarKey(km tea.KeyMsg) tea.Cmd {
-	buttons := m.diffToolbarLeftButtons()
-
-	switch km.String() {
-	case "tab":
-		next := m.nextEnabledToolbar(m.toolbarAction, +1, buttons)
-		if next < 0 {
-			m.toolbarFocused = false
-		} else {
-			m.toolbarAction = next
-		}
-	case "shift+tab":
-		next := m.nextEnabledToolbar(m.toolbarAction, -1, buttons)
-		if next < 0 {
-			m.toolbarFocused = false
-		} else {
-			m.toolbarAction = next
-		}
-	case "h", "left":
-		if prev := m.nextEnabledToolbar(m.toolbarAction, -1, buttons); prev >= 0 {
-			m.toolbarAction = prev
-		}
-	case "l", "right":
-		if next := m.nextEnabledToolbar(m.toolbarAction, +1, buttons); next >= 0 {
-			m.toolbarAction = next
-		}
-	case "enter", " ":
-		m.viewDirty = true
-		return m.executeToolbarAction()
-	case "esc":
-		m.toolbarFocused = false
-	default:
-		// Any other key returns focus to the picker list.
-		m.toolbarFocused = false
-		return m.handleBranchPickerKey(km)
-	}
-	m.viewDirty = true
-	return nil
 }
 
 // handleRebasePlanKey processes keys in the interactive rebase plan editor.
@@ -4257,10 +4181,7 @@ func (m *Model) recomputeOffshootLayout() {
 			if tb.IsZero() {
 				tb = m.branches[b].AuthorTime
 			}
-			if c := ta.Compare(tb); c != 0 {
-				return c
-			}
-			return strings.Compare(m.branches[a].Name, m.branches[b].Name)
+			return ta.Compare(tb)
 		})
 	}
 
