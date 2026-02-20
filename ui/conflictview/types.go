@@ -28,6 +28,7 @@ type ConflictHunk struct {
 	EndLine     int    // 0-indexed line of >>>>>>>
 	OursLabel   string // Label after <<<<<<< marker.
 	TheirsLabel string // Label after >>>>>>> marker.
+	Snippet     string // First non-blank ours line (trimmed), for file list preview.
 }
 
 // ConflictFileEntry describes a single file in the conflict resolution view.

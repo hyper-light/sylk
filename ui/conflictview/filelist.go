@@ -177,7 +177,8 @@ func renderEmptyFileList(entryH, width int, p theme.Palette) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderConflictFileEntry renders a single file list entry.
+// renderConflictFileEntry renders a single file list entry header line.
+// Only this row receives the selection background when the file is selected.
 // Format: [cursor] [type-badge] [filename] [resolution-badge]
 func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool, width int, p theme.Palette) string {
 	hasBg := isCursor
@@ -280,43 +281,92 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 
 // renderHunkLines renders one line per hunk below a file entry.
 // Returns at least one line (blank if no hunks) for visual spacing.
+// Hunk lines do NOT receive the selection background — only the
+// filename header row is highlighted when the file is selected.
 func (m *Model) renderHunkLines(fileIdx int, isCursor bool, width int, p theme.Palette) []string {
-	baseSt := lipgloss.NewStyle()
-	if isCursor {
-		baseSt = baseSt.Background(p.Selection)
-	}
-
 	var hunks []ConflictHunk
 	if fileIdx >= 0 && fileIdx < len(m.data.Entries) {
 		hunks = m.data.Entries[fileIdx].Hunks
 	}
 
 	if len(hunks) == 0 {
-		return []string{baseSt.Render(strings.Repeat(" ", width))}
+		return []string{strings.Repeat(" ", width)}
 	}
 
 	lines := make([]string, len(hunks))
 	for j, h := range hunks {
-		lines[j] = m.renderSingleHunkLine(j, h, isCursor, width, p, baseSt)
+		lines[j] = m.renderSingleHunkLine(j, h, isCursor, width, p)
 	}
 	return lines
 }
 
-// renderSingleHunkLine renders one hunk location line: "    L{line}".
-func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool, width int, p theme.Palette, baseSt lipgloss.Style) string {
-	label := fmt.Sprintf("    L%d", h.StartLine+1)
-	st := lipgloss.NewStyle().Foreground(p.Muted)
-	if isCursor && hunkIdx == m.currentHunk {
-		st = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+// hunkSizeLabel returns a compact "ours/theirs" line-count string.
+func hunkSizeLabel(h ConflictHunk) string {
+	ours := h.DivLine - h.StartLine - 1
+	theirs := h.EndLine - h.DivLine - 1
+	return fmt.Sprintf("%d/%d", ours, theirs)
+}
+
+// renderSingleHunkLine renders one hunk line: "    L12  3/5  snippet…".
+// No selection background — current hunk uses primary text color.
+func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool, width int, p theme.Palette) string {
+	isCurrent := isCursor && hunkIdx == m.currentHunk
+
+	// Line number label.
+	locLabel := fmt.Sprintf("    L%d", h.StartLine+1)
+	locSt := lipgloss.NewStyle().Foreground(p.Muted)
+	if isCurrent {
+		locSt = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
 	}
-	if isCursor {
-		st = st.Background(p.Selection)
+
+	// Hunk size.
+	sizeTxt := hunkSizeLabel(h)
+	sizeSt := lipgloss.NewStyle().Foreground(p.Muted)
+	if isCurrent {
+		sizeSt = lipgloss.NewStyle().Foreground(p.Primary)
 	}
-	text := st.Render(label)
-	if vis := lipgloss.Width(text); vis < width {
-		text += baseSt.Render(strings.Repeat(" ", width-vis))
+
+	var b strings.Builder
+	b.WriteString(locSt.Render(locLabel))
+	b.WriteString("  ")
+	b.WriteString(sizeSt.Render(sizeTxt))
+
+	// Content snippet — fill remaining width.
+	col := lipgloss.Width(b.String())
+	snippetW := width - col - 3 // 2 gap + 1 trailing padding
+	if snippetW > 0 && h.Snippet != "" {
+		snip := h.Snippet
+		if lipgloss.Width(snip) > snippetW {
+			snip = truncateToWidth(snip, snippetW)
+		}
+		snippetSt := lipgloss.NewStyle().Foreground(p.Muted).Italic(true)
+		b.WriteString("  ")
+		b.WriteString(snippetSt.Render(snip))
 	}
-	return text
+
+	row := b.String()
+	if vis := lipgloss.Width(row); vis < width {
+		row += strings.Repeat(" ", width-vis)
+	}
+	return row
+}
+
+// truncateToWidth truncates a string to fit within maxWidth visual columns,
+// appending "…" if truncated.
+func truncateToWidth(s string, maxWidth int) string {
+	if maxWidth <= 1 {
+		return "…"
+	}
+	runes := []rune(s)
+	w := 0
+	for i, r := range runes {
+		rw := lipgloss.Width(string(r))
+		if w+rw > maxWidth-1 { // reserve 1 for "…"
+			return string(runes[:i]) + "…"
+		}
+		w += rw
+	}
+	return s
 }
 
 // ---------------------------------------------------------------------------

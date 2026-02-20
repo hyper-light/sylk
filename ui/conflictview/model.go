@@ -539,11 +539,23 @@ func detectHunks(lines []string) []ConflictHunk {
 		case strings.HasPrefix(line, ">>>>>>>") && pending != nil && pending.DivLine > 0:
 			pending.EndLine = i
 			pending.TheirsLabel = strings.TrimSpace(strings.TrimPrefix(line, ">>>>>>>"))
+			pending.Snippet = firstNonBlankLine(lines, pending.StartLine+1, pending.DivLine)
 			hunks = append(hunks, *pending)
 			pending = nil
 		}
 	}
 	return hunks
+}
+
+// firstNonBlankLine returns the first non-blank trimmed line in lines[start:end].
+func firstNonBlankLine(lines []string, start, end int) string {
+	for i := start; i < end; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // computeRuneOffsets computes cumulative rune offsets for each line.
