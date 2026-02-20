@@ -1,6 +1,8 @@
 package conflictview
 
 import (
+	"math"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -664,15 +666,31 @@ func (m *Model) View(cursorVisible bool) string {
 	return strings.Join(parts, "\n")
 }
 
-// renderFileHeader renders the file path header line.
+// renderFileHeader renders a header line matching the code viewer style:
+// " filename.ext ──────────────".
 func (m *Model) renderFileHeader() string {
-	p := m.theme.Palette
-	pathSt := lipgloss.NewStyle().Foreground(p.Primary)
-	if m.selectedFile >= 0 && m.selectedFile < len(m.data.Entries) {
-		path := m.data.Entries[m.selectedFile].Path
-		return padLine("  "+pathSt.Render(path), m.width)
+	if m.selectedFile < 0 || m.selectedFile >= len(m.data.Entries) {
+		return padLine("", m.width)
 	}
-	return strings.Repeat(" ", m.width)
+	name := filepath.Base(m.data.Entries[m.selectedFile].Path)
+	nameStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted).Bold(true)
+	lineStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Border)
+
+	text := nameStyle.Render(" " + name + " ")
+	textWidth := lipgloss.Width(text)
+	lineWidth := max(m.width-textWidth, 0)
+
+	return text + lineStyle.Render(strings.Repeat("─", lineWidth))
+}
+
+// gutterWidth returns the number of characters needed for line number display,
+// derived from the total number of merged content lines.
+func (m *Model) gutterWidth() int {
+	lineCount := len(m.mergedLines)
+	if lineCount == 0 {
+		return 1
+	}
+	return int(math.Log10(float64(lineCount))) + 1
 }
 
 // renderLoading renders a centered loading spinner.

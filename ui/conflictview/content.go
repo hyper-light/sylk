@@ -1,6 +1,7 @@
 package conflictview
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -55,7 +56,8 @@ func classifyLine(line int, hunks []ConflictHunk) lineRegion {
 }
 
 // renderContent renders the viewport-aware merged content with syntax
-// highlighting, conflict region tinting, inline action lines, and find match overlay.
+// highlighting, conflict region tinting, inline action lines, line numbers,
+// and find match overlay.
 func (m *Model) renderContent(vpH int) string {
 	if m.selectedFile < 0 || m.selectedFile >= len(m.data.Entries) {
 		return m.renderEmpty(vpH)
@@ -82,6 +84,10 @@ func (m *Model) renderContent(vpH int) string {
 		curMatchIdx = m.findBar.MatchIndex()
 	}
 
+	// Gutter setup.
+	gutterW := m.gutterWidth()
+	gutterSt := lipgloss.NewStyle().Foreground(p.Muted)
+
 	// Marker styles.
 	oursMarkerSt := lipgloss.NewStyle().Foreground(p.Secondary).Bold(true)
 	divMarkerSt := lipgloss.NewStyle().Foreground(p.Border).Bold(true)
@@ -97,7 +103,7 @@ func (m *Model) renderContent(vpH int) string {
 		screenY := d - start
 
 		if isAction {
-			rendered, target := m.renderActionLine(hunkIdx, w)
+			rendered, target := m.renderActionLine(hunkIdx, w, gutterW)
 			target.screenY = screenY
 			m.actionTargets = append(m.actionTargets, target)
 			lines = append(lines, padLine(rendered, w))
@@ -106,6 +112,10 @@ func (m *Model) renderContent(vpH int) string {
 
 		line := m.mergedLines[contentLine]
 		region := classifyLine(contentLine, m.hunks)
+
+		// Build gutter with right-aligned line number.
+		numStr := fmt.Sprintf("%*d", gutterW, contentLine+1)
+		gutter := gutterSt.Render(numStr) + " "
 
 		var rendered string
 		switch region {
@@ -124,7 +134,7 @@ func (m *Model) renderContent(vpH int) string {
 				region, allMatches, curMatchIdx, p)
 		}
 
-		lines = append(lines, padLine("  "+rendered, w))
+		lines = append(lines, padLine(gutter+rendered, w))
 	}
 
 	blank := strings.Repeat(" ", w)
@@ -136,9 +146,10 @@ func (m *Model) renderContent(vpH int) string {
 }
 
 // renderActionLine renders the clickable action line above a conflict hunk
-// with contextual labels and branch/sha context, and returns the click target
-// metadata. Format: "Accept Dest (feature) | Accept Source (main) | Accept Both"
-func (m *Model) renderActionLine(hunkIdx, width int) (string, actionTarget) {
+// with contextual labels, and returns the click target metadata.
+// The gutterW parameter aligns the action content with the code gutter.
+// Format: "          Accept Dest | Accept Source | Accept Both"
+func (m *Model) renderActionLine(hunkIdx, width, gutterW int) (string, actionTarget) {
 	p := m.theme.Palette
 	linkSt := lipgloss.NewStyle().Foreground(p.Primary).Underline(true)
 	hoverLinkSt := lipgloss.NewStyle().Foreground(p.Warning).Underline(true).Bold(true)
@@ -160,8 +171,8 @@ func (m *Model) renderActionLine(hunkIdx, width int) (string, actionTarget) {
 	}
 
 	var b strings.Builder
-	b.WriteString("  ")
-	col := 2
+	col := gutterW + 1 // blank gutter + separator, matching content indent
+	b.WriteString(strings.Repeat(" ", col))
 
 	oursText := oursSt.Render("Accept " + m.oursLabel)
 	oursW := lipgloss.Width(oursText)
