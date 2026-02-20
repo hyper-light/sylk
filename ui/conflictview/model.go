@@ -128,19 +128,39 @@ func New(data ConflictData, th *theme.Theme, nerdFonts bool) *Model {
 
 // deriveConflictLabels sets contextual labels based on the operation type
 // and the source/dest names from the sequencer.
+//
+// Merge:       Source/Dest   — context = branch names
+// Pull merge:  Remote/Local  — context = branch names if different,
+//                               short sha if same base branch
+// Cherry-pick: Source/Dest   — context = dest branch + source sha
+// Rebase:      Source/Dest   — context = dest branch + source sha
 func (m *Model) deriveConflictLabels() {
-	// Merge with a source containing "/" suggests a remote tracking branch
-	// (e.g. "origin/main"), so use Local/Remote. Otherwise use Dest/Source.
 	isMerge := m.data.Op == 2 // SeqMerge
-	if isMerge && strings.Contains(m.data.SourceName, "/") {
+	isRemote := isMerge && strings.Contains(m.data.SourceName, "/")
+
+	if isRemote {
 		m.oursLabel = "Local"
 		m.theirsLabel = "Remote"
+		m.oursCtx = m.data.DestName
+
+		// Extract base name from remote ref (e.g. "origin/main" → "main").
+		remote := m.data.SourceName
+		if idx := strings.LastIndex(remote, "/"); idx >= 0 {
+			remote = remote[idx+1:]
+		}
+		// Same base branch name → context is the short sha (the branch
+		// name would be redundant). Different → show the full ref.
+		if remote == m.data.DestName {
+			m.theirsCtx = m.data.Hash
+		} else {
+			m.theirsCtx = m.data.SourceName
+		}
 	} else {
 		m.oursLabel = "Dest"
 		m.theirsLabel = "Source"
+		m.oursCtx = m.data.DestName
+		m.theirsCtx = m.data.SourceName
 	}
-	m.oursCtx = m.data.DestName
-	m.theirsCtx = m.data.SourceName
 }
 
 // ---------------------------------------------------------------------------

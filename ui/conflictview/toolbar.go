@@ -237,11 +237,20 @@ func (m *Model) activateToolbarButton(idx int) tea.Cmd {
 		m.nextHunk()
 		return nil
 	case ctbOurs:
-		return m.resolveKey(ResOurs)
+		cmd := m.resolveKey(ResOurs)
+		m.toolbarFocused = true
+		m.toolbarAction = idx
+		return cmd
 	case ctbTheirs:
-		return m.resolveKey(ResTheirs)
+		cmd := m.resolveKey(ResTheirs)
+		m.toolbarFocused = true
+		m.toolbarAction = idx
+		return cmd
 	case ctbBoth:
-		return m.resolveKey(ResBoth)
+		cmd := m.resolveKey(ResBoth)
+		m.toolbarFocused = true
+		m.toolbarAction = idx
+		return cmd
 	}
 	return nil
 }

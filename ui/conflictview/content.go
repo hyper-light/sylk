@@ -135,8 +135,9 @@ func (m *Model) renderContent(vpH int) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderActionLine renders the clickable "Accept <Dest> | Accept <Source> | Accept Both"
-// line above a conflict hunk and returns the click target metadata.
+// renderActionLine renders the clickable action line above a conflict hunk
+// with contextual labels and branch/sha context, and returns the click target
+// metadata. Format: "Accept Dest (feature) | Accept Source (main) | Accept Both"
 func (m *Model) renderActionLine(hunkIdx, width int) (string, actionTarget) {
 	p := m.theme.Palette
 	linkSt := lipgloss.NewStyle().Foreground(p.Primary).Underline(true)

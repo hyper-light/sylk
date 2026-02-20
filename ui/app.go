@@ -10653,7 +10653,8 @@ func (m *AppModel) needsDecorTick() bool {
 		(m.commitTree != nil && m.commitTree.NeedsDecorTick()) ||
 		(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick()) ||
 		(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick()) ||
-		(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick())
+		(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick()) ||
+		(m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick())
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
