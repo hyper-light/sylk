@@ -184,17 +184,12 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 	hasBg := isCursor
 	bg := p.Selection
 
-	// Cursor prefix.
+	// Left padding (1 space, no arrow — arrows are on hunk lines only).
 	prefixSt := lipgloss.NewStyle()
 	if hasBg {
 		prefixSt = prefixSt.Background(bg)
 	}
-	var prefix string
-	if isCursor {
-		prefix = prefixSt.Foreground(p.Primary).Render("▸ ")
-	} else {
-		prefix = prefixSt.Render("  ")
-	}
+	prefix := prefixSt.Render(" ")
 
 	// Type badge.
 	typeLabel := "Content"
@@ -235,7 +230,7 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 	resBadge := resSt.Render(fitCell(resLabel, 7))
 
 	// File name (fills remaining space).
-	prefixW := 2 + 9 + 1   // cursor + type + sep
+	prefixW := 1 + 9 + 1   // pad + type + sep
 	suffixW := 1 + 7        // sep + resolution
 	nameW := max(width-prefixW-suffixW, 1)
 
@@ -320,9 +315,9 @@ func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool,
 	// Arrow indicator for current hunk, plain indent otherwise.
 	var prefix string
 	if isCurrent {
-		prefix = lipgloss.NewStyle().Foreground(p.Primary).Render("  ▸ ")
+		prefix = lipgloss.NewStyle().Foreground(p.Primary).Render(" ▸ ")
 	} else {
-		prefix = "    "
+		prefix = "   "
 	}
 
 	// Line number label.
