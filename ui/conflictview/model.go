@@ -373,11 +373,13 @@ func (m *Model) ScrollFileListDown() bool {
 	return true
 }
 
-// onFileSelectionChanged resets scroll and recomputes per-file state.
+// onFileSelectionChanged resets scroll and recomputes per-file state,
+// then scrolls to the first conflict hunk if one exists.
 func (m *Model) onFileSelectionChanged() {
 	m.scrollOffset = 0
 	m.currentHunk = 0
 	m.parseMergedContent()
+	m.scrollToCurrentHunk()
 	m.viewDirty = true
 	m.fileListDirty = true
 }
