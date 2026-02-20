@@ -14,8 +14,7 @@ require (
 	github.com/epilande/go-devicons v0.0.0-20250505162540-0661cab71a28
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-git/go-git/v5 v5.16.4
-	github.com/go-skynet/go-llama.cpp v0.0.0-00010101000000-000000000000
-	github.com/gobwas/glob v0.2.3
+github.com/gobwas/glob v0.2.3
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/mattn/go-runewidth v0.0.16
@@ -128,5 +127,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/go-skynet/go-llama.cpp => ./third_party/go-llama.cpp
