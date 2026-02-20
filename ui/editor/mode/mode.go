@@ -71,19 +71,24 @@ type EditorState struct {
 	Cursor            int
 	CursorLine        int
 	CursorCol         int
+	Cursors           *CursorSet // Multi-cursor set; Primary() aliases Cursor/CursorLine/CursorCol.
 	UndoTree          *buffer.UndoTree
 	InStringOrComment bool   // set by the model from tree-sitter or highlight regions
 	CursorNodeType    string // tree-sitter node type at cursor position
 }
 
 // SyncCursorPos updates CursorLine and CursorCol from the absolute Cursor
-// position using the LineIndex.
+// position using the LineIndex, and propagates to the CursorSet primary.
 func (es *EditorState) SyncCursorPos() {
 	es.CursorLine, es.CursorCol = es.LineIndex.PosToLineCol(es.Cursor)
+	if es.Cursors != nil {
+		es.Cursors.SetPrimary(es.Cursor, es.CursorLine, es.CursorCol)
+	}
 }
 
 // ClampCursor ensures the cursor stays within the buffer bounds, respecting
 // a trailing-character offset (0 for insert mode, 1 for normal mode).
+// Propagates clamped position to the CursorSet primary.
 func (es *EditorState) ClampCursor(trailingOffset int) {
 	length := es.Buffer.Length()
 	maxPos := max(length-trailingOffset, 0)

@@ -36,31 +36,33 @@ const (
 // WarmState holds live editor state extracted from Model via Detach().
 // All pointer fields are transferred by reference — no copying.
 type WarmState struct {
-	FilePath     string
-	Language     string
-	Modified     bool
-	Buf          *buffer.PieceTable
-	LineIndex    *buffer.LineIndex
-	UndoTree     *buffer.UndoTree
-	Cursor       int
-	CursorLine   int
-	CursorCol    int
-	ScrollOffset int
+	FilePath        string
+	Language        string
+	Modified        bool
+	Buf             *buffer.PieceTable
+	LineIndex       *buffer.LineIndex
+	UndoTree        *buffer.UndoTree
+	Cursor          int
+	CursorLine      int
+	CursorCol       int
+	ScrollOffset    int
+	CursorPositions []int // Multi-cursor snapshot; nil means single cursor.
 }
 
 // ColdState holds serialized content plus the preserved undo tree.
 // The PieceTable and LineIndex must be rebuilt from Content on restore,
 // but undo history survives demotion intact.
 type ColdState struct {
-	FilePath     string
-	Language     string
-	Modified     bool
-	Content      string
-	UndoTree     *buffer.UndoTree
-	Cursor       int
-	CursorLine   int
-	CursorCol    int
-	ScrollOffset int
+	FilePath        string
+	Language        string
+	Modified        bool
+	Content         string
+	UndoTree        *buffer.UndoTree
+	Cursor          int
+	CursorLine      int
+	CursorCol       int
+	ScrollOffset    int
+	CursorPositions []int // Multi-cursor snapshot; nil means single cursor.
 }
 
 // cacheEntry wraps either a warm or cold state plus LRU bookkeeping.
@@ -232,15 +234,16 @@ func (c *EditorCache) demoteOldestWarm() {
 func (c *EditorCache) demoteEntry(entry *cacheEntry) {
 	ws := entry.warm
 	entry.cold = &ColdState{
-		FilePath:     ws.FilePath,
-		Language:     ws.Language,
-		Modified:     ws.Modified,
-		Content:      ws.Buf.Content(),
-		UndoTree:     ws.UndoTree,
-		Cursor:       ws.Cursor,
-		CursorLine:   ws.CursorLine,
-		CursorCol:    ws.CursorCol,
-		ScrollOffset: ws.ScrollOffset,
+		FilePath:        ws.FilePath,
+		Language:        ws.Language,
+		Modified:        ws.Modified,
+		Content:         ws.Buf.Content(),
+		UndoTree:        ws.UndoTree,
+		Cursor:          ws.Cursor,
+		CursorLine:      ws.CursorLine,
+		CursorCol:       ws.CursorCol,
+		ScrollOffset:    ws.ScrollOffset,
+		CursorPositions: ws.CursorPositions,
 	}
 	entry.warm = nil
 	entry.tier = TierCold

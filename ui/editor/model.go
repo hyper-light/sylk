@@ -140,8 +140,9 @@ type viewCache struct {
 	viewHeight      int      // Height the cache was rendered at.
 	scrollOffset    int      // Vertical scroll offset at render time.
 	scrollLeftCol   int      // Horizontal scroll offset at render time.
-	cursorLine      int      // Source line the cursor was on.
-	cursorRenderIdx int      // Index in lines[] of the cursor line.
+	cursorLine      int      // Source line the primary cursor was on.
+	cursorRenderIdx int      // Index in lines[] of the primary cursor line.
+	multiCursor     bool     // True when multiple cursors were active at render time.
 	valid           bool     // False when structural state changed.
 	cursorOK        bool     // False when only cursor blink changed.
 	lastPhase       bool     // Cursor phase at last render; invalidates cursorOK on change.
@@ -178,6 +179,7 @@ func New(th *theme.Theme) *Model {
 	st := &mode.EditorState{
 		Buffer:    pt,
 		LineIndex: li,
+		Cursors:   mode.NewSingleCursor(0, 0, 0),
 		UndoTree:  ut,
 	}
 	lspSrc := completion.NewLSPSource()
@@ -227,6 +229,7 @@ func (m *Model) OpenFile(path, content, language string) {
 	m.state.LineIndex = m.lineIndex
 	m.state.UndoTree = m.undoTree
 	m.state.Cursor = 0
+	m.state.Cursors = mode.NewSingleCursor(0, 0, 0)
 	m.state.SyncCursorPos()
 
 	m.regions = m.highlighter.Highlight(content, language)
@@ -313,21 +316,30 @@ func (m *Model) ViewContent(cursorVisible bool) string {
 		m.vc.scrollLeftCol = m.scrollLeftCol
 		m.vc.cursorLine = m.state.CursorLine
 		m.vc.cursorRenderIdx = m.findCursorRenderIdx()
+		m.vc.multiCursor = !m.state.Cursors.IsSingle()
 		m.vc.valid = true
 		m.vc.cursorOK = true
 		m.vc.postValid = false    // Force full post-processing.
 		m.vc.cursorWidthOK = false // Invalidate cached cursor line width.
 	} else if !m.vc.cursorOK {
-		// Cursor-only patch: re-render just the cursor line.
-		m.patchCursorLine(cursorVisible)
-		m.vc.cursorOK = true
+		if m.vc.multiCursor {
+			// Multi-cursor blink: full re-render (N cursor lines).
+			m.vc.lines = m.renderVisibleLines(viewHeight, cursorVisible)
+			m.vc.cursorOK = true
+			m.vc.postValid = false
+			m.vc.cursorWidthOK = false
+		} else {
+			// Single-cursor-only patch: re-render just the cursor line.
+			m.patchCursorLine(cursorVisible)
+			m.vc.cursorOK = true
 
-		// Fast path: if post cache is valid and bounce unchanged, splice
-		// only the patched cursor line into the cached output.
-		if m.vc.postValid && m.bounceOffset == m.vc.postBounce {
-			return m.splicePostCursorLine(barStr, viewHeight)
+			// Fast path: if post cache is valid and bounce unchanged, splice
+			// only the patched cursor line into the cached output.
+			if m.vc.postValid && m.bounceOffset == m.vc.postBounce {
+				return m.splicePostCursorLine(barStr, viewHeight)
+			}
+			// Bounce changed or post cache invalid — fall through to full post.
 		}
-		// Bounce changed or post cache invalid — fall through to full post.
 	}
 
 	// Full post-processing: clone, tilde fill, fit, bounce, popups, join.
@@ -537,17 +549,22 @@ func (m *Model) ClearFile() {
 // The JumpList is intentionally left in place (it is cross-file and global).
 // Highlights are NOT captured — they are regenerated on Attach.
 func (m *Model) Detach() *WarmState {
+	var cursorPositions []int
+	if !m.state.Cursors.IsSingle() {
+		cursorPositions = m.state.Cursors.Snapshot()
+	}
 	ws := &WarmState{
-		FilePath:     m.filePath,
-		Language:     m.language,
-		Modified:     m.modified,
-		Buf:          m.buf,
-		LineIndex:    m.lineIndex,
-		UndoTree:     m.undoTree,
-		Cursor:       m.state.Cursor,
-		CursorLine:   m.state.CursorLine,
-		CursorCol:    m.state.CursorCol,
-		ScrollOffset: m.scrollOffset,
+		FilePath:        m.filePath,
+		Language:        m.language,
+		Modified:        m.modified,
+		Buf:             m.buf,
+		LineIndex:       m.lineIndex,
+		UndoTree:        m.undoTree,
+		Cursor:          m.state.Cursor,
+		CursorLine:      m.state.CursorLine,
+		CursorCol:       m.state.CursorCol,
+		ScrollOffset:    m.scrollOffset,
+		CursorPositions: cursorPositions,
 	}
 
 	// Reset the editor to an empty state, reusing ClearFile's pattern
@@ -574,6 +591,7 @@ func (m *Model) Detach() *WarmState {
 	m.state.LineIndex = m.lineIndex
 	m.state.UndoTree = m.undoTree
 	m.state.Cursor = 0
+	m.state.Cursors = mode.NewSingleCursor(0, 0, 0)
 	m.state.SyncCursorPos()
 
 	m.regions = nil
@@ -598,6 +616,11 @@ func (m *Model) AttachWarm(ws *WarmState) {
 	m.state.Cursor = ws.Cursor
 	m.state.CursorLine = ws.CursorLine
 	m.state.CursorCol = ws.CursorCol
+	if ws.CursorPositions != nil {
+		m.state.Cursors.Restore(ws.CursorPositions, m.lineIndex)
+	} else {
+		m.state.Cursors = mode.NewSingleCursor(ws.Cursor, ws.CursorLine, ws.CursorCol)
+	}
 
 	m.scrollOffset = ws.ScrollOffset
 
@@ -635,6 +658,11 @@ func (m *Model) AttachCold(cs *ColdState) {
 	m.state.Cursor = cs.Cursor
 	m.state.CursorLine = cs.CursorLine
 	m.state.CursorCol = cs.CursorCol
+	if cs.CursorPositions != nil {
+		m.state.Cursors.Restore(cs.CursorPositions, m.lineIndex)
+	} else {
+		m.state.Cursors = mode.NewSingleCursor(cs.Cursor, cs.CursorLine, cs.CursorCol)
+	}
 
 	m.scrollOffset = cs.ScrollOffset
 
@@ -671,6 +699,28 @@ func (m *Model) Language() string { return m.language }
 
 // CompletionActive reports whether the completion popup is currently visible.
 func (m *Model) CompletionActive() bool { return m.completionEngine.Active() }
+
+// RemoveBottomCursor removes the bottommost non-primary cursor.
+func (m *Model) RemoveBottomCursor() {
+	m.state.Cursors.RemoveBottommost()
+	m.syncStatusLine()
+	m.invalidateView()
+}
+
+// AddCursorBelow adds a multi-cursor one line below the primary at the same column.
+func (m *Model) AddCursorBelow() {
+	m.addCursorBelow()
+	m.syncStatusLine()
+	m.invalidateView()
+}
+
+// AddCursorAtNextOccurrence adds a multi-cursor at the next occurrence of the
+// word under the primary cursor.
+func (m *Model) AddCursorAtNextOccurrence() {
+	m.addCursorAtNextOccurrence()
+	m.syncStatusLine()
+	m.invalidateView()
+}
 
 // LSPDirty reports whether the buffer has changed since the last didChange flush.
 func (m *Model) LSPDirty() bool { return m.lspDirty }
@@ -2050,7 +2100,7 @@ func (m *Model) MarkSaved() {
 
 // Undo reverses the last edit operation (or grouped operation).
 func (m *Model) Undo() {
-	edits, ok := m.undoTree.Undo()
+	edits, cursorSnap, ok := m.undoTree.Undo()
 	if !ok {
 		return
 	}
@@ -2058,8 +2108,16 @@ func (m *Model) Undo() {
 		m.reverseEdit(edit)
 	}
 	m.lineIndex.Rebuild(m.buf)
-	m.state.Cursor = edits[0].Pos
-	m.state.ClampCursor(1)
+	if cursorSnap != nil && m.state.Cursors != nil && len(cursorSnap) > 1 {
+		m.state.Cursors.Restore(cursorSnap, m.lineIndex)
+		p := m.state.Cursors.Primary()
+		m.state.Cursor = p.Pos
+		m.state.CursorLine = p.Line
+		m.state.CursorCol = p.Col
+	} else {
+		m.state.Cursor = edits[0].Pos
+		m.state.ClampCursor(1)
+	}
 	m.editGeneration++
 	m.modified = true
 	m.lspDirty = true
@@ -2070,7 +2128,7 @@ func (m *Model) Undo() {
 
 // Redo reapplies the last undone edit operation (or grouped operation).
 func (m *Model) Redo() {
-	edits, ok := m.undoTree.Redo()
+	edits, cursorSnap, ok := m.undoTree.Redo()
 	if !ok {
 		return
 	}
@@ -2078,8 +2136,16 @@ func (m *Model) Redo() {
 		m.reapplyEdit(edit)
 	}
 	m.lineIndex.Rebuild(m.buf)
-	m.state.Cursor = edits[len(edits)-1].Pos
-	m.state.ClampCursor(1)
+	if cursorSnap != nil && m.state.Cursors != nil && len(cursorSnap) > 1 {
+		m.state.Cursors.Restore(cursorSnap, m.lineIndex)
+		p := m.state.Cursors.Primary()
+		m.state.Cursor = p.Pos
+		m.state.CursorLine = p.Line
+		m.state.CursorCol = p.Col
+	} else {
+		m.state.Cursor = edits[len(edits)-1].Pos
+		m.state.ClampCursor(1)
+	}
 	m.editGeneration++
 	m.modified = true
 	m.lspDirty = true
@@ -2823,6 +2889,16 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 		case tea.KeyCtrlI:
 			return m.jumpForward()
 		case tea.KeyEsc:
+			if !m.state.Cursors.IsSingle() {
+				m.state.Cursors.ClearSecondary()
+				p := m.state.Cursors.Primary()
+				m.state.Cursor = p.Pos
+				m.state.CursorLine = p.Line
+				m.state.CursorCol = p.Col
+				m.syncStatusLine()
+				m.invalidateView()
+				return m, nil
+			}
 			if m.jumpList.CanBack() {
 				return m.jumpBack()
 			}
@@ -2844,7 +2920,13 @@ func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 	prevCursorLine := m.state.CursorLine
 	prevCursorCol := m.state.CursorCol
 	prevVersion := m.buf.Version()
-	next, cmd := m.dispatchKey(key)
+	var next mode.Mode
+	var cmd tea.Cmd
+	if m.state.Cursors.IsSingle() {
+		next, cmd = m.dispatchKey(key)
+	} else {
+		next, cmd = m.dispatchKeyMultiCursor(key)
+	}
 	if next != m.currentMode {
 		m.transitionMode(next)
 	}
@@ -2958,6 +3040,15 @@ func (m *Model) transitionMode(next mode.Mode) {
 	wasVisual := isVisualMode(m.currentMode)
 	entering := isVisualMode(next)
 
+	// Visual mode and multi-cursor are mutually exclusive.
+	if entering && !wasVisual && !m.state.Cursors.IsSingle() {
+		m.state.Cursors.ClearSecondary()
+		p := m.state.Cursors.Primary()
+		m.state.Cursor = p.Pos
+		m.state.CursorLine = p.Line
+		m.state.CursorCol = p.Col
+	}
+
 	if entering && !wasVisual {
 		sub := mode.VisualChar
 		switch next {
@@ -2992,6 +3083,144 @@ func (m *Model) dispatchKey(key tea.KeyMsg) (mode.Mode, tea.Cmd) {
 		return m.currentMode, nil
 	}
 	return fn(m, key)
+}
+
+// dispatchKeyMultiCursor fans out a single keypress across all cursors in
+// reverse document order (highest position first). Each cursor's edit is
+// applied independently; lower-position cursors are shifted by the delta
+// of higher-position edits. All edits are wrapped in a single undo group
+// with a cursor snapshot for atomic undo/redo.
+func (m *Model) dispatchKeyMultiCursor(key tea.KeyMsg) (mode.Mode, tea.Cmd) {
+	cs := m.state.Cursors
+	snapshot := cs.Snapshot()
+	m.undoTree.BeginGroupWithCursors(snapshot)
+
+	var lastMode mode.Mode
+	var cmds []tea.Cmd
+	reversed := cs.AllReversed()
+
+	for i, cur := range reversed {
+		m.state.Cursor = cur.Pos
+		m.state.CursorLine = cur.Line
+		m.state.CursorCol = cur.Col
+
+		prevLen := m.buf.Length()
+		prevVer := m.buf.Version()
+
+		nextMode, cmd := m.dispatchKey(key)
+		lastMode = nextMode
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
+		newPos := m.state.Cursor
+		delta := m.buf.Length() - prevLen
+		edited := m.buf.Version() != prevVer
+
+		newLine, newCol := m.state.LineIndex.PosToLineCol(newPos)
+		cs.SetNth(i, newPos, newLine, newCol)
+
+		if edited && delta != 0 {
+			cs.ShiftBelow(cur.Pos, delta)
+		}
+	}
+
+	m.undoTree.EndGroup()
+	cs.MergeOverlapping()
+	cs.Sync(m.state.LineIndex)
+
+	p := cs.Primary()
+	m.state.Cursor = p.Pos
+	m.state.CursorLine = p.Line
+	m.state.CursorCol = p.Col
+
+	return lastMode, tea.Batch(cmds...)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-cursor addition helpers
+// ---------------------------------------------------------------------------
+
+// addCursorAtNextOccurrence finds the word under the primary cursor and adds
+// a new cursor at the next occurrence of that word in the buffer. Wraps
+// around to the beginning if no match is found after the primary cursor.
+func (m *Model) addCursorAtNextOccurrence() {
+	start, end := m.WordBoundsAt(m.state.CursorLine, m.state.CursorCol)
+	if start == end {
+		return
+	}
+	info, ok := m.lineIndex.Get(m.state.CursorLine)
+	if !ok {
+		return
+	}
+	word := m.buf.Substring(info.StartPos+start, info.StartPos+end)
+	if word == "" {
+		return
+	}
+
+	content := m.buf.Content()
+	runes := []rune(content)
+	wordRunes := []rune(word)
+	wordLen := len(wordRunes)
+	bufLen := len(runes)
+
+	// Search forward from after the primary cursor's word.
+	searchStart := info.StartPos + end
+	found := -1
+	for i := searchStart; i <= bufLen-wordLen; i++ {
+		if matchWord(runes, i, wordRunes) {
+			found = i
+			break
+		}
+	}
+	// Wrap around.
+	if found < 0 {
+		for i := 0; i < searchStart && i <= bufLen-wordLen; i++ {
+			if matchWord(runes, i, wordRunes) {
+				found = i
+				break
+			}
+		}
+	}
+	if found < 0 {
+		return
+	}
+	line, col := m.lineIndex.PosToLineCol(found)
+	m.state.Cursors.Add(found, line, col)
+}
+
+// matchWord checks if runes[pos:pos+len(word)] equals word.
+func matchWord(runes []rune, pos int, word []rune) bool {
+	for j, r := range word {
+		if runes[pos+j] != r {
+			return false
+		}
+	}
+	return true
+}
+
+// addCursorAbove adds a new cursor one line above the primary cursor at
+// the same column, clamped to the target line's length.
+// addCursorBelow adds a new cursor one line below the primary cursor at
+// the same column, clamped to the target line's length.
+func (m *Model) addCursorBelow() {
+	targetLine := m.state.Cursors.BottomLine() + 1
+	if targetLine >= m.lineIndex.Count() {
+		return
+	}
+	m.addCursorOnLine(targetLine, m.state.CursorCol)
+}
+
+// addCursorOnLine adds a cursor at the given line and column, clamping
+// the column to the line's length.
+func (m *Model) addCursorOnLine(targetLine, desiredCol int) {
+	info, ok := m.lineIndex.Get(targetLine)
+	if !ok {
+		return
+	}
+	col := min(desiredCol, max(info.Length-1, 0))
+	pos := info.StartPos + col
+	m.state.Cursors.Add(pos, targetLine, col)
 }
 
 func dispatchNormal(m *Model, key tea.KeyMsg) (mode.Mode, tea.Cmd) {
@@ -3236,23 +3465,27 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, sc, ec, ulRanges)
 	case len(findSpans) > 0:
 		curCol := -1
-		if !m.overlayActive() && i == m.state.CursorLine && m.focused && ctx.cursorVisible {
+		if !m.overlayActive() && m.state.Cursors.HasLine(i) && m.focused && ctx.cursorVisible {
 			curCol = safeMapCol(colMap, m.state.CursorCol) - vs
 		}
 		return m.renderFindMatchLine(
 			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, findSpans, curCol, ulRanges)
 	case len(jumpSpans) > 0:
 		curCol := -1
-		if !m.overlayActive() && i == m.state.CursorLine && m.focused && ctx.cursorVisible {
+		if !m.overlayActive() && m.state.Cursors.HasLine(i) && m.focused && ctx.cursorVisible {
 			curCol = safeMapCol(colMap, m.state.CursorCol) - vs
 		}
 		return m.renderHighlightLine(
 			i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, jumpSpans, curCol, ulRanges)
-	case !m.overlayActive() && i == m.state.CursorLine && m.focused:
-		displayCol := safeMapCol(colMap, m.state.CursorCol) - vs
+	case !m.overlayActive() && m.state.Cursors.HasLine(i) && m.focused:
+		cols := m.state.Cursors.CursorsOnLine(i)
+		displayCols := make([]int, len(cols))
+		for ci, c := range cols {
+			displayCols[ci] = safeMapCol(colMap, c) - vs
+		}
 		curCol := -1
-		if ctx.cursorVisible {
-			curCol = displayCol
+		if ctx.cursorVisible && len(displayCols) > 0 {
+			curCol = displayCols[0]
 		}
 		if len(hlSpans) > 0 {
 			return m.renderHighlightLine(
@@ -3265,9 +3498,9 @@ func (m *Model) renderOneLine(ctx *renderLineCtx, i int) string {
 			return m.renderWarpLine(
 				i, displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, warpSpan, curCol, ulRanges)
 		}
-		if curCol >= 0 {
-			return m.applyCursor(
-				displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, displayCol, ulRanges)
+		if ctx.cursorVisible {
+			return m.applyCursors(i,
+				displayLine, displayRegions, ctx.gutterWidth, ctx.defaultStyle, displayCols, ulRanges)
 		}
 		gutter := m.renderGutter(i, ctx.gutterWidth)
 		if bg, ok := m.conflictBgColor(i); ok {
@@ -3505,6 +3738,79 @@ func (m *Model) renderWarpLine(lineNum int, line string, regions []highlight.Hig
 
 func (m *Model) applyCursor(line string, regions []highlight.HighlightRegion, gutterWidth int, defaultStyle lipgloss.Style, col int, ulRanges []highlight.UnderlineRange) string {
 	gutter := m.renderGutter(m.state.CursorLine, gutterWidth)
+	runes := []rune(line)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+	beforeEnd := min(col, len(runes))
+	afterStart := min(col+1, len(runes))
+	before := string(runes[:beforeEnd])
+	cursorChar := " "
+	if col < len(runes) {
+		ch := runes[col]
+		if ch < ' ' {
+			cursorChar = " "
+		} else {
+			cursorChar = string(ch)
+		}
+	}
+	after := string(runes[afterStart:])
+	beforeStyled := highlight.RenderLineWithUnderlines(before, filterRegions(regions, 0, beforeEnd), m.theme.Syntax, defaultStyle,
+		filterUnderlines(ulRanges, 0, beforeEnd))
+	afterStyled := highlight.RenderLineWithUnderlines(after, filterRegions(regions, afterStart, len(runes)), m.theme.Syntax, defaultStyle,
+		filterUnderlines(ulRanges, afterStart, len(runes)))
+	return gutter + beforeStyled + cursorStyle.Render(cursorChar) + afterStyled
+}
+
+// applyCursors renders N reverse-video cursor blocks on a single line.
+// When len(cols) == 1, delegates to applyCursor for zero-overhead single-cursor case.
+func (m *Model) applyCursors(lineNum int, line string, regions []highlight.HighlightRegion, gutterWidth int, defaultStyle lipgloss.Style, cols []int, ulRanges []highlight.UnderlineRange) string {
+	if len(cols) == 1 {
+		return m.applyCursorOnLine(lineNum, line, regions, gutterWidth, defaultStyle, cols[0], ulRanges)
+	}
+	gutter := m.renderGutter(lineNum, gutterWidth)
+	runes := []rune(line)
+	n := len(runes)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	// Deduplicate and sort cols (should already be sorted from CursorSet).
+	sortedCols := slices.Clone(cols)
+	slices.Sort(sortedCols)
+	sortedCols = slices.Compact(sortedCols)
+
+	var b strings.Builder
+	pos := 0
+	for _, col := range sortedCols {
+		if col < 0 || col > n {
+			continue
+		}
+		if col > pos {
+			seg := string(runes[pos:col])
+			b.WriteString(highlight.RenderLineWithUnderlines(
+				seg, filterRegions(regions, pos, col), m.theme.Syntax, defaultStyle,
+				filterUnderlines(ulRanges, pos, col)))
+		}
+		ch := " "
+		if col < n {
+			r := runes[col]
+			if r >= ' ' {
+				ch = string(r)
+			}
+		}
+		b.WriteString(cursorStyle.Render(ch))
+		pos = min(col+1, n)
+	}
+	if pos < n {
+		seg := string(runes[pos:])
+		b.WriteString(highlight.RenderLineWithUnderlines(
+			seg, filterRegions(regions, pos, n), m.theme.Syntax, defaultStyle,
+			filterUnderlines(ulRanges, pos, n)))
+	}
+	return gutter + b.String()
+}
+
+// applyCursorOnLine renders a single cursor on a specific line (not necessarily
+// the primary cursor line). Used by applyCursors for secondary cursor lines.
+func (m *Model) applyCursorOnLine(lineNum int, line string, regions []highlight.HighlightRegion, gutterWidth int, defaultStyle lipgloss.Style, col int, ulRanges []highlight.UnderlineRange) string {
+	gutter := m.renderGutter(lineNum, gutterWidth)
 	runes := []rune(line)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 	beforeEnd := min(col, len(runes))
@@ -3975,6 +4281,7 @@ func (m *Model) syncStatusLine() {
 	m.statusLine.SetNodeType(m.state.CursorNodeType)
 	m.statusLine.SetParseErrorCount(len(m.parseErrors))
 	m.statusLine.SetJumpBack(m.jumpList.CanBack())
+	m.statusLine.SetCursorCount(m.state.Cursors.Len())
 	if wInfo, ok := m.warpLines[m.state.CursorLine]; ok {
 		m.statusLine.SetWarpSlot(wInfo.Slot)
 	} else {

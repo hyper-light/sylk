@@ -276,7 +276,7 @@ func insertLineAbove(state *EditorState) {
 // ---------------------------------------------------------------------------
 
 func applyUndo(state *EditorState) {
-	edits, ok := state.UndoTree.Undo()
+	edits, cursorSnap, ok := state.UndoTree.Undo()
 	if !ok {
 		return
 	}
@@ -284,12 +284,20 @@ func applyUndo(state *EditorState) {
 		reverseEdit(state, edit)
 	}
 	state.LineIndex.Rebuild(state.Buffer)
-	state.Cursor = edits[0].Pos
-	state.ClampCursor(1)
+	if cursorSnap != nil && state.Cursors != nil && len(cursorSnap) > 1 {
+		state.Cursors.Restore(cursorSnap, state.LineIndex)
+		p := state.Cursors.Primary()
+		state.Cursor = p.Pos
+		state.CursorLine = p.Line
+		state.CursorCol = p.Col
+	} else {
+		state.Cursor = edits[0].Pos
+		state.ClampCursor(1)
+	}
 }
 
 func applyRedo(state *EditorState) {
-	edits, ok := state.UndoTree.Redo()
+	edits, cursorSnap, ok := state.UndoTree.Redo()
 	if !ok {
 		return
 	}
@@ -297,8 +305,16 @@ func applyRedo(state *EditorState) {
 		reapplyEdit(state, edit)
 	}
 	state.LineIndex.Rebuild(state.Buffer)
-	state.Cursor = edits[len(edits)-1].Pos
-	state.ClampCursor(1)
+	if cursorSnap != nil && state.Cursors != nil && len(cursorSnap) > 1 {
+		state.Cursors.Restore(cursorSnap, state.LineIndex)
+		p := state.Cursors.Primary()
+		state.Cursor = p.Pos
+		state.CursorLine = p.Line
+		state.CursorCol = p.Col
+	} else {
+		state.Cursor = edits[len(edits)-1].Pos
+		state.ClampCursor(1)
+	}
 }
 
 func reverseEdit(state *EditorState, edit buffer.EditOp) {

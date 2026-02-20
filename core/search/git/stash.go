@@ -33,6 +33,13 @@ func (c *GitClient) StashFiles(paths []string) error {
 	if !c.isRepo {
 		return ErrNotGitRepo
 	}
+
+	return c.stashFilesImpl(paths)
+}
+
+// stashFilesImpl is the internal stash implementation without lock acquisition.
+// Caller must hold c.mu.Lock() and verify c.isRepo.
+func (c *GitClient) stashFilesImpl(paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -142,6 +149,12 @@ func (c *GitClient) UnstashFiles() error {
 		return ErrNotGitRepo
 	}
 
+	return c.unstashFilesImpl()
+}
+
+// unstashFilesImpl is the internal unstash implementation without lock acquisition.
+// Caller must hold c.mu.Lock() and verify c.isRepo.
+func (c *GitClient) unstashFilesImpl() error {
 	stashRef, err := c.repo.Reference(plumbing.ReferenceName("refs/stash"), true)
 	if err != nil {
 		return fmt.Errorf("no stash found: %w", err)

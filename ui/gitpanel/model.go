@@ -1638,6 +1638,54 @@ func (m *Model) handleBranchStatsLoaded(msg branchStatsLoadedMsg) {
 	}
 }
 
+// SetDivergence merges upstream divergence info into existing branch entries.
+func (m *Model) SetDivergence(info []git.DivergenceInfo) {
+	byName := make(map[string]git.DivergenceInfo, len(info))
+	for _, d := range info {
+		byName[d.BranchName] = d
+	}
+	for i := range m.branches.allEntries {
+		if d, ok := byName[m.branches.allEntries[i].name]; ok {
+			m.branches.allEntries[i].upstream = d.UpstreamName
+			m.branches.allEntries[i].aheadCount = d.Ahead
+			m.branches.allEntries[i].behindUpstream = d.Behind
+			m.branches.allEntries[i].hasDivergence = true
+		}
+	}
+	for i, e := range m.branches.listState.entries {
+		be, ok := e.(branchEntry)
+		if !ok {
+			continue
+		}
+		if d, ok := byName[be.name]; ok {
+			be.upstream = d.UpstreamName
+			be.aheadCount = d.Ahead
+			be.behindUpstream = d.Behind
+			be.hasDivergence = true
+			m.branches.listState.entries[i] = be
+		}
+	}
+	m.viewDirty = true
+}
+
+// SetBranchStashes marks branches that have associated stashes.
+func (m *Model) SetBranchStashes(stashMap map[string][]git.BranchStashMeta) {
+	for i := range m.branches.allEntries {
+		_, has := stashMap[m.branches.allEntries[i].name]
+		m.branches.allEntries[i].hasBranchStash = has
+	}
+	for i, e := range m.branches.listState.entries {
+		be, ok := e.(branchEntry)
+		if !ok {
+			continue
+		}
+		_, has := stashMap[be.name]
+		be.hasBranchStash = has
+		m.branches.listState.entries[i] = be
+	}
+	m.viewDirty = true
+}
+
 // collectCommitHashes returns the hashes of all commit entries in the list.
 func collectCommitHashes(ls *listState) []string {
 	hashes := make([]string, 0, len(ls.entries))

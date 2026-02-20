@@ -819,6 +819,8 @@ func (c *GitClient) branchExists(name string) bool {
 // =============================================================================
 
 // CheckoutBranch switches the working tree to the named local branch.
+// Before checkout, preserves any detached HEAD commit as a backup ref
+// and optionally auto-stashes dirty worktree files.
 // Uses a write lock because it mutates HEAD and the working tree.
 // Returns ErrNotGitRepo if not a git repository.
 func (c *GitClient) CheckoutBranch(name string) error {
@@ -828,6 +830,9 @@ func (c *GitClient) CheckoutBranch(name string) error {
 	if !c.isRepo {
 		return ErrNotGitRepo
 	}
+
+	// Preserve detached HEAD commit if it would become orphaned.
+	c.preserveDetachedHead()
 
 	wt, err := c.repo.Worktree()
 	if err != nil {
@@ -839,8 +844,21 @@ func (c *GitClient) CheckoutBranch(name string) error {
 	})
 }
 
+// preserveDetachedHead backs up the current HEAD commit if HEAD is detached.
+func (c *GitClient) preserveDetachedHead() {
+	head, err := c.repo.Head()
+	if err != nil {
+		return
+	}
+	if head.Name().IsBranch() {
+		return // Not detached.
+	}
+	_, _ = c.createDetachedBackup(head.Hash())
+}
+
 // CheckoutCommit checks out a specific commit by hash, resulting in a
 // detached HEAD state. Supports both full and abbreviated hashes.
+// Before checkout, preserves any existing detached HEAD commit as a backup ref.
 func (c *GitClient) CheckoutCommit(commitHash string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -848,6 +866,9 @@ func (c *GitClient) CheckoutCommit(commitHash string) error {
 	if !c.isRepo {
 		return ErrNotGitRepo
 	}
+
+	// Preserve existing detached HEAD commit before switching.
+	c.preserveDetachedHead()
 
 	hash, err := c.resolveCommitHash(commitHash)
 	if err != nil {
@@ -1149,6 +1170,8 @@ func (c *GitClient) resolveRemoteCommit(branchName, remoteName string) (*object.
 
 // PushBranch pushes the named branch to the given remote.
 // If remoteName is empty, "origin" is used as the default.
+// Returns ErrForcePushRequired if the remote has diverged and force-push
+// would be needed.
 func (c *GitClient) PushBranch(branchName, remoteName string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1158,6 +1181,11 @@ func (c *GitClient) PushBranch(branchName, remoteName string) error {
 	}
 	if remoteName == "" {
 		remoteName = "origin"
+	}
+
+	// Check if push would require force.
+	if err := c.checkPushSafety(branchName, remoteName); err != nil {
+		return err
 	}
 
 	remote, err := c.repo.Remote(remoteName)
@@ -1180,6 +1208,8 @@ func (c *GitClient) PushBranch(branchName, remoteName string) error {
 }
 
 // DeleteBranch removes a local branch reference.
+// Before deletion, backs up the branch tip as refs/sylk/deleted/{name}-{unix_ns}
+// so the commits remain reachable and can be recovered.
 // Returns ErrDeleteCheckedOut if the branch is currently checked out.
 // Returns ErrNotGitRepo if not a git repository.
 func (c *GitClient) DeleteBranch(name string) error {
@@ -1196,8 +1226,13 @@ func (c *GitClient) DeleteBranch(name string) error {
 		return ErrDeleteCheckedOut
 	}
 
-	// Remove the branch reference.
+	// Back up the branch tip before deletion (best-effort).
 	refName := plumbing.NewBranchReferenceName(name)
+	if ref, err := c.repo.Reference(refName, true); err == nil {
+		_, _ = c.createBranchBackup(name, ref.Hash())
+	}
+
+	// Remove the branch reference.
 	if err := c.repo.Storer.RemoveReference(refName); err != nil {
 		return err
 	}

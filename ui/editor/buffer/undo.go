@@ -22,25 +22,27 @@ type EditOp struct {
 
 // UndoNode is a single node in the branching undo tree.
 type UndoNode struct {
-	ID        int
-	Parent    *UndoNode
-	Children  []*UndoNode
-	Timestamp time.Time
-	Edit      EditOp
-	GroupID   int // non-zero when part of a grouped operation (e.g. formatting)
+	ID             int
+	Parent         *UndoNode
+	Children       []*UndoNode
+	Timestamp      time.Time
+	Edit           EditOp
+	GroupID        int   // non-zero when part of a grouped operation (e.g. formatting)
+	CursorSnapshot []int // Multi-cursor positions at group start; nil for single-cursor edits.
 }
 
 // UndoTree implements a branching undo history matching neovim semantics.
 // New edits branch from the current position; redo follows the most recent
 // child. The tree is bounded by maxNodes to prevent unbounded growth.
 type UndoTree struct {
-	root        *UndoNode
-	current     *UndoNode
-	nextID      int
-	maxNodes    int
-	nodeCount   int
-	activeGroup int // non-zero while recording a grouped operation
-	nextGroupID int // monotonic source for group IDs
+	root           *UndoNode
+	current        *UndoNode
+	nextID         int
+	maxNodes       int
+	nodeCount      int
+	activeGroup    int   // non-zero while recording a grouped operation
+	nextGroupID    int   // monotonic source for group IDs
+	pendingCursors []int // cursor snapshot to attach to the first Record in this group
 }
 
 // defaultMaxUndoNodes is the default upper bound on tree size.
@@ -70,8 +72,18 @@ func (ut *UndoTree) BeginGroup() {
 	ut.nextGroupID++
 }
 
+// BeginGroupWithCursors starts a grouped operation and stores a multi-cursor
+// snapshot. The snapshot is stamped on the first Record() in this group.
+func (ut *UndoTree) BeginGroupWithCursors(cursors []int) {
+	ut.BeginGroup()
+	ut.pendingCursors = cursors
+}
+
 // EndGroup ends the current grouped operation.
-func (ut *UndoTree) EndGroup() { ut.activeGroup = 0 }
+func (ut *UndoTree) EndGroup() {
+	ut.activeGroup = 0
+	ut.pendingCursors = nil
+}
 
 // Record appends a new edit as a child of the current node and advances.
 func (ut *UndoTree) Record(edit EditOp) {
@@ -81,6 +93,10 @@ func (ut *UndoTree) Record(edit EditOp) {
 		Timestamp: time.Now(),
 		Edit:      edit,
 		GroupID:   ut.activeGroup,
+	}
+	if ut.pendingCursors != nil {
+		node.CursorSnapshot = ut.pendingCursors
+		ut.pendingCursors = nil
 	}
 	ut.nextID++
 	ut.current.Children = append(ut.current.Children, node)
@@ -92,30 +108,45 @@ func (ut *UndoTree) Record(edit EditOp) {
 // Undo moves backward through the tree and returns edits to reverse.
 // When the current node belongs to a group, all nodes in that group are
 // collected so the caller can reverse the entire grouped operation at once.
-func (ut *UndoTree) Undo() ([]EditOp, bool) {
+// The returned cursor snapshot (may be nil) is from the first node in
+// the group, for restoring multi-cursor positions.
+func (ut *UndoTree) Undo() ([]EditOp, []int, bool) {
 	if !ut.CanUndo() {
-		return nil, false
+		return nil, nil, false
 	}
+	var cursorSnap []int
 	edits := []EditOp{ut.current.Edit}
+	if ut.current.CursorSnapshot != nil {
+		cursorSnap = ut.current.CursorSnapshot
+	}
 	gid := ut.current.GroupID
 	ut.current = ut.current.Parent
 	for gid != 0 && ut.CanUndo() && ut.current.GroupID == gid {
 		edits = append(edits, ut.current.Edit)
+		if cursorSnap == nil && ut.current.CursorSnapshot != nil {
+			cursorSnap = ut.current.CursorSnapshot
+		}
 		ut.current = ut.current.Parent
 	}
-	return edits, true
+	return edits, cursorSnap, true
 }
 
 // Redo moves forward through the tree and returns edits to re-apply.
 // When the next node belongs to a group, all consecutive nodes in that
 // group are collected so the caller can re-apply the entire operation.
-func (ut *UndoTree) Redo() ([]EditOp, bool) {
+// The returned cursor snapshot (may be nil) is from the first node in
+// the group, for restoring multi-cursor positions.
+func (ut *UndoTree) Redo() ([]EditOp, []int, bool) {
 	if !ut.CanRedo() {
-		return nil, false
+		return nil, nil, false
 	}
 	newest := ut.newestChild(ut.current)
 	ut.current = newest
 	edits := []EditOp{newest.Edit}
+	var cursorSnap []int
+	if newest.CursorSnapshot != nil {
+		cursorSnap = newest.CursorSnapshot
+	}
 	gid := newest.GroupID
 	for gid != 0 && ut.CanRedo() {
 		next := ut.newestChild(ut.current)
@@ -125,7 +156,7 @@ func (ut *UndoTree) Redo() ([]EditOp, bool) {
 		ut.current = next
 		edits = append(edits, next.Edit)
 	}
-	return edits, true
+	return edits, cursorSnap, true
 }
 
 // CanUndo reports whether there is an undo step available.

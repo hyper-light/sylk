@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -55,8 +56,9 @@ type StatusWatcher struct {
 	out     chan StatusUpdate
 	nudgeCh chan struct{}
 
-	fsw      *fsnotify.Watcher
-	stopOnce sync.Once
+	fsw        *fsnotify.Watcher
+	stopOnce   sync.Once
+	lastUpdate atomic.Pointer[StatusUpdate]
 }
 
 // NewStatusWatcher creates a watcher for the given git client.
@@ -133,6 +135,12 @@ func (w *StatusWatcher) Start(ctx context.Context) {
 // (Bubble Tea subscription pattern).
 func (w *StatusWatcher) Events() <-chan StatusUpdate {
 	return w.out
+}
+
+// LastUpdate returns the most recent StatusUpdate, or nil if no refresh
+// has completed yet. The returned pointer is safe to read concurrently.
+func (w *StatusWatcher) LastUpdate() *StatusUpdate {
+	return w.lastUpdate.Load()
 }
 
 // addWatchPaths registers fsnotify watches on key .git/ paths.
@@ -245,6 +253,7 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 
 		case update := <-refreshDone:
 			inFlight = false
+			w.lastUpdate.Store(&update)
 
 			// Adaptive backoff: if this was a fallback-initiated refresh
 			// and neither StatusMap nor TrackedSet changed, double the

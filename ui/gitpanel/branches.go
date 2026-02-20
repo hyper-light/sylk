@@ -31,6 +31,13 @@ type branchEntry struct {
 	filesAdded, filesModified, filesDeleted int
 	hasFileStats bool // true when file-level stats are populated
 	hasLineStats bool // true when line-level stats are populated
+
+	// Upstream divergence (from ComputeDivergenceBatch).
+	upstream     string // e.g. "origin/main"
+	aheadCount   int
+	behindUpstream int
+	hasDivergence  bool // true when divergence data is populated
+	hasBranchStash bool // true when a branch-associated stash exists
 }
 
 func (e branchEntry) FilterText() string  { return e.name + " " + e.subject }
@@ -158,7 +165,12 @@ func renderBranchCell(e branchEntry, colID ColumnID, width int, selected bool, t
 		if selected {
 			style = style.Background(p.Selection)
 		}
-		return fitCell(" "+e.name, width, style)
+		label := " " + e.name
+		label += renderDivergenceSuffix(e, p)
+		if e.hasBranchStash {
+			label += " " + lipgloss.NewStyle().Foreground(p.Lavender).Render("S")
+		}
+		return fitCell(label, width, style)
 
 	case "hash":
 		style := lipgloss.NewStyle().Foreground(p.Primary)
@@ -278,6 +290,24 @@ func renderBranchCell(e branchEntry, colID ColumnID, width int, selected bool, t
 	default:
 		return padStyle.Render(strings.Repeat(" ", width))
 	}
+}
+
+// renderDivergenceSuffix returns a styled ahead/behind indicator for upstream divergence.
+// Returns "" when no divergence data is available or branch is in sync.
+func renderDivergenceSuffix(e branchEntry, p theme.Palette) string {
+	if !e.hasDivergence || (e.aheadCount == 0 && e.behindUpstream == 0) {
+		return ""
+	}
+	var parts []string
+	if e.aheadCount > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(p.Teal).Render(
+			"^"+strconv.Itoa(e.aheadCount)))
+	}
+	if e.behindUpstream > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(p.Peach).Render(
+			"v"+strconv.Itoa(e.behindUpstream)))
+	}
+	return " " + strings.Join(parts, " ")
 }
 
 // renderBranchBadge renders the status badge cell for a branch entry.

@@ -461,6 +461,21 @@ type AppModel struct {
 	// Event-driven git status watcher. Nil when project root is not a git repo.
 	gitWatcher *git.StatusWatcher
 
+	// Safety guard for pre/post-operation snapshots and crash recovery.
+	// Nil when project root is not a git repo.
+	safetyGuard *git.SafetyGuard
+
+	// Pre-commit pipeline: staged paths and message while awaiting user
+	// confirmation from large-file or secret-detection modals.
+	// pendingCommitPhase distinguishes large-file (1) vs secret (2) modal.
+	pendingCommitPaths   []string
+	pendingCommitMessage string
+	pendingCommitPhase   int // 0=none, 1=large-file modal, 2=secrets modal
+
+	// Pending sequencer operation: stores params while conflict preview
+	// or integration detection modals are shown.
+	pendingSeqOp *pendingSequencerOp
+
 	// ESC disambiguation: buffer a standalone ESC for a short window so a
 	// follow-up rune can be merged into an Alt+rune KeyMsg. This mirrors
 	// vim's ttimeoutlen / tmux's escape-time mechanism.
@@ -675,6 +690,9 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		if sw, err := git.NewStatusWatcher(gc); err == nil {
 			app.gitWatcher = sw
 		}
+		if sg, err := git.NewSafetyGuard(gc, app.gitBus, git.DefaultSafetyConfig(), app.gitWatcher); err == nil {
+			app.safetyGuard = sg
+		}
 	}
 
 	return app
@@ -698,6 +716,10 @@ func (m *AppModel) Init() tea.Cmd {
 	if m.gitWatcher != nil {
 		m.gitWatcher.Start(m.ctx)
 		cmds = append(cmds, m.gitWatchCmd())
+	}
+	// Run crash recovery + GC for the safety guard in the background.
+	if m.safetyGuard != nil {
+		cmds = append(cmds, m.safetyRecoveryCmd())
 	}
 	return tea.Batch(cmds...)
 }
@@ -738,6 +760,30 @@ func (m *AppModel) gitWatchCmd() tea.Cmd {
 func (m *AppModel) nudgeGitWatcher() {
 	if m.gitWatcher != nil {
 		m.gitWatcher.Nudge()
+	}
+}
+
+// safetyRecoveryDoneMsg signals that background safety recovery + GC completed.
+type safetyRecoveryDoneMsg struct{}
+
+// safetyRecoveryCmd returns a Cmd that runs crash recovery and GC in the
+// background, keeping the startup path non-blocking.
+func (m *AppModel) safetyRecoveryCmd() tea.Cmd {
+	sg := m.safetyGuard
+	return func() tea.Msg {
+		// Phase 1: Recover incomplete operations.
+		ops, err := sg.RecoverOnStartup()
+		if err == nil {
+			for _, op := range ops {
+				_ = sg.ResolveIncomplete(op, git.RecoveryResume)
+			}
+		}
+
+		// Phase 2: GC old snapshots and journal segments.
+		_, _ = sg.GCSnapshots()
+		_ = sg.GCJournal()
+
+		return safetyRecoveryDoneMsg{}
 	}
 }
 
@@ -904,7 +950,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case msg.GitStatusMsg:
 		m.fileTree.SetGitStatus(typed.StatusMap, typed.TrackedSet, typed.TrackedDirs)
-		cmds := []tea.Cmd{m.gitWatchCmd()}
+		cmds := []tea.Cmd{m.gitWatchCmd(), m.detectSequencerStateCmd()}
 		if m.viewMode == ViewGit {
 			cmds = append(cmds, m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 			if m.commitTree.InCommitView() {
@@ -931,7 +977,35 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitPanel != nil {
 			m.gitPanel.SetHasStash(typed.hasStash)
 		}
+		// Fire async divergence + stash badge loading.
+		return m, tea.Batch(m.computeDivergenceBatchCmd(), m.loadBranchStashesCmd())
+
+	case msg.DivergenceLoadedMsg:
+		if m.gitPanel != nil && len(typed.Info) > 0 {
+			m.gitPanel.SetDivergence(typed.Info)
+		}
 		return m, nil
+
+	case branchStashesLoadedMsg:
+		if m.gitPanel != nil && len(typed.stashes) > 0 {
+			m.gitPanel.SetBranchStashes(typed.stashes)
+		}
+		return m, nil
+
+	case msg.SequencerFileStateMsg:
+		if typed.State != nil && typed.State.Active {
+			step := fmt.Sprintf("%d/%d", typed.State.CurrentStep+1, typed.State.TotalSteps)
+			prompt := strings.ToTitle(typed.State.Type[:1]) + typed.State.Type[1:] + "ing " + step
+			if typed.State.OntoRef != "" {
+				prompt += " onto " + typed.State.OntoRef
+			}
+			m.statusBar.SetPrompt(prompt)
+			m.statusBar.SetMode(strings.ToUpper(typed.State.Type))
+		} else {
+			m.statusBar.ClearPrompt()
+		}
+		return m, nil
+
 	case committree.BranchSelectedMsg:
 		if m.viewMode == ViewGit && m.gitBus != nil {
 			defaultBranch := ""
@@ -950,6 +1024,22 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
+		// Check if the new branch has a saved stash.
+		if m.gitBus != nil {
+			bus := m.gitBus
+			name := typed.Name
+			cmds = append(cmds, func() tea.Msg {
+				if bus.HasBranchStash(name) {
+					stashes, err := bus.ListBranchStashes()
+					if err == nil {
+						if metas, ok := stashes[name]; ok && len(metas) > 0 {
+							return msg.BranchStashAvailableMsg{Meta: metas[0]}
+						}
+					}
+				}
+				return nil
+			})
+		}
 		return m, tea.Batch(cmds...)
 
 	case gitpanel.CommitCheckedOutMsg:
@@ -971,6 +1061,25 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			bus := m.gitBus
 			name := typed.Name
 			return m, func() tea.Msg {
+				// Auto-stash dirty files for the current branch before switching.
+				branches, bErr := bus.ListBranches()
+				if bErr == nil {
+					for _, b := range branches {
+						if !b.IsHead {
+							continue
+						}
+						statuses, _, _ := bus.UncommittedFileStatuses()
+						if len(statuses) > 0 {
+							paths := make([]string, 0, len(statuses))
+							for p := range statuses {
+								paths = append(paths, p)
+							}
+							_, _ = bus.StashForBranch(b.Name, paths)
+						}
+						break
+					}
+				}
+
 				if err := bus.CheckoutBranch(name); err != nil {
 					return gitpanel.BranchCheckoutBlockedMsg{Reason: err.Error()}
 				}
@@ -1074,19 +1183,67 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case committree.CommitRequestMsg:
 		if m.gitBus != nil && m.gitPanel != nil {
-			bus := m.gitBus
 			paths := m.gitPanel.StagedFilePaths()
 			message := typed.Message
-			return m, func() tea.Msg {
-				if len(paths) == 0 {
-					return commitFailedMsg{reason: "no files staged"}
-				}
-				if err := bus.CommitFiles(paths, message); err != nil {
-					return commitFailedMsg{reason: err.Error()}
-				}
-				return commitSucceededMsg{message: message}
+			if len(paths) == 0 {
+				m.statusBar.SetFlash("No files staged")
+				return m, nil
+			}
+			// Route through pre-commit pipeline (large file + secret scan).
+			return m, m.preCommitCheckCmd(paths, message)
+		}
+		return m, nil
+
+	case msg.PreCommitCleanMsg:
+		// Pre-commit checks passed — proceed with actual commit.
+		bus := m.gitBus
+		paths, message := typed.Paths, typed.Message
+		return m, func() tea.Msg {
+			if err := bus.CommitFiles(paths, message); err != nil {
+				return commitFailedMsg{reason: err.Error()}
+			}
+			return commitSucceededMsg{message: message}
+		}
+
+	case msg.LargeFilesDetectedMsg:
+		items := make([]modal.ListModalItem, len(typed.Files))
+		for i, f := range typed.Files {
+			badge := formatFileSize(f.Size)
+			if f.Binary {
+				badge = "BIN"
+			}
+			items[i] = modal.ListModalItem{
+				Label: f.Path,
+				Badge: badge,
+				Color: m.config.Theme().Palette.Peach,
 			}
 		}
+		footer := fmt.Sprintf("%d file(s) flagged", len(typed.Files))
+		lm := modal.NewListModal("Large/Binary Files Detected", items, footer,
+			[]string{"Continue", "Cancel"}, m.config.Theme())
+		m.modalOverlay.Push(lm)
+		m.pendingCommitPaths = typed.Paths
+		m.pendingCommitMessage = typed.Message
+		m.pendingCommitPhase = 1
+		return m, nil
+
+	case msg.SecretsDetectedMsg:
+		items := make([]modal.ListModalItem, len(typed.Findings))
+		for i, f := range typed.Findings {
+			items[i] = modal.ListModalItem{
+				Label:  fmt.Sprintf("%s:%d", f.Path, f.Line),
+				Detail: f.PatternName,
+				Badge:  f.Snippet,
+				Color:  m.config.Theme().Palette.Error,
+			}
+		}
+		footer := fmt.Sprintf("%d secret(s) detected", len(typed.Findings))
+		lm := modal.NewListModal("Potential Secrets Detected", items, footer,
+			[]string{"Continue Anyway", "Cancel"}, m.config.Theme())
+		m.modalOverlay.Push(lm)
+		m.pendingCommitPaths = typed.Paths
+		m.pendingCommitMessage = typed.Message
+		m.pendingCommitPhase = 2
 		return m, nil
 
 	case commitSucceededMsg:
@@ -1355,37 +1512,31 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case committree.CherryPickRequestMsg:
 		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Cherry-picking...")
-			m.mergeLabels = nil // Not a merge operation.
-			bus := m.gitBus
+			m.commitTree.SetLoadingMessage("Checking cherry-pick...")
+			m.mergeLabels = nil
 			hashes, target := typed.Hashes, typed.TargetBranch
-			return m, func() tea.Msg {
-				status, err := bus.CherryPickSequence(hashes, target)
-				if err != nil {
-					return sequencerFailedMsg{reason: err.Error()}
-				}
-				return sequencerResultMsg{status: status}
+			m.pendingSeqOp = &pendingSequencerOp{
+				op: "cherry-pick", hashes: hashes, target: target,
 			}
+			// Run integration detection first.
+			return m, m.detectIntegrationCmd(hashes, target, nil)
 		}
 		return m, nil
 
 	case committree.RebaseStartMsg:
 		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Rebasing...")
-			m.mergeLabels = nil // Not a merge operation.
-			bus := m.gitBus
+			m.commitTree.SetLoadingMessage("Checking rebase...")
+			m.mergeLabels = nil
 			onto := typed.OntoBranch
 			plan := make([]git.RebasePlanEntry, len(typed.Plan))
 			for i, p := range typed.Plan {
 				plan[i] = git.RebasePlanEntry{Action: git.RebaseAction(p.Action), Hash: p.Hash}
 			}
-			return m, func() tea.Msg {
-				status, err := bus.RebaseInteractive(onto, plan)
-				if err != nil {
-					return sequencerFailedMsg{reason: err.Error()}
-				}
-				return sequencerResultMsg{status: status}
+			m.pendingSeqOp = &pendingSequencerOp{
+				op: "rebase", target: onto, plan: plan,
 			}
+			// Run conflict preview.
+			return m, m.conflictPreviewRebaseCmd(onto)
 		}
 		return m, nil
 
@@ -1521,13 +1672,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case conflictview.SequencerAbortMsg:
-		bus := m.gitBus
-		return m, func() tea.Msg {
-			if err := bus.SequencerAbort(); err != nil {
-				return sequencerAbortFailedMsg{reason: err.Error()}
-			}
-			return sequencerAbortedMsg{}
-		}
+		// Preserve state before aborting (backup ref + stash dirty files).
+		return m, m.preserveAbortCmd("sequencer")
 
 	case conflictResolveWrittenMsg:
 		m.nudgeGitWatcher()
@@ -1535,6 +1681,27 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 
 	case conflictResolveFailedMsg:
 		m.statusBar.SetFlash("Resolve failed: " + typed.reason)
+		return m, nil
+
+	case msg.ConflictPreviewMsg:
+		return m, m.handleConflictPreview(typed)
+
+	case msg.IntegrationDetectedMsg:
+		return m, m.handleIntegrationDetected(typed)
+
+	case msg.AbortPreservedMsg:
+		return m, m.handleAbortPreserved(typed)
+
+	case msg.BranchStashAvailableMsg:
+		return m, m.handleBranchStashAvailable(typed)
+
+	case msg.BranchStashRestoredMsg:
+		if typed.Err != nil {
+			m.statusBar.SetFlash("Stash restore failed: " + typed.Err.Error())
+		} else {
+			m.statusBar.SetFlash("Branch stash restored")
+			m.nudgeGitWatcher()
+		}
 		return m, nil
 
 	case editor.ConflictResolvedMsg:
@@ -1640,6 +1807,15 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case mergediff.MergeBranchMsg:
+		if m.gitBus != nil && len(m.mergeLabels) >= 2 {
+			m.pendingSeqOp = &pendingSequencerOp{
+				op:     "merge",
+				hashes: []string{m.mergeLabels[0]},
+				target: m.mergeLabels[1],
+				delete: typed.DeleteSource,
+			}
+			return m, m.conflictPreviewMergeCmd(m.mergeLabels[0], m.mergeLabels[1])
+		}
 		return m, m.executeMergeBranch(typed.DeleteSource)
 
 	case msg.FileReplacedMsg:
@@ -1649,7 +1825,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.GuideResponseMsg:
 		return m, m.handleGuideResponse(typed)
 	case modal.ModalClosedMsg:
-		return m, m.handleModalClosed()
+		return m, m.handleModalClosed(typed.Result)
 	case msg.LSPDiagnosticMsg:
 		return m, m.handleLSPDiagnostic(typed)
 	case msg.LSPProvisionDoneMsg:
@@ -1838,6 +2014,9 @@ func (m *AppModel) Shutdown() error {
 		m.gitBridge.Stop()
 	}
 	_ = m.lspManager.Shutdown()
+	if m.safetyGuard != nil {
+		_ = m.safetyGuard.Close()
+	}
 	return m.deps.Scope.Shutdown(shutdownGrace, shutdownHard)
 }
 
@@ -2132,13 +2311,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictFileList {
-			bus := m.gitBus
-			return m, func() tea.Msg {
-				if err := bus.SequencerAbort(); err != nil {
-					return sequencerAbortFailedMsg{reason: err.Error()}
-				}
-				return sequencerAbortedMsg{}
-			}
+			return m, m.preserveAbortCmd("sequencer")
 		}
 		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList && m.mergeDiffView.FileSearchActive() {
 			m.mergeDiffView.UpdateFileList("esc")
@@ -3543,9 +3716,218 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	return nil
 }
 
-func (m *AppModel) handleModalClosed() tea.Cmd {
+// handleConflictPreview processes a dry-run merge result. If conflicts are
+// found, shows a list modal; otherwise proceeds immediately.
+func (m *AppModel) handleConflictPreview(typed msg.ConflictPreviewMsg) tea.Cmd {
+	if typed.Result == nil || typed.Result.Clean {
+		// No conflicts — proceed directly.
+		if m.pendingSeqOp != nil {
+			op := m.pendingSeqOp
+			m.pendingSeqOp = nil
+			return m.executeSequencerOp(op)
+		}
+		return nil
+	}
+
+	conflicts := typed.Result.Conflicts
+	items := make([]modal.ListModalItem, len(conflicts))
+	for i, c := range conflicts {
+		items[i] = modal.ListModalItem{
+			Label: c.Path,
+			Color: m.config.Theme().Palette.Error,
+		}
+	}
+	footer := fmt.Sprintf("%d file(s) will conflict", len(conflicts))
+	lm := modal.NewListModal("Conflicts Detected ("+typed.Op+")", items, footer,
+		[]string{"Continue", "Cancel"}, m.config.Theme())
+	m.modalOverlay.Push(lm)
+	if m.pendingSeqOp != nil {
+		m.pendingSeqOp.phase = 2
+	}
+	return nil
+}
+
+// handleIntegrationDetected processes cherry-pick duplicate detection results.
+// Shows a list modal when already-integrated commits are found.
+func (m *AppModel) handleIntegrationDetected(typed msg.IntegrationDetectedMsg) tea.Cmd {
+	// Count integrated commits.
+	var integrated int
+	for _, r := range typed.Results {
+		if r.Integrated {
+			integrated++
+		}
+	}
+
+	if integrated == 0 {
+		// No duplicates — proceed to conflict preview.
+		if m.pendingSeqOp != nil {
+			return m.conflictPreviewCherryPickCmd(m.pendingSeqOp.hashes, nil)
+		}
+		return nil
+	}
+
+	items := make([]modal.ListModalItem, 0, len(typed.Results))
+	for _, r := range typed.Results {
+		badge := ""
+		var color lipgloss.Color
+		if r.Integrated {
+			badge = "INTEGRATED"
+			color = m.config.Theme().Palette.Teal
+		}
+		items = append(items, modal.ListModalItem{
+			Label:  r.CommitHash[:min(len(r.CommitHash), 8)],
+			Detail: r.Subject,
+			Badge:  badge,
+			Color:  color,
+		})
+	}
+	footer := fmt.Sprintf("%d of %d commit(s) already integrated", integrated, len(typed.Results))
+	lm := modal.NewListModal("Cherry-Pick Integration Check", items, footer,
+		[]string{"Apply All", "Cancel"}, m.config.Theme())
+	m.modalOverlay.Push(lm)
+	if m.pendingSeqOp != nil {
+		m.pendingSeqOp.phase = 1
+	}
+	return nil
+}
+
+// handleAbortPreserved handles the result of a pre-abort preservation.
+func (m *AppModel) handleAbortPreserved(typed msg.AbortPreservedMsg) tea.Cmd {
+	if typed.Err != nil {
+		m.statusBar.SetFlash("Abort preservation failed: " + typed.Err.Error())
+	} else if typed.Preservation != nil {
+		parts := []string{"State preserved"}
+		if typed.Preservation.BackupBranch != "" {
+			parts = append(parts, "ref: "+typed.Preservation.BackupBranch)
+		}
+		if len(typed.Preservation.StashedPaths) > 0 {
+			parts = append(parts, fmt.Sprintf("%d file(s) stashed", len(typed.Preservation.StashedPaths)))
+		}
+		m.statusBar.SetFlash(strings.Join(parts, " — "))
+	}
+
+	// Now proceed with the actual abort.
+	bus := m.gitBus
+	return func() tea.Msg {
+		if err := bus.SequencerAbort(); err != nil {
+			return sequencerAbortFailedMsg{reason: err.Error()}
+		}
+		return sequencerAbortedMsg{}
+	}
+}
+
+// handleBranchStashAvailable offers to restore a branch stash after checkout.
+func (m *AppModel) handleBranchStashAvailable(typed msg.BranchStashAvailableMsg) tea.Cmd {
+	m.statusBar.SetFlash(
+		fmt.Sprintf("Branch stash available (%d files) — restoring", typed.Meta.FileCount))
+	bus := m.gitBus
+	branch := typed.Meta.BranchName
+	return func() tea.Msg {
+		err := bus.UnstashForBranch(branch)
+		return msg.BranchStashRestoredMsg{Err: err}
+	}
+}
+
+func (m *AppModel) handleModalClosed(result any) tea.Cmd {
 	if !m.modalOverlay.Active() {
 		m.overlay = overlayNone
+	}
+
+	lr, ok := result.(modal.ListModalResult)
+	if !ok {
+		return nil
+	}
+
+	// Route pre-commit pipeline results.
+	if m.pendingCommitPhase != 0 {
+		return m.routePreCommitModal(lr)
+	}
+
+	// Route sequencer operation modals (integration detection, conflict preview).
+	if m.pendingSeqOp != nil {
+		return m.routeSequencerModal(lr)
+	}
+
+	return nil
+}
+
+// routePreCommitModal handles large-file / secret modal confirmations.
+func (m *AppModel) routePreCommitModal(lr modal.ListModalResult) tea.Cmd {
+	phase := m.pendingCommitPhase
+	paths := m.pendingCommitPaths
+	message := m.pendingCommitMessage
+	m.pendingCommitPaths = nil
+	m.pendingCommitMessage = ""
+	m.pendingCommitPhase = 0
+
+	if lr.Action != 0 {
+		m.statusBar.SetFlash("Commit cancelled")
+		return nil
+	}
+
+	bus := m.gitBus
+	switch phase {
+	case 1:
+		// Large-file modal confirmed — proceed to secret scan.
+		return func() tea.Msg {
+			secrets, err := bus.ScanStagedSecrets(paths)
+			if err == nil && len(secrets) > 0 {
+				return msg.SecretsDetectedMsg{Findings: secrets, Paths: paths, Message: message}
+			}
+			return msg.PreCommitCleanMsg{Paths: paths, Message: message}
+		}
+	case 2:
+		// Secrets modal confirmed — proceed to commit.
+		return func() tea.Msg {
+			if err := bus.CommitFiles(paths, message); err != nil {
+				return commitFailedMsg{reason: err.Error()}
+			}
+			return commitSucceededMsg{message: message}
+		}
+	}
+	return nil
+}
+
+// routeSequencerModal handles integration detection and conflict preview
+// modal confirmations for pending cherry-pick/rebase/merge operations.
+func (m *AppModel) routeSequencerModal(lr modal.ListModalResult) tea.Cmd {
+	op := m.pendingSeqOp
+	m.pendingSeqOp = nil
+
+	if lr.Action != 0 {
+		// Last action = cancel.
+		if m.commitTree != nil {
+			m.commitTree.ClearLoadingMessage()
+		}
+		m.statusBar.SetFlash(op.op + " cancelled")
+		return nil
+	}
+
+	return m.executeSequencerOp(op)
+}
+
+// executeSequencerOp dispatches the stored sequencer operation.
+func (m *AppModel) executeSequencerOp(op *pendingSequencerOp) tea.Cmd {
+	bus := m.gitBus
+	switch op.op {
+	case "cherry-pick":
+		return func() tea.Msg {
+			status, err := bus.CherryPickSequence(op.hashes, op.target)
+			if err != nil {
+				return sequencerFailedMsg{reason: err.Error()}
+			}
+			return sequencerResultMsg{status: status}
+		}
+	case "rebase":
+		return func() tea.Msg {
+			status, err := bus.RebaseInteractive(op.target, op.plan)
+			if err != nil {
+				return sequencerFailedMsg{reason: err.Error()}
+			}
+			return sequencerResultMsg{status: status}
+		}
+	case "merge":
+		return m.executeMergeBranch(op.delete)
 	}
 	return nil
 }
@@ -3554,10 +3936,11 @@ func (m *AppModel) handleModalClosed() tea.Cmd {
 type chordState int
 
 const (
-	chordNone    chordState = iota
-	chordSession            // Alt+S pressed, waiting for arrow.
-	chordAgent              // Alt+A pressed, waiting for arrow.
-	chordView               // Alt+V pressed, waiting for arrow.
+	chordNone        chordState = iota
+	chordSession                // Alt+S pressed, waiting for arrow.
+	chordAgent                  // Alt+A pressed, waiting for arrow.
+	chordView                   // Alt+V pressed, waiting for arrow.
+	chordMultiCursor            // Alt+Shift+D pressed, waiting for up/down/d.
 )
 
 // chordArrowDelta maps arrow key strings (including alt-held variants) to
@@ -3584,9 +3967,10 @@ type chordDisplay struct {
 // chordDisplays maps chord states to their display properties.
 // Session select uses Primary (blue), Agent select uses Success (green).
 var chordDisplays = map[chordState]chordDisplay{
-	chordSession: {"Session select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
-	chordAgent:   {"Agent select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Success }},
-	chordView:    {"View select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Accent }},
+	chordSession:     {"Session select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Primary }},
+	chordAgent:       {"Agent select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Success }},
+	chordView:        {"View select", "←/→ cycle", func(p *theme.Palette) lipgloss.Color { return p.Accent }},
+	chordMultiCursor: {"Multi-cursor", "↓ add  ↑ remove  d next word  esc exit", func(p *theme.Palette) lipgloss.Color { return p.Warning }},
 }
 
 // chordHint returns a styled hint string when a chord is active, or "" when idle.
@@ -3644,8 +4028,32 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 		return nil, true
 	}
 
+	ks := key.String()
+
+	// Multi-cursor chord trigger: Alt+Shift+D (only in edit mode with editor focused).
+	if ks == "alt+D" {
+		if m.viewMode == ViewEdit && m.isEditorFocused() {
+			if m.chord == chordMultiCursor {
+				m.chord = chordNone
+			} else {
+				m.chord = chordMultiCursor
+			}
+			return nil, true
+		}
+		return nil, false
+	}
+
+	// Active multi-cursor chord: up/down add cursors, d adds at next word, esc/other cancels.
+	if m.chord == chordMultiCursor {
+		if m.viewMode != ViewEdit || !m.isEditorFocused() {
+			m.chord = chordNone
+			return nil, false
+		}
+		return m.handleMultiCursorChord(ks)
+	}
+
 	// Chord triggers: toggle on if idle or switching, toggle off if repeated.
-	if target, ok := chordKeyMap[key.String()]; ok {
+	if target, ok := chordKeyMap[ks]; ok {
 		// Mode guard: non-view chords are disabled in edit/git mode.
 		// chordView is allowed so the user can cycle between modes.
 		if m.viewMode != ViewChat && target != chordView {
@@ -3661,7 +4069,6 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 			return nil, false
 		}
 		// Debounce: absorb key-repeat to prevent rapid toggle cycling.
-		ks := key.String()
 		now := time.Now()
 		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
 			return nil, true
@@ -3682,11 +4089,45 @@ func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
 	}
 
 	// Active chord: arrow keys cycle, anything else cancels.
-	if delta, ok := chordArrowDelta[key.String()]; ok {
+	if delta, ok := chordArrowDelta[ks]; ok {
 		return m.dispatchChordCycle(m.chord, delta), true
 	}
 
 	m.chord = chordNone
+	return nil, true
+}
+
+// multiCursorChordKeys maps key strings accepted during the multi-cursor chord
+// to their action. The chord stays active after each action, allowing repeated
+// presses. Only "up"/"down" (plain or with alt held) and "d"/"alt+d" are valid.
+var multiCursorChordKeys = map[string]string{
+	"up":       "remove",
+	"down":     "below",
+	"alt+up":   "remove",
+	"alt+down": "below",
+	"d":        "word",
+	"alt+d":    "word",
+}
+
+// handleMultiCursorChord processes keys while the multi-cursor chord is active.
+// Returns (cmd, true) if consumed, or cancels the chord and returns (nil, true)
+// so the cancelled key is swallowed (user presses a non-chord key to exit).
+func (m *AppModel) handleMultiCursorChord(ks string) (tea.Cmd, bool) {
+	action, ok := multiCursorChordKeys[ks]
+	if !ok {
+		// Any non-chord key cancels the chord.
+		m.chord = chordNone
+		return nil, true
+	}
+	ed := m.focusedEditor()
+	switch action {
+	case "remove":
+		ed.RemoveBottomCursor()
+	case "below":
+		ed.AddCursorBelow()
+	case "word":
+		ed.AddCursorAtNextOccurrence()
+	}
 	return nil, true
 }
 
@@ -4063,6 +4504,7 @@ type gitBranchDAGLoadedMsg struct {
 }
 
 type branchDeletedMsg struct{ name string }
+type branchStashesLoadedMsg struct{ stashes map[string][]git.BranchStashMeta }
 type branchDeleteFailedMsg struct{ reason string }
 type branchCreatedMsg struct{ name string }
 type branchCreateFailedMsg struct{ reason string }
@@ -4089,6 +4531,17 @@ type sequencerAbortedMsg struct{}
 type sequencerAbortFailedMsg struct{ reason string }
 type conflictResolveWrittenMsg struct{ path string }
 type conflictResolveFailedMsg struct{ path, reason string }
+
+// pendingSequencerOp stores deferred sequencer parameters while the user
+// reviews a conflict preview or integration detection modal.
+type pendingSequencerOp struct {
+	op     string // "cherry-pick", "rebase", "merge"
+	phase  int    // 1=integration modal, 2=conflict preview modal
+	hashes []string
+	target string
+	plan   []git.RebasePlanEntry
+	delete bool // merge: delete source branch after
+}
 
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.
@@ -4204,6 +4657,157 @@ func (m *AppModel) quickGitStatusCmd() tea.Cmd {
 			hasIndexStaged: hasIndexStaged,
 			hasStash:       bus.HasStash(),
 		}
+	}
+}
+
+// detectSequencerStateCmd checks for an active rebase/merge/cherry-pick
+// by reading .git/ filesystem markers.
+func (m *AppModel) detectSequencerStateCmd() tea.Cmd {
+	bus := m.gitBus
+	if bus == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		state := bus.DetectSequencerFileState()
+		return msg.SequencerFileStateMsg{State: state}
+	}
+}
+
+// computeDivergenceBatchCmd asynchronously computes ahead/behind counts
+// for all branches relative to their configured upstream tracking refs.
+func (m *AppModel) computeDivergenceBatchCmd() tea.Cmd {
+	bus := m.gitBus
+	if bus == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		branches, err := bus.ListBranches()
+		if err != nil {
+			return msg.DivergenceLoadedMsg{}
+		}
+		names := make([]string, len(branches))
+		for i, b := range branches {
+			names[i] = b.Name
+		}
+		info, err := bus.ComputeDivergenceBatch(names)
+		if err != nil {
+			return msg.DivergenceLoadedMsg{}
+		}
+		return msg.DivergenceLoadedMsg{Info: info}
+	}
+}
+
+// loadBranchStashesCmd asynchronously lists branch stashes for stash badges.
+func (m *AppModel) loadBranchStashesCmd() tea.Cmd {
+	bus := m.gitBus
+	if bus == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		stashes, err := bus.ListBranchStashes()
+		if err != nil {
+			return branchStashesLoadedMsg{}
+		}
+		return branchStashesLoadedMsg{stashes: stashes}
+	}
+}
+
+// conflictPreviewMergeCmd previews merge conflicts before executing.
+func (m *AppModel) conflictPreviewMergeCmd(source, target string) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		result, err := bus.PreviewMerge(source, target)
+		if err != nil || result.Clean {
+			return msg.ConflictPreviewMsg{Result: result, Op: "merge"}
+		}
+		return msg.ConflictPreviewMsg{Result: result, Op: "merge"}
+	}
+}
+
+// conflictPreviewRebaseCmd previews rebase conflicts before executing.
+func (m *AppModel) conflictPreviewRebaseCmd(onto string) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		result, err := bus.PreviewRebase(onto)
+		if err != nil || result == nil {
+			return msg.ConflictPreviewMsg{Result: result, Op: "rebase"}
+		}
+		return msg.ConflictPreviewMsg{Result: result, Op: "rebase"}
+	}
+}
+
+// conflictPreviewCherryPickCmd previews cherry-pick conflicts before executing.
+func (m *AppModel) conflictPreviewCherryPickCmd(hashes []string, params any) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		result, err := bus.PreviewCherryPick(hashes)
+		if err != nil || result == nil {
+			return msg.ConflictPreviewMsg{Result: result, Op: "cherry-pick", Params: params}
+		}
+		return msg.ConflictPreviewMsg{Result: result, Op: "cherry-pick", Params: params}
+	}
+}
+
+// detectIntegrationCmd checks for already-integrated cherry-pick commits.
+func (m *AppModel) detectIntegrationCmd(hashes []string, targetBranch string, params any) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		results, err := bus.DetectIntegratedCommits(hashes, targetBranch)
+		if err != nil {
+			return msg.IntegrationDetectedMsg{Params: params}
+		}
+		return msg.IntegrationDetectedMsg{Results: results, Params: params}
+	}
+}
+
+// preserveAbortCmd creates a backup ref and stash before sequencer abort.
+func (m *AppModel) preserveAbortCmd(opName string) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		pres, err := bus.PreserveBeforeAbort(opName)
+		return msg.AbortPreservedMsg{Preservation: pres, Err: err}
+	}
+}
+
+// preCommitSizeThreshold is the file size (bytes) above which a staged file
+// is flagged in the pre-commit pipeline. Derived from: 5 MiB is the standard
+// GitHub push warning threshold and a common large-file guardrail.
+const preCommitSizeThreshold = 5 * 1024 * 1024
+
+// preCommitCheckCmd runs the large-file and secret scan pipeline in sequence.
+// If large files are found, returns LargeFilesDetectedMsg (secrets deferred
+// to after user confirmation). Otherwise proceeds to secret scan.
+func (m *AppModel) preCommitCheckCmd(paths []string, message string) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		large, err := bus.ScanStagedLargeFiles(paths, preCommitSizeThreshold)
+		if err == nil && len(large) > 0 {
+			return msg.LargeFilesDetectedMsg{Files: large, Paths: paths, Message: message}
+		}
+		secrets, err := bus.ScanStagedSecrets(paths)
+		if err == nil && len(secrets) > 0 {
+			return msg.SecretsDetectedMsg{Findings: secrets, Paths: paths, Message: message}
+		}
+		return msg.PreCommitCleanMsg{Paths: paths, Message: message}
+	}
+}
+
+// formatFileSize renders a byte count as a human-readable string.
+func formatFileSize(size int64) string {
+	const (
+		kib = 1024
+		mib = kib * 1024
+		gib = mib * 1024
+	)
+	switch {
+	case size >= gib:
+		return fmt.Sprintf("%.1f GB", float64(size)/float64(gib))
+	case size >= mib:
+		return fmt.Sprintf("%.1f MB", float64(size)/float64(mib))
+	case size >= kib:
+		return fmt.Sprintf("%.1f KB", float64(size)/float64(kib))
+	default:
+		return fmt.Sprintf("%d B", size)
 	}
 }
 

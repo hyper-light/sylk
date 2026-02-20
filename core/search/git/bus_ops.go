@@ -104,6 +104,34 @@ const (
 	OpReadBlobContent     // read_blob_content
 	OpWriteWorktreeFile   // write_worktree_file
 
+	// Preview operations.
+	OpPreviewMerge      // preview_merge
+	OpPreviewRebase     // preview_rebase
+	OpPreviewCherryPick // preview_cherry_pick
+
+	// Guard operations.
+	OpScanLargeFiles // scan_large_files
+	OpScanSecrets    // scan_secrets
+
+	// Divergence operations.
+	OpComputeDivergence      // compute_divergence
+	OpComputeDivergenceBatch // compute_divergence_batch
+
+	// State inspection.
+	OpDetectSequencerFileState // detect_sequencer_file_state
+
+	// Abort preservation.
+	OpPreserveBeforeAbort // preserve_before_abort
+
+	// Integration detection.
+	OpDetectIntegratedCommits // detect_integrated_commits
+
+	// Branch stash operations.
+	OpStashForBranch    // stash_for_branch
+	OpUnstashForBranch  // unstash_for_branch
+	OpHasBranchStash    // has_branch_stash
+	OpListBranchStashes // list_branch_stashes
+
 	opCount // unexported sentinel — must remain last
 )
 
@@ -194,6 +222,27 @@ var opNames = [opCount]string{
 	OpResolveConflictFile: "resolve_conflict_file",
 	OpReadBlobContent:     "read_blob_content",
 	OpWriteWorktreeFile:   "write_worktree_file",
+
+	OpPreviewMerge:      "preview_merge",
+	OpPreviewRebase:     "preview_rebase",
+	OpPreviewCherryPick: "preview_cherry_pick",
+
+	OpScanLargeFiles: "scan_large_files",
+	OpScanSecrets:    "scan_secrets",
+
+	OpComputeDivergence:      "compute_divergence",
+	OpComputeDivergenceBatch: "compute_divergence_batch",
+
+	OpDetectSequencerFileState: "detect_sequencer_file_state",
+
+	OpPreserveBeforeAbort: "preserve_before_abort",
+
+	OpDetectIntegratedCommits: "detect_integrated_commits",
+
+	OpStashForBranch:    "stash_for_branch",
+	OpUnstashForBranch:  "unstash_for_branch",
+	OpHasBranchStash:    "has_branch_stash",
+	OpListBranchStashes: "list_branch_stashes",
 }
 
 // opByName is the inverse of opNames, built at init time.
@@ -273,6 +322,22 @@ var opCategories = [opCount]string{
 	OpSequencerStatus: "sequencer", OpResolveConflictFile: "sequencer",
 	OpReadBlobContent:   "sequencer",
 	OpWriteWorktreeFile: "sequencer",
+
+	OpPreviewMerge: "preview", OpPreviewRebase: "preview",
+	OpPreviewCherryPick: "preview",
+
+	OpScanLargeFiles: "guard", OpScanSecrets: "guard",
+
+	OpComputeDivergence: "state", OpComputeDivergenceBatch: "state",
+
+	OpDetectSequencerFileState: "state",
+
+	OpPreserveBeforeAbort: "safety",
+
+	OpDetectIntegratedCommits: "preview",
+
+	OpStashForBranch: "stash", OpUnstashForBranch: "stash",
+	OpHasBranchStash: "stash", OpListBranchStashes: "stash",
 }
 
 // OpCategory returns the category of the operation (e.g. "branch", "commit").
@@ -295,6 +360,8 @@ var mutatingOps = [...]GitOp{
 	OpCherryPickSequence, OpRebaseInteractive, OpMergeSequence,
 	OpSequencerContinue, OpSequencerBypass, OpSequencerAbort, OpResolveConflictFile,
 	OpWriteWorktreeFile,
+	OpPreserveBeforeAbort,
+	OpStashForBranch, OpUnstashForBranch,
 }
 
 // mutatingBits is a bitset built at init time from mutatingOps.

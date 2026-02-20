@@ -410,3 +410,103 @@ func (b *GitBus) WriteWorktreeFile(path, content string) error {
 	return dispatchVoid(b, OpWriteWorktreeFile, [2]string{path, ""},
 		func() error { return b.client.WriteWorktreeFile(path, content) })
 }
+
+// ---------------------------------------------------------------------------
+// Preview operations
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) PreviewMerge(sourceBranch, targetBranch string) (*ConflictPreviewResult, error) {
+	return dispatch(b, OpPreviewMerge, [2]string{sourceBranch, targetBranch},
+		func() (*ConflictPreviewResult, error) { return b.client.PreviewMerge(sourceBranch, targetBranch) })
+}
+
+func (b *GitBus) PreviewRebase(ontoBranch string) (*ConflictPreviewResult, error) {
+	return dispatch(b, OpPreviewRebase, ontoBranch,
+		func() (*ConflictPreviewResult, error) { return b.client.PreviewRebase(ontoBranch) })
+}
+
+func (b *GitBus) PreviewCherryPick(commitHashes []string) (*ConflictPreviewResult, error) {
+	return dispatch(b, OpPreviewCherryPick, commitHashes,
+		func() (*ConflictPreviewResult, error) { return b.client.PreviewCherryPick(commitHashes) })
+}
+
+// ---------------------------------------------------------------------------
+// Guard operations
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) ScanStagedLargeFiles(paths []string, sizeThreshold int64) ([]LargeFileEntry, error) {
+	return dispatch(b, OpScanLargeFiles, [2]any{paths, sizeThreshold},
+		func() ([]LargeFileEntry, error) { return b.client.ScanStagedLargeFiles(paths, sizeThreshold) })
+}
+
+func (b *GitBus) ScanStagedSecrets(paths []string) ([]SecretFinding, error) {
+	return dispatch(b, OpScanSecrets, paths,
+		func() ([]SecretFinding, error) { return b.client.ScanStagedSecrets(paths) })
+}
+
+// ---------------------------------------------------------------------------
+// Divergence operations
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) ComputeDivergence(branchName string) (*DivergenceInfo, error) {
+	return dispatch(b, OpComputeDivergence, branchName,
+		func() (*DivergenceInfo, error) { return b.client.ComputeDivergence(branchName) })
+}
+
+func (b *GitBus) ComputeDivergenceBatch(branches []string) ([]DivergenceInfo, error) {
+	return dispatch(b, OpComputeDivergenceBatch, branches,
+		func() ([]DivergenceInfo, error) { return b.client.ComputeDivergenceBatch(branches) })
+}
+
+// ---------------------------------------------------------------------------
+// State inspection
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) DetectSequencerFileState() *SequencerFileState {
+	return dispatchPure(b, OpDetectSequencerFileState, nil,
+		func() *SequencerFileState { return b.client.DetectSequencerFileState() })
+}
+
+// ---------------------------------------------------------------------------
+// Abort preservation
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) PreserveBeforeAbort(opName string) (*AbortPreservation, error) {
+	return dispatch(b, OpPreserveBeforeAbort, opName,
+		func() (*AbortPreservation, error) { return b.client.PreserveBeforeAbort(opName) })
+}
+
+// ---------------------------------------------------------------------------
+// Integration detection
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) DetectIntegratedCommits(commitHashes []string, targetBranch string) ([]IntegrationResult, error) {
+	return dispatch(b, OpDetectIntegratedCommits, [2]any{commitHashes, targetBranch},
+		func() ([]IntegrationResult, error) {
+			return b.client.DetectIntegratedCommits(commitHashes, targetBranch)
+		})
+}
+
+// ---------------------------------------------------------------------------
+// Branch stash operations
+// ---------------------------------------------------------------------------
+
+func (b *GitBus) StashForBranch(branchName string, paths []string) (*BranchStashMeta, error) {
+	return dispatch(b, OpStashForBranch, [2]any{branchName, paths},
+		func() (*BranchStashMeta, error) { return b.client.StashForBranch(branchName, paths) })
+}
+
+func (b *GitBus) UnstashForBranch(branchName string) error {
+	return dispatchVoid(b, OpUnstashForBranch, branchName,
+		func() error { return b.client.UnstashForBranch(branchName) })
+}
+
+func (b *GitBus) HasBranchStash(branchName string) bool {
+	return dispatchPure(b, OpHasBranchStash, branchName,
+		func() bool { return b.client.HasBranchStash(branchName) })
+}
+
+func (b *GitBus) ListBranchStashes() (map[string][]BranchStashMeta, error) {
+	return dispatch(b, OpListBranchStashes, nil,
+		func() (map[string][]BranchStashMeta, error) { return b.client.ListBranchStashes() })
+}
