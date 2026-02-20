@@ -18,6 +18,7 @@ const (
 	ctbOurs
 	ctbTheirs
 	ctbBoth
+	ctbUndo
 	ctbCount
 )
 
@@ -38,6 +39,7 @@ var ctbStaticDefs = [ctbCount]ctbDef{
 	ctbOurs:     {icon: "↑", label: "Dest", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
 	ctbTheirs:   {icon: "↓", label: "Source", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
 	ctbBoth:     {icon: "↕", label: "Both", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
+	ctbUndo:     {icon: "↩", label: "Undo", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
 }
 
 // ctbDefFor returns the button definition for a given ID, substituting
@@ -170,10 +172,13 @@ func (m *Model) isToolbarButtonEnabled(id int) bool {
 	case ctbPrev, ctbNext:
 		return m.hasHunks()
 	case ctbOurs, ctbTheirs:
-		return m.selectedEntry() != nil
+		e := m.selectedEntry()
+		return e != nil && e.Resolution == ResUnresolved
 	case ctbBoth:
 		e := m.selectedEntry()
-		return e != nil && supportsResolution(e, ResBoth)
+		return e != nil && e.Resolution == ResUnresolved && supportsResolution(e, ResBoth)
+	case ctbUndo:
+		return m.canUndo()
 	default:
 		return true
 	}
@@ -246,6 +251,10 @@ func (m *Model) activateToolbarButton(idx int) tea.Cmd {
 		return cmd
 	case ctbBoth:
 		cmd := m.resolveKey(ResBoth)
+		m.preserveToolbarFocus(idx)
+		return cmd
+	case ctbUndo:
+		cmd := m.undoResolution()
 		m.preserveToolbarFocus(idx)
 		return cmd
 	}

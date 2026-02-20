@@ -242,6 +242,7 @@ var fileListKeyActions = map[string]func(*Model) tea.Cmd{
 	"o":      func(m *Model) tea.Cmd { return m.resolveFromList(ResOurs) },
 	"t":      func(m *Model) tea.Cmd { return m.resolveFromList(ResTheirs) },
 	"b":      func(m *Model) tea.Cmd { return m.resolveFromList(ResBoth) },
+	"u":      func(m *Model) tea.Cmd { return m.undoResolution() },
 	"ctrl+d": func(m *Model) tea.Cmd { m.fileListHalfPageDown(); return nil },
 	"ctrl+u": func(m *Model) tea.Cmd { m.fileListHalfPageUp(); return nil },
 }

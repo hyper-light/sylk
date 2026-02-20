@@ -72,6 +72,9 @@ type Model struct {
 	// Click targets (recomputed each render).
 	actionTargets []actionTarget
 
+	// Original content for undo (path → original MergedContent).
+	originalContent map[string]string
+
 	// Contextual conflict labels.
 	oursLabel   string // e.g. "Dest" or "Local"
 	theirsLabel string // e.g. "Source" or "Remote"
@@ -121,6 +124,7 @@ func New(data ConflictData, th *theme.Theme, nerdFonts bool) *Model {
 		fileListDirty:   true,
 	}
 	m.deriveConflictLabels()
+	m.snapshotOriginalContent()
 	if len(data.Entries) > 0 {
 		m.parseMergedContent()
 		m.scrollToCurrentHunk()
@@ -400,6 +404,53 @@ func (m *Model) advanceToNextUnresolved() {
 	m.toolbarFocused = true
 	m.toolbarAction = ctbContinue
 	m.viewDirty = true
+}
+
+// ---------------------------------------------------------------------------
+// Undo
+// ---------------------------------------------------------------------------
+
+// snapshotOriginalContent stores the initial MergedContent for each entry
+// so that undo can restore it.
+func (m *Model) snapshotOriginalContent() {
+	m.originalContent = make(map[string]string, len(m.data.Entries))
+	for i := range m.data.Entries {
+		e := &m.data.Entries[i]
+		if e.MergedContent != "" {
+			m.originalContent[e.Path] = e.MergedContent
+		}
+	}
+}
+
+// canUndo reports whether the selected entry has been modified from its
+// original state (resolution set or content changed).
+func (m *Model) canUndo() bool {
+	e := m.selectedEntry()
+	if e == nil {
+		return false
+	}
+	if e.Resolution != ResUnresolved {
+		return true
+	}
+	orig, ok := m.originalContent[e.Path]
+	return ok && e.MergedContent != orig
+}
+
+// undoResolution resets the selected file to its original unresolved state.
+func (m *Model) undoResolution() tea.Cmd {
+	e := m.selectedEntry()
+	if e == nil {
+		return nil
+	}
+	if orig, ok := m.originalContent[e.Path]; ok {
+		e.MergedContent = orig
+	}
+	e.Resolution = ResUnresolved
+	m.parseMergedContent()
+	m.scrollToCurrentHunk()
+	m.viewDirty = true
+	m.fileListDirty = true
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1050,7 @@ var contentKeyActions = map[string]func(*Model) tea.Cmd{
 	"o": func(m *Model) tea.Cmd { return m.resolveKey(ResOurs) },
 	"t": func(m *Model) tea.Cmd { return m.resolveKey(ResTheirs) },
 	"b": func(m *Model) tea.Cmd { return m.resolveKey(ResBoth) },
+	"u": func(m *Model) tea.Cmd { return m.undoResolution() },
 	"n": func(m *Model) tea.Cmd { m.nextHunk(); return nil },
 	"N": func(m *Model) tea.Cmd { m.prevHunk(); return nil },
 	"ctrl+f": func(m *Model) tea.Cmd { m.toggleFindBar(); return nil },
