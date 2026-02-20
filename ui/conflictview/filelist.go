@@ -307,29 +307,38 @@ func hunkSizeLabel(h ConflictHunk) string {
 	return fmt.Sprintf("%d/%d", ours, theirs)
 }
 
-// renderSingleHunkLine renders one hunk line: "    L12  3/5  snippet…".
-// No selection background — current hunk uses primary text color.
+// renderSingleHunkLine renders one hunk line: "  ▸ L12  3/5  snippet…".
+// The current hunk gets an arrow indicator and primary text color.
 func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool, width int, p theme.Palette) string {
 	isCurrent := isCursor && hunkIdx == m.currentHunk
 
-	// Line number label.
-	locLabel := fmt.Sprintf("    L%d", h.StartLine+1)
-	locSt := lipgloss.NewStyle().Foreground(p.Muted)
+	fg := p.Muted
 	if isCurrent {
-		locSt = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+		fg = p.Primary
+	}
+
+	// Arrow indicator for current hunk, plain indent otherwise.
+	var prefix string
+	if isCurrent {
+		prefix = lipgloss.NewStyle().Foreground(p.Primary).Render("  ▸ ")
+	} else {
+		prefix = "    "
+	}
+
+	// Line number label.
+	locSt := lipgloss.NewStyle().Foreground(fg)
+	if isCurrent {
+		locSt = locSt.Bold(true)
 	}
 
 	// Hunk size.
-	sizeTxt := hunkSizeLabel(h)
-	sizeSt := lipgloss.NewStyle().Foreground(p.Muted)
-	if isCurrent {
-		sizeSt = lipgloss.NewStyle().Foreground(p.Primary)
-	}
+	sizeSt := lipgloss.NewStyle().Foreground(fg)
 
 	var b strings.Builder
-	b.WriteString(locSt.Render(locLabel))
+	b.WriteString(prefix)
+	b.WriteString(locSt.Render(fmt.Sprintf("L%d", h.StartLine+1)))
 	b.WriteString("  ")
-	b.WriteString(sizeSt.Render(sizeTxt))
+	b.WriteString(sizeSt.Render(hunkSizeLabel(h)))
 
 	// Content snippet — fill remaining width.
 	col := lipgloss.Width(b.String())
@@ -339,7 +348,7 @@ func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool,
 		if lipgloss.Width(snip) > snippetW {
 			snip = truncateToWidth(snip, snippetW)
 		}
-		snippetSt := lipgloss.NewStyle().Foreground(p.Muted).Italic(true)
+		snippetSt := lipgloss.NewStyle().Foreground(fg).Italic(true)
 		b.WriteString("  ")
 		b.WriteString(snippetSt.Render(snip))
 	}
