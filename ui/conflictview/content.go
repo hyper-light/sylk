@@ -55,94 +55,175 @@ func classifyLine(line int, hunks []ConflictHunk) lineRegion {
 	return lineMarkerTheirs
 }
 
+// renderStyles holds precomputed styles for a single content render frame.
+type renderStyles struct {
+	gutterW        int
+	gutterSt       lipgloss.Style
+	oursMarkerSt   lipgloss.Style
+	divMarkerSt    lipgloss.Style
+	theirsMarkerSt lipgloss.Style
+	ctxSt          lipgloss.Style
+	warnSt         lipgloss.Style
+}
+
+// newRenderStyles builds the style set from the current theme.
+func (m *Model) newRenderStyles() renderStyles {
+	p := m.theme.Palette
+	return renderStyles{
+		gutterW:        m.gutterWidth(),
+		gutterSt:       lipgloss.NewStyle().Foreground(p.Muted),
+		oursMarkerSt:   lipgloss.NewStyle().Foreground(p.Secondary).Bold(true),
+		divMarkerSt:    lipgloss.NewStyle().Foreground(p.Border).Bold(true),
+		theirsMarkerSt: lipgloss.NewStyle().Foreground(p.Warning).Bold(true),
+		ctxSt:          lipgloss.NewStyle().Foreground(p.Muted),
+		warnSt:         lipgloss.NewStyle().Foreground(p.Warning).Bold(true),
+	}
+}
+
 // renderContent renders the viewport-aware merged content with syntax
 // highlighting, conflict region tinting, inline action lines, line numbers,
 // and find match overlay.
 func (m *Model) renderContent(vpH int) string {
-	if m.selectedFile < 0 || m.selectedFile >= len(m.data.Entries) {
+	if !m.hasSelectedFile() {
 		return m.renderEmpty(vpH)
 	}
-	entry := &m.data.Entries[m.selectedFile]
 	if len(m.mergedLines) == 0 {
-		return m.renderNonContentConflict(entry, vpH)
+		return m.renderNonContentConflict(m.selectedEntry(), vpH)
 	}
+	return m.renderMergedContent(vpH)
+}
 
-	p := m.theme.Palette
+// hasSelectedFile reports whether a valid file is selected.
+func (m *Model) hasSelectedFile() bool {
+	return m.selectedFile >= 0 && m.selectedFile < len(m.data.Entries)
+}
+
+// renderMergedContent renders merged content lines with conflict markers.
+func (m *Model) renderMergedContent(vpH int) string {
 	w := m.width
-	displayTotal := m.totalContentLines()
+	m.clampDisplayScroll(vpH)
+	start, end := m.displayRange(vpH)
+	rs := m.newRenderStyles()
+	matches, matchIdx := m.findMatchState()
 
-	// Clamp scroll in display coordinates.
-	m.scrollOffset = max(min(m.scrollOffset, max(displayTotal-vpH, 0)), 0)
-	end := min(m.scrollOffset+vpH, displayTotal)
-	start := min(m.scrollOffset, end)
-
-	// Precompute find matches if find is active.
-	var allMatches []search.MatchRange
-	var curMatchIdx int
-	if m.findActive && m.findBar != nil {
-		allMatches = m.findBar.Matches()
-		curMatchIdx = m.findBar.MatchIndex()
-	}
-
-	// Gutter setup.
-	gutterW := m.gutterWidth()
-	gutterSt := lipgloss.NewStyle().Foreground(p.Muted)
-
-	// Marker styles.
-	oursMarkerSt := lipgloss.NewStyle().Foreground(p.Secondary).Bold(true)
-	divMarkerSt := lipgloss.NewStyle().Foreground(p.Border).Bold(true)
-	theirsMarkerSt := lipgloss.NewStyle().Foreground(p.Warning).Bold(true)
-	ctxSt := lipgloss.NewStyle().Foreground(p.Muted)
-
-	// Reset action targets for this frame.
 	m.actionTargets = m.actionTargets[:0]
-
 	lines := make([]string, 0, vpH)
-	for d := start; d < end; d++ {
-		contentLine, isAction, hunkIdx := m.displayToContent(d)
-		screenY := d - start
+	lines = appendBounded(lines, m.renderStepPreviewHeader(w), vpH)
 
-		if isAction {
-			rendered, target := m.renderActionLine(hunkIdx, w, gutterW)
-			target.screenY = screenY
-			m.actionTargets = append(m.actionTargets, target)
-			lines = append(lines, padLine(rendered, w))
-			continue
-		}
-
-		line := m.mergedLines[contentLine]
-		region := classifyLine(contentLine, m.hunks)
-
-		// Build gutter with right-aligned line number.
-		numStr := fmt.Sprintf("%*d", gutterW, contentLine+1)
-		gutter := gutterSt.Render(numStr) + " "
-
-		var rendered string
-		switch region {
-		case lineMarkerOurs:
-			rendered = oursMarkerSt.Render("<<<<<<< "+m.oursLabel) + renderCtxSuffix(m.oursCtx, ctxSt)
-		case lineMarkerDiv:
-			rendered = divMarkerSt.Render(line)
-		case lineMarkerTheirs:
-			rendered = theirsMarkerSt.Render(">>>>>>> "+m.theirsLabel) + renderCtxSuffix(m.theirsCtx, ctxSt)
-		default:
-			var lineRegions []codepkg.HighlightRegion
-			if contentLine < len(m.highlightRegions) {
-				lineRegions = m.highlightRegions[contentLine]
-			}
-			rendered = m.renderHighlightedLine(line, contentLine, lineRegions,
-				region, allMatches, curMatchIdx, p)
-		}
-
-		lines = append(lines, padLine(gutter+rendered, w))
+	for d := start; d < end && len(lines) < vpH; d++ {
+		lines = m.appendDisplayRow(lines, d, vpH, w, rs, matches, matchIdx)
 	}
+	return strings.Join(padToHeight(lines, vpH, w), "\n")
+}
 
-	blank := strings.Repeat(" ", w)
-	for len(lines) < vpH {
+// clampDisplayScroll clamps scrollOffset to valid display bounds.
+func (m *Model) clampDisplayScroll(vpH int) {
+	displayTotal := m.totalContentLines()
+	m.scrollOffset = max(min(m.scrollOffset, max(displayTotal-vpH, 0)), 0)
+}
+
+// displayRange returns the [start, end) display line range for the viewport.
+func (m *Model) displayRange(vpH int) (int, int) {
+	displayTotal := m.totalContentLines()
+	end := min(m.scrollOffset+vpH, displayTotal)
+	return min(m.scrollOffset, end), end
+}
+
+// findMatchState returns find bar matches and current index, or nil/0.
+func (m *Model) findMatchState() ([]search.MatchRange, int) {
+	if m.findActive && m.findBar != nil {
+		return m.findBar.Matches(), m.findBar.MatchIndex()
+	}
+	return nil, 0
+}
+
+// appendDisplayRow appends rendered row(s) for display index d.
+func (m *Model) appendDisplayRow(lines []string, d, vpH, w int, rs renderStyles, matches []search.MatchRange, matchIdx int) []string {
+	contentLine, isAction, hunkIdx := m.displayToContent(d)
+	if isAction {
+		return m.appendActionRow(lines, hunkIdx, vpH, w, rs.gutterW)
+	}
+	return append(lines, m.renderContentLine(contentLine, w, rs, matches, matchIdx))
+}
+
+// appendActionRow appends base context (if visible) and the action line.
+func (m *Model) appendActionRow(lines []string, hunkIdx, vpH, w, gutterW int) []string {
+	lines = appendBounded(lines, m.renderBaseSection(hunkIdx, w, gutterW), vpH)
+	rendered, target := m.renderActionLine(hunkIdx, w, gutterW)
+	target.screenY = len(lines)
+	m.actionTargets = append(m.actionTargets, target)
+	return append(lines, padLine(rendered, w))
+}
+
+// renderContentLine renders a single content line with gutter and highlights.
+func (m *Model) renderContentLine(contentLine, w int, rs renderStyles, matches []search.MatchRange, matchIdx int) string {
+	gutter := m.renderGutter(contentLine, rs)
+	body := m.renderLineByRegion(m.mergedLines[contentLine], contentLine, rs, matches, matchIdx)
+	return padLine(gutter+body, w)
+}
+
+// renderGutter renders the line number gutter with optional regression marker.
+func (m *Model) renderGutter(contentLine int, rs renderStyles) string {
+	numStr := fmt.Sprintf("%*d", rs.gutterW, contentLine+1)
+	suffix := " "
+	if m.hasRegressionAtLine(contentLine) {
+		suffix = rs.warnSt.Render("!")
+	}
+	return rs.gutterSt.Render(numStr) + suffix
+}
+
+// renderLineByRegion dispatches to marker or highlighted content rendering.
+func (m *Model) renderLineByRegion(line string, lineIdx int, rs renderStyles, matches []search.MatchRange, matchIdx int) string {
+	if rendered, ok := m.renderMarkerLine(line, lineIdx, rs); ok {
+		return rendered
+	}
+	return m.renderHighlightedContentLine(line, lineIdx, rs, matches, matchIdx)
+}
+
+// renderMarkerLine renders conflict marker lines. Returns ("", false) for
+// non-marker lines.
+func (m *Model) renderMarkerLine(line string, lineIdx int, rs renderStyles) (string, bool) {
+	switch classifyLine(lineIdx, m.hunks) {
+	case lineMarkerOurs:
+		return rs.oursMarkerSt.Render("<<<<<<< "+m.oursLabel) + renderCtxSuffix(m.oursCtx, rs.ctxSt), true
+	case lineMarkerDiv:
+		return rs.divMarkerSt.Render(line), true
+	case lineMarkerTheirs:
+		return rs.theirsMarkerSt.Render(">>>>>>> "+m.theirsLabel) + renderCtxSuffix(m.theirsCtx, rs.ctxSt), true
+	default:
+		return "", false
+	}
+}
+
+// renderHighlightedContentLine renders a non-marker line with syntax
+// highlighting and optional find match overlay.
+func (m *Model) renderHighlightedContentLine(line string, lineIdx int, rs renderStyles, matches []search.MatchRange, matchIdx int) string {
+	region := classifyLine(lineIdx, m.hunks)
+	var lineRegions []codepkg.HighlightRegion
+	if lineIdx < len(m.highlightRegions) {
+		lineRegions = m.highlightRegions[lineIdx]
+	}
+	return m.renderHighlightedLine(line, lineIdx, lineRegions, region, matches, matchIdx, m.theme.Palette)
+}
+
+// appendBounded appends lines from text (split by newline) to dst,
+// stopping when len(dst) reaches limit. Returns dst unchanged if text is empty.
+func appendBounded(dst []string, text string, limit int) []string {
+	if text == "" {
+		return dst
+	}
+	parts := strings.Split(text, "\n")
+	room := max(limit-len(dst), 0)
+	return append(dst, parts[:min(len(parts), room)]...)
+}
+
+// padToHeight pads lines to exactly height rows with blank lines.
+func padToHeight(lines []string, height, width int) []string {
+	blank := strings.Repeat(" ", width)
+	for len(lines) < height {
 		lines = append(lines, blank)
 	}
-
-	return strings.Join(lines, "\n")
+	return lines
 }
 
 // renderActionLine renders the clickable action line above a conflict hunk
@@ -198,6 +279,18 @@ func (m *Model) renderActionLine(hunkIdx, width, gutterW int) (string, actionTar
 	bothW := lipgloss.Width(bothText)
 	target.bothRange = [2]int{col, col + bothW}
 	b.WriteString(bothText)
+
+	// Auto-resolve badge when hunk is auto-resolvable.
+	if hunkIdx >= 0 && hunkIdx < len(m.hunks) && m.hunks[hunkIdx].AutoResolved {
+		kindIdx := int(m.hunks[hunkIdx].AutoKind)
+		label := "auto"
+		if kindIdx >= 0 && kindIdx < len(autoResolveKindLabels) {
+			label = autoResolveKindLabels[kindIdx]
+		}
+		autoSt := lipgloss.NewStyle().Foreground(p.Teal)
+		b.WriteString("  ")
+		b.WriteString(autoSt.Render("[auto: " + label + "]"))
+	}
 
 	return b.String(), target
 }
@@ -371,6 +464,112 @@ func offsetRegions(regions []codepkg.HighlightRegion, segStart, segEnd int) []co
 		})
 	}
 	return result
+}
+
+// renderBaseSection renders the ancestor (base) content for a hunk when
+// the three-way base view is active. Returns empty string if unavailable.
+func (m *Model) renderBaseSection(hunkIdx, width, gutterW int) string {
+	if !m.baseVisible {
+		return ""
+	}
+	lines := m.baseHunkLines(hunkIdx)
+	if len(lines) == 0 {
+		return ""
+	}
+	return m.formatBaseSection(lines, width, gutterW)
+}
+
+// baseHunkLines returns the base content lines windowed around a hunk.
+func (m *Model) baseHunkLines(hunkIdx int) []string {
+	content := m.selectedFileBaseContent()
+	if content == "" {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	lines = m.clipToHunkRegion(lines, hunkIdx)
+	return capSlice(lines, 8) // max base lines
+}
+
+// selectedFileBaseContent returns the cached base content for the selected file.
+func (m *Model) selectedFileBaseContent() string {
+	e := m.selectedEntry()
+	if e == nil || m.baseContent == nil {
+		return ""
+	}
+	return m.baseContent[e.Path]
+}
+
+// clipToHunkRegion narrows lines to the region around a specific hunk.
+func (m *Model) clipToHunkRegion(lines []string, hunkIdx int) []string {
+	if hunkIdx < 0 || hunkIdx >= len(m.hunks) {
+		return lines
+	}
+	h := m.hunks[hunkIdx]
+	start := max(h.StartLine-1, 0)
+	end := min(h.EndLine+1, len(lines))
+	if start >= len(lines) {
+		return lines
+	}
+	return lines[start:end]
+}
+
+// capSlice returns at most maxLen elements from the front of s.
+func capSlice(s []string, maxLen int) []string {
+	if len(s) > maxLen {
+		return s[:maxLen]
+	}
+	return s
+}
+
+// formatBaseSection renders a labeled base-content block.
+func (m *Model) formatBaseSection(lines []string, width, gutterW int) string {
+	p := m.theme.Palette
+	baseBgSt := lipgloss.NewStyle().Foreground(p.Muted).Italic(true)
+	labelSt := lipgloss.NewStyle().Foreground(p.Teal).Bold(true)
+	indent := strings.Repeat(" ", gutterW+1)
+
+	result := make([]string, 0, len(lines)+1)
+	result = append(result, padLine(indent+labelSt.Render("Base"), width))
+	for _, l := range lines {
+		result = append(result, padLine(indent+baseBgSt.Render(l), width))
+	}
+	return strings.Join(result, "\n")
+}
+
+// renderStepPreviewHeader renders a compact header showing the commit being
+// applied and its changed files when the step preview overlay is active.
+func (m *Model) renderStepPreviewHeader(width int) string {
+	if !m.stepPreviewVisible || m.stepPreview == nil {
+		return ""
+	}
+	return m.formatStepPreview(width)
+}
+
+// formatStepPreview builds the step preview header lines.
+func (m *Model) formatStepPreview(width int) string {
+	p := m.theme.Palette
+	hashSt := lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+	subjSt := lipgloss.NewStyle().Foreground(p.Foreground)
+
+	lines := make([]string, 0, len(m.stepPreview.FileDiffs)+2)
+	lines = append(lines, padLine("  "+hashSt.Render(m.stepPreview.Hash)+" "+subjSt.Render(m.stepPreview.Subject), width))
+	for _, fd := range m.stepPreview.FileDiffs {
+		lines = append(lines, m.formatFileDiffLine(fd, width))
+	}
+	lines = append(lines, padLine("", width))
+	return strings.Join(lines, "\n")
+}
+
+// formatFileDiffLine renders a single file diff stat line for the step preview.
+func (m *Model) formatFileDiffLine(fd FileDiffSummary, width int) string {
+	p := m.theme.Palette
+	fileSt := lipgloss.NewStyle().Foreground(p.Muted)
+	nameSt := lipgloss.NewStyle().Foreground(p.Success)
+	if m.stepPreview.ConflictPaths[fd.Path] {
+		nameSt = lipgloss.NewStyle().Foreground(p.Error)
+	}
+	stat := fmt.Sprintf("+%d -%d", fd.Additions, fd.Deletions)
+	return padLine("    "+nameSt.Render(fd.Path)+" "+fileSt.Render(stat), width)
 }
 
 // renderCtxSuffix renders " (context)" in muted style if ctx is non-empty.

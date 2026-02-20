@@ -13,6 +13,7 @@ const (
 	detachedRefPrefix = "refs/sylk/detached/"
 	abortRefPrefix    = "refs/sylk/abort/"
 	stashRefPrefix    = "refs/sylk/stash/"
+	seqStepRefPrefix  = "refs/sylk/seq-step/"
 )
 
 // journalDirName is the subdirectory under .git/ for the safety journal.
@@ -124,6 +125,7 @@ var sequencerStartOps = map[GitOp]struct{}{
 // sequencerStepOps advance an active sequence. The guard skips snapshot
 // creation for these and reuses the sequence-start snapshot.
 var sequencerStepOps = map[GitOp]struct{}{
-	OpSequencerContinue: {},
-	OpSequencerBypass:   {},
+	OpSequencerContinue:   {},
+	OpSequencerBypass:     {},
+	OpSequencerUndoStep:   {},
 }

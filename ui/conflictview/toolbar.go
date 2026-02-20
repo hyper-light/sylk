@@ -13,6 +13,7 @@ const (
 	ctbContinue = iota
 	ctbBypass
 	ctbAbort
+	ctbUndoStep
 	ctbPrev
 	ctbNext
 	ctbOurs
@@ -35,6 +36,7 @@ var ctbStaticDefs = [ctbCount]ctbDef{
 	ctbContinue: {icon: "▶", label: "Continue", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	ctbBypass:   {icon: "⏭", label: "Bypass", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
 	ctbAbort:    {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
+	ctbUndoStep: {icon: "⏪", label: "Undo Step", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
 	ctbPrev:     {icon: "◀", label: "Prev", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
 	ctbNext:     {icon: "▶", label: "Next", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
 	ctbOurs:     {icon: "↑", label: "Dest", key: "o", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
@@ -67,8 +69,8 @@ func (m *Model) ctbCellWidth(id int) int {
 }
 
 // ctbLeftCount is the number of buttons in the left toolbar group
-// (Continue, Bypass, Abort, Prev, Next).
-const ctbLeftCount = 5
+// (Continue, Bypass, Abort, UndoStep, Prev, Next).
+const ctbLeftCount = 6
 
 // ctbGroupGap is the minimum gap between left and right toolbar groups.
 const ctbGroupGap = 2
@@ -213,6 +215,8 @@ func (m *Model) isToolbarButtonEnabled(id int) bool {
 	switch id {
 	case ctbContinue:
 		return m.AllResolved()
+	case ctbUndoStep:
+		return m.data.Current > 0
 	case ctbPrev, ctbNext:
 		return m.hasHunks()
 	case ctbOurs, ctbTheirs:
@@ -274,11 +278,13 @@ func (m *Model) activateToolbarButton(idx int) tea.Cmd {
 	}
 	switch idx {
 	case ctbContinue:
-		return func() tea.Msg { return SequencerContinueMsg{} }
+		return func() tea.Msg { return SyntaxValidationRequestMsg{} }
 	case ctbBypass:
 		return func() tea.Msg { return SequencerBypassMsg{} }
 	case ctbAbort:
 		return func() tea.Msg { return SequencerAbortMsg{} }
+	case ctbUndoStep:
+		return func() tea.Msg { return SequencerUndoStepMsg{} }
 	case ctbPrev:
 		m.prevHunk()
 		return nil

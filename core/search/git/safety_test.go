@@ -1694,3 +1694,309 @@ func TestGCSnapshotsIncludesAbortAndStash(t *testing.T) {
 		t.Errorf("expected at least 2 refs GC'd (abort + stash), got %d", removed)
 	}
 }
+
+// =============================================================================
+// Feature C: Per-Step Checkpointing Tests
+// =============================================================================
+
+func TestCreateStepSnapshot(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	client.mu.Lock()
+	snap, err := client.createStepSnapshot(1)
+	client.mu.Unlock()
+	if err != nil {
+		t.Fatalf("create step snapshot: %v", err)
+	}
+	if snap == nil {
+		t.Fatal("expected non-nil step snapshot")
+	}
+	if !strings.HasPrefix(snap.Name, seqStepRefPrefix) {
+		t.Errorf("expected seq-step ref prefix, got %q", snap.Name)
+	}
+	if !strings.Contains(snap.Name, "1-") {
+		t.Errorf("expected step index 1 in ref name, got %q", snap.Name)
+	}
+}
+
+func TestRefIndexSeqStepsLoadAndClear(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	// Create step snapshots directly.
+	client.mu.Lock()
+	_, _ = client.createStepSnapshot(0)
+	time.Sleep(time.Millisecond) // Distinct timestamps.
+	_, _ = client.createStepSnapshot(1)
+	client.mu.Unlock()
+
+	// Verify ref index loads them.
+	idx := newRefIndex(client)
+	steps := idx.listSeqSteps()
+	if len(steps) != 2 {
+		t.Fatalf("expected 2 step snapshots, got %d", len(steps))
+	}
+
+	// Verify newest-first ordering.
+	if steps[0].Timestamp.Before(steps[1].Timestamp) {
+		t.Error("expected newest-first ordering for step snapshots")
+	}
+}
+
+func TestSafetyGuardCreatesStepSnapshots(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	bus := NewGitBus(client)
+	sg, err := NewSafetyGuard(client, bus, DefaultSafetyConfig(), nil)
+	if err != nil {
+		t.Fatalf("new safety guard: %v", err)
+	}
+	defer sg.Close()
+
+	// Trigger lazy load before events to avoid double-counting in refIndex.
+	_ = sg.refIdx.listSeqSteps()
+
+	// Simulate sequence start (PhasePre).
+	sg.onEvent(&GitEvent{
+		Op:        OpRebaseInteractive,
+		Phase:     PhasePre,
+		Timestamp: time.Now(),
+	})
+
+	// Simulate a sequencer step (PhasePre) — should create step snapshot.
+	sg.onEvent(&GitEvent{
+		Op:        OpSequencerContinue,
+		Phase:     PhasePre,
+		Timestamp: time.Now(),
+	})
+
+	steps := sg.refIdx.listSeqSteps()
+	if len(steps) != 1 {
+		t.Fatalf("expected 1 step snapshot after continue, got %d", len(steps))
+	}
+
+	// Simulate a second step.
+	sg.onEvent(&GitEvent{
+		Op:        OpSequencerContinue,
+		Phase:     PhasePre,
+		Timestamp: time.Now(),
+	})
+
+	steps = sg.refIdx.listSeqSteps()
+	if len(steps) != 2 {
+		t.Fatalf("expected 2 step snapshots, got %d", len(steps))
+	}
+}
+
+func TestSafetyGuardClearsStepSnapshotsOnCompletion(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	bus := NewGitBus(client)
+	sg, err := NewSafetyGuard(client, bus, DefaultSafetyConfig(), nil)
+	if err != nil {
+		t.Fatalf("new safety guard: %v", err)
+	}
+	defer sg.Close()
+
+	// Start sequence + one step.
+	sg.onEvent(&GitEvent{Op: OpRebaseInteractive, Phase: PhasePre, Timestamp: time.Now()})
+	sg.onEvent(&GitEvent{Op: OpSequencerContinue, Phase: PhasePre, Timestamp: time.Now()})
+
+	if len(sg.refIdx.listSeqSteps()) == 0 {
+		t.Fatal("expected step snapshots after continue")
+	}
+
+	// Simulate sequence completion via PhasePost with nil SequencerStatus (idle).
+	sg.onEvent(&GitEvent{
+		Op:        OpRebaseInteractive,
+		Phase:     PhasePost,
+		Timestamp: time.Now(),
+		Result:    (*SequencerStatus)(nil),
+	})
+
+	steps := sg.refIdx.listSeqSteps()
+	if len(steps) != 0 {
+		t.Errorf("expected 0 step snapshots after completion, got %d", len(steps))
+	}
+}
+
+func TestSafetyGuardUndoStepDecrementsCount(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	bus := NewGitBus(client)
+	sg, err := NewSafetyGuard(client, bus, DefaultSafetyConfig(), nil)
+	if err != nil {
+		t.Fatalf("new safety guard: %v", err)
+	}
+	defer sg.Close()
+
+	// Start sequence + two steps.
+	sg.onEvent(&GitEvent{Op: OpRebaseInteractive, Phase: PhasePre, Timestamp: time.Now()})
+	sg.onEvent(&GitEvent{Op: OpSequencerContinue, Phase: PhasePre, Timestamp: time.Now()})
+	sg.onEvent(&GitEvent{Op: OpSequencerContinue, Phase: PhasePre, Timestamp: time.Now()})
+
+	sg.mu.Lock()
+	countBefore := sg.seqStepCount
+	sg.mu.Unlock()
+
+	// Undo step should decrement seqStepCount.
+	sg.onEvent(&GitEvent{Op: OpSequencerUndoStep, Phase: PhasePre, Timestamp: time.Now()})
+
+	sg.mu.Lock()
+	countAfter := sg.seqStepCount
+	sg.mu.Unlock()
+
+	if countAfter != countBefore-1 {
+		t.Errorf("seqStepCount: got %d, want %d", countAfter, countBefore-1)
+	}
+}
+
+func TestSafetyGuardUndoStepSkipsStepSnapshot(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	bus := NewGitBus(client)
+	sg, err := NewSafetyGuard(client, bus, DefaultSafetyConfig(), nil)
+	if err != nil {
+		t.Fatalf("new safety guard: %v", err)
+	}
+	defer sg.Close()
+
+	// Start sequence + one step.
+	sg.onEvent(&GitEvent{Op: OpRebaseInteractive, Phase: PhasePre, Timestamp: time.Now()})
+	sg.onEvent(&GitEvent{Op: OpSequencerContinue, Phase: PhasePre, Timestamp: time.Now()})
+
+	stepsBefore := len(sg.refIdx.listSeqSteps())
+
+	// Undo step should NOT create a new step snapshot.
+	sg.onEvent(&GitEvent{Op: OpSequencerUndoStep, Phase: PhasePre, Timestamp: time.Now()})
+
+	stepsAfter := len(sg.refIdx.listSeqSteps())
+	if stepsAfter != stepsBefore {
+		t.Errorf("undo step created %d new step snapshots (expected 0)", stepsAfter-stepsBefore)
+	}
+}
+
+// =============================================================================
+// Feature H: SequencerUndoStep Tests
+// =============================================================================
+
+func TestSequencerUndoStepNoSequencer(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.SequencerUndoStep()
+	if err != ErrNoSequencer {
+		t.Errorf("expected ErrNoSequencer, got %v", err)
+	}
+}
+
+func TestFindPreviousStepSnapshotEmpty(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	// No step snapshots exist.
+	snap := client.findPreviousStepSnapshot()
+	if snap != nil {
+		t.Errorf("expected nil snapshot, got %v", snap)
+	}
+}
+
+func TestFindPreviousStepSnapshotReturnsNewest(t *testing.T) {
+	dir, cleanup := testRepoWithCommit(t)
+	defer cleanup()
+
+	client, err := NewGitClient(dir)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	defer client.Close()
+
+	// Create two step snapshots.
+	client.mu.Lock()
+	snap0, _ := client.createStepSnapshot(0)
+	time.Sleep(time.Millisecond)
+	snap1, _ := client.createStepSnapshot(1)
+	client.mu.Unlock()
+
+	// Should return the newest (snap1).
+	found := client.findPreviousStepSnapshot()
+	if found == nil {
+		t.Fatal("expected non-nil snapshot")
+	}
+	if found.Hash != snap1.Hash {
+		t.Errorf("expected newest snapshot hash %v, got %v (snap0 hash: %v)",
+			snap1.Hash, found.Hash, snap0.Hash)
+	}
+}
+
+func TestOpSequencerUndoStepInSequencerStepOps(t *testing.T) {
+	if _, ok := sequencerStepOps[OpSequencerUndoStep]; !ok {
+		t.Error("OpSequencerUndoStep should be in sequencerStepOps")
+	}
+}
+
+func TestOpSequencerUndoStepIsMutating(t *testing.T) {
+	found := false
+	for _, op := range mutatingOps {
+		if op == OpSequencerUndoStep {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("OpSequencerUndoStep should be in mutatingOps")
+	}
+}

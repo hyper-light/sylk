@@ -208,6 +208,14 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 	}
 	sep := sepSt.Render(" ")
 
+	// Complexity badge.
+	cxLabel, cxColor := complexityBadge(entry.Complexity.Level, p)
+	cxSt := lipgloss.NewStyle().Foreground(cxColor).Bold(true)
+	if hasBg {
+		cxSt = cxSt.Background(bg)
+	}
+	cxBadge := cxSt.Render(cxLabel)
+
 	// Resolution badge with contextual labels.
 	resLabel := "---"
 	resColor := p.Muted
@@ -230,8 +238,8 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 	resBadge := resSt.Render(fitCell(resLabel, 7))
 
 	// File name (fills remaining space).
-	prefixW := 1 + 9 + 1   // pad + type + sep
-	suffixW := 1 + 7        // sep + resolution
+	prefixW := 1 + 9 + 1 + 2 + 1 // pad + type + sep + complexity + sep
+	suffixW := 1 + 7              // sep + resolution
 	nameW := max(width-prefixW-suffixW, 1)
 
 	name := filepath.Base(entry.Path)
@@ -250,6 +258,8 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 	var b strings.Builder
 	b.WriteString(prefix)
 	b.WriteString(typeBadge)
+	b.WriteString(sep)
+	b.WriteString(cxBadge)
 	b.WriteString(sep)
 	b.WriteString(nameSt.Render(name))
 
@@ -288,9 +298,15 @@ func (m *Model) renderHunkLines(fileIdx int, isCursor bool, width int, p theme.P
 		return []string{strings.Repeat(" ", width)}
 	}
 
+	// Check for regression warnings on this file.
+	var hasRegression bool
+	if fileIdx >= 0 && fileIdx < len(m.data.Entries) && len(m.regressionWarnings) > 0 {
+		hasRegression = len(m.regressionWarnings[m.data.Entries[fileIdx].Path]) > 0
+	}
+
 	lines := make([]string, len(hunks))
 	for j, h := range hunks {
-		lines[j] = m.renderSingleHunkLine(j, h, isCursor, width, p)
+		lines[j] = m.renderSingleHunkLine(j, h, isCursor, hasRegression, width, p)
 	}
 	return lines
 }
@@ -304,7 +320,7 @@ func hunkSizeLabel(h ConflictHunk) string {
 
 // renderSingleHunkLine renders one hunk line: "  ▸ L12  3/5  snippet…".
 // The current hunk gets an arrow indicator and primary text color.
-func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool, width int, p theme.Palette) string {
+func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor, hasRegression bool, width int, p theme.Palette) string {
 	isCurrent := isCursor && hunkIdx == m.currentHunk
 
 	fg := p.Muted
@@ -334,6 +350,20 @@ func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool,
 	b.WriteString(locSt.Render(fmt.Sprintf("L%d", h.StartLine+1)))
 	b.WriteString("  ")
 	b.WriteString(sizeSt.Render(hunkSizeLabel(h)))
+
+	// Auto-resolve indicator.
+	if h.AutoResolved {
+		autoSt := lipgloss.NewStyle().Foreground(p.Teal)
+		b.WriteString("  ")
+		b.WriteString(autoSt.Render("A"))
+	}
+
+	// Regression warning indicator.
+	if hasRegression {
+		warnSt := lipgloss.NewStyle().Foreground(p.Warning).Bold(true)
+		b.WriteString(" ")
+		b.WriteString(warnSt.Render("!"))
+	}
 
 	// Content snippet — fill remaining width.
 	col := lipgloss.Width(b.String())
@@ -499,6 +529,21 @@ func (m *Model) fileListHitTest(lineOffset, entryH int) int {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// complexityBadge returns a single-character label and palette color for a
+// complexity level.
+func complexityBadge(level ComplexityLevel, p theme.Palette) (string, lipgloss.Color) {
+	switch level {
+	case ComplexitySimple:
+		return "S", p.Success
+	case ComplexityModerate:
+		return "M", p.Warning
+	case ComplexityComplex:
+		return "C", p.Error
+	default:
+		return " ", p.Muted
+	}
+}
 
 // fitCell pads or truncates a string to exactly the given width.
 func fitCell(s string, width int) string {

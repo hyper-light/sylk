@@ -246,6 +246,21 @@ func (cs *CursorSet) RemoveBottommost() {
 	cs.rebuildLineMap()
 }
 
+// HasLineDuplicates reports whether any two cursors occupy the same line.
+func (cs *CursorSet) HasLineDuplicates() bool {
+	if len(cs.cursors) <= 1 {
+		return false
+	}
+	seen := make(map[int]struct{}, len(cs.cursors))
+	for _, c := range cs.cursors {
+		if _, dup := seen[c.Line]; dup {
+			return true
+		}
+		seen[c.Line] = struct{}{}
+	}
+	return false
+}
+
 // Clone returns a deep copy of the CursorSet.
 func (cs *CursorSet) Clone() *CursorSet {
 	out := &CursorSet{

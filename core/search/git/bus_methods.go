@@ -391,6 +391,11 @@ func (b *GitBus) SequencerAbort() error {
 		func() error { return b.client.SequencerAbort() })
 }
 
+func (b *GitBus) SequencerUndoStep() (*SequencerStatus, error) {
+	return dispatch(b, OpSequencerUndoStep, nil,
+		func() (*SequencerStatus, error) { return b.client.SequencerUndoStep() })
+}
+
 func (b *GitBus) GetSequencerStatus() *SequencerStatus {
 	return dispatchPure(b, OpSequencerStatus, nil,
 		func() *SequencerStatus { return b.client.GetSequencerStatus() })

@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -70,9 +71,10 @@ type Model struct {
 	modified bool
 
 	// Viewport.
-	scrollOffset  int
-	scrollLeftCol int // horizontal scroll offset in display columns
-	bounceOffset  int
+	scrollOffset      int
+	scrollLeftCol     int // horizontal scroll offset in display columns
+	bounceOffset      int
+	lastScrollCursor  int // cursor Pos at last adjustScroll; enables free scroll in multi-cursor
 	width         int
 	height        int
 
@@ -706,6 +708,23 @@ func (m *Model) RemoveBottomCursor() {
 	m.syncStatusLine()
 	m.invalidateView()
 }
+
+// ClearSecondaryCursors removes all cursors except the primary and syncs state.
+func (m *Model) ClearSecondaryCursors() {
+	if m.state.Cursors.IsSingle() {
+		return
+	}
+	m.state.Cursors.ClearSecondary()
+	p := m.state.Cursors.Primary()
+	m.state.Cursor = p.Pos
+	m.state.CursorLine = p.Line
+	m.state.CursorCol = p.Col
+	m.syncStatusLine()
+	m.invalidateView()
+}
+
+// HasMultiCursor reports whether the editor has more than one active cursor.
+func (m *Model) HasMultiCursor() bool { return !m.state.Cursors.IsSingle() }
 
 // AddCursorBelow adds a multi-cursor one line below the primary at the same column.
 func (m *Model) AddCursorBelow() {
@@ -2069,6 +2088,12 @@ func (m *Model) SetBounceOffset(offset int) {
 // clampCursorToViewport ensures the cursor line stays within the visible
 // viewport after a scroll-only movement.
 func (m *Model) clampCursorToViewport() {
+	// When multi-cursor is active, the viewport is locked to the cursor
+	// group via adjustScroll. Moving only the primary through the group
+	// would silently deduplicate secondaries via SetPrimary → sortAndDedup.
+	if !m.state.Cursors.IsSingle() {
+		return
+	}
 	viewHeight := m.viewportHeight()
 	cursorLine := m.state.CursorLine
 	topLine := m.scrollOffset
@@ -2288,12 +2313,76 @@ func (m *Model) ClickAt(x, y int) {
 	if m.sigHelpActive {
 		m.DismissSignatureHelp()
 	}
-	m.setCursorFromViewport(x, y)
+	if !m.state.Cursors.IsSingle() {
+		m.moveGroupToViewport(x, y)
+	} else {
+		m.setCursorFromViewport(x, y)
+	}
 	m.vc.valid = false
 	m.syncStatusLine()
 	if hadSelection {
 		m.clearSelectionSearch()
 	}
+}
+
+// moveGroupToViewport shifts all cursors so the primary lands at the
+// clicked viewport position, preserving relative line offsets. Each
+// cursor's column is set to the clicked column, clamped to the target
+// line's length. If any cursor would land outside the file, the entire
+// group stays put (rigid-body constraint).
+func (m *Model) moveGroupToViewport(x, y int) {
+	totalLines := m.lineIndex.Count()
+	gutterW := m.gutterWidth(totalLines)
+
+	targetLine := max(min(y+m.scrollOffset, totalLines-1), 0)
+	screenCol := max(x-gutterW, 0) + m.scrollLeftCol
+	targetCol := m.screenToBufferCol(targetLine, screenCol)
+
+	lineDelta := targetLine - m.state.CursorLine
+	if lineDelta == 0 {
+		return
+	}
+
+	// Pre-validate: every cursor must land within [0, totalLines).
+	all := m.state.Cursors.All()
+	for _, c := range all {
+		newLine := c.Line + lineDelta
+		if newLine < 0 || newLine >= totalLines {
+			return // Rigid body: if any cursor goes out of bounds, nobody moves.
+		}
+	}
+
+	trailingOffset := 1
+	if m.currentMode == mode.ModeInsert {
+		trailingOffset = 0
+	}
+
+	pri := m.state.Cursors.Primary()
+	var rebuilt *mode.CursorSet
+	for i, c := range all {
+		newLine := c.Line + lineDelta
+		info, ok := m.lineIndex.Get(newLine)
+		if !ok {
+			return
+		}
+		maxCol := max(info.Length-trailingOffset, 0)
+		newCol := min(targetCol, maxCol)
+		newPos := info.StartPos + newCol
+
+		if i == 0 || c.Pos == pri.Pos {
+			rebuilt = mode.NewSingleCursor(newPos, newLine, newCol)
+		} else {
+			rebuilt.Add(newPos, newLine, newCol)
+		}
+	}
+
+	m.state.Cursors = rebuilt
+	m.state.Cursors.Sync(m.lineIndex)
+
+	p := m.state.Cursors.Primary()
+	m.state.Cursor = p.Pos
+	m.state.CursorLine = p.Line
+	m.state.CursorCol = p.Col
 }
 
 // StartDragSelection begins a mouse-initiated text selection anchored at the
@@ -3093,16 +3182,35 @@ func (m *Model) dispatchKey(key tea.KeyMsg) (mode.Mode, tea.Cmd) {
 func (m *Model) dispatchKeyMultiCursor(key tea.KeyMsg) (mode.Mode, tea.Cmd) {
 	cs := m.state.Cursors
 	snapshot := cs.Snapshot()
+	initialVersion := m.buf.Version()
 	m.undoTree.BeginGroupWithCursors(snapshot)
+
+	// Build work items sorted descending by Pos for true reverse-document-order.
+	type cursorWork struct {
+		primary        bool
+		pos, line, col int
+	}
+	all := cs.All()
+	items := make([]cursorWork, len(all))
+	for i, c := range all {
+		items[i] = cursorWork{i == 0, c.Pos, c.Line, c.Col}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].pos > items[j].pos
+	})
+
+	// Detach CursorSet so SyncCursorPos does not call SetPrimary mid-loop.
+	m.state.Cursors = nil
 
 	var lastMode mode.Mode
 	var cmds []tea.Cmd
-	reversed := cs.AllReversed()
+	results := make([]cursorWork, len(items))
 
-	for i, cur := range reversed {
-		m.state.Cursor = cur.Pos
-		m.state.CursorLine = cur.Line
-		m.state.CursorCol = cur.Col
+	for i := range items {
+		cur := &items[i]
+		m.state.Cursor = cur.pos
+		m.state.CursorLine = cur.line
+		m.state.CursorCol = cur.col
 
 		prevLen := m.buf.Length()
 		prevVer := m.buf.Version()
@@ -3113,23 +3221,52 @@ func (m *Model) dispatchKeyMultiCursor(key tea.KeyMsg) (mode.Mode, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
-		newPos := m.state.Cursor
+		newLine, newCol := m.state.LineIndex.PosToLineCol(m.state.Cursor)
+		results[i] = cursorWork{cur.primary, m.state.Cursor, newLine, newCol}
+
+		// Shift remaining lower-position cursors by the edit delta.
 		delta := m.buf.Length() - prevLen
-		edited := m.buf.Version() != prevVer
-
-		newLine, newCol := m.state.LineIndex.PosToLineCol(newPos)
-		cs.SetNth(i, newPos, newLine, newCol)
-
-		if edited && delta != 0 {
-			cs.ShiftBelow(cur.Pos, delta)
+		if m.buf.Version() != prevVer && delta != 0 {
+			for j := i + 1; j < len(items); j++ {
+				items[j].pos += delta
+				items[j].line, items[j].col = m.state.LineIndex.PosToLineCol(items[j].pos)
+			}
 		}
 	}
 
-	m.undoTree.EndGroup()
-	cs.MergeOverlapping()
-	cs.Sync(m.state.LineIndex)
+	// Rebuild CursorSet from results: primary first, then secondaries.
+	var pri cursorWork
+	for _, r := range results {
+		if r.primary {
+			pri = r
+			break
+		}
+	}
+	rebuilt := mode.NewSingleCursor(pri.pos, pri.line, pri.col)
+	for _, r := range results {
+		if !r.primary {
+			rebuilt.Add(r.pos, r.line, r.col)
+		}
+	}
 
-	p := cs.Primary()
+	m.state.Cursors = rebuilt
+	m.undoTree.EndGroup()
+
+	// Rigid-body constraint: for pure motions (no buffer edit), if the group
+	// structure was compromised — cursor count shrank (same-Pos collision
+	// absorbed by Add's dedup) or cursors landed on the same line (different
+	// columns) — reject the entire movement and restore all cursors to their
+	// pre-dispatch positions. Check BEFORE MergeOverlapping so that evidence
+	// of collision is preserved.
+	bufChanged := m.buf.Version() != initialVersion
+	if !bufChanged && (rebuilt.Len() != len(snapshot) || rebuilt.HasLineDuplicates()) {
+		rebuilt.Restore(snapshot, m.state.LineIndex)
+	} else {
+		rebuilt.MergeOverlapping()
+		rebuilt.Sync(m.state.LineIndex)
+	}
+
+	p := rebuilt.Primary()
 	m.state.Cursor = p.Pos
 	m.state.CursorLine = p.Line
 	m.state.CursorCol = p.Col
@@ -3291,6 +3428,15 @@ func (m *Model) viewportHeight() int {
 }
 
 func (m *Model) adjustScroll(viewHeight int) {
+	// When multi-cursor is active, only snap the viewport to the cursor
+	// when the primary cursor actually moved (key press / edit). This
+	// allows free mouse-wheel scrolling without the viewport snapping
+	// back every frame, while still following cursor motions.
+	if !m.state.Cursors.IsSingle() && m.state.Cursor == m.lastScrollCursor {
+		return
+	}
+	m.lastScrollCursor = m.state.Cursor
+
 	cursorLine := m.state.CursorLine
 	if cursorLine < m.scrollOffset {
 		m.scrollOffset = cursorLine

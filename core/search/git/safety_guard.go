@@ -64,8 +64,9 @@ type SafetyGuard struct {
 	inflight map[uint64]*JournalEntry
 
 	// Sequencer coalescing: reuse the initial snapshot for all steps.
-	seqActive  bool
-	seqSnapRef string // snapshot ref name from the sequence start
+	seqActive    bool
+	seqSnapRef   string // snapshot ref name from the sequence start
+	seqStepCount int    // incremented each sequencer step, reset on completion
 }
 
 // NewSafetyGuard creates a SafetyGuard, opens the journal, starts the async
@@ -323,7 +324,17 @@ func (sg *SafetyGuard) handlePre(event *GitEvent) {
 	skipSnapshot := isSeqStep && sg.seqActive
 	if isSeqStart {
 		sg.seqActive = true
+		sg.seqStepCount = 0
 	}
+	isUndo := event.Op == OpSequencerUndoStep
+	if isSeqStep && sg.seqActive && !isUndo {
+		sg.seqStepCount++
+	}
+	if isUndo && sg.seqStepCount > 0 {
+		sg.seqStepCount--
+	}
+	stepIdx := sg.seqStepCount
+	doStepSnap := isSeqStep && sg.seqActive && !isUndo
 	sg.mu.Unlock()
 
 	var snap *SnapshotRef
@@ -349,6 +360,13 @@ func (sg *SafetyGuard) handlePre(event *GitEvent) {
 		sg.mu.Lock()
 		snapRef = sg.seqSnapRef
 		sg.mu.Unlock()
+	}
+
+	// Create per-step checkpoint for incremental rollback.
+	if doStepSnap {
+		if stepSnap, err := sg.client.createStepSnapshot(stepIdx); err == nil && stepSnap != nil {
+			sg.refIdx.addSeqStep(*stepSnap)
+		}
 	}
 
 	headHash := plumbing.ZeroHash
@@ -401,13 +419,21 @@ func (sg *SafetyGuard) handlePost(event *GitEvent) {
 	}
 
 	// Update sequencer coalescing state.
+	seqDone := false
 	if sg.seqActive {
 		if event.Op == OpSequencerAbort || isSequencerDone(event) {
 			sg.seqActive = false
 			sg.seqSnapRef = ""
+			sg.seqStepCount = 0
+			seqDone = true
 		}
 	}
 	sg.mu.Unlock()
+
+	// Clear per-step snapshots once the sequence completes.
+	if seqDone {
+		sg.clearStepSnapshotsAsync()
+	}
 
 	if entry == nil {
 		return // No matching begin — begin may have failed.
@@ -446,6 +472,17 @@ func (sg *SafetyGuard) queueBackups(event *GitEvent) {
 				hash: head.Hash(),
 			})
 		}
+	}
+}
+
+// clearStepSnapshotsAsync removes all per-step snapshot refs via the
+// async worker pattern (best-effort, non-blocking).
+func (sg *SafetyGuard) clearStepSnapshotsAsync() {
+	refs := sg.refIdx.listSeqSteps()
+	for _, ref := range refs {
+		refName := plumbing.ReferenceName(ref.Name)
+		_ = sg.client.repo.Storer.RemoveReference(refName)
+		sg.refIdx.removeRef(ref.Name)
 	}
 }
 

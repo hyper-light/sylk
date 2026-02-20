@@ -437,6 +437,45 @@ func (c *GitClient) SequencerAbort() error {
 	return c.abortSequencer()
 }
 
+// SequencerUndoStep reverts the sequencer to the previous step using per-step
+// snapshot refs created by the safety guard. Returns the new status which will
+// typically be a conflict state for the re-applied step.
+func (c *GitClient) SequencerUndoStep() (*SequencerStatus, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.sequencer == nil {
+		return nil, ErrNoSequencer
+	}
+	if c.sequencer.currentIdx <= 0 {
+		return nil, fmt.Errorf("no previous step to undo")
+	}
+
+	snap := c.findPreviousStepSnapshot()
+	if snap == nil {
+		return nil, fmt.Errorf("no step snapshot available for rollback")
+	}
+
+	if err := c.restoreSnapshot(snap); err != nil {
+		return nil, fmt.Errorf("restore step snapshot: %w", err)
+	}
+
+	c.sequencer.currentIdx--
+	c.sequencer.conflicts = nil
+	c.sequencer.state = SeqRunning
+	return c.processNextStep()
+}
+
+// findPreviousStepSnapshot returns the most recent step snapshot (newest-first),
+// or nil if none exist. The safety guard creates these refs under refs/sylk/seq-step/.
+func (c *GitClient) findPreviousStepSnapshot() *SnapshotRef {
+	refs, err := c.listSylkRefs(seqStepRefPrefix, parseBackupRef)
+	if err != nil || len(refs) == 0 {
+		return nil
+	}
+	return &refs[0] // listSylkRefs sorts newest-first
+}
+
 // GetSequencerStatus returns the current sequencer status, or nil if idle.
 func (c *GitClient) GetSequencerStatus() *SequencerStatus {
 	c.mu.RLock()

@@ -43,6 +43,36 @@ func (c *GitClient) createSnapshot(op GitOp) (*SnapshotRef, error) {
 	}, nil
 }
 
+// createStepSnapshot saves HEAD as a per-step snapshot ref for incremental
+// rollback during multi-step sequencer operations (rebase, cherry-pick).
+// Ref format: "refs/sylk/seq-step/{stepIdx}-{unixNano}".
+func (c *GitClient) createStepSnapshot(stepIdx int) (*SnapshotRef, error) {
+	head, err := c.repo.Head()
+	if err != nil {
+		return nil, nil // No HEAD — nothing to snapshot.
+	}
+
+	now := time.Now()
+	refName := fmt.Sprintf("%s%d-%d", seqStepRefPrefix, stepIdx, now.UnixNano())
+	ref := plumbing.NewHashReference(plumbing.ReferenceName(refName), head.Hash())
+
+	if err := c.repo.Storer.SetReference(ref); err != nil {
+		return nil, fmt.Errorf("create step snapshot ref: %w", err)
+	}
+
+	branchRef := ""
+	if head.Name().IsBranch() {
+		branchRef = head.Name().String()
+	}
+
+	return &SnapshotRef{
+		Name:      refName,
+		Hash:      head.Hash(),
+		Timestamp: now,
+		BranchRef: branchRef,
+	}, nil
+}
+
 // createBranchBackup saves a branch ref as a backup before deletion.
 // Returns the created SnapshotRef for index tracking.
 func (c *GitClient) createBranchBackup(name string, hash plumbing.Hash) (*SnapshotRef, error) {
@@ -247,6 +277,7 @@ type refIndex struct {
 	detached []SnapshotRef
 	aborts   []SnapshotRef
 	stashes  []SnapshotRef
+	seqSteps []SnapshotRef
 	loaded   bool
 }
 
@@ -304,6 +335,10 @@ func (idx *refIndex) loadLocked() {
 			if snap := parseBackupRef(name, hash); snap != nil {
 				idx.stashes = append(idx.stashes, *snap)
 			}
+		case strings.HasPrefix(name, seqStepRefPrefix):
+			if snap := parseBackupRef(name, hash); snap != nil {
+				idx.seqSteps = append(idx.seqSteps, *snap)
+			}
 		}
 		return nil
 	})
@@ -313,6 +348,7 @@ func (idx *refIndex) loadLocked() {
 	sortRefsDesc(idx.detached)
 	sortRefsDesc(idx.aborts)
 	sortRefsDesc(idx.stashes)
+	sortRefsDesc(idx.seqSteps)
 	idx.loaded = true
 }
 
@@ -359,7 +395,23 @@ func (idx *refIndex) removeRef(name string) {
 	idx.detached = removeRefByName(idx.detached, name)
 	idx.aborts = removeRefByName(idx.aborts, name)
 	idx.stashes = removeRefByName(idx.stashes, name)
+	idx.seqSteps = removeRefByName(idx.seqSteps, name)
 	idx.mu.Unlock()
+}
+
+// addSeqStep inserts a per-step sequencer snapshot ref.
+func (idx *refIndex) addSeqStep(ref SnapshotRef) {
+	idx.mu.Lock()
+	idx.seqSteps = insertRefSorted(idx.seqSteps, ref)
+	idx.mu.Unlock()
+}
+
+// listSeqSteps returns a copy of per-step sequencer snapshot refs (newest-first).
+func (idx *refIndex) listSeqSteps() []SnapshotRef {
+	idx.ensureLoaded()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return append([]SnapshotRef(nil), idx.seqSteps...)
 }
 
 // listSnaps returns a copy of snapshot refs (newest-first).

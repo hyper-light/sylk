@@ -74,10 +74,11 @@ func (s *StatusLine) SetCursorCount(n int) { s.cursorCount = n }
 
 // View renders the status line to fill the given width.
 func (s *StatusLine) View(width int) string {
-	left := s.renderLeft()
 	right := s.renderRight()
-	leftLen := lipgloss.Width(left)
 	rightLen := lipgloss.Width(right)
+	maxLeft := max(width-rightLen, 0)
+	left := s.renderLeftTruncated(maxLeft)
+	leftLen := lipgloss.Width(left)
 	pad := max(width-leftLen-rightLen, 0)
 	return s.theme.StatusBar.
 		Width(width).
@@ -88,8 +89,9 @@ func (s *StatusLine) View(width int) string {
 // Section renderers
 // ---------------------------------------------------------------------------
 
-// renderLeft produces the left portion: [MODE] filename [+]
-func (s *StatusLine) renderLeft() string {
+// renderLeftTruncated produces the left portion: [MODE] filename [+],
+// truncating the filename with an ellipsis if the total would exceed maxWidth.
+func (s *StatusLine) renderLeftTruncated(maxWidth int) string {
 	badge := s.modeBadge()
 	name := s.fileName
 	if name == "" {
@@ -99,6 +101,20 @@ func (s *StatusLine) renderLeft() string {
 	if s.modified {
 		mod = " [+]"
 	}
+
+	// Measure the fixed parts: " {badge} " + "{mod} "
+	badgeLen := lipgloss.Width(badge)
+	fixedLen := 1 + badgeLen + 1 + len(mod) + 1 // leading space + badge + space + mod + trailing space
+	nameMax := maxWidth - fixedLen
+	if nameMax < 1 {
+		nameMax = 1
+	}
+	nameRunes := []rune(name)
+	if len(nameRunes) > nameMax {
+		// Truncate from the left (keep the tail which has the filename).
+		name = "\u2026" + string(nameRunes[len(nameRunes)-nameMax+1:])
+	}
+
 	return fmt.Sprintf(" %s %s%s ", badge, name, mod)
 }
 

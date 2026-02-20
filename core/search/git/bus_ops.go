@@ -132,6 +132,9 @@ const (
 	OpHasBranchStash    // has_branch_stash
 	OpListBranchStashes // list_branch_stashes
 
+	// Incremental rollback.
+	OpSequencerUndoStep // sequencer_undo_step
+
 	opCount // unexported sentinel — must remain last
 )
 
@@ -243,6 +246,8 @@ var opNames = [opCount]string{
 	OpUnstashForBranch:  "unstash_for_branch",
 	OpHasBranchStash:    "has_branch_stash",
 	OpListBranchStashes: "list_branch_stashes",
+
+	OpSequencerUndoStep: "sequencer_undo_step",
 }
 
 // opByName is the inverse of opNames, built at init time.
@@ -338,6 +343,8 @@ var opCategories = [opCount]string{
 
 	OpStashForBranch: "stash", OpUnstashForBranch: "stash",
 	OpHasBranchStash: "stash", OpListBranchStashes: "stash",
+
+	OpSequencerUndoStep: "sequencer",
 }
 
 // OpCategory returns the category of the operation (e.g. "branch", "commit").
@@ -359,6 +366,7 @@ var mutatingOps = [...]GitOp{
 	OpCherryPick, OpRebase, OpReset, OpRevert,
 	OpCherryPickSequence, OpRebaseInteractive, OpMergeSequence,
 	OpSequencerContinue, OpSequencerBypass, OpSequencerAbort, OpResolveConflictFile,
+	OpSequencerUndoStep,
 	OpWriteWorktreeFile,
 	OpPreserveBeforeAbort,
 	OpStashForBranch, OpUnstashForBranch,

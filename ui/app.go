@@ -476,6 +476,9 @@ type AppModel struct {
 	// or integration detection modals are shown.
 	pendingSeqOp *pendingSequencerOp
 
+	// pendingSyntaxValidation is true while the syntax-warning modal is displayed.
+	pendingSyntaxValidation bool
+
 	// ESC disambiguation: buffer a standalone ESC for a short window so a
 	// follow-up rune can be merged into an Alt+rune KeyMsg. This mirrors
 	// vim's ttimeoutlen / tmux's escape-time mechanism.
@@ -1648,6 +1651,49 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			return conflictResolveWrittenMsg{path: typed.Path}
 		}
 
+	case conflictview.SyntaxValidationRequestMsg:
+		if m.conflictView == nil {
+			return m, nil
+		}
+		entries := m.conflictView.Entries()
+		return m, func() tea.Msg {
+			warnings := conflictview.ValidateResolvedFiles(entries)
+			return conflictview.SyntaxValidationResultMsg{Warnings: warnings}
+		}
+
+	case conflictview.SyntaxValidationResultMsg:
+		if len(typed.Warnings) == 0 || typed.Proceed {
+			// No warnings or user confirmed — proceed with continue.
+			if m.conflictView != nil {
+				m.conflictView.SetLoading(true)
+			}
+			bus := m.gitBus
+			return m, func() tea.Msg {
+				status, err := bus.SequencerContinue()
+				if err != nil {
+					return sequencerFailedMsg{reason: err.Error()}
+				}
+				return sequencerResultMsg{status: status}
+			}
+		}
+		// Show warning modal.
+		items := make([]modal.ListModalItem, len(typed.Warnings))
+		for i, w := range typed.Warnings {
+			items[i] = modal.ListModalItem{
+				Label:  w.Path,
+				Detail: fmt.Sprintf("%d parse error(s)", len(w.Errors)),
+				Badge:  "ERR",
+				Color:  m.config.Theme().Palette.Error,
+			}
+		}
+		lm := modal.NewListModal("Syntax Errors in Resolved Files", items,
+			"Files may contain invalid syntax after resolution.",
+			[]string{"Continue Anyway", "Cancel"}, m.config.Theme())
+		m.modalOverlay.Push(lm)
+		m.overlay = overlayModal
+		m.pendingSyntaxValidation = true
+		return m, nil
+
 	case conflictview.SequencerContinueMsg:
 		if m.conflictView != nil {
 			m.conflictView.SetLoading(true)
@@ -1674,6 +1720,27 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case conflictview.SequencerAbortMsg:
 		// Preserve state before aborting (backup ref + stash dirty files).
 		return m, m.preserveAbortCmd("sequencer")
+
+	case conflictview.BaseContentRequestMsg:
+		return m, m.fetchBaseContentCmd(typed.Path, typed.BaseHash)
+
+	case conflictview.BaseContentResponseMsg:
+		if m.conflictView != nil && typed.Err == nil {
+			m.conflictView.SetBaseContent(typed.Path, typed.Content)
+		}
+		return m, nil
+
+	case conflictview.StepPreviewRequestMsg:
+		return m, m.fetchStepPreviewCmd(typed.Hash)
+
+	case conflictview.StepPreviewResponseMsg:
+		if m.conflictView != nil && typed.Preview != nil {
+			m.conflictView.SetStepPreview(typed.Preview)
+		}
+		return m, nil
+
+	case conflictview.SequencerUndoStepMsg:
+		return m, m.sequencerUndoStepCmd()
 
 	case conflictResolveWrittenMsg:
 		m.nudgeGitWatcher()
@@ -3848,6 +3915,18 @@ func (m *AppModel) handleModalClosed(result any) tea.Cmd {
 		return m.routeSequencerModal(lr)
 	}
 
+	// Route syntax validation modal.
+	if m.pendingSyntaxValidation {
+		m.pendingSyntaxValidation = false
+		if lr.Action == 0 {
+			// "Continue Anyway" — re-emit with Proceed=true.
+			return func() tea.Msg {
+				return conflictview.SyntaxValidationResultMsg{Proceed: true}
+			}
+		}
+		return nil // Cancel — do nothing.
+	}
+
 	return nil
 }
 
@@ -4113,9 +4192,17 @@ var multiCursorChordKeys = map[string]string{
 // Returns (cmd, true) if consumed, or cancels the chord and returns (nil, true)
 // so the cancelled key is swallowed (user presses a non-chord key to exit).
 func (m *AppModel) handleMultiCursorChord(ks string) (tea.Cmd, bool) {
+	// Esc cancels chord and clears all secondary cursors.
+	if ks == "esc" {
+		m.chord = chordNone
+		if ed := m.focusedEditor(); ed != nil {
+			ed.ClearSecondaryCursors()
+		}
+		return nil, true
+	}
 	action, ok := multiCursorChordKeys[ks]
 	if !ok {
-		// Any non-chord key cancels the chord.
+		// Any non-chord key cancels the chord (but keeps cursors).
 		m.chord = chordNone
 		return nil, true
 	}
@@ -4766,6 +4853,75 @@ func (m *AppModel) preserveAbortCmd(opName string) tea.Cmd {
 	return func() tea.Msg {
 		pres, err := bus.PreserveBeforeAbort(opName)
 		return msg.AbortPreservedMsg{Preservation: pres, Err: err}
+	}
+}
+
+// fetchBaseContentCmd reads ancestor blob content for the three-way diff view.
+func (m *AppModel) fetchBaseContentCmd(path, baseHash string) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		content, err := bus.ReadBlobContent(baseHash)
+		return conflictview.BaseContentResponseMsg{
+			Path: path, Content: content, Err: err,
+		}
+	}
+}
+
+// fetchStepPreviewCmd computes the commit diff for the step preview overlay.
+func (m *AppModel) fetchStepPreviewCmd(hash string) tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		return m.buildStepPreview(bus, hash)
+	}
+}
+
+// buildStepPreview resolves a commit's parent and diffs against it.
+func (m *AppModel) buildStepPreview(bus *git.GitBus, hash string) conflictview.StepPreviewResponseMsg {
+	ci, err := bus.GetCommit(hash)
+	if err != nil || len(ci.ParentHashes) == 0 {
+		return conflictview.StepPreviewResponseMsg{}
+	}
+	diffs, err := bus.GetDiff(ci.ParentHashes[0], ci.Hash)
+	if err != nil {
+		return conflictview.StepPreviewResponseMsg{}
+	}
+	conflictPaths := m.conflictPathSet()
+	fileDiffs := make([]conflictview.FileDiffSummary, len(diffs))
+	for i, fd := range diffs {
+		fileDiffs[i] = conflictview.FileDiffSummary{
+			Path: fd.Path, Additions: fd.Additions, Deletions: fd.Deletions,
+		}
+	}
+	return conflictview.StepPreviewResponseMsg{
+		Preview: &conflictview.StepPreview{
+			Hash: ci.ShortHash, Subject: ci.Message,
+			FileDiffs: fileDiffs, ConflictPaths: conflictPaths,
+		},
+	}
+}
+
+// conflictPathSet returns the set of paths in the current conflict view.
+func (m *AppModel) conflictPathSet() map[string]bool {
+	if m.conflictView == nil {
+		return nil
+	}
+	entries := m.conflictView.Entries()
+	paths := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		paths[e.Path] = true
+	}
+	return paths
+}
+
+// sequencerUndoStepCmd issues the SequencerUndoStep command via the git bus.
+func (m *AppModel) sequencerUndoStepCmd() tea.Cmd {
+	bus := m.gitBus
+	return func() tea.Msg {
+		status, err := bus.SequencerUndoStep()
+		if err != nil {
+			return sequencerFailedMsg{reason: err.Error()}
+		}
+		return sequencerResultMsg{status: status}
 	}
 }
 
@@ -8834,7 +8990,13 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 
 	// Motion while dragging: extend selection even if the pointer left
 	// the panel bounds (clamp handled by the editor).
+	// Suppressed when multi-cursor is active — visual mode and multi-cursor
+	// are mutually exclusive, so drag-select is disabled until cursors are
+	// cleared (Esc).
 	if mouse.Action == tea.MouseActionMotion && m.editorMouseDown {
+		if m.focusedEditor().HasMultiCursor() {
+			return true, nil
+		}
 		viewX, viewY := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
 		if len(m.focusedTabOrder()) > 0 {
 			viewY -= tabbar.Height

@@ -75,6 +75,9 @@ type Model struct {
 	// Original content for undo (path → original MergedContent).
 	originalContent map[string]string
 
+	// Regression warnings per file path (accumulated across resolutions).
+	regressionWarnings map[string][]RegressionWarning
+
 	// Contextual conflict labels.
 	oursLabel   string // e.g. "Dest" or "Local"
 	theirsLabel string // e.g. "Source" or "Remote"
@@ -102,6 +105,17 @@ type Model struct {
 	nerdFonts    bool
 	bounceOffset int
 
+	// Base content for three-way diff (path → ancestor content).
+	baseContent map[string]string
+	baseVisible bool
+
+	// Step preview overlay.
+	stepPreview        *StepPreview
+	stepPreviewVisible bool
+
+	// Chord state: two-key shortcuts (alt+M then 3, alt+D then c).
+	pendingChord string
+
 	// Syntax highlighting.
 	highlighter  *codepkg.Highlighter
 	syntaxStyles map[theme.SyntaxCategory]lipgloss.Style
@@ -126,11 +140,44 @@ func New(data ConflictData, th *theme.Theme, nerdFonts bool) *Model {
 	m.deriveConflictLabels()
 	m.snapshotOriginalContent()
 	m.parseAllEntryHunks()
+	m.detectAutoResolutions()
+	m.scoreAndSortEntries()
 	if len(data.Entries) > 0 {
 		m.parseMergedContent()
 		m.scrollToCurrentHunk()
 	}
 	return m
+}
+
+// detectAutoResolutions scans all entries for trivially resolvable hunks.
+func (m *Model) detectAutoResolutions() {
+	for i := range m.data.Entries {
+		m.detectEntryAutoResolutions(&m.data.Entries[i])
+	}
+}
+
+// detectEntryAutoResolutions marks auto-resolvable hunks on a single entry.
+func (m *Model) detectEntryAutoResolutions(e *ConflictFileEntry) {
+	if len(e.Hunks) == 0 || e.MergedContent == "" {
+		return
+	}
+	lines := strings.Split(e.MergedContent, "\n")
+	for _, ar := range autoResolveHunks(e.Hunks, lines, e.Path) {
+		e.Hunks[ar.HunkIdx].AutoResolved = true
+		e.Hunks[ar.HunkIdx].AutoKind = ar.Kind
+	}
+}
+
+// scoreAndSortEntries computes complexity scores and sorts entries simple-first.
+func (m *Model) scoreAndSortEntries() {
+	if len(m.data.Entries) == 0 {
+		return
+	}
+	scores := scoreAllEntries(m.data.Entries)
+	for i := range m.data.Entries {
+		m.data.Entries[i].Complexity = scores[i]
+	}
+	sortByComplexity(m.data.Entries, scores)
 }
 
 // deriveConflictLabels sets contextual labels based on the operation type
@@ -150,36 +197,26 @@ func (m *Model) deriveConflictLabels() {
 
 	switch {
 	case m.data.Op == opMerge && strings.Contains(m.data.SourceName, "/"):
-		// Pull merge — remote tracking branch.
-		m.oursLabel = "Local"
-		m.theirsLabel = "Remote"
-		m.oursCtx = m.data.DestName
-
-		// Extract base name from remote ref (e.g. "origin/main" → "main").
-		remote := m.data.SourceName
-		if idx := strings.LastIndex(remote, "/"); idx >= 0 {
-			remote = remote[idx+1:]
-		}
-		// Same base branch name → context is the short sha (the branch
-		// name would be redundant). Different → show the full ref.
-		if remote == m.data.DestName {
-			m.theirsCtx = m.data.Hash
-		} else {
-			m.theirsCtx = m.data.SourceName
-		}
+		// Pull merge — use actual branch names.
+		m.oursLabel = m.data.DestName
+		m.theirsLabel = m.data.SourceName
+		m.oursCtx = ""
+		m.theirsCtx = ""
 
 	case m.data.Op == opCherryPick || m.data.Op == opRebase:
-		m.oursLabel = "Curr"
-		m.theirsLabel = "Incmg"
-		m.oursCtx = m.data.DestName
-		m.theirsCtx = m.data.SourceName
+		// Rebase/cherry-pick — ours is the dest branch, theirs is the
+		// short commit hash with the subject as context.
+		m.oursLabel = m.data.DestName
+		m.theirsLabel = m.data.Hash
+		m.oursCtx = ""
+		m.theirsCtx = m.data.Subject
 
 	default:
-		// Local merge.
-		m.oursLabel = "Dest"
-		m.theirsLabel = "Source"
-		m.oursCtx = m.data.DestName
-		m.theirsCtx = m.data.SourceName
+		// Local merge — use actual branch names.
+		m.oursLabel = m.data.DestName
+		m.theirsLabel = m.data.SourceName
+		m.oursCtx = ""
+		m.theirsCtx = ""
 	}
 }
 
@@ -244,6 +281,30 @@ func (m *Model) resolutionLabel(r ConflictResolution) string {
 		return "---"
 	}
 }
+
+// Entries returns the conflict entries (for syntax validation in app layer).
+func (m *Model) Entries() []ConflictFileEntry { return m.data.Entries }
+
+// SetBaseContent stores fetched ancestor content for a file path.
+func (m *Model) SetBaseContent(path, content string) {
+	if m.baseContent == nil {
+		m.baseContent = make(map[string]string)
+	}
+	m.baseContent[path] = content
+	m.viewDirty = true
+}
+
+// SetStepPreview stores the commit diff data for step-preview display.
+func (m *Model) SetStepPreview(p *StepPreview) {
+	m.stepPreview = p
+	m.viewDirty = true
+}
+
+// BaseVisible reports whether the three-way base view is toggled on.
+func (m *Model) BaseVisible() bool { return m.baseVisible }
+
+// StepPreviewVisible reports whether the step preview overlay is toggled on.
+func (m *Model) StepPreviewVisible() bool { return m.stepPreviewVisible }
 
 // Close releases tree-sitter resources.
 func (m *Model) Close() {
@@ -383,6 +444,7 @@ func (m *Model) ScrollFileListDown() bool {
 func (m *Model) onFileSelectionChanged() {
 	m.scrollOffset = 0
 	m.currentHunk = 0
+	m.regressionWarnings = nil
 	m.parseMergedContent()
 	m.scrollToCurrentHunk()
 	m.viewDirty = true
@@ -653,65 +715,101 @@ func (m *Model) scrollToCurrentHunk() {
 
 // resolveCurrentHunk resolves the current hunk by splicing mergedLines.
 func (m *Model) resolveCurrentHunk(r ConflictResolution) tea.Cmd {
-	if len(m.hunks) == 0 || m.currentHunk >= len(m.hunks) {
+	if !m.canResolveHunk() {
 		return nil
 	}
-	if m.selectedFile < 0 || m.selectedFile >= len(m.data.Entries) {
-		return nil
-	}
-
 	hunk := m.hunks[m.currentHunk]
-	lines := m.mergedLines
+	entry := &m.data.Entries[m.selectedFile]
 
+	m.recordRegressionWarnings(entry.Path, hunk, r)
+	m.mergedLines = spliceHunk(m.mergedLines, hunk, r)
+	entry.MergedContent = strings.Join(m.mergedLines, "\n")
+	m.parseMergedContent()
+	return m.afterHunkResolution(entry)
+}
+
+// canResolveHunk reports whether there is a valid hunk+file to resolve.
+func (m *Model) canResolveHunk() bool {
+	return m.hasSelectedFile() &&
+		len(m.hunks) > 0 &&
+		m.currentHunk < len(m.hunks)
+}
+
+// recordRegressionWarnings checks a hunk resolution for suspicious patterns
+// and appends any warnings to the per-file warning map.
+func (m *Model) recordRegressionWarnings(path string, hunk ConflictHunk, r ConflictResolution) {
+	if m.regressionWarnings == nil {
+		m.regressionWarnings = make(map[string][]RegressionWarning)
+	}
+	warnings := checkResolution(m.mergedLines, hunk, r)
+	if len(warnings) == 0 {
+		return
+	}
+	for i := range warnings {
+		warnings[i].HunkIdx = m.currentHunk
+	}
+	m.regressionWarnings[path] = append(m.regressionWarnings[path], warnings...)
+}
+
+// spliceHunk removes conflict markers from lines based on the resolution.
+func spliceHunk(lines []string, hunk ConflictHunk, r ConflictResolution) []string {
 	switch r {
 	case ResOurs:
-		// Keep lines (StartLine+1..DivLine-1), remove markers and theirs.
-		lines = spliceRemoveRange(lines, hunk.DivLine, hunk.EndLine+1) // remove ======= through >>>>>>>
-		lines = spliceRemoveRange(lines, hunk.StartLine, hunk.StartLine+1) // remove <<<<<<<
+		lines = spliceRemoveRange(lines, hunk.DivLine, hunk.EndLine+1)
+		return spliceRemoveRange(lines, hunk.StartLine, hunk.StartLine+1)
 	case ResTheirs:
-		// Keep lines (DivLine+1..EndLine-1), remove markers and ours.
-		lines = spliceRemoveRange(lines, hunk.EndLine, hunk.EndLine+1) // remove >>>>>>>
-		lines = spliceRemoveRange(lines, hunk.StartLine, hunk.DivLine+1) // remove <<<<<<< through =======
+		lines = spliceRemoveRange(lines, hunk.EndLine, hunk.EndLine+1)
+		return spliceRemoveRange(lines, hunk.StartLine, hunk.DivLine+1)
 	case ResBoth:
-		// Keep both sides, remove only the 3 marker lines (bottom-up).
-		lines = spliceRemoveRange(lines, hunk.EndLine, hunk.EndLine+1) // remove >>>>>>>
-		lines = spliceRemoveRange(lines, hunk.DivLine, hunk.DivLine+1) // remove =======
-		lines = spliceRemoveRange(lines, hunk.StartLine, hunk.StartLine+1) // remove <<<<<<<
+		lines = spliceRemoveRange(lines, hunk.EndLine, hunk.EndLine+1)
+		lines = spliceRemoveRange(lines, hunk.DivLine, hunk.DivLine+1)
+		return spliceRemoveRange(lines, hunk.StartLine, hunk.StartLine+1)
 	default:
-		return nil
+		return lines
 	}
+}
 
-	m.mergedLines = lines
-	entry := &m.data.Entries[m.selectedFile]
-	entry.MergedContent = strings.Join(lines, "\n")
-
-	// Re-parse after modification.
-	m.parseMergedContent()
-
-	// If all hunks resolved, mark file resolved, write content, and advance.
+// afterHunkResolution handles post-splice state: marks file resolved if all
+// hunks are gone, or clamps the hunk index and scrolls.
+func (m *Model) afterHunkResolution(entry *ConflictFileEntry) tea.Cmd {
 	if len(m.hunks) == 0 {
-		entry.Resolution = ResOurs
-		m.fileListDirty = true
-		path := entry.Path
-		content := entry.MergedContent
-		m.advanceToNextUnresolved()
-		return func() tea.Msg {
-			return ConflictWriteContentMsg{Path: path, Content: content}
-		}
+		return m.markFileResolved(entry)
 	}
-
-	// Clamp current hunk index.
-	if m.currentHunk >= len(m.hunks) {
-		m.currentHunk = len(m.hunks) - 1
-	}
+	m.currentHunk = min(m.currentHunk, len(m.hunks)-1)
 	m.scrollToCurrentHunk()
 	m.viewDirty = true
 	return nil
 }
 
+// markFileResolved marks an entry resolved, advances to the next unresolved
+// file, and emits a write command for the resolved content.
+func (m *Model) markFileResolved(entry *ConflictFileEntry) tea.Cmd {
+	entry.Resolution = ResOurs
+	m.fileListDirty = true
+	path := entry.Path
+	content := entry.MergedContent
+	m.advanceToNextUnresolved()
+	return func() tea.Msg {
+		return ConflictWriteContentMsg{Path: path, Content: content}
+	}
+}
+
 // spliceRemoveRange removes lines[start:end] from the slice.
 func spliceRemoveRange(lines []string, start, end int) []string {
 	return append(lines[:start], lines[end:]...)
+}
+
+// hasRegressionAtLine reports whether the selected file has any regression
+// warnings. After resolution, hunk boundaries shift, so regression warnings
+// are shown as a per-file indicator on all gutter lines.
+func (m *Model) hasRegressionAtLine(_ int) bool {
+	if len(m.regressionWarnings) == 0 {
+		return false
+	}
+	if m.selectedFile < 0 || m.selectedFile >= len(m.data.Entries) {
+		return false
+	}
+	return len(m.regressionWarnings[m.data.Entries[m.selectedFile].Path]) > 0
 }
 
 // hasHunks reports whether the selected entry has inline conflict hunks.
@@ -855,16 +953,110 @@ func (m *Model) UpdateFileList(key string) tea.Cmd {
 	return nil
 }
 
+// chordPrefixes is the set of keys that start a two-key chord sequence.
+var chordPrefixes = map[string]bool{
+	"alt+M": true,
+	"alt+D": true,
+}
+
 // handleKey processes keyboard input for the content pane.
 func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
-	// Find bar gets priority when active.
 	if m.findActive && m.findBar != nil {
 		return m.handleFindBarKey(key)
 	}
 	if m.toolbarFocused {
 		return m.handleToolbarKey(key)
 	}
-	return m.dispatchContentKey(key.String())
+	return m.handleContentInput(key.String())
+}
+
+// handleContentInput dispatches chord or normal key input.
+func (m *Model) handleContentInput(ks string) tea.Cmd {
+	if cmd, handled := m.handleChordInput(ks); handled {
+		return cmd
+	}
+	return m.dispatchContentKey(ks)
+}
+
+// handleChordInput processes two-key chord sequences.
+// Returns (cmd, true) if the key was consumed by chord logic.
+func (m *Model) handleChordInput(ks string) (tea.Cmd, bool) {
+	if m.pendingChord != "" {
+		return m.finishChord(ks)
+	}
+	if chordPrefixes[ks] {
+		m.pendingChord = ks
+		m.viewDirty = true
+		return nil, true
+	}
+	return nil, false
+}
+
+// finishChord completes a pending chord with the given second key.
+func (m *Model) finishChord(ks string) (tea.Cmd, bool) {
+	chord := m.pendingChord
+	m.pendingChord = ""
+	m.viewDirty = true
+	cmd := m.completeChord(chord, ks)
+	return cmd, cmd != nil
+}
+
+// completeChord handles the second key of a two-key chord.
+// Returns a non-nil cmd if the chord was consumed.
+func (m *Model) completeChord(prefix, completion string) tea.Cmd {
+	switch {
+	case prefix == "alt+M" && completion == "3":
+		// Toggle three-way base context view.
+		m.baseVisible = !m.baseVisible
+		m.viewDirty = true
+		if m.baseVisible {
+			return m.requestBaseContent()
+		}
+		return nil
+
+	case prefix == "alt+D" && completion == "c":
+		// Toggle step preview overlay.
+		m.stepPreviewVisible = !m.stepPreviewVisible
+		m.viewDirty = true
+		if m.stepPreviewVisible && m.stepPreview == nil {
+			return m.requestStepPreview()
+		}
+		return nil
+	}
+	return nil
+}
+
+// requestBaseContent emits a BaseContentRequestMsg for the selected file
+// if base hash is available and content isn't already cached.
+func (m *Model) requestBaseContent() tea.Cmd {
+	if m.selectedFile < 0 || m.selectedFile >= len(m.data.Entries) {
+		return nil
+	}
+	e := &m.data.Entries[m.selectedFile]
+	if e.BaseHash == "" || e.BaseHash == zeroHash {
+		return nil
+	}
+	if m.baseContent != nil {
+		if _, ok := m.baseContent[e.Path]; ok {
+			return nil // Already cached.
+		}
+	}
+	path := e.Path
+	hash := e.BaseHash
+	return func() tea.Msg {
+		return BaseContentRequestMsg{Path: path, BaseHash: hash}
+	}
+}
+
+// requestStepPreview emits a StepPreviewRequestMsg for the current commit.
+func (m *Model) requestStepPreview() tea.Cmd {
+	if m.data.Hash == "" {
+		return nil
+	}
+	hash := m.data.Hash
+	return func() tea.Msg {
+		return StepPreviewRequestMsg{Hash: hash}
+	}
 }
 
 // handleFindBarKey routes keys to the find bar.
