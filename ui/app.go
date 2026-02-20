@@ -1407,12 +1407,14 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			data := conflictview.ConflictData{
-				Op:      int(status.Op),
-				Total:   status.TotalSteps,
-				Current: status.CurrentStep,
-				Hash:    status.CurrentHash,
-				Subject: status.Subject,
-				Entries: entries,
+				Op:         int(status.Op),
+				Total:      status.TotalSteps,
+				Current:    status.CurrentStep,
+				Hash:       status.CurrentHash,
+				Subject:    status.Subject,
+				SourceName: status.SourceName,
+				DestName:   status.DestName,
+				Entries:    entries,
 			}
 			m.enterConflictView(data)
 			m.statusBar.SetFlash("Conflict at step " + fmt.Sprintf("%d/%d", status.CurrentStep+1, status.TotalSteps))

@@ -3874,11 +3874,9 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseSelAnchor < 0 {
 			m.rebaseSelAnchor = m.rebaseCursor
 		}
-
 		if m.rebaseCursor < n-1 {
 			m.rebaseCursor++
 		}
-
 		m.ensureRebaseCursorVisible()
 		m.viewDirty = true
 		return nil
@@ -3889,7 +3887,6 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		if m.rebaseCursor > 0 {
 			m.rebaseCursor--
 		}
-
 		m.ensureRebaseCursorVisible()
 		m.viewDirty = true
 		return nil
@@ -3916,7 +3913,6 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		}
 		m.rebaseSelAnchor = -1
 		if m.rebaseCursor < n-1 {
-
 			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor+1] =
 				m.rebasePlan[m.rebaseCursor+1], m.rebasePlan[m.rebaseCursor]
 			m.rebaseCursor++

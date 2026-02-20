@@ -1987,7 +1987,7 @@ func (m *Model) viewRebasePlan() string {
 		line := prefix + actionCell + sepStr + hashCell + sepStr + subjectCell
 		lines = append(lines, line)
 	}
-	
+
 	// Pad to fill content height.
 	for len(lines) < ch {
 		lines = append(lines, "")

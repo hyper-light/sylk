@@ -83,6 +83,8 @@ type SequencerStatus struct {
 	Conflicts   []MergeConflict
 	CurrentHash string // Short hash of commit being applied
 	Subject     string // Subject line of current commit
+	SourceName  string // Display name for the "theirs" side (branch or short sha)
+	DestName    string // Display name for the "ours" side (branch name)
 }
 
 // =============================================================================
@@ -105,6 +107,10 @@ type sequencer struct {
 	// Merge-specific: both parents for the final merge commit.
 	mergeSourceHash plumbing.Hash
 	mergeTargetRef  plumbing.ReferenceName
+
+	// Display names for conflict labels.
+	sourceName string // "theirs" side: branch name or short sha
+	destName   string // "ours" side: branch name
 
 	// Conflict state
 	conflicts []MergeConflict
@@ -154,6 +160,11 @@ func (c *GitClient) CherryPickSequence(commitHashes []string, targetBranch strin
 		return nil, err
 	}
 	seq.op = SeqCherryPick
+	if targetBranch != "" {
+		seq.destName = targetBranch
+	} else {
+		seq.destName, _ = c.getBranchName()
+	}
 
 	// Checkout target branch if specified and different from current.
 	if targetBranch != "" {
@@ -210,6 +221,7 @@ func (c *GitClient) RebaseInteractive(ontoBranch string, plan []RebasePlanEntry)
 		return nil, err
 	}
 	seq.op = SeqRebase
+	seq.destName = ontoBranch
 	seq.steps = steps
 
 	// Detach HEAD at onto tip.
@@ -244,6 +256,8 @@ func (c *GitClient) MergeSequence(sourceBranch, targetBranch string) (*Sequencer
 		return nil, err
 	}
 	seq.op = SeqMerge
+	seq.sourceName = sourceBranch
+	seq.destName = targetBranch
 
 	// Checkout target branch.
 	if err := c.switchToTargetBranch(seq, targetBranch); err != nil {
@@ -1012,12 +1026,21 @@ func (c *GitClient) buildStatus() *SequencerStatus {
 		TotalSteps:  len(seq.steps),
 		CurrentStep: seq.currentIdx,
 		Conflicts:   seq.conflicts,
+		DestName:    seq.destName,
 	}
 
 	if seq.currentIdx < len(seq.steps) {
 		step := &seq.steps[seq.currentIdx]
 		s.CurrentHash = step.commit.Hash.String()[:7]
 		s.Subject = commitSubject(step.commit.Message)
+	}
+
+	// For merge, source name is the branch. For cherry-pick/rebase, it's the
+	// short hash of the commit currently being applied.
+	if seq.op == SeqMerge {
+		s.SourceName = seq.sourceName
+	} else if seq.currentIdx < len(seq.steps) {
+		s.SourceName = seq.steps[seq.currentIdx].commit.Hash.String()[:7]
 	}
 
 	return s
