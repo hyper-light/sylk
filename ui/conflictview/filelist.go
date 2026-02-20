@@ -83,24 +83,27 @@ func renderDivider(width int, p theme.Palette) string {
 	return lipgloss.NewStyle().Foreground(p.Border).Render(strings.Repeat("─", width))
 }
 
-// linesPerFileEntry is the number of display lines per file (info + hunk line).
-const linesPerFileEntry = 2
+// entryLineCount returns the display height of file entry fileIdx.
+// Each entry has 1 header line plus one line per hunk (minimum 1).
+func (m *Model) entryLineCount(fileIdx int) int {
+	n := len(m.data.Entries[fileIdx].Hunks)
+	return 1 + max(n, 1)
+}
 
-// renderFileEntries renders the visible file entries (2 lines each).
+// renderFileEntries renders the visible file entries (variable height each).
 func (m *Model) renderFileEntries(entryH int, width int, p theme.Palette) string {
 	total := len(m.data.Entries)
 	if total == 0 {
 		return renderEmptyFileList(entryH, width, p)
 	}
 
-	filesVisible := max(entryH/linesPerFileEntry, 1)
-	start, end := visibleWindow(m.selectedFile, total, filesVisible)
-	lines := make([]string, 0, (end-start)*linesPerFileEntry)
+	start, end := m.visibleFileWindow(entryH)
+	lines := make([]string, 0, entryH)
 	for i := start; i < end; i++ {
 		entry := &m.data.Entries[i]
 		isCursor := i == m.selectedFile
 		lines = append(lines, m.renderConflictFileEntry(entry, isCursor, width, p))
-		lines = append(lines, m.renderHunkLine(i, isCursor, width, p))
+		lines = append(lines, m.renderHunkLines(i, isCursor, width, p)...)
 	}
 
 	blank := strings.Repeat(" ", width)
@@ -116,6 +119,48 @@ func (m *Model) renderFileEntries(entryH int, width int, p theme.Palette) string
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// visibleFileWindow returns the range [start, end) of entries that fit
+// in entryH display lines, anchored on the selected file.
+func (m *Model) visibleFileWindow(entryH int) (int, int) {
+	total := len(m.data.Entries)
+	if total == 0 {
+		return 0, 0
+	}
+	start := m.selectedFile
+	end := m.selectedFile + 1
+	used := m.entryLineCount(m.selectedFile)
+	start, used = m.expandWindowUp(start, used, entryH)
+	end, used = m.expandWindowDown(end, total, used, entryH)
+	start, _ = m.expandWindowUp(start, used, entryH)
+	return start, end
+}
+
+// expandWindowUp expands the visible window upward while entries fit.
+func (m *Model) expandWindowUp(start, used, limit int) (int, int) {
+	for start > 0 {
+		h := m.entryLineCount(start - 1)
+		if used+h > limit {
+			break
+		}
+		start--
+		used += h
+	}
+	return start, used
+}
+
+// expandWindowDown expands the visible window downward while entries fit.
+func (m *Model) expandWindowDown(end, total, used, limit int) (int, int) {
+	for end < total {
+		h := m.entryLineCount(end)
+		if used+h > limit {
+			break
+		}
+		end++
+		used += h
+	}
+	return end, used
 }
 
 // renderEmptyFileList renders an empty state.
@@ -233,14 +278,12 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 	return row
 }
 
-// renderHunkLine renders the indented hunk location line below a file entry.
-// Format: "    L12  L45  L89" — the current hunk is highlighted for the
-// selected file.
-func (m *Model) renderHunkLine(fileIdx int, isCursor bool, width int, p theme.Palette) string {
-	bg := p.Selection
+// renderHunkLines renders one line per hunk below a file entry.
+// Returns at least one line (blank if no hunks) for visual spacing.
+func (m *Model) renderHunkLines(fileIdx int, isCursor bool, width int, p theme.Palette) []string {
 	baseSt := lipgloss.NewStyle()
 	if isCursor {
-		baseSt = baseSt.Background(bg)
+		baseSt = baseSt.Background(p.Selection)
 	}
 
 	var hunks []ConflictHunk
@@ -249,48 +292,31 @@ func (m *Model) renderHunkLine(fileIdx int, isCursor bool, width int, p theme.Pa
 	}
 
 	if len(hunks) == 0 {
-		return baseSt.Render(strings.Repeat(" ", width))
+		return []string{baseSt.Render(strings.Repeat(" ", width))}
 	}
 
-	var b strings.Builder
-	b.WriteString(baseSt.Render("    "))
-	col := 4
-
+	lines := make([]string, len(hunks))
 	for j, h := range hunks {
-		label := fmt.Sprintf("L%d", h.StartLine+1)
-		labelW := len(label) // ASCII-only, len == visual width
-
-		sepW := 0
-		if j > 0 {
-			sepW = 2
-		}
-		if col+sepW+labelW > width {
-			break
-		}
-
-		if j > 0 {
-			b.WriteString(baseSt.Render("  "))
-			col += 2
-		}
-
-		st := lipgloss.NewStyle().Foreground(p.Muted)
-		if isCursor && j == m.currentHunk && m.currentHunk < len(hunks) {
-			st = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
-		}
-		if isCursor {
-			st = st.Background(bg)
-		}
-		b.WriteString(st.Render(label))
-		col += labelW
+		lines[j] = m.renderSingleHunkLine(j, h, isCursor, width, p, baseSt)
 	}
+	return lines
+}
 
-	row := b.String()
-	if vis := lipgloss.Width(row); vis < width {
-		b.WriteString(baseSt.Render(strings.Repeat(" ", width-vis)))
-		row = b.String()
+// renderSingleHunkLine renders one hunk location line: "    L{line}".
+func (m *Model) renderSingleHunkLine(hunkIdx int, h ConflictHunk, isCursor bool, width int, p theme.Palette, baseSt lipgloss.Style) string {
+	label := fmt.Sprintf("    L%d", h.StartLine+1)
+	st := lipgloss.NewStyle().Foreground(p.Muted)
+	if isCursor && hunkIdx == m.currentHunk {
+		st = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
 	}
-
-	return row
+	if isCursor {
+		st = st.Background(p.Selection)
+	}
+	text := st.Render(label)
+	if vis := lipgloss.Width(text); vis < width {
+		text += baseSt.Render(strings.Repeat(" ", width-vis))
+	}
+	return text
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +393,9 @@ func (m *Model) fileListHalfPageUp() {
 }
 
 func (m *Model) fileListEntryH() int {
-	return max((m.fileListH-fileListHeaderHeight)/linesPerFileEntry, 1)
+	entryH := max(m.fileListH-fileListHeaderHeight, 0)
+	start, end := m.visibleFileWindow(entryH)
+	return max(end-start, 1)
 }
 
 // resolveFromList applies a resolution from the file list, returning the tea.Cmd.
@@ -389,15 +417,29 @@ func (m *Model) ClickFileList(localY int) {
 	}
 	entryH := max(m.fileListH-fileListHeaderHeight, 0)
 	lineIdx := localY - fileListHeaderHeight
-	total := len(m.data.Entries)
-	filesVisible := max(entryH/linesPerFileEntry, 1)
-	start, _ := visibleWindow(m.selectedFile, total, filesVisible)
-	idx := start + lineIdx/linesPerFileEntry
-	if idx < 0 || idx >= total {
+	if lineIdx >= entryH {
+		return
+	}
+	idx := m.fileListHitTest(lineIdx, entryH)
+	if idx < 0 || idx >= len(m.data.Entries) {
 		return
 	}
 	m.selectedFile = idx
 	m.onFileSelectionChanged()
+}
+
+// fileListHitTest maps a line offset within the entry area to a file index.
+func (m *Model) fileListHitTest(lineOffset, entryH int) int {
+	start, end := m.visibleFileWindow(entryH)
+	cumulative := 0
+	for i := start; i < end; i++ {
+		h := m.entryLineCount(i)
+		if lineOffset < cumulative+h {
+			return i
+		}
+		cumulative += h
+	}
+	return -1
 }
 
 // ---------------------------------------------------------------------------
@@ -419,22 +461,6 @@ func padLine(s string, width int) string {
 		s += strings.Repeat(" ", width-vis)
 	}
 	return s
-}
-
-// visibleWindow calculates start and end for a scrolling window.
-func visibleWindow(selected, total, height int) (start, end int) {
-	if total <= height {
-		return 0, total
-	}
-	half := height / 2
-	start = selected - half
-	start = max(start, 0)
-	end = start + height
-	if end > total {
-		end = total
-		start = max(end-height, 0)
-	}
-	return start, end
 }
 
 // applyBounceShiftLines shifts lines for bounce effect.

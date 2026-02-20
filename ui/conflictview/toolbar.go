@@ -66,32 +66,48 @@ func (m *Model) ctbCellWidth(id int) int {
 	return lipgloss.Width(" " + inner + " ")
 }
 
-// ctbPrimaryCount is the number of always-visible primary buttons.
-const ctbPrimaryCount = 3
+// ctbLeftCount is the number of buttons in the left toolbar group
+// (Continue, Bypass, Abort, Prev, Next).
+const ctbLeftCount = 5
 
-// ctbFittingCount returns how many buttons fit in the current width.
-// The first 3 (Continue/Bypass/Abort) are always shown; the rest are
-// added as width permits.
+// ctbGroupGap is the minimum gap between left and right toolbar groups.
+const ctbGroupGap = 2
+
+// ctbFittingCount returns how many total buttons fit across both groups.
+// The left group (Continue..Next) is always shown; right-group buttons
+// (Ours..Undo) are added as width permits.
 func (m *Model) ctbFittingCount() int {
-	used := 0
-	for i := range ctbPrimaryCount {
-		if i > 0 {
-			used++ // separator
-		}
-		used += m.ctbCellWidth(i)
-	}
-	used++ // trailing border
+	leftW := m.toolbarGroupWidth(0, ctbLeftCount)
 
-	count := ctbPrimaryCount
-	for i := ctbPrimaryCount; i < ctbCount; i++ {
-		need := 1 + m.ctbCellWidth(i) // separator + cell
-		if used+need > m.width {
+	available := m.width - leftW - ctbGroupGap
+	rightUsed := 1 // leading ╭/│
+	count := ctbLeftCount
+	for i := ctbLeftCount; i < ctbCount; i++ {
+		need := m.ctbCellWidth(i)
+		if i > ctbLeftCount {
+			need++ // separator
+		}
+		if rightUsed+need > available {
 			break
 		}
-		used += need
+		rightUsed += need
 		count++
 	}
 	return count
+}
+
+// toolbarGroupWidth returns the total rendered width of buttons [start, end),
+// including inter-button separators and one trailing border character.
+func (m *Model) toolbarGroupWidth(start, end int) int {
+	w := 0
+	for i := start; i < end; i++ {
+		if i > start {
+			w++ // separator
+		}
+		w += m.ctbCellWidth(i)
+	}
+	w++ // trailing border
+	return w
 }
 
 // selectedEntry returns the currently selected entry, or nil.
@@ -102,75 +118,94 @@ func (m *Model) selectedEntry() *ConflictFileEntry {
 	return &m.data.Entries[m.selectedFile]
 }
 
-// renderToolbar renders the conflict toolbar with dynamic button count.
+// btnCell holds the pre-rendered content and visual width of a toolbar button.
+type btnCell struct {
+	inner string
+	width int
+}
+
+// buildBtnCell builds a single toolbar button cell.
+func (m *Model) buildBtnCell(id int, p theme.Palette) btnCell {
+	def := m.ctbDefFor(id)
+	enabled := m.isToolbarButtonEnabled(id)
+	selected := m.toolbarFocused && id == m.toolbarAction
+	hovered := id == m.hoverBtnIdx
+
+	fg := p.Muted
+	bold := false
+	if enabled {
+		fg = p.Foreground
+		if hovered {
+			fg = def.accent(p)
+		}
+		if selected {
+			fg = def.accent(p)
+			bold = true
+		}
+	}
+
+	mainText := lipgloss.NewStyle().Foreground(fg).Bold(bold).Render(def.icon + " " + def.label)
+	text := mainText
+	if def.key != "" {
+		text += lipgloss.NewStyle().Foreground(p.Muted).Render(" (" + def.key + ")")
+	}
+	return btnCell{inner: " " + text + " ", width: m.ctbCellWidth(id)}
+}
+
+// renderToolbar renders the two-group toolbar: navigation on the left,
+// resolution actions right-aligned.
 func (m *Model) renderToolbar() string {
 	p := m.theme.Palette
 	bSt := lipgloss.NewStyle().Foreground(p.Border)
 	fitting := m.ctbFittingCount()
+	leftEnd := min(ctbLeftCount, fitting)
+	rightCount := max(fitting-ctbLeftCount, 0)
 
-	type btnCell struct {
-		inner string
-		width int
-	}
-
+	// Build all button cells.
 	cells := make([]btnCell, fitting)
 	for i := range fitting {
-		def := m.ctbDefFor(i)
-		enabled := m.isToolbarButtonEnabled(i)
-		selected := m.toolbarFocused && i == m.toolbarAction
-		hovered := i == m.hoverBtnIdx
-
-		fg := p.Muted
-		bold := false
-		if enabled {
-			fg = p.Foreground
-			if hovered {
-				fg = def.accent(p)
-			}
-			if selected {
-				fg = def.accent(p)
-				bold = true
-			}
-		}
-
-		mainText := lipgloss.NewStyle().Foreground(fg).Bold(bold).Render(def.icon + " " + def.label)
-		text := mainText
-		if def.key != "" {
-			text += lipgloss.NewStyle().Foreground(p.Muted).Render(" (" + def.key + ")")
-		}
-		w := m.ctbCellWidth(i)
-		cells[i] = btnCell{inner: " " + text + " ", width: w}
+		cells[i] = m.buildBtnCell(i, p)
 	}
 
-	// Row 1: top borders.
-	var row1 strings.Builder
-	for i, c := range cells {
+	// --- Left group ---
+	var lTop, lBot strings.Builder
+	for i := 0; i < leftEnd; i++ {
 		if i > 0 {
-			row1.WriteString(bSt.Render("┬"))
+			lTop.WriteString(bSt.Render("┬"))
+			lBot.WriteString(bSt.Render("│"))
 		}
-		row1.WriteString(bSt.Render(strings.Repeat("─", c.width)))
+		lTop.WriteString(bSt.Render(strings.Repeat("─", cells[i].width)))
+		lBot.WriteString(cells[i].inner)
 	}
-	row1.WriteString(bSt.Render("╮"))
-	row1Str := row1.String()
-	if vis := lipgloss.Width(row1Str); vis < m.width {
-		row1Str += strings.Repeat(" ", m.width-vis)
+	lTop.WriteString(bSt.Render("╮"))
+	lBot.WriteString(bSt.Render("│"))
+
+	if rightCount <= 0 {
+		return padLine(lTop.String(), m.width) + "\n" + padLine(lBot.String(), m.width)
 	}
 
-	// Row 2: button content.
-	var row2 strings.Builder
-	for i, c := range cells {
-		if i > 0 {
-			row2.WriteString(bSt.Render("│"))
+	// --- Right group ---
+	var rTop, rBot strings.Builder
+	rTop.WriteString(bSt.Render("╭"))
+	rBot.WriteString(bSt.Render("│"))
+	for i := ctbLeftCount; i < fitting; i++ {
+		if i > ctbLeftCount {
+			rTop.WriteString(bSt.Render("┬"))
+			rBot.WriteString(bSt.Render("│"))
 		}
-		row2.WriteString(c.inner)
-	}
-	row2.WriteString(bSt.Render("│"))
-	row2Str := row2.String()
-	if vis := lipgloss.Width(row2Str); vis < m.width {
-		row2Str += strings.Repeat(" ", m.width-vis)
+		rTop.WriteString(bSt.Render(strings.Repeat("─", cells[i].width)))
+		rBot.WriteString(cells[i].inner)
 	}
 
-	return row1Str + "\n" + row2Str
+	leftW := lipgloss.Width(lTop.String())
+	rightW := lipgloss.Width(rTop.String())
+	gap := max(m.width-leftW-rightW, 0)
+	spacer := strings.Repeat(" ", gap)
+
+	row1 := lTop.String() + spacer + rTop.String()
+	row2 := lBot.String() + spacer + rBot.String()
+
+	return padLine(row1, m.width) + "\n" + padLine(row2, m.width)
 }
 
 // isToolbarButtonEnabled returns whether a toolbar button is enabled.
@@ -282,11 +317,16 @@ func (m *Model) preserveToolbarFocus(fallback int) {
 }
 
 // conflictToolbarHitTest returns the button index for a click at column x,
-// or -1 if outside all buttons.
+// or -1 if outside all buttons. Accounts for the gap between left and
+// right toolbar groups.
 func (m *Model) conflictToolbarHitTest(x int) int {
 	fitting := m.ctbFittingCount()
+	leftEnd := min(ctbLeftCount, fitting)
+	rightCount := max(fitting-ctbLeftCount, 0)
+
+	// Hit test left group.
 	col := 0
-	for i := range fitting {
+	for i := 0; i < leftEnd; i++ {
 		w := m.ctbCellWidth(i)
 		if i > 0 {
 			col++ // separator
@@ -296,5 +336,32 @@ func (m *Model) conflictToolbarHitTest(x int) int {
 		}
 		col += w
 	}
+
+	if rightCount <= 0 {
+		return -1
+	}
+
+	// Right group is right-aligned. Compute its start column.
+	rightW := 1 // leading ╭/│
+	for i := ctbLeftCount; i < fitting; i++ {
+		if i > ctbLeftCount {
+			rightW++ // separator
+		}
+		rightW += m.ctbCellWidth(i)
+	}
+	rightX := m.width - rightW
+
+	col = rightX + 1 // skip leading ╭/│
+	for i := ctbLeftCount; i < fitting; i++ {
+		w := m.ctbCellWidth(i)
+		if i > ctbLeftCount {
+			col++ // separator
+		}
+		if x >= col && x < col+w {
+			return i
+		}
+		col += w
+	}
+
 	return -1
 }
