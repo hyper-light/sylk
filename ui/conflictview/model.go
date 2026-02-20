@@ -131,16 +131,21 @@ func New(data ConflictData, th *theme.Theme, nerdFonts bool) *Model {
 // deriveConflictLabels sets contextual labels based on the operation type
 // and the source/dest names from the sequencer.
 //
-// Merge:       Source/Dest   — context = branch names
-// Pull merge:  Remote/Local  — context = branch names if different,
-//                               short sha if same base branch
-// Cherry-pick: Source/Dest   — context = dest branch + source sha
-// Rebase:      Source/Dest   — context = dest branch + source sha
+// Merge (local):  Dest/Source    — context = branch names
+// Pull merge:     Local/Remote   — context = branch names if different,
+//                                   short sha if same base branch
+// Cherry-pick:    Curr/Incmg     — context = branch + source sha
+// Rebase:         Curr/Incmg     — context = branch + source sha
 func (m *Model) deriveConflictLabels() {
-	isMerge := m.data.Op == 2 // SeqMerge
-	isRemote := isMerge && strings.Contains(m.data.SourceName, "/")
+	const (
+		opCherryPick = 0 // SeqCherryPick
+		opRebase     = 1 // SeqRebase
+		opMerge      = 2 // SeqMerge
+	)
 
-	if isRemote {
+	switch {
+	case m.data.Op == opMerge && strings.Contains(m.data.SourceName, "/"):
+		// Pull merge — remote tracking branch.
 		m.oursLabel = "Local"
 		m.theirsLabel = "Remote"
 		m.oursCtx = m.data.DestName
@@ -157,7 +162,15 @@ func (m *Model) deriveConflictLabels() {
 		} else {
 			m.theirsCtx = m.data.SourceName
 		}
-	} else {
+
+	case m.data.Op == opCherryPick || m.data.Op == opRebase:
+		m.oursLabel = "Curr"
+		m.theirsLabel = "Incmg"
+		m.oursCtx = m.data.DestName
+		m.theirsCtx = m.data.SourceName
+
+	default:
+		// Local merge.
 		m.oursLabel = "Dest"
 		m.theirsLabel = "Source"
 		m.oursCtx = m.data.DestName
