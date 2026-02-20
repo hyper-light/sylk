@@ -93,13 +93,16 @@ const (
 	OpRevert     // revert
 
 	// Sequencer operations.
-	OpCherryPickSequence // cherry_pick_sequence
-	OpRebaseInteractive  // rebase_interactive
-	OpMergeSequence      // merge_sequence
-	OpSequencerContinue  // sequencer_continue
-	OpSequencerBypass    // sequencer_bypass
-	OpSequencerAbort     // sequencer_abort
-	OpSequencerStatus    // sequencer_status
+	OpCherryPickSequence  // cherry_pick_sequence
+	OpRebaseInteractive   // rebase_interactive
+	OpMergeSequence       // merge_sequence
+	OpSequencerContinue   // sequencer_continue
+	OpSequencerBypass     // sequencer_bypass
+	OpSequencerAbort      // sequencer_abort
+	OpSequencerStatus     // sequencer_status
+	OpResolveConflictFile // resolve_conflict_file
+	OpReadBlobContent     // read_blob_content
+	OpWriteWorktreeFile   // write_worktree_file
 
 	opCount // unexported sentinel — must remain last
 )
@@ -187,7 +190,10 @@ var opNames = [opCount]string{
 	OpSequencerContinue:  "sequencer_continue",
 	OpSequencerBypass:    "sequencer_bypass",
 	OpSequencerAbort:     "sequencer_abort",
-	OpSequencerStatus:    "sequencer_status",
+	OpSequencerStatus:     "sequencer_status",
+	OpResolveConflictFile: "resolve_conflict_file",
+	OpReadBlobContent:     "read_blob_content",
+	OpWriteWorktreeFile:   "write_worktree_file",
 }
 
 // opByName is the inverse of opNames, built at init time.
@@ -264,7 +270,9 @@ var opCategories = [opCount]string{
 	OpCherryPickSequence: "sequencer", OpRebaseInteractive: "sequencer",
 	OpMergeSequence: "sequencer", OpSequencerContinue: "sequencer",
 	OpSequencerBypass: "sequencer", OpSequencerAbort: "sequencer",
-	OpSequencerStatus: "sequencer",
+	OpSequencerStatus: "sequencer", OpResolveConflictFile: "sequencer",
+	OpReadBlobContent:   "sequencer",
+	OpWriteWorktreeFile: "sequencer",
 }
 
 // OpCategory returns the category of the operation (e.g. "branch", "commit").
@@ -285,7 +293,8 @@ var mutatingOps = [...]GitOp{
 	OpPullBranch, OpPushBranch,
 	OpCherryPick, OpRebase, OpReset, OpRevert,
 	OpCherryPickSequence, OpRebaseInteractive, OpMergeSequence,
-	OpSequencerContinue, OpSequencerBypass, OpSequencerAbort,
+	OpSequencerContinue, OpSequencerBypass, OpSequencerAbort, OpResolveConflictFile,
+	OpWriteWorktreeFile,
 }
 
 // mutatingBits is a bitset built at init time from mutatingOps.

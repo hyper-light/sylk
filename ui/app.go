@@ -31,6 +31,7 @@ import (
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/committree"
 	"github.com/adalundhe/sylk/ui/component"
+	"github.com/adalundhe/sylk/ui/conflictview"
 	"github.com/adalundhe/sylk/ui/diffview"
 	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/editor"
@@ -339,6 +340,11 @@ type AppModel struct {
 	mergeDiffViewActive bool             // True while merge diff view is displayed.
 	mergeHashes         []string         // Saved merge commit hashes.
 	mergeLabels         []string         // Branch names for merge pane titles.
+	mergeDeleteSource   bool             // Delete source branch after merge completes.
+
+	// Conflict resolution view overlay (replaces commit tree when active).
+	conflictView       *conflictview.Model // Conflict view (nil when inactive).
+	conflictViewActive bool                // True while conflict view is displayed.
 
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
@@ -1350,6 +1356,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case committree.CherryPickRequestMsg:
 		if m.gitBus != nil && m.commitTree != nil {
 			m.commitTree.SetLoadingMessage("Cherry-picking...")
+			m.mergeLabels = nil // Not a merge operation.
 			bus := m.gitBus
 			hashes, target := typed.Hashes, typed.TargetBranch
 			return m, func() tea.Msg {
@@ -1365,6 +1372,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case committree.RebaseStartMsg:
 		if m.gitBus != nil && m.commitTree != nil {
 			m.commitTree.SetLoadingMessage("Rebasing...")
+			m.mergeLabels = nil // Not a merge operation.
 			bus := m.gitBus
 			onto := typed.OntoBranch
 			plan := make([]git.RebasePlanEntry, len(typed.Plan))
@@ -1381,92 +1389,67 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case committree.SequencerContinueMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Continuing...")
-			bus := m.gitBus
-			return m, func() tea.Msg {
-				status, err := bus.SequencerContinue()
-				if err != nil {
-					return sequencerFailedMsg{reason: err.Error()}
-				}
-				return sequencerResultMsg{status: status}
-			}
-		}
-		return m, nil
-
-	case committree.SequencerBypassMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Bypassing...")
-			bus := m.gitBus
-			return m, func() tea.Msg {
-				status, err := bus.SequencerBypass()
-				if err != nil {
-					return sequencerFailedMsg{reason: err.Error()}
-				}
-				return sequencerResultMsg{status: status}
-			}
-		}
-		return m, nil
-
-	case committree.SequencerAbortMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Aborting...")
-			bus := m.gitBus
-			return m, func() tea.Msg {
-				if err := bus.SequencerAbort(); err != nil {
-					return sequencerAbortFailedMsg{reason: err.Error()}
-				}
-				return sequencerAbortedMsg{}
-			}
-		}
-		return m, nil
-
 	case sequencerResultMsg:
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		status := typed.status
 		if status != nil && status.State == git.SeqConflict {
-			paths := make([]string, len(status.Conflicts))
+			entries := make([]conflictview.ConflictFileEntry, len(status.Conflicts))
 			for i, c := range status.Conflicts {
-				paths[i] = c.Path
+				entries[i] = conflictview.ConflictFileEntry{
+					Path:          c.Path,
+					Type:          conflictview.ConflictType(c.Type),
+					OursHash:      c.OursHash.String(),
+					TheirsHash:    c.TheirsHash.String(),
+					BaseHash:      c.BaseHash.String(),
+					MergedContent: c.MergedContent,
+				}
 			}
-			if m.commitTree != nil {
-				m.commitTree.EnterConflictMode(
-					int(status.Op), status.TotalSteps, status.CurrentStep,
-					status.Subject, paths,
-				)
+			data := conflictview.ConflictData{
+				Op:      int(status.Op),
+				Total:   status.TotalSteps,
+				Current: status.CurrentStep,
+				Hash:    status.CurrentHash,
+				Subject: status.Subject,
+				Entries: entries,
 			}
+			m.enterConflictView(data)
 			m.statusBar.SetFlash("Conflict at step " + fmt.Sprintf("%d/%d", status.CurrentStep+1, status.TotalSteps))
 			return m, nil
 		}
 		// nil status = completed cleanly.
-		m.statusBar.SetFlash("Sequencer completed")
-		if m.commitTree != nil {
-			m.commitTree.ExitConflictMode()
-		}
+		m.exitConflictView()
 		m.nudgeGitWatcher()
+		m.finishMergeIfPending()
+
 		var cmds []tea.Cmd
 		if m.gitPanel != nil {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
+		if m.commitTree != nil {
+			branch := m.commitTree.ActiveBranch()
+			if branch != "" {
+				cmds = append(cmds, m.loadBranchDAGCmd(branch, m.commitTree.GetDefaultBranch()))
+			}
+		}
 		return m, tea.Batch(cmds...)
 
 	case sequencerFailedMsg:
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
-			m.commitTree.ExitConflictMode()
 		}
+		m.exitConflictView()
 		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
 	case sequencerAbortedMsg:
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
-			m.commitTree.ExitConflictMode()
 		}
+		m.exitConflictView()
+		m.mergeDeleteSource = false
 		m.statusBar.SetFlash("Sequencer aborted")
 		m.nudgeGitWatcher()
 		var cmds []tea.Cmd
@@ -1483,9 +1466,71 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusBar.SetFlash(typed.reason)
 		return m, nil
 
+	case conflictview.ConflictResolveFileMsg:
+		bus := m.gitBus
+		path := typed.Path
+		res := int(typed.Resolution)
+		oursHash := typed.OursHash
+		theirsHash := typed.TheirsHash
+		return m, func() tea.Msg {
+			if err := bus.ResolveConflictFile(path, res, oursHash, theirsHash); err != nil {
+				return conflictResolveFailedMsg{path: path, reason: err.Error()}
+			}
+			return conflictResolveWrittenMsg{path: path}
+		}
+
+	case conflictview.ConflictWriteContentMsg:
+		bus := m.gitBus
+		return m, func() tea.Msg {
+			if err := bus.WriteWorktreeFile(typed.Path, typed.Content); err != nil {
+				return conflictResolveFailedMsg{path: typed.Path, reason: err.Error()}
+			}
+			return conflictResolveWrittenMsg{path: typed.Path}
+		}
+
+	case conflictview.SequencerContinueMsg:
+		if m.conflictView != nil {
+			m.conflictView.SetLoading(true)
+		}
+		bus := m.gitBus
+		return m, func() tea.Msg {
+			status, err := bus.SequencerContinue()
+			if err != nil {
+				return sequencerFailedMsg{reason: err.Error()}
+			}
+			return sequencerResultMsg{status: status}
+		}
+
+	case conflictview.SequencerBypassMsg:
+		bus := m.gitBus
+		return m, func() tea.Msg {
+			status, err := bus.SequencerBypass()
+			if err != nil {
+				return sequencerFailedMsg{reason: err.Error()}
+			}
+			return sequencerResultMsg{status: status}
+		}
+
+	case conflictview.SequencerAbortMsg:
+		bus := m.gitBus
+		return m, func() tea.Msg {
+			if err := bus.SequencerAbort(); err != nil {
+				return sequencerAbortFailedMsg{reason: err.Error()}
+			}
+			return sequencerAbortedMsg{}
+		}
+
+	case conflictResolveWrittenMsg:
+		m.nudgeGitWatcher()
+		return m, nil
+
+	case conflictResolveFailedMsg:
+		m.statusBar.SetFlash("Resolve failed: " + typed.reason)
+		return m, nil
+
 	case editor.ConflictResolvedMsg:
-		if m.commitTree != nil && m.commitTree.InConflictMode() {
-			m.commitTree.MarkConflictResolved(typed.Path)
+		if m.conflictViewActive && m.conflictView != nil {
+			m.conflictView.MarkResolvedByPath(typed.Path)
 		}
 		return m, nil
 
@@ -2071,6 +2116,16 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
 		}
+		// Conflict view ESC: content pane → focus file list, file list → exit.
+		if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictView {
+			m.focus.SetFocus(component.FocusConflictFileList)
+			m.syncFocusState()
+			return m, nil
+		}
+		if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictFileList {
+			m.exitConflictView()
+			return m, nil
+		}
 		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList && m.mergeDiffView.FileSearchActive() {
 			m.mergeDiffView.UpdateFileList("esc")
 			return m, nil
@@ -2504,6 +2559,12 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	// Merge diff view loading spinner.
 	if m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick() {
 		m.mergeDiffView.AdvanceSpinner()
+		m.comp.MarkDirty(compositor.SlotRight)
+		changed = true
+	}
+
+	// Conflict view loading spinner (time-based, redraws each decor tick).
+	if m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick() {
 		m.comp.MarkDirty(compositor.SlotRight)
 		changed = true
 	}
@@ -4012,6 +4073,8 @@ type sequencerResultMsg struct{ status *git.SequencerStatus }
 type sequencerFailedMsg struct{ reason string }
 type sequencerAbortedMsg struct{}
 type sequencerAbortFailedMsg struct{ reason string }
+type conflictResolveWrittenMsg struct{ path string }
+type conflictResolveFailedMsg struct{ path, reason string }
 
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
 // via go-git and converts them to BranchNode data for the commit tree panel.
@@ -4379,7 +4442,10 @@ func shortHash(h string) string {
 // When an established (non-loading) diff view already exists, pairs and
 // mode are reloaded in place to preserve open tabs and the active tab.
 func (m *AppModel) enterDiffView(pairs []diffview.DiffPair, mode diffview.CompareMode) {
-	// Exit any active merge diff view first.
+	// Exit any active overlay first.
+	if m.conflictViewActive {
+		m.exitConflictView()
+	}
 	if m.mergeDiffViewActive {
 		m.exitMergeDiffView()
 	}
@@ -4515,7 +4581,45 @@ func (m *AppModel) exitMergeDiffView() {
 	m.viewDirty = true
 }
 
-// executeMergeBranch performs a git merge using the stored branch labels.
+// enterConflictView creates and activates the conflict resolution view.
+func (m *AppModel) enterConflictView(data conflictview.ConflictData) {
+	// Exit any active overlays first.
+	if m.diffViewActive {
+		m.exitDiffView()
+	}
+	if m.mergeDiffViewActive {
+		m.exitMergeDiffView()
+	}
+	if m.conflictView != nil {
+		m.conflictView.Close()
+	}
+	m.conflictView = conflictview.New(data, m.config.Theme(), m.nerdFontsDetected)
+	m.conflictViewActive = true
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	m.conflictView.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
+	lw, lh := m.layout.GetPanelSize(component.FocusFileTree)
+	m.conflictView.SetFileListSize(max(lw-panelBorderSize, 1), max(lh-panelBorderSize, 1))
+	m.conflictView.SetFocused(true)
+	m.focus.SetFocus(component.FocusConflictView)
+	m.syncViewState()
+	m.syncFocusState()
+	m.viewDirty = true
+}
+
+// exitConflictView clears the conflict view and restores commit tree focus.
+func (m *AppModel) exitConflictView() {
+	if m.conflictView != nil {
+		m.conflictView.Close()
+	}
+	m.conflictViewActive = false
+	m.conflictView = nil
+	m.focus.SetFocus(component.FocusCommitTree)
+	m.syncViewState()
+	m.viewDirty = true
+}
+
+// executeMergeBranch performs a git merge using the sequencer so that
+// conflicts can be resolved interactively in the conflict view.
 // mergeLabels[0] is the source branch, mergeLabels[1] is the target branch.
 func (m *AppModel) executeMergeBranch(deleteSource bool) tea.Cmd {
 	bus := m.gitBus
@@ -4525,14 +4629,21 @@ func (m *AppModel) executeMergeBranch(deleteSource bool) tea.Cmd {
 	}
 	source := m.mergeLabels[0]
 	target := m.mergeLabels[1]
+	m.mergeDeleteSource = deleteSource
 	if m.mergeDiffView != nil {
 		m.mergeDiffView.SetMerging("Merging — " + source + " to " + target)
 	}
 
 	return func() tea.Msg {
-		if err := bus.MergeBranch(source, target); err != nil {
+		status, err := bus.MergeSequence(source, target)
+		if err != nil {
 			return mergeBranchFailedMsg{reason: err.Error()}
 		}
+		// Conflicts — route through sequencer pipeline for conflict view.
+		if status != nil && status.State == git.SeqConflict {
+			return sequencerResultMsg{status: status}
+		}
+		// Clean merge — optionally delete source branch.
 		if deleteSource {
 			if err := bus.DeleteBranch(source); err != nil {
 				return mergeBranchDoneMsg{source: source, target: target, deleteErr: err.Error()}
@@ -4540,6 +4651,27 @@ func (m *AppModel) executeMergeBranch(deleteSource bool) tea.Cmd {
 		}
 		return mergeBranchDoneMsg{source: source, target: target, deleted: deleteSource}
 	}
+}
+
+// finishMergeIfPending handles deferred merge completion after sequencer
+// finishes (e.g. after conflict resolution). Deletes source branch if
+// requested and shows the appropriate flash message.
+func (m *AppModel) finishMergeIfPending() {
+	if len(m.mergeLabels) < 2 {
+		m.statusBar.SetFlash("Sequencer completed")
+		return
+	}
+	source, target := m.mergeLabels[0], m.mergeLabels[1]
+	if m.mergeDeleteSource {
+		if err := m.gitBus.DeleteBranch(source); err != nil {
+			m.statusBar.SetFlash("Merged " + source + " → " + target + " (delete failed: " + err.Error() + ")")
+		} else {
+			m.statusBar.SetFlash("Merged " + source + " → " + target + " (deleted " + source + ")")
+		}
+	} else {
+		m.statusBar.SetFlash("Merged " + source + " → " + target)
+	}
+	m.mergeDeleteSource = false
 }
 
 // mergeBranchDoneMsg signals a successful merge.
@@ -6918,6 +7050,20 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Conflict view: forward motion events for toolbar hover tracking.
+	if m.conflictViewActive && m.conflictView != nil && mouse.Action == tea.MouseActionMotion {
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			panelX := m.codePanelX()
+			viewX := mouse.X - panelX - 1
+			viewY := mouse.Y - 1
+			localMouse := tea.MouseMsg{
+				X: viewX, Y: viewY,
+				Action: mouse.Action, Button: mouse.Button,
+			}
+			m.conflictView.Update(localMouse)
+		}
+	}
+
 	// Git mode: track toolbar button hover for commit tree panel.
 	// Skip when diff/merge diff view is active — their toolbars handle hover directly.
 	if m.viewMode == ViewGit && !m.diffViewActive && !m.mergeDiffViewActive && m.commitTree != nil && mouse.Action == tea.MouseActionMotion {
@@ -6990,6 +7136,25 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 	}
 
 	if mouse.Action != tea.MouseActionPress {
+		return nil
+	}
+
+	// Conflict view: route left-click events to file list and content pane.
+	if m.conflictViewActive && m.conflictView != nil && mouse.Button == tea.MouseButtonLeft {
+		m.handleConflictFileListClick(mouse.X, mouse.Y)
+		if m.isInsideCodePanel(mouse.X, mouse.Y) {
+			panelX := m.codePanelX()
+			viewX := mouse.X - panelX - 1
+			viewY := mouse.Y - 1
+			localMouse := tea.MouseMsg{
+				X: viewX, Y: viewY,
+				Action: mouse.Action, Button: mouse.Button,
+			}
+			cmd := m.conflictView.Update(localMouse)
+			m.focus.SetFocus(component.FocusConflictView)
+			m.syncFocusState()
+			return cmd
+		}
 		return nil
 	}
 
@@ -7075,6 +7240,10 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	if m.diffViewActive && m.diffView != nil && m.isInsideCodePanel(x, y) {
 		return pane.PaneFocusID(m.diffView.FocusedPane()), true
 	}
+	// When conflict view is active, route code panel scrolls to the conflict view.
+	if m.conflictViewActive && m.conflictView != nil && m.isInsideCodePanel(x, y) {
+		return component.FocusConflictView, true
+	}
 
 	mode := m.layout.Mode()
 
@@ -7091,6 +7260,12 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 				return component.FocusDiffFileList, true
 			}
 			return component.FocusDiffView, true
+		}
+		if m.conflictViewActive && m.conflictView != nil {
+			if !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree {
+				return component.FocusConflictFileList, true
+			}
+			return component.FocusConflictView, true
 		}
 		if m.leftRing.empty() {
 			return 0, false
@@ -7112,6 +7287,10 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	// Diff view: route file-tree slot scrolls to the diff file list.
 	if m.diffViewActive && m.diffView != nil && resolved == component.FocusFileTree {
 		return component.FocusDiffFileList, true
+	}
+	// Conflict view: route file-tree slot scrolls to the conflict file list.
+	if m.conflictViewActive && m.conflictView != nil && resolved == component.FocusFileTree {
+		return component.FocusConflictFileList, true
 	}
 
 	// In edit mode, route scrolls within the code panel to the pane
@@ -7228,6 +7407,10 @@ func (m *AppModel) tickScrollMomentum() {
 		m.mergeDiffView.SetBounceOffset(paneBO)
 		m.mergeDiffView.SetFileListBounceOffset(m.bounceOffset(component.FocusMergeDiffFileList))
 	}
+	if m.conflictView != nil {
+		m.conflictView.SetBounceOffset(m.bounceOffset(component.FocusConflictView))
+		m.conflictView.SetFileListBounceOffset(m.bounceOffset(component.FocusConflictFileList))
+	}
 }
 
 // settled reports whether the spring is close enough to target to stop.
@@ -7260,6 +7443,22 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 			return m.chat.ScrollUp()
 		}
 		return m.chat.ScrollDown()
+	case component.FocusConflictFileList:
+		if m.conflictViewActive && m.conflictView != nil {
+			if direction < 0 {
+				return m.conflictView.ScrollFileListUp()
+			}
+			return m.conflictView.ScrollFileListDown()
+		}
+		return true
+	case component.FocusConflictView:
+		if m.conflictViewActive && m.conflictView != nil {
+			if direction < 0 {
+				return m.conflictView.ScrollUp()
+			}
+			return m.conflictView.ScrollDown()
+		}
+		return true
 	case component.FocusMergeDiffFileList:
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			if direction < 0 {
@@ -7293,6 +7492,12 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		}
 		return true
 	case component.FocusCodeViewer:
+		if m.conflictViewActive && m.conflictView != nil {
+			if direction < 0 {
+				return m.conflictView.ScrollUp()
+			}
+			return m.conflictView.ScrollDown()
+		}
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			if direction < 0 {
 				return m.mergeDiffView.ScrollUp()
@@ -7613,6 +7818,33 @@ func (m *AppModel) handleMergeDiffFileListClick(x, y int) {
 	m.focus.SetFocus(component.FocusMergeDiffFileList)
 	m.syncFocusState()
 	m.mergeDiffView.ClickFileList(localY)
+}
+
+// handleConflictFileListClick dispatches a click inside the conflict file list.
+func (m *AppModel) handleConflictFileListClick(x, y int) {
+	if m.conflictView == nil {
+		return
+	}
+	panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
+	if panelW == 0 || panelH == 0 {
+		return
+	}
+	panelX := m.fileTreePanelX()
+	innerH := max(panelH-panelBorderSize, 0)
+
+	contentLeft := panelX + 1
+	contentRight := panelX + panelW - 1
+	contentTop := 1
+	contentBottom := 1 + innerH
+
+	if x < contentLeft || x >= contentRight || y < contentTop || y >= contentBottom {
+		return
+	}
+
+	localY := y - contentTop
+	m.focus.SetFocus(component.FocusConflictFileList)
+	m.syncFocusState()
+	m.conflictView.ClickFileList(localY)
 }
 
 // handleCommitTreeClick dispatches a click inside the commit tree panel
@@ -8745,6 +8977,16 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 		comp, cmd := m.commitTree.Update(key)
 		m.commitTree = comp.(*committree.Model)
 		return cmd
+	case component.FocusConflictView:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.conflictView.Update(key)
+		}
+		return nil
+	case component.FocusConflictFileList:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.conflictView.UpdateFileList(key.String())
+		}
+		return nil
 	case component.FocusMergeDiffView:
 		if m.mergeDiffView != nil {
 			cmd := m.mergeDiffView.Update(key)
@@ -8922,6 +9164,10 @@ func (m *AppModel) recalcLayout() {
 		m.mergeDiffView.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
 		m.mergeDiffView.SetFileListSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
 	}
+	if m.conflictView != nil {
+		m.conflictView.SetSize(max(rightW-panelBorderSize, 1), max(rightH-panelBorderSize, 1))
+		m.conflictView.SetFileListSize(max(treeW-panelBorderSize, 1), max(treeH-panelBorderSize, 1))
+	}
 
 	// Input: dynamic height based on content.
 	m.input.SetSize(m.width, inputH)
@@ -9088,6 +9334,14 @@ func (m *AppModel) syncViewState() {
 		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusMergeDiffFileList)
 	}
 
+	// When the conflict view is active, replace commit tree and git panel.
+	if m.conflictViewActive {
+		replaceInRing(&m.leftRing, component.FocusCommitTree, component.FocusConflictView)
+		replaceInRing(&m.rightRing, component.FocusCommitTree, component.FocusConflictView)
+		replaceInRing(&m.leftRing, component.FocusGitPanel, component.FocusConflictFileList)
+		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusConflictFileList)
+	}
+
 	// First-collapse flash: show once when panels first collapse.
 	nowActive := !m.leftRing.empty() || !m.rightRing.empty()
 	if wasEmpty && nowActive && !m.collapseHintShown {
@@ -9165,15 +9419,19 @@ func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.F
 		for i, id := range order {
 			switch id {
 			case component.FocusFileTree:
-				if m.mergeDiffViewActive {
+				if m.conflictViewActive {
+					order[i] = component.FocusConflictFileList
+				} else if m.mergeDiffViewActive {
 					order[i] = component.FocusMergeDiffFileList
 				} else if m.diffViewActive {
 					order[i] = component.FocusDiffFileList
 				} else {
 					order[i] = component.FocusGitPanel
 				}
-			case component.FocusCodeViewer, component.FocusDiffView, component.FocusMergeDiffView:
-				if m.mergeDiffViewActive && m.mergeDiffView != nil {
+			case component.FocusCodeViewer, component.FocusDiffView, component.FocusMergeDiffView, component.FocusConflictView:
+				if m.conflictViewActive {
+					order[i] = component.FocusConflictView
+				} else if m.mergeDiffViewActive && m.mergeDiffView != nil {
 					order[i] = pane.PaneFocusID(m.mergeDiffView.FocusedPane())
 				} else if m.diffViewActive && m.diffView != nil {
 					order[i] = pane.PaneFocusID(m.diffView.FocusedPane())
@@ -9482,6 +9740,20 @@ func (m *AppModel) detectDirtySlots() {
 		}
 	}
 
+	// Conflict view dirty check.
+	if m.conflictViewActive && m.conflictView != nil {
+		if m.conflictView.ViewDirty() {
+			m.comp.MarkDirty(compositor.SlotRight)
+		}
+		if m.conflictView.FileListDirty() {
+			if m.layout.Mode() == layout.FourColumn {
+				m.comp.MarkDirty(compositor.SlotCenterLeft)
+			} else {
+				m.comp.MarkDirty(compositor.SlotLeft)
+			}
+		}
+	}
+
 	// Merge diff view dirty check.
 	if m.mergeDiffViewActive && m.mergeDiffView != nil {
 		if m.mergeDiffView.ViewDirty() {
@@ -9574,6 +9846,9 @@ func (m *AppModel) renderSlotLeft(th *theme.Theme) string {
 // renderSlotCenterLeft renders the bordered file tree for the center-left slot.
 // In git mode, renders the git explorer panel instead.
 func (m *AppModel) renderSlotCenterLeft(th *theme.Theme) string {
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.renderConflictFileListBordered(th)
+	}
 	if m.mergeDiffViewActive && m.mergeDiffView != nil {
 		return m.renderMergeDiffFileListBordered(th)
 	}
@@ -9597,6 +9872,9 @@ func (m *AppModel) renderSlotCenter(th *theme.Theme) string {
 // In TwoColumn mode the right ring may show chat, commit tree, or code.
 // In git mode (non-TwoColumn), renders the commit tree instead of the code panel.
 func (m *AppModel) renderSlotRight(th *theme.Theme) string {
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.renderConflictViewBordered(th)
+	}
 	if m.mergeDiffViewActive && m.mergeDiffView != nil {
 		return m.renderMergeDiffViewBordered(th)
 	}
@@ -9632,6 +9910,9 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	case component.FocusCodeViewer:
 		return m.renderCodePanelBordered(th)
 	case component.FocusFileTree:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.renderConflictFileListBordered(th)
+		}
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			return m.renderMergeDiffFileListBordered(th)
 		}
@@ -9644,6 +9925,16 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 		return m.renderGitPanelBordered(th)
 	case component.FocusCommitTree:
 		return m.renderGitCommitTreeBordered(th)
+	case component.FocusConflictView:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.renderConflictViewBordered(th)
+		}
+		return m.renderCodePanelBordered(th)
+	case component.FocusConflictFileList:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.renderConflictFileListBordered(th)
+		}
+		return m.renderGitPanelBordered(th)
 	case component.FocusMergeDiffView:
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			return m.renderMergeDiffViewBordered(th)
@@ -9665,6 +9956,9 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 		}
 		return m.renderGitPanelBordered(th)
 	default:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.renderConflictViewBordered(th)
+		}
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			return m.renderMergeDiffViewBordered(th)
 		}
@@ -9682,6 +9976,9 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
 	switch id {
 	case component.FocusFileTree:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.renderConflictFileListBordered(th)
+		}
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			return m.renderMergeDiffFileListBordered(th)
 		}
@@ -9691,6 +9988,11 @@ func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string 
 		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 	case component.FocusGitPanel:
 		return m.renderGitPanelBordered(th)
+	case component.FocusConflictFileList:
+		if m.conflictViewActive && m.conflictView != nil {
+			return m.renderConflictFileListBordered(th)
+		}
+		return m.renderLeftPanelBordered(th)
 	case component.FocusMergeDiffFileList:
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			return m.renderMergeDiffFileListBordered(th)
@@ -9993,6 +10295,36 @@ func (m *AppModel) isMergeDiffPaneFocused() bool {
 	return m.mergeDiffViewActive && m.mergeDiffView != nil && pane.IsPaneFocus(m.focus.Current())
 }
 
+// renderConflictFileListBordered renders the conflict file list sidebar.
+func (m *AppModel) renderConflictFileListBordered(th *theme.Theme) string {
+	content := m.conflictView.FileListView(m.cursorVisible)
+	w, h := m.layout.GetPanelSize(component.FocusFileTree)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusConflictFileList {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
+// renderConflictViewBordered renders the conflict resolution content pane.
+func (m *AppModel) renderConflictViewBordered(th *theme.Theme) string {
+	content := m.overlayBlockedChord(m.overlayChordHint(m.conflictView.View(m.cursorVisible), component.FocusCodeViewer, th))
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusConflictView {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(max(w-panelBorderSize, 1)).
+		Height(max(h-panelBorderSize, 1)).
+		MaxHeight(h).
+		Render(content)
+}
+
 func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.Theme) string {
 	w, h := m.layout.GetPanelSize(id)
 	border := th.InactiveBorder
@@ -10067,6 +10399,12 @@ func (m *AppModel) syncFocusState() {
 		}
 		m.mergeDiffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusMergeDiffView)
 		m.mergeDiffView.SetFileListFocused(current == component.FocusMergeDiffFileList)
+	}
+
+	// Conflict view panels.
+	if m.conflictViewActive && m.conflictView != nil {
+		m.conflictView.SetFocused(current == component.FocusConflictView)
+		m.conflictView.SetFileListFocused(current == component.FocusConflictFileList)
 	}
 
 	// Sync warp line display for the newly focused editor.

@@ -1,6 +1,7 @@
 package git
 
 import (
+	"fmt"
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
@@ -393,4 +394,19 @@ func (b *GitBus) SequencerAbort() error {
 func (b *GitBus) GetSequencerStatus() *SequencerStatus {
 	return dispatchPure(b, OpSequencerStatus, nil,
 		func() *SequencerStatus { return b.client.GetSequencerStatus() })
+}
+
+func (b *GitBus) ResolveConflictFile(path string, resolution int, oursHash, theirsHash string) error {
+	return dispatchVoid(b, OpResolveConflictFile, [4]string{path, fmt.Sprintf("%d", resolution), oursHash, theirsHash},
+		func() error { return b.client.ResolveConflictFile(path, resolution, oursHash, theirsHash) })
+}
+
+func (b *GitBus) ReadBlobContent(hashHex string) (string, error) {
+	return dispatch(b, OpReadBlobContent, hashHex,
+		func() (string, error) { return b.client.ReadBlobContent(hashHex) })
+}
+
+func (b *GitBus) WriteWorktreeFile(path, content string) error {
+	return dispatchVoid(b, OpWriteWorktreeFile, [2]string{path, ""},
+		func() error { return b.client.WriteWorktreeFile(path, content) })
 }

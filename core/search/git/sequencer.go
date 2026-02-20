@@ -856,6 +856,12 @@ func (c *GitClient) finishMergeSeq() error {
 func (c *GitClient) abortSequencer() error {
 	seq := c.sequencer
 
+	// Collect conflict paths before clearing the sequencer.
+	conflictPaths := make([]string, len(seq.conflicts))
+	for i, cf := range seq.conflicts {
+		conflictPaths[i] = cf.Path
+	}
+
 	// Restore symbolic HEAD if was on a branch.
 	if !seq.detached {
 		symRef := plumbing.NewSymbolicReference(plumbing.HEAD, seq.originalRef)
@@ -886,8 +892,41 @@ func (c *GitClient) abortSequencer() error {
 		return err
 	}
 
+	// go-git's HardReset can leave conflict-marked files in the worktree.
+	// Explicitly restore each conflict path from the original tree.
+	c.restoreConflictPaths(seq.originalHead, conflictPaths)
+
 	c.sequencer = nil
 	return nil
+}
+
+// restoreConflictPaths overwrites worktree files that had conflict markers
+// with their content from the given commit, or deletes them if they don't
+// exist in that commit's tree. Best-effort: errors are silently ignored
+// since the HardReset already succeeded.
+func (c *GitClient) restoreConflictPaths(commitHash plumbing.Hash, paths []string) {
+	commit, err := c.repo.CommitObject(commitHash)
+	if err != nil {
+		return
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return
+	}
+	for _, p := range paths {
+		fullPath := filepath.Join(c.repoPath, p)
+		f, err := tree.File(p)
+		if err != nil {
+			// File didn't exist in original — remove it.
+			os.Remove(fullPath)
+			continue
+		}
+		content, err := f.Contents()
+		if err != nil {
+			continue
+		}
+		os.WriteFile(fullPath, []byte(content), 0o644)
+	}
 }
 
 // =============================================================================
@@ -990,5 +1029,104 @@ func commitSubject(msg string) string {
 		return msg[:i]
 	}
 	return msg
+}
+
+// =============================================================================
+// Public: Conflict File Resolution
+// =============================================================================
+
+// ResolveConflictFile writes a chosen version of a conflicted file to the
+// worktree. resolution: 1=ours, 2=theirs, 3=both (ours+theirs concatenated).
+// Hash strings are hex-encoded blob hashes; ZeroHash hex means the side
+// deleted the file.
+func (c *GitClient) ResolveConflictFile(path string, resolution int, oursHash, theirsHash string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+
+	fullPath := filepath.Join(c.repoPath, path)
+	oursH := plumbing.NewHash(oursHash)
+	theirsH := plumbing.NewHash(theirsHash)
+	zero := plumbing.ZeroHash
+
+	switch resolution {
+	case 1: // Ours
+		if oursH == zero {
+			return os.Remove(fullPath)
+		}
+		content, err := readBlobContent(c.repo.Storer, oursH)
+		if err != nil {
+			return fmt.Errorf("read ours blob: %w", err)
+		}
+		return c.writeWorktreeFile(fullPath, content)
+
+	case 2: // Theirs
+		if theirsH == zero {
+			return os.Remove(fullPath)
+		}
+		content, err := readBlobContent(c.repo.Storer, theirsH)
+		if err != nil {
+			return fmt.Errorf("read theirs blob: %w", err)
+		}
+		return c.writeWorktreeFile(fullPath, content)
+
+	case 3: // Both (concatenate ours + theirs)
+		var parts []string
+		if oursH != zero {
+			content, err := readBlobContent(c.repo.Storer, oursH)
+			if err != nil {
+				return fmt.Errorf("read ours blob: %w", err)
+			}
+			parts = append(parts, content)
+		}
+		if theirsH != zero {
+			content, err := readBlobContent(c.repo.Storer, theirsH)
+			if err != nil {
+				return fmt.Errorf("read theirs blob: %w", err)
+			}
+			parts = append(parts, content)
+		}
+		return c.writeWorktreeFile(fullPath, strings.Join(parts, ""))
+
+	default:
+		return fmt.Errorf("unknown resolution %d", resolution)
+	}
+}
+
+// ReadBlobContent reads blob content by its hex-encoded hash string.
+// This is a read-only operation that does not modify repository state.
+func (c *GitClient) ReadBlobContent(hashHex string) (string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.isRepo {
+		return "", ErrNotGitRepo
+	}
+
+	return readBlobContent(c.repo.Storer, plumbing.NewHash(hashHex))
+}
+
+// writeWorktreeFile writes content to a file in the worktree, creating
+// parent directories as needed.
+func (c *GitClient) writeWorktreeFile(fullPath, content string) error {
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(fullPath, []byte(content), 0o644)
+}
+
+// WriteWorktreeFile writes content to a relative path in the worktree.
+func (c *GitClient) WriteWorktreeFile(path, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.isRepo {
+		return ErrNotGitRepo
+	}
+	fullPath := filepath.Join(c.repoPath, path)
+	return c.writeWorktreeFile(fullPath, content)
 }
 
