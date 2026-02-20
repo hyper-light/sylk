@@ -238,21 +238,29 @@ func (m *Model) activateToolbarButton(idx int) tea.Cmd {
 		return nil
 	case ctbOurs:
 		cmd := m.resolveKey(ResOurs)
-		m.toolbarFocused = true
-		m.toolbarAction = idx
+		m.preserveToolbarFocus(idx)
 		return cmd
 	case ctbTheirs:
 		cmd := m.resolveKey(ResTheirs)
-		m.toolbarFocused = true
-		m.toolbarAction = idx
+		m.preserveToolbarFocus(idx)
 		return cmd
 	case ctbBoth:
 		cmd := m.resolveKey(ResBoth)
-		m.toolbarFocused = true
-		m.toolbarAction = idx
+		m.preserveToolbarFocus(idx)
 		return cmd
 	}
 	return nil
+}
+
+// preserveToolbarFocus keeps the toolbar focused after a resolve action.
+// If all conflicts just became resolved, advanceToNextUnresolved already
+// moved focus to Continue — don't overwrite that.
+func (m *Model) preserveToolbarFocus(fallback int) {
+	if m.toolbarAction == ctbContinue && m.AllResolved() {
+		return
+	}
+	m.toolbarFocused = true
+	m.toolbarAction = fallback
 }
 
 // conflictToolbarHitTest returns the button index for a click at column x,

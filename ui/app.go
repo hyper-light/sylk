@@ -2118,15 +2118,20 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.commitTree = comp.(*committree.Model)
 			return m, cmd
 		}
-		// Conflict view ESC: content pane → focus file list, file list → exit.
+		// Conflict view ESC: content pane → focus file list, file list → abort sequencer.
 		if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictView {
 			m.focus.SetFocus(component.FocusConflictFileList)
 			m.syncFocusState()
 			return m, nil
 		}
 		if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictFileList {
-			m.exitConflictView()
-			return m, nil
+			bus := m.gitBus
+			return m, func() tea.Msg {
+				if err := bus.SequencerAbort(); err != nil {
+					return sequencerAbortFailedMsg{reason: err.Error()}
+				}
+				return sequencerAbortedMsg{}
+			}
 		}
 		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList && m.mergeDiffView.FileSearchActive() {
 			m.mergeDiffView.UpdateFileList("esc")
