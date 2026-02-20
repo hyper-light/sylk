@@ -37,8 +37,9 @@ type ConflictFileEntry struct {
 	TheirsHash    string
 	BaseHash      string
 	Type          ConflictType
-	MergedContent string // Full file with conflict markers (content conflicts).
+	MergedContent string             // Full file with conflict markers (content conflicts).
 	Resolution    ConflictResolution
+	Hunks         []ConflictHunk   // Parsed conflict regions within MergedContent.
 }
 
 // ConflictData holds all state needed to display the conflict view.

@@ -125,6 +125,7 @@ func New(data ConflictData, th *theme.Theme, nerdFonts bool) *Model {
 	}
 	m.deriveConflictLabels()
 	m.snapshotOriginalContent()
+	m.parseAllEntryHunks()
 	if len(data.Entries) > 0 {
 		m.parseMergedContent()
 		m.scrollToCurrentHunk()
@@ -454,6 +455,25 @@ func (m *Model) undoResolution() tea.Cmd {
 }
 
 // ---------------------------------------------------------------------------
+// File hunk computation
+// ---------------------------------------------------------------------------
+
+// parseAllEntryHunks detects conflict hunks for every entry and stores
+// them directly on the entry, so the file list can display hunk locations
+// without re-parsing.
+func (m *Model) parseAllEntryHunks() {
+	for i := range m.data.Entries {
+		e := &m.data.Entries[i]
+		if e.MergedContent == "" {
+			e.Hunks = nil
+			continue
+		}
+		lines := strings.Split(e.MergedContent, "\n")
+		e.Hunks = detectHunks(lines)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Merged content parsing
 // ---------------------------------------------------------------------------
 
@@ -499,6 +519,8 @@ func (m *Model) parseMergedContent() {
 	if m.currentHunk >= len(m.hunks) {
 		m.currentHunk = max(len(m.hunks)-1, 0)
 	}
+
+	entry.Hunks = m.hunks
 }
 
 // detectHunks scans lines for <<<<<<</=======/>>>>>>> markers.
@@ -586,6 +608,7 @@ func (m *Model) nextHunk() {
 	m.currentHunk = (m.currentHunk + 1) % len(m.hunks)
 	m.scrollToCurrentHunk()
 	m.viewDirty = true
+	m.fileListDirty = true
 }
 
 // prevHunk retreats to the previous conflict hunk, wrapping around.
@@ -596,6 +619,7 @@ func (m *Model) prevHunk() {
 	m.currentHunk = (m.currentHunk - 1 + len(m.hunks)) % len(m.hunks)
 	m.scrollToCurrentHunk()
 	m.viewDirty = true
+	m.fileListDirty = true
 }
 
 // scrollToCurrentHunk scrolls the viewport to show the current hunk's action

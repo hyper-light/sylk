@@ -1444,7 +1444,13 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.exitConflictView()
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
+		m.nudgeGitWatcher()
+		var cmds []tea.Cmd
+		if m.gitPanel != nil {
+			cmds = append(cmds, m.gitPanel.LoadData())
+		}
+		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
+		return m, tea.Batch(cmds...)
 
 	case sequencerAbortedMsg:
 		if m.commitTree != nil {
@@ -1466,6 +1472,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
+		m.nudgeGitWatcher()
 		return m, nil
 
 	case conflictview.ConflictResolveFileMsg:
@@ -1537,9 +1544,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case msg.GitOpEventMsg:
-		if typed.Err == nil {
-			m.nudgeGitWatcher()
-		}
+		// Nudge unconditionally — mutations may have partially changed state
+		// even on error (e.g. sequencer processed some steps before failing).
+		m.nudgeGitWatcher()
 		return m, nil
 
 	case gitBranchDAGLoadedMsg:

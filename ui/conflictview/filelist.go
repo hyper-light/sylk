@@ -83,31 +83,39 @@ func renderDivider(width int, p theme.Palette) string {
 	return lipgloss.NewStyle().Foreground(p.Border).Render(strings.Repeat("─", width))
 }
 
-// renderFileEntries renders the visible file entries.
+// linesPerFileEntry is the number of display lines per file (info + hunk line).
+const linesPerFileEntry = 2
+
+// renderFileEntries renders the visible file entries (2 lines each).
 func (m *Model) renderFileEntries(entryH int, width int, p theme.Palette) string {
 	total := len(m.data.Entries)
 	if total == 0 {
 		return renderEmptyFileList(entryH, width, p)
 	}
 
-	start, end := visibleWindow(m.selectedFile, total, entryH)
-	entries := make([]string, 0, end-start)
+	filesVisible := max(entryH/linesPerFileEntry, 1)
+	start, end := visibleWindow(m.selectedFile, total, filesVisible)
+	lines := make([]string, 0, (end-start)*linesPerFileEntry)
 	for i := start; i < end; i++ {
 		entry := &m.data.Entries[i]
 		isCursor := i == m.selectedFile
-		entries = append(entries, m.renderConflictFileEntry(entry, isCursor, width, p))
+		lines = append(lines, m.renderConflictFileEntry(entry, isCursor, width, p))
+		lines = append(lines, m.renderHunkLine(i, isCursor, width, p))
 	}
 
 	blank := strings.Repeat(" ", width)
-	for len(entries) < entryH {
-		entries = append(entries, blank)
+	for len(lines) < entryH {
+		lines = append(lines, blank)
+	}
+	if len(lines) > entryH {
+		lines = lines[:entryH]
 	}
 
 	if m.fileListBounceOffset != 0 {
-		entries = applyBounceShiftLines(entries, m.fileListBounceOffset, entryH, blank)
+		lines = applyBounceShiftLines(lines, m.fileListBounceOffset, entryH, blank)
 	}
 
-	return strings.Join(entries, "\n")
+	return strings.Join(lines, "\n")
 }
 
 // renderEmptyFileList renders an empty state.
@@ -225,6 +233,66 @@ func (m *Model) renderConflictFileEntry(entry *ConflictFileEntry, isCursor bool,
 	return row
 }
 
+// renderHunkLine renders the indented hunk location line below a file entry.
+// Format: "    L12  L45  L89" — the current hunk is highlighted for the
+// selected file.
+func (m *Model) renderHunkLine(fileIdx int, isCursor bool, width int, p theme.Palette) string {
+	bg := p.Selection
+	baseSt := lipgloss.NewStyle()
+	if isCursor {
+		baseSt = baseSt.Background(bg)
+	}
+
+	var hunks []ConflictHunk
+	if fileIdx >= 0 && fileIdx < len(m.data.Entries) {
+		hunks = m.data.Entries[fileIdx].Hunks
+	}
+
+	if len(hunks) == 0 {
+		return baseSt.Render(strings.Repeat(" ", width))
+	}
+
+	var b strings.Builder
+	b.WriteString(baseSt.Render("    "))
+	col := 4
+
+	for j, h := range hunks {
+		label := fmt.Sprintf("L%d", h.StartLine+1)
+		labelW := len(label) // ASCII-only, len == visual width
+
+		sepW := 0
+		if j > 0 {
+			sepW = 2
+		}
+		if col+sepW+labelW > width {
+			break
+		}
+
+		if j > 0 {
+			b.WriteString(baseSt.Render("  "))
+			col += 2
+		}
+
+		st := lipgloss.NewStyle().Foreground(p.Muted)
+		if isCursor && j == m.currentHunk && m.currentHunk < len(hunks) {
+			st = lipgloss.NewStyle().Foreground(p.Primary).Bold(true)
+		}
+		if isCursor {
+			st = st.Background(bg)
+		}
+		b.WriteString(st.Render(label))
+		col += labelW
+	}
+
+	row := b.String()
+	if vis := lipgloss.Width(row); vis < width {
+		b.WriteString(baseSt.Render(strings.Repeat(" ", width-vis)))
+		row = b.String()
+	}
+
+	return row
+}
+
 // ---------------------------------------------------------------------------
 // File list input handling
 // ---------------------------------------------------------------------------
@@ -235,6 +303,10 @@ var fileListKeyActions = map[string]func(*Model) tea.Cmd{
 	"down":   func(m *Model) tea.Cmd { m.moveFileDown(); return nil },
 	"k":      func(m *Model) tea.Cmd { m.moveFileUp(); return nil },
 	"up":     func(m *Model) tea.Cmd { m.moveFileUp(); return nil },
+	"l":      func(m *Model) tea.Cmd { m.nextHunk(); return nil },
+	"right":  func(m *Model) tea.Cmd { m.nextHunk(); return nil },
+	"h":      func(m *Model) tea.Cmd { m.prevHunk(); return nil },
+	"left":   func(m *Model) tea.Cmd { m.prevHunk(); return nil },
 	"g":      func(m *Model) tea.Cmd { m.moveFileToStart(); return nil },
 	"home":   func(m *Model) tea.Cmd { m.moveFileToStart(); return nil },
 	"G":      func(m *Model) tea.Cmd { m.moveFileToEnd(); return nil },
@@ -295,7 +367,7 @@ func (m *Model) fileListHalfPageUp() {
 }
 
 func (m *Model) fileListEntryH() int {
-	return max(m.fileListH-fileListHeaderHeight, 1)
+	return max((m.fileListH-fileListHeaderHeight)/linesPerFileEntry, 1)
 }
 
 // resolveFromList applies a resolution from the file list, returning the tea.Cmd.
@@ -316,10 +388,11 @@ func (m *Model) ClickFileList(localY int) {
 		return
 	}
 	entryH := max(m.fileListH-fileListHeaderHeight, 0)
-	entryIdx := localY - fileListHeaderHeight
+	lineIdx := localY - fileListHeaderHeight
 	total := len(m.data.Entries)
-	start, _ := visibleWindow(m.selectedFile, total, entryH)
-	idx := start + entryIdx
+	filesVisible := max(entryH/linesPerFileEntry, 1)
+	start, _ := visibleWindow(m.selectedFile, total, filesVisible)
+	idx := start + lineIdx/linesPerFileEntry
 	if idx < 0 || idx >= total {
 		return
 	}

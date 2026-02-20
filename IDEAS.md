@@ -31,3 +31,27 @@ The Librarian performs Codebase Health Assessments (tech debt, test coverage, ch
 
 ### Inline Pre-Delegation Checks
 When a user types a comment like `// TODO: Implement failover...`, the editor detects it. The Architect silently checks the Archivalist for similar systems that have failed in the past. It drops a subtle inline hint: *"We've had Redis OOM failures with similar patterns in Q3, suggest adding bounded limits."*
+
+## 4. Non-Agentic UX Opportunities (Hyper-Tactile Editor)
+
+The Sylk custom Bubble Tea compositor (`window.Manager`, `ui/pane`, `editor.Model`) provides unique, high-performance UI capabilities that a Neovim/Tmux setup handles via separate plugins or layers. We can integrate these deeply:
+
+### Morphic Window Layouts
+The `window.Manager` handles tiling math (`Horizontal`/`Vertical`). Instead of manual `<C-w> s` and dragging borders, implement **Morphic Layouts**. Press a chord (e.g., `<A-L>`) and the windows seamlessly animate (using a Lipgloss tweening engine) into predefined layouts: `Focus` (1 big, others tiny), `Grid` (equal tiles), `Stack` (vertical slices). 
+
+### Kinetic Scroll & "Minimap" Bar
+The `tabbar` is currently fixed. The `findbar` and `replacebar` overlay the terminal output. We could implement a vertical **Kinetic Scrollbar + Minimap** on the right edge of the editor. It wouldn't render code (too slow for terminal), but would render dense braille characters (`⡄`, `⠇`) mapped to `highlight.Regions` or `LSP Diagnostics`. You get an instant visual density map of functions and errors across the whole file, combined with visual bounce offsets.
+
+### Structural Text Objects (Tree-sitter native)
+You already have Tree-sitter AST integration. Expand the Vim motion parser (`motion/parser.go`). Standard vim has `dip` (delete inside paragraph). Sylk should have semantic text objects out of bounds for traditional regex editing:
+- `dif` (delete inside function)
+- `vac` (visual select around class)
+- `yaj` (yank around JSON object / struct block)
+The editor state immediately asks the TS parser for the node bounds and jumps the `PieceTable` cursor.
+
+### Peek / Inline Preview Buffers
+You have `HoverPopup` for LSP. Let's extend it to an **Inline Editor View**. 
+When pressing `gf` (go to file) or `gd` (go to definition), instead of replacing the current buffer or spawning a full window manager split, Sylk conditionally spawns a transient `ui/pane` that floats *over* the current text (like a VSCode peek window). It's a fully weaponized editor instance, but it closes the moment you press `<Esc>` or click outside it.
+
+### Ghost Cursor / Multi-Cursor native
+The `Model` struct tracks `CursorLine` and `CursorCol`. Since we own the rendering pipeline (`renderTextWithCursor`), implementing native multiple cursors (like Sublime/VSCode) is a matter of turning `state.Cursor` into `state.Cursors []int`. The `PieceTable` can take batched inserts. This brings modern IDE editing speed to the terminal native level.

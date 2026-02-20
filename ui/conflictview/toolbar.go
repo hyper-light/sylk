@@ -26,6 +26,7 @@ const (
 type ctbDef struct {
 	icon   string
 	label  string
+	key    string // keyboard shortcut hint, e.g. "o"
 	accent func(theme.Palette) lipgloss.Color
 }
 
@@ -36,10 +37,10 @@ var ctbStaticDefs = [ctbCount]ctbDef{
 	ctbAbort:    {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
 	ctbPrev:     {icon: "◀", label: "Prev", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
 	ctbNext:     {icon: "▶", label: "Next", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
-	ctbOurs:     {icon: "↑", label: "Dest", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
-	ctbTheirs:   {icon: "↓", label: "Source", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
-	ctbBoth:     {icon: "↕", label: "Both", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
-	ctbUndo:     {icon: "↩", label: "Undo", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
+	ctbOurs:     {icon: "↑", label: "Dest", key: "o", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
+	ctbTheirs:   {icon: "↓", label: "Source", key: "t", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
+	ctbBoth:     {icon: "↕", label: "Both", key: "b", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
+	ctbUndo:     {icon: "↩", label: "Undo", key: "u", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
 }
 
 // ctbDefFor returns the button definition for a given ID, substituting
@@ -58,7 +59,11 @@ func (m *Model) ctbDefFor(id int) ctbDef {
 // ctbCellWidth returns the visual width of a toolbar button cell.
 func (m *Model) ctbCellWidth(id int) int {
 	def := m.ctbDefFor(id)
-	return lipgloss.Width(" " + def.icon + " " + def.label + " ")
+	inner := def.icon + " " + def.label
+	if def.key != "" {
+		inner += " (" + def.key + ")"
+	}
+	return lipgloss.Width(" " + inner + " ")
 }
 
 // ctbPrimaryCount is the number of always-visible primary buttons.
@@ -128,7 +133,11 @@ func (m *Model) renderToolbar() string {
 			}
 		}
 
-		text := lipgloss.NewStyle().Foreground(fg).Bold(bold).Render(def.icon + " " + def.label)
+		mainText := lipgloss.NewStyle().Foreground(fg).Bold(bold).Render(def.icon + " " + def.label)
+		text := mainText
+		if def.key != "" {
+			text += lipgloss.NewStyle().Foreground(p.Muted).Render(" (" + def.key + ")")
+		}
 		w := m.ctbCellWidth(i)
 		cells[i] = btnCell{inner: " " + text + " ", width: w}
 	}
