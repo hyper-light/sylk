@@ -236,30 +236,33 @@ func TestTopicPatternBuilder(t *testing.T) {
 }
 
 func TestBuildSessionTopic(t *testing.T) {
-	topic := BuildSessionTopic("sess123", "agent1", ChannelTypeRequests)
-	expected := "session.sess123.agent1.requests"
+	topic := BuildSessionTopic("sess123", "agent1", "agent1", ChannelTypeRequests)
+	expected := "session.sess123.request.agent1.agent1"
 	if topic != expected {
 		t.Errorf("expected %q, got %q", expected, topic)
 	}
 }
 
 func TestParseSessionTopic(t *testing.T) {
-	sessionID, agentID, channel, ok := ParseSessionTopic("session.abc123.guide.requests")
+	sessionID, agentType, agentID, channel, ok := ParseSessionTopic("session.abc123.request.guide.guide")
 	if !ok {
 		t.Error("expected parse to succeed")
 	}
 	if sessionID != "abc123" {
 		t.Errorf("expected sessionID 'abc123', got %q", sessionID)
 	}
+	if agentType != "guide" {
+		t.Errorf("expected agentType 'guide', got %q", agentType)
+	}
 	if agentID != "guide" {
 		t.Errorf("expected agentID 'guide', got %q", agentID)
 	}
-	if channel != "requests" {
-		t.Errorf("expected channel 'requests', got %q", channel)
+	if channel != "request" {
+		t.Errorf("expected channel 'request', got %q", channel)
 	}
 
 	// Invalid topic
-	_, _, _, ok = ParseSessionTopic("invalid.topic")
+	_, _, _, _, ok = ParseSessionTopic("invalid.topic")
 	if ok {
 		t.Error("expected parse to fail for invalid topic")
 	}
@@ -365,11 +368,14 @@ func TestSessionBus_SubscribePattern(t *testing.T) {
 	defer sb.Close()
 
 	var receivedCount int64
-	pattern := "session.*.*.requests"
+	// Pattern matches the 5-segment session topic: session.<sid>.<prefix>.<type>.<id>
+	pattern := "session.*.request.*.*"
 	subscribePattern(t, sb, pattern, &receivedCount)
 
 	assertRouterPatternCount(t, sb, 1)
-	fullTopic := assertResolvedTopic(t, sb, "myagent.requests", "session.test-session.myagent.requests")
+	// Legacy topic "myagent.requests" resolves to the 5-segment format:
+	// agentType="myagent", agentID="myagent", channel=requests → prefix="request"
+	fullTopic := assertResolvedTopic(t, sb, "myagent.requests", "session.test-session.request.myagent.myagent")
 	assertPatternMatches(t, sb, pattern, fullTopic)
 
 	publishPatternMessage(t, sb)

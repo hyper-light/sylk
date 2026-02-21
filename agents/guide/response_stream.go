@@ -130,6 +130,9 @@ const (
 
 	// StreamEventEnd indicates stream ended
 	StreamEventEnd StreamEventType = "end"
+
+	// StreamEventRetry indicates a retry/model-fallback attempt
+	StreamEventRetry StreamEventType = "retry"
 )
 
 // StreamStats contains stream manager statistics

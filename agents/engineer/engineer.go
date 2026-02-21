@@ -154,7 +154,7 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 	}
 
 	e.bus = bus
-	e.channels = guide.NewAgentChannels("engineer")
+	e.channels = guide.NewAgentChannels("engineer", "engineer")
 
 	// Subscribe to own request channel (engineer.requests)
 	var err error

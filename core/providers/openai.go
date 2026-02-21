@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/skills"
+	"github.com/google/uuid"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/responses"
@@ -19,9 +25,21 @@ import (
 // OpenAIProvider implements Provider for OpenAI's GPT models
 type OpenAIProvider struct {
 	client      *openai.Client
+	clientMu    sync.RWMutex
 	config      OpenAIConfig
 	skills      []skills.Skill
 	authService oauth.OpenAIAuthService
+}
+
+type OpenAIDeviceAuthSession struct {
+	Challenge *oauth.DeviceCodeChallenge
+	Results   <-chan OpenAIDeviceAuthResult
+	Cancel    context.CancelFunc
+}
+
+type OpenAIDeviceAuthResult struct {
+	Auth *oauth.OpenAIChatGPTAuth
+	Err  error
 }
 
 type OpenAIModel string
@@ -37,6 +55,7 @@ const (
 
 	// Mirrors Codex chatgpt-mode backend routing.
 	defaultChatGPTCodexBaseURL = "https://chatgpt.com/backend-api/codex"
+	defaultOpenAIUserAgent     = "sylk/1.0 (+https://github.com/adalundhe/sylk)"
 )
 
 // Supported OpenAI models (canonical slugs).
@@ -54,6 +73,12 @@ var openaiModelAliases = map[string]string{
 	"gpt-5-2-codex":      "gpt-5.2-codex",
 }
 
+var openAIRoleToInputRole = map[Role]responses.EasyInputMessageRole{
+	RoleSystem:    responses.EasyInputMessageRoleSystem,
+	RoleUser:      responses.EasyInputMessageRoleUser,
+	RoleAssistant: responses.EasyInputMessageRoleAssistant,
+}
+
 // NewOpenAIProvider creates a new OpenAI provider with the given configuration
 func NewOpenAIProvider(config OpenAIConfig, skills ...skills.Skill) (*OpenAIProvider, error) {
 	return NewOpenAIProviderWithAuthService(config, oauth.NewOpenAIAuthService(oauth.OpenAIAuthServiceConfig{}), skills...)
@@ -66,23 +91,9 @@ func NewOpenAIProviderWithAuthService(
 	authService oauth.OpenAIAuthService,
 	skills ...skills.Skill,
 ) (*OpenAIProvider, error) {
-	if config.Model == "" {
-		config.Model = DefaultOpenAIConfig().Model
-	}
-	if config.MaxTokens == 0 {
-		config.MaxTokens = DefaultOpenAIConfig().MaxTokens
-	}
-	if config.AuthMode == "" {
-		config.AuthMode = DefaultOpenAIConfig().AuthMode
-	}
-	if config.FallbackModel == "" {
-		config.FallbackModel = DefaultOpenAIConfig().FallbackModel
-	}
-	config.Model = normalizeOpenAIModel(config.Model)
-	config.FallbackModel = normalizeOpenAIModel(config.FallbackModel)
-	if config.AuthMode == openAIAuthModeChatGPT && config.BaseURL == "" {
-		config.BaseURL = defaultChatGPTCodexBaseURL
-	}
+	applyOpenAIProviderDefaults(&config)
+	normalizeOpenAIProviderModels(&config)
+	applyDefaultChatGPTBaseURL(&config)
 	if err := hydrateOpenAIConfig(context.Background(), &config, authService); err != nil {
 		return nil, err
 	}
@@ -91,30 +102,7 @@ func NewOpenAIProviderWithAuthService(
 		return nil, err
 	}
 
-	opts := []option.RequestOption{
-		option.WithAPIKey(config.APIKey),
-		option.WithMaxRetries(config.MaxRetries),
-	}
-	if config.Timeout > 0 {
-		opts = append(opts, option.WithRequestTimeout(config.Timeout))
-	}
-
-	if config.BaseURL != "" {
-		opts = append(opts, option.WithBaseURL(config.BaseURL))
-	}
-
-	if config.Organization != "" {
-		opts = append(opts, option.WithHeader("OpenAI-Organization", config.Organization))
-	}
-
-	if config.Project != "" {
-		opts = append(opts, option.WithHeader("OpenAI-Project", config.Project))
-	}
-	if config.AuthMode == openAIAuthModeChatGPT && config.ChatGPTAccountID != "" {
-		opts = append(opts, option.WithHeader("ChatGPT-Account-ID", config.ChatGPTAccountID))
-	}
-
-	client := openai.NewClient(opts...)
+	client := openai.NewClient(buildOpenAIClientOptions(config)...)
 
 	return &OpenAIProvider{
 		client:      &client,
@@ -124,51 +112,527 @@ func NewOpenAIProviderWithAuthService(
 	}, nil
 }
 
+func applyOpenAIProviderDefaults(config *OpenAIConfig) {
+	if config == nil {
+		return
+	}
+	defaults := DefaultOpenAIConfig()
+	applyDefaultString(&config.Model, defaults.Model)
+	applyDefaultInt(&config.MaxTokens, defaults.MaxTokens)
+	applyDefaultString(&config.AuthMode, defaults.AuthMode)
+	applyDefaultString(&config.FallbackModel, defaults.FallbackModel)
+}
+
+func applyDefaultString(value *string, fallback string) {
+	if strings.TrimSpace(*value) != "" {
+		return
+	}
+	*value = fallback
+}
+
+func applyDefaultInt(value *int, fallback int) {
+	if *value != 0 {
+		return
+	}
+	*value = fallback
+}
+
+func normalizeOpenAIProviderModels(config *OpenAIConfig) {
+	if config == nil {
+		return
+	}
+	config.Model = normalizeOpenAIModel(config.Model)
+	config.FallbackModel = normalizeOpenAIModel(config.FallbackModel)
+}
+
+func applyDefaultChatGPTBaseURL(config *OpenAIConfig) {
+	if config == nil {
+		return
+	}
+	if config.AuthMode != openAIAuthModeChatGPT {
+		return
+	}
+	if config.BaseURL == "" {
+		config.BaseURL = defaultChatGPTCodexBaseURL
+	}
+}
+
 func hydrateOpenAIConfig(ctx context.Context, config *OpenAIConfig, authService oauth.OpenAIAuthService) error {
 	if config == nil {
 		return fmt.Errorf("openai config is nil")
 	}
+	normalizeOpenAIHydrationFields(config)
+	if config.AuthMode == openAIAuthModeChatGPT {
+		return hydrateChatGPTConfig(ctx, config, authService)
+	}
+	return hydrateOpenAIAPIKey(config)
+}
 
+func normalizeOpenAIHydrationFields(config *OpenAIConfig) {
 	config.APIKey = strings.TrimSpace(config.APIKey)
 	config.ChatGPTAccountID = strings.TrimSpace(config.ChatGPTAccountID)
 	config.AuthMode = strings.TrimSpace(config.AuthMode)
 	if config.AuthMode == "" {
 		config.AuthMode = openAIAuthModeAPIKey
 	}
+}
 
-	switch config.AuthMode {
-	case openAIAuthModeChatGPT:
-		missingToken := config.APIKey == ""
-		missingAccount := config.ChatGPTAccountID == ""
-		if (missingToken || missingAccount) && authService != nil {
-			auth, err := authService.Resolve(ctx)
-			if err == nil && auth != nil {
-				if missingToken {
-					config.APIKey = strings.TrimSpace(auth.AccessToken)
-				}
-				if missingAccount {
-					config.ChatGPTAccountID = strings.TrimSpace(auth.ChatGPTAccountID)
-				}
-			} else if !errors.Is(err, oauth.ErrAuthNotConfigured) {
-				return fmt.Errorf("resolve chatgpt auth: %w", err)
-			}
-		}
+func hydrateChatGPTConfig(ctx context.Context, config *OpenAIConfig, authService oauth.OpenAIAuthService) error {
+	if err := resolveAndApplyChatGPTAuth(ctx, config, authService); err != nil {
+		return err
+	}
+	return validateChatGPTConfig(config)
+}
 
-		if strings.TrimSpace(config.APIKey) == "" {
-			return fmt.Errorf("openai chatgpt auth requires access token")
-		}
-		if strings.TrimSpace(config.ChatGPTAccountID) == "" {
-			return fmt.Errorf("openai chatgpt auth requires chatgpt_account_id")
-		}
-		return nil
-	default:
-		if config.APIKey == "" {
-			if key, err := llm.ResolveAPIKey("openai"); err == nil {
-				config.APIKey = strings.TrimSpace(key)
-			}
-		}
+func resolveAndApplyChatGPTAuth(ctx context.Context, config *OpenAIConfig, authService oauth.OpenAIAuthService) error {
+	if !chatGPTConfigNeedsResolution(config) {
 		return nil
 	}
+	if authService == nil {
+		return nil
+	}
+	auth, err := authService.Resolve(ctx)
+	if err != nil {
+		return handleChatGPTResolveError(err)
+	}
+	applyResolvedChatGPTAuth(config, auth)
+	return nil
+}
+
+func chatGPTConfigNeedsResolution(config *OpenAIConfig) bool {
+	if config == nil {
+		return false
+	}
+	if config.APIKey == "" {
+		return true
+	}
+	return config.ChatGPTAccountID == ""
+}
+
+func handleChatGPTResolveError(err error) error {
+	if errors.Is(err, oauth.ErrAuthNotConfigured) {
+		return nil
+	}
+	return fmt.Errorf("resolve chatgpt auth: %w", err)
+}
+
+func applyResolvedChatGPTAuth(config *OpenAIConfig, auth *oauth.OpenAIChatGPTAuth) {
+	if !canApplyResolvedChatGPTValues(config, auth) {
+		return
+	}
+	if config.APIKey == "" {
+		config.APIKey = strings.TrimSpace(auth.AccessToken)
+	}
+	if config.ChatGPTAccountID == "" {
+		config.ChatGPTAccountID = strings.TrimSpace(auth.ChatGPTAccountID)
+	}
+}
+
+func canApplyResolvedChatGPTValues(config *OpenAIConfig, auth *oauth.OpenAIChatGPTAuth) bool {
+	if config == nil {
+		return false
+	}
+	return auth != nil
+}
+
+func validateChatGPTConfig(config *OpenAIConfig) error {
+	if strings.TrimSpace(config.APIKey) == "" {
+		return fmt.Errorf("openai chatgpt auth requires access token")
+	}
+	if strings.TrimSpace(config.ChatGPTAccountID) == "" {
+		return fmt.Errorf("openai chatgpt auth requires chatgpt_account_id")
+	}
+	return nil
+}
+
+func hydrateOpenAIAPIKey(config *OpenAIConfig) error {
+	if config == nil {
+		return nil
+	}
+	if config.APIKey != "" {
+		return nil
+	}
+	key, err := llm.ResolveAPIKey("openai")
+	if err != nil {
+		return nil
+	}
+	config.APIKey = strings.TrimSpace(key)
+	return nil
+}
+
+func buildOpenAIClientOptions(config OpenAIConfig) []option.RequestOption {
+	timeout := resolveOpenAITimeout(config.Timeout)
+	opts := buildBaseOpenAIClientOptions(config, timeout)
+	return appendOptionalOpenAIClientOptions(opts, config)
+}
+
+func resolveOpenAITimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return DefaultBaseConfig().Timeout
+	}
+	return timeout
+}
+
+func buildBaseOpenAIClientOptions(config OpenAIConfig, timeout time.Duration) []option.RequestOption {
+	return []option.RequestOption{
+		option.WithAPIKey(config.APIKey),
+		option.WithMaxRetries(config.MaxRetries),
+		option.WithRequestTimeout(timeout),
+		option.WithHTTPClient(newDefaultOpenAIHTTPClient(timeout)),
+		option.WithHeader("User-Agent", defaultOpenAIUserAgent),
+	}
+}
+
+func appendOptionalOpenAIClientOptions(opts []option.RequestOption, config OpenAIConfig) []option.RequestOption {
+	if config.BaseURL != "" {
+		opts = append(opts, option.WithBaseURL(config.BaseURL))
+	}
+	opts = appendOpenAIHeaderOption(opts, "OpenAI-Organization", config.Organization)
+	opts = appendOpenAIHeaderOption(opts, "OpenAI-Project", config.Project)
+	if config.AuthMode == openAIAuthModeChatGPT && config.ChatGPTAccountID != "" {
+		opts = append(opts, option.WithHeader("ChatGPT-Account-ID", config.ChatGPTAccountID))
+	}
+	return opts
+}
+
+func appendOpenAIHeaderOption(opts []option.RequestOption, key string, value string) []option.RequestOption {
+	if strings.TrimSpace(value) == "" {
+		return opts
+	}
+	return append(opts, option.WithHeader(key, value))
+}
+
+func newDefaultOpenAIHTTPClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: timeout,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+}
+
+func (p *OpenAIProvider) getClient() *openai.Client {
+	p.clientMu.RLock()
+	defer p.clientMu.RUnlock()
+	return p.client
+}
+
+func (p *OpenAIProvider) replaceClient(client *openai.Client) {
+	p.clientMu.Lock()
+	defer p.clientMu.Unlock()
+	p.client = client
+}
+
+func (p *OpenAIProvider) StartChatGPTDeviceAuth(
+	ctx context.Context,
+	timeout time.Duration,
+) (*OpenAIDeviceAuthSession, error) {
+	if p.authService == nil {
+		return nil, fmt.Errorf("chatgpt auth service is not configured")
+	}
+	session, err := oauth.StartDeviceAuthSession(ctx, p.authService, timeout)
+	if err != nil {
+		return nil, err
+	}
+	results := make(chan OpenAIDeviceAuthResult, 1)
+	go p.forwardDeviceAuthResults(session.Results, results)
+	return &OpenAIDeviceAuthSession{
+		Challenge: session.Challenge,
+		Results:   results,
+		Cancel:    session.Cancel,
+	}, nil
+}
+
+func (p *OpenAIProvider) forwardDeviceAuthResults(
+	source <-chan oauth.DeviceAuthResult,
+	target chan<- OpenAIDeviceAuthResult,
+) {
+	defer close(target)
+	for result := range source {
+		if shouldApplyDeviceAuthResult(result) {
+			p.applyRefreshedChatGPTAuth(result.Auth)
+		}
+		target <- OpenAIDeviceAuthResult{
+			Auth: result.Auth,
+			Err:  result.Err,
+		}
+	}
+}
+
+func shouldApplyDeviceAuthResult(result oauth.DeviceAuthResult) bool {
+	if result.Err != nil {
+		return false
+	}
+	return result.Auth != nil
+}
+
+type requestObserver struct {
+	requestID  string
+	retryCount int
+	response   *http.Response
+}
+
+func newRequestObserver() *requestObserver {
+	return &requestObserver{
+		requestID: uuid.NewString(),
+	}
+}
+
+func (o *requestObserver) options() []option.RequestOption {
+	return []option.RequestOption{
+		option.WithResponseInto(&o.response),
+		option.WithMiddleware(func(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+			req.Header.Set("X-Request-ID", o.requestID)
+			if v := req.Header.Get("X-Stainless-Retry-Count"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > o.retryCount {
+					o.retryCount = n
+				}
+			}
+			return next(req)
+		}),
+	}
+}
+
+func (o *requestObserver) metadata() map[string]any {
+	metadata := map[string]any{
+		"request_id":  o.requestID,
+		"retry_count": o.retryCount,
+	}
+	if o.response != nil {
+		metadata["http_status"] = o.response.StatusCode
+		if v := strings.TrimSpace(o.response.Header.Get("x-request-id")); v != "" {
+			metadata["openai_request_id"] = v
+		}
+		if v := strings.TrimSpace(o.response.Header.Get("openai-processing-ms")); v != "" {
+			metadata["processing_ms"] = v
+		}
+	}
+	return metadata
+}
+
+func mergeMetadata(dst map[string]any, src map[string]any) map[string]any {
+	if dst == nil {
+		dst = map[string]any{}
+	}
+	for k, v := range src {
+		if shouldSkipMetadata(k, v) {
+			continue
+		}
+		dst[k] = v
+	}
+	return dst
+}
+
+func shouldSkipMetadata(key string, value any) bool {
+	if key == "" {
+		return true
+	}
+	return value == nil
+}
+
+func (p *OpenAIProvider) refreshChatGPTAuth(ctx context.Context) error {
+	if p.authService == nil {
+		return fmt.Errorf("chatgpt auth service is not configured")
+	}
+	updated, err := p.resolveAndRefreshChatGPTAuth(ctx)
+	if err != nil {
+		return err
+	}
+	p.applyRefreshedChatGPTAuth(updated)
+	return nil
+}
+
+func (p *OpenAIProvider) resolveAndRefreshChatGPTAuth(ctx context.Context) (*oauth.OpenAIChatGPTAuth, error) {
+	auth, err := p.resolveChatGPTAuth(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return p.refreshAndPersistChatGPTAuth(ctx, auth)
+}
+
+func (p *OpenAIProvider) resolveChatGPTAuth(ctx context.Context) (*oauth.OpenAIChatGPTAuth, error) {
+	auth, err := p.authService.Resolve(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve chatgpt auth: %w", err)
+	}
+	return auth, nil
+}
+
+func (p *OpenAIProvider) refreshAndPersistChatGPTAuth(
+	ctx context.Context,
+	auth *oauth.OpenAIChatGPTAuth,
+) (*oauth.OpenAIChatGPTAuth, error) {
+	updated, err := p.authService.Refresh(ctx, auth)
+	if err != nil {
+		return nil, p.handleChatGPTRefreshError(ctx, err)
+	}
+	if err := p.authService.Save(ctx, updated); err != nil {
+		return nil, fmt.Errorf("persist refreshed auth: %w", err)
+	}
+	return updated, nil
+}
+
+func (p *OpenAIProvider) handleChatGPTRefreshError(ctx context.Context, err error) error {
+	if oauth.IsInvalidGrant(err) {
+		_ = p.authService.Delete(ctx)
+	}
+	return fmt.Errorf("refresh chatgpt auth: %w", err)
+}
+
+func (p *OpenAIProvider) applyRefreshedChatGPTAuth(updated *oauth.OpenAIChatGPTAuth) {
+	p.clientMu.Lock()
+	defer p.clientMu.Unlock()
+	applyRefreshedChatGPTConfig(p, updated)
+	client := openai.NewClient(buildOpenAIClientOptions(p.config)...)
+	p.client = &client
+}
+
+func applyRefreshedChatGPTConfig(provider *OpenAIProvider, updated *oauth.OpenAIChatGPTAuth) {
+	if !canApplyRefreshedChatGPTConfig(provider, updated) {
+		return
+	}
+	applyRefreshedChatGPTAccessToken(provider, updated)
+	applyRefreshedChatGPTAccountID(provider, updated)
+}
+
+func canApplyRefreshedChatGPTConfig(provider *OpenAIProvider, updated *oauth.OpenAIChatGPTAuth) bool {
+	if provider == nil {
+		return false
+	}
+	return updated != nil
+}
+
+func applyRefreshedChatGPTAccessToken(provider *OpenAIProvider, updated *oauth.OpenAIChatGPTAuth) {
+	provider.config.APIKey = strings.TrimSpace(updated.AccessToken)
+}
+
+func applyRefreshedChatGPTAccountID(provider *OpenAIProvider, updated *oauth.OpenAIChatGPTAuth) {
+	accountID := strings.TrimSpace(updated.ChatGPTAccountID)
+	if accountID == "" {
+		return
+	}
+	provider.config.ChatGPTAccountID = accountID
+}
+
+func isChatGPTAuthError(err error) bool {
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden
+	}
+	return false
+}
+
+func wrapOpenAIProviderError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if providerErr := buildOpenAIProviderError(operation, err); providerErr != nil {
+		return providerErr
+	}
+	return WrapError(ProviderTypeOpenAI, operation, err)
+}
+
+func buildOpenAIProviderError(operation string, err error) error {
+	apiErr, ok := asOpenAIError(err)
+	if !ok {
+		return nil
+	}
+	pe := &ProviderError{
+		Provider:   ProviderTypeOpenAI,
+		Operation:  operation,
+		StatusCode: apiErr.StatusCode,
+		Message:    apiErr.Message,
+		Underlying: err,
+		Retryable:  isOpenAIRetryableStatus(apiErr.StatusCode),
+	}
+	if d, ok := openAIRetryAfter(apiErr); ok {
+		pe.RetryAfter = d
+	}
+	return pe
+}
+
+func asOpenAIError(err error) (*openai.Error, bool) {
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		return apiErr, true
+	}
+	return nil, false
+}
+
+func isOpenAIRetryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+func openAIRetryAfter(apiErr *openai.Error) (time.Duration, bool) {
+	if apiErr == nil {
+		return 0, false
+	}
+	if apiErr.Response == nil {
+		return 0, false
+	}
+	return parseRetryAfterHeader(apiErr.Response.Header)
+}
+
+func parseRetryAfterHeader(h http.Header) (time.Duration, bool) {
+	if h == nil {
+		return 0, false
+	}
+	if d, ok := parseRetryAfterMS(h.Get("Retry-After-Ms")); ok {
+		return d, true
+	}
+	return parseRetryAfterValue(h.Get("Retry-After"))
+}
+
+func parseRetryAfterMS(value string) (time.Duration, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, false
+	}
+	ms, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || ms <= 0 {
+		return 0, false
+	}
+	return time.Duration(ms * float64(time.Millisecond)), true
+}
+
+func parseRetryAfterValue(value string) (time.Duration, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, false
+	}
+	if d, ok := parseRetryAfterSeconds(trimmed); ok {
+		return d, true
+	}
+	return parseRetryAfterTime(trimmed)
+}
+
+func parseRetryAfterSeconds(value string) (time.Duration, bool) {
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || seconds <= 0 {
+		return 0, false
+	}
+	return time.Duration(seconds * float64(time.Second)), true
+}
+
+func parseRetryAfterTime(value string) (time.Duration, bool) {
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	d := time.Until(when)
+	if d <= 0 {
+		return 0, false
+	}
+	return d, true
 }
 
 // Name returns the provider identifier
@@ -181,360 +645,755 @@ func (p *OpenAIProvider) Generate(ctx context.Context, req *Request) (*Response,
 	if req == nil {
 		req = &Request{}
 	}
+	if p.config.AuthMode == openAIAuthModeChatGPT {
+		return p.generateChatGPT(ctx, req)
+	}
+	return p.generateStandard(ctx, req)
+}
 
+func (p *OpenAIProvider) generateChatGPT(ctx context.Context, req *Request) (*Response, error) {
 	params := p.buildResponseParams(req)
 	requestedModel := string(params.Model)
-
-	if p.config.AuthMode == openAIAuthModeChatGPT {
-		resp, err := p.generateViaStreaming(ctx, req)
-		if err != nil {
-			if fallbackModel, ok := p.selectFallbackModel(requestedModel, err); ok {
-				retryReq := *req
-				retryReq.Model = fallbackModel
-				resp, err = p.generateViaStreaming(ctx, &retryReq)
-				if err == nil {
-					if resp.ProviderMetadata == nil {
-						resp.ProviderMetadata = map[string]any{}
-					}
-					resp.ProviderMetadata["requested_model"] = requestedModel
-					resp.ProviderMetadata["fallback_model"] = fallbackModel
-					return resp, nil
-				}
-			}
-			return nil, fmt.Errorf("openai generate: %w", err)
-		}
+	resp, err := p.runChatGPTGenerateAttempt(ctx, req)
+	if err == nil {
 		return resp, nil
 	}
-
-	result, err := p.client.Responses.New(ctx, params)
-	if err != nil {
-		if fallbackModel, ok := p.selectFallbackModel(requestedModel, err); ok {
-			retryReq := *req
-			retryReq.Model = fallbackModel
-			result, err = p.client.Responses.New(ctx, p.buildResponseParams(&retryReq))
-			if err == nil {
-				resp := p.convertResponse(result)
-				if resp.ProviderMetadata == nil {
-					resp.ProviderMetadata = map[string]any{}
-				}
-				resp.ProviderMetadata["requested_model"] = requestedModel
-				resp.ProviderMetadata["fallback_model"] = fallbackModel
-				return resp, nil
-			}
-		}
-		return nil, fmt.Errorf("openai generate: %w", err)
+	fallbackModel, ok := p.selectFallbackModel(requestedModel, err)
+	if !ok {
+		return nil, wrapOpenAIProviderError("generate", err)
 	}
 
-	return p.convertResponse(result), nil
+	retryReq := *req
+	retryReq.Model = fallbackModel
+	resp, err = p.runChatGPTGenerateAttempt(ctx, &retryReq)
+	if err != nil {
+		return nil, wrapOpenAIProviderError("generate", err)
+	}
+	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, map[string]any{
+		"requested_model": requestedModel,
+		"fallback_model":  fallbackModel,
+		"auth_mode":       p.config.AuthMode,
+	})
+	return resp, nil
+}
+
+func (p *OpenAIProvider) runChatGPTGenerateAttempt(ctx context.Context, req *Request) (*Response, error) {
+	resp, err := p.generateViaStreaming(ctx, req)
+	if err == nil {
+		return resp, nil
+	}
+	if !isChatGPTAuthError(err) {
+		return nil, err
+	}
+	if refreshErr := p.refreshChatGPTAuth(ctx); refreshErr != nil {
+		return nil, refreshErr
+	}
+	return p.generateViaStreaming(ctx, req)
+}
+
+func (p *OpenAIProvider) generateStandard(ctx context.Context, req *Request) (*Response, error) {
+	params := p.buildResponseParams(req)
+	requestedModel := string(params.Model)
+	resp, err := p.runStandardGenerateAttempt(ctx, params)
+	if err == nil {
+		return resp, nil
+	}
+	fallbackModel, ok := p.selectFallbackModel(requestedModel, err)
+	if !ok {
+		return nil, wrapOpenAIProviderError("generate", err)
+	}
+	retryReq := *req
+	retryReq.Model = fallbackModel
+	resp, err = p.runStandardGenerateAttempt(ctx, p.buildResponseParams(&retryReq))
+	if err != nil {
+		return nil, wrapOpenAIProviderError("generate", err)
+	}
+	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, map[string]any{
+		"requested_model": requestedModel,
+		"fallback_model":  fallbackModel,
+		"auth_mode":       p.config.AuthMode,
+	})
+	return resp, nil
+}
+
+func (p *OpenAIProvider) runStandardGenerateAttempt(ctx context.Context, params responses.ResponseNewParams) (*Response, error) {
+	observer := newRequestObserver()
+	result, err := p.getClient().Responses.New(ctx, params, observer.options()...)
+	if err != nil {
+		return nil, err
+	}
+	resp := p.convertResponse(result)
+	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, observer.metadata())
+	resp.ProviderMetadata["auth_mode"] = p.config.AuthMode
+	return resp, nil
 }
 
 func (p *OpenAIProvider) generateViaStreaming(ctx context.Context, req *Request) (*Response, error) {
-	var content strings.Builder
-	toolCalls := make(map[string]*ToolCall)
-	toolCallOrder := make([]string, 0, 4)
-	ensureToolCall := func(id string) *ToolCall {
-		tc, ok := toolCalls[id]
-		if ok {
-			return tc
-		}
-		tc = &ToolCall{ID: id}
-		toolCalls[id] = tc
-		toolCallOrder = append(toolCallOrder, id)
-		return tc
-	}
-
-	completion, streamStopReason, streamUsage, err := p.runResponseStream(ctx, req, func(chunk *StreamChunk) error {
-		switch chunk.Type {
-		case ChunkTypeText:
-			content.WriteString(chunk.Text)
-		case ChunkTypeToolStart:
-			if chunk.ToolCall != nil {
-				tc := ensureToolCall(chunk.ToolCall.ID)
-				if chunk.ToolCall.Name != "" {
-					tc.Name = chunk.ToolCall.Name
-				}
-				if tc.Arguments == "" && chunk.ToolCall.ArgumentsDelta != "" {
-					tc.Arguments = chunk.ToolCall.ArgumentsDelta
-				}
-			}
-		case ChunkTypeToolDelta:
-			if chunk.ToolCall != nil {
-				tc := ensureToolCall(chunk.ToolCall.ID)
-				if chunk.ToolCall.Name != "" {
-					tc.Name = chunk.ToolCall.Name
-				}
-				tc.Arguments += chunk.ToolCall.ArgumentsDelta
-			}
-		case ChunkTypeToolEnd:
-			if chunk.ToolCall != nil {
-				tc := ensureToolCall(chunk.ToolCall.ID)
-				if chunk.ToolCall.Name != "" {
-					tc.Name = chunk.ToolCall.Name
-				}
-				// End events can carry finalized arguments. Prefer that canonical value.
-				if chunk.ToolCall.ArgumentsDelta != "" {
-					tc.Arguments = chunk.ToolCall.ArgumentsDelta
-				}
-			}
-		case ChunkTypeEnd:
-		}
-		return nil
-	})
+	assembler := newStreamResponseAssembler()
+	completion, streamStopReason, streamUsage, streamMetadata, err := p.runResponseStream(ctx, req, assembler.onChunk)
 	if err != nil {
 		return nil, err
 	}
 
 	if completion != nil {
-		return p.convertResponse(completion), nil
+		return p.responseFromStreamingCompletion(completion, streamMetadata), nil
 	}
+	return p.responseFromStreamingFallback(req, assembler, streamStopReason, streamUsage, streamMetadata), nil
+}
 
-	// Fallback path if stream ended without a terminal response payload.
+func (p *OpenAIProvider) responseFromStreamingCompletion(completion *responses.Response, metadata map[string]any) *Response {
+	resp := p.convertResponse(completion)
+	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, metadata)
+	resp.ProviderMetadata["auth_mode"] = p.config.AuthMode
+	return resp
+}
+
+func (p *OpenAIProvider) responseFromStreamingFallback(
+	req *Request,
+	assembler *streamResponseAssembler,
+	streamStopReason StopReason,
+	streamUsage Usage,
+	streamMetadata map[string]any,
+) *Response {
+	assembler = ensureStreamResponseAssembler(assembler)
 	resp := &Response{
-		Content:    content.String(),
+		Content:    assembler.content.String(),
 		StopReason: streamStopReason,
 		Usage:      streamUsage,
 	}
-	if resp.StopReason == "" {
-		resp.StopReason = StopReasonEndTurn
+	resp.StopReason = coalesceStopReason(resp.StopReason)
+	resp.Model = p.resolveStreamResponseModel(req)
+	if toolCalls := assembler.orderedToolCalls(); len(toolCalls) > 0 {
+		resp.ToolCalls = toolCalls
 	}
-	model := ""
+	resp.ProviderMetadata = mergeMetadata(resp.ProviderMetadata, streamMetadata)
+	resp.ProviderMetadata["auth_mode"] = p.config.AuthMode
+	return resp
+}
+
+func ensureStreamResponseAssembler(assembler *streamResponseAssembler) *streamResponseAssembler {
+	if assembler != nil {
+		return assembler
+	}
+	return newStreamResponseAssembler()
+}
+
+func coalesceStopReason(reason StopReason) StopReason {
+	if reason != "" {
+		return reason
+	}
+	return StopReasonEndTurn
+}
+
+func (p *OpenAIProvider) resolveStreamResponseModel(req *Request) string {
 	if req != nil {
-		model = normalizeOpenAIModel(req.Model)
-	}
-	resp.Model = model
-	if resp.Model == "" {
-		resp.Model = normalizeOpenAIModel(p.config.Model)
-	}
-	if len(toolCalls) > 0 {
-		resp.ToolCalls = make([]ToolCall, 0, len(toolCallOrder))
-		for _, id := range toolCallOrder {
-			if tc, ok := toolCalls[id]; ok {
-				resp.ToolCalls = append(resp.ToolCalls, *tc)
-			}
+		if model := normalizeOpenAIModel(req.Model); model != "" {
+			return model
 		}
 	}
-	return resp, nil
+	return normalizeOpenAIModel(p.config.Model)
 }
 
 func (p *OpenAIProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
-	_, _, _, err := p.runResponseStream(ctx, req, handler)
+	err := p.streamWithAuthRefreshRetry(ctx, req, handler)
+	return wrapOpenAIProviderError("stream", err)
+}
+
+func (p *OpenAIProvider) streamWithAuthRefreshRetry(ctx context.Context, req *Request, handler StreamHandler) error {
+	_, _, _, _, err := p.runResponseStream(ctx, req, handler)
+	if !p.shouldRetryStreamForAuth(err) {
+		return err
+	}
+	if refreshErr := p.refreshChatGPTAuth(ctx); refreshErr != nil {
+		return refreshErr
+	}
+	_, _, _, _, err = p.runResponseStream(ctx, req, handler)
 	return err
+}
+
+func (p *OpenAIProvider) shouldRetryStreamForAuth(err error) bool {
+	if err == nil {
+		return false
+	}
+	if p.config.AuthMode != openAIAuthModeChatGPT {
+		return false
+	}
+	return isChatGPTAuthError(err)
+}
+
+type streamToolCallState struct {
+	ToolCallChunk
+	OutputIndex int64
+}
+
+type streamResponseAssembler struct {
+	content       strings.Builder
+	toolCalls     map[string]*ToolCall
+	toolCallOrder []string
+	handlers      []func(*StreamChunk) error
+}
+
+func newStreamResponseAssembler() *streamResponseAssembler {
+	assembler := &streamResponseAssembler{
+		toolCalls:     make(map[string]*ToolCall),
+		toolCallOrder: make([]string, 0, 4),
+	}
+	assembler.handlers = []func(*StreamChunk) error{
+		assembler.handleTextChunk,
+		assembler.handleToolStartChunk,
+		assembler.handleToolDeltaChunk,
+		assembler.handleToolEndChunk,
+	}
+	return assembler
+}
+
+func (a *streamResponseAssembler) onChunk(chunk *StreamChunk) error {
+	if chunk == nil {
+		return nil
+	}
+	for _, handler := range a.handlers {
+		if err := handler(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *streamResponseAssembler) handleTextChunk(chunk *StreamChunk) error {
+	if chunk.Type != ChunkTypeText {
+		return nil
+	}
+	a.content.WriteString(chunk.Text)
+	return nil
+}
+
+func (a *streamResponseAssembler) handleToolStartChunk(chunk *StreamChunk) error {
+	if chunk.Type != ChunkTypeToolStart {
+		return nil
+	}
+	return a.applyToolStart(chunk.ToolCall)
+}
+
+func (a *streamResponseAssembler) handleToolDeltaChunk(chunk *StreamChunk) error {
+	if chunk.Type != ChunkTypeToolDelta {
+		return nil
+	}
+	return a.applyToolDelta(chunk.ToolCall)
+}
+
+func (a *streamResponseAssembler) handleToolEndChunk(chunk *StreamChunk) error {
+	if chunk.Type != ChunkTypeToolEnd {
+		return nil
+	}
+	return a.applyToolEnd(chunk.ToolCall)
+}
+
+func (a *streamResponseAssembler) applyToolStart(tool *ToolCallChunk) error {
+	if tool == nil {
+		return nil
+	}
+	tc := a.ensureToolCall(tool.ID)
+	applyToolCallName(tc, tool.Name)
+	applyToolStartArguments(tc, tool.ArgumentsDelta)
+	return nil
+}
+
+func (a *streamResponseAssembler) applyToolDelta(tool *ToolCallChunk) error {
+	if tool == nil {
+		return nil
+	}
+	tc := a.ensureToolCall(tool.ID)
+	applyToolCallName(tc, tool.Name)
+	tc.Arguments += tool.ArgumentsDelta
+	return nil
+}
+
+func (a *streamResponseAssembler) applyToolEnd(tool *ToolCallChunk) error {
+	if tool == nil {
+		return nil
+	}
+	tc := a.ensureToolCall(tool.ID)
+	applyToolCallName(tc, tool.Name)
+	applyToolEndArguments(tc, tool.ArgumentsDelta)
+	return nil
+}
+
+func applyToolCallName(tc *ToolCall, name string) {
+	if tc == nil {
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		return
+	}
+	tc.Name = name
+}
+
+func applyToolStartArguments(tc *ToolCall, delta string) {
+	if tc == nil {
+		return
+	}
+	if tc.Arguments != "" {
+		return
+	}
+	if strings.TrimSpace(delta) == "" {
+		return
+	}
+	tc.Arguments = delta
+}
+
+func applyToolEndArguments(tc *ToolCall, delta string) {
+	if tc == nil {
+		return
+	}
+	if strings.TrimSpace(delta) == "" {
+		return
+	}
+	tc.Arguments = delta
+}
+
+func (a *streamResponseAssembler) ensureToolCall(id string) *ToolCall {
+	tc, ok := a.toolCalls[id]
+	if ok {
+		return tc
+	}
+	tc = &ToolCall{ID: id}
+	a.toolCalls[id] = tc
+	a.toolCallOrder = append(a.toolCallOrder, id)
+	return tc
+}
+
+func (a *streamResponseAssembler) orderedToolCalls() []ToolCall {
+	result := make([]ToolCall, 0, len(a.toolCallOrder))
+	for _, id := range a.toolCallOrder {
+		if tc, ok := a.toolCalls[id]; ok {
+			result = append(result, *tc)
+		}
+	}
+	return result
+}
+
+type openAIResponseEventStream interface {
+	Next() bool
+	Current() responses.ResponseStreamEventUnion
+	Err() error
+	Close() error
+}
+
+type openAIResponseStreamRunner struct {
+	provider *OpenAIProvider
+	observer *requestObserver
+	handler  StreamHandler
+	stream   openAIResponseEventStream
+
+	chunkIndex int
+	finalIndex int
+
+	toolCallBuilders map[string]*streamToolCallState
+	toolCallStarted  map[string]bool
+	toolCallEnded    map[string]bool
+
+	completion            *responses.Response
+	responseStopReason    StopReason
+	responseUsage         Usage
+	preserveUsageOnErrors bool
+	eventHandlers         []func(any) error
+}
+
+func newOpenAIResponseStreamRunner(
+	provider *OpenAIProvider,
+	ctx context.Context,
+	req *Request,
+	handler StreamHandler,
+) *openAIResponseStreamRunner {
+	observer := newRequestObserver()
+	params := provider.buildResponseParams(req)
+	stream := provider.getClient().Responses.NewStreaming(ctx, params, observer.options()...)
+	runner := &openAIResponseStreamRunner{
+		provider:           provider,
+		observer:           observer,
+		handler:            handler,
+		stream:             stream,
+		toolCallBuilders:   make(map[string]*streamToolCallState),
+		toolCallStarted:    make(map[string]bool),
+		toolCallEnded:      make(map[string]bool),
+		responseStopReason: StopReasonEndTurn,
+	}
+	runner.eventHandlers = []func(any) error{
+		runner.handleTextDeltaEvent,
+		runner.handleFunctionCallArgumentsDeltaEvent,
+		runner.handleFunctionCallArgumentsDoneEvent,
+		runner.handleOutputItemAddedEvent,
+		runner.handleOutputItemDoneEvent,
+		runner.handleCompletedEvent,
+		runner.handleFailedEvent,
+		runner.handleIncompleteEvent,
+		runner.handleResponseErrorEvent,
+	}
+	return runner
+}
+
+func (r *openAIResponseStreamRunner) run() (*responses.Response, StopReason, Usage, map[string]any, error) {
+	defer r.closeStream()
+	if err := r.emitStartChunk(); err != nil {
+		return r.zeroUsageFailure(err)
+	}
+	if err := r.consume(); err != nil {
+		return r.consumeFailure(err)
+	}
+	if err := r.finish(); err != nil {
+		return r.zeroUsageFailure(err)
+	}
+	return r.success()
+}
+
+func (r *openAIResponseStreamRunner) closeStream() {
+	if r.stream != nil {
+		_ = r.stream.Close()
+	}
+}
+
+func (r *openAIResponseStreamRunner) emitStartChunk() error {
+	return r.emitChunk(&StreamChunk{
+		Index:     r.chunkIndex,
+		Type:      ChunkTypeStart,
+		Timestamp: time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) consume() error {
+	if r.stream == nil {
+		return fmt.Errorf("openai stream is nil")
+	}
+	for r.stream.Next() {
+		r.chunkIndex++
+		if err := r.processEvent(r.stream.Current().AsAny()); err != nil {
+			return err
+		}
+	}
+	return r.consumeStreamError()
+}
+
+func (r *openAIResponseStreamRunner) processEvent(event any) error {
+	for _, handler := range r.eventHandlers {
+		if err := handler(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *openAIResponseStreamRunner) consumeStreamError() error {
+	if r.stream == nil {
+		return nil
+	}
+	err := r.stream.Err()
+	if err == nil {
+		return nil
+	}
+	r.emitBestEffortErrorChunk(r.chunkIndex+1, err.Error())
+	return fmt.Errorf("openai stream: %w", err)
+}
+
+func (r *openAIResponseStreamRunner) emitBestEffortErrorChunk(index int, message string) {
+	_ = r.emitChunk(&StreamChunk{
+		Index:     index,
+		Type:      ChunkTypeError,
+		Text:      message,
+		Timestamp: time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) finish() error {
+	if err := r.emitPendingToolEnds(); err != nil {
+		return err
+	}
+	return r.emitEndChunk()
+}
+
+func (r *openAIResponseStreamRunner) emitPendingToolEnds() error {
+	pending := r.pendingToolCalls()
+	r.finalIndex = r.chunkIndex
+	for _, call := range pending {
+		r.finalIndex++
+		if err := r.emitToolEnd(r.finalIndex, call); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *openAIResponseStreamRunner) pendingToolCalls() []*streamToolCallState {
+	pending := make([]*streamToolCallState, 0, len(r.toolCallBuilders))
+	for _, toolCall := range r.toolCallBuilders {
+		if r.shouldEmitToolEnd(toolCall) {
+			pending = append(pending, toolCall)
+		}
+	}
+	sortStreamToolCalls(pending)
+	return pending
+}
+
+func sortStreamToolCalls(calls []*streamToolCallState) {
+	sort.SliceStable(calls, func(i, j int) bool {
+		if calls[i].OutputIndex != calls[j].OutputIndex {
+			return calls[i].OutputIndex < calls[j].OutputIndex
+		}
+		return calls[i].ID < calls[j].ID
+	})
+}
+
+func (r *openAIResponseStreamRunner) emitEndChunk() error {
+	return r.emitChunk(&StreamChunk{
+		Index:      r.finalIndex + 1,
+		Type:       ChunkTypeEnd,
+		StopReason: r.responseStopReason,
+		Usage:      &r.responseUsage,
+		Timestamp:  time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) success() (*responses.Response, StopReason, Usage, map[string]any, error) {
+	return r.completion, r.responseStopReason, r.responseUsage, r.observer.metadata(), nil
+}
+
+func (r *openAIResponseStreamRunner) zeroUsageFailure(err error) (*responses.Response, StopReason, Usage, map[string]any, error) {
+	return nil, StopReasonError, Usage{}, r.observer.metadata(), err
+}
+
+func (r *openAIResponseStreamRunner) consumeFailure(err error) (*responses.Response, StopReason, Usage, map[string]any, error) {
+	if r.preserveUsageOnErrors {
+		return nil, StopReasonError, r.responseUsage, r.observer.metadata(), err
+	}
+	return nil, StopReasonError, Usage{}, r.observer.metadata(), err
+}
+
+func (r *openAIResponseStreamRunner) emitChunk(chunk *StreamChunk) error {
+	if r.handler == nil {
+		return nil
+	}
+	return r.handler(chunk)
+}
+
+func (r *openAIResponseStreamRunner) handleTextDeltaEvent(event any) error {
+	ev, ok := event.(responses.ResponseTextDeltaEvent)
+	if !ok {
+		return nil
+	}
+	if ev.Delta == "" {
+		return nil
+	}
+	return r.emitChunk(&StreamChunk{
+		Index:     r.chunkIndex,
+		Type:      ChunkTypeText,
+		Text:      ev.Delta,
+		Timestamp: time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) handleFunctionCallArgumentsDeltaEvent(event any) error {
+	ev, ok := event.(responses.ResponseFunctionCallArgumentsDeltaEvent)
+	if !ok {
+		return nil
+	}
+	toolCall := r.ensureToolCallState(ev.ItemID, ev.OutputIndex)
+	if err := r.emitToolStart(r.chunkIndex, toolCall); err != nil {
+		return err
+	}
+	if ev.Delta == "" {
+		return nil
+	}
+	return r.emitChunk(&StreamChunk{
+		Index: r.chunkIndex,
+		Type:  ChunkTypeToolDelta,
+		ToolCall: &ToolCallChunk{
+			ID:             ev.ItemID,
+			ArgumentsDelta: ev.Delta,
+		},
+		Timestamp: time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) handleFunctionCallArgumentsDoneEvent(event any) error {
+	ev, ok := event.(responses.ResponseFunctionCallArgumentsDoneEvent)
+	if !ok {
+		return nil
+	}
+	toolCall := r.ensureToolCallState(ev.ItemID, ev.OutputIndex)
+	if err := r.emitToolStart(r.chunkIndex, toolCall); err != nil {
+		return err
+	}
+	applyToolCallArguments(toolCall, ev.Arguments)
+	return nil
+}
+
+func (r *openAIResponseStreamRunner) handleOutputItemAddedEvent(event any) error {
+	ev, ok := event.(responses.ResponseOutputItemAddedEvent)
+	if !ok {
+		return nil
+	}
+	if !isFunctionCallOutputItem(ev.Item.Type) {
+		return nil
+	}
+	toolCall := r.ensureToolCallState(ev.Item.ID, ev.OutputIndex)
+	applyToolCallNameChunk(toolCall, ev.Item.Name)
+	return r.emitToolStart(r.chunkIndex, toolCall)
+}
+
+func (r *openAIResponseStreamRunner) handleOutputItemDoneEvent(event any) error {
+	ev, ok := event.(responses.ResponseOutputItemDoneEvent)
+	if !ok {
+		return nil
+	}
+	if !isFunctionCallOutputItem(ev.Item.Type) {
+		return nil
+	}
+	toolCall := r.ensureToolCallState(ev.Item.ID, ev.OutputIndex)
+	applyToolCallNameChunk(toolCall, ev.Item.Name)
+	applyToolCallArguments(toolCall, ev.Item.Arguments)
+	return r.emitToolEnd(r.chunkIndex, toolCall)
+}
+
+func (r *openAIResponseStreamRunner) handleCompletedEvent(event any) error {
+	ev, ok := event.(responses.ResponseCompletedEvent)
+	if !ok {
+		return nil
+	}
+	r.completion = &ev.Response
+	r.responseUsage = r.provider.convertResponseUsage(ev.Response)
+	r.responseStopReason = r.provider.convertResponseStopReason(ev.Response)
+	return nil
+}
+
+func (r *openAIResponseStreamRunner) handleFailedEvent(event any) error {
+	ev, ok := event.(responses.ResponseFailedEvent)
+	if !ok {
+		return nil
+	}
+	r.completion = &ev.Response
+	r.responseUsage = r.provider.convertResponseUsage(ev.Response)
+	r.responseStopReason = StopReasonError
+	return nil
+}
+
+func (r *openAIResponseStreamRunner) handleIncompleteEvent(event any) error {
+	ev, ok := event.(responses.ResponseIncompleteEvent)
+	if !ok {
+		return nil
+	}
+	r.completion = &ev.Response
+	r.responseUsage = r.provider.convertResponseUsage(ev.Response)
+	r.responseStopReason = r.provider.convertIncompleteReason(ev.Response.IncompleteDetails.Reason)
+	return nil
+}
+
+func (r *openAIResponseStreamRunner) handleResponseErrorEvent(event any) error {
+	ev, ok := event.(responses.ResponseErrorEvent)
+	if !ok {
+		return nil
+	}
+	if err := r.emitChunk(&StreamChunk{
+		Index:     r.chunkIndex,
+		Type:      ChunkTypeError,
+		Text:      ev.Message,
+		Timestamp: time.Now(),
+	}); err != nil {
+		return err
+	}
+	r.preserveUsageOnErrors = true
+	return fmt.Errorf("openai stream: %s", ev.Message)
+}
+
+func isFunctionCallOutputItem(itemType string) bool {
+	return itemType == "function_call"
+}
+
+func (r *openAIResponseStreamRunner) ensureToolCallState(id string, outputIndex int64) *streamToolCallState {
+	toolCall := r.toolCallBuilders[id]
+	if toolCall == nil {
+		toolCall = &streamToolCallState{
+			ToolCallChunk: ToolCallChunk{ID: id},
+		}
+		r.toolCallBuilders[id] = toolCall
+	}
+	toolCall.OutputIndex = outputIndex
+	return toolCall
+}
+
+func (r *openAIResponseStreamRunner) emitToolStart(index int, call *streamToolCallState) error {
+	if !r.shouldEmitToolStart(call) {
+		return nil
+	}
+	r.toolCallStarted[call.ID] = true
+	toolCopy := call.ToolCallChunk
+	return r.emitChunk(&StreamChunk{
+		Index:     index,
+		Type:      ChunkTypeToolStart,
+		ToolCall:  &toolCopy,
+		Timestamp: time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) shouldEmitToolStart(call *streamToolCallState) bool {
+	if call == nil {
+		return false
+	}
+	if call.ID == "" {
+		return false
+	}
+	return !r.toolCallStarted[call.ID]
+}
+
+func (r *openAIResponseStreamRunner) emitToolEnd(index int, call *streamToolCallState) error {
+	if !r.shouldEmitToolEnd(call) {
+		return nil
+	}
+	r.toolCallEnded[call.ID] = true
+	toolCopy := call.ToolCallChunk
+	return r.emitChunk(&StreamChunk{
+		Index:     index,
+		Type:      ChunkTypeToolEnd,
+		ToolCall:  &toolCopy,
+		Timestamp: time.Now(),
+	})
+}
+
+func (r *openAIResponseStreamRunner) shouldEmitToolEnd(call *streamToolCallState) bool {
+	if call == nil {
+		return false
+	}
+	if call.ID == "" {
+		return false
+	}
+	return !r.toolCallEnded[call.ID]
+}
+
+func applyToolCallNameChunk(call *streamToolCallState, name string) {
+	if call == nil {
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		return
+	}
+	call.Name = name
+}
+
+func applyToolCallArguments(call *streamToolCallState, arguments string) {
+	if call == nil {
+		return
+	}
+	if strings.TrimSpace(arguments) == "" {
+		return
+	}
+	call.ArgumentsDelta = arguments
 }
 
 func (p *OpenAIProvider) runResponseStream(
 	ctx context.Context,
 	req *Request,
 	handler StreamHandler,
-) (*responses.Response, StopReason, Usage, error) {
-	params := p.buildResponseParams(req)
-	stream := p.client.Responses.NewStreaming(ctx, params)
-	if stream != nil {
-		defer stream.Close()
-	}
-
-	chunkIndex := 0
-	emit := func(chunk *StreamChunk) error {
-		if handler == nil {
-			return nil
-		}
-		return handler(chunk)
-	}
-
-	if err := emit(&StreamChunk{
-		Index:     chunkIndex,
-		Type:      ChunkTypeStart,
-		Timestamp: time.Now(),
-	}); err != nil {
-		return nil, StopReasonError, Usage{}, err
-	}
-
-	var toolCallBuilders = make(map[string]*ToolCallChunk)
-	toolCallStarted := make(map[string]bool)
-	toolCallEnded := make(map[string]bool)
-	var responseStopReason StopReason
-	var responseUsage Usage
-	var completion *responses.Response
-
-	emitToolStart := func(index int, call *ToolCallChunk) error {
-		if call == nil || call.ID == "" || toolCallStarted[call.ID] {
-			return nil
-		}
-		toolCallStarted[call.ID] = true
-		toolCopy := *call
-		return emit(&StreamChunk{
-			Index:     index,
-			Type:      ChunkTypeToolStart,
-			ToolCall:  &toolCopy,
-			Timestamp: time.Now(),
-		})
-	}
-	emitToolEnd := func(index int, call *ToolCallChunk) error {
-		if call == nil || call.ID == "" || toolCallEnded[call.ID] {
-			return nil
-		}
-		toolCallEnded[call.ID] = true
-		toolCopy := *call
-		return emit(&StreamChunk{
-			Index:     index,
-			Type:      ChunkTypeToolEnd,
-			ToolCall:  &toolCopy,
-			Timestamp: time.Now(),
-		})
-	}
-
-	for stream.Next() {
-		event := stream.Current()
-		chunkIndex++
-
-		switch ev := event.AsAny().(type) {
-		case responses.ResponseTextDeltaEvent:
-			if ev.Delta == "" {
-				continue
-			}
-			if err := emit(&StreamChunk{
-				Index:     chunkIndex,
-				Type:      ChunkTypeText,
-				Text:      ev.Delta,
-				Timestamp: time.Now(),
-			}); err != nil {
-				return nil, StopReasonError, Usage{}, err
-			}
-
-		case responses.ResponseFunctionCallArgumentsDeltaEvent:
-			toolCall := toolCallBuilders[ev.ItemID]
-			if toolCall == nil {
-				toolCall = &ToolCallChunk{ID: ev.ItemID}
-				toolCallBuilders[ev.ItemID] = toolCall
-				if err := emitToolStart(chunkIndex, toolCall); err != nil {
-					return nil, StopReasonError, Usage{}, err
-				}
-			}
-			if ev.Delta != "" {
-				if err := emit(&StreamChunk{
-					Index: chunkIndex,
-					Type:  ChunkTypeToolDelta,
-					ToolCall: &ToolCallChunk{
-						ID:             ev.ItemID,
-						ArgumentsDelta: ev.Delta,
-					},
-					Timestamp: time.Now(),
-				}); err != nil {
-					return nil, StopReasonError, Usage{}, err
-				}
-			}
-
-		case responses.ResponseFunctionCallArgumentsDoneEvent:
-			toolCall := toolCallBuilders[ev.ItemID]
-			if toolCall == nil {
-				toolCall = &ToolCallChunk{ID: ev.ItemID}
-				toolCallBuilders[ev.ItemID] = toolCall
-				if err := emitToolStart(chunkIndex, toolCall); err != nil {
-					return nil, StopReasonError, Usage{}, err
-				}
-			}
-			if ev.Arguments != "" {
-				toolCall.ArgumentsDelta = ev.Arguments
-			}
-
-		case responses.ResponseOutputItemAddedEvent:
-			if ev.Item.Type != "function_call" {
-				continue
-			}
-			toolCall := toolCallBuilders[ev.Item.ID]
-			if toolCall == nil {
-				toolCall = &ToolCallChunk{ID: ev.Item.ID}
-				toolCallBuilders[ev.Item.ID] = toolCall
-			}
-			if ev.Item.Name != "" {
-				toolCall.Name = ev.Item.Name
-			}
-			if err := emitToolStart(chunkIndex, toolCall); err != nil {
-				return nil, StopReasonError, Usage{}, err
-			}
-
-		case responses.ResponseOutputItemDoneEvent:
-			if ev.Item.Type != "function_call" {
-				continue
-			}
-			toolCall := toolCallBuilders[ev.Item.ID]
-			if toolCall == nil {
-				toolCall = &ToolCallChunk{ID: ev.Item.ID}
-				toolCallBuilders[ev.Item.ID] = toolCall
-			}
-			if ev.Item.Name != "" {
-				toolCall.Name = ev.Item.Name
-			}
-			if ev.Item.Arguments != "" {
-				toolCall.ArgumentsDelta = ev.Item.Arguments
-			}
-			if err := emitToolEnd(chunkIndex, toolCall); err != nil {
-				return nil, StopReasonError, Usage{}, err
-			}
-
-		case responses.ResponseCompletedEvent:
-			completion = &ev.Response
-			responseUsage = p.convertResponseUsage(ev.Response)
-			responseStopReason = p.convertResponseStopReason(ev.Response)
-
-		case responses.ResponseFailedEvent:
-			completion = &ev.Response
-			responseUsage = p.convertResponseUsage(ev.Response)
-			responseStopReason = StopReasonError
-
-		case responses.ResponseIncompleteEvent:
-			completion = &ev.Response
-			responseUsage = p.convertResponseUsage(ev.Response)
-			responseStopReason = p.convertIncompleteReason(ev.Response.IncompleteDetails.Reason)
-
-		case responses.ResponseErrorEvent:
-			if err := emit(&StreamChunk{
-				Index:     chunkIndex,
-				Type:      ChunkTypeError,
-				Text:      ev.Message,
-				Timestamp: time.Now(),
-			}); err != nil {
-				return nil, StopReasonError, Usage{}, err
-			}
-			return nil, StopReasonError, responseUsage, fmt.Errorf("openai stream: %s", ev.Message)
-		}
-	}
-
-	if err := stream.Err(); err != nil {
-		_ = emit(&StreamChunk{
-			Index:     chunkIndex + 1,
-			Type:      ChunkTypeError,
-			Text:      err.Error(),
-			Timestamp: time.Now(),
-		})
-		return nil, StopReasonError, responseUsage, fmt.Errorf("openai stream: %w", err)
-	}
-
-	if responseStopReason == "" {
-		responseStopReason = StopReasonEndTurn
-	}
-
-	finalIndex := chunkIndex
-	for _, toolCall := range toolCallBuilders {
-		if toolCall == nil {
-			continue
-		}
-		finalIndex++
-		if err := emitToolEnd(finalIndex, toolCall); err != nil {
-			return nil, StopReasonError, Usage{}, err
-		}
-	}
-
-	if err := emit(&StreamChunk{
-		Index:      finalIndex + 1,
-		Type:       ChunkTypeEnd,
-		StopReason: responseStopReason,
-		Usage:      &responseUsage,
-		Timestamp:  time.Now(),
-	}); err != nil {
-		return nil, StopReasonError, Usage{}, err
-	}
-
-	return completion, responseStopReason, responseUsage, nil
+) (*responses.Response, StopReason, Usage, map[string]any, error) {
+	runner := newOpenAIResponseStreamRunner(p, ctx, req, handler)
+	return runner.run()
 }
 
 func (p *OpenAIProvider) Stream(ctx context.Context, req *Request) (<-chan *StreamChunk, error) {
@@ -610,96 +1469,158 @@ func (p *OpenAIProvider) HealthCheck(ctx context.Context) error {
 
 // buildParams constructs OpenAI API parameters from a Request
 func (p *OpenAIProvider) buildResponseParams(req *Request) responses.ResponseNewParams {
-	if req == nil {
-		req = &Request{}
-	}
-
-	model := normalizeOpenAIModel(req.Model)
-	if model == "" {
-		model = normalizeOpenAIModel(p.config.Model)
-	}
-
-	maxTokens := req.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = p.config.MaxTokens
-	}
-
-	systemPrompt := strings.TrimSpace(req.SystemPrompt)
-	if systemPrompt == "" {
-		systemPrompt = strings.TrimSpace(p.config.SystemPrompt)
-	}
-
-	messages := p.convertResponseMessages(req.Messages, systemPrompt)
-
+	req = ensureProviderRequest(req)
+	model := p.resolveRequestModel(req)
+	systemPrompt := p.resolveSystemPrompt(req)
 	params := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(model),
 		Input: responses.ResponseNewParamsInputUnion{
-			OfInputItemList: messages,
+			OfInputItemList: p.convertResponseMessages(req.Messages, systemPrompt),
 		},
 	}
-	if p.config.AuthMode != openAIAuthModeChatGPT {
-		params.MaxOutputTokens = openai.Int(int64(maxTokens))
-	}
+	p.applyMaxOutputTokens(&params, req)
+	p.applyChatGPTResponseOptions(&params, systemPrompt)
+	p.applyTemperature(&params, req, model)
+	p.applyTopP(&params, req)
+	p.applyReasoningEffort(&params, p.resolveReasoningEffort(req))
+	p.applyTools(&params, req.Tools)
+	return params
+}
 
+func ensureProviderRequest(req *Request) *Request {
+	if req != nil {
+		return req
+	}
+	return &Request{}
+}
+
+func (p *OpenAIProvider) resolveRequestModel(req *Request) string {
+	model := normalizeOpenAIModel(req.Model)
+	if model != "" {
+		return model
+	}
+	return normalizeOpenAIModel(p.config.Model)
+}
+
+func (p *OpenAIProvider) resolveSystemPrompt(req *Request) string {
+	systemPrompt := strings.TrimSpace(req.SystemPrompt)
+	if systemPrompt != "" {
+		return systemPrompt
+	}
+	return strings.TrimSpace(p.config.SystemPrompt)
+}
+
+func (p *OpenAIProvider) resolveMaxTokens(req *Request) int {
+	if req.MaxTokens > 0 {
+		return req.MaxTokens
+	}
+	return p.config.MaxTokens
+}
+
+func (p *OpenAIProvider) resolveReasoningEffort(req *Request) string {
+	if req.ReasoningEffort != "" {
+		return req.ReasoningEffort
+	}
+	return p.config.ReasoningEffort
+}
+
+func (p *OpenAIProvider) applyMaxOutputTokens(params *responses.ResponseNewParams, req *Request) {
 	if p.config.AuthMode == openAIAuthModeChatGPT {
-		instructions := systemPrompt
-		if instructions == "" {
-			instructions = "You are Codex, an AI coding agent."
-		}
-		params.Instructions = openai.String(instructions)
-		params.Store = openai.Bool(false)
+		return
 	}
+	params.MaxOutputTokens = openai.Int(int64(p.resolveMaxTokens(req)))
+}
 
+func (p *OpenAIProvider) applyChatGPTResponseOptions(params *responses.ResponseNewParams, systemPrompt string) {
+	if p.config.AuthMode != openAIAuthModeChatGPT {
+		return
+	}
+	params.Instructions = openai.String(chatGPTInstructions(systemPrompt))
+	params.Store = openai.Bool(false)
+}
+
+func chatGPTInstructions(systemPrompt string) string {
+	if systemPrompt != "" {
+		return systemPrompt
+	}
+	return "You are Codex, an AI coding agent."
+}
+
+func (p *OpenAIProvider) applyTemperature(params *responses.ResponseNewParams, req *Request, model string) {
 	if req.Temperature != nil {
 		params.Temperature = openai.Float(*req.Temperature)
-	} else if p.config.Temperature > 0 && modelSupportsTemperature(model) {
-		params.Temperature = openai.Float(p.config.Temperature)
+		return
 	}
-
-	if req.TopP != nil {
-		params.TopP = openai.Float(*req.TopP)
+	if !p.shouldApplyDefaultTemperature(model) {
+		return
 	}
+	params.Temperature = openai.Float(p.config.Temperature)
+}
 
-	reasoningEffort := req.ReasoningEffort
+func (p *OpenAIProvider) shouldApplyDefaultTemperature(model string) bool {
+	if p.config.Temperature <= 0 {
+		return false
+	}
+	return modelSupportsTemperature(model)
+}
+
+func (p *OpenAIProvider) applyTopP(params *responses.ResponseNewParams, req *Request) {
+	if req.TopP == nil {
+		return
+	}
+	params.TopP = openai.Float(*req.TopP)
+}
+
+func (p *OpenAIProvider) applyReasoningEffort(params *responses.ResponseNewParams, reasoningEffort string) {
 	if reasoningEffort == "" {
-		reasoningEffort = p.config.ReasoningEffort
+		return
 	}
+	params.Reasoning = shared.ReasoningParam{}
 	if reasoningEffort == "xhigh" {
-		params.Reasoning = shared.ReasoningParam{}
 		params.Reasoning.SetExtraFields(map[string]any{"effort": "xhigh"})
-	} else if reasoningEffort != "" {
-		params.Reasoning = shared.ReasoningParam{}
-		params.Reasoning.Effort = shared.ReasoningEffort(reasoningEffort)
+		return
 	}
+	params.Reasoning.Effort = shared.ReasoningEffort(reasoningEffort)
+}
 
-	if len(req.Tools) > 0 {
-		params.Tools = p.convertResponseTools(req.Tools)
+func (p *OpenAIProvider) applyTools(params *responses.ResponseNewParams, tools []Tool) {
+	if len(tools) == 0 {
+		return
 	}
-
-	return params
+	params.Tools = p.convertResponseTools(tools)
 }
 
 func (p *OpenAIProvider) convertResponseMessages(messages []Message, systemPrompt string) responses.ResponseInputParam {
 	result := make(responses.ResponseInputParam, 0, len(messages)+1)
-
-	if systemPrompt != "" {
-		result = append(result, responses.ResponseInputItemParamOfMessage(systemPrompt, responses.EasyInputMessageRoleSystem))
-	}
-
+	appendSystemPromptMessage(&result, systemPrompt)
 	for _, msg := range messages {
-		switch msg.Role {
-		case RoleSystem:
-			result = append(result, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleSystem))
-		case RoleUser:
-			result = append(result, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleUser))
-		case RoleAssistant:
-			result = append(result, responses.ResponseInputItemParamOfMessage(msg.Content, responses.EasyInputMessageRoleAssistant))
-		case RoleTool:
-			result = append(result, responses.ResponseInputItemParamOfFunctionCallOutput(msg.ToolCallID, msg.Content))
-		}
+		appendConvertedMessage(&result, msg)
 	}
-
 	return result
+}
+
+func appendSystemPromptMessage(result *responses.ResponseInputParam, systemPrompt string) {
+	if strings.TrimSpace(systemPrompt) == "" {
+		return
+	}
+	*result = append(*result, responses.ResponseInputItemParamOfMessage(systemPrompt, responses.EasyInputMessageRoleSystem))
+}
+
+func appendConvertedMessage(result *responses.ResponseInputParam, msg Message) {
+	if msg.Role == RoleTool {
+		*result = append(*result, responses.ResponseInputItemParamOfFunctionCallOutput(msg.ToolCallID, msg.Content))
+		return
+	}
+	role, ok := openAIInputRole(msg.Role)
+	if !ok {
+		return
+	}
+	*result = append(*result, responses.ResponseInputItemParamOfMessage(msg.Content, role))
+}
+
+func openAIInputRole(role Role) (responses.EasyInputMessageRole, bool) {
+	mapped, ok := openAIRoleToInputRole[role]
+	return mapped, ok
 }
 
 func (p *OpenAIProvider) convertResponseTools(tools []Tool) []responses.ToolUnionParam {
@@ -727,7 +1648,9 @@ func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 		StopReason: p.convertResponseStopReason(*result),
 		Usage:      p.convertResponseUsage(*result),
 		ProviderMetadata: map[string]any{
-			"id": result.ID,
+			"id":           result.ID,
+			"status":       string(result.Status),
+			"service_tier": string(result.ServiceTier),
 		},
 	}
 
@@ -749,13 +1672,60 @@ func (p *OpenAIProvider) convertResponseUsage(result responses.Response) Usage {
 }
 
 func (p *OpenAIProvider) convertResponseStopReason(result responses.Response) StopReason {
-	if result.IncompleteDetails.Reason != "" {
-		return p.convertIncompleteReason(result.IncompleteDetails.Reason)
+	for _, reason := range candidateStopReasons(result, p) {
+		if reason != "" {
+			return reason
+		}
 	}
+	return StopReasonEndTurn
+}
+
+func candidateStopReasons(result responses.Response, provider *OpenAIProvider) []StopReason {
+	reasons := []StopReason{
+		stopReasonFromStatus(result),
+		stopReasonFromIncomplete(result, provider),
+		stopReasonFromError(result),
+		stopReasonFromToolCalls(result),
+	}
+	return reasons
+}
+
+func stopReasonFromStatus(result responses.Response) StopReason {
+	status := strings.ToLower(string(result.Status))
+	if status == "failed" || status == "cancelled" {
+		return StopReasonError
+	}
+	return ""
+}
+
+func stopReasonFromIncomplete(result responses.Response, provider *OpenAIProvider) StopReason {
+	if result.IncompleteDetails.Reason == "" {
+		return ""
+	}
+	return provider.convertIncompleteReason(result.IncompleteDetails.Reason)
+}
+
+func stopReasonFromError(result responses.Response) StopReason {
 	if result.Error.Message != "" {
 		return StopReasonError
 	}
-	return StopReasonEndTurn
+	return ""
+}
+
+func stopReasonFromToolCalls(result responses.Response) StopReason {
+	if hasFunctionToolCalls(result) {
+		return StopReasonToolUse
+	}
+	return ""
+}
+
+func hasFunctionToolCalls(result responses.Response) bool {
+	for _, item := range result.Output {
+		if item.Type == "function_call" {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *OpenAIProvider) convertIncompleteReason(reason string) StopReason {
@@ -806,33 +1776,49 @@ func (p *OpenAIProvider) selectFallbackModel(requestedModel string, err error) (
 	}
 	fallback := normalizeOpenAIModel(p.config.FallbackModel)
 	requestedModel = normalizeOpenAIModel(requestedModel)
-	if fallback == "" || fallback == requestedModel {
-		return "", false
-	}
-	if !p.SupportsModel(fallback) {
+	if !p.isUsableFallbackModel(fallback, requestedModel) {
 		return "", false
 	}
 	return fallback, true
 }
 
+func (p *OpenAIProvider) isUsableFallbackModel(fallback string, requestedModel string) bool {
+	if fallback == "" {
+		return false
+	}
+	if fallback == requestedModel {
+		return false
+	}
+	return p.SupportsModel(fallback)
+}
+
 func isOpenAIModelUnavailableError(err error) bool {
-	var apiErr *openai.Error
-	if !errors.As(err, &apiErr) {
+	apiErr, ok := asOpenAIError(err)
+	if !ok {
 		return false
 	}
 	if apiErr.Code == "model_not_found" {
 		return true
 	}
+	return isModelUnavailableByStatus(apiErr.StatusCode, strings.ToLower(apiErr.Message))
+}
 
-	msg := strings.ToLower(apiErr.Message)
-	switch apiErr.StatusCode {
+func isModelUnavailableByStatus(statusCode int, message string) bool {
+	switch statusCode {
 	case 404:
-		return strings.Contains(msg, "model")
+		return strings.Contains(message, "model")
 	case 403:
-		return strings.Contains(msg, "access") && strings.Contains(msg, "model")
+		return hasAccessAndModelTerms(message)
 	default:
 		return false
 	}
+}
+
+func hasAccessAndModelTerms(message string) bool {
+	if !strings.Contains(message, "access") {
+		return false
+	}
+	return strings.Contains(message, "model")
 }
 
 func ensureObjectType(params map[string]any) map[string]any {

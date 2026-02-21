@@ -91,6 +91,7 @@ type StreamCallback func(resp *StreamResponse) bool
 // TieredRouterConfig configures the agent router
 type TieredRouterConfig struct {
 	AgentID   string
+	AgentType string
 	AgentName string
 	Bus       EventBus
 
@@ -114,6 +115,10 @@ type TieredRouterConfig struct {
 func NewTieredRouter(cfg TieredRouterConfig) (*TieredRouter, error) {
 	if cfg.AgentID == "" {
 		return nil, fmt.Errorf("agent ID is required")
+	}
+	if cfg.AgentType == "" {
+		// Fallback to ID if type not explicitly provided
+		cfg.AgentType = cfg.AgentID
 	}
 	if cfg.Bus == nil {
 		return nil, fmt.Errorf("event bus is required")
@@ -167,7 +172,7 @@ func NewTieredRouter(cfg TieredRouterConfig) (*TieredRouter, error) {
 		agentID:          cfg.AgentID,
 		agentName:        agentName,
 		bus:              cfg.Bus,
-		channels:         NewAgentChannels(cfg.AgentID),
+		channels:         NewAgentChannels(cfg.AgentType, cfg.AgentID),
 		parser:           parser,
 		cache:            NewRouteCache(cacheConfig),
 		knownAgents:      NewAgentMap(DefaultShardCount),
@@ -922,7 +927,14 @@ func (r *TieredRouter) SendAck(fwd *ForwardedRequest) error {
 	msg := NewAckMessage(generateMessageID(), fwd.CorrelationID, r.agentID)
 
 	// Publish to source agent's response channel
-	sourceTopic := TopicResponses(fwd.SourceAgentID)
+	sourceType := fwd.SourceAgentID
+	if info, ok := r.knownAgents.Get(fwd.SourceAgentID); ok {
+		if info.AgentType != "" {
+			sourceType = info.AgentType
+		}
+	}
+
+	sourceTopic := TopicResponses(sourceType, fwd.SourceAgentID)
 	return r.bus.Publish(sourceTopic, msg)
 }
 
@@ -930,7 +942,14 @@ func (r *TieredRouter) SendAck(fwd *ForwardedRequest) error {
 func (r *TieredRouter) SendAckError(fwd *ForwardedRequest, reason string) error {
 	msg := NewAckErrorMessage(generateMessageID(), fwd.CorrelationID, r.agentID, reason)
 
-	sourceTopic := TopicResponses(fwd.SourceAgentID)
+	sourceType := fwd.SourceAgentID
+	if info, ok := r.knownAgents.Get(fwd.SourceAgentID); ok {
+		if info.AgentType != "" {
+			sourceType = info.AgentType
+		}
+	}
+
+	sourceTopic := TopicResponses(sourceType, fwd.SourceAgentID)
 	return r.bus.Publish(sourceTopic, msg)
 }
 

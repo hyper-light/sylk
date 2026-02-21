@@ -10,6 +10,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// thinkingSummaryGlyph is the bullet used for the collapsed thinking line.
+const thinkingSummaryGlyph = "◉"
+
 // sourceIcon returns the icon glyph for a given ChatSource.
 func sourceIcon(source ChatSource) string {
 	icons := [...]string{
@@ -63,18 +66,45 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []Code
 	header := badge + " " + lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(timestamp)
 
 	bodyStyle := messageStyle(entry.Source, th)
+
+	// Phase 1: Thinking (streaming, no content yet).
+	if entry.Streaming && entry.Content == "" && entry.ThinkingText != "" {
+		color := th.Palette.Info
+		if entry.ThinkingColor != "" {
+			color = lipgloss.Color(entry.ThinkingColor)
+		}
+		spinnerStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
+		lines := make([]string, 0, 4)
+		lines = append(lines, header)
+		for _, sub := range strings.Split(entry.ThinkingText, "\n") {
+			lines = append(lines, wrapLine(sub, width, spinnerStyle)...)
+		}
+		lines = append(lines, "")
+		return lines, nil
+	}
+
+	// Phase 2: Collapsed summary (content arrived after thinking).
+	var summaryLines []string
+	if entry.ThinkingElapsed > 0 {
+		summaryStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted).Italic(true)
+		summaryText := fmt.Sprintf("%s thought for %.1fs", thinkingSummaryGlyph, entry.ThinkingElapsed.Seconds())
+		summaryLines = wrapLine(summaryText, width, summaryStyle)
+	}
+
 	contentLines, codeRegions := renderContent(entry.Content, width, bodyStyle, th)
 
-	// Pre-allocate: 1 header + content lines + 1 trailing spacer.
-	lines := make([]string, 0, 2+len(contentLines))
+	// Pre-allocate: 1 header + summary + content lines + 1 trailing spacer.
+	lines := make([]string, 0, 2+len(summaryLines)+len(contentLines))
 	lines = append(lines, header)
+	lines = append(lines, summaryLines...)
 	lines = append(lines, contentLines...)
 	lines = append(lines, "")
 
-	// Offset code region indices to account for the header line.
+	// Offset code region indices to account for the header + summary lines.
+	headerOffset := headerLines + len(summaryLines)
 	for i := range codeRegions {
-		codeRegions[i].Start += headerLines
-		codeRegions[i].End += headerLines
+		codeRegions[i].Start += headerOffset
+		codeRegions[i].End += headerOffset
 	}
 	return lines, codeRegions
 }

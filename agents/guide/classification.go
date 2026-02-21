@@ -309,6 +309,9 @@ func (c *Classifier) detectIntent(textLower string) (Intent, float64) {
 	if c.containsAny(textLower, []string{"check", "verify"}) {
 		return IntentCheck, 0.6
 	}
+	if c.containsAny(textLower, []string{"chat", "hello", "hi", "hey"}) {
+		return IntentChat, 0.6
+	}
 	return IntentUnknown, 0.0
 }
 
@@ -339,6 +342,9 @@ func (c *Classifier) detectDomain(textLower string) Domain {
 	}
 	if c.containsAny(textLower, []string{"test", "qa", "performance test"}) {
 		return DomainTesting
+	}
+	if c.containsAny(textLower, []string{"chat", "hello", "hi", "hey"}) {
+		return DomainGeneral
 	}
 	return DomainUnknown
 }
@@ -403,7 +409,8 @@ func (c *Classifier) baseClassificationResult(raw classifierRawResult) *Classifi
 		IsRetrospective: raw.IsRetrospective,
 		RejectionReason: raw.RejectionReason,
 		Intent:          Intent(raw.Intent),
-		Domain:          Domain(raw.Domain),
+		Domain:          Domain(raw.Domain).Canonical(),
+		TargetAgent:     TargetAgent(raw.TargetAgent),
 		Confidence:      raw.Confidence,
 		MultiIntent:     raw.MultiIntent,
 	}
@@ -437,7 +444,7 @@ func (c *Classifier) applyRawSubIntents(result *ClassificationResult, raw classi
 		result.SubResults = append(result.SubResults, &ClassificationResult{
 			IsRetrospective: raw.IsRetrospective,
 			Intent:          Intent(sub.Intent),
-			Domain:          Domain(sub.Domain),
+			Domain:          Domain(sub.Domain).Canonical(),
 			Confidence:      sub.Confidence,
 		})
 	}
@@ -513,7 +520,7 @@ func (cr *ClassificationResult) assignTargetRouting(result *RouteResult) {
 		result.TemporalFocus = TemporalPast
 		return
 	}
-	if cr.Domain == DomainSystem {
+	if cr.Domain == DomainSystem || cr.Domain == DomainGeneral {
 		result.TargetAgent = TargetGuide
 		result.TemporalFocus = TemporalPresent
 		return

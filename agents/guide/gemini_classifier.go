@@ -97,7 +97,7 @@ func (c *GeminiClassifier) Classify(ctx context.Context, input string) (*Classif
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("gemini classification request failed: %w", err)
+		return nil, formatGeminiError("gemini classification (model "+model+")", err)
 	}
 
 	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
@@ -128,12 +128,12 @@ func (c *GeminiClassifier) buildResponseSchema() *genai.Schema {
 			},
 			"intent": {
 				Type:        genai.TypeString,
-				Enum:        []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "help", "status", "unknown"},
+				Enum:        []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "help", "status", "chat", "unknown"},
 				Description: "The classified intent of the query",
 			},
 			"domain": {
 				Type:        genai.TypeString,
-				Enum:        []string{"local", "history", "research", "planning", "system", "compliance", "testing", "unknown"},
+				Enum:        []string{"local", "history", "research", "planning", "system", "compliance", "testing", "general", "unknown"},
 				Description: "The domain/category of the query",
 			},
 			"target_agent": {
@@ -193,9 +193,9 @@ func (c *GeminiClassifier) buildResponseSchema() *genai.Schema {
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
 						"is_retrospective": {Type: genai.TypeBoolean},
-						"intent":           {Type: genai.TypeString},
-						"domain":           {Type: genai.TypeString},
-						"target_agent":     {Type: genai.TypeString},
+						"intent":           {Type: genai.TypeString, Enum: []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "help", "status", "chat", "unknown"}},
+						"domain":           {Type: genai.TypeString, Enum: []string{"local", "history", "research", "planning", "system", "compliance", "testing", "general", "unknown"}},
+						"target_agent":     {Type: genai.TypeString, Enum: []string{"librarian", "engineer", "designer", "tester", "inspector", "archivalist", "academic", "orchestrator", "architect", "guide", "unknown"}},
 						"confidence":       {Type: genai.TypeNumber},
 					},
 					Required: []string{"is_retrospective", "intent", "domain", "target_agent", "confidence"},

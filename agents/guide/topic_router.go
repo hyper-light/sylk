@@ -420,8 +420,19 @@ func (r *TopicRouter) addActiveSubscriptions(node *trieNode, seen map[int64]*top
 const SessionTopicPrefix = "session"
 
 // BuildSessionTopic creates a session-scoped topic
-func BuildSessionTopic(sessionID, agentID string, channelType ChannelType) string {
-	return SessionTopicPrefix + "." + sessionID + "." + agentID + "." + string(channelType)
+func BuildSessionTopic(sessionID, agentType, agentID string, channelType ChannelType) string {
+	var prefix string
+	switch channelType {
+	case ChannelTypeRequests:
+		prefix = "request"
+	case ChannelTypeResponses:
+		prefix = "response"
+	case ChannelTypeErrors:
+		prefix = "error"
+	default:
+		prefix = string(channelType)
+	}
+	return SessionTopicPrefix + "." + sessionID + "." + prefix + "." + agentType + "." + agentID
 }
 
 // BuildSessionTopicPattern creates a wildcard pattern for session topics
@@ -429,13 +440,14 @@ func BuildSessionTopicPattern(pattern string) string {
 	return SessionTopicPrefix + "." + pattern
 }
 
-// ParseSessionTopic extracts components from a session-scoped topic
-func ParseSessionTopic(topic string) (sessionID, agentID, channel string, ok bool) {
+// ParseSessionTopic extracts components from a session-scoped topic.
+// Returns sessionID, agentType, agentID, channelType.
+func ParseSessionTopic(topic string) (sessionID, agentType, agentID, channel string, ok bool) {
 	segments := splitTopic(topic)
-	if len(segments) != 4 || segments[0] != SessionTopicPrefix {
-		return "", "", "", false
+	if len(segments) != 5 || segments[0] != SessionTopicPrefix {
+		return "", "", "", "", false
 	}
-	return segments[1], segments[2], segments[3], true
+	return segments[1], segments[3], segments[4], segments[2], true
 }
 
 // IsSessionTopic checks if a topic is session-scoped

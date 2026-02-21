@@ -108,6 +108,7 @@ const (
 	// Meta intents
 	IntentHelp    Intent = "help"    // Request help/guidance
 	IntentStatus  Intent = "status"  // Check system status
+	IntentChat    Intent = "chat"    // General conversation or unspecific requests
 	IntentUnknown Intent = "unknown" // Could not classify
 )
 
@@ -125,6 +126,7 @@ func AllIntents() []Intent {
 		IntentDesign,
 		IntentHelp,
 		IntentStatus,
+		IntentChat,
 	}
 }
 
@@ -163,6 +165,7 @@ const (
 	DomainSystem     Domain = "system"     // System status, health, orchestrator updates
 	DomainCompliance Domain = "compliance" // Compliance, completeness, checking requirements
 	DomainTesting    Domain = "testing"    // Testing, QA, failure modes
+	DomainGeneral    Domain = "general"    // Unspecific or conversational requests
 	DomainCode       Domain = "code"      // Source code reading, writing, refactoring
 	DomainFiles      Domain = "files"     // File system operations, file metadata
 	DomainDesign     Domain = "design"    // Architecture, system design, structural decisions
@@ -184,6 +187,7 @@ func AllDomains() []Domain {
 		DomainSystem,
 		DomainCompliance,
 		DomainTesting,
+		DomainGeneral,
 		DomainCode,
 		DomainFiles,
 		DomainDesign,
@@ -203,6 +207,27 @@ func (d Domain) IsHistoricalDomain() bool {
 		d == DomainFailures ||
 		d == DomainDecisions ||
 		d == DomainLearnings
+}
+
+// Canonical maps fine-grained sub-domains back to the seven canonical
+// domains defined in the guide_domain.md taxonomy:
+//
+//	local, history, research, planning, system, compliance, testing
+//
+// Sub-domains that are already canonical pass through unchanged.
+func (d Domain) Canonical() Domain {
+	switch d {
+	case DomainPatterns, DomainFailures, DomainDecisions, DomainLearnings, DomainIntents:
+		return DomainHistory
+	case DomainCode, DomainFiles:
+		return DomainLocal
+	case DomainTasks:
+		return DomainPlanning
+	case DomainDesign:
+		return DomainResearch
+	default:
+		return d
+	}
 }
 
 // =============================================================================
@@ -794,8 +819,8 @@ type RouterConfig struct {
 func DefaultRouterConfig() RouterConfig {
 	return RouterConfig{
 		Model:                 "gemini-3.1-pro-preview",
-		MaxTokens:             2048,
-		Temperature:           0.0,
+		MaxTokens:             65536,
+		Temperature:           1.0,
 		ThinkingLevel:         "HIGH",
 		ExecuteThreshold:      0.90,
 		LogThreshold:          0.75,

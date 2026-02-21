@@ -165,7 +165,7 @@ func (a *Academic) Start(bus guide.EventBus) error {
 	}
 
 	a.bus = bus
-	a.channels = guide.NewAgentChannels("academic")
+	a.channels = guide.NewAgentChannels("academic", "academic")
 
 	// Subscribe to own request channel (academic.requests)
 	var err error

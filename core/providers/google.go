@@ -4,17 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/llm"
+	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/skills"
 	"google.golang.org/genai"
 )
 
 // GoogleProvider implements Provider for Google's Gemini models
 type GoogleProvider struct {
-	client *genai.Client
-	config GoogleConfig
-	skills []skills.Skill
+	client      *genai.Client
+	config      GoogleConfig
+	skills      []skills.Skill
+	authService oauth.GoogleAuthService
+}
+
+type GoogleOAuthLoginSession struct {
+	Challenge *oauth.GoogleOAuthChallenge
+	Results   <-chan GoogleOAuthLoginResult
+	Cancel    context.CancelFunc
+}
+
+type GoogleOAuthLoginResult struct {
+	Auth *oauth.GoogleOAuthAuth
+	Err  error
 }
 
 type GoogleModel string
@@ -31,19 +49,188 @@ var googleModels = map[string]bool{
 
 // NewGoogleProvider creates a new Google provider with the given configuration
 func NewGoogleProvider(ctx context.Context, config GoogleConfig, skills ...skills.Skill) (*GoogleProvider, error) {
-	if config.Model == "" {
-		config.Model = DefaultGoogleConfig().Model
-	}
-	if config.MaxTokens == 0 {
-		config.MaxTokens = DefaultGoogleConfig().MaxTokens
-	}
+	return NewGoogleProviderWithAuthService(ctx, config, oauth.NewGoogleAuthService(oauth.GoogleAuthServiceConfig{}), skills...)
+}
 
+// NewGoogleProviderWithAuthService creates a provider using a custom Google OAuth service.
+func NewGoogleProviderWithAuthService(
+	ctx context.Context,
+	config GoogleConfig,
+	authService oauth.GoogleAuthService,
+	skills ...skills.Skill,
+) (*GoogleProvider, error) {
+	applyGoogleProviderDefaults(&config)
+	if err := hydrateGoogleConfig(ctx, &config, authService); err != nil {
+		return nil, err
+	}
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
+	clientConfig, err := buildGoogleClientConfig(config, authService)
+	if err != nil {
+		return nil, err
+	}
+	client, err := genai.NewClient(ctx, clientConfig)
+	if err != nil {
+		return nil, fmt.Errorf("google provider: failed to create client: %w", err)
+	}
 
+	return &GoogleProvider{
+		client:      client,
+		config:      config,
+		skills:      skills,
+		authService: authService,
+	}, nil
+}
+
+func (g *GoogleProvider) StartOAuthLogin(
+	ctx context.Context,
+	timeout time.Duration,
+) (*GoogleOAuthLoginSession, error) {
+	if g.authService == nil {
+		return nil, fmt.Errorf("google oauth auth service is not configured")
+	}
+	session, err := oauth.StartGoogleOAuthSession(ctx, g.authService, timeout)
+	if err != nil {
+		return nil, err
+	}
+	results := make(chan GoogleOAuthLoginResult, 1)
+	go forwardGoogleOAuthLoginResults(session.Results, results)
+	return &GoogleOAuthLoginSession{
+		Challenge: session.Challenge,
+		Results:   results,
+		Cancel:    session.Cancel,
+	}, nil
+}
+
+func forwardGoogleOAuthLoginResults(
+	source <-chan oauth.GoogleOAuthResult,
+	target chan<- GoogleOAuthLoginResult,
+) {
+	defer close(target)
+	for result := range source {
+		target <- GoogleOAuthLoginResult{
+			Auth: result.Auth,
+			Err:  result.Err,
+		}
+	}
+}
+
+func applyGoogleProviderDefaults(config *GoogleConfig) {
+	if config == nil {
+		return
+	}
+	defaults := DefaultGoogleConfig()
+	if strings.TrimSpace(config.Model) == "" {
+		config.Model = defaults.Model
+	}
+	if config.MaxTokens == 0 {
+		config.MaxTokens = defaults.MaxTokens
+	}
+	if strings.TrimSpace(config.AuthMode) == "" {
+		config.AuthMode = defaults.AuthMode
+	}
+	if strings.TrimSpace(config.Location) == "" {
+		config.Location = defaults.Location
+	}
+}
+
+func hydrateGoogleConfig(
+	ctx context.Context,
+	config *GoogleConfig,
+	authService oauth.GoogleAuthService,
+) error {
+	if config == nil {
+		return fmt.Errorf("google config is nil")
+	}
+	normalizeGoogleHydrationFields(config)
+	if config.AuthMode == GoogleAuthModeOAuth {
+		return hydrateGoogleOAuthConfig(ctx, config, authService)
+	}
+	return hydrateGoogleAPIKeyConfig(config)
+}
+
+func normalizeGoogleHydrationFields(config *GoogleConfig) {
+	config.APIKey = strings.TrimSpace(config.APIKey)
+	config.AuthMode = strings.TrimSpace(config.AuthMode)
+	config.ProjectID = strings.TrimSpace(config.ProjectID)
+	config.Location = strings.TrimSpace(config.Location)
+	if config.AuthMode == "" {
+		config.AuthMode = GoogleAuthModeAPIKey
+	}
+}
+
+func hydrateGoogleAPIKeyConfig(config *GoogleConfig) error {
+	if config == nil {
+		return nil
+	}
+	if config.APIKey != "" {
+		return nil
+	}
+	config.APIKey = resolveGoogleProviderAPIKey()
+	return nil
+}
+
+func resolveGoogleProviderAPIKey() string {
+	if key := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); key != "" {
+		return key
+	}
+	key, err := llm.ResolveAPIKey("google")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(key)
+}
+
+func hydrateGoogleOAuthConfig(
+	ctx context.Context,
+	config *GoogleConfig,
+	authService oauth.GoogleAuthService,
+) error {
+	if authService == nil {
+		return fmt.Errorf("google oauth auth service is not configured")
+	}
+	auth, err := authService.Resolve(ctx)
+	if err == nil {
+		applyResolvedGoogleOAuth(config, auth)
+		config.UseVertexAI = true
+		return nil
+	}
+	return fallbackGoogleOAuthToAPIKey(config, err)
+}
+
+func fallbackGoogleOAuthToAPIKey(config *GoogleConfig, resolveErr error) error {
+	if config == nil {
+		return fmt.Errorf("google config is nil")
+	}
+	if err := hydrateGoogleAPIKeyConfig(config); err != nil {
+		return err
+	}
+	if strings.TrimSpace(config.APIKey) == "" {
+		return fmt.Errorf("resolve google oauth: %w", resolveErr)
+	}
+	config.AuthMode = GoogleAuthModeAPIKey
+	config.UseVertexAI = false
+	return nil
+}
+
+func applyResolvedGoogleOAuth(config *GoogleConfig, auth *oauth.GoogleOAuthAuth) {
+	if config == nil || auth == nil {
+		return
+	}
+	if config.ProjectID == "" {
+		config.ProjectID = strings.TrimSpace(auth.ProjectID)
+	}
+	if config.Location == "" {
+		config.Location = strings.TrimSpace(auth.Location)
+	}
+}
+
+func buildGoogleClientConfig(
+	config GoogleConfig,
+	authService oauth.GoogleAuthService,
+) (*genai.ClientConfig, error) {
 	clientConfig := &genai.ClientConfig{}
-
 	if config.UseVertexAI {
 		clientConfig.Project = config.ProjectID
 		clientConfig.Location = config.Location
@@ -52,17 +239,41 @@ func NewGoogleProvider(ctx context.Context, config GoogleConfig, skills ...skill
 		clientConfig.APIKey = config.APIKey
 		clientConfig.Backend = genai.BackendGeminiAPI
 	}
-
-	client, err := genai.NewClient(ctx, clientConfig)
-	if err != nil {
-		return nil, fmt.Errorf("google provider: failed to create client: %w", err)
+	if config.AuthMode != GoogleAuthModeOAuth {
+		return clientConfig, nil
 	}
+	if authService == nil {
+		return nil, fmt.Errorf("google oauth auth service is not configured")
+	}
+	clientConfig.Backend = genai.BackendVertexAI
+	clientConfig.HTTPClient = oauth.NewGoogleOAuthHTTPClient(authService, newDefaultGoogleHTTPClient(config.Timeout))
+	return clientConfig, nil
+}
 
-	return &GoogleProvider{
-		client: client,
-		config: config,
-		skills: skills,
-	}, nil
+func newDefaultGoogleHTTPClient(timeout time.Duration) *http.Client {
+	resolved := resolveGoogleProviderTimeout(timeout)
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: resolved,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   resolved,
+	}
+}
+
+func resolveGoogleProviderTimeout(timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	return DefaultBaseConfig().Timeout
 }
 
 // Name returns the provider identifier

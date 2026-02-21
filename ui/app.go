@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -31,12 +32,11 @@ import (
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/committree"
 	"github.com/adalundhe/sylk/ui/component"
+	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/conflictview"
 	"github.com/adalundhe/sylk/ui/diffview"
-	"github.com/adalundhe/sylk/ui/compositor"
 	"github.com/adalundhe/sylk/ui/editor"
 	"github.com/adalundhe/sylk/ui/editor/mode"
-	"github.com/adalundhe/sylk/ui/mergediff"
 	"github.com/adalundhe/sylk/ui/editor/preview"
 	"github.com/adalundhe/sylk/ui/editor/register"
 	"github.com/adalundhe/sylk/ui/fieldmanual"
@@ -48,6 +48,7 @@ import (
 	knowledgepkg "github.com/adalundhe/sylk/ui/knowledge"
 	"github.com/adalundhe/sylk/ui/layout"
 	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
+	"github.com/adalundhe/sylk/ui/mergediff"
 	"github.com/adalundhe/sylk/ui/modal"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/pane"
@@ -119,6 +120,22 @@ const escDisambiguateTimeout = 50 * time.Millisecond
 
 // sourceAgentTUI identifies the TUI as the source agent for guide routing.
 const sourceAgentTUI = "tui"
+
+// guideAgent constants identify the guide activity stream in the agent panel.
+const (
+	guideAgentID   = "guide"
+	guideAgentName = "Guide"
+	guideAgentType = "guide"
+)
+
+// guideContext model for lightweight runtime context usage estimation.
+// We retain a high fraction of prior tokens to represent rolling context.
+const (
+	guideMaxContextTokens       = 2_000_000
+	guideContextRetention       = 0.92
+	guideRouteOverheadTokens    = 1200
+	guideResponseOverheadTokens = 120
+)
 
 // ---------------------------------------------------------------------------
 // Warp points
@@ -229,7 +246,13 @@ type Deps struct {
 	SessionManager *session.Manager
 	GuideBus       guide.EventBus
 	StreamManager  *guide.StreamManager
+	Guide          *guide.Guide
 	Scope          *concurrency.GoroutineScope
+
+	// SignalStop restores default signal handling and cancels the parent
+	// context. Called after the Bubble Tea program exits so that a second
+	// Ctrl+C immediately terminates the process during slow shutdown.
+	SignalStop func()
 }
 
 // ---------------------------------------------------------------------------
@@ -295,19 +318,19 @@ type AppModel struct {
 	clipboard register.ClipboardProvider
 
 	// State
-	chord             chordState
-	chordBlocked      bool             // Chord triggered in edit mode (display-only, no cycling).
-	lastToggleKey     string           // Last overlay toggle key (debounce guard).
-	lastToggleAt      time.Time        // When lastToggleKey was pressed.
-	leftRing          viewRing         // Left slot cycling ring (Session/FileTree).
-	rightRing         viewRing         // Right slot cycling ring (Chat/Code).
-	collapseHintShown    bool          // First-collapse flash shown once per session.
-	pendingUncommittedAll bool         // Alt+U pressed; next 'a' focuses [All].
-	scrollSpring      harmonica.Spring // Spring simulation for smooth scroll.
-	scroll            scrollState      // Current scroll animation state.
-	bounceSpring      harmonica.Spring // Underdamped spring for overscroll bounce.
-	bounce            bounceState      // Current bounce animation state.
-	swipe             swipeState       // Horizontal scroll accumulation for ring cycling.
+	chord                 chordState
+	chordBlocked          bool             // Chord triggered in edit mode (display-only, no cycling).
+	lastToggleKey         string           // Last overlay toggle key (debounce guard).
+	lastToggleAt          time.Time        // When lastToggleKey was pressed.
+	leftRing              viewRing         // Left slot cycling ring (Session/FileTree).
+	rightRing             viewRing         // Right slot cycling ring (Chat/Code).
+	collapseHintShown     bool             // First-collapse flash shown once per session.
+	pendingUncommittedAll bool             // Alt+U pressed; next 'a' focuses [All].
+	scrollSpring          harmonica.Spring // Spring simulation for smooth scroll.
+	scroll                scrollState      // Current scroll animation state.
+	bounceSpring          harmonica.Spring // Underdamped spring for overscroll bounce.
+	bounce                bounceState      // Current bounce animation state.
+	swipe                 swipeState       // Horizontal scroll accumulation for ring cycling.
 
 	// View mode state machine — exactly one of ViewChat/ViewEdit/ViewGit.
 	viewMode       ViewMode
@@ -430,12 +453,12 @@ type AppModel struct {
 	previewPanel *preview.Panel // Independent read-only preview sub-panel.
 
 	// Markdown preview (rendered markdown split-right of the source editor).
-	mdPreviewPane          pane.PaneID         // PaneID of the markdown viewer (0 = none).
-	mdPreviewPanel         *markdownpkg.Panel  // Rendered markdown viewer panel.
-	mdPreviewTabHoverClose int                 // Close hover on markdown preview tab (-1).
-	mdTooltipTab           int                 // Tab index showing "View" tooltip (-1 = none).
-	mdTooltipPane          pane.PaneID         // Pane whose tab shows the tooltip.
-	mdTooltipX             int                 // Local X of tooltip for overlay placement.
+	mdPreviewPane          pane.PaneID        // PaneID of the markdown viewer (0 = none).
+	mdPreviewPanel         *markdownpkg.Panel // Rendered markdown viewer panel.
+	mdPreviewTabHoverClose int                // Close hover on markdown preview tab (-1).
+	mdTooltipTab           int                // Tab index showing "View" tooltip (-1 = none).
+	mdTooltipPane          pane.PaneID        // Pane whose tab shows the tooltip.
+	mdTooltipX             int                // Local X of tooltip for overlay placement.
 
 	// Pane tree: binary split tree tracking editor + preview layout.
 	// Each editor pane has its own editor.Model and tab order.
@@ -486,6 +509,10 @@ type AppModel struct {
 	escKey     tea.KeyMsg
 	escAt      time.Time
 	escGen     uint64
+
+	// Guide context usage estimate for agent panel rendering.
+	guideContextTokens int
+	guideContextUsage  float64
 }
 
 // viewRing tracks a cycling list of panels for a swappable layout slot.
@@ -624,36 +651,36 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	th := cfg.Theme()
 
 	app := &AppModel{
-		ctx:                  appCtx,
-		cancel:               appCancel,
-		config:               cfg,
-		deps:                 deps,
-		layout:               layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
-		focus:                layout.NewFocusManager(defaultTabOrder),
-		chat:                 chat.New(th, cfg.ChatHistoryCapacity),
-		statusBar:            status.New(th, deps.SessionManager),
-		sessionPanel:         sessionpkg.New(deps.SessionManager, th),
-		agentPanel:           agentpkg.New(th),
-		codePanel:            codepkg.New(th),
-		knowledgePanel:       knowledgepkg.New(th),
-		fileTree:             filetree.New(th),
-		editorOverlay:        editor.New(th),
-		editorCache:          editor.NewEditorCache(editor.CacheConfig{}),
-		modalOverlay:         modal.New(th),
-		searchOverlay:        search.New(th, search.NewProviderRegistry()),
-		fieldManualOverlay:   fieldmanual.New(th),
-		activityBridge:       bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
-		sessionBridge:        bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
-		streamBridge:         bridge.NewStreamBridge(deps.Scope),
-		guideBridge:          bridge.NewGuideBridge(deps.GuideBus, deps.Scope),
-		lspManager:           lsp.NewManager(deps.Scope),
-		lspInstalling:        make(map[lsp.ServerID]bool),
-		interruptHandler:     interrupt.NewHandler(),
-		clipboard:            register.NewOSClipboard(),
-		scrollSpring:         harmonica.NewSpring(harmonica.FPS(scrollFPS), scrollFrequency, scrollDamping),
-		bounceSpring:         harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
-		hoverMouseLine:       -1,
-		highlightLine:        -1,
+		ctx:                    appCtx,
+		cancel:                 appCancel,
+		config:                 cfg,
+		deps:                   deps,
+		layout:                 layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
+		focus:                  layout.NewFocusManager(defaultTabOrder),
+		chat:                   chat.New(th, cfg.ChatHistoryCapacity),
+		statusBar:              status.New(th, deps.SessionManager),
+		sessionPanel:           sessionpkg.New(deps.SessionManager, th),
+		agentPanel:             agentpkg.New(th),
+		codePanel:              codepkg.New(th),
+		knowledgePanel:         knowledgepkg.New(th),
+		fileTree:               filetree.New(th),
+		editorOverlay:          editor.New(th),
+		editorCache:            editor.NewEditorCache(editor.CacheConfig{}),
+		modalOverlay:           modal.New(th),
+		searchOverlay:          search.New(th, search.NewProviderRegistry()),
+		fieldManualOverlay:     fieldmanual.New(th),
+		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
+		sessionBridge:          bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
+		streamBridge:           bridge.NewStreamBridge(deps.Scope),
+		guideBridge:            bridge.NewGuideBridge(deps.GuideBus, deps.Scope, "default"),
+		lspManager:             lsp.NewManager(deps.Scope),
+		lspInstalling:          make(map[lsp.ServerID]bool),
+		interruptHandler:       interrupt.NewHandlerWithThreshold(time.Duration(cfg.InterruptThresholdMs) * time.Millisecond),
+		clipboard:              register.NewOSClipboard(),
+		scrollSpring:           harmonica.NewSpring(harmonica.FPS(scrollFPS), scrollFrequency, scrollDamping),
+		bounceSpring:           harmonica.NewSpring(harmonica.FPS(scrollFPS), bounceFrequency, bounceDamping),
+		hoverMouseLine:         -1,
+		highlightLine:          -1,
 		tabDragIdx:             -1,
 		tabHoverClose:          -1,
 		previewTabHoverClose:   -1,
@@ -896,7 +923,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, exCmd
 		}
-		if m.viewMode == ViewEdit {
+		if m.viewMode == ViewEdit && isInlineExCommand(typed.Text) {
 			exCmd := m.handleExCommand(typed.Text)
 			if m.viewMode == ViewEdit {
 				m.focusCodePanel()
@@ -2080,11 +2107,20 @@ func (m *AppModel) Shutdown() error {
 	if m.gitBridge != nil {
 		m.gitBridge.Stop()
 	}
-	_ = m.lspManager.Shutdown()
-	if m.safetyGuard != nil {
-		_ = m.safetyGuard.Close()
+
+	var errs []error
+	if err := m.lspManager.Shutdown(); err != nil {
+		errs = append(errs, err)
 	}
-	return m.deps.Scope.Shutdown(shutdownGrace, shutdownHard)
+	if m.safetyGuard != nil {
+		if err := m.safetyGuard.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := m.deps.Scope.Shutdown(shutdownGrace, shutdownHard); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // PushModal adds a modal to the overlay stack and activates the modal overlay.
@@ -2710,13 +2746,31 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 	}
 	m.chat.PushEntry(entry)
 
+	// Push a system message before the thinking placeholder so it appears above the response.
+	sysEntry := &chat.ChatEntry{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Source:    chat.SourceSystem,
+		Content:   "Classifying and routing request",
+		Height:    -1,
+	}
+	m.chat.PushEntry(sysEntry)
+
+	// Push a thinking placeholder so the spinner appears immediately.
+	m.chat.BeginThinking(submit.TargetAgent)
+
 	// Route through Guide bus.
 	return m.publishRouteRequest(submit)
+}
+
+func isInlineExCommand(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), ":")
 }
 
 func (m *AppModel) handleInterrupt() tea.Cmd {
 	// First Ctrl+C: clear input or cancel active stream.
 	m.streamBridge.Stop()
+	m.statusBar.SetFlash("Press Ctrl+C again to quit")
 	return nil
 }
 
@@ -3771,15 +3825,26 @@ func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
 }
 
 func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
+	source := chat.SourceAgent
+	content := r.Content
+	if r.Err != nil {
+		source = chat.SourceError
+		content = r.Err.Error()
+	}
+	if strings.EqualFold(r.AgentID, guideAgentID) {
+		added := estimateGuideTokens(content) + guideResponseOverheadTokens
+		_ = m.bumpGuideContextUsage(added)
+	}
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
-		Source:    chat.SourceAgent,
+		Source:    source,
+		AgentType: r.AgentName,
 		AgentID:   r.AgentID,
-		Content:   r.Content,
+		Content:   content,
 		Height:    -1,
 	}
-	m.chat.PushEntry(entry)
+	m.chat.FinishThinking(entry)
 	return nil
 }
 
@@ -4345,13 +4410,10 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 			cmd = tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 		}
 	case ViewEdit:
-		m.viewMode = ViewEdit
 		if old == ViewGit && m.preGitEditMode {
 			m.preGitEditMode = false
-			cmd = m.enterEditMode()
-		} else if m.savedEditFocus != 0 {
-			m.focus.SetFocus(m.savedEditFocus)
 		}
+		cmd = m.enterEditMode()
 	default: // CHAT
 		if old == ViewGit && m.preGitEditMode {
 			m.preGitEditMode = false
@@ -4591,7 +4653,9 @@ type gitBranchDAGLoadedMsg struct {
 }
 
 type branchDeletedMsg struct{ name string }
-type branchStashesLoadedMsg struct{ stashes map[string][]git.BranchStashMeta }
+type branchStashesLoadedMsg struct {
+	stashes map[string][]git.BranchStashMeta
+}
 type branchDeleteFailedMsg struct{ reason string }
 type branchCreatedMsg struct{ name string }
 type branchCreateFailedMsg struct{ reason string }
@@ -10280,8 +10344,8 @@ var panelDisplayNames = map[component.FocusID]string{
 	component.FocusFileTree:     "Files",
 	component.FocusGitPanel:     "Git",
 	component.FocusCommitTree:   "Tree",
-	component.FocusDiffView:      "Diff",
-	component.FocusDiffFileList:  "Files",
+	component.FocusDiffView:     "Diff",
+	component.FocusDiffFileList: "Files",
 }
 
 // buildRingHint returns the formatted ring indicator string for the status bar.
@@ -11387,6 +11451,8 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 // ---------------------------------------------------------------------------
 
 func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
+	_ = m.bumpGuideContextUsage(estimateGuideTokens(submit.Text) + guideRouteOverheadTokens)
+
 	req := &guide.RouteRequest{
 		CorrelationID: uuid.New().String(),
 		Input:         submit.Text,
@@ -11394,6 +11460,16 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 		TargetAgentID: submit.TargetAgent,
 		SessionID:     submit.SessionID,
 		Timestamp:     time.Now(),
+	}
+
+	if !m.guideRequestAvailable() {
+		return func() tea.Msg {
+			return msg.StreamErrorMsg{
+				SessionID:     submit.SessionID,
+				CorrelationID: req.CorrelationID,
+				Err:           errors.New("guide is not running; start with --mock or connect a guide backend"),
+			}
+		}
 	}
 
 	busMsg := guide.NewRequestMessage("", req)
@@ -11409,6 +11485,62 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 		}
 		return nil
 	}
+}
+
+func (m *AppModel) bumpGuideContextUsage(addedTokens int) float64 {
+	retained := int(float64(m.guideContextTokens) * guideContextRetention)
+	tokens := retained + max(addedTokens, 0)
+	tokens = min(tokens, guideMaxContextTokens)
+	m.guideContextTokens = tokens
+	m.guideContextUsage = float64(tokens) / float64(guideMaxContextTokens)
+	return m.guideContextUsage
+}
+
+func estimateGuideTokens(text string) int {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0
+	}
+	chars := len([]rune(trimmed))
+	return max((chars+3)/4, 1)
+}
+
+func (m *AppModel) publishGuideActivity(
+	eventType events.EventType,
+	outcome events.EventOutcome,
+	content string,
+	contextUsage float64,
+) {
+	if m.deps.ActivityBus == nil {
+		return
+	}
+	event := &events.ActivityEvent{
+		ID:        uuid.New().String(),
+		EventType: eventType,
+		Timestamp: time.Now(),
+		AgentID:   guideAgentID,
+		Content:   content,
+		Outcome:   outcome,
+		Data: map[string]any{
+			"agent_type":    guideAgentType,
+			"agent_name":    guideAgentName,
+			"context_usage": contextUsage,
+		},
+	}
+	m.deps.ActivityBus.Publish(event)
+}
+
+func (m *AppModel) guideRequestAvailable() bool {
+	if m.deps.GuideBus == nil {
+		return false
+	}
+	if m.deps.Guide != nil {
+		return true
+	}
+	if channelBus, ok := m.deps.GuideBus.(*guide.ChannelBus); ok {
+		return channelBus.TopicSubscriberCount(guide.TopicGuideRequests) > 0
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -11704,17 +11836,19 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		return err
 	}
 
-	// In mock mode, seed data and start the mock agent.
+	// In mock mode, seed demo data only. Requests still route through the real Guide.
 	if cfg.MockMode {
 		seedMockData(deps)
-		mock := NewMockAgent(deps.GuideBus, deps.ActivityBus, adapter, deps.Scope)
-		if err := mock.Start(); err != nil {
-			return err
-		}
-		defer mock.Stop()
 	}
 
 	_, err := p.Run()
+
+	// Restore default signal handling so a second Ctrl+C during shutdown
+	// immediately terminates the process instead of being silently consumed.
+	if deps.SignalStop != nil {
+		deps.SignalStop()
+	}
+
 	if err != nil {
 		return err
 	}

@@ -6,3 +6,4 @@
 - `system`: Sylk system status, active sessions, agent health. (Primary: Orchestrator)
 - `compliance`: Meeting requirements, implementation completeness, matching user intent, code quality and implementation optimality (maximizing correctness, robustness, performance, fault tolerance, etc.). (Primary: Inspector)
 - `testing`: Testing, quality assurance, negative testing, exploring and checking failure modes, designing test scenarios, performance testing, race condition testing, edge case checking and testing.
+- `general`: Non-technical, non-work, non-research, or non-pipeline-status system related questions that would in NO WAY overlap with any other domain. (Primary: Guide)

@@ -2,8 +2,8 @@ package bridge
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/session"
@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	sessionBridgeName   = "bridge.session"
-	sessionBufferSize   = 256
-	sessionDrainTimeout = 30 * time.Second
+	sessionBridgeName = "bridge.session"
+	sessionBufferSize = 256
+	// Zero uses the scope's max lifetime; session bridge is long-lived for the UI session.
+	sessionDrainTimeout = 0
 )
 
 // SessionBridge subscribes to session.Manager lifecycle events and forwards
@@ -25,6 +26,7 @@ type SessionBridge struct {
 	dropped     atomic.Int64
 	done        chan struct{}
 	unsubscribe func()
+	stopOnce    sync.Once
 }
 
 // NewSessionBridge creates a bridge that converts session.Manager events
@@ -48,10 +50,12 @@ func (b *SessionBridge) Start(program TeaProgram) error {
 
 // Stop unsubscribes from the manager and signals the drain goroutine to exit.
 func (b *SessionBridge) Stop() {
-	if b.unsubscribe != nil {
-		b.unsubscribe()
-	}
-	close(b.done)
+	b.stopOnce.Do(func() {
+		if b.unsubscribe != nil {
+			b.unsubscribe()
+		}
+		close(b.done)
+	})
 }
 
 // Name returns the bridge identifier.
@@ -74,6 +78,9 @@ func (b *SessionBridge) enqueue(event *session.Event) {
 func (b *SessionBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 	return func(ctx context.Context) error {
 		for {
+			if stop, err := shouldStop(b.done, ctx); stop {
+				return err
+			}
 			select {
 			case event := <-b.buffer:
 				program.Send(msg.SessionEventMsg{Event: event})

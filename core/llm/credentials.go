@@ -48,16 +48,17 @@ func ResolveAPIKey(provider string) (string, error) {
 }
 
 func resolveFromEnv(provider string) string {
-	envKey, ok := providerEnvKeys[provider]
-	if !ok {
-		return ""
+	for _, envKey := range providerEnvCandidates(provider) {
+		if value := os.Getenv(envKey); value != "" {
+			return value
+		}
 	}
-	return os.Getenv(envKey)
+	return ""
 }
 
 func resolveFromDotEnv(provider string) string {
-	envKey, ok := providerEnvKeys[provider]
-	if !ok {
+	candidates := providerEnvCandidates(provider)
+	if len(candidates) == 0 {
 		return ""
 	}
 
@@ -72,11 +73,24 @@ func resolveFromDotEnv(provider string) string {
 	}
 
 	for _, path := range envPaths {
-		if value := parseEnvFile(path, envKey); value != "" {
-			return value
+		for _, envKey := range candidates {
+			if value := parseEnvFile(path, envKey); value != "" {
+				return value
+			}
 		}
 	}
 	return ""
+}
+
+func providerEnvCandidates(provider string) []string {
+	envKey, ok := providerEnvKeys[provider]
+	if !ok {
+		return nil
+	}
+	if provider == "google" {
+		return []string{envKey, "GEMINI_API_KEY"}
+	}
+	return []string{envKey}
 }
 
 func parseEnvFile(path, key string) string {

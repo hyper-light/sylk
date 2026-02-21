@@ -43,6 +43,11 @@ type ChatEntry struct {
 	Height        int          // Cached line count (-1 means not yet computed).
 	Streaming     bool         // True while still receiving chunks.
 	Importance    float64
+
+	// Thinking indicator state.
+	ThinkingText    string        // Animated spinner + message (set by model on tick).
+	ThinkingColor   string        // Hex color for gradient animation (e.g. "#89b4fa"); empty = use theme default.
+	ThinkingElapsed time.Duration // Elapsed from stream start to first chunk (0 = no thinking recorded).
 }
 
 // History is a bounded ring buffer of chat entries.

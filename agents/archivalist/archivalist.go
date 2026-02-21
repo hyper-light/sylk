@@ -300,7 +300,7 @@ func (a *Archivalist) Start(bus guide.EventBus) error {
 	}
 
 	a.bus = bus
-	a.channels = guide.NewAgentChannels("archivalist")
+	a.channels = guide.NewAgentChannels("archivalist", "archivalist")
 
 	// Subscribe to own request channel (archivalist.requests)
 	var err error

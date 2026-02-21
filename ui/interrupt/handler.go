@@ -24,8 +24,17 @@ type Handler struct {
 
 // NewHandler creates a Handler with the default 500ms threshold.
 func NewHandler() *Handler {
+	return NewHandlerWithThreshold(defaultThreshold)
+}
+
+// NewHandlerWithThreshold creates a handler with a custom double-press window.
+// If threshold <= 0, the default threshold is used.
+func NewHandlerWithThreshold(threshold time.Duration) *Handler {
+	if threshold <= 0 {
+		threshold = defaultThreshold
+	}
 	h := &Handler{
-		threshold: defaultThreshold,
+		threshold: threshold,
 	}
 	// Store the zero time so the first Load always returns a valid time.Time.
 	h.lastInterrupt.Store(time.Time{})

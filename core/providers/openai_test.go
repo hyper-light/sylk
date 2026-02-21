@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/responses"
 )
 
 func TestDefaultOpenAIConfig_UsesCodex53WithFallback(t *testing.T) {
@@ -206,16 +207,36 @@ func TestSelectFallbackModel(t *testing.T) {
 }
 
 type mockAuthService struct {
-	auth *oauth.OpenAIChatGPTAuth
-	err  error
+	auth           *oauth.OpenAIChatGPTAuth
+	err            error
+	beginChallenge *oauth.DeviceCodeChallenge
+	beginErr       error
+	completeAuth   *oauth.OpenAIChatGPTAuth
+	completeErr    error
+	completeDelay  time.Duration
+	saveErr        error
+	saveCalls      int
 }
 
 func (m *mockAuthService) BeginDeviceAuth(context.Context) (*oauth.DeviceCodeChallenge, error) {
-	return nil, errors.New("not implemented")
+	if m.beginErr != nil {
+		return nil, m.beginErr
+	}
+	return m.beginChallenge, nil
 }
 
-func (m *mockAuthService) CompleteDeviceAuth(context.Context, *oauth.DeviceCodeChallenge, time.Duration) (*oauth.OpenAIChatGPTAuth, error) {
-	return nil, errors.New("not implemented")
+func (m *mockAuthService) CompleteDeviceAuth(ctx context.Context, _ *oauth.DeviceCodeChallenge, _ time.Duration) (*oauth.OpenAIChatGPTAuth, error) {
+	if m.completeDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(m.completeDelay):
+		}
+	}
+	if m.completeErr != nil {
+		return nil, m.completeErr
+	}
+	return m.completeAuth, nil
 }
 
 func (m *mockAuthService) Refresh(context.Context, *oauth.OpenAIChatGPTAuth) (*oauth.OpenAIChatGPTAuth, error) {
@@ -227,7 +248,8 @@ func (m *mockAuthService) Resolve(context.Context) (*oauth.OpenAIChatGPTAuth, er
 }
 
 func (m *mockAuthService) Save(context.Context, *oauth.OpenAIChatGPTAuth) error {
-	return errors.New("not implemented")
+	m.saveCalls++
+	return m.saveErr
 }
 
 func (m *mockAuthService) Load(context.Context) (*oauth.OpenAIChatGPTAuth, error) {
@@ -236,6 +258,70 @@ func (m *mockAuthService) Load(context.Context) (*oauth.OpenAIChatGPTAuth, error
 
 func (m *mockAuthService) Delete(context.Context) error {
 	return errors.New("not implemented")
+}
+
+func TestOpenAIProviderStartChatGPTDeviceAuth_ReturnsChallengeImmediately(t *testing.T) {
+	authSvc := &mockAuthService{
+		beginChallenge: &oauth.DeviceCodeChallenge{
+			VerificationURL: "https://auth.openai.com/codex/device",
+			UserCode:        "ABCD-1234",
+			DeviceAuthID:    "device_abc",
+			PollInterval:    time.Second,
+		},
+		completeAuth: &oauth.OpenAIChatGPTAuth{
+			AuthMode:         "chatgpt",
+			AccessToken:      "new_token",
+			ChatGPTAccountID: "org_new",
+		},
+		completeDelay: 120 * time.Millisecond,
+	}
+	provider, err := NewOpenAIProviderWithAuthService(OpenAIConfig{
+		BaseConfig: BaseConfig{
+			Model:     "gpt-5.3-codex",
+			APIKey:    "old_token",
+			MaxTokens: 1024,
+		},
+		AuthMode:           openAIAuthModeChatGPT,
+		ChatGPTAccountID:   "org_old",
+		AllowUnknownModels: true,
+	}, authSvc)
+	if err != nil {
+		t.Fatalf("NewOpenAIProviderWithAuthService() error: %v", err)
+	}
+
+	start := time.Now()
+	session, err := provider.StartChatGPTDeviceAuth(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatalf("StartChatGPTDeviceAuth() error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("StartChatGPTDeviceAuth() should return immediately, took %v", elapsed)
+	}
+	if session == nil || session.Challenge == nil {
+		t.Fatal("expected non-nil session challenge")
+	}
+	if session.Challenge.UserCode != "ABCD-1234" {
+		t.Fatalf("unexpected user code: %q", session.Challenge.UserCode)
+	}
+
+	select {
+	case result := <-session.Results:
+		if result.Err != nil {
+			t.Fatalf("unexpected async auth error: %v", result.Err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for device auth completion")
+	}
+
+	if provider.config.APIKey != "new_token" {
+		t.Fatalf("expected provider API key update, got %q", provider.config.APIKey)
+	}
+	if provider.config.ChatGPTAccountID != "org_new" {
+		t.Fatalf("expected provider account update, got %q", provider.config.ChatGPTAccountID)
+	}
+	if authSvc.saveCalls != 1 {
+		t.Fatalf("expected auth Save() call, got %d", authSvc.saveCalls)
+	}
 }
 
 func TestHydrateOpenAIConfig_ChatGPTFromAuthService(t *testing.T) {
@@ -278,5 +364,22 @@ func TestHydrateOpenAIConfig_ChatGPTRequiresAccountID(t *testing.T) {
 	err := hydrateOpenAIConfig(context.Background(), &cfg, authSvc)
 	if err == nil {
 		t.Fatal("expected error when chatgpt_account_id is missing")
+	}
+}
+
+func TestConvertResponseStopReason_ToolUse(t *testing.T) {
+	p := &OpenAIProvider{}
+	result := responses.Response{
+		Status: responses.ResponseStatusCompleted,
+		Output: []responses.ResponseOutputItemUnion{
+			{
+				ID:   "tool_1",
+				Type: "function_call",
+				Name: "run_tests",
+			},
+		},
+	}
+	if got := p.convertResponseStopReason(result); got != StopReasonToolUse {
+		t.Fatalf("expected stop reason %q, got %q", StopReasonToolUse, got)
 	}
 }

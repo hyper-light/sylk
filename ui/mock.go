@@ -8,21 +8,19 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/adalundhe/sylk/agents/guide"
-	codepkg "github.com/adalundhe/sylk/ui/code"
-	"github.com/adalundhe/sylk/ui/filetree"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/session"
-	"github.com/adalundhe/sylk/ui/bridge"
-	"github.com/adalundhe/sylk/ui/msg"
+	codepkg "github.com/adalundhe/sylk/ui/code"
+	"github.com/adalundhe/sylk/ui/filetree"
 )
 
 // ---------------------------------------------------------------------------
 // Mock agent constants (all derived, not magic)
 // ---------------------------------------------------------------------------
 
-// mockGuideID is the agent identifier for the mock guide agent.
-const mockGuideID = "mock-guide"
+// mockGuideID is the agent identifier for the guide agent shown in mock seed data.
+const mockGuideID = "guide"
 
 // mockGuideName is the display name for the mock guide agent.
 const mockGuideName = "Guide"
@@ -63,13 +61,13 @@ const mockFirstWordsCount = 8
 // MockAgent
 // ---------------------------------------------------------------------------
 
-// MockAgent subscribes to guide requests on the EventBus and generates
-// fake streaming responses. It allows manual testing of the TUI without
-// a real agent backend — type a prompt, get a streaming response.
+// MockAgent subscribes to its own request topic on the EventBus and generates
+// fake streaming responses. The Guide routes ForwardedRequests here; the
+// MockAgent responds via StreamResponse messages on its own response topic,
+// which the Guide then forwards back to the TUI.
 type MockAgent struct {
 	bus          guide.EventBus
 	activityBus  *events.ActivityEventBus
-	program      bridge.TeaProgram
 	scope        *concurrency.GoroutineScope
 	subscription guide.Subscription
 }
@@ -78,20 +76,19 @@ type MockAgent struct {
 func NewMockAgent(
 	bus guide.EventBus,
 	activityBus *events.ActivityEventBus,
-	program bridge.TeaProgram,
 	scope *concurrency.GoroutineScope,
 ) *MockAgent {
 	return &MockAgent{
 		bus:         bus,
 		activityBus: activityBus,
-		program:     program,
 		scope:       scope,
 	}
 }
 
-// Start subscribes to guide requests and begins handling them.
+// Start subscribes to the mock agent's own request topic.
 func (m *MockAgent) Start() error {
-	sub, err := m.bus.Subscribe(guide.TopicGuideRequests, m.onRequest)
+	topic := guide.TopicRequests(mockGuideID, mockGuideID)
+	sub, err := m.bus.Subscribe(topic, m.onRequest)
 	if err != nil {
 		return err
 	}
@@ -106,23 +103,23 @@ func (m *MockAgent) Stop() {
 	}
 }
 
-// onRequest handles an incoming guide request by spawning a tracked goroutine.
+// onRequest handles an incoming forwarded request by spawning a tracked goroutine.
 func (m *MockAgent) onRequest(busMsg *guide.Message) error {
-	req, ok := busMsg.GetRouteRequest()
+	fwd, ok := busMsg.GetForwardedRequest()
 	if !ok {
 		return nil
 	}
 	return m.scope.Go(
-		"mock.respond."+req.CorrelationID,
+		"mock.respond."+fwd.CorrelationID,
 		mockResponseTimeout,
-		m.respondFunc(req),
+		m.respondFunc(fwd),
 	)
 }
 
 // respondFunc returns a WorkFunc that generates a mock streaming response.
-func (m *MockAgent) respondFunc(req *guide.RouteRequest) concurrency.WorkFunc {
+func (m *MockAgent) respondFunc(fwd *guide.ForwardedRequest) concurrency.WorkFunc {
 	return func(ctx context.Context) error {
-		m.respond(ctx, req)
+		m.respond(ctx, fwd)
 		return nil
 	}
 }
@@ -131,13 +128,15 @@ func (m *MockAgent) respondFunc(req *guide.RouteRequest) concurrency.WorkFunc {
 // Response generation
 // ---------------------------------------------------------------------------
 
-// respond produces a streaming mock response for the given request.
-func (m *MockAgent) respond(ctx context.Context, req *guide.RouteRequest) {
-	sessionID := req.SessionID
-	correlationID := req.CorrelationID
+// respond produces a streaming mock response for the given forwarded request.
+// All stream events are published to the mock agent's response topic; the Guide
+// picks them up and forwards them to the TUI.
+func (m *MockAgent) respond(ctx context.Context, fwd *guide.ForwardedRequest) {
+	correlationID := fwd.CorrelationID
+	responseTopic := guide.TopicResponses(mockGuideID, mockGuideID)
 
 	// Phase 1: agent starts thinking.
-	m.emitActivity(sessionID, mockGuideID, mockGuideName, mockGuideType,
+	m.emitActivity("", mockGuideID, mockGuideName, mockGuideType,
 		events.EventTypeAgentDecision, events.OutcomePending,
 		"Analyzing request...", 0.1)
 
@@ -146,39 +145,53 @@ func (m *MockAgent) respond(ctx context.Context, req *guide.RouteRequest) {
 	}
 
 	// Phase 2: agent starts acting.
-	m.emitActivity(sessionID, mockGuideID, mockGuideName, mockGuideType,
+	m.emitActivity("", mockGuideID, mockGuideName, mockGuideType,
 		events.EventTypeAgentAction, events.OutcomePending,
 		"Generating response...", 0.3)
 
-	// Phase 3: stream response chunks.
-	response := mockResponse(req.Input)
+	// Phase 3: stream response chunks via the bus.
+	response := mockResponse(fwd.Input)
 	chunks := splitIntoChunks(response)
 
-	m.program.Send(msg.StreamStartMsg{
-		SessionID:     sessionID,
-		CorrelationID: correlationID,
+	m.publishStream(responseTopic, correlationID, &guide.StreamEvent{
+		Type: guide.StreamEventStart, Timestamp: time.Now(),
 	})
 
 	for _, chunk := range chunks {
 		if !sleepCtx(ctx, mockChunkDelay) {
 			return
 		}
-		m.program.Send(msg.StreamChunkMsg{
-			SessionID:     sessionID,
-			CorrelationID: correlationID,
-			Text:          chunk,
+		m.publishStream(responseTopic, correlationID, &guide.StreamEvent{
+			Type: guide.StreamEventData, Text: chunk, Timestamp: time.Now(),
 		})
 	}
 
-	m.program.Send(msg.StreamCompleteMsg{
-		SessionID:     sessionID,
-		CorrelationID: correlationID,
+	m.publishStream(responseTopic, correlationID, &guide.StreamEvent{
+		Type: guide.StreamEventComplete, Timestamp: time.Now(),
 	})
 
 	// Phase 4: agent completes.
-	m.emitActivity(sessionID, mockGuideID, mockGuideName, mockGuideType,
+	m.emitActivity("", mockGuideID, mockGuideName, mockGuideType,
 		events.EventTypeSuccess, events.OutcomeSuccess,
 		"Response complete", 0.0)
+}
+
+// publishStream publishes a StreamResponse message to the given topic.
+func (m *MockAgent) publishStream(topic, correlationID string, event *guide.StreamEvent) {
+	resp := &guide.StreamResponse{
+		CorrelationID:     correlationID,
+		RespondingAgentID: mockGuideID,
+		Event:             event,
+	}
+	busMsg := &guide.Message{
+		ID:            uuid.New().String(),
+		CorrelationID: correlationID,
+		Type:          guide.MessageTypeStream,
+		Payload:       resp,
+		SourceAgentID: mockGuideID,
+		Timestamp:     time.Now(),
+	}
+	_ = m.bus.Publish(topic, busMsg)
 }
 
 // sleepCtx pauses for the given duration, returning false if the context
@@ -391,11 +404,20 @@ func seedAgentHistory(bus *events.ActivityEventBus) {
 				Data: map[string]any{
 					"agent_type":    ah.seed.agentType,
 					"agent_name":    ah.seed.name,
-					"context_usage": evt.usage,
+					"context_usage": seedContextUsage(ah.seed.id, evt.usage),
 				},
 			})
 		}
 	}
+}
+
+func seedContextUsage(agentID string, usage float64) float64 {
+	// Guide usage in mock mode is now driven by live request/response flow.
+	// Keep seeded history neutral so startup does not pin to an arbitrary value.
+	if agentID == mockGuideID {
+		return 0
+	}
+	return usage
 }
 
 // ---------------------------------------------------------------------------

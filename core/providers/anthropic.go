@@ -21,6 +21,7 @@ type AnthropicProvider struct {
 type AnthropicModel string
 
 const (
+	Opus46            AnthropicModel = "claude-opus-4-6"
 	Opus              AnthropicModel = "claude-opus-4-5-20251101"
 	SonnetLongContext AnthropicModel = "claude-sonnet-4-5-20250901"
 	Haiku             AnthropicModel = "claude-haiku-4-5-20251001"
@@ -28,6 +29,7 @@ const (
 
 // Supported Anthropic models
 var anthropicModels = map[string]bool{
+	"claude-opus-4-6": true, // Claude Opus 4.6
 	// Claude 4.5 family
 	"claude-opus-4-5-20251101":   true, // Claude Opus 4.5
 	"claude-sonnet-4-5-20250901": true, // Claude Sonnet 4.5 (1M token window)
@@ -218,6 +220,7 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req *Request) (*Respon
 
 func (p *AnthropicProvider) SupportedModels() []ModelInfo {
 	return []ModelInfo{
+		{ID: "claude-opus-4-6", Name: "Claude Opus 4.6", MaxContext: 200000},
 		{ID: "claude-opus-4-5-20251101", Name: "Claude Opus 4.5", MaxContext: 200000},
 		{ID: "claude-sonnet-4-5-20250901", Name: "Claude Sonnet 4.5", MaxContext: 1000000},
 		{ID: "claude-haiku-4-5-20251001", Name: "Claude Haiku 4.5", MaxContext: 200000},

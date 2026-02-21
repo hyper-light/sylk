@@ -3,7 +3,7 @@ module github.com/adalundhe/sylk
 go 1.24.3
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.19.0
+	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/arnodel/golua v0.1.2
 	github.com/blevesearch/bleve/v2 v2.5.7
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -14,7 +14,7 @@ require (
 	github.com/epilande/go-devicons v0.0.0-20250505162540-0661cab71a28
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/go-git/go-git/v5 v5.16.4
-github.com/gobwas/glob v0.2.3
+	github.com/gobwas/glob v0.2.3
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/mattn/go-runewidth v0.0.16
@@ -30,7 +30,7 @@ github.com/gobwas/glob v0.2.3
 	golang.org/x/term v0.38.0
 	golang.org/x/tools v0.40.0
 	gonum.org/v1/gonum v0.17.0
-	google.golang.org/genai v1.42.0
+	google.golang.org/genai v1.47.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.44.0
 )

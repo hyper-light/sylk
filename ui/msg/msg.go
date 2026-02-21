@@ -32,6 +32,7 @@ type SessionEventMsg struct {
 type StreamStartMsg struct {
 	SessionID     string
 	CorrelationID string
+	AgentID       string // Responding agent ID for badge display.
 }
 
 // StreamChunkMsg carries a streaming text chunk from an LLM response.
@@ -75,6 +76,15 @@ type GuideResponseMsg struct {
 	AgentName     string
 	Content       string
 	Err           error
+}
+
+// RetryStatusMsg reports a retry or model-fallback attempt during Guide processing.
+type RetryStatusMsg struct {
+	SessionID     string
+	CorrelationID string
+	Attempt       int
+	MaxAttempts   int
+	Error         string
 }
 
 // ---------------------------------------------------------------------------

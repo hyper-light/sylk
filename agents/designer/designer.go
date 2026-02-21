@@ -131,7 +131,7 @@ func (d *Designer) Start(bus guide.EventBus) error {
 	}
 
 	d.bus = bus
-	d.channels = guide.NewAgentChannels("designer")
+	d.channels = guide.NewAgentChannels("designer", "designer")
 
 	var err error
 	d.requestSub, err = bus.SubscribeAsync(d.channels.Requests, d.handleBusRequest)

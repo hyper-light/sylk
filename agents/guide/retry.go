@@ -2,10 +2,16 @@ package guide
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"math/rand"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/genai"
 )
 
 // =============================================================================
@@ -391,3 +397,93 @@ type RetryQueueStats struct {
 	TotalAttempts int `json:"total_attempts"`
 	MaxAttempts   int `json:"max_attempts"`
 }
+
+// =============================================================================
+// Retry Status (for error surfacing / UI notifications)
+// =============================================================================
+
+// RetryStatus is published to the bus during retry/model-fallback attempts.
+type RetryStatus struct {
+	Attempt     int
+	MaxAttempts int
+	Model       string // Model name (for model-fallback) or empty (for classification retry).
+	Err         error
+}
+
+// classifyRetryConfig returns retry settings for classification.
+func classifyRetryConfig() RetryConfig {
+	return RetryConfig{
+		MaxRetries:   3,
+		InitialDelay: 500 * time.Millisecond,
+		MaxDelay:     3 * time.Second,
+	}
+}
+
+// respondRetryConfig returns retry settings for guide self-response.
+func respondRetryConfig() RetryConfig {
+	return RetryConfig{
+		MaxRetries:   2,
+		InitialDelay: 1 * time.Second,
+		MaxDelay:     5 * time.Second,
+	}
+}
+
+// RetryConfig controls retry behavior for classification and response.
+type RetryConfig struct {
+	MaxRetries   int
+	InitialDelay time.Duration
+	MaxDelay     time.Duration
+}
+
+// isRetryableAPIError returns true for transient API errors: rate limits (429),
+// server errors (5xx). Non-retryable: 400, 401, 403, 404.
+func isRetryableAPIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr genai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == http.StatusTooManyRequests ||
+			apiErr.Code >= http.StatusInternalServerError
+	}
+	return false
+}
+
+// formatGeminiError extracts the genai.APIError (if present) and returns
+// the full error details. For non-API errors it falls back to err.Error().
+func formatGeminiError(context string, err error) error {
+	var apiErr genai.APIError
+	if !errors.As(err, &apiErr) {
+		return fmt.Errorf("%s: %w", context, err)
+	}
+	code := apiErr.Code
+	msg := strings.TrimSpace(apiErr.Message)
+	status := strings.TrimSpace(apiErr.Status)
+	details := formatGeminiErrorDetails(apiErr.Details)
+	if details != "" {
+		return fmt.Errorf("%s: %d %s — %s [%s]", context, code, status, msg, details)
+	}
+	return fmt.Errorf("%s: %d %s — %s", context, code, status, msg)
+}
+
+func formatGeminiErrorDetails(details []map[string]any) string {
+	if len(details) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(details))
+	for _, d := range details {
+		for k, v := range d {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// retryBackoffDuration returns exponential backoff with jitter, capped at cfg.MaxDelay.
+func retryBackoffDuration(attempt int, cfg RetryConfig) time.Duration {
+	base := float64(cfg.InitialDelay) * math.Pow(2, float64(attempt))
+	capped := math.Min(base, float64(cfg.MaxDelay))
+	jitter := capped * (0.5 + rand.Float64()*0.5)
+	return time.Duration(jitter)
+}
+

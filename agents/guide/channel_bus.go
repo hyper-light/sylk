@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type topicSubscriptions struct {
@@ -13,6 +14,7 @@ type topicSubscriptions struct {
 
 var (
 	ErrBusClosed          = errors.New("bus is closed")
+	ErrBusCloseTimeout    = errors.New("bus close timed out waiting for handlers")
 	ErrSubscriptionClosed = errors.New("subscription is closed")
 	ErrInvalidHandler     = errors.New("handler cannot be nil")
 )
@@ -20,22 +22,31 @@ var (
 type ChannelBus struct {
 	subscriptions *ShardedMap[string, *topicSubscriptions]
 
-	bufferSize int
+	bufferSize   int
+	closeTimeout time.Duration
 
 	closed atomic.Bool
 
 	wg sync.WaitGroup
 }
 
+// defaultCloseTimeout is the maximum time Close() waits for subscription
+// goroutines to drain before returning. Derived from: all handlers are
+// non-blocking (publish uses select/default), so drain should complete
+// in milliseconds; 5s provides generous safety margin.
+const defaultCloseTimeout = 5 * time.Second
+
 type ChannelBusConfig struct {
-	BufferSize int
-	ShardCount int
+	BufferSize   int
+	ShardCount   int
+	CloseTimeout time.Duration
 }
 
 func DefaultChannelBusConfig() ChannelBusConfig {
 	return ChannelBusConfig{
-		BufferSize: 256,
-		ShardCount: DefaultShardCount,
+		BufferSize:   256,
+		ShardCount:   DefaultShardCount,
+		CloseTimeout: defaultCloseTimeout,
 	}
 }
 
@@ -46,10 +57,14 @@ func NewChannelBus(cfg ChannelBusConfig) *ChannelBus {
 	if cfg.ShardCount <= 0 {
 		cfg.ShardCount = DefaultShardCount
 	}
+	if cfg.CloseTimeout <= 0 {
+		cfg.CloseTimeout = defaultCloseTimeout
+	}
 
 	return &ChannelBus{
 		subscriptions: NewStringMap[*topicSubscriptions](cfg.ShardCount),
 		bufferSize:    cfg.BufferSize,
+		closeTimeout:  cfg.CloseTimeout,
 	}
 }
 
@@ -143,6 +158,13 @@ func (b *ChannelBus) Close() error {
 		return ErrBusClosed
 	}
 
+	b.closeAllSubscriptions()
+	return b.awaitDrain()
+}
+
+// closeAllSubscriptions closes every subscription channel so run() goroutines
+// can drain remaining messages and exit.
+func (b *ChannelBus) closeAllSubscriptions() {
 	allTopics := b.subscriptions.Snapshot()
 	for _, topicSubs := range allTopics {
 		if topicSubs == nil {
@@ -156,10 +178,23 @@ func (b *ChannelBus) Close() error {
 		topicSubs.mu.Unlock()
 	}
 	b.subscriptions.Clear()
+}
 
-	b.wg.Wait()
+// awaitDrain waits for all subscription goroutines to finish, bounded by
+// closeTimeout. Returns ErrBusCloseTimeout if handlers don't complete in time.
+func (b *ChannelBus) awaitDrain() error {
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
 
-	return nil
+	select {
+	case <-done:
+		return nil
+	case <-time.After(b.closeTimeout):
+		return ErrBusCloseTimeout
+	}
 }
 
 type channelSubscription struct {

@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// activityBusCloseTimeout bounds shutdown wait for the dispatch goroutine.
+// A blocked subscriber callback must not hang process exit indefinitely.
+const activityBusCloseTimeout = 5 * time.Second
+
 // =============================================================================
 // EventSubscriber Interface
 // =============================================================================
@@ -271,27 +275,33 @@ func (b *ActivityEventBus) dispatch() {
 // then to subscribers registered for this specific event type.
 // Subscriber errors are logged but do not interrupt delivery to other subscribers.
 func (b *ActivityEventBus) deliverEvent(event *ActivityEvent) {
+	wildcardSubs, typedSubs := b.snapshotSubscribers(event.EventType)
+	b.deliverToSubscribers(event, wildcardSubs)
+	b.deliverToSubscribers(event, typedSubs)
+}
+
+func (b *ActivityEventBus) snapshotSubscribers(eventType EventType) ([]EventSubscriber, []EventSubscriber) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// Deliver to wildcard subscribers
-	// Errors are intentionally ignored to ensure all subscribers receive events
-	// even if some fail. Subscribers are responsible for their own error handling.
-	for id, sub := range b.wildcardSubscribers {
-		if err := sub.OnEvent(event); err != nil {
-			// Log subscriber errors for debugging but continue delivery
-			// Note: Production code could emit metrics or use a logger here
-			_ = fmt.Errorf("subscriber %s failed to process event %s: %w", id, event.EventType.String(), err)
+	wildcard := make([]EventSubscriber, 0, len(b.wildcardSubscribers))
+	for _, sub := range b.wildcardSubscribers {
+		wildcard = append(wildcard, sub)
+	}
+	typed := make([]EventSubscriber, 0)
+	if subs, ok := b.subscribers[eventType]; ok {
+		typed = make([]EventSubscriber, 0, len(subs))
+		for _, sub := range subs {
+			typed = append(typed, sub)
 		}
 	}
+	return wildcard, typed
+}
 
-	// Deliver to event-specific subscribers
-	if subs, ok := b.subscribers[event.EventType]; ok {
-		for id, sub := range subs {
-			if err := sub.OnEvent(event); err != nil {
-				// Log subscriber errors for debugging but continue delivery
-				_ = fmt.Errorf("subscriber %s failed to process event %s: %w", id, event.EventType.String(), err)
-			}
+func (b *ActivityEventBus) deliverToSubscribers(event *ActivityEvent, subs []EventSubscriber) {
+	for _, sub := range subs {
+		if err := sub.OnEvent(event); err != nil {
+			_ = fmt.Errorf("subscriber %s failed to process event %s: %w", sub.ID(), event.EventType.String(), err)
 		}
 	}
 }
@@ -312,6 +322,14 @@ func (b *ActivityEventBus) Close() {
 	// Signal dispatch goroutine to stop
 	close(b.done)
 
-	// Wait for dispatch goroutine to finish
-	b.wg.Wait()
+	// Wait for dispatch goroutine to finish, but never block indefinitely.
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(activityBusCloseTimeout):
+	}
 }

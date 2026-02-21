@@ -117,7 +117,7 @@ func (l *Librarian) Start(bus guide.EventBus) error {
 	}
 
 	l.bus = bus
-	l.channels = guide.NewAgentChannels("librarian")
+	l.channels = guide.NewAgentChannels("librarian", "librarian")
 
 	// Subscribe to own request channel (librarian.requests)
 	var err error

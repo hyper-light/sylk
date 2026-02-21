@@ -39,14 +39,28 @@ func TestResolveAPIKeyFromEnv(t *testing.T) {
 			wantKey:  "google-key-789",
 			wantErr:  false,
 		},
+		{
+			name:     "google from gemini env alias",
+			provider: "google",
+			envKey:   "GEMINI_API_KEY",
+			envValue: "gemini-key-123",
+			wantKey:  "gemini-key-123",
+			wantErr:  false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Save original value
 			originalValue := os.Getenv(tt.envKey)
+			originalGoogleValue := os.Getenv("GOOGLE_API_KEY")
+			originalGeminiValue := os.Getenv("GEMINI_API_KEY")
 			defer os.Setenv(tt.envKey, originalValue)
+			defer os.Setenv("GOOGLE_API_KEY", originalGoogleValue)
+			defer os.Setenv("GEMINI_API_KEY", originalGeminiValue)
 
+			os.Unsetenv("GOOGLE_API_KEY")
+			os.Unsetenv("GEMINI_API_KEY")
 			os.Setenv(tt.envKey, tt.envValue)
 
 			key, err := ResolveAPIKey(tt.provider)

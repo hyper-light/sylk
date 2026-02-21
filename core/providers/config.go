@@ -2,6 +2,7 @@ package providers
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -46,8 +47,18 @@ func DefaultBaseConfig() BaseConfig {
 
 // Validate checks the base configuration
 func (c *BaseConfig) Validate() error {
+	if err := validateBaseConfigValues(c); err != nil {
+		return err
+	}
 	if c.APIKey == "" {
 		return fmt.Errorf("api_key is required")
+	}
+	return nil
+}
+
+func validateBaseConfigValues(c *BaseConfig) error {
+	if c == nil {
+		return fmt.Errorf("config is required")
 	}
 	if c.MaxTokens <= 0 {
 		return fmt.Errorf("max_tokens must be positive")
@@ -206,6 +217,10 @@ func (c *OpenAIConfig) Validate() error {
 type GoogleConfig struct {
 	BaseConfig `json:",inline" yaml:",inline"`
 
+	// AuthMode controls credential type.
+	// Supported values: "api_key" (default), "oauth".
+	AuthMode string `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
+
 	// ProjectID for Vertex AI (optional, uses Gemini API if not set)
 	ProjectID string `json:"project_id,omitempty" yaml:"project_id,omitempty"`
 
@@ -230,6 +245,11 @@ type SafetySetting struct {
 	Threshold string `json:"threshold" yaml:"threshold"`
 }
 
+const (
+	GoogleAuthModeAPIKey = "api_key"
+	GoogleAuthModeOAuth  = "oauth"
+)
+
 // DefaultGoogleConfig returns Google/Gemini defaults
 func DefaultGoogleConfig() GoogleConfig {
 	base := DefaultBaseConfig()
@@ -239,21 +259,77 @@ func DefaultGoogleConfig() GoogleConfig {
 	return GoogleConfig{
 		BaseConfig: base,
 		Location:   "us-central1",
+		AuthMode:   GoogleAuthModeOAuth,
 	}
 }
 
 // Validate checks Google-specific configuration
 func (c *GoogleConfig) Validate() error {
-	if err := c.BaseConfig.Validate(); err != nil {
+	if err := validateBaseConfigValues(&c.BaseConfig); err != nil {
 		return fmt.Errorf("google config: %w", err)
 	}
-	if c.UseVertexAI && c.ProjectID == "" {
-		return fmt.Errorf("google config: project_id required for Vertex AI")
+	if err := validateGoogleAuthMode(c.AuthMode); err != nil {
+		return err
 	}
-	if c.TopK != nil && (*c.TopK < 1 || *c.TopK > 40) {
-		return fmt.Errorf("google config: top_k must be between 1 and 40")
+	if err := validateGoogleAuthCredentials(c); err != nil {
+		return err
+	}
+	if err := validateGoogleVertexProject(c); err != nil {
+		return err
+	}
+	if err := validateGoogleTopK(c.TopK); err != nil {
+		return err
 	}
 	return nil
+}
+
+func validateGoogleAuthMode(mode string) error {
+	trimmed := strings.TrimSpace(mode)
+	if trimmed == "" {
+		return nil
+	}
+	switch trimmed {
+	case GoogleAuthModeAPIKey, GoogleAuthModeOAuth:
+		return nil
+	default:
+		return fmt.Errorf("google config: auth_mode must be api_key or oauth")
+	}
+}
+
+func validateGoogleAuthCredentials(c *GoogleConfig) error {
+	if c == nil {
+		return fmt.Errorf("google config: config is required")
+	}
+	if strings.TrimSpace(c.AuthMode) == GoogleAuthModeOAuth {
+		return nil
+	}
+	if strings.TrimSpace(c.APIKey) != "" {
+		return nil
+	}
+	return fmt.Errorf("google config: api_key is required unless auth_mode is oauth")
+}
+
+func validateGoogleVertexProject(c *GoogleConfig) error {
+	if c == nil {
+		return fmt.Errorf("google config: config is required")
+	}
+	if !c.UseVertexAI {
+		return nil
+	}
+	if strings.TrimSpace(c.ProjectID) != "" {
+		return nil
+	}
+	return fmt.Errorf("google config: project_id required for Vertex AI")
+}
+
+func validateGoogleTopK(topK *int) error {
+	if topK == nil {
+		return nil
+	}
+	if *topK >= 1 && *topK <= 40 {
+		return nil
+	}
+	return fmt.Errorf("google config: top_k must be between 1 and 40")
 }
 
 // ProviderType identifies the provider

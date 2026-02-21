@@ -452,7 +452,7 @@ func (sb *SessionBus) resolveTopic(topic string) string {
 	}
 
 	// Add session prefix
-	return BuildSessionTopic(sb.sessionID, extractAgentFromTopic(topic), extractChannelFromTopic(topic))
+	return BuildSessionTopic(sb.sessionID, extractAgentTypeFromTopic(topic), extractAgentFromTopic(topic), extractChannelFromTopic(topic))
 }
 
 // isGlobalTopic checks if topic should not be session-prefixed
@@ -465,7 +465,7 @@ func (sb *SessionBus) isKnownGlobalTopic(topic string) bool {
 }
 
 func (sb *SessionBus) hasGlobalPrefix(topic string) bool {
-	globalPrefixes := []string{"agents.", "routes.", "system.", "guide."}
+	globalPrefixes := []string{"agents.", "routes.", "system.", "guide.", "ui."}
 	for _, prefix := range globalPrefixes {
 		if topicHasPrefix(topic, prefix) {
 			return true
@@ -480,6 +480,22 @@ func topicHasPrefix(topic, prefix string) bool {
 
 func extractAgentFromTopic(topic string) string {
 	segments := splitTopic(topic)
+	if len(segments) >= 3 {
+		return segments[2]
+	}
+	// Fallback for legacy `<agent>.requests`
+	if len(segments) > 0 {
+		return segments[0]
+	}
+	return ""
+}
+
+func extractAgentTypeFromTopic(topic string) string {
+	segments := splitTopic(topic)
+	if len(segments) >= 3 {
+		return segments[1]
+	}
+	// Fallback for legacy topics
 	if len(segments) > 0 {
 		return segments[0]
 	}
@@ -488,6 +504,17 @@ func extractAgentFromTopic(topic string) string {
 
 func extractChannelFromTopic(topic string) ChannelType {
 	segments := splitTopic(topic)
+	if len(segments) >= 3 {
+		switch segments[0] {
+		case "request":
+			return ChannelTypeRequests
+		case "response":
+			return ChannelTypeResponses
+		case "error":
+			return ChannelTypeErrors
+		}
+	}
+	// Fallback for legacy `<agent>.requests`
 	if len(segments) >= 2 {
 		return ChannelType(segments[len(segments)-1])
 	}
@@ -504,18 +531,18 @@ func (sb *SessionBus) SessionID() string {
 }
 
 // RequestsTopic returns the session's requests topic for an agent
-func (sb *SessionBus) RequestsTopic(agentID string) string {
-	return BuildSessionTopic(sb.sessionID, agentID, ChannelTypeRequests)
+func (sb *SessionBus) RequestsTopic(agentType, agentID string) string {
+	return BuildSessionTopic(sb.sessionID, agentType, agentID, ChannelTypeRequests)
 }
 
 // ResponsesTopic returns the session's responses topic for an agent
-func (sb *SessionBus) ResponsesTopic(agentID string) string {
-	return BuildSessionTopic(sb.sessionID, agentID, ChannelTypeResponses)
+func (sb *SessionBus) ResponsesTopic(agentType, agentID string) string {
+	return BuildSessionTopic(sb.sessionID, agentType, agentID, ChannelTypeResponses)
 }
 
 // ErrorsTopic returns the session's errors topic for an agent
-func (sb *SessionBus) ErrorsTopic(agentID string) string {
-	return BuildSessionTopic(sb.sessionID, agentID, ChannelTypeErrors)
+func (sb *SessionBus) ErrorsTopic(agentType, agentID string) string {
+	return BuildSessionTopic(sb.sessionID, agentType, agentID, ChannelTypeErrors)
 }
 
 // =============================================================================

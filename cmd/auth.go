@@ -2,12 +2,14 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/adalundhe/sylk/core/llm"
+	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -86,13 +88,29 @@ func runAuthStatus(cmd *cobra.Command, args []string) error {
 
 	for _, p := range providers {
 		status := "not configured"
-		if llm.HasCredentials(p) {
+		if providerHasCredentials(p) {
 			status = "configured"
 		}
 		fmt.Printf("  %-12s %s\n", p+":", status)
 	}
 
 	return nil
+}
+
+func providerHasCredentials(provider string) bool {
+	if llm.HasCredentials(provider) {
+		return true
+	}
+	if provider != "google" {
+		return false
+	}
+	return hasGoogleOAuthCredentials()
+}
+
+func hasGoogleOAuthCredentials() bool {
+	authSvc := oauth.NewGoogleAuthService(oauth.GoogleAuthServiceConfig{})
+	_, err := authSvc.Resolve(context.Background())
+	return err == nil
 }
 
 func runAuthRemove(cmd *cobra.Command, args []string) error {

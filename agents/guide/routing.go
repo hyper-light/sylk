@@ -284,6 +284,12 @@ func GuideRoutingInfo() *AgentRoutingInfo {
 					"registered",
 					"available",
 				},
+				IntentChat: {
+					"hello",
+					"hi",
+					"hey",
+					"chat",
+				},
 			},
 		},
 

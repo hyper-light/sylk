@@ -2,8 +2,8 @@ package bridge
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/lsp"
@@ -11,17 +11,19 @@ import (
 )
 
 const (
-	lspBridgeName   = "bridge.lsp"
-	lspDrainTimeout = 5 * time.Minute
+	lspBridgeName = "bridge.lsp"
+	// Zero uses the scope's max lifetime; LSP bridge is long-lived for the UI session.
+	lspDrainTimeout = 0
 )
 
 // LSPBridge drains LSP diagnostic notifications from the Manager and
 // forwards them as msg.LSPDiagnosticMsg to the Bubble Tea program.
 type LSPBridge struct {
-	manager *lsp.Manager
-	scope   *concurrency.GoroutineScope
-	dropped atomic.Int64
-	done    chan struct{}
+	manager  *lsp.Manager
+	scope    *concurrency.GoroutineScope
+	dropped  atomic.Int64
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewLSPBridge creates a bridge that converts LSP diagnostics into
@@ -44,7 +46,9 @@ func (b *LSPBridge) Start(program TeaProgram) error {
 
 // Stop signals the drain goroutine to exit.
 func (b *LSPBridge) Stop() {
-	close(b.done)
+	b.stopOnce.Do(func() {
+		close(b.done)
+	})
 }
 
 // Name returns the bridge identifier.
@@ -59,6 +63,9 @@ func (b *LSPBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 	return func(ctx context.Context) error {
 		ch := b.manager.Diagnostics()
 		for {
+			if stop, err := shouldStop(b.done, ctx); stop {
+				return err
+			}
 			select {
 			case result, ok := <-ch:
 				if !ok {

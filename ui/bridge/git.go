@@ -2,8 +2,8 @@ package bridge
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -11,21 +11,23 @@ import (
 )
 
 const (
-	gitBridgeName   = "bridge.git"
-	gitBufferSize   = 64
-	gitDrainTimeout = 30 * time.Second
+	gitBridgeName = "bridge.git"
+	gitBufferSize = 64
+	// Zero uses the scope's max lifetime; git bridge is long-lived for the UI session.
+	gitDrainTimeout = 0
 )
 
 // GitBridge subscribes to mutation events on a GitBus and forwards them
 // as msg.GitOpEventMsg to the Bubble Tea program.  Only mutating
 // operations are forwarded — reads generate no UI messages.
 type GitBridge struct {
-	bus     *git.GitBus
-	scope   *concurrency.GoroutineScope
-	buffer  chan *git.GitEvent
-	dropped atomic.Int64
-	unsub   func()
-	done    chan struct{}
+	bus      *git.GitBus
+	scope    *concurrency.GoroutineScope
+	buffer   chan *git.GitEvent
+	dropped  atomic.Int64
+	unsub    func()
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewGitBridge creates a bridge.  Call Start to begin forwarding events.
@@ -46,10 +48,12 @@ func (b *GitBridge) Start(program TeaProgram) error {
 
 // Stop unsubscribes from the bus and signals the drain goroutine to exit.
 func (b *GitBridge) Stop() {
-	if b.unsub != nil {
-		b.unsub()
-	}
-	close(b.done)
+	b.stopOnce.Do(func() {
+		if b.unsub != nil {
+			b.unsub()
+		}
+		close(b.done)
+	})
 }
 
 // Name returns the bridge identifier.
@@ -75,6 +79,9 @@ func (b *GitBridge) onEvent(event *git.GitEvent) {
 func (b *GitBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 	return func(ctx context.Context) error {
 		for {
+			if stop, err := shouldStop(b.done, ctx); stop {
+				return err
+			}
 			select {
 			case event := <-b.buffer:
 				program.Send(msg.GitOpEventMsg{

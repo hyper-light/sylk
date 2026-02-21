@@ -98,7 +98,7 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 	}
 
 	o.bus = bus
-	o.channels = guide.NewAgentChannels(o.config.AgentID)
+	o.channels = guide.NewAgentChannels(o.config.AgentID, o.config.AgentID)
 
 	var err error
 	o.requestSub, err = bus.SubscribeAsync(o.channels.Requests, o.handleBusRequest)

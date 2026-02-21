@@ -2,7 +2,10 @@ package guide
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/messaging"
@@ -60,11 +63,13 @@ type Guide struct {
 	health         *HealthMonitor
 	dlq            *DeadLetterQueue
 	pendingCleanup *PendingCleanup
+	observer       *ConsultationObserver
 
 	// LLM Skills and Hooks
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	hooks       *skills.HookRegistry
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
+	selfResponder GuideSelfResponder
 
 	// Session metadata
 	sessionID string
@@ -72,6 +77,10 @@ type Guide struct {
 
 	// Running state
 	running bool
+
+	runMu     sync.RWMutex
+	runCtx    context.Context
+	runCancel context.CancelFunc
 }
 
 // agentSubscriptions holds the Guide's subscriptions to an agent's channels
@@ -104,6 +113,10 @@ type Config struct {
 
 	// Skills configuration
 	SkillsConfig *skills.LoaderConfig
+
+	// Optional self-response handler for requests explicitly routed to guide.
+	// If nil, the Guide uses the default static responder.
+	SelfResponder GuideSelfResponder
 }
 
 // DefaultConfig returns sensible defaults
@@ -149,6 +162,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 	})
 
 	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
+	selfResponder := resolveGuideSelfResponder(cfg, nil)
 
 	guide := &Guide{
 		router:         router,
@@ -166,9 +180,11 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		health:         health,
 		dlq:            dlq,
 		pendingCleanup: pendingCleanup,
+		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
 		skills:         skillsRegistry,
 		skillLoader:    skillLoader,
 		hooks:          hookRegistry,
+		selfResponder:  selfResponder,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
 	}
@@ -238,9 +254,9 @@ func buildSkills(cfg Config) (*skills.Registry, *skills.Loader, *skills.HookRegi
 	}
 	skillsLoaderCfg.CoreSkills = []string{"route", "help", "status"}
 	skillsLoaderCfg.AutoLoadDomains = []string{"routing"}
-	
+
 	hooks := skills.NewHookRegistry()
-	
+
 	// CRITICAL SAFETY CATCH
 	// The Guide must NEVER be able to execute generic state-mutating tools like write_file or run_shell_command
 	// even if they somehow leak into its context. We explicitly whitelist its approved tools.
@@ -250,7 +266,7 @@ func buildSkills(cfg Config) (*skills.Registry, *skills.Loader, *skills.HookRegi
 		"task_interact": true, "get_routing_history": true, "get_agent_capabilities": true,
 		"sessions": true, "metrics": true, "switch_session": true, "create_session": true, "close_session": true,
 	}
-	
+
 	hooks.RegisterPreToolCallHook("guide_safety_catch", skills.HookPriorityHigh, func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
 		if !allowedTools[data.ToolName] {
 			return skills.HookResult{
@@ -262,6 +278,78 @@ func buildSkills(cfg Config) (*skills.Registry, *skills.Loader, *skills.HookRegi
 	})
 
 	return skillsRegistry, skills.NewLoader(skillsRegistry, skillsLoaderCfg), hooks
+}
+
+// NewWithClassifier creates a new Guide agent with a custom ClassifierClient.
+// This allows creating a Guide without a real LLM client (e.g., for mock/test mode).
+func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
+	cfg = ensureRouterConfig(cfg)
+	if err := validateBus(cfg); err != nil {
+		return nil, err
+	}
+
+	registry := resolveRegistry(cfg)
+	routing := NewRoutingAggregator()
+	routing.RegisterAgent(GuideRoutingInfo())
+
+	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
+	classifier := NewClassifierWithClient(client, cfg.RouterConfig)
+	router := &Router{
+		config:            cfg.RouterConfig,
+		parser:            parser,
+		classifier:        classifier,
+		riskSampler:       NewRiskSampler(),
+		crossDomainRouter: NewCrossDomainRouter(nil),
+	}
+
+	pendingCfg := resolvePendingConfig(cfg)
+	agentID := resolveAgentID(cfg)
+	cacheCfg := resolveRouteCacheConfig(cfg)
+	circuits := NewCircuitBreakerRegistry(DefaultCircuitBreakerConfig())
+	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{MaxSize: 10000})
+	pendingCleanup := NewPendingCleanup(PendingCleanupConfig{
+		CheckInterval:  1 * time.Second,
+		DefaultTimeout: pendingCfg.DefaultTimeout,
+		DLQ:            dlq,
+		Circuits:       circuits,
+	})
+	health := NewHealthMonitor(cfg.Bus, HealthMonitorConfig{
+		AgentConfig: DefaultAgentHealthConfig(),
+		Circuits:    circuits,
+	})
+
+	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
+	selfResponder := resolveGuideSelfResponder(cfg, nil)
+
+	guide := &Guide{
+		router:         router,
+		config:         cfg,
+		bus:            cfg.Bus,
+		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
+		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
+		readyAgents:    NewStringMap[bool](DefaultShardCount),
+		registry:       registry,
+		routing:        routing,
+		triggers:       NewTriggerDetector(routing),
+		pending:        NewPendingStore(pendingCfg),
+		routeCache:     NewRouteCache(cacheCfg),
+		circuits:       circuits,
+		health:         health,
+		dlq:            dlq,
+		pendingCleanup: pendingCleanup,
+		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
+		skills:         skillsRegistry,
+		skillLoader:    skillLoader,
+		hooks:          hookRegistry,
+		selfResponder:  selfResponder,
+		sessionID:      cfg.SessionID,
+		agentID:        agentID,
+	}
+
+	guide.registerCoreSkills()
+	guide.registerExtendedSkills()
+
+	return guide, nil
 }
 
 // NewWithAPIKey creates a new Guide agent with an API key
@@ -317,6 +405,7 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 	})
 
 	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
+	selfResponder := resolveGuideSelfResponder(cfg, client)
 
 	guide := &Guide{
 		router:         router,
@@ -334,9 +423,11 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 		health:         health,
 		dlq:            dlq,
 		pendingCleanup: pendingCleanup,
+		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
 		skills:         skillsRegistry,
 		skillLoader:    skillLoader,
 		hooks:          hookRegistry,
+		selfResponder:  selfResponder,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
 	}
@@ -748,7 +839,7 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 	g.router.parser.SetRouting(g.routing)
 
 	// Create and store agent channels
-	channels := NewAgentChannels(info.ID)
+	channels := NewAgentChannels(info.Type, info.ID)
 	g.agentChannels.Set(info.ID, channels)
 
 	// Mark agent as not ready yet (waiting for ready announcement)
@@ -935,16 +1026,28 @@ func (g *Guide) Start(ctx context.Context) error {
 		return fmt.Errorf("guide is already running")
 	}
 
+	g.setRunContext(ctx)
+
 	// Subscribe to Guide's own request channel (guide.requests)
 	requestSub, err := g.bus.SubscribeAsync(TopicGuideRequests, g.handleRequestMessage)
 	if err != nil {
+		g.cancelRunContext()
 		return fmt.Errorf("failed to subscribe to guide.requests: %w", err)
 	}
 	g.requestSub = requestSub
 
 	// Start resilience components
 	g.pendingCleanup.Start()
-	g.health.Start(ctx)
+	g.health.Start(g.processingContext())
+
+	if g.observer != nil {
+		if err := g.observer.Start(g.processingContext()); err != nil {
+			g.stopResilience()
+			_ = g.requestSub.Unsubscribe()
+			g.requestSub = nil
+			return fmt.Errorf("failed to start consultation observer: %w", err)
+		}
+	}
 
 	g.running = true
 	return nil
@@ -972,8 +1075,12 @@ func (g *Guide) stopComponents() error {
 }
 
 func (g *Guide) stopResilience() {
+	g.cancelRunContext()
 	g.pendingCleanup.Stop()
 	g.health.Stop()
+	if g.observer != nil {
+		g.observer.Stop()
+	}
 }
 
 func (g *Guide) collectUnsubscribeErrors(errs *[]error) {
@@ -992,11 +1099,11 @@ func (g *Guide) unsubscribeRequest(errs *[]error) {
 }
 
 func (g *Guide) unsubscribeAgentChannels(errs *[]error) {
-	g.agentSubs.Range(func(agentID string, subs *agentSubscriptions) bool {
+	snapshot := g.agentSubs.Snapshot()
+	for _, subs := range snapshot {
 		g.unsubscribeAgentSubs(errs, subs)
-		g.agentSubs.Delete(agentID)
-		return true
-	})
+	}
+	g.agentSubs.Clear()
 }
 
 func (g *Guide) unsubscribeAgentSubs(errs *[]error, subs *agentSubscriptions) {
@@ -1041,6 +1148,11 @@ func (g *Guide) RouteCacheStats() RouteCacheStats {
 
 // handleRequestMessage processes incoming request messages from the event bus
 func (g *Guide) handleRequestMessage(msg *Message) error {
+	ctx := g.processingContext()
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+
 	if msg.Type != MessageTypeRequest {
 		return nil
 	}
@@ -1050,8 +1162,11 @@ func (g *Guide) handleRequestMessage(msg *Message) error {
 		return fmt.Errorf("invalid request payload")
 	}
 
-	forwarded, err := g.Route(context.Background(), req)
+	forwarded, err := g.routeWithRetry(ctx, req, msg.CorrelationID, req.SourceAgentID)
 	if err != nil {
+		if g.isInterruptError(err) {
+			return nil
+		}
 		return g.publishRouteError(msg.CorrelationID, req.SourceAgentID, err)
 	}
 
@@ -1060,10 +1175,155 @@ func (g *Guide) handleRequestMessage(msg *Message) error {
 		return fmt.Errorf("no pending request found for correlation ID: %s", forwarded.CorrelationID)
 	}
 
+	if g.isGuideTarget(pending.TargetAgentID) {
+		return g.respondToGuideRequest(ctx, pending, req)
+	}
+
 	return g.publishForwardedRequest(pending.TargetAgentID, forwarded)
 }
 
+func (g *Guide) isGuideTarget(targetAgentID string) bool {
+	return strings.EqualFold(targetAgentID, g.agentID) ||
+		strings.EqualFold(targetAgentID, "guide") ||
+		strings.EqualFold(targetAgentID, "g")
+}
+
+func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingRequest, req *RouteRequest) error {
+	reply, err := g.generateGuideReply(ctx, req.Input, pending.CorrelationID, pending.SourceAgentID)
+	resp := &RouteResponse{
+		CorrelationID:       pending.CorrelationID,
+		RespondingAgentID:   g.agentID,
+		RespondingAgentName: "Guide",
+	}
+	if err != nil {
+		resp.Success = false
+		resp.Error = err.Error()
+	} else {
+		resp.Success = true
+		resp.Data = reply
+	}
+	resolved, handleErr := g.HandleResponse(ctx, resp)
+	if handleErr != nil {
+		return nil
+	}
+	return g.publishResponseToSource(resolved.SourceAgentID, resp)
+}
+
+func (g *Guide) generateGuideReply(ctx context.Context, input, correlationID, sourceAgentID string) (string, error) {
+	request := g.newGuideSelfResponseRequest(input)
+	responder := g.guideSelfResponder()
+	cfg := respondRetryConfig()
+	var lastErr error
+	for attempt := range cfg.MaxRetries {
+		reply, err := responder.Respond(ctx, request)
+		if err == nil {
+			return strings.TrimSpace(reply), nil
+		}
+		lastErr = err
+		if !isRetryableAPIError(err) || attempt == cfg.MaxRetries-1 {
+			return "", lastErr
+		}
+		g.publishRetryStatus(correlationID, sourceAgentID, RetryStatus{
+			Attempt:     attempt + 1,
+			MaxAttempts: cfg.MaxRetries,
+			Err:         err,
+		})
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(retryBackoffDuration(attempt, cfg)):
+		}
+	}
+	return "", lastErr
+}
+
+func (g *Guide) guideSelfResponder() GuideSelfResponder {
+	if g.selfResponder != nil {
+		return g.selfResponder
+	}
+	return NewStaticGuideResponder()
+}
+
+func (g *Guide) newGuideSelfResponseRequest(input string) GuideSelfResponseRequest {
+	return GuideSelfResponseRequest{
+		Input:              input,
+		AgentID:            g.agentID,
+		PendingRequests:    g.pending.Count(),
+		RegisteredAgentIDs: g.registeredAgentIDs(),
+	}
+}
+
+func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlationID, sourceAgentID string) (*ForwardedRequest, error) {
+	cfg := classifyRetryConfig()
+	var lastErr error
+	for attempt := range cfg.MaxRetries {
+		result, err := g.Route(ctx, req)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !isRetryableAPIError(err) || attempt == cfg.MaxRetries-1 {
+			return nil, lastErr
+		}
+		g.publishRetryStatus(correlationID, sourceAgentID, RetryStatus{
+			Attempt:     attempt + 1,
+			MaxAttempts: cfg.MaxRetries,
+			Err:         err,
+		})
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryBackoffDuration(attempt, cfg)):
+		}
+	}
+	return nil, lastErr
+}
+
+func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status RetryStatus) {
+	if g.bus == nil || !g.running {
+		return
+	}
+	event := &StreamEvent{
+		Type:      StreamEventRetry,
+		Data:      status,
+		Timestamp: time.Now(),
+	}
+	resp := &StreamResponse{
+		CorrelationID:     correlationID,
+		RespondingAgentID: g.agentID,
+		TargetAgentID:     sourceAgentID,
+		Event:             event,
+	}
+	busMsg := &Message{
+		ID:            generateMessageID(),
+		CorrelationID: correlationID,
+		Type:          MessageTypeStream,
+		Payload:       resp,
+	}
+	_ = g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), busMsg)
+}
+
+func (g *Guide) registeredAgentIDs() []string {
+	if g.registry == nil {
+		return nil
+	}
+	agents := g.registry.GetAll()
+	ids := make([]string, 0, len(agents))
+	for _, agent := range agents {
+		if agent == nil || agent.ID == "" {
+			continue
+		}
+		ids = append(ids, agent.ID)
+	}
+	return ids
+}
+
 func (g *Guide) handleResponseMessage(msg *Message) error {
+	ctx := g.processingContext()
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+
 	switch msg.Type {
 	case MessageTypeResponse:
 		resp, ok := msg.GetRouteResponse()
@@ -1071,7 +1331,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			return fmt.Errorf("invalid response payload")
 		}
 
-		pending, err := g.HandleResponse(context.Background(), resp)
+		pending, err := g.HandleResponse(ctx, resp)
 		if err != nil {
 			return nil
 		}
@@ -1096,6 +1356,11 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 
 // handleErrorMessage processes incoming error messages from agent error channels
 func (g *Guide) handleErrorMessage(msg *Message) error {
+	ctx := g.processingContext()
+	if err := ctx.Err(); err != nil {
+		return nil
+	}
+
 	if msg.Type != MessageTypeError {
 		return nil
 	}
@@ -1106,12 +1371,49 @@ func (g *Guide) handleErrorMessage(msg *Message) error {
 	}
 
 	resp := g.routeResponseFromError(msg, errStr)
-	pending, err := g.HandleResponse(context.Background(), resp)
+	pending, err := g.HandleResponse(ctx, resp)
 	if err != nil {
 		return nil
 	}
 
 	return g.publishErrorToSource(pending.SourceAgentID, msg.CorrelationID, msg.SourceAgentID, errStr)
+}
+
+func (g *Guide) setRunContext(parent context.Context) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	runCtx, cancel := context.WithCancel(parent)
+
+	g.runMu.Lock()
+	g.runCtx = runCtx
+	g.runCancel = cancel
+	g.runMu.Unlock()
+}
+
+func (g *Guide) processingContext() context.Context {
+	g.runMu.RLock()
+	ctx := g.runCtx
+	g.runMu.RUnlock()
+	if ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+func (g *Guide) cancelRunContext() {
+	g.runMu.Lock()
+	cancel := g.runCancel
+	g.runCancel = nil
+	g.runMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (g *Guide) isInterruptError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (g *Guide) publishRouteError(correlationID string, sourceAgentID string, err error) error {

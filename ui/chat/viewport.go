@@ -55,9 +55,13 @@ func NewViewport(history *History, th *theme.Theme) *Viewport {
 	}
 }
 
+// chatPadding is the horizontal padding (left + right) applied to chat content.
+// Derived from: 1 space on each side = 2 columns total.
+const chatPadding = 2
+
 // SetSize updates the viewport dimensions.
 func (vp *Viewport) SetSize(width, height int) {
-	vp.viewWidth = max(width, 0)
+	vp.viewWidth = max(width-chatPadding, 0)
 	vp.viewHeight = max(height, 0)
 }
 
@@ -732,7 +736,7 @@ func (vp *Viewport) SetBounceOffset(offset int) {
 }
 
 // formatOutput applies the bounce offset, trims or pads the collected lines
-// to exactly viewHeight, and joins them with newlines.
+// to exactly viewHeight, applies horizontal padding, and joins with newlines.
 func (vp *Viewport) formatOutput(lines []string) string {
 	lines = applyBounceShift(lines, vp.bounceOffset, vp.viewHeight)
 
@@ -743,6 +747,11 @@ func (vp *Viewport) formatOutput(lines []string) string {
 	// Pad with empty lines at the bottom if fewer than viewHeight.
 	for len(lines) < vp.viewHeight {
 		lines = append(lines, "")
+	}
+
+	// Apply 1-space left padding to every line for visual breathing room.
+	for i, line := range lines {
+		lines[i] = " " + line
 	}
 
 	return strings.Join(lines, "\n")

@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/adalundhe/sylk/ui/component"
@@ -12,6 +13,26 @@ import (
 
 // highlightDuration is how long a copied-entry highlight persists.
 const highlightDuration = 2 * time.Second
+
+// thinkingRotateInterval is how often the fun thinking message rotates.
+const thinkingRotateInterval = 3 * time.Second
+
+// spinnerFrames is a Braille dot animation sequence (matches status/spinner.go).
+var spinnerFrames = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// thinkingMessages are rotating messages shown while waiting for the first chunk.
+var thinkingMessages = [...]string{
+	"Thinking...",
+	"Consulting the docs...",
+	"Refactoring my thoughts...",
+	"Compiling wisdom...",
+	"Brewing some ideas...",
+	"Connecting the dots...",
+	"Parsing your intent...",
+	"Chasing a thought...",
+	"Resolving dependencies...",
+	"Optimizing neural pathways...",
+}
 
 // Model is the Bubble Tea model for the chat panel.
 // It displays a scrollable history of chat entries with virtual scrolling,
@@ -28,6 +49,15 @@ type Model struct {
 	// Transient highlight for copy feedback.
 	highlightID    string
 	highlightUntil time.Time
+
+	// Thinking animation state (active between prompt submit and first content).
+	thinkingIdx      int              // History index of thinking placeholder (-1 = inactive).
+	thinkingFrame    int              // Current spinner frame index.
+	thinkingMsgIdx   int              // Current fun message index.
+	thinkingStart    time.Time        // When current thinking phase began.
+	thinkingRotateAt time.Time        // Next message rotation time.
+	retryText        string           // Retry/model-fallback status (replaces fun messages when set).
+	thinkingGradient *theme.Gradient  // Color gradient cycled during thinking animation.
 
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache string
@@ -46,9 +76,11 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 	h := NewHistory(historyCapacity)
 	vp := NewViewport(h, th)
 	return &Model{
-		history:  h,
-		viewport: vp,
-		theme:    th,
+		history:          h,
+		viewport:         vp,
+		theme:            th,
+		thinkingIdx:      -1,
+		thinkingGradient: th.Palette.ThinkingGradient(),
 	}
 }
 
@@ -82,6 +114,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.StreamErrorMsg:
 		m.viewDirty = true
 		return m, m.handleStreamError(typed)
+	case msg.RetryStatusMsg:
+		m.viewDirty = true
+		return m, m.handleRetryStatus(typed)
 	case tea.KeyMsg:
 		m.viewDirty = true
 		return m, m.handleKey(typed)
@@ -159,16 +194,38 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 	return nil
 }
 
-// handleStreamStart creates a placeholder entry and begins accumulation.
+// handleStreamStart begins accumulation. If a thinking placeholder exists,
+// it is reused; otherwise a new entry is pushed.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	// Reuse existing thinking placeholder if present.
+	if m.thinkingIdx >= 0 {
+		idx := m.thinkingIdx
+		m.history.mu.Lock()
+		if idx >= 0 && idx < m.history.count {
+			physical := m.history.logicalToPhysical(idx)
+			if start.AgentID != "" {
+				m.history.entries[physical].AgentType = start.AgentID
+			}
+			m.history.entries[physical].SessionID = start.SessionID
+		}
+		m.history.mu.Unlock()
+		m.accumulator = NewStreamAccumulator(idx)
+		m.viewDirty = true
+		return nil
+	}
+
+	// No thinking placeholder — create a new entry (streaming without prior submit).
+	now := time.Now()
 	entry := &ChatEntry{
-		ID:        uuid.New().String(),
-		Timestamp: time.Now(),
-		Source:    SourceAgent,
-		SessionID: start.SessionID,
-		Content:   "",
-		Height:    -1,
-		Streaming: true,
+		ID:           uuid.New().String(),
+		Timestamp:    now,
+		Source:       SourceAgent,
+		AgentType:    start.AgentID,
+		SessionID:    start.SessionID,
+		Content:      "",
+		Height:       -1,
+		Streaming:    true,
+		ThinkingText: spinnerFrames[0] + " " + thinkingMessages[0],
 	}
 	willEvict := m.history.Full()
 	m.history.Push(entry)
@@ -178,6 +235,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	}
 	idx := m.history.Len() - 1
 	m.accumulator = NewStreamAccumulator(idx)
+	m.startThinkingAnimation(now, idx)
 	return nil
 }
 
@@ -186,6 +244,12 @@ func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 	if m.accumulator == nil {
 		return nil
 	}
+
+	// On the first chunk, transition from thinking to content phase.
+	if m.thinkingIdx >= 0 && m.accumulator.Content() == "" {
+		m.resolveThinkingEntry()
+	}
+
 	m.accumulator.Append(chunk.Text)
 	m.syncAccumulatorToEntry()
 	return nil
@@ -195,6 +259,9 @@ func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 func (m *Model) handleStreamComplete(_ msg.StreamCompleteMsg) tea.Cmd {
 	if m.accumulator == nil {
 		return nil
+	}
+	if m.thinkingIdx >= 0 {
+		m.resolveThinkingEntry()
 	}
 	m.accumulator.Complete()
 	m.finalizeStream()
@@ -210,6 +277,9 @@ func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 		m.finalizeStream()
 		m.accumulator = nil
 	}
+	if m.thinkingIdx >= 0 {
+		m.clearThinkingState()
+	}
 
 	errEntry := &ChatEntry{
 		ID:        uuid.New().String(),
@@ -220,6 +290,27 @@ func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 		Height:    -1,
 	}
 	m.PushEntry(errEntry)
+	return nil
+}
+
+// handleRetryStatus logs each retry error as a chat entry and updates
+// the thinking indicator so the user sees progress during backoff.
+func (m *Model) handleRetryStatus(retry msg.RetryStatusMsg) tea.Cmd {
+	// Push the error as a visible chat line.
+	errEntry := &ChatEntry{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Source:    SourceError,
+		SessionID: retry.SessionID,
+		Content:   fmt.Sprintf("retry %d/%d: %s", retry.Attempt, retry.MaxAttempts, retry.Error),
+		Height:    -1,
+	}
+	m.PushEntry(errEntry)
+
+	// Also update the thinking spinner so it reflects the retry state.
+	if m.thinkingIdx >= 0 {
+		m.retryText = fmt.Sprintf("retrying (%d/%d)...", retry.Attempt, retry.MaxAttempts)
+	}
 	return nil
 }
 
@@ -266,6 +357,7 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 	if willEvict {
 		m.viewport.AdjustSelectionForEviction()
 	}
+	m.viewDirty = true
 }
 
 // ScrollUp scrolls the chat viewport up by one line.
@@ -298,10 +390,13 @@ func (m *Model) SetBounceOffset(offset int) {
 func (m *Model) IsStreaming() bool { return m.accumulator != nil }
 
 // HasActiveAnimation reports whether any tick-driven animation is running
-// (highlight countdown or edge flash).
+// (thinking spinner, highlight countdown, edge flash, or streaming).
 func (m *Model) HasActiveAnimation() bool {
 	now := time.Now()
-	return now.Before(m.highlightUntil) || m.viewport.HasEdgeFlash(now)
+	return m.thinkingIdx >= 0 ||
+		m.accumulator != nil ||
+		now.Before(m.highlightUntil) ||
+		m.viewport.HasEdgeFlash(now)
 }
 
 // EntryAtViewLine returns the chat entry visible at the given viewport-relative
@@ -355,6 +450,148 @@ func (m *Model) handleDecorTick(now time.Time) {
 	if prevHL != afterHL || prevFlash != afterFlash {
 		m.viewDirty = true
 	}
+
+	// Animate thinking indicator while streaming with no content yet.
+	m.tickThinking(now)
+}
+
+// tickThinking advances the thinking spinner and rotates the fun message.
+// Active whenever a thinking placeholder exists (streaming or non-streaming).
+func (m *Model) tickThinking(now time.Time) {
+	if m.thinkingIdx < 0 || m.thinkingStart.IsZero() {
+		return
+	}
+
+	// Advance spinner frame.
+	m.thinkingFrame = (m.thinkingFrame + 1) % len(spinnerFrames)
+
+	// Rotate message every thinkingRotateInterval.
+	if !now.Before(m.thinkingRotateAt) {
+		m.thinkingMsgIdx = (m.thinkingMsgIdx + 1) % len(thinkingMessages)
+		m.thinkingRotateAt = now.Add(thinkingRotateInterval)
+	}
+
+	elapsed := now.Sub(m.thinkingStart).Seconds()
+	var message string
+	if m.retryText != "" {
+		message = m.retryText
+	} else {
+		message = thinkingMessages[m.thinkingMsgIdx]
+	}
+	text := fmt.Sprintf("%s %s  %.1fs",
+		spinnerFrames[m.thinkingFrame],
+		message,
+		elapsed,
+	)
+
+	// Sample gradient color for this tick.
+	gradientColor := string(m.thinkingGradient.Sample(now.Sub(m.thinkingStart)))
+
+	idx := m.thinkingIdx
+	m.history.mu.Lock()
+	if idx >= 0 && idx < m.history.count {
+		physical := m.history.logicalToPhysical(idx)
+		m.history.entries[physical].ThinkingText = text
+		m.history.entries[physical].ThinkingColor = gradientColor
+		m.history.entries[physical].RenderedLines = nil
+		m.history.entries[physical].CodeRegions = nil
+		m.history.entries[physical].Height = -1
+	}
+	m.history.mu.Unlock()
+	m.viewDirty = true
+}
+
+// ---------------------------------------------------------------------------
+// Thinking lifecycle (called from app.go)
+// ---------------------------------------------------------------------------
+
+// BeginThinking pushes a placeholder agent entry with a spinner animation.
+// Called when the user submits a prompt, before any response arrives.
+func (m *Model) BeginThinking(agentType string) {
+	now := time.Now()
+	entry := &ChatEntry{
+		ID:           uuid.New().String(),
+		Timestamp:    now,
+		Source:       SourceAgent,
+		AgentType:    agentType,
+		Content:      "",
+		Height:       -1,
+		Streaming:    true,
+		ThinkingText: spinnerFrames[0] + " " + thinkingMessages[0],
+	}
+	willEvict := m.history.Full()
+	m.history.Push(entry)
+	m.viewport.OnNewEntry()
+	if willEvict {
+		m.viewport.AdjustSelectionForEviction()
+	}
+	idx := m.history.Len() - 1
+	m.startThinkingAnimation(now, idx)
+	m.viewDirty = true
+}
+
+// FinishThinking fills the thinking placeholder with a complete response.
+// Used for non-streaming responses (e.g. GuideResponseMsg).
+func (m *Model) FinishThinking(entry *ChatEntry) {
+	if m.thinkingIdx < 0 {
+		m.PushEntry(entry)
+		return
+	}
+
+	elapsed := time.Since(m.thinkingStart)
+	idx := m.thinkingIdx
+
+	m.history.mu.Lock()
+	if idx >= 0 && idx < m.history.count {
+		physical := m.history.logicalToPhysical(idx)
+		e := &m.history.entries[physical]
+		e.Content = entry.Content
+		e.Source = entry.Source
+		e.AgentType = entry.AgentType
+		e.AgentID = entry.AgentID
+		e.Timestamp = entry.Timestamp
+		e.ThinkingText = ""
+		e.ThinkingElapsed = elapsed
+		e.Streaming = false
+		e.RenderedLines = nil
+		e.CodeRegions = nil
+		e.Height = -1
+	}
+	m.history.mu.Unlock()
+
+	m.clearThinkingState()
+	m.viewDirty = true
+}
+
+// startThinkingAnimation initializes the animation fields for a thinking entry.
+func (m *Model) startThinkingAnimation(now time.Time, idx int) {
+	m.thinkingIdx = idx
+	m.thinkingStart = now
+	m.thinkingFrame = 0
+	m.thinkingMsgIdx = 0
+	m.thinkingRotateAt = now.Add(thinkingRotateInterval)
+}
+
+// resolveThinkingEntry transitions the thinking placeholder to content phase,
+// recording the elapsed thinking time.
+func (m *Model) resolveThinkingEntry() {
+	elapsed := time.Since(m.thinkingStart)
+	idx := m.thinkingIdx
+	m.history.mu.Lock()
+	if idx >= 0 && idx < m.history.count {
+		physical := m.history.logicalToPhysical(idx)
+		m.history.entries[physical].ThinkingElapsed = elapsed
+		m.history.entries[physical].ThinkingText = ""
+	}
+	m.history.mu.Unlock()
+	m.clearThinkingState()
+}
+
+// clearThinkingState resets all thinking animation fields.
+func (m *Model) clearThinkingState() {
+	m.thinkingIdx = -1
+	m.thinkingStart = time.Time{}
+	m.retryText = ""
 }
 
 // syncAccumulatorToEntry writes the accumulated content back into the

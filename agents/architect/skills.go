@@ -399,7 +399,7 @@ func consultKnowledgeSkill(a *Architect) *skills.Skill {
 
 			if params.Target == "librarian" {
 				requirements := &Requirements{Query: params.Query, Scope: params.Scope}
-				patterns, err := a.consultLibrarian(ctx, requirements)
+				patterns, err := a.consultLibrarian(ctx, requirements, "")
 				if err != nil {
 					return nil, err
 				}

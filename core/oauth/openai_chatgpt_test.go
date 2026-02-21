@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -195,6 +197,142 @@ func TestOpenAIAuthService_Refresh(t *testing.T) {
 	}
 	if updated.ChatGPTPlanType != "team" {
 		t.Fatalf("plan type mismatch: %q", updated.ChatGPTPlanType)
+	}
+}
+
+type asyncDeviceAuthService struct {
+	challenge     *DeviceCodeChallenge
+	auth          *OpenAIChatGPTAuth
+	beginErr      error
+	completeErr   error
+	saveErr       error
+	completeDelay time.Duration
+	saveCalls     int32
+}
+
+func (m *asyncDeviceAuthService) BeginDeviceAuth(context.Context) (*DeviceCodeChallenge, error) {
+	if m.beginErr != nil {
+		return nil, m.beginErr
+	}
+	return m.challenge, nil
+}
+
+func (m *asyncDeviceAuthService) CompleteDeviceAuth(ctx context.Context, _ *DeviceCodeChallenge, _ time.Duration) (*OpenAIChatGPTAuth, error) {
+	if m.completeDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(m.completeDelay):
+		}
+	}
+	if m.completeErr != nil {
+		return nil, m.completeErr
+	}
+	return m.auth, nil
+}
+
+func (m *asyncDeviceAuthService) Refresh(context.Context, *OpenAIChatGPTAuth) (*OpenAIChatGPTAuth, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *asyncDeviceAuthService) Resolve(context.Context) (*OpenAIChatGPTAuth, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *asyncDeviceAuthService) Save(context.Context, *OpenAIChatGPTAuth) error {
+	atomic.AddInt32(&m.saveCalls, 1)
+	return m.saveErr
+}
+
+func (m *asyncDeviceAuthService) Load(context.Context) (*OpenAIChatGPTAuth, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (m *asyncDeviceAuthService) Delete(context.Context) error {
+	return errors.New("not implemented")
+}
+
+func TestStartDeviceAuthSession_ReturnsChallengeImmediately(t *testing.T) {
+	t.Parallel()
+
+	service := &asyncDeviceAuthService{
+		challenge: &DeviceCodeChallenge{
+			VerificationURL: "https://auth.openai.com/codex/device",
+			UserCode:        "ABCD-EFGH",
+			DeviceAuthID:    "device_123",
+			PollInterval:    time.Second,
+		},
+		auth: &OpenAIChatGPTAuth{
+			AuthMode:         "chatgpt",
+			AccessToken:      "tok_new",
+			ChatGPTAccountID: "org_new",
+		},
+		completeDelay: 120 * time.Millisecond,
+	}
+
+	start := time.Now()
+	session, err := StartDeviceAuthSession(context.Background(), service, time.Minute)
+	if err != nil {
+		t.Fatalf("StartDeviceAuthSession() error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("StartDeviceAuthSession() should return immediately, took %v", elapsed)
+	}
+	if session == nil || session.Challenge == nil {
+		t.Fatalf("expected challenge to be returned")
+	}
+	if session.Challenge.UserCode != "ABCD-EFGH" {
+		t.Fatalf("unexpected user code: %q", session.Challenge.UserCode)
+	}
+
+	select {
+	case result := <-session.Results:
+		if result.Err != nil {
+			t.Fatalf("unexpected device auth result error: %v", result.Err)
+		}
+		if result.Auth == nil || result.Auth.AccessToken != "tok_new" {
+			t.Fatalf("unexpected auth result: %+v", result.Auth)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for async device auth result")
+	}
+
+	if got := atomic.LoadInt32(&service.saveCalls); got != 1 {
+		t.Fatalf("expected Save() to be called once, got %d", got)
+	}
+}
+
+func TestStartDeviceAuthSession_CancelStopsCompletion(t *testing.T) {
+	t.Parallel()
+
+	service := &asyncDeviceAuthService{
+		challenge: &DeviceCodeChallenge{
+			VerificationURL: "https://auth.openai.com/codex/device",
+			UserCode:        "WXYZ-9876",
+			DeviceAuthID:    "device_cancel",
+			PollInterval:    time.Second,
+		},
+		auth:          &OpenAIChatGPTAuth{AccessToken: "unused", ChatGPTAccountID: "org_unused"},
+		completeDelay: 2 * time.Second,
+	}
+
+	session, err := StartDeviceAuthSession(context.Background(), service, time.Minute)
+	if err != nil {
+		t.Fatalf("StartDeviceAuthSession() error: %v", err)
+	}
+	session.Cancel()
+
+	select {
+	case result := <-session.Results:
+		if !errors.Is(result.Err, context.Canceled) {
+			t.Fatalf("expected context cancellation error, got %v", result.Err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for canceled device auth result")
+	}
+
+	if got := atomic.LoadInt32(&service.saveCalls); got != 0 {
+		t.Fatalf("expected Save() not to run after cancel, got %d", got)
 	}
 }
 
@@ -528,6 +666,286 @@ func TestExchangeAuthorizationCodeForm(t *testing.T) {
 	_, err := svc.(*openAIAuthService).exchangeAuthorizationCode(context.Background(), "code", "verifier")
 	if err != nil {
 		t.Fatalf("exchangeAuthorizationCode() error: %v", err)
+	}
+}
+
+func TestOpenAIAuthService_ResolveRefreshesExpiringStoredAuth(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 2, 21, 10, 0, 0, 0, time.UTC)
+	newIDToken := makeJWT(t, map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "org_refresh_auto",
+		},
+	})
+	newAccessToken := makeJWT(t, map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "org_refresh_auto",
+		},
+	})
+
+	var refreshCalls int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/oauth/token" {
+				return jsonResponse(http.StatusNotFound, `{"message":"not found"}`), nil
+			}
+			atomic.AddInt32(&refreshCalls, 1)
+			return jsonResponse(http.StatusOK, fmt.Sprintf(`{"access_token":%q,"id_token":%q,"refresh_token":"refresh_new","expires_in":3600}`, newAccessToken, newIDToken)), nil
+		}),
+	}
+
+	storePath := filepath.Join(t.TempDir(), "openai_auth.yaml")
+	store := NewFileOpenAIAuthStore(storePath)
+	if err := store.Save(&OpenAIChatGPTAuth{
+		AuthMode:          "chatgpt",
+		AccessToken:       "old_access",
+		RefreshToken:      "refresh_old",
+		ChatGPTAccountID:  "org_refresh_auto",
+		AccessTokenExpiry: now.Add(30 * time.Second),
+		ObtainedAt:        now.Add(-10 * time.Minute),
+	}); err != nil {
+		t.Fatalf("seed auth store: %v", err)
+	}
+
+	svc := NewOpenAIAuthService(OpenAIAuthServiceConfig{
+		Issuer:      "https://auth.openai.com",
+		ClientID:    "client",
+		HTTPClient:  client,
+		Store:       store,
+		DotEnvPaths: []string{},
+		Now: func() time.Time {
+			return now
+		},
+		Sleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+	})
+
+	auth, err := svc.Resolve(context.Background())
+	if err != nil {
+		t.Fatalf("Resolve() error: %v", err)
+	}
+	if auth.AccessToken != newAccessToken {
+		t.Fatalf("expected refreshed access token")
+	}
+	if atomic.LoadInt32(&refreshCalls) != 1 {
+		t.Fatalf("expected one refresh call, got %d", atomic.LoadInt32(&refreshCalls))
+	}
+
+	persisted, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() persisted auth: %v", err)
+	}
+	if persisted == nil || persisted.RefreshToken != "refresh_new" {
+		t.Fatalf("expected refreshed auth persisted, got %#v", persisted)
+	}
+}
+
+func TestOpenAIAuthService_ResolveRefreshSingleflight(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 2, 21, 10, 0, 0, 0, time.UTC)
+	newIDToken := makeJWT(t, map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "org_sf",
+		},
+	})
+	newAccessToken := makeJWT(t, map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "org_sf",
+		},
+	})
+
+	var refreshCalls int32
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/oauth/token" {
+				return jsonResponse(http.StatusNotFound, `{"message":"not found"}`), nil
+			}
+			atomic.AddInt32(&refreshCalls, 1)
+			time.Sleep(20 * time.Millisecond)
+			return jsonResponse(http.StatusOK, fmt.Sprintf(`{"access_token":%q,"id_token":%q,"refresh_token":"refresh_new","expires_in":3600}`, newAccessToken, newIDToken)), nil
+		}),
+	}
+
+	store := NewFileOpenAIAuthStore(filepath.Join(t.TempDir(), "openai_auth.yaml"))
+	if err := store.Save(&OpenAIChatGPTAuth{
+		AuthMode:          "chatgpt",
+		AccessToken:       "old_access",
+		RefreshToken:      "refresh_old",
+		ChatGPTAccountID:  "org_sf",
+		AccessTokenExpiry: now.Add(10 * time.Second),
+		ObtainedAt:        now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+
+	svc := NewOpenAIAuthService(OpenAIAuthServiceConfig{
+		Issuer:      "https://auth.openai.com",
+		ClientID:    "client",
+		HTTPClient:  client,
+		Store:       store,
+		DotEnvPaths: []string{},
+		Now: func() time.Time {
+			return now
+		},
+		Sleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+	})
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			auth, err := svc.Resolve(context.Background())
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if auth.AccessToken != newAccessToken {
+				errCh <- fmt.Errorf("unexpected access token")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("Resolve() error: %v", err)
+	}
+	if got := atomic.LoadInt32(&refreshCalls); got != 1 {
+		t.Fatalf("expected exactly one refresh call, got %d", got)
+	}
+}
+
+func TestOpenAIAuthService_PollAuthorizationCodeHandlesSlowDownAndAccessDenied(t *testing.T) {
+	t.Parallel()
+
+	var calls int32
+	var sleeps []time.Duration
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/api/accounts/deviceauth/token" {
+				return jsonResponse(http.StatusNotFound, `{"message":"not found"}`), nil
+			}
+			n := atomic.AddInt32(&calls, 1)
+			if n == 1 {
+				return jsonResponse(http.StatusBadRequest, `{"error":"slow_down"}`), nil
+			}
+			return jsonResponse(http.StatusOK, `{"authorization_code":"auth_code","code_verifier":"verifier","code_challenge":"challenge"}`), nil
+		}),
+	}
+
+	svc := NewOpenAIAuthService(OpenAIAuthServiceConfig{
+		Issuer:      "https://auth.openai.com",
+		ClientID:    "client",
+		HTTPClient:  client,
+		Store:       NewFileOpenAIAuthStore(filepath.Join(t.TempDir(), "openai_auth.yaml")),
+		DotEnvPaths: []string{},
+		Sleep: func(_ context.Context, d time.Duration) error {
+			sleeps = append(sleeps, d)
+			return nil
+		},
+	})
+
+	challenge := &DeviceCodeChallenge{
+		DeviceAuthID: "dev_1",
+		UserCode:     "CODE-1",
+		PollInterval: time.Second,
+	}
+	token, err := svc.(*openAIAuthService).pollForAuthorizationCode(context.Background(), challenge)
+	if err != nil {
+		t.Fatalf("pollForAuthorizationCode() error: %v", err)
+	}
+	if token.AuthorizationCode != "auth_code" {
+		t.Fatalf("unexpected token response: %+v", token)
+	}
+	if len(sleeps) == 0 || sleeps[0] < time.Second {
+		t.Fatalf("expected slow_down backoff sleep >= 1s, got %v", sleeps)
+	}
+
+	denyClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/api/accounts/deviceauth/token" {
+				return jsonResponse(http.StatusNotFound, `{"message":"not found"}`), nil
+			}
+			return jsonResponse(http.StatusBadRequest, `{"error":"access_denied","error_description":"declined"}`), nil
+		}),
+	}
+	denySvc := NewOpenAIAuthService(OpenAIAuthServiceConfig{
+		Issuer:      "https://auth.openai.com",
+		ClientID:    "client",
+		HTTPClient:  denyClient,
+		Store:       NewFileOpenAIAuthStore(filepath.Join(t.TempDir(), "openai_auth.yaml")),
+		DotEnvPaths: []string{},
+		Sleep: func(context.Context, time.Duration) error {
+			return nil
+		},
+	})
+	_, err = denySvc.(*openAIAuthService).pollForAuthorizationCode(context.Background(), challenge)
+	if err == nil || !errors.Is(err, ErrAuthAccessDenied) {
+		t.Fatalf("expected access denied error, got %v", err)
+	}
+}
+
+func TestEncryptedFileOpenAIAuthStore_SaveLoadAndNoPlaintextLeak(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "auth.enc.yaml")
+	store := NewEncryptedFileOpenAIAuthStore(path, EncryptedFileOpenAIAuthStoreConfig{})
+	auth := &OpenAIChatGPTAuth{
+		AuthMode:         "chatgpt",
+		AccessToken:      "secret_access_token",
+		RefreshToken:     "secret_refresh_token",
+		ChatGPTAccountID: "org_secure",
+	}
+	if err := store.Save(auth); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if loaded.AccessToken != auth.AccessToken || loaded.RefreshToken != auth.RefreshToken {
+		t.Fatalf("loaded auth mismatch: %#v", loaded)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read encrypted file: %v", err)
+	}
+	if strings.Contains(string(raw), auth.AccessToken) || strings.Contains(string(raw), auth.RefreshToken) {
+		t.Fatal("encrypted auth file leaked plaintext tokens")
+	}
+}
+
+func TestEncryptedFileOpenAIAuthStore_LoadLegacyPlaintext(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "auth.yaml")
+	legacy := OpenAIChatGPTAuth{
+		AuthMode:         "chatgpt",
+		AccessToken:      "legacy_access",
+		ChatGPTAccountID: "org_legacy",
+	}
+	encoded, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy payload: %v", err)
+	}
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		t.Fatalf("write legacy file: %v", err)
+	}
+
+	store := NewEncryptedFileOpenAIAuthStore(path, EncryptedFileOpenAIAuthStoreConfig{})
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if loaded.AccessToken != legacy.AccessToken {
+		t.Fatalf("expected legacy token, got %#v", loaded)
 	}
 }
 

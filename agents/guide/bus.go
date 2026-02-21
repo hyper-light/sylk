@@ -611,7 +611,7 @@ func NewAgentReadyMessage(id string, info *AgentRoutingInfo) *Message {
 		AgentID:   info.ID,
 		AgentName: info.Name,
 		Aliases:   info.Aliases,
-		Channels:  NewAgentChannels(info.ID),
+		Channels:  NewAgentChannels(info.Type, info.ID),
 		Ready:     true,
 		ReadyAt:   time.Now(),
 	}

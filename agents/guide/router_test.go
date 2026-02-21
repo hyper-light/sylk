@@ -329,7 +329,7 @@ func TestRouter_FormatAsDSL(t *testing.T) {
 	dsl := router.FormatAsDSL(result)
 	assert.Contains(t, dsl, "@archivalist:")
 	assert.Contains(t, dsl, "recall")
-	assert.Contains(t, dsl, "patterns")
+	assert.Contains(t, dsl, "history")
 }
 
 // TestRouter_MultipleDSLCommands tests routing multiple DSL commands

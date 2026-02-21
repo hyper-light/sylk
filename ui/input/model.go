@@ -56,12 +56,12 @@ var (
 // New creates a Model with the given theme, history capacity, and completion providers.
 func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) *Model {
 	return &Model{
-		lines:     [][]rune{nil},
-		maxHeight: defaultMaxHeight,
-		history:   NewInputHistory(historyCapacity),
-		completer:     NewCompleter(providers...),
-		theme:         th,
-		placeholder:   "Type a message...",
+		lines:       [][]rune{nil},
+		maxHeight:   defaultMaxHeight,
+		history:     NewInputHistory(historyCapacity),
+		completer:   NewCompleter(providers...),
+		theme:       th,
+		placeholder: "Type a message...",
 	}
 }
 

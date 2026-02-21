@@ -61,9 +61,9 @@ type AgentHealth struct {
 	avgResponseTimeNs int64
 
 	// Response time tracking (rolling window)
-	responseTimes    []int64
-	responseTimeIdx  int
-	responseTimeCap  int
+	responseTimes   []int64
+	responseTimeIdx int
+	responseTimeCap int
 
 	// Configuration
 	heartbeatInterval time.Duration
@@ -228,9 +228,11 @@ type HealthMonitor struct {
 	circuits *CircuitBreakerRegistry
 
 	// Control
-	stopCh  chan struct{}
-	stopped bool
-	mu      sync.Mutex
+	stopCh       chan struct{}
+	stopped      bool
+	started      bool
+	heartbeatSub Subscription
+	mu           sync.Mutex
 
 	// Callbacks
 	onUnhealthy func(agentID string, status HealthStatus)
@@ -260,21 +262,59 @@ func NewHealthMonitor(bus EventBus, cfg HealthMonitorConfig) *HealthMonitor {
 
 // Start begins health monitoring
 func (m *HealthMonitor) Start(ctx context.Context) {
-	// Subscribe to heartbeat topic
-	m.bus.SubscribeAsync("agents.heartbeat", m.handleHeartbeat)
+	m.mu.Lock()
+	if m.stopped || m.started {
+		m.mu.Unlock()
+		return
+	}
+	m.started = true
+	m.mu.Unlock()
+
+	sub, err := m.bus.SubscribeAsync("agents.heartbeat", m.handleHeartbeat)
+	if err == nil {
+		m.storeHeartbeatSub(sub)
+	}
 
 	// Start periodic check
 	go m.checkLoop(ctx)
+	go m.stopOnContextDone(ctx)
+}
+
+func (m *HealthMonitor) stopOnContextDone(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	<-ctx.Done()
+	m.Stop()
+}
+
+func (m *HealthMonitor) storeHeartbeatSub(sub Subscription) {
+	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		_ = sub.Unsubscribe()
+		return
+	}
+	m.heartbeatSub = sub
+	m.mu.Unlock()
 }
 
 // Stop halts health monitoring
 func (m *HealthMonitor) Stop() {
 	m.mu.Lock()
-	if !m.stopped {
-		m.stopped = true
-		close(m.stopCh)
+	if m.stopped {
+		m.mu.Unlock()
+		return
 	}
+	m.stopped = true
+	sub := m.heartbeatSub
+	m.heartbeatSub = nil
+	close(m.stopCh)
 	m.mu.Unlock()
+
+	if sub != nil {
+		_ = sub.Unsubscribe()
+	}
 }
 
 // Register registers an agent for health monitoring
@@ -418,10 +458,10 @@ func (m *HealthMonitor) Stats() HealthMonitorStats {
 
 // HealthMonitorStats contains health monitor statistics
 type HealthMonitorStats struct {
-	Total    int                         `json:"total"`
-	Healthy  int                         `json:"healthy"`
-	Agents   map[string]AgentHealthInfo  `json:"agents"`
-	ByStatus map[HealthStatus]int        `json:"by_status"`
+	Total    int                        `json:"total"`
+	Healthy  int                        `json:"healthy"`
+	Agents   map[string]AgentHealthInfo `json:"agents"`
+	ByStatus map[HealthStatus]int       `json:"by_status"`
 }
 
 // =============================================================================
@@ -505,6 +545,6 @@ func (s *HeartbeatSender) sendHeartbeat() {
 type HeartbeatPayload struct {
 	AgentID   string `json:"agent_id"`
 	Timestamp int64  `json:"timestamp"`
-	Load      int    `json:"load,omitempty"`      // Optional: current load
-	Capacity  int    `json:"capacity,omitempty"`  // Optional: max capacity
+	Load      int    `json:"load,omitempty"`     // Optional: current load
+	Capacity  int    `json:"capacity,omitempty"` // Optional: max capacity
 }

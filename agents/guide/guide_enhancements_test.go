@@ -20,7 +20,7 @@ func TestCapabilityIndex_Index(t *testing.T) {
 		Name: "test",
 		Capabilities: guide.AgentCapabilities{
 			Intents:  []guide.Intent{guide.IntentRecall, guide.IntentStore},
-					Domains: []guide.Domain{guide.DomainHistory, guide.DomainLocal},
+			Domains:  []guide.Domain{guide.DomainHistory, guide.DomainLocal},
 			Tags:     []string{"history", "memory"},
 			Keywords: []string{"remember", "recall", "store"},
 		},
@@ -64,6 +64,172 @@ func TestCapabilityIndex_FindByIntent(t *testing.T) {
 	storeAgents := ci.FindByIntent(guide.IntentStore)
 	require.Len(t, storeAgents, 1)
 	assert.Equal(t, "agent2", storeAgents[0].ID)
+}
+
+func TestGuideStop_WithRegisteredAgent_DoesNotDeadlock(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+
+	g, err := guide.NewWithClassifier(&guide.MockClassifierClient{DefaultTarget: "mock-agent"}, guide.Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, g.Start(ctx))
+
+	err = g.Register(&guide.AgentRoutingInfo{
+		ID:   "mock-agent",
+		Type: "mock-agent",
+		Name: "MockAgent",
+		Registration: &guide.AgentRegistration{
+			ID:          "mock-agent",
+			Name:        "MockAgent",
+			Description: "mock target agent",
+			Capabilities: guide.AgentCapabilities{
+				Domains: guide.AllDomains(),
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- g.Stop()
+	}()
+
+	select {
+	case stopErr := <-done:
+		require.NoError(t, stopErr)
+	case <-time.After(2 * time.Second):
+		t.Fatal("guide.Stop() deadlocked with registered agent subscriptions")
+	}
+}
+
+func TestGuide_ExplicitGuideTargetRespondsToSource(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+
+	g, err := guide.NewWithClassifier(&guide.MockClassifierClient{DefaultTarget: "mock-agent"}, guide.Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, g.Start(ctx))
+	defer func() {
+		_ = g.Stop()
+	}()
+
+	respCh := make(chan *guide.Message, 1)
+	sub, err := bus.Subscribe(guide.TopicResponses("tui", "tui"), func(m *guide.Message) error {
+		select {
+		case respCh <- m:
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer func() {
+		_ = sub.Unsubscribe()
+	}()
+
+	req := &guide.RouteRequest{
+		CorrelationID: "corr-guide-target",
+		Input:         "status",
+		SourceAgentID: "tui",
+		TargetAgentID: "guide",
+		Timestamp:     time.Now(),
+	}
+	err = bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req))
+	require.NoError(t, err)
+
+	select {
+	case busMsg := <-respCh:
+		resp, ok := busMsg.GetRouteResponse()
+		require.True(t, ok, "expected RouteResponse payload")
+		assert.Equal(t, req.CorrelationID, resp.CorrelationID)
+		assert.True(t, resp.Success)
+		text, ok := resp.Data.(string)
+		require.True(t, ok, "expected string response data")
+		assert.NotEmpty(t, text)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for guide response")
+	}
+}
+
+type fixedGuideResponder struct {
+	reply string
+}
+
+func (r fixedGuideResponder) Respond(_ context.Context, _ guide.GuideSelfResponseRequest) (string, error) {
+	return r.reply, nil
+}
+
+func TestGuide_ExplicitGuideTarget_UsesConfiguredSelfResponder(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+
+	g, err := guide.NewWithClassifier(&guide.MockClassifierClient{DefaultTarget: "mock-agent"}, guide.Config{
+		Bus:           bus,
+		AgentID:       "guide",
+		SessionID:     "test-session",
+		SelfResponder: fixedGuideResponder{reply: "real guide response"},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, g.Start(ctx))
+	defer func() {
+		_ = g.Stop()
+	}()
+
+	respCh := make(chan *guide.Message, 1)
+	sub, err := bus.Subscribe(guide.TopicResponses("tui", "tui"), func(m *guide.Message) error {
+		select {
+		case respCh <- m:
+		default:
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer func() {
+		_ = sub.Unsubscribe()
+	}()
+
+	req := &guide.RouteRequest{
+		CorrelationID: "corr-guide-self-responder",
+		Input:         "hello there",
+		SourceAgentID: "tui",
+		TargetAgentID: "guide",
+		Timestamp:     time.Now(),
+	}
+	err = bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req))
+	require.NoError(t, err)
+
+	select {
+	case busMsg := <-respCh:
+		resp, ok := busMsg.GetRouteResponse()
+		require.True(t, ok, "expected RouteResponse payload")
+		text, ok := resp.Data.(string)
+		require.True(t, ok, "expected string response data")
+		assert.Equal(t, "real guide response", text)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for guide response")
+	}
 }
 
 func TestCapabilityIndex_FindByKeyword(t *testing.T) {
@@ -131,7 +297,7 @@ func TestGuide_HooksStats(t *testing.T) {
 	})
 	stats := g.Hooks().Stats()
 	assert.Equal(t, 1, stats.PrePromptHooks)
-	assert.Equal(t, 1, stats.TotalHooks)
+	assert.Equal(t, 2, stats.TotalHooks)
 }
 
 func TestSessionRouter_GetOrCreateSession(t *testing.T) {

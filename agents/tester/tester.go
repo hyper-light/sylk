@@ -119,7 +119,7 @@ func (t *Tester) Start(bus guide.EventBus) error {
 	}
 
 	t.bus = bus
-	t.channels = guide.NewAgentChannels("tester")
+	t.channels = guide.NewAgentChannels("tester", "tester")
 
 	var err error
 	t.requestSub, err = bus.SubscribeAsync(t.channels.Requests, t.handleBusRequest)

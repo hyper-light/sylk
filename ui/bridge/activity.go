@@ -2,8 +2,8 @@ package bridge
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
@@ -11,21 +11,23 @@ import (
 )
 
 const (
-	activityBridgeName   = "bridge.activity"
-	activityBufferSize   = 256
-	activityDrainTimeout = 30 * time.Second
+	activityBridgeName = "bridge.activity"
+	activityBufferSize = 256
+	// Zero uses the scope's max lifetime; activity bridge is long-lived for the UI session.
+	activityDrainTimeout = 0
 )
 
 // ActivityBridge implements both events.EventSubscriber and Bridge.
 // It subscribes to the ActivityEventBus and forwards events as
 // msg.ActivityEventMsg to the Bubble Tea program.
 type ActivityBridge struct {
-	id      string
-	bus     *events.ActivityEventBus
-	scope   *concurrency.GoroutineScope
-	buffer  chan *events.ActivityEvent
-	dropped atomic.Int64
-	done    chan struct{}
+	id       string
+	bus      *events.ActivityEventBus
+	scope    *concurrency.GoroutineScope
+	buffer   chan *events.ActivityEvent
+	dropped  atomic.Int64
+	done     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewActivityBridge creates a bridge that converts ActivityEventBus events
@@ -70,8 +72,10 @@ func (b *ActivityBridge) Start(program TeaProgram) error {
 
 // Stop unsubscribes from the bus and signals the drain goroutine to exit.
 func (b *ActivityBridge) Stop() {
-	b.bus.Unsubscribe(b.id)
-	close(b.done)
+	b.stopOnce.Do(func() {
+		b.bus.Unsubscribe(b.id)
+		close(b.done)
+	})
 }
 
 // Name returns the bridge identifier.
@@ -84,6 +88,9 @@ func (b *ActivityBridge) DroppedCount() int64 { return b.dropped.Load() }
 func (b *ActivityBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 	return func(ctx context.Context) error {
 		for {
+			if stop, err := shouldStop(b.done, ctx); stop {
+				return err
+			}
 			select {
 			case event := <-b.buffer:
 				program.Send(msg.ActivityEventMsg{Event: event})

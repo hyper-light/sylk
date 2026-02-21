@@ -134,9 +134,11 @@ func GuideRegistration() *AgentRegistration {
 			Intents: []Intent{
 				IntentHelp,
 				IntentStatus,
+				IntentChat,
 			},
 			Domains: []Domain{
 				DomainSystem,
+				DomainGeneral,
 			},
 		},
 		Constraints: AgentConstraints{
