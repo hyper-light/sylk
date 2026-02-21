@@ -1,124 +1,310 @@
 package guide
 
 import (
+	"math"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
+
+	"github.com/dgraph-io/ristretto"
 )
 
 // =============================================================================
 // Route Cache
 // =============================================================================
 //
-// RouteCache provides fast lookup for previously classified routes.
-// This eliminates LLM calls for repeat queries, reducing token costs to zero.
-//
-// Cache hierarchy:
-// 1. Exact match (normalized input string)
-// 2. Future: Semantic similarity matching
+// RouteCache provides a hybrid cache strategy:
+// 1. Exact normalized lookup
+// 2. Hot-path in-memory admission cache (Ristretto)
+// 3. Semantic fallback based on token overlap
 
-// RouteCache caches classification results to avoid repeat LLM calls
 type RouteCache struct {
 	mu      sync.RWMutex
 	entries map[string]*CachedRoute
-	maxSize int
-	ttl     time.Duration
+	index   map[string]map[string]struct{}
 
-	// Stats
-	hits   int64
-	misses int64
+	maxSize               int
+	ttl                   time.Duration
+	enableSemantic        bool
+	semanticThreshold     float64
+	maxSemanticCandidates int
+
+	hot *ristretto.Cache
+
+	hits           int64
+	misses         int64
+	hotHits        int64
+	similarityHits int64
 }
 
-// CachedRoute represents a cached classification result
 type CachedRoute struct {
-	// Original input (normalized)
 	Input string `json:"input"`
 
-	// Classification result
 	TargetAgentID string  `json:"target_agent_id"`
 	Intent        Intent  `json:"intent"`
 	Domain        Domain  `json:"domain"`
 	Confidence    float64 `json:"confidence"`
 
-	// Cache metadata
 	CachedAt  time.Time `json:"cached_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 	HitCount  int64     `json:"hit_count"`
 
-	// For promotion to learned pattern
 	ClassificationCount int64 `json:"classification_count"`
 }
 
-// RouteCacheConfig configures the route cache
 type RouteCacheConfig struct {
 	MaxSize int           // Maximum entries (default: 10000)
 	TTL     time.Duration // Entry lifetime (default: 1 hour)
+
+	EnableSemantic        bool
+	SemanticThreshold     float64
+	MaxSemanticCandidates int
+
+	EnableHotCache bool
+	HotNumCounters int64
+	HotMaxCost     int64
+	HotBufferItems int64
 }
 
-// DefaultRouteCacheConfig returns sensible defaults
 func DefaultRouteCacheConfig() RouteCacheConfig {
 	return RouteCacheConfig{
-		MaxSize: 10000,
-		TTL:     1 * time.Hour,
+		MaxSize:               10000,
+		TTL:                   1 * time.Hour,
+		EnableSemantic:        true,
+		SemanticThreshold:     0.86,
+		MaxSemanticCandidates: 32,
+		EnableHotCache:        true,
+		HotNumCounters:        100000,
+		HotMaxCost:            10000,
+		HotBufferItems:        64,
 	}
 }
 
-// NewRouteCache creates a new route cache
 func NewRouteCache(cfg RouteCacheConfig) *RouteCache {
+	cfg = normalizeRouteCacheConfig(cfg)
+
+	cache := &RouteCache{
+		entries:               make(map[string]*CachedRoute),
+		index:                 make(map[string]map[string]struct{}),
+		maxSize:               cfg.MaxSize,
+		ttl:                   cfg.TTL,
+		enableSemantic:        cfg.EnableSemantic,
+		semanticThreshold:     cfg.SemanticThreshold,
+		maxSemanticCandidates: cfg.MaxSemanticCandidates,
+	}
+	cache.hot = newHotRouteCache(cfg)
+	return cache
+}
+
+func normalizeRouteCacheConfig(cfg RouteCacheConfig) RouteCacheConfig {
 	if cfg.MaxSize <= 0 {
 		cfg.MaxSize = 10000
 	}
 	if cfg.TTL <= 0 {
 		cfg.TTL = 1 * time.Hour
 	}
-
-	return &RouteCache{
-		entries: make(map[string]*CachedRoute),
-		maxSize: cfg.MaxSize,
-		ttl:     cfg.TTL,
+	if cfg.SemanticThreshold <= 0 || cfg.SemanticThreshold > 1 {
+		cfg.SemanticThreshold = 0.86
 	}
+	if cfg.MaxSemanticCandidates <= 0 {
+		cfg.MaxSemanticCandidates = 32
+	}
+	if cfg.HotNumCounters <= 0 {
+		cfg.HotNumCounters = int64(cfg.MaxSize * 10)
+	}
+	if cfg.HotMaxCost <= 0 {
+		cfg.HotMaxCost = int64(cfg.MaxSize)
+	}
+	if cfg.HotBufferItems <= 0 {
+		cfg.HotBufferItems = 64
+	}
+	return cfg
+}
+
+func newHotRouteCache(cfg RouteCacheConfig) *ristretto.Cache {
+	if !cfg.EnableHotCache {
+		return nil
+	}
+	hot, err := ristretto.NewCache(&ristretto.Config{
+		NumCounters: cfg.HotNumCounters,
+		MaxCost:     cfg.HotMaxCost,
+		BufferItems: cfg.HotBufferItems,
+	})
+	if err != nil {
+		return nil
+	}
+	return hot
 }
 
 // =============================================================================
 // Cache Operations
 // =============================================================================
 
-// Get retrieves a cached route for the given input.
-// Returns nil if not found or expired.
 func (c *RouteCache) Get(input string) *CachedRoute {
 	normalized := normalizeInput(input)
+	if entry := c.getHot(normalized); entry != nil {
+		c.recordHotHit()
+		c.recordHit()
+		return entry
+	}
+	if entry := c.getExact(normalized); entry != nil {
+		c.promoteHot(normalized, entry)
+		c.recordHit()
+		return entry
+	}
+	if entry := c.getSemantic(normalized); entry != nil {
+		c.promoteHot(normalized, entry)
+		c.recordSimilarityHit()
+		c.recordHit()
+		return entry
+	}
+	c.recordMiss()
+	return nil
+}
 
-	c.mu.RLock()
-	entry, ok := c.entries[normalized]
-	c.mu.RUnlock()
-
+func (c *RouteCache) getHot(key string) *CachedRoute {
+	if c == nil || c.hot == nil {
+		return nil
+	}
+	value, ok := c.hot.Get(key)
 	if !ok {
-		c.recordMiss()
 		return nil
 	}
-
-	// Check expiration
-	if time.Now().After(entry.ExpiresAt) {
-		c.mu.Lock()
-		delete(c.entries, normalized)
-		c.mu.Unlock()
-		c.recordMiss()
+	entry, ok := value.(*CachedRoute)
+	if !ok {
 		return nil
 	}
-
-	// Update hit count
-	c.mu.Lock()
-	entry.HitCount++
-	c.mu.Unlock()
-
-	c.recordHit()
+	if !c.isEntryValid(entry) {
+		c.Invalidate(key)
+		return nil
+	}
+	c.bumpHitCount(entry)
 	return entry
 }
 
-// Set stores a classification result in the cache
+func (c *RouteCache) getExact(key string) *CachedRoute {
+	c.mu.RLock()
+	entry, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	if !c.isEntryValid(entry) {
+		c.Invalidate(key)
+		return nil
+	}
+	c.bumpHitCount(entry)
+	return entry
+}
+
+func (c *RouteCache) getSemantic(key string) *CachedRoute {
+	if !c.enableSemantic {
+		return nil
+	}
+	candidates := c.semanticCandidates(key)
+	if len(candidates) == 0 {
+		return nil
+	}
+	entry, score := c.bestSemanticMatch(key, candidates)
+	if entry == nil || score < c.semanticThreshold {
+		return nil
+	}
+	c.bumpHitCount(entry)
+	return entry
+}
+
+func (c *RouteCache) semanticCandidates(key string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.index) == 0 {
+		return nil
+	}
+	collected := make(map[string]struct{})
+	for _, bucket := range semanticBuckets(key) {
+		for candidate := range c.index[bucket] {
+			collected[candidate] = struct{}{}
+			if len(collected) >= c.maxSemanticCandidates {
+				return mapKeys(collected)
+			}
+		}
+	}
+	return mapKeys(collected)
+}
+
+func (c *RouteCache) bestSemanticMatch(key string, candidates []string) (*CachedRoute, float64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	bestScore := 0.0
+	var best *CachedRoute
+	for _, candidate := range candidates {
+		entry := c.entries[candidate]
+		if !c.isEntryValid(entry) {
+			continue
+		}
+		score := semanticSimilarity(key, entry.Input)
+		if score <= bestScore {
+			continue
+		}
+		bestScore = score
+		best = entry
+	}
+	return best, bestScore
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for key := range values {
+		result = append(result, key)
+	}
+	return result
+}
+
+func (c *RouteCache) bumpHitCount(entry *CachedRoute) {
+	if entry == nil {
+		return
+	}
+	c.mu.Lock()
+	entry.HitCount++
+	c.mu.Unlock()
+}
+
+func (c *RouteCache) isEntryValid(entry *CachedRoute) bool {
+	if entry == nil {
+		return false
+	}
+	return time.Now().Before(entry.ExpiresAt)
+}
+
 func (c *RouteCache) Set(input string, result *RouteResult) {
+	if result == nil {
+		return
+	}
+	entry := c.newEntry(normalizeInput(input), result)
+	c.setEntry(entry)
+}
+
+func (c *RouteCache) SetFromRoute(input string, targetAgentID string, intent Intent, domain Domain) {
 	normalized := normalizeInput(input)
 	now := time.Now()
+	entry := &CachedRoute{
+		Input:               normalized,
+		TargetAgentID:       targetAgentID,
+		Intent:              intent,
+		Domain:              domain,
+		Confidence:          1.0,
+		CachedAt:            now,
+		ExpiresAt:           now.Add(c.ttl),
+		HitCount:            0,
+		ClassificationCount: 1,
+	}
+	c.setEntry(entry)
+}
 
+func (c *RouteCache) newEntry(normalized string, result *RouteResult) *CachedRoute {
+	now := time.Now()
 	entry := &CachedRoute{
 		Input:               normalized,
 		TargetAgentID:       string(result.TargetAgent),
@@ -130,123 +316,149 @@ func (c *RouteCache) Set(input string, result *RouteResult) {
 		HitCount:            0,
 		ClassificationCount: 1,
 	}
+	return entry
+}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Check if we need to evict
-	if len(c.entries) >= c.maxSize {
-		c.evictOldest()
+func (c *RouteCache) setEntry(entry *CachedRoute) {
+	if entry == nil {
+		return
 	}
-
-	// Check if updating existing entry
-	if existing, ok := c.entries[normalized]; ok {
-		entry.ClassificationCount = existing.ClassificationCount + 1
+	c.mu.Lock()
+	if existing := c.entries[entry.Input]; existing != nil {
 		entry.HitCount = existing.HitCount
+		entry.ClassificationCount = existing.ClassificationCount + 1
 	}
-
-	c.entries[normalized] = entry
-}
-
-// SetFromRoute stores a route directly (for learned routes from Guide)
-func (c *RouteCache) SetFromRoute(input string, targetAgentID string, intent Intent, domain Domain) {
-	normalized := normalizeInput(input)
-	now := time.Now()
-
-	entry := &CachedRoute{
-		Input:               normalized,
-		TargetAgentID:       targetAgentID,
-		Intent:              intent,
-		Domain:              domain,
-		Confidence:          1.0, // Learned routes have max confidence
-		CachedAt:            now,
-		ExpiresAt:           now.Add(c.ttl),
-		HitCount:            0,
-		ClassificationCount: 1,
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if len(c.entries) >= c.maxSize {
-		c.evictOldest()
-	}
-
-	c.entries[normalized] = entry
-}
-
-// Invalidate removes an entry from the cache
-func (c *RouteCache) Invalidate(input string) {
-	normalized := normalizeInput(input)
-
-	c.mu.Lock()
-	delete(c.entries, normalized)
+	c.ensureCapacity(entry.Input)
+	c.entries[entry.Input] = entry
+	c.indexEntry(entry.Input)
 	c.mu.Unlock()
+	c.promoteHot(entry.Input, entry)
 }
 
-// InvalidateForAgent removes all entries targeting a specific agent
-func (c *RouteCache) InvalidateForAgent(agentID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for key, entry := range c.entries {
-		if entry.TargetAgentID == agentID {
-			delete(c.entries, key)
-		}
+func (c *RouteCache) ensureCapacity(keepKey string) {
+	if len(c.entries) < c.maxSize {
+		return
 	}
+	if _, exists := c.entries[keepKey]; exists {
+		return
+	}
+	c.evictOldest()
 }
 
-// Clear removes all entries from the cache
-func (c *RouteCache) Clear() {
-	c.mu.Lock()
-	c.entries = make(map[string]*CachedRoute)
-	c.mu.Unlock()
-}
-
-// =============================================================================
-// Cache Maintenance
-// =============================================================================
-
-// evictOldest removes the oldest entry (must hold write lock)
 func (c *RouteCache) evictOldest() {
-	var oldestKey string
-	var oldestTime time.Time
-
+	oldestKey := ""
+	oldestTime := time.Time{}
 	for key, entry := range c.entries {
 		if oldestKey == "" || entry.CachedAt.Before(oldestTime) {
 			oldestKey = key
 			oldestTime = entry.CachedAt
 		}
 	}
-
 	if oldestKey != "" {
-		delete(c.entries, oldestKey)
+		c.removeEntry(oldestKey)
 	}
 }
 
-// Cleanup removes expired entries
-func (c *RouteCache) Cleanup() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *RouteCache) promoteHot(key string, entry *CachedRoute) {
+	if c == nil || c.hot == nil || entry == nil {
+		return
+	}
+	c.hot.Set(key, entry, 1)
+}
 
-	now := time.Now()
-	removed := 0
+func (c *RouteCache) indexEntry(key string) {
+	if !c.enableSemantic {
+		return
+	}
+	for _, bucket := range semanticBuckets(key) {
+		set := c.index[bucket]
+		if set == nil {
+			set = map[string]struct{}{}
+			c.index[bucket] = set
+		}
+		set[key] = struct{}{}
+	}
+}
 
-	for key, entry := range c.entries {
-		if now.After(entry.ExpiresAt) {
-			delete(c.entries, key)
-			removed++
+func (c *RouteCache) unindexEntry(key string) {
+	if !c.enableSemantic {
+		return
+	}
+	for _, bucket := range semanticBuckets(key) {
+		set := c.index[bucket]
+		if len(set) == 0 {
+			continue
+		}
+		delete(set, key)
+		if len(set) == 0 {
+			delete(c.index, bucket)
 		}
 	}
+}
 
-	return removed
+func (c *RouteCache) Invalidate(input string) {
+	normalized := normalizeInput(input)
+	c.mu.Lock()
+	c.removeEntry(normalized)
+	c.mu.Unlock()
+}
+
+func (c *RouteCache) removeEntry(key string) {
+	delete(c.entries, key)
+	c.unindexEntry(key)
+	if c.hot != nil {
+		c.hot.Del(key)
+	}
+}
+
+func (c *RouteCache) InvalidateForAgent(agentID string) {
+	c.mu.Lock()
+	keys := make([]string, 0)
+	for key, entry := range c.entries {
+		if entry.TargetAgentID == agentID {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
+		c.removeEntry(key)
+	}
+	c.mu.Unlock()
+}
+
+func (c *RouteCache) Clear() {
+	c.mu.Lock()
+	c.entries = make(map[string]*CachedRoute)
+	c.index = make(map[string]map[string]struct{})
+	c.mu.Unlock()
+	if c.hot != nil {
+		c.hot.Clear()
+	}
+}
+
+// =============================================================================
+// Cache Maintenance
+// =============================================================================
+
+func (c *RouteCache) Cleanup() int {
+	now := time.Now()
+	c.mu.Lock()
+	keys := make([]string, 0)
+	for key, entry := range c.entries {
+		if now.After(entry.ExpiresAt) {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
+		c.removeEntry(key)
+	}
+	c.mu.Unlock()
+	return len(keys)
 }
 
 // =============================================================================
 // Stats
 // =============================================================================
 
-// RouteCacheStats contains cache statistics
 type RouteCacheStats struct {
 	Size    int     `json:"size"`
 	MaxSize int     `json:"max_size"`
@@ -254,46 +466,56 @@ type RouteCacheStats struct {
 	Misses  int64   `json:"misses"`
 	HitRate float64 `json:"hit_rate"`
 	TTL     string  `json:"ttl"`
+
+	HotHits        int64 `json:"hot_hits"`
+	SimilarityHits int64 `json:"similarity_hits"`
 }
 
-// Stats returns cache statistics
 func (c *RouteCache) Stats() RouteCacheStats {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	size := len(c.entries)
+	c.mu.RUnlock()
 
-	total := c.hits + c.misses
+	hits := atomic.LoadInt64(&c.hits)
+	misses := atomic.LoadInt64(&c.misses)
+	total := hits + misses
 	hitRate := 0.0
 	if total > 0 {
-		hitRate = float64(c.hits) / float64(total)
+		hitRate = float64(hits) / float64(total)
 	}
 
 	return RouteCacheStats{
-		Size:    len(c.entries),
-		MaxSize: c.maxSize,
-		Hits:    c.hits,
-		Misses:  c.misses,
-		HitRate: hitRate,
-		TTL:     c.ttl.String(),
+		Size:           size,
+		MaxSize:        c.maxSize,
+		Hits:           hits,
+		Misses:         misses,
+		HitRate:        hitRate,
+		TTL:            c.ttl.String(),
+		HotHits:        atomic.LoadInt64(&c.hotHits),
+		SimilarityHits: atomic.LoadInt64(&c.similarityHits),
 	}
 }
 
 func (c *RouteCache) recordHit() {
-	c.mu.Lock()
-	c.hits++
-	c.mu.Unlock()
+	atomic.AddInt64(&c.hits, 1)
 }
 
 func (c *RouteCache) recordMiss() {
-	c.mu.Lock()
-	c.misses++
-	c.mu.Unlock()
+	atomic.AddInt64(&c.misses, 1)
+}
+
+func (c *RouteCache) recordHotHit() {
+	atomic.AddInt64(&c.hotHits, 1)
+}
+
+func (c *RouteCache) recordSimilarityHit() {
+	atomic.AddInt64(&c.similarityHits, 1)
 }
 
 // =============================================================================
 // Input Normalization
 // =============================================================================
 
-// normalizeInput normalizes input for cache lookup
 func normalizeInput(input string) string {
 	lowered := lowerASCII(input)
 	start, end := trimWhitespaceBounds(lowered)
@@ -346,11 +568,104 @@ func isWhitespace(value byte) bool {
 	}
 }
 
+func semanticBuckets(input string) []string {
+	tokens := semanticTokens(input)
+	if len(tokens) == 0 {
+		return nil
+	}
+	buckets := make([]string, 0, len(tokens)+1)
+	for _, token := range tokens {
+		buckets = append(buckets, "tok:"+token)
+	}
+	if len(tokens) >= 2 {
+		buckets = append(buckets, "bigram:"+tokens[0]+"_"+tokens[1])
+	}
+	return buckets
+}
+
+func semanticTokens(input string) []string {
+	parts := splitSemanticWords(input)
+	if len(parts) == 0 {
+		return nil
+	}
+	uniq := uniqueSemanticTokens(parts)
+	sort.Strings(uniq)
+	if len(uniq) > 12 {
+		return uniq[:12]
+	}
+	return uniq
+}
+
+func splitSemanticWords(input string) []string {
+	return strings.FieldsFunc(input, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '/'
+	})
+}
+
+func uniqueSemanticTokens(tokens []string) []string {
+	seen := map[string]struct{}{}
+	uniq := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		t := strings.TrimSpace(strings.ToLower(token))
+		if len(t) < 2 {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		uniq = append(uniq, t)
+	}
+	return uniq
+}
+
+func semanticSimilarity(a string, b string) float64 {
+	left := semanticTokens(a)
+	right := semanticTokens(b)
+	if len(left) == 0 || len(right) == 0 {
+		return 0
+	}
+	setLeft := toSemanticSet(left)
+	setRight := toSemanticSet(right)
+	intersect := intersectionSize(setLeft, setRight)
+	union := len(setLeft) + len(setRight) - intersect
+	if union == 0 {
+		return 0
+	}
+	base := float64(intersect) / float64(union)
+	prefix := prefixBonus(a, b)
+	return math.Min(1.0, base+prefix)
+}
+
+func toSemanticSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func intersectionSize(left map[string]struct{}, right map[string]struct{}) int {
+	count := 0
+	for value := range left {
+		if _, ok := right[value]; ok {
+			count++
+		}
+	}
+	return count
+}
+
+func prefixBonus(a string, b string) float64 {
+	if strings.HasPrefix(a, b) || strings.HasPrefix(b, a) {
+		return 0.1
+	}
+	return 0
+}
+
 // =============================================================================
-// Bulk Operations (for syncing from Guide)
+// Bulk Operations
 // =============================================================================
 
-// GetAll returns all cached routes (for syncing to agents)
 func (c *RouteCache) GetAll() []*CachedRoute {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -362,15 +677,11 @@ func (c *RouteCache) GetAll() []*CachedRoute {
 	return routes
 }
 
-// SetBulk sets multiple routes at once (for syncing from Guide)
 func (c *RouteCache) SetBulk(routes []*CachedRoute) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	for _, route := range routes {
-		if len(c.entries) >= c.maxSize {
-			c.evictOldest()
+		if route == nil {
+			continue
 		}
-		c.entries[route.Input] = route
+		c.setEntry(route)
 	}
 }

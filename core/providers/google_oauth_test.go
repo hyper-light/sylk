@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -91,6 +92,15 @@ func TestGoogleConfigValidate_APIKeyModeRequiresAPIKey(t *testing.T) {
 	}
 }
 
+func TestGoogleConfigValidate_ServiceAccountModeAllowsMissingAPIKey(t *testing.T) {
+	cfg := DefaultGoogleConfig()
+	cfg.AuthMode = GoogleAuthModeServiceAccount
+	cfg.APIKey = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected service_account config validation to pass, got: %v", err)
+	}
+}
+
 func TestHydrateGoogleConfig_OAuthAppliesResolvedAuth(t *testing.T) {
 	cfg := DefaultGoogleConfig()
 	cfg.AuthMode = GoogleAuthModeOAuth
@@ -146,6 +156,54 @@ func TestHydrateGoogleConfig_OAuthFallsBackToAPIKey(t *testing.T) {
 	}
 	if cfg.UseVertexAI {
 		t.Fatal("expected UseVertexAI false after api key fallback")
+	}
+}
+
+func TestHydrateGoogleConfig_ServiceAccountMode(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv(
+		"GOOGLE_SERVICE_ACCOUNT_JSON",
+		`{"type":"service_account","project_id":"proj_sa","client_email":"svc@test.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"}`,
+	)
+	cfg := DefaultGoogleConfig()
+	cfg.AuthMode = GoogleAuthModeServiceAccount
+	cfg.ProjectID = ""
+	cfg.Location = ""
+	cfg.UseVertexAI = false
+
+	if err := hydrateGoogleConfig(context.Background(), &cfg, &mockGoogleAuthService{}); err != nil {
+		t.Fatalf("hydrateGoogleConfig() error: %v", err)
+	}
+	if cfg.ProjectID != "proj_sa" {
+		t.Fatalf("expected project from service account, got %q", cfg.ProjectID)
+	}
+	if !cfg.UseVertexAI {
+		t.Fatal("expected service account mode to force UseVertexAI")
+	}
+	if got := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); got == "" {
+		t.Fatal("expected GOOGLE_APPLICATION_CREDENTIALS to be set")
+	}
+}
+
+func TestHydrateGoogleConfig_OAuthFallsBackToServiceAccount(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv(
+		"GOOGLE_SERVICE_ACCOUNT_JSON",
+		`{"type":"service_account","project_id":"proj_sa","client_email":"svc@test.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"}`,
+	)
+	cfg := DefaultGoogleConfig()
+	cfg.AuthMode = GoogleAuthModeOAuth
+	cfg.APIKey = ""
+	authSvc := &mockGoogleAuthService{err: oauth.ErrGoogleAuthNotConfigured}
+
+	if err := hydrateGoogleConfig(context.Background(), &cfg, authSvc); err != nil {
+		t.Fatalf("hydrateGoogleConfig() error: %v", err)
+	}
+	if cfg.AuthMode != GoogleAuthModeServiceAccount {
+		t.Fatalf("expected auth mode fallback to %q, got %q", GoogleAuthModeServiceAccount, cfg.AuthMode)
+	}
+	if !cfg.UseVertexAI {
+		t.Fatal("expected UseVertexAI true in service_account fallback")
 	}
 }
 

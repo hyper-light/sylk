@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"time"
 
@@ -30,18 +29,57 @@ type anthropicPlanner struct {
 	logger    *slog.Logger
 }
 
+var ErrArchitectPlannerAuthNotConfigured = errors.New("architect planner auth not configured")
+
+const plannerJSONSystemPrompt = `You are the Sylk Architect planner.
+Return strictly valid JSON with no markdown, no prose, and no extra keys.
+Never wrap JSON in code fences.
+Keep outputs concise and deterministic.`
+
 func (a *Architect) initPlanner(cfg Config) error {
 	if !cfg.EnableLLM {
 		return nil
 	}
 
-	planner, err := newAnthropicPlanner(cfg, a.logger)
-	if err != nil {
-		return err
+	if a.ensurePlanner() == nil {
+		a.logger.Warn("architect llm planner unavailable; using deterministic fallback")
 	}
-	a.planner = planner
-	a.logger.Info("architect llm planner enabled", "model", cfg.Model)
 	return nil
+}
+
+func (a *Architect) ensurePlanner() planningLLM {
+	if !a.config.EnableLLM {
+		return nil
+	}
+	if planner := a.currentPlanner(); planner != nil {
+		return planner
+	}
+
+	a.plannerMu.Lock()
+	defer a.plannerMu.Unlock()
+
+	if a.planner != nil {
+		return a.planner
+	}
+
+	planner, err := newAnthropicPlanner(a.config, a.logger)
+	if err != nil {
+		if !errors.Is(err, ErrArchitectPlannerAuthNotConfigured) {
+			a.logger.Warn("architect llm planner init failed", "error", err)
+		}
+		return nil
+	}
+
+	a.planner = planner
+	a.logger.Info("architect llm planner enabled", "model", a.config.Model)
+	return a.planner
+}
+
+func (a *Architect) currentPlanner() planningLLM {
+	a.plannerMu.RLock()
+	planner := a.planner
+	a.plannerMu.RUnlock()
+	return planner
 }
 
 func (a *Architect) tryAnalyzeRequirementsWithLLM(
@@ -49,10 +87,11 @@ func (a *Architect) tryAnalyzeRequirementsWithLLM(
 	query string,
 	params map[string]any,
 ) (*Requirements, bool) {
-	if a.planner == nil {
+	planner := a.ensurePlanner()
+	if planner == nil {
 		return nil, false
 	}
-	requirements, err := a.planner.AnalyzeRequirements(ctx, query, params)
+	requirements, err := planner.AnalyzeRequirements(ctx, query, params)
 	if err != nil {
 		a.logger.Warn("architect llm requirements fallback", "error", err)
 		return nil, false
@@ -65,10 +104,11 @@ func (a *Architect) tryDesignArchitectureWithLLM(
 	requirements *Requirements,
 	patterns *CodebasePatterns,
 ) (*SolutionArchitecture, bool) {
-	if a.planner == nil {
+	planner := a.ensurePlanner()
+	if planner == nil {
 		return nil, false
 	}
-	architecture, err := a.planner.DesignArchitecture(ctx, requirements, patterns)
+	architecture, err := planner.DesignArchitecture(ctx, requirements, patterns)
 	if err != nil {
 		a.logger.Warn("architect llm design fallback", "error", err)
 		return nil, false
@@ -81,10 +121,11 @@ func (a *Architect) tryGenerateTasksWithLLM(
 	architecture *SolutionArchitecture,
 	constraints *PlanConstraints,
 ) ([]*AtomicTask, bool) {
-	if a.planner == nil {
+	planner := a.ensurePlanner()
+	if planner == nil {
 		return nil, false
 	}
-	tasks, err := a.planner.GenerateTasks(ctx, architecture, constraints)
+	tasks, err := planner.GenerateTasks(ctx, architecture, constraints)
 	if err != nil {
 		a.logger.Warn("architect llm task fallback", "error", err)
 		return nil, false
@@ -93,12 +134,9 @@ func (a *Architect) tryGenerateTasksWithLLM(
 }
 
 func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
-	apiKey := strings.TrimSpace(cfg.AnthropicAPIKey)
+	apiKey := resolveArchitectAnthropicAPIKey(cfg.AnthropicAPIKey)
 	if apiKey == "" {
-		apiKey = strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
-	}
-	if apiKey == "" {
-		return nil, fmt.Errorf("architect llm enabled but ANTHROPIC_API_KEY is missing")
+		return nil, ErrArchitectPlannerAuthNotConfigured
 	}
 
 	opts := []option.RequestOption{
@@ -114,11 +152,19 @@ func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
 		client:    &client,
 		model:     cfg.Model,
 		maxTokens: cfg.MaxOutputTokens,
-		system:    cfg.SystemPrompt,
+		system:    buildPlannerSystemPrompt(cfg.SystemPrompt),
 		timeout:   cfg.LLMRequestTimeout,
 		retryMax:  cfg.LLMRetryMax,
 		logger:    logger,
 	}, nil
+}
+
+func buildPlannerSystemPrompt(base string) string {
+	trimmed := strings.TrimSpace(base)
+	if trimmed == "" {
+		return plannerJSONSystemPrompt
+	}
+	return plannerJSONSystemPrompt + "\n\nContext:\n" + trimmed
 }
 
 func (p *anthropicPlanner) AnalyzeRequirements(
@@ -128,7 +174,7 @@ func (p *anthropicPlanner) AnalyzeRequirements(
 ) (*Requirements, error) {
 	prompt := buildRequirementsPrompt(query, params)
 	var payload requirementsPayload
-	if err := p.requestJSON(ctx, prompt, &payload); err != nil {
+	if err := p.requestJSONWithBudgets(ctx, prompt, &payload, requirementsBudgets(p.maxTokens), p.systemForStage("requirements")); err != nil {
 		return nil, err
 	}
 	return payload.toRequirements(query, params), nil
@@ -141,7 +187,7 @@ func (p *anthropicPlanner) DesignArchitecture(
 ) (*SolutionArchitecture, error) {
 	prompt := buildDesignPrompt(requirements, patterns)
 	var payload architecturePayload
-	if err := p.requestJSON(ctx, prompt, &payload); err != nil {
+	if err := p.requestJSONWithBudgets(ctx, prompt, &payload, designBudgets(p.maxTokens), p.systemForStage("design")); err != nil {
 		return nil, err
 	}
 	return payload.toArchitecture(requirements), nil
@@ -153,11 +199,7 @@ func (p *anthropicPlanner) GenerateTasks(
 	constraints *PlanConstraints,
 ) ([]*AtomicTask, error) {
 	prompt := buildTaskPrompt(architecture, constraints)
-	text, err := p.requestText(ctx, prompt)
-	if err != nil {
-		return nil, err
-	}
-	tasks, err := parseTaskPayload(text)
+	tasks, err := p.parseTasksWithBudgets(ctx, prompt, taskBudgets(p.maxTokens), p.systemForStage("tasks"))
 	if err != nil {
 		return nil, err
 	}
@@ -167,21 +209,47 @@ func (p *anthropicPlanner) GenerateTasks(
 	return tasks, nil
 }
 
-func (p *anthropicPlanner) requestJSON(ctx context.Context, prompt string, out any) error {
-	text, err := p.requestText(ctx, prompt)
-	if err != nil {
-		return err
+func (p *anthropicPlanner) parseTasksWithBudgets(ctx context.Context, prompt string, budgets []int, system string) ([]*AtomicTask, error) {
+	var lastErr error
+	for _, budget := range budgets {
+		text, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		tasks, parseErr := parseTaskPayload(text)
+		if parseErr == nil {
+			return tasks, nil
+		}
+		lastErr = parseErr
 	}
-	return decodeJSONPayload(text, out)
+	return nil, lastErr
 }
 
-func (p *anthropicPlanner) requestText(ctx context.Context, prompt string) (string, error) {
+func (p *anthropicPlanner) requestJSONWithBudgets(ctx context.Context, prompt string, out any, budgets []int, system string) error {
+	var lastErr error
+	for _, budget := range budgets {
+		text, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		decodeErr := decodeJSONPayload(text, out)
+		if decodeErr == nil {
+			return nil
+		}
+		lastErr = decodeErr
+	}
+	return lastErr
+}
+
+func (p *anthropicPlanner) requestTextWithMaxTokens(ctx context.Context, prompt string, maxTokens int, system string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	var lastErr error
 	for attempt := 1; attempt <= p.retryMax; attempt++ {
-		text, err := p.requestTextOnce(ctx, prompt)
+		text, err := p.requestTextOnce(ctx, prompt, maxTokens, system)
 		if err == nil {
 			return text, nil
 		}
@@ -196,12 +264,13 @@ func (p *anthropicPlanner) requestText(ctx context.Context, prompt string) (stri
 	return "", lastErr
 }
 
-func (p *anthropicPlanner) requestTextOnce(ctx context.Context, prompt string) (string, error) {
+func (p *anthropicPlanner) requestTextOnce(ctx context.Context, prompt string, maxTokens int, system string) (string, error) {
+	resolvedSystem := p.resolveSystemPrompt(system)
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(p.model),
-		MaxTokens: int64(p.maxTokens),
+		MaxTokens: int64(maxTokens),
 		System: []anthropic.TextBlockParam{
-			{Text: p.system},
+			{Text: resolvedSystem},
 		},
 		Messages: []anthropic.MessageParam{
 			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
@@ -218,6 +287,22 @@ func (p *anthropicPlanner) requestTextOnce(ctx context.Context, prompt string) (
 	return text, nil
 }
 
+func (p *anthropicPlanner) systemForStage(stage string) string {
+	stagePrompt := strings.TrimSpace(ArchitectPlannerPromptForStage(stage))
+	if stagePrompt == "" {
+		return p.system
+	}
+	return buildPlannerSystemPrompt(stagePrompt)
+}
+
+func (p *anthropicPlanner) resolveSystemPrompt(system string) string {
+	trimmed := strings.TrimSpace(system)
+	if trimmed != "" {
+		return trimmed
+	}
+	return p.system
+}
+
 func extractAnthropicText(msg *anthropic.Message) string {
 	if msg == nil {
 		return ""
@@ -229,6 +314,42 @@ func extractAnthropicText(msg *anthropic.Message) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func requirementsBudgets(base int) []int {
+	return compactBudgets(base, 1536, 3072, 4096)
+}
+
+func designBudgets(base int) []int {
+	return compactBudgets(base, 4096, 6144, 8192)
+}
+
+func taskBudgets(base int) []int {
+	return compactBudgets(base, 3072, 6144, 8192)
+}
+
+func compactBudgets(base int, a int, b int, c int) []int {
+	values := []int{maxInt(base, a), maxInt(base*2, b), maxInt(base*3, c)}
+	seen := map[int]struct{}{}
+	budgets := make([]int, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		budgets = append(budgets, value)
+	}
+	return budgets
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func shouldRetryPlannerCall(ctx context.Context, err error, attempt int, max int) bool {
@@ -277,19 +398,19 @@ func waitForRetry(ctx context.Context, d time.Duration) error {
 }
 
 type requirementsPayload struct {
-	Goals        []string `json:"goals"`
-	Constraints  []string `json:"constraints"`
-	Dependencies []string `json:"dependencies"`
-	Scope        string   `json:"scope"`
-	Priority     string   `json:"priority"`
+	Goals        json.RawMessage `json:"goals"`
+	Constraints  json.RawMessage `json:"constraints"`
+	Dependencies json.RawMessage `json:"dependencies"`
+	Scope        string          `json:"scope"`
+	Priority     string          `json:"priority"`
 }
 
 func (p requirementsPayload) toRequirements(query string, params map[string]any) *Requirements {
 	requirements := &Requirements{
 		Query:        query,
-		Goals:        nonEmptySlice(p.Goals),
-		Constraints:  nonEmptySlice(p.Constraints),
-		Dependencies: nonEmptySlice(p.Dependencies),
+		Goals:        parseStringList(p.Goals),
+		Constraints:  parseStringList(p.Constraints),
+		Dependencies: parseStringList(p.Dependencies),
 		Scope:        nonEmptyString(p.Scope, "project"),
 		Priority:     strings.TrimSpace(p.Priority),
 	}
@@ -323,7 +444,7 @@ type architecturePayload struct {
 	Description string              `json:"description"`
 	Components  []ComponentSpec     `json:"components"`
 	Interfaces  []InterfaceSpec     `json:"interfaces"`
-	Patterns    []string            `json:"patterns"`
+	Patterns    json.RawMessage     `json:"patterns"`
 	Layers      []ArchitectureLayer `json:"layers"`
 }
 
@@ -341,7 +462,7 @@ func (p architecturePayload) toArchitecture(requirements *Requirements) *Solutio
 		Description: desc,
 		Components:  p.Components,
 		Interfaces:  p.Interfaces,
-		Patterns:    nonEmptySlice(p.Patterns),
+		Patterns:    parseStringList(p.Patterns),
 		Layers:      p.Layers,
 	}
 }
@@ -476,18 +597,87 @@ func uniqueNonEmptyStrings(values []string) []string {
 
 func buildRequirementsPrompt(query string, params map[string]any) string {
 	base := fmt.Sprintf(RequirementsAnalysisPrompt, query, mustJSON(params))
-	return base + "\n\nReturn only JSON with keys: goals, constraints, dependencies, scope, priority."
+	return base + `
+
+Return JSON only, exactly:
+{
+  "goals": ["..."],
+  "constraints": ["..."],
+  "dependencies": ["..."],
+  "scope": "project|module|file",
+  "priority": "low|medium|high|critical"
+}
+
+Hard limits:
+- At most 6 goals, 6 constraints, 6 dependencies
+- Each string must be <= 20 words
+`
 }
 
 func buildDesignPrompt(requirements *Requirements, patterns *CodebasePatterns) string {
 	base := fmt.Sprintf(ArchitectureDesignPrompt, mustJSON(requirements), mustJSON(patterns))
-	return base + "\n\nReturn only JSON with keys: name, description, components, interfaces, patterns, layers."
+	return base + `
+
+Return JSON only, exactly:
+{
+  "name": "...",
+  "description": "...",
+  "components": [
+    {
+      "name": "...",
+      "type": "backend|frontend|data|integration|test",
+      "description": "...",
+      "dependencies": ["component_name"],
+      "interfaces": ["interface_name"],
+      "file_path": ""
+    }
+  ],
+  "interfaces": [
+    {
+      "name": "...",
+      "from": "...",
+      "to": "...",
+      "type": "api|event|internal",
+      "description": "...",
+      "methods": [{"name":"...","parameters":["..."],"returns":"..."}]
+    }
+  ],
+  "patterns": ["..."],
+  "layers": [{"name":"...","components":["..."],"order":1}]
+}
+
+Hard limits:
+- At most 6 components, 6 interfaces, 6 patterns, 4 layers
+- Keep all descriptions <= 24 words
+- Use Go-style file paths when file_path is set (e.g. core/providers/token_rotation.go)
+`
 }
 
 func buildTaskPrompt(architecture *SolutionArchitecture, constraints *PlanConstraints) string {
 	base := fmt.Sprintf(TaskDecompositionPrompt, mustJSON(architecture))
-	return base + "\n\nConstraints:\n" + mustJSON(constraints) +
-		"\n\nReturn only JSON as {\"tasks\":[...]} with keys: id, name, description, agent_type, success_criteria, dependencies, estimated_tokens, complexity."
+	return base + "\n\nConstraints:\n" + mustJSON(constraints) + `
+
+Return JSON only, exactly:
+{
+  "tasks": [
+    {
+      "id": "task_1",
+      "name": "...",
+      "description": "...",
+      "agent_type": "engineer|designer|tester|inspector|architect",
+      "success_criteria": ["..."],
+      "dependencies": ["task_1"],
+      "estimated_tokens": 3000,
+      "complexity": "low|medium|high|critical"
+    }
+  ]
+}
+
+Hard limits:
+- At most 10 tasks
+- Keep each description <= 28 words
+- Keep success_criteria to 2-4 concise bullets
+`
 }
 
 func mustJSON(value any) string {
@@ -535,6 +725,48 @@ func parseComplexity(raw string) TaskComplexity {
 	default:
 		return ComplexityMedium
 	}
+}
+
+func parseStringList(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var list []string
+	if json.Unmarshal(raw, &list) == nil {
+		return nonEmptySlice(list)
+	}
+	var single string
+	if json.Unmarshal(raw, &single) == nil {
+		return nonEmptySlice([]string{single})
+	}
+	var maps []map[string]any
+	if json.Unmarshal(raw, &maps) == nil {
+		return extractStringValues(maps)
+	}
+	return nil
+}
+
+func extractStringValues(items []map[string]any) []string {
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		values = append(values, firstNonEmptyMapString(item)...)
+	}
+	return nonEmptySlice(values)
+}
+
+func firstNonEmptyMapString(item map[string]any) []string {
+	keys := []string{"description", "name", "id", "value", "text"}
+	for _, key := range keys {
+		value, ok := item[key]
+		if !ok {
+			continue
+		}
+		text, ok := value.(string)
+		if ok && strings.TrimSpace(text) != "" {
+			return []string{text}
+		}
+	}
+	return nil
 }
 
 func normalizeTaskGraph(tasks []*AtomicTask) []*AtomicTask {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -21,11 +22,15 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/lsp"
+	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
+	"github.com/adalundhe/sylk/core/storage"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/bridge"
 	"github.com/adalundhe/sylk/ui/chat"
@@ -47,11 +52,13 @@ import (
 	"github.com/adalundhe/sylk/ui/interrupt"
 	knowledgepkg "github.com/adalundhe/sylk/ui/knowledge"
 	"github.com/adalundhe/sylk/ui/layout"
+	"github.com/adalundhe/sylk/ui/login"
 	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
 	"github.com/adalundhe/sylk/ui/mergediff"
 	"github.com/adalundhe/sylk/ui/modal"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/pane"
+	"github.com/adalundhe/sylk/ui/redact"
 	"github.com/adalundhe/sylk/ui/search"
 	sessionpkg "github.com/adalundhe/sylk/ui/session"
 	"github.com/adalundhe/sylk/ui/status"
@@ -131,10 +138,11 @@ const (
 // guideContext model for lightweight runtime context usage estimation.
 // We retain a high fraction of prior tokens to represent rolling context.
 const (
-	guideMaxContextTokens       = 2_000_000
-	guideContextRetention       = 0.92
-	guideRouteOverheadTokens    = 1200
-	guideResponseOverheadTokens = 120
+	guideMaxContextTokens        = 2_000_000
+	defaultAgentMaxContextTokens = 200_000
+	guideContextRetention        = 0.92
+	guideRouteOverheadTokens     = 1200
+	guideResponseOverheadTokens  = 120
 )
 
 // ---------------------------------------------------------------------------
@@ -178,6 +186,7 @@ const (
 	overlayModal                    // Modal dialog stack.
 	overlaySearch                   // Command palette.
 	overlayFieldManual              // Field Manual help overlay.
+	overlayLogin                    // Top-panel login flow.
 )
 
 // ---------------------------------------------------------------------------
@@ -199,8 +208,11 @@ var defaultPanels = []layout.PanelSpec{
 // sessionCollapseWidth is derived from: 36 content + 2 border + 2 pad + 4 header.
 const sessionCollapseWidth = 44
 
-// fileTreeCollapseWidth is derived from: 30 content + 2 border + 2 pad + 4 indent.
-const fileTreeCollapseWidth = 38
+// fileTreeCollapseWidth collapses the panel before the git tab bar wraps.
+// Base: 30 content + 2 border + 2 pad + 4 indent = 38.
+const fileTreeBaseCollapseWidth = 38
+
+var fileTreeCollapseWidth = max(fileTreeBaseCollapseWidth, gitpanel.TabBarNaturalWidth()+panelBorderSize)
 
 // codeCollapseWidth is derived from: 56 content + 4 gutter + 1 sep + 2 border + 3 pad.
 // At this width, common code lines (≤56 chars) display without truncation.
@@ -248,6 +260,7 @@ type Deps struct {
 	StreamManager  *guide.StreamManager
 	Guide          *guide.Guide
 	Scope          *concurrency.GoroutineScope
+	AuthRefresh    func(ctx context.Context, provider string) error
 
 	// SignalStop restores default signal handling and cancels the parent
 	// context. Called after the Bubble Tea program exits so that a second
@@ -502,6 +515,11 @@ type AppModel struct {
 	// pendingSyntaxValidation is true while the syntax-warning modal is displayed.
 	pendingSyntaxValidation bool
 
+	// Login flow: top-panel overlay component.
+	loginPanel          *login.Panel
+	oauthSessions       *oauthSessionManager
+	suppressLoginResult bool
+
 	// ESC disambiguation: buffer a standalone ESC for a short window so a
 	// follow-up rune can be merged into an Alt+rune KeyMsg. This mirrors
 	// vim's ttimeoutlen / tmux's escape-time mechanism.
@@ -513,6 +531,13 @@ type AppModel struct {
 	// Guide context usage estimate for agent panel rendering.
 	guideContextTokens int
 	guideContextUsage  float64
+	agentContextTokens map[string]int
+	streamUsage        map[string]streamUsageEntry
+}
+
+type streamUsageEntry struct {
+	AgentID string
+	Tokens  int
 }
 
 // viewRing tracks a cycling list of panels for a swappable layout slot.
@@ -651,24 +676,35 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	th := cfg.Theme()
 
 	app := &AppModel{
-		ctx:                    appCtx,
-		cancel:                 appCancel,
-		config:                 cfg,
-		deps:                   deps,
-		layout:                 layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
-		focus:                  layout.NewFocusManager(defaultTabOrder),
-		chat:                   chat.New(th, cfg.ChatHistoryCapacity),
-		statusBar:              status.New(th, deps.SessionManager),
-		sessionPanel:           sessionpkg.New(deps.SessionManager, th),
-		agentPanel:             agentpkg.New(th),
-		codePanel:              codepkg.New(th),
-		knowledgePanel:         knowledgepkg.New(th),
-		fileTree:               filetree.New(th),
-		editorOverlay:          editor.New(th),
-		editorCache:            editor.NewEditorCache(editor.CacheConfig{}),
-		modalOverlay:           modal.New(th),
-		searchOverlay:          search.New(th, search.NewProviderRegistry()),
-		fieldManualOverlay:     fieldmanual.New(th),
+		ctx:                appCtx,
+		cancel:             appCancel,
+		config:             cfg,
+		deps:               deps,
+		layout:             layout.NewManager(0, 0, defaultPanels, defaultModeCandidates),
+		focus:              layout.NewFocusManager(defaultTabOrder),
+		chat:               chat.New(th, cfg.ChatHistoryCapacity),
+		statusBar:          status.New(th, deps.SessionManager),
+		sessionPanel:       sessionpkg.New(deps.SessionManager, th),
+		agentPanel:         agentpkg.New(th),
+		codePanel:          codepkg.New(th),
+		knowledgePanel:     knowledgepkg.New(th),
+		fileTree:           filetree.New(th),
+		editorOverlay:      editor.New(th),
+		editorCache:        editor.NewEditorCache(editor.CacheConfig{}),
+		modalOverlay:       modal.New(th),
+		searchOverlay:      search.New(th, search.NewProviderRegistry()),
+		fieldManualOverlay: fieldmanual.New(th),
+		loginPanel: login.New(th,
+			func(provider string) string {
+				key, err := llm.ResolveAPIKey(provider)
+				if err != nil || !llm.ValidateKeyFormat(provider, key) {
+					return ""
+				}
+				return key
+			},
+			llm.ValidateKeyFormat,
+			nil, // clipboard — wired after construction (needs m.clipboard)
+		),
 		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
 		sessionBridge:          bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
 		streamBridge:           bridge.NewStreamBridge(deps.Scope),
@@ -687,7 +723,13 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		mdPreviewTabHoverClose: -1,
 		mdTooltipTab:           -1,
 		viewMode:               ViewChat,
+		agentContextTokens:     make(map[string]int),
+		streamUsage:            make(map[string]streamUsageEntry),
+		oauthSessions:          newOAuthSessionManager(),
 	}
+
+	// Wire login panel clipboard now that m.clipboard is available.
+	app.loginPanel.SetClipboard(app.clipboard.Get)
 
 	app.comp = compositor.New()
 	app.previewPanel = preview.New(th)
@@ -700,7 +742,11 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	}
 
 	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
-	app.input = inputpkg.New(th, cfg.InputHistoryCapacity, &tabCompleter{tabOrderFn: app.focusedTabOrder})
+	app.input = inputpkg.New(th, cfg.InputHistoryCapacity,
+		&tabCompleter{tabOrderFn: app.focusedTabOrder},
+		&slashCommandCompleter{},
+	)
+	app.input.SetSlashValidator(isKnownSlashCommand)
 	app.syncFocusState()
 
 	// Nerd Font detection: the font must be installed AND a fontconfig
@@ -931,7 +977,16 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, exCmd
 		}
+		if cmd, ok := parseChatCommand(typed.Text); ok {
+			return m, m.handleChatCommand(cmd, typed)
+		}
 		return m, m.handleSubmit(typed)
+	case msg.LoginResultMsg:
+		return m, m.handleLoginResult(typed)
+	case oauthSessionStartedMsg:
+		return m, m.handleOAuthSessionStarted(typed)
+	case authRefreshResultMsg:
+		return m, m.handleAuthRefreshResult(typed)
 	case msg.InterruptMsg:
 		return m, m.handleInterrupt()
 	case msg.QuitConfirmMsg:
@@ -1563,10 +1618,10 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				plan[i] = git.RebasePlanEntry{Action: git.RebaseAction(p.Action), Hash: p.Hash}
 			}
 			m.pendingSeqOp = &pendingSequencerOp{
-				op: "rebase", target: onto, plan: plan,
+				op: "rebase", target: onto, sourceBranch: typed.SourceBranch, plan: plan,
 			}
 			// Run conflict preview.
-			return m, m.conflictPreviewRebaseCmd(onto)
+			return m, m.conflictPreviewRebaseCmd(onto, typed.SourceBranch)
 		}
 		return m, nil
 
@@ -1916,6 +1971,14 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleFileReplaced(typed)
 	case msg.MultiFileReplaceDoneMsg:
 		return m, m.handleMultiFileReplaceDone(typed)
+	case msg.StreamStartMsg:
+		return m, m.handleStreamStartTelemetry(typed)
+	case msg.StreamChunkMsg:
+		return m, m.handleStreamChunkTelemetry(typed)
+	case msg.StreamCompleteMsg:
+		return m, m.handleStreamCompleteTelemetry(typed)
+	case msg.StreamErrorMsg:
+		return m, m.handleStreamErrorTelemetry(typed)
 	case msg.GuideResponseMsg:
 		return m, m.handleGuideResponse(typed)
 	case modal.ModalClosedMsg:
@@ -2083,6 +2146,15 @@ func (m *AppModel) View() string {
 	}
 	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
 		return m.fieldManualOverlay.View()
+	}
+
+	// Login panel: replaces the main column area, keeps input + status.
+	// Cursor blinks in the login panel; input panel below gets no cursor.
+	if m.overlay == overlayLogin && m.loginPanel.Active() {
+		m.viewDirty = false
+		return m.loginPanel.View(m.cursorVisible) + "\n" +
+			m.input.View(false) + "\n" +
+			m.statusBar.View()
 	}
 
 	// Fast path: nothing dirty.
@@ -2491,6 +2563,13 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 	}
+	if m.overlay == overlayLogin && m.loginPanel.Active() {
+		done, result, cmd := m.loginPanel.Update(key)
+		if done {
+			return m, tea.Batch(cmd, m.handleLoginPanelResult(result))
+		}
+		return m, cmd
+	}
 	// Ctrl+P toggles the search overlay (unless the editor completion popup
 	// is active, where Ctrl+P navigates to the previous item).
 	if key.String() == "ctrl+p" && !m.focusedEditor().CompletionActive() {
@@ -2736,6 +2815,9 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
+	targetAgent := normalizeExplicitTargetAgent(submit.TargetAgent)
+	submit.TargetAgent = targetAgent
+
 	// Push a user entry to chat.
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
@@ -2751,13 +2833,13 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Source:    chat.SourceSystem,
-		Content:   "Classifying and routing request",
+		Content:   routingStatusText(targetAgent),
 		Height:    -1,
 	}
 	m.chat.PushEntry(sysEntry)
 
 	// Push a thinking placeholder so the spinner appears immediately.
-	m.chat.BeginThinking(submit.TargetAgent)
+	m.chat.BeginThinking(thinkingAgentType(targetAgent))
 
 	// Route through Guide bus.
 	return m.publishRouteRequest(submit)
@@ -2765,6 +2847,451 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 
 func isInlineExCommand(text string) bool {
 	return strings.HasPrefix(strings.TrimSpace(text), ":")
+}
+
+// ---------------------------------------------------------------------------
+// Chat commands (/login, etc.)
+// ---------------------------------------------------------------------------
+
+// parseChatCommand returns the command name if text starts with "/".
+func parseChatCommand(text string) (string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "/") {
+		return "", false
+	}
+	cmd := strings.TrimPrefix(trimmed, "/")
+	cmd = strings.SplitN(cmd, " ", 2)[0]
+	cmd = strings.ToLower(cmd)
+	if cmd == "" {
+		return "", false
+	}
+	return cmd, true
+}
+
+// handleChatCommand dispatches a "/command" from chat input.
+func (m *AppModel) handleChatCommand(cmd string, submit msg.SubmitPromptMsg) tea.Cmd {
+	switch cmd {
+	case "login":
+		return m.handleLoginCommand(submit)
+	default:
+		m.pushSystemChat(fmt.Sprintf("Unknown command: /%s", cmd))
+		return nil
+	}
+}
+
+// pushSystemChat adds a system message to the chat panel.
+func (m *AppModel) pushSystemChat(content string) {
+	m.chat.PushEntry(&chat.ChatEntry{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Source:    chat.SourceSystem,
+		Content:   content,
+		Height:    -1,
+	})
+}
+
+// handleLoginCommand activates the top-panel login flow for /login.
+func (m *AppModel) handleLoginCommand(submit msg.SubmitPromptMsg) tea.Cmd {
+	// Echo the user command to chat.
+	m.suppressLoginResult = false
+	m.loginPanel.Activate()
+	inputH := m.inputHeight()
+	mainH := max(m.height-inputH-statusBarHeight, 1)
+	m.loginPanel.SetSize(m.width, mainH)
+	m.overlay = overlayLogin
+	m.viewDirty = true
+	return nil
+}
+
+// deactivateLogin closes the login panel and restores the normal view.
+func (m *AppModel) deactivateLogin() {
+	m.cancelLoginFlow()
+	m.loginPanel.Deactivate()
+	m.overlay = overlayNone
+	m.viewDirty = true
+	m.comp.InvalidateAll()
+}
+
+func (m *AppModel) cancelLoginFlow() {
+	if m.oauthSessions == nil {
+		return
+	}
+	m.oauthSessions.CancelCurrent()
+}
+
+// handleLoginPanelResult processes results from the login panel.
+func (m *AppModel) handleLoginPanelResult(result login.LoginResult) tea.Cmd {
+	switch result.Action {
+	case login.ActionAPIKey:
+		// Keep panel open — handleLoginResult will close on success
+		// or show an inline error on failure.
+		return func() tea.Msg {
+			err := saveAPIKeySecure(m.ctx, result.Provider, result.APIKey)
+			return msg.LoginResultMsg{
+				Provider: result.Provider,
+				Method:   "apikey",
+				Success:  err == nil,
+				Error:    loginErrorString(err),
+			}
+		}
+
+	case login.ActionOAuthStart:
+		// Keep panel visible in OAuth step for status updates.
+		return m.startOAuthFlow(result.Provider)
+
+	case login.ActionCancelled:
+		m.suppressLoginResult = true
+		m.deactivateLogin()
+		return nil
+
+	default:
+		return nil
+	}
+}
+
+// startOAuthFlow launches the appropriate OAuth flow for the provider.
+func (m *AppModel) startOAuthFlow(provider string) tea.Cmd {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if !supportsOAuthProvider(provider) {
+		m.loginPanel.SetError(fmt.Sprintf("OAuth not supported for %s", provider))
+		return nil
+	}
+	if m.oauthSessions == nil {
+		m.oauthSessions = newOAuthSessionManager()
+	}
+	flowID := m.oauthSessions.Begin(provider)
+	switch provider {
+	case "google":
+		return m.startGoogleOAuthCmd(provider, flowID)
+	case "openai":
+		return m.startOpenAIOAuthCmd(provider, flowID)
+	default:
+		return nil
+	}
+}
+
+func supportsOAuthProvider(provider string) bool {
+	switch provider {
+	case "google", "openai":
+		return true
+	default:
+		return false
+	}
+}
+
+// oauthTimeout is the max duration for an OAuth flow before it's considered failed.
+// Derived from: browser-based OAuth typically completes within a few minutes;
+// 10 minutes is generous enough for slow networks or manual steps.
+const oauthTimeout = 10 * time.Minute
+
+type oauthSessionStartedMsg struct {
+	Provider string
+	FlowID   uint64
+	URL      string
+	UserCode string
+	Wait     tea.Cmd
+	Cancel   context.CancelFunc
+}
+
+type authRefreshResultMsg struct {
+	Provider string
+	Err      error
+}
+
+// startGoogleOAuthCmd starts Google OAuth and emits a session-started message.
+func (m *AppModel) startGoogleOAuthCmd(provider string, flowID uint64) tea.Cmd {
+	ctx := m.ctx
+	return func() tea.Msg {
+		authSvc := oauth.NewGoogleAuthService(oauth.GoogleAuthServiceConfig{})
+		session, err := oauth.StartGoogleOAuthSession(ctx, authSvc, oauthTimeout)
+		if err != nil {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: err.Error()}
+		}
+		return oauthSessionStartedMsg{
+			Provider: provider,
+			FlowID:   flowID,
+			URL:      session.Challenge.AuthURL,
+			Wait:     waitGoogleOAuthResultCmd(provider, flowID, session),
+			Cancel:   session.Cancel,
+		}
+	}
+}
+
+// startOpenAIOAuthCmd starts OpenAI device auth and emits a session-started message.
+func (m *AppModel) startOpenAIOAuthCmd(provider string, flowID uint64) tea.Cmd {
+	ctx := m.ctx
+
+	return func() tea.Msg {
+		authSvc := oauth.NewOpenAIAuthService(oauth.OpenAIAuthServiceConfig{})
+		session, err := oauth.StartDeviceAuthSession(ctx, authSvc, oauthTimeout)
+		if err != nil {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: err.Error()}
+		}
+		return oauthSessionStartedMsg{
+			Provider: provider,
+			FlowID:   flowID,
+			URL:      session.Challenge.VerificationURL,
+			UserCode: session.Challenge.UserCode,
+			Wait:     waitOpenAIOAuthResultCmd(provider, flowID, session),
+			Cancel:   session.Cancel,
+		}
+	}
+}
+
+func waitGoogleOAuthResultCmd(
+	provider string,
+	flowID uint64,
+	session *oauth.GoogleOAuthSession,
+) tea.Cmd {
+	return func() tea.Msg {
+		result, ok := <-session.Results
+		if !ok {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: "oauth session ended unexpectedly"}
+		}
+		if result.Err != nil {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: result.Err.Error()}
+		}
+		return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Success: true}
+	}
+}
+
+func waitOpenAIOAuthResultCmd(
+	provider string,
+	flowID uint64,
+	session *oauth.DeviceAuthSession,
+) tea.Cmd {
+	return func() tea.Msg {
+		result, ok := <-session.Results
+		if !ok {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: "oauth session ended unexpectedly"}
+		}
+		if result.Err != nil {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: result.Err.Error()}
+		}
+		return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Success: true}
+	}
+}
+
+func (m *AppModel) handleOAuthSessionStarted(start oauthSessionStartedMsg) tea.Cmd {
+	if m.oauthSessions == nil {
+		m.oauthSessions = newOAuthSessionManager()
+	}
+	if m.overlay != overlayLogin || !m.loginPanel.Active() || m.suppressLoginResult {
+		m.oauthSessions.Abort(start.Provider, start.FlowID, start.Cancel)
+		return nil
+	}
+	if !m.oauthSessions.Attach(start.Provider, start.FlowID, start.Cancel) {
+		return nil
+	}
+	m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL, start.UserCode))
+	if err := openURL(start.URL); err != nil {
+		m.statusBar.SetFlash("Could not open browser automatically. Use the URL shown in the login panel.")
+	}
+	return start.Wait
+}
+
+func formatOAuthStatus(provider, url, userCode string) string {
+	if userCode == "" {
+		return fmt.Sprintf("Authorize %s in your browser:\n%s", loginProviderLabel(provider), url)
+	}
+	return fmt.Sprintf("Authorize %s in your browser:\n%s\nCode: %s", loginProviderLabel(provider), url, userCode)
+}
+
+// handleLoginResult processes the async LoginResultMsg from an auth flow.
+func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
+	if result.Method == "oauth" {
+		if m.oauthSessions == nil {
+			return nil
+		}
+		if !m.oauthSessions.Complete(result.Provider, result.FlowID) {
+			return nil
+		}
+	}
+	if m.suppressLoginResult && !result.Success {
+		m.suppressLoginResult = false
+		return nil
+	}
+	m.suppressLoginResult = false
+
+	if result.Success {
+		// Close panel + flash success on the status bar.
+		if m.loginPanel.Active() {
+			m.deactivateLogin()
+		}
+		m.statusBar.SetFlash(fmt.Sprintf("Authenticated with %s via %s",
+			loginProviderLabel(result.Provider), loginMethodLabel(result.Method)))
+		return m.refreshAuthProviderCmd(result.Provider)
+	}
+
+	// Failure: keep the panel open and show the error inline so the
+	// user can correct input and retry.
+	if m.loginPanel.Active() {
+		m.loginPanel.SetError(redactSecrets(result.Error))
+	} else {
+		m.statusBar.SetFlash(fmt.Sprintf("Login failed: %s", redactSecrets(result.Error)))
+	}
+	return nil
+}
+
+func (m *AppModel) refreshAuthProviderCmd(provider string) tea.Cmd {
+	if m.deps.AuthRefresh == nil {
+		return nil
+	}
+	ctx := m.ctx
+	return func() tea.Msg {
+		return authRefreshResultMsg{Provider: provider, Err: m.deps.AuthRefresh(ctx, provider)}
+	}
+}
+
+func (m *AppModel) handleAuthRefreshResult(result authRefreshResultMsg) tea.Cmd {
+	if result.Err == nil {
+		return nil
+	}
+	m.statusBar.SetFlash(fmt.Sprintf(
+		"Authenticated with %s, but runtime refresh failed: %s",
+		loginProviderLabel(result.Provider),
+		redactSecrets(result.Err.Error()),
+	))
+	return nil
+}
+
+// loginProviderLabel returns a human-readable label for a provider ID.
+func loginProviderLabel(provider string) string {
+	switch provider {
+	case "google":
+		return "Google (Gemini)"
+	case "openai":
+		return "OpenAI"
+	case "anthropic":
+		return "Anthropic"
+	default:
+		return provider
+	}
+}
+
+// loginMethodLabel returns a human-readable label for an auth method.
+func loginMethodLabel(method string) string {
+	switch method {
+	case "oauth":
+		return "OAuth"
+	case "apikey":
+		return "API key"
+	default:
+		return method
+	}
+}
+
+func saveAPIKeySecure(ctx context.Context, provider, key string) error {
+	dirs, err := storage.ResolveDirs()
+	if err != nil {
+		return err
+	}
+	if err := dirs.EnsureAll(); err != nil {
+		return err
+	}
+	manager, err := credentials.NewManager(dirs, "default")
+	if err != nil {
+		return err
+	}
+	if err := manager.SetAPIKey(ctx, provider, key, nil); err != nil {
+		return err
+	}
+	return removeLegacyAPIKeyEntry(provider)
+}
+
+func removeLegacyAPIKeyEntry(provider string) error {
+	creds, err := llm.LoadCredentials()
+	if err != nil {
+		return err
+	}
+	if _, ok := creds[provider]; !ok {
+		return nil
+	}
+	delete(creds, provider)
+	if len(creds) == 0 {
+		path := strings.TrimSpace(llm.DefaultCredentialsPath())
+		if path == "" {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	return llm.SaveCredentials(creds)
+}
+
+func loginErrorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func redactSecrets(text string) string {
+	return redact.Text(text)
+}
+
+// openURL attempts to open an OAuth URL in the user's default browser.
+func openURL(rawURL string) error {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return fmt.Errorf("url is empty")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("unsupported url scheme")
+	}
+	return openURLPlatform(parsed.String())
+}
+
+var explicitTargetAliases = map[string]string{
+	"arch":    "architect",
+	"planner": "architect",
+}
+
+func normalizeExplicitTargetAgent(raw string) string {
+	target := strings.ToLower(strings.TrimSpace(raw))
+	if target == "" {
+		return ""
+	}
+	if alias, ok := explicitTargetAliases[target]; ok {
+		target = alias
+	}
+	if !isSimpleTargetToken(target) {
+		return ""
+	}
+	return target
+}
+
+func isSimpleTargetToken(token string) bool {
+	for _, r := range token {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func routingStatusText(target string) string {
+	if target == "" {
+		return "Classifying and routing request"
+	}
+	return fmt.Sprintf("Routing request to @%s", target)
+}
+
+func thinkingAgentType(target string) string {
+	if target != "" {
+		return target
+	}
+	return guideAgentType
 }
 
 func (m *AppModel) handleInterrupt() tea.Cmd {
@@ -3824,17 +4351,120 @@ func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
 	return nil
 }
 
+func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd {
+	m.trackStreamStart(start.CorrelationID, start.AgentID)
+	return m.propagate(start)
+}
+
+func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd {
+	chunk.Text = redactSecrets(chunk.Text)
+	m.trackStreamChunk(chunk.CorrelationID, chunk.Text)
+	return m.propagate(chunk)
+}
+
+func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
+	m.finalizeStreamUsage(done.CorrelationID, true, "")
+	return m.propagate(done)
+}
+
+func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.Cmd {
+	streamErr.Err = redactedError(streamErr.Err)
+	summary := ""
+	if streamErr.Err != nil {
+		summary = streamErr.Err.Error()
+	}
+	m.finalizeStreamUsage(streamErr.CorrelationID, false, summary)
+	return m.propagate(streamErr)
+}
+
+func (m *AppModel) trackStreamStart(correlationID, agentID string) {
+	if correlationID == "" {
+		return
+	}
+	m.streamUsage[correlationID] = streamUsageEntry{
+		AgentID: normalizeAgentID(agentID),
+	}
+}
+
+func (m *AppModel) trackStreamChunk(correlationID, text string) {
+	if correlationID == "" {
+		return
+	}
+	state, ok := m.streamUsage[correlationID]
+	if !ok {
+		return
+	}
+	state.Tokens += estimateGuideTokens(text)
+	m.streamUsage[correlationID] = state
+}
+
+func (m *AppModel) finalizeStreamUsage(correlationID string, success bool, summary string) {
+	if correlationID == "" {
+		return
+	}
+	state, ok := m.streamUsage[correlationID]
+	if !ok {
+		return
+	}
+	delete(m.streamUsage, correlationID)
+
+	contextUsage := m.bumpAgentContextUsage(state.AgentID, state.Tokens+guideResponseOverheadTokens)
+	m.publishStreamActivity(state.AgentID, success, summary, contextUsage)
+}
+
+func normalizeAgentID(raw string) string {
+	normalized := strings.ToLower(strings.TrimSpace(raw))
+	if normalized == "" {
+		return guideAgentID
+	}
+	return normalized
+}
+
+func redactedError(err error) error {
+	return redact.Error(err)
+}
+
+func (m *AppModel) publishStreamActivity(agentID string, success bool, summary string, contextUsage float64) {
+	if m.deps.ActivityBus == nil {
+		return
+	}
+	id, name, agentType := resolveAgentIdentity(agentID, "")
+	eventType := events.EventTypeLLMResponse
+	outcome := events.OutcomeSuccess
+	content := "Streaming response complete"
+	if !success {
+		eventType = events.EventTypeAgentError
+		outcome = events.OutcomeFailure
+		content = "Streaming response failed"
+		if trimmed := strings.TrimSpace(summary); trimmed != "" {
+			content = summarizeActivityContent(trimmed)
+		}
+	}
+	m.deps.ActivityBus.Publish(&events.ActivityEvent{
+		ID:        uuid.New().String(),
+		EventType: eventType,
+		Timestamp: time.Now(),
+		AgentID:   id,
+		Content:   content,
+		Outcome:   outcome,
+		Data: map[string]any{
+			"agent_type":    agentType,
+			"agent_name":    name,
+			"context_usage": contextUsage,
+		},
+	})
+}
+
 func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	source := chat.SourceAgent
-	content := r.Content
+	content := redactSecrets(r.Content)
 	if r.Err != nil {
 		source = chat.SourceError
-		content = r.Err.Error()
+		content = redactSecrets(r.Err.Error())
 	}
-	if strings.EqualFold(r.AgentID, guideAgentID) {
-		added := estimateGuideTokens(content) + guideResponseOverheadTokens
-		_ = m.bumpGuideContextUsage(added)
-	}
+	added := estimateGuideTokens(content) + guideResponseOverheadTokens
+	contextUsage := m.bumpAgentContextUsage(r.AgentID, added)
+	m.publishResponseActivity(r, source, content, contextUsage)
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
@@ -3846,6 +4476,69 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	}
 	m.chat.FinishThinking(entry)
 	return nil
+}
+
+func (m *AppModel) publishResponseActivity(
+	r msg.GuideResponseMsg,
+	source chat.ChatSource,
+	content string,
+	contextUsage float64,
+) {
+	if m.deps.ActivityBus == nil {
+		return
+	}
+	agentID, agentName, agentType := resolveAgentIdentity(r.AgentID, r.AgentName)
+	outcome := events.OutcomeSuccess
+	eventType := events.EventTypeLLMResponse
+	if source == chat.SourceError {
+		outcome = events.OutcomeFailure
+		eventType = events.EventTypeAgentError
+	}
+	m.deps.ActivityBus.Publish(&events.ActivityEvent{
+		ID:        uuid.New().String(),
+		EventType: eventType,
+		Timestamp: time.Now(),
+		AgentID:   agentID,
+		Content:   summarizeActivityContent(content),
+		Outcome:   outcome,
+		Data: map[string]any{
+			"agent_type":    agentType,
+			"agent_name":    agentName,
+			"context_usage": contextUsage,
+		},
+	})
+}
+
+func resolveAgentIdentity(agentID, agentName string) (string, string, string) {
+	id := strings.TrimSpace(agentID)
+	name := strings.TrimSpace(agentName)
+	if id == "" {
+		id = strings.ToLower(name)
+	}
+	if id == "" {
+		id = "agent"
+	}
+	if name == "" {
+		name = id
+	}
+	agentType := strings.ToLower(id)
+	if strings.EqualFold(id, guideAgentID) {
+		return guideAgentID, guideAgentName, guideAgentType
+	}
+	return id, name, agentType
+}
+
+func summarizeActivityContent(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return "Response generated"
+	}
+	const maxActivityContentRunes = 160
+	runes := []rune(trimmed)
+	if len(runes) <= maxActivityContentRunes {
+		return trimmed
+	}
+	return string(runes[:maxActivityContentRunes]) + "..."
 }
 
 // handleConflictPreview processes a dry-run merge result. If conflicts are
@@ -4064,7 +4757,7 @@ func (m *AppModel) executeSequencerOp(op *pendingSequencerOp) tea.Cmd {
 		}
 	case "rebase":
 		return func() tea.Msg {
-			status, err := bus.RebaseInteractive(op.target, op.plan)
+			status, err := bus.RebaseInteractive(op.target, op.sourceBranch, op.plan)
 			if err != nil {
 				return sequencerFailedMsg{reason: err.Error()}
 			}
@@ -4686,12 +5379,13 @@ type conflictResolveFailedMsg struct{ path, reason string }
 // pendingSequencerOp stores deferred sequencer parameters while the user
 // reviews a conflict preview or integration detection modal.
 type pendingSequencerOp struct {
-	op     string // "cherry-pick", "rebase", "merge"
-	phase  int    // 1=integration modal, 2=conflict preview modal
-	hashes []string
-	target string
-	plan   []git.RebasePlanEntry
-	delete bool // merge: delete source branch after
+	op           string // "cherry-pick", "rebase", "merge"
+	phase        int    // 1=integration modal, 2=conflict preview modal
+	hashes       []string
+	target       string
+	sourceBranch string // rebase: branch being rebased (may differ from HEAD)
+	plan         []git.RebasePlanEntry
+	delete       bool // merge: delete source branch after
 }
 
 // loadGitBranchesCmd returns a tea.Cmd that loads all local branches
@@ -4876,10 +5570,10 @@ func (m *AppModel) conflictPreviewMergeCmd(source, target string) tea.Cmd {
 }
 
 // conflictPreviewRebaseCmd previews rebase conflicts before executing.
-func (m *AppModel) conflictPreviewRebaseCmd(onto string) tea.Cmd {
+func (m *AppModel) conflictPreviewRebaseCmd(onto, sourceBranch string) tea.Cmd {
 	bus := m.gitBus
 	return func() tea.Msg {
-		result, err := bus.PreviewRebase(onto)
+		result, err := bus.PreviewRebase(onto, sourceBranch)
 		if err != nil || result == nil {
 			return msg.ConflictPreviewMsg{Result: result, Op: "rebase"}
 		}
@@ -5872,6 +6566,56 @@ func (tc *tabCompleter) Complete(prefix string, limit int) []Candidate {
 			out = append(out, Candidate{
 				Text:    base,
 				Display: base,
+			})
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// slashCommand describes a known chat slash command.
+type slashCommand struct {
+	name string // Without leading "/".
+	desc string
+}
+
+// chatSlashCommands is the single source of truth for all chat slash commands.
+// Both the validator and the completer derive from this slice.
+var chatSlashCommands = []slashCommand{
+	{name: "login", desc: "Open the provider login panel"},
+}
+
+// isKnownSlashCommand reports whether cmd (without "/") is a registered command.
+func isKnownSlashCommand(cmd string) bool {
+	for _, sc := range chatSlashCommands {
+		if sc.name == cmd {
+			return true
+		}
+	}
+	return false
+}
+
+// slashCommandCompleter provides autocomplete candidates for slash commands
+// typed in the chat input. Implements input.CompletionProvider.
+type slashCommandCompleter struct{}
+
+func (sc *slashCommandCompleter) Name() string { return "commands" }
+
+func (sc *slashCommandCompleter) Complete(prefix string, limit int) []Candidate {
+	if !strings.HasPrefix(prefix, "/") {
+		return nil
+	}
+	typed := strings.ToLower(prefix[1:])
+	var out []Candidate
+	for _, cmd := range chatSlashCommands {
+		if strings.HasPrefix(cmd.name, typed) {
+			out = append(out, Candidate{
+				Text:        "/" + cmd.name,
+				Display:     "/" + cmd.name,
+				Description: cmd.desc,
+				Category:    "command",
 			})
 			if len(out) >= limit {
 				break
@@ -7792,6 +8536,25 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	if m.overlay == overlayModal {
+		return nil
+	}
+	if m.overlay == overlayLogin && m.loginPanel.Active() {
+		// Content starts at Y=1 (top border), X=1 (left border).
+		localX := mouse.X - 1
+		localY := mouse.Y - 1
+		if mouse.Action == tea.MouseActionMotion && localX >= 0 && localY >= 0 {
+			m.loginPanel.HandleMouseMotion(localX, localY)
+			return nil
+		}
+		if mouse.Button == tea.MouseButtonLeft && mouse.Action == tea.MouseActionPress {
+			if localX >= 0 && localY >= 0 {
+				done, result, cmd := m.loginPanel.HandleClick(localX, localY)
+				if done {
+					return tea.Batch(cmd, m.handleLoginPanelResult(result))
+				}
+				return cmd
+			}
+		}
 		return nil
 	}
 
@@ -10022,6 +10785,7 @@ func (m *AppModel) recalcLayout() {
 	m.modalOverlay.SetSize(m.width, m.height)
 	m.searchOverlay.SetSize(m.width, m.height)
 	m.fieldManualOverlay.SetSize(m.width, m.height)
+	m.loginPanel.SetSize(m.width, mainHeight)
 
 	// Compositor: rebuild frame structure (full invalidation).
 	m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
@@ -11451,13 +12215,20 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 // ---------------------------------------------------------------------------
 
 func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
-	_ = m.bumpGuideContextUsage(estimateGuideTokens(submit.Text) + guideRouteOverheadTokens)
+	targetAgent := normalizeExplicitTargetAgent(submit.TargetAgent)
+	usage := m.bumpAgentContextUsage(guideAgentID, estimateGuideTokens(submit.Text)+guideRouteOverheadTokens)
+	m.publishGuideActivity(
+		events.EventTypeLLMRequest,
+		events.OutcomePending,
+		"Classifying and routing request",
+		usage,
+	)
 
 	req := &guide.RouteRequest{
 		CorrelationID: uuid.New().String(),
 		Input:         submit.Text,
 		SourceAgentID: sourceAgentTUI,
-		TargetAgentID: submit.TargetAgent,
+		TargetAgentID: targetAgent,
 		SessionID:     submit.SessionID,
 		Timestamp:     time.Now(),
 	}
@@ -11493,7 +12264,31 @@ func (m *AppModel) bumpGuideContextUsage(addedTokens int) float64 {
 	tokens = min(tokens, guideMaxContextTokens)
 	m.guideContextTokens = tokens
 	m.guideContextUsage = float64(tokens) / float64(guideMaxContextTokens)
+	m.agentContextTokens[guideAgentID] = tokens
 	return m.guideContextUsage
+}
+
+func (m *AppModel) bumpAgentContextUsage(agentID string, addedTokens int) float64 {
+	normalized := strings.ToLower(strings.TrimSpace(agentID))
+	if normalized == "" {
+		return 0
+	}
+	if normalized == guideAgentID {
+		return m.bumpGuideContextUsage(addedTokens)
+	}
+	retained := int(float64(m.agentContextTokens[normalized]) * guideContextRetention)
+	tokens := retained + max(addedTokens, 0)
+	limit := agentContextTokenLimit(normalized)
+	tokens = min(tokens, limit)
+	m.agentContextTokens[normalized] = tokens
+	return float64(tokens) / float64(limit)
+}
+
+func agentContextTokenLimit(agentID string) int {
+	if strings.EqualFold(agentID, "architect") {
+		return defaultAgentMaxContextTokens
+	}
+	return defaultAgentMaxContextTokens
 }
 
 func estimateGuideTokens(text string) int {
@@ -11836,7 +12631,8 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		return err
 	}
 
-	// In mock mode, seed demo data only. Requests still route through the real Guide.
+	// In mock mode, seed demo data only. Requests still route through real
+	// Guide/Architect agents via the event bus.
 	if cfg.MockMode {
 		seedMockData(deps)
 	}

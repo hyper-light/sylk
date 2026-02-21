@@ -32,17 +32,17 @@ var ClassificationToolSchema = map[string]any{
 		},
 		"intent": map[string]any{
 			"type":        "string",
-			"enum":        []string{"recall", "store", "check", "declare", "complete", "help", "status", "unknown"},
+			"enum":        []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "help", "status", "chat", "unknown"},
 			"description": "The classified intent of the query",
 		},
 		"domain": map[string]any{
 			"type":        "string",
-			"enum":        []string{"patterns", "failures", "decisions", "files", "learnings", "intents", "agents", "system", "unknown"},
+			"enum":        []string{"local", "history", "research", "planning", "system", "compliance", "testing", "general", "unknown"},
 			"description": "The domain/category of the query",
 		},
 		"target_agent": map[string]any{
 			"type":        "string",
-			"enum":        []string{"archivalist", "guide", "unknown"},
+			"enum":        []string{"librarian", "engineer", "designer", "tester", "inspector", "archivalist", "academic", "orchestrator", "architect", "guide", "unknown"},
 			"description": "Which agent should handle this query",
 		},
 		"entities": map[string]any{
@@ -97,17 +97,19 @@ var ClassificationToolSchema = map[string]any{
 			"type":        "boolean",
 			"description": "True if the query contains multiple intents",
 		},
-		"sub_intents": map[string]any{
+		"sub_results": map[string]any{
 			"type": "array",
 			"items": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"intent":     map[string]any{"type": "string"},
-					"domain":     map[string]any{"type": "string"},
-					"confidence": map[string]any{"type": "number"},
+					"is_retrospective": map[string]any{"type": "boolean"},
+					"intent":           map[string]any{"type": "string"},
+					"domain":           map[string]any{"type": "string"},
+					"target_agent":     map[string]any{"type": "string"},
+					"confidence":       map[string]any{"type": "number"},
 				},
 			},
-			"description": "Sub-intents if multi_intent is true",
+			"description": "Sub-results if multi_intent is true",
 		},
 	},
 	"required": []string{"is_retrospective", "intent", "domain", "target_agent", "confidence"},
@@ -142,8 +144,7 @@ type Classifier struct {
 	client ClassifierClient
 	config RouterConfig
 
-	// Few-shot corrections
-	corrections []CorrectionRecord
+	corrections *correctionMemory
 }
 
 // NewClassifier creates a new classifier
@@ -151,7 +152,7 @@ func NewClassifier(client *anthropic.Client, config RouterConfig) *Classifier {
 	return &Classifier{
 		client:      NewRealClassifierClient(client),
 		config:      config,
-		corrections: make([]CorrectionRecord, 0),
+		corrections: newCorrectionMemory(config.MaxCorrections),
 	}
 }
 
@@ -160,7 +161,7 @@ func NewClassifierWithClient(client ClassifierClient, config RouterConfig) *Clas
 	return &Classifier{
 		client:      client,
 		config:      config,
-		corrections: make([]CorrectionRecord, 0),
+		corrections: newCorrectionMemory(config.MaxCorrections),
 	}
 }
 
@@ -175,14 +176,14 @@ func NewClassifierWithAPIKey(apiKey string, config RouterConfig) *Classifier {
 	return &Classifier{
 		client:      NewRealClassifierClient(&client),
 		config:      config,
-		corrections: make([]CorrectionRecord, 0),
+		corrections: newCorrectionMemory(config.MaxCorrections),
 	}
 }
 
 // Classify classifies a natural language query
 func (c *Classifier) Classify(ctx context.Context, input string) (*ClassificationResult, error) {
-	// Build prompt with corrections
-	systemPrompt := FormatClassificationPrompt(c.formatCorrections())
+	// Keep prompt modules stable and minimal for cacheability + token efficiency.
+	systemPrompt := BuildClassificationPrompt(input)
 
 	// Create context with timeout
 	if c.config.ClassificationTimeout > 0 {
@@ -208,8 +209,46 @@ func (c *Classifier) Classify(ctx context.Context, input string) (*Classificatio
 		return nil, fmt.Errorf("classification request failed: %w", err)
 	}
 
-	// Extract classification from response
-	return c.extractClassificationFromText(resp)
+	// Extract classification from response and apply local correction overrides.
+	result, err := c.extractClassificationFromText(resp)
+	if err != nil {
+		return nil, err
+	}
+	return c.applyCorrectionOverride(input, result), nil
+}
+
+func (c *Classifier) applyCorrectionOverride(input string, result *ClassificationResult) *ClassificationResult {
+	if c == nil || c.corrections == nil || result == nil {
+		return result
+	}
+	correction := c.corrections.bestMatch(input)
+	if correction == nil {
+		return result
+	}
+	if !matchesWrongClassification(result, correction) {
+		return result
+	}
+	result.Intent = correction.CorrectIntent
+	result.Domain = correction.CorrectDomain
+	result.TargetAgent = correction.CorrectTarget
+	result.Confidence = normalizeConfidence(maxFloat(result.Confidence, 0.95))
+	return result
+}
+
+func matchesWrongClassification(result *ClassificationResult, correction *CorrectionRecord) bool {
+	if result == nil || correction == nil {
+		return false
+	}
+	return result.Intent == correction.WrongIntent &&
+		result.Domain == correction.WrongDomain &&
+		result.TargetAgent == correction.WrongTarget
+}
+
+func maxFloat(left float64, right float64) float64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 // extractClassificationFromText extracts classification from text response
@@ -218,11 +257,13 @@ func (c *Classifier) extractClassificationFromText(resp *anthropic.Message) (*Cl
 	if text == "" {
 		return nil, fmt.Errorf("no text content in response")
 	}
-	jsonStr := extractJSONBlock(text)
-	if jsonStr == "" {
-		return c.parseTextHeuristically(text)
+	for _, candidate := range classificationJSONCandidates(text) {
+		result, err := c.parseToolUseResult([]byte(candidate))
+		if err == nil {
+			return result, nil
+		}
 	}
-	return c.parseToolUseResult([]byte(jsonStr))
+	return c.parseTextHeuristically(text)
 }
 
 func extractTextContent(resp *anthropic.Message) string {
@@ -241,6 +282,50 @@ func extractJSONBlock(text string) string {
 		return ""
 	}
 	return text[start:end]
+}
+
+func classificationJSONCandidates(text string) []string {
+	candidates := []string{strings.TrimSpace(text)}
+	if block := extractJSONBlock(text); block != "" {
+		candidates = append(candidates, block)
+	}
+	if fenced := extractFencedJSONBlock(text); fenced != "" {
+		candidates = append(candidates, fenced)
+	}
+	return uniqueClassificationCandidates(candidates)
+}
+
+func extractFencedJSONBlock(text string) string {
+	start := strings.Index(text, "```")
+	if start == -1 {
+		return ""
+	}
+	rest := text[start+3:]
+	if strings.HasPrefix(strings.ToLower(rest), "json") {
+		rest = rest[4:]
+	}
+	end := strings.Index(rest, "```")
+	if end == -1 {
+		return ""
+	}
+	return strings.TrimSpace(rest[:end])
+}
+
+func uniqueClassificationCandidates(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
 }
 
 func findJSONBounds(text string) (int, int) {
@@ -381,6 +466,8 @@ func (c *Classifier) parseToolUseResult(inputJSON []byte) (*ClassificationResult
 type classifierRawResult struct {
 	IsRetrospective bool   `json:"is_retrospective"`
 	RejectionReason string `json:"rejection_reason"`
+	Rejected        bool   `json:"rejected"`
+	Reason          string `json:"reason"`
 	Intent          string `json:"intent"`
 	Domain          string `json:"domain"`
 	TargetAgent     string `json:"target_agent"`
@@ -395,25 +482,33 @@ type classifierRawResult struct {
 		Data         map[string]any `json:"data"`
 		Query        string         `json:"query"`
 	} `json:"entities"`
-	Confidence  float64 `json:"confidence"`
-	MultiIntent bool    `json:"multi_intent"`
-	SubIntents  []struct {
-		Intent     string  `json:"intent"`
-		Domain     string  `json:"domain"`
-		Confidence float64 `json:"confidence"`
-	} `json:"sub_intents"`
+	Confidence  float64                `json:"confidence"`
+	MultiIntent bool                   `json:"multi_intent"`
+	SubIntents  []classifierRawSubItem `json:"sub_intents"`
+	SubResults  []classifierRawSubItem `json:"sub_results"`
+}
+
+type classifierRawSubItem struct {
+	IsRetrospective *bool   `json:"is_retrospective,omitempty"`
+	Intent          string  `json:"intent"`
+	Domain          string  `json:"domain"`
+	TargetAgent     string  `json:"target_agent"`
+	Confidence      float64 `json:"confidence"`
 }
 
 func (c *Classifier) baseClassificationResult(raw classifierRawResult) *ClassificationResult {
-	return &ClassificationResult{
+	result := &ClassificationResult{
 		IsRetrospective: raw.IsRetrospective,
 		RejectionReason: raw.RejectionReason,
-		Intent:          Intent(raw.Intent),
-		Domain:          Domain(raw.Domain).Canonical(),
-		TargetAgent:     TargetAgent(raw.TargetAgent),
+		Rejected:        raw.Rejected,
+		Reason:          strings.TrimSpace(raw.Reason),
+		Intent:          normalizeIntent(raw.Intent),
+		Domain:          normalizeDomain(raw.Domain),
+		TargetAgent:     normalizeTargetAgent(raw.TargetAgent),
 		Confidence:      raw.Confidence,
 		MultiIntent:     raw.MultiIntent,
 	}
+	return normalizeClassificationResult(result)
 }
 
 func (c *Classifier) applyRawEntities(result *ClassificationResult, raw classifierRawResult) {
@@ -435,49 +530,131 @@ func (c *Classifier) applyRawEntities(result *ClassificationResult, raw classifi
 }
 
 func (c *Classifier) applyRawSubIntents(result *ClassificationResult, raw classifierRawResult) {
-	if !raw.MultiIntent || len(raw.SubIntents) == 0 {
+	items := rawSubItems(raw)
+	if !raw.MultiIntent || len(items) == 0 {
 		return
 	}
 
-	result.SubResults = make([]*ClassificationResult, 0, len(raw.SubIntents))
-	for _, sub := range raw.SubIntents {
-		result.SubResults = append(result.SubResults, &ClassificationResult{
-			IsRetrospective: raw.IsRetrospective,
-			Intent:          Intent(sub.Intent),
-			Domain:          Domain(sub.Domain).Canonical(),
+	result.SubResults = make([]*ClassificationResult, 0, len(items))
+	for _, sub := range items {
+		result.SubResults = append(result.SubResults, normalizeClassificationResult(&ClassificationResult{
+			IsRetrospective: resolveSubRetrospective(raw.IsRetrospective, sub.IsRetrospective),
+			Intent:          normalizeIntent(sub.Intent),
+			Domain:          normalizeDomain(sub.Domain),
+			TargetAgent:     normalizeTargetAgent(sub.TargetAgent),
 			Confidence:      sub.Confidence,
-		})
+		}))
+	}
+	result.MultiIntent = len(result.SubResults) > 0
+}
+
+func rawSubItems(raw classifierRawResult) []classifierRawSubItem {
+	if len(raw.SubResults) > 0 {
+		return raw.SubResults
+	}
+	return raw.SubIntents
+}
+
+func resolveSubRetrospective(parent bool, value *bool) bool {
+	if value == nil {
+		return parent
+	}
+	return *value
+}
+
+func normalizeClassificationResult(result *ClassificationResult) *ClassificationResult {
+	if result == nil {
+		return &ClassificationResult{
+			IsRetrospective: true,
+			Intent:          IntentUnknown,
+			Domain:          DomainUnknown,
+			TargetAgent:     TargetUnknown,
+			Confidence:      0,
+		}
+	}
+	result.Intent = normalizeIntent(string(result.Intent))
+	result.Domain = normalizeDomain(string(result.Domain))
+	result.TargetAgent = normalizeTargetAgent(string(result.TargetAgent))
+	result.Confidence = normalizeConfidence(result.Confidence)
+	result.Reason = strings.TrimSpace(result.Reason)
+	if result.MultiIntent && len(result.SubResults) == 0 {
+		result.MultiIntent = false
+	}
+	return result
+}
+
+func normalizeIntent(raw string) Intent {
+	intent := Intent(strings.ToLower(strings.TrimSpace(raw)))
+	if intent == IntentUnknown {
+		return intent
+	}
+	for _, candidate := range AllIntents() {
+		if candidate == intent {
+			return intent
+		}
+	}
+	return IntentUnknown
+}
+
+func normalizeDomain(raw string) Domain {
+	domain := Domain(strings.ToLower(strings.TrimSpace(raw))).Canonical()
+	if domain == DomainUnknown {
+		return domain
+	}
+	for _, candidate := range AllDomains() {
+		if candidate == domain {
+			return domain
+		}
+	}
+	return DomainUnknown
+}
+
+func normalizeTargetAgent(raw string) TargetAgent {
+	target := TargetAgent(strings.ToLower(strings.TrimSpace(raw)))
+	if target == TargetUnknown {
+		return target
+	}
+	for _, candidate := range AllTargetAgents() {
+		if candidate == target {
+			return target
+		}
+	}
+	return TargetUnknown
+}
+
+func normalizeConfidence(value float64) float64 {
+	switch {
+	case value < 0:
+		return 0
+	case value > 1:
+		return 1
+	default:
+		return value
 	}
 }
 
 // AddCorrection adds a correction for learning
 func (c *Classifier) AddCorrection(correction CorrectionRecord) {
-	c.corrections = append(c.corrections, correction)
-
-	// Keep only recent corrections
-	if len(c.corrections) > c.config.MaxCorrections {
-		c.corrections = c.corrections[1:]
+	if c.corrections == nil {
+		return
 	}
+	c.corrections.add(correction)
 }
 
 // formatCorrections formats corrections for few-shot learning
-func (c *Classifier) formatCorrections() string {
-	if len(c.corrections) == 0 {
+func (c *Classifier) formatCorrections(input string) string {
+	if c.corrections == nil {
 		return ""
 	}
+	candidates := c.corrections.selectForPrompt(input, c.maxPromptCorrections())
+	return formatCorrectionExamples(candidates)
+}
 
-	var sb string
-	for _, corr := range c.corrections {
-		sb += fmt.Sprintf(
-			"Input: %q\nWRONG: intent=%s, domain=%s, target=%s\nCORRECT: intent=%s, domain=%s, target=%s\nReason: %s\n\n",
-			corr.Input,
-			corr.WrongIntent, corr.WrongDomain, corr.WrongTarget,
-			corr.CorrectIntent, corr.CorrectDomain, corr.CorrectTarget,
-			corr.Reason,
-		)
+func (c *Classifier) maxPromptCorrections() int {
+	if c.config.MaxPromptCorrections > 0 {
+		return c.config.MaxPromptCorrections
 	}
-
-	return sb
+	return defaultMaxPromptCorrections
 }
 
 // =============================================================================
@@ -492,16 +669,25 @@ func (cr *ClassificationResult) ToRouteResult(processingTime time.Duration) *Rou
 		TargetAgent:          cr.TargetAgent,
 		Entities:             cr.Entities,
 		Confidence:           cr.Confidence,
+		Rejected:             cr.Rejected,
+		Reason:               strings.TrimSpace(cr.Reason),
 		ClassificationMethod: "llm",
 		ProcessingTime:       processingTime,
 	}
 
 	cr.assignTargetRouting(result)
 	cr.applyRejection(result)
-	result.Action = determineAction(cr.Confidence)
+	result.Action = cr.determineRouteAction(result)
 	cr.applyMultiIntent(result)
 
 	return result
+}
+
+func (cr *ClassificationResult) determineRouteAction(result *RouteResult) RouteAction {
+	if result != nil && result.Rejected {
+		return RouteActionReject
+	}
+	return determineAction(cr.Confidence)
 }
 
 func (cr *ClassificationResult) assignTargetRouting(result *RouteResult) {
@@ -535,7 +721,9 @@ func (cr *ClassificationResult) applyRejection(result *RouteResult) {
 		return
 	}
 	result.Rejected = true
-	result.Reason = cr.rejectionReason()
+	if strings.TrimSpace(result.Reason) == "" {
+		result.Reason = cr.rejectionReason()
+	}
 }
 
 func (cr *ClassificationResult) rejectionReason() string {

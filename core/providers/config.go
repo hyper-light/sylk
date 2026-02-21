@@ -246,8 +246,9 @@ type SafetySetting struct {
 }
 
 const (
-	GoogleAuthModeAPIKey = "api_key"
-	GoogleAuthModeOAuth  = "oauth"
+	GoogleAuthModeAPIKey         = "api_key"
+	GoogleAuthModeOAuth          = "oauth"
+	GoogleAuthModeServiceAccount = "service_account"
 )
 
 // DefaultGoogleConfig returns Google/Gemini defaults
@@ -289,10 +290,10 @@ func validateGoogleAuthMode(mode string) error {
 		return nil
 	}
 	switch trimmed {
-	case GoogleAuthModeAPIKey, GoogleAuthModeOAuth:
+	case GoogleAuthModeAPIKey, GoogleAuthModeOAuth, GoogleAuthModeServiceAccount:
 		return nil
 	default:
-		return fmt.Errorf("google config: auth_mode must be api_key or oauth")
+		return fmt.Errorf("google config: auth_mode must be api_key, oauth, or service_account")
 	}
 }
 
@@ -300,7 +301,8 @@ func validateGoogleAuthCredentials(c *GoogleConfig) error {
 	if c == nil {
 		return fmt.Errorf("google config: config is required")
 	}
-	if strings.TrimSpace(c.AuthMode) == GoogleAuthModeOAuth {
+	switch strings.TrimSpace(c.AuthMode) {
+	case GoogleAuthModeOAuth, GoogleAuthModeServiceAccount:
 		return nil
 	}
 	if strings.TrimSpace(c.APIKey) != "" {

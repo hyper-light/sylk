@@ -2,7 +2,9 @@ package guide
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -21,6 +23,7 @@ type Router struct {
 
 	// Components (stateless)
 	parser            *Parser
+	classifierMu      sync.RWMutex
 	classifier        ClassifierService
 	riskSampler       *RiskSampler
 	crossDomainRouter *CrossDomainRouter
@@ -159,7 +162,11 @@ func (r *Router) routeNaturalLanguage(ctx context.Context, input string, start t
 	}
 
 	// Classify using LLM
-	classification, err := r.classifier.Classify(ctx, input)
+	classifier := r.currentClassifier()
+	if classifier == nil {
+		return nil, errors.New("classifier is not configured")
+	}
+	classification, err := classifier.Classify(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +202,31 @@ func (r *Router) routeNaturalLanguage(ctx context.Context, input string, start t
 // AddCorrection adds a correction to improve future classification.
 // This is for few-shot learning in the LLM prompt.
 func (r *Router) AddCorrection(correction CorrectionRecord) {
-	r.classifier.AddCorrection(correction)
+	classifier := r.currentClassifier()
+	if classifier == nil {
+		return
+	}
+	classifier.AddCorrection(correction)
+}
+
+// SetClassifier swaps the classifier implementation at runtime.
+func (r *Router) SetClassifier(classifier ClassifierService) {
+	if r == nil || classifier == nil {
+		return
+	}
+	r.classifierMu.Lock()
+	r.classifier = classifier
+	r.classifierMu.Unlock()
+}
+
+func (r *Router) currentClassifier() ClassifierService {
+	if r == nil {
+		return nil
+	}
+	r.classifierMu.RLock()
+	classifier := r.classifier
+	r.classifierMu.RUnlock()
+	return classifier
 }
 
 // =============================================================================

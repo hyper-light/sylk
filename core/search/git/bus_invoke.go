@@ -289,8 +289,8 @@ var invokeTable = map[string]invokeEntry{
 	"cherry_pick_sequence": {op: OpCherryPickSequence, params: []string{"hashes", "target_branch"}, fn: func(b *GitBus, p map[string]any) (any, error) {
 		return b.CherryPickSequence(strSlice(p, "hashes"), str(p, "target_branch"))
 	}},
-	"rebase_interactive": {op: OpRebaseInteractive, params: []string{"onto_branch", "plan"}, fn: func(b *GitBus, p map[string]any) (any, error) {
-		return b.RebaseInteractive(str(p, "onto_branch"), rebasePlanSlice(p, "plan"))
+	"rebase_interactive": {op: OpRebaseInteractive, params: []string{"onto_branch", "source_branch", "plan"}, fn: func(b *GitBus, p map[string]any) (any, error) {
+		return b.RebaseInteractive(str(p, "onto_branch"), str(p, "source_branch"), rebasePlanSlice(p, "plan"))
 	}},
 	"merge_sequence": {op: OpMergeSequence, params: []string{"source_branch", "target_branch"}, fn: func(b *GitBus, p map[string]any) (any, error) {
 		return b.MergeSequence(str(p, "source_branch"), str(p, "target_branch"))

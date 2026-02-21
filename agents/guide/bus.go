@@ -336,6 +336,7 @@ const (
 	MessageTypeUserOverride          MessageType = "user_override"
 	MessageTypeUserInterrupt         MessageType = "user_interrupt"
 	MessageTypeWorkflowComplete      MessageType = "workflow_complete"
+	MessageTypeProposal              MessageType = "proposal"
 )
 
 // =============================================================================

@@ -404,8 +404,8 @@ func TestExecutionAgentsEventBusSubscriptions(t *testing.T) {
 			err := tc.start()
 			require.NoError(t, err)
 
-			requestTopic := guide.AgentTopic(tc.channelID, guide.ChannelTypeRequests)
-			responseTopic := guide.AgentTopic(tc.channelID, guide.ChannelTypeResponses)
+			requestTopic := guide.AgentTopic(tc.channelID, tc.channelID, guide.ChannelTypeRequests)
+			responseTopic := guide.AgentTopic(tc.channelID, tc.channelID, guide.ChannelTypeResponses)
 
 			reqCount := bus.TopicSubscriberCount(requestTopic)
 			assert.Greater(t, reqCount, 0, "should have request subscription")

@@ -391,11 +391,13 @@ func (m *Model) IsStreaming() bool { return m.accumulator != nil }
 
 // HasActiveAnimation reports whether any tick-driven animation is running
 // (thinking spinner, highlight countdown, edge flash, or streaming).
+// Uses !IsZero rather than Before for the highlight check so the decor tick
+// chain keeps running until tickHighlight actually clears the viewport state.
 func (m *Model) HasActiveAnimation() bool {
 	now := time.Now()
 	return m.thinkingIdx >= 0 ||
 		m.accumulator != nil ||
-		now.Before(m.highlightUntil) ||
+		!m.highlightUntil.IsZero() ||
 		m.viewport.HasEdgeFlash(now)
 }
 
@@ -441,11 +443,11 @@ func (m *Model) tickHighlight(now time.Time) {
 }
 
 func (m *Model) handleDecorTick(now time.Time) {
-	prevHL := !m.highlightUntil.IsZero() && now.Before(m.highlightUntil)
+	prevHL := !m.highlightUntil.IsZero()
 	prevFlash := m.viewport.HasEdgeFlash(now)
 	m.tickHighlight(now)
 	m.viewport.TickEdgeFlash(now)
-	afterHL := !m.highlightUntil.IsZero() && now.Before(m.highlightUntil)
+	afterHL := !m.highlightUntil.IsZero()
 	afterFlash := m.viewport.HasEdgeFlash(now)
 	if prevHL != afterHL || prevFlash != afterFlash {
 		m.viewDirty = true

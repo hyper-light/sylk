@@ -16,6 +16,17 @@ var tabLabels = [tabCount]string{
 	TabUncommitted: "Uncommitted",
 }
 
+// TabBarNaturalWidth returns the minimum content width to render all tabs
+// on a single line without wrapping. Derived from tabLabels.
+func TabBarNaturalWidth() int {
+	w := 0
+	for i := range tabCount {
+		w += len(tabLabels[GitTab(i)]) + 2 // " Label "
+	}
+	w += (int(tabCount) - 1) * 3 // " | " separators
+	return w
+}
+
 // renderTabBar renders a simple tab bar without close icons.
 //
 //	Commits | Branches | Uncommitted

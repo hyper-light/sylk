@@ -78,8 +78,10 @@ func (s PlanStatus) String() string {
 
 type DesignPlan struct {
 	ID               string
+	SessionID        string
 	Query            string
 	Status           PlanStatus
+	Revision         int
 	Error            string
 	Requirements     *Requirements
 	CodebasePatterns *CodebasePatterns
@@ -87,6 +89,12 @@ type DesignPlan struct {
 	Tasks            []*AtomicTask
 	Workflow         *WorkflowDAG
 	Constraints      *PlanConstraints
+	Consultations    map[string]*ConsultationEvidence
+	Declarations     []*PreDelegationDeclaration
+	PlanFile         string
+	Todos            []PlanTodo
+	RiskSummary      []string
+	UpdatedAt        time.Time
 	CreatedAt        time.Time
 	CompletedAt      time.Time
 }
@@ -322,4 +330,57 @@ type ConsultResponse struct {
 	Data    any
 	Error   string
 	Took    time.Duration
+}
+
+type ConsultationEvidence struct {
+	Target      string
+	Query       string
+	Scope       string
+	Correlation string
+	Success     bool
+	Data        any
+	Error       string
+	RequestedAt time.Time
+	ReceivedAt  time.Time
+}
+
+type PreDelegationDeclaration struct {
+	ID                 string
+	PlanID             string
+	TaskID             string
+	TargetAgent        string
+	Reasoning          string
+	RequiredSkills     []string
+	ExpectedOutcome    string
+	FailureCriteria    string
+	UserClarification  bool
+	ChallengesRaised   []string
+	ConsultationChecks map[string]*ConsultationEvidence
+	CreatedAt          time.Time
+}
+
+type PlanTodo struct {
+	Content    string
+	Status     string
+	ActiveForm string
+}
+
+type PlanModeState struct {
+	SessionID        string
+	PlanID           string
+	Enabled          bool
+	AwaitingApproval bool
+	PlanFile         string
+	AllowedPrompts   []string
+	Todos            []PlanTodo
+	UpdatedAt        time.Time
+}
+
+type ResearchProposal struct {
+	ResearchSlug string
+	PaperPath    string
+	Version      int
+	Summary      string
+	SessionID    string
+	ProjectHash  string
 }

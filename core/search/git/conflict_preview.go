@@ -52,10 +52,11 @@ func (c *GitClient) PreviewMerge(sourceBranch, targetBranch string) (*ConflictPr
 	return c.previewTreeMerge(targetCommit, sourceCommit)
 }
 
-// PreviewRebase simulates rebasing the current branch onto the target branch.
-// Iterates commits unique to the current branch and accumulates conflicts.
+// PreviewRebase simulates rebasing sourceBranch onto ontoBranch.
+// When sourceBranch is empty, falls back to HEAD (same-branch rebase).
+// Iterates commits unique to the source branch and accumulates conflicts.
 // Caller must hold NO lock — acquires RLock internally.
-func (c *GitClient) PreviewRebase(ontoBranch string) (*ConflictPreviewResult, error) {
+func (c *GitClient) PreviewRebase(ontoBranch, sourceBranch string) (*ConflictPreviewResult, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -63,14 +64,24 @@ func (c *GitClient) PreviewRebase(ontoBranch string) (*ConflictPreviewResult, er
 		return nil, ErrNotGitRepo
 	}
 
-	headRef, err := c.repo.Head()
-	if err != nil {
-		return nil, wrapHeadError(err)
-	}
-
-	headCommit, err := c.repo.CommitObject(headRef.Hash())
-	if err != nil {
-		return nil, err
+	// Resolve the source commit: explicit branch or HEAD fallback.
+	var sourceCommit *object.Commit
+	if sourceBranch != "" {
+		var sErr error
+		sourceCommit, sErr = c.resolveBranchCommitInternal(sourceBranch)
+		if sErr != nil {
+			return nil, sErr
+		}
+	} else {
+		headRef, hErr := c.repo.Head()
+		if hErr != nil {
+			return nil, wrapHeadError(hErr)
+		}
+		var cErr error
+		sourceCommit, cErr = c.repo.CommitObject(headRef.Hash())
+		if cErr != nil {
+			return nil, cErr
+		}
 	}
 
 	ontoCommit, err := c.resolveBranchCommitInternal(ontoBranch)
@@ -78,15 +89,15 @@ func (c *GitClient) PreviewRebase(ontoBranch string) (*ConflictPreviewResult, er
 		return nil, err
 	}
 
-	// Find commits unique to current branch (not on onto).
-	bases, err := headCommit.MergeBase(ontoCommit)
+	// Find commits unique to source branch (not on onto).
+	bases, err := sourceCommit.MergeBase(ontoCommit)
 	if err != nil || len(bases) == 0 {
 		return &ConflictPreviewResult{Clean: true}, nil
 	}
 
-	// Collect commits from HEAD to merge-base (first-parent walk).
+	// Collect commits from source to merge-base (first-parent walk).
 	var commits []*object.Commit
-	cur := headCommit
+	cur := sourceCommit
 	for cur.Hash != bases[0].Hash {
 		commits = append(commits, cur)
 		if len(cur.ParentHashes) == 0 {

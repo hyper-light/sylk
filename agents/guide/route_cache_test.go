@@ -269,6 +269,30 @@ func TestRouteCache_Cleanup(t *testing.T) {
 	assert.Equal(t, 0, cache.Stats().Size)
 }
 
+func TestRouteCache_SemanticFallback(t *testing.T) {
+	cache := guide.NewRouteCache(guide.RouteCacheConfig{
+		MaxSize:               1000,
+		TTL:                   time.Hour,
+		EnableSemantic:        true,
+		SemanticThreshold:     0.4,
+		MaxSemanticCandidates: 16,
+	})
+
+	cache.Set("find authentication login flow", &guide.RouteResult{
+		TargetAgent: guide.TargetLibrarian,
+		Intent:      guide.IntentFind,
+		Domain:      guide.DomainLocal,
+		Confidence:  0.9,
+	})
+
+	cached := cache.Get("locate authentication login flow")
+	require.NotNil(t, cached)
+	assert.Equal(t, string(guide.TargetLibrarian), cached.TargetAgentID)
+
+	stats := cache.Stats()
+	assert.GreaterOrEqual(t, stats.SimilarityHits, int64(1))
+}
+
 // TestRouteCache_GetAll tests getting all cached routes
 func TestRouteCache_GetAll(t *testing.T) {
 	cache := guide.NewRouteCache(guide.DefaultRouteCacheConfig())

@@ -2,12 +2,15 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/ui/msg"
+	"github.com/adalundhe/sylk/ui/redact"
 )
 
 const (
@@ -124,7 +127,7 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 		program.Send(msg.StreamErrorMsg{
 			SessionID:     b.sessionID,
 			CorrelationID: busMsg.CorrelationID,
-			Err:           guideError(errText),
+			Err:           guideError(redact.Text(errText)),
 		})
 	}
 }
@@ -141,11 +144,11 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 	case guide.StreamEventStart:
 		program.Send(msg.StreamStartMsg{SessionID: sid, CorrelationID: cid, AgentID: stream.RespondingAgentID})
 	case guide.StreamEventData:
-		program.Send(msg.StreamChunkMsg{SessionID: sid, CorrelationID: cid, Text: stream.Event.Text})
+		program.Send(msg.StreamChunkMsg{SessionID: sid, CorrelationID: cid, Text: redact.Text(stream.Event.Text)})
 	case guide.StreamEventComplete:
 		program.Send(msg.StreamCompleteMsg{SessionID: sid, CorrelationID: cid, Result: stream.Event.Data})
 	case guide.StreamEventError:
-		program.Send(msg.StreamErrorMsg{SessionID: sid, CorrelationID: cid, Err: extractStreamError(stream.Event)})
+		program.Send(msg.StreamErrorMsg{SessionID: sid, CorrelationID: cid, Err: redact.Error(extractStreamError(stream.Event))})
 	case guide.StreamEventRetry:
 		status, _ := stream.Event.Data.(guide.RetryStatus)
 		errText := ""
@@ -178,13 +181,29 @@ func toGuideMsg(resp *guide.RouteResponse) msg.GuideResponseMsg {
 		AgentName:     resp.RespondingAgentName,
 	}
 	if resp.Success {
-		m.Content, _ = resp.Data.(string)
+		m.Content = redact.Text(routeResponseContent(resp.Data))
 		return m
 	}
 	if resp.Error != "" {
-		m.Err = guideError(resp.Error)
+		m.Err = guideError(redact.Text(resp.Error))
 	}
 	return m
+}
+
+func routeResponseContent(data any) string {
+	switch typed := data.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	case []byte:
+		return string(typed)
+	}
+	encoded, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Sprint(data)
+	}
+	return string(encoded)
 }
 
 // guideError is a simple error type for guide response errors.

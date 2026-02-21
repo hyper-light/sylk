@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -190,6 +191,27 @@ func resolveFromFile(provider string) (string, error) {
 	return creds.Credentials[provider], nil
 }
 
+// ValidateKeyFormat checks whether key has the expected prefix and minimum
+// length for the given provider. It is intentionally loose — the goal is to
+// reject obviously-wrong values (empty strings, truncated pastes) without
+// blocking keys whose format evolves over time.
+func ValidateKeyFormat(provider, key string) bool {
+	const minLen = 24
+	if len(key) < minLen {
+		return false
+	}
+	switch provider {
+	case "anthropic":
+		return strings.HasPrefix(key, "sk-ant-")
+	case "openai":
+		return strings.HasPrefix(key, "sk-") && !strings.HasPrefix(key, "sk-ant-")
+	case "google":
+		return strings.HasPrefix(key, "AIza")
+	default:
+		return true
+	}
+}
+
 func GetEnvKeyName(provider string) string {
 	return providerEnvKeys[provider]
 }
@@ -201,4 +223,65 @@ func RegisterEnvKey(provider, envKey string) {
 func HasCredentials(provider string) bool {
 	key, err := ResolveAPIKey(provider)
 	return err == nil && key != ""
+}
+
+// EnsureCredentialsDir creates the ~/.sylk directory and returns its path.
+func EnsureCredentialsDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("getting home directory: %w", err)
+	}
+	dir := filepath.Join(home, ".sylk")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("creating config directory: %w", err)
+	}
+	return dir, nil
+}
+
+// LoadCredentials reads the credentials map from disk.
+func LoadCredentials() (map[string]string, error) {
+	path := DefaultCredentialsPath()
+	if path == "" {
+		return nil, fmt.Errorf("could not determine credentials path")
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return make(map[string]string), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading credentials: %w", err)
+	}
+	var file credentialsFile
+	if err := yaml.Unmarshal(data, &file); err != nil {
+		return nil, fmt.Errorf("parsing credentials: %w", err)
+	}
+	if file.Credentials == nil {
+		return make(map[string]string), nil
+	}
+	return file.Credentials, nil
+}
+
+// SaveCredentials writes the full credentials map to disk.
+func SaveCredentials(creds map[string]string) error {
+	dir, err := EnsureCredentialsDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "credentials.yaml")
+	file := credentialsFile{Credentials: creds}
+	data, err := yaml.Marshal(&file)
+	if err != nil {
+		return fmt.Errorf("marshaling credentials: %w", err)
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+// SaveAPIKey stores a single provider's API key in the credentials file.
+func SaveAPIKey(provider, key string) error {
+	creds, err := LoadCredentials()
+	if err != nil {
+		return err
+	}
+	creds[provider] = key
+	return SaveCredentials(creds)
 }

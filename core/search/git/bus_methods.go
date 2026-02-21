@@ -366,9 +366,9 @@ func (b *GitBus) CherryPickSequence(hashes []string, targetBranch string) (*Sequ
 		func() (*SequencerStatus, error) { return b.client.CherryPickSequence(hashes, targetBranch) })
 }
 
-func (b *GitBus) RebaseInteractive(ontoBranch string, plan []RebasePlanEntry) (*SequencerStatus, error) {
-	return dispatch(b, OpRebaseInteractive, [2]any{ontoBranch, plan},
-		func() (*SequencerStatus, error) { return b.client.RebaseInteractive(ontoBranch, plan) })
+func (b *GitBus) RebaseInteractive(ontoBranch, sourceBranch string, plan []RebasePlanEntry) (*SequencerStatus, error) {
+	return dispatch(b, OpRebaseInteractive, [3]any{ontoBranch, sourceBranch, plan},
+		func() (*SequencerStatus, error) { return b.client.RebaseInteractive(ontoBranch, sourceBranch, plan) })
 }
 
 func (b *GitBus) MergeSequence(sourceBranch, targetBranch string) (*SequencerStatus, error) {
@@ -425,9 +425,9 @@ func (b *GitBus) PreviewMerge(sourceBranch, targetBranch string) (*ConflictPrevi
 		func() (*ConflictPreviewResult, error) { return b.client.PreviewMerge(sourceBranch, targetBranch) })
 }
 
-func (b *GitBus) PreviewRebase(ontoBranch string) (*ConflictPreviewResult, error) {
-	return dispatch(b, OpPreviewRebase, ontoBranch,
-		func() (*ConflictPreviewResult, error) { return b.client.PreviewRebase(ontoBranch) })
+func (b *GitBus) PreviewRebase(ontoBranch, sourceBranch string) (*ConflictPreviewResult, error) {
+	return dispatch(b, OpPreviewRebase, [2]string{ontoBranch, sourceBranch},
+		func() (*ConflictPreviewResult, error) { return b.client.PreviewRebase(ontoBranch, sourceBranch) })
 }
 
 func (b *GitBus) PreviewCherryPick(commitHashes []string) (*ConflictPreviewResult, error) {

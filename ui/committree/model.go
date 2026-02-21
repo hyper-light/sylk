@@ -236,8 +236,9 @@ type CherryPickRequestMsg struct {
 
 // RebaseStartMsg is emitted when the user confirms an interactive rebase plan.
 type RebaseStartMsg struct {
-	OntoBranch string
-	Plan       []RebasePlanItem
+	OntoBranch   string
+	SourceBranch string // Branch being rebased (may differ from HEAD).
+	Plan         []RebasePlanItem
 }
 
 // RebasePlanItem describes one step in the interactive rebase plan.
@@ -2889,7 +2890,9 @@ func (m *Model) executeToolbarAction() tea.Cmd {
 		}
 		onto := m.rebaseOnto
 		m.ExitRebasePlan()
-		return func() tea.Msg { return RebaseStartMsg{OntoBranch: onto, Plan: plan} }
+		return func() tea.Msg {
+		return RebaseStartMsg{OntoBranch: onto, SourceBranch: m.activeBranch, Plan: plan}
+	}
 	case toolbarRebasePlanAbort:
 		m.ExitRebasePlan()
 		return nil
@@ -3273,10 +3276,11 @@ func (m *Model) exitResetMode() {
 	m.viewDirty = true
 }
 
-// enterRevertMode activates revert confirmation mode.
+// enterRevertMode activates revert confirmation mode with Ok auto-focused.
 func (m *Model) enterRevertMode() {
 	m.revertMode = true
-	m.toolbarFocused = false
+	m.toolbarFocused = true
+	m.toolbarAction = 0
 	m.viewDirty = true
 }
 

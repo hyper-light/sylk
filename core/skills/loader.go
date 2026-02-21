@@ -137,27 +137,29 @@ func (l *Loader) sortCandidates(candidates []*Skill) {
 }
 
 func (l *Loader) initialTokens(currentLoaded int) int {
-	return currentLoaded * l.config.EstimatedTokensPerSkill
+	_ = currentLoaded
+	return l.totalLoadedTokens()
 }
 
 func (l *Loader) loadCandidates(candidates []*Skill, currentLoaded int, tokensUsed int) []string {
 	loaded := []string{}
 	for _, skill := range candidates {
-		if !l.canLoadNext(currentLoaded, tokensUsed) {
+		cost := l.skillTokenCost(skill)
+		if !l.canLoadNext(currentLoaded, tokensUsed, cost) {
 			return loaded
 		}
 		if l.registry.Load(skill.Name) {
 			loaded = append(loaded, skill.Name)
 			l.recordEvent(skill.Name, "load", "keyword_match")
 			currentLoaded++
-			tokensUsed += l.config.EstimatedTokensPerSkill
+			tokensUsed += cost
 		}
 	}
 	return loaded
 }
 
-func (l *Loader) canLoadNext(currentLoaded int, tokensUsed int) bool {
-	return l.withinMaxLoaded(currentLoaded) && l.withinTokenBudget(tokensUsed)
+func (l *Loader) canLoadNext(currentLoaded int, tokensUsed int, nextCost int) bool {
+	return l.withinMaxLoaded(currentLoaded) && l.withinTokenBudget(tokensUsed, nextCost)
 }
 
 func (l *Loader) withinMaxLoaded(currentLoaded int) bool {
@@ -167,11 +169,11 @@ func (l *Loader) withinMaxLoaded(currentLoaded int) bool {
 	return currentLoaded < l.config.MaxLoadedSkills
 }
 
-func (l *Loader) withinTokenBudget(tokensUsed int) bool {
+func (l *Loader) withinTokenBudget(tokensUsed int, nextCost int) bool {
 	if l.config.TokenBudget == 0 {
 		return true
 	}
-	return tokensUsed+l.config.EstimatedTokensPerSkill <= l.config.TokenBudget
+	return tokensUsed+nextCost <= l.config.TokenBudget
 }
 
 // LoadDomain loads all skills in a domain if budget allows
@@ -187,15 +189,21 @@ func (l *Loader) LoadDomain(domain string) (int, bool) {
 	// Check if we have budget
 	currentLoaded := len(l.registry.GetLoaded())
 	unloadedInDomain := 0
+	domainCost := 0
 	for _, s := range skills {
 		if !s.Loaded {
 			unloadedInDomain++
+			domainCost += l.skillTokenCost(s)
 		}
 	}
 
 	if l.config.MaxLoadedSkills > 0 && currentLoaded+unloadedInDomain > l.config.MaxLoadedSkills {
 		// Need to unload some skills first
 		l.unloadLeastUsed(unloadedInDomain)
+	}
+	if l.config.TokenBudget > 0 && l.totalLoadedTokens()+domainCost > l.config.TokenBudget {
+		excess := l.totalLoadedTokens() + domainCost - l.config.TokenBudget
+		l.unloadLeastUsedByTokens(excess)
 	}
 
 	count := l.registry.LoadDomain(domain)
@@ -330,18 +338,14 @@ func (l *Loader) OptimizeForBudget() int {
 		return 0
 	}
 
-	loaded := l.registry.GetLoaded()
-	currentTokens := len(loaded) * l.config.EstimatedTokensPerSkill
+	currentTokens := l.totalLoadedTokens()
 
 	if currentTokens <= l.config.TokenBudget {
 		return 0
 	}
 
 	// Need to unload some skills
-	excess := currentTokens - l.config.TokenBudget
-	toUnload := (excess + l.config.EstimatedTokensPerSkill - 1) / l.config.EstimatedTokensPerSkill
-
-	return l.unloadLeastUsed(toUnload)
+	return l.unloadLeastUsedByTokens(currentTokens - l.config.TokenBudget)
 }
 
 // =============================================================================
@@ -365,7 +369,7 @@ func (l *Loader) Stats() LoaderStats {
 
 	loaded := len(l.registry.GetLoaded())
 	total := len(l.registry.GetAll())
-	tokens := loaded * l.config.EstimatedTokensPerSkill
+	tokens := l.totalLoadedTokens()
 
 	var usage float64
 	if l.config.TokenBudget > 0 {
@@ -528,7 +532,11 @@ func (l *Loader) optimizeToBudget(budget int, ctx LoadContext, result *LoadResul
 }
 
 func (l *Loader) currentTokens(loaded []*Skill) int {
-	return len(loaded) * l.config.EstimatedTokensPerSkill
+	total := 0
+	for _, skill := range loaded {
+		total += l.skillTokenCost(skill)
+	}
+	return total
 }
 
 func (l *Loader) scoreLoadedSkills(loaded []*Skill, ctx LoadContext) []skillScore {
@@ -580,9 +588,62 @@ func (l *Loader) unloadToBudget(scores []skillScore, budget int, currentTokens *
 		if l.registry.Unload(scored.skill.Name) {
 			result.Unloaded = append(result.Unloaded, scored.skill.Name)
 			l.recordEvent(scored.skill.Name, "unload", "budget_optimization")
-			*currentTokens -= l.config.EstimatedTokensPerSkill
+			*currentTokens -= l.skillTokenCost(scored.skill)
 		}
 	}
+}
+
+func (l *Loader) totalLoadedTokens() int {
+	return l.currentTokens(l.registry.GetLoaded())
+}
+
+func (l *Loader) skillTokenCost(skill *Skill) int {
+	defaultCost := l.defaultSkillCost()
+	if skill == nil {
+		return defaultCost
+	}
+	cost := skill.EstimatedTokenCost()
+	if cost <= 0 {
+		return defaultCost
+	}
+	if cost < defaultCost {
+		return defaultCost
+	}
+	return cost
+}
+
+func (l *Loader) defaultSkillCost() int {
+	if l.config.EstimatedTokensPerSkill > 0 {
+		return l.config.EstimatedTokensPerSkill
+	}
+	return 200
+}
+
+func (l *Loader) unloadLeastUsedByTokens(excess int) int {
+	if excess <= 0 {
+		return 0
+	}
+	loaded := l.registry.GetLoaded()
+	sort.Slice(loaded, func(i, j int) bool {
+		return loaded[i].InvokeCount < loaded[j].InvokeCount
+	})
+	unloaded := 0
+	remaining := excess
+	for _, skill := range loaded {
+		if remaining <= 0 {
+			return unloaded
+		}
+		if l.isCoreSkill(skill.Name) {
+			continue
+		}
+		if !l.registry.Unload(skill.Name) {
+			continue
+		}
+		unloaded++
+		l.recordEvent(skill.Name, "unload", "token_budget")
+		remaining -= l.skillTokenCost(skill)
+	}
+	return unloaded
 }
 
 // LoadResult contains the results of a loading operation

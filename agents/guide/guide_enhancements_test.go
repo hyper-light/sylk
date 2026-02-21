@@ -283,6 +283,20 @@ func TestGuide_SkillsLoaded(t *testing.T) {
 
 	toolDefs := g.GetLoadedSkillDefinitions()
 	assert.NotEmpty(t, toolDefs)
+	assert.True(t, toolDefsContain(toolDefs, "route"))
+	assert.False(t, toolDefsContain(toolDefs, "task_interact"))
+
+	lazyDefs := g.PrepareToolDefinitionsForInput("run a pipeline task")
+	assert.True(t, toolDefsContain(lazyDefs, "task_interact"))
+}
+
+func toolDefsContain(defs []map[string]any, name string) bool {
+	for _, def := range defs {
+		if def["name"] == name {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGuide_HooksStats(t *testing.T) {

@@ -513,3 +513,16 @@ type DiffViewPair struct {
 	TotalAdd  int
 	TotalDel  int
 }
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+// LoginResultMsg is sent when an auth flow completes (OAuth callback or API key save).
+type LoginResultMsg struct {
+	Provider string // "google", "openai", "anthropic"
+	Method   string // "oauth", "apikey"
+	Success  bool
+	Error    string // Non-empty on failure.
+	FlowID   uint64 // OAuth flow identifier (0 for API-key auth).
+}

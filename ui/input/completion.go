@@ -1,11 +1,5 @@
 package input
 
-import (
-	"strings"
-
-	"github.com/charmbracelet/lipgloss"
-)
-
 // CompletionProvider supplies tab-completion candidates for a given prefix.
 type CompletionProvider interface {
 	Name() string
@@ -29,7 +23,7 @@ type Completer struct {
 	prefix     string
 }
 
-// completionLimit caps the number of candidates shown in the popup.
+// completionLimit caps the number of candidates gathered.
 const completionLimit = 20
 
 // NewCompleter creates a Completer backed by the given providers.
@@ -40,7 +34,7 @@ func NewCompleter(providers ...CompletionProvider) *Completer {
 }
 
 // Trigger gathers candidates for the word under the cursor.
-// It activates the popup when at least one candidate is found.
+// It activates the completer when at least one candidate is found.
 func (c *Completer) Trigger(text string, cursorPos int) {
 	c.prefix = wordBeforeCursor(text, cursorPos)
 	c.candidates = c.gather(c.prefix)
@@ -64,7 +58,7 @@ func (c *Completer) Previous() {
 	c.selected = (c.selected - 1 + len(c.candidates)) % len(c.candidates)
 }
 
-// Accept returns the accepted completion text and dismisses the popup.
+// Accept returns the accepted completion text and dismisses the completer.
 // Returns empty string when there are no candidates.
 func (c *Completer) Accept() string {
 	if len(c.candidates) == 0 {
@@ -76,7 +70,7 @@ func (c *Completer) Accept() string {
 	return text
 }
 
-// Dismiss closes the completion popup.
+// Dismiss closes the completer.
 func (c *Completer) Dismiss() {
 	c.active = false
 	c.candidates = nil
@@ -84,35 +78,28 @@ func (c *Completer) Dismiss() {
 	c.prefix = ""
 }
 
-// IsActive reports whether the completion popup is shown.
+// IsActive reports whether the completer has candidates to show.
 func (c *Completer) IsActive() bool {
 	return c.active
 }
 
-// View renders the completion popup as a styled string of the given width.
-// Returns an empty string when the completer is not active.
-func (c *Completer) View(width int) string {
+// Prefix returns the word fragment that triggered the current completion.
+func (c *Completer) Prefix() string {
+	return c.prefix
+}
+
+// GhostSuffix returns the untyped remainder of the currently selected
+// candidate. Returns "" when inactive or when the candidate does not
+// extend the prefix.
+func (c *Completer) GhostSuffix() string {
 	if !c.active || len(c.candidates) == 0 {
 		return ""
 	}
-
-	menuWidth := min(width, 60)
-	normal := lipgloss.NewStyle().Width(menuWidth)
-	highlight := lipgloss.NewStyle().Width(menuWidth).Reverse(true)
-
-	var b strings.Builder
-	for i, cand := range c.candidates {
-		line := formatCandidate(cand, menuWidth)
-		style := normal
-		if i == c.selected {
-			style = highlight
-		}
-		b.WriteString(style.Render(line))
-		if i < len(c.candidates)-1 {
-			b.WriteByte('\n')
-		}
+	cand := c.candidates[c.selected]
+	if len(cand.Text) <= len(c.prefix) {
+		return ""
 	}
-	return b.String()
+	return cand.Text[len(c.prefix):]
 }
 
 // gather collects candidates from all providers for the given prefix.
@@ -131,27 +118,6 @@ func (c *Completer) gather(prefix string) []Candidate {
 		out = out[:completionLimit]
 	}
 	return out
-}
-
-// formatCandidate formats a candidate into a display line fitting the given width.
-func formatCandidate(cand Candidate, width int) string {
-	display := cand.Display
-	if display == "" {
-		display = cand.Text
-	}
-	if cand.Description == "" {
-		return truncate(display, width)
-	}
-	descMax := width - len(display) - 3 // "  " separator + minimum 1 char desc
-	if descMax <= 0 {
-		return truncate(display, width)
-	}
-	desc := truncate(cand.Description, descMax)
-	padding := width - len(display) - len(desc)
-	if padding < 2 {
-		padding = 2
-	}
-	return display + strings.Repeat(" ", padding) + desc
 }
 
 // wordBeforeCursor extracts the word fragment immediately before cursorPos.

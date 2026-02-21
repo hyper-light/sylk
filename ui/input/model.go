@@ -41,6 +41,10 @@ type Model struct {
 	// optional hint displayed after the text in muted style.
 	lineStyler func(text string) (styled string, hint string)
 
+	// slashValidator reports whether a command name (without "/") is a
+	// known slash command. Used by highlightSlashCommand.
+	slashValidator func(cmd string) bool
+
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache      string
 	viewDirty      bool
@@ -70,6 +74,14 @@ func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) 
 // Pass nil to clear.
 func (m *Model) SetLineStyler(fn func(string) (string, string)) {
 	m.lineStyler = fn
+	m.viewDirty = true
+}
+
+// SetSlashValidator sets a function that reports whether a command name
+// (without the leading "/") is a known slash command. Only exact matches
+// are highlighted.
+func (m *Model) SetSlashValidator(fn func(string) bool) {
+	m.slashValidator = fn
 	m.viewDirty = true
 }
 
@@ -164,11 +176,6 @@ func (m *Model) View(cursorVisible bool) string {
 	style := m.borderStyle()
 
 	body := m.renderBody(cursorVisible)
-	popup := m.completer.View(m.contentWidth())
-
-	if popup != "" {
-		body = body + "\n" + popup
-	}
 
 	// Right-align a submit hint when the input is empty.
 	if m.isEmpty() {
@@ -231,7 +238,7 @@ type keyEntry struct {
 
 // completerKeys are dispatched first when the completer popup is active.
 var completerKeys = []keyEntry{
-	{matchKey("tab"), completerNext},
+	{matchKey("tab"), completerAccept},
 	{matchKey("up"), completerPrev},
 	{matchKey("down"), completerNextDown},
 	{matchKey("enter"), completerAccept},
@@ -283,7 +290,7 @@ func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
 	if k.Type == tea.KeyRunes || k.Type == tea.KeySpace {
 		m.clearSelectionContent()
 		m.insertRunes(k.Runes)
-		m.completer.Dismiss()
+		m.retriggerOrDismiss()
 	}
 	return m, nil
 }
@@ -367,6 +374,7 @@ func actionTab(m *Model) tea.Cmd {
 
 func actionBackspace(m *Model) tea.Cmd {
 	m.deleteBeforeCursor()
+	m.retriggerOrDismiss()
 	return nil
 }
 
@@ -404,11 +412,6 @@ func actionKillToEnd(m *Model) tea.Cmd {
 // ---------------------------------------------------------------------------
 // Completer-mode actions
 // ---------------------------------------------------------------------------
-
-func completerNext(m *Model) tea.Cmd {
-	m.completer.Next()
-	return nil
-}
 
 func completerPrev(m *Model) tea.Cmd {
 	m.completer.Previous()
@@ -481,6 +484,20 @@ func (m *Model) insertRunes(rs []rune) {
 	newLine = append(newLine, line[m.cursorCol:]...)
 	m.lines[m.cursorRow] = newLine
 	m.cursorCol += len(rs)
+}
+
+// retriggerOrDismiss re-triggers the completer when the cursor is on
+// line 0 and the current word prefix starts with "/". Otherwise it
+// dismisses any active completion popup.
+func (m *Model) retriggerOrDismiss() {
+	if m.cursorRow == 0 && m.slashValidator != nil {
+		prefix := wordBeforeCursor(string(m.lines[0]), m.cursorCol)
+		if len(prefix) >= 1 && prefix[0] == '/' {
+			m.completer.Trigger(m.Text(), m.absoluteCursorPos())
+			return
+		}
+	}
+	m.completer.Dismiss()
 }
 
 // insertPaste handles bracketed paste by normalizing line endings and
@@ -668,13 +685,58 @@ func (m *Model) renderLine(line []rune, absRow int, cursorVisible bool) string {
 		return m.renderStyledLine(line, needsCursor, cursorVisible)
 	}
 	if absRow == 0 {
-		lineStr = m.highlightAgentPrefix(lineStr)
+		if len(lineStr) > 0 && lineStr[0] == '/' {
+			lineStr = m.highlightSlashCommand(lineStr)
+		} else {
+			lineStr = m.highlightAgentPrefix(lineStr)
+		}
 	}
 
+	ghost := m.completer.GhostSuffix()
 	if !needsCursor {
-		return lineStr
+		return lineStr + m.renderGhost(ghost)
 	}
-	return m.renderCursor(line, lineStr, cursorVisible)
+	return m.renderCursorWithGhost(line, lineStr, cursorVisible, ghost)
+}
+
+// renderGhost renders the ghost suffix in muted style, or "" if empty.
+func (m *Model) renderGhost(suffix string) string {
+	if suffix == "" {
+		return ""
+	}
+	return lipgloss.NewStyle().Foreground(m.theme.Palette.Muted).Render(suffix)
+}
+
+// renderCursorWithGhost renders the cursor and ghost text together so the
+// ghost position is stable regardless of blink phase. When the cursor is
+// at end-of-line and ghost text exists, the first ghost character becomes
+// the cursor block instead of inserting an extra space.
+func (m *Model) renderCursorWithGhost(line []rune, lineStr string, cursorVisible bool, ghost string) string {
+	ghostRunes := []rune(ghost)
+	mutedStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	atEnd := m.cursorCol >= len(line)
+
+	// Cursor mid-line: standard rendering, ghost appended after.
+	if !atEnd {
+		return m.renderCursor(line, lineStr, cursorVisible) + m.renderGhost(ghost)
+	}
+
+	// Cursor at end-of-line with ghost text: use first ghost char as cursor.
+	if len(ghostRunes) > 0 {
+		tail := mutedStyle.Render(string(ghostRunes[1:]))
+		if cursorVisible {
+			return lineStr + cursorStyle.Render(string(ghostRunes[:1])) + tail
+		}
+		return lineStr + mutedStyle.Render(string(ghostRunes[:1])) + tail
+	}
+
+	// No ghost: standard end-of-line cursor.
+	if cursorVisible {
+		return lineStr + cursorStyle.Render(" ")
+	}
+	return lineStr
 }
 
 // renderStyledLine applies the lineStyler and appends any hint text.
@@ -745,6 +807,61 @@ func (m *Model) highlightAgentPrefix(lineStr string) string {
 	return badge.Render(tag) + lineStr[len(tag):]
 }
 
+// highlightSlashCommand styles the leading /command token. It highlights
+// when the command exactly matches a known slash command, or when the
+// completer popup is active for a "/" prefix (partial match in progress).
+func (m *Model) highlightSlashCommand(lineStr string) string {
+	if m.slashValidator == nil {
+		return lineStr
+	}
+	cmd := detectSlashCommand(lineStr)
+	if cmd == "" {
+		return lineStr
+	}
+	matched := m.slashValidator(cmd)
+	completing := m.completer.IsActive() && strings.HasPrefix(m.completer.Prefix(), "/")
+	if !matched && !completing {
+		return lineStr
+	}
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Secondary).Bold(true)
+	tag := "/" + cmd
+	return style.Render(tag) + lineStr[len(tag):]
+}
+
+// detectSlashCommand returns the command name (without "/") if text begins
+// with an unquoted /word token, or "" otherwise.
+func detectSlashCommand(text string) string {
+	trimmed := strings.TrimLeft(text, " \t")
+	if len(trimmed) < 2 {
+		return ""
+	}
+	// Reject text enclosed in quotes.
+	if trimmed[0] == '"' || trimmed[0] == '\'' {
+		return ""
+	}
+	if trimmed[0] != '/' {
+		return ""
+	}
+	end := 1
+	for end < len(trimmed) && trimmed[end] != ' ' && trimmed[end] != '\t' && trimmed[end] != '\n' {
+		end++
+	}
+	if end <= 1 {
+		return ""
+	}
+	cmd := strings.ToLower(trimmed[1:end])
+	for _, r := range cmd {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '_', r == '-':
+		default:
+			return ""
+		}
+	}
+	return cmd
+}
+
 // isEmpty reports whether the input buffer has no content.
 func (m *Model) isEmpty() bool {
 	return len(m.lines) == 1 && len(m.lines[0]) == 0
@@ -767,7 +884,37 @@ func detectAgentPrefix(text string) (agentName string, remainder string) {
 	if end <= 1 {
 		return "", text
 	}
-	agentName = text[1:end]
+	token, ok := normalizeAgentPrefixToken(text[1:end])
+	if !ok {
+		// Preserve raw input for Guide DSL commands like "@to:agent ..."
+		// and other non-simple @ syntaxes.
+		return "", text
+	}
+	agentName = token
 	remainder = strings.TrimLeft(text[end:], " \t")
 	return agentName, remainder
+}
+
+func normalizeAgentPrefixToken(token string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(token))
+	if normalized == "" {
+		return "", false
+	}
+	if !isAgentPrefixToken(normalized) {
+		return "", false
+	}
+	return normalized, true
+}
+
+func isAgentPrefixToken(token string) bool {
+	for _, r := range token {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }

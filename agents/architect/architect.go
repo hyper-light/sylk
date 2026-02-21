@@ -2,9 +2,11 @@ package architect
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -35,7 +37,9 @@ type Architect struct {
 	// Skills system
 	skills      *skills.Registry
 	skillLoader *skills.Loader
+	hooks       *skills.HookRegistry
 	planner     planningLLM
+	plannerMu   sync.RWMutex
 
 	// Event bus integration
 	bus         guide.EventBus
@@ -48,12 +52,16 @@ type Architect struct {
 
 	// Planning state
 	activePlans map[string]*DesignPlan
+	planModes   map[string]*PlanModeState
 
 	runMu         sync.RWMutex
 	runCtx        context.Context
 	runCancel     context.CancelFunc
 	knownAgentsMu sync.RWMutex
 	activePlansMu sync.RWMutex
+	planModesMu   sync.RWMutex
+	pendingMu     sync.Mutex
+	pendingBus    map[string]chan *guide.Message
 }
 
 // Config holds configuration for the Architect agent
@@ -77,6 +85,13 @@ type Config struct {
 	SimilarityThreshold float64 // Optional, defaults to 0.8
 	ConflictThreshold   float64 // Optional, defaults to 0.3
 	MaxContentLength    int     // Optional, defaults to 10000
+	WorkingDirectory    string  // Optional, defaults to current working directory
+
+	// Consultation/delegation policy
+	MandatoryConsultation            bool          // Optional, defaults to true
+	AllowPlanningWithoutConsultation bool          // Optional, defaults to false
+	ConsultationTimeout              time.Duration // Optional, defaults to 20s
+	ConsultationMaxAge               time.Duration // Optional, defaults to 5m
 
 	// Logging
 	Logger *slog.Logger // Optional, uses slog.Default() if nil
@@ -93,6 +108,10 @@ const (
 	DefaultSimilarityThreshold = 0.8
 	DefaultConflictThreshold   = 0.3
 	DefaultMaxContentLength    = 10000
+	DefaultConsultationTimeout = 20 * time.Second
+	DefaultConsultationMaxAge  = 5 * time.Minute
+	DefaultSkillMaxLoaded      = 16
+	DefaultSkillTokenBudget    = 3200
 )
 
 // New creates a new Architect agent
@@ -104,6 +123,8 @@ func New(cfg Config) (*Architect, error) {
 		logger:      cfg.Logger,
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		activePlans: make(map[string]*DesignPlan),
+		planModes:   make(map[string]*PlanModeState),
+		pendingBus:  make(map[string]chan *guide.Message),
 	}
 
 	architect.initCrossDomain(cfg)
@@ -111,6 +132,9 @@ func New(cfg Config) (*Architect, error) {
 	architect.initSkills()
 	if err := architect.initPlanner(cfg); err != nil {
 		return nil, err
+	}
+	if err := architect.restorePersistedPlans(); err != nil {
+		architect.logger.Warn("failed to restore persisted plans", "error", err)
 	}
 
 	return architect, nil
@@ -147,6 +171,25 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.MaxContentLength == 0 {
 		cfg.MaxContentLength = DefaultMaxContentLength
 	}
+	if cfg.WorkingDirectory == "" {
+		if wd, err := os.Getwd(); err == nil && wd != "" {
+			cfg.WorkingDirectory = wd
+		} else {
+			cfg.WorkingDirectory = "."
+		}
+	}
+	if cfg.ConsultationTimeout == 0 {
+		cfg.ConsultationTimeout = DefaultConsultationTimeout
+	}
+	if cfg.ConsultationMaxAge == 0 {
+		cfg.ConsultationMaxAge = DefaultConsultationMaxAge
+	}
+	if cfg.AllowPlanningWithoutConsultation {
+		cfg.MandatoryConsultation = false
+	}
+	if !cfg.MandatoryConsultation && !cfg.AllowPlanningWithoutConsultation {
+		cfg.MandatoryConsultation = true
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -172,19 +215,16 @@ func (a *Architect) initSynthesizer(cfg Config) {
 
 func (a *Architect) initSkills() {
 	a.skills = skills.NewRegistry()
+	a.hooks = skills.NewHookRegistry()
+	a.registerCoreSkills()
 
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"analyze_requirements",
-		"design_architecture",
-		"generate_tasks",
-		"create_workflow_dag",
-		"estimate_complexity",
-	}
-	loaderCfg.AutoLoadDomains = []string{"planning", "design", "architecture"}
+	loaderCfg.MaxLoadedSkills = DefaultSkillMaxLoaded
+	loaderCfg.TokenBudget = DefaultSkillTokenBudget
+	loaderCfg.CoreSkills = architectCoreSkillNames()
+	loaderCfg.AutoLoadDomains = nil
 	a.skillLoader = skills.NewLoader(a.skills, loaderCfg)
-
-	a.registerCoreSkills()
+	registerArchitectSafetyHook(a.hooks, architectAllSkillNames())
 }
 
 // Close closes the architect and its resources
@@ -323,11 +363,26 @@ func (a *Architect) handleBusRequest(msg *guide.Message) error {
 	if err := ctx.Err(); err != nil {
 		return nil
 	}
+	return a.dispatchBusRequest(ctx, msg)
+}
 
-	if msg.Type != guide.MessageTypeForward {
-		return nil // Ignore non-forward messages
+func (a *Architect) dispatchBusRequest(ctx context.Context, msg *guide.Message) error {
+	if msg == nil {
+		return nil
 	}
+	if msg.Type == guide.MessageTypeForward {
+		return a.handleForwardBusRequest(ctx, msg)
+	}
+	if msg.Type == guide.MessageTypeAction {
+		return a.handleActionBusRequest(ctx, msg)
+	}
+	if msg.Type == guide.MessageTypeProposal {
+		return a.handleProposalBusRequest(ctx, msg)
+	}
+	return nil
+}
 
+func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Message) error {
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
@@ -371,6 +426,33 @@ func (a *Architect) handleBusRequest(msg *guide.Message) error {
 	// Publish response to own response channel
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
+}
+
+func (a *Architect) handleActionBusRequest(ctx context.Context, msg *guide.Message) error {
+	req, ok := msg.GetActionRequest()
+	if !ok {
+		return fmt.Errorf("invalid action request payload")
+	}
+	if req == nil {
+		return nil
+	}
+	if strings.EqualFold(req.Action, "proposal") {
+		return a.handleProposalAction(ctx, req)
+	}
+	if strings.EqualFold(req.Action, "read_research_paper") {
+		return a.handleReadResearchAction(ctx, req)
+	}
+	return nil
+}
+
+func (a *Architect) handleProposalBusRequest(ctx context.Context, msg *guide.Message) error {
+	req := &guide.ActionRequest{
+		CorrelationID: msg.CorrelationID,
+		SourceAgentID: msg.SourceAgentID,
+		Action:        "proposal",
+		Data:          msg.Payload,
+	}
+	return a.handleProposalAction(ctx, req)
 }
 
 func (a *Architect) generateMessageID() string {
@@ -446,15 +528,9 @@ func (a *Architect) handlePlan(ctx context.Context, fwd *guide.ForwardedRequest)
 		ID:        uuid.New().String(),
 		Intent:    IntentPlan,
 		Query:     fwd.Input,
-		SessionID: "",
+		SessionID: sessionIDFromForwarded(fwd),
 		Timestamp: time.Now(),
-	}
-
-	if fwd.Entities != nil {
-		req.Params = make(map[string]any)
-		if fwd.Entities.Scope != "" {
-			req.Params["scope"] = fwd.Entities.Scope
-		}
+		Params:    forwardedRequestParams(fwd),
 	}
 
 	return a.Handle(ctx, req)
@@ -466,8 +542,9 @@ func (a *Architect) handleDesign(ctx context.Context, fwd *guide.ForwardedReques
 		ID:        uuid.New().String(),
 		Intent:    IntentDesign,
 		Query:     fwd.Input,
-		SessionID: "",
+		SessionID: sessionIDFromForwarded(fwd),
 		Timestamp: time.Now(),
+		Params:    forwardedRequestParams(fwd),
 	}
 
 	return a.Handle(ctx, req)
@@ -479,8 +556,9 @@ func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 		ID:        uuid.New().String(),
 		Intent:    IntentRecall,
 		Query:     fwd.Input,
-		SessionID: "",
+		SessionID: sessionIDFromForwarded(fwd),
 		Timestamp: time.Now(),
+		Params:    forwardedRequestParams(fwd),
 	}
 
 	return a.Handle(ctx, req)
@@ -492,18 +570,40 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 		ID:        uuid.New().String(),
 		Intent:    IntentCheck,
 		Query:     fwd.Input,
-		SessionID: "",
+		SessionID: sessionIDFromForwarded(fwd),
 		Timestamp: time.Now(),
+		Params:    forwardedRequestParams(fwd),
 	}
 
 	return a.Handle(ctx, req)
 }
 
+func forwardedRequestParams(fwd *guide.ForwardedRequest) map[string]any {
+	if fwd == nil {
+		return nil
+	}
+	params := map[string]any{}
+	if fwd.Entities != nil {
+		if fwd.Entities.Scope != "" {
+			params["scope"] = fwd.Entities.Scope
+		}
+	}
+	if fwd.CrossDomain != nil {
+		params["cross_domain"] = fwd.CrossDomain
+		params["is_multi_agent"] = fwd.CrossDomain.IsMultiAgent
+		params["primary_agent"] = fwd.CrossDomain.PrimaryAgent
+		params["subtask_count"] = len(fwd.CrossDomain.SubTasks)
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return params
+}
+
 // handleBusResponse processes responses to requests we made
 func (a *Architect) handleBusResponse(msg *guide.Message) error {
-	// For now, just log responses to our requests
-	// Future: implement callback handling for async sub-requests
-	a.logger.Debug("received response", "correlation_id", msg.CorrelationID)
+	a.deliverPendingBusMessage(msg)
+	a.logger.Debug("received response", "correlation_id", msg.CorrelationID, "type", msg.Type)
 	return nil
 }
 
@@ -551,6 +651,7 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
+	a.prepareSkillsForRequest(req)
 
 	start := time.Now()
 	var result any
@@ -607,64 +708,7 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 // 4. Generate atomic tasks
 // 5. Create workflow DAG
 func (a *Architect) executePlanningProtocol(ctx context.Context, req *ArchitectRequest) (*DesignPlan, error) {
-	plan := &DesignPlan{
-		ID:          uuid.New().String(),
-		Query:       req.Query,
-		Status:      PlanStatusAnalyzing,
-		CreatedAt:   time.Now(),
-		Constraints: extractConstraints(req.Params),
-	}
-
-	// Step 1: Analyze requirements
-	requirements, err := a.analyzeRequirements(ctx, req.Query, req.Params)
-	if err != nil {
-		return failPlan(plan, err)
-	}
-	plan.Requirements = requirements
-	plan.Status = PlanStatusConsulting
-
-	// Step 2: Consult Librarian for codebase patterns (if bus is available)
-	if a.running && a.bus != nil {
-		patterns, err := a.consultLibrarian(ctx, requirements, req.SessionID)
-		if err != nil {
-			a.logger.Warn("failed to consult librarian", "error", err)
-		} else {
-			plan.CodebasePatterns = patterns
-		}
-	}
-	plan.Status = PlanStatusDesigning
-
-	// Step 3: Design solution architecture
-	architecture, err := a.designArchitecture(ctx, requirements, plan.CodebasePatterns)
-	if err != nil {
-		return failPlan(plan, err)
-	}
-	plan.Architecture = architecture
-	plan.Status = PlanStatusGenerating
-
-	// Step 4: Generate atomic tasks
-	tasks, err := a.generateAtomicTasks(ctx, architecture, plan.Constraints)
-	if err != nil {
-		return failPlan(plan, err)
-	}
-	plan.Tasks = tasks
-	plan.Status = PlanStatusOrchestrating
-
-	// Step 5: Create workflow DAG
-	workflow, err := a.createWorkflowDAG(ctx, tasks)
-	if err != nil {
-		return failPlan(plan, err)
-	}
-	plan.Workflow = workflow
-	plan.Status = PlanStatusReady
-	plan.CompletedAt = time.Now()
-
-	// Store active plan
-	a.activePlansMu.Lock()
-	a.activePlans[plan.ID] = plan
-	a.activePlansMu.Unlock()
-
-	return plan, nil
+	return a.runPlanningProtocol(ctx, req)
 }
 
 func failPlan(plan *DesignPlan, err error) (*DesignPlan, error) {
@@ -734,26 +778,18 @@ func (a *Architect) analyzeRequirements(ctx context.Context, query string, param
 
 // consultLibrarian queries the Librarian for relevant codebase patterns
 func (a *Architect) consultLibrarian(ctx context.Context, requirements *Requirements, sessionID string) (*CodebasePatterns, error) {
-	// Create a request to the Librarian via the event bus
-	request := &guide.RouteRequest{
-		Input:         fmt.Sprintf("Find patterns related to: %s", requirements.Query),
-		SourceAgentID: "architect",
-		TargetAgentID: "librarian",
-		SessionID:     sessionID,
-		Timestamp:     time.Now(),
+	if requirements == nil {
+		return emptyCodebasePatterns(), nil
 	}
-
-	msg := guide.NewRequestMessage(a.generateMessageID(), request)
-	if err := a.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+	query := fmt.Sprintf("Find patterns related to: %s", requirements.Query)
+	evidence, err := a.requestConsultation(ctx, "librarian", query, requirements.Scope, sessionID)
+	if err != nil {
 		return nil, fmt.Errorf("failed to consult librarian: %w", err)
 	}
-
-	// Return empty patterns for now - async response handling would populate this
-	return &CodebasePatterns{
-		Patterns:           []PatternInfo{},
-		RelevantFiles:      []string{},
-		ExistingComponents: []string{},
-	}, nil
+	if evidence == nil || !evidence.Success {
+		return nil, fmt.Errorf("librarian consultation did not return success")
+	}
+	return codebasePatternsFromEvidence(evidence), nil
 }
 
 // designArchitecture creates a solution architecture based on requirements
@@ -1037,7 +1073,34 @@ func (a *Architect) executeCheck(ctx context.Context, req *ArchitectRequest) (an
 
 // handleDomainQuery handles cross-domain queries
 func (a *Architect) handleDomainQuery(ctx context.Context, d domain.Domain, query string) (*DomainResult, error) {
-	// This would be implemented to query different domains
+	target := crossDomainTarget(d)
+	if target == "" || target == "architect" {
+		return localDomainResult(d, query), nil
+	}
+	if !a.running || a.bus == nil {
+		return localDomainResult(d, query), nil
+	}
+	evidence, err := a.requestConsultation(ctx, target, query, "", "")
+	if err != nil {
+		return nil, err
+	}
+	return consultedDomainResult(d, query, target, evidence), nil
+}
+
+func crossDomainTarget(d domain.Domain) string {
+	switch d {
+	case domain.DomainLibrarian, domain.DomainAcademic, domain.DomainArchivalist:
+		return d.String()
+	case domain.DomainEngineer, domain.DomainDesigner, domain.DomainInspector, domain.DomainTester:
+		return d.String()
+	case domain.DomainOrchestrator:
+		return "orchestrator"
+	default:
+		return ""
+	}
+}
+
+func localDomainResult(d domain.Domain, query string) *DomainResult {
 	return &DomainResult{
 		Domain:      d,
 		Query:       query,
@@ -1045,7 +1108,51 @@ func (a *Architect) handleDomainQuery(ctx context.Context, d domain.Domain, quer
 		Score:       0,
 		Source:      "architect",
 		RetrievedAt: time.Now(),
-	}, nil
+	}
+}
+
+func consultedDomainResult(
+	d domain.Domain,
+	query string,
+	target string,
+	evidence *ConsultationEvidence,
+) *DomainResult {
+	if evidence == nil {
+		return localDomainResult(d, query)
+	}
+	return &DomainResult{
+		Domain:      d,
+		Query:       query,
+		Content:     consultationContent(evidence.Data),
+		Score:       consultationScore(evidence),
+		Source:      target,
+		RetrievedAt: evidence.ReceivedAt,
+		ErrorMsg:    evidence.Error,
+	}
+}
+
+func consultationContent(data any) string {
+	if data == nil {
+		return ""
+	}
+	if text, ok := data.(string); ok {
+		return text
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Sprintf("%v", data)
+	}
+	return string(encoded)
+}
+
+func consultationScore(evidence *ConsultationEvidence) float64 {
+	if evidence == nil {
+		return 0
+	}
+	if evidence.Success {
+		return 1
+	}
+	return 0
 }
 
 // =============================================================================
@@ -1056,6 +1163,7 @@ func (a *Architect) handleDomainQuery(ctx context.Context, d domain.Domain, quer
 func (a *Architect) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      "architect",
+		Type:    "architect",
 		Name:    "architect",
 		Aliases: []string{"arch", "planner", "designer"},
 
@@ -1157,20 +1265,6 @@ func (a *Architect) PublishRequest(req *guide.RouteRequest) error {
 
 	msg := guide.NewRequestMessage(a.generateMessageID(), req)
 	return a.bus.Publish(guide.TopicGuideRequests, msg)
-}
-
-// =============================================================================
-// Skills System
-// =============================================================================
-
-// Skills returns the architect's skill registry
-func (a *Architect) Skills() *skills.Registry {
-	return a.skills
-}
-
-// GetToolDefinitions returns tool definitions for all loaded skills
-func (a *Architect) GetToolDefinitions() []map[string]any {
-	return a.skills.GetToolDefinitions()
 }
 
 // =============================================================================

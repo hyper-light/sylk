@@ -44,6 +44,9 @@ type Skill struct {
 	// Usage tracking
 	InvokeCount int64 `json:"invoke_count"`
 
+	// Optional explicit token estimate for progressive loading budgets.
+	EstimatedTokens int `json:"estimated_tokens,omitempty"`
+
 	// Documentation for markdown generation
 	UsageDoc      string   `json:"usage_doc,omitempty"`
 	BestPractices []string `json:"best_practices,omitempty"`
@@ -139,6 +142,12 @@ func (b *Builder) BestPractice(practice string) *Builder {
 // Priority sets loading priority
 func (b *Builder) Priority(p int) *Builder {
 	b.skill.Priority = p
+	return b
+}
+
+// TokenEstimate sets an explicit token estimate for loader budgeting.
+func (b *Builder) TokenEstimate(tokens int) *Builder {
+	b.skill.EstimatedTokens = tokens
 	return b
 }
 
@@ -505,6 +514,26 @@ func (s *Skill) ToToolDefinition() map[string]any {
 		"description":  s.Description,
 		"input_schema": s.InputSchema,
 	}
+}
+
+// EstimatedTokenCost returns an approximate token cost for loading this skill
+// into model tool context.
+func (s *Skill) EstimatedTokenCost() int {
+	if s == nil {
+		return 0
+	}
+	if s.EstimatedTokens > 0 {
+		return s.EstimatedTokens
+	}
+	payload, err := json.Marshal(s.ToToolDefinition())
+	if err != nil {
+		return 120
+	}
+	estimated := len(payload) / 4
+	if estimated < 60 {
+		return 60
+	}
+	return estimated
 }
 
 // ToToolDefinitions converts multiple skills to Anthropic tool format

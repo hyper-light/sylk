@@ -135,9 +135,9 @@ func TestAllAgentsRegisterWithGuide(t *testing.T) {
 
 			channels := guideAgent.GetAgentChannels(routingInfo.ID)
 			assert.NotNil(t, channels, "agent channels should be created")
-			assert.Equal(t, routingInfo.ID+".requests", channels.Requests)
-			assert.Equal(t, routingInfo.ID+".responses", channels.Responses)
-			assert.Equal(t, routingInfo.ID+".errors", channels.Errors)
+			assert.Equal(t, guide.TopicRequests(routingInfo.Type, routingInfo.ID), channels.Requests)
+			assert.Equal(t, guide.TopicResponses(routingInfo.Type, routingInfo.ID), channels.Responses)
+			assert.Equal(t, guide.TopicErrors(routingInfo.Type, routingInfo.ID), channels.Errors)
 		})
 	}
 
@@ -158,6 +158,7 @@ func TestAllAgentsRegisterWithGuide(t *testing.T) {
 		// Create routing info from registration for Guide
 		routingInfo := &guide.AgentRoutingInfo{
 			ID:           registration.ID,
+			Type:         registration.ID,
 			Name:         registration.Name,
 			Aliases:      registration.Aliases,
 			Registration: registration,
@@ -175,9 +176,9 @@ func TestAllAgentsRegisterWithGuide(t *testing.T) {
 		// Verify agent channels were created
 		channels := guideAgent.GetAgentChannels(registration.ID)
 		assert.NotNil(t, channels, "agent channels should be created")
-		assert.Equal(t, registration.ID+".requests", channels.Requests)
-		assert.Equal(t, registration.ID+".responses", channels.Responses)
-		assert.Equal(t, registration.ID+".errors", channels.Errors)
+		assert.Equal(t, guide.TopicRequests(routingInfo.Type, registration.ID), channels.Requests)
+		assert.Equal(t, guide.TopicResponses(routingInfo.Type, registration.ID), channels.Responses)
+		assert.Equal(t, guide.TopicErrors(routingInfo.Type, registration.ID), channels.Errors)
 	})
 }
 
@@ -327,7 +328,7 @@ func TestEventBusSubscriptions(t *testing.T) {
 			require.NoError(t, err)
 
 			// Verify subscription exists on the expected channel
-			topic := guide.AgentTopic(tc.agentID, tc.channelType)
+			topic := guide.AgentTopic(tc.agentID, tc.agentID, tc.channelType)
 			count := bus.TopicSubscriberCount(topic)
 			assert.Greater(t, count, 0, "agent should have subscription on %s", topic)
 		})

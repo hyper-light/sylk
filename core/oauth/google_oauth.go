@@ -3,6 +3,8 @@ package oauth
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -1077,13 +1079,23 @@ func DefaultGoogleOAuthAuthPath() string {
 	return filepath.Join(home, ".sylk", "google_oauth_auth.yaml")
 }
 
+func DefaultGoogleOAuthAuthKeyPath(authPath string) string {
+	if strings.TrimSpace(authPath) == "" {
+		return ""
+	}
+	return authPath + ".key"
+}
+
 func NewDefaultGoogleOAuthStore(path string, lookupEnv func(string) (string, bool)) GoogleOAuthStore {
-	fileStore := NewFileGoogleOAuthStore(path)
+	encrypted := NewEncryptedFileGoogleOAuthStore(path, EncryptedFileGoogleOAuthStoreConfig{
+		KeyPath:   DefaultGoogleOAuthAuthKeyPath(path),
+		LookupEnv: lookupEnv,
+	})
 	keyring := NewSystemKeyringGoogleOAuthStore(path)
 	if keyring == nil {
-		return fileStore
+		return encrypted
 	}
-	return NewFallbackGoogleOAuthStore(keyring, fileStore)
+	return NewFallbackGoogleOAuthStore(keyring, encrypted)
 }
 
 type FallbackGoogleOAuthStore struct {
@@ -1098,14 +1110,18 @@ func NewFallbackGoogleOAuthStore(primary, secondary GoogleOAuthStore) *FallbackG
 func (s *FallbackGoogleOAuthStore) Save(auth *GoogleOAuthAuth) error {
 	var errs []error
 	if s.primary != nil {
-		if err := s.primary.Save(auth); err != nil {
-			errs = append(errs, err)
+		err := s.primary.Save(auth)
+		if err == nil {
+			return nil
 		}
+		errs = append(errs, err)
 	}
 	if s.secondary != nil {
-		if err := s.secondary.Save(auth); err != nil {
-			errs = append(errs, err)
+		err := s.secondary.Save(auth)
+		if err == nil {
+			return nil
 		}
+		errs = append(errs, err)
 	}
 	return joinStoreErrors(errs)
 }
@@ -1201,6 +1217,223 @@ func (s *FileGoogleOAuthStore) Delete() error {
 		return err
 	}
 	return nil
+}
+
+type EncryptedFileGoogleOAuthStoreConfig struct {
+	KeyPath   string
+	LookupEnv func(string) (string, bool)
+}
+
+type EncryptedFileGoogleOAuthStore struct {
+	path      string
+	keyPath   string
+	lookupEnv func(string) (string, bool)
+}
+
+func NewEncryptedFileGoogleOAuthStore(path string, cfg EncryptedFileGoogleOAuthStoreConfig) *EncryptedFileGoogleOAuthStore {
+	lookupEnv := cfg.LookupEnv
+	if lookupEnv == nil {
+		lookupEnv = os.LookupEnv
+	}
+	keyPath := strings.TrimSpace(cfg.KeyPath)
+	if keyPath == "" {
+		keyPath = DefaultGoogleOAuthAuthKeyPath(path)
+	}
+	return &EncryptedFileGoogleOAuthStore{
+		path:      path,
+		keyPath:   keyPath,
+		lookupEnv: lookupEnv,
+	}
+}
+
+func (s *EncryptedFileGoogleOAuthStore) Save(auth *GoogleOAuthAuth) error {
+	if auth == nil {
+		return fmt.Errorf("google oauth payload is required")
+	}
+	if strings.TrimSpace(s.path) == "" {
+		return fmt.Errorf("google oauth store path is empty")
+	}
+	key, err := s.resolveEncryptionKey()
+	if err != nil {
+		return err
+	}
+	plaintext, err := yaml.Marshal(auth)
+	if err != nil {
+		return fmt.Errorf("marshal google oauth payload: %w", err)
+	}
+	nonce, err := newGoogleOAuthNonce()
+	if err != nil {
+		return err
+	}
+	envelope, err := encryptGoogleOAuthEnvelope(key, nonce, s.path, plaintext)
+	if err != nil {
+		return err
+	}
+	encoded, err := yaml.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("marshal google oauth envelope: %w", err)
+	}
+	return writeFileAtomically(s.path, encoded, 0600)
+}
+
+func (s *EncryptedFileGoogleOAuthStore) Load() (*GoogleOAuthAuth, error) {
+	if strings.TrimSpace(s.path) == "" {
+		return nil, fmt.Errorf("google oauth store path is empty")
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read google oauth payload: %w", err)
+	}
+	legacy := &GoogleOAuthAuth{}
+	if err := yaml.Unmarshal(data, legacy); err == nil && strings.TrimSpace(legacy.AccessToken) != "" {
+		_ = s.Save(legacy)
+		return legacy, nil
+	}
+	var envelope encryptedAuthEnvelope
+	if err := yaml.Unmarshal(data, &envelope); err != nil {
+		return nil, fmt.Errorf("parse google oauth envelope: %w", err)
+	}
+	plaintext, err := s.decryptEnvelope(&envelope)
+	if err != nil {
+		return nil, err
+	}
+	var auth GoogleOAuthAuth
+	if err := yaml.Unmarshal(plaintext, &auth); err != nil {
+		return nil, fmt.Errorf("parse google oauth payload: %w", err)
+	}
+	return &auth, nil
+}
+
+func (s *EncryptedFileGoogleOAuthStore) Delete() error {
+	if strings.TrimSpace(s.path) == "" {
+		return nil
+	}
+	if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *EncryptedFileGoogleOAuthStore) decryptEnvelope(envelope *encryptedAuthEnvelope) ([]byte, error) {
+	if envelope == nil || envelope.Cipher != "AES-256-GCM" || envelope.Nonce == "" || envelope.Ciphertext == "" {
+		return nil, fmt.Errorf("invalid google oauth envelope")
+	}
+	key, err := s.resolveEncryptionKey()
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := base64.RawStdEncoding.DecodeString(envelope.Nonce)
+	if err != nil {
+		return nil, fmt.Errorf("decode google oauth nonce: %w", err)
+	}
+	ciphertext, err := base64.RawStdEncoding.DecodeString(envelope.Ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decode google oauth ciphertext: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("cipher init failed: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("gcm init failed: %w", err)
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, []byte(s.path))
+	if err != nil {
+		return nil, fmt.Errorf("decrypt google oauth payload: %w", err)
+	}
+	return plaintext, nil
+}
+
+func (s *EncryptedFileGoogleOAuthStore) resolveEncryptionKey() ([]byte, error) {
+	if v := firstEnvValue(s.lookupEnv, "SYLK_GOOGLE_OAUTH_KEY_B64", "SYLK_OAUTH_KEY_B64"); v != "" {
+		return decodeOAuthStoreKey(v, "SYLK_GOOGLE_OAUTH_KEY_B64")
+	}
+	if v := firstEnvValue(s.lookupEnv, "SYLK_GOOGLE_OAUTH_PASSPHRASE", "SYLK_OAUTH_PASSPHRASE"); v != "" {
+		sum := sha256.Sum256([]byte(v))
+		return append([]byte(nil), sum[:]...), nil
+	}
+	return loadOrCreateOAuthStoreKey(s.keyPath)
+}
+
+func decodeOAuthStoreKey(value, envName string) ([]byte, error) {
+	key, err := base64.RawStdEncoding.DecodeString(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", envName, err)
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("%s must decode to 32 bytes", envName)
+	}
+	return key, nil
+}
+
+func loadOrCreateOAuthStoreKey(path string) ([]byte, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("oauth key path is empty")
+	}
+	keyData, err := os.ReadFile(path)
+	if err == nil {
+		return parseOAuthStoreKeyBytes(keyData)
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read oauth key file: %w", err)
+	}
+	return createOAuthStoreKey(path)
+}
+
+func parseOAuthStoreKeyBytes(keyData []byte) ([]byte, error) {
+	trimmed := bytes.TrimSpace(keyData)
+	if decoded, err := base64.RawStdEncoding.DecodeString(string(trimmed)); err == nil && len(decoded) == 32 {
+		return decoded, nil
+	}
+	if len(trimmed) == 32 {
+		return append([]byte(nil), trimmed...), nil
+	}
+	return nil, fmt.Errorf("invalid oauth key file format")
+}
+
+func createOAuthStoreKey(path string) ([]byte, error) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate oauth key: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, fmt.Errorf("create oauth key directory: %w", err)
+	}
+	encoded := []byte(base64.RawStdEncoding.EncodeToString(key))
+	if err := writeFileAtomically(path, encoded, 0600); err != nil {
+		return nil, fmt.Errorf("persist oauth key file: %w", err)
+	}
+	return key, nil
+}
+
+func newGoogleOAuthNonce() ([]byte, error) {
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("nonce generation failed: %w", err)
+	}
+	return nonce, nil
+}
+
+func encryptGoogleOAuthEnvelope(key []byte, nonce []byte, aad string, plaintext []byte) (*encryptedAuthEnvelope, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("cipher init failed: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("gcm init failed: %w", err)
+	}
+	ciphertext := gcm.Seal(nil, nonce, plaintext, []byte(aad))
+	return &encryptedAuthEnvelope{
+		Version:    1,
+		Cipher:     "AES-256-GCM",
+		Nonce:      base64.RawStdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.RawStdEncoding.EncodeToString(ciphertext),
+	}, nil
 }
 
 type SystemKeyringGoogleOAuthStore struct {

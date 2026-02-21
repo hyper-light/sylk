@@ -236,6 +236,24 @@ func (sm *StreamManager) CloseStream(correlationID string) {
 	}
 }
 
+// CloseAll closes and removes all active streams.
+func (sm *StreamManager) CloseAll() int {
+	sm.mu.Lock()
+	streams := make([]*ResponseStream, 0, len(sm.streams))
+	for _, stream := range sm.streams {
+		streams = append(streams, stream)
+	}
+	sm.streams = make(map[string]*ResponseStream)
+	sm.mu.Unlock()
+
+	for _, stream := range streams {
+		if stream != nil {
+			stream.Close()
+		}
+	}
+	return len(streams)
+}
+
 // =============================================================================
 // Stream Operations
 // =============================================================================

@@ -166,16 +166,16 @@ const (
 	DomainCompliance Domain = "compliance" // Compliance, completeness, checking requirements
 	DomainTesting    Domain = "testing"    // Testing, QA, failure modes
 	DomainGeneral    Domain = "general"    // Unspecific or conversational requests
-	DomainCode       Domain = "code"      // Source code reading, writing, refactoring
-	DomainFiles      Domain = "files"     // File system operations, file metadata
-	DomainDesign     Domain = "design"    // Architecture, system design, structural decisions
-	DomainTasks      Domain = "tasks"     // Task breakdown, work items, orchestration
-	DomainPatterns   Domain = "patterns"  // Recurring patterns, conventions, idioms
-	DomainFailures   Domain = "failures"  // Past failures, error patterns, regressions
-	DomainDecisions  Domain = "decisions" // Architectural decisions, rationale, trade-offs
-	DomainLearnings  Domain = "learnings" // Lessons learned, insights, best practices discovered
-	DomainIntents    Domain = "intents"   // Intent tracking, declared goals, work-in-progress
-	DomainUnknown    Domain = "unknown"   // Could not classify
+	DomainCode       Domain = "code"       // Source code reading, writing, refactoring
+	DomainFiles      Domain = "files"      // File system operations, file metadata
+	DomainDesign     Domain = "design"     // Architecture, system design, structural decisions
+	DomainTasks      Domain = "tasks"      // Task breakdown, work items, orchestration
+	DomainPatterns   Domain = "patterns"   // Recurring patterns, conventions, idioms
+	DomainFailures   Domain = "failures"   // Past failures, error patterns, regressions
+	DomainDecisions  Domain = "decisions"  // Architectural decisions, rationale, trade-offs
+	DomainLearnings  Domain = "learnings"  // Lessons learned, insights, best practices discovered
+	DomainIntents    Domain = "intents"    // Intent tracking, declared goals, work-in-progress
+	DomainUnknown    Domain = "unknown"    // Could not classify
 )
 
 func AllDomains() []Domain {
@@ -238,17 +238,17 @@ func (d Domain) Canonical() Domain {
 type TargetAgent string
 
 const (
-	TargetArchivalist TargetAgent = "archivalist" // Historical data, patterns, failures
-	TargetGuide       TargetAgent = "guide"       // Routing, help, status
-	TargetLibrarian   TargetAgent = "librarian"   // Code search, file location, semantic search
-	TargetAcademic    TargetAgent = "academic"    // Research, academic papers
-	TargetArchitect   TargetAgent = "architect"   // Planning, design, task breakdown
+	TargetArchivalist  TargetAgent = "archivalist"  // Historical data, patterns, failures
+	TargetGuide        TargetAgent = "guide"        // Routing, help, status
+	TargetLibrarian    TargetAgent = "librarian"    // Code search, file location, semantic search
+	TargetAcademic     TargetAgent = "academic"     // Research, academic papers
+	TargetArchitect    TargetAgent = "architect"    // Planning, design, task breakdown
 	TargetOrchestrator TargetAgent = "orchestrator" // Pipeline execution
-	TargetDesigner    TargetAgent = "designer"    // Design implementation
-	TargetEngineer    TargetAgent = "engineer"    // Code implementation
-	TargetInspector   TargetAgent = "inspector"   // Code review, validation
-	TargetTester      TargetAgent = "tester"      // Test creation, execution
-	TargetUnknown     TargetAgent = "unknown"     // Could not determine target
+	TargetDesigner     TargetAgent = "designer"     // Design implementation
+	TargetEngineer     TargetAgent = "engineer"     // Code implementation
+	TargetInspector    TargetAgent = "inspector"    // Code review, validation
+	TargetTester       TargetAgent = "tester"       // Test creation, execution
+	TargetUnknown      TargetAgent = "unknown"      // Could not determine target
 )
 
 // AllTargetAgents returns all valid target agents
@@ -356,6 +356,7 @@ type ForwardedRequest struct {
 	// Source agent info (for context, target knows who is asking)
 	SourceAgentID   string `json:"source_agent_id"`
 	SourceAgentName string `json:"source_agent_name,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
 
 	// Target agent info
 	TargetAgentID string `json:"target_agent_id"`
@@ -474,6 +475,10 @@ type ClassificationResult struct {
 
 	// Confidence
 	Confidence float64 `json:"confidence"`
+
+	// Explicit rejection from classifier (for ambiguity)
+	Rejected bool   `json:"rejected,omitempty"`
+	Reason   string `json:"reason,omitempty"`
 
 	// For multi-intent
 	MultiIntent bool                    `json:"multi_intent"`
@@ -802,7 +807,8 @@ type RouterConfig struct {
 	SuggestThreshold float64 `json:"suggest_threshold"` // >= this: suggest (default: 0.50)
 
 	// Few-shot corrections
-	MaxCorrections int `json:"max_corrections"` // Max corrections for few-shot prompt
+	MaxCorrections       int `json:"max_corrections"`        // Max corrections retained in memory
+	MaxPromptCorrections int `json:"max_prompt_corrections"` // Max corrections injected per prompt
 
 	// DSL configuration
 	DSLPrefix string `json:"dsl_prefix"` // Prefix for DSL commands (default: "@")
@@ -826,6 +832,7 @@ func DefaultRouterConfig() RouterConfig {
 		LogThreshold:          0.75,
 		SuggestThreshold:      0.50,
 		MaxCorrections:        50,
+		MaxPromptCorrections:  4,
 		DSLPrefix:             "@",
 		ClassificationTimeout: 10 * time.Second,
 		EnrichmentTimeout:     2 * time.Second,

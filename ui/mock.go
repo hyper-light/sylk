@@ -28,8 +28,8 @@ const mockGuideName = "Guide"
 // mockGuideType is the agent type classification for the mock guide.
 const mockGuideType = "guide"
 
-// mockArchitectID is the agent identifier for the mock architect agent.
-const mockArchitectID = "mock-architect"
+// mockArchitectID is the agent identifier for the architect agent in mock mode.
+const mockArchitectID = "architect"
 
 // mockArchitectName is the display name for the mock architect agent.
 const mockArchitectName = "Architect"
@@ -240,7 +240,6 @@ func (m *MockAgent) emitActivity(
 func seedMockData(deps Deps) {
 	seedSessions(deps.SessionManager)
 	seedAgents(deps.ActivityBus)
-	seedAgentHistory(deps.ActivityBus)
 }
 
 // mockSessionConfig holds the parameters for a single mock session.
@@ -411,13 +410,10 @@ func seedAgentHistory(bus *events.ActivityEventBus) {
 	}
 }
 
-func seedContextUsage(agentID string, usage float64) float64 {
-	// Guide usage in mock mode is now driven by live request/response flow.
-	// Keep seeded history neutral so startup does not pin to an arbitrary value.
-	if agentID == mockGuideID {
-		return 0
-	}
-	return usage
+func seedContextUsage(_ string, _ float64) float64 {
+	// Context usage must come from live request/response telemetry.
+	// Seeded events should never pin an arbitrary startup percentage.
+	return 0
 }
 
 // ---------------------------------------------------------------------------

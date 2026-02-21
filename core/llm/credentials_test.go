@@ -315,3 +315,33 @@ func TestResolveFromFileInvalidYAML(t *testing.T) {
 		t.Error("ResolveAPIKey() should return error for invalid YAML")
 	}
 }
+
+func TestValidateKeyFormat(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		key      string
+		want     bool
+	}{
+		{"anthropic valid", "anthropic", "sk-ant-api03-abcdefghijklmnop", true},
+		{"anthropic wrong prefix", "anthropic", "sk-proj-abcdefghijklmnop", false},
+		{"anthropic too short", "anthropic", "sk-ant-short", false},
+		{"openai valid", "openai", "sk-proj-abcdefghijklmnopqrstuvwxyz", true},
+		{"openai anthropic prefix", "openai", "sk-ant-api03-abcdefghijklmnop", false},
+		{"openai too short", "openai", "sk-short", false},
+		{"google valid", "google", "AIzaSyA-ABCDEFGHIJKLMNOPQRS", true},
+		{"google wrong prefix", "google", "sk-ant-api03-abcdefghijklmnop", false},
+		{"google too short", "google", "AIza", false},
+		{"unknown valid", "voyage", "voy-abcdefghijklmnopqrstuvwxyz", true},
+		{"unknown too short", "voyage", "short", false},
+		{"empty key", "anthropic", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ValidateKeyFormat(tt.provider, tt.key)
+			if got != tt.want {
+				t.Errorf("ValidateKeyFormat(%q, %q) = %v, want %v", tt.provider, tt.key, got, tt.want)
+			}
+		})
+	}
+}

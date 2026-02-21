@@ -628,16 +628,16 @@ func (r *TieredRouter) routeDirect(ctx context.Context, correlationID, targetAge
 	}
 
 	// Build forwarded request
-	fwd := &ForwardedRequest{
-		CorrelationID:        correlationID,
-		ParentCorrelationID:  opts.parentCorrelationID,
-		Input:                input,
-		SourceAgentID:        r.agentID,
-		SourceAgentName:      r.agentName,
-		FireAndForget:        opts.fireAndForget,
-		Confidence:           1.0, // Direct routing has max confidence
-		ClassificationMethod: "direct",
-	}
+		fwd := &ForwardedRequest{
+			CorrelationID:        correlationID,
+			ParentCorrelationID:  opts.parentCorrelationID,
+			Input:                input,
+			SourceAgentID:        r.agentID,
+			SourceAgentName:      r.agentName,
+			FireAndForget:        opts.fireAndForget,
+			Confidence:           1.0, // Direct routing has max confidence
+			ClassificationMethod: "direct",
+		}
 
 	// Track pending request (unless fire-and-forget with no callback)
 	if !opts.fireAndForget || opts.callback != nil {

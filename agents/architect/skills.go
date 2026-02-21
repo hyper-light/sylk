@@ -12,11 +12,50 @@ import (
 
 func (a *Architect) registerCoreSkills() {
 	a.skills.Register(analyzeRequirementsSkill(a))
+	a.skills.Register(consultBeforePlanningSkill(a))
+	a.skills.Register(consultLibrarianSkill(a))
+	a.skills.Register(consultArchivalistSkill(a))
+	a.skills.Register(consultAcademicSkill(a))
+	a.skills.Register(consultEngineerSkill(a))
+	a.skills.Register(consultDesignerSkill(a))
+	a.skills.Register(consultInspectorSkill(a))
+	a.skills.Register(consultTesterSkill(a))
 	a.skills.Register(designArchitectureSkill(a))
 	a.skills.Register(generateTasksSkill(a))
 	a.skills.Register(createWorkflowDAGSkill(a))
+	a.skills.Register(createFixDAGSkill(a))
+	a.skills.Register(interruptHandlerSkill(a))
 	a.skills.Register(estimateComplexitySkill(a))
 	a.skills.Register(consultKnowledgeSkill(a))
+	a.skills.Register(preDelegationDeclareSkill(a))
+	a.skills.Register(validatePreDelegationSkill(a))
+	a.skills.Register(handoffToOrchestratorSkill(a))
+	a.skills.Register(monitorExecutionSkill(a))
+	a.skills.Register(revisePlanSkill(a))
+	a.skills.Register(enterPlanModeSkill(a))
+	a.skills.Register(updatePlanFileSkill(a))
+	a.skills.Register(todoWriteSkill(a))
+	a.skills.Register(todoMarkCompleteSkill(a))
+	a.skills.Register(exitPlanModeSkill(a))
+	a.skills.Register(askUserQuestionSkill(a))
+	a.skills.Register(readResearchPaperSkill(a))
+	a.skills.Register(readFileSkill(a))
+	a.skills.Register(globSkill(a))
+	a.skills.Register(grepSkill(a))
+	a.skills.Register(gitStatusSkill(a))
+	a.skills.Register(gitDiffSkill(a))
+	a.skills.Register(gitLogSkill(a))
+	a.skills.Register(gitShowSkill(a))
+	a.skills.Register(gitBlameSkill(a))
+	a.skills.Register(gitLsFilesSkill(a))
+	a.skills.Register(gitBranchListSkill(a))
+	a.skills.Register(gitFetchSkill(a))
+	a.skills.Register(astGrepSearchSkill(a))
+	a.skills.Register(lspGoToDefinitionSkill(a))
+	a.skills.Register(lspFindReferencesSkill(a))
+	a.skills.Register(lspHoverSkill(a))
+	a.skills.Register(lspSymbolsSkill(a))
+	a.skills.Register(lspCallHierarchySkill(a))
 }
 
 type analyzeRequirementsParams struct {
@@ -359,11 +398,11 @@ type consultKnowledgeParams struct {
 
 func consultKnowledgeSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("consult_knowledge").
-		Description("Consult Librarian or Academic for codebase patterns and knowledge.").
+		Description("Consult Librarian, Archivalist, or Academic for evidence before committing to a plan.").
 		Domain("planning").
 		Keywords("consult", "librarian", "academic", "patterns", "knowledge").
 		Priority(75).
-		EnumParam("target", "Agent to consult", []string{"librarian", "academic"}, true).
+		EnumParam("target", "Agent to consult", []string{"librarian", "archivalist", "academic"}, true).
 		StringParam("query", "Question or topic to consult about", true).
 		StringParam("scope", "Scope to limit the search", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -397,23 +436,21 @@ func consultKnowledgeSkill(a *Architect) *skills.Skill {
 				},
 			}
 
-			if params.Target == "librarian" {
-				requirements := &Requirements{Query: params.Query, Scope: params.Scope}
-				patterns, err := a.consultLibrarian(ctx, requirements, "")
-				if err != nil {
-					return nil, err
-				}
+			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, "")
+			if err != nil {
 				return map[string]any{
-					"target":   params.Target,
-					"patterns": patterns,
-					"query":    req.Query,
+					"target": params.Target,
+					"status": "failed",
+					"query":  req.Query,
+					"error":  err.Error(),
 				}, nil
 			}
-
 			return map[string]any{
-				"target": params.Target,
-				"status": "consultation_requested",
-				"query":  req.Query,
+				"target":   params.Target,
+				"status":   "ok",
+				"query":    req.Query,
+				"evidence": evidence,
+				"data":     evidence.Data,
 			}, nil
 		}).
 		Build()

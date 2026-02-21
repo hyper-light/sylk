@@ -38,8 +38,8 @@ func TestLibrarianSearchFunctionality(t *testing.T) {
 	assert.True(t, lib.IsRunning())
 	assert.NotNil(t, lib.Bus())
 	assert.NotNil(t, lib.Channels())
-	assert.Equal(t, "librarian.requests", lib.Channels().Requests)
-	assert.Equal(t, "librarian.responses", lib.Channels().Responses)
+	assert.Equal(t, guide.TopicRequests("librarian", "librarian"), lib.Channels().Requests)
+	assert.Equal(t, guide.TopicResponses("librarian", "librarian"), lib.Channels().Responses)
 }
 
 type mockSearchSystemWithData struct {
@@ -338,8 +338,8 @@ func TestKnowledgeAgentsEventBusSubscriptions(t *testing.T) {
 			err := tc.start()
 			require.NoError(t, err)
 
-			requestTopic := guide.AgentTopic(tc.agentID, guide.ChannelTypeRequests)
-			responseTopic := guide.AgentTopic(tc.agentID, guide.ChannelTypeResponses)
+			requestTopic := guide.AgentTopic(tc.agentID, tc.agentID, guide.ChannelTypeRequests)
+			responseTopic := guide.AgentTopic(tc.agentID, tc.agentID, guide.ChannelTypeResponses)
 
 			reqCount := bus.TopicSubscriberCount(requestTopic)
 			assert.Greater(t, reqCount, 0, "should have request subscription")

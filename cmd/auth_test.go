@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/adalundhe/sylk/core/llm"
 )
 
 func TestIsValidProvider(t *testing.T) {
@@ -30,13 +32,13 @@ func TestIsValidProvider(t *testing.T) {
 }
 
 func TestEnsureCredentialsDir(t *testing.T) {
-	dir, err := ensureCredentialsDir()
+	dir, err := llm.EnsureCredentialsDir()
 	if err != nil {
-		t.Fatalf("ensureCredentialsDir() error = %v", err)
+		t.Fatalf("EnsureCredentialsDir() error = %v", err)
 	}
 
 	if dir == "" {
-		t.Error("ensureCredentialsDir() returned empty path")
+		t.Error("EnsureCredentialsDir() returned empty path")
 	}
 
 	info, err := os.Stat(dir)
@@ -55,17 +57,17 @@ func TestLoadCredentialsFileNotExists(t *testing.T) {
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", oldHome)
 
-	creds, err := loadCredentialsFile()
+	creds, err := llm.LoadCredentials()
 	if err != nil {
-		t.Fatalf("loadCredentialsFile() error = %v", err)
+		t.Fatalf("LoadCredentials() error = %v", err)
 	}
 
 	if creds == nil {
-		t.Error("loadCredentialsFile() returned nil map")
+		t.Error("LoadCredentials() returned nil map")
 	}
 
 	if len(creds) != 0 {
-		t.Errorf("loadCredentialsFile() returned %d credentials, want 0", len(creds))
+		t.Errorf("LoadCredentials() returned %d credentials, want 0", len(creds))
 	}
 }
 
@@ -80,8 +82,8 @@ func TestSaveAndLoadCredentials(t *testing.T) {
 		"openai":    "sk-test456",
 	}
 
-	if err := saveCredentialsFile(testCreds); err != nil {
-		t.Fatalf("saveCredentialsFile() error = %v", err)
+	if err := llm.SaveCredentials(testCreds); err != nil {
+		t.Fatalf("SaveCredentials() error = %v", err)
 	}
 
 	path := filepath.Join(tmpDir, ".sylk", "credentials.yaml")
@@ -94,9 +96,9 @@ func TestSaveAndLoadCredentials(t *testing.T) {
 		t.Errorf("file permissions = %o, want 0600", info.Mode().Perm())
 	}
 
-	loaded, err := loadCredentialsFile()
+	loaded, err := llm.LoadCredentials()
 	if err != nil {
-		t.Fatalf("loadCredentialsFile() error = %v", err)
+		t.Fatalf("LoadCredentials() error = %v", err)
 	}
 
 	if len(loaded) != len(testCreds) {
@@ -116,17 +118,17 @@ func TestSaveCredential(t *testing.T) {
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", oldHome)
 
-	if err := saveCredential("anthropic", "sk-ant-test"); err != nil {
-		t.Fatalf("saveCredential() error = %v", err)
+	if err := llm.SaveAPIKey("anthropic", "sk-ant-test"); err != nil {
+		t.Fatalf("SaveAPIKey() error = %v", err)
 	}
 
-	if err := saveCredential("openai", "sk-openai-test"); err != nil {
-		t.Fatalf("saveCredential() error = %v", err)
+	if err := llm.SaveAPIKey("openai", "sk-openai-test"); err != nil {
+		t.Fatalf("SaveAPIKey() error = %v", err)
 	}
 
-	creds, err := loadCredentialsFile()
+	creds, err := llm.LoadCredentials()
 	if err != nil {
-		t.Fatalf("loadCredentialsFile() error = %v", err)
+		t.Fatalf("LoadCredentials() error = %v", err)
 	}
 
 	if creds["anthropic"] != "sk-ant-test" {
@@ -148,17 +150,17 @@ func TestRemoveCredential(t *testing.T) {
 		"anthropic": "sk-ant-test",
 		"openai":    "sk-openai-test",
 	}
-	if err := saveCredentialsFile(testCreds); err != nil {
-		t.Fatalf("saveCredentialsFile() error = %v", err)
+	if err := llm.SaveCredentials(testCreds); err != nil {
+		t.Fatalf("SaveCredentials() error = %v", err)
 	}
 
 	if err := removeCredential("anthropic"); err != nil {
 		t.Fatalf("removeCredential() error = %v", err)
 	}
 
-	creds, err := loadCredentialsFile()
+	creds, err := llm.LoadCredentials()
 	if err != nil {
-		t.Fatalf("loadCredentialsFile() error = %v", err)
+		t.Fatalf("LoadCredentials() error = %v", err)
 	}
 
 	if _, ok := creds["anthropic"]; ok {
@@ -188,7 +190,7 @@ func TestSaveGoogleCredentialsFile(t *testing.T) {
 	defer os.Setenv("HOME", oldHome)
 
 	srcPath := filepath.Join(tmpDir, "test-creds.json")
-	content := `{"type": "service_account", "project_id": "test"}`
+	content := `{"type":"service_account","project_id":"test","client_email":"svc@test.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"}`
 	if err := os.WriteFile(srcPath, []byte(content), 0644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -198,22 +200,8 @@ func TestSaveGoogleCredentialsFile(t *testing.T) {
 	}
 
 	destPath := filepath.Join(tmpDir, ".sylk", "google-credentials.json")
-	data, err := os.ReadFile(destPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", destPath, err)
-	}
-
-	if string(data) != content {
-		t.Errorf("file content = %q, want %q", string(data), content)
-	}
-
-	info, err := os.Stat(destPath)
-	if err != nil {
-		t.Fatalf("Stat(%q) error = %v", destPath, err)
-	}
-
-	if info.Mode().Perm() != 0600 {
-		t.Errorf("file permissions = %o, want 0600", info.Mode().Perm())
+	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		t.Fatalf("expected no plaintext credentials file at %q", destPath)
 	}
 }
 
@@ -221,5 +209,23 @@ func TestSaveGoogleCredentialsFileNotExists(t *testing.T) {
 	err := saveGoogleCredentialsFile("/nonexistent/path/creds.json")
 	if err == nil {
 		t.Error("saveGoogleCredentialsFile() expected error for non-existent file")
+	}
+}
+
+func TestSaveGoogleCredentialsFileInvalidPayload(t *testing.T) {
+	tmpDir := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", oldHome)
+
+	srcPath := filepath.Join(tmpDir, "invalid-creds.json")
+	content := `{"type":"service_account","project_id":"test"}`
+	if err := os.WriteFile(srcPath, []byte(content), 0644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	err := saveGoogleCredentialsFile(srcPath)
+	if err == nil {
+		t.Fatal("saveGoogleCredentialsFile() expected validation error")
 	}
 }

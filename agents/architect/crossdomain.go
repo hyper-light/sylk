@@ -156,12 +156,60 @@ func (h *CrossDomainHandler) queryDomain(
 	query string,
 ) {
 	defer wg.Done()
-
-	sem <- struct{}{}
-	defer func() { <-sem }()
-
+	if !acquireSemaphore(ctx, sem) {
+		h.safeSendResult(resultChan, h.errorResult(d, query, ctx.Err(), time.Now()))
+		return
+	}
+	defer releaseSemaphore(sem)
+	defer h.recoverDomainPanic(resultChan, d, query)
 	result := h.executeDomainQuery(ctx, d, query)
-	resultChan <- result
+	h.safeSendResult(resultChan, result)
+}
+
+func acquireSemaphore(ctx context.Context, sem chan struct{}) bool {
+	select {
+	case sem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func releaseSemaphore(sem chan struct{}) {
+	select {
+	case <-sem:
+	default:
+	}
+}
+
+func (h *CrossDomainHandler) recoverDomainPanic(resultChan chan<- DomainResult, d domain.Domain, query string) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+	h.safeSendResult(resultChan, h.panicResult(d, query, recovered, time.Now()))
+}
+
+func (h *CrossDomainHandler) panicResult(
+	d domain.Domain,
+	query string,
+	_ any,
+	start time.Time,
+) DomainResult {
+	return DomainResult{
+		Domain:      d,
+		Query:       query,
+		ErrorMsg:    "domain query panic",
+		Took:        time.Since(start),
+		RetrievedAt: time.Now(),
+	}
+}
+
+func (h *CrossDomainHandler) safeSendResult(resultChan chan<- DomainResult, result DomainResult) {
+	select {
+	case resultChan <- result:
+	default:
+	}
 }
 
 func (h *CrossDomainHandler) executeDomainQuery(

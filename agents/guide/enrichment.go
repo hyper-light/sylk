@@ -2,9 +2,12 @@ package guide
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	corecontext "github.com/adalundhe/sylk/core/context"
+	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -86,7 +89,92 @@ func (e *EnrichmentService) Enrich(ctx context.Context, req *RouteRequest, resul
 }
 
 func (e *EnrichmentService) requestEnrichmentSync(ctx context.Context, providerID string, req *RouteRequest) (*corecontext.PrefetchSharePayload, error) {
-	// Stub for sending a direct message via EventBus and waiting for a response
-	// using the provided context timeout.
-	return nil, nil
+	if e == nil || e.bus == nil || req == nil {
+		return nil, fmt.Errorf("enrichment service unavailable")
+	}
+	correlationID := "enrich_" + uuid.NewString()
+	waitCh, sub, err := e.subscribeForEnrichmentResponse(correlationID)
+	if err != nil {
+		return nil, err
+	}
+	defer sub.Unsubscribe()
+	if err := e.publishEnrichmentAction(providerID, req, correlationID); err != nil {
+		return nil, err
+	}
+	return e.awaitEnrichmentResponse(ctx, waitCh)
+}
+
+func (e *EnrichmentService) subscribeForEnrichmentResponse(correlationID string) (<-chan *Message, Subscription, error) {
+	waitCh := make(chan *Message, 1)
+	sub, err := e.bus.SubscribeAsync(TopicResponses("guide", "guide"), func(msg *Message) error {
+		if msg == nil || msg.CorrelationID != correlationID {
+			return nil
+		}
+		select {
+		case waitCh <- msg:
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return waitCh, sub, nil
+}
+
+func (e *EnrichmentService) publishEnrichmentAction(providerID string, req *RouteRequest, correlationID string) error {
+	msg := NewActionMessage(generateMessageID(), &ActionRequest{
+		CorrelationID: correlationID,
+		SourceAgentID: "guide",
+		TargetAgentID: providerID,
+		Action:        "enrich_context",
+		Data: map[string]any{
+			"input":      req.Input,
+			"session_id": req.SessionID,
+			"source":     req.SourceAgentID,
+		},
+		Timestamp: time.Now(),
+	})
+	return e.bus.Publish(TopicRequests(providerID, providerID), msg)
+}
+
+func (e *EnrichmentService) awaitEnrichmentResponse(
+	ctx context.Context,
+	waitCh <-chan *Message,
+) (*corecontext.PrefetchSharePayload, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case msg := <-waitCh:
+		return parseEnrichmentPayload(msg)
+	}
+}
+
+func parseEnrichmentPayload(msg *Message) (*corecontext.PrefetchSharePayload, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("empty enrichment response")
+	}
+	resp, ok := msg.GetRouteResponse()
+	if !ok || resp == nil {
+		return nil, fmt.Errorf("enrichment response missing route payload")
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("enrichment provider error: %s", resp.Error)
+	}
+	if resp.Data == nil {
+		return nil, nil
+	}
+	return decodeEnrichmentPayload(resp.Data)
+}
+
+func decodeEnrichmentPayload(data any) (*corecontext.PrefetchSharePayload, error) {
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	var payload corecontext.PrefetchSharePayload
+	if err := json.Unmarshal(bytes, &payload); err != nil {
+		return nil, err
+	}
+	return &payload, nil
 }

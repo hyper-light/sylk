@@ -1595,14 +1595,18 @@ func NewFallbackOpenAIAuthStore(primary, secondary OpenAIAuthStore) *FallbackOpe
 func (s *FallbackOpenAIAuthStore) Save(auth *OpenAIChatGPTAuth) error {
 	var errs []error
 	if s.primary != nil {
-		if err := s.primary.Save(auth); err != nil {
-			errs = append(errs, err)
+		err := s.primary.Save(auth)
+		if err == nil {
+			return nil
 		}
+		errs = append(errs, err)
 	}
 	if s.secondary != nil {
-		if err := s.secondary.Save(auth); err != nil {
-			errs = append(errs, err)
+		err := s.secondary.Save(auth)
+		if err == nil {
+			return nil
 		}
+		errs = append(errs, err)
 	}
 	if len(errs) == 0 {
 		return nil
@@ -1795,6 +1799,7 @@ func (s *EncryptedFileOpenAIAuthStore) Load() (*OpenAIChatGPTAuth, error) {
 	var legacy OpenAIChatGPTAuth
 	if err := yaml.Unmarshal(data, &legacy); err == nil {
 		if strings.TrimSpace(legacy.AccessToken) != "" && strings.TrimSpace(legacy.ChatGPTAccountID) != "" {
+			_ = s.Save(&legacy)
 			return &legacy, nil
 		}
 	}

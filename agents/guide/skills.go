@@ -32,19 +32,6 @@ func (g *Guide) registerCoreSkills() {
 	g.skills.Register(taskInteractSkill(g))
 	g.skills.Register(routingHistorySkill(g))
 	g.skills.Register(agentCapabilitySkill(g))
-
-	g.skills.Load("route")
-	g.skills.Load("clarify")
-	g.skills.Load("guide_route")
-	g.skills.Load("help")
-	g.skills.Load("status")
-	g.skills.Load("agents")
-	g.skills.Load("route_to")
-	g.skills.Load("reply_to")
-	g.skills.Load("broadcast")
-	g.skills.Load("task_interact")
-	g.skills.Load("get_routing_history")
-	g.skills.Load("get_agent_capabilities")
 }
 
 func (g *Guide) registerExtendedSkills() {
@@ -53,12 +40,6 @@ func (g *Guide) registerExtendedSkills() {
 	g.skills.Register(switchSessionSkill(g))
 	g.skills.Register(createSessionSkill(g))
 	g.skills.Register(closeSessionSkill(g))
-
-	g.skills.Load("sessions")
-	g.skills.Load("metrics")
-	g.skills.Load("switch_session")
-	g.skills.Load("create_session")
-	g.skills.Load("close_session")
 }
 
 func routeSkill(g *Guide) *skills.Skill {
@@ -230,7 +211,7 @@ func helpSkill(g *Guide) *skills.Skill {
 		Priority(80).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			return map[string]any{
-				"skills": g.skills.GetToolDefinitions(),
+				"skills": g.skills.ToToolDefinitions(g.skills.GetAll()),
 			}, nil
 		}).
 		Build()

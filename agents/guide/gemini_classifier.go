@@ -12,47 +12,43 @@ import (
 type GeminiClassifier struct {
 	client      *genai.Client
 	config      RouterConfig
-	corrections []CorrectionRecord
+	corrections *correctionMemory
 }
 
 func NewGeminiClassifier(client *genai.Client, config RouterConfig) *GeminiClassifier {
 	return &GeminiClassifier{
 		client:      client,
 		config:      config,
-		corrections: make([]CorrectionRecord, 0),
+		corrections: newCorrectionMemory(config.MaxCorrections),
 	}
 }
 
 // AddCorrection adds a correction for learning
 func (c *GeminiClassifier) AddCorrection(correction CorrectionRecord) {
-	c.corrections = append(c.corrections, correction)
-	if len(c.corrections) > c.config.MaxCorrections {
-		c.corrections = c.corrections[1:]
+	if c.corrections == nil {
+		return
 	}
+	c.corrections.add(correction)
 }
 
-func (c *GeminiClassifier) formatCorrections() string {
-	if len(c.corrections) == 0 {
+func (c *GeminiClassifier) formatCorrections(input string) string {
+	if c.corrections == nil {
 		return ""
 	}
+	records := c.corrections.selectForPrompt(input, c.maxPromptCorrections())
+	return formatCorrectionExamples(records)
+}
 
-	var sb string
-	for _, corr := range c.corrections {
-		sb += fmt.Sprintf(
-			"Input: %q\nWRONG: intent=%s, domain=%s, target=%s\nCORRECT: intent=%s, domain=%s, target=%s\nReason: %s\n\n",
-			corr.Input,
-			corr.WrongIntent, corr.WrongDomain, corr.WrongTarget,
-			corr.CorrectIntent, corr.CorrectDomain, corr.CorrectTarget,
-			corr.Reason,
-		)
+func (c *GeminiClassifier) maxPromptCorrections() int {
+	if c.config.MaxPromptCorrections > 0 {
+		return c.config.MaxPromptCorrections
 	}
-
-	return sb
+	return defaultMaxPromptCorrections
 }
 
 // Classify classifies a natural language query using structured outputs
 func (c *GeminiClassifier) Classify(ctx context.Context, input string) (*ClassificationResult, error) {
-	systemPrompt := FormatClassificationPrompt(c.formatCorrections())
+	systemPrompt := FormatClassificationPrompt(c.formatCorrections(input))
 
 	if c.config.ClassificationTimeout > 0 {
 		var cancel context.CancelFunc
@@ -111,7 +107,7 @@ func (c *GeminiClassifier) Classify(ctx context.Context, input string) (*Classif
 		return nil, fmt.Errorf("failed to unmarshal structured output: %w", err)
 	}
 
-	return &result, nil
+	return normalizeClassificationResult(&result), nil
 }
 
 func (c *GeminiClassifier) buildResponseSchema() *genai.Schema {
@@ -182,6 +178,14 @@ func (c *GeminiClassifier) buildResponseSchema() *genai.Schema {
 			"confidence": {
 				Type:        genai.TypeNumber,
 				Description: "Classification confidence from 0.0 to 1.0",
+			},
+			"rejected": {
+				Type:        genai.TypeBoolean,
+				Description: "True when the request is too ambiguous to safely route",
+			},
+			"reason": {
+				Type:        genai.TypeString,
+				Description: "Clarifying question or rejection reason when rejected=true",
 			},
 			"multi_intent": {
 				Type:        genai.TypeBoolean,

@@ -119,6 +119,7 @@ func (c *ConsultationObserver) logToArchivalist(msg *Message) {
 		Intent:        IntentStore,
 		Domain:        DomainHistory,
 		SourceAgentID: "guide",
+		SessionID:     c.sessionID,
 		FireAndForget: true,
 	})
 

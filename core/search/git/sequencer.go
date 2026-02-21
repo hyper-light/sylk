@@ -125,6 +125,9 @@ type sequencer struct {
 	originalHead plumbing.Hash
 	originalRef  plumbing.ReferenceName
 	detached     bool
+
+	// Non-empty when rebasing a branch other than HEAD.
+	rebaseSourceRef plumbing.ReferenceName
 }
 
 // =============================================================================
@@ -188,7 +191,9 @@ func (c *GitClient) CherryPickSequence(commitHashes []string, targetBranch strin
 // =============================================================================
 
 // RebaseInteractive replays commits according to the given plan onto ontoBranch.
-func (c *GitClient) RebaseInteractive(ontoBranch string, plan []RebasePlanEntry) (*SequencerStatus, error) {
+// When sourceBranch is non-empty and differs from the current HEAD branch,
+// the rebased tip updates sourceBranch while HEAD is restored to its original branch.
+func (c *GitClient) RebaseInteractive(ontoBranch, sourceBranch string, plan []RebasePlanEntry) (*SequencerStatus, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -223,6 +228,14 @@ func (c *GitClient) RebaseInteractive(ontoBranch string, plan []RebasePlanEntry)
 	seq.op = SeqRebase
 	seq.destName = ontoBranch
 	seq.steps = steps
+
+	// Record source branch when rebasing a non-HEAD branch.
+	if sourceBranch != "" {
+		currentBranch, _ := c.getBranchName()
+		if sourceBranch != currentBranch {
+			seq.rebaseSourceRef = plumbing.NewBranchReferenceName(sourceBranch)
+		}
+	}
 
 	// Detach HEAD at onto tip.
 	if err := c.detachHead(ontoCommit.Hash); err != nil {
@@ -858,22 +871,37 @@ func (c *GitClient) finishCherryPickSeq() error {
 	})
 }
 
-// finishRebaseSeq updates the original branch ref to the final tip and reattaches HEAD.
+// finishRebaseSeq updates the rebased branch ref to the final tip and reattaches HEAD.
+// When rebaseSourceRef is set (non-HEAD branch rebase), the source branch is updated
+// to the rebased tip while HEAD is restored to its original branch and worktree.
 func (c *GitClient) finishRebaseSeq() error {
 	seq := c.sequencer
 
 	if !seq.detached {
-		// Update the original branch to point at the rebased tip.
-		ref := plumbing.NewHashReference(seq.originalRef, seq.currentTip)
+		// Determine which branch receives the rebased tip.
+		updateRef := seq.originalRef
+		if seq.rebaseSourceRef != "" {
+			updateRef = seq.rebaseSourceRef
+		}
+
+		// Update the target branch to point at the rebased tip.
+		ref := plumbing.NewHashReference(updateRef, seq.currentTip)
 		if err := c.repo.Storer.SetReference(ref); err != nil {
 			return err
 		}
 
-		// Re-attach HEAD to the branch.
+		// Re-attach HEAD to the original branch (the one HEAD was on before rebase).
 		symRef := plumbing.NewSymbolicReference(plumbing.HEAD, seq.originalRef)
 		if err := c.repo.Storer.SetReference(symRef); err != nil {
 			return err
 		}
+	}
+
+	// When rebasing a non-HEAD branch, restore worktree to the original HEAD
+	// so the user stays on their current branch. Otherwise reset to the rebased tip.
+	resetTarget := seq.currentTip
+	if seq.rebaseSourceRef != "" {
+		resetTarget = seq.originalHead
 	}
 
 	wt, err := c.repo.Worktree()
@@ -881,7 +909,7 @@ func (c *GitClient) finishRebaseSeq() error {
 		return err
 	}
 	return wt.Reset(&gogit.ResetOptions{
-		Commit: seq.currentTip,
+		Commit: resetTarget,
 		Mode:   gogit.HardReset,
 	})
 }

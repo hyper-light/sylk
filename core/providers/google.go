@@ -2,16 +2,23 @@ package providers
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/oauth"
+	"github.com/adalundhe/sylk/core/storage"
 	"github.com/adalundhe/sylk/skills"
 	"google.golang.org/genai"
 )
@@ -46,6 +53,17 @@ var googleModels = map[string]bool{
 	// Gemini 3 family
 	"gemini-3-pro": true, // Google Gemini 3 Pro
 }
+
+const googleServiceAccountCredentialProvider = "google_service_account"
+const legacyGoogleServiceAccountFilename = "google-credentials.json"
+
+type googleServiceAccountFileCache struct {
+	mu      sync.Mutex
+	payload string
+	path    string
+}
+
+var googleServiceAccountCache googleServiceAccountFileCache
 
 // NewGoogleProvider creates a new Google provider with the given configuration
 func NewGoogleProvider(ctx context.Context, config GoogleConfig, skills ...skills.Skill) (*GoogleProvider, error) {
@@ -144,10 +162,14 @@ func hydrateGoogleConfig(
 		return fmt.Errorf("google config is nil")
 	}
 	normalizeGoogleHydrationFields(config)
-	if config.AuthMode == GoogleAuthModeOAuth {
+	switch config.AuthMode {
+	case GoogleAuthModeOAuth:
 		return hydrateGoogleOAuthConfig(ctx, config, authService)
+	case GoogleAuthModeServiceAccount:
+		return hydrateGoogleServiceAccountConfig(config)
+	default:
+		return hydrateGoogleAPIKeyConfig(config)
 	}
-	return hydrateGoogleAPIKeyConfig(config)
 }
 
 func normalizeGoogleHydrationFields(config *GoogleConfig) {
@@ -203,6 +225,9 @@ func fallbackGoogleOAuthToAPIKey(config *GoogleConfig, resolveErr error) error {
 	if config == nil {
 		return fmt.Errorf("google config is nil")
 	}
+	if canFallbackGoogleOAuthToServiceAccount(config) {
+		return nil
+	}
 	if err := hydrateGoogleAPIKeyConfig(config); err != nil {
 		return err
 	}
@@ -212,6 +237,203 @@ func fallbackGoogleOAuthToAPIKey(config *GoogleConfig, resolveErr error) error {
 	config.AuthMode = GoogleAuthModeAPIKey
 	config.UseVertexAI = false
 	return nil
+}
+
+func canFallbackGoogleOAuthToServiceAccount(config *GoogleConfig) bool {
+	if err := hydrateGoogleServiceAccountConfig(config); err != nil {
+		return false
+	}
+	config.AuthMode = GoogleAuthModeServiceAccount
+	return true
+}
+
+func hydrateGoogleServiceAccountConfig(config *GoogleConfig) error {
+	if config == nil {
+		return fmt.Errorf("google config is nil")
+	}
+	payload, err := resolveGoogleServiceAccountJSON()
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(payload) == "" {
+		return fmt.Errorf("google config: service account credentials not configured")
+	}
+	metadata, err := parseGoogleServiceAccountMetadata(payload)
+	if err != nil {
+		return err
+	}
+	if config.ProjectID == "" {
+		config.ProjectID = metadata.ProjectID
+	}
+	if config.Location == "" {
+		config.Location = "us-central1"
+	}
+	config.UseVertexAI = true
+	return ensureGoogleApplicationCredentials(payload)
+}
+
+type googleServiceAccountMetadata struct {
+	ProjectID string `json:"project_id"`
+}
+
+func parseGoogleServiceAccountMetadata(payload string) (*googleServiceAccountMetadata, error) {
+	parsed := map[string]any{}
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return nil, fmt.Errorf("google config: invalid service account JSON: %w", err)
+	}
+	if err := validateGoogleServiceAccountMap(parsed); err != nil {
+		return nil, err
+	}
+	return &googleServiceAccountMetadata{ProjectID: mapStringValue(parsed, "project_id")}, nil
+}
+
+func validateGoogleServiceAccountMap(payload map[string]any) error {
+	if mapStringValue(payload, "type") != "service_account" {
+		return fmt.Errorf("google config: service account JSON must have type=service_account")
+	}
+	required := []struct {
+		Key    string
+		ErrMsg string
+	}{
+		{Key: "project_id", ErrMsg: "google config: service account JSON missing project_id"},
+		{Key: "client_email", ErrMsg: "google config: service account JSON missing client_email"},
+		{Key: "private_key", ErrMsg: "google config: service account JSON missing private_key"},
+	}
+	for _, field := range required {
+		if mapStringValue(payload, field.Key) == "" {
+			return errors.New(field.ErrMsg)
+		}
+	}
+	return nil
+}
+
+func mapStringValue(payload map[string]any, key string) string {
+	text, _ := payload[key].(string)
+	return strings.TrimSpace(text)
+}
+
+func resolveGoogleServiceAccountJSON() (string, error) {
+	if payload := strings.TrimSpace(os.Getenv("GOOGLE_SERVICE_ACCOUNT_JSON")); payload != "" {
+		return payload, nil
+	}
+	payload, err := loadGoogleServiceAccountFromSecureStore()
+	if err != nil {
+		return "", err
+	}
+	if payload != "" {
+		return payload, nil
+	}
+	return migrateLegacyGoogleServiceAccount()
+}
+
+func loadGoogleServiceAccountFromSecureStore() (string, error) {
+	dirs, err := storage.ResolveDirs()
+	if err != nil {
+		return "", err
+	}
+	manager, err := credentials.NewManager(dirs, "default")
+	if err != nil {
+		return "", err
+	}
+	payload, err := manager.GetAPIKey(googleServiceAccountCredentialProvider)
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(payload), nil
+}
+
+func migrateLegacyGoogleServiceAccount() (string, error) {
+	path := legacyGoogleServiceAccountPath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("google config: read legacy credentials file: %w", err)
+	}
+	payload, err := normalizeGoogleServiceAccountPayload(data)
+	if err != nil {
+		return "", err
+	}
+	if err := persistGoogleServiceAccountCredential(payload); err != nil {
+		return "", err
+	}
+	if err := os.Remove(path); err != nil {
+		return "", fmt.Errorf("google config: remove legacy credentials file: %w", err)
+	}
+	return payload, nil
+}
+
+func normalizeGoogleServiceAccountPayload(data []byte) (string, error) {
+	payload := map[string]any{}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", fmt.Errorf("google config: invalid service account JSON: %w", err)
+	}
+	if err := validateGoogleServiceAccountMap(payload); err != nil {
+		return "", err
+	}
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("google config: normalize service account JSON: %w", err)
+	}
+	return string(normalized), nil
+}
+
+func persistGoogleServiceAccountCredential(payload string) error {
+	dirs, err := storage.ResolveDirs()
+	if err != nil {
+		return err
+	}
+	manager, err := credentials.NewManager(dirs, "default")
+	if err != nil {
+		return err
+	}
+	return manager.SetAPIKey(context.Background(), googleServiceAccountCredentialProvider, payload, nil)
+}
+
+func legacyGoogleServiceAccountPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".", legacyGoogleServiceAccountFilename)
+	}
+	return filepath.Join(home, ".sylk", legacyGoogleServiceAccountFilename)
+}
+
+func ensureGoogleApplicationCredentials(payload string) error {
+	if current := strings.TrimSpace(os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")); current != "" {
+		return nil
+	}
+	path, err := writeGoogleServiceAccountFile(payload)
+	if err != nil {
+		return err
+	}
+	return os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", path)
+}
+
+func writeGoogleServiceAccountFile(payload string) (string, error) {
+	cache := &googleServiceAccountCache
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+
+	if cache.payload == payload && cache.path != "" {
+		if _, err := os.Stat(cache.path); err == nil {
+			return cache.path, nil
+		}
+	}
+
+	dir := filepath.Join(os.TempDir(), "sylk-google")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("google config: create service-account dir: %w", err)
+	}
+	hash := sha256.Sum256([]byte(payload))
+	name := "service-account-" + hex.EncodeToString(hash[:8]) + ".json"
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(payload), 0600); err != nil {
+		return "", fmt.Errorf("google config: write service-account file: %w", err)
+	}
+	cache.payload = payload
+	cache.path = path
+	return path, nil
 }
 
 func applyResolvedGoogleOAuth(config *GoogleConfig, auth *oauth.GoogleOAuthAuth) {

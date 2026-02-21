@@ -8,10 +8,13 @@ import (
 	"sync"
 	"time"
 
+	corecontext "github.com/adalundhe/sylk/core/context"
+	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/genai"
 )
 
@@ -51,6 +54,16 @@ type Guide struct {
 
 	// Route cache for avoiding repeat LLM classifications
 	routeCache *RouteCache
+	// Session-aware router with per-session caches/preferences
+	sessionRouter *SessionRouter
+	// Domain classifier cascade used for pre-classification hints
+	domainClassifier *DomainClassifier
+	// Versioned route store for auditability and rollback
+	routeVersions *RouteVersionStore
+	// Optional enrichment fanout before forwarding requests
+	enrichment *EnrichmentService
+	// Local stream manager for real-time routing/response status
+	streams *StreamManager
 
 	// Agent channels - tracks channel names for each agent
 	agentChannels *ShardedMap[string, *AgentChannels]
@@ -70,6 +83,7 @@ type Guide struct {
 	skillLoader   *skills.Loader
 	hooks         *skills.HookRegistry
 	selfResponder GuideSelfResponder
+	selfMu        sync.RWMutex
 
 	// Session metadata
 	sessionID string
@@ -81,6 +95,8 @@ type Guide struct {
 	runMu     sync.RWMutex
 	runCtx    context.Context
 	runCancel context.CancelFunc
+
+	classifyGroup singleflight.Group
 }
 
 // agentSubscriptions holds the Guide's subscriptions to an agent's channels
@@ -117,6 +133,12 @@ type Config struct {
 	// Optional self-response handler for requests explicitly routed to guide.
 	// If nil, the Guide uses the default static responder.
 	SelfResponder GuideSelfResponder
+
+	// Optional domain-classifier configuration.
+	DomainClassifierConfig *DomainClassifierConfig
+
+	// Optional local stream-manager configuration.
+	StreamConfig *StreamConfig
 }
 
 // DefaultConfig returns sensible defaults
@@ -161,7 +183,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		Circuits:    circuits,
 	})
 
-	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
+	skillsRegistry, loaderCfg, hookRegistry := buildSkills(cfg)
 	selfResponder := resolveGuideSelfResponder(cfg, nil)
 
 	guide := &Guide{
@@ -182,7 +204,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		pendingCleanup: pendingCleanup,
 		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
 		skills:         skillsRegistry,
-		skillLoader:    skillLoader,
+		skillLoader:    nil,
 		hooks:          hookRegistry,
 		selfResponder:  selfResponder,
 		sessionID:      cfg.SessionID,
@@ -191,6 +213,10 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 
 	guide.registerCoreSkills()
 	guide.registerExtendedSkills()
+	guide.skillLoader = skills.NewLoader(guide.skills, loaderCfg)
+	if err := guide.initRuntimeExtensions(cfg); err != nil {
+		return nil, err
+	}
 
 	return guide, nil
 }
@@ -246,14 +272,11 @@ func resolveRouteCacheConfig(cfg Config) RouteCacheConfig {
 	return cacheCfg
 }
 
-func buildSkills(cfg Config) (*skills.Registry, *skills.Loader, *skills.HookRegistry) {
+func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.HookRegistry) {
 	skillsRegistry := skills.NewRegistry()
-	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	if cfg.SkillsConfig != nil {
-		skillsLoaderCfg = *cfg.SkillsConfig
-	}
-	skillsLoaderCfg.CoreSkills = []string{"route", "help", "status"}
-	skillsLoaderCfg.AutoLoadDomains = []string{"routing"}
+	skillsLoaderCfg := guideSkillsLoaderConfig(cfg)
+	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents"}
+	skillsLoaderCfg.AutoLoadDomains = nil
 
 	hooks := skills.NewHookRegistry()
 
@@ -277,7 +300,17 @@ func buildSkills(cfg Config) (*skills.Registry, *skills.Loader, *skills.HookRegi
 		return skills.HookResult{Continue: true}
 	})
 
-	return skillsRegistry, skills.NewLoader(skillsRegistry, skillsLoaderCfg), hooks
+	return skillsRegistry, skillsLoaderCfg, hooks
+}
+
+func guideSkillsLoaderConfig(cfg Config) skills.LoaderConfig {
+	skillsLoaderCfg := skills.DefaultLoaderConfig()
+	if cfg.SkillsConfig != nil {
+		return *cfg.SkillsConfig
+	}
+	skillsLoaderCfg.MaxLoadedSkills = 10
+	skillsLoaderCfg.TokenBudget = 2000
+	return skillsLoaderCfg
 }
 
 // NewWithClassifier creates a new Guide agent with a custom ClassifierClient.
@@ -318,7 +351,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		Circuits:    circuits,
 	})
 
-	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
+	skillsRegistry, loaderCfg, hookRegistry := buildSkills(cfg)
 	selfResponder := resolveGuideSelfResponder(cfg, nil)
 
 	guide := &Guide{
@@ -339,7 +372,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		pendingCleanup: pendingCleanup,
 		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
 		skills:         skillsRegistry,
-		skillLoader:    skillLoader,
+		skillLoader:    nil,
 		hooks:          hookRegistry,
 		selfResponder:  selfResponder,
 		sessionID:      cfg.SessionID,
@@ -348,6 +381,10 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 
 	guide.registerCoreSkills()
 	guide.registerExtendedSkills()
+	guide.skillLoader = skills.NewLoader(guide.skills, loaderCfg)
+	if err := guide.initRuntimeExtensions(cfg); err != nil {
+		return nil, err
+	}
 
 	return guide, nil
 }
@@ -404,7 +441,7 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 		Circuits:    circuits,
 	})
 
-	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
+	skillsRegistry, loaderCfg, hookRegistry := buildSkills(cfg)
 	selfResponder := resolveGuideSelfResponder(cfg, client)
 
 	guide := &Guide{
@@ -425,7 +462,7 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 		pendingCleanup: pendingCleanup,
 		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
 		skills:         skillsRegistry,
-		skillLoader:    skillLoader,
+		skillLoader:    nil,
 		hooks:          hookRegistry,
 		selfResponder:  selfResponder,
 		sessionID:      cfg.SessionID,
@@ -434,8 +471,39 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 
 	guide.registerCoreSkills()
 	guide.registerExtendedSkills()
+	guide.skillLoader = skills.NewLoader(guide.skills, loaderCfg)
+	if err := guide.initRuntimeExtensions(cfg); err != nil {
+		return nil, err
+	}
 
 	return guide, nil
+}
+
+func (g *Guide) initRuntimeExtensions(cfg Config) error {
+	g.sessionRouter = NewSessionRouter(g)
+	g.routeVersions = NewRouteVersionStore(g.routeCache)
+	g.enrichment = NewEnrichmentService(g.bus, g.registry, g.health)
+	g.streams = newGuideStreamManager(cfg.StreamConfig)
+	domainClassifier, err := newGuideDomainClassifier(cfg.DomainClassifierConfig)
+	if err != nil {
+		return err
+	}
+	g.domainClassifier = domainClassifier
+	return nil
+}
+
+func newGuideStreamManager(cfg *StreamConfig) *StreamManager {
+	if cfg == nil {
+		return NewStreamManager(DefaultStreamConfig())
+	}
+	return NewStreamManager(*cfg)
+}
+
+func newGuideDomainClassifier(cfg *DomainClassifierConfig) (*DomainClassifier, error) {
+	if cfg == nil {
+		return NewDomainClassifier(nil)
+	}
+	return NewDomainClassifier(cfg)
 }
 
 // =============================================================================
@@ -452,6 +520,7 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 // 4. LLM classification - cache miss (~250 tokens)
 func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedRequest, error) {
 	g.ensureRequestDefaults(request)
+	g.prepareSkillsForRouting(request)
 
 	classification, targetAgentID, err := g.resolveClassification(ctx, request)
 	if err != nil {
@@ -463,7 +532,9 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 		corrID = g.pending.Add(request, classification, targetAgentID)
 	}
 
-	return g.buildForwardedRequest(request, classification, corrID), nil
+	forwarded := g.buildForwardedRequest(request, classification, corrID)
+	g.attachEnrichment(ctx, request, classification, forwarded)
+	return forwarded, nil
 }
 
 func (g *Guide) ensureRequestDefaults(request *RouteRequest) {
@@ -485,12 +556,76 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		return classification, request.TargetAgentID, nil
 	}
 
-	classification, targetAgentID, ok := g.cachedClassification(request)
-	if ok {
-		return classification, targetAgentID, nil
+	domainCtx := g.preclassifyDomain(ctx, request)
+	if request.SessionID != "" && g.sessionRouter != nil {
+		return g.classifyWithSingleflight(ctx, request, domainCtx, true)
 	}
 
-	return g.classifyWithRouter(ctx, request)
+	classification, targetAgentID, ok := g.cachedClassification(request)
+	if ok {
+		return g.applyDomainHints(classification, domainCtx), targetAgentID, nil
+	}
+
+	return g.classifyWithSingleflight(ctx, request, domainCtx, false)
+}
+
+type classificationTuple struct {
+	result *RouteResult
+	target string
+}
+
+func (g *Guide) classifyWithSingleflight(
+	ctx context.Context,
+	request *RouteRequest,
+	domainCtx *domain.DomainContext,
+	sessionAware bool,
+) (*RouteResult, string, error) {
+	if g == nil {
+		return nil, "", fmt.Errorf("guide is nil")
+	}
+	key := classificationSingleflightKey(request, sessionAware)
+	value, err, _ := g.classifyGroup.Do(key, func() (any, error) {
+		return g.classifyByMode(ctx, request, domainCtx, sessionAware)
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	tuple, ok := value.(*classificationTuple)
+	if !ok || tuple == nil {
+		return nil, "", fmt.Errorf("invalid classification result")
+	}
+	return tuple.result, tuple.target, nil
+}
+
+func (g *Guide) classifyByMode(
+	ctx context.Context,
+	request *RouteRequest,
+	domainCtx *domain.DomainContext,
+	sessionAware bool,
+) (any, error) {
+	if sessionAware {
+		result, target, err := g.classifyWithSessionRouter(ctx, request, domainCtx)
+		if err != nil {
+			return nil, err
+		}
+		return &classificationTuple{result: result, target: target}, nil
+	}
+	result, target, err := g.classifyWithRouter(ctx, request, domainCtx)
+	if err != nil {
+		return nil, err
+	}
+	return &classificationTuple{result: result, target: target}, nil
+}
+
+func classificationSingleflightKey(request *RouteRequest, sessionAware bool) string {
+	if request == nil {
+		return "classify:nil"
+	}
+	normalized := normalizeInput(request.Input)
+	if sessionAware {
+		return "classify:session:" + request.SessionID + ":" + normalized
+	}
+	return "classify:global:" + normalized
 }
 
 func (g *Guide) cachedClassification(request *RouteRequest) (*RouteResult, string, bool) {
@@ -511,15 +646,89 @@ func (g *Guide) cachedClassification(request *RouteRequest) (*RouteResult, strin
 	return classification, cached.TargetAgentID, true
 }
 
-func (g *Guide) classifyWithRouter(ctx context.Context, request *RouteRequest) (*RouteResult, string, error) {
+func (g *Guide) classifyWithRouter(ctx context.Context, request *RouteRequest, domainCtx *domain.DomainContext) (*RouteResult, string, error) {
 	classification, err := g.router.Route(ctx, request)
 	if err != nil {
 		return nil, "", err
 	}
 
+	classification = g.applyDomainHints(classification, domainCtx)
 	targetAgentID := string(classification.TargetAgent)
 	g.cacheAndBroadcastClassification(request, classification)
 	return classification, targetAgentID, nil
+}
+
+func (g *Guide) classifyWithSessionRouter(
+	ctx context.Context,
+	request *RouteRequest,
+	domainCtx *domain.DomainContext,
+) (*RouteResult, string, error) {
+	classification, err := g.sessionRouter.Route(ctx, request.SessionID, request)
+	if err != nil {
+		return nil, "", err
+	}
+	classification = g.applyDomainHints(classification, domainCtx)
+	g.cacheAndBroadcastClassification(request, classification)
+	return classification, string(classification.TargetAgent), nil
+}
+
+func (g *Guide) preclassifyDomain(ctx context.Context, request *RouteRequest) *domain.DomainContext {
+	if g == nil || g.domainClassifier == nil || request == nil {
+		return nil
+	}
+	if g.router != nil && g.router.IsDSL(request.Input) {
+		return nil
+	}
+	domainCtx, err := g.domainClassifier.Classify(ctx, request.Input, request.SessionID)
+	if err != nil {
+		return nil
+	}
+	return domainCtx
+}
+
+func (g *Guide) applyDomainHints(result *RouteResult, domainCtx *domain.DomainContext) *RouteResult {
+	if result == nil || domainCtx == nil {
+		return result
+	}
+	if result.Rejected {
+		return result
+	}
+	if result.Confidence >= 0.75 && result.TargetAgent != TargetUnknown {
+		return result
+	}
+	hintDomain, hintTarget, ok := mapGuideDomainHint(domainCtx.PrimaryDomain.String())
+	if !ok {
+		return result
+	}
+	if result.Domain == DomainUnknown || result.Domain == DomainGeneral {
+		result.Domain = hintDomain
+	}
+	if result.TargetAgent == TargetUnknown {
+		result.TargetAgent = hintTarget
+	}
+	if result.ClassificationMethod == "" {
+		result.ClassificationMethod = "domain_hint"
+	}
+	return result
+}
+
+func mapGuideDomainHint(raw string) (Domain, TargetAgent, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "librarian":
+		return DomainLocal, TargetLibrarian, true
+	case "academic":
+		return DomainResearch, TargetAcademic, true
+	case "archivalist":
+		return DomainHistory, TargetArchivalist, true
+	case "architect":
+		return DomainPlanning, TargetArchitect, true
+	case "orchestrator":
+		return DomainSystem, TargetOrchestrator, true
+	case "guide":
+		return DomainGeneral, TargetGuide, true
+	default:
+		return DomainUnknown, TargetUnknown, false
+	}
 }
 
 func (g *Guide) cacheAndBroadcastClassification(request *RouteRequest, classification *RouteResult) {
@@ -527,7 +736,39 @@ func (g *Guide) cacheAndBroadcastClassification(request *RouteRequest, classific
 		return
 	}
 	g.routeCache.Set(request.Input, classification)
+	g.upsertRouteVersion(request.Input, classification)
 	g.broadcastLearnedRoute(request.Input, classification)
+}
+
+func (g *Guide) upsertRouteVersion(input string, result *RouteResult) {
+	if g == nil || g.routeVersions == nil || result == nil {
+		return
+	}
+	normalized := normalizeInput(input)
+	existing := g.routeVersions.GetRouteByInput(normalized)
+	if existing == nil {
+		_ = g.routeVersions.AddRoute(&VersionedRoute{
+			Input:         normalized,
+			TargetAgentID: string(result.TargetAgent),
+			Intent:        result.Intent,
+			Domain:        result.Domain,
+			Confidence:    result.Confidence,
+			Source:        RouteSourceLLM,
+		})
+		g.routeVersions.CreateVersion("guide", "learned route")
+		return
+	}
+	_ = g.routeVersions.UpdateRoute(existing.ID, func(route *VersionedRoute) {
+		if route == nil {
+			return
+		}
+		route.TargetAgentID = string(result.TargetAgent)
+		route.Intent = result.Intent
+		route.Domain = result.Domain
+		route.Confidence = result.Confidence
+		route.Source = RouteSourceLLM
+	})
+	g.routeVersions.CreateVersion("guide", "updated learned route")
 }
 
 func (g *Guide) resolveCorrelationID(request *RouteRequest) string {
@@ -547,12 +788,49 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		Entities:             classification.Entities,
 		SourceAgentID:        request.SourceAgentID,
 		SourceAgentName:      request.SourceAgentName,
+		SessionID:            request.SessionID,
 		TargetAgentID:        string(classification.TargetAgent),
 		FireAndForget:        request.FireAndForget,
 		Confidence:           classification.Confidence,
 		ClassificationMethod: classification.ClassificationMethod,
 		CrossDomain:          classification.CrossDomain,
 	}
+}
+
+func (g *Guide) attachEnrichment(
+	ctx context.Context,
+	request *RouteRequest,
+	classification *RouteResult,
+	forwarded *ForwardedRequest,
+) {
+	if g == nil || g.enrichment == nil || forwarded == nil || request == nil || classification == nil {
+		return
+	}
+	if classification.Rejected || classification.Action == RouteActionReject {
+		return
+	}
+	payloads := g.enrichment.Enrich(ctx, request, classification)
+	if len(payloads) == 0 {
+		return
+	}
+	forwarded.Entities = mergeEnrichmentEntities(forwarded.Entities, payloads)
+}
+
+func mergeEnrichmentEntities(
+	entities *ExtractedEntities,
+	payloads []corecontext.PrefetchSharePayload,
+) *ExtractedEntities {
+	if len(payloads) == 0 {
+		return entities
+	}
+	if entities == nil {
+		entities = &ExtractedEntities{}
+	}
+	if entities.Data == nil {
+		entities.Data = map[string]any{}
+	}
+	entities.Data["enrichment"] = payloads
+	return entities
 }
 
 // broadcastLearnedRoute broadcasts a newly learned route to all agents
@@ -646,7 +924,11 @@ func (g *Guide) Classify(ctx context.Context, input string) (*RouteResult, error
 		SessionID: g.sessionID,
 		Timestamp: time.Now(),
 	}
-	return g.router.Route(ctx, request)
+	classification, _, err := g.resolveClassification(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return classification, nil
 }
 
 // RecordCorrection records a correction to improve future LLM classification.
@@ -660,10 +942,34 @@ func (g *Guide) RecordCorrection(input string, wrong, correct *RouteResult, reas
 		CorrectIntent: correct.Intent,
 		CorrectDomain: correct.Domain,
 		CorrectTarget: correct.TargetAgent,
+		CorrectedBy:   g.agentID,
 		CorrectedAt:   time.Now(),
 		Reason:        reason,
 	}
 	g.router.AddCorrection(correction)
+	g.persistCorrectionToArchivalist(correction)
+}
+
+func (g *Guide) persistCorrectionToArchivalist(correction CorrectionRecord) {
+	if g == nil || g.bus == nil || !g.running {
+		return
+	}
+	forwarded := &ForwardedRequest{
+		CorrelationID:        generateMessageID(),
+		Input:                "store guide route correction",
+		Intent:               IntentStore,
+		Domain:               DomainHistory,
+		Entities:             &ExtractedEntities{Data: map[string]any{"event_type": "guide_route_correction", "correction": correction}},
+		SourceAgentID:        g.agentID,
+		SourceAgentName:      g.agentID,
+		SessionID:            g.sessionID,
+		TargetAgentID:        "archivalist",
+		FireAndForget:        true,
+		Confidence:           1.0,
+		ClassificationMethod: "system",
+	}
+	msg := NewForwardMessage(generateMessageID(), forwarded)
+	go func() { _ = g.bus.Publish(TopicRequests("archivalist", "archivalist"), msg) }()
 }
 
 // IsDSL checks if input is a structured DSL command
@@ -1078,6 +1384,12 @@ func (g *Guide) stopResilience() {
 	g.cancelRunContext()
 	g.pendingCleanup.Stop()
 	g.health.Stop()
+	if g.streams != nil {
+		g.streams.CloseAll()
+	}
+	if g.domainClassifier != nil {
+		g.domainClassifier.Close()
+	}
 	if g.observer != nil {
 		g.observer.Stop()
 	}
@@ -1238,10 +1550,28 @@ func (g *Guide) generateGuideReply(ctx context.Context, input, correlationID, so
 }
 
 func (g *Guide) guideSelfResponder() GuideSelfResponder {
-	if g.selfResponder != nil {
-		return g.selfResponder
+	g.selfMu.RLock()
+	responder := g.selfResponder
+	g.selfMu.RUnlock()
+	if responder != nil {
+		return responder
 	}
 	return NewStaticGuideResponder()
+}
+
+// SetSelfResponder updates the responder used for guide-targeted queries.
+func (g *Guide) SetSelfResponder(responder GuideSelfResponder) {
+	g.selfMu.Lock()
+	g.selfResponder = responder
+	g.selfMu.Unlock()
+}
+
+// SetClassifier updates the routing classifier used for natural-language requests.
+func (g *Guide) SetClassifier(classifier ClassifierService) {
+	if g == nil || g.router == nil || classifier == nil {
+		return
+	}
+	g.router.SetClassifier(classifier)
 }
 
 func (g *Guide) newGuideSelfResponseRequest(input string) GuideSelfResponseRequest {
@@ -1255,14 +1585,17 @@ func (g *Guide) newGuideSelfResponseRequest(input string) GuideSelfResponseReque
 
 func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlationID, sourceAgentID string) (*ForwardedRequest, error) {
 	cfg := classifyRetryConfig()
+	stream := g.beginRoutingStream(correlationID, req)
 	var lastErr error
 	for attempt := range cfg.MaxRetries {
 		result, err := g.Route(ctx, req)
 		if err == nil {
+			g.completeRoutingStream(stream, result, nil)
 			return result, nil
 		}
 		lastErr = err
 		if !isRetryableAPIError(err) || attempt == cfg.MaxRetries-1 {
+			g.completeRoutingStream(stream, nil, lastErr)
 			return nil, lastErr
 		}
 		g.publishRetryStatus(correlationID, sourceAgentID, RetryStatus{
@@ -1270,13 +1603,55 @@ func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlati
 			MaxAttempts: cfg.MaxRetries,
 			Err:         err,
 		})
+		g.recordRetryStreamEvent(stream, attempt+1, cfg.MaxRetries, err)
 		select {
 		case <-ctx.Done():
+			g.completeRoutingStream(stream, nil, ctx.Err())
 			return nil, ctx.Err()
 		case <-time.After(retryBackoffDuration(attempt, cfg)):
 		}
 	}
+	g.completeRoutingStream(stream, nil, lastErr)
 	return nil, lastErr
+}
+
+func (g *Guide) beginRoutingStream(correlationID string, req *RouteRequest) *ResponseStream {
+	if g == nil || g.streams == nil || correlationID == "" || req == nil {
+		return nil
+	}
+	stream, err := g.streams.CreateStream(correlationID, req.SessionID)
+	if err != nil || stream == nil {
+		return nil
+	}
+	stream.SendProgress(0, 1, "routing request")
+	return stream
+}
+
+func (g *Guide) completeRoutingStream(stream *ResponseStream, result *ForwardedRequest, err error) {
+	if g == nil || g.streams == nil || stream == nil {
+		return
+	}
+	if err != nil {
+		stream.SendError(err)
+		g.streams.CloseStream(stream.CorrelationID)
+		return
+	}
+	if result != nil {
+		stream.SendComplete(result)
+	}
+	g.streams.CloseStream(stream.CorrelationID)
+}
+
+func (g *Guide) recordRetryStreamEvent(stream *ResponseStream, attempt, max int, err error) {
+	if stream == nil {
+		return
+	}
+	stream.SendData(map[string]any{
+		"event":        "retry",
+		"attempt":      attempt,
+		"max_attempts": max,
+		"error":        err.Error(),
+	})
 }
 
 func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status RetryStatus) {
@@ -1342,6 +1717,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		if !ok {
 			return fmt.Errorf("invalid stream response payload")
 		}
+		g.recordIncomingStreamEvent(streamResp)
 		pending := g.pending.Get(streamResp.CorrelationID)
 		if pending == nil {
 			return nil
@@ -1352,6 +1728,17 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 	default:
 		return nil
 	}
+}
+
+func (g *Guide) recordIncomingStreamEvent(resp *StreamResponse) {
+	if g == nil || g.streams == nil || resp == nil || resp.Event == nil {
+		return
+	}
+	stream := g.streams.GetStream(resp.CorrelationID)
+	if stream == nil {
+		return
+	}
+	stream.SendData(resp.Event)
 }
 
 // handleErrorMessage processes incoming error messages from agent error channels
@@ -1509,6 +1896,9 @@ func (g *Guide) Stats() GuideStats {
 		ReadyAgents:      g.countReadyAgents(),
 		PendingRequests:  pendingStats.TotalPending,
 		CacheStats:       g.routeCache.Stats(),
+		RouteVersions:    g.routeVersionStats(),
+		StreamStats:      g.streamStats(),
+		DomainHints:      g.domainHintStats(),
 		CircuitStats:     g.circuits.Stats(),
 		HealthStats:      g.health.Stats(),
 		DLQStats:         g.dlq.Stats(),
@@ -1534,11 +1924,42 @@ type GuideStats struct {
 	ReadyAgents      int                            `json:"ready_agents"`
 	PendingRequests  int                            `json:"pending_requests"`
 	CacheStats       RouteCacheStats                `json:"cache"`
+	RouteVersions    RouteVersionStats              `json:"route_versions"`
+	StreamStats      StreamStats                    `json:"streams"`
+	DomainHints      map[string]any                 `json:"domain_hints,omitempty"`
 	CircuitStats     map[string]CircuitBreakerStats `json:"circuits"`
 	HealthStats      HealthMonitorStats             `json:"health"`
 	DLQStats         DeadLetterStats                `json:"dlq"`
 	SkillStats       skills.Stats                   `json:"skills"`
 	HookStats        skills.HookStats               `json:"hooks"`
+}
+
+func (g *Guide) routeVersionStats() RouteVersionStats {
+	if g == nil || g.routeVersions == nil {
+		return RouteVersionStats{}
+	}
+	return g.routeVersions.Stats()
+}
+
+func (g *Guide) streamStats() StreamStats {
+	if g == nil || g.streams == nil {
+		return StreamStats{}
+	}
+	return g.streams.Stats()
+}
+
+func (g *Guide) domainHintStats() map[string]any {
+	if g == nil || g.domainClassifier == nil {
+		return nil
+	}
+	stats := map[string]any{
+		"enabled":     g.domainClassifier.IsEnabled(),
+		"stage_count": g.domainClassifier.StageCount(),
+	}
+	if cacheStats := g.domainClassifier.CacheStats(); cacheStats != nil {
+		stats["cache"] = cacheStats
+	}
+	return stats
 }
 
 // generateMessageID creates a unique message ID
