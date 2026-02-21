@@ -29,7 +29,7 @@ func TestPendingStore_Add(t *testing.T) {
 
 	classification := &guide.RouteResult{
 		Intent: guide.IntentRecall,
-		Domain: guide.DomainPatterns,
+		Domain: guide.DomainHistory,
 	}
 
 	// Add request

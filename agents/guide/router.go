@@ -20,8 +20,10 @@ type Router struct {
 	config RouterConfig
 
 	// Components (stateless)
-	parser     *Parser
-	classifier *Classifier
+	parser            *Parser
+	classifier        ClassifierService
+	riskSampler       *RiskSampler
+	crossDomainRouter *CrossDomainRouter
 }
 
 // NewRouter creates a new intent-based router.
@@ -32,9 +34,11 @@ func NewRouter(client ClassifierClient, config RouterConfig) *Router {
 	}
 
 	return &Router{
-		config:     config,
-		parser:     NewParser(config.DSLPrefix),
-		classifier: NewClassifierWithClient(client, config),
+		config:            config,
+		parser:            NewParser(config.DSLPrefix),
+		classifier:        NewClassifierWithClient(client, config),
+		riskSampler:       NewRiskSampler(),
+		crossDomainRouter: NewCrossDomainRouter(nil),
 	}
 }
 
@@ -163,6 +167,28 @@ func (r *Router) routeNaturalLanguage(ctx context.Context, input string, start t
 	// Convert to route result
 	result := classification.ToRouteResult(time.Since(start))
 
+	// Cross-Domain Interception
+	// If it's a compound task, this transparently shifts the target to the Architect
+	// and attaches the sub-tasks as metadata.
+	req := &RouteRequest{Input: input}
+	r.crossDomainRouter.Evaluate(req, result)
+
+	// Risk-Averse Bayesian Evaluation
+	action := r.riskSampler.Evaluate(result.Intent, result.Domain, string(result.TargetAgent), result.Confidence)
+
+	if action == RouteActionSuggest || action == RouteActionReject {
+		// The safety catch fired! We do not route.
+		result.Rejected = true
+		result.Action = action
+
+		// Instead of failing, we construct a Clarification Request.
+		if result.Reason == "" {
+			result.Reason = "I think you want the " + string(result.TargetAgent) + " to handle this, but I'm not confident enough given the risk. Could you provide more details?"
+		}
+	} else {
+		result.Action = action
+	}
+
 	return result, nil
 }
 
@@ -219,7 +245,7 @@ func isSearchQuery(input string) bool {
 func buildSearchRouteResult(processingTime time.Duration) *RouteResult {
 	return &RouteResult{
 		Intent:               IntentRecall,
-		Domain:               DomainCode,
+		Domain:               DomainLocal,
 		TargetAgent:          TargetLibrarian,
 		TemporalFocus:        TemporalPresent,
 		Confidence:           0.85,

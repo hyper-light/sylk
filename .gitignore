@@ -38,3 +38,4 @@ third_party/
 .sylk/**/*
 .sylk
 vendor/
+.env*

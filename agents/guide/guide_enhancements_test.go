@@ -20,7 +20,7 @@ func TestCapabilityIndex_Index(t *testing.T) {
 		Name: "test",
 		Capabilities: guide.AgentCapabilities{
 			Intents:  []guide.Intent{guide.IntentRecall, guide.IntentStore},
-			Domains:  []guide.Domain{guide.DomainPatterns, guide.DomainFailures},
+					Domains: []guide.Domain{guide.DomainHistory, guide.DomainLocal},
 			Tags:     []string{"history", "memory"},
 			Keywords: []string{"remember", "recall", "store"},
 		},
@@ -220,7 +220,7 @@ func TestRouteVersionStore_CreateVersion(t *testing.T) {
 		Input:         "test query",
 		TargetAgentID: "archivalist",
 		Intent:        guide.IntentRecall,
-		Domain:        guide.DomainPatterns,
+		Domain:        guide.DomainHistory,
 		Source:        guide.RouteSourceManual,
 	})
 	require.NoError(t, err)

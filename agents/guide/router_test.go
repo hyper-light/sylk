@@ -114,7 +114,7 @@ func TestRouter_LLMClassification(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, guide.IntentRecall, result.Intent)
-	assert.Equal(t, guide.DomainPatterns, result.Domain)
+	assert.Equal(t, guide.DomainHistory, result.Domain)
 	assert.Equal(t, 0.95, result.Confidence)
 	assert.Equal(t, "llm", result.ClassificationMethod)
 
@@ -156,7 +156,7 @@ func TestRouter_FallbackOnLowConfidence(t *testing.T) {
 
 	// Should have low confidence
 	assert.Less(t, result.Confidence, 0.5)
-	assert.Equal(t, guide.RouteActionReject, result.Action)
+	assert.Equal(t, guide.RouteActionSuggest, result.Action)
 }
 
 // TestClassifier_WithMockedClient tests the classifier with mocked LLM responses
@@ -179,7 +179,7 @@ func TestClassifier_WithMockedClient(t *testing.T) {
 				"confidence":       0.92,
 			},
 			expectIntent: guide.IntentRecall,
-			expectDomain: guide.DomainPatterns,
+			expectDomain: guide.DomainHistory,
 		},
 		{
 			name:  "failure recall",
@@ -192,7 +192,7 @@ func TestClassifier_WithMockedClient(t *testing.T) {
 				"confidence":       0.88,
 			},
 			expectIntent: guide.IntentRecall,
-			expectDomain: guide.DomainFailures,
+			expectDomain: guide.DomainHistory,
 		},
 		{
 			name:  "decision declaration",
@@ -205,7 +205,7 @@ func TestClassifier_WithMockedClient(t *testing.T) {
 				"confidence":       0.85,
 			},
 			expectIntent: guide.IntentDeclare,
-			expectDomain: guide.DomainDecisions,
+			expectDomain: guide.DomainHistory,
 		},
 		{
 			name:  "help request",
@@ -320,7 +320,7 @@ func TestRouter_FormatAsDSL(t *testing.T) {
 	result := &guide.RouteResult{
 		TargetAgent: guide.TargetAgent("archivalist"),
 		Intent:      guide.IntentRecall,
-		Domain:      guide.DomainPatterns,
+		Domain:      guide.DomainHistory,
 		Entities: &guide.ExtractedEntities{
 			Scope: "error-handling",
 		},
@@ -385,7 +385,7 @@ func TestRouter_IntentDSLTriggersLLM(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, guide.IntentRecall, result.Intent)
-	assert.Equal(t, guide.DomainPatterns, result.Domain)
+	assert.Equal(t, guide.DomainHistory, result.Domain)
 	assert.Equal(t, "llm", result.ClassificationMethod)
 
 	mockClient.AssertExpectations(t)
@@ -447,8 +447,8 @@ func TestClassifier_MultiIntent(t *testing.T) {
 
 	assert.True(t, result.MultiIntent)
 	assert.Len(t, result.SubResults, 2)
-	assert.Equal(t, guide.DomainPatterns, result.SubResults[0].Domain)
-	assert.Equal(t, guide.DomainFailures, result.SubResults[1].Domain)
+	assert.Equal(t, guide.DomainHistory, result.SubResults[0].Domain)
+	assert.Equal(t, guide.DomainHistory, result.SubResults[1].Domain)
 	mockClient.AssertExpectations(t)
 }
 

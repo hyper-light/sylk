@@ -28,7 +28,7 @@ func TestRouteCache_Set(t *testing.T) {
 	result := &guide.RouteResult{
 		TargetAgent: "archivalist",
 		Intent:      guide.IntentRecall,
-		Domain:      guide.DomainPatterns,
+		Domain:      guide.DomainHistory,
 		Confidence:  0.95,
 	}
 
@@ -45,7 +45,7 @@ func TestRouteCache_Get(t *testing.T) {
 	result := &guide.RouteResult{
 		TargetAgent: "archivalist",
 		Intent:      guide.IntentRecall,
-		Domain:      guide.DomainPatterns,
+		Domain:      guide.DomainHistory,
 		Confidence:  0.95,
 	}
 
@@ -56,7 +56,7 @@ func TestRouteCache_Get(t *testing.T) {
 	require.NotNil(t, cached)
 	assert.Equal(t, "archivalist", cached.TargetAgentID)
 	assert.Equal(t, guide.IntentRecall, cached.Intent)
-	assert.Equal(t, guide.DomainPatterns, cached.Domain)
+	assert.Equal(t, guide.DomainHistory, cached.Domain)
 	assert.Equal(t, 0.95, cached.Confidence)
 
 	// Get non-existent entry
@@ -167,7 +167,7 @@ func TestRouteCache_Clear(t *testing.T) {
 func TestRouteCache_SetFromRoute(t *testing.T) {
 	cache := guide.NewRouteCache(guide.DefaultRouteCacheConfig())
 
-	cache.SetFromRoute("test query", "archivalist", guide.IntentRecall, guide.DomainPatterns)
+	cache.SetFromRoute("test query", "archivalist", guide.IntentRecall, guide.DomainHistory)
 
 	cached := cache.Get("test query")
 	require.NotNil(t, cached)
@@ -290,7 +290,7 @@ func TestRouteCache_SetBulk(t *testing.T) {
 			Input:         "query1",
 			TargetAgentID: "archivalist",
 			Intent:        guide.IntentRecall,
-			Domain:        guide.DomainPatterns,
+			Domain:        guide.DomainHistory,
 		},
 		{
 			Input:         "query2",

@@ -156,53 +156,31 @@ func (i Intent) IsSearchIntent() bool {
 type Domain string
 
 const (
-	// Historical domains (handled by Archivalist)
-	DomainPatterns  Domain = "patterns"  // Code patterns, architectural patterns
-	DomainFailures  Domain = "failures"  // Failed approaches, errors encountered
-	DomainDecisions Domain = "decisions" // Design decisions, choices made
-	DomainFiles     Domain = "files"     // File states, modifications made
-	DomainLearnings Domain = "learnings" // Lessons learned, insights gained
-
-	// Coordination domains
-	DomainIntents Domain = "intents" // Work intentions, declarations
-	DomainAgents  Domain = "agents"  // Agent status, registry
-
-	// Search domains (handled by Librarian)
-	DomainCode Domain = "code" // Code search, symbols, definitions
-
-	// Planning domains (handled by Architect)
-	DomainDesign Domain = "design" // System design, architecture
-	DomainTasks  Domain = "tasks"  // Task decomposition, workflows
-
-	// Meta domains
-	DomainSystem  Domain = "system"  // System status, health
-	DomainUnknown Domain = "unknown" // Could not classify
+	DomainLocal      Domain = "local"      // Reading, searching, modifying local code/files
+	DomainHistory    Domain = "history"    // Patterns, failures, decisions, living memory
+	DomainResearch   Domain = "research"   // Academic papers, theoretical ideas, best practices
+	DomainPlanning   Domain = "planning"   // Workflow planning, task breakdown
+	DomainSystem     Domain = "system"     // System status, health, orchestrator updates
+	DomainCompliance Domain = "compliance" // Compliance, completeness, checking requirements
+	DomainTesting    Domain = "testing"    // Testing, QA, failure modes
+	DomainUnknown    Domain = "unknown"    // Could not classify
 )
 
 func AllDomains() []Domain {
 	return []Domain{
-		DomainPatterns,
-		DomainFailures,
-		DomainDecisions,
-		DomainFiles,
-		DomainLearnings,
-		DomainIntents,
-		DomainAgents,
-		DomainCode,
-		DomainDesign,
-		DomainTasks,
+		DomainLocal,
+		DomainHistory,
+		DomainResearch,
+		DomainPlanning,
 		DomainSystem,
+		DomainCompliance,
+		DomainTesting,
 	}
 }
 
 // IsHistoricalDomain returns true if the domain is handled by the Archivalist
 func (d Domain) IsHistoricalDomain() bool {
-	switch d {
-	case DomainPatterns, DomainFailures, DomainDecisions, DomainFiles, DomainLearnings:
-		return true
-	default:
-		return false
-	}
+	return d == DomainHistory
 }
 
 // =============================================================================
@@ -216,6 +194,13 @@ const (
 	TargetArchivalist TargetAgent = "archivalist" // Historical data, patterns, failures
 	TargetGuide       TargetAgent = "guide"       // Routing, help, status
 	TargetLibrarian   TargetAgent = "librarian"   // Code search, file location, semantic search
+	TargetAcademic    TargetAgent = "academic"    // Research, academic papers
+	TargetArchitect   TargetAgent = "architect"   // Planning, design, task breakdown
+	TargetOrchestrator TargetAgent = "orchestrator" // Pipeline execution
+	TargetDesigner    TargetAgent = "designer"    // Design implementation
+	TargetEngineer    TargetAgent = "engineer"    // Code implementation
+	TargetInspector   TargetAgent = "inspector"   // Code review, validation
+	TargetTester      TargetAgent = "tester"      // Test creation, execution
 	TargetUnknown     TargetAgent = "unknown"     // Could not determine target
 )
 
@@ -225,6 +210,13 @@ func AllTargetAgents() []TargetAgent {
 		TargetArchivalist,
 		TargetGuide,
 		TargetLibrarian,
+		TargetAcademic,
+		TargetArchitect,
+		TargetOrchestrator,
+		TargetDesigner,
+		TargetEngineer,
+		TargetInspector,
+		TargetTester,
 	}
 }
 
@@ -318,6 +310,9 @@ type ForwardedRequest struct {
 	SourceAgentID   string `json:"source_agent_id"`
 	SourceAgentName string `json:"source_agent_name,omitempty"`
 
+	// Target agent info
+	TargetAgentID string `json:"target_agent_id"`
+
 	// FireAndForget indicates no response is expected.
 	// Target should process async and not publish a response message.
 	FireAndForget bool `json:"fire_and_forget,omitempty"`
@@ -325,6 +320,9 @@ type ForwardedRequest struct {
 	// Classification metadata
 	Confidence           float64 `json:"confidence"`
 	ClassificationMethod string  `json:"classification_method"` // "dsl" or "llm"
+
+	// Cross-domain context (populated if multi_intent)
+	CrossDomain *CrossDomainContext `json:"cross_domain,omitempty"`
 }
 
 // PendingRequest tracks a request awaiting response
@@ -362,6 +360,15 @@ type RouteResult struct {
 	// Metadata
 	ClassificationMethod string        `json:"classification_method"` // "dsl" or "llm"
 	ProcessingTime       time.Duration `json:"processing_time"`
+
+	// Cross-domain context
+	CrossDomain *CrossDomainContext `json:"cross_domain,omitempty"`
+}
+
+type CrossDomainContext struct {
+	IsMultiAgent bool           `json:"is_multi_agent"`
+	PrimaryAgent TargetAgent    `json:"primary_agent"`
+	SubTasks     []*RouteResult `json:"sub_tasks,omitempty"`
 }
 
 // RouteAction indicates what action to take based on confidence
@@ -411,8 +418,9 @@ type ClassificationResult struct {
 	RejectionReason string `json:"rejection_reason,omitempty"`
 
 	// Classification
-	Intent Intent `json:"intent"`
-	Domain Domain `json:"domain"`
+	Intent      Intent      `json:"intent"`
+	Domain      Domain      `json:"domain"`
+	TargetAgent TargetAgent `json:"target_agent"`
 
 	// Entities
 	Entities *ExtractedEntities `json:"entities,omitempty"`
@@ -609,6 +617,10 @@ type AgentCapabilities struct {
 	// More specific matchers get higher scores
 	// Used as tiebreaker when priorities are equal
 	Specificity int `json:"specificity,omitempty"`
+
+	// ProvidesEnrichment indicates whether this agent can provide
+	// context enrichment before routing.
+	ProvidesEnrichment bool `json:"provides_enrichment,omitempty"`
 }
 
 // AgentConstraints declares restrictions on what an agent accepts
@@ -732,9 +744,10 @@ type AgentRegistry interface {
 // RouterConfig configures the guide router
 type RouterConfig struct {
 	// LLM configuration
-	Model       string  `json:"model"`       // Model for classification
-	MaxTokens   int     `json:"max_tokens"`  // Max tokens for classification response
-	Temperature float64 `json:"temperature"` // Temperature for classification
+	Model         string  `json:"model"`          // Model for classification
+	MaxTokens     int     `json:"max_tokens"`     // Max tokens for classification response
+	Temperature   float64 `json:"temperature"`    // Temperature for classification
+	ThinkingLevel string  `json:"thinking_level"` // Thinking budget/level (e.g. HIGH, LOW)
 
 	// Confidence thresholds
 	ExecuteThreshold float64 `json:"execute_threshold"` // >= this: execute (default: 0.90)
@@ -749,19 +762,26 @@ type RouterConfig struct {
 
 	// Timeouts
 	ClassificationTimeout time.Duration `json:"classification_timeout"`
+	EnrichmentTimeout     time.Duration `json:"enrichment_timeout"`
+
+	// Ambiguity parameters
+	AmbiguityThreshold float64 `json:"ambiguity_threshold"`
 }
 
 // DefaultRouterConfig returns sensible defaults
 func DefaultRouterConfig() RouterConfig {
 	return RouterConfig{
-		Model:                 "claude-haiku-4-5-20251001", // Claude Haiku 4.5
-		MaxTokens:             512,
+		Model:                 "gemini-3.1-pro-preview",
+		MaxTokens:             2048,
 		Temperature:           0.0,
+		ThinkingLevel:         "HIGH",
 		ExecuteThreshold:      0.90,
 		LogThreshold:          0.75,
 		SuggestThreshold:      0.50,
 		MaxCorrections:        50,
 		DSLPrefix:             "@",
 		ClassificationTimeout: 10 * time.Second,
+		EnrichmentTimeout:     2 * time.Second,
+		AmbiguityThreshold:    0.15,
 	}
 }

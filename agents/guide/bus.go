@@ -315,8 +315,14 @@ const (
 	MessageTypeTaskComplete          MessageType = "task_complete"
 	MessageTypeTaskFailed            MessageType = "task_failed"
 	MessageTypeTaskHelp              MessageType = "task_help"
-	MessageTypeClarificationRequest  MessageType = "clarification_request"
+	// MessageTypeClarificationRequest is a request for user clarification
+	MessageTypeClarificationRequest MessageType = "clarification_request"
+	// MessageTypeClarificationResponse is a response to a clarification request
 	MessageTypeClarificationResponse MessageType = "clarification_response"
+	// MessageTypeDirectConsultation is a direct agent-to-agent consultation
+	MessageTypeDirectConsultation MessageType = "direct_consultation"
+	// MessageTypeVariantRequest is a request for a variant resolution
+	MessageTypeVariantRequest MessageType = "variant_request"
 	MessageTypeValidateTask          MessageType = "validate_task"
 	MessageTypeValidationResult      MessageType = "validation_result"
 	MessageTypeValidationFull        MessageType = "validation_full"

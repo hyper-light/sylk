@@ -303,6 +303,14 @@ func (m *HealthMonitor) GetStatus(agentID string) HealthStatus {
 	return HealthStatusUnknown
 }
 
+// GetInfo returns detailed health information of an agent
+func (m *HealthMonitor) GetInfo(agentID string) (AgentHealthInfo, bool) {
+	if health, ok := m.agents.Get(agentID); ok {
+		return health.Info(), true
+	}
+	return AgentHealthInfo{}, false
+}
+
 // IsHealthy returns true if an agent is healthy
 func (m *HealthMonitor) IsHealthy(agentID string) bool {
 	if health, ok := m.agents.Get(agentID); ok {

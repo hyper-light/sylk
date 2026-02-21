@@ -27,7 +27,7 @@ func TestRegistry_Register(t *testing.T) {
 		Aliases: []string{"ta", "test"},
 		Capabilities: guide.AgentCapabilities{
 			Intents: []guide.Intent{guide.IntentRecall},
-			Domains: []guide.Domain{guide.DomainPatterns},
+			Domains: []guide.Domain{guide.DomainHistory},
 		},
 		Description: "Test agent",
 		Priority:    100,
@@ -150,7 +150,7 @@ func TestRegistry_FindBestMatch(t *testing.T) {
 		Name: "Archivalist",
 		Capabilities: guide.AgentCapabilities{
 			Intents: []guide.Intent{guide.IntentRecall, guide.IntentStore},
-			Domains: []guide.Domain{guide.DomainPatterns, guide.DomainFailures, guide.DomainDecisions},
+			Domains: []guide.Domain{guide.DomainHistory, guide.DomainHistory, guide.DomainHistory},
 		},
 		Priority: 100,
 	})
@@ -160,7 +160,7 @@ func TestRegistry_FindBestMatch(t *testing.T) {
 		Name: "Guide",
 		Capabilities: guide.AgentCapabilities{
 			Intents: []guide.Intent{guide.IntentHelp, guide.IntentStatus},
-			Domains: []guide.Domain{guide.DomainSystem, guide.DomainAgents},
+			Domains: []guide.Domain{guide.DomainSystem, guide.DomainSystem},
 		},
 		Priority: 50,
 	})
@@ -168,7 +168,7 @@ func TestRegistry_FindBestMatch(t *testing.T) {
 	// Test pattern recall - should match archivalist
 	result := &guide.RouteResult{
 		Intent: guide.IntentRecall,
-		Domain: guide.DomainPatterns,
+		Domain: guide.DomainHistory,
 	}
 	best := registry.FindBestMatch(result)
 	require.NotNil(t, best)
@@ -246,7 +246,7 @@ func TestAgentRegistration_MatchScore(t *testing.T) {
 		Name: "Test",
 		Capabilities: guide.AgentCapabilities{
 			Intents: []guide.Intent{guide.IntentRecall, guide.IntentStore},
-			Domains: []guide.Domain{guide.DomainPatterns, guide.DomainFailures},
+			Domains: []guide.Domain{guide.DomainHistory, guide.DomainHistory},
 		},
 		Priority: 100,
 	}
@@ -254,7 +254,7 @@ func TestAgentRegistration_MatchScore(t *testing.T) {
 	// Matching intent and domain should have high score
 	result := &guide.RouteResult{
 		Intent: guide.IntentRecall,
-		Domain: guide.DomainPatterns,
+		Domain: guide.DomainHistory,
 	}
 	score := reg.MatchScore(result)
 	assert.Greater(t, score, 0)
@@ -262,7 +262,7 @@ func TestAgentRegistration_MatchScore(t *testing.T) {
 	// Matching both intent and domain should have high score
 	result = &guide.RouteResult{
 		Intent: guide.IntentStore,
-		Domain: guide.DomainFailures,
+		Domain: guide.DomainHistory,
 	}
 	score = reg.MatchScore(result)
 	assert.Greater(t, score, 0)
@@ -270,7 +270,7 @@ func TestAgentRegistration_MatchScore(t *testing.T) {
 	// Non-matching intent should have zero score
 	result = &guide.RouteResult{
 		Intent: guide.IntentHelp,
-		Domain: guide.DomainPatterns,
+		Domain: guide.DomainHistory,
 	}
 	score = reg.MatchScore(result)
 	assert.Equal(t, 0, score)

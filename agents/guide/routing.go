@@ -262,7 +262,7 @@ func GuideRoutingInfo() *AgentRoutingInfo {
 				Name:          "status",
 				Description:   "Check system and agent status",
 				DefaultIntent: IntentStatus,
-				DefaultDomain: DomainAgents,
+				DefaultDomain: DomainSystem,
 			},
 		},
 

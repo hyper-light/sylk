@@ -97,7 +97,7 @@ func TestRouter_SearchKeywordDetection(t *testing.T) {
 			if tt.expectLibrarian {
 				assert.Equal(t, guide.TargetLibrarian, result.TargetAgent)
 				assert.Equal(t, tt.expectMethod, result.ClassificationMethod)
-				assert.Equal(t, guide.DomainCode, result.Domain)
+				assert.Equal(t, guide.DomainLocal, result.Domain)
 			}
 		})
 	}
@@ -127,7 +127,7 @@ func TestRouter_SearchRouteToLibrarian(t *testing.T) {
 	// Verify routing to Librarian
 	assert.Equal(t, guide.TargetLibrarian, result.TargetAgent)
 	assert.Equal(t, guide.IntentRecall, result.Intent)
-	assert.Equal(t, guide.DomainCode, result.Domain)
+	assert.Equal(t, guide.DomainLocal, result.Domain)
 	assert.Equal(t, "keyword", result.ClassificationMethod)
 	assert.Equal(t, guide.RouteActionExecute, result.Action)
 	assert.GreaterOrEqual(t, result.Confidence, 0.8)
@@ -172,7 +172,7 @@ func TestRouter_NonSearchFallbackToLLM(t *testing.T) {
 	// Should route to Archivalist via LLM classification
 	assert.Equal(t, guide.TargetAgent("archivalist"), result.TargetAgent)
 	assert.Equal(t, guide.IntentRecall, result.Intent)
-	assert.Equal(t, guide.DomainPatterns, result.Domain)
+	assert.Equal(t, guide.DomainHistory, result.Domain)
 	assert.Equal(t, "llm", result.ClassificationMethod)
 
 	// Verify mock WAS called
@@ -202,7 +202,7 @@ func TestRouter_SearchKeywordPriority(t *testing.T) {
 
 	// Search keyword takes priority - routes to Librarian
 	assert.Equal(t, guide.TargetLibrarian, result.TargetAgent)
-	assert.Equal(t, guide.DomainCode, result.Domain)
+	assert.Equal(t, guide.DomainLocal, result.Domain)
 	assert.Equal(t, "keyword", result.ClassificationMethod)
 
 	// Verify mock was NOT called
@@ -299,7 +299,7 @@ func TestRouter_SearchResultProperties(t *testing.T) {
 	// Verify all expected properties
 	assert.Equal(t, guide.TargetLibrarian, result.TargetAgent)
 	assert.Equal(t, guide.IntentRecall, result.Intent)
-	assert.Equal(t, guide.DomainCode, result.Domain)
+	assert.Equal(t, guide.DomainLocal, result.Domain)
 	assert.Equal(t, guide.TemporalPresent, result.TemporalFocus)
 	assert.Equal(t, guide.RouteActionExecute, result.Action)
 	assert.Equal(t, "keyword", result.ClassificationMethod)

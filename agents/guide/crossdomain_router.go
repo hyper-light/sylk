@@ -309,3 +309,39 @@ func (r *CrossDomainRouter) ParallelThreshold() float64 {
 func (r *CrossDomainRouter) Strategy() RoutingStrategy {
 	return r.routingStrategy
 }
+
+// Evaluate checks if the classification requires multi-agent coordination.
+// If so, it mutates the TargetAgent to the Architect and bundles the sub-tasks.
+func (c *CrossDomainRouter) Evaluate(req *RouteRequest, result *RouteResult) {
+	// 1. Explicit Routing Bypass: If the user explicitly typed @engineer, 
+	// honor it, even if it's a complex task. The user is taking manual control.
+	if req.TargetAgentID != "" || IsDirectRouteCommand(req.Input) {
+		return 
+	}
+
+	// 2. Detect Multi-Intent from the LLM Classification
+	if len(result.SubResults) > 1 {
+		result.CrossDomain = &CrossDomainContext{
+			IsMultiAgent: true,
+			PrimaryAgent: result.TargetAgent, // Who the LLM thought was primary
+			SubTasks:     result.SubResults,
+		}
+		
+		// 3. Reroute to Architect
+		// The Guide is a stateless router; it cannot manage a multi-step state machine.
+		// We route to the Architect, whose job is to take this CrossDomainContext,
+		// consult the Librarian/Archivalist, and build an execution DAG for the Orchestrator.
+		result.TargetAgent = TargetAgent("architect")
+		result.Intent = IntentPlan 
+		result.Domain = DomainPlanning
+		
+		// We adjust the confidence because this is a synthetic, system-generated reroute
+		result.Confidence = 1.0 
+		result.ClassificationMethod = "cross_domain_interceptor"
+	}
+}
+
+// IsDirectRouteCommand checks if the input starts with a strict DSL target (e.g. "@engineer")
+func IsDirectRouteCommand(input string) bool {
+    return len(input) > 1 && input[0] == '@' 
+}

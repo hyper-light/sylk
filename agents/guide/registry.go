@@ -137,7 +137,6 @@ func GuideRegistration() *AgentRegistration {
 			},
 			Domains: []Domain{
 				DomainSystem,
-				DomainAgents,
 			},
 		},
 		Constraints: AgentConstraints{

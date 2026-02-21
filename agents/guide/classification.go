@@ -319,20 +319,26 @@ func (c *Classifier) applyHeuristicDomain(textLower string, result *Classificati
 }
 
 func (c *Classifier) detectDomain(textLower string) Domain {
-	if c.containsAny(textLower, []string{"pattern"}) {
-		return DomainPatterns
+	if c.containsAny(textLower, []string{"pattern", "failure", "error", "decision", "learning", "lesson", "history"}) {
+		return DomainHistory
 	}
-	if c.containsAny(textLower, []string{"failure", "error"}) {
-		return DomainFailures
+	if c.containsAny(textLower, []string{"code", "file", "local", "read", "search", "modify"}) {
+		return DomainLocal
 	}
-	if c.containsAny(textLower, []string{"decision"}) {
-		return DomainDecisions
+	if c.containsAny(textLower, []string{"research", "paper", "best practice", "academic"}) {
+		return DomainResearch
 	}
-	if c.containsAny(textLower, []string{"file"}) {
-		return DomainFiles
+	if c.containsAny(textLower, []string{"plan", "task", "break down", "workflow"}) {
+		return DomainPlanning
 	}
-	if c.containsAny(textLower, []string{"learning", "lesson"}) {
-		return DomainLearnings
+	if c.containsAny(textLower, []string{"system", "status", "health", "agent"}) {
+		return DomainSystem
+	}
+	if c.containsAny(textLower, []string{"compliance", "complete", "quality", "review", "lint"}) {
+		return DomainCompliance
+	}
+	if c.containsAny(textLower, []string{"test", "qa", "performance test"}) {
+		return DomainTesting
 	}
 	return DomainUnknown
 }
@@ -476,6 +482,7 @@ func (cr *ClassificationResult) ToRouteResult(processingTime time.Duration) *Rou
 	result := &RouteResult{
 		Intent:               cr.Intent,
 		Domain:               cr.Domain,
+		TargetAgent:          cr.TargetAgent,
 		Entities:             cr.Entities,
 		Confidence:           cr.Confidence,
 		ClassificationMethod: "llm",
@@ -491,12 +498,22 @@ func (cr *ClassificationResult) ToRouteResult(processingTime time.Duration) *Rou
 }
 
 func (cr *ClassificationResult) assignTargetRouting(result *RouteResult) {
+	// Let the LLM select the target agent if it provided one
+	if result.TargetAgent != "" && result.TargetAgent != TargetUnknown {
+		if cr.IsRetrospective {
+			result.TemporalFocus = TemporalPast
+		} else {
+			result.TemporalFocus = TemporalPresent
+		}
+		return
+	}
+
 	if cr.Domain.IsHistoricalDomain() && cr.IsRetrospective {
 		result.TargetAgent = TargetArchivalist
 		result.TemporalFocus = TemporalPast
 		return
 	}
-	if cr.Domain == DomainSystem || cr.Domain == DomainAgents {
+	if cr.Domain == DomainSystem {
 		result.TargetAgent = TargetGuide
 		result.TemporalFocus = TemporalPresent
 		return
@@ -506,7 +523,8 @@ func (cr *ClassificationResult) assignTargetRouting(result *RouteResult) {
 }
 
 func (cr *ClassificationResult) applyRejection(result *RouteResult) {
-	if cr.IsRetrospective || !cr.Domain.IsHistoricalDomain() {
+	// The retrospective constraint ONLY applies if the target agent is the archivalist
+	if cr.IsRetrospective || result.TargetAgent != TargetArchivalist {
 		return
 	}
 	result.Rejected = true

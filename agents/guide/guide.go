@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"google.golang.org/genai"
 )
 
 // =============================================================================
@@ -237,7 +238,30 @@ func buildSkills(cfg Config) (*skills.Registry, *skills.Loader, *skills.HookRegi
 	}
 	skillsLoaderCfg.CoreSkills = []string{"route", "help", "status"}
 	skillsLoaderCfg.AutoLoadDomains = []string{"routing"}
-	return skillsRegistry, skills.NewLoader(skillsRegistry, skillsLoaderCfg), skills.NewHookRegistry()
+	
+	hooks := skills.NewHookRegistry()
+	
+	// CRITICAL SAFETY CATCH
+	// The Guide must NEVER be able to execute generic state-mutating tools like write_file or run_shell_command
+	// even if they somehow leak into its context. We explicitly whitelist its approved tools.
+	allowedTools := map[string]bool{
+		"route": true, "clarify": true, "guide_route": true, "help": true, "status": true,
+		"agents": true, "route_to": true, "reply_to": true, "broadcast": true,
+		"task_interact": true, "get_routing_history": true, "get_agent_capabilities": true,
+		"sessions": true, "metrics": true, "switch_session": true, "create_session": true, "close_session": true,
+	}
+	
+	hooks.RegisterPreToolCallHook("guide_safety_catch", skills.HookPriorityHigh, func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
+		if !allowedTools[data.ToolName] {
+			return skills.HookResult{
+				Continue: false,
+				Error:    fmt.Errorf("SECURITY VIOLATION: Guide agent is not permitted to execute tool %q", data.ToolName),
+			}
+		}
+		return skills.HookResult{Continue: true}
+	})
+
+	return skillsRegistry, skills.NewLoader(skillsRegistry, skillsLoaderCfg), hooks
 }
 
 // NewWithAPIKey creates a new Guide agent with an API key
@@ -253,6 +277,74 @@ func NewWithAPIKey(apiKey string, cfg Config) (*Guide, error) {
 	client := anthropic.NewClient(opts...)
 
 	return New(&client, cfg)
+}
+
+// NewWithGeminiClient creates a new Guide agent with a Gemini client
+func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
+	cfg = ensureRouterConfig(cfg)
+	if err := validateBus(cfg); err != nil {
+		return nil, err
+	}
+
+	registry := resolveRegistry(cfg)
+	routing := NewRoutingAggregator()
+	routing.RegisterAgent(GuideRoutingInfo())
+
+	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
+	classifier := NewGeminiClassifier(client, cfg.RouterConfig)
+	router := &Router{
+		config:            cfg.RouterConfig,
+		parser:            parser,
+		classifier:        classifier,
+		riskSampler:       NewRiskSampler(),
+		crossDomainRouter: NewCrossDomainRouter(nil),
+	}
+
+	pendingCfg := resolvePendingConfig(cfg)
+	agentID := resolveAgentID(cfg)
+	cacheCfg := resolveRouteCacheConfig(cfg)
+	circuits := NewCircuitBreakerRegistry(DefaultCircuitBreakerConfig())
+	dlq := NewDeadLetterQueue(DeadLetterQueueConfig{MaxSize: 10000})
+	pendingCleanup := NewPendingCleanup(PendingCleanupConfig{
+		CheckInterval:  1 * time.Second,
+		DefaultTimeout: pendingCfg.DefaultTimeout,
+		DLQ:            dlq,
+		Circuits:       circuits,
+	})
+	health := NewHealthMonitor(cfg.Bus, HealthMonitorConfig{
+		AgentConfig: DefaultAgentHealthConfig(),
+		Circuits:    circuits,
+	})
+
+	skillsRegistry, skillLoader, hookRegistry := buildSkills(cfg)
+
+	guide := &Guide{
+		router:         router,
+		config:         cfg,
+		bus:            cfg.Bus,
+		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
+		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
+		readyAgents:    NewStringMap[bool](DefaultShardCount),
+		registry:       registry,
+		routing:        routing,
+		triggers:       NewTriggerDetector(routing),
+		pending:        NewPendingStore(pendingCfg),
+		routeCache:     NewRouteCache(cacheCfg),
+		circuits:       circuits,
+		health:         health,
+		dlq:            dlq,
+		pendingCleanup: pendingCleanup,
+		skills:         skillsRegistry,
+		skillLoader:    skillLoader,
+		hooks:          hookRegistry,
+		sessionID:      cfg.SessionID,
+		agentID:        agentID,
+	}
+
+	guide.registerCoreSkills()
+	guide.registerExtendedSkills()
+
+	return guide, nil
 }
 
 // =============================================================================
@@ -364,9 +456,11 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		Entities:             classification.Entities,
 		SourceAgentID:        request.SourceAgentID,
 		SourceAgentName:      request.SourceAgentName,
+		TargetAgentID:        string(classification.TargetAgent),
 		FireAndForget:        request.FireAndForget,
 		Confidence:           classification.Confidence,
 		ClassificationMethod: classification.ClassificationMethod,
+		CrossDomain:          classification.CrossDomain,
 	}
 }
 

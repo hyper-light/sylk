@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -42,6 +43,11 @@ type Skill struct {
 
 	// Usage tracking
 	InvokeCount int64 `json:"invoke_count"`
+
+	// Documentation for markdown generation
+	UsageDoc      string   `json:"usage_doc,omitempty"`
+	BestPractices []string `json:"best_practices,omitempty"`
+	Examples      []string `json:"examples,omitempty"`
 }
 
 // InputSchema defines the JSON Schema for skill inputs
@@ -109,6 +115,24 @@ func (b *Builder) Domain(domain string) *Builder {
 // Keywords sets trigger keywords
 func (b *Builder) Keywords(keywords ...string) *Builder {
 	b.skill.Keywords = keywords
+	return b
+}
+
+// Usage sets the skill usage documentation
+func (b *Builder) Usage(usage string) *Builder {
+	b.skill.UsageDoc = usage
+	return b
+}
+
+// Example adds an example
+func (b *Builder) Example(example string) *Builder {
+	b.skill.Examples = append(b.skill.Examples, example)
+	return b
+}
+
+// BestPractice adds a best practice
+func (b *Builder) BestPractice(practice string) *Builder {
+	b.skill.BestPractices = append(b.skill.BestPractices, practice)
 	return b
 }
 
@@ -202,6 +226,80 @@ func (b *Builder) Handler(h Handler) *Builder {
 // Build returns the constructed skill
 func (b *Builder) Build() *Skill {
 	return b.skill
+}
+
+// =============================================================================
+// Markdown Generation
+// =============================================================================
+
+// ToMarkdown generates a full SKILL.md document from the skill definition
+func (s *Skill) ToMarkdown() string {
+	var sb strings.Builder
+
+	// Frontmatter
+	sb.WriteString("---\n")
+	sb.WriteString(fmt.Sprintf("name: %s\n", s.Name))
+	sb.WriteString(fmt.Sprintf("description: %s\n", s.Description))
+	if s.Domain != "" {
+		sb.WriteString("metadata:\n")
+		sb.WriteString(fmt.Sprintf("  category: %s\n", s.Domain))
+		sb.WriteString("  version: 1.0.0\n")
+	}
+	sb.WriteString("---\n\n")
+
+	// Title
+	sb.WriteString(fmt.Sprintf("# %s Skill\n\n", s.Name))
+
+	// Description or Usage
+	if s.UsageDoc != "" {
+		sb.WriteString(s.UsageDoc + "\n\n")
+	} else {
+		sb.WriteString(s.Description + "\n\n")
+	}
+
+	// Parameters
+	if s.InputSchema != nil && len(s.InputSchema.Properties) > 0 {
+		sb.WriteString("## Parameters\n\n")
+		sb.WriteString("| Parameter | Type | Required | Description |\n")
+		sb.WriteString("|-----------|------|----------|-------------|\n")
+
+		reqMap := make(map[string]bool)
+		for _, req := range s.InputSchema.Required {
+			reqMap[req] = true
+		}
+
+		for name, prop := range s.InputSchema.Properties {
+			reqStr := "No"
+			if reqMap[name] {
+				reqStr = "Yes"
+			}
+			desc := prop.Description
+			if len(prop.Enum) > 0 {
+				desc += fmt.Sprintf(" (One of: %v)", prop.Enum)
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | `%s` | %s | %s |\n", name, prop.Type, reqStr, desc))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Examples
+	if len(s.Examples) > 0 {
+		sb.WriteString("## Example Usage\n\n")
+		for _, ex := range s.Examples {
+			sb.WriteString(ex + "\n\n")
+		}
+	}
+
+	// Best Practices
+	if len(s.BestPractices) > 0 {
+		sb.WriteString("## Best Practices\n\n")
+		for i, bp := range s.BestPractices {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, bp))
+		}
+		sb.WriteString("\n")
+	}
+
+	return strings.TrimSpace(sb.String()) + "\n"
 }
 
 // =============================================================================
