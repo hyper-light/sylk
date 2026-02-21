@@ -368,18 +368,20 @@ func AllChannelTypes() []ChannelType {
 // AgentChannels represents the three channels owned by an agent
 type AgentChannels struct {
 	AgentID   string `json:"agent_id"`
-	Requests  string `json:"requests"`  // <agent>.requests
-	Responses string `json:"responses"` // <agent>.responses
-	Errors    string `json:"errors"`    // <agent>.errors
+	AgentType string `json:"agent_type"`
+	Requests  string `json:"requests"`  // request.<agent_type>.<agent_id>
+	Responses string `json:"responses"` // response.<agent_type>.<agent_id>
+	Errors    string `json:"errors"`    // error.<agent_type>.<agent_id>
 }
 
 // NewAgentChannels creates channel names for an agent
-func NewAgentChannels(agentID string) *AgentChannels {
+func NewAgentChannels(agentType, agentID string) *AgentChannels {
 	return &AgentChannels{
 		AgentID:   agentID,
-		Requests:  agentID + ".requests",
-		Responses: agentID + ".responses",
-		Errors:    agentID + ".errors",
+		AgentType: agentType,
+		Requests:  "request." + agentType + "." + agentID,
+		Responses: "response." + agentType + "." + agentID,
+		Errors:    "error." + agentType + "." + agentID,
 	}
 }
 
@@ -408,23 +410,34 @@ const (
 )
 
 // AgentTopic returns the topic for a specific agent and channel type
-func AgentTopic(agentID string, channelType ChannelType) string {
-	return agentID + "." + string(channelType)
+func AgentTopic(agentType, agentID string, channelType ChannelType) string {
+	var prefix string
+	switch channelType {
+	case ChannelTypeRequests:
+		prefix = "request"
+	case ChannelTypeResponses:
+		prefix = "response"
+	case ChannelTypeErrors:
+		prefix = "error"
+	default:
+		prefix = string(channelType)
+	}
+	return prefix + "." + agentType + "." + agentID
 }
 
 // TopicRequests returns the request topic for an agent
-func TopicRequests(agentID string) string {
-	return AgentTopic(agentID, ChannelTypeRequests)
+func TopicRequests(agentType, agentID string) string {
+	return AgentTopic(agentType, agentID, ChannelTypeRequests)
 }
 
 // TopicResponses returns the response topic for an agent
-func TopicResponses(agentID string) string {
-	return AgentTopic(agentID, ChannelTypeResponses)
+func TopicResponses(agentType, agentID string) string {
+	return AgentTopic(agentType, agentID, ChannelTypeResponses)
 }
 
 // TopicErrors returns the error topic for an agent
-func TopicErrors(agentID string) string {
-	return AgentTopic(agentID, ChannelTypeErrors)
+func TopicErrors(agentType, agentID string) string {
+	return AgentTopic(agentType, agentID, ChannelTypeErrors)
 }
 
 // =============================================================================
@@ -508,6 +521,7 @@ func NewErrorMessage(id, correlationID, sourceAgentID, errorMsg string) *Message
 type AgentAnnouncement struct {
 	// Agent identity
 	AgentID   string   `json:"agent_id"`
+	AgentType string   `json:"agent_type"`
 	AgentName string   `json:"agent_name"`
 	Aliases   []string `json:"aliases,omitempty"`
 
@@ -534,9 +548,10 @@ type AgentAnnouncement struct {
 func NewAgentRegisteredMessage(id string, info *AgentRoutingInfo) *Message {
 	announcement := &AgentAnnouncement{
 		AgentID:         info.ID,
+		AgentType:       info.Type,
 		AgentName:       info.Name,
 		Aliases:         info.Aliases,
-		Channels:        NewAgentChannels(info.ID),
+		Channels:        NewAgentChannels(info.Type, info.ID),
 		ActionShortcuts: info.ActionShortcuts,
 	}
 

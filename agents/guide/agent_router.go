@@ -393,9 +393,17 @@ func (r *TieredRouter) TriggerAction(ctx context.Context, targetAgentID, action 
 		r.trackOutbound(correlationID, targetAgentID, options)
 	}
 
+	// Lookup agent type
+	targetType := targetAgentID
+	if info, ok := r.knownAgents.Get(targetAgentID); ok {
+		if info.AgentType != "" {
+			targetType = info.AgentType
+		}
+	}
+
 	// Publish to target's request channel
 	msg := NewActionMessage(generateMessageID(), actionReq)
-	targetTopic := TopicRequests(targetAgentID)
+	targetTopic := TopicRequests(targetType, targetAgentID)
 
 	if err := r.bus.Publish(targetTopic, msg); err != nil {
 		r.removeOutbound(correlationID)
@@ -635,7 +643,14 @@ func (r *TieredRouter) routeDirect(ctx context.Context, correlationID, targetAge
 	msg := NewForwardMessage(generateMessageID(), fwd)
 	msg.TargetAgentID = targetAgentID
 
-	targetTopic := TopicRequests(targetAgentID)
+	targetType := targetAgentID
+	if info, ok := r.knownAgents.Get(targetAgentID); ok {
+		if info.AgentType != "" {
+			targetType = info.AgentType
+		}
+	}
+
+	targetTopic := TopicRequests(targetType, targetAgentID)
 	if err := r.bus.Publish(targetTopic, msg); err != nil {
 		r.removeOutbound(correlationID)
 		r.circuits.RecordFailure(targetAgentID)

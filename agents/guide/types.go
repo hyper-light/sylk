@@ -163,7 +163,16 @@ const (
 	DomainSystem     Domain = "system"     // System status, health, orchestrator updates
 	DomainCompliance Domain = "compliance" // Compliance, completeness, checking requirements
 	DomainTesting    Domain = "testing"    // Testing, QA, failure modes
-	DomainUnknown    Domain = "unknown"    // Could not classify
+	DomainCode       Domain = "code"      // Source code reading, writing, refactoring
+	DomainFiles      Domain = "files"     // File system operations, file metadata
+	DomainDesign     Domain = "design"    // Architecture, system design, structural decisions
+	DomainTasks      Domain = "tasks"     // Task breakdown, work items, orchestration
+	DomainPatterns   Domain = "patterns"  // Recurring patterns, conventions, idioms
+	DomainFailures   Domain = "failures"  // Past failures, error patterns, regressions
+	DomainDecisions  Domain = "decisions" // Architectural decisions, rationale, trade-offs
+	DomainLearnings  Domain = "learnings" // Lessons learned, insights, best practices discovered
+	DomainIntents    Domain = "intents"   // Intent tracking, declared goals, work-in-progress
+	DomainUnknown    Domain = "unknown"   // Could not classify
 )
 
 func AllDomains() []Domain {
@@ -175,12 +184,25 @@ func AllDomains() []Domain {
 		DomainSystem,
 		DomainCompliance,
 		DomainTesting,
+		DomainCode,
+		DomainFiles,
+		DomainDesign,
+		DomainTasks,
+		DomainPatterns,
+		DomainFailures,
+		DomainDecisions,
+		DomainLearnings,
+		DomainIntents,
 	}
 }
 
 // IsHistoricalDomain returns true if the domain is handled by the Archivalist
 func (d Domain) IsHistoricalDomain() bool {
-	return d == DomainHistory
+	return d == DomainHistory ||
+		d == DomainPatterns ||
+		d == DomainFailures ||
+		d == DomainDecisions ||
+		d == DomainLearnings
 }
 
 // =============================================================================

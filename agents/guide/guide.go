@@ -1116,12 +1116,12 @@ func (g *Guide) handleErrorMessage(msg *Message) error {
 
 func (g *Guide) publishRouteError(correlationID string, sourceAgentID string, err error) error {
 	errMsg := NewErrorMessage(generateMessageID(), correlationID, g.agentID, err.Error())
-	return g.bus.Publish(TopicResponses(sourceAgentID), errMsg)
+	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), errMsg)
 }
 
 func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *ForwardedRequest) error {
 	fwdMsg := g.forwardMessage(targetAgentID, forwarded)
-	return g.bus.Publish(TopicRequests(targetAgentID), fwdMsg)
+	return g.bus.Publish(TopicRequests(targetAgentID, targetAgentID), fwdMsg)
 }
 
 func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest) *Message {
@@ -1132,7 +1132,7 @@ func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest
 
 func (g *Guide) publishResponseToSource(sourceAgentID string, resp *RouteResponse) error {
 	respMsg := NewResponseMessage(generateMessageID(), resp)
-	return g.bus.Publish(TopicResponses(sourceAgentID), respMsg)
+	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), respMsg)
 }
 
 func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse) error {
@@ -1148,12 +1148,12 @@ func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	return g.bus.Publish(TopicResponses(sourceAgentID), msg)
+	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), msg)
 }
 
 func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string) error {
 	errMsg := NewErrorMessage(generateMessageID(), correlationID, sourceAgent, errStr)
-	return g.bus.Publish(TopicResponses(sourceAgentID), errMsg)
+	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), errMsg)
 }
 
 func (g *Guide) routeResponseFromError(msg *Message, errStr string) *RouteResponse {

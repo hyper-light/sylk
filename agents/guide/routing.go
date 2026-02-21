@@ -32,6 +32,7 @@ type AgentRouter interface {
 type AgentRoutingInfo struct {
 	// Agent identity
 	ID   string `json:"id"`
+	Type string `json:"type"`
 	Name string `json:"name"`
 
 	// DSL aliases (e.g., "arch" -> "archivalist")
@@ -247,6 +248,7 @@ func (ra *RoutingAggregator) GetAllRoutingInfo() []*AgentRoutingInfo {
 func GuideRoutingInfo() *AgentRoutingInfo {
 	return &AgentRoutingInfo{
 		ID:      "guide",
+		Type:    "guide",
 		Name:    "guide",
 		Aliases: []string{"g"},
 

@@ -55,6 +55,18 @@ func (c *BaseConfig) Validate() error {
 	if c.Temperature < 0 || c.Temperature > 2 {
 		return fmt.Errorf("temperature must be between 0 and 2")
 	}
+	if c.MaxRetries < 0 {
+		return fmt.Errorf("max_retries must be non-negative")
+	}
+	if c.RetryBaseDelay < 0 {
+		return fmt.Errorf("retry_base_delay must be non-negative")
+	}
+	if c.RetryMaxDelay < 0 {
+		return fmt.Errorf("retry_max_delay must be non-negative")
+	}
+	if c.RetryMaxDelay > 0 && c.RetryBaseDelay > c.RetryMaxDelay {
+		return fmt.Errorf("retry_base_delay must be <= retry_max_delay")
+	}
 	return nil
 }
 
@@ -129,18 +141,33 @@ type OpenAIConfig struct {
 
 	ReasoningEffort string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
 
+	// AuthMode controls how credentials are interpreted.
+	// Supported values: "api_key" (default), "chatgpt".
+	AuthMode string `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
+
+	// ChatGPTAccountID adds ChatGPT account scoping for codex backend access.
+	ChatGPTAccountID string `json:"chatgpt_account_id,omitempty" yaml:"chatgpt_account_id,omitempty"`
+
+	// FallbackModel is used when the requested model is unavailable (e.g. model_not_found).
+	FallbackModel string `json:"fallback_model,omitempty" yaml:"fallback_model,omitempty"`
+
+	// AllowUnknownModels bypasses static model gating in SupportsModel.
+	AllowUnknownModels bool `json:"allow_unknown_models,omitempty" yaml:"allow_unknown_models,omitempty"`
+
 	SystemPrompt string `json:"system_prompt" yaml:"system_prompt"`
 }
 
 // DefaultOpenAIConfig returns OpenAI defaults
 func DefaultOpenAIConfig() OpenAIConfig {
 	base := DefaultBaseConfig()
-	base.Model = "codex-5-2-20250901" // OpenAI 5.2 Codex
+	base.Model = "gpt-5.3-codex"
 	base.MaxTokens = 8192
 
 	return OpenAIConfig{
 		BaseConfig:      base,
 		ReasoningEffort: "xhigh",
+		AuthMode:        "api_key",
+		FallbackModel:   "gpt-5.2-codex",
 	}
 }
 
@@ -161,6 +188,16 @@ func (c *OpenAIConfig) Validate() error {
 		default:
 			return fmt.Errorf("openai config: reasoning_effort must be low, medium, high, or xhigh")
 		}
+	}
+	if c.AuthMode != "" {
+		switch c.AuthMode {
+		case openAIAuthModeAPIKey, openAIAuthModeChatGPT:
+		default:
+			return fmt.Errorf("openai config: auth_mode must be api_key or chatgpt")
+		}
+	}
+	if c.FallbackModel != "" && c.FallbackModel == c.Model {
+		return fmt.Errorf("openai config: fallback_model must differ from model")
 	}
 	return nil
 }
