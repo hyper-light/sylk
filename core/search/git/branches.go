@@ -1759,19 +1759,7 @@ func (c *GitClient) CommitFiles(paths []string, message string) error {
 		return ErrNotGitRepo
 	}
 
-	wt, err := c.repo.Worktree()
-	if err != nil {
-		return err
-	}
-
-	for _, p := range paths {
-		if _, err := wt.Add(p); err != nil {
-			return err
-		}
-	}
-
-	_, err = wt.Commit(message, &gogit.CommitOptions{})
-	return err
+	return newCommitEngine(c).execute(paths, message)
 }
 
 // =============================================================================
