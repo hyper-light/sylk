@@ -624,6 +624,60 @@ func TestMergeSortedEntries(t *testing.T) {
 }
 
 // =============================================================================
+// Benchmarks
+// =============================================================================
+
+// BenchmarkCommitEngine measures commit throughput at varying file counts.
+// Each sub-benchmark creates a fresh repo, writes N files, then times
+// a single CommitFiles call.
+func BenchmarkCommitEngine(b *testing.B) {
+	for _, fileCount := range []int{10, 100, 500} {
+		b.Run(itoa(fileCount)+"_files", func(b *testing.B) {
+			b.StopTimer()
+			for range b.N {
+				dir, err := os.MkdirTemp("", "sylk-bench-*")
+				if err != nil {
+					b.Fatal(err)
+				}
+				repo, err := gogit.PlainInit(dir, false)
+				if err != nil {
+					b.Fatal(err)
+				}
+				// Seed with one commit so HEAD exists.
+				os.WriteFile(filepath.Join(dir, "init.txt"), []byte("init"), 0o644)
+				wt, _ := repo.Worktree()
+				wt.Add("init.txt")
+				wt.Commit("init", &gogit.CommitOptions{
+					Author: &object.Signature{Name: "B", Email: "b@b", When: time.Now()},
+				})
+
+				paths := make([]string, 0, fileCount)
+				for j := range fileCount {
+					name := "d" + itoa(j/25) + "/f" + itoa(j) + ".txt"
+					p := filepath.Join(dir, filepath.FromSlash(name))
+					os.MkdirAll(filepath.Dir(p), 0o755)
+					os.WriteFile(p, []byte("content-"+itoa(j)+strings.Repeat("x", 200)), 0o644)
+					paths = append(paths, name)
+				}
+
+				client, cErr := NewGitClient(dir)
+				if cErr != nil {
+					b.Fatal(cErr)
+				}
+
+				b.StartTimer()
+				if err := client.CommitFiles(paths, "bench"); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+
+				os.RemoveAll(dir)
+			}
+		})
+	}
+}
+
+// =============================================================================
 // Test Helpers
 // =============================================================================
 

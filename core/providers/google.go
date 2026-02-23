@@ -1593,8 +1593,14 @@ func (g *GoogleProvider) convertResponse(result *genai.GenerateContentResponse, 
 		ProviderMetadata: make(map[string]any),
 	}
 
-	// Extract text content
-	resp.Content = result.Text()
+	// Extract text and thinking content.
+	text, thought := extractGoogleCandidateParts(result.Candidates)
+	if text != "" {
+		resp.Content = text
+	} else {
+		resp.Content = result.Text()
+	}
+	resp.Thinking = strings.TrimSpace(thought)
 
 	// Extract function calls
 	if fcs := result.FunctionCalls(); fcs != nil {

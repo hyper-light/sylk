@@ -2067,12 +2067,18 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 	if g == nil || g.bus == nil || reroute == nil {
 		return
 	}
+	sourceAgentID = strings.TrimSpace(sourceAgentID)
+	if sourceAgentID == "" {
+		return
+	}
 	event := &StreamEvent{
 		Type: StreamEventReroute,
 		Data: map[string]string{
-			"from_agent": reroute.SourceAgentID,
-			"to_agent":   reroute.SuggestedTarget,
-			"reason":     reroute.Reason,
+			"from_agent":              reroute.SourceAgentID,
+			"to_agent":               reroute.SuggestedTarget,
+			"reason":                 reroute.Reason,
+			"original_correlation_id": reroute.OriginalCorrelationID,
+			"new_correlation_id":      correlationID,
 		},
 	}
 	resp := &StreamResponse{
@@ -2090,7 +2096,7 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 		TargetAgentID: sourceAgentID,
 		Timestamp:     time.Now(),
 	}
-	_ = g.bus.Publish(TopicGuideResponses, msg)
+	_ = g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), msg)
 }
 
 // rerouteExcludeKey is the context key for reroute excluded agent IDs.

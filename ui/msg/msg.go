@@ -91,11 +91,12 @@ type GuideResponseMsg struct {
 // The Guide broadcasts this when an agent invokes the reroute_request skill
 // and the request is being re-classified to a different agent.
 type StreamRerouteMsg struct {
-	SessionID     string
-	CorrelationID string
-	FromAgentID   string // Agent that requested the reroute.
-	ToAgentID     string // New target agent (may be empty if not yet classified).
-	Reason        string // Why the reroute happened.
+	SessionID              string
+	CorrelationID          string // New correlation ID for the rerouted request.
+	OriginalCorrelationID  string // Correlation ID of the original request being rerouted.
+	FromAgentID            string // Agent that requested the reroute.
+	ToAgentID              string // New target agent (may be empty if not yet classified).
+	Reason                 string // Why the reroute happened.
 }
 
 // RetryStatusMsg reports a retry or model-fallback attempt during Guide processing.

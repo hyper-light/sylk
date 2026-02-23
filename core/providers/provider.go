@@ -114,6 +114,7 @@ type ToolCall struct {
 
 type Response struct {
 	Content          string         `json:"content"`
+	Thinking         string         `json:"thinking,omitempty"`
 	Model            string         `json:"model"`
 	StopReason       StopReason     `json:"stop_reason"`
 	Usage            Usage          `json:"usage"`

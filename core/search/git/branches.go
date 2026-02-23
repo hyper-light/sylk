@@ -1759,7 +1759,11 @@ func (c *GitClient) CommitFiles(paths []string, message string) error {
 		return ErrNotGitRepo
 	}
 
-	return newCommitEngine(c).execute(paths, message)
+	eng, err := newCommitEngine(c)
+	if err != nil {
+		return err
+	}
+	return eng.execute(paths, message)
 }
 
 // =============================================================================

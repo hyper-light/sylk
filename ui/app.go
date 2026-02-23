@@ -3695,6 +3695,19 @@ func (m *AppModel) clearActiveRoute(correlationID string) {
 	m.activeRoute = activeRouteState{}
 }
 
+// forceResetActiveRoute unconditionally clears the activeRoute when the
+// current correlationID matches. Used during reroutes where the old stream
+// is abandoned and a new correlationID takes over.
+func (m *AppModel) forceResetActiveRoute(oldCorrelationID string) {
+	oldCorrelationID = strings.TrimSpace(oldCorrelationID)
+	if oldCorrelationID == "" {
+		return
+	}
+	if strings.TrimSpace(m.activeRoute.CorrelationID) == oldCorrelationID {
+		m.activeRoute = activeRouteState{}
+	}
+}
+
 // setEngagedAgent updates the sticky engaged agent for conversation continuity.
 // Non-guide agents are tracked; "guide" is ignored since the Guide is a router.
 func (m *AppModel) setEngagedAgent(agentID string) {
@@ -3723,12 +3736,22 @@ func (m *AppModel) clearEngagedAgent() {
 }
 
 // handleStreamReroute processes a reroute notification from the Guide.
+// It transitions the activeRoute from the original correlationID to the
+// rerouted one so that stream events from the new target agent are rendered.
 func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
+	// Force-clear the old activeRoute to unblock new stream events.
+	if reroute.OriginalCorrelationID != "" {
+		m.forceResetActiveRoute(reroute.OriginalCorrelationID)
+	}
+	// Set up the new activeRoute for the rerouted stream.
+	if reroute.CorrelationID != "" {
+		m.beginActiveRoute(reroute.CorrelationID, normalizeAgentID(reroute.ToAgentID))
+	}
 	m.clearEngagedAgent()
 	if reroute.ToAgentID != "" {
 		m.setEngagedAgent(reroute.ToAgentID)
 	}
-	if reroute.FromAgentID != "" && reroute.Reason != "" {
+	if reroute.FromAgentID != "" {
 		m.statusBar.SetFlash(reroute.FromAgentID + " -> " + reroute.ToAgentID)
 	}
 	return nil
@@ -4866,7 +4889,6 @@ func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd 
 
 func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd {
 	chunk.Text = redactSecrets(chunk.Text)
-	m.recordStreamChunk(chunk.CorrelationID, chunk.Text)
 	m.trackStreamChunk(chunk.CorrelationID, chunk.Text)
 	if chunk.InputTokens > 0 {
 		m.applyEarlyInputTokens(chunk.CorrelationID, chunk.InputTokens)
@@ -4877,6 +4899,10 @@ func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd 
 	if strings.TrimSpace(chunk.Text) == "" {
 		return nil // Usage-only chunk; status bar updated, no chat content to render.
 	}
+	// Record HadChunk only after confirming the chunk will be rendered.
+	// Setting HadChunk before this point would cause shouldSuppressStreamedRouteResponse
+	// to suppress the GuideResponseMsg even when no chunks were actually displayed.
+	m.recordStreamChunk(chunk.CorrelationID, chunk.Text)
 	return m.propagate(chunk)
 }
 

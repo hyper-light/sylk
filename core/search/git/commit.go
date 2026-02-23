@@ -1,6 +1,7 @@
 package git
 
 import (
+	"compress/zlib"
 	"context"
 	"crypto/sha1"
 	"errors"
@@ -11,8 +12,8 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
@@ -32,25 +33,22 @@ import (
 // commitEngine replaces per-file go-git Worktree.Add() + Worktree.Commit()
 // with plumbing-level batch operations:
 //   - Single index parse + single index write (not N of each)
-//   - Parallel bounded blob storage (not sequential)
+//   - Fully parallel blob storage via direct loose-object writes
 //   - O(1) entry lookup via map (not O(entries) linear scan)
 //   - Zero full-tree status scans (not N merkletrie diffs)
 //   - Hash-skip: skip blob store when content hash matches existing entry
+//   - Skip-existing: tree objects already in the store are not rewritten
 //
 // For N files in an index of size M, this is O(N + M) vs go-git's O(N² × M).
-// On a 5K-entry index committing 50 files: ~100× faster.
-// On a 100K-entry monorepo committing 5000 files: ~1000× faster.
 
 // commitWorkersMax bounds the blob-staging worker pool.
-// Derived: go-git loose object writes are ~4μs each on SSD. Beyond 16 workers
-// the kernel VFS lock and inode allocation become the bottleneck, not CPU or
-// disk bandwidth. Measured on ext4 and APFS with varying thread counts.
+// Derived: beyond 16 workers the kernel VFS lock and inode allocation
+// become the bottleneck on ext4/APFS, not CPU or disk bandwidth.
 const commitWorkersMax = 16
 
 // maxBlobReadSize caps individual file reads during commit staging.
 // Git's index stores file size as uint32 — beyond 4 GiB the size wraps to 0.
-// 256 MiB is a practical ceiling for in-memory blob hashing that avoids
-// excessive heap pressure while covering all reasonable source files.
+// 256 MiB is a practical ceiling for in-memory blob hashing.
 const maxBlobReadSize = 256 << 20
 
 // invalidSignatureRe matches characters that must be stripped from
@@ -61,10 +59,10 @@ var invalidSignatureRe = regexp.MustCompile(`[<>\n]`)
 // commitEngine performs a batch add+commit using plumbing operations.
 // The caller must hold GitClient.mu.Lock() and verify isRepo.
 type commitEngine struct {
-	repoPath string
-	storer   storage.Storer
-	repo     *gogit.Repository
-	storeMu  sync.Mutex // Serializes SetEncodedObject — go-git's DotGit is not thread-safe.
+	repoPath   string
+	objectsDir string // .git/objects/ — for direct parallel blob writes
+	storer     storage.Storer
+	repo       *gogit.Repository
 }
 
 // stagedFile holds the result of staging a single file.
@@ -78,12 +76,17 @@ type stagedFile struct {
 	deleted bool
 }
 
-func newCommitEngine(c *GitClient) *commitEngine {
-	return &commitEngine{
-		repoPath: c.repoPath,
-		storer:   c.repo.Storer,
-		repo:     c.repo,
+func newCommitEngine(c *GitClient) (*commitEngine, error) {
+	gitDir, err := resolveGitDir(c)
+	if err != nil {
+		return nil, fmt.Errorf("resolve git dir: %w", err)
 	}
+	return &commitEngine{
+		repoPath:   c.repoPath,
+		objectsDir: filepath.Join(gitDir, "objects"),
+		storer:     c.repo.Storer,
+		repo:       c.repo,
+	}, nil
 }
 
 // execute stages the given paths and creates a commit.
@@ -92,10 +95,10 @@ func newCommitEngine(c *GitClient) *commitEngine {
 //  1. Resolve signature from git config (Author → Committer → User → default)
 //  2. Resolve HEAD for parent hash (no HEAD = first commit, zero parents)
 //  3. Parse index once, build O(1) entry lookup
-//  4. Parallel blob staging with hash-skip optimization
+//  4. Parallel blob staging: read + hash + write loose objects directly
 //  5. Batch-update index in memory (update, insert, delete, conflict resolve)
 //  6. Write index once
-//  7. Build tree from full index state
+//  7. Build tree from full index (skip-existing tree objects)
 //  8. Create commit object + update HEAD
 func (e *commitEngine) execute(paths []string, message string) error {
 	if len(paths) == 0 {
@@ -143,8 +146,8 @@ func (e *commitEngine) execute(paths []string, message string) error {
 		return fmt.Errorf("write index: %w", err)
 	}
 
-	// Build tree from full index state.
-	treeHash, err := buildTreeFromIndex(e.storer, idx)
+	// Build tree from full index state, skipping tree objects already in store.
+	treeHash, err := buildTreeSkipExisting(e.storer, idx)
 	if err != nil {
 		return fmt.Errorf("build tree: %w", err)
 	}
@@ -159,11 +162,14 @@ func (e *commitEngine) execute(paths []string, message string) error {
 }
 
 // =============================================================================
-// Parallel Blob Staging
+// Parallel Blob Staging — Direct Loose Object Writes
 // =============================================================================
 
 // batchStageFiles processes all paths through a bounded worker pool.
-// Each worker: Lstat → ReadFile → computeBlobHash → skip or storeBlob.
+// Each worker: Lstat → ReadFile → computeBlobHash → skip or writeLooseBlob.
+// Blob writes bypass go-git's non-thread-safe DotGit entirely, writing
+// zlib-compressed loose objects directly to .git/objects/. This is fully
+// parallel-safe because each object has a unique hash-derived path.
 // Returns on first error, cancelling remaining workers immediately.
 func (e *commitEngine) batchStageFiles(
 	paths []string,
@@ -258,11 +264,9 @@ func (e *commitEngine) stageFile(relPath string, existing *index.Entry) (stagedF
 	// Hash-skip: if existing index entry has the same hash, the object
 	// already exists in the store. Skip the write I/O entirely.
 	if existing == nil || existing.Hash != hash {
-		stored, storeErr := e.storeBlobSync(content)
-		if storeErr != nil {
-			return stagedFile{}, storeErr
+		if err := writeLooseBlob(e.objectsDir, hash, content); err != nil {
+			return stagedFile{}, err
 		}
-		hash = stored
 	}
 
 	return stagedFile{
@@ -275,14 +279,55 @@ func (e *commitEngine) stageFile(relPath string, existing *index.Entry) (stagedF
 	}, nil
 }
 
-// storeBlobSync serializes blob storage through a mutex.
-// go-git's DotGit.NewObject() calls cleanObjectList() which mutates shared
-// state without synchronization. File reads + hash computation remain parallel;
-// only the object store write is serialized (~10-30μs per file on SSD).
-func (e *commitEngine) storeBlobSync(content []byte) (plumbing.Hash, error) {
-	e.storeMu.Lock()
-	defer e.storeMu.Unlock()
-	return storeBlob(e.storer, content)
+// writeLooseBlob writes a blob object directly to .git/objects/<xx>/<yy...>.
+// Fully parallel-safe: each hash maps to a unique path. Uses temp file +
+// atomic rename. If the object already exists on disk, it is a no-op.
+func writeLooseBlob(objectsDir string, hash plumbing.Hash, content []byte) error {
+	hex := hash.String()
+	dir := filepath.Join(objectsDir, hex[:2])
+	finalPath := filepath.Join(dir, hex[2:])
+
+	// Skip if loose object already exists on disk.
+	if _, err := os.Stat(finalPath); err == nil {
+		return nil
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, ".tmp_obj_")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // No-op after successful rename.
+
+	zw := zlib.NewWriter(tmp)
+	header := fmt.Sprintf("blob %d\x00", len(content))
+
+	_, err = zw.Write([]byte(header))
+	if err == nil {
+		_, err = zw.Write(content)
+	}
+	if closeErr := zw.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+
+	err = os.Rename(tmpName, finalPath)
+	if err != nil {
+		// Race: another worker wrote the same object. Same content → OK.
+		if _, statErr := os.Stat(finalPath); statErr == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // =============================================================================
@@ -391,6 +436,80 @@ func mergeSortedEntries(sorted, additional []*index.Entry) []*index.Entry {
 }
 
 // =============================================================================
+// Tree Building — Skip-Existing Optimization
+// =============================================================================
+
+// buildTreeSkipExisting builds a tree from the index, but checks
+// HasEncodedObject before writing each tree node. For unchanged
+// subdirectories the tree object already exists in the store —
+// skipping the write eliminates thousands of redundant zlib+file-create
+// operations on large repos.
+func buildTreeSkipExisting(s storage.Storer, idx *index.Index) (plumbing.Hash, error) {
+	return buildFlatEntriesSkipExisting(s, idx.Entries)
+}
+
+func buildFlatEntriesSkipExisting(s storage.Storer, entries []*index.Entry) (plumbing.Hash, error) {
+	type dirBucket struct {
+		entries []*index.Entry
+	}
+
+	var treeEntries []object.TreeEntry
+	subdirs := make(map[string]*dirBucket)
+
+	for _, entry := range entries {
+		dir, rest, hasSep := strings.Cut(entry.Name, "/")
+		if !hasSep {
+			treeEntries = append(treeEntries, object.TreeEntry{
+				Name: dir,
+				Mode: entry.Mode,
+				Hash: entry.Hash,
+			})
+		} else {
+			if subdirs[dir] == nil {
+				subdirs[dir] = &dirBucket{}
+			}
+			clone := *entry
+			clone.Name = rest
+			subdirs[dir].entries = append(subdirs[dir].entries, &clone)
+		}
+	}
+
+	for dir, bucket := range subdirs {
+		subHash, err := buildFlatEntriesSkipExisting(s, bucket.entries)
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+		treeEntries = append(treeEntries, object.TreeEntry{
+			Name: dir,
+			Mode: filemode.Dir,
+			Hash: subHash,
+		})
+	}
+
+	return storeTreeSkipExisting(s, treeEntries)
+}
+
+// storeTreeSkipExisting encodes a tree object and stores it only if
+// it does not already exist in the object store.
+func storeTreeSkipExisting(s storage.Storer, entries []object.TreeEntry) (plumbing.Hash, error) {
+	sort.Sort(object.TreeEntrySorter(entries))
+
+	tree := &object.Tree{Entries: entries}
+	obj := s.NewEncodedObject()
+	if err := tree.Encode(obj); err != nil {
+		return plumbing.ZeroHash, err
+	}
+
+	// Check if this exact tree already exists — skip the disk write.
+	hash := obj.Hash()
+	if s.HasEncodedObject(hash) == nil {
+		return hash, nil
+	}
+
+	return s.SetEncodedObject(obj)
+}
+
+// =============================================================================
 // HEAD Update
 // =============================================================================
 
@@ -472,7 +591,7 @@ func firstNonEmpty(values ...string) string {
 
 // computeBlobHash computes the git blob SHA-1: "blob <size>\0<content>".
 // Used to check whether content matches an existing index entry's hash
-// before incurring the cost of storeBlob (which writes to disk).
+// before incurring the cost of writing a loose object.
 func computeBlobHash(content []byte) plumbing.Hash {
 	h := sha1.New()
 	header := fmt.Sprintf("blob %d\x00", len(content))

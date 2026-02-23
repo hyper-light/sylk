@@ -202,6 +202,10 @@ func parseStreamRerouteMsg(sessionID, correlationID string, event *guide.StreamE
 	result.FromAgentID = strings.TrimSpace(data["from_agent"])
 	result.ToAgentID = strings.TrimSpace(data["to_agent"])
 	result.Reason = strings.TrimSpace(data["reason"])
+	result.OriginalCorrelationID = strings.TrimSpace(data["original_correlation_id"])
+	if newCID := strings.TrimSpace(data["new_correlation_id"]); newCID != "" {
+		result.CorrelationID = newCID
+	}
 	return result
 }
 

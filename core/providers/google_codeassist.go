@@ -232,6 +232,7 @@ func parseVertexGenerateResponse(raw json.RawMessage, model string) (*Response, 
 
 	text, thought := extractVertexStreamParts(&vResp)
 	resp.Content = strings.TrimSpace(text)
+	resp.Thinking = strings.TrimSpace(thought)
 	if thought != "" {
 		resp.ProviderMetadata["thought"] = thought
 	}

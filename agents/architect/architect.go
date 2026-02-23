@@ -933,7 +933,7 @@ func (a *Architect) designArchitecture(ctx context.Context, requirements *Requir
 	architecture := &SolutionArchitecture{
 		Name:        fmt.Sprintf("Architecture for: %s", truncateString(requirements.Query, 50)),
 		Description: requirements.Query,
-		Components:  []ComponentSpec{},
+		Components:  deriveComponentsFromGoals(requirements),
 		Interfaces:  []InterfaceSpec{},
 		Patterns:    []string{},
 	}
@@ -946,6 +946,27 @@ func (a *Architect) designArchitecture(ctx context.Context, requirements *Requir
 	}
 
 	return architecture, nil
+}
+
+// deriveComponentsFromGoals creates one component per requirement goal
+// so the deterministic task fallback has meaningful structure.
+func deriveComponentsFromGoals(requirements *Requirements) []ComponentSpec {
+	if requirements == nil || len(requirements.Goals) == 0 {
+		return nil
+	}
+	components := make([]ComponentSpec, 0, len(requirements.Goals))
+	for i, goal := range requirements.Goals {
+		goal = strings.TrimSpace(goal)
+		if goal == "" {
+			continue
+		}
+		components = append(components, ComponentSpec{
+			Name:        fmt.Sprintf("goal_%d", i+1),
+			Type:        "backend",
+			Description: goal,
+		})
+	}
+	return components
 }
 
 // =============================================================================
@@ -1238,6 +1259,9 @@ func (a *Architect) executeCheck(ctx context.Context, req *ArchitectRequest) (an
 // converse, plan, design, and unclassified) with a single LLM call instead of
 // the full planning protocol.
 func (a *Architect) executeConversation(ctx context.Context, req *ArchitectRequest) (any, error) {
+	ctx = withPlannerThoughtCallback(ctx, func(stage string, thought string) {
+		a.publishPlanThought(ctx, stage, thought)
+	})
 	request := plannerConversationRequest{
 		Mode:                plannerConversationModeConverse,
 		UserQuery:           req.Query,
@@ -1261,10 +1285,17 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 }
 
 // conversationFallback runs the domain-specific execution path when the
-// conversational LLM is unavailable. Design intents use the lighter-weight
-// architecture call; all other intents (plan, converse, help, etc.) fall to
-// the full planning protocol, which has deterministic fallbacks for every step.
+// conversational LLM is unavailable. If the planner is entirely missing
+// (no API key), returns a clear error instead of running the planning
+// protocol with deterministic-only fallbacks that produce generic tasks.
 func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequest, composeErr error) (any, error) {
+	if a.ensurePlanner() == nil {
+		return &ConversationResult{
+			Response: "I can't generate a detailed plan right now — my LLM planner is not configured. " +
+				"Please ensure an Anthropic API key is available (ANTHROPIC_API_KEY environment variable or the secure credential store).",
+			Intent: req.Intent,
+		}, nil
+	}
 	if req.Intent == IntentDesign {
 		return a.executeDesignArchitecture(ctx, req)
 	}

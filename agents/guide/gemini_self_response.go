@@ -128,6 +128,7 @@ func (r *GeminiGuideResponder) respondInternal(
 		if err != nil {
 			return "", nil, fmt.Errorf("gemini model %s: %w", r.model, err)
 		}
+		emitGuideThought(guardedCtx, resp.Thinking)
 
 		if len(resp.ToolCalls) == 0 {
 			text := strings.TrimSpace(resp.Content)

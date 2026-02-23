@@ -1696,6 +1696,7 @@ func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 
 	response := &Response{
 		Content:    result.OutputText(),
+		Thinking:   extractOpenAIReasoningSummary(result),
 		Model:      string(result.Model),
 		StopReason: p.convertResponseStopReason(*result),
 		Usage:      p.convertResponseUsage(*result),
@@ -1712,6 +1713,23 @@ func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 	}
 
 	return response
+}
+
+func extractOpenAIReasoningSummary(result *responses.Response) string {
+	if result == nil {
+		return ""
+	}
+	var thinking strings.Builder
+	for _, item := range result.Output {
+		reasoning, ok := item.AsAny().(responses.ResponseReasoningItem)
+		if !ok {
+			continue
+		}
+		for _, summary := range reasoning.Summary {
+			thinking.WriteString(summary.Text)
+		}
+	}
+	return strings.TrimSpace(thinking.String())
 }
 
 func (p *OpenAIProvider) convertResponseUsage(result responses.Response) Usage {

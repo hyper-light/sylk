@@ -739,12 +739,15 @@ func extractRequiredFields(params map[string]any) []string {
 // convertResponse converts an Anthropic response to generic format
 func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 	var content string
+	var thinking strings.Builder
 	var toolCalls []ToolCall
 
 	for _, block := range msg.Content {
 		switch b := block.AsAny().(type) {
 		case anthropic.TextBlock:
 			content += b.Text
+		case anthropic.ThinkingBlock:
+			thinking.WriteString(b.Thinking)
 		case anthropic.ToolUseBlock:
 			args, _ := b.Input.MarshalJSON()
 			toolCalls = append(toolCalls, ToolCall{
@@ -757,6 +760,7 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 
 	return &Response{
 		Content:    content,
+		Thinking:   strings.TrimSpace(thinking.String()),
 		Model:      string(msg.Model),
 		StopReason: p.convertStopReason(msg.StopReason),
 		Usage: Usage{
