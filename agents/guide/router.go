@@ -156,11 +156,6 @@ func (r *Router) routeMultipleDSL(ctx context.Context, input string, start time.
 
 // routeNaturalLanguage routes using LLM classification (slow path)
 func (r *Router) routeNaturalLanguage(ctx context.Context, input string, start time.Time) (*RouteResult, error) {
-	// Fast path: check for search queries before LLM classification
-	if isSearchQuery(input) {
-		return buildSearchRouteResult(time.Since(start)), nil
-	}
-
 	// Classify using LLM
 	classifier := r.currentClassifier()
 	if classifier == nil {
@@ -172,7 +167,7 @@ func (r *Router) routeNaturalLanguage(ctx context.Context, input string, start t
 	}
 
 	// Convert to route result
-	result := classification.ToRouteResult(time.Since(start))
+	result := classification.ToRouteResult(time.Since(start), r.config)
 
 	// Cross-Domain Interception
 	// If it's a compound task, this transparently shifts the target to the Architect
@@ -248,40 +243,3 @@ func (r *Router) FormatAsDSL(result *RouteResult) string {
 	return FormatDSLCommand(result)
 }
 
-// =============================================================================
-// Search Query Detection
-// =============================================================================
-
-// searchKeywords are keywords that indicate a search query for the Librarian
-var searchKeywords = []string{
-	"find",
-	"search",
-	"locate",
-	"where is",
-}
-
-// isSearchQuery detects if the input contains search-related keywords.
-// Returns true if any search keyword is found in the input (case-insensitive).
-func isSearchQuery(input string) bool {
-	lower := strings.ToLower(input)
-	for _, keyword := range searchKeywords {
-		if strings.Contains(lower, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
-// buildSearchRouteResult creates a RouteResult for search queries routed to Librarian.
-func buildSearchRouteResult(processingTime time.Duration) *RouteResult {
-	return &RouteResult{
-		Intent:               IntentRecall,
-		Domain:               DomainLocal,
-		TargetAgent:          TargetLibrarian,
-		TemporalFocus:        TemporalPresent,
-		Confidence:           0.85,
-		Action:               RouteActionExecute,
-		ClassificationMethod: "keyword",
-		ProcessingTime:       processingTime,
-	}
-}

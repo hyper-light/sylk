@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -40,6 +41,9 @@ type Inspector struct {
 	registrySub guide.Subscription
 	running     bool
 	knownAgents map[string]*guide.AgentAnnouncement
+
+	// Handoff integration
+	handoffBridge *handoff.HandoffBridge
 }
 
 // New creates a new Inspector agent
@@ -359,6 +363,8 @@ func (i *Inspector) intentHandler(intent guide.Intent) (forwardedHandler, error)
 		return i.handleCheck, nil
 	case guide.IntentRecall:
 		return i.handleRecall, nil
+	case guide.IntentHelp:
+		return i.handleHelp, nil
 	default:
 		return nil, fmt.Errorf("unsupported intent: %s", intent)
 	}
@@ -391,6 +397,16 @@ func (i *Inspector) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 		"state":          i.state,
 		"current_result": i.currentResult,
 		"criteria_count": len(i.criteria),
+	}, nil
+}
+
+func (i *Inspector) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
+	return map[string]any{
+		"agent":              "inspector",
+		"description":        "Code quality and requirement compliance validation.",
+		"supported_intents":  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp},
+		"supported_domains":  []guide.Domain{guide.DomainCode},
+		"recommended_routes": []string{"@inspector:check:code", "@inspector:recall:code"},
 	}, nil
 }
 
@@ -898,6 +914,7 @@ func (i *Inspector) GetRoutingInfo() *guide.AgentRoutingInfo {
 				Intents: []guide.Intent{
 					guide.IntentCheck,
 					guide.IntentRecall,
+					guide.IntentHelp,
 				},
 				Domains: []guide.Domain{
 					guide.DomainCode,
@@ -958,4 +975,51 @@ func (i *Inspector) GetCurrentResult() *InspectorResult {
 	defer i.mu.RUnlock()
 
 	return i.currentResult
+}
+
+// =============================================================================
+// Handoff Interface (HandoffInjectable)
+// =============================================================================
+
+// AgentID returns the unique identifier for this agent instance.
+func (i *Inspector) AgentID() string {
+	return "inspector"
+}
+
+// AgentType returns the type classification for this agent.
+func (i *Inspector) AgentType() string {
+	return "inspector"
+}
+
+// Descriptor returns the immutable metadata describing this agent type.
+func (i *Inspector) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:     "inspector",
+		ModelID:       "sonnet-4.5-200k",
+		ContextWindow: 200000,
+		Category:      handoff.CategoryStandalone,
+	}
+}
+
+// InjectPreparedContext accepts prepared context from a handoff into this agent.
+func (i *Inspector) InjectPreparedContext(pc *handoff.PreparedContext) error {
+	return nil
+}
+
+// Terminate gracefully shuts down the agent.
+func (i *Inspector) Terminate(ctx context.Context) error {
+	return i.Stop()
+}
+
+// SetHandoffBridge assigns the handoff bridge for this agent.
+func (i *Inspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	i.handoffBridge = bridge
+}
+
+// ExtractArchivableState returns the agent's current state for handoff persistence.
+func (i *Inspector) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   i.AgentID(),
+		AgentType: i.AgentType(),
+	}
 }

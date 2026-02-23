@@ -845,82 +845,71 @@ func TestAgentGaussianProcess_SetHyperparamsInvalid(t *testing.T) {
 // =============================================================================
 
 func TestCholeskyDecomposition(t *testing.T) {
-	gp := NewAgentGaussianProcess(nil)
+	// Simple positive definite matrix (uses CholeskyFlat from gp_linalg.go)
+	A := NewFlatMatrix(3, 3)
+	A.Data = []float64{4, 2, 2, 2, 5, 2, 2, 2, 6}
 
-	// Simple positive definite matrix
-	A := [][]float64{
-		{4, 2, 2},
-		{2, 5, 2},
-		{2, 2, 6},
-	}
-
-	L, err := gp.choleskyDecomposition(A)
+	L, err := CholeskyFlat(A)
 	if err != nil {
-		t.Fatalf("choleskyDecomposition failed: %v", err)
+		t.Fatalf("CholeskyFlat failed: %v", err)
 	}
 
 	// Verify L * L^T = A
-	n := len(A)
-	for i := 0; i < n; i++ {
-		for j := 0; j < n; j++ {
+	for i := range 3 {
+		for j := range 3 {
 			sum := 0.0
-			for k := 0; k < n; k++ {
-				sum += L[i][k] * L[j][k]
+			for k := range 3 {
+				sum += L.At(i, k) * L.At(j, k)
 			}
-			if math.Abs(sum-A[i][j]) > 1e-10 {
-				t.Errorf("L*L^T[%d][%d] = %f, want %f", i, j, sum, A[i][j])
+			if math.Abs(sum-A.At(i, j)) > 1e-10 {
+				t.Errorf("L*L^T[%d][%d] = %f, want %f", i, j, sum, A.At(i, j))
 			}
 		}
 	}
 }
 
 func TestCholeskyDecomposition_NotPositiveDefinite(t *testing.T) {
-	gp := NewAgentGaussianProcess(nil)
-
 	// Not positive definite (negative eigenvalue)
-	A := [][]float64{
-		{1, 2},
-		{2, 1},
-	}
+	A := NewFlatMatrix(2, 2)
+	A.Data = []float64{1, 2, 2, 1}
 
-	_, err := gp.choleskyDecomposition(A)
+	_, err := CholeskyFlat(A)
 	if err == nil {
-		t.Error("choleskyDecomposition should fail for non-positive definite matrix")
+		t.Error("CholeskyFlat should fail for non-positive definite matrix")
 	}
 }
 
 func TestCholeskyDecomposition_Empty(t *testing.T) {
-	gp := NewAgentGaussianProcess(nil)
+	A := NewFlatMatrix(0, 0)
 
-	L, err := gp.choleskyDecomposition([][]float64{})
+	L, err := CholeskyFlat(A)
 	if err != nil {
 		t.Errorf("Empty matrix should not error: %v", err)
 	}
-	if L != nil {
-		t.Error("Empty matrix should return nil")
+	if L == nil {
+		t.Error("Empty matrix should return non-nil (identity-like)")
+	}
+	if L.Rows != 0 {
+		t.Errorf("L.Rows = %d, want 0", L.Rows)
 	}
 }
 
 func TestSolveTriangular(t *testing.T) {
-	gp := NewAgentGaussianProcess(nil)
-
-	// Lower triangular matrix
-	L := [][]float64{
-		{2, 0, 0},
-		{1, 3, 0},
-		{2, 1, 4},
-	}
+	// Lower triangular matrix (uses SolveTriangularFlat from gp_linalg.go)
+	L := NewFlatMatrix(3, 3)
+	L.Data = []float64{2, 0, 0, 1, 3, 0, 2, 1, 4}
 
 	b := []float64{4, 7, 14}
 
-	// Solve L * x = b
-	x := gp.solveTriangular(L, b, false)
+	// Solve L * x = b (lower=true means forward substitution)
+	x := make([]float64, 3)
+	SolveTriangularFlat(L, b, true, x)
 
 	// Verify L * x = b
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		sum := 0.0
 		for j := 0; j <= i; j++ {
-			sum += L[i][j] * x[j]
+			sum += L.At(i, j) * x[j]
 		}
 		if math.Abs(sum-b[i]) > 1e-10 {
 			t.Errorf("L*x[%d] = %f, want %f", i, sum, b[i])
@@ -929,25 +918,21 @@ func TestSolveTriangular(t *testing.T) {
 }
 
 func TestSolveTriangular_Transpose(t *testing.T) {
-	gp := NewAgentGaussianProcess(nil)
-
 	// Lower triangular matrix
-	L := [][]float64{
-		{2, 0, 0},
-		{1, 3, 0},
-		{2, 1, 4},
-	}
+	L := NewFlatMatrix(3, 3)
+	L.Data = []float64{2, 0, 0, 1, 3, 0, 2, 1, 4}
 
 	b := []float64{10, 10, 4}
 
-	// Solve L^T * x = b
-	x := gp.solveTriangular(L, b, true)
+	// Solve L^T * x = b (lower=false means back substitution)
+	x := make([]float64, 3)
+	SolveTriangularFlat(L, b, false, x)
 
 	// Verify L^T * x = b
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		sum := 0.0
 		for j := i; j < 3; j++ {
-			sum += L[j][i] * x[j]
+			sum += L.At(j, i) * x[j]
 		}
 		if math.Abs(sum-b[i]) > 1e-10 {
 			t.Errorf("L^T*x[%d] = %f, want %f", i, sum, b[i])

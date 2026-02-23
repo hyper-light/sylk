@@ -54,10 +54,12 @@ The Archivalist ONLY handles queries about the PAST. Prospective queries (about 
 ### Capabilities
 
 **Supported Intents**:
+- chat: General conversation and quick questions
 - help: Request assistance
 - status: Query system state
 
 **Supported Domains**:
+- general: Conversation and lightweight guidance
 - system: System status, health
 - agents: Agent registry, status
 

@@ -11,3 +11,11 @@ func (a *Architect) RefreshPlannerAuth() {
 	a.planner = nil
 	a.plannerMu.Unlock()
 }
+
+// PlannerAvailable reports whether the Anthropic planner is initialized.
+func (a *Architect) PlannerAvailable() bool {
+	if a == nil {
+		return false
+	}
+	return a.currentPlanner() != nil
+}

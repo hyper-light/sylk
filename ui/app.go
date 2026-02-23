@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math"
 	"net/url"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/credentials"
@@ -58,6 +61,7 @@ import (
 	"github.com/adalundhe/sylk/ui/modal"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/pane"
+	"github.com/adalundhe/sylk/ui/planview"
 	"github.com/adalundhe/sylk/ui/redact"
 	"github.com/adalundhe/sylk/ui/search"
 	sessionpkg "github.com/adalundhe/sylk/ui/session"
@@ -127,6 +131,8 @@ const escDisambiguateTimeout = 50 * time.Millisecond
 
 // sourceAgentTUI identifies the TUI as the source agent for guide routing.
 const sourceAgentTUI = "tui"
+
+const defaultGuideSessionID = "default"
 
 // guideAgent constants identify the guide activity stream in the agent panel.
 const (
@@ -260,7 +266,7 @@ type Deps struct {
 	StreamManager  *guide.StreamManager
 	Guide          *guide.Guide
 	Scope          *concurrency.GoroutineScope
-	AuthRefresh    func(ctx context.Context, provider string) error
+	AuthRefresh    func(ctx context.Context, provider, method string) error
 
 	// SignalStop restores default signal handling and cancels the parent
 	// context. Called after the Bubble Tea program exits so that a second
@@ -381,6 +387,9 @@ type AppModel struct {
 	// Conflict resolution view overlay (replaces commit tree when active).
 	conflictView       *conflictview.Model // Conflict view (nil when inactive).
 	conflictViewActive bool                // True while conflict view is displayed.
+
+	// Plan DAG viewer panel (visible when a plan is active).
+	planView *planview.Model
 
 	// Mouse drag tracking for inline editor selection.
 	editorMouseDown bool // Left button pressed inside the code panel.
@@ -516,9 +525,10 @@ type AppModel struct {
 	pendingSyntaxValidation bool
 
 	// Login flow: top-panel overlay component.
-	loginPanel          *login.Panel
-	oauthSessions       *oauthSessionManager
-	suppressLoginResult bool
+	loginPanel            *login.Panel
+	oauthSessions         *oauthSessionManager
+	pendingAnthropicOAuth *pendingAnthropicOAuthCode
+	suppressLoginResult   bool
 
 	// ESC disambiguation: buffer a standalone ESC for a short window so a
 	// follow-up rune can be merged into an Alt+rune KeyMsg. This mirrors
@@ -533,12 +543,41 @@ type AppModel struct {
 	guideContextUsage  float64
 	agentContextTokens map[string]int
 	streamUsage        map[string]streamUsageEntry
+	streamedResponses  map[string]streamedResponseState
+	activeRoute        activeRouteState
+	engagedAgentID     string // Sticky agent the user is conversing with.
+	manualTargetAgent  string
+
+	// Cumulative token counters for the status bar display.
+	totalPromptTokens     int
+	totalCompletionTokens int
+
+	// TUI-local WAL logger for suppressed/non-UI operational errors.
+	walLogger *slog.Logger
+	walCloser io.Closer
 }
 
 type streamUsageEntry struct {
-	AgentID string
-	Tokens  int
+	AgentID           string
+	Tokens            int // Estimated/real output tokens.
+	InputTokens       int // Real input tokens from the provider (context window occupancy).
+	StartedAt         time.Time
+	EarlyInputApplied bool // True if early input tokens were applied during streaming.
 }
+
+type streamedResponseState struct {
+	HadChunk  bool
+	Completed bool
+	Succeeded bool
+	SeenAt    time.Time
+}
+
+type activeRouteState struct {
+	CorrelationID string
+	AgentID       string
+}
+
+const streamedResponseStateTTL = 45 * time.Second
 
 // viewRing tracks a cycling list of panels for a swappable layout slot.
 // leftRing holds panels sharing a left column; rightRing holds panels sharing a right column.
@@ -696,11 +735,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		fieldManualOverlay: fieldmanual.New(th),
 		loginPanel: login.New(th,
 			func(provider string) string {
-				key, err := llm.ResolveAPIKey(provider)
-				if err != nil || !llm.ValidateKeyFormat(provider, key) {
-					return ""
-				}
-				return key
+				return resolveLoginPanelAPIKey(provider)
 			},
 			llm.ValidateKeyFormat,
 			nil, // clipboard — wired after construction (needs m.clipboard)
@@ -725,8 +760,11 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		viewMode:               ViewChat,
 		agentContextTokens:     make(map[string]int),
 		streamUsage:            make(map[string]streamUsageEntry),
+		streamedResponses:      make(map[string]streamedResponseState),
 		oauthSessions:          newOAuthSessionManager(),
 	}
+
+	app.walLogger, app.walCloser = newTUIWALLogger()
 
 	// Wire login panel clipboard now that m.clipboard is available.
 	app.loginPanel.SetClipboard(app.clipboard.Get)
@@ -740,6 +778,8 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	app.paneEditors = map[pane.PaneID]*editorPaneState{
 		1: {editor: editor.New(th)},
 	}
+
+	app.planView = planview.New(&th.Palette)
 
 	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
 	app.input = inputpkg.New(th, cfg.InputHistoryCapacity,
@@ -772,6 +812,14 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	}
 
 	return app
+}
+
+func newTUIWALLogger() (*slog.Logger, io.Closer) {
+	logger, closer, err := agentlog.NewWALLogger("tui")
+	if err != nil {
+		return nil, nil
+	}
+	return logger, closer
 }
 
 // Init starts all event bridges, the tick/blink timers, and background LSP provisioning.
@@ -1001,6 +1049,10 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleLSPFlush(typed)
 	case msg.FocusPanelMsg:
 		return m, m.handleFocusPanel(typed)
+	case msg.PlanUpdateMsg:
+		return m, m.handlePlanUpdate(typed)
+	case msg.PlanViewToggleMsg:
+		return m, m.handlePlanViewToggle()
 	case msg.OpenEditorMsg:
 		return m, m.handleOpenEditor(typed)
 	case msg.CloseEditorMsg:
@@ -1975,10 +2027,14 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleStreamStartTelemetry(typed)
 	case msg.StreamChunkMsg:
 		return m, m.handleStreamChunkTelemetry(typed)
+	case msg.StreamProgressMsg:
+		return m, m.handleStreamProgressTelemetry(typed)
 	case msg.StreamCompleteMsg:
 		return m, m.handleStreamCompleteTelemetry(typed)
 	case msg.StreamErrorMsg:
 		return m, m.handleStreamErrorTelemetry(typed)
+	case msg.StreamRerouteMsg:
+		return m, m.handleStreamReroute(typed)
 	case msg.GuideResponseMsg:
 		return m, m.handleGuideResponse(typed)
 	case modal.ModalClosedMsg:
@@ -2188,6 +2244,12 @@ func (m *AppModel) Shutdown() error {
 		if err := m.safetyGuard.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if m.walCloser != nil {
+		if err := m.walCloser.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		m.walCloser = nil
 	}
 	if err := m.deps.Scope.Shutdown(shutdownGrace, shutdownHard); err != nil {
 		errs = append(errs, err)
@@ -2512,12 +2574,17 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			cmd := m.diffView.Update(key)
 			return m, cmd
 		}
+		// Agent panel sub-views consume Esc to back out before double-tap interrupt.
+		if m.focus.Current() == component.FocusAgentPanel && m.agentPanel.InSubView() {
+			comp, cmd := m.agentPanel.Update(key)
+			m.agentPanel = comp.(*agentpkg.Model)
+			m.syncManualTargetFromAgentSelection()
+			return m, cmd
+		}
 		now := time.Now()
 		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
 			m.lastEscTime = time.Time{}
-			m.streamBridge.Stop()
-			m.statusBar.SetFlash("Agent interrupted")
-			return m, nil
+			return m, m.interruptActiveRoute("esc")
 		}
 		m.lastEscTime = now
 		m.statusBar.SetFlash("Press Esc again to interrupt agent")
@@ -2815,8 +2882,9 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
-	targetAgent := normalizeExplicitTargetAgent(submit.TargetAgent)
+	targetAgent := m.resolveSubmitTarget(submit.TargetAgent)
 	submit.TargetAgent = targetAgent
+	submit.SessionID = m.resolveRouteSessionID(submit.SessionID)
 
 	// Push a user entry to chat.
 	entry := &chat.ChatEntry{
@@ -2914,9 +2982,11 @@ func (m *AppModel) deactivateLogin() {
 
 func (m *AppModel) cancelLoginFlow() {
 	if m.oauthSessions == nil {
+		m.pendingAnthropicOAuth = nil
 		return
 	}
 	m.oauthSessions.CancelCurrent()
+	m.pendingAnthropicOAuth = nil
 }
 
 // handleLoginPanelResult processes results from the login panel.
@@ -2938,6 +3008,10 @@ func (m *AppModel) handleLoginPanelResult(result login.LoginResult) tea.Cmd {
 	case login.ActionOAuthStart:
 		// Keep panel visible in OAuth step for status updates.
 		return m.startOAuthFlow(result.Provider)
+
+	case login.ActionOAuthSubmit:
+		m.loginPanel.SetOAuthStatus("Completing OAuth authorization...")
+		return m.completeOAuthCodeFlow(result.Provider, result.OAuthCode)
 
 	case login.ActionCancelled:
 		m.suppressLoginResult = true
@@ -2965,14 +3039,50 @@ func (m *AppModel) startOAuthFlow(provider string) tea.Cmd {
 		return m.startGoogleOAuthCmd(provider, flowID)
 	case "openai":
 		return m.startOpenAIOAuthCmd(provider, flowID)
+	case "anthropic":
+		return m.startAnthropicOAuthCmd(provider, flowID)
 	default:
 		return nil
 	}
 }
 
+func (m *AppModel) completeOAuthCodeFlow(provider, code string) tea.Cmd {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider != "anthropic" {
+		m.loginPanel.SetError(fmt.Sprintf("OAuth code flow is not supported for %s", provider))
+		return nil
+	}
+	pending := m.pendingAnthropicOAuth
+	if pending == nil || pending.service == nil || pending.challenge == nil {
+		m.loginPanel.SetError("No active Anthropic OAuth flow. Start OAuth again.")
+		return nil
+	}
+	ctx := m.ctx
+	return func() tea.Msg {
+		auth, err := pending.service.CompleteAuthCode(ctx, pending.challenge, code)
+		if err == nil {
+			err = pending.service.Save(ctx, auth)
+		}
+		if err != nil {
+			return msg.LoginResultMsg{
+				Provider: provider,
+				Method:   "oauth",
+				FlowID:   pending.flowID,
+				Error:    err.Error(),
+			}
+		}
+		return msg.LoginResultMsg{
+			Provider: provider,
+			Method:   "oauth",
+			FlowID:   pending.flowID,
+			Success:  true,
+		}
+	}
+}
+
 func supportsOAuthProvider(provider string) bool {
 	switch provider {
-	case "google", "openai":
+	case "google", "openai", "anthropic":
 		return true
 	default:
 		return false
@@ -2985,16 +3095,28 @@ func supportsOAuthProvider(provider string) bool {
 const oauthTimeout = 10 * time.Minute
 
 type oauthSessionStartedMsg struct {
-	Provider string
-	FlowID   uint64
-	URL      string
-	UserCode string
-	Wait     tea.Cmd
-	Cancel   context.CancelFunc
+	Provider           string
+	FlowID             uint64
+	URL                string
+	UserCode           string
+	NeedsCode          bool
+	Instructions       string
+	AnthropicService   oauth.AnthropicAuthService
+	AnthropicChallenge *oauth.AnthropicOAuthChallenge
+	Wait               tea.Cmd
+	Cancel             context.CancelFunc
+}
+
+type pendingAnthropicOAuthCode struct {
+	flowID    uint64
+	service   oauth.AnthropicAuthService
+	challenge *oauth.AnthropicOAuthChallenge
+	cancel    context.CancelFunc
 }
 
 type authRefreshResultMsg struct {
 	Provider string
+	Method   string
 	Err      error
 }
 
@@ -3038,6 +3160,30 @@ func (m *AppModel) startOpenAIOAuthCmd(provider string, flowID uint64) tea.Cmd {
 	}
 }
 
+// startAnthropicOAuthCmd starts Anthropic OAuth and emits a session-started message.
+func (m *AppModel) startAnthropicOAuthCmd(provider string, flowID uint64) tea.Cmd {
+	ctx := m.ctx
+	return func() tea.Msg {
+		authSvc := oauth.NewAnthropicAuthService(oauth.AnthropicAuthServiceConfig{})
+		flowCtx, cancel := context.WithCancel(ctx)
+		challenge, err := authSvc.BeginAuth(flowCtx)
+		if err != nil {
+			cancel()
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: err.Error()}
+		}
+		return oauthSessionStartedMsg{
+			Provider:           provider,
+			FlowID:             flowID,
+			URL:                challenge.AuthURL,
+			NeedsCode:          true,
+			Instructions:       "Paste the authorization code shown in your browser.",
+			AnthropicService:   authSvc,
+			AnthropicChallenge: challenge,
+			Cancel:             cancel,
+		}
+	}
+}
+
 func waitGoogleOAuthResultCmd(
 	provider string,
 	flowID uint64,
@@ -3072,6 +3218,23 @@ func waitOpenAIOAuthResultCmd(
 	}
 }
 
+func waitAnthropicOAuthResultCmd(
+	provider string,
+	flowID uint64,
+	session *oauth.AnthropicOAuthSession,
+) tea.Cmd {
+	return func() tea.Msg {
+		result, ok := <-session.Results
+		if !ok {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: "oauth session ended unexpectedly"}
+		}
+		if result.Err != nil {
+			return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Error: result.Err.Error()}
+		}
+		return msg.LoginResultMsg{Provider: provider, Method: "oauth", FlowID: flowID, Success: true}
+	}
+}
+
 func (m *AppModel) handleOAuthSessionStarted(start oauthSessionStartedMsg) tea.Cmd {
 	if m.oauthSessions == nil {
 		m.oauthSessions = newOAuthSessionManager()
@@ -3083,6 +3246,28 @@ func (m *AppModel) handleOAuthSessionStarted(start oauthSessionStartedMsg) tea.C
 	if !m.oauthSessions.Attach(start.Provider, start.FlowID, start.Cancel) {
 		return nil
 	}
+	if start.NeedsCode && strings.EqualFold(start.Provider, "anthropic") {
+		if start.AnthropicService == nil || start.AnthropicChallenge == nil {
+			m.oauthSessions.Abort(start.Provider, start.FlowID, start.Cancel)
+			m.loginPanel.SetError("Anthropic OAuth could not be initialized")
+			return nil
+		}
+		m.pendingAnthropicOAuth = &pendingAnthropicOAuthCode{
+			flowID:    start.FlowID,
+			service:   start.AnthropicService,
+			challenge: start.AnthropicChallenge,
+			cancel:    start.Cancel,
+		}
+		m.loginPanel.SetOAuthCodeEntry(true, start.Instructions)
+		m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL, start.UserCode))
+		if err := openURL(start.URL); err != nil {
+			m.statusBar.SetFlash("Could not open browser automatically. Use the URL shown in the login panel.")
+		}
+		return nil
+	}
+
+	m.pendingAnthropicOAuth = nil
+	m.loginPanel.SetOAuthCodeEntry(false, "")
 	m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL, start.UserCode))
 	if err := openURL(start.URL); err != nil {
 		m.statusBar.SetFlash("Could not open browser automatically. Use the URL shown in the login panel.")
@@ -3103,8 +3288,21 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 		if m.oauthSessions == nil {
 			return nil
 		}
-		if !m.oauthSessions.Complete(result.Provider, result.FlowID) {
-			return nil
+		keepAnthropicPending := strings.EqualFold(result.Provider, "anthropic") &&
+			!result.Success &&
+			m.pendingAnthropicOAuth != nil &&
+			m.pendingAnthropicOAuth.flowID == result.FlowID
+		if !keepAnthropicPending {
+			if !m.oauthSessions.Complete(result.Provider, result.FlowID) {
+				return nil
+			}
+			if strings.EqualFold(result.Provider, "anthropic") {
+				if m.pendingAnthropicOAuth != nil && m.pendingAnthropicOAuth.cancel != nil {
+					m.pendingAnthropicOAuth.cancel()
+				}
+				m.pendingAnthropicOAuth = nil
+				m.loginPanel.SetOAuthCodeEntry(false, "")
+			}
 		}
 	}
 	if m.suppressLoginResult && !result.Success {
@@ -3120,7 +3318,7 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 		}
 		m.statusBar.SetFlash(fmt.Sprintf("Authenticated with %s via %s",
 			loginProviderLabel(result.Provider), loginMethodLabel(result.Method)))
-		return m.refreshAuthProviderCmd(result.Provider)
+		return m.refreshAuthProviderCmd(result.Provider, result.Method)
 	}
 
 	// Failure: keep the panel open and show the error inline so the
@@ -3133,13 +3331,17 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 	return nil
 }
 
-func (m *AppModel) refreshAuthProviderCmd(provider string) tea.Cmd {
+func (m *AppModel) refreshAuthProviderCmd(provider, method string) tea.Cmd {
 	if m.deps.AuthRefresh == nil {
 		return nil
 	}
 	ctx := m.ctx
 	return func() tea.Msg {
-		return authRefreshResultMsg{Provider: provider, Err: m.deps.AuthRefresh(ctx, provider)}
+		return authRefreshResultMsg{
+			Provider: provider,
+			Method:   method,
+			Err:      m.deps.AuthRefresh(ctx, provider, method),
+		}
 	}
 }
 
@@ -3148,8 +3350,9 @@ func (m *AppModel) handleAuthRefreshResult(result authRefreshResultMsg) tea.Cmd 
 		return nil
 	}
 	m.statusBar.SetFlash(fmt.Sprintf(
-		"Authenticated with %s, but runtime refresh failed: %s",
+		"Authenticated with %s via %s, but runtime refresh failed: %s",
 		loginProviderLabel(result.Provider),
+		loginMethodLabel(result.Method),
 		redactSecrets(result.Err.Error()),
 	))
 	return nil
@@ -3197,6 +3400,50 @@ func saveAPIKeySecure(ctx context.Context, provider, key string) error {
 		return err
 	}
 	return removeLegacyAPIKeyEntry(provider)
+}
+
+func resolveLoginPanelAPIKey(provider string) string {
+	return resolveLoginPanelAPIKeyWithResolvers(
+		provider,
+		resolveSecureProviderAPIKey,
+		llm.ResolveAPIKey,
+	)
+}
+
+func resolveLoginPanelAPIKeyWithResolvers(
+	provider string,
+	secureResolver func(string) (string, error),
+	legacyResolver func(string) (string, error),
+) string {
+	normalized := strings.ToLower(strings.TrimSpace(provider))
+	if normalized == "" {
+		return ""
+	}
+	if secureResolver != nil {
+		if key, err := secureResolver(normalized); err == nil && llm.ValidateKeyFormat(normalized, key) {
+			return key
+		}
+	}
+	if legacyResolver == nil {
+		return ""
+	}
+	key, err := legacyResolver(normalized)
+	if err != nil || !llm.ValidateKeyFormat(normalized, key) {
+		return ""
+	}
+	return key
+}
+
+func resolveSecureProviderAPIKey(provider string) (string, error) {
+	dirs, err := storage.ResolveDirs()
+	if err != nil {
+		return "", err
+	}
+	manager, err := credentials.NewManager(dirs, "default")
+	if err != nil {
+		return "", err
+	}
+	return manager.GetAPIKey(provider)
 }
 
 func removeLegacyAPIKeyEntry(provider string) error {
@@ -3267,6 +3514,34 @@ func normalizeExplicitTargetAgent(raw string) string {
 	return target
 }
 
+func (m *AppModel) resolveSubmitTarget(explicit string) string {
+	target := normalizeExplicitTargetAgent(explicit)
+	if target != "" {
+		m.manualTargetAgent = target
+		// Explicit @agent overrides existing engagement.
+		if normalizeAgentID(target) != m.engagedAgentID {
+			m.clearEngagedAgent()
+		}
+		return target
+	}
+	target = normalizeExplicitTargetAgent(m.manualTargetAgent)
+	if target != "" {
+		return target
+	}
+	return ""
+}
+
+func (m *AppModel) syncManualTargetFromAgentSelection() {
+	if m == nil || m.agentPanel == nil {
+		return
+	}
+	selected := normalizeExplicitTargetAgent(m.agentPanel.SelectedAgentID())
+	if selected == "" {
+		return
+	}
+	m.manualTargetAgent = selected
+}
+
 func isSimpleTargetToken(token string) bool {
 	for _, r := range token {
 		switch {
@@ -3295,10 +3570,206 @@ func thinkingAgentType(target string) string {
 }
 
 func (m *AppModel) handleInterrupt() tea.Cmd {
-	// First Ctrl+C: clear input or cancel active stream.
-	m.streamBridge.Stop()
+	cmd := m.interruptActiveRoute("ctrl+c")
+	if cmd != nil {
+		return cmd
+	}
 	m.statusBar.SetFlash("Press Ctrl+C again to quit")
 	return nil
+}
+
+func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
+	correlationID, agentID := m.resolveInterruptTarget()
+	if correlationID == "" {
+		return nil
+	}
+
+	m.chat.MuteThinking("")
+	m.pushInterruptedChatMessage(agentID)
+	m.finalizeStreamUsage(correlationID, false, "interrupted")
+	m.clearActiveRoute(correlationID)
+	if m.statusBar != nil {
+		m.statusBar.SetTokenPhase(status.PhaseIdle)
+	}
+	m.statusBar.SetFlash("Agent interrupted")
+
+	if m.deps.GuideBus == nil {
+		return nil
+	}
+
+	interruptReq := &guide.UserInterruptRequest{
+		CorrelationID: correlationID,
+		SourceAgentID: sourceAgentTUI,
+		Reason:        strings.TrimSpace(reason),
+		Timestamp:     time.Now(),
+	}
+	busMsg := guide.NewUserInterruptMessage("", interruptReq)
+	return func() tea.Msg {
+		if err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg); err != nil {
+			return msg.StreamErrorMsg{
+				SessionID:     m.resolveRouteSessionID(""),
+				CorrelationID: correlationID,
+				Err:           err,
+			}
+		}
+		return nil
+	}
+}
+
+func (m *AppModel) pushInterruptedChatMessage(agentID string) {
+	content := fmt.Sprintf("%s interrupted. What would you like to do next?", interruptAgentDisplayName(agentID))
+	entry := &chat.ChatEntry{
+		ID:        uuid.New().String(),
+		Timestamp: time.Now(),
+		Source:    chat.SourceSystem,
+		AgentType: "system",
+		AgentID:   normalizeAgentID(agentID),
+		Content:   content,
+		Height:    -1,
+	}
+	m.chat.FinishThinking(entry)
+}
+
+func interruptAgentDisplayName(agentID string) string {
+	names := map[string]string{
+		"guide":       "Guide",
+		"architect":   "Architect",
+		"librarian":   "Librarian",
+		"archivalist": "Archivalist",
+		"academic":    "Academic",
+	}
+	key := strings.ToLower(strings.TrimSpace(agentID))
+	if name, ok := names[key]; ok {
+		return name
+	}
+	trimmed := strings.TrimSpace(agentID)
+	if trimmed == "" {
+		return "Agent"
+	}
+	return strings.ToUpper(trimmed[:1]) + trimmed[1:]
+}
+
+func (m *AppModel) setActiveRoute(correlationID, agentID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	if current := strings.TrimSpace(m.activeRoute.CorrelationID); current != "" && current != correlationID {
+		return
+	}
+	m.activeRoute.CorrelationID = correlationID
+	if strings.TrimSpace(agentID) != "" {
+		m.activeRoute.AgentID = normalizeAgentID(agentID)
+	}
+}
+
+func (m *AppModel) beginActiveRoute(correlationID, agentID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	m.activeRoute.CorrelationID = correlationID
+	m.activeRoute.AgentID = normalizeAgentID(agentID)
+}
+
+func (m *AppModel) shouldRenderStreamEvent(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	active := strings.TrimSpace(m.activeRoute.CorrelationID)
+	if active == "" {
+		return true
+	}
+	return active == correlationID
+}
+
+func (m *AppModel) clearActiveRoute(correlationID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	if strings.TrimSpace(m.activeRoute.CorrelationID) != correlationID {
+		return
+	}
+	m.activeRoute = activeRouteState{}
+}
+
+// setEngagedAgent updates the sticky engaged agent for conversation continuity.
+// Non-guide agents are tracked; "guide" is ignored since the Guide is a router.
+func (m *AppModel) setEngagedAgent(agentID string) {
+	normalized := normalizeAgentID(agentID)
+	if normalized == "" || normalized == "guide" {
+		return
+	}
+	m.engagedAgentID = normalized
+	if m.agentPanel != nil {
+		m.agentPanel.SetEngagedAgent(normalized)
+	}
+	if m.statusBar != nil {
+		m.statusBar.SetEngagedAgent(normalized)
+	}
+}
+
+// clearEngagedAgent removes engagement tracking, forcing full classification.
+func (m *AppModel) clearEngagedAgent() {
+	m.engagedAgentID = ""
+	if m.agentPanel != nil {
+		m.agentPanel.ClearEngagedAgent()
+	}
+	if m.statusBar != nil {
+		m.statusBar.SetEngagedAgent("")
+	}
+}
+
+// handleStreamReroute processes a reroute notification from the Guide.
+func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
+	m.clearEngagedAgent()
+	if reroute.ToAgentID != "" {
+		m.setEngagedAgent(reroute.ToAgentID)
+	}
+	if reroute.FromAgentID != "" && reroute.Reason != "" {
+		m.statusBar.SetFlash(reroute.FromAgentID + " -> " + reroute.ToAgentID)
+	}
+	return nil
+}
+
+func (m *AppModel) resolveInterruptTarget() (string, string) {
+	if strings.TrimSpace(m.activeRoute.CorrelationID) != "" {
+		return m.activeRoute.CorrelationID, m.activeRoute.AgentID
+	}
+	return m.latestStreamUsage()
+}
+
+func (m *AppModel) resolveRouteSessionID(candidate string) string {
+	if sessionID := strings.TrimSpace(candidate); sessionID != "" {
+		return sessionID
+	}
+	if m != nil && m.deps.SessionManager != nil {
+		if active, ok := m.deps.SessionManager.GetActive(); ok && active != nil {
+			if sessionID := strings.TrimSpace(active.ID()); sessionID != "" {
+				return sessionID
+			}
+		}
+	}
+	return defaultGuideSessionID
+}
+
+func (m *AppModel) latestStreamUsage() (string, string) {
+	if len(m.streamUsage) == 0 {
+		return "", ""
+	}
+	correlationID := ""
+	agentID := ""
+	var latest time.Time
+	for cid, usage := range m.streamUsage {
+		if correlationID == "" || usage.StartedAt.After(latest) {
+			correlationID = cid
+			agentID = usage.AgentID
+			latest = usage.StartedAt
+		}
+	}
+	return correlationID, agentID
 }
 
 func (m *AppModel) handleQuit() tea.Cmd {
@@ -3415,6 +3886,13 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 		changed = true
 	}
 
+	// Plan viewer spinner animation.
+	if m.planView != nil && m.planView.NeedsDecorTick() {
+		m.planView.MarkViewDirty()
+		m.comp.MarkDirty(compositor.SlotRight)
+		changed = true
+	}
+
 	if changed {
 		m.viewDirty = true
 	}
@@ -3426,6 +3904,24 @@ func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
 	m.focus.SetFocus(fp.Target)
 	m.syncFocusState()
 	return nil
+}
+
+func (m *AppModel) handlePlanUpdate(update msg.PlanUpdateMsg) tea.Cmd {
+	m.chat.HandlePlanUpdate(update)
+	m.comp.MarkDirty(compositor.SlotCenter)
+	m.viewDirty = true
+	return nil
+}
+
+func (m *AppModel) handlePlanViewToggle() tea.Cmd {
+	if m.planView == nil {
+		return nil
+	}
+	comp, cmd := m.planView.Update(msg.PlanViewToggleMsg{})
+	m.planView = comp.(*planview.Model)
+	m.comp.MarkDirty(compositor.SlotRight)
+	m.viewDirty = true
+	return cmd
 }
 
 func (m *AppModel) handleOpenEditor(o msg.OpenEditorMsg) tea.Cmd {
@@ -4352,18 +4848,57 @@ func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
 }
 
 func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd {
+	m.recordStreamStart(start.CorrelationID)
 	m.trackStreamStart(start.CorrelationID, start.AgentID)
+	m.setActiveRoute(start.CorrelationID, start.AgentID)
+	newAgent := normalizeAgentID(start.AgentID)
+	if m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
+		m.statusBar.SetFlash(m.engagedAgentID + " -> " + newAgent)
+	}
+	m.setEngagedAgent(start.AgentID)
+	if !m.shouldRenderStreamEvent(start.CorrelationID) {
+		return nil
+	}
+	m.publishStreamStartActivity(start.AgentID)
+	m.statusBar.SetTokenPhase(status.PhaseOutput)
 	return m.propagate(start)
 }
 
 func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd {
 	chunk.Text = redactSecrets(chunk.Text)
+	m.recordStreamChunk(chunk.CorrelationID, chunk.Text)
 	m.trackStreamChunk(chunk.CorrelationID, chunk.Text)
+	if chunk.InputTokens > 0 {
+		m.applyEarlyInputTokens(chunk.CorrelationID, chunk.InputTokens)
+	}
+	if !m.shouldRenderStreamEvent(chunk.CorrelationID) {
+		return nil
+	}
+	if strings.TrimSpace(chunk.Text) == "" {
+		return nil // Usage-only chunk; status bar updated, no chat content to render.
+	}
 	return m.propagate(chunk)
 }
 
+func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg) tea.Cmd {
+	m.setActiveRoute(progress.CorrelationID, progress.AgentID)
+	progress.Message = redactSecrets(progress.Message)
+	if !m.shouldRenderStreamEvent(progress.CorrelationID) {
+		return nil
+	}
+	return m.propagate(progress)
+}
+
 func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
+	m.recordStreamComplete(done.CorrelationID)
+	shouldRender := m.shouldRenderStreamEvent(done.CorrelationID)
+	m.applyRealStreamUsage(done.CorrelationID, done.InputTokens, done.OutputTokens)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
+	m.clearActiveRoute(done.CorrelationID)
+	if !shouldRender {
+		m.statusBar.StopSpinner()
+		return nil
+	}
 	return m.propagate(done)
 }
 
@@ -4373,7 +4908,14 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 	if streamErr.Err != nil {
 		summary = streamErr.Err.Error()
 	}
+	if m.shouldSuppressErrorAfterSuccess(streamErr.CorrelationID) {
+		m.logSuppressedLLMError("stream", streamErr.CorrelationID, m.streamAgentID(streamErr.CorrelationID), streamErr.Err, "success_already_returned")
+		m.discardStreamUsage(streamErr.CorrelationID)
+		return nil
+	}
+	m.clearRecordedStream(streamErr.CorrelationID)
 	m.finalizeStreamUsage(streamErr.CorrelationID, false, summary)
+	m.clearActiveRoute(streamErr.CorrelationID)
 	return m.propagate(streamErr)
 }
 
@@ -4382,7 +4924,8 @@ func (m *AppModel) trackStreamStart(correlationID, agentID string) {
 		return
 	}
 	m.streamUsage[correlationID] = streamUsageEntry{
-		AgentID: normalizeAgentID(agentID),
+		AgentID:   normalizeAgentID(agentID),
+		StartedAt: time.Now(),
 	}
 }
 
@@ -4394,8 +4937,143 @@ func (m *AppModel) trackStreamChunk(correlationID, text string) {
 	if !ok {
 		return
 	}
-	state.Tokens += estimateGuideTokens(text)
+	added := estimateGuideTokens(text)
+	state.Tokens += added
 	m.streamUsage[correlationID] = state
+	m.totalCompletionTokens += added
+	if m.statusBar != nil {
+		m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+	}
+}
+
+func (m *AppModel) recordStreamStart(correlationID string) {
+	if correlationID == "" {
+		return
+	}
+	m.ensureStreamedResponseState()
+	m.pruneRecordedStreams(time.Now())
+	m.streamedResponses[correlationID] = streamedResponseState{
+		HadChunk:  false,
+		Completed: false,
+		Succeeded: false,
+		SeenAt:    time.Now(),
+	}
+}
+
+func (m *AppModel) recordStreamChunk(correlationID, text string) {
+	if correlationID == "" || strings.TrimSpace(text) == "" {
+		return
+	}
+	m.ensureStreamedResponseState()
+	state := m.streamedResponses[correlationID]
+	state.HadChunk = true
+	state.SeenAt = time.Now()
+	m.streamedResponses[correlationID] = state
+}
+
+func (m *AppModel) recordStreamComplete(correlationID string) {
+	if correlationID == "" {
+		return
+	}
+	m.ensureStreamedResponseState()
+	state := m.streamedResponses[correlationID]
+	state.Completed = true
+	state.SeenAt = time.Now()
+	m.streamedResponses[correlationID] = state
+	m.pruneRecordedStreams(time.Now())
+}
+
+func (m *AppModel) markSuccessfulRouteResponse(correlationID string) {
+	if correlationID == "" {
+		return
+	}
+	m.ensureStreamedResponseState()
+	state := m.streamedResponses[correlationID]
+	state.Succeeded = true
+	state.SeenAt = time.Now()
+	m.streamedResponses[correlationID] = state
+}
+
+func (m *AppModel) shouldSuppressErrorAfterSuccess(correlationID string) bool {
+	if correlationID == "" || m.streamedResponses == nil {
+		return false
+	}
+	state, ok := m.streamedResponses[correlationID]
+	if !ok {
+		return false
+	}
+	return state.Succeeded
+}
+
+func (m *AppModel) streamAgentID(correlationID string) string {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return guideAgentID
+	}
+	if usage, ok := m.streamUsage[correlationID]; ok {
+		return normalizeAgentID(usage.AgentID)
+	}
+	if strings.TrimSpace(m.activeRoute.CorrelationID) == correlationID {
+		return normalizeAgentID(m.activeRoute.AgentID)
+	}
+	return guideAgentID
+}
+
+func (m *AppModel) logSuppressedLLMError(kind, correlationID, agentID string, err error, reason string) {
+	if m == nil || m.walLogger == nil || err == nil {
+		return
+	}
+	m.walLogger.Warn(
+		"ui llm error suppressed",
+		"kind", strings.TrimSpace(kind),
+		"correlation_id", strings.TrimSpace(correlationID),
+		"agent_id", normalizeAgentID(agentID),
+		"reason", strings.TrimSpace(reason),
+		"error", err.Error(),
+	)
+}
+
+func (m *AppModel) clearRecordedStream(correlationID string) {
+	if correlationID == "" || m.streamedResponses == nil {
+		return
+	}
+	delete(m.streamedResponses, correlationID)
+}
+
+func (m *AppModel) shouldSuppressStreamedRouteResponse(correlationID string, hasErr bool) bool {
+	if correlationID == "" || hasErr || m.streamedResponses == nil {
+		return false
+	}
+	state, ok := m.streamedResponses[correlationID]
+	if !ok {
+		return false
+	}
+	if state.Succeeded {
+		state.SeenAt = time.Now()
+		m.streamedResponses[correlationID] = state
+		return state.HadChunk
+	}
+	delete(m.streamedResponses, correlationID)
+	return state.HadChunk
+}
+
+func (m *AppModel) ensureStreamedResponseState() {
+	if m.streamedResponses != nil {
+		return
+	}
+	m.streamedResponses = make(map[string]streamedResponseState)
+}
+
+func (m *AppModel) pruneRecordedStreams(now time.Time) {
+	if m.streamedResponses == nil {
+		return
+	}
+	for correlationID, state := range m.streamedResponses {
+		if now.Sub(state.SeenAt) <= streamedResponseStateTTL {
+			continue
+		}
+		delete(m.streamedResponses, correlationID)
+	}
 }
 
 func (m *AppModel) finalizeStreamUsage(correlationID string, success bool, summary string) {
@@ -4408,8 +5086,79 @@ func (m *AppModel) finalizeStreamUsage(correlationID string, success bool, summa
 	}
 	delete(m.streamUsage, correlationID)
 
-	contextUsage := m.bumpAgentContextUsage(state.AgentID, state.Tokens+guideResponseOverheadTokens)
+	// Input tokens represent the full conversation context sent to the agent,
+	// i.e. the actual context window occupancy. Use them directly when available
+	// (no decay — each call sends the full history). Fall back to output-based
+	// estimation when real input tokens are unavailable.
+	var contextUsage float64
+	if state.InputTokens > 0 {
+		contextUsage = m.setAgentContextUsage(state.AgentID, state.InputTokens)
+	} else {
+		contextUsage = m.bumpAgentContextUsage(state.AgentID, state.Tokens+guideResponseOverheadTokens)
+	}
 	m.publishStreamActivity(state.AgentID, success, summary, contextUsage)
+
+	if m.statusBar != nil && len(m.streamUsage) == 0 {
+		m.statusBar.SetTokenPhase(status.PhaseIdle)
+	}
+}
+
+func (m *AppModel) discardStreamUsage(correlationID string) {
+	if correlationID == "" {
+		return
+	}
+	delete(m.streamUsage, correlationID)
+	if m.statusBar != nil && len(m.streamUsage) == 0 {
+		m.statusBar.SetTokenPhase(status.PhaseIdle)
+	}
+}
+
+// applyEarlyInputTokens applies real input tokens as soon as the provider
+// reports them (at stream start), avoiding the need to wait for completion.
+func (m *AppModel) applyEarlyInputTokens(correlationID string, inputTokens int) {
+	if inputTokens <= 0 {
+		return
+	}
+	state, ok := m.streamUsage[correlationID]
+	if !ok || state.EarlyInputApplied {
+		return
+	}
+	state.EarlyInputApplied = true
+	state.InputTokens = inputTokens
+	m.streamUsage[correlationID] = state
+	m.totalPromptTokens += inputTokens
+	if m.statusBar != nil {
+		m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+	}
+}
+
+// applyRealStreamUsage corrects the accumulated token estimate with real
+// provider-reported values when available. Called before finalizeStreamUsage
+// so the corrected values are used for context usage computation.
+func (m *AppModel) applyRealStreamUsage(correlationID string, inputTokens, outputTokens int) {
+	if inputTokens == 0 && outputTokens == 0 {
+		return
+	}
+	state, ok := m.streamUsage[correlationID]
+	if !ok {
+		return
+	}
+	if outputTokens > 0 {
+		m.totalCompletionTokens -= state.Tokens
+		m.totalCompletionTokens += outputTokens
+		state.Tokens = outputTokens
+		m.streamUsage[correlationID] = state
+	}
+	if inputTokens > 0 {
+		state.InputTokens = inputTokens
+		m.streamUsage[correlationID] = state
+		if !state.EarlyInputApplied {
+			m.totalPromptTokens += inputTokens
+		}
+	}
+	if m.statusBar != nil {
+		m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+	}
 }
 
 func normalizeAgentID(raw string) string {
@@ -4455,21 +5204,60 @@ func (m *AppModel) publishStreamActivity(agentID string, success bool, summary s
 	})
 }
 
+func (m *AppModel) publishStreamStartActivity(agentID string) {
+	if m.deps.ActivityBus == nil {
+		return
+	}
+	id, name, agentType := resolveAgentIdentity(agentID, "")
+	m.deps.ActivityBus.Publish(&events.ActivityEvent{
+		ID:        uuid.New().String(),
+		EventType: events.EventTypeLLMRequest,
+		Timestamp: time.Now(),
+		AgentID:   id,
+		Content:   "Streaming response started",
+		Outcome:   events.OutcomePending,
+		Data: map[string]any{
+			"agent_type": agentType,
+			"agent_name": name,
+		},
+	})
+}
+
 func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
+	if r.Err == nil {
+		m.markSuccessfulRouteResponse(r.CorrelationID)
+	}
+	if r.Err != nil && m.shouldSuppressErrorAfterSuccess(r.CorrelationID) {
+		m.logSuppressedLLMError("route", r.CorrelationID, r.AgentID, r.Err, "success_already_returned")
+		m.clearRecordedStream(r.CorrelationID)
+		m.discardStreamUsage(r.CorrelationID)
+		m.statusBar.StopSpinner()
+		return nil
+	}
+	if m.shouldSuppressStreamedRouteResponse(r.CorrelationID, r.Err != nil) {
+		m.clearActiveRoute(r.CorrelationID)
+		m.discardStreamUsage(r.CorrelationID)
+		m.statusBar.StopSpinner()
+		return nil
+	}
 	source := chat.SourceAgent
 	content := redactSecrets(r.Content)
 	if r.Err != nil {
 		source = chat.SourceError
 		content = redactSecrets(r.Err.Error())
 	}
-	added := estimateGuideTokens(content) + guideResponseOverheadTokens
-	contextUsage := m.bumpAgentContextUsage(r.AgentID, added)
+	m.clearActiveRoute(r.CorrelationID)
+	added := estimateGuideTokens(content)
+	contextUsage := m.bumpAgentContextUsage(r.AgentID, added+guideResponseOverheadTokens)
+	m.totalCompletionTokens += added
+	m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+	m.statusBar.SetTokenPhase(status.PhaseIdle)
 	m.publishResponseActivity(r, source, content, contextUsage)
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Source:    source,
-		AgentType: r.AgentName,
+		AgentType: r.AgentID,
 		AgentID:   r.AgentID,
 		Content:   content,
 		Height:    -1,
@@ -4990,6 +5778,7 @@ func (m *AppModel) dispatchChordCycle(chord chordState, delta int) tea.Cmd {
 		} else {
 			m.agentPanel.CycleNext()
 		}
+		m.syncManualTargetFromAgentSelection()
 	case chordView:
 		return m.cycleViewSlot(delta)
 	}
@@ -5886,10 +6675,10 @@ func (m *AppModel) fetchDiffDataCmd(hashes []string, mode diffview.CompareMode) 
 		var wg sync.WaitGroup
 		wg.Add(len(fromTo))
 		for i, ft := range fromTo {
-			go func() {
+			go func(idx int, pair [2]string) {
 				defer wg.Done()
-				pairs[i] = fetchOneDiffPair(bus, ft)
-			}()
+				pairs[idx] = fetchOneDiffPair(bus, pair)
+			}(i, ft)
 		}
 		wg.Wait()
 		// Override short labels with branch names when available.
@@ -6061,10 +6850,10 @@ func (m *AppModel) fetchMergeDiffDataCmd(hashes, labels []string) tea.Cmd {
 		var wg sync.WaitGroup
 		wg.Add(len(fromTo))
 		for i, ft := range fromTo {
-			go func() {
+			go func(idx int, pair [2]string) {
 				defer wg.Done()
-				pairs[i] = fetchOneDiffPair(bus, ft)
-			}()
+				pairs[idx] = fetchOneDiffPair(bus, pair)
+			}(i, ft)
 		}
 		wg.Wait()
 		for i := range pairs {
@@ -8684,6 +9473,21 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Route wheel events to input when focused and scrollable.
+	if m.focus.Current() == component.FocusInput && m.input.CanScroll() {
+		inputTop := m.height - m.prevInputH - statusBarHeight
+		if mouse.Y >= inputTop && mouse.Y < inputTop+m.prevInputH {
+			switch mouse.Button {
+			case tea.MouseButtonWheelUp:
+				m.input.ScrollUp()
+				return nil
+			case tea.MouseButtonWheelDown:
+				m.input.ScrollDown()
+				return nil
+			}
+		}
+	}
+
 	switch mouse.Button {
 	case tea.MouseButtonWheelUp:
 		if mouse.Alt {
@@ -10543,10 +11347,10 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 
 	switch focused {
 	case component.FocusInput:
-		prevLines := m.input.LineCount()
+		prevVisual := m.input.VisualLineCount()
 		comp, cmd := m.input.Update(key)
 		m.input = comp.(*inputpkg.Model)
-		if m.input.LineCount() != prevLines {
+		if m.input.VisualLineCount() != prevVisual {
 			m.recalcLayout()
 		}
 		return cmd
@@ -10561,6 +11365,7 @@ func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
 	case component.FocusAgentPanel:
 		comp, cmd := m.agentPanel.Update(key)
 		m.agentPanel = comp.(*agentpkg.Model)
+		m.syncManualTargetFromAgentSelection()
 		return cmd
 	case component.FocusCodeViewer:
 		// Non-edit mode: route to read-only code viewer.
@@ -10703,9 +11508,9 @@ const inputBorderSize = 2
 // inputMinContentLines is the minimum visible content lines in the input.
 const inputMinContentLines = 1
 
-// inputMaxContentLines is the maximum visible content lines before the input scrolls.
-// Derived from: user requirement of 3 visible lines.
-const inputMaxContentLines = 3
+// mainMinContentHeight is the minimum usable height for the main area.
+// Derived from: border (2) + minimum 3 content rows for context.
+const mainMinContentHeight = panelBorderSize + 3
 
 // panelBorderSize is the space consumed by a rounded border on each axis.
 // Derived from: 1 char per side × 2 sides = 2.
@@ -10715,11 +11520,27 @@ const panelBorderSize = 2
 // Derived from: 2 headers (1 line each) + 1 divider (1 line + 1 top padding) = 4.
 const leftPanelOverhead = 4
 
+// inputMaxVisualLines computes the dynamic maximum content lines for the input.
+// Derived from: total height - status bar - main area minimum - input border.
+func (m *AppModel) inputMaxVisualLines() int {
+	available := m.height - statusBarHeight - mainMinContentHeight - inputBorderSize
+	return max(available, inputMinContentLines)
+}
+
 // inputHeight returns the current rendered height of the input area
-// based on its content line count, clamped to [min, max] + border.
+// based on its visual line count, clamped to [min, dynamic max] + border.
+// The result is further constrained to ensure the main area retains
+// at least 1 row — the input grows upward, never beyond available space.
 func (m *AppModel) inputHeight() int {
-	lines := clampInt(m.input.LineCount(), inputMinContentLines, inputMaxContentLines)
-	return lines + inputBorderSize
+	visualLines := m.input.VisualLineCount()
+	maxLines := m.inputMaxVisualLines()
+	lines := clampInt(visualLines, inputMinContentLines, maxLines)
+	h := lines + inputBorderSize
+	maxH := m.height - statusBarHeight - 1
+	if maxH < inputMinContentLines+inputBorderSize {
+		return inputMinContentLines + inputBorderSize
+	}
+	return min(h, maxH)
 }
 
 func (m *AppModel) recalcLayout() {
@@ -10727,6 +11548,9 @@ func (m *AppModel) recalcLayout() {
 	inputH := m.inputHeight()
 	mainHeight := m.height - inputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
+
+	// Capture old chat viewport height before layout changes.
+	oldChatViewH := m.chat.ViewportHeight()
 
 	m.layout.SetSize(m.width, mainHeight)
 
@@ -10736,7 +11560,15 @@ func (m *AppModel) recalcLayout() {
 
 	// Center panel: chat. Subtract border so content fits inside renderPanel().
 	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
-	m.chat.SetSize(max(chatW-panelBorderSize, 1), max(chatH-panelBorderSize, 1))
+	newChatViewH := max(chatH-panelBorderSize, 1)
+
+	// Compensate viewport for input-induced height changes so the top
+	// of the chat stays stable (bottom line is dropped, not the top).
+	if inputH != m.prevInputH && oldChatViewH > 0 {
+		m.chat.CompensateInputGrowth(oldChatViewH, newChatViewH)
+	}
+
+	m.chat.SetSize(max(chatW-panelBorderSize, 1), newChatViewH)
 
 	// Left panel: split between session (top) and agent (bottom).
 	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
@@ -10790,6 +11622,71 @@ func (m *AppModel) recalcLayout() {
 	// Compositor: rebuild frame structure (full invalidation).
 	m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
 	m.prevInputH = inputH
+}
+
+// handleInputGrowth performs a targeted layout update when the input panel
+// grows (user added lines). Only the chat slot and input are re-rendered;
+// side panels keep their cached output truncated to the new main-area
+// height with the bottom border preserved. This limits the terminal diff
+// to ~4-5 boundary rows instead of a full-screen redraw.
+func (m *AppModel) handleInputGrowth(newInputH int) {
+	mainHeight := m.height - newInputH - statusBarHeight
+	mainHeight = max(mainHeight, 1)
+
+	// Capture old chat viewport height.
+	oldChatViewH := m.chat.ViewportHeight()
+
+	// Update layout to get correct chat panel dimensions.
+	m.layout.SetSize(m.width, mainHeight)
+
+	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
+	newChatViewH := max(chatH-panelBorderSize, 1)
+
+	// Compensate viewport: keep top line stable, drop bottom.
+	if oldChatViewH > 0 {
+		m.chat.CompensateInputGrowth(oldChatViewH, newChatViewH)
+	}
+	m.chat.SetSize(max(chatW-panelBorderSize, 1), newChatViewH)
+
+	// Resize input to new height.
+	m.input.SetSize(m.width, newInputH)
+
+	// NOTE: left/right/filetree/session/agent panels are deliberately NOT
+	// resized. Their cached compositor output is truncated below, keeping
+	// their rendered content byte-identical for all rows except the border.
+
+	// Determine which compositor slot contains the chat panel.
+	chatSlot := m.chatCompositorSlot()
+
+	// Targeted compositor update — only chat slot + input dirty.
+	m.comp.AdjustInputSection(mainHeight, newInputH, chatSlot)
+
+	// Truncate every main-area side-panel slot EXCEPT the chat slot.
+	for _, slot := range []compositor.SlotID{
+		compositor.SlotLeft,
+		compositor.SlotCenterLeft,
+		compositor.SlotCenter,
+		compositor.SlotRight,
+	} {
+		if slot != chatSlot {
+			m.comp.TruncateSlot(slot, mainHeight)
+		}
+	}
+
+	m.prevInputH = newInputH
+}
+
+// chatCompositorSlot returns the compositor slot that holds the chat panel
+// in the current layout mode.
+func (m *AppModel) chatCompositorSlot() compositor.SlotID {
+	switch m.layout.Mode() {
+	case layout.TwoColumn:
+		return compositor.SlotRight
+	case layout.SingleColumn:
+		return compositor.SlotLeft
+	default:
+		return compositor.SlotCenter
+	}
 }
 
 // resizeCodePanelForPreview computes sizes for all panes within the code
@@ -11242,13 +12139,17 @@ func (m *AppModel) detectDirtySlots() {
 		return
 	}
 
-	// Input height change: requires full recomposition.
-	inputH := m.inputHeight()
-	if inputH != m.prevInputH {
-		mainHeight := m.height - inputH - statusBarHeight
-		mainHeight = max(mainHeight, 1)
-		m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
-		m.prevInputH = inputH
+	// Input height change: when the input GROWS and all main-area slots
+	// have cached output, use a targeted update that only re-renders the
+	// center column and input. Side panels keep truncated cached output,
+	// avoiding the content shift that causes full-screen flicker.
+	// When the input SHRINKS (submit/delete), fall back to full recalcLayout.
+	if newInputH := m.inputHeight(); newInputH != m.prevInputH {
+		if newInputH > m.prevInputH && m.comp.AllMainSlotsCached() {
+			m.handleInputGrowth(newInputH)
+		} else {
+			m.recalcLayout()
+		}
 		return
 	}
 
@@ -11836,6 +12737,25 @@ func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
 		Render(content)
 }
 
+// renderPlanViewBordered renders the plan DAG viewer in the right panel slot
+// with border highlight based on FocusPlanView focus state.
+func (m *AppModel) renderPlanViewBordered(th *theme.Theme) string {
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	innerW := max(w-panelBorderSize, 1)
+	innerH := max(h-panelBorderSize, 1)
+	m.planView.SetSize(innerW, innerH)
+	content := m.planView.View(m.cursorVisible)
+	border := th.InactiveBorder
+	if m.focus.Current() == component.FocusPlanView {
+		border = th.ActiveBorder
+	}
+	return border.
+		Width(innerW).
+		Height(innerH).
+		MaxHeight(h).
+		Render(content)
+}
+
 // renderDiffFileListBordered renders the diff file list sidebar using the
 // FileTree slot dimensions with border highlight based on FocusDiffFileList.
 func (m *AppModel) renderDiffFileListBordered(th *theme.Theme) string {
@@ -12013,6 +12933,11 @@ func (m *AppModel) syncFocusState() {
 	if m.conflictViewActive && m.conflictView != nil {
 		m.conflictView.SetFocused(current == component.FocusConflictView)
 		m.conflictView.SetFileListFocused(current == component.FocusConflictFileList)
+	}
+
+	// Plan viewer panel.
+	if m.planView != nil {
+		m.planView.SetFocused(current == component.FocusPlanView)
 	}
 
 	// Sync warp line display for the newly focused editor.
@@ -12215,23 +13140,29 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 // ---------------------------------------------------------------------------
 
 func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
+	sessionID := m.resolveRouteSessionID(submit.SessionID)
+	submit.SessionID = sessionID
 	targetAgent := normalizeExplicitTargetAgent(submit.TargetAgent)
-	usage := m.bumpAgentContextUsage(guideAgentID, estimateGuideTokens(submit.Text)+guideRouteOverheadTokens)
+	promptEstimate := estimateGuideTokens(submit.Text) + guideRouteOverheadTokens
+	contextUsage := m.bumpAgentContextUsage(guideAgentID, promptEstimate)
+	m.statusBar.SetTokenPhase(status.PhaseInput)
 	m.publishGuideActivity(
 		events.EventTypeLLMRequest,
 		events.OutcomePending,
 		"Classifying and routing request",
-		usage,
+		contextUsage,
 	)
 
 	req := &guide.RouteRequest{
-		CorrelationID: uuid.New().String(),
-		Input:         submit.Text,
-		SourceAgentID: sourceAgentTUI,
-		TargetAgentID: targetAgent,
-		SessionID:     submit.SessionID,
-		Timestamp:     time.Now(),
+		CorrelationID:  uuid.New().String(),
+		Input:          submit.Text,
+		SourceAgentID:  sourceAgentTUI,
+		TargetAgentID:  targetAgent,
+		ExplicitTarget: targetAgent != "",
+		SessionID:      submit.SessionID,
+		Timestamp:      time.Now(),
 	}
+	m.beginActiveRoute(req.CorrelationID, thinkingAgentType(targetAgent))
 
 	if !m.guideRequestAvailable() {
 		return func() tea.Msg {
@@ -12266,6 +13197,25 @@ func (m *AppModel) bumpGuideContextUsage(addedTokens int) float64 {
 	m.guideContextUsage = float64(tokens) / float64(guideMaxContextTokens)
 	m.agentContextTokens[guideAgentID] = tokens
 	return m.guideContextUsage
+}
+
+// setAgentContextUsage directly sets the context usage from real input tokens.
+// Input tokens represent the full conversation context sent to the agent on each
+// call, so they directly measure context window occupancy — no decay needed.
+func (m *AppModel) setAgentContextUsage(agentID string, inputTokens int) float64 {
+	normalized := strings.ToLower(strings.TrimSpace(agentID))
+	if normalized == "" {
+		return 0
+	}
+	limit := agentContextTokenLimit(normalized)
+	tokens := min(max(inputTokens, 0), limit)
+	m.agentContextTokens[normalized] = tokens
+	ratio := float64(tokens) / float64(limit)
+	if normalized == guideAgentID {
+		m.guideContextTokens = tokens
+		m.guideContextUsage = ratio
+	}
+	return ratio
 }
 
 func (m *AppModel) bumpAgentContextUsage(agentID string, addedTokens int) float64 {
@@ -12359,7 +13309,8 @@ func (m *AppModel) needsDecorTick() bool {
 		(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick()) ||
 		(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick()) ||
 		(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick()) ||
-		(m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick())
+		(m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick()) ||
+		(m.planView != nil && m.planView.NeedsDecorTick())
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
@@ -12631,8 +13582,12 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		return err
 	}
 
-	// In mock mode, seed demo data only. Requests still route through real
-	// Guide/Architect agents via the event bus.
+	// Register live agents so the agent panel displays them. Must run after
+	// StartBridges so the activity bridge is subscribed to the bus.
+	seedLiveAgents(deps)
+
+	// In mock mode, seed additional demo data. Requests still route through
+	// real Guide/Architect agents via the event bus.
 	if cfg.MockMode {
 		seedMockData(deps)
 	}

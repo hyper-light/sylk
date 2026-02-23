@@ -2,35 +2,84 @@ package guide
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/prompts"
-	"google.golang.org/genai"
 )
 
 const (
 	defaultGuideResponseModel   = "gemini-3.1-pro-preview"
-	defaultGuideResponseTimeout = 120 * time.Second
+	defaultGuideResponseTimeout = 90 * time.Second
 )
 
-var guideResponseSystemPrompt = prompts.MustLoad("guide", "self_response")
+var guideResponseBaseSystemPrompt = prompts.MustLoad("guide", "self_response")
+var guideResponseSystemPrompt = buildGuideResponseSystemPrompt()
 
 // GeminiGuideResponder provides model-backed responses for guide-targeted prompts.
 type GeminiGuideResponder struct {
-	client  *genai.Client
-	model   string
-	timeout time.Duration
+	provider *providers.GoogleProvider
+	model    string
+	timeout  time.Duration
+
+	responseTemperature *float64
+	responseMaxTokens   int
+	reasoningEffort     string
+
+	toolDefs    func(input string) []providers.Tool
+	toolInvoker func(ctx context.Context, name string, arguments string) (string, error)
+	maxToolRuns int
 }
 
+type guideThoughtEmitter func(string)
+type guideEarlyUsageEmitter func(inputTokens int)
+
+type guideThoughtEmitterKey struct{}
+type guideEarlyUsageEmitterKey struct{}
+
 // NewGeminiGuideResponder creates a Gemini-backed self-responder for Guide.
-func NewGeminiGuideResponder(client *genai.Client, cfg RouterConfig) GuideSelfResponder {
+func NewGeminiGuideResponder(provider *providers.GoogleProvider, cfg RouterConfig) GuideSelfResponder {
 	return &GeminiGuideResponder{
-		client:  client,
-		model:   resolveGuideResponseModel(cfg.Model),
-		timeout: defaultGuideResponseTimeout,
+		provider:            provider,
+		model:               resolveGuideResponseModel(cfg.Model),
+		timeout:             defaultGuideResponseTimeout,
+		responseTemperature: resolveResponseTemperature(cfg),
+		responseMaxTokens:   resolveResponseMaxTokens(cfg),
+		reasoningEffort:     resolveGuideReasoningEffort(cfg.ThinkingLevel),
+		maxToolRuns:         6,
 	}
+}
+
+// NewGeminiGuideResponderWithTools enables true model-driven guide skill invocation.
+func NewGeminiGuideResponderWithTools(
+	provider *providers.GoogleProvider,
+	cfg RouterConfig,
+	toolDefs func(input string) []providers.Tool,
+	toolInvoker func(ctx context.Context, name string, arguments string) (string, error),
+) GuideSelfResponder {
+	return &GeminiGuideResponder{
+		provider:            provider,
+		model:               resolveGuideResponseModel(cfg.Model),
+		timeout:             defaultGuideResponseTimeout,
+		responseTemperature: resolveResponseTemperature(cfg),
+		responseMaxTokens:   resolveResponseMaxTokens(cfg),
+		reasoningEffort:     resolveGuideReasoningEffort(cfg.ThinkingLevel),
+		toolDefs:            toolDefs,
+		toolInvoker:         toolInvoker,
+		maxToolRuns:         6,
+	}
+}
+
+// resolveGuideReasoningEffort normalizes the config ThinkingLevel to a
+// provider-agnostic ReasoningEffort string (low/medium/high).
+func resolveGuideReasoningEffort(thinkingLevel string) string {
+	return strings.ToLower(strings.TrimSpace(thinkingLevel))
 }
 
 func resolveGuideResponseModel(model string) string {
@@ -42,59 +91,294 @@ func resolveGuideResponseModel(model string) string {
 }
 
 func (r *GeminiGuideResponder) Respond(ctx context.Context, request GuideSelfResponseRequest) (string, error) {
-	if r == nil || r.client == nil {
-		return "", fmt.Errorf("gemini guide responder is not configured")
-	}
-	guardedCtx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
-
-	resp, err := r.generateWithModel(guardedCtx, r.model, request)
+	text, _, err := r.respondInternal(ctx, request, nil)
 	if err != nil {
 		return "", err
-	}
-	text := strings.TrimSpace(resp.Text())
-	if text == "" {
-		return "", fmt.Errorf("gemini model %s returned empty response", r.model)
 	}
 	return text, nil
 }
 
-func (r *GeminiGuideResponder) generateWithModel(
+func (r *GeminiGuideResponder) RespondStream(
 	ctx context.Context,
-	model string,
 	request GuideSelfResponseRequest,
-) (*genai.GenerateContentResponse, error) {
-	resp, err := r.client.Models.GenerateContent(
-		ctx,
-		model,
-		genai.Text(buildGuideResponsePrompt(request)),
-		&genai.GenerateContentConfig{
-			SystemInstruction: &genai.Content{
-				Role: "system",
-				Parts: []*genai.Part{
-					{Text: guideResponseSystemPrompt},
-				},
-			},
-			Temperature: guideResponseTemperature(),
-			ThinkingConfig: &genai.ThinkingConfig{
-				ThinkingLevel: genai.ThinkingLevelHigh,
-			},
-		},
-	)
-	if err != nil {
-		return nil, formatGeminiError("gemini model "+model, err)
+	onChunk func(string) error,
+) (string, *providers.Usage, error) {
+	return r.respondInternal(ctx, request, onChunk)
+}
+
+func (r *GeminiGuideResponder) respondInternal(
+	ctx context.Context,
+	request GuideSelfResponseRequest,
+	onChunk func(string) error,
+) (string, *providers.Usage, error) {
+	if r == nil || r.provider == nil {
+		return "", nil, fmt.Errorf("gemini guide responder is not configured")
 	}
-	return resp, nil
+	guardedCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	req := r.buildRequest(request)
+	emitGuideEarlyUsage(guardedCtx, estimateGuidePromptInputTokens(req))
+
+	seen := make(map[guideToolCallSignature]int, r.maxToolRuns)
+	consecutiveErrors := 0
+
+	for turn := 0; turn <= r.maxToolRuns; turn++ {
+		resp, err := r.provider.Complete(guardedCtx, req)
+		if err != nil {
+			return "", nil, fmt.Errorf("gemini model %s: %w", r.model, err)
+		}
+
+		if len(resp.ToolCalls) == 0 {
+			text := strings.TrimSpace(resp.Content)
+			if text == "" {
+				return "", nil, fmt.Errorf("gemini model %s returned empty response", r.model)
+			}
+			if onChunk != nil {
+				if err := onChunk(text); err != nil {
+					return "", nil, err
+				}
+			}
+			return text, &resp.Usage, nil
+		}
+
+		if turn == r.maxToolRuns {
+			return "", nil, fmt.Errorf("gemini model %s exceeded guide tool-call limit (%d)", r.model, r.maxToolRuns)
+		}
+
+		if dup, sig := detectGuideToolCallDuplicate(resp.ToolCalls, seen); dup {
+			return "", nil, fmt.Errorf("gemini model %s repeated identical tool call: %s", r.model, sig.Name)
+		}
+
+		errCount, rerouted := r.applyToolCallsTracked(guardedCtx, req, resp)
+		if rerouted {
+			return "", nil, skills.ErrRerouteRequested
+		}
+		consecutiveErrors = updateConsecutiveToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
+		if consecutiveErrors >= 2 {
+			return "", nil, fmt.Errorf("gemini model %s: tool calls failed %d consecutive turns", r.model, consecutiveErrors)
+		}
+	}
+
+	return "", nil, fmt.Errorf("gemini model %s exhausted tool-call loop", r.model)
+}
+
+// guideToolCallSignature identifies a unique tool invocation by name and arguments.
+type guideToolCallSignature struct {
+	Name      string
+	Arguments string
+}
+
+// detectGuideToolCallDuplicate returns true if every tool call in the batch has
+// been seen before with identical arguments. Single repeated calls and fully
+// repeated multi-call batches are both caught.
+func detectGuideToolCallDuplicate(calls []providers.ToolCall, seen map[guideToolCallSignature]int) (bool, guideToolCallSignature) {
+	batch := make([]guideToolCallSignature, 0, len(calls))
+	for _, call := range calls {
+		sig := guideToolCallSignature{
+			Name:      strings.TrimSpace(call.Name),
+			Arguments: strings.TrimSpace(call.Arguments),
+		}
+		batch = append(batch, sig)
+	}
+
+	allDup := true
+	var firstDup guideToolCallSignature
+	for _, sig := range batch {
+		seen[sig]++
+		if seen[sig] <= 1 {
+			allDup = false
+		} else if firstDup.Name == "" {
+			firstDup = sig
+		}
+	}
+	return allDup, firstDup
+}
+
+// updateConsecutiveToolErrors tracks consecutive turns where every tool call
+// in the batch returned an error. Resets to zero on any turn with a success.
+func updateConsecutiveToolErrors(current int, errCount int, totalCalls int) int {
+	if totalCalls > 0 && errCount == totalCalls {
+		return current + 1
+	}
+	return 0
+}
+
+func (r *GeminiGuideResponder) buildRequest(request GuideSelfResponseRequest) *providers.Request {
+	prompt := buildGuideResponsePrompt(request)
+	req := &providers.Request{
+		Messages: []providers.Message{
+			{Role: providers.RoleUser, Content: prompt},
+		},
+		Model:           r.model,
+		SystemPrompt:    guideResponseSystemPrompt,
+		MaxTokens:       r.responseMaxTokens,
+		Temperature:     r.responseTemperature,
+		ReasoningEffort: r.reasoningEffort,
+	}
+	if r.toolDefs != nil {
+		req.Tools = r.toolDefs(request.Input)
+		req.ToolChoice = "auto"
+	}
+	return req
+}
+
+// applyToolCallsTracked executes tool calls and appends results to the request.
+// Returns the error count and whether a reroute was requested.
+func (r *GeminiGuideResponder) applyToolCallsTracked(
+	ctx context.Context,
+	req *providers.Request,
+	resp *providers.Response,
+) (int, bool) {
+	if req == nil || resp == nil || len(resp.ToolCalls) == 0 {
+		return 0, false
+	}
+
+	req.Messages = append(req.Messages, providers.Message{
+		Role:      providers.RoleAssistant,
+		Content:   strings.TrimSpace(resp.Content),
+		ToolCalls: resp.ToolCalls,
+		Metadata:  resp.ProviderMetadata,
+	})
+
+	errCount := 0
+	rerouted := false
+	for _, call := range resp.ToolCalls {
+		result, err := executeGuideToolCall(ctx, call, r.toolInvoker)
+		if err != nil {
+			if errors.Is(err, skills.ErrRerouteRequested) {
+				rerouted = true
+				result = `{"rerouted": true}`
+			} else {
+				result = guideToolErrorPayload(err)
+				errCount++
+			}
+		}
+		req.Messages = append(req.Messages, providers.Message{
+			Role:       providers.RoleTool,
+			ToolCallID: call.ID,
+			ToolName:   call.Name,
+			Content:    result,
+		})
+	}
+	return errCount, rerouted
+}
+
+func executeGuideToolCall(
+	ctx context.Context,
+	call providers.ToolCall,
+	toolInvoker func(context.Context, string, string) (string, error),
+) (string, error) {
+	if toolInvoker == nil {
+		return "", fmt.Errorf("guide tool runtime is not configured")
+	}
+	return toolInvoker(ctx, call.Name, strings.TrimSpace(call.Arguments))
+}
+
+func guideToolErrorPayload(err error) string {
+	if err == nil {
+		return ""
+	}
+	payload, marshalErr := json.Marshal(map[string]any{
+		"error": strings.TrimSpace(err.Error()),
+	})
+	if marshalErr != nil {
+		return `{"error":"tool execution failed"}`
+	}
+	return string(payload)
+}
+
+func estimateGuidePromptInputTokens(req *providers.Request) int {
+	if req == nil {
+		return 0
+	}
+	totalChars := len(strings.TrimSpace(req.SystemPrompt))
+	for _, msg := range req.Messages {
+		totalChars += len(strings.TrimSpace(msg.Content))
+	}
+	if totalChars == 0 {
+		return 0
+	}
+	return maxGuidePromptInt(totalChars/4, 1)
+}
+
+func buildGuideResponseSystemPrompt() string {
+	sections := []string{
+		strings.TrimSpace(GuideSystemPrompt),
+		strings.TrimSpace(guideResponseBaseSystemPrompt),
+	}
+	nonEmpty := make([]string, 0, len(sections))
+	for _, section := range sections {
+		if section == "" {
+			continue
+		}
+		nonEmpty = append(nonEmpty, section)
+	}
+	return strings.Join(nonEmpty, "\n\n---\n\n")
+}
+
+func withGuideThoughtEmitter(ctx context.Context, emit guideThoughtEmitter) context.Context {
+	if emit == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, guideThoughtEmitterKey{}, emit)
+}
+
+func withGuideEarlyUsageEmitter(ctx context.Context, emit guideEarlyUsageEmitter) context.Context {
+	if emit == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, guideEarlyUsageEmitterKey{}, emit)
+}
+
+func emitGuideThought(ctx context.Context, text string) {
+	if ctx == nil {
+		return
+	}
+	emit, ok := ctx.Value(guideThoughtEmitterKey{}).(guideThoughtEmitter)
+	if !ok || emit == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return
+	}
+	emit(trimmed)
+}
+
+func emitGuideEarlyUsage(ctx context.Context, inputTokens int) {
+	if ctx == nil || inputTokens <= 0 {
+		return
+	}
+	emit, ok := ctx.Value(guideEarlyUsageEmitterKey{}).(guideEarlyUsageEmitter)
+	if !ok || emit == nil {
+		return
+	}
+	emit(inputTokens)
+}
+
+func appendThoughtDelta(buffer *strings.Builder, delta string) string {
+	if buffer == nil {
+		return strings.TrimSpace(delta)
+	}
+	if delta != "" {
+		buffer.WriteString(delta)
+	}
+	return strings.TrimSpace(buffer.String())
 }
 
 func buildGuideResponsePrompt(request GuideSelfResponseRequest) string {
-	return fmt.Sprintf(
-		"Runtime context:\n- guide_agent_id: %s\n- pending_requests: %d\n- registered_agents: %s\n\nUser request:\n%s",
-		strings.TrimSpace(request.AgentID),
-		request.PendingRequests,
-		formatGuideAgentsForPrompt(request.RegisteredAgentIDs),
-		strings.TrimSpace(request.Input),
-	)
+	lines := []string{
+		"Runtime context:",
+		"- guide_agent_id: " + strings.TrimSpace(request.AgentID),
+		"- session_id: " + strings.TrimSpace(request.SessionID),
+		"- pending_requests: " + strconv.Itoa(request.PendingRequests),
+		"- registered_agents: " + formatGuideAgentsForPrompt(request.RegisteredAgentIDs),
+		"- loaded_guide_skills: " + formatGuideLoadedSkillsForPrompt(request.LoadedSkillNames),
+	}
+	lines = append(lines, guideConversationPromptLines(request)...)
+	lines = append(lines, "", "User request:", strings.TrimSpace(request.Input))
+	return strings.Join(lines, "\n")
 }
 
 func formatGuideAgentsForPrompt(agentIDs []string) string {
@@ -105,7 +389,64 @@ func formatGuideAgentsForPrompt(agentIDs []string) string {
 	return strings.Join(ids, ", ")
 }
 
-func guideResponseTemperature() *float32 {
-	value := float32(0.2)
+func formatGuideLoadedSkillsForPrompt(skillNames []string) string {
+	cleaned := make([]string, 0, len(skillNames))
+	for _, name := range skillNames {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		cleaned = append(cleaned, trimmed)
+	}
+	if len(cleaned) == 0 {
+		return "(none)"
+	}
+	return strings.Join(cleaned, ", ")
+}
+
+const (
+	defaultResponseTemperature = 0.7
+	defaultResponseMaxTokens   = 4096
+)
+
+// resolveResponseTemperature returns the self-response temperature from config,
+// falling back to the agent default. Returns a pointer for the provider Request.
+func resolveResponseTemperature(cfg RouterConfig) *float64 {
+	if cfg.ResponseTemperature != nil {
+		return cfg.ResponseTemperature
+	}
+	value := defaultResponseTemperature
 	return &value
+}
+
+// resolveResponseMaxTokens returns the self-response max tokens from config,
+// falling back to the agent default.
+func resolveResponseMaxTokens(cfg RouterConfig) int {
+	if cfg.ResponseMaxTokens > 0 {
+		return cfg.ResponseMaxTokens
+	}
+	return defaultResponseMaxTokens
+}
+
+func guideConversationPromptLines(request GuideSelfResponseRequest) []string {
+	agentID := strings.TrimSpace(request.ActiveConversationAgent)
+	if agentID == "" {
+		return []string{"- active_conversation_agent: (none)"}
+	}
+	lines := []string{
+		"- active_conversation_agent: " + agentID,
+		"- active_conversation_turns: " + strconv.Itoa(maxGuidePromptInt(request.ActiveConversationTurns, 1)),
+		"- active_conversation_age_seconds: " + strconv.Itoa(maxGuidePromptInt(request.ActiveConversationAge, 0)),
+	}
+	if request.ActiveConversationScore > 0 {
+		lines = append(lines, fmt.Sprintf("- active_conversation_score: %.2f", request.ActiveConversationScore))
+	}
+	return lines
+}
+
+func maxGuidePromptInt(value int, floor int) int {
+	if value < floor {
+		return floor
+	}
+	return value
 }

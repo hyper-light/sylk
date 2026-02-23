@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -30,6 +31,9 @@ type Tester struct {
 	registrySub guide.Subscription
 	running     bool
 	knownAgents map[string]*guide.AgentAnnouncement
+
+	// Handoff integration
+	handoffBridge *handoff.HandoffBridge
 }
 
 func New(cfg TesterConfig) (*Tester, error) {
@@ -278,6 +282,8 @@ func (t *Tester) intentHandler(intent guide.Intent) (forwardedHandler, error) {
 		return t.handleRunTests, nil
 	case guide.IntentRecall:
 		return t.handleRecall, nil
+	case guide.IntentHelp:
+		return t.handleHelp, nil
 	default:
 		return nil, fmt.Errorf("unsupported intent: %s", intent)
 	}
@@ -307,6 +313,16 @@ func (t *Tester) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest) 
 	return map[string]any{
 		"state":          t.state,
 		"current_result": t.currentResult,
+	}, nil
+}
+
+func (t *Tester) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
+	return map[string]any{
+		"agent":              "tester",
+		"description":        "Testing and QA validation including coverage, mutation, and flaky test detection.",
+		"supported_intents":  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp},
+		"supported_domains":  []guide.Domain{guide.DomainCode},
+		"recommended_routes": []string{"@tester:check:code", "@tester:recall:code"},
 	}, nil
 }
 
@@ -699,6 +715,7 @@ func (t *Tester) GetRoutingInfo() *guide.AgentRoutingInfo {
 				Intents: []guide.Intent{
 					guide.IntentCheck,
 					guide.IntentRecall,
+					guide.IntentHelp,
 				},
 				Domains: []guide.Domain{
 					guide.DomainCode,
@@ -750,4 +767,51 @@ func (t *Tester) GetCurrentResult() *TestSuiteResult {
 	defer t.mu.RUnlock()
 
 	return t.currentResult
+}
+
+// =============================================================================
+// Handoff Interface (HandoffInjectable)
+// =============================================================================
+
+// AgentID returns the unique identifier for this agent instance.
+func (t *Tester) AgentID() string {
+	return "tester"
+}
+
+// AgentType returns the type classification for this agent.
+func (t *Tester) AgentType() string {
+	return "tester"
+}
+
+// Descriptor returns the immutable metadata describing this agent type.
+func (t *Tester) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:     "tester",
+		ModelID:       "sonnet-4.5-200k",
+		ContextWindow: 200000,
+		Category:      handoff.CategoryStandalone,
+	}
+}
+
+// InjectPreparedContext accepts prepared context from a handoff into this agent.
+func (t *Tester) InjectPreparedContext(pc *handoff.PreparedContext) error {
+	return nil
+}
+
+// Terminate gracefully shuts down the agent.
+func (t *Tester) Terminate(ctx context.Context) error {
+	return t.Stop()
+}
+
+// SetHandoffBridge assigns the handoff bridge for this agent.
+func (t *Tester) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	t.handoffBridge = bridge
+}
+
+// ExtractArchivableState returns the agent's current state for handoff persistence.
+func (t *Tester) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   t.AgentID(),
+		AgentType: t.AgentType(),
+	}
 }

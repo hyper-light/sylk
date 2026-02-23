@@ -15,7 +15,9 @@ func TestArchitect_PlanPersistsAndRestores(t *testing.T) {
 		WorkingDirectory:                 root,
 	})
 
-	resp, err := a.Handle(context.Background(), &ArchitectRequest{
+	// Call executePlanningProtocol directly — Handle now routes IntentPlan
+	// through conversation, so the persistence test uses the internal path.
+	plan, err := a.executePlanningProtocol(context.Background(), &ArchitectRequest{
 		ID:        "req_plan_persist",
 		Intent:    IntentPlan,
 		Query:     "design a robust cache integration",
@@ -23,11 +25,10 @@ func TestArchitect_PlanPersistsAndRestores(t *testing.T) {
 		Timestamp: time.Now(),
 	})
 	if err != nil {
-		t.Fatalf("handle failed: %v", err)
+		t.Fatalf("planning protocol failed: %v", err)
 	}
-	plan, ok := resp.Data.(*DesignPlan)
-	if !ok || plan == nil {
-		t.Fatalf("expected *DesignPlan, got %T", resp.Data)
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
 	}
 
 	planPath := filepath.Join(root, ".sylk", "architect", "plans", plan.ID+".json")
@@ -57,5 +58,29 @@ func TestValidatePlanForExecution_TaskContractFailure(t *testing.T) {
 	}
 	if err := validatePlanForExecution(plan); err == nil {
 		t.Fatal("expected validation error for missing task contract fields")
+	}
+}
+
+func TestValidateDeclarationForPolicy_DoesNotHardFail(t *testing.T) {
+	a := newTestArchitect(t, Config{})
+	runner := &planningProtocolRunner{
+		architect: a,
+		plan:      &DesignPlan{},
+	}
+	declaration := &PreDelegationDeclaration{
+		ConsultationChecks: map[string]*ConsultationEvidence{
+			"librarian": {
+				Target:     "librarian",
+				Success:    false,
+				Error:      "unsupported consultation payload",
+				ReceivedAt: time.Now(),
+			},
+		},
+	}
+	if err := runner.validateDeclarationForPolicy(declaration); err != nil {
+		t.Fatalf("expected warning-only declaration validation, got error: %v", err)
+	}
+	if len(runner.plan.RiskSummary) == 0 {
+		t.Fatal("expected declaration validation warning to be captured in risk summary")
 	}
 }

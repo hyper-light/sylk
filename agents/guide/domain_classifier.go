@@ -3,6 +3,7 @@ package guide
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/domain"
@@ -60,6 +61,12 @@ func defaultDomainClassifierConfig() *DomainClassifierConfig {
 	return &DomainClassifierConfig{
 		Config:      domain.DefaultDomainConfig(),
 		EnableCache: true,
+		CacheConfig: &cache.CacheConfig{
+			NumCounters: 20_000,
+			MaxCost:     5_000_000,
+			BufferItems: 64,
+			TTL:         5 * time.Minute,
+		},
 	}
 }
 

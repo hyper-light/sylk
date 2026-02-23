@@ -3,9 +3,12 @@ package providers
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
 )
 
 // Common provider errors
@@ -82,52 +85,25 @@ func NewProviderError(provider ProviderType, operation string, err error) *Provi
 	return pe
 }
 
-// parseError extracts information from provider-specific errors
+// parseError extracts information from provider-specific errors using typed
+// error inspection rather than string matching.
 func (e *ProviderError) parseError(err error) {
-	errStr := err.Error()
-
-	// Check for common patterns
-	switch {
-	case strings.Contains(errStr, "rate limit") || strings.Contains(errStr, "429"):
-		e.StatusCode = http.StatusTooManyRequests
-		e.Retryable = true
-		e.RetryAfter = 60 * time.Second // Default retry delay
-
-	case strings.Contains(errStr, "unauthorized") || strings.Contains(errStr, "401"):
-		e.StatusCode = http.StatusUnauthorized
-		e.Retryable = false
-
-	case strings.Contains(errStr, "quota") || strings.Contains(errStr, "402"):
-		e.StatusCode = http.StatusPaymentRequired
-		e.Retryable = false
-
-	case strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline"):
-		e.Retryable = true
-		e.RetryAfter = 5 * time.Second
-
-	case strings.Contains(errStr, "500") || strings.Contains(errStr, "502") ||
-		strings.Contains(errStr, "503") || strings.Contains(errStr, "504"):
-		e.Retryable = true
-		e.RetryAfter = 10 * time.Second
-
-	case strings.Contains(errStr, "safety") || strings.Contains(errStr, "content_filter"):
-		e.Retryable = false
+	var anthropicErr *anthropic.Error
+	if errors.As(err, &anthropicErr) {
+		e.StatusCode = anthropicErr.StatusCode
+		e.Retryable = isRetryableHTTPStatus(anthropicErr.StatusCode)
+		return
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		e.Retryable = netErr.Timeout()
+		return
 	}
 }
 
-// IsRetryable checks if an error is retryable
+// IsRetryable checks if an error is retryable using typed error inspection.
 func IsRetryable(err error) bool {
-	var pe *ProviderError
-	if errors.As(err, &pe) {
-		return pe.Retryable
-	}
-
-	// Check for common retryable patterns
-	errStr := err.Error()
-	return strings.Contains(errStr, "rate limit") ||
-		strings.Contains(errStr, "timeout") ||
-		strings.Contains(errStr, "temporary") ||
-		strings.Contains(errStr, "unavailable")
+	return isRetryableError(err)
 }
 
 // GetRetryAfter returns the suggested retry delay for an error

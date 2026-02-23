@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -23,6 +24,26 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(runTestsSkill(e))
 	e.skills.Register(globSkill(e))
 	e.skills.Register(grepSkill(e))
+	e.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "engineer",
+		SessionID: func() string { return e.config.SessionID },
+		Publish:   e.publishRerouteRequest,
+	}))
+}
+
+func (e *Engineer) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if e.bus == nil {
+		return fmt.Errorf("engineer bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "engineer",
+		SuggestedTarget: suggestedTarget,
+		SessionID:       e.config.SessionID,
+		ExcludeAgents:   []string{"engineer"},
+	}
+	return e.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 // =============================================================================

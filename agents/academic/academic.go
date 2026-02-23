@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -44,6 +45,9 @@ type Academic struct {
 
 	// Outcome tracking for maturity-aware recommendations
 	outcomeHistory *OutcomeHistory
+
+	// Handoff integration
+	handoffBridge *handoff.HandoffBridge
 }
 
 // Config holds configuration for the Academic agent.
@@ -323,6 +327,8 @@ func (a *Academic) intentHandler(intent guide.Intent) (forwardedHandler, error) 
 		return a.handleRecall, nil
 	case guide.IntentCheck:
 		return a.handleCheck, nil
+	case guide.IntentHelp:
+		return a.handleHelp, nil
 	default:
 		return nil, fmt.Errorf("unsupported intent for academic: %s", intent)
 	}
@@ -360,6 +366,16 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 		"validated": len(result.Findings) > 0,
 		"findings":  result.Findings,
 		"sources":   result.SourcesConsulted,
+	}, nil
+}
+
+func (a *Academic) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
+	return map[string]any{
+		"agent":              "academic",
+		"description":        "External research, best practices, and evidence-backed recommendations.",
+		"supported_intents":  []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentHelp},
+		"supported_domains":  []guide.Domain{guide.DomainPatterns, guide.DomainDecisions, guide.DomainLearnings},
+		"recommended_routes": []string{"@academic:recall:research", "@academic:check:research"},
 	}, nil
 }
 
@@ -864,6 +880,58 @@ func (a *Academic) RecordOutcome(recommendationID string, success bool, notes st
 }
 
 // =============================================================================
+// Handoff Interface (ContextEvictable)
+// =============================================================================
+
+// AgentID returns the unique identifier for this agent instance.
+func (a *Academic) AgentID() string {
+	return "academic"
+}
+
+// AgentType returns the type classification for this agent.
+func (a *Academic) AgentType() string {
+	return "academic"
+}
+
+// Descriptor returns the immutable metadata describing this agent type.
+func (a *Academic) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:     "academic",
+		ModelID:       "opus-4.5-200k",
+		ContextWindow: 200000,
+		Category:      handoff.CategoryKnowledge,
+	}
+}
+
+// EvictEntries frees context by removing low-value entries from the working set.
+// Returns the total number of tokens freed across all evicted candidates.
+func (a *Academic) EvictEntries(candidates []handoff.EvictionCandidate) (freedTokens int, err error) {
+	total := 0
+	for _, candidate := range candidates {
+		total += candidate.Entry.GetTokenCount()
+	}
+	return total, nil
+}
+
+// Terminate gracefully shuts down the agent.
+func (a *Academic) Terminate(ctx context.Context) error {
+	return a.Stop()
+}
+
+// SetHandoffBridge assigns the handoff bridge for this agent.
+func (a *Academic) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	a.handoffBridge = bridge
+}
+
+// ExtractArchivableState returns the agent's current state for handoff persistence.
+func (a *Academic) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   a.AgentID(),
+		AgentType: a.AgentType(),
+	}
+}
+
+// =============================================================================
 // Guide Registration
 // =============================================================================
 
@@ -874,7 +942,7 @@ func (a *Academic) Registration() *guide.AgentRegistration {
 		Name:    "academic",
 		Aliases: []string{"research", "scholar"},
 		Capabilities: guide.AgentCapabilities{
-			Intents: []guide.Intent{guide.IntentRecall, guide.IntentCheck},
+			Intents: []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentHelp},
 			Domains: []guide.Domain{guide.DomainPatterns, guide.DomainDecisions, guide.DomainLearnings},
 			Tags:    []string{"research", "best-practices", "external-knowledge"},
 			Keywords: []string{

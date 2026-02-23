@@ -15,6 +15,25 @@ func (a *Academic) registerCoreSkills() {
 	a.skills.Register(researchTopicSkill(a))
 	a.skills.Register(findBestPracticesSkill(a))
 	a.skills.Register(compareApproachesSkill(a))
+	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "academic",
+		SessionID: func() string { return "" },
+		Publish:   a.publishRerouteRequest,
+	}))
+}
+
+func (a *Academic) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if a.bus == nil {
+		return fmt.Errorf("academic bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "academic",
+		SuggestedTarget: suggestedTarget,
+		ExcludeAgents:   []string{"academic"},
+	}
+	return a.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 func (a *Academic) registerExtendedSkills() {

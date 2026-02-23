@@ -19,11 +19,14 @@ func TestDeriveConflictLabels_Rebase(t *testing.T) {
 	}}
 	m.deriveConflictLabels()
 
-	if m.oursLabel != "main" {
-		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "main")
+	if m.oursLabel != "Curr" {
+		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "Curr")
 	}
-	if m.theirsLabel != "abc1234" {
-		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "abc1234")
+	if m.theirsLabel != "Incmg" {
+		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "Incmg")
+	}
+	if m.oursCtx != "main" {
+		t.Errorf("oursCtx = %q, want %q", m.oursCtx, "main")
 	}
 	if m.theirsCtx != "fix: thing" {
 		t.Errorf("theirsCtx = %q, want %q", m.theirsCtx, "fix: thing")
@@ -39,11 +42,14 @@ func TestDeriveConflictLabels_CherryPick(t *testing.T) {
 	}}
 	m.deriveConflictLabels()
 
-	if m.oursLabel != "develop" {
-		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "develop")
+	if m.oursLabel != "Curr" {
+		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "Curr")
 	}
-	if m.theirsLabel != "def5678" {
-		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "def5678")
+	if m.theirsLabel != "Incmg" {
+		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "Incmg")
+	}
+	if m.oursCtx != "develop" {
+		t.Errorf("oursCtx = %q, want %q", m.oursCtx, "develop")
 	}
 }
 
@@ -55,11 +61,17 @@ func TestDeriveConflictLabels_PullMerge(t *testing.T) {
 	}}
 	m.deriveConflictLabels()
 
-	if m.oursLabel != "main" {
-		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "main")
+	if m.oursLabel != "Locl" {
+		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "Locl")
 	}
-	if m.theirsLabel != "origin/main" {
-		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "origin/main")
+	if m.theirsLabel != "Remte" {
+		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "Remte")
+	}
+	if m.oursCtx != "main" {
+		t.Errorf("oursCtx = %q, want %q", m.oursCtx, "main")
+	}
+	if m.theirsCtx != "origin/main" {
+		t.Errorf("theirsCtx = %q, want %q", m.theirsCtx, "origin/main")
 	}
 }
 
@@ -71,11 +83,17 @@ func TestDeriveConflictLabels_LocalMerge(t *testing.T) {
 	}}
 	m.deriveConflictLabels()
 
-	if m.oursLabel != "main" {
-		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "main")
+	if m.oursLabel != "Dest" {
+		t.Errorf("oursLabel = %q, want %q", m.oursLabel, "Dest")
 	}
-	if m.theirsLabel != "feature" {
-		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "feature")
+	if m.theirsLabel != "Source" {
+		t.Errorf("theirsLabel = %q, want %q", m.theirsLabel, "Source")
+	}
+	if m.oursCtx != "main" {
+		t.Errorf("oursCtx = %q, want %q", m.oursCtx, "main")
+	}
+	if m.theirsCtx != "feature" {
+		t.Errorf("theirsCtx = %q, want %q", m.theirsCtx, "feature")
 	}
 }
 

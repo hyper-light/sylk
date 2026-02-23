@@ -308,13 +308,13 @@ const (
 
 	MessageTypeAgentReady MessageType = "agent_ready"
 
-	MessageTypeDAGExecute            MessageType = "dag_execute"
-	MessageTypeDAGStatus             MessageType = "dag_status"
-	MessageTypeDAGCancel             MessageType = "dag_cancel"
-	MessageTypeTaskDispatch          MessageType = "task_dispatch"
-	MessageTypeTaskComplete          MessageType = "task_complete"
-	MessageTypeTaskFailed            MessageType = "task_failed"
-	MessageTypeTaskHelp              MessageType = "task_help"
+	MessageTypeDAGExecute   MessageType = "dag_execute"
+	MessageTypeDAGStatus    MessageType = "dag_status"
+	MessageTypeDAGCancel    MessageType = "dag_cancel"
+	MessageTypeTaskDispatch MessageType = "task_dispatch"
+	MessageTypeTaskComplete MessageType = "task_complete"
+	MessageTypeTaskFailed   MessageType = "task_failed"
+	MessageTypeTaskHelp     MessageType = "task_help"
 	// MessageTypeClarificationRequest is a request for user clarification
 	MessageTypeClarificationRequest MessageType = "clarification_request"
 	// MessageTypeClarificationResponse is a response to a clarification request
@@ -322,7 +322,7 @@ const (
 	// MessageTypeDirectConsultation is a direct agent-to-agent consultation
 	MessageTypeDirectConsultation MessageType = "direct_consultation"
 	// MessageTypeVariantRequest is a request for a variant resolution
-	MessageTypeVariantRequest MessageType = "variant_request"
+	MessageTypeVariantRequest        MessageType = "variant_request"
 	MessageTypeValidateTask          MessageType = "validate_task"
 	MessageTypeValidationResult      MessageType = "validation_result"
 	MessageTypeValidationFull        MessageType = "validation_full"
@@ -337,6 +337,14 @@ const (
 	MessageTypeUserInterrupt         MessageType = "user_interrupt"
 	MessageTypeWorkflowComplete      MessageType = "workflow_complete"
 	MessageTypeProposal              MessageType = "proposal"
+	MessageTypeReroute               MessageType = "reroute"
+
+	// Pipeline and DAG coordination message types
+	MessageTypePipelineUpdate    MessageType = "pipeline_update"
+	MessageTypePipelineState     MessageType = "pipeline_state"
+	MessageTypePipelineQuery     MessageType = "pipeline_query"
+	MessageTypePipelineQueryResp MessageType = "pipeline_query_response"
+	MessageTypeDAGModify         MessageType = "dag_modify"
 )
 
 // =============================================================================
@@ -515,6 +523,22 @@ func NewErrorMessage(id, correlationID, sourceAgentID, errorMsg string) *Message
 		Status:        messaging.StatusQueued,
 		Attempt:       1,
 		Priority:      messaging.PriorityHigh, // Errors get high priority
+	}
+}
+
+// NewBridgeMessage creates a message from raw network bridge delivery.
+// The payload is the original wire bytes; downstream handlers decode as needed.
+func NewBridgeMessage(sourceAgentID, targetAgentID string, payload []byte) *Message {
+	return &Message{
+		ID:            uuid.New().String(),
+		Type:          MessageTypeForward,
+		SourceAgentID: sourceAgentID,
+		TargetAgentID: targetAgentID,
+		Payload:       payload,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
 	}
 }
 
@@ -758,6 +782,15 @@ type ActionRequest struct {
 	Timestamp           time.Time `json:"timestamp"`
 }
 
+// UserInterruptRequest represents a user-driven cancellation for an in-flight
+// routed request.
+type UserInterruptRequest struct {
+	CorrelationID string    `json:"correlation_id"`
+	SourceAgentID string    `json:"source_agent_id"`
+	Reason        string    `json:"reason,omitempty"`
+	Timestamp     time.Time `json:"timestamp"`
+}
+
 // NewActionMessage creates a message for an action request
 func NewActionMessage(id string, req *ActionRequest) *Message {
 	if id == "" {
@@ -778,9 +811,33 @@ func NewActionMessage(id string, req *ActionRequest) *Message {
 	}
 }
 
+// NewUserInterruptMessage creates a message for a user interruption request.
+func NewUserInterruptMessage(id string, req *UserInterruptRequest) *Message {
+	if id == "" {
+		id = uuid.New().String()
+	}
+	return &Message{
+		ID:            id,
+		CorrelationID: req.CorrelationID,
+		Type:          MessageTypeUserInterrupt,
+		Payload:       req,
+		SourceAgentID: req.SourceAgentID,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityHigh,
+	}
+}
+
 // GetActionRequest extracts ActionRequest from message payload
 func (m *Message) GetActionRequest() (*ActionRequest, bool) {
 	req, ok := m.Payload.(*ActionRequest)
+	return req, ok
+}
+
+// GetUserInterruptRequest extracts UserInterruptRequest from message payload.
+func (m *Message) GetUserInterruptRequest() (*UserInterruptRequest, bool) {
+	req, ok := m.Payload.(*UserInterruptRequest)
 	return req, ok
 }
 
@@ -831,4 +888,28 @@ func (m *Message) GetStreamResponse() (*StreamResponse, bool) {
 func (m *Message) GetError() (string, bool) {
 	err, ok := m.Payload.(string)
 	return err, ok
+}
+
+// NewRerouteMessage creates a message for rerouting a request through Guide.
+func NewRerouteMessage(id string, reroute *RerouteRequest) *Message {
+	if id == "" {
+		id = uuid.New().String()
+	}
+	return &Message{
+		ID:            id,
+		CorrelationID: reroute.OriginalCorrelationID,
+		Type:          MessageTypeReroute,
+		Payload:       reroute,
+		SourceAgentID: reroute.SourceAgentID,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityHigh,
+	}
+}
+
+// GetRerouteRequest extracts RerouteRequest from message payload.
+func (m *Message) GetRerouteRequest() (*RerouteRequest, bool) {
+	req, ok := m.Payload.(*RerouteRequest)
+	return req, ok
 }

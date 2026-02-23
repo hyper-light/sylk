@@ -44,11 +44,12 @@ const unselectedCardLines = 1
 
 // RenderCard renders a single-line agent card.
 // Layout: [indicator] [status-icon] [name] [summary-truncated] [context%]
-func RenderCard(agent AgentState, width int, th *theme.Theme, selected bool) string {
+// When engaged is true, the agent name uses the engagement style (bold accent).
+func RenderCard(agent AgentState, width int, th *theme.Theme, selected, engaged bool) string {
 	if selected {
-		return renderSelectedCard(agent, width, th)
+		return renderSelectedCard(agent, width, th, engaged)
 	}
-	return renderCompactCard(agent, width, th)
+	return renderCompactCard(agent, width, th, engaged)
 }
 
 // cardLineCount returns the number of terminal lines a card occupies.
@@ -61,16 +62,19 @@ func cardLineCount(selected bool) int {
 
 // renderCompactCard renders a single-line card.
 // Layout: [indicator] [icon] [name] [truncated summary...] [context %]
-func renderCompactCard(agent AgentState, width int, th *theme.Theme) string {
-	return renderCardLine(agent, width, th, false)
+func renderCompactCard(agent AgentState, width int, th *theme.Theme, engaged bool) string {
+	return renderCardLine(agent, width, th, false, engaged)
 }
 
 // renderCardLine renders the one-line card layout with configurable selection styling.
-func renderCardLine(agent AgentState, width int, th *theme.Theme, selected bool) string {
+func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, engaged bool) string {
 	icon := agentStatusDot(agent.Status, selected, th)
 	indicator := selectIndicator(selected, th)
 
 	nameStyle := agentNameStyle(selected, th)
+	if engaged {
+		nameStyle = nameStyle.Bold(true).Underline(true)
+	}
 	name := nameStyle.Render(agent.Name)
 	nameLen := lipgloss.Width(name)
 
@@ -97,8 +101,8 @@ func renderCardLine(agent AgentState, width int, th *theme.Theme, selected bool)
 // renderSelectedCard renders a two-line card for the selected agent.
 // Line 1: [indicator] [icon] [name] [truncated summary] [context %]
 // Line 2: [indent] [full task summary]
-func renderSelectedCard(agent AgentState, width int, th *theme.Theme) string {
-	return renderCardLine(agent, width, th, true)
+func renderSelectedCard(agent AgentState, width int, th *theme.Theme, engaged bool) string {
+	return renderCardLine(agent, width, th, true, engaged)
 }
 
 // statusColors maps AgentStatus to a palette color accessor.
@@ -172,11 +176,15 @@ func contextPctStyle(usage float64, th *theme.Theme) lipgloss.Style {
 	return th.StatusNormal
 }
 
-// truncate shortens s to fit within maxWidth, appending an ellipsis if needed.
+// truncate flattens s to a single line and shortens it to fit within
+// maxWidth, appending an ellipsis if needed. Newlines, carriage returns,
+// and tabs are replaced with spaces; consecutive whitespace is collapsed.
+// This is the render-boundary guard — all card text passes through here.
 func truncate(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return ""
 	}
+	s = flattenToLine(s)
 	if lipgloss.Width(s) <= maxWidth {
 		return s
 	}
@@ -191,6 +199,26 @@ func truncate(s string, maxWidth int) string {
 		}
 	}
 	return s
+}
+
+// flattenToLine collapses newlines and consecutive whitespace into a
+// single space, producing a single-line string.
+func flattenToLine(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := false
+	for _, r := range s {
+		if r == '\n' || r == '\r' || r == '\t' {
+			r = ' '
+		}
+		space := r == ' '
+		if space && prevSpace {
+			continue
+		}
+		prevSpace = space
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // padRight pads s with spaces to reach the target width.

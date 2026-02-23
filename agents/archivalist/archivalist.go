@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -46,6 +47,9 @@ type Archivalist struct {
 	sessionStores    map[string]*SessionStore
 	crossSession     *CrossSessionIndex
 	workflowStore    *WorkflowStore
+
+	// Handoff integration
+	handoffBridge *handoff.HandoffBridge
 }
 
 // Config holds configuration for the Archivalist agent
@@ -479,6 +483,8 @@ func (a *Archivalist) intentHandler(intent guide.Intent) (forwardedHandler, erro
 		return a.handleDeclare, nil
 	case guide.IntentComplete:
 		return a.handleComplete, nil
+	case guide.IntentHelp:
+		return a.handleHelp, nil
 	default:
 		return nil, fmt.Errorf("unsupported intent: %s", intent)
 	}
@@ -577,6 +583,16 @@ func (a *Archivalist) handleDeclare(ctx context.Context, fwd *guide.ForwardedReq
 func (a *Archivalist) handleComplete(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	a.agentContext.CompleteStep(fwd.Input)
 	return map[string]any{"completed": true, "step": fwd.Input}, nil
+}
+
+func (a *Archivalist) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
+	return map[string]any{
+		"agent":              "archivalist",
+		"description":        "Historical memory, decisions, failures, and declared intents.",
+		"supported_intents":  []guide.Intent{guide.IntentRecall, guide.IntentStore, guide.IntentCheck, guide.IntentDeclare, guide.IntentComplete, guide.IntentHelp},
+		"supported_domains":  []guide.Domain{guide.DomainPatterns, guide.DomainFailures, guide.DomainDecisions, guide.DomainFiles, guide.DomainLearnings, guide.DomainIntents},
+		"recommended_routes": []string{"@archivalist:recall:history", "@archivalist:store:history", "@archivalist:check:history"},
+	}, nil
 }
 
 // handleBusResponse processes responses to requests we made
@@ -2079,4 +2095,56 @@ func (a *Archivalist) ExecutePreQueryHooks(ctx context.Context, data *skills.Que
 
 func (a *Archivalist) ExecutePostQueryHooks(ctx context.Context, data *skills.QueryHookData) (*skills.QueryHookData, skills.HookResult, error) {
 	return a.hooks.ExecutePostQueryHooks(ctx, data)
+}
+
+// =============================================================================
+// Handoff Interface (ContextEvictable)
+// =============================================================================
+
+// AgentID returns the unique identifier for this agent instance.
+func (a *Archivalist) AgentID() string {
+	return "archivalist"
+}
+
+// AgentType returns the type classification for this agent.
+func (a *Archivalist) AgentType() string {
+	return "archivalist"
+}
+
+// Descriptor returns the immutable metadata describing this agent type.
+func (a *Archivalist) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:     "archivalist",
+		ModelID:       "sonnet-4.5-1m",
+		ContextWindow: 1000000,
+		Category:      handoff.CategoryKnowledge,
+	}
+}
+
+// EvictEntries frees context by removing low-value entries from the working set.
+// Returns the total number of tokens freed across all evicted candidates.
+func (a *Archivalist) EvictEntries(candidates []handoff.EvictionCandidate) (freedTokens int, err error) {
+	total := 0
+	for _, candidate := range candidates {
+		total += candidate.Entry.GetTokenCount()
+	}
+	return total, nil
+}
+
+// Terminate gracefully shuts down the agent.
+func (a *Archivalist) Terminate(ctx context.Context) error {
+	return a.Stop()
+}
+
+// SetHandoffBridge assigns the handoff bridge for this agent.
+func (a *Archivalist) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	a.handoffBridge = bridge
+}
+
+// ExtractArchivableState returns the agent's current state for handoff persistence.
+func (a *Archivalist) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   a.AgentID(),
+		AgentType: a.AgentType(),
+	}
 }

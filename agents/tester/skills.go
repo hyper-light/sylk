@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -19,6 +20,26 @@ func (t *Tester) registerCoreSkills() {
 	t.skills.Register(suggestTestCasesSkill(t))
 	t.skills.Register(identifyCoverageGapsSkill(t))
 	t.skills.Register(getTestStatusSkill(t))
+	t.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "tester",
+		SessionID: func() string { return t.state.SessionID },
+		Publish:   t.publishRerouteRequest,
+	}))
+}
+
+func (t *Tester) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if t.bus == nil {
+		return fmt.Errorf("tester bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "tester",
+		SuggestedTarget: suggestedTarget,
+		SessionID:       t.state.SessionID,
+		ExcludeAgents:   []string{"tester"},
+	}
+	return t.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 type runTestsParams struct {

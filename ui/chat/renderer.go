@@ -73,11 +73,12 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []Code
 		if entry.ThinkingColor != "" {
 			color = lipgloss.Color(entry.ThinkingColor)
 		}
-		spinnerStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
-		lines := make([]string, 0, 4)
+		animatedStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
+		lines := make([]string, 0, 6)
 		lines = append(lines, header)
-		for _, sub := range strings.Split(entry.ThinkingText, "\n") {
-			lines = append(lines, wrapLine(sub, width, spinnerStyle)...)
+		lines = append(lines, wrapLine(normalizeThinkingLine(entry.ThinkingText), width, animatedStyle)...)
+		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
+			lines = append(lines, wrapLine(normalizeThinkingLine(status), width, animatedStyle)...)
 		}
 		lines = append(lines, "")
 		return lines, nil
@@ -107,6 +108,17 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []Code
 		codeRegions[i].End += headerOffset
 	}
 	return lines, codeRegions
+}
+
+func normalizeThinkingLine(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", " ")
+	text = strings.ReplaceAll(text, "\r", " ")
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return "Thinking..."
+	}
+	return text
 }
 
 // renderBadge produces the styled icon + label string for the entry header.
@@ -170,62 +182,14 @@ func normalizeLang(tag string) string {
 	return lang
 }
 
-// renderContent splits raw content into styled, word-wrapped lines.
-// Code fences (``` blocks) are syntax-highlighted with line numbers; prose is word-wrapped.
-// Returns the rendered lines and code block regions (indices relative to the returned slice).
+// renderContent parses raw markdown and renders it to styled terminal lines
+// with syntax-highlighted code blocks. Returns the rendered lines and code
+// block regions (indices relative to the returned slice).
 func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme) ([]string, []CodeRegion) {
 	if width <= 0 {
 		return nil, nil
 	}
-
-	// Normalize line endings so \r\n and bare \r don't produce phantom columns.
-	raw = strings.ReplaceAll(raw, "\r\n", "\n")
-	raw = strings.ReplaceAll(raw, "\r", "\n")
-
-	var result []string
-	var regions []CodeRegion
-	var codeBuffer []string
-	var codeLang string
-	inCode := false
-
-	for _, line := range strings.Split(raw, "\n") {
-		if strings.HasPrefix(line, "```") {
-			if !inCode {
-				codeLang = normalizeLang(strings.TrimPrefix(line, "```"))
-				inCode = true
-			} else {
-				codeStart := len(result)
-				result = append(result, renderCodeBlock(codeBuffer, codeLang, width, th)...)
-				regions = append(regions, CodeRegion{
-					Start:   codeStart,
-					End:     len(result),
-					Content: strings.Join(codeBuffer, "\n"),
-				})
-				codeBuffer = nil
-				codeLang = ""
-				inCode = false
-			}
-			continue
-		}
-		if inCode {
-			codeBuffer = append(codeBuffer, line)
-		} else {
-			result = append(result, wrapLine(line, width, style)...)
-		}
-	}
-
-	// Flush unclosed fence as highlighted code.
-	if inCode && len(codeBuffer) > 0 {
-		codeStart := len(result)
-		result = append(result, renderCodeBlock(codeBuffer, codeLang, width, th)...)
-		regions = append(regions, CodeRegion{
-			Start:   codeStart,
-			End:     len(result),
-			Content: strings.Join(codeBuffer, "\n"),
-		})
-	}
-
-	return result, regions
+	return renderMarkdownContent(raw, width, style, th)
 }
 
 // gutterSep is the separator between line numbers and code content.
@@ -395,3 +359,4 @@ func forceBreak(word string, width int, style lipgloss.Style, current *strings.B
 	}
 	return lines
 }
+

@@ -1,6 +1,9 @@
 package architect
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestDecodeJSONPayload_FencedJSON(t *testing.T) {
 	raw := "Here is the result:\n```json\n{\"goals\":[\"ship\"],\"scope\":\"api\"}\n```"
@@ -50,3 +53,51 @@ func TestContainsIgnoreCase(t *testing.T) {
 	}
 }
 
+func TestResolveThinkingBudget(t *testing.T) {
+	t.Run("dynamic fallback when thinkingBudget is zero", func(t *testing.T) {
+		p := &anthropicPlanner{thinkingBudget: 0}
+		budget := p.resolveThinkingBudget(6000)
+		// maxTokens/3 = 2000, but floor is 1024, so expect 2000
+		if budget != 2000 {
+			t.Fatalf("expected 2000 for dynamic fallback, got %d", budget)
+		}
+	})
+
+	t.Run("explicit budget used when set", func(t *testing.T) {
+		p := &anthropicPlanner{thinkingBudget: 8192}
+		budget := p.resolveThinkingBudget(16384)
+		if budget != 8192 {
+			t.Fatalf("expected 8192, got %d", budget)
+		}
+	})
+
+	t.Run("clamps when budget >= maxTokens", func(t *testing.T) {
+		p := &anthropicPlanner{thinkingBudget: 8192}
+		budget := p.resolveThinkingBudget(4096)
+		if budget != 4095 {
+			t.Fatalf("expected 4095 (maxTokens-1), got %d", budget)
+		}
+	})
+
+	t.Run("disabled for small maxTokens", func(t *testing.T) {
+		p := &anthropicPlanner{thinkingBudget: 8192}
+		budget := p.resolveThinkingBudget(1024)
+		if budget != 0 {
+			t.Fatalf("expected 0 for small maxTokens, got %d", budget)
+		}
+	})
+}
+
+func TestAppendThoughtDeltaAccumulatesFragments(t *testing.T) {
+	var thought strings.Builder
+
+	if got := appendThoughtDelta(&thought, "Clar"); got != "Clar" {
+		t.Fatalf("appendThoughtDelta(Clar) = %q, want %q", got, "Clar")
+	}
+	if got := appendThoughtDelta(&thought, "ifying questions"); got != "Clarifying questions" {
+		t.Fatalf("appendThoughtDelta(fragment) = %q, want %q", got, "Clarifying questions")
+	}
+	if got := appendThoughtDelta(&thought, "."); got != "Clarifying questions." {
+		t.Fatalf("appendThoughtDelta(period) = %q, want %q", got, "Clarifying questions.")
+	}
+}

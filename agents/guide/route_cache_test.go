@@ -332,7 +332,8 @@ func TestRouteCache_SetBulk(t *testing.T) {
 func TestRouteCache_DefaultConfig(t *testing.T) {
 	cfg := guide.DefaultRouteCacheConfig()
 	assert.Equal(t, 10000, cfg.MaxSize)
-	assert.Equal(t, time.Hour, cfg.TTL)
+	assert.Equal(t, 5*time.Minute, cfg.TTL)
+	assert.False(t, cfg.EnableSemantic)
 }
 
 // TestRouteCache_ZeroConfig tests handling of zero config values
@@ -343,5 +344,5 @@ func TestRouteCache_ZeroConfig(t *testing.T) {
 
 	stats := cache.Stats()
 	assert.Equal(t, 10000, stats.MaxSize)
-	assert.Equal(t, "1h0m0s", stats.TTL)
+	assert.Equal(t, "1h0m0s", stats.TTL) // normalizeRouteCacheConfig fallback is 1h
 }

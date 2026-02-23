@@ -354,7 +354,7 @@ func (p *ClassificationWorkerPool) classifyFromLLM(ctx context.Context, req *Rou
 	if err != nil {
 		return nil, err
 	}
-	result := classResult.ToRouteResult(time.Since(start))
+	result := classResult.ToRouteResult(time.Since(start), p.classifier.config)
 	p.cacheClassification(req, result)
 	return result, nil
 }

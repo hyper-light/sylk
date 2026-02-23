@@ -17,7 +17,7 @@ const (
 	DefaultMaxOutputTokens = 8192
 
 	// ModelSonnet45 is the model identifier for Claude Sonnet 4.5
-	ModelSonnet45 = "claude-sonnet-4-5-20250929"
+	ModelSonnet45 = "claude-sonnet-4-6"
 )
 
 // Client wraps the Anthropic SDK for summary generation

@@ -37,6 +37,18 @@ const (
 	// EntryTypeHandoffOutcome records the result of a handoff decision.
 	// These are used for learning and improving future decisions.
 	EntryTypeHandoffOutcome WALEntryType = "handoff_outcome"
+
+	// EntryTypeBufferResize records elastic buffer size changes.
+	EntryTypeBufferResize WALEntryType = "buffer_resize"
+
+	// EntryTypeOverlapBegin records the start of an overlap.
+	EntryTypeOverlapBegin WALEntryType = "overlap_begin"
+
+	// EntryTypeOverlapComplete records successful overlap completion.
+	EntryTypeOverlapComplete WALEntryType = "overlap_complete"
+
+	// EntryTypeOverlapAbort records overlap abortion.
+	EntryTypeOverlapAbort WALEntryType = "overlap_abort"
 )
 
 // ProfileSnapshot is a serializable form of AgentHandoffProfile.
@@ -319,8 +331,22 @@ type HandoffWALEntry struct {
 	// WasSuccessful indicates if a handoff/operation was successful.
 	WasSuccessful bool `json:"was_successful,omitempty"`
 
+	// Overlap records an overlap lifecycle event.
+	Overlap *OverlapWALEntry `json:"overlap,omitempty"`
+
+	// BufferResize records elastic buffer resize events.
+	BufferResize *BufferResizeEntry `json:"buffer_resize,omitempty"`
+
 	// SequenceNumber is a monotonically increasing counter for ordering.
 	SequenceNumber uint64 `json:"sequence_number"`
+}
+
+// BufferResizeEntry records an elastic buffer resize event.
+type BufferResizeEntry struct {
+	AgentType string       `json:"agent_type"`
+	OldBudget int          `json:"old_budget"`
+	NewBudget int          `json:"new_budget"`
+	State     ElasticState `json:"state"`
 }
 
 // NewObservationEntry creates a WAL entry for an observation.
@@ -674,6 +700,14 @@ func (wal *HandoffWAL) Recover() (*HandoffState, error) {
 			// Outcome entries are informational - no state update needed
 			// They can be used for analytics
 
+		case EntryTypeOverlapBegin, EntryTypeOverlapComplete, EntryTypeOverlapAbort:
+			// Overlap entries are informational. Orphaned overlaps
+			// (begin without complete/abort) are handled by the supervisor
+			// during RecoverOrphanedOverlaps.
+
+		case EntryTypeBufferResize:
+			// Buffer resize entries are informational.
+
 		case EntryTypeCheckpoint:
 			// This shouldn't happen since we started after the last checkpoint,
 			// but handle it gracefully
@@ -814,6 +848,41 @@ func (wal *HandoffWAL) WritePriorUpdate(profile *AgentHandoffProfile) error {
 func (wal *HandoffWAL) WriteHandoffOutcome(decision *HandoffDecision, wasSuccessful bool) error {
 	entry := NewHandoffOutcomeEntry(decision, wasSuccessful, 0)
 	return wal.AppendEntry(entry)
+}
+
+// WriteOverlapEvent writes an overlap lifecycle event to the WAL.
+func (wal *HandoffWAL) WriteOverlapEvent(entry OverlapWALEntry) error {
+	var entryType WALEntryType
+	switch entry.Phase {
+	case OverlapComplete:
+		entryType = EntryTypeOverlapComplete
+	case OverlapAborted:
+		entryType = EntryTypeOverlapAbort
+	default:
+		entryType = EntryTypeOverlapBegin
+	}
+
+	walEntry := &HandoffWALEntry{
+		Timestamp: entry.Timestamp,
+		EntryType: entryType,
+		Overlap:   &entry,
+	}
+	return wal.AppendEntry(walEntry)
+}
+
+// WriteBufferResize writes a buffer resize event to the WAL.
+func (wal *HandoffWAL) WriteBufferResize(agentType string, oldBudget, newBudget int, state ElasticState) error {
+	walEntry := &HandoffWALEntry{
+		Timestamp: time.Now(),
+		EntryType: EntryTypeBufferResize,
+		BufferResize: &BufferResizeEntry{
+			AgentType: agentType,
+			OldBudget: oldBudget,
+			NewBudget: newBudget,
+			State:     state,
+		},
+	}
+	return wal.AppendEntry(walEntry)
 }
 
 // MaybeCheckpoint writes a checkpoint if enough entries have accumulated.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -187,9 +188,53 @@ func (a *Architect) handleReadResearchAction(ctx context.Context, req *guide.Act
 		return a.publishActionFailure(req, fmt.Errorf("read_research_paper returned nil result"))
 	}
 	if !result.Success {
-	return a.publishActionFailure(req, errors.New(result.Error))
-}
+		return a.publishActionFailure(req, errors.New(result.Error))
+	}
 	return a.publishActionSuccess(req, result.Data)
+}
+
+func (a *Architect) handleCancelAction(req *guide.ActionRequest) error {
+	if req == nil {
+		return nil
+	}
+	correlationID := cancelCorrelationID(req)
+	if correlationID == "" {
+		return a.publishActionFailure(req, errors.New("cancel action missing correlation id"))
+	}
+	cancelled := a.cancelInFlight(correlationID)
+	if req.FireAndForget {
+		return nil
+	}
+	return a.publishActionSuccess(req, map[string]any{
+		"correlation_id": correlationID,
+		"cancelled":      cancelled,
+	})
+}
+
+func cancelCorrelationID(req *guide.ActionRequest) string {
+	if req == nil {
+		return ""
+	}
+	if correlationID := lookupCancelCorrelation(req.Data); correlationID != "" {
+		return correlationID
+	}
+	return strings.TrimSpace(req.CorrelationID)
+}
+
+func lookupCancelCorrelation(data any) string {
+	values, ok := data.(map[string]any)
+	if !ok || values == nil {
+		return ""
+	}
+	value, ok := values["correlation_id"]
+	if !ok {
+		return ""
+	}
+	correlationID, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(correlationID)
 }
 
 func (a *Architect) publishActionSuccess(req *guide.ActionRequest, data any) error {

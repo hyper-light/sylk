@@ -29,20 +29,21 @@ const wrapBadgeWidth = 3
 // It references a History ring buffer and renders entries on demand with caching.
 // scrollOff tracks the number of rendered lines scrolled back from the bottom.
 type Viewport struct {
-	history        *History
-	theme          *theme.Theme
-	scrollOff      int // Lines scrolled back from the bottom (0 = following).
-	viewHeight     int
-	viewWidth      int
-	following      bool      // Auto-scroll to bottom on new content.
-	highlightID    string    // Entry ID to highlight (empty = none).
-	highlightStart int       // First entry-relative line to highlight (inclusive).
-	highlightEnd   int       // Last entry-relative line to highlight (exclusive).
-	selectedIndex  int       // Logical history index of selected entry (-1 = none).
-	selectedRegion int       // Region index within the selected entry.
-	edgeFlash      int       // Edge flash direction: -1 = top, 0 = none, 1 = bottom.
-	edgeFlashUntil time.Time // Expiry time for edge flash.
-	bounceOffset   int       // Visual line displacement from overscroll bounce.
+	history            *History
+	theme              *theme.Theme
+	scrollOff          int // Lines scrolled back from the bottom (0 = following).
+	viewHeight         int
+	viewWidth          int
+	following          bool      // Auto-scroll to bottom on new content.
+	layoutCompensation int       // Accumulated scrollOff from input-growth layout changes.
+	highlightID        string    // Entry ID to highlight (empty = none).
+	highlightStart     int       // First entry-relative line to highlight (inclusive).
+	highlightEnd       int       // Last entry-relative line to highlight (exclusive).
+	selectedIndex      int       // Logical history index of selected entry (-1 = none).
+	selectedRegion     int       // Region index within the selected entry.
+	edgeFlash          int       // Edge flash direction: -1 = top, 0 = none, 1 = bottom.
+	edgeFlashUntil     time.Time // Expiry time for edge flash.
+	bounceOffset       int       // Visual line displacement from overscroll bounce.
 }
 
 // NewViewport creates a Viewport bound to the given History.
@@ -63,6 +64,34 @@ const chatPadding = 2
 func (vp *Viewport) SetSize(width, height int) {
 	vp.viewWidth = max(width-chatPadding, 0)
 	vp.viewHeight = max(height, 0)
+}
+
+// CompensateInputGrowth adjusts scrollOff to keep the top of the viewport
+// stable when the chat panel height changes due to input panel growth/shrink.
+// When the viewport shrinks (input grew), the bottom line is dropped instead
+// of the top, preventing a full-screen redraw. When the viewport grows back
+// (input shrank, e.g. on submit), only the layout-induced portion of scrollOff
+// is absorbed — any user-initiated scroll offset is preserved.
+func (vp *Viewport) CompensateInputGrowth(oldHeight, newHeight int) {
+	if oldHeight == newHeight || oldHeight == 0 || newHeight == 0 {
+		return
+	}
+	delta := oldHeight - newHeight
+	if delta > 0 && vp.following {
+		// Viewport shrank: offset scrollOff to keep top line stable.
+		// Bottom content is absorbed by the growing input.
+		vp.scrollOff += delta
+		vp.layoutCompensation += delta
+		vp.following = false
+	} else if delta < 0 && vp.layoutCompensation > 0 {
+		// Viewport grew back: absorb previous compensation.
+		absorption := min(-delta, vp.layoutCompensation)
+		vp.scrollOff = max(0, vp.scrollOff-absorption)
+		vp.layoutCompensation -= absorption
+		if vp.scrollOff == 0 {
+			vp.following = true
+		}
+	}
 }
 
 // ScrollUp scrolls up by one line. Returns true if the scroll was applied,
@@ -693,7 +722,7 @@ func (vp *Viewport) CopyTargetAtViewLine(y int) *CopyTarget {
 // resolveCopyTarget checks whether lineInEntry falls within a code region.
 // If so, returns the code block content and its line range.
 // Otherwise returns the full message content and the prose line range
-// (all content lines, skipping header and spacer).
+// (all content lines, skipping header, thinking summary, and spacer).
 func (vp *Viewport) resolveCopyTarget(entry *ChatEntry, entryHeight, lineInEntry int) *CopyTarget {
 	for _, cr := range entry.CodeRegions {
 		if lineInEntry >= cr.Start && lineInEntry < cr.End {
@@ -708,12 +737,23 @@ func (vp *Viewport) resolveCopyTarget(entry *ChatEntry, entryHeight, lineInEntry
 	if entry.Content == "" {
 		return nil
 	}
+	contentStart := headerLines + thinkingSummaryLines(entry)
 	return &CopyTarget{
 		EntryID:        entry.ID,
 		Content:        entry.Content,
-		HighlightStart: headerLines,
-		HighlightEnd:   max(entryHeight-1, headerLines),
+		HighlightStart: contentStart,
+		HighlightEnd:   max(entryHeight-1, contentStart),
 	}
+}
+
+// thinkingSummaryLines returns the number of rendered lines the collapsed
+// thinking summary occupies. This matches the renderer's Phase 2 logic:
+// one line for the "◉ thought for X.Xs" summary when ThinkingElapsed > 0.
+func thinkingSummaryLines(entry *ChatEntry) int {
+	if entry.ThinkingElapsed > 0 {
+		return 1
+	}
+	return 0
 }
 
 // cacheRendered stores rendered lines and code regions back into the History entry.

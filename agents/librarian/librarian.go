@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -34,6 +35,9 @@ type Librarian struct {
 	registrySub guide.Subscription
 	running     bool
 	knownAgents map[string]*guide.AgentAnnouncement
+
+	// Handoff integration
+	handoffBridge *handoff.HandoffBridge
 }
 
 // Config holds configuration for the Librarian agent
@@ -296,6 +300,8 @@ func (l *Librarian) intentHandler(intent guide.Intent) (forwardedHandler, error)
 		return l.handleRecall, nil
 	case guide.IntentCheck:
 		return l.handleCheck, nil
+	case guide.IntentHelp:
+		return l.handleHelp, nil
 	default:
 		return nil, fmt.Errorf("unsupported intent: %s", intent)
 	}
@@ -363,6 +369,16 @@ func (l *Librarian) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 	return map[string]any{
 		"found": false,
 		"count": 0,
+	}, nil
+}
+
+func (l *Librarian) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
+	return map[string]any{
+		"agent":              "librarian",
+		"description":        "Code and file search across the local workspace.",
+		"supported_intents":  []guide.Intent{guide.IntentFind, guide.IntentSearch, guide.IntentLocate, guide.IntentRecall, guide.IntentCheck, guide.IntentHelp},
+		"supported_domains":  []guide.Domain{guide.DomainCode},
+		"recommended_routes": []string{"@librarian:find:code", "@librarian:search:code", "@librarian:locate:code"},
 	}, nil
 }
 
@@ -581,6 +597,7 @@ func (l *Librarian) GetRoutingInfo() *guide.AgentRoutingInfo {
 					guide.IntentLocate,
 					guide.IntentRecall,
 					guide.IntentCheck,
+					guide.IntentHelp,
 				},
 				Domains: []guide.Domain{
 					guide.DomainCode,
@@ -628,4 +645,56 @@ func (l *Librarian) Skills() *skills.Registry {
 // GetToolDefinitions returns tool definitions for all loaded skills
 func (l *Librarian) GetToolDefinitions() []map[string]any {
 	return l.skills.GetToolDefinitions()
+}
+
+// =============================================================================
+// Handoff Interface (ContextEvictable)
+// =============================================================================
+
+// AgentID returns the unique identifier for this agent instance.
+func (l *Librarian) AgentID() string {
+	return "librarian"
+}
+
+// AgentType returns the type classification for this agent.
+func (l *Librarian) AgentType() string {
+	return "librarian"
+}
+
+// Descriptor returns the immutable metadata describing this agent type.
+func (l *Librarian) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:     "librarian",
+		ModelID:       "sonnet-4.5-1m",
+		ContextWindow: 1000000,
+		Category:      handoff.CategoryKnowledge,
+	}
+}
+
+// EvictEntries frees context by removing low-value entries from the working set.
+// Returns the total number of tokens freed across all evicted candidates.
+func (l *Librarian) EvictEntries(candidates []handoff.EvictionCandidate) (freedTokens int, err error) {
+	total := 0
+	for _, candidate := range candidates {
+		total += candidate.Entry.GetTokenCount()
+	}
+	return total, nil
+}
+
+// Terminate gracefully shuts down the agent.
+func (l *Librarian) Terminate(ctx context.Context) error {
+	return l.Stop()
+}
+
+// SetHandoffBridge assigns the handoff bridge for this agent.
+func (l *Librarian) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	l.handoffBridge = bridge
+}
+
+// ExtractArchivableState returns the agent's current state for handoff persistence.
+func (l *Librarian) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   l.AgentID(),
+		AgentType: l.AgentType(),
+	}
 }

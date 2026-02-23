@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -22,6 +23,26 @@ func (i *Inspector) registerCoreSkills() {
 	i.skills.Register(validateCriteriaSkill(i))
 	i.skills.Register(requestOverrideSkill(i))
 	i.skills.Register(getValidationStatusSkill(i))
+	i.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "inspector",
+		SessionID: func() string { return i.state.SessionID },
+		Publish:   i.publishRerouteRequest,
+	}))
+}
+
+func (i *Inspector) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if i.bus == nil {
+		return fmt.Errorf("inspector bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "inspector",
+		SuggestedTarget: suggestedTarget,
+		SessionID:       i.state.SessionID,
+		ExcludeAgents:   []string{"inspector"},
+	}
+	return i.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 type runLinterParams struct {

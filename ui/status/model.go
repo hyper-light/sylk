@@ -43,6 +43,7 @@ type Model struct {
 	spinnerActive bool
 	statusText    string
 	lastSpin      time.Time
+	lastTokenSpin time.Time
 
 	// Persistent prompt (takes priority over flash; does not auto-clear).
 	prompt string
@@ -50,6 +51,9 @@ type Model struct {
 	// Flash overlay
 	flash      string
 	flashUntil time.Time
+
+	// Engaged agent badge (empty when no agent is engaged)
+	engagedAgent string
 
 	// View ring indicator (pre-formatted by app, empty when no panels collapsed)
 	viewRingHint string
@@ -73,7 +77,7 @@ func New(t *theme.Theme, mgr *session.Manager) *Model {
 		manager: mgr,
 		mode:    "CHAT",
 		spinner: NewSpinner(),
-		tokens:  NewTokenDisplay(t.StatusBar),
+		tokens:  NewTokenDisplay(t.StatusBar, t.StatusNormal),
 	}
 }
 
@@ -132,6 +136,7 @@ func (m *Model) View() string {
 
 	m.viewCache = lipgloss.NewStyle().
 		Width(contentWidth).
+		MaxHeight(1).
 		MarginLeft(statusBarInset).
 		Render(content)
 	m.viewDirty = false
@@ -171,10 +176,29 @@ func (m *Model) HasPrompt() bool {
 	return m.prompt != ""
 }
 
+// SetEngagedAgent updates the engaged agent badge in the status bar.
+// Pass "" to clear the badge when no agent is engaged.
+func (m *Model) SetEngagedAgent(agentID string) {
+	m.engagedAgent = agentID
+	m.viewDirty = true
+}
+
 // SetViewRingHint updates the pre-formatted ring indicator string.
 // Pass "" to clear the indicator when all panels are visible.
 func (m *Model) SetViewRingHint(hint string) {
 	m.viewRingHint = hint
+	m.viewDirty = true
+}
+
+// SetTokens updates the cumulative prompt and completion token counts.
+func (m *Model) SetTokens(prompt, completion int) {
+	m.tokens.Update(prompt, completion)
+	m.viewDirty = true
+}
+
+// SetTokenPhase sets which token counter is actively updating.
+func (m *Model) SetTokenPhase(phase TokenPhase) {
+	m.tokens.SetPhase(phase)
 	m.viewDirty = true
 }
 
@@ -184,13 +208,18 @@ func (m *Model) SetViewRingHint(hint string) {
 // Uses m.flash rather than time-based check to guarantee the clearing
 // tick fires even when the flash deadline and the tick align exactly.
 func (m *Model) IsAnimating() bool {
-	return m.spinnerActive || m.flash != ""
+	return m.spinnerActive || m.flash != "" || m.tokens.IsAnimating()
 }
 
 func (m *Model) handleDecorTick(now time.Time) (tea.Model, tea.Cmd) {
 	if m.spinnerActive && (m.lastSpin.IsZero() || now.Sub(m.lastSpin) >= spinnerFrameInterval) {
 		m.spinner.Tick()
 		m.lastSpin = now
+		m.viewDirty = true
+	}
+	if m.tokens.IsAnimating() && (m.lastTokenSpin.IsZero() || now.Sub(m.lastTokenSpin) >= spinnerFrameInterval) {
+		m.tokens.Tick()
+		m.lastTokenSpin = now
 		m.viewDirty = true
 	}
 	if !m.flashUntil.IsZero() && !now.Before(m.flashUntil) {
@@ -221,9 +250,23 @@ func (m *Model) handleStreamComplete() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// StopSpinner deactivates the center spinner and clears status text.
+// Used as a safety net when stream completion wasn't propagated.
+func (m *Model) StopSpinner() {
+	if !m.spinnerActive {
+		return
+	}
+	m.spinnerActive = false
+	m.statusText = ""
+	m.viewDirty = true
+}
+
 func (m *Model) handleStreamError(v msg.StreamErrorMsg) (tea.Model, tea.Cmd) {
 	m.spinnerActive = false
-	m.statusText = v.Err.Error()
+	m.statusText = ""
+	if v.Err != nil {
+		m.SetFlash(v.Err.Error())
+	}
 	m.viewDirty = true
 	return m, nil
 }
@@ -243,7 +286,12 @@ func (m *Model) renderLeft() string {
 	session := m.sessionLabel()
 	sessionRendered := m.theme.StatusBar.Render(session)
 
-	return lipgloss.JoinHorizontal(lipgloss.Center, modeBadge, " ", sessionRendered)
+	parts := []string{modeBadge, " ", sessionRendered}
+	if m.engagedAgent != "" {
+		agentBadge := m.theme.StatusNormal.Render("[" + m.engagedAgent + "]")
+		parts = append(parts, " ", agentBadge)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Center, parts...)
 }
 
 func (m *Model) renderCenter() string {

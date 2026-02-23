@@ -45,9 +45,9 @@ func main() {
 		SessionID:    "test-session-123",
 	}
 	
-	// Force the model name for the test. We use gemini-2.5-pro as it's generally available,
+	// Force the model name for the test. We use gemini-3.1-pro-preview as it's generally available,
 	// unless you explicitly want to test the 3.1-pro-preview string.
-	cfg.RouterConfig.Model = "gemini-2.5-pro"
+	cfg.RouterConfig.Model = "gemini-3.1-pro-preview"
 
 	g, err := guide.NewWithGeminiClient(client, cfg)
 	if err != nil {

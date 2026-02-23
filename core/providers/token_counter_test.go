@@ -118,7 +118,7 @@ func TestCharacterBasedCounter_MaxContextTokens(t *testing.T) {
 		{"gpt-4o-mini", 128000},
 		{"claude-opus-4-6", 200000},
 		{"claude-opus-4-5-20251101", 200000},
-		{"claude-sonnet-4-5-20250901", 1000000},
+		{"claude-sonnet-4-6", 1000000},
 		{"gemini-3-pro", 2000000},
 		{"unknown-model", 128000}, // default
 	}

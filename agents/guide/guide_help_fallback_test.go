@@ -1,0 +1,147 @@
+package guide_test
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestGuideRoute_FallsBackToGuideWhenTargetLacksIntentSupport(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+
+	g, err := guide.NewWithClassifier(&guide.MockClassifierClient{DefaultTarget: "mock-agent"}, guide.Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	err = g.Register(&guide.AgentRoutingInfo{
+		ID:   "mock-agent",
+		Type: "mock-agent",
+		Name: "mock-agent",
+		Registration: &guide.AgentRegistration{
+			ID:   "mock-agent",
+			Name: "mock-agent",
+			Capabilities: guide.AgentCapabilities{
+				Intents: []guide.Intent{guide.IntentCheck},
+				Domains: []guide.Domain{guide.DomainCode},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	req := &guide.RouteRequest{
+		Input:         "Help me understand this workflow",
+		SourceAgentID: "tui",
+		Timestamp:     time.Now(),
+	}
+
+	forwarded, err := g.Route(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, "guide", forwarded.TargetAgentID)
+	assert.Equal(t, guide.IntentHelp, forwarded.Intent)
+	assert.True(t, strings.Contains(forwarded.ClassificationMethod, "guide_fallback") || forwarded.ClassificationMethod == "llm")
+}
+
+func TestGuideRoute_ExplicitUnsupportedTargetFallsBackToGuide(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+
+	g, err := guide.NewWithClassifier(&guide.MockClassifierClient{DefaultTarget: "mock-agent"}, guide.Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	err = g.Register(&guide.AgentRoutingInfo{
+		ID:   "mock-agent",
+		Type: "mock-agent",
+		Name: "mock-agent",
+		Registration: &guide.AgentRegistration{
+			ID:   "mock-agent",
+			Name: "mock-agent",
+			Capabilities: guide.AgentCapabilities{
+				Intents: []guide.Intent{guide.IntentCheck},
+				Domains: []guide.Domain{guide.DomainCode},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	req := &guide.RouteRequest{
+		Input:         "route this directly",
+		SourceAgentID: "tui",
+		TargetAgentID: "mock-agent",
+		Timestamp:     time.Now(),
+	}
+
+	forwarded, err := g.Route(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, "guide", forwarded.TargetAgentID)
+	assert.Equal(t, guide.IntentHelp, forwarded.Intent)
+	assert.Contains(t, forwarded.ClassificationMethod, "guide_fallback")
+}
+
+func TestGuideRoute_PromotesChatToHelpForSpecialistTarget(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+
+	classifier := &fixedClassifierClient{payload: map[string]any{
+		"is_retrospective": false,
+		"intent":           "chat",
+		"domain":           "general",
+		"target_agent":     "architect",
+		"confidence":       0.95,
+	}}
+	g, err := guide.NewWithClassifier(classifier, guide.Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	err = g.Register(&guide.AgentRoutingInfo{
+		ID:   "architect",
+		Type: "architect",
+		Name: "architect",
+		Registration: &guide.AgentRegistration{
+			ID:   "architect",
+			Name: "architect",
+			Capabilities: guide.AgentCapabilities{
+				Intents: []guide.Intent{
+					guide.IntentPlan,
+					guide.IntentDesign,
+					guide.IntentHelp,
+				},
+				Domains: []guide.Domain{guide.DomainDesign, guide.DomainTasks},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	req := &guide.RouteRequest{
+		Input:         "Can you help me get started with OAuth?",
+		SourceAgentID: "tui",
+		Timestamp:     time.Now(),
+	}
+
+	forwarded, err := g.Route(context.Background(), req)
+	require.NoError(t, err)
+	assert.Equal(t, "architect", forwarded.TargetAgentID)
+	assert.Equal(t, guide.IntentHelp, forwarded.Intent)
+	assert.NotContains(t, forwarded.ClassificationMethod, "guide_fallback")
+}

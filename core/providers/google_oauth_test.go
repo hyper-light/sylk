@@ -130,10 +130,44 @@ func TestHydrateGoogleConfig_OAuthAppliesResolvedAuth(t *testing.T) {
 	}
 }
 
+func TestHydrateGoogleConfig_OAuthWithoutProjectUsesGeminiAPI(t *testing.T) {
+	cfg := DefaultGoogleConfig()
+	cfg.AuthMode = GoogleAuthModeOAuth
+	cfg.ProjectID = ""
+	cfg.UseVertexAI = false
+	cfg.Location = ""
+	cfg.APIKey = ""
+
+	authSvc := &mockGoogleAuthService{
+		auth: &oauth.GoogleOAuthAuth{
+			AccessToken: "access_token",
+			Location:    "us-east1",
+		},
+	}
+
+	if err := hydrateGoogleConfig(context.Background(), &cfg, authSvc); err != nil {
+		t.Fatalf("hydrateGoogleConfig() error: %v", err)
+	}
+	if cfg.UseVertexAI {
+		t.Fatal("expected oauth without project to keep Gemini API backend")
+	}
+	if cfg.ProjectID != "" {
+		t.Fatalf("expected empty project_id, got %q", cfg.ProjectID)
+	}
+	if cfg.Location != "us-east1" {
+		t.Fatalf("expected resolved location, got %q", cfg.Location)
+	}
+}
+
 func TestHydrateGoogleConfig_OAuthReturnsResolveError(t *testing.T) {
 	cfg := DefaultGoogleConfig()
 	cfg.AuthMode = GoogleAuthModeOAuth
 	authSvc := &mockGoogleAuthService{err: oauth.ErrGoogleAuthNotConfigured}
+	originalResolver := googleProviderAPIKeyResolver
+	googleProviderAPIKeyResolver = func() string { return "" }
+	t.Cleanup(func() {
+		googleProviderAPIKeyResolver = originalResolver
+	})
 
 	err := hydrateGoogleConfig(context.Background(), &cfg, authSvc)
 	if err == nil {
@@ -220,6 +254,25 @@ func TestBuildGoogleClientConfig_OAuthUsesVertexAndHTTPClient(t *testing.T) {
 	}
 	if clientCfg.Backend != genai.BackendVertexAI {
 		t.Fatalf("expected vertex backend, got %v", clientCfg.Backend)
+	}
+	if clientCfg.HTTPClient == nil {
+		t.Fatal("expected oauth HTTP client to be configured")
+	}
+}
+
+func TestBuildGoogleClientConfig_OAuthWithoutProjectUsesGeminiAPI(t *testing.T) {
+	cfg := DefaultGoogleConfig()
+	cfg.AuthMode = GoogleAuthModeOAuth
+	cfg.UseVertexAI = false
+	cfg.ProjectID = ""
+	cfg.APIKey = ""
+
+	clientCfg, err := buildGoogleClientConfig(cfg, &mockGoogleAuthService{})
+	if err != nil {
+		t.Fatalf("buildGoogleClientConfig() error: %v", err)
+	}
+	if clientCfg.Backend != genai.BackendGeminiAPI {
+		t.Fatalf("expected gemini backend, got %v", clientCfg.Backend)
 	}
 	if clientCfg.HTTPClient == nil {
 		t.Fatal("expected oauth HTTP client to be configured")

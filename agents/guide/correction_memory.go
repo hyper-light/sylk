@@ -37,9 +37,15 @@ func newCorrectionMemory(maxCorrections int) *correctionMemory {
 }
 
 func newCorrectionCache() *ristretto.Cache {
+	const (
+		maxCorrectionKeys = 512
+		maxRecordsPerKey  = 8
+		avgRecordBytes    = 220
+		avgEntryBytes     = maxRecordsPerKey*avgRecordBytes + 24 // slice header
+	)
 	cache, err := ristretto.NewCache(&ristretto.Config{
-		NumCounters: 1e4,
-		MaxCost:     1024,
+		NumCounters: int64(maxCorrectionKeys * 10),            // 5,120
+		MaxCost:     int64(maxCorrectionKeys) * avgEntryBytes, // 913,408
 		BufferItems: 64,
 	})
 	if err != nil {
@@ -253,11 +259,27 @@ func promptCacheKey(input string) string {
 	return "prompt:" + input
 }
 
+func estimateCorrectionSliceCost(records []CorrectionRecord) int64 {
+	const (
+		sliceHeader    = 24
+		structOverhead = 56 // time.Time(24) + struct alignment(32)
+	)
+	cost := int64(sliceHeader)
+	for i := range records {
+		r := &records[i]
+		cost += int64(structOverhead + len(r.Input) + len(r.WrongIntent) +
+			len(r.WrongDomain) + len(r.WrongTarget) + len(r.CorrectIntent) +
+			len(r.CorrectDomain) + len(r.CorrectTarget) + len(r.CorrectedBy) +
+			len(r.Reason))
+	}
+	return cost
+}
+
 func (m *correctionMemory) cacheSet(key string, records []CorrectionRecord) {
 	if m == nil || m.cache == nil || key == "" {
 		return
 	}
-	_ = m.cache.Set(key, cloneCorrections(records), int64(len(records)+1))
+	_ = m.cache.Set(key, cloneCorrections(records), estimateCorrectionSliceCost(records))
 	m.cache.Wait()
 }
 

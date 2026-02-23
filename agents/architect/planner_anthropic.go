@@ -9,25 +9,30 @@ import (
 	"strings"
 	"time"
 
-	anthropic "github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	promptskill "github.com/adalundhe/sylk/core/promptskills"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 type planningLLM interface {
 	AnalyzeRequirements(ctx context.Context, query string, params map[string]any) (*Requirements, error)
 	DesignArchitecture(ctx context.Context, requirements *Requirements, patterns *CodebasePatterns) (*SolutionArchitecture, error)
 	GenerateTasks(ctx context.Context, architecture *SolutionArchitecture, constraints *PlanConstraints) ([]*AtomicTask, error)
+	ComposeUserResponse(ctx context.Context, request plannerConversationRequest) (string, error)
 }
 
 type anthropicPlanner struct {
-	client    *anthropic.Client
-	model     string
-	maxTokens int
-	system    string
-	timeout   time.Duration
-	retryMax  int
-	logger    *slog.Logger
+	provider           *providers.AnthropicProvider
+	maxTokens          int
+	thinkingBudget     int
+	system             string
+	conversationSystem string
+	timeout            time.Duration
+	logger             *slog.Logger
 }
+
+type plannerThoughtCallback func(stage string, thought string)
+
+type plannerThoughtContextKey struct{}
 
 var ErrArchitectPlannerAuthNotConfigured = errors.New("architect planner auth not configured")
 
@@ -134,28 +139,46 @@ func (a *Architect) tryGenerateTasksWithLLM(
 }
 
 func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
-	apiKey := resolveArchitectAnthropicAPIKey(cfg.AnthropicAPIKey)
-	if apiKey == "" {
-		return nil, ErrArchitectPlannerAuthNotConfigured
+	providerCfg := providers.AnthropicConfig{
+		BaseConfig: providers.BaseConfig{
+			APIKey:         cfg.AnthropicAPIKey,
+			Model:          cfg.Model,
+			MaxTokens:      cfg.MaxOutputTokens,
+			Temperature:    0.7,
+			MaxRetries:     cfg.LLMRetryMax,
+			RetryBaseDelay: 200 * time.Millisecond,
+			RetryMaxDelay:  time.Second,
+		},
+		EnableCaching:    !cfg.DisablePromptCache,
+		PromptCacheTTL:   cfg.PromptCacheTTL,
+		SystemPrompt:     buildPlannerSystemPrompt(cfg.SystemPrompt),
+		ThinkingBudget:   cfg.ThinkingBudget,
+		AdaptiveThinking: true,
+	}
+	if providerCfg.Model == "" {
+		providerCfg.Model = DefaultArchitectModel
+	}
+	if providerCfg.MaxTokens == 0 {
+		providerCfg.MaxTokens = DefaultMaxOutputTokens
 	}
 
-	opts := []option.RequestOption{
-		option.WithAPIKey(apiKey),
-		option.WithHeader(
-			"anthropic-beta",
-			string(anthropic.AnthropicBetaInterleavedThinking2025_05_14),
-		),
+	promptSkills := promptskill.DiscoverAgentSkills("architect")
+	provider, err := providers.NewAnthropicProvider(providerCfg, promptSkills...)
+	if err != nil {
+		if strings.Contains(err.Error(), "api_key") {
+			return nil, ErrArchitectPlannerAuthNotConfigured
+		}
+		return nil, err
 	}
-	client := anthropic.NewClient(opts...)
 
 	return &anthropicPlanner{
-		client:    &client,
-		model:     cfg.Model,
-		maxTokens: cfg.MaxOutputTokens,
-		system:    buildPlannerSystemPrompt(cfg.SystemPrompt),
-		timeout:   cfg.LLMRequestTimeout,
-		retryMax:  cfg.LLMRetryMax,
-		logger:    logger,
+		provider:           provider,
+		maxTokens:          cfg.MaxOutputTokens,
+		thinkingBudget:     cfg.ThinkingBudget,
+		system:             buildPlannerSystemPrompt(cfg.SystemPrompt),
+		conversationSystem: buildPlannerConversationSystemPrompt(cfg.SystemPrompt),
+		timeout:            cfg.LLMRequestTimeout,
+		logger:             logger,
 	}, nil
 }
 
@@ -167,6 +190,29 @@ func buildPlannerSystemPrompt(base string) string {
 	return plannerJSONSystemPrompt + "\n\nContext:\n" + trimmed
 }
 
+func withPlannerThoughtCallback(ctx context.Context, cb plannerThoughtCallback) context.Context {
+	if cb == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, plannerThoughtContextKey{}, cb)
+}
+
+func emitPlannerThought(ctx context.Context, stage string, thought string) {
+	if ctx == nil {
+		return
+	}
+	cb, ok := ctx.Value(plannerThoughtContextKey{}).(plannerThoughtCallback)
+	if !ok || cb == nil {
+		return
+	}
+	stage = strings.TrimSpace(stage)
+	thought = strings.TrimSpace(thought)
+	if thought == "" {
+		return
+	}
+	cb(stage, thought)
+}
+
 func (p *anthropicPlanner) AnalyzeRequirements(
 	ctx context.Context,
 	query string,
@@ -174,7 +220,14 @@ func (p *anthropicPlanner) AnalyzeRequirements(
 ) (*Requirements, error) {
 	prompt := buildRequirementsPrompt(query, params)
 	var payload requirementsPayload
-	if err := p.requestJSONWithBudgets(ctx, prompt, &payload, requirementsBudgets(p.maxTokens), p.systemForStage("requirements")); err != nil {
+	if err := p.requestJSONWithBudgets(
+		ctx,
+		prompt,
+		&payload,
+		requirementsBudgets(p.maxTokens),
+		p.systemForStage("requirements"),
+		"requirements",
+	); err != nil {
 		return nil, err
 	}
 	return payload.toRequirements(query, params), nil
@@ -187,7 +240,14 @@ func (p *anthropicPlanner) DesignArchitecture(
 ) (*SolutionArchitecture, error) {
 	prompt := buildDesignPrompt(requirements, patterns)
 	var payload architecturePayload
-	if err := p.requestJSONWithBudgets(ctx, prompt, &payload, designBudgets(p.maxTokens), p.systemForStage("design")); err != nil {
+	if err := p.requestJSONWithBudgets(
+		ctx,
+		prompt,
+		&payload,
+		designBudgets(p.maxTokens),
+		p.systemForStage("design"),
+		"design",
+	); err != nil {
 		return nil, err
 	}
 	return payload.toArchitecture(requirements), nil
@@ -199,7 +259,13 @@ func (p *anthropicPlanner) GenerateTasks(
 	constraints *PlanConstraints,
 ) ([]*AtomicTask, error) {
 	prompt := buildTaskPrompt(architecture, constraints)
-	tasks, err := p.parseTasksWithBudgets(ctx, prompt, taskBudgets(p.maxTokens), p.systemForStage("tasks"))
+	tasks, err := p.parseTasksWithBudgets(
+		ctx,
+		prompt,
+		taskBudgets(p.maxTokens),
+		p.systemForStage("tasks"),
+		"tasks",
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -209,10 +275,16 @@ func (p *anthropicPlanner) GenerateTasks(
 	return tasks, nil
 }
 
-func (p *anthropicPlanner) parseTasksWithBudgets(ctx context.Context, prompt string, budgets []int, system string) ([]*AtomicTask, error) {
+func (p *anthropicPlanner) parseTasksWithBudgets(
+	ctx context.Context,
+	prompt string,
+	budgets []int,
+	system string,
+	stage string,
+) ([]*AtomicTask, error) {
 	var lastErr error
 	for _, budget := range budgets {
-		text, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system)
+		text, _, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system, stage)
 		if err != nil {
 			lastErr = err
 			continue
@@ -226,10 +298,17 @@ func (p *anthropicPlanner) parseTasksWithBudgets(ctx context.Context, prompt str
 	return nil, lastErr
 }
 
-func (p *anthropicPlanner) requestJSONWithBudgets(ctx context.Context, prompt string, out any, budgets []int, system string) error {
+func (p *anthropicPlanner) requestJSONWithBudgets(
+	ctx context.Context,
+	prompt string,
+	out any,
+	budgets []int,
+	system string,
+	stage string,
+) error {
 	var lastErr error
 	for _, budget := range budgets {
-		text, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system)
+		text, _, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system, stage)
 		if err != nil {
 			lastErr = err
 			continue
@@ -243,48 +322,115 @@ func (p *anthropicPlanner) requestJSONWithBudgets(ctx context.Context, prompt st
 	return lastErr
 }
 
-func (p *anthropicPlanner) requestTextWithMaxTokens(ctx context.Context, prompt string, maxTokens int, system string) (string, error) {
+func (p *anthropicPlanner) requestTextWithMaxTokens(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+) (string, *providers.Usage, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-
-	var lastErr error
-	for attempt := 1; attempt <= p.retryMax; attempt++ {
-		text, err := p.requestTextOnce(ctx, prompt, maxTokens, system)
-		if err == nil {
-			return text, nil
-		}
-		lastErr = err
-		if !shouldRetryPlannerCall(ctx, err, attempt, p.retryMax) {
-			break
-		}
-		if sleepErr := waitForRetry(ctx, plannerRetryDelay(attempt)); sleepErr != nil {
-			return "", sleepErr
-		}
-	}
-	return "", lastErr
+	return p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, nil)
 }
 
-func (p *anthropicPlanner) requestTextOnce(ctx context.Context, prompt string, maxTokens int, system string) (string, error) {
+func (p *anthropicPlanner) requestTextStreamingWithMaxTokens(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+	onChunk func(string),
+) (string, *providers.Usage, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	return p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, onChunk)
+}
+
+func (p *anthropicPlanner) requestTextStreamingOnce(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+	onChunk func(string),
+) (string, *providers.Usage, error) {
 	resolvedSystem := p.resolveSystemPrompt(system)
-	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(p.model),
-		MaxTokens: int64(maxTokens),
-		System: []anthropic.TextBlockParam{
-			{Text: resolvedSystem},
+	req := &providers.Request{
+		Messages: []providers.Message{
+			{Role: providers.RoleUser, Content: prompt},
 		},
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
-		},
+		MaxTokens:      maxTokens,
+		SystemPrompt:   resolvedSystem,
+		ThinkingBudget: p.resolveThinkingBudget(maxTokens),
 	}
-	msg, err := p.client.Messages.New(ctx, params)
+
+	var text strings.Builder
+	var thoughts strings.Builder
+	var finalUsage *providers.Usage
+	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
+		switch chunk.Type {
+		case providers.ChunkTypeStart:
+			text.Reset()
+			thoughts.Reset()
+			if chunk.Usage != nil && chunk.Usage.InputTokens > 0 {
+				emitArchitectEarlyUsage(ctx, chunk.Usage.InputTokens)
+			}
+		case providers.ChunkTypeText:
+			text.WriteString(chunk.Text)
+			if onChunk != nil {
+				onChunk(chunk.Text)
+			}
+		case providers.ChunkTypeThought:
+			if thought := appendThoughtDelta(&thoughts, chunk.Text); thought != "" {
+				emitPlannerThought(ctx, stage, thought)
+			}
+		case providers.ChunkTypeEnd:
+			if chunk.Usage != nil {
+				finalUsage = chunk.Usage
+				accumulateArchitectUsage(ctx, chunk.Usage)
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	text := extractAnthropicText(msg)
-	if text == "" {
-		return "", fmt.Errorf("planner returned empty content")
+	result := strings.TrimSpace(text.String())
+	if result == "" {
+		return "", nil, fmt.Errorf("planner returned empty content")
 	}
-	return text, nil
+	return result, finalUsage, nil
+}
+
+func appendThoughtDelta(buffer *strings.Builder, delta string) string {
+	if buffer == nil {
+		return strings.TrimSpace(delta)
+	}
+	if delta != "" {
+		buffer.WriteString(delta)
+	}
+	return strings.TrimSpace(buffer.String())
+}
+
+// resolveThinkingBudget returns the thinking budget for a planner request.
+// Uses the configured thinkingBudget if set, otherwise falls back to
+// maxTokens/3 dynamic computation. Clamps to maxTokens - 1.
+func (p *anthropicPlanner) resolveThinkingBudget(maxTokens int) int {
+	if maxTokens < 2048 {
+		return 0
+	}
+	budget := p.thinkingBudget
+	if budget <= 0 {
+		budget = maxTokens / 3
+		if budget < 1024 {
+			budget = 1024
+		}
+	}
+	if budget >= maxTokens {
+		return maxTokens - 1
+	}
+	return budget
 }
 
 func (p *anthropicPlanner) systemForStage(stage string) string {
@@ -301,19 +447,6 @@ func (p *anthropicPlanner) resolveSystemPrompt(system string) string {
 		return trimmed
 	}
 	return p.system
-}
-
-func extractAnthropicText(msg *anthropic.Message) string {
-	if msg == nil {
-		return ""
-	}
-	var b strings.Builder
-	for _, block := range msg.Content {
-		if block.Type == "text" {
-			b.WriteString(block.Text)
-		}
-	}
-	return strings.TrimSpace(b.String())
 }
 
 func requirementsBudgets(base int) []int {
@@ -352,57 +485,17 @@ func maxInt(a int, b int) int {
 	return b
 }
 
-func shouldRetryPlannerCall(ctx context.Context, err error, attempt int, max int) bool {
-	if attempt >= max {
-		return false
-	}
-	if ctx.Err() != nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	return isRetryablePlannerError(err)
-}
-
-func isRetryablePlannerError(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "429") ||
-		strings.Contains(msg, "rate") ||
-		strings.Contains(msg, "overloaded") ||
-		strings.Contains(msg, "5xx") ||
-		strings.Contains(msg, "timeout") ||
-		strings.Contains(msg, "temporar")
-}
-
-func plannerRetryDelay(attempt int) time.Duration {
-	switch attempt {
-	case 1:
-		return 200 * time.Millisecond
-	case 2:
-		return 500 * time.Millisecond
-	default:
-		return 1 * time.Second
-	}
-}
-
-func waitForRetry(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
 type requirementsPayload struct {
-	Goals        json.RawMessage `json:"goals"`
-	Constraints  json.RawMessage `json:"constraints"`
-	Dependencies json.RawMessage `json:"dependencies"`
-	Scope        string          `json:"scope"`
-	Priority     string          `json:"priority"`
+	Goals                   json.RawMessage `json:"goals"`
+	Constraints             json.RawMessage `json:"constraints"`
+	Dependencies            json.RawMessage `json:"dependencies"`
+	ClarificationQuestions  json.RawMessage `json:"clarification_questions"`
+	Unknowns                json.RawMessage `json:"unknowns"`
+	Recommendations         json.RawMessage `json:"provisional_recommendations"`
+	Tradeoffs               json.RawMessage `json:"tradeoffs"`
+	RecommendationNarrative string          `json:"recommendation_narrative"`
+	Scope                   string          `json:"scope"`
+	Priority                string          `json:"priority"`
 }
 
 func (p requirementsPayload) toRequirements(query string, params map[string]any) *Requirements {
@@ -414,6 +507,7 @@ func (p requirementsPayload) toRequirements(query string, params map[string]any)
 		Scope:        nonEmptyString(p.Scope, "project"),
 		Priority:     strings.TrimSpace(p.Priority),
 	}
+	requirements.Metadata = requirementsMetadataFromPayload(p)
 	if len(requirements.Goals) == 0 {
 		requirements.Goals = []string{query}
 	}
@@ -422,6 +516,33 @@ func (p requirementsPayload) toRequirements(query string, params map[string]any)
 	}
 	applyRequirementOverrides(requirements, params)
 	return requirements
+}
+
+func requirementsMetadataFromPayload(payload requirementsPayload) map[string]any {
+	questions := parseStringList(payload.ClarificationQuestions)
+	unknowns := parseStringList(payload.Unknowns)
+	recommendations := parseStringList(payload.Recommendations)
+	tradeoffs := parseStringList(payload.Tradeoffs)
+	if len(questions) == 0 && len(unknowns) == 0 && len(recommendations) == 0 && len(tradeoffs) == 0 {
+		return nil
+	}
+	metadata := map[string]any{}
+	if len(questions) > 0 {
+		metadata["clarification_questions"] = questions
+	}
+	if len(unknowns) > 0 {
+		metadata["unknowns"] = unknowns
+	}
+	if len(recommendations) > 0 {
+		metadata["provisional_recommendations"] = recommendations
+	}
+	if len(tradeoffs) > 0 {
+		metadata["tradeoffs"] = tradeoffs
+	}
+	if narrative := strings.TrimSpace(payload.RecommendationNarrative); narrative != "" {
+		metadata["recommendation_narrative"] = narrative
+	}
+	return metadata
 }
 
 func applyRequirementOverrides(requirements *Requirements, params map[string]any) {
@@ -480,6 +601,34 @@ type taskPayload struct {
 	Dependencies    []string `json:"dependencies"`
 	EstimatedTokens int      `json:"estimated_tokens"`
 	Complexity      string   `json:"complexity"`
+
+	// Rich specification fields.
+	AcceptanceCriteria  []acceptanceCriterionPayload `json:"acceptance_criteria"`
+	Guidelines          []string                     `json:"guidelines"`
+	ImplementationGuide string                       `json:"implementation_guide"`
+	Examples            []taskExamplePayload         `json:"examples"`
+	AffectedFiles       []taskFileTargetPayload      `json:"affected_files"`
+	TestRequirements    []string                     `json:"test_requirements"`
+	RiskFactors         []string                     `json:"risk_factors"`
+}
+
+type acceptanceCriterionPayload struct {
+	Given    string `json:"given"`
+	When     string `json:"when"`
+	Then     string `json:"then"`
+	Priority string `json:"priority"`
+}
+
+type taskExamplePayload struct {
+	Label       string `json:"label"`
+	Code        string `json:"code"`
+	Explanation string `json:"explanation"`
+}
+
+type taskFileTargetPayload struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+	Reason    string `json:"reason"`
 }
 
 func (p taskPayload) toTask(index int) *AtomicTask {
@@ -488,15 +637,98 @@ func (p taskPayload) toTask(index int) *AtomicTask {
 		taskID = fmt.Sprintf("task_%d", index+1)
 	}
 	return &AtomicTask{
-		ID:              taskID,
-		Name:            strings.TrimSpace(p.Name),
-		Description:     strings.TrimSpace(p.Description),
-		AgentType:       normalizeTaskAgentType(p.AgentType),
-		SuccessCriteria: nonEmptySlice(p.SuccessCriteria),
-		Dependencies:    nonEmptySlice(p.Dependencies),
-		EstimatedTokens: nonZeroInt(p.EstimatedTokens, 3000),
-		Complexity:      parseComplexity(p.Complexity),
-		Status:          TaskStatusPending,
+		ID:                  taskID,
+		Name:                strings.TrimSpace(p.Name),
+		Description:         strings.TrimSpace(p.Description),
+		AgentType:           normalizeTaskAgentType(p.AgentType),
+		SuccessCriteria:     nonEmptySlice(p.SuccessCriteria),
+		Dependencies:        nonEmptySlice(p.Dependencies),
+		EstimatedTokens:     nonZeroInt(p.EstimatedTokens, 3000),
+		Complexity:          parseComplexity(p.Complexity),
+		Status:              TaskStatusPending,
+		AcceptanceCriteria:  toAcceptanceCriteria(p.AcceptanceCriteria),
+		Guidelines:          nonEmptySlice(p.Guidelines),
+		ImplementationGuide: strings.TrimSpace(p.ImplementationGuide),
+		Examples:            toTaskExamples(p.Examples),
+		AffectedFiles:       toTaskFileTargets(p.AffectedFiles),
+		TestRequirements:    nonEmptySlice(p.TestRequirements),
+		RiskFactors:         nonEmptySlice(p.RiskFactors),
+	}
+}
+
+func toAcceptanceCriteria(payloads []acceptanceCriterionPayload) []AcceptanceCriterion {
+	if len(payloads) == 0 {
+		return nil
+	}
+	criteria := make([]AcceptanceCriterion, 0, len(payloads))
+	for _, p := range payloads {
+		ac := AcceptanceCriterion{
+			Given:    strings.TrimSpace(p.Given),
+			When:     strings.TrimSpace(p.When),
+			Then:     strings.TrimSpace(p.Then),
+			Priority: normalizeACPriority(p.Priority),
+		}
+		if ac.Then == "" {
+			continue
+		}
+		criteria = append(criteria, ac)
+	}
+	return criteria
+}
+
+func normalizeACPriority(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "must", "should", "could":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "must"
+	}
+}
+
+func toTaskExamples(payloads []taskExamplePayload) []TaskExample {
+	if len(payloads) == 0 {
+		return nil
+	}
+	examples := make([]TaskExample, 0, len(payloads))
+	for _, p := range payloads {
+		ex := TaskExample{
+			Label:       strings.TrimSpace(p.Label),
+			Code:        strings.TrimSpace(p.Code),
+			Explanation: strings.TrimSpace(p.Explanation),
+		}
+		if ex.Code == "" && ex.Label == "" {
+			continue
+		}
+		examples = append(examples, ex)
+	}
+	return examples
+}
+
+func toTaskFileTargets(payloads []taskFileTargetPayload) []TaskFileTarget {
+	if len(payloads) == 0 {
+		return nil
+	}
+	targets := make([]TaskFileTarget, 0, len(payloads))
+	for _, p := range payloads {
+		ft := TaskFileTarget{
+			Path:      strings.TrimSpace(p.Path),
+			Operation: normalizeFileOp(p.Operation),
+			Reason:    strings.TrimSpace(p.Reason),
+		}
+		if ft.Path == "" {
+			continue
+		}
+		targets = append(targets, ft)
+	}
+	return targets
+}
+
+func normalizeFileOp(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "create", "modify", "delete":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "modify"
 	}
 }
 
@@ -604,13 +836,23 @@ Return JSON only, exactly:
   "goals": ["..."],
   "constraints": ["..."],
   "dependencies": ["..."],
+  "provisional_recommendations": ["..."],
+  "tradeoffs": ["..."],
+  "recommendation_narrative": "...",
+  "clarification_questions": ["..."],
+  "unknowns": ["..."],
   "scope": "project|module|file",
   "priority": "low|medium|high|critical"
 }
 
 Hard limits:
 - At most 6 goals, 6 constraints, 6 dependencies
+- At most 5 clarification_questions and 5 unknowns
 - Each string must be <= 20 words
+- recommendation_narrative must be <= 90 words
+- If the request is underspecified, include concrete clarification_questions
+- If the user asks for recommendations or preferences, include opinionated provisional_recommendations plus concise tradeoffs
+- For recommendation questions, include at least 2 provisional_recommendations and 2 tradeoffs
 `
 }
 
@@ -662,21 +904,59 @@ Return JSON only, exactly:
   "tasks": [
     {
       "id": "task_1",
-      "name": "...",
-      "description": "...",
+      "name": "Short imperative name",
+      "description": "Detailed implementation description. Include what to build, how it fits the architecture, and key design decisions. Be specific enough that an agent can implement without follow-up questions.",
       "agent_type": "engineer|designer|tester|inspector|architect",
-      "success_criteria": ["..."],
-      "dependencies": ["task_1"],
+      "success_criteria": ["Criterion 1", "Criterion 2"],
+      "dependencies": ["task_id"],
       "estimated_tokens": 3000,
-      "complexity": "low|medium|high|critical"
+      "complexity": "low|medium|high|critical",
+      "acceptance_criteria": [
+        {
+          "given": "Precondition or initial state",
+          "when": "Action or trigger",
+          "then": "Expected observable outcome",
+          "priority": "must|should|could"
+        }
+      ],
+      "guidelines": [
+        "Implementation constraint or convention to follow"
+      ],
+      "implementation_guide": "Step-by-step implementation instructions. Reference specific functions, types, and patterns from the codebase. Include the sequence of operations, error handling strategy, and integration points.",
+      "examples": [
+        {
+          "label": "What the example demonstrates",
+          "code": "func Example() { ... }",
+          "explanation": "Why this pattern applies"
+        }
+      ],
+      "affected_files": [
+        {
+          "path": "core/module/file.go",
+          "operation": "create|modify|delete",
+          "reason": "Why this file is affected"
+        }
+      ],
+      "test_requirements": [
+        "Specific test case that must pass"
+      ],
+      "risk_factors": [
+        "Potential blocker or failure mode"
+      ]
     }
   ]
 }
 
 Hard limits:
 - At most 10 tasks
-- Keep each description <= 28 words
-- Keep success_criteria to 2-4 concise bullets
+- Each task MUST have at least 2 acceptance_criteria with priority "must"
+- Each task MUST have at least 1 affected_files entry
+- Each task MUST have implementation_guide (minimum 2 sentences)
+- guidelines: 1-4 items per task
+- test_requirements: 1-4 items per task
+- examples: 0-2 per task (include for non-trivial tasks)
+- risk_factors: 0-3 per task
+- success_criteria: 2-4 items per task
 `
 }
 

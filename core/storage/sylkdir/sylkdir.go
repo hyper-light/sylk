@@ -102,6 +102,8 @@ func (s *SylkDir) Init() error {
 		filepath.Join(s.GlobalDataPath(), "chunks"),
 		s.GlobalEdgeDataPath(),
 		s.GlobalCanonicalIndexPath(),
+		s.OrchestratorPath(),
+		s.OrchestratorWALPath(),
 	}
 
 	for _, dir := range dirs {
@@ -398,6 +400,21 @@ func (s *SylkDir) GlobalNodeBlocksPath() string {
 // CachePath returns the path to the .sylk/cache directory.
 func (s *SylkDir) CachePath() string {
 	return filepath.Join(s.RootPath(), "cache")
+}
+
+// OrchestratorPath returns the path to the orchestrator data directory.
+func (s *SylkDir) OrchestratorPath() string {
+	return filepath.Join(s.RootPath(), "orchestrator")
+}
+
+// OrchestratorWALPath returns the path to the orchestrator WAL directory.
+func (s *SylkDir) OrchestratorWALPath() string {
+	return filepath.Join(s.OrchestratorPath(), "wal")
+}
+
+// OrchestratorDBPath returns the path to the orchestrator SQLite database.
+func (s *SylkDir) OrchestratorDBPath() string {
+	return filepath.Join(s.OrchestratorPath(), "orchestrator.db")
 }
 
 // CreateGlobalVersion creates a global version directory with subdirectories.

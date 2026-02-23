@@ -58,7 +58,6 @@ var (
 	ErrGoogleAuthDenied        = errors.New("google oauth authorization denied")
 	ErrGoogleMissingToken      = errors.New("missing google oauth access token")
 	ErrGoogleMissingRefresh    = errors.New("missing google oauth refresh token")
-	ErrGoogleMissingProject    = errors.New("missing google cloud project for oauth")
 )
 
 // GoogleOAuthAuth stores Google OAuth credentials for token refresh and reuse.
@@ -75,6 +74,8 @@ type GoogleOAuthAuth struct {
 	AccessTokenExpiry time.Time `yaml:"access_token_expiry,omitempty" json:"access_token_expiry,omitempty"`
 	ProjectID         string    `yaml:"project_id,omitempty" json:"project_id,omitempty"`
 	Location          string    `yaml:"location,omitempty" json:"location,omitempty"`
+	CodeAssistProject string    `yaml:"code_assist_project,omitempty" json:"code_assist_project,omitempty"`
+	CodeAssistTierID  string    `yaml:"code_assist_tier_id,omitempty" json:"code_assist_tier_id,omitempty"`
 }
 
 // GoogleOAuthChallenge contains all information needed to authorize in a browser.
@@ -682,6 +683,14 @@ func (s *googleAuthService) mergeGoogleRefresh(
 }
 
 func (s *googleAuthService) Resolve(ctx context.Context) (*GoogleOAuthAuth, error) {
+	// Prefer persisted interactive auth first so in-session OAuth logins
+	// are not shadowed by stale env/.env values.
+	auth, err := s.resolveGoogleFromStore(ctx)
+	if err == nil {
+		return auth, nil
+	}
+	storeErr := err
+
 	auth, resolved, err := s.resolveGoogleFromSource(ctx, s.resolveGoogleFromEnv, false)
 	if resolved || err != nil {
 		return auth, err
@@ -690,7 +699,10 @@ func (s *googleAuthService) Resolve(ctx context.Context) (*GoogleOAuthAuth, erro
 	if resolved || err != nil {
 		return auth, err
 	}
-	return s.resolveGoogleFromStore(ctx)
+	if storeErr != nil && !errors.Is(storeErr, ErrGoogleAuthNotConfigured) {
+		return nil, storeErr
+	}
+	return nil, ErrGoogleAuthNotConfigured
 }
 
 func (s *googleAuthService) resolveGoogleFromSource(
@@ -910,9 +922,6 @@ func validateGoogleAuth(auth *GoogleOAuthAuth) error {
 	}
 	if strings.TrimSpace(auth.AccessToken) == "" {
 		return ErrGoogleMissingToken
-	}
-	if strings.TrimSpace(auth.ProjectID) == "" {
-		return ErrGoogleMissingProject
 	}
 	return nil
 }

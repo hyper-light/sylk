@@ -183,7 +183,7 @@ func NewClassifierWithAPIKey(apiKey string, config RouterConfig) *Classifier {
 // Classify classifies a natural language query
 func (c *Classifier) Classify(ctx context.Context, input string) (*ClassificationResult, error) {
 	// Keep prompt modules stable and minimal for cacheability + token efficiency.
-	systemPrompt := BuildClassificationPrompt(input)
+	systemPrompt := BuildClassificationPromptWithRuntime(input, classificationPromptRuntimeFromContext(ctx))
 
 	// Create context with timeout
 	if c.config.ClassificationTimeout > 0 {
@@ -661,8 +661,9 @@ func (c *Classifier) maxPromptCorrections() int {
 // Classification Result Methods
 // =============================================================================
 
-// ToRouteResult converts a classification result to a route result
-func (cr *ClassificationResult) ToRouteResult(processingTime time.Duration) *RouteResult {
+// ToRouteResult converts a classification result to a route result.
+// The RouterConfig thresholds control the confidence-to-action mapping.
+func (cr *ClassificationResult) ToRouteResult(processingTime time.Duration, cfg RouterConfig) *RouteResult {
 	result := &RouteResult{
 		Intent:               cr.Intent,
 		Domain:               cr.Domain,
@@ -676,18 +677,17 @@ func (cr *ClassificationResult) ToRouteResult(processingTime time.Duration) *Rou
 	}
 
 	cr.assignTargetRouting(result)
-	cr.applyRejection(result)
-	result.Action = cr.determineRouteAction(result)
-	cr.applyMultiIntent(result)
+	result.Action = cr.determineRouteAction(result, cfg)
+	cr.applyMultiIntent(result, cfg)
 
 	return result
 }
 
-func (cr *ClassificationResult) determineRouteAction(result *RouteResult) RouteAction {
+func (cr *ClassificationResult) determineRouteAction(result *RouteResult, cfg RouterConfig) RouteAction {
 	if result != nil && result.Rejected {
 		return RouteActionReject
 	}
-	return determineAction(cr.Confidence)
+	return determineActionFromConfig(cr.Confidence, cfg)
 }
 
 func (cr *ClassificationResult) assignTargetRouting(result *RouteResult) {
@@ -715,42 +715,25 @@ func (cr *ClassificationResult) assignTargetRouting(result *RouteResult) {
 	result.TemporalFocus = TemporalUnknown
 }
 
-func (cr *ClassificationResult) applyRejection(result *RouteResult) {
-	// The retrospective constraint ONLY applies if the target agent is the archivalist
-	if cr.IsRetrospective || result.TargetAgent != TargetArchivalist {
-		return
-	}
-	result.Rejected = true
-	if strings.TrimSpace(result.Reason) == "" {
-		result.Reason = cr.rejectionReason()
-	}
-}
-
-func (cr *ClassificationResult) rejectionReason() string {
-	if cr.RejectionReason != "" {
-		return cr.RejectionReason
-	}
-	return "Query is prospective (about future), not retrospective (about past)"
-}
-
-func (cr *ClassificationResult) applyMultiIntent(result *RouteResult) {
+func (cr *ClassificationResult) applyMultiIntent(result *RouteResult, cfg RouterConfig) {
 	if !cr.MultiIntent || len(cr.SubResults) == 0 {
 		return
 	}
 	result.SubResults = make([]*RouteResult, 0, len(cr.SubResults))
 	for _, sub := range cr.SubResults {
-		result.SubResults = append(result.SubResults, sub.ToRouteResult(0))
+		result.SubResults = append(result.SubResults, sub.ToRouteResult(0, cfg))
 	}
 }
 
-// determineAction determines the routing action based on confidence
-func determineAction(confidence float64) RouteAction {
+// determineActionFromConfig maps confidence to a routing action using the
+// thresholds declared in RouterConfig.
+func determineActionFromConfig(confidence float64, cfg RouterConfig) RouteAction {
 	switch {
-	case confidence >= 0.90:
+	case confidence >= cfg.ExecuteThreshold:
 		return RouteActionExecute
-	case confidence >= 0.75:
+	case confidence >= cfg.LogThreshold:
 		return RouteActionLog
-	case confidence >= 0.50:
+	case confidence >= cfg.SuggestThreshold:
 		return RouteActionSuggest
 	default:
 		return RouteActionReject

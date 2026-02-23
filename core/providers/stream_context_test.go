@@ -220,6 +220,7 @@ func TestWrapStreamChunk_AllChunkTypes(t *testing.T) {
 
 	chunkTypes := []StreamChunkType{
 		ChunkTypeText,
+		ChunkTypeThought,
 		ChunkTypeToolStart,
 		ChunkTypeToolDelta,
 		ChunkTypeToolEnd,

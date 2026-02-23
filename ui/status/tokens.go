@@ -13,33 +13,95 @@ const tokenSymbol = "\u03C4"
 // Derived from the smallest order of magnitude where abbreviation saves space.
 const kThreshold = 1000
 
+
+// TokenPhase indicates which token counter is actively updating.
+type TokenPhase int
+
+const (
+	PhaseIdle   TokenPhase = iota // Neither side counting.
+	PhaseInput                    // Prompt tokens actively counting.
+	PhaseOutput                   // Completion tokens actively counting.
+)
+
 // TokenDisplay formats prompt and completion token counts for the status bar.
+// Each side highlights independently with a spinner when its phase is active.
 type TokenDisplay struct {
 	promptTokens     int
 	completionTokens int
-	totalTokens      int
-	style            lipgloss.Style
+	phase            TokenPhase
+	spinner          *Spinner
+	idleStyle        lipgloss.Style
+	activeStyle      lipgloss.Style
 }
 
-// NewTokenDisplay creates a TokenDisplay with the given lipgloss style.
-func NewTokenDisplay(style lipgloss.Style) *TokenDisplay {
+// NewTokenDisplay creates a TokenDisplay with idle and active styles.
+func NewTokenDisplay(idle, active lipgloss.Style) *TokenDisplay {
 	return &TokenDisplay{
-		style: style,
+		spinner:     NewSpinner(),
+		idleStyle:   idle,
+		activeStyle: active,
 	}
 }
 
-// Update sets the prompt and completion token counts and recomputes the total.
+// Update sets the prompt and completion token counts.
 func (td *TokenDisplay) Update(prompt, completion int) {
 	td.promptTokens = prompt
 	td.completionTokens = completion
-	td.totalTokens = prompt + completion
 }
 
-// View renders the token display as "tau prompt/completion" with compact notation.
+// SetPhase sets which token counter is actively updating.
+func (td *TokenDisplay) SetPhase(phase TokenPhase) {
+	if phase != PhaseIdle && td.phase == PhaseIdle {
+		td.spinner.Reset()
+	}
+	td.phase = phase
+}
+
+// Tick advances the counting spinner. Called by the status bar decor tick.
+func (td *TokenDisplay) Tick() {
+	if td.phase != PhaseIdle {
+		td.spinner.Tick()
+	}
+}
+
+// IsAnimating reports whether the token display has an active counting phase.
+func (td *TokenDisplay) IsAnimating() bool {
+	return td.phase != PhaseIdle
+}
+
+// View renders the token display as "Sτ ↑in/↓out" where S is a spinner
+// slot (space when idle, animated frame when counting). The spinner is
+// placed before τ to avoid visual confusion with the directional arrows.
+// The active side is distinguished by style (color), not spinner position.
 func (td *TokenDisplay) View() string {
-	prompt := formatTokenCount(td.promptTokens)
-	completion := formatTokenCount(td.completionTokens)
-	return td.style.Render(fmt.Sprintf("%s %s/%s", tokenSymbol, prompt, completion))
+	in := formatTokenCount(td.promptTokens)
+	out := formatTokenCount(td.completionTokens)
+
+	spin := " "
+	inStyle := td.idleStyle
+	outStyle := td.idleStyle
+
+	switch td.phase {
+	case PhaseInput:
+		inStyle = td.activeStyle
+		spin = td.spinner.Current()
+	case PhaseOutput:
+		outStyle = td.activeStyle
+		spin = td.spinner.Current()
+	}
+
+	spinStyle := td.idleStyle
+	if td.phase != PhaseIdle {
+		spinStyle = td.activeStyle
+	}
+	spinPart := spinStyle.Render(spin)
+	gap := td.idleStyle.Render(" ")
+	sym := td.idleStyle.Render(tokenSymbol + " ")
+	sep := td.idleStyle.Render("/")
+	inPart := inStyle.Render("↑" + in)
+	outPart := outStyle.Render("↓" + out)
+
+	return spinPart + gap + sym + inPart + sep + outPart
 }
 
 // formatTokenCount renders a token count using compact "k" notation when the

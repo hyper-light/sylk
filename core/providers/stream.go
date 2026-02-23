@@ -22,6 +22,7 @@ type StreamChunkType string
 
 const (
 	ChunkTypeText      StreamChunkType = "text"
+	ChunkTypeThought   StreamChunkType = "thought"
 	ChunkTypeToolStart StreamChunkType = "tool_start"
 	ChunkTypeToolDelta StreamChunkType = "tool_delta"
 	ChunkTypeToolEnd   StreamChunkType = "tool_end"
@@ -88,6 +89,22 @@ func (a *StreamAccumulator) Add(chunk *StreamChunk) {
 				tc.Arguments.WriteString(chunk.ToolCall.ArgumentsDelta)
 			}
 		}
+
+	case ChunkTypeStart:
+		// Reset for retry — a new ChunkTypeStart means previous attempt failed.
+		a.chunks = a.chunks[:0]
+		a.text.Reset()
+		a.toolCalls = make(map[string]*accumulatedToolCall)
+		a.usage = Usage{}
+		a.stopReason = ""
+		a.startTime = time.Now()
+		a.endTime = time.Time{}
+		if chunk.Usage != nil {
+			a.usage.InputTokens = chunk.Usage.InputTokens
+		}
+
+	case ChunkTypeError:
+		a.endTime = time.Now()
 
 	case ChunkTypeEnd:
 		a.endTime = time.Now()
@@ -178,11 +195,48 @@ func StreamWithCallback(
 		return nil, err
 	}
 
+	var lastErr error
 	for chunk := range chunks {
 		collector.Add(chunk)
+		if chunk.Type == ChunkTypeError {
+			lastErr = fmt.Errorf("stream error: %s", chunk.Text)
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
 	}
 
 	return collector.Response(), nil
+}
+
+// streamViaHandler converts a StreamHandlerProvider.StreamWithHandler call into
+// a channel-based stream. The errorSent flag prevents duplicate error chunks
+// since streamWithHandlerOnce already emits ChunkTypeError for stream-level
+// errors before returning.
+func streamViaHandler(ctx context.Context, provider StreamHandlerProvider, req *Request) <-chan *StreamChunk {
+	chunks := make(chan *StreamChunk, 100)
+	go func() {
+		defer close(chunks)
+		var errorSent bool
+		err := provider.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
+			if chunk.Type == ChunkTypeError {
+				errorSent = true
+			}
+			select {
+			case chunks <- chunk:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		if err != nil && !errorSent {
+			select {
+			case chunks <- &StreamChunk{Type: ChunkTypeError, Text: err.Error(), Timestamp: time.Now()}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+	return chunks
 }
 
 // StreamToChannel converts a streaming provider into channels for chunks and errors.

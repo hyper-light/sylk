@@ -131,6 +131,175 @@ type sequencer struct {
 }
 
 // =============================================================================
+// In-Memory Rebase Fast Path
+// =============================================================================
+
+// canRebaseInMemory returns true when the rebase can be performed entirely
+// in-memory without touching HEAD or the worktree. Requires a non-HEAD source
+// branch and no edit actions (which need worktree interaction).
+func canRebaseInMemory(seq *sequencer) bool {
+	if seq.rebaseSourceRef == "" {
+		return false
+	}
+	for i := range seq.steps {
+		if seq.steps[i].action == RebaseEdit {
+			return false
+		}
+	}
+	return true
+}
+
+// inMemRebase tracks accumulation state for the in-memory rebase fast path.
+type inMemRebase struct {
+	tip      plumbing.Hash
+	sqTree   plumbing.Hash
+	sqParent plumbing.Hash
+	sqMsgs   []string
+	sqAuthor object.Signature
+	sqStart  int
+}
+
+// rebaseInMemory replays all sequencer steps purely in object storage.
+// Returns the final tip hash on success or ErrRebaseConflict if any step
+// produces conflicts.
+func (c *GitClient) rebaseInMemory(seq *sequencer) (plumbing.Hash, error) {
+	st := inMemRebase{tip: seq.currentTip}
+	for i := range seq.steps {
+		if err := c.applyInMemStep(&st, seq.steps, &seq.steps[i], i); err != nil {
+			return plumbing.ZeroHash, err
+		}
+	}
+	if err := c.flushInMemSquash(&st, seq.steps); err != nil {
+		return plumbing.ZeroHash, err
+	}
+	return st.tip, nil
+}
+
+// applyInMemStep dispatches a single step in the in-memory rebase.
+func (c *GitClient) applyInMemStep(st *inMemRebase, steps []sequencerStep, step *sequencerStep, idx int) error {
+	switch step.action {
+	case RebaseDrop:
+		return nil
+	case RebaseSquash, RebaseFixup:
+		return c.applyInMemSquash(st, step, idx, steps)
+	default:
+		return c.flushAndPick(st, steps, step)
+	}
+}
+
+// flushAndPick flushes any pending squash group then applies a pick/reword.
+func (c *GitClient) flushAndPick(st *inMemRebase, steps []sequencerStep, step *sequencerStep) error {
+	if err := c.flushInMemSquash(st, steps); err != nil {
+		return err
+	}
+	return c.applyInMemPick(st, step)
+}
+
+// applyInMemPick merges a pick or reword step and creates a commit.
+func (c *GitClient) applyInMemPick(st *inMemRebase, step *sequencerStep) error {
+	result, err := c.mergeStepAgainstTip(st.tip, step)
+	if err != nil {
+		return err
+	}
+	if result.HasConflicts() {
+		return ErrRebaseConflict
+	}
+	st.tip, err = storeCommitObj(c.repo.Storer, result.TreeHash,
+		[]plumbing.Hash{st.tip}, step.commit.Author, defaultSignature(time.Now()),
+		pickMessage(step))
+	return err
+}
+
+// applyInMemSquash accumulates a squash or fixup step.
+func (c *GitClient) applyInMemSquash(st *inMemRebase, step *sequencerStep, idx int, steps []sequencerStep) error {
+	result, err := c.mergeStepAgainstTip(st.tip, step)
+	if err != nil {
+		return err
+	}
+	if result.HasConflicts() {
+		return ErrRebaseConflict
+	}
+	initSquashGroup(st, steps, step, idx)
+	st.sqTree = result.TreeHash
+	if step.action == RebaseSquash {
+		st.sqMsgs = append(st.sqMsgs, step.commit.Message)
+	}
+	return nil
+}
+
+// flushInMemSquash commits the accumulated squash group if any.
+func (c *GitClient) flushInMemSquash(st *inMemRebase, steps []sequencerStep) error {
+	if st.sqTree == plumbing.ZeroHash {
+		return nil
+	}
+	msg := strings.Join(st.sqMsgs, "\n\n")
+	if msg == "" {
+		msg = findPickMessage(steps, st.sqStart)
+	}
+	parent := st.sqParent
+	if parent == plumbing.ZeroHash {
+		parent = st.tip
+	}
+	h, err := storeCommitObj(c.repo.Storer, st.sqTree, []plumbing.Hash{parent},
+		st.sqAuthor, defaultSignature(time.Now()), msg)
+	if err != nil {
+		return err
+	}
+	st.tip = h
+	st.sqTree = plumbing.ZeroHash
+	st.sqParent = plumbing.ZeroHash
+	st.sqMsgs = nil
+	st.sqAuthor = object.Signature{}
+	return nil
+}
+
+// pickMessage returns the commit message for a pick or reword step.
+func pickMessage(step *sequencerStep) string {
+	if step.action == RebaseReword && step.message != "" {
+		return step.message
+	}
+	return step.commit.Message
+}
+
+// initSquashGroup initializes the squash accumulation state on first entry.
+func initSquashGroup(st *inMemRebase, steps []sequencerStep, step *sequencerStep, idx int) {
+	if st.sqTree != plumbing.ZeroHash {
+		return
+	}
+	st.sqParent = st.tip
+	st.sqStart = idx
+	st.sqAuthor = precedingAppliedAuthor(steps, idx, step.commit.Author)
+}
+
+// precedingAppliedAuthor walks backward from idx, skipping RebaseDrop steps,
+// to find the author of the most recent actually-applied commit. Returns
+// fallback if no preceding applied step exists.
+func precedingAppliedAuthor(steps []sequencerStep, idx int, fallback object.Signature) object.Signature {
+	for i := idx - 1; i >= 0; i-- {
+		if steps[i].action != RebaseDrop {
+			return steps[i].commit.Author
+		}
+	}
+	return fallback
+}
+
+// findPickMessage walks backward from beforeIdx to find the preceding pick
+// or reword step's effective message for pure fixup groups. For reword steps,
+// the overridden message is returned when set.
+func findPickMessage(steps []sequencerStep, beforeIdx int) string {
+	for i := beforeIdx - 1; i >= 0; i-- {
+		s := &steps[i]
+		if s.action == RebasePick {
+			return s.commit.Message
+		}
+		if s.action == RebaseReword {
+			return pickMessage(s)
+		}
+	}
+	return "squashed commits"
+}
+
+// =============================================================================
 // CherryPickSequence
 // =============================================================================
 
@@ -237,11 +406,30 @@ func (c *GitClient) RebaseInteractive(ontoBranch, sourceBranch string, plan []Re
 		}
 	}
 
-	// Detach HEAD at onto tip.
+	seq.currentTip = ontoCommit.Hash
+
+	// Fast path: in-memory rebase for non-HEAD branches with no edit steps.
+	// The entire replay happens in object storage — HEAD and worktree are
+	// untouched. On conflict, fall through to the worktree-based sequencer.
+	if canRebaseInMemory(seq) {
+		finalTip, err := c.rebaseInMemory(seq)
+		if err == nil {
+			ref := plumbing.NewHashReference(seq.rebaseSourceRef, finalTip)
+			if setErr := c.repo.Storer.SetReference(ref); setErr != nil {
+				return nil, setErr
+			}
+			return nil, nil
+		}
+		if !errors.Is(err, ErrRebaseConflict) {
+			return nil, err
+		}
+		seq.currentTip = ontoCommit.Hash // Reset tip for worktree fallback.
+	}
+
+	// Detach HEAD at onto tip (worktree-based sequencer path).
 	if err := c.detachHead(ontoCommit.Hash); err != nil {
 		return nil, err
 	}
-	seq.currentTip = ontoCommit.Hash
 
 	c.sequencer = seq
 	return c.processNextStep()
@@ -553,12 +741,7 @@ func (c *GitClient) handlePickReword(step *sequencerStep) (*SequencerStatus, err
 		return c.pauseOnConflict(result)
 	}
 
-	msg := step.commit.Message
-	if step.action == RebaseReword && step.message != "" {
-		msg = step.message
-	}
-
-	if err := c.commitStep(step, result.TreeHash, msg); err != nil {
+	if err := c.commitStep(step, result.TreeHash, pickMessage(step)); err != nil {
 		return nil, err
 	}
 
@@ -582,13 +765,7 @@ func (c *GitClient) handleSquashFixup(step *sequencerStep) (*SequencerStatus, er
 	// Initialize squash group if needed.
 	if len(seq.squashMsgs) == 0 {
 		seq.squashParent = seq.currentTip
-		// The author comes from the pick that preceded this squash group.
-		// At this point currentIdx > 0 and the previous step was the pick.
-		if seq.currentIdx > 0 {
-			seq.squashAuthor = seq.steps[seq.currentIdx-1].commit.Author
-		} else {
-			seq.squashAuthor = step.commit.Author
-		}
+		seq.squashAuthor = precedingAppliedAuthor(seq.steps, seq.currentIdx, step.commit.Author)
 	}
 
 	seq.squashTree = result.TreeHash
@@ -606,8 +783,10 @@ func (c *GitClient) handleSquashFixup(step *sequencerStep) (*SequencerStatus, er
 // Internal: Merge & Commit Helpers
 // =============================================================================
 
-// applyStepMerge performs the 3-way merge for a step against the current tip.
-func (c *GitClient) applyStepMerge(step *sequencerStep) (*TreeMergeResult, error) {
+// mergeStepAgainstTip performs a 3-way merge of a step's commit against an
+// arbitrary tip hash. Used by both the in-memory fast path and the
+// worktree-based sequencer.
+func (c *GitClient) mergeStepAgainstTip(tipHash plumbing.Hash, step *sequencerStep) (*TreeMergeResult, error) {
 	baseTree, err := commitParentTree(c, step.commit)
 	if err != nil {
 		return nil, err
@@ -618,7 +797,7 @@ func (c *GitClient) applyStepMerge(step *sequencerStep) (*TreeMergeResult, error
 		return nil, err
 	}
 
-	tipCommit, err := c.repo.CommitObject(c.sequencer.currentTip)
+	tipCommit, err := c.repo.CommitObject(tipHash)
 	if err != nil {
 		return nil, err
 	}
@@ -629,6 +808,11 @@ func (c *GitClient) applyStepMerge(step *sequencerStep) (*TreeMergeResult, error
 	}
 
 	return treeMerge3(c.repo.Storer, baseTree, oursTree, commitTree)
+}
+
+// applyStepMerge performs the 3-way merge for a step against the current tip.
+func (c *GitClient) applyStepMerge(step *sequencerStep) (*TreeMergeResult, error) {
+	return c.mergeStepAgainstTip(c.sequencer.currentTip, step)
 }
 
 // applyStep applies a step (for edit action — commits immediately).
@@ -685,12 +869,7 @@ func (c *GitClient) commitCurrentStep(treeHash plumbing.Hash) error {
 		return nil
 	}
 
-	msg := step.commit.Message
-	if step.action == RebaseReword && step.message != "" {
-		msg = step.message
-	}
-
-	return c.commitStep(step, treeHash, msg)
+	return c.commitStep(step, treeHash, pickMessage(step))
 }
 
 // commitMergeStep creates the merge commit with two parents.
@@ -763,14 +942,10 @@ func (c *GitClient) flushSquashGroup() error {
 	return nil
 }
 
-// findGroupPickMessage walks backward from idx to find the pick commit message.
+// findGroupPickMessage walks backward from idx to find the pick commit's
+// effective message. Delegates to findPickMessage for unified logic.
 func (c *GitClient) findGroupPickMessage(idx int) string {
-	for i := idx - 1; i >= 0; i-- {
-		if c.sequencer.steps[i].action == RebasePick || c.sequencer.steps[i].action == RebaseReword {
-			return c.sequencer.steps[i].commit.Message
-		}
-	}
-	return "squashed commits"
+	return findPickMessage(c.sequencer.steps, idx)
 }
 
 // pauseOnConflict writes conflicts to worktree and pauses the sequencer.

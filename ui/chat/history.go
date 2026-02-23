@@ -45,7 +45,8 @@ type ChatEntry struct {
 	Importance    float64
 
 	// Thinking indicator state.
-	ThinkingText    string        // Animated spinner + message (set by model on tick).
+	ThinkingText    string        // Animated spinner + timer line (set by model on tick).
+	ThinkingStatus  string        // Status message shown below spinner (e.g. "Thinking...", "Handing off to architect...").
 	ThinkingColor   string        // Hex color for gradient animation (e.g. "#89b4fa"); empty = use theme default.
 	ThinkingElapsed time.Duration // Elapsed from stream start to first chunk (0 = no thinking recorded).
 }

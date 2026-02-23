@@ -426,6 +426,17 @@ func (pl *ProfileLearner) GetAllProfiles() map[string]*AgentHandoffProfile {
 	return result
 }
 
+// RestoreProfile restores a single profile from WAL recovery.
+func (pl *ProfileLearner) RestoreProfile(profile *AgentHandoffProfile) {
+	if profile == nil {
+		return
+	}
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	key := profileKey{AgentID: profile.AgentType, ModelName: profile.ModelID}
+	pl.profiles[key] = profile.Clone()
+}
+
 // LoadProfiles loads profiles from persistence.
 func (pl *ProfileLearner) LoadProfiles(profiles map[string]*AgentHandoffProfile) {
 	pl.mu.Lock()

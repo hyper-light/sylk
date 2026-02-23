@@ -131,7 +131,7 @@ func TestGuide_ExplicitGuideTargetRespondsToSource(t *testing.T) {
 		_ = g.Stop()
 	}()
 
-	respCh := make(chan *guide.Message, 1)
+	respCh := make(chan *guide.Message, 8)
 	sub, err := bus.Subscribe(guide.TopicResponses("tui", "tui"), func(m *guide.Message) error {
 		select {
 		case respCh <- m:
@@ -154,17 +154,23 @@ func TestGuide_ExplicitGuideTargetRespondsToSource(t *testing.T) {
 	err = bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req))
 	require.NoError(t, err)
 
-	select {
-	case busMsg := <-respCh:
-		resp, ok := busMsg.GetRouteResponse()
-		require.True(t, ok, "expected RouteResponse payload")
-		assert.Equal(t, req.CorrelationID, resp.CorrelationID)
-		assert.True(t, resp.Success)
-		text, ok := resp.Data.(string)
-		require.True(t, ok, "expected string response data")
-		assert.NotEmpty(t, text)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for guide response")
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case busMsg := <-respCh:
+			resp, ok := busMsg.GetRouteResponse()
+			if !ok {
+				continue
+			}
+			assert.Equal(t, req.CorrelationID, resp.CorrelationID)
+			assert.True(t, resp.Success)
+			text, ok := resp.Data.(string)
+			require.True(t, ok, "expected string response data")
+			assert.NotEmpty(t, text)
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for guide response")
+		}
 	}
 }
 
@@ -197,7 +203,7 @@ func TestGuide_ExplicitGuideTarget_UsesConfiguredSelfResponder(t *testing.T) {
 		_ = g.Stop()
 	}()
 
-	respCh := make(chan *guide.Message, 1)
+	respCh := make(chan *guide.Message, 8)
 	sub, err := bus.Subscribe(guide.TopicResponses("tui", "tui"), func(m *guide.Message) error {
 		select {
 		case respCh <- m:
@@ -220,15 +226,21 @@ func TestGuide_ExplicitGuideTarget_UsesConfiguredSelfResponder(t *testing.T) {
 	err = bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage("", req))
 	require.NoError(t, err)
 
-	select {
-	case busMsg := <-respCh:
-		resp, ok := busMsg.GetRouteResponse()
-		require.True(t, ok, "expected RouteResponse payload")
-		text, ok := resp.Data.(string)
-		require.True(t, ok, "expected string response data")
-		assert.Equal(t, "real guide response", text)
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for guide response")
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case busMsg := <-respCh:
+			resp, ok := busMsg.GetRouteResponse()
+			if !ok {
+				continue
+			}
+			text, ok := resp.Data.(string)
+			require.True(t, ok, "expected string response data")
+			assert.Equal(t, "real guide response", text)
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for guide response")
+		}
 	}
 }
 

@@ -59,6 +59,24 @@ type Request struct {
 	SystemPrompt    string         `json:"system_prompt,omitempty"`
 	Tools           []Tool         `json:"tools,omitempty"`
 	Metadata        map[string]any `json:"metadata,omitempty"`
+
+	// ToolChoice controls function-calling behavior when Tools are present.
+	// Supported values (provider-agnostic):
+	//   "auto"  — model decides whether to call a function or respond with text (default)
+	//   "any"   — model must call at least one function
+	//   "none"  — model must not call any function
+	// Empty string means provider default (typically "auto").
+	ToolChoice string `json:"tool_choice,omitempty"`
+
+	// ThinkingBudget sets the Anthropic extended thinking token budget.
+	// When positive, enables thinking mode with this budget.
+	ThinkingBudget int `json:"thinking_budget,omitempty"`
+
+	// ResponseSchema provides structured output schema for Google provider.
+	ResponseSchema map[string]any `json:"response_schema,omitempty"`
+
+	// ResponseMIMEType sets the response format for Google provider (e.g. "application/json").
+	ResponseMIMEType string `json:"response_mime_type,omitempty"`
 }
 
 type Message struct {
@@ -66,6 +84,11 @@ type Message struct {
 	Content    string     `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolName   string     `json:"tool_name,omitempty"`
+
+	// Metadata carries provider-specific data through multi-turn loops.
+	// For Google, this preserves raw model content with thought signatures.
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 type Role string

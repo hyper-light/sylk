@@ -5,6 +5,27 @@ import (
 	"time"
 )
 
+// RerouteRequest is published by an agent's reroute_request skill when the
+// agent determines it cannot handle the current user request. The Guide uses
+// this to re-classify and forward to a better-suited agent.
+type RerouteRequest struct {
+	OriginalCorrelationID string   `json:"original_correlation_id"`
+	OriginalInput         string   `json:"original_input"`
+	Reason                string   `json:"reason"`
+	SourceAgentID         string   `json:"source_agent_id"`
+	SuggestedTarget       string   `json:"suggested_target,omitempty"`
+	SessionID             string   `json:"session_id"`
+	ExcludeAgents         []string `json:"exclude_agents"`
+}
+
+// ConversationTurn captures a single user→agent exchange for conversation continuity.
+type ConversationTurn struct {
+	UserInput  string    `json:"user_input"`
+	AgentID    string    `json:"agent_id"`
+	AgentReply string    `json:"agent_reply"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
 // =============================================================================
 // Compiled Pattern
 // =============================================================================
@@ -303,6 +324,11 @@ type RouteRequest struct {
 	// Optional: explicit target (bypasses classification)
 	TargetAgentID string `json:"target_agent_id,omitempty"`
 
+	// ExplicitTarget indicates the user deliberately chose this target
+	// (e.g. via agent panel selection). When true, conversation flow
+	// will not override the target to maintain session continuity.
+	ExplicitTarget bool `json:"explicit_target,omitempty"`
+
 	// FireAndForget indicates this is an async sub-request that doesn't need
 	// a response routed back to the source. The target processes it in the
 	// background while the source continues with its work.
@@ -371,6 +397,9 @@ type ForwardedRequest struct {
 
 	// Cross-domain context (populated if multi_intent)
 	CrossDomain *CrossDomainContext `json:"cross_domain,omitempty"`
+
+	// ConversationHistory carries prior turns for multi-turn continuity.
+	ConversationHistory []ConversationTurn `json:"conversation_history,omitempty"`
 }
 
 // PendingRequest tracks a request awaiting response
@@ -795,11 +824,17 @@ type AgentRegistry interface {
 
 // RouterConfig configures the guide router
 type RouterConfig struct {
-	// LLM configuration
+	// LLM configuration for classification
 	Model         string  `json:"model"`          // Model for classification
 	MaxTokens     int     `json:"max_tokens"`     // Max tokens for classification response
 	Temperature   float64 `json:"temperature"`    // Temperature for classification
 	ThinkingLevel string  `json:"thinking_level"` // Thinking budget/level (e.g. HIGH, LOW)
+
+	// Self-response LLM overrides — used by the model-backed responder
+	// (e.g. GeminiGuideResponder) when the agent answers directly.
+	// nil/zero means use the default for the agent.
+	ResponseTemperature *float64 `json:"response_temperature,omitempty"` // Sampling temperature for self-responses
+	ResponseMaxTokens   int      `json:"response_max_tokens,omitempty"`  // Max output tokens for self-responses
 
 	// Confidence thresholds
 	ExecuteThreshold float64 `json:"execute_threshold"` // >= this: execute (default: 0.90)
@@ -823,18 +858,21 @@ type RouterConfig struct {
 
 // DefaultRouterConfig returns sensible defaults
 func DefaultRouterConfig() RouterConfig {
+	responseTemp := 0.7
 	return RouterConfig{
 		Model:                 "gemini-3.1-pro-preview",
 		MaxTokens:             65536,
-		Temperature:           1.0,
+		Temperature:           0.7,
 		ThinkingLevel:         "HIGH",
+		ResponseTemperature:   &responseTemp,
+		ResponseMaxTokens:     4096,
 		ExecuteThreshold:      0.90,
 		LogThreshold:          0.75,
 		SuggestThreshold:      0.50,
 		MaxCorrections:        50,
 		MaxPromptCorrections:  4,
 		DSLPrefix:             "@",
-		ClassificationTimeout: 10 * time.Second,
+		ClassificationTimeout: 60 * time.Second,
 		EnrichmentTimeout:     2 * time.Second,
 		AmbiguityThreshold:    0.15,
 	}

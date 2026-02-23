@@ -207,6 +207,54 @@ func (c *Compositor) spliceVertical(start int, id SlotID) {
 	}
 }
 
+// AdjustInputSection shifts the main/input boundary without full cache
+// invalidation. The caller specifies which main-area slot contains the
+// chat panel (layout-dependent); only that slot and the input are marked
+// dirty. Side panels keep their (truncated) cached output, avoiding the
+// content shift that causes visible flicker. The lines[] slice is NOT
+// reallocated because totalH (mainH + inputH + statusH) is invariant.
+// statusDirty is set so the status section is re-spliced, preventing any
+// trailing-newline overflow from the input slot from corrupting the
+// status bar row.
+func (c *Compositor) AdjustInputSection(newMainH, newInputH int, chatSlot SlotID) {
+	c.mainH = newMainH
+	c.inputStart = newMainH
+	// statusStart = mainH + inputH is invariant — not updated.
+	c.mainDirty = true
+	c.inputDirty = true
+	c.statusDirty = true
+	c.slotDirty[chatSlot] = true
+	c.slotDirty[SlotInput] = true
+	c.hasCache = false
+}
+
+// TruncateSlot shortens a cached slot's output to maxLines while preserving
+// the bottom border (last line). Content lines above the border are kept as-is,
+// so the terminal diff sees no change for those rows. Used to keep side panels
+// visually stable when the main area shrinks for input growth.
+func (c *Compositor) TruncateSlot(id SlotID, maxLines int) {
+	sl := c.slotLines[id]
+	if len(sl) <= maxLines || maxLines < 2 {
+		return
+	}
+	truncated := make([]string, maxLines)
+	copy(truncated, sl[:maxLines-1])
+	truncated[maxLines-1] = sl[len(sl)-1] // Preserve bottom border.
+	c.slotLines[id] = truncated
+}
+
+// AllMainSlotsCached reports whether every column slot in the main area
+// has been rendered at least once. Used to guard incremental updates that
+// rely on cached side-panel output.
+func (c *Compositor) AllMainSlotsCached() bool {
+	for _, id := range c.colSlots {
+		if _, ok := c.slotLines[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // SplitLines splits a rendered string into lines. Exported helper for
 // callers that need to feed bordered output into SetSlotLines.
 func SplitLines(s string) []string {

@@ -6,14 +6,19 @@ package git
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/dgraph-io/ristretto"
+	"github.com/go-git/go-billy/v5"
+	"github.com/go-git/go-billy/v5/osfs"
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	gogitcache "github.com/go-git/go-git/v5/plumbing/cache"
+	"github.com/go-git/go-git/v5/storage/filesystem"
 )
 
 // =============================================================================
@@ -27,6 +32,58 @@ var (
 	ErrNotGitRepo     = errors.New("path is not a git repository")
 	ErrNoHead         = errors.New("repository has no HEAD reference")
 	ErrRemoteNotFound = errors.New("remote not found")
+)
+
+// =============================================================================
+// Diff Cache Sizing Constants
+// =============================================================================
+
+const (
+	diffSummaryCostBytes = 48    // DiffSummary: 5 × int + padding
+	fileSummaryCostBytes = 32    // FileSummary: 3 × int + padding
+	maxDiffCacheEntries  = 4_000 // 2,000 commits × 2 entries each
+)
+
+// =============================================================================
+// go-git Object Cache Sizing
+// =============================================================================
+//
+// go-git's PlainOpen unconditionally allocates a 96MB ObjectLRU
+// (cache.DefaultMaxSize = 96 * MiByte). For Sylk's operation profile
+// (status, log, diff, branch view), the working set is bounded by the
+// visible commit window and tree fan-out — not the total object store.
+//
+// openWithSizedCache replaces PlainOpen with a custom open that probes
+// the actual packfile sizes and derives the cache budget from real data:
+//
+//   cacheSize = clamp(totalPackBytes / packCacheDivisor, minObjectCache, maxObjectCache)
+//
+// This gives a 12–24× reduction on small/medium repos while remaining
+// adequate for repositories the size of Kubernetes (~4GB packs → 64MB cap).
+
+const (
+	// minObjectCache is the floor for the go-git object LRU.
+	// Derived: a fresh repo with loose objects still benefits from
+	// caching recently accessed commits and trees during log/diff walks.
+	// 4MB holds ~8,000 small objects (commits ~500B) or ~80 large trees
+	// (~50KB each in a 75K-file repo). Adequate for repos up to ~32MB pack.
+	minObjectCache = 4 * gogitcache.MiByte
+
+	// maxObjectCache is the ceiling for the go-git object LRU.
+	// Derived: Sylk's heaviest operation is DagCommitLimit=500 commits
+	// with full tree comparison. For Kubernetes-scale repos (75K files,
+	// root trees ~500KB), the working set is:
+	//   500 commits × 500B          = 250KB
+	//   500 parent trees × 50KB avg = 25MB
+	//   overhead + blob prefetch    ≈ 15MB
+	// Total ~40MB. 64MB provides headroom without the 96MB waste.
+	maxObjectCache = 64 * gogitcache.MiByte
+
+	// packCacheDivisor controls what fraction of total packfile bytes
+	// maps to object cache budget. Sylk's operations access 5–15% of
+	// objects per session. Divisor=8 (~12.5%) covers the hot working
+	// set with headroom for access pattern variance.
+	packCacheDivisor = 8
 )
 
 // =============================================================================
@@ -58,8 +115,8 @@ func NewGitClient(repoPath string) (*GitClient, error) {
 	}
 
 	cache, _ := ristretto.NewCache(&ristretto.Config{
-		NumCounters: 20000, // ~10x expected max entries
-		MaxCost:     2048,  // max 2048 cached summaries
+		NumCounters: int64(maxDiffCacheEntries * 10),              // 40,000
+		MaxCost:     int64(maxDiffCacheEntries) * diffSummaryCostBytes, // 192,000
 		BufferItems: 64,
 	})
 
@@ -76,13 +133,93 @@ func NewGitClient(repoPath string) (*GitClient, error) {
 
 // initRepository attempts to open the git repository at the given path.
 func (c *GitClient) initRepository(repoPath string) {
-	repo, err := gogit.PlainOpen(repoPath)
+	repo, err := openWithSizedCache(repoPath)
 	if err != nil {
 		return
 	}
 
 	c.repo = repo
 	c.isRepo = true
+}
+
+// openWithSizedCache opens a go-git Repository with an object cache
+// sized to the actual repository, instead of the 96MB default.
+func openWithSizedCache(repoPath string) (*gogit.Repository, error) {
+	wtFS := osfs.New(repoPath)
+	dotFS, err := resolveDotGitFS(repoPath, wtFS)
+	if err != nil {
+		return nil, err
+	}
+
+	cacheSize := deriveObjectCacheSize(dotFS)
+	s := filesystem.NewStorage(dotFS, gogitcache.NewObjectLRU(cacheSize))
+	return gogit.Open(s, wtFS)
+}
+
+// resolveDotGitFS locates the .git storage filesystem. Handles both
+// the normal case (.git is a directory) and the gitdir-file case
+// (.git is a file pointing elsewhere, used by worktrees and submodules).
+func resolveDotGitFS(repoPath string, wtFS billy.Filesystem) (billy.Filesystem, error) {
+	fi, err := wtFS.Stat(".git")
+	if err != nil {
+		return nil, gogit.ErrRepositoryNotExists
+	}
+	if fi.IsDir() {
+		return wtFS.Chroot(".git")
+	}
+	return resolveGitdirFile(repoPath, wtFS)
+}
+
+// resolveGitdirFile reads a .git file (format: "gitdir: <path>\n") and
+// returns a billy.Filesystem rooted at the target git directory.
+func resolveGitdirFile(repoPath string, wtFS billy.Filesystem) (billy.Filesystem, error) {
+	f, err := wtFS.Open(".git")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	content, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+
+	line := strings.TrimSpace(string(content))
+	const gitdirPrefix = "gitdir: "
+	if !strings.HasPrefix(line, gitdirPrefix) {
+		return nil, fmt.Errorf("invalid .git file: missing gitdir prefix")
+	}
+
+	gitdir := strings.TrimPrefix(line, gitdirPrefix)
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(repoPath, gitdir)
+	}
+	return osfs.New(filepath.Clean(gitdir)), nil
+}
+
+// deriveObjectCacheSize probes the packfile sizes in the .git directory
+// and derives a cache budget proportional to actual repository data.
+// Falls back to minObjectCache when packfiles are absent or unreadable.
+func deriveObjectCacheSize(dotFS billy.Filesystem) gogitcache.FileSize {
+	entries, err := dotFS.ReadDir(filepath.Join("objects", "pack"))
+	if err != nil {
+		return minObjectCache
+	}
+
+	var totalPackBytes int64
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pack") {
+			continue
+		}
+		totalPackBytes += entry.Size()
+	}
+
+	if totalPackBytes == 0 {
+		return minObjectCache
+	}
+
+	derived := gogitcache.FileSize(totalPackBytes / packCacheDivisor)
+	return max(minObjectCache, min(maxObjectCache, derived))
 }
 
 // =============================================================================
@@ -241,14 +378,12 @@ func extractRemoteURL(remote *gogit.Remote) string {
 	return cfg.URLs[0]
 }
 
-
 // fileExists checks if a file exists at the given path.
 func (c *GitClient) fileExists(path string) bool {
 	fullPath := filepath.Join(c.repoPath, path)
 	_, err := os.Stat(fullPath)
 	return err == nil
 }
-
 
 // IsValidCommit checks if a commit reference is valid.
 // Resolves full hashes, short hashes, and symbolic refs via go-git.

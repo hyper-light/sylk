@@ -3,6 +3,7 @@ package architect
 import (
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/dag"
 )
 
@@ -15,31 +16,43 @@ const (
 	IntentCreateDAG     ArchitectIntent = "create_dag"
 	IntentRecall        ArchitectIntent = "recall"
 	IntentCheck         ArchitectIntent = "check"
+	IntentHelp          ArchitectIntent = "help"
 	IntentEstimate      ArchitectIntent = "estimate"
 	IntentConsult       ArchitectIntent = "consult"
+	IntentChat          ArchitectIntent = "chat"
+	IntentExecute       ArchitectIntent = "execute"
+	IntentConverse      ArchitectIntent = IntentChat // Backward-compatible alias.
 )
+
+// ConversationResult holds the response from a conversational (non-planning) interaction.
+type ConversationResult struct {
+	Response string
+	Intent   ArchitectIntent
+}
 
 func (i ArchitectIntent) String() string {
 	return string(i)
 }
 
 type ArchitectRequest struct {
-	ID        string
-	Intent    ArchitectIntent
-	Query     string
-	Params    map[string]any
-	SessionID string
-	Timestamp time.Time
+	ID                  string
+	Intent              ArchitectIntent
+	Query               string
+	Params              map[string]any
+	SessionID           string
+	Timestamp           time.Time
+	ConversationHistory []guide.ConversationTurn
 }
 
 type ArchitectResponse struct {
-	ID        string
-	RequestID string
-	Success   bool
-	Data      any
-	Error     string
-	Took      time.Duration
-	Timestamp time.Time
+	ID           string
+	RequestID    string
+	Success      bool
+	Data         any
+	UserResponse string
+	Error        string
+	Took         time.Duration
+	Timestamp    time.Time
 }
 
 type PlanStatus int
@@ -77,26 +90,30 @@ func (s PlanStatus) String() string {
 }
 
 type DesignPlan struct {
-	ID               string
-	SessionID        string
-	Query            string
-	Status           PlanStatus
-	Revision         int
-	Error            string
-	Requirements     *Requirements
-	CodebasePatterns *CodebasePatterns
-	Architecture     *SolutionArchitecture
-	Tasks            []*AtomicTask
-	Workflow         *WorkflowDAG
-	Constraints      *PlanConstraints
-	Consultations    map[string]*ConsultationEvidence
-	Declarations     []*PreDelegationDeclaration
-	PlanFile         string
-	Todos            []PlanTodo
-	RiskSummary      []string
-	UpdatedAt        time.Time
-	CreatedAt        time.Time
-	CompletedAt      time.Time
+	ID                     string
+	SessionID              string
+	Query                  string
+	Status                 PlanStatus
+	Revision               int
+	Error                  string
+	Requirements           *Requirements
+	CodebasePatterns       *CodebasePatterns
+	Architecture           *SolutionArchitecture
+	Tasks                  []*AtomicTask
+	Workflow               *WorkflowDAG
+	Constraints            *PlanConstraints
+	Consultations          map[string]*ConsultationEvidence
+	Declarations           []*PreDelegationDeclaration
+	PlanFile               string
+	Todos                  []PlanTodo
+	RiskSummary            []string
+	ClarificationNeeded    bool
+	ClarificationQuestions []string
+	Assumptions            []string
+	UserResponse           string
+	UpdatedAt              time.Time
+	CreatedAt              time.Time
+	CompletedAt            time.Time
 }
 
 type PlanConstraints struct {
@@ -241,9 +258,42 @@ type AtomicTask struct {
 	Outputs         map[string]any
 	Context         map[string]any
 	Result          *TaskResult
-	CreatedAt       time.Time
-	StartedAt       time.Time
-	CompletedAt     time.Time
+
+	// Rich specification fields for Jira-like task items.
+	AcceptanceCriteria  []AcceptanceCriterion
+	Guidelines          []string
+	ImplementationGuide string
+	Examples            []TaskExample
+	AffectedFiles       []TaskFileTarget
+	TestRequirements    []string
+	RiskFactors         []string
+
+	CreatedAt   time.Time
+	StartedAt   time.Time
+	CompletedAt time.Time
+}
+
+// AcceptanceCriterion defines a single verifiable acceptance condition.
+// Uses Given/When/Then structure for unambiguous testability.
+type AcceptanceCriterion struct {
+	Given    string // Precondition state
+	When     string // Action or trigger
+	Then     string // Expected outcome
+	Priority string // "must" | "should" | "could"
+}
+
+// TaskExample provides a concrete code or pattern example for the task.
+type TaskExample struct {
+	Label       string // Short description of what the example shows
+	Code        string // Code snippet or pattern
+	Explanation string // Why this example is relevant
+}
+
+// TaskFileTarget identifies a file that the task must create or modify.
+type TaskFileTarget struct {
+	Path      string // Relative file path (forward slashes)
+	Operation string // "create" | "modify" | "delete"
+	Reason    string // Why this file is affected
 }
 
 type TaskResult struct {
@@ -383,4 +433,45 @@ type ResearchProposal struct {
 	Summary      string
 	SessionID    string
 	ProjectHash  string
+}
+
+// PlanHandoff is the structured payload sent from the architect to the
+// orchestrator when a plan is approved for execution. Contains everything
+// the orchestrator needs to build a DAG, create task records, and begin
+// execution without reading external files.
+type PlanHandoff struct {
+	PlanID          string                `json:"plan_id"`
+	SessionID       string                `json:"session_id"`
+	Query           string                `json:"query"`
+	Revision        int                   `json:"revision"`
+	Tasks           []*HandoffTask        `json:"tasks"`
+	ExecutionLayers [][]string            `json:"execution_layers"`
+	CriticalPath    []string              `json:"critical_path"`
+	Constraints     *PlanConstraints      `json:"constraints"`
+	TotalTokens     int                   `json:"total_tokens"`
+	RiskSummary     []string              `json:"risk_summary,omitempty"`
+	Trigger         string                `json:"trigger"` // "user-approved" | "auto"
+	Timestamp       time.Time             `json:"timestamp"`
+}
+
+// HandoffTask is the wire format for a single task in PlanHandoff.
+// Mirrors AtomicTask but uses JSON tags for clean serialization and
+// includes all rich specification fields.
+type HandoffTask struct {
+	ID                  string                `json:"id"`
+	Name                string                `json:"name"`
+	Description         string                `json:"description"`
+	AgentType           string                `json:"agent_type"`
+	Dependencies        []string              `json:"dependencies"`
+	EstimatedTokens     int                   `json:"estimated_tokens"`
+	Complexity          string                `json:"complexity"`
+	Priority            int                   `json:"priority"`
+	SuccessCriteria     []string              `json:"success_criteria"`
+	AcceptanceCriteria  []AcceptanceCriterion `json:"acceptance_criteria,omitempty"`
+	Guidelines          []string              `json:"guidelines,omitempty"`
+	ImplementationGuide string                `json:"implementation_guide,omitempty"`
+	Examples            []TaskExample         `json:"examples,omitempty"`
+	AffectedFiles       []TaskFileTarget      `json:"affected_files,omitempty"`
+	TestRequirements    []string              `json:"test_requirements,omitempty"`
+	RiskFactors         []string              `json:"risk_factors,omitempty"`
 }

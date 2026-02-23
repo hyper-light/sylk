@@ -28,7 +28,7 @@ func TestArchitect_SkillsLoaded(t *testing.T) {
 	}
 }
 
-func TestArchitect_ConsultationGateRequiresBus(t *testing.T) {
+func TestArchitect_ConsultationGateWithoutBusStillResponds(t *testing.T) {
 	a := newTestArchitect(t, Config{})
 	req := &ArchitectRequest{
 		ID:        "req_gate",
@@ -36,9 +36,15 @@ func TestArchitect_ConsultationGateRequiresBus(t *testing.T) {
 		Query:     "plan a complex migration",
 		Timestamp: time.Now(),
 	}
-	_, err := a.Handle(context.Background(), req)
-	if err == nil {
-		t.Fatal("expected consultation gate error when bus is unavailable")
+	// Call executePlanningProtocol directly — Handle now routes IntentPlan
+	// through conversation (which requires LLM). The consultation gate
+	// test exercises the planning protocol's bus-less fallback.
+	plan, err := a.executePlanningProtocol(context.Background(), req)
+	if err != nil {
+		t.Fatalf("expected architect to continue without bus consultation, got error: %v", err)
+	}
+	if plan == nil {
+		t.Fatal("expected non-nil plan")
 	}
 }
 

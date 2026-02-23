@@ -107,50 +107,39 @@ func captureStackTrace() string {
 	return string(buf[:n])
 }
 
-// processChunks handles the chunk and error channels from streaming.
+// processChunks drains the chunks channel first, then checks for a final
+// error. This ensures deterministic ordering: all data chunks are published
+// before any error chunk.
 func (b *StreamBridge) processChunks(
 	ctx context.Context,
 	chunks <-chan *StreamChunk,
 	errs <-chan error,
 	streamCtx *StreamContext,
 ) {
-	for b.processNextEvent(ctx, chunks, errs, streamCtx) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case chunk, ok := <-chunks:
+			if !ok {
+				b.drainFinalError(errs, streamCtx)
+				return
+			}
+			b.publishChunk(chunk, streamCtx)
+		}
 	}
 }
 
-// processNextEvent waits for and processes a single event. Returns true to continue.
-func (b *StreamBridge) processNextEvent(
-	ctx context.Context,
-	chunks <-chan *StreamChunk,
-	errs <-chan error,
-	streamCtx *StreamContext,
-) bool {
+// drainFinalError reads a single error from the error channel after chunks
+// are exhausted and publishes it if non-nil.
+func (b *StreamBridge) drainFinalError(errs <-chan error, streamCtx *StreamContext) {
 	select {
-	case <-ctx.Done():
-		return false
 	case err := <-errs:
-		b.handleStreamError(err, streamCtx)
-		return false
-	case chunk, ok := <-chunks:
-		return b.handleChunk(chunk, ok, streamCtx)
+		if err != nil {
+			b.publishErrorChunk(err, streamCtx)
+		}
+	default:
 	}
-}
-
-// handleStreamError publishes an error if one occurred.
-func (b *StreamBridge) handleStreamError(err error, streamCtx *StreamContext) {
-	if err == nil {
-		return
-	}
-	b.publishErrorChunk(err, streamCtx)
-}
-
-// handleChunk processes a single chunk. Returns false when stream is closed.
-func (b *StreamBridge) handleChunk(chunk *StreamChunk, ok bool, streamCtx *StreamContext) bool {
-	if !ok {
-		return false
-	}
-	b.publishChunk(chunk, streamCtx)
-	return true
 }
 
 // publishChunk wraps and publishes a single chunk.

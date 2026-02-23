@@ -12,13 +12,14 @@ func (g *Guide) prepareSkillsForRouting(request *RouteRequest) {
 		return
 	}
 	ctx := skills.LoadContext{
-		RecentInputs:    guideSkillInputs(request),
-		ActiveDomains:   nil,
+		RecentInputs:    guideSkillInputs(g, request),
+		ActiveDomains:   guideSkillDomains(request),
 		RecentlyInvoked: g.recentlyInvokedGuideSkills(6),
 		TokenBudget:     0,
 	}
 	g.LoadSkillsForContext(ctx)
 	g.OptimizeSkillsForBudget()
+	g.ensureCriticalGuideSkills(request.Input)
 }
 
 // PrepareToolDefinitionsForInput progressively loads likely skills for input and returns loaded tool definitions.
@@ -28,7 +29,7 @@ func (g *Guide) PrepareToolDefinitionsForInput(input string) []map[string]any {
 	return g.GetLoadedSkillDefinitions()
 }
 
-func guideSkillInputs(request *RouteRequest) []string {
+func guideSkillInputs(g *Guide, request *RouteRequest) []string {
 	if request == nil {
 		return nil
 	}
@@ -39,7 +40,49 @@ func guideSkillInputs(request *RouteRequest) []string {
 	if request.SourceAgentID != "" {
 		inputs = append(inputs, request.SourceAgentID)
 	}
+	if g != nil && g.conversation != nil && request.SessionID != "" {
+		if snapshot, ok := g.conversation.Snapshot(request.SessionID); ok {
+			inputs = append(inputs, snapshot.ActiveAgentID)
+		}
+	}
 	return trimNonEmpty(inputs)
+}
+
+func guideSkillDomains(request *RouteRequest) []string {
+	if request == nil {
+		return []string{"routing"}
+	}
+	query := strings.ToLower(strings.TrimSpace(request.Input))
+	domains := []string{"routing"}
+	if query == "" {
+		return domains
+	}
+	if strings.Contains(query, "agent") || strings.Contains(query, "registry") {
+		domains = append(domains, "agents")
+	}
+	if strings.Contains(query, "task") || strings.Contains(query, "pipeline") || strings.Contains(query, "orchestrator") {
+		domains = append(domains, "tasks")
+	}
+	return trimNonEmpty(domains)
+}
+
+func (g *Guide) ensureCriticalGuideSkills(input string) {
+	if g == nil || g.skills == nil {
+		return
+	}
+	if guideLooksLikeTaskInput(input) {
+		_ = g.skills.Load("task_interact")
+	}
+}
+
+func guideLooksLikeTaskInput(input string) bool {
+	query := strings.ToLower(strings.TrimSpace(input))
+	if query == "" {
+		return false
+	}
+	return strings.Contains(query, "task") ||
+		strings.Contains(query, "pipeline") ||
+		strings.Contains(query, "orchestrator")
 }
 
 func trimNonEmpty(values []string) []string {

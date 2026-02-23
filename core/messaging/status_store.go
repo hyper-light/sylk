@@ -16,9 +16,14 @@ import (
 const (
 	DefaultStatusStorePath = ".sylk/message_status.db"
 
-	defaultNumCounters = 1e6 // 1M counters for admission policy
-	defaultMaxCost     = 1e8 // 100MB max cache size
-	defaultBufferItems = 64  // Buffer for async operations
+	// Derived: 10,000 max active messages × 10 = 100,000 counters.
+	// CM sketch: 4 rows × (100,000/16) uint64 = ~50KB (vs previous ~500KB).
+	defaultNumCounters = 100_000
+
+	// Derived: 10,000 max entries × 320 avg bytes = 3,200,000.
+	defaultMaxCost = 3_200_000
+
+	defaultBufferItems = 64
 )
 
 type StatusRecord struct {

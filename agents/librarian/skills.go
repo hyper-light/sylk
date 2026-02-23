@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -16,6 +17,25 @@ func (l *Librarian) registerCoreSkills() {
 	l.skills.Register(assessHealthSkill(l))
 	l.skills.Register(queryStructureSkill(l))
 	l.skills.Register(locateSymbolSkill(l))
+	l.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "librarian",
+		SessionID: func() string { return "" },
+		Publish:   l.publishRerouteRequest,
+	}))
+}
+
+func (l *Librarian) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if l.bus == nil {
+		return fmt.Errorf("librarian bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "librarian",
+		SuggestedTarget: suggestedTarget,
+		ExcludeAgents:   []string{"librarian"},
+	}
+	return l.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 type searchCodebaseParams struct {

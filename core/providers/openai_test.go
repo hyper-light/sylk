@@ -3,10 +3,12 @@ package providers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/core/oauth"
+	promptskills "github.com/adalundhe/sylk/skills"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/responses"
 )
@@ -177,6 +179,36 @@ func TestOpenAIProviderBuildResponseParams_ChatGPTFallbackInstructions(t *testin
 	}
 	if params.Instructions.Value == "" {
 		t.Fatal("expected non-empty default instructions")
+	}
+}
+
+func TestOpenAIProviderResolveSystemPrompt_AppendsSkills(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.3-codex",
+				MaxTokens: 256,
+			},
+			SystemPrompt: "Base prompt",
+		},
+		skills: []promptskills.Skill{
+			{
+				Name:        "self-diagnostic",
+				Description: "Explain what failed and how to recover.",
+				Path:        "agents/guide/skillfiles/self-diagnostic/SKILL.md",
+			},
+		},
+	}
+
+	got := p.resolveSystemPrompt(&Request{})
+	if !strings.Contains(got, "Base prompt") {
+		t.Fatalf("expected system prompt to contain base prompt: %q", got)
+	}
+	if !strings.Contains(got, "<available_skills>") {
+		t.Fatalf("expected system prompt to contain skills envelope: %q", got)
+	}
+	if !strings.Contains(got, "self-diagnostic") {
+		t.Fatalf("expected system prompt to contain skill name: %q", got)
 	}
 }
 

@@ -15,15 +15,84 @@ import (
 )
 
 func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectRequest) (*DesignPlan, error) {
+	req = a.enrichPlanningRequest(req)
 	plan := newProtocolPlan(req)
 	a.persistPlanState(plan)
-	runner := &planningProtocolRunner{architect: a, ctx: ctx, request: req, plan: plan}
+	plannerCtx := withPlannerThoughtCallback(ctx, func(stage string, thought string) {
+		a.publishPlanThought(ctx, stage, thought)
+	})
+	runner := &planningProtocolRunner{architect: a, ctx: plannerCtx, request: req, plan: plan}
 	if err := runner.run(); err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
 	plan.CompletedAt = time.Now()
 	a.persistPlanState(plan)
 	return plan, nil
+}
+
+func (a *Architect) enrichPlanningRequest(req *ArchitectRequest) *ArchitectRequest {
+	if req == nil {
+		return nil
+	}
+	if a == nil {
+		return req
+	}
+	clone := *req
+	clone.Params = cloneParams(req.Params)
+	if len(clone.ConversationHistory) > 0 {
+		clone.Params["conversation_history"] = formatConversationHistory(clone.ConversationHistory)
+	}
+	if strings.TrimSpace(req.SessionID) == "" {
+		return &clone
+	}
+	context := a.priorSessionContext(req.SessionID)
+	if len(context) == 0 {
+		return &clone
+	}
+	clone.Params["session_context"] = context
+	return &clone
+}
+
+func formatConversationHistory(turns []guide.ConversationTurn) string {
+	var b strings.Builder
+	for i, turn := range turns {
+		fmt.Fprintf(&b, "Turn %d:\n  User: %s\n  Agent: %s\n", i+1, turn.UserInput, turn.AgentReply)
+	}
+	return b.String()
+}
+
+func cloneParams(values map[string]any) map[string]any {
+	if len(values) == 0 {
+		return map[string]any{}
+	}
+	cloned := make(map[string]any, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func (a *Architect) priorSessionContext(sessionID string) map[string]any {
+	plan := a.latestHistoricalPlanForSession(sessionID)
+	if plan == nil {
+		return nil
+	}
+	context := map[string]any{
+		"prior_plan_query":  plan.Query,
+		"prior_plan_status": plan.Status.String(),
+	}
+	if plan.Requirements != nil {
+		context["prior_scope"] = plan.Requirements.Scope
+		context["prior_goals"] = append([]string(nil), plan.Requirements.Goals...)
+		context["prior_constraints"] = append([]string(nil), plan.Requirements.Constraints...)
+	}
+	if len(plan.ClarificationQuestions) > 0 {
+		context["prior_clarification_questions"] = append([]string(nil), plan.ClarificationQuestions...)
+	}
+	if len(plan.Assumptions) > 0 {
+		context["prior_assumptions"] = append([]string(nil), plan.Assumptions...)
+	}
+	return context
 }
 
 func newProtocolPlan(req *ArchitectRequest) *DesignPlan {
@@ -58,16 +127,20 @@ type planningProtocolRunner struct {
 }
 
 func (r *planningProtocolRunner) run() error {
-	steps := []func() error{
-		r.stepAnalyze,
-		r.stepConsult,
-		r.stepDesign,
-		r.stepGenerate,
-		r.stepWorkflow,
-		r.stepValidate,
-		r.stepReady,
+	if err := r.stepAnalyze(); err != nil {
+		return err
 	}
-	for _, step := range steps {
+	if err := r.stepConsult(); err != nil {
+		return err
+	}
+	needsClarification, err := r.stepClarify()
+	if err != nil {
+		return err
+	}
+	if needsClarification {
+		return nil
+	}
+	for _, step := range r.remainingExecutionSteps() {
 		if err := step(); err != nil {
 			return err
 		}
@@ -78,6 +151,16 @@ func (r *planningProtocolRunner) run() error {
 		}
 	}
 	return nil
+}
+
+func (r *planningProtocolRunner) remainingExecutionSteps() []func() error {
+	return []func() error{
+		r.stepDesign,
+		r.stepGenerate,
+		r.stepWorkflow,
+		r.stepValidate,
+		r.stepReady,
+	}
 }
 
 func shouldAutoHandoff(req *ArchitectRequest) bool {
@@ -171,10 +254,7 @@ func (r *planningProtocolRunner) validateDeclarationForPolicy(declaration *PreDe
 	if r.architect == nil {
 		return fmt.Errorf("architect is nil")
 	}
-	if r.architect.config.MandatoryConsultation {
-		return r.architect.validateDeclaration(declaration)
-	}
-	if len(declaration.ConsultationChecks) == 0 {
+	if declaration == nil || len(declaration.ConsultationChecks) == 0 {
 		return nil
 	}
 	if err := r.architect.validateDeclaration(declaration); err != nil {
@@ -236,6 +316,11 @@ func (r *planningProtocolRunner) stepReady() error {
 	if err := r.transition(PlanStatusReady); err != nil {
 		return err
 	}
+	// Stream formatted plan inline as chat content.
+	r.architect.publishPlanStreamChunk(r.ctx, formatPlanForChat(r.plan))
+	// Stream LLM commentary + readiness footer token-by-token.
+	r.plan.UserResponse = r.architect.readyUserResponseInline(r.ctx, r.request, r.plan)
+	// Persist but do NOT show plan panel yet — it appears during execution.
 	return r.architect.persistPlanState(r.plan)
 }
 
@@ -279,6 +364,7 @@ func summarizeAutoHandoffResponse(msg *guide.Message) string {
 func (r *planningProtocolRunner) transition(status PlanStatus) error {
 	r.plan.Status = status
 	r.plan.UpdatedAt = time.Now()
+	r.architect.publishPlanStreamProgress(r.ctx, status)
 	return r.architect.persistPlanState(r.plan)
 }
 
@@ -350,6 +436,15 @@ func validateTaskContract(task *AtomicTask) error {
 	if len(task.SuccessCriteria) == 0 {
 		return fmt.Errorf("task %s success criteria are required", task.ID)
 	}
+	if len(task.AcceptanceCriteria) == 0 {
+		return fmt.Errorf("task %s acceptance criteria are required", task.ID)
+	}
+	if strings.TrimSpace(task.ImplementationGuide) == "" {
+		return fmt.Errorf("task %s implementation guide is required", task.ID)
+	}
+	if len(task.AffectedFiles) == 0 {
+		return fmt.Errorf("task %s affected files are required", task.ID)
+	}
 	return nil
 }
 
@@ -379,23 +474,41 @@ func (a *Architect) upsertActivePlan(plan *DesignPlan) {
 		return
 	}
 	a.activePlansMu.Lock()
+	defer a.activePlansMu.Unlock()
 	a.activePlans[plan.ID] = plan
-	a.activePlansMu.Unlock()
 }
 
 func (a *Architect) persistPlanSnapshot(plan *DesignPlan) error {
+	if plan == nil {
+		return nil
+	}
+	encoded, err := a.marshalPlanSnapshot(plan)
+	if err != nil {
+		return err
+	}
+	return a.persistEncodedPlanSnapshot(plan.ID, encoded)
+}
+
+func (a *Architect) marshalPlanSnapshot(plan *DesignPlan) ([]byte, error) {
 	if a == nil || plan == nil || strings.TrimSpace(plan.ID) == "" {
+		return nil, nil
+	}
+	return json.MarshalIndent(plan, "", "  ")
+}
+
+func (a *Architect) persistEncodedPlanSnapshot(planID string, encoded []byte) error {
+	if a == nil || strings.TrimSpace(planID) == "" || len(encoded) == 0 {
 		return nil
 	}
 	dir := a.planStoreDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(plan, "", "  ")
-	if err != nil {
-		return err
+	trimmedID := strings.TrimSpace(planID)
+	if trimmedID == "" {
+		return nil
 	}
-	finalPath := filepath.Join(dir, plan.ID+".json")
+	finalPath := filepath.Join(dir, trimmedID+".json")
 	tmpPath := finalPath + ".tmp"
 	if err := os.WriteFile(tmpPath, encoded, 0o644); err != nil {
 		return err

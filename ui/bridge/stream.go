@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,11 +74,17 @@ func convertProgress(d *streamDispatcher, event *guide.StreamEvent) any {
 }
 
 func convertComplete(d *streamDispatcher, event *guide.StreamEvent) any {
-	return msg.StreamCompleteMsg{
-		SessionID:     d.sessionID,
-		CorrelationID: d.correlationID,
-		Result:        event.Data,
+	complete := msg.StreamCompleteMsg{
+		SessionID:         d.sessionID,
+		CorrelationID:     d.correlationID,
+		Result:            event.Data,
+		AuthoritativeText: strings.TrimSpace(event.Text),
 	}
+	if event.Usage != nil {
+		complete.InputTokens = event.Usage.InputTokens
+		complete.OutputTokens = event.Usage.OutputTokens
+	}
+	return complete
 }
 
 func convertError(d *streamDispatcher, event *guide.StreamEvent) any {

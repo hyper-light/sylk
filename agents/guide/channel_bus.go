@@ -36,6 +36,10 @@ type ChannelBus struct {
 // in milliseconds; 5s provides generous safety margin.
 const defaultCloseTimeout = 5 * time.Second
 
+// maxAsyncHandlersPerSubscription caps async fan-out for a single subscription
+// to prevent unbounded goroutine growth under sustained publish load.
+const maxAsyncHandlersPerSubscription = 32
+
 type ChannelBusConfig struct {
 	BufferSize   int
 	ShardCount   int
@@ -257,15 +261,21 @@ func (s *channelSubscription) close() {
 func (s *channelSubscription) run(wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	var asyncLimiter chan struct{}
+	if s.async {
+		asyncLimiter = make(chan struct{}, maxAsyncHandlersPerSubscription)
+	}
+
 	for msg := range s.ch {
 		if !s.active.Load() {
 			continue
 		}
 
 		if s.async {
+			asyncLimiter <- struct{}{}
 			// Track async handler goroutines for proper shutdown
 			wg.Add(1)
-			go s.handleMessageAsync(wg, msg)
+			go s.handleMessageAsync(wg, asyncLimiter, msg)
 		} else {
 			s.handleMessage(msg)
 		}
@@ -274,8 +284,11 @@ func (s *channelSubscription) run(wg *sync.WaitGroup) {
 
 // handleMessageAsync wraps handleMessage with WaitGroup tracking for async handlers.
 // This ensures the bus waits for all async handlers to complete during shutdown.
-func (s *channelSubscription) handleMessageAsync(wg *sync.WaitGroup, msg *Message) {
+func (s *channelSubscription) handleMessageAsync(wg *sync.WaitGroup, limiter chan struct{}, msg *Message) {
 	defer wg.Done()
+	defer func() {
+		<-limiter
+	}()
 	s.handleMessage(msg)
 }
 

@@ -6,6 +6,7 @@ For every implementation request, follow this sequence:
 - extract explicit requirements
 - extract assumptions and unknowns
 - identify ambiguity and scope boundaries
+- when asked for recommendations, produce a clear default stance plus explicit tradeoffs before asking follow-up questions
 
 2. Consult before deciding:
 - gather codebase patterns

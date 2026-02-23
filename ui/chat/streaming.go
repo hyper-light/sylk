@@ -35,6 +35,17 @@ func (sa *StreamAccumulator) Append(text string) {
 	sa.lastChunk = time.Now()
 }
 
+// Replace overwrites the accumulated content with the given text.
+// Used when the agent provides authoritative final text to correct
+// any dropped or reordered streaming chunks.
+func (sa *StreamAccumulator) Replace(text string) {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+
+	sa.content.Reset()
+	sa.content.WriteString(text)
+}
+
 // Complete marks the stream as finished. After this call, IsDone
 // returns true and no further Append calls should be made.
 func (sa *StreamAccumulator) Complete() {

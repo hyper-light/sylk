@@ -12,9 +12,8 @@ import (
 	"github.com/adalundhe/sylk/ui/theme"
 )
 
-// defaultMaxHeight is the maximum visible content rows before internal scrolling.
-// Derived from: 3 lines of user input before the box scrolls internally.
-const defaultMaxHeight = 3
+// borderSize is the vertical space consumed by the input border (top + bottom).
+const borderSize = 2
 
 // Model is the prompt input component.
 type Model struct {
@@ -22,7 +21,11 @@ type Model struct {
 	cursorRow int
 	cursorCol int
 	maxHeight int // Max visible rows before internal scroll
-	scrollOff int // First visible line when content exceeds maxHeight
+	scrollOff int // First visible visual line when content exceeds maxHeight
+
+	// Word-wrap state (visual-only decomposition of actual lines).
+	wrap      *wrapState
+	wrapDirty bool
 
 	// Selection state.
 	allSelected bool // Ctrl+A select-all active.
@@ -61,7 +64,8 @@ var (
 func New(th *theme.Theme, historyCapacity int, providers ...CompletionProvider) *Model {
 	return &Model{
 		lines:       [][]rune{nil},
-		maxHeight:   defaultMaxHeight,
+		maxHeight:   1,
+		wrapDirty:   true,
 		history:     NewInputHistory(historyCapacity),
 		completer:   NewCompleter(providers...),
 		theme:       th,
@@ -104,6 +108,7 @@ func (m *Model) Clear() {
 	m.cursorCol = 0
 	m.scrollOff = 0
 	m.completer.Dismiss()
+	m.wrapDirty = true
 	m.viewDirty = true
 }
 
@@ -212,15 +217,60 @@ func (m *Model) SetFocused(focused bool) {
 // ---------------------------------------------------------------------------
 
 // SetSize updates the component's available dimensions.
+// The maxHeight for internal scrolling is derived from the allocated height.
 func (m *Model) SetSize(width, height int) {
 	m.width = width
 	m.height = height
+	m.maxHeight = max(height-borderSize, 1)
+	m.wrapDirty = true
 	m.viewDirty = true
 }
 
 // LineCount returns the number of content lines currently in the input.
 func (m *Model) LineCount() int {
 	return len(m.lines)
+}
+
+// ensureWrap recomputes the wrap state if dirty.
+func (m *Model) ensureWrap() {
+	if !m.wrapDirty && m.wrap != nil {
+		return
+	}
+	m.wrap = computeWrap(m.lines, m.contentWidth())
+	m.wrapDirty = false
+}
+
+// VisualLineCount returns the number of visual lines after word wrapping.
+func (m *Model) VisualLineCount() int {
+	m.ensureWrap()
+	return m.wrap.visualTotal
+}
+
+// ScrollUp decrements scrollOff by 1 visual line (clamped to 0).
+func (m *Model) ScrollUp() {
+	if m.scrollOff > 0 {
+		m.scrollOff--
+		m.viewDirty = true
+	}
+}
+
+// ScrollDown increments scrollOff by 1 visual line (clamped to max).
+func (m *Model) ScrollDown() {
+	m.ensureWrap()
+	maxOff := m.wrap.visualTotal - m.maxHeight
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.scrollOff < maxOff {
+		m.scrollOff++
+		m.viewDirty = true
+	}
+}
+
+// CanScroll reports whether the content exceeds the visible area.
+func (m *Model) CanScroll() bool {
+	m.ensureWrap()
+	return m.wrap.visualTotal > m.maxHeight
 }
 
 // ---------------------------------------------------------------------------
@@ -336,13 +386,15 @@ func actionNewline(m *Model) tea.Cmd {
 }
 
 func actionUp(m *Model) tea.Cmd {
-	if m.cursorRow > 0 {
-		m.cursorRow--
+	m.ensureWrap()
+	vRow, vCol := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	if vRow > 0 {
+		m.cursorRow, m.cursorCol = m.wrap.visualToActual(vRow-1, vCol)
 		m.clampCol()
 		m.scrollIntoView()
 		return nil
 	}
-	// On first line: navigate history when text is empty or already navigating.
+	// At visual top: history navigation.
 	entry, ok := m.history.Up(m.Text())
 	if !ok {
 		return nil
@@ -352,12 +404,15 @@ func actionUp(m *Model) tea.Cmd {
 }
 
 func actionDown(m *Model) tea.Cmd {
-	if m.cursorRow < len(m.lines)-1 {
-		m.cursorRow++
+	m.ensureWrap()
+	vRow, vCol := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	if vRow < m.wrap.visualTotal-1 {
+		m.cursorRow, m.cursorCol = m.wrap.visualToActual(vRow+1, vCol)
 		m.clampCol()
 		m.scrollIntoView()
 		return nil
 	}
+	// At visual bottom: history navigation.
 	entry, ok := m.history.Down()
 	if !ok {
 		return nil
@@ -389,23 +444,33 @@ func actionRight(m *Model) tea.Cmd {
 }
 
 func actionHome(m *Model) tea.Cmd {
-	m.cursorCol = 0
+	m.ensureWrap()
+	vRow, _ := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	_, segIdx := m.wrap.visualRowToSegment(vRow)
+	span := m.wrap.segments[m.cursorRow][segIdx]
+	m.cursorCol = span.Start
 	return nil
 }
 
 func actionEnd(m *Model) tea.Cmd {
-	m.cursorCol = len(m.lines[m.cursorRow])
+	m.ensureWrap()
+	vRow, _ := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	_, segIdx := m.wrap.visualRowToSegment(vRow)
+	span := m.wrap.segments[m.cursorRow][segIdx]
+	m.cursorCol = span.End
 	return nil
 }
 
 func actionClearLine(m *Model) tea.Cmd {
 	m.lines[m.cursorRow] = nil
 	m.cursorCol = 0
+	m.wrapDirty = true
 	return nil
 }
 
 func actionKillToEnd(m *Model) tea.Cmd {
 	m.lines[m.cursorRow] = m.lines[m.cursorRow][:m.cursorCol]
+	m.wrapDirty = true
 	return nil
 }
 
@@ -462,6 +527,7 @@ func (m *Model) setText(s string) {
 	}
 	m.cursorRow = len(m.lines) - 1
 	m.cursorCol = len(m.lines[m.cursorRow])
+	m.wrapDirty = true
 	m.scrollIntoView()
 }
 
@@ -471,6 +537,7 @@ func (m *Model) clear() {
 	m.cursorRow = 0
 	m.cursorCol = 0
 	m.scrollOff = 0
+	m.wrapDirty = true
 	m.history.Reset()
 	m.completer.Dismiss()
 }
@@ -484,6 +551,7 @@ func (m *Model) insertRunes(rs []rune) {
 	newLine = append(newLine, line[m.cursorCol:]...)
 	m.lines[m.cursorRow] = newLine
 	m.cursorCol += len(rs)
+	m.wrapDirty = true
 }
 
 // retriggerOrDismiss re-triggers the completer when the cursor is on
@@ -534,6 +602,7 @@ func (m *Model) insertNewline() {
 
 	m.cursorRow++
 	m.cursorCol = 0
+	m.wrapDirty = true
 	m.scrollIntoView()
 }
 
@@ -543,6 +612,7 @@ func (m *Model) deleteBeforeCursor() {
 		line := m.lines[m.cursorRow]
 		m.lines[m.cursorRow] = append(line[:m.cursorCol-1], line[m.cursorCol:]...)
 		m.cursorCol--
+		m.wrapDirty = true
 		return
 	}
 	if m.cursorRow == 0 {
@@ -555,13 +625,16 @@ func (m *Model) deleteBeforeCursor() {
 	m.lines = append(m.lines[:m.cursorRow], m.lines[m.cursorRow+1:]...)
 	m.cursorRow--
 	m.cursorCol = joinCol
+	m.wrapDirty = true
 	m.scrollIntoView()
 }
 
-// moveCursorLeft moves the cursor one position to the left, wrapping to the previous line.
+// moveCursorLeft moves the cursor one position to the left, wrapping across
+// visual-line segments and actual lines.
 func (m *Model) moveCursorLeft() {
 	if m.cursorCol > 0 {
 		m.cursorCol--
+		m.scrollIntoView()
 		return
 	}
 	if m.cursorRow > 0 {
@@ -571,10 +644,12 @@ func (m *Model) moveCursorLeft() {
 	}
 }
 
-// moveCursorRight moves the cursor one position to the right, wrapping to the next line.
+// moveCursorRight moves the cursor one position to the right, wrapping across
+// visual-line segments and actual lines.
 func (m *Model) moveCursorRight() {
 	if m.cursorCol < len(m.lines[m.cursorRow]) {
 		m.cursorCol++
+		m.scrollIntoView()
 		return
 	}
 	if m.cursorRow < len(m.lines)-1 {
@@ -589,13 +664,15 @@ func (m *Model) clampCol() {
 	m.cursorCol = min(m.cursorCol, len(m.lines[m.cursorRow]))
 }
 
-// scrollIntoView adjusts scrollOff so the cursor row is visible.
+// scrollIntoView adjusts scrollOff so the cursor's visual row is visible.
 func (m *Model) scrollIntoView() {
-	if m.cursorRow < m.scrollOff {
-		m.scrollOff = m.cursorRow
+	m.ensureWrap()
+	vRow, _ := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	if vRow < m.scrollOff {
+		m.scrollOff = vRow
 	}
-	if m.cursorRow >= m.scrollOff+m.maxHeight {
-		m.scrollOff = m.cursorRow - m.maxHeight + 1
+	if vRow >= m.scrollOff+m.maxHeight {
+		m.scrollOff = vRow - m.maxHeight + 1
 	}
 }
 
@@ -623,6 +700,7 @@ func (m *Model) replaceWordBeforeCursor(text string) {
 	newLine = append(newLine, line[m.cursorCol:]...)
 	m.lines[m.cursorRow] = newLine
 	m.cursorCol = start + len(replacement)
+	m.wrapDirty = true
 }
 
 // runeToFirstByte returns the first byte of a rune's UTF-8 encoding.
@@ -654,37 +732,42 @@ func (m *Model) contentWidth() int {
 	return w
 }
 
-// renderBody renders the visible lines with cursor and placeholder.
+// renderBody renders the visible visual lines with cursor and placeholder.
 func (m *Model) renderBody(cursorVisible bool) string {
 	if m.isEmpty() && !m.focused {
 		return m.theme.Placeholder.Render(m.placeholder)
 	}
-
-	visibleEnd := min(m.scrollOff+m.maxHeight, len(m.lines))
-	visible := m.lines[m.scrollOff:visibleEnd]
-
+	m.ensureWrap()
+	end := min(m.scrollOff+m.maxHeight, m.wrap.visualTotal)
 	var b strings.Builder
-	for i, line := range visible {
-		absRow := m.scrollOff + i
-		rendered := m.renderLine(line, absRow, cursorVisible)
-		b.WriteString(rendered)
-		if i < len(visible)-1 {
+	for vRow := m.scrollOff; vRow < end; vRow++ {
+		if vRow > m.scrollOff {
 			b.WriteByte('\n')
 		}
+		actualRow, segIdx := m.wrap.visualRowToSegment(vRow)
+		span := m.wrap.segments[actualRow][segIdx]
+		segment := m.lines[actualRow][span.Start:span.End]
+		b.WriteString(m.renderVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible))
 	}
 	return b.String()
 }
 
-// renderLine renders a single line, highlighting @agent prefix and showing the cursor.
-func (m *Model) renderLine(line []rune, absRow int, cursorVisible bool) string {
-	lineStr := string(line)
-	needsCursor := m.focused && absRow == m.cursorRow
+// renderVisualLine renders a single visual-line segment.
+// segOffset is the rune offset within the actual line where this segment starts.
+func (m *Model) renderVisualLine(segment []rune, actualRow, segOffset, segIdx int, cursorVisible bool) string {
+	lineStr := string(segment)
+	needsCursor := m.focused && actualRow == m.cursorRow &&
+		m.cursorCol >= segOffset && m.cursorCol <= segOffset+len(segment)
 
-	// Apply custom line styler or default @agent highlighting on line 0.
-	if absRow == 0 && m.lineStyler != nil {
-		return m.renderStyledLine(line, needsCursor, cursorVisible)
+	// localCol is the cursor column relative to this segment.
+	localCol := m.cursorCol - segOffset
+
+	// Line 0, first segment only: apply line styler / @agent / slash highlighting.
+	isFirstSegment := actualRow == 0 && segIdx == 0
+	if isFirstSegment && m.lineStyler != nil {
+		return m.renderStyledLineSegment(segment, localCol, needsCursor, cursorVisible)
 	}
-	if absRow == 0 {
+	if isFirstSegment {
 		if len(lineStr) > 0 && lineStr[0] == '/' {
 			lineStr = m.highlightSlashCommand(lineStr)
 		} else {
@@ -692,11 +775,16 @@ func (m *Model) renderLine(line []rune, absRow int, cursorVisible bool) string {
 		}
 	}
 
-	ghost := m.completer.GhostSuffix()
-	if !needsCursor {
-		return lineStr + m.renderGhost(ghost)
+	// Ghost suffix appears only on the segment containing the cursor.
+	ghost := ""
+	if needsCursor {
+		ghost = m.completer.GhostSuffix()
 	}
-	return m.renderCursorWithGhost(line, lineStr, cursorVisible, ghost)
+
+	if !needsCursor {
+		return lineStr
+	}
+	return m.renderCursorWithGhostLocal(segment, lineStr, localCol, cursorVisible, ghost)
 }
 
 // renderGhost renders the ghost suffix in muted style, or "" if empty.
@@ -707,92 +795,84 @@ func (m *Model) renderGhost(suffix string) string {
 	return lipgloss.NewStyle().Foreground(m.theme.Palette.Muted).Render(suffix)
 }
 
-// renderCursorWithGhost renders the cursor and ghost text together so the
-// ghost position is stable regardless of blink phase. When the cursor is
-// at end-of-line and ghost text exists, the first ghost character becomes
-// the cursor block instead of inserting an extra space.
-func (m *Model) renderCursorWithGhost(line []rune, lineStr string, cursorVisible bool, ghost string) string {
+// renderCursorWithGhostLocal renders the cursor and ghost text together,
+// using localCol (cursor position relative to the segment start).
+func (m *Model) renderCursorWithGhostLocal(seg []rune, segStr string, localCol int, cursorVisible bool, ghost string) string {
 	ghostRunes := []rune(ghost)
 	mutedStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
-	atEnd := m.cursorCol >= len(line)
+	atEnd := localCol >= len(seg)
 
-	// Cursor mid-line: standard rendering, ghost appended after.
+	// Cursor mid-segment: standard rendering, ghost appended after.
 	if !atEnd {
-		return m.renderCursor(line, lineStr, cursorVisible) + m.renderGhost(ghost)
+		return renderCursorAt(seg, segStr, localCol, cursorVisible) + m.renderGhost(ghost)
 	}
 
-	// Cursor at end-of-line with ghost text: use first ghost char as cursor.
+	// Cursor at end-of-segment with ghost text: use first ghost char as cursor.
 	if len(ghostRunes) > 0 {
 		tail := mutedStyle.Render(string(ghostRunes[1:]))
 		if cursorVisible {
-			return lineStr + cursorStyle.Render(string(ghostRunes[:1])) + tail
+			return segStr + cursorStyle.Render(string(ghostRunes[:1])) + tail
 		}
-		return lineStr + mutedStyle.Render(string(ghostRunes[:1])) + tail
+		return segStr + mutedStyle.Render(string(ghostRunes[:1])) + tail
 	}
 
-	// No ghost: standard end-of-line cursor.
+	// No ghost: standard end-of-segment cursor.
 	if cursorVisible {
-		return lineStr + cursorStyle.Render(" ")
+		return segStr + cursorStyle.Render(" ")
 	}
-	return lineStr
+	return segStr
 }
 
-// renderStyledLine applies the lineStyler and appends any hint text.
-func (m *Model) renderStyledLine(line []rune, needsCursor bool, cursorVisible bool) string {
+// renderStyledLineSegment applies the lineStyler to a segment and appends hint text.
+// localCol is the cursor column relative to the segment.
+func (m *Model) renderStyledLineSegment(seg []rune, localCol int, needsCursor bool, cursorVisible bool) string {
 	hintStyle := m.theme.Placeholder
-
 	if needsCursor {
-		styled, hint := m.renderStyledCursor(line, m.lineStyler, cursorVisible)
+		styled, hint := renderStyledCursorAt(seg, localCol, m.lineStyler, cursorVisible)
 		if hint != "" {
 			return styled + hintStyle.Render(" "+hint)
 		}
 		return styled
 	}
-	styled, hint := m.lineStyler(string(line))
+	styled, hint := m.lineStyler(string(seg))
 	if hint != "" {
 		return styled + hintStyle.Render(" "+hint)
 	}
 	return styled
 }
 
-// renderStyledCursor combines a line styler with cursor rendering by
-// applying the style to segments before and after the cursor separately.
-// Returns the rendered text and any hint from the styler.
-func (m *Model) renderStyledCursor(line []rune, styler func(string) (string, string), cursorVisible bool) (string, string) {
-	// Use the full text to get the hint (styler may vary hint by content).
-	_, hint := styler(string(line))
+// renderStyledCursorAt combines a line styler with cursor rendering at localCol.
+func renderStyledCursorAt(seg []rune, localCol int, styler func(string) (string, string), cursorVisible bool) (string, string) {
+	_, hint := styler(string(seg))
 	textStyler := func(s string) string { r, _ := styler(s); return r }
 
 	if !cursorVisible {
-		return textStyler(string(line)), hint
+		return textStyler(string(seg)), hint
 	}
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
-	if m.cursorCol >= len(line) {
-		return textStyler(string(line)) + cursorStyle.Render(" "), hint
+	if localCol >= len(seg) {
+		return textStyler(string(seg)) + cursorStyle.Render(" "), hint
 	}
-	before := textStyler(string(line[:m.cursorCol]))
-	under := cursorStyle.Render(string(line[m.cursorCol : m.cursorCol+1]))
-	after := textStyler(string(line[m.cursorCol+1:]))
+	before := textStyler(string(seg[:localCol]))
+	under := cursorStyle.Render(string(seg[localCol : localCol+1]))
+	after := textStyler(string(seg[localCol+1:]))
 	return before + under + after, hint
 }
 
-// renderCursor inserts a visible block cursor at the cursor position.
-// When the cursor is in the invisible phase of its blink, the text
-// renders without the reverse-video highlight.
-func (m *Model) renderCursor(line []rune, lineStr string, cursorVisible bool) string {
+// renderCursorAt inserts a visible block cursor at localCol within the segment.
+func renderCursorAt(seg []rune, segStr string, localCol int, cursorVisible bool) string {
 	if !cursorVisible {
-		return lineStr
+		return segStr
 	}
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
-
-	if m.cursorCol >= len(line) {
-		return lineStr + cursorStyle.Render(" ")
+	if localCol >= len(seg) {
+		return segStr + cursorStyle.Render(" ")
 	}
-	before := string(line[:m.cursorCol])
-	under := string(line[m.cursorCol : m.cursorCol+1])
-	after := string(line[m.cursorCol+1:])
+	before := string(seg[:localCol])
+	under := string(seg[localCol : localCol+1])
+	after := string(seg[localCol+1:])
 	return before + cursorStyle.Render(under) + after
 }
 

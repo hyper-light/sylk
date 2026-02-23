@@ -2,6 +2,8 @@ package guide
 
 import (
 	"context"
+	"math"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,6 +25,10 @@ type SessionRouter struct {
 	// Global defaults
 	defaultCacheConfig RouteCacheConfig
 	defaultPrefs       SessionRoutingPrefs
+
+	// Derived: realistic max concurrent sessions. Each session creates a
+	// Ristretto instance (CM sketch ~5KB at current counters) plus entries map.
+	maxSessions int
 
 	// Parent guide for fallback routing
 	guide *Guide
@@ -90,13 +96,14 @@ func NewSessionRouter(guide *Guide) *SessionRouter {
 		sessionPrefs:  make(map[string]*SessionRoutingPrefs),
 		defaultCacheConfig: RouteCacheConfig{
 			MaxSize: 1000,
-			TTL:     30 * time.Minute,
+			TTL:     5 * time.Minute,
 		},
 		defaultPrefs: SessionRoutingPrefs{
 			UseGlobalCache:      true,
 			PopulateGlobalCache: true,
 		},
-		guide: guide,
+		maxSessions: 64,
+		guide:       guide,
 	}
 }
 
@@ -111,6 +118,11 @@ func (sr *SessionRouter) GetOrCreateSession(sessionID string) *RouteCache {
 
 	if cache, ok := sr.sessionCaches[sessionID]; ok {
 		return cache
+	}
+
+	// Enforce session cap before creating a new one.
+	if len(sr.sessionCaches) >= sr.maxSessions {
+		sr.evictLeastUsedSessionLocked()
 	}
 
 	cache := NewRouteCache(sr.defaultCacheConfig)
@@ -135,6 +147,36 @@ func (sr *SessionRouter) RemoveSession(sessionID string) {
 	delete(sr.sessionCaches, sessionID)
 	delete(sr.sessionPrefs, sessionID)
 	sr.stats.ActiveSessions--
+}
+
+// evictLeastUsedSessionLocked removes the least-used session to make room.
+// First pass: evict empty sessions. Second pass: evict session with lowest
+// hit count (LFU). Caller must hold sr.mu write lock.
+func (sr *SessionRouter) evictLeastUsedSessionLocked() {
+	// First pass: evict empty sessions.
+	for id, cache := range sr.sessionCaches {
+		if cache.Stats().Size == 0 {
+			delete(sr.sessionCaches, id)
+			delete(sr.sessionPrefs, id)
+			sr.stats.ActiveSessions--
+			return
+		}
+	}
+	// Second pass: evict session with lowest hit count (LFU).
+	var worstID string
+	worstHits := int64(math.MaxInt64)
+	for id, cache := range sr.sessionCaches {
+		stats := cache.Stats()
+		if stats.Hits < worstHits {
+			worstID = id
+			worstHits = stats.Hits
+		}
+	}
+	if worstID != "" {
+		delete(sr.sessionCaches, worstID)
+		delete(sr.sessionPrefs, worstID)
+		sr.stats.ActiveSessions--
+	}
 }
 
 // SetSessionPrefs sets routing preferences for a session
@@ -180,13 +222,57 @@ func (sr *SessionRouter) Route(ctx context.Context, sessionID string, request *R
 }
 
 func (sr *SessionRouter) sessionState(sessionID string) (*RouteCache, *SessionRoutingPrefs, bool, bool) {
-	sr.mu.RLock()
-	cache, hasCache := sr.sessionCaches[sessionID]
-	prefs, hasPrefs := sr.sessionPrefs[sessionID]
-	sr.mu.RUnlock()
+	sr.incrementTotalRoutes()
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return nil, nil, false, false
+	}
+	cache := sr.GetOrCreateSession(trimmed)
+	prefs := sr.snapshotSessionPrefs(trimmed)
+	return cache, prefs, true, true
+}
 
+func (sr *SessionRouter) incrementTotalRoutes() {
+	sr.mu.Lock()
 	sr.stats.TotalRoutes++
-	return cache, prefs, hasCache, hasPrefs
+	sr.mu.Unlock()
+}
+
+func (sr *SessionRouter) incrementSessionHits() {
+	sr.mu.Lock()
+	sr.stats.SessionHits++
+	sr.mu.Unlock()
+}
+
+func (sr *SessionRouter) incrementRuleMatches() {
+	sr.mu.Lock()
+	sr.stats.RuleMatches++
+	sr.mu.Unlock()
+}
+
+func (sr *SessionRouter) incrementGlobalFallbacks() {
+	sr.mu.Lock()
+	sr.stats.GlobalFallbacks++
+	sr.mu.Unlock()
+}
+
+func (sr *SessionRouter) incrementPreferenceBoosts() {
+	sr.mu.Lock()
+	sr.stats.PreferenceBoosts++
+	sr.mu.Unlock()
+}
+
+func (sr *SessionRouter) snapshotSessionPrefs(sessionID string) *SessionRoutingPrefs {
+	sr.mu.RLock()
+	prefs, ok := sr.sessionPrefs[sessionID]
+	if !ok {
+		defaultCopy := cloneSessionRoutingPrefs(&sr.defaultPrefs)
+		sr.mu.RUnlock()
+		return defaultCopy
+	}
+	copyPrefs := cloneSessionRoutingPrefs(prefs)
+	sr.mu.RUnlock()
+	return copyPrefs
 }
 
 func (sr *SessionRouter) trySessionRouting(cache *RouteCache, prefs *SessionRoutingPrefs, hasCache bool, hasPrefs bool, request *RouteRequest) (*RouteResult, bool) {
@@ -210,7 +296,7 @@ func (sr *SessionRouter) trySessionCache(cache *RouteCache, hasCache bool, reque
 	if cached == nil {
 		return nil
 	}
-	sr.stats.SessionHits++
+	sr.incrementSessionHits()
 	return sr.cachedToResult(cached)
 }
 
@@ -222,7 +308,7 @@ func (sr *SessionRouter) trySessionRules(prefs *SessionRoutingPrefs, hasPrefs bo
 	if result == nil {
 		return nil
 	}
-	sr.stats.RuleMatches++
+	sr.incrementRuleMatches()
 	return result
 }
 
@@ -234,7 +320,7 @@ func (sr *SessionRouter) tryGlobalCache(cache *RouteCache, prefs *SessionRouting
 	if cached == nil {
 		return nil
 	}
-	sr.stats.GlobalFallbacks++
+	sr.incrementGlobalFallbacks()
 	result := sr.cachedToResult(cached)
 	sr.cacheSessionFallback(cache, hasCache, request, result)
 	return result
@@ -354,8 +440,68 @@ func (sr *SessionRouter) applyPreferences(result *RouteResult, prefs *SessionRou
 	if sr.isBlockedAgent(prefs, agentID, result) {
 		return result
 	}
+	sr.applyPreferredAgentConfidenceBoost(result, prefs, agentID)
 	sr.applyThresholds(result, prefs)
-	sr.trackPreferenceBoost(prefs, agentID)
+	return result
+}
+
+func (sr *SessionRouter) applyPreferredAgentConfidenceBoost(
+	result *RouteResult,
+	prefs *SessionRoutingPrefs,
+	agentID string,
+) {
+	boost, ok := prefs.PreferredAgents[agentID]
+	if !ok || boost <= 0 {
+		return
+	}
+	result.Confidence = clampUnit(result.Confidence + float64(boost)*0.01)
+	sr.incrementPreferenceBoosts()
+}
+
+func cloneSessionRoutingPrefs(source *SessionRoutingPrefs) *SessionRoutingPrefs {
+	if source == nil {
+		return nil
+	}
+	return &SessionRoutingPrefs{
+		PreferredAgents:     cloneStringIntMap(source.PreferredAgents),
+		BlockedAgents:       cloneStringBoolMap(source.BlockedAgents),
+		ExecuteThreshold:    source.ExecuteThreshold,
+		LogThreshold:        source.LogThreshold,
+		SuggestThreshold:    source.SuggestThreshold,
+		Rules:               cloneSessionRoutingRules(source.Rules),
+		UseGlobalCache:      source.UseGlobalCache,
+		PopulateGlobalCache: source.PopulateGlobalCache,
+	}
+}
+
+func cloneStringIntMap(source map[string]int) map[string]int {
+	if len(source) == 0 {
+		return map[string]int{}
+	}
+	result := make(map[string]int, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneStringBoolMap(source map[string]bool) map[string]bool {
+	if len(source) == 0 {
+		return map[string]bool{}
+	}
+	result := make(map[string]bool, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneSessionRoutingRules(source []SessionRoutingRule) []SessionRoutingRule {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make([]SessionRoutingRule, len(source))
+	copy(result, source)
 	return result
 }
 
@@ -398,12 +544,6 @@ func (sr *SessionRouter) applySuggestThreshold(result *RouteResult, prefs *Sessi
 		return true
 	}
 	return false
-}
-
-func (sr *SessionRouter) trackPreferenceBoost(prefs *SessionRoutingPrefs, agentID string) {
-	if _, hasBoost := prefs.PreferredAgents[agentID]; hasBoost {
-		sr.stats.PreferenceBoosts++
-	}
 }
 
 // cachedToResult converts a cached route to a route result

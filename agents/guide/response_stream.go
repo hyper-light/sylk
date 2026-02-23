@@ -90,6 +90,12 @@ type ResponseStream struct {
 	bytesSent  int64
 }
 
+// StreamUsage carries real token counts from LLM provider responses.
+type StreamUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
 // StreamEvent represents an event in a response stream
 type StreamEvent struct {
 	// Event type
@@ -100,6 +106,9 @@ type StreamEvent struct {
 
 	// Serialized data (for text events)
 	Text string `json:"text,omitempty"`
+
+	// Real token usage from LLM provider (populated on StreamEventComplete)
+	Usage *StreamUsage `json:"usage,omitempty"`
 
 	// Metadata
 	Timestamp time.Time `json:"timestamp"`
@@ -133,6 +142,9 @@ const (
 
 	// StreamEventRetry indicates a retry/model-fallback attempt
 	StreamEventRetry StreamEventType = "retry"
+
+	// StreamEventReroute indicates an agent-initiated reroute to a different agent.
+	StreamEventReroute StreamEventType = "reroute"
 )
 
 // StreamStats contains stream manager statistics

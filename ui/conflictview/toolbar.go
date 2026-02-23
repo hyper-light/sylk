@@ -9,17 +9,18 @@ import (
 )
 
 // Conflict toolbar button IDs.
+// Left group: Continue..Next. Right group: Ours..UndoStep.
 const (
 	ctbContinue = iota
 	ctbBypass
 	ctbAbort
-	ctbUndoStep
 	ctbPrev
 	ctbNext
 	ctbOurs
 	ctbTheirs
 	ctbBoth
 	ctbUndo
+	ctbUndoStep
 	ctbCount
 )
 
@@ -36,13 +37,13 @@ var ctbStaticDefs = [ctbCount]ctbDef{
 	ctbContinue: {icon: "▶", label: "Continue", accent: func(p theme.Palette) lipgloss.Color { return p.Success }},
 	ctbBypass:   {icon: "⏭", label: "Bypass", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
 	ctbAbort:    {icon: "✕", label: "Abort", accent: func(p theme.Palette) lipgloss.Color { return p.Error }},
-	ctbUndoStep: {icon: "⏪", label: "Undo Step", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
 	ctbPrev:     {icon: "◀", label: "Prev", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
 	ctbNext:     {icon: "▶", label: "Next", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
 	ctbOurs:     {icon: "↑", label: "Dest", key: "o", accent: func(p theme.Palette) lipgloss.Color { return p.Secondary }},
 	ctbTheirs:   {icon: "↓", label: "Source", key: "t", accent: func(p theme.Palette) lipgloss.Color { return p.Teal }},
 	ctbBoth:     {icon: "↕", label: "Both", key: "b", accent: func(p theme.Palette) lipgloss.Color { return p.Primary }},
 	ctbUndo:     {icon: "↩", label: "Undo", key: "u", accent: func(p theme.Palette) lipgloss.Color { return p.Warning }},
+	ctbUndoStep: {icon: "↶", label: "Undo", accent: func(p theme.Palette) lipgloss.Color { return p.Peach }},
 }
 
 // ctbDefFor returns the button definition for a given ID, substituting
@@ -69,15 +70,15 @@ func (m *Model) ctbCellWidth(id int) int {
 }
 
 // ctbLeftCount is the number of buttons in the left toolbar group
-// (Continue, Bypass, Abort, UndoStep, Prev, Next).
-const ctbLeftCount = 6
+// (Continue, Bypass, Abort, Prev, Next).
+const ctbLeftCount = 5
 
 // ctbGroupGap is the minimum gap between left and right toolbar groups.
 const ctbGroupGap = 2
 
 // ctbFittingCount returns how many total buttons fit across both groups.
 // The left group (Continue..Next) is always shown; right-group buttons
-// (Ours..Undo) are added as width permits.
+// (Ours..UndoStep) are added as width permits.
 func (m *Model) ctbFittingCount() int {
 	leftW := m.toolbarGroupWidth(0, ctbLeftCount)
 

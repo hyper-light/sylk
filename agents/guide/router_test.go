@@ -18,7 +18,7 @@ func createMockMessage(classification map[string]any) *anthropic.Message {
 	jsonBytes, _ := json.Marshal(classification)
 	return &anthropic.Message{
 		ID:    "msg-test-123",
-		Model: "claude-sonnet-4-5-20250929",
+		Model: "claude-sonnet-4-6",
 		Role:  "assistant",
 		Content: []anthropic.ContentBlockUnion{
 			{
@@ -101,7 +101,7 @@ func TestRouter_LLMClassification(t *testing.T) {
 
 	router := guide.NewRouter(mockClient, guide.RouterConfig{
 		DSLPrefix: "@",
-		Model:     "claude-sonnet-4-5-20250929",
+		Model:     "claude-sonnet-4-6",
 		MaxTokens: 1024,
 	})
 
@@ -141,9 +141,12 @@ func TestRouter_FallbackOnLowConfidence(t *testing.T) {
 		Once()
 
 	router := guide.NewRouter(mockClient, guide.RouterConfig{
-		DSLPrefix: "@",
-		Model:     "claude-sonnet-4-5-20250929",
-		MaxTokens: 1024,
+		DSLPrefix:        "@",
+		Model:            "claude-sonnet-4-6",
+		MaxTokens:        1024,
+		ExecuteThreshold: 0.90,
+		LogThreshold:     0.75,
+		SuggestThreshold: 0.50,
 	})
 
 	req := &guide.RouteRequest{
@@ -154,7 +157,7 @@ func TestRouter_FallbackOnLowConfidence(t *testing.T) {
 	result, err := router.Route(context.Background(), req)
 	require.NoError(t, err)
 
-	// Should have low confidence
+	// Should have low confidence — the risk sampler catches this
 	assert.Less(t, result.Confidence, 0.5)
 	assert.Equal(t, guide.RouteActionSuggest, result.Action)
 }
@@ -232,7 +235,7 @@ func TestClassifier_WithMockedClient(t *testing.T) {
 				Once()
 
 			classifier := guide.NewClassifierWithClient(mockClient, guide.RouterConfig{
-				Model:     "claude-sonnet-4-5-20250929",
+				Model:     "claude-sonnet-4-6",
 				MaxTokens: 1024,
 			})
 
@@ -372,7 +375,7 @@ func TestRouter_IntentDSLTriggersLLM(t *testing.T) {
 
 	router := guide.NewRouter(mockClient, guide.RouterConfig{
 		DSLPrefix: "@",
-		Model:     "claude-sonnet-4-5-20250929",
+		Model:     "claude-sonnet-4-6",
 		MaxTokens: 1024,
 	})
 
@@ -391,7 +394,9 @@ func TestRouter_IntentDSLTriggersLLM(t *testing.T) {
 	mockClient.AssertExpectations(t)
 }
 
-// TestRouter_RetrospectiveCheck tests that non-retrospective queries are flagged
+// TestRouter_RetrospectiveCheck tests that non-retrospective queries are
+// classified without automatic rejection at the routing layer.
+// The Archivalist's own Accepts() gate handles the constraint.
 func TestRouter_RetrospectiveCheck(t *testing.T) {
 	classificationJSON := map[string]any{
 		"is_retrospective": false,
@@ -412,8 +417,9 @@ func TestRouter_RetrospectiveCheck(t *testing.T) {
 	result, err := router.Route(context.Background(), req)
 	require.NoError(t, err)
 
-	assert.True(t, result.Rejected)
-	assert.Contains(t, result.Reason, "future")
+	// No longer auto-rejected at classification time
+	assert.False(t, result.Rejected)
+	assert.Equal(t, guide.TargetAgent("archivalist"), result.TargetAgent)
 	mockClient.AssertExpectations(t)
 }
 
@@ -496,7 +502,7 @@ func newRouterWithMock(t *testing.T, classification map[string]any) (*guide.Rout
 		Once()
 	return guide.NewRouter(mockClient, guide.RouterConfig{
 		DSLPrefix: "@",
-		Model:     "claude-sonnet-4-5-20250929",
+		Model:     "claude-sonnet-4-6",
 		MaxTokens: 1024,
 	}), mockClient
 }
@@ -508,7 +514,7 @@ func newClassifierWithMock(t *testing.T, classification map[string]any) (*guide.
 		Return(createMockMessage(classification), nil).
 		Once()
 	return guide.NewClassifierWithClient(mockClient, guide.RouterConfig{
-		Model:     "claude-sonnet-4-5-20250929",
+		Model:     "claude-sonnet-4-6",
 		MaxTokens: 1024,
 	}), mockClient
 }

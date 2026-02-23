@@ -14,7 +14,7 @@ import (
 type AgentStatus int
 
 const (
-	StatusIdle     AgentStatus = iota
+	StatusIdle AgentStatus = iota
 	StatusThinking
 	StatusActing
 	StatusError
@@ -106,11 +106,11 @@ func viewKeyActions() map[viewState]map[string]keyAction {
 			"esc":   func(m *Model) tea.Cmd { m.exitExpanded(); return nil },
 		},
 		viewEventDetail: {
-			"j":     func(m *Model) tea.Cmd { m.scrollDetail(1); return nil },
-			"down":  func(m *Model) tea.Cmd { m.scrollDetail(1); return nil },
-			"k":     func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
-			"up":    func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
-			"esc":   func(m *Model) tea.Cmd { m.exitEventDetail(); return nil },
+			"j":    func(m *Model) tea.Cmd { m.scrollDetail(1); return nil },
+			"down": func(m *Model) tea.Cmd { m.scrollDetail(1); return nil },
+			"k":    func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
+			"up":   func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
+			"esc":  func(m *Model) tea.Cmd { m.exitEventDetail(); return nil },
 		},
 	}
 }
@@ -130,6 +130,7 @@ type Model struct {
 	streams   map[string]*AgentEventStream
 	order     []string  // Agent IDs in insertion order (bounded by maxAgentOrder).
 	activeID  string    // Agent ID of the currently active agent.
+	engagedID string    // Agent ID the user is conversing with (sticky until reroute/override).
 	selected  int       // Index into order for list view navigation.
 	expanded  string    // Agent ID of the expanded detail view ("" if none).
 	view      viewState // Current view state.
@@ -241,6 +242,9 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 
 	if activeEventTypes[ev.Event.EventType] {
 		m.activeID = agentID
+		if !m.focused {
+			m.SelectByID(agentID)
+		}
 	}
 
 	return nil
@@ -392,6 +396,51 @@ func (m *Model) CycleNext() {
 	m.moveSelection(1)
 }
 
+// InSubView reports whether the agent panel is in a navigable sub-view
+// (expanded agent or event detail) that should consume Esc before the app.
+func (m *Model) InSubView() bool {
+	return m.view != viewList
+}
+
+// SelectByID moves the list selection to the agent with the given ID.
+// Returns true if the agent was found.
+func (m *Model) SelectByID(agentID string) bool {
+	for i, id := range m.order {
+		if id == agentID {
+			m.selected = i
+			return true
+		}
+	}
+	return false
+}
+
+// SetEngagedAgent sets the agent the user is conversing with. This is sticky
+// across messages until a reroute or explicit @agent override clears it.
+func (m *Model) SetEngagedAgent(agentID string) {
+	m.engagedID = strings.ToLower(strings.TrimSpace(agentID))
+}
+
+// ClearEngagedAgent removes the current engagement, forcing full classification
+// on the next user message.
+func (m *Model) ClearEngagedAgent() {
+	m.engagedID = ""
+}
+
+// EngagedAgentID returns the currently engaged agent ID, or "" if none.
+func (m *Model) EngagedAgentID() string {
+	return m.engagedID
+}
+
+// SelectedAgentID returns the currently selected agent ID from list navigation.
+// Returns "" when no agents are available.
+func (m *Model) SelectedAgentID() string {
+	if len(m.order) == 0 {
+		return ""
+	}
+	index := clampIndex(m.selected, len(m.order))
+	return m.order[index]
+}
+
 // moveSelection moves the agent selection cursor by delta.
 func (m *Model) moveSelection(delta int) {
 	count := len(m.order)
@@ -473,6 +522,7 @@ func (m *Model) renderListView() string {
 	var consumedLines int
 	for i, agentID := range m.order {
 		selected := i == m.selected
+		engaged := m.engagedID != "" && agentID == m.engagedID
 		needed := cardLineCount(selected)
 		if consumedLines+needed > m.height {
 			break
@@ -481,7 +531,7 @@ func (m *Model) renderListView() string {
 		if !ok {
 			continue
 		}
-		cards = append(cards, RenderCard(*agent, m.width, m.theme, selected))
+		cards = append(cards, RenderCard(*agent, m.width, m.theme, selected, engaged))
 		consumedLines += needed
 	}
 	return strings.Join(cards, "\n")
@@ -503,7 +553,8 @@ func (m *Model) renderExpandedView() string {
 		return ""
 	}
 
-	card := RenderCard(*agent, m.width, m.theme, true)
+	engaged := m.engagedID != "" && m.expanded == m.engagedID
+	card := RenderCard(*agent, m.width, m.theme, true, engaged)
 	separator := renderDetailSeparator(m.width, m.theme)
 
 	var evts []AgentEvent
@@ -538,7 +589,8 @@ func (m *Model) renderEventDetailView() string {
 		return ""
 	}
 
-	card := RenderCard(*agent, m.width, m.theme, true)
+	engaged := m.engagedID != "" && m.expanded == m.engagedID
+	card := RenderCard(*agent, m.width, m.theme, true, engaged)
 	separator := renderDetailSeparator(m.width, m.theme)
 
 	availableLines := m.height - detailViewOverhead

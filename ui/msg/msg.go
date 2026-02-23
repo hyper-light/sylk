@@ -40,12 +40,14 @@ type StreamChunkMsg struct {
 	SessionID     string
 	CorrelationID string
 	Text          string
+	InputTokens   int // Real provider input tokens (set once on first chunk, 0 = not yet known).
 }
 
 // StreamProgressMsg reports progress during a streaming operation.
 type StreamProgressMsg struct {
 	SessionID     string
 	CorrelationID string
+	AgentID       string
 	Current       int
 	Total         int
 	Message       string
@@ -56,6 +58,13 @@ type StreamCompleteMsg struct {
 	SessionID     string
 	CorrelationID string
 	Result        any
+	InputTokens   int // Real provider input tokens (0 = unavailable).
+	OutputTokens  int // Real provider output tokens (0 = unavailable).
+
+	// AuthoritativeText is the canonical response text sent by the agent.
+	// When non-empty, the chat model replaces accumulated streaming content
+	// with this value to correct any dropped or reordered chunks.
+	AuthoritativeText string
 }
 
 // StreamErrorMsg signals an error during streaming.
@@ -78,13 +87,25 @@ type GuideResponseMsg struct {
 	Err           error
 }
 
+// StreamRerouteMsg signals that an agent-initiated reroute is occurring.
+// The Guide broadcasts this when an agent invokes the reroute_request skill
+// and the request is being re-classified to a different agent.
+type StreamRerouteMsg struct {
+	SessionID     string
+	CorrelationID string
+	FromAgentID   string // Agent that requested the reroute.
+	ToAgentID     string // New target agent (may be empty if not yet classified).
+	Reason        string // Why the reroute happened.
+}
+
 // RetryStatusMsg reports a retry or model-fallback attempt during Guide processing.
 type RetryStatusMsg struct {
 	SessionID     string
 	CorrelationID string
 	Attempt       int
 	MaxAttempts   int
-	Error         string
+	Delay         time.Duration // Time until next retry attempt.
+	Error         string        // Human-readable summary (not raw error).
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +534,64 @@ type DiffViewPair struct {
 	TotalAdd  int
 	TotalDel  int
 }
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Plan viewer
+// ---------------------------------------------------------------------------
+
+// PlanUpdateMsg carries an updated plan snapshot for the plan viewer.
+type PlanUpdateMsg struct {
+	PlanID          string
+	Status          string // "pending", "analyzing", ..., "ready", "executing", "completed", "failed"
+	Tasks           []PlanTaskSnapshot
+	ExecutionLayers [][]string // Task IDs per layer
+	TotalTokensIn   int
+	TotalTokensOut  int
+	StartTime       time.Time
+}
+
+// PlanAcceptanceCriterion defines a single verifiable acceptance condition
+// using Given/When/Then structure.
+type PlanAcceptanceCriterion struct {
+	Given    string
+	When     string
+	Then     string
+	Priority string // "must" | "should" | "could"
+}
+
+// PlanFileTarget identifies a file affected by a plan task.
+type PlanFileTarget struct {
+	Path      string
+	Operation string // "create" | "modify" | "delete"
+	Reason    string
+}
+
+// PlanTaskSnapshot is a point-in-time view of a single task.
+type PlanTaskSnapshot struct {
+	ID            string
+	Name          string
+	Description   string
+	AgentType     string
+	Status        string // "pending", "queued", "running", "completed", "failed", "blocked", "skipped"
+	Dependencies  []string
+	TokensIn      int
+	TokensOut     int
+	Duration      time.Duration
+	StatusMessage string
+
+	// Rich specification fields.
+	AcceptanceCriteria  []PlanAcceptanceCriterion
+	AffectedFiles       []PlanFileTarget
+	ImplementationGuide string
+	Guidelines          []string
+}
+
+// PlanViewToggleMsg requests toggling the plan viewer panel visibility.
+type PlanViewToggleMsg struct{}
 
 // ---------------------------------------------------------------------------
 // Authentication

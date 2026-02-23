@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,12 +24,188 @@ import (
 	"google.golang.org/genai"
 )
 
+// formatGoogleError extracts genai.APIError details if present and returns
+// a descriptive error. For non-API errors it falls back to err.Error().
+func formatGoogleError(errContext string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if providerErr := buildGoogleProviderError(errContext, err); providerErr != nil {
+		return providerErr
+	}
+	return WrapError(ProviderTypeGoogle, errContext, err)
+}
+
+func buildGoogleProviderError(operation string, err error) error {
+	var apiErr genai.APIError
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+
+	status := strings.TrimSpace(apiErr.Status)
+	msg := strings.TrimSpace(apiErr.Message)
+	details := strings.TrimSpace(formatGoogleErrorDetails(apiErr.Details))
+	if msg == "" {
+		msg = "request failed"
+	}
+
+	message := fmt.Sprintf("%d", apiErr.Code)
+	if status != "" {
+		message += " " + status
+	}
+	message += " — " + msg
+	if details != "" {
+		message += " [" + details + "]"
+	}
+
+	providerErr := &ProviderError{
+		Provider:   ProviderTypeGoogle,
+		Operation:  operation,
+		StatusCode: apiErr.Code,
+		Message:    message,
+		Underlying: err,
+		Retryable:  isGoogleRetryableStatus(apiErr.Code),
+	}
+	if retryAfter, ok := googleRetryAfter(apiErr); ok {
+		providerErr.RetryAfter = retryAfter
+	}
+	return providerErr
+}
+
+func formatGoogleErrorDetails(details []map[string]any) string {
+	if len(details) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(details))
+	for _, d := range details {
+		for k, v := range d {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// isGoogleRetryable returns true for transient Google API errors: rate limits
+// (429) and server errors (5xx).
+func isGoogleRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) && providerErr.Provider == ProviderTypeGoogle {
+		return isGoogleRetryableStatus(providerErr.StatusCode)
+	}
+	var apiErr genai.APIError
+	if errors.As(err, &apiErr) {
+		return isGoogleRetryableStatus(apiErr.Code)
+	}
+	return false
+}
+
+func isGoogleRetryableStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
+}
+
+func googleRetryAfter(apiErr genai.APIError) (time.Duration, bool) {
+	if d, ok := googleRetryAfterFromDetails(apiErr.Details); ok {
+		return d, true
+	}
+	if d, ok := googleRetryAfterFromMessage(apiErr.Message); ok {
+		return d, true
+	}
+	return parseRetryAfterValue(apiErr.Message)
+}
+
+// googleRetryAfterFromMessage extracts a duration from human-readable API
+// messages like "Your quota will reset after 39s." by scanning for a
+// time.ParseDuration-compatible token following "after".
+func googleRetryAfterFromMessage(message string) (time.Duration, bool) {
+	lower := strings.ToLower(message)
+	idx := strings.Index(lower, "after ")
+	if idx < 0 {
+		return 0, false
+	}
+	rest := strings.TrimSpace(lower[idx+len("after "):])
+	token, _, _ := strings.Cut(rest, " ")
+	token = strings.TrimRight(token, ".!,;")
+	if token == "" {
+		return 0, false
+	}
+	return googleRetryAfterFromString(token)
+}
+
+func googleRetryAfterFromDetails(details []map[string]any) (time.Duration, bool) {
+	for _, detail := range details {
+		if d, ok := googleRetryAfterFromAny(detail); ok {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func googleRetryAfterFromAny(value any) (time.Duration, bool) {
+	switch v := value.(type) {
+	case map[string]any:
+		if d, ok := googleRetryAfterFromRetryDelayKey(v); ok {
+			return d, true
+		}
+		for _, nested := range v {
+			if d, ok := googleRetryAfterFromAny(nested); ok {
+				return d, true
+			}
+		}
+	case []any:
+		for _, nested := range v {
+			if d, ok := googleRetryAfterFromAny(nested); ok {
+				return d, true
+			}
+		}
+	case string:
+		if d, ok := googleRetryAfterFromString(v); ok {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func googleRetryAfterFromRetryDelayKey(value map[string]any) (time.Duration, bool) {
+	for key, raw := range value {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		if normalized != "retrydelay" && normalized != "retry_delay" {
+			continue
+		}
+		if d, ok := googleRetryAfterFromAny(raw); ok {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func googleRetryAfterFromString(value string) (time.Duration, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, false
+	}
+	if d, err := time.ParseDuration(trimmed); err == nil && d > 0 {
+		return d, true
+	}
+	if d, ok := parseRetryAfterValue(trimmed); ok {
+		return d, true
+	}
+	if seconds, err := strconv.ParseFloat(trimmed, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds * float64(time.Second)), true
+	}
+	return 0, false
+}
+
 // GoogleProvider implements Provider for Google's Gemini models
 type GoogleProvider struct {
-	client      *genai.Client
-	config      GoogleConfig
-	skills      []skills.Skill
-	authService oauth.GoogleAuthService
+	client            *genai.Client
+	config            GoogleConfig
+	skills            []skills.Skill
+	authService       oauth.GoogleAuthService
+	codeAssistProject string       // set when Code Assist is active
+	codeAssistHTTP    *http.Client // OAuth-wrapped HTTP client for Code Assist
 }
 
 type GoogleOAuthLoginSession struct {
@@ -64,6 +241,7 @@ type googleServiceAccountFileCache struct {
 }
 
 var googleServiceAccountCache googleServiceAccountFileCache
+var googleProviderAPIKeyResolver = resolveGoogleProviderAPIKey
 
 // NewGoogleProvider creates a new Google provider with the given configuration
 func NewGoogleProvider(ctx context.Context, config GoogleConfig, skills ...skills.Skill) (*GoogleProvider, error) {
@@ -77,28 +255,69 @@ func NewGoogleProviderWithAuthService(
 	authService oauth.GoogleAuthService,
 	skills ...skills.Skill,
 ) (*GoogleProvider, error) {
+	googleTrace("provider_init", "start", map[string]any{
+		"auth_mode":       strings.TrimSpace(config.AuthMode),
+		"model":          strings.TrimSpace(config.Model),
+		"project_id":     strings.TrimSpace(config.ProjectID),
+		"use_vertex_ai":  config.UseVertexAI,
+		"use_code_assist": config.UseCodeAssist,
+		"has_api_key":    strings.TrimSpace(config.APIKey) != "",
+	})
 	applyGoogleProviderDefaults(&config)
 	if err := hydrateGoogleConfig(ctx, &config, authService); err != nil {
+		googleTrace("provider_init", "hydrate_failed", map[string]any{
+			"error": err.Error(),
+		})
 		return nil, err
 	}
 	if err := config.Validate(); err != nil {
+		googleTrace("provider_init", "validate_failed", map[string]any{
+			"error": err.Error(),
+		})
 		return nil, err
 	}
 	clientConfig, err := buildGoogleClientConfig(config, authService)
 	if err != nil {
+		googleTrace("provider_init", "client_config_failed", map[string]any{
+			"error": err.Error(),
+		})
 		return nil, err
 	}
+	googleTrace("provider_init", "client_config_built", map[string]any{
+		"backend":        googleBackendName(config.UseVertexAI),
+		"has_http_client": clientConfig.HTTPClient != nil,
+		"has_api_key":    clientConfig.APIKey != "",
+		"has_project":    clientConfig.Project != "",
+	})
 	client, err := genai.NewClient(ctx, clientConfig)
 	if err != nil {
+		googleTrace("provider_init", "genai_client_failed", map[string]any{
+			"error": err.Error(),
+		})
 		return nil, fmt.Errorf("google provider: failed to create client: %w", err)
 	}
 
-	return &GoogleProvider{
+	provider := &GoogleProvider{
 		client:      client,
 		config:      config,
 		skills:      skills,
 		authService: authService,
-	}, nil
+	}
+	if config.UseCodeAssist {
+		provider.codeAssistProject = config.ProjectID
+		provider.codeAssistHTTP = oauth.NewGoogleOAuthHTTPClient(authService, newDefaultGoogleHTTPClient(config.Timeout))
+		googleTrace("provider_init", "code_assist_enabled", map[string]any{
+			"project": config.ProjectID,
+		})
+	}
+	googleTrace("provider_init", "success", map[string]any{
+		"auth_mode":            strings.TrimSpace(config.AuthMode),
+		"model":               strings.TrimSpace(config.Model),
+		"use_vertex_ai":       config.UseVertexAI,
+		"use_code_assist":     config.UseCodeAssist,
+		"code_assist_project": provider.codeAssistProject,
+	})
+	return provider, nil
 }
 
 func (g *GoogleProvider) StartOAuthLogin(
@@ -189,19 +408,65 @@ func hydrateGoogleAPIKeyConfig(config *GoogleConfig) error {
 	if config.APIKey != "" {
 		return nil
 	}
-	config.APIKey = resolveGoogleProviderAPIKey()
+	config.APIKey = googleProviderAPIKeyResolver()
 	return nil
 }
 
 func resolveGoogleProviderAPIKey() string {
-	if key := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); key != "" {
+	return resolveGoogleProviderAPIKeyWithResolvers(
+		os.Getenv,
+		resolveGoogleSecureAPIKey,
+		resolveGoogleLegacyAPIKey,
+	)
+}
+
+func resolveGoogleProviderAPIKeyWithResolvers(
+	lookupEnv func(string) string,
+	secureResolver func() string,
+	legacyResolver func() (string, error),
+) string {
+	if lookupEnv == nil {
+		lookupEnv = os.Getenv
+	}
+	if key := strings.TrimSpace(lookupEnv("GEMINI_API_KEY")); key != "" {
 		return key
 	}
-	key, err := llm.ResolveAPIKey("google")
+	if key := strings.TrimSpace(lookupEnv("GOOGLE_API_KEY")); key != "" {
+		return key
+	}
+	if secureResolver != nil {
+		if key := strings.TrimSpace(secureResolver()); key != "" {
+			return key
+		}
+	}
+	if legacyResolver == nil {
+		return ""
+	}
+	key, err := legacyResolver()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(key)
+}
+
+func resolveGoogleSecureAPIKey() string {
+	dirs, err := storage.ResolveDirs()
+	if err != nil || dirs == nil {
+		return ""
+	}
+	manager, err := credentials.NewManager(dirs, "default")
+	if err != nil {
+		return ""
+	}
+	key, err := manager.GetAPIKey("google")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(key)
+}
+
+func resolveGoogleLegacyAPIKey() (string, error) {
+	return llm.ResolveAPIKey("google")
 }
 
 func hydrateGoogleOAuthConfig(
@@ -210,14 +475,92 @@ func hydrateGoogleOAuthConfig(
 	authService oauth.GoogleAuthService,
 ) error {
 	if authService == nil {
+		googleTrace("hydrate_oauth", "no_auth_service", nil)
 		return fmt.Errorf("google oauth auth service is not configured")
 	}
 	auth, err := authService.Resolve(ctx)
 	if err == nil {
+		googleTrace("hydrate_oauth", "resolve_success", map[string]any{
+			"has_access_token":    auth.AccessToken != "",
+			"has_refresh_token":   auth.RefreshToken != "",
+			"project_id":         strings.TrimSpace(auth.ProjectID),
+			"location":           strings.TrimSpace(auth.Location),
+			"code_assist_project": strings.TrimSpace(auth.CodeAssistProject),
+			"code_assist_tier_id": strings.TrimSpace(auth.CodeAssistTierID),
+		})
 		applyResolvedGoogleOAuth(config, auth)
-		config.UseVertexAI = true
+
+		googleTrace("hydrate_oauth", "after_apply", map[string]any{
+			"config_project_id": strings.TrimSpace(config.ProjectID),
+			"config_use_vertex": config.UseVertexAI,
+			"config_auth_mode":  strings.TrimSpace(config.AuthMode),
+		})
+
+		// If OAuth resolved but no project is available, try Code Assist setup.
+		// Code Assist provisions a managed project for free-tier users.
+		if config.ProjectID == "" && auth.CodeAssistProject == "" {
+			googleTrace("hydrate_oauth", "code_assist_setup_start", map[string]any{
+				"config_project_id":   "",
+				"auth_code_assist":    "",
+				"endpoint":            oauth.CodeAssistEndpointForTrace(),
+			})
+			httpClient := oauth.NewGoogleOAuthHTTPClient(authService, nil)
+			result, setupErr := oauth.SetupCodeAssist(ctx, httpClient, "")
+			if setupErr != nil {
+				googleTrace("hydrate_oauth", "code_assist_setup_failed", map[string]any{
+					"error": setupErr.Error(),
+				})
+			} else {
+				googleTrace("hydrate_oauth", "code_assist_setup_success", map[string]any{
+					"project_id": result.ProjectID,
+					"tier_id":    result.TierID,
+					"tier_name":  result.TierName,
+				})
+				auth.CodeAssistProject = result.ProjectID
+				auth.CodeAssistTierID = result.TierID
+				if saveErr := authService.Save(ctx, auth); saveErr != nil {
+					googleTrace("hydrate_oauth", "code_assist_save_failed", map[string]any{
+						"error": saveErr.Error(),
+					})
+				}
+			}
+		} else {
+			googleTrace("hydrate_oauth", "code_assist_setup_skipped", map[string]any{
+				"config_project_id":        strings.TrimSpace(config.ProjectID),
+				"auth_code_assist_project": strings.TrimSpace(auth.CodeAssistProject),
+			})
+		}
+
+		// Apply Code Assist project if available.
+		if auth.CodeAssistProject != "" {
+			config.UseCodeAssist = true
+			if config.ProjectID == "" {
+				config.ProjectID = auth.CodeAssistProject
+			}
+			googleTrace("hydrate_oauth", "code_assist_applied", map[string]any{
+				"project_id":     config.ProjectID,
+				"use_code_assist": true,
+			})
+		}
+
+		// OAuth can target either backend:
+		// - Vertex AI when a project is available (or explicitly requested).
+		// - Gemini API when no project is available.
+		config.UseVertexAI = config.UseVertexAI || strings.TrimSpace(config.ProjectID) != ""
+
+		googleTrace("hydrate_oauth", "final_config", map[string]any{
+			"auth_mode":       strings.TrimSpace(config.AuthMode),
+			"project_id":     strings.TrimSpace(config.ProjectID),
+			"use_vertex_ai":  config.UseVertexAI,
+			"use_code_assist": config.UseCodeAssist,
+			"model":          strings.TrimSpace(config.Model),
+			"api_key_set":    strings.TrimSpace(config.APIKey) != "",
+		})
 		return nil
 	}
+	googleTrace("hydrate_oauth", "resolve_failed", map[string]any{
+		"error": err.Error(),
+	})
 	return fallbackGoogleOAuthToAPIKey(config, err)
 }
 
@@ -467,7 +810,6 @@ func buildGoogleClientConfig(
 	if authService == nil {
 		return nil, fmt.Errorf("google oauth auth service is not configured")
 	}
-	clientConfig.Backend = genai.BackendVertexAI
 	clientConfig.HTTPClient = oauth.NewGoogleOAuthHTTPClient(authService, newDefaultGoogleHTTPClient(config.Timeout))
 	return clientConfig, nil
 }
@@ -503,25 +845,190 @@ func (g *GoogleProvider) Name() string {
 	return string(ProviderTypeGoogle)
 }
 
-// Generate performs a non-streaming completion request
+// AuthMode returns the effective auth mode after hydration/fallback.
+func (g *GoogleProvider) AuthMode() string {
+	if g == nil {
+		return ""
+	}
+	return strings.TrimSpace(g.config.AuthMode)
+}
+
+// UsesVertexAI reports whether requests are routed to Vertex AI backend.
+func (g *GoogleProvider) UsesVertexAI() bool {
+	if g == nil {
+		return false
+	}
+	return g.config.UseVertexAI
+}
+
+// UsesCodeAssist reports whether requests are routed via Code Assist API.
+func (g *GoogleProvider) UsesCodeAssist() bool {
+	if g == nil {
+		return false
+	}
+	return g.codeAssistProject != ""
+}
+
+// Generate performs a non-streaming completion request with retry.
 func (g *GoogleProvider) Generate(ctx context.Context, req *Request) (*Response, error) {
-	model := req.Model
-	if model == "" {
-		model = g.config.Model
-	}
-
-	contents := g.convertMessages(req.Messages)
-	genConfig := g.buildGenerateConfig(req)
-
-	result, err := g.client.Models.GenerateContent(ctx, model, contents, genConfig)
+	googleTrace("generate", "start", map[string]any{
+		"req_model":          strings.TrimSpace(req.Model),
+		"config_model":       strings.TrimSpace(g.config.Model),
+		"code_assist_project": g.codeAssistProject,
+		"use_code_assist":    g.codeAssistProject != "",
+		"use_vertex_ai":      g.config.UseVertexAI,
+		"auth_mode":          strings.TrimSpace(g.config.AuthMode),
+		"message_count":      len(req.Messages),
+		"has_system_prompt":  strings.TrimSpace(req.SystemPrompt) != "",
+	})
+	resp, err := retryGoogleGenerate(ctx, g.config.BaseConfig, func(ctx context.Context) (*Response, error) {
+		if g.codeAssistProject != "" {
+			googleTrace("generate", "using_code_assist", map[string]any{
+				"project": g.codeAssistProject,
+			})
+			return g.generateWithCodeAssist(ctx, req)
+		}
+		model := req.Model
+		if model == "" {
+			model = g.config.Model
+		}
+		googleTrace("generate", "using_genai_sdk", map[string]any{
+			"model":        model,
+			"use_vertex_ai": g.config.UseVertexAI,
+			"backend":      googleBackendName(g.config.UseVertexAI),
+		})
+		contents := g.convertMessages(req.Messages)
+		genConfig := g.buildGenerateConfig(req)
+		result, err := g.client.Models.GenerateContent(ctx, model, contents, genConfig)
+		if err != nil {
+			googleTrace("generate", "genai_sdk_error", map[string]any{
+				"model": model,
+				"error": err.Error(),
+			})
+			return nil, formatGoogleError("generate", err)
+		}
+		googleTrace("generate", "genai_sdk_success", map[string]any{
+			"model": model,
+		})
+		return g.convertResponse(result, model), nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("google generate: %w", err)
+		googleTrace("generate", "failed", map[string]any{
+			"error": err.Error(),
+		})
+	} else {
+		googleTrace("generate", "success", map[string]any{
+			"content_length": len(resp.Content),
+			"stop_reason":    string(resp.StopReason),
+		})
 	}
+	return resp, err
+}
 
-	return g.convertResponse(result, model), nil
+func googleBackendName(useVertexAI bool) string {
+	if useVertexAI {
+		return "vertex_ai"
+	}
+	return "gemini_api"
+}
+
+// retryGoogleGenerate wraps generate with Google-specific retryable error detection.
+func retryGoogleGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context) (*Response, error)) (*Response, error) {
+	maxAttempts := resolveGoogleMaxRetries(cfg.MaxRetries)
+	var lastErr error
+	for attempt := range maxAttempts {
+		resp, err := fn(ctx)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !shouldRetryGoogleCall(ctx, err, attempt, maxAttempts) {
+			break
+		}
+		delay := googleRetryDelay(err, attempt, cfg)
+		notifyRetryObserver(ctx, RetryEvent{
+			Attempt:     attempt + 1,
+			MaxAttempts: maxAttempts,
+			Err:         err,
+			Delay:       delay,
+		})
+		if err := waitRetryDelay(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func shouldRetryGoogleCall(ctx context.Context, err error, attempt int, maxAttempts int) bool {
+	if attempt+1 >= maxAttempts {
+		return false
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return isGoogleRetryable(err)
 }
 
 func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
+	return retryGoogleStream(ctx, g.config.BaseConfig, func(ctx context.Context) error {
+		return g.streamWithHandlerOnce(ctx, req, handler)
+	})
+}
+
+// retryGoogleStream wraps stream with Google-specific retryable error detection.
+func retryGoogleStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) error) error {
+	maxAttempts := resolveGoogleMaxRetries(cfg.MaxRetries)
+	var lastErr error
+	for attempt := range maxAttempts {
+		err := fn(ctx)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !shouldRetryGoogleCall(ctx, err, attempt, maxAttempts) {
+			break
+		}
+		delay := googleRetryDelay(err, attempt, cfg)
+		notifyRetryObserver(ctx, RetryEvent{
+			Attempt:     attempt + 1,
+			MaxAttempts: maxAttempts,
+			Err:         err,
+			Delay:       delay,
+		})
+		if err := waitRetryDelay(ctx, delay); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+// resolveGoogleMaxRetries returns a floor of 5 retries for Google providers
+// to handle quota resets that may require longer backoff sequences.
+func resolveGoogleMaxRetries(configured int) int {
+	resolved := resolveMaxRetries(configured)
+	if resolved < 5 {
+		return 5
+	}
+	return resolved
+}
+
+func googleRetryDelay(err error, attempt int, cfg BaseConfig) time.Duration {
+	if retryAfter := GetRetryAfter(err); retryAfter > 0 {
+		// Server-specified delays (from quota reset info) are authoritative —
+		// respect them even when they exceed the configured max delay cap.
+		return retryAfter
+	}
+	return retryDelay(attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+}
+
+func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request, handler StreamHandler) error {
+	if g.codeAssistProject != "" {
+		return g.streamWithCodeAssist(ctx, req, handler)
+	}
+
 	model := req.Model
 	if model == "" {
 		model = g.config.Model
@@ -540,8 +1047,11 @@ func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, ha
 
 	var chunkIndex int
 	var totalInputTokens, totalOutputTokens int
+	var emittedEarlyUsage bool
 	var stopReason StopReason
-	toolCallsSeen := map[string]bool{}
+	toolCallsSeen := map[googleToolCallKey]bool{}
+	textDelta := &providerDeltaEmitter{}
+	thoughtDelta := &providerDeltaEmitter{}
 
 	for resp, err := range g.client.Models.GenerateContentStream(ctx, model, contents, genConfig) {
 		if err != nil {
@@ -551,13 +1061,13 @@ func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, ha
 				Text:      err.Error(),
 				Timestamp: time.Now(),
 			})
-			return fmt.Errorf("google stream: %w", err)
+			return formatGoogleError("stream", err)
 		}
 
 		chunkIndex++
 
-		text := resp.Text()
-		if text != "" {
+		text, thought := extractGoogleStreamTextAndThought(resp)
+		if text := textDelta.Delta(text); text != "" {
 			if err := handler(&StreamChunk{
 				Index:     chunkIndex,
 				Type:      ChunkTypeText,
@@ -567,12 +1077,23 @@ func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, ha
 				return err
 			}
 		}
+		if thought := thoughtDelta.Delta(thought); thought != "" {
+			if err := handler(&StreamChunk{
+				Index:     chunkIndex,
+				Type:      ChunkTypeThought,
+				Text:      thought,
+				Timestamp: time.Now(),
+			}); err != nil {
+				return err
+			}
+		}
 
 		if resp.FunctionCalls() != nil {
 			for _, fc := range resp.FunctionCalls() {
 				argsJSON, _ := json.Marshal(fc.Args)
-				if !toolCallsSeen[fc.ID] {
-					toolCallsSeen[fc.ID] = true
+				key := googleToolCallKey{ID: fc.ID, Name: fc.Name}
+				if !toolCallsSeen[key] {
+					toolCallsSeen[key] = true
 					if err := handler(&StreamChunk{
 						Index: chunkIndex,
 						Type:  ChunkTypeToolStart,
@@ -602,6 +1123,15 @@ func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, ha
 		if resp.UsageMetadata != nil {
 			totalInputTokens = int(resp.UsageMetadata.PromptTokenCount)
 			totalOutputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+			if !emittedEarlyUsage && totalInputTokens > 0 {
+				emittedEarlyUsage = true
+				handler(&StreamChunk{
+					Index:     chunkIndex,
+					Type:      ChunkTypeStart,
+					Usage:     &Usage{InputTokens: totalInputTokens},
+					Timestamp: time.Now(),
+				})
+			}
 		}
 		if len(resp.Candidates) > 0 {
 			switch resp.Candidates[0].FinishReason {
@@ -633,19 +1163,7 @@ func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, ha
 }
 
 func (g *GoogleProvider) Stream(ctx context.Context, req *Request) (<-chan *StreamChunk, error) {
-	chunks := make(chan *StreamChunk, 100)
-	go func() {
-		defer close(chunks)
-		_ = g.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
-			select {
-			case chunks <- chunk:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
-	}()
-	return chunks, nil
+	return streamViaHandler(ctx, g, req), nil
 }
 
 // ValidateConfig checks if the provider configuration is valid
@@ -703,17 +1221,24 @@ func (g *GoogleProvider) buildGenerateConfig(req *Request) *genai.GenerateConten
 
 	config := &genai.GenerateContentConfig{
 		MaxOutputTokens: int32(maxTokens),
-		SystemInstruction: &genai.Content{
-			Parts: []*genai.Part{
-				genai.NewPartFromText(g.config.SystemPrompt),
-			},
+		ThinkingConfig: &genai.ThinkingConfig{
+			IncludeThoughts: true,
+			ThinkingLevel:   googleThinkingLevel(req.ReasoningEffort),
 		},
 	}
 
+	var systemParts []*genai.Part
+	systemPrompt := combineGoogleSystemPrompts(g.config.SystemPrompt, req.SystemPrompt)
+	if systemPrompt != "" {
+		systemParts = append(systemParts, genai.NewPartFromText(systemPrompt))
+	}
 	if len(g.skills) > 0 {
-		config.SystemInstruction.Parts = append(config.SystemInstruction.Parts, genai.NewPartFromText(
+		systemParts = append(systemParts, genai.NewPartFromText(
 			skills.ToPrompt(g.skills),
 		))
+	}
+	if len(systemParts) > 0 {
+		config.SystemInstruction = &genai.Content{Parts: systemParts}
 	}
 
 	if req.Temperature != nil {
@@ -740,13 +1265,131 @@ func (g *GoogleProvider) buildGenerateConfig(req *Request) *genai.GenerateConten
 
 	if len(req.Tools) > 0 {
 		config.Tools = g.convertTools(req.Tools)
+		config.ToolConfig = googleToolConfig(req.ToolChoice)
 	}
 
 	if len(g.config.SafetySettings) > 0 {
 		config.SafetySettings = g.convertSafetySettings()
 	}
 
+	if req.ResponseSchema != nil {
+		config.ResponseSchema = convertJSONSchemaToGenaiSchema(req.ResponseSchema)
+	}
+	if req.ResponseMIMEType != "" {
+		config.ResponseMIMEType = req.ResponseMIMEType
+	}
+
 	return config
+}
+
+func combineGoogleSystemPrompts(configPrompt string, requestPrompt string) string {
+	sections := make([]string, 0, 2)
+	if trimmed := strings.TrimSpace(configPrompt); trimmed != "" {
+		sections = append(sections, trimmed)
+	}
+	if trimmed := strings.TrimSpace(requestPrompt); trimmed != "" {
+		sections = append(sections, trimmed)
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+// googleToolConfig maps provider-agnostic ToolChoice to genai.ToolConfig.
+// Returns nil when no explicit mode is requested (provider default applies).
+func googleToolConfig(toolChoice string) *genai.ToolConfig {
+	mode := googleFunctionCallingMode(toolChoice)
+	if mode == "" {
+		return nil
+	}
+	return &genai.ToolConfig{
+		FunctionCallingConfig: &genai.FunctionCallingConfig{
+			Mode: mode,
+		},
+	}
+}
+
+func googleFunctionCallingMode(toolChoice string) genai.FunctionCallingConfigMode {
+	switch strings.ToLower(strings.TrimSpace(toolChoice)) {
+	case "auto":
+		return genai.FunctionCallingConfigModeAuto
+	case "any":
+		return genai.FunctionCallingConfigModeAny
+	case "none":
+		return genai.FunctionCallingConfigModeNone
+	default:
+		return ""
+	}
+}
+
+func googleThinkingLevel(reasoningEffort string) genai.ThinkingLevel {
+	switch strings.ToLower(strings.TrimSpace(reasoningEffort)) {
+	case "low":
+		return genai.ThinkingLevelLow
+	case "medium":
+		return genai.ThinkingLevelMedium
+	case "high", "xhigh":
+		return genai.ThinkingLevelHigh
+	default:
+		return genai.ThinkingLevelUnspecified
+	}
+}
+
+// extractGoogleRawContent returns the first candidate's Content from a
+// GenerateContentResponse. This preserves thought parts with their signatures.
+func extractGoogleRawContent(resp *genai.GenerateContentResponse) *genai.Content {
+	if resp == nil || len(resp.Candidates) == 0 {
+		return nil
+	}
+	return resp.Candidates[0].Content
+}
+
+func extractGoogleStreamTextAndThought(resp *genai.GenerateContentResponse) (string, string) {
+	if resp == nil {
+		return "", ""
+	}
+	if text, thought := extractGoogleCandidateParts(resp.Candidates); text != "" || thought != "" {
+		return text, thought
+	}
+	return resp.Text(), ""
+}
+
+func extractGoogleCandidateParts(candidates []*genai.Candidate) (string, string) {
+	if len(candidates) == 0 || candidates[0] == nil || candidates[0].Content == nil {
+		return "", ""
+	}
+	var text strings.Builder
+	var thought strings.Builder
+	for _, part := range candidates[0].Content.Parts {
+		if part == nil || part.Text == "" {
+			continue
+		}
+		if part.Thought {
+			thought.WriteString(part.Text)
+			continue
+		}
+		text.WriteString(part.Text)
+	}
+	return text.String(), thought.String()
+}
+
+type providerDeltaEmitter struct {
+	last string
+}
+
+func (e *providerDeltaEmitter) Delta(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	if e.last == "" {
+		e.last = text
+		return text
+	}
+	if strings.HasPrefix(text, e.last) {
+		delta := text[len(e.last):]
+		e.last = text
+		return delta
+	}
+	e.last += text
+	return text
 }
 
 // convertMessages converts generic messages to Gemini format
@@ -754,31 +1397,45 @@ func (g *GoogleProvider) convertMessages(messages []Message) []*genai.Content {
 	result := make([]*genai.Content, 0, len(messages))
 
 	for _, msg := range messages {
-		content := &genai.Content{}
+		switch msg.Role {
+		case RoleSystem:
+			// System messages handled via SystemInstruction in config
+			continue
+		case RoleAssistant:
+			// When raw model content is available (with thought signatures),
+			// use it directly instead of reconstructing from flattened fields.
+			if raw, ok := msg.Metadata[googleRawContentKey].(*genai.Content); ok && len(raw.Parts) > 0 {
+				result = append(result, raw)
+				continue
+			}
+		}
 
+		content := &genai.Content{}
 		switch msg.Role {
 		case RoleUser:
 			content.Role = "user"
 		case RoleAssistant:
 			content.Role = "model"
-		case RoleSystem:
-			// System messages handled via SystemInstruction in config
-			continue
 		case RoleTool:
-			content.Role = "function"
+			// Vertex AI / Code Assist REST API accepts only "user" and "model".
+			// Function responses are carried as FunctionResponse parts inside a
+			// "user" content block — not a separate "function" role.
+			content.Role = "user"
 		}
 
-		// Add text content
-		if msg.Content != "" {
+		// Tool messages carry their content inside the FunctionResponse part,
+		// so skip adding a redundant text part for them.
+		if msg.Role != RoleTool && msg.Content != "" {
 			content.Parts = append(content.Parts, genai.NewPartFromText(msg.Content))
 		}
 
-		// Add tool calls (function responses)
-		if msg.Role == RoleTool && msg.ToolCallID != "" {
+		// Add tool results (function responses)
+		if msg.Role == RoleTool {
+			name := resolveGoogleFunctionResponseName(msg.ToolName, msg.ToolCallID)
 			content.Parts = append(content.Parts, &genai.Part{
 				FunctionResponse: &genai.FunctionResponse{
 					ID:       msg.ToolCallID,
-					Name:     msg.ToolCallID, // Gemini uses name, not ID
+					Name:     name,
 					Response: map[string]any{"result": msg.Content},
 				},
 			})
@@ -798,10 +1455,30 @@ func (g *GoogleProvider) convertMessages(messages []Message) []*genai.Content {
 			})
 		}
 
+		if len(content.Parts) == 0 {
+			continue
+		}
 		result = append(result, content)
 	}
 
 	return result
+}
+
+// googleToolCallKey uniquely identifies a function call in a streaming response.
+// Uses both ID and Name because Gemini may return empty IDs.
+type googleToolCallKey struct {
+	ID   string
+	Name string
+}
+
+// resolveGoogleFunctionResponseName returns the function name for a tool-result
+// message. Prefers the explicit ToolName; falls back to ToolCallID for backward
+// compatibility with callers that only set the ID.
+func resolveGoogleFunctionResponseName(toolName string, toolCallID string) string {
+	if name := strings.TrimSpace(toolName); name != "" {
+		return name
+	}
+	return strings.TrimSpace(toolCallID)
 }
 
 // convertTools converts generic tools to Gemini format
@@ -903,6 +1580,12 @@ func (g *GoogleProvider) convertSafetySettings() []*genai.SafetySetting {
 	return result
 }
 
+// googleRawContentKey is the ProviderMetadata key for the raw genai.Content
+// from the model's response. Preserving the original content (including thought
+// parts with signatures) is required when replaying multi-turn tool-call
+// conversations with thinking mode enabled.
+const googleRawContentKey = "google_raw_content"
+
 // convertResponse converts a Gemini response to generic format
 func (g *GoogleProvider) convertResponse(result *genai.GenerateContentResponse, model string) *Response {
 	resp := &Response{
@@ -923,6 +1606,11 @@ func (g *GoogleProvider) convertResponse(result *genai.GenerateContentResponse, 
 				Arguments: string(argsJSON),
 			})
 		}
+	}
+
+	// Preserve raw candidate content for multi-turn replay with thought signatures.
+	if raw := extractGoogleRawContent(result); raw != nil {
+		resp.ProviderMetadata[googleRawContentKey] = raw
 	}
 
 	// Extract usage

@@ -85,6 +85,10 @@ func validateBaseConfigValues(c *BaseConfig) error {
 type AnthropicConfig struct {
 	BaseConfig `json:",inline" yaml:",inline"`
 
+	// AuthMode controls credential type.
+	// Supported values: "api_key" (default), "oauth".
+	AuthMode string `json:"auth_mode,omitempty" yaml:"auth_mode,omitempty"`
+
 	// BaseURL overrides the default API endpoint
 	BaseURL string `json:"base_url,omitempty" yaml:"base_url,omitempty"`
 
@@ -100,26 +104,72 @@ type AnthropicConfig struct {
 	SystemPrompt string `json:"system_prompt" yaml:"system_prompt"`
 
 	ThinkingBudget int `json:"thinking_budget" yaml:"thinking_budget"`
+
+	// AdaptiveThinking enables adaptive thinking mode where the model
+	// decides reasoning depth per query instead of using a fixed budget.
+	AdaptiveThinking bool `json:"adaptive_thinking" yaml:"adaptive_thinking"`
+
+	// PromptCacheTTL controls the cache duration for prompt caching.
+	// Requires EnableCaching. Values >= 1h use extended cache TTL.
+	PromptCacheTTL time.Duration `json:"prompt_cache_ttl" yaml:"prompt_cache_ttl"`
 }
+
+const (
+	AnthropicAuthModeAPIKey = "api_key"
+	AnthropicAuthModeOAuth  = "oauth"
+)
 
 // DefaultAnthropicConfig returns Anthropic defaults
 func DefaultAnthropicConfig() AnthropicConfig {
 	base := DefaultBaseConfig()
-	base.Model = "claude-sonnet-4-5-20250901" // Claude Sonnet 4.5 with 1M token window
+	base.Model = "claude-sonnet-4-6" // Claude Sonnet 4.6 with 1M token window
 	base.MaxTokens = 8192
 
 	return AnthropicConfig{
 		BaseConfig: base,
+		AuthMode:   AnthropicAuthModeAPIKey,
 		APIVersion: "2023-06-01",
 	}
 }
 
 // Validate checks Anthropic-specific configuration
 func (c *AnthropicConfig) Validate() error {
-	if err := c.BaseConfig.Validate(); err != nil {
+	if err := validateBaseConfigValues(&c.BaseConfig); err != nil {
 		return fmt.Errorf("anthropic config: %w", err)
 	}
+	if err := validateAnthropicAuthMode(c.AuthMode); err != nil {
+		return err
+	}
+	if err := validateAnthropicAuthCredentials(c); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateAnthropicAuthMode(mode string) error {
+	trimmed := strings.TrimSpace(mode)
+	if trimmed == "" {
+		return nil
+	}
+	switch trimmed {
+	case AnthropicAuthModeAPIKey, AnthropicAuthModeOAuth:
+		return nil
+	default:
+		return fmt.Errorf("anthropic config: auth_mode must be api_key or oauth")
+	}
+}
+
+func validateAnthropicAuthCredentials(c *AnthropicConfig) error {
+	if c == nil {
+		return fmt.Errorf("anthropic config: config is required")
+	}
+	if strings.TrimSpace(c.AuthMode) == AnthropicAuthModeOAuth {
+		return nil
+	}
+	if strings.TrimSpace(c.APIKey) != "" {
+		return nil
+	}
+	return fmt.Errorf("anthropic config: api_key is required unless auth_mode is oauth")
 }
 
 // OpenAIConfig contains OpenAI-specific configuration
@@ -229,6 +279,9 @@ type GoogleConfig struct {
 
 	// UseVertexAI switches from Gemini API to Vertex AI
 	UseVertexAI bool `json:"use_vertex_ai" yaml:"use_vertex_ai"`
+
+	// UseCodeAssist enables Code Assist API streaming via cloudcode-pa endpoint
+	UseCodeAssist bool `json:"use_code_assist,omitempty" yaml:"use_code_assist,omitempty"`
 
 	// SafetySettings configures content filtering
 	SafetySettings []SafetySetting `json:"safety_settings,omitempty" yaml:"safety_settings,omitempty"`

@@ -3,6 +3,7 @@ package guide
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -31,11 +32,12 @@ func (m *MockClassifierClient) New(_ context.Context, _ anthropic.MessageNewPara
 	if target == "" {
 		target = "guide"
 	}
+	intent, domain := mockIntentDomainForTarget(target)
 
 	classification := mockClassificationResponse{
 		IsRetrospective: false,
-		Intent:          string(IntentHelp),
-		Domain:          string(DomainSystem),
+		Intent:          string(intent),
+		Domain:          string(domain),
 		TargetAgent:     target,
 		Confidence:      0.95,
 	}
@@ -52,4 +54,15 @@ func (m *MockClassifierClient) New(_ context.Context, _ anthropic.MessageNewPara
 		Role:       "assistant",
 		StopReason: "end_turn",
 	}, nil
+}
+
+func mockIntentDomainForTarget(target string) (Intent, Domain) {
+	switch strings.ToLower(strings.TrimSpace(target)) {
+	case "architect", "planner", "designer":
+		return IntentPlan, DomainPlanning
+	case "orchestrator", "orch":
+		return IntentStatus, DomainSystem
+	default:
+		return IntentHelp, DomainGeneral
+	}
 }

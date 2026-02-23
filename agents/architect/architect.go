@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -12,8 +13,10 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/domain"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -29,6 +32,7 @@ import (
 type Architect struct {
 	config Config
 	logger *slog.Logger
+	logWAL io.Closer
 
 	// Cross-domain handling
 	crossDomainHandler *CrossDomainHandler
@@ -62,6 +66,11 @@ type Architect struct {
 	planModesMu   sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingBus    map[string]chan *guide.Message
+	inFlightMu    sync.Mutex
+	inFlight      map[string]context.CancelFunc
+
+	// Handoff bridge integration
+	handoffBridge *handoff.HandoffBridge
 }
 
 // Config holds configuration for the Architect agent
@@ -71,11 +80,14 @@ type Config struct {
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
 
 	// LLM planning configuration
-	EnableLLM         bool
-	AnthropicAPIKey   string
-	Model             string
-	LLMRequestTimeout time.Duration
-	LLMRetryMax       int
+	EnableLLM          bool
+	AnthropicAPIKey    string
+	Model              string
+	ThinkingBudget     int
+	LLMRequestTimeout  time.Duration
+	LLMRetryMax        int
+	DisablePromptCache bool
+	PromptCacheTTL     time.Duration
 
 	// Cross-domain configuration
 	CrossDomainTimeout time.Duration // Optional, defaults to 30s
@@ -94,15 +106,19 @@ type Config struct {
 	ConsultationMaxAge               time.Duration // Optional, defaults to 5m
 
 	// Logging
-	Logger *slog.Logger // Optional, uses slog.Default() if nil
+	Logger *slog.Logger // Optional, defaults to per-agent WAL logger if nil.
+
+	logWAL io.Closer
 }
 
 // Default configuration values
 const (
-	DefaultMaxOutputTokens     = 4096
-	DefaultArchitectModel      = "claude-opus-4-6"
-	DefaultLLMRequestTimeout   = 45 * time.Second
-	DefaultLLMRetryMax         = 3
+	DefaultMaxOutputTokens   = 16384
+	DefaultThinkingBudget    = 8192
+	DefaultArchitectModel    = "claude-opus-4-6"
+	DefaultLLMRequestTimeout = 120 * time.Second
+	DefaultLLMRetryMax       = 3
+	DefaultPromptCacheTTL    = 1 * time.Hour
 	DefaultCrossDomainTimeout  = 30 * time.Second
 	DefaultMaxConcurrent       = 3
 	DefaultSimilarityThreshold = 0.8
@@ -117,14 +133,19 @@ const (
 // New creates a new Architect agent
 func New(cfg Config) (*Architect, error) {
 	cfg = applyConfigDefaults(cfg)
+	if err := ensureArchitectLogger(&cfg); err != nil {
+		return nil, err
+	}
 
 	architect := &Architect{
 		config:      cfg,
 		logger:      cfg.Logger,
+		logWAL:      cfg.logWAL,
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		activePlans: make(map[string]*DesignPlan),
 		planModes:   make(map[string]*PlanModeState),
 		pendingBus:  make(map[string]chan *guide.Message),
+		inFlight:    make(map[string]context.CancelFunc),
 	}
 
 	architect.initCrossDomain(cfg)
@@ -150,11 +171,17 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.Model == "" {
 		cfg.Model = DefaultArchitectModel
 	}
+	if cfg.ThinkingBudget == 0 {
+		cfg.ThinkingBudget = DefaultThinkingBudget
+	}
 	if cfg.LLMRequestTimeout == 0 {
 		cfg.LLMRequestTimeout = DefaultLLMRequestTimeout
 	}
 	if cfg.LLMRetryMax == 0 {
 		cfg.LLMRetryMax = DefaultLLMRetryMax
+	}
+	if cfg.PromptCacheTTL == 0 {
+		cfg.PromptCacheTTL = DefaultPromptCacheTTL
 	}
 	if cfg.CrossDomainTimeout == 0 {
 		cfg.CrossDomainTimeout = DefaultCrossDomainTimeout
@@ -190,10 +217,23 @@ func applyConfigDefaults(cfg Config) Config {
 	if !cfg.MandatoryConsultation && !cfg.AllowPlanningWithoutConsultation {
 		cfg.MandatoryConsultation = true
 	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
-	}
 	return cfg
+}
+
+func ensureArchitectLogger(cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("architect config is nil")
+	}
+	if cfg.Logger != nil {
+		return nil
+	}
+	logger, closer, err := agentlog.NewWALLogger("architect")
+	if err != nil {
+		return fmt.Errorf("create architect wal logger: %w", err)
+	}
+	cfg.Logger = logger
+	cfg.logWAL = closer
+	return nil
 }
 
 func (a *Architect) initCrossDomain(cfg Config) {
@@ -229,8 +269,13 @@ func (a *Architect) initSkills() {
 
 // Close closes the architect and its resources
 func (a *Architect) Close() error {
-	a.Stop()
-	return nil
+	stopErr := a.Stop()
+	if a.logWAL == nil {
+		return stopErr
+	}
+	closeErr := a.logWAL.Close()
+	a.logWAL = nil
+	return errors.Join(stopErr, closeErr)
 }
 
 // =============================================================================
@@ -389,8 +434,19 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	}
 
 	startTime := time.Now()
-
-	result, err := a.processForwardedRequest(ctx, fwd)
+	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx = withArchitectStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	reqCtx, usageAcc := withArchitectUsageAccumulator(reqCtx)
+	reqCtx = withArchitectEarlyUsageEmitter(reqCtx, func(inputTokens int) {
+		a.publishPlanStreamEarlyUsage(reqCtx, inputTokens)
+	})
+	a.registerInFlight(fwd.CorrelationID, cancel)
+	defer a.clearInFlight(fwd.CorrelationID)
+	defer cancel()
+	if !fwd.FireAndForget {
+		a.publishPlanStreamStart(reqCtx)
+	}
+	result, err := a.processForwardedRequest(reqCtx, fwd)
 
 	// Don't respond if fire-and-forget
 	if fwd.FireAndForget {
@@ -410,6 +466,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		if a.isInterruptError(err) {
 			return nil
 		}
+		a.publishPlanStreamError(reqCtx, err)
 		resp.Error = err.Error()
 		// Publish to error channel
 		errMsg := guide.NewErrorMessage(
@@ -422,6 +479,12 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	}
 
 	resp.Data = result
+
+	// Always include the authoritative response text in the completion
+	// event. The bridge stores it as AuthoritativeText on StreamCompleteMsg
+	// so the chat model can correct dropped or reordered stream chunks.
+	completeText := extractUserResponse(result)
+	a.publishPlanStreamComplete(reqCtx, completeText, usageAcc.Total())
 
 	// Publish response to own response channel
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
@@ -442,6 +505,9 @@ func (a *Architect) handleActionBusRequest(ctx context.Context, msg *guide.Messa
 	if strings.EqualFold(req.Action, "read_research_paper") {
 		return a.handleReadResearchAction(ctx, req)
 	}
+	if isCancelAction(req.Action) {
+		return a.handleCancelAction(req)
+	}
 	return nil
 }
 
@@ -457,6 +523,52 @@ func (a *Architect) handleProposalBusRequest(ctx context.Context, msg *guide.Mes
 
 func (a *Architect) generateMessageID() string {
 	return fmt.Sprintf("architect_msg_%s", uuid.New().String())
+}
+
+func (a *Architect) registerInFlight(correlationID string, cancel context.CancelFunc) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || cancel == nil {
+		return
+	}
+	a.inFlightMu.Lock()
+	a.inFlight[correlationID] = cancel
+	a.inFlightMu.Unlock()
+}
+
+func (a *Architect) clearInFlight(correlationID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	a.inFlightMu.Lock()
+	delete(a.inFlight, correlationID)
+	a.inFlightMu.Unlock()
+}
+
+func (a *Architect) cancelInFlight(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	var cancel context.CancelFunc
+	a.inFlightMu.Lock()
+	cancel = a.inFlight[correlationID]
+	delete(a.inFlight, correlationID)
+	a.inFlightMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func isCancelAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "cancel", "interrupt", "stop":
+		return true
+	default:
+		return false
+	}
 }
 
 // processForwardedRequest handles the actual request processing
@@ -509,56 +621,29 @@ type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error
 
 func (a *Architect) intentHandler(intent guide.Intent) (forwardedHandler, error) {
 	switch intent {
-	case guide.IntentPlan:
-		return a.handlePlan, nil
-	case guide.IntentDesign:
-		return a.handleDesign, nil
+	case guide.IntentPlan, guide.IntentDesign:
+		return a.handleConversation, nil
 	case guide.IntentRecall:
 		return a.handleRecall, nil
 	case guide.IntentCheck:
 		return a.handleCheck, nil
+	case guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
+		return a.handleConversation, nil
 	default:
-		return nil, fmt.Errorf("unsupported intent: %s", intent)
+		return a.handleConversation, nil
 	}
-}
-
-// handlePlan processes planning requests using the Pre-Delegation Planning Protocol
-func (a *Architect) handlePlan(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	req := &ArchitectRequest{
-		ID:        uuid.New().String(),
-		Intent:    IntentPlan,
-		Query:     fwd.Input,
-		SessionID: sessionIDFromForwarded(fwd),
-		Timestamp: time.Now(),
-		Params:    forwardedRequestParams(fwd),
-	}
-
-	return a.Handle(ctx, req)
-}
-
-// handleDesign processes design/architecture requests
-func (a *Architect) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	req := &ArchitectRequest{
-		ID:        uuid.New().String(),
-		Intent:    IntentDesign,
-		Query:     fwd.Input,
-		SessionID: sessionIDFromForwarded(fwd),
-		Timestamp: time.Now(),
-		Params:    forwardedRequestParams(fwd),
-	}
-
-	return a.Handle(ctx, req)
 }
 
 // handleRecall processes recall requests
 func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	req := &ArchitectRequest{
-		ID:        uuid.New().String(),
-		Intent:    IntentRecall,
-		Query:     fwd.Input,
-		SessionID: sessionIDFromForwarded(fwd),
-		Timestamp: time.Now(),
-		Params:    forwardedRequestParams(fwd),
+		ID:                  uuid.New().String(),
+		Intent:              IntentRecall,
+		Query:               fwd.Input,
+		SessionID:           sessionIDFromForwarded(fwd),
+		Timestamp:           time.Now(),
+		Params:              forwardedRequestParams(fwd),
+		ConversationHistory: fwd.ConversationHistory,
 	}
 
 	return a.Handle(ctx, req)
@@ -567,15 +652,61 @@ func (a *Architect) handleRecall(ctx context.Context, fwd *guide.ForwardedReques
 // handleCheck processes check/verification requests
 func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	req := &ArchitectRequest{
-		ID:        uuid.New().String(),
-		Intent:    IntentCheck,
-		Query:     fwd.Input,
-		SessionID: sessionIDFromForwarded(fwd),
-		Timestamp: time.Now(),
-		Params:    forwardedRequestParams(fwd),
+		ID:                  uuid.New().String(),
+		Intent:              IntentCheck,
+		Query:               fwd.Input,
+		SessionID:           sessionIDFromForwarded(fwd),
+		Timestamp:           time.Now(),
+		Params:              forwardedRequestParams(fwd),
+		ConversationHistory: fwd.ConversationHistory,
 	}
 
 	return a.Handle(ctx, req)
+}
+
+// handleConversation processes conversational requests from the event bus.
+// Both IntentPlan and IntentDesign route here so the architect converses
+// naturally before formalizing a plan.
+func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	// Check if user is approving a ready plan for execution.
+	preReq := &ArchitectRequest{
+		Query:     fwd.Input,
+		SessionID: sessionIDFromForwarded(fwd),
+	}
+	if result, ok := a.tryExecutePlan(ctx, preReq); ok {
+		return result, nil
+	}
+
+	// Check if user is confirming plan formalization after conversation.
+	if plan, ok := a.tryFormalizePlan(ctx, fwd); ok {
+		return plan, nil
+	}
+
+	req := &ArchitectRequest{
+		ID:                  uuid.New().String(),
+		Intent:              mapGuideIntentToArchitect(fwd.Intent),
+		Query:               fwd.Input,
+		SessionID:           sessionIDFromForwarded(fwd),
+		Timestamp:           time.Now(),
+		Params:              forwardedRequestParams(fwd),
+		ConversationHistory: fwd.ConversationHistory,
+	}
+
+	return a.Handle(ctx, req)
+}
+
+// mapGuideIntentToArchitect preserves the original guide intent as an
+// ArchitectIntent hint so the LLM receives the right context (e.g. "design"
+// vs "plan" vs general conversation).
+func mapGuideIntentToArchitect(intent guide.Intent) ArchitectIntent {
+	switch intent {
+	case guide.IntentDesign:
+		return IntentDesign
+	case guide.IntentPlan:
+		return IntentPlan
+	default:
+		return IntentConverse
+	}
 }
 
 func forwardedRequestParams(fwd *guide.ForwardedRequest) map[string]any {
@@ -658,10 +789,8 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 	var err error
 
 	switch req.Intent {
-	case IntentPlan:
-		result, err = a.executePlanningProtocol(ctx, req)
-	case IntentDesign:
-		result, err = a.executeDesignArchitecture(ctx, req)
+	case IntentPlan, IntentDesign:
+		result, err = a.executeConversation(ctx, req)
 	case IntentGenerateTasks:
 		result, err = a.executeGenerateTasks(ctx, req)
 	case IntentCreateDAG:
@@ -670,8 +799,10 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 		result, err = a.executeRecall(ctx, req)
 	case IntentCheck:
 		result, err = a.executeCheck(ctx, req)
+	case IntentHelp, IntentConsult, IntentEstimate, IntentConverse:
+		result, err = a.executeConversation(ctx, req)
 	default:
-		return nil, fmt.Errorf("unsupported intent: %s", req.Intent)
+		result, err = a.executeConversation(ctx, req)
 	}
 
 	if err != nil {
@@ -687,12 +818,13 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 	}
 
 	return &ArchitectResponse{
-		ID:        uuid.New().String(),
-		RequestID: req.ID,
-		Success:   true,
-		Data:      result,
-		Took:      time.Since(start),
-		Timestamp: time.Now(),
+		ID:           uuid.New().String(),
+		RequestID:    req.ID,
+		Success:      true,
+		Data:         result,
+		UserResponse: extractUserResponse(result),
+		Took:         time.Since(start),
+		Timestamp:    time.Now(),
 	}, nil
 }
 
@@ -844,6 +976,14 @@ func (a *Architect) generateAtomicTasks(ctx context.Context, architecture *Solut
 			EstimatedTokens: estimateTaskTokens(component),
 			Complexity:      estimateComplexity(component),
 			Status:          TaskStatusPending,
+			AcceptanceCriteria: []AcceptanceCriterion{{
+				Given:    "the codebase is in a clean state",
+				When:     fmt.Sprintf("the %s component is implemented", component.Name),
+				Then:     "all success criteria are met and tests pass",
+				Priority: "must",
+			}},
+			ImplementationGuide: fmt.Sprintf("Implement the %s component as described. Follow existing codebase patterns.", component.Name),
+			AffectedFiles:       deterministicAffectedFiles(component),
 		}
 		tasks = append(tasks, task)
 	}
@@ -860,11 +1000,34 @@ func (a *Architect) generateAtomicTasks(ctx context.Context, architecture *Solut
 			EstimatedTokens: 5000,
 			Complexity:      ComplexityMedium,
 			Status:          TaskStatusPending,
+			AcceptanceCriteria: []AcceptanceCriterion{{
+				Given:    "the codebase is in a clean state",
+				When:     "the implementation is complete",
+				Then:     "all tests pass and the feature works as described",
+				Priority: "must",
+			}},
+			ImplementationGuide: fmt.Sprintf("Implement %s as described in the architecture.", architecture.Name),
+			AffectedFiles:       []TaskFileTarget{{Path: "TBD", Operation: "create", Reason: "primary implementation file"}},
 		}
 		tasks = append(tasks, task)
 	}
 
 	return normalizeTaskGraph(tasks), nil
+}
+
+func deterministicAffectedFiles(component ComponentSpec) []TaskFileTarget {
+	if component.FilePath != "" {
+		return []TaskFileTarget{{
+			Path:      component.FilePath,
+			Operation: "modify",
+			Reason:    fmt.Sprintf("primary file for %s component", component.Name),
+		}}
+	}
+	return []TaskFileTarget{{
+		Path:      fmt.Sprintf("%s.go", strings.ToLower(strings.ReplaceAll(component.Name, " ", "_"))),
+		Operation: "create",
+		Reason:    fmt.Sprintf("implementation file for %s component", component.Name),
+	}}
 }
 
 func determineAgentType(component ComponentSpec) string {
@@ -1071,6 +1234,49 @@ func (a *Architect) executeCheck(ctx context.Context, req *ArchitectRequest) (an
 	}, nil
 }
 
+// executeConversation handles conversational intents (help, consult, estimate,
+// converse, plan, design, and unclassified) with a single LLM call instead of
+// the full planning protocol.
+func (a *Architect) executeConversation(ctx context.Context, req *ArchitectRequest) (any, error) {
+	request := plannerConversationRequest{
+		Mode:                plannerConversationModeConverse,
+		UserQuery:           req.Query,
+		IntentHint:          string(req.Intent),
+		ConversationHistory: req.ConversationHistory,
+		OnChunk: func(text string) {
+			a.publishPlanStreamChunk(ctx, text)
+		},
+	}
+	response, composeErr := a.composeUserFacingResponse(ctx, request)
+	if composeErr == nil {
+		return &ConversationResult{
+			Response: response,
+			Intent:   req.Intent,
+		}, nil
+	}
+	a.logger.Warn("conversation compose failed, using domain fallback",
+		"intent", req.Intent, "error", composeErr)
+	// LLM unavailable — fall back to domain-specific execution.
+	return a.conversationFallback(ctx, req, composeErr)
+}
+
+// conversationFallback runs the domain-specific execution path when the
+// conversational LLM is unavailable. Design intents use the lighter-weight
+// architecture call; all other intents (plan, converse, help, etc.) fall to
+// the full planning protocol, which has deterministic fallbacks for every step.
+func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequest, composeErr error) (any, error) {
+	if req.Intent == IntentDesign {
+		return a.executeDesignArchitecture(ctx, req)
+	}
+	plan, err := a.executePlanningProtocol(ctx, req)
+	if err != nil {
+		// Surface both the protocol error and the original compose error
+		// so the user can diagnose why the LLM path failed.
+		return nil, fmt.Errorf("planning protocol: %w (conversation unavailable: %v)", err, composeErr)
+	}
+	return plan, nil
+}
+
 // handleDomainQuery handles cross-domain queries
 func (a *Architect) handleDomainQuery(ctx context.Context, d domain.Domain, query string) (*DomainResult, error) {
 	target := crossDomainTarget(d)
@@ -1186,6 +1392,12 @@ func (a *Architect) GetRoutingInfo() *guide.AgentRoutingInfo {
 				DefaultIntent: guide.IntentPlan,
 				DefaultDomain: guide.DomainTasks,
 			},
+			{
+				Name:          "execute",
+				Description:   "Execute the current plan",
+				DefaultIntent: guide.IntentPlan,
+				DefaultDomain: guide.DomainTasks,
+			},
 		},
 
 		Triggers: guide.AgentTriggers{
@@ -1200,6 +1412,10 @@ func (a *Architect) GetRoutingInfo() *guide.AgentRoutingInfo {
 				"orchestrate",
 				"coordinate",
 				"structure",
+				"execute plan",
+				"go ahead",
+				"start execution",
+				"run the plan",
 			},
 			WeakTriggers: []string{
 				"implement",
@@ -1215,6 +1431,10 @@ func (a *Architect) GetRoutingInfo() *guide.AgentRoutingInfo {
 					"create workflow",
 					"break down",
 					"decompose",
+					"execute plan",
+					"go ahead",
+					"start execution",
+					"run the plan",
 				},
 				guide.IntentDesign: {
 					"architect",
@@ -1235,6 +1455,7 @@ func (a *Architect) GetRoutingInfo() *guide.AgentRoutingInfo {
 					guide.IntentDesign,
 					guide.IntentRecall,
 					guide.IntentCheck,
+					guide.IntentHelp,
 				},
 				Domains: []guide.Domain{
 					guide.DomainDesign,
@@ -1282,6 +1503,30 @@ func containsIgnoreCase(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
+// extractUserResponse returns the human-readable UserResponse from a planning,
+// conversation, or architect response result.
+func extractUserResponse(data any) string {
+	switch v := data.(type) {
+	case *ArchitectResponse:
+		if v != nil {
+			return v.UserResponse
+		}
+	case *DesignPlan:
+		if v != nil {
+			return v.UserResponse
+		}
+	case *ConversationResult:
+		if v != nil {
+			return v.Response
+		}
+	case *SolutionArchitecture:
+		if v != nil {
+			return v.Description
+		}
+	}
+	return ""
+}
+
 // GetActivePlan returns an active plan by ID
 func (a *Architect) GetActivePlan(id string) (*DesignPlan, bool) {
 	a.activePlansMu.RLock()
@@ -1301,4 +1546,56 @@ func (a *Architect) GetAllActivePlans() []*DesignPlan {
 		plans = append(plans, plan)
 	}
 	return plans
+}
+
+// =============================================================================
+// HandoffableAgent + ContextEvictable Implementation
+// =============================================================================
+
+// SetHandoffBridge sets the handoff bridge for the architect agent.
+func (a *Architect) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	a.handoffBridge = bridge
+}
+
+// AgentID returns the unique identifier for this architect instance.
+func (a *Architect) AgentID() string {
+	return "architect"
+}
+
+// AgentType returns the agent type classification.
+func (a *Architect) AgentType() string {
+	return "architect"
+}
+
+// Descriptor returns the immutable agent descriptor for handoff participation.
+func (a *Architect) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:     "architect",
+		ModelID:       "opus-4.5-200k",
+		ContextWindow: 200000,
+		Category:      handoff.CategoryKnowledge,
+	}
+}
+
+// ExtractArchivableState captures the architect's state for handoff persistence.
+func (a *Architect) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   a.AgentID(),
+		AgentType: a.AgentType(),
+		Timestamp: time.Now(),
+	}
+}
+
+// Terminate gracefully shuts down the architect agent.
+func (a *Architect) Terminate(ctx context.Context) error {
+	return a.Stop()
+}
+
+// EvictEntries frees context by evicting the given candidates.
+// Returns the total number of tokens freed across all evicted entries.
+func (a *Architect) EvictEntries(candidates []handoff.EvictionCandidate) (freedTokens int, err error) {
+	for _, c := range candidates {
+		freedTokens += c.Entry.GetTokenCount()
+	}
+	return freedTokens, nil
 }

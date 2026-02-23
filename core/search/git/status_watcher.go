@@ -44,10 +44,10 @@ const statusChanSize = 1
 // StatusWatcher
 // =============================================================================
 
-// StatusWatcher monitors .git/ internals via fsnotify and exposes a channel
-// of resolved StatusUpdate snapshots. It replaces tick-based polling with
-// event-driven refresh, falling back to a periodic scan for external
-// working-tree edits.
+// StatusWatcher monitors .git/ internals and working-tree directories via
+// fsnotify and exposes a channel of resolved StatusUpdate snapshots. Uses
+// a stat-dirty StatusEngine for efficient refresh, falling back to a
+// periodic scan for external working-tree edits.
 type StatusWatcher struct {
 	client     *GitClient
 	gitDir     string // resolved .git directory (handles worktrees)
@@ -56,8 +56,10 @@ type StatusWatcher struct {
 	out     chan StatusUpdate
 	nudgeCh chan struct{}
 
-	fsw        *fsnotify.Watcher
-	stopOnce   sync.Once
+	engine    *StatusEngine     // stat-dirty engine, replaces direct client calls
+	fsw       *fsnotify.Watcher // .git/ internal watcher
+	wtWatcher *fsnotify.Watcher // working-tree directory watcher
+	stopOnce  sync.Once
 	lastUpdate atomic.Pointer[StatusUpdate]
 }
 
@@ -75,13 +77,23 @@ func NewStatusWatcher(client *GitClient) (*StatusWatcher, error) {
 		return nil, err
 	}
 
+	wtw, err := fsnotify.NewWatcher()
+	if err != nil {
+		fsw.Close()
+		return nil, err
+	}
+
+	engine := NewStatusEngine(client, gitDir)
+
 	return &StatusWatcher{
 		client:     client,
 		gitDir:     gitDir,
 		refsPrefix: filepath.Join(gitDir, "refs"),
 		out:        make(chan StatusUpdate, statusChanSize),
 		nudgeCh:    make(chan struct{}, 1),
+		engine:     engine,
 		fsw:        fsw,
+		wtWatcher:  wtw,
 	}, nil
 }
 
@@ -143,13 +155,53 @@ func (w *StatusWatcher) LastUpdate() *StatusUpdate {
 	return w.lastUpdate.Load()
 }
 
-// addWatchPaths registers fsnotify watches on key .git/ paths.
+// addWatchPaths registers fsnotify watches on key .git/ paths and
+// working-tree directories.
 func (w *StatusWatcher) addWatchPaths() {
 	// Watch .git/ itself for HEAD, index, MERGE_HEAD, REBASE_HEAD, etc.
 	_ = w.fsw.Add(w.gitDir)
 
 	// Watch refs subdirectories for branch/tag pointer changes.
 	addDirRecursive(w.fsw, w.refsPrefix)
+
+	// Watch working-tree directories for instant change detection.
+	w.addWorktreeWatches()
+}
+
+// addWorktreeWatches recursively adds fsnotify watches for all non-ignored
+// directories under the repository root. Skips .git/ and gitignored dirs.
+func (w *StatusWatcher) addWorktreeWatches() {
+	repoPath := w.client.repoPath
+	ignores := newIgnoreStack(repoPath, w.gitDir)
+
+	_ = filepath.WalkDir(repoPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+
+		osRel, relErr := filepath.Rel(repoPath, path)
+		if relErr != nil {
+			return nil
+		}
+
+		// Normalize to forward slashes for gitignore matching.
+		rel := toSlash(osRel)
+
+		if rel == ".git" {
+			return filepath.SkipDir
+		}
+
+		if rel != "." && ignores.isIgnored(rel, true) {
+			return filepath.SkipDir
+		}
+
+		if rel != "." {
+			ignores.loadDirPatterns(repoPath, rel)
+		}
+
+		_ = w.wtWatcher.Add(path)
+		return nil
+	})
 }
 
 // addDirRecursive adds a directory and all subdirectories to the watcher.
@@ -177,6 +229,7 @@ func addDirRecursive(fsw *fsnotify.Watcher, root string) {
 func (w *StatusWatcher) loop(ctx context.Context) {
 	defer close(w.out)
 	defer w.fsw.Close()
+	defer w.wtWatcher.Close()
 
 	// Adaptive fallback timer (one-shot, re-armed after each refresh).
 	fallbackInterval := statusFallbackBase
@@ -219,6 +272,15 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 			fallbackInterval = statusFallbackBase // reset backoff
 			arm(debounce, &debounceActive, maxWindow, &maxWindowActive)
 
+		case ev, ok := <-w.wtWatcher.Events:
+			if !ok {
+				return
+			}
+			w.handleWorktreeEvent(ev)
+			fallbackFromEvent = true
+			fallbackInterval = statusFallbackBase // reset backoff
+			arm(debounce, &debounceActive, maxWindow, &maxWindowActive)
+
 		case <-w.nudgeCh:
 			fallbackFromEvent = true
 			fallbackInterval = statusFallbackBase // reset backoff
@@ -239,7 +301,7 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 			maxWindowActive = false
 			if !inFlight {
 				inFlight = true
-				go doRefresh(ctx, w.client, refreshDone)
+				go doRefresh(ctx, w.engine, refreshDone)
 			}
 
 		case <-maxWindow.C:
@@ -248,7 +310,7 @@ func (w *StatusWatcher) loop(ctx context.Context) {
 			debounceActive = false
 			if !inFlight {
 				inFlight = true
-				go doRefresh(ctx, w.client, refreshDone)
+				go doRefresh(ctx, w.engine, refreshDone)
 			}
 
 		case update := <-refreshDone:
@@ -331,33 +393,40 @@ func newStoppedTimer() *time.Timer {
 	return t
 }
 
-// doRefresh queries git status and tracked set, then sends the result on the
-// done channel. Runs in a separate goroutine so the event loop is not blocked.
-func doRefresh(ctx context.Context, client *GitClient, done chan<- StatusUpdate) {
-	// Early exit if context is already cancelled.
+// doRefresh computes working-tree status via the stat-dirty StatusEngine,
+// then sends the result on the done channel. Runs in a separate goroutine
+// so the event loop is not blocked.
+func doRefresh(ctx context.Context, engine *StatusEngine, done chan<- StatusUpdate) {
 	if ctx.Err() != nil {
 		return
 	}
 
-	wts, err := client.WorktreeStatus()
-	if err != nil {
+	update, err := engine.Refresh(ctx)
+	if err != nil || ctx.Err() != nil {
 		return
 	}
 
-	statusMap := BuildStatusMap(wts)
-	tracked := client.TrackedSet()
-	trackedDirs := BuildTrackedDirs(tracked)
+	done <- update
+}
 
-	// Check context again after potentially slow operations.
-	if ctx.Err() != nil {
+// handleWorktreeEvent processes a working-tree fsnotify event.
+// For newly created directories, adds a watch to catch future events.
+func (w *StatusWatcher) handleWorktreeEvent(ev fsnotify.Event) {
+	if ev.Op&fsnotify.Create == 0 {
+		return
+	}
+	info, err := os.Stat(ev.Name)
+	if err != nil || !info.IsDir() {
 		return
 	}
 
-	done <- StatusUpdate{
-		StatusMap:   statusMap,
-		TrackedSet:  tracked,
-		TrackedDirs: trackedDirs,
+	// Skip .git directories. Uses OS separator since ev.Name is an OS path.
+	rel, relErr := filepath.Rel(w.client.repoPath, ev.Name)
+	if relErr != nil || rel == ".git" || strings.HasPrefix(rel, ".git"+string(filepath.Separator)) {
+		return
 	}
+
+	_ = w.wtWatcher.Add(ev.Name)
 }
 
 // watchNewRefDir dynamically adds fsnotify watches for newly created
@@ -417,10 +486,11 @@ func (w *StatusWatcher) Nudge() {
 // Stop
 // =============================================================================
 
-// Stop closes the fsnotify watcher, which causes the loop to exit and close
+// Stop closes both fsnotify watchers, which causes the loop to exit and close
 // the output channel. Safe to call multiple times.
 func (w *StatusWatcher) Stop() {
 	w.stopOnce.Do(func() {
 		w.fsw.Close()
+		w.wtWatcher.Close()
 	})
 }

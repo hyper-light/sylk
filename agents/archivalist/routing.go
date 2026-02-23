@@ -78,6 +78,7 @@ func ArchivalistRegistration() *guide.AgentRegistration {
 				guide.IntentCheck,
 				guide.IntentDeclare,
 				guide.IntentComplete,
+				guide.IntentHelp,
 			},
 			Domains: []guide.Domain{
 				guide.DomainPatterns,

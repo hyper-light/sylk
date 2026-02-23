@@ -197,26 +197,25 @@ func (m *Model) deriveConflictLabels() {
 
 	switch {
 	case m.data.Op == opMerge && strings.Contains(m.data.SourceName, "/"):
-		// Pull merge — use actual branch names.
-		m.oursLabel = m.data.DestName
-		m.theirsLabel = m.data.SourceName
-		m.oursCtx = ""
-		m.theirsCtx = ""
+		// Pull merge — short fixed labels.
+		m.oursLabel = "Locl"
+		m.theirsLabel = "Remte"
+		m.oursCtx = m.data.DestName
+		m.theirsCtx = m.data.SourceName
 
 	case m.data.Op == opCherryPick || m.data.Op == opRebase:
-		// Rebase/cherry-pick — ours is the dest branch, theirs is the
-		// short commit hash with the subject as context.
-		m.oursLabel = m.data.DestName
-		m.theirsLabel = m.data.Hash
-		m.oursCtx = ""
+		// Rebase/cherry-pick — short fixed labels, subject as context.
+		m.oursLabel = "Curr"
+		m.theirsLabel = "Incmg"
+		m.oursCtx = m.data.DestName
 		m.theirsCtx = m.data.Subject
 
 	default:
-		// Local merge — use actual branch names.
-		m.oursLabel = m.data.DestName
-		m.theirsLabel = m.data.SourceName
-		m.oursCtx = ""
-		m.theirsCtx = ""
+		// Local merge — short fixed labels.
+		m.oursLabel = "Dest"
+		m.theirsLabel = "Source"
+		m.oursCtx = m.data.DestName
+		m.theirsCtx = m.data.SourceName
 	}
 }
 

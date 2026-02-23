@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 // =============================================================================
@@ -77,6 +79,15 @@ type ResponseContext struct {
 
 	// Timestamp is when the response was generated.
 	Timestamp time.Time `json:"timestamp"`
+
+	// StopReason from the provider response (empty when unavailable).
+	StopReason providers.StopReason `json:"stop_reason,omitempty"`
+
+	// CacheEfficiency is the fraction of input tokens served from cache.
+	CacheEfficiency float64 `json:"cache_efficiency,omitempty"`
+
+	// OutputRatio is the ratio of output to input tokens.
+	OutputRatio float64 `json:"output_ratio,omitempty"`
 }
 
 // AssessmentContext provides additional context for quality assessment.
@@ -468,57 +479,59 @@ func (h *DefaultQualityAssessorHook) Reset() {
 // Internal Methods
 // =============================================================================
 
-// assessCoherence evaluates response coherence.
-// Returns a value in [0, 1] where 1 indicates high coherence.
+// assessCoherence evaluates response coherence using the provider's
+// StopReason as the primary signal, with a small cache-efficiency bonus.
+//
+// Cache bonus: when cache efficiency exceeds the neutral quality prior
+// (majority cached), coherence gets a small multiplicative bump derived
+// from the gap between stop_sequence and end_turn quality scores.
 func (h *DefaultQualityAssessorHook) assessCoherence(response *ResponseContext) float64 {
 	if response.Content == "" {
 		return 0.0
 	}
-
-	// Heuristic-based coherence assessment
-	// In practice, this could use more sophisticated NLP methods
-	coherence := 1.0
-
-	// Penalize very short responses (might be incomplete)
-	if len(response.Content) < 50 {
-		coherence *= 0.8
+	coherence := float64(StopQualityFromReason(response.StopReason))
+	// Threshold: neutral prior (same as unknown StopReason).
+	// Bonus: gap between stop_sequence(0.9) and end_turn(1.0) = half that gap.
+	cacheThreshold := float64(StopQualityFromReason(""))
+	cacheBonus := 1.0 + (float64(StopQualityFromReason(providers.StopReasonEndTurn))-float64(StopQualityFromReason(providers.StopReasonStopSequence)))/2.0
+	if response.CacheEfficiency > cacheThreshold {
+		coherence = min(coherence*cacheBonus, 1.0)
 	}
-
-	// Penalize very long generation times (might indicate struggling)
-	if response.GenerationTime > 10*time.Second {
-		coherence *= 0.9
-	}
-
-	// Consider token efficiency
-	if response.TokenCount > 0 && response.ContextSize > 0 {
-		efficiency := float64(response.TokenCount) / float64(response.ContextSize)
-		if efficiency > 0.5 {
-			// Response is too large relative to context
-			coherence *= 0.95
-		}
-	}
-
 	return clamp(coherence, 0.0, 1.0)
 }
 
-// assessCompleteness evaluates response completeness.
-// Returns a value in [0, 1] where 1 indicates complete response.
+// assessCompleteness evaluates response completeness using StopReason
+// and output ratio. Split into sub-functions for CC < 4.
 func (h *DefaultQualityAssessorHook) assessCompleteness(response *ResponseContext) float64 {
 	if response.Content == "" {
 		return 0.0
 	}
+	base := stopReasonCompleteness(response.StopReason)
+	return adjustForOutputRatio(base, response.OutputRatio)
+}
 
-	// Basic completeness heuristics
-	completeness := 1.0
+// stopReasonCompleteness maps StopReason to a base completeness score,
+// derived from the StopQuality mapping.
+func stopReasonCompleteness(reason providers.StopReason) float64 {
+	return float64(StopQualityFromReason(reason))
+}
 
-	// Very short responses are likely incomplete
-	if len(response.Content) < 20 {
-		completeness = 0.5
-	} else if len(response.Content) < 100 {
-		completeness = 0.8
+// adjustForOutputRatio reduces completeness when output is vanishingly
+// small relative to input. Threshold and penalty derived from StopQuality:
+//   - Threshold: outputRatio < StopQualityFromReason(max_tokens) / 100
+//     i.e. ratio below (truncation quality / 100) = effectively empty.
+//   - Penalty: midpoint between max_tokens and end_turn quality scores.
+func adjustForOutputRatio(base, outputRatio float64) float64 {
+	if base < 1.0 {
+		return base
 	}
-
-	return clamp(completeness, 0.0, 1.0)
+	maxTokensQ := float64(StopQualityFromReason(providers.StopReasonMaxTokens))
+	endTurnQ := float64(StopQualityFromReason(providers.StopReasonEndTurn))
+	threshold := maxTokensQ / (endTurnQ * 100.0) // 0.3 / 100 = 0.003 ≈ 0.3%
+	if outputRatio > 0 && outputRatio < threshold {
+		return (maxTokensQ + endTurnQ) / 2.0
+	}
+	return base
 }
 
 // feedbackToRating converts feedback to a normalized rating.

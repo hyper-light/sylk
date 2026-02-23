@@ -1020,6 +1020,7 @@ func newOpenAIResponseStreamRunner(
 	}
 	runner.eventHandlers = []func(any) error{
 		runner.handleTextDeltaEvent,
+		runner.handleReasoningSummaryDeltaEvent,
 		runner.handleFunctionCallArgumentsDeltaEvent,
 		runner.handleFunctionCallArgumentsDoneEvent,
 		runner.handleOutputItemAddedEvent,
@@ -1188,6 +1189,41 @@ func (r *openAIResponseStreamRunner) handleTextDeltaEvent(event any) error {
 		Text:      ev.Delta,
 		Timestamp: time.Now(),
 	})
+}
+
+func (r *openAIResponseStreamRunner) handleReasoningSummaryDeltaEvent(event any) error {
+	switch ev := event.(type) {
+	case responses.ResponseReasoningSummaryTextDeltaEvent:
+		return r.emitReasoningSummaryChunk(ev.Delta)
+	case responses.ResponseReasoningSummaryDeltaEvent:
+		return r.emitReasoningSummaryChunk(reasoningSummaryText(ev.Delta))
+	default:
+		return nil
+	}
+}
+
+func (r *openAIResponseStreamRunner) emitReasoningSummaryChunk(text string) error {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return r.emitChunk(&StreamChunk{
+		Index:     r.chunkIndex,
+		Type:      ChunkTypeThought,
+		Text:      text,
+		Timestamp: time.Now(),
+	})
+}
+
+func reasoningSummaryText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case map[string]any:
+		if text, ok := typed["text"].(string); ok {
+			return text
+		}
+	}
+	return ""
 }
 
 func (r *openAIResponseStreamRunner) handleFunctionCallArgumentsDeltaEvent(event any) error {
@@ -1397,19 +1433,7 @@ func (p *OpenAIProvider) runResponseStream(
 }
 
 func (p *OpenAIProvider) Stream(ctx context.Context, req *Request) (<-chan *StreamChunk, error) {
-	chunks := make(chan *StreamChunk, 100)
-	go func() {
-		defer close(chunks)
-		_ = p.StreamWithHandler(ctx, req, func(chunk *StreamChunk) error {
-			select {
-			case chunks <- chunk:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
-	}()
-	return chunks, nil
+	return streamViaHandler(ctx, p, req), nil
 }
 
 // ValidateConfig checks if the provider configuration is valid
@@ -1482,7 +1506,7 @@ func (p *OpenAIProvider) buildResponseParams(req *Request) responses.ResponseNew
 	p.applyChatGPTResponseOptions(&params, systemPrompt)
 	p.applyTemperature(&params, req, model)
 	p.applyTopP(&params, req)
-	p.applyReasoningEffort(&params, p.resolveReasoningEffort(req))
+	p.applyReasoningEffort(&params, p.resolveReasoningEffort(req), model)
 	p.applyTools(&params, req.Tools)
 	return params
 }
@@ -1504,10 +1528,26 @@ func (p *OpenAIProvider) resolveRequestModel(req *Request) string {
 
 func (p *OpenAIProvider) resolveSystemPrompt(req *Request) string {
 	systemPrompt := strings.TrimSpace(req.SystemPrompt)
-	if systemPrompt != "" {
-		return systemPrompt
+	if systemPrompt == "" {
+		systemPrompt = strings.TrimSpace(p.config.SystemPrompt)
 	}
-	return strings.TrimSpace(p.config.SystemPrompt)
+	return appendPromptSkills(systemPrompt, p.skills)
+}
+
+func appendPromptSkills(systemPrompt string, promptSkills []skills.Skill) string {
+	if len(promptSkills) == 0 {
+		return strings.TrimSpace(systemPrompt)
+	}
+	skillsPrompt := strings.TrimSpace(skills.ToPrompt(promptSkills))
+	base := strings.TrimSpace(systemPrompt)
+	switch {
+	case base == "":
+		return skillsPrompt
+	case skillsPrompt == "":
+		return base
+	default:
+		return base + "\n" + skillsPrompt
+	}
 }
 
 func (p *OpenAIProvider) resolveMaxTokens(req *Request) int {
@@ -1571,16 +1611,28 @@ func (p *OpenAIProvider) applyTopP(params *responses.ResponseNewParams, req *Req
 	params.TopP = openai.Float(*req.TopP)
 }
 
-func (p *OpenAIProvider) applyReasoningEffort(params *responses.ResponseNewParams, reasoningEffort string) {
-	if reasoningEffort == "" {
+func (p *OpenAIProvider) applyReasoningEffort(
+	params *responses.ResponseNewParams,
+	reasoningEffort string,
+	model string,
+) {
+	if reasoningEffort == "" && !supportsOpenAIReasoningConfig(model) {
 		return
 	}
 	params.Reasoning = shared.ReasoningParam{}
+	params.Reasoning.Summary = shared.ReasoningSummaryAuto
 	if reasoningEffort == "xhigh" {
 		params.Reasoning.SetExtraFields(map[string]any{"effort": "xhigh"})
 		return
 	}
-	params.Reasoning.Effort = shared.ReasoningEffort(reasoningEffort)
+	if reasoningEffort != "" {
+		params.Reasoning.Effort = shared.ReasoningEffort(reasoningEffort)
+	}
+}
+
+func supportsOpenAIReasoningConfig(model string) bool {
+	model = normalizeOpenAIModel(model)
+	return strings.HasPrefix(model, "gpt-5") || strings.HasPrefix(model, "o")
 }
 
 func (p *OpenAIProvider) applyTools(params *responses.ResponseNewParams, tools []Tool) {

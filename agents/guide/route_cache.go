@@ -71,14 +71,14 @@ type RouteCacheConfig struct {
 
 func DefaultRouteCacheConfig() RouteCacheConfig {
 	return RouteCacheConfig{
-		MaxSize:               10000,
-		TTL:                   1 * time.Hour,
-		EnableSemantic:        true,
+		MaxSize:               10_000,
+		TTL:                   5 * time.Minute,
+		EnableSemantic:        false,
 		SemanticThreshold:     0.86,
 		MaxSemanticCandidates: 32,
 		EnableHotCache:        true,
-		HotNumCounters:        100000,
-		HotMaxCost:            10000,
+		HotNumCounters:        100_000, // 10 × MaxSize
+		HotMaxCost:            7_000_000, // 10,000 × 700 bytes max entry cost
 		HotBufferItems:        64,
 	}
 }
@@ -116,7 +116,9 @@ func normalizeRouteCacheConfig(cfg RouteCacheConfig) RouteCacheConfig {
 		cfg.HotNumCounters = int64(cfg.MaxSize * 10)
 	}
 	if cfg.HotMaxCost <= 0 {
-		cfg.HotMaxCost = int64(cfg.MaxSize)
+		// Derived: MaxSize × max entry bytes (700).
+		const maxRouteCostBytes = 700
+		cfg.HotMaxCost = int64(cfg.MaxSize) * maxRouteCostBytes
 	}
 	if cfg.HotBufferItems <= 0 {
 		cfg.HotBufferItems = 64
@@ -173,16 +175,38 @@ func (c *RouteCache) getHot(key string) *CachedRoute {
 	if !ok {
 		return nil
 	}
-	entry, ok := value.(*CachedRoute)
+	hotEntry, ok := value.(*CachedRoute)
 	if !ok {
 		return nil
 	}
+	// Ristretto admission is async — the hot cache may hold a stale pointer
+	// from an earlier Set whose buffer flushed before a later one. The entries
+	// map is authoritative; prefer it when it contains a different pointer.
+	entry := c.reconcileHot(key, hotEntry)
 	if !c.isEntryValid(entry) {
 		c.Invalidate(key)
 		return nil
 	}
 	c.bumpHitCount(entry)
 	return entry
+}
+
+// reconcileHot returns the authoritative entry for key. If the entries map
+// holds a different (newer) pointer than what Ristretto returned, the map
+// entry wins and the hot cache is updated lazily on the next promote.
+// Returns nil when the entry was removed from the authoritative map
+// (Ristretto Del is async, so the hot cache may still hold a stale pointer).
+func (c *RouteCache) reconcileHot(key string, hotEntry *CachedRoute) *CachedRoute {
+	c.mu.RLock()
+	mapEntry, exists := c.entries[key]
+	c.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+	if mapEntry != hotEntry {
+		return mapEntry
+	}
+	return hotEntry
 }
 
 func (c *RouteCache) getExact(key string) *CachedRoute {
@@ -359,11 +383,18 @@ func (c *RouteCache) evictOldest() {
 	}
 }
 
+func estimateRouteCost(entry *CachedRoute) int64 {
+	// Struct fixed overhead: 2×time.Time(48) + 2×int64(16) + float64(8) + alignment(40) = 112
+	const fixedOverhead = 112
+	return int64(fixedOverhead + len(entry.Input) + len(entry.TargetAgentID) +
+		len(entry.Intent) + len(entry.Domain))
+}
+
 func (c *RouteCache) promoteHot(key string, entry *CachedRoute) {
 	if c == nil || c.hot == nil || entry == nil {
 		return
 	}
-	c.hot.Set(key, entry, 1)
+	c.hot.Set(key, entry, estimateRouteCost(entry))
 }
 
 func (c *RouteCache) indexEntry(key string) {

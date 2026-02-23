@@ -14,3 +14,4 @@ Display available skills and usage information.
 
 ## Output
 Returns a list of available skills with descriptions and parameters.
+Use `conversation_context` when the user asks why routing stayed/switched or asks what agent is currently active in-session.

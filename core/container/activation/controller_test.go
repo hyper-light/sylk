@@ -1,0 +1,562 @@
+package activation
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/container"
+	csecurity "github.com/adalundhe/sylk/core/container/security"
+)
+
+// --- Test helpers ---
+
+func testCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func testScope(t *testing.T) *concurrency.GoroutineScope {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return concurrency.NewGoroutineScope(ctx, "test-scope", nil)
+}
+
+func newMockContainer(t *testing.T, agentType string) *container.Container {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	scope := concurrency.NewGoroutineScope(ctx, "test-"+agentType, nil)
+	secCtx := csecurity.NewSecurityContext(csecurity.SecurityContextConfig{
+		ContainerID: "test-" + agentType,
+		AgentID:     "agent-" + agentType,
+		Role:        "worker",
+	})
+	agent := &mockContainerAgent{id: "agent-" + agentType, agentType: agentType}
+	return container.NewContainer(container.ContainerConfig{
+		ID:     container.ContainerID("test-" + agentType),
+		Spec:   container.ContainerSpec{Name: agentType, AgentType: agentType},
+		Scope:  scope,
+		SecCtx: secCtx,
+		Agent:  agent,
+	})
+}
+
+type mockContainerAgent struct {
+	id        string
+	agentType string
+}
+
+func (m *mockContainerAgent) AgentID() string                   { return m.id }
+func (m *mockContainerAgent) AgentType() string                 { return m.agentType }
+func (m *mockContainerAgent) Terminate(_ context.Context) error { return nil }
+
+// mockRuntime implements container.ContainerRuntime for testing.
+type mockRuntime struct {
+	mu         sync.Mutex
+	created    []*container.Container
+	started    int
+	stopped    int
+	paused     int
+	resumed    int
+	removed    int
+	createFunc func(ctx context.Context, spec container.ContainerSpec) (*container.Container, error)
+}
+
+func newMockRuntime(t *testing.T) *mockRuntime {
+	t.Helper()
+	return &mockRuntime{
+		createFunc: func(_ context.Context, spec container.ContainerSpec) (*container.Container, error) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			scope := concurrency.NewGoroutineScope(ctx, "rt-"+spec.AgentType, nil)
+			secCtx := csecurity.NewSecurityContext(csecurity.SecurityContextConfig{
+				ContainerID: "rt-" + spec.AgentType,
+				Role:        "worker",
+			})
+			agent := &mockContainerAgent{id: "agent-" + spec.AgentType, agentType: spec.AgentType}
+			c := container.NewContainer(container.ContainerConfig{
+				ID:     container.ContainerID("rt-" + spec.AgentType),
+				Spec:   spec,
+				Scope:  scope,
+				SecCtx: secCtx,
+				Agent:  agent,
+			})
+			return c, nil
+		},
+	}
+}
+
+func (r *mockRuntime) CreateContainer(_ context.Context, spec container.ContainerSpec, _ *container.Pod) (*container.Container, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, err := r.createFunc(context.Background(), spec)
+	if err != nil {
+		return nil, err
+	}
+	r.created = append(r.created, c)
+	return c, nil
+}
+
+func (r *mockRuntime) StartContainer(_ context.Context, c *container.Container) error {
+	r.mu.Lock()
+	r.started++
+	r.mu.Unlock()
+	return c.Start(context.Background())
+}
+
+func (r *mockRuntime) StopContainer(_ context.Context, c *container.Container) error {
+	r.mu.Lock()
+	r.stopped++
+	r.mu.Unlock()
+	return c.Stop(context.Background())
+}
+
+func (r *mockRuntime) PauseContainer(_ context.Context, c *container.Container) error {
+	r.mu.Lock()
+	r.paused++
+	r.mu.Unlock()
+	return c.Pause()
+}
+
+func (r *mockRuntime) ResumeContainer(_ context.Context, c *container.Container) error {
+	r.mu.Lock()
+	r.resumed++
+	r.mu.Unlock()
+	return c.Resume()
+}
+
+func (r *mockRuntime) RemoveContainer(_ context.Context, _ *container.Container) error {
+	r.mu.Lock()
+	r.removed++
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *mockRuntime) ContainerStatus(c *container.Container) *container.ContainerStatus {
+	return &container.ContainerStatus{ID: c.ID(), State: c.State()}
+}
+
+func (r *mockRuntime) CreatePod(_ context.Context, _ container.PodSpec) (*container.Pod, error) {
+	return nil, nil
+}
+
+func (r *mockRuntime) StartPod(_ context.Context, _ *container.Pod) error  { return nil }
+func (r *mockRuntime) StopPod(_ context.Context, _ *container.Pod) error   { return nil }
+func (r *mockRuntime) RemovePod(_ context.Context, _ *container.Pod) error { return nil }
+func (r *mockRuntime) PodStatus(_ *container.Pod) *container.PodStatus     { return nil }
+
+func (r *mockRuntime) createdCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.created)
+}
+
+func testControllerConfig(t *testing.T) ActivationControllerConfig {
+	t.Helper()
+	defaults := DefaultPolicyDefaults()
+	return ActivationControllerConfig{
+		Runtime:      newMockRuntime(t),
+		Registry:     container.NewContainerRegistry(),
+		Scope:        testScope(t),
+		StorageDir:   t.TempDir(),
+		WarmPoolCap:  8,
+		CoolStoreCap: 16,
+		Policies: []*ActivationPolicy{
+			DefaultPolicy("engineer", defaults),
+			DefaultPolicy("architect", defaults),
+			DefaultPolicy("tester", defaults),
+		},
+	}
+}
+
+// --- Tests ---
+
+func TestController_EnsureActive_ColdStart(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	c, err := ac.EnsureActive(testCtx(t), "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+	if c == nil {
+		t.Fatal("expected non-nil container")
+	}
+
+	tier, _ := ac.TierOf("engineer")
+	if tier != TierHot {
+		t.Fatalf("expected TierHot, got %v", tier)
+	}
+
+	snap := ac.Metrics().Snapshot()
+	if snap.ColdStarts != 1 {
+		t.Fatalf("expected 1 cold start, got %d", snap.ColdStarts)
+	}
+}
+
+func TestController_EnsureActive_HotHit(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	c1, _ := ac.EnsureActive(testCtx(t), "engineer")
+	c2, _ := ac.EnsureActive(testCtx(t), "engineer")
+
+	if c1 != c2 {
+		t.Fatal("expected same container on hot hit")
+	}
+
+	snap := ac.Metrics().Snapshot()
+	if snap.HotHits != 1 {
+		t.Fatalf("expected 1 hot hit, got %d", snap.HotHits)
+	}
+}
+
+func TestController_DemoteHotToWarm(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	_, err = ac.EnsureActive(testCtx(t), "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+
+	err = ac.DemoteTo(testCtx(t), "engineer", TierWarm)
+	if err != nil {
+		t.Fatalf("DemoteTo: %v", err)
+	}
+
+	tier, _ := ac.TierOf("engineer")
+	if tier != TierWarm {
+		t.Fatalf("expected TierWarm, got %v", tier)
+	}
+
+	snap := ac.Metrics().Snapshot()
+	if snap.DemotionsToWarm != 1 {
+		t.Fatalf("expected 1 warm demotion, got %d", snap.DemotionsToWarm)
+	}
+}
+
+func TestController_PromoteFromWarm(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	_, _ = ac.EnsureActive(testCtx(t), "engineer")
+	_ = ac.DemoteTo(testCtx(t), "engineer", TierWarm)
+
+	// Re-activate from Warm.
+	c, err := ac.EnsureActive(testCtx(t), "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive from warm: %v", err)
+	}
+	if c == nil {
+		t.Fatal("expected non-nil container")
+	}
+
+	tier, _ := ac.TierOf("engineer")
+	if tier != TierHot {
+		t.Fatalf("expected TierHot after warm start, got %v", tier)
+	}
+
+	snap := ac.Metrics().Snapshot()
+	if snap.WarmStarts != 1 {
+		t.Fatalf("expected 1 warm start, got %d", snap.WarmStarts)
+	}
+}
+
+func TestController_FullCycle_ColdHotWarmCoolCold(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+
+	// Cold -> Hot
+	_, _ = ac.EnsureActive(ctx, "engineer")
+	assertTier(t, ac, "engineer", TierHot)
+
+	// Hot -> Warm
+	_ = ac.DemoteTo(ctx, "engineer", TierWarm)
+	assertTier(t, ac, "engineer", TierWarm)
+
+	// Warm -> Cool
+	_ = ac.DemoteTo(ctx, "engineer", TierCool)
+	assertTier(t, ac, "engineer", TierCool)
+
+	// Cool -> Cold
+	_ = ac.DemoteTo(ctx, "engineer", TierCold)
+	assertTier(t, ac, "engineer", TierCold)
+}
+
+func TestController_ConcurrentEnsureActive_SameType(t *testing.T) {
+	cfg := testControllerConfig(t)
+	rt := cfg.Runtime.(*mockRuntime)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	const numGoroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	containers := make([]*container.Container, numGoroutines)
+	errors := make([]error, numGoroutines)
+
+	for i := range numGoroutines {
+		go func(idx int) {
+			defer wg.Done()
+			c, err := ac.EnsureActive(testCtx(t), "engineer")
+			containers[idx] = c
+			errors[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errors {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+
+	// All should get the same container (coalesced).
+	first := containers[0]
+	for i := 1; i < len(containers); i++ {
+		if containers[i] != first {
+			t.Fatalf("goroutine %d got different container", i)
+		}
+	}
+
+	// Should only create one container.
+	if rt.createdCount() != 1 {
+		t.Fatalf("expected 1 container created, got %d", rt.createdCount())
+	}
+}
+
+func TestController_ConcurrentEnsureActive_DifferentTypes(t *testing.T) {
+	cfg := testControllerConfig(t)
+	rt := cfg.Runtime.(*mockRuntime)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	types := []string{"engineer", "architect", "tester"}
+	var wg sync.WaitGroup
+	wg.Add(len(types))
+
+	for _, tp := range types {
+		go func(agentType string) {
+			defer wg.Done()
+			_, _ = ac.EnsureActive(testCtx(t), agentType)
+		}(tp)
+	}
+	wg.Wait()
+
+	// Each type should have its own container.
+	if rt.createdCount() != 3 {
+		t.Fatalf("expected 3 containers created, got %d", rt.createdCount())
+	}
+}
+
+func TestController_DemoteTo_RespectsMinTier(t *testing.T) {
+	cfg := testControllerConfig(t)
+	cfg.Policies = []*ActivationPolicy{
+		{
+			AgentType: "guide",
+			MinTier:   TierWarm,
+		},
+	}
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	_, err = ac.EnsureActive(testCtx(t), "guide")
+	if err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+
+	_ = ac.DemoteTo(testCtx(t), "guide", TierCold)
+
+	// Should stop at MinTier = TierWarm.
+	tier, _ := ac.TierOf("guide")
+	if tier != TierWarm {
+		t.Fatalf("expected TierWarm (MinTier), got %v", tier)
+	}
+}
+
+func TestController_UnknownAgentType(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	_, err = ac.EnsureActive(testCtx(t), "nonexistent")
+	if err != ErrUnknownAgentType {
+		t.Fatalf("expected ErrUnknownAgentType, got %v", err)
+	}
+}
+
+func TestController_Shutdown(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	_, _ = ac.EnsureActive(testCtx(t), "engineer")
+	_, _ = ac.EnsureActive(testCtx(t), "architect")
+
+	err = ac.Shutdown(testCtx(t))
+	if err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// All entries should be cold.
+	for _, agentType := range []string{"engineer", "architect"} {
+		tier, _ := ac.TierOf(agentType)
+		if tier != TierCold {
+			t.Fatalf("%s should be TierCold after shutdown, got %v", agentType, tier)
+		}
+	}
+
+	// Further activations should fail.
+	_, err = ac.EnsureActive(testCtx(t), "engineer")
+	if err != ErrControllerClosed {
+		t.Fatalf("expected ErrControllerClosed, got %v", err)
+	}
+}
+
+func TestController_RegisterPolicy_Runtime(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ac.RegisterPolicy(&ActivationPolicy{
+		AgentType: "librarian",
+		MinTier:   TierCold,
+	})
+
+	if ac.EntryCount() != 4 { // 3 from config + 1 new
+		t.Fatalf("expected 4 entries, got %d", ac.EntryCount())
+	}
+}
+
+func TestController_TouchActivity(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ac.TouchActivity("engineer")
+	entry, _ := ac.getEntry("engineer")
+	if entry.LastActive.Load() == 0 {
+		t.Fatal("expected non-zero last active after touch")
+	}
+}
+
+func TestController_Metrics(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+
+	// Cold start.
+	_, _ = ac.EnsureActive(ctx, "engineer")
+	// Hot hit.
+	_, _ = ac.EnsureActive(ctx, "engineer")
+	// Demote.
+	_ = ac.DemoteTo(ctx, "engineer", TierWarm)
+	// Warm start.
+	_, _ = ac.EnsureActive(ctx, "engineer")
+
+	snap := ac.Metrics().Snapshot()
+	if snap.ActivationsTotal != 3 {
+		t.Fatalf("expected 3 total, got %d", snap.ActivationsTotal)
+	}
+	if snap.ColdStarts != 1 {
+		t.Fatalf("expected 1 cold, got %d", snap.ColdStarts)
+	}
+	if snap.HotHits != 1 {
+		t.Fatalf("expected 1 hot, got %d", snap.HotHits)
+	}
+	if snap.WarmStarts != 1 {
+		t.Fatalf("expected 1 warm, got %d", snap.WarmStarts)
+	}
+}
+
+func TestController_EvictUnderPressure(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	// Use a pressure evaluator that always reports pressure.
+	ac.pressure = &alwaysPressured{}
+
+	ctx := testCtx(t)
+	_, _ = ac.EnsureActive(ctx, "engineer")
+	_, _ = ac.EnsureActive(ctx, "architect")
+
+	ac.EvictUnderPressure(ctx)
+
+	snap := ac.Metrics().Snapshot()
+	if snap.EvictionsByPressure == 0 {
+		t.Fatal("expected at least one eviction by pressure")
+	}
+}
+
+// alwaysPressured is a test double for PressureEvaluator.
+type alwaysPressured struct {
+	count atomic.Int32
+}
+
+func (a *alwaysPressured) IsUnderPressure() bool {
+	// Stop after first eviction to prevent infinite loop.
+	return a.count.Add(1) <= 3
+}
+
+func (a *alwaysPressured) Evaluate(entries []*ActivationEntry) []EvictionCandidate {
+	pe := NewPressureEvaluator(nil, nil, PressureConfig{})
+	return pe.Evaluate(entries)
+}
+
+func assertTier(t *testing.T, ac *ActivationController, agentType string, expected ActivationTier) {
+	t.Helper()
+	tier, err := ac.TierOf(agentType)
+	if err != nil {
+		t.Fatalf("TierOf(%s): %v", agentType, err)
+	}
+	if tier != expected {
+		t.Fatalf("expected %v for %s, got %v", expected, agentType, tier)
+	}
+}

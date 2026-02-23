@@ -132,6 +132,8 @@ func providerHasCredentials(provider string) bool {
 	switch provider {
 	case "google":
 		return hasGoogleOAuthCredentials() || hasGoogleServiceAccountCredentials()
+	case "anthropic":
+		return hasAnthropicOAuthCredentials()
 	case "openai":
 		return hasOpenAIOAuthCredentials()
 	default:
@@ -141,6 +143,12 @@ func providerHasCredentials(provider string) bool {
 
 func hasGoogleOAuthCredentials() bool {
 	authSvc := oauth.NewGoogleAuthService(oauth.GoogleAuthServiceConfig{})
+	_, err := authSvc.Resolve(context.Background())
+	return err == nil
+}
+
+func hasAnthropicOAuthCredentials() bool {
+	authSvc := oauth.NewAnthropicAuthService(oauth.AnthropicAuthServiceConfig{})
 	_, err := authSvc.Resolve(context.Background())
 	return err == nil
 }
@@ -284,6 +292,8 @@ func removeProviderOAuthCredential(provider string) (bool, error) {
 	switch provider {
 	case "google":
 		return removeGoogleOAuthCredential()
+	case "anthropic":
+		return removeAnthropicOAuthCredential()
 	case "openai":
 		return removeOpenAIOAuthCredential()
 	default:
@@ -293,6 +303,17 @@ func removeProviderOAuthCredential(provider string) (bool, error) {
 
 func removeGoogleOAuthCredential() (bool, error) {
 	authSvc := oauth.NewGoogleAuthService(oauth.GoogleAuthServiceConfig{})
+	if _, err := authSvc.Resolve(context.Background()); err != nil {
+		return false, nil
+	}
+	if err := authSvc.Delete(context.Background()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func removeAnthropicOAuthCredential() (bool, error) {
+	authSvc := oauth.NewAnthropicAuthService(oauth.AnthropicAuthServiceConfig{})
 	if _, err := authSvc.Resolve(context.Background()); err != nil {
 		return false, nil
 	}

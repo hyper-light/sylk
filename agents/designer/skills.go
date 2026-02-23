@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -21,6 +22,26 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(a11yAuditSkill(d))
 	d.skills.Register(a11yFixSuggestSkill(d))
 	d.skills.Register(contrastCheckSkill(d))
+	d.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "designer",
+		SessionID: func() string { return d.config.SessionID },
+		Publish:   d.publishRerouteRequest,
+	}))
+}
+
+func (d *Designer) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if d.bus == nil {
+		return fmt.Errorf("designer bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "designer",
+		SuggestedTarget: suggestedTarget,
+		SessionID:       d.config.SessionID,
+		ExcludeAgents:   []string{"designer"},
+	}
+	return d.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 type componentSearchParams struct {

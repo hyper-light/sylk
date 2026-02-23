@@ -3,7 +3,9 @@ package archivalist
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -23,12 +25,32 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Register(briefingSkill(a))
 	a.skills.Register(routeToSkill(a))
 	a.skills.Register(replyToSkill(a))
+	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "archivalist",
+		SessionID: func() string { return a.defaultSessionID },
+		Publish:   a.publishRerouteRequest,
+	}))
 
 	a.skills.Load("store")
 	a.skills.Load("query")
 	a.skills.Load("briefing")
 	a.skills.Load("route_to")
 	a.skills.Load("reply_to")
+}
+
+func (a *Archivalist) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if a.bus == nil {
+		return fmt.Errorf("archivalist bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "archivalist",
+		SuggestedTarget: suggestedTarget,
+		SessionID:       a.defaultSessionID,
+		ExcludeAgents:   []string{"archivalist"},
+	}
+	return a.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 func storeSkill(a *Archivalist) *skills.Skill {

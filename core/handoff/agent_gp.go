@@ -190,8 +190,8 @@ type AgentGaussianProcess struct {
 	priorMean *GPPriorMean
 
 	// Cache for the Cholesky decomposition of K + sigma_n^2 * I.
-	// This is recomputed when observations change.
-	choleskyL [][]float64
+	// Uses FlatMatrix for cache-coherent SIMD access.
+	choleskyL *FlatMatrix
 
 	// Cache for alpha = L^T \ (L \ y) used in prediction.
 	alpha []float64
@@ -315,30 +315,22 @@ func (gp *AgentGaussianProcess) predictLocked(queryFeatures []float64) *GPPredic
 		return gp.makePrediction(priorMean, priorVar)
 	}
 
-	// Compute k* = k(X, x*)
-	kStar := make([]float64, n)
-	for i, obs := range gp.observations {
-		kStar[i] = gp.matern25Kernel(obs.Features(), queryFeatures)
-	}
+	// Compute k* = k(X, x*) using SIMD-accelerated kernel vector.
+	kStar := KernelVectorFlat(queryFeatures, gp.observations, gp.hyperparams)
 
-	// Compute mean: m(x*) + k*^T * alpha
-	mean := gp.priorMeanValue(queryFeatures)
-	for i := 0; i < n; i++ {
-		mean += kStar[i] * gp.alpha[i]
-	}
+	// Compute mean: m(x*) + k*^T * alpha using SIMD dot product.
+	mean := gp.priorMeanValue(queryFeatures) + DotVek(kStar, gp.alpha)
 
 	// Compute variance: k(x*, x*) - k*^T * (K + sigma_n^2 I)^-1 * k*
 	// Using Cholesky: variance = k** - v^T * v where v = L^-1 * k*
 	kStarStar := gp.matern25Kernel(queryFeatures, queryFeatures)
 
-	// Solve L * v = k* for v
-	v := gp.solveTriangular(gp.choleskyL, kStar, false)
+	// Solve L * v = k* for v using SIMD-accelerated triangular solve.
+	v := make([]float64, n)
+	SolveTriangularFlat(gp.choleskyL, kStar, true, v)
 
-	// variance = k** - v^T * v
-	variance := kStarStar
-	for i := 0; i < n; i++ {
-		variance -= v[i] * v[i]
-	}
+	// variance = k** - v^T * v using SIMD dot product.
+	variance := kStarStar - DotVek(v, v)
 
 	// Ensure variance is non-negative (numerical stability)
 	if variance < 0 {
@@ -371,32 +363,15 @@ func (gp *AgentGaussianProcess) updateCache() {
 		return
 	}
 
-	// Build kernel matrix K
-	K := make([][]float64, n)
-	for i := 0; i < n; i++ {
-		K[i] = make([]float64, n)
-		for j := 0; j < n; j++ {
-			K[i][j] = gp.matern25Kernel(
-				gp.observations[i].Features(),
-				gp.observations[j].Features(),
-			)
-		}
-		// Add noise variance to diagonal
-		K[i][i] += gp.hyperparams.NoiseVariance
-	}
+	// Build kernel matrix K using SIMD-accelerated computation.
+	K := KernelMatrixFlat(gp.observations, gp.hyperparams)
 
 	// Compute Cholesky decomposition: K = L * L^T
-	L, err := gp.choleskyDecomposition(K)
+	// CholeskyFlat handles jitter internally on failure.
+	L, err := CholeskyFlat(K)
 	if err != nil {
-		// Numerical issues - add jitter and try again
-		for i := 0; i < n; i++ {
-			K[i][i] += 1e-6
-		}
-		L, err = gp.choleskyDecomposition(K)
-		if err != nil {
-			// Still failing - cache remains invalid
-			return
-		}
+		// Numerical issues even after jitter - cache remains invalid.
+		return
 	}
 	gp.choleskyL = L
 
@@ -407,11 +382,13 @@ func (gp *AgentGaussianProcess) updateCache() {
 		yMinusM[i] = obs.Quality - gp.priorMeanValue(obs.Features())
 	}
 
-	// Solve L * z = (y - m) for z
-	z := gp.solveTriangular(L, yMinusM, false)
+	// Solve L * z = (y - m) for z using SIMD-accelerated triangular solve.
+	z := make([]float64, n)
+	SolveTriangularFlat(L, yMinusM, true, z)
 
 	// Solve L^T * alpha = z for alpha
-	gp.alpha = gp.solveTriangular(L, z, true)
+	gp.alpha = make([]float64, n)
+	SolveTriangularFlat(L, z, false, gp.alpha)
 
 	gp.cacheValid = true
 }
@@ -444,26 +421,9 @@ func (gp *AgentGaussianProcess) matern25Kernel(x1, x2 []float64) float64 {
 }
 
 // scaledDistance computes the scaled Euclidean distance between two vectors.
-// Each dimension is scaled by its lengthscale.
+// Delegates to ScaledDistanceVek for SIMD-accelerated computation.
 func (gp *AgentGaussianProcess) scaledDistance(x1, x2 []float64) float64 {
-	sumSquared := 0.0
-	n := len(x1)
-	if len(x2) < n {
-		n = len(x2)
-	}
-	nL := len(gp.hyperparams.Lengthscales)
-
-	for d := 0; d < n; d++ {
-		diff := x1[d] - x2[d]
-		// Use the appropriate lengthscale, or the last one if index out of bounds
-		l := gp.hyperparams.Lengthscales[nL-1]
-		if d < nL {
-			l = gp.hyperparams.Lengthscales[d]
-		}
-		sumSquared += (diff * diff) / (l * l)
-	}
-
-	return math.Sqrt(sumSquared)
+	return ScaledDistanceVek(x1, x2, gp.hyperparams.Lengthscales)
 }
 
 // =============================================================================
@@ -707,83 +667,9 @@ func (gp *AgentGaussianProcess) GetPriorMean() *GPPriorMean {
 // Cholesky Decomposition and Linear Algebra Helpers
 // =============================================================================
 
-// choleskyDecomposition computes the Cholesky decomposition A = L * L^T.
-// Returns L such that A = L * L^T, where L is lower triangular.
-// Returns an error if A is not positive definite.
-func (gp *AgentGaussianProcess) choleskyDecomposition(A [][]float64) ([][]float64, error) {
-	n := len(A)
-	if n == 0 {
-		return nil, nil
-	}
-
-	L := make([][]float64, n)
-	for i := 0; i < n; i++ {
-		L[i] = make([]float64, n)
-	}
-
-	for i := 0; i < n; i++ {
-		for j := 0; j <= i; j++ {
-			sum := 0.0
-			for k := 0; k < j; k++ {
-				sum += L[i][k] * L[j][k]
-			}
-
-			if i == j {
-				// Diagonal element
-				val := A[i][i] - sum
-				if val <= 0 {
-					return nil, fmt.Errorf("matrix is not positive definite at index %d", i)
-				}
-				L[i][j] = math.Sqrt(val)
-			} else {
-				// Off-diagonal element
-				if L[j][j] == 0 {
-					return nil, fmt.Errorf("zero diagonal at index %d", j)
-				}
-				L[i][j] = (A[i][j] - sum) / L[j][j]
-			}
-		}
-	}
-
-	return L, nil
-}
-
-// solveTriangular solves L * x = b for x, where L is triangular.
-// If transpose is true, solves L^T * x = b instead.
-func (gp *AgentGaussianProcess) solveTriangular(
-	L [][]float64,
-	b []float64,
-	transpose bool,
-) []float64 {
-	n := len(b)
-	x := make([]float64, n)
-
-	if !transpose {
-		// Forward substitution: L * x = b
-		for i := 0; i < n; i++ {
-			sum := 0.0
-			for j := 0; j < i; j++ {
-				sum += L[i][j] * x[j]
-			}
-			if L[i][i] != 0 {
-				x[i] = (b[i] - sum) / L[i][i]
-			}
-		}
-	} else {
-		// Back substitution: L^T * x = b
-		for i := n - 1; i >= 0; i-- {
-			sum := 0.0
-			for j := i + 1; j < n; j++ {
-				sum += L[j][i] * x[j]
-			}
-			if L[i][i] != 0 {
-				x[i] = (b[i] - sum) / L[i][i]
-			}
-		}
-	}
-
-	return x
-}
+// NOTE: choleskyDecomposition and solveTriangular have been replaced by
+// CholeskyFlat and SolveTriangularFlat in gp_linalg.go, which use
+// FlatMatrix for cache-coherent layout and vek.Dot for SIMD acceleration.
 
 // =============================================================================
 // Hyperparameter Management
@@ -835,7 +721,7 @@ func (gp *AgentGaussianProcess) ClearObservations() {
 	gp.mu.Lock()
 	defer gp.mu.Unlock()
 
-	gp.observations = make([]*GPObservation, 0)
+	gp.observations = gp.observations[:0]
 	gp.choleskyL = nil
 	gp.alpha = nil
 	gp.cacheValid = false

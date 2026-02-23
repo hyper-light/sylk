@@ -37,6 +37,15 @@ const mockArchitectName = "Architect"
 // mockArchitectType is the agent type classification for the mock architect.
 const mockArchitectType = "architect"
 
+// seedOrchestratorID is the agent identifier for the orchestrator in seed data.
+const seedOrchestratorID = "orchestrator"
+
+// seedOrchestratorName is the display name for the orchestrator agent.
+const seedOrchestratorName = "Orchestrator"
+
+// seedOrchestratorType is the agent type classification for the orchestrator.
+const seedOrchestratorType = "orchestrator"
+
 // mockChunkDelay is the delay between streaming chunks.
 // Derived from: typical LLM token emission rate (~25 tokens/sec → 40ms).
 const mockChunkDelay = 40 * time.Millisecond
@@ -235,11 +244,17 @@ func (m *MockAgent) emitActivity(
 // Mock data seeding
 // ---------------------------------------------------------------------------
 
+// seedLiveAgents publishes activity events for the real agents so the agent
+// panel displays them from the moment the TUI starts. This runs for all modes
+// (mock and non-mock) and must be called after StartBridges.
+func seedLiveAgents(deps Deps) {
+	seedAgents(deps.ActivityBus)
+}
+
 // seedMockData pre-populates sessions and registers mock agents so the TUI
 // has content to display on startup.
 func seedMockData(deps Deps) {
 	seedSessions(deps.SessionManager)
-	seedAgents(deps.ActivityBus)
 }
 
 // mockSessionConfig holds the parameters for a single mock session.
@@ -290,6 +305,7 @@ func mockAgentSeeds() []mockAgentSeed {
 	return []mockAgentSeed{
 		{id: mockGuideID, name: mockGuideName, agentType: mockGuideType},
 		{id: mockArchitectID, name: mockArchitectName, agentType: mockArchitectType},
+		{id: seedOrchestratorID, name: seedOrchestratorName, agentType: seedOrchestratorType},
 	}
 }
 

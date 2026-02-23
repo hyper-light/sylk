@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -56,6 +57,25 @@ func (a *Architect) registerCoreSkills() {
 	a.skills.Register(lspHoverSkill(a))
 	a.skills.Register(lspSymbolsSkill(a))
 	a.skills.Register(lspCallHierarchySkill(a))
+	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
+		AgentID:   "architect",
+		SessionID: func() string { return "" },
+		Publish:   a.publishRerouteRequest,
+	}))
+}
+
+func (a *Architect) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
+	if a.bus == nil {
+		return fmt.Errorf("architect bus not available")
+	}
+	reroute := &guide.RerouteRequest{
+		OriginalInput:   originalInput,
+		Reason:          reason,
+		SourceAgentID:   "architect",
+		SuggestedTarget: suggestedTarget,
+		ExcludeAgents:   []string{"architect"},
+	}
+	return a.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
 type analyzeRequirementsParams struct {

@@ -4,19 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	corecontext "github.com/adalundhe/sylk/core/context"
 	"github.com/adalundhe/sylk/core/domain"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/messaging"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"golang.org/x/sync/singleflight"
-	"google.golang.org/genai"
 )
+
+const defaultAutoUpgradeInterval = 15 * time.Second
 
 // =============================================================================
 // Guide Agent
@@ -88,6 +93,32 @@ type Guide struct {
 	// Session metadata
 	sessionID string
 	agentID   string
+	// Session-scoped conversation flow tracking for interactive handoffs.
+	conversation *ConversationFlowManager
+
+	// Handoff bridge for context-exhaustion lifecycle management
+	handoffBridge *handoff.HandoffBridge
+
+	// Container activation hook — called before forwarding a request to
+	// an agent, triggering the ActivationController to ensure the target
+	// agent's container is hot.
+	activationHook func(ctx context.Context, agentType string) error
+
+	// Container activity hook — called after successful activation and on
+	// response handling to reset the idle timer, preventing active
+	// conversation agents from being demoted.
+	touchActivityHook func(agentType string)
+
+	// Service registry for health-aware routing. When set, isAgentHealthy
+	// uses healthy endpoints from the registry instead of the local
+	// readyAgents map.
+	serviceRegistry ServiceHealthChecker
+
+	// Self-managed Google provider lifecycle
+	googleConfig   *providers.GoogleConfig
+	googleProvider *providers.GoogleProvider
+	providerMu     sync.RWMutex
+	autoUpgradeWg  sync.WaitGroup
 
 	// Running state
 	running bool
@@ -95,6 +126,9 @@ type Guide struct {
 	runMu     sync.RWMutex
 	runCtx    context.Context
 	runCancel context.CancelFunc
+
+	requestCancelMu sync.Mutex
+	requestCancels  map[string]context.CancelFunc
 
 	classifyGroup singleflight.Group
 }
@@ -139,6 +173,18 @@ type Config struct {
 
 	// Optional local stream-manager configuration.
 	StreamConfig *StreamConfig
+
+	// Optional conversation-flow tuning for sticky follow-ups and completion signals.
+	ConversationFlowConfig *ConversationFlowConfig
+
+	// GoogleConfig enables self-managed provider lifecycle within the Guide.
+	// When set, RefreshAuth() rebuilds the classifier and responder from this config,
+	// and Start() auto-upgrades from rule-based to Gemini when credentials appear.
+	GoogleConfig *providers.GoogleConfig
+
+	// AutoUpgradeInterval controls the retry interval for background auto-upgrade
+	// from rule-based to Gemini classification. 0 uses defaultAutoUpgradeInterval.
+	AutoUpgradeInterval time.Duration
 }
 
 // DefaultConfig returns sensible defaults
@@ -184,7 +230,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 	})
 
 	skillsRegistry, loaderCfg, hookRegistry := buildSkills(cfg)
-	selfResponder := resolveGuideSelfResponder(cfg, nil)
+	selfResponder := resolveGuideSelfResponder(cfg, nil, nil)
 
 	guide := &Guide{
 		router:         router,
@@ -209,6 +255,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		selfResponder:  selfResponder,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
+		requestCancels: make(map[string]context.CancelFunc),
 	}
 
 	guide.registerCoreSkills()
@@ -275,7 +322,7 @@ func resolveRouteCacheConfig(cfg Config) RouteCacheConfig {
 func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.HookRegistry) {
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := guideSkillsLoaderConfig(cfg)
-	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents"}
+	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents", "self_diagnostic"}
 	skillsLoaderCfg.AutoLoadDomains = nil
 
 	hooks := skills.NewHookRegistry()
@@ -285,8 +332,9 @@ func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.Hoo
 	// even if they somehow leak into its context. We explicitly whitelist its approved tools.
 	allowedTools := map[string]bool{
 		"route": true, "clarify": true, "guide_route": true, "help": true, "status": true,
-		"agents": true, "route_to": true, "reply_to": true, "broadcast": true,
+		"agents": true, "conversation_context": true, "route_to": true, "reply_to": true, "broadcast": true,
 		"task_interact": true, "get_routing_history": true, "get_agent_capabilities": true,
+		"self_diagnostic": true,
 		"sessions": true, "metrics": true, "switch_session": true, "create_session": true, "close_session": true,
 	}
 
@@ -309,7 +357,7 @@ func guideSkillsLoaderConfig(cfg Config) skills.LoaderConfig {
 		return *cfg.SkillsConfig
 	}
 	skillsLoaderCfg.MaxLoadedSkills = 10
-	skillsLoaderCfg.TokenBudget = 2000
+	skillsLoaderCfg.TokenBudget = 2600
 	return skillsLoaderCfg
 }
 
@@ -352,7 +400,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 	})
 
 	skillsRegistry, loaderCfg, hookRegistry := buildSkills(cfg)
-	selfResponder := resolveGuideSelfResponder(cfg, nil)
+	selfResponder := resolveGuideSelfResponder(cfg, nil, nil)
 
 	guide := &Guide{
 		router:         router,
@@ -375,8 +423,10 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		skillLoader:    nil,
 		hooks:          hookRegistry,
 		selfResponder:  selfResponder,
+		googleConfig:   cfg.GoogleConfig,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
+		requestCancels: make(map[string]context.CancelFunc),
 	}
 
 	guide.registerCoreSkills()
@@ -404,8 +454,8 @@ func NewWithAPIKey(apiKey string, cfg Config) (*Guide, error) {
 	return New(&client, cfg)
 }
 
-// NewWithGeminiClient creates a new Guide agent with a Gemini client
-func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
+// NewWithGeminiClient creates a new Guide agent with a Google provider.
+func NewWithGeminiClient(provider *providers.GoogleProvider, cfg Config) (*Guide, error) {
 	cfg = ensureRouterConfig(cfg)
 	if err := validateBus(cfg); err != nil {
 		return nil, err
@@ -416,7 +466,7 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 	routing.RegisterAgent(GuideRoutingInfo())
 
 	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
-	classifier := NewGeminiClassifier(client, cfg.RouterConfig)
+	classifier := NewGeminiClassifier(provider, cfg.RouterConfig)
 	router := &Router{
 		config:            cfg.RouterConfig,
 		parser:            parser,
@@ -442,7 +492,7 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 	})
 
 	skillsRegistry, loaderCfg, hookRegistry := buildSkills(cfg)
-	selfResponder := resolveGuideSelfResponder(cfg, client)
+	selfResponder := resolveGuideSelfResponder(cfg, provider, nil)
 
 	guide := &Guide{
 		router:         router,
@@ -465,13 +515,19 @@ func NewWithGeminiClient(client *genai.Client, cfg Config) (*Guide, error) {
 		skillLoader:    nil,
 		hooks:          hookRegistry,
 		selfResponder:  selfResponder,
+		googleConfig:   cfg.GoogleConfig,
+		googleProvider: provider,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
+		requestCancels: make(map[string]context.CancelFunc),
 	}
 
 	guide.registerCoreSkills()
 	guide.registerExtendedSkills()
 	guide.skillLoader = skills.NewLoader(guide.skills, loaderCfg)
+	if cfg.SelfResponder == nil {
+		guide.selfResponder = resolveGuideSelfResponder(cfg, provider, guide)
+	}
 	if err := guide.initRuntimeExtensions(cfg); err != nil {
 		return nil, err
 	}
@@ -484,6 +540,7 @@ func (g *Guide) initRuntimeExtensions(cfg Config) error {
 	g.routeVersions = NewRouteVersionStore(g.routeCache)
 	g.enrichment = NewEnrichmentService(g.bus, g.registry, g.health)
 	g.streams = newGuideStreamManager(cfg.StreamConfig)
+	g.conversation = newGuideConversationFlow(cfg.ConversationFlowConfig)
 	domainClassifier, err := newGuideDomainClassifier(cfg.DomainClassifierConfig)
 	if err != nil {
 		return err
@@ -547,26 +604,397 @@ func (g *Guide) ensureRequestDefaults(request *RouteRequest) {
 }
 
 func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest) (*RouteResult, string, error) {
-	if request.TargetAgentID != "" {
-		classification := &RouteResult{
-			TargetAgent:          TargetAgent(request.TargetAgentID),
-			Confidence:           1.0,
-			ClassificationMethod: "explicit",
+	g.observeUserConversationSignal(request)
+	ctx = g.augmentClassificationContext(ctx, request)
+
+	// Fast-path: when an active conversation agent has high ACT-R activation
+	// and no explicit target was specified, skip LLM classification entirely.
+	if !request.ExplicitTarget && request.TargetAgentID == "" {
+		if result, target, ok := g.tryConversationFastPath(request); ok {
+			return result, target, nil
 		}
-		return classification, request.TargetAgentID, nil
+	}
+
+	if request.TargetAgentID != "" {
+		classification := g.explicitTargetClassification(request.TargetAgentID)
+		classification.Domain = g.supportedDomainForTarget(request.TargetAgentID, classification.Domain, classification.Intent)
+		classification, targetAgentID := g.ensureRoutableClassification(classification, request.TargetAgentID)
+		// Explicit non-guide targets should bypass conversation-flow remapping.
+		// Explicit "guide" requests still represent "route this through guide",
+		// so follow-up continuity should remain active.
+		if request.ExplicitTarget && !explicitGuideFollowupAllowed(request.TargetAgentID) {
+			g.observeRoutedConversationTarget(request, targetAgentID)
+		} else if explicitGuideFollowupAllowed(request.TargetAgentID) {
+			classification, targetAgentID = g.applyConversationFlow(request, classification, targetAgentID)
+		} else {
+			g.observeRoutedConversationTarget(request, targetAgentID)
+		}
+		return classification, targetAgentID, nil
 	}
 
 	domainCtx := g.preclassifyDomain(ctx, request)
 	if request.SessionID != "" && g.sessionRouter != nil {
-		return g.classifyWithSingleflight(ctx, request, domainCtx, true)
+		classification, targetAgentID, err := g.classifyWithSingleflight(ctx, request, domainCtx, true)
+		if err != nil {
+			return nil, "", err
+		}
+		classification, targetAgentID = g.finalizeClassificationWithExclude(ctx, request.Input, classification, targetAgentID)
+		classification, targetAgentID = g.applyConversationFlow(request, classification, targetAgentID)
+		return classification, targetAgentID, nil
 	}
 
 	classification, targetAgentID, ok := g.cachedClassification(request)
 	if ok {
-		return g.applyDomainHints(classification, domainCtx), targetAgentID, nil
+		classification = g.applyDomainHints(classification, domainCtx)
+		classification, targetAgentID = g.finalizeClassificationWithExclude(ctx, request.Input, classification, targetAgentID)
+		classification, targetAgentID = g.applyConversationFlow(request, classification, targetAgentID)
+		return classification, targetAgentID, nil
 	}
 
-	return g.classifyWithSingleflight(ctx, request, domainCtx, false)
+	classification, targetAgentID, err := g.classifyWithSingleflight(ctx, request, domainCtx, false)
+	if err != nil {
+		return nil, "", err
+	}
+	classification, targetAgentID = g.finalizeClassificationWithExclude(ctx, request.Input, classification, targetAgentID)
+	classification, targetAgentID = g.applyConversationFlow(request, classification, targetAgentID)
+	return classification, targetAgentID, nil
+}
+
+// tryConversationFastPath checks whether the conversation flow manager has a
+// strong enough active agent to skip LLM classification entirely. Returns a
+// synthetic RouteResult, the target agent ID, and true when the fast-path fires.
+func (g *Guide) tryConversationFastPath(request *RouteRequest) (*RouteResult, string, bool) {
+	if g == nil || g.conversation == nil || request == nil {
+		return nil, "", false
+	}
+	activeAgentID, ok := g.conversation.IsActiveForFastPath(request.SessionID)
+	if !ok {
+		return nil, "", false
+	}
+	if g.isGuideTarget(activeAgentID) {
+		return nil, "", false
+	}
+	if g.registry != nil && g.registry.Get(activeAgentID) == nil {
+		return nil, "", false
+	}
+	result := &RouteResult{
+		TargetAgent:          TargetAgent(activeAgentID),
+		Intent:               IntentChat,
+		Domain:               DomainGeneral,
+		Confidence:           0.85,
+		Action:               RouteActionExecute,
+		ClassificationMethod: "conversation_fast_path",
+		Reason:               "active conversation agent with high activation score",
+	}
+	result.Intent = g.supportedIntentForTarget(activeAgentID, result.Intent)
+	result.Domain = g.supportedDomainForTarget(activeAgentID, result.Domain, result.Intent)
+	g.observeRoutedConversationTarget(request, activeAgentID)
+	return result, activeAgentID, true
+}
+
+func (g *Guide) explicitTargetClassification(targetAgentID string) *RouteResult {
+	target := strings.TrimSpace(targetAgentID)
+	return &RouteResult{
+		TargetAgent:          TargetAgent(target),
+		Intent:               IntentHelp,
+		Domain:               DomainGeneral,
+		Confidence:           1.0,
+		Action:               RouteActionExecute,
+		ClassificationMethod: "explicit",
+		Reason:               "explicit target requested",
+	}
+}
+
+func explicitGuideFollowupAllowed(targetAgentID string) bool {
+	target := strings.ToLower(strings.TrimSpace(targetAgentID))
+	return target == "guide" || target == "g"
+}
+
+func (g *Guide) augmentClassificationContext(ctx context.Context, request *RouteRequest) context.Context {
+	if g == nil || request == nil || g.conversation == nil {
+		return ctx
+	}
+	snapshot, ok := g.conversation.Snapshot(request.SessionID)
+	if !ok {
+		return ctx
+	}
+	return withClassificationContext(ctx, ClassificationContext{
+		SessionID:               request.SessionID,
+		ActiveConversationAgent: snapshot.ActiveAgentID,
+		ActiveConversationTurns: snapshot.Turns,
+		ActiveConversationAge:   int(snapshot.Age.Seconds()),
+		ActiveConversationScore: snapshot.ActivationHint,
+	})
+}
+
+func (g *Guide) finalizeClassification(input string, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
+	classification, targetAgentID = g.ensureRoutableClassification(classification, targetAgentID)
+	return g.applyGuidePreferencePolicy(input, classification, targetAgentID)
+}
+
+// finalizeClassificationWithExclude wraps finalizeClassification and checks
+// the reroute exclude list. If the classified target is excluded, picks the
+// next best match from the agent registry.
+func (g *Guide) finalizeClassificationWithExclude(
+	ctx context.Context,
+	input string,
+	classification *RouteResult,
+	targetAgentID string,
+) (*RouteResult, string) {
+	classification, targetAgentID = g.finalizeClassification(input, classification, targetAgentID)
+	excludeAgents := rerouteExcludeAgentsFromContext(ctx)
+	if len(excludeAgents) == 0 {
+		return classification, targetAgentID
+	}
+	if !isExcludedAgent(targetAgentID, excludeAgents) {
+		return classification, targetAgentID
+	}
+	// Target is excluded — try to find an alternative via the registry.
+	if g.registry != nil {
+		for _, reg := range g.registry.GetAll() {
+			if reg.ID == targetAgentID || isExcludedAgent(reg.ID, excludeAgents) {
+				continue
+			}
+			if reg.Accepts(classification) {
+				classification.TargetAgent = TargetAgent(reg.ID)
+				classification.Reason = "rerouted away from excluded agent " + targetAgentID
+				return classification, reg.ID
+			}
+		}
+	}
+	// No alternative found — fall back to Guide self-response.
+	fallback := g.guideFallbackClassification(classification)
+	return fallback, string(fallback.TargetAgent)
+}
+
+func isExcludedAgent(agentID string, excludeAgents []string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(agentID))
+	for _, excluded := range excludeAgents {
+		if strings.EqualFold(strings.TrimSpace(excluded), normalized) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *Guide) ensureRoutableClassification(classification *RouteResult, targetAgentID string) (*RouteResult, string) {
+	target := classificationTargetAgentID(targetAgentID, classification)
+	classification = g.normalizeConversationalIntentForTarget(classification, target)
+	if g.classificationSupportedByTarget(classification, target) {
+		return classification, target
+	}
+	fallback := g.guideFallbackClassification(classification)
+	return fallback, string(fallback.TargetAgent)
+}
+
+func (g *Guide) normalizeConversationalIntentForTarget(
+	classification *RouteResult,
+	targetAgentID string,
+) *RouteResult {
+	if classification == nil || targetAgentID == "" || g.isGuideTarget(targetAgentID) {
+		return classification
+	}
+	if classification.Intent != IntentChat {
+		return classification
+	}
+	// Keep chat when target explicitly supports it.
+	if g.agentSupportsIntent(targetAgentID, IntentChat) {
+		return classification
+	}
+	// Promote chat to help for specialists that support conversational help but
+	// do not advertise chat intent.
+	if !g.agentSupportsIntent(targetAgentID, IntentHelp) {
+		return classification
+	}
+	promoted := *classification
+	promoted.Intent = IntentHelp
+	return &promoted
+}
+
+func (g *Guide) applyGuidePreferencePolicy(input string, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
+	if !preferGuideTargetForClassification(input, classification, targetAgentID) {
+		return classification, targetAgentID
+	}
+	// If the classifier says IntentChat but the target agent supports
+	// IntentHelp (conversational), promote the intent and forward instead
+	// of redirecting to guide. This lets agents like the architect handle
+	// substantive conversations without being blocked by the chat policy.
+	if classification.Intent == IntentChat && g.agentSupportsIntent(targetAgentID, IntentHelp) {
+		promoted := *classification
+		promoted.Intent = IntentHelp
+		return &promoted, targetAgentID
+	}
+	fallback := g.guideFallbackClassification(classification)
+	return fallback, string(fallback.TargetAgent)
+}
+
+func preferGuideTargetForClassification(input string, classification *RouteResult, targetAgentID string) bool {
+	if classification == nil || targetAgentID == "" {
+		return false
+	}
+	if strings.EqualFold(targetAgentID, "guide") || strings.EqualFold(targetAgentID, "g") {
+		return false
+	}
+	if classification.Intent == IntentChat {
+		return true
+	}
+	return isGuideSystemMetaStatus(input, classification)
+}
+
+func isGuideSystemMetaStatus(input string, classification *RouteResult) bool {
+	if classification == nil || classification.Intent != IntentStatus {
+		return false
+	}
+	query := normalizeGuideQuery(input)
+	if query == "" {
+		return false
+	}
+	hasAgentSignal := containsAny(query, "agent", "registry")
+	hasGuideSignal := containsAny(query, "guide", "sylk")
+	return hasAgentSignal || hasGuideSignal
+}
+
+func classificationTargetAgentID(targetAgentID string, classification *RouteResult) string {
+	if targetAgentID != "" {
+		return targetAgentID
+	}
+	if classification == nil {
+		return ""
+	}
+	return string(classification.TargetAgent)
+}
+
+func (g *Guide) classificationSupportedByTarget(classification *RouteResult, targetAgentID string) bool {
+	if classification == nil || targetAgentID == "" {
+		return false
+	}
+	if g.isGuideTarget(targetAgentID) {
+		return true
+	}
+	return g.agentSupportsIntent(targetAgentID, classification.Intent)
+}
+
+func (g *Guide) agentSupportsIntent(targetAgentID string, intent Intent) bool {
+	if g == nil || g.registry == nil || intent == "" || intent == IntentUnknown {
+		return false
+	}
+	agent := g.registry.Get(targetAgentID)
+	if agent == nil {
+		return false
+	}
+	return agent.Capabilities.SupportsIntent(intent)
+}
+
+func (g *Guide) agentSupportsDomain(targetAgentID string, domain Domain) bool {
+	if g == nil || g.registry == nil || domain == "" || domain == DomainUnknown {
+		return false
+	}
+	agent := g.registry.Get(targetAgentID)
+	if agent == nil {
+		return false
+	}
+	return agent.Capabilities.SupportsDomain(domain)
+}
+
+func (g *Guide) supportedDomainForTarget(targetAgentID string, current Domain, intent Intent) Domain {
+	if strings.TrimSpace(targetAgentID) == "" || g.isGuideTarget(targetAgentID) {
+		return current
+	}
+	if g.agentSupportsDomain(targetAgentID, current) {
+		return current
+	}
+	candidates := candidateDomainsForIntent(intent)
+	for _, candidate := range candidates {
+		if g.agentSupportsDomain(targetAgentID, candidate) {
+			return candidate
+		}
+	}
+	if g == nil || g.registry == nil {
+		return current
+	}
+	agent := g.registry.Get(targetAgentID)
+	if agent == nil || len(agent.Capabilities.Domains) == 0 {
+		return current
+	}
+	return agent.Capabilities.Domains[0]
+}
+
+func candidateDomainsForIntent(intent Intent) []Domain {
+	switch intent {
+	case IntentPlan, IntentDesign:
+		return []Domain{DomainDesign, DomainTasks, DomainGeneral}
+	case IntentCheck:
+		return []Domain{DomainCode, DomainDesign, DomainGeneral}
+	case IntentRecall:
+		return []Domain{DomainHistory, DomainGeneral}
+	case IntentFind, IntentSearch:
+		return []Domain{DomainLocal, DomainCode, DomainGeneral}
+	case IntentStatus:
+		return []Domain{DomainSystem, DomainGeneral}
+	default:
+		return []Domain{DomainGeneral, DomainSystem}
+	}
+}
+
+func (g *Guide) guideFallbackClassification(classification *RouteResult) *RouteResult {
+	if classification == nil {
+		return &RouteResult{
+			Intent:               IntentHelp,
+			Domain:               DomainGeneral,
+			TargetAgent:          g.guideTargetAgent(),
+			Confidence:           0.51,
+			Action:               RouteActionExecute,
+			ClassificationMethod: "guide_fallback",
+			Reason:               "routing fallback to guide for clarification",
+		}
+	}
+	fallback := *classification
+	fallback.Intent = guideFallbackIntent(classification.Intent)
+	fallback.Domain = guideFallbackDomain(classification.Domain, fallback.Intent)
+	fallback.TargetAgent = g.guideTargetAgent()
+	fallback.Rejected = false
+	fallback.Action = RouteActionExecute
+	fallback.Reason = "routing fallback to guide for clarification"
+	if fallback.Confidence <= 0 {
+		fallback.Confidence = 0.51
+	}
+	fallback.ClassificationMethod = fallbackClassificationMethod(fallback.ClassificationMethod)
+	return &fallback
+}
+
+func guideFallbackIntent(current Intent) Intent {
+	switch current {
+	case IntentChat:
+		return IntentChat
+	case IntentStatus:
+		return IntentStatus
+	default:
+		return IntentHelp
+	}
+}
+
+func guideFallbackDomain(current Domain, intent Intent) Domain {
+	if intent == IntentStatus {
+		return DomainSystem
+	}
+	if current == DomainGeneral {
+		return DomainGeneral
+	}
+	return DomainGeneral
+}
+
+func fallbackClassificationMethod(current string) string {
+	if current == "" {
+		return "guide_fallback"
+	}
+	return current + "+guide_fallback"
+}
+
+func (g *Guide) guideTargetAgent() TargetAgent {
+	if g != nil && g.agentID != "" {
+		return TargetAgent(g.agentID)
+	}
+	return TargetGuide
 }
 
 type classificationTuple struct {
@@ -779,7 +1207,7 @@ func (g *Guide) resolveCorrelationID(request *RouteRequest) string {
 }
 
 func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *RouteResult, correlationID string) *ForwardedRequest {
-	return &ForwardedRequest{
+	fwd := &ForwardedRequest{
 		CorrelationID:        correlationID,
 		ParentCorrelationID:  request.ParentCorrelationID,
 		Input:                request.Input,
@@ -794,7 +1222,16 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		Confidence:           classification.Confidence,
 		ClassificationMethod: classification.ClassificationMethod,
 		CrossDomain:          classification.CrossDomain,
+		ConversationHistory:  g.conversationHistory(request.SessionID, string(classification.TargetAgent)),
 	}
+	return fwd
+}
+
+func (g *Guide) conversationHistory(sessionID string, targetAgentID string) []ConversationTurn {
+	if g == nil || g.conversation == nil || sessionID == "" {
+		return nil
+	}
+	return g.conversation.HistoryForSessionAgent(sessionID, targetAgentID)
 }
 
 func (g *Guide) attachEnrichment(
@@ -1179,7 +1616,7 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 // subscribeToAgentChannels subscribes to an agent's response and error channels
 func (g *Guide) subscribeToAgentChannels(agentID string, channels *AgentChannels) (*agentSubscriptions, error) {
 	// Subscribe to responses channel
-	respSub, err := g.bus.SubscribeAsync(channels.Responses, g.handleResponseMessage)
+	respSub, err := g.bus.Subscribe(channels.Responses, g.handleResponseMessage)
 	if err != nil {
 		return nil, fmt.Errorf("failed to subscribe to %s: %w", channels.Responses, err)
 	}
@@ -1356,7 +1793,56 @@ func (g *Guide) Start(ctx context.Context) error {
 	}
 
 	g.running = true
+	if err := g.subscribeRegisteredAgentChannels(); err != nil {
+		_ = g.requestSub.Unsubscribe()
+		g.requestSub = nil
+		g.stopResilience()
+		g.running = false
+		return err
+	}
+
+	// If started with a rule-based classifier and a GoogleConfig is available,
+	// launch a background goroutine to auto-upgrade to Gemini classification
+	// once credentials become available.
+	if g.googleConfig != nil && g.googleProvider == nil {
+		g.startAuthAutoUpgrade()
+	}
+
 	return nil
+}
+
+func (g *Guide) subscribeRegisteredAgentChannels() error {
+	if g == nil || g.bus == nil {
+		return nil
+	}
+	channelsByAgent := g.agentChannels.Snapshot()
+	created := make([]*agentSubscriptions, 0, len(channelsByAgent))
+	for agentID, channels := range channelsByAgent {
+		if channels == nil {
+			continue
+		}
+		if _, exists := g.agentSubs.Get(agentID); exists {
+			continue
+		}
+		subs, err := g.subscribeToAgentChannels(agentID, channels)
+		if err != nil {
+			g.unsubscribeAgentSubsBatch(created)
+			return fmt.Errorf("failed to subscribe to %s channels: %w", agentID, err)
+		}
+		g.agentSubs.Set(agentID, subs)
+		created = append(created, subs)
+	}
+	return nil
+}
+
+func (g *Guide) unsubscribeAgentSubsBatch(subs []*agentSubscriptions) {
+	if len(subs) == 0 {
+		return
+	}
+	var errs []error
+	for _, sub := range subs {
+		g.unsubscribeAgentSubs(&errs, sub)
+	}
 }
 
 // Stop unsubscribes from event bus topics and stops message processing.
@@ -1382,6 +1868,7 @@ func (g *Guide) stopComponents() error {
 
 func (g *Guide) stopResilience() {
 	g.cancelRunContext()
+	g.autoUpgradeWg.Wait()
 	g.pendingCleanup.Stop()
 	g.health.Stop()
 	if g.streams != nil {
@@ -1464,34 +1951,164 @@ func (g *Guide) handleRequestMessage(msg *Message) error {
 	if err := ctx.Err(); err != nil {
 		return nil
 	}
-
-	if msg.Type != MessageTypeRequest {
+	switch msg.Type {
+	case MessageTypeRequest:
+		return g.handleRouteRequestMessage(ctx, msg)
+	case MessageTypeReroute:
+		return g.handleRerouteMessage(ctx, msg)
+	case MessageTypeUserInterrupt:
+		return g.handleUserInterruptMessage(msg)
+	default:
 		return nil
 	}
+}
 
+func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) error {
 	req, ok := msg.GetRouteRequest()
 	if !ok {
 		return fmt.Errorf("invalid request payload")
 	}
+	if req == nil {
+		return nil
+	}
+	correlationID := routeCorrelationID(msg, req)
+	req.CorrelationID = correlationID
+	reqCtx, cancel := context.WithCancel(ctx)
+	g.registerRequestCancel(correlationID, cancel)
+	defer g.clearRequestCancel(correlationID)
+	defer cancel()
 
-	forwarded, err := g.routeWithRetry(ctx, req, msg.CorrelationID, req.SourceAgentID)
+	reqCtx = providers.WithRetryObserver(reqCtx, func(event providers.RetryEvent) {
+		g.publishRetryStatus(correlationID, req.SourceAgentID, RetryStatus{
+			Attempt:     event.Attempt,
+			MaxAttempts: event.MaxAttempts,
+			Delay:       event.Delay,
+			Err:         event.Err,
+		})
+	})
+
+	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID)
 	if err != nil {
 		if g.isInterruptError(err) {
 			return nil
 		}
-		return g.publishRouteError(msg.CorrelationID, req.SourceAgentID, err)
+		return g.publishRouteError(correlationID, req.SourceAgentID, err)
 	}
-
 	pending := g.pending.Get(forwarded.CorrelationID)
 	if pending == nil {
 		return fmt.Errorf("no pending request found for correlation ID: %s", forwarded.CorrelationID)
 	}
-
 	if g.isGuideTarget(pending.TargetAgentID) {
-		return g.respondToGuideRequest(ctx, pending, req)
+		return g.respondToGuideRequest(reqCtx, pending, req)
+	}
+	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID)
+	return g.publishForwardedRequest(pending.TargetAgentID, forwarded)
+}
+
+func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
+	reroute, ok := msg.GetRerouteRequest()
+	if !ok || reroute == nil {
+		return fmt.Errorf("invalid reroute payload")
 	}
 
+	// Break conversation stickiness so the fast-path won't fire.
+	if g.conversation != nil && reroute.SessionID != "" {
+		g.conversation.Clear(reroute.SessionID)
+	}
+
+	// Build a fresh RouteRequest from the reroute payload.
+	req := &RouteRequest{
+		Input:         reroute.OriginalInput,
+		SourceAgentID: reroute.SourceAgentID,
+		SessionID:     reroute.SessionID,
+		Timestamp:     msg.Timestamp,
+	}
+
+	// If the source agent suggested a target, try that first.
+	if reroute.SuggestedTarget != "" {
+		req.TargetAgentID = reroute.SuggestedTarget
+	}
+
+	g.ensureRequestDefaults(req)
+	correlationID := generateMessageID()
+	req.CorrelationID = correlationID
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	g.registerRequestCancel(correlationID, cancel)
+	defer g.clearRequestCancel(correlationID)
+	defer cancel()
+
+	// Inject exclude list into context for loop prevention.
+	reqCtx = withRerouteExcludeAgents(reqCtx, reroute.ExcludeAgents)
+
+	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID)
+	if err != nil {
+		if g.isInterruptError(err) {
+			return nil
+		}
+		return g.publishRouteError(correlationID, req.SourceAgentID, err)
+	}
+
+	// Publish reroute notification for UI.
+	g.publishRerouteEvent(correlationID, req.SourceAgentID, reroute)
+
+	pending := g.pending.Get(forwarded.CorrelationID)
+	if pending == nil {
+		return fmt.Errorf("no pending request found for rerouted correlation ID: %s", forwarded.CorrelationID)
+	}
+	if g.isGuideTarget(pending.TargetAgentID) {
+		return g.respondToGuideRequest(reqCtx, pending, req)
+	}
+	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID)
 	return g.publishForwardedRequest(pending.TargetAgentID, forwarded)
+}
+
+func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute *RerouteRequest) {
+	if g == nil || g.bus == nil || reroute == nil {
+		return
+	}
+	event := &StreamEvent{
+		Type: StreamEventReroute,
+		Data: map[string]string{
+			"from_agent": reroute.SourceAgentID,
+			"to_agent":   reroute.SuggestedTarget,
+			"reason":     reroute.Reason,
+		},
+	}
+	resp := &StreamResponse{
+		CorrelationID:     correlationID,
+		RespondingAgentID: "guide",
+		TargetAgentID:     sourceAgentID,
+		Event:             event,
+	}
+	msg := &Message{
+		ID:            generateMessageID(),
+		CorrelationID: correlationID,
+		Type:          MessageTypeStream,
+		Payload:       resp,
+		SourceAgentID: "guide",
+		TargetAgentID: sourceAgentID,
+		Timestamp:     time.Now(),
+	}
+	_ = g.bus.Publish(TopicGuideResponses, msg)
+}
+
+// rerouteExcludeKey is the context key for reroute excluded agent IDs.
+type rerouteExcludeKey struct{}
+
+func withRerouteExcludeAgents(ctx context.Context, agents []string) context.Context {
+	if len(agents) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, rerouteExcludeKey{}, agents)
+}
+
+func rerouteExcludeAgentsFromContext(ctx context.Context) []string {
+	if ctx == nil {
+		return nil
+	}
+	agents, _ := ctx.Value(rerouteExcludeKey{}).([]string)
+	return agents
 }
 
 func (g *Guide) isGuideTarget(targetAgentID string) bool {
@@ -1500,8 +2117,42 @@ func (g *Guide) isGuideTarget(targetAgentID string) bool {
 		strings.EqualFold(targetAgentID, "g")
 }
 
+func routeCorrelationID(msg *Message, req *RouteRequest) string {
+	if req != nil && strings.TrimSpace(req.CorrelationID) != "" {
+		return strings.TrimSpace(req.CorrelationID)
+	}
+	if msg != nil && strings.TrimSpace(msg.CorrelationID) != "" {
+		return strings.TrimSpace(msg.CorrelationID)
+	}
+	return generateMessageID()
+}
+
 func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingRequest, req *RouteRequest) error {
-	reply, err := g.generateGuideReply(ctx, req.Input, pending.CorrelationID, pending.SourceAgentID)
+	g.publishGuideStreamStart(pending.CorrelationID, pending.SourceAgentID)
+	ctx = withGuideThoughtEmitter(ctx, func(thought string) {
+		g.publishGuideStreamProgress(pending.CorrelationID, pending.SourceAgentID, thought)
+	})
+	ctx = withGuideEarlyUsageEmitter(ctx, func(inputTokens int) {
+		g.publishGuideStreamEarlyUsage(pending.CorrelationID, pending.SourceAgentID, inputTokens)
+	})
+	ctx = providers.WithRetryObserver(ctx, func(event providers.RetryEvent) {
+		g.publishRetryStatus(pending.CorrelationID, pending.SourceAgentID, RetryStatus{
+			Attempt:     event.Attempt,
+			MaxAttempts: event.MaxAttempts,
+			Delay:       event.Delay,
+			Err:         event.Err,
+		})
+	})
+	reply, usage, err := g.generateGuideReply(
+		ctx,
+		req.Input,
+		req.SessionID,
+		pending.CorrelationID,
+		pending.SourceAgentID,
+		func(chunk string) {
+			g.publishGuideStreamChunk(pending.CorrelationID, pending.SourceAgentID, chunk)
+		},
+	)
 	resp := &RouteResponse{
 		CorrelationID:       pending.CorrelationID,
 		RespondingAgentID:   g.agentID,
@@ -1510,9 +2161,11 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 	if err != nil {
 		resp.Success = false
 		resp.Error = err.Error()
+		g.publishGuideStreamError(pending.CorrelationID, pending.SourceAgentID, err)
 	} else {
 		resp.Success = true
 		resp.Data = reply
+		g.publishGuideStreamComplete(pending.CorrelationID, pending.SourceAgentID, usage)
 	}
 	resolved, handleErr := g.HandleResponse(ctx, resp)
 	if handleErr != nil {
@@ -1521,32 +2174,33 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 	return g.publishResponseToSource(resolved.SourceAgentID, resp)
 }
 
-func (g *Guide) generateGuideReply(ctx context.Context, input, correlationID, sourceAgentID string) (string, error) {
-	request := g.newGuideSelfResponseRequest(input)
+func (g *Guide) generateGuideReply(
+	ctx context.Context,
+	input string,
+	sessionID string,
+	_ string,
+	_ string,
+	onChunk func(string),
+) (string, *StreamUsage, error) {
+	request := g.newGuideSelfResponseRequest(input, sessionID)
 	responder := g.guideSelfResponder()
-	cfg := respondRetryConfig()
-	var lastErr error
-	for attempt := range cfg.MaxRetries {
-		reply, err := responder.Respond(ctx, request)
-		if err == nil {
-			return strings.TrimSpace(reply), nil
+	reply, providerUsage, err := RespondGuideSelf(ctx, responder, request, func(chunk string) error {
+		if onChunk != nil {
+			onChunk(chunk)
 		}
-		lastErr = err
-		if !isRetryableAPIError(err) || attempt == cfg.MaxRetries-1 {
-			return "", lastErr
-		}
-		g.publishRetryStatus(correlationID, sourceAgentID, RetryStatus{
-			Attempt:     attempt + 1,
-			MaxAttempts: cfg.MaxRetries,
-			Err:         err,
-		})
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(retryBackoffDuration(attempt, cfg)):
+		return nil
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	var usage *StreamUsage
+	if providerUsage != nil {
+		usage = &StreamUsage{
+			InputTokens:  providerUsage.InputTokens,
+			OutputTokens: providerUsage.OutputTokens,
 		}
 	}
-	return "", lastErr
+	return strings.TrimSpace(reply), usage, nil
 }
 
 func (g *Guide) guideSelfResponder() GuideSelfResponder {
@@ -1574,45 +2228,192 @@ func (g *Guide) SetClassifier(classifier ClassifierService) {
 	g.router.SetClassifier(classifier)
 }
 
-func (g *Guide) newGuideSelfResponseRequest(input string) GuideSelfResponseRequest {
-	return GuideSelfResponseRequest{
-		Input:              input,
-		AgentID:            g.agentID,
-		PendingRequests:    g.pending.Count(),
-		RegisteredAgentIDs: g.registeredAgentIDs(),
+// RefreshAuth rebuilds the classifier and self-responder from the stored
+// GoogleConfig by creating a fresh provider. This is the Guide's equivalent
+// of Architect.RefreshPlannerAuth(): the caller only needs to say "credentials
+// changed" — the Guide handles all internal reconstruction.
+func (g *Guide) RefreshAuth(ctx context.Context) error {
+	return g.refreshAuthWithMode(ctx, "", false)
+}
+
+// RefreshAuthWithMethod rebuilds auth-sensitive runtime components using the
+// login method that triggered refresh. OAuth refreshes are strict: if provider
+// construction silently falls back to a different auth mode, the refresh fails.
+func (g *Guide) RefreshAuthWithMethod(ctx context.Context, method string) error {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "oauth":
+		const (
+			maxAttempts = 8
+			retryDelay  = 350 * time.Millisecond
+		)
+		var lastErr error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			err := g.refreshAuthWithMode(ctx, providers.GoogleAuthModeOAuth, true)
+			if err == nil {
+				return nil
+			}
+			lastErr = err
+			if attempt == maxAttempts {
+				break
+			}
+			geminiTrace("auth", "refresh_retry", map[string]any{
+				"requested_auth_mode": providers.GoogleAuthModeOAuth,
+				"attempt":             attempt,
+				"next_attempt":        attempt + 1,
+				"error":               err.Error(),
+			})
+			if sleepErr := sleepContext(ctx, retryDelay); sleepErr != nil {
+				return sleepErr
+			}
+		}
+		return lastErr
+	case "apikey":
+		return g.refreshAuthWithMode(ctx, providers.GoogleAuthModeAPIKey, false)
+	default:
+		return g.refreshAuthWithMode(ctx, "", false)
 	}
 }
 
-func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlationID, sourceAgentID string) (*ForwardedRequest, error) {
-	cfg := classifyRetryConfig()
-	stream := g.beginRoutingStream(correlationID, req)
-	var lastErr error
-	for attempt := range cfg.MaxRetries {
-		result, err := g.Route(ctx, req)
-		if err == nil {
-			g.completeRoutingStream(stream, result, nil)
-			return result, nil
-		}
-		lastErr = err
-		if !isRetryableAPIError(err) || attempt == cfg.MaxRetries-1 {
-			g.completeRoutingStream(stream, nil, lastErr)
-			return nil, lastErr
-		}
-		g.publishRetryStatus(correlationID, sourceAgentID, RetryStatus{
-			Attempt:     attempt + 1,
-			MaxAttempts: cfg.MaxRetries,
-			Err:         err,
-		})
-		g.recordRetryStreamEvent(stream, attempt+1, cfg.MaxRetries, err)
-		select {
-		case <-ctx.Done():
-			g.completeRoutingStream(stream, nil, ctx.Err())
-			return nil, ctx.Err()
-		case <-time.After(retryBackoffDuration(attempt, cfg)):
-		}
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
 	}
-	g.completeRoutingStream(stream, nil, lastErr)
-	return nil, lastErr
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (g *Guide) refreshAuthWithMode(ctx context.Context, mode string, strict bool) error {
+	if g == nil || g.googleConfig == nil {
+		return nil
+	}
+	cfgOverride := *g.googleConfig
+	if trimmed := strings.TrimSpace(mode); trimmed != "" {
+		cfgOverride.AuthMode = trimmed
+	}
+	promptSkills := DiscoverGuidePromptSkills()
+	provider, err := providers.NewGoogleProvider(ctx, cfgOverride, promptSkills...)
+	if err != nil {
+		geminiTrace("auth", "refresh_failed", map[string]any{
+			"requested_auth_mode": strings.TrimSpace(cfgOverride.AuthMode),
+			"strict":              strict,
+			"error":               err.Error(),
+		})
+		return err
+	}
+	resolvedMode := provider.AuthMode()
+	if strict && strings.TrimSpace(cfgOverride.AuthMode) != "" && !strings.EqualFold(resolvedMode, cfgOverride.AuthMode) {
+		err := fmt.Errorf(
+			"google auth refresh requested %q but resolved %q",
+			cfgOverride.AuthMode,
+			resolvedMode,
+		)
+		geminiTrace("auth", "refresh_mode_mismatch", map[string]any{
+			"requested_auth_mode": strings.TrimSpace(cfgOverride.AuthMode),
+			"resolved_auth_mode":  strings.TrimSpace(resolvedMode),
+			"use_vertex_ai":       provider.UsesVertexAI(),
+		})
+		return err
+	}
+	geminiTrace("auth", "refresh_success", map[string]any{
+		"requested_auth_mode": strings.TrimSpace(cfgOverride.AuthMode),
+		"resolved_auth_mode":  strings.TrimSpace(resolvedMode),
+		"use_vertex_ai":       provider.UsesVertexAI(),
+	})
+	g.providerMu.Lock()
+	g.googleProvider = provider
+	g.googleConfig = &cfgOverride
+	g.providerMu.Unlock()
+
+	cfg := g.config.RouterConfig
+	g.SetClassifier(NewGeminiClassifier(provider, cfg))
+	g.SetSelfResponder(resolveGuideSelfResponder(g.config, provider, g))
+	if cache := g.RouteCache(); cache != nil {
+		cache.Clear()
+	}
+	return nil
+}
+
+func (g *Guide) startAuthAutoUpgrade() {
+	interval := g.config.AutoUpgradeInterval
+	if interval <= 0 {
+		interval = defaultAutoUpgradeInterval
+	}
+	ctx := g.processingContext()
+	g.autoUpgradeWg.Add(1)
+	go func() {
+		defer g.autoUpgradeWg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			if err := g.RefreshAuth(ctx); err == nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (g *Guide) newGuideSelfResponseRequest(input string, sessionID string) GuideSelfResponseRequest {
+	request := GuideSelfResponseRequest{
+		Input:              input,
+		AgentID:            g.agentID,
+		SessionID:          sessionID,
+		PendingRequests:    g.pending.Count(),
+		RegisteredAgentIDs: g.registeredAgentIDs(),
+		LoadedSkillNames:   g.loadedGuideSkillNames(),
+	}
+	if g == nil || g.conversation == nil {
+		return request
+	}
+	snapshot, ok := g.conversation.Snapshot(sessionID)
+	if !ok {
+		return request
+	}
+	request.ActiveConversationAgent = snapshot.ActiveAgentID
+	request.ActiveConversationTurns = snapshot.Turns
+	request.ActiveConversationAge = int(snapshot.Age.Seconds())
+	request.ActiveConversationScore = snapshot.ActivationHint
+	return request
+}
+
+func (g *Guide) loadedGuideSkillNames() []string {
+	if g == nil || g.skills == nil {
+		return nil
+	}
+	loaded := g.skills.GetLoaded()
+	if len(loaded) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(loaded))
+	for _, skill := range loaded {
+		if skill == nil {
+			continue
+		}
+		name := strings.TrimSpace(skill.Name)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, _, _ string) (*ForwardedRequest, error) {
+	stream := g.beginRoutingStream(req.CorrelationID, req)
+	result, err := g.Route(ctx, req)
+	g.completeRoutingStream(stream, result, err)
+	return result, err
 }
 
 func (g *Guide) beginRoutingStream(correlationID string, req *RouteRequest) *ResponseStream {
@@ -1678,6 +2479,124 @@ func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status R
 	_ = g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), busMsg)
 }
 
+func (g *Guide) publishGuideStreamStart(correlationID, sourceAgentID string) {
+	event := &StreamEvent{
+		Type:      StreamEventStart,
+		Timestamp: time.Now(),
+	}
+	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
+}
+
+func (g *Guide) publishGuideStreamChunk(correlationID, sourceAgentID, text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	event := &StreamEvent{
+		Type:      StreamEventData,
+		Text:      text,
+		Timestamp: time.Now(),
+	}
+	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
+}
+
+func (g *Guide) publishGuideStreamProgress(correlationID, sourceAgentID, message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	event := &StreamEvent{
+		Type: StreamEventProgress,
+		Data: &ProgressData{
+			Message: message,
+		},
+		Timestamp: time.Now(),
+	}
+	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
+}
+
+func (g *Guide) publishRouteHandoffProgress(correlationID, sourceAgentID, targetAgentID string) {
+	targetAgentID = strings.TrimSpace(targetAgentID)
+	if targetAgentID == "" {
+		return
+	}
+	event := &StreamEvent{
+		Type: StreamEventProgress,
+		Data: &ProgressData{
+			Message: "Handing off to " + targetAgentID + "...",
+		},
+		Timestamp: time.Now(),
+	}
+	g.publishStreamEventForResponder(correlationID, sourceAgentID, targetAgentID, event)
+}
+
+func (g *Guide) publishGuideStreamEarlyUsage(correlationID, sourceAgentID string, inputTokens int) {
+	if inputTokens <= 0 {
+		return
+	}
+	event := &StreamEvent{
+		Type:      StreamEventData,
+		Usage:     &StreamUsage{InputTokens: inputTokens},
+		Timestamp: time.Now(),
+	}
+	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
+}
+
+func (g *Guide) publishGuideStreamComplete(correlationID, sourceAgentID string, usage *StreamUsage) {
+	event := &StreamEvent{
+		Type:      StreamEventComplete,
+		Usage:     usage,
+		Timestamp: time.Now(),
+	}
+	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
+}
+
+func (g *Guide) publishGuideStreamError(correlationID, sourceAgentID string, err error) {
+	if err == nil {
+		return
+	}
+	event := &StreamEvent{
+		Type:      StreamEventError,
+		Data:      map[string]string{"error": err.Error()},
+		Timestamp: time.Now(),
+	}
+	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
+}
+
+func (g *Guide) publishGuideStreamEvent(correlationID, sourceAgentID string, event *StreamEvent) {
+	g.publishStreamEventForResponder(correlationID, sourceAgentID, g.agentID, event)
+}
+
+func (g *Guide) publishStreamEventForResponder(correlationID, sourceAgentID, responderID string, event *StreamEvent) {
+	if g == nil || g.bus == nil || event == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	sourceAgentID = strings.TrimSpace(sourceAgentID)
+	responderID = strings.TrimSpace(responderID)
+	if correlationID == "" || sourceAgentID == "" || responderID == "" {
+		return
+	}
+	resp := &StreamResponse{
+		CorrelationID:     correlationID,
+		RespondingAgentID: responderID,
+		TargetAgentID:     sourceAgentID,
+		Event:             event,
+	}
+	msg := &Message{
+		ID:            generateMessageID(),
+		CorrelationID: correlationID,
+		Type:          MessageTypeStream,
+		Payload:       resp,
+		SourceAgentID: g.agentID,
+		TargetAgentID: sourceAgentID,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+	_ = g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), msg)
+}
+
 func (g *Guide) registeredAgentIDs() []string {
 	if g.registry == nil {
 		return nil
@@ -1699,6 +2618,12 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		return nil
 	}
 
+	// Touch activity for the responding agent to prevent idle demotion
+	// during active conversation flow.
+	if g.touchActivityHook != nil && msg.SourceAgentID != "" {
+		g.touchActivityHook(msg.SourceAgentID)
+	}
+
 	switch msg.Type {
 	case MessageTypeResponse:
 		resp, ok := msg.GetRouteResponse()
@@ -1710,6 +2635,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		if err != nil {
 			return nil
 		}
+		g.observeConversationResponse(pending, resp)
 
 		return g.publishResponseToSource(pending.SourceAgentID, resp)
 	case MessageTypeStream:
@@ -1739,6 +2665,115 @@ func (g *Guide) recordIncomingStreamEvent(resp *StreamResponse) {
 		return
 	}
 	stream.SendData(resp.Event)
+}
+
+func (g *Guide) registerRequestCancel(correlationID string, cancel context.CancelFunc) {
+	if g == nil || cancel == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	g.requestCancelMu.Lock()
+	g.requestCancels[correlationID] = cancel
+	g.requestCancelMu.Unlock()
+}
+
+func (g *Guide) clearRequestCancel(correlationID string) {
+	if g == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	g.requestCancelMu.Lock()
+	delete(g.requestCancels, correlationID)
+	g.requestCancelMu.Unlock()
+}
+
+func (g *Guide) cancelRequestContext(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	var cancel context.CancelFunc
+	g.requestCancelMu.Lock()
+	cancel = g.requestCancels[correlationID]
+	delete(g.requestCancels, correlationID)
+	g.requestCancelMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (g *Guide) handleUserInterruptMessage(msg *Message) error {
+	req, correlationID := g.interruptRequestFromMessage(msg)
+	if correlationID == "" {
+		return nil
+	}
+	g.cancelRequestContext(correlationID)
+	pending := g.pending.Remove(correlationID)
+	if pending != nil {
+		g.forwardUserInterruptToTarget(req, pending)
+	}
+	if g.streams != nil {
+		g.streams.CloseStream(correlationID)
+	}
+	return nil
+}
+
+func (g *Guide) interruptRequestFromMessage(msg *Message) (*UserInterruptRequest, string) {
+	if msg == nil {
+		return nil, ""
+	}
+	req, _ := msg.GetUserInterruptRequest()
+	correlationID := strings.TrimSpace(msg.CorrelationID)
+	if req != nil && strings.TrimSpace(req.CorrelationID) != "" {
+		correlationID = strings.TrimSpace(req.CorrelationID)
+	}
+	return req, correlationID
+}
+
+func (g *Guide) forwardUserInterruptToTarget(req *UserInterruptRequest, pending *PendingRequest) {
+	if g == nil || pending == nil || strings.TrimSpace(pending.TargetAgentID) == "" {
+		return
+	}
+	if g.isGuideTarget(pending.TargetAgentID) {
+		return
+	}
+	action := g.userInterruptAction(req, pending)
+	msg := NewActionMessage(generateMessageID(), action)
+	_ = g.bus.Publish(guideTargetTopic(pending.TargetAgentID), msg)
+}
+
+func (g *Guide) userInterruptAction(req *UserInterruptRequest, pending *PendingRequest) *ActionRequest {
+	reason := ""
+	if req != nil {
+		reason = req.Reason
+	}
+	data := map[string]any{
+		"correlation_id": pending.CorrelationID,
+	}
+	if reason != "" {
+		data["reason"] = reason
+	}
+	return &ActionRequest{
+		CorrelationID: pending.CorrelationID,
+		SourceAgentID: g.agentID,
+		TargetAgentID: pending.TargetAgentID,
+		Action:        "cancel",
+		Data:          data,
+		FireAndForget: true,
+		Timestamp:     time.Now(),
+	}
+}
+
+func guideTargetTopic(targetAgentID string) string {
+	return TopicRequests(targetAgentID, targetAgentID)
 }
 
 // handleErrorMessage processes incoming error messages from agent error channels
@@ -1809,6 +2844,15 @@ func (g *Guide) publishRouteError(correlationID string, sourceAgentID string, er
 }
 
 func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *ForwardedRequest) error {
+	if g.activationHook != nil {
+		if err := g.activationHook(g.processingContext(), targetAgentID); err != nil {
+			slog.Warn("activation hook failed", "target", targetAgentID, "error", err)
+			// Still attempt delivery — agent might already be hot.
+		}
+	}
+	if g.touchActivityHook != nil {
+		g.touchActivityHook(targetAgentID)
+	}
 	fwdMsg := g.forwardMessage(targetAgentID, forwarded)
 	return g.bus.Publish(TopicRequests(targetAgentID, targetAgentID), fwdMsg)
 }
@@ -2081,4 +3125,93 @@ func (g *Guide) OptimizeSkillsForBudget() int {
 // LoadSkillsForContext performs context-aware skill loading
 func (g *Guide) LoadSkillsForContext(ctx skills.LoadContext) skills.LoadResult {
 	return g.skillLoader.LoadForContext(ctx)
+}
+
+// =============================================================================
+// HandoffInjectable Interface
+// =============================================================================
+
+// SetHandoffBridge attaches a HandoffBridge to this Guide instance.
+func (g *Guide) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	g.handoffBridge = bridge
+}
+
+// AgentID returns the unique identifier for this Guide instance.
+func (g *Guide) AgentID() string {
+	return g.config.AgentID
+}
+
+// AgentType returns the agent type string for the Guide.
+func (g *Guide) AgentType() string {
+	return "guide"
+}
+
+// Descriptor returns the immutable metadata describing this agent type.
+func (g *Guide) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:     "guide",
+		ModelID:       "haiku-4.5-200k",
+		ContextWindow: 200_000,
+		Category:      handoff.CategoryStandalone,
+	}
+}
+
+// ExtractArchivableState captures the Guide's current state for handoff persistence.
+func (g *Guide) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   g.config.AgentID,
+		AgentType: "guide",
+		Timestamp: time.Now(),
+	}
+}
+
+// Terminate gracefully shuts down the Guide, delegating to Stop.
+func (g *Guide) Terminate(_ context.Context) error {
+	return g.Stop()
+}
+
+// InjectPreparedContext accepts a prepared context from a handoff.
+// Guide rebuilds router state from scratch, so the prepared context is
+// acknowledged but not applied.
+func (g *Guide) InjectPreparedContext(_ *handoff.PreparedContext) error {
+	return nil
+}
+
+// ServiceHealthChecker abstracts health checking to avoid importing
+// the network package directly. The container bootstrap layer provides
+// an implementation backed by the ServiceRegistry.
+type ServiceHealthChecker interface {
+	HasHealthyEndpoints(agentType string) bool
+}
+
+// SetActivationHook sets a callback invoked before forwarding a request
+// to ensure the target agent's container is active. The hook is typically
+// bound to ActivationController.EnsureActive.
+func (g *Guide) SetActivationHook(hook func(ctx context.Context, agentType string) error) {
+	g.activationHook = hook
+}
+
+// SetTouchActivityHook installs a callback invoked after request
+// forwarding and response handling to reset the idle timer on the
+// target agent's container, preventing demotion during active
+// conversations.
+func (g *Guide) SetTouchActivityHook(hook func(agentType string)) {
+	g.touchActivityHook = hook
+}
+
+// SetServiceRegistry sets the health checker used for routing decisions.
+// When set, isAgentHealthy delegates to the registry instead of the
+// local readyAgents map.
+func (g *Guide) SetServiceRegistry(reg ServiceHealthChecker) {
+	g.serviceRegistry = reg
+}
+
+// isAgentHealthy checks whether an agent is healthy enough to receive
+// traffic. Prefers the service registry (probe-driven) when available,
+// falling back to the local readyAgents map.
+func (g *Guide) isAgentHealthy(agentType string) bool {
+	if g.serviceRegistry != nil {
+		return g.serviceRegistry.HasHealthyEndpoints(agentType)
+	}
+	return g.IsAgentReady(agentType)
 }

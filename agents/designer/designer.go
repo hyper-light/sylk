@@ -866,3 +866,22 @@ func (d *Designer) Skills() *skills.Registry {
 func (d *Designer) GetToolDefinitions() []map[string]any {
 	return d.skills.GetToolDefinitions()
 }
+
+// =============================================================================
+// ContainerAgent Interface
+// =============================================================================
+
+// AgentID returns the unique instance identifier for this designer.
+func (d *Designer) AgentID() string {
+	return d.id
+}
+
+// AgentType returns the type classification for this agent.
+func (d *Designer) AgentType() string {
+	return "designer"
+}
+
+// Terminate gracefully shuts down the designer agent.
+func (d *Designer) Terminate(_ context.Context) error {
+	return d.Stop()
+}

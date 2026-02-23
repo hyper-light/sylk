@@ -320,7 +320,7 @@ func (c *GitClient) fileSummaryForHash(hash string) (FileSummary, error) {
 		return FileSummary{}, err
 	}
 
-	c.diffCache.Set("file:"+hash, fs, 1)
+	c.diffCache.Set("file:"+hash, fs, fileSummaryCostBytes)
 	return fs, nil
 }
 
@@ -383,8 +383,8 @@ func (c *GitClient) diffSummaryForHash(hash string) (DiffSummary, error) {
 		return DiffSummary{}, err
 	}
 
-	c.diffCache.Set("line:"+hash, ds, 1)
-	c.diffCache.Set("file:"+hash, FileSummary{ds.FilesAdded, ds.FilesModified, ds.FilesDeleted}, 1)
+	c.diffCache.Set("line:"+hash, ds, diffSummaryCostBytes)
+	c.diffCache.Set("file:"+hash, FileSummary{ds.FilesAdded, ds.FilesModified, ds.FilesDeleted}, fileSummaryCostBytes)
 	return ds, nil
 }
 

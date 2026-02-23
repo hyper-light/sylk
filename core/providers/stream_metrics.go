@@ -91,7 +91,15 @@ func (c *StreamMetricsCollector) RecordChunk(chunk *StreamChunk) {
 // Caller must hold the mutex.
 func (c *StreamMetricsCollector) recordChunkType(chunk *StreamChunk) {
 	switch chunk.Type {
+	case ChunkTypeStart:
+		// Reset timing for retry — ensures TTFT reflects the successful attempt.
+		c.firstTokenTime = time.Time{}
+		c.firstToolTime = time.Time{}
+		c.chunksReceived = 0
+		c.startTime = time.Now()
 	case ChunkTypeText:
+		c.recordFirstToken()
+	case ChunkTypeThought:
 		c.recordFirstToken()
 	case ChunkTypeToolStart:
 		c.recordFirstToolCall()

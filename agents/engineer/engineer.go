@@ -896,3 +896,22 @@ func (e *Engineer) Skills() *skills.Registry {
 func (e *Engineer) GetToolDefinitions() []map[string]any {
 	return e.skills.GetToolDefinitions()
 }
+
+// =============================================================================
+// ContainerAgent Interface
+// =============================================================================
+
+// AgentID returns the unique instance identifier for this engineer.
+func (e *Engineer) AgentID() string {
+	return e.id
+}
+
+// AgentType returns the type classification for this agent.
+func (e *Engineer) AgentType() string {
+	return "engineer"
+}
+
+// Terminate gracefully shuts down the engineer agent.
+func (e *Engineer) Terminate(_ context.Context) error {
+	return e.Stop()
+}

@@ -14,6 +14,7 @@ var (
 	ArchitectSystemOutputPrompt     = prompts.MustLoad("architect", "system_output")
 	ArchitectSystemGuardrailsPrompt = prompts.MustLoad("architect", "system_guardrails")
 	ArchitectSystemSkillsPrompt     = prompts.MustLoad("architect", "system_skills")
+	ArchitectConversationPrompt     = prompts.MustLoad("architect", "conversation")
 	DefaultSystemPrompt             = strings.Join([]string{
 		ArchitectSystemCorePrompt,
 		ArchitectSystemProtocolPrompt,

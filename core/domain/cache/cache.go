@@ -10,9 +10,15 @@ import (
 )
 
 const (
-	defaultNumCounters = 1e7 // 10M counters for admission policy
-	defaultMaxCost     = 1e8 // 100MB max cost
-	defaultBufferItems = 64  // Buffer items for async writes
+	// Derived: 2,000 max entries × 10 = 20,000 counters.
+	// CM sketch: 4 rows × (20,000/16) uint64 = ~10KB (vs previous ~5MB).
+	defaultNumCounters = 20_000
+
+	// Derived: 2,000 max entries × 2,500 bytes max entry cost = 5,000,000.
+	// Steady-state: ~500 entries × 600 avg = ~300KB.
+	defaultMaxCost = 5_000_000
+
+	defaultBufferItems = 64
 	defaultTTL         = 5 * time.Minute
 )
 
