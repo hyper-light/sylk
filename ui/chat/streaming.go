@@ -81,3 +81,11 @@ func (sa *StreamAccumulator) LastChunk() time.Time {
 	defer sa.mu.Unlock()
 	return sa.lastChunk
 }
+
+// AdjustIndex shifts the tracked entry index by delta. Used when ring buffer
+// eviction shifts all logical indices down by 1.
+func (sa *StreamAccumulator) AdjustIndex(delta int) {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	sa.entryIndex += delta
+}

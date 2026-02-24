@@ -69,6 +69,11 @@ type Model struct {
 	planEntryIdx int    // History index of the plan ChatEntry (-1 = no plan entry).
 	planID       string // Correlates updates to the correct entry.
 
+	// Render throttle: chunks buffer at full speed, but the history entry
+	// is only synced (and viewDirty set) on DecorTick or StreamComplete.
+	streamRenderPending bool
+	streamRenderState   *streamRenderState // nil when not streaming.
+
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache string
 	viewDirty bool
@@ -117,7 +122,6 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 		m.viewDirty = true
 		return m, m.handleStreamStart(typed)
 	case msg.StreamChunkMsg:
-		m.viewDirty = true
 		return m, m.handleStreamChunk(typed)
 	case msg.StreamProgressMsg:
 		return m, m.handleStreamProgress(typed)
@@ -260,6 +264,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		}
 		m.history.mu.Unlock()
 		m.accumulator = NewStreamAccumulator(idx)
+		m.streamRenderState = &streamRenderState{}
 		m.viewDirty = true
 		return nil
 	}
@@ -286,11 +291,14 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	}
 	idx := m.history.Len() - 1
 	m.accumulator = NewStreamAccumulator(idx)
+	m.streamRenderState = &streamRenderState{}
 	m.startThinkingAnimation(now, idx)
 	return nil
 }
 
-// handleStreamChunk appends text to the accumulator and updates the entry.
+// handleStreamChunk appends text to the accumulator. The entry is NOT synced
+// immediately — instead streamRenderPending is set and the actual sync happens
+// on the next DecorTick (100ms) or StreamComplete, reducing per-token renders.
 func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 	if m.accumulator == nil {
 		return nil
@@ -302,7 +310,7 @@ func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 	}
 
 	m.accumulator.Append(chunk.Text)
-	m.syncAccumulatorToEntry()
+	m.streamRenderPending = true
 	return nil
 }
 
@@ -332,6 +340,9 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	if m.accumulator == nil {
 		return nil
 	}
+	m.streamRenderPending = false
+	m.streamRenderState = nil
+	m.viewport.SetStreamState(nil, -1)
 	if m.thinkingIdx >= 0 {
 		m.resolveThinkingEntry()
 	}
@@ -346,6 +357,9 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 
 // handleStreamError adds an error entry and cleans up the accumulator.
 func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
+	m.streamRenderPending = false
+	m.streamRenderState = nil
+	m.viewport.SetStreamState(nil, -1)
 	// Finalize any partial stream.
 	if m.accumulator != nil {
 		m.accumulator.Complete()
@@ -457,35 +471,54 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // a new entry; later updates rewrite the same entry's content.
 func (m *Model) HandlePlanUpdate(update msg.PlanUpdateMsg) {
 	content := formatPlanMarkdown(update)
+	entryID := "plan-" + update.PlanID
 
 	// New plan or different plan ID — push a fresh entry.
 	if m.planEntryIdx < 0 || m.planID != update.PlanID {
-		entry := &ChatEntry{
-			ID:        "plan-" + update.PlanID,
-			Timestamp: update.StartTime,
-			Source:    SourceAgent,
-			AgentType: "architect",
-			Content:   content,
-			Height:    -1,
-		}
-		m.PushEntry(entry)
-		m.planEntryIdx = m.history.Len() - 1
-		m.planID = update.PlanID
+		m.pushPlanEntry(entryID, content, update)
 		return
 	}
 
-	// Same plan — update existing entry in place.
-	idx := m.planEntryIdx
-	m.history.mu.Lock()
-	if idx >= 0 && idx < m.history.count {
-		physical := m.history.logicalToPhysical(idx)
-		m.history.entries[physical].Content = content
-		m.history.entries[physical].RenderedLines = nil
-		m.history.entries[physical].CodeRegions = nil
-		m.history.entries[physical].Height = -1
+	// Same plan — update existing entry in place via UpdateAt.
+	// Verify the entry ID to detect if the plan entry was evicted and
+	// its slot reused by a different entry.
+	matched := false
+	ok := m.history.UpdateAt(m.planEntryIdx, func(e *ChatEntry) {
+		if e.ID != entryID {
+			return // Slot reused after eviction; stale index.
+		}
+		matched = true
+		e.Content = content
+		e.RenderedLines = nil
+		e.CodeRegions = nil
+		e.Height = -1
+	})
+
+	if !ok || !matched {
+		// Index out of range or entry was evicted — re-push.
+		m.pushPlanEntry(entryID, content, update)
+		return
 	}
-	m.history.mu.Unlock()
 	m.viewDirty = true
+}
+
+// pushPlanEntry appends a new plan chat entry and records its index.
+func (m *Model) pushPlanEntry(id, content string, update msg.PlanUpdateMsg) {
+	ts := update.StartTime
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	entry := &ChatEntry{
+		ID:        id,
+		Timestamp: ts,
+		Source:    SourceAgent,
+		AgentType: "architect",
+		Content:   content,
+		Height:    -1,
+	}
+	m.PushEntry(entry)
+	m.planEntryIdx = m.history.Len() - 1
+	m.planID = update.PlanID
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +534,17 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 	m.viewport.OnNewEntry()
 	if willEvict {
 		m.viewport.AdjustSelectionForEviction()
+		// All logical indices shift down by 1 when the oldest entry is evicted.
+		// A tracked index reaching -1 means that entry was the evicted one.
+		if m.thinkingIdx >= 0 {
+			m.thinkingIdx--
+		}
+		if m.planEntryIdx >= 0 {
+			m.planEntryIdx--
+		}
+		if m.accumulator != nil {
+			m.accumulator.AdjustIndex(-1)
+		}
 	}
 	m.viewDirty = true
 }
@@ -600,6 +644,23 @@ func (m *Model) handleDecorTick(now time.Time) {
 
 	// Animate thinking indicator while streaming with no content yet.
 	m.tickThinking(now)
+
+	// Flush buffered stream chunks to the history entry.
+	m.flushStreamRender()
+}
+
+// flushStreamRender syncs accumulated stream content to the history entry
+// and marks the view dirty. Called on DecorTick (100ms) and StreamComplete.
+func (m *Model) flushStreamRender() {
+	if !m.streamRenderPending || m.accumulator == nil {
+		return
+	}
+	m.streamRenderPending = false
+	m.syncAccumulatorToEntry()
+	if m.streamRenderState != nil {
+		m.viewport.SetStreamState(m.streamRenderState, m.accumulator.EntryIndex())
+	}
+	m.viewDirty = true
 }
 
 // tickThinking advances the thinking spinner and rotates the fun message.

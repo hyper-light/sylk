@@ -1,9 +1,13 @@
 package architect
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestIsExecutionRequest(t *testing.T) {
 	positives := []string{
+		// Substring matches.
 		"go ahead",
 		"Go Ahead",
 		"execute",
@@ -24,6 +28,37 @@ func TestIsExecutionRequest(t *testing.T) {
 		"  go ahead  ",
 		"yes, go ahead and execute",
 		"Sounds good, proceed with it",
+		"run it",
+		"fire away",
+		"confirmed",
+		"make it so",
+		"let's start",
+		"start building",
+		// Exact affirmatives.
+		"yes",
+		"Yes",
+		"YES",
+		"y",
+		"yep",
+		"yeah",
+		"yup",
+		"ok",
+		"okay",
+		"sure",
+		"right",
+		"great",
+		"perfect",
+		"awesome",
+		"absolutely",
+		"affirmative",
+		"roger",
+		"aye",
+		// Exact with trailing punctuation.
+		"yes!",
+		"sure.",
+		"ok!",
+		"Yeah!",
+		"absolutely!",
 	}
 	for _, input := range positives {
 		if !isExecutionRequest(input) {
@@ -40,6 +75,10 @@ func TestIsExecutionRequest(t *testing.T) {
 		"explain the architecture",
 		"plan a new feature",
 		"design this for me",
+		// Short affirmatives embedded in longer questions should NOT match.
+		"yes, but can we change the database layer?",
+		"ok so what about the auth flow?",
+		"sure, but I have some concerns about scaling",
 	}
 	for _, input := range negatives {
 		if isExecutionRequest(input) {
@@ -70,14 +109,13 @@ func TestLatestReadyPlan_NoneReady(t *testing.T) {
 }
 
 func TestLatestReadyPlan_SelectsMostRecent(t *testing.T) {
+	now := time.Now()
 	a := &Architect{
 		activePlans: map[string]*DesignPlan{
-			"old": {ID: "old", Status: PlanStatusReady},
-			"new": {ID: "new", Status: PlanStatusReady},
+			"old": {ID: "old", Status: PlanStatusReady, UpdatedAt: now.Add(-5 * time.Minute)},
+			"new": {ID: "new", Status: PlanStatusReady, UpdatedAt: now.Add(-1 * time.Minute)},
 		},
 	}
-	// Set UpdatedAt so "new" is more recent.
-	a.activePlans["new"].UpdatedAt = a.activePlans["old"].UpdatedAt.Add(1)
 
 	plan := a.latestReadyPlan()
 	if plan == nil || plan.ID != "new" {

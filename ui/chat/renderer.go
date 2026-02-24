@@ -56,7 +56,8 @@ const headerLines = 1
 // colors and styling. Code fence blocks (``` ... ```) are rendered with
 // a subtle background. Returns the rendered lines and any code block regions
 // (with line indices relative to the returned slice).
-func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []CodeRegion) {
+// The optional cache stores pre-rendered code blocks keyed by (lang, content, width).
+func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockCache) ([]string, []CodeRegion) {
 	if width <= 0 {
 		return nil, nil
 	}
@@ -68,17 +69,19 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []Code
 	bodyStyle := messageStyle(entry.Source, th)
 
 	// Phase 1: Thinking (streaming, no content yet).
+	// Capped at: header(1) + spinner(1) + status(≤thinkingStatusMaxLines) + spacer(1).
 	if entry.Streaming && entry.Content == "" && entry.ThinkingText != "" {
 		color := th.Palette.Info
 		if entry.ThinkingColor != "" {
 			color = lipgloss.Color(entry.ThinkingColor)
 		}
 		animatedStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
-		lines := make([]string, 0, 6)
+		lines := make([]string, 0, 2+thinkingStatusMaxLines+1)
 		lines = append(lines, header)
-		lines = append(lines, wrapLine(normalizeThinkingLine(entry.ThinkingText), width, animatedStyle)...)
+		lines = append(lines, animatedStyle.Render(truncateToWidth(normalizeThinkingLine(entry.ThinkingText), width)))
 		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
-			lines = append(lines, wrapLine(normalizeThinkingLine(status), width, animatedStyle)...)
+			wrapped := wrapLine(normalizeThinkingLine(status), width, animatedStyle)
+			lines = append(lines, capLines(wrapped, thinkingStatusMaxLines, width, animatedStyle)...)
 		}
 		lines = append(lines, "")
 		return lines, nil
@@ -92,7 +95,7 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []Code
 		summaryLines = wrapLine(summaryText, width, summaryStyle)
 	}
 
-	contentLines, codeRegions := renderContent(entry.Content, width, bodyStyle, th)
+	contentLines, codeRegions := renderContent(entry.Content, width, bodyStyle, th, cache)
 
 	// Pre-allocate: 1 header + summary + content lines + 1 trailing spacer.
 	lines := make([]string, 0, 2+len(summaryLines)+len(contentLines))
@@ -108,6 +111,41 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme) ([]string, []Code
 		codeRegions[i].End += headerOffset
 	}
 	return lines, codeRegions
+}
+
+// thinkingStatusMaxLines is the maximum number of wrapped lines the
+// thinking status text may occupy. Enough for a sentence or two without
+// filling the viewport.
+// Derived from: 2 lines ≈ 1-2 sentences at typical terminal widths.
+const thinkingStatusMaxLines = 2
+
+// capLines returns at most maxLines from the given slice. If truncated,
+// an ellipsis indicator is appended to the last retained line.
+func capLines(lines []string, maxLines, _ int, style lipgloss.Style) []string {
+	if len(lines) <= maxLines {
+		return lines
+	}
+	capped := make([]string, maxLines)
+	copy(capped, lines[:maxLines])
+	capped[maxLines-1] += style.Render("…")
+	return capped
+}
+
+// truncateToWidth truncates plain text to fit within width visible columns,
+// appending "…" if truncated. For unstyled text only (no ANSI sequences).
+func truncateToWidth(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= width {
+		return text
+	}
+	// Reserve 1 column for the ellipsis.
+	if width <= 1 {
+		return "…"
+	}
+	return string(runes[:width-1]) + "…"
 }
 
 func normalizeThinkingLine(text string) string {
@@ -185,11 +223,11 @@ func normalizeLang(tag string) string {
 // renderContent parses raw markdown and renders it to styled terminal lines
 // with syntax-highlighted code blocks. Returns the rendered lines and code
 // block regions (indices relative to the returned slice).
-func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme) ([]string, []CodeRegion) {
+func renderContent(raw string, width int, style lipgloss.Style, th *theme.Theme, cache *codeBlockCache) ([]string, []CodeRegion) {
 	if width <= 0 {
 		return nil, nil
 	}
-	return renderMarkdownContent(raw, width, style, th)
+	return renderMarkdownContent(raw, width, style, th, cache)
 }
 
 // gutterSep is the separator between line numbers and code content.
@@ -200,10 +238,27 @@ const gutterSep = " │ "
 const gutterSepWidth = 3
 
 // renderCodeBlock syntax-highlights buffered code lines with line numbers.
-func renderCodeBlock(lines []string, lang string, width int, th *theme.Theme) []string {
+// When cache is non-nil, the result is looked up / stored by (lang, content, width).
+func renderCodeBlock(lines []string, lang string, width int, th *theme.Theme, cache *codeBlockCache) []string {
+	content := strings.Join(lines, "\n")
+
+	if cache != nil {
+		key := codeBlockKey{lang: lang, content: content, width: width}
+		if cached := cache.Get(key); cached != nil {
+			return cached
+		}
+		result := renderCodeBlockUncached(lines, lang, content, width, th)
+		cache.Put(key, result)
+		return result
+	}
+	return renderCodeBlockUncached(lines, lang, content, width, th)
+}
+
+// renderCodeBlockUncached performs syntax highlighting and line-number formatting
+// without cache interaction. content must equal strings.Join(lines, "\n").
+func renderCodeBlockUncached(lines []string, lang, content string, width int, th *theme.Theme) []string {
 	hl := codepkg.NewHighlighter(th)
 	defer hl.Close()
-	content := strings.Join(lines, "\n")
 	allRegions := hl.HighlightContent(content, lang)
 
 	digits := digitCount(len(lines))

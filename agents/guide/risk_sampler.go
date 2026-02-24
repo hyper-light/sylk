@@ -17,8 +17,12 @@ func getFailurePenalty(intent Intent) float64 {
 	switch intent {
 	case IntentFind, IntentSearch, IntentLocate, IntentHelp, IntentStatus, IntentRecall:
 		return -1.0 // Read-only / safe actions
-	case IntentPlan, IntentDesign, IntentDeclare, IntentCheck:
-		return -2.5 // Planning / Coordination actions
+	case IntentPlan, IntentDesign:
+		return -1.0 // Non-destructive coordination — misrouting is easily recoverable
+	case IntentChat:
+		return -0.5 // Lowest risk — wrong conversational agent is trivially redirected
+	case IntentDeclare, IntentCheck:
+		return -2.5 // Verification / declaration actions
 	case IntentStore, IntentComplete:
 		return -5.0 // Destructive / State-mutating actions
 	default:

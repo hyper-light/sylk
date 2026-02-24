@@ -359,6 +359,16 @@ func (m *HealthMonitor) IsHealthy(agentID string) bool {
 	return false
 }
 
+// SetDegradedByQuality marks an agent as degraded due to GP quality
+// prediction dropping below acceptable thresholds. This is called by the
+// quality publisher callback when quality signals indicate soft degradation.
+func (m *HealthMonitor) SetDegradedByQuality(agentID string) {
+	health, ok := m.agents.Get(agentID)
+	if ok {
+		health.SetDegraded()
+	}
+}
+
 // handleHeartbeat processes heartbeat messages
 func (m *HealthMonitor) handleHeartbeat(msg *Message) error {
 	agentID := msg.SourceAgentID

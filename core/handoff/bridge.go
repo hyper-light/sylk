@@ -94,6 +94,12 @@ type HandoffBridge struct {
 	// Signal fusion (per-bridge, wired to supervisor's baseline registry).
 	fuser *SignalFuser
 
+	// Quality publisher — pushes GP predictions to the service registry.
+	qualityPublisher func(agentID string, quality, stdDev float64)
+
+	// Active traffic shift — non-nil during gradual handoff.
+	activeShift *TrafficShiftController
+
 	turnCount atomic.Int64
 	started   atomic.Bool
 	stopCh    chan struct{}
@@ -271,6 +277,18 @@ func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 
 	// Feed parallel buffer with optional stress sideband.
 	b.feedParallelBuffer(turn, rec, flushed)
+
+	// Publish GP quality to service registry.
+	b.publishQualityUpdate(rec)
+
+	// If a traffic shift is active and this turn is from the new agent,
+	// increment the new-agent turn counter.
+	b.mu.RLock()
+	shift := b.activeShift
+	b.mu.RUnlock()
+	if shift != nil {
+		shift.RecordNewAgentTurn()
+	}
 }
 
 // injectProviderSignals feeds provider-level signals into the fuser.
@@ -360,6 +378,81 @@ func (b *HandoffBridge) feedParallelBuffer(turn int64, rec TurnRecord, flushed F
 	} else {
 		b.parallelBuffer.UpdateGP(pred)
 	}
+}
+
+// publishQualityUpdate sends the current GP prediction to the quality publisher.
+func (b *HandoffBridge) publishQualityUpdate(rec TurnRecord) {
+	b.mu.RLock()
+	publisher := b.qualityPublisher
+	agentID := b.agent.AgentID()
+	b.mu.RUnlock()
+
+	if publisher == nil {
+		return
+	}
+
+	pred := b.gp.Predict(rec.ContextSize, rec.OutputTokens, rec.ToolCalls)
+	if pred == nil {
+		return
+	}
+
+	publisher(agentID, pred.Mean, pred.StdDev)
+}
+
+// buildShiftConfig derives a ShiftConfig from the bridge's current state.
+// All values are derived from existing bridge data — no magic numbers.
+func (b *HandoffBridge) buildShiftConfig() ShiftConfig {
+	obsCount := b.gp.NumObservations()
+
+	// InitialWeight = 1/(observations+1), clamped [0.05, 0.2].
+	initial := 1.0 / float64(obsCount+1)
+	if initial < 0.05 {
+		initial = 0.05
+	}
+	if initial > 0.2 {
+		initial = 0.2
+	}
+
+	// QualityThreshold from old agent's pessimistic bound.
+	var threshold float64
+	b.mu.RLock()
+	oldPred := b.gp.PredictLatest()
+	b.mu.RUnlock()
+	if oldPred != nil {
+		threshold = oldPred.Mean - oldPred.StdDev
+	}
+
+	// EvalInterval from context check config.
+	evalInterval := b.config.ContextConfig.MinCheckInterval
+
+	// MaxShiftDuration from overlap coordinator.
+	var maxDuration time.Duration
+	if b.overlapCoord != nil {
+		maxDuration = b.overlapCoord.TotalTimeout()
+	}
+	if maxDuration == 0 {
+		maxDuration = 2 * time.Minute
+	}
+
+	// GP minimum useful observations.
+	const gpMinUsefulObs = 10
+
+	return ShiftConfig{
+		InitialWeight:    initial,
+		WeightStep:       initial,
+		EvalInterval:     evalInterval,
+		MinNewAgentTurns: gpMinUsefulObs,
+		QualityThreshold: threshold,
+		MaxShiftDuration: maxDuration,
+	}
+}
+
+// SetQualityPublisher sets the callback that publishes GP quality
+// predictions to the service registry.
+func (b *HandoffBridge) SetQualityPublisher(fn func(agentID string, quality, stdDev float64)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.qualityPublisher = fn
 }
 
 // RecordQualitySignal records external quality feedback.
@@ -486,6 +579,9 @@ func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
 
 // executeOverlapHandoff uses the parallel buffer's pre-materialized snapshot
 // to begin an overlap where both agents run in parallel during the transition.
+// Instead of an atomic swap, it initiates a gradual traffic shift: the new
+// agent receives canary traffic first and weight ramps up as GP quality is
+// confirmed.
 func (b *HandoffBridge) executeOverlapHandoff(_ *HandoffRecommendation) {
 	// Snapshot is already materialized — O(1) atomic read.
 	snapshot := b.parallelBuffer.Snapshot()
@@ -517,32 +613,110 @@ func (b *HandoffBridge) executeOverlapHandoff(_ *HandoffRecommendation) {
 		return
 	}
 
-	// Complete the overlap — swap agents.
-	if err := handle.Complete(); err != nil {
+	newID := handle.NewAgent.AgentID()
+
+	// Register the new agent alongside the old in the Guide's routing table.
+	if b.supervisor.onShiftBegin != nil {
+		b.supervisor.onShiftBegin(oldID, handle.NewAgent)
+	}
+
+	// Build shift config from bridge state and start gradual traffic shift.
+	shiftCfg := b.buildShiftConfig()
+	shift := NewTrafficShiftController(
+		shiftCfg,
+		b.supervisor.updateWeight,
+		func(agentID string) (float64, float64, bool) {
+			return b.getNewAgentQuality(agentID)
+		},
+		func(completedOldID, completedNewID string) {
+			b.completeTrafficShift(handle, completedOldID, completedNewID)
+		},
+		func(abortedOldID, abortedNewID string) {
+			b.rollbackTrafficShift(handle, abortedOldID, abortedNewID)
+		},
+		func(entry ShiftWALEntry) {
+			if b.supervisor.wal != nil {
+				_ = b.supervisor.wal.WriteShiftEvent(entry)
+			}
+		},
+	)
+
+	b.mu.Lock()
+	b.activeShift = shift
+	b.mu.Unlock()
+
+	if err := shift.BeginShift(oldID, newID); err != nil {
 		handle.Abort(err.Error())
 		b.parallelBuffer.elastic.Reset()
+		b.mu.Lock()
+		b.activeShift = nil
+		b.mu.Unlock()
+	}
+}
+
+// getNewAgentQuality reads the GP prediction for an agent from the
+// supervisor's bridge registry.
+func (b *HandoffBridge) getNewAgentQuality(agentID string) (mean, lowerBound float64, ok bool) {
+	bridge := b.supervisor.GetBridge(agentID)
+	if bridge == nil {
+		return 0, 0, false
+	}
+	pred := bridge.gp.PredictLatest()
+	if pred == nil {
+		return 0, 0, false
+	}
+	return pred.Mean, pred.LowerBound, true
+}
+
+// completeTrafficShift is called when the gradual shift converges. It
+// finalizes the overlap by completing the handle, replacing the agent,
+// and resetting the parallel buffer.
+func (b *HandoffBridge) completeTrafficShift(handle *OverlapHandle, oldID, newID string) {
+	if err := handle.Complete(); err != nil {
 		return
 	}
 
-	// Notify supervisor of replacement.
 	if b.supervisor.onAgentReplaced != nil {
-		if err := b.supervisor.onAgentReplaced(oldID, handle.NewAgent.AgentID(), handle.NewAgent); err != nil {
-			return
-		}
+		_ = b.supervisor.onAgentReplaced(oldID, newID, handle.NewAgent)
 	}
 
 	b.ReplaceAgent(handle.NewAgent)
 	b.parallelBuffer.Reset()
 
-	// Persist outcome.
+	b.mu.Lock()
+	b.activeShift = nil
+	b.mu.Unlock()
+
 	if b.supervisor.wal != nil {
 		_ = b.supervisor.wal.WriteHandoffOutcome(
 			&HandoffDecision{
 				ShouldHandoff: true,
-				Reason:        "parallel buffer handoff complete",
+				Reason:        "traffic shift converged",
 				Timestamp:     time.Now(),
 			},
 			true,
+		)
+	}
+}
+
+// rollbackTrafficShift is called when the new agent fails quality checks.
+// It aborts the overlap, resets weights, and deregisters the new agent.
+func (b *HandoffBridge) rollbackTrafficShift(handle *OverlapHandle, _, _ string) {
+	handle.Abort("traffic shift quality rollback")
+	b.parallelBuffer.elastic.Reset()
+
+	b.mu.Lock()
+	b.activeShift = nil
+	b.mu.Unlock()
+
+	if b.supervisor.wal != nil {
+		_ = b.supervisor.wal.WriteHandoffOutcome(
+			&HandoffDecision{
+				ShouldHandoff: true,
+				Reason:        "traffic shift aborted — quality rollback",
+				Timestamp:     time.Now(),
+			},
+			false,
 		)
 	}
 }

@@ -148,6 +148,11 @@ func (oc *OverlapCoordinator) Phase() OverlapPhase {
 	return oc.phase
 }
 
+// TotalTimeout returns the configured total timeout for overlaps.
+func (oc *OverlapCoordinator) TotalTimeout() time.Duration {
+	return oc.totalTimeout
+}
+
 // SetWALWriter sets the WAL writer callback for persistence.
 func (oc *OverlapCoordinator) SetWALWriter(fn func(OverlapWALEntry)) {
 	oc.mu.Lock()

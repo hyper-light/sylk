@@ -285,6 +285,20 @@ func (gp *AgentGaussianProcess) Predict(contextSize, tokenCount, toolCallCount i
 	return gp.predictLocked(queryFeatures)
 }
 
+// PredictLatest computes the GP prediction at the most recent observation's
+// feature point. Returns nil if there are no observations.
+func (gp *AgentGaussianProcess) PredictLatest() *GPPrediction {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+
+	if len(gp.observations) == 0 {
+		return nil
+	}
+
+	latest := gp.observations[len(gp.observations)-1]
+	return gp.predictLocked(latest.Features())
+}
+
 // PredictFromFeatures computes the GP prediction from a feature vector.
 func (gp *AgentGaussianProcess) PredictFromFeatures(features []float64) *GPPrediction {
 	gp.mu.Lock()

@@ -222,6 +222,21 @@ func (m *Model) SetSize(width, height int) {
 	m.width = width
 	m.height = height
 	m.maxHeight = max(height-borderSize, 1)
+
+	// Clamp scrollOff so the visible area is fully utilized when maxHeight
+	// grows (e.g. after a paste triggers input expansion). Without this,
+	// scrollIntoView() during paste sets scrollOff using the OLD maxHeight,
+	// leaving the rendered body shorter than the compositor's allocation.
+	if m.wrap != nil {
+		maxOff := m.wrap.visualTotal - m.maxHeight
+		if maxOff < 0 {
+			maxOff = 0
+		}
+		if m.scrollOff > maxOff {
+			m.scrollOff = maxOff
+		}
+	}
+
 	m.wrapDirty = true
 	m.viewDirty = true
 }

@@ -70,9 +70,9 @@ func defaultDescriptors() []AgentDescriptor {
 		{AgentType: "orchestrator", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone},
 		{AgentType: "engineer", ModelID: "opus-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryPipeline},
 		{AgentType: "designer", ModelID: "sonnet-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryPipeline},
-		{AgentType: "inspector", ModelID: "sonnet-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone},
-		{AgentType: "inspector-pipeline", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryPipeline},
-		{AgentType: "tester", ModelID: "sonnet-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone},
-		{AgentType: "tester-pipeline", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryPipeline},
+		{AgentType: "inspector", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryStandalone},
+		{AgentType: "inspector-pipeline", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryPipeline},
+		{AgentType: "tester", ModelID: "gpt-5.3-codex", ReasoningEffort: "xhigh", ContextWindow: contextWindow200K, Category: CategoryStandalone},
+		{AgentType: "tester-pipeline", ModelID: "gpt-5.3-codex", ReasoningEffort: "xhigh", ContextWindow: contextWindow200K, Category: CategoryPipeline},
 	}
 }

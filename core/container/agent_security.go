@@ -44,16 +44,45 @@ var securityProfileByCategory = map[handoff.AgentCategory]agentSecurityProfile{
 	},
 }
 
+// inspectorReadOnlyOverride forces both inspector variants to read-only
+// filesystem access. Inspectors must NEVER modify files — they observe and
+// report only.
+var inspectorReadOnlyOverride = agentSecurityProfile{
+	role:          "worker",
+	pathRead:      []string{"*"},
+	pathWrite:     nil,
+	canEscalate:   false,
+	runAsReadOnly: true,
+}
+
+// agentTypeOverrides maps specific agent types to security profiles that
+// deviate from their category default. The global inspector is registered
+// as CategoryStandalone for bus permissions but must be filesystem read-only.
+var agentTypeOverrides = map[string]agentSecurityProfile{
+	"inspector":          inspectorReadOnlyOverride,
+	"inspector-pipeline": inspectorReadOnlyOverride,
+}
+
 // BuildSecuritySpec constructs a SecurityContextSpec for an agent based on
-// its descriptor category and topic naming convention. Publish/subscribe
-// topics follow the Guide bus topic convention: agents publish to
-// guide.requests and their own response/error topics, and subscribe to
-// their own request topic and the registry broadcast.
+// its descriptor category and topic naming convention. Agent-type overrides
+// take precedence over category defaults. Publish/subscribe topics follow
+// the Guide bus topic convention: agents publish to guide.requests and
+// their own response/error topics, and subscribe to their own request
+// topic and the registry broadcast.
 func BuildSecuritySpec(desc handoff.AgentDescriptor) SecurityContextSpec {
-	profile := securityProfileByCategory[desc.Category]
+	profile, ok := agentTypeOverrides[desc.AgentType]
+	if !ok {
+		profile = securityProfileByCategory[desc.Category]
+	}
 
 	publishTopics := agentPublishTopics(desc.AgentType)
 	subscribeTopics := agentSubscribeTopics(desc.AgentType)
+
+	// Inspector variants additionally publish to audit.results and subscribe
+	// to request topics from the orchestrator.
+	if desc.AgentType == "inspector" || desc.AgentType == "inspector-pipeline" {
+		publishTopics = append(publishTopics, "audit.results")
+	}
 
 	return SecurityContextSpec{
 		Role: profile.role,

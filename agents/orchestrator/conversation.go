@@ -43,7 +43,14 @@ func (o *Orchestrator) executeConversation(ctx context.Context, req *guide.Forwa
 		}, nil
 	}
 
-	// Build LLM request with conversation system prompt and read-only tools.
+	return o.executeConversationLLM(ctx, cr)
+}
+
+// executeConversationLLM sends the conversation request to the LLM with
+// the orchestrator system prompt, read-only tools, and tool loop.
+// Split from executeConversation so callers (e.g. respondToIngestion) can
+// bypass the static fast-path when the query must always reach the LLM.
+func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestratorConversationRequest) (*ConversationResult, error) {
 	systemPrompt := OrchestratorConversationSystemPrompt()
 	userMessage := buildConversationUserPrompt(cr)
 	tools := o.buildConversationToolDefinitions()
@@ -116,6 +123,33 @@ func formatFallbackResponse(summary *OrchestratorSummary) string {
 	}
 
 	return b.String()
+}
+
+// respondToIngestion transforms the raw ingestion result into a natural
+// language query and delegates to the LLM conversation pipeline. The LLM
+// sees the newly-ingested workflow/tasks/DAG in its runtime snapshot and
+// produces a conversational acknowledgment (or error explanation).
+//
+// Bypasses tryStaticOrchestratorReply because the ingestion summary
+// contains keywords ("execution", "dag", "workflow") that would trigger
+// false-positive static matches.
+func (o *Orchestrator) respondToIngestion(
+	ctx context.Context,
+	req *guide.ForwardedRequest,
+	ingestionResult any,
+) (any, error) {
+	if o.provider == nil {
+		return o.conversationFallback(ctx)
+	}
+
+	summary := buildIngestionSummary(req.Input, ingestionResult)
+
+	enriched := *req // shallow copy preserves routing metadata
+	enriched.Input = summary
+	enriched.Intent = guide.IntentChat
+
+	cr := o.buildConversationRequest(&enriched)
+	return o.executeConversationLLM(ctx, cr)
 }
 
 // extractOrchestratorUserResponse returns the human-readable response from a result.

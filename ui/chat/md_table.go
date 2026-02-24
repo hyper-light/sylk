@@ -28,7 +28,7 @@ func renderTable(n *east.Table, ctx *blockContext) {
 
 	// Render header row.
 	if len(cells) > 0 {
-		ctx.lines = append(ctx.lines, renderTableRow(cells[0], colWidths, alignments, ctx.styles.tableHeader, ctx.styles))
+		ctx.lines = append(ctx.lines, renderTableRow(cells[0], colWidths, alignments, ctx.styles.tableHeader, ctx.styles)...)
 	}
 
 	// Separator line.
@@ -36,7 +36,7 @@ func renderTable(n *east.Table, ctx *blockContext) {
 
 	// Body rows.
 	for i := 1; i < len(cells); i++ {
-		ctx.lines = append(ctx.lines, renderTableRow(cells[i], colWidths, alignments, ctx.styles.text, ctx.styles))
+		ctx.lines = append(ctx.lines, renderTableRow(cells[i], colWidths, alignments, ctx.styles.text, ctx.styles)...)
 	}
 	ctx.lines = append(ctx.lines, "")
 }
@@ -129,41 +129,59 @@ func shrinkColumns(widths []int, available int, colCount int) {
 	}
 }
 
-// renderTableRow renders a single table row with proper column alignment.
-func renderTableRow(cells []tableCell, widths []int, aligns []east.Alignment, cellStyle lipgloss.Style, styles *chatMdStyles) string {
-	var b strings.Builder
+// maxCellWrapLines caps the number of wrapped lines per cell to prevent
+// pathologically tall rows from a single long cell.
+const maxCellWrapLines = 8
+
+// renderTableRow renders a single table row with word-wrapped cell content.
+// Returns one terminal line per wrapped row height (the tallest cell
+// determines the row's line count). Shorter cells are padded with blanks.
+func renderTableRow(cells []tableCell, widths []int, aligns []east.Alignment, cellStyle lipgloss.Style, styles *chatMdStyles) []string {
 	sep := styles.tableBorder.Render(" │ ")
 
+	// Wrap each cell's inline runs to fit the column width.
+	wrapped := make([][]string, len(widths))
+	rowHeight := 1
 	for col := range widths {
-		if col > 0 {
-			b.WriteString(sep)
-		}
-
-		var content string
 		if col < len(cells) {
-			content = renderCellContent(cells[col].runs)
+			wrapped[col] = wrapRuns(cells[col].runs, widths[col])
 		}
-		visWidth := lipgloss.Width(content)
-
-		align := east.AlignNone
-		if col < len(aligns) {
-			align = aligns[col]
+		if len(wrapped[col]) == 0 {
+			wrapped[col] = []string{""}
 		}
-
-		padded := alignCell(content, visWidth, widths[col], align, cellStyle)
-		b.WriteString(padded)
+		if len(wrapped[col]) > maxCellWrapLines {
+			wrapped[col] = wrapped[col][:maxCellWrapLines]
+		}
+		if len(wrapped[col]) > rowHeight {
+			rowHeight = len(wrapped[col])
+		}
 	}
-	return b.String()
+
+	// Build one output line per row height.
+	lines := make([]string, 0, rowHeight)
+	for lineIdx := range rowHeight {
+		var b strings.Builder
+		for col := range widths {
+			if col > 0 {
+				b.WriteString(sep)
+			}
+			var content string
+			if lineIdx < len(wrapped[col]) {
+				content = wrapped[col][lineIdx]
+			}
+			visWidth := lipgloss.Width(content)
+
+			align := east.AlignNone
+			if col < len(aligns) {
+				align = aligns[col]
+			}
+			b.WriteString(alignCell(content, visWidth, widths[col], align, cellStyle))
+		}
+		lines = append(lines, b.String())
+	}
+	return lines
 }
 
-// renderCellContent flattens inline runs into a single string.
-func renderCellContent(runs []styledRun) string {
-	var b strings.Builder
-	for _, r := range runs {
-		b.WriteString(r.rendered)
-	}
-	return b.String()
-}
 
 // alignCell pads content to fit the column width with proper alignment.
 func alignCell(content string, visWidth, colWidth int, align east.Alignment, style lipgloss.Style) string {

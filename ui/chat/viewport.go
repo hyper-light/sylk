@@ -44,15 +44,21 @@ type Viewport struct {
 	edgeFlash          int       // Edge flash direction: -1 = top, 0 = none, 1 = bottom.
 	edgeFlashUntil     time.Time // Expiry time for edge flash.
 	bounceOffset       int       // Visual line displacement from overscroll bounce.
+	codeCache          *codeBlockCache
+	hIdx               heightIndex        // Cached prefix-sum of entry heights.
+	streamState        *streamRenderState // Active stream render state (nil when not streaming).
+	streamEntryIndex   int                // Entry index for the active stream (-1 = none).
 }
 
 // NewViewport creates a Viewport bound to the given History.
 func NewViewport(history *History, th *theme.Theme) *Viewport {
 	return &Viewport{
-		history:       history,
-		theme:         th,
-		following:     true,
-		selectedIndex: -1,
+		history:          history,
+		theme:            th,
+		following:        true,
+		selectedIndex:    -1,
+		codeCache:        newCodeBlockCache(16),
+		streamEntryIndex: -1,
 	}
 }
 
@@ -60,9 +66,15 @@ func NewViewport(history *History, th *theme.Theme) *Viewport {
 // Derived from: 1 space on each side = 2 columns total.
 const chatPadding = 2
 
-// SetSize updates the viewport dimensions.
+// SetSize updates the viewport dimensions. When viewWidth changes,
+// all entry render caches are invalidated (rendered at wrong width).
 func (vp *Viewport) SetSize(width, height int) {
-	vp.viewWidth = max(width-chatPadding, 0)
+	newWidth := max(width-chatPadding, 0)
+	if newWidth != vp.viewWidth {
+		vp.invalidateAllEntryHeights()
+		vp.codeCache.Clear()
+	}
+	vp.viewWidth = newWidth
 	vp.viewHeight = max(height, 0)
 }
 
@@ -344,16 +356,13 @@ func (vp *Viewport) scrollRangeIntoView(rangeStart, rangeEnd int) {
 
 // entryLineRange returns the absolute start line (inclusive) and end line
 // (exclusive) for the entry at the given logical index.
+// Uses the cached height index. O(log n) via buildHeightIndex.
 func (vp *Viewport) entryLineRange(index int) (start, end int) {
-	cumulative := 0
-	for i := range vp.history.Len() {
-		h := vp.entryHeight(i)
-		if i == index {
-			return cumulative, cumulative + h
-		}
-		cumulative += h
+	vp.buildHeightIndex()
+	if index < 0 || index >= vp.hIdx.entryCount {
+		return 0, 0
 	}
-	return 0, 0
+	return vp.hIdx.cumulative[index], vp.hIdx.cumulative[index+1]
 }
 
 // regions returns the navigable regions for an entry, ensuring it is
@@ -471,16 +480,14 @@ func (vp *Viewport) lastVisibleLineBg() lipgloss.Color {
 
 // entryAtAbsLine returns the entry index and entry-relative line number
 // for the given absolute line position. Returns (-1, 0) if not found.
+// Uses binary search via the height index. O(log n).
 func (vp *Viewport) entryAtAbsLine(absLine int) (int, int) {
-	cumulative := 0
-	for i := range vp.history.Len() {
-		h := vp.entryHeight(i)
-		if absLine < cumulative+h {
-			return i, absLine - cumulative
-		}
-		cumulative += h
+	vp.buildHeightIndex()
+	idx := vp.hIdx.findEntryAtLine(absLine)
+	if idx < 0 {
+		return -1, 0
 	}
-	return -1, 0
+	return idx, absLine - vp.hIdx.cumulative[idx]
 }
 
 // copyHighlightBgAt returns the copy-highlight background color if the
@@ -541,20 +548,85 @@ func truncateVisible(s string, maxCols int) string {
 	return s
 }
 
-// collectVisibleLines flattens all entry lines and extracts the window
-// defined by scrollOff and viewHeight.
+// heightIndex is a prefix-sum index over entry heights for O(log n) lookups.
+type heightIndex struct {
+	cumulative []int // cumulative[i] = sum of heights for entries 0..i-1. len = count+1.
+	entryCount int
+}
+
+// buildHeightIndex populates the prefix-sum from current entry heights.
+// Reuses slice capacity when possible.
+func (vp *Viewport) buildHeightIndex() {
+	count := vp.history.Len()
+	needed := count + 1
+	if cap(vp.hIdx.cumulative) >= needed {
+		vp.hIdx.cumulative = vp.hIdx.cumulative[:needed]
+	} else {
+		vp.hIdx.cumulative = make([]int, needed)
+	}
+	vp.hIdx.entryCount = count
+	vp.hIdx.cumulative[0] = 0
+	for i := range count {
+		vp.hIdx.cumulative[i+1] = vp.hIdx.cumulative[i] + vp.entryHeight(i)
+	}
+}
+
+// findEntryAtLine returns the entry index containing the given absolute line.
+// Uses binary search on the cumulative prefix sum. O(log n).
+// Returns -1 if absLine is out of range.
+func (hi *heightIndex) findEntryAtLine(absLine int) int {
+	if hi.entryCount == 0 || absLine < 0 || absLine >= hi.cumulative[hi.entryCount] {
+		return -1
+	}
+	lo, h := 0, hi.entryCount
+	for lo < h {
+		mid := lo + (h-lo)/2
+		if hi.cumulative[mid+1] <= absLine {
+			lo = mid + 1
+		} else {
+			h = mid
+		}
+	}
+	return lo
+}
+
+// collectVisibleLines renders only the entries overlapping the viewport
+// window defined by scrollOff and viewHeight, clipping partial entries
+// at the boundaries.
 func (vp *Viewport) collectVisibleLines(total int) []string {
-	all := vp.flattenLines(total)
-	totalLines := len(all)
+	vp.buildHeightIndex()
+	totalLines := vp.hIdx.cumulative[vp.hIdx.entryCount]
 
 	end := max(totalLines-vp.scrollOff, 0)
 	start := max(end-vp.viewHeight, 0)
 
-	if end > totalLines {
-		end = totalLines
+	if totalLines == 0 || start >= end {
+		return nil
 	}
 
-	visible := all[start:end]
+	firstEntry := vp.hIdx.findEntryAtLine(start)
+	lastEntry := vp.hIdx.findEntryAtLine(end - 1)
+	if firstEntry < 0 {
+		firstEntry = 0
+	}
+	if lastEntry < 0 {
+		lastEntry = vp.hIdx.entryCount - 1
+	}
+
+	visible := make([]string, 0, end-start)
+	for i := firstEntry; i <= lastEntry; i++ {
+		entryLines := vp.renderEntry(i)
+		entryStart := vp.hIdx.cumulative[i]
+		entryEnd := vp.hIdx.cumulative[i+1]
+
+		// Clip to visible window.
+		lineFrom := max(start-entryStart, 0)
+		lineTo := min(end-entryStart, entryEnd-entryStart)
+		if lineFrom < lineTo && lineFrom < len(entryLines) {
+			lineTo = min(lineTo, len(entryLines))
+			visible = append(visible, entryLines[lineFrom:lineTo]...)
+		}
+	}
 
 	// Trim leading empty lines so messages align flush to the top.
 	for len(visible) > 0 && visible[0] == "" {
@@ -564,19 +636,31 @@ func (vp *Viewport) collectVisibleLines(total int) []string {
 	return visible
 }
 
-// flattenLines renders all entries and concatenates their lines.
-// Rendering is cached per entry, so repeated calls are cheap.
-func (vp *Viewport) flattenLines(total int) []string {
-	var all []string
-	for i := 0; i < total; i++ {
-		all = append(all, vp.renderEntry(i)...)
+// invalidateAllEntryHeights clears the render cache for all entries,
+// forcing re-render on next view pass.
+func (vp *Viewport) invalidateAllEntryHeights() {
+	count := vp.history.Len()
+	vp.history.mu.Lock()
+	defer vp.history.mu.Unlock()
+	for i := range count {
+		physical := vp.history.logicalToPhysical(i)
+		vp.history.entries[physical].RenderedLines = nil
+		vp.history.entries[physical].CodeRegions = nil
+		vp.history.entries[physical].Height = -1
 	}
-	return all
+}
+
+// SetStreamState sets the active stream render state and entry index.
+// Pass nil state and -1 index to clear.
+func (vp *Viewport) SetStreamState(state *streamRenderState, entryIndex int) {
+	vp.streamState = state
+	vp.streamEntryIndex = entryIndex
 }
 
 // renderEntry renders a single entry by logical index, using cached lines
 // if available. If the entry matches highlightID, a background highlight
-// is applied on top of the cached output.
+// is applied on top of the cached output. For the active streaming entry,
+// uses incremental rendering via renderStreamingEntryFull.
 func (vp *Viewport) renderEntry(index int) []string {
 	entry := vp.history.Get(index)
 	if entry == nil {
@@ -584,10 +668,15 @@ func (vp *Viewport) renderEntry(index int) []string {
 	}
 
 	var lines []string
-	if entry.RenderedLines != nil && entry.Height >= 0 {
+	// Use incremental streaming render for the active streaming entry.
+	if index == vp.streamEntryIndex && vp.streamState != nil {
+		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, vp.streamState)
+		vp.cacheRendered(index, rendered, regions)
+		lines = rendered
+	} else if entry.RenderedLines != nil && entry.Height >= 0 {
 		lines = entry.RenderedLines
 	} else {
-		rendered, regions := RenderEntry(entry, vp.viewWidth, vp.theme)
+		rendered, regions := RenderEntry(entry, vp.viewWidth, vp.theme, vp.codeCache)
 		vp.cacheRendered(index, rendered, regions)
 		lines = rendered
 	}
@@ -828,13 +917,10 @@ func applyBounceShift(lines []string, offset, viewHeight int) []string {
 }
 
 // totalLines returns the sum of all rendered entry heights.
+// Builds the height index as a side effect to keep it fresh.
 func (vp *Viewport) totalLines() int {
-	total := vp.history.Len()
-	lines := 0
-	for i := 0; i < total; i++ {
-		lines += vp.entryHeight(i)
-	}
-	return lines
+	vp.buildHeightIndex()
+	return vp.hIdx.cumulative[vp.hIdx.entryCount]
 }
 
 // maxScrollOffset returns the maximum line-based scroll offset.
@@ -877,7 +963,7 @@ func (vp *Viewport) entryHeight(index int) int {
 	if entry.Height >= 0 {
 		return entry.Height
 	}
-	rendered, regions := RenderEntry(entry, vp.viewWidth, vp.theme)
+	rendered, regions := RenderEntry(entry, vp.viewWidth, vp.theme, vp.codeCache)
 	vp.cacheRendered(index, rendered, regions)
 	return len(rendered)
 }

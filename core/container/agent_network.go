@@ -12,12 +12,14 @@ func BuildNetworkPolicies(descriptors []handoff.AgentDescriptor) []*network.Netw
 	pipelineTypes := collectByCategory(descriptors, handoff.CategoryPipeline)
 	knowledgeTypes := collectByCategory(descriptors, handoff.CategoryKnowledge)
 
-	policies := make([]*network.NetworkPolicy, 0, len(descriptors)*2+3)
+	policies := make([]*network.NetworkPolicy, 0, len(descriptors)*2+5)
 	policies = append(policies, guideHubIngress(allTypes))
 	policies = append(policies, perAgentPolicies(allTypes)...)
 	policies = append(policies, registryBroadcast())
 	policies = append(policies, orchestratorPipelineEgress(pipelineTypes))
 	policies = append(policies, architectConsultationEgress(knowledgeTypes))
+	policies = append(policies, auditResultsPublish())
+	policies = append(policies, auditResultsSubscribe())
 	return policies
 }
 
@@ -109,6 +111,32 @@ func architectConsultationEgress(knowledgeTypes []string) *network.NetworkPolicy
 		Egress: []network.EgressRule{{
 			To:            []network.PeerSelector{{AgentTypes: knowledgeTypes}},
 			AllowedTopics: []string{"request.*.*"},
+		}},
+	}
+}
+
+// auditResultsPublish creates the policy allowing inspector variants to publish
+// audit findings to the audit.results topic.
+func auditResultsPublish() *network.NetworkPolicy {
+	return &network.NetworkPolicy{
+		Name:        "audit-results-publish",
+		PodSelector: map[string]string{},
+		Egress: []network.EgressRule{{
+			To:            []network.PeerSelector{{AgentTypes: []string{"inspector", "inspector-pipeline"}}},
+			AllowedTopics: []string{"audit.results"},
+		}},
+	}
+}
+
+// auditResultsSubscribe creates the policy allowing the orchestrator and
+// architect to subscribe to audit findings on the audit.results topic.
+func auditResultsSubscribe() *network.NetworkPolicy {
+	return &network.NetworkPolicy{
+		Name:        "audit-results-subscribe",
+		PodSelector: map[string]string{},
+		Ingress: []network.IngressRule{{
+			From:          []network.PeerSelector{{AgentTypes: []string{"orchestrator", "architect"}}},
+			AllowedTopics: []string{"audit.results"},
 		}},
 	}
 }

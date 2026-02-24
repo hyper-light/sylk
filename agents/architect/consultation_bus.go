@@ -37,6 +37,13 @@ func (a *Architect) deliverPendingBusMessage(msg *guide.Message) {
 	if msg == nil || msg.CorrelationID == "" {
 		return
 	}
+	// Only deliver terminal messages (response or error) to synchronous
+	// waiters. Stream events (start, chunk, complete) arrive on the same
+	// channel via the Guide relay and must be filtered out — otherwise
+	// requestRouteSync returns a stream event instead of the real response.
+	if msg.Type != guide.MessageTypeResponse && msg.Type != guide.MessageTypeError {
+		return
+	}
 	a.pendingMu.Lock()
 	ch := a.pendingBus[msg.CorrelationID]
 	a.pendingMu.Unlock()
@@ -48,6 +55,11 @@ func (a *Architect) deliverPendingBusMessage(msg *guide.Message) {
 	default:
 	}
 }
+
+// routeSyncTimeout bounds how long the architect waits for a bus response.
+// If the orchestrator (or any other target) fails to respond within this
+// window, the caller receives a timeout error rather than blocking forever.
+const routeSyncTimeout = 60 * time.Second
 
 func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error) {
 	if a.bus == nil || !a.running {
@@ -68,9 +80,13 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		return nil, err
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, routeSyncTimeout)
+	defer cancel()
+
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, fmt.Errorf("route request to %q timed out after %s: %w",
+			req.TargetAgentID, routeSyncTimeout, ctx.Err())
 	case response := <-waitCh:
 		return response, nil
 	}

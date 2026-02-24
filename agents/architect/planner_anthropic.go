@@ -20,14 +20,28 @@ type planningLLM interface {
 	ComposeUserResponse(ctx context.Context, request plannerConversationRequest) (string, error)
 }
 
+// plannerStreamProvider is the subset of provider capabilities the planner
+// needs. Satisfied by *providers.AnthropicProvider and test mocks.
+type plannerStreamProvider interface {
+	StreamWithHandler(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error
+}
+
 type anthropicPlanner struct {
-	provider           *providers.AnthropicProvider
+	provider           plannerStreamProvider
 	maxTokens          int
 	thinkingBudget     int
 	system             string
 	conversationSystem string
 	timeout            time.Duration
 	logger             *slog.Logger
+}
+
+// streamResult carries the full outcome of a single streaming LLM call,
+// including the stop reason so callers can detect max_tokens truncation.
+type streamResult struct {
+	Text       string
+	Usage      *providers.Usage
+	StopReason providers.StopReason
 }
 
 type plannerThoughtCallback func(stage string, thought string)
@@ -94,13 +108,19 @@ func (a *Architect) tryAnalyzeRequirementsWithLLM(
 ) (*Requirements, bool) {
 	planner := a.ensurePlanner()
 	if planner == nil {
+		a.logInfo("architect llm requirements: planner unavailable")
 		return nil, false
 	}
 	requirements, err := planner.AnalyzeRequirements(ctx, query, params)
 	if err != nil {
-		a.logger.Warn("architect llm requirements fallback", "error", err)
+		a.logWarn("architect llm requirements fallback", "error", err)
 		return nil, false
 	}
+	if requirements == nil || len(requirements.Goals) == 0 {
+		a.logWarn("architect llm requirements: empty goals, using deterministic fallback")
+		return nil, false
+	}
+	a.logInfo("architect llm requirements ok", "goals", len(requirements.Goals))
 	return requirements, true
 }
 
@@ -111,13 +131,19 @@ func (a *Architect) tryDesignArchitectureWithLLM(
 ) (*SolutionArchitecture, bool) {
 	planner := a.ensurePlanner()
 	if planner == nil {
+		a.logInfo("architect llm design: planner unavailable")
 		return nil, false
 	}
 	architecture, err := planner.DesignArchitecture(ctx, requirements, patterns)
 	if err != nil {
-		a.logger.Warn("architect llm design fallback", "error", err)
+		a.logWarn("architect llm design fallback", "error", err)
 		return nil, false
 	}
+	if architecture == nil || len(architecture.Components) == 0 {
+		a.logWarn("architect llm design: empty components, using deterministic fallback")
+		return nil, false
+	}
+	a.logInfo("architect llm design ok", "components", len(architecture.Components))
 	return architecture, true
 }
 
@@ -128,13 +154,19 @@ func (a *Architect) tryGenerateTasksWithLLM(
 ) ([]*AtomicTask, bool) {
 	planner := a.ensurePlanner()
 	if planner == nil {
+		a.logInfo("architect llm tasks: planner unavailable")
 		return nil, false
 	}
 	tasks, err := planner.GenerateTasks(ctx, architecture, constraints)
 	if err != nil {
-		a.logger.Warn("architect llm task fallback", "error", err)
+		a.logWarn("architect llm task fallback", "error", err)
 		return nil, false
 	}
+	if len(tasks) == 0 {
+		a.logWarn("architect llm tasks: empty result, using deterministic fallback")
+		return nil, false
+	}
+	a.logInfo("architect llm tasks ok", "count", len(tasks))
 	return normalizeTaskGraph(tasks), true
 }
 
@@ -152,7 +184,6 @@ func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
 		EnableCaching:    !cfg.DisablePromptCache,
 		PromptCacheTTL:   cfg.PromptCacheTTL,
 		SystemPrompt:     buildPlannerSystemPrompt(cfg.SystemPrompt),
-		ThinkingBudget:   cfg.ThinkingBudget,
 		AdaptiveThinking: true,
 	}
 	if providerCfg.Model == "" {
@@ -174,7 +205,7 @@ func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
 	return &anthropicPlanner{
 		provider:           provider,
 		maxTokens:          cfg.MaxOutputTokens,
-		thinkingBudget:     cfg.ThinkingBudget,
+		thinkingBudget:     0, // Adaptive thinking — model allocates dynamically.
 		system:             buildPlannerSystemPrompt(cfg.SystemPrompt),
 		conversationSystem: buildPlannerConversationSystemPrompt(cfg.SystemPrompt),
 		timeout:            cfg.LLMRequestTimeout,
@@ -283,8 +314,8 @@ func (p *anthropicPlanner) parseTasksWithBudgets(
 	stage string,
 ) ([]*AtomicTask, error) {
 	var lastErr error
-	for _, budget := range budgets {
-		text, _, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system, stage)
+	for i, budget := range budgets {
+		text, err := p.requestJSONText(ctx, prompt, budget, system, stage, i == len(budgets)-1)
 		if err != nil {
 			lastErr = err
 			continue
@@ -307,8 +338,8 @@ func (p *anthropicPlanner) requestJSONWithBudgets(
 	stage string,
 ) error {
 	var lastErr error
-	for _, budget := range budgets {
-		text, _, err := p.requestTextWithMaxTokens(ctx, prompt, budget, system, stage)
+	for i, budget := range budgets {
+		text, err := p.requestJSONText(ctx, prompt, budget, system, stage, i == len(budgets)-1)
 		if err != nil {
 			lastErr = err
 			continue
@@ -322,7 +353,51 @@ func (p *anthropicPlanner) requestJSONWithBudgets(
 	return lastErr
 }
 
-func (p *anthropicPlanner) requestTextWithMaxTokens(
+// requestJSONText performs a single-shot request at the given budget.
+// At non-final budgets, truncation (max_tokens) returns an error immediately
+// so the caller escalates to the next budget without wasting continuation
+// round trips. At the final budget, continuation is used to extend the
+// response since there is no higher budget to escalate to.
+func (p *anthropicPlanner) requestJSONText(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+	finalBudget bool,
+) (string, error) {
+	if finalBudget {
+		text, _, err := p.requestTextWithContinuation(ctx, prompt, maxTokens, system, stage)
+		return text, err
+	}
+	// Non-final budget: single-shot, fast-escalate on truncation.
+	sr, err := p.requestTextOnce(ctx, prompt, maxTokens, system, stage)
+	if err != nil {
+		return "", err
+	}
+	if sr.StopReason == providers.StopReasonMaxTokens {
+		return "", fmt.Errorf("response truncated at %d token budget, escalating", maxTokens)
+	}
+	return sr.Text, nil
+}
+
+// requestTextOnce performs a single-shot request and returns the full
+// streamResult including StopReason, allowing callers to react to truncation.
+func (p *anthropicPlanner) requestTextOnce(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+) (*streamResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	return p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, nil)
+}
+
+// requestTextWithContinuation performs a request with automatic continuation
+// on max_tokens, used for final-budget JSON calls where no escalation remains.
+func (p *anthropicPlanner) requestTextWithContinuation(
 	ctx context.Context,
 	prompt string,
 	maxTokens int,
@@ -331,7 +406,7 @@ func (p *anthropicPlanner) requestTextWithMaxTokens(
 ) (string, *providers.Usage, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	return p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, nil)
+	return p.requestTextStreamingWithContinuation(ctx, prompt, maxTokens, system, stage, nil)
 }
 
 func (p *anthropicPlanner) requestTextStreamingWithMaxTokens(
@@ -344,7 +419,7 @@ func (p *anthropicPlanner) requestTextStreamingWithMaxTokens(
 ) (string, *providers.Usage, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	return p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, onChunk)
+	return p.requestTextStreamingWithContinuation(ctx, prompt, maxTokens, system, stage, onChunk)
 }
 
 func (p *anthropicPlanner) requestTextStreamingOnce(
@@ -354,7 +429,7 @@ func (p *anthropicPlanner) requestTextStreamingOnce(
 	system string,
 	stage string,
 	onChunk func(string),
-) (string, *providers.Usage, error) {
+) (*streamResult, error) {
 	resolvedSystem := p.resolveSystemPrompt(system)
 	req := &providers.Request{
 		Messages: []providers.Message{
@@ -364,10 +439,22 @@ func (p *anthropicPlanner) requestTextStreamingOnce(
 		SystemPrompt:   resolvedSystem,
 		ThinkingBudget: p.resolveThinkingBudget(maxTokens),
 	}
+	return p.streamRequest(ctx, req, stage, onChunk)
+}
 
+// streamRequest executes a single streaming request and returns the result.
+// Separated from requestTextStreamingOnce so continuation can reuse it
+// with custom multi-turn requests.
+func (p *anthropicPlanner) streamRequest(
+	ctx context.Context,
+	req *providers.Request,
+	stage string,
+	onChunk func(string),
+) (*streamResult, error) {
 	var text strings.Builder
 	var thoughts strings.Builder
 	var finalUsage *providers.Usage
+	var stopReason providers.StopReason
 	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
 		switch chunk.Type {
 		case providers.ChunkTypeStart:
@@ -390,17 +477,178 @@ func (p *anthropicPlanner) requestTextStreamingOnce(
 				finalUsage = chunk.Usage
 				accumulateArchitectUsage(ctx, chunk.Usage)
 			}
+			if chunk.StopReason != "" {
+				stopReason = chunk.StopReason
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return "", nil, err
+		// If the stream was interrupted but we accumulated partial text,
+		// treat it as a truncated result rather than discarding the work.
+		// The continuation loop can pick it up via StopReasonMaxTokens.
+		if partial := strings.TrimSpace(text.String()); partial != "" && isRecoverableStreamError(ctx, err) {
+			return &streamResult{
+				Text:       partial,
+				Usage:      finalUsage,
+				StopReason: providers.StopReasonMaxTokens,
+			}, nil
+		}
+		return nil, err
 	}
 	result := strings.TrimSpace(text.String())
 	if result == "" {
-		return "", nil, fmt.Errorf("planner returned empty content")
+		return nil, fmt.Errorf("planner returned empty content")
 	}
-	return result, finalUsage, nil
+	return &streamResult{
+		Text:       result,
+		Usage:      finalUsage,
+		StopReason: stopReason,
+	}, nil
+}
+
+const (
+	maxContinuationRounds = 4
+	continuationPrompt    = "Continue exactly where you left off. Do not repeat any text already generated."
+	truncationIndicator   = "\n\n---\n*[Response truncated due to length. Ask me to continue if you need more detail.]*"
+	// contextDeadlineGuard is the minimum remaining time needed to attempt a continuation round.
+	contextDeadlineGuard = 10 * time.Second
+)
+
+// requestTextStreamingWithContinuation wraps requestTextStreamingOnce with
+// automatic continuation when the model hits the max output token limit.
+// Continuation rounds reuse the same onChunk callback, making the token
+// flow seamless from the UI's perspective.
+func (p *anthropicPlanner) requestTextStreamingWithContinuation(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+	onChunk func(string),
+) (string, *providers.Usage, error) {
+	sr, err := p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, onChunk)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Common path: model finished naturally — return immediately.
+	if sr.StopReason != providers.StopReasonMaxTokens {
+		return sr.Text, sr.Usage, nil
+	}
+
+	accumulated := sr.Text
+	mergedUsage := cloneUsage(sr.Usage)
+
+	for round := range maxContinuationRounds {
+		if !hasTimeForContinuation(ctx) {
+			p.logger.Info("continuation skipped: context deadline too close",
+				"round", round+1, "accumulated_len", len(accumulated))
+			break
+		}
+
+		contResult, contErr := p.requestContinuation(ctx, prompt, accumulated, maxTokens, system, stage, onChunk)
+		if contErr != nil {
+			p.logger.Warn("continuation round failed, returning partial",
+				"round", round+1, "error", contErr)
+			break
+		}
+
+		accumulated += contResult.Text
+		mergedUsage = mergeUsage(mergedUsage, contResult.Usage)
+
+		if contResult.StopReason != providers.StopReasonMaxTokens {
+			return accumulated, mergedUsage, nil
+		}
+	}
+
+	// All rounds exhausted or broke out — still max_tokens.
+	// Stream the indicator to the UI so the user sees truncation happened,
+	// but do NOT include it in the returned text. The returned text feeds
+	// into plan.UserResponse → ConversationHistory → next LLM prompt.
+	// Including the indicator there causes the model to interpret its own
+	// prior response as failed/incomplete and refuse to proceed with handoff.
+	if onChunk != nil {
+		onChunk(truncationIndicator)
+	}
+	return accumulated, mergedUsage, nil
+}
+
+// requestContinuation builds a multi-turn prefill request and streams
+// the continuation through the same onChunk callback.
+func (p *anthropicPlanner) requestContinuation(
+	ctx context.Context,
+	originalPrompt string,
+	accumulatedText string,
+	maxTokens int,
+	system string,
+	stage string,
+	onChunk func(string),
+) (*streamResult, error) {
+	resolvedSystem := p.resolveSystemPrompt(system)
+	req := &providers.Request{
+		Messages: []providers.Message{
+			{Role: providers.RoleUser, Content: originalPrompt},
+			{Role: providers.RoleAssistant, Content: accumulatedText},
+			{Role: providers.RoleUser, Content: continuationPrompt},
+		},
+		MaxTokens:      maxTokens,
+		SystemPrompt:   resolvedSystem,
+		ThinkingBudget: 0, // Model already reasoned on round 1.
+	}
+	return p.streamRequest(ctx, req, stage, onChunk)
+}
+
+// mergeUsage sums two Usage values, handling nil inputs.
+func mergeUsage(a *providers.Usage, b *providers.Usage) *providers.Usage {
+	if a == nil && b == nil {
+		return nil
+	}
+	result := &providers.Usage{}
+	if a != nil {
+		result.InputTokens = a.InputTokens
+		result.OutputTokens = a.OutputTokens
+		result.TotalTokens = a.TotalTokens
+		result.CacheReadTokens = a.CacheReadTokens
+		result.CacheWriteTokens = a.CacheWriteTokens
+	}
+	if b != nil {
+		result.InputTokens += b.InputTokens
+		result.OutputTokens += b.OutputTokens
+		result.TotalTokens += b.TotalTokens
+		result.CacheReadTokens += b.CacheReadTokens
+		result.CacheWriteTokens += b.CacheWriteTokens
+	}
+	return result
+}
+
+// cloneUsage returns a shallow copy of a Usage pointer, or nil.
+func cloneUsage(u *providers.Usage) *providers.Usage {
+	if u == nil {
+		return nil
+	}
+	copy := *u
+	return &copy
+}
+
+// isRecoverableStreamError returns true if the error indicates a stream
+// interruption (timeout, cancellation) where accumulated partial text
+// should be preserved rather than discarded.
+func isRecoverableStreamError(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+// hasTimeForContinuation checks whether the context has enough remaining
+// deadline to justify another API call.
+func hasTimeForContinuation(ctx context.Context) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true // No deadline set — proceed.
+	}
+	return time.Until(deadline) >= contextDeadlineGuard
 }
 
 func appendThoughtDelta(buffer *strings.Builder, delta string) string {
@@ -414,23 +662,21 @@ func appendThoughtDelta(buffer *strings.Builder, delta string) string {
 }
 
 // resolveThinkingBudget returns the thinking budget for a planner request.
-// Uses the configured thinkingBudget if set, otherwise falls back to
-// maxTokens/3 dynamic computation. Clamps to maxTokens - 1.
+// Returns 0 when thinkingBudget is not explicitly configured — this is the
+// normal case with adaptive thinking, where the provider handles allocation
+// dynamically and the request should not carry a fixed budget.
+// When a fixed budget IS set, clamps to [0, maxTokens-1].
 func (p *anthropicPlanner) resolveThinkingBudget(maxTokens int) int {
+	if p.thinkingBudget <= 0 {
+		return 0
+	}
 	if maxTokens < 2048 {
 		return 0
 	}
-	budget := p.thinkingBudget
-	if budget <= 0 {
-		budget = maxTokens / 3
-		if budget < 1024 {
-			budget = 1024
-		}
-	}
-	if budget >= maxTokens {
+	if p.thinkingBudget >= maxTokens {
 		return maxTokens - 1
 	}
-	return budget
+	return p.thinkingBudget
 }
 
 func (p *anthropicPlanner) systemForStage(stage string) string {

@@ -130,6 +130,20 @@ const (
 	DefaultSkillTokenBudget    = 3200
 )
 
+// logInfo logs at Info level, safe to call when a.logger is nil.
+func (a *Architect) logInfo(msg string, args ...any) {
+	if a != nil && a.logger != nil {
+		a.logger.Info(msg, args...)
+	}
+}
+
+// logWarn logs at Warn level, safe to call when a.logger is nil.
+func (a *Architect) logWarn(msg string, args ...any) {
+	if a != nil && a.logger != nil {
+		a.logger.Warn(msg, args...)
+	}
+}
+
 // New creates a new Architect agent
 func New(cfg Config) (*Architect, error) {
 	cfg = applyConfigDefaults(cfg)
@@ -668,17 +682,23 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 // Both IntentPlan and IntentDesign route here so the architect converses
 // naturally before formalizing a plan.
 func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	a.logInfo("handleConversation: entry",
+		"input", truncateString(fwd.Input, 80),
+		"intent", string(fwd.Intent))
+
 	// Check if user is approving a ready plan for execution.
 	preReq := &ArchitectRequest{
 		Query:     fwd.Input,
 		SessionID: sessionIDFromForwarded(fwd),
 	}
 	if result, ok := a.tryExecutePlan(ctx, preReq); ok {
+		a.logInfo("handleConversation: dispatched existing plan")
 		return result, nil
 	}
 
 	// Check if user is confirming plan formalization after conversation.
 	if plan, ok := a.tryFormalizePlan(ctx, fwd); ok {
+		a.logInfo("handleConversation: formalized plan")
 		return plan, nil
 	}
 
@@ -692,6 +712,8 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		ConversationHistory: fwd.ConversationHistory,
 	}
 
+	a.logInfo("handleConversation: routing to Handle",
+		"intent", string(req.Intent))
 	return a.Handle(ctx, req)
 }
 
@@ -876,8 +898,10 @@ func extractConstraints(params map[string]any) *PlanConstraints {
 // analyzeRequirements extracts and structures requirements from the query
 func (a *Architect) analyzeRequirements(ctx context.Context, query string, params map[string]any) (*Requirements, error) {
 	if requirements, ok := a.tryAnalyzeRequirementsWithLLM(ctx, query, params); ok {
+		a.logInfo("analyzeRequirements: LLM path used", "goals", len(requirements.Goals))
 		return requirements, nil
 	}
+	a.logInfo("analyzeRequirements: deterministic fallback")
 
 	requirements := &Requirements{
 		Query:        query,
@@ -927,8 +951,11 @@ func (a *Architect) consultLibrarian(ctx context.Context, requirements *Requirem
 // designArchitecture creates a solution architecture based on requirements
 func (a *Architect) designArchitecture(ctx context.Context, requirements *Requirements, patterns *CodebasePatterns) (*SolutionArchitecture, error) {
 	if architecture, ok := a.tryDesignArchitectureWithLLM(ctx, requirements, patterns); ok {
+		a.logInfo("designArchitecture: LLM path used", "components", len(architecture.Components))
 		return architecture, nil
 	}
+	a.logInfo("designArchitecture: deterministic fallback",
+		"goals", len(requirements.Goals))
 
 	architecture := &SolutionArchitecture{
 		Name:        fmt.Sprintf("Architecture for: %s", truncateString(requirements.Query, 50)),
@@ -945,6 +972,8 @@ func (a *Architect) designArchitecture(ctx context.Context, requirements *Requir
 		}
 	}
 
+	a.logInfo("designArchitecture: deterministic result",
+		"components", len(architecture.Components))
 	return architecture, nil
 }
 
@@ -980,8 +1009,11 @@ func deriveComponentsFromGoals(requirements *Requirements) []ComponentSpec {
 // - Dependencies must be explicit
 func (a *Architect) generateAtomicTasks(ctx context.Context, architecture *SolutionArchitecture, constraints *PlanConstraints) ([]*AtomicTask, error) {
 	if tasks, ok := a.tryGenerateTasksWithLLM(ctx, architecture, constraints); ok {
+		a.logInfo("generateAtomicTasks: LLM path used", "tasks", len(tasks))
 		return tasks, nil
 	}
+	a.logInfo("generateAtomicTasks: deterministic fallback",
+		"components", len(architecture.Components))
 
 	tasks := make([]*AtomicTask, 0)
 
@@ -1259,6 +1291,9 @@ func (a *Architect) executeCheck(ctx context.Context, req *ArchitectRequest) (an
 // converse, plan, design, and unclassified) with a single LLM call instead of
 // the full planning protocol.
 func (a *Architect) executeConversation(ctx context.Context, req *ArchitectRequest) (any, error) {
+	a.logInfo("executeConversation: entry",
+		"intent", string(req.Intent),
+		"query", truncateString(req.Query, 80))
 	ctx = withPlannerThoughtCallback(ctx, func(stage string, thought string) {
 		a.publishPlanThought(ctx, stage, thought)
 	})
@@ -1273,14 +1308,15 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	}
 	response, composeErr := a.composeUserFacingResponse(ctx, request)
 	if composeErr == nil {
+		a.logInfo("executeConversation: LLM compose succeeded",
+			"response_len", len(response))
 		return &ConversationResult{
 			Response: response,
 			Intent:   req.Intent,
 		}, nil
 	}
-	a.logger.Warn("conversation compose failed, using domain fallback",
-		"intent", req.Intent, "error", composeErr)
-	// LLM unavailable — fall back to domain-specific execution.
+	a.logWarn("executeConversation: compose failed, using domain fallback",
+		"intent", string(req.Intent), "error", composeErr)
 	return a.conversationFallback(ctx, req, composeErr)
 }
 
@@ -1289,7 +1325,11 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 // (no API key), returns a clear error instead of running the planning
 // protocol with deterministic-only fallbacks that produce generic tasks.
 func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequest, composeErr error) (any, error) {
+	a.logInfo("conversationFallback: entry",
+		"intent", string(req.Intent),
+		"planner_available", a.ensurePlanner() != nil)
 	if a.ensurePlanner() == nil {
+		a.logWarn("conversationFallback: no planner configured")
 		return &ConversationResult{
 			Response: "I can't generate a detailed plan right now — my LLM planner is not configured. " +
 				"Please ensure an Anthropic API key is available (ANTHROPIC_API_KEY environment variable or the secure credential store).",

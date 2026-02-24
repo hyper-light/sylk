@@ -30,6 +30,15 @@ type ConversationResult struct {
 	Intent   ArchitectIntent
 }
 
+// ResponseText implements the guide-layer text extraction interface so the
+// conversation history stores the clean response string, not a JSON blob.
+func (r *ConversationResult) ResponseText() string {
+	if r == nil {
+		return ""
+	}
+	return r.Response
+}
+
 func (i ArchitectIntent) String() string {
 	return string(i)
 }
@@ -114,6 +123,15 @@ type DesignPlan struct {
 	UpdatedAt              time.Time
 	CreatedAt              time.Time
 	CompletedAt            time.Time
+}
+
+// ResponseText implements the guide-layer text extraction interface so the
+// conversation history stores the human-readable plan summary, not a JSON blob.
+func (p *DesignPlan) ResponseText() string {
+	if p == nil {
+		return ""
+	}
+	return p.UserResponse
 }
 
 type PlanConstraints struct {
@@ -452,6 +470,9 @@ type PlanHandoff struct {
 	RiskSummary     []string              `json:"risk_summary,omitempty"`
 	Trigger         string                `json:"trigger"` // "user-approved" | "auto"
 	Timestamp       time.Time             `json:"timestamp"`
+	Architecture    *SolutionArchitecture `json:"architecture,omitempty"`
+	Requirements    *Requirements         `json:"requirements,omitempty"`
+	Assumptions     []string              `json:"assumptions,omitempty"`
 }
 
 // HandoffTask is the wire format for a single task in PlanHandoff.

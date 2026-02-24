@@ -43,6 +43,13 @@ type HandoffSupervisor struct {
 
 	onAgentReplaced func(oldID, newID string, newAgent HandoffableAgent) error
 
+	// Quality publisher — propagated to all bridges.
+	qualityPublisher func(agentID string, quality, stdDev float64)
+
+	// Traffic shift callbacks — wired by bootstrap.
+	onShiftBegin func(oldID string, newAgent HandoffableAgent)
+	updateWeight func(agentID string, weight float64)
+
 	started atomic.Bool
 }
 
@@ -160,6 +167,14 @@ func (s *HandoffSupervisor) RegisterAgent(agent HandoffableAgent) (*HandoffBridg
 	cfg := BridgeConfigForAgent(desc)
 	bridge := NewHandoffBridge(cfg, agent, s)
 
+	// Propagate quality publisher to the new bridge.
+	s.mu.RLock()
+	publisher := s.qualityPublisher
+	s.mu.RUnlock()
+	if publisher != nil {
+		bridge.SetQualityPublisher(publisher)
+	}
+
 	if err := bridge.Start(); err != nil {
 		return nil, fmt.Errorf("start bridge for %q: %w", agent.AgentID(), err)
 	}
@@ -211,6 +226,35 @@ func (s *HandoffSupervisor) SetAgentReplacedCallback(fn func(string, string, Han
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onAgentReplaced = fn
+}
+
+// SetQualityPublisher sets the callback that bridges use to publish
+// GP quality predictions. Propagated to all existing and future bridges.
+func (s *HandoffSupervisor) SetQualityPublisher(fn func(agentID string, quality, stdDev float64)) {
+	s.mu.Lock()
+	s.qualityPublisher = fn
+	bridges := make([]*HandoffBridge, 0, len(s.bridges))
+	for _, b := range s.bridges {
+		bridges = append(bridges, b)
+	}
+	s.mu.Unlock()
+
+	for _, b := range bridges {
+		b.SetQualityPublisher(fn)
+	}
+}
+
+// SetTrafficShiftCallbacks sets the callbacks used during gradual traffic
+// shifts. onBegin registers the new agent alongside the old in the Guide.
+// updateWeight updates the routing weight in the service registry.
+func (s *HandoffSupervisor) SetTrafficShiftCallbacks(
+	onBegin func(oldID string, newAgent HandoffableAgent),
+	updateWeight func(agentID string, weight float64),
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onShiftBegin = onBegin
+	s.updateWeight = updateWeight
 }
 
 // BridgeCount returns the number of active bridges.
@@ -282,6 +326,34 @@ func (s *HandoffSupervisor) recoverOrphanedOverlaps() {
 			SnapshotSeq: overlap.SnapshotSeq,
 			Timestamp:   time.Now(),
 			Error:       "recovered from crash — overlap abandoned",
+		})
+	}
+
+	// Find unmatched shift_begin entries (no corresponding converge/abort).
+	pendingShifts := make(map[string]*ShiftWALEntry)
+	for i := range entries {
+		entry := &entries[i]
+		if entry.Shift == nil {
+			continue
+		}
+		switch entry.EntryType {
+		case EntryTypeShiftBegin:
+			pendingShifts[entry.Shift.OldID] = entry.Shift
+		case EntryTypeShiftConverge, EntryTypeShiftAbort:
+			delete(pendingShifts, entry.Shift.OldID)
+		}
+	}
+
+	// Reset weights for orphaned shifts — old agent gets full weight.
+	for _, shift := range pendingShifts {
+		_ = s.wal.WriteShiftEvent(ShiftWALEntry{
+			Phase:     ShiftAborted,
+			OldID:     shift.OldID,
+			NewID:     shift.NewID,
+			OldWeight: 1.0,
+			NewWeight: 0,
+			Timestamp: time.Now(),
+			Error:     "recovered from crash — shift abandoned",
 		})
 	}
 }

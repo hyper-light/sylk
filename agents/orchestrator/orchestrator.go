@@ -407,8 +407,10 @@ func (o *Orchestrator) unsubscribeAll() []error {
 // Handle processes workflow coordination requests
 func (o *Orchestrator) Handle(ctx context.Context, req *guide.ForwardedRequest) (any, error) {
 	// Detect structured plan handoff payloads from the architect.
+	// On match, ingest mechanically then route through the conversation
+	// pipeline so the LLM produces a natural language acknowledgment.
 	if result, ok := o.tryIngestPlanFromInput(ctx, req.Input); ok {
-		return result, nil
+		return o.respondToIngestion(ctx, req, result)
 	}
 
 	switch req.Intent {
@@ -531,7 +533,13 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 
 	if err != nil {
 		o.publishStreamError(ctx, err)
+		o.publishStreamComplete(ctx, "", usageAcc.Total())
 		resp.Error = err.Error()
+		// Publish to BOTH error and response channels. The response channel
+		// is what the Guide relays to the source agent's synchronous waiter;
+		// the error channel is for observability/logging subscribers.
+		respMsg := guide.NewResponseMessage(generateMessageID(), resp)
+		_ = o.bus.Publish(o.channels.Responses, respMsg)
 		errMsg := guide.NewErrorMessage(
 			generateMessageID(),
 			fwd.CorrelationID,

@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 )
 
-// executionPhrases are user phrases that signal "execute the current plan".
-// Matched case-insensitively via substring against the user input.
-var executionPhrases = []string{
+// executionSubstrings are user phrases matched via substring containment.
+var executionSubstrings = []string{
 	"go ahead",
 	"execute",
 	"proceed",
@@ -25,6 +25,35 @@ var executionPhrases = []string{
 	"looks good",
 	"approved",
 	"lgtm",
+	"run it",
+	"fire away",
+	"begin execution",
+	"make it so",
+	"let's start",
+	"start building",
+	"confirmed",
+}
+
+// executionExactPhrases are short affirmatives that match only when the
+// entire message (after trimming/lowering) equals the phrase. Substring
+// matching would cause false positives (e.g. "yes, but can we change X?").
+var executionExactPhrases = []string{
+	"yes",
+	"y",
+	"yep",
+	"yeah",
+	"yup",
+	"ok",
+	"okay",
+	"sure",
+	"right",
+	"great",
+	"perfect",
+	"awesome",
+	"absolutely",
+	"affirmative",
+	"roger",
+	"aye",
 }
 
 // isExecutionRequest returns true if the user message signals intent
@@ -34,7 +63,14 @@ func isExecutionRequest(input string) bool {
 	if lower == "" {
 		return false
 	}
-	for _, phrase := range executionPhrases {
+	// Strip trailing punctuation for exact matching (e.g. "yes!" → "yes").
+	stripped := strings.TrimRight(lower, ".!?,;:")
+	for _, phrase := range executionExactPhrases {
+		if stripped == phrase {
+			return true
+		}
+	}
+	for _, phrase := range executionSubstrings {
 		if strings.Contains(lower, phrase) {
 			return true
 		}
@@ -50,18 +86,35 @@ func (a *Architect) tryExecutePlan(ctx context.Context, req *ArchitectRequest) (
 	}
 	plan := a.latestReadyPlan()
 	if plan == nil {
+		a.logInfo("tryExecutePlan: execution request but no ready plan found")
 		return nil, false
 	}
+	a.logInfo("tryExecutePlan: dispatching plan",
+		"plan_id", plan.ID,
+		"query", truncateString(plan.Query, 80),
+		"tasks", len(plan.Tasks),
+		"created_at", plan.CreatedAt.String())
 	return a.dispatchPlanExecution(ctx, req, plan)
 }
 
-// latestReadyPlan returns the most recently updated plan with PlanStatusReady.
+// readyPlanMaxAge is the maximum age of a ready plan eligible for execution.
+// Plans older than this are stale (e.g. restored from disk across sessions)
+// and should not be dispatched.
+const readyPlanMaxAge = 30 * time.Minute
+
+// latestReadyPlan returns the most recently updated plan with PlanStatusReady,
+// provided it was updated within readyPlanMaxAge. Stale restored plans are
+// skipped to prevent dispatching outdated generic plans.
 func (a *Architect) latestReadyPlan() *DesignPlan {
 	a.activePlansMu.RLock()
 	defer a.activePlansMu.RUnlock()
+	cutoff := time.Now().Add(-readyPlanMaxAge)
 	var best *DesignPlan
 	for _, plan := range a.activePlans {
 		if plan.Status != PlanStatusReady {
+			continue
+		}
+		if plan.UpdatedAt.Before(cutoff) {
 			continue
 		}
 		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {

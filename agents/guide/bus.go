@@ -315,6 +315,8 @@ const (
 	MessageTypeTaskComplete MessageType = "task_complete"
 	MessageTypeTaskFailed   MessageType = "task_failed"
 	MessageTypeTaskHelp     MessageType = "task_help"
+	// MessageTypeAuditResult carries audit findings from the inspector
+	MessageTypeAuditResult MessageType = "audit_result"
 	// MessageTypeClarificationRequest is a request for user clarification
 	MessageTypeClarificationRequest MessageType = "clarification_request"
 	// MessageTypeClarificationResponse is a response to a clarification request

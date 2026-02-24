@@ -22,6 +22,10 @@ func renderBlock(node ast.Node, ctx *blockContext) {
 		renderHeading(n, ctx)
 	case *ast.Paragraph:
 		renderParagraph(n, ctx)
+	case *ast.TextBlock:
+		// TextBlock is goldmark's representation of tight list item content.
+		// Rendered identically to Paragraph: collect inline runs and wrap.
+		renderTextBlock(n, ctx)
 	case *ast.FencedCodeBlock:
 		renderFencedCode(n, ctx)
 	case *ast.CodeBlock:
@@ -81,6 +85,15 @@ func renderParagraph(n *ast.Paragraph, ctx *blockContext) {
 	ctx.lines = append(ctx.lines, "")
 }
 
+// renderTextBlock handles ast.TextBlock — goldmark's tight list item content.
+// Unlike Paragraph, TextBlock omits the trailing blank line since tight lists
+// have no inter-item spacing.
+func renderTextBlock(n *ast.TextBlock, ctx *blockContext) {
+	runs := collectInlineRuns(n, ctx.source, ctx.styles.text, ctx.styles)
+	lines := wrapRuns(runs, ctx.width)
+	ctx.lines = append(ctx.lines, lines...)
+}
+
 // renderFencedCode extracts code lines from AST segments, calls the existing
 // renderCodeBlock, and records a CodeRegion.
 func renderFencedCode(n *ast.FencedCodeBlock, ctx *blockContext) {
@@ -106,7 +119,7 @@ func renderFencedCode(n *ast.FencedCodeBlock, ctx *blockContext) {
 	}
 
 	codeStart := len(ctx.lines)
-	ctx.lines = append(ctx.lines, renderCodeBlock(codeLines, lang, ctx.fullWidth, ctx.theme)...)
+	ctx.lines = append(ctx.lines, renderCodeBlock(codeLines, lang, ctx.fullWidth, ctx.theme, ctx.codeCache)...)
 	ctx.regions = append(ctx.regions, CodeRegion{
 		Start:   codeStart,
 		End:     len(ctx.lines),
@@ -126,7 +139,7 @@ func renderIndentedCode(n *ast.CodeBlock, ctx *blockContext) {
 	}
 
 	codeStart := len(ctx.lines)
-	ctx.lines = append(ctx.lines, renderCodeBlock(codeLines, "", ctx.fullWidth, ctx.theme)...)
+	ctx.lines = append(ctx.lines, renderCodeBlock(codeLines, "", ctx.fullWidth, ctx.theme, ctx.codeCache)...)
 	ctx.regions = append(ctx.regions, CodeRegion{
 		Start:   codeStart,
 		End:     len(ctx.lines),
@@ -177,6 +190,7 @@ func renderListItem(n *ast.ListItem, ctx *blockContext, depth int, ordered bool,
 		styles:    ctx.styles,
 		theme:     ctx.theme,
 		listDepth: depth + 1,
+		codeCache: ctx.codeCache,
 	}
 
 	for child := n.FirstChild(); child != nil; child = child.NextSibling() {
@@ -224,6 +238,7 @@ func renderBlockquote(n *ast.Blockquote, ctx *blockContext) {
 		styles:    ctx.styles,
 		theme:     ctx.theme,
 		listDepth: ctx.listDepth,
+		codeCache: ctx.codeCache,
 	}
 	// Override text style for blockquote content.
 	savedText := ctx.styles.text

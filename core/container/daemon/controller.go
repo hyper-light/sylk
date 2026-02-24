@@ -149,3 +149,13 @@ func (dc *DaemonSetController) SpecCount() int {
 	defer dc.mu.RUnlock()
 	return len(dc.specs)
 }
+
+// InjectInstance registers a pre-created container as the running instance
+// for the named daemon set. Use this when containers are created outside
+// the normal Reconcile flow (e.g. parallel bootstrap) and need to be
+// adopted by the controller for ongoing lifecycle management.
+func (dc *DaemonSetController) InjectInstance(name string, c *container.Container) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	dc.instances[name] = c
+}

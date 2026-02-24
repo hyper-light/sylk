@@ -44,10 +44,11 @@ func (c AgentCategory) String() string {
 // AgentDescriptor is immutable metadata about an agent type.
 // It describes the agent's model, context window, and handoff category.
 type AgentDescriptor struct {
-	AgentType     string        `json:"agent_type"`
-	ModelID       string        `json:"model_id"`
-	ContextWindow int           `json:"context_window"`
-	Category      AgentCategory `json:"category"`
+	AgentType       string        `json:"agent_type"`
+	ModelID         string        `json:"model_id"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
+	ContextWindow   int           `json:"context_window"`
+	Category        AgentCategory `json:"category"`
 }
 
 // ArchivableState captures agent state for handoff persistence.

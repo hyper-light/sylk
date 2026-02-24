@@ -240,6 +240,11 @@ func (a *Architect) publishPlanSnapshot(ctx context.Context, plan *DesignPlan) {
 	if plan == nil {
 		return
 	}
+	a.logInfo("publishPlanSnapshot",
+		"plan_id", plan.ID,
+		"status", plan.Status.String(),
+		"tasks", len(plan.Tasks),
+		"components", len(plan.Architecture.Components))
 	snapshot := buildPlanSnapshotData(plan)
 	a.publishPlanStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventData,

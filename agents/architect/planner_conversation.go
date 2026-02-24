@@ -195,10 +195,12 @@ Requirements:
 }
 
 func plannerConversationMaxTokensForMode(mode plannerConversationMode, maxTokens int) int {
-	if mode == plannerConversationModeConverse {
+	switch mode {
+	case plannerConversationModeConverse, plannerConversationModeReady:
 		return converseMaxTokens(maxTokens)
+	default:
+		return plannerConversationMaxTokens(maxTokens)
 	}
-	return plannerConversationMaxTokens(maxTokens)
 }
 
 func plannerConversationMaxTokens(maxTokens int) int {

@@ -1,6 +1,7 @@
 package network
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -13,6 +14,13 @@ type ServiceEndpoint struct {
 	Healthy   bool
 	Labels    map[string]string
 	LastSeen  time.Time
+
+	// Quality is the GP-predicted quality score in [0,1]. 0 = unknown.
+	Quality float64
+	// StdDev is the GP uncertainty (standard deviation of the prediction).
+	StdDev float64
+	// Weight is the routing weight during overlap in [0,1]. 1.0 = normal.
+	Weight float64
 }
 
 // ServiceRegistry maintains a health-aware directory of agent endpoints.
@@ -37,6 +45,9 @@ func (sr *ServiceRegistry) Register(ep ServiceEndpoint) {
 	defer sr.mu.Unlock()
 
 	ep.LastSeen = time.Now()
+	if ep.Weight == 0 {
+		ep.Weight = 1.0
+	}
 	sr.endpoints[ep.AgentID] = &ep
 	sr.indexType(ep.AgentID, ep.AgentType)
 }
@@ -164,4 +175,54 @@ func (sr *ServiceRegistry) HealthyCount() int {
 		}
 	}
 	return count
+}
+
+// UpdateQuality sets the GP-predicted quality and uncertainty for an endpoint.
+func (sr *ServiceRegistry) UpdateQuality(agentID string, quality, stdDev float64) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	ep, exists := sr.endpoints[agentID]
+	if !exists {
+		return
+	}
+	ep.Quality = quality
+	ep.StdDev = stdDev
+	ep.LastSeen = time.Now()
+}
+
+// UpdateWeight sets the routing weight for an endpoint during overlap.
+func (sr *ServiceRegistry) UpdateWeight(agentID string, weight float64) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	ep, exists := sr.endpoints[agentID]
+	if !exists {
+		return
+	}
+	ep.Weight = weight
+	ep.LastSeen = time.Now()
+}
+
+// GetWeightedEndpoints returns healthy+ready endpoints for the given type,
+// sorted by Weight descending. Used by the Guide for quality-aware routing.
+func (sr *ServiceRegistry) GetWeightedEndpoints(agentType string) []ServiceEndpoint {
+	sr.mu.RLock()
+	defer sr.mu.RUnlock()
+
+	ids := sr.byType[agentType]
+	result := make([]ServiceEndpoint, 0, len(ids))
+	for id := range ids {
+		ep := sr.endpoints[id]
+		if ep != nil && ep.Healthy && ep.Ready {
+			result = append(result, *ep)
+		}
+	}
+
+	// Sort by Weight descending for predictable ordering.
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Weight > result[j].Weight
+	})
+
+	return result
 }

@@ -35,7 +35,16 @@ type Executor struct {
 	dispatcher NodeDispatcher
 	closed     atomic.Bool
 
+	layerGate LayerGate
+
 	scope *concurrency.GoroutineScope
+}
+
+// SetLayerGate assigns a gate function invoked between layers.
+func (e *Executor) SetLayerGate(gate LayerGate) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.layerGate = gate
 }
 
 func NewExecutor(policy ExecutionPolicy, scope *concurrency.GoroutineScope) *Executor {
@@ -156,7 +165,35 @@ func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) bool {
 	err := e.executeLayer(layer)
 	e.emitLayerCompleted(layerIdx)
 
-	return err != nil && e.policy.FailurePolicy == FailurePolicyFailFast
+	if err != nil && e.policy.FailurePolicy == FailurePolicyFailFast {
+		return true
+	}
+
+	if gateErr := e.invokeLayerGate(layerIdx); gateErr != nil {
+		return true
+	}
+
+	return false
+}
+
+func (e *Executor) invokeLayerGate(layerIdx int) error {
+	e.mu.RLock()
+	gate := e.layerGate
+	e.mu.RUnlock()
+
+	if gate == nil {
+		return nil
+	}
+
+	e.mu.RLock()
+	results := make(map[string]*NodeResult, len(e.nodeResults))
+	for k, v := range e.nodeResults {
+		results[k] = v
+	}
+	dagID := e.dag.ID()
+	e.mu.RUnlock()
+
+	return gate(e.ctx, dagID, layerIdx, results)
 }
 
 func (e *Executor) emitLayerStarted(layerIdx, nodeCount int) {

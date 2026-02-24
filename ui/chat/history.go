@@ -138,6 +138,21 @@ func (h *History) Range(start, end int, fn func(index int, entry *ChatEntry) boo
 	}
 }
 
+// UpdateAt atomically modifies the entry at the given logical index.
+// The callback receives a pointer to the entry for in-place mutation.
+// Returns false if the index is out of range.
+func (h *History) UpdateAt(index int, fn func(*ChatEntry)) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if index < 0 || index >= h.count {
+		return false
+	}
+	physical := h.logicalToPhysical(index)
+	fn(&h.entries[physical])
+	return true
+}
+
 // InvalidateRender clears the cached rendered lines for the entry at the
 // given logical index, forcing re-render on the next view pass.
 func (h *History) InvalidateRender(index int) {

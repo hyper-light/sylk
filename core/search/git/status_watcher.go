@@ -137,9 +137,24 @@ func resolveGitDir(client *GitClient) (string, error) {
 
 // Start begins watching. The output channel (accessible via Events) is closed
 // when the context is cancelled or Stop is called.
+//
+// Cheap .git/ and refs/ watches are registered synchronously (~1ms).
+// The expensive worktree directory walk runs in the same goroutine as the
+// event loop, right before loop starts. The loop's initial fallback timer
+// fires at t=0 (time.NewTimer(0) at line 236), so the first StatusUpdate
+// arrives before worktree watches complete — the brief window where
+// directory-level fsnotify events are missed is covered by the adaptive
+// fallback timer (5–60s).
 func (w *StatusWatcher) Start(ctx context.Context) {
-	w.addWatchPaths()
-	go w.loop(ctx)
+	// Cheap: .git/ + refs/ watches (~1ms).
+	_ = w.fsw.Add(w.gitDir)
+	addDirRecursive(w.fsw, w.refsPrefix)
+
+	// Expensive: worktree walk + event loop in a single goroutine.
+	go func() {
+		w.addWorktreeWatches()
+		w.loop(ctx)
+	}()
 }
 
 // Events returns the read-only channel that emits StatusUpdate snapshots on
@@ -153,19 +168,6 @@ func (w *StatusWatcher) Events() <-chan StatusUpdate {
 // has completed yet. The returned pointer is safe to read concurrently.
 func (w *StatusWatcher) LastUpdate() *StatusUpdate {
 	return w.lastUpdate.Load()
-}
-
-// addWatchPaths registers fsnotify watches on key .git/ paths and
-// working-tree directories.
-func (w *StatusWatcher) addWatchPaths() {
-	// Watch .git/ itself for HEAD, index, MERGE_HEAD, REBASE_HEAD, etc.
-	_ = w.fsw.Add(w.gitDir)
-
-	// Watch refs subdirectories for branch/tag pointer changes.
-	addDirRecursive(w.fsw, w.refsPrefix)
-
-	// Watch working-tree directories for instant change detection.
-	w.addWorktreeWatches()
 }
 
 // addWorktreeWatches recursively adds fsnotify watches for all non-ignored

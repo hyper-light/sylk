@@ -188,6 +188,18 @@ func (b *Builder) IntParam(name, description string, required bool) *Builder {
 	return b
 }
 
+// FloatParam adds a number (floating-point) parameter
+func (b *Builder) FloatParam(name, description string, required bool) *Builder {
+	b.skill.InputSchema.Properties[name] = &Property{
+		Type:        "number",
+		Description: description,
+	}
+	if required {
+		b.skill.InputSchema.Required = append(b.skill.InputSchema.Required, name)
+	}
+	return b
+}
+
 // BoolParam adds a boolean parameter
 func (b *Builder) BoolParam(name, description string, required bool) *Builder {
 	b.skill.InputSchema.Properties[name] = &Property{

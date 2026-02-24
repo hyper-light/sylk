@@ -49,6 +49,15 @@ const (
 
 	// EntryTypeOverlapAbort records overlap abortion.
 	EntryTypeOverlapAbort WALEntryType = "overlap_abort"
+
+	// EntryTypeShiftBegin records the start of a gradual traffic shift.
+	EntryTypeShiftBegin WALEntryType = "shift_begin"
+
+	// EntryTypeShiftConverge records successful traffic shift convergence.
+	EntryTypeShiftConverge WALEntryType = "shift_converge"
+
+	// EntryTypeShiftAbort records traffic shift abortion.
+	EntryTypeShiftAbort WALEntryType = "shift_abort"
 )
 
 // ProfileSnapshot is a serializable form of AgentHandoffProfile.
@@ -336,6 +345,9 @@ type HandoffWALEntry struct {
 
 	// BufferResize records elastic buffer resize events.
 	BufferResize *BufferResizeEntry `json:"buffer_resize,omitempty"`
+
+	// Shift records a traffic shift lifecycle event.
+	Shift *ShiftWALEntry `json:"shift,omitempty"`
 
 	// SequenceNumber is a monotonically increasing counter for ordering.
 	SequenceNumber uint64 `json:"sequence_number"`
@@ -705,6 +717,11 @@ func (wal *HandoffWAL) Recover() (*HandoffState, error) {
 			// (begin without complete/abort) are handled by the supervisor
 			// during RecoverOrphanedOverlaps.
 
+		case EntryTypeShiftBegin, EntryTypeShiftConverge, EntryTypeShiftAbort:
+			// Shift entries are informational. Orphaned shifts
+			// (begin without converge/abort) are handled by the supervisor
+			// during recoverOrphanedOverlaps.
+
 		case EntryTypeBufferResize:
 			// Buffer resize entries are informational.
 
@@ -881,6 +898,26 @@ func (wal *HandoffWAL) WriteBufferResize(agentType string, oldBudget, newBudget 
 			NewBudget: newBudget,
 			State:     state,
 		},
+	}
+	return wal.AppendEntry(walEntry)
+}
+
+// WriteShiftEvent writes a traffic shift lifecycle event to the WAL.
+func (wal *HandoffWAL) WriteShiftEvent(entry ShiftWALEntry) error {
+	var entryType WALEntryType
+	switch entry.Phase {
+	case ShiftConverged:
+		entryType = EntryTypeShiftConverge
+	case ShiftAborted:
+		entryType = EntryTypeShiftAbort
+	default:
+		entryType = EntryTypeShiftBegin
+	}
+
+	walEntry := &HandoffWALEntry{
+		Timestamp: entry.Timestamp,
+		EntryType: entryType,
+		Shift:     &entry,
 	}
 	return wal.AppendEntry(walEntry)
 }

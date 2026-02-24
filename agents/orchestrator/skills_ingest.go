@@ -92,6 +92,9 @@ func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, er
 	}
 
 	// Submit to DAG bridge for execution.
+	if o.dagBridge == nil {
+		return nil, fmt.Errorf("dag bridge unavailable (no project directory)")
+	}
 	dagID, err := o.dagBridge.Execute(ctx, d, handoff.PlanID, handoff.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("dag execution failed: %w", err)

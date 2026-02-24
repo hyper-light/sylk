@@ -272,6 +272,15 @@ type Deps struct {
 	// context. Called after the Bubble Tea program exits so that a second
 	// Ctrl+C immediately terminates the process during slow shutdown.
 	SignalStop func()
+
+	// Pre-computed results from parallel bootstrap. These fields are
+	// optional; when non-nil they bypass the corresponding blocking
+	// detection/creation in New().
+	NerdFontsDetected bool
+	GitClient         *git.GitClient
+	GitWatcher        *git.StatusWatcher
+	GitBus            *git.GitBus
+	SafetyGuard       *git.SafetyGuard
 }
 
 // ---------------------------------------------------------------------------
@@ -789,14 +798,28 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	app.input.SetSlashValidator(isKnownSlashCommand)
 	app.syncFocusState()
 
-	// Nerd Font detection: the font must be installed AND a fontconfig
-	// fallback snippet must be in place (so VTE terminals like Terminator
-	// resolve PUA codepoints to Symbols Nerd Font).
-	app.nerdFontsDetected = fonts.Detected()
+	// Nerd Font detection: use pre-computed result from parallel bootstrap
+	// when available, falling back to blocking detection.
+	if deps.NerdFontsDetected {
+		app.nerdFontsDetected = true
+	} else if deps.GitClient == nil {
+		// Only run blocking detection if bootstrap didn't pre-compute it.
+		app.nerdFontsDetected = fonts.Detected()
+	}
 	app.fileTree.SetNerdFonts(app.nerdFontsDetected)
 
-	// Git status watcher for file tree decorations.
-	if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
+	// Git status watcher for file tree decorations. Use pre-created
+	// objects from parallel bootstrap when available.
+	if deps.GitClient != nil && deps.GitClient.IsGitRepo() {
+		app.gitClient = deps.GitClient
+		app.gitBus = deps.GitBus
+		app.gitBridge = bridge.NewGitBridge(app.gitBus, deps.Scope)
+		configPath := filepath.Join(cfg.ProjectRoot, ".sylk", "config.yaml")
+		app.gitPanel = gitpanel.New(th, app.gitBus, configPath)
+		app.commitTree = committree.New(th)
+		app.gitWatcher = deps.GitWatcher
+		app.safetyGuard = deps.SafetyGuard
+	} else if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
 		app.gitClient = gc
 		app.gitBus = git.NewGitBus(gc)
 		app.gitBridge = bridge.NewGitBridge(app.gitBus, deps.Scope)
@@ -5074,13 +5097,17 @@ func (m *AppModel) shouldSuppressStreamedRouteResponse(correlationID string, has
 	if !ok {
 		return false
 	}
+	// Suppress when content was already delivered via stream chunks.
+	// Progress-only streams (start→complete with no chunks) are not
+	// suppressed since they never delivered user-visible content.
+	delivered := state.HadChunk
 	if state.Succeeded {
 		state.SeenAt = time.Now()
 		m.streamedResponses[correlationID] = state
-		return state.HadChunk
+		return delivered
 	}
 	delete(m.streamedResponses, correlationID)
-	return state.HadChunk
+	return delivered
 }
 
 func (m *AppModel) ensureStreamedResponseState() {

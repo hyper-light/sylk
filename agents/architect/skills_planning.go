@@ -529,6 +529,9 @@ func buildPlanHandoff(plan *DesignPlan, trigger string) *PlanHandoff {
 		RiskSummary:     plan.RiskSummary,
 		Trigger:         trigger,
 		Timestamp:       time.Now(),
+		Architecture:    plan.Architecture,
+		Requirements:    plan.Requirements,
+		Assumptions:     plan.Assumptions,
 	}
 }
 

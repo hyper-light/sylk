@@ -23,7 +23,10 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector"
 	"github.com/adalundhe/sylk/agents/librarian"
 	"github.com/adalundhe/sylk/agents/orchestrator"
-	"github.com/adalundhe/sylk/agents/tester"
+	globaltester "github.com/adalundhe/sylk/agents/tester/global"
+	pipelinetester "github.com/adalundhe/sylk/agents/tester/pipeline"
+	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/container/activation"
@@ -32,8 +35,10 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui"
+	"github.com/adalundhe/sylk/ui/fonts"
 	"github.com/spf13/cobra"
 )
 
@@ -59,7 +64,11 @@ func runTUI(_ *cobra.Command, _ []string) error {
 	restoreStdLog := installTUIStdLogSink()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	deps, cleanup, err := bootstrapDeps(ctx, tuiMock)
+	// Resolve project root early so the parallel bootstrap can initialize
+	// git resources concurrently with agent container creation.
+	projectRoot := resolveProjectRoot()
+
+	deps, cleanup, err := bootstrapDeps(ctx, tuiMock, projectRoot)
 	if err != nil {
 		stop()
 		restoreErr := restoreStdLog()
@@ -73,12 +82,22 @@ func runTUI(_ *cobra.Command, _ []string) error {
 	cfg := ui.DefaultConfig()
 	cfg.ThemeMode = parseThemeMode(tuiTheme)
 	cfg.MockMode = tuiMock
+	cfg.ProjectRoot = projectRoot
 
 	runErr := ui.Run(ctx, cfg, deps)
 	stop()
 	cleanupErr := cleanup()
 	restoreErr := restoreStdLog()
 	return errors.Join(runErr, cleanupErr, restoreErr)
+}
+
+// resolveProjectRoot finds the project root: git root or CWD.
+func resolveProjectRoot() string {
+	cwd, _ := os.Getwd()
+	if root, err := boot.FindGitRoot(cwd); err == nil {
+		return root
+	}
+	return cwd
 }
 
 // activityBusBuffer is the channel size for the activity event bus.
@@ -88,16 +107,49 @@ const activityBusBuffer = 1000
 // possible graceful stop (60s for max-context agents) + headroom.
 const shutdownTimeout = 90 * time.Second
 
+// =============================================================================
+// Typed result structs for Phase 2 parallel bootstrap goroutines.
+// =============================================================================
+
+type daemonContainerResult struct {
+	c   *container.Container
+	err error
+}
+
+type activationCtrlResult struct {
+	ctrl *activation.ActivationController
+	err  error
+}
+
+type fontResult struct {
+	detected bool
+}
+
+type gitBootResult struct {
+	client  *git.GitClient
+	watcher *git.StatusWatcher
+	bus     *git.GitBus
+	guard   *git.SafetyGuard
+}
+
 // bootstrapDeps initializes the core systems needed by the TUI.
 // Agents run inside containers managed by the container runtime.
 // DaemonSets keep Guide and Orchestrator always-hot; on-demand agents
 // activate via the ActivationController when the Guide routes requests.
-func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, error) {
+//
+// Startup is structured in 4 phases to maximize parallelism:
+//
+//	Phase 1: Infrastructure (sequential, ~15ms)
+//	Phase 2: Parallel creation (Guide, Orch, ActivationCtrl, HealthSync, Fonts, Git)
+//	Phase 3: Wiring (sequential, depends on Phase 2 results)
+//	Phase 4: Post-wiring (Architect pre-activation, handoff, session)
+func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.Deps, func() error, error) {
 	_ = mockMode
+	start := time.Now()
 
-	// ---------------------------------------------------------------
-	// 1. Shared infrastructure — no inter-dependencies
-	// ---------------------------------------------------------------
+	// =================================================================
+	// Phase 1: Infrastructure (sequential, ~15ms)
+	// =================================================================
 
 	scope := concurrency.NewGoroutineScope(ctx, "tui", nil)
 	scope.SetMaxLifetime(24 * time.Hour)
@@ -112,41 +164,19 @@ func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, e
 		Scope: scope,
 	})
 
-	// ---------------------------------------------------------------
-	// 2. Container infrastructure
-	// ---------------------------------------------------------------
-
 	descriptors := handoff.NewDescriptorRegistry()
 	pressureLevel := new(atomic.Int32)
 	budget := concurrency.NewGoroutineBudget(pressureLevel)
 	containerReg := container.NewContainerRegistry()
 	serviceReg := network.NewServiceRegistry()
 	specReg := container.NewAgentSpecRegistry(descriptors)
-
 	quota := container.NewResourceQuota(quotaFromSpecs(specReg))
-
-	// ---------------------------------------------------------------
-	// 3. Agent creator registry — maps type → factory
-	// ---------------------------------------------------------------
 
 	creatorReg := container.NewAgentCreatorRegistry()
 	registerAgentCreators(creatorReg, guideBus, activityBus)
 
-	// ---------------------------------------------------------------
-	// 4. Admission — hook mutator attaches lifecycle hooks to every
-	//    container spec. The Guide and ServiceRegistry are set after
-	//    the Guide container is created (circular dependency resolved
-	//    by deferred SetGuide call).
-	// ---------------------------------------------------------------
-
-	hookMut := &lifecycleHookMutator{
-		serviceReg: serviceReg,
-	}
+	hookMut := &lifecycleHookMutator{serviceReg: serviceReg}
 	admission := container.NewAdmissionController(nil, []container.SpecMutator{hookMut})
-
-	// ---------------------------------------------------------------
-	// 5. Container runtime
-	// ---------------------------------------------------------------
 
 	runtime := container.NewDefaultRuntime(container.DefaultRuntimeConfig{
 		Budget:      budget,
@@ -156,10 +186,6 @@ func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, e
 		CreateAgent: creatorReg.Creator(),
 		ParentCtx:   ctx,
 	})
-
-	// ---------------------------------------------------------------
-	// 6. Network namespace — policy enforcement on bus traffic
-	// ---------------------------------------------------------------
 
 	policies := container.BuildNetworkPolicies(descriptors.All())
 	busBridge := network.NewBusBridge(func(topic, sourceAgent, targetAgent string, payload []byte) error {
@@ -172,20 +198,219 @@ func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, e
 		Sink:     busBridge,
 	})
 
-	// ---------------------------------------------------------------
-	// 7. DaemonSets — creates Guide + Orchestrator (always-hot)
-	// ---------------------------------------------------------------
-
+	// Prepare daemon specs for parallel container creation.
 	daemonCtrl := daemon.NewDaemonSetController(runtime, containerReg)
-	for _, spec := range daemon.AgentDaemonSetSpecs(specReg) {
+	daemonSpecs := daemon.AgentDaemonSetSpecs(specReg)
+	for _, spec := range daemonSpecs {
 		daemonCtrl.Apply(spec)
 	}
-	if err := daemonCtrl.Reconcile(ctx); err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
-		return ui.Deps{}, nil, fmt.Errorf("daemon reconcile: %w", err)
+	daemonSpecMap := make(map[string]container.ContainerSpec, len(daemonSpecs))
+	for _, spec := range daemonSpecs {
+		daemonSpecMap[spec.Name] = spec.ContainerSpec
 	}
 
-	// Extract Guide and Orchestrator from their containers.
+	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
+
+	// =================================================================
+	// Phase 2: Parallel creation
+	// =================================================================
+	// Guide and Orchestrator are critical — any failure aborts startup.
+	// ActivationCtrl, HealthSyncer, Fonts, and Git are non-critical.
+
+	phase2Start := time.Now()
+
+	// parallelCancel is a cancellation handle used to signal early abort
+	// when a critical goroutine fails. Agent factories receive the
+	// long-lived `ctx` (signal context) so their run-contexts survive
+	// Phase 2 — the cancel context is never passed to them.
+	_, parallelCancel := context.WithCancel(ctx)
+
+	guideCh := make(chan daemonContainerResult, 1)
+	orchCh := make(chan daemonContainerResult, 1)
+	activationCh := make(chan activationCtrlResult, 1)
+	healthCh := make(chan error, 1)
+	fontCh := make(chan fontResult, 1)
+	gitCh := make(chan gitBootResult, 1)
+
+	// A: Guide container — uses the long-lived `ctx` for CreateContainer
+	// so the agent's run-context outlives Phase 2.
+	go func() {
+		spec, ok := daemonSpecMap["guide"]
+		if !ok {
+			guideCh <- daemonContainerResult{err: fmt.Errorf("no daemon spec for guide")}
+			return
+		}
+		c, err := runtime.CreateContainer(ctx, spec, nil)
+		if err != nil {
+			guideCh <- daemonContainerResult{err: err}
+			return
+		}
+		if err := runtime.StartContainer(ctx, c); err != nil {
+			_ = runtime.RemoveContainer(ctx, c)
+			guideCh <- daemonContainerResult{err: err}
+			return
+		}
+		guideCh <- daemonContainerResult{c: c}
+	}()
+
+	// B: Orchestrator container
+	go func() {
+		spec, ok := daemonSpecMap["orchestrator"]
+		if !ok {
+			orchCh <- daemonContainerResult{err: fmt.Errorf("no daemon spec for orchestrator")}
+			return
+		}
+		c, err := runtime.CreateContainer(ctx, spec, nil)
+		if err != nil {
+			orchCh <- daemonContainerResult{err: err}
+			return
+		}
+		if err := runtime.StartContainer(ctx, c); err != nil {
+			_ = runtime.RemoveContainer(ctx, c)
+			orchCh <- daemonContainerResult{err: err}
+			return
+		}
+		orchCh <- daemonContainerResult{c: c}
+	}()
+
+	// C: ActivationController
+	go func() {
+		activationPolicies := activation.AgentActivationPolicies(descriptors.All())
+		storageDir, err := activationStorageDir()
+		if err != nil {
+			activationCh <- activationCtrlResult{err: err}
+			return
+		}
+		ctrl, err := activation.NewActivationController(activation.ActivationControllerConfig{
+			Runtime:    runtime,
+			Registry:   containerReg,
+			Scope:      scope,
+			Policies:   activationPolicies,
+			StorageDir: storageDir,
+		})
+		if err != nil {
+			activationCh <- activationCtrlResult{err: err}
+			return
+		}
+		if err := ctrl.Start(budget, quota); err != nil {
+			activationCh <- activationCtrlResult{err: err}
+			return
+		}
+		activationCh <- activationCtrlResult{ctrl: ctrl}
+	}()
+
+	// D: HealthSyncer
+	go func() {
+		syncer := container.NewHealthSyncer(container.HealthSyncerConfig{
+			ContainerRegistry: containerReg,
+			ServiceRegistry:   serviceReg,
+			Scope:             scope,
+		})
+		healthCh <- syncer.Start()
+	}()
+
+	// E: Fonts
+	go func() {
+		fontCh <- fontResult{detected: fonts.Detected()}
+	}()
+
+	// F: Git
+	go func() {
+		var result gitBootResult
+		gc, err := git.NewGitClient(projectRoot)
+		if err != nil || !gc.IsGitRepo() {
+			gitCh <- result
+			return
+		}
+		result.client = gc
+		result.bus = git.NewGitBus(gc)
+		if sw, err := git.NewStatusWatcher(gc); err == nil {
+			result.watcher = sw
+		}
+		if sg, err := git.NewSafetyGuard(gc, result.bus, git.DefaultSafetyConfig(), result.watcher); err == nil {
+			result.guard = sg
+		}
+		gitCh <- result
+	}()
+
+	// Collect results. Use select with nil-channel disabling to drain
+	// all 6 channels. Critical errors cancel remaining goroutines.
+	var (
+		guideResult daemonContainerResult
+		orchResult  daemonContainerResult
+		actResult   activationCtrlResult
+		fontRes     fontResult
+		gitRes      gitBootResult
+		criticalErr error
+	)
+
+	for completed := 0; completed < 6; completed++ {
+		select {
+		case r := <-guideCh:
+			guideResult = r
+			if r.err != nil && criticalErr == nil {
+				criticalErr = fmt.Errorf("guide container: %w", r.err)
+				parallelCancel()
+			}
+			guideCh = nil
+
+		case r := <-orchCh:
+			orchResult = r
+			if r.err != nil && criticalErr == nil {
+				criticalErr = fmt.Errorf("orchestrator container: %w", r.err)
+				parallelCancel()
+			}
+			orchCh = nil
+
+		case r := <-activationCh:
+			actResult = r
+			if r.err != nil {
+				slog.Warn("activation controller failed during parallel bootstrap", "error", r.err)
+			}
+			activationCh = nil
+
+		case err := <-healthCh:
+			if err != nil {
+				slog.Warn("health syncer start failed", "error", err)
+			}
+			healthCh = nil
+
+		case r := <-fontCh:
+			fontRes = r
+			fontCh = nil
+
+		case r := <-gitCh:
+			gitRes = r
+			gitCh = nil
+		}
+	}
+	parallelCancel()
+
+	if criticalErr != nil {
+		// Clean up any containers that were successfully created.
+		for _, c := range []*container.Container{guideResult.c, orchResult.c} {
+			if c != nil {
+				_ = runtime.StopContainer(context.Background(), c)
+				_ = runtime.RemoveContainer(context.Background(), c)
+			}
+		}
+		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
+		return ui.Deps{}, nil, criticalErr
+	}
+
+	// Inject pre-created containers into the DaemonSetController so the
+	// periodic reconciler manages them going forward.
+	daemonCtrl.InjectInstance("guide", guideResult.c)
+	daemonCtrl.InjectInstance("orchestrator", orchResult.c)
+
+	slog.Info("bootstrap phase 2 complete", "elapsed", time.Since(phase2Start))
+
+	// =================================================================
+	// Phase 3: Wiring (sequential, depends on Phase 2 results)
+	// =================================================================
+
+	phase3Start := time.Now()
+
 	g, err := extractAgent[*guide.Guide](containerReg, "guide")
 	if err != nil {
 		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
@@ -197,58 +422,25 @@ func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, e
 		return ui.Deps{}, nil, fmt.Errorf("extract orchestrator: %w", err)
 	}
 
-	// Now wire the Guide into the hook mutator so future containers
-	// get PostStart/PreStop hooks that register with the Guide.
 	hookMut.SetGuide(g)
 
-	// Register orchestrator as a router with the Guide.
 	if err := registerOrchestratorWithGuide(g, orch); err != nil {
 		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
 		return ui.Deps{}, nil, fmt.Errorf("register orchestrator: %w", err)
 	}
 
-	// ---------------------------------------------------------------
-	// 8. Activation controller — on-demand agent lifecycle
-	// ---------------------------------------------------------------
-
-	activationPolicies := activation.AgentActivationPolicies(descriptors.All())
-	storageDir, err := activationStorageDir()
-	if err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
-		return ui.Deps{}, nil, fmt.Errorf("activation dir: %w", err)
+	activationCtrl := actResult.ctrl
+	if activationCtrl != nil {
+		g.SetActivationHook(func(fwdCtx context.Context, agentType string) error {
+			_, activateErr := activationCtrl.EnsureActive(fwdCtx, agentType)
+			return activateErr
+		})
+		g.SetTouchActivityHook(func(agentType string) {
+			activationCtrl.TouchActivity(agentType)
+		})
 	}
-
-	activationCtrl, err := activation.NewActivationController(activation.ActivationControllerConfig{
-		Runtime:    runtime,
-		Registry:   containerReg,
-		Scope:      scope,
-		Policies:   activationPolicies,
-		StorageDir: storageDir,
-	})
-	if err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
-		return ui.Deps{}, nil, fmt.Errorf("activation controller: %w", err)
-	}
-	if err := activationCtrl.Start(budget, quota); err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
-		return ui.Deps{}, nil, fmt.Errorf("activation start: %w", err)
-	}
-
-	// Wire activation hooks into Guide:
-	// - Activation hook ensures target agent containers are hot before forwarding.
-	// - Touch activity hook resets idle timers on active conversation agents,
-	//   preventing demotion during ongoing interactions (pause over terminate).
-	g.SetActivationHook(func(fwdCtx context.Context, agentType string) error {
-		_, activateErr := activationCtrl.EnsureActive(fwdCtx, agentType)
-		return activateErr
-	})
-	g.SetTouchActivityHook(func(agentType string) {
-		activationCtrl.TouchActivity(agentType)
-	})
 	g.SetServiceRegistry(serviceReg)
 
-	// Wire task router into orchestrator for DAG→container dispatch.
-	// Routes through guide.requests for policy, audit, and activation enforcement.
 	orch.SetTaskRouter(orchestrator.NewTaskRouter(orchestrator.TaskRouterConfig{
 		Bus:       guideBus,
 		Scope:     scope,
@@ -256,43 +448,29 @@ func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, e
 		SessionID: "default",
 	}))
 
-	// ---------------------------------------------------------------
-	// 9. Health sync — probe results → ServiceRegistry
-	// ---------------------------------------------------------------
+	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 
-	healthSyncer := container.NewHealthSyncer(container.HealthSyncerConfig{
-		ContainerRegistry: containerReg,
-		ServiceRegistry:   serviceReg,
-		Scope:             scope,
-	})
-	if err := healthSyncer.Start(); err != nil {
-		slog.Warn("health syncer start failed", "error", err)
-	}
+	// =================================================================
+	// Phase 4: Post-wiring
+	// =================================================================
 
-	// ---------------------------------------------------------------
-	// 10. Pre-activate Architect (commonly used first)
-	// ---------------------------------------------------------------
+	phase4Start := time.Now()
 
-	if _, err := activationCtrl.EnsureActive(ctx, "architect"); err != nil {
-		slog.Warn("architect pre-activation failed", "error", err)
-	} else {
-		arch, archErr := extractAgent[*architect.Architect](containerReg, "architect")
-		if archErr == nil {
-			_ = registerArchitectWithGuide(g, arch)
+	// Pre-activate Architect (commonly used first).
+	if activationCtrl != nil {
+		if _, err := activationCtrl.EnsureActive(ctx, "architect"); err != nil {
+			slog.Warn("architect pre-activation failed", "error", err)
+		} else {
+			arch, archErr := extractAgent[*architect.Architect](containerReg, "architect")
+			if archErr == nil {
+				_ = registerArchitectWithGuide(g, arch)
+			}
 		}
 	}
 
-	// ---------------------------------------------------------------
-	// 11. Handoff supervisor — context management + agent lifecycle
-	// ---------------------------------------------------------------
-
 	// Extract the architect reference (may be nil if pre-activation failed).
 	arch, _ := extractAgent[*architect.Architect](containerReg, "architect")
-	supervisor := bootstrapHandoffSupervisor(g, arch, orch)
-
-	// ---------------------------------------------------------------
-	// 12. Default session
-	// ---------------------------------------------------------------
+	supervisor := bootstrapHandoffSupervisor(g, arch, orch, serviceReg)
 
 	defaultSession, err := sessionMgr.Create(ctx, session.DefaultConfig())
 	if err != nil {
@@ -301,35 +479,33 @@ func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, e
 	}
 	_ = sessionMgr.Switch(defaultSession.ID())
 
-	// Signal orchestrator that bootstrap is complete — unblocks the LLM
-	// event loop so it only processes events arriving after readiness.
 	orch.SignalReady()
 
-	// ---------------------------------------------------------------
+	slog.Info("bootstrap phase 4 complete", "elapsed", time.Since(phase4Start))
+	slog.Info("bootstrap total", "elapsed", time.Since(start))
+
+	// =================================================================
 	// Cleanup — ordered teardown
-	// ---------------------------------------------------------------
+	// =================================================================
 
 	cleanup := func() error {
-		// Shutdown timeout prevents hung agents from blocking process exit.
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 
 		var errs []error
 
-		// Supervisor first (stops handoff tracking).
 		if supervisor != nil {
 			if stopErr := supervisor.Stop(); stopErr != nil {
 				errs = append(errs, stopErr)
 			}
 		}
 
-		// Activation controller — demotes all active agents, pausing where
-		// possible (preferring pause over terminate per lifecycle policy).
-		if shutErr := activationCtrl.Shutdown(shutdownCtx); shutErr != nil {
-			errs = append(errs, shutErr)
+		if activationCtrl != nil {
+			if shutErr := activationCtrl.Shutdown(shutdownCtx); shutErr != nil {
+				errs = append(errs, shutErr)
+			}
 		}
 
-		// Stop all remaining containers.
 		for _, c := range containerReg.All() {
 			if c.IsRunning() {
 				if stopErr := runtime.StopContainer(shutdownCtx, c); stopErr != nil {
@@ -353,13 +529,18 @@ func bootstrapDeps(ctx context.Context, mockMode bool) (ui.Deps, func() error, e
 	}
 
 	deps := ui.Deps{
-		ActivityBus:    activityBus,
-		SessionManager: sessionMgr,
-		GuideBus:       guideBus,
-		StreamManager:  streamMgr,
-		Guide:          g,
-		Scope:          scope,
-		AuthRefresh:    buildAuthRefreshHook(g, arch, orch),
+		ActivityBus:       activityBus,
+		SessionManager:    sessionMgr,
+		GuideBus:          guideBus,
+		StreamManager:     streamMgr,
+		Guide:             g,
+		Scope:             scope,
+		AuthRefresh:       buildAuthRefreshHook(g, arch, orch),
+		NerdFontsDetected: fontRes.detected,
+		GitClient:         gitRes.client,
+		GitWatcher:        gitRes.watcher,
+		GitBus:            gitRes.bus,
+		SafetyGuard:       gitRes.guard,
 	}
 
 	return deps, cleanup, nil
@@ -453,16 +634,52 @@ func registerOnDemandAgentCreators(reg *container.AgentCreatorRegistry, bus guid
 		return i, nil
 	})
 
-	// Tester — test creation, execution.
+	// Global Tester — cross-pipeline SDET.
 	reg.Register("tester", func(_ context.Context) (container.ContainerAgent, error) {
-		t, err := tester.New(tester.TesterConfig{})
+		openaiCfg := providers.OpenAIConfig{
+			BaseConfig: providers.BaseConfig{
+				Model:     "gpt-5.3-codex",
+				MaxTokens: 16384,
+			},
+			ReasoningEffort: "xhigh",
+			AuthMode:        "api_key",
+		}
+		provider, err := providers.NewOpenAIProvider(openaiCfg)
+		if err != nil {
+			return nil, fmt.Errorf("global tester provider: %w", err)
+		}
+		gt, err := globaltester.New(shared.GlobalTesterConfig{}, provider)
 		if err != nil {
 			return nil, err
 		}
-		if startErr := t.Start(bus); startErr != nil {
+		if startErr := gt.Start(bus); startErr != nil {
 			return nil, startErr
 		}
-		return t, nil
+		return gt, nil
+	})
+
+	// Pipeline Tester — per-task QE.
+	reg.Register("tester-pipeline", func(_ context.Context) (container.ContainerAgent, error) {
+		openaiCfg := providers.OpenAIConfig{
+			BaseConfig: providers.BaseConfig{
+				Model:     "gpt-5.3-codex",
+				MaxTokens: 16384,
+			},
+			ReasoningEffort: "xhigh",
+			AuthMode:        "api_key",
+		}
+		provider, err := providers.NewOpenAIProvider(openaiCfg)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline tester provider: %w", err)
+		}
+		pt, err := pipelinetester.New(shared.PipelineTesterConfig{}, provider)
+		if err != nil {
+			return nil, err
+		}
+		if startErr := pt.Start(bus); startErr != nil {
+			return nil, startErr
+		}
+		return pt, nil
 	})
 
 	// Engineer — code implementation.
@@ -847,6 +1064,7 @@ func bootstrapHandoffSupervisor(
 	g *guide.Guide,
 	arch *architect.Architect,
 	orch *orchestrator.Orchestrator,
+	serviceReg *network.ServiceRegistry,
 ) *handoff.HandoffSupervisor {
 	walDir, err := handoffWALDir()
 	if err != nil {
@@ -870,18 +1088,36 @@ func bootstrapHandoffSupervisor(
 		return orch, nil
 	})
 
-	// Wire agent replacement: when handoff creates a new agent, re-register it
-	// with the Guide's routing table.
-	supervisor.SetAgentReplacedCallback(func(oldID, _ string, newAgent handoff.HandoffableAgent) error {
+	// Wire agent replacement: during gradual shift, the new agent is already
+	// registered by onShiftBegin — only unregister the old one.
+	supervisor.SetAgentReplacedCallback(func(oldID, _ string, _ handoff.HandoffableAgent) error {
 		g.UnregisterAgent(oldID)
-		if router, ok := newAgent.(guide.AgentRouter); ok {
-			if regErr := g.RegisterRouter(router); regErr != nil {
-				return regErr
-			}
-			g.MarkAgentReady(newAgent.AgentID())
-		}
 		return nil
 	})
+
+	// Wire quality publisher: GP quality flows to the service registry.
+	supervisor.SetQualityPublisher(func(agentID string, quality, stdDev float64) {
+		serviceReg.UpdateQuality(agentID, quality, stdDev)
+	})
+
+	// Wire traffic shift callbacks.
+	supervisor.SetTrafficShiftCallbacks(
+		func(oldID string, newAgent handoff.HandoffableAgent) {
+			// Register new agent alongside old in Guide's routing table.
+			if router, ok := newAgent.(guide.AgentRouter); ok {
+				_ = g.RegisterRouter(router)
+				g.MarkAgentReady(newAgent.AgentID())
+			}
+			// Start with zero weight — the shift controller sets the initial.
+			serviceReg.UpdateWeight(newAgent.AgentID(), 0)
+		},
+		func(agentID string, weight float64) {
+			serviceReg.UpdateWeight(agentID, weight)
+		},
+	)
+
+	// Wire Guide's quality checker via adapter.
+	g.SetServiceQualityRegistry(&serviceRegistryQualityAdapter{reg: serviceReg})
 
 	if startErr := supervisor.Start(); startErr != nil {
 		return nil
@@ -895,6 +1131,31 @@ func bootstrapHandoffSupervisor(
 	registerHandoffAgent(supervisor, orch)
 
 	return supervisor
+}
+
+// serviceRegistryQualityAdapter adapts ServiceRegistry to the Guide's
+// ServiceQualityChecker interface, avoiding circular imports.
+type serviceRegistryQualityAdapter struct {
+	reg *network.ServiceRegistry
+}
+
+func (a *serviceRegistryQualityAdapter) HasHealthyEndpoints(agentType string) bool {
+	return a.reg.HasHealthyEndpoints(agentType)
+}
+
+func (a *serviceRegistryQualityAdapter) GetWeightedEndpoints(agentType string) []guide.QualityEndpoint {
+	endpoints := a.reg.GetWeightedEndpoints(agentType)
+	result := make([]guide.QualityEndpoint, len(endpoints))
+	for i := range endpoints {
+		result[i] = guide.QualityEndpoint{
+			AgentID:   endpoints[i].AgentID,
+			AgentType: endpoints[i].AgentType,
+			Quality:   endpoints[i].Quality,
+			StdDev:    endpoints[i].StdDev,
+			Weight:    endpoints[i].Weight,
+		}
+	}
+	return result
 }
 
 // handoffWALDir returns the WAL directory path under the user's home .sylk directory.

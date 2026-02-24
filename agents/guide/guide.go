@@ -114,6 +114,10 @@ type Guide struct {
 	// readyAgents map.
 	serviceRegistry ServiceHealthChecker
 
+	// Quality-aware routing for weighted endpoint selection during overlap.
+	qualityChecker  ServiceQualityChecker
+	qualitySelector *QualityAwareSelector
+
 	// Self-managed Google provider lifecycle
 	googleConfig   *providers.GoogleConfig
 	googleProvider *providers.GoogleProvider
@@ -2859,8 +2863,13 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	if g.touchActivityHook != nil {
 		g.touchActivityHook(targetAgentID)
 	}
-	fwdMsg := g.forwardMessage(targetAgentID, forwarded)
-	return g.bus.Publish(TopicRequests(targetAgentID, targetAgentID), fwdMsg)
+
+	// Weighted target resolution: during overlap, multiple endpoints may
+	// exist for the same agent type. Select based on quality weights.
+	resolvedTarget := g.resolveWeightedTarget(targetAgentID)
+
+	fwdMsg := g.forwardMessage(resolvedTarget, forwarded)
+	return g.bus.Publish(TopicRequests(resolvedTarget, resolvedTarget), fwdMsg)
 }
 
 func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest) *Message {
@@ -3190,6 +3199,14 @@ type ServiceHealthChecker interface {
 	HasHealthyEndpoints(agentType string) bool
 }
 
+// ServiceQualityChecker extends ServiceHealthChecker with quality-aware
+// endpoint selection. When set on the Guide, it enables weighted routing
+// during overlap handoffs.
+type ServiceQualityChecker interface {
+	ServiceHealthChecker
+	GetWeightedEndpoints(agentType string) []QualityEndpoint
+}
+
 // SetActivationHook sets a callback invoked before forwarding a request
 // to ensure the target agent's container is active. The hook is typically
 // bound to ActivationController.EnsureActive.
@@ -3210,6 +3227,35 @@ func (g *Guide) SetTouchActivityHook(hook func(agentType string)) {
 // local readyAgents map.
 func (g *Guide) SetServiceRegistry(reg ServiceHealthChecker) {
 	g.serviceRegistry = reg
+}
+
+// SetServiceQualityRegistry sets the quality-aware health checker.
+// This enables weighted endpoint selection during overlap handoffs.
+// It also sets the base serviceRegistry (satisfies ServiceHealthChecker).
+func (g *Guide) SetServiceQualityRegistry(reg ServiceQualityChecker) {
+	g.serviceRegistry = reg
+	g.qualityChecker = reg
+	g.qualitySelector = NewQualityAwareSelector(nil)
+}
+
+// resolveWeightedTarget selects the best endpoint for the given target
+// agent type using quality-weighted routing. If no quality checker is
+// set or only one endpoint exists, returns the original target unchanged.
+func (g *Guide) resolveWeightedTarget(targetAgentID string) string {
+	if g.qualityChecker == nil || g.qualitySelector == nil {
+		return targetAgentID
+	}
+
+	endpoints := g.qualityChecker.GetWeightedEndpoints(targetAgentID)
+	if len(endpoints) <= 1 {
+		return targetAgentID
+	}
+
+	selected := g.qualitySelector.Select(endpoints)
+	if selected.AgentID == "" {
+		return targetAgentID
+	}
+	return selected.AgentID
 }
 
 // isAgentHealthy checks whether an agent is healthy enough to receive

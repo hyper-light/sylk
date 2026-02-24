@@ -21,8 +21,9 @@ const (
 	maxConversationTurns = 8
 
 	// maxConversationTurnContentLen bounds each UserInput/AgentReply field.
-	// At ~4 chars/token, 2000 chars ≈ 500 tokens; 8 turns × 2 fields × 500 = 8000 tokens max.
-	maxConversationTurnContentLen = 2000
+	// At ~4 chars/token, 8000 chars ≈ 2000 tokens; 8 turns × 2 fields × 2000 = 32000 tokens max.
+	// 32K tokens is ~16% of a 200K context window — acceptable for rich plan discussions.
+	maxConversationTurnContentLen = 8000
 )
 
 type ConversationFlowConfig struct {
@@ -330,16 +331,37 @@ func (m *ConversationFlowManager) HistoryForSessionAgent(sessionID, agentID stri
 	return result
 }
 
+// truncationMarker is appended when content is shortened so the LLM
+// understands it is seeing a summary, not a broken/incomplete response.
+const truncationMarker = "\n[…]"
+
 func truncateConversationContent(s string) string {
 	if len(s) <= maxConversationTurnContentLen {
 		return s
 	}
-	// Clip at a valid UTF-8 boundary by converting to runes.
 	runes := []rune(s)
 	if len(runes) <= maxConversationTurnContentLen {
 		return s
 	}
-	return string(runes[:maxConversationTurnContentLen])
+
+	// Reserve room for the marker.
+	markerRunes := []rune(truncationMarker)
+	limit := maxConversationTurnContentLen - len(markerRunes)
+	if limit < 1 {
+		limit = 1
+	}
+
+	clipped := string(runes[:limit])
+
+	// Prefer truncating at a paragraph boundary (last "\n\n").
+	if idx := strings.LastIndex(clipped, "\n\n"); idx > limit/2 {
+		clipped = clipped[:idx]
+	} else if idx := strings.LastIndex(clipped, "\n"); idx > limit/2 {
+		// Fall back to line boundary.
+		clipped = clipped[:idx]
+	}
+
+	return clipped + truncationMarker
 }
 
 // Snapshot returns the active conversation state for a session when available.
@@ -659,12 +681,24 @@ func followupIntentCandidates() []Intent {
 	}
 }
 
+// responseTexter is satisfied by agent response types (e.g. ConversationResult,
+// DesignPlan) that carry human-readable text. Checked before falling back to
+// JSON serialization so conversation history stores clean prose, not struct JSON.
+type responseTexter interface {
+	ResponseText() string
+}
+
 func guideResponseText(response *RouteResponse) string {
 	if response == nil || response.Data == nil {
 		return ""
 	}
 	if text, ok := response.Data.(string); ok {
 		return strings.TrimSpace(text)
+	}
+	if rt, ok := response.Data.(responseTexter); ok {
+		if text := strings.TrimSpace(rt.ResponseText()); text != "" {
+			return text
+		}
 	}
 	if values, ok := response.Data.(map[string]any); ok {
 		if answer, ok := values["answer"].(string); ok {

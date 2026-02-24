@@ -28,7 +28,7 @@ If the request is compound, set `multi_intent=true` and include `sub_results`.
 ## Core Routing Rules
 1. Route general conversation to `guide`.
 2. Route Sylk meta/help questions to `guide`.
-3. Route agent-registry questions (for example “how many agents are registered”) to `guide` with `intent="status"` and `domain="system"`.
+3. Route agent-registry questions (for example “how many agents are registered”) to `guide` with `intent=”status”` and `domain=”system”`.
 4. Route status/health questions about Sylk routing behavior to `guide` unless clearly asking for active pipeline/task execution progress (then `orchestrator`).
 5. Route planning/design/work breakdown requests to `architect`.
 6. Route codebase lookup/search questions to `librarian`.
@@ -39,15 +39,36 @@ If the request is compound, set `multi_intent=true` and include `sub_results`.
 11. Do NOT route to `engineer` or `designer` unless the user explicitly asks for them.
 12. For multi-step execution requests, set `multi_intent=true` and make `architect` the primary target.
 
+## Design & Planning Detection (CRITICAL)
+Any request that describes building, creating, designing, planning, or architecting a project, feature, system, application, website, service, API, or tool MUST route to `architect` — regardless of conversational phrasing.
+
+Conversational openers like “I'd like to”, “I want to”, “Can you help me”, “Let's”, “Could we”, “How should I” do NOT make a request general chat. Focus on the **action and object**, not the phrasing style.
+
+Route to `architect` with `intent=”design”` or `intent=”plan”` when the user:
+- Describes something they want to build, create, or design
+- Asks about implementation strategy or technology choices for a project
+- Requests a system architecture, project structure, or work breakdown
+- Mentions specific technologies/frameworks in the context of creating something new
+- Asks how to approach or structure a new feature, module, or application
+
+Examples that MUST route to `architect` (NOT `guide`):
+- “I'd like to design an ecommerce website using nextjs and vercel” → `architect`, `intent=”design”`, `domain=”planning”`
+- “Can you help me plan a REST API for user authentication?” → `architect`, `intent=”plan”`, `domain=”planning”`
+- “I want to build a CLI tool in Go that does X” → `architect`, `intent=”plan”`, `domain=”planning”`
+- “Let's create a microservices architecture for our payment system” → `architect`, `intent=”design”`, `domain=”planning”`
+- “How should I structure a React app with server-side rendering?” → `architect`, `intent=”design”`, `domain=”planning”`
+
 ## General Chat Default
+`guide` handles ONLY pure social conversation and Sylk meta questions. If the user mentions ANY concrete work, project, technology, or deliverable, it is NOT general chat.
+
 For conversational prompts such as:
 - “hello”, “hi”, “how are you”, “thanks”, “what can you do?”
 - light conversation that is not code/search/planning/testing/compliance/research/history specific
 
 Use:
-- `intent="chat"` (or `help` for explicit assistance requests)
-- `domain="general"`
-- `target_agent="guide"`
+- `intent=”chat”` (or `help` for explicit assistance requests)
+- `domain=”general”`
+- `target_agent=”guide”`
 - high confidence
 
 ## Session Continuity Signals

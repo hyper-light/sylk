@@ -21,12 +21,18 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 	plannerCtx := withPlannerThoughtCallback(ctx, func(stage string, thought string) {
 		a.publishPlanThought(ctx, stage, thought)
 	})
-	runner := &planningProtocolRunner{architect: a, ctx: plannerCtx, request: req, plan: plan}
+	diag := openProtocolDiagnostics(plan.ID, a.config.WorkingDirectory)
+	defer diag.close()
+	diag.log("protocol start plan=%s query=%q planner_available=%v",
+		plan.ID, req.Query, a.ensurePlanner() != nil)
+	runner := &planningProtocolRunner{architect: a, ctx: plannerCtx, request: req, plan: plan, diag: diag}
 	if err := runner.run(); err != nil {
+		diag.log("protocol FAILED: %v", err)
 		return a.failAndPersistPlan(plan, err)
 	}
 	plan.CompletedAt = time.Now()
 	a.persistPlanState(plan)
+	diag.log("protocol complete tasks=%d components=%d", len(plan.Tasks), len(plan.Architecture.Components))
 	return plan, nil
 }
 
@@ -124,6 +130,44 @@ type planningProtocolRunner struct {
 	ctx       context.Context
 	request   *ArchitectRequest
 	plan      *DesignPlan
+	diag      *protocolDiagnostics
+}
+
+// protocolDiagnostics writes a structured log file per plan for post-mortem
+// debugging. Safe to use as a zero-value (all methods are no-ops on nil file).
+type protocolDiagnostics struct {
+	file *os.File
+}
+
+func openProtocolDiagnostics(planID, baseDir string) *protocolDiagnostics {
+	if strings.TrimSpace(baseDir) == "" {
+		baseDir = "."
+	}
+	dir := filepath.Join(baseDir, ".sylk", "architect", "diagnostics")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return &protocolDiagnostics{}
+	}
+	name := filepath.Join(dir, "protocol_"+planID+".log")
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return &protocolDiagnostics{}
+	}
+	return &protocolDiagnostics{file: f}
+}
+
+func (d *protocolDiagnostics) log(format string, args ...any) {
+	if d == nil || d.file == nil {
+		return
+	}
+	ts := time.Now().Format("15:04:05.000")
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(d.file, "[%s] %s\n", ts, msg)
+}
+
+func (d *protocolDiagnostics) close() {
+	if d != nil && d.file != nil {
+		d.file.Close()
+	}
 }
 
 func (r *planningProtocolRunner) run() error {
@@ -145,11 +189,6 @@ func (r *planningProtocolRunner) run() error {
 			return err
 		}
 	}
-	if shouldAutoHandoff(r.request) {
-		if err := r.stepAutoHandoff(); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -163,21 +202,19 @@ func (r *planningProtocolRunner) remainingExecutionSteps() []func() error {
 	}
 }
 
-func shouldAutoHandoff(req *ArchitectRequest) bool {
-	if req == nil || len(req.Params) == 0 {
-		return false
-	}
-	value, ok := req.Params["auto_handoff"].(bool)
-	return ok && value
-}
-
 func (r *planningProtocolRunner) stepAnalyze() error {
 	if err := r.transition(PlanStatusAnalyzing); err != nil {
 		return err
 	}
 	requirements, err := r.architect.analyzeRequirements(r.ctx, r.request.Query, r.request.Params)
 	if err != nil {
+		r.diag.log("stepAnalyze FAILED: %v", err)
 		return err
+	}
+	r.diag.log("stepAnalyze goals=%d scope=%q constraints=%d",
+		len(requirements.Goals), requirements.Scope, len(requirements.Constraints))
+	for i, g := range requirements.Goals {
+		r.diag.log("  goal[%d]: %q", i, g)
 	}
 	r.plan.Requirements = requirements
 	return r.architect.persistPlanState(r.plan)
@@ -207,7 +244,14 @@ func (r *planningProtocolRunner) stepDesign() error {
 	}
 	architecture, err := r.architect.designArchitecture(r.ctx, r.plan.Requirements, r.plan.CodebasePatterns)
 	if err != nil {
+		r.diag.log("stepDesign FAILED: %v", err)
 		return err
+	}
+	r.diag.log("stepDesign name=%q components=%d patterns=%d",
+		architecture.Name, len(architecture.Components), len(architecture.Patterns))
+	for i, c := range architecture.Components {
+		r.diag.log("  component[%d]: name=%q type=%q desc=%q",
+			i, c.Name, c.Type, truncateString(c.Description, 80))
 	}
 	r.plan.Architecture = architecture
 	return r.architect.persistPlanState(r.plan)
@@ -219,7 +263,14 @@ func (r *planningProtocolRunner) stepGenerate() error {
 	}
 	tasks, err := r.architect.generateAtomicTasks(r.ctx, r.plan.Architecture, r.plan.Constraints)
 	if err != nil {
+		r.diag.log("stepGenerate FAILED: %v", err)
 		return err
+	}
+	r.diag.log("stepGenerate tasks=%d", len(tasks))
+	for i, t := range tasks {
+		r.diag.log("  task[%d]: id=%q name=%q agent=%q deps=%v ac=%d files=%d guide_len=%d",
+			i, t.ID, t.Name, t.AgentType, t.Dependencies,
+			len(t.AcceptanceCriteria), len(t.AffectedFiles), len(t.ImplementationGuide))
 	}
 	r.plan.Tasks = tasks
 	return r.architect.persistPlanState(r.plan)
@@ -316,17 +367,18 @@ func (r *planningProtocolRunner) stepReady() error {
 	if err := r.transition(PlanStatusReady); err != nil {
 		return err
 	}
-	// Stream formatted plan inline as chat content.
-	r.architect.publishPlanStreamChunk(r.ctx, formatPlanForChat(r.plan))
+	// Publish full plan snapshot for the inline chat widget.
+	r.architect.publishPlanSnapshot(r.ctx, r.plan)
 	// Stream LLM commentary + readiness footer token-by-token.
 	r.plan.UserResponse = r.architect.readyUserResponseInline(r.ctx, r.request, r.plan)
-	// Persist but do NOT show plan panel yet — it appears during execution.
 	return r.architect.persistPlanState(r.plan)
 }
 
 func (r *planningProtocolRunner) stepAutoHandoff() error {
 	if !r.architect.running || r.architect.bus == nil {
-		return fmt.Errorf("auto_handoff requested but architect bus is unavailable")
+		r.architect.logWarn("stepAutoHandoff: bus unavailable, skipping handoff")
+		r.diag.log("stepAutoHandoff: bus unavailable, plan stays Ready")
+		return nil
 	}
 	if err := r.transition(PlanStatusExecuting); err != nil {
 		return err
@@ -339,9 +391,14 @@ func (r *planningProtocolRunner) stepAutoHandoff() error {
 	}
 	response, err := r.architect.requestRouteSync(r.ctx, request)
 	if err != nil {
-		return err
+		r.architect.logWarn("stepAutoHandoff: route failed", "error", err)
+		r.diag.log("stepAutoHandoff: route failed: %v", err)
+		r.plan.RiskSummary = append(r.plan.RiskSummary, "handoff error: "+err.Error())
+		return r.architect.persistPlanState(r.plan)
 	}
-	r.plan.RiskSummary = append(r.plan.RiskSummary, summarizeAutoHandoffResponse(response))
+	summary := summarizeAutoHandoffResponse(response)
+	r.diag.log("stepAutoHandoff: %s", summary)
+	r.plan.RiskSummary = append(r.plan.RiskSummary, summary)
 	return r.architect.persistPlanState(r.plan)
 }
 
@@ -524,6 +581,14 @@ func (a *Architect) planStoreDir() string {
 	return filepath.Join(base, ".sylk", "architect", "plans")
 }
 
+// restoreMaxAge is the maximum age of a persisted plan eligible for restore.
+// Plans older than this are stale artifacts from prior sessions.
+const restoreMaxAge = 24 * time.Hour
+
+// restoreMaxPlans caps the number of plans restored on startup to prevent
+// unbounded memory growth from accumulated plan files.
+const restoreMaxPlans = 32
+
 func (a *Architect) restorePersistedPlans() error {
 	dir := a.planStoreDir()
 	entries, err := os.ReadDir(dir)
@@ -533,30 +598,57 @@ func (a *Architect) restorePersistedPlans() error {
 		}
 		return err
 	}
+	cutoff := time.Now().Add(-restoreMaxAge)
+	restored := 0
+	skipped := 0
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
+		if restored >= restoreMaxPlans {
+			skipped++
+			continue
+		}
 		path := filepath.Join(dir, entry.Name())
-		if err := a.restorePlanFromFile(path); err != nil {
-			a.logger.Warn("failed to restore plan", "path", path, "error", err)
+		if ok, restoreErr := a.restorePlanFromFile(path, cutoff); restoreErr != nil {
+			a.logger.Warn("failed to restore plan", "path", path, "error", restoreErr)
+			continue
+		} else if ok {
+			restored++
+		} else {
+			skipped++
 		}
 	}
+	a.logInfo("restorePersistedPlans: done",
+		"dir", dir, "restored", restored, "skipped", skipped)
 	return nil
 }
 
-func (a *Architect) restorePlanFromFile(path string) error {
+func (a *Architect) restorePlanFromFile(path string, cutoff time.Time) (bool, error) {
 	payload, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	var plan DesignPlan
 	if err := json.Unmarshal(payload, &plan); err != nil {
-		return err
+		return false, err
 	}
 	if strings.TrimSpace(plan.ID) == "" {
-		return fmt.Errorf("restored plan missing id")
+		return false, fmt.Errorf("restored plan missing id")
 	}
+	// Skip terminal-state plans and plans older than cutoff.
+	if plan.Status == PlanStatusFailed || plan.Status == PlanStatusExecuting {
+		return false, nil
+	}
+	if plan.UpdatedAt.Before(cutoff) {
+		return false, nil
+	}
+	a.logInfo("restorePlanFromFile",
+		"plan_id", plan.ID,
+		"status", plan.Status.String(),
+		"query", truncateString(plan.Query, 80),
+		"tasks", len(plan.Tasks),
+		"created_at", plan.CreatedAt.String())
 	a.upsertActivePlan(&plan)
-	return nil
+	return true, nil
 }
