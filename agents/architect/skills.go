@@ -13,6 +13,8 @@ import (
 
 func (a *Architect) registerCoreSkills() {
 	a.skills.Register(analyzeRequirementsSkill(a))
+	a.skills.Register(routePlanAcceptanceSkill(a))
+	a.skills.Register(handlePlanAcceptanceResultSkill(a))
 	a.skills.Register(consultBeforePlanningSkill(a))
 	a.skills.Register(consultLibrarianSkill(a))
 	a.skills.Register(consultArchivalistSkill(a))
@@ -30,7 +32,9 @@ func (a *Architect) registerCoreSkills() {
 	a.skills.Register(consultKnowledgeSkill(a))
 	a.skills.Register(preDelegationDeclareSkill(a))
 	a.skills.Register(validatePreDelegationSkill(a))
-	a.skills.Register(handoffToOrchestratorSkill(a))
+	// handoff_to_orchestrator is NOT registered as a skill — handoff is
+	// triggered by the system via handleExecute → dispatchPlanExecution,
+	// not by LLM tool invocation.
 	a.skills.Register(monitorExecutionSkill(a))
 	a.skills.Register(revisePlanSkill(a))
 	a.skills.Register(enterPlanModeSkill(a))
@@ -256,13 +260,15 @@ type createWorkflowDAGParams struct {
 
 func createWorkflowDAGSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("create_workflow_dag").
-		Description("Create a workflow DAG for task orchestration.").
+		Description("Build a workflow DAG structure from atomic tasks during plan formulation. Does NOT dispatch or execute the plan.").
 		Domain("planning").
-		Keywords("workflow", "dag", "orchestration", "execution", "order").
+		Keywords("workflow", "dag", "dependency graph", "task order", "plan structure").
 		Priority(85).
 		ArrayParam("tasks", "Tasks to create workflow from", "object", true).
 		EnumParam("policy", "Execution policy", []string{"fail_fast", "continue"}, false).
 		IntParam("max_concurrency", "Maximum concurrent tasks (default: 10)", false).
+		Usage("Use during plan formulation to organize atomic tasks into a dependency graph. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance followed by handle_plan_acceptance_result.").
+		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires: route_plan_acceptance → Guide verdict → handle_plan_acceptance_result.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params createWorkflowDAGParams
 			if err := json.Unmarshal(input, &params); err != nil {

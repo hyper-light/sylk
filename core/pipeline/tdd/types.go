@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/adalundhe/sylk/agents/inspector"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 )
 
@@ -85,7 +85,10 @@ type PipelineConfig struct {
 	PhaseTimeout    time.Duration
 	PipelineTimeout time.Duration
 	Priority        int
-	InitialCriteria *inspector.InspectorCriteria
+	InitialCriteria *inspShared.InspectorCriteria
+	TaskPrompt      string            // Full task prompt from buildNodePrompt
+	CoWorkerTypes   []WorkerType      // Co-tenant worker types (sequential order)
+	AgentPrompts    map[WorkerType]string // Per-agent scoped prompts (compound only)
 }
 
 // Pipeline represents the state of a single TDD pipeline execution.
@@ -101,11 +104,17 @@ type Pipeline struct {
 	MaxLoops   int
 
 	// Phase results — populated as the pipeline progresses.
-	InspectorCriteria *inspector.InspectorCriteria
+	InspectorCriteria *inspShared.InspectorCriteria
 	TesterTests       *tester.TestSuiteResult
 	WorkerOutput      *WorkerResult
-	InspectorResult   *inspector.InspectorResult
+	InspectorResult   *inspShared.InspectorResult
 	TesterResult      *tester.TesterResponse
+
+	// Compound pipeline fields.
+	TaskPrompt      string
+	CoWorkerTypes   []WorkerType
+	AgentPrompts    map[WorkerType]string
+	CoWorkerOutputs []*WorkerResult
 
 	// Timestamps.
 	CreatedAt   time.Time
@@ -115,6 +124,11 @@ type Pipeline struct {
 	LastError string
 }
 
+// IsCompound returns true if this pipeline has co-tenant workers.
+func (p *Pipeline) IsCompound() bool {
+	return len(p.CoWorkerTypes) > 0
+}
+
 // PipelineResult is the final output of a completed TDD pipeline.
 type PipelineResult struct {
 	PipelineID string
@@ -122,11 +136,12 @@ type PipelineResult struct {
 	Status     PipelineStatus
 	LoopCount  int
 
-	InspectorCriteria *inspector.InspectorCriteria
+	InspectorCriteria *inspShared.InspectorCriteria
 	TesterTests       *tester.TestSuiteResult
 	WorkerOutput      *WorkerResult
-	InspectorResult   *inspector.InspectorResult
+	InspectorResult   *inspShared.InspectorResult
 	TesterResult      *tester.TesterResponse
+	CoWorkerOutputs   []*WorkerResult
 
 	Duration time.Duration
 	Error    string
@@ -139,13 +154,15 @@ type PipelineEvent struct {
 	SessionID  string
 	OldStatus  PipelineStatus
 	NewStatus  PipelineStatus
+	WorkerType WorkerType
 	LoopCount  int
+	MaxLoops   int
 	Timestamp  time.Time
 	Error      string
 }
 
 // WorkerAgent is the interface that engineer and designer adapters implement.
 type WorkerAgent interface {
-	Execute(ctx context.Context, criteria *inspector.InspectorCriteria, inspectorFeedback *InspectorFeedback, testerFeedback *TesterFeedback) (*WorkerResult, error)
+	Execute(ctx context.Context, criteria *inspShared.InspectorCriteria, inspectorFeedback *InspectorFeedback, testerFeedback *TesterFeedback) (*WorkerResult, error)
 	Close() error
 }

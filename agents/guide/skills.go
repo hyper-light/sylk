@@ -36,6 +36,7 @@ func (g *Guide) registerCoreSkills() {
 	g.skills.Register(taskInteractSkill(g))
 	g.skills.Register(routingHistorySkill(g))
 	g.skills.Register(agentCapabilitySkill(g))
+	g.skills.Register(evaluatePlanAcceptanceSkill(g))
 }
 
 func (g *Guide) registerExtendedSkills() {
@@ -83,7 +84,7 @@ func routeSkill(g *Guide) *skills.Skill {
 				CorrelationID: params.CorrelationID,
 				SessionID:     sessionID,
 			}
-			return g.Route(ctx, request)
+			return g.RouteAndForward(ctx, request)
 		}).
 		Build()
 }
@@ -140,7 +141,7 @@ func taskInteractSkill(g *Guide) *skills.Skill {
 				TargetAgentID: "orchestrator",
 				SessionID:     sessionID,
 			}
-			return g.Route(ctx, request)
+			return g.RouteAndForward(ctx, request)
 		}).
 		Build()
 }
@@ -225,7 +226,7 @@ func guideRouteSkill(g *Guide) *skills.Skill {
 				Input:     params.Input,
 				SessionID: params.SessionID,
 			}
-			return g.Route(ctx, request)
+			return g.RouteAndForward(ctx, request)
 		}).
 		Build()
 }
@@ -436,7 +437,7 @@ func routeToSkill(g *Guide) *skills.Skill {
 				TargetAgentID: params.Target,
 				SessionID:     resolveGuideSkillSessionID(g, params.SessionID),
 			}
-			return g.Route(ctx, request)
+			return g.RouteAndForward(ctx, request)
 		}).
 		Build()
 }
@@ -600,6 +601,7 @@ func closeSessionSkill(g *Guide) *skills.Skill {
 		}).
 		Build()
 }
+
 
 func resolveGuideSkillSessionID(g *Guide, candidate string) string {
 	sessionID := strings.TrimSpace(candidate)

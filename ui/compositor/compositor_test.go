@@ -7,7 +7,7 @@ import (
 
 func TestSetStructureResetsCache(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 3, 1, 1)
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 3, 0, 1, 1)
 
 	if c.HasCache() {
 		t.Fatal("expected no cache after SetStructure")
@@ -25,7 +25,7 @@ func TestSetStructureResetsCache(t *testing.T) {
 
 func TestSingleColumnCompose(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotCenter}, 2, 1, 1)
+	c.SetStructure([]SlotID{SlotCenter}, 2, 0, 1, 1)
 
 	c.SetSlotLines(SlotCenter, []string{"chat-line-0", "chat-line-1"})
 	c.SetSlotLines(SlotInput, []string{"input-line"})
@@ -43,7 +43,7 @@ func TestSingleColumnCompose(t *testing.T) {
 
 func TestTwoColumnSplice(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 0, 0)
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 0, 0, 0)
 
 	c.SetSlotLines(SlotLeft, []string{"L0", "L1"})
 	c.SetSlotLines(SlotRight, []string{"R0", "R1"})
@@ -57,7 +57,7 @@ func TestTwoColumnSplice(t *testing.T) {
 
 func TestPartialDirty(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 1, 1)
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 0, 1, 1)
 
 	c.SetSlotLines(SlotLeft, []string{"L0", "L1"})
 	c.SetSlotLines(SlotRight, []string{"R0", "R1"})
@@ -88,7 +88,7 @@ func TestPartialDirty(t *testing.T) {
 
 func TestInvalidateAll(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotCenter}, 1, 1, 1)
+	c.SetStructure([]SlotID{SlotCenter}, 1, 0, 1, 1)
 	c.SetSlotLines(SlotCenter, []string{"c"})
 	c.SetSlotLines(SlotInput, []string{"i"})
 	c.SetSlotLines(SlotStatus, []string{"s"})
@@ -105,7 +105,7 @@ func TestInvalidateAll(t *testing.T) {
 
 func TestFourColumnSplice(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotLeft, SlotCenterLeft, SlotCenter, SlotRight}, 2, 0, 0)
+	c.SetStructure([]SlotID{SlotLeft, SlotCenterLeft, SlotCenter, SlotRight}, 2, 0, 0, 0)
 
 	c.SetSlotLines(SlotLeft, []string{"A0", "A1"})
 	c.SetSlotLines(SlotCenterLeft, []string{"B0", "B1"})
@@ -128,7 +128,7 @@ func TestSplitLines(t *testing.T) {
 
 func TestCachedFrameReturnsSame(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotCenter}, 1, 0, 0)
+	c.SetStructure([]SlotID{SlotCenter}, 1, 0, 0, 0)
 	c.SetSlotLines(SlotCenter, []string{"hello"})
 	first := c.Compose()
 	second := c.CachedFrame()
@@ -139,7 +139,7 @@ func TestCachedFrameReturnsSame(t *testing.T) {
 
 func TestMarkDirty(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotCenter}, 1, 1, 1)
+	c.SetStructure([]SlotID{SlotCenter}, 1, 0, 1, 1)
 	c.SetSlotLines(SlotCenter, []string{"c"})
 	c.SetSlotLines(SlotInput, []string{"i"})
 	c.SetSlotLines(SlotStatus, []string{"s"})
@@ -156,7 +156,7 @@ func TestMarkDirty(t *testing.T) {
 
 func TestMissingSlotProducesEmptyLines(t *testing.T) {
 	c := New()
-	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 0, 0)
+	c.SetStructure([]SlotID{SlotLeft, SlotRight}, 2, 0, 0, 0)
 
 	// Only set left, right is missing.
 	c.SetSlotLines(SlotLeft, []string{"L0", "L1"})
@@ -165,5 +165,101 @@ func TestMissingSlotProducesEmptyLines(t *testing.T) {
 	lines := strings.Split(got, "\n")
 	if lines[0] != "L0" || lines[1] != "L1" {
 		t.Fatalf("unexpected: %v", lines)
+	}
+}
+
+func TestQueueSlotCompose(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 2, 1, 1, 1)
+
+	c.SetSlotLines(SlotCenter, []string{"chat-0", "chat-1"})
+	c.SetSlotLines(SlotQueue, []string{"queue-0"})
+	c.SetSlotLines(SlotInput, []string{"input-0"})
+	c.SetSlotLines(SlotStatus, []string{"status-0"})
+
+	got := c.Compose()
+	want := "chat-0\nchat-1\nqueue-0\ninput-0\nstatus-0"
+	if got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestQueueSlotZeroHeight(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 2, 0, 1, 1)
+
+	c.SetSlotLines(SlotCenter, []string{"chat-0", "chat-1"})
+	c.SetSlotLines(SlotInput, []string{"input-0"})
+	c.SetSlotLines(SlotStatus, []string{"status-0"})
+
+	got := c.Compose()
+	want := "chat-0\nchat-1\ninput-0\nstatus-0"
+	if got != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestQueueDirtyFlag(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 2, 1, 1, 1)
+	c.SetSlotLines(SlotCenter, []string{"c0", "c1"})
+	c.SetSlotLines(SlotQueue, []string{"q0"})
+	c.SetSlotLines(SlotInput, []string{"i0"})
+	c.SetSlotLines(SlotStatus, []string{"s0"})
+	c.Compose()
+
+	// Only update queue.
+	c.SetSlotLines(SlotQueue, []string{"q1"})
+	if !c.IsDirty(SlotQueue) {
+		t.Fatal("expected queue dirty")
+	}
+	if c.IsDirty(SlotCenter) {
+		t.Fatal("expected main clean")
+	}
+	if c.IsDirty(SlotInput) {
+		t.Fatal("expected input clean")
+	}
+
+	got := c.Compose()
+	want := "c0\nc1\nq1\ni0\ns0"
+	if got != want {
+		t.Fatalf("got: %q, want: %q", got, want)
+	}
+}
+
+func TestAdjustVerticalSections(t *testing.T) {
+	c := New()
+	// Total: main=3 + queue=1 + input=1 + status=1 = 6 lines.
+	c.SetStructure([]SlotID{SlotCenter}, 3, 1, 1, 1)
+	c.SetSlotLines(SlotCenter, []string{"c0", "c1", "c2"})
+	c.SetSlotLines(SlotQueue, []string{"q0"})
+	c.SetSlotLines(SlotInput, []string{"i0"})
+	c.SetSlotLines(SlotStatus, []string{"s0"})
+	c.Compose()
+
+	// Shrink main by 1, grow queue to 2.
+	c.SetSlotLines(SlotCenter, []string{"c0", "c1"})
+	c.SetSlotLines(SlotQueue, []string{"q0", "q1"})
+	c.AdjustVerticalSections(2, 2, 1, SlotCenter)
+
+	got := c.Compose()
+	want := "c0\nc1\nq0\nq1\ni0\ns0"
+	if got != want {
+		t.Fatalf("got: %q, want: %q", got, want)
+	}
+}
+
+func TestInvalidateAllIncludesQueue(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 1, 1, 1, 1)
+	c.SetSlotLines(SlotCenter, []string{"c"})
+	c.SetSlotLines(SlotQueue, []string{"q"})
+	c.SetSlotLines(SlotInput, []string{"i"})
+	c.SetSlotLines(SlotStatus, []string{"s"})
+	c.Compose()
+
+	c.InvalidateAll()
+	if !c.IsDirty(SlotQueue) {
+		t.Fatal("expected queue dirty after InvalidateAll")
 	}
 }

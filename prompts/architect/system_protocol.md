@@ -18,7 +18,7 @@ For every implementation request, follow this sequence:
 - define risks and mitigations
 
 4. Generate atomic tasks:
-- each task must be single-agent completable
+- each task must be single-pipeline completable (a pipeline may host a primary agent and co-tenant agents with per-agent scoped specifications)
 - each task must have explicit acceptance criteria
 - each dependency must be explicit
 

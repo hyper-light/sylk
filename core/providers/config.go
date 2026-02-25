@@ -307,7 +307,7 @@ const (
 // DefaultGoogleConfig returns Google/Gemini defaults
 func DefaultGoogleConfig() GoogleConfig {
 	base := DefaultBaseConfig()
-	base.Model = string(Gemini3Pro) // Google Gemini 3 Pro
+	base.Model = string(Gemini31Pro) // Google Gemini 3.1 Pro Preview
 	base.MaxTokens = 8192
 
 	return GoogleConfig{

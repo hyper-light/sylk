@@ -36,6 +36,16 @@ func WithRetryObserver(ctx context.Context, observer RetryObserver) context.Cont
 	return context.WithValue(ctx, retryObserverKey{}, observer)
 }
 
+// RetryObserverFromContext extracts a previously attached RetryObserver from
+// the context. Returns nil when no observer is present.
+func RetryObserverFromContext(ctx context.Context) RetryObserver {
+	if ctx == nil {
+		return nil
+	}
+	obs, _ := ctx.Value(retryObserverKey{}).(RetryObserver)
+	return obs
+}
+
 func notifyRetryObserver(ctx context.Context, event RetryEvent) {
 	if ctx == nil {
 		return
@@ -99,6 +109,30 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 		}
 	}
 	return lastErr
+}
+
+// retryAwareHandler wraps a StreamHandler so that when a provider retry
+// replays the stream, the replayed ChunkTypeStart chunk has RetryReset=true.
+// Consumers can check this flag to discard prior partial content accumulated
+// from the failed attempt.
+//
+// A retry is distinguished from a secondary start event (e.g. early usage)
+// by whether content chunks (text, thought, tool) were seen since the last
+// start. Only a start that follows content is a retry.
+func retryAwareHandler(handler StreamHandler) StreamHandler {
+	var hasContent bool
+	return func(chunk *StreamChunk) error {
+		switch chunk.Type {
+		case ChunkTypeStart:
+			if hasContent {
+				chunk.RetryReset = true
+			}
+			hasContent = false
+		case ChunkTypeText, ChunkTypeThought, ChunkTypeToolStart, ChunkTypeToolDelta:
+			hasContent = true
+		}
+		return handler(chunk)
+	}
 }
 
 func resolveMaxRetries(configured int) int {

@@ -82,23 +82,27 @@ func reportToEngineerSkill(pt *PipelineTester) *skills.Skill {
 // reportToDesignerSkill creates a skill that sends failure reports to the Designer.
 func reportToDesignerSkill(pt *PipelineTester) *skills.Skill {
 	type params struct {
-		TestName     string `json:"test_name"`
-		ErrorMessage string `json:"error_message"`
-		RootCause    string `json:"root_cause"`
-		SuggestedFix string `json:"suggested_fix"`
-		File         string `json:"file"`
+		TestName         string `json:"test_name"`
+		ErrorMessage     string `json:"error_message"`
+		RootCause        string `json:"root_cause"`
+		SuggestedFix     string `json:"suggested_fix"`
+		File             string `json:"file"`
+		DesignIssue      string `json:"design_issue,omitempty"`
+		DesignSuggestion string `json:"design_suggestion,omitempty"`
 	}
 
 	return skills.NewSkill("report_to_designer").
 		Description("Send a failure report with root cause and suggested fix to the pipeline Designer.").
 		Domain("testing").
-		Keywords("report", "designer", "feedback", "failure").
+		Keywords("report", "designer", "feedback", "failure", "design").
 		Priority(85).
 		StringParam("test_name", "Name of the failing test", true).
 		StringParam("error_message", "Error message from the failure", true).
 		StringParam("root_cause", "Root cause analysis", true).
 		StringParam("suggested_fix", "Suggested fix for the defect", true).
 		StringParam("file", "File containing the defect", true).
+		StringParam("design_issue", "Description of the design-specific problem", false).
+		StringParam("design_suggestion", "Design-specific fix recommendation", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
@@ -109,14 +113,21 @@ func reportToDesignerSkill(pt *PipelineTester) *skills.Skill {
 				return nil, fmt.Errorf("bus not available")
 			}
 
+			feedbackType := "test_failure"
+			if p.DesignIssue != "" {
+				feedbackType = "design_test_failure"
+			}
+
 			feedback := map[string]any{
-				"type":          "test_failure",
-				"test_name":     p.TestName,
-				"error_message": p.ErrorMessage,
-				"root_cause":    p.RootCause,
-				"suggested_fix": p.SuggestedFix,
-				"file":          p.File,
-				"from_agent":    pt.id,
+				"type":              feedbackType,
+				"test_name":         p.TestName,
+				"error_message":     p.ErrorMessage,
+				"root_cause":        p.RootCause,
+				"suggested_fix":     p.SuggestedFix,
+				"file":              p.File,
+				"design_issue":      p.DesignIssue,
+				"design_suggestion": p.DesignSuggestion,
+				"from_agent":        pt.id,
 			}
 
 			req := &guide.RouteRequest{

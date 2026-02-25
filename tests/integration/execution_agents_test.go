@@ -8,8 +8,11 @@ import (
 	"github.com/adalundhe/sylk/agents/designer"
 	"github.com/adalundhe/sylk/agents/engineer"
 	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/agents/inspector"
+	inspPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/agents/tester"
+	globaltester "github.com/adalundhe/sylk/agents/tester/global"
+	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,7 +22,7 @@ func TestEngineerScopeLimit(t *testing.T) {
 }
 
 func TestEngineerCreation(t *testing.T) {
-	eng, err := engineer.New(engineer.Config{})
+	eng, err := engineer.New(engineer.Config{}, nil)
 	require.NoError(t, err)
 	require.NotNil(t, eng)
 
@@ -27,15 +30,16 @@ func TestEngineerCreation(t *testing.T) {
 	require.NotNil(t, routingInfo)
 
 	assert.Equal(t, "engineer", routingInfo.Name)
+	assert.Equal(t, "engineer", routingInfo.Type)
 	assert.NotEmpty(t, routingInfo.ID)
-	assert.True(t, len(routingInfo.ID) > len("engineer_"))
+	assert.Contains(t, routingInfo.ID, "engineer_")
 }
 
 func TestEngineerStartStop(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	eng, err := engineer.New(engineer.Config{})
+	eng, err := engineer.New(engineer.Config{}, nil)
 	require.NoError(t, err)
 
 	assert.False(t, eng.IsRunning())
@@ -53,7 +57,7 @@ func TestEngineerStartStop(t *testing.T) {
 }
 
 func TestEngineerRoutingInfo(t *testing.T) {
-	eng, err := engineer.New(engineer.Config{})
+	eng, err := engineer.New(engineer.Config{}, nil)
 	require.NoError(t, err)
 
 	routingInfo := eng.GetRoutingInfo()
@@ -71,7 +75,7 @@ func TestDesignerScopeLimit(t *testing.T) {
 }
 
 func TestDesignerCreation(t *testing.T) {
-	des, err := designer.New(designer.Config{})
+	des, err := designer.New(designer.Config{}, nil)
 	require.NoError(t, err)
 	require.NotNil(t, des)
 
@@ -79,15 +83,16 @@ func TestDesignerCreation(t *testing.T) {
 	require.NotNil(t, routingInfo)
 
 	assert.Equal(t, "designer", routingInfo.Name)
+	assert.Equal(t, "designer", routingInfo.Type)
 	assert.NotEmpty(t, routingInfo.ID)
-	assert.True(t, len(routingInfo.ID) > len("designer_"))
+	assert.NotContains(t, routingInfo.ID, "designer_")
 }
 
 func TestDesignerStartStop(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	des, err := designer.New(designer.Config{})
+	des, err := designer.New(designer.Config{}, nil)
 	require.NoError(t, err)
 
 	assert.False(t, des.IsRunning())
@@ -105,7 +110,7 @@ func TestDesignerStartStop(t *testing.T) {
 }
 
 func TestDesignerRoutingInfo(t *testing.T) {
-	des, err := designer.New(designer.Config{})
+	des, err := designer.New(designer.Config{}, nil)
 	require.NoError(t, err)
 
 	routingInfo := des.GetRoutingInfo()
@@ -120,47 +125,34 @@ func TestDesignerRoutingInfo(t *testing.T) {
 	assert.Contains(t, caps.Domains, guide.DomainFiles)
 }
 
-func TestInspector8PhaseValidation(t *testing.T) {
-	phases := []inspector.ValidationPhase{
-		inspector.PhaseLintCheck,
-		inspector.PhaseTypeCheck,
-		inspector.PhaseFormatCheck,
-		inspector.PhaseSecurityScan,
-		inspector.PhaseTestCoverage,
-		inspector.PhaseDocumentation,
-		inspector.PhaseComplexity,
-		inspector.PhaseFinalReview,
-	}
+func TestPipelineInspectorDefaultConfig(t *testing.T) {
+	cfg := inspShared.DefaultPipelineInspectorConfig()
 
-	assert.Len(t, phases, 8)
-
-	assert.Equal(t, inspector.ValidationPhase("lint_check"), inspector.PhaseLintCheck)
-	assert.Equal(t, inspector.ValidationPhase("type_check"), inspector.PhaseTypeCheck)
-	assert.Equal(t, inspector.ValidationPhase("format_check"), inspector.PhaseFormatCheck)
-	assert.Equal(t, inspector.ValidationPhase("security_scan"), inspector.PhaseSecurityScan)
-	assert.Equal(t, inspector.ValidationPhase("test_coverage"), inspector.PhaseTestCoverage)
-	assert.Equal(t, inspector.ValidationPhase("documentation"), inspector.PhaseDocumentation)
-	assert.Equal(t, inspector.ValidationPhase("complexity"), inspector.PhaseComplexity)
-	assert.Equal(t, inspector.ValidationPhase("final_review"), inspector.PhaseFinalReview)
+	assert.NotEmpty(t, cfg.Model)
+	assert.Greater(t, cfg.MaxToolRuns, 0)
+	assert.Greater(t, cfg.MaxTokens, 0)
+	assert.NotZero(t, cfg.DefaultTimeout)
+	assert.Greater(t, cfg.MaxFeedbackLoops, 0)
 }
 
 func TestInspectorCreation(t *testing.T) {
-	insp, err := inspector.New(inspector.InspectorConfig{})
+	insp, err := inspPipeline.New(inspShared.PipelineInspectorConfig{}, nil)
 	require.NoError(t, err)
 	require.NotNil(t, insp)
 
 	routingInfo := insp.GetRoutingInfo()
 	require.NotNil(t, routingInfo)
 
-	assert.Equal(t, "inspector", routingInfo.ID)
-	assert.Equal(t, "inspector", routingInfo.Name)
+	assert.NotEmpty(t, routingInfo.ID)
+	assert.Equal(t, "inspector-pipeline", routingInfo.Type)
+	assert.Equal(t, "inspector-pipeline", routingInfo.Name)
 }
 
 func TestInspectorStartStop(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	insp, err := inspector.New(inspector.InspectorConfig{})
+	insp, err := inspPipeline.New(inspShared.PipelineInspectorConfig{}, nil)
 	require.NoError(t, err)
 
 	assert.False(t, insp.IsRunning())
@@ -178,7 +170,7 @@ func TestInspectorStartStop(t *testing.T) {
 }
 
 func TestInspectorRoutingInfo(t *testing.T) {
-	insp, err := inspector.New(inspector.InspectorConfig{})
+	insp, err := inspPipeline.New(inspShared.PipelineInspectorConfig{}, nil)
 	require.NoError(t, err)
 
 	routingInfo := insp.GetRoutingInfo()
@@ -188,11 +180,11 @@ func TestInspectorRoutingInfo(t *testing.T) {
 	caps := routingInfo.Registration.Capabilities
 	assert.Contains(t, caps.Intents, guide.IntentCheck)
 	assert.Contains(t, caps.Domains, guide.DomainCode)
-	assert.Equal(t, 75, caps.Priority)
+	assert.Equal(t, 70, caps.Priority)
 }
 
 func TestInspectorConfigDefaults(t *testing.T) {
-	insp, err := inspector.New(inspector.InspectorConfig{})
+	insp, err := inspPipeline.New(inspShared.PipelineInspectorConfig{}, nil)
 	require.NoError(t, err)
 
 	assert.NotNil(t, insp)
@@ -225,22 +217,23 @@ func TestTester6CategorySystem(t *testing.T) {
 }
 
 func TestTesterCreation(t *testing.T) {
-	tst, err := tester.New(tester.TesterConfig{})
+	tst, err := globaltester.New(shared.GlobalTesterConfig{}, nil)
 	require.NoError(t, err)
 	require.NotNil(t, tst)
 
 	routingInfo := tst.GetRoutingInfo()
 	require.NotNil(t, routingInfo)
 
-	assert.Equal(t, "tester", routingInfo.ID)
-	assert.Equal(t, "tester", routingInfo.Name)
+	assert.NotContains(t, routingInfo.ID, "tester_")
+	assert.Equal(t, "tester", routingInfo.Type)
+	assert.Equal(t, "Tester", routingInfo.Name)
 }
 
 func TestTesterStartStop(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	tst, err := tester.New(tester.TesterConfig{})
+	tst, err := globaltester.New(shared.GlobalTesterConfig{}, nil)
 	require.NoError(t, err)
 
 	assert.False(t, tst.IsRunning())
@@ -258,7 +251,7 @@ func TestTesterStartStop(t *testing.T) {
 }
 
 func TestTesterRoutingInfo(t *testing.T) {
-	tst, err := tester.New(tester.TesterConfig{})
+	tst, err := globaltester.New(shared.GlobalTesterConfig{}, nil)
 	require.NoError(t, err)
 
 	routingInfo := tst.GetRoutingInfo()
@@ -285,16 +278,16 @@ func TestExecutionAgentsConcurrentStart(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	eng, err := engineer.New(engineer.Config{})
+	eng, err := engineer.New(engineer.Config{}, nil)
 	require.NoError(t, err)
 
-	des, err := designer.New(designer.Config{})
+	des, err := designer.New(designer.Config{}, nil)
 	require.NoError(t, err)
 
-	insp, err := inspector.New(inspector.InspectorConfig{})
+	insp, err := inspPipeline.New(inspShared.PipelineInspectorConfig{}, nil)
 	require.NoError(t, err)
 
-	tst, err := tester.New(tester.TesterConfig{})
+	tst, err := globaltester.New(shared.GlobalTesterConfig{}, nil)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -340,7 +333,7 @@ func TestExecutionAgentsConcurrentStart(t *testing.T) {
 
 	eng.Stop()
 	des.Stop()
-	insp.Stop()
+	_ = insp.Stop()
 	tst.Stop()
 }
 
@@ -348,64 +341,65 @@ func TestExecutionAgentsEventBusSubscriptions(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
+	type channelIDs struct {
+		agentType string
+		agentID   string
+	}
+
 	tests := []struct {
-		name      string
-		channelID string
-		start     func() error
+		name  string
+		start func() (channelIDs, error)
 	}{
 		{
-			name:      "engineer",
-			channelID: "engineer",
-			start: func() error {
-				eng, err := engineer.New(engineer.Config{})
+			name: "engineer",
+			start: func() (channelIDs, error) {
+				eng, err := engineer.New(engineer.Config{}, nil)
 				if err != nil {
-					return err
+					return channelIDs{}, err
 				}
-				return eng.Start(bus)
+				return channelIDs{"engineer", "engineer"}, eng.Start(bus)
 			},
 		},
 		{
-			name:      "designer",
-			channelID: "designer",
-			start: func() error {
-				des, err := designer.New(designer.Config{})
+			name: "designer",
+			start: func() (channelIDs, error) {
+				des, err := designer.New(designer.Config{}, nil)
 				if err != nil {
-					return err
+					return channelIDs{}, err
 				}
-				return des.Start(bus)
+				return channelIDs{"designer", des.ID()}, des.Start(bus)
 			},
 		},
 		{
-			name:      "inspector",
-			channelID: "inspector",
-			start: func() error {
-				insp, err := inspector.New(inspector.InspectorConfig{})
+			name: "inspector",
+			start: func() (channelIDs, error) {
+				insp, err := inspPipeline.New(inspShared.PipelineInspectorConfig{}, nil)
 				if err != nil {
-					return err
+					return channelIDs{}, err
 				}
-				return insp.Start(bus)
+				id := insp.AgentID()
+				return channelIDs{"inspector-pipeline", id}, insp.Start(bus)
 			},
 		},
 		{
-			name:      "tester",
-			channelID: "tester",
-			start: func() error {
-				tst, err := tester.New(tester.TesterConfig{})
+			name: "tester",
+			start: func() (channelIDs, error) {
+				tst, err := globaltester.New(shared.GlobalTesterConfig{}, nil)
 				if err != nil {
-					return err
+					return channelIDs{}, err
 				}
-				return tst.Start(bus)
+				return channelIDs{"tester", tst.AgentID()}, tst.Start(bus)
 			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.start()
+			ids, err := tc.start()
 			require.NoError(t, err)
 
-			requestTopic := guide.AgentTopic(tc.channelID, tc.channelID, guide.ChannelTypeRequests)
-			responseTopic := guide.AgentTopic(tc.channelID, tc.channelID, guide.ChannelTypeResponses)
+			requestTopic := guide.AgentTopic(ids.agentType, ids.agentID, guide.ChannelTypeRequests)
+			responseTopic := guide.AgentTopic(ids.agentType, ids.agentID, guide.ChannelTypeResponses)
 
 			reqCount := bus.TopicSubscriberCount(requestTopic)
 			assert.Greater(t, reqCount, 0, "should have request subscription")
@@ -431,22 +425,22 @@ func TestAllExecutionAgentsRegisterWithGuide(t *testing.T) {
 	require.NoError(t, err)
 	defer guideAgent.Stop()
 
-	eng, err := engineer.New(engineer.Config{})
+	eng, err := engineer.New(engineer.Config{}, nil)
 	require.NoError(t, err)
 	err = guideAgent.Register(eng.GetRoutingInfo())
 	require.NoError(t, err)
 
-	des, err := designer.New(designer.Config{})
+	des, err := designer.New(designer.Config{}, nil)
 	require.NoError(t, err)
 	err = guideAgent.Register(des.GetRoutingInfo())
 	require.NoError(t, err)
 
-	insp, err := inspector.New(inspector.InspectorConfig{})
+	insp, err := inspPipeline.New(inspShared.PipelineInspectorConfig{}, nil)
 	require.NoError(t, err)
 	err = guideAgent.Register(insp.GetRoutingInfo())
 	require.NoError(t, err)
 
-	tst, err := tester.New(tester.TesterConfig{})
+	tst, err := globaltester.New(shared.GlobalTesterConfig{}, nil)
 	require.NoError(t, err)
 	err = guideAgent.Register(tst.GetRoutingInfo())
 	require.NoError(t, err)
@@ -456,6 +450,6 @@ func TestAllExecutionAgentsRegisterWithGuide(t *testing.T) {
 
 	assert.NotNil(t, guideAgent.GetAgent(eng.GetRoutingInfo().ID))
 	assert.NotNil(t, guideAgent.GetAgent(des.GetRoutingInfo().ID))
-	assert.NotNil(t, guideAgent.GetAgent("inspector"))
-	assert.NotNil(t, guideAgent.GetAgent("tester"))
+	assert.NotNil(t, guideAgent.GetAgent(insp.GetRoutingInfo().ID))
+	assert.NotNil(t, guideAgent.GetAgent(tst.GetRoutingInfo().ID))
 }

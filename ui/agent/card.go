@@ -3,6 +3,7 @@ package agent
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
@@ -42,14 +43,30 @@ const selectedCardLines = 1
 // unselectedCardLines is the number of terminal lines an unselected card occupies.
 const unselectedCardLines = 1
 
-// RenderCard renders a single-line agent card.
-// Layout: [indicator] [status-icon] [name] [summary-truncated] [context%]
+// dotAnimFrameCount is the local alias for theme.DotAnimFrameCount.
+const dotAnimFrameCount = theme.DotAnimFrameCount
+
+
+// AnimState carries per-frame animation parameters through the render pipeline.
+// Constructed once per frame in the Model and passed to each RenderCard call.
+type AnimState struct {
+	DotFrame   int
+	Elapsed    time.Duration
+	HasActive  bool             // Any agent actively working (gates dot animation).
+	Ripple     bool             // Focused AND active (gates ripple text + full shimmer).
+	RippleGrad *theme.Gradient
+}
+
+// RenderCard renders a single-line agent card with an optional tree prefix.
+// Layout: [prefix][indicator] [status-icon] [name] [summary-truncated] [context%]
 // When engaged is true, the agent name uses the engagement style (bold accent).
-func RenderCard(agent AgentState, width int, th *theme.Theme, selected, engaged bool) string {
+// The prefix (e.g. " │ ") is prepended and its visual width subtracted from available space.
+// AnimState carries per-frame animation parameters for dot and ripple effects.
+func RenderCard(agent AgentState, width int, th *theme.Theme, selected, engaged bool, prefix string, anim AnimState) string {
 	if selected {
-		return renderSelectedCard(agent, width, th, engaged)
+		return renderSelectedCard(agent, width, th, engaged, prefix, anim)
 	}
-	return renderCompactCard(agent, width, th, engaged)
+	return renderCompactCard(agent, width, th, engaged, prefix, anim)
 }
 
 // cardLineCount returns the number of terminal lines a card occupies.
@@ -61,22 +78,23 @@ func cardLineCount(selected bool) int {
 }
 
 // renderCompactCard renders a single-line card.
-// Layout: [indicator] [icon] [name] [truncated summary...] [context %]
-func renderCompactCard(agent AgentState, width int, th *theme.Theme, engaged bool) string {
-	return renderCardLine(agent, width, th, false, engaged)
+// Layout: [prefix][indicator] [icon] [name] [truncated summary...] [context %]
+func renderCompactCard(agent AgentState, width int, th *theme.Theme, engaged bool, prefix string, anim AnimState) string {
+	return renderCardLine(agent, width, th, false, engaged, prefix, anim)
 }
 
 // renderCardLine renders the one-line card layout with configurable selection styling.
-func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, engaged bool) string {
-	icon := agentStatusDot(agent.Status, selected, th)
+// The prefix is prepended and its visual width is deducted from the available space.
+func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, engaged bool, prefix string, anim AnimState) string {
+	prefixW := lipgloss.Width(prefix)
+	innerWidth := width - prefixW
+
+	icon := agentStatusDot(agent.Status, selected, th, anim)
 	indicator := selectIndicator(selected, th)
 
-	nameStyle := agentNameStyle(selected, th)
-	if engaged {
-		nameStyle = nameStyle.Bold(true).Underline(true)
-	}
-	name := nameStyle.Render(agent.Name)
-	nameLen := lipgloss.Width(name)
+	// Use plain name width for layout (ANSI-safe via lipgloss.Width).
+	nameLen := lipgloss.Width(agent.Name)
+	name := renderAgentName(agent.Name, selected, engaged, agent.Status, anim, th)
 
 	contextPct := formatContextPct(agent.ContextUsage)
 
@@ -85,24 +103,22 @@ func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, enga
 	// Fixed overhead: cardPadding + iconWidth + space(1) + space(1) + contextBarWidth + space(1)
 	separators := 3 // spaces between icon/name, name/summary, summary/context
 	fixedWidth := cardPadding + iconWidth + nameLen + separators + contextBarWidth
-	summaryWidth := width - fixedWidth
+	summaryWidth := innerWidth - fixedWidth
 
-	summary := truncate(agent.TaskSummary, summaryWidth)
-	summaryStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	summary = summaryStyle.Render(padRight(summary, summaryWidth))
+	summary := renderAgentSummary(agent.TaskSummary, summaryWidth, agent.Status, nameLen, anim, th)
 
 	contextStyle := contextPctStyle(agent.ContextUsage, th)
 	contextStr := contextStyle.Render(contextPct)
 
-	return fmt.Sprintf("%s %s %s %s %s",
-		indicator, icon, name, summary, contextStr)
+	return fmt.Sprintf("%s%s %s %s %s %s",
+		prefix, indicator, icon, name, summary, contextStr)
 }
 
 // renderSelectedCard renders a two-line card for the selected agent.
-// Line 1: [indicator] [icon] [name] [truncated summary] [context %]
+// Line 1: [prefix][indicator] [icon] [name] [truncated summary] [context %]
 // Line 2: [indent] [full task summary]
-func renderSelectedCard(agent AgentState, width int, th *theme.Theme, engaged bool) string {
-	return renderCardLine(agent, width, th, true, engaged)
+func renderSelectedCard(agent AgentState, width int, th *theme.Theme, engaged bool, prefix string, anim AnimState) string {
+	return renderCardLine(agent, width, th, true, engaged, prefix, anim)
 }
 
 // statusColors maps AgentStatus to a palette color accessor.
@@ -116,22 +132,39 @@ var statusColors = map[AgentStatus]func(*theme.Theme) lipgloss.Color{
 	StatusWaiting:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Muted },
 }
 
-// agentStatusDot renders a status icon reflecting the agent's operational state.
-// The icon shape conveys status; the color conveys selection.
-// Selected agents use AgentActive (green+bold); unselected use status-based colors.
-func agentStatusDot(status AgentStatus, selected bool, th *theme.Theme) string {
-	icon := statusIcons[status]
-	if icon == "" {
-		icon = theme.IconIdle
+// resolveStaticIcon returns the static display glyph for a non-active status.
+func resolveStaticIcon(status AgentStatus) string {
+	if icon := statusIcons[status]; icon != "" {
+		return icon
 	}
+	return theme.IconIdle
+}
+
+// resolveStatusColor returns the palette color for a given status.
+func resolveStatusColor(status AgentStatus, th *theme.Theme) lipgloss.Color {
+	if colorFn := statusColors[status]; colorFn != nil {
+		return colorFn(th)
+	}
+	return th.Palette.Muted
+}
+
+// agentStatusDot renders a status icon reflecting the agent's operational state.
+// Active agents get an animated origami-bloom glyph; gradient color only when
+// the agent panel is focused (Ripple). Otherwise the animated glyph uses the
+// static status color. Inactive agents get static icons.
+func agentStatusDot(status AgentStatus, selected bool, th *theme.Theme, anim AnimState) string {
+	if isActiveStatus(status) && anim.HasActive {
+		icon := theme.DotAnimFrames[anim.DotFrame%dotAnimFrameCount]
+		if anim.Ripple && anim.RippleGrad != nil {
+			return theme.RenderGradientGlyph(icon, anim.RippleGrad, anim.Elapsed)
+		}
+		return lipgloss.NewStyle().Foreground(resolveStatusColor(status, th)).Render(icon)
+	}
+	icon := resolveStaticIcon(status)
 	if selected {
 		return th.AgentActive.Render(icon)
 	}
-	colorFn := statusColors[status]
-	if colorFn == nil {
-		colorFn = func(th *theme.Theme) lipgloss.Color { return th.Palette.Muted }
-	}
-	return lipgloss.NewStyle().Foreground(colorFn(th)).Render(icon)
+	return lipgloss.NewStyle().Foreground(resolveStatusColor(status, th)).Render(icon)
 }
 
 // agentNameStyle returns the style for an agent name.
@@ -150,6 +183,36 @@ func selectIndicator(selected bool, th *theme.Theme) string {
 		return th.AgentActive.Render(selectedIndicator)
 	}
 	return unselectedIndicator
+}
+
+// renderAgentName renders the agent name, applying the per-character ripple
+// gradient when the agent is actively working and ripple is available.
+// Falls back to standard lipgloss styling otherwise.
+func renderAgentName(name string, selected, engaged bool, status AgentStatus, anim AnimState, th *theme.Theme) string {
+	if anim.Ripple && isActiveStatus(status) && anim.RippleGrad != nil {
+		styled := theme.RenderRippleText(name, anim.Elapsed, anim.RippleGrad, 0)
+		if engaged {
+			return "\x1b[1;4m" + styled // bold + underline persists through color codes
+		}
+		return styled
+	}
+	style := agentNameStyle(selected, th)
+	if engaged {
+		style = style.Bold(true).Underline(true)
+	}
+	return style.Render(name)
+}
+
+// renderAgentSummary renders the task summary, applying the per-character ripple
+// gradient when the agent is actively working. The character offset continues
+// from the name so the wave flows continuously across name and summary.
+func renderAgentSummary(text string, width int, status AgentStatus, nameLen int, anim AnimState, th *theme.Theme) string {
+	truncated := truncate(text, width)
+	padded := padRight(truncated, width)
+	if anim.Ripple && isActiveStatus(status) && anim.RippleGrad != nil {
+		return theme.RenderRippleText(padded, anim.Elapsed, anim.RippleGrad, nameLen+1)
+	}
+	return lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(padded)
 }
 
 // formatContextPct formats a 0.0-1.0 usage fraction as a percentage string.

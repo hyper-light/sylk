@@ -1,10 +1,12 @@
 package chat
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -134,6 +136,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.RetryStatusMsg:
 		m.viewDirty = true
 		return m, m.handleRetryStatus(typed)
+	case msg.ToolCallEventMsg:
+		m.viewDirty = true
+		return m, m.handleToolCallEvent(typed)
 	case tea.KeyMsg:
 		m.viewDirty = true
 		return m, m.handleKey(typed)
@@ -251,6 +256,18 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 // handleStreamStart begins accumulation. If a thinking placeholder exists,
 // it is reused; otherwise a new entry is pushed.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	// Retry path: provider retried the stream. Reset the existing
+	// accumulator and render state instead of creating a new entry.
+	if m.accumulator != nil {
+		m.accumulator.Replace("")
+		m.streamRenderState = &streamRenderState{}
+		m.streamRenderPending = false
+		m.syncAccumulatorToEntry()
+		m.viewport.SetStreamState(m.streamRenderState, m.accumulator.EntryIndex())
+		m.viewDirty = true
+		return nil
+	}
+
 	// Reuse existing thinking placeholder if present.
 	if m.thinkingIdx >= 0 {
 		idx := m.thinkingIdx
@@ -375,11 +392,22 @@ func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 		Timestamp: time.Now(),
 		Source:    SourceError,
 		SessionID: errMsg.SessionID,
-		Content:   errMsg.Err.Error(),
+		Content:   formatErrorForChat(errMsg.Err),
 		Height:    -1,
 	}
 	m.PushEntry(errEntry)
 	return nil
+}
+
+// formatErrorForChat returns a human-readable error message suitable for the
+// chat panel. For ProviderErrors it extracts the JSON message field and maps
+// status codes to friendly labels. Falls back to the raw Error() text.
+func formatErrorForChat(err error) string {
+	var pe *providers.ProviderError
+	if errors.As(err, &pe) {
+		return pe.UserMessage()
+	}
+	return err.Error()
 }
 
 // handleRetryStatus logs each retry error as a chat entry and updates
@@ -425,12 +453,67 @@ func formatRetryMessage(retry msg.RetryStatusMsg) string {
 }
 
 // formatRetryDelay renders a duration as a compact human string (e.g. "2s", "1m30s").
+// Uses Round instead of Truncate so sub-second values like 0.8s display as "1s" not "0s".
 func formatRetryDelay(d time.Duration) string {
-	d = d.Truncate(time.Second)
+	d = d.Round(time.Second)
 	if d < time.Second {
 		return "<1s"
 	}
 	return d.String()
+}
+
+// handleToolCallEvent processes a tool call start or completion event by
+// updating the active streaming entry's ToolCalls list.
+func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
+	idx := m.activeStreamingIndex()
+	if idx < 0 {
+		return nil
+	}
+
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		switch ev.Phase {
+		case 0: // ToolCallStart
+			e.ToolCalls = append(e.ToolCalls, ToolCallRecord{
+				ToolName:    ev.ToolName,
+				ArgsSummary: ev.ArgsSummary,
+				FullArgs:    ev.FullArgs,
+				StartedAt:   ev.StartedAt,
+			})
+		case 1: // ToolCallComplete
+			// Find the last incomplete record with the same tool name.
+			for i := len(e.ToolCalls) - 1; i >= 0; i-- {
+				if e.ToolCalls[i].ToolName == ev.ToolName && !e.ToolCalls[i].Completed {
+					e.ToolCalls[i].Duration = ev.Duration
+					e.ToolCalls[i].Success = ev.Success
+					e.ToolCalls[i].Completed = true
+					e.ToolCalls[i].Output = ev.Output
+					e.ToolCalls[i].ErrorMsg = ev.ErrorMsg
+					if !ev.Success {
+						e.ToolCalls[i].Expanded = true // Auto-expand failures.
+					}
+					break
+				}
+			}
+		}
+		// Invalidate render cache.
+		e.RenderedLines = nil
+		e.CodeRegions = nil
+		e.ToolCallRegions = nil
+		e.Height = -1
+	})
+	return nil
+}
+
+// activeStreamingIndex returns the history index of the entry currently receiving
+// streaming content. Checks the accumulator first, then the thinking placeholder.
+func (m *Model) activeStreamingIndex() int {
+	if m.accumulator != nil {
+		return m.accumulator.EntryIndex()
+	}
+	if m.thinkingIdx >= 0 {
+		return m.thinkingIdx
+	}
+	return -1
 }
 
 // handleKey processes keyboard input when the chat panel is focused.
@@ -549,6 +632,21 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 	m.viewDirty = true
 }
 
+// Clear discards all chat entries and resets the viewport to its initial state.
+// Active streams and thinking indicators are cancelled.
+func (m *Model) Clear() {
+	m.history.Clear()
+	m.clearThinkingState()
+	m.accumulator = nil
+	m.streamRenderPending = false
+	m.streamRenderState = nil
+	m.planEntryIdx = -1
+	m.planID = ""
+	m.highlightID = ""
+	m.viewport.Reset()
+	m.viewDirty = true
+}
+
 // ScrollUp scrolls the chat viewport up by one line.
 // Returns true if the scroll was applied, false if at boundary.
 func (m *Model) ScrollUp() bool {
@@ -572,6 +670,20 @@ func (m *Model) ScrollDown() bool {
 // SetBounceOffset updates the visual bounce displacement for rendering.
 func (m *Model) SetBounceOffset(offset int) {
 	m.viewport.SetBounceOffset(offset)
+	m.viewDirty = true
+}
+
+// AbortStream discards the active accumulator and stream render state
+// without finalizing content. Used when an interrupt makes the stream
+// obsolete before a StreamCompleteMsg arrives.
+func (m *Model) AbortStream() {
+	if m.accumulator == nil {
+		return
+	}
+	m.accumulator = nil
+	m.streamRenderPending = false
+	m.streamRenderState = nil
+	m.viewport.SetStreamState(nil, -1)
 	m.viewDirty = true
 }
 
@@ -645,8 +757,38 @@ func (m *Model) handleDecorTick(now time.Time) {
 	// Animate thinking indicator while streaming with no content yet.
 	m.tickThinking(now)
 
+	// Invalidate entries with active (incomplete) tool calls for live timer.
+	m.tickActiveToolCalls()
+
 	// Flush buffered stream chunks to the history entry.
 	m.flushStreamRender()
+}
+
+// tickActiveToolCalls invalidates the render cache for entries with in-progress
+// tool calls so the live elapsed timer updates on each DecorTick.
+func (m *Model) tickActiveToolCalls() {
+	idx := m.activeStreamingIndex()
+	if idx < 0 {
+		return
+	}
+	hasActive := false
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		for i := range e.ToolCalls {
+			if !e.ToolCalls[i].Completed {
+				hasActive = true
+				break
+			}
+		}
+		if hasActive {
+			e.RenderedLines = nil
+			e.CodeRegions = nil
+			e.ToolCallRegions = nil
+			e.Height = -1
+		}
+	})
+	if hasActive {
+		m.viewDirty = true
+	}
 }
 
 // flushStreamRender syncs accumulated stream content to the history entry
@@ -905,7 +1047,11 @@ func sanitizeThinkingMessage(message string) string {
 }
 
 // syncAccumulatorToEntry writes the accumulated content back into the
-// History entry and invalidates its render cache.
+// History entry and invalidates its height. RenderedLines and CodeRegions
+// are NOT wiped — the streaming render path in renderEntry() and
+// entryHeight() always re-renders the active streaming entry regardless
+// of cached state, so wiping them would only cause unnecessary flicker
+// when the standard path is used as a fallback.
 func (m *Model) syncAccumulatorToEntry() {
 	idx := m.accumulator.EntryIndex()
 	content := m.accumulator.Content()
@@ -918,8 +1064,6 @@ func (m *Model) syncAccumulatorToEntry() {
 	}
 	physical := m.history.logicalToPhysical(idx)
 	m.history.entries[physical].Content = content
-	m.history.entries[physical].RenderedLines = nil
-	m.history.entries[physical].CodeRegions = nil
 	m.history.entries[physical].Height = -1
 }
 

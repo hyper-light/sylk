@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -16,8 +17,13 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 	seen := make(map[shared.ToolCallSignature]int, gi.config.MaxToolRuns)
 	consecutiveErrors := 0
 
+	p := gi.getProvider()
+	if p == nil {
+		return "", fmt.Errorf("global inspector: no LLM provider configured")
+	}
+
 	for turn := 0; turn <= gi.config.MaxToolRuns; turn++ {
-		resp, err := gi.provider.Complete(ctx, req)
+		resp, err := p.Complete(ctx, req)
 		if err != nil {
 			return "", fmt.Errorf("global inspector llm: %w", err)
 		}
@@ -64,13 +70,17 @@ func (gi *GlobalInspector) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
-		result, err := gi.executeToolCall(ctx, call)
+		result, err := agentShared.TimedToolCall(ctx, "inspector", call, func() (string, error) {
+			return gi.executeToolCall(ctx, call)
+		})
+		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
 			} else {
 				result = shared.ToolErrorPayload(err)
+				isError = true
 				errCount++
 			}
 		}
@@ -79,6 +89,7 @@ func (gi *GlobalInspector) applyToolCalls(
 			ToolCallID: call.ID,
 			ToolName:   call.Name,
 			Content:    result,
+			IsError:    isError,
 		})
 		if rerouted {
 			break

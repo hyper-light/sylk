@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 type plannerConversationMode string
@@ -15,6 +16,7 @@ const (
 	plannerConversationModeClarification plannerConversationMode = "clarification"
 	plannerConversationModeReady         plannerConversationMode = "ready"
 	plannerConversationModeConverse      plannerConversationMode = "converse"
+	plannerConversationModeFeedback      plannerConversationMode = "feedback"
 )
 
 type plannerConversationRequest struct {
@@ -30,6 +32,7 @@ type plannerConversationRequest struct {
 	ClarificationQuestions  []string                 `json:"clarification_questions,omitempty"`
 	TaskCount               int                      `json:"task_count,omitempty"`
 	FirstTask               string                   `json:"first_task,omitempty"`
+	PlanSummary             string                   `json:"plan_summary,omitempty"`
 	ConversationHistory     []guide.ConversationTurn `json:"conversation_history,omitempty"`
 	OnChunk                 func(string)             `json:"-"`
 }
@@ -38,15 +41,68 @@ func (a *Architect) composeUserFacingResponse(
 	ctx context.Context,
 	request plannerConversationRequest,
 ) (string, error) {
+	// Try tool-loop path first — enables the LLM to invoke skills like
+	// route_plan_acceptance during conversation.
+	text, err := a.composeUserFacingResponseWithTools(ctx, request)
+	if err == nil {
+		return text, nil
+	}
+	a.logWarn("architect tool-loop compose failed, trying text-only", "error", err)
+
+	// Fall through to text-only streaming path.
 	planner := a.ensurePlanner()
 	if planner == nil {
 		return "", fmt.Errorf("architect planner not configured (EnableLLM may be false or API key missing)")
 	}
-	text, err := planner.ComposeUserResponse(ctxOrBackground(ctx), request)
+	text, err = planner.ComposeUserResponse(ctxOrBackground(ctx), request)
 	if err != nil {
 		a.logger.Warn("architect llm conversation fallback", "mode", request.normalizedMode(), "error", err)
 		return "", fmt.Errorf("architect planner: %w", err)
 	}
+	text = sanitizePlannerConversationResponse(text)
+	if text == "" {
+		return "", fmt.Errorf("architect planner returned empty response")
+	}
+	return text, nil
+}
+
+// composeUserFacingResponseWithTools builds a request with tool definitions
+// and runs the tool dispatch loop, enabling the LLM to invoke architect skills
+// (e.g. route_plan_acceptance, consult_librarian) during conversation turns.
+func (a *Architect) composeUserFacingResponseWithTools(
+	ctx context.Context,
+	request plannerConversationRequest,
+) (string, error) {
+	planner := a.ensurePlanner()
+	if planner == nil {
+		return "", fmt.Errorf("architect planner not configured")
+	}
+
+	a.ensureToolLoopSkillsLoaded()
+	tools := a.buildToolDefinitions()
+	if len(tools) == 0 {
+		return "", fmt.Errorf("no tool definitions available")
+	}
+
+	prompt := buildPlannerConversationPrompt(request)
+	maxTokens := plannerConversationMaxTokensForMode(request.normalizedMode(), a.config.MaxOutputTokens)
+	stage := "conversation_" + string(request.normalizedMode())
+
+	req := &providers.Request{
+		Messages: []providers.Message{
+			{Role: providers.RoleUser, Content: prompt},
+		},
+		MaxTokens:      maxTokens,
+		SystemPrompt:   planner.ConversationSystemPrompt(),
+		ThinkingBudget: 0, // Adaptive — let the provider handle allocation.
+		Tools:          tools,
+	}
+
+	text, err := a.executeToolLoop(ctx, req, stage, request.OnChunk)
+	if err != nil {
+		return "", err
+	}
+
 	text = sanitizePlannerConversationResponse(text)
 	if text == "" {
 		return "", fmt.Errorf("architect planner returned empty response")
@@ -134,6 +190,7 @@ func normalizePlannerConversationRequest(request plannerConversationRequest) pla
 		request.TaskCount = 0
 	}
 	request.FirstTask = strings.TrimSpace(request.FirstTask)
+	request.PlanSummary = strings.TrimSpace(request.PlanSummary)
 	return request
 }
 
@@ -182,6 +239,19 @@ Requirements:
 - If the conversation naturally leads to a concrete implementation task, mention that you can help plan it, but do not force the conversation into a planning protocol.
 - Keep a natural, collaborative tone.
 - Do not use canned lead-ins or boilerplate.`
+	case plannerConversationModeFeedback:
+		return `The user is responding to a plan you presented. The plan summary is included in the context JSON as "plan_summary".
+
+CRITICAL — Check for approval first:
+If the user's response signals acceptance (e.g., "yes", "yep", "looks good", "go ahead", "do it", "approved", "ship it", or similar affirmative), you MUST invoke the route_plan_acceptance tool with their verbatim response. Do NOT write a text reply — route immediately.
+
+If the user is NOT approving (they have questions, want changes, or disagree), write a response:
+- Address the user's feedback directly.
+- If they want refinements, explain specifically what you'll change and why.
+- If they're asking for clarification, answer concisely with architectural reasoning.
+- Maintain a collaborative tone — the plan is a proposal, not a decree.
+- Do not re-present the entire plan — focus on what changes based on their feedback.
+- End with a brief re-approval cue (e.g., "Say **go ahead** to proceed, or let me know what else to adjust.").`
 	default:
 		return `Write the next user-facing response.
 
@@ -196,7 +266,7 @@ Requirements:
 
 func plannerConversationMaxTokensForMode(mode plannerConversationMode, maxTokens int) int {
 	switch mode {
-	case plannerConversationModeConverse, plannerConversationModeReady:
+	case plannerConversationModeConverse, plannerConversationModeReady, plannerConversationModeFeedback:
 		return converseMaxTokens(maxTokens)
 	default:
 		return plannerConversationMaxTokens(maxTokens)
@@ -240,6 +310,8 @@ func (r plannerConversationRequest) normalizedMode() plannerConversationMode {
 		return plannerConversationModeReady
 	case plannerConversationModeConverse:
 		return plannerConversationModeConverse
+	case plannerConversationModeFeedback:
+		return plannerConversationModeFeedback
 	default:
 		return plannerConversationModeClarification
 	}

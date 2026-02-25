@@ -12,9 +12,11 @@ import (
 	"github.com/adalundhe/sylk/agents/designer"
 	"github.com/adalundhe/sylk/agents/engineer"
 	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/agents/inspector"
+	inspGlobal "github.com/adalundhe/sylk/agents/inspector/global"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/agents/librarian"
-	"github.com/adalundhe/sylk/agents/tester"
+	globaltester "github.com/adalundhe/sylk/agents/tester/global"
+	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -81,30 +83,30 @@ func TestAllAgentsRegisterWithGuide(t *testing.T) {
 		{
 			name: "engineer",
 			createAgent: func() (guide.AgentRouter, error) {
-				return engineer.New(engineer.Config{})
+				return engineer.New(engineer.Config{}, nil)
 			},
 			hasDynamicID: true,
 		},
 		{
 			name: "designer",
 			createAgent: func() (guide.AgentRouter, error) {
-				return designer.New(designer.Config{})
+				return designer.New(designer.Config{}, nil)
 			},
 			hasDynamicID: true,
 		},
 		{
 			name: "inspector",
 			createAgent: func() (guide.AgentRouter, error) {
-				return inspector.New(inspector.InspectorConfig{})
+				return inspGlobal.New(inspShared.GlobalInspectorConfig{}, nil)
 			},
-			expectedID: "inspector",
+			hasDynamicID: true,
 		},
 		{
 			name: "tester",
 			createAgent: func() (guide.AgentRouter, error) {
-				return tester.New(tester.TesterConfig{})
+				return globaltester.New(shared.GlobalTesterConfig{}, nil)
 			},
-			expectedID: "tester",
+			hasDynamicID: true,
 		},
 	}
 
@@ -364,10 +366,10 @@ func TestMultipleAgentRegistration(t *testing.T) {
 			return architect.New(architect.Config{})
 		},
 		func() (guide.AgentRouter, error) {
-			return inspector.New(inspector.InspectorConfig{})
+			return inspGlobal.New(inspShared.GlobalInspectorConfig{}, nil)
 		},
 		func() (guide.AgentRouter, error) {
-			return tester.New(tester.TesterConfig{})
+			return globaltester.New(shared.GlobalTesterConfig{}, nil)
 		},
 	}
 
@@ -496,7 +498,7 @@ func TestRoutingInfoCapabilities(t *testing.T) {
 		{
 			name: "inspector_capabilities",
 			createAgent: func() (guide.AgentRouter, error) {
-				return inspector.New(inspector.InspectorConfig{})
+				return inspGlobal.New(inspShared.GlobalInspectorConfig{}, nil)
 			},
 			expectedIntents:  []guide.Intent{guide.IntentCheck},
 			expectedDomains:  []guide.Domain{guide.DomainCode},
@@ -505,7 +507,7 @@ func TestRoutingInfoCapabilities(t *testing.T) {
 		{
 			name: "tester_capabilities",
 			createAgent: func() (guide.AgentRouter, error) {
-				return tester.New(tester.TesterConfig{})
+				return globaltester.New(shared.GlobalTesterConfig{}, nil)
 			},
 			expectedIntents:  []guide.Intent{guide.IntentCheck},
 			expectedDomains:  []guide.Domain{guide.DomainCode},

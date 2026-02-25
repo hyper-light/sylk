@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -67,13 +68,17 @@ func (o *Orchestrator) applyToolCalls(
 	rerouted := false
 	for _, call := range resp.ToolCalls {
 		o.publishActivity(events.EventTypeToolResult, call.Name)
-		result, err := o.executeToolCall(ctx, call)
+		result, err := shared.TimedToolCall(ctx, "orchestrator", call, func() (string, error) {
+			return o.executeToolCall(ctx, call)
+		})
+		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
 			} else {
 				result = toolErrorPayload(err)
+				isError = true
 				errCount++
 			}
 		}
@@ -82,6 +87,7 @@ func (o *Orchestrator) applyToolCalls(
 			ToolCallID: call.ID,
 			ToolName:   call.Name,
 			Content:    result,
+			IsError:    isError,
 		})
 		if rerouted {
 			break

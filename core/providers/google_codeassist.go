@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
@@ -18,7 +19,26 @@ import (
 const (
 	codeAssistEndpoint      = "https://cloudcode-pa.googleapis.com"
 	codeAssistStreamVersion = "v1internal"
+
+	codeAssistUserAgent = "sylk/1.0 (+https://github.com/adalundhe/sylk)"
 )
+
+// codeAssistClientHeader is computed at init from the Go runtime version to
+// match what the genai SDK sends, ensuring consistent client identification.
+var codeAssistClientHeader string
+
+func init() {
+	goVer := runtime.Version() // e.g. "go1.24.1"
+	codeAssistClientHeader = "google-genai-sdk/1.47.0 gl-go/" + goVer
+}
+
+// setCodeAssistHeaders adds User-Agent and x-goog-api-client headers that the
+// genai SDK normally sets. The raw Code Assist HTTP path bypasses the SDK, so
+// we add them explicitly for consistent client identification.
+func setCodeAssistHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", codeAssistUserAgent)
+	req.Header.Set("X-Goog-Api-Client", codeAssistClientHeader)
+}
 
 // codeAssistGenerateRequest wraps a standard Vertex AI request in the
 // Code Assist envelope (matches gemini-cli converter.ts).
@@ -129,18 +149,38 @@ func buildCodeAssistGenerateURL() string {
 // codeAssistHTTPError constructs a ProviderError from a non-200 Code Assist
 // HTTP response, enabling the retry infrastructure to detect retryable status
 // codes (429, 5xx) and parse server-specified backoff durations.
+//
+// For 429 responses, the JSON body is parsed for structured Google error
+// details (ErrorInfo, RetryInfo, QuotaFailure) and classified using the same
+// logic as genai.APIError — terminal quotas (daily limits) are marked
+// non-retryable, and server-specified retry delays are extracted.
 func codeAssistHTTPError(operation string, statusCode int, body []byte) *ProviderError {
 	bodyStr := strings.TrimSpace(string(body))
-	retryAfter := codeAssistRetryAfterFromBody(bodyStr)
 
-	return &ProviderError{
+	pe := &ProviderError{
 		Provider:   ProviderTypeGoogle,
 		Operation:  "code assist " + operation,
 		StatusCode: statusCode,
 		Message:    fmt.Sprintf("code assist %s HTTP %d: %s", operation, statusCode, bodyStr),
 		Retryable:  isGoogleRetryableStatus(statusCode),
-		RetryAfter: retryAfter,
 	}
+
+	// Try structured quota classification from the JSON error body.
+	if quota := classifyCodeAssistQuota(statusCode, body); quota != nil {
+		if quota.Class == GoogleQuotaTerminal {
+			pe.Retryable = false
+		}
+		if quota.RetryDelay > 0 {
+			pe.RetryAfter = quota.RetryDelay
+		}
+	}
+
+	// Fall back to message-based retry-after extraction.
+	if pe.RetryAfter == 0 {
+		pe.RetryAfter = codeAssistRetryAfterFromBody(bodyStr)
+	}
+
+	return pe
 }
 
 // codeAssistRetryAfterFromBody extracts a retry duration from Code Assist
@@ -152,6 +192,42 @@ func codeAssistRetryAfterFromBody(body string) time.Duration {
 		return d
 	}
 	return 0
+}
+
+// codeAssistErrorBody is the JSON envelope for Code Assist error responses.
+// Matches the standard Google API error format: {"error": {"code":N, "message":"...", "status":"...", "details":[...]}}.
+type codeAssistErrorBody struct {
+	Error struct {
+		Code    int              `json:"code"`
+		Message string           `json:"message"`
+		Status  string           `json:"status"`
+		Details []map[string]any `json:"details"`
+	} `json:"error"`
+}
+
+// classifyCodeAssistQuota parses the Code Assist JSON error body and applies
+// the same quota classification as classifyGoogleQuota. Returns nil for
+// non-429 errors or unparseable bodies.
+func classifyCodeAssistQuota(statusCode int, body []byte) *GoogleQuotaInfo {
+	if statusCode != http.StatusTooManyRequests {
+		return nil
+	}
+	var errBody codeAssistErrorBody
+	if json.Unmarshal(body, &errBody) != nil {
+		return nil
+	}
+	if len(errBody.Error.Details) == 0 && errBody.Error.Message == "" {
+		return nil
+	}
+	// Construct a synthetic genai.APIError from the parsed body so we can
+	// reuse the unified classifyGoogleQuota logic.
+	synthetic := genai.APIError{
+		Code:    statusCode,
+		Status:  errBody.Error.Status,
+		Message: errBody.Error.Message,
+		Details: errBody.Error.Details,
+	}
+	return classifyGoogleQuota(synthetic)
 }
 
 func (g *GoogleProvider) generateWithCodeAssist(ctx context.Context, req *Request) (*Response, error) {
@@ -181,6 +257,7 @@ func (g *GoogleProvider) generateWithCodeAssist(ctx context.Context, req *Reques
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
+	setCodeAssistHeaders(httpReq)
 
 	httpResp, err := g.codeAssistHTTP.Do(httpReq)
 	if err != nil {
@@ -381,6 +458,7 @@ func (g *GoogleProvider) streamWithCodeAssist(
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	setCodeAssistHeaders(httpReq)
 
 	resp, err := g.codeAssistHTTP.Do(httpReq)
 	if err != nil {

@@ -7,95 +7,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/google/uuid"
 )
-
-// executionSubstrings are user phrases matched via substring containment.
-var executionSubstrings = []string{
-	"go ahead",
-	"execute",
-	"proceed",
-	"let's do it",
-	"let's go",
-	"do it",
-	"start execution",
-	"run the plan",
-	"ship it",
-	"kick it off",
-	"sounds good",
-	"looks good",
-	"approved",
-	"lgtm",
-	"run it",
-	"fire away",
-	"begin execution",
-	"make it so",
-	"let's start",
-	"start building",
-	"confirmed",
-}
-
-// executionExactPhrases are short affirmatives that match only when the
-// entire message (after trimming/lowering) equals the phrase. Substring
-// matching would cause false positives (e.g. "yes, but can we change X?").
-var executionExactPhrases = []string{
-	"yes",
-	"y",
-	"yep",
-	"yeah",
-	"yup",
-	"ok",
-	"okay",
-	"sure",
-	"right",
-	"great",
-	"perfect",
-	"awesome",
-	"absolutely",
-	"affirmative",
-	"roger",
-	"aye",
-}
-
-// isExecutionRequest returns true if the user message signals intent
-// to execute the current ready plan.
-func isExecutionRequest(input string) bool {
-	lower := strings.ToLower(strings.TrimSpace(input))
-	if lower == "" {
-		return false
-	}
-	// Strip trailing punctuation for exact matching (e.g. "yes!" → "yes").
-	stripped := strings.TrimRight(lower, ".!?,;:")
-	for _, phrase := range executionExactPhrases {
-		if stripped == phrase {
-			return true
-		}
-	}
-	for _, phrase := range executionSubstrings {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
-// tryExecutePlan checks if a ready plan exists and dispatches it.
-// Returns (result, true) if execution was triggered, (nil, false) otherwise.
-func (a *Architect) tryExecutePlan(ctx context.Context, req *ArchitectRequest) (*ConversationResult, bool) {
-	if !isExecutionRequest(req.Query) {
-		return nil, false
-	}
-	plan := a.latestReadyPlan()
-	if plan == nil {
-		a.logInfo("tryExecutePlan: execution request but no ready plan found")
-		return nil, false
-	}
-	a.logInfo("tryExecutePlan: dispatching plan",
-		"plan_id", plan.ID,
-		"query", truncateString(plan.Query, 80),
-		"tasks", len(plan.Tasks),
-		"created_at", plan.CreatedAt.String())
-	return a.dispatchPlanExecution(ctx, req, plan)
-}
 
 // readyPlanMaxAge is the maximum age of a ready plan eligible for execution.
 // Plans older than this are stale (e.g. restored from disk across sessions)
@@ -124,7 +37,10 @@ func (a *Architect) latestReadyPlan() *DesignPlan {
 	return best
 }
 
-// dispatchPlanExecution transitions the plan to Executing and routes to orchestrator.
+// dispatchPlanExecution validates the handoff payload, routes it synchronously
+// to the orchestrator, and transitions the plan to Executing on success.
+// Emits a StreamEventReroute BEFORE the sync call so the TUI switches to the
+// orchestrator agent while the orchestrator is actively processing.
 func (a *Architect) dispatchPlanExecution(
 	ctx context.Context,
 	_ *ArchitectRequest,
@@ -137,37 +53,97 @@ func (a *Architect) dispatchPlanExecution(
 		}, true
 	}
 
-	plan.Status = PlanStatusExecuting
-	_ = a.persistPlanState(plan)
+	payload := buildHandoffPayload(plan, "user-approved execution")
+	if !isPlanHandoffPayloadValid(payload) {
+		a.logWarn("dispatchPlanExecution: invalid handoff payload", "plan_id", plan.ID)
+		return &ConversationResult{
+			Response: "The plan could not be serialized for handoff. This is an internal error — please retry or revise the plan.",
+			Intent:   IntentExecute,
+		}, true
+	}
 
 	a.publishPlanSnapshot(ctx, plan)
 
-	payload := buildHandoffPayload(plan, "user-approved execution")
+	// Generate the orchestrator's correlation ID before the sync call so we
+	// can emit a reroute event that tells the TUI to track the orchestrator's
+	// stream events. Without this, the TUI would only see the architect's CID.
+	orchCID := "corr_" + uuid.NewString()
+
+	// Extract the architect's original CID from stream context for the reroute.
+	originalCID := originalCIDFromContext(ctx)
+
+	a.logInfo("dispatchPlanExecution: emitting reroute",
+		"plan_id", plan.ID,
+		"original_cid", originalCID,
+		"orch_cid", orchCID)
+
+	// Emit reroute BEFORE the sync call so the TUI switches to "orchestrator"
+	// while the orchestrator is actively processing the plan ingestion.
+	a.publishHandoffReroute(ctx, "orchestrator", originalCID, orchCID)
+
+	a.logInfo("dispatchPlanExecution: calling requestRouteSync",
+		"plan_id", plan.ID,
+		"orch_cid", orchCID)
+
 	request := &guide.RouteRequest{
 		Input:         payload,
+		CorrelationID: orchCID,
 		TargetAgentID: "orchestrator",
 		SessionID:     plan.SessionID,
 	}
 
 	response, err := a.requestRouteSync(ctx, request)
+	a.logInfo("dispatchPlanExecution: requestRouteSync returned",
+		"plan_id", plan.ID,
+		"has_response", response != nil,
+		"has_error", err != nil)
 	if err != nil {
-		plan.Status = PlanStatusFailed
-		plan.Error = err.Error()
-		_ = a.persistPlanState(plan)
-		a.publishPlanSnapshot(ctx, plan)
+		a.logWarn("dispatchPlanExecution: route failed", "plan_id", plan.ID, "error", err)
 		return &ConversationResult{
-			Response: "I tried to dispatch the plan but hit an error: " + err.Error(),
+			Response: "I tried to dispatch the plan but hit an error: " + err.Error() + "\nSay **go ahead** to retry.",
 			Intent:   IntentExecute,
 		}, true
 	}
 
+	if !isHandoffSuccess(response) {
+		summary := summarizeAutoHandoffResponse(response)
+		a.logWarn("dispatchPlanExecution: orchestrator rejected", "plan_id", plan.ID, "summary", summary)
+		return &ConversationResult{
+			Response: "The orchestrator rejected the handoff: " + summary + "\nSay **go ahead** to retry.",
+			Intent:   IntentExecute,
+		}, true
+	}
+
+	// Orchestrator confirmed ingestion — transition to Executing.
+	// Clear ReadyDirective so the guide does not enter PhasePlanApproval
+	// for an already-executing plan.
+	plan.ReadyDirective = nil
+	plan.Status = PlanStatusExecuting
 	summary := summarizeAutoHandoffResponse(response)
 	plan.RiskSummary = append(plan.RiskSummary, summary)
 	_ = a.persistPlanState(plan)
 	a.publishPlanSnapshot(ctx, plan)
 
 	return &ConversationResult{
-		Response: fmt.Sprintf("Plan dispatched to the orchestrator. %s", summary),
-		Intent:   IntentExecute,
+		Response:      fmt.Sprintf("Plan dispatched to the orchestrator. %s", summary),
+		Intent:        IntentExecute,
+		HandoffTarget: "orchestrator",
 	}, true
+}
+
+// originalCIDFromContext extracts the architect's original correlation ID
+// from the stream context metadata.
+func originalCIDFromContext(ctx context.Context) string {
+	metadata, ok := architectStreamMetadataFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return metadata.CorrelationID
+}
+
+// isPlanHandoffPayloadValid returns true if the payload is a valid
+// PlanHandoff JSON (starts with {"plan_id":), not an error payload.
+func isPlanHandoffPayloadValid(payload string) bool {
+	trimmed := strings.TrimSpace(payload)
+	return strings.HasPrefix(trimmed, `{"plan_id":`) || strings.HasPrefix(trimmed, `{"plan_id" :`)
 }

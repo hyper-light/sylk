@@ -8,16 +8,35 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
+// MaxTodosBeforeArchitect is the scope limit enforced by the system prompt.
+// If the LLM determines a task requires more than this many steps, it should
+// request Architect decomposition via the reroute skill.
 const MaxTodosBeforeArchitect = 12
+
+// designerProvider is the minimal interface the Designer needs from its LLM.
+// Satisfied by *providers.GoogleProvider and *gateway.GatewayProvider.
+type designerProvider interface {
+	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+}
 
 type Designer struct {
 	id     string
 	config Config
 	logger *slog.Logger
+
+	provider        designerProvider
+	providerWrapper gateway.ProviderWrapper
+	handoffBridge   *handoff.HandoffBridge
+	usageAccum      *designerUsageAccumulator
 
 	state    *DesignerState
 	stateMu  sync.RWMutex
@@ -36,6 +55,8 @@ type Designer struct {
 
 	consultations []Consultation
 	consultMu     sync.RWMutex
+
+	fileAccess versioning.FileAccess
 }
 
 type Config struct {
@@ -53,15 +74,20 @@ const (
 	DefaultMaxOutputTokens = 8192
 )
 
-func New(cfg Config) (*Designer, error) {
+// New creates a Designer backed by an LLM provider for tool-loop execution.
+// The provider must satisfy designerProvider (e.g. *providers.GoogleProvider
+// or *gateway.GatewayProvider).
+func New(cfg Config, provider designerProvider) (*Designer, error) {
 	cfg = applyConfigDefaults(cfg)
 
-	designerID := fmt.Sprintf("designer_%s", uuid.New().String()[:8])
+	designerID := uuid.New().String()[:8]
 
 	d := &Designer{
 		id:          designerID,
 		config:      cfg,
 		logger:      cfg.Logger,
+		provider:    provider,
+		usageAccum:  &designerUsageAccumulator{},
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		failures:    make(map[string]*FailureRecord),
 		state: &DesignerState{
@@ -79,9 +105,49 @@ func New(cfg Config) (*Designer, error) {
 	return d, nil
 }
 
+// SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+func (d *Designer) SetProvider(p designerProvider) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	d.provider = p
+}
+
+// SetProviderWrapper stores a callback that re-applies gateway rate limiting
+// to fresh providers created during credential refresh.
+func (d *Designer) SetProviderWrapper(w gateway.ProviderWrapper) {
+	d.providerWrapper = w
+}
+
+// getProvider returns the current provider under read lock.
+func (d *Designer) getProvider() designerProvider {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.provider
+}
+
+// ProviderType implements container.AuthRefreshable.
+func (d *Designer) ProviderType() string { return "google" }
+
+// RefreshProvider implements container.AuthRefreshable.
+// Re-resolves Google credentials and replaces the provider.
+func (d *Designer) RefreshProvider(ctx context.Context) error {
+	cfg := providers.DefaultGoogleConfig()
+	p, err := providers.NewGoogleProvider(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("designer refresh provider: %w", err)
+	}
+	var wrapped designerProvider = p
+	if d.providerWrapper != nil {
+		wrapped = d.providerWrapper(p)
+	}
+	d.SetProvider(wrapped)
+	d.logger.Info("provider refreshed")
+	return nil
+}
+
 func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
-		cfg.SystemPrompt = DefaultSystemPrompt
+		cfg.SystemPrompt = DesignerSystemPrompt()
 	}
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
@@ -89,6 +155,24 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+
+	defaults := DefaultDesignerToolLoopConfig()
+	if cfg.DesignerConfig.MaxToolRuns == 0 {
+		cfg.DesignerConfig.MaxToolRuns = defaults.MaxToolRuns
+	}
+	if cfg.DesignerConfig.MaxTokens == 0 {
+		cfg.DesignerConfig.MaxTokens = defaults.MaxTokens
+	}
+	if cfg.DesignerConfig.DefaultTimeout == 0 {
+		cfg.DesignerConfig.DefaultTimeout = defaults.DefaultTimeout
+	}
+	if cfg.DesignerConfig.ReasoningEffort == "" {
+		cfg.DesignerConfig.ReasoningEffort = defaults.ReasoningEffort
+	}
+	if cfg.DesignerConfig.Model == "" {
+		cfg.DesignerConfig.Model = defaults.Model
+	}
+
 	if cfg.DesignerConfig.MaxConcurrentTasks == 0 {
 		cfg.DesignerConfig.MaxConcurrentTasks = 1
 	}
@@ -109,8 +193,11 @@ func (d *Designer) initSkills() {
 		"component_search", "component_create", "component_modify",
 		"token_validate", "token_suggest",
 		"a11y_audit", "a11y_fix_suggest", "contrast_check",
+		"request_engineer_review", "request_inspector_check",
+		"request_tester_validation", "ask_user_clarification",
+		"report_to_engineer", "report_to_orchestrator",
 	}
-	loaderCfg.AutoLoadDomains = []string{"ui", "design", "accessibility"}
+	loaderCfg.AutoLoadDomains = []string{"ui", "design", "accessibility", "collaboration"}
 	d.skillLoader = skills.NewLoader(d.skills, loaderCfg)
 
 	d.registerCoreSkills()
@@ -131,7 +218,7 @@ func (d *Designer) Start(bus guide.EventBus) error {
 	}
 
 	d.bus = bus
-	d.channels = guide.NewAgentChannels("designer", "designer")
+	d.channels = guide.NewAgentChannels("designer", d.id)
 
 	var err error
 	d.requestSub, err = bus.SubscribeAsync(d.channels.Requests, d.handleBusRequest)
@@ -226,6 +313,10 @@ func (d *Designer) Channels() *guide.AgentChannels {
 	return d.channels
 }
 
+// =============================================================================
+// Request Handling — LLM Tool Loop
+// =============================================================================
+
 func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	if msg.Type != guide.MessageTypeForward {
 		return nil
@@ -237,9 +328,11 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	ctx := context.Background()
+	emitter := shared.NewToolCallEmitter(d.bus, d.channels, "designer", fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	startTime := time.Now()
 
-	result, err := d.processForwardedRequest(ctx, fwd)
+	result, err := d.handleDesign(ctx, fwd)
 
 	if fwd.FireAndForget {
 		return nil
@@ -248,7 +341,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   d.id,
+		RespondingAgentID:   "designer",
 		RespondingAgentName: "designer",
 		ProcessingTime:      time.Since(startTime),
 	}
@@ -274,41 +367,50 @@ func (d *Designer) generateMessageID() string {
 	return fmt.Sprintf("designer_msg_%s", uuid.New().String())
 }
 
-func (d *Designer) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	handler, err := d.intentHandler(fwd.Intent)
+// handleDesign is the unified entry point for all design intents. It builds
+// a provider request with the composed system prompt and full tool definitions,
+// then executes the bounded LLM tool loop.
+func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if fwd.Input == "" {
+		return nil, fmt.Errorf("design task input is required")
+	}
+
+	d.setStatus(AgentStatusBusy)
+	defer d.setStatus(AgentStatusIdle)
+
+	timeout := d.config.DesignerConfig.DefaultTimeout
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	toolDefs := d.buildToolDefinitions()
+
+	req := &providers.Request{
+		SystemPrompt: d.config.SystemPrompt,
+		Messages: []providers.Message{
+			{
+				Role:    providers.RoleUser,
+				Content: fwd.Input,
+			},
+		},
+		Tools:           toolDefs,
+		MaxTokens:       d.config.DesignerConfig.MaxTokens,
+		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
+	}
+
+	result, err := d.executeToolLoop(ctx, req)
 	if err != nil {
+		d.recordFailure(fwd.CorrelationID, err.Error(), fwd.Input)
 		return nil, err
 	}
-	return handler(ctx, fwd)
-}
 
-type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error)
+	inTok, outTok := d.usageAccum.Total()
 
-func (d *Designer) intentHandler(intent guide.Intent) (forwardedHandler, error) {
-	switch intent {
-	case guide.IntentDesign:
-		return d.handleDesign, nil
-	case guide.IntentComplete:
-		return d.handleDesign, nil
-	default:
-		return d.handleDesign, nil
-	}
-}
-
-func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	taskID := uuid.New().String()
-
-	req := &DesignerRequest{
-		ID:         uuid.New().String(),
-		Intent:     IntentDesignComponent,
-		TaskID:     taskID,
-		Prompt:     fwd.Input,
-		DesignerID: d.id,
-		SessionID:  d.config.SessionID,
-		Timestamp:  time.Now(),
-	}
-
-	return d.Handle(ctx, req)
+	return map[string]any{
+		"response":      result,
+		"agent_id":      d.id,
+		"input_tokens":  inTok,
+		"output_tokens": outTok,
+	}, nil
 }
 
 func (d *Designer) handleBusResponse(msg *guide.Message) error {
@@ -342,363 +444,29 @@ func (d *Designer) GetKnownAgents() map[string]*guide.AgentAnnouncement {
 	return result
 }
 
-func (d *Designer) Handle(ctx context.Context, req *DesignerRequest) (*DesignerResponse, error) {
-	if req == nil {
-		return nil, fmt.Errorf("request cannot be nil")
+// HandleRequest is the public entry point for direct invocations (e.g. from
+// the TDD pipeline factory). It wraps the input into a ForwardedRequest and
+// delegates to the LLM tool loop.
+func (d *Designer) HandleRequest(ctx context.Context, input string) (any, error) {
+	fwd := &guide.ForwardedRequest{
+		Input:         input,
+		Intent:        guide.IntentDesign,
+		Domain:        guide.DomainCode,
+		SourceAgentID: d.id,
+		TargetAgentID: d.id,
 	}
-
-	startTime := time.Now()
-	d.setStatus(AgentStatusBusy)
-	defer d.setStatus(AgentStatusIdle)
-
-	if err := d.validateTaskScope(ctx, req); err != nil {
-		return d.failureResponse(req, err, startTime)
-	}
-
-	if err := d.consultLibrarian(ctx, req); err != nil {
-		d.logger.Warn("librarian consultation failed", "error", err)
-	}
-
-	if err := d.consultAcademic(ctx, req, "Initial research on UI best practices and accessibility guidelines"); err != nil {
-		d.logger.Warn("academic consultation failed", "error", err)
-	}
-
-	if failure := d.checkPreviousFailures(req.TaskID); failure != nil {
-		d.logger.Info("found previous failure", "task_id", req.TaskID, "attempts", failure.AttemptCount)
-		if failure.AttemptCount >= 3 {
-			if err := d.consultAcademic(ctx, req, "Task has failed multiple times. Need alternative design approach."); err != nil {
-				d.logger.Warn("academic consultation failed", "error", err)
-			}
-		}
-	}
-
-	plan, err := d.planImplementation(ctx, req)
-	if err != nil {
-		return d.failureResponse(req, err, startTime)
-	}
-
-	if len(plan.Steps) > MaxTodosBeforeArchitect {
-		return d.scopeLimitResponse(req, plan, startTime)
-	}
-
-	if issues := d.preImplementationChecks(ctx, req, plan); len(issues) > 0 {
-		d.logger.Warn("pre-implementation issues detected", "issues", issues)
-		if d.hasUnclearIssues(issues) {
-			if err := d.consultAcademic(ctx, req, fmt.Sprintf("Pre-implementation issues: %v", issues)); err != nil {
-				d.logger.Warn("academic consultation failed", "error", err)
-			}
-		}
-	}
-
-	result, err := d.executeImplementation(ctx, req, plan)
-	if err != nil {
-		d.recordFailure(req.TaskID, err.Error(), req.Prompt)
-		return d.failureResponse(req, err, startTime)
-	}
-
-	if err := d.validateTokens(ctx, result); err != nil {
-		d.logger.Warn("token validation failed", "error", err)
-		result.TokensValidated = false
-	} else {
-		result.TokensValidated = true
-	}
-
-	if err := d.runA11yAudit(ctx, result); err != nil {
-		d.logger.Warn("accessibility audit failed", "error", err)
-		result.A11yAuditPassed = false
-	} else {
-		result.A11yAuditPassed = true
-	}
-
-	if err := d.validateResult(ctx, result); err != nil {
-		d.recordFailure(req.TaskID, err.Error(), req.Prompt)
-		return d.failureResponse(req, err, startTime)
-	}
-
-	return &DesignerResponse{
-		ID:        uuid.New().String(),
-		RequestID: req.ID,
-		Success:   true,
-		Result:    result,
-		Timestamp: time.Now(),
-	}, nil
+	return d.handleDesign(ctx, fwd)
 }
 
-type ImplementationPlan struct {
-	TaskID      string
-	Description string
-	Steps       []ImplementationStep
-	Estimates   EstimateInfo
-}
-
-type ImplementationStep struct {
-	ID          string
-	Description string
-	Type        string
-	Target      string
-	Completed   bool
-}
-
-type EstimateInfo struct {
-	TotalSteps    int
-	EstimatedTime time.Duration
-	Complexity    string
-}
-
-func (d *Designer) validateTaskScope(ctx context.Context, req *DesignerRequest) error {
-	if req.Prompt == "" {
-		return fmt.Errorf("design task prompt is required")
-	}
-	return nil
-}
-
-func (d *Designer) consultLibrarian(ctx context.Context, req *DesignerRequest) error {
-	if d.bus == nil {
-		return fmt.Errorf("event bus not available")
-	}
-
-	start := time.Now()
-	consultation := Consultation{
-		Target:    ConsultLibrarian,
-		Query:     fmt.Sprintf("Search for existing UI component patterns, design tokens, and style guidelines for: %s", req.Prompt),
-		Timestamp: time.Now(),
-	}
-
-	routeReq := &guide.RouteRequest{
-		CorrelationID:   uuid.New().String(),
-		Input:           consultation.Query,
-		SourceAgentID:   d.id,
-		SourceAgentName: "designer",
-		TargetAgentID:   "librarian",
-		FireAndForget:   true,
-		SessionID:       d.config.SessionID,
-		Timestamp:       time.Now(),
-	}
-
-	if err := d.PublishRequest(routeReq); err != nil {
-		return err
-	}
-
-	consultation.Duration = time.Since(start)
-	d.recordConsultation(consultation)
-	return nil
-}
-
-func (d *Designer) consultAcademic(ctx context.Context, req *DesignerRequest, reason string) error {
-	if d.bus == nil {
-		return fmt.Errorf("event bus not available")
-	}
-
-	start := time.Now()
-	consultation := Consultation{
-		Target:    ConsultAcademic,
-		Query:     fmt.Sprintf("Need UI/UX guidance for task: %s. Reason: %s", req.Prompt, reason),
-		Timestamp: time.Now(),
-	}
-
-	routeReq := &guide.RouteRequest{
-		CorrelationID:   uuid.New().String(),
-		Input:           consultation.Query,
-		SourceAgentID:   d.id,
-		SourceAgentName: "designer",
-		TargetAgentID:   "academic",
-		FireAndForget:   true,
-		SessionID:       d.config.SessionID,
-		Timestamp:       time.Now(),
-	}
-
-	if err := d.PublishRequest(routeReq); err != nil {
-		return err
-	}
-
-	consultation.Duration = time.Since(start)
-	d.recordConsultation(consultation)
-	return nil
-}
-
-func (d *Designer) checkPreviousFailures(taskID string) *FailureRecord {
-	d.stateMu.RLock()
-	defer d.stateMu.RUnlock()
-	return d.failures[taskID]
-}
-
-func (d *Designer) planImplementation(ctx context.Context, req *DesignerRequest) (*ImplementationPlan, error) {
-	plan := &ImplementationPlan{
-		TaskID:      req.TaskID,
-		Description: req.Prompt,
-		Steps:       make([]ImplementationStep, 0),
-		Estimates: EstimateInfo{
-			Complexity: "medium",
-		},
-	}
-
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Analyze design requirements",
-		Type:        "analyze",
-	})
-
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Identify design tokens needed",
-		Type:        "tokens",
-	})
-
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Implement component structure",
-		Type:        "implement",
-	})
-
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Apply design tokens to styles",
-		Type:        "style",
-	})
-
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Add interactive states",
-		Type:        "interactions",
-	})
-
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Validate design token usage",
-		Type:        "validate_tokens",
-	})
-
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Run accessibility audit",
-		Type:        "a11y_audit",
-	})
-
-	plan.Estimates.TotalSteps = len(plan.Steps)
-	plan.Estimates.EstimatedTime = time.Duration(len(plan.Steps)) * 3 * time.Minute
-
-	return plan, nil
-}
-
-type PreImplementationIssue struct {
-	Type        string
-	Description string
-	Severity    string
-	Unclear     bool
-}
-
-func (d *Designer) preImplementationChecks(ctx context.Context, req *DesignerRequest, plan *ImplementationPlan) []PreImplementationIssue {
-	return nil
-}
-
-func (d *Designer) hasUnclearIssues(issues []PreImplementationIssue) bool {
-	for _, issue := range issues {
-		if issue.Unclear {
-			return true
-		}
-	}
-	return false
-}
-
-func (d *Designer) executeImplementation(ctx context.Context, req *DesignerRequest, plan *ImplementationPlan) (*DesignResult, error) {
-	start := time.Now()
-	result := &DesignResult{
-		TaskID:       req.TaskID,
-		FilesChanged: make([]FileChange, 0),
-	}
-
-	for i, step := range plan.Steps {
-		d.updateProgress(req.TaskID, i+1, len(plan.Steps), step.Description)
-
-		switch step.Type {
-		case "analyze":
-			d.logger.Debug("executing analysis step", "step", step.Description)
-
-		case "tokens":
-			d.logger.Debug("identifying design tokens", "step", step.Description)
-
-		case "implement":
-			d.logger.Debug("implementing component", "step", step.Description)
-
-		case "style":
-			d.logger.Debug("applying styles", "step", step.Description)
-
-		case "interactions":
-			d.logger.Debug("adding interactions", "step", step.Description)
-
-		case "validate_tokens":
-			d.logger.Debug("validating tokens", "step", step.Description)
-
-		case "a11y_audit":
-			d.logger.Debug("running a11y audit", "step", step.Description)
-
-		default:
-			d.logger.Debug("executing step", "type", step.Type, "description", step.Description)
-		}
-
-		step.Completed = true
-	}
-
-	result.Success = true
-	result.Duration = time.Since(start)
-	result.Output = "Design implementation completed successfully"
-
-	return result, nil
-}
-
-func (d *Designer) validateTokens(ctx context.Context, result *DesignResult) error {
-	return nil
-}
-
-func (d *Designer) runA11yAudit(ctx context.Context, result *DesignResult) error {
-	return nil
-}
-
-func (d *Designer) validateResult(ctx context.Context, result *DesignResult) error {
-	if result == nil {
-		return fmt.Errorf("result is nil")
-	}
-	return nil
-}
-
-func (d *Designer) scopeLimitResponse(req *DesignerRequest, plan *ImplementationPlan, startTime time.Time) (*DesignerResponse, error) {
-	return &DesignerResponse{
-		ID:        uuid.New().String(),
-		RequestID: req.ID,
-		Success:   false,
-		Error:     fmt.Sprintf("SCOPE LIMIT EXCEEDED: Task requires %d steps (max %d). Request Architect decomposition.", len(plan.Steps), MaxTodosBeforeArchitect),
-		Timestamp: time.Now(),
-	}, fmt.Errorf("scope limit exceeded: %d steps required, max is %d", len(plan.Steps), MaxTodosBeforeArchitect)
-}
-
-func (d *Designer) failureResponse(req *DesignerRequest, err error, startTime time.Time) (*DesignerResponse, error) {
-	return &DesignerResponse{
-		ID:        uuid.New().String(),
-		RequestID: req.ID,
-		Success:   false,
-		Error:     err.Error(),
-		Timestamp: time.Now(),
-	}, err
-}
+// =============================================================================
+// State Management
+// =============================================================================
 
 func (d *Designer) setStatus(status AgentStatus) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 	d.state.Status = status
 	d.state.LastActiveAt = time.Now()
-}
-
-func (d *Designer) updateProgress(taskID string, completed, total int, currentStep string) {
-	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
-	d.state.CurrentTaskID = taskID
-	d.state.LastActiveAt = time.Now()
-
-	d.logger.Debug("progress update",
-		"task_id", taskID,
-		"step", fmt.Sprintf("%d/%d", completed, total),
-		"current", currentStep,
-	)
 }
 
 func (d *Designer) recordFailure(taskID, errorMsg, approach string) {
@@ -747,9 +515,14 @@ func (d *Designer) GetConsultations() []Consultation {
 	return result
 }
 
+// =============================================================================
+// Routing & Skills
+// =============================================================================
+
 func (d *Designer) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      d.id,
+		Type:    "designer",
 		Name:    "designer",
 		Aliases: []string{"design", "ui", "ux", "frontend"},
 
@@ -841,7 +614,7 @@ func (d *Designer) GetRoutingInfo() *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.7,
 			},
-			Description: "UI/UX design specialist. Creates accessible, performant, and beautiful user interfaces.",
+			Description: "UI/UX design specialist powered by Gemini 3.1 Pro Preview. LLM-driven 6-phase protocol for accessible, performant UI implementation.",
 			Priority:    70,
 		},
 	}
@@ -868,7 +641,7 @@ func (d *Designer) GetToolDefinitions() []map[string]any {
 }
 
 // =============================================================================
-// ContainerAgent Interface
+// ContainerAgent & HandoffInjectable Interface
 // =============================================================================
 
 // AgentID returns the unique instance identifier for this designer.
@@ -881,7 +654,43 @@ func (d *Designer) AgentType() string {
 	return "designer"
 }
 
+// Descriptor returns immutable metadata for the handoff system.
+func (d *Designer) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:       "designer",
+		ModelID:         "gemini-3.1-pro-preview",
+		ReasoningEffort: "high",
+		ContextWindow:   1_000_000,
+		Category:        handoff.CategoryPipeline,
+	}
+}
+
+// InjectPreparedContext accepts context from a handoff.
+func (d *Designer) InjectPreparedContext(_ *handoff.PreparedContext) error {
+	return nil
+}
+
+// ExtractArchivableState returns state for handoff persistence.
+func (d *Designer) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   d.AgentID(),
+		AgentType: d.AgentType(),
+		Timestamp: time.Now(),
+	}
+}
+
+// SetHandoffBridge assigns the handoff bridge for turn recording.
+func (d *Designer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	d.handoffBridge = bridge
+}
+
+// SetFileAccess assigns the per-pipeline file access layer.
+func (d *Designer) SetFileAccess(fa versioning.FileAccess) { d.fileAccess = fa }
+
 // Terminate gracefully shuts down the designer agent.
 func (d *Designer) Terminate(_ context.Context) error {
 	return d.Stop()
 }
+
+// Compile-time interface verification.
+var _ handoff.HandoffInjectable = (*Designer)(nil)

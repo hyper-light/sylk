@@ -1,6 +1,10 @@
 package shared
 
-import "github.com/adalundhe/sylk/prompts"
+import (
+	"strings"
+
+	"github.com/adalundhe/sylk/prompts"
+)
 
 // Prompt variables loaded from embedded markdown files.
 var (
@@ -22,6 +26,12 @@ var (
 
 	// Global Tester system prompt.
 	GlobalSystemPrompt = prompts.MustLoad("tester", "system")
+
+	// Design validation context for pipeline tester.
+	pipelineDesignValidation = prompts.MustLoad("tester", "design_validation")
+
+	// Conversation mode prompt for chat intents.
+	TesterConversationPrompt = prompts.MustLoad("tester", "conversation")
 )
 
 // PipelineTesterSystemPrompt composes the full pipeline tester system prompt.
@@ -33,6 +43,16 @@ func PipelineTesterSystemPrompt() string {
 		TesterGuardrails
 }
 
+// PipelineTesterSystemPromptForWorker composes the pipeline tester system prompt,
+// appending design validation context when workerType is "designer".
+func PipelineTesterSystemPromptForWorker(workerType string) string {
+	base := PipelineTesterSystemPrompt()
+	if workerType == "designer" {
+		return base + "\n\n" + pipelineDesignValidation
+	}
+	return base
+}
+
 // GlobalTesterSystemPrompt composes the full global tester system prompt.
 func GlobalTesterSystemPrompt() string {
 	return GlobalSystemPrompt + "\n\n" +
@@ -42,3 +62,13 @@ func GlobalTesterSystemPrompt() string {
 		TesterSkillsPolicy + "\n\n" +
 		TesterGuardrails
 }
+
+// TesterConversationSystemPrompt returns the system prompt for conversation mode.
+// Uses only the conversation persona — the pipeline-specific GlobalSystemPrompt
+// (Inspector gate, 7-phase protocol, skill schemas) and TesterGuardrails
+// (gate prerequisite) are excluded so the LLM responds to direct user chat
+// without blocking on pipeline prerequisites.
+func TesterConversationSystemPrompt() string {
+	return strings.TrimSpace(TesterConversationPrompt)
+}
+

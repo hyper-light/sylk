@@ -1117,22 +1117,17 @@ func NewFallbackGoogleOAuthStore(primary, secondary GoogleOAuthStore) *FallbackG
 }
 
 func (s *FallbackGoogleOAuthStore) Save(auth *GoogleOAuthAuth) error {
-	var errs []error
+	var primaryErr, secondaryErr error
 	if s.primary != nil {
-		err := s.primary.Save(auth)
-		if err == nil {
-			return nil
-		}
-		errs = append(errs, err)
+		primaryErr = s.primary.Save(auth)
 	}
 	if s.secondary != nil {
-		err := s.secondary.Save(auth)
-		if err == nil {
-			return nil
-		}
-		errs = append(errs, err)
+		secondaryErr = s.secondary.Save(auth)
 	}
-	return joinStoreErrors(errs)
+	if primaryErr == nil || secondaryErr == nil {
+		return nil
+	}
+	return joinStoreErrors([]error{primaryErr, secondaryErr})
 }
 
 func (s *FallbackGoogleOAuthStore) Load() (*GoogleOAuthAuth, error) {

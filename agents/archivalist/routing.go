@@ -28,6 +28,7 @@ func (a *Archivalist) GetRoutingInfo() *guide.AgentRoutingInfo {
 func ArchivalistRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:   "archivalist",
+		Type: "archivalist",
 		Name: "archivalist",
 
 		// DSL aliases

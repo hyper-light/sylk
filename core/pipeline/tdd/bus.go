@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/adalundhe/sylk/agents/engineer"
-	"github.com/adalundhe/sylk/agents/inspector"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 )
 
@@ -14,20 +14,23 @@ var ErrBusClosed = errors.New("pipeline bus closed")
 
 // InspectorFeedback wraps inspector feedback for the worker.
 type InspectorFeedback struct {
-	Criteria *inspector.InspectorCriteria
-	Feedback *inspector.InspectorFeedback
+	Criteria   *inspShared.InspectorCriteria
+	Feedback   *inspShared.InspectorFeedback
+	WorkerType WorkerType
 }
 
 // TesterFeedback wraps tester feedback for the worker.
 type TesterFeedback struct {
 	Response    *tester.TesterResponse
 	FailedTests []string
+	WorkerType  WorkerType
 }
 
 // WorkerResult wraps the worker output with changed file paths.
 type WorkerResult struct {
 	TaskResult   *engineer.TaskResult
 	ChangedFiles []string
+	WorkerType   WorkerType
 }
 
 // PipelineBus provides bounded typed channels for intra-pipeline communication.
@@ -36,7 +39,7 @@ type PipelineBus struct {
 	inspectorFeedback chan *InspectorFeedback
 	testerFeedback    chan *TesterFeedback
 	workerDone        chan *WorkerResult
-	inspectorDone     chan *inspector.InspectorResult
+	inspectorDone     chan *inspShared.InspectorResult
 	testerDone        chan *tester.TesterResponse
 	userMessages      chan any
 
@@ -50,7 +53,7 @@ func NewPipelineBus() *PipelineBus {
 		inspectorFeedback: make(chan *InspectorFeedback, 1),
 		testerFeedback:    make(chan *TesterFeedback, 1),
 		workerDone:        make(chan *WorkerResult, 1),
-		inspectorDone:     make(chan *inspector.InspectorResult, 1),
+		inspectorDone:     make(chan *inspShared.InspectorResult, 1),
 		testerDone:        make(chan *tester.TesterResponse, 1),
 		userMessages:      make(chan any, 4),
 	}
@@ -87,12 +90,12 @@ func (b *PipelineBus) RecvWorkerDone(ctx context.Context) (*WorkerResult, error)
 }
 
 // SendInspectorDone sends inspector validation result.
-func (b *PipelineBus) SendInspectorDone(ctx context.Context, r *inspector.InspectorResult) error {
+func (b *PipelineBus) SendInspectorDone(ctx context.Context, r *inspShared.InspectorResult) error {
 	return sendCh(ctx, b, b.inspectorDone, r)
 }
 
 // RecvInspectorDone receives inspector validation result.
-func (b *PipelineBus) RecvInspectorDone(ctx context.Context) (*inspector.InspectorResult, error) {
+func (b *PipelineBus) RecvInspectorDone(ctx context.Context) (*inspShared.InspectorResult, error) {
 	return recvCh(ctx, b, b.inspectorDone)
 }
 
@@ -186,5 +189,37 @@ func drainAndClose[T any](ch chan T) {
 			close(ch)
 			return
 		}
+	}
+}
+
+// mergeWorkerResults combines the primary result with co-worker results.
+// ChangedFiles are deduplicated. Primary's TaskResult is authoritative.
+func mergeWorkerResults(primary *WorkerResult, coResults []*WorkerResult) *WorkerResult {
+	if len(coResults) == 0 {
+		return primary
+	}
+	if primary == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(primary.ChangedFiles))
+	merged := make([]string, 0, len(primary.ChangedFiles))
+	for _, f := range primary.ChangedFiles {
+		if _, ok := seen[f]; !ok {
+			seen[f] = struct{}{}
+			merged = append(merged, f)
+		}
+	}
+	for _, cr := range coResults {
+		for _, f := range cr.ChangedFiles {
+			if _, ok := seen[f]; !ok {
+				seen[f] = struct{}{}
+				merged = append(merged, f)
+			}
+		}
+	}
+	return &WorkerResult{
+		TaskResult:   primary.TaskResult,
+		ChangedFiles: merged,
+		WorkerType:   primary.WorkerType,
 	}
 }

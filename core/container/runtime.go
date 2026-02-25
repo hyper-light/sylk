@@ -56,6 +56,12 @@ type ContainerRuntime interface {
 	PodStatus(p *Pod) *PodStatus
 }
 
+// ProbeFactory builds probe specs for a container after its agent has been
+// created. Called by CreateContainer between agent creation and NewContainer.
+// This resolves the ordering problem where probes need the live agent
+// reference but specs are mutated before agent creation.
+type ProbeFactory func(agent ContainerAgent, spec *ContainerSpec) []ProbeSpec
+
 // DefaultRuntimeConfig provides configuration for the default runtime.
 type DefaultRuntimeConfig struct {
 	Budget          *concurrency.GoroutineBudget
@@ -63,18 +69,20 @@ type DefaultRuntimeConfig struct {
 	Quota           *ResourceQuota
 	Admission       *AdmissionController
 	CreateAgent     AgentCreator
+	ProbeFactory    ProbeFactory
 	ParentCtx       context.Context
 }
 
 // DefaultRuntime is the container runtime that wires existing primitives.
 type DefaultRuntime struct {
-	budget      *concurrency.GoroutineBudget
-	registry    *ContainerRegistry
-	quota       *ResourceQuota
-	admission   *AdmissionController
-	createAgent AgentCreator
-	parentCtx   context.Context
-	closed      atomic.Bool
+	budget       *concurrency.GoroutineBudget
+	registry     *ContainerRegistry
+	quota        *ResourceQuota
+	admission    *AdmissionController
+	createAgent  AgentCreator
+	probeFactory ProbeFactory
+	parentCtx    context.Context
+	closed       atomic.Bool
 }
 
 // NewDefaultRuntime creates the default container runtime.
@@ -84,12 +92,13 @@ func NewDefaultRuntime(cfg DefaultRuntimeConfig) *DefaultRuntime {
 		ctx = context.Background()
 	}
 	return &DefaultRuntime{
-		budget:      cfg.Budget,
-		registry:    cfg.Registry,
-		quota:       cfg.Quota,
-		admission:   cfg.Admission,
-		createAgent: cfg.CreateAgent,
-		parentCtx:   ctx,
+		budget:       cfg.Budget,
+		registry:     cfg.Registry,
+		quota:        cfg.Quota,
+		admission:    cfg.Admission,
+		createAgent:  cfg.CreateAgent,
+		probeFactory: cfg.ProbeFactory,
+		parentCtx:    ctx,
 	}
 }
 
@@ -111,6 +120,12 @@ func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpe
 	agent, err := rt.createAgentForSpec(ctx, &spec)
 	if err != nil {
 		return nil, fmt.Errorf("create agent: %w", err)
+	}
+
+	// Wire probes after agent creation — the ProbeFactory needs the live
+	// agent to construct liveness/readiness handlers.
+	if rt.probeFactory != nil && agent != nil {
+		spec.Probes = rt.probeFactory(agent, &spec)
 	}
 
 	id := ContainerID(uuid.New().String())

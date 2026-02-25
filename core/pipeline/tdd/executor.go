@@ -7,9 +7,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/adalundhe/sylk/agents/inspector"
+	inspPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/agents/tester"
+	pipelinetester "github.com/adalundhe/sylk/agents/tester/pipeline"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/events"
 )
 
 const (
@@ -23,14 +26,24 @@ const (
 	scopeShutdownHard      = 30 * time.Second
 )
 
+// domainFromWorkerType maps a WorkerType to its corresponding ValidationDomain.
+func domainFromWorkerType(wt WorkerType) inspShared.ValidationDomain {
+	if wt == WorkerDesigner {
+		return inspShared.DomainDesign
+	}
+	return inspShared.DomainCode
+}
+
 // TDDExecutor runs the TDD loop: define → test → implement → validate → loop.
 type TDDExecutor struct {
 	pipeline     *Pipeline
 	bus          *PipelineBus
 	runner       *concurrency.PipelineRunner
-	inspector    *inspector.Inspector
-	tester       *tester.Tester
+	inspector    *inspPipeline.PipelineInspector
+	tester       *pipelinetester.PipelineTester
 	worker       WorkerAgent
+	coWorkers    []WorkerAgent
+	activityBus  *events.ActivityEventBus
 	phaseTimeout time.Duration
 	maxLoops     int
 	onEvent      func(PipelineEvent)
@@ -42,9 +55,11 @@ type TDDExecutor struct {
 type TDDExecutorConfig struct {
 	Pipeline     *Pipeline
 	Bus          *PipelineBus
-	Inspector    *inspector.Inspector
-	Tester       *tester.Tester
+	Inspector    *inspPipeline.PipelineInspector
+	Tester       *pipelinetester.PipelineTester
 	Worker       WorkerAgent
+	CoWorkers    []WorkerAgent
+	ActivityBus  *events.ActivityEventBus
 	PhaseTimeout time.Duration
 	MaxLoops     int
 	OnEvent      func(PipelineEvent)
@@ -78,6 +93,8 @@ func NewTDDExecutor(cfg TDDExecutorConfig) *TDDExecutor {
 		inspector:    cfg.Inspector,
 		tester:       cfg.Tester,
 		worker:       cfg.Worker,
+		coWorkers:    cfg.CoWorkers,
+		activityBus:  cfg.ActivityBus,
 		phaseTimeout: phaseTimeout,
 		maxLoops:     maxLoops,
 		onEvent:      cfg.OnEvent,
@@ -159,6 +176,7 @@ func (e *TDDExecutor) phaseDefineCriteria(ctx context.Context) error {
 	if err := e.transitionStatus(StatusDefiningCriteria); err != nil {
 		return err
 	}
+	e.emitAgentActivity(events.EventTypeAgentAction, "inspector-pipeline", "Defining validation criteria")
 	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
 	defer cancel()
 
@@ -171,6 +189,10 @@ func (e *TDDExecutor) phaseDefineCriteria(ctx context.Context) error {
 		return fmt.Errorf("no initial criteria provided for task %s", taskID)
 	}
 
+	if existing.Domain == "" {
+		existing.Domain = domainFromWorkerType(e.pipeline.WorkerType)
+	}
+
 	e.inspector.DefineCriteria(taskID, existing)
 	return nil
 }
@@ -179,18 +201,21 @@ func (e *TDDExecutor) phaseCreateTests(ctx context.Context) error {
 	if err := e.transitionStatus(StatusCreatingTests); err != nil {
 		return err
 	}
+	e.emitAgentActivity(events.EventTypeAgentAction, "tester-pipeline", "Creating test suite")
 	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
 	defer cancel()
 
 	e.mu.RLock()
 	taskID := e.pipeline.TaskID
+	workerType := string(e.pipeline.WorkerType)
 	e.mu.RUnlock()
 
 	req := &tester.TesterRequest{
-		Intent: tester.IntentRunTests,
-		Files:  []string{taskID},
+		Intent:     tester.IntentRunTests,
+		Files:      []string{taskID},
+		WorkerType: workerType,
 	}
-	resp, err := e.tester.Handle(ctx, req)
+	resp, err := e.tester.HandleRequest(ctx, req)
 	if err != nil {
 		return fmt.Errorf("tester create tests: %w", err)
 	}
@@ -207,21 +232,58 @@ func (e *TDDExecutor) phaseWorkerExecute(ctx context.Context) error {
 	if err := e.transitionStatus(StatusExecuting); err != nil {
 		return err
 	}
+	workerAgent := string(e.pipeline.WorkerType)
+	e.emitAgentActivity(events.EventTypeAgentAction, workerAgent, "Executing implementation")
 	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
 	defer cancel()
 
+	criteria, inspFb, testFb := e.workerInputs()
+
+	e.mu.RLock()
+	wt := e.pipeline.WorkerType
+	e.mu.RUnlock()
+
+	// Set task prompt on primary worker.
+	taskPrompt := e.resolveTaskPrompt(wt)
+	e.applyWorkerPrompt(e.worker, taskPrompt, nil)
+
+	// Execute primary worker.
+	result, err := e.worker.Execute(ctx, criteria, inspFb, testFb)
+	if err != nil {
+		return fmt.Errorf("worker execute: %w", err)
+	}
+	result.WorkerType = wt
+
+	// Execute co-workers sequentially.
+	coResults := e.executeCoWorkers(ctx, criteria, inspFb, testFb, result)
+
+	// Merge results.
+	merged := mergeWorkerResults(result, coResults)
+
+	e.mu.Lock()
+	e.pipeline.WorkerOutput = merged
+	e.pipeline.CoWorkerOutputs = coResults
+	e.mu.Unlock()
+
+	return nil
+}
+
+// workerInputs extracts criteria and feedback under RLock.
+func (e *TDDExecutor) workerInputs() (*inspShared.InspectorCriteria, *InspectorFeedback, *TesterFeedback) {
 	e.mu.RLock()
 	criteria := e.pipeline.InspectorCriteria
 	inspResult := e.pipeline.InspectorResult
 	testerResult := e.pipeline.TesterResult
 	loop := e.pipeline.LoopCount
+	wt := e.pipeline.WorkerType
 	e.mu.RUnlock()
 
 	var inspFb *InspectorFeedback
 	if inspResult != nil && loop > 1 {
 		inspFb = &InspectorFeedback{
-			Criteria: criteria,
-			Feedback: &inspector.InspectorFeedback{
+			Criteria:   criteria,
+			WorkerType: wt,
+			Feedback: &inspShared.InspectorFeedback{
 				Loop:   inspResult.LoopCount,
 				Passed: inspResult.Passed,
 				Issues: inspResult.Issues,
@@ -236,26 +298,76 @@ func (e *TDDExecutor) phaseWorkerExecute(ctx context.Context) error {
 			testFb = &TesterFeedback{
 				Response:    testerResult,
 				FailedTests: failed,
+				WorkerType:  wt,
 			}
 		}
 	}
 
-	result, err := e.worker.Execute(ctx, criteria, inspFb, testFb)
-	if err != nil {
-		return fmt.Errorf("worker execute: %w", err)
+	return criteria, inspFb, testFb
+}
+
+// executeCoWorkers runs each co-worker sequentially, passing the primary
+// result as context. Co-worker failures are non-fatal.
+func (e *TDDExecutor) executeCoWorkers(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback, primaryResult *WorkerResult) []*WorkerResult {
+	if len(e.coWorkers) == 0 {
+		return nil
 	}
 
-	e.mu.Lock()
-	e.pipeline.WorkerOutput = result
-	e.mu.Unlock()
+	e.mu.RLock()
+	coTypes := e.pipeline.CoWorkerTypes
+	e.mu.RUnlock()
 
-	return nil
+	results := make([]*WorkerResult, 0, len(e.coWorkers))
+	for i, cw := range e.coWorkers {
+		var cwType WorkerType
+		if i < len(coTypes) {
+			cwType = coTypes[i]
+		}
+
+		taskPrompt := e.resolveTaskPrompt(cwType)
+		e.applyWorkerPrompt(cw, taskPrompt, primaryResult)
+
+		r, err := cw.Execute(ctx, criteria, inspFb, testFb)
+		if err != nil {
+			e.logger.Warn("co-worker failed", "type", cwType, "error", err)
+			continue // Non-fatal: primary result is authoritative.
+		}
+		r.WorkerType = cwType
+		results = append(results, r)
+	}
+	return results
+}
+
+// resolveTaskPrompt returns the scoped prompt for a worker type,
+// falling back to the pipeline-level task prompt.
+func (e *TDDExecutor) resolveTaskPrompt(wt WorkerType) string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.pipeline.AgentPrompts != nil {
+		if prompt, ok := e.pipeline.AgentPrompts[wt]; ok {
+			return prompt
+		}
+	}
+	return e.pipeline.TaskPrompt
+}
+
+// applyWorkerPrompt sets the task prompt and optional prior output on a worker
+// via the TaskPromptSetter and PriorOutputSetter interfaces.
+func (e *TDDExecutor) applyWorkerPrompt(w WorkerAgent, prompt string, priorOutput *WorkerResult) {
+	if setter, ok := w.(TaskPromptSetter); ok {
+		setter.SetTaskPrompt(prompt)
+	}
+	if setter, ok := w.(PriorOutputSetter); ok {
+		setter.SetPriorOutput(priorOutput)
+	}
 }
 
 func (e *TDDExecutor) phaseValidate(ctx context.Context) (bool, error) {
 	if err := e.transitionStatus(StatusValidating); err != nil {
 		return false, err
 	}
+	e.emitAgentActivity(events.EventTypeAgentAction, "inspector-pipeline", "Validating results")
+	e.emitAgentActivity(events.EventTypeAgentAction, "tester-pipeline", "Running validation tests")
 	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
 	defer cancel()
 
@@ -269,16 +381,18 @@ func (e *TDDExecutor) phaseValidate(ctx context.Context) (bool, error) {
 	scope := concurrency.NewGoroutineScope(ctx, fmt.Sprintf("tdd-validate-%s", e.pipeline.ID), nil)
 
 	var (
-		inspResult   *inspector.InspectorResult
+		inspResult   *inspShared.InspectorResult
 		testerResult *tester.TesterResponse
 		inspErr      error
 		testerErr    error
 		resultMu     sync.Mutex
 	)
 
+	workerType := string(e.pipeline.WorkerType)
+
 	// Inspector validation goroutine.
 	if err := scope.Go("inspector-validate", validationTimeout, func(ctx context.Context) error {
-		r, err := e.inspector.ValidateAgainstCriteria(ctx, taskID, files)
+		r, err := e.inspector.ValidateAgainstCriteria(ctx, taskID, files, workerType)
 		resultMu.Lock()
 		inspResult = r
 		inspErr = err
@@ -291,10 +405,11 @@ func (e *TDDExecutor) phaseValidate(ctx context.Context) (bool, error) {
 	// Tester validation goroutine.
 	if err := scope.Go("tester-validate", validationTimeout, func(ctx context.Context) error {
 		req := &tester.TesterRequest{
-			Intent: tester.IntentRunTests,
-			Files:  files,
+			Intent:     tester.IntentRunTests,
+			Files:      files,
+			WorkerType: workerType,
 		}
-		r, err := e.tester.Handle(ctx, req)
+		r, err := e.tester.HandleRequest(ctx, req)
 		resultMu.Lock()
 		testerResult = r
 		testerErr = err
@@ -354,6 +469,7 @@ func (e *TDDExecutor) complete() error {
 	e.mu.Unlock()
 
 	e.emitEvent(old, StatusCompleted, loop, "")
+	e.emitAgentActivity(events.EventTypeSuccess, string(e.pipeline.WorkerType), "Pipeline completed successfully")
 	return nil
 }
 
@@ -370,6 +486,7 @@ func (e *TDDExecutor) fail(err error) error {
 
 	if !IsTerminalStatus(old) {
 		e.emitEvent(old, StatusFailed, loop, err.Error())
+		e.emitAgentActivity(events.EventTypeFailure, string(e.pipeline.WorkerType), fmt.Sprintf("Pipeline failed: %s", err.Error()))
 	}
 	return err
 }
@@ -383,6 +500,13 @@ func (e *TDDExecutor) markCancelled() {
 		e.pipeline.CompletedAt = time.Now()
 	}
 	e.mu.Unlock()
+}
+
+// CloseCoWorkers closes all co-worker agents.
+func (e *TDDExecutor) CloseCoWorkers() {
+	for _, cw := range e.coWorkers {
+		cw.Close()
+	}
 }
 
 func (e *TDDExecutor) currentLoop() int {
@@ -408,12 +532,35 @@ func (e *TDDExecutor) emitEvent(old, new PipelineStatus, loop int, errMsg string
 		SessionID:  e.pipeline.SessionID,
 		OldStatus:  old,
 		NewStatus:  new,
+		WorkerType: e.pipeline.WorkerType,
 		LoopCount:  loop,
+		MaxLoops:   e.maxLoops,
 		Timestamp:  time.Now(),
 		Error:      errMsg,
 	}
 	e.mu.RUnlock()
 	e.onEvent(evt)
+}
+
+// emitAgentActivity publishes a synthetic activity event for a pipeline agent
+// phase transition to the ActivityEventBus. No-op when activityBus is nil.
+func (e *TDDExecutor) emitAgentActivity(eventType events.EventType, agentName, content string) {
+	if e.activityBus == nil {
+		return
+	}
+	e.mu.RLock()
+	sessionID := e.pipeline.SessionID
+	pipelineID := e.pipeline.ID
+	workerType := string(e.pipeline.WorkerType)
+	e.mu.RUnlock()
+
+	evt := events.NewActivityEvent(eventType, sessionID, content)
+	evt.AgentID = agentName
+	evt.Category = "pipeline"
+	evt.Data["pipeline_id"] = pipelineID
+	evt.Data["agent_type"] = agentName
+	evt.Data["worker_type"] = workerType
+	e.activityBus.Publish(evt)
 }
 
 func failedTestNames(suite *tester.TestSuiteResult) []string {

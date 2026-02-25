@@ -78,11 +78,11 @@ func (p *BusReadinessProbe) Execute(_ context.Context) (ProbeResult, error) {
 	}, nil
 }
 
-// livenessProbeSpec builds a ProbeSpec for liveness checking with timing
+// LivenessProbeSpec builds a ProbeSpec for liveness checking with timing
 // derived from the container's graceful stop duration. Probe period is
 // GracefulStop/6 so at least two probes fire within the grace window.
 // Initial delay is GracefulStop/3 to allow startup time.
-func livenessProbeSpec(agent ContainerAgent, gracefulStop time.Duration) ProbeSpec {
+func LivenessProbeSpec(agent ContainerAgent, gracefulStop time.Duration) ProbeSpec {
 	// Denominator 6: ensures ≥3 probe opportunities within grace period
 	// before the container would be force-killed.
 	period := gracefulStop / 6
@@ -104,10 +104,10 @@ func livenessProbeSpec(agent ContainerAgent, gracefulStop time.Duration) ProbeSp
 // probe period baseline. Matches guide.DefaultChannelBusConfig().CloseTimeout.
 const busCloseTimeout = 5 * time.Second
 
-// readinessProbeSpec builds a ProbeSpec for bus readiness checking.
+// ReadinessProbeSpec builds a ProbeSpec for bus readiness checking.
 // Period matches the bus close timeout (5s) since that is the maximum
 // time the bus waits for handlers to drain on shutdown.
-func readinessProbeSpec(agentID string, isReady func(string) bool) ProbeSpec {
+func ReadinessProbeSpec(agentID string, isReady func(string) bool) ProbeSpec {
 	return ProbeSpec{
 		Type:             ProbeReadiness,
 		Handler:          NewBusReadinessProbe(agentID, isReady),

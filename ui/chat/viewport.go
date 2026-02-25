@@ -62,6 +62,23 @@ func NewViewport(history *History, th *theme.Theme) *Viewport {
 	}
 }
 
+// Reset restores the viewport to its initial state after a history clear.
+// Preserves dimensions and theme but resets scroll, selection, and caches.
+func (vp *Viewport) Reset() {
+	vp.scrollOff = 0
+	vp.following = true
+	vp.layoutCompensation = 0
+	vp.highlightID = ""
+	vp.selectedIndex = -1
+	vp.selectedRegion = 0
+	vp.edgeFlash = 0
+	vp.bounceOffset = 0
+	vp.codeCache.Clear()
+	vp.hIdx = heightIndex{}
+	vp.streamState = nil
+	vp.streamEntryIndex = -1
+}
+
 // chatPadding is the horizontal padding (left + right) applied to chat content.
 // Derived from: 1 space on each side = 2 columns total.
 const chatPadding = 2
@@ -959,6 +976,13 @@ func (vp *Viewport) entryHeight(index int) int {
 	entry := vp.history.Get(index)
 	if entry == nil {
 		return 0
+	}
+	// For the active streaming entry, use the streaming render path
+	// to get an accurate height consistent with renderEntry().
+	if index == vp.streamEntryIndex && vp.streamState != nil {
+		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, vp.streamState)
+		vp.cacheRendered(index, rendered, regions)
+		return len(rendered)
 	}
 	if entry.Height >= 0 {
 		return entry.Height

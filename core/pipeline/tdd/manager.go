@@ -7,11 +7,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/google/uuid"
 )
 
 // PipelineManagerConfig configures the PipelineManager.
 type PipelineManagerConfig struct {
+	ActivityBus            *events.ActivityEventBus
 	MaxActivePipelines     int
 	DefaultMaxLoops        int
 	DefaultPhaseTimeout    time.Duration
@@ -68,6 +70,16 @@ func NewPipelineManager(cfg PipelineManagerConfig, factory *AgentFactory, onEven
 	}
 }
 
+// SetOnEvent replaces the event callback. It is safe to call before any
+// pipeline is started but must not race with concurrent Create/Start calls.
+// This allows deferred wiring when the callback target (e.g. a UI bridge)
+// is created after the manager.
+func (m *PipelineManager) SetOnEvent(fn func(PipelineEvent)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onEvent = fn
+}
+
 // Create builds a new Pipeline and TDDExecutor from config without starting it.
 func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (string, error) {
 	m.mu.Lock()
@@ -100,10 +112,13 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 		Status:            StatusPending,
 		MaxLoops:          maxLoops,
 		InspectorCriteria: cfg.InitialCriteria,
+		TaskPrompt:        cfg.TaskPrompt,
+		CoWorkerTypes:     cfg.CoWorkerTypes,
+		AgentPrompts:      cfg.AgentPrompts,
 		CreatedAt:         time.Now(),
 	}
 
-	insp, err := m.factory.CreateInspector()
+	insp, err := m.factory.CreateInspector(cfg.WorkerType)
 	if err != nil {
 		return "", fmt.Errorf("create inspector: %w", err)
 	}
@@ -119,6 +134,17 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 		return "", fmt.Errorf("create worker: %w", err)
 	}
 
+	var coWorkers []WorkerAgent
+	if len(cfg.CoWorkerTypes) > 0 {
+		coWorkers, err = m.factory.CreateCoWorkers(cfg.CoWorkerTypes)
+		if err != nil {
+			insp.Close()
+			tst.Close()
+			worker.Close()
+			return "", fmt.Errorf("create co-workers: %w", err)
+		}
+	}
+
 	bus := NewPipelineBus()
 	exec := NewTDDExecutor(TDDExecutorConfig{
 		Pipeline:     pipeline,
@@ -126,6 +152,8 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 		Inspector:    insp,
 		Tester:       tst,
 		Worker:       worker,
+		CoWorkers:    coWorkers,
+		ActivityBus:  m.config.ActivityBus,
 		PhaseTimeout: phaseTimeout,
 		MaxLoops:     maxLoops,
 		OnEvent:      m.onEvent,
@@ -197,6 +225,7 @@ func (m *PipelineManager) Cancel(_ context.Context, id string) error {
 
 	// Mark cancelled via executor's lock.
 	mp.executor.markCancelled()
+	mp.executor.CloseCoWorkers()
 	mp.bus.Close()
 	return nil
 }
@@ -285,6 +314,7 @@ func (m *PipelineManager) GetResult(id string) (*PipelineResult, error) {
 		WorkerOutput:      p.WorkerOutput,
 		InspectorResult:   p.InspectorResult,
 		TesterResult:      p.TesterResult,
+		CoWorkerOutputs:   p.CoWorkerOutputs,
 		Duration:          duration,
 		Error:             p.LastError,
 	}, nil
@@ -314,6 +344,7 @@ func (m *PipelineManager) CloseAll() {
 		}
 		_ = mp.executor.Stop()
 		mp.executor.markCancelled()
+		mp.executor.CloseCoWorkers()
 		mp.bus.Close()
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -15,7 +16,7 @@ import (
 // execute → append results → repeat, bounded by config.MaxToolRuns.
 // Follows the orchestrator tool_loop.go pattern exactly.
 func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Request) (string, error) {
-	seen := make(map[toolCallSignature]int, pt.config.MaxToolRuns)
+	seen := make(map[shared.ToolCallSignature]int, pt.config.MaxToolRuns)
 	consecutiveErrors := 0
 
 	for turn := 0; turn <= pt.config.MaxToolRuns; turn++ {
@@ -32,7 +33,7 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 			return "", fmt.Errorf("pipeline tester exceeded tool-call limit (%d)", pt.config.MaxToolRuns)
 		}
 
-		if dup, sig := detectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			return "", fmt.Errorf("pipeline tester repeated tool call: %s", sig.Name)
 		}
 
@@ -40,8 +41,8 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
-		consecutiveErrors = updateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
-		if consecutiveErrors >= 2 {
+		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
+		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
 			return "", fmt.Errorf("pipeline tester tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
@@ -65,13 +66,17 @@ func (pt *PipelineTester) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
-		result, err := pt.executeToolCall(ctx, call)
+		result, err := shared.TimedToolCall(ctx, "tester-pipeline", call, func() (string, error) {
+			return pt.executeToolCall(ctx, call)
+		})
+		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
 			} else {
-				result = toolErrorPayload(err)
+				result = shared.ToolErrorPayload(err)
+				isError = true
 				errCount++
 			}
 		}
@@ -80,6 +85,7 @@ func (pt *PipelineTester) applyToolCalls(
 			ToolCallID: call.ID,
 			ToolName:   call.Name,
 			Content:    result,
+			IsError:    isError,
 		})
 		if rerouted {
 			break
@@ -111,7 +117,7 @@ func (pt *PipelineTester) executeToolCall(_ context.Context, call providers.Tool
 		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
 	}
 
-	return marshalToolOutput(result.Data)
+	return shared.MarshalToolOutput(result.Data)
 }
 
 // buildToolDefinitions converts loaded skills to provider tool format.
@@ -129,7 +135,7 @@ func (pt *PipelineTester) buildToolDefinitions() []providers.Tool {
 			continue
 		}
 		description, _ := def["description"].(string)
-		parameters := coerceMap(def["input_schema"])
+		parameters := shared.CoerceMap(def["input_schema"])
 		if len(parameters) == 0 {
 			parameters = map[string]any{
 				"type":       "object",
@@ -145,85 +151,5 @@ func (pt *PipelineTester) buildToolDefinitions() []providers.Tool {
 	return tools
 }
 
-// --- Tool loop helpers (identical to orchestrator pattern) ---
-
-func marshalToolOutput(data any) (string, error) {
-	switch typed := data.(type) {
-	case string:
-		return typed, nil
-	case fmt.Stringer:
-		return typed.String(), nil
-	default:
-		payload, err := json.Marshal(data)
-		if err != nil {
-			return "", fmt.Errorf("marshal tool output: %w", err)
-		}
-		return string(payload), nil
-	}
-}
-
-func toolErrorPayload(err error) string {
-	if err == nil {
-		return ""
-	}
-	payload, marshalErr := json.Marshal(map[string]any{
-		"error": strings.TrimSpace(err.Error()),
-	})
-	if marshalErr != nil {
-		return `{"error":"tool execution failed"}`
-	}
-	return string(payload)
-}
-
-func coerceMap(value any) map[string]any {
-	if value == nil {
-		return nil
-	}
-	if mapped, ok := value.(map[string]any); ok {
-		return mapped
-	}
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return nil
-	}
-	var mapped map[string]any
-	if err := json.Unmarshal(payload, &mapped); err != nil {
-		return nil
-	}
-	return mapped
-}
-
-type toolCallSignature struct {
-	Name      string
-	Arguments string
-}
-
-func detectToolCallDuplicate(calls []providers.ToolCall, seen map[toolCallSignature]int) (bool, toolCallSignature) {
-	batch := make([]toolCallSignature, 0, len(calls))
-	for _, call := range calls {
-		sig := toolCallSignature{
-			Name:      strings.TrimSpace(call.Name),
-			Arguments: strings.TrimSpace(call.Arguments),
-		}
-		batch = append(batch, sig)
-	}
-
-	allDup := true
-	var firstDup toolCallSignature
-	for _, sig := range batch {
-		seen[sig]++
-		if seen[sig] <= 1 {
-			allDup = false
-		} else if firstDup.Name == "" {
-			firstDup = sig
-		}
-	}
-	return allDup, firstDup
-}
-
-func updateToolErrors(current, errCount, totalCalls int) int {
-	if totalCalls > 0 && errCount == totalCalls {
-		return current + 1
-	}
-	return 0
-}
+// Tool loop helpers (marshalToolOutput, toolErrorPayload, coerceMap,
+// detectToolCallDuplicate, updateToolErrors) are in agents/shared/toolloop.go.

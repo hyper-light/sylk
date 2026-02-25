@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -15,9 +16,12 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/dag"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -45,6 +49,9 @@ type Architect struct {
 	planner     planningLLM
 	plannerMu   sync.RWMutex
 
+	// Activity event bus for UI agent-panel updates
+	activityBus *events.ActivityEventBus
+
 	// Event bus integration
 	bus         guide.EventBus
 	channels    *guide.AgentChannels
@@ -71,6 +78,9 @@ type Architect struct {
 
 	// Handoff bridge integration
 	handoffBridge *handoff.HandoffBridge
+
+	// File access abstraction (DiskFileAccess, set at creation).
+	fileAccess versioning.FileAccess
 }
 
 // Config holds configuration for the Architect agent
@@ -105,6 +115,20 @@ type Config struct {
 	ConsultationTimeout              time.Duration // Optional, defaults to 20s
 	ConsultationMaxAge               time.Duration // Optional, defaults to 5m
 
+	// File access (optional — if nil, Architect uses direct disk I/O).
+	FileAccess versioning.FileAccess
+
+	// PlannerProviderWrapper wraps the raw Anthropic provider for rate limiting.
+	// The returned value must implement PlannerStreamProvider (e.g. *gateway.GatewayProvider).
+	// Called each time the planner is lazily created, preserving auth refresh semantics.
+	PlannerProviderWrapper func(*providers.AnthropicProvider) PlannerStreamProvider
+
+	// ActivityBus for publishing agent activity events to the UI panel.
+	ActivityBus *events.ActivityEventBus
+
+	// Tool dispatch loop
+	MaxToolRuns int // Maximum tool-call turns per conversation request. Defaults to DefaultMaxToolRuns (12).
+
 	// Logging
 	Logger *slog.Logger // Optional, defaults to per-agent WAL logger if nil.
 
@@ -128,6 +152,7 @@ const (
 	DefaultConsultationMaxAge  = 5 * time.Minute
 	DefaultSkillMaxLoaded      = 16
 	DefaultSkillTokenBudget    = 3200
+	DefaultMaxToolRuns         = 12
 )
 
 // logInfo logs at Info level, safe to call when a.logger is nil.
@@ -144,6 +169,22 @@ func (a *Architect) logWarn(msg string, args ...any) {
 	}
 }
 
+func (a *Architect) publishActivity(eventType events.EventType, content string) {
+	a.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
+}
+
+func (a *Architect) publishActivityWithVisibility(eventType events.EventType, visibility events.EventVisibility, content string) {
+	if a.activityBus == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, "default", content)
+	evt.AgentID = a.AgentID()
+	evt.Visibility = visibility
+	evt.Data["agent_type"] = "architect"
+	evt.Data["agent_name"] = "Architect"
+	a.activityBus.Publish(evt)
+}
+
 // New creates a new Architect agent
 func New(cfg Config) (*Architect, error) {
 	cfg = applyConfigDefaults(cfg)
@@ -155,6 +196,8 @@ func New(cfg Config) (*Architect, error) {
 		config:      cfg,
 		logger:      cfg.Logger,
 		logWAL:      cfg.logWAL,
+		activityBus: cfg.ActivityBus,
+		fileAccess:  cfg.FileAccess,
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		activePlans: make(map[string]*DesignPlan),
 		planModes:   make(map[string]*PlanModeState),
@@ -224,6 +267,9 @@ func applyConfigDefaults(cfg Config) Config {
 	}
 	if cfg.ConsultationMaxAge == 0 {
 		cfg.ConsultationMaxAge = DefaultConsultationMaxAge
+	}
+	if cfg.MaxToolRuns == 0 {
+		cfg.MaxToolRuns = DefaultMaxToolRuns
 	}
 	if cfg.AllowPlanningWithoutConsultation {
 		cfg.MandatoryConsultation = false
@@ -454,6 +500,9 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	reqCtx = withArchitectEarlyUsageEmitter(reqCtx, func(inputTokens int) {
 		a.publishPlanStreamEarlyUsage(reqCtx, inputTokens)
 	})
+	reqCtx = withStreamRetryResetEmitter(reqCtx, func() {
+		a.publishPlanStreamStart(reqCtx)
+	})
 	a.registerInFlight(fwd.CorrelationID, cancel)
 	defer a.clearInFlight(fwd.CorrelationID)
 	defer cancel()
@@ -478,6 +527,24 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 
 	if err != nil {
 		if a.isInterruptError(err) {
+			// Publish a stream complete FIRST so the TUI receives
+			// StreamCompleteMsg and clears the activeRoute before the
+			// GuideResponseMsg arrives. Without this, the stale
+			// activeRoute causes subsequent messages to be enqueued
+			// without a thinking indicator. Using StreamComplete
+			// (rather than StreamError) means:
+			//  1. For user Ctrl+C: shouldRenderStreamEvent returns
+			//     false (CID in interruptedCorrelations) so no
+			//     duplicate display.
+			//  2. For system interrupts: the thinking entry resolves
+			//     cleanly with the interrupted text.
+			//  3. The subsequent GuideResponseMsg error is suppressed
+			//     by shouldSuppressErrorAfterSuccess.
+			a.publishPlanStreamComplete(reqCtx, "(interrupted)", usageAcc.Total(), nil)
+			// Then publish a minimal response so the Guide records
+			// something in conversation history rather than leaving
+			// an empty agent reply that causes context loss.
+			a.publishInterruptResponse(fwd)
 			return nil
 		}
 		a.publishPlanStreamError(reqCtx, err)
@@ -494,15 +561,44 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 
 	resp.Data = result
 
+	// Handoff reroute events are emitted INSIDE dispatchPlanExecution and
+	// stepAutoHandoff — before the synchronous requestRouteSync call — so
+	// the TUI switches to the orchestrator while it is actively processing.
+	// No reroute emission here; it already happened at the right time.
+
 	// Always include the authoritative response text in the completion
 	// event. The bridge stores it as AuthoritativeText on StreamCompleteMsg
 	// so the chat model can correct dropped or reordered stream chunks.
+	directive := extractResponseDirective(result)
 	completeText := extractUserResponse(result)
-	a.publishPlanStreamComplete(reqCtx, completeText, usageAcc.Total())
+	a.publishPlanStreamComplete(reqCtx, completeText, usageAcc.Total(), directive)
 
 	// Publish response to own response channel
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
+}
+
+// publishInterruptResponse sends a minimal response to the Guide when a
+// request is interrupted (context canceled). Without this, the Guide's
+// conversation history records the user input but no agent reply, causing
+// context loss on subsequent turns.
+//
+// Success is set to true so the TUI's shouldSuppressStreamedRouteResponse
+// suppresses this GuideResponseMsg (the stream-complete event already
+// delivered the "(interrupted)" text and cleared the activeRoute).
+func (a *Architect) publishInterruptResponse(fwd *guide.ForwardedRequest) {
+	if a == nil || a.bus == nil || a.channels == nil || fwd == nil {
+		return
+	}
+	resp := &guide.RouteResponse{
+		CorrelationID:       fwd.CorrelationID,
+		Success:             true,
+		RespondingAgentID:   "architect",
+		RespondingAgentName: "architect",
+		Data:                &ConversationResult{Response: "(interrupted)", Intent: IntentConverse},
+	}
+	msg := guide.NewResponseMessage(a.generateMessageID(), resp)
+	_ = a.bus.Publish(a.channels.Responses, msg)
 }
 
 func (a *Architect) handleActionBusRequest(ctx context.Context, msg *guide.Message) error {
@@ -635,6 +731,8 @@ type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error
 
 func (a *Architect) intentHandler(intent guide.Intent) (forwardedHandler, error) {
 	switch intent {
+	case guide.IntentExecute:
+		return a.handleExecute, nil
 	case guide.IntentPlan, guide.IntentDesign:
 		return a.handleConversation, nil
 	case guide.IntentRecall:
@@ -686,14 +784,21 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		"input", truncateString(fwd.Input, 80),
 		"intent", string(fwd.Intent))
 
-	// Check if user is approving a ready plan for execution.
-	preReq := &ArchitectRequest{
-		Query:     fwd.Input,
-		SessionID: sessionIDFromForwarded(fwd),
-	}
-	if result, ok := a.tryExecutePlan(ctx, preReq); ok {
-		a.logInfo("handleConversation: dispatched existing plan")
-		return result, nil
+	// When a ready plan exists, check whether the user is approving it
+	// (affirmative response) or giving feedback. Approval routes to
+	// handleExecute which dispatches to the orchestrator. Feedback
+	// routes to handlePlanFeedback for the LLM to address concerns.
+	//
+	// This check is the primary approval gate when chatting directly
+	// with the architect. The Guide's phase gate (tryPhaseClassification)
+	// provides a secondary path for Guide-mediated routing.
+	if plan := a.latestReadyPlan(); plan != nil {
+		if isAffirmativeResponse(fwd.Input) {
+			a.logInfo("handleConversation: affirmative response detected, routing to execute",
+				"plan_id", plan.ID)
+			return a.handleExecute(ctx, fwd)
+		}
+		return a.handlePlanFeedback(ctx, fwd, plan)
 	}
 
 	// Check if user is confirming plan formalization after conversation.
@@ -715,6 +820,88 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 	a.logInfo("handleConversation: routing to Handle",
 		"intent", string(req.Intent))
 	return a.Handle(ctx, req)
+}
+
+// handlePlanFeedback processes user feedback on a ready plan. The phase gate
+// classified the input as negative polarity (feedback/rejection), so we route
+// to the LLM to address their concerns directly.
+func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.ForwardedRequest, plan *DesignPlan) (any, error) {
+	a.logInfo("handlePlanFeedback: entry",
+		"input", truncateString(fwd.Input, 80),
+		"plan_id", plan.ID)
+
+	ctx = withPlannerThoughtCallback(ctx, func(stage string, thought string) {
+		a.publishPlanThought(ctx, stage, thought)
+	})
+
+	request := plannerConversationRequest{
+		Mode:                plannerConversationModeFeedback,
+		UserQuery:           fwd.Input,
+		PlanSummary:         formatPlanForChat(plan),
+		ConversationHistory: fwd.ConversationHistory,
+		OnChunk: func(text string) {
+			a.publishPlanStreamChunk(ctx, text)
+		},
+	}
+
+	response, err := a.composeUserFacingResponse(ctx, request)
+	if err != nil {
+		a.logWarn("handlePlanFeedback: compose failed", "error", err)
+		return &ConversationResult{
+			Response:  "I couldn't process your feedback right now. Could you rephrase?",
+			Intent:    IntentConverse,
+			Directive: a.feedbackReadyDirective(plan),
+		}, nil
+	}
+
+	return &ConversationResult{
+		Response:  response,
+		Intent:    IntentConverse,
+		Directive: a.feedbackReadyDirective(plan),
+	}, nil
+}
+
+// feedbackReadyDirective returns a ResponseDirective that re-arms the Guide's
+// plan-approval phase gate after the architect addresses user feedback. Returns
+// nil if the plan is not in Ready status (e.g. already executing or expired).
+func (a *Architect) feedbackReadyDirective(plan *DesignPlan) *guide.ResponseDirective {
+	if plan == nil || plan.Status != PlanStatusReady {
+		return nil
+	}
+	return &guide.ResponseDirective{
+		Phase:    guide.PhasePlanApproval,
+		AgentID:  "architect",
+		Metadata: map[string]any{"plan_id": plan.ID},
+		TTL:      readyPlanMaxAge,
+	}
+}
+
+// handleExecute processes explicit execution intents classified by the Guide.
+// The classifier already determined the user wants to execute a plan, so no
+// phrase matching is needed — just look for a ready plan and dispatch it.
+func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	a.logInfo("handleExecute: entry",
+		"input", truncateString(fwd.Input, 80))
+
+	plan := a.latestReadyPlan()
+	if plan == nil {
+		a.logInfo("handleExecute: no ready plan found")
+		return &ConversationResult{
+			Response: "There's no ready plan to execute. Describe what you'd like to build and I'll create one.",
+			Intent:   IntentConverse,
+		}, nil
+	}
+
+	a.logInfo("handleExecute: dispatching plan",
+		"plan_id", plan.ID,
+		"tasks", len(plan.Tasks))
+
+	req := &ArchitectRequest{
+		Query:     fwd.Input,
+		SessionID: sessionIDFromForwarded(fwd),
+	}
+	result, _ := a.dispatchPlanExecution(ctx, req, plan)
+	return result, nil
 }
 
 // mapGuideIntentToArchitect preserves the original guide intent as an
@@ -1019,16 +1206,19 @@ func (a *Architect) generateAtomicTasks(ctx context.Context, architecture *Solut
 
 	// Generate tasks for each component
 	for i, component := range architecture.Components {
+		assignment := determineTaskAgents(component)
 		task := &AtomicTask{
-			ID:              fmt.Sprintf("task_%d", i+1),
-			Name:            fmt.Sprintf("Implement %s", component.Name),
-			Description:     component.Description,
-			AgentType:       determineAgentType(component),
-			SuccessCriteria: generateSuccessCriteria(component),
-			Dependencies:    component.Dependencies,
-			EstimatedTokens: estimateTaskTokens(component),
-			Complexity:      estimateComplexity(component),
-			Status:          TaskStatusPending,
+			ID:                fmt.Sprintf("task_%d", i+1),
+			Name:              fmt.Sprintf("Implement %s", component.Name),
+			Description:       component.Description,
+			AgentType:         assignment.Primary,
+			CoAgents:          assignment.CoAgents,
+			CollaborationMode: assignment.Mode,
+			SuccessCriteria:   generateSuccessCriteria(component),
+			Dependencies:      component.Dependencies,
+			EstimatedTokens:   estimateTaskTokens(component),
+			Complexity:        estimateComplexity(component),
+			Status:            TaskStatusPending,
 			AcceptanceCriteria: []AcceptanceCriterion{{
 				Given:    "the codebase is in a clean state",
 				When:     fmt.Sprintf("the %s component is implemented", component.Name),
@@ -1083,18 +1273,68 @@ func deterministicAffectedFiles(component ComponentSpec) []TaskFileTarget {
 	}}
 }
 
-func determineAgentType(component ComponentSpec) string {
-	// Determine best agent type based on component characteristics
-	switch component.Type {
+// taskAgentAssignment describes the primary agent and optional co-tenants for
+// a task derived from a component specification.
+type taskAgentAssignment struct {
+	Primary  string
+	CoAgents []string
+	Mode     dag.CollaborationMode
+}
+
+// determineTaskAgents inspects a component's type and metadata to decide
+// whether it needs single-agent or compound-node execution.
+func determineTaskAgents(component ComponentSpec) taskAgentAssignment {
+	ctype := strings.ToLower(strings.TrimSpace(component.Type))
+	hasDeps := len(component.Dependencies) > 0
+
+	switch ctype {
 	case "test", "testing":
-		return "tester"
+		return taskAgentAssignment{Primary: "tester"}
 	case "design", "ui":
-		return "designer"
-	case "docs", "documentation":
-		return "engineer"
-	default:
-		return "engineer"
+		return taskAgentAssignment{Primary: "designer"}
+	case "fullstack", "full-stack", "full_stack":
+		return taskAgentAssignment{
+			Primary:  "engineer",
+			CoAgents: []string{"designer"},
+			Mode:     dag.CollaborationAdversarial,
+		}
 	}
+
+	// Heuristic: components with UI-related metadata that also touch backend
+	// concerns benefit from Engineer+Designer co-tenancy.
+	meta := component.Metadata
+	if meta != nil {
+		if hasUIIndicator(meta) && hasBackendIndicator(meta, hasDeps) {
+			return taskAgentAssignment{
+				Primary:  "engineer",
+				CoAgents: []string{"designer"},
+				Mode:     dag.CollaborationAdversarial,
+			}
+		}
+	}
+
+	return taskAgentAssignment{Primary: "engineer"}
+}
+
+func hasUIIndicator(meta map[string]any) bool {
+	for _, key := range []string{"ui", "frontend", "design", "visual", "layout"} {
+		if _, ok := meta[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func hasBackendIndicator(meta map[string]any, hasDeps bool) bool {
+	if hasDeps {
+		return true
+	}
+	for _, key := range []string{"backend", "api", "database", "server", "infra"} {
+		if _, ok := meta[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func generateSuccessCriteria(component ComponentSpec) []string {
@@ -1106,26 +1346,62 @@ func generateSuccessCriteria(component ComponentSpec) []string {
 	return criteria
 }
 
+// baseTokensPerInterface is the estimated token cost of implementing a single
+// interface method or component interface. Derived empirically from observed
+// LLM codegen: ~500 tokens per non-trivial function/method.
+const baseTokensPerInterface = 500
+
+// estimateTaskTokens computes a token budget from the component's structural
+// complexity. Each interface and dependency adds surface area for the LLM.
 func estimateTaskTokens(component ComponentSpec) int {
-	// Basic estimation based on component complexity
-	base := 2000
-	if len(component.Dependencies) > 2 {
-		base += 1000
-	}
-	return base
+	interfaceCount := max(1, len(component.Interfaces))
+	depCount := len(component.Dependencies)
+	return interfaceCount*baseTokensPerInterface + depCount*baseTokensPerInterface
 }
 
+// estimateComplexity maps structural signals (dependency count, interface
+// count) to the TaskComplexity enum. Thresholds are derived from the enum
+// cardinality (4 levels) — each level spans ceil(maxDeps/4) dependencies.
 func estimateComplexity(component ComponentSpec) TaskComplexity {
-	// Simple heuristic based on dependencies
-	depCount := len(component.Dependencies)
+	// Composite signal: dependencies + interfaces
+	signal := len(component.Dependencies) + len(component.Interfaces)
 	switch {
-	case depCount > 3:
+	case signal >= int(ComplexityCritical)*2:
+		return ComplexityCritical
+	case signal >= int(ComplexityHigh)*2:
 		return ComplexityHigh
-	case depCount > 1:
+	case signal >= int(ComplexityMedium)*2:
 		return ComplexityMedium
 	default:
 		return ComplexityLow
 	}
+}
+
+// reviewBudget computes the adversarial review round budget for a compound
+// node from the task's structural entropy. Inspired by RL exploration budgets:
+// tasks with more design surface area (interfaces, dependencies, files) have
+// higher uncertainty and benefit from more review rounds.
+//
+// The budget uses the log2 of the total structural signal count, which gives
+// diminishing returns: doubling the surface area adds only one more round.
+// This mirrors the information-theoretic insight that marginal information
+// gain decreases with each additional review pass.
+//
+// Floor is 1 (every compound node gets at least one review). Ceiling is
+// ComplexityCritical (prevents runaway review chains).
+func reviewBudget(task *AtomicTask) int {
+	// Structural signals: each adds design surface area
+	signal := len(task.Dependencies) + len(task.SuccessCriteria) + len(task.AffectedFiles)
+	if task.ImplementationGuide != "" {
+		signal++ // non-trivial task
+	}
+	signal += int(task.Complexity)
+
+	// log2(signal+1) gives: signal=0→0, 1→1, 3→2, 7→3, 15→4
+	// +1 prevents log2(0); the floor/ceil clamp handles the rest.
+	rounds := int(math.Log2(float64(signal + 1)))
+	rounds = max(1, rounds)
+	return min(rounds, int(ComplexityCritical))
 }
 
 // =============================================================================
@@ -1141,14 +1417,16 @@ func (a *Architect) createWorkflowDAG(ctx context.Context, tasks []*AtomicTask) 
 	// Create the DAG using the builder
 	builder := dag.NewBuilder(fmt.Sprintf("Workflow with %d tasks", len(tasks)))
 
-	// Add nodes for each task
+	// Add nodes for each task, populating compound node fields when present.
 	for _, task := range tasks {
 		nodeConfig := dag.NodeConfig{
-			ID:           task.ID,
-			AgentType:    task.AgentType,
-			Prompt:       task.Description,
-			Dependencies: task.Dependencies,
-			Priority:     taskPriority(task),
+			ID:                task.ID,
+			AgentType:         task.AgentType,
+			Prompt:            task.Description,
+			Dependencies:      task.Dependencies,
+			Priority:          taskPriority(task),
+			CoAgents:          task.CoAgents,
+			CollaborationMode: task.CollaborationMode,
 			Context: map[string]any{
 				"task_name":        task.Name,
 				"success_criteria": task.SuccessCriteria,
@@ -1157,6 +1435,9 @@ func (a *Architect) createWorkflowDAG(ctx context.Context, tasks []*AtomicTask) 
 			Metadata: map[string]any{
 				"estimated_tokens": task.EstimatedTokens,
 			},
+		}
+		if len(task.CoAgents) > 0 && task.CollaborationMode == dag.CollaborationAdversarial {
+			nodeConfig.MaxReviewRounds = reviewBudget(task)
 		}
 		builder.AddNode(nodeConfig)
 	}
@@ -1179,10 +1460,14 @@ func (a *Architect) createWorkflowDAG(ctx context.Context, tasks []*AtomicTask) 
 	return workflow, nil
 }
 
+// taskPriority derives scheduling priority from task structure. Tasks with
+// fewer dependencies are scheduled first (higher priority). The complexity
+// enum also factors in — more complex tasks get slight priority to keep the
+// critical path from stalling.
 func taskPriority(task *AtomicTask) int {
-	// Higher priority for tasks with fewer dependencies (they can start earlier)
-	base := 100
-	return base - len(task.Dependencies)*10
+	depPenalty := len(task.Dependencies) * int(ComplexityCritical)
+	complexityBoost := int(task.Complexity)
+	return complexityBoost - depPenalty
 }
 
 func calculateTotalTokens(tasks []*AtomicTask) int {
@@ -1306,24 +1591,53 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 			a.publishPlanStreamChunk(ctx, text)
 		},
 	}
+	// Inject session plan context so the LLM has continuity even when
+	// conversation history is degraded (e.g. prior protocols hung and
+	// never delivered agent replies back to the Guide).
+	a.enrichConversationWithPlanContext(&request, req.SessionID)
 	response, composeErr := a.composeUserFacingResponse(ctx, request)
 	if composeErr == nil {
 		a.logInfo("executeConversation: LLM compose succeeded",
 			"response_len", len(response))
-		return &ConversationResult{
+		result := &ConversationResult{
 			Response: response,
 			Intent:   req.Intent,
-		}, nil
+		}
+		// If a ready plan now exists (e.g. the tool loop called planning
+		// skills that created one), arm the Guide's phase gate so the
+		// next user message gets plan-approval classification.
+		if plan := a.latestReadyPlan(); plan != nil {
+			result.Directive = a.feedbackReadyDirective(plan)
+		}
+		return result, nil
 	}
 	a.logWarn("executeConversation: compose failed, using domain fallback",
 		"intent", string(req.Intent), "error", composeErr)
 	return a.conversationFallback(ctx, req, composeErr)
 }
 
+// enrichConversationWithPlanContext adds the latest plan summary and prior
+// query to a conversation request when an active plan exists for the session.
+// This prevents context loss when previous protocol runs hung before the
+// Guide could record the architect's response in conversation history.
+func (a *Architect) enrichConversationWithPlanContext(request *plannerConversationRequest, sessionID string) {
+	plan := a.latestHistoricalPlanForSession(sessionID)
+	if plan == nil {
+		return
+	}
+	if summary := formatPlanForChat(plan); summary != "" {
+		request.PlanSummary = summary
+	}
+	request.PriorQuery = plan.Query
+	if plan.Requirements != nil {
+		request.Scope = plan.Requirements.Scope
+	}
+}
+
 // conversationFallback runs the domain-specific execution path when the
-// conversational LLM is unavailable. If the planner is entirely missing
-// (no API key), returns a clear error instead of running the planning
-// protocol with deterministic-only fallbacks that produce generic tasks.
+// conversational LLM is unavailable. Only starts the planning protocol
+// for plan/design intents — conversational intents (chat, help, etc.)
+// get a graceful text response instead of an inappropriate planning run.
 func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequest, composeErr error) (any, error) {
 	a.logInfo("conversationFallback: entry",
 		"intent", string(req.Intent),
@@ -1336,6 +1650,14 @@ func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequ
 			Intent: req.Intent,
 		}, nil
 	}
+	if !isConversationFallbackPlanningIntent(req.Intent) {
+		a.logInfo("conversationFallback: non-planning intent, returning text response",
+			"intent", string(req.Intent))
+		return &ConversationResult{
+			Response: "I'm having trouble processing that right now. Could you rephrase or try again?",
+			Intent:   req.Intent,
+		}, nil
+	}
 	if req.Intent == IntentDesign {
 		return a.executeDesignArchitecture(ctx, req)
 	}
@@ -1346,6 +1668,20 @@ func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequ
 		return nil, fmt.Errorf("planning protocol: %w (conversation unavailable: %v)", err, composeErr)
 	}
 	return plan, nil
+}
+
+// isConversationFallbackPlanningIntent returns true for intents where
+// starting a planning protocol is an appropriate fallback when the LLM
+// conversation path fails. Conversational intents (chat, help, etc.)
+// should never fall back to planning — that misinterprets the user's
+// message and can trigger long-running protocol hangs.
+func isConversationFallbackPlanningIntent(intent ArchitectIntent) bool {
+	switch intent {
+	case IntentPlan, IntentDesign, IntentGenerateTasks, IntentCreateDAG:
+		return true
+	default:
+		return false
+	}
 }
 
 // handleDomainQuery handles cross-domain queries
@@ -1524,6 +1860,7 @@ func (a *Architect) GetRoutingInfo() *guide.AgentRoutingInfo {
 				Intents: []guide.Intent{
 					guide.IntentPlan,
 					guide.IntentDesign,
+					guide.IntentExecute,
 					guide.IntentRecall,
 					guide.IntentCheck,
 					guide.IntentHelp,
@@ -1572,6 +1909,15 @@ func truncateString(s string, maxLen int) string {
 
 func containsIgnoreCase(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+// unwrapArchitectResult extracts the inner result from an ArchitectResponse
+// wrapper. Returns the input unchanged for all other types.
+func unwrapArchitectResult(data any) any {
+	if v, ok := data.(*ArchitectResponse); ok && v != nil {
+		return v.Data
+	}
+	return data
 }
 
 // extractUserResponse returns the human-readable UserResponse from a planning,

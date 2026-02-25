@@ -514,6 +514,7 @@ func (l *Librarian) handleToolingRequest(ctx context.Context, req *LibrarianRequ
 func (l *Librarian) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      "librarian",
+		Type:    "librarian",
 		Name:    "librarian",
 		Aliases: []string{"lib", "search", "find"},
 

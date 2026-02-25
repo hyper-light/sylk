@@ -24,7 +24,7 @@ var guideResponseSystemPrompt = buildGuideResponseSystemPrompt()
 
 // GeminiGuideResponder provides model-backed responses for guide-targeted prompts.
 type GeminiGuideResponder struct {
-	provider *providers.GoogleProvider
+	provider geminiLLMProvider
 	model    string
 	timeout  time.Duration
 
@@ -44,7 +44,7 @@ type guideThoughtEmitterKey struct{}
 type guideEarlyUsageEmitterKey struct{}
 
 // NewGeminiGuideResponder creates a Gemini-backed self-responder for Guide.
-func NewGeminiGuideResponder(provider *providers.GoogleProvider, cfg RouterConfig) GuideSelfResponder {
+func NewGeminiGuideResponder(provider geminiLLMProvider, cfg RouterConfig) GuideSelfResponder {
 	return &GeminiGuideResponder{
 		provider:            provider,
 		model:               resolveGuideResponseModel(cfg.Model),
@@ -58,7 +58,7 @@ func NewGeminiGuideResponder(provider *providers.GoogleProvider, cfg RouterConfi
 
 // NewGeminiGuideResponderWithTools enables true model-driven guide skill invocation.
 func NewGeminiGuideResponderWithTools(
-	provider *providers.GoogleProvider,
+	provider geminiLLMProvider,
 	cfg RouterConfig,
 	toolDefs func(input string) []providers.Tool,
 	toolInvoker func(ctx context.Context, name string, arguments string) (string, error),
@@ -246,12 +246,14 @@ func (r *GeminiGuideResponder) applyToolCallsTracked(
 	rerouted := false
 	for _, call := range resp.ToolCalls {
 		result, err := executeGuideToolCall(ctx, call, r.toolInvoker)
+		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
 			} else {
 				result = guideToolErrorPayload(err)
+				isError = true
 				errCount++
 			}
 		}
@@ -260,6 +262,7 @@ func (r *GeminiGuideResponder) applyToolCallsTracked(
 			ToolCallID: call.ID,
 			ToolName:   call.Name,
 			Content:    result,
+			IsError:    isError,
 		})
 	}
 	return errCount, rerouted

@@ -26,7 +26,7 @@ func DefaultDAGBridgeConfig() DAGBridgeConfig {
 	return DAGBridgeConfig{
 		MaxConcurrentDAGs:    4,
 		DefaultNodeTimeout:   5 * time.Minute,
-		DefaultRetries:       1,
+		DefaultRetries:       3,
 		MaxConcurrencyPerDAG: 8,
 	}
 }
@@ -38,6 +38,7 @@ type DAGBridgeDeps struct {
 	Buffers     *BufferRegistry
 	Scope       *concurrency.GoroutineScope
 	ActivityBus *events.ActivityEventBus
+	Activator   guide.AgentActivator // optional on-demand agent activator
 	SessionID   string
 	AgentID     string
 }
@@ -62,12 +63,14 @@ type DAGBridge struct {
 	buffers   *BufferRegistry
 	scope     *concurrency.GoroutineScope
 	config    DAGBridgeConfig
+	activator guide.AgentActivator
 	sessionID string
 	agentID   string
 
 	activityBus *events.ActivityEventBus
 	activeDAGs  map[string]*ActiveDAGMeta
-	unsubs      []func() // scheduler event unsubscribe functions
+	gates       map[string]*dag.DecisionGate // per-DAG decision gates
+	unsubs      []func()                     // scheduler event unsubscribe functions
 }
 
 // NewDAGBridge creates a bridge between the DAG scheduler and orchestrator subsystems.
@@ -75,7 +78,7 @@ func NewDAGBridge(cfg DAGBridgeConfig, deps DAGBridgeDeps) *DAGBridge {
 	schedulerCfg := dag.SchedulerConfig{
 		MaxConcurrentDAGs: cfg.MaxConcurrentDAGs,
 		DefaultPolicy: dag.ExecutionPolicy{
-			FailurePolicy:  dag.FailurePolicyFailFast,
+			FailurePolicy:  dag.FailurePolicyContinue,
 			MaxConcurrency: cfg.MaxConcurrencyPerDAG,
 			DefaultTimeout: cfg.DefaultNodeTimeout,
 			DefaultRetries: cfg.DefaultRetries,
@@ -84,18 +87,23 @@ func NewDAGBridge(cfg DAGBridgeConfig, deps DAGBridgeDeps) *DAGBridge {
 		Scope: deps.Scope,
 	}
 
-	return &DAGBridge{
+	b := &DAGBridge{
 		scheduler:   dag.NewScheduler(schedulerCfg, deps.Scope),
 		store:       deps.Store,
 		journal:     deps.Journal,
 		buffers:     deps.Buffers,
 		scope:       deps.Scope,
 		config:      cfg,
+		activator:   deps.Activator,
 		sessionID:   deps.SessionID,
 		agentID:     deps.AgentID,
 		activityBus: deps.ActivityBus,
 		activeDAGs:  make(map[string]*ActiveDAGMeta),
+		gates:       make(map[string]*dag.DecisionGate),
 	}
+
+	b.scheduler.SetDefaultLayerGate(b.compositeGate())
+	return b
 }
 
 // SetBus sets the event bus after construction (wired during Start).
@@ -103,6 +111,13 @@ func (b *DAGBridge) SetBus(bus guide.EventBus) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.bus = bus
+}
+
+// SetActivator sets the on-demand agent activator after construction.
+func (b *DAGBridge) SetActivator(a guide.AgentActivator) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.activator = a
 }
 
 // Execute builds/receives a DAG from a plan, journals, persists, and submits to the scheduler.
@@ -132,7 +147,13 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	}
 
 	// 3. Create BusNodeDispatcher
-	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers)
+	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, b.activator)
+
+	// 3b. Create decision gate for this DAG
+	gate := dag.NewDecisionGate(d, b.onNonBlockingFailure, b.onBlockingDecisionRequired)
+	b.mu.Lock()
+	b.gates[d.ID()] = gate
+	b.mu.Unlock()
 
 	// 4. Track active DAG
 	dagCtx, dagCancel := context.WithCancel(ctx)
@@ -365,6 +386,7 @@ func (b *DAGBridge) onDAGFailed(dagID, planID, errMsg string) {
 func (b *DAGBridge) cleanupDAG(dagID string) {
 	b.mu.Lock()
 	delete(b.activeDAGs, dagID)
+	delete(b.gates, dagID)
 	b.mu.Unlock()
 }
 
@@ -455,4 +477,70 @@ func countNodeState(states map[string]dag.NodeState, target dag.NodeState) int {
 		}
 	}
 	return count
+}
+
+// compositeGate returns a LayerGate that delegates to per-DAG decision gates.
+func (b *DAGBridge) compositeGate() dag.LayerGate {
+	return func(ctx context.Context, dagID string, layerIdx int, nodeResults map[string]*dag.NodeResult) error {
+		b.mu.RLock()
+		gate, ok := b.gates[dagID]
+		b.mu.RUnlock()
+
+		if !ok {
+			return nil
+		}
+		return gate.Gate()(ctx, dagID, layerIdx, nodeResults)
+	}
+}
+
+// onNonBlockingFailure publishes per-failure activity notifications.
+func (b *DAGBridge) onNonBlockingFailure(dagID string, failures []dag.FailedNodeSummary) {
+	for _, f := range failures {
+		name := f.NodeName
+		if name == "" {
+			name = f.NodeID
+		}
+		b.publishActivity(events.EventTypeAgentAction,
+			fmt.Sprintf("%s failed! Non-blocking and continuing.", name))
+	}
+}
+
+// onBlockingDecisionRequired publishes a bus message requesting a user decision.
+func (b *DAGBridge) onBlockingDecisionRequired(req dag.LayerDecisionRequest) {
+	b.mu.RLock()
+	bus := b.bus
+	b.mu.RUnlock()
+
+	if bus == nil {
+		return
+	}
+
+	msg := &guide.Message{
+		ID:            generateMessageID(),
+		Type:          guide.MessageTypeLayerDecision,
+		SourceAgentID: b.agentID,
+		Payload: map[string]any{
+			"dag_id":       req.DAGID,
+			"layer_idx":    req.LayerIdx,
+			"failed_nodes": req.FailedNodes,
+			"class":        "blocking",
+		},
+		Timestamp: time.Now(),
+	}
+	bus.Publish("dag.decision", msg)
+
+	b.publishActivity(events.EventTypeAgentError,
+		fmt.Sprintf("DAG %s layer %d has blocking failures — awaiting decision", req.DAGID, req.LayerIdx))
+}
+
+// ResolveDecision delivers a user decision to the waiting gate for a DAG.
+func (b *DAGBridge) ResolveDecision(dagID string, decision dag.DecisionKind) {
+	b.mu.RLock()
+	gate, ok := b.gates[dagID]
+	b.mu.RUnlock()
+
+	if !ok {
+		return
+	}
+	gate.ResolveDecision(dagID, decision)
 }

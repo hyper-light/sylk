@@ -15,15 +15,18 @@ type Node struct {
 	mu sync.RWMutex
 
 	// Configuration
-	id           string
-	agentType    string
-	prompt       string
-	context      map[string]any
-	dependencies []string
-	timeout      time.Duration
-	retries      int
-	priority     int
-	metadata     map[string]any
+	id                string
+	agentType         string
+	prompt            string
+	context           map[string]any
+	dependencies      []string
+	timeout           time.Duration
+	retries           int
+	priority          int
+	metadata          map[string]any
+	coAgents          []string
+	collaborationMode CollaborationMode
+	maxReviewRounds   int
 
 	// Runtime state
 	state      NodeState
@@ -53,18 +56,26 @@ func NewNode(cfg NodeConfig) *Node {
 		deps = []string{}
 	}
 
+	coAgents := cfg.CoAgents
+	if coAgents == nil {
+		coAgents = []string{}
+	}
+
 	return &Node{
-		id:           cfg.ID,
-		agentType:    cfg.AgentType,
-		prompt:       cfg.Prompt,
-		context:      ctx,
-		dependencies: deps,
-		timeout:      cfg.Timeout,
-		retries:      cfg.Retries,
-		priority:     cfg.Priority,
-		metadata:     meta,
-		state:        NodeStatePending,
-		dependents:   []string{},
+		id:                cfg.ID,
+		agentType:         cfg.AgentType,
+		prompt:            cfg.Prompt,
+		context:           ctx,
+		dependencies:      deps,
+		timeout:           cfg.Timeout,
+		retries:           cfg.Retries,
+		priority:          cfg.Priority,
+		metadata:          meta,
+		coAgents:          coAgents,
+		collaborationMode: cfg.CollaborationMode,
+		maxReviewRounds:   cfg.MaxReviewRounds,
+		state:             NodeStatePending,
+		dependents:        []string{},
 	}
 }
 
@@ -159,6 +170,31 @@ func (n *Node) Metadata() map[string]any {
 	return result
 }
 
+// CoAgents returns a copy of the co-agent types for compound nodes.
+func (n *Node) CoAgents() []string {
+	if len(n.coAgents) == 0 {
+		return nil
+	}
+	result := make([]string, len(n.coAgents))
+	copy(result, n.coAgents)
+	return result
+}
+
+// CollaborationMode returns the collaboration mode for compound nodes.
+func (n *Node) CollaborationMode() CollaborationMode {
+	return n.collaborationMode
+}
+
+// MaxReviewRounds returns the maximum adversarial review rounds.
+func (n *Node) MaxReviewRounds() int {
+	return n.maxReviewRounds
+}
+
+// IsCompound returns true if this node has co-tenant agents.
+func (n *Node) IsCompound() bool {
+	return len(n.coAgents) > 0
+}
+
 // =============================================================================
 // State Management
 // =============================================================================
@@ -221,6 +257,13 @@ func (n *Node) IncrementRetryCount() int {
 	defer n.mu.Unlock()
 	n.retryCount++
 	return n.retryCount
+}
+
+// ResetRetryCount resets the retry count to zero for layer replay
+func (n *Node) ResetRetryCount() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.retryCount = 0
 }
 
 // =============================================================================
@@ -318,21 +361,24 @@ func (n *Node) Clone() *Node {
 	defer n.mu.RUnlock()
 
 	return &Node{
-		id:           n.id,
-		agentType:    n.agentType,
-		prompt:       n.prompt,
-		context:      n.context,
-		dependencies: n.dependencies,
-		timeout:      n.timeout,
-		retries:      n.retries,
-		priority:     n.priority,
-		metadata:     n.metadata,
-		state:        n.state,
-		result:       n.result,
-		startTime:    n.startTime,
-		retryCount:   n.retryCount,
-		dependents:   n.dependents,
-		layer:        n.layer,
+		id:                n.id,
+		agentType:         n.agentType,
+		prompt:            n.prompt,
+		context:           n.context,
+		dependencies:      n.dependencies,
+		timeout:           n.timeout,
+		retries:           n.retries,
+		priority:          n.priority,
+		metadata:          n.metadata,
+		coAgents:          n.coAgents,
+		collaborationMode: n.collaborationMode,
+		maxReviewRounds:   n.maxReviewRounds,
+		state:             n.state,
+		result:            n.result,
+		startTime:         n.startTime,
+		retryCount:        n.retryCount,
+		dependents:        n.dependents,
+		layer:             n.layer,
 	}
 }
 
@@ -342,14 +388,17 @@ func (n *Node) ToConfig() NodeConfig {
 	defer n.mu.RUnlock()
 
 	return NodeConfig{
-		ID:           n.id,
-		AgentType:    n.agentType,
-		Prompt:       n.prompt,
-		Context:      n.context,
-		Dependencies: n.dependencies,
-		Timeout:      n.timeout,
-		Retries:      n.retries,
-		Priority:     n.priority,
-		Metadata:     n.metadata,
+		ID:                n.id,
+		AgentType:         n.agentType,
+		Prompt:            n.prompt,
+		Context:           n.context,
+		Dependencies:      n.dependencies,
+		Timeout:           n.timeout,
+		Retries:           n.retries,
+		Priority:          n.priority,
+		Metadata:          n.metadata,
+		CoAgents:          n.coAgents,
+		CollaborationMode: n.collaborationMode,
+		MaxReviewRounds:   n.maxReviewRounds,
 	}
 }

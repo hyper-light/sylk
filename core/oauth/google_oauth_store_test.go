@@ -93,7 +93,7 @@ func TestEncryptedFileGoogleOAuthStoreLoadsLegacyPlaintext(t *testing.T) {
 	}
 }
 
-func TestFallbackGoogleOAuthStoreSavePrefersPrimary(t *testing.T) {
+func TestFallbackGoogleOAuthStoreSaveWritesBothStores(t *testing.T) {
 	t.Helper()
 
 	primary := &recordingGoogleOAuthStore{}
@@ -106,8 +106,8 @@ func TestFallbackGoogleOAuthStoreSavePrefersPrimary(t *testing.T) {
 	if primary.saveCalls != 1 {
 		t.Fatalf("primary save calls = %d, want 1", primary.saveCalls)
 	}
-	if secondary.saveCalls != 0 {
-		t.Fatalf("secondary save calls = %d, want 0", secondary.saveCalls)
+	if secondary.saveCalls != 1 {
+		t.Fatalf("secondary save calls = %d, want 1", secondary.saveCalls)
 	}
 }
 

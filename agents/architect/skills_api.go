@@ -21,9 +21,10 @@ func architectCoreSkillNames() []string {
 		"create_workflow_dag",
 		"pre_delegation_declare",
 		"validate_pre_delegation",
-		"handoff_to_orchestrator",
 		"monitor_execution",
 		"revise_plan",
+		"route_plan_acceptance",
+		"handle_plan_acceptance_result",
 		"ask_user_question",
 	}
 }
@@ -48,9 +49,10 @@ func architectAllSkillNames() []string {
 		"estimate_complexity",
 		"pre_delegation_declare",
 		"validate_pre_delegation",
-		"handoff_to_orchestrator",
 		"monitor_execution",
 		"revise_plan",
+		"route_plan_acceptance",
+		"handle_plan_acceptance_result",
 		"enter_plan_mode",
 		"update_plan_file",
 		"todo_write",
@@ -261,6 +263,20 @@ func (a *Architect) ensureSkillLoaded(name string) {
 		return
 	}
 	_ = a.skills.Load(name)
+}
+
+// ensureToolLoopSkillsLoaded loads all allowed architect skills so they are
+// available as tool definitions for the LLM tool-call loop. This bypasses the
+// progressive loader's token budget (MaxLoadedSkills=16, TokenBudget=3200)
+// which is too restrictive for tool-calling — the LLM needs the full set of
+// tools in order to choose the right one. Called before buildToolDefinitions().
+func (a *Architect) ensureToolLoopSkillsLoaded() {
+	if a.skills == nil {
+		return
+	}
+	for _, name := range architectAllSkillNames() {
+		a.skills.Load(name)
+	}
 }
 
 func (a *Architect) prepareSkillsForRequest(req *ArchitectRequest) {

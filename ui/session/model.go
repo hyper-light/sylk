@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"slices"
+	"time"
 
 	coresession "github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui/component"
@@ -43,6 +44,18 @@ type Model struct {
 	width        int
 	height       int
 	focused      bool
+
+	// Dot animation for active session when agents are working.
+	dotFrame       int
+	hasActiveAgent bool
+	shimmerStart   time.Time
+	dotGradient    *theme.Gradient
+
+	// Border gradients for tree connectors and section footer.
+	// Selected at render time: active when focused + agents working, idle
+	// when focused without activity, nil when unfocused (static fallback).
+	idleGroupGradient   *theme.Gradient // Subdued: green → jade → blue → white.
+	activeGroupGradient *theme.Gradient // Full prismatic spectrum.
 }
 
 // Verify interface compliance at compile time.
@@ -54,10 +67,15 @@ var (
 
 // New creates a session panel Model with the given manager and theme.
 func New(mgr *coresession.Manager, th *theme.Theme) *Model {
+	idleGroup := th.Palette.IdleGroupGradient()
 	m := &Model{
-		manager:   mgr,
-		summaries: make([]SessionSummary, 0, maxSummaries),
-		theme:     th,
+		manager:             mgr,
+		summaries:           make([]SessionSummary, 0, maxSummaries),
+		theme:               th,
+		shimmerStart:        time.Now(),
+		dotGradient:         th.Palette.RippleGradient(),
+		idleGroupGradient:   idleGroup,
+		activeGroupGradient: th.Palette.GroupGradient(),
 	}
 	m.refreshSummaries()
 	return m
@@ -84,9 +102,30 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	}
 }
 
+// sessionDotPhaseOffset shifts the session dot's gradient phase relative to
+// the agent dot. Half the 4-second ripple cycle ensures the two dots are
+// never color-synchronized, creating organic visual depth.
+const sessionDotPhaseOffset = 2 * time.Second
+
 // View renders the session panel.
 func (m *Model) View() string {
-	return RenderList(m.summaries, m.selected, m.width, m.height, m.theme)
+	// Border gradient: full prismatic when focused + active, subdued idle
+	// shimmer otherwise. Tree connectors and footer always animate — focus
+	// only controls whether the palette is prismatic or subdued.
+	borderGrad := m.idleGroupGradient
+	if m.focused && m.hasActiveAgent {
+		borderGrad = m.activeGroupGradient
+	}
+
+	anim := SessionAnimState{
+		DotFrame:       m.dotFrame,
+		Elapsed:        time.Since(m.shimmerStart) + sessionDotPhaseOffset,
+		HasActiveAgent: m.hasActiveAgent,
+		Focused:        m.focused,
+		Gradient:       m.dotGradient,
+		BorderGradient: borderGrad,
+	}
+	return RenderList(m.summaries, m.selected, m.width, m.height, m.theme, anim)
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +279,26 @@ func (m *Model) closeSession() tea.Cmd {
 	m.refreshSummaries()
 	m.selected = clampIndex(m.selected, max(len(m.summaries), 1))
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Dot animation
+// ---------------------------------------------------------------------------
+
+// SetAgentActive updates whether agents are currently working. Called by the
+// app during decor ticks to sync agent panel activity into the session dot.
+func (m *Model) SetAgentActive(active bool) {
+	m.hasActiveAgent = active
+}
+
+// AdvanceDotFrame increments the origami-bloom dot animation frame counter.
+func (m *Model) AdvanceDotFrame() {
+	m.dotFrame = (m.dotFrame + 1) % theme.DotAnimFrameCount
+}
+
+// HasActiveAgent reports whether the session dot should animate.
+func (m *Model) HasActiveAgent() bool {
+	return m.hasActiveAgent
 }
 
 // ---------------------------------------------------------------------------

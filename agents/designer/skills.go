@@ -22,6 +22,15 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(a11yAuditSkill(d))
 	d.skills.Register(a11yFixSuggestSkill(d))
 	d.skills.Register(contrastCheckSkill(d))
+
+	// Collaboration skills (feedback.go)
+	d.skills.Register(requestEngineerReviewSkill(d))
+	d.skills.Register(requestInspectorCheckSkill(d))
+	d.skills.Register(requestTesterValidationSkill(d))
+	d.skills.Register(askUserClarificationSkill(d))
+	d.skills.Register(reportToEngineerSkill(d))
+	d.skills.Register(reportToOrchestratorSkill(d))
+
 	d.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "designer",
 		SessionID: func() string { return d.config.SessionID },

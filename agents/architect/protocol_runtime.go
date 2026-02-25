@@ -21,6 +21,9 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 	plannerCtx := withPlannerThoughtCallback(ctx, func(stage string, thought string) {
 		a.publishPlanThought(ctx, stage, thought)
 	})
+	plannerCtx = withStreamRetryResetEmitter(plannerCtx, func() {
+		a.publishPlanStreamStart(ctx)
+	})
 	diag := openProtocolDiagnostics(plan.ID, a.config.WorkingDirectory)
 	defer diag.close()
 	diag.log("protocol start plan=%s query=%q planner_available=%v",
@@ -199,6 +202,7 @@ func (r *planningProtocolRunner) remainingExecutionSteps() []func() error {
 		r.stepWorkflow,
 		r.stepValidate,
 		r.stepReady,
+		r.stepAutoHandoff,
 	}
 }
 
@@ -224,18 +228,30 @@ func (r *planningProtocolRunner) stepConsult() error {
 	if err := r.transition(PlanStatusConsulting); err != nil {
 		return err
 	}
+	r.diag.log("stepConsult: enforcing consultation gate")
 	if err := r.architect.enforceConsultationGate(r.ctx, r.plan, r.request); err != nil {
+		r.diag.log("stepConsult: consultation gate FAILED: %v", err)
 		return err
 	}
-	if r.architect.running && r.architect.bus != nil {
-		patterns, err := r.architect.consultLibrarian(r.ctx, r.plan.Requirements, r.request.SessionID)
-		if err != nil {
-			r.architect.logger.Warn("failed to consult librarian", "error", err)
-		} else {
-			r.plan.CodebasePatterns = patterns
-		}
-	}
+	r.diag.log("stepConsult: consultation gate passed consultations=%d",
+		len(r.plan.Consultations))
+	// Extract librarian patterns from the gate evidence rather than
+	// issuing a redundant second consultation request.
+	r.plan.CodebasePatterns = extractLibrarianPatterns(r.plan)
 	return r.architect.persistPlanState(r.plan)
+}
+
+// extractLibrarianPatterns builds CodebasePatterns from the consultation
+// evidence already collected by enforceConsultationGate.
+func extractLibrarianPatterns(plan *DesignPlan) *CodebasePatterns {
+	if plan == nil || plan.Consultations == nil {
+		return emptyCodebasePatterns()
+	}
+	evidence, ok := plan.Consultations["librarian"]
+	if !ok || evidence == nil || !evidence.Success {
+		return emptyCodebasePatterns()
+	}
+	return codebasePatternsFromEvidence(evidence)
 }
 
 func (r *planningProtocolRunner) stepDesign() error {
@@ -371,51 +387,142 @@ func (r *planningProtocolRunner) stepReady() error {
 	r.architect.publishPlanSnapshot(r.ctx, r.plan)
 	// Stream LLM commentary + readiness footer token-by-token.
 	r.plan.UserResponse = r.architect.readyUserResponseInline(r.ctx, r.request, r.plan)
+	// Set the response directive so the Guide enters plan-approval phase.
+	r.plan.ReadyDirective = &guide.ResponseDirective{
+		Phase:    guide.PhasePlanApproval,
+		AgentID:  "architect",
+		Metadata: map[string]any{"plan_id": r.plan.ID},
+		TTL:      readyPlanMaxAge,
+	}
 	return r.architect.persistPlanState(r.plan)
 }
 
 func (r *planningProtocolRunner) stepAutoHandoff() error {
 	if !r.architect.running || r.architect.bus == nil {
-		r.architect.logWarn("stepAutoHandoff: bus unavailable, skipping handoff")
 		r.diag.log("stepAutoHandoff: bus unavailable, plan stays Ready")
+		r.architect.publishPlanStreamChunk(r.ctx,
+			"\n\nOrchestrator bus is unavailable — plan stays ready. Say **go ahead** to retry.")
 		return nil
 	}
-	if err := r.transition(PlanStatusExecuting); err != nil {
-		return err
-	}
+
 	payload := buildHandoffPayload(r.plan, "auto handoff from planning protocol")
+	if !isPlanHandoffPayloadValid(payload) {
+		r.diag.log("stepAutoHandoff: invalid payload, plan stays Ready")
+		r.architect.logWarn("stepAutoHandoff: handoff payload is invalid (not plan JSON)",
+			"plan_id", r.plan.ID)
+		r.architect.publishPlanStreamChunk(r.ctx,
+			"\n\nPlan serialization failed — say **go ahead** to retry.")
+		return nil
+	}
+
+	// Generate the orchestrator's CID and emit reroute BEFORE the sync call
+	// so the TUI switches to "orchestrator" while the orchestrator processes.
+	orchCID := "corr_" + uuid.NewString()
+	originalCID := originalCIDFromContext(r.ctx)
+	r.architect.publishHandoffReroute(r.ctx, "orchestrator", originalCID, orchCID)
+
 	request := &guide.RouteRequest{
 		Input:         payload,
+		CorrelationID: orchCID,
 		TargetAgentID: "orchestrator",
 		SessionID:     r.plan.SessionID,
 	}
+
 	response, err := r.architect.requestRouteSync(r.ctx, request)
 	if err != nil {
-		r.architect.logWarn("stepAutoHandoff: route failed", "error", err)
+		r.architect.logWarn("stepAutoHandoff: route failed", "plan_id", r.plan.ID, "error", err)
 		r.diag.log("stepAutoHandoff: route failed: %v", err)
-		r.plan.RiskSummary = append(r.plan.RiskSummary, "handoff error: "+err.Error())
-		return r.architect.persistPlanState(r.plan)
+		r.architect.publishPlanStreamChunk(r.ctx,
+			"\n\nHandoff to orchestrator failed: "+err.Error()+"\nSay **go ahead** to retry.")
+		return nil
 	}
+
+	if !isHandoffSuccess(response) {
+		summary := summarizeAutoHandoffResponse(response)
+		r.architect.logWarn("stepAutoHandoff: orchestrator rejected",
+			"plan_id", r.plan.ID, "summary", summary)
+		r.diag.log("stepAutoHandoff: rejected: %s", summary)
+		r.architect.publishPlanStreamChunk(r.ctx,
+			"\n\nOrchestrator rejected the handoff: "+summary+"\nSay **go ahead** to retry.")
+		return nil
+	}
+
 	summary := summarizeAutoHandoffResponse(response)
-	r.diag.log("stepAutoHandoff: %s", summary)
+	r.diag.log("stepAutoHandoff: success: %s", summary)
+
+	// Clear the ReadyDirective so the guide does not enter PhasePlanApproval
+	// for a plan that is already executing. Without this, the next user
+	// message would be phase-classified as plan approval/feedback instead of
+	// flowing through normal classification.
+	r.plan.ReadyDirective = nil
+
+	if err := r.transition(PlanStatusExecuting); err != nil {
+		return err
+	}
 	r.plan.RiskSummary = append(r.plan.RiskSummary, summary)
+	r.architect.publishPlanStreamChunk(r.ctx, "\n\n"+summary)
 	return r.architect.persistPlanState(r.plan)
+}
+
+func isHandoffSuccess(msg *guide.Message) bool {
+	if msg == nil {
+		return false
+	}
+	resp, ok := msg.GetRouteResponse()
+	return ok && resp != nil && resp.Success
 }
 
 func summarizeAutoHandoffResponse(msg *guide.Message) string {
 	if msg == nil {
-		return "auto handoff dispatched"
+		return "Plan dispatched to orchestrator."
 	}
-	if resp, ok := msg.GetRouteResponse(); ok && resp != nil {
-		if resp.Success {
-			return "auto handoff acknowledged by orchestrator"
+	resp, ok := msg.GetRouteResponse()
+	if !ok || resp == nil {
+		if errText, ok := msg.GetError(); ok {
+			return "Handoff error: " + strings.TrimSpace(errText)
 		}
-		return "auto handoff response error: " + strings.TrimSpace(resp.Error)
+		return "Plan dispatched to orchestrator."
 	}
-	if errText, ok := msg.GetError(); ok {
-		return "auto handoff error: " + strings.TrimSpace(errText)
+	if !resp.Success {
+		return "Handoff response error: " + strings.TrimSpace(resp.Error)
 	}
-	return "auto handoff dispatched"
+	// Extract the orchestrator's user-facing response if available.
+	if text := extractHandoffUserResponse(resp.Data); text != "" {
+		return text
+	}
+	return "Plan accepted by orchestrator — DAG execution started."
+}
+
+// extractHandoffUserResponse extracts the user-facing text from the
+// orchestrator's ingestion response. The bus is in-memory so the data
+// arrives as a struct pointer (not a map). We try map assertion first
+// (cheap), then JSON round-trip to handle cross-package struct types
+// that the architect cannot import directly.
+func extractHandoffUserResponse(data any) string {
+	if data == nil {
+		return ""
+	}
+	// Fast path: already a map (e.g. from deserialized payloads).
+	if m, ok := data.(map[string]any); ok {
+		if resp, ok := m["response"].(string); ok && strings.TrimSpace(resp) != "" {
+			return strings.TrimSpace(resp)
+		}
+	}
+	// Struct path: JSON round-trip for cross-package types (e.g.
+	// *orchestrator.ConversationResult) that arrive as struct pointers
+	// through the in-memory bus.
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return ""
+	}
+	var m map[string]any
+	if json.Unmarshal(encoded, &m) != nil {
+		return ""
+	}
+	if resp, ok := m["response"].(string); ok && strings.TrimSpace(resp) != "" {
+		return strings.TrimSpace(resp)
+	}
+	return ""
 }
 
 func (r *planningProtocolRunner) transition(status PlanStatus) error {

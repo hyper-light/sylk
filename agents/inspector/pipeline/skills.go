@@ -25,6 +25,12 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(shared.GlobSkill())
 	pi.skills.Register(shared.GrepSkill())
 
+	// Design validation skills (always registered — LLM selects based on context).
+	pi.skills.Register(shared.ValidateTokenUsageSkill(pi.toolRunner))
+	pi.skills.Register(shared.ValidateAccessibilitySkill(pi.toolRunner))
+	pi.skills.Register(shared.ValidateComponentAPISkill(pi.toolRunner))
+	pi.skills.Register(shared.ValidateDesignConsistencySkill(pi.toolRunner))
+
 	// Pipeline-specific skills.
 	pi.skills.Register(defineCriteriaSkill(pi))
 	pi.skills.Register(validateCriteriaSkill(pi))

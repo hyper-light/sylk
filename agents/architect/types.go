@@ -26,8 +26,10 @@ const (
 
 // ConversationResult holds the response from a conversational (non-planning) interaction.
 type ConversationResult struct {
-	Response string
-	Intent   ArchitectIntent
+	Response      string
+	Intent        ArchitectIntent
+	HandoffTarget string                  // Non-empty when this result triggered a handoff (e.g. "orchestrator").
+	Directive     *guide.ResponseDirective // Carried to StreamEventComplete.
 }
 
 // ResponseText implements the guide-layer text extraction interface so the
@@ -120,6 +122,7 @@ type DesignPlan struct {
 	ClarificationQuestions []string
 	Assumptions            []string
 	UserResponse           string
+	ReadyDirective         *guide.ResponseDirective // Set when plan reaches Ready status.
 	UpdatedAt              time.Time
 	CreatedAt              time.Time
 	CompletedAt            time.Time
@@ -286,6 +289,12 @@ type AtomicTask struct {
 	TestRequirements    []string
 	RiskFactors         []string
 
+	// Co-tenancy fields for compound node dispatch.
+	CoAgents          []string
+	CollaborationMode dag.CollaborationMode
+	MaxReviewRounds   int          // 0 = sequential default, >0 for adversarial
+	AgentScopes       []AgentScope // Per-agent scoped specifications for compound tasks
+
 	CreatedAt   time.Time
 	StartedAt   time.Time
 	CompletedAt time.Time
@@ -298,6 +307,18 @@ type AcceptanceCriterion struct {
 	When     string // Action or trigger
 	Then     string // Expected outcome
 	Priority string // "must" | "should" | "could"
+}
+
+// AgentScope defines a single agent's responsibilities within a compound task.
+// The Architect's LLM produces these to tell each agent exactly what to do.
+type AgentScope struct {
+	AgentType           string               `json:"agent_type"`
+	Role                string               `json:"role"` // "primary" | "co_agent"
+	AcceptanceCriteria  []AcceptanceCriterion `json:"acceptance_criteria"`
+	ImplementationGuide string               `json:"implementation_guide"`
+	AffectedFiles       []TaskFileTarget     `json:"affected_files"`
+	Guidelines          []string             `json:"guidelines"`
+	TestRequirements    []string             `json:"test_requirements"`
 }
 
 // TaskExample provides a concrete code or pattern example for the task.
@@ -495,4 +516,8 @@ type HandoffTask struct {
 	AffectedFiles       []TaskFileTarget      `json:"affected_files,omitempty"`
 	TestRequirements    []string              `json:"test_requirements,omitempty"`
 	RiskFactors         []string              `json:"risk_factors,omitempty"`
+	CoAgents            []string              `json:"co_agents,omitempty"`
+	CollaborationMode   string                `json:"collaboration_mode,omitempty"`
+	MaxReviewRounds     int                   `json:"max_review_rounds,omitempty"`
+	AgentScopes         []AgentScope          `json:"agent_scopes,omitempty"`
 }

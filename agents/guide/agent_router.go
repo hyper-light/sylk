@@ -70,6 +70,9 @@ type TieredRouter struct {
 	// Signal emission for progress tracking
 	signals *routerSignals
 
+	// On-demand agent activation for cold/demoted targets
+	activator AgentActivator
+
 	// Running state
 	running bool
 }
@@ -109,6 +112,9 @@ type TieredRouterConfig struct {
 
 	// Optional: request timeout
 	RequestTimeout time.Duration
+
+	// Optional: on-demand agent activator for cold/demoted targets
+	Activator AgentActivator
 }
 
 // NewTieredRouter creates a new agent router
@@ -185,7 +191,14 @@ func NewTieredRouter(cfg TieredRouterConfig) (*TieredRouter, error) {
 		dlq:              dlq,
 		retryQueue:       retryQueue,
 		signals:          newRouterSignals(),
+		activator:        cfg.Activator,
 	}, nil
+}
+
+// SetActivator sets the on-demand agent activator for cold/demoted targets.
+// Safe to call before Start; not safe for concurrent use with routing.
+func (r *TieredRouter) SetActivator(a AgentActivator) {
+	r.activator = a
 }
 
 // =============================================================================
@@ -406,6 +419,14 @@ func (r *TieredRouter) TriggerAction(ctx context.Context, targetAgentID, action 
 		}
 	}
 
+	// Activate target agent if demoted/cold.
+	if r.activator != nil {
+		if err := r.activator.EnsureActive(ctx, targetType); err != nil {
+			r.removeOutbound(correlationID)
+			return "", fmt.Errorf("activate %s for action: %w", targetType, err)
+		}
+	}
+
 	// Publish to target's request channel
 	msg := NewActionMessage(generateMessageID(), actionReq)
 	targetTopic := TopicRequests(targetType, targetAgentID)
@@ -413,6 +434,11 @@ func (r *TieredRouter) TriggerAction(ctx context.Context, targetAgentID, action 
 	if err := r.bus.Publish(targetTopic, msg); err != nil {
 		r.removeOutbound(correlationID)
 		return "", fmt.Errorf("failed to publish action to %s: %w", targetTopic, err)
+	}
+
+	// Touch activity after successful publish.
+	if r.activator != nil {
+		r.activator.TouchActivity(targetType)
 	}
 
 	// Emit progress signal - programmatic action is agent-to-agent communication
@@ -603,11 +629,21 @@ func (r *TieredRouter) routeDirect(ctx context.Context, correlationID, targetAge
 		return r.routeViaGuide(ctx, correlationID, input, opts)
 	}
 
-	// Check if target is ready (registration handshake complete)
+	// Check if target is ready (registration handshake complete).
+	// If not ready, attempt on-demand activation before falling back to Guide.
 	if ready, _ := r.readyAgents.Get(targetAgentID); !ready {
-		// Agent registered but not ready - fall back to Guide
-		// Guide will queue or retry appropriately
-		return r.routeViaGuide(ctx, correlationID, input, opts)
+		activated := false
+		if r.activator != nil {
+			targetType := r.resolveAgentType(targetAgentID)
+			if err := r.activator.EnsureActive(ctx, targetType); err == nil {
+				if nowReady, _ := r.readyAgents.Get(targetAgentID); nowReady {
+					activated = true
+				}
+			}
+		}
+		if !activated {
+			return r.routeViaGuide(ctx, correlationID, input, opts)
+		}
 	}
 
 	// Check circuit breaker - don't route to failing agents
@@ -743,7 +779,7 @@ func (r *TieredRouter) handleResponse(msg *Message) error {
 		}
 		r.recordCircuitSuccess(pending.TargetAgentID)
 		streamResp.TargetAgentID = pending.TargetAgentID
-		streamResp.RespondingAgentID = pending.TargetAgentID
+		streamResp.RespondingAgentID = r.resolveAgentDisplayName(pending.TargetAgentID)
 		r.invokeStreamHandler(streamResp)
 		return nil
 	default:
@@ -771,6 +807,16 @@ func (r *TieredRouter) handleAck(msg *Message) error {
 	}
 
 	return nil
+}
+
+// resolveAgentDisplayName converts a UUID-based agent ID to the
+// human-readable name from the knownAgents registry.
+// Returns the input unchanged when no match is found.
+func (r *TieredRouter) resolveAgentDisplayName(agentID string) string {
+	if ann, ok := r.knownAgents.Get(agentID); ok && ann.AgentName != "" {
+		return ann.AgentName
+	}
+	return agentID
 }
 
 func (r *TieredRouter) recordCircuitSuccess(targetAgentID string) {
@@ -994,6 +1040,15 @@ func (r *TieredRouter) trackOutbound(correlationID, targetAgentID string, opts r
 func (r *TieredRouter) removeOutbound(correlationID string) {
 	r.pending.Delete(correlationID)
 	r.pendingCleanup.Remove(correlationID)
+}
+
+// resolveAgentType maps an agent ID to its type name. Falls back to
+// the agent ID itself when no announcement carries a distinct type.
+func (r *TieredRouter) resolveAgentType(agentID string) string {
+	if info, ok := r.knownAgents.Get(agentID); ok && info.AgentType != "" {
+		return info.AgentType
+	}
+	return agentID
 }
 
 // Channels returns the agent's channel configuration

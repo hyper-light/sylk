@@ -66,6 +66,7 @@ const panelBorderSize = 2
 const (
 	showIcon  = "[show]"
 	pasteIcon = "[paste]"
+	copyIcon  = "[copy]"
 )
 
 // Icon widths include a leading space separator.
@@ -73,6 +74,7 @@ const (
 const (
 	showIconWidth  = 7  // " [show]"
 	pasteIconWidth = 8  // " [paste]"
+	copyIconWidth  = 7  // " [copy]"
 	iconAreaWidth  = 15 // showIconWidth + pasteIconWidth
 )
 
@@ -104,18 +106,22 @@ type Panel struct {
 	btnFocus      btnFocus
 	showRevealed  bool                      // True while the key is temporarily visible.
 	showRevealAt  time.Time                 // When the reveal started; auto-expires after revealDuration.
-	showHover     bool                      // Mouse is hovering over the show icon.
-	pasteHover    bool                      // Mouse is hovering over the paste icon.
-	okHover       bool                      // Mouse is hovering over the Ok button.
-	abortHover    bool                      // Mouse is hovering over the Abort button.
-	keyResolver   func(string) string       // Returns pre-validated env/dotenv key or "".
-	keyValidator  func(string, string) bool // Validates key format (provider, key) → ok.
-	clipboard     func() (string, error)    // Reads system clipboard.
-	btnRowY       int                       // Y offset of button content row (set during render).
-	inputRowY     int                       // Y offset of input row (set during render).
-	th            *theme.Theme
-	width         int
-	height        int
+	showHover      bool                      // Mouse is hovering over the show icon.
+	pasteHover     bool                      // Mouse is hovering over the paste icon.
+	copyHover      bool                      // Mouse is hovering over the device code copy icon.
+	okHover        bool                      // Mouse is hovering over the Ok button.
+	abortHover     bool                      // Mouse is hovering over the Abort button.
+	keyResolver    func(string) string       // Returns pre-validated env/dotenv key or "".
+	keyValidator   func(string, string) bool // Validates key format (provider, key) → ok.
+	clipboard      func() (string, error)    // Reads system clipboard.
+	clipboardWrite func(string) error        // Writes to system clipboard.
+	deviceCode     string                    // Device code shown during OAuth device flow.
+	btnRowY        int                       // Y offset of button content row (set during render).
+	inputRowY      int                       // Y offset of input row (set during render).
+	deviceCodeRowY int                       // Y offset of device code row (set during render).
+	th             *theme.Theme
+	width          int
+	height         int
 }
 
 // New creates an idle login panel.
@@ -145,6 +151,16 @@ func (p *Panel) SetClipboard(fn func() (string, error)) {
 	p.clipboard = fn
 }
 
+// SetClipboardWrite wires the clipboard write function after construction.
+func (p *Panel) SetClipboardWrite(fn func(string) error) {
+	p.clipboardWrite = fn
+}
+
+// SetDeviceCode sets the device code displayed during OAuth device flow.
+func (p *Panel) SetDeviceCode(code string) {
+	p.deviceCode = code
+}
+
 // Active reports whether the panel is currently displayed.
 func (p *Panel) Active() bool { return p.step != stepIdle }
 
@@ -164,10 +180,13 @@ func (p *Panel) Activate() {
 	p.showRevealed = false
 	p.showHover = false
 	p.pasteHover = false
+	p.copyHover = false
 	p.okHover = false
 	p.abortHover = false
+	p.deviceCode = ""
 	p.btnRowY = -1
 	p.inputRowY = -1
+	p.deviceCodeRowY = -1
 	p.items = []item{
 		{id: "google", label: "Google (Gemini)", desc: "OAuth or API Key"},
 		{id: "openai", label: "OpenAI", desc: "OAuth or API Key"},
@@ -240,6 +259,13 @@ func (p *Panel) HandleClick(x, y int) (done bool, result LoginResult, cmd tea.Cm
 		return p.handleButtonClick(x, y)
 
 	case stepOAuth:
+		if p.deviceCode != "" && p.deviceCodeRowY >= 0 && y == p.deviceCodeRowY {
+			if p.hitTestDeviceCodeCopy(x) {
+				p.doCopyDeviceCode()
+				return false, LoginResult{}, nil
+			}
+			return false, LoginResult{}, nil
+		}
 		if p.oauthCodeMode && p.inputRowY >= 0 && y == p.inputRowY {
 			if p.hitTestOAuthCodeIcon(x) == focusPaste {
 				p.btnFocus = focusPaste
@@ -259,8 +285,15 @@ func (p *Panel) HandleClick(x, y int) (done bool, result LoginResult, cmd tea.Cm
 func (p *Panel) HandleMouseMotion(x, y int) {
 	p.showHover = false
 	p.pasteHover = false
+	p.copyHover = false
 	p.okHover = false
 	p.abortHover = false
+
+	// Device code copy icon hover (OAuth step with device code).
+	if p.step == stepOAuth && p.deviceCode != "" && p.deviceCodeRowY >= 0 && y == p.deviceCodeRowY {
+		p.copyHover = p.hitTestDeviceCodeCopy(x)
+		return
+	}
 
 	// Input row icon hover (API key step only).
 	if p.step == stepAPIKey && p.inputRowY >= 0 && y == p.inputRowY {
@@ -791,11 +824,14 @@ func (p *Panel) Deactivate() {
 	p.showRevealed = false
 	p.showHover = false
 	p.pasteHover = false
+	p.copyHover = false
 	p.okHover = false
 	p.abortHover = false
+	p.deviceCode = ""
 	p.validationErr = ""
 	p.btnRowY = -1
 	p.inputRowY = -1
+	p.deviceCodeRowY = -1
 }
 
 func (p *Panel) clearInput() {
@@ -874,6 +910,9 @@ func (p *Panel) View(cursorVisible bool) string {
 	lines = append(lines, bottomLines...)
 	content := strings.Join(lines, "\n")
 
+	if p.th.ActiveBorderRender != nil {
+		return p.th.ActiveBorderRender(content, innerW, innerH, h)
+	}
 	return p.th.ActiveBorder.
 		Width(innerW).
 		Height(innerH).
@@ -1134,6 +1173,44 @@ func (p *Panel) renderPasteIcon() string {
 	}
 }
 
+func (p *Panel) renderCopyIcon() string {
+	pal := p.th.Palette
+	switch {
+	case p.copyHover:
+		return lipgloss.NewStyle().Foreground(pal.Secondary).
+			Render(" " + copyIcon)
+	default:
+		return lipgloss.NewStyle().Foreground(pal.Muted).
+			Render(" " + copyIcon)
+	}
+}
+
+// hitTestDeviceCodeCopy reports whether x hits the copy icon on the device code row.
+func (p *Panel) hitTestDeviceCodeCopy(x int) bool {
+	// Layout: pad(1) + "Code: "(6) + deviceCode(N) → copy icon starts after.
+	codeLen := len([]rune(p.deviceCode))
+	copyStart := 1 + 6 + codeLen
+	return x >= copyStart && x < copyStart+copyIconWidth
+}
+
+// doCopyDeviceCode writes the device code to the system clipboard.
+func (p *Panel) doCopyDeviceCode() {
+	if p.clipboardWrite == nil || p.deviceCode == "" {
+		return
+	}
+	_ = p.clipboardWrite(p.deviceCode)
+}
+
+// bodyVisibleRows counts the total visible terminal rows occupied by
+// the body entries, accounting for embedded newlines.
+func bodyVisibleRows(entries []string) int {
+	n := 0
+	for _, e := range entries {
+		n += 1 + strings.Count(e, "\n")
+	}
+	return n
+}
+
 func (p *Panel) renderOAuthBody(innerW int, cursorVisible bool) []string {
 	pal := p.th.Palette
 	mutedStyle := lipgloss.NewStyle().Foreground(pal.Muted)
@@ -1143,6 +1220,7 @@ func (p *Panel) renderOAuthBody(innerW int, cursorVisible bool) []string {
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 	pad := " "
 	p.inputRowY = -1
+	p.deviceCodeRowY = -1
 
 	provLabel := providerLabel(p.provider)
 	desc := pad + mutedStyle.Render("Complete sign-in in your browser to authenticate with "+provLabel+".")
@@ -1157,6 +1235,14 @@ func (p *Panel) renderOAuthBody(innerW int, cursorVisible bool) []string {
 	lines = append(lines, desc)
 	lines = append(lines, "")
 	lines = append(lines, statusLine)
+
+	// Device code line with clickable copy icon.
+	if p.deviceCode != "" {
+		codeLine := pad + labelStyle.Render("Code: ") + infoStyle.Render(p.deviceCode) + p.renderCopyIcon()
+		p.deviceCodeRowY = 2 + bodyVisibleRows(lines)
+		lines = append(lines, codeLine)
+	}
+
 	if p.oauthCodeMode {
 		prompt := p.oauthPrompt
 		if prompt == "" {
@@ -1185,7 +1271,7 @@ func (p *Panel) renderOAuthBody(innerW int, cursorVisible bool) []string {
 			Render(inputContent)
 		underline := mutedStyle.Render(strings.Repeat("─", max(fieldW, 10)))
 
-		p.inputRowY = 2 + len(lines)
+		p.inputRowY = 2 + bodyVisibleRows(lines)
 		lines = append(lines, pad+inputBox+p.renderPasteIcon())
 		lines = append(lines, pad+underline)
 		if p.validationErr != "" {

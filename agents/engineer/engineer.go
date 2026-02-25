@@ -8,7 +8,13 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/escalation"
+	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -16,13 +22,29 @@ import (
 // stop and request Architect decomposition.
 const MaxTodosBeforeArchitect = 12
 
+// MaxAttemptsBeforeConsultation is the failure count threshold that triggers
+// Academic consultation for alternative approaches. Derived from the audit
+// config's MaxAuditIterations — if the agent can self-audit N times,
+// escalation to Academic occurs after N failures of the full cycle.
+var MaxAttemptsBeforeConsultation = DefaultAuditConfig().MaxAuditIterations
+
+// engineerProvider is the minimal interface the Engineer needs from its LLM.
+// Satisfied by *providers.OpenAIProvider and *gateway.GatewayProvider.
+type engineerProvider interface {
+	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+}
+
 // Engineer is the code implementation specialist agent for the Sylk system.
-// It executes individual coding tasks, focusing on clean, modular, testable,
-// and readable code implementation.
+// It uses GPT-5.3 Codex with xhigh reasoning to execute individual coding
+// tasks via an LLM-driven tool loop with self-audit.
 type Engineer struct {
 	id     string
 	config Config
 	logger *slog.Logger
+
+	// LLM provider
+	provider        engineerProvider
+	providerWrapper gateway.ProviderWrapper
 
 	// State management
 	state    *EngineerState
@@ -45,12 +67,31 @@ type Engineer struct {
 	// Consultation tracking
 	consultations []Consultation
 	consultMu     sync.RWMutex
+
+	// Synchronous consultation bus
+	pendingMu       sync.Mutex
+	pendingConsults map[string]chan *guide.Message
+
+	// Handoff bridge
+	handoffBridge *handoff.HandoffBridge
+
+	// File access abstraction (injected per-pipeline by Orchestrator).
+	fileAccess versioning.FileAccess
+
+	// Self-audit configuration
+	auditConfig AuditConfig
+
+	// Refactor loop configuration
+	refactorConfig shared.RefactorLoopConfig
+
+	// Escalation
+	escalator *escalation.Escalator
 }
 
 // Config holds configuration for the Engineer agent
 type Config struct {
 	// System prompt configuration
-	SystemPrompt    string // Optional, uses DefaultSystemPrompt if empty
+	SystemPrompt    string // Optional, uses DefaultEngineerSystemPrompt if empty
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
 
 	// Engineer-specific configuration
@@ -65,21 +106,29 @@ type Config struct {
 
 // Default configuration values
 const (
-	DefaultMaxOutputTokens = 8192
+	DefaultMaxOutputTokens = 16384
+	DefaultModel           = "gpt-5.3-codex"
+	DefaultReasoningEffort = "xhigh"
+	DefaultMaxToolRuns     = 16
+	DefaultMaxTokens       = 16384
 )
 
-// New creates a new Engineer agent
-func New(cfg Config) (*Engineer, error) {
+// New creates a new Engineer agent with the given LLM provider.
+func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 	cfg = applyConfigDefaults(cfg)
 
 	engineerID := fmt.Sprintf("engineer_%s", uuid.New().String()[:8])
 
 	eng := &Engineer{
-		id:          engineerID,
-		config:      cfg,
-		logger:      cfg.Logger,
-		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		failures:    make(map[string]*FailureRecord),
+		id:              engineerID,
+		config:          cfg,
+		logger:          cfg.Logger,
+		provider:        provider,
+		knownAgents:     make(map[string]*guide.AgentAnnouncement),
+		failures:        make(map[string]*FailureRecord),
+		pendingConsults: make(map[string]chan *guide.Message),
+		auditConfig:     DefaultAuditConfig(),
+		refactorConfig:  shared.DefaultRefactorLoopConfig(),
 		state: &EngineerState{
 			ID:        engineerID,
 			SessionID: cfg.SessionID,
@@ -95,15 +144,74 @@ func New(cfg Config) (*Engineer, error) {
 	return eng, nil
 }
 
+// SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+func (e *Engineer) SetProvider(p engineerProvider) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.provider = p
+}
+
+// SetProviderWrapper stores a callback that re-applies gateway rate limiting
+// to fresh providers created during credential refresh.
+func (e *Engineer) SetProviderWrapper(w gateway.ProviderWrapper) {
+	e.providerWrapper = w
+}
+
+// getProvider returns the current provider under read lock.
+func (e *Engineer) getProvider() engineerProvider {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	return e.provider
+}
+
+// ProviderType implements container.AuthRefreshable.
+func (e *Engineer) ProviderType() string { return "openai" }
+
+// RefreshProvider implements container.AuthRefreshable.
+// Re-resolves OpenAI credentials and replaces the provider.
+func (e *Engineer) RefreshProvider(_ context.Context) error {
+	cfg := providers.OpenAIConfig{
+		BaseConfig: providers.BaseConfig{
+			Model:     DefaultModel,
+			MaxTokens: DefaultMaxTokens,
+		},
+		ReasoningEffort: DefaultReasoningEffort,
+		AuthMode:        "api_key",
+	}
+	p, err := providers.NewOpenAIProvider(cfg)
+	if err != nil {
+		return fmt.Errorf("engineer refresh provider: %w", err)
+	}
+	var wrapped engineerProvider = p
+	if e.providerWrapper != nil {
+		wrapped = e.providerWrapper(p)
+	}
+	e.SetProvider(wrapped)
+	e.logger.Info("provider refreshed")
+	return nil
+}
+
 func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
-		cfg.SystemPrompt = DefaultSystemPrompt
+		cfg.SystemPrompt = DefaultEngineerSystemPrompt
 	}
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.EngineerConfig.Model == "" {
+		cfg.EngineerConfig.Model = DefaultModel
+	}
+	if cfg.EngineerConfig.ReasoningEffort == "" {
+		cfg.EngineerConfig.ReasoningEffort = DefaultReasoningEffort
+	}
+	if cfg.EngineerConfig.MaxToolRuns == 0 {
+		cfg.EngineerConfig.MaxToolRuns = DefaultMaxToolRuns
+	}
+	if cfg.EngineerConfig.MaxTokens == 0 {
+		cfg.EngineerConfig.MaxTokens = DefaultMaxTokens
 	}
 	if cfg.EngineerConfig.CommandTimeout == 0 {
 		cfg.EngineerConfig.CommandTimeout = 30 * time.Second
@@ -117,6 +225,9 @@ func applyConfigDefaults(cfg Config) Config {
 	if len(cfg.EngineerConfig.ApprovedCommands.Patterns) == 0 {
 		cfg.EngineerConfig.ApprovedCommands = DefaultApprovedPatterns()
 	}
+	if cfg.EngineerConfig.SessionID == "" {
+		cfg.EngineerConfig.SessionID = cfg.SessionID
+	}
 	return cfg
 }
 
@@ -124,7 +235,10 @@ func (e *Engineer) initSkills() {
 	e.skills = skills.NewRegistry()
 
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{"read_file", "write_file", "edit_file", "run_command", "run_tests", "glob", "grep"}
+	loaderCfg.CoreSkills = []string{
+		"read_file", "write_file", "edit_file", "run_command",
+		"run_tests", "glob", "grep",
+	}
 	loaderCfg.AutoLoadDomains = []string{"code", "filesystem", "testing"}
 	e.skillLoader = skills.NewLoader(e.skills, loaderCfg)
 
@@ -275,6 +389,10 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	ctx := context.Background()
 	startTime := time.Now()
 
+	// Wire tool call emitter for inline visualization.
+	emitter := shared.NewToolCallEmitter(e.bus, e.channels, "engineer", fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = shared.WithToolCallEmitter(ctx, emitter)
+
 	result, err := e.processForwardedRequest(ctx, fwd)
 
 	// Don't respond if fire-and-forget
@@ -286,7 +404,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   e.id,
+		RespondingAgentID:   "engineer",
 		RespondingAgentName: "engineer",
 		ProcessingTime:      time.Since(startTime),
 	}
@@ -350,14 +468,14 @@ func (e *Engineer) handleImplement(ctx context.Context, fwd *guide.ForwardedRequ
 		Timestamp:  time.Now(),
 	}
 
-	// Handle the task using the 10-step protocol
+	// Handle the task using LLM-driven protocol
 	return e.Handle(ctx, req)
 }
 
-// handleBusResponse processes responses to requests we made
+// handleBusResponse processes responses to requests we made.
+// Delivers to synchronous consultation waiters.
 func (e *Engineer) handleBusResponse(msg *guide.Message) error {
-	// Log responses to our requests for debugging
-	e.logger.Debug("received response", "correlation_id", msg.CorrelationID)
+	e.deliverConsultResponse(msg)
 	return nil
 }
 
@@ -390,10 +508,10 @@ func (e *Engineer) GetKnownAgents() map[string]*guide.AgentAnnouncement {
 }
 
 // =============================================================================
-// Direct API Methods - 10-Step Implementation Protocol
+// LLM-Driven Implementation Protocol
 // =============================================================================
 
-// Handle processes an EngineerRequest using the 10-step implementation protocol
+// Handle processes an EngineerRequest using the LLM-driven implementation protocol.
 func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
@@ -403,170 +521,127 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	e.setStatus(AgentStatusBusy)
 	defer e.setStatus(AgentStatusIdle)
 
-	// STEP 1: Parse task and validate scope
+	// Step 1: Validate scope
 	if err := e.validateTaskScope(ctx, req); err != nil {
 		return e.failureResponse(req, err, startTime)
 	}
 
-	// STEP 2: Consult Librarian (DEFAULT - before implementation)
-	if err := e.consultLibrarian(ctx, req); err != nil {
-		e.logger.Warn("librarian consultation failed", "error", err)
-		// Non-fatal, continue with implementation
+	// Step 2: Synchronous Librarian consultation
+	var consultContext string
+	if e.bus != nil && e.running {
+		evidence, err := e.requestConsultation(ctx, "librarian",
+			fmt.Sprintf("Search for relevant patterns, similar implementations, and dependencies for: %s", req.Prompt),
+			"", e.config.SessionID)
+		if err != nil {
+			e.logger.Warn("librarian consultation failed", "error", err)
+		} else if evidence.Success {
+			consultContext = fmt.Sprintf("Librarian consultation evidence:\n%v", evidence.Data)
+		}
 	}
 
-	// STEP 3: Check for previous failures on similar tasks
+	// Step 3: Check previous failures → consult Academic if threshold exceeded
 	if failure := e.checkPreviousFailures(req.TaskID); failure != nil {
 		e.logger.Info("found previous failure", "task_id", req.TaskID, "attempts", failure.AttemptCount)
-		if failure.AttemptCount >= 3 {
-			// Consult Academic for alternative approaches
-			if err := e.consultAcademic(ctx, req, "Task has failed multiple times. Need alternative approach."); err != nil {
+		if failure.AttemptCount >= MaxAttemptsBeforeConsultation && e.bus != nil && e.running {
+			evidence, err := e.requestConsultation(ctx, "academic",
+				fmt.Sprintf("Task has failed %d times. Need alternative approach for: %s. Last error: %s",
+					failure.AttemptCount, req.Prompt, failure.LastError),
+				"", e.config.SessionID)
+			if err != nil {
 				e.logger.Warn("academic consultation failed", "error", err)
+			} else if evidence.Success {
+				consultContext += fmt.Sprintf("\n\nAcademic consultation evidence:\n%v", evidence.Data)
 			}
 		}
 	}
 
-	// STEP 4: Plan implementation (break into steps)
-	plan, err := e.planImplementation(ctx, req)
-	if err != nil {
-		return e.failureResponse(req, err, startTime)
+	// Step 4: Compose system prompt + consultation context
+	systemPrompt := e.config.SystemPrompt
+	if consultContext != "" {
+		systemPrompt += "\n\n---\n\n# Consultation Context\n\n" + consultContext
 	}
 
-	// STEP 5: Check scope limit
-	if len(plan.Steps) > MaxTodosBeforeArchitect {
-		return e.scopeLimitResponse(req, plan, startTime)
+	// Step 5: Build LLM request with tools
+	llmReq := &providers.Request{
+		SystemPrompt:    systemPrompt,
+		Messages:        []providers.Message{{Role: providers.RoleUser, Content: req.Prompt}},
+		Tools:           e.buildToolDefinitions(),
+		Model:           e.config.EngineerConfig.Model,
+		MaxTokens:       e.config.EngineerConfig.MaxTokens,
+		ReasoningEffort: e.config.EngineerConfig.ReasoningEffort,
 	}
 
-	// STEP 6: Execute pre-implementation checks
-	if issues := e.preImplementationChecks(ctx, req, plan); len(issues) > 0 {
-		e.logger.Warn("pre-implementation issues detected", "issues", issues)
-		// Consult Academic if unclear
-		if e.hasUnclearIssues(issues) {
-			if err := e.consultAcademic(ctx, req, fmt.Sprintf("Pre-implementation issues: %v", issues)); err != nil {
-				e.logger.Warn("academic consultation failed", "error", err)
-			}
-		}
-	}
-
-	// STEP 7-9: Execute implementation steps
-	result, err := e.executeImplementation(ctx, req, plan)
+	// Step 6: Execute tool loop
+	result, err := e.executeToolLoop(ctx, llmReq)
 	if err != nil {
 		e.recordFailure(req.TaskID, err.Error(), req.Prompt)
 		return e.failureResponse(req, err, startTime)
 	}
 
-	// STEP 10: Validate and finalize
-	if err := e.validateResult(ctx, result); err != nil {
-		e.recordFailure(req.TaskID, err.Error(), req.Prompt)
-		return e.failureResponse(req, err, startTime)
+	// Step 7: Self-audit (bounded iterations)
+	for iteration := range e.auditConfig.MaxAuditIterations {
+		verdict, auditErr := e.selfAudit(ctx, result, req.Prompt)
+		if auditErr != nil {
+			e.logger.Warn("self-audit failed", "error", auditErr, "iteration", iteration)
+			break
+		}
+		if !shouldReimplement(verdict, iteration, e.auditConfig) {
+			break
+		}
+		// Re-enter tool loop with audit feedback
+		e.logger.Info("re-implementing after audit", "iteration", iteration, "score", verdict.QualityScore)
+		llmReq.Messages = append(llmReq.Messages,
+			providers.Message{Role: providers.RoleAssistant, Content: result},
+			providers.Message{Role: providers.RoleUser, Content: e.buildAuditFeedback(verdict)},
+		)
+		result, err = e.executeToolLoop(ctx, llmReq)
+		if err != nil {
+			e.recordFailure(req.TaskID, err.Error(), req.Prompt)
+			return e.failureResponse(req, err, startTime)
+		}
 	}
 
 	return &EngineerResponse{
 		ID:        uuid.New().String(),
 		RequestID: req.ID,
 		Success:   true,
-		Result:    result,
+		Result: &TaskResult{
+			TaskID:       req.TaskID,
+			Success:      true,
+			Output:       result,
+			Duration:     time.Since(startTime),
+			FilesChanged: make([]FileChange, 0),
+		},
 		Timestamp: time.Now(),
 	}, nil
 }
 
+func (e *Engineer) buildAuditFeedback(verdict *AuditVerdict) string {
+	if verdict == nil || len(verdict.Issues) == 0 {
+		return "The self-audit found issues. Please review and fix your implementation."
+	}
+	msg := fmt.Sprintf("Self-audit failed (score: %.2f). Fix the following issues:\n", verdict.QualityScore)
+	for i, issue := range verdict.Issues {
+		msg += fmt.Sprintf("%d. [%s/%s] %s", i+1, issue.Category, issue.Severity, issue.Description)
+		if issue.File != "" {
+			msg += fmt.Sprintf(" (in %s)", issue.File)
+		}
+		if issue.Suggestion != "" {
+			msg += fmt.Sprintf(" — Suggestion: %s", issue.Suggestion)
+		}
+		msg += "\n"
+	}
+	return msg
+}
+
 // =============================================================================
-// Implementation Protocol Steps
+// Protocol Helpers
 // =============================================================================
 
-// ImplementationPlan represents a planned implementation
-type ImplementationPlan struct {
-	TaskID      string
-	Description string
-	Steps       []ImplementationStep
-	Estimates   EstimateInfo
-}
-
-// ImplementationStep represents a single step in the implementation
-type ImplementationStep struct {
-	ID          string
-	Description string
-	Type        string // "read", "write", "edit", "test", "command"
-	Target      string // file path or command
-	Completed   bool
-}
-
-// EstimateInfo contains estimation information
-type EstimateInfo struct {
-	TotalSteps    int
-	EstimatedTime time.Duration
-	Complexity    string // "low", "medium", "high"
-}
-
-func (e *Engineer) validateTaskScope(ctx context.Context, req *EngineerRequest) error {
+func (e *Engineer) validateTaskScope(_ context.Context, req *EngineerRequest) error {
 	if req.Prompt == "" {
 		return fmt.Errorf("task prompt is required")
 	}
-	return nil
-}
-
-func (e *Engineer) consultLibrarian(ctx context.Context, req *EngineerRequest) error {
-	if e.bus == nil {
-		return fmt.Errorf("event bus not available")
-	}
-
-	start := time.Now()
-	consultation := Consultation{
-		Target:    ConsultLibrarian,
-		Query:     fmt.Sprintf("Search for relevant patterns, similar implementations, and dependencies for: %s", req.Prompt),
-		Timestamp: time.Now(),
-	}
-
-	// Publish request to librarian
-	routeReq := &guide.RouteRequest{
-		CorrelationID:   uuid.New().String(),
-		Input:           consultation.Query,
-		SourceAgentID:   e.id,
-		SourceAgentName: "engineer",
-		TargetAgentID:   "librarian",
-		FireAndForget:   true, // Non-blocking consultation
-		SessionID:       e.config.SessionID,
-		Timestamp:       time.Now(),
-	}
-
-	if err := e.PublishRequest(routeReq); err != nil {
-		return err
-	}
-
-	consultation.Duration = time.Since(start)
-	e.recordConsultation(consultation)
-	return nil
-}
-
-func (e *Engineer) consultAcademic(ctx context.Context, req *EngineerRequest, reason string) error {
-	if e.bus == nil {
-		return fmt.Errorf("event bus not available")
-	}
-
-	start := time.Now()
-	consultation := Consultation{
-		Target:    ConsultAcademic,
-		Query:     fmt.Sprintf("Need guidance for task: %s. Reason: %s", req.Prompt, reason),
-		Timestamp: time.Now(),
-	}
-
-	// Publish request to academic
-	routeReq := &guide.RouteRequest{
-		CorrelationID:   uuid.New().String(),
-		Input:           consultation.Query,
-		SourceAgentID:   e.id,
-		SourceAgentName: "engineer",
-		TargetAgentID:   "academic",
-		FireAndForget:   true,
-		SessionID:       e.config.SessionID,
-		Timestamp:       time.Now(),
-	}
-
-	if err := e.PublishRequest(routeReq); err != nil {
-		return err
-	}
-
-	consultation.Duration = time.Since(start)
-	e.recordConsultation(consultation)
 	return nil
 }
 
@@ -576,134 +651,7 @@ func (e *Engineer) checkPreviousFailures(taskID string) *FailureRecord {
 	return e.failures[taskID]
 }
 
-func (e *Engineer) planImplementation(ctx context.Context, req *EngineerRequest) (*ImplementationPlan, error) {
-	// Create a basic implementation plan
-	// In a full implementation, this would use LLM to generate steps
-	plan := &ImplementationPlan{
-		TaskID:      req.TaskID,
-		Description: req.Prompt,
-		Steps:       make([]ImplementationStep, 0),
-		Estimates: EstimateInfo{
-			Complexity: "medium",
-		},
-	}
-
-	// Basic step: analyze task
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Analyze task requirements",
-		Type:        "analyze",
-	})
-
-	// Basic step: implement
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Implement solution",
-		Type:        "implement",
-	})
-
-	// Basic step: validate
-	plan.Steps = append(plan.Steps, ImplementationStep{
-		ID:          uuid.New().String(),
-		Description: "Validate implementation",
-		Type:        "validate",
-	})
-
-	plan.Estimates.TotalSteps = len(plan.Steps)
-	plan.Estimates.EstimatedTime = time.Duration(len(plan.Steps)) * 5 * time.Minute
-
-	return plan, nil
-}
-
-// PreImplementationIssue represents an issue found during pre-implementation checks
-type PreImplementationIssue struct {
-	Type        string // "memory_leak", "race_condition", "deadlock", "off_by_one", "missing_error_handling", "code_smell"
-	Description string
-	Severity    string // "low", "medium", "high", "critical"
-	Unclear     bool   // Whether the issue needs clarification
-}
-
-func (e *Engineer) preImplementationChecks(ctx context.Context, req *EngineerRequest, plan *ImplementationPlan) []PreImplementationIssue {
-	// Pre-implementation checks for:
-	// - Memory leaks
-	// - Race conditions
-	// - Deadlocks
-	// - Off-by-one bugs
-	// - Missing error handling
-	// - Code smells
-	//
-	// In a full implementation, this would analyze the task and existing code
-	return nil
-}
-
-func (e *Engineer) hasUnclearIssues(issues []PreImplementationIssue) bool {
-	for _, issue := range issues {
-		if issue.Unclear {
-			return true
-		}
-	}
-	return false
-}
-
-func (e *Engineer) executeImplementation(ctx context.Context, req *EngineerRequest, plan *ImplementationPlan) (*TaskResult, error) {
-	start := time.Now()
-	result := &TaskResult{
-		TaskID:       req.TaskID,
-		FilesChanged: make([]FileChange, 0),
-	}
-
-	// Execute each step in the plan
-	for i, step := range plan.Steps {
-		e.updateProgress(req.TaskID, i+1, len(plan.Steps), step.Description)
-
-		// Execute step based on type
-		switch step.Type {
-		case "analyze":
-			// Analysis step - read relevant files
-			e.logger.Debug("executing analysis step", "step", step.Description)
-
-		case "implement":
-			// Implementation step - write/edit files
-			e.logger.Debug("executing implementation step", "step", step.Description)
-
-		case "validate":
-			// Validation step - run tests
-			e.logger.Debug("executing validation step", "step", step.Description)
-
-		default:
-			e.logger.Debug("executing step", "type", step.Type, "description", step.Description)
-		}
-
-		step.Completed = true
-	}
-
-	result.Success = true
-	result.Duration = time.Since(start)
-	result.Output = "Implementation completed successfully"
-
-	return result, nil
-}
-
-func (e *Engineer) validateResult(ctx context.Context, result *TaskResult) error {
-	// Validate the implementation result
-	// In a full implementation, this would run tests and checks
-	if result == nil {
-		return fmt.Errorf("result is nil")
-	}
-	return nil
-}
-
-func (e *Engineer) scopeLimitResponse(req *EngineerRequest, plan *ImplementationPlan, startTime time.Time) (*EngineerResponse, error) {
-	return &EngineerResponse{
-		ID:        uuid.New().String(),
-		RequestID: req.ID,
-		Success:   false,
-		Error:     fmt.Sprintf("SCOPE LIMIT EXCEEDED: Task requires %d steps (max %d). Request Architect decomposition.", len(plan.Steps), MaxTodosBeforeArchitect),
-		Timestamp: time.Now(),
-	}, fmt.Errorf("scope limit exceeded: %d steps required, max is %d", len(plan.Steps), MaxTodosBeforeArchitect)
-}
-
-func (e *Engineer) failureResponse(req *EngineerRequest, err error, startTime time.Time) (*EngineerResponse, error) {
+func (e *Engineer) failureResponse(req *EngineerRequest, err error, _ time.Time) (*EngineerResponse, error) {
 	return &EngineerResponse{
 		ID:        uuid.New().String(),
 		RequestID: req.ID,
@@ -711,6 +659,16 @@ func (e *Engineer) failureResponse(req *EngineerRequest, err error, startTime ti
 		Error:     err.Error(),
 		Timestamp: time.Now(),
 	}, err
+}
+
+// isTesterAvailable checks if any known agent has a tester type.
+func (e *Engineer) isTesterAvailable() bool {
+	for _, ann := range e.knownAgents {
+		if ann.AgentType == "tester" || ann.AgentType == "tester-pipeline" {
+			return true
+		}
+	}
+	return false
 }
 
 // =============================================================================
@@ -722,20 +680,6 @@ func (e *Engineer) setStatus(status AgentStatus) {
 	defer e.stateMu.Unlock()
 	e.state.Status = status
 	e.state.LastActiveAt = time.Now()
-}
-
-func (e *Engineer) updateProgress(taskID string, completed, total int, currentStep string) {
-	e.stateMu.Lock()
-	defer e.stateMu.Unlock()
-	e.state.CurrentTaskID = taskID
-	e.state.LastActiveAt = time.Now()
-
-	// Could emit progress event here
-	e.logger.Debug("progress update",
-		"task_id", taskID,
-		"step", fmt.Sprintf("%d/%d", completed, total),
-		"current", currentStep,
-	)
 }
 
 func (e *Engineer) recordFailure(taskID, errorMsg, approach string) {
@@ -795,6 +739,7 @@ func (e *Engineer) GetConsultations() []Consultation {
 func (e *Engineer) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      e.id,
+		Type:    "engineer",
 		Name:    "engineer",
 		Aliases: []string{"eng", "impl", "code", "implement"},
 
@@ -815,31 +760,15 @@ func (e *Engineer) GetRoutingInfo() *guide.AgentRoutingInfo {
 
 		Triggers: guide.AgentTriggers{
 			StrongTriggers: []string{
-				"implement",
-				"code",
-				"write",
-				"create",
-				"build",
-				"fix",
-				"refactor",
-				"add feature",
-				"modify",
-				"update code",
+				"implement", "code", "write", "create", "build",
+				"fix", "refactor", "add feature", "modify", "update code",
 			},
 			WeakTriggers: []string{
-				"function",
-				"method",
-				"class",
-				"file",
-				"module",
+				"function", "method", "class", "file", "module",
 			},
 			IntentTriggers: map[guide.Intent][]string{
 				guide.IntentComplete: {
-					"implement",
-					"code",
-					"write",
-					"create",
-					"build",
+					"implement", "code", "write", "create", "build",
 				},
 			},
 		},
@@ -864,7 +793,7 @@ func (e *Engineer) GetRoutingInfo() *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.7,
 			},
-			Description: "Code implementation specialist. Executes coding tasks with clean, modular, testable, readable code.",
+			Description: "Staff-level implementation engineer. GPT-5.3 Codex with xhigh reasoning. Executes coding tasks with self-audit and consultation.",
 			Priority:    70,
 		},
 	}
@@ -898,7 +827,7 @@ func (e *Engineer) GetToolDefinitions() []map[string]any {
 }
 
 // =============================================================================
-// ContainerAgent Interface
+// HandoffInjectable Interface
 // =============================================================================
 
 // AgentID returns the unique instance identifier for this engineer.
@@ -909,6 +838,47 @@ func (e *Engineer) AgentID() string {
 // AgentType returns the type classification for this agent.
 func (e *Engineer) AgentType() string {
 	return "engineer"
+}
+
+// Descriptor returns the agent's descriptor for handoff operations.
+func (e *Engineer) Descriptor() handoff.AgentDescriptor {
+	return handoff.AgentDescriptor{
+		AgentType:       "engineer",
+		ModelID:         "gpt-5.3-codex",
+		ReasoningEffort: "xhigh",
+		ContextWindow:   200_000,
+		Category:        handoff.CategoryPipeline,
+	}
+}
+
+// InjectPreparedContext accepts a handoff context (no-op for now).
+func (e *Engineer) InjectPreparedContext(_ *handoff.PreparedContext) error {
+	return nil
+}
+
+// SetHandoffBridge sets the handoff bridge for this engineer.
+func (e *Engineer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	e.handoffBridge = bridge
+}
+
+// SetFileAccess injects the FileAccess implementation for this pipeline.
+// Called by the Orchestrator when dispatching the engineer to a pipeline.
+func (e *Engineer) SetFileAccess(fa versioning.FileAccess) {
+	e.fileAccess = fa
+}
+
+// SetEscalator injects the confidence-based escalation evaluator.
+func (e *Engineer) SetEscalator(esc *escalation.Escalator) {
+	e.escalator = esc
+}
+
+// ExtractArchivableState returns the engineer's archivable state.
+func (e *Engineer) ExtractArchivableState() *handoff.ArchivableState {
+	return &handoff.ArchivableState{
+		AgentID:   e.id,
+		AgentType: "engineer",
+		Timestamp: time.Now(),
+	}
 }
 
 // Terminate gracefully shuts down the engineer agent.

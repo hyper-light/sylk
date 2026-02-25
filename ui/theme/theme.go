@@ -7,8 +7,9 @@ type Theme struct {
 	Palette Palette
 
 	// Panel styles
-	ActiveBorder   lipgloss.Style
-	InactiveBorder lipgloss.Style
+	ActiveBorder       lipgloss.Style
+	ActiveBorderRender func(content string, innerW, innerH, maxH int) string // Per-character gradient border (nil = use ActiveBorder).
+	InactiveBorder     lipgloss.Style
 
 	// Chat message styles
 	UserMessage   lipgloss.Style

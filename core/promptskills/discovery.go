@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	coreskills "github.com/adalundhe/sylk/core/skills"
 	promptskills "github.com/adalundhe/sylk/skills"
 )
 
@@ -173,4 +174,57 @@ func uniqueNonEmpty(values []string) []string {
 		result = append(result, trimmed)
 	}
 	return result
+}
+
+// GoSkillsToPromptSkills converts Go-coded skills (core/skills.Skill) to
+// prompt skill format (skills.Skill) by parsing each skill's ToMarkdown()
+// output. Skills whose markdown fails to parse are silently skipped.
+func GoSkillsToPromptSkills(goSkills []*coreskills.Skill) []promptskills.Skill {
+	result := make([]promptskills.Skill, 0, len(goSkills))
+	for _, gs := range goSkills {
+		ps, ok := goSkillToPromptSkill(gs)
+		if !ok {
+			continue
+		}
+		result = append(result, ps)
+	}
+	return result
+}
+
+func goSkillToPromptSkill(gs *coreskills.Skill) (promptskills.Skill, bool) {
+	if gs == nil || strings.TrimSpace(gs.Name) == "" {
+		return promptskills.Skill{}, false
+	}
+	md := gs.ToMarkdown()
+	parsed, err := promptskills.ReadSkillString(md)
+	if err != nil || parsed == nil {
+		return promptskills.Skill{}, false
+	}
+	return *parsed, true
+}
+
+// MergePromptSkills merges disk-discovered prompt skills with Go-coded skill
+// prompt representations. Disk skills take precedence on name collision.
+func MergePromptSkills(diskSkills []promptskills.Skill, goSkills []*coreskills.Skill) []promptskills.Skill {
+	converted := GoSkillsToPromptSkills(goSkills)
+	if len(converted) == 0 {
+		return diskSkills
+	}
+	seen := make(map[string]struct{}, len(diskSkills))
+	for _, ds := range diskSkills {
+		seen[ds.Name] = struct{}{}
+	}
+	merged := make([]promptskills.Skill, len(diskSkills), len(diskSkills)+len(converted))
+	copy(merged, diskSkills)
+	for _, cs := range converted {
+		if _, exists := seen[cs.Name]; exists {
+			continue
+		}
+		seen[cs.Name] = struct{}{}
+		merged = append(merged, cs)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].Name < merged[j].Name
+	})
+	return merged
 }

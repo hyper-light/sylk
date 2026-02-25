@@ -152,8 +152,14 @@ func DefaultApprovedPatterns() ApprovedCommandPatterns {
 
 // EngineerConfig contains configuration options for the Engineer agent.
 type EngineerConfig struct {
-	// Model is the AI model to use (default: Opus 4.5).
+	// Model is the AI model to use (default: gpt-5.3-codex).
 	Model string `json:"model"`
+	// ReasoningEffort controls the model's reasoning depth (default: xhigh).
+	ReasoningEffort string `json:"reasoning_effort"`
+	// MaxToolRuns bounds the LLM tool-call loop iterations (default: 16).
+	MaxToolRuns int `json:"max_tool_runs"`
+	// MaxTokens is the maximum output tokens per LLM call (default: 16384).
+	MaxTokens int `json:"max_tokens"`
 	// MaxConcurrentTasks limits parallel task execution.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
 	// CommandTimeout is the maximum time for a single command execution.
@@ -168,6 +174,8 @@ type EngineerConfig struct {
 	EnableFileWrites bool `json:"enable_file_writes"`
 	// EnableCommands allows the Engineer to execute shell commands.
 	EnableCommands bool `json:"enable_commands"`
+	// SessionID identifies the current session for consultation routing.
+	SessionID string `json:"session_id"`
 }
 
 // FileChange represents a modification to a file during task execution.

@@ -86,6 +86,10 @@ type Message struct {
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolName   string     `json:"tool_name,omitempty"`
 
+	// IsError signals that a tool result represents a failed invocation.
+	// Used by providers to set the API's is_error flag (e.g. Anthropic).
+	IsError bool `json:"is_error,omitempty"`
+
 	// Metadata carries provider-specific data through multi-turn loops.
 	// For Google, this preserves raw model content with thought signatures.
 	Metadata map[string]any `json:"metadata,omitempty"`

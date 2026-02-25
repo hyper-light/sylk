@@ -347,6 +347,16 @@ const (
 	MessageTypePipelineQuery     MessageType = "pipeline_query"
 	MessageTypePipelineQueryResp MessageType = "pipeline_query_response"
 	MessageTypeDAGModify         MessageType = "dag_modify"
+
+	// MessageTypeAuthChanged is published when credential availability changes.
+	MessageTypeAuthChanged MessageType = "auth_changed"
+
+	// MessageTypeLayerDecision is published when a DAG layer has a blocking failure
+	// requiring a user decision (retry, skip, or abort).
+	MessageTypeLayerDecision MessageType = "layer_decision"
+
+	// MessageTypeLayerDecisionResponse carries the user's decision for a blocking layer.
+	MessageTypeLayerDecisionResponse MessageType = "layer_decision_response"
 )
 
 // =============================================================================
@@ -418,6 +428,11 @@ const (
 	// TopicRoutesLearned is where Guide broadcasts newly learned routes.
 	// Agents can subscribe to sync their local route caches.
 	TopicRoutesLearned = "routes.learned"
+
+	// TopicAuthCredentials is where the AuthRegistry broadcasts credential
+	// availability changes. DaemonSet agents subscribe directly; on-demand
+	// agents are refreshed via the container-walk refresher.
+	TopicAuthCredentials = "auth.credentials"
 )
 
 // AgentTopic returns the topic for a specific agent and channel type
@@ -914,4 +929,38 @@ func NewRerouteMessage(id string, reroute *RerouteRequest) *Message {
 func (m *Message) GetRerouteRequest() (*RerouteRequest, bool) {
 	req, ok := m.Payload.(*RerouteRequest)
 	return req, ok
+}
+
+// =============================================================================
+// Auth Changed Messages
+// =============================================================================
+
+// AuthEventPayload is the bus payload for credential availability changes.
+type AuthEventPayload struct {
+	ProviderType string `json:"provider_type"` // "google", "anthropic", "openai"
+	AuthMethod   string `json:"auth_method"`   // "oauth", "api_key", etc.
+	Available    bool   `json:"available"`
+}
+
+// NewAuthChangedMessage creates a message announcing a credential change.
+func NewAuthChangedMessage(id string, event AuthEventPayload) *Message {
+	if id == "" {
+		id = uuid.New().String()
+	}
+	return &Message{
+		ID:            id,
+		Type:          MessageTypeAuthChanged,
+		Payload:       &event,
+		SourceAgentID: "auth_registry",
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityHigh,
+	}
+}
+
+// GetAuthEvent extracts AuthEventPayload from message payload.
+func (m *Message) GetAuthEvent() (*AuthEventPayload, bool) {
+	ev, ok := m.Payload.(*AuthEventPayload)
+	return ev, ok
 }

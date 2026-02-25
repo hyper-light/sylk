@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -55,6 +56,89 @@ func (e *ProviderError) Error() string {
 
 func (e *ProviderError) Unwrap() error {
 	return e.Underlying
+}
+
+// UserMessage returns a concise, human-readable error description suitable for
+// display in the chat panel. It extracts the nested "message" field from JSON
+// error bodies (common with Google/OpenAI APIs) and maps HTTP status codes to
+// friendly labels.
+func (e *ProviderError) UserMessage() string {
+	label := httpStatusLabel(e.StatusCode)
+
+	// Try to extract a human-readable message from embedded JSON.
+	if extracted := extractJSONMessage(e.Message); extracted != "" {
+		if label != "" {
+			return label + " — " + extracted
+		}
+		return extracted
+	}
+
+	// Strip any trailing "(status NNN)" since we include the label.
+	msg := e.Message
+	if suffix := fmt.Sprintf(" (status %d)", e.StatusCode); strings.HasSuffix(msg, suffix) {
+		msg = strings.TrimSuffix(msg, suffix)
+	}
+
+	// Strip the JSON body if we couldn't parse it but have a prefix.
+	if idx := strings.Index(msg, "{"); idx > 0 {
+		msg = strings.TrimSpace(msg[:idx])
+	}
+
+	if label != "" && msg != "" {
+		return label + " — " + msg
+	}
+	if label != "" {
+		return label
+	}
+	return msg
+}
+
+// httpStatusLabel returns a short human label for common HTTP error codes.
+func httpStatusLabel(code int) string {
+	switch code {
+	case http.StatusTooManyRequests:
+		return "Rate limited"
+	case http.StatusUnauthorized:
+		return "Authentication failed"
+	case http.StatusForbidden:
+		return "Access denied"
+	case http.StatusPaymentRequired:
+		return "Quota exceeded"
+	case http.StatusBadRequest:
+		return "Bad request"
+	case http.StatusNotFound:
+		return "Endpoint not found"
+	case http.StatusServiceUnavailable:
+		return "Service unavailable"
+	case http.StatusGatewayTimeout:
+		return "Gateway timeout"
+	case http.StatusInternalServerError:
+		return "Server error"
+	default:
+		if code >= 500 {
+			return "Server error"
+		}
+		return ""
+	}
+}
+
+// extractJSONMessage finds an embedded JSON object in s and returns the
+// "error.message" field if present. Handles the common Google/OpenAI
+// envelope format: {"error":{"message":"..."}}.
+func extractJSONMessage(s string) string {
+	idx := strings.Index(s, "{")
+	if idx < 0 {
+		return ""
+	}
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(s[idx:]), &envelope) == nil && envelope.Error.Message != "" {
+		return envelope.Error.Message
+	}
+	return ""
 }
 
 // Is implements errors.Is for common error types

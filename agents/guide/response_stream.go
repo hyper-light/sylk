@@ -7,7 +7,28 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/events"
 )
+
+// ConversationPhase identifies a phase-aware classification mode the Guide
+// should enter after an agent emits a ResponseDirective on StreamEventComplete.
+type ConversationPhase string
+
+const (
+	PhaseNone         ConversationPhase = ""
+	PhasePlanApproval ConversationPhase = "plan_approval"
+)
+
+// ResponseDirective signals the Guide to enter a conversation phase for the
+// session. The next user message is classified by the phase gate (binary
+// polarity) instead of the full intent classifier.
+type ResponseDirective struct {
+	Phase    ConversationPhase `json:"phase"`
+	AgentID  string            `json:"agent_id"`
+	Metadata map[string]any    `json:"metadata,omitempty"`
+	TTL      time.Duration     `json:"ttl"`
+}
 
 // ErrStreamClosed is returned when attempting to send to a closed stream.
 var ErrStreamClosed = &streamError{msg: "stream is closed"}
@@ -110,6 +131,15 @@ type StreamEvent struct {
 	// Real token usage from LLM provider (populated on StreamEventComplete)
 	Usage *StreamUsage `json:"usage,omitempty"`
 
+	// Directive signals the Guide to enter a conversation phase for the session.
+	// Populated on StreamEventComplete when the agent wants phase-aware
+	// classification of the next user message.
+	Directive *ResponseDirective `json:"directive,omitempty"`
+
+	// Visibility classifies who should see this event. Zero value (VisibilityUser)
+	// means user-facing for backwards compatibility.
+	Visibility events.EventVisibility `json:"visibility"`
+
 	// Metadata
 	Timestamp time.Time `json:"timestamp"`
 	Sequence  int64     `json:"sequence"`
@@ -145,6 +175,9 @@ const (
 
 	// StreamEventReroute indicates an agent-initiated reroute to a different agent.
 	StreamEventReroute StreamEventType = "reroute"
+
+	// StreamEventToolCall carries a tool call start or completion event.
+	StreamEventToolCall StreamEventType = "tool_call"
 )
 
 // StreamStats contains stream manager statistics
@@ -269,6 +302,17 @@ func (sm *StreamManager) CloseAll() int {
 // =============================================================================
 // Stream Operations
 // =============================================================================
+
+// ForwardEvent sends a pre-built StreamEvent to the stream, preserving its
+// original Type. Use this when relaying events from external sources (e.g.
+// agent bus messages) where the event type must not be re-wrapped.
+func (rs *ResponseStream) ForwardEvent(event *StreamEvent) bool {
+	if event == nil || rs.closed.Load() {
+		return false
+	}
+	event.Sequence = atomic.AddInt64(&rs.eventCount, 1)
+	return rs.sendEvent(event)
+}
 
 // SendData sends a data event to a stream
 func (rs *ResponseStream) SendData(data any) bool {

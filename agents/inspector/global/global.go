@@ -12,11 +12,21 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/providers/gateway"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
+
+// inspectorProvider is the minimal interface the GlobalInspector needs from its LLM.
+// Satisfied by *providers.AnthropicProvider and *gateway.GatewayProvider.
+type inspectorProvider interface {
+	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+	StreamWithHandler(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error
+}
 
 // GlobalInspector validates cross-file architectural quality on DAG layer completion.
 type GlobalInspector struct {
@@ -25,7 +35,8 @@ type GlobalInspector struct {
 	logger *slog.Logger
 
 	// LLM provider (Anthropic Opus 4.6).
-	provider *providers.AnthropicProvider
+	provider        inspectorProvider
+	providerWrapper gateway.ProviderWrapper
 
 	// Tool runner for external analysis tools.
 	toolRunner *shared.ToolRunner
@@ -54,14 +65,17 @@ type GlobalInspector struct {
 
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
+
+	// File access (injected per-session at runtime).
+	fileAccess versioning.FileAccess
 }
 
 // New creates a new GlobalInspector instance.
-func New(cfg shared.GlobalInspectorConfig, provider *providers.AnthropicProvider) (*GlobalInspector, error) {
+func New(cfg shared.GlobalInspectorConfig, provider inspectorProvider) (*GlobalInspector, error) {
 	cfg = applyConfigDefaults(cfg)
 
 	gi := &GlobalInspector{
-		id:          fmt.Sprintf("inspector_%s", uuid.New().String()[:8]),
+		id:          uuid.New().String()[:8],
 		config:      cfg,
 		logger:      slog.Default().With("agent", "inspector"),
 		provider:    provider,
@@ -73,6 +87,52 @@ func New(cfg shared.GlobalInspectorConfig, provider *providers.AnthropicProvider
 
 	gi.initSkills()
 	return gi, nil
+}
+
+// SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+func (gi *GlobalInspector) SetProvider(p inspectorProvider) {
+	gi.mu.Lock()
+	defer gi.mu.Unlock()
+	gi.provider = p
+}
+
+// SetProviderWrapper stores a callback that re-applies gateway rate limiting
+// to fresh providers created during credential refresh.
+func (gi *GlobalInspector) SetProviderWrapper(w gateway.ProviderWrapper) {
+	gi.providerWrapper = w
+}
+
+// getProvider returns the current provider under read lock.
+func (gi *GlobalInspector) getProvider() inspectorProvider {
+	gi.mu.RLock()
+	defer gi.mu.RUnlock()
+	return gi.provider
+}
+
+// ProviderType implements container.AuthRefreshable.
+func (gi *GlobalInspector) ProviderType() string { return "anthropic" }
+
+// RefreshProvider implements container.AuthRefreshable.
+// Re-resolves Anthropic credentials and replaces the provider.
+func (gi *GlobalInspector) RefreshProvider(_ context.Context) error {
+	cfg := providers.AnthropicConfig{
+		BaseConfig: providers.BaseConfig{
+			Model:     gi.config.Model,
+			MaxTokens: gi.config.MaxTokens,
+		},
+		AuthMode: providers.AnthropicAuthModeAPIKey,
+	}
+	p, err := providers.NewAnthropicProvider(cfg)
+	if err != nil {
+		return fmt.Errorf("inspector refresh provider: %w", err)
+	}
+	var wrapped inspectorProvider = p
+	if gi.providerWrapper != nil {
+		wrapped = gi.providerWrapper(p)
+	}
+	gi.SetProvider(wrapped)
+	gi.logger.Info("provider refreshed")
+	return nil
 }
 
 func applyConfigDefaults(cfg shared.GlobalInspectorConfig) shared.GlobalInspectorConfig {
@@ -154,7 +214,7 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 	}
 
 	gi.bus = bus
-	gi.channels = guide.NewAgentChannels(gi.id, "inspector")
+	gi.channels = guide.NewAgentChannels("inspector", gi.id)
 
 	var err error
 	gi.requestSub, err = bus.SubscribeAsync(gi.channels.Requests, gi.handleBusRequest)
@@ -231,13 +291,19 @@ func (gi *GlobalInspector) unsubRegistry() error {
 	return err
 }
 
-// Handle processes a forwarded request.
+// Handle processes a forwarded request with intent dispatch.
 func (gi *GlobalInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	if staticResult := shared.TryStaticReply(fwd.Input, gi.getState(), nil); staticResult != nil {
-		return staticResult, nil
+	switch fwd.Intent {
+	case guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
+		return gi.handleConversation(ctx, fwd)
+	default:
+		return gi.handleTaskRequest(ctx, fwd)
 	}
+}
 
-	if gi.provider == nil {
+// handleTaskRequest processes non-conversational task requests (audits, checks).
+func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if gi.getProvider() == nil {
 		return shared.ConversationFallback(gi.getState()), nil
 	}
 
@@ -259,9 +325,9 @@ func (gi *GlobalInspector) Handle(ctx context.Context, fwd *guide.ForwardedReque
 		return nil, fmt.Errorf("global inspector tool loop: %w", err)
 	}
 
-	return map[string]any{
-		"response": result,
-		"agent_id": gi.id,
+	return &ConversationResult{
+		Response: result,
+		Intent:   string(fwd.Intent),
 	}, nil
 }
 
@@ -281,8 +347,11 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
 
+	toolEmitter := agentShared.NewToolCallEmitter(gi.bus, gi.channels, "inspector", fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
+
 	if !fwd.FireAndForget {
-		shared.PublishStreamStart(gi.bus, gi.channels, ctx, gi.id)
+		shared.PublishStreamStart(gi.bus, gi.channels, ctx, "inspector")
 	}
 
 	result, err := gi.Handle(ctx, fwd)
@@ -292,20 +361,23 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	}
 
 	if err != nil {
-		shared.PublishStreamError(gi.bus, gi.channels, ctx, gi.id, err)
-		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, "", usageAcc.Total())
+		shared.PublishStreamError(gi.bus, gi.channels, ctx, "inspector", err)
+		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, "inspector", "", usageAcc.Total())
 		errMsg := guide.NewErrorMessage(gi.generateMessageID(), fwd.CorrelationID, gi.id, err.Error())
 		return gi.bus.Publish(gi.channels.Errors, errMsg)
 	}
 
-	shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, "", usageAcc.Total())
+	// For streamed conversations, include the authoritative text in the
+	// completion event so the chat model can correct dropped/reordered chunks.
+	completeText := extractInspectorUserResponse(result)
+	shared.PublishStreamComplete(gi.bus, gi.channels, ctx, "inspector", completeText, usageAcc.Total())
 
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             true,
 		Data:                result,
-		RespondingAgentID:   gi.id,
-		RespondingAgentName: "inspector",
+		RespondingAgentID:   "inspector",
+		RespondingAgentName: "Inspector",
 		ProcessingTime:      time.Since(startTime),
 	}
 	respMsg := guide.NewResponseMessage(gi.generateMessageID(), resp)
@@ -363,13 +435,20 @@ func (gi *GlobalInspector) DiffStore() *AuditDiffStore { return gi.diffStore }
 func (gi *GlobalInspector) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      gi.id,
-		Name:    "inspector",
+		Type:    "inspector",
+		Name:    "Inspector",
 		Aliases: []string{"global-inspector", "audit", "quality-audit"},
 		ActionShortcuts: []guide.ActionShortcut{
 			{
 				Name:          "audit",
 				Description:   "Audit code quality across files",
 				DefaultIntent: guide.IntentCheck,
+				DefaultDomain: guide.DomainCode,
+			},
+			{
+				Name:          "chat",
+				Description:   "Conversational interaction",
+				DefaultIntent: guide.IntentChat,
 				DefaultDomain: guide.DomainCode,
 			},
 		},
@@ -384,10 +463,10 @@ func (gi *GlobalInspector) GetRoutingInfo() *guide.AgentRoutingInfo {
 		},
 		Registration: &guide.AgentRegistration{
 			ID:      gi.id,
-			Name:    "inspector",
+			Name:    "Inspector",
 			Aliases: []string{"global-inspector", "audit"},
 			Capabilities: guide.AgentCapabilities{
-				Intents:  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp},
+				Intents:  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp, guide.IntentChat},
 				Domains:  []guide.Domain{guide.DomainCode},
 				Tags:     []string{"audit", "quality", "cross-file", "architecture", "plan"},
 				Keywords: []string{"audit", "inspect", "quality", "cross-file", "plan", "architecture"},
@@ -447,6 +526,11 @@ func (gi *GlobalInspector) Terminate(_ context.Context) error { return gi.Close(
 // SetHandoffBridge sets the handoff bridge for this agent.
 func (gi *GlobalInspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	gi.handoffBridge = bridge
+}
+
+// SetFileAccess injects the per-session file access layer.
+func (gi *GlobalInspector) SetFileAccess(fa versioning.FileAccess) {
+	gi.fileAccess = fa
 }
 
 // ExtractArchivableState returns the archivable state of this agent.

@@ -124,6 +124,14 @@ func findBoundaryBeforeOpenFence(content string, candidateBoundary int) int {
 // trimTrailingBlankLines pass on the merged result produces output identical
 // to a single-pass renderMarkdownContent call.
 func renderStreamingEntry(content string, width int, th *theme.Theme, cache *codeBlockCache, state *streamRenderState) ([]string, []CodeRegion) {
+	// Guard: if content shrank below the cached stable boundary (e.g., stream
+	// retry reset raced with render), reset the state to avoid slice panic.
+	if state.lastStableLen > len(content) {
+		state.lastStableLen = 0
+		state.stableLines = nil
+		state.stableRegions = nil
+	}
+
 	boundary := findStableBoundary(content)
 
 	// If stable prefix grew, re-render it (includes newly completed blocks).

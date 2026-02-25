@@ -29,6 +29,27 @@ type CodeRegion struct {
 	Content string // Raw code without fence markers.
 }
 
+// ToolCallRecord tracks a single tool invocation for inline display.
+type ToolCallRecord struct {
+	ToolName    string
+	ArgsSummary string        // Compact one-liner (from SummarizeToolArgs).
+	FullArgs    string        // Pretty-printed JSON (for expanded view).
+	Output      string        // Truncated tool output (max 512 chars).
+	ErrorMsg    string        // Error message on failure.
+	StartedAt   time.Time
+	Duration    time.Duration
+	Success     bool
+	Completed   bool
+	Expanded    bool // Toggle state for expand/collapse.
+}
+
+// ToolCallRegion describes a tool call block's position within rendered lines.
+type ToolCallRegion struct {
+	Start     int // First rendered line (inclusive).
+	End       int // Last rendered line (exclusive).
+	RecordIdx int // Index into ChatEntry.ToolCalls.
+}
+
 // ChatEntry represents a single message in the chat history.
 type ChatEntry struct {
 	ID            string
@@ -43,6 +64,10 @@ type ChatEntry struct {
 	Height        int          // Cached line count (-1 means not yet computed).
 	Streaming     bool         // True while still receiving chunks.
 	Importance    float64
+
+	// Tool call visualization.
+	ToolCalls       []ToolCallRecord // Inline tool call records (bounded by agent MaxToolRuns).
+	ToolCallRegions []ToolCallRegion // Cached tool call positions (lazily computed with RenderedLines).
 
 	// Thinking indicator state.
 	ThinkingText    string        // Animated spinner + timer line (set by model on tick).
@@ -84,6 +109,15 @@ func (h *History) Push(entry *ChatEntry) {
 	if h.count < h.capacity {
 		h.count++
 	}
+}
+
+// Clear resets the ring buffer, discarding all entries.
+func (h *History) Clear() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	clear(h.entries)
+	h.head = 0
+	h.count = 0
 }
 
 // Len returns the number of valid entries.
@@ -165,6 +199,7 @@ func (h *History) InvalidateRender(index int) {
 	physical := h.logicalToPhysical(index)
 	h.entries[physical].RenderedLines = nil
 	h.entries[physical].CodeRegions = nil
+	h.entries[physical].ToolCallRegions = nil
 	h.entries[physical].Height = -1
 }
 

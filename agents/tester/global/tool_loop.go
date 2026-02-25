@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -18,8 +19,13 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 	seen := make(map[toolCallSignature]int, gt.config.MaxToolRuns)
 	consecutiveErrors := 0
 
+	provider := gt.getProvider()
+	if provider == nil {
+		return "", fmt.Errorf("global tester: no LLM provider configured")
+	}
+
 	for turn := 0; turn <= gt.config.MaxToolRuns; turn++ {
-		resp, err := gt.provider.Complete(ctx, req)
+		resp, err := provider.Complete(ctx, req)
 		if err != nil {
 			return "", fmt.Errorf("global tester llm: %w", err)
 		}
@@ -65,13 +71,17 @@ func (gt *GlobalTester) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
-		result, err := gt.executeToolCall(ctx, call)
+		result, err := agentshared.TimedToolCall(ctx, "tester", call, func() (string, error) {
+			return gt.executeToolCall(ctx, call)
+		})
+		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
 			} else {
 				result = toolErrorPayload(err)
+				isError = true
 				errCount++
 			}
 		}
@@ -80,6 +90,7 @@ func (gt *GlobalTester) applyToolCalls(
 			ToolCallID: call.ID,
 			ToolName:   call.Name,
 			Content:    result,
+			IsError:    isError,
 		})
 		if rerouted {
 			break

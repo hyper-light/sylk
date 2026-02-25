@@ -426,8 +426,18 @@ type TokenSuggestion struct {
 
 // DesignerConfig contains configuration options for the Designer agent.
 type DesignerConfig struct {
-	// Model is the AI model to use (default: Claude Opus 4.5).
+	// Model is the AI model to use (default: gemini-3.1-pro-preview).
 	Model string `json:"model"`
+	// ReasoningEffort controls the LLM thinking level (default: high).
+	ReasoningEffort string `json:"reasoning_effort"`
+	// MaxToolRuns bounds the number of tool-call loop iterations.
+	MaxToolRuns int `json:"max_tool_runs"`
+	// MaxTokens is the maximum output tokens per LLM call.
+	MaxTokens int `json:"max_tokens"`
+	// DefaultTimeout is the deadline for a single Handle invocation.
+	DefaultTimeout time.Duration `json:"default_timeout"`
+	// SessionID identifies the owning session.
+	SessionID string `json:"session_id"`
 	// MaxConcurrentTasks limits parallel task execution.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
 	// WorkingDirectory is the base directory for file operations.
@@ -440,6 +450,20 @@ type DesignerConfig struct {
 	A11yLevel string `json:"a11y_level"`
 	// MemoryThreshold defines when to trigger pipeline handoff.
 	MemoryThreshold MemoryThreshold `json:"memory_threshold"`
+}
+
+// DefaultDesignerToolLoopConfig returns the default LLM tool loop configuration.
+// MaxToolRuns=16: 6 protocol phases × ~2.5 avg skill invocations per phase.
+// MaxTokens=16384: matches pipeline tester budget.
+// DefaultTimeout=90s: 1.5× pipeline tester's 60s, proportional to larger context.
+func DefaultDesignerToolLoopConfig() DesignerConfig {
+	return DesignerConfig{
+		Model:           "gemini-3.1-pro-preview",
+		ReasoningEffort: "high",
+		MaxToolRuns:     16,
+		MaxTokens:       16384,
+		DefaultTimeout:  90 * time.Second,
+	}
 }
 
 // MemoryThreshold defines context window usage thresholds for the Designer.

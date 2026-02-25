@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -65,13 +66,17 @@ func (pi *PipelineInspector) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
-		result, err := pi.executeToolCall(ctx, call)
+		result, err := agentShared.TimedToolCall(ctx, "inspector-pipeline", call, func() (string, error) {
+			return pi.executeToolCall(ctx, call)
+		})
+		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
 			} else {
 				result = shared.ToolErrorPayload(err)
+				isError = true
 				errCount++
 			}
 		}
@@ -80,6 +85,7 @@ func (pi *PipelineInspector) applyToolCalls(
 			ToolCallID: call.ID,
 			ToolName:   call.Name,
 			Content:    result,
+			IsError:    isError,
 		})
 		if rerouted {
 			break

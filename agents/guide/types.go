@@ -123,8 +123,9 @@ const (
 	IntentLocate Intent = "locate" // Locate specific items
 
 	// Planning intents (handled by Architect)
-	IntentPlan   Intent = "plan"   // Create a design plan
-	IntentDesign Intent = "design" // Design architecture
+	IntentPlan    Intent = "plan"    // Create a design plan
+	IntentDesign  Intent = "design"  // Design architecture
+	IntentExecute Intent = "execute" // Approve/execute a ready plan
 
 	// Meta intents
 	IntentHelp    Intent = "help"    // Request help/guidance
@@ -145,6 +146,7 @@ func AllIntents() []Intent {
 		IntentLocate,
 		IntentPlan,
 		IntentDesign,
+		IntentExecute,
 		IntentHelp,
 		IntentStatus,
 		IntentChat,
@@ -412,6 +414,12 @@ type PendingRequest struct {
 	Classification  *RouteResult  `json:"classification,omitempty"`
 	CreatedAt       time.Time     `json:"created_at"`
 	ExpiresAt       time.Time     `json:"expires_at"`
+
+	// StreamTargetOverride, when non-empty, overrides SourceAgentID for
+	// stream event routing. Set by reroute events so that stream chunks
+	// reach the TUI while the MessageTypeResponse still reaches the
+	// original requester (e.g. architect's sync wait).
+	StreamTargetOverride string `json:"stream_target_override,omitempty"`
 }
 
 // RouteResult represents the result of routing a request
@@ -504,6 +512,9 @@ type ClassificationResult struct {
 
 	// Confidence
 	Confidence float64 `json:"confidence"`
+
+	// Classification method metadata
+	ClassificationMethod string `json:"classification_method,omitempty"` // "dsl", "llm", "rule_preempt", etc.
 
 	// Explicit rejection from classifier (for ambiguity)
 	Rejected bool   `json:"rejected,omitempty"`

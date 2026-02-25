@@ -31,13 +31,14 @@ If the request is compound, set `multi_intent=true` and include `sub_results`.
 3. Route agent-registry questions (for example “how many agents are registered”) to `guide` with `intent=”status”` and `domain=”system”`.
 4. Route status/health questions about Sylk routing behavior to `guide` unless clearly asking for active pipeline/task execution progress (then `orchestrator`).
 5. Route planning/design/work breakdown requests to `architect`.
-6. Route codebase lookup/search questions to `librarian`.
-7. Route past-memory questions to `archivalist`.
-8. Route external research questions to `academic`.
-9. Route testing-only requests to `tester`.
-10. Route compliance/review/verification requests to `inspector`.
-11. Do NOT route to `engineer` or `designer` unless the user explicitly asks for them.
-12. For multi-step execution requests, set `multi_intent=true` and make `architect` the primary target.
+6. Route plan approval/execution requests ("go ahead", "execute", "hand it off", "proceed", "ship it", "kick it off", "run the plan") to `architect` with `intent="execute"`.
+7. Route codebase lookup/search questions to `librarian`.
+8. Route past-memory questions to `archivalist`.
+9. Route external research questions to `academic`.
+10. Route testing-only requests to `tester`.
+11. Route compliance/review/verification requests to `inspector`.
+12. Do NOT route to `engineer` or `designer` unless the user explicitly asks for them.
+13. For multi-step execution requests, set `multi_intent=true` and make `architect` the primary target.
 
 ## Design & Planning Detection (CRITICAL)
 Any request that describes building, creating, designing, planning, or architecting a project, feature, system, application, website, service, API, or tool MUST route to `architect` — regardless of conversational phrasing.
@@ -57,6 +58,18 @@ Examples that MUST route to `architect` (NOT `guide`):
 - “I want to build a CLI tool in Go that does X” → `architect`, `intent=”plan”`, `domain=”planning”`
 - “Let's create a microservices architecture for our payment system” → `architect`, `intent=”design”`, `domain=”planning”`
 - “How should I structure a React app with server-side rendering?” → `architect`, `intent=”design”`, `domain=”planning”`
+
+## Execution Detection
+When the user approves, confirms, or requests execution of a plan, route to `architect` with `intent="execute"`. This includes phrases like:
+- "go ahead" → `architect`, `intent="execute"`, `domain="planning"`
+- "hand it off" → `architect`, `intent="execute"`, `domain="planning"`
+- "ship it" → `architect`, `intent="execute"`, `domain="planning"`
+- "execute the plan" → `architect`, `intent="execute"`, `domain="planning"`
+- "proceed with the handoff" → `architect`, `intent="execute"`, `domain="planning"`
+- "kick it off" → `architect`, `intent="execute"`, `domain="planning"`
+- "run the plan" → `architect`, `intent="execute"`, `domain="planning"`
+
+Do NOT classify these as `chat` or `plan` — they are explicit execution approvals.
 
 ## General Chat Default
 `guide` handles ONLY pure social conversation and Sylk meta questions. If the user mentions ANY concrete work, project, technology, or deliverable, it is NOT general chat.
@@ -95,7 +108,7 @@ Return exactly this JSON shape:
 {
   "is_retrospective": true,
   "rejection_reason": "optional",
-  "intent": "recall|store|check|declare|complete|find|search|locate|plan|design|help|status|chat|unknown",
+  "intent": "recall|store|check|declare|complete|find|search|locate|plan|design|execute|help|status|chat|unknown",
   "domain": "local|history|research|planning|system|compliance|testing|general|unknown",
   "target_agent": "librarian|engineer|designer|tester|inspector|archivalist|academic|orchestrator|architect|guide|unknown",
   "entities": {

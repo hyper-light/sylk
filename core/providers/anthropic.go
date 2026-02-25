@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -330,14 +331,15 @@ func (p *AnthropicProvider) generateOnce(ctx context.Context, req *Request) (*Re
 // StreamWithHandler streams a completion. Auth retry wraps the full transient
 // retry loop so that at most one refresh occurs per call.
 func (p *AnthropicProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
-	err := p.streamWithRetry(ctx, req, handler)
+	wrapped := retryAwareHandler(handler)
+	err := p.streamWithRetry(ctx, req, wrapped)
 	if !p.shouldRetryForAnthropicAuth(err) {
 		return err
 	}
 	if refreshErr := p.refreshAnthropicOAuthAuth(ctx); refreshErr != nil {
 		return refreshErr
 	}
-	return p.streamWithRetry(ctx, req, handler)
+	return p.streamWithRetry(ctx, req, wrapped)
 }
 
 func (p *AnthropicProvider) streamWithRetry(ctx context.Context, req *Request, handler StreamHandler) error {
@@ -357,6 +359,11 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 	var stopReason StopReason
 	var startSent bool
 	toolCallIDForIndex := map[int64]string{}
+
+	// Track all content blocks for multi-turn replay. Anthropic requires
+	// that thinking blocks (with opaque signatures) be preserved verbatim
+	// in assistant messages when extended thinking is enabled.
+	contentBlockTracker := newContentBlockTracker()
 
 	for stream.Next() {
 		event := stream.Current()
@@ -398,6 +405,8 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 			continue
 		}
 
+		contentBlockTracker.observe(event)
+
 		chunk := p.convertStreamEvent(event, chunkIndex, toolCallIDForIndex)
 		if chunk != nil {
 			if !startSent {
@@ -429,6 +438,11 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 		stopReason = StopReasonEndTurn
 	}
 
+	var providerData map[string]any
+	if raw := contentBlockTracker.build(); len(raw) > 0 {
+		providerData = map[string]any{anthropicRawContentKey: raw}
+	}
+
 	return handler(&StreamChunk{
 		Index:      chunkIndex + 1,
 		Type:       ChunkTypeEnd,
@@ -440,7 +454,8 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 			CacheReadTokens:  cacheReadTokens,
 			CacheWriteTokens: cacheWriteTokens,
 		},
-		Timestamp: time.Now(),
+		ProviderData: providerData,
+		Timestamp:    time.Now(),
 	})
 }
 
@@ -513,7 +528,12 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 	}
 
 	systemPrompt := resolveSystemPrompt(req.SystemPrompt, p.config.SystemPrompt)
-	if len(p.skills) > 0 {
+	if len(p.skills) > 0 && len(req.Tools) == 0 {
+		// Inject skill descriptions into the system prompt only when proper
+		// API tool definitions are absent. When req.Tools is populated, the
+		// LLM uses the native tool API; the <available_skills> XML block
+		// would create a conflicting double signal that causes the model to
+		// emit XML tool-call markup as text instead.
 		systemPrompt = systemPrompt + "\n" + skills.ToPrompt(p.skills)
 	}
 
@@ -609,6 +629,20 @@ func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.Mess
 			if strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 {
 				continue
 			}
+			// When serialized content blocks are available (preserved from streaming
+			// or disk), reconstruct SDK params to retain thinking blocks with
+			// opaque signatures. Uses decodeAnthropicBlocks to handle both
+			// in-memory []anthropicContentBlock and deserialized []any forms.
+			if v, ok := msg.Metadata[anthropicRawContentKey]; ok {
+				if blocks := decodeAnthropicBlocks(v); len(blocks) > 0 {
+					params := make([]anthropic.ContentBlockParamUnion, len(blocks))
+					for i := range blocks {
+						params[i] = blocks[i].toParam()
+					}
+					result = append(result, anthropic.NewAssistantMessage(params...))
+					continue
+				}
+			}
 			if len(msg.ToolCalls) > 0 {
 				blocks := make([]anthropic.ContentBlockParamUnion, 0, len(msg.ToolCalls)+1)
 				if msg.Content != "" {
@@ -619,7 +653,7 @@ func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.Mess
 						OfToolUse: &anthropic.ToolUseBlockParam{
 							ID:    normalizeToolCallID(tc.ID),
 							Name:  tc.Name,
-							Input: tc.Arguments,
+							Input: json.RawMessage(tc.Arguments),
 						},
 					})
 				}
@@ -632,7 +666,7 @@ func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.Mess
 
 		case RoleTool:
 			result = append(result, anthropic.NewUserMessage(
-				anthropic.NewToolResultBlock(normalizeToolCallID(msg.ToolCallID), msg.Content, false),
+				anthropic.NewToolResultBlock(normalizeToolCallID(msg.ToolCallID), msg.Content, msg.IsError),
 			))
 		}
 	}
@@ -758,6 +792,11 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 		}
 	}
 
+	meta := map[string]any{"id": msg.ID}
+	if raw := extractAnthropicRawContent(msg); len(raw) > 0 {
+		meta[anthropicRawContentKey] = raw
+	}
+
 	return &Response{
 		Content:    content,
 		Thinking:   strings.TrimSpace(thinking.String()),
@@ -769,10 +808,8 @@ func (p *AnthropicProvider) convertResponse(msg *anthropic.Message) *Response {
 			TotalTokens:     int(msg.Usage.InputTokens + msg.Usage.OutputTokens),
 			CacheReadTokens: int(msg.Usage.CacheReadInputTokens),
 		},
-		ToolCalls: toolCalls,
-		ProviderMetadata: map[string]any{
-			"id": msg.ID,
-		},
+		ToolCalls:        toolCalls,
+		ProviderMetadata: meta,
 	}
 }
 
@@ -842,6 +879,135 @@ func (p *AnthropicProvider) convertStreamEvent(event anthropic.MessageStreamEven
 	}
 
 	return nil
+}
+
+// anthropicRawContentKey is the ProviderMetadata key for serialized content
+// blocks from the model's response. Preserving the original content (including
+// thinking blocks with opaque signatures) is required for multi-turn
+// conversations with extended thinking enabled.
+//
+// Values stored under this key are []anthropicContentBlock — a plain struct
+// slice that survives JSON round-trips through disk persistence.
+const anthropicRawContentKey = "anthropic_raw_content"
+
+// anthropicContentBlock is a JSON-serializable representation of an Anthropic
+// content block. Unlike raw SDK ContentBlockParamUnion values, this survives
+// JSON round-trips through disk persistence (map[string]any → JSON → map[string]any).
+type anthropicContentBlock struct {
+	Type      string `json:"type"`                // "thinking", "redacted_thinking", "text", "tool_use"
+	Text      string `json:"text,omitempty"`      // text blocks
+	Thinking  string `json:"thinking,omitempty"`  // thinking blocks
+	Signature string `json:"signature,omitempty"` // thinking blocks (opaque, required for replay)
+	Data      string `json:"data,omitempty"`      // redacted thinking blocks
+	ToolID    string `json:"id,omitempty"`        // tool_use blocks
+	ToolName  string `json:"name,omitempty"`      // tool_use blocks
+	ToolInput string `json:"input,omitempty"`     // tool_use blocks (raw JSON string)
+}
+
+// toParam converts a serializable content block back into the SDK param type.
+func (b *anthropicContentBlock) toParam() anthropic.ContentBlockParamUnion {
+	switch b.Type {
+	case "thinking":
+		return anthropic.NewThinkingBlock(b.Signature, b.Thinking)
+	case "redacted_thinking":
+		return anthropic.NewRedactedThinkingBlock(b.Data)
+	case "tool_use":
+		return anthropic.ContentBlockParamUnion{
+			OfToolUse: &anthropic.ToolUseBlockParam{
+				ID:    b.ToolID,
+				Name:  b.ToolName,
+				Input: json.RawMessage(b.ToolInput),
+			},
+		}
+	default: // "text" and any unknown types
+		return anthropic.NewTextBlock(b.Text)
+	}
+}
+
+// decodeAnthropicBlocks extracts []anthropicContentBlock from a Metadata value.
+// Handles both the in-memory type (direct assertion) and the deserialized form
+// ([]any of map[string]any from JSON round-trip through disk).
+func decodeAnthropicBlocks(v any) []anthropicContentBlock {
+	if blocks, ok := v.([]anthropicContentBlock); ok {
+		return blocks
+	}
+	// JSON round-trip for data that was deserialized from disk.
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var blocks []anthropicContentBlock
+	if err := json.Unmarshal(data, &blocks); err != nil {
+		return nil
+	}
+	return blocks
+}
+
+// contentBlockTracker accumulates streaming content blocks using the SDK's
+// built-in Message.Accumulate method. This captures thinking blocks (with
+// signatures), redacted thinking, text, and tool_use blocks in stream order
+// for faithful multi-turn replay.
+type contentBlockTracker struct {
+	msg anthropic.Message
+}
+
+func newContentBlockTracker() *contentBlockTracker {
+	return &contentBlockTracker{}
+}
+
+// observe feeds a stream event into the SDK accumulator.
+func (t *contentBlockTracker) observe(event anthropic.MessageStreamEventUnion) {
+	t.msg.Accumulate(event)
+}
+
+// build converts the accumulated content blocks into serializable form.
+// Returns nil when there are no content blocks.
+func (t *contentBlockTracker) build() []anthropicContentBlock {
+	return contentBlocksFromSDK(t.msg.Content)
+}
+
+// extractAnthropicRawContent converts an Anthropic Message's content blocks
+// into serializable form for multi-turn replay. Used by the non-streaming path.
+func extractAnthropicRawContent(msg *anthropic.Message) []anthropicContentBlock {
+	return contentBlocksFromSDK(msg.Content)
+}
+
+// contentBlocksFromSDK converts SDK content block unions into the serializable
+// representation. Preserves block order for faithful multi-turn replay.
+func contentBlocksFromSDK(content []anthropic.ContentBlockUnion) []anthropicContentBlock {
+	if len(content) == 0 {
+		return nil
+	}
+	blocks := make([]anthropicContentBlock, 0, len(content))
+	for _, cb := range content {
+		switch b := cb.AsAny().(type) {
+		case anthropic.ThinkingBlock:
+			blocks = append(blocks, anthropicContentBlock{
+				Type:      "thinking",
+				Thinking:  b.Thinking,
+				Signature: b.Signature,
+			})
+		case anthropic.RedactedThinkingBlock:
+			blocks = append(blocks, anthropicContentBlock{
+				Type: "redacted_thinking",
+				Data: b.Data,
+			})
+		case anthropic.TextBlock:
+			blocks = append(blocks, anthropicContentBlock{
+				Type: "text",
+				Text: b.Text,
+			})
+		case anthropic.ToolUseBlock:
+			args, _ := b.Input.MarshalJSON()
+			blocks = append(blocks, anthropicContentBlock{
+				Type:      "tool_use",
+				ToolID:    b.ID,
+				ToolName:  b.Name,
+				ToolInput: string(args),
+			})
+		}
+	}
+	return blocks
 }
 
 // convertStopReason converts Anthropic stop reason to generic format

@@ -23,12 +23,16 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
+	coreerrors "github.com/adalundhe/sylk/core/errors"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/llm"
+	"github.com/adalundhe/sylk/core/pipeline/tdd"
+	"github.com/adalundhe/sylk/core/pipeline/variants"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -62,6 +66,7 @@ import (
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/pane"
 	"github.com/adalundhe/sylk/ui/planview"
+	"github.com/adalundhe/sylk/ui/queue"
 	"github.com/adalundhe/sylk/ui/redact"
 	"github.com/adalundhe/sylk/ui/search"
 	sessionpkg "github.com/adalundhe/sylk/ui/session"
@@ -266,7 +271,7 @@ type Deps struct {
 	StreamManager  *guide.StreamManager
 	Guide          *guide.Guide
 	Scope          *concurrency.GoroutineScope
-	AuthRefresh    func(ctx context.Context, provider, method string) error
+	AuthRegistry   *credentials.AuthRegistry
 
 	// SignalStop restores default signal handling and cancels the parent
 	// context. Called after the Bubble Tea program exits so that a second
@@ -281,6 +286,21 @@ type Deps struct {
 	GitWatcher        *git.StatusWatcher
 	GitBus            *git.GitBus
 	SafetyGuard       *git.SafetyGuard
+
+	// Pipeline system — optional, nil when no pipeline subsystem is active.
+	PipelineManager *tdd.PipelineManager
+	VariantRegistry variants.Registry
+
+	// SeedAgents pre-populates the agent panel with known agents at startup.
+	// Agents are created as idle entries without requiring activity events.
+	SeedAgents []AgentSeed
+}
+
+// AgentSeed describes an agent to pre-populate in the UI agent panel.
+type AgentSeed struct {
+	ID        string
+	AgentType string
+	Name      string
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +353,7 @@ type AppModel struct {
 	streamBridge   *bridge.StreamBridge
 	guideBridge    *bridge.GuideBridge
 	lspBridge      *bridge.LSPBridge
+	pipelineBridge *bridge.PipelineBridge
 
 	// LSP
 	lspManager    *lsp.Manager
@@ -404,6 +425,9 @@ type AppModel struct {
 	editorMouseDown bool // Left button pressed inside the code panel.
 	editorDragging  bool // Actual drag motion detected after press.
 
+	// Mouse drag tracking for input panel text selection.
+	inputMouseDown bool // Left button pressed inside the input panel.
+
 	// Tab bar drag-and-drop reordering.
 	tabDragIdx        int         // Tab index being dragged (-1 = none).
 	tabDragSourcePane pane.PaneID // Pane the drag originated from (0 = none).
@@ -417,6 +441,12 @@ type AppModel struct {
 	// Overflow arrow flash windows.
 	tabArrowFlashLeftUntil  time.Time
 	tabArrowFlashRightUntil time.Time
+
+	// Focus ring shimmer.
+	focusGradient       *theme.Gradient // Current gradient for focus ring border.
+	idleFocusGradient   *theme.Gradient // Subdued blue→white gradient (no active agents).
+	activeFocusGradient *theme.Gradient // Full prismatic gradient (active agents).
+	focusRingStart      time.Time       // Epoch for focus ring shimmer.
 
 	// Demand-driven tick chain state.
 	tickGen  uint64   // Generation counter; incremented on tick chain transitions.
@@ -553,9 +583,14 @@ type AppModel struct {
 	agentContextTokens map[string]int
 	streamUsage        map[string]streamUsageEntry
 	streamedResponses  map[string]streamedResponseState
-	activeRoute        activeRouteState
-	engagedAgentID     string // Sticky agent the user is conversing with.
+	activeRoute              activeRouteState
+	interruptedCorrelations map[string]struct{} // Correlation IDs killed by interrupt.
+	engagedAgentID          string              // Sticky agent the user is conversing with.
 	manualTargetAgent  string
+
+	// Prompt queue: stacks follow-up prompts while agents stream.
+	promptQueue   queue.Queue
+	queueGradient *theme.Gradient
 
 	// Cumulative token counters for the status bar display.
 	totalPromptTokens     int
@@ -771,12 +806,25 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		streamUsage:            make(map[string]streamUsageEntry),
 		streamedResponses:      make(map[string]streamedResponseState),
 		oauthSessions:          newOAuthSessionManager(),
+		focusGradient:       th.Palette.IdleFocusRingGradient(),
+		idleFocusGradient:   th.Palette.IdleFocusRingGradient(),
+		activeFocusGradient: th.Palette.FocusRingGradient(),
+		focusRingStart:      time.Now(),
 	}
+
+	app.promptQueue = queue.New(queue.MaxCapacity)
+	app.queueGradient = th.Palette.QueueGradient()
 
 	app.walLogger, app.walCloser = newTUIWALLogger()
 
 	// Wire login panel clipboard now that m.clipboard is available.
 	app.loginPanel.SetClipboard(app.clipboard.Get)
+	app.loginPanel.SetClipboardWrite(app.clipboard.Set)
+
+	// Pre-populate agent panel with known agents from bootstrap.
+	for _, seed := range deps.SeedAgents {
+		app.agentPanel.SeedAgent(seed.ID, seed.AgentType, seed.Name)
+	}
 
 	app.comp = compositor.New()
 	app.previewPanel = preview.New(th)
@@ -831,6 +879,14 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		}
 		if sg, err := git.NewSafetyGuard(gc, app.gitBus, git.DefaultSafetyConfig(), app.gitWatcher); err == nil {
 			app.safetyGuard = sg
+		}
+	}
+
+	// Pipeline bridge — optional, only created when the pipeline subsystem is active.
+	if deps.PipelineManager != nil || deps.VariantRegistry != nil {
+		app.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.VariantRegistry, deps.Scope)
+		if deps.PipelineManager != nil {
+			deps.PipelineManager.SetOnEvent(app.pipelineBridge.OnPipelineEvent)
 		}
 	}
 
@@ -1056,8 +1112,6 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleLoginResult(typed)
 	case oauthSessionStartedMsg:
 		return m, m.handleOAuthSessionStarted(typed)
-	case authRefreshResultMsg:
-		return m, m.handleAuthRefreshResult(typed)
 	case msg.InterruptMsg:
 		return m, m.handleInterrupt()
 	case msg.QuitConfirmMsg:
@@ -1070,12 +1124,24 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleBlink(typed)
 	case msg.LSPFlushMsg:
 		return m, m.handleLSPFlush(typed)
+	case msg.QueueAdvanceMsg:
+		return m, m.dispatchQueueHead()
 	case msg.FocusPanelMsg:
 		return m, m.handleFocusPanel(typed)
 	case msg.PlanUpdateMsg:
 		return m, m.handlePlanUpdate(typed)
 	case msg.PlanViewToggleMsg:
 		return m, m.handlePlanViewToggle()
+	case msg.PipelineStateMsg:
+		comp, cmd := m.agentPanel.Update(typed)
+		m.agentPanel = comp.(*agentpkg.Model)
+		m.comp.MarkDirty(compositor.SlotLeft)
+		return m, cmd
+	case msg.VariantStateMsg:
+		comp, cmd := m.agentPanel.Update(typed)
+		m.agentPanel = comp.(*agentpkg.Model)
+		m.comp.MarkDirty(compositor.SlotLeft)
+		return m, cmd
 	case msg.OpenEditorMsg:
 		return m, m.handleOpenEditor(typed)
 	case msg.CloseEditorMsg:
@@ -2258,6 +2324,9 @@ func (m *AppModel) Shutdown() error {
 	if m.gitBridge != nil {
 		m.gitBridge.Stop()
 	}
+	if m.pipelineBridge != nil {
+		m.pipelineBridge.Stop()
+	}
 
 	var errs []error
 	if err := m.lspManager.Shutdown(); err != nil {
@@ -2361,6 +2430,16 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focusedEditor().ClearSelection()
 			return m, nil
 		}
+		if m.focus.Current() == component.FocusInput && m.input.HasSelection() {
+			text := m.input.SelectedText()
+			if err := m.clipboard.Set(text); err != nil {
+				m.statusBar.SetFlash("Copy failed")
+			} else {
+				m.statusBar.SetFlash("Copied!")
+			}
+			m.input.ClearSelection()
+			return m, nil
+		}
 		if ks == "ctrl+c" {
 			result := m.interruptHandler.HandleCtrlC()
 			return m, func() tea.Msg { return result }
@@ -2429,6 +2508,47 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Redo in the editor (Alt+Shift+Z, only when editor is focused).
 	if key.String() == "alt+Z" && m.viewMode == ViewEdit && m.isEditorFocused() {
 		m.focusedEditor().Redo()
+		return m, nil
+	}
+
+	// Queue shortcuts (active regardless of view mode).
+	// Alt+Shift+Space: toggle queue pause/resume.
+	if ks == "alt+ " && !m.promptQueue.IsEmpty() {
+		paused := m.promptQueue.TogglePause()
+		if paused {
+			m.statusBar.SetFlash("Queue paused")
+		} else {
+			m.statusBar.SetFlash("Queue resumed")
+			// Try to advance if we just unpaused and the route is clear.
+			if strings.TrimSpace(m.activeRoute.CorrelationID) == "" {
+				return m, m.tryAdvanceQueue()
+			}
+		}
+		m.comp.MarkDirty(compositor.SlotQueue)
+		m.viewDirty = true
+		return m, nil
+	}
+	// Alt+K: cancel top pending queue entry.
+	if ks == "alt+k" && !m.promptQueue.IsEmpty() {
+		pending := m.promptQueue.PendingEntries()
+		if len(pending) > 0 {
+			m.promptQueue.Cancel(pending[0].ID)
+			m.recalcLayout()
+			m.comp.MarkDirty(compositor.SlotQueue)
+			m.viewDirty = true
+			m.statusBar.SetFlash("Cancelled queued prompt")
+		}
+		return m, nil
+	}
+	// Alt+Shift+K: cancel all queued entries.
+	if ks == "alt+K" && !m.promptQueue.IsEmpty() {
+		n := m.promptQueue.CancelAll()
+		if n > 0 {
+			m.recalcLayout()
+			m.comp.MarkDirty(compositor.SlotQueue)
+			m.viewDirty = true
+			m.statusBar.SetFlash(fmt.Sprintf("Cancelled %d queued prompts", n))
+		}
 		return m, nil
 	}
 
@@ -2909,6 +3029,19 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 	submit.TargetAgent = targetAgent
 	submit.SessionID = m.resolveRouteSessionID(submit.SessionID)
 
+	// If there's an active route, enqueue instead of dispatching immediately.
+	if strings.TrimSpace(m.activeRoute.CorrelationID) != "" {
+		_, ok := m.promptQueue.Enqueue(uuid.New().String(), submit.Text, submit.TargetAgent, submit.SessionID)
+		if !ok {
+			m.pushSystemChat(fmt.Sprintf("%d requests pending. Please wait before sending another message!", m.promptQueue.PendingCount()))
+			return nil
+		}
+		m.recalcLayout() // Queue strip appeared or grew.
+		m.comp.MarkDirty(compositor.SlotQueue)
+		m.viewDirty = true
+		return nil
+	}
+
 	// Push a user entry to chat.
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
@@ -2962,6 +3095,9 @@ func parseChatCommand(text string) (string, bool) {
 // handleChatCommand dispatches a "/command" from chat input.
 func (m *AppModel) handleChatCommand(cmd string, submit msg.SubmitPromptMsg) tea.Cmd {
 	switch cmd {
+	case "clear":
+		m.chat.Clear()
+		return nil
 	case "login":
 		return m.handleLoginCommand(submit)
 	default:
@@ -3137,12 +3273,6 @@ type pendingAnthropicOAuthCode struct {
 	cancel    context.CancelFunc
 }
 
-type authRefreshResultMsg struct {
-	Provider string
-	Method   string
-	Err      error
-}
-
 // startGoogleOAuthCmd starts Google OAuth and emits a session-started message.
 func (m *AppModel) startGoogleOAuthCmd(provider string, flowID uint64) tea.Cmd {
 	ctx := m.ctx
@@ -3282,7 +3412,8 @@ func (m *AppModel) handleOAuthSessionStarted(start oauthSessionStartedMsg) tea.C
 			cancel:    start.Cancel,
 		}
 		m.loginPanel.SetOAuthCodeEntry(true, start.Instructions)
-		m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL, start.UserCode))
+		m.loginPanel.SetDeviceCode(start.UserCode)
+		m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL))
 		if err := openURL(start.URL); err != nil {
 			m.statusBar.SetFlash("Could not open browser automatically. Use the URL shown in the login panel.")
 		}
@@ -3291,18 +3422,16 @@ func (m *AppModel) handleOAuthSessionStarted(start oauthSessionStartedMsg) tea.C
 
 	m.pendingAnthropicOAuth = nil
 	m.loginPanel.SetOAuthCodeEntry(false, "")
-	m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL, start.UserCode))
+	m.loginPanel.SetDeviceCode(start.UserCode)
+	m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL))
 	if err := openURL(start.URL); err != nil {
 		m.statusBar.SetFlash("Could not open browser automatically. Use the URL shown in the login panel.")
 	}
 	return start.Wait
 }
 
-func formatOAuthStatus(provider, url, userCode string) string {
-	if userCode == "" {
-		return fmt.Sprintf("Authorize %s in your browser:\n%s", loginProviderLabel(provider), url)
-	}
-	return fmt.Sprintf("Authorize %s in your browser:\n%s\nCode: %s", loginProviderLabel(provider), url, userCode)
+func formatOAuthStatus(provider, url string) string {
+	return fmt.Sprintf("Authorize %s in your browser:\n%s", loginProviderLabel(provider), url)
 }
 
 // handleLoginResult processes the async LoginResultMsg from an auth flow.
@@ -3339,9 +3468,16 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 		if m.loginPanel.Active() {
 			m.deactivateLogin()
 		}
+		// Persist the auth mode preference so it survives restarts.
+		_ = credentials.SaveAuthPref(result.Provider, result.Method)
 		m.statusBar.SetFlash(fmt.Sprintf("Authenticated with %s via %s",
 			loginProviderLabel(result.Provider), loginMethodLabel(result.Method)))
-		return m.refreshAuthProviderCmd(result.Provider, result.Method)
+		// Notify the AuthRegistry so all agents of this provider type
+		// receive the credential update via the event bus.
+		if m.deps.AuthRegistry != nil {
+			m.deps.AuthRegistry.NotifyCredentialChanged(result.Provider, result.Method)
+		}
+		return nil
 	}
 
 	// Failure: keep the panel open and show the error inline so the
@@ -3351,33 +3487,6 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 	} else {
 		m.statusBar.SetFlash(fmt.Sprintf("Login failed: %s", redactSecrets(result.Error)))
 	}
-	return nil
-}
-
-func (m *AppModel) refreshAuthProviderCmd(provider, method string) tea.Cmd {
-	if m.deps.AuthRefresh == nil {
-		return nil
-	}
-	ctx := m.ctx
-	return func() tea.Msg {
-		return authRefreshResultMsg{
-			Provider: provider,
-			Method:   method,
-			Err:      m.deps.AuthRefresh(ctx, provider, method),
-		}
-	}
-}
-
-func (m *AppModel) handleAuthRefreshResult(result authRefreshResultMsg) tea.Cmd {
-	if result.Err == nil {
-		return nil
-	}
-	m.statusBar.SetFlash(fmt.Sprintf(
-		"Authenticated with %s via %s, but runtime refresh failed: %s",
-		loginProviderLabel(result.Provider),
-		loginMethodLabel(result.Method),
-		redactSecrets(result.Err.Error()),
-	))
 	return nil
 }
 
@@ -3549,6 +3658,9 @@ func (m *AppModel) resolveSubmitTarget(explicit string) string {
 	}
 	target = normalizeExplicitTargetAgent(m.manualTargetAgent)
 	if target != "" {
+		if normalizeAgentID(target) != m.engagedAgentID {
+			m.clearEngagedAgent()
+		}
 		return target
 	}
 	return ""
@@ -3563,6 +3675,13 @@ func (m *AppModel) syncManualTargetFromAgentSelection() {
 		return
 	}
 	m.manualTargetAgent = selected
+	// Clear engagement when the user explicitly selects a different agent
+	// (or the guide, which cannot be engaged). Without this, the previous
+	// engaged agent (e.g. architect) stays sticky in the UI even after the
+	// user navigates away.
+	if normalizeAgentID(selected) != m.engagedAgentID {
+		m.clearEngagedAgent()
+	}
 }
 
 func isSimpleTargetToken(token string) bool {
@@ -3608,11 +3727,24 @@ func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
 	}
 
 	m.chat.MuteThinking("")
+	m.chat.AbortStream()
+	if m.interruptedCorrelations == nil {
+		m.interruptedCorrelations = make(map[string]struct{})
+	}
+	m.interruptedCorrelations[correlationID] = struct{}{}
 	m.pushInterruptedChatMessage(agentID)
 	m.finalizeStreamUsage(correlationID, false, "interrupted")
+	m.markQueueEntryByCorrelation(correlationID, false)
 	m.clearActiveRoute(correlationID)
+	m.agentPanel.DemoteAllActive()
 	if m.statusBar != nil {
 		m.statusBar.SetTokenPhase(status.PhaseIdle)
+	}
+	// Pause the queue on user interrupt — deliberate resume required.
+	if !m.promptQueue.IsEmpty() {
+		m.promptQueue.SetPaused(true)
+		m.recalcLayout()
+		m.viewDirty = true
 	}
 	m.statusBar.SetFlash("Agent interrupted")
 
@@ -3700,6 +3832,9 @@ func (m *AppModel) shouldRenderStreamEvent(correlationID string) bool {
 	if correlationID == "" {
 		return false
 	}
+	if _, interrupted := m.interruptedCorrelations[correlationID]; interrupted {
+		return false
+	}
 	active := strings.TrimSpace(m.activeRoute.CorrelationID)
 	if active == "" {
 		return true
@@ -3728,6 +3863,61 @@ func (m *AppModel) forceResetActiveRoute(oldCorrelationID string) {
 	}
 	if strings.TrimSpace(m.activeRoute.CorrelationID) == oldCorrelationID {
 		m.activeRoute = activeRouteState{}
+	}
+}
+
+// tryAdvanceQueue dispatches the next pending queue entry if the queue is
+// non-empty and not paused. Returns a Cmd that re-enters handleSubmit, or nil.
+func (m *AppModel) tryAdvanceQueue() tea.Cmd {
+	if m.promptQueue.IsPaused() || m.promptQueue.IsEmpty() {
+		return nil
+	}
+	entry, ok := m.promptQueue.Advance()
+	if !ok {
+		m.recalcLayout()
+		m.viewDirty = true
+		return nil
+	}
+	m.promptQueue.MarkDispatching(entry.ID)
+	// Dispatch as a deferred BubbleTea command so it runs in a clean Update cycle.
+	return func() tea.Msg {
+		return msg.QueueAdvanceMsg{}
+	}
+}
+
+// dispatchQueueHead sends the head queue entry through the normal submit path.
+func (m *AppModel) dispatchQueueHead() tea.Cmd {
+	entry, ok := m.promptQueue.Peek()
+	if !ok || entry.State != queue.StateDispatching {
+		return nil
+	}
+	submit := msg.SubmitPromptMsg{
+		Text:        entry.Text,
+		TargetAgent: entry.TargetAgent,
+		SessionID:   entry.SessionID,
+	}
+	// The activeRoute is now clear, so handleSubmit will dispatch normally.
+	cmd := m.handleSubmit(submit)
+	// Mark the queue entry as active with the new correlation ID.
+	if strings.TrimSpace(m.activeRoute.CorrelationID) != "" {
+		m.promptQueue.MarkActive(entry.ID, m.activeRoute.CorrelationID)
+	}
+	m.recalcLayout()
+	m.viewDirty = true
+	return cmd
+}
+
+// markQueueEntryByCorrelation marks a queue entry as completed or failed based
+// on its correlation ID. No-op if no queue entry matches the correlation ID.
+func (m *AppModel) markQueueEntryByCorrelation(correlationID string, success bool) {
+	active, ok := m.promptQueue.ActiveEntry()
+	if !ok || active.CorrelationID != correlationID {
+		return
+	}
+	if success {
+		m.promptQueue.MarkCompleted(active.ID)
+	} else {
+		m.promptQueue.MarkFailed(active.ID)
 	}
 }
 
@@ -3895,6 +4085,12 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 		changed = true
 	}
 
+	// Queue strip gradient animation (only when non-empty and not paused).
+	if !m.promptQueue.IsEmpty() && !m.promptQueue.IsPaused() {
+		m.comp.MarkDirty(compositor.SlotQueue)
+		changed = true
+	}
+
 	// Commit tree loading spinner (time-based, redraws each decor tick).
 	if m.commitTree != nil && m.commitTree.NeedsDecorTick() {
 		m.comp.MarkDirty(compositor.SlotRight)
@@ -3936,6 +4132,38 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	if m.planView != nil && m.planView.NeedsDecorTick() {
 		m.planView.MarkViewDirty()
 		m.comp.MarkDirty(compositor.SlotRight)
+		changed = true
+	}
+
+	// Agent panel shimmer + dot animation.
+	agentActive := m.agentPanel.HasActiveAgent()
+	if m.agentPanel.NeedsDecorTick() {
+		if agentActive {
+			m.agentPanel.AdvanceDotFrame()
+		}
+		m.comp.MarkDirty(compositor.SlotLeft)
+		changed = true
+	}
+
+	// Session panel dot animation — sync agent activity and advance frame.
+	m.sessionPanel.SetAgentActive(agentActive)
+	if agentActive {
+		m.sessionPanel.AdvanceDotFrame()
+		m.comp.MarkDirty(compositor.SlotLeft)
+		changed = true
+	}
+
+	// Swap focus ring gradient: full prismatic when active agents, subdued when idle.
+	if agentActive {
+		m.focusGradient = m.activeFocusGradient
+	} else {
+		m.focusGradient = m.idleFocusGradient
+	}
+
+	// Focus ring border shimmer — mark the focused panel slot and input.
+	if m.focusGradient != nil {
+		m.comp.MarkDirty(m.focusBorderGroup())
+		m.comp.MarkDirty(compositor.SlotInput)
 		changed = true
 	}
 
@@ -4941,14 +5169,69 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
 	m.recordStreamComplete(done.CorrelationID)
 	shouldRender := m.shouldRenderStreamEvent(done.CorrelationID)
+	delete(m.interruptedCorrelations, done.CorrelationID)
 	m.applyRealStreamUsage(done.CorrelationID, done.InputTokens, done.OutputTokens)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
+	m.markQueueEntryByCorrelation(done.CorrelationID, true)
 	m.clearActiveRoute(done.CorrelationID)
 	if !shouldRender {
 		m.statusBar.StopSpinner()
-		return nil
+		return m.tryAdvanceQueue()
+	}
+	// AuthoritativeText in the completion event delivers final content to the
+	// chat accumulator, equivalent to having received text chunks. Record it
+	// so shouldSuppressStreamedRouteResponse suppresses the duplicate
+	// GuideResponseMsg that follows.
+	if strings.TrimSpace(done.AuthoritativeText) != "" {
+		m.recordStreamChunk(done.CorrelationID, done.AuthoritativeText)
+	}
+	if advCmd := m.tryAdvanceQueue(); advCmd != nil {
+		return tea.Batch(m.propagate(done), advCmd)
 	}
 	return m.propagate(done)
+}
+
+// isTerminalStreamError returns true when the error represents a condition
+// that no guide-level retry, reroute, or circuit-breaker recovery can fix.
+// For these errors the agent panel animations should stop immediately.
+//
+// Non-terminal errors (rate-limit exhaustion, server 5xx, timeouts) may still
+// be recovered by the Guide via reroute or retry-queue, so animations persist
+// until either a terminal event or a successful recovery arrives.
+func isTerminalStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Tiered error taxonomy: Permanent and UserFixable are unrecoverable.
+	var te *coreerrors.TieredError
+	if errors.As(err, &te) {
+		return te.Tier == coreerrors.TierPermanent || te.Tier == coreerrors.TierUserFixable
+	}
+
+	// Provider errors: non-retryable status codes (401, 402, 403, 400, 404)
+	// indicate credential, permission, or configuration problems the Guide
+	// cannot route around.
+	var pe *providers.ProviderError
+	if errors.As(err, &pe) {
+		return !pe.Retryable
+	}
+
+	// Sentinel errors from the providers package.
+	switch {
+	case errors.Is(err, providers.ErrAuthenticationError):
+		return true
+	case errors.Is(err, providers.ErrQuotaExceeded):
+		return true
+	case errors.Is(err, providers.ErrProviderNotFound):
+		return true
+	case errors.Is(err, providers.ErrModelNotSupported):
+		return true
+	case errors.Is(err, providers.ErrInvalidConfig):
+		return true
+	}
+
+	return false
 }
 
 func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.Cmd {
@@ -4963,8 +5246,21 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 		return nil
 	}
 	m.clearRecordedStream(streamErr.CorrelationID)
+	delete(m.interruptedCorrelations, streamErr.CorrelationID)
 	m.finalizeStreamUsage(streamErr.CorrelationID, false, summary)
+	m.markQueueEntryByCorrelation(streamErr.CorrelationID, false)
 	m.clearActiveRoute(streamErr.CorrelationID)
+	if isTerminalStreamError(streamErr.Err) {
+		m.agentPanel.DemoteAllActive()
+		// Pause the queue on terminal errors to prevent blindly dispatching
+		// into a broken agent.
+		m.promptQueue.SetPaused(true)
+		m.recalcLayout()
+		m.viewDirty = true
+	}
+	if advCmd := m.tryAdvanceQueue(); advCmd != nil {
+		return tea.Batch(m.propagate(streamErr), advCmd)
+	}
 	return m.propagate(streamErr)
 }
 
@@ -5306,11 +5602,15 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
 	m.statusBar.SetTokenPhase(status.PhaseIdle)
 	m.publishResponseActivity(r, source, content, contextUsage)
+	agentDisplay := r.AgentID
+	if r.AgentName != "" {
+		agentDisplay = r.AgentName
+	}
 	entry := &chat.ChatEntry{
 		ID:        uuid.New().String(),
 		Timestamp: time.Now(),
 		Source:    source,
-		AgentType: r.AgentID,
+		AgentType: agentDisplay,
 		AgentID:   r.AgentID,
 		Content:   content,
 		Height:    -1,
@@ -7426,6 +7726,7 @@ type slashCommand struct {
 // chatSlashCommands is the single source of truth for all chat slash commands.
 // Both the validator and the completer derive from this slice.
 var chatSlashCommands = []slashCommand{
+	{name: "clear", desc: "Clear the chat history"},
 	{name: "login", desc: "Open the provider login panel"},
 }
 
@@ -9593,6 +9894,19 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Input panel drag: finalize on release, extend selection on motion.
+	if mouse.Action == tea.MouseActionRelease && m.inputMouseDown {
+		m.inputMouseDown = false
+		return nil
+	}
+	if mouse.Action == tea.MouseActionMotion && m.inputMouseDown {
+		inputTop := m.height - m.prevInputH - statusBarHeight
+		contentX := max(mouse.X-1, 0)
+		contentY := max(mouse.Y-inputTop-1, 0)
+		m.input.DragTo(contentX, contentY)
+		return nil
+	}
+
 	if mouse.Action != tea.MouseActionPress {
 		return nil
 	}
@@ -9676,6 +9990,20 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 			return cmd
 		}
 		return nil
+	}
+
+	// Input panel click: begin drag selection at click point.
+	inputTop := m.height - m.prevInputH - statusBarHeight
+	if mouse.Y >= inputTop && mouse.Y < inputTop+m.prevInputH {
+		contentX := mouse.X - 1           // skip left border
+		contentY := mouse.Y - inputTop - 1 // skip top border
+		if contentX >= 0 && contentY >= 0 {
+			m.input.DragStart(contentX, contentY)
+			m.inputMouseDown = true
+			m.focus.SetFocus(component.FocusInput)
+			m.syncFocusState()
+			return nil
+		}
 	}
 
 	if cmd := m.handleFileTreeClick(mouse.X, mouse.Y); cmd != nil {
@@ -10572,6 +10900,7 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		cmd := m.finalizeCrossPaneDrop()
 		m.editorMouseDown = false
 		m.editorDragging = false
+		m.inputMouseDown = false // Cross-panel release safety.
 		m.tabDragIdx = -1
 		m.tabDragSourcePane = 0
 		m.tabDropTarget = 0
@@ -11577,7 +11906,8 @@ const leftPanelOverhead = 4
 // Derived from: total height - status bar - main area minimum - input border.
 func (m *AppModel) inputMaxVisualLines() int {
 	available := m.height - statusBarHeight - mainMinContentHeight - inputBorderSize
-	return max(available, inputMinContentLines)
+	proportional := max(m.height/10, inputMinContentLines)
+	return max(min(available, proportional), inputMinContentLines)
 }
 
 // inputHeight returns the current rendered height of the input area
@@ -11597,9 +11927,10 @@ func (m *AppModel) inputHeight() int {
 }
 
 func (m *AppModel) recalcLayout() {
-	// Reserve space for input (dynamic) and status bar.
+	// Reserve space for queue strip, input (dynamic), and status bar.
+	queueH := m.promptQueue.ViewHeight()
 	inputH := m.inputHeight()
-	mainHeight := m.height - inputH - statusBarHeight
+	mainHeight := m.height - queueH - inputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
 
 	// Capture old chat viewport height before layout changes.
@@ -11673,7 +12004,7 @@ func (m *AppModel) recalcLayout() {
 	m.loginPanel.SetSize(m.width, mainHeight)
 
 	// Compositor: rebuild frame structure (full invalidation).
-	m.comp.SetStructure(m.compositorColumns(), mainHeight, inputH, statusBarHeight)
+	m.comp.SetStructure(m.compositorColumns(), mainHeight, queueH, inputH, statusBarHeight)
 	m.prevInputH = inputH
 }
 
@@ -11683,7 +12014,8 @@ func (m *AppModel) recalcLayout() {
 // height with the bottom border preserved. This limits the terminal diff
 // to ~4-5 boundary rows instead of a full-screen redraw.
 func (m *AppModel) handleInputGrowth(newInputH int) {
-	mainHeight := m.height - newInputH - statusBarHeight
+	queueH := m.promptQueue.ViewHeight()
+	mainHeight := m.height - queueH - newInputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
 
 	// Capture old chat viewport height.
@@ -11711,8 +12043,8 @@ func (m *AppModel) handleInputGrowth(newInputH int) {
 	// Determine which compositor slot contains the chat panel.
 	chatSlot := m.chatCompositorSlot()
 
-	// Targeted compositor update — only chat slot + input dirty.
-	m.comp.AdjustInputSection(mainHeight, newInputH, chatSlot)
+	// Targeted compositor update — only chat slot + queue + input dirty.
+	m.comp.AdjustVerticalSections(mainHeight, queueH, newInputH, chatSlot)
 
 	// Truncate every main-area side-panel slot EXCEPT the chat slot.
 	for _, slot := range []compositor.SlotID{
@@ -12364,6 +12696,7 @@ func (m *AppModel) detectDirtySlots() {
 // renderDirtySlots re-renders only the compositor slots that are dirty.
 func (m *AppModel) renderDirtySlots() {
 	th := m.config.Theme()
+	m.applyFocusRingShimmer(th)
 
 	if m.comp.IsDirty(compositor.SlotLeft) {
 		m.comp.SetSlotLines(compositor.SlotLeft,
@@ -12381,6 +12714,10 @@ func (m *AppModel) renderDirtySlots() {
 		m.comp.SetSlotLines(compositor.SlotRight,
 			compositor.SplitLines(m.renderSlotRight(th)))
 	}
+	if m.comp.IsDirty(compositor.SlotQueue) {
+		m.comp.SetSlotLines(compositor.SlotQueue,
+			compositor.SplitLines(m.renderQueueStrip()))
+	}
 	if m.comp.IsDirty(compositor.SlotInput) {
 		m.comp.SetSlotLines(compositor.SlotInput,
 			compositor.SplitLines(m.input.View(m.cursorVisible)))
@@ -12389,6 +12726,37 @@ func (m *AppModel) renderDirtySlots() {
 		m.comp.SetSlotLines(compositor.SlotStatus,
 			compositor.SplitLines(m.statusBar.View()))
 	}
+}
+
+// applyFocusRingShimmer sets per-character gradient border rendering on the
+// theme, replacing the old per-side approach that produced visible color
+// jumps at corners. Called once per frame before any slot rendering.
+func (m *AppModel) applyFocusRingShimmer(th *theme.Theme) {
+	if m.focusGradient == nil {
+		return
+	}
+	elapsed := time.Since(m.focusRingStart)
+	g := m.focusGradient
+
+	th.ActiveBorderRender = func(content string, innerW, innerH, maxH int) string {
+		return theme.RenderGradientBorder(content, g, elapsed, innerW, innerH, maxH)
+	}
+	m.input.SetFocusBorderRender(th.ActiveBorderRender)
+}
+
+// renderQueueStrip renders the prompt queue between chat and input.
+// Returns empty string when the queue is empty (0 lines).
+func (m *AppModel) renderQueueStrip() string {
+	if m.promptQueue.IsEmpty() {
+		return ""
+	}
+	var grad *theme.Gradient
+	if !m.promptQueue.IsPaused() {
+		grad = m.queueGradient
+	}
+	elapsed := time.Since(m.focusRingStart) // Reuse app-level animation clock.
+	pal := m.config.Theme().Palette
+	return m.promptQueue.View(m.width, elapsed, grad, pal)
 }
 
 // renderSlotLeft renders the bordered content for the left column slot.
@@ -12646,15 +13014,7 @@ func (m *AppModel) renderLeftPanelBordered(th *theme.Theme) string {
 // borderLeftPanel wraps arbitrary content in the left panel's border frame.
 func (m *AppModel) borderLeftPanel(content string, th *theme.Theme) string {
 	w, h := m.layout.GetPanelSize(component.FocusSessionPanel)
-	border := th.InactiveBorder
-	if m.isLeftPanelFocused() {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.isLeftPanelFocused(), w, h, th)
 }
 
 // renderLeftPanel stacks sessions and agents with line-extended headers and a divider.
@@ -12744,15 +13104,7 @@ func (m *AppModel) focusCodePanel() {
 func (m *AppModel) renderCodePanelBordered(th *theme.Theme) string {
 	content := m.overlayChordHint(m.codePanelView(), component.FocusCodeViewer, th)
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
-	border := th.InactiveBorder
-	if m.isCodePanelFocused() {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.isCodePanelFocused(), w, h, th)
 }
 
 // renderGitPanelBordered renders the git explorer panel using the FileTree slot
@@ -12763,15 +13115,8 @@ func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
 		content = m.overlayChordHint(content, component.FocusFileTree, th)
 	}
 	w, h := m.layout.GetPanelSize(component.FocusFileTree)
-	border := th.InactiveBorder
-	if m.focus.Current() == component.FocusGitPanel {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	focused := m.focus.Current() == component.FocusGitPanel
+	return m.renderBordered(content, focused, w, h, th)
 }
 
 // renderGitCommitTreeBordered renders the commit tree panel using the CodeViewer
@@ -12779,34 +13124,16 @@ func (m *AppModel) renderGitPanelBordered(th *theme.Theme) string {
 func (m *AppModel) renderGitCommitTreeBordered(th *theme.Theme) string {
 	content := m.overlayBlockedChord(m.overlayChordHint(m.commitTree.View(m.cursorVisible), component.FocusCodeViewer, th))
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
-	border := th.InactiveBorder
-	if m.focus.Current() == component.FocusCommitTree {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.focus.Current() == component.FocusCommitTree, w, h, th)
 }
 
 // renderPlanViewBordered renders the plan DAG viewer in the right panel slot
 // with border highlight based on FocusPlanView focus state.
 func (m *AppModel) renderPlanViewBordered(th *theme.Theme) string {
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
-	innerW := max(w-panelBorderSize, 1)
-	innerH := max(h-panelBorderSize, 1)
-	m.planView.SetSize(innerW, innerH)
+	m.planView.SetSize(max(w-panelBorderSize, 1), max(h-panelBorderSize, 1))
 	content := m.planView.View(m.cursorVisible)
-	border := th.InactiveBorder
-	if m.focus.Current() == component.FocusPlanView {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(innerW).
-		Height(innerH).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.focus.Current() == component.FocusPlanView, w, h, th)
 }
 
 // renderDiffFileListBordered renders the diff file list sidebar using the
@@ -12814,15 +13141,7 @@ func (m *AppModel) renderPlanViewBordered(th *theme.Theme) string {
 func (m *AppModel) renderDiffFileListBordered(th *theme.Theme) string {
 	content := m.diffView.FileListView(m.cursorVisible)
 	w, h := m.layout.GetPanelSize(component.FocusFileTree)
-	border := th.InactiveBorder
-	if m.focus.Current() == component.FocusDiffFileList {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.focus.Current() == component.FocusDiffFileList, w, h, th)
 }
 
 // renderDiffViewBordered renders the diff view using the CodeViewer slot
@@ -12830,45 +13149,21 @@ func (m *AppModel) renderDiffFileListBordered(th *theme.Theme) string {
 func (m *AppModel) renderDiffViewBordered(th *theme.Theme) string {
 	content := m.overlayBlockedChord(m.overlayChordHint(m.diffView.View(m.cursorVisible), component.FocusCodeViewer, th))
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
-	border := th.InactiveBorder
-	if m.isDiffPaneFocused() {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.isDiffPaneFocused(), w, h, th)
 }
 
 // renderMergeDiffFileListBordered renders the merge diff file list sidebar.
 func (m *AppModel) renderMergeDiffFileListBordered(th *theme.Theme) string {
 	content := m.mergeDiffView.FileListView(m.cursorVisible)
 	w, h := m.layout.GetPanelSize(component.FocusFileTree)
-	border := th.InactiveBorder
-	if m.focus.Current() == component.FocusMergeDiffFileList {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.focus.Current() == component.FocusMergeDiffFileList, w, h, th)
 }
 
 // renderMergeDiffViewBordered renders the merge diff view.
 func (m *AppModel) renderMergeDiffViewBordered(th *theme.Theme) string {
 	content := m.overlayBlockedChord(m.overlayChordHint(m.mergeDiffView.View(m.cursorVisible), component.FocusCodeViewer, th))
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
-	border := th.InactiveBorder
-	if m.isMergeDiffPaneFocused() {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.isMergeDiffPaneFocused(), w, h, th)
 }
 
 // isMergeDiffPaneFocused reports whether the focused component is a merge diff pane.
@@ -12880,43 +13175,39 @@ func (m *AppModel) isMergeDiffPaneFocused() bool {
 func (m *AppModel) renderConflictFileListBordered(th *theme.Theme) string {
 	content := m.conflictView.FileListView(m.cursorVisible)
 	w, h := m.layout.GetPanelSize(component.FocusFileTree)
-	border := th.InactiveBorder
-	if m.focus.Current() == component.FocusConflictFileList {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.focus.Current() == component.FocusConflictFileList, w, h, th)
 }
 
 // renderConflictViewBordered renders the conflict resolution content pane.
 func (m *AppModel) renderConflictViewBordered(th *theme.Theme) string {
 	content := m.overlayBlockedChord(m.overlayChordHint(m.conflictView.View(m.cursorVisible), component.FocusCodeViewer, th))
 	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	return m.renderBordered(content, m.focus.Current() == component.FocusConflictView, w, h, th)
+}
+
+// renderBordered wraps content in a panel border. When focused and a gradient
+// border renderer is active, uses per-character gradient coloring; otherwise
+// falls back to the standard lipgloss per-side border style.
+func (m *AppModel) renderBordered(content string, focused bool, w, h int, th *theme.Theme) string {
+	innerW := max(w-panelBorderSize, 1)
+	innerH := max(h-panelBorderSize, 1)
+	if focused && th.ActiveBorderRender != nil {
+		return th.ActiveBorderRender(content, innerW, innerH, h)
+	}
 	border := th.InactiveBorder
-	if m.focus.Current() == component.FocusConflictView {
+	if focused {
 		border = th.ActiveBorder
 	}
 	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
+		Width(innerW).
+		Height(innerH).
 		MaxHeight(h).
 		Render(content)
 }
 
 func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.Theme) string {
 	w, h := m.layout.GetPanelSize(id)
-	border := th.InactiveBorder
-	if m.focus.IsFocused(id) {
-		border = th.ActiveBorder
-	}
-	return border.
-		Width(max(w-panelBorderSize, 1)).
-		Height(max(h-panelBorderSize, 1)).
-		MaxHeight(h).
-		Render(content)
+	return m.renderBordered(content, m.focus.IsFocused(id), w, h, th)
 }
 
 // ---------------------------------------------------------------------------
@@ -13185,6 +13476,11 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 			return err
 		}
 	}
+	if m.pipelineBridge != nil {
+		if err := m.pipelineBridge.Start(program); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -13363,7 +13659,9 @@ func (m *AppModel) needsDecorTick() bool {
 		(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick()) ||
 		(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick()) ||
 		(m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick()) ||
-		(m.planView != nil && m.planView.NeedsDecorTick())
+		(m.planView != nil && m.planView.NeedsDecorTick()) ||
+		m.agentPanel.NeedsDecorTick() ||
+		m.focusGradient != nil
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs

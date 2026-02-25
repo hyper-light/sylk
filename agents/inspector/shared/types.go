@@ -29,6 +29,17 @@ const (
 	Info Severity = "info"
 )
 
+// ValidationDomain identifies the validation context for a worker's output.
+type ValidationDomain string
+
+const (
+	// DomainCode is the default validation domain for pure code output.
+	DomainCode ValidationDomain = "code"
+
+	// DomainDesign is the validation domain for BubbleTea/Lipgloss design output.
+	DomainDesign ValidationDomain = "design"
+)
+
 // ValidSeverities returns all valid severity levels in descending order of importance.
 func ValidSeverities() []Severity {
 	return []Severity{Critical, High, Medium, Low, Info}
@@ -79,6 +90,9 @@ type ValidationIssue struct {
 
 	// RuleID references the validation rule that triggered this issue.
 	RuleID string `json:"rule_id,omitempty"`
+
+	// Domain identifies whether this issue relates to code or design validation.
+	Domain ValidationDomain `json:"domain,omitempty"`
 }
 
 // InspectorCriteria defines the success criteria and quality gates for a task.
@@ -86,6 +100,9 @@ type ValidationIssue struct {
 type InspectorCriteria struct {
 	// TaskID uniquely identifies the task these criteria apply to.
 	TaskID string `json:"task_id"`
+
+	// Domain identifies whether these criteria target code or design validation.
+	Domain ValidationDomain `json:"domain,omitempty"`
 
 	// SuccessCriteria lists the specific criteria that must be met.
 	SuccessCriteria []SuccessCriterion `json:"success_criteria"`
@@ -705,14 +722,58 @@ type QualityGrade struct {
 
 	// Adherence measures conformance to the plan and coding standards (0.0 to 1.0).
 	Adherence float64 `json:"adherence"`
+
+	// TokenConsistency measures palette/theme token usage (0.0 to 1.0). Design only.
+	TokenConsistency float64 `json:"token_consistency,omitempty"`
+
+	// Accessibility measures WCAG AA compliance (0.0 to 1.0). Design only.
+	Accessibility float64 `json:"accessibility,omitempty"`
+
+	// ComponentAPI measures Model/Update/View pattern adherence (0.0 to 1.0). Design only.
+	ComponentAPI float64 `json:"component_api,omitempty"`
 }
 
-// Overall returns the weighted average quality score.
+// Design-specific quality grade weight constants. These sum to 1.0.
+const (
+	weightDesignCorrectness      = 0.20
+	weightDesignRobustness       = 0.10
+	weightDesignPerformance      = 0.05
+	weightDesignSecurity         = 0.10
+	weightDesignAdherence        = 0.10
+	weightDesignTokenConsistency = 0.20
+	weightDesignAccessibility    = 0.15
+	weightDesignComponentAPI     = 0.10
+)
+
+// Overall returns the weighted average quality score for code domains.
 // Weights: correctness=0.30, robustness=0.20, performance=0.15, security=0.20, adherence=0.15.
 func (g QualityGrade) Overall() float64 {
+	return g.codeOverall()
+}
+
+// OverallForDomain returns the weighted average for the given validation domain.
+func (g QualityGrade) OverallForDomain(domain ValidationDomain) float64 {
+	if domain == DomainDesign {
+		return g.designOverall()
+	}
+	return g.codeOverall()
+}
+
+func (g QualityGrade) codeOverall() float64 {
 	return g.Correctness*weightCorrectness +
 		g.Robustness*weightRobustness +
 		g.Performance*weightPerformance +
 		g.Security*weightSecurity +
 		g.Adherence*weightAdherence
+}
+
+func (g QualityGrade) designOverall() float64 {
+	return g.Correctness*weightDesignCorrectness +
+		g.Robustness*weightDesignRobustness +
+		g.Performance*weightDesignPerformance +
+		g.Security*weightDesignSecurity +
+		g.Adherence*weightDesignAdherence +
+		g.TokenConsistency*weightDesignTokenConsistency +
+		g.Accessibility*weightDesignAccessibility +
+		g.ComponentAPI*weightDesignComponentAPI
 }

@@ -4,17 +4,21 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/adalundhe/sylk/agents/designer"
 	"github.com/adalundhe/sylk/agents/engineer"
-	"github.com/adalundhe/sylk/agents/inspector"
-	"github.com/adalundhe/sylk/agents/tester"
+	inspPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
+	pipelinetester "github.com/adalundhe/sylk/agents/tester/pipeline"
+	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 // AgentFactory creates pipeline-scoped agent instances.
 type AgentFactory struct {
-	inspectorConfig inspector.InspectorConfig
-	testerConfig    tester.TesterConfig
+	inspectorConfig inspShared.PipelineInspectorConfig
+	testerConfig    shared.PipelineTesterConfig
 	engineerConfig  engineer.Config
 	designerConfig  designer.Config
 	logger          *slog.Logger
@@ -22,8 +26,8 @@ type AgentFactory struct {
 
 // AgentFactoryConfig holds the configs needed to build agents.
 type AgentFactoryConfig struct {
-	InspectorConfig inspector.InspectorConfig
-	TesterConfig    tester.TesterConfig
+	InspectorConfig inspShared.PipelineInspectorConfig
+	TesterConfig    shared.PipelineTesterConfig
 	EngineerConfig  engineer.Config
 	DesignerConfig  designer.Config
 	Logger          *slog.Logger
@@ -44,29 +48,41 @@ func NewAgentFactory(cfg AgentFactoryConfig) *AgentFactory {
 	}
 }
 
-// CreateInspector creates a pipeline-scoped Inspector in PipelineInternal mode.
-func (f *AgentFactory) CreateInspector() (*inspector.Inspector, error) {
+// CreateInspector creates a pipeline-scoped PipelineInspector.
+// The worker type is used to select the correct system prompt for design-aware validation.
+func (f *AgentFactory) CreateInspector(wt WorkerType) (*inspPipeline.PipelineInspector, error) {
 	cfg := f.inspectorConfig
-	cfg.Mode = inspector.PipelineInternal
-	return inspector.New(cfg)
+	insp, err := inspPipeline.New(cfg, nil)
+	if err != nil {
+		return nil, err
+	}
+	insp.SetWorkerType(string(wt))
+	return insp, nil
 }
 
-// CreateTester creates a pipeline-scoped Tester.
-func (f *AgentFactory) CreateTester() (*tester.Tester, error) {
-	return tester.New(f.testerConfig)
+// CreateTester creates a pipeline-scoped PipelineTester.
+func (f *AgentFactory) CreateTester() (*pipelinetester.PipelineTester, error) {
+	return pipelinetester.New(f.testerConfig, nil)
 }
 
 // CreateWorker creates a WorkerAgent adapter for the given worker type.
 func (f *AgentFactory) CreateWorker(wt WorkerType) (WorkerAgent, error) {
 	switch wt {
 	case WorkerEngineer:
-		eng, err := engineer.New(f.engineerConfig)
+		eng, err := engineer.New(f.engineerConfig, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create engineer: %w", err)
 		}
 		return &engineerWorker{eng: eng}, nil
 	case WorkerDesigner:
-		des, err := designer.New(f.designerConfig)
+		googleCfg := providers.DefaultGoogleConfig()
+		googleCfg.Model = string(providers.Gemini31Pro)
+		googleCfg.MaxTokens = 16384
+		provider, err := providers.NewGoogleProvider(context.Background(), googleCfg)
+		if err != nil {
+			return nil, fmt.Errorf("create designer google provider: %w", err)
+		}
+		des, err := designer.New(f.designerConfig, provider)
 		if err != nil {
 			return nil, fmt.Errorf("create designer: %w", err)
 		}
@@ -76,13 +92,45 @@ func (f *AgentFactory) CreateWorker(wt WorkerType) (WorkerAgent, error) {
 	}
 }
 
-// engineerWorker adapts the Engineer agent to the WorkerAgent interface.
-type engineerWorker struct {
-	eng *engineer.Engineer
+// CreateCoWorkers creates worker agents for each co-tenant type.
+// On partial failure, closes all successfully created workers before returning.
+func (f *AgentFactory) CreateCoWorkers(types []WorkerType) ([]WorkerAgent, error) {
+	workers := make([]WorkerAgent, 0, len(types))
+	for _, wt := range types {
+		w, err := f.CreateWorker(wt)
+		if err != nil {
+			for _, prev := range workers {
+				prev.Close()
+			}
+			return nil, fmt.Errorf("create co-worker %s: %w", wt, err)
+		}
+		workers = append(workers, w)
+	}
+	return workers, nil
 }
 
-func (w *engineerWorker) Execute(ctx context.Context, criteria *inspector.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error) {
-	prompt := buildEngineerPrompt(criteria, inspFb, testFb)
+// TaskPromptSetter is implemented by worker adapters that accept a task prompt.
+type TaskPromptSetter interface {
+	SetTaskPrompt(prompt string)
+}
+
+// PriorOutputSetter is implemented by worker adapters that accept prior output context.
+type PriorOutputSetter interface {
+	SetPriorOutput(result *WorkerResult)
+}
+
+// engineerWorker adapts the Engineer agent to the WorkerAgent interface.
+type engineerWorker struct {
+	eng        *engineer.Engineer
+	taskPrompt string
+	priorOutput *WorkerResult
+}
+
+func (w *engineerWorker) SetTaskPrompt(prompt string)        { w.taskPrompt = prompt }
+func (w *engineerWorker) SetPriorOutput(result *WorkerResult) { w.priorOutput = result }
+
+func (w *engineerWorker) Execute(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error) {
+	prompt := buildEngineerPromptWithContext(w.taskPrompt, w.priorOutput, criteria, inspFb, testFb)
 	req := &engineer.EngineerRequest{
 		Intent:    engineer.IntentComplete,
 		TaskID:    criteria.TaskID,
@@ -105,51 +153,88 @@ func (w *engineerWorker) Close() error {
 
 // designerWorker adapts the Designer agent to the WorkerAgent interface.
 type designerWorker struct {
-	des *designer.Designer
+	des         *designer.Designer
+	taskPrompt  string
+	priorOutput *WorkerResult
 }
 
-func (w *designerWorker) Execute(ctx context.Context, criteria *inspector.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error) {
-	prompt := buildDesignerPrompt(criteria, inspFb, testFb)
-	req := &designer.DesignerRequest{
-		Intent:    designer.IntentDesignComponent,
-		TaskID:    criteria.TaskID,
-		Prompt:    prompt,
-		SessionID: "",
-	}
-	resp, err := w.des.Handle(ctx, req)
+func (w *designerWorker) SetTaskPrompt(prompt string)        { w.taskPrompt = prompt }
+func (w *designerWorker) SetPriorOutput(result *WorkerResult) { w.priorOutput = result }
+
+func (w *designerWorker) Execute(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error) {
+	prompt := buildDesignerPromptWithContext(w.taskPrompt, w.priorOutput, criteria, inspFb, testFb)
+	result, err := w.des.HandleRequest(ctx, prompt)
 	if err != nil {
 		return nil, err
 	}
-	if !resp.Success {
-		return nil, fmt.Errorf("designer failed: %s", resp.Error)
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("designer returned unexpected result type")
 	}
-	return designResultToWorkerResult(resp.Result), nil
+	response, _ := resultMap["response"].(string)
+	return &WorkerResult{
+		TaskResult: &engineer.TaskResult{
+			TaskID:  criteria.TaskID,
+			Success: true,
+			Output:  response,
+		},
+	}, nil
 }
 
 func (w *designerWorker) Close() error {
 	return w.des.Close()
 }
 
-func buildEngineerPrompt(criteria *inspector.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) string {
-	prompt := fmt.Sprintf("Implement task %s according to the defined criteria.", criteria.TaskID)
-	if inspFb != nil && inspFb.Feedback != nil && !inspFb.Feedback.Passed {
-		prompt += fmt.Sprintf(" Inspector feedback (loop %d): %d issues found.", inspFb.Feedback.Loop, len(inspFb.Feedback.Issues))
-	}
-	if testFb != nil && len(testFb.FailedTests) > 0 {
-		prompt += fmt.Sprintf(" %d tests currently failing.", len(testFb.FailedTests))
-	}
-	return prompt
+func buildEngineerPrompt(criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) string {
+	return buildEngineerPromptWithContext("", nil, criteria, inspFb, testFb)
 }
 
-func buildDesignerPrompt(criteria *inspector.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) string {
-	prompt := fmt.Sprintf("Design components for task %s according to the defined criteria.", criteria.TaskID)
+func buildDesignerPrompt(criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) string {
+	return buildDesignerPromptWithContext("", nil, criteria, inspFb, testFb)
+}
+
+func buildEngineerPromptWithContext(taskPrompt string, priorOutput *WorkerResult, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) string {
+	var b strings.Builder
+	if taskPrompt != "" {
+		b.WriteString(taskPrompt)
+		b.WriteString("\n\n")
+	}
+	writePriorOutputSection(&b, priorOutput)
+	fmt.Fprintf(&b, "Implement task %s according to the defined criteria.", criteria.TaskID)
+	writeFeedbackSuffix(&b, inspFb, testFb)
+	return b.String()
+}
+
+func buildDesignerPromptWithContext(taskPrompt string, priorOutput *WorkerResult, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) string {
+	var b strings.Builder
+	if taskPrompt != "" {
+		b.WriteString(taskPrompt)
+		b.WriteString("\n\n")
+	}
+	writePriorOutputSection(&b, priorOutput)
+	fmt.Fprintf(&b, "Design components for task %s according to the defined criteria.", criteria.TaskID)
+	writeFeedbackSuffix(&b, inspFb, testFb)
+	return b.String()
+}
+
+func writePriorOutputSection(b *strings.Builder, priorOutput *WorkerResult) {
+	if priorOutput == nil || len(priorOutput.ChangedFiles) == 0 {
+		return
+	}
+	b.WriteString("## Prior Agent Output\nThe primary agent has already modified these files:\n")
+	for _, f := range priorOutput.ChangedFiles {
+		fmt.Fprintf(b, "- %s\n", f)
+	}
+	b.WriteString("\nBuild upon their work. Do not re-implement what they have already done.\n\n")
+}
+
+func writeFeedbackSuffix(b *strings.Builder, inspFb *InspectorFeedback, testFb *TesterFeedback) {
 	if inspFb != nil && inspFb.Feedback != nil && !inspFb.Feedback.Passed {
-		prompt += fmt.Sprintf(" Inspector feedback (loop %d): %d issues found.", inspFb.Feedback.Loop, len(inspFb.Feedback.Issues))
+		fmt.Fprintf(b, " Inspector feedback (loop %d): %d issues found.", inspFb.Feedback.Loop, len(inspFb.Feedback.Issues))
 	}
 	if testFb != nil && len(testFb.FailedTests) > 0 {
-		prompt += fmt.Sprintf(" %d tests currently failing.", len(testFb.FailedTests))
+		fmt.Fprintf(b, " %d tests currently failing.", len(testFb.FailedTests))
 	}
-	return prompt
 }
 
 func taskResultToWorkerResult(tr *engineer.TaskResult) *WorkerResult {

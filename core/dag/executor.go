@@ -2,6 +2,7 @@ package dag
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,7 +36,8 @@ type Executor struct {
 	dispatcher NodeDispatcher
 	closed     atomic.Bool
 
-	layerGate LayerGate
+	layerGate    LayerGate
+	layerRetries map[int]int
 
 	scope *concurrency.GoroutineScope
 }
@@ -98,6 +100,7 @@ func (e *Executor) initializeExecution(ctx context.Context, dag *DAG, dispatcher
 	e.currentLayer = 0
 	e.startTime = time.Now()
 	e.nodeResults = make(map[string]*NodeResult)
+	e.layerRetries = make(map[int]int)
 	e.dispatcher = dispatcher
 	e.cancelled.Store(false)
 
@@ -128,6 +131,18 @@ func (e *Executor) emitCompletionEvent(dag *DAG, result *DAGResult) {
 	})
 }
 
+// layerOutcome is the result of processing a layer, including its gate.
+type layerOutcome int
+
+const (
+	layerOutcomeContinue layerOutcome = iota
+	layerOutcomeStop
+	layerOutcomeRetry
+)
+
+// maxLayerRetries is the maximum number of retries per layer.
+const maxLayerRetries = 3
+
 func resultEventType(state DAGState) EventType {
 	switch state {
 	case DAGStateSucceeded:
@@ -144,19 +159,24 @@ func resultEventType(state DAGState) EventType {
 func (e *Executor) executeLayers() *DAGResult {
 	layers := e.dag.ExecutionOrder()
 
-	for layerIdx, layer := range layers {
+	for layerIdx := 0; layerIdx < len(layers); layerIdx++ {
 		if e.cancelled.Load() {
 			break
 		}
-		if e.executeAndCheckLayer(layerIdx, layer) {
+		outcome := e.executeAndCheckLayer(layerIdx, layers[layerIdx])
+		if outcome == layerOutcomeStop {
 			break
+		}
+		if outcome == layerOutcomeRetry {
+			e.resetLayerForRetry(layers[layerIdx])
+			layerIdx-- // loop re-increments
 		}
 	}
 
 	return e.buildResult()
 }
 
-func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) bool {
+func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) layerOutcome {
 	e.mu.Lock()
 	e.currentLayer = layerIdx
 	e.mu.Unlock()
@@ -166,14 +186,52 @@ func (e *Executor) executeAndCheckLayer(layerIdx int, layer []string) bool {
 	e.emitLayerCompleted(layerIdx)
 
 	if err != nil && e.policy.FailurePolicy == FailurePolicyFailFast {
-		return true
+		return layerOutcomeStop
 	}
 
-	if gateErr := e.invokeLayerGate(layerIdx); gateErr != nil {
-		return true
-	}
+	return e.evaluateGateResult(layerIdx)
+}
 
-	return false
+func (e *Executor) evaluateGateResult(layerIdx int) layerOutcome {
+	gateErr := e.invokeLayerGate(layerIdx)
+	if gateErr == nil {
+		return layerOutcomeContinue
+	}
+	if errors.Is(gateErr, ErrLayerRetry) {
+		return e.checkLayerRetryBudget(layerIdx)
+	}
+	return layerOutcomeStop
+}
+
+func (e *Executor) checkLayerRetryBudget(layerIdx int) layerOutcome {
+	e.mu.Lock()
+	e.layerRetries[layerIdx]++
+	count := e.layerRetries[layerIdx]
+	e.mu.Unlock()
+
+	if count > maxLayerRetries {
+		return layerOutcomeStop
+	}
+	return layerOutcomeRetry
+}
+
+func (e *Executor) resetLayerForRetry(layer []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, nodeID := range layer {
+		result, ok := e.nodeResults[nodeID]
+		if !ok || result.State != NodeStateFailed {
+			continue
+		}
+		node, exists := e.dag.GetNode(nodeID)
+		if !exists {
+			continue
+		}
+		node.SetState(NodeStatePending)
+		node.ResetRetryCount()
+		delete(e.nodeResults, nodeID)
+	}
 }
 
 func (e *Executor) invokeLayerGate(layerIdx int) error {
@@ -292,6 +350,11 @@ func (e *Executor) layerAction(nodeID string) (layerAction, *Node, error) {
 func (e *Executor) nodeForLayer(nodeID string) *Node {
 	node, ok := e.dag.GetNode(nodeID)
 	if !ok {
+		return nil
+	}
+
+	// Skip already-succeeded nodes during layer replay.
+	if node.State().IsTerminal() {
 		return nil
 	}
 

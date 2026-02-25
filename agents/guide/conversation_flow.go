@@ -3,6 +3,7 @@ package guide
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"strings"
 	"sync"
@@ -44,6 +45,17 @@ type conversationFlowState struct {
 	ActiveAgentID string
 	UpdatedAt     time.Time
 	agents        map[string]conversationAgentState
+	phase         *sessionPhase // Active conversation phase (e.g. plan approval).
+}
+
+// sessionPhase tracks an active conversation phase set by a ResponseDirective.
+// The phase is consumed (one-shot) on the next user message classification.
+type sessionPhase struct {
+	Phase     ConversationPhase
+	AgentID   string
+	Metadata  map[string]any
+	SetAt     time.Time
+	ExpiresAt time.Time
 }
 
 type conversationAgentState struct {
@@ -686,6 +698,343 @@ func followupIntentCandidates() []Intent {
 // JSON serialization so conversation history stores clean prose, not struct JSON.
 type responseTexter interface {
 	ResponseText() string
+}
+
+// =============================================================================
+// Conversation Phase Tracking
+// =============================================================================
+
+// SetPhase records a conversation phase for the session from a ResponseDirective.
+func (m *ConversationFlowManager) SetPhase(sessionID string, directive *ResponseDirective) {
+	if m == nil || directive == nil || directive.Phase == PhaseNone {
+		return
+	}
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return
+	}
+	now := time.Now()
+	ttl := directive.TTL
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+	m.mu.Lock()
+	state, ok := m.sessions[trimmed]
+	if !ok {
+		state = conversationFlowState{
+			agents: map[string]conversationAgentState{},
+		}
+	}
+	state.phase = &sessionPhase{
+		Phase:     directive.Phase,
+		AgentID:   strings.TrimSpace(directive.AgentID),
+		Metadata:  directive.Metadata,
+		SetAt:     now,
+		ExpiresAt: now.Add(ttl),
+	}
+	state.UpdatedAt = now
+	m.sessions[trimmed] = state
+	m.mu.Unlock()
+}
+
+// CurrentPhase returns the active phase for the session, or nil if expired/absent.
+func (m *ConversationFlowManager) CurrentPhase(sessionID string) *sessionPhase {
+	if m == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return nil
+	}
+	m.mu.RLock()
+	state, ok := m.sessions[trimmed]
+	m.mu.RUnlock()
+	if !ok || state.phase == nil {
+		return nil
+	}
+	if time.Now().After(state.phase.ExpiresAt) {
+		m.ClearPhase(trimmed)
+		return nil
+	}
+	return state.phase
+}
+
+// ClearPhase removes the active phase for the session.
+func (m *ConversationFlowManager) ClearPhase(sessionID string) {
+	if m == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return
+	}
+	m.mu.Lock()
+	if state, ok := m.sessions[trimmed]; ok {
+		state.phase = nil
+		m.sessions[trimmed] = state
+	}
+	m.mu.Unlock()
+}
+
+// =============================================================================
+// Phase-Aware Classification
+// =============================================================================
+
+// tryPhaseClassification checks whether a conversation phase is active and
+// classifies the input using phase-specific polarity instead of full intent
+// detection. Returns (result, targetAgentID, true) when the phase gate fires.
+func (g *Guide) tryPhaseClassification(request *RouteRequest) (*RouteResult, string, bool) {
+	if g == nil || g.conversation == nil || request == nil {
+		return nil, "", false
+	}
+	phase := g.conversation.CurrentPhase(request.SessionID)
+	if phase == nil {
+		return nil, "", false
+	}
+
+	// One-shot: consume the phase regardless of classification outcome.
+	defer g.conversation.ClearPhase(request.SessionID)
+
+	switch phase.Phase {
+	case PhasePlanApproval:
+		return g.classifyPlanApprovalPhase(request, phase)
+	default:
+		return nil, "", false
+	}
+}
+
+// classifyPlanApprovalPhase handles the PhasePlanApproval phase. Checks for
+// topic escape first, then classifies polarity (accept vs feedback).
+func (g *Guide) classifyPlanApprovalPhase(request *RouteRequest, phase *sessionPhase) (*RouteResult, string, bool) {
+	input := strings.TrimSpace(request.Input)
+	if input == "" {
+		return nil, "", false
+	}
+
+	// Topic escape: if the input references a different domain, fall through
+	// to normal classification.
+	if isPlanApprovalTopicEscape(input) {
+		return nil, "", false
+	}
+
+	targetAgent := phase.AgentID
+	if targetAgent == "" {
+		targetAgent = "architect"
+	}
+
+	if classifyPlanApprovalPolarity(input) {
+		result := &RouteResult{
+			Intent:               IntentExecute,
+			Domain:               DomainPlanning,
+			TargetAgent:          TargetAgent(targetAgent),
+			Confidence:           0.95,
+			Action:               RouteActionExecute,
+			ClassificationMethod: "phase_plan_approval",
+			Reason:               "plan approval: positive polarity",
+		}
+		return result, targetAgent, true
+	}
+
+	result := &RouteResult{
+		Intent:               IntentPlan,
+		Domain:               DomainPlanning,
+		TargetAgent:          TargetAgent(targetAgent),
+		Confidence:           0.95,
+		Action:               RouteActionExecute,
+		ClassificationMethod: "phase_plan_feedback",
+		Reason:               "plan approval: feedback/rejection",
+	}
+	return result, targetAgent, true
+}
+
+// planApprovalPositiveExact are short affirmatives that match only when the
+// entire message (after trim + lower + strip punctuation) equals the phrase.
+// Acceptance is a closed class — there are only so many ways to say "yes".
+var planApprovalPositiveExact = map[string]struct{}{
+	"yes": {}, "y": {}, "yep": {}, "yeah": {}, "yup": {},
+	"ok": {}, "okay": {}, "sure": {}, "right": {},
+	"great": {}, "perfect": {}, "awesome": {}, "absolutely": {},
+	"affirmative": {}, "roger": {}, "aye": {}, "approved": {}, "lgtm": {},
+}
+
+// planApprovalPositiveContains are phrases that signal acceptance when found
+// anywhere in the input.
+var planApprovalPositiveContains = []string{
+	"go ahead", "go for it", "do it", "make it so", "ship it",
+	"let's go", "lets go", "let's do it", "lets do it",
+	"sounds good", "looks good", "kick it off",
+	"run it", "proceed", "execute", "hand off", "handoff",
+}
+
+// planApprovalNegationPrefixes are phrases that negate a subsequent positive
+// signal. Checked before positive matching so "don't go ahead" and "no,
+// don't proceed" are correctly classified as negative (feedback/rejection).
+var planApprovalNegationPrefixes = []string{
+	"don't", "don't", "do not", "dont",
+	"not yet", "hold off", "hold on",
+	"wait", "stop", "cancel", "pause",
+	"i disagree", "i object", "i refuse",
+	"no,", "no.", "no!", "nope",
+}
+
+// classifyPlanApprovalPolarity returns true for positive (accept), false for
+// negative (feedback/reject). The positive list is intentionally small because
+// acceptance is a closed class. Everything else is feedback — the correct
+// default because unsolicited approval is rare.
+//
+// Negation is checked first: "don't go ahead" contains "go ahead" but is
+// negative because the negation prefix overrides the positive signal.
+func classifyPlanApprovalPolarity(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	if hasPlanApprovalNegation(lower) {
+		return false
+	}
+	stripped := strings.TrimRight(lower, ".!?,;:")
+	if _, ok := planApprovalPositiveExact[stripped]; ok {
+		return true
+	}
+	for _, phrase := range planApprovalPositiveContains {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPlanApprovalNegation returns true when the input contains a negation
+// prefix that overrides any subsequent positive signal.
+func hasPlanApprovalNegation(lower string) bool {
+	for _, prefix := range planApprovalNegationPrefixes {
+		if strings.Contains(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPlanApprovalTopicEscape returns true when the input clearly references a
+// different domain, indicating the user has moved on from plan approval.
+func isPlanApprovalTopicEscape(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	// File paths or code references.
+	if strings.ContainsAny(lower, "/\\") {
+		return true
+	}
+	// Explicit agent targeting.
+	escapeKeywords := []string{
+		"@librarian", "@tester", "@inspector", "@engineer", "@designer",
+		"find the", "search for", "locate the", "show me the file",
+	}
+	for _, kw := range escapeKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// observeStreamDirective checks an incoming stream event for a ResponseDirective
+// and records the conversation phase for the session.
+func (g *Guide) observeStreamDirective(streamResp *StreamResponse) {
+	if g == nil || g.conversation == nil || streamResp == nil || streamResp.Event == nil {
+		return
+	}
+	event := streamResp.Event
+	if event.Type != StreamEventComplete || event.Directive == nil {
+		return
+	}
+	pending := g.pending.Get(streamResp.CorrelationID)
+	if pending == nil || pending.Request == nil {
+		return
+	}
+	g.conversation.SetPhase(pending.Request.SessionID, event.Directive)
+}
+
+// observeStreamReroute detects reroute events and records the stream target
+// override so that stream events for the new CID reach the correct consumer.
+//
+// When the architect dispatches a plan to the orchestrator, it emits a reroute
+// carrying both the original CID and the orchestrator's new CID. The pending
+// for the new CID has SourceAgentID = "architect" (set by requestRouteSync),
+// but stream events must reach the TUI. This method stores the mapping
+// newCID → original source so that resolveStreamTarget can redirect streams
+// while the MessageTypeResponse still reaches the architect for the sync wait.
+func (g *Guide) observeStreamReroute(streamResp *StreamResponse) {
+	if g == nil || streamResp == nil || streamResp.Event == nil {
+		return
+	}
+	if streamResp.Event.Type != StreamEventReroute {
+		return
+	}
+	data, ok := streamResp.Event.Data.(map[string]string)
+	if !ok {
+		return
+	}
+	newCID := strings.TrimSpace(data["new_correlation_id"])
+	if newCID == "" {
+		return
+	}
+	// The reroute arrives on the original CID's pending. The original
+	// source (e.g. "tui") is who should receive the new CID's streams.
+	pending := g.pending.Get(streamResp.CorrelationID)
+	if pending == nil {
+		return
+	}
+	originalSource := strings.TrimSpace(pending.SourceAgentID)
+	if originalSource == "" {
+		return
+	}
+	slog.Info("guide: observeStreamReroute: storing stream target override",
+		"new_cid", newCID,
+		"original_source", originalSource,
+		"reroute_cid", streamResp.CorrelationID)
+
+	// Store the mapping. The pending for newCID may not exist yet (the
+	// route request hasn't arrived), so we store in the deferred map.
+	g.streamReroutesMu.Lock()
+	g.streamReroutes[newCID] = originalSource
+	g.streamReroutesMu.Unlock()
+
+	// If the pending already exists, apply immediately.
+	if newPending := g.pending.Get(newCID); newPending != nil {
+		newPending.StreamTargetOverride = originalSource
+		slog.Info("guide: observeStreamReroute: applied immediately to existing pending",
+			"new_cid", newCID)
+	}
+}
+
+// applyDeferredStreamReroute checks the deferred reroute map and applies
+// the stream target override to the pending if one was registered before
+// the pending was created. Consumes the entry (one-shot application).
+func (g *Guide) applyDeferredStreamReroute(pending *PendingRequest) {
+	if pending == nil || pending.StreamTargetOverride != "" {
+		return
+	}
+	g.streamReroutesMu.Lock()
+	target, ok := g.streamReroutes[pending.CorrelationID]
+	if ok {
+		delete(g.streamReroutes, pending.CorrelationID)
+	}
+	g.streamReroutesMu.Unlock()
+	if ok && target != "" {
+		pending.StreamTargetOverride = target
+		slog.Info("guide: applyDeferredStreamReroute: applied deferred override",
+			"cid", pending.CorrelationID,
+			"stream_target", target)
+	}
+}
+
+// resolveStreamTarget returns the agent ID to which stream events should
+// be published. Uses StreamTargetOverride when set (rerouted streams),
+// otherwise falls back to the original SourceAgentID.
+func (g *Guide) resolveStreamTarget(pending *PendingRequest) string {
+	if pending.StreamTargetOverride != "" {
+		return pending.StreamTargetOverride
+	}
+	return pending.SourceAgentID
 }
 
 func guideResponseText(response *RouteResponse) string {

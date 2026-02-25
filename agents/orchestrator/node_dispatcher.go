@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ type BusNodeDispatcher struct {
 	sessionID string
 	dagID     string
 	buffers   *BufferRegistry
+	activator guide.AgentActivator
 	pending   sync.Map // nodeID → chan *dag.NodeResult
 }
 
@@ -26,13 +28,16 @@ type BusNodeDispatcher struct {
 var _ dag.NodeDispatcher = (*BusNodeDispatcher)(nil)
 
 // NewBusNodeDispatcher creates a new dispatcher wired to the event bus.
-func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, buffers *BufferRegistry) *BusNodeDispatcher {
+// The activator is optional — when non-nil, Dispatch calls EnsureActive
+// before publishing to guarantee the target agent is hot.
+func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, buffers *BufferRegistry, activator guide.AgentActivator) *BusNodeDispatcher {
 	return &BusNodeDispatcher{
 		bus:       bus,
 		agentID:   agentID,
 		sessionID: sessionID,
 		dagID:     dagID,
 		buffers:   buffers,
+		activator: activator,
 	}
 }
 
@@ -54,24 +59,40 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 
 	taskID := uuid.New().String()
 
+	payload := map[string]any{
+		"task_id":        taskID,
+		"node_id":        node.ID(),
+		"dag_id":         d.dagID,
+		"agent_type":     node.AgentType(),
+		"prompt":         node.Prompt(),
+		"context":        node.Context(),
+		"parent_results": parentSummaries,
+	}
+
+	// Include compound node fields when present
+	if node.IsCompound() {
+		payload["co_agents"] = node.CoAgents()
+		payload["collaboration_mode"] = node.CollaborationMode().String()
+		payload["max_review_rounds"] = node.MaxReviewRounds()
+	}
+
 	msg := &guide.Message{
 		ID:            uuid.New().String(),
 		Type:          guide.MessageTypeTaskDispatch,
 		SourceAgentID: d.agentID,
-		Payload: map[string]any{
-			"task_id":        taskID,
-			"node_id":        node.ID(),
-			"dag_id":         d.dagID,
-			"agent_type":     node.AgentType(),
-			"prompt":         node.Prompt(),
-			"context":        node.Context(),
-			"parent_results": parentSummaries,
-		},
+		Payload:       payload,
 		Metadata: map[string]any{
 			"session_id": d.sessionID,
 			"dag_id":     d.dagID,
 		},
 		Timestamp: time.Now(),
+	}
+
+	// Activate target agent if demoted/cold.
+	if d.activator != nil {
+		if err := d.activator.EnsureActive(ctx, node.AgentType()); err != nil {
+			return nil, fmt.Errorf("activate %s for node %s: %w", node.AgentType(), node.ID(), err)
+		}
 	}
 
 	if err := d.bus.Publish("tasks.dispatch", msg); err != nil {
@@ -89,12 +110,15 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 // OnNodeComplete is called by the orchestrator when a pipeline agent responds.
 // It resolves the pending dispatch for the given node.
 func (d *BusNodeDispatcher) OnNodeComplete(nodeID string, result *dag.NodeResult) {
-	if val, ok := d.pending.Load(nodeID); ok {
-		ch := val.(chan *dag.NodeResult)
-		select {
-		case ch <- result:
-		default:
-			// Channel already has a result — drop duplicate
-		}
+	val, ok := d.pending.Load(nodeID)
+	if !ok {
+		slog.Warn("node complete for unknown node", "node_id", nodeID, "dag_id", d.dagID)
+		return
+	}
+	ch := val.(chan *dag.NodeResult)
+	select {
+	case ch <- result:
+	default:
+		// Channel already has a result — drop duplicate
 	}
 }

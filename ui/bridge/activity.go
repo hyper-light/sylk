@@ -2,8 +2,12 @@ package bridge
 
 import (
 	"context"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
@@ -16,6 +20,27 @@ const (
 	// Zero uses the scope's max lifetime; activity bridge is long-lived for the UI session.
 	activityDrainTimeout = 0
 )
+
+var (
+	bridgeDebugLog     *slog.Logger
+	bridgeDebugLogOnce sync.Once
+)
+
+func bridgeEventDebugLog() *slog.Logger {
+	bridgeDebugLogOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".sylk", "logs")
+		os.MkdirAll(dir, 0755)
+		f, err := os.OpenFile(filepath.Join(dir, "ui_events.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			bridgeDebugLog = slog.Default()
+			return
+		}
+		bridgeDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	})
+	return bridgeDebugLog
+}
 
 // ActivityBridge implements both events.EventSubscriber and Bridge.
 // It subscribes to the ActivityEventBus and forwards events as
@@ -93,6 +118,13 @@ func (b *ActivityBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 			}
 			select {
 			case event := <-b.buffer:
+				bridgeEventDebugLog().Info("activity_bridge: drain",
+					"agent_id", event.AgentID,
+					"event_type", event.EventType,
+					"content", event.Content,
+					"outcome", event.Outcome,
+					"event_ts", event.Timestamp.Format(time.RFC3339Nano),
+					"drain_ts", time.Now().Format(time.RFC3339Nano))
 				program.Send(msg.ActivityEventMsg{Event: event})
 			case <-b.done:
 				return nil

@@ -7,15 +7,15 @@ import (
 
 	"github.com/adalundhe/sylk/agents/designer"
 	"github.com/adalundhe/sylk/agents/engineer"
-	"github.com/adalundhe/sylk/agents/inspector"
-	"github.com/adalundhe/sylk/agents/tester"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
+	"github.com/adalundhe/sylk/agents/tester/shared"
 )
 
 func newTestManager(t *testing.T) *PipelineManager {
 	t.Helper()
 	factory := NewAgentFactory(AgentFactoryConfig{
-		InspectorConfig: inspector.DefaultInspectorConfig(),
-		TesterConfig:    tester.DefaultTesterConfig(),
+		InspectorConfig: inspShared.DefaultPipelineInspectorConfig(),
+		TesterConfig:    shared.PipelineTesterConfig{},
 		EngineerConfig:  engineer.Config{},
 		DesignerConfig:  designer.Config{},
 	})
@@ -30,9 +30,9 @@ func newTestPipelineConfig(taskID string) PipelineConfig {
 		SessionID:  "session-1",
 		DAGNodeID:  "dag-1",
 		WorkerType: WorkerEngineer,
-		InitialCriteria: &inspector.InspectorCriteria{
+		InitialCriteria: &inspShared.InspectorCriteria{
 			TaskID: taskID,
-			SuccessCriteria: []inspector.SuccessCriterion{
+			SuccessCriteria: []inspShared.SuccessCriterion{
 				{ID: "sc1", Description: "compiles", Verifiable: true},
 			},
 		},

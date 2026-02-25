@@ -749,6 +749,10 @@ type TesterRequest struct {
 	// SessionID for context.
 	SessionID string `json:"session_id"`
 
+	// WorkerType identifies the pipeline worker that produced the output.
+	// Values: "engineer", "designer". Uses string to avoid circular import.
+	WorkerType string `json:"worker_type,omitempty"`
+
 	// Timestamp of the request.
 	Timestamp time.Time `json:"timestamp"`
 }

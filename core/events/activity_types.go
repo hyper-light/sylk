@@ -280,6 +280,86 @@ func (eo *EventOutcome) UnmarshalJSON(data []byte) error {
 }
 
 // =============================================================================
+// EventVisibility Enum
+// =============================================================================
+
+// EventVisibility classifies who should see an activity event.
+// Zero value (VisibilityUser) means the event is user-facing — backwards
+// compatible with all existing code that never sets the field.
+type EventVisibility int
+
+const (
+	// VisibilityUser marks events originating from or relevant to user requests.
+	// These promote agents to active in the UI and appear in the chat panel.
+	VisibilityUser EventVisibility = 0
+
+	// VisibilityAgent marks events from inter-agent coordination (e.g. agent
+	// A asking agent B for help). The UI updates agent status but does NOT
+	// promote the agent to active or auto-select its panel card.
+	VisibilityAgent EventVisibility = 1
+
+	// VisibilitySystem marks housekeeping events (health checks, background
+	// syncs, fire-and-forget internal requests). The UI records the event
+	// for debugging but does NOT update agent status or panel state.
+	VisibilitySystem EventVisibility = 2
+)
+
+func (v EventVisibility) String() string {
+	switch v {
+	case VisibilityUser:
+		return "user"
+	case VisibilityAgent:
+		return "agent"
+	case VisibilitySystem:
+		return "system"
+	default:
+		return fmt.Sprintf("visibility(%d)", v)
+	}
+}
+
+// ParseEventVisibility converts a string representation to EventVisibility.
+func ParseEventVisibility(value string) (EventVisibility, bool) {
+	switch value {
+	case "user":
+		return VisibilityUser, true
+	case "agent":
+		return VisibilityAgent, true
+	case "system":
+		return VisibilitySystem, true
+	default:
+		return VisibilityUser, false
+	}
+}
+
+func (v EventVisibility) MarshalJSON() ([]byte, error) {
+	return json.Marshal(v.String())
+}
+
+func (v *EventVisibility) UnmarshalJSON(data []byte) error {
+	var asString string
+	if err := json.Unmarshal(data, &asString); err == nil {
+		if parsed, ok := ParseEventVisibility(asString); ok {
+			*v = parsed
+			return nil
+		}
+		return fmt.Errorf("invalid event visibility: %s", asString)
+	}
+
+	var asInt int
+	if err := json.Unmarshal(data, &asInt); err == nil {
+		*v = EventVisibility(asInt)
+		return nil
+	}
+
+	return fmt.Errorf("invalid event visibility")
+}
+
+// IsUserVisible returns true if the event should be shown to the user.
+func (v EventVisibility) IsUserVisible() bool {
+	return v == VisibilityUser
+}
+
+// =============================================================================
 // ActivityEvent Type
 // =============================================================================
 
@@ -298,6 +378,7 @@ type ActivityEvent struct {
 	RelatedIDs []string             `json:"related_ids,omitempty"`
 	Outcome    EventOutcome         `json:"outcome"`
 	Importance float64              `json:"importance"`
+	Visibility EventVisibility      `json:"visibility"`
 	Data       map[string]any       `json:"data,omitempty"`
 }
 

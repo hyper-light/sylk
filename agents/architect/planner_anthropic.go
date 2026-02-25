@@ -9,8 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/dag"
 	promptskill "github.com/adalundhe/sylk/core/promptskills"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 type planningLLM interface {
@@ -18,10 +20,15 @@ type planningLLM interface {
 	DesignArchitecture(ctx context.Context, requirements *Requirements, patterns *CodebasePatterns) (*SolutionArchitecture, error)
 	GenerateTasks(ctx context.Context, architecture *SolutionArchitecture, constraints *PlanConstraints) ([]*AtomicTask, error)
 	ComposeUserResponse(ctx context.Context, request plannerConversationRequest) (string, error)
+	CompleteForToolLoop(ctx context.Context, req *providers.Request, stage string, onChunk func(string)) (*providers.Response, error)
+	ConversationSystemPrompt() string
 }
 
-// plannerStreamProvider is the subset of provider capabilities the planner
-// needs. Satisfied by *providers.AnthropicProvider and test mocks.
+// PlannerStreamProvider is the subset of provider capabilities the planner
+// needs. Satisfied by *providers.AnthropicProvider, *gateway.GatewayProvider,
+// and test mocks.
+type PlannerStreamProvider = plannerStreamProvider
+
 type plannerStreamProvider interface {
 	StreamWithHandler(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error
 }
@@ -30,6 +37,7 @@ type anthropicPlanner struct {
 	provider           plannerStreamProvider
 	maxTokens          int
 	thinkingBudget     int
+	contextWindow      int
 	system             string
 	conversationSystem string
 	timeout            time.Duration
@@ -81,7 +89,7 @@ func (a *Architect) ensurePlanner() planningLLM {
 		return a.planner
 	}
 
-	planner, err := newAnthropicPlanner(a.config, a.logger)
+	planner, err := newAnthropicPlanner(a.config, a.logger, a.skills.GetAll())
 	if err != nil {
 		if !errors.Is(err, ErrArchitectPlannerAuthNotConfigured) {
 			a.logger.Warn("architect llm planner init failed", "error", err)
@@ -170,7 +178,7 @@ func (a *Architect) tryGenerateTasksWithLLM(
 	return normalizeTaskGraph(tasks), true
 }
 
-func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
+func newAnthropicPlanner(cfg Config, logger *slog.Logger, goSkills []*skills.Skill) (planningLLM, error) {
 	providerCfg := providers.AnthropicConfig{
 		BaseConfig: providers.BaseConfig{
 			APIKey:         cfg.AnthropicAPIKey,
@@ -193,8 +201,9 @@ func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
 		providerCfg.MaxTokens = DefaultMaxOutputTokens
 	}
 
-	promptSkills := promptskill.DiscoverAgentSkills("architect")
-	provider, err := providers.NewAnthropicProvider(providerCfg, promptSkills...)
+	diskSkills := promptskill.DiscoverAgentSkills("architect")
+	promptSkills := promptskill.MergePromptSkills(diskSkills, goSkills)
+	rawProvider, err := providers.NewAnthropicProvider(providerCfg, promptSkills...)
 	if err != nil {
 		if strings.Contains(err.Error(), "api_key") {
 			return nil, ErrArchitectPlannerAuthNotConfigured
@@ -202,10 +211,17 @@ func newAnthropicPlanner(cfg Config, logger *slog.Logger) (planningLLM, error) {
 		return nil, err
 	}
 
+	var stream plannerStreamProvider = rawProvider
+	if cfg.PlannerProviderWrapper != nil {
+		stream = cfg.PlannerProviderWrapper(rawProvider)
+	}
+
+	counter := providers.NewCharacterBasedCounter(providers.DefaultTokenCounterConfig())
 	return &anthropicPlanner{
-		provider:           provider,
+		provider:           stream,
 		maxTokens:          cfg.MaxOutputTokens,
 		thinkingBudget:     0, // Adaptive thinking — model allocates dynamically.
+		contextWindow:      counter.MaxContextTokens(providerCfg.Model),
 		system:             buildPlannerSystemPrompt(cfg.SystemPrompt),
 		conversationSystem: buildPlannerConversationSystemPrompt(cfg.SystemPrompt),
 		timeout:            cfg.LLMRequestTimeout,
@@ -452,14 +468,20 @@ func (p *anthropicPlanner) streamRequest(
 	onChunk func(string),
 ) (*streamResult, error) {
 	var text strings.Builder
-	var thoughts strings.Builder
+	emitter := newThoughtEmitter(ctx)
 	var finalUsage *providers.Usage
 	var stopReason providers.StopReason
 	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
 		switch chunk.Type {
 		case providers.ChunkTypeStart:
+			// RetryReset is set by the provider's retryAwareHandler when a
+			// stream retry replays from the beginning. Signal the UI to
+			// discard prior partial content before the replayed chunks arrive.
+			if chunk.RetryReset {
+				emitStreamRetryReset(ctx)
+			}
 			text.Reset()
-			thoughts.Reset()
+			emitter = newThoughtEmitter(ctx)
 			if chunk.Usage != nil && chunk.Usage.InputTokens > 0 {
 				emitArchitectEarlyUsage(ctx, chunk.Usage.InputTokens)
 			}
@@ -469,7 +491,7 @@ func (p *anthropicPlanner) streamRequest(
 				onChunk(chunk.Text)
 			}
 		case providers.ChunkTypeThought:
-			if thought := appendThoughtDelta(&thoughts, chunk.Text); thought != "" {
+			if thought := emitter.addDelta(chunk.Text); thought != "" {
 				emitPlannerThought(ctx, stage, thought)
 			}
 		case providers.ChunkTypeEnd:
@@ -507,18 +529,91 @@ func (p *anthropicPlanner) streamRequest(
 	}, nil
 }
 
+// streamRequestFull executes a streaming request and accumulates the full
+// response including tool calls via StreamAccumulator. Side effects (text→onChunk,
+// thought→emit, start→reset/earlyUsage, end→accumulateUsage) are preserved so
+// the UI pipeline stays in sync.
+func (p *anthropicPlanner) streamRequestFull(
+	ctx context.Context,
+	req *providers.Request,
+	stage string,
+	onChunk func(string),
+) (*providers.Response, error) {
+	accumulator := providers.NewStreamAccumulator()
+	emitter := newThoughtEmitter(ctx)
+
+	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
+		accumulator.Add(chunk)
+
+		switch chunk.Type {
+		case providers.ChunkTypeStart:
+			if chunk.RetryReset {
+				emitStreamRetryReset(ctx)
+			}
+			emitter = newThoughtEmitter(ctx)
+			if chunk.Usage != nil && chunk.Usage.InputTokens > 0 {
+				emitArchitectEarlyUsage(ctx, chunk.Usage.InputTokens)
+			}
+		case providers.ChunkTypeText:
+			if onChunk != nil {
+				onChunk(chunk.Text)
+			}
+		case providers.ChunkTypeThought:
+			if thought := emitter.addDelta(chunk.Text); thought != "" {
+				emitPlannerThought(ctx, stage, thought)
+			}
+		case providers.ChunkTypeEnd:
+			if chunk.Usage != nil {
+				accumulateArchitectUsage(ctx, chunk.Usage)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	resp := accumulator.Response()
+	if resp == nil {
+		return nil, fmt.Errorf("planner returned nil response")
+	}
+	return resp, nil
+}
+
+// CompleteForToolLoop performs a streaming request that accumulates the full
+// response including any tool calls. This bridges the streaming planner to the
+// synchronous tool loop pattern used by all other agents.
+func (p *anthropicPlanner) CompleteForToolLoop(
+	ctx context.Context,
+	req *providers.Request,
+	stage string,
+	onChunk func(string),
+) (*providers.Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	return p.streamRequestFull(ctx, req, stage, onChunk)
+}
+
+// ConversationSystemPrompt returns the conversation-mode system prompt.
+func (p *anthropicPlanner) ConversationSystemPrompt() string {
+	return p.conversationSystem
+}
+
 const (
-	maxContinuationRounds = 4
-	continuationPrompt    = "Continue exactly where you left off. Do not repeat any text already generated."
-	truncationIndicator   = "\n\n---\n*[Response truncated due to length. Ask me to continue if you need more detail.]*"
+	truncationIndicator = "\n\n---\n*[Response truncated due to length. Ask me to continue if you need more detail.]*"
 	// contextDeadlineGuard is the minimum remaining time needed to attempt a continuation round.
 	contextDeadlineGuard = 10 * time.Second
 )
 
 // requestTextStreamingWithContinuation wraps requestTextStreamingOnce with
 // automatic continuation when the model hits the max output token limit.
-// Continuation rounds reuse the same onChunk callback, making the token
-// flow seamless from the UI's perspective.
+//
+// Continuation uses:
+//   - Z-algorithm overlap detection (O(n) worst case) to deduplicate repeated text
+//   - EMA-based progress decay to stop when the model is repeating more than producing
+//   - Structural completeness detection to stop when JSON is balanced or markdown fences close
+//   - Sliding-window prefill to prevent unbounded context growth
+//   - All bounds derived from model parameters (contextWindow, maxOutputTokens)
 func (p *anthropicPlanner) requestTextStreamingWithContinuation(
 	ctx context.Context,
 	prompt string,
@@ -531,72 +626,12 @@ func (p *anthropicPlanner) requestTextStreamingWithContinuation(
 	if err != nil {
 		return "", nil, err
 	}
-
-	// Common path: model finished naturally — return immediately.
 	if sr.StopReason != providers.StopReasonMaxTokens {
 		return sr.Text, sr.Usage, nil
 	}
-
-	accumulated := sr.Text
-	mergedUsage := cloneUsage(sr.Usage)
-
-	for round := range maxContinuationRounds {
-		if !hasTimeForContinuation(ctx) {
-			p.logger.Info("continuation skipped: context deadline too close",
-				"round", round+1, "accumulated_len", len(accumulated))
-			break
-		}
-
-		contResult, contErr := p.requestContinuation(ctx, prompt, accumulated, maxTokens, system, stage, onChunk)
-		if contErr != nil {
-			p.logger.Warn("continuation round failed, returning partial",
-				"round", round+1, "error", contErr)
-			break
-		}
-
-		accumulated += contResult.Text
-		mergedUsage = mergeUsage(mergedUsage, contResult.Usage)
-
-		if contResult.StopReason != providers.StopReasonMaxTokens {
-			return accumulated, mergedUsage, nil
-		}
-	}
-
-	// All rounds exhausted or broke out — still max_tokens.
-	// Stream the indicator to the UI so the user sees truncation happened,
-	// but do NOT include it in the returned text. The returned text feeds
-	// into plan.UserResponse → ConversationHistory → next LLM prompt.
-	// Including the indicator there causes the model to interpret its own
-	// prior response as failed/incomplete and refuse to proceed with handoff.
-	if onChunk != nil {
-		onChunk(truncationIndicator)
-	}
-	return accumulated, mergedUsage, nil
-}
-
-// requestContinuation builds a multi-turn prefill request and streams
-// the continuation through the same onChunk callback.
-func (p *anthropicPlanner) requestContinuation(
-	ctx context.Context,
-	originalPrompt string,
-	accumulatedText string,
-	maxTokens int,
-	system string,
-	stage string,
-	onChunk func(string),
-) (*streamResult, error) {
-	resolvedSystem := p.resolveSystemPrompt(system)
-	req := &providers.Request{
-		Messages: []providers.Message{
-			{Role: providers.RoleUser, Content: originalPrompt},
-			{Role: providers.RoleAssistant, Content: accumulatedText},
-			{Role: providers.RoleUser, Content: continuationPrompt},
-		},
-		MaxTokens:      maxTokens,
-		SystemPrompt:   resolvedSystem,
-		ThinkingBudget: 0, // Model already reasoned on round 1.
-	}
-	return p.streamRequest(ctx, req, stage, onChunk)
+	mode := continuationModeFromOnChunk(onChunk)
+	cfg := deriveContinuationConfig(p.contextWindow, maxTokens, defaultCharsPerToken)
+	return p.runContinuationLoop(ctx, prompt, sr, cfg, mode, system, stage, onChunk)
 }
 
 // mergeUsage sums two Usage values, handling nil inputs.
@@ -651,14 +686,73 @@ func hasTimeForContinuation(ctx context.Context) bool {
 	return time.Until(deadline) >= contextDeadlineGuard
 }
 
-func appendThoughtDelta(buffer *strings.Builder, delta string) string {
-	if buffer == nil {
-		return strings.TrimSpace(delta)
+// thoughtEmitter batches thought deltas and emits snapshots only when
+// warranted, avoiding the O(n^2) total allocation of returning buffer.String()
+// on every delta. Emission triggers: first non-empty thought, sentence
+// boundary in delta, or buffer doubled since last emit.
+type thoughtEmitter struct {
+	buffer      strings.Builder
+	lastEmitLen int
+	hasCallback bool
+}
+
+// newThoughtEmitter creates a thought emitter. When hasCallback is false,
+// addDelta skips materialization entirely.
+func newThoughtEmitter(ctx context.Context) thoughtEmitter {
+	return thoughtEmitter{hasCallback: hasPlannerThoughtCallback(ctx)}
+}
+
+// addDelta appends delta to the buffer and returns a snapshot only when
+// emission is warranted. Returns "" to skip emission.
+func (e *thoughtEmitter) addDelta(delta string) string {
+	if delta == "" || !e.hasCallback {
+		if delta != "" {
+			e.buffer.WriteString(delta)
+		}
+		return ""
 	}
-	if delta != "" {
-		buffer.WriteString(delta)
+	e.buffer.WriteString(delta)
+	if !e.shouldEmit(delta) {
+		return ""
 	}
-	return strings.TrimSpace(buffer.String())
+	e.lastEmitLen = e.buffer.Len()
+	return strings.TrimSpace(e.buffer.String())
+}
+
+// shouldEmit returns true when a snapshot should be published.
+func (e *thoughtEmitter) shouldEmit(delta string) bool {
+	// First non-empty content.
+	if e.lastEmitLen == 0 {
+		return true
+	}
+	// Sentence boundary in this delta.
+	if containsSentenceBoundary(delta) {
+		return true
+	}
+	// Buffer doubled since last emit.
+	return e.buffer.Len() >= e.lastEmitLen*2
+}
+
+// containsSentenceBoundary returns true if s contains a sentence-ending
+// character that warrants a thought snapshot emission.
+func containsSentenceBoundary(s string) bool {
+	for _, ch := range s {
+		switch ch {
+		case '.', '!', '?', '\n':
+			return true
+		}
+	}
+	return false
+}
+
+// hasPlannerThoughtCallback returns true if the context carries a thought
+// callback. Used as a fast-path check to skip materialization.
+func hasPlannerThoughtCallback(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	cb, ok := ctx.Value(plannerThoughtContextKey{}).(plannerThoughtCallback)
+	return ok && cb != nil
 }
 
 // resolveThinkingBudget returns the thinking budget for a planner request.
@@ -848,6 +942,12 @@ type taskPayload struct {
 	EstimatedTokens int      `json:"estimated_tokens"`
 	Complexity      string   `json:"complexity"`
 
+	// Co-tenancy fields for compound node dispatch.
+	CoAgents          []string             `json:"co_agents,omitempty"`
+	CollaborationMode string               `json:"collaboration_mode,omitempty"`
+	MaxReviewRounds   int                  `json:"max_review_rounds,omitempty"`
+	AgentScopes       []agentScopePayload  `json:"agent_scopes,omitempty"`
+
 	// Rich specification fields.
 	AcceptanceCriteria  []acceptanceCriterionPayload `json:"acceptance_criteria"`
 	Guidelines          []string                     `json:"guidelines"`
@@ -877,12 +977,22 @@ type taskFileTargetPayload struct {
 	Reason    string `json:"reason"`
 }
 
+type agentScopePayload struct {
+	AgentType           string                       `json:"agent_type"`
+	Role                string                       `json:"role"`
+	AcceptanceCriteria  []acceptanceCriterionPayload `json:"acceptance_criteria"`
+	ImplementationGuide string                       `json:"implementation_guide"`
+	AffectedFiles       []taskFileTargetPayload      `json:"affected_files"`
+	Guidelines          []string                     `json:"guidelines"`
+	TestRequirements    []string                     `json:"test_requirements"`
+}
+
 func (p taskPayload) toTask(index int) *AtomicTask {
 	taskID := strings.TrimSpace(p.ID)
 	if taskID == "" {
 		taskID = fmt.Sprintf("task_%d", index+1)
 	}
-	return &AtomicTask{
+	task := &AtomicTask{
 		ID:                  taskID,
 		Name:                strings.TrimSpace(p.Name),
 		Description:         strings.TrimSpace(p.Description),
@@ -899,6 +1009,56 @@ func (p taskPayload) toTask(index int) *AtomicTask {
 		AffectedFiles:       toTaskFileTargets(p.AffectedFiles),
 		TestRequirements:    nonEmptySlice(p.TestRequirements),
 		RiskFactors:         nonEmptySlice(p.RiskFactors),
+	}
+
+	// Populate co-tenancy fields when the LLM specifies them.
+	if coAgents := nonEmptySlice(p.CoAgents); len(coAgents) > 0 {
+		task.CoAgents = coAgents
+		task.CollaborationMode = parseCollaborationMode(p.CollaborationMode)
+		task.MaxReviewRounds = p.MaxReviewRounds
+		task.AgentScopes = toAgentScopes(p.AgentScopes)
+	}
+
+	return task
+}
+
+func parseCollaborationMode(raw string) dag.CollaborationMode {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "adversarial":
+		return dag.CollaborationAdversarial
+	default:
+		return dag.CollaborationSequential
+	}
+}
+
+func toAgentScopes(payloads []agentScopePayload) []AgentScope {
+	if len(payloads) == 0 {
+		return nil
+	}
+	scopes := make([]AgentScope, 0, len(payloads))
+	for _, p := range payloads {
+		agentType := normalizeTaskAgentType(p.AgentType)
+		role := normalizeAgentRole(p.Role)
+		scope := AgentScope{
+			AgentType:           agentType,
+			Role:                role,
+			AcceptanceCriteria:  toAcceptanceCriteria(p.AcceptanceCriteria),
+			ImplementationGuide: strings.TrimSpace(p.ImplementationGuide),
+			AffectedFiles:       toTaskFileTargets(p.AffectedFiles),
+			Guidelines:          nonEmptySlice(p.Guidelines),
+			TestRequirements:    nonEmptySlice(p.TestRequirements),
+		}
+		scopes = append(scopes, scope)
+	}
+	return scopes
+}
+
+func normalizeAgentRole(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "primary", "co_agent":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return "co_agent"
 	}
 }
 
@@ -1153,6 +1313,20 @@ Return JSON only, exactly:
       "name": "Short imperative name",
       "description": "Detailed implementation description. Include what to build, how it fits the architecture, and key design decisions. Be specific enough that an agent can implement without follow-up questions.",
       "agent_type": "engineer|designer|tester|inspector|architect",
+      "co_agents": ["designer"],
+      "collaboration_mode": "sequential|adversarial",
+      "max_review_rounds": 0,
+      "agent_scopes": [
+        {
+          "agent_type": "designer",
+          "role": "primary",
+          "acceptance_criteria": [{"given": "...", "when": "...", "then": "...", "priority": "must"}],
+          "implementation_guide": "Step-by-step for THIS agent only",
+          "affected_files": [{"path": "...", "operation": "create", "reason": "..."}],
+          "guidelines": ["Constraint specific to this agent"],
+          "test_requirements": ["Test specific to this agent's output"]
+        }
+      ],
       "success_criteria": ["Criterion 1", "Criterion 2"],
       "dependencies": ["task_id"],
       "estimated_tokens": 3000,
@@ -1203,6 +1377,15 @@ Hard limits:
 - examples: 0-2 per task (include for non-trivial tasks)
 - risk_factors: 0-3 per task
 - success_criteria: 2-4 items per task
+- co_agents: omit for single-agent tasks. When a task involves BOTH visual/UX concerns AND implementation logic, split responsibilities:
+  1. Identify the primary agent (who acts first): designer for UI-first tasks, engineer for logic-first tasks
+  2. Identify co-agents (who act after the primary): the complementary agent type
+  3. Set collaboration_mode: "sequential" (primary acts, co-agent follows) or "adversarial" (co-agent can push back, bounded by max_review_rounds)
+  4. Provide agent_scopes: REQUIRED when co_agents is non-empty. Each agent MUST have its own scoped acceptance_criteria, implementation_guide, affected_files, and guidelines.
+  Classification: tasks with styled components/layouts/theming → primary: designer, co_agents: ["engineer"]. Tasks with UI + state/API/logic → primary: engineer, co_agents: ["designer"]. Pure backend or pure design → no co_agents.
+  Execution model: primary agent executes first, producing files. Co-agents execute sequentially after, receiving the primary's changed files as context.
+- max_review_rounds: omit or 0 for sequential mode. Set 1-3 for adversarial mode (bounds review iterations).
+- agent_scopes: REQUIRED when co_agents is non-empty. 1 scope per agent (primary + each co-agent). Each scope must have at least 1 acceptance_criteria with priority "must". Omit entirely for single-agent tasks.
 `
 }
 

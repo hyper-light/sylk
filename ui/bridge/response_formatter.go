@@ -33,21 +33,39 @@ func formatStructuredPayload(agentID string, payload any) (string, bool) {
 }
 
 // formatConversationResult extracts the Response field from a ConversationResult
-// payload (architect conversational responses).
+// payload. Handles both PascalCase keys (architect.ConversationResult, no json
+// tags) and lowercase keys (orchestrator.ConversationResult, has json tags).
 func formatConversationResult(payload any) (string, bool) {
 	values, ok := toMap(payload)
 	if !ok {
 		return "", false
 	}
-	response := strings.TrimSpace(stringFromKey(values, "Response"))
+	response := conversationResultResponse(values)
 	if response == "" {
 		return "", false
 	}
-	_, hasIntent := values["Intent"]
-	if !hasIntent {
+	if !conversationResultHasIntent(values) {
 		return "", false
 	}
 	return response, true
+}
+
+// conversationResultResponse extracts the response text from a
+// ConversationResult map, checking both PascalCase and lowercase keys.
+func conversationResultResponse(values map[string]any) string {
+	if text := strings.TrimSpace(stringFromKey(values, "Response")); text != "" {
+		return text
+	}
+	return strings.TrimSpace(stringFromKey(values, "response"))
+}
+
+// conversationResultHasIntent checks for the Intent field in either case.
+func conversationResultHasIntent(values map[string]any) bool {
+	if _, ok := values["Intent"]; ok {
+		return true
+	}
+	_, ok := values["intent"]
+	return ok
 }
 
 func unwrapResponseEnvelope(payload any) any {

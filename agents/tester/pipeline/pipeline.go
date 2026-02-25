@@ -11,13 +11,21 @@ import (
 	"sync"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
+
+// pipelineTesterProvider is the minimal interface the PipelineTester needs.
+// Satisfied by *providers.OpenAIProvider and *gateway.GatewayProvider.
+type pipelineTesterProvider interface {
+	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+}
 
 // PipelineTester validates individual task implementations within pipelines.
 type PipelineTester struct {
@@ -26,7 +34,7 @@ type PipelineTester struct {
 	logger *slog.Logger
 
 	// LLM provider (OpenAI gpt-5.3-codex with xhigh reasoning).
-	provider *providers.OpenAIProvider
+	provider pipelineTesterProvider
 
 	// State.
 	inspectorGate *shared.InspectorGate
@@ -50,16 +58,21 @@ type PipelineTester struct {
 	running     bool
 	knownAgents map[string]*guide.AgentAnnouncement
 
+	// Worker type for design-aware prompt selection.
+	workerType string
+
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
+
+	fileAccess versioning.FileAccess
 }
 
 // New creates a new PipelineTester instance.
-func New(cfg shared.PipelineTesterConfig, provider *providers.OpenAIProvider) (*PipelineTester, error) {
+func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*PipelineTester, error) {
 	cfg = applyConfigDefaults(cfg)
 
 	pt := &PipelineTester{
-		id:          fmt.Sprintf("tester-pipeline_%s", uuid.New().String()[:8]),
+		id:          uuid.New().String()[:8],
 		config:      cfg,
 		logger:      slog.Default().With("agent", "tester-pipeline"),
 		provider:    provider,
@@ -141,6 +154,13 @@ func (pt *PipelineTester) SetInspectorGate(gate *shared.InspectorGate) {
 	pt.inspectorGate = gate
 }
 
+// SetWorkerType sets the worker type for design-aware prompt selection.
+func (pt *PipelineTester) SetWorkerType(wt string) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.workerType = wt
+}
+
 // Close shuts down the pipeline tester.
 func (pt *PipelineTester) Close() error {
 	return pt.Stop()
@@ -153,7 +173,7 @@ func (pt *PipelineTester) Start(bus guide.EventBus) error {
 	}
 
 	pt.bus = bus
-	pt.channels = guide.NewAgentChannels(pt.id, "tester-pipeline")
+	pt.channels = guide.NewAgentChannels("tester-pipeline", pt.id)
 
 	var err error
 	pt.requestSub, err = bus.SubscribeAsync(pt.channels.Requests, pt.handleBusRequest)
@@ -236,7 +256,11 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		return nil, fmt.Errorf("pipeline tester: no LLM provider configured")
 	}
 
-	systemPrompt := shared.PipelineTesterSystemPrompt()
+	pt.mu.RLock()
+	wt := pt.workerType
+	pt.mu.RUnlock()
+
+	systemPrompt := shared.PipelineTesterSystemPromptForWorker(wt)
 	tools := pt.buildToolDefinitions()
 
 	req := &providers.Request{
@@ -270,6 +294,8 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 	ctx := context.Background()
 	startTime := time.Now()
+	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, "tester-pipeline", fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
 
 	result, err := pt.Handle(ctx, fwd)
 
@@ -280,7 +306,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   pt.id,
+		RespondingAgentID:   "tester-pipeline",
 		RespondingAgentName: "tester-pipeline",
 		ProcessingTime:      time.Since(startTime),
 	}
@@ -344,6 +370,7 @@ func (pt *PipelineTester) publishRerouteRequest(reason, originalInput, suggested
 func (pt *PipelineTester) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      pt.id,
+		Type:    "tester-pipeline",
 		Name:    "tester-pipeline",
 		Aliases: []string{"pipeline-test", "task-test"},
 		Triggers: guide.AgentTriggers{
@@ -426,6 +453,9 @@ func (pt *PipelineTester) InjectPreparedContext(_ *handoff.PreparedContext) erro
 func (pt *PipelineTester) Terminate(_ context.Context) error {
 	return pt.Stop()
 }
+
+// SetFileAccess assigns the per-pipeline file access layer.
+func (pt *PipelineTester) SetFileAccess(fa versioning.FileAccess) { pt.fileAccess = fa }
 
 // SetHandoffBridge assigns the handoff bridge.
 func (pt *PipelineTester) SetHandoffBridge(bridge *handoff.HandoffBridge) {

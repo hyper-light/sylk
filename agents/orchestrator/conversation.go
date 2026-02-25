@@ -2,9 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/adalundhe/sylk/agents/architect"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -20,22 +23,30 @@ type ConversationResult struct {
 	Intent   string `json:"intent"`
 }
 
-// handleConversation processes conversational requests via the Gemini Flash provider.
-// Falls back to a deterministic status summary when no provider is configured.
+// handleConversation processes conversational requests through the LLM.
+// When the LLM provider is unavailable, known meta queries (greetings,
+// status, health) fall back to deterministic replies so the orchestrator
+// remains minimally responsive without an LLM.
 func (o *Orchestrator) handleConversation(ctx context.Context, req *guide.ForwardedRequest) (any, error) {
-	if o.provider == nil {
-		return o.conversationFallback(ctx)
-	}
-	return o.executeConversation(ctx, req)
-}
-
-// executeConversation builds a conversation request, tries the static fast-path,
-// and falls back to the LLM tool loop for complex queries.
-func (o *Orchestrator) executeConversation(ctx context.Context, req *guide.ForwardedRequest) (*ConversationResult, error) {
 	cr := o.buildConversationRequest(req)
 
-	// Fast-path: deterministic response for trivial queries (no LLM call).
+	// Snapshot provider under lock — SetProvider may write concurrently.
+	o.mu.RLock()
+	provider := o.provider
+	o.mu.RUnlock()
+
+	o.logInfo("handleConversation",
+		"has_provider", provider != nil,
+		"input_len", len(req.Input))
+
+	// Prefer LLM for all conversations — natural, context-aware responses.
+	if provider != nil {
+		return o.executeConversationLLM(ctx, cr)
+	}
+
+	// Fallback: deterministic response for known meta queries when no LLM.
 	if reply, ok := tryStaticOrchestratorReply(cr); ok {
+		o.logInfo("handleConversation: static reply used")
 		o.publishStreamChunk(ctx, reply)
 		return &ConversationResult{
 			Response: reply,
@@ -43,7 +54,8 @@ func (o *Orchestrator) executeConversation(ctx context.Context, req *guide.Forwa
 		}, nil
 	}
 
-	return o.executeConversationLLM(ctx, cr)
+	o.logWarnMsg("handleConversation: no provider and no static match")
+	return nil, fmt.Errorf("orchestrator: LLM provider not available — authorize Google credentials to enable")
 }
 
 // executeConversationLLM sends the conversation request to the LLM with
@@ -88,68 +100,201 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 	}, nil
 }
 
-// conversationFallback returns a deterministic status summary when no LLM provider is available.
-func (o *Orchestrator) conversationFallback(ctx context.Context) (*ConversationResult, error) {
-	summary, err := o.GetSummary(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("orchestrator conversation fallback: %w", err)
-	}
+// ingestionLLMTimeout is the LLM timeout for generating a plan ingestion
+// summary. Must fit comfortably within the architect's routeSyncTimeout (60s).
+const ingestionLLMTimeout = 45 * time.Second
 
-	response := formatFallbackResponse(summary)
-
-	// Publish as a single chunk for the stream bridge.
-	o.publishStreamChunk(ctx, response)
-
-	return &ConversationResult{
-		Response: response,
-		Intent:   "chat",
-	}, nil
-}
-
-func formatFallbackResponse(summary *OrchestratorSummary) string {
-	var b strings.Builder
-	b.WriteString(summary.Overview)
-
-	if summary.Workflows.Running > 0 {
-		b.WriteString(fmt.Sprintf("\n\nActive workflows: %d running, %d completed, %d failed.",
-			summary.Workflows.Running, summary.Workflows.Completed, summary.Workflows.Failed))
-	}
-
-	if summary.Tasks.Failed > 0 {
-		b.WriteString(fmt.Sprintf("\n\nRecent failures: %d tasks failed.", summary.Tasks.Failed))
-		for _, f := range summary.Tasks.RecentFailures {
-			b.WriteString(fmt.Sprintf("\n- %s (%s): %s", f.Name, f.AgentID, f.Error))
-		}
-	}
-
-	return b.String()
-}
-
-// respondToIngestion transforms the raw ingestion result into a natural
-// language query and delegates to the LLM conversation pipeline. The LLM
-// sees the newly-ingested workflow/tasks/DAG in its runtime snapshot and
-// produces a conversational acknowledgment (or error explanation).
-//
-// Bypasses tryStaticOrchestratorReply because the ingestion summary
-// contains keywords ("execution", "dag", "workflow") that would trigger
-// false-positive static matches.
+// respondToIngestion generates a natural-language plan summary via the LLM.
+// The ingestion itself (DAG creation, task records, workflow state) has
+// ALREADY succeeded before this function is called. If the LLM is
+// unavailable or times out, falls back to a deterministic ack so the
+// handoff always completes reliably within the architect's 60s window.
 func (o *Orchestrator) respondToIngestion(
 	ctx context.Context,
 	req *guide.ForwardedRequest,
 	ingestionResult any,
 ) (any, error) {
-	if o.provider == nil {
-		return o.conversationFallback(ctx)
+	o.mu.RLock()
+	provider := o.provider
+	o.mu.RUnlock()
+
+	o.logInfo("respondToIngestion",
+		"has_provider", provider != nil,
+		"correlation_id", req.CorrelationID)
+
+	if provider != nil {
+		result, err := o.generateIngestionSummary(ctx, req.Input, ingestionResult)
+		if err == nil {
+			o.logInfo("respondToIngestion: LLM summary generated",
+				"response_len", len(result.Response))
+			return result, nil
+		}
+		o.logWarnMsg("respondToIngestion: LLM summary failed, using deterministic ack",
+			"error", err)
+		// LLM failed — fall through to deterministic ack. Include error
+		// in the ack so the user sees why the summary isn't richer.
+		ack := buildDeterministicIngestionAck(ingestionResult) +
+			"\n\n_LLM summary unavailable: " + err.Error() + "_"
+		o.publishStreamChunk(ctx, ack)
+		return &ConversationResult{Response: ack, Intent: "ingestion_ack"}, nil
 	}
 
-	summary := buildIngestionSummary(req.Input, ingestionResult)
+	o.logWarnMsg("respondToIngestion: no provider, using deterministic ack")
+	ack := buildDeterministicIngestionAck(ingestionResult) +
+		"\n\n_Orchestrator LLM provider not configured — using deterministic ack._"
+	o.publishStreamChunk(ctx, ack)
+	return &ConversationResult{
+		Response: ack,
+		Intent:   "ingestion_ack",
+	}, nil
+}
 
-	enriched := *req // shallow copy preserves routing metadata
-	enriched.Input = summary
-	enriched.Intent = guide.IntentChat
+// generateIngestionSummary calls the LLM with the plan details and ingestion
+// result to produce a human-readable summary of the orchestrator's
+// understanding of the plan.
+func (o *Orchestrator) generateIngestionSummary(
+	ctx context.Context,
+	planJSON string,
+	ingestionResult any,
+) (*ConversationResult, error) {
+	prompt := buildIngestionSummaryPrompt(planJSON, ingestionResult)
+	systemPrompt := OrchestratorConversationSystemPrompt()
 
-	cr := o.buildConversationRequest(&enriched)
-	return o.executeConversationLLM(ctx, cr)
+	temp := float64(conversationTemp)
+	llmReq := &providers.Request{
+		Messages: []providers.Message{
+			{Role: providers.RoleUser, Content: prompt},
+		},
+		SystemPrompt: systemPrompt,
+		Model:        o.config.Model,
+		MaxTokens:    conversationMaxTokens,
+		Temperature:  &temp,
+	}
+
+	llmCtx, cancel := context.WithTimeout(ctx, ingestionLLMTimeout)
+	defer cancel()
+	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
+
+	resp, err := o.provider.Complete(llmCtx, llmReq)
+	if err != nil {
+		return nil, fmt.Errorf("ingestion summary LLM: %w", err)
+	}
+
+	trimmed := strings.TrimSpace(resp.Content)
+	if trimmed == "" {
+		return nil, fmt.Errorf("ingestion summary: empty LLM response")
+	}
+
+	accumulateOrchestratorUsage(ctx, &resp.Usage)
+	o.publishStreamChunk(ctx, trimmed)
+
+	return &ConversationResult{
+		Response: trimmed,
+		Intent:   "ingestion_ack",
+	}, nil
+}
+
+// buildIngestionSummaryPrompt composes the user message for the LLM to
+// summarize an ingested plan. Extracts the human-readable fields from the
+// PlanHandoff JSON rather than passing the raw blob.
+func buildIngestionSummaryPrompt(planJSON string, ingestionResult any) string {
+	var b strings.Builder
+
+	b.WriteString("A plan has been ingested and a DAG has been created for execution.\n\n")
+
+	// Ingestion result metadata.
+	if resultMap, ok := ingestionResult.(map[string]any); ok {
+		planID, _ := resultMap["plan_id"].(string)
+		dagID, _ := resultMap["dag_id"].(string)
+		taskCount, _ := resultMap["task_count"].(int)
+		layerCount, _ := resultMap["layer_count"].(int)
+		b.WriteString(fmt.Sprintf("## Ingestion Result\n- Plan ID: %s\n- DAG ID: %s\n- Tasks: %d\n- Execution Layers: %d\n\n",
+			planID, dagID, taskCount, layerCount))
+	}
+
+	// Extract structured plan details for the summary.
+	var handoff architect.PlanHandoff
+	if err := json.Unmarshal([]byte(planJSON), &handoff); err == nil {
+		b.WriteString("## Plan Details\n")
+		b.WriteString(fmt.Sprintf("**Original Request:** %s\n\n", handoff.Query))
+
+		if handoff.Architecture != nil {
+			if handoff.Architecture.Name != "" {
+				b.WriteString(fmt.Sprintf("**Architecture:** %s\n", handoff.Architecture.Name))
+			}
+			if len(handoff.Architecture.Patterns) > 0 {
+				b.WriteString(fmt.Sprintf("**Patterns:** %s\n", strings.Join(handoff.Architecture.Patterns, ", ")))
+			}
+			if len(handoff.Architecture.Components) > 0 {
+				b.WriteString("**Components:**\n")
+				for _, c := range handoff.Architecture.Components {
+					b.WriteString(fmt.Sprintf("- %s: %s\n", c.Name, c.Description))
+				}
+			}
+		}
+
+		if len(handoff.Tasks) > 0 {
+			b.WriteString("\n**Tasks:**\n")
+			for _, t := range handoff.Tasks {
+				b.WriteString(fmt.Sprintf("- [%s] %s (%s, %s complexity)\n",
+					t.ID, t.Name, t.AgentType, t.Complexity))
+			}
+		}
+
+		if len(handoff.ExecutionLayers) > 0 {
+			b.WriteString("\n**Execution Order:**\n")
+			for i, layer := range handoff.ExecutionLayers {
+				b.WriteString(fmt.Sprintf("  Layer %d: %s\n", i+1, strings.Join(layer, ", ")))
+			}
+		}
+
+		if len(handoff.CriticalPath) > 0 {
+			b.WriteString(fmt.Sprintf("\n**Critical Path:** %s\n", strings.Join(handoff.CriticalPath, " → ")))
+		}
+
+		if len(handoff.RiskSummary) > 0 {
+			b.WriteString("\n**Risks:**\n")
+			for _, r := range handoff.RiskSummary {
+				b.WriteString(fmt.Sprintf("- %s\n", r))
+			}
+		}
+
+		if len(handoff.Assumptions) > 0 {
+			b.WriteString("\n**Assumptions:**\n")
+			for _, a := range handoff.Assumptions {
+				b.WriteString(fmt.Sprintf("- %s\n", a))
+			}
+		}
+	}
+
+	b.WriteString("\n---\n\n")
+	b.WriteString("Summarize this plan for the user. Include:\n")
+	b.WriteString("1. What will be built (the original request)\n")
+	b.WriteString("2. How the work is organized (task breakdown, execution layers, parallelism)\n")
+	b.WriteString("3. Key architectural decisions\n")
+	b.WriteString("4. Any risks or assumptions worth noting\n")
+	b.WriteString("5. Confirm that the DAG is now executing\n\n")
+	b.WriteString("Be concise but informative. Use markdown formatting.")
+
+	return b.String()
+}
+
+// buildDeterministicIngestionAck produces a structured acknowledgment
+// from the ingestion result without requiring an LLM provider.
+func buildDeterministicIngestionAck(ingestionResult any) string {
+	resultMap, ok := ingestionResult.(map[string]any)
+	if !ok {
+		return "Plan ingested. DAG execution started."
+	}
+	planID, _ := resultMap["plan_id"].(string)
+	dagID, _ := resultMap["dag_id"].(string)
+	taskCount, _ := resultMap["task_count"].(int)
+	layerCount, _ := resultMap["layer_count"].(int)
+
+	return fmt.Sprintf(
+		"Plan %s ingested. DAG %s started with %d tasks across %d layers.",
+		planID, dagID, taskCount, layerCount,
+	)
 }
 
 // extractOrchestratorUserResponse returns the human-readable response from a result.

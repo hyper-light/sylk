@@ -63,7 +63,7 @@ func RespondGuideSelf(
 	return strings.TrimSpace(reply), nil, nil
 }
 
-func resolveGuideSelfResponder(cfg Config, provider *providers.GoogleProvider, owner *Guide) GuideSelfResponder {
+func resolveGuideSelfResponder(cfg Config, provider geminiLLMProvider, owner *Guide) GuideSelfResponder {
 	var responder GuideSelfResponder
 	if cfg.SelfResponder != nil {
 		responder = cfg.SelfResponder

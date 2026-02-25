@@ -178,12 +178,16 @@ func (m *Model) View() string {
 	b.WriteString(m.renderStatusBar())
 
 	// Wrap in border.
+	innerW := max(m.width-2, 0)
+	if m.focused && m.theme.ActiveBorderRender != nil {
+		return m.theme.ActiveBorderRender(b.String(), innerW, m.height, 0)
+	}
 	borderStyle := m.theme.InactiveBorder
 	if m.focused {
 		borderStyle = m.theme.ActiveBorder
 	}
 	return borderStyle.
-		Width(max(m.width-2, 0)). // -2 for border chars
+		Width(innerW). // -2 for border chars
 		Height(m.height).
 		Render(b.String())
 }

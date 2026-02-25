@@ -173,6 +173,15 @@ type NodeConfig struct {
 
 	// Metadata holds arbitrary node metadata
 	Metadata map[string]any
+
+	// CoAgents lists additional collaborating agent types for compound nodes.
+	CoAgents []string
+
+	// CollaborationMode defines how co-tenant agents interact.
+	CollaborationMode CollaborationMode
+
+	// MaxReviewRounds bounds adversarial review rounds (default 2).
+	MaxReviewRounds int
 }
 
 // =============================================================================
@@ -445,4 +454,7 @@ var (
 
 	// ErrExecutorClosed indicates the executor is closed
 	ErrExecutorClosed = errors.New("executor is closed")
+
+	// ErrLayerRetry indicates a layer retry was requested by the gate
+	ErrLayerRetry = errors.New("layer retry requested")
 )

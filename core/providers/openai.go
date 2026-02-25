@@ -795,7 +795,7 @@ func (p *OpenAIProvider) resolveStreamResponseModel(req *Request) string {
 }
 
 func (p *OpenAIProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
-	err := p.streamWithAuthRefreshRetry(ctx, req, handler)
+	err := p.streamWithAuthRefreshRetry(ctx, req, retryAwareHandler(handler))
 	return wrapOpenAIProviderError("stream", err)
 }
 
@@ -1530,6 +1530,11 @@ func (p *OpenAIProvider) resolveSystemPrompt(req *Request) string {
 	systemPrompt := strings.TrimSpace(req.SystemPrompt)
 	if systemPrompt == "" {
 		systemPrompt = strings.TrimSpace(p.config.SystemPrompt)
+	}
+	if len(req.Tools) > 0 {
+		// Skip prompt-based skill descriptions when native tool definitions
+		// are present — prevents double-signaling that causes XML markup leakage.
+		return strings.TrimSpace(systemPrompt)
 	}
 	return appendPromptSkills(systemPrompt, p.skills)
 }

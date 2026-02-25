@@ -28,6 +28,9 @@ type Scheduler struct {
 	// Default policy
 	defaultPolicy ExecutionPolicy
 
+	// Default layer gate applied to all new executors
+	defaultGate LayerGate
+
 	// Event handlers
 	handlersMu sync.RWMutex
 	handlers   []EventHandler
@@ -82,6 +85,13 @@ func NewScheduler(cfg SchedulerConfig, scope *concurrency.GoroutineScope) *Sched
 		handlers:          make([]EventHandler, 0),
 		scope:             scope,
 	}
+}
+
+// SetDefaultLayerGate sets a gate function applied to all new executors.
+func (s *Scheduler) SetDefaultLayerGate(gate LayerGate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultGate = gate
 }
 
 // =============================================================================
@@ -151,6 +161,14 @@ func (s *Scheduler) createExecutor(dag *DAG) *Executor {
 	executor.Subscribe(func(event *Event) {
 		s.emitEvent(event)
 	})
+
+	s.mu.RLock()
+	gate := s.defaultGate
+	s.mu.RUnlock()
+	if gate != nil {
+		executor.SetLayerGate(gate)
+	}
+
 	return executor
 }
 

@@ -10,14 +10,21 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
+// geminiLLMProvider is the interface required by GeminiClassifier. Satisfied by
+// both *providers.GoogleProvider and *gateway.GatewayProvider.
+type geminiLLMProvider interface {
+	providers.ProviderAdapter
+	providers.StreamHandlerProvider
+}
+
 // GeminiClassifier implements ClassifierService using Gemini's structured outputs.
 type GeminiClassifier struct {
-	provider    *providers.GoogleProvider
+	provider    geminiLLMProvider
 	config      RouterConfig
 	corrections *correctionMemory
 }
 
-func NewGeminiClassifier(provider *providers.GoogleProvider, config RouterConfig) *GeminiClassifier {
+func NewGeminiClassifier(provider geminiLLMProvider, config RouterConfig) *GeminiClassifier {
 	return &GeminiClassifier{
 		provider:    provider,
 		config:      config,
@@ -349,7 +356,7 @@ func (c *GeminiClassifier) buildResponseSchemaMap() map[string]any {
 			},
 			"intent": map[string]any{
 				"type":        "string",
-				"enum":        []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "help", "status", "chat", "unknown"},
+				"enum":        []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "execute", "help", "status", "chat", "unknown"},
 				"description": "The classified intent of the query",
 			},
 			"domain": map[string]any{
@@ -397,7 +404,7 @@ func (c *GeminiClassifier) buildResponseSchemaMap() map[string]any {
 					"type": "object",
 					"properties": map[string]any{
 						"is_retrospective": map[string]any{"type": "boolean"},
-						"intent":           map[string]any{"type": "string", "enum": []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "help", "status", "chat", "unknown"}},
+						"intent":           map[string]any{"type": "string", "enum": []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "execute", "help", "status", "chat", "unknown"}},
 						"domain":           map[string]any{"type": "string", "enum": []string{"local", "history", "research", "planning", "system", "compliance", "testing", "general", "unknown"}},
 						"target_agent":     map[string]any{"type": "string", "enum": []string{"librarian", "engineer", "designer", "tester", "inspector", "archivalist", "academic", "orchestrator", "architect", "guide", "unknown"}},
 						"confidence":       map[string]any{"type": "number"},

@@ -52,7 +52,7 @@ func TestGuideRoute_FallsBackToGuideWhenTargetLacksIntentSupport(t *testing.T) {
 	assert.True(t, strings.Contains(forwarded.ClassificationMethod, "guide_fallback") || forwarded.ClassificationMethod == "llm")
 }
 
-func TestGuideRoute_ExplicitUnsupportedTargetFallsBackToGuide(t *testing.T) {
+func TestGuideRoute_ExplicitTargetHonorsUserSelection(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer func() {
 		_ = bus.Close()
@@ -80,18 +80,22 @@ func TestGuideRoute_ExplicitUnsupportedTargetFallsBackToGuide(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// User deliberately selected mock-agent (ExplicitTarget=true).
+	// Even though IntentHelp is not in mock-agent's capabilities,
+	// the request must be routed to the selected agent.
 	req := &guide.RouteRequest{
-		Input:         "route this directly",
-		SourceAgentID: "tui",
-		TargetAgentID: "mock-agent",
-		Timestamp:     time.Now(),
+		Input:          "route this directly",
+		SourceAgentID:  "tui",
+		TargetAgentID:  "mock-agent",
+		ExplicitTarget: true,
+		Timestamp:      time.Now(),
 	}
 
 	forwarded, err := g.Route(context.Background(), req)
 	require.NoError(t, err)
-	assert.Equal(t, "guide", forwarded.TargetAgentID)
-	assert.Equal(t, guide.IntentHelp, forwarded.Intent)
-	assert.Contains(t, forwarded.ClassificationMethod, "guide_fallback")
+	assert.Equal(t, "mock-agent", forwarded.TargetAgentID)
+	assert.Equal(t, guide.IntentCheck, forwarded.Intent)
+	assert.Equal(t, "explicit", forwarded.ClassificationMethod)
 }
 
 func TestGuideRoute_PromotesChatToHelpForSpecialistTarget(t *testing.T) {

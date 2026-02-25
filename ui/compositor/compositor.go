@@ -10,6 +10,7 @@ const (
 	SlotCenterLeft                   // FileTree (FourColumn only).
 	SlotCenter                       // Chat.
 	SlotRight                        // Code panel (editor/viewer).
+	SlotQueue                        // Prompt queue strip (between main and input).
 	SlotInput                        // Input bar.
 	SlotStatus                       // Status bar.
 )
@@ -29,11 +30,13 @@ type Compositor struct {
 	mainH    int      // Line count for the main area columns.
 
 	// Vertical section start indices in lines[].
+	queueStart  int
 	inputStart  int
 	statusStart int
 
 	// Section-level dirty flags (control spliceMain / spliceVertical).
 	mainDirty   bool
+	queueDirty  bool
 	inputDirty  bool
 	statusDirty bool
 
@@ -55,23 +58,27 @@ func New() Compositor {
 
 // SetStructure configures the compositor for the current layout geometry.
 // Called on resize and layout-mode changes. Resets all caches.
-func (c *Compositor) SetStructure(colSlots []SlotID, mainH, inputH, statusH int) {
-	totalH := mainH + inputH + statusH
+// queueH may be 0 when the prompt queue is empty (no space consumed).
+func (c *Compositor) SetStructure(colSlots []SlotID, mainH, queueH, inputH, statusH int) {
+	totalH := mainH + queueH + inputH + statusH
 	c.lines = make([]string, totalH)
 	c.colSlots = colSlots
 	c.mainH = mainH
-	c.inputStart = mainH
-	c.statusStart = mainH + inputH
+	c.queueStart = mainH
+	c.inputStart = mainH + queueH
+	c.statusStart = mainH + queueH + inputH
 
 	// Full invalidation — section + per-slot.
 	clear(c.slotLines)
 	c.mainDirty = true
+	c.queueDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
-	c.slotDirty = make(map[SlotID]bool, len(colSlots)+2)
+	c.slotDirty = make(map[SlotID]bool, len(colSlots)+3)
 	for _, id := range colSlots {
 		c.slotDirty[id] = true
 	}
+	c.slotDirty[SlotQueue] = true
 	c.slotDirty[SlotInput] = true
 	c.slotDirty[SlotStatus] = true
 	c.hasCache = false
@@ -84,6 +91,8 @@ func (c *Compositor) SetSlotLines(id SlotID, lines []string) {
 	c.slotLines[id] = lines
 	c.slotDirty[id] = true
 	switch id {
+	case SlotQueue:
+		c.queueDirty = true
 	case SlotInput:
 		c.inputDirty = true
 	case SlotStatus:
@@ -99,6 +108,8 @@ func (c *Compositor) SetSlotLines(id SlotID, lines []string) {
 func (c *Compositor) MarkDirty(id SlotID) {
 	c.slotDirty[id] = true
 	switch id {
+	case SlotQueue:
+		c.queueDirty = true
 	case SlotInput:
 		c.inputDirty = true
 	case SlotStatus:
@@ -124,11 +135,13 @@ func (c *Compositor) IsSlotCached(id SlotID) bool {
 // transitions, edit-mode toggles, etc.).
 func (c *Compositor) InvalidateAll() {
 	c.mainDirty = true
+	c.queueDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
 	for _, id := range c.colSlots {
 		c.slotDirty[id] = true
 	}
+	c.slotDirty[SlotQueue] = true
 	c.slotDirty[SlotInput] = true
 	c.slotDirty[SlotStatus] = true
 	c.hasCache = false
@@ -143,10 +156,14 @@ func (c *Compositor) CachedFrame() string { return c.joined }
 // Compose rebuilds dirty sections of the frame and returns the joined string.
 // Skips the O(n) strings.Join when no section was actually modified.
 func (c *Compositor) Compose() string {
-	dirty := c.mainDirty || c.inputDirty || c.statusDirty
+	dirty := c.mainDirty || c.queueDirty || c.inputDirty || c.statusDirty
 	if c.mainDirty {
 		c.spliceMain()
 		c.mainDirty = false
+	}
+	if c.queueDirty {
+		c.spliceVertical(c.queueStart, SlotQueue)
+		c.queueDirty = false
 	}
 	if c.inputDirty {
 		c.spliceVertical(c.inputStart, SlotInput)
@@ -207,25 +224,33 @@ func (c *Compositor) spliceVertical(start int, id SlotID) {
 	}
 }
 
-// AdjustInputSection shifts the main/input boundary without full cache
-// invalidation. The caller specifies which main-area slot contains the
-// chat panel (layout-dependent); only that slot and the input are marked
-// dirty. Side panels keep their (truncated) cached output, avoiding the
-// content shift that causes visible flicker. The lines[] slice is NOT
-// reallocated because totalH (mainH + inputH + statusH) is invariant.
-// statusDirty is set so the status section is re-spliced, preventing any
-// trailing-newline overflow from the input slot from corrupting the
-// status bar row.
-func (c *Compositor) AdjustInputSection(newMainH, newInputH int, chatSlot SlotID) {
+// AdjustVerticalSections shifts the main/queue/input boundaries without full
+// cache invalidation. The caller specifies which main-area slot contains the
+// chat panel (layout-dependent); only that slot, the queue, and the input are
+// marked dirty. Side panels keep their (truncated) cached output, avoiding
+// the content shift that causes visible flicker. The lines[] slice is NOT
+// reallocated because totalH (mainH + queueH + inputH + statusH) is
+// invariant. statusDirty is set so the status section is re-spliced,
+// preventing any trailing-newline overflow from corrupting the status bar row.
+func (c *Compositor) AdjustVerticalSections(newMainH, newQueueH, newInputH int, chatSlot SlotID) {
 	c.mainH = newMainH
-	c.inputStart = newMainH
-	// statusStart = mainH + inputH is invariant — not updated.
+	c.queueStart = newMainH
+	c.inputStart = newMainH + newQueueH
+	// statusStart = mainH + queueH + inputH is invariant — not updated.
 	c.mainDirty = true
+	c.queueDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
 	c.slotDirty[chatSlot] = true
+	c.slotDirty[SlotQueue] = true
 	c.slotDirty[SlotInput] = true
 	c.hasCache = false
+}
+
+// AdjustInputSection shifts the main/input boundary without full cache
+// invalidation. Convenience wrapper for layouts without an active queue strip.
+func (c *Compositor) AdjustInputSection(newMainH, newInputH int, chatSlot SlotID) {
+	c.AdjustVerticalSections(newMainH, 0, newInputH, chatSlot)
 }
 
 // TruncateSlot shortens a cached slot's output to maxLines while preserving

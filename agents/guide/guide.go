@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -12,16 +14,44 @@ import (
 
 	corecontext "github.com/adalundhe/sylk/core/context"
 	"github.com/adalundhe/sylk/core/domain"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"golang.org/x/sync/singleflight"
 )
 
-const defaultAutoUpgradeInterval = 15 * time.Second
+var (
+	guideDebugLog     *slog.Logger
+	guideDebugLogOnce sync.Once
+)
+
+func guideFileLog() *slog.Logger {
+	guideDebugLogOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".sylk", "logs")
+		os.MkdirAll(dir, 0755)
+		f, err := os.OpenFile(filepath.Join(dir, "ui_events.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			guideDebugLog = slog.Default()
+			return
+		}
+		guideDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	})
+	return guideDebugLog
+}
+
+func truncateLogStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
 
 // =============================================================================
 // Guide Agent
@@ -37,6 +67,9 @@ type Guide struct {
 
 	// Event bus for async message passing
 	bus EventBus
+
+	// Activity event bus for UI agent-panel updates
+	activityBus *events.ActivityEventBus
 
 	// Subscription to Guide's own request channel (guide.requests)
 	requestSub Subscription
@@ -76,6 +109,12 @@ type Guide struct {
 	// Ready agents - agents that have completed initialization
 	readyAgents *ShardedMap[string, bool]
 
+	// typeIndex maps agent IDs (including UUIDs) to their agent type name.
+	// Populated during Register and never cleared — bounded to the number
+	// of distinct agent registrations (≤16). Used to resolve UUIDs back to
+	// type names for the activation controller, which indexes by type.
+	typeIndex *ShardedMap[string, string]
+
 	// Resilience components
 	circuits       *CircuitBreakerRegistry
 	health         *HealthMonitor
@@ -99,15 +138,16 @@ type Guide struct {
 	// Handoff bridge for context-exhaustion lifecycle management
 	handoffBridge *handoff.HandoffBridge
 
-	// Container activation hook — called before forwarding a request to
-	// an agent, triggering the ActivationController to ensure the target
-	// agent's container is hot.
-	activationHook func(ctx context.Context, agentType string) error
+	// On-demand agent activator — ensures the target agent's container
+	// is hot before forwarding a request, and resets the idle timer
+	// after successful activation and on response handling.
+	activator AgentActivator
 
-	// Container activity hook — called after successful activation and on
-	// response handling to reset the idle timer, preventing active
-	// conversation agents from being demoted.
-	touchActivityHook func(agentType string)
+	// Agent registrar callback — called after on-demand activation to
+	// register the agent's routing info (capabilities, intents, channels)
+	// with the Guide. Bridges the container→guide registration gap for
+	// agents that weren't pre-activated during bootstrap.
+	agentRegistrar func(agentType string)
 
 	// Service registry for health-aware routing. When set, isAgentHealthy
 	// uses healthy endpoints from the registry instead of the local
@@ -119,10 +159,12 @@ type Guide struct {
 	qualitySelector *QualityAwareSelector
 
 	// Self-managed Google provider lifecycle
-	googleConfig   *providers.GoogleConfig
-	googleProvider *providers.GoogleProvider
-	providerMu     sync.RWMutex
-	autoUpgradeWg  sync.WaitGroup
+	googleConfig    *providers.GoogleConfig
+	googleProvider  geminiLLMProvider
+	providerMu      sync.RWMutex
+	providerWrapper gateway.ProviderWrapper
+	// Auth credential change subscription.
+	authSub Subscription
 
 	// Running state
 	running bool
@@ -133,6 +175,14 @@ type Guide struct {
 
 	requestCancelMu sync.Mutex
 	requestCancels  map[string]context.CancelFunc
+
+	// streamReroutes stores CID → stream target agent ID for rerouted
+	// streams. Populated when a reroute event arrives (before the pending
+	// for the new CID may exist). Applied to the pending's
+	// StreamTargetOverride when the pending is created or when the first
+	// stream event arrives for that CID.
+	streamReroutesMu sync.Mutex
+	streamReroutes   map[string]string
 
 	classifyGroup singleflight.Group
 }
@@ -182,13 +232,11 @@ type Config struct {
 	ConversationFlowConfig *ConversationFlowConfig
 
 	// GoogleConfig enables self-managed provider lifecycle within the Guide.
-	// When set, RefreshAuth() rebuilds the classifier and responder from this config,
-	// and Start() auto-upgrades from rule-based to Gemini when credentials appear.
+	// When set, RefreshAuth() rebuilds the classifier and responder from this config.
 	GoogleConfig *providers.GoogleConfig
 
-	// AutoUpgradeInterval controls the retry interval for background auto-upgrade
-	// from rule-based to Gemini classification. 0 uses defaultAutoUpgradeInterval.
-	AutoUpgradeInterval time.Duration
+	// ActivityBus for publishing agent activity events to the UI panel.
+	ActivityBus *events.ActivityEventBus
 }
 
 // DefaultConfig returns sensible defaults
@@ -240,9 +288,11 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		router:         router,
 		config:         cfg,
 		bus:            cfg.Bus,
+		activityBus:    cfg.ActivityBus,
 		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
 		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:    NewStringMap[bool](DefaultShardCount),
+		typeIndex:      NewStringMap[string](DefaultShardCount),
 		registry:       registry,
 		routing:        routing,
 		triggers:       NewTriggerDetector(routing),
@@ -260,6 +310,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
 		requestCancels: make(map[string]context.CancelFunc),
+		streamReroutes: make(map[string]string),
 	}
 
 	guide.registerCoreSkills()
@@ -326,7 +377,7 @@ func resolveRouteCacheConfig(cfg Config) RouteCacheConfig {
 func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.HookRegistry) {
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := guideSkillsLoaderConfig(cfg)
-	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents", "self_diagnostic"}
+	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents", "self_diagnostic", "evaluate_plan_acceptance"}
 	skillsLoaderCfg.AutoLoadDomains = nil
 
 	hooks := skills.NewHookRegistry()
@@ -338,7 +389,7 @@ func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.Hoo
 		"route": true, "clarify": true, "guide_route": true, "help": true, "status": true,
 		"agents": true, "conversation_context": true, "route_to": true, "reply_to": true, "broadcast": true,
 		"task_interact": true, "get_routing_history": true, "get_agent_capabilities": true,
-		"self_diagnostic": true,
+		"self_diagnostic": true, "evaluate_plan_acceptance": true,
 		"sessions": true, "metrics": true, "switch_session": true, "create_session": true, "close_session": true,
 	}
 
@@ -410,9 +461,11 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		router:         router,
 		config:         cfg,
 		bus:            cfg.Bus,
+		activityBus:    cfg.ActivityBus,
 		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
 		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:    NewStringMap[bool](DefaultShardCount),
+		typeIndex:      NewStringMap[string](DefaultShardCount),
 		registry:       registry,
 		routing:        routing,
 		triggers:       NewTriggerDetector(routing),
@@ -431,6 +484,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
 		requestCancels: make(map[string]context.CancelFunc),
+		streamReroutes: make(map[string]string),
 	}
 
 	guide.registerCoreSkills()
@@ -459,7 +513,8 @@ func NewWithAPIKey(apiKey string, cfg Config) (*Guide, error) {
 }
 
 // NewWithGeminiClient creates a new Guide agent with a Google provider.
-func NewWithGeminiClient(provider *providers.GoogleProvider, cfg Config) (*Guide, error) {
+// The provider must implement both ProviderAdapter and StreamHandlerProvider.
+func NewWithGeminiClient(provider geminiLLMProvider, cfg Config) (*Guide, error) {
 	cfg = ensureRouterConfig(cfg)
 	if err := validateBus(cfg); err != nil {
 		return nil, err
@@ -470,7 +525,8 @@ func NewWithGeminiClient(provider *providers.GoogleProvider, cfg Config) (*Guide
 	routing.RegisterAgent(GuideRoutingInfo())
 
 	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
-	classifier := NewGeminiClassifier(provider, cfg.RouterConfig)
+	gemini := NewGeminiClassifier(provider, cfg.RouterConfig)
+	classifier := NewFallbackClassifier(gemini, NewRuleClassifierService())
 	router := &Router{
 		config:            cfg.RouterConfig,
 		parser:            parser,
@@ -502,9 +558,11 @@ func NewWithGeminiClient(provider *providers.GoogleProvider, cfg Config) (*Guide
 		router:         router,
 		config:         cfg,
 		bus:            cfg.Bus,
+		activityBus:    cfg.ActivityBus,
 		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
 		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:    NewStringMap[bool](DefaultShardCount),
+		typeIndex:      NewStringMap[string](DefaultShardCount),
 		registry:       registry,
 		routing:        routing,
 		triggers:       NewTriggerDetector(routing),
@@ -524,6 +582,7 @@ func NewWithGeminiClient(provider *providers.GoogleProvider, cfg Config) (*Guide
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
 		requestCancels: make(map[string]context.CancelFunc),
+		streamReroutes: make(map[string]string),
 	}
 
 	guide.registerCoreSkills()
@@ -598,6 +657,28 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 	return forwarded, nil
 }
 
+// RouteAndForward routes the request AND publishes it to the target agent.
+// Used by tool/skill handlers where the caller cannot do the forwarding itself
+// (e.g. the self-response tool loop). For guide-targeted requests, the forwarded
+// request is returned without publishing — the caller handles the response.
+func (g *Guide) RouteAndForward(ctx context.Context, request *RouteRequest) (*ForwardedRequest, error) {
+	forwarded, err := g.Route(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	pending := g.pending.Get(forwarded.CorrelationID)
+	if pending == nil {
+		return forwarded, nil
+	}
+	if g.isGuideTarget(pending.TargetAgentID) {
+		return forwarded, nil
+	}
+	if err := g.publishForwardedRequest(pending.TargetAgentID, forwarded); err != nil {
+		return nil, fmt.Errorf("forward to %s: %w", pending.TargetAgentID, err)
+	}
+	return forwarded, nil
+}
+
 func (g *Guide) ensureRequestDefaults(request *RouteRequest) {
 	if request.Timestamp.IsZero() {
 		request.Timestamp = time.Now()
@@ -611,6 +692,15 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	g.observeUserConversationSignal(request)
 	ctx = g.augmentClassificationContext(ctx, request)
 
+	// Phase-aware pre-classification gate: when an agent has set a conversation
+	// phase (e.g. plan approval), classify by polarity instead of full intent.
+	if !request.ExplicitTarget && request.TargetAgentID == "" {
+		if result, target, ok := g.tryPhaseClassification(request); ok {
+			g.observeRoutedConversationTarget(request, target)
+			return result, target, nil
+		}
+	}
+
 	// Fast-path: when an active conversation agent has high ACT-R activation
 	// and no explicit target was specified, skip LLM classification entirely.
 	if !request.ExplicitTarget && request.TargetAgentID == "" {
@@ -620,9 +710,27 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	}
 
 	if request.TargetAgentID != "" {
+		resolvedTarget, err := g.ensureExplicitTargetReady(ctx, request.TargetAgentID)
+		if err != nil && request.ExplicitTarget {
+			return nil, "", fmt.Errorf("cannot route to @%s: %w", request.TargetAgentID, err)
+		}
+		if resolvedTarget != "" {
+			request.TargetAgentID = resolvedTarget
+		}
 		classification := g.explicitTargetClassification(request.TargetAgentID)
 		classification.Domain = g.supportedDomainForTarget(request.TargetAgentID, classification.Domain, classification.Intent)
-		classification, targetAgentID := g.ensureRoutableClassification(classification, request.TargetAgentID)
+
+		var targetAgentID string
+		if request.ExplicitTarget {
+			// User deliberately selected this agent (panel click or @agent
+			// prefix). Honor the choice — skip routability demotion that
+			// would redirect to Guide when the synthetic IntentHelp is not
+			// in the agent's declared intents.
+			targetAgentID = classificationTargetAgentID(request.TargetAgentID, classification)
+		} else {
+			classification, targetAgentID = g.ensureRoutableClassification(classification, request.TargetAgentID)
+		}
+
 		// Explicit non-guide targets should bypass conversation-flow remapping.
 		// Explicit "guide" requests still represent "route this through guide",
 		// so follow-up continuity should remain active.
@@ -678,7 +786,7 @@ func (g *Guide) tryConversationFastPath(request *RouteRequest) (*RouteResult, st
 	if g.isGuideTarget(activeAgentID) {
 		return nil, "", false
 	}
-	if g.registry != nil && g.registry.Get(activeAgentID) == nil {
+	if g.resolveAgent(activeAgentID) == nil {
 		return nil, "", false
 	}
 	result := &RouteResult{
@@ -698,15 +806,30 @@ func (g *Guide) tryConversationFastPath(request *RouteRequest) (*RouteResult, st
 
 func (g *Guide) explicitTargetClassification(targetAgentID string) *RouteResult {
 	target := strings.TrimSpace(targetAgentID)
+	intent := g.defaultIntentForTarget(target)
 	return &RouteResult{
 		TargetAgent:          TargetAgent(target),
-		Intent:               IntentHelp,
+		Intent:               intent,
 		Domain:               DomainGeneral,
 		Confidence:           1.0,
 		Action:               RouteActionExecute,
 		ClassificationMethod: "explicit",
 		Reason:               "explicit target requested",
 	}
+}
+
+// defaultIntentForTarget returns the first declared intent for the target
+// agent, falling back to IntentHelp when the agent is unknown or has no
+// declared intents. This prevents explicit-target routing from assigning
+// IntentHelp to agents that don't declare it (e.g. Engineer → IntentComplete,
+// Designer → IntentDesign), which would cause ensureRoutableClassification
+// to demote the request to the Guide.
+func (g *Guide) defaultIntentForTarget(targetAgentID string) Intent {
+	agent := g.resolveAgent(targetAgentID)
+	if agent == nil || len(agent.Capabilities.Intents) == 0 {
+		return IntentHelp
+	}
+	return agent.Capabilities.Intents[0]
 }
 
 func explicitGuideFollowupAllowed(targetAgentID string) bool {
@@ -819,10 +942,14 @@ func (g *Guide) applyGuidePreferencePolicy(input string, classification *RouteRe
 	if !preferGuideTargetForClassification(input, classification, targetAgentID) {
 		return classification, targetAgentID
 	}
-	// If the classifier says IntentChat but the target agent supports
-	// IntentHelp (conversational), promote the intent and forward instead
-	// of redirecting to guide. This lets agents like the architect handle
-	// substantive conversations without being blocked by the chat policy.
+	// If the classifier says IntentChat and the target agent explicitly
+	// supports IntentChat, forward directly — no promotion needed.
+	if classification.Intent == IntentChat && g.agentSupportsIntent(targetAgentID, IntentChat) {
+		return classification, targetAgentID
+	}
+	// Otherwise, if the target supports IntentHelp (conversational), promote
+	// chat to help and forward instead of redirecting to guide. This lets
+	// agents handle substantive conversations without being blocked.
 	if classification.Intent == IntentChat && g.agentSupportsIntent(targetAgentID, IntentHelp) {
 		promoted := *classification
 		promoted.Intent = IntentHelp
@@ -878,11 +1005,101 @@ func (g *Guide) classificationSupportedByTarget(classification *RouteResult, tar
 	return g.agentSupportsIntent(targetAgentID, classification.Intent)
 }
 
+// resolveAgent looks up an agent registration by ID first, then by name/alias.
+// Agents like the tester register with UUID-based IDs but are referenced by
+// type name ("tester") in routing requests, so the name fallback is essential.
+func (g *Guide) resolveAgent(idOrName string) *AgentRegistration {
+	if g == nil || g.registry == nil {
+		return nil
+	}
+	if agent := g.registry.Get(idOrName); agent != nil {
+		return agent
+	}
+	return g.registry.GetByName(idOrName)
+}
+
+// resolveAgentID converts a name/alias to the actual registration ID.
+// Returns the input unchanged when no registration is found.
+func (g *Guide) resolveAgentID(idOrName string) string {
+	if agent := g.resolveAgent(idOrName); agent != nil {
+		return agent.ID
+	}
+	return idOrName
+}
+
+// resolveAgentDisplayName converts a UUID-based agent ID to the
+// human-readable registration name (e.g. "a1b2c3d4" → "inspector").
+// Returns the input unchanged when no registration is found.
+func (g *Guide) resolveAgentDisplayName(agentID string) string {
+	if agent := g.resolveAgent(agentID); agent != nil && agent.Name != "" {
+		return agent.Name
+	}
+	return agentID
+}
+
+// resolveActivationType maps an agent ID (UUID or type name) to the agent type
+// name expected by the activation controller. Returns the input unchanged when
+// no mapping exists — the caller should assume it is already a type name.
+func (g *Guide) resolveActivationType(idOrName string) string {
+	// Fast path: routing aggregator knows both UUID-keyed and name-keyed agents.
+	if info := g.routing.GetRoutingInfo(idOrName); info != nil && info.Type != "" {
+		return info.Type
+	}
+	// Persistent index survives agent unregistration (e.g. after demotion).
+	if agentType, ok := g.typeIndex.Get(idOrName); ok {
+		return agentType
+	}
+	return idOrName
+}
+
+// ensureExplicitTargetReady activates and registers the target agent if it
+// isn't already known to the Guide. On-demand agents (tester, inspector) may
+// not have been pre-activated during bootstrap — their containers are created
+// lazily. This method bridges the gap by:
+//  1. Calling the activation hook (creates the container and starts the agent).
+//  2. Calling the agent registrar (registers routing info: capabilities,
+//     intents, channels) synchronously before routing checks capabilities.
+//
+// Both steps are idempotent — they no-op if the agent is already active/registered.
+//
+// Returns the resolved agent ID (which may differ from targetAgentID when
+// re-activation creates a new agent with a fresh UUID) and an error when the
+// agent cannot be activated or remains unresolvable after activation.
+func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID string) (string, error) {
+	if g.resolveAgent(targetAgentID) != nil {
+		return targetAgentID, nil
+	}
+
+	// Resolve UUID → type for the activation controller, which indexes
+	// by type name ("tester"), not by agent UUID.
+	activationType := g.resolveActivationType(targetAgentID)
+
+	if g.activator != nil {
+		if err := g.activator.EnsureActive(ctx, activationType); err != nil {
+			return "", fmt.Errorf("activate %s: %w", targetAgentID, err)
+		}
+	}
+	if g.agentRegistrar != nil {
+		g.agentRegistrar(activationType)
+	}
+
+	// The original UUID still resolves — agent was just paused, not replaced.
+	if g.resolveAgent(targetAgentID) != nil {
+		return targetAgentID, nil
+	}
+	// Re-activation created a new agent with a fresh UUID. Resolve via
+	// the type name which is indexed by the registry's name lookup.
+	if resolved := g.resolveAgentID(activationType); g.resolveAgent(resolved) != nil {
+		return resolved, nil
+	}
+	return "", fmt.Errorf("agent %q not available after activation", targetAgentID)
+}
+
 func (g *Guide) agentSupportsIntent(targetAgentID string, intent Intent) bool {
-	if g == nil || g.registry == nil || intent == "" || intent == IntentUnknown {
+	if intent == "" || intent == IntentUnknown {
 		return false
 	}
-	agent := g.registry.Get(targetAgentID)
+	agent := g.resolveAgent(targetAgentID)
 	if agent == nil {
 		return false
 	}
@@ -890,10 +1107,10 @@ func (g *Guide) agentSupportsIntent(targetAgentID string, intent Intent) bool {
 }
 
 func (g *Guide) agentSupportsDomain(targetAgentID string, domain Domain) bool {
-	if g == nil || g.registry == nil || domain == "" || domain == DomainUnknown {
+	if domain == "" || domain == DomainUnknown {
 		return false
 	}
-	agent := g.registry.Get(targetAgentID)
+	agent := g.resolveAgent(targetAgentID)
 	if agent == nil {
 		return false
 	}
@@ -913,10 +1130,7 @@ func (g *Guide) supportedDomainForTarget(targetAgentID string, current Domain, i
 			return candidate
 		}
 	}
-	if g == nil || g.registry == nil {
-		return current
-	}
-	agent := g.registry.Get(targetAgentID)
+	agent := g.resolveAgent(targetAgentID)
 	if agent == nil || len(agent.Capabilities.Domains) == 0 {
 		return current
 	}
@@ -1410,7 +1624,7 @@ func (g *Guide) persistCorrectionToArchivalist(correction CorrectionRecord) {
 		ClassificationMethod: "system",
 	}
 	msg := NewForwardMessage(generateMessageID(), forwarded)
-	go func() { _ = g.bus.Publish(TopicRequests("archivalist", "archivalist"), msg) }()
+	go func() { _ = g.bus.Publish(g.agentRequestTopic("archivalist"), msg) }()
 }
 
 // IsDSL checks if input is a structured DSL command
@@ -1577,6 +1791,12 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 	// Register with routing aggregator (aliases, actions, triggers)
 	g.routing.RegisterAgent(info)
 
+	// Persist UUID → type mapping for activation resolution.
+	// Never cleared — bounded to ≤16 agent registrations.
+	if info.Type != "" {
+		g.typeIndex.Set(info.ID, info.Type)
+	}
+
 	// Register capabilities/constraints with registry
 	if info.Registration != nil {
 		g.registry.Register(info.Registration)
@@ -1597,6 +1817,16 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 
 	// Subscribe to agent's response and error channels (if bus is running)
 	if g.bus != nil && g.running {
+		// Unsubscribe existing subscriptions to prevent leaked duplicates.
+		// Register may be called multiple times for the same agent (e.g. after
+		// activation from cold start), and each call to subscribeToAgentChannels
+		// appends a new subscription to the bus topic. Without cleanup, every
+		// leaked subscription independently delivers stream chunks to the TUI.
+		if existing, ok := g.agentSubs.Get(info.ID); ok {
+			_ = existing.responses.Unsubscribe()
+			_ = existing.errors.Unsubscribe()
+			g.agentSubs.Delete(info.ID)
+		}
 		subs, err := g.subscribeToAgentChannels(info.ID, channels)
 		if err != nil {
 			// Rollback registration on subscription failure
@@ -1805,11 +2035,17 @@ func (g *Guide) Start(ctx context.Context) error {
 		return err
 	}
 
-	// If started with a rule-based classifier and a GoogleConfig is available,
-	// launch a background goroutine to auto-upgrade to Gemini classification
-	// once credentials become available.
-	if g.googleConfig != nil && g.googleProvider == nil {
-		g.startAuthAutoUpgrade()
+	// Subscribe to credential changes so the Guide refreshes its own
+	// Google provider when the user authenticates after startup.
+	// This replaces the legacy auto-upgrade polling loop — the AuthRegistry
+	// broadcasts events reactively when credentials become available,
+	// eliminating the 15-second polling interval that contributed to
+	// rate limiting.
+	authSub, authErr := g.bus.SubscribeAsync(TopicAuthCredentials, g.handleAuthChanged)
+	if authErr != nil {
+		slog.Warn("guide: failed to subscribe to auth credentials topic", "error", authErr)
+	} else {
+		g.authSub = authSub
 	}
 
 	return nil
@@ -1872,7 +2108,6 @@ func (g *Guide) stopComponents() error {
 
 func (g *Guide) stopResilience() {
 	g.cancelRunContext()
-	g.autoUpgradeWg.Wait()
 	g.pendingCleanup.Stop()
 	g.health.Stop()
 	if g.streams != nil {
@@ -1888,7 +2123,18 @@ func (g *Guide) stopResilience() {
 
 func (g *Guide) collectUnsubscribeErrors(errs *[]error) {
 	g.unsubscribeRequest(errs)
+	g.unsubscribeAuth(errs)
 	g.unsubscribeAgentChannels(errs)
+}
+
+func (g *Guide) unsubscribeAuth(errs *[]error) {
+	if g.authSub == nil {
+		return
+	}
+	if err := g.authSub.Unsubscribe(); err != nil {
+		*errs = append(*errs, err)
+	}
+	g.authSub = nil
 }
 
 func (g *Guide) unsubscribeRequest(errs *[]error) {
@@ -1975,6 +2221,14 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 	if req == nil {
 		return nil
 	}
+	guideFileLog().Info("guide: handleRouteRequestMessage",
+		"source_agent", req.SourceAgentID,
+		"target_agent", req.TargetAgentID,
+		"input_len", len(req.Input),
+		"input_preview", truncateLogStr(req.Input, 100),
+		"session_id", req.SessionID,
+		"msg_type", msg.Type,
+		"msg_source", msg.SourceAgentID)
 	correlationID := routeCorrelationID(msg, req)
 	req.CorrelationID = correlationID
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -1991,7 +2245,9 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		})
 	})
 
-	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID)
+	vis := classifyRequestVisibility(req)
+	g.publishActivity(events.EventTypeAgentDecision, vis, "Classifying request...")
+	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, vis)
 	if err != nil {
 		if g.isInterruptError(err) {
 			return nil
@@ -2005,7 +2261,8 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 	if g.isGuideTarget(pending.TargetAgentID) {
 		return g.respondToGuideRequest(reqCtx, pending, req)
 	}
-	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID)
+	g.publishActivity(events.EventTypeAgentAction, vis, "Routing to "+pending.TargetAgentID)
+	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID, vis)
 	return g.publishForwardedRequest(pending.TargetAgentID, forwarded)
 }
 
@@ -2045,7 +2302,7 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 	// Inject exclude list into context for loop prevention.
 	reqCtx = withRerouteExcludeAgents(reqCtx, reroute.ExcludeAgents)
 
-	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID)
+	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, classifyRequestVisibility(req))
 	if err != nil {
 		if g.isInterruptError(err) {
 			return nil
@@ -2063,7 +2320,7 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 	if g.isGuideTarget(pending.TargetAgentID) {
 		return g.respondToGuideRequest(reqCtx, pending, req)
 	}
-	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID)
+	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID, classifyRequestVisibility(req))
 	return g.publishForwardedRequest(pending.TargetAgentID, forwarded)
 }
 
@@ -2100,7 +2357,7 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 		TargetAgentID: sourceAgentID,
 		Timestamp:     time.Now(),
 	}
-	_ = g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), msg)
+	_ = g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg)
 }
 
 // rerouteExcludeKey is the context key for reroute excluded agent IDs.
@@ -2138,9 +2395,27 @@ func routeCorrelationID(msg *Message, req *RouteRequest) string {
 }
 
 func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingRequest, req *RouteRequest) error {
+	// Direct skill invocation for structured requests (e.g. plan acceptance).
+	// The architect sends "evaluate-plan-acceptance: {json}" — intercept here
+	// so the skill handler returns map[string]any instead of an LLM string.
+	if data, ok := g.tryDirectSkillInvocation(ctx, req.Input); ok {
+		resp := &RouteResponse{
+			CorrelationID:       pending.CorrelationID,
+			RespondingAgentID:   g.agentID,
+			RespondingAgentName: "Guide",
+			Success:             true,
+			Data:                data,
+		}
+		resolved, handleErr := g.HandleResponse(ctx, resp)
+		if handleErr != nil {
+			return nil
+		}
+		return g.publishResponseToSource(resolved.SourceAgentID, resp)
+	}
+
 	g.publishGuideStreamStart(pending.CorrelationID, pending.SourceAgentID)
 	ctx = withGuideThoughtEmitter(ctx, func(thought string) {
-		g.publishGuideStreamProgress(pending.CorrelationID, pending.SourceAgentID, thought)
+		g.publishGuideStreamProgress(pending.CorrelationID, pending.SourceAgentID, thought, events.VisibilityUser)
 	})
 	ctx = withGuideEarlyUsageEmitter(ctx, func(inputTokens int) {
 		g.publishGuideStreamEarlyUsage(pending.CorrelationID, pending.SourceAgentID, inputTokens)
@@ -2238,6 +2513,12 @@ func (g *Guide) SetClassifier(classifier ClassifierService) {
 	g.router.SetClassifier(classifier)
 }
 
+// SetProviderWrapper stores a callback that re-applies gateway rate limiting
+// to fresh providers created during credential refresh.
+func (g *Guide) SetProviderWrapper(w gateway.ProviderWrapper) {
+	g.providerWrapper = w
+}
+
 // RefreshAuth rebuilds the classifier and self-responder from the stored
 // GoogleConfig by creating a fresh provider. This is the Guide's equivalent
 // of Architect.RefreshPlannerAuth(): the caller only needs to say "credentials
@@ -2277,7 +2558,7 @@ func (g *Guide) RefreshAuthWithMethod(ctx context.Context, method string) error 
 			}
 		}
 		return lastErr
-	case "apikey":
+	case "apikey", providers.GoogleAuthModeAPIKey:
 		return g.refreshAuthWithMode(ctx, providers.GoogleAuthModeAPIKey, false)
 	default:
 		return g.refreshAuthWithMode(ctx, "", false)
@@ -2306,7 +2587,7 @@ func (g *Guide) refreshAuthWithMode(ctx context.Context, mode string, strict boo
 	if trimmed := strings.TrimSpace(mode); trimmed != "" {
 		cfgOverride.AuthMode = trimmed
 	}
-	promptSkills := DiscoverGuidePromptSkills()
+	promptSkills := DiscoverGuidePromptSkills(g.skills.GetAll())
 	provider, err := providers.NewGoogleProvider(ctx, cfgOverride, promptSkills...)
 	if err != nil {
 		geminiTrace("auth", "refresh_failed", map[string]any{
@@ -2335,43 +2616,25 @@ func (g *Guide) refreshAuthWithMode(ctx context.Context, mode string, strict boo
 		"resolved_auth_mode":  strings.TrimSpace(resolvedMode),
 		"use_vertex_ai":       provider.UsesVertexAI(),
 	})
+	var wrapped geminiLLMProvider = provider
+	if g.providerWrapper != nil {
+		wrapped = g.providerWrapper(provider)
+	}
 	g.providerMu.Lock()
-	g.googleProvider = provider
+	g.googleProvider = wrapped
 	g.googleConfig = &cfgOverride
 	g.providerMu.Unlock()
 
 	cfg := g.config.RouterConfig
-	g.SetClassifier(NewGeminiClassifier(provider, cfg))
-	g.SetSelfResponder(resolveGuideSelfResponder(g.config, provider, g))
+	gemini := NewGeminiClassifier(wrapped, cfg)
+	g.SetClassifier(NewFallbackClassifier(gemini, NewRuleClassifierService()))
+	g.SetSelfResponder(resolveGuideSelfResponder(g.config, wrapped, g))
 	if cache := g.RouteCache(); cache != nil {
 		cache.Clear()
 	}
 	return nil
 }
 
-func (g *Guide) startAuthAutoUpgrade() {
-	interval := g.config.AutoUpgradeInterval
-	if interval <= 0 {
-		interval = defaultAutoUpgradeInterval
-	}
-	ctx := g.processingContext()
-	g.autoUpgradeWg.Add(1)
-	go func() {
-		defer g.autoUpgradeWg.Done()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			if err := g.RefreshAuth(ctx); err == nil {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
-}
 
 func (g *Guide) newGuideSelfResponseRequest(input string, sessionID string) GuideSelfResponseRequest {
 	request := GuideSelfResponseRequest{
@@ -2419,50 +2682,10 @@ func (g *Guide) loadedGuideSkillNames() []string {
 	return names
 }
 
-func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, _, _ string) (*ForwardedRequest, error) {
-	stream := g.beginRoutingStream(req.CorrelationID, req)
+func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlationID, sourceAgentID string, visibility events.EventVisibility) (*ForwardedRequest, error) {
+	g.publishGuideStreamProgress(correlationID, sourceAgentID, "Classifying request...", visibility)
 	result, err := g.Route(ctx, req)
-	g.completeRoutingStream(stream, result, err)
 	return result, err
-}
-
-func (g *Guide) beginRoutingStream(correlationID string, req *RouteRequest) *ResponseStream {
-	if g == nil || g.streams == nil || correlationID == "" || req == nil {
-		return nil
-	}
-	stream, err := g.streams.CreateStream(correlationID, req.SessionID)
-	if err != nil || stream == nil {
-		return nil
-	}
-	stream.SendProgress(0, 1, "routing request")
-	return stream
-}
-
-func (g *Guide) completeRoutingStream(stream *ResponseStream, result *ForwardedRequest, err error) {
-	if g == nil || g.streams == nil || stream == nil {
-		return
-	}
-	if err != nil {
-		stream.SendError(err)
-		g.streams.CloseStream(stream.CorrelationID)
-		return
-	}
-	if result != nil {
-		stream.SendComplete(result)
-	}
-	g.streams.CloseStream(stream.CorrelationID)
-}
-
-func (g *Guide) recordRetryStreamEvent(stream *ResponseStream, attempt, max int, err error) {
-	if stream == nil {
-		return
-	}
-	stream.SendData(map[string]any{
-		"event":        "retry",
-		"attempt":      attempt,
-		"max_attempts": max,
-		"error":        err.Error(),
-	})
 }
 
 func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status RetryStatus) {
@@ -2486,7 +2709,7 @@ func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status R
 		Type:          MessageTypeStream,
 		Payload:       resp,
 	}
-	_ = g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), busMsg)
+	_ = g.bus.Publish(g.agentResponseTopic(sourceAgentID), busMsg)
 }
 
 func (g *Guide) publishGuideStreamStart(correlationID, sourceAgentID string) {
@@ -2509,7 +2732,7 @@ func (g *Guide) publishGuideStreamChunk(correlationID, sourceAgentID, text strin
 	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
 }
 
-func (g *Guide) publishGuideStreamProgress(correlationID, sourceAgentID, message string) {
+func (g *Guide) publishGuideStreamProgress(correlationID, sourceAgentID, message string, visibility events.EventVisibility) {
 	message = strings.TrimSpace(message)
 	if message == "" {
 		return
@@ -2519,12 +2742,42 @@ func (g *Guide) publishGuideStreamProgress(correlationID, sourceAgentID, message
 		Data: &ProgressData{
 			Message: message,
 		},
-		Timestamp: time.Now(),
+		Visibility: visibility,
+		Timestamp:  time.Now(),
 	}
 	g.publishGuideStreamEvent(correlationID, sourceAgentID, event)
 }
 
-func (g *Guide) publishRouteHandoffProgress(correlationID, sourceAgentID, targetAgentID string) {
+func (g *Guide) publishActivity(eventType events.EventType, visibility events.EventVisibility, content string) {
+	if g.activityBus == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, g.sessionID, content)
+	evt.AgentID = g.agentID
+	evt.Visibility = visibility
+	evt.Data["agent_type"] = "guide"
+	evt.Data["agent_name"] = "Guide"
+	g.activityBus.Publish(evt)
+}
+
+// classifyRequestVisibility determines EventVisibility from a RouteRequest.
+// TUI-originated requests are user-visible. Fire-and-forget or agent-sourced
+// requests are classified as system or agent respectively.
+func classifyRequestVisibility(req *RouteRequest) events.EventVisibility {
+	if req == nil {
+		return events.VisibilityUser
+	}
+	if req.FireAndForget {
+		return events.VisibilitySystem
+	}
+	src := strings.TrimSpace(req.SourceAgentID)
+	if src == "" || src == "tui" {
+		return events.VisibilityUser
+	}
+	return events.VisibilityAgent
+}
+
+func (g *Guide) publishRouteHandoffProgress(correlationID, sourceAgentID, targetAgentID string, visibility events.EventVisibility) {
 	targetAgentID = strings.TrimSpace(targetAgentID)
 	if targetAgentID == "" {
 		return
@@ -2534,7 +2787,8 @@ func (g *Guide) publishRouteHandoffProgress(correlationID, sourceAgentID, target
 		Data: &ProgressData{
 			Message: "Handing off to " + targetAgentID + "...",
 		},
-		Timestamp: time.Now(),
+		Visibility: visibility,
+		Timestamp:  time.Now(),
 	}
 	g.publishStreamEventForResponder(correlationID, sourceAgentID, targetAgentID, event)
 }
@@ -2604,7 +2858,7 @@ func (g *Guide) publishStreamEventForResponder(correlationID, sourceAgentID, res
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	_ = g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), msg)
+	_ = g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg)
 }
 
 func (g *Guide) registeredAgentIDs() []string {
@@ -2630,8 +2884,8 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 
 	// Touch activity for the responding agent to prevent idle demotion
 	// during active conversation flow.
-	if g.touchActivityHook != nil && msg.SourceAgentID != "" {
-		g.touchActivityHook(msg.SourceAgentID)
+	if g.activator != nil && msg.SourceAgentID != "" {
+		g.activator.TouchActivity(msg.SourceAgentID)
 	}
 
 	switch msg.Type {
@@ -2646,6 +2900,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			return nil
 		}
 		g.observeConversationResponse(pending, resp)
+		resp.RespondingAgentID = g.resolveAgentDisplayName(resp.RespondingAgentID)
 
 		return g.publishResponseToSource(pending.SourceAgentID, resp)
 	case MessageTypeStream:
@@ -2654,13 +2909,17 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			return fmt.Errorf("invalid stream response payload")
 		}
 		g.recordIncomingStreamEvent(streamResp)
+		g.observeStreamDirective(streamResp)
+		g.observeStreamReroute(streamResp)
 		pending := g.pending.Get(streamResp.CorrelationID)
 		if pending == nil {
 			return nil
 		}
-		streamResp.TargetAgentID = pending.SourceAgentID
-		streamResp.RespondingAgentID = pending.TargetAgentID
-		return g.publishStreamToSource(pending.SourceAgentID, streamResp)
+		g.applyDeferredStreamReroute(pending)
+		streamTarget := g.resolveStreamTarget(pending)
+		streamResp.TargetAgentID = streamTarget
+		streamResp.RespondingAgentID = g.resolveAgentDisplayName(pending.TargetAgentID)
+		return g.publishStreamToSource(streamTarget, streamResp)
 	default:
 		return nil
 	}
@@ -2674,7 +2933,7 @@ func (g *Guide) recordIncomingStreamEvent(resp *StreamResponse) {
 	if stream == nil {
 		return
 	}
-	stream.SendData(resp.Event)
+	stream.ForwardEvent(resp.Event)
 }
 
 func (g *Guide) registerRequestCancel(correlationID string, cancel context.CancelFunc) {
@@ -2757,7 +3016,7 @@ func (g *Guide) forwardUserInterruptToTarget(req *UserInterruptRequest, pending 
 	}
 	action := g.userInterruptAction(req, pending)
 	msg := NewActionMessage(generateMessageID(), action)
-	_ = g.bus.Publish(guideTargetTopic(pending.TargetAgentID), msg)
+	_ = g.bus.Publish(g.agentRequestTopic(pending.TargetAgentID), msg)
 }
 
 func (g *Guide) userInterruptAction(req *UserInterruptRequest, pending *PendingRequest) *ActionRequest {
@@ -2782,9 +3041,6 @@ func (g *Guide) userInterruptAction(req *UserInterruptRequest, pending *PendingR
 	}
 }
 
-func guideTargetTopic(targetAgentID string) string {
-	return TopicRequests(targetAgentID, targetAgentID)
-}
 
 // handleErrorMessage processes incoming error messages from agent error channels
 func (g *Guide) handleErrorMessage(msg *Message) error {
@@ -2848,28 +3104,65 @@ func (g *Guide) isInterruptError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// agentRequestTopic returns the request topic for a registered agent,
+// falling back to TopicRequests(id, id) for unregistered agents (e.g. guide itself).
+func (g *Guide) agentRequestTopic(agentID string) string {
+	if ch, ok := g.agentChannels.Get(agentID); ok {
+		return ch.Requests
+	}
+	return TopicRequests(agentID, agentID)
+}
+
+// agentResponseTopic returns the response topic for a registered agent,
+// falling back to TopicResponses(id, id) for unregistered agents (e.g. guide itself).
+func (g *Guide) agentResponseTopic(agentID string) string {
+	if ch, ok := g.agentChannels.Get(agentID); ok {
+		return ch.Responses
+	}
+	return TopicResponses(agentID, agentID)
+}
+
 func (g *Guide) publishRouteError(correlationID string, sourceAgentID string, err error) error {
 	errMsg := NewErrorMessage(generateMessageID(), correlationID, g.agentID, err.Error())
-	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), errMsg)
+	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), errMsg)
 }
 
 func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *ForwardedRequest) error {
-	if g.activationHook != nil {
-		if err := g.activationHook(g.processingContext(), targetAgentID); err != nil {
-			slog.Warn("activation hook failed", "target", targetAgentID, "error", err)
-			// Still attempt delivery — agent might already be hot.
+	// Resolve name/alias to the actual registration ID. Agents with UUID-based
+	// IDs (tester, inspector) register channels under the UUID but routing uses
+	// the type name ("tester", "inspector") as the target.
+	resolved := g.resolveAgentID(targetAgentID)
+
+	// The activation controller indexes by type name, not UUID.
+	activationType := g.resolveActivationType(resolved)
+
+	if g.activator != nil {
+		if err := g.activator.EnsureActive(g.processingContext(), activationType); err != nil {
+			// Check if agent is already reachable despite activation error.
+			if g.resolveAgent(resolved) == nil {
+				return fmt.Errorf("activate %s for forwarding: %w", activationType, err)
+			}
 		}
 	}
-	if g.touchActivityHook != nil {
-		g.touchActivityHook(targetAgentID)
+
+	// Re-register routing info after activation (handles new UUIDs from cold start).
+	if g.agentRegistrar != nil {
+		g.agentRegistrar(activationType)
+	}
+
+	// Re-resolve — cold start may create new agent with fresh UUID.
+	resolved = g.resolveAgentID(targetAgentID)
+
+	if g.activator != nil {
+		g.activator.TouchActivity(activationType)
 	}
 
 	// Weighted target resolution: during overlap, multiple endpoints may
 	// exist for the same agent type. Select based on quality weights.
-	resolvedTarget := g.resolveWeightedTarget(targetAgentID)
+	resolvedTarget := g.resolveWeightedTarget(resolved)
 
 	fwdMsg := g.forwardMessage(resolvedTarget, forwarded)
-	return g.bus.Publish(TopicRequests(resolvedTarget, resolvedTarget), fwdMsg)
+	return g.bus.Publish(g.agentRequestTopic(resolvedTarget), fwdMsg)
 }
 
 func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest) *Message {
@@ -2880,7 +3173,7 @@ func (g *Guide) forwardMessage(targetAgentID string, forwarded *ForwardedRequest
 
 func (g *Guide) publishResponseToSource(sourceAgentID string, resp *RouteResponse) error {
 	respMsg := NewResponseMessage(generateMessageID(), resp)
-	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), respMsg)
+	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), respMsg)
 }
 
 func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse) error {
@@ -2896,12 +3189,12 @@ func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), msg)
+	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg)
 }
 
 func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string) error {
 	errMsg := NewErrorMessage(generateMessageID(), correlationID, sourceAgent, errStr)
-	return g.bus.Publish(TopicResponses(sourceAgentID, sourceAgentID), errMsg)
+	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), errMsg)
 }
 
 func (g *Guide) routeResponseFromError(msg *Message, errStr string) *RouteResponse {
@@ -3207,19 +3500,19 @@ type ServiceQualityChecker interface {
 	GetWeightedEndpoints(agentType string) []QualityEndpoint
 }
 
-// SetActivationHook sets a callback invoked before forwarding a request
-// to ensure the target agent's container is active. The hook is typically
-// bound to ActivationController.EnsureActive.
-func (g *Guide) SetActivationHook(hook func(ctx context.Context, agentType string) error) {
-	g.activationHook = hook
+// SetActivator installs the on-demand agent activator used before
+// forwarding requests and after response handling to manage container
+// lifecycle (activation and idle timer reset).
+func (g *Guide) SetActivator(a AgentActivator) {
+	g.activator = a
 }
 
-// SetTouchActivityHook installs a callback invoked after request
-// forwarding and response handling to reset the idle timer on the
-// target agent's container, preventing demotion during active
-// conversations.
-func (g *Guide) SetTouchActivityHook(hook func(agentType string)) {
-	g.touchActivityHook = hook
+// SetAgentRegistrar sets a callback invoked after on-demand activation to
+// register the agent's routing info with the Guide. This bridges the gap
+// between container activation (which only marks readiness) and Guide
+// registration (which provides capabilities, intents, and channels).
+func (g *Guide) SetAgentRegistrar(registrar func(agentType string)) {
+	g.agentRegistrar = registrar
 }
 
 // SetServiceRegistry sets the health checker used for routing decisions.
@@ -3227,6 +3520,25 @@ func (g *Guide) SetTouchActivityHook(hook func(agentType string)) {
 // local readyAgents map.
 func (g *Guide) SetServiceRegistry(reg ServiceHealthChecker) {
 	g.serviceRegistry = reg
+}
+
+// handleAuthChanged processes credential change events from the AuthRegistry.
+// Only reacts to "google" provider changes — the Guide's own auth is Google.
+func (g *Guide) handleAuthChanged(msg *Message) error {
+	ev, ok := msg.GetAuthEvent()
+	if !ok || ev == nil {
+		return nil
+	}
+	if ev.ProviderType != "google" || !ev.Available {
+		return nil
+	}
+	ctx := g.processingContext()
+	if err := g.RefreshAuthWithMethod(ctx, ev.AuthMethod); err != nil {
+		slog.Warn("guide: auth refresh from bus event failed",
+			"method", ev.AuthMethod,
+			"error", err)
+	}
+	return nil
 }
 
 // SetServiceQualityRegistry sets the quality-aware health checker.

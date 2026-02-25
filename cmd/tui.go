@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,7 +19,9 @@ import (
 	"github.com/adalundhe/sylk/agents/designer"
 	"github.com/adalundhe/sylk/agents/engineer"
 	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/agents/inspector"
+	inspectorGlobal "github.com/adalundhe/sylk/agents/inspector/global"
+	inspectorPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
+	inspectorShared "github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/agents/librarian"
 	"github.com/adalundhe/sylk/agents/orchestrator"
 	globaltester "github.com/adalundhe/sylk/agents/tester/global"
@@ -32,11 +33,16 @@ import (
 	"github.com/adalundhe/sylk/core/container/activation"
 	"github.com/adalundhe/sylk/core/container/daemon"
 	"github.com/adalundhe/sylk/core/container/network"
+	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
+	"github.com/adalundhe/sylk/core/storage"
+	"github.com/adalundhe/sylk/core/storage/sylkdir"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/ui"
 	"github.com/adalundhe/sylk/ui/fonts"
 	"github.com/spf13/cobra"
@@ -173,18 +179,20 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	quota := container.NewResourceQuota(quotaFromSpecs(specReg))
 
 	creatorReg := container.NewAgentCreatorRegistry()
-	registerAgentCreators(creatorReg, guideBus, activityBus)
 
 	hookMut := &lifecycleHookMutator{serviceReg: serviceReg}
 	admission := container.NewAdmissionController(nil, []container.SpecMutator{hookMut})
 
+	probeFact := &probeFactoryHolder{}
+
 	runtime := container.NewDefaultRuntime(container.DefaultRuntimeConfig{
-		Budget:      budget,
-		Registry:    containerReg,
-		Quota:       quota,
-		Admission:   admission,
-		CreateAgent: creatorReg.Creator(),
-		ParentCtx:   ctx,
+		Budget:       budget,
+		Registry:     containerReg,
+		Quota:        quota,
+		Admission:    admission,
+		CreateAgent:  creatorReg.Creator(),
+		ProbeFactory: probeFact.Build,
+		ParentCtx:    ctx,
 	})
 
 	policies := container.BuildNetworkPolicies(descriptors.All())
@@ -208,6 +216,54 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	for _, spec := range daemonSpecs {
 		daemonSpecMap[spec.Name] = spec.ContainerSpec
 	}
+
+	// =================================================================
+	// Phase 1.5: Shared Google auth hydration (before parallel creation)
+	// =================================================================
+	// Performs OAuth resolve + Code Assist setup once so the parallel
+	// Guide and Orchestrator goroutines don't race two setup requests
+	// against the same quota window.
+
+	const (
+		hydrateMaxAttempts = 3
+		hydrateRetryDelay  = 2 * time.Second
+	)
+
+	guideCfg := defaultGuideGoogleConfig()
+	var hydrated *providers.HydratedGoogleAuth
+	for attempt := 1; attempt <= hydrateMaxAttempts; attempt++ {
+		h, err := providers.HydrateGoogleAuth(ctx, guideCfg)
+		if err == nil {
+			hydrated = h
+			break
+		}
+		slog.Warn("google auth hydration attempt failed",
+			"attempt", attempt,
+			"max", hydrateMaxAttempts,
+			"error", err)
+		if attempt < hydrateMaxAttempts {
+			select {
+			case <-ctx.Done():
+			case <-time.After(hydrateRetryDelay):
+			}
+		}
+	}
+
+	// Create provider gateways for cross-agent rate limiting coordination.
+	// Select rate limit profile based on actual auth mode, not hydration status.
+	var googleGwCfg gateway.GatewayConfig
+	if guideCfg.AuthMode == providers.GoogleAuthModeOAuth {
+		googleGwCfg = gateway.DefaultGoogleOAuthConfig()
+	} else {
+		googleGwCfg = gateway.DefaultGoogleAPIKeyConfig()
+	}
+	googleGateway := gateway.NewProviderGateway(googleGwCfg, slog.Default())
+	anthropicGateway := gateway.NewProviderGateway(gateway.DefaultAnthropicConfig(), slog.Default())
+	openaiGateway := gateway.NewProviderGateway(gateway.DefaultOpenAIConfig(), slog.Default())
+
+	// Register agent creators after hydration so closures capture the
+	// resolved auth state — avoids duplicate OAuth / Code Assist setup.
+	registerAgentCreators(creatorReg, guideBus, activityBus, projectRoot, hydrated, googleGateway, anthropicGateway, openaiGateway)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
 
@@ -423,6 +479,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	}
 
 	hookMut.SetGuide(g)
+	probeFact.SetIsReady(g.IsAgentReady)
 
 	if err := registerOrchestratorWithGuide(g, orch); err != nil {
 		cleanupInfra(runtime, containerReg, namespace, guideBus, activityBus)
@@ -430,16 +487,44 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	}
 
 	activationCtrl := actResult.ctrl
+	var activator guide.AgentActivator
 	if activationCtrl != nil {
-		g.SetActivationHook(func(fwdCtx context.Context, agentType string) error {
-			_, activateErr := activationCtrl.EnsureActive(fwdCtx, agentType)
-			return activateErr
-		})
-		g.SetTouchActivityHook(func(agentType string) {
-			activationCtrl.TouchActivity(agentType)
-		})
+		activator = activation.NewControllerActivator(activationCtrl)
+		g.SetActivator(activator)
 	}
 	g.SetServiceRegistry(serviceReg)
+	g.SetProviderWrapper(googleGateway.Wrapper(gateway.PriorityUserInteractive))
+
+	// Agent registrar: bridges on-demand activation → routing registration.
+	// When the Guide activates an agent lazily (via ensureExplicitTargetReady),
+	// the PostStartHook only marks readiness. This callback extracts the agent
+	// from the container registry and registers its routing info (capabilities,
+	// intents, channels) with the Guide.
+	g.SetAgentRegistrar(func(agentType string) {
+		containers := containerReg.ListByType(agentType)
+		if len(containers) == 0 {
+			return
+		}
+		agent := containers[0].Agent()
+		if router, ok := agent.(guide.AgentRouter); ok {
+			_ = registerAgentWithGuide(g, router, agentType)
+		}
+	})
+
+	// AuthRegistry: centralized credential lifecycle. Publishes events to
+	// the bus (consumed by Guide + Orchestrator) and walks the container
+	// registry for on-demand agents (tester, engineer, designer, inspector).
+	authProbe := buildAuthProbe()
+	authPublisher := chainPublishers(
+		buildAuthPublisher(guideBus),
+		buildOnDemandAuthRefresher(containerReg),
+	)
+	authRegistry := credentials.NewAuthRegistry(authProbe, authPublisher, slog.Default())
+
+	// Wire orchestrator to refresh its own Google provider on auth events.
+	orch.SetProviderRefresher(func(refreshCtx context.Context) {
+		refreshOrchestratorProvider(refreshCtx, orch, googleGateway)
+	})
 
 	orch.SetTaskRouter(orchestrator.NewTaskRouter(orchestrator.TaskRouterConfig{
 		Bus:       guideBus,
@@ -447,6 +532,9 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		AgentID:   "orchestrator",
 		SessionID: "default",
 	}))
+	if activator != nil {
+		orch.SetActivator(activator)
+	}
 
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 
@@ -456,6 +544,16 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 	phase4Start := time.Now()
 
+	// Seed the agent panel with all known global agents unconditionally.
+	// Pre-activation is best-effort — provider may be unavailable (missing
+	// API key, network error, etc.) but the agent should still be visible
+	// in the UI as idle. It becomes functional on first successful route.
+	seeds := []ui.AgentSeed{
+		{ID: "architect", AgentType: "architect", Name: "Architect"},
+		{ID: "inspector", AgentType: "inspector", Name: "Inspector"},
+		{ID: "tester", AgentType: "tester", Name: "Tester"},
+	}
+
 	// Pre-activate Architect (commonly used first).
 	if activationCtrl != nil {
 		if _, err := activationCtrl.EnsureActive(ctx, "architect"); err != nil {
@@ -464,6 +562,33 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 			arch, archErr := extractAgent[*architect.Architect](containerReg, "architect")
 			if archErr == nil {
 				_ = registerArchitectWithGuide(g, arch)
+				seeds[0].ID = arch.AgentID()
+			}
+		}
+	}
+
+	// Pre-activate Inspector.
+	if activationCtrl != nil {
+		if _, err := activationCtrl.EnsureActive(ctx, "inspector"); err != nil {
+			slog.Warn("inspector pre-activation failed", "error", err)
+		} else {
+			gi, giErr := extractAgent[*inspectorGlobal.GlobalInspector](containerReg, "inspector")
+			if giErr == nil {
+				_ = registerAgentWithGuide(g, gi, "inspector")
+				seeds[1].ID = gi.AgentID()
+			}
+		}
+	}
+
+	// Pre-activate Tester.
+	if activationCtrl != nil {
+		if _, err := activationCtrl.EnsureActive(ctx, "tester"); err != nil {
+			slog.Warn("tester pre-activation failed", "error", err)
+		} else {
+			gt, gtErr := extractAgent[*globaltester.GlobalTester](containerReg, "tester")
+			if gtErr == nil {
+				_ = registerAgentWithGuide(g, gt, "tester")
+				seeds[2].ID = gt.AgentID()
 			}
 		}
 	}
@@ -480,6 +605,10 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	_ = sessionMgr.Switch(defaultSession.ID())
 
 	orch.SignalReady()
+
+	// Initial credential probe — triggers auth broadcasts to all
+	// agents that started in degraded mode.
+	authRegistry.ProbeAll()
 
 	slog.Info("bootstrap phase 4 complete", "elapsed", time.Since(phase4Start))
 	slog.Info("bootstrap total", "elapsed", time.Since(start))
@@ -520,6 +649,10 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		namespace.Close()
 		runtime.Close()
 
+		googleGateway.Stop()
+		anthropicGateway.Stop()
+		openaiGateway.Stop()
+
 		if busErr := guideBus.Close(); busErr != nil {
 			errs = append(errs, busErr)
 		}
@@ -535,12 +668,13 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		StreamManager:     streamMgr,
 		Guide:             g,
 		Scope:             scope,
-		AuthRefresh:       buildAuthRefreshHook(g, arch, orch),
+		AuthRegistry:      authRegistry,
 		NerdFontsDetected: fontRes.detected,
 		GitClient:         gitRes.client,
 		GitWatcher:        gitRes.watcher,
 		GitBus:            gitRes.bus,
 		SafetyGuard:       gitRes.guard,
+		SeedAgents:        seeds,
 	}
 
 	return deps, cleanup, nil
@@ -552,33 +686,46 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 // registerAgentCreators populates the creator registry with factory closures
 // for every agent type. Each factory creates and starts the agent on the bus.
+// hydrated may be nil when auth hydration failed — Guide/Orchestrator fall
+// back to rule-based or LLM-less mode in that case.
 func registerAgentCreators(
 	reg *container.AgentCreatorRegistry,
 	bus guide.EventBus,
 	actBus *events.ActivityEventBus,
+	projectRoot string,
+	hydrated *providers.HydratedGoogleAuth,
+	googleGw *gateway.ProviderGateway,
+	anthropicGw *gateway.ProviderGateway,
+	openaiGw *gateway.ProviderGateway,
 ) {
 	// Guide — Gemini with rule-based fallback.
 	reg.Register("guide", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapLiveGuide(ctx, bus)
+		return bootstrapLiveGuide(ctx, bus, actBus, hydrated, googleGw)
 	})
 
-	// Architect — Anthropic LLM planner.
+	// Architect — Anthropic LLM planner. Gets read-only DiskFileAccess.
 	reg.Register("architect", func(_ context.Context) (container.ContainerAgent, error) {
-		return bootstrapArchitect(bus)
+		return bootstrapArchitect(bus, actBus, projectRoot, anthropicGw)
 	})
 
 	// Orchestrator — pipeline coordinator.
 	reg.Register("orchestrator", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapOrchestrator(ctx, bus, actBus)
+		return bootstrapOrchestrator(ctx, bus, actBus, projectRoot, hydrated, googleGw)
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, bus)
+	registerOnDemandAgentCreators(reg, bus, googleGw, anthropicGw, openaiGw)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
 // These are created lazily by the ActivationController when the Guide routes to them.
-func registerOnDemandAgentCreators(reg *container.AgentCreatorRegistry, bus guide.EventBus) {
+func registerOnDemandAgentCreators(
+	reg *container.AgentCreatorRegistry,
+	bus guide.EventBus,
+	googleGw *gateway.ProviderGateway,
+	anthropicGw *gateway.ProviderGateway,
+	openaiGw *gateway.ProviderGateway,
+) {
 	// Librarian — codebase search specialist.
 	// Requires a SearchSystem at construction. Since Librarian's search backend
 	// is not yet initialized at bootstrap, the factory returns an error until
@@ -622,19 +769,59 @@ func registerOnDemandAgentCreators(reg *container.AgentCreatorRegistry, bus guid
 		return a, nil
 	})
 
-	// Inspector — code review, validation.
+	// Global Inspector — cross-file architectural quality auditor.
 	reg.Register("inspector", func(_ context.Context) (container.ContainerAgent, error) {
-		i, err := inspector.New(inspector.InspectorConfig{})
+		anthropicCfg := providers.AnthropicConfig{
+			BaseConfig: providers.BaseConfig{
+				Model:     "claude-opus-4-6",
+				MaxTokens: 16384,
+			},
+			AuthMode: resolveAnthropicAuthMode(),
+		}
+		provider, err := providers.NewAnthropicProvider(anthropicCfg)
+		if err != nil {
+			return nil, fmt.Errorf("global inspector provider: %w", err)
+		}
+		wrapped := anthropicGw.WrapProvider(provider, gateway.PriorityValidation)
+		gi, err := inspectorGlobal.New(inspectorShared.GlobalInspectorConfig{}, wrapped)
 		if err != nil {
 			return nil, err
 		}
-		if startErr := i.Start(bus); startErr != nil {
+		gi.SetProviderWrapper(anthropicGw.Wrapper(gateway.PriorityValidation))
+		if startErr := gi.Start(bus); startErr != nil {
 			return nil, startErr
 		}
-		return i, nil
+		return gi, nil
+	})
+
+	// Pipeline Inspector — per-task quality validation.
+	reg.Register("inspector-pipeline", func(_ context.Context) (container.ContainerAgent, error) {
+		anthropicCfg := providers.AnthropicConfig{
+			BaseConfig: providers.BaseConfig{
+				Model:     "claude-opus-4-6",
+				MaxTokens: 16384,
+			},
+			AuthMode: resolveAnthropicAuthMode(),
+		}
+		provider, err := providers.NewAnthropicProvider(anthropicCfg)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
+		}
+		wrapped := anthropicGw.WrapProvider(provider, gateway.PriorityValidation)
+		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{}, wrapped)
+		if err != nil {
+			return nil, err
+		}
+		if startErr := pi.Start(bus); startErr != nil {
+			return nil, startErr
+		}
+		return pi, nil
 	})
 
 	// Global Tester — cross-pipeline SDET.
+	// Provider creation is best-effort: when the OpenAI API key is missing the
+	// tester starts in degraded mode — static conversation replies still work,
+	// LLM-dependent paths return a clear error.
 	reg.Register("tester", func(_ context.Context) (container.ContainerAgent, error) {
 		openaiCfg := providers.OpenAIConfig{
 			BaseConfig: providers.BaseConfig{
@@ -644,14 +831,17 @@ func registerOnDemandAgentCreators(reg *container.AgentCreatorRegistry, bus guid
 			ReasoningEffort: "xhigh",
 			AuthMode:        "api_key",
 		}
-		provider, err := providers.NewOpenAIProvider(openaiCfg)
-		if err != nil {
-			return nil, fmt.Errorf("global tester provider: %w", err)
+		var wrapped providers.Provider
+		if provider, provErr := providers.NewOpenAIProvider(openaiCfg); provErr != nil {
+			slog.Warn("tester: OpenAI provider unavailable, LLM features disabled", "error", provErr)
+		} else {
+			wrapped = openaiGw.WrapProvider(provider, gateway.PriorityValidation)
 		}
-		gt, err := globaltester.New(shared.GlobalTesterConfig{}, provider)
+		gt, err := globaltester.New(shared.GlobalTesterConfig{}, wrapped)
 		if err != nil {
 			return nil, err
 		}
+		gt.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityValidation))
 		if startErr := gt.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -672,7 +862,8 @@ func registerOnDemandAgentCreators(reg *container.AgentCreatorRegistry, bus guid
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
-		pt, err := pipelinetester.New(shared.PipelineTesterConfig{}, provider)
+		wrapped := openaiGw.WrapProvider(provider, gateway.PriorityValidation)
+		pt, err := pipelinetester.New(shared.PipelineTesterConfig{}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -684,27 +875,91 @@ func registerOnDemandAgentCreators(reg *container.AgentCreatorRegistry, bus guid
 
 	// Engineer — code implementation.
 	reg.Register("engineer", func(_ context.Context) (container.ContainerAgent, error) {
-		e, err := engineer.New(engineer.Config{})
+		openaiCfg := providers.OpenAIConfig{
+			BaseConfig: providers.BaseConfig{
+				Model:     "gpt-5.3-codex",
+				MaxTokens: 16384,
+			},
+			ReasoningEffort: "xhigh",
+			AuthMode:        "api_key",
+		}
+		engProvider, engProvErr := providers.NewOpenAIProvider(openaiCfg)
+		if engProvErr != nil {
+			return nil, fmt.Errorf("engineer provider: %w", engProvErr)
+		}
+		wrapped := openaiGw.WrapProvider(engProvider, gateway.PriorityExecution)
+		e, err := engineer.New(engineer.Config{}, wrapped)
 		if err != nil {
 			return nil, err
 		}
+		e.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityExecution))
 		if startErr := e.Start(bus); startErr != nil {
 			return nil, startErr
 		}
 		return e, nil
 	})
 
-	// Designer — design implementation.
-	reg.Register("designer", func(_ context.Context) (container.ContainerAgent, error) {
-		d, err := designer.New(designer.Config{})
+	// Designer — LLM-driven design implementation via Gemini 3.1 Pro Preview.
+	reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
+		googleCfg := providers.DefaultGoogleConfig()
+		googleCfg.Model = string(providers.Gemini31Pro)
+		googleCfg.MaxTokens = 16384
+		provider, err := providers.NewGoogleProvider(ctx, googleCfg)
+		if err != nil {
+			return nil, fmt.Errorf("designer google provider: %w", err)
+		}
+		wrapped := googleGw.WrapProvider(provider, gateway.PriorityExecution)
+		d, err := designer.New(designer.Config{}, wrapped)
 		if err != nil {
 			return nil, err
 		}
+		d.SetProviderWrapper(googleGw.Wrapper(gateway.PriorityExecution))
 		if startErr := d.Start(bus); startErr != nil {
 			return nil, startErr
 		}
 		return d, nil
 	})
+}
+
+// =============================================================================
+// Probe Factory Holder
+// =============================================================================
+
+// probesPerContainer is the number of probes wired per container. Used by
+// quota derivation in place of len(spec.Probes) because probes are attached
+// by the ProbeFactory after spec mutation (not present at quota time).
+const probesPerContainer int64 = 2
+
+// probeFactoryHolder builds probe specs for containers. The Guide's
+// IsAgentReady callback is set after the Guide container is created,
+// breaking the circular dependency between probe construction and Guide.
+type probeFactoryHolder struct {
+	mu      sync.Mutex
+	isReady func(string) bool
+}
+
+// SetIsReady wires the Guide's readiness callback. Thread-safe.
+func (pf *probeFactoryHolder) SetIsReady(fn func(string) bool) {
+	pf.mu.Lock()
+	defer pf.mu.Unlock()
+	pf.isReady = fn
+}
+
+// Build constructs liveness and readiness probe specs for a container.
+// Always produces a liveness probe. Produces a readiness probe only when
+// the Guide's IsAgentReady callback has been wired.
+func (pf *probeFactoryHolder) Build(agent container.ContainerAgent, spec *container.ContainerSpec) []container.ProbeSpec {
+	probes := make([]container.ProbeSpec, 0, 2)
+	probes = append(probes, container.LivenessProbeSpec(agent, spec.GracefulStop))
+
+	pf.mu.Lock()
+	isReady := pf.isReady
+	pf.mu.Unlock()
+
+	if isReady != nil {
+		probes = append(probes, container.ReadinessProbeSpec(agent.AgentID(), isReady))
+	}
+	return probes
 }
 
 // =============================================================================
@@ -785,11 +1040,14 @@ func extractAgent[T container.ContainerAgent](reg *container.ContainerRegistry, 
 const asyncHookGoroutinesPerContainer int64 = 1
 
 // runtimeOverhead returns the goroutine overhead the container runtime adds
-// per container, derived from the container's spec:
+// per container:
 //   - 1 goroutine per probe (ProbeRunner.startProbeLoop in probe.go)
 //   - 1 goroutine for the async post-start hook (HookRunner.runHookAsync)
-func runtimeOverhead(spec container.ContainerSpec) int64 {
-	return int64(len(spec.Probes)) + asyncHookGoroutinesPerContainer
+//
+// Uses the constant probesPerContainer because the ProbeFactory attaches
+// probes after spec mutation — spec.Probes is empty at quota derivation time.
+func runtimeOverhead(_ container.ContainerSpec) int64 {
+	return probesPerContainer + asyncHookGoroutinesPerContainer
 }
 
 // quotaFromSpecs derives resource quota limits from the AgentSpecRegistry.
@@ -861,21 +1119,31 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 // =============================================================================
 
 // bootstrapLiveGuide creates and starts a Guide with Gemini classification.
-// If Gemini auth is unavailable, it falls back to a local rule-based classifier
-// so the UI can launch without interactive authorization.
-func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus) (*guide.Guide, error) {
+// When hydrated is non-nil, it reuses pre-resolved auth (skipping duplicate
+// OAuth + Code Assist setup). If Gemini auth is unavailable, it falls back to
+// a local rule-based classifier so the UI can launch without authorization.
+func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actBus *events.ActivityEventBus, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway) (*guide.Guide, error) {
 	googleCfg := defaultGuideGoogleConfig()
 	cfg := guide.Config{
 		Bus:          bus,
+		ActivityBus:  actBus,
 		AgentID:      "guide",
 		SessionID:    "default",
 		GoogleConfig: &googleCfg,
 	}
 
-	promptSkills := guide.DiscoverGuidePromptSkills()
-	provider, err := providers.NewGoogleProvider(ctx, googleCfg, promptSkills...)
+	promptSkills := guide.DiscoverGuidePromptSkills(guide.GuideGoSkills())
+
+	var provider *providers.GoogleProvider
+	var err error
+	if hydrated != nil {
+		provider, err = providers.NewGoogleProviderFromHydrated(ctx, googleCfg, hydrated, promptSkills...)
+	} else {
+		provider, err = providers.NewGoogleProvider(ctx, googleCfg, promptSkills...)
+	}
 	if err == nil && provider != nil {
-		g, newErr := guide.NewWithGeminiClient(provider, cfg)
+		wrapped := googleGw.WrapProvider(provider, gateway.PriorityUserInteractive)
+		g, newErr := guide.NewWithGeminiClient(wrapped, cfg)
 		if newErr != nil {
 			return nil, newErr
 		}
@@ -895,11 +1163,16 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus) (*guide.Guide, 
 	return g, nil
 }
 
-func bootstrapArchitect(bus guide.EventBus) (*architect.Architect, error) {
+func bootstrapArchitect(bus guide.EventBus, actBus *events.ActivityEventBus, projectRoot string, anthropicGw *gateway.ProviderGateway) (*architect.Architect, error) {
 	cfg := architect.Config{
 		EnableLLM:       true,
 		Model:           architect.DefaultArchitectModel,
 		AnthropicAPIKey: resolveArchitectAPIKey(),
+		FileAccess:      versioning.NewDiskFileAccess(projectRoot, true),
+		ActivityBus:     actBus,
+		PlannerProviderWrapper: func(p *providers.AnthropicProvider) architect.PlannerStreamProvider {
+			return anthropicGw.WrapProvider(p, gateway.PriorityPlanning)
+		},
 	}
 	a, err := architect.New(cfg)
 	if err != nil {
@@ -924,51 +1197,177 @@ func registerArchitectWithGuide(g *guide.Guide, a *architect.Architect) error {
 	if err := g.RegisterRouter(a); err != nil {
 		return err
 	}
-	g.MarkAgentReady("architect")
+	g.MarkAgentReady(a.GetRoutingInfo().ID)
 	return nil
 }
 
-func buildAuthRefreshHook(g *guide.Guide, arch *architect.Architect, orch *orchestrator.Orchestrator) func(ctx context.Context, provider, method string) error {
-	return func(ctx context.Context, provider, method string) error {
-		switch strings.ToLower(strings.TrimSpace(provider)) {
-		case "google":
-			refreshErr := g.RefreshAuthWithMethod(ctx, method)
-			refreshOrchestratorProvider(ctx, orch)
-			return refreshErr
-		case "anthropic":
-			if arch != nil {
-				arch.RefreshPlannerAuth()
+// registerAgentWithGuide registers any AgentRouter with the Guide and marks it ready.
+func registerAgentWithGuide(g *guide.Guide, router guide.AgentRouter, _ string) error {
+	if g == nil || router == nil {
+		return nil
+	}
+	if err := g.RegisterRouter(router); err != nil {
+		return err
+	}
+	// Use the agent's own routing ID (UUID) — Register() stores
+	// readyAgents keyed by info.ID, not by agentType.
+	g.MarkAgentReady(router.GetRoutingInfo().ID)
+	return nil
+}
+
+// buildAuthPublisher creates an AuthPublisher that broadcasts credential
+// changes over the event bus. DaemonSet agents (Guide, Orchestrator)
+// subscribe to this topic directly.
+func buildAuthPublisher(bus guide.EventBus) credentials.AuthPublisher {
+	return func(event credentials.AuthEvent) {
+		msg := guide.NewAuthChangedMessage("", guide.AuthEventPayload{
+			ProviderType: event.ProviderType,
+			AuthMethod:   event.AuthMethod,
+			Available:    event.Available,
+		})
+		_ = bus.Publish(guide.TopicAuthCredentials, msg)
+	}
+}
+
+// buildOnDemandAuthRefresher creates a publisher that walks the container
+// registry and refreshes on-demand agents matching the event's provider type.
+func buildOnDemandAuthRefresher(containerReg *container.ContainerRegistry) credentials.AuthPublisher {
+	return func(event credentials.AuthEvent) {
+		if !event.Available {
+			return
+		}
+		for _, c := range containerReg.All() {
+			agent := c.Agent()
+			refreshable, ok := agent.(container.AuthRefreshable)
+			if !ok || refreshable.ProviderType() != event.ProviderType {
+				continue
 			}
-			return nil
-		default:
-			return nil
+			if err := refreshable.RefreshProvider(context.Background()); err != nil {
+				slog.Warn("on-demand auth refresh failed",
+					"agent", c.ID(),
+					"provider", event.ProviderType,
+					"error", err)
+			}
 		}
 	}
+}
+
+// buildAuthProbe creates a probe function that checks whether credentials
+// are available for a given provider type using environment variables and
+// the secure credential store. Mirrors the resolution logic used by each
+// provider's hydration path.
+func buildAuthProbe() credentials.AuthProbe {
+	// Pre-resolve the credential manager so the closure can check the
+	// secure store (keychain / encrypted file) in addition to env vars.
+	var credManager *credentials.Manager
+	if dirs, dirErr := storage.ResolveDirs(); dirErr == nil && dirs != nil {
+		credManager, _ = credentials.NewManager(dirs, "default")
+	}
+
+	return func(providerType string) bool {
+		switch providerType {
+		case "google":
+			if os.Getenv("GEMINI_API_KEY") != "" || os.Getenv("GOOGLE_API_KEY") != "" {
+				return true
+			}
+			return probeSecureKey(credManager, "google")
+		case "anthropic":
+			return providers.ResolveAnthropicAPIKey("") != ""
+		case "openai":
+			if os.Getenv("OPENAI_API_KEY") != "" {
+				return true
+			}
+			return probeSecureKey(credManager, "openai")
+		default:
+			return false
+		}
+	}
+}
+
+// probeSecureKey checks the secure credential store for a stored API key.
+func probeSecureKey(mgr *credentials.Manager, provider string) bool {
+	if mgr == nil {
+		return false
+	}
+	key, err := mgr.GetAPIKey(provider)
+	return err == nil && key != ""
+}
+
+// chainPublishers combines multiple AuthPublishers into one.
+func chainPublishers(publishers ...credentials.AuthPublisher) credentials.AuthPublisher {
+	return func(event credentials.AuthEvent) {
+		for _, pub := range publishers {
+			pub(event)
+		}
+	}
+}
+
+func resolveAnthropicAuthMode() string {
+	if pref := credentials.LoadAuthPref("anthropic"); pref != "" {
+		return normalizeAuthPref(pref)
+	}
+	return providers.AnthropicAuthModeAPIKey
 }
 
 func defaultGuideGoogleConfig() providers.GoogleConfig {
 	cfg := providers.DefaultGoogleConfig()
 	cfg.Model = "gemini-3.1-pro-preview"
+	if pref := credentials.LoadAuthPref("google"); pref != "" {
+		cfg.AuthMode = normalizeAuthPref(pref)
+	}
 	return cfg
 }
 
 func defaultOrchestratorGoogleConfig() providers.GoogleConfig {
 	cfg := providers.DefaultGoogleConfig()
 	cfg.Model = "gemini-3-flash-preview"
+	if pref := credentials.LoadAuthPref("google"); pref != "" {
+		cfg.AuthMode = normalizeAuthPref(pref)
+	}
 	return cfg
 }
 
-func bootstrapOrchestrator(ctx context.Context, bus guide.EventBus, actBus *events.ActivityEventBus) (*orchestrator.Orchestrator, error) {
+// normalizeAuthPref maps login panel method labels to provider auth mode
+// constants. The login panel stores "apikey" (no underscore) but the
+// provider constants use "api_key" (with underscore).
+func normalizeAuthPref(pref string) string {
+	switch pref {
+	case "apikey":
+		return "api_key"
+	default:
+		return pref
+	}
+}
+
+func bootstrapOrchestrator(ctx context.Context, bus guide.EventBus, actBus *events.ActivityEventBus, projectRoot string, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway) (*orchestrator.Orchestrator, error) {
 	googleCfg := defaultOrchestratorGoogleConfig()
-	provider, provErr := providers.NewGoogleProvider(ctx, googleCfg)
+
+	// Best-effort provider creation. If Google auth isn't available yet,
+	// the orchestrator starts in LLM-ready mode and activates when the
+	// user authorizes later (via SetProvider from the auth refresh hook).
+	provider, provErr := resolveOrchestratorGoogleProvider(ctx, googleCfg, hydrated)
+	if provErr != nil {
+		slog.Warn("orchestrator google provider deferred — will activate on auth",
+			"error", provErr,
+			"auth_mode", googleCfg.AuthMode)
+	}
 
 	cfg := orchestrator.DefaultConfig()
-	cfg.EnableLLM = provErr == nil && provider != nil
-	if cfg.EnableLLM {
+	cfg.EnableLLM = true
+	if provErr == nil && provider != nil {
 		cfg.GoogleConfig = &googleCfg
 	}
 
-	orch, err := orchestrator.New(cfg, provider, actBus, nil)
+	sd := sylkdir.New(projectRoot)
+	if err := sd.Init(); err != nil {
+		return nil, fmt.Errorf("orchestrator sylkdir init: %w", err)
+	}
+
+	var orchProvider orchestrator.OrchestratorProvider
+	if provider != nil {
+		orchProvider = googleGw.WrapProvider(provider, gateway.PriorityUserInteractive)
+	}
+	orch, err := orchestrator.New(cfg, orchProvider, actBus, sd)
 	if err != nil {
 		return nil, err
 	}
@@ -978,6 +1377,40 @@ func bootstrapOrchestrator(ctx context.Context, bus guide.EventBus, actBus *even
 	return orch, nil
 }
 
+// resolveOrchestratorGoogleProvider creates the Google provider for the
+// orchestrator. Tries the hydrated auth first, then the configured auth mode,
+// then falls back to API key mode if the configured mode fails.
+func resolveOrchestratorGoogleProvider(ctx context.Context, cfg providers.GoogleConfig, hydrated *providers.HydratedGoogleAuth) (*providers.GoogleProvider, error) {
+	// Best case: shared hydrated auth from Phase 1.5.
+	if hydrated != nil {
+		provider, err := providers.NewGoogleProviderFromHydrated(ctx, cfg, hydrated)
+		if err == nil {
+			return provider, nil
+		}
+		slog.Debug("orchestrator hydrated provider failed, trying fresh", "error", err)
+	}
+
+	// Try the configured auth mode (typically OAuth).
+	provider, err := providers.NewGoogleProvider(ctx, cfg)
+	if err == nil {
+		return provider, nil
+	}
+
+	// If the configured mode was not API key, retry with API key mode.
+	// The user may have GEMINI_API_KEY or GOOGLE_API_KEY set.
+	if cfg.AuthMode != providers.GoogleAuthModeAPIKey {
+		apiKeyCfg := cfg
+		apiKeyCfg.AuthMode = providers.GoogleAuthModeAPIKey
+		provider, apiKeyErr := providers.NewGoogleProvider(ctx, apiKeyCfg)
+		if apiKeyErr == nil {
+			return provider, nil
+		}
+		// Return the original error — it's more informative.
+	}
+
+	return nil, err
+}
+
 func registerOrchestratorWithGuide(g *guide.Guide, orch *orchestrator.Orchestrator) error {
 	if g == nil || orch == nil {
 		return nil
@@ -985,20 +1418,21 @@ func registerOrchestratorWithGuide(g *guide.Guide, orch *orchestrator.Orchestrat
 	if err := g.RegisterRouter(orch); err != nil {
 		return err
 	}
-	g.MarkAgentReady("orchestrator")
+	g.MarkAgentReady(orch.GetRoutingInfo().ID)
 	return nil
 }
 
-func refreshOrchestratorProvider(ctx context.Context, orch *orchestrator.Orchestrator) {
+func refreshOrchestratorProvider(ctx context.Context, orch *orchestrator.Orchestrator, googleGw *gateway.ProviderGateway) {
 	if orch == nil {
 		return
 	}
 	googleCfg := defaultOrchestratorGoogleConfig()
-	provider, err := providers.NewGoogleProvider(ctx, googleCfg)
+	provider, err := resolveOrchestratorGoogleProvider(ctx, googleCfg, nil)
 	if err != nil || provider == nil {
+		slog.Warn("orchestrator provider refresh failed", "error", err)
 		return
 	}
-	orch.SetProvider(provider)
+	orch.SetProvider(googleGw.WrapProvider(provider, gateway.PriorityUserInteractive))
 }
 
 // =============================================================================

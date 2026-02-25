@@ -51,6 +51,7 @@ type StreamProgressMsg struct {
 	Current       int
 	Total         int
 	Message       string
+	Visibility    events.EventVisibility
 }
 
 // StreamCompleteMsg signals the end of an LLM response stream.
@@ -598,6 +599,29 @@ type PlanViewToggleMsg struct{}
 // Authentication
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pipeline & variant state
+// ---------------------------------------------------------------------------
+
+// PipelineStateMsg carries a pipeline state update for the agent panel.
+type PipelineStateMsg struct {
+	PipelineID string
+	TaskID     string
+	Status     string // TDD phase or lifecycle status.
+	WorkerType string // Agent type running the pipeline.
+	LoopCount  int
+	MaxLoops   int
+}
+
+// VariantStateMsg carries a variant state update for the agent panel.
+type VariantStateMsg struct {
+	VariantID  string
+	PipelineID string
+	Name       string
+	State      string // created, active, suspended, complete, failed, merging, merged, cancelled.
+	Message    string
+}
+
 // LoginResultMsg is sent when an auth flow completes (OAuth callback or API key save).
 type LoginResultMsg struct {
 	Provider string // "google", "openai", "anthropic"
@@ -605,4 +629,59 @@ type LoginResultMsg struct {
 	Success  bool
 	Error    string // Non-empty on failure.
 	FlowID   uint64 // OAuth flow identifier (0 for API-key auth).
+}
+
+// ---------------------------------------------------------------------------
+// Prompt queue
+// ---------------------------------------------------------------------------
+
+// QueueAdvanceMsg signals that the prompt queue should attempt to dispatch
+// the next pending entry. Sent as a deferred message after a stream
+// completes or fails, so advancement happens in a clean Update cycle.
+type QueueAdvanceMsg struct{}
+
+// ---------------------------------------------------------------------------
+// Tool call visualization
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Layer decision (DAG failure classification)
+// ---------------------------------------------------------------------------
+
+// LayerDecisionMsg is sent when a DAG layer encounters a blocking failure
+// and requires a user decision to proceed.
+type LayerDecisionMsg struct {
+	DAGID       string
+	LayerIdx    int
+	FailedNodes []LayerFailedNode
+}
+
+// LayerFailedNode describes a single failed node in a layer decision.
+type LayerFailedNode struct {
+	NodeID    string
+	NodeName  string
+	AgentType string
+	Error     string
+}
+
+// ---------------------------------------------------------------------------
+// Tool call visualization
+// ---------------------------------------------------------------------------
+
+// ToolCallEventMsg carries a tool call start or completion event for inline
+// display in the chat panel. Dispatched from the GuideBridge when it receives
+// a StreamEventToolCall stream event.
+type ToolCallEventMsg struct {
+	SessionID     string
+	CorrelationID string
+	AgentID       string
+	Phase         int           // 0 = start, 1 = complete.
+	ToolName      string
+	ArgsSummary   string
+	FullArgs      string        // Pretty-printed JSON (for expanded view).
+	Output        string        // Truncated result (for expanded view, max 512 chars).
+	ErrorMsg      string        // Error text on failure.
+	StartedAt     time.Time
+	Duration      time.Duration
+	Success       bool
 }

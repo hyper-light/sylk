@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // tryStaticOrchestratorReply returns a fast, deterministic response for trivial
@@ -39,12 +40,22 @@ func normalizeOrchestratorQuery(input string) string {
 
 func isOrchestratorGreetingQuery(query string) bool {
 	// Short greeting tokens only — don't match "hello, what's the status?"
-	tokens := strings.Fields(query)
+	// Tokenize by non-letter/non-number runes to strip punctuation
+	// (e.g. "howdy!" → "howdy"), matching the guide's tokenizer pattern.
+	tokens := tokenizeOrchestratorQuery(query)
 	if len(tokens) == 0 || len(tokens) > 3 {
 		return false
 	}
 	first := tokens[0]
 	return first == "hello" || first == "hi" || first == "hey" || first == "howdy" || first == "yo"
+}
+
+// tokenizeOrchestratorQuery splits on non-letter/non-number runes, stripping
+// punctuation from tokens. Matches the guide's tokenizeGuideQuery pattern.
+func tokenizeOrchestratorQuery(query string) []string {
+	return strings.FieldsFunc(query, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
 }
 
 func isOrchestratorStatusQuery(query string) bool {

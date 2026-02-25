@@ -24,6 +24,141 @@ import (
 	"google.golang.org/genai"
 )
 
+// GoogleQuotaClass distinguishes retryable rate limits from terminal quota exhaustion.
+type GoogleQuotaClass int
+
+const (
+	// GoogleQuotaRetryable indicates a per-minute or per-second rate limit that
+	// will reset after a short backoff window.
+	GoogleQuotaRetryable GoogleQuotaClass = iota
+
+	// GoogleQuotaTerminal indicates a daily or account-level quota that will not
+	// reset within a reasonable retry window (e.g. daily token limit).
+	GoogleQuotaTerminal
+)
+
+// GoogleQuotaInfo carries classification and server-suggested retry delay
+// extracted from a Google API error's structured details.
+type GoogleQuotaInfo struct {
+	Class      GoogleQuotaClass
+	RetryDelay time.Duration
+}
+
+// classifyGoogleQuota inspects the structured Details of a genai.APIError to
+// determine whether the quota error is retryable (per-minute) or terminal
+// (daily/account). This mirrors gemini-cli's classifyGoogleError logic.
+//
+// Classification priority:
+//  1. ErrorInfo with reason/domain on "googleapis.com" or "cloudcode"
+//  2. QuotaFailure violations with quotaId patterns
+//  3. RetryInfo retryDelay extraction
+//  4. Fallback: "retry in Xs" message parsing
+func classifyGoogleQuota(apiErr genai.APIError) *GoogleQuotaInfo {
+	if apiErr.Code != http.StatusTooManyRequests {
+		return nil
+	}
+
+	var (
+		info       GoogleQuotaInfo
+		hasReason  bool
+		hasQuotaID bool
+	)
+	info.Class = GoogleQuotaRetryable // default for 429
+
+	for _, detail := range apiErr.Details {
+		typeName, _ := detail["@type"].(string)
+		switch typeName {
+		case "type.googleapis.com/google.rpc.ErrorInfo":
+			reason, _ := detail["reason"].(string)
+			if reason != "" {
+				hasReason = true
+			}
+			if classifyGoogleErrorInfoReason(reason) == GoogleQuotaTerminal {
+				info.Class = GoogleQuotaTerminal
+			}
+
+		case "type.googleapis.com/google.rpc.RetryInfo":
+			if d := extractGoogleRetryInfoDelay(detail); d > 0 {
+				info.RetryDelay = d
+			}
+
+		case "type.googleapis.com/google.rpc.QuotaFailure":
+			violations, _ := detail["violations"].([]any)
+			for _, v := range violations {
+				vm, _ := v.(map[string]any)
+				quotaID, _ := vm["quotaId"].(string)
+				if quotaID == "" {
+					continue
+				}
+				hasQuotaID = true
+				if isGoogleDailyQuotaID(quotaID) {
+					info.Class = GoogleQuotaTerminal
+				} else if isGooglePerMinuteQuotaID(quotaID) && info.RetryDelay == 0 {
+					info.RetryDelay = 60 * time.Second
+				}
+			}
+		}
+	}
+
+	// Apply defaults when structured details didn't provide a delay.
+	if info.RetryDelay == 0 && info.Class == GoogleQuotaRetryable {
+		switch {
+		case hasReason:
+			info.RetryDelay = 10 * time.Second
+		case hasQuotaID:
+			// per-minute default already set above
+		default:
+			// Fallback: try "retry in Xs" from message text.
+			if d, ok := googleRetryAfterFromMessage(apiErr.Message); ok {
+				info.RetryDelay = d
+			}
+		}
+	}
+
+	return &info
+}
+
+// classifyGoogleErrorInfoReason maps ErrorInfo reason strings to quota class.
+func classifyGoogleErrorInfoReason(reason string) GoogleQuotaClass {
+	switch strings.ToUpper(strings.TrimSpace(reason)) {
+	case "QUOTA_EXHAUSTED":
+		return GoogleQuotaTerminal
+	case "RATE_LIMIT_EXCEEDED":
+		return GoogleQuotaRetryable
+	default:
+		return GoogleQuotaRetryable
+	}
+}
+
+// extractGoogleRetryInfoDelay parses the "retryDelay" field from a RetryInfo detail.
+func extractGoogleRetryInfoDelay(detail map[string]any) time.Duration {
+	raw, ok := detail["retryDelay"]
+	if !ok {
+		return 0
+	}
+	if d, ok := googleRetryAfterFromAny(raw); ok {
+		return d
+	}
+	return 0
+}
+
+// isGoogleDailyQuotaID returns true for quota IDs indicating a daily or
+// per-day limit (terminal — won't reset within retry window).
+func isGoogleDailyQuotaID(quotaID string) bool {
+	upper := strings.ToUpper(quotaID)
+	return strings.Contains(upper, "PERDAY") ||
+		strings.Contains(upper, "PER_DAY") ||
+		strings.Contains(upper, "DAILY")
+}
+
+// isGooglePerMinuteQuotaID returns true for quota IDs indicating a per-minute
+// limit (retryable — resets within ~60s).
+func isGooglePerMinuteQuotaID(quotaID string) bool {
+	upper := strings.ToUpper(quotaID)
+	return strings.Contains(upper, "PERMINUTE") ||
+		strings.Contains(upper, "PER_MINUTE")
+}
+
 // formatGoogleError extracts genai.APIError details if present and returns
 // a descriptive error. For non-API errors it falls back to err.Error().
 func formatGoogleError(errContext string, err error) error {
@@ -66,9 +201,25 @@ func buildGoogleProviderError(operation string, err error) error {
 		Underlying: err,
 		Retryable:  isGoogleRetryableStatus(apiErr.Code),
 	}
-	if retryAfter, ok := googleRetryAfter(apiErr); ok {
-		providerErr.RetryAfter = retryAfter
+
+	// Structured quota classification overrides the basic status-code check.
+	if quota := classifyGoogleQuota(apiErr); quota != nil {
+		if quota.Class == GoogleQuotaTerminal {
+			providerErr.Retryable = false
+		}
+		if quota.RetryDelay > 0 {
+			providerErr.RetryAfter = quota.RetryDelay
+		}
 	}
+
+	// Fall back to generic retry-after extraction when classification didn't
+	// provide a delay (non-429 errors, or 429 without structured details).
+	if providerErr.RetryAfter == 0 {
+		if retryAfter, ok := googleRetryAfter(apiErr); ok {
+			providerErr.RetryAfter = retryAfter
+		}
+	}
+
 	return providerErr
 }
 
@@ -86,18 +237,34 @@ func formatGoogleErrorDetails(details []map[string]any) string {
 }
 
 // isGoogleRetryable returns true for transient Google API errors: rate limits
-// (429) and server errors (5xx).
+// (429) and server errors (5xx). Terminal quota errors (daily limits) return false.
 func isGoogleRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
 	var providerErr *ProviderError
 	if errors.As(err, &providerErr) && providerErr.Provider == ProviderTypeGoogle {
-		return isGoogleRetryableStatus(providerErr.StatusCode)
+		return providerErr.Retryable
 	}
 	var apiErr genai.APIError
 	if errors.As(err, &apiErr) {
+		if quota := classifyGoogleQuota(apiErr); quota != nil && quota.Class == GoogleQuotaTerminal {
+			return false
+		}
 		return isGoogleRetryableStatus(apiErr.Code)
+	}
+	return false
+}
+
+// isGoogleRateLimitError reports whether err represents a Google 429 rate limit.
+func isGoogleRateLimitError(err error) bool {
+	var providerErr *ProviderError
+	if errors.As(err, &providerErr) && providerErr.Provider == ProviderTypeGoogle {
+		return providerErr.StatusCode == http.StatusTooManyRequests && providerErr.Retryable
+	}
+	var apiErr genai.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == http.StatusTooManyRequests
 	}
 	return false
 }
@@ -222,13 +389,14 @@ type GoogleOAuthLoginResult struct {
 type GoogleModel string
 
 const (
-	Gemini3Pro GoogleModel = "gemini-3-pro-preview"
+	Gemini31Pro  GoogleModel = "gemini-3.1-pro-preview"
+	Gemini3Flash GoogleModel = "gemini-3-flash-preview"
 )
 
 // Supported Google models
 var googleModels = map[string]bool{
-	// Gemini 3 family
-	"gemini-3-pro": true, // Google Gemini 3 Pro
+	"gemini-3.1-pro-preview": true, // Google Gemini 3.1 Pro Preview (1M context)
+	"gemini-3-flash-preview":         true, // Google Gemini 3 Flash (1M context)
 }
 
 const googleServiceAccountCredentialProvider = "google_service_account"
@@ -353,6 +521,96 @@ func forwardGoogleOAuthLoginResults(
 	}
 }
 
+// HydratedGoogleAuth carries the resolved auth service and config mutations
+// (ProjectID, UseCodeAssist, UseVertexAI) from a single OAuth + Code Assist
+// setup pass. Callers share this across multiple provider creations to avoid
+// duplicate auth hydration against the same quota window.
+type HydratedGoogleAuth struct {
+	AuthService   oauth.GoogleAuthService
+	ProjectID     string
+	UseCodeAssist bool
+	UseVertexAI   bool
+}
+
+// HydrateGoogleAuth performs OAuth resolution and Code Assist setup once,
+// returning the hydrated state for sharing across provider instances.
+func HydrateGoogleAuth(ctx context.Context, config GoogleConfig) (*HydratedGoogleAuth, error) {
+	authService := oauth.NewGoogleAuthService(oauth.GoogleAuthServiceConfig{})
+	applyGoogleProviderDefaults(&config)
+	if err := hydrateGoogleConfig(ctx, &config, authService); err != nil {
+		return nil, err
+	}
+	return &HydratedGoogleAuth{
+		AuthService:   authService,
+		ProjectID:     config.ProjectID,
+		UseCodeAssist: config.UseCodeAssist,
+		UseVertexAI:   config.UseVertexAI,
+	}, nil
+}
+
+// NewGoogleProviderFromHydrated creates a provider using pre-hydrated auth,
+// skipping the duplicate OAuth resolve + Code Assist setup.
+func NewGoogleProviderFromHydrated(
+	ctx context.Context,
+	config GoogleConfig,
+	hydrated *HydratedGoogleAuth,
+	skills ...skills.Skill,
+) (*GoogleProvider, error) {
+	if hydrated == nil {
+		return nil, fmt.Errorf("google provider: hydrated auth is nil")
+	}
+	googleTrace("provider_init", "from_hydrated_start", map[string]any{
+		"auth_mode":       strings.TrimSpace(config.AuthMode),
+		"model":           strings.TrimSpace(config.Model),
+		"hydrated_project": strings.TrimSpace(hydrated.ProjectID),
+		"hydrated_ca":     hydrated.UseCodeAssist,
+		"hydrated_vertex": hydrated.UseVertexAI,
+	})
+	applyGoogleProviderDefaults(&config)
+
+	// Apply hydrated fields only when the incoming config doesn't override.
+	if config.ProjectID == "" {
+		config.ProjectID = hydrated.ProjectID
+	}
+	if !config.UseCodeAssist {
+		config.UseCodeAssist = hydrated.UseCodeAssist
+	}
+	if !config.UseVertexAI {
+		config.UseVertexAI = hydrated.UseVertexAI
+	}
+
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+	clientConfig, err := buildGoogleClientConfig(config, hydrated.AuthService)
+	if err != nil {
+		return nil, err
+	}
+	client, err := genai.NewClient(ctx, clientConfig)
+	if err != nil {
+		return nil, fmt.Errorf("google provider: failed to create client: %w", err)
+	}
+	provider := &GoogleProvider{
+		client:      client,
+		config:      config,
+		skills:      skills,
+		authService: hydrated.AuthService,
+	}
+	if config.UseCodeAssist {
+		provider.codeAssistProject = config.ProjectID
+		provider.codeAssistHTTP = oauth.NewGoogleOAuthHTTPClient(hydrated.AuthService, newDefaultGoogleHTTPClient(config.Timeout))
+		googleTrace("provider_init", "from_hydrated_code_assist", map[string]any{
+			"project": config.ProjectID,
+		})
+	}
+	googleTrace("provider_init", "from_hydrated_success", map[string]any{
+		"model":           strings.TrimSpace(config.Model),
+		"use_vertex_ai":   config.UseVertexAI,
+		"use_code_assist": config.UseCodeAssist,
+	})
+	return provider, nil
+}
+
 func applyGoogleProviderDefaults(config *GoogleConfig) {
 	if config == nil {
 		return
@@ -396,7 +654,10 @@ func normalizeGoogleHydrationFields(config *GoogleConfig) {
 	config.AuthMode = strings.TrimSpace(config.AuthMode)
 	config.ProjectID = strings.TrimSpace(config.ProjectID)
 	config.Location = strings.TrimSpace(config.Location)
-	if config.AuthMode == "" {
+	switch config.AuthMode {
+	case "":
+		config.AuthMode = GoogleAuthModeAPIKey
+	case "apikey":
 		config.AuthMode = GoogleAuthModeAPIKey
 	}
 }
@@ -973,8 +1234,9 @@ func shouldRetryGoogleCall(ctx context.Context, err error, attempt int, maxAttem
 }
 
 func (g *GoogleProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
+	wrapped := retryAwareHandler(handler)
 	return retryGoogleStream(ctx, g.config.BaseConfig, func(ctx context.Context) error {
-		return g.streamWithHandlerOnce(ctx, req, handler)
+		return g.streamWithHandlerOnce(ctx, req, wrapped)
 	})
 }
 
@@ -1005,12 +1267,29 @@ func retryGoogleStream(ctx context.Context, cfg BaseConfig, fn func(context.Cont
 	return lastErr
 }
 
-// resolveGoogleMaxRetries returns a floor of 5 retries for Google providers
+const (
+	// googleRateLimitBaseDelay is the backoff base for 429 rate limits without
+	// a server-specified Retry-After. 5s matches gemini-cli and comfortably
+	// spans per-minute quota windows with exponential growth.
+	googleRateLimitBaseDelay = 5 * time.Second
+
+	// googleRateLimitMaxDelay caps rate-limit backoff at 2 minutes. With 5s
+	// base the sequence is 5s, 10s, 20s, 40s, 80s, 120s — covering ~275s
+	// total, which spans most per-minute quota reset windows.
+	googleRateLimitMaxDelay = 120 * time.Second
+
+	// googleMinRetries is the floor for Google provider retry attempts. With
+	// 5s base delay and 2-min cap, 8 retries cover ~5 minutes of backoff
+	// which comfortably spans most per-minute quota windows.
+	googleMinRetries = 8
+)
+
+// resolveGoogleMaxRetries returns a floor of googleMinRetries for Google providers
 // to handle quota resets that may require longer backoff sequences.
 func resolveGoogleMaxRetries(configured int) int {
 	resolved := resolveMaxRetries(configured)
-	if resolved < 5 {
-		return 5
+	if resolved < googleMinRetries {
+		return googleMinRetries
 	}
 	return resolved
 }
@@ -1020,6 +1299,9 @@ func googleRetryDelay(err error, attempt int, cfg BaseConfig) time.Duration {
 		// Server-specified delays (from quota reset info) are authoritative —
 		// respect them even when they exceed the configured max delay cap.
 		return retryAfter
+	}
+	if isGoogleRateLimitError(err) {
+		return retryDelay(attempt, googleRateLimitBaseDelay, googleRateLimitMaxDelay)
 	}
 	return retryDelay(attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 }
@@ -1192,7 +1474,8 @@ func (g *GoogleProvider) Complete(ctx context.Context, req *Request) (*Response,
 
 func (g *GoogleProvider) SupportedModels() []ModelInfo {
 	return []ModelInfo{
-		{ID: "gemini-3-pro", Name: "Gemini 3 Pro", MaxContext: 200000},
+		{ID: "gemini-3.1-pro-preview", Name: "Gemini 3.1 Pro Preview", MaxContext: 1_000_000},
+		{ID: "gemini-3-flash", Name: "Gemini 3 Flash", MaxContext: 1_000_000},
 	}
 }
 
@@ -1204,8 +1487,8 @@ func (g *GoogleProvider) CountTokens(messages []Message) (int, error) {
 	return count, nil
 }
 
-func (g *GoogleProvider) MaxContextTokens(model string) int {
-	return 200000
+func (g *GoogleProvider) MaxContextTokens(_ string) int {
+	return 1_000_000
 }
 
 func (g *GoogleProvider) HealthCheck(ctx context.Context) error {
@@ -1232,7 +1515,9 @@ func (g *GoogleProvider) buildGenerateConfig(req *Request) *genai.GenerateConten
 	if systemPrompt != "" {
 		systemParts = append(systemParts, genai.NewPartFromText(systemPrompt))
 	}
-	if len(g.skills) > 0 {
+	if len(g.skills) > 0 && len(req.Tools) == 0 {
+		// Only inject skill descriptions when native tool definitions are
+		// absent — prevents double-signaling that causes XML markup leakage.
 		systemParts = append(systemParts, genai.NewPartFromText(
 			skills.ToPrompt(g.skills),
 		))
@@ -1432,11 +1717,12 @@ func (g *GoogleProvider) convertMessages(messages []Message) []*genai.Content {
 		// Add tool results (function responses)
 		if msg.Role == RoleTool {
 			name := resolveGoogleFunctionResponseName(msg.ToolName, msg.ToolCallID)
+			responseMap := buildGoogleFunctionResponse(msg.Content, msg.IsError)
 			content.Parts = append(content.Parts, &genai.Part{
 				FunctionResponse: &genai.FunctionResponse{
 					ID:       msg.ToolCallID,
 					Name:     name,
-					Response: map[string]any{"result": msg.Content},
+					Response: responseMap,
 				},
 			})
 		}
@@ -1474,6 +1760,15 @@ type googleToolCallKey struct {
 // resolveGoogleFunctionResponseName returns the function name for a tool-result
 // message. Prefers the explicit ToolName; falls back to ToolCallID for backward
 // compatibility with callers that only set the ID.
+// buildGoogleFunctionResponse constructs the Response map for a FunctionResponse.
+// Google's API convention: use "output" for success, "error" for failure.
+func buildGoogleFunctionResponse(content string, isError bool) map[string]any {
+	if isError {
+		return map[string]any{"error": content}
+	}
+	return map[string]any{"result": content}
+}
+
 func resolveGoogleFunctionResponseName(toolName string, toolCallID string) string {
 	if name := strings.TrimSpace(toolName); name != "" {
 		return name

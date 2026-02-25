@@ -16,6 +16,12 @@ const (
 	CategoryNegative      = "negative"
 	CategoryEdgeCase      = "edge_case"
 	CategoryBoundary      = "boundary"
+
+	// Design-specific test categories.
+	CategoryAccessibility     = "accessibility"
+	CategoryTokenUsage        = "token_usage"
+	CategoryComponentAPI      = "component_api"
+	CategoryDesignConsistency = "design_consistency"
 )
 
 // RiskLevel classifies the severity of a risk area.
@@ -38,6 +44,12 @@ const (
 	RiskSecurity    RiskCategory = "security"
 	RiskLogic       RiskCategory = "logic"
 	RiskState       RiskCategory = "state"
+
+	// Design-specific risk categories.
+	RiskTokenMisuse       RiskCategory = "token_misuse"
+	RiskAccessibility     RiskCategory = "accessibility"
+	RiskComponentPattern  RiskCategory = "component_pattern"
+	RiskStyleInconsistency RiskCategory = "style_inconsistency"
 )
 
 // InspectorGate tracks Inspector completion before testing begins.

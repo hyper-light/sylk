@@ -84,6 +84,12 @@ func accumulateOrchestratorUsage(ctx context.Context, usage *providers.Usage) {
 }
 
 func (o *Orchestrator) publishStreamStart(ctx context.Context) {
+	metadata, ok := orchestratorStreamMetadataFromContext(ctx)
+	if ok {
+		o.logInfo("publishStreamStart",
+			"correlation_id", metadata.CorrelationID,
+			"source_agent", metadata.SourceAgentID)
+	}
 	o.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventStart,
 		Timestamp: time.Now(),
@@ -94,6 +100,9 @@ func (o *Orchestrator) publishStreamChunk(ctx context.Context, text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
+	o.logInfo("publishStreamChunk",
+		"text_len", len(text),
+		"text_prefix", truncateForLog(text, 80))
 	o.publishStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventData,
 		Text:      text,

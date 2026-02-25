@@ -53,6 +53,28 @@ func (r *AgentSpecRegistry) Descriptors() *handoff.DescriptorRegistry {
 	return r.descriptors
 }
 
+// fileAccessTypeByAgent maps specific agent types to their file access tier.
+// Agents not listed here derive their file access type from category:
+//   - Pipeline category → FileAccessVFS
+//   - All others → FileAccessDisk
+var fileAccessTypeByAgent = map[string]FileAccessType{
+	"inspector": FileAccessGlobal, // Global Inspector — per-session CVS
+	"tester":    FileAccessGlobal, // Global Tester — per-session CVS
+}
+
+// fileAccessForAgent derives the file access type for an agent. Specific
+// overrides (for global agents categorized as Standalone) take precedence
+// over category-based derivation.
+func fileAccessForAgent(agentType string, category handoff.AgentCategory) FileAccessType {
+	if fa, ok := fileAccessTypeByAgent[agentType]; ok {
+		return fa
+	}
+	if category == handoff.CategoryPipeline {
+		return FileAccessVFS
+	}
+	return FileAccessDisk
+}
+
 // SpecForAgent builds a ContainerSpec from the registered descriptor for agentType.
 // Returns an error if agentType is not found in the descriptor registry.
 func (r *AgentSpecRegistry) SpecForAgent(agentType string) (ContainerSpec, error) {
@@ -64,11 +86,12 @@ func (r *AgentSpecRegistry) SpecForAgent(agentType string) (ContainerSpec, error
 	goroutineLimit := goroutineLimitByCategory[desc.Category]
 
 	return ContainerSpec{
-		Name:          agentType,
-		AgentType:     desc.AgentType,
-		Role:          RoleMain,
-		RestartPolicy: restartPolicyByCategory[desc.Category],
-		GracefulStop:  gracefulStopDuration(desc.ContextWindow),
+		Name:           agentType,
+		AgentType:      desc.AgentType,
+		Role:           RoleMain,
+		RestartPolicy:  restartPolicyByCategory[desc.Category],
+		FileAccessType: fileAccessForAgent(agentType, desc.Category),
+		GracefulStop:   gracefulStopDuration(desc.ContextWindow),
 		Descriptor: AgentDescriptorRef{
 			AgentType:     desc.AgentType,
 			ModelID:       desc.ModelID,

@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/escalation"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
 func (e *Engineer) registerCoreSkills() {
+	// File operations
 	e.skills.Register(readFileSkill(e))
 	e.skills.Register(writeFileSkill(e))
 	e.skills.Register(editFileSkill(e))
@@ -24,11 +27,258 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(runTestsSkill(e))
 	e.skills.Register(globSkill(e))
 	e.skills.Register(grepSkill(e))
+
+	// Consultation skills
+	e.skills.Register(directConsultSkill(e, "consult_librarian", "librarian",
+		"Consult the Librarian for codebase patterns, existing implementations, and dependency information."))
+	e.skills.Register(directConsultSkill(e, "consult_archivalist", "archivalist",
+		"Consult the Archivalist for historical context on code decisions and past changes."))
+	e.skills.Register(directConsultSkill(e, "consult_academic", "academic",
+		"Consult the Academic for theoretical guidance, alternative approaches, and research-backed solutions."))
+
+	// Discovery skills
+	e.skills.Register(discoverProjectToolsSkill(e))
+	e.skills.Register(discoverCodePatternsSkill(e))
+
+	// Audit skills
+	e.skills.Register(auditImplementationSkill(e))
+	e.skills.Register(reviewCodeQualitySkill(e))
+
+	// Communication skills
+	e.skills.Register(signalOrchestratorSkill(e))
+
+	// Confidence / escalation
+	e.skills.Register(reportConfidenceSkill(e))
+
+	// Reroute
 	e.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "engineer",
 		SessionID: func() string { return e.config.SessionID },
 		Publish:   e.publishRerouteRequest,
 	}))
+}
+
+// =============================================================================
+// Consultation Skills (following architect directConsultSkill pattern)
+// =============================================================================
+
+type directConsultParams struct {
+	Query     string `json:"query"`
+	Scope     string `json:"scope"`
+	SessionID string `json:"session_id"`
+}
+
+func directConsultSkill(e *Engineer, name, target, description string) *skills.Skill {
+	return skills.NewSkill(name).
+		Description(description).
+		Domain("consultation").
+		Keywords("consult", target, "knowledge", "patterns", "history", "research").
+		Priority(90).
+		StringParam("query", "Consultation question", true).
+		StringParam("scope", "Scope for consultation", false).
+		StringParam("session_id", "Session identifier", false).
+		Usage(fmt.Sprintf("Use to gather evidence from the %s. Consultation is synchronous — you will receive the result before proceeding.", target)).
+		Example(`{"query": "What patterns exist for error handling in this codebase?", "scope": "backend"}`).
+		BestPractice("Consult before implementing, not after. Results are cached — do not re-consult the same agent for the same query.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params directConsultParams
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if params.Query == "" {
+				return nil, fmt.Errorf("query is required")
+			}
+			sessionID := params.SessionID
+			if sessionID == "" {
+				sessionID = e.config.SessionID
+			}
+			evidence, err := e.requestConsultation(ctx, target, params.Query, params.Scope, sessionID)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"target":  target,
+				"success": evidence.Success,
+				"data":    evidence.Data,
+			}, nil
+		}).
+		Build()
+}
+
+// =============================================================================
+// Audit Skills
+// =============================================================================
+
+func auditImplementationSkill(e *Engineer) *skills.Skill {
+	return skills.NewSkill("audit_implementation").
+		Description("Self-audit the current implementation for quality issues. Returns a structured verdict with quality score and issues.").
+		Domain("quality").
+		Keywords("audit", "review", "quality", "check", "validate").
+		Priority(85).
+		StringParam("implementation", "The implementation output to audit", true).
+		StringParam("criteria", "Acceptance criteria to audit against", false).
+		Usage("Call after completing implementation to self-review. If audit fails, fix issues and re-audit.").
+		BestPractice("Always audit before reporting completion. If audit fails, fix issues and re-audit.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Implementation string `json:"implementation"`
+				Criteria       string `json:"criteria"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if params.Implementation == "" {
+				return nil, fmt.Errorf("implementation is required")
+			}
+			verdict, err := e.selfAudit(ctx, params.Implementation, params.Criteria)
+			if err != nil {
+				return nil, err
+			}
+			return verdict, nil
+		}).
+		Build()
+}
+
+func reviewCodeQualitySkill(e *Engineer) *skills.Skill {
+	return skills.NewSkill("review_code_quality").
+		Description("Review code against readability, correctness, performance, and maintainability standards.").
+		Domain("quality").
+		Keywords("review", "quality", "standards", "code", "check").
+		Priority(80).
+		StringParam("code", "Code to review", true).
+		StringParam("standards", "Specific standards to check against", false).
+		Usage("Use to check code against project quality standards before finalizing.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Code      string `json:"code"`
+				Standards string `json:"standards"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if params.Code == "" {
+				return nil, fmt.Errorf("code is required")
+			}
+			verdict, err := e.selfAudit(ctx, params.Code, params.Standards)
+			if err != nil {
+				return nil, err
+			}
+			return verdict, nil
+		}).
+		Build()
+}
+
+// =============================================================================
+// Communication Skills
+// =============================================================================
+
+func signalOrchestratorSkill(e *Engineer) *skills.Skill {
+	return skills.NewSkill("signal_orchestrator").
+		Description("Signal the Orchestrator with progress, questions, or blocks.").
+		Domain("communication").
+		Keywords("signal", "orchestrator", "progress", "question", "block", "stuck").
+		Priority(75).
+		StringParam("signal_type", "Type of signal: progress, question, blocked, completed, failed", true).
+		StringParam("message", "Signal message content", true).
+		StringParam("task_id", "Task identifier", false).
+		Usage("Use when you need to communicate with the Orchestrator about task progress or issues.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				SignalType string `json:"signal_type"`
+				Message    string `json:"message"`
+				TaskID     string `json:"task_id"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if params.SignalType == "" || params.Message == "" {
+				return nil, fmt.Errorf("signal_type and message are required")
+			}
+			if e.bus == nil || !e.running {
+				return nil, fmt.Errorf("engineer bus is unavailable")
+			}
+			routeReq := &guide.RouteRequest{
+				Input:         fmt.Sprintf("[%s] %s", params.SignalType, params.Message),
+				TargetAgentID: "orchestrator",
+				FireAndForget: true,
+				SessionID:     e.config.SessionID,
+			}
+			if err := e.PublishRequest(routeReq); err != nil {
+				return nil, err
+			}
+			return map[string]any{"signaled": true, "type": params.SignalType}, nil
+		}).
+		Build()
+}
+
+func reportConfidenceSkill(e *Engineer) *skills.Skill {
+	return skills.NewSkill("report_confidence").
+		Description("Report a multi-dimensional numeric confidence assessment for the current task. Returns composite score, category, and escalation target if warranted.").
+		Domain("quality").
+		Keywords("confidence", "quality", "assessment", "escalate", "score").
+		Priority(95).
+		FloatParam("correctness", "Functional correctness score [0.0, 1.0]", true).
+		FloatParam("completeness", "Completeness score — all requirements addressed [0.0, 1.0]", true).
+		FloatParam("quality", "Code quality score [0.0, 1.0]", true).
+		FloatParam("integration", "Integration score — fits cleanly in codebase [0.0, 1.0]", true).
+		StringParam("reasoning", "Explanation of scores and rationale", true).
+		StringParam("task_id", "Task identifier", false).
+		Usage("Call to report your confidence that the implementation is correct and complete. Scores are numeric [0,1] per dimension. Composite is the weighted geometric mean — a single low dimension tanks the composite. If below threshold, escalation is triggered.").
+		Example(`{"correctness": 0.9, "completeness": 0.8, "quality": 0.85, "integration": 0.7, "reasoning": "All tests pass, but integration with existing error handler is uncertain."}`).
+		BestPractice("Report confidence after every implementation pass. Use honestly — inflated scores lead to silent defects. Low integration score triggers design review.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Correctness  float64 `json:"correctness"`
+				Completeness float64 `json:"completeness"`
+				Quality      float64 `json:"quality"`
+				Integration  float64 `json:"integration"`
+				Reasoning    string  `json:"reasoning"`
+				TaskID       string  `json:"task_id"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if params.Reasoning == "" {
+				return nil, fmt.Errorf("reasoning is required")
+			}
+
+			conf := escalation.NewConfidenceLevel(e.id, "engineer", params.TaskID)
+			conf.Correctness = params.Correctness
+			conf.Completeness = params.Completeness
+			conf.Quality = params.Quality
+			conf.Integration = params.Integration
+			conf.Reasoning = params.Reasoning
+
+			composite := conf.Composite(escalation.DefaultWeights())
+			category := escalation.CategorizeConfidence(composite)
+
+			result := map[string]any{
+				"composite": composite,
+				"category":  category.String(),
+				"dimensions": map[string]float64{
+					"correctness":  params.Correctness,
+					"completeness": params.Completeness,
+					"quality":      params.Quality,
+					"integration":  params.Integration,
+				},
+			}
+
+			// Evaluate escalation via the escalation system
+			if e.escalator != nil {
+				target, warranted := e.escalator.ReportConfidence(conf, handoff.CategoryPipeline, 0)
+				if warranted && target != nil {
+					result["escalation"] = map[string]any{
+						"warranted":        true,
+						"target_agent":     target.TargetAgent,
+						"reason":           target.Reason.String(),
+						"suggested_action": target.SuggestedAction.String(),
+					}
+				}
+			}
+
+			return result, nil
+		}).
+		Build()
 }
 
 func (e *Engineer) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
@@ -77,7 +327,13 @@ func readFileSkill(e *Engineer) *skills.Skill {
 
 			fullPath := resolvePath(e.config.EngineerConfig.WorkingDirectory, params.Path)
 
-			content, err := os.ReadFile(fullPath)
+			var content []byte
+			var err error
+			if e.fileAccess != nil {
+				content, err = e.fileAccess.ReadFile(ctx, params.Path)
+			} else {
+				content, err = os.ReadFile(fullPath)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
@@ -166,14 +422,26 @@ func writeFileSkill(e *Engineer) *skills.Skill {
 			}
 
 			// Check if file exists for action type
-			_, err := os.Stat(fullPath)
 			action := FileActionCreate
-			if err == nil {
-				action = FileActionModify
+			if e.fileAccess != nil {
+				exists, _ := e.fileAccess.Exists(ctx, params.Path)
+				if exists {
+					action = FileActionModify
+				}
+			} else {
+				if _, statErr := os.Stat(fullPath); statErr == nil {
+					action = FileActionModify
+				}
 			}
 
-			if err := os.WriteFile(fullPath, []byte(params.Content), 0644); err != nil {
-				return nil, fmt.Errorf("failed to write file: %w", err)
+			var writeErr error
+			if e.fileAccess != nil {
+				writeErr = e.fileAccess.WriteFile(ctx, params.Path, []byte(params.Content))
+			} else {
+				writeErr = os.WriteFile(fullPath, []byte(params.Content), 0644)
+			}
+			if writeErr != nil {
+				return nil, fmt.Errorf("failed to write file: %w", writeErr)
 			}
 
 			lines := strings.Split(params.Content, "\n")
@@ -231,7 +499,13 @@ func editFileSkill(e *Engineer) *skills.Skill {
 
 			fullPath := resolvePath(e.config.EngineerConfig.WorkingDirectory, params.Path)
 
-			content, err := os.ReadFile(fullPath)
+			var content []byte
+			var err error
+			if e.fileAccess != nil {
+				content, err = e.fileAccess.ReadFile(ctx, params.Path)
+			} else {
+				content, err = os.ReadFile(fullPath)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
@@ -253,8 +527,14 @@ func editFileSkill(e *Engineer) *skills.Skill {
 				editsApplied++
 			}
 
-			if err := os.WriteFile(fullPath, []byte(modifiedContent), 0644); err != nil {
-				return nil, fmt.Errorf("failed to write file: %w", err)
+			var writeErr error
+			if e.fileAccess != nil {
+				writeErr = e.fileAccess.WriteFile(ctx, params.Path, []byte(modifiedContent))
+			} else {
+				writeErr = os.WriteFile(fullPath, []byte(modifiedContent), 0644)
+			}
+			if writeErr != nil {
+				return nil, fmt.Errorf("failed to write file: %w", writeErr)
 			}
 
 			// Calculate diff stats
@@ -512,7 +792,13 @@ func globSkill(e *Engineer) *skills.Skill {
 				workDir = "."
 			}
 
-			matches, err := findFilesGlob(workDir, params.Pattern, params.Exclude)
+			var matches []string
+			var err error
+			if e.fileAccess != nil {
+				matches, err = e.fileAccess.Glob(ctx, workDir, params.Pattern, params.Exclude)
+			} else {
+				matches, err = findFilesGlob(workDir, params.Pattern, params.Exclude)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("glob failed: %w", err)
 			}
@@ -650,16 +936,29 @@ func grepSkill(e *Engineer) *skills.Skill {
 				maxMatches = 100
 			}
 
-			matches, err := searchFiles(searchPath, regex, params.Include, params.ContextLines, maxMatches)
-			if err != nil {
-				return nil, fmt.Errorf("search failed: %w", err)
+			var matches any
+			var matchCount int
+			if e.fileAccess != nil {
+				faMatches, faErr := e.fileAccess.Grep(ctx, searchPath, params.Pattern, params.Include, params.ContextLines, maxMatches)
+				if faErr != nil {
+					return nil, fmt.Errorf("search failed: %w", faErr)
+				}
+				matches = faMatches
+				matchCount = len(faMatches)
+			} else {
+				localMatches, localErr := searchFiles(searchPath, regex, params.Include, params.ContextLines, maxMatches)
+				if localErr != nil {
+					return nil, fmt.Errorf("search failed: %w", localErr)
+				}
+				matches = localMatches
+				matchCount = len(localMatches)
 			}
 
 			return map[string]any{
 				"pattern":   params.Pattern,
 				"matches":   matches,
-				"count":     len(matches),
-				"truncated": len(matches) >= maxMatches,
+				"count":     matchCount,
+				"truncated": matchCount >= maxMatches,
 			}, nil
 		}).
 		Build()

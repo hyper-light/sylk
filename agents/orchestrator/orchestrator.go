@@ -4,20 +4,31 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
 	"github.com/google/uuid"
 )
+
+// OrchestratorProvider is the minimal LLM interface required by the Orchestrator.
+// Satisfied by *providers.GoogleProvider and *gateway.GatewayProvider.
+type OrchestratorProvider interface {
+	Complete(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error)
+}
 
 // Orchestrator is a read-only workflow observer and coordinator.
 // Identity: Gemini 3 Flash — observational nervous system
@@ -43,8 +54,8 @@ type Orchestrator struct {
 	knownAgents map[string]*guide.AgentAnnouncement
 
 	// LLM integration
-	provider  *providers.GoogleProvider // Gemini Flash provider (nil = fallback mode)
-	eventCh   chan *busEvent            // buffered channel for LLM event loop
+	provider  OrchestratorProvider // Gemini Flash provider (nil = fallback mode)
+	eventCh   chan *busEvent       // buffered channel for LLM event loop
 	bootGate  *bootstrapGate           // signal-based readiness gate for LLM loop
 	llmCtx    context.Context
 	llmCancel context.CancelFunc
@@ -70,7 +81,36 @@ type Orchestrator struct {
 	// Task router for DAG→container dispatch
 	taskRouter *TaskRouter
 
+	// Per-session VFS infrastructure (maps sessionID → SessionVFS).
+	sessionVFS   map[string]*versioning.SessionVFS
+	sessionVFSMu sync.RWMutex
+
+	// Auth credential change subscription.
+	authSub guide.Subscription
+
+	// refreshProvider re-resolves the Google provider on auth changes.
+	// Set via SetProviderRefresher from bootstrap.
+	refreshProvider func(ctx context.Context)
+
+	// File-backed WAL logger for debug tracing (visible via tail).
+	logger *slog.Logger
+	logWAL io.Closer
+
 	mu sync.RWMutex
+}
+
+// logInfo logs at Info level, safe to call when o.logger is nil.
+func (o *Orchestrator) logInfo(msg string, args ...any) {
+	if o != nil && o.logger != nil {
+		o.logger.Info(msg, args...)
+	}
+}
+
+// logWarnMsg logs at Warn level, safe to call when o.logger is nil.
+func (o *Orchestrator) logWarnMsg(msg string, args ...any) {
+	if o != nil && o.logger != nil {
+		o.logger.Warn(msg, args...)
+	}
 }
 
 // New creates a new Orchestrator agent. The optional GoogleProvider enables
@@ -78,8 +118,13 @@ type Orchestrator struct {
 // fallback mode (critical events auto-escalate without model involvement).
 // The optional ActivityEventBus enables UI agent panel visibility.
 // The optional SylkDir enables persistent storage (WAL, SQLite, BufferRegistry).
-func New(cfg Config, provider *providers.GoogleProvider, activityBus *events.ActivityEventBus, sd *sylkdir.SylkDir) (*Orchestrator, error) {
+func New(cfg Config, provider OrchestratorProvider, activityBus *events.ActivityEventBus, sd *sylkdir.SylkDir) (*Orchestrator, error) {
 	cfg = applyConfigDefaults(cfg)
+
+	logger, logCloser, logErr := agentlog.NewWALLogger("orchestrator")
+	if logErr != nil {
+		slog.Warn("orchestrator: WAL logger unavailable, debug tracing disabled", "error", logErr)
+	}
 
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
@@ -96,10 +141,15 @@ func New(cfg Config, provider *providers.GoogleProvider, activityBus *events.Act
 		hooks:       hookRegistry,
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		activityBus: activityBus,
+		sessionVFS:  make(map[string]*versioning.SessionVFS),
+		logger:      logger,
+		logWAL:      logCloser,
 	}
 
-	if provider != nil && cfg.EnableLLM {
+	if provider != nil {
 		o.provider = provider
+	}
+	if cfg.EnableLLM {
 		o.eventCh = make(chan *busEvent, llmEventBufferSize)
 		o.bootGate = newBootstrapGate(cfg.BootstrapSafetyDeadline)
 	}
@@ -180,11 +230,57 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityBu
 	return nil
 }
 
-// SetProvider hot-swaps the Google provider (used for auth refresh).
-func (o *Orchestrator) SetProvider(provider *providers.GoogleProvider) {
+// SetProvider hot-swaps the LLM provider. When called after Start with a
+// non-nil provider and the LLM event loop has not yet started, the loop
+// is started lazily. This supports deferred authorization — the user may
+// configure Google credentials after the orchestrator is already running.
+func (o *Orchestrator) SetProvider(provider OrchestratorProvider) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.provider = provider
+
+	// Start the LLM event loop lazily when a provider arrives post-Start.
+	if provider != nil && o.running && o.llmCtx == nil && o.eventCh != nil {
+		o.llmCtx, o.llmCancel = context.WithCancel(context.Background())
+		o.llmWg.Add(1)
+		go func() {
+			defer o.llmWg.Done()
+			o.runLLMLoop(o.llmCtx)
+		}()
+		if o.bootGate != nil {
+			o.bootGate.SignalReady()
+		}
+		o.publishActivity(events.EventTypeSuccess, "LLM provider activated (deferred auth)")
+	}
+}
+
+// SetProviderRefresher registers a callback that re-resolves the Google
+// provider from credentials. Called from bootstrap to wire the
+// orchestrator into the auth refresh flow.
+func (o *Orchestrator) SetProviderRefresher(fn func(ctx context.Context)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.refreshProvider = fn
+}
+
+// handleAuthChanged processes credential change events from the bus.
+// Only reacts to "google" provider changes.
+func (o *Orchestrator) handleAuthChanged(msg *guide.Message) error {
+	ev, ok := msg.GetAuthEvent()
+	if !ok || ev == nil {
+		return nil
+	}
+	if ev.ProviderType != "google" || !ev.Available {
+		return nil
+	}
+	o.mu.RLock()
+	refreshFn := o.refreshProvider
+	o.mu.RUnlock()
+
+	if refreshFn != nil {
+		refreshFn(context.Background())
+	}
+	return nil
 }
 
 // SetTaskRouter attaches the task router for DAG→container dispatch.
@@ -193,6 +289,44 @@ func (o *Orchestrator) SetTaskRouter(router *TaskRouter) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.taskRouter = router
+}
+
+// SetActivator installs the on-demand agent activator, threading it to the
+// DAG bridge so BusNodeDispatchers can activate cold agents before dispatch.
+func (o *Orchestrator) SetActivator(a guide.AgentActivator) {
+	if o.dagBridge != nil {
+		o.dagBridge.SetActivator(a)
+	}
+}
+
+// SetSessionVFS associates a SessionVFS with the given session. Called when
+// the Orchestrator creates a new session's CVS infrastructure.
+func (o *Orchestrator) SetSessionVFS(sessionID string, svfs *versioning.SessionVFS) {
+	o.sessionVFSMu.Lock()
+	defer o.sessionVFSMu.Unlock()
+	o.sessionVFS[sessionID] = svfs
+}
+
+// GetSessionVFS returns the SessionVFS for the given session, or nil.
+func (o *Orchestrator) GetSessionVFS(sessionID string) *versioning.SessionVFS {
+	o.sessionVFSMu.RLock()
+	defer o.sessionVFSMu.RUnlock()
+	return o.sessionVFS[sessionID]
+}
+
+// CloseSessionVFS tears down the VFS infrastructure for a session.
+func (o *Orchestrator) CloseSessionVFS(sessionID string) error {
+	o.sessionVFSMu.Lock()
+	svfs, ok := o.sessionVFS[sessionID]
+	if ok {
+		delete(o.sessionVFS, sessionID)
+	}
+	o.sessionVFSMu.Unlock()
+
+	if !ok || svfs == nil {
+		return nil
+	}
+	return svfs.Close()
 }
 
 // SignalReady marks bootstrap as complete, unblocking the LLM event loop.
@@ -272,6 +406,16 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 	}
 
 	o.subscribeToTaskEvents()
+
+	// Subscribe to credential changes so the Orchestrator refreshes its own
+	// Google provider when the user authenticates.
+	authSub, authErr := bus.SubscribeAsync(guide.TopicAuthCredentials, o.handleAuthChanged)
+	if authErr != nil {
+		slog.Warn("orchestrator: failed to subscribe to auth credentials topic", "error", authErr)
+	} else {
+		o.authSub = authSub
+	}
+
 	o.healthMonitor.Start(context.Background())
 
 	if o.provider != nil && o.eventCh != nil {
@@ -378,6 +522,10 @@ func (o *Orchestrator) Stop() error {
 	errs := o.unsubscribeAll()
 	o.mu.Unlock()
 
+	if o.logWAL != nil {
+		o.logWAL.Close()
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("errors during stop: %v", errs)
 	}
@@ -401,17 +549,34 @@ func (o *Orchestrator) unsubscribeAll() []error {
 			errs = append(errs, err)
 		}
 	}
+	if o.authSub != nil {
+		if err := o.authSub.Unsubscribe(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return errs
 }
 
 // Handle processes workflow coordination requests
 func (o *Orchestrator) Handle(ctx context.Context, req *guide.ForwardedRequest) (any, error) {
+	o.publishActivity(events.EventTypeAgentAction, "Processing request...")
+	o.logInfo("Handle: entry",
+		"intent", string(req.Intent),
+		"correlation_id", req.CorrelationID,
+		"input_prefix", truncateForLog(req.Input, 120))
+
 	// Detect structured plan handoff payloads from the architect.
 	// On match, ingest mechanically then route through the conversation
 	// pipeline so the LLM produces a natural language acknowledgment.
 	if result, ok := o.tryIngestPlanFromInput(ctx, req.Input); ok {
+		o.publishActivity(events.EventTypeAgentAction, "Ingesting execution plan...")
+		o.logInfo("Handle: plan ingested, generating response",
+			"correlation_id", req.CorrelationID)
 		return o.respondToIngestion(ctx, req, result)
 	}
+
+	o.logInfo("Handle: routing by intent",
+		"intent", string(req.Intent))
 
 	switch req.Intent {
 	case guide.IntentStatus:
@@ -427,63 +592,59 @@ func (o *Orchestrator) Handle(ctx context.Context, req *guide.ForwardedRequest) 
 
 func (o *Orchestrator) handleStatusQuery(ctx context.Context, req *guide.ForwardedRequest) (any, error) {
 	o.mu.RLock()
-	defer o.mu.RUnlock()
+	text := o.formatStatusText(req)
+	o.mu.RUnlock()
 
+	o.publishStreamChunk(ctx, text)
+	return &ConversationResult{Response: text, Intent: "status"}, nil
+}
+
+// formatStatusText produces human-readable text for the requested status
+// domain. Must be called under o.mu.RLock().
+func (o *Orchestrator) formatStatusText(req *guide.ForwardedRequest) string {
 	switch req.Domain {
 	case guide.DomainTasks:
-		return o.getTaskStatus(req.Entities)
+		if req.Entities == nil || req.Entities.Query == "" {
+			return formatTasksAsText(o.state.Tasks)
+		}
+		task, ok := o.state.Tasks[req.Entities.Query]
+		if !ok {
+			return fmt.Sprintf("Task not found: %s", req.Entities.Query)
+		}
+		return formatSingleTaskAsText(task)
+
 	case "workflow", "workflows":
-		return o.getWorkflowStatus(req.Entities)
+		if req.Entities == nil || req.Entities.Query == "" {
+			return formatWorkflowsAsText(o.state.Workflows)
+		}
+		wf, ok := o.state.Workflows[req.Entities.Query]
+		if !ok {
+			return fmt.Sprintf("Workflow not found: %s", req.Entities.Query)
+		}
+		return formatSingleWorkflowAsText(wf)
+
 	default:
-		return o.GetSummary(ctx)
+		return o.generateOverview()
 	}
 }
 
 func (o *Orchestrator) handleRecallQuery(ctx context.Context, req *guide.ForwardedRequest) (any, error) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-
 	if req.Domain == guide.DomainFailures {
-		return o.queryFailurePatterns(ctx, req.Entities)
+		patterns, err := o.queryFailurePatterns(ctx, req.Entities)
+		if err != nil {
+			return nil, err
+		}
+		text := formatFailurePatternsAsText(patterns)
+		o.publishStreamChunk(ctx, text)
+		return &ConversationResult{Response: text, Intent: "recall"}, nil
 	}
 
-	return o.state, nil
-}
+	o.mu.RLock()
+	text := formatStateOverviewAsText(o.state)
+	o.mu.RUnlock()
 
-func (o *Orchestrator) handleHelpQuery(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
-	return map[string]any{
-		"agent":              "orchestrator",
-		"description":        "Workflow observer and coordinator for task and workflow state.",
-		"supported_intents":  []guide.Intent{guide.IntentStatus, guide.IntentRecall, guide.IntentHelp, guide.IntentChat},
-		"supported_domains":  []guide.Domain{guide.DomainTasks, "workflow", "health"},
-		"recommended_routes": []string{"@orchestrator:status:tasks", "@orchestrator:status:workflow", "@orchestrator:recall:failures", "@orchestrator:chat"},
-	}, nil
-}
-
-func (o *Orchestrator) getTaskStatus(entities *guide.ExtractedEntities) (any, error) {
-	if entities == nil || entities.Query == "" {
-		return o.state.Tasks, nil
-	}
-
-	taskID := entities.Query
-	task, ok := o.state.Tasks[taskID]
-	if !ok {
-		return nil, fmt.Errorf("task not found: %s", taskID)
-	}
-	return task, nil
-}
-
-func (o *Orchestrator) getWorkflowStatus(entities *guide.ExtractedEntities) (any, error) {
-	if entities == nil || entities.Query == "" {
-		return o.state.Workflows, nil
-	}
-
-	workflowID := entities.Query
-	workflow, ok := o.state.Workflows[workflowID]
-	if !ok {
-		return nil, fmt.Errorf("workflow not found: %s", workflowID)
-	}
-	return workflow, nil
+	o.publishStreamChunk(ctx, text)
+	return &ConversationResult{Response: text, Intent: "recall"}, nil
 }
 
 func (o *Orchestrator) queryFailurePatterns(ctx context.Context, entities *guide.ExtractedEntities) ([]FailurePattern, error) {
@@ -508,16 +669,35 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	ctx := context.Background()
 	startTime := time.Now()
 
+	o.logInfo("handleBusRequest: received",
+		"correlation_id", fwd.CorrelationID,
+		"source_agent", fwd.SourceAgentID,
+		"intent", string(fwd.Intent),
+		"fire_and_forget", fwd.FireAndForget,
+		"input_len", len(fwd.Input))
+
 	// Always set up stream context — the Guide may promote IntentChat to
 	// IntentHelp, so we cannot predicate streaming on the incoming intent.
 	// This mirrors the architect's handleForwardBusRequest pattern.
 	ctx = withOrchestratorStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx, usageAcc := withOrchestratorUsageAccumulator(ctx)
+
+	toolEmitter := shared.NewToolCallEmitter(o.bus, o.channels, "orchestrator", fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = shared.WithToolCallEmitter(ctx, toolEmitter)
+
 	if !fwd.FireAndForget {
+		o.logInfo("handleBusRequest: publishing StreamStart",
+			"correlation_id", fwd.CorrelationID)
 		o.publishStreamStart(ctx)
 	}
 
 	result, err := o.Handle(ctx, fwd)
+
+	o.logInfo("handleBusRequest: Handle returned",
+		"correlation_id", fwd.CorrelationID,
+		"has_result", result != nil,
+		"has_error", err != nil,
+		"duration", time.Since(startTime))
 
 	if fwd.FireAndForget {
 		return nil
@@ -526,7 +706,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   o.config.AgentID,
+		RespondingAgentID:   "orchestrator",
 		RespondingAgentName: "orchestrator",
 		ProcessingTime:      time.Since(startTime),
 	}
@@ -570,6 +750,8 @@ func (o *Orchestrator) handleBusResponse(msg *guide.Message) error {
 
 	if router != nil {
 		router.DeliverResponse(msg)
+	} else {
+		slog.Warn("response dropped: task router not yet wired", "correlation_id", msg.CorrelationID)
 	}
 	return nil
 }
@@ -761,6 +943,13 @@ func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 
 	o.healthMonitor.RecordTaskFailed(task.AssignedAgentID, taskID, errorMsg)
 	o.updateWorkflowProgress(task.WorkflowID)
+
+	// Notify DAG bridge for DAG-originated task failures.
+	if o.dagBridge != nil {
+		if nodeID, hasNode := data["node_id"].(string); hasNode && nodeID != "" {
+			o.dagBridge.NotifyNodeComplete(nodeID, convertTaskFailedToNodeResult(task))
+		}
+	}
 
 	go o.submitTaskEvent(task)
 
@@ -1089,6 +1278,7 @@ func (o *Orchestrator) summarizeTasks() TasksSummary {
 func (o *Orchestrator) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      o.config.AgentID,
+		Type:    o.config.AgentID,
 		Name:    "orchestrator",
 		Aliases: []string{"orch"},
 		Registration: &guide.AgentRegistration{
@@ -1098,7 +1288,7 @@ func (o *Orchestrator) GetRoutingInfo() *guide.AgentRoutingInfo {
 			Description: "Workflow observer and coordinator. Monitors task health, submits events to Archivalist.",
 			Priority:    80,
 			Capabilities: guide.AgentCapabilities{
-				Intents: []guide.Intent{guide.IntentStatus, guide.IntentRecall, guide.IntentHelp, guide.IntentChat},
+				Intents: []guide.Intent{guide.IntentChat, guide.IntentStatus, guide.IntentRecall, guide.IntentHelp},
 				Domains: []guide.Domain{guide.DomainTasks, "workflow", "health"},
 			},
 		},
@@ -1130,13 +1320,19 @@ func (o *Orchestrator) State() *State {
 	return o.state
 }
 
-// publishActivity sends an activity event to the UI agent panel.
+// publishActivity sends a user-visible activity event to the UI agent panel.
 func (o *Orchestrator) publishActivity(eventType events.EventType, content string) {
+	o.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
+}
+
+// publishActivityWithVisibility sends an activity event with explicit visibility.
+func (o *Orchestrator) publishActivityWithVisibility(eventType events.EventType, visibility events.EventVisibility, content string) {
 	if o.activityBus == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, o.config.SessionID, content)
 	evt.AgentID = o.config.AgentID
+	evt.Visibility = visibility
 	evt.Data["agent_type"] = "orchestrator"
 	evt.Data["agent_name"] = "Orchestrator"
 	o.activityBus.Publish(evt)
@@ -1148,7 +1344,7 @@ func (o *Orchestrator) retryObserver() providers.RetryObserver {
 	return func(event providers.RetryEvent) {
 		o.publishActivity(events.EventTypeAgentError,
 			fmt.Sprintf("Rate limited, retrying (%d/%d) after %s",
-				event.Attempt, event.MaxAttempts, event.Delay.Truncate(time.Second)))
+				event.Attempt, event.MaxAttempts, event.Delay.Round(time.Second)))
 	}
 }
 
@@ -1253,11 +1449,43 @@ func (o *Orchestrator) subscribeDAGTopics() {
 		{"dag.execute", o.handleDAGExecuteRequest},
 		{"dag.modify", o.handleDAGModifyRequest},
 		{"dag.cancel", o.handleDAGCancelRequest},
+		{"dag.decision.response", o.handleLayerDecisionResponse},
 	}
 	for _, t := range topics {
 		if sub, err := o.bus.SubscribeAsync(t.topic, t.handler); err == nil {
 			o.dagSubs = append(o.dagSubs, sub)
 		}
+	}
+}
+
+func (o *Orchestrator) handleLayerDecisionResponse(msg *guide.Message) error {
+	data, ok := msg.Payload.(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	dagID, _ := data["dag_id"].(string)
+	decisionStr, _ := data["decision"].(string)
+
+	if dagID == "" || o.dagBridge == nil {
+		return nil
+	}
+
+	decision := parseDecisionKind(decisionStr)
+	o.dagBridge.ResolveDecision(dagID, decision)
+	return nil
+}
+
+func parseDecisionKind(s string) dag.DecisionKind {
+	switch s {
+	case "retry":
+		return dag.DecisionRetry
+	case "skip":
+		return dag.DecisionSkip
+	case "abort":
+		return dag.DecisionAbort
+	default:
+		return dag.DecisionAbort
 	}
 }
 
@@ -1460,6 +1688,19 @@ func convertTaskCompleteToNodeResult(task *TaskRecord) *dag.NodeResult {
 	}
 }
 
+func convertTaskFailedToNodeResult(task *TaskRecord) *dag.NodeResult {
+	var resultErr error
+	if task.Error != "" {
+		resultErr = fmt.Errorf("%s", task.Error)
+	}
+	return &dag.NodeResult{
+		NodeID:  task.ID,
+		State:   dag.NodeStateFailed,
+		Error:   resultErr,
+		EndTime: time.Now(),
+	}
+}
+
 func convertPipelineToNodeResult(update *PipelineUpdate) *dag.NodeResult {
 	state := dag.NodeStateSucceeded
 	var resultErr error
@@ -1504,8 +1745,8 @@ func (o *Orchestrator) AgentType() string {
 func (o *Orchestrator) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:     "orchestrator",
-		ModelID:       "haiku-4.5-200k",
-		ContextWindow: 200_000,
+		ModelID:       "gemini-3-flash-preview",
+		ContextWindow: 1_000_000,
 		Category:      handoff.CategoryStandalone,
 	}
 }

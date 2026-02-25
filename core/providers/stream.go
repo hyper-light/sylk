@@ -16,6 +16,15 @@ type StreamChunk struct {
 	Usage      *Usage          `json:"usage,omitempty"`
 	StopReason StopReason      `json:"stop_reason,omitempty"`
 	Timestamp  time.Time       `json:"timestamp"`
+	// RetryReset is true when this ChunkTypeStart marks a provider retry,
+	// indicating the handler should discard any prior partial content.
+	// Set automatically by retryAwareHandler.
+	RetryReset bool `json:"retry_reset,omitempty"`
+	// ProviderData carries provider-specific opaque data through the
+	// stream pipeline. Used by providers that need to preserve raw
+	// response content (e.g. thinking blocks with signatures) for
+	// multi-turn replay. Emitted on ChunkTypeEnd.
+	ProviderData map[string]any `json:"provider_data,omitempty"`
 }
 
 type StreamChunkType string
@@ -40,12 +49,14 @@ type ToolCallChunk struct {
 type StreamAccumulator struct {
 	mu sync.Mutex
 
-	chunks     []StreamChunk
-	text       strings.Builder
-	toolCalls  map[string]*accumulatedToolCall
-	usage      Usage
-	stopReason StopReason
-	model      string
+	chunks       []StreamChunk
+	text         strings.Builder
+	thinking     strings.Builder
+	toolCalls    map[string]*accumulatedToolCall
+	providerData map[string]any
+	usage        Usage
+	stopReason   StopReason
+	model        string
 
 	startTime time.Time
 	endTime   time.Time
@@ -90,11 +101,16 @@ func (a *StreamAccumulator) Add(chunk *StreamChunk) {
 			}
 		}
 
+	case ChunkTypeThought:
+		a.thinking.WriteString(chunk.Text)
+
 	case ChunkTypeStart:
 		// Reset for retry — a new ChunkTypeStart means previous attempt failed.
 		a.chunks = a.chunks[:0]
 		a.text.Reset()
+		a.thinking.Reset()
 		a.toolCalls = make(map[string]*accumulatedToolCall)
+		a.providerData = nil
 		a.usage = Usage{}
 		a.stopReason = ""
 		a.startTime = time.Now()
@@ -114,6 +130,9 @@ func (a *StreamAccumulator) Add(chunk *StreamChunk) {
 		if chunk.StopReason != "" {
 			a.stopReason = chunk.StopReason
 		}
+		if len(chunk.ProviderData) > 0 {
+			a.providerData = chunk.ProviderData
+		}
 	}
 }
 
@@ -130,16 +149,22 @@ func (a *StreamAccumulator) Response() *Response {
 		})
 	}
 
+	meta := map[string]any{
+		"chunk_count":     len(a.chunks),
+		"stream_duration": a.endTime.Sub(a.startTime).String(),
+	}
+	for k, v := range a.providerData {
+		meta[k] = v
+	}
+
 	return &Response{
-		Content:    a.text.String(),
-		Model:      a.model,
-		StopReason: a.stopReason,
-		Usage:      a.usage,
-		ToolCalls:  toolCalls,
-		ProviderMetadata: map[string]any{
-			"chunk_count":     len(a.chunks),
-			"stream_duration": a.endTime.Sub(a.startTime).String(),
-		},
+		Content:          a.text.String(),
+		Thinking:         strings.TrimSpace(a.thinking.String()),
+		Model:            a.model,
+		StopReason:       a.stopReason,
+		Usage:            a.usage,
+		ToolCalls:        toolCalls,
+		ProviderMetadata: meta,
 	}
 }
 
@@ -147,6 +172,12 @@ func (a *StreamAccumulator) Text() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.text.String()
+}
+
+func (a *StreamAccumulator) Thinking() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.TrimSpace(a.thinking.String())
 }
 
 func (a *StreamAccumulator) ChunkCount() int {

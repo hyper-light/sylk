@@ -187,6 +187,8 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 		})
 	case guide.StreamEventReroute:
 		program.Send(parseStreamRerouteMsg(sid, cid, stream.Event))
+	case guide.StreamEventToolCall:
+		program.Send(parseToolCallEventMsg(sid, cid, stream.RespondingAgentID, stream.Event))
 	}
 }
 
@@ -205,6 +207,56 @@ func parseStreamRerouteMsg(sessionID, correlationID string, event *guide.StreamE
 	result.OriginalCorrelationID = strings.TrimSpace(data["original_correlation_id"])
 	if newCID := strings.TrimSpace(data["new_correlation_id"]); newCID != "" {
 		result.CorrelationID = newCID
+	}
+	return result
+}
+
+func parseToolCallEventMsg(sessionID, correlationID, agentID string, event *guide.StreamEvent) msg.ToolCallEventMsg {
+	result := msg.ToolCallEventMsg{
+		SessionID:     sessionID,
+		CorrelationID: correlationID,
+		AgentID:       agentID,
+	}
+	if event == nil || event.Data == nil {
+		return result
+	}
+	data, ok := event.Data.(map[string]any)
+	if !ok {
+		return result
+	}
+	if v, ok := data["tool_name"].(string); ok {
+		result.ToolName = v
+	}
+	if v, ok := data["args_summary"].(string); ok {
+		result.ArgsSummary = v
+	}
+	if v, ok := data["full_args"].(string); ok {
+		result.FullArgs = v
+	}
+	if v, ok := data["output"].(string); ok {
+		result.Output = v
+	}
+	if v, ok := data["error_msg"].(string); ok {
+		result.ErrorMsg = v
+	}
+	if v, ok := data["phase"].(float64); ok {
+		result.Phase = int(v)
+	}
+	if v, ok := data["phase"].(int); ok {
+		result.Phase = v
+	}
+	if v, ok := data["success"].(bool); ok {
+		result.Success = v
+	}
+	if v, ok := data["started_at"].(string); ok {
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			result.StartedAt = t
+		}
+	}
+	if v, ok := data["duration"].(string); ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			result.Duration = d
+		}
 	}
 	return result
 }
@@ -241,7 +293,7 @@ func streamDataText(event *guide.StreamEvent) string {
 
 func toStreamProgressMsg(sessionID, correlationID, agentID string, event *guide.StreamEvent) msg.StreamProgressMsg {
 	progress := parseProgressData(event)
-	return msg.StreamProgressMsg{
+	m := msg.StreamProgressMsg{
 		SessionID:     sessionID,
 		CorrelationID: correlationID,
 		AgentID:       strings.TrimSpace(agentID),
@@ -249,6 +301,10 @@ func toStreamProgressMsg(sessionID, correlationID, agentID string, event *guide.
 		Total:         progress.Total,
 		Message:       redact.Text(strings.TrimSpace(progress.Message)),
 	}
+	if event != nil {
+		m.Visibility = event.Visibility
+	}
+	return m
 }
 
 func parseProgressData(event *guide.StreamEvent) guide.ProgressData {

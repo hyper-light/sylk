@@ -68,22 +68,45 @@ type AgentDescriptorRef struct {
 	Category      int // Maps to handoff.AgentCategory
 }
 
+// FileAccessType identifies how a container accesses the filesystem.
+type FileAccessType int
+
+const (
+	FileAccessDisk   FileAccessType = iota // Direct disk I/O (Architect, Guide, Librarian, etc.)
+	FileAccessVFS                          // Per-pipeline VFS overlay (Engineer, Designer, Pipeline Inspector/Tester)
+	FileAccessGlobal                       // Per-session CVS-backed (Global Inspector, Global Tester)
+)
+
+var fileAccessTypeNames = map[FileAccessType]string{
+	FileAccessDisk:   "disk",
+	FileAccessVFS:    "vfs",
+	FileAccessGlobal: "global",
+}
+
+func (f FileAccessType) String() string {
+	if name, ok := fileAccessTypeNames[f]; ok {
+		return name
+	}
+	return "unknown"
+}
+
 // ContainerSpec is the declarative specification for a single container.
 type ContainerSpec struct {
-	Name          string
-	AgentType     string
-	Descriptor    AgentDescriptorRef
-	Role          ContainerRole
-	RestartPolicy RestartPolicy
-	Resources     ResourceSpec
-	Mounts        []MountSpec
-	Network       NetworkAttachment
-	Security      SecurityContextSpec
-	Probes        []ProbeSpec
-	Hooks         LifecycleHookSpec
-	Env           map[string]string
-	GracefulStop  time.Duration
-	Labels        map[string]string
+	Name           string
+	AgentType      string
+	Descriptor     AgentDescriptorRef
+	Role           ContainerRole
+	RestartPolicy  RestartPolicy
+	FileAccessType FileAccessType
+	Resources      ResourceSpec
+	Mounts         []MountSpec
+	Network        NetworkAttachment
+	Security       SecurityContextSpec
+	Probes         []ProbeSpec
+	Hooks          LifecycleHookSpec
+	Env            map[string]string
+	GracefulStop   time.Duration
+	Labels         map[string]string
 }
 
 // ResourceSpec defines resource requests (soft) and limits (hard).

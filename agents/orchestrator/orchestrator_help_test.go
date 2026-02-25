@@ -16,8 +16,8 @@ func TestOrchestratorHandle_HelpIntent(t *testing.T) {
 	}, nil, nil, nil)
 	require.NoError(t, err)
 
-	// IntentHelp routes to conversation; with nil provider it falls back
-	// to a deterministic status summary.
+	// IntentHelp routes to conversation; empty input hits the static
+	// online reply fast-path (no LLM required).
 	result, err := o.Handle(context.Background(), &guide.ForwardedRequest{
 		Intent: guide.IntentHelp,
 	})

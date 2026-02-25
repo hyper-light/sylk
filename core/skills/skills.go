@@ -253,17 +253,28 @@ func (b *Builder) Build() *Skill {
 // Markdown Generation
 // =============================================================================
 
+// yamlSafeValue wraps a string in double quotes if it contains characters that
+// would break unquoted YAML scalar parsing (colons, brackets, etc.).
+func yamlSafeValue(v string) string {
+	if strings.ContainsAny(v, ":{}[]#&*!|>'\",") {
+		escaped := strings.ReplaceAll(v, `"`, `\"`)
+		return `"` + escaped + `"`
+	}
+	return v
+}
+
 // ToMarkdown generates a full SKILL.md document from the skill definition
 func (s *Skill) ToMarkdown() string {
 	var sb strings.Builder
 
-	// Frontmatter
+	// Frontmatter — quote values that contain YAML-special characters
+	// (colons, brackets, etc.) to prevent parse failures in ReadSkillString.
 	sb.WriteString("---\n")
-	sb.WriteString(fmt.Sprintf("name: %s\n", s.Name))
-	sb.WriteString(fmt.Sprintf("description: %s\n", s.Description))
+	sb.WriteString(fmt.Sprintf("name: %s\n", yamlSafeValue(s.Name)))
+	sb.WriteString(fmt.Sprintf("description: %s\n", yamlSafeValue(s.Description)))
 	if s.Domain != "" {
 		sb.WriteString("metadata:\n")
-		sb.WriteString(fmt.Sprintf("  category: %s\n", s.Domain))
+		sb.WriteString(fmt.Sprintf("  category: %s\n", yamlSafeValue(s.Domain)))
 		sb.WriteString("  version: 1.0.0\n")
 	}
 	sb.WriteString("---\n\n")

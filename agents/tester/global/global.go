@@ -11,13 +11,22 @@ import (
 	"sync"
 	"time"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/providers/gateway"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
+
+// globalTesterProvider is the minimal interface the GlobalTester needs.
+// Satisfied by *providers.OpenAIProvider and *gateway.GatewayProvider.
+type globalTesterProvider interface {
+	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+}
 
 // GlobalTester architects and runs integration/e2e/cross-cutting tests
 // after a batch of concurrent pipelines completes.
@@ -27,7 +36,8 @@ type GlobalTester struct {
 	logger *slog.Logger
 
 	// LLM provider (OpenAI gpt-5.3-codex with xhigh reasoning).
-	provider *providers.OpenAIProvider
+	provider        globalTesterProvider
+	providerWrapper gateway.ProviderWrapper
 
 	// State.
 	inspectorGate *shared.InspectorGate
@@ -55,14 +65,17 @@ type GlobalTester struct {
 
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
+
+	// File access (injected per-session at runtime).
+	fileAccess versioning.FileAccess
 }
 
 // New creates a new GlobalTester instance.
-func New(cfg shared.GlobalTesterConfig, provider *providers.OpenAIProvider) (*GlobalTester, error) {
+func New(cfg shared.GlobalTesterConfig, provider globalTesterProvider) (*GlobalTester, error) {
 	cfg = applyConfigDefaults(cfg)
 
 	gt := &GlobalTester{
-		id:          fmt.Sprintf("tester_%s", uuid.New().String()[:8]),
+		id:          uuid.New().String()[:8],
 		config:      cfg,
 		logger:      slog.Default().With("agent", "tester"),
 		provider:    provider,
@@ -73,6 +86,63 @@ func New(cfg shared.GlobalTesterConfig, provider *providers.OpenAIProvider) (*Gl
 
 	gt.initSkills()
 	return gt, nil
+}
+
+// SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+// Called by the auth-push mechanism when the user provides credentials after
+// initial activation. A nil provider disables LLM features (static
+// conversation replies continue to work).
+func (gt *GlobalTester) SetProvider(p providers.Provider) {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	gt.provider = p
+}
+
+// SetProviderWrapper stores a callback that re-applies gateway rate limiting
+// to fresh providers created during credential refresh.
+func (gt *GlobalTester) SetProviderWrapper(w gateway.ProviderWrapper) {
+	gt.providerWrapper = w
+}
+
+// HasProvider reports whether an LLM provider is currently configured.
+func (gt *GlobalTester) HasProvider() bool {
+	gt.mu.RLock()
+	defer gt.mu.RUnlock()
+	return gt.provider != nil
+}
+
+// getProvider returns the current provider under read lock.
+func (gt *GlobalTester) getProvider() globalTesterProvider {
+	gt.mu.RLock()
+	defer gt.mu.RUnlock()
+	return gt.provider
+}
+
+// ProviderType implements container.AuthRefreshable.
+func (gt *GlobalTester) ProviderType() string { return "openai" }
+
+// RefreshProvider implements container.AuthRefreshable.
+// Re-resolves OpenAI credentials and replaces the provider.
+func (gt *GlobalTester) RefreshProvider(_ context.Context) error {
+	cfg := providers.OpenAIConfig{
+		BaseConfig: providers.BaseConfig{
+			Model:     gt.config.Model,
+			MaxTokens: gt.config.MaxTokens,
+		},
+		ReasoningEffort: gt.config.ReasoningEffort,
+		AuthMode:        "api_key",
+	}
+	p, err := providers.NewOpenAIProvider(cfg)
+	if err != nil {
+		return fmt.Errorf("tester refresh provider: %w", err)
+	}
+	if gt.providerWrapper != nil {
+		gt.SetProvider(gt.providerWrapper(p))
+	} else {
+		gt.SetProvider(p)
+	}
+	gt.logger.Info("provider refreshed")
+	return nil
 }
 
 func applyConfigDefaults(cfg shared.GlobalTesterConfig) shared.GlobalTesterConfig {
@@ -191,7 +261,7 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 	}
 
 	gt.bus = bus
-	gt.channels = guide.NewAgentChannels(gt.id, "tester")
+	gt.channels = guide.NewAgentChannels("tester", gt.id)
 
 	var err error
 	gt.requestSub, err = bus.SubscribeAsync(gt.channels.Requests, gt.handleBusRequest)
@@ -268,10 +338,24 @@ func (gt *GlobalTester) unsubRegistry() error {
 	return err
 }
 
-// Handle processes a forwarded request through the LLM tool loop.
+// Handle processes a forwarded request, dispatching by intent.
+// Conversational intents (Help, Chat, Unknown) route to the conversation
+// pipeline with static fast-path, LLM fallback, and streaming. Task-oriented
+// intents (Check, Recall) route to the full LLM tool loop with the testing
+// system prompt.
 func (gt *GlobalTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	if gt.provider == nil {
-		return nil, fmt.Errorf("global tester: no LLM provider configured")
+	switch fwd.Intent {
+	case guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
+		return gt.handleConversation(ctx, fwd)
+	default:
+		return gt.handleTaskRequest(ctx, fwd)
+	}
+}
+
+// handleTaskRequest processes task-oriented requests through the full LLM tool loop.
+func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if gt.getProvider() == nil {
+		return nil, fmt.Errorf("global tester: no LLM provider configured — authenticate with OpenAI to enable")
 	}
 
 	systemPrompt := shared.GlobalTesterSystemPrompt()
@@ -309,6 +393,17 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	ctx := context.Background()
 	startTime := time.Now()
 
+	// Always set up stream context — the Guide may promote IntentChat to
+	// IntentHelp, so we cannot predicate streaming on the incoming intent.
+	// This mirrors the orchestrator's handleBusRequest pattern.
+	ctx = withTesterStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx, usageAcc := withTesterUsageAccumulator(ctx)
+	toolEmitter := agentshared.NewToolCallEmitter(gt.bus, gt.channels, "tester", fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
+	if !fwd.FireAndForget {
+		gt.publishStreamStart(ctx)
+	}
+
 	result, err := gt.Handle(ctx, fwd)
 
 	if fwd.FireAndForget {
@@ -318,13 +413,17 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   gt.id,
-		RespondingAgentName: "tester",
+		RespondingAgentID:   "tester",
+		RespondingAgentName: "Tester",
 		ProcessingTime:      time.Since(startTime),
 	}
 
 	if err != nil {
+		gt.publishStreamError(ctx, err)
+		gt.publishStreamComplete(ctx, "", usageAcc.Total())
 		resp.Error = err.Error()
+		respMsg := guide.NewResponseMessage(gt.generateMessageID(), resp)
+		_ = gt.bus.Publish(gt.channels.Responses, respMsg)
 		errMsg := guide.NewErrorMessage(
 			gt.generateMessageID(),
 			fwd.CorrelationID,
@@ -335,6 +434,15 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+
+	// Conversation text is already streamed via chunks — send complete with
+	// empty text so the bridge doesn't duplicate content.
+	completeText := extractTesterUserResponse(result)
+	if isStreamedTesterConversation(result) {
+		completeText = ""
+	}
+	gt.publishStreamComplete(ctx, completeText, usageAcc.Total())
+
 	respMsg := guide.NewResponseMessage(gt.generateMessageID(), resp)
 	return gt.bus.Publish(gt.channels.Responses, respMsg)
 }
@@ -382,11 +490,13 @@ func (gt *GlobalTester) publishRerouteRequest(reason, originalInput, suggestedTa
 func (gt *GlobalTester) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      gt.id,
-		Name:    "tester",
+		Type:    "tester",
+		Name:    "Tester",
 		Aliases: []string{"test", "testing", "qa"},
 		ActionShortcuts: []guide.ActionShortcut{
 			{Name: "test", Description: "Run tests", DefaultIntent: guide.IntentCheck, DefaultDomain: guide.DomainCode},
 			{Name: "coverage", Description: "Coverage report", DefaultIntent: guide.IntentCheck, DefaultDomain: guide.DomainCode},
+			{Name: "chat", Description: "Conversational interaction", DefaultIntent: guide.IntentChat, DefaultDomain: guide.DomainSystem},
 		},
 		Triggers: guide.AgentTriggers{
 			StrongTriggers: []string{
@@ -400,10 +510,10 @@ func (gt *GlobalTester) GetRoutingInfo() *guide.AgentRoutingInfo {
 		},
 		Registration: &guide.AgentRegistration{
 			ID:      gt.id,
-			Name:    "tester",
+			Name:    "Tester",
 			Aliases: []string{"test", "testing", "qa"},
 			Capabilities: guide.AgentCapabilities{
-				Intents:  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp},
+				Intents:  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp, guide.IntentChat},
 				Domains:  []guide.Domain{guide.DomainCode},
 				Tags:     []string{"testing", "quality", "coverage", "integration", "e2e", "sdet"},
 				Keywords: []string{"test", "integration", "e2e", "coverage", "mutation", "quality"},
@@ -474,6 +584,11 @@ func (gt *GlobalTester) Terminate(_ context.Context) error {
 // SetHandoffBridge assigns the handoff bridge.
 func (gt *GlobalTester) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	gt.handoffBridge = bridge
+}
+
+// SetFileAccess injects the per-session file access layer.
+func (gt *GlobalTester) SetFileAccess(fa versioning.FileAccess) {
+	gt.fileAccess = fa
 }
 
 // ExtractArchivableState returns state for handoff persistence.

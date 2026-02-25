@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -21,6 +22,29 @@ type architectStreamContextKey struct{}
 type architectEarlyUsageEmitter func(inputTokens int)
 type architectEarlyUsageKey struct{}
 type architectUsageAccumulatorKey struct{}
+
+// streamRetryResetEmitter is called when the provider retries a stream,
+// signaling the UI to reset its accumulator before replayed content arrives.
+type streamRetryResetEmitter func()
+type streamRetryResetEmitterKey struct{}
+
+func withStreamRetryResetEmitter(ctx context.Context, emitter streamRetryResetEmitter) context.Context {
+	if emitter == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, streamRetryResetEmitterKey{}, emitter)
+}
+
+func emitStreamRetryReset(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	emitter, ok := ctx.Value(streamRetryResetEmitterKey{}).(streamRetryResetEmitter)
+	if !ok || emitter == nil {
+		return
+	}
+	emitter()
+}
 
 // architectUsageAccumulator sums real token counts from multiple LLM calls
 // within a single Architect request. Thread-safe for concurrent sub-calls.
@@ -84,6 +108,17 @@ var planStatusProgress = map[PlanStatus]streamProgressSpec{
 	PlanStatusFailed:        {Current: 6, Total: 6, Message: "Planning failed."},
 }
 
+func activityEventTypeForPlanStatus(status PlanStatus) events.EventType {
+	switch status {
+	case PlanStatusPending, PlanStatusAnalyzing, PlanStatusConsulting:
+		return events.EventTypeAgentDecision
+	case PlanStatusFailed:
+		return events.EventTypeAgentError
+	default:
+		return events.EventTypeAgentAction
+	}
+}
+
 func withArchitectEarlyUsageEmitter(ctx context.Context, emit architectEarlyUsageEmitter) context.Context {
 	if emit == nil {
 		return ctx
@@ -133,6 +168,7 @@ func (a *Architect) publishPlanStreamProgress(ctx context.Context, status PlanSt
 	if !ok {
 		return
 	}
+	a.publishActivity(activityEventTypeForPlanStatus(status), spec.Message)
 	a.publishPlanStreamEvent(ctx, &guide.StreamEvent{
 		Type: guide.StreamEventProgress,
 		Data: &guide.ProgressData{
@@ -213,14 +249,51 @@ func (a *Architect) publishPlanStreamEarlyUsage(ctx context.Context, inputTokens
 	})
 }
 
-func (a *Architect) publishPlanStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage) {
+func (a *Architect) publishPlanStreamComplete(ctx context.Context, userResponse string, usage *guide.StreamUsage, directive *guide.ResponseDirective) {
 	event := &guide.StreamEvent{
 		Type:      guide.StreamEventComplete,
 		Text:      strings.TrimSpace(userResponse),
 		Usage:     usage,
+		Directive: directive,
 		Timestamp: time.Now(),
 	}
 	a.publishPlanStreamEvent(ctx, event)
+}
+
+// publishHandoffReroute emits a StreamEventReroute so the TUI switches
+// the engaged agent indicator from "architect" to the handoff target.
+// originalCID is the architect's stream CID (to be cleared in the TUI).
+// newCID is the orchestrator's request CID (for the TUI to track).
+func (a *Architect) publishHandoffReroute(ctx context.Context, toAgentID, originalCID, newCID string) {
+	a.publishPlanStreamEvent(ctx, &guide.StreamEvent{
+		Type: guide.StreamEventReroute,
+		Data: map[string]string{
+			"from_agent":              "architect",
+			"to_agent":               toAgentID,
+			"reason":                 "plan handoff",
+			"original_correlation_id": originalCID,
+			"new_correlation_id":      newCID,
+		},
+		Timestamp: time.Now(),
+	})
+}
+
+// extractResponseDirective extracts a ResponseDirective from a planning or
+// conversation result, for inclusion on the StreamEventComplete event.
+// Unwraps *ArchitectResponse to reach the inner result type.
+func extractResponseDirective(data any) *guide.ResponseDirective {
+	inner := unwrapArchitectResult(data)
+	switch v := inner.(type) {
+	case *DesignPlan:
+		if v != nil {
+			return v.ReadyDirective
+		}
+	case *ConversationResult:
+		if v != nil {
+			return v.Directive
+		}
+	}
+	return nil
 }
 
 func (a *Architect) publishPlanStreamError(ctx context.Context, err error) {

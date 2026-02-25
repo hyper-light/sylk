@@ -72,7 +72,7 @@ func TestLivenessProbeSpec_DerivedTiming(t *testing.T) {
 	agent := &mockAgent{id: "test-1", agentType: "test"}
 	graceful := 30 * time.Second
 
-	spec := livenessProbeSpec(agent, graceful)
+	spec := LivenessProbeSpec(agent, graceful)
 	if spec.Type != ProbeLiveness {
 		t.Fatalf("expected ProbeLiveness, got %v", spec.Type)
 	}
@@ -88,7 +88,7 @@ func TestLivenessProbeSpec_DerivedTiming(t *testing.T) {
 }
 
 func TestReadinessProbeSpec_FixedTiming(t *testing.T) {
-	spec := readinessProbeSpec("agent-1", func(_ string) bool { return true })
+	spec := ReadinessProbeSpec("agent-1", func(_ string) bool { return true })
 	if spec.Type != ProbeReadiness {
 		t.Fatalf("expected ProbeReadiness, got %v", spec.Type)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -211,10 +212,10 @@ func buildDAGFromHandoff(h *architect.PlanHandoff) (*dag.DAG, error) {
 
 	if h.Constraints != nil {
 		policy := dag.ExecutionPolicy{
-			FailurePolicy:  dag.FailurePolicyFailFast,
+			FailurePolicy:  dag.FailurePolicyContinue,
 			MaxConcurrency: constraintConcurrency(h.Constraints),
 			DefaultTimeout: constraintTimeout(h.Constraints),
-			DefaultRetries: 1,
+			DefaultRetries: 3,
 			RetryBackoff:   time.Second,
 		}
 		builder = builder.WithPolicy(policy)
@@ -226,7 +227,7 @@ func buildDAGFromHandoff(h *architect.PlanHandoff) (*dag.DAG, error) {
 	for _, ht := range h.Tasks {
 		prompt := buildNodePrompt(ht)
 		nodeCtx := buildNodeContext(ht)
-		builder = builder.AddNode(dag.NodeConfig{
+		cfg := dag.NodeConfig{
 			ID:           ht.ID,
 			AgentType:    ht.AgentType,
 			Prompt:       prompt,
@@ -237,7 +238,15 @@ func buildDAGFromHandoff(h *architect.PlanHandoff) (*dag.DAG, error) {
 				"name":       ht.Name,
 				"complexity": ht.Complexity,
 			},
-		})
+			CoAgents:          ht.CoAgents,
+			CollaborationMode: parseHandoffCollaborationMode(ht.CollaborationMode),
+			MaxReviewRounds:   ht.MaxReviewRounds,
+		}
+		if len(ht.AgentScopes) > 0 {
+			scopedPrompts := buildScopedPrompts(ht)
+			cfg.Context["agent_prompts"] = scopedPrompts
+		}
+		builder = builder.AddNode(cfg)
 	}
 
 	return builder.Build()
@@ -323,10 +332,10 @@ func buildNodePrompt(ht *architect.HandoffTask) string {
 // buildNodeContext creates the structured context map for a DAG node.
 func buildNodeContext(ht *architect.HandoffTask) map[string]any {
 	ctx := map[string]any{
-		"task_id":         ht.ID,
-		"task_name":       ht.Name,
-		"agent_type":      ht.AgentType,
-		"complexity":      ht.Complexity,
+		"task_id":          ht.ID,
+		"task_name":        ht.Name,
+		"agent_type":       ht.AgentType,
+		"complexity":       ht.Complexity,
 		"estimated_tokens": ht.EstimatedTokens,
 	}
 	if len(ht.AffectedFiles) > 0 {
@@ -334,6 +343,13 @@ func buildNodeContext(ht *architect.HandoffTask) map[string]any {
 	}
 	if len(ht.AcceptanceCriteria) > 0 {
 		ctx["acceptance_criteria"] = ht.AcceptanceCriteria
+	}
+	if len(ht.CoAgents) > 0 {
+		ctx["co_agents"] = ht.CoAgents
+		ctx["collaboration_mode"] = ht.CollaborationMode
+	}
+	if len(ht.AgentScopes) > 0 {
+		ctx["agent_scopes"] = ht.AgentScopes
 	}
 	return ctx
 }
@@ -352,7 +368,87 @@ func constraintTimeout(c *architect.PlanConstraints) time.Duration {
 	return 5 * time.Minute
 }
 
-// analyzeActiveDAG analyzes a running or completed DAG from the scheduler/store.
+// parseHandoffCollaborationMode converts a string collaboration mode from a
+// HandoffTask to the dag.CollaborationMode enum.
+func parseHandoffCollaborationMode(s string) dag.CollaborationMode {
+	if strings.EqualFold(s, "adversarial") {
+		return dag.CollaborationAdversarial
+	}
+	return dag.CollaborationSequential
+}
+
+// buildScopedPrompts produces per-agent scoped prompts for compound tasks.
+// Each scoped prompt includes shared context plus agent-specific instructions.
+// Returns a map of agent_type → prompt string.
+func buildScopedPrompts(ht *architect.HandoffTask) map[string]string {
+	prompts := make(map[string]string, len(ht.AgentScopes))
+	for _, scope := range ht.AgentScopes {
+		var b strings.Builder
+
+		// Shared context.
+		fmt.Fprintf(&b, "# Task: %s\n\n## Description\n%s\n", ht.Name, ht.Description)
+
+		if len(ht.RiskFactors) > 0 {
+			b.WriteString("\n## Risk Factors\n")
+			for _, rf := range ht.RiskFactors {
+				fmt.Fprintf(&b, "- %s\n", rf)
+			}
+		}
+
+		if len(ht.SuccessCriteria) > 0 {
+			b.WriteString("\n## Success Criteria\n")
+			for _, sc := range ht.SuccessCriteria {
+				fmt.Fprintf(&b, "- %s\n", sc)
+			}
+		}
+
+		// Agent-specific sections.
+		b.WriteString("\n## Your Scope\n")
+		fmt.Fprintf(&b, "Role: %s\n", scope.Role)
+
+		if scope.ImplementationGuide != "" {
+			b.WriteString("\n### Implementation Guide\n")
+			b.WriteString(scope.ImplementationGuide)
+			b.WriteString("\n")
+		}
+
+		if len(scope.AcceptanceCriteria) > 0 {
+			b.WriteString("\n### Acceptance Criteria\n")
+			for i, ac := range scope.AcceptanceCriteria {
+				fmt.Fprintf(&b, "%d. [%s] Given %s, when %s, then %s\n",
+					i+1, ac.Priority, ac.Given, ac.When, ac.Then)
+			}
+		}
+
+		if len(scope.AffectedFiles) > 0 {
+			b.WriteString("\n### Affected Files\n")
+			for _, af := range scope.AffectedFiles {
+				fmt.Fprintf(&b, "- %s [%s]: %s\n", af.Path, af.Operation, af.Reason)
+			}
+		}
+
+		if len(scope.Guidelines) > 0 {
+			b.WriteString("\n### Guidelines\n")
+			for _, g := range scope.Guidelines {
+				fmt.Fprintf(&b, "- %s\n", g)
+			}
+		}
+
+		if len(scope.TestRequirements) > 0 {
+			b.WriteString("\n### Test Requirements\n")
+			for _, tr := range scope.TestRequirements {
+				fmt.Fprintf(&b, "- %s\n", tr)
+			}
+		}
+
+		if scope.Role == "co_agent" {
+			b.WriteString("\n### Context\nYou will receive the primary agent's changed files as context. Build upon their work. Do not re-implement what they have already done.\n")
+		}
+
+		prompts[scope.AgentType] = b.String()
+	}
+	return prompts
+}
 func (o *Orchestrator) analyzeActiveDAG(dagID string) (any, error) {
 	status, err := o.dagBridge.Status(dagID)
 	if err != nil {
@@ -489,13 +585,38 @@ func isPlanHandoffJSON(input string) bool {
 // a plan handoff, (nil, false) otherwise.
 func (o *Orchestrator) tryIngestPlanFromInput(ctx context.Context, input string) (any, bool) {
 	if !isPlanHandoffJSON(input) {
+		// Log if it looks like it should have been a handoff (contains plan-like keys).
+		if looksLikeMalformedHandoff(input) {
+			slog.Warn("input looks like a malformed plan handoff — treating as conversation",
+				"prefix", truncateForLog(input, 120))
+		}
 		return nil, false
 	}
 	result, err := o.ingestPlan(ctx, input)
 	if err != nil {
+		slog.Warn("plan ingestion failed", "error", err)
 		return map[string]any{"error": err.Error(), "ingested": false}, true
 	}
 	return result, true
+}
+
+// looksLikeMalformedHandoff returns true if the input contains plan-related
+// keys but failed the isPlanHandoffJSON prefix check. Used for diagnostics.
+func looksLikeMalformedHandoff(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if len(trimmed) < 2 || trimmed[0] != '{' {
+		return false
+	}
+	return strings.Contains(trimmed, `"plan_id"`) ||
+		strings.Contains(trimmed, `"tasks"`) ||
+		strings.Contains(trimmed, `"execution_layers"`)
+}
+
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 // generateMessageIDForIngest generates a unique message ID for ingestion events.

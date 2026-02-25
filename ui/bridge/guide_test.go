@@ -309,3 +309,55 @@ func TestSummarizeRetryError_PlainError(t *testing.T) {
 		t.Fatalf("summarizeRetryError:\n  got:  %q\n  want: %q", got, raw)
 	}
 }
+
+func TestFormatConversationResult_PascalCaseKeys(t *testing.T) {
+	// Architect's ConversationResult has no JSON tags → PascalCase keys.
+	payload := map[string]any{
+		"Response":      "Plan dispatched to the orchestrator.",
+		"Intent":        "execute",
+		"HandoffTarget": "orchestrator",
+	}
+	text, ok := formatConversationResult(payload)
+	if !ok {
+		t.Fatal("expected formatConversationResult to succeed for PascalCase keys")
+	}
+	if text != "Plan dispatched to the orchestrator." {
+		t.Fatalf("unexpected text: %q", text)
+	}
+}
+
+func TestFormatConversationResult_LowercaseKeys(t *testing.T) {
+	// Orchestrator's ConversationResult has JSON tags → lowercase keys.
+	payload := map[string]any{
+		"response": "Plan ingested. DAG started.",
+		"intent":   "ingestion_ack",
+	}
+	text, ok := formatConversationResult(payload)
+	if !ok {
+		t.Fatal("expected formatConversationResult to succeed for lowercase keys")
+	}
+	if text != "Plan ingested. DAG started." {
+		t.Fatalf("unexpected text: %q", text)
+	}
+}
+
+func TestFormatConversationResult_EmptyResponse(t *testing.T) {
+	payload := map[string]any{
+		"response": "",
+		"intent":   "chat",
+	}
+	_, ok := formatConversationResult(payload)
+	if ok {
+		t.Fatal("expected formatConversationResult to return false for empty response")
+	}
+}
+
+func TestFormatConversationResult_MissingIntent(t *testing.T) {
+	payload := map[string]any{
+		"response": "some text",
+	}
+	_, ok := formatConversationResult(payload)
+	if ok {
+		t.Fatal("expected formatConversationResult to return false when intent is missing")
+	}
+}

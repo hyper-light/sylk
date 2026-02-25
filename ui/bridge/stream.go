@@ -70,6 +70,9 @@ func convertProgress(d *streamDispatcher, event *guide.StreamEvent) any {
 		m.Total = progress.Total
 		m.Message = progress.Message
 	}
+	if event != nil {
+		m.Visibility = event.Visibility
+	}
 	return m
 }
 

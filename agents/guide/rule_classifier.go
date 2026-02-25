@@ -87,8 +87,21 @@ func classifyByRules(input string) (Intent, Domain, string, float64) {
 	if containsClassifierKeyword(query, "agent", "registry", "status", "health", "guide", "sylk") {
 		return IntentStatus, DomainSystem, "guide", 0.9
 	}
-	if containsClassifierKeyword(query, "plan", "architecture", "break down", "decompose", "strategy") {
+	if containsClassifierKeyword(query, "go ahead", "execute", "hand off", "handoff",
+		"ship it", "run the plan", "proceed with", "kick it off") {
+		return IntentExecute, DomainPlanning, "architect", 0.90
+	}
+	if containsClassifierKeyword(query, "plan", "architecture", "break down", "decompose",
+		"strategy", "workflow", "coordinate", "orchestrate") {
 		return IntentPlan, DomainPlanning, "architect", 0.88
+	}
+	if containsClassifierKeyword(query, "design", "ui", "ux", "layout", "component",
+		"visual", "style", "css", "mockup", "wireframe") {
+		return IntentDesign, DomainDesign, "designer", 0.85
+	}
+	if containsClassifierKeyword(query, "implement", "build", "write", "refactor",
+		"function", "class", "method", "fix bug", "add feature", "engineer") {
+		return IntentDeclare, DomainLocal, "engineer", 0.85
 	}
 	if containsClassifierKeyword(query, "find", "search", "locate", "where", "file", "code") {
 		return IntentFind, DomainLocal, "librarian", 0.85
@@ -98,6 +111,13 @@ func classifyByRules(input string) (Intent, Domain, string, float64) {
 	}
 	if containsClassifierKeyword(query, "review", "compliance", "requirement", "lint", "inspect") {
 		return IntentCheck, DomainCompliance, "inspector", 0.82
+	}
+	if containsClassifierKeyword(query, "history", "pattern", "failure", "learning",
+		"lesson", "what happened", "last time") {
+		return IntentRecall, DomainHistory, "archivalist", 0.82
+	}
+	if containsClassifierKeyword(query, "research", "paper", "best practice", "documentation") {
+		return IntentRecall, DomainResearch, "academic", 0.80
 	}
 	return IntentHelp, DomainGeneral, "guide", 0.75
 }

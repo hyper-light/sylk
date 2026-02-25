@@ -28,7 +28,12 @@ type Model struct {
 	wrapDirty bool
 
 	// Selection state.
-	allSelected bool // Ctrl+A select-all active.
+	sel selection // Anchor+cursor range selection.
+
+	// Markdown display state.
+	md      *mdDisplay    // Parsed markdown mapping (nil if none).
+	mdDirty bool          // True when lines have changed since last parse.
+	mdStyle *mdInputStyles // Cached markdown styles.
 
 	history   *InputHistory
 	completer *Completer
@@ -47,6 +52,10 @@ type Model struct {
 	// slashValidator reports whether a command name (without "/") is a
 	// known slash command. Used by highlightSlashCommand.
 	slashValidator func(cmd string) bool
+
+	// focusBorderRender, when set, replaces the lipgloss border style with
+	// per-character gradient border rendering for the focus ring shimmer.
+	focusBorderRender func(content string, innerW, innerH, maxH int) string
 
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache      string
@@ -107,44 +116,76 @@ func (m *Model) Clear() {
 	m.cursorRow = 0
 	m.cursorCol = 0
 	m.scrollOff = 0
+	m.sel.active = false
 	m.completer.Dismiss()
 	m.wrapDirty = true
+	m.mdDirty = true
 	m.viewDirty = true
 }
 
 // SelectAll marks all input content as selected.
-func (m *Model) SelectAll() { m.allSelected = true }
+func (m *Model) SelectAll() {
+	m.sel = selection{anchorRow: 0, anchorCol: 0, active: true}
+	m.cursorRow = len(m.lines) - 1
+	m.cursorCol = len(m.lines[m.cursorRow])
+	m.viewDirty = true
+}
 
-// HasSelection reports whether a selection is active.
-func (m *Model) HasSelection() bool { return m.allSelected && !m.isEmpty() }
+// HasSelection reports whether a valid selection is active.
+// Deactivates a stale selection whose anchor/cursor coordinates are
+// out of bounds relative to the current buffer.
+func (m *Model) HasSelection() bool {
+	if !m.sel.active || m.isEmpty() {
+		return false
+	}
+	if m.sel.anchorRow < 0 || m.sel.anchorRow >= len(m.lines) ||
+		m.cursorRow < 0 || m.cursorRow >= len(m.lines) ||
+		m.sel.anchorCol < 0 || m.cursorCol < 0 {
+		m.sel.active = false
+		return false
+	}
+	return true
+}
 
 // SelectedText returns the selected text, or "" if nothing is selected.
 func (m *Model) SelectedText() string {
 	if !m.HasSelection() {
 		return ""
 	}
-	return m.Text()
+	return m.sel.extractText(m.lines, m.cursorRow, m.cursorCol)
 }
 
-// CutSelection copies the selected text and clears the input.
+// ClearSelection deactivates the selection.
+func (m *Model) ClearSelection() {
+	m.sel.active = false
+	m.viewDirty = true
+}
+
+// CutSelection copies the selected text and removes it from the buffer.
 func (m *Model) CutSelection() string {
 	text := m.SelectedText()
 	if text == "" {
 		return ""
 	}
-	m.Clear()
-	m.allSelected = false
+	m.clearSelectionContent()
 	return text
 }
 
-// clearSelectionContent replaces a select-all with an empty buffer, ready for
-// new input. No-op when nothing is selected.
+// clearSelectionContent deletes selected text, ready for new input.
+// No-op when nothing is selected.
 func (m *Model) clearSelectionContent() {
-	if !m.allSelected {
+	if !m.sel.active {
 		return
 	}
-	m.Clear()
-	m.allSelected = false
+	newLines, row, col := m.sel.deleteRange(m.lines, m.cursorRow, m.cursorCol)
+	m.lines = newLines
+	m.cursorRow = row
+	m.cursorCol = col
+	m.sel.active = false
+	m.wrapDirty = true
+	m.mdDirty = true
+	m.viewDirty = true
+	m.scrollIntoView()
 }
 
 // ---------------------------------------------------------------------------
@@ -178,20 +219,22 @@ func (m *Model) View(cursorVisible bool) string {
 		return m.viewCache
 	}
 
-	style := m.borderStyle()
-
 	body := m.renderBody(cursorVisible)
 
 	// Right-align a submit hint when the input is empty.
+	cw := m.contentWidth()
 	if m.isEmpty() {
-		w := m.contentWidth()
 		hint := m.theme.Placeholder.Render("enter ↵")
-		if gap := w - lipgloss.Width(body) - lipgloss.Width(hint); gap > 0 {
+		if gap := cw - lipgloss.Width(body) - lipgloss.Width(hint); gap > 0 {
 			body = body + strings.Repeat(" ", gap) + hint
 		}
 	}
 
-	m.viewCache = style.Width(m.contentWidth()).Render(body)
+	if m.focused && m.focusBorderRender != nil {
+		m.viewCache = m.focusBorderRender(body, cw, m.maxHeight, m.height)
+	} else {
+		m.viewCache = m.borderStyle().Width(cw).Render(body)
+	}
 	m.viewDirty = false
 	return m.viewCache
 }
@@ -246,12 +289,34 @@ func (m *Model) LineCount() int {
 	return len(m.lines)
 }
 
+// ensureMd reparses the markdown display mapping if dirty.
+func (m *Model) ensureMd() {
+	if !m.mdDirty && m.md != nil {
+		return
+	}
+	if m.mdStyle == nil {
+		m.mdStyle = newMdInputStyles(m.theme)
+	}
+	m.md = parseMdDisplay(m.lines, m.theme)
+	m.mdDirty = false
+}
+
 // ensureWrap recomputes the wrap state if dirty.
 func (m *Model) ensureWrap() {
 	if !m.wrapDirty && m.wrap != nil {
 		return
 	}
-	m.wrap = computeWrap(m.lines, m.contentWidth())
+	m.ensureMd()
+	if m.md != nil {
+		// Wrap on display text (with hidden delimiters removed).
+		dispLines := make([][]rune, len(m.lines))
+		for i, line := range m.lines {
+			dispLines[i] = m.md.displayRunes(i, line)
+		}
+		m.wrap = computeWrap(dispLines, m.contentWidth())
+	} else {
+		m.wrap = computeWrap(m.lines, m.contentWidth())
+	}
 	m.wrapDirty = false
 }
 
@@ -310,6 +375,16 @@ var completerKeys = []keyEntry{
 	{matchKey("esc"), completerDismiss},
 }
 
+// selectionKeys extend or start a range selection with shift+arrow.
+var selectionKeys = []keyEntry{
+	{matchKey("shift+left"), actionSelLeft},
+	{matchKey("shift+right"), actionSelRight},
+	{matchKey("shift+up"), actionSelUp},
+	{matchKey("shift+down"), actionSelDown},
+	{matchKey("shift+home"), actionSelHome},
+	{matchKey("shift+end"), actionSelEnd},
+}
+
 // normalKeys are dispatched when the completer is not active.
 var normalKeys = []keyEntry{
 	{matchKey("enter"), actionSubmit},
@@ -337,8 +412,9 @@ func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
 	}
 
 	// Backspace/Delete with selection: clear selected content.
-	if m.allSelected && (k.Type == tea.KeyBackspace || k.Type == tea.KeyDelete) {
+	if m.sel.active && (k.Type == tea.KeyBackspace || k.Type == tea.KeyDelete) {
 		m.clearSelectionContent()
+		m.retriggerOrDismiss()
 		return m, nil
 	}
 
@@ -347,8 +423,14 @@ func (m *Model) handleKey(k tea.KeyMsg) (component.Component, tea.Cmd) {
 			return m, cmd
 		}
 	}
+
+	// Shift+arrow: extend or start selection.
+	if cmd, handled := m.dispatch(selectionKeys, k); handled {
+		return m, cmd
+	}
+
 	if cmd, handled := m.dispatch(normalKeys, k); handled {
-		m.allSelected = false
+		m.sel.active = false
 		return m, cmd
 	}
 	// Fall through: insert printable characters (replacing selection).
@@ -401,11 +483,11 @@ func actionNewline(m *Model) tea.Cmd {
 }
 
 func actionUp(m *Model) tea.Cmd {
-	m.ensureWrap()
-	vRow, vCol := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	vRow, vCol := m.cursorToVisual()
 	if vRow > 0 {
-		m.cursorRow, m.cursorCol = m.wrap.visualToActual(vRow-1, vCol)
+		m.cursorRow, m.cursorCol = m.visualToCursor(vRow-1, vCol)
 		m.clampCol()
+		m.skipHiddenDelimiters(-1)
 		m.scrollIntoView()
 		return nil
 	}
@@ -419,11 +501,11 @@ func actionUp(m *Model) tea.Cmd {
 }
 
 func actionDown(m *Model) tea.Cmd {
-	m.ensureWrap()
-	vRow, vCol := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	vRow, vCol := m.cursorToVisual()
 	if vRow < m.wrap.visualTotal-1 {
-		m.cursorRow, m.cursorCol = m.wrap.visualToActual(vRow+1, vCol)
+		m.cursorRow, m.cursorCol = m.visualToCursor(vRow+1, vCol)
 		m.clampCol()
+		m.skipHiddenDelimiters(1)
 		m.scrollIntoView()
 		return nil
 	}
@@ -459,20 +541,20 @@ func actionRight(m *Model) tea.Cmd {
 }
 
 func actionHome(m *Model) tea.Cmd {
-	m.ensureWrap()
-	vRow, _ := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
-	_, segIdx := m.wrap.visualRowToSegment(vRow)
-	span := m.wrap.segments[m.cursorRow][segIdx]
-	m.cursorCol = span.Start
+	vRow, _ := m.cursorToVisual()
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, 0)
+	m.clampCol()
 	return nil
 }
 
 func actionEnd(m *Model) tea.Cmd {
+	vRow, _ := m.cursorToVisual()
 	m.ensureWrap()
-	vRow, _ := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
 	_, segIdx := m.wrap.visualRowToSegment(vRow)
-	span := m.wrap.segments[m.cursorRow][segIdx]
-	m.cursorCol = span.End
+	row, _ := m.wrap.visualToActual(vRow, 0)
+	span := m.wrap.segments[row][segIdx]
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, span.End-span.Start)
+	m.clampCol()
 	return nil
 }
 
@@ -480,13 +562,140 @@ func actionClearLine(m *Model) tea.Cmd {
 	m.lines[m.cursorRow] = nil
 	m.cursorCol = 0
 	m.wrapDirty = true
+	m.mdDirty = true
 	return nil
 }
 
 func actionKillToEnd(m *Model) tea.Cmd {
 	m.lines[m.cursorRow] = m.lines[m.cursorRow][:m.cursorCol]
 	m.wrapDirty = true
+	m.mdDirty = true
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Selection-mode actions (shift+arrow)
+// ---------------------------------------------------------------------------
+
+// beginSel activates selection with anchor at the current cursor if not already active.
+func (m *Model) beginSel() {
+	if !m.sel.active {
+		m.sel = selection{
+			anchorRow: m.cursorRow,
+			anchorCol: m.cursorCol,
+			active:    true,
+		}
+		m.viewDirty = true
+	}
+}
+
+func actionSelLeft(m *Model) tea.Cmd {
+	m.beginSel()
+	m.moveCursorLeft()
+	return nil
+}
+
+func actionSelRight(m *Model) tea.Cmd {
+	m.beginSel()
+	m.moveCursorRight()
+	return nil
+}
+
+func actionSelUp(m *Model) tea.Cmd {
+	m.beginSel()
+	vRow, vCol := m.cursorToVisual()
+	if vRow > 0 {
+		m.cursorRow, m.cursorCol = m.visualToCursor(vRow-1, vCol)
+		m.clampCol()
+		m.skipHiddenDelimiters(-1)
+		m.scrollIntoView()
+	}
+	return nil
+}
+
+func actionSelDown(m *Model) tea.Cmd {
+	m.beginSel()
+	vRow, vCol := m.cursorToVisual()
+	if vRow < m.wrap.visualTotal-1 {
+		m.cursorRow, m.cursorCol = m.visualToCursor(vRow+1, vCol)
+		m.clampCol()
+		m.skipHiddenDelimiters(1)
+		m.scrollIntoView()
+	}
+	return nil
+}
+
+func actionSelHome(m *Model) tea.Cmd {
+	m.beginSel()
+	vRow, _ := m.cursorToVisual()
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, 0)
+	m.clampCol()
+	return nil
+}
+
+func actionSelEnd(m *Model) tea.Cmd {
+	m.beginSel()
+	vRow, _ := m.cursorToVisual()
+	m.ensureWrap()
+	_, segIdx := m.wrap.visualRowToSegment(vRow)
+	row, _ := m.wrap.visualToActual(vRow, 0)
+	span := m.wrap.segments[row][segIdx]
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, span.End-span.Start)
+	m.clampCol()
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Mouse click positioning
+// ---------------------------------------------------------------------------
+
+// ClickAt positions the cursor at the given content-relative coordinates.
+// x is the column within the content area, y is the row.
+func (m *Model) ClickAt(x, y int) {
+	m.sel.active = false
+	m.completer.Dismiss()
+
+	m.ensureWrap()
+	vRow := m.scrollOff + y
+	if vRow < 0 {
+		vRow = 0
+	}
+	if vRow >= m.wrap.visualTotal {
+		vRow = m.wrap.visualTotal - 1
+	}
+
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, x)
+	m.clampCol()
+	m.skipHiddenDelimiters(1)
+	m.viewDirty = true
+}
+
+// DragStart begins a mouse drag selection at the given content-relative coordinates.
+func (m *Model) DragStart(x, y int) {
+	m.completer.Dismiss()
+	m.ensureWrap()
+	vRow := max(min(m.scrollOff+y, m.wrap.visualTotal-1), 0)
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, x)
+	m.clampCol()
+	m.sel = selection{
+		anchorRow: m.cursorRow,
+		anchorCol: m.cursorCol,
+		active:    true,
+	}
+	m.viewDirty = true
+}
+
+// DragTo extends the selection to the given content-relative coordinates.
+func (m *Model) DragTo(x, y int) {
+	if !m.sel.active {
+		return
+	}
+	m.ensureWrap()
+	vRow := max(min(m.scrollOff+y, m.wrap.visualTotal-1), 0)
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, max(x, 0))
+	m.clampCol()
+	m.scrollIntoView()
+	m.viewDirty = true
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +751,9 @@ func (m *Model) setText(s string) {
 	}
 	m.cursorRow = len(m.lines) - 1
 	m.cursorCol = len(m.lines[m.cursorRow])
+	m.sel.active = false
 	m.wrapDirty = true
+	m.mdDirty = true
 	m.scrollIntoView()
 }
 
@@ -552,7 +763,10 @@ func (m *Model) clear() {
 	m.cursorRow = 0
 	m.cursorCol = 0
 	m.scrollOff = 0
+	m.sel.active = false
 	m.wrapDirty = true
+	m.mdDirty = true
+	m.md = nil
 	m.history.Reset()
 	m.completer.Dismiss()
 }
@@ -567,6 +781,7 @@ func (m *Model) insertRunes(rs []rune) {
 	m.lines[m.cursorRow] = newLine
 	m.cursorCol += len(rs)
 	m.wrapDirty = true
+	m.mdDirty = true
 }
 
 // retriggerOrDismiss re-triggers the completer when the cursor is on
@@ -602,6 +817,7 @@ func (m *Model) insertPaste(runes []rune) {
 
 // insertNewline splits the current line at the cursor.
 func (m *Model) insertNewline() {
+	m.sel.active = false
 	line := m.lines[m.cursorRow]
 	before := make([]rune, m.cursorCol)
 	copy(before, line[:m.cursorCol])
@@ -618,6 +834,7 @@ func (m *Model) insertNewline() {
 	m.cursorRow++
 	m.cursorCol = 0
 	m.wrapDirty = true
+	m.mdDirty = true
 	m.scrollIntoView()
 }
 
@@ -628,12 +845,14 @@ func (m *Model) deleteBeforeCursor() {
 		m.lines[m.cursorRow] = append(line[:m.cursorCol-1], line[m.cursorCol:]...)
 		m.cursorCol--
 		m.wrapDirty = true
+		m.mdDirty = true
 		return
 	}
 	if m.cursorRow == 0 {
 		return
 	}
-	// Join with previous line.
+	// Join with previous line; deactivate selection since row count changes.
+	m.sel.active = false
 	prev := m.lines[m.cursorRow-1]
 	joinCol := len(prev)
 	m.lines[m.cursorRow-1] = append(prev, m.lines[m.cursorRow]...)
@@ -641,6 +860,7 @@ func (m *Model) deleteBeforeCursor() {
 	m.cursorRow--
 	m.cursorCol = joinCol
 	m.wrapDirty = true
+	m.mdDirty = true
 	m.scrollIntoView()
 }
 
@@ -649,6 +869,7 @@ func (m *Model) deleteBeforeCursor() {
 func (m *Model) moveCursorLeft() {
 	if m.cursorCol > 0 {
 		m.cursorCol--
+		m.skipHiddenDelimiters(-1)
 		m.scrollIntoView()
 		return
 	}
@@ -664,12 +885,14 @@ func (m *Model) moveCursorLeft() {
 func (m *Model) moveCursorRight() {
 	if m.cursorCol < len(m.lines[m.cursorRow]) {
 		m.cursorCol++
+		m.skipHiddenDelimiters(1)
 		m.scrollIntoView()
 		return
 	}
 	if m.cursorRow < len(m.lines)-1 {
 		m.cursorRow++
 		m.cursorCol = 0
+		m.skipHiddenDelimiters(1)
 		m.scrollIntoView()
 	}
 }
@@ -679,10 +902,51 @@ func (m *Model) clampCol() {
 	m.cursorCol = min(m.cursorCol, len(m.lines[m.cursorRow]))
 }
 
+// cursorToVisual converts raw cursor (row, col) to visual (vRow, vCol),
+// accounting for markdown display mapping when active.
+func (m *Model) cursorToVisual() (vRow, vCol int) {
+	m.ensureWrap()
+	if m.md != nil && m.cursorRow < len(m.md.lines) {
+		ml := m.md.lines[m.cursorRow]
+		dispCol := ml.rawColToDisplay(m.cursorCol)
+		return m.wrap.actualToVisual(m.cursorRow, dispCol)
+	}
+	return m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+}
+
+// visualToCursor converts visual (vRow, vCol) to raw cursor (row, col),
+// accounting for markdown display mapping when active.
+func (m *Model) visualToCursor(vRow, vCol int) (row, col int) {
+	m.ensureWrap()
+	row, dispCol := m.wrap.visualToActual(vRow, vCol)
+	if m.md != nil && row < len(m.md.lines) {
+		ml := m.md.lines[row]
+		col = ml.displayColToRaw(dispCol)
+	} else {
+		col = dispCol
+	}
+	return row, col
+}
+
+// skipHiddenDelimiters advances or retreats the cursor past hidden delimiter
+// positions when markdown is active. dir should be -1 (left) or +1 (right).
+func (m *Model) skipHiddenDelimiters(dir int) {
+	if m.md == nil || m.cursorRow >= len(m.md.lines) {
+		return
+	}
+	ml := m.md.lines[m.cursorRow]
+	lineLen := len(m.lines[m.cursorRow])
+	for m.cursorCol > 0 && m.cursorCol < lineLen {
+		if ml.rawToDisp[m.cursorCol] != -1 {
+			break
+		}
+		m.cursorCol += dir
+	}
+}
+
 // scrollIntoView adjusts scrollOff so the cursor's visual row is visible.
 func (m *Model) scrollIntoView() {
-	m.ensureWrap()
-	vRow, _ := m.wrap.actualToVisual(m.cursorRow, m.cursorCol)
+	vRow, _ := m.cursorToVisual()
 	if vRow < m.scrollOff {
 		m.scrollOff = vRow
 	}
@@ -716,6 +980,7 @@ func (m *Model) replaceWordBeforeCursor(text string) {
 	m.lines[m.cursorRow] = newLine
 	m.cursorCol = start + len(replacement)
 	m.wrapDirty = true
+	m.mdDirty = true
 }
 
 // runeToFirstByte returns the first byte of a rune's UTF-8 encoding.
@@ -728,6 +993,20 @@ func runeToFirstByte(r rune) byte {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+// SetFocusBorderStyle updates the focused border style for the input panel.
+// Called per frame by the app to apply the focus ring shimmer.
+func (m *Model) SetFocusBorderStyle(style lipgloss.Style) {
+	m.theme.InputFocused = style
+}
+
+// SetFocusBorderRender sets a per-character gradient border renderer for the
+// input panel's focus ring. When non-nil, replaces the lipgloss border style.
+// Marks the view dirty since the gradient changes each frame.
+func (m *Model) SetFocusBorderRender(fn func(content string, innerW, innerH, maxH int) string) {
+	m.focusBorderRender = fn
+	m.viewDirty = true
+}
 
 // borderStyle returns the appropriate border style based on focus state.
 func (m *Model) borderStyle() lipgloss.Style {
@@ -761,8 +1040,15 @@ func (m *Model) renderBody(cursorVisible bool) string {
 		}
 		actualRow, segIdx := m.wrap.visualRowToSegment(vRow)
 		span := m.wrap.segments[actualRow][segIdx]
-		segment := m.lines[actualRow][span.Start:span.End]
-		b.WriteString(m.renderVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible))
+
+		if m.md != nil {
+			dispRunes := m.md.displayRunes(actualRow, m.lines[actualRow])
+			segment := dispRunes[span.Start:span.End]
+			b.WriteString(m.renderMdVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible))
+		} else {
+			segment := m.lines[actualRow][span.Start:span.End]
+			b.WriteString(m.renderVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible))
+		}
 	}
 	return b.String()
 }
@@ -790,6 +1076,15 @@ func (m *Model) renderVisualLine(segment []rune, actualRow, segOffset, segIdx in
 		}
 	}
 
+	// Apply selection highlight if active.
+	if m.sel.active {
+		ghost := ""
+		if needsCursor {
+			ghost = m.completer.GhostSuffix()
+		}
+		return m.renderSelectionWithCursor(segment, actualRow, segOffset, needsCursor, localCol, cursorVisible, ghost)
+	}
+
 	// Ghost suffix appears only on the segment containing the cursor.
 	ghost := ""
 	if needsCursor {
@@ -800,6 +1095,162 @@ func (m *Model) renderVisualLine(segment []rune, actualRow, segOffset, segIdx in
 		return lineStr
 	}
 	return m.renderCursorWithGhostLocal(segment, lineStr, localCol, cursorVisible, ghost)
+}
+
+// renderMdVisualLine renders a visual-line segment with markdown styling.
+// The segment contains display runes (hidden delimiters removed).
+// segOffset is the display-column offset within the display rune array.
+func (m *Model) renderMdVisualLine(segment []rune, actualRow, segOffset, segIdx int, cursorVisible bool) string {
+	if actualRow >= len(m.md.lines) {
+		return m.renderVisualLine(segment, actualRow, segOffset, segIdx, cursorVisible)
+	}
+	ml := m.md.lines[actualRow]
+
+	// Determine cursor position in display coordinates.
+	rawCursorCol := m.cursorCol
+	dispCursorCol := ml.rawColToDisplay(rawCursorCol)
+	needsCursor := m.focused && actualRow == m.cursorRow &&
+		dispCursorCol >= segOffset && dispCursorCol <= segOffset+len(segment)
+	localCol := dispCursorCol - segOffset
+
+	// Build styled output character by character.
+	var b strings.Builder
+	selStyle := lipgloss.NewStyle().Background(m.theme.Palette.Selection)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	for i, r := range segment {
+		dispCol := segOffset + i
+		kind := ml.regionAt(dispCol)
+		ch := string(r)
+
+		// Determine if this position is selected.
+		isSel := m.sel.active && m.selContainsDisplay(actualRow, dispCol, ml)
+
+		// Apply markdown style.
+		styled := ch
+		if kind != mdNone {
+			styled = m.mdStyle.styleFor(kind).Render(ch)
+		}
+
+		// Apply selection overlay.
+		if isSel {
+			styled = selStyle.Render(ch)
+		}
+
+		// Apply cursor overlay.
+		if needsCursor && cursorVisible && i == localCol {
+			styled = cursorStyle.Render(ch)
+		}
+
+		b.WriteString(styled)
+	}
+
+	// Cursor at end of segment.
+	if needsCursor && localCol >= len(segment) {
+		ghost := m.completer.GhostSuffix()
+		if len(ghost) > 0 {
+			ghostRunes := []rune(ghost)
+			mutedStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+			if cursorVisible {
+				b.WriteString(cursorStyle.Render(string(ghostRunes[:1])))
+			} else {
+				b.WriteString(mutedStyle.Render(string(ghostRunes[:1])))
+			}
+			if len(ghostRunes) > 1 {
+				b.WriteString(mutedStyle.Render(string(ghostRunes[1:])))
+			}
+		} else if cursorVisible {
+			b.WriteString(cursorStyle.Render(" "))
+		}
+	}
+
+	return b.String()
+}
+
+// selContainsDisplay checks if a display column on a given row is within the selection.
+// It converts the display column back to raw coordinates for the selection check.
+func (m *Model) selContainsDisplay(actualRow, dispCol int, ml mdLine) bool {
+	rawCol := ml.displayColToRaw(dispCol)
+	return m.sel.containsPos(m.cursorRow, m.cursorCol, actualRow, rawCol)
+}
+
+// applySelectionHighlight renders a segment with selection background highlight.
+func (m *Model) applySelectionHighlight(segment []rune, actualRow, segOffset int) string {
+	selStyle := lipgloss.NewStyle().Background(m.theme.Palette.Selection)
+
+	var b strings.Builder
+	inSel := false
+	var run []rune
+
+	flush := func() {
+		if len(run) == 0 {
+			return
+		}
+		s := string(run)
+		if inSel {
+			b.WriteString(selStyle.Render(s))
+		} else {
+			b.WriteString(s)
+		}
+		run = run[:0]
+	}
+
+	for i, r := range segment {
+		col := segOffset + i
+		sel := m.sel.containsPos(m.cursorRow, m.cursorCol, actualRow, col)
+		if sel != inSel {
+			flush()
+			inSel = sel
+		}
+		run = append(run, r)
+	}
+	flush()
+	return b.String()
+}
+
+// renderSelectionWithCursor renders a segment with selection background and
+// cursor overlay in a single pass, preventing the cursor from stripping
+// selection styling.
+func (m *Model) renderSelectionWithCursor(segment []rune, actualRow, segOffset int, needsCursor bool, localCol int, cursorVisible bool, ghost string) string {
+	selStyle := lipgloss.NewStyle().Background(m.theme.Palette.Selection)
+	cursorStyle := lipgloss.NewStyle().Reverse(true)
+
+	var b strings.Builder
+	for i, r := range segment {
+		col := segOffset + i
+		ch := string(r)
+		isSel := m.sel.containsPos(m.cursorRow, m.cursorCol, actualRow, col)
+
+		if needsCursor && cursorVisible && i == localCol {
+			b.WriteString(cursorStyle.Render(ch))
+		} else if isSel {
+			b.WriteString(selStyle.Render(ch))
+		} else {
+			b.WriteString(ch)
+		}
+	}
+
+	// Cursor at end of segment.
+	if needsCursor && localCol >= len(segment) {
+		ghostRunes := []rune(ghost)
+		mutedStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
+		if len(ghostRunes) > 0 {
+			if cursorVisible {
+				b.WriteString(cursorStyle.Render(string(ghostRunes[:1])))
+			} else {
+				b.WriteString(mutedStyle.Render(string(ghostRunes[:1])))
+			}
+			if len(ghostRunes) > 1 {
+				b.WriteString(mutedStyle.Render(string(ghostRunes[1:])))
+			}
+		} else if cursorVisible {
+			b.WriteString(cursorStyle.Render(" "))
+		}
+	} else if needsCursor && len(ghost) > 0 {
+		b.WriteString(m.renderGhost(ghost))
+	}
+
+	return b.String()
 }
 
 // renderGhost renders the ghost suffix in muted style, or "" if empty.

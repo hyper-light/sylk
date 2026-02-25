@@ -84,7 +84,7 @@ func readinessFooter(plan *DesignPlan) string {
 	default:
 		detail = fmt.Sprintf("**Plan ready** — %d tasks.", tasks)
 	}
-	return detail + "\nSay **go ahead** to begin execution, or ask me to refine specific parts."
+	return detail + "\nHanding off to the orchestrator for execution."
 }
 
 func planLayerCount(plan *DesignPlan) int {

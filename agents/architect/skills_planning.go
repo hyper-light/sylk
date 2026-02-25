@@ -380,7 +380,12 @@ func (a *Architect) publishDeclaration(declaration *PreDelegationDeclaration, se
 	}
 	msg := guide.NewRequestMessage(a.generateMessageID(), req)
 	msg.Metadata = map[string]any{"declaration": declaration}
-	_ = a.bus.Publish(guide.TopicGuideRequests, msg)
+	if err := a.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		a.logWarn("failed to publish pre-delegation declaration",
+			"declaration_id", declaration.ID,
+			"session_id", sessionID,
+			"error", err)
+	}
 }
 
 type validatePreDelegationParams struct {
@@ -435,67 +440,20 @@ func (a *Architect) findDeclaration(planID string, declarationID string) (*PreDe
 	return nil, fmt.Errorf("declaration not found: %s", declarationID)
 }
 
-type handoffParams struct {
-	PlanID        string `json:"plan_id"`
-	Summary       string `json:"summary,omitempty"`
-	FireAndForget bool   `json:"fire_and_forget,omitempty"`
-}
-
-func handoffToOrchestratorSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("handoff_to_orchestrator").
-		Description("Hand off a validated plan package to the Orchestrator for execution.").
-		Domain("coordination").
-		Keywords("handoff", "orchestrator", "dispatch", "execute plan").
-		Priority(90).
-		StringParam("plan_id", "Plan identifier to hand off", true).
-		StringParam("summary", "Optional handoff summary", false).
-		BoolParam("fire_and_forget", "Whether to avoid waiting for orchestrator response", false).
-		Usage("Use after a plan has been fully designed, consulted, and declared. Dispatches the plan package to the Orchestrator for DAG execution. Set fire_and_forget=true for background execution without waiting for the Orchestrator's acknowledgment. Do NOT hand off plans that are still in the consulting or designing phase.").
-		Example(`{"plan_id": "plan_abc", "summary": "WebSocket handler with 3 tasks: implement, test, lint", "fire_and_forget": false}`).
-		BestPractice("Prefer fire_and_forget=false for the first handoff so you receive the DAG execution ID for subsequent monitoring.").
-		BestPractice("After handoff, use `monitor_execution` to track progress rather than re-querying the plan state.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params handoffParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			plan, err := a.selectPlan(params.PlanID)
-			if err != nil {
-				return nil, err
-			}
-			payload := buildHandoffPayload(plan, params.Summary)
-			req := &guide.RouteRequest{
-				Input:         payload,
-				TargetAgentID: "orchestrator",
-				SessionID:     plan.SessionID,
-				FireAndForget: params.FireAndForget,
-			}
-			if params.FireAndForget {
-				if err := a.publishRouteRequest(req); err != nil {
-					return nil, err
-				}
-				return map[string]any{"status": "dispatched", "plan_id": plan.ID, "fire_and_forget": true}, nil
-			}
-			response, err := a.requestRouteSync(ctx, req)
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"status": "dispatched", "plan_id": plan.ID, "response": response.Payload}, nil
-		}).
-		Build()
-}
-
 // buildHandoffPayload serializes the plan as a structured PlanHandoff JSON
 // document. The orchestrator's ingest_plan skill parses this to create task
 // records, build a DAG, and begin execution.
+//
+// Returns an empty string on nil plan or marshal failure — callers MUST
+// validate the result via isPlanHandoffPayloadValid before sending.
 func buildHandoffPayload(plan *DesignPlan, trigger string) string {
 	if plan == nil {
-		return `{"error":"empty plan"}`
+		return ""
 	}
 	handoff := buildPlanHandoff(plan, trigger)
 	data, err := json.Marshal(handoff)
 	if err != nil {
-		return fmt.Sprintf(`{"error":"marshal failed: %s"}`, err.Error())
+		return ""
 	}
 	return string(data)
 }
@@ -536,7 +494,7 @@ func buildPlanHandoff(plan *DesignPlan, trigger string) *PlanHandoff {
 }
 
 func atomicTaskToHandoff(t *AtomicTask) *HandoffTask {
-	return &HandoffTask{
+	h := &HandoffTask{
 		ID:                  t.ID,
 		Name:                t.Name,
 		Description:         t.Description,
@@ -553,7 +511,14 @@ func atomicTaskToHandoff(t *AtomicTask) *HandoffTask {
 		AffectedFiles:       t.AffectedFiles,
 		TestRequirements:    t.TestRequirements,
 		RiskFactors:         t.RiskFactors,
+		CoAgents:            t.CoAgents,
+		MaxReviewRounds:     t.MaxReviewRounds,
+		AgentScopes:         t.AgentScopes,
 	}
+	if t.CollaborationMode != 0 {
+		h.CollaborationMode = t.CollaborationMode.String()
+	}
+	return h
 }
 
 type monitorExecutionParams struct {
@@ -720,15 +685,16 @@ type createFixDAGParams struct {
 
 func createFixDAGSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("create_fix_dag").
-		Description("Create a remediation workflow DAG from inspector/tester correction signals.").
+		Description("Build a remediation DAG structure from inspector/tester correction signals. Does NOT dispatch or execute the plan.").
 		Domain("planning").
-		Keywords("fix dag", "corrections", "repair workflow", "recovery plan").
+		Keywords("fix dag", "corrections", "repair structure", "remediation tasks").
 		Priority(85).
 		StringParam("plan_id", "Plan identifier to attach fix DAG to", false).
 		StringParam("session_id", "Session identifier", false).
 		ArrayParam("corrections", "Correction list from inspector/tester feedback", "object", true).
-		Usage("Use when Inspector or Tester feedback produces correction signals that need a remediation workflow. Builds a fix DAG from the correction list and attaches it to the specified plan. Each correction becomes an engineer task. Do NOT use for fresh feature work — this is strictly for remediation of existing plan failures.").
+		Usage("Use when Inspector or Tester feedback produces correction signals that need a remediation workflow. Builds a fix DAG from the correction list and attaches it to the specified plan. Each correction becomes an engineer task. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance followed by handle_plan_acceptance_result. Do NOT use for fresh feature work — this is strictly for remediation of existing plan failures.").
 		Example(`{"plan_id": "plan_abc", "corrections": [{"description": "Missing nil check in handler", "issue": "panic on nil input"}], "session_id": "sess_abc"}`).
+		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires: route_plan_acceptance → Guide verdict → handle_plan_acceptance_result.").
 		BestPractice("Review the generated task count — if corrections produce more than 5 tasks, consider revising the original plan rather than layering fixes.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			params, err := parseCreateFixDAGParams(input)
@@ -1300,4 +1266,421 @@ func buildResearchPlanningQuery(params *readResearchPaperParams, content string)
 		summary = truncateString(content, 600)
 	}
 	return fmt.Sprintf("Convert research proposal '%s' into execution plan. Summary: %s", slug, summary)
+}
+
+// ---------------------------------------------------------------------------
+// route_plan_acceptance — route plan + user response to Guide for evaluation
+// ---------------------------------------------------------------------------
+
+type routePlanAcceptanceParams struct {
+	PlanID       string `json:"plan_id"`
+	UserResponse string `json:"user_response"`
+}
+
+func routePlanAcceptanceSkill(a *Architect) *skills.Skill {
+	return skills.NewSkill("route_plan_acceptance").
+		Description("Route a ready plan and user response to the Guide for acceptance evaluation.").
+		Domain("coordination").
+		Keywords("plan", "acceptance", "evaluate", "approve", "reject", "feedback").
+		Priority(100).
+		StringParam("plan_id", "Plan identifier (uses latest ready plan if omitted)", false).
+		StringParam("user_response", "The user's verbatim response to the plan", true).
+		Usage("Use IMMEDIATELY after the user responds to a presented plan. Packages the plan text, plan ID, plan name, and user response into a structured payload and routes it to the Guide's evaluate-plan-acceptance skill. All four payload fields are derived by the handler — do NOT attempt to construct the evaluation payload manually. The Guide returns accept/modify/reject with optional modification notes.").
+		Example(`{"plan_id": "plan_abc", "user_response": "Looks good, but swap the task order for steps 2 and 3."}`).
+		BestPractice("Always call this skill for user responses to ready plans — do not classify acceptance yourself.").
+		BestPractice("If the result is 'modify', read the modifications list and apply changes via revise_plan before re-presenting.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			params, err := parseRoutePlanAcceptanceParams(input)
+			if err != nil {
+				return nil, err
+			}
+			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID)
+			if err != nil {
+				return nil, err
+			}
+			payload := buildPlanAcceptancePayload(plan, params.UserResponse)
+			return a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
+		}).
+		Build()
+}
+
+func parseRoutePlanAcceptanceParams(input json.RawMessage) (*routePlanAcceptanceParams, error) {
+	var params routePlanAcceptanceParams
+	if err := json.Unmarshal(input, &params); err != nil {
+		return nil, fmt.Errorf("invalid parameters: %w", err)
+	}
+	if strings.TrimSpace(params.UserResponse) == "" {
+		return nil, fmt.Errorf("user_response is required")
+	}
+	return &params, nil
+}
+
+// resolveReadyPlanForAcceptance locates the plan by ID or falls back to the
+// latest ready plan. Returns an error if no eligible plan exists.
+func (a *Architect) resolveReadyPlanForAcceptance(planID string) (*DesignPlan, error) {
+	if id := strings.TrimSpace(planID); id != "" {
+		plan, ok := a.GetActivePlan(id)
+		if !ok {
+			return nil, fmt.Errorf("plan not found: %s", id)
+		}
+		if plan.Status != PlanStatusReady {
+			return nil, fmt.Errorf("plan %s is not in ready status (current: %s)", id, plan.Status)
+		}
+		return plan, nil
+	}
+	plan := a.latestReadyPlan()
+	if plan == nil {
+		return nil, fmt.Errorf("no ready plan available for acceptance evaluation")
+	}
+	return plan, nil
+}
+
+// planAcceptancePayload is the exact structure the Guide's
+// evaluate-plan-acceptance skill requires. All fields are mandatory.
+type planAcceptancePayload struct {
+	Plan         string `json:"plan"`
+	PlanID       string `json:"plan_id"`
+	PlanName     string `json:"plan_name"`
+	UserResponse string `json:"user_response"`
+}
+
+// planAcceptanceResult is the full output contract matching the Guide's
+// evaluate-plan-acceptance SKILL.md output spec. Echoes all input fields
+// plus the classification result and modification notes.
+type planAcceptanceResult struct {
+	Plan          string   `json:"plan"`
+	PlanID        string   `json:"plan_id"`
+	PlanName      string   `json:"plan_name"`
+	UserResponse  string   `json:"user_response"`
+	Result        string   `json:"result"`
+	Modifications []string `json:"modifications"`
+}
+
+// buildPlanAcceptancePayload constructs the payload from plan data. Every field
+// is derived from the plan — the caller only provides the user's response text.
+func buildPlanAcceptancePayload(plan *DesignPlan, userResponse string) *planAcceptancePayload {
+	planText := formatPlanForChat(plan)
+	if planText == "" {
+		planText = strings.TrimSpace(plan.Query)
+	}
+	planName := derivePlanName(plan)
+	return &planAcceptancePayload{
+		Plan:         planText,
+		PlanID:       plan.ID,
+		PlanName:     planName,
+		UserResponse: userResponse,
+	}
+}
+
+// derivePlanName extracts a human-readable name from the plan's query or ID.
+func derivePlanName(plan *DesignPlan) string {
+	if plan == nil {
+		return ""
+	}
+	query := strings.TrimSpace(plan.Query)
+	if query != "" {
+		return truncateString(query, 120)
+	}
+	return plan.ID
+}
+
+// routePlanAcceptanceToGuide serializes the payload and sends it to the Guide
+// for evaluation via the bus. Returns the Guide's structured response.
+func (a *Architect) routePlanAcceptanceToGuide(
+	ctx context.Context,
+	sessionID string,
+	payload *planAcceptancePayload,
+) (any, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode acceptance payload: %w", err)
+	}
+
+	req := &guide.RouteRequest{
+		Input:         "evaluate-plan-acceptance: " + string(encoded),
+		TargetAgentID: "guide",
+		SessionID:     sessionID,
+	}
+
+	response, err := a.requestRouteSync(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("guide acceptance evaluation failed: %w", err)
+	}
+
+	return extractAcceptanceResult(response, payload)
+}
+
+// extractAcceptanceResult unwraps the Guide's response into a
+// planAcceptanceResult that satisfies the full SKILL.md output contract.
+// The four input fields are always populated from the original payload;
+// result and modifications are extracted from the Guide's response data.
+func extractAcceptanceResult(
+	msg *guide.Message,
+	payload *planAcceptancePayload,
+) (*planAcceptanceResult, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("empty response from guide acceptance evaluation")
+	}
+
+	resp, ok := msg.GetRouteResponse()
+	if !ok || resp == nil {
+		return nil, fmt.Errorf("unexpected response type from guide acceptance evaluation")
+	}
+
+	if !resp.Success {
+		return nil, fmt.Errorf("guide acceptance evaluation returned error: %s", resp.Error)
+	}
+
+	out := &planAcceptanceResult{
+		Plan:         payload.Plan,
+		PlanID:       payload.PlanID,
+		PlanName:     payload.PlanName,
+		UserResponse: payload.UserResponse,
+	}
+
+	data, ok := resp.Data.(map[string]any)
+	if !ok {
+		return out, nil
+	}
+
+	out.Result = acceptanceResultString(data)
+	out.Modifications = acceptanceModifications(data)
+	return out, nil
+}
+
+// acceptanceResultString extracts the "result" field from the Guide's
+// response, defaulting to empty string if absent or non-string.
+func acceptanceResultString(data map[string]any) string {
+	v, ok := data["result"]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+// acceptanceModifications extracts the "modifications" list from the Guide's
+// response. Returns nil if absent or not a string slice.
+func acceptanceModifications(data map[string]any) []string {
+	v, ok := data["modifications"]
+	if !ok {
+		return nil
+	}
+	raw, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	mods := make([]string, 0, len(raw))
+	for _, item := range raw {
+		s, ok := item.(string)
+		if !ok {
+			continue
+		}
+		if trimmed := strings.TrimSpace(s); trimmed != "" {
+			mods = append(mods, trimmed)
+		}
+	}
+	return mods
+}
+
+// =============================================================================
+// handle_plan_acceptance_result — Act on the Guide's plan evaluation verdict
+// =============================================================================
+
+// acceptanceVerdict enumerates the three outcomes from the Guide's
+// evaluate-plan-acceptance skill.
+type acceptanceVerdict string
+
+const (
+	verdictAccept acceptanceVerdict = "accept"
+	verdictModify acceptanceVerdict = "modify"
+	verdictReject acceptanceVerdict = "reject"
+)
+
+type handlePlanAcceptanceResultParams struct {
+	PlanID        string   `json:"plan_id"`
+	Result        string   `json:"result"`
+	UserResponse  string   `json:"user_response"`
+	Modifications []string `json:"modifications"`
+}
+
+func handlePlanAcceptanceResultSkill(a *Architect) *skills.Skill {
+	return skills.NewSkill("handle_plan_acceptance_result").
+		Description("Act on the Guide plan acceptance verdict to dispatch, revise, or request clarification.").
+		Domain("coordination").
+		Keywords("acceptance", "result", "dispatch", "modify", "reject", "verdict").
+		Priority(100).
+		StringParam("plan_id", "Plan identifier (uses latest ready plan if omitted)", false).
+		EnumParam("result", "The Guide's verdict", []string{"accept", "modify", "reject"}, true).
+		StringParam("user_response", "The user's original response that produced this verdict", true).
+		ArrayParam("modifications", "Modification notes from the Guide (required when result is modify or reject)", "string", false).
+		Usage("Use IMMEDIATELY after receiving the output from route_plan_acceptance. This skill acts on the Guide's verdict: accept dispatches to the orchestrator, modify applies revisions and re-routes for approval, reject asks the user for clarification and re-routes. Do NOT call this skill without first calling route_plan_acceptance — the inputs come directly from its output.").
+		Example(`{"plan_id": "plan_abc", "result": "modify", "user_response": "Swap steps 2 and 3", "modifications": ["Reorder task 2 and task 3"]}`).
+		BestPractice("Never skip this skill after route_plan_acceptance — the Guide's verdict must be acted on to close the feedback loop.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			params, err := parseAcceptanceResultParams(input)
+			if err != nil {
+				return nil, err
+			}
+			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID)
+			if err != nil {
+				return nil, err
+			}
+			verdict := acceptanceVerdict(params.Result)
+			switch verdict {
+			case verdictAccept:
+				return a.actOnAccept(ctx, plan)
+			case verdictModify:
+				return a.actOnModify(ctx, plan, params.UserResponse, params.Modifications)
+			case verdictReject:
+				return a.actOnReject(ctx, plan, params.UserResponse, params.Modifications)
+			default:
+				return nil, fmt.Errorf("unknown verdict: %q", params.Result)
+			}
+		}).
+		Build()
+}
+
+func parseAcceptanceResultParams(input json.RawMessage) (*handlePlanAcceptanceResultParams, error) {
+	var params handlePlanAcceptanceResultParams
+	if err := json.Unmarshal(input, &params); err != nil {
+		return nil, fmt.Errorf("invalid parameters: %w", err)
+	}
+	result := strings.TrimSpace(strings.ToLower(params.Result))
+	if result == "" {
+		return nil, fmt.Errorf("result is required")
+	}
+	params.Result = result
+	if strings.TrimSpace(params.UserResponse) == "" {
+		return nil, fmt.Errorf("user_response is required")
+	}
+	return &params, nil
+}
+
+// actOnAccept dispatches the plan to the orchestrator for execution.
+func (a *Architect) actOnAccept(ctx context.Context, plan *DesignPlan) (any, error) {
+	a.logInfo("actOnAccept: dispatching plan", "plan_id", plan.ID)
+
+	req := &ArchitectRequest{
+		ID:        uuid.New().String(),
+		Intent:    IntentExecute,
+		Query:     "user-approved plan execution",
+		SessionID: plan.SessionID,
+		Timestamp: time.Now(),
+	}
+	result, _ := a.dispatchPlanExecution(ctx, req, plan)
+	return result, nil
+}
+
+// actOnModify applies the user's modifications to the plan, then re-routes
+// the updated plan + user response back through the Guide for re-approval.
+func (a *Architect) actOnModify(
+	ctx context.Context,
+	plan *DesignPlan,
+	userResponse string,
+	modifications []string,
+) (any, error) {
+	a.logInfo("actOnModify: applying modifications",
+		"plan_id", plan.ID,
+		"modification_count", len(modifications))
+
+	reason := formatModificationReason(modifications)
+	a.applyPlanRevision(plan, reason, nil)
+
+	payload := buildPlanAcceptancePayload(plan, userResponse)
+	guideResult, err := a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
+	if err != nil {
+		return nil, fmt.Errorf("re-evaluation after modify failed: %w", err)
+	}
+
+	return map[string]any{
+		"action":           "modify",
+		"plan_id":          plan.ID,
+		"revision":         plan.Revision,
+		"modifications":    modifications,
+		"re_evaluation":    guideResult,
+		"directive":        "re_approval_requested",
+		"awaiting_user":    true,
+		"response_to_user": formatModifyResponse(modifications),
+	}, nil
+}
+
+// actOnReject records the rejection, then re-routes the plan + user response
+// back through the Guide so the user can provide clarification or correction.
+func (a *Architect) actOnReject(
+	ctx context.Context,
+	plan *DesignPlan,
+	userResponse string,
+	modifications []string,
+) (any, error) {
+	a.logInfo("actOnReject: plan rejected",
+		"plan_id", plan.ID,
+		"modification_count", len(modifications))
+
+	reason := "plan rejected by user"
+	if len(modifications) > 0 {
+		reason = "plan rejected: " + strings.Join(modifications, "; ")
+	}
+	a.applyPlanRevision(plan, reason, nil)
+
+	payload := buildPlanAcceptancePayload(plan, userResponse)
+	guideResult, err := a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
+	if err != nil {
+		return nil, fmt.Errorf("re-evaluation after reject failed: %w", err)
+	}
+
+	return map[string]any{
+		"action":           "reject",
+		"plan_id":          plan.ID,
+		"revision":         plan.Revision,
+		"modifications":    modifications,
+		"re_evaluation":    guideResult,
+		"directive":        "clarification_requested",
+		"awaiting_user":    true,
+		"response_to_user": formatRejectResponse(modifications),
+	}, nil
+}
+
+// formatModificationReason builds a revision reason string from modification
+// notes returned by the Guide's acceptance evaluation.
+func formatModificationReason(modifications []string) string {
+	if len(modifications) == 0 {
+		return "user requested modifications"
+	}
+	return "user modifications: " + strings.Join(modifications, "; ")
+}
+
+// formatModifyResponse builds the user-facing message after modifications are
+// applied, prompting for re-approval.
+func formatModifyResponse(modifications []string) string {
+	var b strings.Builder
+	b.WriteString("I've updated the plan with your requested changes")
+	if len(modifications) > 0 {
+		b.WriteString(":\n")
+		for i, mod := range modifications {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, mod))
+		}
+	} else {
+		b.WriteString(".\n")
+	}
+	b.WriteString("\nSay **go ahead** to proceed, or let me know what else to adjust.")
+	return b.String()
+}
+
+// formatRejectResponse builds the user-facing message after a rejection,
+// asking for clarification or a new direction.
+func formatRejectResponse(modifications []string) string {
+	var b strings.Builder
+	b.WriteString("I understand this plan doesn't work as-is.")
+	if len(modifications) > 0 {
+		b.WriteString(" Here's what I noted:\n")
+		for i, mod := range modifications {
+			b.WriteString(fmt.Sprintf("%d. %s\n", i+1, mod))
+		}
+	}
+	b.WriteString("\nCould you clarify what direction you'd prefer, or what specific changes would make this work?")
+	return b.String()
 }

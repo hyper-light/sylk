@@ -265,8 +265,7 @@ var modelContextLimits = map[string]int{
 	"codex-5.2":                  200000,
 	"gpt-4o":                     128000,
 	"gpt-4o-mini":                128000,
-	"gemini-3-pro":               2000000,
-	"gemini-3-pro-preview":       2000000,
+	"gemini-3.1-pro-preview":     2000000,
 	"gemini-3-flash":             1000000,
 }
 

@@ -32,7 +32,7 @@ var ClassificationToolSchema = map[string]any{
 		},
 		"intent": map[string]any{
 			"type":        "string",
-			"enum":        []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "help", "status", "chat", "unknown"},
+			"enum":        []string{"recall", "store", "check", "declare", "complete", "find", "search", "locate", "plan", "design", "execute", "help", "status", "chat", "unknown"},
 			"description": "The classified intent of the query",
 		},
 		"domain": map[string]any{

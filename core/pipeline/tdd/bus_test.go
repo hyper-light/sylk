@@ -5,7 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/adalundhe/sylk/agents/inspector"
+	"github.com/adalundhe/sylk/agents/engineer"
+	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 )
 
@@ -15,7 +16,7 @@ func TestPipelineBus_InspectorFeedbackRoundTrip(t *testing.T) {
 	ctx := context.Background()
 
 	fb := &InspectorFeedback{
-		Criteria: &inspector.InspectorCriteria{TaskID: "t1"},
+		Criteria: &inspShared.InspectorCriteria{TaskID: "t1"},
 	}
 	if err := bus.SendInspectorFeedback(ctx, fb); err != nil {
 		t.Fatal(err)
@@ -76,7 +77,7 @@ func TestPipelineBus_InspectorDoneRoundTrip(t *testing.T) {
 	defer bus.Close()
 	ctx := context.Background()
 
-	r := &inspector.InspectorResult{TaskID: "t2", Passed: true}
+	r := &inspShared.InspectorResult{TaskID: "t2", Passed: true}
 	if err := bus.SendInspectorDone(ctx, r); err != nil {
 		t.Fatal(err)
 	}
@@ -196,6 +197,62 @@ func TestPipelineBus_RecvOnClosedBus(t *testing.T) {
 	_, err := bus.RecvInspectorFeedback(context.Background())
 	if err != ErrBusClosed {
 		t.Errorf("expected ErrBusClosed, got %v", err)
+	}
+}
+
+func TestMergeWorkerResults(t *testing.T) {
+	primary := &WorkerResult{
+		TaskResult:   &engineer.TaskResult{TaskID: "t1", Success: true},
+		ChangedFiles: []string{"a.go", "b.go"},
+		WorkerType:   WorkerEngineer,
+	}
+	coResult := &WorkerResult{
+		TaskResult:   &engineer.TaskResult{TaskID: "t1", Success: true},
+		ChangedFiles: []string{"b.go", "c.go"},
+		WorkerType:   WorkerDesigner,
+	}
+
+	merged := mergeWorkerResults(primary, []*WorkerResult{coResult})
+	if merged.TaskResult.TaskID != "t1" {
+		t.Errorf("got TaskID %q, want %q", merged.TaskResult.TaskID, "t1")
+	}
+	if merged.WorkerType != WorkerEngineer {
+		t.Errorf("got WorkerType %q, want %q", merged.WorkerType, WorkerEngineer)
+	}
+	// Files should be deduplicated: a.go, b.go, c.go
+	if len(merged.ChangedFiles) != 3 {
+		t.Fatalf("got %d files, want 3: %v", len(merged.ChangedFiles), merged.ChangedFiles)
+	}
+	want := map[string]bool{"a.go": true, "b.go": true, "c.go": true}
+	for _, f := range merged.ChangedFiles {
+		if !want[f] {
+			t.Errorf("unexpected file %q", f)
+		}
+	}
+}
+
+func TestMergeWorkerResults_NoCo(t *testing.T) {
+	primary := &WorkerResult{
+		TaskResult:   &engineer.TaskResult{TaskID: "t1"},
+		ChangedFiles: []string{"x.go"},
+		WorkerType:   WorkerEngineer,
+	}
+	merged := mergeWorkerResults(primary, nil)
+	if merged != primary {
+		t.Error("expected same pointer returned when no co-results")
+	}
+
+	merged = mergeWorkerResults(primary, []*WorkerResult{})
+	if merged != primary {
+		t.Error("expected same pointer returned when empty co-results")
+	}
+}
+
+func TestMergeWorkerResults_NilPrimary(t *testing.T) {
+	co := &WorkerResult{ChangedFiles: []string{"y.go"}}
+	merged := mergeWorkerResults(nil, []*WorkerResult{co})
+	if merged != nil {
+		t.Error("expected nil when primary is nil")
 	}
 }
 

@@ -93,17 +93,77 @@ func TestResolveThinkingBudget(t *testing.T) {
 	})
 }
 
-func TestAppendThoughtDeltaAccumulatesFragments(t *testing.T) {
-	var thought strings.Builder
+func TestThoughtEmitter_BatchesEmissions(t *testing.T) {
+	// Create emitter with callback present.
+	ctx := withPlannerThoughtCallback(context.Background(), func(string, string) {})
+	emitter := newThoughtEmitter(ctx)
 
-	if got := appendThoughtDelta(&thought, "Clar"); got != "Clar" {
-		t.Fatalf("appendThoughtDelta(Clar) = %q, want %q", got, "Clar")
+	// First non-empty delta always emits (first-content trigger).
+	if got := emitter.addDelta("Clarifying"); got == "" {
+		t.Fatal("first non-empty delta should emit")
 	}
-	if got := appendThoughtDelta(&thought, "ifying questions"); got != "Clarifying questions" {
-		t.Fatalf("appendThoughtDelta(fragment) = %q, want %q", got, "Clarifying questions")
+
+	// Mid-word fragment — may or may not emit depending on doubling.
+	// " questions" (10 chars) brings buffer from 10 to 20, which is >= 10*2 → doubling.
+	if got := emitter.addDelta(" questions"); got == "" {
+		t.Fatal("doubling trigger should emit after buffer doubles")
 	}
-	if got := appendThoughtDelta(&thought, "."); got != "Clarifying questions." {
-		t.Fatalf("appendThoughtDelta(period) = %q, want %q", got, "Clarifying questions.")
+
+	// Sentence boundary (period) triggers emission.
+	if got := emitter.addDelta("."); got == "" {
+		t.Fatal("sentence boundary should trigger emission")
+	} else if got != "Clarifying questions." {
+		t.Fatalf("emission = %q, want %q", got, "Clarifying questions.")
+	}
+}
+
+func TestThoughtEmitter_NoCallback_SkipsEmission(t *testing.T) {
+	// Emitter without callback never emits snapshots.
+	emitter := newThoughtEmitter(context.Background())
+
+	if got := emitter.addDelta("some thought."); got != "" {
+		t.Fatalf("emitter without callback should skip emission, got %q", got)
+	}
+}
+
+func TestThoughtEmitter_DoublingTrigger(t *testing.T) {
+	ctx := withPlannerThoughtCallback(context.Background(), func(string, string) {})
+	emitter := newThoughtEmitter(ctx)
+
+	// First delta emits (first-content trigger), set lastEmitLen.
+	got := emitter.addDelta("a")
+	if got == "" {
+		t.Fatal("first delta should emit")
+	}
+	// "b" brings buffer to len=2 which is >= lastEmitLen(1)*2 → doubling trigger.
+	if got := emitter.addDelta("b"); got != "ab" {
+		t.Fatalf("doubling trigger should emit 'ab', got %q", got)
+	}
+	// Now lastEmitLen=2. Need buffer >= 4 to trigger again.
+	if got := emitter.addDelta("c"); got != "" {
+		t.Fatalf("should not emit at len=3, got %q", got)
+	}
+	if got := emitter.addDelta("d"); got != "abcd" {
+		t.Fatalf("doubling trigger at len=4 should emit 'abcd', got %q", got)
+	}
+}
+
+func TestContainsSentenceBoundary(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"hello", false},
+		{"hello.", true},
+		{"hello!", true},
+		{"hello?", true},
+		{"hello\nworld", true},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := containsSentenceBoundary(tt.input); got != tt.want {
+			t.Errorf("containsSentenceBoundary(%q) = %v, want %v", tt.input, got, tt.want)
+		}
 	}
 }
 
@@ -190,11 +250,20 @@ func (m *timeoutStreamProvider) StreamWithHandler(
 	return context.DeadlineExceeded
 }
 
+// testContextWindow and testMaxOutputTokens define the model parameters used by
+// newTestPlanner. Continuation bounds are derived from these via
+// deriveContinuationConfig: maxRounds = 16384/4096 = 4.
+const (
+	testContextWindow   = 16384
+	testMaxOutputTokens = 4096
+)
+
 func newTestPlanner(mock *mockStreamProvider) *anthropicPlanner {
 	return &anthropicPlanner{
 		provider:       mock,
-		maxTokens:      4096,
+		maxTokens:      testMaxOutputTokens,
 		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
 		system:         "test system",
 		timeout:        30 * time.Second,
 		logger:         slog.Default(),
@@ -285,8 +354,11 @@ func TestContinuation_SingleRound(t *testing.T) {
 }
 
 func TestContinuation_MaxRoundsExhausted(t *testing.T) {
-	// 1 initial + 4 continuation rounds = 5 calls, all max_tokens.
-	calls := make([]mockStreamCall, maxContinuationRounds+1)
+	// Derive round count from model parameters — no magic numbers.
+	cfg := deriveContinuationConfig(testContextWindow, testMaxOutputTokens, defaultCharsPerToken)
+	totalCalls := cfg.maxRounds + 1 // 1 initial + maxRounds continuation
+
+	calls := make([]mockStreamCall, totalCalls)
 	for i := range calls {
 		calls[i] = mockStreamCall{
 			Text:       fmt.Sprintf("part%d", i),
@@ -301,13 +373,13 @@ func TestContinuation_MaxRoundsExhausted(t *testing.T) {
 	onChunk := func(s string) { chunks = append(chunks, s) }
 
 	text, _, err := p.requestTextStreamingWithContinuation(
-		context.Background(), "prompt", 4096, "", "test", onChunk,
+		context.Background(), "prompt", testMaxOutputTokens, "", "test", onChunk,
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if mock.invoked != maxContinuationRounds+1 {
-		t.Fatalf("invoked = %d, want %d", mock.invoked, maxContinuationRounds+1)
+	if mock.invoked != totalCalls {
+		t.Fatalf("invoked = %d, want %d", mock.invoked, totalCalls)
 	}
 	// Returned text must NOT contain the indicator — it feeds into conversation
 	// history and would confuse the LLM into thinking the response failed.
@@ -478,15 +550,16 @@ func TestContinuation_RecoverFromTimeout(t *testing.T) {
 			}
 			return completionMock.StreamWithHandler(ctx, req, handler)
 		}),
-		maxTokens:      4096,
+		maxTokens:      testMaxOutputTokens,
 		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
 		system:         "test system",
 		timeout:        30 * time.Second,
 		logger:         slog.Default(),
 	}
 
 	text, _, err := p.requestTextStreamingWithContinuation(
-		context.Background(), "prompt", 4096, "", "test", nil,
+		context.Background(), "prompt", testMaxOutputTokens, "", "test", nil,
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
