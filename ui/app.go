@@ -855,6 +855,14 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		app.nerdFontsDetected = fonts.Detected()
 	}
 	app.fileTree.SetNerdFonts(app.nerdFontsDetected)
+	app.statusBar.SetNerdFonts(app.nerdFontsDetected)
+
+	// Probe initial auth state for provider status icons.
+	if deps.AuthRegistry != nil {
+		for _, provider := range []string{"google", "anthropic", "openai"} {
+			app.statusBar.SetAuthStatus(provider, deps.AuthRegistry.IsAvailable(provider))
+		}
+	}
 
 	// Git status watcher for file tree decorations. Use pre-created
 	// objects from parallel bootstrap when available.
@@ -3477,6 +3485,7 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 		if m.deps.AuthRegistry != nil {
 			m.deps.AuthRegistry.NotifyCredentialChanged(result.Provider, result.Method)
 		}
+		m.statusBar.SetAuthStatus(result.Provider, true)
 		return nil
 	}
 
@@ -12177,6 +12186,18 @@ func (m *AppModel) syncViewState() {
 			component.FocusCommitTree,
 		})
 		m.rightRing.reset(nil)
+	}
+
+	// When chat mode is active, ensure Chat is visible in the right
+	// ring. In ThreeColumn+ Chat has a dedicated column and is absent
+	// from the right ring, so setTo is a no-op. In TwoColumn, Chat
+	// shares the right ring and must be selected — otherwise a
+	// ThreeColumn→TwoColumn transition preserves the previous panel
+	// (CodeViewer) and the chat panel disappears.
+	if m.viewMode == ViewChat {
+		if !m.rightRing.empty() {
+			m.rightRing.setTo(component.FocusChat)
+		}
 	}
 
 	// When edit mode is active, ensure CodeViewer is visible in the

@@ -138,6 +138,30 @@ type gitBootResult struct {
 	guard   *git.SafetyGuard
 }
 
+type hydrateResult struct{ hydrated *providers.HydratedGoogleAuth }
+
+// hydrateOnceCell is a one-shot rendezvous: the hydration goroutine calls
+// resolve() exactly once; consumers call result() and block until the value
+// is available. After the first resolve, result() returns immediately.
+type hydrateOnceCell struct {
+	ch  chan struct{}
+	val atomic.Pointer[providers.HydratedGoogleAuth]
+}
+
+func newHydrateOnce() *hydrateOnceCell {
+	return &hydrateOnceCell{ch: make(chan struct{})}
+}
+
+func (h *hydrateOnceCell) resolve(v *providers.HydratedGoogleAuth) {
+	h.val.Store(v)
+	close(h.ch)
+}
+
+func (h *hydrateOnceCell) result() *providers.HydratedGoogleAuth {
+	<-h.ch
+	return h.val.Load()
+}
+
 // bootstrapDeps initializes the core systems needed by the TUI.
 // Agents run inside containers managed by the container runtime.
 // DaemonSets keep Guide and Orchestrator always-hot; on-demand agents
@@ -152,6 +176,12 @@ type gitBootResult struct {
 func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.Deps, func() error, error) {
 	_ = mockMode
 	start := time.Now()
+
+	// Load .env.local before anything reads environment variables.
+	// Existing env vars take priority — LoadDotenv never overrides.
+	if err := boot.LoadDotenv(projectRoot); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to load .env.local", "error", err)
+	}
 
 	// =================================================================
 	// Phase 1: Infrastructure (sequential, ~15ms)
@@ -218,36 +248,16 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	}
 
 	// =================================================================
-	// Phase 1.5: Shared Google auth hydration (before parallel creation)
+	// Phase 1.5: Google config + gateways (hydration deferred to Phase 2)
 	// =================================================================
-	// Performs OAuth resolve + Code Assist setup once so the parallel
-	// Guide and Orchestrator goroutines don't race two setup requests
-	// against the same quota window.
-
-	const (
-		hydrateMaxAttempts = 3
-		hydrateRetryDelay  = 2 * time.Second
-	)
+	// Hydration runs as a Phase 2 goroutine. Guide and Orchestrator
+	// factories block on hydrateOnce.result() — exactly one hydration
+	// call, shared by all consumers. Non-daemon factories (restart /
+	// on-demand) read hydratedRef atomically after the initial boot.
 
 	guideCfg := defaultGuideGoogleConfig()
-	var hydrated *providers.HydratedGoogleAuth
-	for attempt := 1; attempt <= hydrateMaxAttempts; attempt++ {
-		h, err := providers.HydrateGoogleAuth(ctx, guideCfg)
-		if err == nil {
-			hydrated = h
-			break
-		}
-		slog.Warn("google auth hydration attempt failed",
-			"attempt", attempt,
-			"max", hydrateMaxAttempts,
-			"error", err)
-		if attempt < hydrateMaxAttempts {
-			select {
-			case <-ctx.Done():
-			case <-time.After(hydrateRetryDelay):
-			}
-		}
-	}
+	hydrateOnce := newHydrateOnce()
+	var hydratedRef atomic.Pointer[providers.HydratedGoogleAuth]
 
 	// Create provider gateways for cross-agent rate limiting coordination.
 	// Select rate limit profile based on actual auth mode, not hydration status.
@@ -261,9 +271,10 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	anthropicGateway := gateway.NewProviderGateway(gateway.DefaultAnthropicConfig(), slog.Default())
 	openaiGateway := gateway.NewProviderGateway(gateway.DefaultOpenAIConfig(), slog.Default())
 
-	// Register agent creators after hydration so closures capture the
-	// resolved auth state — avoids duplicate OAuth / Code Assist setup.
-	registerAgentCreators(creatorReg, guideBus, activityBus, projectRoot, hydrated, googleGateway, anthropicGateway, openaiGateway)
+	// Register agent creators. During initial boot, Guide/Orch factories
+	// call hydrateOnce.result() to wait for the shared hydration. After
+	// boot, daemon restarts read hydratedRef atomically (already stored).
+	registerAgentCreators(creatorReg, guideBus, activityBus, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
 
@@ -281,12 +292,18 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// Phase 2 — the cancel context is never passed to them.
 	_, parallelCancel := context.WithCancel(ctx)
 
+	const (
+		hydrateMaxAttempts = 3
+		hydrateRetryDelay  = 500 * time.Millisecond
+	)
+
 	guideCh := make(chan daemonContainerResult, 1)
 	orchCh := make(chan daemonContainerResult, 1)
 	activationCh := make(chan activationCtrlResult, 1)
 	healthCh := make(chan error, 1)
 	fontCh := make(chan fontResult, 1)
 	gitCh := make(chan gitBootResult, 1)
+	hydrateCh := make(chan hydrateResult, 1)
 
 	// A: Guide container — uses the long-lived `ctx` for CreateContainer
 	// so the agent's run-context outlives Phase 2.
@@ -389,8 +406,36 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		gitCh <- result
 	}()
 
+	// G: Hydration — runs concurrently with all other Phase 2 goroutines.
+	// Guide and Orch factories block on hydrateOnce.result() so all
+	// three share a single hydration call. hydratedRef is stored for
+	// daemon restart factories that read it atomically after boot.
+	go func() {
+		var h *providers.HydratedGoogleAuth
+		for attempt := 1; attempt <= hydrateMaxAttempts; attempt++ {
+			result, err := providers.HydrateGoogleAuth(ctx, guideCfg)
+			if err == nil {
+				h = result
+				hydratedRef.Store(h)
+				break
+			}
+			slog.Warn("google auth hydration attempt failed",
+				"attempt", attempt,
+				"max", hydrateMaxAttempts,
+				"error", err)
+			if attempt < hydrateMaxAttempts {
+				select {
+				case <-ctx.Done():
+				case <-time.After(hydrateRetryDelay):
+				}
+			}
+		}
+		hydrateOnce.resolve(h)
+		hydrateCh <- hydrateResult{hydrated: h}
+	}()
+
 	// Collect results. Use select with nil-channel disabling to drain
-	// all 6 channels. Critical errors cancel remaining goroutines.
+	// all 7 channels. Critical errors cancel remaining goroutines.
 	var (
 		guideResult daemonContainerResult
 		orchResult  daemonContainerResult
@@ -400,7 +445,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		criticalErr error
 	)
 
-	for completed := 0; completed < 6; completed++ {
+	for completed := 0; completed < 7; completed++ {
 		select {
 		case r := <-guideCh:
 			guideResult = r
@@ -438,6 +483,9 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		case r := <-gitCh:
 			gitRes = r
 			gitCh = nil
+
+		case <-hydrateCh:
+			hydrateCh = nil
 		}
 	}
 	parallelCancel()
@@ -539,63 +587,10 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 
 	// =================================================================
-	// Phase 4: Post-wiring
+	// Phase 4: Critical path (session + seeds) + background activation
 	// =================================================================
 
 	phase4Start := time.Now()
-
-	// Seed the agent panel with all known global agents unconditionally.
-	// Pre-activation is best-effort — provider may be unavailable (missing
-	// API key, network error, etc.) but the agent should still be visible
-	// in the UI as idle. It becomes functional on first successful route.
-	seeds := []ui.AgentSeed{
-		{ID: "architect", AgentType: "architect", Name: "Architect"},
-		{ID: "inspector", AgentType: "inspector", Name: "Inspector"},
-		{ID: "tester", AgentType: "tester", Name: "Tester"},
-	}
-
-	// Pre-activate Architect (commonly used first).
-	if activationCtrl != nil {
-		if _, err := activationCtrl.EnsureActive(ctx, "architect"); err != nil {
-			slog.Warn("architect pre-activation failed", "error", err)
-		} else {
-			arch, archErr := extractAgent[*architect.Architect](containerReg, "architect")
-			if archErr == nil {
-				_ = registerArchitectWithGuide(g, arch)
-				seeds[0].ID = arch.AgentID()
-			}
-		}
-	}
-
-	// Pre-activate Inspector.
-	if activationCtrl != nil {
-		if _, err := activationCtrl.EnsureActive(ctx, "inspector"); err != nil {
-			slog.Warn("inspector pre-activation failed", "error", err)
-		} else {
-			gi, giErr := extractAgent[*inspectorGlobal.GlobalInspector](containerReg, "inspector")
-			if giErr == nil {
-				_ = registerAgentWithGuide(g, gi, "inspector")
-				seeds[1].ID = gi.AgentID()
-			}
-		}
-	}
-
-	// Pre-activate Tester.
-	if activationCtrl != nil {
-		if _, err := activationCtrl.EnsureActive(ctx, "tester"); err != nil {
-			slog.Warn("tester pre-activation failed", "error", err)
-		} else {
-			gt, gtErr := extractAgent[*globaltester.GlobalTester](containerReg, "tester")
-			if gtErr == nil {
-				_ = registerAgentWithGuide(g, gt, "tester")
-				seeds[2].ID = gt.AgentID()
-			}
-		}
-	}
-
-	// Extract the architect reference (may be nil if pre-activation failed).
-	arch, _ := extractAgent[*architect.Architect](containerReg, "architect")
-	supervisor := bootstrapHandoffSupervisor(g, arch, orch, serviceReg)
 
 	defaultSession, err := sessionMgr.Create(ctx, session.DefaultConfig())
 	if err != nil {
@@ -606,12 +601,100 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 	orch.SignalReady()
 
-	// Initial credential probe — triggers auth broadcasts to all
-	// agents that started in degraded mode.
-	authRegistry.ProbeAll()
+	// Seeds use placeholder IDs (agent type names). The UI's
+	// ensureAgent/promoteSeededAgent re-keys to UUIDs when activity
+	// events arrive from pre-activated agents.
+	seeds := []ui.AgentSeed{
+		{ID: "architect", AgentType: "architect", Name: "Architect"},
+		{ID: "inspector", AgentType: "inspector", Name: "Inspector"},
+		{ID: "tester", AgentType: "tester", Name: "Tester"},
+	}
 
-	slog.Info("bootstrap phase 4 complete", "elapsed", time.Since(phase4Start))
-	slog.Info("bootstrap total", "elapsed", time.Since(start))
+	// Background Phase 4: agent pre-activations, handoff supervisor,
+	// and auth probe run after deps are returned. Tracked by scope.Go
+	// so the goroutine is bounded and cancelable.
+	var supervisorRef atomic.Pointer[handoff.HandoffSupervisor]
+	phase4Done := make(chan struct{})
+
+	_ = scope.Go("phase4-background", 0, func(bgCtx context.Context) error {
+		defer close(phase4Done)
+
+		var wg sync.WaitGroup
+
+		// A: Agent pre-activations (3 parallel goroutines)
+		if activationCtrl != nil {
+			wg.Add(3)
+			go func() {
+				defer wg.Done()
+				if _, err := activationCtrl.EnsureActive(bgCtx, "architect"); err != nil {
+					return
+				}
+				arch, err := extractAgent[*architect.Architect](containerReg, "architect")
+				if err != nil {
+					return
+				}
+				_ = registerArchitectWithGuide(g, arch)
+			}()
+			go func() {
+				defer wg.Done()
+				if _, err := activationCtrl.EnsureActive(bgCtx, "inspector"); err != nil {
+					return
+				}
+				gi, err := extractAgent[*inspectorGlobal.GlobalInspector](containerReg, "inspector")
+				if err != nil {
+					return
+				}
+				_ = registerAgentWithGuide(g, gi, "inspector")
+			}()
+			go func() {
+				defer wg.Done()
+				if _, err := activationCtrl.EnsureActive(bgCtx, "tester"); err != nil {
+					return
+				}
+				gt, err := extractAgent[*globaltester.GlobalTester](containerReg, "tester")
+				if err != nil {
+					return
+				}
+				_ = registerAgentWithGuide(g, gt, "tester")
+			}()
+		}
+
+		// B: Handoff supervisor (tolerates nil arch)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sup := bootstrapHandoffSupervisor(g, nil, orch, serviceReg)
+			if sup != nil {
+				supervisorRef.Store(sup)
+			}
+		}()
+
+		// C: Auth probe
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			authRegistry.ProbeAll()
+		}()
+
+		wg.Wait()
+
+		// Late-register architect with handoff supervisor if both succeeded.
+		// HandoffAgentFactory uses sync.RWMutex — thread-safe after Start().
+		if sup := supervisorRef.Load(); sup != nil {
+			if arch, archErr := extractAgent[*architect.Architect](containerReg, "architect"); archErr == nil {
+				sup.Factory().RegisterCreator("architect",
+					func(_ context.Context) (handoff.HandoffableAgent, error) {
+						return arch, nil
+					})
+				registerHandoffAgent(sup, arch)
+			}
+		}
+
+		slog.Info("bootstrap phase 4 background complete", "elapsed", time.Since(phase4Start))
+		return nil
+	})
+
+	slog.Info("bootstrap critical path complete", "elapsed", time.Since(start))
 
 	// =================================================================
 	// Cleanup — ordered teardown
@@ -621,10 +704,16 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 
+		// Wait for background Phase 4 before teardown.
+		select {
+		case <-phase4Done:
+		case <-shutdownCtx.Done():
+		}
+
 		var errs []error
 
-		if supervisor != nil {
-			if stopErr := supervisor.Stop(); stopErr != nil {
+		if sup := supervisorRef.Load(); sup != nil {
+			if stopErr := sup.Stop(); stopErr != nil {
 				errs = append(errs, stopErr)
 			}
 		}
@@ -685,22 +774,29 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 // =============================================================================
 
 // registerAgentCreators populates the creator registry with factory closures
-// for every agent type. Each factory creates and starts the agent on the bus.
-// hydrated may be nil when auth hydration failed — Guide/Orchestrator fall
-// back to rule-based or LLM-less mode in that case.
+// for every agent type. Guide and Orchestrator block on hydrateOnce.result()
+// during initial boot so all share a single hydration. After boot, daemon
+// restart factories read hydratedRef atomically (already populated).
 func registerAgentCreators(
 	reg *container.AgentCreatorRegistry,
 	bus guide.EventBus,
 	actBus *events.ActivityEventBus,
 	projectRoot string,
-	hydrated *providers.HydratedGoogleAuth,
+	hydrateOnce *hydrateOnceCell,
+	hydratedRef *atomic.Pointer[providers.HydratedGoogleAuth],
 	googleGw *gateway.ProviderGateway,
 	anthropicGw *gateway.ProviderGateway,
 	openaiGw *gateway.ProviderGateway,
 ) {
 	// Guide — Gemini with rule-based fallback.
+	// First call blocks on hydrateOnce; subsequent calls (daemon restart)
+	// read hydratedRef which is already populated.
 	reg.Register("guide", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapLiveGuide(ctx, bus, actBus, hydrated, googleGw)
+		h := hydrateOnce.result()
+		if h == nil {
+			h = hydratedRef.Load()
+		}
+		return bootstrapLiveGuide(ctx, bus, actBus, h, googleGw)
 	})
 
 	// Architect — Anthropic LLM planner. Gets read-only DiskFileAccess.
@@ -710,7 +806,11 @@ func registerAgentCreators(
 
 	// Orchestrator — pipeline coordinator.
 	reg.Register("orchestrator", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapOrchestrator(ctx, bus, actBus, projectRoot, hydrated, googleGw)
+		h := hydrateOnce.result()
+		if h == nil {
+			h = hydratedRef.Load()
+		}
+		return bootstrapOrchestrator(ctx, bus, actBus, projectRoot, h, googleGw)
 	})
 
 	// On-demand agents — created lazily by the ActivationController.

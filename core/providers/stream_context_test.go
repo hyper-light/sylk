@@ -2,6 +2,7 @@ package providers
 
 import (
 	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -183,7 +184,7 @@ func TestWrapStreamChunk(t *testing.T) {
 		t.Errorf("ParentID = %q, want %q", msg.ParentID, ctx.RequestID)
 	}
 
-	if msg.Payload != *chunk {
+	if !reflect.DeepEqual(msg.Payload, *chunk) {
 		t.Error("Payload should be the original chunk")
 	}
 

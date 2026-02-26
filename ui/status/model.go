@@ -59,6 +59,7 @@ type Model struct {
 	viewRingHint string
 
 	// Right section
+	authIcons     *AuthIconDisplay
 	tokens        *TokenDisplay
 	droppedEvents atomic.Int64
 
@@ -73,11 +74,12 @@ func (m *Model) ViewDirty() bool { return m.viewDirty }
 // New creates a status bar Model bound to the given theme and session manager.
 func New(t *theme.Theme, mgr *session.Manager) *Model {
 	return &Model{
-		theme:   t,
-		manager: mgr,
-		mode:    "CHAT",
-		spinner: NewSpinner(),
-		tokens:  NewTokenDisplay(t.StatusBar, t.StatusNormal),
+		theme:     t,
+		manager:   mgr,
+		mode:      "CHAT",
+		spinner:   NewSpinner(),
+		authIcons: NewAuthIconDisplay(t.StatusBar, t.StatusNormal, t.StatusError),
+		tokens:    NewTokenDisplay(t.StatusBar, t.StatusNormal),
 	}
 }
 
@@ -129,7 +131,7 @@ func (m *Model) View() string {
 
 	leftSection := left + sep + center
 	fixedWidth := lipgloss.Width(leftSection) + lipgloss.Width(sep) + lipgloss.Width(right)
-	padWidth := max(contentWidth-fixedWidth, 0)
+	padWidth := max(contentWidth-fixedWidth-m.authIcons.WidthCorrection(), 0)
 
 	padding := m.theme.StatusBar.Render(repeatSpace(padWidth))
 	content := leftSection + padding + sep + right
@@ -199,6 +201,18 @@ func (m *Model) SetTokens(prompt, completion int) {
 // SetTokenPhase sets which token counter is actively updating.
 func (m *Model) SetTokenPhase(phase TokenPhase) {
 	m.tokens.SetPhase(phase)
+	m.viewDirty = true
+}
+
+// SetAuthStatus updates the auth availability for a provider icon.
+func (m *Model) SetAuthStatus(provider string, available bool) {
+	m.authIcons.SetAvailable(provider, available)
+	m.viewDirty = true
+}
+
+// SetNerdFonts toggles Nerd Font glyphs on the auth icons.
+func (m *Model) SetNerdFonts(detected bool) {
+	m.authIcons.SetNerdFonts(detected)
 	m.viewDirty = true
 }
 
@@ -318,17 +332,20 @@ func (m *Model) renderCenter() string {
 }
 
 func (m *Model) renderRight() string {
-	parts := []string{m.tokens.View()}
+	auth := m.authIcons.View()
+	sep := m.theme.StatusBar.Render(separatorChar)
+	tokens := m.tokens.View()
+
+	result := auth + sep + tokens
 
 	dropped := m.droppedEvents.Load()
 	if dropped > 0 {
-		indicator := m.theme.StatusWarning.Render(
+		result += m.theme.StatusWarning.Render(
 			fmt.Sprintf(" %s%d", droppedWarningPrefix, dropped),
 		)
-		parts = append(parts, indicator)
 	}
 
-	return lipgloss.JoinHorizontal(lipgloss.Center, parts...)
+	return result
 }
 
 // -- Helpers ----------------------------------------------------------------

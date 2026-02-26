@@ -3,6 +3,7 @@ package guide
 import (
 	"time"
 
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/google/uuid"
 )
@@ -357,6 +358,9 @@ const (
 
 	// MessageTypeLayerDecisionResponse carries the user's decision for a blocking layer.
 	MessageTypeLayerDecisionResponse MessageType = "layer_decision_response"
+
+	// MessageTypeActivity wraps an ActivityEvent routed through the ChannelBus.
+	MessageTypeActivity MessageType = "activity"
 )
 
 // =============================================================================
@@ -433,6 +437,10 @@ const (
 	// availability changes. DaemonSet agents subscribe directly; on-demand
 	// agents are refreshed via the container-walk refresher.
 	TopicAuthCredentials = "auth.credentials"
+
+	// TopicActivity is where activity events are published after migration
+	// from the standalone ActivityEventBus to the Guide ChannelBus.
+	TopicActivity = "activity.events"
 )
 
 // AgentTopic returns the topic for a specific agent and channel type
@@ -962,5 +970,29 @@ func NewAuthChangedMessage(id string, event AuthEventPayload) *Message {
 // GetAuthEvent extracts AuthEventPayload from message payload.
 func (m *Message) GetAuthEvent() (*AuthEventPayload, bool) {
 	ev, ok := m.Payload.(*AuthEventPayload)
+	return ev, ok
+}
+
+// =============================================================================
+// Activity Messages (for ActivityEventBus → ChannelBus migration)
+// =============================================================================
+
+// NewActivityMessage wraps an ActivityEvent as a ChannelBus message.
+func NewActivityMessage(sourceAgentID string, event *events.ActivityEvent) *Message {
+	return &Message{
+		ID:            uuid.New().String(),
+		Type:          MessageTypeActivity,
+		Payload:       event,
+		SourceAgentID: sourceAgentID,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityLow,
+	}
+}
+
+// GetActivityEvent extracts an ActivityEvent from the message payload.
+func (m *Message) GetActivityEvent() (*events.ActivityEvent, bool) {
+	ev, ok := m.Payload.(*events.ActivityEvent)
 	return ev, ok
 }
