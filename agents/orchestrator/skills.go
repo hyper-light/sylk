@@ -211,7 +211,7 @@ func reportFailureSkill(o *Orchestrator) *skills.Skill {
 			}
 
 			if ok {
-				go o.submitTaskEvent(task)
+				o.submitTaskEventAsync(task)
 			}
 
 			return map[string]any{"reported": true, "task_id": params.TaskID}, nil
@@ -250,7 +250,7 @@ func submitTaskEventSkill(o *Orchestrator) *skills.Skill {
 				return map[string]any{"submitted": false, "reason": "task not in terminal state"}, nil
 			}
 
-			go o.submitTaskEvent(task)
+			o.submitTaskEventAsync(task)
 			return map[string]any{"submitted": true, "task_id": params.TaskID}, nil
 		}).
 		Build()

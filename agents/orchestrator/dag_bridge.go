@@ -50,6 +50,7 @@ type ActiveDAGMeta struct {
 	Revision   int
 	Dispatcher *BusNodeDispatcher
 	CancelFunc context.CancelFunc
+	Unsub      func()
 	StartedAt  time.Time
 }
 
@@ -70,7 +71,6 @@ type DAGBridge struct {
 	activityPub events.ActivityPublisher
 	activeDAGs  map[string]*ActiveDAGMeta
 	gates       map[string]*dag.DecisionGate // per-DAG decision gates
-	unsubs      []func()                     // scheduler event unsubscribe functions
 }
 
 // NewDAGBridge creates a bridge between the DAG scheduler and orchestrator subsystems.
@@ -170,7 +170,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	// 5. Subscribe to DAG events for WAL/SQLite forwarding
 	unsub := b.scheduler.Subscribe(b.dagEventForwarder(d.ID(), planID))
 	b.mu.Lock()
-	b.unsubs = append(b.unsubs, unsub)
+	b.activeDAGs[d.ID()].Unsub = unsub
 	b.mu.Unlock()
 
 	// 6. Submit to scheduler (async execution)
@@ -295,15 +295,20 @@ func (b *DAGBridge) RecoverFromWAL(ctx context.Context) error {
 	return nil
 }
 
-// Close shuts down the scheduler and unsubscribes events.
+// Close shuts down the scheduler and unsubscribes remaining per-DAG event handlers.
 func (b *DAGBridge) Close() error {
 	b.mu.Lock()
-	unsubs := b.unsubs
-	b.unsubs = nil
+	remaining := make([]*ActiveDAGMeta, 0, len(b.activeDAGs))
+	for _, meta := range b.activeDAGs {
+		remaining = append(remaining, meta)
+	}
+	b.activeDAGs = make(map[string]*ActiveDAGMeta)
 	b.mu.Unlock()
 
-	for _, unsub := range unsubs {
-		unsub()
+	for _, meta := range remaining {
+		if meta.Unsub != nil {
+			meta.Unsub()
+		}
 	}
 	return b.scheduler.Close()
 }
@@ -385,9 +390,14 @@ func (b *DAGBridge) onDAGFailed(dagID, planID, errMsg string) {
 
 func (b *DAGBridge) cleanupDAG(dagID string) {
 	b.mu.Lock()
+	meta := b.activeDAGs[dagID]
 	delete(b.activeDAGs, dagID)
 	delete(b.gates, dagID)
 	b.mu.Unlock()
+
+	if meta != nil && meta.Unsub != nil {
+		meta.Unsub()
+	}
 }
 
 func (b *DAGBridge) publishDAGStatusToBus(dagID, state, errMsg string) {

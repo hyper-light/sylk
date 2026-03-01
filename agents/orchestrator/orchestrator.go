@@ -933,7 +933,7 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 		}
 	}
 
-	go o.submitTaskEvent(task)
+	o.submitTaskEventAsync(task)
 
 	o.pushEvent(&busEvent{
 		Topic:    "tasks.complete",
@@ -979,7 +979,7 @@ func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 		}
 	}
 
-	go o.submitTaskEvent(task)
+	o.submitTaskEventAsync(task)
 
 	o.pushEvent(&busEvent{
 		Topic:    "tasks.failed",
@@ -1082,14 +1082,35 @@ func (o *Orchestrator) updateWorkflowProgress(workflowID string) {
 }
 
 // submitTaskEvent submits a task event to Archivalist for terminal states
-func (o *Orchestrator) submitTaskEvent(task *TaskRecord) {
+const submitTaskEventTimeout = 30 * time.Second
+
+// submitTaskEventAsync dispatches submitTaskEventCtx via the GoroutineScope,
+// replacing all former bare `go o.submitTaskEvent(task)` call sites.
+func (o *Orchestrator) submitTaskEventAsync(task *TaskRecord) {
+	if o.scope == nil {
+		return
+	}
+	o.scope.Go("submit-task-event", submitTaskEventTimeout, func(ctx context.Context) error {
+		o.submitTaskEventCtx(ctx, task)
+		return nil
+	})
+}
+
+// submitTaskEventCtx submits a terminal task event to Archivalist using the
+// provided context (from scope) instead of context.Background(). Acquires
+// o.mu to read task fields atomically, fixing the prior data-race on
+// task.EventSubmitted.
+func (o *Orchestrator) submitTaskEventCtx(ctx context.Context, task *TaskRecord) {
 	if !o.config.ArchivalistEnabled {
 		return
 	}
-	if task.EventSubmitted {
-		return
-	}
-	if !task.Status.IsTerminal() {
+
+	o.mu.RLock()
+	alreadySubmitted := task.EventSubmitted
+	isTerminal := task.Status.IsTerminal()
+	o.mu.RUnlock()
+
+	if alreadySubmitted || !isTerminal {
 		return
 	}
 
@@ -1114,7 +1135,7 @@ func (o *Orchestrator) submitTaskEvent(task *TaskRecord) {
 		event.Duration = time.Since(*task.StartedAt)
 	}
 
-	o.SubmitEventToArchivalist(context.Background(), event)
+	o.SubmitEventToArchivalist(ctx, event)
 
 	o.mu.Lock()
 	task.EventSubmitted = true
@@ -1177,8 +1198,21 @@ func (o *Orchestrator) PushStatusUpdate(update *StatusUpdate) {
 	defer o.mu.Unlock()
 
 	if o.state.UpdateBuffer.Add(update) {
-		go o.flushUpdateBuffer()
+		o.flushUpdateBufferAsync()
 	}
+}
+
+const flushUpdateBufferTimeout = 10 * time.Second
+
+// flushUpdateBufferAsync dispatches flushUpdateBuffer via the GoroutineScope.
+func (o *Orchestrator) flushUpdateBufferAsync() {
+	if o.scope == nil {
+		return
+	}
+	o.scope.Go("flush-update-buffer", flushUpdateBufferTimeout, func(ctx context.Context) error {
+		o.flushUpdateBuffer()
+		return nil
+	})
 }
 
 func (o *Orchestrator) flushUpdateBuffer() {
@@ -1204,7 +1238,7 @@ func (o *Orchestrator) processStatusUpdate(update *StatusUpdate) {
 		if update.Status.IsTerminal() {
 			now := time.Now()
 			task.CompletedAt = &now
-			go o.submitTaskEvent(task)
+			o.submitTaskEventAsync(task)
 		}
 	}
 }

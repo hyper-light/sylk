@@ -296,7 +296,9 @@ func (c *Compositor) ResizeVerticalQuick(mainH, queueH, inputH, statusH int) {
 	c.statusDirty = true
 
 	c.hasCache = false
-	c.joined = ""
+	// c.joined is intentionally NOT cleared. The previous frame string
+	// is preserved so the fast resize path in View() can truncate/pad it
+	// to the new height without recomposing from shifted boundaries.
 }
 
 // AllMainSlotsCached reports whether every column slot in the main area
@@ -309,6 +311,24 @@ func (c *Compositor) AllMainSlotsCached() bool {
 		}
 	}
 	return true
+}
+
+// TruncateFrame adjusts a frame string to exactly targetLines lines.
+// On shrink, bottom lines are removed. On grow, empty lines are appended.
+// This matches the terminal's own alt-screen resize behaviour (truncate from
+// bottom), so the app's output never shifts relative to what the terminal
+// already shows — eliminating the visible "jump up" on vertical resize.
+func TruncateFrame(frame string, targetLines int) string {
+	lines := strings.Split(frame, "\n")
+	if len(lines) == targetLines {
+		return frame
+	}
+	if len(lines) > targetLines {
+		return strings.Join(lines[:targetLines], "\n")
+	}
+	grown := make([]string, targetLines)
+	copy(grown, lines)
+	return strings.Join(grown, "\n")
 }
 
 // SplitLines splits a rendered string into lines. Exported helper for

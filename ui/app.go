@@ -2368,11 +2368,17 @@ func (m *AppModel) View() string {
 		return m.comp.CachedFrame()
 	}
 
-	// Vertical resize fast path: recompose from stale caches without
-	// detecting or rendering dirty slots. Blink, tick, and component
-	// updates are deferred until the settle message fires.
+	// Vertical resize fast path: truncate the previous frame to the new
+	// height instead of recomposing from shifted boundaries. This matches
+	// the terminal's own alt-screen resize behaviour (truncate from bottom),
+	// so the app never shifts content relative to what the terminal already
+	// shows — eliminating the visible "jump up" during vertical drag resize.
+	// Blink, tick, and component updates are deferred until settle fires.
 	if m.resizeQuickActive {
 		m.viewDirty = false
+		if prev := m.comp.CachedFrame(); prev != "" {
+			return compositor.TruncateFrame(prev, m.height)
+		}
 		return m.comp.Compose()
 	}
 
