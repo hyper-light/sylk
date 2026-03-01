@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/google/uuid"
 )
 
 // orchestratorStreamContext carries correlation metadata through context
@@ -160,5 +162,125 @@ func (o *Orchestrator) publishStreamEvent(ctx context.Context, event *guide.Stre
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
+	_ = o.bus.Publish(o.channels.Responses, msg)
+}
+
+// publishStreamPush registers a stream push with the Guide so subsequent
+// stream events route to the TUI. Returns the push ID for use as
+// correlation ID in followup stream events.
+func (o *Orchestrator) publishStreamPush(ctx context.Context) (string, error) {
+	if o.bus == nil || o.channels == nil {
+		return "", fmt.Errorf("bus or channels not available")
+	}
+
+	pushID := "push_" + uuid.New().String()
+
+	push := &guide.AgentPush{
+		PushID:   pushID,
+		AgentID:  "orchestrator",
+		PushType: guide.PushTypeStream,
+	}
+
+	event := &guide.StreamEvent{
+		Type:      guide.StreamEventPush,
+		Data:      push,
+		Timestamp: time.Now(),
+	}
+
+	stream := &guide.StreamResponse{
+		CorrelationID:     pushID,
+		RespondingAgentID: "orchestrator",
+		TargetAgentID:     "orchestrator",
+		Event:             event,
+	}
+
+	msg := &guide.Message{
+		ID:            generateMessageID(),
+		CorrelationID: pushID,
+		Type:          guide.MessageTypeStream,
+		Payload:       stream,
+		SourceAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+
+	if err := o.bus.Publish(o.channels.Responses, msg); err != nil {
+		return "", fmt.Errorf("publish stream push: %w", err)
+	}
+
+	return pushID, nil
+}
+
+// publishNotificationPush sends a one-shot notification to the TUI via the
+// agent push mechanism.
+func (o *Orchestrator) publishNotificationPush(content string) {
+	if o.bus == nil || o.channels == nil {
+		return
+	}
+
+	pushID := "notif_" + uuid.New().String()
+
+	push := &guide.AgentPush{
+		PushID:   pushID,
+		AgentID:  "orchestrator",
+		PushType: guide.PushTypeNotification,
+		Content:  content,
+	}
+
+	event := &guide.StreamEvent{
+		Type:      guide.StreamEventPush,
+		Data:      push,
+		Timestamp: time.Now(),
+	}
+
+	stream := &guide.StreamResponse{
+		CorrelationID:     pushID,
+		RespondingAgentID: "orchestrator",
+		TargetAgentID:     "orchestrator",
+		Event:             event,
+	}
+
+	msg := &guide.Message{
+		ID:            generateMessageID(),
+		CorrelationID: pushID,
+		Type:          guide.MessageTypeStream,
+		Payload:       stream,
+		SourceAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+
+	_ = o.bus.Publish(o.channels.Responses, msg)
+}
+
+// publishStreamEventForPush publishes a stream event using a push ID as
+// correlation, so the Guide routes it to the TUI via the synthetic pending.
+func (o *Orchestrator) publishStreamEventForPush(pushID string, event *guide.StreamEvent) {
+	if o.bus == nil || o.channels == nil || event == nil {
+		return
+	}
+
+	stream := &guide.StreamResponse{
+		CorrelationID:     pushID,
+		RespondingAgentID: "orchestrator",
+		Event:             event,
+	}
+
+	msg := &guide.Message{
+		ID:            generateMessageID(),
+		CorrelationID: pushID,
+		Type:          guide.MessageTypeStream,
+		Payload:       stream,
+		SourceAgentID: "orchestrator",
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+
 	_ = o.bus.Publish(o.channels.Responses, msg)
 }

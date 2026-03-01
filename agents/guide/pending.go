@@ -107,6 +107,29 @@ func (ps *PendingStore) Add(req *RouteRequest, classification *RouteResult, targ
 	return corrID
 }
 
+// Set stores a pre-built PendingRequest by its CorrelationID.
+// Used for synthetic pendings (e.g. agent push) that bypass the
+// standard classification-based Add flow.
+func (ps *PendingStore) Set(correlationID string, pending *PendingRequest) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	ps.pending[correlationID] = pending
+
+	if pending.SourceAgentID != "" {
+		if ps.bySource[pending.SourceAgentID] == nil {
+			ps.bySource[pending.SourceAgentID] = make(map[string]struct{})
+		}
+		ps.bySource[pending.SourceAgentID][correlationID] = struct{}{}
+	}
+	if pending.TargetAgentID != "" {
+		if ps.byTarget[pending.TargetAgentID] == nil {
+			ps.byTarget[pending.TargetAgentID] = make(map[string]struct{})
+		}
+		ps.byTarget[pending.TargetAgentID][correlationID] = struct{}{}
+	}
+}
+
 // Get retrieves a pending request by correlation ID
 func (ps *PendingStore) Get(correlationID string) *PendingRequest {
 	ps.mu.RLock()

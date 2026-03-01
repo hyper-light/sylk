@@ -252,6 +252,17 @@ func (b *DAGBridge) List() []*dag.DAGStatus {
 	return b.scheduler.List()
 }
 
+// GetDispatcherForDAG returns the BusNodeDispatcher for an active DAG,
+// or nil if the DAG is not active.
+func (b *DAGBridge) GetDispatcherForDAG(dagID string) *BusNodeDispatcher {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if meta, ok := b.activeDAGs[dagID]; ok {
+		return meta.Dispatcher
+	}
+	return nil
+}
+
 // NotifyNodeComplete resolves a pending node dispatch.
 func (b *DAGBridge) NotifyNodeComplete(nodeID string, result *dag.NodeResult) {
 	b.mu.RLock()

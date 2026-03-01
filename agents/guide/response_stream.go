@@ -178,7 +178,32 @@ const (
 
 	// StreamEventToolCall carries a tool call start or completion event.
 	StreamEventToolCall StreamEventType = "tool_call"
+
+	// StreamEventPush indicates an agent-initiated push to the user.
+	// The agent publishes this on its own response channel; the Guide
+	// creates a synthetic pending synchronously before any subsequent
+	// stream events, guaranteeing race-free routing to the TUI.
+	StreamEventPush StreamEventType = "push"
 )
+
+// PushType classifies the push intent.
+type PushType string
+
+const (
+	// PushTypeStream signals that the agent will stream content after the push.
+	PushTypeStream PushType = "stream"
+	// PushTypeNotification is a one-shot message with no subsequent stream.
+	PushTypeNotification PushType = "notification"
+)
+
+// AgentPush is the payload carried by a StreamEventPush event.
+type AgentPush struct {
+	PushID   string         `json:"push_id"`
+	AgentID  string         `json:"agent_id"`
+	PushType PushType       `json:"push_type"`
+	Content  string         `json:"content,omitempty"`
+	Metadata map[string]any `json:"metadata,omitempty"`
+}
 
 // StreamStats contains stream manager statistics
 type StreamStats struct {

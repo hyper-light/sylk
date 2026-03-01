@@ -71,6 +71,13 @@ type Model struct {
 	planEntryIdx int    // History index of the plan ChatEntry (-1 = no plan entry).
 	planID       string // Correlates updates to the correct entry.
 
+	// In-stream plan embedding: when a plan snapshot arrives during an active
+	// stream, the plan markdown is composed into the stream entry rather than
+	// pushed as a separate chat entry. This gives the user one cohesive agent
+	// response: plan + approval cue.
+	streamPlanMarkdown string // rendered plan markdown for current stream (empty = none)
+	streamPlanOffset   int    // accumulator content length when plan was injected
+
 	// Render throttle: chunks buffer at full speed, but the history entry
 	// is only synced (and viewDirty set) on DecorTick or StreamComplete.
 	streamRenderPending bool
@@ -256,10 +263,16 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 // handleStreamStart begins accumulation. If a thinking placeholder exists,
 // it is reused; otherwise a new entry is pushed.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	chatDebugLog().Info("chat.handleStreamStart: ENTRY",
+		"correlation_id", start.CorrelationID,
+		"agent_id", start.AgentID,
+		"has_accumulator", m.accumulator != nil,
+		"thinking_idx", m.thinkingIdx)
 	// Retry path: provider retried the stream. Reset the existing
 	// accumulator and render state instead of creating a new entry.
 	if m.accumulator != nil {
 		m.accumulator.Replace("")
+		m.streamPlanOffset = 0 // Plan stays; offset resets since LLM text cleared.
 		m.streamRenderState = &streamRenderState{}
 		m.streamRenderPending = false
 		m.syncAccumulatorToEntry()
@@ -318,6 +331,9 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 // on the next DecorTick (100ms) or StreamComplete, reducing per-token renders.
 func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 	if m.accumulator == nil {
+		chatDebugLog().Warn("chat.handleStreamChunk: NIL_ACCUMULATOR — chunk dropped",
+			"correlation_id", chunk.CorrelationID,
+			"text_len", len(chunk.Text))
 		return nil
 	}
 
@@ -354,21 +370,40 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 
 // handleStreamComplete finalizes the streaming entry.
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
+	chatDebugLog().Info("chat.handleStreamComplete: ENTRY",
+		"correlation_id", done.CorrelationID,
+		"agent_id", done.AgentID,
+		"authoritative_text_len", len(done.AuthoritativeText),
+		"has_accumulator", m.accumulator != nil,
+		"thinking_idx", m.thinkingIdx,
+		"stream_render_pending", m.streamRenderPending)
 	if m.accumulator == nil {
+		chatDebugLog().Warn("chat.handleStreamComplete: NIL_ACCUMULATOR — thinking NOT cleared",
+			"correlation_id", done.CorrelationID,
+			"thinking_idx", m.thinkingIdx)
 		return nil
 	}
 	m.streamRenderPending = false
 	m.streamRenderState = nil
 	m.viewport.SetStreamState(nil, -1)
 	if m.thinkingIdx >= 0 {
+		chatDebugLog().Info("chat.handleStreamComplete: RESOLVING_THINKING",
+			"correlation_id", done.CorrelationID,
+			"thinking_idx", m.thinkingIdx)
 		m.resolveThinkingEntry()
+	} else {
+		chatDebugLog().Info("chat.handleStreamComplete: NO_THINKING_TO_RESOLVE",
+			"correlation_id", done.CorrelationID)
 	}
 	if done.AuthoritativeText != "" {
 		m.accumulator.Replace(done.AuthoritativeText)
+		m.streamPlanOffset = 0
 	}
 	m.accumulator.Complete()
 	m.finalizeStream()
 	m.accumulator = nil
+	chatDebugLog().Info("chat.handleStreamComplete: DONE",
+		"correlation_id", done.CorrelationID)
 	return nil
 }
 
@@ -550,13 +585,29 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 // ---------------------------------------------------------------------------
 
 // HandlePlanUpdate renders the plan as a markdown chat entry and updates it
-// in place on subsequent snapshots. The first update for a given PlanID pushes
-// a new entry; later updates rewrite the same entry's content.
+// in place on subsequent snapshots. During the planning phase (active stream,
+// first "ready" snapshot), the plan is embedded into the stream entry for a
+// cohesive agent response. During execution (no active stream), the plan
+// appears as a separate entry for live task status tracking.
 func (m *Model) HandlePlanUpdate(update msg.PlanUpdateMsg) {
 	content := formatPlanMarkdown(update)
+
+	// Active stream + ready plan + no plan already embedded → embed in stream.
+	// The plan markdown is stored but NOT synced to the entry yet — that would
+	// write to Content and kill the thinking spinner (the renderer only shows
+	// thinking when Content == ""). The plan will be composed into the entry
+	// naturally when the first LLM text chunk triggers resolveThinkingEntry →
+	// flushStreamRender → syncAccumulatorToEntry → composeStreamContent.
+	if m.accumulator != nil && update.Status == "ready" && m.streamPlanMarkdown == "" {
+		m.streamPlanMarkdown = content
+		m.streamPlanOffset = len(m.accumulator.Content())
+		m.planID = update.PlanID
+		return
+	}
+
+	// No active stream (or non-ready status) — use the existing separate-entry path.
 	entryID := "plan-" + update.PlanID
 
-	// New plan or different plan ID — push a fresh entry.
 	if m.planEntryIdx < 0 || m.planID != update.PlanID {
 		m.pushPlanEntry(entryID, content, update)
 		return
@@ -642,6 +693,8 @@ func (m *Model) Clear() {
 	m.streamRenderState = nil
 	m.planEntryIdx = -1
 	m.planID = ""
+	m.streamPlanMarkdown = ""
+	m.streamPlanOffset = 0
 	m.highlightID = ""
 	m.viewport.Reset()
 	m.viewDirty = true
@@ -683,6 +736,8 @@ func (m *Model) AbortStream() {
 	m.accumulator = nil
 	m.streamRenderPending = false
 	m.streamRenderState = nil
+	m.streamPlanMarkdown = ""
+	m.streamPlanOffset = 0
 	m.viewport.SetStreamState(nil, -1)
 	m.viewDirty = true
 }
@@ -1046,6 +1101,21 @@ func sanitizeThinkingMessage(message string) string {
 	return strings.Join(strings.Fields(cleaned.String()), " ")
 }
 
+// composeStreamContent returns the full entry content by splicing the
+// embedded plan markdown (if any) into the accumulated LLM text at the
+// recorded injection offset.
+func (m *Model) composeStreamContent() string {
+	content := m.accumulator.Content()
+	if m.streamPlanMarkdown == "" {
+		return content
+	}
+	offset := m.streamPlanOffset
+	if offset > len(content) {
+		offset = len(content)
+	}
+	return content[:offset] + "\n\n" + m.streamPlanMarkdown + "\n\n" + content[offset:]
+}
+
 // syncAccumulatorToEntry writes the accumulated content back into the
 // History entry and invalidates its height. RenderedLines and CodeRegions
 // are NOT wiped — the streaming render path in renderEntry() and
@@ -1054,7 +1124,7 @@ func sanitizeThinkingMessage(message string) string {
 // when the standard path is used as a fallback.
 func (m *Model) syncAccumulatorToEntry() {
 	idx := m.accumulator.EntryIndex()
-	content := m.accumulator.Content()
+	content := m.composeStreamContent()
 
 	m.history.mu.Lock()
 	defer m.history.mu.Unlock()
@@ -1068,14 +1138,21 @@ func (m *Model) syncAccumulatorToEntry() {
 }
 
 // finalizeStream marks the streaming entry as complete.
+// When a plan was embedded in the stream, the entry is promoted to a
+// first-class plan entry: its ID is re-stamped to the canonical plan ID
+// and planEntryIdx is recorded. This lets the existing update-in-place
+// path in HandlePlanUpdate work for all subsequent plan snapshots without
+// any special-case logic.
 func (m *Model) finalizeStream() {
 	idx := m.accumulator.EntryIndex()
-	content := m.accumulator.Content()
+	content := m.composeStreamContent()
+	hadPlan := m.streamPlanMarkdown != ""
 
 	m.history.mu.Lock()
-	defer m.history.mu.Unlock()
-
 	if idx < 0 || idx >= m.history.count {
+		m.history.mu.Unlock()
+		m.streamPlanMarkdown = ""
+		m.streamPlanOffset = 0
 		return
 	}
 	physical := m.history.logicalToPhysical(idx)
@@ -1084,6 +1161,14 @@ func (m *Model) finalizeStream() {
 	m.history.entries[physical].RenderedLines = nil
 	m.history.entries[physical].CodeRegions = nil
 	m.history.entries[physical].Height = -1
+	if hadPlan && m.planID != "" {
+		m.history.entries[physical].ID = "plan-" + m.planID
+		m.planEntryIdx = idx
+	}
+	m.history.mu.Unlock()
+
+	m.streamPlanMarkdown = ""
+	m.streamPlanOffset = 0
 }
 
 // activitySource maps an ActivityEventMsg to the appropriate ChatSource.

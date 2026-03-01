@@ -81,13 +81,21 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 // A tracked goroutine waits for the Guide-correlated response and publishes
 // the result as a PipelineUpdate to pipeline.update.<agentType>.
 func (r *TaskRouter) Route(task *PipelineTask) error {
+	return r.RouteWithLifecycle(task, nil)
+}
+
+// RouteWithLifecycle dispatches a pipeline task and selects on a done channel
+// so the waiting goroutine exits when the corresponding Dispatch call returns,
+// preventing goroutine leaks under FailurePolicyContinue.
+// A nil done channel blocks forever in select — correct for the non-lifecycle case.
+func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}) error {
 	corrID := "pipe_" + uuid.NewString()[:12]
 	waitCh := r.registerPending(corrID, task)
 
 	req := &guide.RouteRequest{
-		CorrelationID: corrID,
-		Input:         encodeTaskInput(task),
-		TargetAgentID: task.AgentType,
+		CorrelationID:  corrID,
+		Input:          encodeTaskInput(task),
+		TargetAgentID:  task.AgentType,
 		ExplicitTarget: true,
 		SourceAgentID:  r.agentID,
 		SourceAgentName: "orchestrator",
@@ -117,6 +125,8 @@ func (r *TaskRouter) Route(task *PipelineTask) error {
 			r.handleRouteResponse(task, resp)
 		case <-ctx.Done():
 			r.publishFailure(task, ctx.Err())
+		case <-done:
+			// Dispatch returned (success or timeout) — stop waiting.
 		}
 		return nil
 	})

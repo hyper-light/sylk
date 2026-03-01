@@ -90,6 +90,12 @@ func (b *GuideBridge) onMessage(busMsg *guide.Message) error {
 	case b.buffer <- busMsg:
 	default:
 		b.dropped.Add(1)
+		if stream, ok := busMsg.GetStreamResponse(); ok && stream.Event != nil && stream.Event.Type == guide.StreamEventComplete {
+			bridgeEventDebugLog().Warn("GuideBridge: STREAM_COMPLETE_DROPPED",
+				"correlation_id", busMsg.CorrelationID,
+				"buffer_cap", cap(b.buffer),
+				"total_dropped", b.dropped.Load())
+		}
 	}
 	return nil
 }
@@ -160,6 +166,11 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 	case guide.StreamEventProgress:
 		program.Send(toStreamProgressMsg(sid, cid, stream.RespondingAgentID, stream.Event))
 	case guide.StreamEventComplete:
+		bridgeEventDebugLog().Info("GuideBridge: STREAM_COMPLETE_DISPATCH",
+			"correlation_id", cid,
+			"agent_id", stream.RespondingAgentID,
+			"has_directive", stream.Event.Directive != nil,
+			"text_len", len(stream.Event.Text))
 		complete := msg.StreamCompleteMsg{SessionID: sid, CorrelationID: cid, AgentID: stream.RespondingAgentID, Result: stream.Event.Data}
 		if text := streamCompleteText(stream.RespondingAgentID, stream.Event); text != "" {
 			complete.AuthoritativeText = redact.Text(text)
@@ -169,6 +180,8 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 			complete.OutputTokens = stream.Event.Usage.OutputTokens
 		}
 		program.Send(complete)
+		bridgeEventDebugLog().Info("GuideBridge: STREAM_COMPLETE_SENT",
+			"correlation_id", cid)
 	case guide.StreamEventError:
 		program.Send(msg.StreamErrorMsg{SessionID: sid, CorrelationID: cid, Err: redact.Error(extractStreamError(stream.Event))})
 	case guide.StreamEventRetry:

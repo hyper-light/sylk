@@ -15,6 +15,10 @@ import (
 const (
 	conversationMaxTokens = 4096
 	conversationTemp      = 0.5
+
+	// ingestionLLMTimeout is the LLM timeout for generating a plan ingestion
+	// summary. Runs asynchronously — does not block the architect's sync wait.
+	ingestionLLMTimeout = 45 * time.Second
 )
 
 // ConversationResult holds the response from a conversational interaction.
@@ -100,53 +104,53 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 	}, nil
 }
 
-// ingestionLLMTimeout is the LLM timeout for generating a plan ingestion
-// summary. Must fit comfortably within the architect's routeSyncTimeout (60s).
-const ingestionLLMTimeout = 45 * time.Second
-
-// respondToIngestion generates a natural-language plan summary via the LLM.
-// The ingestion itself (DAG creation, task records, workflow state) has
-// ALREADY succeeded before this function is called. If the LLM is
-// unavailable or times out, falls back to a deterministic ack so the
-// handoff always completes reliably within the architect's 60s window.
+// respondToIngestion returns a deterministic ack immediately (unblocking the
+// architect's routeSyncTimeout) and then generates a richer LLM summary
+// asynchronously, pushing it to the TUI via a notification once the
+// architect's stream has completed.
+//
+// Split into immediate + deferred:
+//  1. Immediate: deterministic ack returned via RouteResponse (~1s). The
+//     architect's tool loop includes this text in its own stream to the TUI.
+//  2. Deferred: LLM summary generated in a tracked goroutine. By the time
+//     the LLM responds (10-30s), the architect's stream has completed, so
+//     the notification push won't corrupt the TUI's single accumulator.
 func (o *Orchestrator) respondToIngestion(
 	ctx context.Context,
 	req *guide.ForwardedRequest,
 	ingestionResult any,
 ) (any, error) {
+	o.logInfo("respondToIngestion", "correlation_id", req.CorrelationID)
+
+	preAck := buildDeterministicIngestionAck(ingestionResult)
+
+	// Publish stream chunk so the architect's sync waiter sees activity.
+	o.publishStreamChunk(ctx, preAck)
+
+	// Snapshot provider under lock — SetProvider may write concurrently.
 	o.mu.RLock()
 	provider := o.provider
 	o.mu.RUnlock()
 
-	o.logInfo("respondToIngestion",
-		"has_provider", provider != nil,
-		"correlation_id", req.CorrelationID)
-
+	// Spawn async LLM summary if a provider is available. The goroutine is
+	// tracked via o.scope so it participates in graceful shutdown.
 	if provider != nil {
-		result, err := o.generateIngestionSummary(ctx, req.Input, ingestionResult)
-		if err == nil {
-			o.logInfo("respondToIngestion: LLM summary generated",
+		planJSON := req.Input
+		o.scope.Go("ingestion-summary", ingestionLLMTimeout+5*time.Second, func(scopeCtx context.Context) error {
+			result, err := o.generateIngestionSummary(scopeCtx, planJSON, ingestionResult)
+			if err != nil {
+				o.logWarnMsg("respondToIngestion: async LLM summary failed", "error", err)
+				return nil // Non-fatal — the deterministic ack already reached the user.
+			}
+			o.logInfo("respondToIngestion: async LLM summary generated",
 				"response_len", len(result.Response))
-			return result, nil
-		}
-		o.logWarnMsg("respondToIngestion: LLM summary failed, using deterministic ack",
-			"error", err)
-		// LLM failed — fall through to deterministic ack. Include error
-		// in the ack so the user sees why the summary isn't richer.
-		ack := buildDeterministicIngestionAck(ingestionResult) +
-			"\n\n_LLM summary unavailable: " + err.Error() + "_"
-		o.publishStreamChunk(ctx, ack)
-		return &ConversationResult{Response: ack, Intent: "ingestion_ack"}, nil
+			o.publishNotificationPush(result.Response)
+			return nil
+		})
 	}
 
-	o.logWarnMsg("respondToIngestion: no provider, using deterministic ack")
-	ack := buildDeterministicIngestionAck(ingestionResult) +
-		"\n\n_Orchestrator LLM provider not configured — using deterministic ack._"
-	o.publishStreamChunk(ctx, ack)
-	return &ConversationResult{
-		Response: ack,
-		Intent:   "ingestion_ack",
-	}, nil
+	// Return the deterministic ack immediately — unblocks the architect.
+	return &ConversationResult{Response: preAck, Intent: "ingestion_ack"}, nil
 }
 
 // generateIngestionSummary calls the LLM with the plan details and ingestion
@@ -186,7 +190,6 @@ func (o *Orchestrator) generateIngestionSummary(
 	}
 
 	accumulateOrchestratorUsage(ctx, &resp.Usage)
-	o.publishStreamChunk(ctx, trimmed)
 
 	return &ConversationResult{
 		Response: trimmed,
@@ -195,14 +198,12 @@ func (o *Orchestrator) generateIngestionSummary(
 }
 
 // buildIngestionSummaryPrompt composes the user message for the LLM to
-// summarize an ingested plan. Extracts the human-readable fields from the
-// PlanHandoff JSON rather than passing the raw blob.
+// summarize an ingested plan.
 func buildIngestionSummaryPrompt(planJSON string, ingestionResult any) string {
 	var b strings.Builder
 
 	b.WriteString("A plan has been ingested and a DAG has been created for execution.\n\n")
 
-	// Ingestion result metadata.
 	if resultMap, ok := ingestionResult.(map[string]any); ok {
 		planID, _ := resultMap["plan_id"].(string)
 		dagID, _ := resultMap["dag_id"].(string)
@@ -212,7 +213,6 @@ func buildIngestionSummaryPrompt(planJSON string, ingestionResult any) string {
 			planID, dagID, taskCount, layerCount))
 	}
 
-	// Extract structured plan details for the summary.
 	var handoff architect.PlanHandoff
 	if err := json.Unmarshal([]byte(planJSON), &handoff); err == nil {
 		b.WriteString("## Plan Details\n")

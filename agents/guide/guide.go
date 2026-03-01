@@ -3220,14 +3220,27 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		if !ok {
 			return fmt.Errorf("invalid stream response payload")
 		}
+
+		// Agent-initiated push: create synthetic pending before stream events.
+		// Runs in the same subscriber goroutine as subsequent stream events
+		// from this agent, so FIFO ordering guarantees the pending exists
+		// when StreamStart arrives.
+		if streamResp.Event != nil && streamResp.Event.Type == StreamEventPush {
+			return g.handleAgentPush(streamResp, msg)
+		}
+
 		g.recordIncomingStreamEvent(streamResp)
 		g.observeStreamDirective(streamResp)
 		g.observeStreamReroute(streamResp)
 		pending := g.pending.Get(streamResp.CorrelationID)
 		if pending == nil {
+			if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete {
+				DebugFileLog().Warn("handleResponseMessage: STREAM_COMPLETE_NO_PENDING",
+					"correlation_id", streamResp.CorrelationID,
+					"source_agent", msg.SourceAgentID)
+			}
 			return nil
 		}
-		g.applyDeferredStreamReroute(pending)
 		streamTarget := g.resolveStreamTarget(pending)
 		streamResp.TargetAgentID = streamTarget
 		streamResp.RespondingAgentID = g.resolveAgentDisplayName(pending.TargetAgentID)
@@ -3237,13 +3250,92 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 	}
 }
 
+// handleAgentPush processes a StreamEventPush event from an agent.
+// Dispatches to the appropriate handler based on push type.
+func (g *Guide) handleAgentPush(streamResp *StreamResponse, msg *Message) error {
+	push, ok := streamResp.Event.Data.(*AgentPush)
+	if !ok {
+		return fmt.Errorf("invalid agent push payload")
+	}
+
+	DebugFileLog().Info("guide: handleAgentPush",
+		"push_id", push.PushID,
+		"agent_id", push.AgentID,
+		"push_type", string(push.PushType),
+		"source_agent", msg.SourceAgentID)
+
+	switch push.PushType {
+	case PushTypeStream:
+		return g.handleStreamPush(push, msg)
+	case PushTypeNotification:
+		return g.handleNotificationPush(push, msg)
+	default:
+		return fmt.Errorf("unknown push type: %s", push.PushType)
+	}
+}
+
+// handleStreamPush creates a synthetic pending so subsequent stream events
+// from the same agent channel route to the TUI. This runs in the same
+// subscriber goroutine as stream events, so FIFO ordering guarantees the
+// pending exists when StreamStart arrives.
+func (g *Guide) handleStreamPush(push *AgentPush, _ *Message) error {
+	pending := &PendingRequest{
+		CorrelationID:        push.PushID,
+		SourceAgentID:        "tui",
+		TargetAgentID:        push.AgentID,
+		CreatedAt:            time.Now(),
+		ExpiresAt:            time.Now().Add(10 * time.Minute),
+		StreamTargetOverride: "tui",
+	}
+	g.pending.Set(push.PushID, pending)
+
+	g.publishActivity(events.EventTypeAgentAction, events.VisibilityAgent,
+		fmt.Sprintf("Agent push registered: %s → user", push.AgentID))
+
+	return nil
+}
+
+// handleNotificationPush sends a one-shot stream sequence (Start + Data + Complete)
+// to the TUI for a notification push.
+func (g *Guide) handleNotificationPush(push *AgentPush, _ *Message) error {
+	agentName := g.resolveAgentDisplayName(push.AgentID)
+
+	for _, event := range []*StreamEvent{
+		{Type: StreamEventStart, Timestamp: time.Now()},
+		{Type: StreamEventData, Text: push.Content, Timestamp: time.Now()},
+		{Type: StreamEventComplete, Timestamp: time.Now()},
+	} {
+		resp := &StreamResponse{
+			CorrelationID:     push.PushID,
+			RespondingAgentID: agentName,
+			TargetAgentID:     "tui",
+			Event:             event,
+		}
+		g.publishStreamToSource("tui", resp)
+	}
+
+	g.publishActivity(events.EventTypeAgentAction, events.VisibilityAgent,
+		fmt.Sprintf("Agent notification: %s → user", push.AgentID))
+
+	return nil
+}
+
 func (g *Guide) recordIncomingStreamEvent(resp *StreamResponse) {
 	if g == nil || g.streams == nil || resp == nil || resp.Event == nil {
 		return
 	}
 	stream := g.streams.GetStream(resp.CorrelationID)
 	if stream == nil {
+		if resp.Event.Type == StreamEventComplete {
+			DebugFileLog().Warn("recordIncomingStreamEvent: STREAM_COMPLETE_NO_STREAM",
+				"correlation_id", resp.CorrelationID)
+		}
 		return
+	}
+	if resp.Event.Type == StreamEventComplete {
+		DebugFileLog().Info("recordIncomingStreamEvent: FORWARDING_COMPLETE",
+			"correlation_id", resp.CorrelationID,
+			"stream_closed", stream.IsClosed())
 	}
 	stream.ForwardEvent(resp.Event)
 }
@@ -3554,7 +3646,16 @@ func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	return g.bus.Publish(g.agentResponseTopic(sourceAgentID), msg)
+	topic := g.agentResponseTopic(sourceAgentID)
+	err := g.bus.Publish(topic, msg)
+	if resp.Event != nil && resp.Event.Type == StreamEventComplete {
+		DebugFileLog().Info("publishStreamToSource: STREAM_COMPLETE_FORWARDED",
+			"correlation_id", resp.CorrelationID,
+			"target", sourceAgentID,
+			"topic", topic,
+			"publish_err", err)
+	}
+	return err
 }
 
 func (g *Guide) publishErrorToSource(sourceAgentID string, correlationID string, sourceAgent string, errStr string) error {
@@ -3887,7 +3988,44 @@ func (g *Guide) SetAgentRegistrar(registrar func(agentType string)) {
 // hasActiveAgentSubs returns true if the given agent ID has active bus
 // subscriptions (both response and error channels). Used to skip redundant
 // agentRegistrar calls on forwarded requests.
+//
+// When the direct UUID lookup misses, falls back to a type-based scan:
+// resolve agentID → type via typeIndex, then check if ANY agent ID with
+// the same type has active subscriptions. This prevents re-registration
+// churn when a cold-started agent receives a new UUID but the old UUID's
+// subscriptions are still alive.
 func (g *Guide) hasActiveAgentSubs(agentID string) bool {
+	if g.isActiveAgentSub(agentID) {
+		return true
+	}
+
+	// Fallback: resolve to agent type and scan all agentSubs for a match.
+	agentType := g.resolveActivationType(agentID)
+	if agentType == "" || agentType == agentID {
+		return false
+	}
+
+	found := false
+	g.agentSubs.Range(func(id string, subs *agentSubscriptions) bool {
+		if id == agentID {
+			return true // already checked above
+		}
+		resolvedType, ok := g.typeIndex.Get(id)
+		if !ok || resolvedType != agentType {
+			return true
+		}
+		if subs.responses != nil && subs.responses.IsActive() &&
+			subs.errors != nil && subs.errors.IsActive() {
+			found = true
+			return false // stop iteration
+		}
+		return true
+	})
+	return found
+}
+
+// isActiveAgentSub checks a single agent ID for active subscriptions.
+func (g *Guide) isActiveAgentSub(agentID string) bool {
 	subs, ok := g.agentSubs.Get(agentID)
 	if !ok || subs == nil {
 		return false

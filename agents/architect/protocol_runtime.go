@@ -3,9 +3,7 @@ package architect
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,40 +11,16 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
 	"github.com/google/uuid"
 )
 
-// stageCost classifies the minimum time a protocol step needs to do useful work.
-type stageCost int
-
-const (
-	stageCostLocal        stageCost = iota // in-memory only, negligible duration
-	stageCostLLM                           // LLM API call(s), reserves LLMRequestTimeout
-	stageCostConsultation                  // bus consultation, reserves ConsultationTimeout
-)
-
-// errBudgetExhausted is a sentinel indicating the operation's remaining time
-// cannot satisfy the current step's reservation plus all downstream reserves.
-var errBudgetExhausted = errors.New("operation budget exhausted")
-
-// budgetExhaustedError carries diagnostic context for budget failures.
-type budgetExhaustedError struct {
-	step              string
-	remaining         time.Duration
-	stepReservation   time.Duration
-	downstreamReserve time.Duration
-}
-
-func (e *budgetExhaustedError) Error() string {
-	return fmt.Sprintf("%s: remaining %s < step reservation %s + downstream reserve %s",
-		e.step,
-		e.remaining.Truncate(time.Millisecond),
-		e.stepReservation.Truncate(time.Millisecond),
-		e.downstreamReserve.Truncate(time.Millisecond))
-}
-
-func (e *budgetExhaustedError) Unwrap() error { return errBudgetExhausted }
+// protocolMaxToolRuns is the tool-call budget for the agent-driven planning
+// protocol. The protocol needs ~6-8 skill calls (analyze, consult, design,
+// generate_tasks, plus potentially ask_user_question, route_plan_acceptance,
+// and handle_plan_acceptance_result). 16 provides headroom.
+const protocolMaxToolRuns = 16
 
 func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectRequest) (*DesignPlan, error) {
 	a.logInfo("runPlanningProtocol: entry",
@@ -96,7 +70,18 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 		a.logWarn("runPlanningProtocol: FAILED",
 			"plan_id", plan.ID,
 			"elapsed", elapsed.String(),
+			"plan_status", plan.SM().State().String(),
 			"err", err)
+		// On context cancellation, preserve the plan's current state
+		// instead of marking it Failed. This allows the next conversation
+		// turn to detect and resume the in-progress plan.
+		if ctx.Err() != nil && plan.SM().State() != PlanStatusPending {
+			a.logInfo("runPlanningProtocol: interrupted, preserving plan state",
+				"plan_id", plan.ID,
+				"preserved_status", plan.SM().State().String())
+			a.persistPlanState(plan)
+			return plan, err
+		}
 		return a.failAndPersistPlan(plan, err)
 	}
 	plan.CompletedAt = time.Now()
@@ -250,213 +235,105 @@ func (d *protocolDiagnostics) close() {
 	}
 }
 
+// run launches the agent-driven tool loop where the LLM drives the planning
+// protocol by invoking plan-aware skills. The state machine validates
+// transitions as a guardrail rather than controlling the flow.
 func (r *planningProtocolRunner) run() error {
-	steps := r.allStepsWithCosts()
-	// Analyze (0), Consult (1).
-	for i := range 2 {
-		if err := r.runStepAt(steps, i); err != nil {
-			return err
-		}
+	prompt := r.buildProtocolPrompt()
+	system := r.architect.buildProtocolSystemPrompt()
+	r.architect.ensureToolLoopSkillsLoaded()
+	tools := r.architect.buildToolDefinitions()
+	if len(tools) == 0 {
+		return fmt.Errorf("no tool definitions available for protocol")
 	}
-	// Clarify (2) — returns (bool, error), handled inline.
-	if err := r.checkReservation(steps, 2); err != nil {
-		return err
+
+	// Emit stream start so the TUI shows an active thinking indicator.
+	r.architect.publishPlanStreamStart(r.ctx)
+
+	loopCtx := withToolRunsOverride(r.ctx, protocolMaxToolRuns)
+	req := &providers.Request{
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
+		MaxTokens:    r.architect.config.MaxOutputTokens,
+		SystemPrompt: system,
+		Tools:        tools,
 	}
-	r.diag.log("stepClarify: START")
-	clarifyStart := time.Now()
-	needsClarification, err := r.stepClarify()
-	r.diag.log("stepClarify: END elapsed=%v needs_clarification=%v err=%v",
-		time.Since(clarifyStart), needsClarification, err)
+
+	text, err := r.architect.executeToolLoop(
+		loopCtx, req, "planning_protocol",
+		func(chunk string) { r.architect.publishPlanStreamChunk(r.ctx, chunk) },
+	)
 	if err != nil {
 		return err
 	}
-	if needsClarification {
+	// If the LLM invoked ask_user_question, the plan is now Clarifying.
+	if r.plan.IsClarifying() {
 		return nil
 	}
-	// Execution steps (3..7).
-	for i := 3; i < len(steps); i++ {
-		if err := r.runStepAt(steps, i); err != nil {
-			return err
-		}
+	// The tool loop's final text turn is the plan presentation.
+	if r.plan.SM().State() == PlanStatusReady && strings.TrimSpace(text) != "" {
+		r.plan.UserResponse = sanitizePlannerConversationResponse(text)
+		return r.architect.persistPlanState(r.plan)
 	}
 	return nil
 }
 
-type namedStep struct {
-	name string
-	fn   func() error
-	cost stageCost
+// protocolPhaseInstructions is the embedded constant that drives the LLM's
+// planning protocol behavior within the tool loop.
+const protocolPhaseInstructions = `You drive the planning protocol by invoking skills. Execute these phases in order:
+
+1. **Analyze**: Invoke plan with action=analyze, plan_id, and the user's query.
+2. **Consult**: Invoke consult with mode=pre_planning and plan_id.
+3. **Clarify** (conditional): Review the analysis results. If critical ambiguities
+   would lead to a wrong plan, invoke ask_user_question. If you do, STOP and do
+   not invoke further skills. If requirements are clear, proceed to Design.
+4. **Design**: Invoke plan with action=design and plan_id.
+5. **Generate**: Invoke plan with action=generate_tasks and plan_id.
+   This automatically creates the workflow and validates the plan.
+6. **Present and ask for approval**: The structured plan is automatically rendered in your
+   response when generate_tasks completes. Do NOT repeat the plan structure or task list.
+   Write a brief assessment (2-4 sentences): highlight the key architectural tradeoff,
+   the primary risk, and why this decomposition is a good default.
+   Sound like a principal engineer, not a workflow bot.
+   End by inviting the user to approve or request changes. Use your own natural phrasing —
+   do NOT use a scripted template. Vary your wording each time.
+   Do NOT invoke route_plan_acceptance — wait for the user to respond.
+
+Always pass plan_id to plan and consult skills. Do not skip phases 1, 2, 4, or 5.
+
+Exception — auto-approve (when approval_required is false):
+Skip the approval cue in step 6. Instead, after the brief assessment, invoke
+route_plan_acceptance with the plan_id and a brief user_response summary. When
+route_plan_acceptance returns the Guide's verdict, invoke handle_plan_acceptance_result
+with the verdict. On "accept", this dispatches the plan to the orchestrator automatically.`
+
+// buildProtocolPrompt constructs the user message that seeds the tool loop.
+func (r *planningProtocolRunner) buildProtocolPrompt() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Plan ID: %s\n", r.plan.ID)
+	fmt.Fprintf(&b, "Session ID: %s\n", r.plan.SessionID)
+	fmt.Fprintf(&b, "User query: %s\n", r.request.Query)
+	fmt.Fprintf(&b, "Approval required: %v\n", !r.architect.config.AutoApprove)
+	if sessionCtx, ok := r.request.Params["session_context"]; ok {
+		contextJSON, _ := json.Marshal(sessionCtx)
+		fmt.Fprintf(&b, "\nSession context:\n%s\n", string(contextJSON))
+	}
+	if history, ok := r.request.Params["conversation_history"].(string); ok && history != "" {
+		fmt.Fprintf(&b, "\nConversation history:\n%s\n", history)
+	}
+	b.WriteString("\nBegin by invoking plan with action=analyze.")
+	return b.String()
 }
 
-// allStepsWithCosts is the single source of truth for the protocol step
-// sequence and each step's cost classification.
-// stepMaybeAutoHandoff is removed — the LLM handles auto-handoff by
-// reading approval_required in the stepReady tool loop and invoking
-// route_plan_acceptance when appropriate.
-func (r *planningProtocolRunner) allStepsWithCosts() []namedStep {
-	return []namedStep{
-		{"stepAnalyze", r.stepAnalyze, stageCostLLM},
-		{"stepConsult", r.stepConsult, stageCostConsultation},
-		{"stepClarify", nil, stageCostLLM}, // handled inline (bool return)
-		{"stepDesign", r.stepDesign, stageCostLLM},
-		{"stepGenerate", r.stepGenerate, stageCostLLM},
-		{"stepWorkflow", r.stepWorkflow, stageCostLocal},
-		{"stepValidate", r.stepValidate, stageCostLocal},
-		{"stepReady", r.stepReady, stageCostLLM},
+// buildProtocolSystemPrompt constructs the system prompt for the agent-driven
+// planning loop, combining the core architect identity with protocol phase
+// instructions.
+func (a *Architect) buildProtocolSystemPrompt() string {
+	modules := []string{
+		ArchitectSystemCorePrompt,
+		protocolPhaseInstructions,
+		ArchitectSystemGuardrailsPrompt,
 	}
-}
-
-// reservationForCost resolves a cost class to a config-derived duration.
-func (r *planningProtocolRunner) reservationForCost(cost stageCost) time.Duration {
-	switch cost {
-	case stageCostLLM:
-		return r.architect.config.LLMRequestTimeout
-	case stageCostConsultation:
-		return r.architect.config.ConsultationTimeout
-	default:
-		return 0
-	}
-}
-
-// downstreamReserve sums the minimum reservations for all steps after idx.
-func (r *planningProtocolRunner) downstreamReserve(steps []namedStep, idx int) time.Duration {
-	var total time.Duration
-	for i := idx + 1; i < len(steps); i++ {
-		total += r.reservationForCost(steps[i].cost)
-	}
-	return total
-}
-
-// remainingBudget returns the time remaining until the operation context's
-// deadline. Returns math.MaxInt64 nanoseconds when no deadline is set.
-func (r *planningProtocolRunner) remainingBudget() time.Duration {
-	deadline, ok := r.ctx.Deadline()
-	if !ok {
-		return time.Duration(math.MaxInt64)
-	}
-	return time.Until(deadline)
-}
-
-// checkReservation verifies sufficient budget for step at idx plus all
-// downstream steps. Used for inline steps (e.g. clarify) that cannot
-// go through runStepAt.
-func (r *planningProtocolRunner) checkReservation(steps []namedStep, idx int) error {
-	stepRes := r.reservationForCost(steps[idx].cost)
-	downstream := r.downstreamReserve(steps, idx)
-	totalNeeded := stepRes + downstream
-	remaining := r.remainingBudget()
-	if totalNeeded > 0 && remaining < totalNeeded {
-		return &budgetExhaustedError{
-			step:              steps[idx].name,
-			remaining:         remaining,
-			stepReservation:   stepRes,
-			downstreamReserve: downstream,
-		}
-	}
-	return nil
-}
-
-// runStepAt runs the step at the given index after checking budget reserves.
-func (r *planningProtocolRunner) runStepAt(steps []namedStep, idx int) error {
-	step := steps[idx]
-	downstream := r.downstreamReserve(steps, idx)
-	return r.runStep(step.name, step.fn, step.cost, downstream)
-}
-
-// runStep checks the deadline reservation and, if sufficient budget remains,
-// executes fn under the operation context. No child context is created —
-// the existing timeout hierarchy (provider per-request, continuation AIMD,
-// DeadlinePropagator) handles upper bounds.
-func (r *planningProtocolRunner) runStep(name string, fn func() error, cost stageCost, downstream time.Duration) error {
-	stepReservation := r.reservationForCost(cost)
-	totalNeeded := stepReservation + downstream
-	remaining := r.remainingBudget()
-	if totalNeeded > 0 && remaining < totalNeeded {
-		err := &budgetExhaustedError{
-			step:              name,
-			remaining:         remaining,
-			stepReservation:   stepReservation,
-			downstreamReserve: downstream,
-		}
-		r.diag.log("%s: BUDGET EXHAUSTED %v", name, err)
-		r.architect.logWarn("protocol.runStep: budget exhausted",
-			"step", name,
-			"plan_id", r.plan.ID,
-			"remaining", remaining.String(),
-			"step_reservation", stepReservation.String(),
-			"downstream_reserve", downstream.String())
-		return err
-	}
-
-	r.diag.log("%s: START ctx_deadline=%s remaining=%v reservation=%v downstream=%v",
-		name, contextDeadlineString(r.ctx),
-		remaining.Truncate(time.Millisecond), stepReservation, downstream)
-	r.architect.logInfo("protocol.runStep: START",
-		"step", name,
-		"plan_id", r.plan.ID,
-		"plan_status", r.plan.SM().State().String(),
-		"remaining", remaining.String(),
-		"ctx_deadline", contextDeadlineString(r.ctx))
-	start := time.Now()
-	err := fn()
-	elapsed := time.Since(start)
-	r.diag.log("%s: END elapsed=%v err=%v ctx_deadline=%s", name, elapsed, err, contextDeadlineString(r.ctx))
-	r.architect.logInfo("protocol.runStep: END",
-		"step", name,
-		"plan_id", r.plan.ID,
-		"elapsed", elapsed.String(),
-		"err", err)
-	return err
-}
-
-func (r *planningProtocolRunner) stepAnalyze() error {
-	if err := r.transition(PlanStatusAnalyzing); err != nil {
-		return err
-	}
-	requirements, err := r.architect.analyzeRequirements(r.ctx, r.request.Query, r.request.Params)
-	if err != nil {
-		r.diag.log("stepAnalyze FAILED: %v", err)
-		return err
-	}
-	r.diag.log("stepAnalyze goals=%d scope=%q constraints=%d",
-		len(requirements.Goals), requirements.Scope, len(requirements.Constraints))
-	for i, g := range requirements.Goals {
-		r.diag.log("  goal[%d]: %q", i, g)
-	}
-	r.plan.Requirements = requirements
-	return r.architect.persistPlanState(r.plan)
-}
-
-func (r *planningProtocolRunner) stepConsult() error {
-	if err := r.transition(PlanStatusConsulting); err != nil {
-		return err
-	}
-	r.diag.log("stepConsult: enforcing consultation gate mandatory=%v bus_available=%v",
-		r.architect.config.MandatoryConsultation, r.architect.bus != nil && r.architect.running)
-	r.architect.logInfo("stepConsult: enforcing consultation gate",
-		"plan_id", r.plan.ID,
-		"mandatory", r.architect.config.MandatoryConsultation,
-		"consultation_timeout", r.architect.config.ConsultationTimeout.String(),
-		"ctx_deadline", contextDeadlineString(r.ctx))
-	gateStart := time.Now()
-	if err := r.architect.enforceConsultationGate(r.ctx, r.plan, r.request); err != nil {
-		r.diag.log("stepConsult: consultation gate FAILED after %v: %v", time.Since(gateStart), err)
-		r.architect.logWarn("stepConsult: consultation gate FAILED",
-			"plan_id", r.plan.ID,
-			"elapsed", time.Since(gateStart).String(),
-			"err", err)
-		return err
-	}
-	r.diag.log("stepConsult: consultation gate passed after %v consultations=%d",
-		time.Since(gateStart), len(r.plan.Consultations))
-	r.architect.logInfo("stepConsult: consultation gate passed",
-		"plan_id", r.plan.ID,
-		"elapsed", time.Since(gateStart).String(),
-		"consultations", len(r.plan.Consultations))
-	// Extract librarian patterns from the gate evidence rather than
-	// issuing a redundant second consultation request.
-	r.plan.CodebasePatterns = extractLibrarianPatterns(r.plan)
-	return r.architect.persistPlanState(r.plan)
+	return strings.Join(nonEmptyPlannerSections(modules), "\n\n---\n\n")
 }
 
 // extractLibrarianPatterns builds CodebasePatterns from the consultation
@@ -470,69 +347,6 @@ func extractLibrarianPatterns(plan *DesignPlan) *CodebasePatterns {
 		return emptyCodebasePatterns()
 	}
 	return codebasePatternsFromEvidence(evidence)
-}
-
-func (r *planningProtocolRunner) stepDesign() error {
-	if err := r.transition(PlanStatusDesigning); err != nil {
-		return err
-	}
-	architecture, err := r.architect.designArchitecture(r.ctx, r.plan.Requirements, r.plan.CodebasePatterns)
-	if err != nil {
-		r.diag.log("stepDesign FAILED: %v", err)
-		return err
-	}
-	r.diag.log("stepDesign name=%q components=%d patterns=%d",
-		architecture.Name, len(architecture.Components), len(architecture.Patterns))
-	for i, c := range architecture.Components {
-		r.diag.log("  component[%d]: name=%q type=%q desc=%q",
-			i, c.Name, c.Type, truncateString(c.Description, 80))
-	}
-	r.plan.Architecture = architecture
-	return r.architect.persistPlanState(r.plan)
-}
-
-func (r *planningProtocolRunner) stepGenerate() error {
-	if err := r.transition(PlanStatusGenerating); err != nil {
-		return err
-	}
-	tasks, err := r.architect.generateAtomicTasks(r.ctx, r.plan.Architecture, r.plan.Constraints)
-	if err != nil {
-		r.diag.log("stepGenerate FAILED: %v", err)
-		return err
-	}
-	r.diag.log("stepGenerate tasks=%d", len(tasks))
-	for i, t := range tasks {
-		r.diag.log("  task[%d]: id=%q name=%q agent=%q deps=%v ac=%d files=%d guide_len=%d",
-			i, t.ID, t.Name, t.AgentType, t.Dependencies,
-			len(t.AcceptanceCriteria), len(t.AffectedFiles), len(t.ImplementationGuide))
-	}
-	r.plan.Tasks = tasks
-	return r.architect.persistPlanState(r.plan)
-}
-
-func (r *planningProtocolRunner) stepWorkflow() error {
-	if err := r.transition(PlanStatusOrchestrating); err != nil {
-		return err
-	}
-	workflow, err := r.architect.createWorkflowDAG(r.ctx, r.plan.Tasks)
-	if err != nil {
-		return err
-	}
-	r.plan.Workflow = workflow
-	return r.architect.persistPlanState(r.plan)
-}
-
-func (r *planningProtocolRunner) stepValidate() error {
-	if err := validatePlanForExecution(r.plan); err != nil {
-		return err
-	}
-	declaration := buildAutoDeclaration(r.plan)
-	if err := r.validateDeclarationForPolicy(declaration); err != nil {
-		return err
-	}
-	r.plan.Declarations = append(r.plan.Declarations, declaration)
-	r.architect.publishDeclaration(declaration, r.plan.SessionID)
-	return r.architect.persistPlanState(r.plan)
 }
 
 func (r *planningProtocolRunner) validateDeclarationForPolicy(declaration *PreDelegationDeclaration) error {
@@ -595,118 +409,6 @@ func cloneConsultationChecks(plan *DesignPlan) map[string]*ConsultationEvidence 
 		checks[key] = evidence
 	}
 	return checks
-}
-
-func (r *planningProtocolRunner) stepReady() error {
-	if err := r.transition(PlanStatusReady); err != nil {
-		return err
-	}
-	// Grant ready lease so the reaper knows when this plan becomes stale.
-	if r.architect.leaseManager != nil {
-		r.architect.leaseManager.GrantReadyLease(r.plan)
-	}
-	// Publish full plan snapshot for the inline chat widget.
-	r.architect.publishPlanSnapshot(r.ctx, r.plan)
-	// Stream LLM commentary + readiness footer token-by-token.
-	r.diag.log("stepReady: composing user response via LLM ctx_deadline=%s", contextDeadlineString(r.ctx))
-	r.architect.logInfo("stepReady: composing user response via LLM",
-		"plan_id", r.plan.ID,
-		"ctx_deadline", contextDeadlineString(r.ctx),
-		"tasks", len(r.plan.Tasks))
-	llmStart := time.Now()
-	r.plan.UserResponse = r.architect.readyUserResponseInline(r.ctx, r.request, r.plan)
-	r.diag.log("stepReady: LLM response complete elapsed=%v len=%d",
-		time.Since(llmStart), len(r.plan.UserResponse))
-	r.architect.logInfo("stepReady: LLM response complete",
-		"plan_id", r.plan.ID,
-		"elapsed", time.Since(llmStart).String(),
-		"response_len", len(r.plan.UserResponse))
-	// ReadyDirective is now derived from SM state — no explicit assignment.
-	r.diag.log("stepReady: plan in Ready state, directive derived plan_id=%s", r.plan.ID)
-	return r.architect.persistPlanState(r.plan)
-}
-
-func (r *planningProtocolRunner) stepAutoHandoff() error {
-	r.architect.logInfo("stepAutoHandoff: entry",
-		"plan_id", r.plan.ID,
-		"running", r.architect.running,
-		"bus_available", r.architect.bus != nil,
-		"ctx_deadline", contextDeadlineString(r.ctx))
-	if !r.architect.running || r.architect.bus == nil {
-		r.diag.log("stepAutoHandoff: bus unavailable, plan stays Ready")
-		r.architect.logWarn("stepAutoHandoff: bus unavailable, plan stays Ready",
-			"plan_id", r.plan.ID)
-		r.architect.publishPlanStreamChunk(r.ctx,
-			"\n\nOrchestrator bus is unavailable — plan stays ready. Say **go ahead** to retry.")
-		return nil
-	}
-
-	payload := buildHandoffPayload(r.plan, "auto handoff from planning protocol")
-	if !isPlanHandoffPayloadValid(payload) {
-		r.diag.log("stepAutoHandoff: invalid payload, plan stays Ready")
-		r.architect.logWarn("stepAutoHandoff: handoff payload is invalid (not plan JSON)",
-			"plan_id", r.plan.ID)
-		r.architect.publishPlanStreamChunk(r.ctx,
-			"\n\nPlan serialization failed — say **go ahead** to retry.")
-		return nil
-	}
-
-	// Generate the orchestrator's CID and emit reroute BEFORE the sync call
-	// so the TUI switches to "orchestrator" while the orchestrator processes.
-	orchCID := "corr_" + uuid.NewString()
-	originalCID := originalCIDFromContext(r.ctx)
-	r.architect.logInfo("stepAutoHandoff: emitting reroute + calling requestRouteSync",
-		"plan_id", r.plan.ID,
-		"original_cid", originalCID,
-		"orch_cid", orchCID)
-	r.architect.publishHandoffReroute(r.ctx, "orchestrator", originalCID, orchCID)
-
-	request := &guide.RouteRequest{
-		Input:         payload,
-		CorrelationID: orchCID,
-		TargetAgentID: "orchestrator",
-		SessionID:     r.plan.SessionID,
-	}
-
-	handoffStart := time.Now()
-	response, err := r.architect.requestRouteSync(r.ctx, request)
-	r.architect.logInfo("stepAutoHandoff: requestRouteSync returned",
-		"plan_id", r.plan.ID,
-		"elapsed", time.Since(handoffStart).String(),
-		"has_response", response != nil,
-		"err", err)
-	if err != nil {
-		r.architect.logWarn("stepAutoHandoff: route failed",
-			"plan_id", r.plan.ID,
-			"elapsed", time.Since(handoffStart).String(),
-			"error", err)
-		r.diag.log("stepAutoHandoff: route failed after %v: %v", time.Since(handoffStart), err)
-		r.architect.publishPlanStreamChunk(r.ctx,
-			"\n\nHandoff to orchestrator failed: "+err.Error()+"\nSay **go ahead** to retry.")
-		return nil
-	}
-
-	if !isHandoffSuccess(response) {
-		summary := summarizeAutoHandoffResponse(response)
-		r.architect.logWarn("stepAutoHandoff: orchestrator rejected",
-			"plan_id", r.plan.ID, "summary", summary)
-		r.diag.log("stepAutoHandoff: rejected: %s", summary)
-		r.architect.publishPlanStreamChunk(r.ctx,
-			"\n\nOrchestrator rejected the handoff: "+summary+"\nSay **go ahead** to retry.")
-		return nil
-	}
-
-	summary := summarizeAutoHandoffResponse(response)
-	r.diag.log("stepAutoHandoff: success: %s", summary)
-
-	// ReadyDirective is derived from SM state — transitions to Executing
-	// automatically makes ReadyDirective() return nil.
-	if err := r.transition(PlanStatusExecuting); err != nil {
-		return err
-	}
-	r.plan.RiskSummary = append(r.plan.RiskSummary, summary)
-	r.architect.publishPlanStreamChunk(r.ctx, "\n\n"+summary)
-	return r.architect.persistPlanState(r.plan)
 }
 
 func isHandoffSuccess(msg *guide.Message) bool {

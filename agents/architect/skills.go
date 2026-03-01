@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
@@ -52,6 +53,46 @@ func (a *Architect) publishRerouteRequest(reason, originalInput, suggestedTarget
 }
 
 // ---------------------------------------------------------------------------
+// Plan-aware skill helpers
+// ---------------------------------------------------------------------------
+
+// resolveProtocolPlan looks up an active plan by ID. Returns nil, false
+// when planID is empty or not found — callers should proceed without
+// plan attachment in that case (backward compatibility).
+func (a *Architect) resolveProtocolPlan(planID string) (*DesignPlan, bool) {
+	if strings.TrimSpace(planID) == "" {
+		return nil, false
+	}
+	return a.GetActivePlan(planID)
+}
+
+// advancePlan validates the state machine transition, runs the mutate
+// function to attach results, transitions state, publishes progress,
+// and persists. This is the single entry point for plan state changes
+// from skill handlers.
+func (a *Architect) advancePlan(
+	ctx context.Context,
+	plan *DesignPlan,
+	targetStatus PlanStatus,
+	mutate func(),
+) error {
+	if plan == nil {
+		return fmt.Errorf("advancePlan: plan is nil")
+	}
+	if err := plan.SM().TransitionTo(targetStatus, plan); err != nil {
+		return fmt.Errorf("advancePlan: %w", err)
+	}
+	plan.Status = plan.SM().State()
+	plan.Epoch = plan.SM().Epoch()
+	plan.UpdatedAt = time.Now()
+	if mutate != nil {
+		mutate()
+	}
+	a.publishPlanStreamProgress(ctx, targetStatus)
+	return a.persistPlanState(plan)
+}
+
+// ---------------------------------------------------------------------------
 // plan (consolidated: analyze, design, generate_tasks, estimate, revise)
 // ---------------------------------------------------------------------------
 
@@ -94,21 +135,37 @@ func planSkill(a *Architect) *skills.Skill {
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{
+			result := map[string]any{
 				"requirements": requirements,
 				"analysis": map[string]any{
 					"goal_count":       len(requirements.Goals),
 					"constraint_count": len(requirements.Constraints),
 					"scope":            requirements.Scope,
 				},
-			}, nil
+			}
+			if plan, ok := a.resolveProtocolPlan(p.PlanID); ok {
+				if err := a.advancePlan(ctx, plan, PlanStatusAnalyzing, func() {
+					plan.Requirements = requirements
+				}); err != nil {
+					return nil, err
+				}
+				result["plan_status"] = plan.SM().State().String()
+			}
+			return result, nil
 		},
 		"design": func(ctx context.Context, p *planInput) (any, error) {
-			if p.Requirements == nil {
+			plan, hasPlan := a.resolveProtocolPlan(p.PlanID)
+			requirements := p.Requirements
+			var codebasePatterns *CodebasePatterns
+			if hasPlan {
+				// In protocol mode, use the plan's accumulated state.
+				requirements = plan.Requirements
+				codebasePatterns = plan.CodebasePatterns
+			}
+			if requirements == nil {
 				return nil, fmt.Errorf("requirements is required for action=design")
 			}
-			var codebasePatterns *CodebasePatterns
-			if len(p.Patterns) > 0 {
+			if codebasePatterns == nil && len(p.Patterns) > 0 {
 				codebasePatterns = &CodebasePatterns{
 					Patterns: make([]PatternInfo, len(p.Patterns)),
 				}
@@ -116,31 +173,48 @@ func planSkill(a *Architect) *skills.Skill {
 					codebasePatterns.Patterns[i] = PatternInfo{Name: pat}
 				}
 			}
-			architecture, err := a.designArchitecture(ctx, p.Requirements, codebasePatterns)
+			architecture, err := a.designArchitecture(ctx, requirements, codebasePatterns)
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{
+			result := map[string]any{
 				"architecture": architecture,
 				"summary": map[string]any{
 					"component_count": len(architecture.Components),
 					"interface_count": len(architecture.Interfaces),
 					"pattern_count":   len(architecture.Patterns),
 				},
-			}, nil
+			}
+			if hasPlan {
+				if err := a.advancePlan(ctx, plan, PlanStatusDesigning, func() {
+					plan.Architecture = architecture
+				}); err != nil {
+					return nil, err
+				}
+				result["plan_status"] = plan.SM().State().String()
+			}
+			return result, nil
 		},
 		"generate_tasks": func(ctx context.Context, p *planInput) (any, error) {
-			if p.Architecture == nil {
-				return nil, fmt.Errorf("architecture is required for action=generate_tasks")
-			}
+			plan, hasPlan := a.resolveProtocolPlan(p.PlanID)
+			architecture := p.Architecture
 			constraints := &PlanConstraints{
 				MaxTasksPerAgent: p.MaxTasksPerAgent,
 				AllowParallel:    p.AllowParallel,
 			}
+			if hasPlan {
+				architecture = plan.Architecture
+				if plan.Constraints != nil {
+					constraints = plan.Constraints
+				}
+			}
+			if architecture == nil {
+				return nil, fmt.Errorf("architecture is required for action=generate_tasks")
+			}
 			if constraints.MaxTasksPerAgent == 0 {
 				constraints.MaxTasksPerAgent = 5
 			}
-			tasks, err := a.generateAtomicTasks(ctx, p.Architecture, constraints)
+			tasks, err := a.generateAtomicTasks(ctx, architecture, constraints)
 			if err != nil {
 				return nil, err
 			}
@@ -150,14 +224,63 @@ func planSkill(a *Architect) *skills.Skill {
 				totalTokens += task.EstimatedTokens
 				complexityCounts[task.Complexity.String()]++
 			}
-			return map[string]any{
+			result := map[string]any{
 				"tasks": tasks,
 				"summary": map[string]any{
 					"task_count":        len(tasks),
 					"total_tokens":      totalTokens,
 					"complexity_counts": complexityCounts,
 				},
-			}, nil
+			}
+			if hasPlan {
+				// Generating → attach tasks
+				if err := a.advancePlan(ctx, plan, PlanStatusGenerating, func() {
+					plan.Tasks = tasks
+				}); err != nil {
+					return nil, err
+				}
+				// Auto-chain: workflow DAG
+				workflow, wErr := a.createWorkflowDAG(ctx, plan.Tasks)
+				if wErr != nil {
+					return nil, wErr
+				}
+				if err := a.advancePlan(ctx, plan, PlanStatusOrchestrating, func() {
+					plan.Workflow = workflow
+				}); err != nil {
+					return nil, err
+				}
+				// Auto-chain: validate + declaration
+				if vErr := validatePlanForExecution(plan); vErr != nil {
+					return nil, vErr
+				}
+				declaration := buildAutoDeclaration(plan)
+				if dErr := a.validateDeclaration(declaration); dErr != nil {
+					plan.RiskSummary = append(plan.RiskSummary, "declaration validation warning: "+dErr.Error())
+				}
+				plan.Declarations = append(plan.Declarations, declaration)
+				a.publishDeclaration(declaration, plan.SessionID)
+				// Transition to Ready
+				if err := a.advancePlan(ctx, plan, PlanStatusReady, nil); err != nil {
+					return nil, err
+				}
+				// Grant ready lease
+				if a.leaseManager != nil {
+					a.leaseManager.GrantReadyLease(plan)
+				}
+				a.publishPlanSnapshot(ctx, plan)
+				layers := planLayerCount(plan)
+				result["plan_status"] = plan.SM().State().String()
+				result["layer_count"] = layers
+				result["task_summary"] = firstTaskName(plan)
+				result["next_action"] = "PROTOCOL COMPLETE. The plan is ready and automatically " +
+					"rendered in your response — the user can see it. Do NOT invoke any more tools. " +
+					"Do NOT repeat the plan structure or task list. Write a brief assessment: " +
+					"highlight the key architectural tradeoff and the primary risk. " +
+					"Sound like a principal engineer. Then invite the user to approve or " +
+					"request changes — use your own natural phrasing, not a scripted template. " +
+					"Do NOT invoke route_plan_acceptance — wait for the user's response."
+			}
+			return result, nil
 		},
 		"estimate": func(_ context.Context, p *planInput) (any, error) {
 			if strings.TrimSpace(p.Description) == "" {
@@ -228,7 +351,7 @@ func planSkill(a *Architect) *skills.Skill {
 			"involves_tests":    {Type: "boolean", Description: "Whether task includes testing"},
 			"involves_refactor": {Type: "boolean", Description: "Whether task involves refactoring"},
 		}, false).
-		StringParam("plan_id", "Plan identifier to revise (for revise)", false).
+		StringParam("plan_id", "Plan identifier for protocol-driven operations (analyze, design, generate_tasks, revise)", false).
 		StringParam("reason", "Reason for revision (for revise)", false).
 		ObjectParam("updates", "Optional update payload (for revise)", map[string]*skills.Property{}, false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {

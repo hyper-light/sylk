@@ -210,6 +210,18 @@ func queryPipelineStateSkill(o *Orchestrator) *skills.Skill {
 				return nil, fmt.Errorf("orchestrator not running")
 			}
 
+			// Check store once upfront — avoids bus subscription if data exists.
+			if stateJSON, err := o.store.GetPipelineState(params.AgentID, params.DAGID, params.NodeID); err == nil && stateJSON != "" {
+				var state any
+				json.Unmarshal([]byte(stateJSON), &state)
+				return map[string]any{
+					"query_id": uuid.New().String(),
+					"timeout":  false,
+					"state":    state,
+					"source":   "store",
+				}, nil
+			}
+
 			queryID := uuid.New().String()
 			query := &PipelineQuery{
 				QueryID:   queryID,
@@ -227,41 +239,50 @@ func queryPipelineStateSkill(o *Orchestrator) *skills.Skill {
 				Timestamp:     time.Now(),
 			}
 
+			// Subscribe to pipeline state updates for this agent before
+			// publishing the query, so we don't miss the response.
+			stateCh := make(chan string, 1)
+			sub, subErr := bus.SubscribeAsync("pipeline.state."+params.AgentID, func(respMsg *guide.Message) error {
+				data, ok := respMsg.Payload.(map[string]any)
+				if !ok {
+					return nil
+				}
+				stateJSON, _ := data["state_json"].(string)
+				if stateJSON != "" {
+					select {
+					case stateCh <- stateJSON:
+					default:
+					}
+				}
+				return nil
+			})
+			if subErr != nil {
+				return nil, fmt.Errorf("subscribe pipeline state: %w", subErr)
+			}
+			defer sub.Unsubscribe()
+
 			if err := bus.Publish("pipeline.query."+params.AgentID, msg); err != nil {
 				return nil, fmt.Errorf("publish pipeline query: %w", err)
 			}
 
-			// Await response with timeout
-			timeout := 10 * time.Second
-			deadline := time.After(timeout)
-
-			// Check for cached response periodically
-			ticker := time.NewTicker(100 * time.Millisecond)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-deadline:
-					return map[string]any{
-						"query_id": queryID,
-						"timeout":  true,
-						"message":  "pipeline agent did not respond within timeout",
-					}, nil
-				case <-ticker.C:
-					// Check if response has arrived (stored in pipeline state)
-					if stateJSON, err := o.store.GetPipelineState(params.AgentID, params.DAGID, params.NodeID); err == nil && stateJSON != "" {
-						var state any
-						json.Unmarshal([]byte(stateJSON), &state)
-						return map[string]any{
-							"query_id": queryID,
-							"timeout":  false,
-							"state":    state,
-							"source":   "store",
-						}, nil
-					}
-				}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(10 * time.Second):
+				return map[string]any{
+					"query_id": queryID,
+					"timeout":  true,
+					"message":  "pipeline agent did not respond within timeout",
+				}, nil
+			case stateJSON := <-stateCh:
+				var state any
+				json.Unmarshal([]byte(stateJSON), &state)
+				return map[string]any{
+					"query_id": queryID,
+					"timeout":  false,
+					"state":    state,
+					"source":   "bus",
+				}, nil
 			}
 		}).
 		Build()

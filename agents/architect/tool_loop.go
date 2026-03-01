@@ -13,6 +13,17 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
+// toolRunsOverrideKey allows protocol code to override the default MaxToolRuns
+// for a specific executeToolLoop invocation via the context.
+type toolRunsOverrideKey struct{}
+
+// withToolRunsOverride returns a context that overrides the max tool runs
+// for executeToolLoop. Used by the planning protocol to set a higher budget
+// (protocolMaxToolRuns) than the default config.MaxToolRuns.
+func withToolRunsOverride(ctx context.Context, maxRuns int) context.Context {
+	return context.WithValue(ctx, toolRunsOverrideKey{}, maxRuns)
+}
+
 // executeToolLoop runs the LLM tool-call loop: stream → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
 // Follows the engineer/designer tool loop pattern, using the streaming
@@ -24,6 +35,9 @@ func (a *Architect) executeToolLoop(
 	onChunk func(string),
 ) (string, error) {
 	maxRuns := a.config.MaxToolRuns
+	if override, ok := ctx.Value(toolRunsOverrideKey{}).(int); ok && override > 0 {
+		maxRuns = override
+	}
 	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	consecutiveErrors := 0
 

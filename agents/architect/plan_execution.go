@@ -84,28 +84,17 @@ func (a *Architect) dispatchPlanExecution(
 
 	a.publishPlanSnapshot(ctx, plan)
 
-	// Generate the orchestrator's correlation ID before the sync call so we
-	// can emit a reroute event that tells the TUI to track the orchestrator's
-	// stream events. Without this, the TUI would only see the architect's CID.
+	// Generate the orchestrator's correlation ID for the sync call.
 	orchCID := "corr_" + uuid.NewString()
-
-	// Extract the architect's original CID from stream context for the reroute.
-	originalCID := originalCIDFromContext(ctx)
-
-	a.logInfo("dispatchPlanExecution: emitting reroute BEFORE sync call",
-		"plan_id", plan.ID,
-		"original_cid", originalCID,
-		"orch_cid", orchCID,
-		"payload_len", len(payload))
-
-	// Emit reroute BEFORE the sync call so the TUI switches to "orchestrator"
-	// while the orchestrator is actively processing the plan ingestion.
-	a.publishHandoffReroute(ctx, "orchestrator", originalCID, orchCID)
 
 	a.logInfo("dispatchPlanExecution: BLOCKING CALL to requestRouteSync",
 		"plan_id", plan.ID,
 		"orch_cid", orchCID,
+		"payload_len", len(payload),
 		"ctx_deadline", contextDeadlineString(ctx))
+
+	// The orchestrator handles its own push to the TUI via the agent push
+	// mechanism — no reroute event needed from the architect.
 
 	request := &guide.RouteRequest{
 		Input:         payload,
@@ -125,7 +114,7 @@ func (a *Architect) dispatchPlanExecution(
 	if err != nil {
 		a.logWarn("dispatchPlanExecution: route failed", "plan_id", plan.ID, "error", err)
 		return &ConversationResult{
-			Response: "I tried to dispatch the plan but hit an error: " + err.Error() + "\nSay **go ahead** to retry.",
+			Response: "I tried to dispatch the plan but hit an error: " + err.Error() + "\nWant me to try again?",
 			Intent:   IntentExecute,
 		}, true
 	}
@@ -134,7 +123,7 @@ func (a *Architect) dispatchPlanExecution(
 		summary := summarizeAutoHandoffResponse(response)
 		a.logWarn("dispatchPlanExecution: orchestrator rejected", "plan_id", plan.ID, "summary", summary)
 		return &ConversationResult{
-			Response: "The orchestrator rejected the handoff: " + summary + "\nSay **go ahead** to retry.",
+			Response: "The orchestrator rejected the handoff: " + summary + "\nWant me to try again?",
 			Intent:   IntentExecute,
 		}, true
 	}
@@ -175,6 +164,55 @@ func originalCIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	return metadata.CorrelationID
+}
+
+// latestHistoricalPlanForSession returns the most recently updated plan for
+// a session regardless of status. Used for conversation context enrichment
+// and prior session context — not for execution eligibility.
+func (a *Architect) latestHistoricalPlanForSession(sessionID string) *DesignPlan {
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return nil
+	}
+	a.activePlansMu.RLock()
+	defer a.activePlansMu.RUnlock()
+	var best *DesignPlan
+	for _, plan := range a.activePlans {
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
+			continue
+		}
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	return best
+}
+
+// latestConsultingPlan returns the most recently updated plan in Consulting
+// or Clarifying state for the given session. Used by ask_user_question to
+// attach clarification questions to the in-flight plan.
+func (a *Architect) latestConsultingPlan(sessionID string) *DesignPlan {
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return nil
+	}
+	a.activePlansMu.RLock()
+	defer a.activePlansMu.RUnlock()
+	var best *DesignPlan
+	for _, plan := range a.activePlans {
+		state := plan.SM().State()
+		if state != PlanStatusConsulting && state != PlanStatusClarifying &&
+			state != PlanStatusAnalyzing && state != PlanStatusDesigning {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
+			continue
+		}
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	return best
 }
 
 // isPlanHandoffPayloadValid returns true if the payload is a valid

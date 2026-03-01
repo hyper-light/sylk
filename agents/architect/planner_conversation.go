@@ -13,9 +13,8 @@ import (
 type plannerConversationMode string
 
 const (
-	plannerConversationModeClarification    plannerConversationMode = "clarification"
-	plannerConversationModeClarifyDecision  plannerConversationMode = "clarify_decision"
-	plannerConversationModeReady            plannerConversationMode = "ready"
+	plannerConversationModeClarification plannerConversationMode = "clarification"
+	plannerConversationModeReady        plannerConversationMode = "ready"
 	plannerConversationModeConverse         plannerConversationMode = "converse"
 	plannerConversationModeFeedback         plannerConversationMode = "feedback"
 )
@@ -49,8 +48,16 @@ func (a *Architect) composeUserFacingResponse(
 	// route_plan_acceptance during conversation.
 	text, err := a.composeUserFacingResponseWithTools(ctx, request)
 	if err == nil {
+		architectDebugLog().Info("composeUserFacingResponse: TOOL_LOOP_SUCCESS",
+			"mode", string(request.normalizedMode()),
+			"text_len", len(text),
+			"ctx_err", ctx.Err())
 		return text, nil
 	}
+	architectDebugLog().Warn("composeUserFacingResponse: TOOL_LOOP_FAILED",
+		"mode", string(request.normalizedMode()),
+		"error", err.Error(),
+		"ctx_err", ctx.Err())
 	a.logWarn("architect tool-loop compose failed, trying text-only", "error", err)
 
 	// Fall through to text-only streaming path.
@@ -253,31 +260,34 @@ Requirements:
 - Summarize the plan in plain language and include why it is a good default.
 - Mention one critical tradeoff or risk the user should validate.
 - Check the "approval_required" field in the context JSON:
-  - If true: ask the user whether to refine or proceed. End with a brief, natural
-    approval cue so the user knows how to proceed. Examples of good approval cues:
-      "Say **go ahead** when you're ready, or tell me what to adjust."
-      "Ready to execute? Say **go ahead**, or let me know what needs changing."
+  - If true: ask the user whether to refine or proceed. End by inviting the user
+    to approve or request changes. Use your own natural phrasing — do NOT use a
+    scripted template or repeat the same wording each time.
     Do NOT use robotic phrasing like "Do you approve this plan?" or "Please confirm."
-    Do NOT invoke route_plan_acceptance.
+    Do NOT automatically invoke route_plan_acceptance, you must receive a response from
+    the user.
   - If false: invoke route_plan_acceptance immediately with the plan details.
     Do not ask for approval.
 - Do not use canned lead-ins or protocol labels.`
-	case plannerConversationModeClarifyDecision:
-		return `You have just analyzed the user's requirements. Examine the context JSON — it contains the requirements analysis with goals, constraints, scope, and any clarification_questions or unknowns identified during analysis.
-
-Decide whether to proceed with planning or ask clarifying questions first:
-- If the requirements are clear enough to produce a useful plan: write a brief acknowledgment and proceed. Do NOT invoke ask_user_question.
-- If critical ambiguities would lead to a wrong plan: invoke ask_user_question with the most important clarifying questions (max 3). Focus on questions that would change the plan's direction, not minor details.
-
-Do not mention the decision process to the user.`
 	case plannerConversationModeConverse:
 		return `Write the next user-facing response.
 
-CRITICAL — Check for planning confirmation first:
-If you previously offered to create a plan and the user's message expresses agreement or approval (any affirmative intent, regardless of phrasing), you MUST invoke the start_planning tool IMMEDIATELY with a comprehensive query synthesizing all requirements from the conversation. Do NOT write a text response about planning — invoke the tool.
+Planning flow:
+1. When the user confirms they want to proceed with planning, invoke start_planning with a
+   comprehensive query synthesizing all gathered requirements.
+2. After start_planning returns, it gives you a plan_id and protocol instructions. Follow those
+   instructions: invoke plan(analyze), consult(pre_planning), plan(design), plan(generate_tasks)
+   in order, passing the plan_id to each.
+3. After generate_tasks completes, the plan is automatically rendered in your response.
+   Do NOT repeat the plan structure or task list. Write a brief assessment:
+   - Highlight one critical tradeoff or risk.
+   - Sound like a principal engineer, not a workflow bot.
+4. Invite the user to approve or request changes. Use your own natural phrasing —
+   do NOT use a scripted template or repeat the same wording each time.
+   Do NOT invoke route_plan_acceptance — wait for the user's next message.
 
 The user is in conversation with you — an expert software architect. They may be:
-- Confirming readiness to plan (see CRITICAL rule above)
+- Requesting implementation — gather requirements and clarify constraints first
 - Asking for advice, recommendations, or opinions
 - Providing pushback or disagreement on a prior suggestion
 - Asking clarifying questions about technology, patterns, or tradeoffs
@@ -287,15 +297,23 @@ The user is in conversation with you — an expert software architect. They may 
 Requirements:
 - Respond directly and substantively to whatever the user said.
 - Draw on your architectural expertise — be opinionated with clear reasoning.
-- If the conversation naturally leads to a concrete implementation task and you have enough context, ask the user if they'd like you to create an actionable plan.
-- Do not invoke start_planning without user confirmation. Do not force the conversation into planning.
+- For general conversation (no planning intent), engage naturally. If the conversation
+  leads to a concrete task, ask if they'd like you to create a plan.
 - Keep a natural, collaborative tone.
 - Do not use canned lead-ins or boilerplate.`
 	case plannerConversationModeFeedback:
 		return `The user is responding to a plan you presented. The plan summary is included in the context JSON as "plan_summary".
 
 CRITICAL — Check for approval first:
-If the user's response signals acceptance (e.g., "yes", "yep", "looks good", "go ahead", "do it", "approved", "ship it", or similar affirmative), you MUST invoke the route_plan_acceptance tool with their verbatim response. Do NOT write a text reply — route immediately.
+If the user's response signals acceptance (e.g., "yes", "yep", "looks good", "go ahead", "do it",
+"approved", "ship it", or similar affirmative):
+1. Invoke route_plan_acceptance with plan_id and the user's verbatim response. Do NOT write a
+   text reply first — invoke the tool immediately.
+2. When route_plan_acceptance returns the Guide's verdict, invoke handle_plan_acceptance_result
+   with the verdict details (plan_id, result, user_response). On "accept", the plan dispatches
+   to the orchestrator automatically.
+3. After handle_plan_acceptance_result confirms dispatch, write a brief acknowledgment
+   (e.g., "Plan dispatched — the orchestrator is picking it up now.").
 
 If the user is NOT approving (they have questions, want changes, or disagree), write a response:
 - Address the user's feedback directly.
@@ -303,7 +321,7 @@ If the user is NOT approving (they have questions, want changes, or disagree), w
 - If they're asking for clarification, answer concisely with architectural reasoning.
 - Maintain a collaborative tone — the plan is a proposal, not a decree.
 - Do not re-present the entire plan — focus on what changes based on their feedback.
-- End with a brief re-approval cue (e.g., "Say **go ahead** to proceed, or let me know what else to adjust.").`
+- End by inviting the user to approve or request further changes. Use natural phrasing, not a template.`
 	default:
 		return `Write the next user-facing response.
 
@@ -318,7 +336,7 @@ Requirements:
 
 func plannerConversationMaxTokensForMode(mode plannerConversationMode, maxTokens int) int {
 	switch mode {
-	case plannerConversationModeConverse, plannerConversationModeReady, plannerConversationModeFeedback, plannerConversationModeClarifyDecision:
+	case plannerConversationModeConverse, plannerConversationModeReady, plannerConversationModeFeedback:
 		return converseMaxTokens(maxTokens)
 	default:
 		return plannerConversationMaxTokens(maxTokens)
@@ -364,8 +382,6 @@ func (r plannerConversationRequest) normalizedMode() plannerConversationMode {
 		return plannerConversationModeConverse
 	case plannerConversationModeFeedback:
 		return plannerConversationModeFeedback
-	case plannerConversationModeClarifyDecision:
-		return plannerConversationModeClarifyDecision
 	default:
 		return plannerConversationModeClarification
 	}

@@ -75,6 +75,7 @@ type Orchestrator struct {
 	// Pipeline subscriptions
 	pipelineSubs []guide.Subscription
 	dagSubs      []guide.Subscription
+	taskSubs     []guide.Subscription
 
 	// Handoff bridge for context-aware agent lifecycle management
 	handoffBridge *handoff.HandoffBridge
@@ -479,10 +480,20 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 }
 
 func (o *Orchestrator) subscribeToTaskEvents() {
-	o.bus.SubscribeAsync("tasks.dispatch", o.handleTaskDispatch)
-	o.bus.SubscribeAsync("tasks.complete", o.handleTaskComplete)
-	o.bus.SubscribeAsync("tasks.failed", o.handleTaskFailed)
-	o.bus.SubscribeAsync("workflows.status", o.handleWorkflowStatus)
+	topics := []struct {
+		topic   string
+		handler guide.MessageHandler
+	}{
+		{"tasks.dispatch", o.handleTaskDispatch},
+		{"tasks.complete", o.handleTaskComplete},
+		{"tasks.failed", o.handleTaskFailed},
+		{"workflows.status", o.handleWorkflowStatus},
+	}
+	for _, t := range topics {
+		if sub, err := o.bus.SubscribeAsync(t.topic, t.handler); err == nil {
+			o.taskSubs = append(o.taskSubs, sub)
+		}
+	}
 }
 
 // Stop unsubscribes from event bus topics and shuts down the LLM loop.
@@ -562,26 +573,31 @@ func (o *Orchestrator) Stop() error {
 
 func (o *Orchestrator) unsubscribeAll() []error {
 	var errs []error
-	if o.requestSub != nil {
-		if err := o.requestSub.Unsubscribe(); err != nil {
+	for _, sub := range []guide.Subscription{o.requestSub, o.responseSub, o.registrySub, o.authSub} {
+		if sub != nil {
+			if err := sub.Unsubscribe(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	for _, sub := range o.taskSubs {
+		if err := sub.Unsubscribe(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if o.responseSub != nil {
-		if err := o.responseSub.Unsubscribe(); err != nil {
+	o.taskSubs = nil
+	for _, sub := range o.pipelineSubs {
+		if err := sub.Unsubscribe(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if o.registrySub != nil {
-		if err := o.registrySub.Unsubscribe(); err != nil {
+	o.pipelineSubs = nil
+	for _, sub := range o.dagSubs {
+		if err := sub.Unsubscribe(); err != nil {
 			errs = append(errs, err)
 		}
 	}
-	if o.authSub != nil {
-		if err := o.authSub.Unsubscribe(); err != nil {
-			errs = append(errs, err)
-		}
-	}
+	o.dagSubs = nil
 	return errs
 }
 
@@ -875,6 +891,11 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		Data:     map[string]any{"task_id": taskID, "agent_id": agentID, "workflow_id": workflowID},
 	})
 
+	// Publish pipeline agent activity so the TUI panel shows the agent.
+	if nodeID != "" && agentType != "" {
+		o.publishPipelineAgentActivity(agentType, dagID, nodeID, taskID)
+	}
+
 	// Route to containerized pipeline agent for DAG-originated dispatches.
 	if router != nil && nodeID != "" {
 		pipelineTask := &PipelineTask{
@@ -887,7 +908,17 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 			ParentResults: parentResults,
 			SessionID:     o.config.SessionID,
 		}
-		if routeErr := router.Route(pipelineTask); routeErr != nil {
+
+		// Look up the dispatch lifecycle channel so the route goroutine
+		// exits when the executor's Dispatch call returns.
+		var done <-chan struct{}
+		if o.dagBridge != nil {
+			if dispatcher := o.dagBridge.GetDispatcherForDAG(dagID); dispatcher != nil {
+				done = dispatcher.DispatchDone(nodeID)
+			}
+		}
+
+		if routeErr := router.RouteWithLifecycle(pipelineTask, done); routeErr != nil {
 			o.pushEvent(&busEvent{
 				Topic:     "tasks.dispatch",
 				Timestamp: time.Now(),
@@ -1385,6 +1416,25 @@ func (o *Orchestrator) State() *State {
 // publishActivity sends a user-visible activity event to the UI agent panel.
 func (o *Orchestrator) publishActivity(eventType events.EventType, content string) {
 	o.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
+}
+
+// publishPipelineAgentActivity publishes an activity event for a pipeline
+// agent so the TUI's ensureAgent creates a panel entry. Uses agentType as
+// AgentID so one entry per agent type (not per dispatch).
+func (o *Orchestrator) publishPipelineAgentActivity(agentType, dagID, nodeID, taskID string) {
+	if o.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(events.EventTypeAgentAction, o.config.SessionID,
+		fmt.Sprintf("Processing pipeline task: %s", nodeID))
+	evt.AgentID = agentType
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = agentType
+	evt.Data["agent_name"] = agentType
+	evt.Data["pipeline_id"] = dagID
+	evt.Data["node_id"] = nodeID
+	evt.Data["task_id"] = taskID
+	o.activityPub.PublishActivity(evt)
 }
 
 // publishActivityWithVisibility sends an activity event with explicit visibility.

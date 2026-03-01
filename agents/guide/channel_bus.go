@@ -39,6 +39,13 @@ const defaultCloseTimeout = 5 * time.Second
 // to prevent unbounded goroutine growth under sustained publish load.
 const maxAsyncHandlersPerSubscription = 32
 
+// maxQueueSize caps the per-subscriber message queue. When a subscriber's
+// queue reaches this size, oldest messages are dropped to make room for new
+// ones. This prevents unbounded memory growth when handlers are slow or
+// stalled. The value is generous enough to absorb bursts (e.g. DAG layer
+// dispatch) without dropping under normal operation.
+const maxQueueSize = 4096
+
 type ChannelBusConfig struct {
 	BufferSize   int
 	ShardCount   int
@@ -152,8 +159,24 @@ func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message)
 	}
 	sub.mu.Lock()
 	sub.queue = append(sub.queue, msg)
+	dropped := 0
+	if len(sub.queue) > maxQueueSize {
+		dropped = len(sub.queue) - maxQueueSize
+		// Drop oldest messages to keep the queue bounded.
+		// copy avoids holding references to dropped messages.
+		remaining := make([]*Message, maxQueueSize)
+		copy(remaining, sub.queue[dropped:])
+		sub.queue = remaining
+	}
 	queueLen := len(sub.queue)
 	sub.mu.Unlock()
+
+	if dropped > 0 {
+		DebugFileLog().Warn("publishToSubscriber: QUEUE_OVERFLOW_DROP",
+			"topic", sub.topic,
+			"dropped", dropped,
+			"queue_len", queueLen)
+	}
 
 	// Diagnostic: confirm enqueue for stream-complete events.
 	if b.isStreamComplete(msg) {

@@ -15,13 +15,14 @@ import (
 // BusNodeDispatcher implements dag.NodeDispatcher by routing node execution
 // to pipeline agents via the EventBus.
 type BusNodeDispatcher struct {
-	bus       guide.EventBus
-	agentID   string
-	sessionID string
-	dagID     string
-	buffers   *BufferRegistry
-	activator guide.AgentActivator
-	pending   sync.Map // nodeID → chan *dag.NodeResult
+	bus          guide.EventBus
+	agentID      string
+	sessionID    string
+	dagID        string
+	buffers      *BufferRegistry
+	activator    guide.AgentActivator
+	pending      sync.Map // nodeID → chan *dag.NodeResult
+	dispatchDone sync.Map // nodeID → chan struct{}
 }
 
 // compile-time assertion
@@ -45,8 +46,12 @@ func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, 
 // arrives or the context is cancelled.
 func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
 	ch := make(chan *dag.NodeResult, 1)
+	done := make(chan struct{})
 	d.pending.Store(node.ID(), ch)
+	d.dispatchDone.Store(node.ID(), done)
 	defer d.pending.Delete(node.ID())
+	defer d.dispatchDone.Delete(node.ID())
+	defer close(done)
 
 	// Build parent result summaries for the dispatch payload
 	parentSummaries := make(map[string]any, len(parentResults))
@@ -105,6 +110,17 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// DispatchDone returns a channel that is closed when the Dispatch call for
+// nodeID returns (success or timeout). Returns nil if no dispatch is active
+// for the given node; a nil channel blocks forever in select, which is the
+// correct fallback for the non-lifecycle case.
+func (d *BusNodeDispatcher) DispatchDone(nodeID string) <-chan struct{} {
+	if val, ok := d.dispatchDone.Load(nodeID); ok {
+		return val.(chan struct{})
+	}
+	return nil
 }
 
 // OnNodeComplete is called by the orchestrator when a pipeline agent responds.

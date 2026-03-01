@@ -2,73 +2,39 @@ package architect
 
 import (
 	"context"
+	"fmt"
 	"strings"
-
-	"github.com/adalundhe/sylk/agents/guide"
 )
 
-// readyUserResponseInline streams plan commentary token-by-token into chat
-// via publishPlanStreamChunk. Returns the text for persistence in
-// plan.UserResponse.
-func (a *Architect) readyUserResponseInline(
-	ctx context.Context,
-	req *ArchitectRequest,
-	plan *DesignPlan,
-) string {
-	request := a.buildReadyConversationRequest(req, plan)
-	request.OnChunk = func(text string) {
-		a.publishPlanStreamChunk(ctx, text)
+// ctxOrBackground returns ctx if it has not been cancelled, otherwise returns
+// context.Background(). Used to escape cancelled parent contexts for fallback
+// LLM calls that must complete regardless of the original request lifecycle.
+func ctxOrBackground(ctx context.Context) context.Context {
+	if ctx.Err() != nil {
+		return context.Background()
 	}
-	response, err := a.composeUserFacingResponse(ctx, request)
-	if err != nil {
-		fb := fallbackReadyUserResponse(req, plan)
-		a.publishPlanStreamChunk(ctx, fb)
-		return fb
-	}
-	return response
+	return ctx
 }
 
-func (a *Architect) buildReadyConversationRequest(
-	req *ArchitectRequest,
-	plan *DesignPlan,
-) plannerConversationRequest {
-	requirements := requirementsFromPlan(plan)
-	return plannerConversationRequest{
-		Mode:                    plannerConversationModeReady,
-		UserQuery:               reqQuery(req),
-		PriorQuery:              requirementsQuery(requirements),
-		Scope:                   requirementsScope(requirements),
-		RecommendationNarrative: clarificationRecommendationNarrative(requirements),
-		Recommendations:         clarificationRecommendationItems(requirements),
-		Tradeoffs:               clarificationTradeoffItems(requirements),
-		Assumptions:             assumptionsFromPlan(plan),
-		TaskCount:               planTaskCount(plan),
-		LayerCount:              planLayerCount(plan),
-		FirstTask:               firstTaskName(plan),
-		ApprovalRequired:        !a.config.AutoApprove,
-		SessionID:               reqSessionID(req),
-		ConversationHistory:     reqConversationHistory(req),
+// fallbackReadyUserResponse generates a deterministic user-facing response
+// when a plan is ready but the LLM compose step failed (e.g. context cancelled).
+func fallbackReadyUserResponse(_ *Requirements, plan *DesignPlan) string {
+	if plan == nil || len(plan.Tasks) == 0 {
+		return "I've prepared a plan, but couldn't generate a summary. Please review the plan details above."
 	}
-}
-
-func reqConversationHistory(req *ArchitectRequest) []guide.ConversationTurn {
-	if req == nil {
-		return nil
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("I've prepared a plan with %d tasks", len(plan.Tasks)))
+	layers := planLayerCount(plan)
+	if layers > 1 {
+		b.WriteString(fmt.Sprintf(" across %d execution layers", layers))
 	}
-	return req.ConversationHistory
+	b.WriteString(".\n\n")
+	b.WriteString(formatPlanForChat(plan))
+	return b.String()
 }
 
-func fallbackReadyUserResponse(_ *ArchitectRequest, _ *DesignPlan) string {
-	return "The plan is ready. Let me know if you want to refine anything before execution."
-}
-
-func reqSessionID(req *ArchitectRequest) string {
-	if req == nil {
-		return ""
-	}
-	return req.SessionID
-}
-
+// planLayerCount returns the number of execution layers in the plan's workflow,
+// or 0 if no workflow is set.
 func planLayerCount(plan *DesignPlan) int {
 	if plan == nil || plan.Workflow == nil {
 		return 0
@@ -76,30 +42,11 @@ func planLayerCount(plan *DesignPlan) int {
 	return len(plan.Workflow.ExecutionLayers)
 }
 
-func requirementsFromPlan(plan *DesignPlan) *Requirements {
-	if plan == nil {
-		return nil
-	}
-	return plan.Requirements
-}
-
-func assumptionsFromPlan(plan *DesignPlan) []string {
-	if plan == nil {
-		return nil
-	}
-	return append([]string(nil), plan.Assumptions...)
-}
-
-func planTaskCount(plan *DesignPlan) int {
-	if plan == nil {
-		return 0
-	}
-	return len(plan.Tasks)
-}
-
+// firstTaskName returns the name of the first task in the plan, or an empty
+// string if the plan has no tasks.
 func firstTaskName(plan *DesignPlan) string {
-	if plan == nil || len(plan.Tasks) == 0 || plan.Tasks[0] == nil {
+	if plan == nil || len(plan.Tasks) == 0 {
 		return ""
 	}
-	return strings.TrimSpace(plan.Tasks[0].Name)
+	return plan.Tasks[0].Name
 }

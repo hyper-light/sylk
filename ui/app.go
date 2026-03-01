@@ -913,6 +913,27 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	return app
 }
 
+var (
+	uiDebugLogger     *slog.Logger
+	uiDebugLoggerOnce sync.Once
+)
+
+func uiDebugFileLog() *slog.Logger {
+	uiDebugLoggerOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".sylk", "logs")
+		_ = os.MkdirAll(dir, 0755)
+		f, err := os.OpenFile(filepath.Join(dir, "ui_events.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			uiDebugLogger = slog.Default()
+			return
+		}
+		uiDebugLogger = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+	return uiDebugLogger
+}
+
 func newTUIWALLogger() (*slog.Logger, io.Closer) {
 	logger, closer, err := agentlog.NewWALLogger("tui")
 	if err != nil {
@@ -2368,17 +2389,11 @@ func (m *AppModel) View() string {
 		return m.comp.CachedFrame()
 	}
 
-	// Vertical resize fast path: truncate the previous frame to the new
-	// height instead of recomposing from shifted boundaries. This matches
-	// the terminal's own alt-screen resize behaviour (truncate from bottom),
-	// so the app never shifts content relative to what the terminal already
-	// shows — eliminating the visible "jump up" during vertical drag resize.
-	// Blink, tick, and component updates are deferred until settle fires.
+	// Vertical resize fast path: recompose from stale caches without
+	// detecting or rendering dirty slots. Blink, tick, and component
+	// updates are deferred until the settle message fires.
 	if m.resizeQuickActive {
 		m.viewDirty = false
-		if prev := m.comp.CachedFrame(); prev != "" {
-			return compositor.TruncateFrame(prev, m.height)
-		}
 		return m.comp.Compose()
 	}
 
@@ -4350,6 +4365,15 @@ func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
 
 func (m *AppModel) handlePlanUpdate(update msg.PlanUpdateMsg) tea.Cmd {
 	m.chat.HandlePlanUpdate(update)
+	if m.planView != nil {
+		comp, cmd := m.planView.Update(update)
+		m.planView = comp.(*planview.Model)
+		if cmd != nil {
+			m.comp.MarkDirty(compositor.SlotCenter)
+			m.viewDirty = true
+			return cmd
+		}
+	}
 	m.comp.MarkDirty(compositor.SlotCenter)
 	m.viewDirty = true
 	return nil
@@ -5335,14 +5359,24 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 }
 
 func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
+	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_RECEIVED",
+		"correlation_id", done.CorrelationID,
+		"agent_id", done.AgentID,
+		"active_route", m.activeRoute.CorrelationID,
+		"authoritative_text_len", len(done.AuthoritativeText))
 	m.recordStreamComplete(done.CorrelationID)
 	shouldRender := m.shouldRenderStreamEvent(done.CorrelationID)
+	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_SHOULD_RENDER",
+		"correlation_id", done.CorrelationID,
+		"should_render", shouldRender)
 	delete(m.interruptedCorrelations, done.CorrelationID)
 	m.applyRealStreamUsage(done.CorrelationID, done.InputTokens, done.OutputTokens)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
 	m.markQueueEntryByCorrelation(done.CorrelationID, true)
 	m.clearActiveRoute(done.CorrelationID)
 	if !shouldRender {
+		uiDebugFileLog().Warn("AppModel: STREAM_COMPLETE_NOT_RENDERED",
+			"correlation_id", done.CorrelationID)
 		m.statusBar.StopSpinner()
 		return m.tryAdvanceQueue()
 	}

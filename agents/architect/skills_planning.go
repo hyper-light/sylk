@@ -26,6 +26,7 @@ type consultInput struct {
 	Scope           string `json:"scope,omitempty"`
 	SessionID       string `json:"session_id,omitempty"`
 	IncludeAcademic bool   `json:"include_academic,omitempty"`
+	PlanID          string `json:"plan_id,omitempty"`
 }
 
 var consultAllTargets = map[string]bool{
@@ -66,14 +67,20 @@ func consultSkill(a *Architect) *skills.Skill {
 			}, nil
 		},
 		"pre_planning": func(ctx context.Context, p *consultInput) (any, error) {
-			plan := &DesignPlan{
-				ID:            uuid.NewString(),
-				Query:         p.Query,
-				SessionID:     p.SessionID,
-				CreatedAt:     time.Now(),
-				UpdatedAt:     time.Now(),
-				Constraints:   &PlanConstraints{Scope: p.Scope},
-				Consultations: map[string]*ConsultationEvidence{},
+			protoPlan, hasPlan := a.resolveProtocolPlan(p.PlanID)
+			var plan *DesignPlan
+			if hasPlan {
+				plan = protoPlan
+			} else {
+				plan = &DesignPlan{
+					ID:            uuid.NewString(),
+					Query:         p.Query,
+					SessionID:     p.SessionID,
+					CreatedAt:     time.Now(),
+					UpdatedAt:     time.Now(),
+					Constraints:   &PlanConstraints{Scope: p.Scope},
+					Consultations: map[string]*ConsultationEvidence{},
+				}
 			}
 			req := &ArchitectRequest{
 				ID:        uuid.NewString(),
@@ -86,8 +93,19 @@ func consultSkill(a *Architect) *skills.Skill {
 					"scope":            p.Scope,
 				},
 			}
+			if hasPlan {
+				if err := a.advancePlan(ctx, plan, PlanStatusConsulting, nil); err != nil {
+					return nil, err
+				}
+			}
 			if err := a.enforceConsultationGate(ctx, plan, req); err != nil {
 				return nil, err
+			}
+			if hasPlan {
+				plan.CodebasePatterns = extractLibrarianPatterns(plan)
+				if err := a.persistPlanState(plan); err != nil {
+					return nil, err
+				}
 			}
 			return map[string]any{
 				"ready":         true,
@@ -154,6 +172,7 @@ func consultSkill(a *Architect) *skills.Skill {
 		StringParam("scope", "Scope to limit the search", false).
 		StringParam("session_id", "Session identifier", false).
 		BoolParam("include_academic", "Whether to require Academic consultation (pre_planning mode)", false).
+		StringParam("plan_id", "Plan identifier for protocol-driven consultation", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params consultInput
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -1046,8 +1065,8 @@ func askUserQuestionSkill(a *Architect) *skills.Skill {
 				return nil, fmt.Errorf("questions are required")
 			}
 			sessionID := normalizeSessionID(params.SessionID)
-			// When invoked during the planning protocol's clarify step,
-			// attach the questions to the in-flight plan so stepClarify
+			// When invoked during the planning protocol tool loop,
+			// attach the questions to the in-flight plan so the protocol
 			// can detect that clarification was requested.
 			if plan := a.latestConsultingPlan(sessionID); plan != nil {
 				plan.ClarificationQuestions = extractQuestionTexts(params.Questions)
@@ -1180,19 +1199,20 @@ type startPlanningInput struct {
 
 func startPlanningSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("start_planning").
-		Description("Transition from conversation to plan generation. "+
-			"Synthesizes the conversation into a planning query and executes the full planning protocol.").
+		Description("Create a new plan and return the plan_id. "+
+			"After receiving the plan_id, drive the protocol by invoking "+
+			"plan and consult skills directly with that plan_id.").
 		Domain("planning").
 		Keywords("start planning", "create plan", "formalize", "generate plan").
 		Priority(100).
 		TokenEstimate(300).
 		StringParam("query", "Synthesized planning query capturing all requirements, constraints, and scope gathered from the conversation", true).
 		StringParam("session_id", "Session identifier for plan tracking", false).
-		Usage("Invoke when the conversation has reached sufficient clarity to produce an actionable plan. "+
-			"The query must synthesize all requirements, constraints, technology choices, and scope from the conversation — "+
-			"do not just repeat the user's last message.").
+		Usage("Invoke to create a new plan. Returns plan_id and protocol instructions. "+
+			"Then invoke the planning skills yourself using the returned plan_id: "+
+			"plan(analyze) → consult(pre_planning) → plan(design) → plan(generate_tasks). "+
+			"Do NOT wait — drive the protocol immediately after receiving the plan_id.").
 		BestPractice("Synthesize the full conversation context into the query — do not just repeat the user's last message.").
-		BestPractice("Before invoking, confirm with the user that they are ready to proceed to planning.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params startPlanningInput
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -1202,11 +1222,9 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 			if query == "" {
 				return nil, fmt.Errorf("query is required")
 			}
-			sessionID := normalizeSessionID(params.SessionID)
-			if sessionID == "default" {
-				if ctxSession := architectSessionIDFromContext(ctx); ctxSession != "" {
-					sessionID = ctxSession
-				}
+			sessionID := architectSessionIDFromContext(ctx)
+			if sessionID == "" {
+				sessionID = normalizeSessionID(params.SessionID)
 			}
 			req := &ArchitectRequest{
 				ID:        uuid.NewString(),
@@ -1215,15 +1233,28 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 				SessionID: sessionID,
 				Timestamp: time.Now(),
 			}
-			plan, err := a.executePlanningProtocol(ctx, req)
-			if err != nil {
-				return nil, err
-			}
+			req = a.enrichPlanningRequest(req)
+			plan := newProtocolPlan(req)
+			a.persistPlanState(plan)
+			a.logInfo("start_planning: plan created",
+				"plan_id", plan.ID,
+				"session_id", sessionID,
+				"query", truncateString(query, 120))
 			return map[string]any{
-				"plan_id": plan.ID,
-				"status":  plan.Status.String(),
-				"tasks":   len(plan.Tasks),
-				"summary": truncateString(formatPlanForChat(plan), 500),
+				"plan_id":    plan.ID,
+				"session_id": sessionID,
+				"status":     plan.Status.String(),
+				"protocol": "Drive the planning protocol using the plan_id above. " +
+					"Invoke these skills in order:\n" +
+					"1. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
+					"2. consult(mode=pre_planning, plan_id=<plan_id>)\n" +
+					"3. If critical ambiguities exist, invoke ask_user_question and STOP.\n" +
+					"4. plan(action=design, plan_id=<plan_id>)\n" +
+					"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow and validates.\n" +
+					"6. The plan is automatically rendered when generate_tasks completes.\n" +
+					"   Write a brief assessment — highlight the key tradeoff and risk.\n" +
+					"   Invite the user to approve or request changes — use natural phrasing, not a template.\n" +
+					"   Do NOT repeat the plan structure. Do NOT invoke route_plan_acceptance.",
 			}, nil
 		}).
 		Build()
@@ -1251,17 +1282,48 @@ func routePlanAcceptanceSkill(a *Architect) *skills.Skill {
 		BestPractice("Always call this skill for user responses to ready plans — do not classify acceptance yourself.").
 		BestPractice("If the result is 'modify', read the modifications list and apply changes via plan action=revise before re-presenting.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			architectDebugLog().Info("route_plan_acceptance: ENTRY",
+				"input", truncateString(string(input), 500),
+				"ctx_err", ctx.Err())
 			params, err := parseRoutePlanAcceptanceParams(input)
 			if err != nil {
+				architectDebugLog().Warn("route_plan_acceptance: PARSE_ERROR", "error", err.Error())
 				return nil, err
 			}
 			sessionID := architectSessionIDFromContext(ctx)
+			architectDebugLog().Info("route_plan_acceptance: RESOLVING_PLAN",
+				"plan_id_param", params.PlanID,
+				"session_id", sessionID,
+				"user_response", truncateString(params.UserResponse, 200))
 			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
 			if err != nil {
+				architectDebugLog().Warn("route_plan_acceptance: PLAN_RESOLVE_FAILED",
+					"error", err.Error(),
+					"plan_id_param", params.PlanID,
+					"session_id", sessionID)
 				return nil, err
 			}
+			architectDebugLog().Info("route_plan_acceptance: PLAN_RESOLVED",
+				"plan_id", plan.ID,
+				"plan_status", plan.Status.String(),
+				"plan_session", plan.SessionID,
+				"task_count", len(plan.Tasks))
 			payload := buildPlanAcceptancePayload(plan, params.UserResponse)
-			return a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
+			architectDebugLog().Info("route_plan_acceptance: ROUTING_TO_GUIDE",
+				"plan_id", plan.ID,
+				"payload_plan_len", len(payload.Plan),
+				"payload_plan_name", payload.PlanName)
+			result, err := a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
+			if err != nil {
+				architectDebugLog().Warn("route_plan_acceptance: GUIDE_ERROR",
+					"error", err.Error(),
+					"plan_id", plan.ID)
+			} else {
+				architectDebugLog().Info("route_plan_acceptance: GUIDE_RESULT",
+					"plan_id", plan.ID,
+					"result_type", fmt.Sprintf("%T", result))
+			}
+			return result, err
 		}).
 		Build()
 }
@@ -1280,20 +1342,36 @@ func parseRoutePlanAcceptanceParams(input json.RawMessage) (*routePlanAcceptance
 // resolveReadyPlanForAcceptance locates the plan by ID or falls back to the
 // latest ready plan for the given session. Returns an error if no eligible plan exists.
 func (a *Architect) resolveReadyPlanForAcceptance(planID, sessionID string) (*DesignPlan, error) {
+	architectDebugLog().Info("resolveReadyPlanForAcceptance: ENTRY",
+		"plan_id_param", planID,
+		"session_id", sessionID)
 	if id := strings.TrimSpace(planID); id != "" {
 		plan, ok := a.GetActivePlan(id)
 		if !ok {
+			architectDebugLog().Warn("resolveReadyPlanForAcceptance: NOT_FOUND",
+				"plan_id", id)
 			return nil, fmt.Errorf("plan not found: %s", id)
 		}
 		if plan.Status != PlanStatusReady {
+			architectDebugLog().Warn("resolveReadyPlanForAcceptance: NOT_READY",
+				"plan_id", id,
+				"status", plan.Status.String())
 			return nil, fmt.Errorf("plan %s is not in ready status (current: %s)", id, plan.Status)
 		}
+		architectDebugLog().Info("resolveReadyPlanForAcceptance: FOUND_BY_ID",
+			"plan_id", id,
+			"status", plan.Status.String())
 		return plan, nil
 	}
 	plan := a.latestReadyPlan(sessionID)
 	if plan == nil {
+		architectDebugLog().Warn("resolveReadyPlanForAcceptance: NO_READY_PLAN",
+			"session_id", sessionID)
 		return nil, fmt.Errorf("no ready plan available for acceptance evaluation")
 	}
+	architectDebugLog().Info("resolveReadyPlanForAcceptance: FOUND_BY_SESSION",
+		"plan_id", plan.ID,
+		"session_id", sessionID)
 	return plan, nil
 }
 
@@ -1355,8 +1433,18 @@ func (a *Architect) routePlanAcceptanceToGuide(
 ) (any, error) {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
+		architectDebugLog().Warn("routePlanAcceptanceToGuide: ENCODE_ERROR", "error", err.Error())
 		return nil, fmt.Errorf("failed to encode acceptance payload: %w", err)
 	}
+
+	architectDebugLog().Info("routePlanAcceptanceToGuide: SENDING_TO_GUIDE",
+		"session_id", sessionID,
+		"payload_len", len(encoded),
+		"plan_id", payload.PlanID,
+		"plan_name", payload.PlanName,
+		"user_response", truncateString(payload.UserResponse, 200),
+		"ctx_err", ctx.Err(),
+		"ctx_deadline", contextDeadlineString(ctx))
 
 	req := &guide.RouteRequest{
 		Input:         "evaluate-plan-acceptance: " + string(encoded),
@@ -1366,8 +1454,17 @@ func (a *Architect) routePlanAcceptanceToGuide(
 
 	response, err := a.requestRouteSync(ctx, req)
 	if err != nil {
+		architectDebugLog().Warn("routePlanAcceptanceToGuide: ROUTE_SYNC_ERROR",
+			"error", err.Error(),
+			"plan_id", payload.PlanID,
+			"session_id", sessionID,
+			"ctx_err", ctx.Err())
 		return nil, fmt.Errorf("guide acceptance evaluation failed: %w", err)
 	}
+
+	architectDebugLog().Info("routePlanAcceptanceToGuide: ROUTE_SYNC_RESPONSE",
+		"plan_id", payload.PlanID,
+		"response_nil", response == nil)
 
 	return extractAcceptanceResult(response, payload)
 }
@@ -1381,15 +1478,25 @@ func extractAcceptanceResult(
 	payload *planAcceptancePayload,
 ) (*planAcceptanceResult, error) {
 	if msg == nil {
+		architectDebugLog().Warn("extractAcceptanceResult: NIL_MESSAGE")
 		return nil, fmt.Errorf("empty response from guide acceptance evaluation")
 	}
 
 	resp, ok := msg.GetRouteResponse()
 	if !ok || resp == nil {
+		architectDebugLog().Warn("extractAcceptanceResult: NO_ROUTE_RESPONSE",
+			"msg_type", msg.Type)
 		return nil, fmt.Errorf("unexpected response type from guide acceptance evaluation")
 	}
 
+	architectDebugLog().Info("extractAcceptanceResult: ROUTE_RESPONSE",
+		"success", resp.Success,
+		"error", resp.Error,
+		"data_type", fmt.Sprintf("%T", resp.Data))
+
 	if !resp.Success {
+		architectDebugLog().Warn("extractAcceptanceResult: GUIDE_FAILURE",
+			"error", resp.Error)
 		return nil, fmt.Errorf("guide acceptance evaluation returned error: %s", resp.Error)
 	}
 
@@ -1402,11 +1509,17 @@ func extractAcceptanceResult(
 
 	data, ok := resp.Data.(map[string]any)
 	if !ok {
+		architectDebugLog().Warn("extractAcceptanceResult: DATA_NOT_MAP",
+			"data_type", fmt.Sprintf("%T", resp.Data))
 		return out, nil
 	}
 
 	out.Result = acceptanceResultString(data)
 	out.Modifications = acceptanceModifications(data)
+	architectDebugLog().Info("extractAcceptanceResult: EXTRACTED",
+		"result", out.Result,
+		"modifications_count", len(out.Modifications),
+		"plan_id", out.PlanID)
 	return out, nil
 }
 
@@ -1483,25 +1596,54 @@ func handlePlanAcceptanceResultSkill(a *Architect) *skills.Skill {
 		Example(`{"plan_id": "plan_abc", "result": "modify", "user_response": "Swap steps 2 and 3", "modifications": ["Reorder task 2 and task 3"]}`).
 		BestPractice("Never skip this skill after route_plan_acceptance — the Guide's verdict must be acted on to close the feedback loop.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			architectDebugLog().Info("handlePlanAcceptanceResult: ENTRY",
+				"input_len", len(input))
 			params, err := parseAcceptanceResultParams(input)
 			if err != nil {
+				architectDebugLog().Warn("handlePlanAcceptanceResult: PARSE_ERROR",
+					"error", err.Error())
 				return nil, err
 			}
-			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID, "")
+			architectDebugLog().Info("handlePlanAcceptanceResult: PARAMS",
+				"plan_id", params.PlanID,
+				"result", params.Result,
+				"user_response_len", len(params.UserResponse),
+				"modifications", len(params.Modifications))
+			sessionID := architectSessionIDFromContext(ctx)
+			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
 			if err != nil {
+				architectDebugLog().Warn("handlePlanAcceptanceResult: PLAN_RESOLVE_FAILED",
+					"plan_id", params.PlanID,
+					"session_id", sessionID,
+					"error", err.Error())
 				return nil, err
 			}
 			verdict := acceptanceVerdict(params.Result)
+			architectDebugLog().Info("handlePlanAcceptanceResult: DISPATCHING",
+				"plan_id", plan.ID,
+				"verdict", string(verdict))
+			var result any
 			switch verdict {
 			case verdictAccept:
-				return a.actOnAccept(ctx, plan)
+				result, err = a.actOnAccept(ctx, plan)
 			case verdictModify:
-				return a.actOnModify(ctx, plan, params.UserResponse, params.Modifications)
+				result, err = a.actOnModify(ctx, plan, params.UserResponse, params.Modifications)
 			case verdictReject:
-				return a.actOnReject(ctx, plan, params.UserResponse, params.Modifications)
+				result, err = a.actOnReject(ctx, plan, params.UserResponse, params.Modifications)
 			default:
 				return nil, fmt.Errorf("unknown verdict: %q", params.Result)
 			}
+			if err != nil {
+				architectDebugLog().Warn("handlePlanAcceptanceResult: ACTION_ERROR",
+					"plan_id", plan.ID,
+					"verdict", string(verdict),
+					"error", err.Error())
+				return nil, err
+			}
+			architectDebugLog().Info("handlePlanAcceptanceResult: ACTION_COMPLETE",
+				"plan_id", plan.ID,
+				"verdict", string(verdict))
+			return result, nil
 		}).
 		Build()
 }
@@ -1525,6 +1667,11 @@ func parseAcceptanceResultParams(input json.RawMessage) (*handlePlanAcceptanceRe
 // actOnAccept dispatches the plan to the orchestrator for execution.
 func (a *Architect) actOnAccept(ctx context.Context, plan *DesignPlan) (any, error) {
 	a.logInfo("actOnAccept: dispatching plan", "plan_id", plan.ID)
+	architectDebugLog().Info("actOnAccept: ENTRY",
+		"plan_id", plan.ID,
+		"plan_status", plan.SM().State().String(),
+		"tasks", len(plan.Tasks),
+		"session_id", plan.SessionID)
 
 	req := &ArchitectRequest{
 		ID:        uuid.New().String(),
@@ -1533,7 +1680,13 @@ func (a *Architect) actOnAccept(ctx context.Context, plan *DesignPlan) (any, err
 		SessionID: plan.SessionID,
 		Timestamp: time.Now(),
 	}
+	architectDebugLog().Info("actOnAccept: CALLING_DISPATCH",
+		"plan_id", plan.ID,
+		"request_id", req.ID)
 	result, _ := a.dispatchPlanExecution(ctx, req, plan)
+	architectDebugLog().Info("actOnAccept: DISPATCH_RETURNED",
+		"plan_id", plan.ID,
+		"has_result", result != nil)
 	return result, nil
 }
 
@@ -1628,7 +1781,7 @@ func formatModifyResponse(modifications []string) string {
 	} else {
 		b.WriteString(".\n")
 	}
-	b.WriteString("\nSay **go ahead** to proceed, or let me know what else to adjust.")
+	b.WriteString("\nWant to proceed with these changes, or would you like further adjustments?")
 	return b.String()
 }
 

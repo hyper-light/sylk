@@ -141,8 +141,10 @@ func pendingPlanRuntimeSection(runtime *ClassificationPromptRuntime) string {
 		lines = append(lines, "- pending_plan_agent: "+planAgent)
 	}
 	lines = append(lines,
-		`Bare affirmatives ("yes", "ok", "sure", "lgtm", "go ahead") should be classified`,
-		`as intent=execute, domain=planning, target_agent=architect when a plan is pending.`,
+		`Any approval or execution phrase ("yes", "ok", "sure", "lgtm", "go ahead",`,
+		`"hand it off", "ship it", "do it", "execute", "proceed", "approved", "let's go")`,
+		`should be classified as intent=execute, domain=planning, target_agent=architect`,
+		`when a plan is pending. Do NOT classify these as intent=plan — they are approvals.`,
 	)
 	return strings.Join(lines, "\n")
 }
