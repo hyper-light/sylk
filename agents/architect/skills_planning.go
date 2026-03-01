@@ -15,50 +15,75 @@ import (
 	"github.com/google/uuid"
 )
 
-type consultBeforePlanningParams struct {
+// ---------------------------------------------------------------------------
+// consult (consolidated: single, pre_planning, knowledge)
+// ---------------------------------------------------------------------------
+
+type consultInput struct {
+	Mode            string `json:"mode"`
+	Target          string `json:"target,omitempty"`
 	Query           string `json:"query"`
 	Scope           string `json:"scope,omitempty"`
 	SessionID       string `json:"session_id,omitempty"`
 	IncludeAcademic bool   `json:"include_academic,omitempty"`
 }
 
-func consultBeforePlanningSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("consult_before_planning").
-		Description("Perform mandatory knowledge consultations before creating or revising plans.").
-		Domain("consultation").
-		Keywords("consult", "before planning", "context", "evidence", "librarian", "archivalist").
-		Priority(100).
-		StringParam("query", "Planning request to consult for", true).
-		StringParam("scope", "Scope of consultation", false).
-		StringParam("session_id", "Session identifier", false).
-		BoolParam("include_academic", "Whether to require Academic consultation", false).
-		Usage("Use BEFORE creating any new plan or revising an existing one. This is the mandatory consultation gate — it queries Librarian and Archivalist (and optionally Academic) to gather evidence that informs the plan design. Do NOT skip this step; plans without consultation evidence will fail the pre-delegation validation gate.").
-		Example(`{"query": "Implement WebSocket support for real-time notifications", "scope": "backend", "include_academic": true}`).
-		BestPractice("Always provide a specific scope to narrow consultation queries — broad scopes produce unfocused evidence.").
-		BestPractice("Set include_academic=true only for architecturally novel features — routine CRUD operations do not benefit from academic research.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			params, err := parseConsultBeforePlanningParams(input)
+var consultAllTargets = map[string]bool{
+	"librarian": true, "archivalist": true, "academic": true,
+	"engineer": true, "designer": true, "inspector": true, "tester": true,
+}
+
+var consultKnowledgeTargets = map[string]bool{
+	"librarian": true, "archivalist": true, "academic": true,
+}
+
+func consultSkill(a *Architect) *skills.Skill {
+	type handler = func(context.Context, *consultInput) (any, error)
+	dispatch := map[string]handler{
+		"single": func(ctx context.Context, p *consultInput) (any, error) {
+			if strings.TrimSpace(p.Target) == "" {
+				return nil, fmt.Errorf("target is required for mode=single")
+			}
+			if !consultAllTargets[p.Target] {
+				return nil, fmt.Errorf("unknown consultation target: %q", p.Target)
+			}
+			if !a.isAgentRegistered(p.Target) {
+				return map[string]any{
+					"target": p.Target,
+					"status": "not_registered",
+					"message": fmt.Sprintf("agent %q is not registered; skip or choose a different target", p.Target),
+				}, nil
+			}
+			evidence, err := a.requestConsultation(ctx, p.Target, p.Query, p.Scope, p.SessionID)
 			if err != nil {
 				return nil, err
 			}
+			return map[string]any{
+				"target":   p.Target,
+				"success":  evidence.Success,
+				"evidence": evidence,
+				"data":     evidence.Data,
+			}, nil
+		},
+		"pre_planning": func(ctx context.Context, p *consultInput) (any, error) {
 			plan := &DesignPlan{
 				ID:            uuid.NewString(),
-				Query:         params.Query,
-				SessionID:     params.SessionID,
+				Query:         p.Query,
+				SessionID:     p.SessionID,
 				CreatedAt:     time.Now(),
 				UpdatedAt:     time.Now(),
-				Constraints:   &PlanConstraints{Scope: params.Scope},
+				Constraints:   &PlanConstraints{Scope: p.Scope},
 				Consultations: map[string]*ConsultationEvidence{},
 			}
 			req := &ArchitectRequest{
 				ID:        uuid.NewString(),
 				Intent:    IntentPlan,
-				Query:     params.Query,
-				SessionID: params.SessionID,
+				Query:     p.Query,
+				SessionID: p.SessionID,
 				Timestamp: time.Now(),
 				Params: map[string]any{
-					"include_academic": params.IncludeAcademic,
-					"scope":            params.Scope,
+					"include_academic": p.IncludeAcademic,
+					"scope":            p.Scope,
 				},
 			}
 			if err := a.enforceConsultationGate(ctx, plan, req); err != nil {
@@ -69,95 +94,81 @@ func consultBeforePlanningSkill(a *Architect) *skills.Skill {
 				"consultations": plan.Consultations,
 				"required":      mandatoryConsultationTargets(req),
 			}, nil
-		}).
-		Build()
-}
-
-func parseConsultBeforePlanningParams(input json.RawMessage) (*consultBeforePlanningParams, error) {
-	var params consultBeforePlanningParams
-	if err := json.Unmarshal(input, &params); err != nil {
-		return nil, fmt.Errorf("invalid parameters: %w", err)
-	}
-	if strings.TrimSpace(params.Query) == "" {
-		return nil, fmt.Errorf("query is required")
-	}
-	return &params, nil
-}
-
-func consultLibrarianSkill(a *Architect) *skills.Skill {
-	return directConsultSkill(a, "consult_librarian", "librarian", "Consult Librarian for codebase patterns and implementation context.")
-}
-
-func consultArchivalistSkill(a *Architect) *skills.Skill {
-	return directConsultSkill(a, "consult_archivalist", "archivalist", "Consult Archivalist for historical failures and prior outcomes.")
-}
-
-func consultAcademicSkill(a *Architect) *skills.Skill {
-	return directConsultSkill(a, "consult_academic", "academic", "Consult Academic for best practices and external research validation.")
-}
-
-func consultEngineerSkill(a *Architect) *skills.Skill {
-	return directConsultSkill(a, "consult_engineer", "engineer", "Consult Engineer for implementation feasibility and execution detail risks.")
-}
-
-func consultDesignerSkill(a *Architect) *skills.Skill {
-	return directConsultSkill(a, "consult_designer", "designer", "Consult Designer for UX/UI approach and component design constraints.")
-}
-
-func consultInspectorSkill(a *Architect) *skills.Skill {
-	return directConsultSkill(a, "consult_inspector", "inspector", "Consult Inspector for quality constraints and review risks before delegation.")
-}
-
-func consultTesterSkill(a *Architect) *skills.Skill {
-	return directConsultSkill(a, "consult_tester", "tester", "Consult Tester for test strategy and validation coverage before execution.")
-}
-
-type directConsultParams struct {
-	Query     string `json:"query"`
-	Scope     string `json:"scope,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
-}
-
-func directConsultSkill(a *Architect, name string, target string, description string) *skills.Skill {
-	return skills.NewSkill(name).
-		Description(description).
-		Domain("consultation").
-		Keywords("consult", target, "knowledge", "patterns", "history", "research").
-		Priority(90).
-		StringParam("query", "Consultation question", true).
-		StringParam("scope", "Scope for consultation", false).
-		StringParam("session_id", "Session identifier", false).
-		Usage(fmt.Sprintf("Use to gather evidence from the %s before or during planning. The consultation result includes success status and evidence data that will be attached to the active plan's consultation record. Do NOT call after delegation — consultations are a planning-phase activity.", target)).
-		Example(`{"query": "What patterns exist for WebSocket connections in this codebase?", "scope": "backend"}`).
-		BestPractice("Consultation responses are cached on the plan — do not re-consult the same agent for the same query within a single planning cycle.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			params, err := parseDirectConsultParams(input)
-			if err != nil {
-				return nil, err
+		},
+		"knowledge": func(ctx context.Context, p *consultInput) (any, error) {
+			if strings.TrimSpace(p.Target) == "" {
+				return nil, fmt.Errorf("target is required for mode=knowledge")
 			}
-			evidence, err := a.requestConsultation(ctx, target, params.Query, params.Scope, params.SessionID)
+			if !consultKnowledgeTargets[p.Target] {
+				return nil, fmt.Errorf("knowledge target must be librarian, archivalist, or academic; got %q", p.Target)
+			}
+			if !a.running || a.bus == nil {
+				return map[string]any{
+					"status":  "unavailable",
+					"message": "Event bus not available for consultation",
+				}, nil
+			}
+			if !a.isAgentRegistered(p.Target) {
+				return map[string]any{
+					"target":  p.Target,
+					"status":  "not_registered",
+					"message": fmt.Sprintf("agent %q is not registered; skip or choose a different target", p.Target),
+				}, nil
+			}
+			evidence, err := a.requestConsultation(ctx, p.Target, p.Query, p.Scope, "")
 			if err != nil {
-				return nil, err
+				return map[string]any{
+					"target": p.Target,
+					"status": "failed",
+					"query":  p.Query,
+					"error":  err.Error(),
+				}, nil
 			}
 			return map[string]any{
-				"target":   target,
-				"success":  evidence.Success,
+				"target":   p.Target,
+				"status":   "ok",
+				"query":    p.Query,
 				"evidence": evidence,
 				"data":     evidence.Data,
 			}, nil
+		},
+	}
+
+	return skills.NewSkill("consult").
+		Description("Consult agents for evidence before or during planning.\n\n"+
+			"Modes:\n"+
+			"- single: Consult one agent directly (params: target [required], query, scope, session_id)\n"+
+			"- pre_planning: Mandatory consultation gate before plan creation (params: query, scope, session_id, include_academic)\n"+
+			"- knowledge: Consult Librarian/Archivalist/Academic for evidence (params: target [required], query, scope)").
+		Domain("consultation").
+		Keywords("consult", "before planning", "context", "evidence", "librarian",
+			"archivalist", "academic", "engineer", "designer", "inspector", "tester",
+			"knowledge", "patterns", "history", "research").
+		Priority(100).
+		TokenEstimate(500).
+		EnumParam("mode", "Consultation mode", []string{"single", "pre_planning", "knowledge"}, true).
+		EnumParam("target", "Agent to consult", []string{
+			"librarian", "archivalist", "academic", "engineer", "designer", "inspector", "tester",
+		}, false).
+		StringParam("query", "Question or topic to consult about", true).
+		StringParam("scope", "Scope to limit the search", false).
+		StringParam("session_id", "Session identifier", false).
+		BoolParam("include_academic", "Whether to require Academic consultation (pre_planning mode)", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params consultInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if strings.TrimSpace(params.Query) == "" {
+				return nil, fmt.Errorf("query is required")
+			}
+			fn, ok := dispatch[params.Mode]
+			if !ok {
+				return nil, fmt.Errorf("unknown consult mode: %q", params.Mode)
+			}
+			return fn(ctx, &params)
 		}).
 		Build()
-}
-
-func parseDirectConsultParams(input json.RawMessage) (*directConsultParams, error) {
-	var params directConsultParams
-	if err := json.Unmarshal(input, &params); err != nil {
-		return nil, fmt.Errorf("invalid parameters: %w", err)
-	}
-	if strings.TrimSpace(params.Query) == "" {
-		return nil, fmt.Errorf("query is required")
-	}
-	return &params, nil
 }
 
 type preDelegationParams struct {
@@ -403,7 +414,7 @@ func validatePreDelegationSkill(a *Architect) *skills.Skill {
 		StringParam("declaration_id", "Declaration identifier", false).
 		Usage("Use to validate an existing declaration's consultation evidence before proceeding with handoff. Returns valid=true if all required consultations (Librarian, Archivalist) are present, successful, and within the configured max age. Use this as a preflight check before `handoff_to_orchestrator`.").
 		Example(`{"plan_id": "plan_abc", "declaration_id": "decl_xyz"}`).
-		BestPractice("If validation fails due to stale consultations, re-run `consult_before_planning` rather than creating a new declaration from scratch.").
+		BestPractice("If validation fails due to stale consultations, re-run `consult` with mode=pre_planning rather than creating a new declaration from scratch.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params validatePreDelegationParams
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -574,46 +585,6 @@ func monitorExecutionSkill(a *Architect) *skills.Skill {
 		Build()
 }
 
-type revisePlanParams struct {
-	PlanID  string         `json:"plan_id"`
-	Reason  string         `json:"reason"`
-	Updates map[string]any `json:"updates,omitempty"`
-}
-
-func revisePlanSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("revise_plan").
-		Description("Revise an existing plan in response to runtime feedback or changed assumptions.").
-		Domain("planning").
-		Keywords("revise", "replan", "update plan", "change workflow").
-		Priority(85).
-		StringParam("plan_id", "Plan identifier to revise", true).
-		StringParam("reason", "Reason for revision", true).
-		ObjectParam("updates", "Optional update payload", map[string]*skills.Property{}, false).
-		Usage("Use when runtime feedback, user input, or execution results require changes to an existing plan. Increments the plan revision, records the reason, and optionally updates status or scope. Always provide a meaningful reason — it is persisted in the plan's risk summary for audit. Do NOT use to create new plans — use `consult_before_planning` + the planning protocol instead.").
-		Example(`{"plan_id": "plan_abc", "reason": "Engineer reported dependency conflict — adjusting task order", "updates": {"scope": "backend+infra"}}`).
-		BestPractice("After revision, re-validate any existing declarations with `validate_pre_delegation` — the changed plan may invalidate prior consultation evidence.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params revisePlanParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if strings.TrimSpace(params.Reason) == "" {
-				return nil, fmt.Errorf("reason is required")
-			}
-			plan, err := a.selectPlan(params.PlanID)
-			if err != nil {
-				return nil, err
-			}
-			updated := a.applyPlanRevision(plan, params.Reason, params.Updates)
-			return map[string]any{
-				"plan_id":  updated.ID,
-				"revision": updated.Revision,
-				"status":   updated.Status.String(),
-				"updated":  updated.UpdatedAt,
-			}, nil
-		}).
-		Build()
-}
 
 func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates map[string]any) *DesignPlan {
 	var (
@@ -650,7 +621,10 @@ func applyPlanUpdateFields(plan *DesignPlan, updates map[string]any) {
 		return
 	}
 	if status, ok := updates["status"].(string); ok {
-		plan.Status = parsePlanStatus(status, plan.Status)
+		target := parsePlanStatus(status, plan.Status)
+		if err := plan.SM().TransitionTo(target, plan); err == nil {
+			plan.Status = plan.SM().State()
+		}
 	}
 	if scope, ok := updates["scope"].(string); ok && plan.Constraints != nil {
 		plan.Constraints.Scope = scope
@@ -663,6 +637,7 @@ func parsePlanStatus(status string, fallback PlanStatus) PlanStatus {
 		"pending":       PlanStatusPending,
 		"analyzing":     PlanStatusAnalyzing,
 		"consulting":    PlanStatusConsulting,
+		"clarifying":    PlanStatusClarifying,
 		"designing":     PlanStatusDesigning,
 		"generating":    PlanStatusGenerating,
 		"orchestrating": PlanStatusOrchestrating,
@@ -677,58 +652,6 @@ func parsePlanStatus(status string, fallback PlanStatus) PlanStatus {
 	return fallback
 }
 
-type createFixDAGParams struct {
-	PlanID      string `json:"plan_id,omitempty"`
-	SessionID   string `json:"session_id,omitempty"`
-	Corrections []any  `json:"corrections"`
-}
-
-func createFixDAGSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("create_fix_dag").
-		Description("Build a remediation DAG structure from inspector/tester correction signals. Does NOT dispatch or execute the plan.").
-		Domain("planning").
-		Keywords("fix dag", "corrections", "repair structure", "remediation tasks").
-		Priority(85).
-		StringParam("plan_id", "Plan identifier to attach fix DAG to", false).
-		StringParam("session_id", "Session identifier", false).
-		ArrayParam("corrections", "Correction list from inspector/tester feedback", "object", true).
-		Usage("Use when Inspector or Tester feedback produces correction signals that need a remediation workflow. Builds a fix DAG from the correction list and attaches it to the specified plan. Each correction becomes an engineer task. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance followed by handle_plan_acceptance_result. Do NOT use for fresh feature work — this is strictly for remediation of existing plan failures.").
-		Example(`{"plan_id": "plan_abc", "corrections": [{"description": "Missing nil check in handler", "issue": "panic on nil input"}], "session_id": "sess_abc"}`).
-		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires: route_plan_acceptance → Guide verdict → handle_plan_acceptance_result.").
-		BestPractice("Review the generated task count — if corrections produce more than 5 tasks, consider revising the original plan rather than layering fixes.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			params, err := parseCreateFixDAGParams(input)
-			if err != nil {
-				return nil, err
-			}
-			tasks := buildFixTasks(params.Corrections)
-			workflow, err := a.createWorkflowDAG(ctx, tasks)
-			if err != nil {
-				return nil, err
-			}
-			linkedPlanID := a.attachFixWorkflow(params.PlanID, workflow, tasks)
-			return map[string]any{
-				"plan_id":      linkedPlanID,
-				"session_id":   normalizeSessionID(params.SessionID),
-				"workflow":     workflow,
-				"task_count":   len(tasks),
-				"corrections":  len(params.Corrections),
-				"workflow_tag": "fix",
-			}, nil
-		}).
-		Build()
-}
-
-func parseCreateFixDAGParams(input json.RawMessage) (*createFixDAGParams, error) {
-	var params createFixDAGParams
-	if err := json.Unmarshal(input, &params); err != nil {
-		return nil, fmt.Errorf("invalid parameters: %w", err)
-	}
-	if len(params.Corrections) == 0 {
-		return nil, fmt.Errorf("corrections are required")
-	}
-	return &params, nil
-}
 
 func buildFixTasks(corrections []any) []*AtomicTask {
 	tasks := make([]*AtomicTask, 0, len(corrections))
@@ -790,7 +713,13 @@ func (a *Architect) attachFixWorkflow(planID string, workflow *WorkflowDAG, task
 	}
 	current.Workflow = workflow
 	current.Tasks = tasks
-	current.Status = PlanStatusReady
+	if smErr := current.SM().TransitionTo(PlanStatusReady, current); smErr != nil {
+		a.logger.Warn("attachFixWorkflow: transition to Ready rejected",
+			"plan_id", current.ID, "error", smErr)
+		a.activePlansMu.Unlock()
+		return current.ID
+	}
+	current.Status = current.SM().State()
 	current.UpdatedAt = time.Now()
 	currentID = current.ID
 	encoded, encodeError = a.marshalPlanSnapshot(current)
@@ -822,7 +751,7 @@ func interruptHandlerSkill(a *Architect) *skills.Skill {
 		StringParam("session_id", "Session identifier", false).
 		StringParam("action", "interrupt action: pause|resume|cancel|stop", true).
 		StringParam("reason", "Optional reason for interruption", false).
-		Usage("Use when the user or system signals a stop, pause, resume, or cancel for an active plan. Updates the plan status safely and records the reason. Valid actions: pause (→pending), resume (→executing), cancel/stop (→failed). Do NOT use for plan revision — use `revise_plan` instead.").
+		Usage("Use when the user or system signals a stop, pause, resume, or cancel for an active plan. Updates the plan status safely and records the reason. Valid actions: pause (→pending), resume (→executing), cancel/stop (→failed). Do NOT use for plan revision — use `plan` with action=revise instead.").
 		Example(`{"plan_id": "plan_abc", "action": "pause", "reason": "User requested pause to review intermediate results"}`).
 		BestPractice("After cancellation, broadcast a status update so downstream agents (Orchestrator, pipeline agents) can clean up.").
 		BestPractice("Resume only after verifying the plan's consultation evidence is still fresh — stale evidence after a long pause invalidates the plan.").
@@ -873,7 +802,14 @@ func (a *Architect) applyInterruptAction(plan *DesignPlan, action string, reason
 		a.activePlansMu.Unlock()
 		return plan
 	}
-	current.Status = interruptStatus(action, current.Status)
+	target := interruptStatus(action, current.SM().State())
+	if smErr := current.SM().TransitionTo(target, current); smErr != nil {
+		a.logger.Warn("applyInterruptAction: transition rejected",
+			"plan_id", current.ID, "action", action, "error", smErr)
+		a.activePlansMu.Unlock()
+		return current
+	}
+	current.Status = current.SM().State()
 	if strings.TrimSpace(reason) != "" {
 		current.RiskSummary = append(current.RiskSummary, reason)
 	}
@@ -904,34 +840,121 @@ func interruptStatus(action string, fallback PlanStatus) PlanStatus {
 	}
 }
 
-type enterPlanModeParams struct {
-	TaskDescription string `json:"task_description"`
-	PlanFile        string `json:"plan_file,omitempty"`
-	SessionID       string `json:"session_id,omitempty"`
+// ---------------------------------------------------------------------------
+// plan_mode (consolidated: enter, update_file, exit, todo_write, todo_mark_complete)
+// ---------------------------------------------------------------------------
+
+type planModeInput struct {
+	Action          string     `json:"action"`
+	SessionID       string     `json:"session_id,omitempty"`
+	TaskDescription string     `json:"task_description,omitempty"`
+	PlanFile        string     `json:"plan_file,omitempty"`
+	Content         string     `json:"content,omitempty"`
+	Append          bool       `json:"append,omitempty"`
+	Todos           []PlanTodo `json:"todos,omitempty"`
+	Index           int        `json:"index,omitempty"`
+	AllowedPrompts  []string   `json:"allowed_prompts,omitempty"`
 }
 
-func enterPlanModeSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("enter_plan_mode").
-		Description("Enter plan mode for complex work requiring approval and revision tracking.").
+func planModeSkill(a *Architect) *skills.Skill {
+	type handler = func(context.Context, *planModeInput) (any, error)
+	dispatch := map[string]handler{
+		"enter": func(_ context.Context, p *planModeInput) (any, error) {
+			if strings.TrimSpace(p.TaskDescription) == "" {
+				return nil, fmt.Errorf("task_description is required for action=enter")
+			}
+			mode := a.enterPlanMode(p.SessionID, p.PlanFile, p.TaskDescription)
+			return mode, nil
+		},
+		"update_file": func(_ context.Context, p *planModeInput) (any, error) {
+			mode, err := a.getPlanMode(p.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			if err := writePlanFile(mode.PlanFile, p.Content, p.Append); err != nil {
+				return nil, err
+			}
+			mode.UpdatedAt = time.Now()
+			return map[string]any{"plan_file": mode.PlanFile, "updated": mode.UpdatedAt}, nil
+		},
+		"exit": func(_ context.Context, p *planModeInput) (any, error) {
+			mode, err := a.getPlanMode(p.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			mode.AwaitingApproval = true
+			mode.AllowedPrompts = p.AllowedPrompts
+			mode.UpdatedAt = time.Now()
+			return map[string]any{
+				"session_id":        mode.SessionID,
+				"awaiting_approval": mode.AwaitingApproval,
+				"allowed_prompts":   mode.AllowedPrompts,
+			}, nil
+		},
+		"todo_write": func(_ context.Context, p *planModeInput) (any, error) {
+			mode, err := a.getPlanMode(p.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			mode.Todos = p.Todos
+			mode.UpdatedAt = time.Now()
+			return map[string]any{"todos": mode.Todos, "count": len(mode.Todos)}, nil
+		},
+		"todo_mark_complete": func(_ context.Context, p *planModeInput) (any, error) {
+			mode, err := a.getPlanMode(p.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			if p.Index < 0 || p.Index >= len(mode.Todos) {
+				return nil, fmt.Errorf("todo index out of range")
+			}
+			mode.Todos[p.Index].Status = "completed"
+			mode.UpdatedAt = time.Now()
+			return map[string]any{
+				"index":      p.Index,
+				"todo":       mode.Todos[p.Index],
+				"todo_count": len(mode.Todos),
+				"updated_at": mode.UpdatedAt,
+			}, nil
+		},
+	}
+
+	return skills.NewSkill("plan_mode").
+		Description("Manage plan mode lifecycle for structured planning with approval gates.\n\n"+
+			"Actions:\n"+
+			"- enter: Enter plan mode (params: task_description [required], plan_file, session_id)\n"+
+			"- update_file: Write/append to plan markdown file (params: content, append, session_id)\n"+
+			"- exit: Mark plan as awaiting user approval (params: allowed_prompts, session_id)\n"+
+			"- todo_write: Create/replace todo list (params: todos [required], session_id)\n"+
+			"- todo_mark_complete: Mark a todo as completed (params: index [required], session_id)").
 		Domain("planning").
-		Keywords("plan mode", "complex", "design", "architecture", "approval").
-		Priority(85).
-		StringParam("task_description", "Task to plan", true).
-		StringParam("plan_file", "Optional plan markdown file path", false).
+		Keywords("plan mode", "complex", "design", "architecture", "approval",
+			"update plan file", "plan markdown", "revise document",
+			"exit plan mode", "review", "ready",
+			"todo", "tasks", "tracking", "progress", "complete", "mark done").
+		Priority(80).
+		TokenEstimate(450).
+		EnumParam("action", "Plan mode action", []string{
+			"enter", "update_file", "exit", "todo_write", "todo_mark_complete",
+		}, true).
 		StringParam("session_id", "Session identifier", false).
-		Usage("Use when the user's request requires a structured planning workflow with approval gates — typically for complex multi-step features, architectural changes, or tasks spanning multiple agents. Creates a plan markdown file and enables plan mode for the session. Do NOT enter plan mode for simple single-agent tasks.").
-		Example(`{"task_description": "Implement user authentication with OAuth2 and JWT tokens", "plan_file": "auth_plan.md", "session_id": "sess_abc"}`).
-		BestPractice("Plan mode persists a markdown file — always provide a descriptive task_description as it becomes the file header.").
+		StringParam("task_description", "Task to plan (required for enter)", false).
+		StringParam("plan_file", "Optional plan markdown file path (for enter)", false).
+		StringParam("content", "Content to write (for update_file)", false).
+		BoolParam("append", "Append instead of overwrite (for update_file)", false).
+		ArrayParam("todos", "Todo objects with content/status/active_form (for todo_write)", "object", false).
+		IntParam("index", "0-based todo index (for todo_mark_complete)", false).
+		ArrayParam("allowed_prompts", "Permitted command prompts (for exit)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params enterPlanModeParams
+			var params planModeInput
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			if strings.TrimSpace(params.TaskDescription) == "" {
-				return nil, fmt.Errorf("task_description is required")
+			fn, ok := dispatch[params.Action]
+			if !ok {
+				return nil, fmt.Errorf("unknown plan_mode action: %q", params.Action)
 			}
-			mode := a.enterPlanMode(params.SessionID, params.PlanFile, params.TaskDescription)
-			return mode, nil
+			return fn(ctx, &params)
 		}).
 		Build()
 }
@@ -982,41 +1005,6 @@ func ensurePlanFileExists(path string, taskDescription string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-type updatePlanFileParams struct {
-	SessionID string `json:"session_id,omitempty"`
-	Content   string `json:"content"`
-	Append    bool   `json:"append,omitempty"`
-}
-
-func updatePlanFileSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("update_plan_file").
-		Description("Update the active plan-mode markdown file.").
-		Domain("planning").
-		Keywords("update plan file", "plan markdown", "revise document").
-		Priority(80).
-		StringParam("session_id", "Session identifier", false).
-		StringParam("content", "Content to write", true).
-		BoolParam("append", "Append content instead of overwrite", false).
-		Usage("Use to write or append content to the active plan-mode markdown file. Requires plan mode to be enabled for the session. Set append=true to add content without overwriting existing plan text. Do NOT use outside plan mode — the handler will return an error if plan mode is not enabled.").
-		Example(`{"content": "## Implementation\n\n1. Create WebSocket handler\n2. Add message routing\n", "append": true, "session_id": "sess_abc"}`).
-		BestPractice("Use append=true for incremental plan building (adding sections) and append=false only for complete plan rewrites.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params updatePlanFileParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			mode, err := a.getPlanMode(params.SessionID)
-			if err != nil {
-				return nil, err
-			}
-			if err := writePlanFile(mode.PlanFile, params.Content, params.Append); err != nil {
-				return nil, err
-			}
-			mode.UpdatedAt = time.Now()
-			return map[string]any{"plan_file": mode.PlanFile, "updated": mode.UpdatedAt}, nil
-		}).
-		Build()
-}
 
 func writePlanFile(path string, content string, appendMode bool) error {
 	if !appendMode {
@@ -1031,114 +1019,6 @@ func writePlanFile(path string, content string, appendMode bool) error {
 	return err
 }
 
-type todoWriteParams struct {
-	SessionID string     `json:"session_id,omitempty"`
-	Todos     []PlanTodo `json:"todos"`
-}
-
-func todoWriteSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("todo_write").
-		Description("Write or replace the plan-mode todo list.").
-		Domain("planning").
-		Keywords("todo", "tasks", "tracking", "progress").
-		Priority(75).
-		StringParam("session_id", "Session identifier", false).
-		ArrayParam("todos", "Todo objects with content/status/active_form", "object", true).
-		Usage("Use to create or replace the plan-mode todo list for tracking implementation progress. Each todo should have content, status, and an active_form (present-tense description shown during execution). Requires plan mode to be enabled.").
-		Example(`{"session_id": "sess_abc", "todos": [{"content": "Implement WebSocket handler", "status": "pending", "active_form": "Implementing WebSocket handler"}, {"content": "Write integration tests", "status": "pending", "active_form": "Writing integration tests"}]}`).
-		BestPractice("Keep todo items at the task level (not sub-task) — each should map to a single agent delegation.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params todoWriteParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			mode, err := a.getPlanMode(params.SessionID)
-			if err != nil {
-				return nil, err
-			}
-			mode.Todos = params.Todos
-			mode.UpdatedAt = time.Now()
-			return map[string]any{"todos": mode.Todos, "count": len(mode.Todos)}, nil
-		}).
-		Build()
-}
-
-type todoMarkCompleteParams struct {
-	SessionID string `json:"session_id,omitempty"`
-	Index     int    `json:"index"`
-}
-
-func todoMarkCompleteSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("todo_mark_complete").
-		Description("Mark a plan-mode todo as completed by index.").
-		Domain("planning").
-		Keywords("todo complete", "mark done", "finish step").
-		Priority(75).
-		StringParam("session_id", "Session identifier", false).
-		IntParam("index", "0-based todo index", true).
-		Usage("Use to mark a specific plan-mode todo as completed by its 0-based index. Requires plan mode to be enabled and the index to be within the todo list bounds.").
-		Example(`{"session_id": "sess_abc", "index": 0}`).
-		BestPractice("Mark todos complete only after receiving confirmation from the executing agent — do not mark complete optimistically.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params todoMarkCompleteParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			mode, err := a.getPlanMode(params.SessionID)
-			if err != nil {
-				return nil, err
-			}
-			if params.Index < 0 || params.Index >= len(mode.Todos) {
-				return nil, fmt.Errorf("todo index out of range")
-			}
-			mode.Todos[params.Index].Status = "completed"
-			mode.UpdatedAt = time.Now()
-			return map[string]any{
-				"index":      params.Index,
-				"todo":       mode.Todos[params.Index],
-				"todo_count": len(mode.Todos),
-				"updated_at": mode.UpdatedAt,
-			}, nil
-		}).
-		Build()
-}
-
-type exitPlanModeParams struct {
-	SessionID      string   `json:"session_id,omitempty"`
-	AllowedPrompts []string `json:"allowed_prompts,omitempty"`
-}
-
-func exitPlanModeSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("exit_plan_mode").
-		Description("Exit plan mode and mark plan as awaiting user approval.").
-		Domain("planning").
-		Keywords("exit plan mode", "approval", "review", "ready").
-		Priority(80).
-		StringParam("session_id", "Session identifier", false).
-		ArrayParam("allowed_prompts", "Optional permitted command prompts", "string", false).
-		Usage("Use when the plan is complete and ready for user review. Marks the plan as awaiting approval and optionally specifies allowed command prompts that the user can execute. The plan file remains on disk for the user to review. Do NOT exit plan mode before the plan is fully formed — premature exit wastes the user's review effort.").
-		Example(`{"session_id": "sess_abc", "allowed_prompts": ["run tests", "install dependencies"]}`).
-		BestPractice("Always populate allowed_prompts with the specific actions needed to implement the plan — this gives the user a clear next-step menu.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params exitPlanModeParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			mode, err := a.getPlanMode(params.SessionID)
-			if err != nil {
-				return nil, err
-			}
-			mode.AwaitingApproval = true
-			mode.AllowedPrompts = params.AllowedPrompts
-			mode.UpdatedAt = time.Now()
-			return map[string]any{
-				"session_id":        mode.SessionID,
-				"awaiting_approval": mode.AwaitingApproval,
-				"allowed_prompts":   mode.AllowedPrompts,
-			}, nil
-		}).
-		Build()
-}
 
 type askUserQuestionParams struct {
 	SessionID string           `json:"session_id,omitempty"`
@@ -1165,13 +1045,34 @@ func askUserQuestionSkill(a *Architect) *skills.Skill {
 			if len(params.Questions) == 0 {
 				return nil, fmt.Errorf("questions are required")
 			}
+			sessionID := normalizeSessionID(params.SessionID)
+			// When invoked during the planning protocol's clarify step,
+			// attach the questions to the in-flight plan so stepClarify
+			// can detect that clarification was requested.
+			if plan := a.latestConsultingPlan(sessionID); plan != nil {
+				plan.ClarificationQuestions = extractQuestionTexts(params.Questions)
+			}
 			return map[string]any{
 				"status":     "clarification_required",
-				"session_id": normalizeSessionID(params.SessionID),
+				"session_id": sessionID,
 				"questions":  params.Questions,
 			}, nil
 		}).
 		Build()
+}
+
+// extractQuestionTexts pulls the "question" string from each question
+// object map, filtering empty entries.
+func extractQuestionTexts(questions []map[string]any) []string {
+	texts := make([]string, 0, len(questions))
+	for _, q := range questions {
+		text := strings.TrimSpace(fmt.Sprint(q["question"]))
+		if text == "" || text == "<nil>" {
+			continue
+		}
+		texts = append(texts, text)
+	}
+	return texts
 }
 
 func (a *Architect) getPlanMode(sessionID string) (*PlanModeState, error) {
@@ -1269,6 +1170,66 @@ func buildResearchPlanningQuery(params *readResearchPaperParams, content string)
 }
 
 // ---------------------------------------------------------------------------
+// start_planning — transition from conversation to plan generation
+// ---------------------------------------------------------------------------
+
+type startPlanningInput struct {
+	Query     string `json:"query"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+func startPlanningSkill(a *Architect) *skills.Skill {
+	return skills.NewSkill("start_planning").
+		Description("Transition from conversation to plan generation. "+
+			"Synthesizes the conversation into a planning query and executes the full planning protocol.").
+		Domain("planning").
+		Keywords("start planning", "create plan", "formalize", "generate plan").
+		Priority(100).
+		TokenEstimate(300).
+		StringParam("query", "Synthesized planning query capturing all requirements, constraints, and scope gathered from the conversation", true).
+		StringParam("session_id", "Session identifier for plan tracking", false).
+		Usage("Invoke when the conversation has reached sufficient clarity to produce an actionable plan. "+
+			"The query must synthesize all requirements, constraints, technology choices, and scope from the conversation — "+
+			"do not just repeat the user's last message.").
+		BestPractice("Synthesize the full conversation context into the query — do not just repeat the user's last message.").
+		BestPractice("Before invoking, confirm with the user that they are ready to proceed to planning.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params startPlanningInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			query := strings.TrimSpace(params.Query)
+			if query == "" {
+				return nil, fmt.Errorf("query is required")
+			}
+			sessionID := normalizeSessionID(params.SessionID)
+			if sessionID == "default" {
+				if ctxSession := architectSessionIDFromContext(ctx); ctxSession != "" {
+					sessionID = ctxSession
+				}
+			}
+			req := &ArchitectRequest{
+				ID:        uuid.NewString(),
+				Intent:    IntentPlan,
+				Query:     query,
+				SessionID: sessionID,
+				Timestamp: time.Now(),
+			}
+			plan, err := a.executePlanningProtocol(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"plan_id": plan.ID,
+				"status":  plan.Status.String(),
+				"tasks":   len(plan.Tasks),
+				"summary": truncateString(formatPlanForChat(plan), 500),
+			}, nil
+		}).
+		Build()
+}
+
+// ---------------------------------------------------------------------------
 // route_plan_acceptance — route plan + user response to Guide for evaluation
 // ---------------------------------------------------------------------------
 
@@ -1288,13 +1249,14 @@ func routePlanAcceptanceSkill(a *Architect) *skills.Skill {
 		Usage("Use IMMEDIATELY after the user responds to a presented plan. Packages the plan text, plan ID, plan name, and user response into a structured payload and routes it to the Guide's evaluate-plan-acceptance skill. All four payload fields are derived by the handler — do NOT attempt to construct the evaluation payload manually. The Guide returns accept/modify/reject with optional modification notes.").
 		Example(`{"plan_id": "plan_abc", "user_response": "Looks good, but swap the task order for steps 2 and 3."}`).
 		BestPractice("Always call this skill for user responses to ready plans — do not classify acceptance yourself.").
-		BestPractice("If the result is 'modify', read the modifications list and apply changes via revise_plan before re-presenting.").
+		BestPractice("If the result is 'modify', read the modifications list and apply changes via plan action=revise before re-presenting.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			params, err := parseRoutePlanAcceptanceParams(input)
 			if err != nil {
 				return nil, err
 			}
-			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID)
+			sessionID := architectSessionIDFromContext(ctx)
+			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID, sessionID)
 			if err != nil {
 				return nil, err
 			}
@@ -1316,8 +1278,8 @@ func parseRoutePlanAcceptanceParams(input json.RawMessage) (*routePlanAcceptance
 }
 
 // resolveReadyPlanForAcceptance locates the plan by ID or falls back to the
-// latest ready plan. Returns an error if no eligible plan exists.
-func (a *Architect) resolveReadyPlanForAcceptance(planID string) (*DesignPlan, error) {
+// latest ready plan for the given session. Returns an error if no eligible plan exists.
+func (a *Architect) resolveReadyPlanForAcceptance(planID, sessionID string) (*DesignPlan, error) {
 	if id := strings.TrimSpace(planID); id != "" {
 		plan, ok := a.GetActivePlan(id)
 		if !ok {
@@ -1328,7 +1290,7 @@ func (a *Architect) resolveReadyPlanForAcceptance(planID string) (*DesignPlan, e
 		}
 		return plan, nil
 	}
-	plan := a.latestReadyPlan()
+	plan := a.latestReadyPlan(sessionID)
 	if plan == nil {
 		return nil, fmt.Errorf("no ready plan available for acceptance evaluation")
 	}
@@ -1525,7 +1487,7 @@ func handlePlanAcceptanceResultSkill(a *Architect) *skills.Skill {
 			if err != nil {
 				return nil, err
 			}
-			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID)
+			plan, err := a.resolveReadyPlanForAcceptance(params.PlanID, "")
 			if err != nil {
 				return nil, err
 			}

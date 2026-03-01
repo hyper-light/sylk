@@ -21,7 +21,7 @@ type ResourceBroker struct {
 	allocations map[string]*AllocationSet
 	waitGraph   map[string][]string
 
-	signalBus *signal.SignalBus
+	signalBus signal.SignalBusInterface
 	config    ResourceBrokerConfig
 	closed    bool
 	stopCh    chan struct{}
@@ -76,7 +76,7 @@ func NewResourceBroker(
 	netPool *ResourcePool,
 	procPool *ResourcePool,
 	diskQuota *DiskQuotaManager,
-	signalBus *signal.SignalBus,
+	signalBus signal.SignalBusInterface,
 	config ResourceBrokerConfig,
 ) *ResourceBroker {
 	b := &ResourceBroker{

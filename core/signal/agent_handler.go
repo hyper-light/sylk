@@ -65,7 +65,7 @@ type CheckpointProvider interface {
 }
 
 type AgentSignalHandler struct {
-	bus        *SignalBus
+	bus        SignalBusInterface
 	subscriber SignalSubscriber
 	agentID    string
 	agentType  string
@@ -82,7 +82,7 @@ type AgentSignalHandler struct {
 	running bool
 }
 
-func NewAgentSignalHandler(bus *SignalBus, agentID, agentType string) *AgentSignalHandler {
+func NewAgentSignalHandler(bus SignalBusInterface, agentID, agentType string) *AgentSignalHandler {
 	signals := []Signal{
 		PauseAll,
 		ResumeAll,
@@ -100,7 +100,7 @@ func NewAgentSignalHandler(bus *SignalBus, agentID, agentType string) *AgentSign
 			ID:      uuid.New().String(),
 			AgentID: agentID,
 			Signals: signals,
-			Channel: make(chan SignalMessage, bus.config.ChannelBufferSize),
+			Channel: make(chan SignalMessage, bus.ChannelBufferSize()),
 		},
 		state:  AgentIdle,
 		stopCh: make(chan struct{}),

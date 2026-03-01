@@ -302,6 +302,8 @@ func (s *SessionIngestion) buildSymbolEntities(symbols []ingestion.SymbolNode, e
 			CreatedAt:    now,
 			SessionID:    s.session.Meta.ID,
 			DocRef:       ent.docRefMap[sym.FileID],
+			SectionStart: sym.StartLine,
+			SectionEnd:   sym.EndLine,
 		}
 	}
 }
@@ -402,6 +404,8 @@ func (s *SessionIngestion) buildChunkEntities(ctx context.Context, graph *ingest
 						CreatedAt:    now,
 						SessionID:    s.session.Meta.ID,
 						DocRef:       chunkDocRef,
+						SectionStart: b.LineStart,
+						SectionEnd:   b.LineEnd,
 					})
 
 					local.docs = append(local.docs, &VersionDocument{

@@ -132,15 +132,15 @@ type IndexEvent struct {
 // IndexEventPublisher publishes index-related events to the activity event bus.
 // It bridges the gap between the indexing system and the event-driven architecture.
 type IndexEventPublisher struct {
-	// bus is the activity event bus to publish events to
-	bus *ActivityEventBus
+	// bus is the activity publisher to publish events to
+	bus ActivityPublisher
 
 	// sessionID is the session this publisher is associated with
 	sessionID string
 }
 
 // NewIndexEventPublisher creates a new IndexEventPublisher.
-func NewIndexEventPublisher(bus *ActivityEventBus, sessionID string) *IndexEventPublisher {
+func NewIndexEventPublisher(bus ActivityPublisher, sessionID string) *IndexEventPublisher {
 	return &IndexEventPublisher{
 		bus:       bus,
 		sessionID: sessionID,
@@ -164,7 +164,7 @@ func (p *IndexEventPublisher) PublishIndexStart(indexType IndexType, rootPath st
 	event.Data["index_type"] = indexType.String()
 	event.Data["root_path"] = rootPath
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -219,7 +219,7 @@ func (p *IndexEventPublisher) PublishIndexComplete(indexEvent *IndexEvent) error
 		event.Data["error_count"] = len(indexEvent.Errors)
 	}
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -240,7 +240,7 @@ func (p *IndexEventPublisher) PublishFileAdd(filePath string) error {
 	event.Data["file_path"] = filePath
 	event.Data["operation"] = "add"
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -261,7 +261,7 @@ func (p *IndexEventPublisher) PublishFileRemove(filePath string) error {
 	event.Data["file_path"] = filePath
 	event.Data["operation"] = "remove"
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -289,7 +289,7 @@ func (p *IndexEventPublisher) PublishError(err error, filePath string) error {
 	event.Data["error_message"] = err.Error()
 	event.Data["file_path"] = filePath
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 

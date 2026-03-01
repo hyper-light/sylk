@@ -90,12 +90,12 @@ type LLMProviderEventHook interface {
 // LLMEventPublisher publishes LLM-related events to the ActivityEventBus.
 // It tracks LLM requests, responses, and errors for observability and debugging.
 type LLMEventPublisher struct {
-	bus *events.ActivityEventBus
+	bus events.ActivityPublisher
 }
 
-// NewLLMEventPublisher creates a new LLMEventPublisher with the given event bus.
+// NewLLMEventPublisher creates a new LLMEventPublisher with the given activity publisher.
 // Returns nil if bus is nil.
-func NewLLMEventPublisher(bus *events.ActivityEventBus) *LLMEventPublisher {
+func NewLLMEventPublisher(bus events.ActivityPublisher) *LLMEventPublisher {
 	if bus == nil {
 		return nil
 	}
@@ -124,7 +124,7 @@ func (p *LLMEventPublisher) PublishLLMRequest(sessionID, agentID, model string, 
 	}
 	event.Category = "llm"
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -157,7 +157,7 @@ func (p *LLMEventPublisher) PublishLLMResponse(sessionID, agentID, model string,
 	}
 	event.Category = "llm"
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -187,7 +187,7 @@ func (p *LLMEventPublisher) PublishLLMError(sessionID, agentID, model string, er
 	}
 	event.Category = "llm"
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 

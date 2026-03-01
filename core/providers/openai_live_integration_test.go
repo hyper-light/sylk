@@ -18,7 +18,7 @@ func TestOpenAILive_Codex53Generate(t *testing.T) {
 	if v := strings.TrimSpace(os.Getenv("OPENAI_MODEL")); v != "" {
 		cfg.Model = v
 	}
-	provider, err := NewOpenAIProvider(cfg)
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewOpenAIProvider() error: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestOpenAILive_ChatGPTCodex53Generate(t *testing.T) {
 	if v := strings.TrimSpace(os.Getenv("OPENAI_MODEL")); v != "" {
 		cfg.Model = v
 	}
-	provider, err := NewOpenAIProvider(cfg)
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewOpenAIProvider() error: %v", err)
 	}

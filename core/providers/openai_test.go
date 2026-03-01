@@ -307,7 +307,7 @@ func TestOpenAIProviderStartChatGPTDeviceAuth_ReturnsChallengeImmediately(t *tes
 		},
 		completeDelay: 120 * time.Millisecond,
 	}
-	provider, err := NewOpenAIProviderWithAuthService(OpenAIConfig{
+	provider, err := NewOpenAIProviderWithAuthService(context.Background(), OpenAIConfig{
 		BaseConfig: BaseConfig{
 			Model:     "gpt-5.3-codex",
 			APIKey:    "old_token",

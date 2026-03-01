@@ -15,6 +15,8 @@ type AuthRefreshable interface {
 	ProviderType() string
 
 	// RefreshProvider re-resolves credentials and replaces the LLM provider.
-	// Returns nil on success or if the agent is already using valid credentials.
-	RefreshProvider(ctx context.Context) error
+	// authMethod is the canonical auth mode (e.g. "api_key", "oauth", "chatgpt")
+	// from the AuthRegistry event. Returns nil on success or if the agent is
+	// already using valid credentials.
+	RefreshProvider(ctx context.Context, authMethod string) error
 }

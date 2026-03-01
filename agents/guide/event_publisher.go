@@ -17,14 +17,14 @@ import (
 // It wraps the ActivityEventBus to provide type-safe event publishing
 // for user prompts, routing decisions, and clarification requests.
 type GuideEventPublisher struct {
-	bus       *events.ActivityEventBus
+	bus       events.ActivityPublisher
 	sessionID string
 }
 
 // NewGuideEventPublisher creates a new GuideEventPublisher.
 // The bus parameter must not be nil. The sessionID is used as the default
 // session ID for events, but can be overridden per-event.
-func NewGuideEventPublisher(bus *events.ActivityEventBus, sessionID string) *GuideEventPublisher {
+func NewGuideEventPublisher(bus events.ActivityPublisher, sessionID string) *GuideEventPublisher {
 	return &GuideEventPublisher{
 		bus:       bus,
 		sessionID: sessionID,
@@ -56,7 +56,7 @@ func (p *GuideEventPublisher) PublishUserPrompt(sessionID, content, agentID stri
 		},
 	}
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -90,7 +90,7 @@ func (p *GuideEventPublisher) PublishRoutingDecision(sessionID, fromAgent, toAge
 		},
 	}
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -119,7 +119,7 @@ func (p *GuideEventPublisher) PublishClarificationRequest(sessionID, question st
 		},
 	}
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -128,7 +128,7 @@ func (p *GuideEventPublisher) SessionID() string {
 	return p.sessionID
 }
 
-// Bus returns the underlying event bus.
-func (p *GuideEventPublisher) Bus() *events.ActivityEventBus {
+// Bus returns the underlying activity publisher.
+func (p *GuideEventPublisher) Bus() events.ActivityPublisher {
 	return p.bus
 }

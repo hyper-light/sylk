@@ -28,6 +28,20 @@ type architectUsageAccumulatorKey struct{}
 type streamRetryResetEmitter func()
 type streamRetryResetEmitterKey struct{}
 
+// architectSessionIDKey carries the active session ID through the context so
+// skill handlers (e.g. start_planning) can inherit it without relying on the
+// LLM to echo it back as a tool parameter.
+type architectSessionIDKey struct{}
+
+func withArchitectSessionID(ctx context.Context, sessionID string) context.Context {
+	return context.WithValue(ctx, architectSessionIDKey{}, strings.TrimSpace(sessionID))
+}
+
+func architectSessionIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(architectSessionIDKey{}).(string)
+	return v
+}
+
 func withStreamRetryResetEmitter(ctx context.Context, emitter streamRetryResetEmitter) context.Context {
 	if emitter == nil {
 		return ctx
@@ -99,6 +113,7 @@ var planStatusProgress = map[PlanStatus]streamProgressSpec{
 	PlanStatusPending:       {Current: 0, Total: 6, Message: "Framing the plan..."},
 	PlanStatusAnalyzing:     {Current: 1, Total: 6, Message: "Analyzing requirements..."},
 	PlanStatusConsulting:    {Current: 2, Total: 6, Message: "Consulting available knowledge agents..."},
+	PlanStatusClarifying:    {Current: 2, Total: 6, Message: "Waiting for clarification..."},
 	PlanStatusDesigning:     {Current: 3, Total: 6, Message: "Designing architecture options..."},
 	PlanStatusGenerating:    {Current: 4, Total: 6, Message: "Generating an actionable task breakdown..."},
 	PlanStatusOrchestrating: {Current: 5, Total: 6, Message: "Assembling workflow and dependencies..."},
@@ -286,7 +301,7 @@ func extractResponseDirective(data any) *guide.ResponseDirective {
 	switch v := inner.(type) {
 	case *DesignPlan:
 		if v != nil {
-			return v.ReadyDirective
+			return v.ReadyDirective()
 		}
 	case *ConversationResult:
 		if v != nil {
@@ -294,6 +309,20 @@ func extractResponseDirective(data any) *guide.ResponseDirective {
 		}
 	}
 	return nil
+}
+
+func directivePhaseStr(d *guide.ResponseDirective) string {
+	if d == nil {
+		return "<nil>"
+	}
+	return string(d.Phase)
+}
+
+func directiveAgentStr(d *guide.ResponseDirective) string {
+	if d == nil {
+		return "<nil>"
+	}
+	return d.AgentID
 }
 
 func (a *Architect) publishPlanStreamError(ctx context.Context, err error) {
@@ -378,15 +407,22 @@ func buildPlanSnapshotData(plan *DesignPlan) map[string]any {
 
 func (a *Architect) publishPlanStreamEvent(ctx context.Context, event *guide.StreamEvent) {
 	if event == nil || a == nil || a.bus == nil || a.channels == nil {
+		architectDebugLog().Warn("publishPlanStreamEvent: NIL_GUARD",
+			"event_nil", event == nil,
+			"bus_nil", a == nil || a.bus == nil,
+			"channels_nil", a == nil || a.channels == nil)
 		return
 	}
 	metadata, ok := architectStreamMetadataFromContext(ctx)
 	if !ok {
+		architectDebugLog().Warn("publishPlanStreamEvent: NO_STREAM_METADATA",
+			"event_type", string(event.Type),
+			"ctx_err", ctx.Err())
 		return
 	}
 	stream := &guide.StreamResponse{
 		CorrelationID:     metadata.CorrelationID,
-		RespondingAgentID: "architect",
+		RespondingAgentID: a.id,
 		TargetAgentID:     metadata.SourceAgentID,
 		Event:             event,
 	}
@@ -395,14 +431,21 @@ func (a *Architect) publishPlanStreamEvent(ctx context.Context, event *guide.Str
 		CorrelationID: metadata.CorrelationID,
 		Type:          guide.MessageTypeStream,
 		Payload:       stream,
-		SourceAgentID: "architect",
+		SourceAgentID: a.id,
 		TargetAgentID: metadata.SourceAgentID,
 		Timestamp:     time.Now(),
 		Status:        messaging.StatusQueued,
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	_ = a.bus.Publish(a.channels.Responses, msg)
+	err := a.bus.Publish(a.channels.Responses, msg)
+	if event.Type == guide.StreamEventComplete {
+		architectDebugLog().Info("publishPlanStreamEvent: STREAM_COMPLETE_PUBLISHED",
+			"correlation_id", metadata.CorrelationID,
+			"has_directive", event.Directive != nil,
+			"topic", a.channels.Responses,
+			"publish_err", err)
+	}
 }
 
 // formatPlanForChat renders a DesignPlan as readable markdown suitable for

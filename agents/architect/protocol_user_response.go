@@ -2,43 +2,33 @@ package architect
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
 )
 
-// readyUserResponseInline streams plan commentary and the readiness footer
-// token-by-token into chat via publishPlanStreamChunk. Returns the combined
-// text for persistence in plan.UserResponse.
+// readyUserResponseInline streams plan commentary token-by-token into chat
+// via publishPlanStreamChunk. Returns the text for persistence in
+// plan.UserResponse.
 func (a *Architect) readyUserResponseInline(
 	ctx context.Context,
 	req *ArchitectRequest,
 	plan *DesignPlan,
 ) string {
-	request := buildReadyConversationRequest(req, plan)
+	request := a.buildReadyConversationRequest(req, plan)
 	request.OnChunk = func(text string) {
 		a.publishPlanStreamChunk(ctx, text)
 	}
-
-	var summary string
-	if response, err := a.composeUserFacingResponse(ctx, request); err == nil {
-		summary = response
-	} else {
+	response, err := a.composeUserFacingResponse(ctx, request)
+	if err != nil {
 		fb := fallbackReadyUserResponse(req, plan)
 		a.publishPlanStreamChunk(ctx, fb)
-		summary = fb
+		return fb
 	}
-
-	footer := readinessFooter(plan)
-	if footer != "" {
-		a.publishPlanStreamChunk(ctx, "\n\n"+footer)
-		return summary + "\n\n" + footer
-	}
-	return summary
+	return response
 }
 
-func buildReadyConversationRequest(
+func (a *Architect) buildReadyConversationRequest(
 	req *ArchitectRequest,
 	plan *DesignPlan,
 ) plannerConversationRequest {
@@ -53,7 +43,10 @@ func buildReadyConversationRequest(
 		Tradeoffs:               clarificationTradeoffItems(requirements),
 		Assumptions:             assumptionsFromPlan(plan),
 		TaskCount:               planTaskCount(plan),
+		LayerCount:              planLayerCount(plan),
 		FirstTask:               firstTaskName(plan),
+		ApprovalRequired:        !a.config.AutoApprove,
+		SessionID:               reqSessionID(req),
 		ConversationHistory:     reqConversationHistory(req),
 	}
 }
@@ -69,22 +62,11 @@ func fallbackReadyUserResponse(_ *ArchitectRequest, _ *DesignPlan) string {
 	return "The plan is ready. Let me know if you want to refine anything before execution."
 }
 
-// readinessFooter returns a deterministic footer that signals the plan is
-// ready for execution. Derived entirely from plan data — no LLM involved.
-func readinessFooter(plan *DesignPlan) string {
-	tasks := planTaskCount(plan)
-	if tasks == 0 {
+func reqSessionID(req *ArchitectRequest) string {
+	if req == nil {
 		return ""
 	}
-	layers := planLayerCount(plan)
-	var detail string
-	switch {
-	case layers > 1:
-		detail = fmt.Sprintf("**Plan ready** — %d tasks across %d execution layers.", tasks, layers)
-	default:
-		detail = fmt.Sprintf("**Plan ready** — %d tasks.", tasks)
-	}
-	return detail + "\nHanding off to the orchestrator for execution."
+	return req.SessionID
 }
 
 func planLayerCount(plan *DesignPlan) int {

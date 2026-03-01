@@ -106,22 +106,21 @@ func (g *Guide) evaluatePlanAcceptance(ctx context.Context, input planAcceptance
 	}
 
 	g.providerMu.RLock()
-	provider := g.googleProvider
+	provider := g.provider
+	model := g.activeModel
 	g.providerMu.RUnlock()
 
 	if provider == nil {
-		return nil, fmt.Errorf("google provider not configured for plan acceptance evaluation")
+		return nil, fmt.Errorf("provider not configured for plan acceptance evaluation")
 	}
 
 	temp := float64(planAcceptanceTemperature)
 	req := &providers.Request{
-		SystemPrompt:     systemPrompt,
-		Messages:         []providers.Message{{Role: providers.RoleUser, Content: buildPlanAcceptanceUserPrompt(input)}},
-		ResponseMIMEType: "application/json",
-		ResponseSchema:   planAcceptanceResponseSchema(),
-		Temperature:      &temp,
-		MaxTokens:        planAcceptanceMaxTokens,
-		Model:            resolveGuideResponseModel(g.config.RouterConfig.Model),
+		SystemPrompt: systemPrompt,
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: buildPlanAcceptanceUserPrompt(input)}},
+		Temperature:  &temp,
+		MaxTokens:    planAcceptanceMaxTokens,
+		Model:        model,
 	}
 
 	resp, err := provider.Complete(ctx, req)

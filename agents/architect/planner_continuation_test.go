@@ -6,13 +6,13 @@ import (
 )
 
 func TestDeriveMaxRounds(t *testing.T) {
-	// 200K/16K: theoretical=12, prefillCapacity=(200000/2)/16384=6 → min(12,6)=6
-	if got := deriveMaxRounds(200000, 16384); got != 6 {
-		t.Fatalf("deriveMaxRounds(200K,16K) = %d, want 6", got)
+	// 200K/16K: theoretical=12, prefillCapacity=6 → min(cap=3, min(12,6))=3
+	if got := deriveMaxRounds(200000, 16384); got != 3 {
+		t.Fatalf("deriveMaxRounds(200K,16K) = %d, want 3", got)
 	}
-	// 200K/4K: theoretical=48, prefillCapacity=(100000/4096)=24 → 24
-	if got := deriveMaxRounds(200000, 4096); got != 24 {
-		t.Fatalf("deriveMaxRounds(200K,4K) = %d, want 24", got)
+	// 200K/4K: theoretical=48, prefillCapacity=24 → min(cap=3, min(48,24))=3
+	if got := deriveMaxRounds(200000, 4096); got != 3 {
+		t.Fatalf("deriveMaxRounds(200K,4K) = %d, want 3", got)
 	}
 	// 16K/4K: theoretical=4, prefillCapacity=2 → 2
 	if got := deriveMaxRounds(16384, 4096); got != 2 {
@@ -27,9 +27,9 @@ func TestDeriveMaxRounds(t *testing.T) {
 func TestDeriveContinuationConfig(t *testing.T) {
 	cfg := deriveContinuationConfig(200000, 16384, 4)
 
-	// deriveMaxRounds(200000,16384) = min(12, 6) = 6
-	if cfg.maxRounds != 6 {
-		t.Fatalf("maxRounds = %d, want 6", cfg.maxRounds)
+	// deriveMaxRounds(200000,16384) = min(cap=3, min(12, 6)) = 3
+	if cfg.maxRounds != 3 {
+		t.Fatalf("maxRounds = %d, want 3", cfg.maxRounds)
 	}
 	if cfg.prefillCharLimit != 400000 { // (200000/2) * 4
 		t.Fatalf("prefillCharLimit = %d, want 400000", cfg.prefillCharLimit)
@@ -41,10 +41,10 @@ func TestDeriveContinuationConfig(t *testing.T) {
 		t.Fatalf("maxOutputTokens = %d, want 16384", cfg.maxOutputTokens)
 	}
 
-	// windowSize = max(1, 6/3) = 2
-	// alpha = 2.0 / (2+1) = 0.6666...
-	// threshold = 1.0 / max(2, 2) = 0.5
-	wantAlpha := 2.0 / 3.0
+	// windowSize = max(1, 3/3) = 1
+	// alpha = 2.0 / (1+1) = 1.0
+	// threshold = 1.0 / max(2, 1) = 0.5
+	wantAlpha := 1.0
 	if diff := cfg.progressAlpha - wantAlpha; diff > 1e-9 || diff < -1e-9 {
 		t.Fatalf("progressAlpha = %f, want %f", cfg.progressAlpha, wantAlpha)
 	}

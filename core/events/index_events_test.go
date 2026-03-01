@@ -2,7 +2,6 @@ package events
 
 import (
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 )
@@ -140,18 +139,18 @@ func TestIndexEvent_FullIndexOperation(t *testing.T) {
 func TestIndexEvent_IncrementalIndexOperation(t *testing.T) {
 	now := time.Now()
 	event := IndexEvent{
-		ID:           "test-index-3",
-		EventType:    IndexEventTypeComplete,
-		Timestamp:    now,
-		SessionID:    "session-123",
-		IndexType:    IndexTypeIncremental,
-		IndexVersion: 2,
-		PrevVersion:  1,
-		RootPath:     "/project/root",
-		Duration:     2 * time.Second,
-		FilesIndexed: 10,
-		FilesRemoved: 2,
-		FilesUpdated: 5,
+		ID:            "test-index-3",
+		EventType:     IndexEventTypeComplete,
+		Timestamp:     now,
+		SessionID:     "session-123",
+		IndexType:     IndexTypeIncremental,
+		IndexVersion:  2,
+		PrevVersion:   1,
+		RootPath:      "/project/root",
+		Duration:      2 * time.Second,
+		FilesIndexed:  10,
+		FilesRemoved:  2,
+		FilesUpdated:  5,
 		EntitiesFound: 50,
 		EdgesCreated:  25,
 	}
@@ -176,18 +175,18 @@ func TestIndexEvent_IncrementalIndexOperation(t *testing.T) {
 func TestIndexEvent_FileChangeOperation(t *testing.T) {
 	now := time.Now()
 	event := IndexEvent{
-		ID:           "test-index-4",
-		EventType:    IndexEventTypeFileAdd,
-		Timestamp:    now,
-		SessionID:    "session-123",
-		IndexType:    IndexTypeFileChange,
-		IndexVersion: 3,
-		PrevVersion:  2,
-		RootPath:     "/project/root",
-		Duration:     100 * time.Millisecond,
-		FilesIndexed: 1,
-		FilesRemoved: 0,
-		FilesUpdated: 0,
+		ID:            "test-index-4",
+		EventType:     IndexEventTypeFileAdd,
+		Timestamp:     now,
+		SessionID:     "session-123",
+		IndexType:     IndexTypeFileChange,
+		IndexVersion:  3,
+		PrevVersion:   2,
+		RootPath:      "/project/root",
+		Duration:      100 * time.Millisecond,
+		FilesIndexed:  1,
+		FilesRemoved:  0,
+		FilesUpdated:  0,
 		EntitiesFound: 5,
 		EdgesCreated:  3,
 	}
@@ -219,18 +218,18 @@ func TestIndexEvent_WithErrors(t *testing.T) {
 	}
 
 	event := IndexEvent{
-		ID:           "test-index-5",
-		EventType:    IndexEventTypeError,
-		Timestamp:    now,
-		SessionID:    "session-123",
-		IndexType:    IndexTypeFull,
-		IndexVersion: 1,
-		PrevVersion:  0,
-		RootPath:     "/project/root",
-		Duration:     3 * time.Second,
-		FilesIndexed: 98,
-		FilesRemoved: 0,
-		FilesUpdated: 0,
+		ID:            "test-index-5",
+		EventType:     IndexEventTypeError,
+		Timestamp:     now,
+		SessionID:     "session-123",
+		IndexType:     IndexTypeFull,
+		IndexVersion:  1,
+		PrevVersion:   0,
+		RootPath:      "/project/root",
+		Duration:      3 * time.Second,
+		FilesIndexed:  98,
+		FilesRemoved:  0,
+		FilesUpdated:  0,
 		EntitiesFound: 490,
 		EdgesCreated:  245,
 		Errors:        errors,
@@ -256,18 +255,18 @@ func TestIndexEvent_WithErrors(t *testing.T) {
 func TestIndexEvent_FileRemoveOperation(t *testing.T) {
 	now := time.Now()
 	event := IndexEvent{
-		ID:           "test-index-6",
-		EventType:    IndexEventTypeFileRemove,
-		Timestamp:    now,
-		SessionID:    "session-123",
-		IndexType:    IndexTypeFileChange,
-		IndexVersion: 4,
-		PrevVersion:  3,
-		RootPath:     "/project/root",
-		Duration:     50 * time.Millisecond,
-		FilesIndexed: 0,
-		FilesRemoved: 1,
-		FilesUpdated: 0,
+		ID:            "test-index-6",
+		EventType:     IndexEventTypeFileRemove,
+		Timestamp:     now,
+		SessionID:     "session-123",
+		IndexType:     IndexTypeFileChange,
+		IndexVersion:  4,
+		PrevVersion:   3,
+		RootPath:      "/project/root",
+		Duration:      50 * time.Millisecond,
+		FilesIndexed:  0,
+		FilesRemoved:  1,
+		FilesUpdated:  0,
 		EntitiesFound: 0,
 		EdgesCreated:  0,
 	}
@@ -375,16 +374,15 @@ func TestIndexEvent_VersionTracking(t *testing.T) {
 // =============================================================================
 
 func TestNewIndexEventPublisher(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	if publisher == nil {
 		t.Fatal("Expected non-nil publisher")
 	}
 
-	if publisher.bus != bus {
+	if publisher.bus != collector {
 		t.Error("Expected bus to be set")
 	}
 
@@ -394,28 +392,16 @@ func TestNewIndexEventPublisher(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishIndexStart(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	// Create subscriber to capture events
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexStart},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	err := publisher.PublishIndexStart(IndexTypeFull, "/project/root")
 	if err != nil {
 		t.Fatalf("PublishIndexStart returned error: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -470,18 +456,9 @@ func TestIndexEventPublisher_PublishIndexStart_NilBus(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishIndexComplete(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	// Create subscriber to capture events
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexComplete},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	indexEvent := &IndexEvent{
 		ID:            "idx-1",
@@ -506,10 +483,7 @@ func TestIndexEventPublisher_PublishIndexComplete(t *testing.T) {
 		t.Fatalf("PublishIndexComplete returned error: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -561,18 +535,9 @@ func TestIndexEventPublisher_PublishIndexComplete(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishIndexComplete_WithErrors(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	// Create subscriber to capture events
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexComplete},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	indexEvent := &IndexEvent{
 		ID:           "idx-1",
@@ -596,10 +561,7 @@ func TestIndexEventPublisher_PublishIndexComplete_WithErrors(t *testing.T) {
 		t.Fatalf("PublishIndexComplete returned error: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -640,10 +602,9 @@ func TestIndexEventPublisher_PublishIndexComplete_NilBus(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishIndexComplete_NilEvent(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	err := publisher.PublishIndexComplete(nil)
 	if err == nil {
@@ -652,28 +613,16 @@ func TestIndexEventPublisher_PublishIndexComplete_NilEvent(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishFileAdd(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	// Create subscriber to capture events
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexFileAdded},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	err := publisher.PublishFileAdd("/project/new_file.go")
 	if err != nil {
 		t.Fatalf("PublishFileAdd returned error: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -723,28 +672,16 @@ func TestIndexEventPublisher_PublishFileAdd_NilBus(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishFileRemove(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	// Create subscriber to capture events
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexFileRemoved},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	err := publisher.PublishFileRemove("/project/deleted_file.go")
 	if err != nil {
 		t.Fatalf("PublishFileRemove returned error: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -789,18 +726,9 @@ func TestIndexEventPublisher_PublishFileRemove_NilBus(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishError(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	// Create subscriber to capture events
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexError},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	testErr := fmt.Errorf("parse error: unexpected token")
 	err := publisher.PublishError(testErr, "/project/bad_file.go")
@@ -808,10 +736,7 @@ func TestIndexEventPublisher_PublishError(t *testing.T) {
 		t.Fatalf("PublishError returned error: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -844,18 +769,9 @@ func TestIndexEventPublisher_PublishError(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishError_EmptyFilePath(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	// Create wildcard subscriber to capture all events
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	testErr := fmt.Errorf("general indexing error")
 	err := publisher.PublishError(testErr, "")
@@ -863,10 +779,7 @@ func TestIndexEventPublisher_PublishError_EmptyFilePath(t *testing.T) {
 		t.Fatalf("PublishError returned error: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -892,10 +805,9 @@ func TestIndexEventPublisher_PublishError_NilBus(t *testing.T) {
 }
 
 func TestIndexEventPublisher_PublishError_NilError(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 
 	err := publisher.PublishError(nil, "/project/file.go")
 	if err == nil {
@@ -909,10 +821,9 @@ func TestIndexEventPublisher_PublishError_NilError(t *testing.T) {
 
 func TestIndexerEventHook_Interface(t *testing.T) {
 	// Test that IndexEventPublisherHook implements IndexerEventHook
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 	hook := NewIndexEventPublisherHook(publisher)
 
 	// Verify hook implements IndexerEventHook
@@ -920,25 +831,14 @@ func TestIndexerEventHook_Interface(t *testing.T) {
 }
 
 func TestIndexEventPublisherHook_OnIndexStart(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexStart},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 	hook := NewIndexEventPublisherHook(publisher)
 
 	hook.OnIndexStart(IndexTypeFull, "/project/root")
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -949,17 +849,9 @@ func TestIndexEventPublisherHook_OnIndexStart(t *testing.T) {
 }
 
 func TestIndexEventPublisherHook_OnIndexComplete(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexComplete},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 	hook := NewIndexEventPublisherHook(publisher)
 
 	indexEvent := &IndexEvent{
@@ -972,10 +864,7 @@ func TestIndexEventPublisherHook_OnIndexComplete(t *testing.T) {
 
 	hook.OnIndexComplete(indexEvent)
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -986,25 +875,14 @@ func TestIndexEventPublisherHook_OnIndexComplete(t *testing.T) {
 }
 
 func TestIndexEventPublisherHook_OnFileAdd(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexFileAdded},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 	hook := NewIndexEventPublisherHook(publisher)
 
 	hook.OnFileAdd("/project/new_file.go")
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -1015,25 +893,14 @@ func TestIndexEventPublisherHook_OnFileAdd(t *testing.T) {
 }
 
 func TestIndexEventPublisherHook_OnFileRemove(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexFileRemoved},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 	hook := NewIndexEventPublisherHook(publisher)
 
 	hook.OnFileRemove("/project/deleted_file.go")
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -1044,25 +911,14 @@ func TestIndexEventPublisherHook_OnFileRemove(t *testing.T) {
 }
 
 func TestIndexEventPublisherHook_OnError(t *testing.T) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := NewTestActivityCollector()
 
-	sub := &mockIndexSubscriber{
-		id:         "test-sub",
-		eventTypes: []EventType{EventTypeIndexError},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewIndexEventPublisher(bus, "test-session")
+	publisher := NewIndexEventPublisher(collector, "test-session")
 	hook := NewIndexEventPublisherHook(publisher)
 
 	hook.OnError(fmt.Errorf("test error"), "/project/bad_file.go")
 
-	// Wait for event delivery
-	time.Sleep(100 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(events))
 	}
@@ -1139,37 +995,4 @@ func TestNewIndexEvent(t *testing.T) {
 	if event.Errors == nil {
 		t.Error("Expected non-nil errors slice")
 	}
-}
-
-// =============================================================================
-// Mock Subscriber for Index Event Tests
-// =============================================================================
-
-// mockIndexSubscriber implements EventSubscriber for testing index events
-type mockIndexSubscriber struct {
-	id         string
-	eventTypes []EventType
-	events     []*ActivityEvent
-	mu         sync.Mutex
-}
-
-func (m *mockIndexSubscriber) ID() string {
-	return m.id
-}
-
-func (m *mockIndexSubscriber) EventTypes() []EventType {
-	return m.eventTypes
-}
-
-func (m *mockIndexSubscriber) OnEvent(event *ActivityEvent) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.events = append(m.events, event)
-	return nil
-}
-
-func (m *mockIndexSubscriber) getEvents() []*ActivityEvent {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]*ActivityEvent{}, m.events...)
 }

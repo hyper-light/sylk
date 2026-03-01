@@ -41,7 +41,7 @@ type ResourcePoolConfig struct {
 	Total               int
 	UserReservedPercent float64
 	PipelineTimeout     time.Duration
-	SignalBus           *signal.SignalBus
+	SignalBus           signal.SignalBusInterface
 }
 
 // DefaultResourcePoolConfig returns sensible defaults.
@@ -106,7 +106,7 @@ type ResourcePool struct {
 	handles   map[string]*ResourceHandle
 	waitQueue waitQueue
 
-	signalBus *signal.SignalBus
+	signalBus signal.SignalBusInterface
 	closed    bool
 	closeOnce sync.Once
 }

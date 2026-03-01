@@ -40,6 +40,7 @@ func TestValidSignals_IncludesAllSignals(t *testing.T) {
 		EvictCaches,
 		CompactContexts,
 		MemoryPressureChanged,
+		TimePressure,
 	}
 
 	if len(signals) != len(expected) {

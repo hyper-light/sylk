@@ -29,6 +29,10 @@ type GuideSelfResponseRequest struct {
 	ActiveConversationTurns int
 	ActiveConversationAge   int
 	ActiveConversationScore float64
+
+	// ConversationHistory carries recent self-response turns so the model
+	// has context from previous interactions within the same session.
+	ConversationHistory []providers.Message
 }
 
 // GuideSelfResponder handles requests explicitly targeted at the guide agent.
@@ -63,17 +67,18 @@ func RespondGuideSelf(
 	return strings.TrimSpace(reply), nil, nil
 }
 
-func resolveGuideSelfResponder(cfg Config, provider geminiLLMProvider, owner *Guide) GuideSelfResponder {
+func resolveGuideSelfResponder(cfg Config, provider providers.ProviderAdapter, model string, owner *Guide) GuideSelfResponder {
 	var responder GuideSelfResponder
 	if cfg.SelfResponder != nil {
 		responder = cfg.SelfResponder
 	} else if provider == nil {
 		responder = NewStaticGuideResponder()
 	} else {
-		primary := NewGeminiGuideResponder(provider, cfg.RouterConfig)
+		primary := NewGuideResponder(provider, model, cfg.RouterConfig)
 		if owner != nil {
-			primary = NewGeminiGuideResponderWithTools(
+			primary = NewGuideResponderWithTools(
 				provider,
+				model,
 				cfg.RouterConfig,
 				owner.prepareGuideSelfResponseTools,
 				owner.executeGuideSelfResponseToolCall,

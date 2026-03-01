@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
@@ -25,13 +26,13 @@ import (
 )
 
 // OrchestratorProvider is the minimal LLM interface required by the Orchestrator.
-// Satisfied by *providers.GoogleProvider and *gateway.GatewayProvider.
+// Satisfied by any providers.ProviderAdapter (e.g. Google, Anthropic, gateway-wrapped).
 type OrchestratorProvider interface {
 	Complete(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error)
 }
 
 // Orchestrator is a read-only workflow observer and coordinator.
-// Identity: Gemini 3 Flash — observational nervous system
+// Identity: observational nervous system (provider-agnostic)
 // Role: Monitor workflows, track task health, submit events to Archivalist
 type Orchestrator struct {
 	config Config
@@ -54,15 +55,15 @@ type Orchestrator struct {
 	knownAgents map[string]*guide.AgentAnnouncement
 
 	// LLM integration
-	provider  OrchestratorProvider // Gemini Flash provider (nil = fallback mode)
+	provider  OrchestratorProvider // LLM provider (nil = fallback mode)
 	eventCh   chan *busEvent       // buffered channel for LLM event loop
 	bootGate  *bootstrapGate           // signal-based readiness gate for LLM loop
 	llmCtx    context.Context
 	llmCancel context.CancelFunc
 	llmWg     sync.WaitGroup // tracks the LLM loop goroutine
 
-	// Activity event publishing for UI agent panel visibility
-	activityBus *events.ActivityEventBus
+	// Activity publisher for UI agent panel visibility
+	activityPub events.ActivityPublisher
 
 	// Data plane: WAL, SQLite, BufferRegistry, DAG Bridge
 	store          *Store
@@ -88,9 +89,10 @@ type Orchestrator struct {
 	// Auth credential change subscription.
 	authSub guide.Subscription
 
-	// refreshProvider re-resolves the Google provider on auth changes.
-	// Set via SetProviderRefresher from bootstrap.
-	refreshProvider func(ctx context.Context)
+	// refreshProvider re-resolves the LLM provider on auth changes.
+	// Set via SetProviderRefresher from bootstrap. The authMethod parameter
+	// carries the canonical auth mode from the AuthRegistry event.
+	refreshProvider func(ctx context.Context, authMethod string)
 
 	// File-backed WAL logger for debug tracing (visible via tail).
 	logger *slog.Logger
@@ -116,9 +118,9 @@ func (o *Orchestrator) logWarnMsg(msg string, args ...any) {
 // New creates a new Orchestrator agent. The optional GoogleProvider enables
 // LLM-driven event analysis. When nil, the orchestrator runs in deterministic
 // fallback mode (critical events auto-escalate without model involvement).
-// The optional ActivityEventBus enables UI agent panel visibility.
+// The optional ActivityPublisher enables UI agent panel visibility.
 // The optional SylkDir enables persistent storage (WAL, SQLite, BufferRegistry).
-func New(cfg Config, provider OrchestratorProvider, activityBus *events.ActivityEventBus, sd *sylkdir.SylkDir) (*Orchestrator, error) {
+func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityPublisher, sd *sylkdir.SylkDir) (*Orchestrator, error) {
 	cfg = applyConfigDefaults(cfg)
 
 	logger, logCloser, logErr := agentlog.NewWALLogger("orchestrator")
@@ -140,7 +142,7 @@ func New(cfg Config, provider OrchestratorProvider, activityBus *events.Activity
 		skillLoader: skillLoader,
 		hooks:       hookRegistry,
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		activityBus: activityBus,
+		activityPub: activityPub,
 		sessionVFS:  make(map[string]*versioning.SessionVFS),
 		logger:      logger,
 		logWAL:      logCloser,
@@ -165,7 +167,7 @@ func New(cfg Config, provider OrchestratorProvider, activityBus *events.Activity
 
 	// Initialize data plane if SylkDir is available
 	if sd != nil {
-		if err := o.initDataPlane(cfg, sd, activityBus); err != nil {
+		if err := o.initDataPlane(cfg, sd, activityPub); err != nil {
 			return nil, err
 		}
 	}
@@ -176,7 +178,7 @@ func New(cfg Config, provider OrchestratorProvider, activityBus *events.Activity
 }
 
 // initDataPlane initializes the persistent data plane: SQLite, WAL, BufferRegistry, DAG Bridge.
-func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityBus *events.ActivityEventBus) error {
+func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPub events.ActivityPublisher) error {
 	// SQLite store
 	store, err := OpenStore(DefaultStoreConfig(sd.OrchestratorDBPath()))
 	if err != nil {
@@ -222,7 +224,7 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityBu
 		Journal:     journal,
 		Buffers:     buffers,
 		Scope:       scope,
-		ActivityBus: activityBus,
+		ActivityPub: activityPub,
 		SessionID:   cfg.SessionID,
 		AgentID:     cfg.AgentID,
 	})
@@ -233,7 +235,7 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityBu
 // SetProvider hot-swaps the LLM provider. When called after Start with a
 // non-nil provider and the LLM event loop has not yet started, the loop
 // is started lazily. This supports deferred authorization — the user may
-// configure Google credentials after the orchestrator is already running.
+// configure credentials after the orchestrator is already running.
 func (o *Orchestrator) SetProvider(provider OrchestratorProvider) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -254,17 +256,43 @@ func (o *Orchestrator) SetProvider(provider OrchestratorProvider) {
 	}
 }
 
-// SetProviderRefresher registers a callback that re-resolves the Google
+// SetProviderRefresher registers a callback that re-resolves the LLM
 // provider from credentials. Called from bootstrap to wire the
 // orchestrator into the auth refresh flow.
-func (o *Orchestrator) SetProviderRefresher(fn func(ctx context.Context)) {
+func (o *Orchestrator) SetProviderRefresher(fn func(ctx context.Context, authMethod string)) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.refreshProvider = fn
 }
 
+// SwapModel implements container.ModelSwappable.
+// Installs the pre-built, gateway-wrapped provider and updates config.Model.
+func (o *Orchestrator) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	o.SetProvider(provider)
+	o.mu.Lock()
+	o.config.Model = modelID
+	o.mu.Unlock()
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (o *Orchestrator) CurrentModel() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.config.Model
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (o *Orchestrator) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "gemini-3-flash-preview", DisplayName: "Gemini 3 Flash"},
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6"},
+	}
+}
+
 // handleAuthChanged processes credential change events from the bus.
-// Only reacts to "google" provider changes.
+// Currently reacts to "google" provider changes for credential refresh.
 func (o *Orchestrator) handleAuthChanged(msg *guide.Message) error {
 	ev, ok := msg.GetAuthEvent()
 	if !ok || ev == nil {
@@ -278,7 +306,7 @@ func (o *Orchestrator) handleAuthChanged(msg *guide.Message) error {
 	o.mu.RUnlock()
 
 	if refreshFn != nil {
-		refreshFn(context.Background())
+		refreshFn(context.Background(), ev.AuthMethod)
 	}
 	return nil
 }
@@ -1327,7 +1355,7 @@ func (o *Orchestrator) publishActivity(eventType events.EventType, content strin
 
 // publishActivityWithVisibility sends an activity event with explicit visibility.
 func (o *Orchestrator) publishActivityWithVisibility(eventType events.EventType, visibility events.EventVisibility, content string) {
-	if o.activityBus == nil {
+	if o.activityPub == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, o.config.SessionID, content)
@@ -1335,7 +1363,7 @@ func (o *Orchestrator) publishActivityWithVisibility(eventType events.EventType,
 	evt.Visibility = visibility
 	evt.Data["agent_type"] = "orchestrator"
 	evt.Data["agent_name"] = "Orchestrator"
-	o.activityBus.Publish(evt)
+	o.activityPub.PublishActivity(evt)
 }
 
 // retryObserver returns a provider RetryObserver that publishes retry status
@@ -1741,11 +1769,11 @@ func (o *Orchestrator) AgentType() string {
 	return "orchestrator"
 }
 
-// Descriptor returns the immutable agent descriptor for handoff decisions.
+// Descriptor returns the agent descriptor for handoff decisions.
 func (o *Orchestrator) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:     "orchestrator",
-		ModelID:       "gemini-3-flash-preview",
+		ModelID:       o.CurrentModel(),
 		ContextWindow: 1_000_000,
 		Category:      handoff.CategoryStandalone,
 	}

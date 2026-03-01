@@ -2,39 +2,39 @@
 
 ## Available Skills
 
-### File Operations
+### Understanding (Priority 100–95)
 - `read_file` — Read file contents with optional offset/limit
-- `write_file` — Create or overwrite a file
+- `lsp` — Query gopls for code intelligence (goto_definition, find_references, hover, symbols, call_hierarchy)
 - `edit_file` — Search-and-replace edits within a file
 
-### Code Operations
-- `run_command` — Execute approved shell commands
-- `run_tests` — Run project tests with pattern/verbose/coverage options
+### Search & Quality Tools (Priority 90)
+- `write_file` — Create or overwrite a file
 - `glob` — Find files by pattern
 - `grep` — Search file contents with regex
-
-### Consultation
-- `consult_librarian` — Query codebase patterns and context
-- `consult_archivalist` — Query historical decisions
-- `consult_academic` — Query theoretical guidance
-
-### Discovery
-- `discover_project_tools` — Scan for build tools and frameworks
 - `discover_code_patterns` — Scan for coding conventions
+- `format` — Format source files (check, apply, detect)
+- `lint` — Run linters on source files (run, detect)
 
-### Quality
-- `audit_implementation` — Self-audit code quality
-- `review_code_quality` — Review against quality standards
+### Judgment & Consultation (Priority 85)
+- `consult` — Query domain experts (target: librarian, archivalist, or academic)
+- `audit` — Self-audit code for quality issues
+
+### Execution & Reporting (Priority 80–70)
+- `run_command` — Execute approved shell commands
 - `report_confidence` — Report confidence assessment for escalation
-
-### Communication
+- `discover_project_tools` — Scan for build tools and frameworks
 - `signal_orchestrator` — Signal progress, questions, or blocks
-- `ask_user_question` — Escalate a question to the user
+
+### Routing
+- `reroute` — Request rerouting to a different agent
 
 ## Best Practices
 
 1. **Read before writing.** Always read a file before editing it.
 2. **Use edit_file over write_file** when modifying existing files.
-3. **Test after changes.** Run relevant tests after making modifications.
-4. **One concern per tool call.** Keep tool calls focused and atomic.
-5. **Check results.** Verify tool call results before proceeding.
+3. **Use LSP for navigation.** Goto definition and find references before modifying unfamiliar code.
+4. **Format after changes.** Run format check/apply after modifying source files.
+5. **Lint after changes.** Run lint to catch issues before reporting completion.
+6. **Consult before implementing.** Ask domain experts for context, not after the fact.
+7. **Audit before completion.** Self-audit code quality before reporting confidence.
+8. **One concern per tool call.** Keep tool calls focused and atomic.

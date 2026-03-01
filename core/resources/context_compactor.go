@@ -8,11 +8,11 @@ import (
 )
 
 type ContextCompactor struct {
-	bus      *signal.SignalBus
+	bus      signal.SignalBusInterface
 	registry *UsageRegistry
 }
 
-func NewContextCompactor(bus *signal.SignalBus, registry *UsageRegistry) *ContextCompactor {
+func NewContextCompactor(bus signal.SignalBusInterface, registry *UsageRegistry) *ContextCompactor {
 	return &ContextCompactor{
 		bus:      bus,
 		registry: registry,

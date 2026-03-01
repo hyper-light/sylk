@@ -4,6 +4,7 @@ import (
 	"fmt"
 )
 
+// Deprecated: Use ResolvedNode from DocResolver instead.
 // ChunkLocation describes the exact position and content of a chunk
 // within its parent document. Returned by ChunkLocator.Locate.
 type ChunkLocation struct {
@@ -18,6 +19,9 @@ type ChunkLocation struct {
 	ChunkContent string // The parent document content at [ByteStart:ByteEnd]
 }
 
+// Deprecated: Use DocResolver instead. DocResolver handles all node types
+// (not just chunks) via Node.SectionStart/SectionEnd.
+//
 // ChunkLocator resolves chunk node IDs to their parent document location.
 // It reads from the session's HEAD version stores. All reads are lock-free.
 type ChunkLocator struct {
@@ -27,6 +31,7 @@ type ChunkLocator struct {
 	version       SemanticVersion
 }
 
+// Deprecated: Use NewDocResolver instead.
 // NewChunkLocator creates a locator bound to the session's HEAD version.
 // It reuses the session's registered stores to avoid double-registration.
 func NewChunkLocator(sess *Session) *ChunkLocator {
@@ -38,6 +43,7 @@ func NewChunkLocator(sess *Session) *ChunkLocator {
 	}
 }
 
+// Deprecated: Use DocResolver.Resolve instead.
 // Locate resolves a chunk node ID to its full location within the parent
 // document, including the content at the chunk's byte range.
 func (cl *ChunkLocator) Locate(chunkNodeID uint32) (*ChunkLocation, error) {
@@ -48,6 +54,7 @@ func (cl *ChunkLocator) Locate(chunkNodeID uint32) (*ChunkLocation, error) {
 	return cl.resolveRef(chunkNodeID, ref)
 }
 
+// Deprecated: Use DocResolver.Resolve instead.
 // LocateBatch resolves multiple chunk node IDs, deduplicating parent doc
 // reads by DocRef. Returns locations in the same order as the input IDs.
 func (cl *ChunkLocator) LocateBatch(chunkNodeIDs []uint32) ([]*ChunkLocation, error) {

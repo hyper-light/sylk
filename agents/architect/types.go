@@ -7,6 +7,10 @@ import (
 	"github.com/adalundhe/sylk/core/dag"
 )
 
+// PlanStatusClarifying is outside the iota sequence (value 10) to avoid
+// shifting existing values and breaking persisted plan JSON.
+const PlanStatusClarifying PlanStatus = 10
+
 type ArchitectIntent string
 
 const (
@@ -39,6 +43,16 @@ func (r *ConversationResult) ResponseText() string {
 		return ""
 	}
 	return r.Response
+}
+
+// ResponseDirective implements the guide-layer directiveCarrier interface so
+// the Guide can extract the directive from a RouteResponse as a fallback when
+// the STREAM_COMPLETE event carrying the directive is lost.
+func (r *ConversationResult) ResponseDirective() *guide.ResponseDirective {
+	if r == nil {
+		return nil
+	}
+	return r.Directive
 }
 
 func (i ArchitectIntent) String() string {
@@ -86,6 +100,7 @@ func (s PlanStatus) String() string {
 		PlanStatusPending:       "pending",
 		PlanStatusAnalyzing:     "analyzing",
 		PlanStatusConsulting:    "consulting",
+		PlanStatusClarifying:    "clarifying",
 		PlanStatusDesigning:     "designing",
 		PlanStatusGenerating:    "generating",
 		PlanStatusOrchestrating: "orchestrating",
@@ -118,14 +133,43 @@ type DesignPlan struct {
 	PlanFile               string
 	Todos                  []PlanTodo
 	RiskSummary            []string
-	ClarificationNeeded    bool
 	ClarificationQuestions []string
 	Assumptions            []string
 	UserResponse           string
-	ReadyDirective         *guide.ResponseDirective // Set when plan reaches Ready status.
 	UpdatedAt              time.Time
 	CreatedAt              time.Time
 	CompletedAt            time.Time
+
+	// Distributed lifecycle fields for epoch-based stale detection and lease management.
+	Epoch       uint64    `json:"epoch"`
+	LeaseExpiry time.Time `json:"lease_expiry"`
+	LeaseHolder string    `json:"lease_holder,omitempty"`
+
+	// sm is not serialized; reconstructed on restore or creation.
+	sm *PlanStateMachine `json:"-"`
+}
+
+// SM returns the plan's state machine, lazily initializing from the
+// current Status if needed (e.g. after JSON deserialization).
+func (p *DesignPlan) SM() *PlanStateMachine {
+	if p.sm == nil {
+		p.sm = NewPlanStateMachine(p.ID, p.Status)
+	}
+	return p.sm
+}
+
+// ReadyDirective returns a ResponseDirective when the plan is in Ready
+// state, nil otherwise. This is a derived value — no stored field.
+func (p *DesignPlan) ReadyDirective() *guide.ResponseDirective {
+	if p.SM().State() != PlanStatusReady {
+		return nil
+	}
+	return readyPlanDirective(p.ID, p.SM().Epoch())
+}
+
+// IsClarifying returns true when the plan is waiting for user clarification.
+func (p *DesignPlan) IsClarifying() bool {
+	return p.SM().State() == PlanStatusClarifying
 }
 
 // ResponseText implements the guide-layer text extraction interface so the
@@ -135,6 +179,16 @@ func (p *DesignPlan) ResponseText() string {
 		return ""
 	}
 	return p.UserResponse
+}
+
+// ResponseDirective implements the guide-layer directiveCarrier interface so
+// the Guide can extract the directive from a RouteResponse as a fallback when
+// the STREAM_COMPLETE event carrying the directive is lost.
+func (p *DesignPlan) ResponseDirective() *guide.ResponseDirective {
+	if p == nil {
+		return nil
+	}
+	return p.ReadyDirective()
 }
 
 type PlanConstraints struct {

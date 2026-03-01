@@ -19,22 +19,47 @@ type clarificationContext struct {
 }
 
 func (r *planningProtocolRunner) stepClarify() (bool, error) {
-	decision := r.architect.clarificationDecisionForRequest(r.ctx, r.request, r.plan.Requirements)
-	if !decision.Needed {
-		r.plan.ClarificationNeeded = false
-		r.plan.ClarificationQuestions = nil
-		r.plan.Assumptions = nil
-		r.plan.UserResponse = ""
+	if shouldSkipClarification(r.request) {
 		return false, nil
 	}
-	r.plan.ClarificationNeeded = true
-	r.plan.ClarificationQuestions = decision.Questions
-	r.plan.Assumptions = decision.Assumptions
-	r.plan.UserResponse = r.architect.clarificationUserResponse(r.ctx, r.request, r.plan.Requirements, decision)
+	request := r.buildClarifyDecisionRequest()
+	request.OnChunk = func(text string) {
+		r.architect.publishPlanStreamChunk(r.ctx, text)
+	}
+	response, err := r.architect.composeUserFacingResponse(r.ctx, request)
+	if err != nil {
+		// LLM unavailable — skip clarification, proceed with planning.
+		return false, nil
+	}
+	// The ask_user_question skill handler populates ClarificationQuestions
+	// on the plan when invoked during the tool loop. If the LLM decided
+	// not to ask, the slice stays empty.
+	if len(r.plan.ClarificationQuestions) == 0 {
+		return false, nil
+	}
+	r.plan.UserResponse = response
 	r.plan.RiskSummary = append(r.plan.RiskSummary, "planning paused pending user clarification")
-	r.plan.Status = PlanStatusPending
-	r.plan.UpdatedAt = time.Now()
-	return true, r.architect.persistPlanState(r.plan)
+	if err := r.transition(PlanStatusClarifying); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *planningProtocolRunner) buildClarifyDecisionRequest() plannerConversationRequest {
+	requirements := requirementsFromPlan(r.plan)
+	return plannerConversationRequest{
+		Mode:                    plannerConversationModeClarifyDecision,
+		UserQuery:               reqQuery(r.request),
+		PriorQuery:              requirementsQuery(requirements),
+		Scope:                   requirementsScope(requirements),
+		RecommendationNarrative: clarificationRecommendationNarrative(requirements),
+		Recommendations:         clarificationRecommendationItems(requirements),
+		Tradeoffs:               clarificationTradeoffItems(requirements),
+		Assumptions:             assumptionsFromPlan(r.plan),
+		ClarificationQuestions:  clarificationQuestionsFromMetadata(requirements),
+		SessionID:               reqSessionID(r.request),
+		ConversationHistory:     reqConversationHistory(r.request),
+	}
 }
 
 func (a *Architect) clarificationDecisionForRequest(
@@ -54,6 +79,9 @@ func (a *Architect) clarificationDecisionForRequest(
 	if len(questions) == 0 {
 		return clarificationDecision{}
 	}
+	if !requiresClarification(requirements) {
+		return clarificationDecision{}
+	}
 	limit := a.clarificationQuestionLimit()
 	assumptions := clarificationAssumptionsFromMetadata(requirements)
 	return clarificationDecision{
@@ -63,8 +91,37 @@ func (a *Architect) clarificationDecisionForRequest(
 	}
 }
 
+// requiresClarification returns true only when the analysis produced
+// significantly more uncertainty signals than well-defined goals. The
+// ratio of ambiguity signals (clarification questions + unknowns) to
+// goals determines whether clarification is warranted — we only
+// clarify when unknowns outweigh knowns. This prevents trivially
+// simple requests (e.g. "hello world Python script") from entering
+// clarification mode when the LLM speculatively generates questions
+// as part of thorough analysis.
+func requiresClarification(requirements *Requirements) bool {
+	if requirements == nil {
+		return false
+	}
+	goals := len(requirements.Goals)
+	if goals == 0 {
+		return true
+	}
+	questions := len(clarificationQuestionsFromMetadata(requirements))
+	unknowns := len(unknownsFromMetadata(requirements))
+	ambiguitySignals := questions + unknowns
+	return ambiguitySignals > goals
+}
+
+func unknownsFromMetadata(requirements *Requirements) []string {
+	if requirements == nil || requirements.Metadata == nil {
+		return nil
+	}
+	return stringSliceFromAny(requirements.Metadata["unknowns"])
+}
+
 func ctxOrBackground(ctx context.Context) context.Context {
-	if ctx != nil {
+	if ctx != nil && ctx.Err() == nil {
 		return ctx
 	}
 	return context.Background()
@@ -300,6 +357,34 @@ func (a *Architect) clarificationContextForRequest(req *ArchitectRequest) clarif
 		ctx.PriorQuery = plan.Query
 	}
 	return ctx
+}
+
+// latestConsultingPlan returns the most recently updated plan in Consulting
+// state for the given session. Used by the ask_user_question skill handler
+// to attach clarification questions to the in-flight plan.
+func (a *Architect) latestConsultingPlan(sessionID string) *DesignPlan {
+	if a == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return nil
+	}
+	a.activePlansMu.RLock()
+	defer a.activePlansMu.RUnlock()
+	var best *DesignPlan
+	for _, plan := range a.activePlans {
+		if plan == nil || plan.SM().State() != PlanStatusConsulting {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
+			continue
+		}
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	return best
 }
 
 func (a *Architect) latestHistoricalPlanForSession(sessionID string) *DesignPlan {

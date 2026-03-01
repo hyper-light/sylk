@@ -23,6 +23,9 @@ const (
 	EvictCaches           Signal = "evict_caches"
 	CompactContexts       Signal = "compact_contexts"
 	MemoryPressureChanged Signal = "memory_pressure_changed"
+
+	// Time pressure signal — agent approaching operation deadline.
+	TimePressure Signal = "time_pressure"
 )
 
 // SignalMessage represents a signal sent through the bus.
@@ -76,6 +79,7 @@ func ValidSignals() []Signal {
 		EvictCaches,
 		CompactContexts,
 		MemoryPressureChanged,
+		TimePressure,
 	}
 }
 
@@ -103,6 +107,19 @@ type MemoryPressurePayload struct {
 	To        string
 	Usage     float64
 	Timestamp time.Time
+}
+
+// TimePressurePayload carries context for user-facing degradation decisions.
+// Emitted when an agent's operation deadline is approaching (remaining < 20%
+// of total budget). The UI presents options; the user decides.
+type TimePressurePayload struct {
+	AgentID    string        `json:"agent_id"`
+	AgentType  string        `json:"agent_type"`
+	Operation  string        `json:"operation"`
+	Elapsed    time.Duration `json:"elapsed"`
+	Remaining  time.Duration `json:"remaining"`
+	Stage      string        `json:"stage"`
+	Suggestion string        `json:"suggestion"`
 }
 
 // NewSignalMessage creates a new signal message with defaults.

@@ -105,3 +105,73 @@ func TestLatest_Bounded(t *testing.T) {
 		t.Errorf("expected exactly 3 entries in latest, got %d", count)
 	}
 }
+
+func TestNotifyCredentialChanged_NormalizesMethod(t *testing.T) {
+	reg, published := newTestRegistry(map[string]string{
+		"openai": "key",
+	})
+
+	// Login panel sends "apikey" without underscore.
+	reg.NotifyCredentialChanged("openai", "apikey")
+
+	if len(*published) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(*published))
+	}
+	ev := (*published)[0]
+	if ev.AuthMethod != "api_key" {
+		t.Errorf("expected normalized 'api_key', got %q", ev.AuthMethod)
+	}
+}
+
+func TestActiveMethod_ReturnsCurrentMethod(t *testing.T) {
+	reg, _ := newTestRegistry(map[string]string{
+		"google": "gkey",
+	})
+
+	// Before any probe, ActiveMethod returns "".
+	if m := reg.ActiveMethod("google"); m != "" {
+		t.Errorf("expected empty before probe, got %q", m)
+	}
+
+	reg.ProbeAll()
+
+	// After probe, ActiveMethod returns the stored method.
+	m := reg.ActiveMethod("google")
+	if m == "" {
+		t.Error("expected non-empty method after probe")
+	}
+
+	// Unknown provider returns "".
+	if m := reg.ActiveMethod("nonexistent"); m != "" {
+		t.Errorf("expected empty for unknown provider, got %q", m)
+	}
+}
+
+func TestActiveMethod_UnavailableReturnsEmpty(t *testing.T) {
+	reg, _ := newTestRegistry(map[string]string{})
+
+	reg.NotifyCredentialChanged("google", "oauth")
+
+	// Probe returns false — credentials unavailable.
+	if m := reg.ActiveMethod("google"); m != "" {
+		t.Errorf("expected empty for unavailable provider, got %q", m)
+	}
+}
+
+func TestNormalizeMethod(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"apikey", "api_key"},
+		{"api_key", "api_key"},
+		{"oauth", "oauth"},
+		{"chatgpt", "chatgpt"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := normalizeMethod(tt.input); got != tt.want {
+			t.Errorf("normalizeMethod(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}

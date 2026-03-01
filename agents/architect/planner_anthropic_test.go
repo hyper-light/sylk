@@ -525,8 +525,8 @@ func TestStreamRequest_PartialTextOnTimeout(t *testing.T) {
 	if sr.Text != "partial plan content" {
 		t.Fatalf("Text = %q, want partial plan content", sr.Text)
 	}
-	if sr.StopReason != providers.StopReasonMaxTokens {
-		t.Fatalf("StopReason = %q, want %q (timeout treated as truncation)", sr.StopReason, providers.StopReasonMaxTokens)
+	if sr.StopReason != providers.StopReasonError {
+		t.Fatalf("StopReason = %q, want %q (timeout preserved as error for continuation triage)", sr.StopReason, providers.StopReasonError)
 	}
 }
 

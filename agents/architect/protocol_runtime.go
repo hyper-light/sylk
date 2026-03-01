@@ -3,7 +3,9 @@ package architect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,31 +13,102 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/resources"
 	"github.com/google/uuid"
 )
 
+// stageCost classifies the minimum time a protocol step needs to do useful work.
+type stageCost int
+
+const (
+	stageCostLocal        stageCost = iota // in-memory only, negligible duration
+	stageCostLLM                           // LLM API call(s), reserves LLMRequestTimeout
+	stageCostConsultation                  // bus consultation, reserves ConsultationTimeout
+)
+
+// errBudgetExhausted is a sentinel indicating the operation's remaining time
+// cannot satisfy the current step's reservation plus all downstream reserves.
+var errBudgetExhausted = errors.New("operation budget exhausted")
+
+// budgetExhaustedError carries diagnostic context for budget failures.
+type budgetExhaustedError struct {
+	step              string
+	remaining         time.Duration
+	stepReservation   time.Duration
+	downstreamReserve time.Duration
+}
+
+func (e *budgetExhaustedError) Error() string {
+	return fmt.Sprintf("%s: remaining %s < step reservation %s + downstream reserve %s",
+		e.step,
+		e.remaining.Truncate(time.Millisecond),
+		e.stepReservation.Truncate(time.Millisecond),
+		e.downstreamReserve.Truncate(time.Millisecond))
+}
+
+func (e *budgetExhaustedError) Unwrap() error { return errBudgetExhausted }
+
 func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectRequest) (*DesignPlan, error) {
+	a.logInfo("runPlanningProtocol: entry",
+		"query", truncateString(req.Query, 120),
+		"session_id", req.SessionID,
+		"intent", string(req.Intent),
+		"ctx_deadline", contextDeadlineString(ctx))
+
 	req = a.enrichPlanningRequest(req)
 	plan := newProtocolPlan(req)
 	a.persistPlanState(plan)
-	plannerCtx := withPlannerThoughtCallback(ctx, func(stage string, thought string) {
-		a.publishPlanThought(ctx, stage, thought)
+
+	// Derive operation budget from model parameters (no magic numbers).
+	// stages * budgetLevels * perRequestTimeout
+	opTimeout := a.operationTimeout()
+	a.logInfo("runPlanningProtocol: operation timeout derived",
+		"plan_id", plan.ID,
+		"op_timeout", opTimeout.String(),
+		"llm_request_timeout", a.config.LLMRequestTimeout.String())
+	propagator := &resources.DeadlinePropagator{CleanupBuffer: 5 * time.Second}
+	opCtx, opCancel := propagator.Propagate(ctx, opTimeout)
+	defer opCancel()
+
+	a.logInfo("runPlanningProtocol: op context created",
+		"plan_id", plan.ID,
+		"op_ctx_deadline", contextDeadlineString(opCtx))
+
+	// Reset per-operation state: budget for fraction computation, pressure
+	// debounce flag so each operation gets at most one TimePressure signal.
+	a.resetPlannerOperationState(opTimeout)
+
+	plannerCtx := withPlannerThoughtCallback(opCtx, func(stage string, thought string) {
+		a.publishPlanThought(opCtx, stage, thought)
 	})
 	plannerCtx = withStreamRetryResetEmitter(plannerCtx, func() {
-		a.publishPlanStreamStart(ctx)
+		a.publishPlanStreamStart(opCtx)
 	})
 	diag := openProtocolDiagnostics(plan.ID, a.config.WorkingDirectory)
 	defer diag.close()
-	diag.log("protocol start plan=%s query=%q planner_available=%v",
-		plan.ID, req.Query, a.ensurePlanner() != nil)
+	diag.log("protocol start plan=%s query=%q planner_available=%v op_timeout=%v",
+		plan.ID, req.Query, a.ensurePlanner(ctx) != nil, opTimeout)
 	runner := &planningProtocolRunner{architect: a, ctx: plannerCtx, request: req, plan: plan, diag: diag}
+	protocolStart := time.Now()
 	if err := runner.run(); err != nil {
-		diag.log("protocol FAILED: %v", err)
+		elapsed := time.Since(protocolStart)
+		diag.log("protocol FAILED after %v: %v", elapsed, err)
+		a.logWarn("runPlanningProtocol: FAILED",
+			"plan_id", plan.ID,
+			"elapsed", elapsed.String(),
+			"err", err)
 		return a.failAndPersistPlan(plan, err)
 	}
 	plan.CompletedAt = time.Now()
 	a.persistPlanState(plan)
-	diag.log("protocol complete tasks=%d components=%d", len(plan.Tasks), len(plan.Architecture.Components))
+	elapsed := time.Since(protocolStart)
+	diag.log("protocol complete elapsed=%v tasks=%d components=%d",
+		elapsed, len(plan.Tasks), len(plan.Architecture.Components))
+	a.logInfo("runPlanningProtocol: complete",
+		"plan_id", plan.ID,
+		"elapsed", elapsed.String(),
+		"tasks", len(plan.Tasks),
+		"status", plan.SM().State().String())
 	return plan, nil
 }
 
@@ -106,10 +179,12 @@ func (a *Architect) priorSessionContext(sessionID string) map[string]any {
 
 func newProtocolPlan(req *ArchitectRequest) *DesignPlan {
 	if req == nil {
-		return &DesignPlan{ID: uuid.NewString(), Status: PlanStatusFailed, Error: "nil request"}
+		plan := &DesignPlan{ID: uuid.NewString(), Status: PlanStatusFailed, Error: "nil request"}
+		plan.sm = NewPlanStateMachine(plan.ID, PlanStatusFailed)
+		return plan
 	}
 	now := time.Now()
-	return &DesignPlan{
+	plan := &DesignPlan{
 		ID:            uuid.NewString(),
 		SessionID:     req.SessionID,
 		Query:         req.Query,
@@ -120,6 +195,8 @@ func newProtocolPlan(req *ArchitectRequest) *DesignPlan {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
+	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusPending)
+	return plan
 }
 
 func (a *Architect) failAndPersistPlan(plan *DesignPlan, err error) (*DesignPlan, error) {
@@ -174,36 +251,162 @@ func (d *protocolDiagnostics) close() {
 }
 
 func (r *planningProtocolRunner) run() error {
-	if err := r.stepAnalyze(); err != nil {
+	steps := r.allStepsWithCosts()
+	// Analyze (0), Consult (1).
+	for i := range 2 {
+		if err := r.runStepAt(steps, i); err != nil {
+			return err
+		}
+	}
+	// Clarify (2) — returns (bool, error), handled inline.
+	if err := r.checkReservation(steps, 2); err != nil {
 		return err
 	}
-	if err := r.stepConsult(); err != nil {
-		return err
-	}
+	r.diag.log("stepClarify: START")
+	clarifyStart := time.Now()
 	needsClarification, err := r.stepClarify()
+	r.diag.log("stepClarify: END elapsed=%v needs_clarification=%v err=%v",
+		time.Since(clarifyStart), needsClarification, err)
 	if err != nil {
 		return err
 	}
 	if needsClarification {
 		return nil
 	}
-	for _, step := range r.remainingExecutionSteps() {
-		if err := step(); err != nil {
+	// Execution steps (3..7).
+	for i := 3; i < len(steps); i++ {
+		if err := r.runStepAt(steps, i); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *planningProtocolRunner) remainingExecutionSteps() []func() error {
-	return []func() error{
-		r.stepDesign,
-		r.stepGenerate,
-		r.stepWorkflow,
-		r.stepValidate,
-		r.stepReady,
-		r.stepAutoHandoff,
+type namedStep struct {
+	name string
+	fn   func() error
+	cost stageCost
+}
+
+// allStepsWithCosts is the single source of truth for the protocol step
+// sequence and each step's cost classification.
+// stepMaybeAutoHandoff is removed — the LLM handles auto-handoff by
+// reading approval_required in the stepReady tool loop and invoking
+// route_plan_acceptance when appropriate.
+func (r *planningProtocolRunner) allStepsWithCosts() []namedStep {
+	return []namedStep{
+		{"stepAnalyze", r.stepAnalyze, stageCostLLM},
+		{"stepConsult", r.stepConsult, stageCostConsultation},
+		{"stepClarify", nil, stageCostLLM}, // handled inline (bool return)
+		{"stepDesign", r.stepDesign, stageCostLLM},
+		{"stepGenerate", r.stepGenerate, stageCostLLM},
+		{"stepWorkflow", r.stepWorkflow, stageCostLocal},
+		{"stepValidate", r.stepValidate, stageCostLocal},
+		{"stepReady", r.stepReady, stageCostLLM},
 	}
+}
+
+// reservationForCost resolves a cost class to a config-derived duration.
+func (r *planningProtocolRunner) reservationForCost(cost stageCost) time.Duration {
+	switch cost {
+	case stageCostLLM:
+		return r.architect.config.LLMRequestTimeout
+	case stageCostConsultation:
+		return r.architect.config.ConsultationTimeout
+	default:
+		return 0
+	}
+}
+
+// downstreamReserve sums the minimum reservations for all steps after idx.
+func (r *planningProtocolRunner) downstreamReserve(steps []namedStep, idx int) time.Duration {
+	var total time.Duration
+	for i := idx + 1; i < len(steps); i++ {
+		total += r.reservationForCost(steps[i].cost)
+	}
+	return total
+}
+
+// remainingBudget returns the time remaining until the operation context's
+// deadline. Returns math.MaxInt64 nanoseconds when no deadline is set.
+func (r *planningProtocolRunner) remainingBudget() time.Duration {
+	deadline, ok := r.ctx.Deadline()
+	if !ok {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Until(deadline)
+}
+
+// checkReservation verifies sufficient budget for step at idx plus all
+// downstream steps. Used for inline steps (e.g. clarify) that cannot
+// go through runStepAt.
+func (r *planningProtocolRunner) checkReservation(steps []namedStep, idx int) error {
+	stepRes := r.reservationForCost(steps[idx].cost)
+	downstream := r.downstreamReserve(steps, idx)
+	totalNeeded := stepRes + downstream
+	remaining := r.remainingBudget()
+	if totalNeeded > 0 && remaining < totalNeeded {
+		return &budgetExhaustedError{
+			step:              steps[idx].name,
+			remaining:         remaining,
+			stepReservation:   stepRes,
+			downstreamReserve: downstream,
+		}
+	}
+	return nil
+}
+
+// runStepAt runs the step at the given index after checking budget reserves.
+func (r *planningProtocolRunner) runStepAt(steps []namedStep, idx int) error {
+	step := steps[idx]
+	downstream := r.downstreamReserve(steps, idx)
+	return r.runStep(step.name, step.fn, step.cost, downstream)
+}
+
+// runStep checks the deadline reservation and, if sufficient budget remains,
+// executes fn under the operation context. No child context is created —
+// the existing timeout hierarchy (provider per-request, continuation AIMD,
+// DeadlinePropagator) handles upper bounds.
+func (r *planningProtocolRunner) runStep(name string, fn func() error, cost stageCost, downstream time.Duration) error {
+	stepReservation := r.reservationForCost(cost)
+	totalNeeded := stepReservation + downstream
+	remaining := r.remainingBudget()
+	if totalNeeded > 0 && remaining < totalNeeded {
+		err := &budgetExhaustedError{
+			step:              name,
+			remaining:         remaining,
+			stepReservation:   stepReservation,
+			downstreamReserve: downstream,
+		}
+		r.diag.log("%s: BUDGET EXHAUSTED %v", name, err)
+		r.architect.logWarn("protocol.runStep: budget exhausted",
+			"step", name,
+			"plan_id", r.plan.ID,
+			"remaining", remaining.String(),
+			"step_reservation", stepReservation.String(),
+			"downstream_reserve", downstream.String())
+		return err
+	}
+
+	r.diag.log("%s: START ctx_deadline=%s remaining=%v reservation=%v downstream=%v",
+		name, contextDeadlineString(r.ctx),
+		remaining.Truncate(time.Millisecond), stepReservation, downstream)
+	r.architect.logInfo("protocol.runStep: START",
+		"step", name,
+		"plan_id", r.plan.ID,
+		"plan_status", r.plan.SM().State().String(),
+		"remaining", remaining.String(),
+		"ctx_deadline", contextDeadlineString(r.ctx))
+	start := time.Now()
+	err := fn()
+	elapsed := time.Since(start)
+	r.diag.log("%s: END elapsed=%v err=%v ctx_deadline=%s", name, elapsed, err, contextDeadlineString(r.ctx))
+	r.architect.logInfo("protocol.runStep: END",
+		"step", name,
+		"plan_id", r.plan.ID,
+		"elapsed", elapsed.String(),
+		"err", err)
+	return err
 }
 
 func (r *planningProtocolRunner) stepAnalyze() error {
@@ -228,13 +431,28 @@ func (r *planningProtocolRunner) stepConsult() error {
 	if err := r.transition(PlanStatusConsulting); err != nil {
 		return err
 	}
-	r.diag.log("stepConsult: enforcing consultation gate")
+	r.diag.log("stepConsult: enforcing consultation gate mandatory=%v bus_available=%v",
+		r.architect.config.MandatoryConsultation, r.architect.bus != nil && r.architect.running)
+	r.architect.logInfo("stepConsult: enforcing consultation gate",
+		"plan_id", r.plan.ID,
+		"mandatory", r.architect.config.MandatoryConsultation,
+		"consultation_timeout", r.architect.config.ConsultationTimeout.String(),
+		"ctx_deadline", contextDeadlineString(r.ctx))
+	gateStart := time.Now()
 	if err := r.architect.enforceConsultationGate(r.ctx, r.plan, r.request); err != nil {
-		r.diag.log("stepConsult: consultation gate FAILED: %v", err)
+		r.diag.log("stepConsult: consultation gate FAILED after %v: %v", time.Since(gateStart), err)
+		r.architect.logWarn("stepConsult: consultation gate FAILED",
+			"plan_id", r.plan.ID,
+			"elapsed", time.Since(gateStart).String(),
+			"err", err)
 		return err
 	}
-	r.diag.log("stepConsult: consultation gate passed consultations=%d",
-		len(r.plan.Consultations))
+	r.diag.log("stepConsult: consultation gate passed after %v consultations=%d",
+		time.Since(gateStart), len(r.plan.Consultations))
+	r.architect.logInfo("stepConsult: consultation gate passed",
+		"plan_id", r.plan.ID,
+		"elapsed", time.Since(gateStart).String(),
+		"consultations", len(r.plan.Consultations))
 	// Extract librarian patterns from the gate evidence rather than
 	// issuing a redundant second consultation request.
 	r.plan.CodebasePatterns = extractLibrarianPatterns(r.plan)
@@ -383,23 +601,41 @@ func (r *planningProtocolRunner) stepReady() error {
 	if err := r.transition(PlanStatusReady); err != nil {
 		return err
 	}
+	// Grant ready lease so the reaper knows when this plan becomes stale.
+	if r.architect.leaseManager != nil {
+		r.architect.leaseManager.GrantReadyLease(r.plan)
+	}
 	// Publish full plan snapshot for the inline chat widget.
 	r.architect.publishPlanSnapshot(r.ctx, r.plan)
 	// Stream LLM commentary + readiness footer token-by-token.
+	r.diag.log("stepReady: composing user response via LLM ctx_deadline=%s", contextDeadlineString(r.ctx))
+	r.architect.logInfo("stepReady: composing user response via LLM",
+		"plan_id", r.plan.ID,
+		"ctx_deadline", contextDeadlineString(r.ctx),
+		"tasks", len(r.plan.Tasks))
+	llmStart := time.Now()
 	r.plan.UserResponse = r.architect.readyUserResponseInline(r.ctx, r.request, r.plan)
-	// Set the response directive so the Guide enters plan-approval phase.
-	r.plan.ReadyDirective = &guide.ResponseDirective{
-		Phase:    guide.PhasePlanApproval,
-		AgentID:  "architect",
-		Metadata: map[string]any{"plan_id": r.plan.ID},
-		TTL:      readyPlanMaxAge,
-	}
+	r.diag.log("stepReady: LLM response complete elapsed=%v len=%d",
+		time.Since(llmStart), len(r.plan.UserResponse))
+	r.architect.logInfo("stepReady: LLM response complete",
+		"plan_id", r.plan.ID,
+		"elapsed", time.Since(llmStart).String(),
+		"response_len", len(r.plan.UserResponse))
+	// ReadyDirective is now derived from SM state — no explicit assignment.
+	r.diag.log("stepReady: plan in Ready state, directive derived plan_id=%s", r.plan.ID)
 	return r.architect.persistPlanState(r.plan)
 }
 
 func (r *planningProtocolRunner) stepAutoHandoff() error {
+	r.architect.logInfo("stepAutoHandoff: entry",
+		"plan_id", r.plan.ID,
+		"running", r.architect.running,
+		"bus_available", r.architect.bus != nil,
+		"ctx_deadline", contextDeadlineString(r.ctx))
 	if !r.architect.running || r.architect.bus == nil {
 		r.diag.log("stepAutoHandoff: bus unavailable, plan stays Ready")
+		r.architect.logWarn("stepAutoHandoff: bus unavailable, plan stays Ready",
+			"plan_id", r.plan.ID)
 		r.architect.publishPlanStreamChunk(r.ctx,
 			"\n\nOrchestrator bus is unavailable — plan stays ready. Say **go ahead** to retry.")
 		return nil
@@ -419,6 +655,10 @@ func (r *planningProtocolRunner) stepAutoHandoff() error {
 	// so the TUI switches to "orchestrator" while the orchestrator processes.
 	orchCID := "corr_" + uuid.NewString()
 	originalCID := originalCIDFromContext(r.ctx)
+	r.architect.logInfo("stepAutoHandoff: emitting reroute + calling requestRouteSync",
+		"plan_id", r.plan.ID,
+		"original_cid", originalCID,
+		"orch_cid", orchCID)
 	r.architect.publishHandoffReroute(r.ctx, "orchestrator", originalCID, orchCID)
 
 	request := &guide.RouteRequest{
@@ -428,10 +668,19 @@ func (r *planningProtocolRunner) stepAutoHandoff() error {
 		SessionID:     r.plan.SessionID,
 	}
 
+	handoffStart := time.Now()
 	response, err := r.architect.requestRouteSync(r.ctx, request)
+	r.architect.logInfo("stepAutoHandoff: requestRouteSync returned",
+		"plan_id", r.plan.ID,
+		"elapsed", time.Since(handoffStart).String(),
+		"has_response", response != nil,
+		"err", err)
 	if err != nil {
-		r.architect.logWarn("stepAutoHandoff: route failed", "plan_id", r.plan.ID, "error", err)
-		r.diag.log("stepAutoHandoff: route failed: %v", err)
+		r.architect.logWarn("stepAutoHandoff: route failed",
+			"plan_id", r.plan.ID,
+			"elapsed", time.Since(handoffStart).String(),
+			"error", err)
+		r.diag.log("stepAutoHandoff: route failed after %v: %v", time.Since(handoffStart), err)
 		r.architect.publishPlanStreamChunk(r.ctx,
 			"\n\nHandoff to orchestrator failed: "+err.Error()+"\nSay **go ahead** to retry.")
 		return nil
@@ -450,12 +699,8 @@ func (r *planningProtocolRunner) stepAutoHandoff() error {
 	summary := summarizeAutoHandoffResponse(response)
 	r.diag.log("stepAutoHandoff: success: %s", summary)
 
-	// Clear the ReadyDirective so the guide does not enter PhasePlanApproval
-	// for a plan that is already executing. Without this, the next user
-	// message would be phase-classified as plan approval/feedback instead of
-	// flowing through normal classification.
-	r.plan.ReadyDirective = nil
-
+	// ReadyDirective is derived from SM state — transitions to Executing
+	// automatically makes ReadyDirective() return nil.
 	if err := r.transition(PlanStatusExecuting); err != nil {
 		return err
 	}
@@ -526,7 +771,11 @@ func extractHandoffUserResponse(data any) string {
 }
 
 func (r *planningProtocolRunner) transition(status PlanStatus) error {
-	r.plan.Status = status
+	if err := r.plan.SM().TransitionTo(status, r.plan); err != nil {
+		return err
+	}
+	r.plan.Status = r.plan.SM().State() // sync cache for JSON
+	r.plan.Epoch = r.plan.SM().Epoch()  // sync epoch for JSON
 	r.plan.UpdatedAt = time.Now()
 	r.architect.publishPlanStreamProgress(r.ctx, status)
 	return r.architect.persistPlanState(r.plan)
@@ -713,6 +962,8 @@ func (a *Architect) restorePersistedPlans() error {
 			continue
 		}
 		if restored >= restoreMaxPlans {
+			// Delete files beyond the cap to prevent unbounded disk growth.
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
 			skipped++
 			continue
 		}
@@ -743,13 +994,19 @@ func (a *Architect) restorePlanFromFile(path string, cutoff time.Time) (bool, er
 	if strings.TrimSpace(plan.ID) == "" {
 		return false, fmt.Errorf("restored plan missing id")
 	}
-	// Skip terminal-state plans and plans older than cutoff.
-	if plan.Status == PlanStatusFailed || plan.Status == PlanStatusExecuting {
+	// Skip terminal-state plans, actively executing plans, and stale ready/completed
+	// plans. Ready plans from prior sessions are stale artifacts — the Guide's phase
+	// gate (which arms plan approval) is in-memory-only and lost on restart.
+	switch plan.Status {
+	case PlanStatusFailed, PlanStatusExecuting, PlanStatusReady, PlanStatusCompleted:
+		_ = os.Remove(path) // Proactively clean up terminal/stale plan files.
 		return false, nil
 	}
 	if plan.UpdatedAt.Before(cutoff) {
+		_ = os.Remove(path) // Proactively clean up old plan files.
 		return false, nil
 	}
+	plan.sm = NewPlanStateMachineWithEpoch(plan.ID, plan.Status, plan.Epoch)
 	a.logInfo("restorePlanFromFile",
 		"plan_id", plan.ID,
 		"status", plan.Status.String(),

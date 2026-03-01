@@ -30,7 +30,7 @@ func main() {
 		SessionID:    "test-session-123",
 	}
 
-	g, _ := guide.NewWithGeminiClient(client, cfg)
+	g, _ := guide.NewWithProvider(client, "gemini-3.1-pro-preview", cfg)
 
 	prompt := "Hello! Can you help me out?"
 	req := &guide.RouteRequest{

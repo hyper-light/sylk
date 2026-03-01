@@ -79,6 +79,7 @@ type Result struct {
 	Success   bool   `json:"success"`
 	Data      any    `json:"data,omitempty"`
 	Error     string `json:"error,omitempty"`
+	Err       error  `json:"-"` // typed error preserved for sentinel checks
 }
 
 // =============================================================================
@@ -516,6 +517,7 @@ func (r *Registry) Invoke(ctx context.Context, name string, input json.RawMessag
 			SkillName: name,
 			Success:   false,
 			Error:     err.Error(),
+			Err:       err,
 		}
 	}
 

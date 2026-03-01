@@ -16,12 +16,12 @@ import (
 // It wraps the ActivityEventBus to provide type-safe event publishing
 // for tool calls, results, and timeouts.
 type ToolEventPublisher struct {
-	bus *events.ActivityEventBus
+	bus events.ActivityPublisher
 }
 
 // NewToolEventPublisher creates a new ToolEventPublisher.
 // The bus parameter must not be nil.
-func NewToolEventPublisher(bus *events.ActivityEventBus) *ToolEventPublisher {
+func NewToolEventPublisher(bus events.ActivityPublisher) *ToolEventPublisher {
 	return &ToolEventPublisher{
 		bus: bus,
 	}
@@ -54,7 +54,7 @@ func (p *ToolEventPublisher) PublishToolCall(sessionID, agentID, toolName string
 		},
 	}
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -86,7 +86,7 @@ func (p *ToolEventPublisher) PublishToolResult(sessionID, agentID, toolName stri
 		},
 	}
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -118,11 +118,11 @@ func (p *ToolEventPublisher) PublishToolTimeout(sessionID, agentID, toolName str
 		},
 	}
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
-// Bus returns the underlying event bus.
-func (p *ToolEventPublisher) Bus() *events.ActivityEventBus {
+// Bus returns the underlying activity publisher.
+func (p *ToolEventPublisher) Bus() events.ActivityPublisher {
 	return p.bus
 }

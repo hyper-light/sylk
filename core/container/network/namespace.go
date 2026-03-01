@@ -35,27 +35,36 @@ type MessageSink interface {
 	Deliver(ctx context.Context, env *MessageEnvelope) error
 }
 
+// TelemetryObserver receives notifications after each Send attempt,
+// enabling cross-cutting telemetry (e.g. activity event emission)
+// without coupling individual publishers to the telemetry layer.
+type TelemetryObserver interface {
+	OnMessageSent(env *MessageEnvelope, err error)
+}
+
 // NetworkNamespace provides the shared communication space within a pod.
 // It enforces policy evaluation, rate limiting, circuit breaking, and
 // message authentication on all traffic.
 type NetworkNamespace struct {
-	mu              sync.RWMutex
-	podID           string
-	evaluator       *PolicyEvaluator
-	rateLimiters    map[string]*RateLimiter      // containerID → rate limiter
-	circuitBreakers map[string]*CircuitBreaker    // agentID → circuit breaker
-	auth            *MessageAuthenticator
-	sink            MessageSink
-	closed          bool
+	mu                sync.RWMutex
+	podID             string
+	evaluator         *PolicyEvaluator
+	rateLimiters      map[string]*RateLimiter      // containerID → rate limiter
+	circuitBreakers   map[string]*CircuitBreaker    // agentID → circuit breaker
+	auth              *MessageAuthenticator
+	sink              MessageSink
+	telemetryObserver TelemetryObserver
+	closed            bool
 }
 
 // NetworkNamespaceConfig provides construction parameters.
 type NetworkNamespaceConfig struct {
-	PodID           string
-	Policies        []*NetworkPolicy
-	Auth            *MessageAuthenticator
-	Sink            MessageSink
-	RateLimiterCfg  RateLimiterConfig
+	PodID             string
+	Policies          []*NetworkPolicy
+	Auth              *MessageAuthenticator
+	Sink              MessageSink
+	RateLimiterCfg    RateLimiterConfig
+	TelemetryObserver TelemetryObserver
 }
 
 // NewNetworkNamespace creates a network namespace for a pod.
@@ -66,12 +75,13 @@ func NewNetworkNamespace(cfg NetworkNamespaceConfig) *NetworkNamespace {
 		auth = NewMessageAuthenticator()
 	}
 	return &NetworkNamespace{
-		podID:           cfg.PodID,
-		evaluator:       evaluator,
-		rateLimiters:    make(map[string]*RateLimiter),
-		circuitBreakers: make(map[string]*CircuitBreaker),
-		auth:            auth,
-		sink:            cfg.Sink,
+		podID:             cfg.PodID,
+		evaluator:         evaluator,
+		rateLimiters:      make(map[string]*RateLimiter),
+		circuitBreakers:   make(map[string]*CircuitBreaker),
+		auth:              auth,
+		sink:              cfg.Sink,
+		telemetryObserver: cfg.TelemetryObserver,
 	}
 }
 
@@ -120,7 +130,9 @@ func (ns *NetworkNamespace) Send(ctx context.Context, env *MessageEnvelope) erro
 	if err := ns.signMessage(env); err != nil {
 		return err
 	}
-	return ns.deliver(ctx, env, cb)
+	err := ns.deliver(ctx, env, cb)
+	ns.emitTelemetry(env, err)
+	return err
 }
 
 func (ns *NetworkNamespace) checkRateLimit(rl *RateLimiter) error {
@@ -179,6 +191,13 @@ func (ns *NetworkNamespace) recordCircuitResult(cb *CircuitBreaker, err error) {
 		cb.RecordFailure()
 	} else {
 		cb.RecordSuccess()
+	}
+}
+
+// emitTelemetry notifies the telemetry observer after a Send attempt.
+func (ns *NetworkNamespace) emitTelemetry(env *MessageEnvelope, err error) {
+	if ns.telemetryObserver != nil {
+		ns.telemetryObserver.OnMessageSent(env, err)
 	}
 }
 

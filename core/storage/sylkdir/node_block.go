@@ -16,9 +16,10 @@ const (
 
 	// NodeHeaderSize is the fixed header size for binary node format.
 	// Layout: ID(4) + Domain(1) + Type(1) + CreatedBy(2) + CreatedAt(8) +
-	//         SessionID(4) + DocRef(4) + SupersededBy(4) + Supersedes(4)
-	// Total: 32 bytes (cache-line aligned, zero padding)
-	NodeHeaderSize = 32
+	//         SessionID(4) + DocRef(4) + SectionStart(4) + SectionEnd(4) +
+	//         SupersededBy(4) + Supersedes(4)
+	// Total: 40 bytes
+	NodeHeaderSize = 40
 
 	// MaxStringLen is the maximum length for a variable-length string field.
 	MaxStringLen = 65535
@@ -48,6 +49,10 @@ type Node struct {
 	// Document reference (many-to-one: multiple nodes → one document)
 	DocRef uint32 // Document ID from DocIDMap (0 = no document)
 
+	// Section within the parent document (1-indexed lines, 0 = whole document).
+	SectionStart uint32 // First line (inclusive); 0 means entire document
+	SectionEnd   uint32 // Last line (inclusive); 0 means entire document
+
 	// Content
 	Name      string // Human-readable name
 	Path      string // File path or URL
@@ -70,7 +75,7 @@ func (n *Node) BinarySize() int {
 }
 
 // MarshalBinary encodes the node to binary format.
-// Format: fixed 32-byte header + variable-length strings (length-prefixed).
+// Format: fixed 40-byte header + variable-length strings (length-prefixed).
 func (n *Node) MarshalBinary() ([]byte, error) {
 	buf := make([]byte, n.BinarySize())
 	n.MarshalBinaryTo(buf)
@@ -79,7 +84,7 @@ func (n *Node) MarshalBinary() ([]byte, error) {
 
 // MarshalBinaryTo encodes the node into the provided buffer (must be >= BinarySize()).
 func (n *Node) MarshalBinaryTo(buf []byte) {
-	// Write fixed header (32 bytes, zero padding)
+	// Write fixed header (40 bytes)
 	binary.LittleEndian.PutUint32(buf[0:4], n.ID)
 	buf[4] = n.Domain
 	buf[5] = n.NodeType
@@ -87,8 +92,10 @@ func (n *Node) MarshalBinaryTo(buf []byte) {
 	binary.LittleEndian.PutUint64(buf[8:16], n.CreatedAt)
 	binary.LittleEndian.PutUint32(buf[16:20], n.SessionID)
 	binary.LittleEndian.PutUint32(buf[20:24], n.DocRef)
-	binary.LittleEndian.PutUint32(buf[24:28], n.SupersededBy)
-	binary.LittleEndian.PutUint32(buf[28:32], n.Supersedes)
+	binary.LittleEndian.PutUint32(buf[24:28], n.SectionStart)
+	binary.LittleEndian.PutUint32(buf[28:32], n.SectionEnd)
+	binary.LittleEndian.PutUint32(buf[32:36], n.SupersededBy)
+	binary.LittleEndian.PutUint32(buf[36:40], n.Supersedes)
 
 	// Write variable-length strings
 	offset := NodeHeaderSize
@@ -105,7 +112,7 @@ func (n *Node) UnmarshalBinary(data []byte) error {
 		return ErrInvalidNodeData
 	}
 
-	// Read fixed header (32 bytes, zero padding)
+	// Read fixed header (40 bytes)
 	n.ID = binary.LittleEndian.Uint32(data[0:4])
 	n.Domain = data[4]
 	n.NodeType = data[5]
@@ -113,8 +120,10 @@ func (n *Node) UnmarshalBinary(data []byte) error {
 	n.CreatedAt = binary.LittleEndian.Uint64(data[8:16])
 	n.SessionID = binary.LittleEndian.Uint32(data[16:20])
 	n.DocRef = binary.LittleEndian.Uint32(data[20:24])
-	n.SupersededBy = binary.LittleEndian.Uint32(data[24:28])
-	n.Supersedes = binary.LittleEndian.Uint32(data[28:32])
+	n.SectionStart = binary.LittleEndian.Uint32(data[24:28])
+	n.SectionEnd = binary.LittleEndian.Uint32(data[28:32])
+	n.SupersededBy = binary.LittleEndian.Uint32(data[32:36])
+	n.Supersedes = binary.LittleEndian.Uint32(data[36:40])
 
 	// Read variable-length strings
 	offset := NodeHeaderSize

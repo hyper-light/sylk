@@ -33,7 +33,7 @@ func main() {
 	cfg.RouterConfig.Model = "gemini-3.1-pro-preview"
 	cfg.RouterConfig.ClassificationTimeout = 60 * 1000000000 // 60s timeout for thinking model
 	
-	g, _ := guide.NewWithGeminiClient(client, cfg)
+	g, _ := guide.NewWithProvider(client, "gemini-3.1-pro-preview", cfg)
 
 	prompts := []string{
 		"Hey, how do I use the DSL syntax to talk to the archivalist?",

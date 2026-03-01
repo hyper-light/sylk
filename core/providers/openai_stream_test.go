@@ -64,7 +64,7 @@ func TestOpenAIProviderGenerate_ChatGPTUsesCompletedResponse(t *testing.T) {
 	cfg.AuthMode = openAIAuthModeChatGPT
 	cfg.ChatGPTAccountID = "acct_123"
 
-	provider, err := NewOpenAIProvider(cfg)
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewOpenAIProvider() error = %v", err)
 	}
@@ -121,7 +121,7 @@ func TestOpenAIProviderStreamWithHandler_EmitsToolAndTextChunks(t *testing.T) {
 	cfg.APIKey = "test-api-key"
 	cfg.BaseURL = server.URL
 
-	provider, err := NewOpenAIProvider(cfg)
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewOpenAIProvider() error = %v", err)
 	}
@@ -209,7 +209,7 @@ func TestOpenAIProviderStreamWithHandler_EmitsReasoningChunks(t *testing.T) {
 	cfg.APIKey = "test-api-key"
 	cfg.BaseURL = server.URL
 
-	provider, err := NewOpenAIProvider(cfg)
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewOpenAIProvider() error = %v", err)
 	}
@@ -341,7 +341,7 @@ func TestOpenAIProviderGenerate_ChatGPTRetryOnUnauthorizedRefreshesAuth(t *testi
 	cfg.ChatGPTAccountID = "acct_123"
 	cfg.BaseURL = server.URL
 
-	provider, err := NewOpenAIProviderWithAuthService(cfg, authSvc)
+	provider, err := NewOpenAIProviderWithAuthService(context.Background(), cfg, authSvc)
 	if err != nil {
 		t.Fatalf("NewOpenAIProviderWithAuthService() error = %v", err)
 	}
@@ -390,7 +390,7 @@ func TestOpenAIProviderStreamWithHandler_ToolEndOrderByOutputIndex(t *testing.T)
 	cfg.APIKey = "test-api-key"
 	cfg.BaseURL = server.URL
 
-	provider, err := NewOpenAIProvider(cfg)
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("NewOpenAIProvider() error = %v", err)
 	}

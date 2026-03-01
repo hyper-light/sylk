@@ -1515,9 +1515,10 @@ func (g *GoogleProvider) buildGenerateConfig(req *Request) *genai.GenerateConten
 	if systemPrompt != "" {
 		systemParts = append(systemParts, genai.NewPartFromText(systemPrompt))
 	}
-	if len(g.skills) > 0 && len(req.Tools) == 0 {
+	if len(g.skills) > 0 && len(req.Tools) == 0 && !req.SkipProviderSkills {
 		// Only inject skill descriptions when native tool definitions are
-		// absent — prevents double-signaling that causes XML markup leakage.
+		// absent and the caller hasn't suppressed skills (e.g. classification
+		// requests need a focused prompt without the full skill catalogue).
 		systemParts = append(systemParts, genai.NewPartFromText(
 			skills.ToPrompt(g.skills),
 		))

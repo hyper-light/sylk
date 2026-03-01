@@ -76,7 +76,7 @@ func TestAllAgentsRegisterWithGuide(t *testing.T) {
 		{
 			name: "architect",
 			createAgent: func() (guide.AgentRouter, error) {
-				return architect.New(architect.Config{})
+				return architect.New(context.Background(), architect.Config{})
 			},
 			expectedID: "architect",
 		},
@@ -363,7 +363,7 @@ func TestMultipleAgentRegistration(t *testing.T) {
 			return archivalist.New(archivalist.Config{})
 		},
 		func() (guide.AgentRouter, error) {
-			return architect.New(architect.Config{})
+			return architect.New(context.Background(), architect.Config{})
 		},
 		func() (guide.AgentRouter, error) {
 			return inspGlobal.New(inspShared.GlobalInspectorConfig{}, nil)
@@ -489,7 +489,7 @@ func TestRoutingInfoCapabilities(t *testing.T) {
 		{
 			name: "architect_capabilities",
 			createAgent: func() (guide.AgentRouter, error) {
-				return architect.New(architect.Config{})
+				return architect.New(context.Background(), architect.Config{})
 			},
 			expectedIntents:  []guide.Intent{guide.IntentPlan, guide.IntentDesign},
 			expectedDomains:  []guide.Domain{guide.DomainDesign, guide.DomainTasks},
@@ -559,7 +559,7 @@ func TestAgentTriggersConfiguration(t *testing.T) {
 		{
 			name: "architect_triggers",
 			createAgent: func() (guide.AgentRouter, error) {
-				return architect.New(architect.Config{})
+				return architect.New(context.Background(), architect.Config{})
 			},
 			expectedStrongTrigs: []string{"plan", "design", "architect", "decompose"},
 			expectedIntentTrigs: map[guide.Intent][]string{

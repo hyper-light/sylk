@@ -13,6 +13,17 @@ import (
 
 var ErrPendingNotFound = errors.New("pending request not found")
 
+// isNonGuideHandoff returns true when a forwarded request was routed to a
+// non-guide agent, indicating that the self-response tool loop should yield
+// control via ErrRerouteRequested.
+func isNonGuideHandoff(g *Guide, forwarded *ForwardedRequest) bool {
+	if g == nil || forwarded == nil {
+		return false
+	}
+	pending := g.pending.Get(forwarded.CorrelationID)
+	return pending != nil && !g.isGuideTarget(pending.TargetAgentID)
+}
+
 type skillParams struct {
 	SessionID string `json:"session_id"`
 	AgentID   string `json:"agent_id"`
@@ -82,9 +93,17 @@ func routeSkill(g *Guide) *skills.Skill {
 				Input:         params.Input,
 				TargetAgentID: params.Target,
 				CorrelationID: params.CorrelationID,
+				SourceAgentID: g.agentID,
 				SessionID:     sessionID,
 			}
-			return g.RouteAndForward(ctx, request)
+			forwarded, err := g.RouteAndForward(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			if isNonGuideHandoff(g, forwarded) {
+				return forwarded, skills.ErrRerouteRequested
+			}
+			return forwarded, nil
 		}).
 		Build()
 }
@@ -139,9 +158,17 @@ func taskInteractSkill(g *Guide) *skills.Skill {
 			request := &RouteRequest{
 				Input:         params.TaskDescription,
 				TargetAgentID: "orchestrator",
+				SourceAgentID: g.agentID,
 				SessionID:     sessionID,
 			}
-			return g.RouteAndForward(ctx, request)
+			forwarded, err := g.RouteAndForward(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			if isNonGuideHandoff(g, forwarded) {
+				return forwarded, skills.ErrRerouteRequested
+			}
+			return forwarded, nil
 		}).
 		Build()
 }
@@ -223,10 +250,18 @@ func guideRouteSkill(g *Guide) *skills.Skill {
 			}
 
 			request := &RouteRequest{
-				Input:     params.Input,
-				SessionID: params.SessionID,
+				Input:         params.Input,
+				SourceAgentID: g.agentID,
+				SessionID:     params.SessionID,
 			}
-			return g.RouteAndForward(ctx, request)
+			forwarded, err := g.RouteAndForward(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			if isNonGuideHandoff(g, forwarded) {
+				return forwarded, skills.ErrRerouteRequested
+			}
+			return forwarded, nil
 		}).
 		Build()
 }
@@ -435,9 +470,17 @@ func routeToSkill(g *Guide) *skills.Skill {
 			request := &RouteRequest{
 				Input:         params.Input,
 				TargetAgentID: params.Target,
+				SourceAgentID: g.agentID,
 				SessionID:     resolveGuideSkillSessionID(g, params.SessionID),
 			}
-			return g.RouteAndForward(ctx, request)
+			forwarded, err := g.RouteAndForward(ctx, request)
+			if err != nil {
+				return nil, err
+			}
+			if isNonGuideHandoff(g, forwarded) {
+				return forwarded, skills.ErrRerouteRequested
+			}
+			return forwarded, nil
 		}).
 		Build()
 }

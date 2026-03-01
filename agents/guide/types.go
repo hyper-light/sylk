@@ -402,6 +402,9 @@ type ForwardedRequest struct {
 
 	// ConversationHistory carries prior turns for multi-turn continuity.
 	ConversationHistory []ConversationTurn `json:"conversation_history,omitempty"`
+
+	// Metadata carries phase-gate context (e.g. epoch for stale-approval detection).
+	Metadata map[string]any `json:"metadata,omitempty"`
 }
 
 // PendingRequest tracks a request awaiting response
@@ -443,8 +446,9 @@ type RouteResult struct {
 	SubResults []*RouteResult `json:"sub_results,omitempty"`
 
 	// Metadata
-	ClassificationMethod string        `json:"classification_method"` // "dsl" or "llm"
-	ProcessingTime       time.Duration `json:"processing_time"`
+	ClassificationMethod string         `json:"classification_method"` // "dsl" or "llm"
+	ProcessingTime       time.Duration  `json:"processing_time"`
+	PhaseMetadata        map[string]any `json:"phase_metadata,omitempty"` // From phase gate (e.g. epoch)
 
 	// Cross-domain context
 	CrossDomain *CrossDomainContext `json:"cross_domain,omitempty"`
@@ -842,7 +846,7 @@ type RouterConfig struct {
 	ThinkingLevel string  `json:"thinking_level"` // Thinking budget/level (e.g. HIGH, LOW)
 
 	// Self-response LLM overrides — used by the model-backed responder
-	// (e.g. GeminiGuideResponder) when the agent answers directly.
+	// (e.g. GuideResponder) when the agent answers directly.
 	// nil/zero means use the default for the agent.
 	ResponseTemperature *float64 `json:"response_temperature,omitempty"` // Sampling temperature for self-responses
 	ResponseMaxTokens   int      `json:"response_max_tokens,omitempty"`  // Max output tokens for self-responses

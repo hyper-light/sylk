@@ -80,6 +80,11 @@ type AgentState struct {
 	Status       AgentStatus
 	TaskSummary  string
 	ContextUsage float64 // 0.0 to 1.0
+	ModelID      string  // Currently assigned model ID (e.g. "claude-opus-4-6").
+
+	// SupportedModels is the per-agent model list from the backend.
+	// When non-empty, overrides the static provider-based model table.
+	SupportedModels []ModelEntry
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +246,7 @@ func viewKeyActions() map[viewState]map[string]keyAction {
 			"k":     func(m *Model) tea.Cmd { m.moveSelection(-1); return nil },
 			"up":    func(m *Model) tea.Cmd { m.moveSelection(-1); return nil },
 			"enter": func(m *Model) tea.Cmd { m.enterExpanded(); return nil },
+			"tab":   func(m *Model) tea.Cmd { m.enterSelector(); return nil },
 		},
 		viewExpanded: {
 			"j":     func(m *Model) tea.Cmd { m.moveEventSelection(1); return nil },
@@ -249,6 +255,7 @@ func viewKeyActions() map[viewState]map[string]keyAction {
 			"up":    func(m *Model) tea.Cmd { m.moveEventSelection(-1); return nil },
 			"enter": func(m *Model) tea.Cmd { m.enterEventDetail(); return nil },
 			"esc":   func(m *Model) tea.Cmd { m.exitExpanded(); return nil },
+			"tab":   func(m *Model) tea.Cmd { m.enterSelector(); return nil },
 		},
 		viewEventDetail: {
 			"j":    func(m *Model) tea.Cmd { m.scrollDetail(1); return nil },
@@ -256,6 +263,7 @@ func viewKeyActions() map[viewState]map[string]keyAction {
 			"k":    func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
 			"up":   func(m *Model) tea.Cmd { m.scrollDetail(-1); return nil },
 			"esc":  func(m *Model) tea.Cmd { m.exitEventDetail(); return nil },
+			"tab":  func(m *Model) tea.Cmd { m.enterSelector(); return nil },
 		},
 	}
 }
@@ -299,6 +307,9 @@ type Model struct {
 	focused      bool
 
 	dotFrame int // Current frame index for the filling-circle dot animation.
+
+	// Model selector state.
+	selector modelSelector
 
 	// Pipeline & variant state.
 	pipelines     map[string]*PipelineState  // Pipeline ID → state.
@@ -364,6 +375,8 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 		return m, m.handleVariantState(typed)
 	case msg.StreamProgressMsg:
 		return m, m.handleStreamProgress(typed)
+	case msg.StreamCompleteMsg:
+		return m, m.handleStreamComplete(typed)
 	case tea.KeyMsg:
 		return m, m.handleKey(typed)
 	default:
@@ -399,8 +412,11 @@ func (m *Model) Focused() bool {
 	return m.focused
 }
 
-// SetFocused sets the focus state.
+// SetFocused sets the focus state. Losing focus exits the selector.
 func (m *Model) SetFocused(focused bool) {
+	if !focused && m.selector.active {
+		m.exitSelector()
+	}
 	m.focused = focused
 }
 
@@ -508,6 +524,23 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	return nil
 }
 
+// handleStreamComplete transitions the responding agent back to StatusIdle
+// when a stream finishes. This is the normal completion counterpart to
+// handleStreamProgress (which sets StatusThinking on progress events).
+func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
+	agentID := strings.TrimSpace(done.AgentID)
+	if agentID == "" {
+		return nil
+	}
+	agent, ok := m.agents[agentID]
+	if !ok {
+		return nil
+	}
+	agent.Status = StatusIdle
+	m.rowsDirty = true
+	return nil
+}
+
 // demotePreviousActive transitions the previous active agent from an active
 // status to Waiting when a different agent takes over. This prevents stale
 // active indicators on agents that handed off control (e.g. guide → architect)
@@ -567,6 +600,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 		Category:   category,
 		PipelineID: pipelineID,
 		Status:     StatusIdle,
+		ModelID:    defaultModelForAgent(agentType),
 	}
 	m.agents[agentID] = agent
 	m.streams[agentID] = NewAgentEventStream()
@@ -782,6 +816,7 @@ func (m *Model) DemoteAllActive() {
 // Called once per decor tick when active agents exist.
 func (m *Model) AdvanceDotFrame() {
 	m.dotFrame = (m.dotFrame + 1) % dotAnimFrameCount
+	m.DecrementSelectorFlash()
 }
 
 // NeedsDecorTick reports whether the agent panel has active shimmer animations.
@@ -807,6 +842,11 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 		return nil
 	}
 
+	// Selector mode intercepts all keys while active.
+	if m.selector.active {
+		return m.handleSelectorKey(key)
+	}
+
 	tables := viewKeyActions()
 	if actions, ok := tables[m.view]; ok {
 		if action, ok := actions[key.String()]; ok {
@@ -814,6 +854,134 @@ func (m *Model) handleKey(key tea.KeyMsg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// selectorKeyActions maps key strings to selector actions.
+// Table-driven dispatch matching the viewKeyActions pattern.
+var selectorKeyActions = map[string]func(m *Model) tea.Cmd{
+	"tab":   func(m *Model) tea.Cmd { m.toggleSelectorFocus(); return nil },
+	"enter": func(m *Model) tea.Cmd { return m.triggerSelectorFocus() },
+	" ":     func(m *Model) tea.Cmd { return m.triggerSelectorFocus() },
+	"left":  func(m *Model) tea.Cmd { return m.cycleModelPrev() },
+	"h":     func(m *Model) tea.Cmd { return m.cycleModelPrev() },
+	"right": func(m *Model) tea.Cmd { return m.cycleModelNext() },
+	"l":     func(m *Model) tea.Cmd { return m.cycleModelNext() },
+	"esc":   func(m *Model) tea.Cmd { m.exitSelector(); return nil },
+}
+
+// handleSelectorKey dispatches keys while the selector is active.
+func (m *Model) handleSelectorKey(key tea.KeyMsg) tea.Cmd {
+	if action, ok := selectorKeyActions[key.String()]; ok {
+		return action(m)
+	}
+	return nil
+}
+
+// enterSelector activates the model selector for the current agent.
+func (m *Model) enterSelector() {
+	agent := m.selectedAgent()
+	if agent == nil {
+		return
+	}
+	models := agentModels(agent)
+	if len(models) <= 1 {
+		return
+	}
+	m.selector.active = true
+	m.selector.focus = selectorFocusLeft
+}
+
+// exitSelector deactivates the model selector.
+func (m *Model) exitSelector() {
+	m.selector.active = false
+	m.selector.focus = selectorFocusNone
+}
+
+// toggleSelectorFocus cycles focus: left → right → exit.
+func (m *Model) toggleSelectorFocus() {
+	if m.selector.focus == selectorFocusLeft {
+		m.selector.focus = selectorFocusRight
+		return
+	}
+	m.exitSelector()
+}
+
+// triggerSelectorFocus activates the focused arrow direction.
+func (m *Model) triggerSelectorFocus() tea.Cmd {
+	switch m.selector.focus {
+	case selectorFocusLeft:
+		return m.cycleModelPrev()
+	case selectorFocusRight:
+		return m.cycleModelNext()
+	}
+	return nil
+}
+
+// selectedAgent returns the agent state for the current context:
+// expanded/detail views use m.expanded; list view uses the selected row.
+func (m *Model) selectedAgent() *AgentState {
+	if m.view != viewList && m.expanded != "" {
+		return m.agents[m.expanded]
+	}
+	id := m.SelectedAgentID()
+	if id == "" {
+		return nil
+	}
+	return m.agents[id]
+}
+
+// cycleModelPrev cycles the selected agent's model to the previous entry.
+func (m *Model) cycleModelPrev() tea.Cmd {
+	agent := m.selectedAgent()
+	if agent == nil {
+		return nil
+	}
+	models := agentModels(agent)
+	if len(models) <= 1 {
+		return nil
+	}
+	idx := modelIndex(models, agent.ModelID)
+	agent.ModelID = models[cyclePrev(idx, len(models))].ID
+	m.selector.flash = flashFrames
+	return m.emitModelChange(agent)
+}
+
+// cycleModelNext cycles the selected agent's model to the next entry.
+func (m *Model) cycleModelNext() tea.Cmd {
+	agent := m.selectedAgent()
+	if agent == nil {
+		return nil
+	}
+	models := agentModels(agent)
+	if len(models) <= 1 {
+		return nil
+	}
+	idx := modelIndex(models, agent.ModelID)
+	agent.ModelID = models[cycleNext(idx, len(models))].ID
+	m.selector.flash = flashFrames
+	return m.emitModelChange(agent)
+}
+
+// emitModelChange returns a command that produces a ModelChangeMsg.
+func (m *Model) emitModelChange(agent *AgentState) tea.Cmd {
+	change := msg.ModelChangeMsg{
+		AgentID:   agent.ID,
+		AgentType: agent.AgentType,
+		ModelID:   agent.ModelID,
+	}
+	return func() tea.Msg { return change }
+}
+
+// DecrementSelectorFlash decrements the flash counter. Called per decor tick.
+func (m *Model) DecrementSelectorFlash() {
+	if m.selector.flash > 0 {
+		m.selector.flash--
+	}
+}
+
+// SelectorActive reports whether the model selector is in active mode.
+func (m *Model) SelectorActive() bool {
+	return m.selector.active
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,8 +1183,9 @@ func (m *Model) SelectByID(agentID string) bool {
 
 // SeedAgent creates an idle agent entry without requiring an activity event.
 // Used during bootstrap to pre-populate the panel with known agents.
+// When supportedModels is non-empty, it overrides the static model table.
 // No-op if the agent already exists or the panel is at capacity.
-func (m *Model) SeedAgent(id, agentType, name string) {
+func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEntry) {
 	if _, exists := m.agents[id]; exists {
 		return
 	}
@@ -1024,12 +1193,18 @@ func (m *Model) SeedAgent(id, agentType, name string) {
 		return
 	}
 	category := agentCategoryByType[agentType]
+	modelID := defaultModelForAgent(agentType)
+	if len(supportedModels) > 0 {
+		modelID = supportedModels[0].ID
+	}
 	agent := &AgentState{
-		ID:        id,
-		Name:      name,
-		AgentType: agentType,
-		Category:  category,
-		Status:    StatusIdle,
+		ID:              id,
+		Name:            name,
+		AgentType:       agentType,
+		Category:        category,
+		Status:          StatusIdle,
+		ModelID:         modelID,
+		SupportedModels: supportedModels,
 	}
 	m.agents[id] = agent
 	m.streams[id] = NewAgentEventStream()
@@ -1191,12 +1366,13 @@ func (m *Model) renderListView() string {
 		RippleGrad: m.rippleGradient,
 	}
 
+	contentHeight := m.height
 	activeStart, activeEnd := m.selectedGroupRange()
-	lines := make([]string, 0, min(len(m.rows)*2, m.height))
+	lines := make([]string, 0, min(len(m.rows)*2, contentHeight))
 	var consumedLines int
 
 	for i, row := range m.rows {
-		if consumedLines >= m.height {
+		if consumedLines >= contentHeight {
 			break
 		}
 		selected := i == m.selected
@@ -1246,7 +1422,7 @@ func (m *Model) renderListView() string {
 		}
 
 		// Footer gets the next phase step after the last content row.
-		if consumedLines < m.height && m.isGroupEnd(i) {
+		if consumedLines < contentHeight && m.isGroupEnd(i) {
 			var footerColor lipgloss.Color
 			if inActiveGroup {
 				phase := elapsed - time.Duration(i-activeStart+1)*groupFlowStep
@@ -1442,6 +1618,78 @@ func (m *Model) renderEventDetailView() string {
 	detail := renderEventDetailContent(ev, m.width, availableLines, m.scrollOff, m.theme)
 
 	return card + "\n" + separator + "\n" + detail
+}
+
+// ---------------------------------------------------------------------------
+// Model selector rendering & mouse
+// ---------------------------------------------------------------------------
+
+// RenderSelectorLine renders the bottom-line model selector for the current agent.
+// Exported so the app can place it at the absolute bottom of the left panel.
+func (m *Model) RenderSelectorLine() string {
+	agent := m.selectedAgent()
+	if agent == nil {
+		return ""
+	}
+	models := agentModels(agent)
+	if len(models) == 0 {
+		return ""
+	}
+	idx := modelIndex(models, agent.ModelID)
+	return renderModelSelector(models, idx, m.width, m.selector, m.theme)
+}
+
+// HandleSelectorClick processes a mouse click at local x-coordinate on the
+// selector line. Returns a command if a model change was triggered.
+func (m *Model) HandleSelectorClick(x int) tea.Cmd {
+	agent := m.selectedAgent()
+	if agent == nil {
+		return nil
+	}
+	models := agentModels(agent)
+	idx := modelIndex(models, agent.ModelID)
+	hit := selectorArrowHitTest(x, m.width, models, idx)
+	switch hit {
+	case selectorFocusLeft:
+		return m.cycleModelPrev()
+	case selectorFocusRight:
+		return m.cycleModelNext()
+	}
+	return nil
+}
+
+// HandleSelectorHover updates hover state for the selector arrows.
+func (m *Model) HandleSelectorHover(x int) {
+	agent := m.selectedAgent()
+	if agent == nil {
+		return
+	}
+	models := agentModels(agent)
+	idx := modelIndex(models, agent.ModelID)
+	hit := selectorArrowHitTest(x, m.width, models, idx)
+	m.selector.hoverLeft = hit == selectorFocusLeft
+	m.selector.hoverRight = hit == selectorFocusRight
+}
+
+// ClearSelectorHover resets all hover state on the selector.
+func (m *Model) ClearSelectorHover() {
+	m.selector.hoverLeft = false
+	m.selector.hoverRight = false
+}
+
+// SelectorLineCount returns the number of lines the selector occupies.
+func (m *Model) SelectorLineCount() int {
+	return selectorLineCount
+}
+
+// RevertModelID sets the agent's ModelID back to a previous value.
+// Used when a backend swap fails to undo the optimistic UI update.
+func (m *Model) RevertModelID(agentID, previousModelID string) {
+	agent, ok := m.agents[agentID]
+	if !ok {
+		return
+	}
+	agent.ModelID = previousModelID
 }
 
 // ---------------------------------------------------------------------------

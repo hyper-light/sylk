@@ -15,16 +15,24 @@ import (
 // and should not be dispatched.
 const readyPlanMaxAge = 30 * time.Minute
 
-// latestReadyPlan returns the most recently updated plan with PlanStatusReady,
-// provided it was updated within readyPlanMaxAge. Stale restored plans are
-// skipped to prevent dispatching outdated generic plans.
-func (a *Architect) latestReadyPlan() *DesignPlan {
+// latestReadyPlan returns the most recently updated plan with PlanStatusReady
+// for the given session, provided it was updated within readyPlanMaxAge.
+// Session scoping prevents restored plans from prior sessions from misleading
+// routing (e.g. triggering handlePlanFeedback for plans the user never saw).
+func (a *Architect) latestReadyPlan(sessionID string) *DesignPlan {
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return nil
+	}
 	a.activePlansMu.RLock()
 	defer a.activePlansMu.RUnlock()
 	cutoff := time.Now().Add(-readyPlanMaxAge)
 	var best *DesignPlan
 	for _, plan := range a.activePlans {
-		if plan.Status != PlanStatusReady {
+		if plan.SM().State() != PlanStatusReady {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
 			continue
 		}
 		if plan.UpdatedAt.Before(cutoff) {
@@ -46,7 +54,17 @@ func (a *Architect) dispatchPlanExecution(
 	_ *ArchitectRequest,
 	plan *DesignPlan,
 ) (*ConversationResult, bool) {
+	a.logInfo("dispatchPlanExecution: entry",
+		"plan_id", plan.ID,
+		"plan_status", plan.SM().State().String(),
+		"tasks", len(plan.Tasks),
+		"running", a.running,
+		"bus_available", a.bus != nil,
+		"ctx_deadline", contextDeadlineString(ctx))
+
 	if !a.running || a.bus == nil {
+		a.logWarn("dispatchPlanExecution: bus unavailable",
+			"plan_id", plan.ID)
 		return &ConversationResult{
 			Response: "I have a plan ready, but I can't dispatch it right now — the orchestration bus isn't available.",
 			Intent:   IntentExecute,
@@ -55,7 +73,9 @@ func (a *Architect) dispatchPlanExecution(
 
 	payload := buildHandoffPayload(plan, "user-approved execution")
 	if !isPlanHandoffPayloadValid(payload) {
-		a.logWarn("dispatchPlanExecution: invalid handoff payload", "plan_id", plan.ID)
+		a.logWarn("dispatchPlanExecution: invalid handoff payload",
+			"plan_id", plan.ID,
+			"payload_len", len(payload))
 		return &ConversationResult{
 			Response: "The plan could not be serialized for handoff. This is an internal error — please retry or revise the plan.",
 			Intent:   IntentExecute,
@@ -72,18 +92,20 @@ func (a *Architect) dispatchPlanExecution(
 	// Extract the architect's original CID from stream context for the reroute.
 	originalCID := originalCIDFromContext(ctx)
 
-	a.logInfo("dispatchPlanExecution: emitting reroute",
+	a.logInfo("dispatchPlanExecution: emitting reroute BEFORE sync call",
 		"plan_id", plan.ID,
 		"original_cid", originalCID,
-		"orch_cid", orchCID)
+		"orch_cid", orchCID,
+		"payload_len", len(payload))
 
 	// Emit reroute BEFORE the sync call so the TUI switches to "orchestrator"
 	// while the orchestrator is actively processing the plan ingestion.
 	a.publishHandoffReroute(ctx, "orchestrator", originalCID, orchCID)
 
-	a.logInfo("dispatchPlanExecution: calling requestRouteSync",
+	a.logInfo("dispatchPlanExecution: BLOCKING CALL to requestRouteSync",
 		"plan_id", plan.ID,
-		"orch_cid", orchCID)
+		"orch_cid", orchCID,
+		"ctx_deadline", contextDeadlineString(ctx))
 
 	request := &guide.RouteRequest{
 		Input:         payload,
@@ -92,9 +114,12 @@ func (a *Architect) dispatchPlanExecution(
 		SessionID:     plan.SessionID,
 	}
 
+	handoffStart := time.Now()
 	response, err := a.requestRouteSync(ctx, request)
+	handoffElapsed := time.Since(handoffStart)
 	a.logInfo("dispatchPlanExecution: requestRouteSync returned",
 		"plan_id", plan.ID,
+		"blocked_for", handoffElapsed.String(),
 		"has_response", response != nil,
 		"has_error", err != nil)
 	if err != nil {
@@ -114,11 +139,22 @@ func (a *Architect) dispatchPlanExecution(
 		}, true
 	}
 
-	// Orchestrator confirmed ingestion — transition to Executing.
-	// Clear ReadyDirective so the guide does not enter PhasePlanApproval
-	// for an already-executing plan.
-	plan.ReadyDirective = nil
-	plan.Status = PlanStatusExecuting
+	// Orchestrator confirmed ingestion — CAS transition Ready→Executing.
+	// ReadyDirective is derived from SM state, so transitioning to Executing
+	// automatically makes it return nil.
+	if err := plan.SM().TransitionTo(PlanStatusExecuting, plan); err != nil {
+		a.logWarn("dispatchPlanExecution: transition to Executing failed", "plan_id", plan.ID, "error", err)
+		return &ConversationResult{
+			Response: "The plan is no longer in a ready state: " + err.Error(),
+			Intent:   IntentExecute,
+		}, true
+	}
+	plan.Status = plan.SM().State()
+	plan.Epoch = plan.SM().Epoch()
+	// Grant executing lease for crash recovery detection.
+	if a.leaseManager != nil {
+		a.leaseManager.GrantExecutingLease(plan, "orchestrator")
+	}
 	summary := summarizeAutoHandoffResponse(response)
 	plan.RiskSummary = append(plan.RiskSummary, summary)
 	_ = a.persistPlanState(plan)

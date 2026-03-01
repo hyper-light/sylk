@@ -8,7 +8,7 @@ import (
 )
 
 type SignalHandler struct {
-	bus        *SignalBus
+	bus        SignalBusInterface
 	subscriber SignalSubscriber
 	callback   func(SignalMessage)
 	stopCh     chan struct{}
@@ -16,14 +16,14 @@ type SignalHandler struct {
 	running    bool
 }
 
-func NewSignalHandler(bus *SignalBus, agentID string, signals []Signal) *SignalHandler {
+func NewSignalHandler(bus SignalBusInterface, agentID string, signals []Signal) *SignalHandler {
 	return &SignalHandler{
 		bus: bus,
 		subscriber: SignalSubscriber{
 			ID:      uuid.New().String(),
 			AgentID: agentID,
 			Signals: signals,
-			Channel: make(chan SignalMessage, bus.config.ChannelBufferSize),
+			Channel: make(chan SignalMessage, bus.ChannelBufferSize()),
 		},
 		stopCh: make(chan struct{}),
 	}

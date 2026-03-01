@@ -14,6 +14,7 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -74,8 +75,13 @@ type GlobalTester struct {
 func New(cfg shared.GlobalTesterConfig, provider globalTesterProvider) (*GlobalTester, error) {
 	cfg = applyConfigDefaults(cfg)
 
+	testerID := cfg.AgentID
+	if testerID == "" {
+		testerID = fmt.Sprintf("tester_%s", uuid.New().String()[:8])
+	}
+
 	gt := &GlobalTester{
-		id:          uuid.New().String()[:8],
+		id:          testerID,
 		config:      cfg,
 		logger:      slog.Default().With("agent", "tester"),
 		provider:    provider,
@@ -123,16 +129,16 @@ func (gt *GlobalTester) ProviderType() string { return "openai" }
 
 // RefreshProvider implements container.AuthRefreshable.
 // Re-resolves OpenAI credentials and replaces the provider.
-func (gt *GlobalTester) RefreshProvider(_ context.Context) error {
+func (gt *GlobalTester) RefreshProvider(ctx context.Context, authMethod string) error {
 	cfg := providers.OpenAIConfig{
 		BaseConfig: providers.BaseConfig{
 			Model:     gt.config.Model,
 			MaxTokens: gt.config.MaxTokens,
 		},
 		ReasoningEffort: gt.config.ReasoningEffort,
-		AuthMode:        "api_key",
+		AuthMode:        authMethod,
 	}
-	p, err := providers.NewOpenAIProvider(cfg)
+	p, err := providers.NewOpenAIProvider(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("tester refresh provider: %w", err)
 	}
@@ -141,8 +147,35 @@ func (gt *GlobalTester) RefreshProvider(_ context.Context) error {
 	} else {
 		gt.SetProvider(p)
 	}
-	gt.logger.Info("provider refreshed")
+	gt.logger.Info("provider refreshed", "auth_method", authMethod)
 	return nil
+}
+
+// SwapModel implements container.ModelSwappable.
+// Re-creates the OpenAI provider with the given model ID, re-applying the
+// gateway wrapper. Thread-safe via mu.
+func (gt *GlobalTester) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	gt.SetProvider(provider)
+	gt.mu.Lock()
+	gt.config.Model = modelID
+	gt.mu.Unlock()
+	gt.logger.Info("model swapped", "model", modelID)
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (gt *GlobalTester) CurrentModel() string {
+	gt.mu.RLock()
+	defer gt.mu.RUnlock()
+	return gt.config.Model
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (gt *GlobalTester) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+	}
 }
 
 func applyConfigDefaults(cfg shared.GlobalTesterConfig) shared.GlobalTesterConfig {
@@ -488,45 +521,7 @@ func (gt *GlobalTester) publishRerouteRequest(reason, originalInput, suggestedTa
 
 // GetRoutingInfo returns routing metadata for Guide registration.
 func (gt *GlobalTester) GetRoutingInfo() *guide.AgentRoutingInfo {
-	return &guide.AgentRoutingInfo{
-		ID:      gt.id,
-		Type:    "tester",
-		Name:    "Tester",
-		Aliases: []string{"test", "testing", "qa"},
-		ActionShortcuts: []guide.ActionShortcut{
-			{Name: "test", Description: "Run tests", DefaultIntent: guide.IntentCheck, DefaultDomain: guide.DomainCode},
-			{Name: "coverage", Description: "Coverage report", DefaultIntent: guide.IntentCheck, DefaultDomain: guide.DomainCode},
-			{Name: "chat", Description: "Conversational interaction", DefaultIntent: guide.IntentChat, DefaultDomain: guide.DomainSystem},
-		},
-		Triggers: guide.AgentTriggers{
-			StrongTriggers: []string{
-				"test", "testing", "coverage", "mutation",
-				"integration test", "e2e test", "cross-pipeline",
-			},
-			WeakTriggers: []string{"verify", "check", "quality"},
-			IntentTriggers: map[guide.Intent][]string{
-				guide.IntentCheck: {"test", "run tests", "coverage", "integration test"},
-			},
-		},
-		Registration: &guide.AgentRegistration{
-			ID:      gt.id,
-			Name:    "Tester",
-			Aliases: []string{"test", "testing", "qa"},
-			Capabilities: guide.AgentCapabilities{
-				Intents:  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp, guide.IntentChat},
-				Domains:  []guide.Domain{guide.DomainCode},
-				Tags:     []string{"testing", "quality", "coverage", "integration", "e2e", "sdet"},
-				Keywords: []string{"test", "integration", "e2e", "coverage", "mutation", "quality"},
-				Priority: 70,
-			},
-			Constraints: guide.AgentConstraints{
-				TemporalFocus: guide.TemporalPresent,
-				MinConfidence: 0.6,
-			},
-			Description: "Cross-pipeline SDET. Architects integration/e2e test strategies with 7-phase LLM-driven protocol.",
-			Priority:    70,
-		},
-	}
+	return TesterRoutingInfo(gt.id)
 }
 
 // Skills returns the skill registry.
@@ -556,6 +551,14 @@ func (gt *GlobalTester) PublishRequest(req *guide.RouteRequest) error {
 
 // AgentID returns the unique identifier.
 func (gt *GlobalTester) AgentID() string { return gt.id }
+
+// SetCanonicalID overwrites the tester's internal ID. Used during
+// handoff swap so the new instance assumes the canonical identity.
+func (gt *GlobalTester) SetCanonicalID(id string) {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	gt.id = id
+}
 
 // AgentType returns the type classification.
 func (gt *GlobalTester) AgentType() string { return "tester" }

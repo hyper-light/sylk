@@ -44,8 +44,8 @@ func (r *Registry) Register(providerType ProviderType, provider Provider) error 
 }
 
 // RegisterAnthropic creates and registers an Anthropic provider
-func (r *Registry) RegisterAnthropic(config AnthropicConfig) error {
-	provider, err := NewAnthropicProvider(config)
+func (r *Registry) RegisterAnthropic(ctx context.Context, config AnthropicConfig) error {
+	provider, err := NewAnthropicProvider(ctx, config)
 	if err != nil {
 		return err
 	}
@@ -53,8 +53,8 @@ func (r *Registry) RegisterAnthropic(config AnthropicConfig) error {
 }
 
 // RegisterOpenAI creates and registers an OpenAI provider
-func (r *Registry) RegisterOpenAI(config OpenAIConfig) error {
-	provider, err := NewOpenAIProvider(config)
+func (r *Registry) RegisterOpenAI(ctx context.Context, config OpenAIConfig) error {
+	provider, err := NewOpenAIProvider(ctx, config)
 	if err != nil {
 		return err
 	}
@@ -182,7 +182,7 @@ func NewRegistryBuilder(ctx context.Context) *RegistryBuilder {
 
 // WithAnthropic adds an Anthropic provider
 func (b *RegistryBuilder) WithAnthropic(config AnthropicConfig) *RegistryBuilder {
-	if err := b.registry.RegisterAnthropic(config); err != nil {
+	if err := b.registry.RegisterAnthropic(b.ctx, config); err != nil {
 		b.errors = append(b.errors, fmt.Errorf("anthropic: %w", err))
 	}
 	return b
@@ -190,7 +190,7 @@ func (b *RegistryBuilder) WithAnthropic(config AnthropicConfig) *RegistryBuilder
 
 // WithOpenAI adds an OpenAI provider
 func (b *RegistryBuilder) WithOpenAI(config OpenAIConfig) *RegistryBuilder {
-	if err := b.registry.RegisterOpenAI(config); err != nil {
+	if err := b.registry.RegisterOpenAI(b.ctx, config); err != nil {
 		b.errors = append(b.errors, fmt.Errorf("openai: %w", err))
 	}
 	return b

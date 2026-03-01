@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +22,27 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/google/uuid"
 )
+
+var (
+	providerDebugLog     *slog.Logger
+	providerDebugLogOnce sync.Once
+)
+
+func providerFileLog() *slog.Logger {
+	providerDebugLogOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".sylk", "logs")
+		_ = os.MkdirAll(dir, 0755)
+		f, err := os.OpenFile(filepath.Join(dir, "ui_events.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			providerDebugLog = slog.Default()
+			return
+		}
+		providerDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	})
+	return providerDebugLog
+}
 
 // AnthropicProvider implements Provider for Anthropic's Claude models
 type AnthropicProvider struct {
@@ -48,9 +71,10 @@ var anthropicModels = map[string]bool{
 	"claude-haiku-4-5-20251001": true, // Claude Haiku 4.5
 }
 
-// NewAnthropicProvider creates a new Anthropic provider with the given configuration
-func NewAnthropicProvider(config AnthropicConfig, skills ...skills.Skill) (*AnthropicProvider, error) {
+// NewAnthropicProvider creates a new Anthropic provider with the given configuration.
+func NewAnthropicProvider(ctx context.Context, config AnthropicConfig, skills ...skills.Skill) (*AnthropicProvider, error) {
 	return NewAnthropicProviderWithAuthService(
+		ctx,
 		config,
 		oauth.NewAnthropicAuthService(oauth.AnthropicAuthServiceConfig{}),
 		skills...,
@@ -59,18 +83,22 @@ func NewAnthropicProvider(config AnthropicConfig, skills ...skills.Skill) (*Anth
 
 // NewAnthropicProviderWithAuthService creates a provider using a custom Anthropic OAuth service.
 func NewAnthropicProviderWithAuthService(
+	ctx context.Context,
 	config AnthropicConfig,
 	authService oauth.AnthropicAuthService,
 	skills ...skills.Skill,
 ) (*AnthropicProvider, error) {
 	applyAnthropicProviderDefaults(&config)
-	if err := hydrateAnthropicConfig(context.Background(), &config, authService); err != nil {
+	if err := hydrateAnthropicConfig(ctx, &config, authService); err != nil {
 		return nil, err
 	}
+	providerFileLog().Info("DEBUG: anthropic_provider_validate_start")
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
+	providerFileLog().Info("DEBUG: anthropic_provider_new_client_start")
 	client := anthropic.NewClient(buildAnthropicClientOptions(config)...)
+	providerFileLog().Info("DEBUG: anthropic_provider_new_client_done")
 	return &AnthropicProvider{
 		client:      &client,
 		config:      config,
@@ -98,10 +126,22 @@ func hydrateAnthropicConfig(
 		return fmt.Errorf("anthropic config is nil")
 	}
 	normalizeAnthropicHydrationFields(config)
+	providerFileLog().Info("DEBUG: hydrate_anthropic_start",
+		"auth_mode", config.AuthMode,
+		"has_api_key", config.APIKey != "",
+		"model", config.Model)
+	hydrateStart := time.Now()
+	var err error
 	if config.AuthMode == AnthropicAuthModeOAuth {
-		return hydrateAnthropicOAuthConfig(ctx, config, authService)
+		err = hydrateAnthropicOAuthConfig(ctx, config, authService)
+	} else {
+		err = hydrateAnthropicAPIKeyConfig(config)
 	}
-	return hydrateAnthropicAPIKeyConfig(config)
+	providerFileLog().Info("DEBUG: hydrate_anthropic_done",
+		"auth_mode", config.AuthMode,
+		"elapsed_ms", time.Since(hydrateStart).Milliseconds(),
+		"error", err)
+	return err
 }
 
 func normalizeAnthropicHydrationFields(config *AnthropicConfig) {
@@ -349,10 +389,28 @@ func (p *AnthropicProvider) streamWithRetry(ctx context.Context, req *Request, h
 }
 
 func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Request, handler StreamHandler) error {
+	providerFileLog().Info("anthropic_stream: BUILD_PARAMS",
+		"model", p.config.Model,
+		"req_max_tokens", req.MaxTokens,
+		"req_thinking_budget", req.ThinkingBudget,
+		"req_tools_count", len(req.Tools),
+		"req_messages_count", len(req.Messages),
+		"adaptive_thinking", p.config.AdaptiveThinking,
+		"config_thinking_budget", p.config.ThinkingBudget,
+		"config_max_tokens", p.config.MaxTokens,
+		"system_prompt_len", len(req.SystemPrompt))
+
 	params := p.buildParams(req)
+
+	providerFileLog().Info("anthropic_stream: PARAMS_BUILT",
+		"param_max_tokens", params.MaxTokens,
+		"param_model", string(params.Model),
+		"param_tools_count", len(params.Tools))
+
 	stream := p.getClient().Messages.NewStreaming(ctx, params)
 	defer stream.Close()
 
+	streamStart := time.Now()
 	var chunkIndex int
 	var inputTokens, outputTokens int
 	var cacheReadTokens, cacheWriteTokens int
@@ -422,6 +480,10 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 	}
 
 	if err := stream.Err(); err != nil {
+		providerFileLog().Info("anthropic_stream: STREAM_ERROR",
+			"err", err.Error(),
+			"elapsed", time.Since(streamStart).String(),
+			"chunk_count", chunkIndex)
 		if p.shouldRetryForAnthropicAuth(err) {
 			return err
 		}
@@ -437,6 +499,17 @@ func (p *AnthropicProvider) streamWithHandlerOnce(ctx context.Context, req *Requ
 	if stopReason == "" {
 		stopReason = StopReasonEndTurn
 	}
+
+	providerFileLog().Info("anthropic_stream: STREAM_COMPLETE",
+		"elapsed", time.Since(streamStart).String(),
+		"chunk_count", chunkIndex,
+		"stop_reason", string(stopReason),
+		"input_tokens", inputTokens,
+		"output_tokens", outputTokens,
+		"total_tokens", inputTokens+outputTokens,
+		"cache_read_tokens", cacheReadTokens,
+		"cache_write_tokens", cacheWriteTokens,
+		"tool_calls_seen", len(toolCallIDForIndex))
 
 	var providerData map[string]any
 	if raw := contentBlockTracker.build(); len(raw) > 0 {
@@ -528,12 +601,14 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 	}
 
 	systemPrompt := resolveSystemPrompt(req.SystemPrompt, p.config.SystemPrompt)
-	if len(p.skills) > 0 && len(req.Tools) == 0 {
+	if len(p.skills) > 0 && len(req.Tools) == 0 && !req.SkipProviderSkills {
 		// Inject skill descriptions into the system prompt only when proper
-		// API tool definitions are absent. When req.Tools is populated, the
-		// LLM uses the native tool API; the <available_skills> XML block
-		// would create a conflicting double signal that causes the model to
-		// emit XML tool-call markup as text instead.
+		// API tool definitions are absent and the caller hasn't suppressed
+		// skills (e.g. classification requests need a focused prompt without
+		// the full skill catalogue). When req.Tools is populated, the LLM
+		// uses the native tool API; the <available_skills> XML block would
+		// create a conflicting double signal that causes the model to emit
+		// XML tool-call markup as text instead.
 		systemPrompt = systemPrompt + "\n" + skills.ToPrompt(p.skills)
 	}
 
@@ -556,6 +631,23 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 	}
 
 	params.Thinking = p.resolveThinkingConfig(req.ThinkingBudget, maxTokens)
+
+	// Log the resolved thinking configuration for debugging.
+	thinkingDesc := "disabled"
+	if p.config.AdaptiveThinking {
+		thinkingDesc = "adaptive"
+	} else if req.ThinkingBudget > 0 {
+		thinkingDesc = fmt.Sprintf("fixed(%d)", req.ThinkingBudget)
+	} else if p.config.ThinkingBudget > 0 {
+		thinkingDesc = fmt.Sprintf("config(%d)", p.config.ThinkingBudget)
+	}
+	providerFileLog().Info("anthropic_build_params: THINKING_CONFIG",
+		"thinking_mode", thinkingDesc,
+		"req_thinking_budget", req.ThinkingBudget,
+		"config_thinking_budget", p.config.ThinkingBudget,
+		"adaptive_thinking", p.config.AdaptiveThinking,
+		"max_tokens", maxTokens,
+		"tools_count", len(req.Tools))
 
 	if p.config.EnableCaching {
 		cacheControl := anthropic.NewCacheControlEphemeralParam()

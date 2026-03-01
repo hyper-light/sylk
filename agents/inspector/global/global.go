@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -74,8 +75,13 @@ type GlobalInspector struct {
 func New(cfg shared.GlobalInspectorConfig, provider inspectorProvider) (*GlobalInspector, error) {
 	cfg = applyConfigDefaults(cfg)
 
+	inspectorID := cfg.AgentID
+	if inspectorID == "" {
+		inspectorID = fmt.Sprintf("inspector_%s", uuid.New().String()[:8])
+	}
+
 	gi := &GlobalInspector{
-		id:          uuid.New().String()[:8],
+		id:          inspectorID,
 		config:      cfg,
 		logger:      slog.Default().With("agent", "inspector"),
 		provider:    provider,
@@ -114,15 +120,15 @@ func (gi *GlobalInspector) ProviderType() string { return "anthropic" }
 
 // RefreshProvider implements container.AuthRefreshable.
 // Re-resolves Anthropic credentials and replaces the provider.
-func (gi *GlobalInspector) RefreshProvider(_ context.Context) error {
+func (gi *GlobalInspector) RefreshProvider(ctx context.Context, authMethod string) error {
 	cfg := providers.AnthropicConfig{
 		BaseConfig: providers.BaseConfig{
 			Model:     gi.config.Model,
 			MaxTokens: gi.config.MaxTokens,
 		},
-		AuthMode: providers.AnthropicAuthModeAPIKey,
+		AuthMode: authMethod,
 	}
-	p, err := providers.NewAnthropicProvider(cfg)
+	p, err := providers.NewAnthropicProvider(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("inspector refresh provider: %w", err)
 	}
@@ -131,8 +137,39 @@ func (gi *GlobalInspector) RefreshProvider(_ context.Context) error {
 		wrapped = gi.providerWrapper(p)
 	}
 	gi.SetProvider(wrapped)
-	gi.logger.Info("provider refreshed")
+	gi.logger.Info("provider refreshed", "auth_method", authMethod)
 	return nil
+}
+
+// SwapModel implements container.ModelSwappable.
+// Re-creates the Anthropic provider with the given model ID, re-applying the
+// gateway wrapper. Thread-safe via mu.
+func (gi *GlobalInspector) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	ip, ok := provider.(inspectorProvider)
+	if !ok {
+		return fmt.Errorf("inspector swap model: provider does not satisfy inspectorProvider")
+	}
+	gi.SetProvider(ip)
+	gi.mu.Lock()
+	gi.config.Model = modelID
+	gi.mu.Unlock()
+	gi.logger.Info("model swapped", "model", modelID)
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (gi *GlobalInspector) CurrentModel() string {
+	gi.mu.RLock()
+	defer gi.mu.RUnlock()
+	return gi.config.Model
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (gi *GlobalInspector) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+	}
 }
 
 func applyConfigDefaults(cfg shared.GlobalInspectorConfig) shared.GlobalInspectorConfig {
@@ -433,53 +470,7 @@ func (gi *GlobalInspector) DiffStore() *AuditDiffStore { return gi.diffStore }
 
 // GetRoutingInfo returns routing metadata for Guide registration.
 func (gi *GlobalInspector) GetRoutingInfo() *guide.AgentRoutingInfo {
-	return &guide.AgentRoutingInfo{
-		ID:      gi.id,
-		Type:    "inspector",
-		Name:    "Inspector",
-		Aliases: []string{"global-inspector", "audit", "quality-audit"},
-		ActionShortcuts: []guide.ActionShortcut{
-			{
-				Name:          "audit",
-				Description:   "Audit code quality across files",
-				DefaultIntent: guide.IntentCheck,
-				DefaultDomain: guide.DomainCode,
-			},
-			{
-				Name:          "chat",
-				Description:   "Conversational interaction",
-				DefaultIntent: guide.IntentChat,
-				DefaultDomain: guide.DomainCode,
-			},
-		},
-		Triggers: guide.AgentTriggers{
-			StrongTriggers: []string{
-				"audit", "cross-file", "architectural review",
-				"plan adherence", "quality audit",
-			},
-			IntentTriggers: map[guide.Intent][]string{
-				guide.IntentCheck: {"audit", "inspect", "review quality"},
-			},
-		},
-		Registration: &guide.AgentRegistration{
-			ID:      gi.id,
-			Name:    "Inspector",
-			Aliases: []string{"global-inspector", "audit"},
-			Capabilities: guide.AgentCapabilities{
-				Intents:  []guide.Intent{guide.IntentCheck, guide.IntentRecall, guide.IntentHelp, guide.IntentChat},
-				Domains:  []guide.Domain{guide.DomainCode},
-				Tags:     []string{"audit", "quality", "cross-file", "architecture", "plan"},
-				Keywords: []string{"audit", "inspect", "quality", "cross-file", "plan", "architecture"},
-				Priority: 75,
-			},
-			Constraints: guide.AgentConstraints{
-				TemporalFocus: guide.TemporalPresent,
-				MinConfidence: 0.6,
-			},
-			Description: "Global quality inspector. Cross-file architectural auditing, plan adherence validation, and DAG layer gating.",
-			Priority:    75,
-		},
-	}
+	return InspectorRoutingInfo(gi.id)
 }
 
 // PublishRequest publishes a routed request to the Guide.
@@ -503,6 +494,14 @@ func (gi *GlobalInspector) IsRunning() bool { return gi.running }
 
 // AgentID returns the unique identifier of this inspector instance.
 func (gi *GlobalInspector) AgentID() string { return gi.id }
+
+// SetCanonicalID overwrites the inspector's internal ID. Used during
+// handoff swap so the new instance assumes the canonical identity.
+func (gi *GlobalInspector) SetCanonicalID(id string) {
+	gi.mu.Lock()
+	defer gi.mu.Unlock()
+	gi.id = id
+}
 
 // AgentType returns the type name of this agent.
 func (gi *GlobalInspector) AgentType() string { return "inspector" }

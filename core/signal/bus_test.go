@@ -520,7 +520,8 @@ func TestValidSignals(t *testing.T) {
 	assert.Contains(t, signals, signal.EvictCaches)
 	assert.Contains(t, signals, signal.CompactContexts)
 	assert.Contains(t, signals, signal.MemoryPressureChanged)
-	assert.Len(t, signals, 11)
+	assert.Contains(t, signals, signal.TimePressure)
+	assert.Len(t, signals, 12)
 }
 
 // Helper functions

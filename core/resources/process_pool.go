@@ -14,7 +14,7 @@ type ProcessPoolConfig struct {
 	CPUMultiplier   int
 	UserReserved    float64
 	PipelineTimeout time.Duration
-	SignalBus       *signal.SignalBus
+	SignalBus       signal.SignalBusInterface
 }
 
 // DefaultProcessPoolConfig returns sensible defaults.

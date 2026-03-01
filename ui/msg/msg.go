@@ -58,6 +58,7 @@ type StreamProgressMsg struct {
 type StreamCompleteMsg struct {
 	SessionID     string
 	CorrelationID string
+	AgentID       string // Responding agent ID for panel status reset.
 	Result        any
 	InputTokens   int // Real provider input tokens (0 = unavailable).
 	OutputTokens  int // Real provider output tokens (0 = unavailable).
@@ -541,6 +542,13 @@ type DiffViewPair struct {
 // Authentication
 // ---------------------------------------------------------------------------
 
+// AuthStatusMsg carries per-provider auth availability after the background
+// ProbeAll completes. Dispatched by a deferred Init cmd so the status bar
+// icons update once the AuthRegistry is populated.
+type AuthStatusMsg struct {
+	Providers map[string]bool // provider → available
+}
+
 // ---------------------------------------------------------------------------
 // Plan viewer
 // ---------------------------------------------------------------------------
@@ -632,6 +640,25 @@ type LoginResultMsg struct {
 }
 
 // ---------------------------------------------------------------------------
+// Model swap
+// ---------------------------------------------------------------------------
+
+// ModelChangeMsg signals the user changed an agent's LLM model via the selector.
+type ModelChangeMsg struct {
+	AgentID   string
+	AgentType string
+	ModelID   string
+}
+
+// ModelSwapResultMsg reports the outcome of a backend model swap.
+type ModelSwapResultMsg struct {
+	AgentID   string
+	AgentType string
+	ModelID   string
+	Err       error
+}
+
+// ---------------------------------------------------------------------------
 // Prompt queue
 // ---------------------------------------------------------------------------
 
@@ -684,4 +711,22 @@ type ToolCallEventMsg struct {
 	StartedAt     time.Time
 	Duration      time.Duration
 	Success       bool
+}
+
+// ResizeSettleMsg fires after a debounce delay following vertical-only
+// resizes. When the generation matches the current resizeGen, a full
+// layout recalculation + cache invalidation is performed so that side
+// panels render at their final dimensions.
+type ResizeSettleMsg struct {
+	Gen uint64
+}
+
+// TimePressureMsg signals that an agent is approaching its operation deadline.
+// The UI can display this to inform the user and offer options (cancel, wait).
+type TimePressureMsg struct {
+	AgentType string
+	Stage     string
+	Elapsed   time.Duration
+	Remaining time.Duration
+	Message   string
 }

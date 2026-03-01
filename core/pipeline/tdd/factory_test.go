@@ -57,7 +57,7 @@ func TestAgentFactory_CreateTester(t *testing.T) {
 
 func TestAgentFactory_CreateWorkerEngineer(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(WorkerEngineer)
+	w, err := f.CreateWorker(t.Context(),WorkerEngineer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestAgentFactory_CreateWorkerEngineer(t *testing.T) {
 
 func TestAgentFactory_CreateWorkerDesigner(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(WorkerDesigner)
+	w, err := f.CreateWorker(t.Context(),WorkerDesigner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestAgentFactory_CreateWorkerDesigner(t *testing.T) {
 
 func TestAgentFactory_CreateWorkerUnknown(t *testing.T) {
 	f := newTestFactory()
-	_, err := f.CreateWorker("unknown")
+	_, err := f.CreateWorker(t.Context(),"unknown")
 	if err == nil {
 		t.Error("expected error for unknown worker type")
 	}
@@ -91,7 +91,7 @@ func TestAgentFactory_CreateWorkerUnknown(t *testing.T) {
 
 func TestAgentFactory_CreateCoWorkers(t *testing.T) {
 	f := newTestFactory()
-	workers, err := f.CreateCoWorkers([]WorkerType{WorkerEngineer})
+	workers, err := f.CreateCoWorkers(t.Context(),[]WorkerType{WorkerEngineer})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestAgentFactory_CreateCoWorkers(t *testing.T) {
 func TestAgentFactory_CreateCoWorkers_PartialFailure(t *testing.T) {
 	f := newTestFactory()
 	// Second type is invalid — first worker should be closed on failure.
-	_, err := f.CreateCoWorkers([]WorkerType{WorkerEngineer, "invalid"})
+	_, err := f.CreateCoWorkers(t.Context(),[]WorkerType{WorkerEngineer, "invalid"})
 	if err == nil {
 		t.Error("expected error for invalid co-worker type")
 	}
@@ -114,7 +114,7 @@ func TestAgentFactory_CreateCoWorkers_PartialFailure(t *testing.T) {
 
 func TestAgentFactory_CreateCoWorkers_Empty(t *testing.T) {
 	f := newTestFactory()
-	workers, err := f.CreateCoWorkers(nil)
+	workers, err := f.CreateCoWorkers(t.Context(),nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestAgentFactory_CreateCoWorkers_Empty(t *testing.T) {
 
 func TestTaskPromptSetter(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(WorkerEngineer)
+	w, err := f.CreateWorker(t.Context(),WorkerEngineer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestTaskPromptSetter(t *testing.T) {
 
 func TestPriorOutputSetter(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(WorkerEngineer)
+	w, err := f.CreateWorker(t.Context(),WorkerEngineer)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -311,6 +311,11 @@ func (b *SignalBus) cleanupExpiredPendingAcks() {
 	}
 }
 
+// ChannelBufferSize returns the configured channel buffer size for subscribers.
+func (b *SignalBus) ChannelBufferSize() int {
+	return b.config.ChannelBufferSize
+}
+
 // PendingCount returns the number of pending ACK entries (for testing/monitoring).
 func (b *SignalBus) PendingCount() int {
 	b.mu.RLock()

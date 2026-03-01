@@ -9,64 +9,29 @@ import (
 )
 
 // =============================================================================
-// Mock Subscriber for Testing
-// =============================================================================
-
-// testToolSubscriber implements events.EventSubscriber for testing
-type testToolSubscriber struct {
-	id         string
-	eventTypes []events.EventType
-	events     []*events.ActivityEvent
-	mu         sync.Mutex
-}
-
-func (s *testToolSubscriber) ID() string {
-	return s.id
-}
-
-func (s *testToolSubscriber) EventTypes() []events.EventType {
-	return s.eventTypes
-}
-
-func (s *testToolSubscriber) OnEvent(event *events.ActivityEvent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.events = append(s.events, event)
-	return nil
-}
-
-func (s *testToolSubscriber) getEvents() []*events.ActivityEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]*events.ActivityEvent{}, s.events...)
-}
-
-// =============================================================================
 // NewToolEventPublisher Tests
 // =============================================================================
 
 func TestNewToolEventPublisher(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	if publisher == nil {
 		t.Fatal("Expected non-nil publisher")
 	}
 
-	if publisher.bus != bus {
+	if publisher.bus != collector {
 		t.Error("Expected bus to be set")
 	}
 }
 
 func TestToolEventPublisher_Bus(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
-	if publisher.Bus() != bus {
+	if publisher.Bus() != collector {
 		t.Error("Expected Bus() to return the underlying bus")
 	}
 }
@@ -76,17 +41,9 @@ func TestToolEventPublisher_Bus(t *testing.T) {
 // =============================================================================
 
 func TestToolEventPublisher_PublishToolCall(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolCall},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	params := map[string]any{
 		"path":    "/tmp/test.txt",
@@ -98,10 +55,7 @@ func TestToolEventPublisher_PublishToolCall(t *testing.T) {
 		t.Fatalf("PublishToolCall failed: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -149,27 +103,16 @@ func TestToolEventPublisher_PublishToolCall_NilBus(t *testing.T) {
 }
 
 func TestToolEventPublisher_PublishToolCall_NilParams(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolCall},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	err := publisher.PublishToolCall("session", "agent", "tool", nil)
 	if err != nil {
 		t.Fatalf("PublishToolCall should accept nil params: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -185,27 +128,16 @@ func TestToolEventPublisher_PublishToolCall_NilParams(t *testing.T) {
 }
 
 func TestToolEventPublisher_PublishToolCall_EmptyParams(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolCall},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	err := publisher.PublishToolCall("session", "agent", "tool", map[string]any{})
 	if err != nil {
 		t.Fatalf("PublishToolCall should accept empty params: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -222,17 +154,9 @@ func TestToolEventPublisher_PublishToolCall_EmptyParams(t *testing.T) {
 // =============================================================================
 
 func TestToolEventPublisher_PublishToolResult_Success(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolResult},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	result := map[string]any{
 		"bytes_written": 1024,
@@ -244,10 +168,7 @@ func TestToolEventPublisher_PublishToolResult_Success(t *testing.T) {
 		t.Fatalf("PublishToolResult failed: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -277,17 +198,9 @@ func TestToolEventPublisher_PublishToolResult_Success(t *testing.T) {
 }
 
 func TestToolEventPublisher_PublishToolResult_Failure(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolResult},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	result := "permission denied"
 
@@ -296,10 +209,7 @@ func TestToolEventPublisher_PublishToolResult_Failure(t *testing.T) {
 		t.Fatalf("PublishToolResult failed: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -324,27 +234,16 @@ func TestToolEventPublisher_PublishToolResult_NilBus(t *testing.T) {
 }
 
 func TestToolEventPublisher_PublishToolResult_NilResult(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolResult},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	err := publisher.PublishToolResult("session", "agent", "tool", nil, events.OutcomeSuccess)
 	if err != nil {
 		t.Fatalf("PublishToolResult should accept nil result: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -355,17 +254,9 @@ func TestToolEventPublisher_PublishToolResult_NilResult(t *testing.T) {
 }
 
 func TestToolEventPublisher_PublishToolResult_VariousResultTypes(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolResult},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	testCases := []struct {
 		name   string
@@ -394,17 +285,9 @@ func TestToolEventPublisher_PublishToolResult_VariousResultTypes(t *testing.T) {
 // =============================================================================
 
 func TestToolEventPublisher_PublishToolTimeout(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolTimeout},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	timeout := 30 * time.Second
 
@@ -413,10 +296,7 @@ func TestToolEventPublisher_PublishToolTimeout(t *testing.T) {
 		t.Fatalf("PublishToolTimeout failed: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -463,27 +343,16 @@ func TestToolEventPublisher_PublishToolTimeout_NilBus(t *testing.T) {
 }
 
 func TestToolEventPublisher_PublishToolTimeout_ZeroDuration(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolTimeout},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	err := publisher.PublishToolTimeout("session", "agent", "tool", 0)
 	if err != nil {
 		t.Fatalf("PublishToolTimeout should accept zero duration: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -494,17 +363,9 @@ func TestToolEventPublisher_PublishToolTimeout_ZeroDuration(t *testing.T) {
 }
 
 func TestToolEventPublisher_PublishToolTimeout_SubMillisecond(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{events.EventTypeToolTimeout},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	// 500 microseconds
 	err := publisher.PublishToolTimeout("session", "agent", "tool", 500*time.Microsecond)
@@ -512,10 +373,7 @@ func TestToolEventPublisher_PublishToolTimeout_SubMillisecond(t *testing.T) {
 		t.Fatalf("PublishToolTimeout failed: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(150 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) != 1 {
 		t.Fatalf("Expected 1 event, got %d", len(receivedEvents))
 	}
@@ -536,17 +394,9 @@ func TestToolEventPublisher_PublishToolTimeout_SubMillisecond(t *testing.T) {
 // =============================================================================
 
 func TestToolEventPublisher_EventIDsAreUnique(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	// Publish multiple events with different sessions to avoid debouncing
 	// (debouncer keys on event_type:agent_id:session_id)
@@ -555,10 +405,7 @@ func TestToolEventPublisher_EventIDsAreUnique(t *testing.T) {
 	_ = publisher.PublishToolResult("session-3", "agent-3", "tool1", "result", events.OutcomeSuccess)
 	_ = publisher.PublishToolTimeout("session-4", "agent-4", "tool3", time.Second)
 
-	// Wait for event delivery
-	time.Sleep(200 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
+	receivedEvents := collector.Events()
 	if len(receivedEvents) < 4 {
 		t.Fatalf("Expected at least 4 events, got %d", len(receivedEvents))
 	}
@@ -581,17 +428,9 @@ func TestToolEventPublisher_EventIDsAreUnique(t *testing.T) {
 // =============================================================================
 
 func TestToolEventPublisher_ConcurrentPublishing(t *testing.T) {
-	bus := events.NewActivityEventBus(1000)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	wg := sync.WaitGroup{}
 	goroutines := 10
@@ -616,13 +455,11 @@ func TestToolEventPublisher_ConcurrentPublishing(t *testing.T) {
 
 	wg.Wait()
 
-	// Wait for event delivery
-	time.Sleep(500 * time.Millisecond)
-
-	// Should not panic and should receive at least some events
-	receivedEvents := sub.getEvents()
-	if len(receivedEvents) == 0 {
-		t.Error("Expected at least some events to be received")
+	// Should not panic and should receive all events (collector is synchronous)
+	receivedEvents := collector.Events()
+	expectedCount := goroutines * eventsPerGoroutine
+	if len(receivedEvents) != expectedCount {
+		t.Errorf("Expected %d events, got %d", expectedCount, len(receivedEvents))
 	}
 }
 
@@ -631,17 +468,9 @@ func TestToolEventPublisher_ConcurrentPublishing(t *testing.T) {
 // =============================================================================
 
 func TestToolEventPublisher_FullToolLifecycle(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	// Simulate a tool lifecycle: call -> result
 	params := map[string]any{"path": "/tmp/test.txt"}
@@ -656,46 +485,24 @@ func TestToolEventPublisher_FullToolLifecycle(t *testing.T) {
 		t.Fatalf("PublishToolResult failed: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(200 * time.Millisecond)
-
-	receivedEvents := sub.getEvents()
-	if len(receivedEvents) < 2 {
-		t.Fatalf("Expected at least 2 events, got %d", len(receivedEvents))
+	receivedEvents := collector.Events()
+	if len(receivedEvents) != 2 {
+		t.Fatalf("Expected 2 events, got %d", len(receivedEvents))
 	}
 
 	// Verify order and types
-	foundCall := false
-	foundResult := false
-	for _, event := range receivedEvents {
-		if event.EventType == events.EventTypeToolCall {
-			foundCall = true
-		}
-		if event.EventType == events.EventTypeToolResult {
-			foundResult = true
-		}
+	if receivedEvents[0].EventType != events.EventTypeToolCall {
+		t.Errorf("Expected first event to be EventTypeToolCall, got %v", receivedEvents[0].EventType)
 	}
-
-	if !foundCall {
-		t.Error("Expected to find EventTypeToolCall event")
-	}
-	if !foundResult {
-		t.Error("Expected to find EventTypeToolResult event")
+	if receivedEvents[1].EventType != events.EventTypeToolResult {
+		t.Errorf("Expected second event to be EventTypeToolResult, got %v", receivedEvents[1].EventType)
 	}
 }
 
 func TestToolEventPublisher_ToolTimeoutLifecycle(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	sub := &testToolSubscriber{
-		id:         "test-sub",
-		eventTypes: []events.EventType{},
-	}
-	bus.Subscribe(sub)
-
-	publisher := NewToolEventPublisher(bus)
+	publisher := NewToolEventPublisher(collector)
 
 	// Simulate a tool lifecycle: call -> timeout
 	params := map[string]any{"url": "https://slow-server.example.com"}
@@ -709,20 +516,21 @@ func TestToolEventPublisher_ToolTimeoutLifecycle(t *testing.T) {
 		t.Fatalf("PublishToolTimeout failed: %v", err)
 	}
 
-	// Wait for event delivery
-	time.Sleep(200 * time.Millisecond)
+	receivedEvents := collector.Events()
+	if len(receivedEvents) != 2 {
+		t.Fatalf("Expected 2 events, got %d", len(receivedEvents))
+	}
 
-	receivedEvents := sub.getEvents()
-	if len(receivedEvents) < 2 {
-		t.Fatalf("Expected at least 2 events, got %d", len(receivedEvents))
+	// Verify order and types
+	if receivedEvents[0].EventType != events.EventTypeToolCall {
+		t.Errorf("Expected first event to be EventTypeToolCall, got %v", receivedEvents[0].EventType)
+	}
+	if receivedEvents[1].EventType != events.EventTypeToolTimeout {
+		t.Errorf("Expected second event to be EventTypeToolTimeout, got %v", receivedEvents[1].EventType)
 	}
 
 	// Verify timeout has failure outcome
-	for _, event := range receivedEvents {
-		if event.EventType == events.EventTypeToolTimeout {
-			if event.Outcome != events.OutcomeFailure {
-				t.Errorf("Timeout event should have OutcomeFailure, got %v", event.Outcome)
-			}
-		}
+	if receivedEvents[1].Outcome != events.OutcomeFailure {
+		t.Errorf("Timeout event should have OutcomeFailure, got %v", receivedEvents[1].Outcome)
 	}
 }

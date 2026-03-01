@@ -149,6 +149,29 @@ type Message struct {
 
 	// Metadata for extensibility (custom key-value pairs)
 	Metadata map[string]any `json:"metadata,omitempty"`
+
+	// ReplyTo carries the return address so agents respond directly
+	// to the originator's session topic, removing Guide from the
+	// response hot path. Guide can still observe via ObserverTopics.
+	ReplyTo *ReplyTo `json:"reply_to,omitempty"`
+}
+
+// maxObserverTopics caps the number of observer topics on ReplyTo
+// to prevent unbounded growth.
+const maxObserverTopics = 4
+
+// ReplyTo carries the return address for direct agent-to-originator
+// response routing. Agents publish their response to Topic; Guide
+// (or other observers) can subscribe to ObserverTopics for
+// correlation/telemetry without being on the response hot path.
+type ReplyTo struct {
+	// Topic is the primary response destination.
+	Topic string `json:"topic"`
+
+	// ObserverTopics are additional topics that receive a copy of the
+	// response for observation (e.g. Guide correlation, telemetry).
+	// Capped at maxObserverTopics.
+	ObserverTopics []string `json:"observer_topics,omitempty"`
 }
 
 // =============================================================================
@@ -272,6 +295,20 @@ func (m *Message) WithMetadata(key string, value any) *Message {
 	return m
 }
 
+// WithReplyTo sets the return address for direct response routing.
+// observers are optional topics (capped at maxObserverTopics) that
+// receive a copy of the response.
+func (m *Message) WithReplyTo(topic string, observers ...string) *Message {
+	if len(observers) > maxObserverTopics {
+		observers = observers[:maxObserverTopics]
+	}
+	m.ReplyTo = &ReplyTo{
+		Topic:          topic,
+		ObserverTopics: observers,
+	}
+	return m
+}
+
 // MessageType indicates what kind of message this is
 type MessageType string
 
@@ -361,11 +398,32 @@ const (
 
 	// MessageTypeActivity wraps an ActivityEvent routed through the ChannelBus.
 	MessageTypeActivity MessageType = "activity"
+
+	// MessageTypeSignal wraps a signal.SignalMessage routed through the ChannelBus.
+	MessageTypeSignal MessageType = "signal"
+
+	// MessageTypeSignalAck wraps a signal.SignalAck routed through the ChannelBus.
+	MessageTypeSignalAck MessageType = "signal_ack"
 )
 
 // =============================================================================
 // Topic Helpers
 // =============================================================================
+
+// TopicSignal returns the ChannelBus topic for a specific signal type.
+func TopicSignal(signalType string) string {
+	return TopicSignalPrefix + signalType
+}
+
+// UserResponseTopic returns the response topic for a user session.
+func UserResponseTopic(sessionID string) string {
+	return "response." + UserAgentType + "." + sessionID
+}
+
+// UserErrorTopic returns the error topic for a user session.
+func UserErrorTopic(sessionID string) string {
+	return "error." + UserAgentType + "." + sessionID
+}
 
 // =============================================================================
 // Channel Types
@@ -441,6 +499,15 @@ const (
 	// TopicActivity is where activity events are published after migration
 	// from the standalone ActivityEventBus to the Guide ChannelBus.
 	TopicActivity = "activity.events"
+
+	// TopicSignalPrefix is the prefix for signal topics routed through the ChannelBus.
+	TopicSignalPrefix = "signal."
+
+	// TopicSignalAck is the topic for signal acknowledgment messages.
+	TopicSignalAck = "signal.ack"
+
+	// UserAgentType is the agent type used for user session service endpoints.
+	UserAgentType = "user"
 )
 
 // AgentTopic returns the topic for a specific agent and channel type
@@ -995,4 +1062,74 @@ func NewActivityMessage(sourceAgentID string, event *events.ActivityEvent) *Mess
 func (m *Message) GetActivityEvent() (*events.ActivityEvent, bool) {
 	ev, ok := m.Payload.(*events.ActivityEvent)
 	return ev, ok
+}
+
+// =============================================================================
+// Signal Messages (for SignalBus → ChannelBus migration)
+// =============================================================================
+
+// SignalPayload wraps a signal for ChannelBus transport.
+type SignalPayload struct {
+	Signal      string `json:"signal"`
+	TargetID    string `json:"target_id,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Payload     any    `json:"payload,omitempty"`
+	RequiresAck bool   `json:"requires_ack"`
+}
+
+// SignalAckPayload wraps a signal acknowledgment for ChannelBus transport.
+type SignalAckPayload struct {
+	SignalID     string `json:"signal_id"`
+	SubscriberID string `json:"subscriber_id"`
+	AgentID      string `json:"agent_id"`
+	State        string `json:"state,omitempty"`
+	Checkpoint   any    `json:"checkpoint,omitempty"`
+}
+
+// NewSignalMessage creates a ChannelBus message wrapping a signal broadcast.
+func NewSignalBusMessage(id string, payload *SignalPayload) *Message {
+	if id == "" {
+		id = uuid.New().String()
+	}
+	return &Message{
+		ID:            id,
+		CorrelationID: id,
+		Type:          MessageTypeSignal,
+		Payload:       payload,
+		SourceAgentID: "signal_adapter",
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityHigh,
+	}
+}
+
+// NewSignalAckMessage creates a ChannelBus message wrapping a signal ACK.
+func NewSignalAckMessage(id string, ack *SignalAckPayload) *Message {
+	if id == "" {
+		id = uuid.New().String()
+	}
+	return &Message{
+		ID:            id,
+		CorrelationID: ack.SignalID,
+		Type:          MessageTypeSignalAck,
+		Payload:       ack,
+		SourceAgentID: ack.AgentID,
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+}
+
+// GetSignalPayload extracts SignalPayload from message payload.
+func (m *Message) GetSignalPayload() (*SignalPayload, bool) {
+	sp, ok := m.Payload.(*SignalPayload)
+	return sp, ok
+}
+
+// GetSignalAckPayload extracts SignalAckPayload from message payload.
+func (m *Message) GetSignalAckPayload() (*SignalAckPayload, bool) {
+	ap, ok := m.Payload.(*SignalAckPayload)
+	return ap, ok
 }

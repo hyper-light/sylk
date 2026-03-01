@@ -31,9 +31,8 @@ type ChannelBus struct {
 }
 
 // defaultCloseTimeout is the maximum time Close() waits for subscription
-// goroutines to drain before returning. Derived from: all handlers are
-// non-blocking (publish uses select/default), so drain should complete
-// in milliseconds; 5s provides generous safety margin.
+// goroutines to drain before returning. Queue drain should complete in
+// milliseconds; 5s provides generous safety margin.
 const defaultCloseTimeout = 5 * time.Second
 
 // maxAsyncHandlersPerSubscription caps async fan-out for a single subscription
@@ -83,9 +82,45 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 	}
 
 	subs := b.snapshotSubscribers(topicSubs)
+
+	// Diagnostic: log subscriber state for stream-complete events.
+	if b.isStreamComplete(msg) {
+		activeSubs, closedSubs := b.classifySubscribers(subs)
+		DebugFileLog().Info("Publish: STREAM_COMPLETE_SUBSCRIBER_SNAPSHOT",
+			"topic", topic,
+			"correlation_id", msg.CorrelationID,
+			"total_subs", len(subs),
+			"active_subs", activeSubs,
+			"closed_subs", closedSubs)
+	}
+
 	b.publishToSubscribers(subs, msg)
 
 	return nil
+}
+
+// isStreamComplete returns true if the message carries a StreamEventComplete.
+func (b *ChannelBus) isStreamComplete(msg *Message) bool {
+	if msg == nil || msg.Type != MessageTypeStream {
+		return false
+	}
+	stream, ok := msg.GetStreamResponse()
+	if !ok || stream == nil || stream.Event == nil {
+		return false
+	}
+	return stream.Event.Type == StreamEventComplete
+}
+
+// classifySubscribers counts active vs closed subscriptions in a snapshot.
+func (b *ChannelBus) classifySubscribers(subs []*channelSubscription) (active, closed int) {
+	for _, sub := range subs {
+		if sub.closed.Load() {
+			closed++
+		} else if sub.active.Load() {
+			active++
+		}
+	}
+	return
 }
 
 func (b *ChannelBus) snapshotSubscribers(topicSubs *topicSubscriptions) []*channelSubscription {
@@ -102,15 +137,37 @@ func (b *ChannelBus) publishToSubscribers(subs []*channelSubscription, msg *Mess
 
 func (b *ChannelBus) publishToSubscriber(sub *channelSubscription, msg *Message) {
 	if !sub.active.Load() {
+		DebugFileLog().Warn("publishToSubscriber: INACTIVE_DROP",
+			"topic", sub.topic,
+			"msg_type", string(msg.Type),
+			"correlation_id", msg.CorrelationID)
 		return
 	}
-	sub.closeMu.RLock()
-	defer sub.closeMu.RUnlock()
 	if sub.closed.Load() {
+		DebugFileLog().Warn("publishToSubscriber: CLOSED_DROP",
+			"topic", sub.topic,
+			"msg_type", string(msg.Type),
+			"correlation_id", msg.CorrelationID)
 		return
 	}
+	sub.mu.Lock()
+	sub.queue = append(sub.queue, msg)
+	queueLen := len(sub.queue)
+	sub.mu.Unlock()
+
+	// Diagnostic: confirm enqueue for stream-complete events.
+	if b.isStreamComplete(msg) {
+		DebugFileLog().Info("publishToSubscriber: STREAM_COMPLETE_ENQUEUED",
+			"topic", sub.topic,
+			"correlation_id", msg.CorrelationID,
+			"queue_len", queueLen,
+			"async", sub.async)
+	}
+
+	// Non-blocking signal: if a signal is already pending the consumer
+	// will drain all accumulated messages (including this one) when it wakes.
 	select {
-	case sub.ch <- msg:
+	case sub.notify <- struct{}{}:
 	default:
 	}
 }
@@ -132,9 +189,10 @@ func (b *ChannelBus) subscribe(topic string, handler MessageHandler, async bool)
 	}
 
 	sub := &channelSubscription{
-		bus:     b,
-		topic:   topic,
-		ch:      make(chan *Message, b.bufferSize),
+		bus:    b,
+		topic:  topic,
+		notify: make(chan struct{}, 1),
+		done:   make(chan struct{}),
 		handler: handler,
 		async:   async,
 	}
@@ -166,8 +224,7 @@ func (b *ChannelBus) Close() error {
 	return b.awaitDrain()
 }
 
-// closeAllSubscriptions closes every subscription channel so run() goroutines
-// can drain remaining messages and exit.
+// closeAllSubscriptions signals every subscription to drain and exit.
 func (b *ChannelBus) closeAllSubscriptions() {
 	allTopics := b.subscriptions.Snapshot()
 	for _, topicSubs := range allTopics {
@@ -204,12 +261,14 @@ func (b *ChannelBus) awaitDrain() error {
 type channelSubscription struct {
 	bus        *ChannelBus
 	topic      string
-	ch         chan *Message
 	handler    MessageHandler
 	async      bool
 	active     atomic.Bool
 	closed     atomic.Bool
-	closeMu    sync.RWMutex // protects channel close/send operations
+	mu         sync.Mutex   // guards queue
+	queue      []*Message   // append-only from publishers, batch-drained by consumer
+	notify     chan struct{} // cap-1 signal: "queue has messages"
+	done       chan struct{} // closed on unsubscribe/bus-close to wake consumer
 	topicShard *topicSubscriptions
 }
 
@@ -250,12 +309,10 @@ func (s *channelSubscription) Unsubscribe() error {
 }
 
 func (s *channelSubscription) close() {
-	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
 	if s.closed.Swap(true) {
 		return
 	}
-	close(s.ch)
+	close(s.done)
 }
 
 func (s *channelSubscription) run(wg *sync.WaitGroup) {
@@ -266,14 +323,31 @@ func (s *channelSubscription) run(wg *sync.WaitGroup) {
 		asyncLimiter = make(chan struct{}, maxAsyncHandlersPerSubscription)
 	}
 
-	for msg := range s.ch {
+	for {
+		select {
+		case <-s.notify:
+			s.processBatch(wg, asyncLimiter)
+		case <-s.done:
+			s.processBatch(wg, asyncLimiter)
+			return
+		}
+	}
+}
+
+// processBatch drains all queued messages under a single lock acquisition
+// and dispatches them to the handler (sync or async, same as before).
+func (s *channelSubscription) processBatch(wg *sync.WaitGroup, asyncLimiter chan struct{}) {
+	s.mu.Lock()
+	batch := s.queue
+	s.queue = nil
+	s.mu.Unlock()
+
+	for _, msg := range batch {
 		if !s.active.Load() {
 			continue
 		}
-
 		if s.async {
 			asyncLimiter <- struct{}{}
-			// Track async handler goroutines for proper shutdown
 			wg.Add(1)
 			go s.handleMessageAsync(wg, asyncLimiter, msg)
 		} else {

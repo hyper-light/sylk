@@ -13,10 +13,16 @@ func (a *Architect) enforceConsultationGate(
 	plan *DesignPlan,
 	req *ArchitectRequest,
 ) error {
+	a.logInfo("enforceConsultationGate: entry",
+		"mandatory", a.config.MandatoryConsultation,
+		"bus_available", a.bus != nil && a.running,
+		"ctx_deadline", contextDeadlineString(ctx))
 	if !a.config.MandatoryConsultation {
+		a.logInfo("enforceConsultationGate: skipped (not mandatory)")
 		return nil
 	}
 	if a.bus == nil || !a.running {
+		a.logWarn("enforceConsultationGate: bus unavailable, skipping consultations")
 		appendRiskSummary(plan, "consultation warning: architect bus unavailable; continuing without mandatory consultation results")
 		return nil
 	}
@@ -28,11 +34,30 @@ func (a *Architect) collectMandatoryConsultations(
 	plan *DesignPlan,
 	req *ArchitectRequest,
 ) error {
-	targets := mandatoryConsultationTargets(req)
-	for _, target := range targets {
+	allTargets := mandatoryConsultationTargets(req)
+	targets := a.filterRegisteredTargets(allTargets, plan)
+	a.logInfo("collectMandatoryConsultations: starting",
+		"requested", strings.Join(allTargets, ","),
+		"registered", strings.Join(targets, ","),
+		"skipped", len(allTargets)-len(targets),
+		"ctx_deadline", contextDeadlineString(ctx))
+	for i, target := range targets {
+		a.logInfo("collectMandatoryConsultations: consulting",
+			"target", target,
+			"index", i,
+			"total", len(targets),
+			"ctx_deadline", contextDeadlineString(ctx))
+		start := time.Now()
 		if err := a.captureConsultationResult(ctx, plan, req, target); err != nil {
+			a.logWarn("collectMandatoryConsultations: consultation aborted",
+				"target", target,
+				"elapsed", time.Since(start).String(),
+				"err", err)
 			return err
 		}
+		a.logInfo("collectMandatoryConsultations: consultation complete",
+			"target", target,
+			"elapsed", time.Since(start).String())
 	}
 	return nil
 }
@@ -45,11 +70,18 @@ func (a *Architect) captureConsultationResult(
 ) error {
 	evidence, err := a.runConsultation(ctx, target, req, plan)
 	if shouldAbortConsultationGate(ctx, err) {
+		a.logWarn("captureConsultationResult: context cancelled during consultation",
+			"target", target,
+			"ctx_err", ctx.Err())
 		return ctx.Err()
 	}
 	recordConsultationEvidence(plan, target, ensureConsultationEvidence(target, req, plan, evidence, err))
 	if shouldWarnConsultation(err, evidence) {
-		appendRiskSummary(plan, consultationWarningMessage(target, evidence, err))
+		warning := consultationWarningMessage(target, evidence, err)
+		a.logInfo("captureConsultationResult: consultation warning",
+			"target", target,
+			"warning", warning)
+		appendRiskSummary(plan, warning)
 	}
 	return nil
 }
@@ -130,6 +162,23 @@ func consultationWarningMessage(target string, evidence *ConsultationEvidence, e
 	return fmt.Sprintf("consultation warning (%s): consultation unsuccessful", target)
 }
 
+// filterRegisteredTargets returns only those targets that are currently
+// registered on the bus. Unregistered targets are recorded as skipped
+// consultations with a risk warning so the plan reflects reduced coverage.
+func (a *Architect) filterRegisteredTargets(targets []string, plan *DesignPlan) []string {
+	registered := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if a.isAgentRegistered(target) {
+			registered = append(registered, target)
+			continue
+		}
+		a.logInfo("filterRegisteredTargets: skipping unregistered agent",
+			"target", target)
+		appendRiskSummary(plan, fmt.Sprintf("consultation skipped (%s): agent not registered", target))
+	}
+	return registered
+}
+
 func mandatoryConsultationTargets(req *ArchitectRequest) []string {
 	targets := []string{"librarian", "archivalist"}
 	if shouldConsultAcademic(req) {
@@ -174,9 +223,22 @@ func (a *Architect) runConsultation(
 ) (*ConsultationEvidence, error) {
 	scope := planScope(plan)
 	query := consultationPrompt(target, req.Query, scope)
+	a.logInfo("runConsultation: creating timeout context",
+		"target", target,
+		"consultation_timeout", a.config.ConsultationTimeout.String(),
+		"parent_ctx_deadline", contextDeadlineString(ctx))
 	consultCtx, cancel := context.WithTimeout(ctx, a.config.ConsultationTimeout)
 	defer cancel()
+	a.logInfo("runConsultation: calling requestConsultation",
+		"target", target,
+		"consult_ctx_deadline", contextDeadlineString(consultCtx))
+	start := time.Now()
 	evidence, err := a.requestConsultation(consultCtx, target, query, scope, req.SessionID)
+	a.logInfo("runConsultation: requestConsultation returned",
+		"target", target,
+		"elapsed", time.Since(start).String(),
+		"success", evidence != nil && evidence.Success,
+		"err", err)
 	if evidence != nil && evidence.RequestedAt.IsZero() {
 		evidence.RequestedAt = time.Now()
 	}

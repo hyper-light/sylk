@@ -23,7 +23,7 @@ import (
 type Config struct {
 	// LLM configuration
 	EnableLLM       bool                   `json:"enable_llm"`
-	Model           string                 `json:"model"`              // Default: "gemini-3-flash-preview"
+	Model           string                 `json:"model"`              // Default: "gemini-3-flash-preview" (provider-agnostic, swappable at runtime)
 	MaxOutputTokens int                    `json:"max_output_tokens"`  // Default: 2048
 	Temperature     float64                `json:"temperature"`        // Default: 0.3
 	GoogleConfig    *providers.GoogleConfig `json:"google_config,omitempty"`

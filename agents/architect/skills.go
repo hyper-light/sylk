@@ -4,63 +4,32 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
+	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
-	"github.com/google/uuid"
 )
 
 func (a *Architect) registerCoreSkills() {
-	a.skills.Register(analyzeRequirementsSkill(a))
+	a.skills.Register(planSkill(a))
+	a.skills.Register(planWorkflowSkill(a))
+	a.skills.Register(startPlanningSkill(a))
+	a.skills.Register(consultSkill(a))
+	a.skills.Register(planModeSkill(a))
 	a.skills.Register(routePlanAcceptanceSkill(a))
 	a.skills.Register(handlePlanAcceptanceResultSkill(a))
-	a.skills.Register(consultBeforePlanningSkill(a))
-	a.skills.Register(consultLibrarianSkill(a))
-	a.skills.Register(consultArchivalistSkill(a))
-	a.skills.Register(consultAcademicSkill(a))
-	a.skills.Register(consultEngineerSkill(a))
-	a.skills.Register(consultDesignerSkill(a))
-	a.skills.Register(consultInspectorSkill(a))
-	a.skills.Register(consultTesterSkill(a))
-	a.skills.Register(designArchitectureSkill(a))
-	a.skills.Register(generateTasksSkill(a))
-	a.skills.Register(createWorkflowDAGSkill(a))
-	a.skills.Register(createFixDAGSkill(a))
-	a.skills.Register(interruptHandlerSkill(a))
-	a.skills.Register(estimateComplexitySkill(a))
-	a.skills.Register(consultKnowledgeSkill(a))
 	a.skills.Register(preDelegationDeclareSkill(a))
 	a.skills.Register(validatePreDelegationSkill(a))
-	// handoff_to_orchestrator is NOT registered as a skill — handoff is
-	// triggered by the system via handleExecute → dispatchPlanExecution,
-	// not by LLM tool invocation.
 	a.skills.Register(monitorExecutionSkill(a))
-	a.skills.Register(revisePlanSkill(a))
-	a.skills.Register(enterPlanModeSkill(a))
-	a.skills.Register(updatePlanFileSkill(a))
-	a.skills.Register(todoWriteSkill(a))
-	a.skills.Register(todoMarkCompleteSkill(a))
-	a.skills.Register(exitPlanModeSkill(a))
+	a.skills.Register(interruptHandlerSkill(a))
 	a.skills.Register(askUserQuestionSkill(a))
 	a.skills.Register(readResearchPaperSkill(a))
 	a.skills.Register(readFileSkill(a))
 	a.skills.Register(globSkill(a))
 	a.skills.Register(grepSkill(a))
-	a.skills.Register(gitStatusSkill(a))
-	a.skills.Register(gitDiffSkill(a))
-	a.skills.Register(gitLogSkill(a))
-	a.skills.Register(gitShowSkill(a))
-	a.skills.Register(gitBlameSkill(a))
-	a.skills.Register(gitLsFilesSkill(a))
-	a.skills.Register(gitBranchListSkill(a))
-	a.skills.Register(gitFetchSkill(a))
+	a.skills.Register(gitSkill(a))
+	a.skills.Register(lspSkill(a))
 	a.skills.Register(astGrepSearchSkill(a))
-	a.skills.Register(lspGoToDefinitionSkill(a))
-	a.skills.Register(lspFindReferencesSkill(a))
-	a.skills.Register(lspHoverSkill(a))
-	a.skills.Register(lspSymbolsSkill(a))
-	a.skills.Register(lspCallHierarchySkill(a))
 	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "architect",
 		SessionID: func() string { return "" },
@@ -82,49 +51,49 @@ func (a *Architect) publishRerouteRequest(reason, originalInput, suggestedTarget
 	return a.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
 
-type analyzeRequirementsParams struct {
-	Query       string   `json:"query"`
-	Scope       string   `json:"scope,omitempty"`
-	Goals       []string `json:"goals,omitempty"`
-	Constraints []string `json:"constraints,omitempty"`
+// ---------------------------------------------------------------------------
+// plan (consolidated: analyze, design, generate_tasks, estimate, revise)
+// ---------------------------------------------------------------------------
+
+type planInput struct {
+	Action           string                `json:"action"`
+	Query            string                `json:"query,omitempty"`
+	Scope            string                `json:"scope,omitempty"`
+	Goals            []string              `json:"goals,omitempty"`
+	Constraints      []string              `json:"constraints,omitempty"`
+	Requirements     *Requirements         `json:"requirements,omitempty"`
+	Patterns         []string              `json:"patterns,omitempty"`
+	Architecture     *SolutionArchitecture `json:"architecture,omitempty"`
+	MaxTasksPerAgent int                   `json:"max_tasks_per_agent,omitempty"`
+	AllowParallel    bool                  `json:"allow_parallel,omitempty"`
+	Description      string                `json:"description,omitempty"`
+	Context          map[string]any        `json:"context,omitempty"`
+	PlanID           string                `json:"plan_id,omitempty"`
+	Reason           string                `json:"reason,omitempty"`
+	Updates          map[string]any        `json:"updates,omitempty"`
 }
 
-func analyzeRequirementsSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("analyze_requirements").
-		Description("Analyze project requirements and extract goals, constraints, and dependencies.").
-		Domain("planning").
-		Keywords("analyze", "requirements", "understand", "goals", "constraints").
-		Priority(100).
-		StringParam("query", "The requirement or task to analyze", true).
-		StringParam("scope", "Scope of analysis (e.g., file path, module name)", false).
-		ArrayParam("goals", "Explicit goals if known", "string", false).
-		ArrayParam("constraints", "Known constraints to consider", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params analyzeRequirementsParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
+func planSkill(a *Architect) *skills.Skill {
+	type handler = func(context.Context, *planInput) (any, error)
+	dispatch := map[string]handler{
+		"analyze": func(ctx context.Context, p *planInput) (any, error) {
+			if strings.TrimSpace(p.Query) == "" {
+				return nil, fmt.Errorf("query is required for action=analyze")
 			}
-
-			if params.Query == "" {
-				return nil, fmt.Errorf("query is required")
-			}
-
 			reqParams := map[string]any{}
-			if params.Scope != "" {
-				reqParams["scope"] = params.Scope
+			if p.Scope != "" {
+				reqParams["scope"] = p.Scope
 			}
-			if len(params.Goals) > 0 {
-				reqParams["goals"] = params.Goals
+			if len(p.Goals) > 0 {
+				reqParams["goals"] = p.Goals
 			}
-			if len(params.Constraints) > 0 {
-				reqParams["constraints"] = params.Constraints
+			if len(p.Constraints) > 0 {
+				reqParams["constraints"] = p.Constraints
 			}
-
-			requirements, err := a.analyzeRequirements(ctx, params.Query, reqParams)
+			requirements, err := a.analyzeRequirements(ctx, p.Query, reqParams)
 			if err != nil {
 				return nil, err
 			}
-
 			return map[string]any{
 				"requirements": requirements,
 				"analysis": map[string]any{
@@ -133,52 +102,24 @@ func analyzeRequirementsSkill(a *Architect) *skills.Skill {
 					"scope":            requirements.Scope,
 				},
 			}, nil
-		}).
-		Build()
-}
-
-type designArchitectureParams struct {
-	Requirements *Requirements `json:"requirements"`
-	Patterns     []string      `json:"patterns,omitempty"`
-}
-
-func designArchitectureSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("design_architecture").
-		Description("Design system architecture based on requirements and existing patterns.").
-		Domain("design").
-		Keywords("design", "architecture", "system", "components", "structure").
-		Priority(95).
-		ObjectParam("requirements", "Requirements to design for", map[string]*skills.Property{
-			"query": {Type: "string", Description: "Main requirement query"},
-			"goals": {Type: "array", Items: &skills.Property{Type: "string"}, Description: "Goals to achieve"},
-			"scope": {Type: "string", Description: "Scope of the design"},
-		}, true).
-		ArrayParam("patterns", "Existing patterns to incorporate", "string", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params designArchitectureParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
+		},
+		"design": func(ctx context.Context, p *planInput) (any, error) {
+			if p.Requirements == nil {
+				return nil, fmt.Errorf("requirements is required for action=design")
 			}
-
-			if params.Requirements == nil {
-				return nil, fmt.Errorf("requirements is required")
-			}
-
 			var codebasePatterns *CodebasePatterns
-			if len(params.Patterns) > 0 {
+			if len(p.Patterns) > 0 {
 				codebasePatterns = &CodebasePatterns{
-					Patterns: make([]PatternInfo, len(params.Patterns)),
+					Patterns: make([]PatternInfo, len(p.Patterns)),
 				}
-				for i, p := range params.Patterns {
-					codebasePatterns.Patterns[i] = PatternInfo{Name: p}
+				for i, pat := range p.Patterns {
+					codebasePatterns.Patterns[i] = PatternInfo{Name: pat}
 				}
 			}
-
-			architecture, err := a.designArchitecture(ctx, params.Requirements, codebasePatterns)
+			architecture, err := a.designArchitecture(ctx, p.Requirements, codebasePatterns)
 			if err != nil {
 				return nil, err
 			}
-
 			return map[string]any{
 				"architecture": architecture,
 				"summary": map[string]any{
@@ -187,59 +128,28 @@ func designArchitectureSkill(a *Architect) *skills.Skill {
 					"pattern_count":   len(architecture.Patterns),
 				},
 			}, nil
-		}).
-		Build()
-}
-
-type generateTasksParams struct {
-	Architecture     *SolutionArchitecture `json:"architecture"`
-	MaxTasksPerAgent int                   `json:"max_tasks_per_agent,omitempty"`
-	AllowParallel    bool                  `json:"allow_parallel,omitempty"`
-}
-
-func generateTasksSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("generate_tasks").
-		Description("Generate atomic tasks from system architecture.").
-		Domain("planning").
-		Keywords("generate", "tasks", "atomic", "decompose", "breakdown").
-		Priority(90).
-		ObjectParam("architecture", "Architecture to generate tasks from", map[string]*skills.Property{
-			"name":        {Type: "string", Description: "Architecture name"},
-			"description": {Type: "string", Description: "Architecture description"},
-			"components":  {Type: "array", Description: "Component specifications"},
-		}, true).
-		IntParam("max_tasks_per_agent", "Maximum tasks per agent (default: 5)", false).
-		BoolParam("allow_parallel", "Allow parallel task execution (default: true)", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params generateTasksParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
+		},
+		"generate_tasks": func(ctx context.Context, p *planInput) (any, error) {
+			if p.Architecture == nil {
+				return nil, fmt.Errorf("architecture is required for action=generate_tasks")
 			}
-
-			if params.Architecture == nil {
-				return nil, fmt.Errorf("architecture is required")
-			}
-
 			constraints := &PlanConstraints{
-				MaxTasksPerAgent: params.MaxTasksPerAgent,
-				AllowParallel:    params.AllowParallel,
+				MaxTasksPerAgent: p.MaxTasksPerAgent,
+				AllowParallel:    p.AllowParallel,
 			}
 			if constraints.MaxTasksPerAgent == 0 {
 				constraints.MaxTasksPerAgent = 5
 			}
-
-			tasks, err := a.generateAtomicTasks(ctx, params.Architecture, constraints)
+			tasks, err := a.generateAtomicTasks(ctx, p.Architecture, constraints)
 			if err != nil {
 				return nil, err
 			}
-
 			totalTokens := 0
 			complexityCounts := map[string]int{}
 			for _, task := range tasks {
 				totalTokens += task.EstimatedTokens
 				complexityCounts[task.Complexity.String()]++
 			}
-
 			return map[string]any{
 				"tasks": tasks,
 				"summary": map[string]any{
@@ -248,47 +158,122 @@ func generateTasksSkill(a *Architect) *skills.Skill {
 					"complexity_counts": complexityCounts,
 				},
 			}, nil
+		},
+		"estimate": func(_ context.Context, p *planInput) (any, error) {
+			if strings.TrimSpace(p.Description) == "" {
+				return nil, fmt.Errorf("description is required for action=estimate")
+			}
+			estimate := estimateTaskComplexity(p.Description, p.Context)
+			return map[string]any{"estimate": estimate}, nil
+		},
+		"revise": func(_ context.Context, p *planInput) (any, error) {
+			if strings.TrimSpace(p.Reason) == "" {
+				return nil, fmt.Errorf("reason is required for action=revise")
+			}
+			plan, err := a.selectPlan(p.PlanID)
+			if err != nil {
+				return nil, err
+			}
+			updated := a.applyPlanRevision(plan, p.Reason, p.Updates)
+			return map[string]any{
+				"plan_id":  updated.ID,
+				"revision": updated.Revision,
+				"status":   updated.Status.String(),
+				"updated":  updated.UpdatedAt,
+			}, nil
+		},
+	}
+
+	return skills.NewSkill("plan").
+		Description("Plan operations for analyzing requirements, designing architecture, generating tasks, estimating complexity, and revising plans.\n\n"+
+			"Actions:\n"+
+			"- analyze: Analyze project requirements (params: query [required], scope, goals, constraints)\n"+
+			"- design: Design system architecture (params: requirements [required], patterns)\n"+
+			"- generate_tasks: Generate atomic tasks from architecture (params: architecture [required], max_tasks_per_agent, allow_parallel)\n"+
+			"- estimate: Estimate task complexity and token usage (params: description [required], context)\n"+
+			"- revise: Revise an existing plan (params: plan_id, reason [required], updates)").
+		Domain("planning").
+		Keywords("analyze", "requirements", "understand", "goals", "constraints",
+			"design", "architecture", "system", "components", "structure",
+			"generate", "tasks", "atomic", "decompose", "breakdown",
+			"estimate", "complexity", "tokens", "effort", "size",
+			"revise", "replan", "update plan", "change workflow").
+		Priority(100).
+		TokenEstimate(600).
+		EnumParam("action", "Planning action to execute", []string{
+			"analyze", "design", "generate_tasks", "estimate", "revise",
+		}, true).
+		StringParam("query", "Requirement or task to analyze (for analyze)", false).
+		StringParam("scope", "Scope of analysis (for analyze)", false).
+		ArrayParam("goals", "Explicit goals (for analyze)", "string", false).
+		ArrayParam("constraints", "Known constraints (for analyze)", "string", false).
+		ObjectParam("requirements", "Requirements to design for (for design)", map[string]*skills.Property{
+			"query": {Type: "string", Description: "Main requirement query"},
+			"goals": {Type: "array", Items: &skills.Property{Type: "string"}, Description: "Goals to achieve"},
+			"scope": {Type: "string", Description: "Scope of the design"},
+		}, false).
+		ArrayParam("patterns", "Existing patterns to incorporate (for design)", "string", false).
+		ObjectParam("architecture", "Architecture to generate tasks from (for generate_tasks)", map[string]*skills.Property{
+			"name":        {Type: "string", Description: "Architecture name"},
+			"description": {Type: "string", Description: "Architecture description"},
+			"components":  {Type: "array", Description: "Component specifications"},
+		}, false).
+		IntParam("max_tasks_per_agent", "Maximum tasks per agent (for generate_tasks, default 5)", false).
+		BoolParam("allow_parallel", "Allow parallel execution (for generate_tasks, default true)", false).
+		StringParam("description", "Task description to estimate (for estimate)", false).
+		ObjectParam("context", "Additional context for estimation (for estimate)", map[string]*skills.Property{
+			"has_dependencies":  {Type: "boolean", Description: "Whether task has dependencies"},
+			"dependency_count":  {Type: "integer", Description: "Number of dependencies"},
+			"scope":             {Type: "string", Description: "Task scope"},
+			"involves_tests":    {Type: "boolean", Description: "Whether task includes testing"},
+			"involves_refactor": {Type: "boolean", Description: "Whether task involves refactoring"},
+		}, false).
+		StringParam("plan_id", "Plan identifier to revise (for revise)", false).
+		StringParam("reason", "Reason for revision (for revise)", false).
+		ObjectParam("updates", "Optional update payload (for revise)", map[string]*skills.Property{}, false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params planInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			fn, ok := dispatch[params.Action]
+			if !ok {
+				return nil, fmt.Errorf("unknown plan action: %q", params.Action)
+			}
+			return fn(ctx, &params)
 		}).
 		Build()
 }
 
-type createWorkflowDAGParams struct {
-	Tasks          []*AtomicTask `json:"tasks"`
+// ---------------------------------------------------------------------------
+// plan_workflow (consolidated: standard, fix)
+// ---------------------------------------------------------------------------
+
+type planWorkflowInput struct {
+	Type           string        `json:"type"`
+	Tasks          []*AtomicTask `json:"tasks,omitempty"`
 	Policy         string        `json:"policy,omitempty"`
 	MaxConcurrency int           `json:"max_concurrency,omitempty"`
+	PlanID         string        `json:"plan_id,omitempty"`
+	SessionID      string        `json:"session_id,omitempty"`
+	Corrections    []any         `json:"corrections,omitempty"`
 }
 
-func createWorkflowDAGSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("create_workflow_dag").
-		Description("Build a workflow DAG structure from atomic tasks during plan formulation. Does NOT dispatch or execute the plan.").
-		Domain("planning").
-		Keywords("workflow", "dag", "dependency graph", "task order", "plan structure").
-		Priority(85).
-		ArrayParam("tasks", "Tasks to create workflow from", "object", true).
-		EnumParam("policy", "Execution policy", []string{"fail_fast", "continue"}, false).
-		IntParam("max_concurrency", "Maximum concurrent tasks (default: 10)", false).
-		Usage("Use during plan formulation to organize atomic tasks into a dependency graph. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance followed by handle_plan_acceptance_result.").
-		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires: route_plan_acceptance → Guide verdict → handle_plan_acceptance_result.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params createWorkflowDAGParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
+func planWorkflowSkill(a *Architect) *skills.Skill {
+	type handler = func(context.Context, *planWorkflowInput) (any, error)
+	dispatch := map[string]handler{
+		"standard": func(ctx context.Context, p *planWorkflowInput) (any, error) {
+			if len(p.Tasks) == 0 {
+				return nil, fmt.Errorf("tasks are required for type=standard")
 			}
-
-			if len(params.Tasks) == 0 {
-				return nil, fmt.Errorf("tasks are required")
-			}
-
-			workflow, err := a.createWorkflowDAG(ctx, params.Tasks)
+			workflow, err := a.createWorkflowDAG(ctx, p.Tasks)
 			if err != nil {
 				return nil, err
 			}
-
 			executionOrder := [][]string{}
 			if workflow.DAG != nil {
 				executionOrder = workflow.DAG.ExecutionOrder()
 			}
-
 			return map[string]any{
 				"workflow": map[string]any{
 					"dag_id":           workflow.DAG.ID(),
@@ -298,47 +283,64 @@ func createWorkflowDAGSkill(a *Architect) *skills.Skill {
 					"layer_count":      len(executionOrder),
 				},
 			}, nil
-		}).
-		Build()
-}
+		},
+		"fix": func(ctx context.Context, p *planWorkflowInput) (any, error) {
+			if len(p.Corrections) == 0 {
+				return nil, fmt.Errorf("corrections are required for type=fix")
+			}
+			tasks := buildFixTasks(p.Corrections)
+			workflow, err := a.createWorkflowDAG(ctx, tasks)
+			if err != nil {
+				return nil, err
+			}
+			linkedPlanID := a.attachFixWorkflow(p.PlanID, workflow, tasks)
+			return map[string]any{
+				"plan_id":      linkedPlanID,
+				"session_id":   normalizeSessionID(p.SessionID),
+				"workflow":     workflow,
+				"task_count":   len(tasks),
+				"corrections":  len(p.Corrections),
+				"workflow_tag": "fix",
+			}, nil
+		},
+	}
 
-type estimateComplexityParams struct {
-	Description string         `json:"description"`
-	Context     map[string]any `json:"context,omitempty"`
-}
-
-func estimateComplexitySkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("estimate_complexity").
-		Description("Estimate the complexity and token usage for a task.").
+	return skills.NewSkill("plan_workflow").
+		Description("Build workflow DAG structures from tasks or corrections. Does NOT dispatch or execute the plan.\n\n"+
+			"Types:\n"+
+			"- standard: Build DAG from atomic tasks (params: tasks [required], policy, max_concurrency)\n"+
+			"- fix: Build remediation DAG from corrections (params: corrections [required], plan_id, session_id)").
 		Domain("planning").
-		Keywords("estimate", "complexity", "tokens", "effort", "size").
-		Priority(80).
-		StringParam("description", "Task description to estimate", true).
-		ObjectParam("context", "Additional context for estimation", map[string]*skills.Property{
-			"has_dependencies":  {Type: "boolean", Description: "Whether task has dependencies"},
-			"dependency_count":  {Type: "integer", Description: "Number of dependencies"},
-			"scope":             {Type: "string", Description: "Task scope"},
-			"involves_tests":    {Type: "boolean", Description: "Whether task includes testing"},
-			"involves_refactor": {Type: "boolean", Description: "Whether task involves refactoring"},
-		}, false).
+		Keywords("workflow", "dag", "dependency graph", "task order", "plan structure",
+			"fix dag", "corrections", "repair structure", "remediation tasks").
+		Priority(85).
+		TokenEstimate(350).
+		EnumParam("type", "Workflow type to build", []string{"standard", "fix"}, true).
+		ArrayParam("tasks", "Atomic tasks for standard workflow", "object", false).
+		EnumParam("policy", "Execution policy (for standard)", []string{"fail_fast", "continue"}, false).
+		IntParam("max_concurrency", "Maximum concurrent tasks (for standard, default 10)", false).
+		StringParam("plan_id", "Plan identifier to attach fix DAG to (for fix)", false).
+		StringParam("session_id", "Session identifier (for fix)", false).
+		ArrayParam("corrections", "Correction list from inspector/tester feedback (for fix)", "object", false).
+		Usage("Use during plan formulation to organize atomic tasks into a dependency graph. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance followed by handle_plan_acceptance_result.").
+		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires: route_plan_acceptance → Guide verdict → handle_plan_acceptance_result.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params estimateComplexityParams
+			var params planWorkflowInput
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-
-			if params.Description == "" {
-				return nil, fmt.Errorf("description is required")
+			fn, ok := dispatch[params.Type]
+			if !ok {
+				return nil, fmt.Errorf("unknown plan_workflow type: %q", params.Type)
 			}
-
-			estimate := estimateTaskComplexity(params.Description, params.Context)
-
-			return map[string]any{
-				"estimate": estimate,
-			}, nil
+			return fn(ctx, &params)
 		}).
 		Build()
 }
+
+// ---------------------------------------------------------------------------
+// estimateTaskComplexity — shared helper used by planSkill action=estimate
+// ---------------------------------------------------------------------------
 
 func estimateTaskComplexity(description string, context map[string]any) *ComplexityEstimate {
 	baseTokens := 2000
@@ -414,70 +416,4 @@ func estimateTaskComplexity(description string, context map[string]any) *Complex
 		RiskLevel:       riskLevel,
 		Factors:         factors,
 	}
-}
-
-type consultKnowledgeParams struct {
-	Target string `json:"target"`
-	Query  string `json:"query"`
-	Scope  string `json:"scope,omitempty"`
-}
-
-func consultKnowledgeSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("consult_knowledge").
-		Description("Consult Librarian, Archivalist, or Academic for evidence before committing to a plan.").
-		Domain("planning").
-		Keywords("consult", "librarian", "academic", "patterns", "knowledge").
-		Priority(75).
-		EnumParam("target", "Agent to consult", []string{"librarian", "archivalist", "academic"}, true).
-		StringParam("query", "Question or topic to consult about", true).
-		StringParam("scope", "Scope to limit the search", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params consultKnowledgeParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			if params.Target == "" {
-				return nil, fmt.Errorf("target is required")
-			}
-			if params.Query == "" {
-				return nil, fmt.Errorf("query is required")
-			}
-
-			if !a.running || a.bus == nil {
-				return map[string]any{
-					"status":  "unavailable",
-					"message": "Event bus not available for consultation",
-				}, nil
-			}
-
-			req := &ArchitectRequest{
-				ID:        uuid.New().String(),
-				Intent:    IntentConsult,
-				Query:     params.Query,
-				Timestamp: time.Now(),
-				Params: map[string]any{
-					"target": params.Target,
-					"scope":  params.Scope,
-				},
-			}
-
-			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, "")
-			if err != nil {
-				return map[string]any{
-					"target": params.Target,
-					"status": "failed",
-					"query":  req.Query,
-					"error":  err.Error(),
-				}, nil
-			}
-			return map[string]any{
-				"target":   params.Target,
-				"status":   "ok",
-				"query":    req.Query,
-				"evidence": evidence,
-				"data":     evidence.Data,
-			}, nil
-		}).
-		Build()
 }

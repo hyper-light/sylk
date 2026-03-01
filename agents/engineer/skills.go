@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/escalation"
+	"github.com/adalundhe/sylk/core/format"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -24,31 +27,27 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(writeFileSkill(e))
 	e.skills.Register(editFileSkill(e))
 	e.skills.Register(runCommandSkill(e))
-	e.skills.Register(runTestsSkill(e))
 	e.skills.Register(globSkill(e))
 	e.skills.Register(grepSkill(e))
 
-	// Consultation skills
-	e.skills.Register(directConsultSkill(e, "consult_librarian", "librarian",
-		"Consult the Librarian for codebase patterns, existing implementations, and dependency information."))
-	e.skills.Register(directConsultSkill(e, "consult_archivalist", "archivalist",
-		"Consult the Archivalist for historical context on code decisions and past changes."))
-	e.skills.Register(directConsultSkill(e, "consult_academic", "academic",
-		"Consult the Academic for theoretical guidance, alternative approaches, and research-backed solutions."))
+	// Code analysis & quality
+	e.skills.Register(lspSkill(e))
+	e.skills.Register(formatSkill(e))
+	e.skills.Register(lintSkill(e))
 
-	// Discovery skills
+	// Consultation
+	e.skills.Register(consultSkill(e))
+
+	// Discovery
 	e.skills.Register(discoverProjectToolsSkill(e))
 	e.skills.Register(discoverCodePatternsSkill(e))
 
-	// Audit skills
-	e.skills.Register(auditImplementationSkill(e))
-	e.skills.Register(reviewCodeQualitySkill(e))
-
-	// Communication skills
-	e.skills.Register(signalOrchestratorSkill(e))
-
-	// Confidence / escalation
+	// Quality & reporting
+	e.skills.Register(auditSkill(e))
 	e.skills.Register(reportConfidenceSkill(e))
+
+	// Communication
+	e.skills.Register(signalOrchestratorSkill(e))
 
 	// Reroute
 	e.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
@@ -59,31 +58,41 @@ func (e *Engineer) registerCoreSkills() {
 }
 
 // =============================================================================
-// Consultation Skills (following architect directConsultSkill pattern)
+// Consolidated Consultation Skill
 // =============================================================================
 
-type directConsultParams struct {
-	Query     string `json:"query"`
-	Scope     string `json:"scope"`
-	SessionID string `json:"session_id"`
+// consultTargets enumerates valid consultation targets.
+var consultTargets = map[string]string{
+	"librarian":   "Codebase patterns, existing implementations, and dependency information",
+	"archivalist": "Historical context on code decisions and past changes",
+	"academic":    "Theoretical guidance, alternative approaches, and research-backed solutions",
 }
 
-func directConsultSkill(e *Engineer, name, target, description string) *skills.Skill {
-	return skills.NewSkill(name).
-		Description(description).
+func consultSkill(e *Engineer) *skills.Skill {
+	return skills.NewSkill("consult").
+		Description("Consult a domain expert agent. Targets: librarian (codebase patterns), archivalist (historical context), academic (theoretical guidance).").
 		Domain("consultation").
-		Keywords("consult", target, "knowledge", "patterns", "history", "research").
-		Priority(90).
+		Keywords("consult", "librarian", "archivalist", "academic", "knowledge", "patterns", "history", "research").
+		Priority(85).
+		EnumParam("target", "Agent to consult", []string{"librarian", "archivalist", "academic"}, true).
 		StringParam("query", "Consultation question", true).
 		StringParam("scope", "Scope for consultation", false).
 		StringParam("session_id", "Session identifier", false).
-		Usage(fmt.Sprintf("Use to gather evidence from the %s. Consultation is synchronous — you will receive the result before proceeding.", target)).
-		Example(`{"query": "What patterns exist for error handling in this codebase?", "scope": "backend"}`).
+		Usage("Use to gather evidence from domain experts. Consultation is synchronous — you will receive the result before proceeding.").
+		Example(`{"target": "librarian", "query": "What patterns exist for error handling in this codebase?", "scope": "backend"}`).
 		BestPractice("Consult before implementing, not after. Results are cached — do not re-consult the same agent for the same query.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params directConsultParams
+			var params struct {
+				Target    string `json:"target"`
+				Query     string `json:"query"`
+				Scope     string `json:"scope"`
+				SessionID string `json:"session_id"`
+			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if _, ok := consultTargets[params.Target]; !ok {
+				return nil, fmt.Errorf("invalid target %q: must be librarian, archivalist, or academic", params.Target)
 			}
 			if params.Query == "" {
 				return nil, fmt.Errorf("query is required")
@@ -92,12 +101,12 @@ func directConsultSkill(e *Engineer, name, target, description string) *skills.S
 			if sessionID == "" {
 				sessionID = e.config.SessionID
 			}
-			evidence, err := e.requestConsultation(ctx, target, params.Query, params.Scope, sessionID)
+			evidence, err := e.requestConsultation(ctx, params.Target, params.Query, params.Scope, sessionID)
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{
-				"target":  target,
+				"target":  params.Target,
 				"success": evidence.Success,
 				"data":    evidence.Data,
 			}, nil
@@ -106,52 +115,23 @@ func directConsultSkill(e *Engineer, name, target, description string) *skills.S
 }
 
 // =============================================================================
-// Audit Skills
+// Consolidated Audit Skill
 // =============================================================================
 
-func auditImplementationSkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("audit_implementation").
-		Description("Self-audit the current implementation for quality issues. Returns a structured verdict with quality score and issues.").
+func auditSkill(e *Engineer) *skills.Skill {
+	return skills.NewSkill("audit").
+		Description("Self-audit code for quality issues against readability, correctness, performance, and maintainability standards. Returns a structured verdict with quality score and issues.").
 		Domain("quality").
-		Keywords("audit", "review", "quality", "check", "validate").
+		Keywords("audit", "review", "quality", "check", "validate", "standards", "code").
 		Priority(85).
-		StringParam("implementation", "The implementation output to audit", true).
-		StringParam("criteria", "Acceptance criteria to audit against", false).
+		StringParam("code", "The code or implementation output to audit", true).
+		StringParam("criteria", "Acceptance criteria or standards to audit against", false).
 		Usage("Call after completing implementation to self-review. If audit fails, fix issues and re-audit.").
 		BestPractice("Always audit before reporting completion. If audit fails, fix issues and re-audit.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
-				Implementation string `json:"implementation"`
-				Criteria       string `json:"criteria"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if params.Implementation == "" {
-				return nil, fmt.Errorf("implementation is required")
-			}
-			verdict, err := e.selfAudit(ctx, params.Implementation, params.Criteria)
-			if err != nil {
-				return nil, err
-			}
-			return verdict, nil
-		}).
-		Build()
-}
-
-func reviewCodeQualitySkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("review_code_quality").
-		Description("Review code against readability, correctness, performance, and maintainability standards.").
-		Domain("quality").
-		Keywords("review", "quality", "standards", "code", "check").
-		Priority(80).
-		StringParam("code", "Code to review", true).
-		StringParam("standards", "Specific standards to check against", false).
-		Usage("Use to check code against project quality standards before finalizing.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Code      string `json:"code"`
-				Standards string `json:"standards"`
+				Code     string `json:"code"`
+				Criteria string `json:"criteria"`
 			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
@@ -159,7 +139,7 @@ func reviewCodeQualitySkill(e *Engineer) *skills.Skill {
 			if params.Code == "" {
 				return nil, fmt.Errorf("code is required")
 			}
-			verdict, err := e.selfAudit(ctx, params.Code, params.Standards)
+			verdict, err := e.selfAudit(ctx, params.Code, params.Criteria)
 			if err != nil {
 				return nil, err
 			}
@@ -177,7 +157,7 @@ func signalOrchestratorSkill(e *Engineer) *skills.Skill {
 		Description("Signal the Orchestrator with progress, questions, or blocks.").
 		Domain("communication").
 		Keywords("signal", "orchestrator", "progress", "question", "block", "stuck").
-		Priority(75).
+		Priority(70).
 		StringParam("signal_type", "Type of signal: progress, question, blocked, completed, failed", true).
 		StringParam("message", "Signal message content", true).
 		StringParam("task_id", "Task identifier", false).
@@ -216,7 +196,7 @@ func reportConfidenceSkill(e *Engineer) *skills.Skill {
 		Description("Report a multi-dimensional numeric confidence assessment for the current task. Returns composite score, category, and escalation target if warranted.").
 		Domain("quality").
 		Keywords("confidence", "quality", "assessment", "escalate", "score").
-		Priority(95).
+		Priority(80).
 		FloatParam("correctness", "Functional correctness score [0.0, 1.0]", true).
 		FloatParam("completeness", "Completeness score — all requirements addressed [0.0, 1.0]", true).
 		FloatParam("quality", "Code quality score [0.0, 1.0]", true).
@@ -396,7 +376,7 @@ func writeFileSkill(e *Engineer) *skills.Skill {
 		Description("Write content to a file. Creates the file if it doesn't exist, overwrites if it does.").
 		Domain("filesystem").
 		Keywords("write", "file", "create", "save", "output").
-		Priority(95).
+		Priority(90).
 		StringParam("path", "Path to the file to write (relative to working directory)", true).
 		StringParam("content", "Content to write to the file", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -476,7 +456,7 @@ func editFileSkill(e *Engineer) *skills.Skill {
 		Description("Edit specific sections of a file using search and replace. Each edit specifies old text to find and new text to replace it with.").
 		Domain("filesystem").
 		Keywords("edit", "modify", "replace", "change", "update").
-		Priority(90).
+		Priority(95).
 		StringParam("path", "Path to the file to edit (relative to working directory)", true).
 		ArrayParam("edits", "List of edits to apply, each with old_text and new_text", "object", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -567,7 +547,7 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 		Description("Execute a shell command. Only approved command patterns are allowed for safety.").
 		Domain("code").
 		Keywords("run", "execute", "command", "shell", "bash").
-		Priority(85).
+		Priority(80).
 		StringParam("command", "Command to execute", true).
 		StringParam("working_dir", "Working directory for command execution", false).
 		IntParam("timeout_ms", "Command timeout in milliseconds (default: 30000)", false).
@@ -662,105 +642,6 @@ func isCommandBlocked(command string, approved ApprovedCommandPatterns) bool {
 }
 
 // =============================================================================
-// run_tests - Run project tests
-// =============================================================================
-
-type runTestsParams struct {
-	Pattern  string `json:"pattern,omitempty"`
-	Verbose  bool   `json:"verbose,omitempty"`
-	Coverage bool   `json:"coverage,omitempty"`
-}
-
-func runTestsSkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("run_tests").
-		Description("Run project tests. Supports pattern matching, verbose output, and coverage reporting.").
-		Domain("testing").
-		Keywords("test", "run", "check", "verify", "coverage").
-		Priority(80).
-		StringParam("pattern", "Test pattern to run (e.g., './...' for all, './pkg/...' for specific package)", false).
-		BoolParam("verbose", "Enable verbose test output", false).
-		BoolParam("coverage", "Enable coverage reporting", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params runTestsParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-
-			if !e.config.EngineerConfig.EnableCommands {
-				return nil, fmt.Errorf("command execution is disabled")
-			}
-
-			// Build test command
-			args := []string{"test"}
-
-			if params.Pattern != "" {
-				args = append(args, params.Pattern)
-			} else {
-				args = append(args, "./...")
-			}
-
-			if params.Verbose {
-				args = append(args, "-v")
-			}
-
-			if params.Coverage {
-				args = append(args, "-cover")
-			}
-
-			command := "go " + strings.Join(args, " ")
-
-			ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-			defer cancel()
-
-			cmd := exec.CommandContext(ctx, "go", args...)
-			cmd.Dir = e.config.EngineerConfig.WorkingDirectory
-
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout = &stdout
-			cmd.Stderr = &stderr
-
-			startTime := time.Now()
-			err := cmd.Run()
-			duration := time.Since(startTime)
-
-			exitCode := 0
-			if err != nil {
-				if exitErr, ok := err.(*exec.ExitError); ok {
-					exitCode = exitErr.ExitCode()
-				}
-			}
-
-			// Parse test results
-			output := stdout.String()
-			passed := exitCode == 0
-			testCount := countTestsInOutput(output)
-
-			return map[string]any{
-				"command":   command,
-				"passed":    passed,
-				"exit_code": exitCode,
-				"tests_run": testCount,
-				"duration":  duration.String(),
-				"stdout":    output,
-				"stderr":    stderr.String(),
-			}, nil
-		}).
-		Build()
-}
-
-func countTestsInOutput(output string) int {
-	// Count "--- PASS:" and "--- FAIL:" lines
-	count := 0
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "--- PASS:") || strings.Contains(line, "--- FAIL:") {
-			count++
-		}
-	}
-	return count
-}
-
-// =============================================================================
 // glob - Find files by pattern
 // =============================================================================
 
@@ -774,7 +655,7 @@ func globSkill(e *Engineer) *skills.Skill {
 		Description("Find files matching a glob pattern. Supports ** for recursive matching.").
 		Domain("filesystem").
 		Keywords("glob", "find", "files", "pattern", "match").
-		Priority(75).
+		Priority(90).
 		StringParam("pattern", "Glob pattern (e.g., '**/*.go', 'src/**/*.ts')", true).
 		ArrayParam("exclude", "Patterns to exclude (e.g., 'vendor/**', 'node_modules/**')", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -902,7 +783,7 @@ func grepSkill(e *Engineer) *skills.Skill {
 		Description("Search file contents using regular expressions. Returns matching lines with optional context.").
 		Domain("code").
 		Keywords("grep", "search", "find", "regex", "pattern").
-		Priority(70).
+		Priority(90).
 		StringParam("pattern", "Regular expression pattern to search for", true).
 		StringParam("path", "Directory path to search in (default: working directory)", false).
 		StringParam("include", "File pattern to include (e.g., '*.go', '*.ts')", false).
@@ -1043,6 +924,389 @@ func isBinaryFile(name string) bool {
 		}
 	}
 	return false
+}
+
+// =============================================================================
+// lsp - Language Server Protocol code intelligence
+// =============================================================================
+
+type lspInput struct {
+	Action    string `json:"action"`
+	File      string `json:"file,omitempty"`
+	Line      int    `json:"line,omitempty"`
+	Column    int    `json:"column,omitempty"`
+	Query     string `json:"query,omitempty"`
+	Direction string `json:"direction,omitempty"`
+}
+
+func lspSkill(e *Engineer) *skills.Skill {
+	type handler = func(context.Context, *lspInput) (any, error)
+
+	locationAction := func(subcommand string) handler {
+		return func(ctx context.Context, p *lspInput) (any, error) {
+			if strings.TrimSpace(p.File) == "" {
+				return nil, fmt.Errorf("file is required for %s", subcommand)
+			}
+			loc := lspLocation(p.File, p.Line, p.Column)
+			output, status := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, subcommand, loc)
+			if status != "ok" {
+				return map[string]any{"status": status, "reason": output}, nil
+			}
+			return map[string]any{"status": "ok", "output": output}, nil
+		}
+	}
+
+	dispatch := map[string]handler{
+		"goto_definition": locationAction("definition"),
+		"find_references": locationAction("references"),
+		"hover":           locationAction("hover"),
+		"symbols": func(ctx context.Context, p *lspInput) (any, error) {
+			argument := strings.TrimSpace(p.Query)
+			if argument == "" {
+				argument = strings.TrimSpace(p.File)
+			}
+			if argument == "" {
+				argument = "."
+			}
+			output, status := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, "symbols", argument)
+			if status != "ok" {
+				return map[string]any{"status": status, "reason": output}, nil
+			}
+			return map[string]any{"status": "ok", "output": output}, nil
+		},
+		"call_hierarchy": func(ctx context.Context, p *lspInput) (any, error) {
+			loc := lspLocation(p.File, p.Line, p.Column)
+			refs, refsStatus := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, "references", loc)
+			defn, defStatus := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, "definition", loc)
+			if refsStatus != "ok" && defStatus != "ok" {
+				return map[string]any{"status": "unavailable", "reason": refs}, nil
+			}
+			return map[string]any{
+				"status":     "ok",
+				"direction":  p.Direction,
+				"references": refs,
+				"definition": defn,
+			}, nil
+		},
+	}
+
+	return skills.NewSkill("lsp").
+		Description("Query gopls language server for code intelligence.\n\n"+
+			"Actions:\n"+
+			"- goto_definition: Navigate to symbol definition (params: file, line, column)\n"+
+			"- find_references: Find all references to a symbol (params: file, line, column)\n"+
+			"- hover: Get type info and documentation for a symbol (params: file, line, column)\n"+
+			"- symbols: List symbols in a file or search workspace (params: file or query)\n"+
+			"- call_hierarchy: Trace callers/callees of a symbol (params: file, line, column, direction)").
+		Domain("code_analysis").
+		Keywords("lsp", "symbol", "definition", "references", "hover",
+			"outline", "structure", "call hierarchy", "callers", "callees").
+		Priority(95).
+		EnumParam("action", "LSP action to execute", []string{
+			"goto_definition", "find_references", "hover", "symbols", "call_hierarchy",
+		}, true).
+		StringParam("file", "File path", false).
+		IntParam("line", "Line number (1-based)", false).
+		IntParam("column", "Column number (1-based)", false).
+		StringParam("query", "Symbol query for workspace search", false).
+		StringParam("direction", "Call hierarchy direction: incoming|outgoing|both", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params lspInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			fn, ok := dispatch[params.Action]
+			if !ok {
+				return nil, fmt.Errorf("unknown lsp action: %q", params.Action)
+			}
+			return fn(ctx, &params)
+		}).
+		Build()
+}
+
+func lspLocation(file string, line, column int) string {
+	return fmt.Sprintf("%s:%d:%d", file, line, column)
+}
+
+func runGoplsCommand(ctx context.Context, workDir, subcommand, arg string) (string, string) {
+	if detect.Which("gopls") == "" {
+		return "gopls is not installed", "unavailable"
+	}
+	output, err := runToolInDir(ctx, workDir, "gopls", subcommand, arg)
+	if err != nil {
+		return err.Error(), "error"
+	}
+	return output, "ok"
+}
+
+func runToolInDir(ctx context.Context, dir, bin string, args ...string) (string, error) {
+	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(callCtx, bin, args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%s %s failed: %w\n%s", bin, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// =============================================================================
+// format - Code formatting
+// =============================================================================
+
+// formatterCheckArgs maps formatter IDs to their check-mode arguments.
+// $FILE is replaced with the actual file path at invocation time.
+var formatterCheckArgs = map[format.FormatterID][]string{
+	"goimports":     {"-l", "$FILE"},
+	"gofmt":         {"-l", "$FILE"},
+	"prettier":      {"--check", "$FILE"},
+	"biome":         {"format", "--check", "$FILE"},
+	"ruff-format":   {"format", "--check", "$FILE"},
+	"black":         {"--check", "$FILE"},
+	"rustfmt":       {"--check", "$FILE"},
+	"clang-format":  {"--dry-run", "-Werror", "$FILE"},
+	"shfmt":         {"-d", "$FILE"},
+	"rubocop":       {"--lint", "$FILE"},
+	"terraform-fmt": {"fmt", "-check", "$FILE"},
+}
+
+func formatSkill(e *Engineer) *skills.Skill {
+	type handler = func(context.Context, *formatInput) (any, error)
+
+	selector := format.NewFormatterSelector()
+
+	dispatch := map[string]handler{
+		"check": func(ctx context.Context, p *formatInput) (any, error) {
+			if p.File == "" {
+				return nil, fmt.Errorf("file is required for check")
+			}
+			root := e.config.EngineerConfig.WorkingDirectory
+			f := selector.SelectFormatter(root, p.File)
+			if f == nil {
+				return map[string]any{"formatted": true, "reason": "no formatter available for extension"}, nil
+			}
+			checkArgs, ok := formatterCheckArgs[f.ID]
+			if !ok {
+				return map[string]any{"formatted": true, "reason": "no check mode for " + string(f.ID)}, nil
+			}
+			fullPath := resolvePath(root, p.File)
+			args := substituteFileArg(checkArgs, fullPath)
+			output, err := runToolInDir(ctx, root, f.Command, args...)
+			if err != nil {
+				return map[string]any{"formatted": false, "formatter": string(f.ID), "output": err.Error()}, nil
+			}
+			return map[string]any{"formatted": strings.TrimSpace(output) == "", "formatter": string(f.ID), "output": output}, nil
+		},
+		"apply": func(ctx context.Context, p *formatInput) (any, error) {
+			if p.File == "" {
+				return nil, fmt.Errorf("file is required for apply")
+			}
+			root := e.config.EngineerConfig.WorkingDirectory
+			f := selector.SelectFormatter(root, p.File)
+			if f == nil {
+				return map[string]any{"success": false, "reason": "no formatter available for extension"}, nil
+			}
+			fullPath := resolvePath(root, p.File)
+			args := substituteFileArg(f.Args, fullPath)
+			_, err := runToolInDir(ctx, root, f.Command, args...)
+			if err != nil {
+				return map[string]any{"success": false, "formatter": string(f.ID), "error": err.Error()}, nil
+			}
+			return map[string]any{"success": true, "formatter": string(f.ID)}, nil
+		},
+		"detect": func(_ context.Context, p *formatInput) (any, error) {
+			root := e.config.EngineerConfig.WorkingDirectory
+			all := selector.DetectFormatters(root, p.File)
+			detected := make([]map[string]any, 0, len(all))
+			for _, d := range all {
+				detected = append(detected, map[string]any{
+					"formatter":  string(d.FormatterID),
+					"confidence": d.Confidence,
+					"reason":     d.Reason,
+				})
+			}
+			return map[string]any{"formatters": detected, "count": len(detected)}, nil
+		},
+	}
+
+	return skills.NewSkill("format").
+		Description("Format source files using project-appropriate formatters.\n\n"+
+			"Actions:\n"+
+			"- check: Verify if a file is formatted (params: file)\n"+
+			"- apply: Format a file in-place (params: file)\n"+
+			"- detect: List available formatters for a file (params: file)").
+		Domain("code_quality").
+		Keywords("format", "formatter", "gofmt", "goimports", "prettier", "style", "whitespace").
+		Priority(90).
+		EnumParam("action", "Format action to execute", []string{"check", "apply", "detect"}, true).
+		StringParam("file", "File path to format or check", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params formatInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			fn, ok := dispatch[params.Action]
+			if !ok {
+				return nil, fmt.Errorf("unknown format action: %q", params.Action)
+			}
+			return fn(ctx, &params)
+		}).
+		Build()
+}
+
+type formatInput struct {
+	Action string `json:"action"`
+	File   string `json:"file,omitempty"`
+}
+
+func substituteFileArg(args []string, filePath string) []string {
+	result := make([]string, len(args))
+	for i, arg := range args {
+		if arg == "$FILE" {
+			result[i] = filePath
+		} else {
+			result[i] = arg
+		}
+	}
+	return result
+}
+
+// =============================================================================
+// lint - Code linting
+// =============================================================================
+
+type linterDef struct {
+	id        string
+	command   string
+	args      []string
+	fixArgs   []string
+	languages []string
+	indicator string
+}
+
+var knownLinters = []linterDef{
+	{id: "golangci-lint", command: "golangci-lint", args: []string{"run", "--out-format", "json"}, fixArgs: []string{"run", "--fix"}, languages: []string{".go"}, indicator: "go.mod"},
+	{id: "eslint", command: "eslint", args: []string{"--format", "json"}, fixArgs: []string{"--fix"}, languages: []string{".js", ".jsx", ".ts", ".tsx"}, indicator: "package.json"},
+	{id: "ruff", command: "ruff", args: []string{"check", "--output-format", "json"}, fixArgs: []string{"check", "--fix"}, languages: []string{".py"}, indicator: "ruff.toml"},
+	{id: "clippy", command: "cargo", args: []string{"clippy", "--message-format", "json"}, fixArgs: []string{"clippy", "--fix"}, languages: []string{".rs"}, indicator: "Cargo.toml"},
+}
+
+type lintInput struct {
+	Action string   `json:"action"`
+	Paths  []string `json:"paths,omitempty"`
+	Fix    bool     `json:"fix,omitempty"`
+}
+
+type lintIssue struct {
+	File     string `json:"file"`
+	Line     int    `json:"line"`
+	Column   int    `json:"column"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+	Rule     string `json:"rule"`
+}
+
+func lintSkill(e *Engineer) *skills.Skill {
+	type handler = func(context.Context, *lintInput) (any, error)
+
+	dispatch := map[string]handler{
+		"run": func(ctx context.Context, p *lintInput) (any, error) {
+			root := e.config.EngineerConfig.WorkingDirectory
+			linter := selectLinter(root, p.Paths)
+			if linter == nil {
+				return map[string]any{"issues": []lintIssue{}, "linter": "none", "reason": "no linter detected"}, nil
+			}
+			args := linter.args
+			if p.Fix {
+				args = linter.fixArgs
+			}
+			args = append(args, p.Paths...)
+			output, err := runToolInDir(ctx, root, linter.command, args...)
+			if err != nil {
+				exitErr := &exec.ExitError{}
+				if !errors.As(err, &exitErr) {
+					return map[string]any{"linter": linter.id, "error": err.Error()}, nil
+				}
+				// Linters exit non-zero when issues found — extract output from error
+				parts := strings.SplitN(err.Error(), "\n", 2)
+				if len(parts) > 1 {
+					output = parts[1]
+				}
+			}
+			return map[string]any{"linter": linter.id, "output": output, "fix": p.Fix}, nil
+		},
+		"detect": func(_ context.Context, _ *lintInput) (any, error) {
+			root := e.config.EngineerConfig.WorkingDirectory
+			detected := detectLinters(root)
+			result := make([]map[string]string, 0, len(detected))
+			for _, l := range detected {
+				result = append(result, map[string]string{
+					"id":        l.id,
+					"command":   l.command,
+					"indicator": l.indicator,
+				})
+			}
+			return map[string]any{"linters": result, "count": len(result)}, nil
+		},
+	}
+
+	return skills.NewSkill("lint").
+		Description("Run linters on source files to detect code issues.\n\n"+
+			"Actions:\n"+
+			"- run: Run the appropriate linter on paths (params: paths, fix)\n"+
+			"- detect: List available linters for the project").
+		Domain("code_quality").
+		Keywords("lint", "linter", "golangci-lint", "eslint", "ruff", "clippy", "issues", "warnings").
+		Priority(90).
+		EnumParam("action", "Lint action to execute", []string{"run", "detect"}, true).
+		ArrayParam("paths", "File or directory paths to lint", "string", false).
+		BoolParam("fix", "Attempt to auto-fix issues", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params lintInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			fn, ok := dispatch[params.Action]
+			if !ok {
+				return nil, fmt.Errorf("unknown lint action: %q", params.Action)
+			}
+			return fn(ctx, &params)
+		}).
+		Build()
+}
+
+func detectLinters(root string) []linterDef {
+	var detected []linterDef
+	for _, l := range knownLinters {
+		if detect.Which(l.command) == "" {
+			continue
+		}
+		if l.indicator != "" && !detect.FileExists(root, l.indicator) {
+			continue
+		}
+		detected = append(detected, l)
+	}
+	return detected
+}
+
+func selectLinter(root string, paths []string) *linterDef {
+	detected := detectLinters(root)
+	if len(detected) == 0 {
+		return nil
+	}
+	if len(paths) == 0 {
+		return &detected[0]
+	}
+	ext := filepath.Ext(paths[0])
+	for i := range detected {
+		for _, lang := range detected[i].languages {
+			if lang == ext {
+				return &detected[i]
+			}
+		}
+	}
+	return &detected[0]
 }
 
 // =============================================================================

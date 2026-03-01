@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -16,6 +17,7 @@ import (
 // It serves as the SINGLE SOURCE OF TRUTH for formatters, linters, test frameworks,
 // and coding patterns in a codebase.
 type Librarian struct {
+	id     string
 	config Config
 	logger *slog.Logger
 
@@ -36,12 +38,18 @@ type Librarian struct {
 	running     bool
 	knownAgents map[string]*guide.AgentAnnouncement
 
+	// State mutex (guards id during handoff swap).
+	mu sync.Mutex
+
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
 }
 
 // Config holds configuration for the Librarian agent
 type Config struct {
+	// Canonical agent ID. If empty, defaults to "librarian".
+	ID string
+
 	// System prompt configuration
 	SystemPrompt    string // Optional, uses DefaultSystemPrompt if empty
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
@@ -66,7 +74,13 @@ func New(cfg Config) (*Librarian, error) {
 		return nil, fmt.Errorf("search system is required")
 	}
 
+	librarianID := cfg.ID
+	if librarianID == "" {
+		librarianID = "librarian"
+	}
+
 	librarian := &Librarian{
+		id:            librarianID,
 		config:        cfg,
 		logger:        cfg.Logger,
 		searchHandler: NewSearchHandler(cfg.SearchSystem),
@@ -121,7 +135,7 @@ func (l *Librarian) Start(bus guide.EventBus) error {
 	}
 
 	l.bus = bus
-	l.channels = guide.NewAgentChannels("librarian", "librarian")
+	l.channels = guide.NewAgentChannels("librarian", l.id)
 
 	// Subscribe to own request channel (librarian.requests)
 	var err error
@@ -512,113 +526,7 @@ func (l *Librarian) handleToolingRequest(ctx context.Context, req *LibrarianRequ
 
 // GetRoutingInfo returns the librarian's routing information for Guide registration
 func (l *Librarian) GetRoutingInfo() *guide.AgentRoutingInfo {
-	return &guide.AgentRoutingInfo{
-		ID:      "librarian",
-		Type:    "librarian",
-		Name:    "librarian",
-		Aliases: []string{"lib", "search", "find"},
-
-		ActionShortcuts: []guide.ActionShortcut{
-			{
-				Name:          "search",
-				Description:   "Search the codebase for code, patterns, or symbols",
-				DefaultIntent: guide.IntentSearch,
-				DefaultDomain: guide.DomainCode,
-			},
-			{
-				Name:          "find",
-				Description:   "Find specific files, symbols, or patterns",
-				DefaultIntent: guide.IntentFind,
-				DefaultDomain: guide.DomainCode,
-			},
-			{
-				Name:          "locate",
-				Description:   "Locate where a symbol is defined or used",
-				DefaultIntent: guide.IntentLocate,
-				DefaultDomain: guide.DomainCode,
-			},
-		},
-
-		Triggers: guide.AgentTriggers{
-			StrongTriggers: []string{
-				"find",
-				"search",
-				"locate",
-				"where is",
-				"show me",
-				"look for",
-				"grep",
-				"definition of",
-				"usages of",
-				"references to",
-				"pattern",
-				"linter",
-				"formatter",
-				"test framework",
-			},
-			WeakTriggers: []string{
-				"code",
-				"file",
-				"function",
-				"class",
-				"method",
-				"symbol",
-			},
-			IntentTriggers: map[guide.Intent][]string{
-				guide.IntentFind: {
-					"find",
-					"where is",
-					"locate",
-					"show me where",
-				},
-				guide.IntentSearch: {
-					"search",
-					"look for",
-					"grep",
-					"scan",
-				},
-				guide.IntentLocate: {
-					"definition",
-					"declaration",
-					"usages",
-					"references",
-					"implementations",
-				},
-			},
-		},
-
-		Registration: &guide.AgentRegistration{
-			ID:      "librarian",
-			Name:    "librarian",
-			Aliases: []string{"lib", "search", "find"},
-			Capabilities: guide.AgentCapabilities{
-				Intents: []guide.Intent{
-					guide.IntentFind,
-					guide.IntentSearch,
-					guide.IntentLocate,
-					guide.IntentRecall,
-					guide.IntentCheck,
-					guide.IntentHelp,
-				},
-				Domains: []guide.Domain{
-					guide.DomainCode,
-				},
-				Tags: []string{"search", "code", "patterns", "symbols", "tooling"},
-				Keywords: []string{
-					"find", "search", "locate", "grep", "pattern",
-					"symbol", "definition", "reference", "usage",
-					"linter", "formatter", "test", "tooling",
-				},
-				Priority: 80,
-			},
-			Constraints: guide.AgentConstraints{
-				TemporalFocus: guide.TemporalPresent,
-				MinConfidence: 0.6,
-			},
-			Description: "Code search and pattern detection. SINGLE SOURCE OF TRUTH for formatters, linters, test frameworks, and coding patterns.",
-			Priority:    80,
-		},
-	}
+	return LibrarianRoutingInfo(l.id)
 }
 
 // PublishRequest publishes a request to the Guide for routing
@@ -627,7 +535,7 @@ func (l *Librarian) PublishRequest(req *guide.RouteRequest) error {
 		return fmt.Errorf("librarian is not running")
 	}
 
-	req.SourceAgentID = "librarian"
+	req.SourceAgentID = l.id
 	req.SourceAgentName = "librarian"
 
 	msg := guide.NewRequestMessage(l.generateMessageID(), req)
@@ -654,7 +562,15 @@ func (l *Librarian) GetToolDefinitions() []map[string]any {
 
 // AgentID returns the unique identifier for this agent instance.
 func (l *Librarian) AgentID() string {
-	return "librarian"
+	return l.id
+}
+
+// SetCanonicalID overwrites the librarian's internal ID. Used during
+// handoff swap so the new instance assumes the canonical identity.
+func (l *Librarian) SetCanonicalID(id string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.id = id
 }
 
 // AgentType returns the type classification for this agent.

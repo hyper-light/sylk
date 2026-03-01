@@ -99,6 +99,11 @@ func (im *IdleMonitor) scan(ctx context.Context) {
 }
 
 func (im *IdleMonitor) evaluateEntry(ctx context.Context, entry *ActivationEntry) {
+	if entry.HasActiveRequests() {
+		entry.TouchActivity()
+		return
+	}
+
 	tier := entry.LoadTier()
 	policy := entry.Policy
 

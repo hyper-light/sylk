@@ -76,7 +76,7 @@ const mockFirstWordsCount = 8
 // which the Guide then forwards back to the TUI.
 type MockAgent struct {
 	bus          guide.EventBus
-	activityBus  *events.ActivityEventBus
+	activityPub  events.ActivityPublisher
 	scope        *concurrency.GoroutineScope
 	subscription guide.Subscription
 }
@@ -84,12 +84,12 @@ type MockAgent struct {
 // NewMockAgent creates a mock agent with the given dependencies.
 func NewMockAgent(
 	bus guide.EventBus,
-	activityBus *events.ActivityEventBus,
+	activityPub events.ActivityPublisher,
 	scope *concurrency.GoroutineScope,
 ) *MockAgent {
 	return &MockAgent{
 		bus:         bus,
-		activityBus: activityBus,
+		activityPub: activityPub,
 		scope:       scope,
 	}
 }
@@ -224,7 +224,7 @@ func (m *MockAgent) emitActivity(
 	content string,
 	contextUsage float64,
 ) {
-	m.activityBus.Publish(&events.ActivityEvent{
+	m.activityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: eventType,
 		Timestamp: time.Now(),
@@ -248,7 +248,7 @@ func (m *MockAgent) emitActivity(
 // panel displays them from the moment the TUI starts. This runs for all modes
 // (mock and non-mock) and must be called after StartBridges.
 func seedLiveAgents(deps Deps) {
-	seedAgents(deps.ActivityBus)
+	seedAgents(deps.ActivityPub)
 }
 
 // seedMockData pre-populates sessions and registers mock agents so the TUI
@@ -311,9 +311,9 @@ func mockAgentSeeds() []mockAgentSeed {
 
 // seedAgents publishes initial activity events to register mock agents
 // in the agent panel.
-func seedAgents(bus *events.ActivityEventBus) {
+func seedAgents(pub events.ActivityPublisher) {
 	for _, agent := range mockAgentSeeds() {
-		bus.Publish(&events.ActivityEvent{
+		pub.PublishActivity(&events.ActivityEvent{
 			ID:        uuid.New().String(),
 			EventType: events.EventTypeLLMResponse,
 			Timestamp: time.Now(),
@@ -394,7 +394,7 @@ const mockEventInterval = 500 * time.Millisecond
 
 // seedAgentHistory populates each mock agent's event stream with a
 // realistic sequence of past events for testing the expanded view.
-func seedAgentHistory(bus *events.ActivityEventBus) {
+func seedAgentHistory(pub events.ActivityPublisher) {
 	type agentHistory struct {
 		seed   mockAgentSeed
 		events []mockHistoryEvent
@@ -409,7 +409,7 @@ func seedAgentHistory(bus *events.ActivityEventBus) {
 
 	for _, ah := range histories {
 		for i, evt := range ah.events {
-			bus.Publish(&events.ActivityEvent{
+			pub.PublishActivity(&events.ActivityEvent{
 				ID:        uuid.New().String(),
 				EventType: evt.eventType,
 				Timestamp: baseTime.Add(time.Duration(i) * mockEventInterval),

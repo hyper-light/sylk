@@ -14,13 +14,13 @@ import (
 // activity events to the event bus. It encapsulates the agent ID and provides
 // typed methods for common event types.
 type AgentEventPublisher struct {
-	bus     *events.ActivityEventBus
+	bus     events.ActivityPublisher
 	agentID string
 }
 
 // NewAgentEventPublisher creates a new AgentEventPublisher for the given agent.
 // The bus parameter must not be nil.
-func NewAgentEventPublisher(bus *events.ActivityEventBus, agentID string) *AgentEventPublisher {
+func NewAgentEventPublisher(bus events.ActivityPublisher, agentID string) *AgentEventPublisher {
 	return &AgentEventPublisher{
 		bus:     bus,
 		agentID: agentID,
@@ -32,8 +32,8 @@ func (p *AgentEventPublisher) AgentID() string {
 	return p.agentID
 }
 
-// Bus returns the underlying event bus.
-func (p *AgentEventPublisher) Bus() *events.ActivityEventBus {
+// Bus returns the underlying activity publisher.
+func (p *AgentEventPublisher) Bus() events.ActivityPublisher {
 	return p.bus
 }
 
@@ -55,7 +55,7 @@ func (p *AgentEventPublisher) PublishAgentAction(sessionID, action, details stri
 	event.Data["action"] = action
 	event.Data["details"] = details
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -77,7 +77,7 @@ func (p *AgentEventPublisher) PublishAgentDecision(sessionID, decision, rational
 	event.Data["decision"] = decision
 	event.Data["rationale"] = rationale
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -105,7 +105,7 @@ func (p *AgentEventPublisher) PublishAgentError(sessionID string, err error, con
 	event.Data["error"] = errMsg
 	event.Data["context"] = context
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -122,7 +122,7 @@ func (p *AgentEventPublisher) PublishSuccess(sessionID, description string) erro
 	event.Outcome = events.OutcomeSuccess
 	event.Data["description"] = description
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -150,7 +150,7 @@ func (p *AgentEventPublisher) PublishFailure(sessionID, description string, err 
 	event.Data["description"] = description
 	event.Data["error"] = errMsg
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 

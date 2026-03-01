@@ -13,7 +13,7 @@ type FileHandlePoolConfig struct {
 	UsagePercent    float64
 	UserReserved    float64
 	PipelineTimeout time.Duration
-	SignalBus       *signal.SignalBus
+	SignalBus       signal.SignalBusInterface
 }
 
 // DefaultFileHandlePoolConfig returns sensible defaults.

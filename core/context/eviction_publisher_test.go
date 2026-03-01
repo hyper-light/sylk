@@ -12,80 +12,6 @@ import (
 )
 
 // =============================================================================
-// Test Helpers
-// =============================================================================
-
-// mockEventCollector collects published events for testing.
-type mockEventCollector struct {
-	events []*events.ActivityEvent
-	mu     sync.Mutex
-}
-
-func newMockEventCollector() *mockEventCollector {
-	return &mockEventCollector{
-		events: make([]*events.ActivityEvent, 0),
-	}
-}
-
-func (c *mockEventCollector) ID() string {
-	return "mock-collector"
-}
-
-func (c *mockEventCollector) EventTypes() []events.EventType {
-	return []events.EventType{} // Wildcard - receive all events
-}
-
-func (c *mockEventCollector) OnEvent(event *events.ActivityEvent) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.events = append(c.events, event)
-	return nil
-}
-
-func (c *mockEventCollector) getEvents() []*events.ActivityEvent {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	result := make([]*events.ActivityEvent, len(c.events))
-	copy(result, c.events)
-	return result
-}
-
-func (c *mockEventCollector) count() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.events)
-}
-
-func (c *mockEventCollector) clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.events = c.events[:0]
-}
-
-// setupTestBus creates a test event bus with a collector.
-func setupTestBus() (*events.ActivityEventBus, *mockEventCollector) {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-
-	collector := newMockEventCollector()
-	bus.Subscribe(collector)
-
-	return bus, collector
-}
-
-// waitForEvents waits until expected number of events are collected or timeout.
-func waitForEvents(collector *mockEventCollector, expected int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if collector.count() >= expected {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
-}
-
-// =============================================================================
 // AE.3.5 EvictionReason Tests
 // =============================================================================
 
@@ -165,10 +91,9 @@ func TestDefaultEvictionPublisherConfig(t *testing.T) {
 // =============================================================================
 
 func TestNewEvictionEventPublisher(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	if publisher == nil {
@@ -181,8 +106,7 @@ func TestNewEvictionEventPublisher(t *testing.T) {
 }
 
 func TestNewEvictionEventPublisher_WithConfig(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel:      EventDetailVerbose,
@@ -191,7 +115,7 @@ func TestNewEvictionEventPublisher_WithConfig(t *testing.T) {
 		IncludeMetadata:  true,
 	}
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	if publisher.GetDetailLevel() != EventDetailVerbose {
@@ -215,10 +139,9 @@ func TestNewEvictionEventPublisher_NilBus(t *testing.T) {
 // =============================================================================
 
 func TestPublishEvictionStarted(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	err := publisher.PublishEvictionStarted("agent-1", EvictionReasonMemoryPressure, 5000)
@@ -226,17 +149,12 @@ func TestPublishEvictionStarted(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Wait for event
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(evts))
 	}
 
-	events := collector.getEvents()
-	if len(events) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(events))
-	}
-
-	event := events[0]
+	event := evts[0]
 	if event.Category != "eviction" {
 		t.Errorf("expected category 'eviction', got '%s'", event.Category)
 	}
@@ -251,14 +169,13 @@ func TestPublishEvictionStarted(t *testing.T) {
 }
 
 func TestPublishEvictionStarted_DetailNone(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel: EventDetailNone,
 		BufferSize:  100,
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	err := publisher.PublishEvictionStarted("agent-1", EvictionReasonMemoryPressure, 5000)
@@ -266,11 +183,8 @@ func TestPublishEvictionStarted_DetailNone(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Give time for any events to arrive
-	time.Sleep(100 * time.Millisecond)
-
-	if collector.count() != 0 {
-		t.Errorf("expected no events at detail level none, got %d", collector.count())
+	if collector.EventCount() != 0 {
+		t.Errorf("expected no events at detail level none, got %d", collector.EventCount())
 	}
 }
 
@@ -279,14 +193,13 @@ func TestPublishEvictionStarted_DetailNone(t *testing.T) {
 // =============================================================================
 
 func TestPublishItemEvicted(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel: EventDetailVerbose,
 		BufferSize:  100,
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	evt := &EvictionEvent{
@@ -304,13 +217,12 @@ func TestPublishItemEvicted(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least one event")
 	}
 
-	events := collector.getEvents()
-	event := events[0]
-
+	event := evts[0]
 	if event.Data["item_id"] != "item-123" {
 		t.Errorf("expected item_id 'item-123', got '%v'", event.Data["item_id"])
 	}
@@ -321,14 +233,13 @@ func TestPublishItemEvicted(t *testing.T) {
 }
 
 func TestPublishItemEvicted_BelowVerbose(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel: EventDetailStandard, // Below verbose
 		BufferSize:  100,
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	evt := &EvictionEvent{
@@ -343,24 +254,20 @@ func TestPublishItemEvicted_BelowVerbose(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Give time for any events
-	time.Sleep(100 * time.Millisecond)
-
-	if collector.count() != 0 {
-		t.Errorf("expected no events below verbose level, got %d", collector.count())
+	if collector.EventCount() != 0 {
+		t.Errorf("expected no events below verbose level, got %d", collector.EventCount())
 	}
 }
 
 func TestPublishItemEvicted_WithMetadata(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel:     EventDetailVerbose,
 		BufferSize:      100,
 		IncludeMetadata: true,
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	evt := &EvictionEvent{
@@ -378,13 +285,12 @@ func TestPublishItemEvicted_WithMetadata(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least one event")
 	}
 
-	events := collector.getEvents()
-	event := events[0]
-
+	event := evts[0]
 	if event.Data["metadata"] == nil {
 		t.Error("expected metadata to be included")
 	}
@@ -395,10 +301,9 @@ func TestPublishItemEvicted_WithMetadata(t *testing.T) {
 // =============================================================================
 
 func TestPublishEvictionCompleted(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	now := time.Now()
@@ -418,13 +323,12 @@ func TestPublishEvictionCompleted(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least one event")
 	}
 
-	events := collector.getEvents()
-	event := events[0]
-
+	event := evts[0]
 	if event.Data["phase"] != "completed" {
 		t.Errorf("expected phase 'completed', got '%v'", event.Data["phase"])
 	}
@@ -439,15 +343,14 @@ func TestPublishEvictionCompleted(t *testing.T) {
 }
 
 func TestPublishEvictionCompleted_WithItems(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel:      EventDetailVerbose,
 		BufferSize:       100,
 		MaxItemsPerEvent: 5,
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	now := time.Now()
@@ -474,13 +377,12 @@ func TestPublishEvictionCompleted_WithItems(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least one event")
 	}
 
-	events := collector.getEvents()
-	event := events[0]
-
+	event := evts[0]
 	itemData, ok := event.Data["items"].([]map[string]any)
 	if !ok {
 		t.Fatal("expected items in event data")
@@ -492,15 +394,14 @@ func TestPublishEvictionCompleted_WithItems(t *testing.T) {
 }
 
 func TestPublishEvictionCompleted_ItemsTruncated(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel:      EventDetailVerbose,
 		BufferSize:       100,
 		MaxItemsPerEvent: 2, // Limit to 2 items
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	now := time.Now()
@@ -528,13 +429,12 @@ func TestPublishEvictionCompleted_ItemsTruncated(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least one event")
 	}
 
-	events := collector.getEvents()
-	event := events[0]
-
+	event := evts[0]
 	if event.Data["items_truncated"] != true {
 		t.Error("expected items_truncated flag")
 	}
@@ -550,10 +450,9 @@ func TestPublishEvictionCompleted_ItemsTruncated(t *testing.T) {
 // =============================================================================
 
 func TestPublishEvictionFailed(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	testErr := errors.New("eviction failed: out of memory")
@@ -562,13 +461,12 @@ func TestPublishEvictionFailed(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least one event")
 	}
 
-	events := collector.getEvents()
-	event := events[0]
-
+	event := evts[0]
 	if event.Data["phase"] != "failed" {
 		t.Errorf("expected phase 'failed', got '%v'", event.Data["phase"])
 	}
@@ -587,10 +485,9 @@ func TestPublishEvictionFailed(t *testing.T) {
 // =============================================================================
 
 func TestPublishBatch(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	entries := []*ContentEntry{
@@ -604,19 +501,14 @@ func TestPublishBatch(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Note: The event bus debouncer may merge events with the same signature
-	// (same event type, agent ID, session ID) within 100ms. This is expected
-	// behavior for preventing event flooding. We verify at least one event
-	// with the complete phase is received with correct data.
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatalf("expected at least 1 event, got %d", collector.count())
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least 1 event")
 	}
-
-	events := collector.getEvents()
 
 	// Verify we received at least one eviction event
 	var foundEvictionEvent bool
-	for _, e := range events {
+	for _, e := range evts {
 		if e.Category == "eviction" {
 			foundEvictionEvent = true
 			// If it's a complete event, verify the data
@@ -637,15 +529,14 @@ func TestPublishBatch(t *testing.T) {
 }
 
 func TestPublishBatch_VerboseLevel(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel:      EventDetailVerbose,
 		BufferSize:       100,
 		MaxItemsPerEvent: 50,
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	entries := []*ContentEntry{
@@ -658,17 +549,14 @@ func TestPublishBatch_VerboseLevel(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Note: The event bus debouncer may merge events with the same signature
-	// within 100ms. At verbose level we attempt to send start + 2 items + complete,
-	// but debouncing may reduce this. Verify at least one event arrives.
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatalf("expected at least 1 event at verbose level, got %d", collector.count())
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least 1 event at verbose level")
 	}
 
 	// Verify we got at least one eviction-related event
-	events := collector.getEvents()
 	var foundEviction bool
-	for _, e := range events {
+	for _, e := range evts {
 		if e.Category == "eviction" {
 			foundEviction = true
 			break
@@ -681,10 +569,9 @@ func TestPublishBatch_VerboseLevel(t *testing.T) {
 }
 
 func TestPublishBatch_EmptyEntries(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	err := publisher.PublishBatch("agent-1", EvictionReasonTokenLimit, []*ContentEntry{}, 0)
@@ -692,11 +579,8 @@ func TestPublishBatch_EmptyEntries(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Give time for any events
-	time.Sleep(100 * time.Millisecond)
-
-	if collector.count() != 0 {
-		t.Errorf("expected no events for empty batch, got %d", collector.count())
+	if collector.EventCount() != 0 {
+		t.Errorf("expected no events for empty batch, got %d", collector.EventCount())
 	}
 }
 
@@ -705,10 +589,9 @@ func TestPublishBatch_EmptyEntries(t *testing.T) {
 // =============================================================================
 
 func TestSetDetailLevel(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	if publisher.GetDetailLevel() != EventDetailStandard {
@@ -723,10 +606,9 @@ func TestSetDetailLevel(t *testing.T) {
 }
 
 func TestSetIncludeMetadata(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	publisher.SetIncludeMetadata(true)
@@ -734,10 +616,9 @@ func TestSetIncludeMetadata(t *testing.T) {
 }
 
 func TestUpdateSession(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	publisher.UpdateSession("session-2", "agent-2")
@@ -747,13 +628,13 @@ func TestUpdateSession(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for event")
+	evts := collector.Events()
+	if len(evts) == 0 {
+		t.Fatal("expected at least one event")
 	}
 
-	events := collector.getEvents()
-	if events[0].SessionID != "session-2" {
-		t.Errorf("expected session-2, got %s", events[0].SessionID)
+	if evts[0].SessionID != "session-2" {
+		t.Errorf("expected session-2, got %s", evts[0].SessionID)
 	}
 }
 
@@ -762,14 +643,13 @@ func TestUpdateSession(t *testing.T) {
 // =============================================================================
 
 func TestNonBlockingPublish(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel: EventDetailVerbose,
 		BufferSize:  5, // Very small buffer
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	// Publish more events than buffer can hold
@@ -789,10 +669,9 @@ func TestNonBlockingPublish(t *testing.T) {
 }
 
 func TestFlush(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	// Publish event
@@ -801,13 +680,10 @@ func TestFlush(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Flush and verify event was delivered
+	// Flush
 	publisher.Flush()
 
-	// Small delay for event processing
-	time.Sleep(50 * time.Millisecond)
-
-	if collector.count() == 0 {
+	if collector.EventCount() == 0 {
 		t.Error("expected event after flush")
 	}
 }
@@ -817,10 +693,9 @@ func TestFlush(t *testing.T) {
 // =============================================================================
 
 func TestEvictionHookInterface(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	// Use as hook interface
@@ -829,14 +704,11 @@ func TestEvictionHookInterface(t *testing.T) {
 	// Test OnEvictionStarted
 	hook.OnEvictionStarted("agent-1", EvictionReasonMemoryPressure, 1000)
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for hook event")
+	if collector.EventCount() == 0 {
+		t.Fatal("expected at least one event from OnEvictionStarted")
 	}
 
-	collector.clear()
-
-	// Wait for debouncer window to pass (bus uses 100ms debounce)
-	time.Sleep(150 * time.Millisecond)
+	collector.Reset()
 
 	// Test OnEvictionCompleted
 	batch := &EvictionBatchEvent{
@@ -851,20 +723,17 @@ func TestEvictionHookInterface(t *testing.T) {
 	}
 	hook.OnEvictionCompleted(batch)
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for complete event")
+	if collector.EventCount() == 0 {
+		t.Fatal("expected at least one event from OnEvictionCompleted")
 	}
 
-	collector.clear()
-
-	// Wait for debouncer window
-	time.Sleep(150 * time.Millisecond)
+	collector.Reset()
 
 	// Test OnEvictionFailed
 	hook.OnEvictionFailed("agent-1", EvictionReasonMemoryPressure, errors.New("test error"))
 
-	if !waitForEvents(collector, 1, time.Second) {
-		t.Fatal("timeout waiting for failed event")
+	if collector.EventCount() == 0 {
+		t.Fatal("expected at least one event from OnEvictionFailed")
 	}
 }
 
@@ -898,10 +767,9 @@ func TestNoOpEvictionPublisher(t *testing.T) {
 // =============================================================================
 
 func TestClose(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 
 	// Publish some events
 	for i := 0; i < 10; i++ {
@@ -924,10 +792,9 @@ func TestClose(t *testing.T) {
 }
 
 func TestCloseMultipleTimes(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 
 	// Close multiple times should not panic
 	publisher.Close()
@@ -936,10 +803,9 @@ func TestCloseMultipleTimes(t *testing.T) {
 }
 
 func TestPublishAfterClose(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	publisher.Close()
 
 	// Should not error or panic
@@ -954,14 +820,13 @@ func TestPublishAfterClose(t *testing.T) {
 // =============================================================================
 
 func TestConcurrentPublish(t *testing.T) {
-	bus, collector := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
 	config := &EvictionPublisherConfig{
 		DetailLevel: EventDetailVerbose,
 		BufferSize:  1000,
 	}
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", config)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", config)
 	defer publisher.Close()
 
 	var wg sync.WaitGroup
@@ -989,22 +854,18 @@ func TestConcurrentPublish(t *testing.T) {
 	wg.Wait()
 	publisher.Flush()
 
-	// Give time for events to be processed
-	time.Sleep(500 * time.Millisecond)
-
 	// Should have published events without errors
 	if published == 0 {
 		t.Error("expected some events to be published")
 	}
 
-	t.Logf("Published %d events, collected %d", published, collector.count())
+	t.Logf("Published %d events, collected %d", published, collector.EventCount())
 }
 
 func TestConcurrentConfigUpdate(t *testing.T) {
-	bus, _ := setupTestBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	publisher := NewEvictionEventPublisher(bus, "session-1", "agent-1", nil)
+	publisher := NewEvictionEventPublisher(collector, "session-1", "agent-1", nil)
 	defer publisher.Close()
 
 	var wg sync.WaitGroup

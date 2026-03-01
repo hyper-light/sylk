@@ -265,7 +265,7 @@ var defaultTabOrder = []component.FocusID{
 // Deps holds all core system references needed by the TUI.
 // The caller (cmd.go) is responsible for constructing and providing these.
 type Deps struct {
-	ActivityBus    *events.ActivityEventBus
+	ActivityPub events.ActivityPublisher
 	SessionManager *session.Manager
 	GuideBus       guide.EventBus
 	StreamManager  *guide.StreamManager
@@ -294,13 +294,19 @@ type Deps struct {
 	// SeedAgents pre-populates the agent panel with known agents at startup.
 	// Agents are created as idle entries without requiring activity events.
 	SeedAgents []AgentSeed
+
+	// ModelSwap swaps an agent's LLM model at runtime (within-provider).
+	// agentType is the canonical type (e.g. "engineer", "architect").
+	// Returns nil on success or the swap error.
+	ModelSwap func(ctx context.Context, agentType, modelID string) error
 }
 
 // AgentSeed describes an agent to pre-populate in the UI agent panel.
 type AgentSeed struct {
-	ID        string
-	AgentType string
-	Name      string
+	ID              string
+	AgentType       string
+	Name            string
+	SupportedModels []agentpkg.ModelEntry
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +544,12 @@ type AppModel struct {
 	width  int
 	height int
 	ready  bool
+
+	// Resize settle: vertical-only resizes schedule a delayed full invalidation
+	// so that rapid SIGWINCH bursts use the fast path while a final settle
+	// ensures pixel-perfect rendering.
+	resizeGen         uint64 // Resize settle generation counter.
+	resizeQuickActive bool   // True between vertical fast path and settle.
 
 	// Font detection result cached from New() to avoid repeated fc-list calls.
 	nerdFontsDetected bool
@@ -784,7 +796,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 			llm.ValidateKeyFormat,
 			nil, // clipboard — wired after construction (needs m.clipboard)
 		),
-		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.ActivityBus, deps.Scope),
+		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.GuideBus),
 		sessionBridge:          bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
 		streamBridge:           bridge.NewStreamBridge(deps.Scope),
 		guideBridge:            bridge.NewGuideBridge(deps.GuideBus, deps.Scope, "default"),
@@ -823,7 +835,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 
 	// Pre-populate agent panel with known agents from bootstrap.
 	for _, seed := range deps.SeedAgents {
-		app.agentPanel.SeedAgent(seed.ID, seed.AgentType, seed.Name)
+		app.agentPanel.SeedAgent(seed.ID, seed.AgentType, seed.Name, seed.SupportedModels)
 	}
 
 	app.comp = compositor.New()
@@ -932,6 +944,9 @@ func (m *AppModel) Init() tea.Cmd {
 	if m.safetyGuard != nil {
 		cmds = append(cmds, m.safetyRecoveryCmd())
 	}
+	if cmd := m.deferredAuthPollCmd(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -995,6 +1010,27 @@ func (m *AppModel) safetyRecoveryCmd() tea.Cmd {
 		_ = sg.GCJournal()
 
 		return safetyRecoveryDoneMsg{}
+	}
+}
+
+// deferredAuthPollCmd returns a Cmd that re-checks auth availability after
+// the Phase 4 background ProbeAll has had time to complete. ProbeAll runs
+// in a scope.Go goroutine and typically finishes in <1ms; the 200ms delay
+// provides a generous margin. This bridges the gap between the synchronous
+// UI init (which reads an empty registry) and the async probe.
+func (m *AppModel) deferredAuthPollCmd() tea.Cmd {
+	reg := m.deps.AuthRegistry
+	if reg == nil {
+		return nil
+	}
+	providers := [3]string{"google", "anthropic", "openai"}
+	return func() tea.Msg {
+		time.Sleep(200 * time.Millisecond)
+		statuses := make(map[string]bool, len(providers))
+		for _, p := range providers {
+			statuses[p] = reg.IsAvailable(p)
+		}
+		return msg.AuthStatusMsg{Providers: statuses}
 	}
 }
 
@@ -1118,8 +1154,17 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleSubmit(typed)
 	case msg.LoginResultMsg:
 		return m, m.handleLoginResult(typed)
+	case msg.ModelChangeMsg:
+		return m, m.handleModelChange(typed)
+	case msg.ModelSwapResultMsg:
+		return m, m.handleModelSwapResult(typed)
 	case oauthSessionStartedMsg:
 		return m, m.handleOAuthSessionStarted(typed)
+	case msg.AuthStatusMsg:
+		for provider, available := range typed.Providers {
+			m.statusBar.SetAuthStatus(provider, available)
+		}
+		return m, nil
 	case msg.InterruptMsg:
 		return m, m.handleInterrupt()
 	case msg.QuitConfirmMsg:
@@ -1130,6 +1175,14 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleDecorTick(typed)
 	case msg.BlinkMsg:
 		return m, m.handleBlink(typed)
+	case msg.ResizeSettleMsg:
+		if typed.Gen == m.resizeGen {
+			// Full recalc: recalcLayout() → SetStructure() clears all
+			// caches and marks every slot dirty — no separate InvalidateAll needed.
+			m.recalcLayout()
+			m.viewDirty = true
+		}
+		return m, nil
 	case msg.LSPFlushMsg:
 		return m, m.handleLSPFlush(typed)
 	case msg.QueueAdvanceMsg:
@@ -2315,6 +2368,14 @@ func (m *AppModel) View() string {
 		return m.comp.CachedFrame()
 	}
 
+	// Vertical resize fast path: recompose from stale caches without
+	// detecting or rendering dirty slots. Blink, tick, and component
+	// updates are deferred until the settle message fires.
+	if m.resizeQuickActive {
+		m.viewDirty = false
+		return m.comp.Compose()
+	}
+
 	m.detectDirtySlots()
 	m.renderDirtySlots()
 	m.viewDirty = false
@@ -2367,13 +2428,52 @@ func (m *AppModel) PushModal(content modal.ModalContent) {
 // Message handlers
 // ---------------------------------------------------------------------------
 
+// resizeSettleDelay is the debounce delay after a vertical-only resize.
+// After this delay without further resizes, a full layout recalculation
+// is triggered so panels render at their final dimensions.
+const resizeSettleDelay = 150 * time.Millisecond
+
 func (m *AppModel) handleResize(sz tea.WindowSizeMsg) tea.Cmd {
+	oldWidth := m.width
 	m.width = sz.Width
 	m.height = sz.Height
 	m.ready = true
 
+	// Fast path: width unchanged and all main-area slots cached.
+	// Skip all panel SetSize calls and re-rendering — just recompose the
+	// frame from truncated caches. A settle message fires a full recalcLayout
+	// once resizing stops.
+	if oldWidth == sz.Width && m.comp.AllMainSlotsCached() {
+		return m.handleResizeVertical()
+	}
+
 	m.recalcLayout()
 	return nil
+}
+
+// handleResizeVertical is the fast path for height-only terminal resizes.
+// It recomputes section heights from the updated m.height, truncates all
+// compositor caches to fit, and schedules a deferred full recalcLayout.
+// No panel SetSize calls are made, so no component reports dirty and
+// renderDirtySlots is a no-op — the frame is recomposed from stale-but-
+// correctly-sized cached data in O(lines) string copies.
+func (m *AppModel) handleResizeVertical() tea.Cmd {
+	queueH := m.promptQueue.ViewHeight()
+	inputH := m.inputHeight()
+	mainH := m.height - queueH - inputH - statusBarHeight
+	mainH = max(mainH, 1)
+	queueH, inputH = correctOverflow(mainH, queueH, inputH, m.height)
+
+	m.comp.ResizeVerticalQuick(mainH, queueH, inputH, statusBarHeight)
+	m.resizeQuickActive = true
+	// Sync prevInputH so detectDirtySlots won't trigger handleInputGrowth.
+	m.prevInputH = inputH
+
+	m.resizeGen++
+	gen := m.resizeGen
+	return tea.Tick(resizeSettleDelay, func(_ time.Time) tea.Msg {
+		return msg.ResizeSettleMsg{Gen: gen}
+	})
 }
 
 // handleKey wraps dispatchKey with ESC/Alt disambiguation. Terminals encode
@@ -3421,7 +3521,8 @@ func (m *AppModel) handleOAuthSessionStarted(start oauthSessionStartedMsg) tea.C
 		}
 		m.loginPanel.SetOAuthCodeEntry(true, start.Instructions)
 		m.loginPanel.SetDeviceCode(start.UserCode)
-		m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL))
+		m.loginPanel.SetOAuthURL(start.URL)
+		m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider))
 		if err := openURL(start.URL); err != nil {
 			m.statusBar.SetFlash("Could not open browser automatically. Use the URL shown in the login panel.")
 		}
@@ -3431,15 +3532,16 @@ func (m *AppModel) handleOAuthSessionStarted(start oauthSessionStartedMsg) tea.C
 	m.pendingAnthropicOAuth = nil
 	m.loginPanel.SetOAuthCodeEntry(false, "")
 	m.loginPanel.SetDeviceCode(start.UserCode)
-	m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider, start.URL))
+	m.loginPanel.SetOAuthURL(start.URL)
+	m.loginPanel.SetOAuthStatus(formatOAuthStatus(start.Provider))
 	if err := openURL(start.URL); err != nil {
 		m.statusBar.SetFlash("Could not open browser automatically. Use the URL shown in the login panel.")
 	}
 	return start.Wait
 }
 
-func formatOAuthStatus(provider, url string) string {
-	return fmt.Sprintf("Authorize %s in your browser:\n%s", loginProviderLabel(provider), url)
+func formatOAuthStatus(provider string) string {
+	return fmt.Sprintf("Authorize %s in your browser:", loginProviderLabel(provider))
 }
 
 // handleLoginResult processes the async LoginResultMsg from an auth flow.
@@ -3495,6 +3597,39 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 		m.loginPanel.SetError(redactSecrets(result.Error))
 	} else {
 		m.statusBar.SetFlash(fmt.Sprintf("Login failed: %s", redactSecrets(result.Error)))
+	}
+	return nil
+}
+
+// handleModelChange spawns a background command to swap the agent's LLM model.
+func (m *AppModel) handleModelChange(change msg.ModelChangeMsg) tea.Cmd {
+	if m.deps.ModelSwap == nil {
+		return nil
+	}
+	ctx := m.ctx
+	return func() tea.Msg {
+		err := m.deps.ModelSwap(ctx, change.AgentType, change.ModelID)
+		return msg.ModelSwapResultMsg{
+			AgentID:   change.AgentID,
+			AgentType: change.AgentType,
+			ModelID:   change.ModelID,
+			Err:       err,
+		}
+	}
+}
+
+// handleModelSwapResult processes the result of a backend model swap.
+// On error, reverts the optimistic UI update and logs a warning.
+func (m *AppModel) handleModelSwapResult(result msg.ModelSwapResultMsg) tea.Cmd {
+	if result.Err != nil {
+		// Revert the UI's optimistic ModelID update.
+		prev := agentpkg.DefaultModelForAgentType(result.AgentType)
+		m.agentPanel.RevertModelID(result.AgentID, prev)
+		slog.Warn("model swap failed",
+			"agent", result.AgentID,
+			"agent_type", result.AgentType,
+			"model", result.ModelID,
+			"error", result.Err)
 	}
 	return nil
 }
@@ -3658,6 +3793,12 @@ func normalizeExplicitTargetAgent(raw string) string {
 func (m *AppModel) resolveSubmitTarget(explicit string) string {
 	target := normalizeExplicitTargetAgent(explicit)
 	if target != "" {
+		// Guide is the router — "@guide" means "let classifier decide",
+		// so clear the sticky target and return empty.
+		if target == "guide" || target == "g" {
+			m.manualTargetAgent = ""
+			return ""
+		}
 		m.manualTargetAgent = target
 		// Explicit @agent overrides existing engagement.
 		if normalizeAgentID(target) != m.engagedAgentID {
@@ -3667,6 +3808,11 @@ func (m *AppModel) resolveSubmitTarget(explicit string) string {
 	}
 	target = normalizeExplicitTargetAgent(m.manualTargetAgent)
 	if target != "" {
+		// Guard against stale "guide" in manualTargetAgent.
+		if target == "guide" || target == "g" {
+			m.manualTargetAgent = ""
+			return ""
+		}
 		if normalizeAgentID(target) != m.engagedAgentID {
 			m.clearEngagedAgent()
 		}
@@ -3683,11 +3829,18 @@ func (m *AppModel) syncManualTargetFromAgentSelection() {
 	if selected == "" {
 		return
 	}
+	// Guide is the router, not a target. Selecting it in the panel means
+	// "let the classifier decide" — clear any sticky target so subsequent
+	// prompts flow through normal LLM classification.
+	if selected == "guide" || selected == "g" {
+		m.manualTargetAgent = ""
+		m.clearEngagedAgent()
+		return
+	}
 	m.manualTargetAgent = selected
-	// Clear engagement when the user explicitly selects a different agent
-	// (or the guide, which cannot be engaged). Without this, the previous
-	// engaged agent (e.g. architect) stays sticky in the UI even after the
-	// user navigates away.
+	// Clear engagement when the user explicitly selects a different agent.
+	// Without this, the previous engaged agent (e.g. architect) stays
+	// sticky in the UI even after the user navigates away.
 	if normalizeAgentID(selected) != m.engagedAgentID {
 		m.clearEngagedAgent()
 	}
@@ -5532,7 +5685,7 @@ func redactedError(err error) error {
 }
 
 func (m *AppModel) publishStreamActivity(agentID string, success bool, summary string, contextUsage float64) {
-	if m.deps.ActivityBus == nil {
+	if m.deps.ActivityPub == nil {
 		return
 	}
 	id, name, agentType := resolveAgentIdentity(agentID, "")
@@ -5547,7 +5700,7 @@ func (m *AppModel) publishStreamActivity(agentID string, success bool, summary s
 			content = summarizeActivityContent(trimmed)
 		}
 	}
-	m.deps.ActivityBus.Publish(&events.ActivityEvent{
+	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: eventType,
 		Timestamp: time.Now(),
@@ -5563,11 +5716,11 @@ func (m *AppModel) publishStreamActivity(agentID string, success bool, summary s
 }
 
 func (m *AppModel) publishStreamStartActivity(agentID string) {
-	if m.deps.ActivityBus == nil {
+	if m.deps.ActivityPub == nil {
 		return
 	}
 	id, name, agentType := resolveAgentIdentity(agentID, "")
-	m.deps.ActivityBus.Publish(&events.ActivityEvent{
+	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: events.EventTypeLLMRequest,
 		Timestamp: time.Now(),
@@ -5634,7 +5787,7 @@ func (m *AppModel) publishResponseActivity(
 	content string,
 	contextUsage float64,
 ) {
-	if m.deps.ActivityBus == nil {
+	if m.deps.ActivityPub == nil {
 		return
 	}
 	agentID, agentName, agentType := resolveAgentIdentity(r.AgentID, r.AgentName)
@@ -5644,7 +5797,7 @@ func (m *AppModel) publishResponseActivity(
 		outcome = events.OutcomeFailure
 		eventType = events.EventTypeAgentError
 	}
-	m.deps.ActivityBus.Publish(&events.ActivityEvent{
+	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: eventType,
 		Timestamp: time.Now(),
@@ -9836,6 +9989,11 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	// Model selector hover: update arrow highlight on motion over the selector line.
+	if mouse.Action == tea.MouseActionMotion {
+		m.updateSelectorHover(mouse)
+	}
+
 	// Route wheel events to input when focused and scrollable.
 	if m.focus.Current() == component.FocusInput && m.input.CanScroll() {
 		inputTop := m.height - m.prevInputH - statusBarHeight
@@ -10015,10 +10173,62 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 		}
 	}
 
+	if cmd := m.handleAgentSelectorClick(mouse.X, mouse.Y); cmd != nil {
+		return cmd
+	}
+
 	if cmd := m.handleFileTreeClick(mouse.X, mouse.Y); cmd != nil {
 		return cmd
 	}
 	return m.handleChatClick(mouse.X, mouse.Y)
+}
+
+// agentSelectorScreenY returns the screen Y of the model selector line.
+// The selector is the last content line inside the left panel border,
+// i.e. the row just above the bottom border = leftH - 2 (0-indexed).
+// Returns -1 if the left panel is not visible.
+func (m *AppModel) agentSelectorScreenY() int {
+	_, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
+	if leftH < 3 {
+		return -1
+	}
+	return leftH - 2
+}
+
+// updateSelectorHover updates arrow hover state when the cursor moves
+// over or away from the model selector line in the agent panel.
+func (m *AppModel) updateSelectorHover(mouse tea.MouseMsg) {
+	selY := m.agentSelectorScreenY()
+	if selY < 0 || mouse.Y != selY {
+		m.agentPanel.ClearSelectorHover()
+		return
+	}
+	leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+	contentLeft := 1
+	contentRight := leftW - 1
+	if mouse.X < contentLeft || mouse.X >= contentRight {
+		m.agentPanel.ClearSelectorHover()
+		return
+	}
+	m.agentPanel.HandleSelectorHover(mouse.X - contentLeft)
+}
+
+// handleAgentSelectorClick routes a press on the model selector line.
+func (m *AppModel) handleAgentSelectorClick(screenX, screenY int) tea.Cmd {
+	selY := m.agentSelectorScreenY()
+	if selY < 0 || screenY != selY {
+		return nil
+	}
+	leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+	contentLeft := 1 // left border
+	contentRight := leftW - 1
+	if screenX < contentLeft || screenX >= contentRight {
+		return nil
+	}
+	localX := screenX - contentLeft
+	m.focus.SetFocus(component.FocusAgentPanel)
+	m.syncFocusState()
+	return m.agentPanel.HandleSelectorClick(localX)
 }
 
 // panelForScroll resolves the panel under screen coordinate x, accounting
@@ -11935,12 +12145,35 @@ func (m *AppModel) inputHeight() int {
 	return min(h, maxH)
 }
 
+// correctOverflow reduces queueH and inputH so the total frame height
+// (mainH + queueH + inputH + statusBarHeight) does not exceed termH.
+// Steals from queue first (can reach 0), then shrinks input (minimum
+// inputBorderSize). Returns corrected queueH and inputH.
+func correctOverflow(mainH, queueH, inputH, termH int) (int, int) {
+	overflow := mainH + queueH + inputH + statusBarHeight - termH
+	if overflow <= 0 {
+		return queueH, inputH
+	}
+	steal := min(overflow, queueH)
+	queueH -= steal
+	overflow -= steal
+	if overflow > 0 {
+		inputH = max(inputH-overflow, inputBorderSize)
+	}
+	return queueH, inputH
+}
+
 func (m *AppModel) recalcLayout() {
+	m.resizeQuickActive = false
 	// Reserve space for queue strip, input (dynamic), and status bar.
 	queueH := m.promptQueue.ViewHeight()
 	inputH := m.inputHeight()
 	mainHeight := m.height - queueH - inputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
+
+	// Budget correction: when mainHeight is clamped to 1 the total may
+	// exceed m.height. Reduce queue/input to compensate.
+	queueH, inputH = correctOverflow(mainHeight, queueH, inputH, m.height)
 
 	// Capture old chat viewport height before layout changes.
 	oldChatViewH := m.chat.ViewportHeight()
@@ -12012,7 +12245,7 @@ func (m *AppModel) recalcLayout() {
 	m.fieldManualOverlay.SetSize(m.width, m.height)
 	m.loginPanel.SetSize(m.width, mainHeight)
 
-	// Compositor: rebuild frame structure (full invalidation).
+	// Full invalidation — section + per-slot caches cleared.
 	m.comp.SetStructure(m.compositorColumns(), mainHeight, queueH, inputH, statusBarHeight)
 	m.prevInputH = inputH
 }
@@ -13039,9 +13272,11 @@ func (m *AppModel) borderLeftPanel(content string, th *theme.Theme) string {
 }
 
 // renderLeftPanel stacks sessions and agents with line-extended headers and a divider.
+// The model selector is pinned to the absolute bottom row (just above the border).
 func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
-	leftW, _ := m.layout.GetPanelSize(component.FocusSessionPanel)
+	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
 	innerW := max(leftW-panelBorderSize, 1)
+	innerH := max(leftH-panelBorderSize, 1)
 
 	sessionsFocused := m.focus.IsFocused(component.FocusSessionPanel)
 	agentsFocused := m.focus.IsFocused(component.FocusAgentPanel)
@@ -13051,13 +13286,34 @@ func (m *AppModel) renderLeftPanel(th *theme.Theme) string {
 		dividerStyle.Render(strings.Repeat("─", innerW)),
 	)
 
-	return strings.Join([]string{
+	body := strings.Join([]string{
 		sectionHeader("Sessions", innerW, sessionsFocused, th),
 		m.sessionPanel.View(),
 		divider,
 		sectionHeader("Agents", innerW, agentsFocused, th),
 		m.agentPanel.View(),
 	}, "\n")
+
+	sel := m.agentPanel.RenderSelectorLine()
+	selLines := m.agentPanel.SelectorLineCount()
+	bodyTarget := innerH - selLines
+	body = padLeftPanelBody(body, bodyTarget)
+	return body + "\n" + sel
+}
+
+// padLeftPanelBody pads s to exactly targetLines lines by appending empty lines.
+func padLeftPanelBody(s string, targetLines int) string {
+	if targetLines <= 0 {
+		return s
+	}
+	if s == "" {
+		return strings.Repeat("\n", max(targetLines-1, 0))
+	}
+	current := strings.Count(s, "\n") + 1
+	if current < targetLines {
+		s += strings.Repeat("\n", targetLines-current)
+	}
+	return s
 }
 
 // sectionHeader renders a label followed by a trailing line.
@@ -13626,7 +13882,7 @@ func (m *AppModel) publishGuideActivity(
 	content string,
 	contextUsage float64,
 ) {
-	if m.deps.ActivityBus == nil {
+	if m.deps.ActivityPub == nil {
 		return
 	}
 	event := &events.ActivityEvent{
@@ -13642,7 +13898,7 @@ func (m *AppModel) publishGuideActivity(
 			"context_usage": contextUsage,
 		},
 	}
-	m.deps.ActivityBus.Publish(event)
+	m.deps.ActivityPub.PublishActivity(event)
 }
 
 func (m *AppModel) guideRequestAvailable() bool {

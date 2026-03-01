@@ -14,6 +14,10 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
+// ---------------------------------------------------------------------------
+// read_file
+// ---------------------------------------------------------------------------
+
 type readFileParams struct {
 	Path   string `json:"path"`
 	Offset int    `json:"offset,omitempty"`
@@ -94,6 +98,10 @@ func clampLimit(limit int) int {
 	}
 	return limit
 }
+
+// ---------------------------------------------------------------------------
+// glob
+// ---------------------------------------------------------------------------
 
 type globParams struct {
 	Pattern string   `json:"pattern"`
@@ -181,6 +189,10 @@ func matchesGlob(pattern string, candidate string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// grep
+// ---------------------------------------------------------------------------
 
 type grepParams struct {
 	Pattern      string `json:"pattern"`
@@ -295,225 +307,152 @@ func appendFileMatches(root string, path string, regex *regexp.Regexp, max int, 
 	return nil
 }
 
-func gitStatusSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_status").
-		Description("Show repository status.").
-		Domain("git_read").
-		Keywords("git", "history", "status", "diff", "changes").
-		Priority(75).
-		Usage("Use to understand the current working tree state before planning — which files are modified, staged, or untracked. Essential for determining if the codebase is clean before delegating work.").
-		Example(`{}`).
-		BestPractice("Check git_status before delegation to ensure no uncommitted changes conflict with the planned work.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+// ---------------------------------------------------------------------------
+// git (consolidated: status, diff, log, show, blame, ls_files, branch_list, fetch)
+// ---------------------------------------------------------------------------
+
+type gitInput struct {
+	Command   string `json:"command"`
+	Ref       string `json:"ref,omitempty"`
+	Path      string `json:"path,omitempty"`
+	File      string `json:"file,omitempty"`
+	Count     int    `json:"count,omitempty"`
+	StartLine int    `json:"start_line,omitempty"`
+	EndLine   int    `json:"end_line,omitempty"`
+}
+
+func gitSkill(a *Architect) *skills.Skill {
+	type handler = func(context.Context, *gitInput) (any, error)
+	dispatch := map[string]handler{
+		"status": func(ctx context.Context, _ *gitInput) (any, error) {
 			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "status")
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"command": "git status", "output": output}, nil
-		}).
-		Build()
-}
-
-func gitDiffSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_diff").
-		Description("Show uncommitted diff.").
-		Domain("git_read").
-		Keywords("git", "history", "status", "diff", "changes").
-		Priority(75).
-		Usage("Use to examine uncommitted changes in detail — understanding what has been modified and how. Critical for plan revision when the codebase has changed since the plan was created.").
-		Example(`{}`).
-		BestPractice("Review the diff before revising a plan — changes may have already addressed some planned tasks.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+		},
+		"diff": func(ctx context.Context, _ *gitInput) (any, error) {
 			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "diff", "--no-ext-diff")
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"command": "git diff --no-ext-diff", "output": output}, nil
-		}).
-		Build()
-}
-
-func gitLsFilesSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_ls_files").
-		Description("List tracked files.").
-		Domain("git_read").
-		Keywords("git", "history", "status", "diff", "changes").
-		Priority(75).
-		Usage("Use to enumerate all tracked files in the repository. Useful for understanding project scope and file organization. Do NOT use for pattern matching — use `glob` instead.").
-		Example(`{}`).
-		BestPractice("For large repos, prefer `glob` with a specific pattern over ls-files — ls-files returns every tracked file.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "ls-files")
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"command": "git ls-files", "output": output}, nil
-		}).
-		Build()
-}
-
-func gitBranchListSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_branch_list").
-		Description("List branches.").
-		Domain("git_read").
-		Keywords("git", "history", "status", "diff", "changes").
-		Priority(75).
-		Usage("Use to discover available branches for context — understanding parallel work streams, feature branches, or release state.").
-		Example(`{}`).
-		BestPractice("Cross-reference with git_log to understand branch divergence when planning merge-related tasks.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "branch", "--list")
-			if err != nil {
-				return nil, err
-			}
-			return map[string]any{"command": "git branch --list", "output": output}, nil
-		}).
-		Build()
-}
-
-func gitFetchSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_fetch").
-		Description("Fetch remote refs without modifying working tree files.").
-		Domain("git_read").
-		Keywords("git fetch", "remote update", "sync refs").
-		Priority(70).
-		Usage("Use to sync remote refs before making branch or remote-dependent planning decisions. Fetches all remotes with pruning and tags. Safe operation — does not modify working tree files.").
-		Example(`{}`).
-		BestPractice("Run git_fetch before git_branch_list when remote branch state matters for the plan.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "fetch", "--all", "--prune", "--tags")
-			if err != nil {
-				return map[string]any{
-					"status": "error",
-					"error":  err.Error(),
-				}, nil
-			}
-			return map[string]any{
-				"status": "ok",
-				"output": output,
-			}, nil
-		}).
-		Build()
-}
-
-type gitLogParams struct {
-	Count int    `json:"count,omitempty"`
-	Path  string `json:"path,omitempty"`
-}
-
-func gitLogSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_log").
-		Description("Show commit history for context gathering.").
-		Domain("git_read").
-		Keywords("git log", "history", "commits").
-		Priority(75).
-		IntParam("count", "Number of commits", false).
-		StringParam("path", "Optional path filter", false).
-		Usage("Use to understand recent commit history for planning context — identifying what changed, when, and by whom. Use path filter to scope history to relevant directories. Do NOT request excessive counts — 10-20 commits typically suffice for context.").
-		Example(`{"count": 15, "path": "core/auth/"}`).
-		BestPractice("Use path filtering to focus history on the module being planned — repo-wide history is noisy.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params gitLogParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			count := params.Count
+		},
+		"log": func(ctx context.Context, p *gitInput) (any, error) {
+			count := p.Count
 			if count <= 0 {
 				count = 10
 			}
 			args := []string{"log", fmt.Sprintf("--max-count=%d", count), "--oneline"}
-			if strings.TrimSpace(params.Path) != "" {
-				args = append(args, "--", params.Path)
+			if strings.TrimSpace(p.Path) != "" {
+				args = append(args, "--", p.Path)
 			}
 			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", args...)
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"output": output, "count": count}, nil
-		}).
-		Build()
-}
-
-type gitShowParams struct {
-	Ref string `json:"ref,omitempty"`
-}
-
-func gitShowSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_show").
-		Description("Show details for a commit or object.").
-		Domain("git_read").
-		Keywords("git show", "commit details").
-		Priority(70).
-		StringParam("ref", "Commit ref (default HEAD)", false).
-		Usage("Use to inspect a specific commit's changes — understanding what a particular commit introduced. Defaults to HEAD if no ref is provided. Useful for understanding the most recent change before planning.").
-		Example(`{"ref": "HEAD~3"}`).
-		BestPractice("Use --stat output (default) to get an overview before deciding if the full diff is needed.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params gitShowParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
+		},
+		"show": func(ctx context.Context, p *gitInput) (any, error) {
 			ref := "HEAD"
-			if strings.TrimSpace(params.Ref) != "" {
-				ref = params.Ref
+			if strings.TrimSpace(p.Ref) != "" {
+				ref = p.Ref
 			}
 			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "show", "--stat", "--no-color", ref)
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"ref": ref, "output": output}, nil
-		}).
-		Build()
-}
-
-type gitBlameParams struct {
-	File      string `json:"file"`
-	StartLine int    `json:"start_line,omitempty"`
-	EndLine   int    `json:"end_line,omitempty"`
-}
-
-func gitBlameSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("git_blame").
-		Description("Show line-level authorship history for a file.").
-		Domain("git_read").
-		Keywords("git blame", "who changed", "history").
-		Priority(70).
-		StringParam("file", "File path", true).
-		IntParam("start_line", "Start line", false).
-		IntParam("end_line", "End line", false).
-		Usage("Use to understand authorship and change history for specific file regions — identifying who last modified critical code and when. Use start_line/end_line to scope blame to the relevant section.").
-		Example(`{"file": "core/auth/handler.go", "start_line": 50, "end_line": 80}`).
-		BestPractice("Scope blame to specific line ranges — full-file blame on large files produces excessive output.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params gitBlameParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
+		},
+		"blame": func(ctx context.Context, p *gitInput) (any, error) {
+			if strings.TrimSpace(p.File) == "" {
+				return nil, fmt.Errorf("file is required for git blame")
 			}
-			if strings.TrimSpace(params.File) == "" {
-				return nil, fmt.Errorf("file is required")
-			}
-			args := buildGitBlameArgs(params)
+			args := buildGitBlameArgs(p.File, p.StartLine, p.EndLine)
 			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", args...)
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"file": params.File, "output": output}, nil
+			return map[string]any{"file": p.File, "output": output}, nil
+		},
+		"ls_files": func(ctx context.Context, _ *gitInput) (any, error) {
+			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "ls-files")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"command": "git ls-files", "output": output}, nil
+		},
+		"branch_list": func(ctx context.Context, _ *gitInput) (any, error) {
+			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "branch", "--list")
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"command": "git branch --list", "output": output}, nil
+		},
+		"fetch": func(ctx context.Context, _ *gitInput) (any, error) {
+			output, err := runCommandInDir(ctx, a.config.WorkingDirectory, "git", "fetch", "--all", "--prune", "--tags")
+			if err != nil {
+				return map[string]any{"status": "error", "error": err.Error()}, nil
+			}
+			return map[string]any{"status": "ok", "output": output}, nil
+		},
+	}
+
+	return skills.NewSkill("git").
+		Description("Execute git read operations for planning context.\n\n"+
+			"Commands:\n"+
+			"- status: Show repository working tree status\n"+
+			"- diff: Show uncommitted diff (--no-ext-diff)\n"+
+			"- log: Show commit history (params: count, path)\n"+
+			"- show: Show commit/object details with --stat (params: ref)\n"+
+			"- blame: Show line-level authorship (params: file [required], start_line, end_line)\n"+
+			"- ls_files: List all tracked files\n"+
+			"- branch_list: List local branches\n"+
+			"- fetch: Fetch all remotes with pruning and tags").
+		Domain("git_read").
+		Keywords("git", "status", "diff", "log", "show", "blame", "branch", "fetch",
+			"history", "commits", "changes", "remote", "ls-files").
+		Priority(75).
+		TokenEstimate(450).
+		EnumParam("command", "Git command to execute", []string{
+			"status", "diff", "log", "show", "blame", "ls_files", "branch_list", "fetch",
+		}, true).
+		StringParam("ref", "Commit ref for show (default HEAD)", false).
+		StringParam("path", "Path filter for log", false).
+		StringParam("file", "File path for blame (required for blame)", false).
+		IntParam("count", "Number of commits for log (default 10)", false).
+		IntParam("start_line", "Start line for blame range", false).
+		IntParam("end_line", "End line for blame range", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params gitInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			fn, ok := dispatch[params.Command]
+			if !ok {
+				return nil, fmt.Errorf("unknown git command: %q", params.Command)
+			}
+			return fn(ctx, &params)
 		}).
 		Build()
 }
 
-func buildGitBlameArgs(params gitBlameParams) []string {
-	args := []string{"blame", "--", params.File}
-	if params.StartLine > 0 && params.EndLine >= params.StartLine {
+func buildGitBlameArgs(file string, startLine, endLine int) []string {
+	args := []string{"blame", "--", file}
+	if startLine > 0 && endLine >= startLine {
 		args = []string{
 			"blame",
-			fmt.Sprintf("-L%d,%d", params.StartLine, params.EndLine),
+			fmt.Sprintf("-L%d,%d", startLine, endLine),
 			"--",
-			params.File,
+			file,
 		}
 	}
 	return args
 }
+
+// ---------------------------------------------------------------------------
+// ast_grep_search
+// ---------------------------------------------------------------------------
 
 type astGrepParams struct {
 	Pattern string   `json:"pattern"`
@@ -561,131 +500,44 @@ func buildAstGrepArgs(params astGrepParams) []string {
 	return append(args, params.Paths...)
 }
 
-type lspLocationParams struct {
-	File   string `json:"file"`
-	Line   int    `json:"line"`
-	Column int    `json:"column"`
+// ---------------------------------------------------------------------------
+// lsp (consolidated: goto_definition, find_references, hover, symbols, call_hierarchy)
+// ---------------------------------------------------------------------------
+
+type lspInput struct {
+	Action    string `json:"action"`
+	File      string `json:"file,omitempty"`
+	Line      int    `json:"line,omitempty"`
+	Column    int    `json:"column,omitempty"`
+	Query     string `json:"query,omitempty"`
+	Direction string `json:"direction,omitempty"`
 }
 
-type lspSymbolsParams struct {
-	File  string `json:"file,omitempty"`
-	Query string `json:"query,omitempty"`
-}
+func lspSkill(a *Architect) *skills.Skill {
+	type handler = func(context.Context, *lspInput) (any, error)
 
-type lspCallHierarchyParams struct {
-	File      string `json:"file"`
-	Line      int    `json:"line"`
-	Column    int    `json:"column"`
-	Direction string `json:"direction"`
-}
-
-func lspGoToDefinitionSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("lsp_go_to_definition").
-		Description("Navigate to symbol definition via gopls.").
-		Domain("lsp").
-		Keywords("lsp", "symbol", "definition", "references", "hover").
-		Priority(60).
-		StringParam("file", "File path", true).
-		IntParam("line", "Line (1-based)", true).
-		IntParam("column", "Column (1-based)", true).
-		Usage("Use to navigate to a symbol's definition — understanding where a type, function, or variable is defined. Requires gopls to be running. Essential for tracing dependency chains during planning.").
-		Example(`{"file": "core/auth/handler.go", "line": 42, "column": 15}`).
-		BestPractice("Combine with lsp_find_references to understand both definition and usage scope of a symbol.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params lspLocationParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
+	locationAction := func(subcommand string) handler {
+		return func(ctx context.Context, p *lspInput) (any, error) {
+			if strings.TrimSpace(p.File) == "" {
+				return nil, fmt.Errorf("file is required for %s", subcommand)
 			}
-			if strings.TrimSpace(params.File) == "" {
-				return nil, fmt.Errorf("file is required")
-			}
-			output, status := runGoplsCommand(ctx, a.config.WorkingDirectory, "definition", lspLocation(params))
+			loc := lspLocation(p.File, p.Line, p.Column)
+			output, status := runGoplsCommand(ctx, a.config.WorkingDirectory, subcommand, loc)
 			if status != "ok" {
 				return map[string]any{"status": status, "reason": output}, nil
 			}
 			return map[string]any{"status": "ok", "output": output}, nil
-		}).
-		Build()
-}
+		}
+	}
 
-func lspFindReferencesSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("lsp_find_references").
-		Description("Find symbol references via gopls.").
-		Domain("lsp").
-		Keywords("lsp", "symbol", "definition", "references", "hover").
-		Priority(60).
-		StringParam("file", "File path", true).
-		IntParam("line", "Line (1-based)", true).
-		IntParam("column", "Column (1-based)", true).
-		Usage("Use to find all references to a symbol — understanding the blast radius of a planned change. Critical for assessing risk when modifying shared interfaces or widely-used functions.").
-		Example(`{"file": "core/auth/handler.go", "line": 42, "column": 15}`).
-		BestPractice("High reference counts indicate a symbol is widely used — plan changes to such symbols with extra caution and broader test coverage.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params lspLocationParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if strings.TrimSpace(params.File) == "" {
-				return nil, fmt.Errorf("file is required")
-			}
-			output, status := runGoplsCommand(ctx, a.config.WorkingDirectory, "references", lspLocation(params))
-			if status != "ok" {
-				return map[string]any{"status": status, "reason": output}, nil
-			}
-			return map[string]any{"status": "ok", "output": output}, nil
-		}).
-		Build()
-}
-
-func lspHoverSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("lsp_hover").
-		Description("Get symbol hover info via gopls.").
-		Domain("lsp").
-		Keywords("lsp", "symbol", "definition", "references", "hover").
-		Priority(60).
-		StringParam("file", "File path", true).
-		IntParam("line", "Line (1-based)", true).
-		IntParam("column", "Column (1-based)", true).
-		Usage("Use to get type information and documentation for a symbol at a specific location. Useful for understanding parameter types and return values without reading the full definition file.").
-		Example(`{"file": "core/auth/handler.go", "line": 42, "column": 15}`).
-		BestPractice("Use hover for quick type checks — go_to_definition for full implementation details.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params lspLocationParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if strings.TrimSpace(params.File) == "" {
-				return nil, fmt.Errorf("file is required")
-			}
-			output, status := runGoplsCommand(ctx, a.config.WorkingDirectory, "hover", lspLocation(params))
-			if status != "ok" {
-				return map[string]any{"status": status, "reason": output}, nil
-			}
-			return map[string]any{"status": "ok", "output": output}, nil
-		}).
-		Build()
-}
-
-func lspSymbolsSkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("lsp_symbols").
-		Description("List symbols from gopls for a file or workspace query.").
-		Domain("lsp").
-		Keywords("lsp symbols", "outline", "structure").
-		Priority(55).
-		StringParam("file", "Optional file path", false).
-		StringParam("query", "Optional symbol query", false).
-		Usage("Use to list symbols (functions, types, variables) in a file or search workspace symbols by query. Useful for understanding module structure and available APIs during planning.").
-		Example(`{"file": "core/auth/handler.go"}`).
-		Example(`{"query": "HandleWebSocket"}`).
-		BestPractice("Use file-scoped symbols for module overview and query-scoped symbols for cross-module discovery.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params lspSymbolsParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			argument := strings.TrimSpace(params.Query)
+	dispatch := map[string]handler{
+		"goto_definition": locationAction("definition"),
+		"find_references": locationAction("references"),
+		"hover":           locationAction("hover"),
+		"symbols": func(ctx context.Context, p *lspInput) (any, error) {
+			argument := strings.TrimSpace(p.Query)
 			if argument == "" {
-				argument = strings.TrimSpace(params.File)
+				argument = strings.TrimSpace(p.File)
 			}
 			if argument == "" {
 				argument = "."
@@ -695,30 +547,9 @@ func lspSymbolsSkill(a *Architect) *skills.Skill {
 				return map[string]any{"status": status, "reason": output}, nil
 			}
 			return map[string]any{"status": "ok", "output": output}, nil
-		}).
-		Build()
-}
-
-func lspCallHierarchySkill(a *Architect) *skills.Skill {
-	return skills.NewSkill("lsp_call_hierarchy").
-		Description("Approximate call hierarchy by combining gopls references/definition queries.").
-		Domain("lsp").
-		Keywords("lsp call hierarchy", "callers", "callees").
-		Priority(55).
-		StringParam("file", "File path", true).
-		IntParam("line", "Line (1-based)", true).
-		IntParam("column", "Column (1-based)", true).
-		StringParam("direction", "incoming|outgoing|both", true).
-		Usage("Use to trace call relationships for a symbol — identifying callers (incoming) and callees (outgoing). Built on combined references/definition queries. Essential for understanding execution flow when planning refactors.").
-		Example(`{"file": "core/auth/handler.go", "line": 42, "column": 15, "direction": "incoming"}`).
-		BestPractice("Use direction=incoming to find callers of a function (who calls this?) and direction=outgoing to find callees (what does this call?).").
-		BestPractice("If both references and definition queries fail, gopls may not be running — check the status field.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params lspCallHierarchyParams
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			loc := lspLocation(lspLocationParams{File: params.File, Line: params.Line, Column: params.Column})
+		},
+		"call_hierarchy": func(ctx context.Context, p *lspInput) (any, error) {
+			loc := lspLocation(p.File, p.Line, p.Column)
 			refs, refsStatus := runGoplsCommand(ctx, a.config.WorkingDirectory, "references", loc)
 			defn, defStatus := runGoplsCommand(ctx, a.config.WorkingDirectory, "definition", loc)
 			if refsStatus != "ok" && defStatus != "ok" {
@@ -726,16 +557,54 @@ func lspCallHierarchySkill(a *Architect) *skills.Skill {
 			}
 			return map[string]any{
 				"status":     "ok",
-				"direction":  params.Direction,
+				"direction":  p.Direction,
 				"references": refs,
 				"definition": defn,
 			}, nil
+		},
+	}
+
+	return skills.NewSkill("lsp").
+		Description("Query gopls language server for code intelligence.\n\n"+
+			"Actions:\n"+
+			"- goto_definition: Navigate to symbol definition (params: file, line, column)\n"+
+			"- find_references: Find all references to a symbol (params: file, line, column)\n"+
+			"- hover: Get type info and documentation for a symbol (params: file, line, column)\n"+
+			"- symbols: List symbols in a file or search workspace (params: file or query)\n"+
+			"- call_hierarchy: Trace callers/callees of a symbol (params: file, line, column, direction)").
+		Domain("lsp").
+		Keywords("lsp", "symbol", "definition", "references", "hover",
+			"outline", "structure", "call hierarchy", "callers", "callees").
+		Priority(60).
+		TokenEstimate(400).
+		EnumParam("action", "LSP action to execute", []string{
+			"goto_definition", "find_references", "hover", "symbols", "call_hierarchy",
+		}, true).
+		StringParam("file", "File path", false).
+		IntParam("line", "Line number (1-based)", false).
+		IntParam("column", "Column number (1-based)", false).
+		StringParam("query", "Symbol query for workspace search", false).
+		StringParam("direction", "Call hierarchy direction: incoming|outgoing|both", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params lspInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			fn, ok := dispatch[params.Action]
+			if !ok {
+				return nil, fmt.Errorf("unknown lsp action: %q", params.Action)
+			}
+			return fn(ctx, &params)
 		}).
 		Build()
 }
 
-func lspLocation(params lspLocationParams) string {
-	return fmt.Sprintf("%s:%d:%d", params.File, params.Line, params.Column)
+// ---------------------------------------------------------------------------
+// Shared utilities
+// ---------------------------------------------------------------------------
+
+func lspLocation(file string, line, column int) string {
+	return fmt.Sprintf("%s:%d:%d", file, line, column)
 }
 
 func runGoplsCommand(ctx context.Context, workDir string, subcommand string, arg string) (string, string) {

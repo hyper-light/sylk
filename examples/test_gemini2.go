@@ -42,7 +42,7 @@ func main() {
 	
 	cfg.RouterConfig.Model = "gemini-3.1-pro-preview"
 
-	g, _ := guide.NewWithGeminiClient(client, cfg)
+	g, _ := guide.NewWithProvider(client, "gemini-3.1-pro-preview", cfg)
 
 	// Avoid the fast-path keyword detection
 	prompt := "My authentication system seems to be running out of memory slowly. Could you investigate and deploy a patch?"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/adalundhe/sylk/core/container"
 )
@@ -48,16 +49,24 @@ func (g *ActivationGate) DoOrWait(
 	g.mu.Lock()
 	if f, ok := g.inflight[agentType]; ok {
 		g.mu.Unlock()
-		return g.waitForFuture(ctx, f)
+		activationFileLog().Info("DEBUG: gate_coalescing", "agent_type", agentType)
+		return g.waitForFuture(ctx, agentType, f)
 	}
 
 	f := &activationFuture{done: make(chan struct{})}
 	g.inflight[agentType] = f
 	g.mu.Unlock()
 
+	activationFileLog().Info("DEBUG: gate_primary_caller", "agent_type", agentType)
+	activateStart := time.Now()
+
 	// Ensure f.done is always closed, even if activate panics.
 	// Without this, coalesced waiters would hang forever on a panic.
 	defer func() {
+		activationFileLog().Info("DEBUG: gate_primary_done",
+			"agent_type", agentType,
+			"elapsed_ms", time.Since(activateStart).Milliseconds(),
+			"error", f.err)
 		close(f.done)
 		g.mu.Lock()
 		delete(g.inflight, agentType)
@@ -84,11 +93,20 @@ func (g *ActivationGate) safeActivate(
 	return activate(ctx)
 }
 
-func (g *ActivationGate) waitForFuture(ctx context.Context, f *activationFuture) (*container.Container, bool, error) {
+func (g *ActivationGate) waitForFuture(ctx context.Context, agentType string, f *activationFuture) (*container.Container, bool, error) {
+	waitStart := time.Now()
 	select {
 	case <-ctx.Done():
+		activationFileLog().Info("DEBUG: gate_coalesced_ctx_cancelled",
+			"agent_type", agentType,
+			"waited_ms", time.Since(waitStart).Milliseconds(),
+			"error", ctx.Err())
 		return nil, true, ctx.Err()
 	case <-f.done:
+		activationFileLog().Info("DEBUG: gate_coalesced_resolved",
+			"agent_type", agentType,
+			"waited_ms", time.Since(waitStart).Milliseconds(),
+			"error", f.err)
 		return f.c, true, f.err
 	}
 }

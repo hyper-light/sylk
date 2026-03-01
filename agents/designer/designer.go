@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -23,7 +24,7 @@ import (
 const MaxTodosBeforeArchitect = 12
 
 // designerProvider is the minimal interface the Designer needs from its LLM.
-// Satisfied by *providers.GoogleProvider and *gateway.GatewayProvider.
+// Satisfied by any providers.ProviderAdapter (e.g. Google, Anthropic, gateway-wrapped).
 type designerProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
 }
@@ -57,13 +58,26 @@ type Designer struct {
 	consultMu     sync.RWMutex
 
 	fileAccess versioning.FileAccess
+
+	// Request-scoped context lifecycle (mirrors architect/engineer pattern).
+	runCtx         context.Context
+	runCancel      context.CancelFunc
+	requestMu      sync.Mutex
+	requestCancels map[string]context.CancelFunc
 }
 
 type Config struct {
+	// Canonical agent ID. If empty, generates a UUID8 (pipeline use).
+	ID string
+
 	SystemPrompt    string
 	MaxOutputTokens int
 
 	DesignerConfig DesignerConfig
+
+	// RequestGuard is called at handler entry to prevent activation demotion
+	// during in-flight processing. Returns a release function. Nil-safe.
+	RequestGuard func() func()
 
 	Logger *slog.Logger
 
@@ -75,12 +89,14 @@ const (
 )
 
 // New creates a Designer backed by an LLM provider for tool-loop execution.
-// The provider must satisfy designerProvider (e.g. *providers.GoogleProvider
-// or *gateway.GatewayProvider).
+// The provider must satisfy designerProvider (any provider supporting Complete).
 func New(cfg Config, provider designerProvider) (*Designer, error) {
 	cfg = applyConfigDefaults(cfg)
 
-	designerID := uuid.New().String()[:8]
+	designerID := cfg.ID
+	if designerID == "" {
+		designerID = fmt.Sprintf("designer_%s", uuid.New().String()[:8])
+	}
 
 	d := &Designer{
 		id:          designerID,
@@ -130,8 +146,11 @@ func (d *Designer) ProviderType() string { return "google" }
 
 // RefreshProvider implements container.AuthRefreshable.
 // Re-resolves Google credentials and replaces the provider.
-func (d *Designer) RefreshProvider(ctx context.Context) error {
+func (d *Designer) RefreshProvider(ctx context.Context, authMethod string) error {
 	cfg := providers.DefaultGoogleConfig()
+	if authMethod != "" {
+		cfg.AuthMode = authMethod
+	}
 	p, err := providers.NewGoogleProvider(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("designer refresh provider: %w", err)
@@ -141,8 +160,35 @@ func (d *Designer) RefreshProvider(ctx context.Context) error {
 		wrapped = d.providerWrapper(p)
 	}
 	d.SetProvider(wrapped)
-	d.logger.Info("provider refreshed")
+	d.logger.Info("provider refreshed", "auth_method", authMethod)
 	return nil
+}
+
+// SwapModel implements container.ModelSwappable.
+// Installs the pre-built provider and updates the active model. Thread-safe.
+func (d *Designer) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	d.SetProvider(provider)
+	d.stateMu.Lock()
+	d.config.DesignerConfig.Model = modelID
+	d.stateMu.Unlock()
+	d.logger.Info("model swapped", "model", modelID)
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (d *Designer) CurrentModel() string {
+	d.stateMu.RLock()
+	defer d.stateMu.RUnlock()
+	return d.config.DesignerConfig.Model
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (d *Designer) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+		{ID: "gemini-3-flash-preview", DisplayName: "Gemini 3 Flash"},
+		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6"},
+	}
 }
 
 func applyConfigDefaults(cfg Config) Config {
@@ -239,6 +285,8 @@ func (d *Designer) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	d.runCtx, d.runCancel = context.WithCancel(context.Background())
+	d.requestCancels = make(map[string]context.CancelFunc)
 	d.running = true
 	d.logger.Info("designer started", "id", d.id, "channels", d.channels)
 	return nil
@@ -249,6 +297,9 @@ func (d *Designer) Stop() error {
 		return nil
 	}
 
+	if d.runCancel != nil {
+		d.runCancel()
+	}
 	errs := d.unsubscribeAll()
 	d.running = false
 
@@ -318,6 +369,9 @@ func (d *Designer) Channels() *guide.AgentChannels {
 // =============================================================================
 
 func (d *Designer) handleBusRequest(msg *guide.Message) error {
+	if msg.Type == guide.MessageTypeAction {
+		return d.handleActionMessage(msg)
+	}
 	if msg.Type != guide.MessageTypeForward {
 		return nil
 	}
@@ -327,9 +381,19 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	ctx := context.Background()
+	if d.config.RequestGuard != nil {
+		release := d.config.RequestGuard()
+		defer release()
+	}
+
+	// Request-scoped cancellable context.
+	reqCtx, cancel := context.WithCancel(d.runCtx)
+	d.registerRequestCancel(fwd.CorrelationID, cancel)
+	defer d.clearRequestCancel(fwd.CorrelationID)
+	defer cancel()
+
 	emitter := shared.NewToolCallEmitter(d.bus, d.channels, "designer", fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = shared.WithToolCallEmitter(ctx, emitter)
+	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	startTime := time.Now()
 
 	result, err := d.handleDesign(ctx, fwd)
@@ -365,6 +429,41 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 
 func (d *Designer) generateMessageID() string {
 	return fmt.Sprintf("designer_msg_%s", uuid.New().String())
+}
+
+func (d *Designer) registerRequestCancel(correlationID string, cancel context.CancelFunc) {
+	d.requestMu.Lock()
+	if d.requestCancels != nil {
+		d.requestCancels[correlationID] = cancel
+	}
+	d.requestMu.Unlock()
+}
+
+func (d *Designer) clearRequestCancel(correlationID string) {
+	d.requestMu.Lock()
+	delete(d.requestCancels, correlationID)
+	d.requestMu.Unlock()
+}
+
+func (d *Designer) cancelRequest(correlationID string) {
+	d.requestMu.Lock()
+	cancel := d.requestCancels[correlationID]
+	delete(d.requestCancels, correlationID)
+	d.requestMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (d *Designer) handleActionMessage(msg *guide.Message) error {
+	action, ok := msg.GetActionRequest()
+	if !ok || action == nil {
+		return nil
+	}
+	if action.Action == "cancel" {
+		d.cancelRequest(action.CorrelationID)
+	}
+	return nil
 }
 
 // handleDesign is the unified entry point for all design intents. It builds
@@ -519,105 +618,17 @@ func (d *Designer) GetConsultations() []Consultation {
 // Routing & Skills
 // =============================================================================
 
+// SetCanonicalID overwrites the designer's internal ID. Used during
+// handoff swap so the new instance assumes the canonical identity.
+func (d *Designer) SetCanonicalID(id string) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	d.id = id
+	d.state.ID = id
+}
+
 func (d *Designer) GetRoutingInfo() *guide.AgentRoutingInfo {
-	return &guide.AgentRoutingInfo{
-		ID:      d.id,
-		Type:    "designer",
-		Name:    "designer",
-		Aliases: []string{"design", "ui", "ux", "frontend"},
-
-		ActionShortcuts: []guide.ActionShortcut{
-			{
-				Name:          "design",
-				Description:   "Design a UI component or layout",
-				DefaultIntent: guide.IntentDesign,
-				DefaultDomain: guide.DomainCode,
-			},
-			{
-				Name:          "component",
-				Description:   "Create or modify a UI component",
-				DefaultIntent: guide.IntentDesign,
-				DefaultDomain: guide.DomainCode,
-			},
-			{
-				Name:          "a11y",
-				Description:   "Run accessibility audit",
-				DefaultIntent: guide.IntentCheck,
-				DefaultDomain: guide.DomainCode,
-			},
-		},
-
-		Triggers: guide.AgentTriggers{
-			StrongTriggers: []string{
-				"design",
-				"component",
-				"ui",
-				"ux",
-				"layout",
-				"style",
-				"accessible",
-				"accessibility",
-				"a11y",
-				"wcag",
-				"color contrast",
-				"design token",
-				"responsive",
-			},
-			WeakTriggers: []string{
-				"button",
-				"form",
-				"modal",
-				"dialog",
-				"input",
-				"card",
-				"navigation",
-				"header",
-				"footer",
-			},
-			IntentTriggers: map[guide.Intent][]string{
-				guide.IntentDesign: {
-					"design",
-					"create component",
-					"build ui",
-					"layout",
-					"style",
-				},
-				guide.IntentCheck: {
-					"audit",
-					"accessibility",
-					"a11y",
-					"contrast",
-					"wcag",
-				},
-			},
-		},
-
-		Registration: &guide.AgentRegistration{
-			ID:      d.id,
-			Name:    "designer",
-			Aliases: []string{"design", "ui", "ux"},
-			Capabilities: guide.AgentCapabilities{
-				Intents: []guide.Intent{
-					guide.IntentDesign,
-					guide.IntentComplete,
-					guide.IntentCheck,
-				},
-				Domains: []guide.Domain{
-					guide.DomainCode,
-					guide.DomainFiles,
-				},
-				Tags:     []string{"ui", "ux", "design", "accessibility", "components", "frontend"},
-				Keywords: []string{"design", "component", "ui", "ux", "style", "layout", "a11y", "accessible", "wcag"},
-				Priority: 70,
-			},
-			Constraints: guide.AgentConstraints{
-				TemporalFocus: guide.TemporalPresent,
-				MinConfidence: 0.7,
-			},
-			Description: "UI/UX design specialist powered by Gemini 3.1 Pro Preview. LLM-driven 6-phase protocol for accessible, performant UI implementation.",
-			Priority:    70,
-		},
-	}
+	return DesignerRoutingInfo(d.id)
 }
 
 func (d *Designer) PublishRequest(req *guide.RouteRequest) error {
@@ -658,7 +669,7 @@ func (d *Designer) AgentType() string {
 func (d *Designer) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:       "designer",
-		ModelID:         "gemini-3.1-pro-preview",
+		ModelID:         d.CurrentModel(),
 		ReasoningEffort: "high",
 		ContextWindow:   1_000_000,
 		Category:        handoff.CategoryPipeline,

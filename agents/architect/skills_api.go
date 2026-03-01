@@ -12,17 +12,13 @@ import (
 
 func architectCoreSkillNames() []string {
 	return []string{
-		"analyze_requirements",
-		"consult_before_planning",
-		"consult_librarian",
-		"consult_archivalist",
-		"design_architecture",
-		"generate_tasks",
-		"create_workflow_dag",
+		"plan",
+		"plan_workflow",
+		"start_planning",
+		"consult",
 		"pre_delegation_declare",
 		"validate_pre_delegation",
 		"monitor_execution",
-		"revise_plan",
 		"route_plan_acceptance",
 		"handle_plan_acceptance_result",
 		"ask_user_question",
@@ -31,56 +27,30 @@ func architectCoreSkillNames() []string {
 
 func architectAllSkillNames() []string {
 	return []string{
-		"analyze_requirements",
-		"consult_before_planning",
-		"consult_knowledge",
-		"consult_librarian",
-		"consult_archivalist",
-		"consult_academic",
-		"consult_engineer",
-		"consult_designer",
-		"consult_inspector",
-		"consult_tester",
-		"design_architecture",
-		"generate_tasks",
-		"create_workflow_dag",
-		"create_fix_dag",
+		"plan",
+		"plan_workflow",
+		"start_planning",
+		"consult",
+		"plan_mode",
+		"git",
+		"lsp",
 		"interrupt_handler",
-		"estimate_complexity",
 		"pre_delegation_declare",
 		"validate_pre_delegation",
 		"monitor_execution",
-		"revise_plan",
 		"route_plan_acceptance",
 		"handle_plan_acceptance_result",
-		"enter_plan_mode",
-		"update_plan_file",
-		"todo_write",
-		"todo_mark_complete",
-		"exit_plan_mode",
 		"ask_user_question",
 		"read_research_paper",
 		"read_file",
 		"glob",
 		"grep",
-		"git_status",
-		"git_diff",
-		"git_log",
-		"git_show",
-		"git_blame",
-		"git_ls_files",
-		"git_branch_list",
-		"git_fetch",
 		"ast_grep_search",
-		"lsp_go_to_definition",
-		"lsp_find_references",
-		"lsp_hover",
-		"lsp_symbols",
-		"lsp_call_hierarchy",
+		"reroute_request",
 	}
 }
 
-func registerArchitectSafetyHook(hooks *skills.HookRegistry, allowed []string) {
+func registerArchitectSafetyHook(hooks *skills.HookRegistry, registry *skills.Registry, allowed []string) {
 	if hooks == nil {
 		return
 	}
@@ -95,13 +65,22 @@ func registerArchitectSafetyHook(hooks *skills.HookRegistry, allowed []string) {
 			if data == nil {
 				return skills.HookResult{Continue: true}
 			}
-			if allowedSet[data.ToolName] {
-				return skills.HookResult{Continue: true}
+			if !allowedSet[data.ToolName] {
+				return skills.HookResult{
+					Continue: false,
+					Error:    fmt.Errorf("SECURITY VIOLATION: Architect is not permitted to execute tool %q", data.ToolName),
+				}
 			}
-			return skills.HookResult{
-				Continue: false,
-				Error:    fmt.Errorf("SECURITY VIOLATION: Architect is not permitted to execute tool %q", data.ToolName),
+			// Demand-page: load the skill if it's allowed but not yet loaded.
+			// This is the "page fault handler" — the skill was in the address
+			// space (registered + allowed) but not resident (not loaded).
+			if registry != nil {
+				skill := registry.Get(data.ToolName)
+				if skill != nil && !skill.Loaded {
+					registry.Load(data.ToolName)
+				}
 			}
+			return skills.HookResult{Continue: true}
 		},
 	)
 }
@@ -265,17 +244,19 @@ func (a *Architect) ensureSkillLoaded(name string) {
 	_ = a.skills.Load(name)
 }
 
-// ensureToolLoopSkillsLoaded loads all allowed architect skills so they are
-// available as tool definitions for the LLM tool-call loop. This bypasses the
-// progressive loader's token budget (MaxLoadedSkills=16, TokenBudget=3200)
-// which is too restrictive for tool-calling — the LLM needs the full set of
-// tools in order to choose the right one. Called before buildToolDefinitions().
+// ensureToolLoopSkillsLoaded loads core architect skills so they are available
+// as tool definitions for the LLM tool-call loop. Remaining skills are
+// demand-paged via the safety hook when the LLM calls them — reducing initial
+// tool definitions from ~47 (~5500 tokens) to ~14 (~1700 tokens).
 func (a *Architect) ensureToolLoopSkillsLoaded() {
 	if a.skills == nil {
 		return
 	}
-	for _, name := range architectAllSkillNames() {
+	for _, name := range architectCoreSkillNames() {
 		a.skills.Load(name)
+	}
+	if a.skillLoader != nil {
+		a.skillLoader.OptimizeForBudget()
 	}
 }
 
@@ -427,7 +408,7 @@ func architectPinnedSkills(req *ArchitectRequest) []string {
 	}
 	pinned := []string{}
 	if shouldPinResearchSkill(req) {
-		pinned = append(pinned, "read_research_paper", "consult_academic")
+		pinned = append(pinned, "read_research_paper", "consult")
 	}
 	if shouldPinFilesystemSkills(req) {
 		pinned = append(pinned, "read_file", "glob", "grep")

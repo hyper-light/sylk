@@ -27,3 +27,20 @@ func TestBuildClassificationPromptWithRuntime_EmptyRuntimeOmitted(t *testing.T) 
 		t.Fatalf("did not expect runtime agent hint for empty runtime")
 	}
 }
+
+func TestClassificationRuntimeSection_IncludesPendingPlan(t *testing.T) {
+	prompt := BuildClassificationPromptWithRuntime("yes", &ClassificationPromptRuntime{
+		SessionID:        "sess-2",
+		PendingPlanID:    "plan-abc",
+		PendingPlanAgent: "architect",
+	})
+	if !strings.Contains(prompt, "Pending Plan Approval") {
+		t.Fatalf("expected Pending Plan Approval section in prompt")
+	}
+	if !strings.Contains(prompt, "pending_plan_id: plan-abc") {
+		t.Fatalf("expected pending_plan_id in prompt")
+	}
+	if !strings.Contains(prompt, "pending_plan_agent: architect") {
+		t.Fatalf("expected pending_plan_agent in prompt")
+	}
+}

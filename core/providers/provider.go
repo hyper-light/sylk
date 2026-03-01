@@ -77,6 +77,11 @@ type Request struct {
 
 	// ResponseMIMEType sets the response format for Google provider (e.g. "application/json").
 	ResponseMIMEType string `json:"response_mime_type,omitempty"`
+
+	// SkipProviderSkills suppresses ambient skill injection into the system
+	// prompt. Classification requests set this to true — they need a focused
+	// prompt without the full skill catalogue.
+	SkipProviderSkills bool `json:"skip_provider_skills,omitempty"`
 }
 
 type Message struct {

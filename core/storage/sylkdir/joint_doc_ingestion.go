@@ -210,14 +210,14 @@ func (j *JointDocIngestion) createChunks(req *JointDocRequest, boundaries []Chun
 
 	for i, b := range boundaries {
 		id := j.allocID()
-		nodes[i] = j.chunkNode(id, req, i, now)
+		nodes[i] = j.chunkNode(id, req, i, now, b)
 		docs[i] = j.chunkDoc(id, req, b)
 		refs[i] = j.chunkRef(id, b, parentDocRef, uint16(i), cc)
 	}
 	return nodes, docs, refs
 }
 
-func (j *JointDocIngestion) chunkNode(id uint32, req *JointDocRequest, seq int, now uint64) *Node {
+func (j *JointDocIngestion) chunkNode(id uint32, req *JointDocRequest, seq int, now uint64, b ChunkBoundary) *Node {
 	var docRef uint32
 	if j.session.DocIDMap != nil {
 		docRef = j.session.DocIDMap.GetOrAssign(fmt.Sprintf("doc_%d_c%03d", id, seq))
@@ -232,6 +232,8 @@ func (j *JointDocIngestion) chunkNode(id uint32, req *JointDocRequest, seq int, 
 		CreatedAt:    now,
 		SessionID:    j.session.Meta.ID,
 		DocRef:       docRef,
+		SectionStart: b.LineStart,
+		SectionEnd:   b.LineEnd,
 	}
 }
 

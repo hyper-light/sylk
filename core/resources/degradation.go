@@ -91,7 +91,7 @@ type DegradationController struct {
 	mu               sync.RWMutex
 	config           DegradationConfig
 	memoryMonitor    *MemoryMonitor
-	signalBus        *signal.SignalBus
+	signalBus        signal.SignalBusInterface
 	checkpointer     PipelineCheckpointer
 	resourceReleaser PipelineResourceReleaser
 	userNotifier     UserNotifier
@@ -104,7 +104,7 @@ type DegradationController struct {
 func NewDegradationController(
 	config DegradationConfig,
 	memMon *MemoryMonitor,
-	bus *signal.SignalBus,
+	bus signal.SignalBusInterface,
 ) *DegradationController {
 	dc := &DegradationController{
 		config:        config,

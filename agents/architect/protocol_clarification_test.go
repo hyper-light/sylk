@@ -99,3 +99,101 @@ func TestFallbackClarificationResponse_NoQuestions(t *testing.T) {
 		t.Fatal("expected non-empty fallback response")
 	}
 }
+
+func TestRequiresClarification_NilRequirements(t *testing.T) {
+	if requiresClarification(nil) {
+		t.Fatal("expected false for nil requirements")
+	}
+}
+
+func TestRequiresClarification_NoGoals(t *testing.T) {
+	requirements := &Requirements{Query: "vague request"}
+	if !requiresClarification(requirements) {
+		t.Fatal("expected true when no goals are defined")
+	}
+}
+
+func TestRequiresClarification_GoalsOutweighQuestions(t *testing.T) {
+	requirements := &Requirements{
+		Query: "hello world Python script",
+		Goals: []string{"Create a Python hello world script", "Print output to stdout"},
+		Metadata: map[string]any{
+			"clarification_questions": []string{"Which Python version?"},
+		},
+	}
+	if requiresClarification(requirements) {
+		t.Fatal("expected false when goals (2) outweigh questions+unknowns (1)")
+	}
+}
+
+func TestRequiresClarification_QuestionsOutweighGoals(t *testing.T) {
+	requirements := &Requirements{
+		Query: "build an app",
+		Goals: []string{"Build an application"},
+		Metadata: map[string]any{
+			"clarification_questions": []string{"What kind of app?", "What language?"},
+			"unknowns":               []string{"target platform"},
+		},
+	}
+	if !requiresClarification(requirements) {
+		t.Fatal("expected true when questions+unknowns (3) outweigh goals (1)")
+	}
+}
+
+func TestRequiresClarification_EqualGoalsAndQuestions(t *testing.T) {
+	requirements := &Requirements{
+		Query: "implement auth",
+		Goals: []string{"secure login", "session management"},
+		Metadata: map[string]any{
+			"clarification_questions": []string{"OAuth or JWT?", "Need refresh tokens?"},
+		},
+	}
+	if requiresClarification(requirements) {
+		t.Fatal("expected false when questions (2) equal goals (2) — not strictly greater")
+	}
+}
+
+func TestClarificationDecision_AmbiguityGateSkipsTrivial(t *testing.T) {
+	a := &Architect{}
+	decision := a.clarificationDecisionForRequest(
+		context.Background(),
+		&ArchitectRequest{Query: "hello world Python script"},
+		&Requirements{
+			Query: "hello world Python script",
+			Goals: []string{"Create a hello world script", "Use Python"},
+			Metadata: map[string]any{
+				"clarification_questions": []string{"Which Python version?"},
+			},
+		},
+	)
+	if decision.Needed {
+		t.Fatal("expected ambiguity gate to skip clarification for trivially simple request")
+	}
+}
+
+func TestUnknownsFromMetadata_NilRequirements(t *testing.T) {
+	unknowns := unknownsFromMetadata(nil)
+	if len(unknowns) != 0 {
+		t.Fatalf("expected 0 unknowns for nil, got %d", len(unknowns))
+	}
+}
+
+func TestUnknownsFromMetadata_EmptyMetadata(t *testing.T) {
+	unknowns := unknownsFromMetadata(&Requirements{Query: "test"})
+	if len(unknowns) != 0 {
+		t.Fatalf("expected 0 unknowns for empty metadata, got %d", len(unknowns))
+	}
+}
+
+func TestUnknownsFromMetadata_WithUnknowns(t *testing.T) {
+	requirements := &Requirements{
+		Query: "test",
+		Metadata: map[string]any{
+			"unknowns": []string{"target platform", "deployment strategy"},
+		},
+	}
+	unknowns := unknownsFromMetadata(requirements)
+	if len(unknowns) != 2 {
+		t.Fatalf("expected 2 unknowns, got %d", len(unknowns))
+	}
+}

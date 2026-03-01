@@ -79,14 +79,15 @@ var openAIRoleToInputRole = map[Role]responses.EasyInputMessageRole{
 	RoleAssistant: responses.EasyInputMessageRoleAssistant,
 }
 
-// NewOpenAIProvider creates a new OpenAI provider with the given configuration
-func NewOpenAIProvider(config OpenAIConfig, skills ...skills.Skill) (*OpenAIProvider, error) {
-	return NewOpenAIProviderWithAuthService(config, oauth.NewOpenAIAuthService(oauth.OpenAIAuthServiceConfig{}), skills...)
+// NewOpenAIProvider creates a new OpenAI provider with the given configuration.
+func NewOpenAIProvider(ctx context.Context, config OpenAIConfig, skills ...skills.Skill) (*OpenAIProvider, error) {
+	return NewOpenAIProviderWithAuthService(ctx, config, oauth.NewOpenAIAuthService(oauth.OpenAIAuthServiceConfig{}), skills...)
 }
 
 // NewOpenAIProviderWithAuthService creates a provider using a custom auth service.
 // This enables callers to orchestrate OAuth behavior through a shared interface.
 func NewOpenAIProviderWithAuthService(
+	ctx context.Context,
 	config OpenAIConfig,
 	authService oauth.OpenAIAuthService,
 	skills ...skills.Skill,
@@ -94,7 +95,7 @@ func NewOpenAIProviderWithAuthService(
 	applyOpenAIProviderDefaults(&config)
 	normalizeOpenAIProviderModels(&config)
 	applyDefaultChatGPTBaseURL(&config)
-	if err := hydrateOpenAIConfig(context.Background(), &config, authService); err != nil {
+	if err := hydrateOpenAIConfig(ctx, &config, authService); err != nil {
 		return nil, err
 	}
 
@@ -1531,9 +1532,11 @@ func (p *OpenAIProvider) resolveSystemPrompt(req *Request) string {
 	if systemPrompt == "" {
 		systemPrompt = strings.TrimSpace(p.config.SystemPrompt)
 	}
-	if len(req.Tools) > 0 {
+	if len(req.Tools) > 0 || req.SkipProviderSkills {
 		// Skip prompt-based skill descriptions when native tool definitions
-		// are present — prevents double-signaling that causes XML markup leakage.
+		// are present (prevents double-signaling that causes XML markup
+		// leakage) or when the caller has explicitly suppressed skills
+		// (e.g. classification requests need a focused prompt).
 		return strings.TrimSpace(systemPrompt)
 	}
 	return appendPromptSkills(systemPrompt, p.skills)

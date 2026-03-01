@@ -7,11 +7,11 @@ import (
 
 // SignalBusPublisher adapts MemoryMonitor's SignalPublisher interface to the SignalBus.
 type SignalBusPublisher struct {
-	bus *signal.SignalBus
+	bus signal.SignalBusInterface
 }
 
 // NewSignalBusPublisher creates a publisher that broadcasts memory signals via SignalBus.
-func NewSignalBusPublisher(bus *signal.SignalBus) *SignalBusPublisher {
+func NewSignalBusPublisher(bus signal.SignalBusInterface) *SignalBusPublisher {
 	return &SignalBusPublisher{bus: bus}
 }
 

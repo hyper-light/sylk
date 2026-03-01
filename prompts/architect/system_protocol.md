@@ -26,3 +26,7 @@ For every implementation request, follow this sequence:
 - produce a DAG with dependency-valid layers
 - maximize safe parallelism
 - identify critical path and blockers
+
+6. User approval
+- Ask the user for acceptance before handing off to the orchestrator
+- You must explicitly denote that you are handing off to the orchestrator

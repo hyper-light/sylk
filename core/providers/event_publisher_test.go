@@ -10,70 +10,6 @@ import (
 )
 
 // =============================================================================
-// Test Helpers
-// =============================================================================
-
-// testEventSubscriber captures events for testing
-type testEventSubscriber struct {
-	id         string
-	eventTypes []events.EventType
-	events     []*events.ActivityEvent
-	mu         sync.Mutex
-}
-
-func newTestSubscriber(id string, eventTypes ...events.EventType) *testEventSubscriber {
-	return &testEventSubscriber{
-		id:         id,
-		eventTypes: eventTypes,
-		events:     make([]*events.ActivityEvent, 0),
-	}
-}
-
-func (s *testEventSubscriber) ID() string {
-	return s.id
-}
-
-func (s *testEventSubscriber) EventTypes() []events.EventType {
-	return s.eventTypes
-}
-
-func (s *testEventSubscriber) OnEvent(event *events.ActivityEvent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.events = append(s.events, event)
-	return nil
-}
-
-func (s *testEventSubscriber) getEvents() []*events.ActivityEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	result := make([]*events.ActivityEvent, len(s.events))
-	copy(result, s.events)
-	return result
-}
-
-func (s *testEventSubscriber) waitForEvents(count int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		if len(s.events) >= count {
-			s.mu.Unlock()
-			return true
-		}
-		s.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
-}
-
-// createTestBus creates an event bus for testing
-func createTestBus() *events.ActivityEventBus {
-	bus := events.NewActivityEventBus(100)
-	bus.Start()
-	return bus
-}
-
-// =============================================================================
 // LLMMetrics Tests
 // =============================================================================
 
@@ -188,14 +124,13 @@ func TestLLMMetrics_TotalTokens(t *testing.T) {
 
 func TestNewLLMEventPublisher(t *testing.T) {
 	t.Run("with_valid_bus", func(t *testing.T) {
-		bus := createTestBus()
-		defer bus.Close()
+		collector := events.NewTestActivityCollector()
 
-		publisher := NewLLMEventPublisher(bus)
+		publisher := NewLLMEventPublisher(collector)
 		if publisher == nil {
 			t.Fatal("expected non-nil publisher")
 		}
-		if publisher.bus != bus {
+		if publisher.bus != collector {
 			t.Error("expected publisher to have the provided bus")
 		}
 	})
@@ -209,13 +144,8 @@ func TestNewLLMEventPublisher(t *testing.T) {
 }
 
 func TestLLMEventPublisher_PublishLLMRequest(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub", events.EventTypeLLMRequest)
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 
 	t.Run("publishes_request_event", func(t *testing.T) {
 		err := publisher.PublishLLMRequest("session-1", "agent-1", "gpt-4", 1000)
@@ -223,11 +153,7 @@ func TestLLMEventPublisher_PublishLLMRequest(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if !sub.waitForEvents(1, 500*time.Millisecond) {
-			t.Fatal("timeout waiting for event")
-		}
-
-		evts := sub.getEvents()
+		evts := collector.Events()
 		if len(evts) == 0 {
 			t.Fatal("expected at least one event")
 		}
@@ -263,13 +189,8 @@ func TestLLMEventPublisher_PublishLLMRequest(t *testing.T) {
 }
 
 func TestLLMEventPublisher_PublishLLMResponse(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub", events.EventTypeLLMResponse)
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 
 	t.Run("publishes_response_event", func(t *testing.T) {
 		duration := 500 * time.Millisecond
@@ -278,11 +199,7 @@ func TestLLMEventPublisher_PublishLLMResponse(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if !sub.waitForEvents(1, 500*time.Millisecond) {
-			t.Fatal("timeout waiting for event")
-		}
-
-		evts := sub.getEvents()
+		evts := collector.Events()
 		if len(evts) == 0 {
 			t.Fatal("expected at least one event")
 		}
@@ -338,13 +255,8 @@ func TestLLMEventPublisher_PublishLLMResponse(t *testing.T) {
 }
 
 func TestLLMEventPublisher_PublishLLMError(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub", events.EventTypeAgentError)
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 
 	t.Run("publishes_error_event", func(t *testing.T) {
 		testErr := errors.New("API rate limit exceeded")
@@ -353,11 +265,7 @@ func TestLLMEventPublisher_PublishLLMError(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if !sub.waitForEvents(1, 500*time.Millisecond) {
-			t.Fatal("timeout waiting for event")
-		}
-
-		evts := sub.getEvents()
+		evts := collector.Events()
 		if len(evts) == 0 {
 			t.Fatal("expected at least one event")
 		}
@@ -408,10 +316,9 @@ func TestLLMEventPublisher_PublishLLMError(t *testing.T) {
 
 func TestNewLLMEventPublisherHook(t *testing.T) {
 	t.Run("with_valid_publisher", func(t *testing.T) {
-		bus := createTestBus()
-		defer bus.Close()
+		collector := events.NewTestActivityCollector()
 
-		publisher := NewLLMEventPublisher(bus)
+		publisher := NewLLMEventPublisher(collector)
 		hook := NewLLMEventPublisherHook(publisher)
 		if hook == nil {
 			t.Fatal("expected non-nil hook")
@@ -430,22 +337,13 @@ func TestNewLLMEventPublisherHook(t *testing.T) {
 }
 
 func TestLLMEventPublisherHook_OnRequest(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub", events.EventTypeLLMRequest)
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 	hook := NewLLMEventPublisherHook(publisher)
 
 	hook.OnRequest("session-1", "agent-1", "gpt-4", 1000)
 
-	if !sub.waitForEvents(1, 500*time.Millisecond) {
-		t.Fatal("timeout waiting for event")
-	}
-
-	evts := sub.getEvents()
+	evts := collector.Events()
 	if len(evts) == 0 {
 		t.Fatal("expected at least one event")
 	}
@@ -455,22 +353,13 @@ func TestLLMEventPublisherHook_OnRequest(t *testing.T) {
 }
 
 func TestLLMEventPublisherHook_OnResponse(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub", events.EventTypeLLMResponse)
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 	hook := NewLLMEventPublisherHook(publisher)
 
 	hook.OnResponse("session-1", "agent-1", "claude-3", 1000, 500, 500*time.Millisecond)
 
-	if !sub.waitForEvents(1, 500*time.Millisecond) {
-		t.Fatal("timeout waiting for event")
-	}
-
-	evts := sub.getEvents()
+	evts := collector.Events()
 	if len(evts) == 0 {
 		t.Fatal("expected at least one event")
 	}
@@ -480,22 +369,13 @@ func TestLLMEventPublisherHook_OnResponse(t *testing.T) {
 }
 
 func TestLLMEventPublisherHook_OnError(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub", events.EventTypeAgentError)
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 	hook := NewLLMEventPublisherHook(publisher)
 
 	hook.OnError("session-1", "agent-1", "gpt-4", errors.New("connection timeout"))
 
-	if !sub.waitForEvents(1, 500*time.Millisecond) {
-		t.Fatal("timeout waiting for event")
-	}
-
-	evts := sub.getEvents()
+	evts := collector.Events()
 	if len(evts) == 0 {
 		t.Fatal("expected at least one event")
 	}
@@ -541,10 +421,9 @@ func TestNoOpLLMEventHook(t *testing.T) {
 
 func TestLLMProviderEventHook_InterfaceCompliance(t *testing.T) {
 	t.Run("LLMEventPublisherHook", func(t *testing.T) {
-		bus := createTestBus()
-		defer bus.Close()
+		collector := events.NewTestActivityCollector()
 
-		publisher := NewLLMEventPublisher(bus)
+		publisher := NewLLMEventPublisher(collector)
 		hook := NewLLMEventPublisherHook(publisher)
 
 		var _ LLMProviderEventHook = hook
@@ -561,13 +440,8 @@ func TestLLMProviderEventHook_InterfaceCompliance(t *testing.T) {
 // =============================================================================
 
 func TestLLMEventPublisher_Concurrent(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub") // wildcard
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 
 	const numGoroutines = 50
 	var wg sync.WaitGroup
@@ -593,12 +467,8 @@ func TestLLMEventPublisher_Concurrent(t *testing.T) {
 
 	wg.Wait()
 
-	// Give time for events to be processed
-	time.Sleep(100 * time.Millisecond)
-
-	// Note: Due to debouncing in ActivityEventBus, we may not receive all events
-	// This test primarily verifies no race conditions or panics
-	evts := sub.getEvents()
+	// Collector is synchronous, all events are already recorded
+	evts := collector.Events()
 	if len(evts) == 0 {
 		t.Error("expected at least some events to be received")
 	}
@@ -609,13 +479,8 @@ func TestLLMEventPublisher_Concurrent(t *testing.T) {
 // =============================================================================
 
 func TestLLMEventPublisher_FullWorkflow(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub") // wildcard
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 	hook := NewLLMEventPublisherHook(publisher)
 
 	// Simulate a typical LLM request/response cycle
@@ -626,18 +491,10 @@ func TestLLMEventPublisher_FullWorkflow(t *testing.T) {
 	// 1. Request initiated
 	hook.OnRequest(sessionID, agentID, model, 1500)
 
-	// 2. Wait for response
-	time.Sleep(50 * time.Millisecond)
-
-	// 3. Response received
+	// 2. Response received
 	hook.OnResponse(sessionID, agentID, model, 1500, 750, 500*time.Millisecond)
 
-	// Wait for events
-	if !sub.waitForEvents(2, time.Second) {
-		t.Fatal("timeout waiting for events")
-	}
-
-	evts := sub.getEvents()
+	evts := collector.Events()
 	if len(evts) < 2 {
 		t.Fatalf("expected at least 2 events, got %d", len(evts))
 	}
@@ -668,13 +525,8 @@ func TestLLMEventPublisher_FullWorkflow(t *testing.T) {
 }
 
 func TestLLMEventPublisher_ErrorWorkflow(t *testing.T) {
-	bus := createTestBus()
-	defer bus.Close()
-
-	sub := newTestSubscriber("test-sub") // wildcard
-	bus.Subscribe(sub)
-
-	publisher := NewLLMEventPublisher(bus)
+	collector := events.NewTestActivityCollector()
+	publisher := NewLLMEventPublisher(collector)
 	hook := NewLLMEventPublisherHook(publisher)
 
 	sessionID := "session-456"
@@ -684,18 +536,13 @@ func TestLLMEventPublisher_ErrorWorkflow(t *testing.T) {
 	// 1. Request initiated
 	hook.OnRequest(sessionID, agentID, model, 2000)
 
-	// 2. Wait, then error occurs
-	time.Sleep(50 * time.Millisecond)
-
-	// 3. Error received
+	// 2. Error received
 	hook.OnError(sessionID, agentID, model, errors.New("context length exceeded"))
 
-	// Wait for events
-	if !sub.waitForEvents(2, time.Second) {
-		t.Fatal("timeout waiting for events")
+	evts := collector.Events()
+	if len(evts) < 2 {
+		t.Fatalf("expected at least 2 events, got %d", len(evts))
 	}
-
-	evts := sub.getEvents()
 
 	// Verify error event
 	var hasError bool

@@ -23,12 +23,12 @@ var ErrNilBus = errors.New("event bus is nil")
 // GuidePublisher publishes events related to the guide/router component.
 // It handles user prompts, routing decisions, and clarification requests.
 type GuidePublisher struct {
-	bus       *ActivityEventBus
+	bus       ActivityPublisher
 	sessionID string
 }
 
 // NewGuidePublisher creates a new GuidePublisher.
-func NewGuidePublisher(bus *ActivityEventBus, sessionID string) *GuidePublisher {
+func NewGuidePublisher(bus ActivityPublisher, sessionID string) *GuidePublisher {
 	return &GuidePublisher{
 		bus:       bus,
 		sessionID: sessionID,
@@ -47,7 +47,7 @@ func (p *GuidePublisher) PublishUserPrompt(prompt string) error {
 
 	event.Data["prompt"] = prompt
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -67,7 +67,7 @@ func (p *GuidePublisher) PublishRoutingDecision(fromAgent, toAgent, reason strin
 	event.Data["toAgent"] = toAgent
 	event.Data["reason"] = reason
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -83,7 +83,7 @@ func (p *GuidePublisher) PublishClarificationRequest(question string) error {
 
 	event.Data["question"] = question
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -94,13 +94,13 @@ func (p *GuidePublisher) PublishClarificationRequest(question string) error {
 // ToolPublisher publishes events related to tool execution.
 // It handles tool calls, results, and timeouts.
 type ToolPublisher struct {
-	bus       *ActivityEventBus
+	bus       ActivityPublisher
 	sessionID string
 	agentID   string
 }
 
 // NewToolPublisher creates a new ToolPublisher.
-func NewToolPublisher(bus *ActivityEventBus, sessionID, agentID string) *ToolPublisher {
+func NewToolPublisher(bus ActivityPublisher, sessionID, agentID string) *ToolPublisher {
 	return &ToolPublisher{
 		bus:       bus,
 		sessionID: sessionID,
@@ -124,7 +124,7 @@ func (p *ToolPublisher) PublishToolCall(toolName string, params map[string]any) 
 	event.Data["tool_name"] = toolName
 	event.Data["params"] = params
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -151,7 +151,7 @@ func (p *ToolPublisher) PublishToolResult(toolName string, result any, success b
 	event.Data["result"] = result
 	event.Data["outcome"] = event.Outcome.String()
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -173,7 +173,7 @@ func (p *ToolPublisher) PublishToolTimeout(toolName string, timeout time.Duratio
 	event.Data["timeout_duration"] = timeout.String()
 	event.Data["timeout_ms"] = timeout.Milliseconds()
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -184,13 +184,13 @@ func (p *ToolPublisher) PublishToolTimeout(toolName string, timeout time.Duratio
 // AgentPublisher publishes events related to agent activities.
 // It handles agent actions, decisions, errors, and outcomes.
 type AgentPublisher struct {
-	bus       *ActivityEventBus
+	bus       ActivityPublisher
 	sessionID string
 	agentID   string
 }
 
 // NewAgentPublisher creates a new AgentPublisher.
-func NewAgentPublisher(bus *ActivityEventBus, sessionID, agentID string) *AgentPublisher {
+func NewAgentPublisher(bus ActivityPublisher, sessionID, agentID string) *AgentPublisher {
 	return &AgentPublisher{
 		bus:       bus,
 		sessionID: sessionID,
@@ -214,7 +214,7 @@ func (p *AgentPublisher) PublishAgentAction(action, details string) error {
 	event.Data["action"] = action
 	event.Data["details"] = details
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -234,7 +234,7 @@ func (p *AgentPublisher) PublishAgentDecision(decision, rationale string) error 
 	event.Data["decision"] = decision
 	event.Data["rationale"] = rationale
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -262,7 +262,7 @@ func (p *AgentPublisher) PublishAgentError(err error, context string) error {
 	event.Data["error_message"] = errMsg
 	event.Data["context"] = context
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -280,7 +280,7 @@ func (p *AgentPublisher) PublishSuccess(summary string) error {
 
 	event.Data["summary"] = summary
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -306,7 +306,7 @@ func (p *AgentPublisher) PublishFailure(err error, summary string) error {
 	event.Data["error"] = errMsg
 	event.Data["summary"] = summary
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -317,13 +317,13 @@ func (p *AgentPublisher) PublishFailure(err error, summary string) error {
 // LLMPublisher publishes events related to LLM interactions.
 // It handles LLM requests, responses, and errors.
 type LLMPublisher struct {
-	bus       *ActivityEventBus
+	bus       ActivityPublisher
 	sessionID string
 	agentID   string
 }
 
 // NewLLMPublisher creates a new LLMPublisher.
-func NewLLMPublisher(bus *ActivityEventBus, sessionID, agentID string) *LLMPublisher {
+func NewLLMPublisher(bus ActivityPublisher, sessionID, agentID string) *LLMPublisher {
 	return &LLMPublisher{
 		bus:       bus,
 		sessionID: sessionID,
@@ -347,7 +347,7 @@ func (p *LLMPublisher) PublishLLMRequest(model string, inputTokens int) error {
 	event.Data["model"] = model
 	event.Data["input_tokens"] = inputTokens
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -377,7 +377,7 @@ func (p *LLMPublisher) PublishLLMResponse(model string, inputTokens, outputToken
 	event.Data["duration_ms"] = duration.Milliseconds()
 	event.Data["tokens_per_sec"] = tokensPerSec
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }
 
@@ -411,6 +411,6 @@ func (p *LLMPublisher) PublishLLMError(model string, err error, errContext strin
 	event.Data["error"] = errMsg
 	event.Data["error_context"] = errContext
 
-	p.bus.Publish(event)
+	p.bus.PublishActivity(event)
 	return nil
 }

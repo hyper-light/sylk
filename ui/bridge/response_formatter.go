@@ -128,7 +128,7 @@ func looksLikeArchitectPlan(values map[string]any) bool {
 }
 
 func architectNeedsClarification(plan map[string]any) bool {
-	if boolFromKey(plan, "ClarificationNeeded") {
+	if status, ok := plan["Status"].(string); ok && status == "clarifying" {
 		return true
 	}
 	return len(architectClarificationQuestions(plan)) > 0

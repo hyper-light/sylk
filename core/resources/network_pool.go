@@ -14,7 +14,7 @@ type NetworkPoolConfig struct {
 	PerProviderMax  int
 	UserReserved    float64
 	PipelineTimeout time.Duration
-	SignalBus       *signal.SignalBus
+	SignalBus       signal.SignalBusInterface
 }
 
 // DefaultNetworkPoolConfig returns sensible defaults.

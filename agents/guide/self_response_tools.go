@@ -3,6 +3,7 @@ package guide
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -104,6 +105,9 @@ func (g *Guide) executeGuideSelfResponseToolCall(ctx context.Context, name strin
 		return "", fmt.Errorf("tool %q returned nil result", name)
 	}
 	if !result.Success {
+		if result.Err != nil && errors.Is(result.Err, coreskills.ErrRerouteRequested) {
+			return "", coreskills.ErrRerouteRequested
+		}
 		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
 	}
 

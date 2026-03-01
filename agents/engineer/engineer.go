@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -86,16 +87,29 @@ type Engineer struct {
 
 	// Escalation
 	escalator *escalation.Escalator
+
+	// Request-scoped context lifecycle (mirrors architect pattern).
+	runCtx         context.Context
+	runCancel      context.CancelFunc
+	requestMu      sync.Mutex
+	requestCancels map[string]context.CancelFunc
 }
 
 // Config holds configuration for the Engineer agent
 type Config struct {
+	// Canonical agent ID. If empty, generates a UUID8 (pipeline use).
+	ID string
+
 	// System prompt configuration
 	SystemPrompt    string // Optional, uses DefaultEngineerSystemPrompt if empty
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
 
 	// Engineer-specific configuration
 	EngineerConfig EngineerConfig // Task execution configuration
+
+	// RequestGuard is called at handler entry to prevent activation demotion
+	// during in-flight processing. Returns a release function. Nil-safe.
+	RequestGuard func() func()
 
 	// Logging
 	Logger *slog.Logger // Optional, uses slog.Default() if nil
@@ -117,7 +131,10 @@ const (
 func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 	cfg = applyConfigDefaults(cfg)
 
-	engineerID := fmt.Sprintf("engineer_%s", uuid.New().String()[:8])
+	engineerID := cfg.ID
+	if engineerID == "" {
+		engineerID = fmt.Sprintf("engineer_%s", uuid.New().String()[:8])
+	}
 
 	eng := &Engineer{
 		id:              engineerID,
@@ -169,16 +186,16 @@ func (e *Engineer) ProviderType() string { return "openai" }
 
 // RefreshProvider implements container.AuthRefreshable.
 // Re-resolves OpenAI credentials and replaces the provider.
-func (e *Engineer) RefreshProvider(_ context.Context) error {
+func (e *Engineer) RefreshProvider(ctx context.Context, authMethod string) error {
 	cfg := providers.OpenAIConfig{
 		BaseConfig: providers.BaseConfig{
 			Model:     DefaultModel,
 			MaxTokens: DefaultMaxTokens,
 		},
 		ReasoningEffort: DefaultReasoningEffort,
-		AuthMode:        "api_key",
+		AuthMode:        authMethod,
 	}
-	p, err := providers.NewOpenAIProvider(cfg)
+	p, err := providers.NewOpenAIProvider(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("engineer refresh provider: %w", err)
 	}
@@ -187,8 +204,38 @@ func (e *Engineer) RefreshProvider(_ context.Context) error {
 		wrapped = e.providerWrapper(p)
 	}
 	e.SetProvider(wrapped)
-	e.logger.Info("provider refreshed")
+	e.logger.Info("provider refreshed", "auth_method", authMethod)
 	return nil
+}
+
+// SwapModel implements container.ModelSwappable.
+// Re-creates the OpenAI provider with the given model ID, re-applying the
+// gateway wrapper. Thread-safe via stateMu.
+func (e *Engineer) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	e.SetProvider(provider)
+	e.stateMu.Lock()
+	e.config.EngineerConfig.Model = modelID
+	e.stateMu.Unlock()
+	e.logger.Info("model swapped", "model", modelID)
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (e *Engineer) CurrentModel() string {
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
+	if e.config.EngineerConfig.Model != "" {
+		return e.config.EngineerConfig.Model
+	}
+	return DefaultModel
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (e *Engineer) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "gpt-5.2-codex", DisplayName: "GPT-5.2 Codex"},
+	}
 }
 
 func applyConfigDefaults(cfg Config) Config {
@@ -236,10 +283,10 @@ func (e *Engineer) initSkills() {
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = []string{
-		"read_file", "write_file", "edit_file", "run_command",
-		"run_tests", "glob", "grep",
+		"read_file", "edit_file", "write_file", "lsp",
+		"glob", "grep", "run_command",
 	}
-	loaderCfg.AutoLoadDomains = []string{"code", "filesystem", "testing"}
+	loaderCfg.AutoLoadDomains = []string{"code", "filesystem", "code_analysis", "code_quality"}
 	e.skillLoader = skills.NewLoader(e.skills, loaderCfg)
 
 	e.registerCoreSkills()
@@ -248,6 +295,15 @@ func (e *Engineer) initSkills() {
 // ID returns the engineer's unique identifier
 func (e *Engineer) ID() string {
 	return e.id
+}
+
+// SetCanonicalID overwrites the engineer's internal ID. Used during
+// handoff swap so the new instance assumes the canonical identity.
+func (e *Engineer) SetCanonicalID(id string) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.id = id
+	e.state.ID = id
 }
 
 // Close closes the engineer and its resources
@@ -268,7 +324,7 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 	}
 
 	e.bus = bus
-	e.channels = guide.NewAgentChannels("engineer", "engineer")
+	e.channels = guide.NewAgentChannels("engineer", e.id)
 
 	// Subscribe to own request channel (engineer.requests)
 	var err error
@@ -292,6 +348,8 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	e.runCtx, e.runCancel = context.WithCancel(context.Background())
+	e.requestCancels = make(map[string]context.CancelFunc)
 	e.running = true
 	e.logger.Info("engineer started", "id", e.id, "channels", e.channels)
 	return nil
@@ -303,6 +361,9 @@ func (e *Engineer) Stop() error {
 		return nil
 	}
 
+	if e.runCancel != nil {
+		e.runCancel()
+	}
 	errs := e.unsubscribeAll()
 	e.running = false
 
@@ -376,6 +437,9 @@ func (e *Engineer) Channels() *guide.AgentChannels {
 
 // handleBusRequest processes incoming forwarded requests from the event bus
 func (e *Engineer) handleBusRequest(msg *guide.Message) error {
+	if msg.Type == guide.MessageTypeAction {
+		return e.handleActionMessage(msg)
+	}
 	if msg.Type != guide.MessageTypeForward {
 		return nil // Ignore non-forward messages
 	}
@@ -385,13 +449,22 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	// Process the request
-	ctx := context.Background()
+	if e.config.RequestGuard != nil {
+		release := e.config.RequestGuard()
+		defer release()
+	}
+
+	// Process the request with a cancellable request-scoped context.
+	reqCtx, cancel := context.WithCancel(e.runCtx)
+	e.registerRequestCancel(fwd.CorrelationID, cancel)
+	defer e.clearRequestCancel(fwd.CorrelationID)
+	defer cancel()
+
 	startTime := time.Now()
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(e.bus, e.channels, "engineer", fwd.CorrelationID, fwd.SourceAgentID)
-	ctx = shared.WithToolCallEmitter(ctx, emitter)
+	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 
 	result, err := e.processForwardedRequest(ctx, fwd)
 
@@ -430,6 +503,41 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 
 func (e *Engineer) generateMessageID() string {
 	return fmt.Sprintf("engineer_msg_%s", uuid.New().String())
+}
+
+func (e *Engineer) registerRequestCancel(correlationID string, cancel context.CancelFunc) {
+	e.requestMu.Lock()
+	if e.requestCancels != nil {
+		e.requestCancels[correlationID] = cancel
+	}
+	e.requestMu.Unlock()
+}
+
+func (e *Engineer) clearRequestCancel(correlationID string) {
+	e.requestMu.Lock()
+	delete(e.requestCancels, correlationID)
+	e.requestMu.Unlock()
+}
+
+func (e *Engineer) cancelRequest(correlationID string) {
+	e.requestMu.Lock()
+	cancel := e.requestCancels[correlationID]
+	delete(e.requestCancels, correlationID)
+	e.requestMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (e *Engineer) handleActionMessage(msg *guide.Message) error {
+	action, ok := msg.GetActionRequest()
+	if !ok || action == nil {
+		return nil
+	}
+	if action.Action == "cancel" {
+		e.cancelRequest(action.CorrelationID)
+	}
+	return nil
 }
 
 // processForwardedRequest handles the actual request processing
@@ -737,66 +845,7 @@ func (e *Engineer) GetConsultations() []Consultation {
 
 // GetRoutingInfo returns the engineer's routing information for Guide registration
 func (e *Engineer) GetRoutingInfo() *guide.AgentRoutingInfo {
-	return &guide.AgentRoutingInfo{
-		ID:      e.id,
-		Type:    "engineer",
-		Name:    "engineer",
-		Aliases: []string{"eng", "impl", "code", "implement"},
-
-		ActionShortcuts: []guide.ActionShortcut{
-			{
-				Name:          "implement",
-				Description:   "Implement a coding task",
-				DefaultIntent: guide.IntentComplete,
-				DefaultDomain: guide.DomainCode,
-			},
-			{
-				Name:          "code",
-				Description:   "Write code for a specific feature or fix",
-				DefaultIntent: guide.IntentComplete,
-				DefaultDomain: guide.DomainCode,
-			},
-		},
-
-		Triggers: guide.AgentTriggers{
-			StrongTriggers: []string{
-				"implement", "code", "write", "create", "build",
-				"fix", "refactor", "add feature", "modify", "update code",
-			},
-			WeakTriggers: []string{
-				"function", "method", "class", "file", "module",
-			},
-			IntentTriggers: map[guide.Intent][]string{
-				guide.IntentComplete: {
-					"implement", "code", "write", "create", "build",
-				},
-			},
-		},
-
-		Registration: &guide.AgentRegistration{
-			ID:      e.id,
-			Name:    "engineer",
-			Aliases: []string{"eng", "impl", "code"},
-			Capabilities: guide.AgentCapabilities{
-				Intents: []guide.Intent{
-					guide.IntentComplete,
-				},
-				Domains: []guide.Domain{
-					guide.DomainCode,
-					guide.DomainFiles,
-				},
-				Tags:     []string{"implementation", "code", "development", "testing"},
-				Keywords: []string{"implement", "code", "write", "create", "build", "fix", "refactor", "test"},
-				Priority: 70,
-			},
-			Constraints: guide.AgentConstraints{
-				TemporalFocus: guide.TemporalPresent,
-				MinConfidence: 0.7,
-			},
-			Description: "Staff-level implementation engineer. GPT-5.3 Codex with xhigh reasoning. Executes coding tasks with self-audit and consultation.",
-			Priority:    70,
-		},
-	}
+	return EngineerRoutingInfo(e.id)
 }
 
 // PublishRequest publishes a request to the Guide for routing

@@ -43,7 +43,7 @@ type TDDExecutor struct {
 	tester       *pipelinetester.PipelineTester
 	worker       WorkerAgent
 	coWorkers    []WorkerAgent
-	activityBus  *events.ActivityEventBus
+	activityPub  events.ActivityPublisher
 	phaseTimeout time.Duration
 	maxLoops     int
 	onEvent      func(PipelineEvent)
@@ -59,7 +59,7 @@ type TDDExecutorConfig struct {
 	Tester       *pipelinetester.PipelineTester
 	Worker       WorkerAgent
 	CoWorkers    []WorkerAgent
-	ActivityBus  *events.ActivityEventBus
+	ActivityPub  events.ActivityPublisher
 	PhaseTimeout time.Duration
 	MaxLoops     int
 	OnEvent      func(PipelineEvent)
@@ -94,7 +94,7 @@ func NewTDDExecutor(cfg TDDExecutorConfig) *TDDExecutor {
 		tester:       cfg.Tester,
 		worker:       cfg.Worker,
 		coWorkers:    cfg.CoWorkers,
-		activityBus:  cfg.ActivityBus,
+		activityPub:  cfg.ActivityPub,
 		phaseTimeout: phaseTimeout,
 		maxLoops:     maxLoops,
 		onEvent:      cfg.OnEvent,
@@ -543,9 +543,9 @@ func (e *TDDExecutor) emitEvent(old, new PipelineStatus, loop int, errMsg string
 }
 
 // emitAgentActivity publishes a synthetic activity event for a pipeline agent
-// phase transition to the ActivityEventBus. No-op when activityBus is nil.
+// phase transition to the ActivityPublisher. No-op when activityPub is nil.
 func (e *TDDExecutor) emitAgentActivity(eventType events.EventType, agentName, content string) {
-	if e.activityBus == nil {
+	if e.activityPub == nil {
 		return
 	}
 	e.mu.RLock()
@@ -560,7 +560,7 @@ func (e *TDDExecutor) emitAgentActivity(eventType events.EventType, agentName, c
 	evt.Data["pipeline_id"] = pipelineID
 	evt.Data["agent_type"] = agentName
 	evt.Data["worker_type"] = workerType
-	e.activityBus.Publish(evt)
+	e.activityPub.PublishActivity(evt)
 }
 
 func failedTestNames(suite *tester.TestSuiteResult) []string {

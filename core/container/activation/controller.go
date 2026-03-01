@@ -5,13 +5,37 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 )
+
+var (
+	activationDebugLog     *slog.Logger
+	activationDebugLogOnce sync.Once
+)
+
+func activationFileLog() *slog.Logger {
+	activationDebugLogOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".sylk", "logs")
+		_ = os.MkdirAll(dir, 0755)
+		f, err := os.OpenFile(filepath.Join(dir, "ui_events.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			activationDebugLog = slog.Default()
+			return
+		}
+		activationDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	})
+	return activationDebugLog
+}
 
 var (
 	ErrControllerClosed     = errors.New("activation controller is closed")
@@ -167,8 +191,16 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 
 	ac.metrics.ActivationsTotal.Add(1)
 
+	deadline, hasDeadline := ctx.Deadline()
+	activationFileLog().Info("DEBUG: ensure_active_start",
+		"agent_type", agentType,
+		"has_deadline", hasDeadline,
+		"deadline", deadline,
+		"ctx_err", ctx.Err())
+
 	entry, err := ac.getEntry(agentType)
 	if err != nil {
+		activationFileLog().Info("DEBUG: ensure_active_entry_error", "agent_type", agentType, "error", err)
 		return nil, err
 	}
 
@@ -177,13 +209,21 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 		if c := entry.Container.Load(); c != nil {
 			ac.metrics.HotHits.Add(1)
 			entry.TouchActivity()
+			activationFileLog().Info("DEBUG: ensure_active_hot_hit", "agent_type", agentType)
 			return c, nil
 		}
 	}
 
+	activateStart := time.Now()
+	activationFileLog().Info("DEBUG: ensure_active_gate_enter", "agent_type", agentType, "current_tier", entry.LoadTier())
 	c, coalesced, err := ac.gate.DoOrWait(ctx, agentType, func(ctx context.Context) (*container.Container, error) {
 		return ac.promote(ctx, entry)
 	})
+	activationFileLog().Info("DEBUG: ensure_active_gate_exit",
+		"agent_type", agentType,
+		"coalesced", coalesced,
+		"elapsed_ms", time.Since(activateStart).Milliseconds(),
+		"error", err)
 	if err != nil {
 		return nil, err
 	}
@@ -312,18 +352,34 @@ func (ac *ActivationController) Shutdown(ctx context.Context) error {
 
 // promote brings an entry to TierHot from whatever tier it currently occupies.
 func (ac *ActivationController) promote(ctx context.Context, entry *ActivationEntry) (*container.Container, error) {
-	tier := entry.LoadTier()
+	if ctx.Err() != nil {
+		activationFileLog().Info("DEBUG: promote_ctx_already_cancelled", "agent_type", entry.AgentType, "error", ctx.Err())
+		return nil, ctx.Err()
+	}
 
+	tier := entry.LoadTier()
+	activationFileLog().Info("DEBUG: promote_start", "agent_type", entry.AgentType, "tier", tier)
+	promoteStart := time.Now()
+
+	var c *container.Container
+	var err error
 	switch tier {
 	case TierHot:
-		return entry.Container.Load(), nil
+		c = entry.Container.Load()
 	case TierWarm:
-		return ac.promoteFromWarm(ctx, entry)
+		c, err = ac.promoteFromWarm(ctx, entry)
 	case TierCool:
-		return ac.promoteFromCool(ctx, entry)
+		c, err = ac.promoteFromCool(ctx, entry)
 	default:
-		return ac.promoteFromCold(ctx, entry)
+		c, err = ac.promoteFromCold(ctx, entry)
 	}
+
+	activationFileLog().Info("DEBUG: promote_done",
+		"agent_type", entry.AgentType,
+		"from_tier", tier,
+		"elapsed_ms", time.Since(promoteStart).Milliseconds(),
+		"error", err)
+	return c, err
 }
 
 func (ac *ActivationController) promoteFromWarm(ctx context.Context, entry *ActivationEntry) (*container.Container, error) {
@@ -373,6 +429,11 @@ func (ac *ActivationController) promoteFromCool(ctx context.Context, entry *Acti
 		}
 	}
 
+	if ctx.Err() != nil {
+		_ = ac.runtime.RemoveContainer(context.Background(), c)
+		return nil, ctx.Err()
+	}
+
 	if err := ac.runtime.StartContainer(ctx, c); err != nil {
 		if removeErr := ac.runtime.RemoveContainer(ctx, c); removeErr != nil {
 			ac.logger.Warn("container cleanup failed after start error",
@@ -396,12 +457,32 @@ func (ac *ActivationController) promoteFromCool(ctx context.Context, entry *Acti
 }
 
 func (ac *ActivationController) promoteFromCold(ctx context.Context, entry *ActivationEntry) (*container.Container, error) {
+	createStart := time.Now()
+	activationFileLog().Info("DEBUG: cold_start_create_container", "agent_type", entry.AgentType)
 	c, err := ac.runtime.CreateContainer(ctx, entry.Spec, nil)
+	activationFileLog().Info("DEBUG: cold_start_create_done",
+		"agent_type", entry.AgentType,
+		"elapsed_ms", time.Since(createStart).Milliseconds(),
+		"error", err)
 	if err != nil {
 		return nil, err
 	}
 
+	// Check cancellation between creation and start — if the scope is
+	// shutting down, clean up the created container immediately.
+	if ctx.Err() != nil {
+		activationFileLog().Info("DEBUG: cold_start_ctx_cancelled_before_start", "agent_type", entry.AgentType, "error", ctx.Err())
+		_ = ac.runtime.RemoveContainer(context.Background(), c)
+		return nil, ctx.Err()
+	}
+
+	startTime := time.Now()
+	activationFileLog().Info("DEBUG: cold_start_start_container", "agent_type", entry.AgentType)
 	if err := ac.runtime.StartContainer(ctx, c); err != nil {
+		activationFileLog().Info("DEBUG: cold_start_start_failed",
+			"agent_type", entry.AgentType,
+			"elapsed_ms", time.Since(startTime).Milliseconds(),
+			"error", err)
 		if removeErr := ac.runtime.RemoveContainer(ctx, c); removeErr != nil {
 			ac.logger.Warn("container cleanup failed after start error",
 				"agent_type", entry.AgentType,
@@ -410,6 +491,9 @@ func (ac *ActivationController) promoteFromCold(ctx context.Context, entry *Acti
 		}
 		return nil, err
 	}
+	activationFileLog().Info("DEBUG: cold_start_start_done",
+		"agent_type", entry.AgentType,
+		"elapsed_ms", time.Since(startTime).Milliseconds())
 
 	entry.Container.Store(c)
 	entry.StoreTier(TierHot)
@@ -467,7 +551,34 @@ func (ac *ActivationController) demoteHotToWarm(ctx context.Context, entry *Acti
 	return nil
 }
 
+// AcquireRequestGuard increments the active-request counter for the given
+// agent type and returns a release function. While the counter is > 0,
+// demoteWarmToCool and idle demotion refuse to stop the agent's container,
+// preventing in-flight work from being killed by chain-demotion.
+//
+// The returned release function is idempotent and safe to call multiple times.
+// For unknown agent types, returns a no-op function.
+func (ac *ActivationController) AcquireRequestGuard(agentType string) func() {
+	entry, err := ac.getEntry(agentType)
+	if err != nil {
+		return func() {}
+	}
+	entry.ActiveRequests.Add(1)
+	entry.TouchActivity()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			entry.ActiveRequests.Add(-1)
+			entry.TouchActivity()
+		})
+	}
+}
+
 func (ac *ActivationController) demoteWarmToCool(ctx context.Context, entry *ActivationEntry) error {
+	if entry.HasActiveRequests() {
+		entry.TouchActivity()
+		return nil
+	}
 	c := ac.warmPool.Take(entry.AgentType)
 	if c == nil {
 		c = entry.Container.Load()

@@ -13,7 +13,7 @@ import (
 
 // PipelineManagerConfig configures the PipelineManager.
 type PipelineManagerConfig struct {
-	ActivityBus            *events.ActivityEventBus
+	ActivityPub            events.ActivityPublisher
 	MaxActivePipelines     int
 	DefaultMaxLoops        int
 	DefaultPhaseTimeout    time.Duration
@@ -127,7 +127,7 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 		insp.Close()
 		return "", fmt.Errorf("create tester: %w", err)
 	}
-	worker, err := m.factory.CreateWorker(cfg.WorkerType)
+	worker, err := m.factory.CreateWorker(ctx, cfg.WorkerType)
 	if err != nil {
 		insp.Close()
 		tst.Close()
@@ -136,7 +136,7 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 
 	var coWorkers []WorkerAgent
 	if len(cfg.CoWorkerTypes) > 0 {
-		coWorkers, err = m.factory.CreateCoWorkers(cfg.CoWorkerTypes)
+		coWorkers, err = m.factory.CreateCoWorkers(ctx, cfg.CoWorkerTypes)
 		if err != nil {
 			insp.Close()
 			tst.Close()
@@ -153,7 +153,7 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 		Tester:       tst,
 		Worker:       worker,
 		CoWorkers:    coWorkers,
-		ActivityBus:  m.config.ActivityBus,
+		ActivityPub:  m.config.ActivityPub,
 		PhaseTimeout: phaseTimeout,
 		MaxLoops:     maxLoops,
 		OnEvent:      m.onEvent,

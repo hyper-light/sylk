@@ -66,7 +66,7 @@ func (f *AgentFactory) CreateTester() (*pipelinetester.PipelineTester, error) {
 }
 
 // CreateWorker creates a WorkerAgent adapter for the given worker type.
-func (f *AgentFactory) CreateWorker(wt WorkerType) (WorkerAgent, error) {
+func (f *AgentFactory) CreateWorker(ctx context.Context, wt WorkerType) (WorkerAgent, error) {
 	switch wt {
 	case WorkerEngineer:
 		eng, err := engineer.New(f.engineerConfig, nil)
@@ -78,7 +78,7 @@ func (f *AgentFactory) CreateWorker(wt WorkerType) (WorkerAgent, error) {
 		googleCfg := providers.DefaultGoogleConfig()
 		googleCfg.Model = string(providers.Gemini31Pro)
 		googleCfg.MaxTokens = 16384
-		provider, err := providers.NewGoogleProvider(context.Background(), googleCfg)
+		provider, err := providers.NewGoogleProvider(ctx, googleCfg)
 		if err != nil {
 			return nil, fmt.Errorf("create designer google provider: %w", err)
 		}
@@ -94,10 +94,10 @@ func (f *AgentFactory) CreateWorker(wt WorkerType) (WorkerAgent, error) {
 
 // CreateCoWorkers creates worker agents for each co-tenant type.
 // On partial failure, closes all successfully created workers before returning.
-func (f *AgentFactory) CreateCoWorkers(types []WorkerType) ([]WorkerAgent, error) {
+func (f *AgentFactory) CreateCoWorkers(ctx context.Context, types []WorkerType) ([]WorkerAgent, error) {
 	workers := make([]WorkerAgent, 0, len(types))
 	for _, wt := range types {
-		w, err := f.CreateWorker(wt)
+		w, err := f.CreateWorker(ctx, wt)
 		if err != nil {
 			for _, prev := range workers {
 				prev.Close()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -56,13 +57,19 @@ type progressTracker struct {
 	count int
 }
 
+// maxContinuationRounds is the hard ceiling on continuation rounds.
+// 3 rounds (initial + 2 continuations) is sufficient for any plan;
+// beyond this, coherence degrades regardless of context window size.
+const maxContinuationRounds = 3
+
 // deriveMaxRounds computes the tightest safe round limit from model parameters.
 // Beyond (contextWindow/2)/maxOutputTokens rounds, the sliding prefill tail
-// can't represent full output — coherence degrades.
+// can't represent full output — coherence degrades. Capped at
+// maxContinuationRounds to bound total latency.
 func deriveMaxRounds(contextWindow, maxOutputTokens int) int {
 	theoretical := contextWindow / maxOutputTokens
 	prefillCapacity := (contextWindow / 2) / maxOutputTokens
-	return max(1, min(theoretical, prefillCapacity))
+	return min(maxContinuationRounds, max(1, min(theoretical, prefillCapacity)))
 }
 
 // deriveContinuationConfig computes all continuation bounds from model parameters.
@@ -144,15 +151,28 @@ func (p *anthropicPlanner) runContinuationLoop(
 	stage string,
 	onChunk func(string),
 ) (string, *providers.Usage, error) {
+	p.logger.Info("runContinuationLoop: entry",
+		"stage", stage,
+		"max_rounds", cfg.maxRounds,
+		"initial_len", len(initial.Text),
+		"ctx_deadline", contextDeadlineString(ctx))
 	state := initContinuationState(initial, mode, cfg)
+	loopStart := time.Now()
 	p.executeRounds(ctx, prompt, &state, cfg, system, stage, onChunk)
+	p.logger.Info("runContinuationLoop: done",
+		"stage", stage,
+		"rounds_used", state.metrics.roundsUsed,
+		"abort_reason", state.metrics.abortReason,
+		"net_new_bytes", state.metrics.netNewBytesTotal,
+		"final_len", state.length,
+		"elapsed", time.Since(loopStart).String())
 	finalizeContinuation(&state, onChunk, stage, p.logger)
 	return state.lastSnapshot, state.usage, nil
 }
 
 // executeRounds runs up to maxRounds continuation requests, stopping when
-// the model completes naturally, progress decays, structure completes, or
-// the context deadline approaches.
+// the model completes naturally, progress decays, structure completes,
+// the AIMD window is exhausted, or the context deadline approaches.
 func (p *anthropicPlanner) executeRounds(
 	ctx context.Context,
 	prompt string,
@@ -162,11 +182,46 @@ func (p *anthropicPlanner) executeRounds(
 	stage string,
 	onChunk func(string),
 ) {
-	for range cfg.maxRounds {
-		if !p.continuationRound(ctx, prompt, state, cfg, system, stage, onChunk) {
+	aimd := newContinuationAIMD(cfg.maxRounds)
+
+	for round := range cfg.maxRounds { // hard ceiling unchanged
+		if round >= aimd.AllowedRounds() {
+			p.logger.Info("executeRounds: AIMD window exhausted",
+				"stage", stage, "round", round,
+				"allowed", aimd.AllowedRounds())
+			state.metrics.abortReason = "aimd_window_exhausted"
 			return
 		}
+		p.logger.Info("executeRounds: starting round",
+			"stage", stage,
+			"round", round,
+			"max_rounds", cfg.maxRounds,
+			"aimd_allowed", aimd.AllowedRounds(),
+			"progress_ema", state.progress.ema,
+			"accumulated_len", state.length,
+			"ctx_deadline", contextDeadlineString(ctx))
+		roundStart := time.Now()
+		if !p.continuationRound(ctx, prompt, state, cfg, system, stage, onChunk) {
+			p.logger.Info("executeRounds: round signaled stop",
+				"stage", stage, "round", round,
+				"elapsed", time.Since(roundStart).String(),
+				"abort_reason", state.metrics.abortReason)
+			return
+		}
+		p.logger.Info("executeRounds: round complete",
+			"stage", stage, "round", round,
+			"elapsed", time.Since(roundStart).String(),
+			"net_new_total", state.metrics.netNewBytesTotal,
+			"progress_healthy", state.progress.isHealthy(cfg.progressThreshold))
+		// Feed progress signal back to AIMD.
+		if state.progress.isHealthy(cfg.progressThreshold) {
+			aimd.OnProgress()
+		} else {
+			aimd.OnStall()
+		}
 	}
+	p.logger.Info("executeRounds: max rounds exhausted",
+		"stage", stage, "max_rounds", cfg.maxRounds)
 	state.metrics.abortReason = "max_rounds_exhausted"
 }
 
@@ -182,13 +237,23 @@ func (p *anthropicPlanner) continuationRound(
 	onChunk func(string),
 ) bool {
 	if !hasTimeForContinuation(ctx) {
+		p.logger.Info("continuationRound: insufficient time remaining",
+			"stage", stage,
+			"ctx_deadline", contextDeadlineString(ctx))
 		state.metrics.abortReason = "context_deadline"
 		return false
 	}
 	return p.executeContinuationRound(ctx, prompt, state, cfg, system, stage, onChunk)
 }
 
+// perRoundTimeoutCap is the maximum time allowed for a single continuation
+// round. Derived from the default per-request timeout (120s) × 0.75 = 90s,
+// leaving headroom for overlap detection and stitching.
+const perRoundTimeoutCap = 90 * time.Second
+
 // executeContinuationRound performs the request and applies the result.
+// Each round is bounded by min(p.timeout, perRoundTimeoutCap) to prevent
+// a single round from consuming the entire operation budget.
 func (p *anthropicPlanner) executeContinuationRound(
 	ctx context.Context,
 	prompt string,
@@ -200,13 +265,32 @@ func (p *anthropicPlanner) executeContinuationRound(
 ) bool {
 	state.metrics.roundsUsed++
 
-	result, err := p.requestContinuation(ctx, prompt, state.lastSnapshot, state.lastStructure, state.mode, cfg, system, stage, onChunk)
+	roundTimeout := min(p.timeout, perRoundTimeoutCap)
+	roundCtx, roundCancel := context.WithTimeout(ctx, roundTimeout)
+	defer roundCancel()
+
+	p.logger.Info("executeContinuationRound: requesting continuation",
+		"stage", stage,
+		"round", state.metrics.roundsUsed,
+		"accumulated_len", state.length,
+		"round_timeout", roundTimeout.String(),
+		"ctx_deadline", contextDeadlineString(roundCtx))
+	reqStart := time.Now()
+	result, err := p.requestContinuation(roundCtx, prompt, state.lastSnapshot, state.lastStructure, state.mode, cfg, system, stage, onChunk)
 	if err != nil {
-		p.logger.Warn("continuation round failed",
-			"round", state.metrics.roundsUsed, "error", err)
+		p.logger.Warn("executeContinuationRound: request failed",
+			"stage", stage,
+			"round", state.metrics.roundsUsed,
+			"elapsed", time.Since(reqStart).String(),
+			"error", err)
 		state.metrics.abortReason = "request_error"
 		return false
 	}
+	p.logger.Info("executeContinuationRound: request succeeded",
+		"stage", stage,
+		"round", state.metrics.roundsUsed,
+		"elapsed", time.Since(reqStart).String(),
+		"result_len", len(result.Text))
 	return applyContinuationResult(state, result, cfg)
 }
 
@@ -272,7 +356,7 @@ func shouldContinue(
 	overlap overlapResult,
 	cfg continuationConfig,
 ) bool {
-	if result.StopReason != providers.StopReasonMaxTokens {
+	if !isTruncatedResult(result.StopReason) {
 		return false
 	}
 	if !checkProgress(state, overlap, cfg) {

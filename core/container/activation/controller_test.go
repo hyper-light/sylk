@@ -2,6 +2,7 @@ package activation
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -550,6 +551,84 @@ func (a *alwaysPressured) Evaluate(entries []*ActivationEntry) []EvictionCandida
 	return pe.Evaluate(entries)
 }
 
+func TestController_EnsureActive_CancelledContext(t *testing.T) {
+	cfg := testControllerConfig(t)
+	rt := cfg.Runtime.(*mockRuntime)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	_, err = ac.EnsureActive(ctx, "engineer")
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// No container should have been created — promote checks ctx.Err()
+	// before delegating to promoteFromCold.
+	if rt.createdCount() != 0 {
+		t.Fatalf("expected 0 containers created, got %d", rt.createdCount())
+	}
+}
+
+func TestController_PromoteFromCold_CancelBetweenCreateAndStart(t *testing.T) {
+	cfg := testControllerConfig(t)
+	rt := cfg.Runtime.(*mockRuntime)
+
+	// Wrap createFunc to cancel context after container creation.
+	origCreate := rt.createFunc
+	cancelAfterCreate := make(chan context.CancelFunc, 1)
+	rt.createFunc = func(ctx context.Context, spec container.ContainerSpec) (*container.Container, error) {
+		c, err := origCreate(ctx, spec)
+		if err != nil {
+			return nil, err
+		}
+		// Signal the test to cancel the context.
+		if fn, ok := ctx.Value(cancelKey{}).(context.CancelFunc); ok {
+			fn()
+		}
+		return c, err
+	}
+	_ = cancelAfterCreate // suppress unused
+
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = context.WithValue(ctx, cancelKey{}, cancel)
+
+	_, err = ac.EnsureActive(ctx, "engineer")
+	if err == nil {
+		t.Fatal("expected error from context cancelled between create and start")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+
+	// Container was created but should have been cleaned up (removed).
+	if rt.createdCount() != 1 {
+		t.Fatalf("expected 1 container created, got %d", rt.createdCount())
+	}
+
+	rt.mu.Lock()
+	removed := rt.removed
+	rt.mu.Unlock()
+	if removed != 1 {
+		t.Fatalf("expected 1 container removed (cleanup), got %d", removed)
+	}
+}
+
+type cancelKey struct{}
+
 func assertTier(t *testing.T, ac *ActivationController, agentType string, expected ActivationTier) {
 	t.Helper()
 	tier, err := ac.TierOf(agentType)
@@ -559,4 +638,164 @@ func assertTier(t *testing.T, ac *ActivationController, agentType string, expect
 	if tier != expected {
 		t.Fatalf("expected %v for %s, got %v", expected, agentType, tier)
 	}
+}
+
+// --- Request Guard Tests ---
+
+func TestController_AcquireRequestGuard_IncrementsCounter(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	entry, _ := ac.getEntry("engineer")
+	if entry.HasActiveRequests() {
+		t.Fatal("expected no active requests initially")
+	}
+
+	release := ac.AcquireRequestGuard("engineer")
+	if !entry.HasActiveRequests() {
+		t.Fatal("expected active requests after acquire")
+	}
+
+	release()
+	if entry.HasActiveRequests() {
+		t.Fatal("expected no active requests after release")
+	}
+}
+
+func TestController_AcquireRequestGuard_ReleaseIsIdempotent(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	release := ac.AcquireRequestGuard("engineer")
+	release()
+	release() // second call must not decrement below zero
+
+	entry, _ := ac.getEntry("engineer")
+	if entry.ActiveRequests.Load() != 0 {
+		t.Fatalf("expected 0 active requests, got %d", entry.ActiveRequests.Load())
+	}
+}
+
+func TestController_AcquireRequestGuard_UnknownAgent(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	// Must return a no-op function without panicking.
+	release := ac.AcquireRequestGuard("nonexistent")
+	release() // no panic
+}
+
+func TestController_DemoteWarmToCool_BlockedByActiveRequests(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+
+	// Cold → Hot
+	_, err = ac.EnsureActive(ctx, "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+
+	// Hot → Warm
+	err = ac.DemoteTo(ctx, "engineer", TierWarm)
+	if err != nil {
+		t.Fatalf("DemoteTo Warm: %v", err)
+	}
+	assertTier(t, ac, "engineer", TierWarm)
+
+	// Acquire guard while at Warm tier
+	release := ac.AcquireRequestGuard("engineer")
+
+	// Attempt Warm → Cool — should be blocked
+	err = ac.DemoteTo(ctx, "engineer", TierCool)
+	if err != nil {
+		t.Fatalf("DemoteTo Cool: %v", err)
+	}
+
+	// Tier must remain Warm because guard is held
+	assertTier(t, ac, "engineer", TierWarm)
+
+	release()
+}
+
+func TestController_DemoteWarmToCool_ProceedsAfterRelease(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+
+	// Cold → Hot → Warm
+	_, err = ac.EnsureActive(ctx, "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+	err = ac.DemoteTo(ctx, "engineer", TierWarm)
+	if err != nil {
+		t.Fatalf("DemoteTo Warm: %v", err)
+	}
+
+	// Acquire and immediately release guard
+	release := ac.AcquireRequestGuard("engineer")
+	release()
+
+	// Warm → Cool — should proceed now
+	err = ac.DemoteTo(ctx, "engineer", TierCool)
+	if err != nil {
+		t.Fatalf("DemoteTo Cool after release: %v", err)
+	}
+	assertTier(t, ac, "engineer", TierCool)
+}
+
+func TestController_IdleMonitor_SkipsDemotionWithActiveRequests(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+
+	// Cold → Hot
+	_, err = ac.EnsureActive(ctx, "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+
+	// Acquire guard
+	release := ac.AcquireRequestGuard("engineer")
+
+	entry, _ := ac.getEntry("engineer")
+
+	// Manually backdate LastActive so the entry looks idle
+	entry.LastActive.Store(0)
+
+	// Create idle monitor and call evaluateEntry directly
+	im := NewIdleMonitor(ac, testScope(t), time.Second)
+	im.evaluateEntry(ctx, entry)
+
+	// Tier should still be Hot — evaluateEntry should have skipped demotion
+	assertTier(t, ac, "engineer", TierHot)
+
+	// LastActive should have been refreshed by the guard check
+	if entry.LastActive.Load() == 0 {
+		t.Fatal("expected LastActive to be refreshed by evaluateEntry guard check")
+	}
+
+	release()
 }

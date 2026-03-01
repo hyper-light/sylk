@@ -83,6 +83,9 @@ func (d *Designer) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
+		if ctx.Err() != nil {
+			break
+		}
 		result, err := shared.TimedToolCall(ctx, "designer", call, func() (string, error) {
 			return d.executeToolCall(ctx, call)
 		})
@@ -112,7 +115,7 @@ func (d *Designer) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (d *Designer) executeToolCall(_ context.Context, call providers.ToolCall) (string, error) {
+func (d *Designer) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return "", fmt.Errorf("tool name is required")
@@ -126,7 +129,7 @@ func (d *Designer) executeToolCall(_ context.Context, call providers.ToolCall) (
 		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
 
-	result := d.skills.Invoke(context.Background(), name, json.RawMessage(raw))
+	result := d.skills.Invoke(ctx, name, json.RawMessage(raw))
 	if result == nil {
 		return "", fmt.Errorf("tool %q returned nil", name)
 	}

@@ -27,7 +27,7 @@ func discoverProjectToolsSkill(e *Engineer) *skills.Skill {
 		Description("Scan the project root for build tools, package managers, and frameworks. Returns a structured inventory of detected tooling.").
 		Domain("discovery").
 		Keywords("discover", "scan", "detect", "tools", "framework", "project").
-		Priority(60).
+		Priority(75).
 		StringParam("path", "Project root path to scan (default: working directory)", false).
 		Usage("Call early in implementation to understand the project's tooling before making changes.").
 		BestPractice("Run once at the start of a task. Cache the result mentally — do not re-scan.").
@@ -55,7 +55,7 @@ func discoverCodePatternsSkill(e *Engineer) *skills.Skill {
 		Description("Scan the codebase for coding conventions: error handling, naming, test patterns, and import styles. Returns a structured summary.").
 		Domain("discovery").
 		Keywords("discover", "scan", "detect", "patterns", "conventions", "style").
-		Priority(55).
+		Priority(90).
 		StringParam("path", "Directory to scan (default: working directory)", false).
 		StringParam("language", "Primary language to focus on (e.g., go, typescript)", false).
 		Usage("Call to understand existing code conventions before implementing. Helps ensure consistency.").

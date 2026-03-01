@@ -39,19 +39,19 @@ type TrackedExecutorEventHook interface {
 // events to an ActivityEventBus. This adapter bridges the TrackedToolExecutor
 // with the activity event system.
 type ToolEventPublisherHook struct {
-	bus *events.ActivityEventBus
+	bus events.ActivityPublisher
 }
 
 // NewToolEventPublisherHook creates a new ToolEventPublisherHook that publishes
-// tool events to the given event bus.
-func NewToolEventPublisherHook(bus *events.ActivityEventBus) *ToolEventPublisherHook {
+// tool events to the given activity publisher.
+func NewToolEventPublisherHook(bus events.ActivityPublisher) *ToolEventPublisherHook {
 	return &ToolEventPublisherHook{
 		bus: bus,
 	}
 }
 
-// Bus returns the underlying event bus.
-func (h *ToolEventPublisherHook) Bus() *events.ActivityEventBus {
+// Bus returns the underlying activity publisher.
+func (h *ToolEventPublisherHook) Bus() events.ActivityPublisher {
 	return h.bus
 }
 
@@ -69,7 +69,7 @@ func (h *ToolEventPublisherHook) OnToolStart(sessionID, agentID, toolName string
 	event.Data["tool_name"] = toolName
 	event.Data["params"] = params
 
-	h.bus.Publish(event)
+	h.bus.PublishActivity(event)
 }
 
 // OnToolComplete publishes a tool result event when a tool finishes execution.
@@ -90,7 +90,7 @@ func (h *ToolEventPublisherHook) OnToolComplete(sessionID, agentID, toolName str
 	event.Data["tool_name"] = toolName
 	event.Data["result"] = result
 
-	h.bus.Publish(event)
+	h.bus.PublishActivity(event)
 }
 
 // OnToolTimeout publishes a tool timeout event when a tool execution times out.
@@ -109,7 +109,7 @@ func (h *ToolEventPublisherHook) OnToolTimeout(sessionID, agentID, toolName stri
 	event.Data["timeout"] = timeout.String()
 	event.Data["timeout_ms"] = timeout.Milliseconds()
 
-	h.bus.Publish(event)
+	h.bus.PublishActivity(event)
 }
 
 // =============================================================================

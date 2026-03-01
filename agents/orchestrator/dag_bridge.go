@@ -37,7 +37,7 @@ type DAGBridgeDeps struct {
 	Journal     *OrchestratorJournal
 	Buffers     *BufferRegistry
 	Scope       *concurrency.GoroutineScope
-	ActivityBus *events.ActivityEventBus
+	ActivityPub events.ActivityPublisher
 	Activator   guide.AgentActivator // optional on-demand agent activator
 	SessionID   string
 	AgentID     string
@@ -67,7 +67,7 @@ type DAGBridge struct {
 	sessionID string
 	agentID   string
 
-	activityBus *events.ActivityEventBus
+	activityPub events.ActivityPublisher
 	activeDAGs  map[string]*ActiveDAGMeta
 	gates       map[string]*dag.DecisionGate // per-DAG decision gates
 	unsubs      []func()                     // scheduler event unsubscribe functions
@@ -97,7 +97,7 @@ func NewDAGBridge(cfg DAGBridgeConfig, deps DAGBridgeDeps) *DAGBridge {
 		activator:   deps.Activator,
 		sessionID:   deps.SessionID,
 		agentID:     deps.AgentID,
-		activityBus: deps.ActivityBus,
+		activityPub: deps.ActivityPub,
 		activeDAGs:  make(map[string]*ActiveDAGMeta),
 		gates:       make(map[string]*dag.DecisionGate),
 	}
@@ -414,14 +414,14 @@ func (b *DAGBridge) publishDAGStatusToBus(dagID, state, errMsg string) {
 }
 
 func (b *DAGBridge) publishActivity(eventType events.EventType, content string) {
-	if b.activityBus == nil {
+	if b.activityPub == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, b.sessionID, content)
 	evt.AgentID = b.agentID
 	evt.Data["agent_type"] = "orchestrator"
 	evt.Data["agent_name"] = "Orchestrator"
-	b.activityBus.Publish(evt)
+	b.activityPub.PublishActivity(evt)
 }
 
 func errorFromEvent(event *dag.Event) string {

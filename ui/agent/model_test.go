@@ -419,9 +419,9 @@ func TestModel_SeedAgent(t *testing.T) {
 	model.SetSize(80, 40)
 	model.SetFocused(true)
 
-	model.SeedAgent("architect-001", "architect", "Architect")
-	model.SeedAgent("inspector-001", "inspector", "Inspector")
-	model.SeedAgent("tester-001", "tester", "Tester")
+	model.SeedAgent("architect-001", "architect", "Architect", nil)
+	model.SeedAgent("inspector-001", "inspector", "Inspector", nil)
+	model.SeedAgent("tester-001", "tester", "Tester", nil)
 
 	// All three should be present and idle.
 	if len(model.agents) != 3 {
@@ -444,7 +444,7 @@ func TestModel_SeedAgent(t *testing.T) {
 	}
 
 	// Duplicate seed is a no-op.
-	model.SeedAgent("architect-001", "architect", "Architect")
+	model.SeedAgent("architect-001", "architect", "Architect", nil)
 	if len(model.agents) != 3 {
 		t.Fatalf("duplicate seed changed count: %d, want 3", len(model.agents))
 	}
@@ -465,8 +465,8 @@ func TestModel_SeedAgent_PromotePlaceholder(t *testing.T) {
 	model.SetFocused(true)
 
 	// Seed with placeholder ID == AgentType (activation failed, no real ID).
-	model.SeedAgent("tester", "tester", "Tester")
-	model.SeedAgent("inspector", "inspector", "Inspector")
+	model.SeedAgent("tester", "tester", "Tester", nil)
+	model.SeedAgent("inspector", "inspector", "Inspector", nil)
 
 	if len(model.agents) != 2 {
 		t.Fatalf("agents count = %d, want 2", len(model.agents))

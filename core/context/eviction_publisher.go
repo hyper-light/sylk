@@ -177,8 +177,8 @@ func DefaultEvictionPublisherConfig() *EvictionPublisherConfig {
 // EvictionEventPublisher publishes eviction events to the ActivityEventBus.
 // It provides non-blocking event publishing with configurable detail levels.
 type EvictionEventPublisher struct {
-	// bus is the activity event bus to publish to.
-	bus *events.ActivityEventBus
+	// bus is the activity publisher to publish to.
+	bus events.ActivityPublisher
 
 	// sessionID is the current session identifier.
 	sessionID string
@@ -204,7 +204,7 @@ type EvictionEventPublisher struct {
 
 // NewEvictionEventPublisher creates a new EvictionEventPublisher.
 func NewEvictionEventPublisher(
-	bus *events.ActivityEventBus,
+	bus events.ActivityPublisher,
 	sessionID, agentID string,
 	config *EvictionPublisherConfig,
 ) *EvictionEventPublisher {
@@ -238,7 +238,7 @@ func (p *EvictionEventPublisher) processBuffer() {
 
 	for event := range p.buffer {
 		if p.bus != nil {
-			p.bus.Publish(event)
+			p.bus.PublishActivity(event)
 		}
 	}
 }

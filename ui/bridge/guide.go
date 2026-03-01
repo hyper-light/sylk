@@ -160,7 +160,7 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 	case guide.StreamEventProgress:
 		program.Send(toStreamProgressMsg(sid, cid, stream.RespondingAgentID, stream.Event))
 	case guide.StreamEventComplete:
-		complete := msg.StreamCompleteMsg{SessionID: sid, CorrelationID: cid, Result: stream.Event.Data}
+		complete := msg.StreamCompleteMsg{SessionID: sid, CorrelationID: cid, AgentID: stream.RespondingAgentID, Result: stream.Event.Data}
 		if text := streamCompleteText(stream.RespondingAgentID, stream.Event); text != "" {
 			complete.AuthoritativeText = redact.Text(text)
 		}

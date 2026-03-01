@@ -1,7 +1,6 @@
 package bridge
 
 import (
-	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -9,16 +8,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/msg"
 )
 
 const (
 	activityBridgeName = "bridge.activity"
-	activityBufferSize = 256
-	// Zero uses the scope's max lifetime; activity bridge is long-lived for the UI session.
-	activityDrainTimeout = 0
 )
 
 var (
@@ -42,64 +38,55 @@ func bridgeEventDebugLog() *slog.Logger {
 	return bridgeDebugLog
 }
 
-// ActivityBridge implements both events.EventSubscriber and Bridge.
-// It subscribes to the ActivityEventBus and forwards events as
-// msg.ActivityEventMsg to the Bubble Tea program.
+// ActivityBridge subscribes to ChannelBus TopicActivity and forwards
+// activity events as msg.ActivityEventMsg to the Bubble Tea program.
+// Events are filtered (UserVisible only) and deduplicated before delivery.
 type ActivityBridge struct {
-	id       string
-	bus      *events.ActivityEventBus
-	scope    *concurrency.GoroutineScope
-	buffer   chan *events.ActivityEvent
-	dropped  atomic.Int64
-	done     chan struct{}
-	stopOnce sync.Once
+	id        string
+	bus       guide.EventBus
+	sub       guide.Subscription
+	debouncer *guide.DebouncedMessageHandler
+	dropped   atomic.Int64
+	stopOnce  sync.Once
 }
 
-// NewActivityBridge creates a bridge that converts ActivityEventBus events
-// into Bubble Tea messages. The bridge must be registered with the bus
-// via bus.Subscribe(bridge) before calling Start.
-func NewActivityBridge(id string, bus *events.ActivityEventBus, scope *concurrency.GoroutineScope) *ActivityBridge {
+// NewActivityBridge creates a bridge that converts ChannelBus activity
+// messages into Bubble Tea messages.
+func NewActivityBridge(id string, bus guide.EventBus) *ActivityBridge {
 	return &ActivityBridge{
-		id:     id,
-		bus:    bus,
-		scope:  scope,
-		buffer: make(chan *events.ActivityEvent, activityBufferSize),
-		done:   make(chan struct{}),
+		id:  id,
+		bus: bus,
 	}
-}
-
-// -- events.EventSubscriber implementation --
-
-// ID returns the unique subscriber identifier.
-func (b *ActivityBridge) ID() string { return b.id }
-
-// EventTypes returns nil to subscribe to all event types (wildcard).
-func (b *ActivityBridge) EventTypes() []events.EventType { return nil }
-
-// OnEvent is called by the ActivityEventBus. It enqueues the event into the
-// bounded buffer, incrementing the dropped counter on backpressure.
-func (b *ActivityBridge) OnEvent(event *events.ActivityEvent) error {
-	select {
-	case b.buffer <- event:
-	default:
-		b.dropped.Add(1)
-	}
-	return nil
 }
 
 // -- Bridge implementation --
 
-// Start registers with the bus and launches the drain goroutine via GoroutineScope.
+// Start subscribes to TopicActivity on the ChannelBus with filtering
+// and deduplication, forwarding matching events to the Bubble Tea program.
 func (b *ActivityBridge) Start(program TeaProgram) error {
-	b.bus.Subscribe(b)
-	return b.scope.Go(activityBridgeName, activityDrainTimeout, b.drainFunc(program))
+	forwarder := b.forwardHandler(program)
+	b.debouncer = guide.NewDebouncedMessageHandler(forwarder)
+	filtered := guide.NewFilteredActivityHandler(b.debouncer.Handle, guide.UserVisibleFilter())
+
+	sub, err := b.bus.SubscribeAsync(guide.TopicActivity, filtered)
+	if err != nil {
+		b.debouncer.Stop()
+		b.debouncer = nil
+		return err
+	}
+	b.sub = sub
+	return nil
 }
 
-// Stop unsubscribes from the bus and signals the drain goroutine to exit.
+// Stop unsubscribes from the ChannelBus and releases the debouncer.
 func (b *ActivityBridge) Stop() {
 	b.stopOnce.Do(func() {
-		b.bus.Unsubscribe(b.id)
-		close(b.done)
+		if b.sub != nil {
+			_ = b.sub.Unsubscribe()
+		}
+		if b.debouncer != nil {
+			b.debouncer.Stop()
+		}
 	})
 }
 
@@ -109,28 +96,26 @@ func (b *ActivityBridge) Name() string { return activityBridgeName }
 // DroppedCount returns the total number of events dropped due to backpressure.
 func (b *ActivityBridge) DroppedCount() int64 { return b.dropped.Load() }
 
-// drainFunc returns the WorkFunc that drains the buffer and sends tea messages.
-func (b *ActivityBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
-	return func(ctx context.Context) error {
-		for {
-			if stop, err := shouldStop(b.done, ctx); stop {
-				return err
-			}
-			select {
-			case event := <-b.buffer:
-				bridgeEventDebugLog().Info("activity_bridge: drain",
-					"agent_id", event.AgentID,
-					"event_type", event.EventType,
-					"content", event.Content,
-					"outcome", event.Outcome,
-					"event_ts", event.Timestamp.Format(time.RFC3339Nano),
-					"drain_ts", time.Now().Format(time.RFC3339Nano))
-				program.Send(msg.ActivityEventMsg{Event: event})
-			case <-b.done:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+// forwardHandler returns a MessageHandler that extracts the ActivityEvent
+// from a ChannelBus message and sends it to the Bubble Tea program.
+func (b *ActivityBridge) forwardHandler(program TeaProgram) guide.MessageHandler {
+	return func(m *guide.Message) error {
+		event, ok := m.GetActivityEvent()
+		if !ok {
+			return nil
 		}
+		b.logEvent(event)
+		program.Send(msg.ActivityEventMsg{Event: event})
+		return nil
 	}
+}
+
+func (b *ActivityBridge) logEvent(event *events.ActivityEvent) {
+	bridgeEventDebugLog().Info("activity_bridge: forward",
+		"agent_id", event.AgentID,
+		"event_type", event.EventType,
+		"content", event.Content,
+		"outcome", event.Outcome,
+		"event_ts", event.Timestamp.Format(time.RFC3339Nano),
+		"forward_ts", time.Now().Format(time.RFC3339Nano))
 }

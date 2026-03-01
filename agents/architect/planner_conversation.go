@@ -13,10 +13,11 @@ import (
 type plannerConversationMode string
 
 const (
-	plannerConversationModeClarification plannerConversationMode = "clarification"
-	plannerConversationModeReady         plannerConversationMode = "ready"
-	plannerConversationModeConverse      plannerConversationMode = "converse"
-	plannerConversationModeFeedback      plannerConversationMode = "feedback"
+	plannerConversationModeClarification    plannerConversationMode = "clarification"
+	plannerConversationModeClarifyDecision  plannerConversationMode = "clarify_decision"
+	plannerConversationModeReady            plannerConversationMode = "ready"
+	plannerConversationModeConverse         plannerConversationMode = "converse"
+	plannerConversationModeFeedback         plannerConversationMode = "feedback"
 )
 
 type plannerConversationRequest struct {
@@ -31,8 +32,11 @@ type plannerConversationRequest struct {
 	Assumptions             []string                 `json:"assumptions,omitempty"`
 	ClarificationQuestions  []string                 `json:"clarification_questions,omitempty"`
 	TaskCount               int                      `json:"task_count,omitempty"`
+	LayerCount              int                      `json:"layer_count,omitempty"`
 	FirstTask               string                   `json:"first_task,omitempty"`
 	PlanSummary             string                   `json:"plan_summary,omitempty"`
+	ApprovalRequired        bool                     `json:"approval_required,omitempty"`
+	SessionID               string                   `json:"session_id,omitempty"`
 	ConversationHistory     []guide.ConversationTurn `json:"conversation_history,omitempty"`
 	OnChunk                 func(string)             `json:"-"`
 }
@@ -50,7 +54,7 @@ func (a *Architect) composeUserFacingResponse(
 	a.logWarn("architect tool-loop compose failed, trying text-only", "error", err)
 
 	// Fall through to text-only streaming path.
-	planner := a.ensurePlanner()
+	planner := a.ensurePlanner(ctx)
 	if planner == nil {
 		return "", fmt.Errorf("architect planner not configured (EnableLLM may be false or API key missing)")
 	}
@@ -73,7 +77,7 @@ func (a *Architect) composeUserFacingResponseWithTools(
 	ctx context.Context,
 	request plannerConversationRequest,
 ) (string, error) {
-	planner := a.ensurePlanner()
+	planner := a.ensurePlanner(ctx)
 	if planner == nil {
 		return "", fmt.Errorf("architect planner not configured")
 	}
@@ -88,6 +92,23 @@ func (a *Architect) composeUserFacingResponseWithTools(
 	maxTokens := plannerConversationMaxTokensForMode(request.normalizedMode(), a.config.MaxOutputTokens)
 	stage := "conversation_" + string(request.normalizedMode())
 
+	// Debug: log the full request construction.
+	toolNames := make([]string, len(tools))
+	for i, t := range tools {
+		toolNames[i] = t.Name
+	}
+	a.logDebug("compose_with_tools: REQUEST",
+		"mode", string(request.normalizedMode()),
+		"stage", stage,
+		"max_tokens", maxTokens,
+		"thinking_budget", 0,
+		"tools", strings.Join(toolNames, ","),
+		"tools_count", len(tools),
+		"prompt_len", len(prompt),
+		"system_prompt_len", len(planner.ConversationSystemPrompt()),
+		"user_query", truncateString(request.UserQuery, 200),
+		"history_turns", len(request.ConversationHistory))
+
 	req := &providers.Request{
 		Messages: []providers.Message{
 			{Role: providers.RoleUser, Content: prompt},
@@ -100,11 +121,21 @@ func (a *Architect) composeUserFacingResponseWithTools(
 
 	text, err := a.executeToolLoop(ctx, req, stage, request.OnChunk)
 	if err != nil {
+		a.logDebug("compose_with_tools: TOOL_LOOP_ERROR",
+			"stage", stage,
+			"err", err.Error())
 		return "", err
 	}
 
+	a.logDebug("compose_with_tools: RAW_RESULT",
+		"stage", stage,
+		"text_len", len(text),
+		"text_preview", truncateString(text, 300))
+
 	text = sanitizePlannerConversationResponse(text)
 	if text == "" {
+		a.logDebug("compose_with_tools: EMPTY_AFTER_SANITIZE",
+			"stage", stage)
 		return "", fmt.Errorf("architect planner returned empty response")
 	}
 	return text, nil
@@ -221,12 +252,32 @@ Requirements:
 - Sound like a principal engineer, not a workflow bot.
 - Summarize the plan in plain language and include why it is a good default.
 - Mention one critical tradeoff or risk the user should validate.
-- Ask one concise next-step question: refine now or proceed to execution.
+- Check the "approval_required" field in the context JSON:
+  - If true: ask the user whether to refine or proceed. End with a brief, natural
+    approval cue so the user knows how to proceed. Examples of good approval cues:
+      "Say **go ahead** when you're ready, or tell me what to adjust."
+      "Ready to execute? Say **go ahead**, or let me know what needs changing."
+    Do NOT use robotic phrasing like "Do you approve this plan?" or "Please confirm."
+    Do NOT invoke route_plan_acceptance.
+  - If false: invoke route_plan_acceptance immediately with the plan details.
+    Do not ask for approval.
 - Do not use canned lead-ins or protocol labels.`
+	case plannerConversationModeClarifyDecision:
+		return `You have just analyzed the user's requirements. Examine the context JSON — it contains the requirements analysis with goals, constraints, scope, and any clarification_questions or unknowns identified during analysis.
+
+Decide whether to proceed with planning or ask clarifying questions first:
+- If the requirements are clear enough to produce a useful plan: write a brief acknowledgment and proceed. Do NOT invoke ask_user_question.
+- If critical ambiguities would lead to a wrong plan: invoke ask_user_question with the most important clarifying questions (max 3). Focus on questions that would change the plan's direction, not minor details.
+
+Do not mention the decision process to the user.`
 	case plannerConversationModeConverse:
 		return `Write the next user-facing response.
 
+CRITICAL — Check for planning confirmation first:
+If you previously offered to create a plan and the user's message expresses agreement or approval (any affirmative intent, regardless of phrasing), you MUST invoke the start_planning tool IMMEDIATELY with a comprehensive query synthesizing all requirements from the conversation. Do NOT write a text response about planning — invoke the tool.
+
 The user is in conversation with you — an expert software architect. They may be:
+- Confirming readiness to plan (see CRITICAL rule above)
 - Asking for advice, recommendations, or opinions
 - Providing pushback or disagreement on a prior suggestion
 - Asking clarifying questions about technology, patterns, or tradeoffs
@@ -236,7 +287,8 @@ The user is in conversation with you — an expert software architect. They may 
 Requirements:
 - Respond directly and substantively to whatever the user said.
 - Draw on your architectural expertise — be opinionated with clear reasoning.
-- If the conversation naturally leads to a concrete implementation task, mention that you can help plan it, but do not force the conversation into a planning protocol.
+- If the conversation naturally leads to a concrete implementation task and you have enough context, ask the user if they'd like you to create an actionable plan.
+- Do not invoke start_planning without user confirmation. Do not force the conversation into planning.
 - Keep a natural, collaborative tone.
 - Do not use canned lead-ins or boilerplate.`
 	case plannerConversationModeFeedback:
@@ -266,7 +318,7 @@ Requirements:
 
 func plannerConversationMaxTokensForMode(mode plannerConversationMode, maxTokens int) int {
 	switch mode {
-	case plannerConversationModeConverse, plannerConversationModeReady, plannerConversationModeFeedback:
+	case plannerConversationModeConverse, plannerConversationModeReady, plannerConversationModeFeedback, plannerConversationModeClarifyDecision:
 		return converseMaxTokens(maxTokens)
 	default:
 		return plannerConversationMaxTokens(maxTokens)
@@ -312,6 +364,8 @@ func (r plannerConversationRequest) normalizedMode() plannerConversationMode {
 		return plannerConversationModeConverse
 	case plannerConversationModeFeedback:
 		return plannerConversationModeFeedback
+	case plannerConversationModeClarifyDecision:
+		return plannerConversationModeClarifyDecision
 	default:
 		return plannerConversationModeClarification
 	}

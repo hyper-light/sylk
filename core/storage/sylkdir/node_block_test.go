@@ -15,6 +15,8 @@ func makeTestNode(id uint32) *Node {
 		CreatedAt:    uint64(time.Now().UnixNano()),
 		SessionID:    1,
 		DocRef:       0,
+		SectionStart: 10,
+		SectionEnd:   25,
 		Name:         "FunctionName",
 		Path:         "path/to/file.go",
 		Package:      "mypackage",
@@ -75,6 +77,12 @@ func TestNodeMarshalUnmarshal(t *testing.T) {
 	}
 	if decoded.DocRef != original.DocRef {
 		t.Errorf("DocRef: got %d, want %d", decoded.DocRef, original.DocRef)
+	}
+	if decoded.SectionStart != original.SectionStart {
+		t.Errorf("SectionStart: got %d, want %d", decoded.SectionStart, original.SectionStart)
+	}
+	if decoded.SectionEnd != original.SectionEnd {
+		t.Errorf("SectionEnd: got %d, want %d", decoded.SectionEnd, original.SectionEnd)
 	}
 	if decoded.SupersededBy != original.SupersededBy {
 		t.Errorf("SupersededBy: got %d, want %d", decoded.SupersededBy, original.SupersededBy)
@@ -426,5 +434,31 @@ func TestNodeLargeStrings(t *testing.T) {
 	}
 	if decoded.Name != original.Name {
 		t.Errorf("Large Name mismatch")
+	}
+}
+
+func TestNodeSectionZeroMeansWholeDoc(t *testing.T) {
+	node := makeTestNode(99)
+	node.SectionStart = 0
+	node.SectionEnd = 0
+
+	data, err := node.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+
+	decoded := &Node{}
+	if err := decoded.UnmarshalBinary(data); err != nil {
+		t.Fatalf("UnmarshalBinary: %v", err)
+	}
+
+	if decoded.SectionStart != 0 {
+		t.Errorf("SectionStart: got %d, want 0", decoded.SectionStart)
+	}
+	if decoded.SectionEnd != 0 {
+		t.Errorf("SectionEnd: got %d, want 0", decoded.SectionEnd)
+	}
+	if decoded.SupersededBy != node.SupersededBy {
+		t.Errorf("SupersededBy corrupted: got %d, want %d", decoded.SupersededBy, node.SupersededBy)
 	}
 }

@@ -7,7 +7,7 @@ import (
 )
 
 type PressureIntegrationConfig struct {
-	SignalBus      *signal.SignalBus
+	SignalBus      signal.SignalBusInterface
 	Scheduler      PipelineScheduler
 	PipelineInfo   ActivePipelineProvider
 	Caches         []EvictableCache

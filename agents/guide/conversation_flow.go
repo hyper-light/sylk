@@ -1,6 +1,7 @@
 package guide
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -45,15 +46,15 @@ type conversationFlowState struct {
 	ActiveAgentID string
 	UpdatedAt     time.Time
 	agents        map[string]conversationAgentState
-	phase         *sessionPhase // Active conversation phase (e.g. plan approval).
+	pending       *pendingPlan // Architect plan awaiting user approval.
 }
 
-// sessionPhase tracks an active conversation phase set by a ResponseDirective.
-// The phase is consumed (one-shot) on the next user message classification.
-type sessionPhase struct {
-	Phase     ConversationPhase
+// pendingPlan tracks an architect plan awaiting user approval.
+// Consumed on execute/feedback; TTL-bounded to prevent stale plans.
+type pendingPlan struct {
+	PlanID    string
 	AgentID   string
-	Metadata  map[string]any
+	Epoch     uint64
 	SetAt     time.Time
 	ExpiresAt time.Time
 }
@@ -229,6 +230,33 @@ func (m *ConversationFlowManager) Clear(sessionID string) {
 	m.mu.Lock()
 	delete(m.sessions, trimmed)
 	m.mu.Unlock()
+}
+
+// ClearStickiness clears routing stickiness (ActiveAgentID) for the session
+// but preserves the agents map containing conversation history. Use this on
+// interrupt instead of Clear to avoid destroying the session's memory.
+func (m *ConversationFlowManager) ClearStickiness(sessionID string) {
+	if m == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.sessions[trimmed]
+	if !ok {
+		return
+	}
+	state.ActiveAgentID = ""
+	m.sessions[trimmed] = state
+}
+
+// RecordInterruption records an interruption marker as the agent's reply so
+// the LLM knows the prior turn was cut short. Delegates to RecordAgentReply.
+func (m *ConversationFlowManager) RecordInterruption(sessionID, agentID string) {
+	m.RecordAgentReply(sessionID, agentID, "(interrupted by user)")
 }
 
 // RecordUserInput pushes a new turn with the user's input into the session history.
@@ -547,6 +575,7 @@ func isAgentConversationDoneSignal(input string) bool {
 		"no further action needed",
 		"work is complete",
 		"all tasks completed",
+		"(interrupted)",
 	)
 }
 
@@ -609,9 +638,41 @@ func (g *Guide) observeConversationResponse(pending *PendingRequest, response *R
 		pending.TargetAgentID,
 		responseText,
 	)
+	g.observeResponseDirective(pending, response)
+}
+
+// observeResponseDirective extracts a ResponseDirective from the RouteResponse
+// data as a fallback when the STREAM_COMPLETE event carrying the directive was
+// lost. This is a safety net — the primary path is observeStreamDirective.
+func (g *Guide) observeResponseDirective(pending *PendingRequest, response *RouteResponse) {
+	if g == nil || g.conversation == nil || response == nil || response.Data == nil {
+		return
+	}
+	if pending == nil || pending.Request == nil {
+		return
+	}
+	// Skip if a pending plan is already set for this session (stream path succeeded).
+	if g.conversation.PendingPlan(pending.Request.SessionID) != nil {
+		return
+	}
+	carrier, ok := response.Data.(directiveCarrier)
+	if !ok {
+		return
+	}
+	directive := carrier.ResponseDirective()
+	if directive == nil {
+		return
+	}
+	DebugFileLog().Info("observeResponseDirective: FALLBACK_SET_PENDING_PLAN",
+		"session_id", pending.Request.SessionID,
+		"phase", string(directive.Phase),
+		"agent_id", directive.AgentID,
+		"correlation_id", response.CorrelationID)
+	g.conversation.SetPendingPlan(pending.Request.SessionID, directive)
 }
 
 func (g *Guide) applyConversationFlow(
+	ctx context.Context,
 	request *RouteRequest,
 	classification *RouteResult,
 	targetAgentID string,
@@ -627,7 +688,7 @@ func (g *Guide) applyConversationFlow(
 	updated := remapClassificationTarget(classification, desiredTarget)
 	updated.Intent = g.supportedIntentForTarget(desiredTarget, updated.Intent)
 	updated.Domain = g.supportedDomainForTarget(desiredTarget, updated.Domain, updated.Intent)
-	updated, targetAgentID = g.ensureRoutableClassification(updated, desiredTarget)
+	updated, targetAgentID = g.ensureRoutableClassification(ctx, updated, desiredTarget)
 	g.observeRoutedConversationTarget(request, targetAgentID)
 	return updated, targetAgentID
 }
@@ -700,23 +761,33 @@ type responseTexter interface {
 	ResponseText() string
 }
 
+// directiveCarrier is satisfied by agent response types that carry a
+// ResponseDirective (e.g. DesignPlan when ready, ConversationResult with
+// plan approval). Used as a fallback when the STREAM_COMPLETE event carrying
+// the directive is lost due to bus delivery issues.
+type directiveCarrier interface {
+	ResponseDirective() *ResponseDirective
+}
+
 // =============================================================================
-// Conversation Phase Tracking
+// Pending Plan Tracking
 // =============================================================================
 
-// SetPhase records a conversation phase for the session from a ResponseDirective.
-func (m *ConversationFlowManager) SetPhase(sessionID string, directive *ResponseDirective) {
-	if m == nil || directive == nil || directive.Phase == PhaseNone {
+const defaultPendingPlanTTL = 30 * time.Minute
+
+// SetPendingPlan records a pending plan from a ResponseDirective.
+// Only stores when directive.Phase == PhasePlanApproval.
+func (m *ConversationFlowManager) SetPendingPlan(sessionID string, directive *ResponseDirective) {
+	if m == nil || directive == nil || directive.Phase != PhasePlanApproval {
 		return
 	}
 	trimmed := strings.TrimSpace(sessionID)
 	if trimmed == "" {
 		return
 	}
-	now := time.Now()
-	ttl := directive.TTL
-	if ttl <= 0 {
-		ttl = 30 * time.Minute
+	pp := pendingPlanFromDirective(directive)
+	if pp == nil {
+		return
 	}
 	m.mu.Lock()
 	state, ok := m.sessions[trimmed]
@@ -725,20 +796,21 @@ func (m *ConversationFlowManager) SetPhase(sessionID string, directive *Response
 			agents: map[string]conversationAgentState{},
 		}
 	}
-	state.phase = &sessionPhase{
-		Phase:     directive.Phase,
-		AgentID:   strings.TrimSpace(directive.AgentID),
-		Metadata:  directive.Metadata,
-		SetAt:     now,
-		ExpiresAt: now.Add(ttl),
-	}
-	state.UpdatedAt = now
+	state.pending = pp
+	state.UpdatedAt = pp.SetAt
 	m.sessions[trimmed] = state
 	m.mu.Unlock()
+	DebugFileLog().Info("SetPendingPlan: STORED",
+		"session_id", trimmed,
+		"plan_id", pp.PlanID,
+		"agent_id", pp.AgentID,
+		"epoch", pp.Epoch,
+		"expires_at", pp.ExpiresAt.String())
 }
 
-// CurrentPhase returns the active phase for the session, or nil if expired/absent.
-func (m *ConversationFlowManager) CurrentPhase(sessionID string) *sessionPhase {
+// PendingPlan returns the active pending plan for the session, or nil if
+// expired/absent. Clears expired entries on read.
+func (m *ConversationFlowManager) PendingPlan(sessionID string) *pendingPlan {
 	if m == nil {
 		return nil
 	}
@@ -749,18 +821,18 @@ func (m *ConversationFlowManager) CurrentPhase(sessionID string) *sessionPhase {
 	m.mu.RLock()
 	state, ok := m.sessions[trimmed]
 	m.mu.RUnlock()
-	if !ok || state.phase == nil {
+	if !ok || state.pending == nil {
 		return nil
 	}
-	if time.Now().After(state.phase.ExpiresAt) {
-		m.ClearPhase(trimmed)
+	if time.Now().After(state.pending.ExpiresAt) {
+		m.ClearPendingPlan(trimmed)
 		return nil
 	}
-	return state.phase
+	return state.pending
 }
 
-// ClearPhase removes the active phase for the session.
-func (m *ConversationFlowManager) ClearPhase(sessionID string) {
+// ClearPendingPlan removes the pending plan for the session.
+func (m *ConversationFlowManager) ClearPendingPlan(sessionID string) {
 	if m == nil {
 		return
 	}
@@ -770,170 +842,42 @@ func (m *ConversationFlowManager) ClearPhase(sessionID string) {
 	}
 	m.mu.Lock()
 	if state, ok := m.sessions[trimmed]; ok {
-		state.phase = nil
+		state.pending = nil
 		m.sessions[trimmed] = state
 	}
 	m.mu.Unlock()
 }
 
-// =============================================================================
-// Phase-Aware Classification
-// =============================================================================
-
-// tryPhaseClassification checks whether a conversation phase is active and
-// classifies the input using phase-specific polarity instead of full intent
-// detection. Returns (result, targetAgentID, true) when the phase gate fires.
-func (g *Guide) tryPhaseClassification(request *RouteRequest) (*RouteResult, string, bool) {
-	if g == nil || g.conversation == nil || request == nil {
-		return nil, "", false
+// pendingPlanFromDirective extracts a pendingPlan from a ResponseDirective.
+// Handles both uint64 and float64 epoch types (JSON round-trip yields float64).
+func pendingPlanFromDirective(directive *ResponseDirective) *pendingPlan {
+	if directive == nil {
+		return nil
 	}
-	phase := g.conversation.CurrentPhase(request.SessionID)
-	if phase == nil {
-		return nil, "", false
+	agentID := strings.TrimSpace(directive.AgentID)
+	if agentID == "" {
+		agentID = "architect"
 	}
-
-	// One-shot: consume the phase regardless of classification outcome.
-	defer g.conversation.ClearPhase(request.SessionID)
-
-	switch phase.Phase {
-	case PhasePlanApproval:
-		return g.classifyPlanApprovalPhase(request, phase)
-	default:
-		return nil, "", false
+	planID, _ := directive.Metadata["plan_id"].(string)
+	var epoch uint64
+	switch v := directive.Metadata["epoch"].(type) {
+	case uint64:
+		epoch = v
+	case float64:
+		epoch = uint64(v)
 	}
-}
-
-// classifyPlanApprovalPhase handles the PhasePlanApproval phase. Checks for
-// topic escape first, then classifies polarity (accept vs feedback).
-func (g *Guide) classifyPlanApprovalPhase(request *RouteRequest, phase *sessionPhase) (*RouteResult, string, bool) {
-	input := strings.TrimSpace(request.Input)
-	if input == "" {
-		return nil, "", false
+	now := time.Now()
+	ttl := directive.TTL
+	if ttl <= 0 {
+		ttl = defaultPendingPlanTTL
 	}
-
-	// Topic escape: if the input references a different domain, fall through
-	// to normal classification.
-	if isPlanApprovalTopicEscape(input) {
-		return nil, "", false
+	return &pendingPlan{
+		PlanID:    planID,
+		AgentID:   agentID,
+		Epoch:     epoch,
+		SetAt:     now,
+		ExpiresAt: now.Add(ttl),
 	}
-
-	targetAgent := phase.AgentID
-	if targetAgent == "" {
-		targetAgent = "architect"
-	}
-
-	if classifyPlanApprovalPolarity(input) {
-		result := &RouteResult{
-			Intent:               IntentExecute,
-			Domain:               DomainPlanning,
-			TargetAgent:          TargetAgent(targetAgent),
-			Confidence:           0.95,
-			Action:               RouteActionExecute,
-			ClassificationMethod: "phase_plan_approval",
-			Reason:               "plan approval: positive polarity",
-		}
-		return result, targetAgent, true
-	}
-
-	result := &RouteResult{
-		Intent:               IntentPlan,
-		Domain:               DomainPlanning,
-		TargetAgent:          TargetAgent(targetAgent),
-		Confidence:           0.95,
-		Action:               RouteActionExecute,
-		ClassificationMethod: "phase_plan_feedback",
-		Reason:               "plan approval: feedback/rejection",
-	}
-	return result, targetAgent, true
-}
-
-// planApprovalPositiveExact are short affirmatives that match only when the
-// entire message (after trim + lower + strip punctuation) equals the phrase.
-// Acceptance is a closed class — there are only so many ways to say "yes".
-var planApprovalPositiveExact = map[string]struct{}{
-	"yes": {}, "y": {}, "yep": {}, "yeah": {}, "yup": {},
-	"ok": {}, "okay": {}, "sure": {}, "right": {},
-	"great": {}, "perfect": {}, "awesome": {}, "absolutely": {},
-	"affirmative": {}, "roger": {}, "aye": {}, "approved": {}, "lgtm": {},
-}
-
-// planApprovalPositiveContains are phrases that signal acceptance when found
-// anywhere in the input.
-var planApprovalPositiveContains = []string{
-	"go ahead", "go for it", "do it", "make it so", "ship it",
-	"let's go", "lets go", "let's do it", "lets do it",
-	"sounds good", "looks good", "kick it off",
-	"run it", "proceed", "execute", "hand off", "handoff",
-}
-
-// planApprovalNegationPrefixes are phrases that negate a subsequent positive
-// signal. Checked before positive matching so "don't go ahead" and "no,
-// don't proceed" are correctly classified as negative (feedback/rejection).
-var planApprovalNegationPrefixes = []string{
-	"don't", "don't", "do not", "dont",
-	"not yet", "hold off", "hold on",
-	"wait", "stop", "cancel", "pause",
-	"i disagree", "i object", "i refuse",
-	"no,", "no.", "no!", "nope",
-}
-
-// classifyPlanApprovalPolarity returns true for positive (accept), false for
-// negative (feedback/reject). The positive list is intentionally small because
-// acceptance is a closed class. Everything else is feedback — the correct
-// default because unsolicited approval is rare.
-//
-// Negation is checked first: "don't go ahead" contains "go ahead" but is
-// negative because the negation prefix overrides the positive signal.
-func classifyPlanApprovalPolarity(input string) bool {
-	lower := strings.ToLower(strings.TrimSpace(input))
-	if lower == "" {
-		return false
-	}
-	if hasPlanApprovalNegation(lower) {
-		return false
-	}
-	stripped := strings.TrimRight(lower, ".!?,;:")
-	if _, ok := planApprovalPositiveExact[stripped]; ok {
-		return true
-	}
-	for _, phrase := range planApprovalPositiveContains {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasPlanApprovalNegation returns true when the input contains a negation
-// prefix that overrides any subsequent positive signal.
-func hasPlanApprovalNegation(lower string) bool {
-	for _, prefix := range planApprovalNegationPrefixes {
-		if strings.Contains(lower, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-// isPlanApprovalTopicEscape returns true when the input clearly references a
-// different domain, indicating the user has moved on from plan approval.
-func isPlanApprovalTopicEscape(input string) bool {
-	lower := strings.ToLower(strings.TrimSpace(input))
-	// File paths or code references.
-	if strings.ContainsAny(lower, "/\\") {
-		return true
-	}
-	// Explicit agent targeting.
-	escapeKeywords := []string{
-		"@librarian", "@tester", "@inspector", "@engineer", "@designer",
-		"find the", "search for", "locate the", "show me the file",
-	}
-	for _, kw := range escapeKeywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
 }
 
 // observeStreamDirective checks an incoming stream event for a ResponseDirective
@@ -943,14 +887,29 @@ func (g *Guide) observeStreamDirective(streamResp *StreamResponse) {
 		return
 	}
 	event := streamResp.Event
-	if event.Type != StreamEventComplete || event.Directive == nil {
+	if event.Type != StreamEventComplete {
+		return
+	}
+	DebugFileLog().Info("observeStreamDirective: STREAM_COMPLETE",
+		"correlation_id", streamResp.CorrelationID,
+		"has_directive", event.Directive != nil)
+	if event.Directive == nil {
 		return
 	}
 	pending := g.pending.Get(streamResp.CorrelationID)
 	if pending == nil || pending.Request == nil {
+		DebugFileLog().Warn("observeStreamDirective: PENDING_MISSING",
+			"correlation_id", streamResp.CorrelationID,
+			"pending_nil", pending == nil)
 		return
 	}
-	g.conversation.SetPhase(pending.Request.SessionID, event.Directive)
+	sessionID := pending.Request.SessionID
+	DebugFileLog().Info("observeStreamDirective: SET_PENDING_PLAN",
+		"correlation_id", streamResp.CorrelationID,
+		"session_id", sessionID,
+		"phase", string(event.Directive.Phase),
+		"agent_id", event.Directive.AgentID)
+	g.conversation.SetPendingPlan(sessionID, event.Directive)
 }
 
 // observeStreamReroute detects reroute events and records the stream target

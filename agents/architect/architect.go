@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/signal"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
@@ -34,6 +36,7 @@ import (
 // The Architect consults with Librarian for codebase patterns and creates
 // workflow DAGs for task orchestration.
 type Architect struct {
+	id     string
 	config Config
 	logger *slog.Logger
 	logWAL io.Closer
@@ -49,8 +52,8 @@ type Architect struct {
 	planner     planningLLM
 	plannerMu   sync.RWMutex
 
-	// Activity event bus for UI agent-panel updates
-	activityBus *events.ActivityEventBus
+	// Activity publisher for UI agent-panel updates
+	activityPub events.ActivityPublisher
 
 	// Event bus integration
 	bus         guide.EventBus
@@ -81,10 +84,26 @@ type Architect struct {
 
 	// File access abstraction (DiskFileAccess, set at creation).
 	fileAccess versioning.FileAccess
+
+	// toolDefsDirty is set when demand-paged skills are loaded mid-loop,
+	// triggering a tool definition rebuild on the next LLM turn.
+	toolDefsDirty bool
+
+	// Signal bus for broadcasting degradation signals.
+	signalBus     signal.SignalBusInterface
+	signalAdapter *guide.ChannelBusSignalAdapter // non-nil only when self-created
+
+	// Distributed plan lifecycle: lease management + background reaper.
+	leaseManager *PlanLeaseManager
+	reaper       *PlanReaper
+	heartbeatSub guide.Subscription
 }
 
 // Config holds configuration for the Architect agent
 type Config struct {
+	// Canonical agent ID. If empty, defaults to "architect".
+	ID string
+
 	// System prompt configuration
 	SystemPrompt    string // Optional, uses DefaultSystemPrompt if empty
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
@@ -115,6 +134,10 @@ type Config struct {
 	ConsultationTimeout              time.Duration // Optional, defaults to 20s
 	ConsultationMaxAge               time.Duration // Optional, defaults to 5m
 
+	// Plan approval policy
+	AutoApprove bool // When true, plans are dispatched to the orchestrator
+	// without waiting for user approval. Default: false.
+
 	// File access (optional — if nil, Architect uses direct disk I/O).
 	FileAccess versioning.FileAccess
 
@@ -123,11 +146,20 @@ type Config struct {
 	// Called each time the planner is lazily created, preserving auth refresh semantics.
 	PlannerProviderWrapper func(*providers.AnthropicProvider) PlannerStreamProvider
 
-	// ActivityBus for publishing agent activity events to the UI panel.
-	ActivityBus *events.ActivityEventBus
+	// ActivityPub for publishing agent activity events to the UI panel.
+	ActivityPub events.ActivityPublisher
 
 	// Tool dispatch loop
 	MaxToolRuns int // Maximum tool-call turns per conversation request. Defaults to DefaultMaxToolRuns (12).
+
+	// RequestGuard is called at handler entry to prevent activation demotion
+	// during in-flight processing. Returns a release function. Nil-safe.
+	RequestGuard func() func()
+
+	// Signal bus for broadcasting degradation / time-pressure signals.
+	// Optional — if nil, the Architect creates a ChannelBusSignalAdapter
+	// from its EventBus during Start.
+	SignalBus signal.SignalBusInterface
 
 	// Logging
 	Logger *slog.Logger // Optional, defaults to per-agent WAL logger if nil.
@@ -155,6 +187,32 @@ const (
 	DefaultMaxToolRuns         = 12
 )
 
+// ---------------------------------------------------------------------------
+// Architect debug file logger — writes to ~/.sylk/logs/architect_debug.log
+// at Debug level for thorough runtime diagnostics.
+// ---------------------------------------------------------------------------
+
+var (
+	architectDebugLogger     *slog.Logger
+	architectDebugLoggerOnce sync.Once
+)
+
+func architectDebugLog() *slog.Logger {
+	architectDebugLoggerOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".sylk", "logs")
+		_ = os.MkdirAll(dir, 0755)
+		f, err := os.OpenFile(filepath.Join(dir, "architect_debug.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			architectDebugLogger = slog.Default()
+			return
+		}
+		architectDebugLogger = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+	return architectDebugLogger
+}
+
 // logInfo logs at Info level, safe to call when a.logger is nil.
 func (a *Architect) logInfo(msg string, args ...any) {
 	if a != nil && a.logger != nil {
@@ -169,12 +227,17 @@ func (a *Architect) logWarn(msg string, args ...any) {
 	}
 }
 
+// logDebug logs at Debug level to the dedicated architect debug file.
+func (a *Architect) logDebug(msg string, args ...any) {
+	architectDebugLog().Debug(msg, args...)
+}
+
 func (a *Architect) publishActivity(eventType events.EventType, content string) {
 	a.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
 }
 
 func (a *Architect) publishActivityWithVisibility(eventType events.EventType, visibility events.EventVisibility, content string) {
-	if a.activityBus == nil {
+	if a.activityPub == nil {
 		return
 	}
 	evt := events.NewActivityEvent(eventType, "default", content)
@@ -182,21 +245,53 @@ func (a *Architect) publishActivityWithVisibility(eventType events.EventType, vi
 	evt.Visibility = visibility
 	evt.Data["agent_type"] = "architect"
 	evt.Data["agent_name"] = "Architect"
-	a.activityBus.Publish(evt)
+	a.activityPub.PublishActivity(evt)
 }
 
-// New creates a new Architect agent
-func New(cfg Config) (*Architect, error) {
+// operationTimeout derives the planning operation budget from model parameters.
+// stages * budgetLevels * perRequestTimeout — no magic numbers.
+func (a *Architect) operationTimeout() time.Duration {
+	stages := 3 // analyze, design, generate
+	budgetLevels := len(requirementsBudgets(a.config.MaxOutputTokens))
+	return time.Duration(stages*budgetLevels) * a.config.LLMRequestTimeout
+}
+
+// resetPlannerOperationState resets per-operation state on the planner:
+// operation budget for deadline-pressure fraction computation, and the
+// pressure-emitted debounce flag so each operation gets at most one signal.
+func (a *Architect) resetPlannerOperationState(budget time.Duration) {
+	a.plannerMu.RLock()
+	defer a.plannerMu.RUnlock()
+	if ap, ok := a.planner.(*anthropicPlanner); ok && ap != nil {
+		ap.resetOperationState(budget)
+	}
+}
+
+// New creates a new Architect agent. The context is checked between
+// initialization steps so construction can be interrupted during shutdown.
+func New(ctx context.Context, cfg Config) (*Architect, error) {
+	newStart := time.Now()
 	cfg = applyConfigDefaults(cfg)
 	if err := ensureArchitectLogger(&cfg); err != nil {
 		return nil, err
 	}
 
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	architectID := cfg.ID
+	if architectID == "" {
+		architectID = "architect"
+	}
+
+	guide.DebugFileLog().Info("DEBUG: architect_new_struct_init")
 	architect := &Architect{
+		id:          architectID,
 		config:      cfg,
 		logger:      cfg.Logger,
 		logWAL:      cfg.logWAL,
-		activityBus: cfg.ActivityBus,
+		activityPub: cfg.ActivityPub,
 		fileAccess:  cfg.FileAccess,
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		activePlans: make(map[string]*DesignPlan),
@@ -205,16 +300,36 @@ func New(cfg Config) (*Architect, error) {
 		inFlight:    make(map[string]context.CancelFunc),
 	}
 
+	guide.DebugFileLog().Info("DEBUG: architect_new_init_cross_domain")
 	architect.initCrossDomain(cfg)
+	guide.DebugFileLog().Info("DEBUG: architect_new_init_synthesizer")
 	architect.initSynthesizer(cfg)
+	guide.DebugFileLog().Info("DEBUG: architect_new_init_skills")
 	architect.initSkills()
-	if err := architect.initPlanner(cfg); err != nil {
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	guide.DebugFileLog().Info("DEBUG: architect_new_init_planner_start")
+	if err := architect.initPlanner(ctx, cfg); err != nil {
 		return nil, err
 	}
+	guide.DebugFileLog().Info("DEBUG: architect_new_init_planner_done", "elapsed_ms", time.Since(newStart).Milliseconds())
+
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	architect.leaseManager = NewPlanLeaseManager(cfg.LLMRequestTimeout, readyPlanMaxAge)
+
+	guide.DebugFileLog().Info("DEBUG: architect_new_restore_plans_start")
 	if err := architect.restorePersistedPlans(); err != nil {
 		architect.logger.Warn("failed to restore persisted plans", "error", err)
 	}
+	guide.DebugFileLog().Info("DEBUG: architect_new_restore_plans_done", "elapsed_ms", time.Since(newStart).Milliseconds())
 
+	guide.DebugFileLog().Info("DEBUG: architect_new_complete", "total_elapsed_ms", time.Since(newStart).Milliseconds())
 	return architect, nil
 }
 
@@ -324,7 +439,7 @@ func (a *Architect) initSkills() {
 	loaderCfg.CoreSkills = architectCoreSkillNames()
 	loaderCfg.AutoLoadDomains = nil
 	a.skillLoader = skills.NewLoader(a.skills, loaderCfg)
-	registerArchitectSafetyHook(a.hooks, architectAllSkillNames())
+	registerArchitectSafetyHook(a.hooks, a.skills, architectAllSkillNames())
 }
 
 // Close closes the architect and its resources
@@ -345,20 +460,25 @@ func (a *Architect) Close() error {
 // Start begins listening for messages on the event bus.
 // The architect subscribes to its own channels and the registry topic.
 func (a *Architect) Start(bus guide.EventBus) error {
+	a.runMu.Lock()
 	if a.running {
+		a.runMu.Unlock()
 		return fmt.Errorf("architect is already running")
 	}
+	a.running = true
+	a.runMu.Unlock()
 
 	a.setRunContext(context.Background())
 
 	a.bus = bus
-	a.channels = guide.NewAgentChannels("architect", "architect")
+	a.channels = guide.NewAgentChannels("architect", a.id)
 
 	// Subscribe to own request channel (architect.requests)
 	var err error
 	a.requestSub, err = bus.SubscribeAsync(a.channels.Requests, a.handleBusRequest)
 	if err != nil {
 		a.cancelRunContext()
+		a.setNotRunning()
 		return fmt.Errorf("failed to subscribe to %s: %w", a.channels.Requests, err)
 	}
 
@@ -367,6 +487,7 @@ func (a *Architect) Start(bus guide.EventBus) error {
 	if err != nil {
 		a.requestSub.Unsubscribe()
 		a.cancelRunContext()
+		a.setNotRunning()
 		return fmt.Errorf("failed to subscribe to %s: %w", a.channels.Responses, err)
 	}
 
@@ -376,23 +497,77 @@ func (a *Architect) Start(bus guide.EventBus) error {
 		a.requestSub.Unsubscribe()
 		a.responseSub.Unsubscribe()
 		a.cancelRunContext()
+		a.setNotRunning()
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
-	a.running = true
+	// Wire signal bus: prefer injected, otherwise create adapter from EventBus.
+	if a.config.SignalBus != nil {
+		a.signalBus = a.config.SignalBus
+	} else {
+		adapter, adapterErr := guide.NewChannelBusSignalAdapter(bus, guide.ChannelBusSignalAdapterConfig{})
+		if adapterErr != nil {
+			a.logger.Warn("architect signal adapter creation failed", "error", adapterErr)
+		} else {
+			a.signalAdapter = adapter
+			a.signalBus = adapter
+		}
+	}
+
+	// Start plan reaper after all subscriptions succeed.
+	a.reaper = NewPlanReaper(a, a.leaseManager, a.logger)
+	a.reaper.Start()
+
+	// Subscribe to heartbeat topic for executing plan lease renewal.
+	a.heartbeatSub, _ = bus.SubscribeAsync("plan.heartbeat", a.handlePlanHeartbeat)
+
 	a.logger.Info("architect started", "channels", a.channels)
 	return nil
 }
 
 // Stop unsubscribes from event bus topics and stops message processing.
 func (a *Architect) Stop() error {
+	a.runMu.Lock()
 	if !a.running {
+		a.runMu.Unlock()
 		return nil
+	}
+	a.running = false
+	a.runMu.Unlock()
+
+	// Diagnostic: log stop with in-flight state so we can trace what
+	// triggers Stop() while requests are still processing.
+	a.inFlightMu.Lock()
+	inFlightCount := len(a.inFlight)
+	a.inFlightMu.Unlock()
+	a.logInfo("architect: Stop() called",
+		"in_flight_count", inFlightCount)
+	architectDebugLog().Info("architect: STOP_CALLED",
+		"in_flight_count", inFlightCount,
+		"agent_id", a.id)
+
+	// Stop plan reaper before unsubscribing.
+	if a.reaper != nil {
+		a.reaper.Stop()
+		a.reaper = nil
+	}
+
+	// Close self-created signal adapter (if any).
+	if a.signalAdapter != nil {
+		a.signalAdapter.Close()
+		a.signalAdapter = nil
 	}
 
 	a.cancelRunContext()
 	errs := a.unsubscribeAll()
-	a.running = false
+
+	// Unsubscribe heartbeat.
+	if a.heartbeatSub != nil {
+		if err := a.heartbeatSub.Unsubscribe(); err != nil {
+			errs = append(errs, err)
+		}
+		a.heartbeatSub = nil
+	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("errors during stop: %v", errs)
@@ -466,15 +641,30 @@ func (a *Architect) Channels() *guide.AgentChannels {
 func (a *Architect) handleBusRequest(msg *guide.Message) error {
 	ctx := a.processingContext()
 	if err := ctx.Err(); err != nil {
+		a.logInfo("handleBusRequest: context already cancelled", "err", err)
 		return nil
 	}
-	return a.dispatchBusRequest(ctx, msg)
+	a.logInfo("handleBusRequest: entry",
+		"msg_type", string(msg.Type),
+		"correlation_id", msg.CorrelationID)
+	start := time.Now()
+	err := a.dispatchBusRequest(ctx, msg)
+	a.logInfo("handleBusRequest: exit",
+		"msg_type", string(msg.Type),
+		"correlation_id", msg.CorrelationID,
+		"elapsed", time.Since(start).String(),
+		"err", err)
+	return err
 }
 
 func (a *Architect) dispatchBusRequest(ctx context.Context, msg *guide.Message) error {
 	if msg == nil {
+		a.logInfo("dispatchBusRequest: nil message, skipping")
 		return nil
 	}
+	a.logInfo("dispatchBusRequest: routing",
+		"msg_type", string(msg.Type),
+		"correlation_id", msg.CorrelationID)
 	if msg.Type == guide.MessageTypeForward {
 		return a.handleForwardBusRequest(ctx, msg)
 	}
@@ -484,14 +674,30 @@ func (a *Architect) dispatchBusRequest(ctx context.Context, msg *guide.Message) 
 	if msg.Type == guide.MessageTypeProposal {
 		return a.handleProposalBusRequest(ctx, msg)
 	}
+	a.logInfo("dispatchBusRequest: unhandled message type", "msg_type", string(msg.Type))
 	return nil
 }
 
 func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Message) error {
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
+		a.logWarn("handleForwardBusRequest: invalid forward request payload")
 		return fmt.Errorf("invalid forward request payload")
 	}
+
+	if a.config.RequestGuard != nil {
+		release := a.config.RequestGuard()
+		defer release()
+	}
+
+	a.logInfo("handleForwardBusRequest: entry",
+		"correlation_id", fwd.CorrelationID,
+		"intent", string(fwd.Intent),
+		"input", truncateString(fwd.Input, 120),
+		"session_id", fwd.SessionID,
+		"fire_and_forget", fwd.FireAndForget,
+		"history_len", len(fwd.ConversationHistory),
+		"ctx_deadline", contextDeadlineString(ctx))
 
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -509,10 +715,20 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	if !fwd.FireAndForget {
 		a.publishPlanStreamStart(reqCtx)
 	}
+	a.logInfo("handleForwardBusRequest: calling processForwardedRequest",
+		"correlation_id", fwd.CorrelationID,
+		"elapsed_before_process", time.Since(startTime).String())
 	result, err := a.processForwardedRequest(reqCtx, fwd)
+	a.logInfo("handleForwardBusRequest: processForwardedRequest returned",
+		"correlation_id", fwd.CorrelationID,
+		"elapsed", time.Since(startTime).String(),
+		"has_result", result != nil,
+		"err", err)
 
 	// Don't respond if fire-and-forget
 	if fwd.FireAndForget {
+		a.logInfo("handleForwardBusRequest: fire-and-forget, not responding",
+			"correlation_id", fwd.CorrelationID)
 		return nil
 	}
 
@@ -520,7 +736,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "architect",
+		RespondingAgentID:   a.id,
 		RespondingAgentName: "architect",
 		ProcessingTime:      time.Since(startTime),
 	}
@@ -561,16 +777,23 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 
 	resp.Data = result
 
-	// Handoff reroute events are emitted INSIDE dispatchPlanExecution and
-	// stepAutoHandoff — before the synchronous requestRouteSync call — so
-	// the TUI switches to the orchestrator while it is actively processing.
-	// No reroute emission here; it already happened at the right time.
+	// Handoff reroute events are emitted INSIDE dispatchPlanExecution (and
+	// stepAutoHandoff when AutoApprove is enabled) — before the synchronous
+	// requestRouteSync call — so the TUI switches to the orchestrator while
+	// it is actively processing. No reroute emission here; it already
+	// happened at the right time.
 
 	// Always include the authoritative response text in the completion
 	// event. The bridge stores it as AuthoritativeText on StreamCompleteMsg
 	// so the chat model can correct dropped or reordered stream chunks.
 	directive := extractResponseDirective(result)
 	completeText := extractUserResponse(result)
+	architectDebugLog().Info("handleForwardBusRequest: DIRECTIVE_EXTRACT",
+		"correlation_id", fwd.CorrelationID,
+		"has_directive", directive != nil,
+		"directive_phase", directivePhaseStr(directive),
+		"directive_agent", directiveAgentStr(directive),
+		"complete_text_len", len(completeText))
 	a.publishPlanStreamComplete(reqCtx, completeText, usageAcc.Total(), directive)
 
 	// Publish response to own response channel
@@ -593,7 +816,7 @@ func (a *Architect) publishInterruptResponse(fwd *guide.ForwardedRequest) {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             true,
-		RespondingAgentID:   "architect",
+		RespondingAgentID:   a.id,
 		RespondingAgentName: "architect",
 		Data:                &ConversationResult{Response: "(interrupted)", Intent: IntentConverse},
 	}
@@ -683,11 +906,31 @@ func isCancelAction(action string) bool {
 
 // processForwardedRequest handles the actual request processing
 func (a *Architect) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	a.logInfo("processForwardedRequest: resolving intent handler",
+		"intent", string(fwd.Intent),
+		"ctx_deadline", contextDeadlineString(ctx))
 	handler, err := a.intentHandler(fwd.Intent)
 	if err != nil {
+		a.logWarn("processForwardedRequest: no handler for intent",
+			"intent", string(fwd.Intent), "err", err)
 		return nil, err
 	}
-	return handler(ctx, fwd)
+	a.logInfo("processForwardedRequest: dispatching to handler",
+		"intent", string(fwd.Intent))
+	start := time.Now()
+	result, handlerErr := handler(ctx, fwd)
+	a.logInfo("processForwardedRequest: handler returned",
+		"intent", string(fwd.Intent),
+		"elapsed", time.Since(start).String(),
+		"has_result", result != nil,
+		"err", handlerErr)
+	return result, handlerErr
+}
+
+func (a *Architect) setNotRunning() {
+	a.runMu.Lock()
+	a.running = false
+	a.runMu.Unlock()
 }
 
 func (a *Architect) setRunContext(parent context.Context) {
@@ -781,30 +1024,34 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 // naturally before formalizing a plan.
 func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	a.logInfo("handleConversation: entry",
-		"input", truncateString(fwd.Input, 80),
-		"intent", string(fwd.Intent))
+		"input", truncateString(fwd.Input, 120),
+		"intent", string(fwd.Intent),
+		"session_id", sessionIDFromForwarded(fwd),
+		"history_len", len(fwd.ConversationHistory),
+		"ctx_deadline", contextDeadlineString(ctx),
+		"active_plans_count", a.activePlanCount())
 
-	// When a ready plan exists, check whether the user is approving it
-	// (affirmative response) or giving feedback. Approval routes to
-	// handleExecute which dispatches to the orchestrator. Feedback
-	// routes to handlePlanFeedback for the LLM to address concerns.
-	//
-	// This check is the primary approval gate when chatting directly
-	// with the architect. The Guide's phase gate (tryPhaseClassification)
-	// provides a secondary path for Guide-mediated routing.
-	if plan := a.latestReadyPlan(); plan != nil {
-		if isAffirmativeResponse(fwd.Input) {
-			a.logInfo("handleConversation: affirmative response detected, routing to execute",
-				"plan_id", plan.ID)
-			return a.handleExecute(ctx, fwd)
-		}
-		return a.handlePlanFeedback(ctx, fwd, plan)
+	// Check clarifying plan FIRST. If the user is in a clarification flow,
+	// route their response back into the protocol — never to handleExecute
+	// or handlePlanFeedback. This prevents the bug where an affirmative
+	// clarification answer dispatches a stale Ready plan.
+	if plan := a.latestClarifyingPlan(sessionIDFromForwarded(fwd)); plan != nil {
+		a.logInfo("handleConversation: ROUTE=clarification_response",
+			"plan_id", plan.ID,
+			"plan_query", truncateString(plan.Query, 80),
+			"plan_status", plan.SM().State().String())
+		return a.handleClarificationResponse(ctx, fwd, plan)
 	}
 
-	// Check if user is confirming plan formalization after conversation.
-	if plan, ok := a.tryFormalizePlan(ctx, fwd); ok {
-		a.logInfo("handleConversation: formalized plan")
-		return plan, nil
+	// When a ready plan exists and the Guide routed here (IntentPlan, not
+	// IntentExecute), it's feedback. The Guide's LLM phase gate classifies
+	// approvals as IntentExecute, which routes to handleExecute directly —
+	// no double-classification needed here.
+	if plan := a.latestReadyPlan(sessionIDFromForwarded(fwd)); plan != nil {
+		a.logInfo("handleConversation: ROUTE=plan_feedback (ready plan, non-execute intent)",
+			"plan_id", plan.ID,
+			"plan_age", time.Since(plan.UpdatedAt).String())
+		return a.handlePlanFeedback(ctx, fwd, plan)
 	}
 
 	req := &ArchitectRequest{
@@ -817,8 +1064,75 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		ConversationHistory: fwd.ConversationHistory,
 	}
 
-	a.logInfo("handleConversation: routing to Handle",
-		"intent", string(req.Intent))
+	a.logInfo("handleConversation: ROUTE=conversation (no plan triggers matched)",
+		"mapped_intent", string(req.Intent))
+	return a.Handle(ctx, req)
+}
+
+// latestClarifyingPlan returns the most recently updated plan in Clarifying
+// state for the given session. Returns nil if no matching plan exists.
+func (a *Architect) latestClarifyingPlan(sessionID string) *DesignPlan {
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" {
+		return nil
+	}
+	a.activePlansMu.RLock()
+	defer a.activePlansMu.RUnlock()
+	cutoff := time.Now().Add(-readyPlanMaxAge)
+	var best *DesignPlan
+	for _, plan := range a.activePlans {
+		if plan.SM().State() != PlanStatusClarifying {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
+			continue
+		}
+		if plan.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	return best
+}
+
+// handleClarificationResponse processes the user's answer to a clarification
+// question. Transitions the plan from Clarifying→Pending and re-runs the
+// planning protocol with skip_clarification so the same questions are not
+// re-asked.
+func (a *Architect) handleClarificationResponse(ctx context.Context, fwd *guide.ForwardedRequest, plan *DesignPlan) (any, error) {
+	a.logInfo("handleClarificationResponse: entry",
+		"plan_id", plan.ID,
+		"plan_query", truncateString(plan.Query, 80),
+		"user_input", truncateString(fwd.Input, 120),
+		"ctx_deadline", contextDeadlineString(ctx),
+		"plan_state", plan.SM().State().String())
+
+	if err := plan.SM().TransitionTo(PlanStatusPending, plan); err != nil {
+		a.logWarn("handleClarificationResponse: transition failed", "plan_id", plan.ID, "error", err)
+		return &ConversationResult{
+			Response: "I couldn't process your clarification response. Could you rephrase?",
+			Intent:   IntentConverse,
+		}, nil
+	}
+	plan.Status = plan.SM().State()
+	plan.UpdatedAt = time.Now()
+	_ = a.persistPlanState(plan)
+
+	req := &ArchitectRequest{
+		ID:        uuid.New().String(),
+		Intent:    IntentPlan,
+		Query:     fwd.Input,
+		SessionID: sessionIDFromForwarded(fwd),
+		Timestamp: time.Now(),
+		Params: map[string]any{
+			"skip_clarification": true,
+			"prior_plan_id":     plan.ID,
+		},
+		ConversationHistory: fwd.ConversationHistory,
+	}
+
 	return a.Handle(ctx, req)
 }
 
@@ -830,6 +1144,7 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 		"input", truncateString(fwd.Input, 80),
 		"plan_id", plan.ID)
 
+	ctx = withArchitectSessionID(ctx, sessionIDFromForwarded(fwd))
 	ctx = withPlannerThoughtCallback(ctx, func(stage string, thought string) {
 		a.publishPlanThought(ctx, stage, thought)
 	})
@@ -865,31 +1180,43 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 // plan-approval phase gate after the architect addresses user feedback. Returns
 // nil if the plan is not in Ready status (e.g. already executing or expired).
 func (a *Architect) feedbackReadyDirective(plan *DesignPlan) *guide.ResponseDirective {
-	if plan == nil || plan.Status != PlanStatusReady {
+	if plan == nil {
 		return nil
 	}
-	return &guide.ResponseDirective{
-		Phase:    guide.PhasePlanApproval,
-		AgentID:  "architect",
-		Metadata: map[string]any{"plan_id": plan.ID},
-		TTL:      readyPlanMaxAge,
-	}
+	return plan.ReadyDirective()
 }
 
 // handleExecute processes explicit execution intents classified by the Guide.
 // The classifier already determined the user wants to execute a plan, so no
 // phrase matching is needed — just look for a ready plan and dispatch it.
+// Validates epoch from phase-gate metadata to reject stale approvals.
 func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	a.logInfo("handleExecute: entry",
 		"input", truncateString(fwd.Input, 80))
 
-	plan := a.latestReadyPlan()
+	plan := a.latestReadyPlan(sessionIDFromForwarded(fwd))
 	if plan == nil {
 		a.logInfo("handleExecute: no ready plan found")
 		return &ConversationResult{
 			Response: "There's no ready plan to execute. Describe what you'd like to build and I'll create one.",
 			Intent:   IntentConverse,
 		}, nil
+	}
+
+	// Epoch validation: reject stale approvals where the plan was re-planned
+	// or updated since the user last saw it.
+	if requestEpoch, ok := epochFromMetadata(fwd.Metadata); ok {
+		if plan.SM().Epoch() != requestEpoch {
+			a.logWarn("handleExecute: stale epoch",
+				"plan_id", plan.ID,
+				"plan_epoch", plan.SM().Epoch(),
+				"request_epoch", requestEpoch)
+			return &ConversationResult{
+				Response:  "The plan has been updated since you last reviewed it. Please review the updated plan and approve again.",
+				Intent:    IntentConverse,
+				Directive: plan.ReadyDirective(),
+			}, nil
+		}
 	}
 
 	a.logInfo("handleExecute: dispatching plan",
@@ -902,6 +1229,27 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 	}
 	result, _ := a.dispatchPlanExecution(ctx, req, plan)
 	return result, nil
+}
+
+// epochFromMetadata extracts the epoch from phase-gate metadata.
+func epochFromMetadata(metadata map[string]any) (uint64, bool) {
+	if metadata == nil {
+		return 0, false
+	}
+	v, ok := metadata["epoch"]
+	if !ok {
+		return 0, false
+	}
+	switch e := v.(type) {
+	case uint64:
+		return e, true
+	case float64:
+		return uint64(e), true
+	case int:
+		return uint64(e), true
+	default:
+		return 0, false
+	}
 }
 
 // mapGuideIntentToArchitect preserves the original guide intent as an
@@ -991,6 +1339,12 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
+	a.logInfo("Handle: entry",
+		"req_id", req.ID,
+		"intent", string(req.Intent),
+		"query", truncateString(req.Query, 120),
+		"session_id", req.SessionID,
+		"ctx_deadline", contextDeadlineString(ctx))
 	a.prepareSkillsForRequest(req)
 
 	start := time.Now()
@@ -999,20 +1353,32 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 
 	switch req.Intent {
 	case IntentPlan, IntentDesign:
+		a.logInfo("Handle: ROUTE=executeConversation (plan/design)", "intent", string(req.Intent))
 		result, err = a.executeConversation(ctx, req)
 	case IntentGenerateTasks:
+		a.logInfo("Handle: ROUTE=executeGenerateTasks")
 		result, err = a.executeGenerateTasks(ctx, req)
 	case IntentCreateDAG:
+		a.logInfo("Handle: ROUTE=executeCreateDAG")
 		result, err = a.executeCreateDAG(ctx, req)
 	case IntentRecall:
+		a.logInfo("Handle: ROUTE=executeRecall")
 		result, err = a.executeRecall(ctx, req)
 	case IntentCheck:
+		a.logInfo("Handle: ROUTE=executeCheck")
 		result, err = a.executeCheck(ctx, req)
 	case IntentHelp, IntentConsult, IntentEstimate, IntentConverse:
+		a.logInfo("Handle: ROUTE=executeConversation (conversational)", "intent", string(req.Intent))
 		result, err = a.executeConversation(ctx, req)
 	default:
+		a.logInfo("Handle: ROUTE=executeConversation (default)", "intent", string(req.Intent))
 		result, err = a.executeConversation(ctx, req)
 	}
+	a.logInfo("Handle: handler returned",
+		"intent", string(req.Intent),
+		"elapsed", time.Since(start).String(),
+		"has_result", result != nil,
+		"err", err)
 
 	if err != nil {
 		resp := &ArchitectResponse{
@@ -1053,7 +1419,12 @@ func (a *Architect) executePlanningProtocol(ctx context.Context, req *ArchitectR
 }
 
 func failPlan(plan *DesignPlan, err error) (*DesignPlan, error) {
-	plan.Status = PlanStatusFailed
+	if smErr := plan.SM().TransitionToFailed(plan, err); smErr != nil {
+		// Already in a terminal state — just record the error.
+		plan.Error = err.Error()
+		return plan, err
+	}
+	plan.Status = plan.SM().State()
 	plan.Error = err.Error()
 	return plan, err
 }
@@ -1578,7 +1949,11 @@ func (a *Architect) executeCheck(ctx context.Context, req *ArchitectRequest) (an
 func (a *Architect) executeConversation(ctx context.Context, req *ArchitectRequest) (any, error) {
 	a.logInfo("executeConversation: entry",
 		"intent", string(req.Intent),
-		"query", truncateString(req.Query, 80))
+		"query", truncateString(req.Query, 120),
+		"session_id", req.SessionID,
+		"ctx_deadline", contextDeadlineString(ctx),
+		"planner_available", a.ensurePlanner(ctx) != nil)
+	ctx = withArchitectSessionID(ctx, req.SessionID)
 	ctx = withPlannerThoughtCallback(ctx, func(stage string, thought string) {
 		a.publishPlanThought(ctx, stage, thought)
 	})
@@ -1595,7 +1970,15 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	// conversation history is degraded (e.g. prior protocols hung and
 	// never delivered agent replies back to the Guide).
 	a.enrichConversationWithPlanContext(&request, req.SessionID)
+	a.logInfo("executeConversation: calling composeUserFacingResponse",
+		"has_plan_summary", request.PlanSummary != "",
+		"has_prior_query", request.PriorQuery != "")
+	composeStart := time.Now()
 	response, composeErr := a.composeUserFacingResponse(ctx, request)
+	a.logInfo("executeConversation: composeUserFacingResponse returned",
+		"elapsed", time.Since(composeStart).String(),
+		"response_len", len(response),
+		"err", composeErr)
 	if composeErr == nil {
 		a.logInfo("executeConversation: LLM compose succeeded",
 			"response_len", len(response))
@@ -1606,10 +1989,36 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		// If a ready plan now exists (e.g. the tool loop called planning
 		// skills that created one), arm the Guide's phase gate so the
 		// next user message gets plan-approval classification.
-		if plan := a.latestReadyPlan(); plan != nil {
+		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
 			result.Directive = a.feedbackReadyDirective(plan)
+			architectDebugLog().Info("executeConversation: DIRECTIVE_SET",
+				"plan_id", plan.ID,
+				"session_id", req.SessionID,
+				"phase", string(result.Directive.Phase))
+		} else {
+			architectDebugLog().Info("executeConversation: NO_READY_PLAN",
+				"session_id", req.SessionID)
 		}
 		return result, nil
+	}
+	// The tool loop may have successfully created a plan via start_planning
+	// even though the outer context was cancelled before the final LLM turn
+	// could compose a summary. Recover the plan's response and directive
+	// rather than falling through to conversationFallback (which would run
+	// a redundant planning protocol with a cancelled context).
+	if plan := a.latestReadyPlan(req.SessionID); plan != nil {
+		a.logInfo("executeConversation: compose failed but ready plan exists, recovering",
+			"plan_id", plan.ID,
+			"plan_response_len", len(plan.UserResponse))
+		userResp := plan.UserResponse
+		if strings.TrimSpace(userResp) == "" {
+			userResp = fallbackReadyUserResponse(nil, plan)
+		}
+		return &ConversationResult{
+			Response:  userResp,
+			Intent:    req.Intent,
+			Directive: a.feedbackReadyDirective(plan),
+		}, nil
 	}
 	a.logWarn("executeConversation: compose failed, using domain fallback",
 		"intent", string(req.Intent), "error", composeErr)
@@ -1641,8 +2050,8 @@ func (a *Architect) enrichConversationWithPlanContext(request *plannerConversati
 func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequest, composeErr error) (any, error) {
 	a.logInfo("conversationFallback: entry",
 		"intent", string(req.Intent),
-		"planner_available", a.ensurePlanner() != nil)
-	if a.ensurePlanner() == nil {
+		"planner_available", a.ensurePlanner(ctx) != nil)
+	if a.ensurePlanner(ctx) == nil {
 		a.logWarn("conversationFallback: no planner configured")
 		return &ConversationResult{
 			Response: "I can't generate a detailed plan right now — my LLM planner is not configured. " +
@@ -1774,113 +2183,7 @@ func consultationScore(evidence *ConsultationEvidence) float64 {
 
 // GetRoutingInfo returns the architect's routing information for Guide registration
 func (a *Architect) GetRoutingInfo() *guide.AgentRoutingInfo {
-	return &guide.AgentRoutingInfo{
-		ID:      "architect",
-		Type:    "architect",
-		Name:    "architect",
-		Aliases: []string{"arch", "planner", "designer"},
-
-		ActionShortcuts: []guide.ActionShortcut{
-			{
-				Name:          "plan",
-				Description:   "Create a design plan with atomic tasks and workflow DAG",
-				DefaultIntent: guide.IntentPlan,
-				DefaultDomain: guide.DomainDesign,
-			},
-			{
-				Name:          "design",
-				Description:   "Design system architecture",
-				DefaultIntent: guide.IntentDesign,
-				DefaultDomain: guide.DomainDesign,
-			},
-			{
-				Name:          "decompose",
-				Description:   "Decompose requirements into atomic tasks",
-				DefaultIntent: guide.IntentPlan,
-				DefaultDomain: guide.DomainTasks,
-			},
-			{
-				Name:          "execute",
-				Description:   "Execute the current plan",
-				DefaultIntent: guide.IntentPlan,
-				DefaultDomain: guide.DomainTasks,
-			},
-		},
-
-		Triggers: guide.AgentTriggers{
-			StrongTriggers: []string{
-				"plan",
-				"design",
-				"architect",
-				"decompose",
-				"break down",
-				"create workflow",
-				"task generation",
-				"orchestrate",
-				"coordinate",
-				"structure",
-				"execute plan",
-				"go ahead",
-				"start execution",
-				"run the plan",
-			},
-			WeakTriggers: []string{
-				"implement",
-				"build",
-				"create",
-				"develop",
-				"organize",
-			},
-			IntentTriggers: map[guide.Intent][]string{
-				guide.IntentPlan: {
-					"plan",
-					"design",
-					"create workflow",
-					"break down",
-					"decompose",
-					"execute plan",
-					"go ahead",
-					"start execution",
-					"run the plan",
-				},
-				guide.IntentDesign: {
-					"architect",
-					"structure",
-					"design",
-					"organize",
-				},
-			},
-		},
-
-		Registration: &guide.AgentRegistration{
-			ID:      "architect",
-			Name:    "architect",
-			Aliases: []string{"arch", "planner", "designer"},
-			Capabilities: guide.AgentCapabilities{
-				Intents: []guide.Intent{
-					guide.IntentPlan,
-					guide.IntentDesign,
-					guide.IntentExecute,
-					guide.IntentRecall,
-					guide.IntentCheck,
-					guide.IntentHelp,
-				},
-				Domains: []guide.Domain{
-					guide.DomainDesign,
-					guide.DomainTasks,
-				},
-				Tags:     []string{"planning", "design", "architecture", "tasks", "workflow"},
-				Keywords: []string{"plan", "design", "architect", "decompose", "workflow", "dag", "tasks"},
-				Priority: 90,
-			},
-			Constraints: guide.AgentConstraints{
-				TemporalFocus: guide.TemporalFuture,
-				MinConfidence: 0.6,
-			},
-			Description: "System design and planning specialist. Creates atomic tasks and workflow DAGs using Pre-Delegation Planning Protocol.",
-			Priority:    90,
-		},
-	}
+	return ArchitectRoutingInfo(a.id)
 }
 
 // PublishRequest publishes a request to the Guide for routing
@@ -1889,7 +2192,7 @@ func (a *Architect) PublishRequest(req *guide.RouteRequest) error {
 		return fmt.Errorf("architect is not running")
 	}
 
-	req.SourceAgentID = "architect"
+	req.SourceAgentID = a.id
 	req.SourceAgentName = "architect"
 
 	msg := guide.NewRequestMessage(a.generateMessageID(), req)
@@ -1905,6 +2208,27 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// contextDeadlineString returns a human-readable string for the context deadline.
+// Returns "none" if no deadline is set.
+func contextDeadlineString(ctx context.Context) string {
+	if ctx == nil {
+		return "nil_ctx"
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return "none"
+	}
+	remaining := time.Until(deadline)
+	return fmt.Sprintf("%s (remaining: %s)", deadline.Format("15:04:05.000"), remaining.Truncate(time.Millisecond))
+}
+
+// activePlanCount returns the number of active plans in the map (for diagnostic logging).
+func (a *Architect) activePlanCount() int {
+	a.activePlansMu.RLock()
+	defer a.activePlansMu.RUnlock()
+	return len(a.activePlans)
 }
 
 func containsIgnoreCase(s, substr string) bool {
@@ -1976,7 +2300,15 @@ func (a *Architect) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 
 // AgentID returns the unique identifier for this architect instance.
 func (a *Architect) AgentID() string {
-	return "architect"
+	return a.id
+}
+
+// SetCanonicalID overwrites the architect's internal ID. Used during
+// handoff swap so the new instance assumes the canonical identity.
+func (a *Architect) SetCanonicalID(id string) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.id = id
 }
 
 // AgentType returns the agent type classification.

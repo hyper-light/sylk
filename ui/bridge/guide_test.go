@@ -115,7 +115,7 @@ func TestToGuideMsg_HumanizesArchitectClarificationEnvelope(t *testing.T) {
 			"ID":      "response-2",
 			"Success": true,
 			"Data": map[string]any{
-				"ClarificationNeeded": true,
+				"Status": "clarifying",
 				"UserResponse":        "I recommend starting with Google and Entra for phase 1 enterprise SSO.",
 				"ClarificationQuestions": []any{
 					"Which OAuth providers are in scope for phase 1?",

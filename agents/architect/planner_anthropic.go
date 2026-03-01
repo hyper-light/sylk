@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/dag"
 	promptskill "github.com/adalundhe/sylk/core/promptskills"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/resources"
+	"github.com/adalundhe/sylk/core/signal"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -42,6 +45,12 @@ type anthropicPlanner struct {
 	conversationSystem string
 	timeout            time.Duration
 	logger             *slog.Logger
+	stagePropagator    *resources.DeadlinePropagator
+
+	// Signal bus for broadcasting time-pressure degradation signals.
+	signalBus       signal.SignalBusInterface
+	operationBudget time.Duration // total operation budget, set per-operation
+	pressureOnce    sync.Once     // ensures at most one TimePressure signal per operation
 }
 
 // streamResult carries the full outcome of a single streaming LLM call,
@@ -63,18 +72,18 @@ Return strictly valid JSON with no markdown, no prose, and no extra keys.
 Never wrap JSON in code fences.
 Keep outputs concise and deterministic.`
 
-func (a *Architect) initPlanner(cfg Config) error {
+func (a *Architect) initPlanner(ctx context.Context, cfg Config) error {
 	if !cfg.EnableLLM {
 		return nil
 	}
 
-	if a.ensurePlanner() == nil {
+	if a.ensurePlanner(ctx) == nil {
 		a.logger.Warn("architect llm planner unavailable; using deterministic fallback")
 	}
 	return nil
 }
 
-func (a *Architect) ensurePlanner() planningLLM {
+func (a *Architect) ensurePlanner(ctx context.Context) planningLLM {
 	if !a.config.EnableLLM {
 		return nil
 	}
@@ -89,7 +98,7 @@ func (a *Architect) ensurePlanner() planningLLM {
 		return a.planner
 	}
 
-	planner, err := newAnthropicPlanner(a.config, a.logger, a.skills.GetAll())
+	planner, err := newAnthropicPlanner(ctx, a.config, a.logger, a.skills.GetAll())
 	if err != nil {
 		if !errors.Is(err, ErrArchitectPlannerAuthNotConfigured) {
 			a.logger.Warn("architect llm planner init failed", "error", err)
@@ -98,6 +107,11 @@ func (a *Architect) ensurePlanner() planningLLM {
 	}
 
 	a.planner = planner
+	// Wire signal bus inline — write lock is already held by this method;
+	// calling wirePlannerSignalBus() would deadlock on plannerMu.RLock().
+	if ap, ok := planner.(*anthropicPlanner); ok && ap != nil {
+		ap.signalBus = a.signalBus
+	}
 	a.logger.Info("architect llm planner enabled", "model", a.config.Model)
 	return a.planner
 }
@@ -114,7 +128,7 @@ func (a *Architect) tryAnalyzeRequirementsWithLLM(
 	query string,
 	params map[string]any,
 ) (*Requirements, bool) {
-	planner := a.ensurePlanner()
+	planner := a.ensurePlanner(ctx)
 	if planner == nil {
 		a.logInfo("architect llm requirements: planner unavailable")
 		return nil, false
@@ -137,7 +151,7 @@ func (a *Architect) tryDesignArchitectureWithLLM(
 	requirements *Requirements,
 	patterns *CodebasePatterns,
 ) (*SolutionArchitecture, bool) {
-	planner := a.ensurePlanner()
+	planner := a.ensurePlanner(ctx)
 	if planner == nil {
 		a.logInfo("architect llm design: planner unavailable")
 		return nil, false
@@ -160,7 +174,7 @@ func (a *Architect) tryGenerateTasksWithLLM(
 	architecture *SolutionArchitecture,
 	constraints *PlanConstraints,
 ) ([]*AtomicTask, bool) {
-	planner := a.ensurePlanner()
+	planner := a.ensurePlanner(ctx)
 	if planner == nil {
 		a.logInfo("architect llm tasks: planner unavailable")
 		return nil, false
@@ -178,7 +192,7 @@ func (a *Architect) tryGenerateTasksWithLLM(
 	return normalizeTaskGraph(tasks), true
 }
 
-func newAnthropicPlanner(cfg Config, logger *slog.Logger, goSkills []*skills.Skill) (planningLLM, error) {
+func newAnthropicPlanner(ctx context.Context, cfg Config, logger *slog.Logger, goSkills []*skills.Skill) (planningLLM, error) {
 	providerCfg := providers.AnthropicConfig{
 		BaseConfig: providers.BaseConfig{
 			APIKey:         cfg.AnthropicAPIKey,
@@ -203,7 +217,7 @@ func newAnthropicPlanner(cfg Config, logger *slog.Logger, goSkills []*skills.Ski
 
 	diskSkills := promptskill.DiscoverAgentSkills("architect")
 	promptSkills := promptskill.MergePromptSkills(diskSkills, goSkills)
-	rawProvider, err := providers.NewAnthropicProvider(providerCfg, promptSkills...)
+	rawProvider, err := providers.NewAnthropicProvider(ctx, providerCfg, promptSkills...)
 	if err != nil {
 		if strings.Contains(err.Error(), "api_key") {
 			return nil, ErrArchitectPlannerAuthNotConfigured
@@ -226,7 +240,29 @@ func newAnthropicPlanner(cfg Config, logger *slog.Logger, goSkills []*skills.Ski
 		conversationSystem: buildPlannerConversationSystemPrompt(cfg.SystemPrompt),
 		timeout:            cfg.LLMRequestTimeout,
 		logger:             logger,
+		stagePropagator:    &resources.DeadlinePropagator{CleanupBuffer: 2 * time.Second},
 	}, nil
+}
+
+// newPlannerFromProvider builds a planner around an externally-created,
+// gateway-wrapped provider. Used by SwapModel for cross-provider swaps.
+func newPlannerFromProvider(provider plannerStreamProvider, cfg Config, logger *slog.Logger) planningLLM {
+	maxTokens := cfg.MaxOutputTokens
+	if maxTokens == 0 {
+		maxTokens = DefaultMaxOutputTokens
+	}
+	counter := providers.NewCharacterBasedCounter(providers.DefaultTokenCounterConfig())
+	return &anthropicPlanner{
+		provider:           provider,
+		maxTokens:          maxTokens,
+		thinkingBudget:     0,
+		contextWindow:      counter.MaxContextTokens(cfg.Model),
+		system:             buildPlannerSystemPrompt(cfg.SystemPrompt),
+		conversationSystem: buildPlannerConversationSystemPrompt(cfg.SystemPrompt),
+		timeout:            cfg.LLMRequestTimeout,
+		logger:             logger,
+		stagePropagator:    &resources.DeadlinePropagator{CleanupBuffer: 2 * time.Second},
+	}
 }
 
 func buildPlannerSystemPrompt(base string) string {
@@ -382,6 +418,7 @@ func (p *anthropicPlanner) requestJSONText(
 	stage string,
 	finalBudget bool,
 ) (string, error) {
+	p.checkDeadlinePressure(ctx, stage)
 	if finalBudget {
 		text, _, err := p.requestTextWithContinuation(ctx, prompt, maxTokens, system, stage)
 		return text, err
@@ -406,9 +443,9 @@ func (p *anthropicPlanner) requestTextOnce(
 	system string,
 	stage string,
 ) (*streamResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	reqCtx, cancel := p.propagateDeadline(ctx)
 	defer cancel()
-	return p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, nil)
+	return p.requestTextStreamingOnce(reqCtx, prompt, maxTokens, system, stage, nil)
 }
 
 // requestTextWithContinuation performs a request with automatic continuation
@@ -420,9 +457,9 @@ func (p *anthropicPlanner) requestTextWithContinuation(
 	system string,
 	stage string,
 ) (string, *providers.Usage, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	reqCtx, cancel := p.propagateDeadline(ctx)
 	defer cancel()
-	return p.requestTextStreamingWithContinuation(ctx, prompt, maxTokens, system, stage, nil)
+	return p.requestTextStreamingWithContinuation(reqCtx, prompt, maxTokens, system, stage, nil)
 }
 
 func (p *anthropicPlanner) requestTextStreamingWithMaxTokens(
@@ -433,9 +470,9 @@ func (p *anthropicPlanner) requestTextStreamingWithMaxTokens(
 	stage string,
 	onChunk func(string),
 ) (string, *providers.Usage, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	reqCtx, cancel := p.propagateDeadline(ctx)
 	defer cancel()
-	return p.requestTextStreamingWithContinuation(ctx, prompt, maxTokens, system, stage, onChunk)
+	return p.requestTextStreamingWithContinuation(reqCtx, prompt, maxTokens, system, stage, onChunk)
 }
 
 func (p *anthropicPlanner) requestTextStreamingOnce(
@@ -508,12 +545,12 @@ func (p *anthropicPlanner) streamRequest(
 	if err != nil {
 		// If the stream was interrupted but we accumulated partial text,
 		// treat it as a truncated result rather than discarding the work.
-		// The continuation loop can pick it up via StopReasonMaxTokens.
+		// The continuation loop picks up StopReasonError via isTruncatedResult.
 		if partial := strings.TrimSpace(text.String()); partial != "" && isRecoverableStreamError(ctx, err) {
 			return &streamResult{
 				Text:       partial,
 				Usage:      finalUsage,
-				StopReason: providers.StopReasonMaxTokens,
+				StopReason: providers.StopReasonError,
 			}, nil
 		}
 		return nil, err
@@ -542,6 +579,16 @@ func (p *anthropicPlanner) streamRequestFull(
 	accumulator := providers.NewStreamAccumulator()
 	emitter := newThoughtEmitter(ctx)
 
+	streamStart := time.Now()
+	var textChunks, thoughtChunks, toolChunks, otherChunks int
+
+	architectDebugLog().Debug("stream_full: START",
+		"stage", stage,
+		"max_tokens", req.MaxTokens,
+		"thinking_budget", req.ThinkingBudget,
+		"tools_count", len(req.Tools),
+		"messages_count", len(req.Messages))
+
 	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
 		accumulator.Add(chunk)
 
@@ -553,30 +600,67 @@ func (p *anthropicPlanner) streamRequestFull(
 			emitter = newThoughtEmitter(ctx)
 			if chunk.Usage != nil && chunk.Usage.InputTokens > 0 {
 				emitArchitectEarlyUsage(ctx, chunk.Usage.InputTokens)
+				architectDebugLog().Debug("stream_full: EARLY_USAGE",
+					"stage", stage,
+					"input_tokens", chunk.Usage.InputTokens)
 			}
 		case providers.ChunkTypeText:
+			textChunks++
 			if onChunk != nil {
 				onChunk(chunk.Text)
 			}
 		case providers.ChunkTypeThought:
+			thoughtChunks++
 			if thought := emitter.addDelta(chunk.Text); thought != "" {
 				emitPlannerThought(ctx, stage, thought)
 			}
+		case providers.ChunkTypeToolStart, providers.ChunkTypeToolDelta, providers.ChunkTypeToolEnd:
+			toolChunks++
 		case providers.ChunkTypeEnd:
 			if chunk.Usage != nil {
 				accumulateArchitectUsage(ctx, chunk.Usage)
+				architectDebugLog().Debug("stream_full: END_USAGE",
+					"stage", stage,
+					"stop_reason", string(chunk.StopReason),
+					"input_tokens", chunk.Usage.InputTokens,
+					"output_tokens", chunk.Usage.OutputTokens,
+					"total_tokens", chunk.Usage.TotalTokens,
+					"cache_read", chunk.Usage.CacheReadTokens,
+					"cache_write", chunk.Usage.CacheWriteTokens)
 			}
+		default:
+			otherChunks++
 		}
 		return nil
 	})
+
+	architectDebugLog().Debug("stream_full: STREAM_DONE",
+		"stage", stage,
+		"elapsed", time.Since(streamStart).String(),
+		"text_chunks", textChunks,
+		"thought_chunks", thoughtChunks,
+		"tool_chunks", toolChunks,
+		"other_chunks", otherChunks,
+		"err", err)
+
 	if err != nil {
 		return nil, err
 	}
 
 	resp := accumulator.Response()
 	if resp == nil {
+		architectDebugLog().Debug("stream_full: NIL_RESPONSE", "stage", stage)
 		return nil, fmt.Errorf("planner returned nil response")
 	}
+
+	architectDebugLog().Debug("stream_full: RESPONSE",
+		"stage", stage,
+		"content_len", len(resp.Content),
+		"thinking_len", len(resp.Thinking),
+		"tool_call_count", len(resp.ToolCalls),
+		"stop_reason", string(resp.StopReason),
+		"model", resp.Model)
+
 	return resp, nil
 }
 
@@ -589,9 +673,37 @@ func (p *anthropicPlanner) CompleteForToolLoop(
 	stage string,
 	onChunk func(string),
 ) (*providers.Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	reqCtx, cancel := p.propagateDeadline(ctx)
 	defer cancel()
-	return p.streamRequestFull(ctx, req, stage, onChunk)
+
+	architectDebugLog().Debug("complete_for_tool_loop: ENTRY",
+		"stage", stage,
+		"max_tokens", req.MaxTokens,
+		"thinking_budget", req.ThinkingBudget,
+		"tools_count", len(req.Tools),
+		"messages_count", len(req.Messages),
+		"timeout", p.timeout.String(),
+		"ctx_deadline", contextDeadlineString(reqCtx))
+
+	start := time.Now()
+	resp, err := p.streamRequestFull(reqCtx, req, stage, onChunk)
+
+	architectDebugLog().Debug("complete_for_tool_loop: DONE",
+		"stage", stage,
+		"elapsed", time.Since(start).String(),
+		"err", err,
+		"has_response", resp != nil)
+
+	return resp, err
+}
+
+// propagateDeadline uses the stage-level propagator to create a child context
+// whose deadline is min(p.timeout, parent_remaining - cleanupBuffer).
+func (p *anthropicPlanner) propagateDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if p.stagePropagator != nil {
+		return p.stagePropagator.Propagate(ctx, p.timeout)
+	}
+	return context.WithTimeout(ctx, p.timeout)
 }
 
 // ConversationSystemPrompt returns the conversation-mode system prompt.
@@ -626,7 +738,7 @@ func (p *anthropicPlanner) requestTextStreamingWithContinuation(
 	if err != nil {
 		return "", nil, err
 	}
-	if sr.StopReason != providers.StopReasonMaxTokens {
+	if !isTruncatedResult(sr.StopReason) {
 		return sr.Text, sr.Usage, nil
 	}
 	mode := continuationModeFromOnChunk(onChunk)
@@ -666,6 +778,14 @@ func cloneUsage(u *providers.Usage) *providers.Usage {
 	return &copy
 }
 
+// isTruncatedResult returns true for stop reasons that indicate the response
+// was cut short and continuation may recover additional content. Both
+// max_tokens (model hit output budget) and error (stream interrupted by
+// timeout/cancellation with partial text recovered) qualify.
+func isTruncatedResult(reason providers.StopReason) bool {
+	return reason == providers.StopReasonMaxTokens || reason == providers.StopReasonError
+}
+
 // isRecoverableStreamError returns true if the error indicates a stream
 // interruption (timeout, cancellation) where accumulated partial text
 // should be preserved rather than discarded.
@@ -684,6 +804,62 @@ func hasTimeForContinuation(ctx context.Context) bool {
 		return true // No deadline set — proceed.
 	}
 	return time.Until(deadline) >= contextDeadlineGuard
+}
+
+// timePressureFraction is the remaining-budget fraction below which
+// a time pressure signal is emitted. Derived from the 80/20 rule:
+// 80% of work completes in 20% of the time budget.
+const timePressureFraction = 0.20
+
+// checkDeadlinePressure broadcasts a TimePressure signal through the signal bus
+// when the operation deadline is approaching (remaining < 20% of total budget).
+// Uses sync.Once to ensure at most one signal per planning operation — callers
+// invoke this on every stage/budget-level entry; only the first crossing fires.
+func (p *anthropicPlanner) checkDeadlinePressure(ctx context.Context, stage string) {
+	if p.signalBus == nil || p.operationBudget <= 0 {
+		return
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return
+	}
+	remaining := time.Until(deadline)
+	fraction := float64(remaining) / float64(p.operationBudget)
+	if fraction >= timePressureFraction {
+		return
+	}
+	elapsed := p.operationBudget - remaining
+	p.pressureOnce.Do(func() {
+		msg := signal.SignalMessage{
+			ID:       "tp_" + stage + "_" + time.Now().Format("150405"),
+			Signal:   signal.TimePressure,
+			TargetID: "architect",
+			Reason:   "planning operation approaching deadline",
+			Payload: signal.TimePressurePayload{
+				AgentType: "architect",
+				Operation: "planning",
+				Elapsed:   elapsed,
+				Remaining: remaining,
+				Stage:     stage,
+				Suggestion: fmt.Sprintf(
+					"Planning is taking longer than expected (stage: %s, elapsed: %s, remaining: %s)",
+					stage, elapsed.Truncate(time.Second), remaining.Truncate(time.Second)),
+			},
+			SentAt: time.Now(),
+		}
+		if err := p.signalBus.Broadcast(msg); err != nil {
+			p.logger.Warn("failed to broadcast time-pressure signal",
+				"stage", stage, "error", err)
+		}
+	})
+}
+
+// resetOperationState resets per-operation mutable state on the planner.
+// Called at the start of each planning operation so pressure debouncing
+// and budget tracking are fresh.
+func (p *anthropicPlanner) resetOperationState(budget time.Duration) {
+	p.operationBudget = budget
+	p.pressureOnce = sync.Once{} // fresh Once for this operation
 }
 
 // thoughtEmitter batches thought deltas and emits snapshots only when
@@ -1256,7 +1432,7 @@ Hard limits:
 - At most 5 clarification_questions and 5 unknowns
 - Each string must be <= 20 words
 - recommendation_narrative must be <= 90 words
-- If the request is underspecified, include concrete clarification_questions
+- Only include clarification_questions when the request has GENUINE ambiguity that would lead to fundamentally different implementations. For straightforward, well-understood, or single-scope requests, set clarification_questions to an empty array
 - If the user asks for recommendations or preferences, include opinionated provisional_recommendations plus concise tradeoffs
 - For recommendation questions, include at least 2 provisional_recommendations and 2 tradeoffs
 `

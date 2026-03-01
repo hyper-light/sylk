@@ -30,6 +30,7 @@ const (
 	focusPaste                 // Paste button (API key step only).
 	focusOk                    // Ok button.
 	focusAbort                 // Abort button.
+	focusCopyURL               // OAuth URL copy button.
 )
 
 // LoginAction describes the outcome when the panel reports done.
@@ -116,9 +117,12 @@ type Panel struct {
 	clipboard      func() (string, error)    // Reads system clipboard.
 	clipboardWrite func(string) error        // Writes to system clipboard.
 	deviceCode     string                    // Device code shown during OAuth device flow.
+	oauthURL       string                    // Raw OAuth URL for separate display and copy.
+	copyURLHover   bool                      // Mouse is hovering over the OAuth URL copy button.
 	btnRowY        int                       // Y offset of button content row (set during render).
 	inputRowY      int                       // Y offset of input row (set during render).
 	deviceCodeRowY int                       // Y offset of device code row (set during render).
+	copyURLRowY    int                       // Y offset of OAuth URL copy button row.
 	th             *theme.Theme
 	width          int
 	height         int
@@ -143,6 +147,7 @@ func New(
 		clipboard:    clipboard,
 		btnRowY:      -1,
 		inputRowY:    -1,
+		copyURLRowY:  -1,
 	}
 }
 
@@ -159,6 +164,11 @@ func (p *Panel) SetClipboardWrite(fn func(string) error) {
 // SetDeviceCode sets the device code displayed during OAuth device flow.
 func (p *Panel) SetDeviceCode(code string) {
 	p.deviceCode = code
+}
+
+// SetOAuthURL stores the raw OAuth URL for separate rendering and copy-to-clipboard.
+func (p *Panel) SetOAuthURL(url string) {
+	p.oauthURL = url
 }
 
 // Active reports whether the panel is currently displayed.
@@ -181,12 +191,15 @@ func (p *Panel) Activate() {
 	p.showHover = false
 	p.pasteHover = false
 	p.copyHover = false
+	p.copyURLHover = false
 	p.okHover = false
 	p.abortHover = false
 	p.deviceCode = ""
+	p.oauthURL = ""
 	p.btnRowY = -1
 	p.inputRowY = -1
 	p.deviceCodeRowY = -1
+	p.copyURLRowY = -1
 	p.items = []item{
 		{id: "google", label: "Google (Gemini)", desc: "OAuth or API Key"},
 		{id: "openai", label: "OpenAI", desc: "OAuth or API Key"},
@@ -259,6 +272,13 @@ func (p *Panel) HandleClick(x, y int) (done bool, result LoginResult, cmd tea.Cm
 		return p.handleButtonClick(x, y)
 
 	case stepOAuth:
+		if p.oauthURL != "" && p.copyURLRowY >= 0 && y == p.copyURLRowY {
+			if p.hitTestCopyURL(x) {
+				p.doCopyOAuthURL()
+				return false, LoginResult{}, nil
+			}
+			return false, LoginResult{}, nil
+		}
 		if p.deviceCode != "" && p.deviceCodeRowY >= 0 && y == p.deviceCodeRowY {
 			if p.hitTestDeviceCodeCopy(x) {
 				p.doCopyDeviceCode()
@@ -286,8 +306,15 @@ func (p *Panel) HandleMouseMotion(x, y int) {
 	p.showHover = false
 	p.pasteHover = false
 	p.copyHover = false
+	p.copyURLHover = false
 	p.okHover = false
 	p.abortHover = false
+
+	// OAuth URL copy button hover.
+	if p.step == stepOAuth && p.oauthURL != "" && p.copyURLRowY >= 0 && y == p.copyURLRowY {
+		p.copyURLHover = p.hitTestCopyURL(x)
+		return
+	}
 
 	// Device code copy icon hover (OAuth step with device code).
 	if p.step == stepOAuth && p.deviceCode != "" && p.deviceCodeRowY >= 0 && y == p.deviceCodeRowY {
@@ -672,6 +699,11 @@ func (p *Panel) updateOAuth(key tea.KeyMsg) (bool, LoginResult, tea.Cmd) {
 		return false, LoginResult{}, nil
 	}
 	switch p.btnFocus {
+	case focusCopyURL:
+		if ks == "enter" || ks == " " {
+			p.doCopyOAuthURL()
+			return false, LoginResult{}, nil
+		}
 	case focusInput:
 		if p.oauthCodeMode {
 			return p.handleOAuthCodeInput(key, ks)
@@ -696,8 +728,11 @@ func (p *Panel) updateOAuth(key tea.KeyMsg) (bool, LoginResult, tea.Cmd) {
 }
 
 func (p *Panel) advanceFocusOAuth() {
+	hasURL := p.oauthURL != ""
 	if p.oauthCodeMode {
 		switch p.btnFocus {
+		case focusCopyURL:
+			p.btnFocus = focusInput
 		case focusInput:
 			p.btnFocus = focusPaste
 		case focusPaste:
@@ -705,22 +740,40 @@ func (p *Panel) advanceFocusOAuth() {
 		case focusOk:
 			p.btnFocus = focusAbort
 		default:
-			p.btnFocus = focusInput
+			if hasURL {
+				p.btnFocus = focusCopyURL
+			} else {
+				p.btnFocus = focusInput
+			}
 		}
 		return
 	}
-	if p.btnFocus == focusOk {
-		p.btnFocus = focusAbort
-	} else {
+	switch p.btnFocus {
+	case focusCopyURL:
 		p.btnFocus = focusOk
+	case focusOk:
+		p.btnFocus = focusAbort
+	default:
+		if hasURL {
+			p.btnFocus = focusCopyURL
+		} else {
+			p.btnFocus = focusOk
+		}
 	}
 }
 
 func (p *Panel) retreatFocusOAuth() {
+	hasURL := p.oauthURL != ""
 	if p.oauthCodeMode {
 		switch p.btnFocus {
-		case focusInput:
+		case focusCopyURL:
 			p.btnFocus = focusAbort
+		case focusInput:
+			if hasURL {
+				p.btnFocus = focusCopyURL
+			} else {
+				p.btnFocus = focusAbort
+			}
 		case focusPaste:
 			p.btnFocus = focusInput
 		case focusOk:
@@ -730,7 +783,18 @@ func (p *Panel) retreatFocusOAuth() {
 		}
 		return
 	}
-	p.advanceFocusOAuth()
+	switch p.btnFocus {
+	case focusCopyURL:
+		p.btnFocus = focusAbort
+	case focusOk:
+		if hasURL {
+			p.btnFocus = focusCopyURL
+		} else {
+			p.btnFocus = focusAbort
+		}
+	default:
+		p.btnFocus = focusOk
+	}
 }
 
 func (p *Panel) handleOAuthCodeInput(key tea.KeyMsg, ks string) (bool, LoginResult, tea.Cmd) {
@@ -825,13 +889,16 @@ func (p *Panel) Deactivate() {
 	p.showHover = false
 	p.pasteHover = false
 	p.copyHover = false
+	p.copyURLHover = false
 	p.okHover = false
 	p.abortHover = false
 	p.deviceCode = ""
+	p.oauthURL = ""
 	p.validationErr = ""
 	p.btnRowY = -1
 	p.inputRowY = -1
 	p.deviceCodeRowY = -1
+	p.copyURLRowY = -1
 }
 
 func (p *Panel) clearInput() {
@@ -1185,6 +1252,22 @@ func (p *Panel) renderCopyIcon() string {
 	}
 }
 
+// renderCopyURLBtn renders the standalone [copy] button for the OAuth URL row.
+func (p *Panel) renderCopyURLBtn() string {
+	pal := p.th.Palette
+	switch {
+	case p.btnFocus == focusCopyURL:
+		return lipgloss.NewStyle().Bold(true).Foreground(pal.Primary).
+			Render(copyIcon)
+	case p.copyURLHover:
+		return lipgloss.NewStyle().Foreground(pal.Secondary).
+			Render(copyIcon)
+	default:
+		return lipgloss.NewStyle().Foreground(pal.Muted).
+			Render(copyIcon)
+	}
+}
+
 // hitTestDeviceCodeCopy reports whether x hits the copy icon on the device code row.
 func (p *Panel) hitTestDeviceCodeCopy(x int) bool {
 	// Layout: pad(1) + "Code: "(6) + deviceCode(N) → copy icon starts after.
@@ -1193,12 +1276,26 @@ func (p *Panel) hitTestDeviceCodeCopy(x int) bool {
 	return x >= copyStart && x < copyStart+copyIconWidth
 }
 
+// hitTestCopyURL reports whether x hits the [copy] button on the OAuth URL copy row.
+func (p *Panel) hitTestCopyURL(x int) bool {
+	// Layout: pad(1) + "[copy]"(6).
+	return x >= 1 && x < 1+len(copyIcon)
+}
+
 // doCopyDeviceCode writes the device code to the system clipboard.
 func (p *Panel) doCopyDeviceCode() {
 	if p.clipboardWrite == nil || p.deviceCode == "" {
 		return
 	}
 	_ = p.clipboardWrite(p.deviceCode)
+}
+
+// doCopyOAuthURL writes the OAuth URL to the system clipboard.
+func (p *Panel) doCopyOAuthURL() {
+	if p.clipboardWrite == nil || p.oauthURL == "" {
+		return
+	}
+	_ = p.clipboardWrite(p.oauthURL)
 }
 
 // bodyVisibleRows counts the total visible terminal rows occupied by
@@ -1221,6 +1318,7 @@ func (p *Panel) renderOAuthBody(innerW int, cursorVisible bool) []string {
 	pad := " "
 	p.inputRowY = -1
 	p.deviceCodeRowY = -1
+	p.copyURLRowY = -1
 
 	provLabel := providerLabel(p.provider)
 	desc := pad + mutedStyle.Render("Complete sign-in in your browser to authenticate with "+provLabel+".")
@@ -1235,6 +1333,16 @@ func (p *Panel) renderOAuthBody(innerW int, cursorVisible bool) []string {
 	lines = append(lines, desc)
 	lines = append(lines, "")
 	lines = append(lines, statusLine)
+
+	// OAuth URL on its own wrapped line(s) with a copy button below.
+	if p.oauthURL != "" {
+		lines = append(lines, "")
+		maxURLWidth := max(innerW*3/4, 20)
+		wrappedURL := wrapURL(p.oauthURL, maxURLWidth)
+		lines = append(lines, pad+infoStyle.Render(wrappedURL))
+		p.copyURLRowY = 2 + bodyVisibleRows(lines)
+		lines = append(lines, pad+p.renderCopyURLBtn())
+	}
 
 	// Device code line with clickable copy icon.
 	if p.deviceCode != "" {
@@ -1328,4 +1436,21 @@ func truncate(s string, maxLen int) string {
 		runes = runes[:maxLen-1]
 	}
 	return string(runes) + "…"
+}
+
+// wrapURL character-wraps a URL to maxWidth. OAuth URLs have no word boundaries,
+// so simple rune-based splitting is the only sensible strategy.
+func wrapURL(rawURL string, maxWidth int) string {
+	runes := []rune(rawURL)
+	if len(runes) <= maxWidth {
+		return rawURL
+	}
+	var b strings.Builder
+	for i, r := range runes {
+		if i > 0 && i%maxWidth == 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

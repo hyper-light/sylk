@@ -29,13 +29,13 @@ type PausedPipeline struct {
 
 type PipelineSuspender struct {
 	provider ActivePipelineProvider
-	bus      *signal.SignalBus
+	bus      signal.SignalBusInterface
 
 	mu     sync.RWMutex
 	paused map[string]*PausedPipeline
 }
 
-func NewPipelineSuspender(provider ActivePipelineProvider, bus *signal.SignalBus) *PipelineSuspender {
+func NewPipelineSuspender(provider ActivePipelineProvider, bus signal.SignalBusInterface) *PipelineSuspender {
 	return &PipelineSuspender{
 		provider: provider,
 		bus:      bus,

@@ -11,68 +11,9 @@ import (
 // Test Helpers
 // =============================================================================
 
-// testSubscriber implements EventSubscriber for capturing events in tests.
-type testSubscriber struct {
-	id         string
-	eventTypes []EventType
-	events     chan *ActivityEvent
-	mu         sync.Mutex
-	received   []*ActivityEvent
-}
-
-func newTestSubscriber(id string, eventTypes ...EventType) *testSubscriber {
-	return &testSubscriber{
-		id:         id,
-		eventTypes: eventTypes,
-		events:     make(chan *ActivityEvent, 100),
-		received:   make([]*ActivityEvent, 0),
-	}
-}
-
-func (s *testSubscriber) ID() string {
-	return s.id
-}
-
-func (s *testSubscriber) EventTypes() []EventType {
-	return s.eventTypes
-}
-
-func (s *testSubscriber) OnEvent(event *ActivityEvent) error {
-	s.mu.Lock()
-	s.received = append(s.received, event)
-	s.mu.Unlock()
-
-	select {
-	case s.events <- event:
-	default:
-	}
-	return nil
-}
-
-func (s *testSubscriber) getEvents() []*ActivityEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]*ActivityEvent{}, s.received...)
-}
-
-func (s *testSubscriber) waitForEvent(timeout time.Duration) *ActivityEvent {
-	select {
-	case event := <-s.events:
-		return event
-	case <-time.After(timeout):
-		return nil
-	}
-}
-
-// setupTestBus creates a test bus and returns it along with a wildcard subscriber.
-func setupTestBus() (*ActivityEventBus, *testSubscriber) {
-	bus := NewActivityEventBus(100)
-	bus.Start()
-
-	sub := newTestSubscriber("test-subscriber")
-	bus.Subscribe(sub)
-
-	return bus, sub
+// setupTestCollector creates a TestActivityCollector for capturing events in tests.
+func setupTestCollector() *TestActivityCollector {
+	return NewTestActivityCollector()
 }
 
 // =============================================================================
@@ -82,16 +23,15 @@ func setupTestBus() (*ActivityEventBus, *testSubscriber) {
 func TestGuidePublisher_New(t *testing.T) {
 	t.Parallel()
 
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewGuidePublisher(bus, "session-123")
+	publisher := NewGuidePublisher(collector, "session-123")
 
 	if publisher == nil {
 		t.Fatal("Expected non-nil publisher")
 	}
 
-	if publisher.bus != bus {
+	if publisher.bus != collector {
 		t.Error("Expected bus to be set")
 	}
 
@@ -103,20 +43,21 @@ func TestGuidePublisher_New(t *testing.T) {
 func TestGuidePublisher_PublishUserPrompt(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewGuidePublisher(bus, "session-123")
+	publisher := NewGuidePublisher(collector, "session-123")
 
 	err := publisher.PublishUserPrompt("What is the weather today?")
 	if err != nil {
 		t.Fatalf("PublishUserPrompt returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeUserPrompt {
@@ -157,20 +98,21 @@ func TestGuidePublisher_PublishUserPrompt(t *testing.T) {
 func TestGuidePublisher_PublishRoutingDecision(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewGuidePublisher(bus, "session-123")
+	publisher := NewGuidePublisher(collector, "session-123")
 
 	err := publisher.PublishRoutingDecision("guide", "coder", "User requested code generation")
 	if err != nil {
 		t.Fatalf("PublishRoutingDecision returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeAgentDecision {
@@ -199,20 +141,21 @@ func TestGuidePublisher_PublishRoutingDecision(t *testing.T) {
 func TestGuidePublisher_PublishClarificationRequest(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewGuidePublisher(bus, "session-123")
+	publisher := NewGuidePublisher(collector, "session-123")
 
 	err := publisher.PublishClarificationRequest("Which file would you like me to modify?")
 	if err != nil {
 		t.Fatalf("PublishClarificationRequest returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeUserClarification {
@@ -261,16 +204,15 @@ func TestGuidePublisher_NilBus(t *testing.T) {
 func TestToolPublisher_New(t *testing.T) {
 	t.Parallel()
 
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewToolPublisher(bus, "session-123", "agent-1")
+	publisher := NewToolPublisher(collector, "session-123", "agent-1")
 
 	if publisher == nil {
 		t.Fatal("Expected non-nil publisher")
 	}
 
-	if publisher.bus != bus {
+	if publisher.bus != collector {
 		t.Error("Expected bus to be set")
 	}
 
@@ -286,10 +228,9 @@ func TestToolPublisher_New(t *testing.T) {
 func TestToolPublisher_PublishToolCall(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewToolPublisher(bus, "session-123", "agent-1")
+	publisher := NewToolPublisher(collector, "session-123", "agent-1")
 
 	params := map[string]any{
 		"path":    "/src/main.go",
@@ -301,10 +242,12 @@ func TestToolPublisher_PublishToolCall(t *testing.T) {
 		t.Fatalf("PublishToolCall returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeToolCall {
@@ -339,10 +282,9 @@ func TestToolPublisher_PublishToolCall(t *testing.T) {
 func TestToolPublisher_PublishToolResult_Success(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewToolPublisher(bus, "session-123", "agent-1")
+	publisher := NewToolPublisher(collector, "session-123", "agent-1")
 
 	result := map[string]any{
 		"bytes_written": 1024,
@@ -354,10 +296,12 @@ func TestToolPublisher_PublishToolResult_Success(t *testing.T) {
 		t.Fatalf("PublishToolResult returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeToolResult {
@@ -391,20 +335,21 @@ func TestToolPublisher_PublishToolResult_Success(t *testing.T) {
 func TestToolPublisher_PublishToolResult_Failure(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewToolPublisher(bus, "session-123", "agent-1")
+	publisher := NewToolPublisher(collector, "session-123", "agent-1")
 
 	err := publisher.PublishToolResult("read_file", "file not found", false)
 	if err != nil {
 		t.Fatalf("PublishToolResult returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify outcome
 	if event.Outcome != OutcomeFailure {
@@ -419,10 +364,9 @@ func TestToolPublisher_PublishToolResult_Failure(t *testing.T) {
 func TestToolPublisher_PublishToolTimeout(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewToolPublisher(bus, "session-123", "agent-1")
+	publisher := NewToolPublisher(collector, "session-123", "agent-1")
 
 	timeout := 30 * time.Second
 
@@ -431,10 +375,12 @@ func TestToolPublisher_PublishToolTimeout(t *testing.T) {
 		t.Fatalf("PublishToolTimeout returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeToolTimeout {
@@ -486,16 +432,15 @@ func TestToolPublisher_NilBus(t *testing.T) {
 func TestAgentPublisher_New(t *testing.T) {
 	t.Parallel()
 
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	if publisher == nil {
 		t.Fatal("Expected non-nil publisher")
 	}
 
-	if publisher.bus != bus {
+	if publisher.bus != collector {
 		t.Error("Expected bus to be set")
 	}
 
@@ -511,20 +456,21 @@ func TestAgentPublisher_New(t *testing.T) {
 func TestAgentPublisher_PublishAgentAction(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	err := publisher.PublishAgentAction("file_edit", "Modified main.go to add error handling")
 	if err != nil {
 		t.Fatalf("PublishAgentAction returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeAgentAction {
@@ -554,20 +500,21 @@ func TestAgentPublisher_PublishAgentAction(t *testing.T) {
 func TestAgentPublisher_PublishAgentDecision(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	err := publisher.PublishAgentDecision("refactor", "Code duplication detected in utils package")
 	if err != nil {
 		t.Fatalf("PublishAgentDecision returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeAgentDecision {
@@ -587,10 +534,9 @@ func TestAgentPublisher_PublishAgentDecision(t *testing.T) {
 func TestAgentPublisher_PublishAgentError(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	testErr := errors.New("syntax error in generated code")
 	err := publisher.PublishAgentError(testErr, "Code generation for authentication module")
@@ -598,10 +544,12 @@ func TestAgentPublisher_PublishAgentError(t *testing.T) {
 		t.Fatalf("PublishAgentError returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeAgentError {
@@ -626,10 +574,9 @@ func TestAgentPublisher_PublishAgentError(t *testing.T) {
 func TestAgentPublisher_PublishAgentError_NilError(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	// Should handle nil error gracefully
 	err := publisher.PublishAgentError(nil, "Some context")
@@ -637,10 +584,12 @@ func TestAgentPublisher_PublishAgentError_NilError(t *testing.T) {
 		t.Fatalf("PublishAgentError returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify error_message is empty string
 	if event.Data["error_message"] != "" {
@@ -651,20 +600,21 @@ func TestAgentPublisher_PublishAgentError_NilError(t *testing.T) {
 func TestAgentPublisher_PublishSuccess(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	err := publisher.PublishSuccess("Successfully completed code refactoring")
 	if err != nil {
 		t.Fatalf("PublishSuccess returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeSuccess {
@@ -695,10 +645,9 @@ func TestAgentPublisher_PublishSuccess(t *testing.T) {
 func TestAgentPublisher_PublishFailure(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	testErr := errors.New("compilation failed")
 	err := publisher.PublishFailure(testErr, "Build process failed for main package")
@@ -706,10 +655,12 @@ func TestAgentPublisher_PublishFailure(t *testing.T) {
 		t.Fatalf("PublishFailure returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeFailure {
@@ -734,10 +685,9 @@ func TestAgentPublisher_PublishFailure(t *testing.T) {
 func TestAgentPublisher_PublishFailure_NilError(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "coder-agent")
+	publisher := NewAgentPublisher(collector, "session-123", "coder-agent")
 
 	// Should handle nil error gracefully
 	err := publisher.PublishFailure(nil, "Unknown failure")
@@ -745,10 +695,12 @@ func TestAgentPublisher_PublishFailure_NilError(t *testing.T) {
 		t.Fatalf("PublishFailure returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify error is empty string
 	if event.Data["error"] != "" {
@@ -790,16 +742,15 @@ func TestAgentPublisher_NilBus(t *testing.T) {
 func TestLLMPublisher_New(t *testing.T) {
 	t.Parallel()
 
-	bus := NewActivityEventBus(100)
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewLLMPublisher(bus, "session-123", "coder-agent")
+	publisher := NewLLMPublisher(collector, "session-123", "coder-agent")
 
 	if publisher == nil {
 		t.Fatal("Expected non-nil publisher")
 	}
 
-	if publisher.bus != bus {
+	if publisher.bus != collector {
 		t.Error("Expected bus to be set")
 	}
 
@@ -815,20 +766,21 @@ func TestLLMPublisher_New(t *testing.T) {
 func TestLLMPublisher_PublishLLMRequest(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewLLMPublisher(bus, "session-123", "coder-agent")
+	publisher := NewLLMPublisher(collector, "session-123", "coder-agent")
 
 	err := publisher.PublishLLMRequest("gpt-4", 1500)
 	if err != nil {
 		t.Fatalf("PublishLLMRequest returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeLLMRequest {
@@ -858,10 +810,9 @@ func TestLLMPublisher_PublishLLMRequest(t *testing.T) {
 func TestLLMPublisher_PublishLLMResponse(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewLLMPublisher(bus, "session-123", "coder-agent")
+	publisher := NewLLMPublisher(collector, "session-123", "coder-agent")
 
 	duration := 2 * time.Second
 	err := publisher.PublishLLMResponse("gpt-4", 1500, 500, duration)
@@ -869,10 +820,12 @@ func TestLLMPublisher_PublishLLMResponse(t *testing.T) {
 		t.Fatalf("PublishLLMResponse returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeLLMResponse {
@@ -915,10 +868,9 @@ func TestLLMPublisher_PublishLLMResponse(t *testing.T) {
 func TestLLMPublisher_PublishLLMResponse_ZeroDuration(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewLLMPublisher(bus, "session-123", "coder-agent")
+	publisher := NewLLMPublisher(collector, "session-123", "coder-agent")
 
 	// Zero duration should not cause division by zero
 	err := publisher.PublishLLMResponse("gpt-4", 1500, 500, 0)
@@ -926,10 +878,12 @@ func TestLLMPublisher_PublishLLMResponse_ZeroDuration(t *testing.T) {
 		t.Fatalf("PublishLLMResponse returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// tokens_per_sec should be 0 when duration is 0
 	tokensPerSec, ok := event.Data["tokens_per_sec"].(float64)
@@ -945,10 +899,9 @@ func TestLLMPublisher_PublishLLMResponse_ZeroDuration(t *testing.T) {
 func TestLLMPublisher_PublishLLMError(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewLLMPublisher(bus, "session-123", "coder-agent")
+	publisher := NewLLMPublisher(collector, "session-123", "coder-agent")
 
 	testErr := errors.New("rate limit exceeded")
 	err := publisher.PublishLLMError("gpt-4", testErr, "Token generation")
@@ -956,10 +909,12 @@ func TestLLMPublisher_PublishLLMError(t *testing.T) {
 		t.Fatalf("PublishLLMError returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify event type
 	if event.EventType != EventTypeLLMResponse {
@@ -988,10 +943,9 @@ func TestLLMPublisher_PublishLLMError(t *testing.T) {
 func TestLLMPublisher_PublishLLMError_NilError(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewLLMPublisher(bus, "session-123", "coder-agent")
+	publisher := NewLLMPublisher(collector, "session-123", "coder-agent")
 
 	// Should handle nil error gracefully
 	err := publisher.PublishLLMError("gpt-4", nil, "Unknown error")
@@ -999,10 +953,12 @@ func TestLLMPublisher_PublishLLMError_NilError(t *testing.T) {
 		t.Fatalf("PublishLLMError returned error: %v", err)
 	}
 
-	event := sub.waitForEvent(200 * time.Millisecond)
-	if event == nil {
+	events := collector.Events()
+	if len(events) == 0 {
 		t.Fatal("Expected to receive event")
 	}
+
+	event := events[0]
 
 	// Verify error is "unknown error" when nil error is passed
 	if event.Data["error"] != "unknown error" {
@@ -1033,17 +989,16 @@ func TestLLMPublisher_NilBus(t *testing.T) {
 // Integration Tests
 // =============================================================================
 
-func TestIntegration_MultiplePublishersSameBus(t *testing.T) {
+func TestIntegration_MultiplePublishersSameCollector(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
 	// Create multiple publishers
-	guidePublisher := NewGuidePublisher(bus, "session-123")
-	toolPublisher := NewToolPublisher(bus, "session-123", "agent-1")
-	agentPublisher := NewAgentPublisher(bus, "session-123", "agent-1")
-	llmPublisher := NewLLMPublisher(bus, "session-123", "agent-1")
+	guidePublisher := NewGuidePublisher(collector, "session-123")
+	toolPublisher := NewToolPublisher(collector, "session-123", "agent-1")
+	agentPublisher := NewAgentPublisher(collector, "session-123", "agent-1")
+	llmPublisher := NewLLMPublisher(collector, "session-123", "agent-1")
 
 	// Publish events from all publishers
 	_ = guidePublisher.PublishUserPrompt("Hello")
@@ -1051,14 +1006,10 @@ func TestIntegration_MultiplePublishersSameBus(t *testing.T) {
 	_ = agentPublisher.PublishAgentAction("test_action", "details")
 	_ = llmPublisher.PublishLLMRequest("gpt-4", 100)
 
-	// Wait for all events
-	time.Sleep(300 * time.Millisecond)
+	events := collector.Events()
 
-	events := sub.getEvents()
-
-	// Should have received at least 4 events (some may be debounced if same signature)
-	if len(events) < 4 {
-		t.Errorf("Expected at least 4 events, got %d", len(events))
+	if len(events) != 4 {
+		t.Errorf("Expected 4 events, got %d", len(events))
 	}
 
 	// Verify all event types are present
@@ -1081,62 +1032,19 @@ func TestIntegration_MultiplePublishersSameBus(t *testing.T) {
 	}
 }
 
-func TestIntegration_EventsDeliveredToSubscribers(t *testing.T) {
-	t.Parallel()
-
-	bus := NewActivityEventBus(100)
-	bus.Start()
-	defer bus.Close()
-
-	// Create specific-type subscriber
-	toolSub := newTestSubscriber("tool-sub", EventTypeToolCall, EventTypeToolResult)
-	bus.Subscribe(toolSub)
-
-	// Create wildcard subscriber
-	wildcardSub := newTestSubscriber("wildcard-sub")
-	bus.Subscribe(wildcardSub)
-
-	publisher := NewToolPublisher(bus, "session-123", "agent-1")
-
-	_ = publisher.PublishToolCall("test_tool", nil)
-	_ = publisher.PublishToolResult("test_tool", "success", true)
-
-	// Wait for delivery
-	time.Sleep(300 * time.Millisecond)
-
-	toolEvents := toolSub.getEvents()
-	wildcardEvents := wildcardSub.getEvents()
-
-	// Tool subscriber should receive tool events
-	if len(toolEvents) < 2 {
-		t.Errorf("Tool subscriber expected at least 2 events, got %d", len(toolEvents))
-	}
-
-	// Wildcard subscriber should also receive events
-	if len(wildcardEvents) < 2 {
-		t.Errorf("Wildcard subscriber expected at least 2 events, got %d", len(wildcardEvents))
-	}
-}
-
 func TestIntegration_EventsHaveUniqueIDs(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewGuidePublisher(bus, "session-123")
+	publisher := NewGuidePublisher(collector, "session-123")
 
 	// Publish multiple events
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_ = publisher.PublishUserPrompt("prompt")
-		// Small delay to avoid debouncing
-		time.Sleep(150 * time.Millisecond)
 	}
 
-	// Wait for delivery
-	time.Sleep(200 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 
 	// Check that all IDs are unique
 	ids := make(map[string]bool)
@@ -1155,20 +1063,16 @@ func TestIntegration_EventsHaveUniqueIDs(t *testing.T) {
 func TestIntegration_TimestampsAreSet(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
 	before := time.Now()
 
-	publisher := NewAgentPublisher(bus, "session-123", "agent-1")
+	publisher := NewAgentPublisher(collector, "session-123", "agent-1")
 	_ = publisher.PublishAgentAction("test", "test")
-
-	// Wait for delivery
-	time.Sleep(200 * time.Millisecond)
 
 	after := time.Now()
 
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) == 0 {
 		t.Fatal("Expected at least one event")
 	}
@@ -1192,13 +1096,12 @@ func TestIntegration_TimestampsAreSet(t *testing.T) {
 func TestEdgeCase_EmptyStringParameters(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	guidePublisher := NewGuidePublisher(bus, "session-123")
-	toolPublisher := NewToolPublisher(bus, "session-123", "agent-1")
-	agentPublisher := NewAgentPublisher(bus, "session-123", "agent-1")
-	llmPublisher := NewLLMPublisher(bus, "session-123", "agent-1")
+	guidePublisher := NewGuidePublisher(collector, "session-123")
+	toolPublisher := NewToolPublisher(collector, "session-123", "agent-1")
+	agentPublisher := NewAgentPublisher(collector, "session-123", "agent-1")
+	llmPublisher := NewLLMPublisher(collector, "session-123", "agent-1")
 
 	// Test with empty strings - should not panic
 	_ = guidePublisher.PublishUserPrompt("")
@@ -1216,23 +1119,19 @@ func TestEdgeCase_EmptyStringParameters(t *testing.T) {
 	_ = llmPublisher.PublishLLMResponse("", 0, 0, 0)
 	_ = llmPublisher.PublishLLMError("", nil, "")
 
-	// Wait for delivery
-	time.Sleep(300 * time.Millisecond)
-
-	// All events should have been published (though may be debounced)
-	events := sub.getEvents()
-	if len(events) == 0 {
-		t.Error("Expected at least some events to be published")
+	// All events should have been published
+	events := collector.Events()
+	if len(events) != 14 {
+		t.Errorf("Expected 14 events, got %d", len(events))
 	}
 }
 
 func TestEdgeCase_ZeroTokenCounts(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewLLMPublisher(bus, "session-123", "agent-1")
+	publisher := NewLLMPublisher(collector, "session-123", "agent-1")
 
 	err := publisher.PublishLLMRequest("gpt-4", 0)
 	if err != nil {
@@ -1244,12 +1143,9 @@ func TestEdgeCase_ZeroTokenCounts(t *testing.T) {
 		t.Fatalf("PublishLLMResponse with zero tokens returned error: %v", err)
 	}
 
-	// Wait for delivery
-	time.Sleep(300 * time.Millisecond)
-
-	events := sub.getEvents()
-	if len(events) < 2 {
-		t.Errorf("Expected at least 2 events, got %d", len(events))
+	events := collector.Events()
+	if len(events) != 2 {
+		t.Errorf("Expected 2 events, got %d", len(events))
 	}
 
 	// Verify zero values are captured
@@ -1273,10 +1169,9 @@ func TestEdgeCase_ZeroTokenCounts(t *testing.T) {
 func TestEdgeCase_NilParams(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewToolPublisher(bus, "session-123", "agent-1")
+	publisher := NewToolPublisher(collector, "session-123", "agent-1")
 
 	// nil params should be handled gracefully
 	err := publisher.PublishToolCall("test_tool", nil)
@@ -1284,10 +1179,7 @@ func TestEdgeCase_NilParams(t *testing.T) {
 		t.Fatalf("PublishToolCall with nil params returned error: %v", err)
 	}
 
-	// Wait for delivery
-	time.Sleep(200 * time.Millisecond)
-
-	events := sub.getEvents()
+	events := collector.Events()
 	if len(events) == 0 {
 		t.Fatal("Expected at least one event")
 	}
@@ -1305,35 +1197,30 @@ func TestEdgeCase_NilParams(t *testing.T) {
 func TestEdgeCase_ConcurrentPublishing(t *testing.T) {
 	t.Parallel()
 
-	bus, sub := setupTestBus()
-	defer bus.Close()
+	collector := setupTestCollector()
 
-	publisher := NewAgentPublisher(bus, "session-123", "agent-1")
+	publisher := NewAgentPublisher(collector, "session-123", "agent-1")
 
 	// Concurrent publishing from multiple goroutines
 	var wg sync.WaitGroup
 	goroutines := 10
 	eventsPerGoroutine := 10
 
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
-			for j := 0; j < eventsPerGoroutine; j++ {
+			for range eventsPerGoroutine {
 				_ = publisher.PublishAgentAction("action", "details")
 			}
-		}(i)
+		}()
 	}
 
 	wg.Wait()
 
-	// Wait for delivery
-	time.Sleep(500 * time.Millisecond)
-
-	// Should receive at least some events (may be debounced)
-	events := sub.getEvents()
-	if len(events) == 0 {
-		t.Error("Expected to receive at least some events")
+	// All events should have been collected (TestActivityCollector is synchronous and thread-safe)
+	if collector.EventCount() != goroutines*eventsPerGoroutine {
+		t.Errorf("Expected %d events, got %d", goroutines*eventsPerGoroutine, collector.EventCount())
 	}
 }
 
@@ -1345,10 +1232,10 @@ func TestGuidePublisher_EventTypes(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name          string
-		publishFunc   func(*GuidePublisher) error
-		expectedType  EventType
-		expectedCat   string
+		name        string
+		publishFunc func(*GuidePublisher) error
+		expectedType EventType
+		expectedCat  string
 	}{
 		{
 			name: "UserPrompt",
@@ -1377,24 +1264,24 @@ func TestGuidePublisher_EventTypes(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt // capture range variable
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			bus, sub := setupTestBus()
-			defer bus.Close()
+			collector := setupTestCollector()
 
-			publisher := NewGuidePublisher(bus, "session-123")
+			publisher := NewGuidePublisher(collector, "session-123")
 
 			err := tt.publishFunc(publisher)
 			if err != nil {
 				t.Fatalf("Publish function returned error: %v", err)
 			}
 
-			event := sub.waitForEvent(200 * time.Millisecond)
-			if event == nil {
+			events := collector.Events()
+			if len(events) == 0 {
 				t.Fatal("Expected to receive event")
 			}
+
+			event := events[0]
 
 			if event.EventType != tt.expectedType {
 				t.Errorf("Expected event type %s, got %s", tt.expectedType, event.EventType)
@@ -1451,24 +1338,24 @@ func TestToolPublisher_EventTypes(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt // capture range variable
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			bus, sub := setupTestBus()
-			defer bus.Close()
+			collector := setupTestCollector()
 
-			publisher := NewToolPublisher(bus, "session-123", "agent-1")
+			publisher := NewToolPublisher(collector, "session-123", "agent-1")
 
 			err := tt.publishFunc(publisher)
 			if err != nil {
 				t.Fatalf("Publish function returned error: %v", err)
 			}
 
-			event := sub.waitForEvent(200 * time.Millisecond)
-			if event == nil {
+			events := collector.Events()
+			if len(events) == 0 {
 				t.Fatal("Expected to receive event")
 			}
+
+			event := events[0]
 
 			if event.EventType != tt.expectedType {
 				t.Errorf("Expected event type %s, got %s", tt.expectedType, event.EventType)
@@ -1533,24 +1420,24 @@ func TestAgentPublisher_EventTypes(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt // capture range variable
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			bus, sub := setupTestBus()
-			defer bus.Close()
+			collector := setupTestCollector()
 
-			publisher := NewAgentPublisher(bus, "session-123", "agent-1")
+			publisher := NewAgentPublisher(collector, "session-123", "agent-1")
 
 			err := tt.publishFunc(publisher)
 			if err != nil {
 				t.Fatalf("Publish function returned error: %v", err)
 			}
 
-			event := sub.waitForEvent(200 * time.Millisecond)
-			if event == nil {
+			events := collector.Events()
+			if len(events) == 0 {
 				t.Fatal("Expected to receive event")
 			}
+
+			event := events[0]
 
 			if event.EventType != tt.expectedType {
 				t.Errorf("Expected event type %s, got %s", tt.expectedType, event.EventType)
@@ -1599,24 +1486,24 @@ func TestLLMPublisher_EventTypes(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt // capture range variable
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			bus, sub := setupTestBus()
-			defer bus.Close()
+			collector := setupTestCollector()
 
-			publisher := NewLLMPublisher(bus, "session-123", "agent-1")
+			publisher := NewLLMPublisher(collector, "session-123", "agent-1")
 
 			err := tt.publishFunc(publisher)
 			if err != nil {
 				t.Fatalf("Publish function returned error: %v", err)
 			}
 
-			event := sub.waitForEvent(200 * time.Millisecond)
-			if event == nil {
+			events := collector.Events()
+			if len(events) == 0 {
 				t.Fatal("Expected to receive event")
 			}
+
+			event := events[0]
 
 			if event.EventType != tt.expectedType {
 				t.Errorf("Expected event type %s, got %s", tt.expectedType, event.EventType)

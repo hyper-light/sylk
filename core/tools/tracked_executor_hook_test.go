@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"sync"
 	"testing"
 	"time"
 
@@ -11,106 +10,16 @@ import (
 )
 
 // =============================================================================
-// Test Helpers
-// =============================================================================
-
-// testEventSubscriber captures events for testing.
-type testEventSubscriber struct {
-	id         string
-	eventTypes []events.EventType
-	events     []*events.ActivityEvent
-	mu         sync.Mutex
-}
-
-func newTestEventSubscriber(id string, eventTypes ...events.EventType) *testEventSubscriber {
-	return &testEventSubscriber{
-		id:         id,
-		eventTypes: eventTypes,
-		events:     make([]*events.ActivityEvent, 0),
-	}
-}
-
-func (s *testEventSubscriber) ID() string {
-	return s.id
-}
-
-func (s *testEventSubscriber) EventTypes() []events.EventType {
-	return s.eventTypes
-}
-
-func (s *testEventSubscriber) OnEvent(event *events.ActivityEvent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.events = append(s.events, event)
-	return nil
-}
-
-func (s *testEventSubscriber) Events() []*events.ActivityEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	result := make([]*events.ActivityEvent, len(s.events))
-	copy(result, s.events)
-	return result
-}
-
-func (s *testEventSubscriber) LastEvent() *events.ActivityEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.events) == 0 {
-		return nil
-	}
-	return s.events[len(s.events)-1]
-}
-
-func (s *testEventSubscriber) WaitForEvent(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		count := len(s.events)
-		s.mu.Unlock()
-		if count > 0 {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
-}
-
-func (s *testEventSubscriber) WaitForEventCount(count int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		s.mu.Lock()
-		currentCount := len(s.events)
-		s.mu.Unlock()
-		if currentCount >= count {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
-}
-
-// createTestEventBus creates a test event bus with a wildcard subscriber.
-func createTestEventBus() (*events.ActivityEventBus, *testEventSubscriber) {
-	bus := events.NewActivityEventBus(100)
-	sub := newTestEventSubscriber("test-sub")
-	bus.Subscribe(sub)
-	bus.Start()
-	return bus, sub
-}
-
-// =============================================================================
 // ToolEventPublisherHook Tests
 // =============================================================================
 
 func TestNewToolEventPublisherHook(t *testing.T) {
-	bus := events.NewActivityEventBus(100)
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	assert.NotNil(t, hook)
-	assert.Equal(t, bus, hook.Bus())
+	assert.Equal(t, collector, hook.Bus())
 }
 
 func TestNewToolEventPublisherHook_NilBus(t *testing.T) {
@@ -121,10 +30,9 @@ func TestNewToolEventPublisherHook_NilBus(t *testing.T) {
 }
 
 func TestToolEventPublisherHook_OnToolStart(t *testing.T) {
-	bus, sub := createTestEventBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	params := map[string]any{
 		"path":    "/etc/config.yaml",
@@ -133,10 +41,10 @@ func TestToolEventPublisherHook_OnToolStart(t *testing.T) {
 
 	hook.OnToolStart("session-123", "agent-456", "file_read", params)
 
-	require.True(t, sub.WaitForEvent(time.Second))
+	receivedEvents := collector.Events()
+	require.Len(t, receivedEvents, 1)
 
-	event := sub.LastEvent()
-	require.NotNil(t, event)
+	event := receivedEvents[0]
 	assert.Equal(t, events.EventTypeToolCall, event.EventType)
 	assert.Equal(t, "session-123", event.SessionID)
 	assert.Equal(t, "agent-456", event.AgentID)
@@ -154,25 +62,23 @@ func TestToolEventPublisherHook_OnToolStart_NilBus(t *testing.T) {
 }
 
 func TestToolEventPublisherHook_OnToolStart_NilParams(t *testing.T) {
-	bus, sub := createTestEventBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	hook.OnToolStart("session-123", "agent-456", "file_read", nil)
 
-	require.True(t, sub.WaitForEvent(time.Second))
+	receivedEvents := collector.Events()
+	require.Len(t, receivedEvents, 1)
 
-	event := sub.LastEvent()
-	require.NotNil(t, event)
+	event := receivedEvents[0]
 	assert.Nil(t, event.Data["params"])
 }
 
 func TestToolEventPublisherHook_OnToolComplete_Success(t *testing.T) {
-	bus, sub := createTestEventBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	result := map[string]any{
 		"content": "file contents here",
@@ -181,10 +87,10 @@ func TestToolEventPublisherHook_OnToolComplete_Success(t *testing.T) {
 
 	hook.OnToolComplete("session-123", "agent-456", "file_read", result, events.OutcomeSuccess)
 
-	require.True(t, sub.WaitForEvent(time.Second))
+	receivedEvents := collector.Events()
+	require.Len(t, receivedEvents, 1)
 
-	event := sub.LastEvent()
-	require.NotNil(t, event)
+	event := receivedEvents[0]
 	assert.Equal(t, events.EventTypeToolResult, event.EventType)
 	assert.Equal(t, "session-123", event.SessionID)
 	assert.Equal(t, "agent-456", event.AgentID)
@@ -195,17 +101,16 @@ func TestToolEventPublisherHook_OnToolComplete_Success(t *testing.T) {
 }
 
 func TestToolEventPublisherHook_OnToolComplete_Failure(t *testing.T) {
-	bus, sub := createTestEventBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	hook.OnToolComplete("session-123", "agent-456", "file_write", nil, events.OutcomeFailure)
 
-	require.True(t, sub.WaitForEvent(time.Second))
+	receivedEvents := collector.Events()
+	require.Len(t, receivedEvents, 1)
 
-	event := sub.LastEvent()
-	require.NotNil(t, event)
+	event := receivedEvents[0]
 	assert.Equal(t, events.EventTypeToolResult, event.EventType)
 	assert.Contains(t, event.Content, "Tool failed: file_write")
 	assert.Equal(t, events.OutcomeFailure, event.Outcome)
@@ -219,19 +124,18 @@ func TestToolEventPublisherHook_OnToolComplete_NilBus(t *testing.T) {
 }
 
 func TestToolEventPublisherHook_OnToolTimeout(t *testing.T) {
-	bus, sub := createTestEventBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	timeout := 30 * time.Second
 
 	hook.OnToolTimeout("session-123", "agent-456", "slow_tool", timeout)
 
-	require.True(t, sub.WaitForEvent(time.Second))
+	receivedEvents := collector.Events()
+	require.Len(t, receivedEvents, 1)
 
-	event := sub.LastEvent()
-	require.NotNil(t, event)
+	event := receivedEvents[0]
 	assert.Equal(t, events.EventTypeToolTimeout, event.EventType)
 	assert.Equal(t, "session-123", event.SessionID)
 	assert.Equal(t, "agent-456", event.AgentID)
@@ -276,82 +180,67 @@ func TestCompositeToolEventHook_AddHook(t *testing.T) {
 }
 
 func TestCompositeToolEventHook_OnToolStart(t *testing.T) {
-	bus1, sub1 := createTestEventBus()
-	defer bus1.Close()
+	collector1 := events.NewTestActivityCollector()
+	collector2 := events.NewTestActivityCollector()
 
-	bus2, sub2 := createTestEventBus()
-	defer bus2.Close()
-
-	hook1 := NewToolEventPublisherHook(bus1)
-	hook2 := NewToolEventPublisherHook(bus2)
+	hook1 := NewToolEventPublisherHook(collector1)
+	hook2 := NewToolEventPublisherHook(collector2)
 
 	composite := NewCompositeToolEventHook(hook1, hook2)
 
 	params := map[string]any{"key": "value"}
 	composite.OnToolStart("session-123", "agent-456", "test_tool", params)
 
-	require.True(t, sub1.WaitForEvent(time.Second))
-	require.True(t, sub2.WaitForEvent(time.Second))
+	events1 := collector1.Events()
+	events2 := collector2.Events()
 
-	event1 := sub1.LastEvent()
-	event2 := sub2.LastEvent()
+	require.Len(t, events1, 1)
+	require.Len(t, events2, 1)
 
-	assert.NotNil(t, event1)
-	assert.NotNil(t, event2)
-	assert.Equal(t, events.EventTypeToolCall, event1.EventType)
-	assert.Equal(t, events.EventTypeToolCall, event2.EventType)
+	assert.Equal(t, events.EventTypeToolCall, events1[0].EventType)
+	assert.Equal(t, events.EventTypeToolCall, events2[0].EventType)
 }
 
 func TestCompositeToolEventHook_OnToolComplete(t *testing.T) {
-	bus1, sub1 := createTestEventBus()
-	defer bus1.Close()
+	collector1 := events.NewTestActivityCollector()
+	collector2 := events.NewTestActivityCollector()
 
-	bus2, sub2 := createTestEventBus()
-	defer bus2.Close()
-
-	hook1 := NewToolEventPublisherHook(bus1)
-	hook2 := NewToolEventPublisherHook(bus2)
+	hook1 := NewToolEventPublisherHook(collector1)
+	hook2 := NewToolEventPublisherHook(collector2)
 
 	composite := NewCompositeToolEventHook(hook1, hook2)
 
 	composite.OnToolComplete("session-123", "agent-456", "test_tool", "result", events.OutcomeSuccess)
 
-	require.True(t, sub1.WaitForEvent(time.Second))
-	require.True(t, sub2.WaitForEvent(time.Second))
+	events1 := collector1.Events()
+	events2 := collector2.Events()
 
-	event1 := sub1.LastEvent()
-	event2 := sub2.LastEvent()
+	require.Len(t, events1, 1)
+	require.Len(t, events2, 1)
 
-	assert.NotNil(t, event1)
-	assert.NotNil(t, event2)
-	assert.Equal(t, events.EventTypeToolResult, event1.EventType)
-	assert.Equal(t, events.EventTypeToolResult, event2.EventType)
+	assert.Equal(t, events.EventTypeToolResult, events1[0].EventType)
+	assert.Equal(t, events.EventTypeToolResult, events2[0].EventType)
 }
 
 func TestCompositeToolEventHook_OnToolTimeout(t *testing.T) {
-	bus1, sub1 := createTestEventBus()
-	defer bus1.Close()
+	collector1 := events.NewTestActivityCollector()
+	collector2 := events.NewTestActivityCollector()
 
-	bus2, sub2 := createTestEventBus()
-	defer bus2.Close()
-
-	hook1 := NewToolEventPublisherHook(bus1)
-	hook2 := NewToolEventPublisherHook(bus2)
+	hook1 := NewToolEventPublisherHook(collector1)
+	hook2 := NewToolEventPublisherHook(collector2)
 
 	composite := NewCompositeToolEventHook(hook1, hook2)
 
 	composite.OnToolTimeout("session-123", "agent-456", "test_tool", 10*time.Second)
 
-	require.True(t, sub1.WaitForEvent(time.Second))
-	require.True(t, sub2.WaitForEvent(time.Second))
+	events1 := collector1.Events()
+	events2 := collector2.Events()
 
-	event1 := sub1.LastEvent()
-	event2 := sub2.LastEvent()
+	require.Len(t, events1, 1)
+	require.Len(t, events2, 1)
 
-	assert.NotNil(t, event1)
-	assert.NotNil(t, event2)
-	assert.Equal(t, events.EventTypeToolTimeout, event1.EventType)
-	assert.Equal(t, events.EventTypeToolTimeout, event2.EventType)
+	assert.Equal(t, events.EventTypeToolTimeout, events1[0].EventType)
+	assert.Equal(t, events.EventTypeToolTimeout, events2[0].EventType)
 }
 
 // =============================================================================
@@ -402,10 +291,9 @@ func TestNoOpToolEventHook_ImplementsInterface(t *testing.T) {
 // =============================================================================
 
 func TestToolEventPublisherHook_FullToolLifecycle(t *testing.T) {
-	bus, sub := createTestEventBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	// Simulate tool execution lifecycle
 	params := map[string]any{"file": "test.txt"}
@@ -413,17 +301,11 @@ func TestToolEventPublisherHook_FullToolLifecycle(t *testing.T) {
 	// 1. Tool starts
 	hook.OnToolStart("session-123", "agent-456", "file_read", params)
 
-	// Wait to avoid debouncing
-	time.Sleep(150 * time.Millisecond)
-
 	// 2. Tool completes successfully
 	result := map[string]any{"content": "file content"}
 	hook.OnToolComplete("session-123", "agent-456", "file_read", result, events.OutcomeSuccess)
 
-	// Wait for both events
-	require.True(t, sub.WaitForEventCount(2, 2*time.Second))
-
-	capturedEvents := sub.Events()
+	capturedEvents := collector.Events()
 	require.Len(t, capturedEvents, 2)
 
 	// Verify event sequence
@@ -432,24 +314,17 @@ func TestToolEventPublisherHook_FullToolLifecycle(t *testing.T) {
 }
 
 func TestToolEventPublisherHook_ToolWithTimeout(t *testing.T) {
-	bus, sub := createTestEventBus()
-	defer bus.Close()
+	collector := events.NewTestActivityCollector()
 
-	hook := NewToolEventPublisherHook(bus)
+	hook := NewToolEventPublisherHook(collector)
 
 	// 1. Tool starts
 	hook.OnToolStart("session-123", "agent-456", "slow_tool", nil)
 
-	// Wait to avoid debouncing
-	time.Sleep(150 * time.Millisecond)
-
 	// 2. Tool times out
 	hook.OnToolTimeout("session-123", "agent-456", "slow_tool", 30*time.Second)
 
-	// Wait for both events
-	require.True(t, sub.WaitForEventCount(2, 2*time.Second))
-
-	capturedEvents := sub.Events()
+	capturedEvents := collector.Events()
 	require.Len(t, capturedEvents, 2)
 
 	// Verify event sequence

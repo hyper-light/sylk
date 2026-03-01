@@ -33,7 +33,7 @@ func (s RateLimitState) String() string {
 
 type RateLimiterOption func(*ProviderRateLimiter)
 
-func WithSignalBus(bus *signal.SignalBus) RateLimiterOption {
+func WithSignalBus(bus signal.SignalBusInterface) RateLimiterOption {
 	return func(r *ProviderRateLimiter) {
 		r.signalBus = bus
 	}
@@ -57,7 +57,7 @@ func WithSoftLimit(limit *UsageLimit) RateLimiterOption {
 	}
 }
 
-func NewProviderRateLimiter(provider string, softLimit *UsageLimit, bus *signal.SignalBus, opts ...RateLimiterOption) *ProviderRateLimiter {
+func NewProviderRateLimiter(provider string, softLimit *UsageLimit, bus signal.SignalBusInterface, opts ...RateLimiterOption) *ProviderRateLimiter {
 	r := &ProviderRateLimiter{
 		provider:    provider,
 		state:       RateLimitOK,
@@ -90,7 +90,7 @@ type ProviderRateLimiter struct {
 	periodStart  time.Time
 	softLimit    *UsageLimit
 
-	signalBus *signal.SignalBus
+	signalBus signal.SignalBusInterface
 }
 
 func (r *ProviderRateLimiter) OnResponse(statusCode int, headers http.Header) {

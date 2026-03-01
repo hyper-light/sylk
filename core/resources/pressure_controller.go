@@ -21,7 +21,7 @@ type FileHandleBudgetIntegration interface {
 type PressureControllerConfig struct {
 	MemoryLimit      int64
 	Caches           []EvictableCache
-	SignalBus        *signal.SignalBus
+	SignalBus        signal.SignalBusInterface
 	SpikeConfig      SpikeMonitorConfig
 	StateConfig      PressureStateConfig
 	Scheduler        PipelineScheduler
@@ -38,7 +38,7 @@ type PressureController struct {
 	evictor          *CacheEvictor
 	compactor        *ContextCompactor
 	suspender        *PipelineSuspender
-	signalBus        *signal.SignalBus
+	signalBus        signal.SignalBusInterface
 	goroutineBudget  GoroutineBudgetIntegration
 	fileHandleBudget FileHandleBudgetIntegration
 

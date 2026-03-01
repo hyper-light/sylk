@@ -56,9 +56,10 @@ func NewAuthRegistry(probe AuthProbe, publisher AuthPublisher, logger *slog.Logg
 // and publishes an AuthEvent reflecting current availability.
 func (r *AuthRegistry) NotifyCredentialChanged(providerType, authMethod string) {
 	available := r.probeAvailable(providerType)
+	method := normalizeMethod(authMethod)
 	event := AuthEvent{
 		ProviderType: providerType,
-		AuthMethod:   authMethod,
+		AuthMethod:   method,
 		Available:    available,
 		Timestamp:    time.Now(),
 	}
@@ -69,7 +70,7 @@ func (r *AuthRegistry) NotifyCredentialChanged(providerType, authMethod string) 
 
 	r.logger.Info("credential state changed",
 		"provider", providerType,
-		"method", authMethod,
+		"method", method,
 		"available", available)
 
 	if r.publisher != nil {
@@ -95,7 +96,7 @@ func (r *AuthRegistry) ProbeAll() {
 		if !available {
 			continue
 		}
-		method := LoadAuthPref(provider)
+		method := normalizeMethod(LoadAuthPref(provider))
 		if method == "" {
 			method = "api_key"
 		}
@@ -121,6 +122,18 @@ func (r *AuthRegistry) ProbeAll() {
 	}
 }
 
+// ActiveMethod returns the auth method currently active for the given
+// provider type. Returns "" if no credentials are known.
+func (r *AuthRegistry) ActiveMethod(providerType string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ev, ok := r.latest[providerType]
+	if !ok || !ev.Available {
+		return ""
+	}
+	return ev.AuthMethod
+}
+
 // probeAvailable checks whether credentials are available for the given
 // provider type using the configured probe function.
 func (r *AuthRegistry) probeAvailable(providerType string) bool {
@@ -128,4 +141,14 @@ func (r *AuthRegistry) probeAvailable(providerType string) bool {
 		return false
 	}
 	return r.probe(providerType)
+}
+
+// normalizeMethod maps login panel method labels to provider auth mode
+// constants. The login panel stores "apikey" (no underscore) but provider
+// configs use "api_key" (with underscore).
+func normalizeMethod(method string) string {
+	if method == "apikey" {
+		return "api_key"
+	}
+	return method
 }

@@ -2,49 +2,40 @@ package guide
 
 import "context"
 
-// rulePreemptThreshold is the minimum rule-classifier confidence at which
-// an unambiguous keyword match preempts the LLM classifier. Keywords at or
-// above this threshold (e.g. "hand it off" → IntentExecute at 0.90) are
-// authoritative signals that the LLM consistently misclassifies.
-const rulePreemptThreshold = 0.90
-
-// FallbackClassifier wraps a primary ClassifierService and a rule-based
-// fallback. Classification order:
-//  1. Rules first — if an unambiguous keyword match hits at >= rulePreemptThreshold,
-//     use it directly. This catches execution phrases the LLM misclassifies.
-//  2. LLM primary — for nuanced, context-dependent classification.
-//  3. Rules fallback — if the LLM returns an error (stale credentials, quota, etc.).
+// FallbackClassifier wraps a primary LLM ClassifierService and a rule-based
+// fallback. The LLM is always the primary classifier; rules exist only as a
+// graceful degradation path when the LLM API is unavailable (stale credentials,
+// quota exhaustion, timeout, etc.).
+//
+// Classification order:
+//  1. LLM primary — for nuanced, context-dependent classification.
+//  2. Rules fallback — if the LLM returns an error.
+//
+// Known LLM misclassification patterns should be fixed via the correction
+// memory (AddCorrection), which seeds examples into the LLM prompt, NOT via
+// keyword preemption rules.
 type FallbackClassifier struct {
 	primary  ClassifierService
 	fallback ClassifierService
 }
 
-// NewFallbackClassifier creates a classifier that tries high-confidence rules
-// first, then the LLM primary, then rules as a degraded fallback.
+// NewFallbackClassifier creates a classifier that tries the LLM primary first
+// and falls back to keyword rules only when the LLM is unavailable.
 func NewFallbackClassifier(primary, fallback ClassifierService) *FallbackClassifier {
 	return &FallbackClassifier{primary: primary, fallback: fallback}
 }
 
 func (c *FallbackClassifier) Classify(ctx context.Context, input string) (*ClassificationResult, error) {
-	// Fast path: high-confidence rule matches preempt the LLM.
-	// Execution keywords ("go ahead", "hand it off", "ship it") are
-	// unambiguous signals that the LLM consistently maps to IntentPlan.
-	ruleResult, ruleErr := c.fallback.Classify(ctx, input)
-	if ruleErr == nil && ruleResult != nil &&
-		ruleResult.Intent != IntentUnknown && ruleResult.Intent != IntentHelp &&
-		ruleResult.Confidence >= rulePreemptThreshold {
-		ruleResult.ClassificationMethod = "rule_preempt"
-		return ruleResult, nil
-	}
-
-	// Normal path: LLM classifier for nuanced intent detection.
+	// Primary path: LLM classifier for nuanced intent detection.
 	result, err := c.primary.Classify(ctx, input)
 	if err == nil {
 		return result, nil
 	}
 
-	// Degraded path: LLM failed, use whatever rules returned.
-	if ruleResult != nil && ruleErr == nil {
+	// Degraded path: LLM failed, fall back to keyword heuristics.
+	ruleResult, ruleErr := c.fallback.Classify(ctx, input)
+	if ruleErr == nil && ruleResult != nil {
+		ruleResult.ClassificationMethod = "rule_fallback"
 		return ruleResult, nil
 	}
 	return nil, err
@@ -55,7 +46,7 @@ func (c *FallbackClassifier) AddCorrection(correction CorrectionRecord) {
 }
 
 // RuleClassifierService implements ClassifierService using keyword heuristics
-// directly, without going through the Anthropic ClassifierClient adapter.
+// directly. Used only as a degraded fallback when the LLM API is unavailable.
 type RuleClassifierService struct{}
 
 func NewRuleClassifierService() *RuleClassifierService {

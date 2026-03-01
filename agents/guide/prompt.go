@@ -23,6 +23,8 @@ type ClassificationPromptRuntime struct {
 	ActiveConversationTurns  int
 	ActiveConversationAgeSec int
 	ActiveConversationScore  float64
+	PendingPlanID            string
+	PendingPlanAgent         string
 }
 
 // BuildClassificationPrompt composes prompt modules based on request content.
@@ -113,5 +115,34 @@ func classificationRuntimeSection(runtime *ClassificationPromptRuntime) string {
 	if score > 0 {
 		lines = append(lines, fmt.Sprintf("- active_conversation_score: %.2f", score))
 	}
+	if pendingSection := pendingPlanRuntimeSection(runtime); pendingSection != "" {
+		lines = append(lines, "", pendingSection)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func pendingPlanRuntimeSection(runtime *ClassificationPromptRuntime) string {
+	if runtime == nil {
+		return ""
+	}
+	planID := strings.TrimSpace(runtime.PendingPlanID)
+	planAgent := strings.TrimSpace(runtime.PendingPlanAgent)
+	if planID == "" && planAgent == "" {
+		return ""
+	}
+	lines := []string{
+		"## Pending Plan Approval",
+		"A plan from the architect is waiting for user approval.",
+	}
+	if planID != "" {
+		lines = append(lines, "- pending_plan_id: "+planID)
+	}
+	if planAgent != "" {
+		lines = append(lines, "- pending_plan_agent: "+planAgent)
+	}
+	lines = append(lines,
+		`Bare affirmatives ("yes", "ok", "sure", "lgtm", "go ahead") should be classified`,
+		`as intent=execute, domain=planning, target_agent=architect when a plan is pending.`,
+	)
 	return strings.Join(lines, "\n")
 }

@@ -30,7 +30,7 @@ If the request is compound, set `multi_intent=true` and include `sub_results`.
 2. Route Sylk meta/help questions to `guide`.
 3. Route agent-registry questions (for example “how many agents are registered”) to `guide` with `intent=”status”` and `domain=”system”`.
 4. Route status/health questions about Sylk routing behavior to `guide` unless clearly asking for active pipeline/task execution progress (then `orchestrator`).
-5. Route planning/design/work breakdown requests to `architect`.
+5. Route planning/design/building/work breakdown requests to `architect`.
 6. Route plan approval/execution requests ("go ahead", "execute", "hand it off", "proceed", "ship it", "kick it off", "run the plan") to `architect` with `intent="execute"`.
 7. Route codebase lookup/search questions to `librarian`.
 8. Route past-memory questions to `archivalist`.
@@ -70,6 +70,16 @@ When the user approves, confirms, or requests execution of a plan, route to `arc
 - "run the plan" → `architect`, `intent="execute"`, `domain="planning"`
 
 Do NOT classify these as `chat` or `plan` — they are explicit execution approvals.
+
+## Pending Plan Context
+When a `Pending Plan Approval` block is present in the system prompt:
+- Bare affirmatives ("yes", "ok", "sure", "lgtm", "okay") MUST route to the
+  `pending_plan_agent` with `intent="execute"`, `domain="planning"`.
+- Affirmatives with conditions ("yes, but...", "ok, however...") MUST route
+  to the `pending_plan_agent` with `intent="plan"`, `domain="planning"`.
+- Explicit negation ("no", "scrap it") MUST route to the `pending_plan_agent`
+  with `intent="plan"`, `domain="planning"`.
+- Off-topic messages should be routed normally, ignoring the pending plan.
 
 ## General Chat Default
 `guide` handles ONLY pure social conversation and Sylk meta questions. If the user mentions ANY concrete work, project, technology, or deliverable, it is NOT general chat.

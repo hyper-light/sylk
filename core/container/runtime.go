@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -11,6 +15,27 @@ import (
 	csecurity "github.com/adalundhe/sylk/core/container/security"
 	"github.com/google/uuid"
 )
+
+var (
+	runtimeDebugLog     *slog.Logger
+	runtimeDebugLogOnce sync.Once
+)
+
+func runtimeFileLog() *slog.Logger {
+	runtimeDebugLogOnce.Do(func() {
+		home, _ := os.UserHomeDir()
+		dir := filepath.Join(home, ".sylk", "logs")
+		_ = os.MkdirAll(dir, 0755)
+		f, err := os.OpenFile(filepath.Join(dir, "ui_events.log"),
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			runtimeDebugLog = slog.Default()
+			return
+		}
+		runtimeDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	})
+	return runtimeDebugLog
+}
 
 var (
 	ErrRuntimeClosed = errors.New("container runtime is closed")
@@ -117,7 +142,13 @@ func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpe
 		return nil, fmt.Errorf("quota: %w", err)
 	}
 
+	agentStart := time.Now()
+	runtimeFileLog().Info("DEBUG: runtime_create_agent_start", "agent_type", spec.AgentType)
 	agent, err := rt.createAgentForSpec(ctx, &spec)
+	runtimeFileLog().Info("DEBUG: runtime_create_agent_done",
+		"agent_type", spec.AgentType,
+		"elapsed_ms", time.Since(agentStart).Milliseconds(),
+		"error", err)
 	if err != nil {
 		return nil, fmt.Errorf("create agent: %w", err)
 	}

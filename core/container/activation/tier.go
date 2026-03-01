@@ -45,7 +45,13 @@ type ActivationEntry struct {
 	Spec            container.ContainerSpec
 	LastActive      atomic.Int64 // UnixNano timestamp
 	ActivationCount atomic.Int64
+	ActiveRequests  atomic.Int64 // in-flight requests holding demotion guard
 	Policy          *ActivationPolicy
+}
+
+// HasActiveRequests returns true if any request guard is currently held.
+func (e *ActivationEntry) HasActiveRequests() bool {
+	return e.ActiveRequests.Load() > 0
 }
 
 // LoadTier returns the current ActivationTier.

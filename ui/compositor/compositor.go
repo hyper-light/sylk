@@ -268,6 +268,37 @@ func (c *Compositor) TruncateSlot(id SlotID, maxLines int) {
 	c.slotLines[id] = truncated
 }
 
+// ResizeVerticalQuick updates frame geometry for a height-only resize without
+// marking any slots dirty or touching cached slot data. Sections are marked
+// dirty so Compose recomposes from stale caches at new positions. Because no
+// slot is dirty, the caller's renderDirtySlots pass is a no-op — zero panel
+// re-rendering occurs. A deferred settle message should trigger a full
+// SetStructure + re-render once resizing stops.
+func (c *Compositor) ResizeVerticalQuick(mainH, queueH, inputH, statusH int) {
+	// Slot caches are intentionally NOT truncated. slotLine returns "" for
+	// rows beyond cache length, and spliceVertical is guarded by
+	// idx < len(c.lines). On shrink, spliceMain reads only rows 0..mainH-1
+	// from the (longer) cached data — the visible top rows stay byte-identical.
+	// On grow, excess rows are empty strings filled on settle. This avoids
+	// TruncateSlot's bottom-border jump that causes visible jitter.
+
+	// Reallocate the frame line buffer and update section boundaries.
+	c.lines = make([]string, mainH+queueH+inputH+statusH)
+	c.mainH = mainH
+	c.queueStart = mainH
+	c.inputStart = mainH + queueH
+	c.statusStart = mainH + queueH + inputH
+
+	// Sections dirty for recomposition; slots NOT dirty (no re-rendering).
+	c.mainDirty = true
+	c.queueDirty = true
+	c.inputDirty = true
+	c.statusDirty = true
+
+	c.hasCache = false
+	c.joined = ""
+}
+
 // AllMainSlotsCached reports whether every column slot in the main area
 // has been rendered at least once. Used to guard incremental updates that
 // rely on cached side-panel output.

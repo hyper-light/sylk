@@ -49,7 +49,7 @@ func main() {
 	// unless you explicitly want to test the 3.1-pro-preview string.
 	cfg.RouterConfig.Model = "gemini-3.1-pro-preview"
 
-	g, err := guide.NewWithGeminiClient(client, cfg)
+	g, err := guide.NewWithProvider(client, "gemini-3.1-pro-preview", cfg)
 	if err != nil {
 		fmt.Printf("Failed to create Guide: %v\n", err)
 		os.Exit(1)

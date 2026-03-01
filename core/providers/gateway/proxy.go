@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"time"
 
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -46,12 +47,32 @@ func (p *GatewayProvider) HealthCheck(ctx context.Context) error { return p.inne
 
 // Complete performs a non-streaming completion through the gateway.
 func (p *GatewayProvider) Complete(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error) {
+	admitStart := time.Now()
+	p.gateway.logger.Info("DEBUG: gateway_admit_start",
+		"gateway", p.gateway.config.Name,
+		"priority", p.priority,
+		"inflight", p.gateway.inflight.Load(),
+		"max_inflight", p.gateway.maxInflight,
+		"model", req.Model,
+		"skip_skills", req.SkipProviderSkills)
 	if err := p.gateway.Admit(ctx, p.priority); err != nil {
+		p.gateway.logger.Info("DEBUG: gateway_admit_failed",
+			"gateway", p.gateway.config.Name,
+			"elapsed_ms", time.Since(admitStart).Milliseconds(),
+			"error", err)
 		return nil, err
 	}
+	p.gateway.logger.Info("DEBUG: gateway_admit_ok",
+		"gateway", p.gateway.config.Name,
+		"elapsed_ms", time.Since(admitStart).Milliseconds())
 
 	ctx = p.injectRetryObserver(ctx)
+	completeStart := time.Now()
 	resp, err := p.inner.Complete(ctx, req)
+	p.gateway.logger.Info("DEBUG: gateway_complete_done",
+		"gateway", p.gateway.config.Name,
+		"elapsed_ms", time.Since(completeStart).Milliseconds(),
+		"error", err)
 	p.gateway.Release(err)
 	p.detect429(err)
 	return resp, err

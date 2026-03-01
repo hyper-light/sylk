@@ -84,22 +84,18 @@ func classifyByRules(input string) (Intent, Domain, string, float64) {
 	if containsClassifierKeyword(query, "hello", "hi", "hey", "how are you", "thanks") {
 		return IntentChat, DomainGeneral, "guide", 0.92
 	}
-	if containsClassifierKeyword(query, "agent", "registry", "status", "health", "guide", "sylk") {
+	if containsClassifierKeyword(query, "agent", "registry", "status", "health", "guide") {
 		return IntentStatus, DomainSystem, "guide", 0.9
 	}
-	if containsClassifierKeyword(query, "go ahead", "execute", "hand off", "handoff",
-		"ship it", "run the plan", "proceed with", "kick it off") {
-		return IntentExecute, DomainPlanning, "architect", 0.90
-	}
 	if containsClassifierKeyword(query, "plan", "architecture", "break down", "decompose",
-		"strategy", "workflow", "coordinate", "orchestrate") {
+		"strategy", "workflow", "coordinate", "orchestrate", "build") {
 		return IntentPlan, DomainPlanning, "architect", 0.88
 	}
 	if containsClassifierKeyword(query, "design", "ui", "ux", "layout", "component",
 		"visual", "style", "css", "mockup", "wireframe") {
 		return IntentDesign, DomainDesign, "designer", 0.85
 	}
-	if containsClassifierKeyword(query, "implement", "build", "write", "refactor",
+	if containsClassifierKeyword(query, "implement", "write", "refactor",
 		"function", "class", "method", "fix bug", "add feature", "engineer") {
 		return IntentDeclare, DomainLocal, "engineer", 0.85
 	}
