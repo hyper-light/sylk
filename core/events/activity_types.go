@@ -48,6 +48,12 @@ const (
 	// Outcome events
 	EventTypeSuccess EventType = 15
 	EventTypeFailure EventType = 16
+
+	// Steering events
+	EventTypeSteeringInject     EventType = 19
+	EventTypeSteeringEdit       EventType = 20
+	EventTypeSteeringRollback   EventType = 21
+	EventTypeSteeringCheckpoint EventType = 22
 )
 
 // ValidEventTypes returns all valid EventType values.
@@ -72,6 +78,10 @@ func ValidEventTypes() []EventType {
 		EventTypeContextRestore,
 		EventTypeSuccess,
 		EventTypeFailure,
+		EventTypeSteeringInject,
+		EventTypeSteeringEdit,
+		EventTypeSteeringRollback,
+		EventTypeSteeringCheckpoint,
 	}
 }
 
