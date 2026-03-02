@@ -305,13 +305,13 @@ func archivalistRequestSkill(o *Orchestrator) *skills.Skill {
 
 func readPlanFileSkill(o *Orchestrator) *skills.Skill {
 	return skills.NewSkill("read_plan_file").
-		Description("Read an architect plan file for crash recovery or execution context. Restricted to .sylk/plans/*.md files only — path traversal is blocked.").
+		Description("Read an architect plan file for crash recovery or execution context. Restricted to .sylk/sessions/*/plans/*.md files only — path traversal is blocked.").
 		Domain("orchestration").
 		Keywords("plan", "read", "file", "crash", "recovery").
 		Priority(70).
-		Usage("Use during crash recovery to reload the architect's plan context, or when you need to verify the plan associated with a running DAG. The path must be under .sylk/plans/ and end with .md. Paths containing '..' are rejected.").
-		StringParam("file_path", "Path to plan file (must be under .sylk/plans/ and end with .md)", true).
-		Example(`{"file_path": ".sylk/plans/plan_abc123.md"}`).
+		Usage("Use during crash recovery to reload the architect's plan context, or when you need to verify the plan associated with a running DAG. The path must be under .sylk/sessions/<session_id>/plans/ and end with .md. Paths containing '..' are rejected.").
+		StringParam("file_path", "Path to plan file (must be under .sylk/sessions/<session_id>/plans/ and end with .md)", true).
+		Example(`{"file_path": ".sylk/sessions/default/plans/add_user_auth_abc123.md"}`).
 		BestPractice("Never construct file_path from untrusted input — always use plan IDs from known DAG executions or workflow state.").
 		BestPractice("If the file is not found, the plan may have been cleaned up — check the DAG execution store for the plan_json snapshot instead.").
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
@@ -324,7 +324,7 @@ func readPlanFileSkill(o *Orchestrator) *skills.Skill {
 
 			cleaned := filepath.Clean(params.FilePath)
 			if !isValidPlanPath(cleaned) {
-				return nil, fmt.Errorf("access denied: path must be under .sylk/plans/ and end with .md")
+				return nil, fmt.Errorf("access denied: path must be under .sylk/sessions/*/plans/ and end with .md")
 			}
 
 			data, err := os.ReadFile(cleaned)
@@ -336,7 +336,7 @@ func readPlanFileSkill(o *Orchestrator) *skills.Skill {
 		Build()
 }
 
-// isValidPlanPath validates that a path targets .sylk/plans/*.md with no traversal.
+// isValidPlanPath validates that a path targets .sylk/sessions/*/plans/*.md with no traversal.
 func isValidPlanPath(cleaned string) bool {
 	if !strings.HasSuffix(cleaned, ".md") {
 		return false
@@ -344,7 +344,7 @@ func isValidPlanPath(cleaned string) bool {
 	if strings.Contains(cleaned, "..") {
 		return false
 	}
-	return strings.Contains(cleaned, ".sylk/plans/") || strings.HasPrefix(cleaned, ".sylk/plans/")
+	return strings.Contains(cleaned, ".sylk/sessions/") && strings.Contains(cleaned, "/plans/")
 }
 
 func escalateToArchitectSkill(o *Orchestrator) *skills.Skill {

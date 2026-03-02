@@ -93,10 +93,16 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 		Timestamp: time.Now(),
 	}
 
-	// Activate target agent if demoted/cold.
+	// Activate target agent if demoted/cold. Pipeline-wide activation
+	// happens in DAGBridge.Execute; this is a per-node safety net.
 	if d.activator != nil {
 		if err := d.activator.EnsureActive(ctx, node.AgentType()); err != nil {
 			return nil, fmt.Errorf("activate %s for node %s: %w", node.AgentType(), node.ID(), err)
+		}
+		for _, co := range node.CoAgents() {
+			if err := d.activator.EnsureActive(ctx, co); err != nil {
+				return nil, fmt.Errorf("activate co-agent %s for node %s: %w", co, node.ID(), err)
+			}
 		}
 	}
 

@@ -601,7 +601,7 @@ func (a *Architect) persistPlanSnapshot(plan *DesignPlan) error {
 	if err != nil {
 		return err
 	}
-	return a.persistEncodedPlanSnapshot(plan.ID, encoded)
+	return a.persistEncodedPlanSnapshot(plan.ID, plan.SessionID, encoded)
 }
 
 func (a *Architect) marshalPlanSnapshot(plan *DesignPlan) ([]byte, error) {
@@ -611,11 +611,11 @@ func (a *Architect) marshalPlanSnapshot(plan *DesignPlan) ([]byte, error) {
 	return json.MarshalIndent(plan, "", "  ")
 }
 
-func (a *Architect) persistEncodedPlanSnapshot(planID string, encoded []byte) error {
+func (a *Architect) persistEncodedPlanSnapshot(planID, sessionID string, encoded []byte) error {
 	if a == nil || strings.TrimSpace(planID) == "" || len(encoded) == 0 {
 		return nil
 	}
-	dir := a.planStoreDir()
+	dir := a.planStoreDir(sessionID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -631,12 +631,15 @@ func (a *Architect) persistEncodedPlanSnapshot(planID string, encoded []byte) er
 	return os.Rename(tmpPath, finalPath)
 }
 
-func (a *Architect) planStoreDir() string {
+func (a *Architect) planStoreDir(sessionID string) string {
 	base := a.config.WorkingDirectory
 	if strings.TrimSpace(base) == "" {
 		base = "."
 	}
-	return filepath.Join(base, ".sylk", "architect", "plans")
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = "default"
+	}
+	return filepath.Join(base, ".sylk", "sessions", sessionID, "agents", "architect", "plans")
 }
 
 // restoreMaxAge is the maximum age of a persisted plan eligible for restore.
@@ -648,8 +651,12 @@ const restoreMaxAge = 24 * time.Hour
 const restoreMaxPlans = 32
 
 func (a *Architect) restorePersistedPlans() error {
-	dir := a.planStoreDir()
-	entries, err := os.ReadDir(dir)
+	base := a.config.WorkingDirectory
+	if strings.TrimSpace(base) == "" {
+		base = "."
+	}
+	sessionsDir := filepath.Join(base, ".sylk", "sessions")
+	sessionEntries, err := os.ReadDir(sessionsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -659,28 +666,37 @@ func (a *Architect) restorePersistedPlans() error {
 	cutoff := time.Now().Add(-restoreMaxAge)
 	restored := 0
 	skipped := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+	for _, sessionEntry := range sessionEntries {
+		if !sessionEntry.IsDir() {
 			continue
 		}
-		if restored >= restoreMaxPlans {
-			// Delete files beyond the cap to prevent unbounded disk growth.
-			_ = os.Remove(filepath.Join(dir, entry.Name()))
-			skipped++
+		planDir := filepath.Join(sessionsDir, sessionEntry.Name(), "agents", "architect", "plans")
+		entries, readErr := os.ReadDir(planDir)
+		if readErr != nil {
 			continue
 		}
-		path := filepath.Join(dir, entry.Name())
-		if ok, restoreErr := a.restorePlanFromFile(path, cutoff); restoreErr != nil {
-			a.logger.Warn("failed to restore plan", "path", path, "error", restoreErr)
-			continue
-		} else if ok {
-			restored++
-		} else {
-			skipped++
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			if restored >= restoreMaxPlans {
+				_ = os.Remove(filepath.Join(planDir, entry.Name()))
+				skipped++
+				continue
+			}
+			path := filepath.Join(planDir, entry.Name())
+			if ok, restoreErr := a.restorePlanFromFile(path, cutoff); restoreErr != nil {
+				a.logger.Warn("failed to restore plan", "path", path, "error", restoreErr)
+				continue
+			} else if ok {
+				restored++
+			} else {
+				skipped++
+			}
 		}
 	}
 	a.logInfo("restorePersistedPlans: done",
-		"dir", dir, "restored", restored, "skipped", skipped)
+		"sessions_dir", sessionsDir, "restored", restored, "skipped", skipped)
 	return nil
 }
 

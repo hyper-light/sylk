@@ -3216,6 +3216,15 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 
 		return g.publishResponseToSource(pending.SourceAgentID, resp)
 	case MessageTypeStream:
+		// Relay guard: messages already relayed by the Guide carry a marker.
+		// Processing them again creates a self-loop when the target's
+		// response channel also has a Guide subscriber.
+		if msg.Metadata != nil {
+			if _, relayed := msg.Metadata["_guide_relayed"]; relayed {
+				return nil
+			}
+		}
+
 		streamResp, ok := msg.GetStreamResponse()
 		if !ok {
 			return fmt.Errorf("invalid stream response payload")
@@ -3645,6 +3654,7 @@ func (g *Guide) publishStreamToSource(sourceAgentID string, resp *StreamResponse
 		Status:        messaging.StatusQueued,
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
+		Metadata:      map[string]any{"_guide_relayed": true},
 	}
 	topic := g.agentResponseTopic(sourceAgentID)
 	err := g.bus.Publish(topic, msg)

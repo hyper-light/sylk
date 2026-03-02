@@ -45,7 +45,7 @@ func (a *Architect) publishRerouteRequest(reason, originalInput, suggestedTarget
 	reroute := &guide.RerouteRequest{
 		OriginalInput:   originalInput,
 		Reason:          reason,
-		SourceAgentID:   "architect",
+		SourceAgentID:   a.id,
 		SuggestedTarget: suggestedTarget,
 		ExcludeAgents:   []string{"architect"},
 	}

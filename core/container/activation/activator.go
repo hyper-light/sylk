@@ -24,3 +24,12 @@ func (a *ControllerActivator) EnsureActive(ctx context.Context, agentType string
 func (a *ControllerActivator) TouchActivity(agentType string) {
 	a.ctrl.TouchActivity(agentType)
 }
+
+// HoldActive activates the agent and acquires a request guard that prevents
+// idle demotion while held. Returns an idempotent release function.
+func (a *ControllerActivator) HoldActive(ctx context.Context, agentType string) (func(), error) {
+	if _, err := a.ctrl.EnsureActive(ctx, agentType); err != nil {
+		return func() {}, err
+	}
+	return a.ctrl.AcquireRequestGuard(agentType), nil
+}

@@ -511,6 +511,7 @@ type PlanTodo struct {
 type PlanModeState struct {
 	SessionID        string
 	PlanID           string
+	PlanName         string
 	Enabled          bool
 	AwaitingApproval bool
 	PlanFile         string
@@ -544,6 +545,7 @@ type PlanHandoff struct {
 	TotalTokens     int                   `json:"total_tokens"`
 	RiskSummary     []string              `json:"risk_summary,omitempty"`
 	Trigger         string                `json:"trigger"` // "user-approved" | "auto"
+	PlanFile        string                `json:"plan_file,omitempty"`
 	Timestamp       time.Time             `json:"timestamp"`
 	Architecture    *SolutionArchitecture `json:"architecture,omitempty"`
 	Requirements    *Requirements         `json:"requirements,omitempty"`

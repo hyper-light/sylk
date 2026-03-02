@@ -43,4 +43,4 @@ Generate a summary via `generate_summary` and submit to archivalist.
 Health checks run deterministically every 10s via the HealthMonitor. Results are cached in a hot cache and forwarded to Archivalist for history. Critical transitions auto-escalate to the architect. Use `query_agent_health` to read cached results and `query_health_history` for historical data.
 
 ### Architect plan changes
-Read plan files via `read_plan_file` to maintain awareness of current execution context.
+Read plan files via `read_plan_file` to maintain awareness of current execution context. Plan files are stored under `.sylk/sessions/<session_id>/plans/`.

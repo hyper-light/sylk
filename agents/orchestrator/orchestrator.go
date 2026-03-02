@@ -328,6 +328,17 @@ func (o *Orchestrator) SetActivator(a guide.AgentActivator) {
 	}
 }
 
+// SetRegistrar installs the pipeline registrar, threading it to the DAG
+// bridge so PipelinePods can register activated agents with the Guide.
+func (o *Orchestrator) SetRegistrar(fn PipelineRegistrar) {
+	if o.dagBridge != nil {
+		o.dagBridge.SetRegistrar(fn)
+	}
+	if o.logger != nil {
+		o.dagBridge.SetLogger(o.logger)
+	}
+}
+
 // SetSessionVFS associates a SessionVFS with the given session. Called when
 // the Orchestrator creates a new session's CVS infrastructure.
 func (o *Orchestrator) SetSessionVFS(sessionID string, svfs *versioning.SessionVFS) {
@@ -891,9 +902,20 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		Data:     map[string]any{"task_id": taskID, "agent_id": agentID, "workflow_id": workflowID},
 	})
 
-	// Publish pipeline agent activity so the TUI panel shows the agent.
+	// Publish pipeline agent activity so the TUI panel shows ALL pipeline agents.
 	if nodeID != "" && agentType != "" {
 		o.publishPipelineAgentActivity(agentType, dagID, nodeID, taskID)
+
+		if coAgents, ok := data["co_agents"].([]any); ok {
+			for _, co := range coAgents {
+				if coType, ok := co.(string); ok {
+					o.publishPipelineAgentActivity(coType, dagID, nodeID, taskID)
+				}
+			}
+		}
+
+		o.publishPipelineAgentActivity("inspector-pipeline", dagID, nodeID, taskID)
+		o.publishPipelineAgentActivity("tester-pipeline", dagID, nodeID, taskID)
 	}
 
 	// Route to containerized pipeline agent for DAG-originated dispatches.

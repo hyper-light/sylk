@@ -17,6 +17,11 @@ type subscription struct {
 	handler GitEventHandler
 }
 
+// PreMutationGate is called before mutating git operations. If it returns
+// a non-nil error, the operation is blocked. Used by the Guardian agent
+// to gate protected-branch mutations behind user approval.
+type PreMutationGate func(op GitOp, params any) error
+
 // GitBus wraps a GitClient, routing every operation through a centralised
 // dispatch that emits pre/post events to subscribers.
 type GitBus struct {
@@ -25,6 +30,9 @@ type GitBus struct {
 	mu     sync.RWMutex
 	subs   map[uint64]subscription
 	nextID atomic.Uint64
+
+	gateMu sync.RWMutex
+	gate   PreMutationGate
 }
 
 // NewGitBus creates a bus that wraps the given client.
@@ -38,6 +46,29 @@ func NewGitBus(client *GitClient) *GitBus {
 // Client returns the underlying GitClient for direct access when the bus
 // abstraction is not needed (e.g. StatusWatcher construction).
 func (b *GitBus) Client() *GitClient { return b.client }
+
+// SetPreMutationGate installs a gate that is called before mutating operations.
+// Pass nil to remove the gate.
+func (b *GitBus) SetPreMutationGate(gate PreMutationGate) {
+	b.gateMu.Lock()
+	b.gate = gate
+	b.gateMu.Unlock()
+}
+
+// checkGate invokes the pre-mutation gate for mutating operations.
+// Returns nil if no gate is set or the operation is non-mutating.
+func (b *GitBus) checkGate(op GitOp, params any) error {
+	if !IsMutating(op) {
+		return nil
+	}
+	b.gateMu.RLock()
+	gate := b.gate
+	b.gateMu.RUnlock()
+	if gate == nil {
+		return nil
+	}
+	return gate(op, params)
+}
 
 // Subscribe registers a handler for specific ops.
 // Pass nil for ops to subscribe to all operations (wildcard).
@@ -108,6 +139,10 @@ func (b *GitBus) hasSubscribers() bool {
 
 // dispatch handles (R, error) returns — covers the majority of methods.
 func dispatch[R any](b *GitBus, op GitOp, params any, fn func() (R, error)) (R, error) {
+	if err := b.checkGate(op, params); err != nil {
+		var zero R
+		return zero, err
+	}
 	if !b.hasSubscribers() {
 		return fn()
 	}
@@ -124,6 +159,9 @@ func dispatch[R any](b *GitBus, op GitOp, params any, fn func() (R, error)) (R, 
 
 // dispatchVoid handles error-only returns — covers mutating void methods.
 func dispatchVoid(b *GitBus, op GitOp, params any, fn func() error) error {
+	if err := b.checkGate(op, params); err != nil {
+		return err
+	}
 	if !b.hasSubscribers() {
 		return fn()
 	}

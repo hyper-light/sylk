@@ -168,6 +168,17 @@ func (s *SessionStore) CreateNamed(sessionID uint32, stringID string, baseSnapsh
 		filepath.Join(sessionPath, "data", "vectors"),
 		filepath.Join(sessionPath, "data", "docs"),
 		filepath.Join(sessionPath, "data", "chunks"),
+		filepath.Join(sessionPath, "plans"),
+		filepath.Join(sessionPath, "agents", "architect", "plans"),
+	}
+
+	// Per-agent WAL directories for session-scoped event journals.
+	agentWALNames := []string{
+		"guide", "orchestrator", "architect", "engineer", "designer",
+		"guardian", "inspector", "tester", "librarian", "academic", "archivalist",
+	}
+	for _, name := range agentWALNames {
+		dirs = append(dirs, filepath.Join(sessionPath, "agents", name, "wal"))
 	}
 
 	for _, dir := range dirs {

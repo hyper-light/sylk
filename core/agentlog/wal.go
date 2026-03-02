@@ -138,3 +138,9 @@ func copyRecord(src slog.Record) slog.Record {
 	})
 	return dst
 }
+
+// ResolveSessionWALDir returns the per-agent WAL directory within a session.
+// Layout: <sessionDir>/agents/<agentName>/wal/
+func ResolveSessionWALDir(sessionDir, agentName string) string {
+	return filepath.Join(sessionDir, "agents", normalizeAgentID(agentName), "wal")
+}

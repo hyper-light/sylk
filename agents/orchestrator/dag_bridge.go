@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -49,6 +50,7 @@ type ActiveDAGMeta struct {
 	SessionID  string
 	Revision   int
 	Dispatcher *BusNodeDispatcher
+	Pod        *PipelinePod
 	CancelFunc context.CancelFunc
 	Unsub      func()
 	StartedAt  time.Time
@@ -65,8 +67,10 @@ type DAGBridge struct {
 	scope     *concurrency.GoroutineScope
 	config    DAGBridgeConfig
 	activator guide.AgentActivator
+	registrar PipelineRegistrar
 	sessionID string
 	agentID   string
+	logger    *slog.Logger
 
 	activityPub events.ActivityPublisher
 	activeDAGs  map[string]*ActiveDAGMeta
@@ -118,6 +122,21 @@ func (b *DAGBridge) SetActivator(a guide.AgentActivator) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.activator = a
+}
+
+// SetRegistrar sets the pipeline registrar that registers activated agents
+// with the Guide's routing layer.
+func (b *DAGBridge) SetRegistrar(fn PipelineRegistrar) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.registrar = fn
+}
+
+// SetLogger sets the structured logger for pipeline pod diagnostics.
+func (b *DAGBridge) SetLogger(l *slog.Logger) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.logger = l
 }
 
 // Execute builds/receives a DAG from a plan, journals, persists, and submits to the scheduler.
@@ -173,7 +192,38 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.activeDAGs[d.ID()].Unsub = unsub
 	b.mu.Unlock()
 
-	// 6. Submit to scheduler (async execution)
+	// 6. Activate every agent the DAG requires via PipelinePod.
+	//    The pod acquires demotion guards that keep agents hot for
+	//    the pipeline's entire duration. Activation is fatal — a
+	//    pipeline cannot execute with missing agents.
+	b.mu.RLock()
+	activator := b.activator
+	registrar := b.registrar
+	logger := b.logger
+	b.mu.RUnlock()
+
+	pod := NewPipelinePod(PipelinePodConfig{
+		DAGID:     d.ID(),
+		Activator: activator,
+		Registrar: registrar,
+		Logger:    logger,
+	})
+	if activator != nil {
+		if err := pod.Activate(ctx, d); err != nil {
+			dagCancel()
+			b.mu.Lock()
+			delete(b.activeDAGs, d.ID())
+			b.mu.Unlock()
+			b.journal.LogDAGAbort(d.ID(), err.Error())
+			b.store.UpdateDAGState(d.ID(), "failed", err.Error())
+			return "", fmt.Errorf("dag bridge: activate agents: %w", err)
+		}
+	}
+	b.mu.Lock()
+	b.activeDAGs[d.ID()].Pod = pod
+	b.mu.Unlock()
+
+	// 7. Submit to scheduler (async execution)
 	_, err := b.scheduler.Submit(dagCtx, d, dispatcher)
 	if err != nil {
 		dagCancel()
@@ -192,19 +242,22 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 func (b *DAGBridge) Cancel(dagID, reason string) error {
 	b.mu.Lock()
 	meta, ok := b.activeDAGs[dagID]
+	delete(b.activeDAGs, dagID)
 	b.mu.Unlock()
 
 	if !ok {
 		return b.scheduler.Cancel(dagID)
 	}
 
+	if meta.Pod != nil {
+		meta.Pod.Release()
+	}
+	if meta.Unsub != nil {
+		meta.Unsub()
+	}
 	meta.CancelFunc()
 	b.journal.LogDAGCancel(dagID, reason)
 	b.store.UpdateDAGState(dagID, "cancelled", reason)
-
-	b.mu.Lock()
-	delete(b.activeDAGs, dagID)
-	b.mu.Unlock()
 
 	return nil
 }
@@ -317,6 +370,9 @@ func (b *DAGBridge) Close() error {
 	b.mu.Unlock()
 
 	for _, meta := range remaining {
+		if meta.Pod != nil {
+			meta.Pod.Release()
+		}
 		if meta.Unsub != nil {
 			meta.Unsub()
 		}
@@ -406,7 +462,13 @@ func (b *DAGBridge) cleanupDAG(dagID string) {
 	delete(b.gates, dagID)
 	b.mu.Unlock()
 
-	if meta != nil && meta.Unsub != nil {
+	if meta == nil {
+		return
+	}
+	if meta.Pod != nil {
+		meta.Pod.Release()
+	}
+	if meta.Unsub != nil {
 		meta.Unsub()
 	}
 }

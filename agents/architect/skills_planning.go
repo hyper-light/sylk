@@ -12,6 +12,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/storage"
 	"github.com/google/uuid"
 )
 
@@ -390,7 +391,7 @@ func (a *Architect) persistDeclaration(plan *DesignPlan, declaration *PreDelegat
 		a.logger.Warn("failed to encode declaration plan snapshot", "plan_id", snapshotID, "error", encodeError)
 		return
 	}
-	if err := a.persistEncodedPlanSnapshot(snapshotID, encoded); err != nil {
+	if err := a.persistEncodedPlanSnapshot(snapshotID, plan.SessionID, encoded); err != nil {
 		a.logger.Warn("failed to persist declaration plan snapshot", "plan_id", snapshotID, "error", err)
 	}
 }
@@ -402,7 +403,7 @@ func (a *Architect) publishDeclaration(declaration *PreDelegationDeclaration, se
 	req := &guide.RouteRequest{
 		CorrelationID: "decl_" + uuid.NewString(),
 		Input:         "store pre-delegation declaration",
-		SourceAgentID: "architect",
+		SourceAgentID: a.id,
 		TargetAgentID: "archivalist",
 		FireAndForget: true,
 		SessionID:     sessionID,
@@ -516,6 +517,7 @@ func buildPlanHandoff(plan *DesignPlan, trigger string) *PlanHandoff {
 		TotalTokens:     totalTokens,
 		RiskSummary:     plan.RiskSummary,
 		Trigger:         trigger,
+		PlanFile:        plan.PlanFile,
 		Timestamp:       time.Now(),
 		Architecture:    plan.Architecture,
 		Requirements:    plan.Requirements,
@@ -629,7 +631,7 @@ func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates m
 		a.logger.Warn("failed to encode revised plan snapshot", "plan_id", snapshotID, "error", encodeError)
 		return current
 	}
-	if err := a.persistEncodedPlanSnapshot(snapshotID, encoded); err != nil {
+	if err := a.persistEncodedPlanSnapshot(snapshotID, current.SessionID, encoded); err != nil {
 		a.logger.Warn("failed to persist revised plan snapshot", "plan_id", snapshotID, "error", err)
 	}
 	return current
@@ -747,7 +749,7 @@ func (a *Architect) attachFixWorkflow(planID string, workflow *WorkflowDAG, task
 		a.logger.Warn("failed to encode fix workflow snapshot", "plan_id", currentID, "error", encodeError)
 		return currentID
 	}
-	if err := a.persistEncodedPlanSnapshot(currentID, encoded); err != nil {
+	if err := a.persistEncodedPlanSnapshot(currentID, current.SessionID, encoded); err != nil {
 		a.logger.Warn("failed to persist fix workflow snapshot", "plan_id", currentID, "error", err)
 	}
 	return currentID
@@ -840,7 +842,7 @@ func (a *Architect) applyInterruptAction(plan *DesignPlan, action string, reason
 		a.logger.Warn("failed to encode interrupted plan snapshot", "plan_id", snapshotID, "error", encodeError)
 		return current
 	}
-	if err := a.persistEncodedPlanSnapshot(snapshotID, encoded); err != nil {
+	if err := a.persistEncodedPlanSnapshot(snapshotID, current.SessionID, encoded); err != nil {
 		a.logger.Warn("failed to persist interrupted plan snapshot", "plan_id", snapshotID, "error", err)
 	}
 	return current
@@ -980,10 +982,13 @@ func planModeSkill(a *Architect) *skills.Skill {
 
 func (a *Architect) enterPlanMode(sessionID string, planFile string, taskDescription string) *PlanModeState {
 	normalizedSession := normalizeSessionID(sessionID)
-	resolvedFile := resolvePlanFile(a.config.WorkingDirectory, normalizedSession, planFile)
+	planID := uuid.NewString()
+	resolvedFile := resolvePlanFile(a.config.WorkingDirectory, normalizedSession, taskDescription, planID, planFile)
 	_ = ensurePlanFileExists(resolvedFile, taskDescription)
 	mode := &PlanModeState{
 		SessionID:        normalizedSession,
+		PlanID:           planID,
+		PlanName:         taskDescription,
 		Enabled:          true,
 		AwaitingApproval: false,
 		PlanFile:         resolvedFile,
@@ -1002,15 +1007,19 @@ func normalizeSessionID(sessionID string) string {
 	return sessionID
 }
 
-func resolvePlanFile(workDir string, sessionID string, planFile string) string {
+func resolvePlanFile(workDir, sessionID, planName, planID, planFile string) string {
 	if strings.TrimSpace(planFile) != "" {
 		if filepath.IsAbs(planFile) {
 			return planFile
 		}
 		return filepath.Join(workDir, planFile)
 	}
-	name := fmt.Sprintf("%s_plan.md", sessionID)
-	return filepath.Join(workDir, ".sylk", "plans", name)
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = "default"
+	}
+	planSlug := storage.Slug(planName)
+	fileName := fmt.Sprintf("%s_%s.md", planSlug, planID)
+	return filepath.Join(workDir, ".sylk", "sessions", sessionID, "plans", fileName)
 }
 
 func ensurePlanFileExists(path string, taskDescription string) error {

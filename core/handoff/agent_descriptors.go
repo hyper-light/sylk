@@ -74,5 +74,6 @@ func defaultDescriptors() []AgentDescriptor {
 		{AgentType: "inspector-pipeline", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryPipeline},
 		{AgentType: "tester", ModelID: "gpt-5.3-codex", ReasoningEffort: "xhigh", ContextWindow: contextWindow200K, Category: CategoryStandalone},
 		{AgentType: "tester-pipeline", ModelID: "gpt-5.3-codex", ReasoningEffort: "xhigh", ContextWindow: contextWindow200K, Category: CategoryPipeline},
+		{AgentType: "guardian", ModelID: "gpt-5.3-codex", ReasoningEffort: "high", ContextWindow: contextWindow200K, Category: CategoryStandalone},
 	}
 }

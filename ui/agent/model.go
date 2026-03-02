@@ -1220,6 +1220,13 @@ func (m *Model) SetEngagedAgent(agentID string) {
 	m.userSelected = false
 }
 
+// LockSelection prevents auto-follow from moving the selection until
+// the next SetEngagedAgent call resets it. Used during interrupt to
+// keep the panel stable on the agent the user was communicating with.
+func (m *Model) LockSelection() {
+	m.userSelected = true
+}
+
 // ClearEngagedAgent removes the current engagement, forcing full classification
 // on the next user message.
 func (m *Model) ClearEngagedAgent() {

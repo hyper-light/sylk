@@ -91,7 +91,7 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		return nil, fmt.Errorf("route request is required")
 	}
 	req.CorrelationID = ensureCorrelationID(req.CorrelationID)
-	req.SourceAgentID = "architect"
+	req.SourceAgentID = a.id
 	req.SourceAgentName = "architect"
 	req.Timestamp = time.Now()
 
@@ -149,7 +149,7 @@ func (a *Architect) publishRouteRequest(req *guide.RouteRequest) error {
 		return fmt.Errorf("route request is required")
 	}
 	req.CorrelationID = ensureCorrelationID(req.CorrelationID)
-	req.SourceAgentID = "architect"
+	req.SourceAgentID = a.id
 	req.SourceAgentName = "architect"
 	if req.Timestamp.IsZero() {
 		req.Timestamp = time.Now()

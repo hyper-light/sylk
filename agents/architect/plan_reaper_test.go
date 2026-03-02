@@ -96,7 +96,7 @@ func TestReaper_RemoveDiskFile(t *testing.T) {
 		logger:    slog.Default(),
 	}
 
-	r.removeDiskFile(planID)
+	r.removeDiskFile(planID, "")
 
 	if _, err := os.Stat(planFile); !os.IsNotExist(err) {
 		t.Fatal("expected plan file to be removed")

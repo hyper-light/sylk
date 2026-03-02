@@ -18,6 +18,7 @@ import (
 	"github.com/adalundhe/sylk/agents/archivalist"
 	"github.com/adalundhe/sylk/agents/designer"
 	"github.com/adalundhe/sylk/agents/engineer"
+	"github.com/adalundhe/sylk/agents/guardian"
 	"github.com/adalundhe/sylk/agents/guide"
 	inspectorGlobal "github.com/adalundhe/sylk/agents/inspector/global"
 	inspectorPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
@@ -40,6 +41,7 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
+	"github.com/adalundhe/sylk/core/security"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/core/storage"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
@@ -281,10 +283,17 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// factory closures read it when the agent is first activated.
 	var actCtrlRef atomic.Pointer[activation.ActivationController]
 
+	// gitSubsRef holds git subsystem results for the Guardian factory
+	// closure. On initial boot (Phase 2), the git goroutine hasn't
+	// completed yet so the factory reads nil → Guardian starts without
+	// git. On daemon restart (reconciler-driven), the reference is
+	// populated → Guardian starts fully wired immediately.
+	var gitSubsRef atomic.Pointer[gitBootResult]
+
 	// Register agent creators. During initial boot, Guide/Orch factories
 	// call hydrateOnce.result() to wait for the shared hydration. After
 	// boot, daemon restarts read hydratedRef atomically (already stored).
-	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef)
+	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef, &gitSubsRef)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
 
@@ -309,6 +318,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 	guideCh := make(chan daemonContainerResult, 1)
 	orchCh := make(chan daemonContainerResult, 1)
+	guardianCh := make(chan daemonContainerResult, 1)
 	activationCh := make(chan activationCtrlResult, 1)
 	healthCh := make(chan error, 1)
 	fontCh := make(chan fontResult, 1)
@@ -354,6 +364,26 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 			return
 		}
 		orchCh <- daemonContainerResult{c: c}
+	}()
+
+	// B2: Guardian container (non-critical)
+	go func() {
+		spec, ok := daemonSpecMap["guardian"]
+		if !ok {
+			guardianCh <- daemonContainerResult{err: fmt.Errorf("no daemon spec for guardian")}
+			return
+		}
+		c, err := runtime.CreateContainer(ctx, spec, nil)
+		if err != nil {
+			guardianCh <- daemonContainerResult{err: err}
+			return
+		}
+		if err := runtime.StartContainer(ctx, c); err != nil {
+			_ = runtime.RemoveContainer(ctx, c)
+			guardianCh <- daemonContainerResult{err: err}
+			return
+		}
+		guardianCh <- daemonContainerResult{c: c}
 	}()
 
 	// C: ActivationController
@@ -413,6 +443,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		if sg, err := git.NewSafetyGuard(gc, result.bus, git.DefaultSafetyConfig(), result.watcher); err == nil {
 			result.guard = sg
 		}
+		gitSubsRef.Store(&result)
 		gitCh <- result
 	}()
 
@@ -445,17 +476,18 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	}()
 
 	// Collect results. Use select with nil-channel disabling to drain
-	// all 7 channels. Critical errors cancel remaining goroutines.
+	// all 8 channels. Critical errors cancel remaining goroutines.
 	var (
-		guideResult daemonContainerResult
-		orchResult  daemonContainerResult
-		actResult   activationCtrlResult
-		fontRes     fontResult
-		gitRes      gitBootResult
-		criticalErr error
+		guideResult    daemonContainerResult
+		orchResult     daemonContainerResult
+		guardianResult daemonContainerResult
+		actResult      activationCtrlResult
+		fontRes        fontResult
+		gitRes         gitBootResult
+		criticalErr    error
 	)
 
-	for completed := 0; completed < 7; completed++ {
+	for completed := 0; completed < 8; completed++ {
 		select {
 		case r := <-guideCh:
 			guideResult = r
@@ -472,6 +504,13 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				parallelCancel()
 			}
 			orchCh = nil
+
+		case r := <-guardianCh:
+			guardianResult = r
+			if r.err != nil {
+				slog.Warn("guardian container failed during parallel bootstrap", "error", r.err)
+			}
+			guardianCh = nil
 
 		case r := <-activationCh:
 			actResult = r
@@ -516,6 +555,9 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// periodic reconciler manages them going forward.
 	daemonCtrl.InjectInstance("guide", guideResult.c)
 	daemonCtrl.InjectInstance("orchestrator", orchResult.c)
+	if guardianResult.err == nil && guardianResult.c != nil {
+		daemonCtrl.InjectInstance("guardian", guardianResult.c)
+	}
 
 	slog.Info("bootstrap phase 2 complete", "elapsed", time.Since(phase2Start))
 
@@ -544,6 +586,16 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		return ui.Deps{}, nil, fmt.Errorf("register orchestrator: %w", err)
 	}
 
+	// Wire Guardian: extract from container, register with Guide, wire git subsystems.
+	if guardianResult.err == nil && guardianResult.c != nil {
+		if grd, grdErr := extractAgent[*guardian.Guardian](containerReg, "guardian"); grdErr == nil {
+			_ = registerAgentWithGuide(g, grd, "guardian")
+			if gitRes.bus != nil {
+				grd.SetGitSubsystems(gitRes.bus, gitRes.watcher)
+			}
+		}
+	}
+
 	// Pre-register routing metadata for all non-pipeline agents so the
 	// classifier can see them before their containers spin up.
 	preRegisterAgentRouting(g, identityReg)
@@ -552,6 +604,24 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	if activationCtrl != nil {
 		actCtrlRef.Store(activationCtrl)
 	}
+
+	// Adopt bootstrap daemon containers so their activation entries start
+	// at TierHot. Without this, EnsureActive sees TierCold and cold-starts
+	// a duplicate instance.
+	if activationCtrl != nil {
+		if _, err := activationCtrl.AdoptContainer("guide", guideResult.c); err != nil {
+			slog.Warn("adopt guide container", "error", err)
+		}
+		if _, err := activationCtrl.AdoptContainer("orchestrator", orchResult.c); err != nil {
+			slog.Warn("adopt orchestrator container", "error", err)
+		}
+		if guardianResult.err == nil && guardianResult.c != nil {
+			if _, err := activationCtrl.AdoptContainer("guardian", guardianResult.c); err != nil {
+				slog.Warn("adopt guardian container", "error", err)
+			}
+		}
+	}
+
 	var activator guide.AgentActivator
 	if activationCtrl != nil {
 		activator = activation.NewControllerActivator(activationCtrl)
@@ -601,6 +671,22 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		orch.SetActivator(activator)
 	}
 
+	// PipelineRegistrar: when a PipelinePod activates agents for a DAG,
+	// this callback extracts each agent from the container registry and
+	// registers its routing info with the Guide.
+	orch.SetRegistrar(func(ctx context.Context, agentType string) error {
+		containers := containerReg.ListByType(agentType)
+		if len(containers) == 0 {
+			return fmt.Errorf("no container for agent type %s after activation", agentType)
+		}
+		agent := containers[0].Agent()
+		router, ok := agent.(guide.AgentRouter)
+		if !ok {
+			return nil
+		}
+		return registerAgentWithGuide(g, router, agentType)
+	})
+
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 
 	// =================================================================
@@ -624,6 +710,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	seeds := []ui.AgentSeed{
 		{ID: "guide", AgentType: "guide", Name: "Guide"},
 		{ID: "architect", AgentType: "architect", Name: "Architect"},
+		{ID: "guardian", AgentType: "guardian", Name: "Guardian"},
 		{ID: "inspector", AgentType: "inspector", Name: "Inspector"},
 		{ID: "tester", AgentType: "tester", Name: "Tester"},
 	}
@@ -730,7 +817,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	phase4Remaining.Add(1)
 	_ = scope.Go("phase4-handoff-supervisor", 0, func(_ context.Context) error {
 		defer phase4Finish()
-		sup := bootstrapHandoffSupervisor(g, nil, orch, serviceReg)
+		sup := bootstrapHandoffSupervisor(g, nil, orch, serviceReg, containerReg, activationCtrl)
 		if sup != nil {
 			supervisorRef.Store(sup)
 		}
@@ -842,6 +929,7 @@ func registerAgentCreators(
 	anthropicGw *gateway.ProviderGateway,
 	openaiGw *gateway.ProviderGateway,
 	actCtrlRef *atomic.Pointer[activation.ActivationController],
+	gitSubsRef *atomic.Pointer[gitBootResult],
 ) {
 	// Guide — Gemini with rule-based fallback.
 	// First call blocks on hydrateOnce; subsequent calls (daemon restart)
@@ -867,6 +955,11 @@ func registerAgentCreators(
 			h = hydratedRef.Load()
 		}
 		return bootstrapOrchestrator(ctx, bus, actPub, projectRoot, h, googleGw)
+	})
+
+	// Guardian — safety sidecar daemon.
+	reg.Register("guardian", func(ctx context.Context) (container.ContainerAgent, error) {
+		return bootstrapGuardian(ctx, bus, actPub, projectRoot, openaiGw, gitSubsRef)
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
@@ -1380,6 +1473,59 @@ func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.Event
 	return a, nil
 }
 
+// bootstrapGuardian creates and starts a Guardian agent. Provider creation is
+// best-effort: when the OpenAI API key is missing the guardian starts in
+// degraded mode — deterministic safety checks still work, LLM-dependent
+// escalation paths return a clear error. Git subsystems are wired from the
+// atomic ref if available (daemon restart case); on initial boot they are
+// nil and wired later via SetGitSubsystems in Phase 3.
+func bootstrapGuardian(
+	ctx context.Context,
+	bus guide.EventBus,
+	actPub events.ActivityPublisher,
+	projectRoot string,
+	openaiGw *gateway.ProviderGateway,
+	gitSubsRef *atomic.Pointer[gitBootResult],
+) (*guardian.Guardian, error) {
+	openaiCfg := providers.OpenAIConfig{
+		BaseConfig: providers.BaseConfig{
+			Model:     "gpt-5.3-codex",
+			MaxTokens: 8192,
+		},
+		ReasoningEffort: "high",
+		AuthMode:        "api_key",
+	}
+	var wrapped providers.Provider
+	if p, err := providers.NewOpenAIProvider(ctx, openaiCfg); err != nil {
+		slog.Warn("guardian: OpenAI provider unavailable, LLM features disabled", "error", err)
+	} else {
+		wrapped = openaiGw.WrapProvider(p, gateway.PriorityValidation)
+	}
+
+	cfg := guardian.Config{
+		ActivityPub: actPub,
+		FileAccess:  versioning.NewDiskFileAccess(projectRoot, true),
+		Sanitizer:   security.NewSecretSanitizer(),
+	}
+
+	// Wire git subsystems from atomic ref (available on daemon restart,
+	// nil on initial boot — Phase 3 wires via SetGitSubsystems).
+	if gs := gitSubsRef.Load(); gs != nil {
+		cfg.GitBus = gs.bus
+		cfg.GitWatcher = gs.watcher
+	}
+
+	g, err := guardian.New(cfg, wrapped)
+	if err != nil {
+		return nil, err
+	}
+	g.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityValidation))
+	if err := g.Start(bus); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
 // resolveArchitectAPIKey resolves the Anthropic API key for the architect
 // from the same credential chain the provider layer uses.
 func resolveArchitectAPIKey() string {
@@ -1435,6 +1581,11 @@ func preRegisterAgentRouting(g *guide.Guide, ids *container.AgentIdentityRegistr
 		if err := g.PreRegister(a.fn(canonicalID)); err != nil {
 			slog.Warn("pre-register agent", "agent", a.agentType, "error", err)
 		}
+	}
+
+	// Guardian uses a hardcoded ID (daemon, not identity-registered).
+	if err := g.PreRegister(guardian.GuardianRoutingInfo("guardian")); err != nil {
+		slog.Warn("pre-register guardian", "error", err)
 	}
 }
 
@@ -1505,6 +1656,7 @@ var agentSwapPriority = map[string]gateway.RequestPriority{
 	"guide":        gateway.PriorityUserInteractive,
 	"orchestrator": gateway.PriorityUserInteractive,
 	"architect":    gateway.PriorityPlanning,
+	"guardian":     gateway.PriorityValidation,
 	"inspector":    gateway.PriorityValidation,
 	"tester":       gateway.PriorityValidation,
 	"engineer":     gateway.PriorityExecution,
@@ -1860,6 +2012,8 @@ func bootstrapHandoffSupervisor(
 	arch *architect.Architect,
 	orch *orchestrator.Orchestrator,
 	serviceReg *network.ServiceRegistry,
+	containerReg *container.ContainerRegistry,
+	activationCtrl *activation.ActivationController,
 ) *handoff.HandoffSupervisor {
 	walDir, err := handoffWALDir()
 	if err != nil {
@@ -1895,6 +2049,21 @@ func bootstrapHandoffSupervisor(
 			_ = g.RegisterRouter(router)
 			g.MarkAgentReady(oldID)
 		}
+
+		// Adopt the new container into the ActivationController so the
+		// entry points to the live replacement, not the terminated old one.
+		if activationCtrl != nil && containerReg != nil {
+			containers := containerReg.ListByType(newAgent.AgentType())
+			for _, c := range containers {
+				if agent := c.Agent(); agent != nil && agent.AgentID() == newAgent.AgentID() {
+					if _, err := activationCtrl.AdoptContainer(newAgent.AgentType(), c); err != nil {
+						slog.Warn("adopt replacement container", "agent_type", newAgent.AgentType(), "error", err)
+					}
+					break
+				}
+			}
+		}
+
 		return nil
 	})
 

@@ -204,9 +204,9 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 		return nil, err
 	}
 
-	// Fast path: already hot.
+	// Fast path: already hot and running.
 	if entry.LoadTier() == TierHot {
-		if c := entry.Container.Load(); c != nil {
+		if c := entry.Container.Load(); c != nil && c.IsRunning() {
 			ac.metrics.HotHits.Add(1)
 			entry.TouchActivity()
 			activationFileLog().Info("DEBUG: ensure_active_hot_hit", "agent_type", agentType)
@@ -355,6 +355,15 @@ func (ac *ActivationController) promote(ctx context.Context, entry *ActivationEn
 	if ctx.Err() != nil {
 		activationFileLog().Info("DEBUG: promote_ctx_already_cancelled", "agent_type", entry.AgentType, "error", ctx.Err())
 		return nil, ctx.Err()
+	}
+
+	// Singleton guard: if a running container already exists, return it
+	// and correct the tier. Covers stale-tier scenarios.
+	if existing := entry.Container.Load(); existing != nil && existing.IsRunning() {
+		entry.StoreTier(TierHot)
+		activationFileLog().Info("DEBUG: promote_singleton_guard",
+			"agent_type", entry.AgentType, "existing_id", existing.ID())
+		return existing, nil
 	}
 
 	tier := entry.LoadTier()
@@ -787,6 +796,28 @@ func (ac *ActivationController) getEntry(agentType string) (*ActivationEntry, er
 		return nil, ErrUnknownAgentType
 	}
 	return entry, nil
+}
+
+// AdoptContainer registers an externally-created container as the active
+// instance for the given agent type. Returns the existing container if
+// one is already hot and running (singleton invariant).
+func (ac *ActivationController) AdoptContainer(agentType string, c *container.Container) (*container.Container, error) {
+	if ac.closed.Load() {
+		return nil, ErrControllerClosed
+	}
+	entry, err := ac.getEntry(agentType)
+	if err != nil {
+		return nil, err
+	}
+	if entry.LoadTier() == TierHot {
+		if existing := entry.Container.Load(); existing != nil && existing.IsRunning() {
+			return existing, nil
+		}
+	}
+	entry.Container.Store(c)
+	entry.StoreTier(TierHot)
+	entry.TouchActivity()
+	return c, nil
 }
 
 // allEntries returns a snapshot of all entries for iteration.

@@ -7,6 +7,7 @@ const (
 	RoleObserver          AgentRole = "observer"
 	RoleObserverKnowledge AgentRole = "observer_knowledge"
 	RoleWorker            AgentRole = "worker"
+	RoleGuardian          AgentRole = "guardian"
 	RoleSupervisor        AgentRole = "supervisor"
 	RoleOrchestrator      AgentRole = "orchestrator"
 	RoleAdmin             AgentRole = "admin"
@@ -24,6 +25,7 @@ var DefaultAgentRoles = map[string]AgentRole{
 	"inspector":    RoleObserver,
 	"tester":       RoleObserver,
 	"orchestrator": RoleOrchestrator,
+	"guardian":     RoleGuardian,
 }
 
 // ActionType defines the type of permission action
@@ -50,6 +52,9 @@ var roleCapabilities = map[AgentRole]map[ActionType]bool{
 		ActionTypeCommand: true,
 		ActionTypeNetwork: true,
 		ActionTypePath:    true,
+	},
+	RoleGuardian: {
+		ActionTypePath: true, // read-only paths only — no command or network access
 	},
 	RoleSupervisor: {
 		ActionTypeCommand: true,
@@ -92,6 +97,7 @@ func IsHigherRole(role1, role2 AgentRole) bool {
 		RoleObserver:          0,
 		RoleObserverKnowledge: 1,
 		RoleWorker:            2,
+		RoleGuardian:          2,
 		RoleSupervisor:        3,
 		RoleOrchestrator:      3,
 		RoleAdmin:             4,

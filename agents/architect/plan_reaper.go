@@ -107,7 +107,7 @@ func (r *PlanReaper) executeAction(action reaperAction, plan *DesignPlan) {
 
 func (r *PlanReaper) evictPlan(plan *DesignPlan) {
 	r.architect.removeActivePlan(plan.ID)
-	r.removeDiskFile(plan.ID)
+	r.removeDiskFile(plan.ID, plan.SessionID)
 	r.logger.Info("reaper: evicted terminal plan",
 		"plan_id", plan.ID,
 		"status", plan.SM().State().String())
@@ -128,8 +128,8 @@ func (r *PlanReaper) expirePlan(plan *DesignPlan, reason string) {
 		"plan_id", plan.ID, "reason", reason)
 }
 
-func (r *PlanReaper) removeDiskFile(planID string) {
-	dir := r.architect.planStoreDir()
+func (r *PlanReaper) removeDiskFile(planID, sessionID string) {
+	dir := r.architect.planStoreDir(sessionID)
 	path := filepath.Join(dir, strings.TrimSpace(planID)+".json")
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		r.logger.Warn("reaper: failed to remove disk file",

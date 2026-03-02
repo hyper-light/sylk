@@ -3839,6 +3839,14 @@ func (m *AppModel) resolveSubmitTarget(explicit string) string {
 		}
 		return target
 	}
+	// Conversation continuity: if the user is engaged with an agent
+	// (set on every StreamStart), route to that agent. Survives
+	// interrupts — cleared only by selecting Guide in the panel or
+	// @agent to a different target.
+	engaged := normalizeExplicitTargetAgent(m.engagedAgentID)
+	if engaged != "" && engaged != "guide" && engaged != "g" {
+		return engaged
+	}
 	return ""
 }
 
@@ -3920,6 +3928,7 @@ func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
 	m.markQueueEntryByCorrelation(correlationID, false)
 	m.clearActiveRoute(correlationID)
 	m.agentPanel.DemoteAllActive()
+	m.agentPanel.LockSelection()
 	if m.statusBar != nil {
 		m.statusBar.SetTokenPhase(status.PhaseIdle)
 	}

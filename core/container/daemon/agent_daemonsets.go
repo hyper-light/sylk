@@ -10,7 +10,7 @@ import (
 // always hot, never evicted, auto-restarted on failure.
 // Guide is the bus router (must be first). Orchestrator coordinates
 // pipeline execution.
-var daemonAgents = []string{"guide", "orchestrator"}
+var daemonAgents = []string{"guide", "orchestrator", "guardian"}
 
 // daemonPriority assigns scheduling priority to daemon agents.
 // Guide gets the highest priority because all routing depends on it.
@@ -18,6 +18,7 @@ var daemonAgents = []string{"guide", "orchestrator"}
 var daemonPriority = map[string]int{
 	"guide":        math.MaxInt,
 	"orchestrator": math.MaxInt - 1,
+	"guardian":     math.MaxInt - 2,
 }
 
 // resourcePressureToleration exempts daemon containers from eviction
