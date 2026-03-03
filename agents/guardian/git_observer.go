@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/search/git"
 )
@@ -27,6 +28,14 @@ type GitObserver struct {
 	mu          sync.Mutex
 	running     bool
 	stats       observerStats
+	onEvent     OnEventFunc
+}
+
+// SetOnEvent wires a callback for WAL event emission.
+func (o *GitObserver) SetOnEvent(fn OnEventFunc) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.onEvent = fn
 }
 
 type observerStats struct {
@@ -108,6 +117,14 @@ func (o *GitObserver) handleGitEvent(event *git.GitEvent) {
 
 	// Protected branch mutation detected — this is logged.
 	// The actual gating happens via PreMutationGate on the GitBus.
+	o.mu.Lock()
+	onEvt := o.onEvent
+	o.mu.Unlock()
+	if onEvt != nil {
+		onEvt(agentlog.EventDiffReviewed, "warn", &agentlog.DiffPayload{
+			Verdict: fmt.Sprintf("protected branch mutation: %s on %q", opName(event.Op), branch),
+		})
+	}
 	o.publishProtectedBranchWarning(event, branch)
 }
 
@@ -132,22 +149,40 @@ func (o *GitObserver) GateCheck(ctx context.Context, op git.GitOp, params any) e
 	}
 
 	approved, err := o.requestApproval(ctx, proposal)
+	o.mu.Lock()
+	onEvt := o.onEvent
+	o.mu.Unlock()
 	if err != nil {
 		o.mu.Lock()
 		o.stats.mutationsBlocked++
 		o.mu.Unlock()
+		if onEvt != nil {
+			onEvt(agentlog.EventDiffRejected, "error", &agentlog.DiffPayload{
+				Verdict: "approval_failed", Reason: err.Error(),
+			})
+		}
 		return fmt.Errorf("guardian: approval request failed: %w", err)
 	}
 	if !approved {
 		o.mu.Lock()
 		o.stats.mutationsBlocked++
 		o.mu.Unlock()
+		if onEvt != nil {
+			onEvt(agentlog.EventDiffRejected, "warn", &agentlog.DiffPayload{
+				Verdict: "denied", Reason: fmt.Sprintf("%s on %q", opName(op), branch),
+			})
+		}
 		return fmt.Errorf("guardian: user denied mutation %s on protected branch %q", opName(op), branch)
 	}
 
 	o.mu.Lock()
 	o.stats.mutationsApproved++
 	o.mu.Unlock()
+	if onEvt != nil {
+		onEvt(agentlog.EventDiffApproved, "info", &agentlog.DiffPayload{
+			Verdict: "approved", Reason: fmt.Sprintf("%s on %q", opName(op), branch),
+		})
+	}
 	return nil
 }
 

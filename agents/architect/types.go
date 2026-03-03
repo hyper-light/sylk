@@ -11,6 +11,10 @@ import (
 // shifting existing values and breaking persisted plan JSON.
 const PlanStatusClarifying PlanStatus = 10
 
+// PlanStatusSuperseded is a terminal state meaning "replaced by newer user intent".
+// Distinct from Failed — the plan was not broken, it was interrupted.
+const PlanStatusSuperseded PlanStatus = 11
+
 type ArchitectIntent string
 
 const (
@@ -108,6 +112,7 @@ func (s PlanStatus) String() string {
 		PlanStatusExecuting:     "executing",
 		PlanStatusCompleted:     "completed",
 		PlanStatusFailed:        "failed",
+		PlanStatusSuperseded:    "superseded",
 	}
 	if name, ok := names[s]; ok {
 		return name

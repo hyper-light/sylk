@@ -163,11 +163,14 @@ func TestHydrateGoogleConfig_OAuthReturnsResolveError(t *testing.T) {
 	cfg := DefaultGoogleConfig()
 	cfg.AuthMode = GoogleAuthModeOAuth
 	authSvc := &mockGoogleAuthService{err: oauth.ErrGoogleAuthNotConfigured}
-	originalResolver := googleProviderAPIKeyResolver
+
+	originalKeyResolver := googleProviderAPIKeyResolver
 	googleProviderAPIKeyResolver = func() string { return "" }
-	t.Cleanup(func() {
-		googleProviderAPIKeyResolver = originalResolver
-	})
+	t.Cleanup(func() { googleProviderAPIKeyResolver = originalKeyResolver })
+
+	originalSAResolver := googleServiceAccountJSONResolver
+	googleServiceAccountJSONResolver = func() (string, error) { return "", nil }
+	t.Cleanup(func() { googleServiceAccountJSONResolver = originalSAResolver })
 
 	err := hydrateGoogleConfig(context.Background(), &cfg, authSvc)
 	if err == nil {
@@ -181,6 +184,10 @@ func TestHydrateGoogleConfig_OAuthFallsBackToAPIKey(t *testing.T) {
 	cfg.APIKey = "fallback_key"
 	cfg.UseVertexAI = true
 	authSvc := &mockGoogleAuthService{err: oauth.ErrGoogleAuthNotConfigured}
+
+	originalSAResolver := googleServiceAccountJSONResolver
+	googleServiceAccountJSONResolver = func() (string, error) { return "", nil }
+	t.Cleanup(func() { googleServiceAccountJSONResolver = originalSAResolver })
 
 	if err := hydrateGoogleConfig(context.Background(), &cfg, authSvc); err != nil {
 		t.Fatalf("hydrateGoogleConfig() error: %v", err)

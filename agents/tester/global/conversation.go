@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -17,6 +18,15 @@ const testerConversationMaxTokens = 4096
 type ConversationResult struct {
 	Response string `json:"response"`
 	Intent   string `json:"intent"`
+}
+
+// ResponseText implements the guide-layer responseTexter interface so the
+// conversation history stores the clean response string, not a JSON blob.
+func (r *ConversationResult) ResponseText() string {
+	if r == nil {
+		return ""
+	}
+	return r.Response
 }
 
 // handleConversation processes conversational requests. When an LLM provider
@@ -67,7 +77,7 @@ func (gt *GlobalTester) executeConversationLLM(ctx context.Context, cr testerCon
 	llmCtx, cancel := context.WithTimeout(ctx, gt.config.DefaultTimeout)
 	defer cancel()
 
-	response, err := gt.executeToolLoop(llmCtx, llmReq)
+	response, err := gt.executeToolLoop(llmCtx, llmReq, agentshared.SteeringLedgerFromContext(llmCtx))
 	if err != nil {
 		return nil, fmt.Errorf("tester conversation: %w", err)
 	}

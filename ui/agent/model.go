@@ -81,6 +81,7 @@ type AgentState struct {
 	TaskSummary  string
 	ContextUsage float64 // 0.0 to 1.0
 	ModelID      string  // Currently assigned model ID (e.g. "claude-opus-4-6").
+	ProviderID   string  // Provider for ModelID (e.g. "anthropic", "google", "openai").
 
 	// SupportedModels is the per-agent model list from the backend.
 	// When non-empty, overrides the static provider-based model table.
@@ -221,8 +222,9 @@ var eventTypeToStatus = map[events.EventType]AgentStatus{
 	events.EventTypeToolTimeout:   StatusError,
 	events.EventTypeLLMRequest:    StatusThinking,
 	events.EventTypeLLMResponse:   StatusIdle,
-	events.EventTypeSuccess:       StatusSuccess,
-	events.EventTypeFailure:       StatusError,
+	events.EventTypeSuccess:         StatusSuccess,
+	events.EventTypeFailure:         StatusError,
+	events.EventTypeAgentRegistered: StatusWaiting,
 }
 
 // viewState represents which view the agent panel is currently showing.
@@ -279,24 +281,13 @@ var activeStatuses = map[AgentStatus]bool{
 // isActiveStatus reports whether the status represents active work.
 func isActiveStatus(s AgentStatus) bool { return activeStatuses[s] }
 
-// activeEventTypes is the set of event types that mark an agent as the
-// currently active agent. These represent an agent initiating work.
-var activeEventTypes = map[events.EventType]bool{
-	events.EventTypeAgentAction:   true,
-	events.EventTypeAgentDecision: true,
-	events.EventTypeLLMRequest:    true,
-	events.EventTypeToolCall:      true,
-}
-
 // Model is the Bubble Tea model for the agent dashboard panel.
 type Model struct {
 	agents    map[string]*AgentState
 	streams   map[string]*AgentEventStream
-	order     []string  // Agent IDs in insertion order (bounded by maxAgentOrder).
-	activeID  string    // Agent ID of the currently active agent.
-	engagedID string    // Agent ID the user is conversing with (sticky until reroute/override).
-	selected     int       // Index into m.rows for list view navigation.
-	userSelected bool      // True when the user manually changed selection; suppresses auto-follow.
+	order     []string // Agent IDs in insertion order (bounded by maxAgentOrder).
+	engagedID string   // Agent ID the user is conversing with (sticky until reroute/override).
+	selected  int      // Index into m.rows for list view navigation.
 	expanded     string    // Agent ID of the expanded detail view ("" if none).
 	view         viewState // Current view state.
 	eventSel     int       // Selected event index in expanded view (logical, 0=oldest, -1=tail-follow).
@@ -309,7 +300,8 @@ type Model struct {
 	dotFrame int // Current frame index for the filling-circle dot animation.
 
 	// Model selector state.
-	selector modelSelector
+	selector   modelSelector
+	modelStore *AgentModelStore // Persisted model selections (nil-safe).
 
 	// Pipeline & variant state.
 	pipelines     map[string]*PipelineState  // Pipeline ID → state.
@@ -351,8 +343,14 @@ func New(th *theme.Theme) *Model {
 		groupGradient:       idleGroup,
 		idleGroupGradient:   idleGroup,
 		activeGroupGradient: th.Palette.GroupGradient(),
-		rippleGradient:      th.Palette.RippleGradient(),
+		rippleGradient:      th.Palette.ThinkingGradient(),
 	}
+}
+
+// SetModelStore injects the persisted model store so dynamically-created
+// agents pick up the user's previous model selection.
+func (m *Model) SetModelStore(store *AgentModelStore) {
+	m.modelStore = store
 }
 
 // ---------------------------------------------------------------------------
@@ -466,17 +464,12 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 		return nil
 	}
 
-	// User-visible: full promotion path.
+	// User-visible: update status only. No auto-follow or active promotion.
+	// Agent status is already set by updateAgentStatus above.
+	// Multiple agents can be active simultaneously; isActiveStatus() on each
+	// agent's Status is the source of truth.
 	m.updateAgentStatus(agentID, ev)
 	m.pushAgentEvent(agentID, ev)
-
-	if activeEventTypes[ev.Event.EventType] {
-		m.demotePreviousActive(agentID)
-		m.activeID = agentID
-		if !m.focused && !m.userSelected {
-			m.SelectByID(agentID)
-		}
-	}
 
 	return nil
 }
@@ -513,14 +506,8 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	agent.TaskSummary = progress.Message
 	m.rowsDirty = true
 
-	// Agent-to-agent: update status text but don't promote.
-	if vis == events.VisibilityAgent {
-		return nil
-	}
-
-	// User-visible: full promotion.
-	m.demotePreviousActive(agentID)
-	m.activeID = agentID
+	// No auto-promotion for any visibility level.
+	// Status is already set to StatusThinking above — multiple agents can be active.
 	return nil
 }
 
@@ -541,22 +528,6 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	return nil
 }
 
-// demotePreviousActive transitions the previous active agent from an active
-// status to Waiting when a different agent takes over. This prevents stale
-// active indicators on agents that handed off control (e.g. guide → architect)
-// without receiving a terminal event.
-func (m *Model) demotePreviousActive(newActiveID string) {
-	if m.activeID == "" || m.activeID == newActiveID {
-		return
-	}
-	prev, ok := m.agents[m.activeID]
-	if !ok {
-		return
-	}
-	if isActiveStatus(prev.Status) {
-		prev.Status = StatusIdle
-	}
-}
 
 // ensureAgent creates an agent entry if it does not exist, respecting the bound.
 // For standalone agents (one-per-type), re-keys the existing entry to the new
@@ -570,11 +541,15 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 
 	agentType := extractString(ev.Event.Data, "agent_type")
 
-	// For standalone agents there should be exactly one panel entry per type.
-	// Find any existing entry with the same type and re-key it to the new
-	// UUID. This covers both seeded placeholders (ID == AgentType) and
-	// previously-activated entries whose UUID became stale after demotion.
-	if agentType != "" && agentCategoryByType[agentType] == "standalone" {
+	// For standalone and pipeline agents there should be exactly one panel
+	// entry per type. Find any existing entry with the same type and re-key
+	// it to the new UUID. This covers:
+	//  1. Seeded placeholder (ID == AgentType) promoted on first activation.
+	//  2. Re-activation after demotion: old UUID entry promoted to new UUID.
+	//  3. Pipeline agents: orchestrator creates a type-based placeholder
+	//     (e.g. ID="engineer") that the real agent's UUID replaces.
+	category := agentCategoryByType[agentType]
+	if agentType != "" && (category == "standalone" || category == "pipeline") {
 		if existing := m.findAgentByType(agentType); existing != nil {
 			m.promoteSeededAgent(existing, agentID, ev)
 			return
@@ -590,8 +565,20 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 		agentName = agentID
 	}
 
-	category := agentCategoryByType[agentType]
 	pipelineID := extractString(ev.Event.Data, "pipeline_id")
+
+	modelID := defaultModelForAgent(agentType)
+	providerID := deriveProvider(modelID)
+	if m.modelStore != nil {
+		entry := m.modelStore.EntryFor(agentType)
+		if entry.Model != "" {
+			modelID = entry.Model
+			providerID = entry.Provider
+			if providerID == "" {
+				providerID = deriveProvider(modelID)
+			}
+		}
+	}
 
 	agent := &AgentState{
 		ID:         agentID,
@@ -600,26 +587,37 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 		Category:   category,
 		PipelineID: pipelineID,
 		Status:     StatusIdle,
-		ModelID:    defaultModelForAgent(agentType),
+		ModelID:    modelID,
+		ProviderID: providerID,
 	}
 	m.agents[agentID] = agent
 	m.streams[agentID] = NewAgentEventStream()
 	m.order = append(m.order, agentID)
 	m.rowsDirty = true
 
-	// Register as pipeline member if the pipeline already exists.
+	// Register as pipeline member, creating the pipeline entry on-demand
+	// when it arrives from a DAG dispatch (no PipelineStateMsg for DAGs).
 	if pipelineID != "" {
-		if pl, ok := m.pipelines[pipelineID]; ok {
-			if len(pl.Members) < maxAgents {
-				pl.Members = append(pl.Members, agentID)
+		pl, ok := m.pipelines[pipelineID]
+		if !ok && len(m.pipelines) < maxPipelines {
+			taskID := extractString(ev.Event.Data, "task_id")
+			if taskID == "" {
+				taskID = pipelineShortID(pipelineID)
 			}
+			pl = &PipelineState{
+				ID:        pipelineID,
+				TaskID:    taskID,
+				Status:    "executing",
+				CreatedAt: time.Now(),
+			}
+			m.pipelines[pipelineID] = pl
+			m.pipelineOrder = append(m.pipelineOrder, pipelineID)
+		}
+		if pl != nil && len(pl.Members) < maxAgents {
+			pl.Members = append(pl.Members, agentID)
 		}
 	}
 
-	// First agent becomes active by default.
-	if m.activeID == "" {
-		m.activeID = agentID
-	}
 }
 
 // promoteSeededAgent replaces a seeded placeholder entry with the real agent ID.
@@ -656,9 +654,6 @@ func (m *Model) promoteSeededAgent(placeholder *AgentState, realID string, ev ms
 	}
 
 	// Update tracking references.
-	if m.activeID == oldID {
-		m.activeID = realID
-	}
 	if m.engagedID == oldID {
 		m.engagedID = realID
 	}
@@ -809,6 +804,17 @@ func (m *Model) DemoteAllActive() {
 		if isActiveStatus(agent.Status) {
 			agent.Status = StatusIdle
 		}
+	}
+}
+
+// DemoteAgent transitions a specific agent to StatusIdle if it is currently
+// in an active status. Used on handoff to clear the routing agent (e.g. guide)
+// without disturbing other concurrent active agents.
+func (m *Model) DemoteAgent(agentID string) {
+	agent := m.findAgentByType(agentID)
+	if agent != nil && isActiveStatus(agent.Status) {
+		agent.Status = StatusIdle
+		m.rowsDirty = true
 	}
 }
 
@@ -1184,8 +1190,11 @@ func (m *Model) SelectByID(agentID string) bool {
 // SeedAgent creates an idle agent entry without requiring an activity event.
 // Used during bootstrap to pre-populate the panel with known agents.
 // When supportedModels is non-empty, it overrides the static model table.
+// persistedModelID, when non-empty and present in the model list, overrides the
+// default model so the UI shows the user's persisted selection on boot.
+// persistedProviderID is stored alongside the model; when empty, derived from modelID.
 // No-op if the agent already exists or the panel is at capacity.
-func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEntry) {
+func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEntry, persistedModelID, persistedProviderID string) {
 	if _, exists := m.agents[id]; exists {
 		return
 	}
@@ -1193,9 +1202,20 @@ func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEnt
 		return
 	}
 	category := agentCategoryByType[agentType]
+	models := supportedModels
+	if len(models) == 0 {
+		models = modelsForAgent(agentType)
+	}
 	modelID := defaultModelForAgent(agentType)
 	if len(supportedModels) > 0 {
 		modelID = supportedModels[0].ID
+	}
+	if persistedModelID != "" && modelInList(models, persistedModelID) {
+		modelID = persistedModelID
+	}
+	providerID := persistedProviderID
+	if providerID == "" {
+		providerID = deriveProvider(modelID)
 	}
 	agent := &AgentState{
 		ID:              id,
@@ -1204,6 +1224,7 @@ func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEnt
 		Category:        category,
 		Status:          StatusIdle,
 		ModelID:         modelID,
+		ProviderID:      providerID,
 		SupportedModels: supportedModels,
 	}
 	m.agents[id] = agent
@@ -1212,19 +1233,21 @@ func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEnt
 	m.rowsDirty = true
 }
 
-// SetEngagedAgent sets the agent the user is conversing with. This is sticky
-// across messages until a reroute or explicit @agent override clears it.
-// Resets userSelected so auto-follow resumes for the new conversation turn.
-func (m *Model) SetEngagedAgent(agentID string) {
-	m.engagedID = strings.ToLower(strings.TrimSpace(agentID))
-	m.userSelected = false
+// modelInList returns true if modelID is present in the model list.
+func modelInList(models []ModelEntry, modelID string) bool {
+	for _, m := range models {
+		if m.ID == modelID {
+			return true
+		}
+	}
+	return false
 }
 
-// LockSelection prevents auto-follow from moving the selection until
-// the next SetEngagedAgent call resets it. Used during interrupt to
-// keep the panel stable on the agent the user was communicating with.
-func (m *Model) LockSelection() {
-	m.userSelected = true
+// SetEngagedAgent sets the agent the user is conversing with. This is sticky
+// across messages until a reroute or explicit @agent override clears it.
+// Panel selection is NOT affected — it is always user-driven.
+func (m *Model) SetEngagedAgent(agentID string) {
+	m.engagedID = strings.ToLower(strings.TrimSpace(agentID))
 }
 
 // ClearEngagedAgent removes the current engagement, forcing full classification
@@ -1277,7 +1300,6 @@ func (m *Model) moveSelection(delta int) {
 		return
 	}
 	m.selected = next
-	m.userSelected = true
 }
 
 // enterExpanded transitions from list view to expanded view for the selected row.
@@ -1356,25 +1378,25 @@ func (m *Model) renderListView() string {
 
 	elapsed := time.Since(m.shimmerStart)
 	hasActive := m.HasActiveAgent()
-	ripple := m.focused && hasActive
+	ripple := hasActive // Active agents always shimmer, regardless of focus.
 
 	// Swap group gradient: full prismatic when focused + active, subdued otherwise.
-	if ripple {
+	if m.focused && hasActive {
 		m.groupGradient = m.activeGroupGradient
 	} else {
 		m.groupGradient = m.idleGroupGradient
 	}
 
 	anim := AnimState{
-		DotFrame:   m.dotFrame,
-		Elapsed:    elapsed,
-		HasActive:  hasActive,
-		Ripple:     ripple,
-		RippleGrad: m.rippleGradient,
+		DotFrame:        m.dotFrame,
+		Elapsed:         elapsed,
+		HasActive:       hasActive,
+		Ripple:          ripple,
+		RippleGrad:      m.rippleGradient,      // ThinkingGradient for active agents.
+		HolographicGrad: m.activeGroupGradient,  // Full prismatic for selected active agent.
 	}
 
 	contentHeight := m.height
-	activeStart, activeEnd := m.selectedGroupRange()
 	lines := make([]string, 0, min(len(m.rows)*2, contentHeight))
 	var consumedLines int
 
@@ -1383,12 +1405,12 @@ func (m *Model) renderListView() string {
 			break
 		}
 		selected := i == m.selected
-		inActiveGroup := i >= activeStart && i <= activeEnd
 
-		// Per-row phase offset creates a downward-flowing prismatic wave.
+		// Per-row phase offset creates a downward-flowing prismatic wave
+		// across ALL sections when any agent is active.
 		var activeColor lipgloss.Color
-		if inActiveGroup {
-			phase := elapsed - time.Duration(i-activeStart)*groupFlowStep
+		if hasActive {
+			phase := elapsed - time.Duration(i)*groupFlowStep
 			activeColor = m.groupGradient.Sample(phase)
 		}
 
@@ -1416,7 +1438,7 @@ func (m *Model) renderListView() string {
 			if pl == nil {
 				continue
 			}
-			lines = append(lines, renderPipelineRow(pl, m.width, elapsed, m.gradient, m.theme, selected))
+			lines = append(lines, renderPipelineRow(pl, m.width, elapsed, m.gradient, m.theme, selected, activeColor, anim))
 			consumedLines++
 
 		case rowVariant:
@@ -1424,15 +1446,15 @@ func (m *Model) renderListView() string {
 			if v == nil {
 				continue
 			}
-			lines = append(lines, renderVariantRow(v, m.width, m.theme, selected))
+			lines = append(lines, renderVariantRow(v, m.width, m.theme, selected, activeColor, anim))
 			consumedLines++
 		}
 
 		// Footer gets the next phase step after the last content row.
 		if consumedLines < contentHeight && m.isGroupEnd(i) {
 			var footerColor lipgloss.Color
-			if inActiveGroup {
-				phase := elapsed - time.Duration(i-activeStart+1)*groupFlowStep
+			if hasActive {
+				phase := elapsed - time.Duration(i+1)*groupFlowStep
 				footerColor = m.groupGradient.Sample(phase)
 			}
 			lines = append(lines, renderSectionFooter(m.width, footerColor, m.theme))
@@ -1441,42 +1463,6 @@ func (m *Model) renderListView() string {
 	}
 
 	return strings.Join(lines, "\n")
-}
-
-// selectedGroupRange returns the inclusive [start, end] row indices of the group
-// containing the currently selected row. A group starts at a section or pipeline
-// header and extends until the next header or end of list.
-func (m *Model) selectedGroupRange() (int, int) {
-	if len(m.rows) == 0 {
-		return 0, 0
-	}
-	sel := clampIndex(m.selected, len(m.rows))
-
-	// Walk backward to find the group header.
-	start := sel
-	for start > 0 {
-		if m.rows[start].Kind == rowSection || m.rows[start].Kind == rowPipeline {
-			break
-		}
-		start--
-	}
-
-	// Include the spacer row immediately before the group header.
-	if start > 0 && m.rows[start-1].Kind == rowSpacer {
-		start--
-	}
-
-	// Walk forward to find the end of the group.
-	end := sel
-	for end+1 < len(m.rows) {
-		next := m.rows[end+1]
-		if next.Kind == rowSection || next.Kind == rowPipeline || next.Kind == rowSpacer {
-			break
-		}
-		end++
-	}
-
-	return start, end
 }
 
 // renderSectionHeader renders a section label. When activeColor is non-empty,
@@ -1689,6 +1675,17 @@ func (m *Model) SelectorLineCount() int {
 	return selectorLineCount
 }
 
+// PersistedModelFor returns the persisted model for agentType, falling back to
+// the hardcoded default when the store is absent or has no entry.
+func (m *Model) PersistedModelFor(agentType string) string {
+	if m.modelStore != nil {
+		if persisted := m.modelStore.ModelFor(agentType); persisted != "" {
+			return persisted
+		}
+	}
+	return DefaultModelForAgentType(agentType)
+}
+
 // RevertModelID sets the agent's ModelID back to a previous value.
 // Used when a backend swap fails to undo the optimistic UI update.
 func (m *Model) RevertModelID(agentID, previousModelID string) {
@@ -1737,6 +1734,18 @@ func extractString(data map[string]any, key string) string {
 		return ""
 	}
 	return s
+}
+
+// pipelineShortID derives a short display label from a pipeline/DAG ID.
+// For UUIDs (36 chars), returns the first 8 hex characters. For shorter
+// IDs, returns the full string.
+func pipelineShortID(id string) string {
+	const shortLen = 8
+	clean := strings.ReplaceAll(id, "-", "")
+	if len(clean) > shortLen {
+		return clean[:shortLen]
+	}
+	return id
 }
 
 // extractFloat safely extracts a float64 value from a map.

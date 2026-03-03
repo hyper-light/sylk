@@ -171,6 +171,13 @@ func architectStreamMetadataFromContext(ctx context.Context) (architectStreamCon
 	return metadata, true
 }
 
+func correlationIDFromContext(ctx context.Context) string {
+	if meta, ok := architectStreamMetadataFromContext(ctx); ok {
+		return meta.CorrelationID
+	}
+	return ""
+}
+
 func (a *Architect) publishPlanStreamStart(ctx context.Context) {
 	a.publishPlanStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventStart,

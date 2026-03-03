@@ -50,11 +50,12 @@ const dotAnimFrameCount = theme.DotAnimFrameCount
 // AnimState carries per-frame animation parameters through the render pipeline.
 // Constructed once per frame in the Model and passed to each RenderCard call.
 type AnimState struct {
-	DotFrame   int
-	Elapsed    time.Duration
-	HasActive  bool             // Any agent actively working (gates dot animation).
-	Ripple     bool             // Focused AND active (gates ripple text + full shimmer).
-	RippleGrad *theme.Gradient
+	DotFrame       int
+	Elapsed        time.Duration
+	HasActive      bool            // Any agent actively working (gates dot animation).
+	Ripple         bool            // Active agents present (gates ripple text).
+	RippleGrad     *theme.Gradient // ThinkingGradient — used for active (non-selected) agents.
+	HolographicGrad *theme.Gradient // GroupGradient — used for the selected active agent.
 }
 
 // RenderCard renders a single-line agent card with an optional tree prefix.
@@ -105,7 +106,7 @@ func renderCardLine(agent AgentState, width int, th *theme.Theme, selected, enga
 	fixedWidth := cardPadding + iconWidth + nameLen + separators + contextBarWidth
 	summaryWidth := innerWidth - fixedWidth
 
-	summary := renderAgentSummary(agent.TaskSummary, summaryWidth, agent.Status, nameLen, anim, th)
+	summary := renderAgentSummary(agent.TaskSummary, summaryWidth, selected, agent.Status, nameLen, anim, th)
 
 	contextStyle := contextPctStyle(agent.ContextUsage, th)
 	contextStr := contextStyle.Render(contextPct)
@@ -129,7 +130,7 @@ var statusColors = map[AgentStatus]func(*theme.Theme) lipgloss.Color{
 	StatusError:    func(th *theme.Theme) lipgloss.Color { return th.Palette.Error },
 	StatusSuccess:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Success },
 	StatusHandoff:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Warning },
-	StatusWaiting:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Muted },
+	StatusWaiting:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Subtle },
 }
 
 // resolveStaticIcon returns the static display glyph for a non-active status.
@@ -189,12 +190,19 @@ func selectIndicator(selected bool, th *theme.Theme) string {
 // gradient when the agent is actively working and ripple is available.
 // Falls back to standard lipgloss styling otherwise.
 func renderAgentName(name string, selected, engaged bool, status AgentStatus, anim AnimState, th *theme.Theme) string {
-	if anim.Ripple && isActiveStatus(status) && anim.RippleGrad != nil {
-		styled := theme.RenderRippleText(name, anim.Elapsed, anim.RippleGrad, 0)
-		if engaged {
-			return "\x1b[1;4m" + styled // bold + underline persists through color codes
+	if anim.Ripple && isActiveStatus(status) {
+		// Selected active agent: holographic shimmer. Other active agents: thinking shimmer.
+		grad := anim.RippleGrad
+		if selected && anim.HolographicGrad != nil {
+			grad = anim.HolographicGrad
 		}
-		return styled
+		if grad != nil {
+			styled := theme.RenderRippleText(name, anim.Elapsed, grad, 0)
+			if engaged {
+				return "\x1b[1;4m" + styled
+			}
+			return styled
+		}
 	}
 	style := agentNameStyle(selected, th)
 	if engaged {
@@ -206,11 +214,17 @@ func renderAgentName(name string, selected, engaged bool, status AgentStatus, an
 // renderAgentSummary renders the task summary, applying the per-character ripple
 // gradient when the agent is actively working. The character offset continues
 // from the name so the wave flows continuously across name and summary.
-func renderAgentSummary(text string, width int, status AgentStatus, nameLen int, anim AnimState, th *theme.Theme) string {
+func renderAgentSummary(text string, width int, selected bool, status AgentStatus, nameLen int, anim AnimState, th *theme.Theme) string {
 	truncated := truncate(text, width)
 	padded := padRight(truncated, width)
-	if anim.Ripple && isActiveStatus(status) && anim.RippleGrad != nil {
-		return theme.RenderRippleText(padded, anim.Elapsed, anim.RippleGrad, nameLen+1)
+	if anim.Ripple && isActiveStatus(status) {
+		grad := anim.RippleGrad
+		if selected && anim.HolographicGrad != nil {
+			grad = anim.HolographicGrad
+		}
+		if grad != nil {
+			return theme.RenderRippleText(padded, anim.Elapsed, grad, nameLen+1)
+		}
 	}
 	return lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(padded)
 }

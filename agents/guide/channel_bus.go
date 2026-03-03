@@ -22,6 +22,11 @@ var (
 type ChannelBus struct {
 	subscriptions *ShardedMap[string, *topicSubscriptions]
 
+	// wildcardRouter matches published topics against wildcard subscriptions.
+	wildcardRouter *TopicRouter
+	wildcardMu     sync.RWMutex
+	wildcardIndex  map[int64]*channelSubscription // topicSub.id → channelSub
+
 	bufferSize   int
 	closeTimeout time.Duration
 
@@ -72,9 +77,11 @@ func NewChannelBus(cfg ChannelBusConfig) *ChannelBus {
 	}
 
 	return &ChannelBus{
-		subscriptions: NewStringMap[*topicSubscriptions](cfg.ShardCount),
-		bufferSize:    cfg.BufferSize,
-		closeTimeout:  cfg.CloseTimeout,
+		subscriptions:  NewStringMap[*topicSubscriptions](cfg.ShardCount),
+		wildcardRouter: NewTopicRouter(),
+		wildcardIndex:  make(map[int64]*channelSubscription),
+		bufferSize:     cfg.BufferSize,
+		closeTimeout:   cfg.CloseTimeout,
 	}
 }
 
@@ -83,27 +90,48 @@ func (b *ChannelBus) Publish(topic string, msg *Message) error {
 		return ErrBusClosed
 	}
 
+	// Exact-match subscribers.
 	topicSubs, ok := b.subscriptions.Get(topic)
-	if !ok || topicSubs == nil {
-		return nil
+	if ok && topicSubs != nil {
+		subs := b.snapshotSubscribers(topicSubs)
+
+		// Diagnostic: log subscriber state for stream-complete events.
+		if b.isStreamComplete(msg) {
+			activeSubs, closedSubs := b.classifySubscribers(subs)
+			DebugFileLog().Info("Publish: STREAM_COMPLETE_SUBSCRIBER_SNAPSHOT",
+				"topic", topic,
+				"correlation_id", msg.CorrelationID,
+				"total_subs", len(subs),
+				"active_subs", activeSubs,
+				"closed_subs", closedSubs)
+		}
+
+		b.publishToSubscribers(subs, msg)
 	}
 
-	subs := b.snapshotSubscribers(topicSubs)
-
-	// Diagnostic: log subscriber state for stream-complete events.
-	if b.isStreamComplete(msg) {
-		activeSubs, closedSubs := b.classifySubscribers(subs)
-		DebugFileLog().Info("Publish: STREAM_COMPLETE_SUBSCRIBER_SNAPSHOT",
-			"topic", topic,
-			"correlation_id", msg.CorrelationID,
-			"total_subs", len(subs),
-			"active_subs", activeSubs,
-			"closed_subs", closedSubs)
-	}
-
-	b.publishToSubscribers(subs, msg)
+	// Wildcard-match subscribers.
+	b.publishToWildcardMatches(topic, msg)
 
 	return nil
+}
+
+// publishToWildcardMatches queries the TopicRouter for wildcard patterns
+// matching topic and delivers msg to matched channelSubscriptions.
+func (b *ChannelBus) publishToWildcardMatches(topic string, msg *Message) {
+	matches := b.wildcardRouter.Match(topic)
+	if len(matches) == 0 {
+		return
+	}
+
+	b.wildcardMu.RLock()
+	defer b.wildcardMu.RUnlock()
+
+	for _, topicSub := range matches {
+		channelSub, ok := b.wildcardIndex[topicSub.id]
+		if ok {
+			b.publishToSubscriber(channelSub, msg)
+		}
+	}
 }
 
 // isStreamComplete returns true if the message carries a StreamEventComplete.
@@ -212,18 +240,29 @@ func (b *ChannelBus) subscribe(topic string, handler MessageHandler, async bool)
 	}
 
 	sub := &channelSubscription{
-		bus:    b,
-		topic:  topic,
-		notify: make(chan struct{}, 1),
-		done:   make(chan struct{}),
+		bus:     b,
+		topic:   topic,
+		notify:  make(chan struct{}, 1),
+		done:    make(chan struct{}),
 		handler: handler,
 		async:   async,
 	}
 	sub.active.Store(true)
 
-	// W12.27: Use GetOrCreate with factory to avoid check-then-act race.
-	// The factory is only called if the topic doesn't exist, and the entire
-	// operation is atomic (factory runs under shard lock).
+	if hasWildcard(topic) {
+		b.registerWildcardSub(topic, sub)
+	} else {
+		b.registerExactSub(topic, sub)
+	}
+
+	b.wg.Add(1)
+	go sub.run(&b.wg)
+
+	return sub, nil
+}
+
+// registerExactSub stores the subscription under the exact topic key.
+func (b *ChannelBus) registerExactSub(topic string, sub *channelSubscription) {
 	topicSubs, _ := b.subscriptions.GetOrCreate(topic, func() *topicSubscriptions {
 		return &topicSubscriptions{}
 	})
@@ -231,11 +270,23 @@ func (b *ChannelBus) subscribe(topic string, handler MessageHandler, async bool)
 	topicSubs.subs = append(topicSubs.subs, sub)
 	topicSubs.mu.Unlock()
 	sub.topicShard = topicSubs
+}
 
-	b.wg.Add(1)
-	go sub.run(&b.wg)
+// registerWildcardSub registers the subscription in the TopicRouter for
+// pattern matching and stores the channelSubscription in the wildcard index.
+func (b *ChannelBus) registerWildcardSub(topic string, sub *channelSubscription) {
+	topicSub := b.wildcardRouter.Subscribe(topic, nil) // handler unused; delivery via channelSub
 
-	return sub, nil
+	b.wildcardMu.Lock()
+	b.wildcardIndex[topicSub.id] = sub
+	b.wildcardMu.Unlock()
+
+	sub.wildcardCleanup = func() {
+		b.wildcardRouter.Unsubscribe(topicSub)
+		b.wildcardMu.Lock()
+		delete(b.wildcardIndex, topicSub.id)
+		b.wildcardMu.Unlock()
+	}
 }
 
 func (b *ChannelBus) Close() error {
@@ -249,6 +300,7 @@ func (b *ChannelBus) Close() error {
 
 // closeAllSubscriptions signals every subscription to drain and exit.
 func (b *ChannelBus) closeAllSubscriptions() {
+	// Exact subscriptions.
 	allTopics := b.subscriptions.Snapshot()
 	for _, topicSubs := range allTopics {
 		if topicSubs == nil {
@@ -262,6 +314,14 @@ func (b *ChannelBus) closeAllSubscriptions() {
 		topicSubs.mu.Unlock()
 	}
 	b.subscriptions.Clear()
+
+	// Wildcard subscriptions.
+	b.wildcardMu.Lock()
+	for _, sub := range b.wildcardIndex {
+		sub.close()
+	}
+	b.wildcardIndex = nil
+	b.wildcardMu.Unlock()
 }
 
 // awaitDrain waits for all subscription goroutines to finish, bounded by
@@ -293,6 +353,10 @@ type channelSubscription struct {
 	notify     chan struct{} // cap-1 signal: "queue has messages"
 	done       chan struct{} // closed on unsubscribe/bus-close to wake consumer
 	topicShard *topicSubscriptions
+
+	// wildcardCleanup removes this sub from the TopicRouter and wildcard index.
+	// Non-nil only for wildcard subscriptions.
+	wildcardCleanup func()
 }
 
 func (s *channelSubscription) Topic() string {
@@ -308,6 +372,19 @@ func (s *channelSubscription) Unsubscribe() error {
 		return ErrSubscriptionClosed
 	}
 
+	if s.wildcardCleanup != nil {
+		s.wildcardCleanup()
+	} else {
+		s.removeFromTopicShard()
+	}
+
+	s.close()
+
+	return nil
+}
+
+// removeFromTopicShard removes this exact-match subscription from its shard.
+func (s *channelSubscription) removeFromTopicShard() {
 	topicSubs := s.topicShard
 	if topicSubs == nil {
 		if looked, ok := s.bus.subscriptions.Get(s.topic); ok {
@@ -325,10 +402,6 @@ func (s *channelSubscription) Unsubscribe() error {
 		topicSubs.subs = updated
 		topicSubs.mu.Unlock()
 	}
-
-	s.close()
-
-	return nil
 }
 
 func (s *channelSubscription) close() {
@@ -434,22 +507,46 @@ func (b *ChannelBus) Stats() ChannelBusStats {
 		stats.Subscriptions += activeSubs
 	}
 
+	// Include wildcard subscriptions.
+	b.wildcardMu.RLock()
+	for _, sub := range b.wildcardIndex {
+		if sub.active.Load() {
+			stats.ByTopic[sub.topic]++
+			stats.Subscriptions++
+			stats.Topics++
+		}
+	}
+	b.wildcardMu.RUnlock()
+
 	return stats
 }
 
 func (b *ChannelBus) TopicSubscriberCount(topic string) int {
+	count := 0
+
+	// Exact subscribers.
 	topicSubs, ok := b.subscriptions.Get(topic)
-	if !ok || topicSubs == nil {
-		return 0
+	if ok && topicSubs != nil {
+		topicSubs.mu.RLock()
+		for _, sub := range topicSubs.subs {
+			if sub.active.Load() {
+				count++
+			}
+		}
+		topicSubs.mu.RUnlock()
 	}
 
-	topicSubs.mu.RLock()
-	count := 0
-	for _, sub := range topicSubs.subs {
-		if sub.active.Load() {
-			count++
+	// Wildcard subscribers matching this topic.
+	matches := b.wildcardRouter.Match(topic)
+	b.wildcardMu.RLock()
+	for _, topicSub := range matches {
+		if channelSub, ok := b.wildcardIndex[topicSub.id]; ok {
+			if channelSub.active.Load() {
+				count++
+			}
 		}
 	}
-	topicSubs.mu.RUnlock()
+	b.wildcardMu.RUnlock()
+
 	return count
 }

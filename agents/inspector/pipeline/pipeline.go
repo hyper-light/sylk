@@ -5,14 +5,19 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -34,6 +39,10 @@ type PipelineInspector struct {
 
 	// LLM provider (Anthropic Opus 4.6).
 	provider pipelineInspectorProvider
+
+	// Activity publisher for UI agent-panel updates. Nil-safe.
+	activityPub events.ActivityPublisher
+	pipelineID  string // DAG pipeline ID for TUI grouping.
 
 	// Tool runner for external analysis tools.
 	toolRunner *shared.ToolRunner
@@ -68,6 +77,17 @@ type PipelineInspector struct {
 	handoffBridge *handoff.HandoffBridge
 
 	fileAccess versioning.FileAccess
+
+	// Request lifecycle.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	// Steering ledger management.
+	steering *agentShared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *agentShared.RequestSerializer
 }
 
 // New creates a new PipelineInspector instance.
@@ -83,7 +103,11 @@ func New(cfg shared.PipelineInspectorConfig, provider pipelineInspectorProvider)
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		pendingBus:  make(map[string]chan *guide.Message),
 		criteria:    make(map[string]*shared.InspectorCriteria),
+		steering:          agentShared.NewSteeringManager(),
+		requestSerializer: agentShared.NewRequestSerializer(),
 	}
+
+	pi.steering.InitLazy("inspector-pipeline", nil)
 
 	pi.initState()
 	pi.initSkills()
@@ -184,6 +208,7 @@ func (pi *PipelineInspector) Start(bus guide.EventBus) error {
 
 	pi.bus = bus
 	pi.channels = guide.NewAgentChannels("inspector-pipeline", pi.id)
+	pi.runCtx, pi.runCancel = context.WithCancel(context.Background())
 
 	var err error
 	pi.requestSub, err = bus.SubscribeAsync(pi.channels.Requests, pi.handleBusRequest)
@@ -213,6 +238,11 @@ func (pi *PipelineInspector) Start(bus guide.EventBus) error {
 func (pi *PipelineInspector) Stop() error {
 	if !pi.running {
 		return nil
+	}
+
+	pi.steering.CloseAll()
+	if pi.runCancel != nil {
+		pi.runCancel()
 	}
 
 	var errs []error
@@ -260,11 +290,158 @@ func (pi *PipelineInspector) unsubRegistry() error {
 	return err
 }
 
+// pipelineTaskFields holds the decoded fields from a JSON-encoded PipelineTask.
+// Defined locally to avoid importing the orchestrator package.
+type pipelineTaskFields struct {
+	NodeID        string         `json:"node_id"`
+	DAGID         string         `json:"dag_id"`
+	TaskID        string         `json:"task_id"`
+	AgentType     string         `json:"agent_type"`
+	Prompt        string         `json:"prompt"`
+	Context       map[string]any `json:"context,omitempty"`
+	ParentResults map[string]any `json:"parent_results,omitempty"`
+	SessionID     string         `json:"session_id"`
+}
+
+// decodePipelineTask tries to decode fwd.Input as a JSON PipelineTask.
+// Returns nil if the input is not a valid pipeline task.
+func decodePipelineTask(input string) *pipelineTaskFields {
+	trimmed := strings.TrimSpace(input)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil
+	}
+	var task pipelineTaskFields
+	if err := json.Unmarshal([]byte(trimmed), &task); err != nil {
+		return nil
+	}
+	if task.NodeID == "" || task.AgentType == "" {
+		return nil
+	}
+	return &task
+}
+
+// composePipelineUserMessage builds a structured LLM user message from
+// decoded pipeline task fields. This replaces the raw JSON blob with a
+// clear, actionable instruction the LLM can act on.
+func composePipelineUserMessage(task *pipelineTaskFields) string {
+	stage := extractPipelineStage(task.Context)
+
+	var b strings.Builder
+	b.WriteString("## Pipeline Task Assignment\n\n")
+	fmt.Fprintf(&b, "**Stage**: %s | **Node**: %s | **Task ID**: %s\n\n", stage, task.NodeID, task.TaskID)
+
+	b.WriteString("### Task Description\n\n")
+	b.WriteString(coalesce(task.Prompt, "No task description provided."))
+	b.WriteString("\n\n")
+
+	b.WriteString(formatParentResults(task.ParentResults))
+	b.WriteString(stageInstructions(stage))
+
+	return b.String()
+}
+
+// extractPipelineStage reads the pipeline_stage from task context.
+func extractPipelineStage(ctx map[string]any) string {
+	if ctx == nil {
+		return "unknown"
+	}
+	if s, ok := ctx["pipeline_stage"].(string); ok && s != "" {
+		return s
+	}
+	return "unknown"
+}
+
+// coalesce returns the first non-empty string.
+func coalesce(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// formatParentResults renders upstream node results as markdown for the LLM.
+func formatParentResults(results map[string]any) string {
+	if len(results) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("### Upstream Results\n\n")
+	for nodeID, result := range results {
+		b.WriteString(formatSingleResult(nodeID, result))
+	}
+	return b.String()
+}
+
+// formatSingleResult renders one parent node's result as markdown.
+func formatSingleResult(nodeID string, result any) string {
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	var b strings.Builder
+	state, _ := resultMap["state"].(string)
+	fmt.Fprintf(&b, "**%s** (state: %s)\n", nodeID, state)
+
+	if output := resultMap["output"]; output != nil {
+		outputJSON, err := json.MarshalIndent(output, "  ", "  ")
+		if err == nil {
+			fmt.Fprintf(&b, "```json\n%s\n```\n", outputJSON)
+		}
+	}
+	b.WriteByte('\n')
+	return b.String()
+}
+
+// stageInstructions returns stage-specific instructions for the LLM.
+func stageInstructions(stage string) string {
+	if stage == "inspect" {
+		return "### Instructions\n\n" +
+			"This is the **inspect** stage (pre-implementation). Execute the validation protocol:\n" +
+			"1. Define success criteria for this task using `define_criteria`\n" +
+			"2. If upstream results contain implementation files, run analysis tools\n" +
+			"3. Grade and report using `grade_task_quality` and `get_validation_status`\n"
+	}
+	return "### Instructions\n\n" +
+		"Execute the full validation protocol: define/retrieve criteria, run analysis tools, " +
+		"validate against criteria, grade the implementation, and report results.\n"
+}
+
+// prependConversationHistory formats prior conversation turns as structured
+// text and prepends them to the user message so the LLM retains multi-turn
+// context across requests. Returns the original message unchanged when there
+// is no history.
+func prependConversationHistory(history []guide.ConversationTurn, userMessage string) string {
+	if len(history) == 0 {
+		return userMessage
+	}
+
+	var b strings.Builder
+	b.WriteString("## Prior Conversation\n\n")
+	for _, turn := range history {
+		fmt.Fprintf(&b, "[%s] User: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.UserInput)
+		if turn.AgentReply != "" {
+			fmt.Fprintf(&b, "[%s] %s: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.AgentID, turn.AgentReply)
+		}
+	}
+	b.WriteString("\n---\n\n")
+	b.WriteString(userMessage)
+	return b.String()
+}
+
 // Handle processes a forwarded request through the LLM tool loop.
 func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	// Try static conversation fast-path
-	if staticResult := shared.TryStaticReply(fwd.Input, pi.getState(), pi.getCurrentIssues()); staticResult != nil {
-		return staticResult, nil
+	// Decode structured pipeline task from orchestrator dispatch.
+	task := decodePipelineTask(fwd.Input)
+
+	// Only try static/conversational replies for non-pipeline inputs.
+	// Pipeline task JSON contains keywords like "state" that would falsely
+	// trigger TryStaticReply, short-circuiting actual inspection work.
+	if task == nil {
+		if staticResult := shared.TryStaticReply(fwd.Input, pi.getState(), pi.getCurrentIssues()); staticResult != nil {
+			return staticResult, nil
+		}
 	}
 
 	if pi.provider == nil {
@@ -274,43 +451,86 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	systemPrompt := shared.PipelineInspectorSystemPrompt()
 	tools := pi.buildToolDefinitions()
 
+	// Build user message: structured for pipeline tasks, raw for conversation.
+	userMessage := fwd.Input
+	if task != nil {
+		userMessage = composePipelineUserMessage(task)
+	}
+
+	// Prepend conversation history so the LLM retains multi-turn context.
+	userMessage = prependConversationHistory(fwd.ConversationHistory, userMessage)
+
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages: []providers.Message{
-			{Role: providers.RoleUser, Content: fwd.Input},
+			{Role: providers.RoleUser, Content: userMessage},
 		},
 		Model:     pi.config.Model,
 		MaxTokens: pi.config.MaxTokens,
 		Tools:     tools,
 	}
 
-	result, err := pi.executeToolLoop(ctx, req)
+	result, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("pipeline inspector tool loop: %w", err)
 	}
 
-	return map[string]any{
-		"response": result,
-		"agent_id": pi.id,
-	}, nil
+	return result, nil
 }
 
 func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
+	if msg.Type == guide.MessageTypeAction {
+		action, ok := msg.GetActionRequest()
+		if ok && action != nil {
+			pi.steering.HandleAction(action)
+		}
+		return nil
+	}
 	if msg.Type != guide.MessageTypeForward {
 		// Check for pending RPC responses
 		pi.deliverPendingMessage(msg)
 		return nil
 	}
 
+	if !pi.requestSerializer.Acquire(pi.runCtx) {
+		return nil // runCtx cancelled, agent shutting down
+	}
+	defer pi.requestSerializer.Release()
+
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	ctx := context.Background()
+	pi.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	agentShared.LogIncomingRequest(pi.steering.EventLogger(), fwd, pi.id)
+
+	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+		pi.pipelineID = dagID
+	}
+
+	agentShared.EmitDispatchACK(pi.bus, fwd.Metadata, pi.id, "inspector-pipeline", fwd.CorrelationID)
+	pi.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
+
+	reqCtx, cancel := context.WithCancel(pi.runCtx)
+	pi.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	defer cancel()
+
+	ctx := reqCtx
 	ctx = shared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
+
+	// Create steering ledger for this request.
+	ledger := pi.steering.Create(fwd.CorrelationID, pi.id, fwd.SessionID, nil, nil)
+	defer pi.steering.Close(fwd.CorrelationID, ctx.Err() != nil)
+	ctx = agentShared.WithSteeringLedger(ctx, ledger)
+	ctx = agentShared.WithLogMeta(ctx, agentShared.LogMeta{
+		EventLogger: pi.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     pi.id,
+		SessionID:   fwd.SessionID,
+	})
 
 	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, "inspector-pipeline", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
@@ -320,19 +540,27 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	}
 
 	result, err := pi.Handle(ctx, fwd)
+	agentShared.LogResponse(pi.steering.EventLogger(), fwd.CorrelationID, pi.id, fwd.SessionID, time.Since(startTime), err)
 
 	if fwd.FireAndForget {
 		return nil
 	}
 
 	if err != nil {
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
+		}
 		shared.PublishStreamError(pi.bus, pi.channels, ctx, "inspector-pipeline", err)
 		shared.PublishStreamComplete(pi.bus, pi.channels, ctx, "inspector-pipeline", "", usageAcc.Total())
+		pi.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(pi.generateMessageID(), fwd.CorrelationID, pi.id, err.Error())
 		return pi.bus.Publish(pi.channels.Errors, errMsg)
 	}
 
 	shared.PublishStreamComplete(pi.bus, pi.channels, ctx, "inspector-pipeline", "", usageAcc.Total())
+	pi.publishActivity(events.EventTypeAgentAction, "Inspection task completed")
 
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
@@ -360,8 +588,16 @@ func (pi *PipelineInspector) handleRegistryAnnouncement(msg *guide.Message) erro
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
 		pi.knownAgents[ann.AgentID] = ann
+		agentShared.LogAgentEvent(pi.steering.EventLogger(), agentlog.EventRegistryEvent,
+			pi.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "registered",
+			})
 	case guide.MessageTypeAgentUnregistered:
 		delete(pi.knownAgents, ann.AgentID)
+		agentShared.LogAgentEvent(pi.steering.EventLogger(), agentlog.EventRegistryEvent,
+			pi.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "unregistered",
+			})
 	}
 	return nil
 }
@@ -466,6 +702,11 @@ func (pi *PipelineInspector) DefineCriteria(taskID string, criteria *shared.Insp
 		pi.state.CurrentTaskID = taskID
 		pi.state.LastActiveAt = time.Now()
 	}
+	if el := pi.steering.EventLogger(); el != nil {
+		agentShared.LogAgentEvent(el, agentlog.EventValidationStarted,
+			pi.id, "", "", "info",
+			&agentlog.ValidationPayload{Phase: "criteria_defined", TaskID: taskID})
+	}
 }
 
 // ValidateAgainstCriteria validates files against stored criteria (TDD Phase 4).
@@ -479,6 +720,11 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 	now := time.Now()
 
 	if pi.provider == nil {
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
+				lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+				&agentlog.ValidationPayload{Phase: "stub_pass", TaskID: taskID, Success: true})
+		}
 		result := &shared.InspectorResult{
 			TaskID:             taskID,
 			Mode:               "pipeline",
@@ -507,8 +753,13 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 		Tools:        pi.buildToolDefinitions(),
 	}
 
-	_, err := pi.executeToolLoop(ctx, req)
+	_, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 	if err != nil {
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("validation tool loop: %v", err)})
+		}
 		return nil, fmt.Errorf("validation tool loop: %w", err)
 	}
 
@@ -523,6 +774,11 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 		StartedAt:          now,
 		CompletedAt:        time.Now(),
 		LoopCount:          1,
+	}
+	if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
+			lm.AgentID, lm.SessionID, lm.CorrID, "info",
+			&agentlog.ValidationPayload{Phase: "validated", TaskID: taskID, Success: true})
 	}
 	return result, nil
 }
@@ -569,6 +825,28 @@ func (pi *PipelineInspector) Skills() *skills.Registry { return pi.skills }
 
 // IsRunning returns whether the pipeline inspector is running.
 func (pi *PipelineInspector) IsRunning() bool { return pi.running }
+
+// SetActivityPublisher injects the activity publisher for TUI panel updates.
+func (pi *PipelineInspector) SetActivityPublisher(pub events.ActivityPublisher) {
+	pi.activityPub = pub
+}
+
+// publishActivity emits a user-visible activity event so the UI agent panel
+// tracks this pipeline inspector's lifecycle.
+func (pi *PipelineInspector) publishActivity(eventType events.EventType, content string) {
+	if pi.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, pi.config.SessionID, content)
+	evt.AgentID = pi.id
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "inspector-pipeline"
+	evt.Data["agent_name"] = "Inspector"
+	if pi.pipelineID != "" {
+		evt.Data["pipeline_id"] = pi.pipelineID
+	}
+	pi.activityPub.PublishActivity(evt)
+}
 
 // --- HandoffInjectable ---
 

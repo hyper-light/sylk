@@ -85,6 +85,9 @@ func (a *Architect) advancePlan(
 	plan.Status = plan.SM().State()
 	plan.Epoch = plan.SM().Epoch()
 	plan.UpdatedAt = time.Now()
+	if targetStatus == PlanStatusReady && a.leaseManager != nil {
+		a.leaseManager.GrantReadyLease(plan)
+	}
 	if mutate != nil {
 		mutate()
 	}
@@ -272,13 +275,7 @@ func planSkill(a *Architect) *skills.Skill {
 				result["plan_status"] = plan.SM().State().String()
 				result["layer_count"] = layers
 				result["task_summary"] = firstTaskName(plan)
-				result["next_action"] = "PROTOCOL COMPLETE. The plan is ready and automatically " +
-					"rendered in your response — the user can see it. Do NOT invoke any more tools. " +
-					"Do NOT repeat the plan structure or task list. Write a brief assessment: " +
-					"highlight the key architectural tradeoff and the primary risk. " +
-					"Sound like a principal engineer. Then invite the user to approve or " +
-					"request changes — use your own natural phrasing, not a scripted template. " +
-					"Do NOT invoke route_plan_acceptance — wait for the user's response."
+				result["next_action"] = generateTasksNextAction(a.config.AutoApprove)
 			}
 			return result, nil
 		},
@@ -339,7 +336,18 @@ func planSkill(a *Architect) *skills.Skill {
 		ObjectParam("architecture", "Architecture to generate tasks from (for generate_tasks)", map[string]*skills.Property{
 			"name":        {Type: "string", Description: "Architecture name"},
 			"description": {Type: "string", Description: "Architecture description"},
-			"components":  {Type: "array", Description: "Component specifications"},
+			"components": {
+				Type:        "array",
+				Description: "Component specifications",
+				Items: &skills.Property{
+					Type: "object",
+					Properties: map[string]*skills.Property{
+						"name":        {Type: "string", Description: "Component name"},
+						"type":        {Type: "string", Description: "Component type"},
+						"description": {Type: "string", Description: "Component description"},
+					},
+				},
+			},
 		}, false).
 		IntParam("max_tasks_per_agent", "Maximum tasks per agent (for generate_tasks, default 5)", false).
 		BoolParam("allow_parallel", "Allow parallel execution (for generate_tasks, default true)", false).
@@ -539,4 +547,27 @@ func estimateTaskComplexity(description string, context map[string]any) *Complex
 		RiskLevel:       riskLevel,
 		Factors:         factors,
 	}
+}
+
+// generateTasksNextAction returns the LLM instruction for what to do after
+// generate_tasks completes and the plan reaches Ready. When auto-approve is
+// enabled, the LLM must invoke route_plan_acceptance immediately. When
+// approval is required, it must wait for the user's response.
+func generateTasksNextAction(autoApprove bool) string {
+	const base = "PROTOCOL COMPLETE. The plan is ready. The system renders " +
+		"the plan structure separately in the UI — the user already sees it. " +
+		"Do NOT repeat, re-render, or include the plan structure, task list, " +
+		"acceptance criteria, file lists, or implementation guides in your text. " +
+		"Write ONLY a brief assessment (2-4 sentences): highlight the key " +
+		"architectural tradeoff and the primary risk. Sound like a principal engineer."
+
+	if autoApprove {
+		return base + " Then invoke route_plan_acceptance with the plan_id " +
+			"and a brief summary as user_response. When it returns the Guide's " +
+			"verdict, invoke handle_plan_acceptance_result with the verdict details. " +
+			"On accept, the plan dispatches to the orchestrator automatically."
+	}
+	return base + " Then invite the user to approve or request changes — " +
+		"use your own natural phrasing, not a scripted template. " +
+		"Do NOT invoke route_plan_acceptance — wait for the user's response."
 }

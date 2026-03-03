@@ -2,9 +2,11 @@ package guardian
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/events"
 )
 
@@ -22,6 +24,14 @@ type HealthMonitor struct {
 
 	running bool
 	cancel  context.CancelFunc
+	onEvent OnEventFunc
+}
+
+// SetOnEvent wires a callback for WAL event emission.
+func (hm *HealthMonitor) SetOnEvent(fn OnEventFunc) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	hm.onEvent = fn
 }
 
 type agentHealth struct {
@@ -270,7 +280,16 @@ func (hm *HealthMonitor) tickerLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = hm.DetectAnomalies()
+			anomalies := hm.DetectAnomalies()
+			hm.mu.RLock()
+			onEvt := hm.onEvent
+			hm.mu.RUnlock()
+			if onEvt != nil && len(anomalies) > 0 {
+				onEvt(agentlog.EventHealthAlert, "warn", &agentlog.HealthPayload{
+					Status: "anomaly",
+					Metric: fmt.Sprintf("%d health anomalies detected", len(anomalies)),
+				})
+			}
 		}
 	}
 }

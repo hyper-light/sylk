@@ -46,19 +46,18 @@ type Viewport struct {
 	bounceOffset       int       // Visual line displacement from overscroll bounce.
 	codeCache          *codeBlockCache
 	hIdx               heightIndex        // Cached prefix-sum of entry heights.
-	streamState        *streamRenderState // Active stream render state (nil when not streaming).
-	streamEntryIndex   int                // Entry index for the active stream (-1 = none).
+	streamStates map[int]*streamRenderState // Entry index → render state for active streams.
 }
 
 // NewViewport creates a Viewport bound to the given History.
 func NewViewport(history *History, th *theme.Theme) *Viewport {
 	return &Viewport{
-		history:          history,
-		theme:            th,
-		following:        true,
-		selectedIndex:    -1,
-		codeCache:        newCodeBlockCache(16),
-		streamEntryIndex: -1,
+		history:       history,
+		theme:         th,
+		following:     true,
+		selectedIndex: -1,
+		codeCache:     newCodeBlockCache(16),
+		streamStates:  make(map[int]*streamRenderState),
 	}
 }
 
@@ -75,8 +74,7 @@ func (vp *Viewport) Reset() {
 	vp.bounceOffset = 0
 	vp.codeCache.Clear()
 	vp.hIdx = heightIndex{}
-	vp.streamState = nil
-	vp.streamEntryIndex = -1
+	clear(vp.streamStates)
 }
 
 // chatPadding is the horizontal padding (left + right) applied to chat content.
@@ -667,11 +665,26 @@ func (vp *Viewport) invalidateAllEntryHeights() {
 	}
 }
 
-// SetStreamState sets the active stream render state and entry index.
-// Pass nil state and -1 index to clear.
-func (vp *Viewport) SetStreamState(state *streamRenderState, entryIndex int) {
-	vp.streamState = state
-	vp.streamEntryIndex = entryIndex
+// AddStreamState registers or updates the stream render state for a given entry.
+func (vp *Viewport) AddStreamState(entryIndex int, state *streamRenderState) {
+	if state == nil {
+		delete(vp.streamStates, entryIndex)
+		return
+	}
+	if vp.streamStates == nil {
+		vp.streamStates = make(map[int]*streamRenderState)
+	}
+	vp.streamStates[entryIndex] = state
+}
+
+// RemoveStreamState removes the stream render state for a given entry.
+func (vp *Viewport) RemoveStreamState(entryIndex int) {
+	delete(vp.streamStates, entryIndex)
+}
+
+// ClearAllStreamStates removes all active stream render states.
+func (vp *Viewport) ClearAllStreamStates() {
+	clear(vp.streamStates)
 }
 
 // renderEntry renders a single entry by logical index, using cached lines
@@ -685,9 +698,9 @@ func (vp *Viewport) renderEntry(index int) []string {
 	}
 
 	var lines []string
-	// Use incremental streaming render for the active streaming entry.
-	if index == vp.streamEntryIndex && vp.streamState != nil {
-		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, vp.streamState)
+	// Use incremental streaming render for any active streaming entry.
+	if state, ok := vp.streamStates[index]; ok && state != nil {
+		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, state)
 		vp.cacheRendered(index, rendered, regions)
 		lines = rendered
 	} else if entry.RenderedLines != nil && entry.Height >= 0 {
@@ -977,10 +990,10 @@ func (vp *Viewport) entryHeight(index int) int {
 	if entry == nil {
 		return 0
 	}
-	// For the active streaming entry, use the streaming render path
+	// For any active streaming entry, use the streaming render path
 	// to get an accurate height consistent with renderEntry().
-	if index == vp.streamEntryIndex && vp.streamState != nil {
-		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, vp.streamState)
+	if state, ok := vp.streamStates[index]; ok && state != nil {
+		rendered, regions := renderStreamingEntryFull(entry, vp.viewWidth, vp.theme, vp.codeCache, state)
 		vp.cacheRendered(index, rendered, regions)
 		return len(rendered)
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (d *Designer) registerCoreSkills() {
@@ -86,7 +87,7 @@ func componentSearchSkill(d *Designer) *skills.Skill {
 				searchPath = "."
 			}
 
-			matches, err := searchComponents(searchPath, params.Query, params.IncludeVariants)
+			matches, err := searchComponents(ctx, d.fileAccess, searchPath, params.Query, params.IncludeVariants)
 			if err != nil {
 				return nil, fmt.Errorf("component search failed: %w", err)
 			}
@@ -107,11 +108,37 @@ type componentMatch struct {
 	Variants []string `json:"variants,omitempty"`
 }
 
-func searchComponents(root, query string, includeVariants bool) ([]componentMatch, error) {
+func searchComponents(ctx context.Context, fa versioning.FileAccess, root, query string, includeVariants bool) ([]componentMatch, error) {
 	var matches []componentMatch
 	queryLower := strings.ToLower(query)
 
 	componentExtensions := []string{".tsx", ".jsx", ".vue", ".svelte"}
+
+	// Use FileAccess glob when available, fall back to disk walk.
+	if fa != nil {
+		for _, ext := range componentExtensions {
+			globMatches, err := fa.Glob(ctx, root, "*"+ext, nil)
+			if err != nil {
+				continue
+			}
+			for _, relPath := range globMatches {
+				name := filepath.Base(relPath)
+				if !strings.Contains(strings.ToLower(name), queryLower) {
+					continue
+				}
+				match := componentMatch{
+					Name: strings.TrimSuffix(name, filepath.Ext(name)),
+					Path: relPath,
+					Type: determineComponentType(relPath),
+				}
+				if includeVariants {
+					match.Variants = extractVariantsVFS(ctx, fa, filepath.Join(root, relPath))
+				}
+				matches = append(matches, match)
+			}
+		}
+		return matches, nil
+	}
 
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -156,6 +183,29 @@ func searchComponents(root, query string, includeVariants bool) ([]componentMatc
 	})
 
 	return matches, err
+}
+
+func extractVariantsVFS(ctx context.Context, fa versioning.FileAccess, path string) []string {
+	content, err := fa.ReadFile(ctx, path)
+	if err != nil {
+		return nil
+	}
+
+	variantPattern := regexp.MustCompile(`variant[s]?\s*[=:]\s*['"](\w+)['"]|type\s*Variant\s*=\s*['"](\w+)['"]`)
+	matches := variantPattern.FindAllStringSubmatch(string(content), -1)
+
+	variants := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, match := range matches {
+		for i := 1; i < len(match); i++ {
+			if match[i] != "" && !seen[match[i]] {
+				variants = append(variants, match[i])
+				seen[match[i]] = true
+			}
+		}
+	}
+
+	return variants
 }
 
 func determineComponentType(path string) string {
@@ -303,10 +353,16 @@ func componentModifySkill(d *Designer) *skills.Skill {
 				return nil, fmt.Errorf("file writes are disabled")
 			}
 
-			fullPath := resolvePath(d.config.DesignerConfig.WorkingDirectory, params.Path)
-
-			if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-				return nil, fmt.Errorf("component not found: %s", params.Path)
+			if d.fileAccess != nil {
+				exists, _ := d.fileAccess.Exists(ctx, params.Path)
+				if !exists {
+					return nil, fmt.Errorf("component not found: %s", params.Path)
+				}
+			} else {
+				fullPath := resolvePath(d.config.DesignerConfig.WorkingDirectory, params.Path)
+				if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+					return nil, fmt.Errorf("component not found: %s", params.Path)
+				}
 			}
 
 			return map[string]any{
@@ -339,9 +395,14 @@ func tokenValidateSkill(d *Designer) *skills.Skill {
 				return nil, fmt.Errorf("path is required")
 			}
 
-			fullPath := resolvePath(d.config.DesignerConfig.WorkingDirectory, params.Path)
-
-			content, err := os.ReadFile(fullPath)
+			var content []byte
+			var err error
+			if d.fileAccess != nil {
+				content, err = d.fileAccess.ReadFile(ctx, params.Path)
+			} else {
+				fullPath := resolvePath(d.config.DesignerConfig.WorkingDirectory, params.Path)
+				content, err = os.ReadFile(fullPath)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
@@ -537,9 +598,14 @@ func a11yAuditSkill(d *Designer) *skills.Skill {
 				level = "AA"
 			}
 
-			fullPath := resolvePath(d.config.DesignerConfig.WorkingDirectory, params.Path)
-
-			content, err := os.ReadFile(fullPath)
+			var content []byte
+			var err error
+			if d.fileAccess != nil {
+				content, err = d.fileAccess.ReadFile(ctx, params.Path)
+			} else {
+				fullPath := resolvePath(d.config.DesignerConfig.WorkingDirectory, params.Path)
+				content, err = os.ReadFile(fullPath)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}

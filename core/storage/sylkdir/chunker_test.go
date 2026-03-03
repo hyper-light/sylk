@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-func TestBuildLineIndex(t *testing.T) {
+func TestChunkerBuildLineIndex(t *testing.T) {
 	content := []byte("line1\nline2\nline3\n")
 	li := buildLineIndex(content)
 

@@ -82,6 +82,23 @@ type Request struct {
 	// prompt. Classification requests set this to true — they need a focused
 	// prompt without the full skill catalogue.
 	SkipProviderSkills bool `json:"skip_provider_skills,omitempty"`
+
+	// FrequencyPenalty penalizes tokens proportional to how often they have
+	// appeared so far. Range depends on provider (typically -2.0 to 2.0).
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+
+	// PresencePenalty penalizes tokens that have appeared at all. Range
+	// depends on provider (typically -2.0 to 2.0).
+	PresencePenalty *float64 `json:"presence_penalty,omitempty"`
+
+	// TopK limits sampling to the top K most likely tokens. Only
+	// supported by Anthropic (mapped to top_k). Zero means unlimited.
+	TopK *int `json:"top_k,omitempty"`
+
+	// DisableParallelToolUse prevents the model from issuing multiple
+	// tool calls in a single turn. Supported by Anthropic on all
+	// ToolChoice modes (auto, any, tool).
+	DisableParallelToolUse bool `json:"disable_parallel_tool_use,omitempty"`
 }
 
 type Message struct {
@@ -134,17 +151,20 @@ type Response struct {
 type StopReason string
 
 const (
-	StopReasonEndTurn      StopReason = "end_turn"
-	StopReasonMaxTokens    StopReason = "max_tokens"
-	StopReasonStopSequence StopReason = "stop_sequence"
-	StopReasonToolUse      StopReason = "tool_use"
-	StopReasonError        StopReason = "error"
+	StopReasonEndTurn       StopReason = "end_turn"
+	StopReasonMaxTokens     StopReason = "max_tokens"
+	StopReasonStopSequence  StopReason = "stop_sequence"
+	StopReasonToolUse       StopReason = "tool_use"
+	StopReasonError         StopReason = "error"
+	StopReasonContentFilter StopReason = "content_filter"
+	StopReasonPauseTurn     StopReason = "pause_turn"
 )
 
 type Usage struct {
 	InputTokens      int `json:"input_tokens"`
 	OutputTokens     int `json:"output_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
 	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }

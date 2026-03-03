@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	agentShared "github.com/adalundhe/sylk/agents/shared"
+
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -15,6 +18,17 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 
 	auditCtx, cancel := context.WithTimeout(ctx, gi.config.AuditTimeout)
 	defer cancel()
+
+	lm := agentShared.LogMetaFromContext(ctx)
+	if lm.EventLogger != nil {
+		agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditStarted,
+			lm.AgentID, lm.SessionID, lm.CorrID, "info",
+			&agentlog.AuditPayload{AuditID: req.DAGID, Phase: "started"})
+	} else if gi.steering != nil {
+		agentShared.LogAgentEvent(gi.steering.EventLogger(), agentlog.EventAuditStarted,
+			gi.id, "", "", "info",
+			&agentlog.AuditPayload{AuditID: req.DAGID, Phase: "started"})
+	}
 
 	result := &shared.AuditResult{
 		DAGID:     req.DAGID,
@@ -36,8 +50,13 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 		Tools:     gi.buildToolDefinitions(),
 	}
 
-	response, err := gi.executeToolLoop(auditCtx, llmReq)
+	response, err := gi.executeToolLoop(auditCtx, llmReq, agentShared.SteeringLedgerFromContext(auditCtx))
 	if err != nil {
+		if lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("audit tool loop: %v", err)})
+		}
 		return nil, fmt.Errorf("audit layer %d of DAG %s: %w", req.LayerIdx, req.DAGID, err)
 	}
 
@@ -47,6 +66,31 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 	result.CompletedAt = time.Now()
 	result.Duration = result.CompletedAt.Sub(startTime)
 	result.Passed = !result.HasBlockingIssues()
+
+	// Log per-finding events for blocking issues.
+	if lm.EventLogger != nil {
+		for _, issue := range result.Issues {
+			if issue.Severity == shared.Critical || issue.Severity == shared.High {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditFinding,
+					lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+					&agentlog.AuditPayload{AuditID: req.DAGID, Phase: "finding", Finding: issue.Message})
+			}
+		}
+	}
+
+	if lm.EventLogger != nil {
+		phase := "completed"
+		if !result.Passed {
+			phase = "completed_with_findings"
+		}
+		agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditCompleted,
+			lm.AgentID, lm.SessionID, lm.CorrID, "info",
+			&agentlog.AuditPayload{AuditID: req.DAGID, Phase: phase, DurNs: result.Duration.Nanoseconds()})
+	} else if gi.steering != nil {
+		agentShared.LogAgentEvent(gi.steering.EventLogger(), agentlog.EventAuditCompleted,
+			gi.id, "", "", "info",
+			&agentlog.AuditPayload{AuditID: req.DAGID, Phase: "completed", DurNs: result.Duration.Nanoseconds()})
+	}
 
 	return result, nil
 }

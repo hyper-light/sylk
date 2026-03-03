@@ -12,14 +12,14 @@ import (
 )
 
 const (
-	defaultConversationSessionTTL        = 20 * time.Minute
+	defaultConversationSessionTTL        = 30 * time.Minute
 	defaultConversationReleaseConfidence = 0.9
-	defaultConversationACTRHalfLife      = 10 * time.Minute
+	defaultConversationACTRHalfLife      = 15 * time.Minute
 	defaultConversationACTRFrequencyK    = 0.35
 	defaultConversationACTRThreshold     = 0.45
 
 	// maxConversationTurns bounds the per-session history ring.
-	// Derived from ACT-R half-life (10min) / typical interaction rate (~1.25/min).
+	// Derived from ACT-R half-life (15min) / typical interaction rate (~1.25/min).
 	maxConversationTurns = 8
 
 	// maxConversationTurnContentLen bounds each UserInput/AgentReply field.
@@ -161,7 +161,40 @@ func (m *ConversationFlowManager) ObserveResponse(sessionID string, agentID stri
 		m.Clear(sessionID)
 		return
 	}
-	m.ObserveRoutedRequest(sessionID, agentID)
+	// Only refresh UpdatedAt — do NOT increment Turns. ObserveRoutedRequest
+	// is called on the routing path (when a *new* user message arrives).
+	// Calling it here on every response would inflate the ACT-R score,
+	// causing the conversation fast-path to fire indefinitely and preventing
+	// the Guide from ever reclassifying subsequent user messages.
+	m.refreshAgentTimestamp(sessionID, agentID)
+}
+
+// refreshAgentTimestamp updates only the UpdatedAt timestamp for an agent
+// without incrementing Turns. Used by ObserveResponse to keep the session
+// alive without inflating ACT-R frequency scores.
+func (m *ConversationFlowManager) refreshAgentTimestamp(sessionID string, agentID string) {
+	trimmedSession := strings.TrimSpace(sessionID)
+	normalizedAgent := strings.ToLower(strings.TrimSpace(agentID))
+	if trimmedSession == "" || normalizedAgent == "" {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	state, ok := m.sessions[trimmedSession]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	agentState, ok := state.agents[normalizedAgent]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	agentState.UpdatedAt = now
+	state.agents[normalizedAgent] = agentState
+	state.UpdatedAt = now
+	m.sessions[trimmedSession] = state
+	m.mu.Unlock()
 }
 
 func (m *ConversationFlowManager) SuggestedTarget(sessionID string, targetAgentID string, result *RouteResult) (string, bool) {
@@ -215,7 +248,8 @@ func (m *ConversationFlowManager) sessionState(sessionID string) (conversationFl
 	if time.Since(state.UpdatedAt) <= m.config.SessionTTL {
 		return state, true
 	}
-	m.Clear(trimmed)
+	// Session expired — preserve the pendingPlan if it has its own live TTL.
+	m.expireSessionPreservePlan(trimmed)
 	return conversationFlowState{}, false
 }
 
@@ -229,6 +263,44 @@ func (m *ConversationFlowManager) Clear(sessionID string) {
 	}
 	m.mu.Lock()
 	delete(m.sessions, trimmed)
+	m.mu.Unlock()
+}
+
+// ClearAllStickiness clears ActiveAgentID across every session so the next
+// request goes through full LLM classification with the new provider.
+// Conversation history (turns, ring buffer), pending plans, and ACT-R decay
+// state are preserved so chat continuity is maintained after a model swap.
+func (m *ConversationFlowManager) ClearAllStickiness() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for sid, state := range m.sessions {
+		state.ActiveAgentID = ""
+		m.sessions[sid] = state
+	}
+}
+
+// expireSessionPreservePlan resets the session's conversation state while
+// keeping the pendingPlan when it still has a valid TTL. This prevents the
+// session TTL from destroying plans that have their own longer TTL.
+func (m *ConversationFlowManager) expireSessionPreservePlan(sessionID string) {
+	m.mu.Lock()
+	state, ok := m.sessions[sessionID]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if state.pending != nil && time.Now().Before(state.pending.ExpiresAt) {
+		state.ActiveAgentID = ""
+		state.agents = map[string]conversationAgentState{}
+		state.UpdatedAt = time.Time{}
+		m.sessions[sessionID] = state
+		m.mu.Unlock()
+		return
+	}
+	delete(m.sessions, sessionID)
 	m.mu.Unlock()
 }
 

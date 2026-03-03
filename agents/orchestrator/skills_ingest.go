@@ -142,6 +142,10 @@ func validateHandoff(h *architect.PlanHandoff) error {
 			return fmt.Errorf("duplicate task id: %s", t.ID)
 		}
 		ids[t.ID] = struct{}{}
+		if !pipelineExpandable(t.AgentType) {
+			return fmt.Errorf("task %s has invalid agent_type %q: only %q and %q are pipeline-eligible",
+				t.ID, t.AgentType, "engineer", "designer")
+		}
 	}
 	return nil
 }

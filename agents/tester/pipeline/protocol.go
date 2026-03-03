@@ -18,7 +18,6 @@ import (
 // PipelineProtocolPhases returns the ordered phases of the pipeline testing protocol.
 func PipelineProtocolPhases() []shared.ProtocolPhase {
 	return []shared.ProtocolPhase{
-		shared.PhaseGateInspector,
 		shared.PhaseAnalyzeRisks,
 		shared.PhasePlanTests,
 		shared.PhaseImplementTests,

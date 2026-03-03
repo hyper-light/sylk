@@ -9,8 +9,21 @@ import (
 	"path/filepath"
 	"strings"
 
+	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
+
+// FileAccess is satisfied by versioning.FileAccess implementations (VFSFileAccess,
+// DiskFileAccess, GlobalVFSFileAccess). Pipeline agents pass their per-pipeline
+// VFS so that read operations see staged content.
+type FileAccess = versioning.FileAccess
+
+// FileAccessFunc returns the current FileAccess for an agent. Skills capture
+// this function at registration time and call it at invocation time, so the
+// returned value reflects whatever was injected via SetFileAccess().
+type FileAccessFunc func() FileAccess
 
 // RunLinterSkill returns a skill that runs golangci-lint.
 func RunLinterSkill(runner *ToolRunner) *skills.Skill {
@@ -23,6 +36,7 @@ func RunLinterSkill(runner *ToolRunner) *skills.Skill {
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
 			issues := RunGolangCILint(ctx, runner, paths)
+			logAnalysisFindings(ctx, "run_linter", issues)
 			return analysisResult("run_linter", issues), nil
 		}).
 		Build()
@@ -42,6 +56,7 @@ func RunTypeCheckerSkill(runner *ToolRunner) *skills.Skill {
 			issues = append(issues, RunGoVet(ctx, runner, paths)...)
 			issues = append(issues, RunStaticcheck(ctx, runner, paths)...)
 			issues = DeduplicateIssues(issues)
+			logAnalysisFindings(ctx, "run_type_checker", issues)
 			return analysisResult("run_type_checker", issues), nil
 		}).
 		Build()
@@ -58,6 +73,7 @@ func RunFormatterCheckSkill(runner *ToolRunner) *skills.Skill {
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
 			issues := RunGoFmt(ctx, runner, paths)
+			logAnalysisFindings(ctx, "run_formatter_check", issues)
 			return analysisResult("run_formatter_check", issues), nil
 		}).
 		Build()
@@ -79,6 +95,7 @@ func RunSecurityScanSkill(runner *ToolRunner) *skills.Skill {
 			result := analysisResult("run_security_scan", issues)
 			result["critical_count"] = criticalCount
 			result["high_count"] = highCount
+			logAnalysisFindings(ctx, "run_security_scan", issues)
 			return result, nil
 		}).
 		Build()
@@ -103,6 +120,7 @@ func CheckCoverageSkill(runner *ToolRunner) *skills.Skill {
 				params.Paths = []string{"./..."}
 			}
 			issues := RunCoverage(ctx, runner, params.Paths, params.Threshold)
+			logAnalysisFindings(ctx, "check_coverage", issues)
 			return analysisResult("check_coverage", issues), nil
 		}).
 		Build()
@@ -129,6 +147,7 @@ func AnalyzeComplexitySkill(runner *ToolRunner) *skills.Skill {
 				params.Paths = []string{"./..."}
 			}
 			issues := RunComplexity(ctx, runner, params.Paths, params.MaxCyclomatic, params.MaxCognitive)
+			logAnalysisFindings(ctx, "analyze_complexity", issues)
 			return analysisResult("analyze_complexity", issues), nil
 		}).
 		Build()
@@ -145,6 +164,7 @@ func DetectRaceConditionsSkill(runner *ToolRunner) *skills.Skill {
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
 			issues := RunRaceDetector(ctx, runner, paths)
+			logAnalysisFindings(ctx, "detect_race_conditions", issues)
 			return analysisResult("detect_race_conditions", issues), nil
 		}).
 		Build()
@@ -161,6 +181,7 @@ func DetectDeadlocksSkill(runner *ToolRunner) *skills.Skill {
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
 			issues := RunDeadlockDetector(ctx, runner, paths)
+			logAnalysisFindings(ctx, "detect_deadlocks", issues)
 			return analysisResult("detect_deadlocks", issues), nil
 		}).
 		Build()
@@ -177,13 +198,17 @@ func DetectMemoryLeaksSkill(runner *ToolRunner) *skills.Skill {
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
 			issues := RunMemoryAnalyzer(ctx, runner, paths)
+			logAnalysisFindings(ctx, "detect_memory_leaks", issues)
 			return analysisResult("detect_memory_leaks", issues), nil
 		}).
 		Build()
 }
 
-// ReadFileSkill returns a read-only file reading skill.
-func ReadFileSkill() *skills.Skill {
+// ReadFileSkill returns a read-only file reading skill that routes through
+// the FileAccess returned by getFA at invocation time. Pipeline agents pass
+// a closure over their fileAccess field so reads see staged content; global
+// agents may pass nil to fall back to direct disk I/O.
+func ReadFileSkill(getFA FileAccessFunc) *skills.Skill {
 	return skills.NewSkill("read_file").
 		Description("Read the contents of a file. Read-only — never modifies files.").
 		Domain("filesystem").
@@ -201,7 +226,13 @@ func ReadFileSkill() *skills.Skill {
 				return nil, fmt.Errorf("path is required")
 			}
 
-			data, err := os.ReadFile(params.Path)
+			var data []byte
+			var err error
+			if fa := getFA(); fa != nil {
+				data, err = fa.ReadFile(ctx, params.Path)
+			} else {
+				data, err = os.ReadFile(params.Path)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("read %s: %w", params.Path, err)
 			}
@@ -215,8 +246,9 @@ func ReadFileSkill() *skills.Skill {
 		Build()
 }
 
-// GlobSkill returns a read-only file glob skill.
-func GlobSkill() *skills.Skill {
+// GlobSkill returns a read-only file glob skill that routes through the
+// FileAccess returned by getFA at invocation time.
+func GlobSkill(getFA FileAccessFunc) *skills.Skill {
 	return skills.NewSkill("glob").
 		Description("Find files matching a glob pattern. Read-only.").
 		Domain("filesystem").
@@ -237,6 +269,18 @@ func GlobSkill() *skills.Skill {
 			}
 			if params.Dir == "" {
 				params.Dir = "."
+			}
+
+			if fa := getFA(); fa != nil {
+				matches, err := fa.Glob(ctx, params.Dir, params.Pattern, nil)
+				if err != nil {
+					return nil, fmt.Errorf("glob %s: %w", params.Dir, err)
+				}
+				return map[string]any{
+					"pattern": params.Pattern,
+					"matches": matches,
+					"count":   len(matches),
+				}, nil
 			}
 
 			var matches []string
@@ -269,8 +313,9 @@ func GlobSkill() *skills.Skill {
 		Build()
 }
 
-// GrepSkill returns a read-only text search skill.
-func GrepSkill() *skills.Skill {
+// GrepSkill returns a read-only text search skill that routes through the
+// FileAccess returned by getFA at invocation time.
+func GrepSkill(getFA FileAccessFunc) *skills.Skill {
 	return skills.NewSkill("grep").
 		Description("Search file contents for a pattern. Read-only.").
 		Domain("filesystem").
@@ -292,6 +337,20 @@ func GrepSkill() *skills.Skill {
 				return nil, fmt.Errorf("pattern and path are required")
 			}
 
+			const maxMatches = 100
+
+			if fa := getFA(); fa != nil {
+				faMatches, err := fa.Grep(ctx, params.Path, params.Pattern, params.Glob, 0, maxMatches)
+				if err != nil {
+					return nil, fmt.Errorf("search %s: %w", params.Path, err)
+				}
+				return map[string]any{
+					"pattern": params.Pattern,
+					"matches": faMatches,
+					"count":   len(faMatches),
+				}, nil
+			}
+
 			type match struct {
 				File string `json:"file"`
 				Line int    `json:"line"`
@@ -299,7 +358,6 @@ func GrepSkill() *skills.Skill {
 			}
 			var results []match
 
-			const maxMatches = 100
 			err := filepath.WalkDir(params.Path, func(path string, d fs.DirEntry, err error) error {
 				if err != nil || d.IsDir() {
 					return nil
@@ -364,6 +422,25 @@ func analysisResult(tool string, issues []ValidationIssue) map[string]any {
 		"issue_count": len(issues),
 		"issues":      issues,
 	}
+}
+
+func logAnalysisFindings(ctx context.Context, tool string, issues []ValidationIssue) {
+	if !HasBlockingIssues(issues) {
+		return
+	}
+	lm := agentShared.LogMetaFromContext(ctx)
+	if lm.EventLogger == nil {
+		return
+	}
+	blocking := 0
+	for _, issue := range issues {
+		if issue.Severity == Critical || issue.Severity == High {
+			blocking++
+		}
+	}
+	agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditFinding,
+		lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+		&agentlog.AuditPayload{Phase: tool, Finding: fmt.Sprintf("%d blocking issues", blocking)})
 }
 
 func countBySeverity(issues []ValidationIssue, sev Severity) int {

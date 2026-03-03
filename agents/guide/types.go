@@ -340,6 +340,18 @@ type RouteRequest struct {
 	SessionID string    `json:"session_id,omitempty"`
 	RequestID string    `json:"request_id,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+
+	// Metadata carries opaque key-value pairs that the Guide merges into
+	// ForwardedRequest.Metadata alongside classification phase metadata.
+	// Used by the orchestrator to propagate dispatch-time values (e.g.
+	// ack_topic) through the Guide to the target agent.
+	Metadata map[string]any `json:"metadata,omitempty"`
+
+	// Hops tracks how many times this request has been routed through the
+	// Guide. Incremented on each pass through handleRouteRequestMessage.
+	// When Hops exceeds maxRouteHops the Guide rejects the request with
+	// an error instead of forwarding, breaking routing loops structurally.
+	Hops int `json:"hops,omitempty"`
 }
 
 // RouteResponse represents a response from a target agent
@@ -396,6 +408,10 @@ type ForwardedRequest struct {
 	// Classification metadata
 	Confidence           float64 `json:"confidence"`
 	ClassificationMethod string  `json:"classification_method"` // "dsl" or "llm"
+
+	// Hops propagated from the original RouteRequest so that agents creating
+	// sub-requests can carry forward the hop count for loop detection.
+	Hops int `json:"hops,omitempty"`
 
 	// Cross-domain context (populated if multi_intent)
 	CrossDomain *CrossDomainContext `json:"cross_domain,omitempty"`

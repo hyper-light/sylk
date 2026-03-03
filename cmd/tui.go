@@ -704,6 +704,10 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 	orch.SignalReady()
 
+	// Load persisted agent model selections from the config file.
+	configPath := filepath.Join(projectRoot, ".sylk", "config.yaml")
+	modelStore := agentpkg.NewAgentModelStore(configPath)
+
 	// Seeds use placeholder IDs (agent type names). The UI's
 	// ensureAgent/promoteSeededAgent re-keys to UUIDs when activity
 	// events arrive from pre-activated agents.
@@ -717,6 +721,32 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 	// Populate per-agent supported models from the container registry.
 	populateSeedModels(seeds, containerReg)
+
+	// Enrich seeds with persisted model+provider selections so the UI shows the
+	// user's previous choice immediately on boot.
+	for i := range seeds {
+		entry := modelStore.EntryFor(seeds[i].AgentType)
+		seeds[i].PersistedModelID = entry.Model
+		seeds[i].PersistedProviderID = entry.Provider
+	}
+
+	// Write defaults for any agent not yet in the config file.
+	agentDefaults := make(map[string]agentpkg.AgentConfigEntry, len(seeds))
+	for _, s := range seeds {
+		if dflt := agentpkg.DefaultModelForAgentType(s.AgentType); dflt != "" {
+			agentDefaults[s.AgentType] = agentpkg.AgentConfigEntry{
+				Provider: agentpkg.DeriveProvider(dflt),
+				Model:    dflt,
+			}
+		}
+	}
+	if err := modelStore.EnsureDefaults(agentDefaults); err != nil {
+		slog.Warn("agent model config: ensure defaults", "error", err)
+	}
+
+	// Build the model swapper early so phase4 goroutines can apply
+	// persisted models after activation.
+	modelSwapper := buildModelSwapper(containerReg, googleGateway, anthropicGateway, openaiGateway)
 
 	// Background Phase 4: agent pre-activations, handoff supervisor,
 	// and auth probe run after deps are returned. Each child is a
@@ -757,10 +787,21 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// budget, the context cancels and EnsureActive returns immediately.
 	const phase4ActivationTimeout = 45 * time.Second
 
+	// activationsDone is closed after all activation goroutines finish,
+	// so the boot-model-swap goroutine can wait without deadlocking phase4Done.
+	activationsDone := make(chan struct{})
+	var activationsRemaining atomic.Int32
+
 	if activationCtrl != nil {
+		activationsRemaining.Add(3)
 		phase4Remaining.Add(3)
 		_ = scope.Go("phase4-activate-architect", phase4ActivationTimeout, func(bgCtx context.Context) error {
 			defer phase4Finish()
+			defer func() {
+				if activationsRemaining.Add(-1) == 0 {
+					close(activationsDone)
+				}
+			}()
 			p4Start := time.Now()
 			deadline, hasDL := bgCtx.Deadline()
 			slog.Info("phase4: architect activation start", "has_deadline", hasDL, "deadline", deadline)
@@ -781,6 +822,11 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		})
 		_ = scope.Go("phase4-activate-inspector", phase4ActivationTimeout, func(bgCtx context.Context) error {
 			defer phase4Finish()
+			defer func() {
+				if activationsRemaining.Add(-1) == 0 {
+					close(activationsDone)
+				}
+			}()
 			if _, err := activationCtrl.EnsureActive(bgCtx, "inspector"); err != nil {
 				slog.Warn("phase4: inspector activation failed", "error", err)
 				return nil
@@ -797,6 +843,11 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		})
 		_ = scope.Go("phase4-activate-tester", phase4ActivationTimeout, func(bgCtx context.Context) error {
 			defer phase4Finish()
+			defer func() {
+				if activationsRemaining.Add(-1) == 0 {
+					close(activationsDone)
+				}
+			}()
 			if _, err := activationCtrl.EnsureActive(bgCtx, "tester"); err != nil {
 				slog.Warn("phase4: tester activation failed", "error", err)
 				return nil
@@ -811,6 +862,8 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 			_ = registerAgentWithGuide(g, gt, "tester")
 			return nil
 		})
+	} else {
+		close(activationsDone)
 	}
 
 	// B: Handoff supervisor (tolerates nil arch)
@@ -829,6 +882,35 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	_ = scope.Go("phase4-auth-probe", 0, func(_ context.Context) error {
 		defer phase4Finish()
 		authRegistry.ProbeAll()
+		return nil
+	})
+
+	// D: Apply persisted model+provider to agent backends.
+	// Runs after activations so SwapModel targets live agents.
+	phase4Remaining.Add(1)
+	_ = scope.Go("phase4-boot-model-swap", phase4ActivationTimeout, func(bgCtx context.Context) error {
+		defer phase4Finish()
+		// Wait for activations to complete before swapping.
+		select {
+		case <-activationsDone:
+		case <-bgCtx.Done():
+			return nil
+		}
+		for _, s := range seeds {
+			if bgCtx.Err() != nil {
+				return nil
+			}
+			dflt := agentpkg.DefaultModelForAgentType(s.AgentType)
+			persisted := modelStore.ModelFor(s.AgentType)
+			if persisted == "" || persisted == dflt {
+				continue
+			}
+			if err := modelSwapper(bgCtx, s.AgentType, persisted); err != nil {
+				slog.Warn("boot model swap failed", "agent", s.AgentType, "model", persisted, "error", err)
+			} else {
+				slog.Info("boot model swap applied", "agent", s.AgentType, "model", persisted)
+			}
+		}
 		return nil
 	})
 
@@ -903,7 +985,13 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		GitBus:            gitRes.bus,
 		SafetyGuard:       gitRes.guard,
 		SeedAgents:        seeds,
-		ModelSwap:         buildModelSwapper(containerReg, googleGateway, anthropicGateway, openaiGateway),
+		ModelSwap:         modelSwapper,
+		ModelSave: func(agentType, provider, modelID string) {
+			if err := modelStore.SetEntry(agentType, provider, modelID); err != nil {
+				slog.Warn("agent model config: save", "agent", agentType, "provider", provider, "model", modelID, "error", err)
+			}
+		},
+		AgentModelStore: modelStore,
 	}
 
 	return deps, cleanup, nil
@@ -963,7 +1051,7 @@ func registerAgentCreators(
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, googleGw, anthropicGw, openaiGw, actCtrlRef)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, googleGw, anthropicGw, openaiGw, actCtrlRef)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
@@ -972,6 +1060,7 @@ func registerOnDemandAgentCreators(
 	reg *container.AgentCreatorRegistry,
 	ids *container.AgentIdentityRegistry,
 	bus guide.EventBus,
+	actPub events.ActivityPublisher,
 	googleGw *gateway.ProviderGateway,
 	anthropicGw *gateway.ProviderGateway,
 	openaiGw *gateway.ProviderGateway,
@@ -1065,6 +1154,7 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
+		pi.SetActivityPublisher(actPub)
 		if startErr := pi.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1121,6 +1211,7 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
+		pt.SetActivityPublisher(actPub)
 		if startErr := pt.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1143,7 +1234,7 @@ func registerOnDemandAgentCreators(
 			return nil, fmt.Errorf("engineer provider: %w", engProvErr)
 		}
 		wrapped := openaiGw.WrapProvider(engProvider, gateway.PriorityExecution)
-		engCfg := engineer.Config{ID: engineerID}
+		engCfg := engineer.Config{ID: engineerID, ActivityPub: actPub}
 		if ac := actCtrlRef.Load(); ac != nil {
 			engCfg.RequestGuard = func() func() {
 				return ac.AcquireRequestGuard("engineer")
@@ -1171,7 +1262,7 @@ func registerOnDemandAgentCreators(
 			return nil, fmt.Errorf("designer google provider: %w", err)
 		}
 		wrapped := googleGw.WrapProvider(provider, gateway.PriorityExecution)
-		desCfg := designer.Config{ID: designerID}
+		desCfg := designer.Config{ID: designerID, ActivityPub: actPub}
 		if ac := actCtrlRef.Load(); ac != nil {
 			desCfg.RequestGuard = func() func() {
 				return ac.AcquireRequestGuard("designer")
@@ -1726,7 +1817,8 @@ func createSwapProvider(
 				Model:     modelID,
 				MaxTokens: container.SwapMaxTokens,
 			},
-			AuthMode: "api_key",
+			ReasoningEffort: "xhigh",
+			AuthMode:        "api_key",
 		})
 		if err != nil {
 			return nil, err

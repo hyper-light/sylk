@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 
+	agentShared "github.com/adalundhe/sylk/agents/shared"
+
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -20,6 +23,11 @@ func (pi *PipelineInspector) runFeedbackLoop(
 	}
 
 	if !shared.HasBlockingIssues(issues) {
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.ValidationPayload{Phase: "early_pass", Success: true})
+		}
 		result.Passed = true
 		result.Issues = issues
 		return result, nil
@@ -29,6 +37,11 @@ func (pi *PipelineInspector) runFeedbackLoop(
 	currentIssues := issues
 
 	for loop := range pi.config.MaxFeedbackLoops {
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationCorrection,
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.ValidationPayload{Phase: "correction_loop", TaskID: fmt.Sprintf("loop_%d", loop+1)})
+		}
 		corrections := generateCorrections(currentIssues)
 		feedback := shared.InspectorFeedback{
 			Loop:        loop + 1,
@@ -47,6 +60,11 @@ func (pi *PipelineInspector) runFeedbackLoop(
 			resp, err := pi.requestRouteSync(ctx, "engineer", string(payload))
 			if err != nil {
 				pi.logger.Warn("correction routing failed", "loop", loop+1, "error", err)
+				if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+						lm.AgentID, lm.SessionID, lm.CorrID, "error",
+						&agentlog.ErrorPayload{Error: fmt.Sprintf("correction routing failed loop %d: %v", loop+1, err)})
+				}
 			}
 			_ = resp
 		}
@@ -68,8 +86,13 @@ func (pi *PipelineInspector) runFeedbackLoop(
 			Tools:     pi.buildToolDefinitions(),
 		}
 
-		_, err := pi.executeToolLoop(ctx, req)
+		_, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 		if err != nil {
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ValidationPayload{Phase: "revalidation_failed", TaskID: fmt.Sprintf("loop_%d", loop+1), Success: false})
+			}
 			feedback.Passed = false
 			feedbackHistory = append(feedbackHistory, feedback)
 			break
@@ -81,6 +104,11 @@ func (pi *PipelineInspector) runFeedbackLoop(
 		feedbackHistory = append(feedbackHistory, feedback)
 
 		if feedback.Passed {
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.ValidationPayload{Phase: "revalidation_passed", TaskID: fmt.Sprintf("loop_%d", loop+1), Success: true})
+			}
 			result.Passed = true
 			break
 		}

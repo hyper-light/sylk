@@ -149,6 +149,23 @@ func (sr *SessionRouter) RemoveSession(sessionID string) {
 	sr.stats.ActiveSessions--
 }
 
+// ClearClassificationCaches removes all per-session classification caches
+// while preserving session routing preferences (preferred agents, blocked
+// agents, thresholds). Used during model swap: cached classification results
+// from the previous provider are invalid, but user-configured preferences
+// should survive the swap.
+func (sr *SessionRouter) ClearClassificationCaches() {
+	if sr == nil {
+		return
+	}
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	clear(sr.sessionCaches)
+	// sessionPrefs are intentionally preserved — they represent user
+	// configuration, not model-dependent classification state.
+}
+
 // evictLeastUsedSessionLocked removes the least-used session to make room.
 // First pass: evict empty sessions. Second pass: evict session with lowest
 // hit count (LFU). Caller must hold sr.mu write lock.

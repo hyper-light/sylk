@@ -54,6 +54,9 @@ const (
 	EventTypeSteeringEdit       EventType = 20
 	EventTypeSteeringRollback   EventType = 21
 	EventTypeSteeringCheckpoint EventType = 22
+
+	// Agent lifecycle events
+	EventTypeAgentRegistered EventType = 23
 )
 
 // ValidEventTypes returns all valid EventType values.
@@ -82,6 +85,7 @@ func ValidEventTypes() []EventType {
 		EventTypeSteeringEdit,
 		EventTypeSteeringRollback,
 		EventTypeSteeringCheckpoint,
+		EventTypeAgentRegistered,
 	}
 }
 
@@ -135,6 +139,16 @@ func (et EventType) String() string {
 		return "success"
 	case EventTypeFailure:
 		return "failure"
+	case EventTypeSteeringInject:
+		return "steering_inject"
+	case EventTypeSteeringEdit:
+		return "steering_edit"
+	case EventTypeSteeringRollback:
+		return "steering_rollback"
+	case EventTypeSteeringCheckpoint:
+		return "steering_checkpoint"
+	case EventTypeAgentRegistered:
+		return "agent_registered"
 	default:
 		return fmt.Sprintf("event_type(%d)", et)
 	}
@@ -180,6 +194,16 @@ func ParseEventType(value string) (EventType, bool) {
 		return EventTypeSuccess, true
 	case "failure":
 		return EventTypeFailure, true
+	case "steering_inject":
+		return EventTypeSteeringInject, true
+	case "steering_edit":
+		return EventTypeSteeringEdit, true
+	case "steering_rollback":
+		return EventTypeSteeringRollback, true
+	case "steering_checkpoint":
+		return EventTypeSteeringCheckpoint, true
+	case "agent_registered":
+		return EventTypeAgentRegistered, true
 	default:
 		return EventType(0), false
 	}
@@ -375,21 +399,22 @@ func (v EventVisibility) IsUserVisible() bool {
 
 // ActivityEvent represents a single activity event in the system.
 type ActivityEvent struct {
-	ID         string               `json:"id"`
-	EventType  EventType            `json:"event_type"`
-	Timestamp  time.Time            `json:"timestamp"`
-	SessionID  string               `json:"session_id"`
-	AgentID    string               `json:"agent_id,omitempty"`
-	Content    string               `json:"content"`
-	Summary    string               `json:"summary,omitempty"`
-	Category   string               `json:"category,omitempty"`
-	FilePaths  []string             `json:"file_paths,omitempty"`
-	Keywords   []string             `json:"keywords,omitempty"`
-	RelatedIDs []string             `json:"related_ids,omitempty"`
-	Outcome    EventOutcome         `json:"outcome"`
-	Importance float64              `json:"importance"`
-	Visibility EventVisibility      `json:"visibility"`
-	Data       map[string]any       `json:"data,omitempty"`
+	ID            string          `json:"id"`
+	EventType     EventType       `json:"event_type"`
+	Timestamp     time.Time       `json:"timestamp"`
+	SessionID     string          `json:"session_id"`
+	CorrelationID string          `json:"correlation_id,omitempty"`
+	AgentID       string          `json:"agent_id,omitempty"`
+	Content       string          `json:"content"`
+	Summary       string          `json:"summary,omitempty"`
+	Category      string          `json:"category,omitempty"`
+	FilePaths     []string        `json:"file_paths,omitempty"`
+	Keywords      []string        `json:"keywords,omitempty"`
+	RelatedIDs    []string        `json:"related_ids,omitempty"`
+	Outcome       EventOutcome    `json:"outcome"`
+	Importance    float64         `json:"importance"`
+	Visibility    EventVisibility `json:"visibility"`
+	Data          map[string]any  `json:"data,omitempty"`
 }
 
 // NewActivityEvent creates a new ActivityEvent with the given type, session ID, and content.
@@ -437,6 +462,12 @@ func defaultImportance(eventType EventType) float64 {
 		return 0.30
 	case EventTypeIndexError:
 		return 0.80
+	case EventTypeSteeringInject, EventTypeSteeringEdit, EventTypeSteeringRollback:
+		return 0.70
+	case EventTypeSteeringCheckpoint:
+		return 0.35
+	case EventTypeAgentRegistered:
+		return 0.20
 	default:
 		return 0.50
 	}

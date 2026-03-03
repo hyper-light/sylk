@@ -340,6 +340,18 @@ type EngineerResponse struct {
 	Timestamp time.Time   `json:"timestamp"`
 }
 
+// ResponseText implements the guide-layer responseTexter interface so the
+// conversation history stores the clean output string, not a JSON blob.
+func (r *EngineerResponse) ResponseText() string {
+	if r == nil {
+		return ""
+	}
+	if r.Result != nil && r.Result.Output != "" {
+		return r.Result.Output
+	}
+	return r.Error
+}
+
 type CheckpointState struct {
 	TaskID     string         `json:"task_id"`
 	EngineerID string         `json:"engineer_id"`

@@ -14,6 +14,7 @@ type PipelineUpdate struct {
 	AgentID   string    `json:"agent_id"`
 	AgentType string    `json:"agent_type"`
 	Status    string    `json:"status"`
+	Stage     string    `json:"stage,omitempty"` // Pipeline stage: "inspect", "test", "execute"
 	Progress  float64   `json:"progress"`
 	Message   string    `json:"message"`
 	Output    any       `json:"output,omitempty"`

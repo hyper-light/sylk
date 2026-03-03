@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
 	"github.com/adalundhe/sylk/core/skills"
@@ -36,6 +37,7 @@ type GuideResponder struct {
 	toolDefs    func(input string) []providers.Tool
 	toolInvoker func(ctx context.Context, name string, arguments string) (string, error)
 	maxToolRuns int
+	eventLogger *agentlog.SessionEventLogger
 }
 
 type guideThoughtEmitter func(string)
@@ -119,7 +121,14 @@ func (r *GuideResponder) respondInternal(
 	consecutiveErrors := 0
 
 	for turn := range r.maxToolRuns + 1 {
+		// NOTE: Steering checkpoint integration deferred for guide self-response
+		// due to agents/shared ↔ agents/guide import cycle. The guide's tool loop
+		// is stateless (no ledger), so DrainAndCheckpoint would be a no-op.
+		// When guide gets its own ledger, use core/steering directly here.
+
+		turnStart := time.Now()
 		resp, err := r.provider.Complete(guardedCtx, req)
+		logClassifierLLMCall(r.eventLogger, r.model, resp, time.Since(turnStart), err)
 		if err != nil {
 			return "", nil, fmt.Errorf("guide model %s: %w", r.model, err)
 		}

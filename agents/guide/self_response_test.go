@@ -262,3 +262,86 @@ func TestRespondGuideSelf_FallsBackToRespond(t *testing.T) {
 		t.Fatalf("unexpected chunks: %#v", chunks)
 	}
 }
+
+// =============================================================================
+// Context Cancellation Tests
+// =============================================================================
+
+func TestFallbackGuideResponder_Respond_NoFallbackOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	fallbackStub := &stubGuideResponder{reply: "static fallback"}
+	responder := NewFallbackGuideResponder(
+		&stubGuideResponder{err: errors.New("provider error")},
+		fallbackStub,
+	)
+	// Meta query that would normally trigger static fallback.
+	reply, err := responder.Respond(ctx, GuideSelfResponseRequest{Input: "status"})
+	if err == nil {
+		t.Fatal("expected error when context is cancelled")
+	}
+	if reply != "" {
+		t.Fatalf("reply = %q, want empty on cancelled context", reply)
+	}
+	if fallbackStub.calls != 0 {
+		t.Fatalf("fallback called %d times, want 0 on cancelled context", fallbackStub.calls)
+	}
+}
+
+func TestFallbackGuideResponder_RespondStream_NoFallbackOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	fallbackStub := &stubStreamGuideResponder{reply: "static fallback"}
+	responder := NewFallbackGuideResponder(
+		&stubStreamGuideResponder{err: errors.New("provider error")},
+		fallbackStub,
+	)
+	reply, _, err := responder.(GuideSelfStreamResponder).RespondStream(
+		ctx,
+		GuideSelfResponseRequest{Input: "status"},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected error when context is cancelled")
+	}
+	if reply != "" {
+		t.Fatalf("reply = %q, want empty on cancelled context", reply)
+	}
+	if fallbackStub.streamCalls != 0 {
+		t.Fatalf("fallback stream called %d times, want 0", fallbackStub.streamCalls)
+	}
+}
+
+// =============================================================================
+// Static Reply Detection Tests
+// =============================================================================
+
+func TestIsStaticGuideReply(t *testing.T) {
+	tests := []struct {
+		name  string
+		reply string
+		want  bool
+	}{
+		{"online", guideOnlineReply, true},
+		{"help", guideHelpReply, true},
+		{"chat", guideChatReply, true},
+		{"wellbeing", "I'm doing well and ready to help. Ask anything.", true},
+		{"status", "Guide is running. Pending requests: 2. Registered agents: 3.", true},
+		{"agents_list", "Registered agents (3): architect, guide, tester", true},
+		{"agent_count", "There are 3 registered agents right now.", true},
+		{"capabilities", "Sylk can route requests across specialized agents.", true},
+		{"no_agents", "No agents are currently registered.", true},
+		{"llm_reply", "Here's how to set up OAuth authentication with your app...", false},
+		{"empty", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isStaticGuideReply(tt.reply)
+			if got != tt.want {
+				t.Fatalf("isStaticGuideReply(%q) = %v, want %v", tt.reply, got, tt.want)
+			}
+		})
+	}
+}

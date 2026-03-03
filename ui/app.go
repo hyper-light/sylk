@@ -299,14 +299,24 @@ type Deps struct {
 	// agentType is the canonical type (e.g. "engineer", "architect").
 	// Returns nil on success or the swap error.
 	ModelSwap func(ctx context.Context, agentType, modelID string) error
+
+	// ModelSave persists a successful model selection to the config file.
+	// Called after a successful swap; errors are logged but non-fatal.
+	ModelSave func(agentType, provider, modelID string)
+
+	// AgentModelStore provides persisted model selections so dynamically-
+	// created agents (engineer, designer, etc.) pick up previous choices.
+	AgentModelStore *agentpkg.AgentModelStore
 }
 
 // AgentSeed describes an agent to pre-populate in the UI agent panel.
 type AgentSeed struct {
-	ID              string
-	AgentType       string
-	Name            string
-	SupportedModels []agentpkg.ModelEntry
+	ID                  string
+	AgentType           string
+	Name                string
+	SupportedModels     []agentpkg.ModelEntry
+	PersistedModelID    string // From config file; overrides default when valid.
+	PersistedProviderID string // From config file; provider for PersistedModelID.
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +378,7 @@ type AppModel struct {
 	// Interrupt
 	interruptHandler *interrupt.Handler
 	lastEscTime      time.Time
+	escPressCount    int // consecutive Esc presses within the 1s window
 
 	// Clipboard
 	clipboard register.ClipboardProvider
@@ -595,8 +606,8 @@ type AppModel struct {
 	agentContextTokens map[string]int
 	streamUsage        map[string]streamUsageEntry
 	streamedResponses  map[string]streamedResponseState
-	activeRoute              activeRouteState
-	interruptedCorrelations map[string]struct{} // Correlation IDs killed by interrupt.
+	activeStreams            map[string]*activeStreamEntry // key = correlationID
+	interruptedCorrelations map[string]struct{}           // Correlation IDs killed by interrupt.
 	engagedAgentID          string              // Sticky agent the user is conversing with.
 	manualTargetAgent  string
 
@@ -628,9 +639,11 @@ type streamedResponseState struct {
 	SeenAt    time.Time
 }
 
-type activeRouteState struct {
+type activeStreamEntry struct {
 	CorrelationID string
 	AgentID       string
+	SteeringPace  string    // "auto", "step", "paused" — tracks current pace for UI display.
+	StartedAt     time.Time
 }
 
 const streamedResponseStateTTL = 45 * time.Second
@@ -817,6 +830,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		agentContextTokens:     make(map[string]int),
 		streamUsage:            make(map[string]streamUsageEntry),
 		streamedResponses:      make(map[string]streamedResponseState),
+		activeStreams:          make(map[string]*activeStreamEntry),
 		oauthSessions:          newOAuthSessionManager(),
 		focusGradient:       th.Palette.IdleFocusRingGradient(),
 		idleFocusGradient:   th.Palette.IdleFocusRingGradient(),
@@ -833,9 +847,14 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	app.loginPanel.SetClipboard(app.clipboard.Get)
 	app.loginPanel.SetClipboardWrite(app.clipboard.Set)
 
+	// Inject model store so dynamically-created agents read persisted models.
+	if deps.AgentModelStore != nil {
+		app.agentPanel.SetModelStore(deps.AgentModelStore)
+	}
+
 	// Pre-populate agent panel with known agents from bootstrap.
 	for _, seed := range deps.SeedAgents {
-		app.agentPanel.SeedAgent(seed.ID, seed.AgentType, seed.Name, seed.SupportedModels)
+		app.agentPanel.SeedAgent(seed.ID, seed.AgentType, seed.Name, seed.SupportedModels, seed.PersistedModelID, seed.PersistedProviderID)
 	}
 
 	app.comp = compositor.New()
@@ -2208,6 +2227,27 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleStreamReroute(typed)
 	case msg.GuideResponseMsg:
 		return m, m.handleGuideResponse(typed)
+	case msg.RetryStatusMsg:
+		if typed.CorrelationID != "" {
+			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
+				return m, nil
+			}
+		}
+		return m, m.propagate(typed)
+	case msg.ToolCallEventMsg:
+		if typed.CorrelationID != "" {
+			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
+				return m, nil
+			}
+		}
+		return m, m.propagate(typed)
+	case msg.ActivityEventMsg:
+		if typed.Event != nil && typed.Event.CorrelationID != "" {
+			if _, interrupted := m.interruptedCorrelations[typed.Event.CorrelationID]; interrupted {
+				return m, nil
+			}
+		}
+		return m, m.propagate(typed)
 	case modal.ModalClosedMsg:
 		return m, m.handleModalClosed(typed.Result)
 	case msg.LSPDiagnosticMsg:
@@ -2648,8 +2688,8 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statusBar.SetFlash("Queue paused")
 		} else {
 			m.statusBar.SetFlash("Queue resumed")
-			// Try to advance if we just unpaused and the route is clear.
-			if strings.TrimSpace(m.activeRoute.CorrelationID) == "" {
+			// Try to advance if we just unpaused and no streams are active.
+			if !m.hasActiveStreams() {
 				return m, m.tryAdvanceQueue()
 			}
 		}
@@ -2679,6 +2719,12 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statusBar.SetFlash(fmt.Sprintf("Cancelled %d queued prompts", n))
 		}
 		return m, nil
+	}
+
+	// Alt+;: toggle steering pace (auto → step → paused → auto).
+	// Only active when an agent is processing a request.
+	if ks == "alt+;" && m.hasActiveStreams() {
+		return m, m.toggleSteeringPace()
 	}
 
 	// Alt+R: find references for symbol under cursor (edit mode).
@@ -2855,10 +2901,23 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		now := time.Now()
 		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
+			m.escPressCount++
+			m.lastEscTime = now
+			if m.escPressCount == 2 {
+				// Double-Esc: interrupt selected/engaged agent only.
+				// Call first, then set flash — interruptActiveRoute sets its own
+				// flash which would overwrite the hint if set beforehand.
+				cmd := m.interruptActiveRoute("esc")
+				m.statusBar.SetFlash("Agent interrupted · Esc again to interrupt all")
+				return m, cmd
+			}
+			// Triple-Esc (or more): interrupt ALL active agents.
 			m.lastEscTime = time.Time{}
-			return m, m.interruptActiveRoute("esc")
+			m.escPressCount = 0
+			return m, m.interruptAllActiveRoutes("esc-all")
 		}
 		m.lastEscTime = now
+		m.escPressCount = 1
 		m.statusBar.SetFlash("Press Esc again to interrupt agent")
 		return m, nil
 	}
@@ -3158,8 +3217,17 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 	submit.TargetAgent = targetAgent
 	submit.SessionID = m.resolveRouteSessionID(submit.SessionID)
 
-	// If there's an active route, enqueue instead of dispatching immediately.
-	if strings.TrimSpace(m.activeRoute.CorrelationID) != "" {
+	// If any agents are streaming, either steer the target agent or enqueue.
+	if m.hasActiveStreams() {
+		// Find the active stream for the target agent (or engaged agent).
+		steerTarget := targetAgent
+		if steerTarget == "" {
+			steerTarget = m.engagedAgentID
+		}
+		if stream := m.activeStreamForAgent(steerTarget); stream != nil {
+			return m.publishSteerAction(submit.Text)
+		}
+		// Target agent is not streaming — queue for after the active request completes.
 		_, ok := m.promptQueue.Enqueue(uuid.New().String(), submit.Text, submit.TargetAgent, submit.SessionID)
 		if !ok {
 			m.pushSystemChat(fmt.Sprintf("%d requests pending. Please wait before sending another message!", m.promptQueue.PendingCount()))
@@ -3640,17 +3708,23 @@ func (m *AppModel) handleModelChange(change msg.ModelChangeMsg) tea.Cmd {
 }
 
 // handleModelSwapResult processes the result of a backend model swap.
-// On error, reverts the optimistic UI update and logs a warning.
+// On success, persists the selection. On error, reverts the optimistic UI
+// update and logs a warning.
 func (m *AppModel) handleModelSwapResult(result msg.ModelSwapResultMsg) tea.Cmd {
 	if result.Err != nil {
-		// Revert the UI's optimistic ModelID update.
-		prev := agentpkg.DefaultModelForAgentType(result.AgentType)
+		// Revert the UI's optimistic ModelID update to the persisted model.
+		prev := m.agentPanel.PersistedModelFor(result.AgentType)
 		m.agentPanel.RevertModelID(result.AgentID, prev)
 		slog.Warn("model swap failed",
 			"agent", result.AgentID,
 			"agent_type", result.AgentType,
 			"model", result.ModelID,
 			"error", result.Err)
+		return nil
+	}
+	if m.deps.ModelSave != nil {
+		provider := agentpkg.DeriveProvider(result.ModelID)
+		m.deps.ModelSave(result.AgentType, provider, result.ModelID)
 	}
 	return nil
 }
@@ -3926,9 +4000,8 @@ func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
 	m.pushInterruptedChatMessage(agentID)
 	m.finalizeStreamUsage(correlationID, false, "interrupted")
 	m.markQueueEntryByCorrelation(correlationID, false)
-	m.clearActiveRoute(correlationID)
+	m.unregisterStream(correlationID)
 	m.agentPanel.DemoteAllActive()
-	m.agentPanel.LockSelection()
 	if m.statusBar != nil {
 		m.statusBar.SetTokenPhase(status.PhaseIdle)
 	}
@@ -3951,6 +4024,182 @@ func (m *AppModel) interruptActiveRoute(reason string) tea.Cmd {
 		Timestamp:     time.Now(),
 	}
 	busMsg := guide.NewUserInterruptMessage("", interruptReq)
+	return func() tea.Msg {
+		if err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg); err != nil {
+			return msg.StreamErrorMsg{
+				SessionID:     m.resolveRouteSessionID(""),
+				CorrelationID: correlationID,
+				Err:           err,
+			}
+		}
+		return nil
+	}
+}
+
+// interruptAllActiveRoutes interrupts every active stream — all agents.
+// Triggered by triple-Esc. Each active stream gets its own interrupt
+// request so every agent receives a cancel action.
+func (m *AppModel) interruptAllActiveRoutes(reason string) tea.Cmd {
+	// Collect all active stream entries.
+	targets := make([]activeStreamEntry, 0, len(m.activeStreams))
+	for _, entry := range m.activeStreams {
+		targets = append(targets, *entry)
+	}
+	// If no active streams (e.g. double-Esc already unregistered the only
+	// stream), fall back to the single-target path and ensure the flash
+	// reflects that all agents are interrupted.
+	if len(targets) == 0 {
+		cmd := m.interruptActiveRoute(reason)
+		m.statusBar.SetFlash("All agents interrupted")
+		return cmd
+	}
+
+	// UI cleanup — same as interruptActiveRoute but for all streams.
+	m.chat.MuteThinking("")
+	m.chat.AbortStream()
+	if m.interruptedCorrelations == nil {
+		m.interruptedCorrelations = make(map[string]struct{})
+	}
+	for _, t := range targets {
+		m.interruptedCorrelations[t.CorrelationID] = struct{}{}
+		m.finalizeStreamUsage(t.CorrelationID, false, "interrupted")
+		m.markQueueEntryByCorrelation(t.CorrelationID, false)
+		m.unregisterStream(t.CorrelationID)
+	}
+	m.pushInterruptedChatMessage("all agents")
+	m.agentPanel.DemoteAllActive()
+	if m.statusBar != nil {
+		m.statusBar.SetTokenPhase(status.PhaseIdle)
+	}
+	if !m.promptQueue.IsEmpty() {
+		m.promptQueue.SetPaused(true)
+		m.recalcLayout()
+		m.viewDirty = true
+	}
+	m.statusBar.SetFlash("All agents interrupted")
+
+	if m.deps.GuideBus == nil {
+		return nil
+	}
+
+	// Build interrupt messages for every active stream.
+	messages := make([]*guide.Message, 0, len(targets))
+	for _, t := range targets {
+		req := &guide.UserInterruptRequest{
+			CorrelationID: t.CorrelationID,
+			SourceAgentID: sourceAgentTUI,
+			Reason:        strings.TrimSpace(reason),
+			Timestamp:     time.Now(),
+		}
+		messages = append(messages, guide.NewUserInterruptMessage("", req))
+	}
+
+	return func() tea.Msg {
+		for _, busMsg := range messages {
+			_ = m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg)
+		}
+		return nil
+	}
+}
+
+// publishSteerAction sends a live steering command to the active agent
+// via the guide bus. The user's text is injected into the agent's tool loop
+// at the next checkpoint boundary.
+func (m *AppModel) publishSteerAction(text string) tea.Cmd {
+	// Resolve the target agent's active stream for steering.
+	target := m.manualTargetAgent
+	if target == "" {
+		target = m.engagedAgentID
+	}
+	stream := m.activeStreamForAgent(target)
+	if stream == nil {
+		return nil
+	}
+	correlationID := stream.CorrelationID
+	agentID := stream.AgentID
+	if correlationID == "" || m.deps.GuideBus == nil {
+		return nil
+	}
+
+	// Show the steering input with holographic shimmer until the agent acknowledges.
+	m.chat.PushSteeringEntry(text, correlationID)
+
+	actionReq := &guide.ActionRequest{
+		CorrelationID: correlationID,
+		SourceAgentID: sourceAgentTUI,
+		TargetAgentID: agentID,
+		Action:        "steer",
+		Data:          text,
+		FireAndForget: true,
+		Timestamp:     time.Now(),
+	}
+	busMsg := guide.NewActionMessage("", actionReq)
+
+	return func() tea.Msg {
+		if err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg); err != nil {
+			return msg.StreamErrorMsg{
+				SessionID:     m.resolveRouteSessionID(""),
+				CorrelationID: correlationID,
+				Err:           err,
+			}
+		}
+		return nil
+	}
+}
+
+// toggleSteeringPace cycles the steering pace: auto → step → paused → auto.
+func (m *AppModel) toggleSteeringPace() tea.Cmd {
+	// Find the selected/engaged agent's active stream to read/write pace.
+	target := m.manualTargetAgent
+	if target == "" {
+		target = m.engagedAgentID
+	}
+	stream := m.activeStreamForAgent(target)
+	if stream == nil {
+		return nil
+	}
+	var next string
+	switch stream.SteeringPace {
+	case "", "auto":
+		next = "step"
+	case "step":
+		next = "paused"
+	default:
+		next = "auto"
+	}
+	stream.SteeringPace = next
+	m.statusBar.SetFlash(fmt.Sprintf("Steering pace: %s", next))
+	return m.publishPaceAction(next)
+}
+
+// publishPaceAction sends a pace-change action to the active agent.
+func (m *AppModel) publishPaceAction(pace string) tea.Cmd {
+	// Resolve the target agent's active stream for the pace action.
+	target := m.manualTargetAgent
+	if target == "" {
+		target = m.engagedAgentID
+	}
+	stream := m.activeStreamForAgent(target)
+	if stream == nil {
+		return nil
+	}
+	correlationID := stream.CorrelationID
+	agentID := stream.AgentID
+	if correlationID == "" || m.deps.GuideBus == nil {
+		return nil
+	}
+
+	actionReq := &guide.ActionRequest{
+		CorrelationID: correlationID,
+		SourceAgentID: sourceAgentTUI,
+		TargetAgentID: agentID,
+		Action:        "pace",
+		Data:          map[string]any{"pace": pace},
+		FireAndForget: true,
+		Timestamp:     time.Now(),
+	}
+	busMsg := guide.NewActionMessage("", actionReq)
+
 	return func() tea.Msg {
 		if err := m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg); err != nil {
 			return msg.StreamErrorMsg{
@@ -3996,29 +4245,30 @@ func interruptAgentDisplayName(agentID string) string {
 	return strings.ToUpper(trimmed[:1]) + trimmed[1:]
 }
 
-func (m *AppModel) setActiveRoute(correlationID, agentID string) {
+// registerStream adds a stream to the active set. Idempotent — no-op if
+// the correlationID is already registered. Multiple agents can stream
+// concurrently (e.g. architect + orchestrator).
+func (m *AppModel) registerStream(correlationID, agentID string) {
 	correlationID = strings.TrimSpace(correlationID)
 	if correlationID == "" {
 		return
 	}
-	if current := strings.TrimSpace(m.activeRoute.CorrelationID); current != "" && current != correlationID {
+	if m.activeStreams == nil {
+		m.activeStreams = make(map[string]*activeStreamEntry)
+	}
+	if _, exists := m.activeStreams[correlationID]; exists {
 		return
 	}
-	m.activeRoute.CorrelationID = correlationID
-	if strings.TrimSpace(agentID) != "" {
-		m.activeRoute.AgentID = normalizeAgentID(agentID)
+	m.activeStreams[correlationID] = &activeStreamEntry{
+		CorrelationID: correlationID,
+		AgentID:       normalizeAgentID(agentID),
+		StartedAt:     time.Now(),
 	}
 }
 
-func (m *AppModel) beginActiveRoute(correlationID, agentID string) {
-	correlationID = strings.TrimSpace(correlationID)
-	if correlationID == "" {
-		return
-	}
-	m.activeRoute.CorrelationID = correlationID
-	m.activeRoute.AgentID = normalizeAgentID(agentID)
-}
-
+// shouldRenderStreamEvent returns true when the correlationID belongs to
+// a registered (active) stream. When no streams are active, any event is
+// accepted — this preserves the "first-event wins" bootstrap behaviour.
 func (m *AppModel) shouldRenderStreamEvent(correlationID string) bool {
 	correlationID = strings.TrimSpace(correlationID)
 	if correlationID == "" {
@@ -4027,35 +4277,33 @@ func (m *AppModel) shouldRenderStreamEvent(correlationID string) bool {
 	if _, interrupted := m.interruptedCorrelations[correlationID]; interrupted {
 		return false
 	}
-	active := strings.TrimSpace(m.activeRoute.CorrelationID)
-	if active == "" {
+	if len(m.activeStreams) == 0 {
 		return true
 	}
-	return active == correlationID
+	_, active := m.activeStreams[correlationID]
+	return active
 }
 
-func (m *AppModel) clearActiveRoute(correlationID string) {
-	correlationID = strings.TrimSpace(correlationID)
-	if correlationID == "" {
-		return
-	}
-	if strings.TrimSpace(m.activeRoute.CorrelationID) != correlationID {
-		return
-	}
-	m.activeRoute = activeRouteState{}
+// unregisterStream removes the given correlationID from the active set.
+func (m *AppModel) unregisterStream(correlationID string) {
+	delete(m.activeStreams, strings.TrimSpace(correlationID))
 }
 
-// forceResetActiveRoute unconditionally clears the activeRoute when the
-// current correlationID matches. Used during reroutes where the old stream
-// is abandoned and a new correlationID takes over.
-func (m *AppModel) forceResetActiveRoute(oldCorrelationID string) {
-	oldCorrelationID = strings.TrimSpace(oldCorrelationID)
-	if oldCorrelationID == "" {
-		return
+// activeStreamForAgent returns the active stream entry for the given agent,
+// or nil if the agent has no active stream.
+func (m *AppModel) activeStreamForAgent(agentID string) *activeStreamEntry {
+	normalized := normalizeAgentID(agentID)
+	for _, entry := range m.activeStreams {
+		if entry.AgentID == normalized {
+			return entry
+		}
 	}
-	if strings.TrimSpace(m.activeRoute.CorrelationID) == oldCorrelationID {
-		m.activeRoute = activeRouteState{}
-	}
+	return nil
+}
+
+// hasActiveStreams reports whether any streams are currently active.
+func (m *AppModel) hasActiveStreams() bool {
+	return len(m.activeStreams) > 0
 }
 
 // tryAdvanceQueue dispatches the next pending queue entry if the queue is
@@ -4088,11 +4336,14 @@ func (m *AppModel) dispatchQueueHead() tea.Cmd {
 		TargetAgent: entry.TargetAgent,
 		SessionID:   entry.SessionID,
 	}
-	// The activeRoute is now clear, so handleSubmit will dispatch normally.
+	// Active streams are clear, so handleSubmit will dispatch normally.
 	cmd := m.handleSubmit(submit)
-	// Mark the queue entry as active with the new correlation ID.
-	if strings.TrimSpace(m.activeRoute.CorrelationID) != "" {
-		m.promptQueue.MarkActive(entry.ID, m.activeRoute.CorrelationID)
+	// Mark the queue entry as active with the latest correlation ID.
+	if m.hasActiveStreams() {
+		for cid := range m.activeStreams {
+			m.promptQueue.MarkActive(entry.ID, cid)
+			break
+		}
 	}
 	m.recalcLayout()
 	m.viewDirty = true
@@ -4141,16 +4392,31 @@ func (m *AppModel) clearEngagedAgent() {
 }
 
 // handleStreamReroute processes a reroute notification from the Guide.
-// It transitions the activeRoute from the original correlationID to the
+// It transitions the active stream from the original correlationID to the
 // rerouted one so that stream events from the new target agent are rendered.
 func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
-	// Force-clear the old activeRoute to unblock new stream events.
+	// Guard interrupted correlations — drop reroutes for dead requests.
 	if reroute.OriginalCorrelationID != "" {
-		m.forceResetActiveRoute(reroute.OriginalCorrelationID)
+		if _, interrupted := m.interruptedCorrelations[reroute.OriginalCorrelationID]; interrupted {
+			return nil
+		}
 	}
-	// Set up the new activeRoute for the rerouted stream.
 	if reroute.CorrelationID != "" {
-		m.beginActiveRoute(reroute.CorrelationID, normalizeAgentID(reroute.ToAgentID))
+		if _, interrupted := m.interruptedCorrelations[reroute.CorrelationID]; interrupted {
+			return nil
+		}
+	}
+	// Remove the old stream to unblock new stream events.
+	if reroute.OriginalCorrelationID != "" {
+		m.unregisterStream(reroute.OriginalCorrelationID)
+	}
+	// Register the new stream for the rerouted agent.
+	if reroute.CorrelationID != "" {
+		m.registerStream(reroute.CorrelationID, normalizeAgentID(reroute.ToAgentID))
+	}
+	// Demote the handing-off agent (e.g. guide) so it no longer shows as active.
+	if reroute.FromAgentID != "" && m.agentPanel != nil {
+		m.agentPanel.DemoteAgent(normalizeAgentID(reroute.FromAgentID))
 	}
 	m.clearEngagedAgent()
 	if reroute.ToAgentID != "" {
@@ -4163,8 +4429,25 @@ func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 }
 
 func (m *AppModel) resolveInterruptTarget() (string, string) {
-	if strings.TrimSpace(m.activeRoute.CorrelationID) != "" {
-		return m.activeRoute.CorrelationID, m.activeRoute.AgentID
+	// Prefer the selected/engaged agent's active stream.
+	selected := m.manualTargetAgent
+	if selected == "" {
+		selected = m.engagedAgentID
+	}
+	if stream := m.activeStreamForAgent(selected); stream != nil {
+		return stream.CorrelationID, stream.AgentID
+	}
+	// Fallback: most recently started active stream.
+	if len(m.activeStreams) > 0 {
+		var best *activeStreamEntry
+		for _, entry := range m.activeStreams {
+			if best == nil || entry.StartedAt.After(best.StartedAt) {
+				best = entry
+			}
+		}
+		if best != nil {
+			return best.CorrelationID, best.AgentID
+		}
 	}
 	return m.latestStreamUsage()
 }
@@ -4373,6 +4656,12 @@ func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
 }
 
 func (m *AppModel) handlePlanUpdate(update msg.PlanUpdateMsg) tea.Cmd {
+	// Guard interrupted correlations — drop plan updates for dead requests.
+	if update.CorrelationID != "" {
+		if _, interrupted := m.interruptedCorrelations[update.CorrelationID]; interrupted {
+			return nil
+		}
+	}
 	m.chat.HandlePlanUpdate(update)
 	if m.planView != nil {
 		comp, cmd := m.planView.Update(update)
@@ -5323,16 +5612,27 @@ func (m *AppModel) reloadEditorFromDisk(path string) tea.Cmd {
 }
 
 func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd {
-	m.recordStreamStart(start.CorrelationID)
-	m.trackStreamStart(start.CorrelationID, start.AgentID)
-	m.setActiveRoute(start.CorrelationID, start.AgentID)
-	newAgent := normalizeAgentID(start.AgentID)
-	if m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
-		m.statusBar.SetFlash(m.engagedAgentID + " -> " + newAgent)
-	}
-	m.setEngagedAgent(start.AgentID)
+	// Guard interrupted correlations BEFORE any side effects (registration,
+	// agent promotion, flash updates). This prevents stale state leakage
+	// from events that arrive after an interrupt.
 	if !m.shouldRenderStreamEvent(start.CorrelationID) {
 		return nil
+	}
+	m.recordStreamStart(start.CorrelationID)
+	m.trackStreamStart(start.CorrelationID, start.AgentID)
+	m.registerStream(start.CorrelationID, start.AgentID)
+	newAgent := normalizeAgentID(start.AgentID)
+	// When a non-guide agent starts streaming, the guide's routing work is done.
+	// Demote it so it no longer shows as active in the agent panel.
+	if newAgent != "" && newAgent != "guide" && m.agentPanel != nil {
+		m.agentPanel.DemoteAgent("guide")
+	}
+	// Engagement is NOT auto-tracked on stream start. It only changes on:
+	// - Explicit user target (@agent)
+	// - Reroute (handleStreamReroute sets it)
+	// This keeps the user's selected/engaged agent fully decoupled from activity.
+	if m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
+		m.statusBar.SetFlash(m.engagedAgentID + " -> " + newAgent)
 	}
 	m.publishStreamStartActivity(start.AgentID)
 	m.statusBar.SetTokenPhase(status.PhaseOutput)
@@ -5359,7 +5659,7 @@ func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd 
 }
 
 func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg) tea.Cmd {
-	m.setActiveRoute(progress.CorrelationID, progress.AgentID)
+	m.registerStream(progress.CorrelationID, progress.AgentID)
 	progress.Message = redactSecrets(progress.Message)
 	if !m.shouldRenderStreamEvent(progress.CorrelationID) {
 		return nil
@@ -5371,7 +5671,7 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_RECEIVED",
 		"correlation_id", done.CorrelationID,
 		"agent_id", done.AgentID,
-		"active_route", m.activeRoute.CorrelationID,
+		"active_streams", len(m.activeStreams),
 		"authoritative_text_len", len(done.AuthoritativeText))
 	m.recordStreamComplete(done.CorrelationID)
 	shouldRender := m.shouldRenderStreamEvent(done.CorrelationID)
@@ -5382,7 +5682,7 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 	m.applyRealStreamUsage(done.CorrelationID, done.InputTokens, done.OutputTokens)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
 	m.markQueueEntryByCorrelation(done.CorrelationID, true)
-	m.clearActiveRoute(done.CorrelationID)
+	m.unregisterStream(done.CorrelationID)
 	if !shouldRender {
 		uiDebugFileLog().Warn("AppModel: STREAM_COMPLETE_NOT_RENDERED",
 			"correlation_id", done.CorrelationID)
@@ -5460,7 +5760,7 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 	delete(m.interruptedCorrelations, streamErr.CorrelationID)
 	m.finalizeStreamUsage(streamErr.CorrelationID, false, summary)
 	m.markQueueEntryByCorrelation(streamErr.CorrelationID, false)
-	m.clearActiveRoute(streamErr.CorrelationID)
+	m.unregisterStream(streamErr.CorrelationID)
 	if isTerminalStreamError(streamErr.Err) {
 		m.agentPanel.DemoteAllActive()
 		// Pause the queue on terminal errors to prevent blindly dispatching
@@ -5569,8 +5869,8 @@ func (m *AppModel) streamAgentID(correlationID string) string {
 	if usage, ok := m.streamUsage[correlationID]; ok {
 		return normalizeAgentID(usage.AgentID)
 	}
-	if strings.TrimSpace(m.activeRoute.CorrelationID) == correlationID {
-		return normalizeAgentID(m.activeRoute.AgentID)
+	if entry, ok := m.activeStreams[strings.TrimSpace(correlationID)]; ok {
+		return normalizeAgentID(entry.AgentID)
 	}
 	return guideAgentID
 }
@@ -5784,6 +6084,13 @@ func (m *AppModel) publishStreamStartActivity(agentID string) {
 }
 
 func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
+	// Guard interrupted correlations — drop guide responses for dead requests.
+	if r.CorrelationID != "" {
+		if _, interrupted := m.interruptedCorrelations[r.CorrelationID]; interrupted {
+			delete(m.interruptedCorrelations, r.CorrelationID)
+			return nil
+		}
+	}
 	if r.Err == nil {
 		m.markSuccessfulRouteResponse(r.CorrelationID)
 	}
@@ -5795,7 +6102,7 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		return nil
 	}
 	if m.shouldSuppressStreamedRouteResponse(r.CorrelationID, r.Err != nil) {
-		m.clearActiveRoute(r.CorrelationID)
+		m.unregisterStream(r.CorrelationID)
 		m.discardStreamUsage(r.CorrelationID)
 		m.statusBar.StopSpinner()
 		return nil
@@ -5806,7 +6113,7 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		source = chat.SourceError
 		content = redactSecrets(r.Err.Error())
 	}
-	m.clearActiveRoute(r.CorrelationID)
+	m.unregisterStream(r.CorrelationID)
 	added := estimateGuideTokens(content)
 	contextUsage := m.bumpAgentContextUsage(r.AgentID, added+guideResponseOverheadTokens)
 	m.totalCompletionTokens += added
@@ -13837,7 +14144,7 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 		SessionID:      submit.SessionID,
 		Timestamp:      time.Now(),
 	}
-	m.beginActiveRoute(req.CorrelationID, thinkingAgentType(targetAgent))
+	m.registerStream(req.CorrelationID, thinkingAgentType(targetAgent))
 
 	if !m.guideRequestAvailable() {
 		return func() tea.Msg {

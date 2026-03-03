@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -156,7 +157,7 @@ func (o *Orchestrator) processBatch(ctx context.Context, batch []*busEvent) {
 	defer cancel()
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
 
-	_, err := o.executeToolLoop(llmCtx, req)
+	_, err := o.executeToolLoop(llmCtx, req, shared.SteeringLedgerFromContext(llmCtx))
 	if err != nil {
 		if batchMaxSeverity(batch) >= severityCritical {
 			o.publishActivity(events.EventTypeAgentError, "LLM analysis failed, using fallback")

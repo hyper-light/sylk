@@ -178,6 +178,8 @@ func renderStreamingEntry(content string, width int, th *theme.Theme, cache *cod
 // renderStreamingEntryFull wraps the incremental content render with the
 // standard entry header, thinking summary, and trailing spacer.
 // For thinking-phase entries (no content yet), delegates to standard RenderEntry.
+// When content is present but the stream is still active, a status footer shows
+// the current progress message so the user sees that work continues.
 func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockCache, state *streamRenderState) ([]string, []CodeRegion) {
 	// During thinking phase, use standard render.
 	if entry.Content == "" && entry.ThinkingText != "" {
@@ -201,11 +203,34 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 
 	contentLines, codeRegions := renderStreamingEntry(entry.Content, width, th, cache, state)
 
-	// Pre-allocate: 1 header + summary + content + 1 trailing spacer.
-	lines := make([]string, 0, 2+len(summaryLines)+len(contentLines))
+	// Streaming status footer: when content is present but the stream is
+	// still active, show the spinner + progress message below the content.
+	// This gives the user visual feedback during long tool-processing gaps
+	// (e.g. multi-turn planning protocol where no text chunks arrive for
+	// minutes while tools execute).
+	var statusLines []string
+	if entry.Streaming && entry.ThinkingText != "" {
+		color := th.Palette.Info
+		if entry.ThinkingColor != "" {
+			color = lipgloss.Color(entry.ThinkingColor)
+		}
+		statusStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
+		statusText := normalizeThinkingLine(entry.ThinkingText)
+		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
+			mdLines, _ := renderMarkdownContent(status, width, statusStyle, th, nil)
+			if len(mdLines) > 0 {
+				statusText += "  " + mdLines[0]
+			}
+		}
+		statusLines = []string{truncateToWidth(statusText, width)}
+	}
+
+	// Pre-allocate: 1 header + summary + content + status + 1 trailing spacer.
+	lines := make([]string, 0, 2+len(summaryLines)+len(contentLines)+len(statusLines))
 	lines = append(lines, header)
 	lines = append(lines, summaryLines...)
 	lines = append(lines, contentLines...)
+	lines = append(lines, statusLines...)
 	lines = append(lines, "")
 
 	// Offset code region indices to account for the header + summary.

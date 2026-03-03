@@ -90,6 +90,62 @@ func TestWALMultipleOperations(t *testing.T) {
 	}
 }
 
+func TestWALDirectOpen(t *testing.T) {
+	dir := t.TempDir()
+
+	j, err := OpenSteeringJournalDirect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	j.LogBegin("direct-1", "test-agent", "session-1")
+	j.LogComplete("direct-1", 3, 2)
+
+	incomplete := j.FindIncompleteOperations()
+	if len(incomplete) != 0 {
+		t.Fatalf("expected 0 incomplete, got %d", len(incomplete))
+	}
+
+	j.Close()
+}
+
+func TestWALCrashRecovery(t *testing.T) {
+	dir := t.TempDir()
+
+	// Phase 1: simulate crash — write Begin without Complete, then close journal.
+	j1, err := OpenSteeringJournalDirect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j1.LogBegin("crash-1", "architect", "session-x")
+	j1.LogCheckpoint(Checkpoint{ID: "cp_crash_0", Turn: 1, MessageCount: 5, Phase: "designing"})
+	j1.LogBegin("crash-2", "architect", "session-x")
+	j1.Close()
+
+	// Phase 2: reopen — find incomplete operations and close brackets.
+	j2, err := OpenSteeringJournalDirect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j2.Close()
+
+	incomplete := j2.FindIncompleteOperations()
+	if len(incomplete) != 2 {
+		t.Fatalf("expected 2 incomplete, got %d", len(incomplete))
+	}
+
+	// Close all brackets (simulates SteeringManager.InitJournal recovery).
+	for _, op := range incomplete {
+		j2.LogInterrupted(op.CorrelationID, "", 0, "recovered")
+	}
+
+	// Verify brackets are now closed.
+	remaining := j2.FindIncompleteOperations()
+	if len(remaining) != 0 {
+		t.Fatalf("expected 0 incomplete after recovery, got %d", len(remaining))
+	}
+}
+
 func TestWALEmptyJournal(t *testing.T) {
 	dir := t.TempDir()
 	// Create the WAL directory structure manually.

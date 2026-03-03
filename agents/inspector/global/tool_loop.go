@@ -6,14 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
-func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.Request) (string, error) {
+func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, gi.config.MaxToolRuns)
 	consecutiveErrors := 0
 
@@ -23,22 +26,77 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 	}
 
 	for turn := 0; turn <= gi.config.MaxToolRuns; turn++ {
+		// ── STEERING CHECKPOINT ──
+		sc := agentShared.DrainAndCheckpoint(ledger, req, turn, "inspecting", nil)
+		if sc.Rollback != nil || sc.EditReplay != nil {
+			cp := sc.Rollback
+			if cp == nil {
+				cp = sc.EditReplay
+			}
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				action := "rollback"
+				if sc.EditReplay != nil {
+					action = "edit_replay"
+				}
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventSteeringCheckpoint,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("%s at turn %d", action, cp.Turn)})
+			}
+			req.Messages = req.Messages[:cp.MessageCount]
+			if sc.EditReplay != nil {
+				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
+			}
+			turn = cp.Turn
+			seen = make(map[shared.ToolCallSignature]int, gi.config.MaxToolRuns)
+			consecutiveErrors = 0
+			continue
+		}
+		if sc.ShouldPause {
+			if err := ledger.WaitForResume(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// ── END STEERING ──
+
+		turnStart := time.Now()
 		resp, err := p.Complete(ctx, req)
+		agentShared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
+			}
 			return "", fmt.Errorf("global inspector llm: %w", err)
 		}
 
 		shared.AccumulateUsage(ctx, &resp.Usage)
 
 		if len(resp.ToolCalls) == 0 {
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.AuditPayload{Phase: "tool_loop_completed"})
+			}
 			return strings.TrimSpace(resp.Content), nil
 		}
 
 		if turn == gi.config.MaxToolRuns {
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", gi.config.MaxToolRuns)})
+			}
 			return "", fmt.Errorf("global inspector exceeded tool-call limit (%d)", gi.config.MaxToolRuns)
 		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
+			}
 			return "", fmt.Errorf("global inspector repeated tool call: %s", sig.Name)
 		}
 
@@ -48,10 +106,20 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
+			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
+			}
 			return "", fmt.Errorf("global inspector tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
 
+	if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+			lm.AgentID, lm.SessionID, lm.CorrID, "error",
+			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
+	}
 	return "", fmt.Errorf("global inspector exhausted tool-call loop")
 }
 
@@ -82,7 +150,17 @@ func (gi *GlobalInspector) applyToolCalls(
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
+				if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ToolPayload{ToolName: call.Name, Success: false, Err: err.Error()})
+				}
 			}
+		}
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentShared.ToolNameToEventType(call.Name),
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -98,7 +176,7 @@ func (gi *GlobalInspector) applyToolCalls(
 	return errCount, rerouted
 }
 
-func (gi *GlobalInspector) executeToolCall(_ context.Context, call providers.ToolCall) (string, error) {
+func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return "", fmt.Errorf("tool name is required")
@@ -112,7 +190,7 @@ func (gi *GlobalInspector) executeToolCall(_ context.Context, call providers.Too
 		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
 
-	result := gi.skills.Invoke(context.Background(), name, json.RawMessage(raw))
+	result := gi.skills.Invoke(ctx, name, json.RawMessage(raw))
 	if result == nil {
 		return "", fmt.Errorf("tool %q returned nil", name)
 	}

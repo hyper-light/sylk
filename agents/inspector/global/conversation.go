@@ -22,6 +22,15 @@ type ConversationResult struct {
 	Intent   string `json:"intent"`
 }
 
+// ResponseText implements the guide-layer responseTexter interface so the
+// conversation history stores the clean response string, not a JSON blob.
+func (r *ConversationResult) ResponseText() string {
+	if r == nil {
+		return ""
+	}
+	return r.Response
+}
+
 // handleConversation processes conversational requests. Static meta queries
 // (status, issue count, help) are answered deterministically without an LLM.
 // All other queries use StreamWithHandler for real-time text + thinking chunks.

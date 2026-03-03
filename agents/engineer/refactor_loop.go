@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -37,9 +38,20 @@ func NewRefactorLoop(engineer *Engineer, config shared.RefactorLoopConfig, logge
 func (rl *RefactorLoop) Run(ctx context.Context, taskID, initialResult string) (string, error) {
 	result := initialResult
 
+	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationStarted,
+			lm.AgentID, lm.SessionID, lm.CorrID, "info",
+			&agentlog.GenerationPayload{Phase: "started"})
+	}
+
 	for iteration := range rl.config.MaxIterations {
 		feedback, err := rl.requestTesterValidation(ctx, taskID, result)
 		if err != nil {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: err.Error()})
+			}
 			rl.logger.Warn("tester validation failed, returning current result",
 				"error", err, "iteration", iteration)
 			return result, nil // Graceful degradation
@@ -48,6 +60,11 @@ func (rl *RefactorLoop) Run(ctx context.Context, taskID, initialResult string) (
 		if !feedback.ShouldContinueLoop(rl.config.MinQualityComposite) {
 			rl.logger.Info("quality threshold met", "iteration", iteration,
 				"composite", rl.compositeOrFallback(feedback))
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.GenerationPayload{Phase: "completed", ToolRuns: iteration})
+			}
 			return result, nil
 		}
 
@@ -59,8 +76,19 @@ func (rl *RefactorLoop) Run(ctx context.Context, taskID, initialResult string) (
 			"pass_count", feedback.PassCount,
 		)
 
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationStarted,
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.GenerationPayload{Phase: "reimplementing"})
+		}
+
 		result, err = rl.reimplementWithFeedback(ctx, taskID, result, feedback)
 		if err != nil {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: err.Error()})
+			}
 			return "", fmt.Errorf("refactor loop iteration %d: %w", iteration, err)
 		}
 	}
@@ -83,7 +111,17 @@ func (rl *RefactorLoop) requestTesterValidation(
 	ctx, cancel := context.WithTimeout(ctx, rl.config.TesterTimeout)
 	defer cancel()
 
+	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		shared.LogAgentEvent(lm.EventLogger, agentlog.EventConsultationSent,
+			lm.AgentID, lm.SessionID, lm.CorrID, "info",
+			&agentlog.ConsultPayload{Target: "tester-pipeline"})
+	}
 	evidence, err := rl.engineer.requestConsultation(ctx, "tester-pipeline", query, "", rl.engineer.config.SessionID)
+	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		shared.LogAgentEvent(lm.EventLogger, agentlog.EventConsultationRecv,
+			lm.AgentID, lm.SessionID, lm.CorrID, "info",
+			&agentlog.ConsultPayload{Target: "tester-pipeline", Success: err == nil})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("tester consultation: %w", err)
 	}
@@ -112,7 +150,7 @@ func (rl *RefactorLoop) reimplementWithFeedback(
 		ReasoningEffort: rl.engineer.config.EngineerConfig.ReasoningEffort,
 	}
 
-	return rl.engineer.executeToolLoop(ctx, req)
+	return rl.engineer.executeToolLoop(ctx, req, shared.SteeringLedgerFromContext(ctx))
 }
 
 func parseTesterFeedback(evidence *shared.ConsultationEvidence) (*shared.TestFeedback, error) {

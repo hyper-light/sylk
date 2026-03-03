@@ -6,39 +6,102 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 // executeToolLoop runs the model tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
 // Follows the orchestrator tool_loop.go pattern exactly.
-func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Request) (string, error) {
+func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[toolCallSignature]int, gt.config.MaxToolRuns)
 	consecutiveErrors := 0
 
 	provider := gt.getProvider()
 	if provider == nil {
+		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
+		}
 		return "", fmt.Errorf("global tester: no LLM provider configured")
 	}
 
 	for turn := 0; turn <= gt.config.MaxToolRuns; turn++ {
+		// ── STEERING CHECKPOINT ──
+		sc := agentshared.DrainAndCheckpoint(ledger, req, turn, "testing", nil)
+		if sc.Rollback != nil || sc.EditReplay != nil {
+			cp := sc.Rollback
+			if cp == nil {
+				cp = sc.EditReplay
+			}
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				action := "rollback"
+				if sc.EditReplay != nil {
+					action = "edit_replay"
+				}
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSteeringCheckpoint,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("%s at turn %d", action, cp.Turn)})
+			}
+			req.Messages = req.Messages[:cp.MessageCount]
+			if sc.EditReplay != nil {
+				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
+			}
+			turn = cp.Turn
+			seen = make(map[toolCallSignature]int, gt.config.MaxToolRuns)
+			consecutiveErrors = 0
+			continue
+		}
+		if sc.ShouldPause {
+			if err := ledger.WaitForResume(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// ── END STEERING ──
+
+		turnStart := time.Now()
 		resp, err := provider.Complete(ctx, req)
+		agentshared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
+			}
 			return "", fmt.Errorf("global tester llm: %w", err)
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.TestSuitePayload{Phase: "tool_loop_completed"})
+			}
 			return strings.TrimSpace(resp.Content), nil
 		}
 
 		if turn == gt.config.MaxToolRuns {
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", gt.config.MaxToolRuns)})
+			}
 			return "", fmt.Errorf("global tester exceeded tool-call limit (%d)", gt.config.MaxToolRuns)
 		}
 
 		if dup, sig := detectToolCallDuplicate(resp.ToolCalls, seen); dup {
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
+			}
 			return "", fmt.Errorf("global tester repeated tool call: %s", sig.Name)
 		}
 
@@ -48,10 +111,20 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		}
 		consecutiveErrors = updateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
+			}
 			return "", fmt.Errorf("global tester tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
 
+	if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+			lm.AgentID, lm.SessionID, lm.CorrID, "error",
+			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
+	}
 	return "", fmt.Errorf("global tester exhausted tool-call loop")
 }
 
@@ -83,7 +156,17 @@ func (gt *GlobalTester) applyToolCalls(
 				result = toolErrorPayload(err)
 				isError = true
 				errCount++
+				if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ToolPayload{ToolName: call.Name, Success: false, Err: err.Error()})
+				}
 			}
+		}
+		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentshared.LogAgentEvent(lm.EventLogger, agentshared.ToolNameToEventType(call.Name),
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -100,7 +183,7 @@ func (gt *GlobalTester) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (gt *GlobalTester) executeToolCall(_ context.Context, call providers.ToolCall) (string, error) {
+func (gt *GlobalTester) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return "", fmt.Errorf("tool name is required")
@@ -114,7 +197,7 @@ func (gt *GlobalTester) executeToolCall(_ context.Context, call providers.ToolCa
 		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
 
-	result := gt.skills.Invoke(context.Background(), name, json.RawMessage(raw))
+	result := gt.skills.Invoke(ctx, name, json.RawMessage(raw))
 	if result == nil {
 		return "", fmt.Errorf("tool %q returned nil", name)
 	}

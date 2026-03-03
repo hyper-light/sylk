@@ -17,6 +17,10 @@ const (
 	NodeStatePending NodeState = iota
 	// NodeStateQueued indicates the node is queued for execution
 	NodeStateQueued
+	// NodeStateDispatched indicates the bus message is published, awaiting agent ACK
+	NodeStateDispatched
+	// NodeStateAcked indicates the agent acknowledged receipt, execution starting
+	NodeStateAcked
 	// NodeStateRunning indicates the node is currently executing
 	NodeStateRunning
 	// NodeStateSucceeded indicates the node completed successfully
@@ -43,14 +47,16 @@ type nodeStateStringMap map[NodeState]string
 
 func nodeStateStrings() nodeStateStringMap {
 	return nodeStateStringMap{
-		NodeStatePending:   "pending",
-		NodeStateQueued:    "queued",
-		NodeStateRunning:   "running",
-		NodeStateSucceeded: "succeeded",
-		NodeStateFailed:    "failed",
-		NodeStateBlocked:   "blocked",
-		NodeStateSkipped:   "skipped",
-		NodeStateCancelled: "cancelled",
+		NodeStatePending:    "pending",
+		NodeStateQueued:     "queued",
+		NodeStateDispatched: "dispatched",
+		NodeStateAcked:      "acked",
+		NodeStateRunning:    "running",
+		NodeStateSucceeded:  "succeeded",
+		NodeStateFailed:     "failed",
+		NodeStateBlocked:    "blocked",
+		NodeStateSkipped:    "skipped",
+		NodeStateCancelled:  "cancelled",
 	}
 }
 
@@ -361,12 +367,16 @@ const (
 	EventLayerStarted
 	EventLayerCompleted
 	EventNodeQueued
+	EventNodeDispatched
+	EventNodeAcked
 	EventNodeStarted
 	EventNodeCompleted
 	EventNodeFailed
 	EventNodeRetrying
 	EventNodeSkipped
 	EventNodeCancelled
+	EventPipelineExpanded
+	EventStageTransition
 )
 
 // String returns the string representation of an event type
@@ -378,19 +388,23 @@ type eventTypeStringMap map[EventType]string
 
 func eventTypeStrings() eventTypeStringMap {
 	return eventTypeStringMap{
-		EventDAGStarted:     "dag_started",
-		EventDAGCompleted:   "dag_completed",
-		EventDAGFailed:      "dag_failed",
-		EventDAGCancelled:   "dag_cancelled",
-		EventLayerStarted:   "layer_started",
-		EventLayerCompleted: "layer_completed",
-		EventNodeQueued:     "node_queued",
-		EventNodeStarted:    "node_started",
-		EventNodeCompleted:  "node_completed",
-		EventNodeFailed:     "node_failed",
-		EventNodeRetrying:   "node_retrying",
-		EventNodeSkipped:    "node_skipped",
-		EventNodeCancelled:  "node_cancelled",
+		EventDAGStarted:       "dag_started",
+		EventDAGCompleted:     "dag_completed",
+		EventDAGFailed:        "dag_failed",
+		EventDAGCancelled:     "dag_cancelled",
+		EventLayerStarted:     "layer_started",
+		EventLayerCompleted:   "layer_completed",
+		EventNodeQueued:       "node_queued",
+		EventNodeDispatched:   "node_dispatched",
+		EventNodeAcked:        "node_acked",
+		EventNodeStarted:      "node_started",
+		EventNodeCompleted:    "node_completed",
+		EventNodeFailed:       "node_failed",
+		EventNodeRetrying:     "node_retrying",
+		EventNodeSkipped:      "node_skipped",
+		EventNodeCancelled:    "node_cancelled",
+		EventPipelineExpanded: "pipeline_expanded",
+		EventStageTransition:  "stage_transition",
 	}
 }
 
@@ -457,4 +471,7 @@ var (
 
 	// ErrLayerRetry indicates a layer retry was requested by the gate
 	ErrLayerRetry = errors.New("layer retry requested")
+
+	// ErrDispatchNotAcked indicates the target agent did not acknowledge dispatch
+	ErrDispatchNotAcked = errors.New("dispatch not acknowledged")
 )

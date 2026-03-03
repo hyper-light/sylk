@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -80,7 +81,7 @@ func (g *Guardian) composeUserFacingResponse(ctx context.Context, req *guardianC
 
 	return g.executeToolLoop(ctx, llmReq, "conversation", func(chunk string) {
 		g.publishStreamChunk(ctx, "", chunk)
-	})
+	}, shared.SteeringLedgerFromContext(ctx))
 }
 
 // composeWithoutLLM generates a deterministic response when no LLM is available.

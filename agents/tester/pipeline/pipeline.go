@@ -8,12 +8,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -36,9 +40,12 @@ type PipelineTester struct {
 	// LLM provider (OpenAI gpt-5.3-codex with xhigh reasoning).
 	provider pipelineTesterProvider
 
+	// Activity publisher for UI agent-panel updates. Nil-safe.
+	activityPub events.ActivityPublisher
+	pipelineID  string // DAG pipeline ID for TUI grouping.
+
 	// State.
-	inspectorGate *shared.InspectorGate
-	currentPlan   *shared.TestPlan
+	currentPlan *shared.TestPlan
 	diagnoses     map[string]*shared.DiagnosisReport
 	mu            sync.RWMutex
 
@@ -65,6 +72,17 @@ type PipelineTester struct {
 	handoffBridge *handoff.HandoffBridge
 
 	fileAccess versioning.FileAccess
+
+	// Request lifecycle.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	// Steering ledger management.
+	steering *agentshared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *agentshared.RequestSerializer
 }
 
 // New creates a new PipelineTester instance.
@@ -79,7 +97,11 @@ func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*Pip
 		diagnoses:   make(map[string]*shared.DiagnosisReport),
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		diagEngine:  shared.NewDiagnosisEngine(),
+		steering:          agentshared.NewSteeringManager(),
+		requestSerializer: agentshared.NewRequestSerializer(),
 	}
+
+	pt.steering.InitLazy("tester-pipeline", nil)
 
 	pt.initSkills()
 	return pt, nil
@@ -126,7 +148,6 @@ func (pt *PipelineTester) initSkills() {
 }
 
 func (pt *PipelineTester) registerCoreSkills() {
-	pt.skills.Register(shared.CheckInspectorGateSkill(pt.getInspectorGate))
 	pt.skills.Register(shared.AnalyzeRiskSkill())
 	pt.skills.Register(shared.PlanTestsSkill())
 	pt.skills.Register(shared.WriteTestSkill())
@@ -139,19 +160,6 @@ func (pt *PipelineTester) registerCoreSkills() {
 		SessionID: func() string { return pt.config.SessionID },
 		Publish:   pt.publishRerouteRequest,
 	}))
-}
-
-func (pt *PipelineTester) getInspectorGate() *shared.InspectorGate {
-	pt.mu.RLock()
-	defer pt.mu.RUnlock()
-	return pt.inspectorGate
-}
-
-// SetInspectorGate records that the Inspector has passed.
-func (pt *PipelineTester) SetInspectorGate(gate *shared.InspectorGate) {
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
-	pt.inspectorGate = gate
 }
 
 // SetWorkerType sets the worker type for design-aware prompt selection.
@@ -174,6 +182,7 @@ func (pt *PipelineTester) Start(bus guide.EventBus) error {
 
 	pt.bus = bus
 	pt.channels = guide.NewAgentChannels("tester-pipeline", pt.id)
+	pt.runCtx, pt.runCancel = context.WithCancel(context.Background())
 
 	var err error
 	pt.requestSub, err = bus.SubscribeAsync(pt.channels.Requests, pt.handleBusRequest)
@@ -203,6 +212,11 @@ func (pt *PipelineTester) Start(bus guide.EventBus) error {
 func (pt *PipelineTester) Stop() error {
 	if !pt.running {
 		return nil
+	}
+
+	pt.steering.CloseAll()
+	if pt.runCancel != nil {
+		pt.runCancel()
 	}
 
 	var errs []error
@@ -250,6 +264,28 @@ func (pt *PipelineTester) unsubRegistry() error {
 	return err
 }
 
+// prependConversationHistory formats prior conversation turns as structured
+// text and prepends them to the user message so the LLM retains multi-turn
+// context across requests. Returns the original message unchanged when there
+// is no history.
+func prependConversationHistory(history []guide.ConversationTurn, userMessage string) string {
+	if len(history) == 0 {
+		return userMessage
+	}
+
+	var b strings.Builder
+	b.WriteString("## Prior Conversation\n\n")
+	for _, turn := range history {
+		fmt.Fprintf(&b, "[%s] User: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.UserInput)
+		if turn.AgentReply != "" {
+			fmt.Fprintf(&b, "[%s] %s: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.AgentID, turn.AgentReply)
+		}
+	}
+	b.WriteString("\n---\n\n")
+	b.WriteString(userMessage)
+	return b.String()
+}
+
 // Handle processes a forwarded request through the LLM tool loop.
 func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	if pt.provider == nil {
@@ -263,41 +299,84 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	systemPrompt := shared.PipelineTesterSystemPromptForWorker(wt)
 	tools := pt.buildToolDefinitions()
 
+	// Prepend conversation history so the LLM retains multi-turn context.
+	userMessage := prependConversationHistory(fwd.ConversationHistory, fwd.Input)
+
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages: []providers.Message{
-			{Role: providers.RoleUser, Content: fwd.Input},
+			{Role: providers.RoleUser, Content: userMessage},
 		},
 		Tools: tools,
 	}
 
-	result, err := pt.executeToolLoop(ctx, req)
+	result, err := pt.executeToolLoop(ctx, req, agentshared.SteeringLedgerFromContext(ctx))
 	if err != nil {
+		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("tool loop: %v", err)})
+		}
 		return nil, fmt.Errorf("pipeline tester tool loop: %w", err)
 	}
 
-	return map[string]any{
-		"response": result,
-		"agent_id": pt.id,
-	}, nil
+	return result, nil
 }
 
 func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
+	if msg.Type == guide.MessageTypeAction {
+		action, ok := msg.GetActionRequest()
+		if ok && action != nil {
+			pt.steering.HandleAction(action)
+		}
+		return nil
+	}
+
 	if msg.Type != guide.MessageTypeForward {
 		return nil
 	}
+
+	if !pt.requestSerializer.Acquire(pt.runCtx) {
+		return nil // runCtx cancelled, agent shutting down
+	}
+	defer pt.requestSerializer.Release()
 
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	ctx := context.Background()
+	pt.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	agentshared.LogIncomingRequest(pt.steering.EventLogger(), fwd, pt.id)
+
+	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+		pt.pipelineID = dagID
+	}
+
+	agentshared.EmitDispatchACK(pt.bus, fwd.Metadata, pt.id, "tester-pipeline", fwd.CorrelationID)
+	pt.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
+
+	reqCtx, cancel := context.WithCancel(pt.runCtx)
+	pt.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	defer cancel()
+
+	ledger := pt.steering.Create(fwd.CorrelationID, pt.id, fwd.SessionID, nil, nil)
+	defer pt.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
+
+	ctx := reqCtx
+	ctx = agentshared.WithSteeringLedger(ctx, ledger)
+	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{
+		EventLogger: pt.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     pt.id,
+		SessionID:   fwd.SessionID,
+	})
 	startTime := time.Now()
 	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, "tester-pipeline", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
 
 	result, err := pt.Handle(ctx, fwd)
+	agentshared.LogResponse(pt.steering.EventLogger(), fwd.CorrelationID, pt.id, fwd.SessionID, time.Since(startTime), err)
 
 	if fwd.FireAndForget {
 		return nil
@@ -312,7 +391,13 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	if err != nil {
+		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
+		}
 		resp.Error = err.Error()
+		pt.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			pt.generateMessageID(),
 			fwd.CorrelationID,
@@ -323,6 +408,8 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	pt.publishActivity(events.EventTypeAgentAction, "Validation task completed")
+
 	respMsg := guide.NewResponseMessage(pt.generateMessageID(), resp)
 	return pt.bus.Publish(pt.channels.Responses, respMsg)
 }
@@ -338,11 +425,19 @@ func (pt *PipelineTester) handleRegistryAnnouncement(msg *guide.Message) error {
 		return nil
 	}
 
+	action := "registered"
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
 		pt.knownAgents[ann.AgentID] = ann
 	case guide.MessageTypeAgentUnregistered:
 		delete(pt.knownAgents, ann.AgentID)
+		action = "unregistered"
+	}
+	if el := pt.steering.EventLogger(); el != nil {
+		agentshared.LogAgentEvent(el, agentlog.EventRegistryEvent,
+			pt.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: action,
+			})
 	}
 	return nil
 }
@@ -426,6 +521,28 @@ func (pt *PipelineTester) PublishRequest(req *guide.RouteRequest) error {
 // =============================================================================
 // HandoffInjectable Implementation
 // =============================================================================
+
+// SetActivityPublisher injects the activity publisher for TUI panel updates.
+func (pt *PipelineTester) SetActivityPublisher(pub events.ActivityPublisher) {
+	pt.activityPub = pub
+}
+
+// publishActivity emits a user-visible activity event so the UI agent panel
+// tracks this pipeline tester's lifecycle.
+func (pt *PipelineTester) publishActivity(eventType events.EventType, content string) {
+	if pt.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, pt.config.SessionID, content)
+	evt.AgentID = pt.id
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "tester-pipeline"
+	evt.Data["agent_name"] = "Tester"
+	if pt.pipelineID != "" {
+		evt.Data["pipeline_id"] = pt.pipelineID
+	}
+	pt.activityPub.PublishActivity(evt)
+}
 
 // AgentID returns the unique identifier.
 func (pt *PipelineTester) AgentID() string { return pt.id }

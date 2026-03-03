@@ -1194,6 +1194,8 @@ func (r *openAIResponseStreamRunner) handleTextDeltaEvent(event any) error {
 
 func (r *openAIResponseStreamRunner) handleReasoningSummaryDeltaEvent(event any) error {
 	switch ev := event.(type) {
+	case responses.ResponseReasoningSummaryPartAddedEvent:
+		return r.emitReasoningSummaryChunk("\n")
 	case responses.ResponseReasoningSummaryTextDeltaEvent:
 		return r.emitReasoningSummaryChunk(ev.Delta)
 	case responses.ResponseReasoningSummaryDeltaEvent:
@@ -1204,7 +1206,7 @@ func (r *openAIResponseStreamRunner) handleReasoningSummaryDeltaEvent(event any)
 }
 
 func (r *openAIResponseStreamRunner) emitReasoningSummaryChunk(text string) error {
-	if strings.TrimSpace(text) == "" {
+	if text == "" {
 		return nil
 	}
 	return r.emitChunk(&StreamChunk{
@@ -1503,12 +1505,16 @@ func (p *OpenAIProvider) buildResponseParams(req *Request) responses.ResponseNew
 			OfInputItemList: p.convertResponseMessages(req.Messages, systemPrompt),
 		},
 	}
+	p.applyStore(&params)
 	p.applyMaxOutputTokens(&params, req)
 	p.applyChatGPTResponseOptions(&params, systemPrompt)
 	p.applyTemperature(&params, req, model)
 	p.applyTopP(&params, req)
 	p.applyReasoningEffort(&params, p.resolveReasoningEffort(req), model)
+	p.applyTruncation(&params, model)
+	p.applyInclude(&params, model)
 	p.applyTools(&params, req.Tools)
+	p.applyToolChoice(&params, req.ToolChoice)
 	return params
 }
 
@@ -1643,11 +1649,49 @@ func supportsOpenAIReasoningConfig(model string) bool {
 	return strings.HasPrefix(model, "gpt-5") || strings.HasPrefix(model, "o")
 }
 
+func (p *OpenAIProvider) applyTruncation(params *responses.ResponseNewParams, model string) {
+	if supportsOpenAIReasoningConfig(model) {
+		params.Truncation = responses.ResponseNewParamsTruncationAuto
+	}
+}
+
+// applyInclude requests encrypted reasoning content so that reasoning items
+// can be round-tripped through multi-turn tool loops. Without this, the API
+// returns reasoning summaries but omits the encrypted content that the model
+// needs to reconstruct its chain-of-thought on subsequent turns.
+func (p *OpenAIProvider) applyInclude(params *responses.ResponseNewParams, model string) {
+	if supportsOpenAIReasoningConfig(model) {
+		params.Include = append(params.Include, responses.ResponseIncludableReasoningEncryptedContent)
+	}
+}
+
+func (p *OpenAIProvider) applyStore(params *responses.ResponseNewParams) {
+	params.Store = openai.Bool(false)
+}
+
 func (p *OpenAIProvider) applyTools(params *responses.ResponseNewParams, tools []Tool) {
 	if len(tools) == 0 {
 		return
 	}
 	params.Tools = p.convertResponseTools(tools)
+}
+
+func (p *OpenAIProvider) applyToolChoice(params *responses.ResponseNewParams, choice string) {
+	if len(params.Tools) == 0 {
+		return
+	}
+	switch strings.TrimSpace(strings.ToLower(choice)) {
+	case "any", "required":
+		params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+			OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsRequired),
+		}
+	case "none":
+		params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+			OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsNone),
+		}
+	default:
+		// "auto" or empty — let the API default.
+	}
 }
 
 func (p *OpenAIProvider) convertResponseMessages(messages []Message, systemPrompt string) responses.ResponseInputParam {
@@ -1675,7 +1719,44 @@ func appendConvertedMessage(result *responses.ResponseInputParam, msg Message) {
 	if !ok {
 		return
 	}
-	*result = append(*result, responses.ResponseInputItemParamOfMessage(msg.Content, role))
+	// Emit preserved reasoning items before text/tool-call items so the API
+	// sees them in output order (reasoning → text → function_call).
+	appendReasoningItems(result, msg.Metadata)
+	if strings.TrimSpace(msg.Content) != "" {
+		*result = append(*result, responses.ResponseInputItemParamOfMessage(msg.Content, role))
+	}
+	for _, tc := range msg.ToolCalls {
+		*result = append(*result, responses.ResponseInputItemParamOfFunctionCall(tc.Arguments, tc.ID, tc.Name))
+	}
+}
+
+// appendReasoningItems reconstructs ResponseReasoningItemParam entries from
+// the metadata snapshot stored by extractOpenAIReasoningItems. This preserves
+// the model's chain-of-thought (including encrypted content) across multi-turn
+// tool loops, matching the Responses API's expected input format.
+func appendReasoningItems(result *responses.ResponseInputParam, metadata map[string]any) {
+	if metadata == nil {
+		return
+	}
+	raw, ok := metadata["reasoning_items"]
+	if !ok {
+		return
+	}
+	items, ok := raw.([]openAIReasoningItem)
+	if !ok {
+		return
+	}
+	for _, ri := range items {
+		summaries := make([]responses.ResponseReasoningItemSummaryParam, len(ri.SummaryTexts))
+		for j, text := range ri.SummaryTexts {
+			summaries[j] = responses.ResponseReasoningItemSummaryParam{Text: text}
+		}
+		item := responses.ResponseInputItemParamOfReasoning(ri.ID, summaries)
+		if ri.EncryptedContent != "" {
+			item.OfReasoning.EncryptedContent = openai.Opt(ri.EncryptedContent)
+		}
+		*result = append(*result, item)
+	}
 }
 
 func openAIInputRole(role Role) (responses.EasyInputMessageRole, bool) {
@@ -1686,7 +1767,14 @@ func openAIInputRole(role Role) (responses.EasyInputMessageRole, bool) {
 func (p *OpenAIProvider) convertResponseTools(tools []Tool) []responses.ToolUnionParam {
 	result := make([]responses.ToolUnionParam, len(tools))
 	for i, tool := range tools {
-		result[i] = responses.ToolParamOfFunction(tool.Name, ensureObjectType(tool.Parameters), true)
+		params := sanitizeSchemaIterative(tool.Parameters)
+		// Only enable strict mode when the schema is strict-compatible:
+		// all properties must be in the required array and
+		// additionalProperties must be false. Schemas with optional
+		// parameters (required array shorter than properties) cannot
+		// use strict mode — OpenAI rejects them at request time.
+		strict := isStrictCompatible(params)
+		result[i] = responses.ToolParamOfFunction(tool.Name, params, strict)
 		if tool.Description != "" {
 			desc := openai.String(tool.Description)
 			function := result[i].OfFunction
@@ -1697,22 +1785,49 @@ func (p *OpenAIProvider) convertResponseTools(tools []Tool) []responses.ToolUnio
 	return result
 }
 
+// isStrictCompatible returns true when the JSON schema is compatible with
+// OpenAI's strict function calling mode. Strict mode requires every property
+// to be listed in the required array and additionalProperties to be false.
+// Schemas with optional parameters (fewer required entries than properties)
+// must use non-strict mode.
+func isStrictCompatible(params map[string]any) bool {
+	props, _ := params["properties"].(map[string]any)
+	if len(props) == 0 {
+		return true // No properties — trivially strict-compatible.
+	}
+	req, _ := params["required"].([]any)
+	if len(req) < len(props) {
+		return false
+	}
+	ap, hasAP := params["additionalProperties"]
+	if !hasAP {
+		return false
+	}
+	apBool, ok := ap.(bool)
+	return ok && !apBool
+}
+
 func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {
 	if result == nil {
 		return &Response{StopReason: StopReasonError}
 	}
 
+	metadata := map[string]any{
+		"id":           result.ID,
+		"status":       string(result.Status),
+		"service_tier": string(result.ServiceTier),
+	}
+	if items := extractOpenAIReasoningItems(result); len(items) > 0 {
+		metadata["reasoning_items"] = items
+	}
+
 	response := &Response{
-		Content:    result.OutputText(),
-		Thinking:   extractOpenAIReasoningSummary(result),
-		Model:      string(result.Model),
-		StopReason: p.convertResponseStopReason(*result),
-		Usage:      p.convertResponseUsage(*result),
-		ProviderMetadata: map[string]any{
-			"id":           result.ID,
-			"status":       string(result.Status),
-			"service_tier": string(result.ServiceTier),
-		},
+		Content:          result.OutputText(),
+		Thinking:         extractOpenAIReasoningSummary(result),
+		Model:            string(result.Model),
+		StopReason:       p.convertResponseStopReason(*result),
+		Usage:            p.convertResponseUsage(*result),
+		ProviderMetadata: metadata,
 	}
 
 	toolCalls := p.extractToolCalls(*result)
@@ -1738,6 +1853,39 @@ func extractOpenAIReasoningSummary(result *responses.Response) string {
 		}
 	}
 	return strings.TrimSpace(thinking.String())
+}
+
+// openAIReasoningItem is a JSON-serializable snapshot of a reasoning output
+// item, stored in ProviderMetadata so that appendConvertedMessage can emit
+// ResponseReasoningItemParam on subsequent multi-turn requests.
+type openAIReasoningItem struct {
+	ID               string   `json:"id"`
+	SummaryTexts     []string `json:"summary_texts"`
+	EncryptedContent string   `json:"encrypted_content,omitempty"`
+}
+
+// extractOpenAIReasoningItems collects reasoning output items from a response
+// into a serializable slice for round-tripping through Message.Metadata.
+func extractOpenAIReasoningItems(result *responses.Response) []openAIReasoningItem {
+	if result == nil {
+		return nil
+	}
+	var items []openAIReasoningItem
+	for _, item := range result.Output {
+		reasoning, ok := item.AsAny().(responses.ResponseReasoningItem)
+		if !ok {
+			continue
+		}
+		ri := openAIReasoningItem{ID: reasoning.ID}
+		for _, summary := range reasoning.Summary {
+			ri.SummaryTexts = append(ri.SummaryTexts, summary.Text)
+		}
+		if reasoning.EncryptedContent != "" {
+			ri.EncryptedContent = reasoning.EncryptedContent
+		}
+		items = append(items, ri)
+	}
+	return items
 }
 
 func (p *OpenAIProvider) convertResponseUsage(result responses.Response) Usage {
@@ -1899,12 +2047,56 @@ func hasAccessAndModelTerms(message string) bool {
 	return strings.Contains(message, "model")
 }
 
-func ensureObjectType(params map[string]any) map[string]any {
+// sanitizeSchemaIterative walks the JSON schema tree using an explicit stack,
+// ensuring every node has a "type" field and every object node has
+// "additionalProperties": false. This satisfies OpenAI's strict function
+// calling requirements without recursion.
+func sanitizeSchemaIterative(params map[string]any) map[string]any {
 	if params == nil {
-		return map[string]any{"type": "object"}
+		return map[string]any{"type": "object", "additionalProperties": false}
 	}
-	if _, hasType := params["type"]; !hasType {
-		params["type"] = "object"
+	stack := []map[string]any{params}
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		// Infer type if missing.
+		if _, hasType := node["type"]; !hasType {
+			switch {
+			case node["properties"] != nil:
+				node["type"] = "object"
+			case node["items"] != nil:
+				node["type"] = "array"
+			default:
+				node["type"] = "object"
+			}
+		}
+
+		// Object nodes require additionalProperties: false for strict mode.
+		if node["type"] == "object" {
+			node["additionalProperties"] = false
+		}
+
+		// Array nodes require an items schema. Add a default if missing.
+		if node["type"] == "array" {
+			if _, hasItems := node["items"]; !hasItems {
+				node["items"] = map[string]any{"type": "object"}
+			}
+		}
+
+		// Push nested property schemas onto the stack.
+		if props, ok := node["properties"].(map[string]any); ok {
+			for _, v := range props {
+				if child, ok := v.(map[string]any); ok {
+					stack = append(stack, child)
+				}
+			}
+		}
+
+		// Push array items schema onto the stack.
+		if items, ok := node["items"].(map[string]any); ok {
+			stack = append(stack, items)
+		}
 	}
 	return params
 }

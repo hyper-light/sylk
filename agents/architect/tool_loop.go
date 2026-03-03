@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 // toolRunsOverrideKey allows protocol code to override the default MaxToolRuns
@@ -33,6 +34,7 @@ func (a *Architect) executeToolLoop(
 	req *providers.Request,
 	stage string,
 	onChunk func(string),
+	ledger *steering.SteeringLedger,
 ) (string, error) {
 	maxRuns := a.config.MaxToolRuns
 	if override, ok := ctx.Value(toolRunsOverrideKey{}).(int); ok && override > 0 {
@@ -78,6 +80,34 @@ func (a *Architect) executeToolLoop(
 				"elapsed", time.Since(loopStart).String())
 			return "", ctx.Err()
 		}
+
+		// ── STEERING CHECKPOINT ──
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, stage, nil)
+		if sc.Rollback != nil || sc.EditReplay != nil {
+			cp := sc.Rollback
+			if cp == nil {
+				cp = sc.EditReplay
+			}
+			req.Messages = req.Messages[:cp.MessageCount]
+			if sc.EditReplay != nil {
+				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
+			}
+			turn = cp.Turn
+			seen = make(map[shared.ToolCallSignature]int, maxRuns)
+			consecutiveErrors = 0
+			a.logInfo("executeToolLoop: steering rollback",
+				"stage", stage, "to_turn", cp.Turn, "to_msgcount", cp.MessageCount)
+			continue
+		}
+		if sc.ShouldPause {
+			a.logInfo("executeToolLoop: steering pause", "stage", stage, "turn", turn)
+			if err := ledger.WaitForResume(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// ── END STEERING ──
+
 		if a.toolDefsDirty {
 			req.Tools = a.buildToolDefinitions()
 			a.toolDefsDirty = false
@@ -89,13 +119,30 @@ func (a *Architect) executeToolLoop(
 		// Debug: log message history size entering this turn.
 		msgSummary := make([]string, len(req.Messages))
 		for i, m := range req.Messages {
-			msgSummary[i] = fmt.Sprintf("%s(%d)", m.Role, len(m.Content))
+			tcInfo := ""
+			if len(m.ToolCalls) > 0 {
+				tcNames := make([]string, len(m.ToolCalls))
+				for j, tc := range m.ToolCalls {
+					tcNames[j] = tc.Name
+				}
+				tcInfo = fmt.Sprintf("+tools[%s]", strings.Join(tcNames, ","))
+			}
+			if m.ToolCallID != "" {
+				tcInfo = fmt.Sprintf("+result[%s]", m.ToolName)
+			}
+			msgSummary[i] = fmt.Sprintf("%s(%d)%s", m.Role, len(m.Content), tcInfo)
 		}
 		a.logDebug("tool_loop: LLM_CALL_START",
 			"stage", stage,
 			"turn", turn,
 			"messages", strings.Join(msgSummary, ","),
 			"loop_elapsed", time.Since(loopStart).String())
+		architectDebugLog().Info("handoff: TOOL_LOOP_TURN",
+			"stage", stage,
+			"turn", turn,
+			"messages_count", len(req.Messages),
+			"messages_detail", strings.Join(msgSummary, " | "),
+			"tools_count", len(req.Tools))
 
 		a.logInfo("executeToolLoop: LLM call",
 			"stage", stage,
@@ -104,6 +151,7 @@ func (a *Architect) executeToolLoop(
 			"ctx_deadline", contextDeadlineString(ctx))
 		turnStart := time.Now()
 		resp, err := planner.CompleteForToolLoop(ctx, req, stage, onChunk)
+		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 
 		// Debug: thorough response logging.
 		if resp != nil {
@@ -153,6 +201,15 @@ func (a *Architect) executeToolLoop(
 				"turn", turn,
 				"content_len", len(resp.Content),
 				"total_elapsed", time.Since(loopStart).String())
+			architectDebugLog().Warn("handoff: TOOL_LOOP_TEXT_ONLY_EXIT",
+				"stage", stage,
+				"turn", turn,
+				"stop_reason", string(resp.StopReason),
+				"content_len", len(resp.Content),
+				"content_preview", truncateString(resp.Content, 500),
+				"thinking_preview", truncateString(resp.Thinking, 300),
+				"model", resp.Model,
+				"tools_were_available", len(req.Tools) > 0)
 			return strings.TrimSpace(resp.Content), nil
 		}
 
@@ -382,6 +439,25 @@ func resultError(r *skills.Result) string {
 		return "<nil result>"
 	}
 	return r.Error
+}
+
+// filterToolsByNames returns only the tools whose names are in the allowed set.
+// When allowed is nil or empty, returns all tools unchanged.
+func filterToolsByNames(tools []providers.Tool, allowed []string) []providers.Tool {
+	if len(allowed) == 0 {
+		return tools
+	}
+	set := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		set[name] = struct{}{}
+	}
+	filtered := make([]providers.Tool, 0, len(allowed))
+	for _, t := range tools {
+		if _, ok := set[t.Name]; ok {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered
 }
 
 // buildToolDefinitions converts loaded skills to provider Tool format.

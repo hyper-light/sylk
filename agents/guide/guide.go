@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	corecontext "github.com/adalundhe/sylk/core/context"
 	"github.com/adalundhe/sylk/core/domain"
@@ -64,6 +65,11 @@ func truncateLogStr(s string, max int) string {
 // shrink this deadline via DeadlinePropagator.
 const defaultGuideRequestTimeout = 120 * time.Second
 
+// maxRouteHops is the maximum number of times a single RouteRequest may pass
+// through handleRouteRequestMessage before the Guide rejects it as a routing
+// loop. A normal request traverses the Guide exactly once (hops=1). Agent
+// reroutes add a second hop (hops=2). Anything beyond 3 is pathological.
+const maxRouteHops = 3
 
 // =============================================================================
 // Guide Agent
@@ -82,6 +88,9 @@ type Guide struct {
 
 	// Activity publisher for UI agent-panel updates
 	activityPub events.ActivityPublisher
+
+	// Structured event logger for WAL + JSONL dual-write.
+	eventLogger *agentlog.SessionEventLogger
 
 	// Subscription to Guide's own request channel (guide.requests)
 	requestSub Subscription
@@ -541,8 +550,11 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 	routing := NewRoutingAggregator()
 	routing.RegisterAgent(GuideRoutingInfo())
 
+	guideEventLogger := agentlog.NewSessionEventLogger("guide", "routing")
+
 	parser := NewParserWithRouting(cfg.RouterConfig.DSLPrefix, routing)
 	llmClassifier := NewLLMClassifier(provider, model, cfg.RouterConfig)
+	llmClassifier.eventLogger = guideEventLogger
 	classifier := NewFallbackClassifier(llmClassifier, NewRuleClassifierService())
 	router := &Router{
 		config:            cfg.RouterConfig,
@@ -576,6 +588,7 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		config:         cfg,
 		bus:            cfg.Bus,
 		activityPub:    cfg.ActivityPub,
+		eventLogger:    guideEventLogger,
 		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
 		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:    NewStringMap[bool](DefaultShardCount),
@@ -660,10 +673,19 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 	g.ensureRequestDefaults(request)
 	g.prepareSkillsForRouting(request)
 
+	classStart := time.Now()
 	classification, targetAgentID, err := g.resolveClassification(ctx, request)
 	if err != nil {
 		return nil, err
 	}
+	g.logEvent(agentlog.EventRouteClassified, request.CorrelationID, "info", &agentlog.RoutePayload{
+		Intent:      string(classification.Intent),
+		Domain:      string(classification.Domain),
+		TargetAgent: targetAgentID,
+		Confidence:  classification.Confidence,
+		DurNs:       time.Since(classStart).Nanoseconds(),
+		Model:       classification.ClassificationMethod,
+	})
 	g.applyPendingPlanMetadata(request.SessionID, classification)
 
 	corrID := g.resolveCorrelationID(request)
@@ -749,9 +771,12 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 			classification, targetAgentID = g.ensureRoutableClassification(ctx, classification, request.TargetAgentID)
 		}
 
-		// Explicit non-guide targets should bypass conversation-flow remapping.
-		// Explicit "guide" requests still represent "route this through guide",
-		// so follow-up continuity should remain active.
+		// Explicit non-guide targets should bypass conversation-flow
+		// remapping. Explicit "guide" requests still represent "route
+		// this through guide", so follow-up continuity should remain
+		// active. The hop-based loop breaker (maxRouteHops) prevents
+		// the OOM that was previously possible when conversation-flow
+		// remapped an explicit guide request back to the architect.
 		if request.ExplicitTarget && !explicitGuideFollowupAllowed(request.TargetAgentID) {
 			g.observeRoutedConversationTarget(request, targetAgentID)
 		} else if explicitGuideFollowupAllowed(request.TargetAgentID) {
@@ -781,6 +806,10 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	classification, targetAgentID, ok := g.cachedClassification(request)
 	if ok {
 		guideFileLog().Info("DEBUG: classify_cache_hit", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
+		g.logEvent(agentlog.EventRouteCacheHit, request.CorrelationID, "info", &agentlog.RoutePayload{
+			TargetAgent: targetAgentID,
+			Confidence:  classification.Confidence,
+		})
 		classification = g.applyDomainHints(classification, domainCtx)
 		classification, targetAgentID = g.finalizeClassificationWithExclude(ctx, request.Input, classification, targetAgentID)
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
@@ -1585,10 +1614,27 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		Confidence:           classification.Confidence,
 		ClassificationMethod: classification.ClassificationMethod,
 		CrossDomain:          classification.CrossDomain,
+		Hops:                 request.Hops,
 		ConversationHistory:  g.conversationHistory(request.SessionID, string(classification.TargetAgent)),
-		Metadata:             classification.PhaseMetadata,
+		Metadata:             mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
 	}
 	return fwd
+}
+
+// mergeForwardMetadata combines classification phase metadata with request
+// metadata. Request metadata keys take precedence on conflict.
+func mergeForwardMetadata(phase, request map[string]any) map[string]any {
+	if len(phase) == 0 && len(request) == 0 {
+		return nil
+	}
+	merged := make(map[string]any, len(phase)+len(request))
+	for k, v := range phase {
+		merged[k] = v
+	}
+	for k, v := range request {
+		merged[k] = v
+	}
+	return merged
 }
 
 func (g *Guide) conversationHistory(sessionID string, targetAgentID string) []ConversationTurn {
@@ -1679,6 +1725,12 @@ func (g *Guide) HandleResponse(ctx context.Context, response *RouteResponse) (*P
 	if pending == nil {
 		return nil, fmt.Errorf("no pending request for correlation ID: %s", response.CorrelationID)
 	}
+
+	g.logEvent(agentlog.EventResponseCorrelated, response.CorrelationID, "info", &agentlog.CorrelationPayload{
+		SourceAgent: response.RespondingAgentID,
+		Success:     response.Error == "",
+		DurNs:       time.Since(pending.CreatedAt).Nanoseconds(),
+	})
 
 	return pending, nil
 }
@@ -1998,6 +2050,12 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 		_ = g.bus.Publish(TopicAgentRegistry, msg)
 	}
 
+	g.logEvent(agentlog.EventAgentRegistered, "", "info", &agentlog.RegistryPayload{
+		AgentID:   info.ID,
+		AgentType: info.Type,
+		Action:    "registered",
+	})
+
 	return nil
 }
 
@@ -2293,6 +2351,9 @@ func (g *Guide) stopResilience() {
 	if g.observer != nil {
 		g.observer.Stop()
 	}
+	if g.eventLogger != nil {
+		g.eventLogger.Close()
+	}
 }
 
 func (g *Guide) collectUnsubscribeErrors(errs *[]error) {
@@ -2395,6 +2456,26 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 	if req == nil {
 		return nil
 	}
+
+	// Structural loop breaker: reject requests that have been routed too
+	// many times. Each pass through this method increments Hops. Without
+	// this guard, a classification bug (e.g. conversation-flow remapping
+	// an explicit target) creates an exponential goroutine fork → OOM.
+	req.Hops++
+	if req.Hops > maxRouteHops {
+		guideFileLog().Warn("guide: routing loop detected — dropping request",
+			"hops", req.Hops,
+			"source_agent", req.SourceAgentID,
+			"target_agent", req.TargetAgentID,
+			"correlation_id", req.CorrelationID,
+			"input_preview", truncateLogStr(req.Input, 100))
+		return g.publishRouteError(
+			routeCorrelationID(msg, req),
+			req.SourceAgentID,
+			fmt.Errorf("routing loop detected after %d hops (source=%s target=%s)", req.Hops, req.SourceAgentID, req.TargetAgentID),
+		)
+	}
+
 	guideFileLog().Info("guide: handleRouteRequestMessage",
 		"source_agent", req.SourceAgentID,
 		"target_agent", req.TargetAgentID,
@@ -2402,9 +2483,19 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		"input_preview", truncateLogStr(req.Input, 100),
 		"session_id", req.SessionID,
 		"msg_type", msg.Type,
-		"msg_source", msg.SourceAgentID)
+		"msg_source", msg.SourceAgentID,
+		"hops", req.Hops)
 	correlationID := routeCorrelationID(msg, req)
 	req.CorrelationID = correlationID
+
+	// Lazily bind the event logger to the session directory on first request.
+	if req.SessionID != "" && g.eventLogger != nil && !g.eventLogger.IsBound() {
+		if err := g.eventLogger.BindSession(filepath.Join(".sylk", "sessions", req.SessionID), req.SessionID); err != nil {
+			slog.Warn("guide: event logger bind failed",
+				"session_id", req.SessionID, "err", err)
+		}
+	}
+
 	reqCtx, cancel := context.WithTimeout(ctx, defaultGuideRequestTimeout)
 	g.registerRequestCancel(correlationID, cancel)
 	defer g.clearRequestCancel(correlationID)
@@ -2455,6 +2546,10 @@ func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
 	if !ok || reroute == nil {
 		return fmt.Errorf("invalid reroute payload")
 	}
+	g.logEvent(agentlog.EventRerouted, msg.CorrelationID, "info", &agentlog.ForwardPayload{
+		TargetAgent: reroute.SuggestedTarget,
+		InputLen:    len(reroute.OriginalInput),
+	})
 
 	// Break conversation stickiness so the fast-path won't fire.
 	if g.conversation != nil && reroute.SessionID != "" {
@@ -2677,9 +2772,12 @@ func (g *Guide) generateGuideReply(
 		return nil
 	})
 	if err != nil {
+		g.clearSelfResponseHistory()
 		return "", nil, err
 	}
-	g.appendSelfResponseTurn(input, reply)
+	if !isStaticGuideReply(reply) {
+		g.appendSelfResponseTurn(input, reply)
+	}
 	var usage *StreamUsage
 	if providerUsage != nil {
 		usage = &StreamUsage{
@@ -2844,6 +2942,11 @@ func (g *Guide) refreshAuthWithMode(ctx context.Context, mode string, strict boo
 // SwapModel implements container.ModelSwappable.
 // Installs the pre-built, gateway-wrapped provider and rewires the
 // classifier and self-responder. Thread-safe.
+//
+// Performs a comprehensive state reset beyond the provider/classifier swap:
+// conversation flow sessions, session router caches, and self-response
+// history are all cleared so stale routing decisions from the previous
+// provider cannot leak into classification or response generation.
 func (g *Guide) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
 	if g == nil {
 		return nil
@@ -2861,6 +2964,21 @@ func (g *Guide) SwapModel(_ context.Context, modelID string, provider providers.
 	if cache := g.RouteCache(); cache != nil {
 		cache.Clear()
 	}
+
+	// Clear routing stickiness so the next request goes through fresh LLM
+	// classification with the new provider. Conversation history and pending
+	// plans are preserved to maintain chat continuity.
+	if g.conversation != nil {
+		g.conversation.ClearAllStickiness()
+	}
+
+	// Clear session classification caches: results from the previous
+	// provider are invalid for the new model. Session preferences
+	// (preferred agents, blocked agents) are preserved.
+	if g.sessionRouter != nil {
+		g.sessionRouter.ClearClassificationCaches()
+	}
+
 	return nil
 }
 
@@ -3009,6 +3127,7 @@ func (g *Guide) publishRetryStatus(correlationID, sourceAgentID string, status R
 }
 
 func (g *Guide) publishGuideStreamStart(correlationID, sourceAgentID string) {
+	g.logEvent(agentlog.EventStreamStarted, correlationID, "info", &agentlog.StreamPayload{Phase: "started"})
 	event := &StreamEvent{
 		Type:      StreamEventStart,
 		Timestamp: time.Now(),
@@ -3102,6 +3221,7 @@ func (g *Guide) publishGuideStreamEarlyUsage(correlationID, sourceAgentID string
 }
 
 func (g *Guide) publishGuideStreamComplete(correlationID, sourceAgentID string, usage *StreamUsage) {
+	g.logEvent(agentlog.EventStreamCompleted, correlationID, "info", &agentlog.StreamPayload{Phase: "completed"})
 	event := &StreamEvent{
 		Type:      StreamEventComplete,
 		Usage:     usage,
@@ -3312,7 +3432,7 @@ func (g *Guide) handleNotificationPush(push *AgentPush, _ *Message) error {
 	for _, event := range []*StreamEvent{
 		{Type: StreamEventStart, Timestamp: time.Now()},
 		{Type: StreamEventData, Text: push.Content, Timestamp: time.Now()},
-		{Type: StreamEventComplete, Timestamp: time.Now()},
+		{Type: StreamEventComplete, Text: push.Content, Timestamp: time.Now()},
 	} {
 		resp := &StreamResponse{
 			CorrelationID:     push.PushID,
@@ -3416,6 +3536,10 @@ func (g *Guide) handleUserInterruptMessage(msg *Message) error {
 // correlation epoch. Called on abort to prevent stale routing, ghost sessions,
 // and orphaned caches. The pattern is extensible — any new request-scoped
 // state only needs an entry here.
+//
+// When pending is nil (interrupt arrived before pending.Add completed), the
+// cleanup broadens: the entire route cache is cleared instead of a single
+// agent, because we don't know which agent was targeted.
 func (g *Guide) reclaimRequestEpoch(correlationID string, pending *PendingRequest) {
 	sid := g.resolveSessionID(pending)
 
@@ -3429,10 +3553,16 @@ func (g *Guide) reclaimRequestEpoch(correlationID string, pending *PendingReques
 		}
 	}
 
-	// 2. Route cache: invalidate any cached classification that would
-	//    short-circuit the next request to the same (now-stale) route.
-	if g.routeCache != nil && pending != nil && pending.TargetAgentID != "" {
-		g.routeCache.InvalidateForAgent(pending.TargetAgentID)
+	// 2. Route cache: invalidate cached classifications that would
+	//    short-circuit the next request to a stale route.
+	//    When pending is nil (race: interrupt before Add), clear the
+	//    entire cache since the target agent is unknown.
+	if g.routeCache != nil {
+		if pending != nil && pending.TargetAgentID != "" {
+			g.routeCache.InvalidateForAgent(pending.TargetAgentID)
+		} else {
+			g.routeCache.Clear()
+		}
 	}
 
 	// 3. Session router: remove per-session route bindings so the
@@ -3440,6 +3570,10 @@ func (g *Guide) reclaimRequestEpoch(correlationID string, pending *PendingReques
 	if g.sessionRouter != nil && sid != "" {
 		g.sessionRouter.RemoveSession(sid)
 	}
+
+	// 4. Self-response history: clear to prevent stale context from
+	//    polluting the next request after an error/interrupt.
+	g.clearSelfResponseHistory()
 }
 
 // resolveSessionID extracts the session ID from a pending request,
@@ -3493,6 +3627,11 @@ func (g *Guide) userInterruptAction(req *UserInterruptRequest, pending *PendingR
 	if pending.CorrelationID != "" {
 		data["epoch"] = pending.CorrelationID
 	}
+	// Include session_id so agents can perform session-scoped cleanup
+	// (e.g. the architect supersedes stalled plans for the session).
+	if pending.Request != nil && pending.Request.SessionID != "" {
+		data["session_id"] = pending.Request.SessionID
+	}
 	return &ActionRequest{
 		CorrelationID: pending.CorrelationID,
 		SourceAgentID: g.agentID,
@@ -3530,11 +3669,13 @@ func (g *Guide) handleErrorMessage(msg *Message) error {
 	return g.publishErrorToSource(pending.SourceAgentID, msg.CorrelationID, msg.SourceAgentID, errStr)
 }
 
-func (g *Guide) setRunContext(parent context.Context) {
-	if parent == nil {
-		parent = context.Background()
-	}
-	runCtx, cancel := context.WithCancel(parent)
+func (g *Guide) setRunContext(_ context.Context) {
+	// Use Background as the base — the guide's run context must only be
+	// cancelled by Stop(), not by the bootstrap parent. The parent context
+	// is ephemeral (container lifecycle, activation deadline) and may be
+	// cancelled after bootstrap completes. Deriving runCtx from it caused
+	// the guide to silently drop all messages when the parent expired.
+	runCtx, cancel := context.WithCancel(context.Background())
 
 	g.runMu.Lock()
 	g.runCtx = runCtx
@@ -3625,6 +3766,12 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	// Weighted target resolution: during overlap, multiple endpoints may
 	// exist for the same agent type. Select based on quality weights.
 	resolvedTarget := g.resolveWeightedTarget(resolved)
+
+	g.logEvent(agentlog.EventForwardDispatched, forwarded.CorrelationID, "info", &agentlog.ForwardPayload{
+		TargetAgent: resolvedTarget,
+		InputLen:    len(forwarded.Input),
+		Intent:      string(forwarded.Intent),
+	})
 
 	fwdMsg := g.forwardMessage(resolvedTarget, forwarded, replyTo)
 	return g.bus.Publish(g.agentRequestTopic(resolvedTarget), fwdMsg)
@@ -3847,6 +3994,29 @@ func (g *Guide) SkillLoader() *skills.Loader {
 // Hooks returns the Guide's hook registry
 func (g *Guide) Hooks() *skills.HookRegistry {
 	return g.hooks
+}
+
+// logEvent is a nil-safe helper that dual-writes an event to WAL + JSONL.
+func (g *Guide) logEvent(eventType agentlog.EventType, corrID, level string, data any) {
+	if g.eventLogger == nil {
+		return
+	}
+	g.eventLogger.LogWALJSON(eventType, data)
+	g.eventLogger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     "guide",
+		SessionID: g.sessionID,
+		Event:     eventType.String(),
+		EventCode: eventType,
+		CorrID:    corrID,
+		Data:      data,
+	})
+}
+
+// EventLogger returns the Guide's session event logger.
+func (g *Guide) EventLogger() *agentlog.SessionEventLogger {
+	return g.eventLogger
 }
 
 // RegisterSkill registers a skill with the Guide's skill registry

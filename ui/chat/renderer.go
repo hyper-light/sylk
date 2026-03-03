@@ -80,9 +80,25 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 		lines = append(lines, header)
 		lines = append(lines, animatedStyle.Render(truncateToWidth(normalizeThinkingLine(entry.ThinkingText), width)))
 		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
-			wrapped := wrapLine(normalizeThinkingLine(status), width, animatedStyle)
-			lines = append(lines, capLines(wrapped, thinkingStatusMaxLines, width, animatedStyle)...)
+			mdLines, _ := renderMarkdownContent(status, width, animatedStyle, th, nil)
+			lines = append(lines, capLines(mdLines, thinkingStatusMaxLines, width, animatedStyle)...)
 		}
+		lines = append(lines, "")
+		return lines, nil
+	}
+
+	// Phase 1b: Steering pending (holographic shimmer until acknowledged).
+	// Content is present but renders with animated italic + gradient color.
+	if entry.SteeringPending && entry.Content != "" {
+		color := th.Palette.Warning
+		if entry.ThinkingColor != "" {
+			color = lipgloss.Color(entry.ThinkingColor)
+		}
+		animatedStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
+		wrapped := wrapLine(entry.Content, width, animatedStyle)
+		lines := make([]string, 0, 1+len(wrapped)+1)
+		lines = append(lines, header)
+		lines = append(lines, wrapped...)
 		lines = append(lines, "")
 		return lines, nil
 	}

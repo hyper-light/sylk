@@ -22,9 +22,10 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(shared.DetectRaceConditionsSkill(gi.toolRunner))
 	gi.skills.Register(shared.DetectDeadlocksSkill(gi.toolRunner))
 	gi.skills.Register(shared.DetectMemoryLeaksSkill(gi.toolRunner))
-	gi.skills.Register(shared.ReadFileSkill())
-	gi.skills.Register(shared.GlobSkill())
-	gi.skills.Register(shared.GrepSkill())
+	faFunc := func() shared.FileAccess { return gi.fileAccess }
+	gi.skills.Register(shared.ReadFileSkill(faFunc))
+	gi.skills.Register(shared.GlobSkill(faFunc))
+	gi.skills.Register(shared.GrepSkill(faFunc))
 
 	// Global-specific skills.
 	gi.skills.Register(auditLayerSkill(gi))

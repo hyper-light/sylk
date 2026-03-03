@@ -193,6 +193,7 @@ func (a *Architect) tryGenerateTasksWithLLM(
 }
 
 func newAnthropicPlanner(ctx context.Context, cfg Config, logger *slog.Logger, goSkills []*skills.Skill) (planningLLM, error) {
+	defaults := providers.DefaultBaseConfig()
 	providerCfg := providers.AnthropicConfig{
 		BaseConfig: providers.BaseConfig{
 			APIKey:         cfg.AnthropicAPIKey,
@@ -200,8 +201,8 @@ func newAnthropicPlanner(ctx context.Context, cfg Config, logger *slog.Logger, g
 			MaxTokens:      cfg.MaxOutputTokens,
 			Temperature:    0.7,
 			MaxRetries:     cfg.LLMRetryMax,
-			RetryBaseDelay: 200 * time.Millisecond,
-			RetryMaxDelay:  time.Second,
+			RetryBaseDelay: defaults.RetryBaseDelay,
+			RetryMaxDelay:  defaults.RetryMaxDelay,
 		},
 		EnableCaching:    !cfg.DisablePromptCache,
 		PromptCacheTTL:   cfg.PromptCacheTTL,
@@ -582,12 +583,24 @@ func (p *anthropicPlanner) streamRequestFull(
 	streamStart := time.Now()
 	var textChunks, thoughtChunks, toolChunks, otherChunks int
 
+	streamMsgSummary := make([]string, len(req.Messages))
+	for i, m := range req.Messages {
+		extra := ""
+		if len(m.ToolCalls) > 0 {
+			extra = fmt.Sprintf("+tc:%d", len(m.ToolCalls))
+		}
+		if m.ToolCallID != "" {
+			extra = "+result:" + m.ToolName
+		}
+		streamMsgSummary[i] = fmt.Sprintf("%s(%d)%s", m.Role, len(m.Content), extra)
+	}
 	architectDebugLog().Debug("stream_full: START",
 		"stage", stage,
 		"max_tokens", req.MaxTokens,
 		"thinking_budget", req.ThinkingBudget,
 		"tools_count", len(req.Tools),
-		"messages_count", len(req.Messages))
+		"messages_count", len(req.Messages),
+		"messages_detail", strings.Join(streamMsgSummary, " | "))
 
 	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
 		accumulator.Add(chunk)
@@ -1488,7 +1501,7 @@ Return JSON only, exactly:
       "id": "task_1",
       "name": "Short imperative name",
       "description": "Detailed implementation description. Include what to build, how it fits the architecture, and key design decisions. Be specific enough that an agent can implement without follow-up questions.",
-      "agent_type": "engineer|designer|tester|inspector|architect",
+      "agent_type": "engineer|designer",
       "co_agents": ["designer"],
       "collaboration_mode": "sequential|adversarial",
       "max_review_rounds": 0,
@@ -1542,6 +1555,12 @@ Return JSON only, exactly:
     }
   ]
 }
+
+Pipeline model:
+- Each engineer/designer task is automatically expanded into a 3-stage pipeline: inspector → tester → engineer/designer.
+- Do NOT create standalone tester, inspector, or architect tasks. Testing and inspection are pipeline stages, not task types.
+- agent_type MUST be "engineer" or "designer" only. Any other value is rejected.
+- Include test_requirements on each task — the pipeline tester uses them to write tests BEFORE the engineer/designer executes.
 
 Hard limits:
 - At most 10 tasks

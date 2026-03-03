@@ -68,6 +68,26 @@ func TestConversationFlow_AgentDoneClearsSession(t *testing.T) {
 	}
 }
 
+func TestObserveResponse_DoesNotIncrementTurns(t *testing.T) {
+	flow := NewConversationFlowManager(ConversationFlowConfig{})
+	flow.ObserveRoutedRequest("session-1", "architect") // Turns = 1
+
+	// Simulate multiple agent responses — none should bump Turns.
+	flow.ObserveResponse("session-1", "architect", "working on it...")
+	flow.ObserveResponse("session-1", "architect", "still going...")
+	flow.ObserveResponse("session-1", "architect", "partial result")
+
+	flow.mu.RLock()
+	state := flow.sessions["session-1"]
+	agentState := state.agents["architect"]
+	turns := agentState.Turns
+	flow.mu.RUnlock()
+
+	if turns != 1 {
+		t.Fatalf("Turns = %d, want 1 (ObserveResponse should not increment)", turns)
+	}
+}
+
 func TestConversationHistory_RecordAndRetrieve(t *testing.T) {
 	flow := NewConversationFlowManager(ConversationFlowConfig{})
 	flow.ObserveRoutedRequest("s1", "architect")
@@ -389,6 +409,114 @@ func TestPendingPlanFromDirective_Float64Epoch(t *testing.T) {
 	}
 	if pp.Epoch != 99 {
 		t.Fatalf("Epoch = %d, want 99 (from float64)", pp.Epoch)
+	}
+}
+
+// =============================================================================
+// Session Expiry + Pending Plan Preservation Tests
+// =============================================================================
+
+func TestSessionExpiry_PreservesPendingPlanWithLiveTTL(t *testing.T) {
+	flow := NewConversationFlowManager(ConversationFlowConfig{
+		SessionTTL: 1 * time.Nanosecond, // expire immediately
+	})
+	flow.ObserveRoutedRequest("s1", "architect")
+
+	flow.SetPendingPlan("s1", &ResponseDirective{
+		Phase:   PhasePlanApproval,
+		AgentID: "architect",
+		Metadata: map[string]any{
+			"plan_id": "plan-survive",
+			"epoch":   uint64(7),
+		},
+		TTL: 30 * time.Minute,
+	})
+
+	// Session TTL expired, but pending plan has 30min left.
+	// sessionState should return false (session expired)...
+	_, ok := flow.sessionState("s1")
+	if ok {
+		t.Fatal("expected session to be expired")
+	}
+
+	// ...but the pending plan should still be retrievable.
+	pp := flow.PendingPlan("s1")
+	if pp == nil {
+		t.Fatal("expected pending plan to survive session expiry")
+	}
+	if pp.PlanID != "plan-survive" {
+		t.Fatalf("PlanID = %q, want plan-survive", pp.PlanID)
+	}
+}
+
+func TestSessionExpiry_DeletesSessionWhenPlanAlsoExpired(t *testing.T) {
+	flow := NewConversationFlowManager(ConversationFlowConfig{
+		SessionTTL: 1 * time.Nanosecond,
+	})
+	flow.ObserveRoutedRequest("s1", "architect")
+
+	flow.SetPendingPlan("s1", &ResponseDirective{
+		Phase:   PhasePlanApproval,
+		AgentID: "architect",
+		Metadata: map[string]any{
+			"plan_id": "plan-expired",
+			"epoch":   uint64(1),
+		},
+		TTL: 1 * time.Nanosecond, // also expires immediately
+	})
+
+	_, ok := flow.sessionState("s1")
+	if ok {
+		t.Fatal("expected session to be expired")
+	}
+
+	pp := flow.PendingPlan("s1")
+	if pp != nil {
+		t.Fatal("expected nil pending plan when both session and plan are expired")
+	}
+}
+
+func TestSessionExpiry_ClearsConversationStateButKeepsPlan(t *testing.T) {
+	flow := NewConversationFlowManager(ConversationFlowConfig{
+		SessionTTL: 1 * time.Nanosecond,
+	})
+	flow.ObserveRoutedRequest("s1", "architect")
+	flow.RecordUserInput("s1", "architect", "plan auth")
+	flow.RecordAgentReply("s1", "architect", "here is the plan")
+
+	flow.SetPendingPlan("s1", &ResponseDirective{
+		Phase:   PhasePlanApproval,
+		AgentID: "architect",
+		Metadata: map[string]any{
+			"plan_id": "plan-keep",
+			"epoch":   uint64(3),
+		},
+		TTL: 30 * time.Minute,
+	})
+
+	// Trigger session expiry via sessionState.
+	flow.sessionState("s1")
+
+	// Conversation history should be cleared.
+	history := flow.HistoryForSession("s1")
+	if len(history) != 0 {
+		t.Fatalf("len(history) = %d, want 0 after session expiry", len(history))
+	}
+
+	// But plan survives.
+	pp := flow.PendingPlan("s1")
+	if pp == nil {
+		t.Fatal("expected pending plan to survive")
+	}
+	if pp.PlanID != "plan-keep" {
+		t.Fatalf("PlanID = %q, want plan-keep", pp.PlanID)
+	}
+}
+
+func TestDefaultSessionTTL_MatchesPendingPlanTTL(t *testing.T) {
+	if defaultConversationSessionTTL != defaultPendingPlanTTL {
+		t.Fatalf("session TTL (%v) != pending plan TTL (%v); they should match",
+			defaultConversationSessionTTL, defaultPendingPlanTTL)
 	}
 }
 

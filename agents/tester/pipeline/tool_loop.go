@@ -6,34 +6,92 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 // executeToolLoop runs the model tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
 // Follows the orchestrator tool_loop.go pattern exactly.
-func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Request) (string, error) {
+func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, pt.config.MaxToolRuns)
 	consecutiveErrors := 0
 
 	for turn := 0; turn <= pt.config.MaxToolRuns; turn++ {
+		// ── STEERING CHECKPOINT ──
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "testing", nil)
+		if sc.Rollback != nil || sc.EditReplay != nil {
+			cp := sc.Rollback
+			if cp == nil {
+				cp = sc.EditReplay
+			}
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				action := "rollback"
+				if sc.EditReplay != nil {
+					action = "edit_replay"
+				}
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventSteeringCheckpoint,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("%s at turn %d", action, cp.Turn)})
+			}
+			req.Messages = req.Messages[:cp.MessageCount]
+			if sc.EditReplay != nil {
+				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
+			}
+			turn = cp.Turn
+			seen = make(map[shared.ToolCallSignature]int, pt.config.MaxToolRuns)
+			consecutiveErrors = 0
+			continue
+		}
+		if sc.ShouldPause {
+			if err := ledger.WaitForResume(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// ── END STEERING ──
+
+		turnStart := time.Now()
 		resp, err := pt.provider.Complete(ctx, req)
+		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
+			}
 			return "", fmt.Errorf("pipeline tester llm: %w", err)
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.TestSuitePayload{Phase: "tool_loop_completed"})
+			}
 			return strings.TrimSpace(resp.Content), nil
 		}
 
 		if turn == pt.config.MaxToolRuns {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", pt.config.MaxToolRuns)})
+			}
 			return "", fmt.Errorf("pipeline tester exceeded tool-call limit (%d)", pt.config.MaxToolRuns)
 		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
+			}
 			return "", fmt.Errorf("pipeline tester repeated tool call: %s", sig.Name)
 		}
 
@@ -43,10 +101,20 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
+			}
 			return "", fmt.Errorf("pipeline tester tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
 
+	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+			lm.AgentID, lm.SessionID, lm.CorrID, "error",
+			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
+	}
 	return "", fmt.Errorf("pipeline tester exhausted tool-call loop")
 }
 
@@ -78,7 +146,17 @@ func (pt *PipelineTester) applyToolCalls(
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
+				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					shared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ToolPayload{ToolName: call.Name, Success: false, Err: err.Error()})
+				}
 			}
+		}
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, shared.ToolNameToEventType(call.Name),
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -95,7 +173,7 @@ func (pt *PipelineTester) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (pt *PipelineTester) executeToolCall(_ context.Context, call providers.ToolCall) (string, error) {
+func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return "", fmt.Errorf("tool name is required")
@@ -109,7 +187,7 @@ func (pt *PipelineTester) executeToolCall(_ context.Context, call providers.Tool
 		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
 
-	result := pt.skills.Invoke(context.Background(), name, json.RawMessage(raw))
+	result := pt.skills.Invoke(ctx, name, json.RawMessage(raw))
 	if result == nil {
 		return "", fmt.Errorf("tool %q returned nil", name)
 	}

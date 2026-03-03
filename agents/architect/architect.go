@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
@@ -97,6 +98,13 @@ type Architect struct {
 	leaseManager *PlanLeaseManager
 	reaper       *PlanReaper
 	heartbeatSub guide.Subscription
+
+	// Steering ledger management.
+	steering *shared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *shared.RequestSerializer
 }
 
 // Config holds configuration for the Architect agent
@@ -297,8 +305,12 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		activePlans: make(map[string]*DesignPlan),
 		planModes:   make(map[string]*PlanModeState),
 		pendingBus:  make(map[string]chan *guide.Message),
-		inFlight:    make(map[string]context.CancelFunc),
+		inFlight:          make(map[string]context.CancelFunc),
+		steering:          shared.NewSteeringManager(),
+		requestSerializer: shared.NewRequestSerializer(),
 	}
+
+	architect.steering.InitLazy("architect", cfg.ActivityPub)
 
 	guide.DebugFileLog().Info("DEBUG: architect_new_init_cross_domain")
 	architect.initCrossDomain(cfg)
@@ -535,6 +547,8 @@ func (a *Architect) Stop() error {
 	a.running = false
 	a.runMu.Unlock()
 
+	a.steering.CloseAll()
+
 	// Diagnostic: log stop with in-flight state so we can trace what
 	// triggers Stop() while requests are still processing.
 	a.inFlightMu.Lock()
@@ -679,11 +693,19 @@ func (a *Architect) dispatchBusRequest(ctx context.Context, msg *guide.Message) 
 }
 
 func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Message) error {
+	if !a.requestSerializer.Acquire(ctx) {
+		return nil // parent context done, agent shutting down
+	}
+	defer a.requestSerializer.Release()
+
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		a.logWarn("handleForwardBusRequest: invalid forward request payload")
 		return fmt.Errorf("invalid forward request payload")
 	}
+
+	a.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	shared.LogIncomingRequest(a.steering.EventLogger(), fwd, a.id)
 
 	if a.config.RequestGuard != nil {
 		release := a.config.RequestGuard()
@@ -701,6 +723,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx = withRouteHops(reqCtx, fwd.Hops)
 	reqCtx = withArchitectStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
 	reqCtx, usageAcc := withArchitectUsageAccumulator(reqCtx)
 	reqCtx = withArchitectEarlyUsageEmitter(reqCtx, func(inputTokens int) {
@@ -709,7 +732,20 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	reqCtx = withStreamRetryResetEmitter(reqCtx, func() {
 		a.publishPlanStreamStart(reqCtx)
 	})
+
+	// Create steering ledger for this request.
+	ledger := a.steering.Create(fwd.CorrelationID, a.id, fwd.SessionID, a.activityPub, nil)
+	defer a.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
+	reqCtx = shared.WithSteeringLedger(reqCtx, ledger)
+	reqCtx = shared.WithLogMeta(reqCtx, shared.LogMeta{
+		EventLogger: a.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     a.id,
+		SessionID:   fwd.SessionID,
+	})
+
 	a.registerInFlight(fwd.CorrelationID, cancel)
+	a.steering.RegisterCancel(fwd.CorrelationID, cancel)
 	defer a.clearInFlight(fwd.CorrelationID)
 	defer cancel()
 	if !fwd.FireAndForget {
@@ -719,6 +755,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		"correlation_id", fwd.CorrelationID,
 		"elapsed_before_process", time.Since(startTime).String())
 	result, err := a.processForwardedRequest(reqCtx, fwd)
+	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, a.id, fwd.SessionID, time.Since(startTime), err)
 	a.logInfo("handleForwardBusRequest: processForwardedRequest returned",
 		"correlation_id", fwd.CorrelationID,
 		"elapsed", time.Since(startTime).String(),
@@ -832,14 +869,19 @@ func (a *Architect) handleActionBusRequest(ctx context.Context, msg *guide.Messa
 	if req == nil {
 		return nil
 	}
+	// Cancel must be checked BEFORE steering.HandleAction so the Architect's
+	// custom handleCancelAction runs (publishes interrupt response + supersedes plans).
+	if isCancelAction(req.Action) {
+		return a.handleCancelAction(req)
+	}
+	if a.steering.HandleAction(req) {
+		return nil
+	}
 	if strings.EqualFold(req.Action, "proposal") {
 		return a.handleProposalAction(ctx, req)
 	}
 	if strings.EqualFold(req.Action, "read_research_paper") {
 		return a.handleReadResearchAction(ctx, req)
-	}
-	if isCancelAction(req.Action) {
-		return a.handleCancelAction(req)
 	}
 	return nil
 }
@@ -909,6 +951,14 @@ func (a *Architect) processForwardedRequest(ctx context.Context, fwd *guide.Forw
 	a.logInfo("processForwardedRequest: resolving intent handler",
 		"intent", string(fwd.Intent),
 		"ctx_deadline", contextDeadlineString(ctx))
+	architectDebugLog().Info("handoff: PROCESS_FWD_REQUEST",
+		"intent", string(fwd.Intent),
+		"user_input", truncateString(fwd.Input, 300),
+		"session_id", fwd.SessionID,
+		"correlation_id", fwd.CorrelationID,
+		"has_metadata", fwd.Metadata != nil,
+		"current_model", a.config.Model,
+		"active_plans", a.activePlanCount())
 	handler, err := a.intentHandler(fwd.Intent)
 	if err != nil {
 		a.logWarn("processForwardedRequest: no handler for intent",
@@ -924,6 +974,12 @@ func (a *Architect) processForwardedRequest(ctx context.Context, fwd *guide.Forw
 		"elapsed", time.Since(start).String(),
 		"has_result", result != nil,
 		"err", handlerErr)
+	architectDebugLog().Info("handoff: PROCESS_FWD_RESULT",
+		"intent", string(fwd.Intent),
+		"elapsed", time.Since(start).String(),
+		"has_result", result != nil,
+		"err", handlerErr,
+		"result_type", fmt.Sprintf("%T", result))
 	return result, handlerErr
 }
 
@@ -1043,15 +1099,53 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		return a.handleClarificationResponse(ctx, fwd, plan)
 	}
 
-	// When a ready plan exists and the Guide routed here (IntentPlan, not
-	// IntentExecute), it's feedback. The Guide's LLM phase gate classifies
-	// approvals as IntentExecute, which routes to handleExecute directly —
-	// no double-classification needed here.
+	// When a ready plan exists, evaluate the user's response using the
+	// Guide's purpose-built acceptance evaluator before routing. This
+	// prevents misrouting when the Guide's general intent classifier labels
+	// an approval as IntentPlan instead of IntentExecute — approvals always
+	// go through the deterministic dispatch path, never the LLM tool loop.
 	if plan := a.latestReadyPlan(sessionIDFromForwarded(fwd)); plan != nil {
-		a.logInfo("handleConversation: ROUTE=plan_feedback (ready plan, non-execute intent)",
+		architectDebugLog().Info("handoff: READY_PLAN_FOUND",
 			"plan_id", plan.ID,
-			"plan_age", time.Since(plan.UpdatedAt).String())
-		return a.handlePlanFeedback(ctx, fwd, plan)
+			"plan_state", plan.SM().State().String(),
+			"plan_epoch", plan.SM().Epoch(),
+			"plan_age", time.Since(plan.UpdatedAt).String(),
+			"user_input", fwd.Input,
+			"is_approval_signal", isApprovalSignal(fwd.Input),
+			"current_model", a.config.Model)
+		verdict, evalErr := a.evaluateAcceptanceVerdict(ctx, plan, fwd.Input)
+		architectDebugLog().Info("handoff: ACCEPTANCE_VERDICT",
+			"plan_id", plan.ID,
+			"verdict", string(verdict),
+			"eval_err", evalErr,
+			"user_input_preview", truncateString(fwd.Input, 200))
+		if evalErr != nil {
+			a.logWarn("handleConversation: acceptance evaluation failed",
+				"plan_id", plan.ID,
+				"error", evalErr)
+			// Short-circuit: if the user's input is a clear approval signal,
+			// dispatch deterministically instead of falling to the LLM path.
+			// This avoids the LLM "talking about handoff" failure mode when
+			// the Guide's evaluator is temporarily unreachable.
+			if isApprovalSignal(fwd.Input) {
+				a.logInfo("handleConversation: ROUTE=direct_dispatch (approval signal fallback)",
+					"plan_id", plan.ID,
+					"eval_error", evalErr)
+				return a.handleExecute(ctx, fwd)
+			}
+			return a.handlePlanFeedback(ctx, fwd, plan)
+		}
+		switch verdict {
+		case verdictAccept:
+			a.logInfo("handleConversation: ROUTE=direct_dispatch (acceptance evaluator: accept)",
+				"plan_id", plan.ID)
+			return a.handleExecute(ctx, fwd)
+		default:
+			a.logInfo("handleConversation: ROUTE=plan_feedback (acceptance evaluator: "+string(verdict)+")",
+				"plan_id", plan.ID,
+				"plan_age", time.Since(plan.UpdatedAt).String())
+			return a.handlePlanFeedback(ctx, fwd, plan)
+		}
 	}
 
 	req := &ArchitectRequest{
@@ -1139,10 +1233,26 @@ func (a *Architect) handleClarificationResponse(ctx context.Context, fwd *guide.
 // handlePlanFeedback processes user feedback on a ready plan. The phase gate
 // classified the input as negative polarity (feedback/rejection), so we route
 // to the LLM to address their concerns directly.
+//
+// Includes a programmatic approval fallback: if the LLM tool loop completes
+// without dispatching (plan still Ready) but the user's input signals approval,
+// we dispatch directly. This covers providers (e.g. OpenAI) whose models
+// don't reliably invoke function-calling tools.
 func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.ForwardedRequest, plan *DesignPlan) (any, error) {
 	a.logInfo("handlePlanFeedback: entry",
 		"input", truncateString(fwd.Input, 80),
 		"plan_id", plan.ID)
+
+	architectDebugLog().Info("handoff: FEEDBACK_ENTRY",
+		"plan_id", plan.ID,
+		"plan_state", plan.SM().State().String(),
+		"user_input", fwd.Input,
+		"is_approval_signal", isApprovalSignal(fwd.Input),
+		"approval_required", !a.config.AutoApprove,
+		"current_model", a.config.Model,
+		"session_id", sessionIDFromForwarded(fwd),
+		"history_len", len(fwd.ConversationHistory),
+		"plan_summary_len", len(formatPlanForChat(plan)))
 
 	ctx = withArchitectSessionID(ctx, sessionIDFromForwarded(fwd))
 	ctx = withPlannerThoughtCallback(ctx, func(stage string, thought string) {
@@ -1152,6 +1262,9 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 	request := plannerConversationRequest{
 		Mode:                plannerConversationModeFeedback,
 		UserQuery:           fwd.Input,
+		PlanID:              plan.ID,
+		SessionID:           sessionIDFromForwarded(fwd),
+		ApprovalRequired:    !a.config.AutoApprove,
 		PlanSummary:         formatPlanForChat(plan),
 		ConversationHistory: fwd.ConversationHistory,
 		OnChunk: func(text string) {
@@ -1162,12 +1275,53 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 	response, err := a.composeUserFacingResponse(ctx, request)
 	if err != nil {
 		a.logWarn("handlePlanFeedback: compose failed", "error", err)
+		architectDebugLog().Warn("handoff: COMPOSE_FAILED",
+			"plan_id", plan.ID,
+			"error", err.Error(),
+			"plan_state_after", plan.SM().State().String(),
+			"is_approval_signal", isApprovalSignal(fwd.Input))
+		// Compose failed — if user was approving, dispatch directly.
+		if plan.SM().State() == PlanStatusReady && isApprovalSignal(fwd.Input) {
+			a.logInfo("handlePlanFeedback: compose failed but approval detected, dispatching",
+				"plan_id", plan.ID)
+			architectDebugLog().Info("handoff: FALLBACK_DISPATCH_ON_ERROR",
+				"plan_id", plan.ID)
+			return a.handleExecute(ctx, fwd)
+		}
 		return &ConversationResult{
 			Response:  "I couldn't process your feedback right now. Could you rephrase?",
 			Intent:    IntentConverse,
 			Directive: a.feedbackReadyDirective(plan),
 		}, nil
 	}
+
+	planStateAfter := plan.SM().State().String()
+	approvalDetected := isApprovalSignal(fwd.Input)
+	architectDebugLog().Info("handoff: COMPOSE_SUCCESS",
+		"plan_id", plan.ID,
+		"plan_state_after", planStateAfter,
+		"is_approval_signal", approvalDetected,
+		"response_len", len(response),
+		"response_preview", truncateString(response, 300))
+
+	// Programmatic fallback: the LLM composed a response but didn't invoke
+	// route_plan_acceptance (plan is still Ready). If user input signals
+	// approval, bypass the LLM and dispatch directly. This handles providers
+	// whose models don't reliably call function tools.
+	if plan.SM().State() == PlanStatusReady && isApprovalSignal(fwd.Input) {
+		a.logInfo("handlePlanFeedback: plan still Ready after compose, approval detected — dispatching",
+			"plan_id", plan.ID,
+			"response_preview", truncateString(response, 120))
+		architectDebugLog().Info("handoff: FALLBACK_DISPATCH_POST_COMPOSE",
+			"plan_id", plan.ID,
+			"llm_response_discarded", truncateString(response, 200))
+		return a.handleExecute(ctx, fwd)
+	}
+
+	architectDebugLog().Info("handoff: RETURNING_CONVERSATION_RESULT",
+		"plan_id", plan.ID,
+		"plan_state", planStateAfter,
+		"has_directive", a.feedbackReadyDirective(plan) != nil)
 
 	return &ConversationResult{
 		Response:  response,
@@ -1179,6 +1333,57 @@ func (a *Architect) handlePlanFeedback(ctx context.Context, fwd *guide.Forwarded
 // feedbackReadyDirective returns a ResponseDirective that re-arms the Guide's
 // plan-approval phase gate after the architect addresses user feedback. Returns
 // nil if the plan is not in Ready status (e.g. already executing or expired).
+// isApprovalSignal checks whether the user's input is an unambiguous plan
+// approval. Returns false for inputs that contain modification language
+// alongside approval words (e.g. "yes but change X"). Used as a programmatic
+// fallback when the LLM doesn't invoke route_plan_acceptance.
+func isApprovalSignal(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	// Reject inputs that contain modification qualifiers — these are
+	// feedback, not pure approval.
+	for _, qualifier := range approvalDisqualifiers {
+		if strings.Contains(lower, qualifier) {
+			architectDebugLog().Debug("handoff: APPROVAL_SIGNAL_DISQUALIFIED",
+				"input_preview", truncateString(lower, 200),
+				"disqualifier", qualifier)
+			return false
+		}
+	}
+	for _, phrase := range approvalPhrases {
+		if strings.Contains(lower, phrase) {
+			architectDebugLog().Debug("handoff: APPROVAL_SIGNAL_MATCHED",
+				"input_preview", truncateString(lower, 200),
+				"matched_phrase", phrase)
+			return true
+		}
+	}
+	architectDebugLog().Debug("handoff: APPROVAL_SIGNAL_NO_MATCH",
+		"input_preview", truncateString(lower, 200))
+	return false
+}
+
+// approvalPhrases are unambiguous approval signals. Ordered by specificity
+// (multi-word first) so the contains check is greedy.
+var approvalPhrases = []string{
+	"looks good", "go ahead", "ship it", "do it", "kick it off",
+	"run it", "start it", "go for it", "let's go", "fire it off",
+	"lgtm", "approved", "proceed", "execute", "confirm",
+	"yes", "yep", "yeah", "yup",
+}
+
+// approvalDisqualifiers are words that turn an approval into feedback
+// (e.g. "yes but change X", "go ahead, except swap step 2").
+var approvalDisqualifiers = []string{
+	"but ", "except", "change", "modify", "update", "instead",
+	"swap", "move", "add ", "remove", "however", "although",
+	"before that", "first ", "wait", "hold on", "actually",
+	"what about", "what if", "how about", "can you", "could you",
+	"question", "why ", "?",
+}
+
 func (a *Architect) feedbackReadyDirective(plan *DesignPlan) *guide.ResponseDirective {
 	if plan == nil {
 		return nil
@@ -1193,10 +1398,17 @@ func (a *Architect) feedbackReadyDirective(plan *DesignPlan) *guide.ResponseDire
 func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	a.logInfo("handleExecute: entry",
 		"input", truncateString(fwd.Input, 80))
+	architectDebugLog().Info("handoff: EXECUTE_ENTRY",
+		"user_input", truncateString(fwd.Input, 200),
+		"session_id", sessionIDFromForwarded(fwd),
+		"has_metadata", fwd.Metadata != nil)
 
 	plan := a.latestReadyPlan(sessionIDFromForwarded(fwd))
 	if plan == nil {
 		a.logInfo("handleExecute: no ready plan found")
+		architectDebugLog().Warn("handoff: EXECUTE_NO_READY_PLAN",
+			"session_id", sessionIDFromForwarded(fwd),
+			"active_plans", a.activePlanCount())
 		return &ConversationResult{
 			Response: "There's no ready plan to execute. Describe what you'd like to build and I'll create one.",
 			Intent:   IntentConverse,
@@ -1211,6 +1423,10 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 				"plan_id", plan.ID,
 				"plan_epoch", plan.SM().Epoch(),
 				"request_epoch", requestEpoch)
+			architectDebugLog().Warn("handoff: EXECUTE_STALE_EPOCH",
+				"plan_id", plan.ID,
+				"plan_epoch", plan.SM().Epoch(),
+				"request_epoch", requestEpoch)
 			return &ConversationResult{
 				Response:  "The plan has been updated since you last reviewed it. Please review the updated plan and approve again.",
 				Intent:    IntentConverse,
@@ -1222,12 +1438,20 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 	a.logInfo("handleExecute: dispatching plan",
 		"plan_id", plan.ID,
 		"tasks", len(plan.Tasks))
+	architectDebugLog().Info("handoff: EXECUTE_DISPATCHING",
+		"plan_id", plan.ID,
+		"task_count", len(plan.Tasks),
+		"plan_state", plan.SM().State().String())
 
 	req := &ArchitectRequest{
 		Query:     fwd.Input,
 		SessionID: sessionIDFromForwarded(fwd),
 	}
-	result, _ := a.dispatchPlanExecution(ctx, req, plan)
+	result, err := a.dispatchPlanExecution(ctx, req, plan)
+	architectDebugLog().Info("handoff: EXECUTE_DISPATCH_RESULT",
+		"plan_id", plan.ID,
+		"has_result", result != nil,
+		"err", err)
 	return result, nil
 }
 
@@ -1659,8 +1883,6 @@ func determineTaskAgents(component ComponentSpec) taskAgentAssignment {
 	hasDeps := len(component.Dependencies) > 0
 
 	switch ctype {
-	case "test", "testing":
-		return taskAgentAssignment{Primary: "tester"}
 	case "design", "ui":
 		return taskAgentAssignment{Primary: "designer"}
 	case "fullstack", "full-stack", "full_stack":
@@ -1995,6 +2217,14 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 				"plan_id", plan.ID,
 				"session_id", req.SessionID,
 				"phase", string(result.Directive.Phase))
+		} else if stalled := a.latestStalledPlan(req.SessionID); stalled != nil {
+			// The tool loop started a plan (via start_planning) but
+			// couldn't complete it — e.g. API overloaded mid-protocol.
+			// Recover via deterministic protocol so the plan reaches Ready.
+			a.recoverStalledPlan(ctx, stalled)
+			if plan := a.latestReadyPlan(req.SessionID); plan != nil {
+				result.Directive = a.feedbackReadyDirective(plan)
+			}
 		} else {
 			architectDebugLog().Info("executeConversation: NO_READY_PLAN",
 				"session_id", req.SessionID)
@@ -2019,6 +2249,18 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 			Intent:    req.Intent,
 			Directive: a.feedbackReadyDirective(plan),
 		}, nil
+	}
+	// Check for stalled plans before falling back to conversationFallback.
+	if stalled := a.latestStalledPlan(req.SessionID); stalled != nil {
+		a.recoverStalledPlan(ctx, stalled)
+		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
+			userResp := fallbackReadyUserResponse(nil, plan)
+			return &ConversationResult{
+				Response:  userResp,
+				Intent:    req.Intent,
+				Directive: a.feedbackReadyDirective(plan),
+			}, nil
+		}
 	}
 	a.logWarn("executeConversation: compose failed, using domain fallback",
 		"intent", string(req.Intent), "error", composeErr)
@@ -2072,9 +2314,13 @@ func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequ
 	}
 	plan, err := a.executePlanningProtocol(ctx, req)
 	if err != nil {
-		// Surface both the protocol error and the original compose error
-		// so the user can diagnose why the LLM path failed.
-		return nil, fmt.Errorf("planning protocol: %w (conversation unavailable: %v)", err, composeErr)
+		friendly := providers.FriendlyErrorMessage(err)
+		a.logWarn("conversationFallback: protocol failed, returning friendly message",
+			"raw_error", err, "friendly", friendly)
+		return &ConversationResult{
+			Response: friendly,
+			Intent:   req.Intent,
+		}, nil
 	}
 	return plan, nil
 }

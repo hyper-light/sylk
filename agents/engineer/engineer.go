@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -56,6 +59,15 @@ type Engineer struct {
 	skills      *skills.Registry
 	skillLoader *skills.Loader
 
+	// Activity publisher for UI agent-panel updates.
+	activityPub events.ActivityPublisher
+
+	// pipelineID tracks the DAG pipeline this agent belongs to.
+	// Set from ForwardedRequest.Metadata["dag_id"] on dispatch;
+	// included in activity events so the TUI groups the agent under
+	// the correct pipeline section.
+	pipelineID string
+
 	// Event bus integration
 	bus         guide.EventBus
 	channels    *guide.AgentChannels
@@ -93,6 +105,13 @@ type Engineer struct {
 	runCancel      context.CancelFunc
 	requestMu      sync.Mutex
 	requestCancels map[string]context.CancelFunc
+
+	// Steering ledger management.
+	steering *shared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *shared.RequestSerializer
 }
 
 // Config holds configuration for the Engineer agent
@@ -106,6 +125,10 @@ type Config struct {
 
 	// Engineer-specific configuration
 	EngineerConfig EngineerConfig // Task execution configuration
+
+	// ActivityPub publishes activity events so the UI agent panel tracks
+	// this agent's lifecycle. Nil-safe (events silently dropped).
+	ActivityPub events.ActivityPublisher
 
 	// RequestGuard is called at handler entry to prevent activation demotion
 	// during in-flight processing. Returns a release function. Nil-safe.
@@ -141,6 +164,7 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 		config:          cfg,
 		logger:          cfg.Logger,
 		provider:        provider,
+		activityPub:     cfg.ActivityPub,
 		knownAgents:     make(map[string]*guide.AgentAnnouncement),
 		failures:        make(map[string]*FailureRecord),
 		pendingConsults: make(map[string]chan *guide.Message),
@@ -154,7 +178,11 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 			StartedAt: time.Now(),
 		},
 		consultations: make([]Consultation, 0),
+		steering:          shared.NewSteeringManager(),
+		requestSerializer: shared.NewRequestSerializer(),
 	}
+
+	eng.steering.InitLazy("engineer", nil)
 
 	eng.initSkills()
 
@@ -361,6 +389,7 @@ func (e *Engineer) Stop() error {
 		return nil
 	}
 
+	e.steering.CloseAll()
 	if e.runCancel != nil {
 		e.runCancel()
 	}
@@ -444,10 +473,26 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		return nil // Ignore non-forward messages
 	}
 
+	if !e.requestSerializer.Acquire(e.runCtx) {
+		return nil // parent context done, agent shutting down
+	}
+	defer e.requestSerializer.Release()
+
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
+
+	e.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	shared.LogIncomingRequest(e.steering.EventLogger(), fwd, e.id)
+
+	// Track pipeline association for activity event grouping.
+	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+		e.pipelineID = dagID
+	}
+
+	shared.EmitDispatchACK(e.bus, fwd.Metadata, e.id, "engineer", fwd.CorrelationID)
+	e.publishActivity(events.EventTypeAgentAction, "Processing implementation task")
 
 	if e.config.RequestGuard != nil {
 		release := e.config.RequestGuard()
@@ -457,16 +502,29 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(e.runCtx)
 	e.registerRequestCancel(fwd.CorrelationID, cancel)
+	e.steering.RegisterCancel(fwd.CorrelationID, cancel)
 	defer e.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
+
+	// Create steering ledger for this request.
+	ledger := e.steering.Create(fwd.CorrelationID, e.id, fwd.SessionID, nil, nil)
+	defer e.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
 
 	startTime := time.Now()
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(e.bus, e.channels, "engineer", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx = shared.WithSteeringLedger(ctx, ledger)
+	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
+		EventLogger: e.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     e.id,
+		SessionID:   fwd.SessionID,
+	})
 
 	result, err := e.processForwardedRequest(ctx, fwd)
+	shared.LogResponse(e.steering.EventLogger(), fwd.CorrelationID, e.id, fwd.SessionID, time.Since(startTime), err)
 
 	// Don't respond if fire-and-forget
 	if fwd.FireAndForget {
@@ -483,8 +541,13 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	if err != nil {
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
+		}
 		resp.Error = err.Error()
-		// Publish to error channel
+		e.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			e.generateMessageID(),
 			fwd.CorrelationID,
@@ -495,8 +558,8 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	e.publishActivity(events.EventTypeAgentAction, "Implementation task completed")
 
-	// Publish response to own response channel
 	respMsg := guide.NewResponseMessage(e.generateMessageID(), resp)
 	return e.bus.Publish(e.channels.Responses, respMsg)
 }
@@ -534,7 +597,12 @@ func (e *Engineer) handleActionMessage(msg *guide.Message) error {
 	if !ok || action == nil {
 		return nil
 	}
+	if e.steering.HandleAction(action) {
+		return nil
+	}
 	if action.Action == "cancel" {
+		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
+			e.id, "", action.CorrelationID, "warn", &agentlog.ErrorPayload{Error: "request cancelled via action"})
 		e.cancelRequest(action.CorrelationID)
 	}
 	return nil
@@ -598,9 +666,17 @@ func (e *Engineer) handleRegistryAnnouncement(msg *guide.Message) error {
 	case guide.MessageTypeAgentRegistered:
 		e.knownAgents[ann.AgentID] = ann
 		e.logger.Debug("agent registered", "agent_id", ann.AgentID)
+		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventRegistryEvent,
+			e.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "registered",
+			})
 	case guide.MessageTypeAgentUnregistered:
 		delete(e.knownAgents, ann.AgentID)
 		e.logger.Debug("agent unregistered", "agent_id", ann.AgentID)
+		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventRegistryEvent,
+			e.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "unregistered",
+			})
 	}
 
 	return nil
@@ -631,15 +707,21 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 
 	// Step 1: Validate scope
 	if err := e.validateTaskScope(ctx, req); err != nil {
+		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
+			e.id, "", "", "error", &agentlog.ErrorPayload{Error: err.Error()})
 		return e.failureResponse(req, err, startTime)
 	}
 
 	// Step 2: Synchronous Librarian consultation
 	var consultContext string
 	if e.bus != nil && e.running {
+		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationSent,
+			e.id, "", "", "info", &agentlog.ConsultPayload{Target: "librarian"})
 		evidence, err := e.requestConsultation(ctx, "librarian",
 			fmt.Sprintf("Search for relevant patterns, similar implementations, and dependencies for: %s", req.Prompt),
 			"", e.config.SessionID)
+		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationRecv,
+			e.id, "", "", "info", &agentlog.ConsultPayload{Target: "librarian", Success: err == nil})
 		if err != nil {
 			e.logger.Warn("librarian consultation failed", "error", err)
 		} else if evidence.Success {
@@ -651,10 +733,14 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	if failure := e.checkPreviousFailures(req.TaskID); failure != nil {
 		e.logger.Info("found previous failure", "task_id", req.TaskID, "attempts", failure.AttemptCount)
 		if failure.AttemptCount >= MaxAttemptsBeforeConsultation && e.bus != nil && e.running {
+			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationSent,
+				e.id, "", "", "info", &agentlog.ConsultPayload{Target: "academic"})
 			evidence, err := e.requestConsultation(ctx, "academic",
 				fmt.Sprintf("Task has failed %d times. Need alternative approach for: %s. Last error: %s",
 					failure.AttemptCount, req.Prompt, failure.LastError),
 				"", e.config.SessionID)
+			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationRecv,
+				e.id, "", "", "info", &agentlog.ConsultPayload{Target: "academic", Success: err == nil})
 			if err != nil {
 				e.logger.Warn("academic consultation failed", "error", err)
 			} else if evidence.Success {
@@ -680,13 +766,17 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	}
 
 	// Step 6: Execute tool loop
-	result, err := e.executeToolLoop(ctx, llmReq)
+	result, err := e.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
 	if err != nil {
+		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
+			e.id, "", "", "error", &agentlog.ErrorPayload{Error: err.Error()})
 		e.recordFailure(req.TaskID, err.Error(), req.Prompt)
 		return e.failureResponse(req, err, startTime)
 	}
 
 	// Step 7: Self-audit (bounded iterations)
+	shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventDiscoveryStarted,
+		e.id, "", "", "info", &agentlog.DiscoveryPayload{Phase: "started", Type: "self-audit"})
 	for iteration := range e.auditConfig.MaxAuditIterations {
 		verdict, auditErr := e.selfAudit(ctx, result, req.Prompt)
 		if auditErr != nil {
@@ -702,12 +792,20 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 			providers.Message{Role: providers.RoleAssistant, Content: result},
 			providers.Message{Role: providers.RoleUser, Content: e.buildAuditFeedback(verdict)},
 		)
-		result, err = e.executeToolLoop(ctx, llmReq)
+		result, err = e.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
 		if err != nil {
+			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
+				e.id, "", "", "error", &agentlog.ErrorPayload{Error: fmt.Sprintf("audit re-implement: %v", err)})
 			e.recordFailure(req.TaskID, err.Error(), req.Prompt)
 			return e.failureResponse(req, err, startTime)
 		}
 	}
+
+	shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventDiscoveryCompleted,
+		e.id, "", "", "info", &agentlog.DiscoveryPayload{Phase: "completed", Type: "self-audit"})
+
+	shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventGenerationCompleted,
+		e.id, "", "", "info", &agentlog.GenerationPayload{Phase: "completed"})
 
 	return &EngineerResponse{
 		ID:        uuid.New().String(),
@@ -788,6 +886,24 @@ func (e *Engineer) setStatus(status AgentStatus) {
 	defer e.stateMu.Unlock()
 	e.state.Status = status
 	e.state.LastActiveAt = time.Now()
+	shared.LogStatusUpdate(e.steering.EventLogger(), e.id, "", string(status))
+}
+
+// publishActivity emits a user-visible activity event so the UI agent panel
+// tracks this engineer's lifecycle.
+func (e *Engineer) publishActivity(eventType events.EventType, content string) {
+	if e.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, e.config.SessionID, content)
+	evt.AgentID = e.id
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "engineer"
+	evt.Data["agent_name"] = "Engineer"
+	if e.pipelineID != "" {
+		evt.Data["pipeline_id"] = e.pipelineID
+	}
+	e.activityPub.PublishActivity(evt)
 }
 
 func (e *Engineer) recordFailure(taskID, errorMsg, approach string) {

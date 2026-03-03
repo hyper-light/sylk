@@ -190,6 +190,45 @@ func (e *testTimeoutError) Temporary() bool { return false }
 
 var _ net.Error = (*testTimeoutError)(nil)
 
+func TestServerGuidedDelay_UsesServerHint(t *testing.T) {
+	// When the server says "wait 30s", the delay should be at least 30s
+	// even if exponential backoff would compute less.
+	err := &ProviderError{Retryable: true, RetryAfter: 30 * time.Second}
+	d := serverGuidedDelay(err, 0, time.Second, 5*time.Second)
+	if d < 30*time.Second {
+		t.Fatalf("expected >= 30s from server hint, got %v", d)
+	}
+}
+
+func TestServerGuidedDelay_FallsBackToExponential(t *testing.T) {
+	// When no server hint, use normal exponential backoff.
+	err := &ProviderError{Retryable: true, RetryAfter: 0}
+	d := serverGuidedDelay(err, 2, time.Second, 30*time.Second)
+	// Attempt 2: base * 2^2 = 4s (±jitter)
+	if d < 2*time.Second || d > 6*time.Second {
+		t.Fatalf("expected ~4s from exponential backoff, got %v", d)
+	}
+}
+
+func TestServerGuidedDelay_ExponentialExceedsHint(t *testing.T) {
+	// When exponential backoff already exceeds the server hint,
+	// use the exponential value.
+	err := &ProviderError{Retryable: true, RetryAfter: 100 * time.Millisecond}
+	d := serverGuidedDelay(err, 3, time.Second, 30*time.Second)
+	// Attempt 3: base * 2^3 = 8s (±jitter) — exceeds 100ms hint
+	if d < 5*time.Second {
+		t.Fatalf("expected exponential to dominate, got %v", d)
+	}
+}
+
+func TestServerGuidedDelay_NilError(t *testing.T) {
+	d := serverGuidedDelay(nil, 0, time.Second, 30*time.Second)
+	// No server hint → pure exponential: base * 2^0 = 1s (±jitter)
+	if d < 500*time.Millisecond || d > 2*time.Second {
+		t.Fatalf("expected ~1s from exponential, got %v", d)
+	}
+}
+
 func TestRetryStream_SucceedsFirstAttempt(t *testing.T) {
 	cfg := BaseConfig{MaxRetries: 3, RetryBaseDelay: time.Millisecond, RetryMaxDelay: 10 * time.Millisecond}
 	calls := 0

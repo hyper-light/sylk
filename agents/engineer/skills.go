@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -305,15 +304,11 @@ func readFileSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("path is required")
 			}
 
-			fullPath := resolvePath(e.config.EngineerConfig.WorkingDirectory, params.Path)
-
-			var content []byte
-			var err error
-			if e.fileAccess != nil {
-				content, err = e.fileAccess.ReadFile(ctx, params.Path)
-			} else {
-				content, err = os.ReadFile(fullPath)
+			if e.fileAccess == nil {
+				return nil, fmt.Errorf("file access not configured")
 			}
+
+			content, err := e.fileAccess.ReadFile(ctx, params.Path)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
@@ -393,35 +388,19 @@ func writeFileSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("file writes are disabled")
 			}
 
-			fullPath := resolvePath(e.config.EngineerConfig.WorkingDirectory, params.Path)
-
-			// Ensure directory exists
-			dir := filepath.Dir(fullPath)
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return nil, fmt.Errorf("failed to create directory: %w", err)
+			if e.fileAccess == nil {
+				return nil, fmt.Errorf("file access not configured")
 			}
 
 			// Check if file exists for action type
 			action := FileActionCreate
-			if e.fileAccess != nil {
-				exists, _ := e.fileAccess.Exists(ctx, params.Path)
-				if exists {
-					action = FileActionModify
-				}
-			} else {
-				if _, statErr := os.Stat(fullPath); statErr == nil {
-					action = FileActionModify
-				}
+			exists, _ := e.fileAccess.Exists(ctx, params.Path)
+			if exists {
+				action = FileActionModify
 			}
 
-			var writeErr error
-			if e.fileAccess != nil {
-				writeErr = e.fileAccess.WriteFile(ctx, params.Path, []byte(params.Content))
-			} else {
-				writeErr = os.WriteFile(fullPath, []byte(params.Content), 0644)
-			}
-			if writeErr != nil {
-				return nil, fmt.Errorf("failed to write file: %w", writeErr)
+			if err := e.fileAccess.WriteFile(ctx, params.Path, []byte(params.Content)); err != nil {
+				return nil, fmt.Errorf("failed to write file: %w", err)
 			}
 
 			lines := strings.Split(params.Content, "\n")
@@ -477,15 +456,11 @@ func editFileSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("file writes are disabled")
 			}
 
-			fullPath := resolvePath(e.config.EngineerConfig.WorkingDirectory, params.Path)
-
-			var content []byte
-			var err error
-			if e.fileAccess != nil {
-				content, err = e.fileAccess.ReadFile(ctx, params.Path)
-			} else {
-				content, err = os.ReadFile(fullPath)
+			if e.fileAccess == nil {
+				return nil, fmt.Errorf("file access not configured")
 			}
+
+			content, err := e.fileAccess.ReadFile(ctx, params.Path)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read file: %w", err)
 			}
@@ -507,14 +482,8 @@ func editFileSkill(e *Engineer) *skills.Skill {
 				editsApplied++
 			}
 
-			var writeErr error
-			if e.fileAccess != nil {
-				writeErr = e.fileAccess.WriteFile(ctx, params.Path, []byte(modifiedContent))
-			} else {
-				writeErr = os.WriteFile(fullPath, []byte(modifiedContent), 0644)
-			}
-			if writeErr != nil {
-				return nil, fmt.Errorf("failed to write file: %w", writeErr)
+			if err := e.fileAccess.WriteFile(ctx, params.Path, []byte(modifiedContent)); err != nil {
+				return nil, fmt.Errorf("failed to write file: %w", err)
 			}
 
 			// Calculate diff stats
@@ -668,18 +637,16 @@ func globSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("pattern is required")
 			}
 
+			if e.fileAccess == nil {
+				return nil, fmt.Errorf("file access not configured")
+			}
+
 			workDir := e.config.EngineerConfig.WorkingDirectory
 			if workDir == "" {
 				workDir = "."
 			}
 
-			var matches []string
-			var err error
-			if e.fileAccess != nil {
-				matches, err = e.fileAccess.Glob(ctx, workDir, params.Pattern, params.Exclude)
-			} else {
-				matches, err = findFilesGlob(workDir, params.Pattern, params.Exclude)
-			}
+			matches, err := e.fileAccess.Glob(ctx, workDir, params.Pattern, params.Exclude)
 			if err != nil {
 				return nil, fmt.Errorf("glob failed: %w", err)
 			}
@@ -693,72 +660,6 @@ func globSkill(e *Engineer) *skills.Skill {
 		Build()
 }
 
-func findFilesGlob(root, pattern string, exclude []string) ([]string, error) {
-	var matches []string
-
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-
-		if info.IsDir() {
-			return nil
-		}
-
-		relPath, err := filepath.Rel(root, path)
-		if err != nil {
-			return nil
-		}
-
-		// Check exclusions
-		for _, excl := range exclude {
-			matched, _ := filepath.Match(excl, relPath)
-			if matched {
-				return nil
-			}
-			// Also check with doublestar-style matching for directories
-			if strings.Contains(excl, "**") {
-				excl = strings.ReplaceAll(excl, "**", "*")
-				matched, _ = filepath.Match(excl, relPath)
-				if matched {
-					return nil
-				}
-			}
-		}
-
-		// Check pattern match
-		matched, err := filepath.Match(pattern, relPath)
-		if err != nil {
-			// Try simpler matching for complex patterns
-			if strings.Contains(pattern, "**") {
-				// Handle ** patterns
-				simplePat := strings.ReplaceAll(pattern, "**", "*")
-				matched, _ = filepath.Match(simplePat, relPath)
-			}
-		}
-
-		if matched {
-			matches = append(matches, relPath)
-		} else if strings.Contains(pattern, "**") {
-			// For **/*.go patterns, check if file extension matches
-			parts := strings.Split(pattern, "/")
-			if len(parts) > 0 {
-				lastPart := parts[len(parts)-1]
-				if strings.HasPrefix(lastPart, "*.") {
-					ext := strings.TrimPrefix(lastPart, "*")
-					if strings.HasSuffix(relPath, ext) {
-						matches = append(matches, relPath)
-					}
-				}
-			}
-		}
-
-		return nil
-	})
-
-	return matches, err
-}
-
 // =============================================================================
 // grep - Search file contents
 // =============================================================================
@@ -769,13 +670,6 @@ type grepParams struct {
 	Include      string `json:"include,omitempty"`
 	ContextLines int    `json:"context_lines,omitempty"`
 	MaxMatches   int    `json:"max_matches,omitempty"`
-}
-
-type grepMatch struct {
-	File    string `json:"file"`
-	Line    int    `json:"line"`
-	Content string `json:"content"`
-	Context string `json:"context,omitempty"`
 }
 
 func grepSkill(e *Engineer) *skills.Skill {
@@ -799,9 +693,8 @@ func grepSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("pattern is required")
 			}
 
-			regex, err := regexp.Compile(params.Pattern)
-			if err != nil {
-				return nil, fmt.Errorf("invalid regex pattern: %w", err)
+			if e.fileAccess == nil {
+				return nil, fmt.Errorf("file access not configured")
 			}
 
 			searchPath := params.Path
@@ -817,114 +710,21 @@ func grepSkill(e *Engineer) *skills.Skill {
 				maxMatches = 100
 			}
 
-			var matches any
-			var matchCount int
-			if e.fileAccess != nil {
-				faMatches, faErr := e.fileAccess.Grep(ctx, searchPath, params.Pattern, params.Include, params.ContextLines, maxMatches)
-				if faErr != nil {
-					return nil, fmt.Errorf("search failed: %w", faErr)
-				}
-				matches = faMatches
-				matchCount = len(faMatches)
-			} else {
-				localMatches, localErr := searchFiles(searchPath, regex, params.Include, params.ContextLines, maxMatches)
-				if localErr != nil {
-					return nil, fmt.Errorf("search failed: %w", localErr)
-				}
-				matches = localMatches
-				matchCount = len(localMatches)
+			faMatches, err := e.fileAccess.Grep(ctx, searchPath, params.Pattern, params.Include, params.ContextLines, maxMatches)
+			if err != nil {
+				return nil, fmt.Errorf("search failed: %w", err)
 			}
 
 			return map[string]any{
 				"pattern":   params.Pattern,
-				"matches":   matches,
-				"count":     matchCount,
-				"truncated": matchCount >= maxMatches,
+				"matches":   faMatches,
+				"count":     len(faMatches),
+				"truncated": len(faMatches) >= maxMatches,
 			}, nil
 		}).
 		Build()
 }
 
-func searchFiles(root string, pattern *regexp.Regexp, include string, contextLines, maxMatches int) ([]grepMatch, error) {
-	var matches []grepMatch
-
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-
-		if info.IsDir() {
-			// Skip common non-code directories
-			if info.Name() == "vendor" || info.Name() == "node_modules" || info.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Check include pattern
-		if include != "" {
-			matched, _ := filepath.Match(include, info.Name())
-			if !matched {
-				return nil
-			}
-		}
-
-		// Skip binary files (simple heuristic)
-		if isBinaryFile(info.Name()) {
-			return nil
-		}
-
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-
-		relPath, _ := filepath.Rel(root, path)
-		lines := strings.Split(string(content), "\n")
-
-		for i, line := range lines {
-			if len(matches) >= maxMatches {
-				return filepath.SkipAll
-			}
-
-			if pattern.MatchString(line) {
-				match := grepMatch{
-					File:    relPath,
-					Line:    i + 1,
-					Content: strings.TrimSpace(line),
-				}
-
-				if contextLines > 0 {
-					start := i - contextLines
-					if start < 0 {
-						start = 0
-					}
-					end := i + contextLines + 1
-					if end > len(lines) {
-						end = len(lines)
-					}
-					match.Context = strings.Join(lines[start:end], "\n")
-				}
-
-				matches = append(matches, match)
-			}
-		}
-
-		return nil
-	})
-
-	return matches, err
-}
-
-func isBinaryFile(name string) bool {
-	binaryExts := []string{".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".tar", ".gz"}
-	for _, ext := range binaryExts {
-		if strings.HasSuffix(strings.ToLower(name), ext) {
-			return true
-		}
-	}
-	return false
-}
 
 // =============================================================================
 // lsp - Language Server Protocol code intelligence

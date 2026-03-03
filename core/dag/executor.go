@@ -3,6 +3,8 @@ package dag
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -118,16 +120,20 @@ func (e *Executor) configureSemaphore() {
 
 func (e *Executor) emitCompletionEvent(dag *DAG, result *DAGResult) {
 	eventType := resultEventType(result.State)
+	data := map[string]any{
+		"duration":  result.Duration,
+		"succeeded": result.NodesSucceeded,
+		"failed":    result.NodesFailed,
+		"skipped":   result.NodesSkipped,
+	}
+	if result.Error != nil {
+		data["error"] = result.Error.Error()
+	}
 	e.emitEvent(&Event{
 		Type:      eventType,
 		DAGID:     dag.ID(),
 		Timestamp: time.Now(),
-		Data: map[string]any{
-			"duration":  result.Duration,
-			"succeeded": result.NodesSucceeded,
-			"failed":    result.NodesFailed,
-			"skipped":   result.NodesSkipped,
-		},
+		Data:      data,
 	})
 }
 
@@ -541,7 +547,7 @@ func (e *Executor) failedNodeResult(node *Node, nodeID string, err error) *NodeR
 func (e *Executor) dispatchNode(node *Node, parentResults map[string]*NodeResult, timeout time.Duration) (*NodeResult, error) {
 	nodeID := node.ID()
 	e.markNodeQueued(node, nodeID)
-	e.markNodeStarted(node, nodeID)
+	e.markNodeDispatched(node, nodeID)
 
 	ctx, cancel := e.nodeContext(timeout)
 	defer cancel()
@@ -562,6 +568,52 @@ func (e *Executor) markNodeQueued(node *Node, nodeID string) {
 	node.SetState(NodeStateQueued)
 	e.emitEvent(&Event{
 		Type:      EventNodeQueued,
+		DAGID:     e.dag.ID(),
+		NodeID:    nodeID,
+		Timestamp: time.Now(),
+	})
+}
+
+func (e *Executor) markNodeDispatched(node *Node, nodeID string) {
+	node.SetState(NodeStateDispatched)
+	e.emitEvent(&Event{
+		Type:      EventNodeDispatched,
+		DAGID:     e.dag.ID(),
+		NodeID:    nodeID,
+		Timestamp: time.Now(),
+	})
+}
+
+// MarkNodeAcked transitions a node to the Acked state. Called externally
+// by the dispatcher when an agent ACK is received.
+func (e *Executor) MarkNodeAcked(nodeID, agentID string) {
+	node, ok := e.dag.GetNode(nodeID)
+	if !ok {
+		return
+	}
+	node.SetState(NodeStateAcked)
+	e.emitEvent(&Event{
+		Type:      EventNodeAcked,
+		DAGID:     e.dag.ID(),
+		NodeID:    nodeID,
+		Timestamp: time.Now(),
+		Data: map[string]any{
+			"agent_id": agentID,
+		},
+	})
+}
+
+// MarkNodeRunning transitions a node to the Running state. Called externally
+// by the dispatcher after ACK processing completes.
+func (e *Executor) MarkNodeRunning(nodeID string) {
+	node, ok := e.dag.GetNode(nodeID)
+	if !ok {
+		return
+	}
+	node.SetState(NodeStateRunning)
+	node.SetStartTime(time.Now())
+	e.emitEvent(&Event{
+		Type:      EventNodeStarted,
 		DAGID:     e.dag.ID(),
 		NodeID:    nodeID,
 		Timestamp: time.Now(),
@@ -732,9 +784,28 @@ func (e *Executor) applyResultState(result *DAGResult) {
 	}
 	if result.NodesFailed > 0 {
 		result.State = DAGStateFailed
+		result.Error = buildNodeFailureError(result.NodeResults)
 		return
 	}
 	result.State = DAGStateSucceeded
+}
+
+func buildNodeFailureError(nodeResults map[string]*NodeResult) error {
+	msgs := make([]string, 0, len(nodeResults))
+	for _, nr := range nodeResults {
+		if nr.State == NodeStateFailed {
+			msgs = append(msgs, nodeFailureMsg(nr))
+		}
+	}
+	slices.Sort(msgs)
+	return errors.New(strings.Join(msgs, "; "))
+}
+
+func nodeFailureMsg(nr *NodeResult) string {
+	if nr.Error != nil {
+		return nr.NodeID + ": " + nr.Error.Error()
+	}
+	return nr.NodeID + ": unknown error"
 }
 
 func (e *Executor) Cancel() error {

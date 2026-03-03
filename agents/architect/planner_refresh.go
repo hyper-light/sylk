@@ -52,10 +52,9 @@ func (a *Architect) SwapModel(_ context.Context, modelID string, provider provid
 	if !ok {
 		return fmt.Errorf("architect swap model: provider does not satisfy plannerStreamProvider")
 	}
-	planner := newPlannerFromProvider(sp, a.config, a.logger)
 	a.plannerMu.Lock()
 	a.config.Model = modelID
-	a.planner = planner
+	a.planner = newPlannerFromProvider(sp, a.config, a.logger)
 	a.plannerMu.Unlock()
 	return nil
 }

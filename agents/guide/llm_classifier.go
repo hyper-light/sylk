@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -18,6 +19,7 @@ type LLMClassifier struct {
 	model       string
 	config      RouterConfig
 	corrections *correctionMemory
+	eventLogger *agentlog.SessionEventLogger
 }
 
 // NewLLMClassifier creates a provider-agnostic LLM classifier.
@@ -80,11 +82,13 @@ func (c *LLMClassifier) Classify(ctx context.Context, input string) (*Classifica
 		"skip_provider_skills", req.SkipProviderSkills,
 		"reasoning_effort", req.ReasoningEffort)
 	resp, err := c.provider.Complete(ctx, req)
+	classifyDur := time.Since(completeStart)
 	guideFileLog().Info("DEBUG: classifier_complete_done",
 		"model", c.model,
-		"elapsed_ms", time.Since(completeStart).Milliseconds(),
+		"elapsed_ms", classifyDur.Milliseconds(),
 		"error", err,
 		"response_len", classifierResponseLen(resp))
+	logClassifierLLMCall(c.eventLogger, c.model, resp, classifyDur, err)
 	if err != nil {
 		geminiTrace("classifier", "classify_complete_failed", map[string]any{
 			"error":         err.Error(),
@@ -171,6 +175,54 @@ func classifierResponseLen(resp *providers.Response) int {
 		return 0
 	}
 	return len(resp.Content)
+}
+
+// logClassifierLLMCall records an LLM call from the Guide's classifier.
+func logClassifierLLMCall(el *agentlog.SessionEventLogger, model string, resp *providers.Response, dur time.Duration, err error) {
+	if el == nil {
+		return
+	}
+	inTok, outTok := 0, 0
+	if resp != nil {
+		inTok, outTok = resp.Usage.InputTokens, resp.Usage.OutputTokens
+	}
+
+	eventType := agentlog.EventLLMResponseReceived
+	if err != nil {
+		eventType = agentlog.EventLLMError
+	}
+
+	el.LogWALJSON(eventType, &agentlog.LLMPayload{
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+		DurationNs:   dur.Nanoseconds(),
+	})
+
+	data := map[string]any{
+		"model":         model,
+		"input_tokens":  inTok,
+		"output_tokens": outTok,
+	}
+	if resp != nil && resp.Content != "" {
+		data["response_preview"] = truncateLogStr(resp.Content, 512)
+	}
+
+	entry := agentlog.JSONLEntry{
+		Timestamp:  time.Now(),
+		Level:      "info",
+		Agent:      "guide",
+		Event:      "llm_call",
+		EventCode:  eventType,
+		DurationNs: dur.Nanoseconds(),
+		Data:       data,
+	}
+	if err != nil {
+		entry.Level = "error"
+		entry.Event = "llm_error"
+		entry.Error = err.Error()
+	}
+	el.LogEvent(entry)
 }
 
 // Ensure LLMClassifier satisfies ClassifierService at compile time.

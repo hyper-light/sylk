@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -37,6 +40,8 @@ type Designer struct {
 	provider        designerProvider
 	providerWrapper gateway.ProviderWrapper
 	handoffBridge   *handoff.HandoffBridge
+	activityPub     events.ActivityPublisher
+	pipelineID      string // DAG pipeline ID for TUI grouping.
 	usageAccum      *designerUsageAccumulator
 
 	state    *DesignerState
@@ -64,6 +69,13 @@ type Designer struct {
 	runCancel      context.CancelFunc
 	requestMu      sync.Mutex
 	requestCancels map[string]context.CancelFunc
+
+	// Steering ledger management.
+	steering *shared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *shared.RequestSerializer
 }
 
 type Config struct {
@@ -74,6 +86,10 @@ type Config struct {
 	MaxOutputTokens int
 
 	DesignerConfig DesignerConfig
+
+	// ActivityPub publishes activity events so the UI agent panel tracks
+	// this agent's lifecycle. Nil-safe (events silently dropped).
+	ActivityPub events.ActivityPublisher
 
 	// RequestGuard is called at handler entry to prevent activation demotion
 	// during in-flight processing. Returns a release function. Nil-safe.
@@ -103,6 +119,7 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 		config:      cfg,
 		logger:      cfg.Logger,
 		provider:    provider,
+		activityPub: cfg.ActivityPub,
 		usageAccum:  &designerUsageAccumulator{},
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		failures:    make(map[string]*FailureRecord),
@@ -114,7 +131,11 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 			StartedAt: time.Now(),
 		},
 		consultations: make([]Consultation, 0),
+		steering:          shared.NewSteeringManager(),
+		requestSerializer: shared.NewRequestSerializer(),
 	}
+
+	d.steering.InitLazy("designer", nil)
 
 	d.initSkills()
 
@@ -297,6 +318,7 @@ func (d *Designer) Stop() error {
 		return nil
 	}
 
+	d.steering.CloseAll()
 	if d.runCancel != nil {
 		d.runCancel()
 	}
@@ -376,10 +398,25 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		return nil
 	}
 
+	if !d.requestSerializer.Acquire(d.runCtx) {
+		return nil // parent context done, agent shutting down
+	}
+	defer d.requestSerializer.Release()
+
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
+
+	d.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	shared.LogIncomingRequest(d.steering.EventLogger(), fwd, d.id)
+
+	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+		d.pipelineID = dagID
+	}
+
+	shared.EmitDispatchACK(d.bus, fwd.Metadata, d.id, "designer", fwd.CorrelationID)
+	d.publishActivity(events.EventTypeAgentAction, "Processing design task")
 
 	if d.config.RequestGuard != nil {
 		release := d.config.RequestGuard()
@@ -389,14 +426,27 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	// Request-scoped cancellable context.
 	reqCtx, cancel := context.WithCancel(d.runCtx)
 	d.registerRequestCancel(fwd.CorrelationID, cancel)
+	d.steering.RegisterCancel(fwd.CorrelationID, cancel)
 	defer d.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
+	// Create steering ledger for this request.
+	ledger := d.steering.Create(fwd.CorrelationID, d.id, fwd.SessionID, nil, nil)
+	defer d.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
+
 	emitter := shared.NewToolCallEmitter(d.bus, d.channels, "designer", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx = shared.WithSteeringLedger(ctx, ledger)
+	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
+		EventLogger: d.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     d.id,
+		SessionID:   fwd.SessionID,
+	})
 	startTime := time.Now()
 
 	result, err := d.handleDesign(ctx, fwd)
+	shared.LogResponse(d.steering.EventLogger(), fwd.CorrelationID, d.id, fwd.SessionID, time.Since(startTime), err)
 
 	if fwd.FireAndForget {
 		return nil
@@ -411,7 +461,13 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	if err != nil {
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
+		}
 		resp.Error = err.Error()
+		d.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
 			d.generateMessageID(),
 			fwd.CorrelationID,
@@ -422,6 +478,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	d.publishActivity(events.EventTypeAgentAction, "Design task completed")
 
 	respMsg := guide.NewResponseMessage(d.generateMessageID(), resp)
 	return d.bus.Publish(d.channels.Responses, respMsg)
@@ -460,7 +517,15 @@ func (d *Designer) handleActionMessage(msg *guide.Message) error {
 	if !ok || action == nil {
 		return nil
 	}
+	if d.steering.HandleAction(action) {
+		return nil
+	}
 	if action.Action == "cancel" {
+		if el := d.steering.EventLogger(); el != nil {
+			shared.LogAgentEvent(el, agentlog.EventError,
+				d.id, "", action.CorrelationID, "warn",
+				&agentlog.ErrorPayload{Error: "request cancelled via action"})
+		}
 		d.cancelRequest(action.CorrelationID)
 	}
 	return nil
@@ -496,8 +561,19 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
 	}
 
-	result, err := d.executeToolLoop(ctx, req)
+	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		shared.LogAgentEvent(lm.EventLogger, agentlog.EventPromptComposed,
+			lm.AgentID, lm.SessionID, lm.CorrID, "info",
+			&agentlog.DesignPayload{Phase: "prompt_composed"})
+	}
+
+	result, err := d.executeToolLoop(ctx, req, shared.SteeringLedgerFromContext(ctx))
 	if err != nil {
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: err.Error()})
+		}
 		d.recordFailure(fwd.CorrelationID, err.Error(), fwd.Input)
 		return nil, err
 	}
@@ -527,9 +603,17 @@ func (d *Designer) handleRegistryAnnouncement(msg *guide.Message) error {
 	case guide.MessageTypeAgentRegistered:
 		d.knownAgents[ann.AgentID] = ann
 		d.logger.Debug("agent registered", "agent_id", ann.AgentID)
+		shared.LogAgentEvent(d.steering.EventLogger(), agentlog.EventRegistryEvent,
+			d.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "registered",
+			})
 	case guide.MessageTypeAgentUnregistered:
 		delete(d.knownAgents, ann.AgentID)
 		d.logger.Debug("agent unregistered", "agent_id", ann.AgentID)
+		shared.LogAgentEvent(d.steering.EventLogger(), agentlog.EventRegistryEvent,
+			d.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "unregistered",
+			})
 	}
 
 	return nil
@@ -566,6 +650,24 @@ func (d *Designer) setStatus(status AgentStatus) {
 	defer d.stateMu.Unlock()
 	d.state.Status = status
 	d.state.LastActiveAt = time.Now()
+	shared.LogStatusUpdate(d.steering.EventLogger(), d.id, "", string(status))
+}
+
+// publishActivity emits a user-visible activity event so the UI agent panel
+// tracks this designer's lifecycle.
+func (d *Designer) publishActivity(eventType events.EventType, content string) {
+	if d.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, d.config.SessionID, content)
+	evt.AgentID = d.id
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "designer"
+	evt.Data["agent_name"] = "Designer"
+	if d.pipelineID != "" {
+		evt.Data["pipeline_id"] = d.pipelineID
+	}
+	d.activityPub.PublishActivity(evt)
 }
 
 func (d *Designer) recordFailure(taskID, errorMsg, approach string) {

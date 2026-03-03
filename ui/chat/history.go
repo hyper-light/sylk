@@ -74,6 +74,9 @@ type ChatEntry struct {
 	ThinkingStatus  string        // Status message shown below spinner (e.g. "Thinking...", "Handing off to architect...").
 	ThinkingColor   string        // Hex color for gradient animation (e.g. "#89b4fa"); empty = use theme default.
 	ThinkingElapsed time.Duration // Elapsed from stream start to first chunk (0 = no thinking recorded).
+
+	// Steering state.
+	SteeringPending bool // True while steering text awaits agent acknowledgment (renders holographic).
 }
 
 // History is a bounded ring buffer of chat entries.

@@ -419,9 +419,9 @@ func TestModel_SeedAgent(t *testing.T) {
 	model.SetSize(80, 40)
 	model.SetFocused(true)
 
-	model.SeedAgent("architect-001", "architect", "Architect", nil)
-	model.SeedAgent("inspector-001", "inspector", "Inspector", nil)
-	model.SeedAgent("tester-001", "tester", "Tester", nil)
+	model.SeedAgent("architect-001", "architect", "Architect", nil, "", "")
+	model.SeedAgent("inspector-001", "inspector", "Inspector", nil, "", "")
+	model.SeedAgent("tester-001", "tester", "Tester", nil, "", "")
 
 	// All three should be present and idle.
 	if len(model.agents) != 3 {
@@ -444,7 +444,7 @@ func TestModel_SeedAgent(t *testing.T) {
 	}
 
 	// Duplicate seed is a no-op.
-	model.SeedAgent("architect-001", "architect", "Architect", nil)
+	model.SeedAgent("architect-001", "architect", "Architect", nil, "", "")
 	if len(model.agents) != 3 {
 		t.Fatalf("duplicate seed changed count: %d, want 3", len(model.agents))
 	}
@@ -465,8 +465,8 @@ func TestModel_SeedAgent_PromotePlaceholder(t *testing.T) {
 	model.SetFocused(true)
 
 	// Seed with placeholder ID == AgentType (activation failed, no real ID).
-	model.SeedAgent("tester", "tester", "Tester", nil)
-	model.SeedAgent("inspector", "inspector", "Inspector", nil)
+	model.SeedAgent("tester", "tester", "Tester", nil, "", "")
+	model.SeedAgent("inspector", "inspector", "Inspector", nil, "", "")
 
 	if len(model.agents) != 2 {
 		t.Fatalf("agents count = %d, want 2", len(model.agents))
@@ -519,6 +519,75 @@ func TestModel_SeedAgent_PromotePlaceholder(t *testing.T) {
 	// Inspector placeholder should be untouched.
 	if model.agents["inspector"] == nil {
 		t.Fatal("inspector placeholder was incorrectly removed")
+	}
+}
+
+func TestModel_RegisteredTransition(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	// Phase 1: AgentRegistered → StatusWaiting.
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_reg",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "Pipeline agent registered: engineer",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "dag-1",
+			},
+		},
+	})
+
+	agent := model.agents["eng-1"]
+	if agent == nil {
+		t.Fatal("agent eng-1 not created on registration event")
+	}
+	if agent.Status != StatusWaiting {
+		t.Fatalf("status after registration = %v, want StatusWaiting", agent.Status)
+	}
+
+	// Phase 2: LLMRequest → StatusThinking (active work begins).
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_llm",
+			EventType: events.EventTypeLLMRequest,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "thinking",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "dag-1",
+			},
+		},
+	})
+
+	if agent.Status != StatusThinking {
+		t.Fatalf("status after LLMRequest = %v, want StatusThinking", agent.Status)
+	}
+
+	// Phase 3: LLMResponse → StatusIdle (work done, never returns to Waiting).
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_resp",
+			EventType: events.EventTypeLLMResponse,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "done",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "dag-1",
+			},
+		},
+	})
+
+	if agent.Status != StatusIdle {
+		t.Fatalf("status after LLMResponse = %v, want StatusIdle", agent.Status)
 	}
 }
 

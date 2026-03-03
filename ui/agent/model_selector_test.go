@@ -311,7 +311,7 @@ func TestDefaultModelForAgentType(t *testing.T) {
 
 func TestSeedAgentSetsModelID(t *testing.T) {
 	m := New(theme.DefaultDark())
-	m.SeedAgent("eng-1", "engineer", "Engineer", nil)
+	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "", "")
 
 	agent := m.agents["eng-1"]
 	if agent == nil {
@@ -319,6 +319,9 @@ func TestSeedAgentSetsModelID(t *testing.T) {
 	}
 	if agent.ModelID != "gpt-5.3-codex" {
 		t.Errorf("seeded agent ModelID = %q, want gpt-5.3-codex", agent.ModelID)
+	}
+	if agent.ProviderID != "openai" {
+		t.Errorf("seeded agent ProviderID = %q, want openai", agent.ProviderID)
 	}
 }
 
@@ -328,7 +331,7 @@ func TestSeedAgentWithSupportedModels(t *testing.T) {
 		{ID: "custom-v2", DisplayName: "Custom V2"},
 		{ID: "custom-v1", DisplayName: "Custom V1"},
 	}
-	m.SeedAgent("eng-1", "engineer", "Engineer", customModels)
+	m.SeedAgent("eng-1", "engineer", "Engineer", customModels, "", "")
 
 	agent := m.agents["eng-1"]
 	if agent == nil {
@@ -349,6 +352,55 @@ func TestSeedAgentWithSupportedModels(t *testing.T) {
 	models := agentModels(agent)
 	if len(models) != 2 || models[0].ID != "custom-v2" {
 		t.Errorf("agentModels returned %v, want custom models", models)
+	}
+}
+
+func TestSeedAgentWithPersistedModel(t *testing.T) {
+	m := New(theme.DefaultDark())
+	// Seed engineer with a persisted model+provider that exists in the static table.
+	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "gpt-5.2-codex", "openai")
+
+	agent := m.agents["eng-1"]
+	if agent == nil {
+		t.Fatal("seeded agent not found")
+	}
+
+	// Persisted model is in the engineer's static model table → should be used.
+	if agent.ModelID != "gpt-5.2-codex" {
+		t.Errorf("ModelID = %q, want gpt-5.2-codex", agent.ModelID)
+	}
+	if agent.ProviderID != "openai" {
+		t.Errorf("ProviderID = %q, want openai", agent.ProviderID)
+	}
+}
+
+func TestSeedAgentWithPersistedProviderDerived(t *testing.T) {
+	m := New(theme.DefaultDark())
+	// Seed with persisted model but empty provider — should derive from model.
+	m.SeedAgent("arch-1", "architect", "Architect", nil, "claude-opus-4-6", "")
+
+	agent := m.agents["arch-1"]
+	if agent == nil {
+		t.Fatal("seeded agent not found")
+	}
+	if agent.ProviderID != "anthropic" {
+		t.Errorf("ProviderID = %q, want anthropic (derived)", agent.ProviderID)
+	}
+}
+
+func TestSeedAgentWithInvalidPersistedModel(t *testing.T) {
+	m := New(theme.DefaultDark())
+	// Seed engineer with a persisted model NOT in the model list.
+	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "nonexistent-model", "")
+
+	agent := m.agents["eng-1"]
+	if agent == nil {
+		t.Fatal("seeded agent not found")
+	}
+
+	// Invalid persisted model → falls back to default.
+	if agent.ModelID != "gpt-5.3-codex" {
+		t.Errorf("ModelID = %q, want gpt-5.3-codex (default)", agent.ModelID)
 	}
 }
 

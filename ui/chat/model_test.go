@@ -1,6 +1,7 @@
 package chat
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -112,5 +113,21 @@ func TestStreamProgressSanitizesThinkingMessage(t *testing.T) {
 	}
 	if !strings.Contains(last.ThinkingStatus, "line one line two") {
 		t.Fatalf("expected normalized progress status, got %q", last.ThinkingStatus)
+	}
+}
+
+func TestFormatErrorForChat_BugReportError(t *testing.T) {
+	raw := `planning protocol: architect llm: anthropic stream: received error while streaming: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CYeT1GYt7Kg27RdtV9zeo"} (conversation unavailable: architect planner: anthropic stream: received error while streaming: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CYeSzHBJdCParu7tGNPhn"})`
+	got := formatErrorForChat(errors.New(raw))
+	want := "Overloaded (overloaded_error) [req_011CYeT1GYt7Kg27RdtV9zeo]"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestFormatErrorForChat_PlainError(t *testing.T) {
+	got := formatErrorForChat(errors.New("connection timeout"))
+	if got != "connection timeout" {
+		t.Fatalf("expected plain message, got %q", got)
 	}
 }

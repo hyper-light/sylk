@@ -78,7 +78,14 @@ func TestReaper_ClassifyAction_None(t *testing.T) {
 func TestReaper_RemoveDiskFile(t *testing.T) {
 	dir := t.TempDir()
 	planID := "test-reaper-plan"
-	planDir := filepath.Join(dir, ".sylk", "architect", "plans")
+
+	a := &Architect{
+		config:      Config{WorkingDirectory: dir},
+		activePlans: map[string]*DesignPlan{},
+	}
+
+	// Use planStoreDir to derive the correct path (matches removeDiskFile).
+	planDir := a.planStoreDir("")
 	if err := os.MkdirAll(planDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -87,10 +94,6 @@ func TestReaper_RemoveDiskFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a := &Architect{
-		config:      Config{WorkingDirectory: dir},
-		activePlans: map[string]*DesignPlan{},
-	}
 	r := &PlanReaper{
 		architect: a,
 		logger:    slog.Default(),

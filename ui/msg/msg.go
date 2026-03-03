@@ -556,6 +556,7 @@ type AuthStatusMsg struct {
 // PlanUpdateMsg carries an updated plan snapshot for the plan viewer.
 type PlanUpdateMsg struct {
 	PlanID          string
+	CorrelationID   string // Correlation of the request that owns this plan.
 	Status          string // "pending", "analyzing", ..., "ready", "executing", "completed", "failed"
 	Tasks           []PlanTaskSnapshot
 	ExecutionLayers [][]string // Task IDs per layer

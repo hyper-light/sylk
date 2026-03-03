@@ -6,9 +6,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/search/git"
 )
+
+// OnEventFunc is a callback for emitting WAL events from sub-components
+// that don't hold an event logger reference directly.
+type OnEventFunc func(agentlog.EventType, string, any)
 
 // CheckpointManager runs a periodic ticker and proposes safety checkpoints
 // when the worktree has dirty files. Every checkpoint requires explicit user approval.
@@ -19,6 +24,7 @@ type CheckpointManager struct {
 	dirtyThreshold  int
 	activityPub     events.ActivityPublisher
 	requestApproval ApprovalFunc
+	onEvent         OnEventFunc
 
 	mu          sync.Mutex
 	running     bool
@@ -45,6 +51,13 @@ func NewCheckpointManager(
 		requestApproval: requestApproval,
 		checkpoints:     make([]CheckpointRecord, 0),
 	}
+}
+
+// SetOnEvent wires a callback for WAL event emission.
+func (cm *CheckpointManager) SetOnEvent(fn OnEventFunc) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.onEvent = fn
 }
 
 // Start begins the periodic checkpoint ticker.
@@ -148,7 +161,15 @@ func (cm *CheckpointManager) createCheckpoint(seq, fileCount int) {
 
 	cm.mu.Lock()
 	cm.checkpoints = append(cm.checkpoints, record)
+	onEvt := cm.onEvent
 	cm.mu.Unlock()
+
+	if onEvt != nil {
+		onEvt(agentlog.EventCheckpointCreated, "info", &agentlog.CheckpointPayload{
+			CheckpointID: fmt.Sprintf("checkpoint_%d", seq),
+			Action:       "created",
+		})
+	}
 
 	cm.publishCheckpointActivity(record)
 }

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -47,6 +49,12 @@ func DiagnoseFailureSkill(engine DiagnosisEngine) *skills.Skill {
 			report, err := engine.DiagnoseFailure(ctx, failure, p.SourceFiles)
 			if err != nil {
 				return nil, fmt.Errorf("diagnose failure: %w", err)
+			}
+
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventCaseFailed,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.TestCasePayload{CaseName: p.TestName, Phase: "diagnosed"})
 			}
 
 			return report, nil
@@ -102,6 +110,11 @@ func PlanTestsSkill() *skills.Skill {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventTestPlanCreated,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.TestPlanPayload{TestCount: len(p.RiskAreas)})
 			}
 			return map[string]any{
 				"plan": &TestPlan{},
@@ -165,36 +178,24 @@ func RunTestSuiteSkill() *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			return map[string]any{
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteStarted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.TestSuitePayload{Phase: "started"})
+			}
+			result := map[string]any{
 				"packages": p.Packages,
 				"passed":   0,
 				"failed":   0,
 				"output":   "",
-			}, nil
+			}
+			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.TestSuitePayload{Phase: "completed"})
+			}
+			return result, nil
 		}).
 		Build()
 }
 
-// CheckInspectorGateSkill creates a skill that verifies inspector completion.
-func CheckInspectorGateSkill(getGate func() *InspectorGate) *skills.Skill {
-	return skills.NewSkill("check_inspector_gate").
-		Description("Verify that the Inspector has passed before beginning testing. MUST be called first.").
-		Domain("testing").
-		Keywords("inspector", "gate", "prerequisite", "validate").
-		Priority(100).
-		Handler(func(_ context.Context, _ json.RawMessage) (any, error) {
-			gate := getGate()
-			if gate == nil {
-				return map[string]any{
-					"passed": false,
-					"reason": "inspector gate not initialized",
-				}, nil
-			}
-			return map[string]any{
-				"passed":    gate.Passed,
-				"timestamp": gate.Timestamp,
-				"result_ref": gate.ResultRef,
-			}, nil
-		}).
-		Build()
-}

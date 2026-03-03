@@ -493,6 +493,168 @@ func TestChannelBus_W12_27_ConcurrentNewTopics(t *testing.T) {
 	assert.GreaterOrEqual(t, stats.Subscriptions, 1)
 }
 
+// =============================================================================
+// Wildcard Subscription Tests
+// =============================================================================
+
+func TestChannelBus_WildcardSubscription_SingleSegment(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	received := make(chan *guide.Message, 3)
+
+	_, err := bus.SubscribeAsync("pipeline.update.*", func(msg *guide.Message) error {
+		received <- msg
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Publish to matching topics.
+	bus.Publish("pipeline.update.engineer", &guide.Message{ID: "msg-eng"})
+	bus.Publish("pipeline.update.designer", &guide.Message{ID: "msg-des"})
+	bus.Publish("pipeline.update.inspector", &guide.Message{ID: "msg-ins"})
+
+	for _, wantID := range []string{"msg-eng", "msg-des", "msg-ins"} {
+		select {
+		case msg := <-received:
+			assert.Equal(t, wantID, msg.ID)
+		case <-time.After(time.Second):
+			t.Fatalf("timeout waiting for %s", wantID)
+		}
+	}
+}
+
+func TestChannelBus_WildcardSubscription_NoFalseMatch(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	var count int64
+
+	_, err := bus.SubscribeAsync("pipeline.update.*", func(msg *guide.Message) error {
+		atomic.AddInt64(&count, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Non-matching topics should not deliver.
+	bus.Publish("pipeline.state.engineer", &guide.Message{ID: "no-match-1"})
+	bus.Publish("pipeline.update", &guide.Message{ID: "no-match-2"})
+	bus.Publish("tasks.dispatch", &guide.Message{ID: "no-match-3"})
+
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int64(0), atomic.LoadInt64(&count))
+}
+
+func TestChannelBus_WildcardAndExact_BothDelivered(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	var wildcardCount, exactCount int64
+
+	_, err := bus.SubscribeAsync("events.*", func(msg *guide.Message) error {
+		atomic.AddInt64(&wildcardCount, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	_, err = bus.SubscribeAsync("events.login", func(msg *guide.Message) error {
+		atomic.AddInt64(&exactCount, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	bus.Publish("events.login", &guide.Message{ID: "login"})
+
+	time.Sleep(100 * time.Millisecond)
+
+	assert.Equal(t, int64(1), atomic.LoadInt64(&wildcardCount))
+	assert.Equal(t, int64(1), atomic.LoadInt64(&exactCount))
+}
+
+func TestChannelBus_WildcardUnsubscribe(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	var count int64
+
+	sub, err := bus.SubscribeAsync("pipeline.*", func(msg *guide.Message) error {
+		atomic.AddInt64(&count, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	bus.Publish("pipeline.update", &guide.Message{ID: "m1"})
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&count))
+
+	err = sub.Unsubscribe()
+	require.NoError(t, err)
+	assert.False(t, sub.IsActive())
+
+	bus.Publish("pipeline.update", &guide.Message{ID: "m2"})
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&count)) // no increment
+}
+
+func TestChannelBus_WildcardTopicSubscriberCount(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	sub, err := bus.SubscribeAsync("data.*", func(msg *guide.Message) error { return nil })
+	require.NoError(t, err)
+
+	// Wildcard sub should be counted for matching topics.
+	assert.Equal(t, 1, bus.TopicSubscriberCount("data.events"))
+	assert.Equal(t, 1, bus.TopicSubscriberCount("data.metrics"))
+
+	// Non-matching topic should have zero.
+	assert.Equal(t, 0, bus.TopicSubscriberCount("other.topic"))
+
+	sub.Unsubscribe()
+	assert.Equal(t, 0, bus.TopicSubscriberCount("data.events"))
+}
+
+func TestChannelBus_WildcardStats(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	_, err := bus.SubscribeAsync("pipeline.update.*", func(msg *guide.Message) error { return nil })
+	require.NoError(t, err)
+
+	_, err = bus.Subscribe("tasks.dispatch", func(msg *guide.Message) error { return nil })
+	require.NoError(t, err)
+
+	stats := bus.Stats()
+	assert.Equal(t, 2, stats.Subscriptions)
+	assert.Equal(t, 2, stats.Topics)
+	assert.Equal(t, 1, stats.ByTopic["pipeline.update.*"])
+	assert.Equal(t, 1, stats.ByTopic["tasks.dispatch"])
+}
+
+func TestChannelBus_WildcardClose(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+
+	var count int64
+
+	_, err := bus.SubscribeAsync("events.*", func(msg *guide.Message) error {
+		atomic.AddInt64(&count, 1)
+		return nil
+	})
+	require.NoError(t, err)
+
+	bus.Publish("events.test", &guide.Message{ID: "m1"})
+	time.Sleep(50 * time.Millisecond)
+
+	err = bus.Close()
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(1), atomic.LoadInt64(&count))
+
+	// After close, publish should fail.
+	err = bus.Publish("events.test", &guide.Message{ID: "m2"})
+	assert.Error(t, err)
+}
+
 func TestChannelBus_W12_27_ConcurrentSubscribeAndPublish(t *testing.T) {
 	// W12.27: Test that subscribing and publishing to the same topic concurrently is safe
 	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 1000})

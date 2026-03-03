@@ -83,6 +83,10 @@ func resolveGuideSelfResponder(cfg Config, provider providers.ProviderAdapter, m
 				owner.prepareGuideSelfResponseTools,
 				owner.executeGuideSelfResponseToolCall,
 			)
+			// Share the Guide's event logger with the self-responder.
+			if gr, ok := primary.(*GuideResponder); ok && owner.eventLogger != nil {
+				gr.eventLogger = owner.eventLogger
+			}
 		}
 		responder = NewFallbackGuideResponder(
 			primary,
@@ -116,6 +120,12 @@ func (r *fallbackGuideResponder) Respond(ctx context.Context, request GuideSelfR
 		"primary_error": traceGuideResponderError(primaryErr),
 		"primary_reply": tracePreview(reply, 180),
 	})
+	// Do not fall back to static responder when context was cancelled —
+	// the user interrupted, and returning a canned response creates a
+	// false-success turn that pollutes history and misleads the UI.
+	if ctx.Err() != nil {
+		return "", primaryErr
+	}
 	if !allowStaticGuideFallback(request) {
 		geminiTrace("self_response", "fallback_skipped_non_meta", map[string]any{
 			"input_preview": tracePreview(request.Input, 180),
@@ -156,6 +166,12 @@ func (r *fallbackGuideResponder) RespondStream(
 		"primary_error": traceGuideResponderError(primaryErr),
 		"primary_reply": tracePreview(reply, 180),
 	})
+	// Do not fall back to static responder when context was cancelled —
+	// the user interrupted, and returning a canned response creates a
+	// false-success turn that pollutes history and misleads the UI.
+	if ctx.Err() != nil {
+		return "", nil, primaryErr
+	}
 	if !allowStaticGuideFallback(request) {
 		geminiTrace("self_response", "fallback_stream_skipped_non_meta", map[string]any{
 			"input_preview": tracePreview(request.Input, 180),
@@ -453,6 +469,31 @@ func primaryGuideResponderError(reply string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("guide responder returned empty response")
+}
+
+// isStaticGuideReply returns true when the reply matches a known static
+// guide response pattern. Used to avoid appending canned responses to
+// conversation history where they'd bias the LLM on future turns.
+func isStaticGuideReply(reply string) bool {
+	trimmed := strings.TrimSpace(reply)
+	for _, prefix := range staticGuideReplyPrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+var staticGuideReplyPrefixes = []string{
+	"Guide is online.",
+	"Guide is running.",
+	"I can help with routing,",
+	"Hi. I can help with general questions",
+	"I'm doing well and ready to help.",
+	"Registered agents (",
+	"There are",
+	"Sylk can route requests",
+	"No agents are currently registered.",
 }
 
 func allowStaticGuideFallback(request GuideSelfResponseRequest) bool {

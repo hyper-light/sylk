@@ -208,6 +208,12 @@ type TaskRecord struct {
 	Attempts    int `json:"attempts"`
 	MaxAttempts int `json:"max_attempts"`
 
+	// Pipeline stage tracking
+	PipelineStage    string     `json:"pipeline_stage,omitempty"`     // "inspect", "test", "execute"
+	StageAgentID     string     `json:"stage_agent_id,omitempty"`     // Agent that ACKed current stage
+	StageStartedAt   *time.Time `json:"stage_started_at,omitempty"`   // When current stage was ACKed
+	PipelineParentID string     `json:"pipeline_parent_id,omitempty"` // Original parent node ID
+
 	// Context
 	SessionID string         `json:"session_id"`
 	Metadata  map[string]any `json:"metadata,omitempty"`

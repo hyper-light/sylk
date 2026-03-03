@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/architect"
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -25,6 +26,15 @@ const (
 type ConversationResult struct {
 	Response string `json:"response"`
 	Intent   string `json:"intent"`
+}
+
+// ResponseText implements the guide-layer responseTexter interface so the
+// conversation history stores the clean response string, not a JSON blob.
+func (r *ConversationResult) ResponseText() string {
+	if r == nil {
+		return ""
+	}
+	return r.Response
 }
 
 // handleConversation processes conversational requests through the LLM.
@@ -90,7 +100,7 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 	defer cancel()
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
 
-	response, err := o.executeToolLoop(llmCtx, llmReq)
+	response, err := o.executeToolLoop(llmCtx, llmReq, shared.SteeringLedgerFromContext(llmCtx))
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator conversation: %w", err)
 	}

@@ -30,11 +30,12 @@ func (o *ActivityTelemetryObserver) OnMessageSent(env *MessageEnvelope, err erro
 	eventType := inferEventType(env.Topic)
 
 	event := &events.ActivityEvent{
-		ID:        uuid.New().String(),
-		EventType: eventType,
-		AgentID:   env.SourceAgentType,
-		SessionID: env.SourceContainerID,
-		Timestamp: time.Now(),
+		ID:         uuid.New().String(),
+		EventType:  eventType,
+		AgentID:    env.SourceAgentType,
+		SessionID:  env.SourceContainerID,
+		Timestamp:  time.Now(),
+		Visibility: events.VisibilityAgent, // Agent-to-agent coordination — not user-facing.
 		Data: map[string]any{
 			"topic":            env.Topic,
 			"source_container": env.SourceContainerID,

@@ -1,20 +1,9 @@
 package architect
 
 import (
-	"context"
 	"fmt"
 	"strings"
 )
-
-// ctxOrBackground returns ctx if it has not been cancelled, otherwise returns
-// context.Background(). Used to escape cancelled parent contexts for fallback
-// LLM calls that must complete regardless of the original request lifecycle.
-func ctxOrBackground(ctx context.Context) context.Context {
-	if ctx.Err() != nil {
-		return context.Background()
-	}
-	return ctx
-}
 
 // fallbackReadyUserResponse generates a deterministic user-facing response
 // when a plan is ready but the LLM compose step failed (e.g. context cancelled).

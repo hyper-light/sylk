@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -21,18 +23,30 @@ type contentScanInput struct {
 func contentScanSkill(g *Guardian) *skills.Skill {
 	type handler = func(context.Context, *contentScanInput) (any, error)
 	dispatch := map[string]handler{
-		"scan_output": func(_ context.Context, p *contentScanInput) (any, error) {
+		"scan_output": func(ctx context.Context, p *contentScanInput) (any, error) {
 			if p.Content == "" {
 				return nil, fmt.Errorf("content is required for scan_output")
 			}
 			findings := g.contentValidator.ScanContent(p.Content)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventContentScanned,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.DiffPayload{Verdict: fmt.Sprintf("%d findings", len(findings))})
+				for _, f := range findings {
+					if f.Type == FindingCredentialLeak {
+						shared.LogAgentEvent(lm.EventLogger, agentlog.EventCredentialDetected,
+							lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+							&agentlog.DiffPayload{Reason: f.Title})
+					}
+				}
+			}
 			return map[string]any{
 				"findings":      findings,
 				"finding_count": len(findings),
 				"clean":         len(findings) == 0,
 			}, nil
 		},
-		"scan_staged": func(_ context.Context, p *contentScanInput) (any, error) {
+		"scan_staged": func(ctx context.Context, p *contentScanInput) (any, error) {
 			if len(p.Paths) == 0 {
 				return nil, fmt.Errorf("paths required for scan_staged")
 			}
@@ -40,14 +54,26 @@ func contentScanSkill(g *Guardian) *skills.Skill {
 				if g.fileAccess == nil {
 					return "", fmt.Errorf("no file access configured")
 				}
-				ctx := context.Background()
-				data, err := g.fileAccess.ReadFile(ctx, path)
+				bgCtx := context.Background()
+				data, err := g.fileAccess.ReadFile(bgCtx, path)
 				if err != nil {
 					return "", err
 				}
 				return string(data), nil
 			}
 			findings := g.contentValidator.ScanPaths(p.Paths, readFile)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventContentScanned,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.DiffPayload{Verdict: fmt.Sprintf("%d paths, %d findings", len(p.Paths), len(findings))})
+				for _, f := range findings {
+					if f.Type == FindingCredentialLeak {
+						shared.LogAgentEvent(lm.EventLogger, agentlog.EventCredentialDetected,
+							lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+							&agentlog.DiffPayload{Reason: f.Title})
+					}
+				}
+			}
 			return map[string]any{
 				"findings":      findings,
 				"finding_count": len(findings),
@@ -55,11 +81,18 @@ func contentScanSkill(g *Guardian) *skills.Skill {
 				"clean":         len(findings) == 0,
 			}, nil
 		},
-		"detect_injection": func(_ context.Context, p *contentScanInput) (any, error) {
+		"detect_injection": func(ctx context.Context, p *contentScanInput) (any, error) {
 			if p.Content == "" {
 				return nil, fmt.Errorf("content is required for detect_injection")
 			}
 			findings := g.contentValidator.injectionScanner.Scan(p.Content)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				for _, f := range findings {
+					shared.LogAgentEvent(lm.EventLogger, agentlog.EventInjectionDetected,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.DiffPayload{Reason: f.Title})
+				}
+			}
 			return map[string]any{
 				"findings":      findings,
 				"finding_count": len(findings),

@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
@@ -54,6 +58,10 @@ type ActiveDAGMeta struct {
 	CancelFunc context.CancelFunc
 	Unsub      func()
 	StartedAt  time.Time
+
+	// SubNodeMap maps expanded sub-node IDs to their original parent
+	// node IDs. Populated during pipeline expansion.
+	SubNodeMap map[string]string // subNodeID → parentNodeID
 }
 
 // DAGBridge wires the dag.Scheduler into the orchestrator's bus/WAL/store/buffers.
@@ -72,8 +80,9 @@ type DAGBridge struct {
 	agentID   string
 	logger    *slog.Logger
 
-	activityPub events.ActivityPublisher
-	activeDAGs  map[string]*ActiveDAGMeta
+	activityPub  events.ActivityPublisher
+	eventLogger  *agentlog.SessionEventLogger
+	activeDAGs   map[string]*ActiveDAGMeta
 	gates       map[string]*dag.DecisionGate // per-DAG decision gates
 }
 
@@ -139,6 +148,13 @@ func (b *DAGBridge) SetLogger(l *slog.Logger) {
 	b.logger = l
 }
 
+// SetEventLogger sets the JSONL event logger for DAG event instrumentation.
+func (b *DAGBridge) SetEventLogger(el *agentlog.SessionEventLogger) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.eventLogger = el
+}
+
 // Execute builds/receives a DAG from a plan, journals, persists, and submits to the scheduler.
 func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID string) (string, error) {
 	b.mu.Lock()
@@ -149,11 +165,24 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		return "", fmt.Errorf("dag bridge: bus not set")
 	}
 
+	// 0. Expand pipeline-eligible nodes into sub-DAGs.
+	expanded, subNodeMap := ExpandDAG(d)
+	if len(subNodeMap) > 0 {
+		b.journal.LogPipelineExpanded(d.ID(), d.ID(), subNodeMapKeys(subNodeMap))
+		shared.LogAgentEvent(b.eventLogger, agentlog.EventPipelineExpanded,
+			b.agentID, sessionID, "", "info",
+			&agentlog.PipelinePayload{PipelineID: d.ID(), Stage: "expanded"})
+		d = expanded
+	}
+
 	// 1. WAL: LogDAGStart
 	dagJSON, _ := d.MarshalJSON()
 	if err := b.journal.LogDAGStart(d.ID(), string(dagJSON)); err != nil {
 		return "", fmt.Errorf("dag bridge: wal start: %w", err)
 	}
+	shared.LogAgentEvent(b.eventLogger, agentlog.EventDAGStarted,
+		b.agentID, sessionID, "", "info",
+		&agentlog.DAGPayload{DAGID: d.ID(), State: "started"})
 
 	// 2. SQLite: InsertDAGExecution
 	policyJSON, _ := json.Marshal(d.Policy())
@@ -165,17 +194,48 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		return "", fmt.Errorf("dag bridge: store insert: %w", err)
 	}
 
-	// 3. Create BusNodeDispatcher
-	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, b.activator)
+	// 3. Create PipelinePod for per-node guard lifecycle management.
+	//    The pod acquires demotion guards per-node (not bulk), deduplicates
+	//    registrar calls, and provides full activation observability.
+	b.mu.RLock()
+	activator := b.activator
+	registrar := b.registrar
+	logger := b.logger
+	b.mu.RUnlock()
 
-	// 3b. Create decision gate for this DAG
+	pod := NewPipelinePod(PipelinePodConfig{
+		DAGID:       d.ID(),
+		SessionID:   sessionID,
+		Activator:   activator,
+		Registrar:   registrar,
+		ActivityPub: b.activityPub,
+		Logger:      logger,
+	})
+
+	// 3a. Pre-activate all pipeline agent types so they are registered
+	// with the Guide and visible in the TUI before the first sub-node
+	// dispatches. Each pipeline always uses all four agent types.
+	pod.PreActivate(ctx, d)
+
+	// 3b. Create BusNodeDispatcher with pod-based per-node activation.
+	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, pod)
+	dagID := d.ID()
+
+	// 3c. Create decision gate for this DAG
 	gate := dag.NewDecisionGate(d, b.onNonBlockingFailure, b.onBlockingDecisionRequired)
 	b.mu.Lock()
 	b.gates[d.ID()] = gate
 	b.mu.Unlock()
 
 	// 4. Track active DAG
-	dagCtx, dagCancel := context.WithCancel(ctx)
+	//
+	// Decouple the DAG lifecycle from the caller's request context.
+	// DAGs are async — they outlive the tool-loop request that submitted
+	// them. WithoutCancel preserves context values (logging metadata,
+	// etc.) while preventing the request's defer-cancel from cascading
+	// into a running DAG. Explicit cancellation is still available via
+	// Cancel() and CancelAll().
+	dagCtx, dagCancel := context.WithCancel(context.WithoutCancel(ctx))
 	b.mu.Lock()
 	b.activeDAGs[d.ID()] = &ActiveDAGMeta{
 		PlanID:     planID,
@@ -183,6 +243,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		Dispatcher: dispatcher,
 		CancelFunc: dagCancel,
 		StartedAt:  time.Now(),
+		SubNodeMap: subNodeMap,
 	}
 	b.mu.Unlock()
 
@@ -192,44 +253,41 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.activeDAGs[d.ID()].Unsub = unsub
 	b.mu.Unlock()
 
-	// 6. Activate every agent the DAG requires via PipelinePod.
-	//    The pod acquires demotion guards that keep agents hot for
-	//    the pipeline's entire duration. Activation is fatal — a
-	//    pipeline cannot execute with missing agents.
-	b.mu.RLock()
-	activator := b.activator
-	registrar := b.registrar
-	logger := b.logger
-	b.mu.RUnlock()
-
-	pod := NewPipelinePod(PipelinePodConfig{
-		DAGID:     d.ID(),
-		Activator: activator,
-		Registrar: registrar,
-		Logger:    logger,
-	})
-	if activator != nil {
-		if err := pod.Activate(ctx, d); err != nil {
-			dagCancel()
-			b.mu.Lock()
-			delete(b.activeDAGs, d.ID())
-			b.mu.Unlock()
-			b.journal.LogDAGAbort(d.ID(), err.Error())
-			b.store.UpdateDAGState(d.ID(), "failed", err.Error())
-			return "", fmt.Errorf("dag bridge: activate agents: %w", err)
-		}
-	}
+	// 6. Store pod in meta for cleanup and sub-node tracking.
 	b.mu.Lock()
 	b.activeDAGs[d.ID()].Pod = pod
 	b.mu.Unlock()
+
+	// 6b. Register expanded sub-nodes with the pod for per-node observability.
+	//     Sorted iteration ensures deterministic registration order.
+	for _, subNodeID := range slices.Sorted(maps.Keys(subNodeMap)) {
+		parentNodeID := subNodeMap[subNodeID]
+		node, ok := d.GetNode(subNodeID)
+		if !ok {
+			dagCancel()
+			b.cleanupDAG(d.ID())
+			errMsg := fmt.Sprintf("sub-node %s missing from expanded DAG", subNodeID)
+			b.journal.LogDAGAbort(d.ID(), errMsg)
+			b.store.UpdateDAGState(d.ID(), "failed", errMsg)
+			return "", fmt.Errorf("dag bridge: %s", errMsg)
+		}
+		stage := string(StageFromSubNodeID(subNodeID))
+		pod.RegisterSubNode(subNodeID, parentNodeID, stage, node.AgentType())
+	}
+
+	// 6c. Wire ACK callback now that the pod is available.
+	dispatcher.SetACKCallback(func(nodeID string, ack *ACKResult) {
+		b.journal.LogNodeAcked(dagID, nodeID, ack.AgentID)
+		if _, isSub := subNodeMap[nodeID]; isSub {
+			pod.RecordSubNodeACK(nodeID, ack.AgentID, ack.AckedAt)
+		}
+	})
 
 	// 7. Submit to scheduler (async execution)
 	_, err := b.scheduler.Submit(dagCtx, d, dispatcher)
 	if err != nil {
 		dagCancel()
-		b.mu.Lock()
-		delete(b.activeDAGs, d.ID())
-		b.mu.Unlock()
+		b.cleanupDAG(d.ID())
 		b.journal.LogDAGAbort(d.ID(), err.Error())
 		b.store.UpdateDAGState(d.ID(), "failed", err.Error())
 		return "", fmt.Errorf("dag bridge: submit: %w", err)
@@ -242,20 +300,14 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 func (b *DAGBridge) Cancel(dagID, reason string) error {
 	b.mu.Lock()
 	meta, ok := b.activeDAGs[dagID]
-	delete(b.activeDAGs, dagID)
 	b.mu.Unlock()
 
 	if !ok {
 		return b.scheduler.Cancel(dagID)
 	}
 
-	if meta.Pod != nil {
-		meta.Pod.Release()
-	}
-	if meta.Unsub != nil {
-		meta.Unsub()
-	}
 	meta.CancelFunc()
+	b.cleanupDAG(dagID)
 	b.journal.LogDAGCancel(dagID, reason)
 	b.store.UpdateDAGState(dagID, "cancelled", reason)
 
@@ -316,14 +368,44 @@ func (b *DAGBridge) GetDispatcherForDAG(dagID string) *BusNodeDispatcher {
 	return nil
 }
 
-// NotifyNodeComplete resolves a pending node dispatch.
+// NotifyNodeComplete resolves a pending node dispatch. For sub-nodes from
+// pipeline expansion, only the :execute sub-node unblocks the parent
+// dispatcher — inspect and test results are recorded but don't resolve
+// the original dispatch.
 func (b *DAGBridge) NotifyNodeComplete(nodeID string, result *dag.NodeResult) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	for _, meta := range b.activeDAGs {
+		// Direct match — not a sub-node or already the dispatched ID.
 		meta.Dispatcher.OnNodeComplete(nodeID, result)
+
+		// If this is an :execute sub-node, also resolve the parent node.
+		if meta.SubNodeMap != nil {
+			if parentID, ok := meta.SubNodeMap[nodeID]; ok {
+				stage := StageFromSubNodeID(nodeID)
+				if stage == StageExecute {
+					meta.Dispatcher.OnNodeComplete(parentID, result)
+				}
+			}
+		}
 	}
+}
+
+// ResolveSubNode returns the parent node ID for a sub-node, or the
+// original nodeID if it is not an expanded sub-node.
+func (b *DAGBridge) ResolveSubNode(dagID, nodeID string) string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	meta, ok := b.activeDAGs[dagID]
+	if !ok || meta.SubNodeMap == nil {
+		return nodeID
+	}
+	if parentID, ok := meta.SubNodeMap[nodeID]; ok {
+		return parentID
+	}
+	return nodeID
 }
 
 // RecoverFromWAL replays incomplete DAGs on startup.
@@ -387,13 +469,36 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 			return
 		}
 
+		el := b.eventLogger
 		switch event.Type {
-		case dag.EventNodeStarted:
+		case dag.EventNodeDispatched:
 			b.journal.LogNodeDispatch(dagID, event.NodeID, "")
+			shared.LogAgentEvent(el, agentlog.EventNodeDispatched,
+				b.agentID, b.sessionID, "", "info",
+				&agentlog.DAGPayload{DAGID: dagID, NodeID: event.NodeID, State: "dispatched"})
+
+		case dag.EventNodeAcked:
+			agentID, _ := event.Data["agent_id"].(string)
+			b.journal.LogNodeAcked(dagID, event.NodeID, agentID)
+
+		case dag.EventNodeStarted:
+			// Legacy — still emitted for non-ACK nodes.
+			b.journal.LogNodeDispatch(dagID, event.NodeID, "")
+
+		case dag.EventStageTransition:
+			fromStage, _ := event.Data["from_stage"].(string)
+			toStage, _ := event.Data["to_stage"].(string)
+			b.journal.LogStageTransition(dagID, event.NodeID, fromStage, toStage)
+			shared.LogAgentEvent(el, agentlog.EventStageTransition,
+				b.agentID, b.sessionID, "", "info",
+				&agentlog.PipelinePayload{PipelineID: dagID, Stage: toStage, State: fromStage})
 
 		case dag.EventNodeCompleted:
 			b.journal.LogNodeResult(dagID, event.NodeID, "succeeded", "")
 			b.updateProgressFromScheduler(dagID)
+			shared.LogAgentEvent(el, agentlog.EventNodeCompleted,
+				b.agentID, b.sessionID, "", "info",
+				&agentlog.DAGPayload{DAGID: dagID, NodeID: event.NodeID, State: "succeeded"})
 
 		case dag.EventNodeFailed:
 			errMsg := ""
@@ -402,22 +507,34 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 			}
 			b.journal.LogNodeResult(dagID, event.NodeID, "failed", errMsg)
 			b.updateProgressFromScheduler(dagID)
+			shared.LogAgentEvent(el, agentlog.EventNodeFailed,
+				b.agentID, b.sessionID, "", "error",
+				&agentlog.DAGPayload{DAGID: dagID, NodeID: event.NodeID, State: "failed", Err: errMsg})
 
 		case dag.EventDAGCompleted:
 			b.journal.LogDAGComplete(dagID, "succeeded")
 			b.store.UpdateDAGState(dagID, "succeeded", "")
 			b.onDAGComplete(dagID, planID)
+			shared.LogAgentEvent(el, agentlog.EventDAGCompleted,
+				b.agentID, b.sessionID, "", "info",
+				&agentlog.DAGPayload{DAGID: dagID, State: "succeeded"})
 
 		case dag.EventDAGFailed:
 			errMsg := errorFromEvent(event)
 			b.journal.LogDAGComplete(dagID, "failed")
 			b.store.UpdateDAGState(dagID, "failed", errMsg)
 			b.onDAGFailed(dagID, planID, errMsg)
+			shared.LogAgentEvent(el, agentlog.EventDAGAborted,
+				b.agentID, b.sessionID, "", "error",
+				&agentlog.DAGPayload{DAGID: dagID, State: "failed", Err: errMsg})
 
 		case dag.EventDAGCancelled:
 			b.journal.LogDAGCancel(dagID, "cancelled via scheduler")
 			b.store.UpdateDAGState(dagID, "cancelled", "")
 			b.cleanupDAG(dagID)
+			shared.LogAgentEvent(el, agentlog.EventDAGCancelled,
+				b.agentID, b.sessionID, "", "info",
+				&agentlog.DAGPayload{DAGID: dagID, State: "cancelled"})
 		}
 	}
 }
@@ -465,6 +582,8 @@ func (b *DAGBridge) cleanupDAG(dagID string) {
 	if meta == nil {
 		return
 	}
+	// Release pod guards directly (pod.Release is idempotent and logs
+	// diagnostic summaries of unreleased nodes).
 	if meta.Pod != nil {
 		meta.Pod.Release()
 	}
@@ -505,6 +624,14 @@ func (b *DAGBridge) publishActivity(eventType events.EventType, content string) 
 	evt.Data["agent_type"] = "orchestrator"
 	evt.Data["agent_name"] = "Orchestrator"
 	b.activityPub.PublishActivity(evt)
+}
+
+func subNodeMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func errorFromEvent(event *dag.Event) string {

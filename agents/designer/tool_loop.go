@@ -9,29 +9,75 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 // executeToolLoop runs the model tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.DesignerConfig.MaxToolRuns.
 // After each Complete call it records a TurnRecord on the handoff bridge (if set)
 // and accumulates usage for streaming.
-func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request) (string, error) {
+func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, d.config.DesignerConfig.MaxToolRuns)
 	consecutiveErrors := 0
 
 	p := d.getProvider()
 	if p == nil {
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
+		}
 		return "", fmt.Errorf("designer: no LLM provider configured")
 	}
 
 	for turn := 0; turn <= d.config.DesignerConfig.MaxToolRuns; turn++ {
+		// ── STEERING CHECKPOINT ──
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "designing", nil)
+		if sc.Rollback != nil || sc.EditReplay != nil {
+			cp := sc.Rollback
+			if cp == nil {
+				cp = sc.EditReplay
+			}
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				action := "rollback"
+				if sc.EditReplay != nil {
+					action = "edit_replay"
+				}
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignIteration,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.DesignPayload{Phase: action})
+			}
+			req.Messages = req.Messages[:cp.MessageCount]
+			if sc.EditReplay != nil {
+				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
+			}
+			turn = cp.Turn
+			seen = make(map[shared.ToolCallSignature]int, d.config.DesignerConfig.MaxToolRuns)
+			consecutiveErrors = 0
+			continue
+		}
+		if sc.ShouldPause {
+			if err := ledger.WaitForResume(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// ── END STEERING ──
+
 		turnStart := time.Now()
 
 		resp, err := p.Complete(ctx, req)
+		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
+			}
 			return "", fmt.Errorf("designer llm: %w", err)
 		}
 
@@ -39,14 +85,29 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request) 
 
 		if len(resp.ToolCalls) == 0 {
 			d.recordTurn(req, resp, turn, 0, 0, turnStart)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignGenerated,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.DesignPayload{Phase: "completed", DurNs: time.Since(turnStart).Nanoseconds()})
+			}
 			return strings.TrimSpace(resp.Content), nil
 		}
 
 		if turn == d.config.DesignerConfig.MaxToolRuns {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", d.config.DesignerConfig.MaxToolRuns)})
+			}
 			return "", fmt.Errorf("designer exceeded tool-call limit (%d)", d.config.DesignerConfig.MaxToolRuns)
 		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
+			}
 			return "", fmt.Errorf("designer repeated tool call: %s", sig.Name)
 		}
 
@@ -54,15 +115,36 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request) 
 
 		d.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignIteration,
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.DesignPayload{Phase: "iteration", DurNs: time.Since(turnStart).Nanoseconds()})
+		}
+
 		if rerouted {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignGenerated,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.DesignPayload{Phase: "rerouted"})
+			}
 			return "", skills.ErrRerouteRequested
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
+			}
 			return "", fmt.Errorf("designer tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
 
+	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+			lm.AgentID, lm.SessionID, lm.CorrID, "error",
+			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
+	}
 	return "", fmt.Errorf("designer exhausted tool-call loop")
 }
 
@@ -98,7 +180,17 @@ func (d *Designer) applyToolCalls(
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
+				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					shared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ToolPayload{ToolName: call.Name, Success: false, Err: err.Error()})
+				}
 			}
+		}
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, shared.ToolNameToEventType(call.Name),
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,

@@ -7,12 +7,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -69,6 +71,17 @@ type GlobalInspector struct {
 
 	// File access (injected per-session at runtime).
 	fileAccess versioning.FileAccess
+
+	// Request lifecycle.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	// Steering ledger management.
+	steering *agentShared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *agentShared.RequestSerializer
 }
 
 // New creates a new GlobalInspector instance.
@@ -89,7 +102,11 @@ func New(cfg shared.GlobalInspectorConfig, provider inspectorProvider) (*GlobalI
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		pendingBus:  make(map[string]chan *guide.Message),
 		diffStore:   NewAuditDiffStore(cfg.MaxAge),
+		steering:          agentShared.NewSteeringManager(),
+		requestSerializer: agentShared.NewRequestSerializer(),
 	}
+
+	gi.steering.InitLazy("inspector", nil)
 
 	gi.initSkills()
 	return gi, nil
@@ -252,6 +269,7 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 
 	gi.bus = bus
 	gi.channels = guide.NewAgentChannels("inspector", gi.id)
+	gi.runCtx, gi.runCancel = context.WithCancel(context.Background())
 
 	var err error
 	gi.requestSub, err = bus.SubscribeAsync(gi.channels.Requests, gi.handleBusRequest)
@@ -281,6 +299,11 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 func (gi *GlobalInspector) Stop() error {
 	if !gi.running {
 		return nil
+	}
+
+	gi.steering.CloseAll()
+	if gi.runCancel != nil {
+		gi.runCancel()
 	}
 
 	var errs []error
@@ -357,8 +380,13 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 		Tools:     tools,
 	}
 
-	result, err := gi.executeToolLoop(ctx, req)
+	result, err := gi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 	if err != nil {
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("tool loop: %v", err)})
+		}
 		return nil, fmt.Errorf("global inspector tool loop: %w", err)
 	}
 
@@ -369,20 +397,50 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 }
 
 func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
+	if msg.Type == guide.MessageTypeAction {
+		action, ok := msg.GetActionRequest()
+		if ok && action != nil {
+			gi.steering.HandleAction(action)
+		}
+		return nil
+	}
 	if msg.Type != guide.MessageTypeForward {
 		gi.deliverPendingMessage(msg)
 		return nil
 	}
+
+	if !gi.requestSerializer.Acquire(gi.runCtx) {
+		return nil // runCtx cancelled, agent shutting down
+	}
+	defer gi.requestSerializer.Release()
 
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	ctx := context.Background()
+	gi.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	agentShared.LogIncomingRequest(gi.steering.EventLogger(), fwd, gi.id)
+
+	reqCtx, cancel := context.WithCancel(gi.runCtx)
+	gi.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	defer cancel()
+
+	ctx := reqCtx
 	ctx = shared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
+
+	// Create steering ledger for this request.
+	ledger := gi.steering.Create(fwd.CorrelationID, gi.id, fwd.SessionID, nil, nil)
+	defer gi.steering.Close(fwd.CorrelationID, ctx.Err() != nil)
+	ctx = agentShared.WithSteeringLedger(ctx, ledger)
+	ctx = agentShared.WithLogMeta(ctx, agentShared.LogMeta{
+		EventLogger: gi.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     gi.id,
+		SessionID:   fwd.SessionID,
+	})
 
 	toolEmitter := agentShared.NewToolCallEmitter(gi.bus, gi.channels, "inspector", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
@@ -392,12 +450,18 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	}
 
 	result, err := gi.Handle(ctx, fwd)
+	agentShared.LogResponse(gi.steering.EventLogger(), fwd.CorrelationID, gi.id, fwd.SessionID, time.Since(startTime), err)
 
 	if fwd.FireAndForget {
 		return nil
 	}
 
 	if err != nil {
+		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
+		}
 		shared.PublishStreamError(gi.bus, gi.channels, ctx, "inspector", err)
 		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, "inspector", "", usageAcc.Total())
 		errMsg := guide.NewErrorMessage(gi.generateMessageID(), fwd.CorrelationID, gi.id, err.Error())
@@ -435,8 +499,16 @@ func (gi *GlobalInspector) handleRegistryAnnouncement(msg *guide.Message) error 
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
 		gi.knownAgents[ann.AgentID] = ann
+		agentShared.LogAgentEvent(gi.steering.EventLogger(), agentlog.EventRegistryEvent,
+			gi.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "registered",
+			})
 	case guide.MessageTypeAgentUnregistered:
 		delete(gi.knownAgents, ann.AgentID)
+		agentShared.LogAgentEvent(gi.steering.EventLogger(), agentlog.EventRegistryEvent,
+			gi.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "unregistered",
+			})
 	}
 	return nil
 }

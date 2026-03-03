@@ -49,6 +49,9 @@ const (
 	// Search
 	IconSearch = "/"
 	IconFilter = "⊕"
+
+	// Steering
+	IconSteer = "⎈"
 )
 
 // DotAnimFrames are origami-bloom glyphs for active status dot animation.

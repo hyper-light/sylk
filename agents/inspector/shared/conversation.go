@@ -13,6 +13,15 @@ type ConversationResult struct {
 	Static   bool   `json:"static"`
 }
 
+// ResponseText implements the guide-layer responseTexter interface so the
+// conversation history stores the clean response string, not a JSON blob.
+func (r *ConversationResult) ResponseText() string {
+	if r == nil {
+		return ""
+	}
+	return r.Response
+}
+
 // TryStaticReply attempts to answer simple queries without an LLM call.
 // Returns nil if no static match is found.
 func TryStaticReply(input string, state *InspectorState, issues []ValidationIssue) *ConversationResult {

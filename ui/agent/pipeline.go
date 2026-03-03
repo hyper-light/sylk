@@ -72,22 +72,28 @@ const variantPrefix = " \u250a " // " ┊ "
 
 // renderPipelineRow renders a pipeline header row.
 // Layout: [indicator] [task-id] [status] [progress-bar] [loop/max]
-func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme, selected bool) string {
-	indicator := " "
-	indicatorStyle := lipgloss.NewStyle()
-	if selected {
-		indicatorStyle = th.AgentActive
-		indicator = theme.IconExpand
-	}
-	indicator = indicatorStyle.Render(indicator)
-
-	// Task ID.
-	nameStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
-	if !selected {
-		nameStyle = lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
-	}
+// When activeColor is non-empty the indicator and task-id use the holographic
+// group color; the task-id additionally gets a ripple shimmer via anim.
+func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme, selected bool, activeColor lipgloss.Color, anim AnimState) string {
+	// Task ID — always bold, matching renderSectionHeader.
 	taskLabel := truncate(pl.TaskID, 16)
-	name := nameStyle.Render(taskLabel)
+	var name string
+	if activeColor != "" && anim.Ripple {
+		hGrad := anim.RippleGrad
+		if selected && anim.HolographicGrad != nil {
+			hGrad = anim.HolographicGrad
+		}
+		if hGrad != nil {
+			name = "\x1b[1m" + theme.RenderRippleText(taskLabel, anim.Elapsed, hGrad, 0)
+		}
+	}
+	if name == "" {
+		nameStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
+		if !selected {
+			nameStyle = lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
+		}
+		name = nameStyle.Render(taskLabel)
+	}
 
 	// Status label.
 	statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtext)
@@ -100,7 +106,11 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 	loopStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	loopLabel := loopStyle.Render(fmt.Sprintf("%d/%d", pl.LoopCount, pl.MaxLoops))
 
-	return fmt.Sprintf("%s %s %s %s %s", indicator, name, statusLabel, bar, loopLabel)
+	if selected {
+		indicator := th.AgentActive.Render(theme.IconExpand)
+		return fmt.Sprintf("%s %s %s %s %s", indicator, name, statusLabel, bar, loopLabel)
+	}
+	return fmt.Sprintf("%s %s %s %s", name, statusLabel, bar, loopLabel)
 }
 
 // renderProgressBar renders a 5-cell shimmer progress bar.
@@ -142,14 +152,23 @@ func renderProgressBar(status string, elapsed time.Duration, grad *theme.Gradien
 
 // renderVariantRow renders a single variant sub-row.
 // Layout: [┊ ] [icon] [var_xxxx] [state] [message]
-func renderVariantRow(v *VariantState, width int, th *theme.Theme, selected bool) string {
-	prefix := lipgloss.NewStyle().Foreground(th.Palette.Subtle).Render(variantPrefix)
+// When activeColor is non-empty the dotted prefix and short-ID use the
+// holographic group color, and the ID gets a ripple shimmer via anim.
+func renderVariantRow(v *VariantState, width int, th *theme.Theme, selected bool, activeColor lipgloss.Color, anim AnimState) string {
+	prefixColor := th.Palette.Subtle
+	if activeColor != "" {
+		prefixColor = activeColor
+	}
+	prefix := lipgloss.NewStyle().Foreground(prefixColor).Render(variantPrefix)
 
 	icon := variantStateIcons[v.State]
 	if icon == "" {
 		icon = theme.IconIdle
 	}
 	iconStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
+	if activeColor != "" {
+		iconStyle = lipgloss.NewStyle().Foreground(activeColor)
+	}
 	if selected {
 		iconStyle = th.AgentActive
 	}
@@ -160,11 +179,24 @@ func renderVariantRow(v *VariantState, width int, th *theme.Theme, selected bool
 	if len(shortID) > 8 {
 		shortID = "var_" + shortID[len(shortID)-4:]
 	}
-	idStyle := lipgloss.NewStyle().Foreground(th.Palette.Foreground)
-	if selected {
-		idStyle = idStyle.Bold(true)
+
+	var idStr string
+	if activeColor != "" && anim.Ripple {
+		hGrad := anim.RippleGrad
+		if selected && anim.HolographicGrad != nil {
+			hGrad = anim.HolographicGrad
+		}
+		if hGrad != nil {
+			idStr = theme.RenderRippleText(shortID, anim.Elapsed, hGrad, 0)
+		}
 	}
-	idStr := idStyle.Render(shortID)
+	if idStr == "" {
+		idStyle := lipgloss.NewStyle().Foreground(th.Palette.Foreground)
+		if selected {
+			idStyle = idStyle.Bold(true)
+		}
+		idStr = idStyle.Render(shortID)
+	}
 
 	stateStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtext)
 	stateStr := stateStyle.Render(v.State)

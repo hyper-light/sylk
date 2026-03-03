@@ -14,6 +14,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -96,6 +97,13 @@ type Guardian struct {
 	inFlightMu sync.Mutex
 	inFlight   map[string]context.CancelFunc
 	knownMu    sync.RWMutex
+
+	// Steering ledger management.
+	steering *shared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *shared.RequestSerializer
 }
 
 // ---------------------------------------------------------------------------
@@ -160,8 +168,12 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 		fileAccess:       cfg.FileAccess,
 		knownAgents:      make(map[string]*guide.AgentAnnouncement),
 		pendingApprovals: make(map[string]chan ApprovalResult),
-		inFlight:         make(map[string]context.CancelFunc),
+		inFlight:          make(map[string]context.CancelFunc),
+		steering:          shared.NewSteeringManager(),
+		requestSerializer: shared.NewRequestSerializer(),
 	}
+
+	g.steering.InitLazy("guardian", cfg.ActivityPub)
 
 	g.initSkills()
 	g.initSubsystems()
@@ -185,6 +197,9 @@ func (g *Guardian) initSkills() {
 func (g *Guardian) initSubsystems() {
 	g.contentValidator = NewContentValidator(g.config.Sanitizer, g.config.InjectionScanEnabled)
 	g.healthMon = NewHealthMonitor(g.config.HealthCheckInterval, g.config.AgentTimeoutDefault, g.config.TokenBudget, g.config.CostBudget)
+	g.healthMon.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
+		shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
+	})
 	g.diffGate = NewDiffGate(g.config.Sanitizer, g.config.SuspiciousDiffPatterns)
 }
 
@@ -315,6 +330,9 @@ func (g *Guardian) SetGitSubsystems(gitBus *git.GitBus, watcher *git.StatusWatch
 		return
 	}
 	g.gitObserver = NewGitObserver(gitBus, g.config.ProtectedBranches, g.activityPub, g.requestApproval)
+	g.gitObserver.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
+		shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
+	})
 	g.gitObserver.Start()
 
 	if watcher != nil {
@@ -326,6 +344,9 @@ func (g *Guardian) SetGitSubsystems(gitBus *git.GitBus, watcher *git.StatusWatch
 			g.activityPub,
 			g.requestApproval,
 		)
+		g.checkpointMgr.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
+			shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
+		})
 		g.checkpointMgr.Start(g.runCtx)
 	}
 }
@@ -388,7 +409,10 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 	// Start git subsystems if GitBus is available.
 	if g.config.GitBus != nil {
 		g.gitObserver = NewGitObserver(g.config.GitBus, g.config.ProtectedBranches, g.activityPub, g.requestApproval)
-		g.gitObserver.Start()
+		g.gitObserver.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
+		shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
+	})
+	g.gitObserver.Start()
 
 		if g.config.GitWatcher != nil {
 			g.checkpointMgr = NewCheckpointManager(
@@ -399,6 +423,9 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 				g.activityPub,
 				g.requestApproval,
 			)
+			g.checkpointMgr.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
+				shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
+			})
 			g.checkpointMgr.Start(ctx)
 		}
 	}
@@ -420,6 +447,7 @@ func (g *Guardian) Stop() error {
 	g.running = false
 	g.runMu.Unlock()
 
+	g.steering.CloseAll()
 	g.inFlightMu.Lock()
 	inFlightCount := len(g.inFlight)
 	g.inFlightMu.Unlock()
@@ -520,10 +548,18 @@ func (g *Guardian) dispatchBusRequest(ctx context.Context, msg *guide.Message) e
 }
 
 func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Message) error {
+	if !g.requestSerializer.Acquire(ctx) {
+		return nil // parent context done, agent shutting down
+	}
+	defer g.requestSerializer.Release()
+
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
+
+	g.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	shared.LogIncomingRequest(g.steering.EventLogger(), fwd, g.id)
 
 	if g.config.RequestGuard != nil {
 		release := g.config.RequestGuard()
@@ -533,14 +569,27 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
 	g.registerInFlight(fwd.CorrelationID, cancel)
+	g.steering.RegisterCancel(fwd.CorrelationID, cancel)
 	defer g.clearInFlight(fwd.CorrelationID)
 	defer cancel()
+
+	// Create steering ledger for this request.
+	ledger := g.steering.Create(fwd.CorrelationID, g.id, fwd.SessionID, g.activityPub, nil)
+	defer g.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
+	reqCtx = shared.WithSteeringLedger(reqCtx, ledger)
+	reqCtx = shared.WithLogMeta(reqCtx, shared.LogMeta{
+		EventLogger: g.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     g.id,
+		SessionID:   fwd.SessionID,
+	})
 
 	// Publish stream start.
 	g.publishStreamStart(reqCtx, fwd.CorrelationID)
 
 	// Execute conversation.
 	result, err := g.executeConversation(reqCtx, fwd)
+	shared.LogResponse(g.steering.EventLogger(), fwd.CorrelationID, g.id, fwd.SessionID, time.Since(startTime), err)
 
 	// Build response.
 	resp := &guide.RouteResponse{
@@ -552,6 +601,11 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	}
 
 	if err != nil {
+		if lm := shared.LogMetaFromContext(reqCtx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
+		}
 		resp.Error = err.Error()
 		g.publishStreamComplete(reqCtx, fwd.CorrelationID, resp.Error, nil)
 	} else {
@@ -568,6 +622,11 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 
 func (g *Guardian) handleActionBusRequest(_ context.Context, msg *guide.Message) error {
 	g.logInfo("handleActionBusRequest", "correlation_id", msg.CorrelationID)
+	action, ok := msg.GetActionRequest()
+	if !ok || action == nil {
+		return nil
+	}
+	g.steering.HandleAction(action)
 	return nil
 }
 
@@ -609,6 +668,10 @@ func (g *Guardian) handleRegistryAnnouncement(msg *guide.Message) error {
 	g.knownMu.Lock()
 	g.knownAgents[ann.AgentID] = ann
 	g.knownMu.Unlock()
+	shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventRegistryEvent,
+		g.id, "", "", "info", &agentlog.RegistryPayload{
+			AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "registered",
+		})
 	return nil
 }
 
@@ -648,6 +711,10 @@ func (g *Guardian) requestApproval(ctx context.Context, proposal *GitMutationPro
 	}()
 
 	// Publish proposal to Guide.
+	shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalRequested,
+		g.id, "", correlationID, "info", &agentlog.DiffPayload{
+			Verdict: "pending", Reason: proposal.Reason,
+		})
 	if err := g.bus.Publish(guide.TopicGuideRequests, newProposalMessage(correlationID, proposal)); err != nil {
 		return false, fmt.Errorf("publish proposal: %w", err)
 	}
@@ -658,10 +725,26 @@ func (g *Guardian) requestApproval(ctx context.Context, proposal *GitMutationPro
 
 	select {
 	case result := <-ch:
+		action := "approved"
+		if !result.Approved {
+			action = "denied"
+		}
+		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
+			g.id, "", correlationID, "info", &agentlog.DiffPayload{
+				Verdict: action, Reason: result.Reason,
+			})
 		return result.Approved, nil
 	case <-timer.C:
+		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
+			g.id, "", correlationID, "warn", &agentlog.DiffPayload{
+				Verdict: "timeout",
+			})
 		return false, fmt.Errorf("approval timed out after %v", DefaultApprovalTTL)
 	case <-ctx.Done():
+		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
+			g.id, "", correlationID, "warn", &agentlog.DiffPayload{
+				Verdict: "cancelled",
+			})
 		return false, ctx.Err()
 	}
 }

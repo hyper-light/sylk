@@ -6,21 +6,49 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 // executeToolLoop runs the model tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
-func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Request) (string, error) {
+func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	seen := make(map[toolCallSignature]int, o.config.MaxToolRuns)
 	consecutiveErrors := 0
 
 	for turn := 0; turn <= o.config.MaxToolRuns; turn++ {
+		// ── STEERING CHECKPOINT ──
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, "orchestrating", nil)
+		if sc.Rollback != nil || sc.EditReplay != nil {
+			cp := sc.Rollback
+			if cp == nil {
+				cp = sc.EditReplay
+			}
+			req.Messages = req.Messages[:cp.MessageCount]
+			if sc.EditReplay != nil {
+				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
+			}
+			turn = cp.Turn
+			seen = make(map[toolCallSignature]int, o.config.MaxToolRuns)
+			consecutiveErrors = 0
+			continue
+		}
+		if sc.ShouldPause {
+			if err := ledger.WaitForResume(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// ── END STEERING ──
+
+		turnStart := time.Now()
 		resp, err := o.provider.Complete(ctx, req)
+		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
 			return "", fmt.Errorf("orchestrator llm: %w", err)
 		}
@@ -97,7 +125,7 @@ func (o *Orchestrator) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (o *Orchestrator) executeToolCall(_ context.Context, call providers.ToolCall) (string, error) {
+func (o *Orchestrator) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return "", fmt.Errorf("tool name is required")
@@ -111,7 +139,7 @@ func (o *Orchestrator) executeToolCall(_ context.Context, call providers.ToolCal
 		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
 
-	result := o.skills.Invoke(context.Background(), name, json.RawMessage(raw))
+	result := o.skills.Invoke(ctx, name, json.RawMessage(raw))
 	if result == nil {
 		return "", fmt.Errorf("tool %q returned nil", name)
 	}

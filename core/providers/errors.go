@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +37,13 @@ type ProviderError struct {
 	Retryable   bool
 	RetryAfter  time.Duration
 	Underlying  error
+
+	// ContextTooLarge is true when the request exceeded the model's context
+	// window. ContextUsedTokens and ContextMaxTokens provide the extracted
+	// token counts when available (zero otherwise).
+	ContextTooLarge  bool
+	ContextUsedTokens int
+	ContextMaxTokens  int
 }
 
 func (e *ProviderError) Error() string {
@@ -58,19 +67,20 @@ func (e *ProviderError) Unwrap() error {
 	return e.Underlying
 }
 
-// UserMessage returns a concise, human-readable error description suitable for
-// display in the chat panel. It extracts the nested "message" field from JSON
-// error bodies (common with Google/OpenAI APIs) and maps HTTP status codes to
-// friendly labels.
+// UserMessage returns a human-readable error description suitable for display
+// in the chat panel. It extracts structured fields from JSON error bodies
+// (common with Google/OpenAI/Anthropic APIs), maps HTTP status codes to
+// friendly labels, and preserves error type and request ID for debugging.
 func (e *ProviderError) UserMessage() string {
 	label := httpStatusLabel(e.StatusCode)
 
-	// Try to extract a human-readable message from embedded JSON.
-	if extracted := extractJSONMessage(e.Message); extracted != "" {
+	// Try to extract structured detail from embedded JSON.
+	if detail := extractJSONErrorDetail(e.Message); detail.Message != "" {
+		formatted := detail.format()
 		if label != "" {
-			return label + " — " + extracted
+			return label + " — " + formatted
 		}
-		return extracted
+		return formatted
 	}
 
 	// Strip any trailing "(status NNN)" since we include the label.
@@ -122,23 +132,128 @@ func httpStatusLabel(code int) string {
 	}
 }
 
-// extractJSONMessage finds an embedded JSON object in s and returns the
-// "error.message" field if present. Handles the common Google/OpenAI
-// envelope format: {"error":{"message":"..."}}.
-func extractJSONMessage(s string) string {
+// jsonErrorDetail holds the structured fields extracted from a provider
+// error JSON envelope. All three providers (Anthropic, Google, OpenAI)
+// use {"error":{"message":"..."}}, with additional fields varying.
+type jsonErrorDetail struct {
+	Message   string // error.message (all providers)
+	ErrorType string // error.type (Anthropic/OpenAI)
+	RequestID string // request_id (Anthropic top-level)
+}
+
+// format returns a human-readable string that includes all available detail.
+// The message is always shown; error type and request ID are appended when present.
+func (d jsonErrorDetail) format() string {
+	if d.Message == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(d.Message)
+	if d.ErrorType != "" {
+		b.WriteString(" (")
+		b.WriteString(d.ErrorType)
+		b.WriteString(")")
+	}
+	if d.RequestID != "" {
+		b.WriteString(" [")
+		b.WriteString(d.RequestID)
+		b.WriteString("]")
+	}
+	return b.String()
+}
+
+// extractJSONErrorDetail finds an embedded JSON object in s and returns the
+// structured error fields. Handles the common Google/OpenAI/Anthropic
+// envelope format: {"error":{"message":"...", "type":"..."}, "request_id":"..."}.
+// Uses json.Decoder so it tolerates trailing non-JSON text after the object.
+func extractJSONErrorDetail(s string) jsonErrorDetail {
 	idx := strings.Index(s, "{")
 	if idx < 0 {
-		return ""
+		return jsonErrorDetail{}
 	}
 	var envelope struct {
 		Error struct {
 			Message string `json:"message"`
+			Type    string `json:"type"`
 		} `json:"error"`
+		RequestID string `json:"request_id"`
 	}
-	if json.Unmarshal([]byte(s[idx:]), &envelope) == nil && envelope.Error.Message != "" {
-		return envelope.Error.Message
+	dec := json.NewDecoder(strings.NewReader(s[idx:]))
+	if dec.Decode(&envelope) == nil && envelope.Error.Message != "" {
+		return jsonErrorDetail{
+			Message:   envelope.Error.Message,
+			ErrorType: envelope.Error.Type,
+			RequestID: envelope.RequestID,
+		}
 	}
-	return ""
+	return jsonErrorDetail{}
+}
+
+// extractJSONMessage returns just the message field for callers that don't
+// need the full detail.
+func extractJSONMessage(s string) string {
+	return extractJSONErrorDetail(s).Message
+}
+
+// FriendlyErrorMessage extracts a human-readable message from any error
+// in the chain. Safe to call with any error type.
+func FriendlyErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	// 1. ProviderError — already has UserMessage().
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		return pe.UserMessage()
+	}
+
+	// 2. Anthropic SDK error — has StatusCode and structured fields.
+	var ae *anthropic.Error
+	if errors.As(err, &ae) {
+		label := httpStatusLabel(ae.StatusCode)
+		if detail := extractJSONErrorDetail(ae.Error()); detail.Message != "" {
+			formatted := detail.format()
+			if label != "" {
+				return label + " — " + formatted
+			}
+			return formatted
+		}
+		if label != "" {
+			return label
+		}
+	}
+
+	// 3. Scan raw text for embedded JSON error envelope.
+	raw := err.Error()
+	if detail := extractJSONErrorDetail(raw); detail.Message != "" {
+		return detail.format()
+	}
+
+	// 4. Strip internal wrapping prefixes for a cleaner fallback.
+	return cleanErrorPrefixes(raw)
+}
+
+// cleanErrorPrefixes strips internal wrapping prefixes like
+// "planning protocol: architect llm: anthropic stream: " that are
+// meaningless to users.
+func cleanErrorPrefixes(s string) string {
+	prefixes := []string{
+		"planning protocol: ",
+		"architect llm: ",
+		"architect planner: ",
+		"anthropic stream: ",
+		"received error while streaming: ",
+	}
+	cleaned := s
+	for _, p := range prefixes {
+		cleaned = strings.TrimPrefix(cleaned, p)
+	}
+	// Strip the "(conversation unavailable: ...)" suffix.
+	if idx := strings.Index(cleaned, " (conversation unavailable:"); idx > 0 {
+		cleaned = cleaned[:idx]
+	}
+	return strings.TrimSpace(cleaned)
 }
 
 // Is implements errors.Is for common error types
@@ -176,6 +291,12 @@ func (e *ProviderError) parseError(err error) {
 	if errors.As(err, &anthropicErr) {
 		e.StatusCode = anthropicErr.StatusCode
 		e.Retryable = isRetryableHTTPStatus(anthropicErr.StatusCode)
+		if anthropicErr.Response != nil {
+			if d, ok := parseRetryAfterHeader(anthropicErr.Response.Header); ok {
+				e.RetryAfter = d
+			}
+		}
+		parseContextTooLarge(e.Message, e)
 		return
 	}
 	var netErr net.Error
@@ -212,4 +333,45 @@ func WrapError(provider ProviderType, operation string, err error) error {
 	}
 
 	return NewProviderError(provider, operation, err)
+}
+
+// googleContextPattern matches Google API error messages reporting input token
+// count exceeding the model's maximum. Captures the used and max token counts.
+var googleContextPattern = regexp.MustCompile(
+	`(?i)input token count[:\s]+(\d+).*?exceed[s]?.*?maximum[:\s]+(\d+)`,
+)
+
+// anthropicContextPattern matches Anthropic API error messages reporting
+// prompt length exceeding the model's context window. Example:
+// "prompt is too long: 123456 tokens > 100000 maximum"
+var anthropicContextPattern = regexp.MustCompile(
+	`(?i)prompt is too long[:\s]+(\d+)\s+tokens?\s*>\s*(\d+)`,
+)
+
+// parseContextTooLarge checks an error message for context window overflow
+// and populates the ProviderError fields when detected. Checks both Google
+// and Anthropic error message formats.
+func parseContextTooLarge(message string, pe *ProviderError) {
+	if matches := googleContextPattern.FindStringSubmatch(message); matches != nil {
+		pe.ContextTooLarge = true
+		pe.ContextUsedTokens, _ = strconv.Atoi(matches[1])
+		pe.ContextMaxTokens, _ = strconv.Atoi(matches[2])
+		return
+	}
+	if matches := anthropicContextPattern.FindStringSubmatch(message); matches != nil {
+		pe.ContextTooLarge = true
+		pe.ContextUsedTokens, _ = strconv.Atoi(matches[1])
+		pe.ContextMaxTokens, _ = strconv.Atoi(matches[2])
+		return
+	}
+}
+
+// IsContextTooLarge returns true if the error chain contains a ProviderError
+// with the ContextTooLarge flag set.
+func IsContextTooLarge(err error) bool {
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		return pe.ContextTooLarge
+	}
+	return false
 }

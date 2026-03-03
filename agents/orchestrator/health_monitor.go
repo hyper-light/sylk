@@ -229,22 +229,66 @@ func (m *HealthMonitor) checkTaskTimeout(agentID string, metrics *AgentHealthMet
 	}
 
 	for _, task := range m.orchestrator.state.Tasks {
-		if task.AssignedAgentID != agentID {
+		if task.AssignedAgentID != agentID && task.StageAgentID != agentID {
 			continue
 		}
-		if task.Status != TaskStatusRunning {
-			continue
-		}
-		if task.StartedAt == nil {
+		if task.Status.IsTerminal() {
 			continue
 		}
 
-		elapsed := now.Sub(*task.StartedAt)
+		// Stage-aware timeout: use stage start time if available.
+		startTime := task.StartedAt
+		if task.StageStartedAt != nil {
+			startTime = task.StageStartedAt
+		}
+		if startTime == nil {
+			continue
+		}
+
+		// Check queued tasks (no ACK received yet).
+		if task.Status == TaskStatusQueued {
+			elapsed := now.Sub(*startTime)
+			if elapsed > m.config.TaskTimeout {
+				m.createAlert(agentID, AlertTypeTimeout, HealthLevelUnhealthy,
+					"Task stuck in queue (no ACK): "+task.ID)
+				metrics.TimedOutTasks++
+			}
+			continue
+		}
+
+		// Running tasks
+		elapsed := now.Sub(*startTime)
 		if elapsed > m.config.TaskTimeout {
+			stageInfo := ""
+			if task.PipelineStage != "" {
+				stageInfo = " (stage: " + task.PipelineStage + ")"
+			}
 			m.createAlert(agentID, AlertTypeTimeout, HealthLevelUnhealthy,
-				"Task timed out: "+task.ID)
+				"Task timed out: "+task.ID+stageInfo)
 			metrics.TimedOutTasks++
 		}
+	}
+}
+
+// RecordStageTransition records the transition of a task from one pipeline
+// stage to the next. Decrements ActiveTasks on the completing agent and
+// increments on the next.
+func (m *HealthMonitor) RecordStageTransition(fromAgentID, toAgentID, taskID, stage string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if fromMetrics, ok := m.agents[fromAgentID]; ok {
+		if fromMetrics.ActiveTasks > 0 {
+			fromMetrics.ActiveTasks--
+		}
+		fromMetrics.CompletedTasks++
+		fromMetrics.LastSeen = time.Now()
+	}
+
+	if toMetrics, ok := m.agents[toAgentID]; ok {
+		toMetrics.ActiveTasks++
+		toMetrics.TotalRequests++
+		toMetrics.LastSeen = time.Now()
 	}
 }
 

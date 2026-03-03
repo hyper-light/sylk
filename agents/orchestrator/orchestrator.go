@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,6 +101,18 @@ type Orchestrator struct {
 	logWAL io.Closer
 
 	mu sync.RWMutex
+
+	// Request lifecycle: runCtx is cancelled in Stop() and serves as parent
+	// for per-request contexts, enabling graceful cancellation.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	// Steering ledger management.
+	steering *shared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *shared.RequestSerializer
 }
 
 // logInfo logs at Info level, safe to call when o.logger is nil.
@@ -147,6 +160,8 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		sessionVFS:  make(map[string]*versioning.SessionVFS),
 		logger:      logger,
 		logWAL:      logCloser,
+		steering:          shared.NewSteeringManager(),
+		requestSerializer: shared.NewRequestSerializer(),
 	}
 
 	if provider != nil {
@@ -171,6 +186,10 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		if err := o.initDataPlane(cfg, sd, activityPub); err != nil {
 			return nil, err
 		}
+		o.steering.InitLazy("orchestrator", activityPub)
+		// Orchestrator has SylkDir at construction — pre-bind using legacy path
+		// until session binding occurs on first request.
+		o.steering.InitJournal("orchestrator", activityPub, sd.AgentSteeringPath("orchestrator"))
 	}
 
 	o.registerCoreSkills()
@@ -337,6 +356,9 @@ func (o *Orchestrator) SetRegistrar(fn PipelineRegistrar) {
 	if o.logger != nil {
 		o.dagBridge.SetLogger(o.logger)
 	}
+	if o.steering != nil {
+		o.dagBridge.SetEventLogger(o.steering.EventLogger())
+	}
 }
 
 // SetSessionVFS associates a SessionVFS with the given session. Called when
@@ -422,6 +444,7 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 
 	o.bus = bus
 	o.channels = guide.NewAgentChannels(o.config.AgentID, o.config.AgentID)
+	o.runCtx, o.runCancel = context.WithCancel(context.Background())
 
 	var err error
 	o.requestSub, err = bus.SubscribeAsync(o.channels.Requests, o.handleBusRequest)
@@ -523,6 +546,13 @@ func (o *Orchestrator) Stop() error {
 	o.running = false
 	llmCancel := o.llmCancel
 	o.mu.Unlock()
+
+	o.steering.CloseAll()
+
+	// Cancel the request lifecycle context so in-flight requests unwind.
+	if o.runCancel != nil {
+		o.runCancel()
+	}
 
 	// Cancel the LLM loop context and wait for the goroutine to finish.
 	// This must happen outside o.mu because the LLM loop acquires RLock
@@ -712,16 +742,49 @@ func (o *Orchestrator) queryFailurePatterns(ctx context.Context, entities *guide
 
 // handleBusRequest processes incoming requests from the event bus
 func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
+	if msg.Type == guide.MessageTypeAction {
+		action, ok := msg.GetActionRequest()
+		if ok && action != nil {
+			o.steering.HandleAction(action)
+		}
+		return nil
+	}
 	if msg.Type != guide.MessageTypeForward {
 		return nil
 	}
+
+	if !o.requestSerializer.Acquire(o.runCtx) {
+		return nil // runCtx cancelled, agent shutting down
+	}
+	defer o.requestSerializer.Release()
 
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	ctx := context.Background()
+	o.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	shared.LogIncomingRequest(o.steering.EventLogger(), fwd, o.config.AgentID)
+
+	reqCtx, cancel := context.WithCancel(o.runCtx)
+	cancelEntry := o.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	defer cancel()
+
+	// Cascading cancel: when this request is interrupted, cancel all
+	// in-flight pipeline agents and running DAGs.
+	cancelEntry.AddHook(func() {
+		o.mu.RLock()
+		router := o.taskRouter
+		o.mu.RUnlock()
+		if router != nil {
+			router.CancelAllPending("request interrupted")
+		}
+		if o.dagBridge != nil {
+			o.dagBridge.CancelAll("request interrupted")
+		}
+	})
+
+	ctx := reqCtx
 	startTime := time.Now()
 
 	o.logInfo("handleBusRequest: received",
@@ -740,6 +803,17 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	toolEmitter := shared.NewToolCallEmitter(o.bus, o.channels, "orchestrator", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = shared.WithToolCallEmitter(ctx, toolEmitter)
 
+	// Create steering ledger for this request.
+	ledger := o.steering.Create(fwd.CorrelationID, o.config.AgentID, fwd.SessionID, o.activityPub, nil)
+	defer o.steering.Close(fwd.CorrelationID, ctx.Err() != nil)
+	ctx = shared.WithSteeringLedger(ctx, ledger)
+	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
+		EventLogger: o.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     o.config.AgentID,
+		SessionID:   fwd.SessionID,
+	})
+
 	if !fwd.FireAndForget {
 		o.logInfo("handleBusRequest: publishing StreamStart",
 			"correlation_id", fwd.CorrelationID)
@@ -747,6 +821,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	}
 
 	result, err := o.Handle(ctx, fwd)
+	shared.LogResponse(o.steering.EventLogger(), fwd.CorrelationID, o.config.AgentID, fwd.SessionID, time.Since(startTime), err)
 
 	o.logInfo("handleBusRequest: Handle returned",
 		"correlation_id", fwd.CorrelationID,
@@ -869,21 +944,59 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	parentResults, _ := data["parent_results"].(map[string]any)
 	dagID, _ := data["dag_id"].(string)
 
+	// Propagate dispatch-protocol keys into node context so they flow
+	// through TaskRouter → Guide → ForwardedRequest.Metadata → agent.
+	// dag_id and node_id are needed by pipeline agents to include
+	// pipeline_id in their activity events for TUI panel grouping.
+	if nodeCtx == nil {
+		nodeCtx = make(map[string]any)
+	}
+	if ackTopic, ok := data["ack_topic"].(string); ok && ackTopic != "" {
+		nodeCtx["ack_topic"] = ackTopic
+	}
+	if dagID != "" {
+		nodeCtx["dag_id"] = dagID
+	}
+	if nodeID != "" {
+		nodeCtx["node_id"] = nodeID
+	}
+
 	now := time.Now()
+
+	// Extract pipeline stage from sub-node context if present.
+	pipelineStage := ""
+	pipelineParentID := ""
+	if nodeCtx != nil {
+		if stage, ok := nodeCtx["pipeline_stage"].(string); ok {
+			pipelineStage = stage
+		}
+		if parentID, ok := nodeCtx["pipeline_parent_id"].(string); ok {
+			pipelineParentID = parentID
+		}
+	}
+
+	// Task starts as Queued — transitions to Running when ACK arrives.
+	initialStatus := TaskStatusQueued
+	if agentID != "" {
+		initialStatus = TaskStatusRunning
+	}
+
 	task := &TaskRecord{
-		ID:              taskID,
-		WorkflowID:      workflowID,
-		Name:            name,
-		Status:          TaskStatusRunning,
-		AssignedAgentID: agentID,
-		AssignedAt:      &now,
-		CreatedAt:       now,
-		StartedAt:       &now,
-		SessionID:       o.config.SessionID,
+		ID:               taskID,
+		WorkflowID:       workflowID,
+		Name:             name,
+		Status:           initialStatus,
+		AssignedAgentID:  agentID,
+		AssignedAt:       &now,
+		CreatedAt:        now,
+		StartedAt:        &now,
+		SessionID:        o.config.SessionID,
+		PipelineStage:    pipelineStage,
+		PipelineParentID: pipelineParentID,
 	}
 
 	o.state.Tasks[taskID] = task
-	o.healthMonitor.RecordTaskStart(agentID, taskID)
+	o.healthMonitor.RecordTaskStart(agentType, taskID)
 
 	if workflowID != "" {
 		if wf, ok := o.state.Workflows[workflowID]; ok {
@@ -903,19 +1016,28 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	})
 
 	// Publish pipeline agent activity so the TUI panel shows ALL pipeline agents.
+	// Dispatched agents (primary + co-agents) get AgentAction (active work).
+	// Remaining pipeline agents get AgentRegistered (present but idle).
 	if nodeID != "" && agentType != "" {
+		dispatched := make(map[string]struct{})
+
 		o.publishPipelineAgentActivity(agentType, dagID, nodeID, taskID)
+		dispatched[agentType] = struct{}{}
 
 		if coAgents, ok := data["co_agents"].([]any); ok {
 			for _, co := range coAgents {
 				if coType, ok := co.(string); ok {
 					o.publishPipelineAgentActivity(coType, dagID, nodeID, taskID)
+					dispatched[coType] = struct{}{}
 				}
 			}
 		}
 
-		o.publishPipelineAgentActivity("inspector-pipeline", dagID, nodeID, taskID)
-		o.publishPipelineAgentActivity("tester-pipeline", dagID, nodeID, taskID)
+		for _, pipelineType := range pipelineAgentTypes {
+			if _, active := dispatched[pipelineType]; !active {
+				o.publishPipelineAgentRegistration(pipelineType, dagID)
+			}
+		}
 	}
 
 	// Route to containerized pipeline agent for DAG-originated dispatches.
@@ -1440,6 +1562,14 @@ func (o *Orchestrator) publishActivity(eventType events.EventType, content strin
 	o.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
 }
 
+// pipelineAgentDisplayNames maps agent type strings to their user-facing names.
+var pipelineAgentDisplayNames = map[string]string{
+	"engineer":           "Engineer",
+	"designer":           "Designer",
+	"inspector-pipeline": "Inspector",
+	"tester-pipeline":    "Tester",
+}
+
 // publishPipelineAgentActivity publishes an activity event for a pipeline
 // agent so the TUI's ensureAgent creates a panel entry. Uses agentType as
 // AgentID so one entry per agent type (not per dispatch).
@@ -1447,15 +1577,40 @@ func (o *Orchestrator) publishPipelineAgentActivity(agentType, dagID, nodeID, ta
 	if o.activityPub == nil {
 		return
 	}
+	displayName := pipelineAgentDisplayNames[agentType]
+	if displayName == "" {
+		displayName = agentType
+	}
 	evt := events.NewActivityEvent(events.EventTypeAgentAction, o.config.SessionID,
 		fmt.Sprintf("Processing pipeline task: %s", nodeID))
 	evt.AgentID = agentType
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = agentType
-	evt.Data["agent_name"] = agentType
+	evt.Data["agent_name"] = displayName
 	evt.Data["pipeline_id"] = dagID
 	evt.Data["node_id"] = nodeID
 	evt.Data["task_id"] = taskID
+	o.activityPub.PublishActivity(evt)
+}
+
+// publishPipelineAgentRegistration publishes a registration event for a
+// pipeline agent that is present but not yet dispatched. Uses
+// EventTypeAgentRegistered so the TUI shows the agent as waiting (not active).
+func (o *Orchestrator) publishPipelineAgentRegistration(agentType, dagID string) {
+	if o.activityPub == nil {
+		return
+	}
+	displayName := pipelineAgentDisplayNames[agentType]
+	if displayName == "" {
+		displayName = agentType
+	}
+	evt := events.NewActivityEvent(events.EventTypeAgentRegistered, o.config.SessionID,
+		fmt.Sprintf("Pipeline agent registered: %s", agentType))
+	evt.AgentID = agentType
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = agentType
+	evt.Data["agent_name"] = displayName
+	evt.Data["pipeline_id"] = dagID
 	o.activityPub.PublishActivity(evt)
 }
 
@@ -1718,7 +1873,7 @@ func (o *Orchestrator) handleDAGExecuteRequest(msg *guide.Message) error {
 		return nil
 	}
 
-	dagID, err := o.dagBridge.Execute(context.Background(), d, planID, o.config.SessionID)
+	dagID, err := o.dagBridge.Execute(o.runCtx, d, planID, o.config.SessionID)
 	if err != nil {
 		o.publishActivity(events.EventTypeAgentError, "DAG execution failed: "+err.Error())
 		return nil

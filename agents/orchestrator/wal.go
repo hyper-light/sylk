@@ -141,6 +141,41 @@ func (j *OrchestratorJournal) LogDAGModify(dagID string, revision int, diffJSON 
 	return err
 }
 
+// LogNodeAcked records that an agent acknowledged a dispatched node.
+func (j *OrchestratorJournal) LogNodeAcked(dagID, nodeID, agentID string) error {
+	_, err := j.journal.AppendJSON(agentlog.EventNodeAcked, &dagWALPayload{
+		DAGID:   dagID,
+		NodeID:  nodeID,
+		State:   "acked",
+		Payload: agentID,
+	})
+	return err
+}
+
+// LogPipelineExpanded records that a node was expanded into a sub-DAG.
+func (j *OrchestratorJournal) LogPipelineExpanded(dagID, parentNodeID string, subNodeIDs []string) error {
+	payload, _ := json.Marshal(subNodeIDs)
+	_, err := j.journal.AppendJSON(agentlog.EventPipelineExpanded, &dagWALPayload{
+		DAGID:   dagID,
+		NodeID:  parentNodeID,
+		State:   "expanded",
+		Payload: string(payload),
+	})
+	return err
+}
+
+// LogStageTransition records a pipeline stage change for a node.
+func (j *OrchestratorJournal) LogStageTransition(dagID, nodeID, fromStage, toStage string) error {
+	payload, _ := json.Marshal(map[string]string{"from": fromStage, "to": toStage})
+	_, err := j.journal.AppendJSON(agentlog.EventStageTransition, &dagWALPayload{
+		DAGID:   dagID,
+		NodeID:  nodeID,
+		State:   toStage,
+		Payload: string(payload),
+	})
+	return err
+}
+
 // LogDAGCancel records a DAG cancellation.
 func (j *OrchestratorJournal) LogDAGCancel(dagID, reason string) error {
 	_, err := j.journal.AppendJSON(agentlog.EventDAGCancelled, &dagWALPayload{

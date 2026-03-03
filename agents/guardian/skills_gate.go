@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -21,18 +23,27 @@ type reviewGateInput struct {
 func reviewGateSkill(g *Guardian) *skills.Skill {
 	type handler = func(context.Context, *reviewGateInput) (any, error)
 	dispatch := map[string]handler{
-		"review_diff": func(_ context.Context, p *reviewGateInput) (any, error) {
+		"review_diff": func(ctx context.Context, p *reviewGateInput) (any, error) {
 			if p.DiffContent == "" {
 				return nil, fmt.Errorf("diff_content is required for review_diff")
 			}
 			result := g.diffGate.ReviewDiff(p.DiffContent)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				verdict := "clean"
+				if !result.Clean {
+					verdict = "suspicious"
+				}
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventDiffReviewed,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.DiffPayload{Verdict: verdict, Reason: fmt.Sprintf("%d findings", len(result.Findings))})
+			}
 			return map[string]any{
 				"clean":    result.Clean,
 				"findings": result.Findings,
 				"stats":    result.Stats,
 			}, nil
 		},
-		"pre_commit_check": func(_ context.Context, p *reviewGateInput) (any, error) {
+		"pre_commit_check": func(ctx context.Context, p *reviewGateInput) (any, error) {
 			if p.DiffContent == "" {
 				return nil, fmt.Errorf("diff_content is required for pre_commit_check")
 			}
@@ -48,6 +59,15 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 				return string(data), nil
 			}
 			result := g.diffGate.PreCommitCheck(p.DiffContent, p.Paths, readFile)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				evt := agentlog.EventDiffApproved
+				if !result.Clean {
+					evt = agentlog.EventDiffRejected
+				}
+				shared.LogAgentEvent(lm.EventLogger, evt,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.DiffPayload{Verdict: fmt.Sprintf("%d findings", len(result.Findings))})
+			}
 			return map[string]any{
 				"clean":         result.Clean,
 				"findings":      result.Findings,

@@ -53,8 +53,9 @@ type TaskRouter struct {
 
 // pendingRoute tracks a dispatched task awaiting a Guide-routed response.
 type pendingRoute struct {
-	task *PipelineTask
-	ch   chan *guide.Message
+	task   *PipelineTask
+	ch     chan *guide.Message
+	closed bool // set by CancelAllPending before closing ch
 }
 
 // NewTaskRouter creates a TaskRouter that routes tasks through the Guide.
@@ -101,6 +102,7 @@ func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}
 		SourceAgentName: "orchestrator",
 		SessionID:      task.SessionID,
 		Timestamp:      time.Now(),
+		Metadata:       extractDispatchMetadata(task.Context),
 	}
 
 	msg := guide.NewRequestMessage(generateMessageID(), req)
@@ -143,12 +145,14 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 
 	r.pendingMu.Lock()
 	pr := r.pending[msg.CorrelationID]
-	r.pendingMu.Unlock()
-
-	if pr == nil {
-		r.logger.Warn("response has no pending route", "correlation_id", msg.CorrelationID)
-		return false
+	if pr == nil || pr.closed {
+		r.pendingMu.Unlock()
+		if pr == nil {
+			r.logger.Warn("response has no pending route", "correlation_id", msg.CorrelationID)
+		}
+		return pr != nil
 	}
+	r.pendingMu.Unlock()
 
 	select {
 	case pr.ch <- msg:
@@ -160,6 +164,10 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 // handleRouteResponse extracts the pipeline agent's result from the
 // Guide-correlated RouteResponse and publishes a PipelineUpdate.
 func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message) {
+	if msg == nil {
+		r.publishFailure(task, fmt.Errorf("route cancelled for node %s", task.NodeID))
+		return
+	}
 	resp, ok := msg.GetRouteResponse()
 	if !ok || resp == nil {
 		r.publishFailure(task, fmt.Errorf("invalid route response for node %s", task.NodeID))
@@ -171,6 +179,57 @@ func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message)
 	}
 
 	r.publishSucceeded(task, resp.Data)
+}
+
+// CancelAllPending cancels all in-flight pipeline routes by publishing a
+// cancel action for each pending correlation and closing the response
+// channels to unblock waiting goroutines. Called by the DAGBridge when
+// the parent request is interrupted.
+func (r *TaskRouter) CancelAllPending(reason string) {
+	// Mark all pending routes as closed under lock, then close channels
+	// and publish cancel actions outside the lock. The closed flag prevents
+	// DeliverResponse from sending on a closed channel.
+	r.pendingMu.Lock()
+	snapshot := make(map[string]*pendingRoute, len(r.pending))
+	for corrID, pr := range r.pending {
+		pr.closed = true
+		snapshot[corrID] = pr
+	}
+	r.pendingMu.Unlock()
+
+	for corrID, pr := range snapshot {
+		r.logger.Info("CancelAllPending: cancelling pipeline route",
+			"correlation_id", corrID,
+			"agent_type", pr.task.AgentType,
+			"node_id", pr.task.NodeID,
+			"reason", reason)
+
+		// Publish a cancel action to the Guide so it forwards the
+		// interrupt to the pipeline agent.
+		action := &guide.ActionRequest{
+			CorrelationID: corrID,
+			SourceAgentID: r.agentID,
+			TargetAgentID: pr.task.AgentType,
+			Action:        "cancel",
+			Data: map[string]any{
+				"correlation_id": corrID,
+				"session_id":     pr.task.SessionID,
+				"reason":         reason,
+			},
+			FireAndForget: true,
+			Timestamp:     time.Now(),
+		}
+		msg := guide.NewActionMessage(generateMessageID(), action)
+		if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+			r.logger.Warn("CancelAllPending: publish cancel failed",
+				"correlation_id", corrID, "error", err)
+		}
+
+		// Close the response channel to unblock the waiting goroutine.
+		// A closed channel returns the zero value, which handleRouteResponse
+		// treats as a nil message (route cancelled).
+		close(pr.ch)
+	}
 }
 
 // --- pending registration ---
@@ -228,6 +287,29 @@ func (r *TaskRouter) publishPipelineUpdate(task *PipelineTask, status string, ou
 	}
 }
 
+// extractDispatchMetadata extracts dispatch-protocol keys (e.g. ack_topic)
+// from the task context and returns them as RouteRequest.Metadata so the
+// Guide merges them into ForwardedRequest.Metadata for the target agent.
+func extractDispatchMetadata(ctx map[string]any) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	meta := make(map[string]any, 3)
+	if ackTopic, _ := ctx["ack_topic"].(string); ackTopic != "" {
+		meta["ack_topic"] = ackTopic
+	}
+	if dagID, _ := ctx["dag_id"].(string); dagID != "" {
+		meta["dag_id"] = dagID
+	}
+	if nodeID, _ := ctx["node_id"].(string); nodeID != "" {
+		meta["node_id"] = nodeID
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	return meta
+}
+
 // --- encoding ---
 
 // encodeTaskInput serializes the pipeline task as the RouteRequest Input string.
@@ -272,6 +354,7 @@ func (r *TaskRouter) RouteCompound(ctx context.Context, task *CompoundPipelineTa
 		SourceAgentName: "orchestrator",
 		SessionID:       task.SessionID,
 		Timestamp:       time.Now(),
+		Metadata:        extractDispatchMetadata(task.Context),
 	}
 	msg := guide.NewRequestMessage(generateMessageID(), req)
 	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
@@ -284,6 +367,16 @@ func (r *TaskRouter) RouteCompound(ctx context.Context, task *CompoundPipelineTa
 	case primaryMsg = <-primaryCh:
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+
+	if primaryMsg == nil {
+		return &dag.CompoundNodeResult{
+			PrimaryResult: &dag.NodeResult{
+				NodeID: task.NodeID,
+				State:  dag.NodeStateFailed,
+				Error:  fmt.Errorf("primary agent route cancelled"),
+			},
+		}, fmt.Errorf("compound primary: route cancelled")
 	}
 
 	resp, ok := primaryMsg.GetRouteResponse()
@@ -392,6 +485,9 @@ func (r *TaskRouter) routeCoAgent(
 
 	select {
 	case respMsg := <-ch:
+		if respMsg == nil {
+			return &dag.NodeResult{State: dag.NodeStateFailed, Error: fmt.Errorf("co-agent route cancelled")}, nil
+		}
 		coResp, ok := respMsg.GetRouteResponse()
 		if !ok || coResp == nil {
 			return &dag.NodeResult{State: dag.NodeStateFailed, Error: fmt.Errorf("invalid co-agent response")}, nil

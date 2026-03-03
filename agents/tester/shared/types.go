@@ -52,14 +52,6 @@ const (
 	RiskStyleInconsistency RiskCategory = "style_inconsistency"
 )
 
-// InspectorGate tracks Inspector completion before testing begins.
-// Both tester variants gate on this — they NEVER run until Inspector passes.
-type InspectorGate struct {
-	Passed    bool      `json:"passed"`
-	Timestamp time.Time `json:"timestamp"`
-	ResultRef string    `json:"result_ref,omitempty"`
-}
-
 // TestPlan represents a deliberate testing strategy with rationale.
 type TestPlan struct {
 	ID          string            `json:"id"`
@@ -203,7 +195,6 @@ func DefaultGlobalTesterConfig() GlobalTesterConfig {
 type ProtocolPhase string
 
 const (
-	PhaseGateInspector      ProtocolPhase = "gate_inspector"
 	PhaseAnalyzeRisks       ProtocolPhase = "analyze_risks"
 	PhasePlanTests          ProtocolPhase = "plan_tests"
 	PhaseImplementTests     ProtocolPhase = "implement_tests"

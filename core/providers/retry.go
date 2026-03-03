@@ -70,7 +70,7 @@ func retryGenerate(ctx context.Context, cfg BaseConfig, fn func(context.Context)
 		if !shouldRetryProviderCall(ctx, err, attempt, maxAttempts) {
 			break
 		}
-		delay := retryDelay(attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+		delay := serverGuidedDelay(err, attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     attempt + 1,
 			MaxAttempts: maxAttempts,
@@ -97,7 +97,7 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 		if !shouldRetryProviderCall(ctx, err, attempt, maxAttempts) {
 			break
 		}
-		delay := retryDelay(attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
+		delay := serverGuidedDelay(err, attempt, cfg.RetryBaseDelay, cfg.RetryMaxDelay)
 		notifyRetryObserver(ctx, RetryEvent{
 			Attempt:     attempt + 1,
 			MaxAttempts: maxAttempts,
@@ -109,6 +109,20 @@ func retryStream(ctx context.Context, cfg BaseConfig, fn func(context.Context) e
 		}
 	}
 	return lastErr
+}
+
+// serverGuidedDelay returns the retry delay for an attempt, honoring the
+// server's Retry-After when available. The delay is max(exponential backoff,
+// server hint), ensuring we never undercut the server's guidance. This makes
+// all providers (Anthropic, Google, OpenAI) benefit from server-guided
+// backoff through the generic retry path.
+func serverGuidedDelay(err error, attempt int, baseDelay, maxDelay time.Duration) time.Duration {
+	computed := retryDelay(attempt, baseDelay, maxDelay)
+	serverHint := GetRetryAfter(err)
+	if serverHint > computed {
+		return serverHint
+	}
+	return computed
 }
 
 // retryAwareHandler wraps a StreamHandler so that when a provider retry

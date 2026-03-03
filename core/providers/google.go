@@ -220,6 +220,9 @@ func buildGoogleProviderError(operation string, err error) error {
 		}
 	}
 
+	// Detect context window overflow from the error message.
+	parseContextTooLarge(msg, providerErr)
+
 	return providerErr
 }
 
@@ -410,6 +413,7 @@ type googleServiceAccountFileCache struct {
 
 var googleServiceAccountCache googleServiceAccountFileCache
 var googleProviderAPIKeyResolver = resolveGoogleProviderAPIKey
+var googleServiceAccountJSONResolver = resolveGoogleServiceAccountJSON
 
 // NewGoogleProvider creates a new Google provider with the given configuration
 func NewGoogleProvider(ctx context.Context, config GoogleConfig, skills ...skills.Skill) (*GoogleProvider, error) {
@@ -855,7 +859,7 @@ func hydrateGoogleServiceAccountConfig(config *GoogleConfig) error {
 	if config == nil {
 		return fmt.Errorf("google config is nil")
 	}
-	payload, err := resolveGoogleServiceAccountJSON()
+	payload, err := googleServiceAccountJSONResolver()
 	if err != nil {
 		return err
 	}
@@ -1328,7 +1332,7 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 	}
 
 	var chunkIndex int
-	var totalInputTokens, totalOutputTokens int
+	var totalInputTokens, totalOutputTokens, totalReasoningTokens, totalCacheReadTokens int
 	var emittedEarlyUsage bool
 	var stopReason StopReason
 	toolCallsSeen := map[googleToolCallKey]bool{}
@@ -1405,6 +1409,8 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 		if resp.UsageMetadata != nil {
 			totalInputTokens = int(resp.UsageMetadata.PromptTokenCount)
 			totalOutputTokens = int(resp.UsageMetadata.CandidatesTokenCount)
+			totalReasoningTokens = int(resp.UsageMetadata.ThoughtsTokenCount)
+			totalCacheReadTokens = int(resp.UsageMetadata.CachedContentTokenCount)
 			if !emittedEarlyUsage && totalInputTokens > 0 {
 				emittedEarlyUsage = true
 				handler(&StreamChunk{
@@ -1415,20 +1421,16 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 				})
 			}
 		}
-		if len(resp.Candidates) > 0 {
-			switch resp.Candidates[0].FinishReason {
-			case genai.FinishReasonStop:
-				stopReason = StopReasonEndTurn
-			case genai.FinishReasonMaxTokens:
-				stopReason = StopReasonMaxTokens
-			case genai.FinishReasonSafety:
-				stopReason = StopReasonError
-			}
+		if len(resp.Candidates) > 0 && resp.Candidates[0].FinishReason != "" {
+			stopReason = googleFinishReason(
+				resp.Candidates[0].FinishReason,
+				len(toolCallsSeen) > 0,
+			)
 		}
 	}
 
 	if stopReason == "" {
-		stopReason = StopReasonEndTurn
+		stopReason = googleFinishReason("", len(toolCallsSeen) > 0)
 	}
 
 	return handler(&StreamChunk{
@@ -1436,9 +1438,11 @@ func (g *GoogleProvider) streamWithHandlerOnce(ctx context.Context, req *Request
 		Type:       ChunkTypeEnd,
 		StopReason: stopReason,
 		Usage: &Usage{
-			InputTokens:  totalInputTokens,
-			OutputTokens: totalOutputTokens,
-			TotalTokens:  totalInputTokens + totalOutputTokens,
+			InputTokens:     totalInputTokens,
+			OutputTokens:    totalOutputTokens,
+			TotalTokens:     totalInputTokens + totalOutputTokens,
+			ReasoningTokens: totalReasoningTokens,
+			CacheReadTokens: totalCacheReadTokens,
 		},
 		Timestamp: time.Now(),
 	})
@@ -1545,6 +1549,16 @@ func (g *GoogleProvider) buildGenerateConfig(req *Request) *genai.GenerateConten
 		config.TopK = &topK
 	}
 
+	if req.FrequencyPenalty != nil {
+		fp := float32(*req.FrequencyPenalty)
+		config.FrequencyPenalty = &fp
+	}
+
+	if req.PresencePenalty != nil {
+		pp := float32(*req.PresencePenalty)
+		config.PresencePenalty = &pp
+	}
+
 	if len(req.StopSequences) > 0 {
 		config.StopSequences = req.StopSequences
 	}
@@ -1581,28 +1595,37 @@ func combineGoogleSystemPrompts(configPrompt string, requestPrompt string) strin
 
 // googleToolConfig maps provider-agnostic ToolChoice to genai.ToolConfig.
 // Returns nil when no explicit mode is requested (provider default applies).
+// When toolChoice is a function name (not auto/any/none), forces the model
+// to call that specific function via AllowedFunctionNames.
 func googleToolConfig(toolChoice string) *genai.ToolConfig {
-	mode := googleFunctionCallingMode(toolChoice)
-	if mode == "" {
-		return nil
-	}
-	return &genai.ToolConfig{
-		FunctionCallingConfig: &genai.FunctionCallingConfig{
-			Mode: mode,
-		},
-	}
-}
-
-func googleFunctionCallingMode(toolChoice string) genai.FunctionCallingConfigMode {
-	switch strings.ToLower(strings.TrimSpace(toolChoice)) {
-	case "auto":
-		return genai.FunctionCallingConfigModeAuto
+	normalized := strings.ToLower(strings.TrimSpace(toolChoice))
+	switch normalized {
+	case "", "auto":
+		return &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode: genai.FunctionCallingConfigModeAuto,
+			},
+		}
 	case "any":
-		return genai.FunctionCallingConfigModeAny
+		return &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode: genai.FunctionCallingConfigModeAny,
+			},
+		}
 	case "none":
-		return genai.FunctionCallingConfigModeNone
+		return &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode: genai.FunctionCallingConfigModeNone,
+			},
+		}
 	default:
-		return ""
+		// Treat as a specific function name.
+		return &genai.ToolConfig{
+			FunctionCallingConfig: &genai.FunctionCallingConfig{
+				Mode:                 genai.FunctionCallingConfigModeAny,
+				AllowedFunctionNames: []string{toolChoice},
+			},
+		}
 	}
 }
 
@@ -1621,11 +1644,15 @@ func googleThinkingLevel(reasoningEffort string) genai.ThinkingLevel {
 
 // extractGoogleRawContent returns the first candidate's Content from a
 // GenerateContentResponse. This preserves thought parts with their signatures.
-func extractGoogleRawContent(resp *genai.GenerateContentResponse) *genai.Content {
-	if resp == nil || len(resp.Candidates) == 0 {
+// extractGoogleRawContent returns a serializable snapshot of the first
+// candidate's content. The snapshot preserves thought signatures and
+// function calls so they survive JSON round-trips (WAL, session persistence).
+func extractGoogleRawContent(resp *genai.GenerateContentResponse) *googleSerializableContent {
+	if resp == nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
 		return nil
 	}
-	return resp.Candidates[0].Content
+	sc := snapshotGenaiContent(resp.Candidates[0].Content)
+	return &sc
 }
 
 func extractGoogleStreamTextAndThought(resp *genai.GenerateContentResponse) (string, string) {
@@ -1662,7 +1689,7 @@ type providerDeltaEmitter struct {
 }
 
 func (e *providerDeltaEmitter) Delta(text string) string {
-	if strings.TrimSpace(text) == "" {
+	if text == "" {
 		return ""
 	}
 	if e.last == "" {
@@ -1690,7 +1717,7 @@ func (g *GoogleProvider) convertMessages(messages []Message) []*genai.Content {
 		case RoleAssistant:
 			// When raw model content is available (with thought signatures),
 			// use it directly instead of reconstructing from flattened fields.
-			if raw, ok := msg.Metadata[googleRawContentKey].(*genai.Content); ok && len(raw.Parts) > 0 {
+			if raw := restoreGoogleRawContent(msg.Metadata); raw != nil {
 				result = append(result, raw)
 				continue
 			}
@@ -1876,11 +1903,105 @@ func (g *GoogleProvider) convertSafetySettings() []*genai.SafetySetting {
 	return result
 }
 
-// googleRawContentKey is the ProviderMetadata key for the raw genai.Content
-// from the model's response. Preserving the original content (including thought
-// parts with signatures) is required when replaying multi-turn tool-call
-// conversations with thinking mode enabled.
+// googleRawContentKey is the ProviderMetadata key for the serializable
+// snapshot of the model's response content. Preserving thought signatures
+// is required when replaying multi-turn tool-call conversations with
+// thinking mode enabled.
 const googleRawContentKey = "google_raw_content"
+
+// googleSerializableContent is a JSON-safe snapshot of genai.Content that
+// survives serialization boundaries (WAL replay, session persistence).
+// The raw *genai.Content pointer approach fails because map[string]any
+// deserializes to map[string]any, not *genai.Content.
+type googleSerializableContent struct {
+	Role  string                    `json:"role"`
+	Parts []googleSerializablePartItem `json:"parts"`
+}
+
+// googleSerializablePartItem captures the fields of genai.Part that matter
+// for multi-turn replay: text (with thought flag and signature) and
+// function calls.
+type googleSerializablePartItem struct {
+	Text             string         `json:"text,omitempty"`
+	Thought          bool           `json:"thought,omitempty"`
+	ThoughtSignature []byte         `json:"thought_signature,omitempty"`
+	FunctionCallID   string         `json:"fc_id,omitempty"`
+	FunctionCallName string         `json:"fc_name,omitempty"`
+	FunctionCallArgs map[string]any `json:"fc_args,omitempty"`
+}
+
+// toGenaiContent reconstructs a *genai.Content from the serializable snapshot.
+func (sc googleSerializableContent) toGenaiContent() *genai.Content {
+	content := &genai.Content{Role: sc.Role}
+	for _, sp := range sc.Parts {
+		part := &genai.Part{
+			Text:             sp.Text,
+			Thought:          sp.Thought,
+			ThoughtSignature: sp.ThoughtSignature,
+		}
+		if sp.FunctionCallName != "" {
+			part.FunctionCall = &genai.FunctionCall{
+				ID:   sp.FunctionCallID,
+				Name: sp.FunctionCallName,
+				Args: sp.FunctionCallArgs,
+			}
+		}
+		content.Parts = append(content.Parts, part)
+	}
+	return content
+}
+
+// restoreGoogleRawContent reconstructs a *genai.Content from the metadata
+// snapshot. Handles both in-memory (typed struct) and post-serialization
+// (map[string]any from JSON round-trip) representations.
+func restoreGoogleRawContent(metadata map[string]any) *genai.Content {
+	if metadata == nil {
+		return nil
+	}
+	raw, ok := metadata[googleRawContentKey]
+	if !ok {
+		return nil
+	}
+	// In-memory path: direct struct (stored by convertResponse).
+	if sc, ok := raw.(googleSerializableContent); ok {
+		return sc.toGenaiContent()
+	}
+	if scp, ok := raw.(*googleSerializableContent); ok && scp != nil {
+		return scp.toGenaiContent()
+	}
+	// Post-deserialization path: re-encode map[string]any → JSON → struct.
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var sc googleSerializableContent
+	if json.Unmarshal(encoded, &sc) != nil || len(sc.Parts) == 0 {
+		return nil
+	}
+	return sc.toGenaiContent()
+}
+
+// snapshotGenaiContent converts a *genai.Content to a serializable form.
+func snapshotGenaiContent(c *genai.Content) googleSerializableContent {
+	sc := googleSerializableContent{Role: c.Role}
+	for _, part := range c.Parts {
+		if part == nil {
+			continue
+		}
+		sp := googleSerializablePartItem{
+			Text:             part.Text,
+			Thought:          part.Thought,
+			ThoughtSignature: part.ThoughtSignature,
+		}
+		if part.FunctionCall != nil {
+			sp.FunctionCallID = part.FunctionCall.ID
+			sp.FunctionCallName = part.FunctionCall.Name
+			sp.FunctionCallArgs = part.FunctionCall.Args
+		}
+		sc.Parts = append(sc.Parts, sp)
+	}
+	return sc
+}
 
 // convertResponse converts a Gemini response to generic format
 func (g *GoogleProvider) convertResponse(result *genai.GenerateContentResponse, model string) *Response {
@@ -1918,28 +2039,52 @@ func (g *GoogleProvider) convertResponse(result *genai.GenerateContentResponse, 
 	// Extract usage
 	if result.UsageMetadata != nil {
 		resp.Usage = Usage{
-			InputTokens:  int(result.UsageMetadata.PromptTokenCount),
-			OutputTokens: int(result.UsageMetadata.CandidatesTokenCount),
-			TotalTokens:  int(result.UsageMetadata.TotalTokenCount),
+			InputTokens:     int(result.UsageMetadata.PromptTokenCount),
+			OutputTokens:    int(result.UsageMetadata.CandidatesTokenCount),
+			TotalTokens:     int(result.UsageMetadata.TotalTokenCount),
+			ReasoningTokens: int(result.UsageMetadata.ThoughtsTokenCount),
+			CacheReadTokens: int(result.UsageMetadata.CachedContentTokenCount),
 		}
 	}
 
 	// Determine stop reason
 	if len(result.Candidates) > 0 {
-		candidate := result.Candidates[0]
-		switch candidate.FinishReason {
-		case genai.FinishReasonStop:
-			resp.StopReason = StopReasonEndTurn
-		case genai.FinishReasonMaxTokens:
-			resp.StopReason = StopReasonMaxTokens
-		case genai.FinishReasonSafety:
-			resp.StopReason = StopReasonError
-		default:
-			resp.StopReason = StopReasonEndTurn
-		}
+		resp.StopReason = googleFinishReason(
+			result.Candidates[0].FinishReason,
+			len(resp.ToolCalls) > 0,
+		)
 	}
 
 	return resp
+}
+
+// googleFinishReason maps a genai.FinishReason to a StopReason. When
+// hasToolCalls is true, returns StopReasonToolUse regardless of the API's
+// finish reason (Gemini often returns empty/STOP when tool calls are present).
+func googleFinishReason(reason genai.FinishReason, hasToolCalls bool) StopReason {
+	if hasToolCalls {
+		return StopReasonToolUse
+	}
+	switch reason {
+	case genai.FinishReasonStop:
+		return StopReasonEndTurn
+	case genai.FinishReasonMaxTokens:
+		return StopReasonMaxTokens
+	case genai.FinishReasonSafety,
+		genai.FinishReasonBlocklist,
+		genai.FinishReasonProhibitedContent,
+		genai.FinishReasonSPII,
+		genai.FinishReasonImageSafety,
+		genai.FinishReasonImageProhibitedContent:
+		return StopReasonContentFilter
+	case genai.FinishReasonRecitation,
+		genai.FinishReasonLanguage,
+		genai.FinishReasonMalformedFunctionCall,
+		genai.FinishReasonImageRecitation:
+		return StopReasonError
+	default:
+		return StopReasonEndTurn
+	}
 }
 
 // convertToGenaiType converts a JSON schema type string to genai.Type

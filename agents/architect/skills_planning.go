@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage"
 	"github.com/google/uuid"
@@ -741,7 +743,11 @@ func (a *Architect) attachFixWorkflow(planID string, workflow *WorkflowDAG, task
 		return current.ID
 	}
 	current.Status = current.SM().State()
+	current.Epoch = current.SM().Epoch()
 	current.UpdatedAt = time.Now()
+	if a.leaseManager != nil {
+		a.leaseManager.GrantReadyLease(current)
+	}
 	currentID = current.ID
 	encoded, encodeError = a.marshalPlanSnapshot(current)
 	a.activePlansMu.Unlock()
@@ -1249,24 +1255,45 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 				"plan_id", plan.ID,
 				"session_id", sessionID,
 				"query", truncateString(query, 120))
+
+			shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanCreated,
+				a.id, sessionID, "", "info",
+				&agentlog.PlanPayload{PlanID: plan.ID, Status: plan.Status.String()})
 			return map[string]any{
 				"plan_id":    plan.ID,
 				"session_id": sessionID,
 				"status":     plan.Status.String(),
-				"protocol": "Drive the planning protocol using the plan_id above. " +
-					"Invoke these skills in order:\n" +
-					"1. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
-					"2. consult(mode=pre_planning, plan_id=<plan_id>)\n" +
-					"3. If critical ambiguities exist, invoke ask_user_question and STOP.\n" +
-					"4. plan(action=design, plan_id=<plan_id>)\n" +
-					"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow and validates.\n" +
-					"6. The plan is automatically rendered when generate_tasks completes.\n" +
-					"   Write a brief assessment — highlight the key tradeoff and risk.\n" +
-					"   Invite the user to approve or request changes — use natural phrasing, not a template.\n" +
-					"   Do NOT repeat the plan structure. Do NOT invoke route_plan_acceptance.",
+				"protocol": startPlanningProtocolInstructions(a.config.AutoApprove),
 			}, nil
 		}).
 		Build()
+}
+
+// startPlanningProtocolInstructions returns the protocol field for the
+// start_planning skill result. When auto-approve is enabled, the LLM is
+// instructed to invoke route_plan_acceptance after generate_tasks. When
+// approval is required, the LLM must wait for the user's response.
+func startPlanningProtocolInstructions(autoApprove bool) string {
+	const base = "Drive the planning protocol using the plan_id above. " +
+		"Invoke these skills in order:\n" +
+		"1. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
+		"2. consult(mode=pre_planning, plan_id=<plan_id>)\n" +
+		"3. If critical ambiguities exist, invoke ask_user_question and STOP.\n" +
+		"4. plan(action=design, plan_id=<plan_id>)\n" +
+		"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow and validates.\n" +
+		"6. The system renders the plan structure separately in the UI — the user already sees it.\n" +
+		"   Do NOT repeat, re-render, or include plan structure, tasks, criteria, or guides in your text.\n" +
+		"   Write ONLY a brief assessment — highlight the key tradeoff and risk."
+
+	if autoApprove {
+		return base + "\n" +
+			"7. Invoke route_plan_acceptance with the plan_id and a brief summary as user_response.\n" +
+			"8. When route_plan_acceptance returns the Guide's verdict, invoke handle_plan_acceptance_result " +
+			"with the verdict details. On accept, the plan dispatches to the orchestrator automatically."
+	}
+	return base + "\n" +
+		"   Invite the user to approve or request changes — use natural phrasing, not a template.\n" +
+		"   Do NOT invoke route_plan_acceptance — wait for the user's response."
 }
 
 // ---------------------------------------------------------------------------

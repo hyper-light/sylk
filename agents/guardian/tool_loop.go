@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/steering"
 )
 
 // executeToolLoop runs the LLM tool-call loop: stream → check ToolCalls →
@@ -19,6 +21,7 @@ func (g *Guardian) executeToolLoop(
 	req *providers.Request,
 	stage string,
 	onChunk func(string),
+	ledger *steering.SteeringLedger,
 ) (string, error) {
 	maxRuns := g.config.MaxToolRuns
 	seen := make(map[shared.ToolCallSignature]int, maxRuns)
@@ -26,6 +29,11 @@ func (g *Guardian) executeToolLoop(
 
 	provider := g.getProvider()
 	if provider == nil {
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
+		}
 		return "", fmt.Errorf("guardian: no LLM provider configured")
 	}
 
@@ -41,13 +49,54 @@ func (g *Guardian) executeToolLoop(
 			g.logWarn("executeToolLoop: context cancelled", "stage", stage, "turn", turn)
 			return "", ctx.Err()
 		}
+
+		// ── STEERING CHECKPOINT ──
+		sc := shared.DrainAndCheckpoint(ledger, req, turn, stage, nil)
+		if sc.Rollback != nil || sc.EditReplay != nil {
+			cp := sc.Rollback
+			if cp == nil {
+				cp = sc.EditReplay
+			}
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				action := "rollback"
+				if sc.EditReplay != nil {
+					action = "edit_replay"
+				}
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventSteeringCheckpoint,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("%s at turn %d", action, cp.Turn)})
+			}
+			req.Messages = req.Messages[:cp.MessageCount]
+			if sc.EditReplay != nil {
+				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
+			}
+			turn = cp.Turn
+			seen = make(map[shared.ToolCallSignature]int, maxRuns)
+			consecutiveErrors = 0
+			continue
+		}
+		if sc.ShouldPause {
+			if err := ledger.WaitForResume(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
+		// ── END STEERING ──
+
 		if g.toolDefsDirty {
 			req.Tools = g.buildToolDefinitions()
 			g.toolDefsDirty = false
 		}
 
+		turnStart := time.Now()
 		resp, err := provider.Complete(ctx, req)
+		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
+			}
 			g.logWarn("executeToolLoop: LLM error", "stage", stage, "turn", turn, "err", err)
 			return "", fmt.Errorf("guardian llm: %w", err)
 		}
@@ -67,11 +116,21 @@ func (g *Guardian) executeToolLoop(
 
 		if turn == maxRuns {
 			g.logWarn("executeToolLoop: tool-call limit exceeded", "stage", stage, "max_runs", maxRuns)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", maxRuns)})
+			}
 			return "", fmt.Errorf("guardian exceeded tool-call limit (%d)", maxRuns)
 		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			g.logWarn("executeToolLoop: duplicate tool call", "stage", stage, "tool", sig.Name)
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
+			}
 			return "", fmt.Errorf("guardian repeated tool call: %s", sig.Name)
 		}
 
@@ -81,10 +140,20 @@ func (g *Guardian) executeToolLoop(
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
+			}
 			return "", fmt.Errorf("guardian tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
 
+	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+		shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+			lm.AgentID, lm.SessionID, lm.CorrID, "error",
+			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
+	}
 	return "", fmt.Errorf("guardian exhausted tool-call loop")
 }
 
@@ -127,7 +196,17 @@ func (g *Guardian) applyToolCalls(
 				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
+				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					shared.LogAgentEvent(lm.EventLogger, agentlog.EventSkillFailed,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ToolPayload{ToolName: call.Name, Success: false, Err: err.Error()})
+				}
 			}
+		}
+		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			shared.LogAgentEvent(lm.EventLogger, shared.ToolNameToEventType(call.Name),
+				lm.AgentID, lm.SessionID, lm.CorrID, "info",
+				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
 	"github.com/google/uuid"
@@ -32,6 +34,11 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 	req = a.enrichPlanningRequest(req)
 	plan := newProtocolPlan(req)
 	a.persistPlanState(plan)
+
+	corrID := correlationIDFromContext(ctx)
+	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventProtocolStarted,
+		a.id, req.SessionID, corrID, "info",
+		&agentlog.ProtocolPayload{PlanID: plan.ID, Phase: "started"})
 
 	// Derive operation budget from model parameters (no magic numbers).
 	// stages * budgetLevels * perRequestTimeout
@@ -60,8 +67,17 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 	})
 	diag := openProtocolDiagnostics(plan.ID, a.config.WorkingDirectory)
 	defer diag.close()
+	plannerAvailable := a.ensurePlanner(ctx) != nil
 	diag.log("protocol start plan=%s query=%q planner_available=%v op_timeout=%v",
-		plan.ID, req.Query, a.ensurePlanner(ctx) != nil, opTimeout)
+		plan.ID, req.Query, plannerAvailable, opTimeout)
+
+	// When no LLM planner is available, run the deterministic multi-stage
+	// path directly. This allows planning to proceed with structural
+	// fallbacks instead of failing at the tool loop planner check.
+	if !plannerAvailable {
+		return a.runDeterministicProtocol(plannerCtx, req, plan, diag)
+	}
+
 	runner := &planningProtocolRunner{architect: a, ctx: plannerCtx, request: req, plan: plan, diag: diag}
 	protocolStart := time.Now()
 	if err := runner.run(); err != nil {
@@ -72,15 +88,25 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 			"elapsed", elapsed.String(),
 			"plan_status", plan.SM().State().String(),
 			"err", err)
-		// On context cancellation, preserve the plan's current state
-		// instead of marking it Failed. This allows the next conversation
-		// turn to detect and resume the in-progress plan.
-		if ctx.Err() != nil && plan.SM().State() != PlanStatusPending {
-			a.logInfo("runPlanningProtocol: interrupted, preserving plan state",
-				"plan_id", plan.ID,
-				"preserved_status", plan.SM().State().String())
-			a.persistPlanState(plan)
-			return plan, err
+		// Context cancellation from user interrupt: supersedeStalledPlans
+		// already moved the plan to Superseded via the CancelEntry hook.
+		// Fall through to retryable check or fail.
+
+		// Last resort: when the LLM protocol exhausted all retries with
+		// a retryable error (e.g., API persistently overloaded), fall
+		// back to the deterministic protocol so the plan reaches Ready
+		// instead of being marked Failed. The retry infrastructure
+		// (server-guided backoff, proper delays) handles transient
+		// overload; this path only fires when the API is truly unreachable.
+		if providers.IsRetryable(err) {
+			diag.log("retryable failure after %v, falling back to deterministic protocol", elapsed)
+			a.logInfo("runPlanningProtocol: retryable failure, deterministic fallback",
+				"plan_id", plan.ID, "elapsed", elapsed.String())
+			plan.sm = NewPlanStateMachine(plan.ID, PlanStatusPending)
+			plan.Status = PlanStatusPending
+			plan.Epoch = plan.SM().Epoch()
+			plan.UpdatedAt = time.Now()
+			return a.runDeterministicProtocol(plannerCtx, req, plan, diag)
 		}
 		return a.failAndPersistPlan(plan, err)
 	}
@@ -94,6 +120,93 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 		"elapsed", elapsed.String(),
 		"tasks", len(plan.Tasks),
 		"status", plan.SM().State().String())
+
+	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventProtocolCompleted,
+		a.id, req.SessionID, corrID, "info",
+		&agentlog.ProtocolPayload{PlanID: plan.ID, Phase: "completed", DurNs: elapsed.Nanoseconds()})
+
+	return plan, nil
+}
+
+// runDeterministicProtocol executes the multi-stage planning path using
+// deterministic fallbacks (analyzeRequirements → designArchitecture →
+// generateAtomicTasks → createWorkflowDAG). Used when no LLM planner is
+// configured so the planning protocol can still produce structural plans.
+func (a *Architect) runDeterministicProtocol(
+	ctx context.Context,
+	req *ArchitectRequest,
+	plan *DesignPlan,
+	diag *protocolDiagnostics,
+) (*DesignPlan, error) {
+	protocolStart := time.Now()
+	diag.log("deterministic protocol start plan=%s", plan.ID)
+
+	transition := func(status PlanStatus) error {
+		if err := plan.SM().TransitionTo(status, plan); err != nil {
+			return err
+		}
+		plan.Status = plan.SM().State()
+		plan.Epoch = plan.SM().Epoch()
+		plan.UpdatedAt = time.Now()
+		return a.persistPlanState(plan)
+	}
+
+	// 1. Analyze
+	if err := transition(PlanStatusAnalyzing); err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	requirements, err := a.analyzeRequirements(ctx, req.Query, req.Params)
+	if err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	plan.Requirements = requirements
+
+	// 2. Consult (skip — no bus in deterministic mode)
+	if err := transition(PlanStatusConsulting); err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+
+	// 3. Design
+	if err := transition(PlanStatusDesigning); err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	architecture, err := a.designArchitecture(ctx, requirements, nil)
+	if err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	plan.Architecture = architecture
+
+	// 4. Generate tasks
+	if err := transition(PlanStatusGenerating); err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	tasks, err := a.generateAtomicTasks(ctx, architecture, plan.Constraints)
+	if err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	plan.Tasks = tasks
+
+	// 5. Orchestrate
+	if err := transition(PlanStatusOrchestrating); err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	workflow, err := a.createWorkflowDAG(ctx, tasks)
+	if err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	plan.Workflow = workflow
+
+	// 6. Ready
+	if err := transition(PlanStatusReady); err != nil {
+		return a.failAndPersistPlan(plan, err)
+	}
+	plan.LeaseExpiry = time.Now().Add(readyPlanMaxAge)
+	a.upsertActivePlan(plan)
+
+	elapsed := time.Since(protocolStart)
+	diag.log("deterministic protocol complete elapsed=%v tasks=%d", elapsed, len(tasks))
+	a.logInfo("runDeterministicProtocol: complete",
+		"plan_id", plan.ID, "elapsed", elapsed.String(), "tasks", len(tasks))
 	return plan, nil
 }
 
@@ -261,6 +374,7 @@ func (r *planningProtocolRunner) run() error {
 	text, err := r.architect.executeToolLoop(
 		loopCtx, req, "planning_protocol",
 		func(chunk string) { r.architect.publishPlanStreamChunk(r.ctx, chunk) },
+		shared.SteeringLedgerFromContext(loopCtx),
 	)
 	if err != nil {
 		return err
@@ -289,10 +403,11 @@ const protocolPhaseInstructions = `You drive the planning protocol by invoking s
 4. **Design**: Invoke plan with action=design and plan_id.
 5. **Generate**: Invoke plan with action=generate_tasks and plan_id.
    This automatically creates the workflow and validates the plan.
-6. **Present and ask for approval**: The structured plan is automatically rendered in your
-   response when generate_tasks completes. Do NOT repeat the plan structure or task list.
-   Write a brief assessment (2-4 sentences): highlight the key architectural tradeoff,
-   the primary risk, and why this decomposition is a good default.
+6. **Present and ask for approval**: The system renders the structured plan separately
+   in the UI — the user already sees it. Do NOT repeat, re-render, or include the plan
+   structure, task list, acceptance criteria, file lists, or implementation guides in
+   your text. Write ONLY a brief assessment (2-4 sentences): highlight the key
+   architectural tradeoff, the primary risk, and why this decomposition is a good default.
    Sound like a principal engineer, not a workflow bot.
    End by inviting the user to approve or request changes. Use your own natural phrasing —
    do NOT use a scripted template. Vary your wording each time.
@@ -712,12 +827,18 @@ func (a *Architect) restorePlanFromFile(path string, cutoff time.Time) (bool, er
 	if strings.TrimSpace(plan.ID) == "" {
 		return false, fmt.Errorf("restored plan missing id")
 	}
-	// Skip terminal-state plans, actively executing plans, and stale ready/completed
-	// plans. Ready plans from prior sessions are stale artifacts — the Guide's phase
-	// gate (which arms plan approval) is in-memory-only and lost on restart.
+	// Skip terminal-state plans only. These have no further transitions.
+	//
+	// Ready and Executing plans ARE restored — the architect may be demoted
+	// (idle timeout) while waiting for user approval or while the orchestrator
+	// executes a DAG. Without restoring Executing plans the reaper loses
+	// crash-recovery ability (expire-fail on lease timeout) and heartbeat
+	// lease renewal has no target. Staleness is handled at lookup time:
+	// latestReadyPlan applies a 30-minute age gate, the reaper expires leases,
+	// and session scoping prevents cross-session pollution.
 	switch plan.Status {
-	case PlanStatusFailed, PlanStatusExecuting, PlanStatusReady, PlanStatusCompleted:
-		_ = os.Remove(path) // Proactively clean up terminal/stale plan files.
+	case PlanStatusFailed, PlanStatusCompleted, PlanStatusSuperseded:
+		_ = os.Remove(path) // Proactively clean up terminal plan files.
 		return false, nil
 	}
 	if plan.UpdatedAt.Before(cutoff) {

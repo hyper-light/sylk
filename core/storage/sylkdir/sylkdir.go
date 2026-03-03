@@ -417,6 +417,26 @@ func (s *SylkDir) OrchestratorDBPath() string {
 	return filepath.Join(s.OrchestratorPath(), "orchestrator.db")
 }
 
+// AgentSteeringPath returns the path to an agent's steering WAL directory.
+// Structure: .sylk/agents/{agentType}/steering/
+//
+// Deprecated: Use SessionAgentWALPath for session-scoped WAL storage.
+func (s *SylkDir) AgentSteeringPath(agentType string) string {
+	return filepath.Join(s.RootPath(), "agents", agentType, "steering")
+}
+
+// SessionAgentWALPath returns the session-scoped WAL directory for an agent.
+// Structure: .sylk/sessions/{sessionID}/agents/{agentName}/wal/
+func (s *SylkDir) SessionAgentWALPath(sessionID, agentName string) string {
+	return filepath.Join(s.SessionPath(sessionID), "agents", agentName, "wal")
+}
+
+// SessionAgentLogsPath returns the session-scoped logs directory for an agent.
+// Structure: .sylk/sessions/{sessionID}/agents/{agentName}/logs/
+func (s *SylkDir) SessionAgentLogsPath(sessionID, agentName string) string {
+	return filepath.Join(s.SessionPath(sessionID), "agents", agentName, "logs")
+}
+
 // CreateGlobalVersion creates a global version directory with subdirectories.
 // Structure: .sylk/versions/v1.0.0/{nodes,vectors,docs,chunks,bleve}
 func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {

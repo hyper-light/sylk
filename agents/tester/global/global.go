@@ -8,11 +8,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -41,8 +43,7 @@ type GlobalTester struct {
 	providerWrapper gateway.ProviderWrapper
 
 	// State.
-	inspectorGate *shared.InspectorGate
-	currentPlan   *shared.TestPlan
+	currentPlan *shared.TestPlan
 	harness       *TestHarness
 	batchContext   *shared.BatchContext
 	diagnoses     map[string]*shared.DiagnosisReport
@@ -69,6 +70,17 @@ type GlobalTester struct {
 
 	// File access (injected per-session at runtime).
 	fileAccess versioning.FileAccess
+
+	// Request lifecycle.
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	// Steering ledger management.
+	steering *agentshared.SteeringManager
+
+	// Request serialization: ensures at most one forwarded request
+	// executes at a time, preventing cancel/new-request interleaving.
+	requestSerializer *agentshared.RequestSerializer
 }
 
 // New creates a new GlobalTester instance.
@@ -88,7 +100,11 @@ func New(cfg shared.GlobalTesterConfig, provider globalTesterProvider) (*GlobalT
 		diagnoses:   make(map[string]*shared.DiagnosisReport),
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 		diagEngine:  shared.NewDiagnosisEngine(),
+		steering:          agentshared.NewSteeringManager(),
+		requestSerializer: agentshared.NewRequestSerializer(),
 	}
+
+	gt.steering.InitLazy("tester", nil)
 
 	gt.initSkills()
 	return gt, nil
@@ -243,7 +259,6 @@ func (gt *GlobalTester) initSkills() {
 
 func (gt *GlobalTester) registerCoreSkills() {
 	// Shared skills.
-	gt.skills.Register(shared.CheckInspectorGateSkill(gt.getInspectorGate))
 	gt.skills.Register(shared.AnalyzeRiskSkill())
 	gt.skills.Register(shared.PlanTestsSkill())
 	gt.skills.Register(shared.WriteTestSkill())
@@ -269,19 +284,6 @@ func (gt *GlobalTester) registerCoreSkills() {
 	}))
 }
 
-func (gt *GlobalTester) getInspectorGate() *shared.InspectorGate {
-	gt.mu.RLock()
-	defer gt.mu.RUnlock()
-	return gt.inspectorGate
-}
-
-// SetInspectorGate records Inspector completion for batch-level gating.
-func (gt *GlobalTester) SetInspectorGate(gate *shared.InspectorGate) {
-	gt.mu.Lock()
-	defer gt.mu.Unlock()
-	gt.inspectorGate = gate
-}
-
 // Close shuts down the global tester.
 func (gt *GlobalTester) Close() error {
 	return gt.Stop()
@@ -295,6 +297,7 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 
 	gt.bus = bus
 	gt.channels = guide.NewAgentChannels("tester", gt.id)
+	gt.runCtx, gt.runCancel = context.WithCancel(context.Background())
 
 	var err error
 	gt.requestSub, err = bus.SubscribeAsync(gt.channels.Requests, gt.handleBusRequest)
@@ -324,6 +327,11 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 func (gt *GlobalTester) Stop() error {
 	if !gt.running {
 		return nil
+	}
+
+	gt.steering.CloseAll()
+	if gt.runCancel != nil {
+		gt.runCancel()
 	}
 
 	var errs []error
@@ -402,8 +410,13 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		Tools: tools,
 	}
 
-	result, err := gt.executeToolLoop(ctx, req)
+	result, err := gt.executeToolLoop(ctx, req, agentshared.SteeringLedgerFromContext(ctx))
 	if err != nil {
+		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("tool loop: %v", err)})
+		}
 		return nil, fmt.Errorf("global tester tool loop: %w", err)
 	}
 
@@ -414,23 +427,51 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 }
 
 func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
+	if msg.Type == guide.MessageTypeAction {
+		action, ok := msg.GetActionRequest()
+		if ok && action != nil {
+			gt.steering.HandleAction(action)
+		}
+		return nil
+	}
 	if msg.Type != guide.MessageTypeForward {
 		return nil
 	}
+
+	if !gt.requestSerializer.Acquire(gt.runCtx) {
+		return nil // runCtx cancelled, agent shutting down
+	}
+	defer gt.requestSerializer.Release()
 
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	ctx := context.Background()
+	gt.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	agentshared.LogIncomingRequest(gt.steering.EventLogger(), fwd, gt.id)
+
+	reqCtx, cancel := context.WithCancel(gt.runCtx)
+	gt.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	defer cancel()
+
+	ctx := reqCtx
 	startTime := time.Now()
 
-	// Always set up stream context — the Guide may promote IntentChat to
-	// IntentHelp, so we cannot predicate streaming on the incoming intent.
-	// This mirrors the orchestrator's handleBusRequest pattern.
 	ctx = withTesterStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx, usageAcc := withTesterUsageAccumulator(ctx)
+
+	// Create steering ledger for this request.
+	ledger := gt.steering.Create(fwd.CorrelationID, gt.id, fwd.SessionID, nil, nil)
+	defer gt.steering.Close(fwd.CorrelationID, ctx.Err() != nil)
+	ctx = agentshared.WithSteeringLedger(ctx, ledger)
+	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{
+		EventLogger: gt.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     gt.id,
+		SessionID:   fwd.SessionID,
+	})
+
 	toolEmitter := agentshared.NewToolCallEmitter(gt.bus, gt.channels, "tester", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
 	if !fwd.FireAndForget {
@@ -438,6 +479,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	result, err := gt.Handle(ctx, fwd)
+	agentshared.LogResponse(gt.steering.EventLogger(), fwd.CorrelationID, gt.id, fwd.SessionID, time.Since(startTime), err)
 
 	if fwd.FireAndForget {
 		return nil
@@ -452,6 +494,11 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	if err != nil {
+		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+				lm.AgentID, lm.SessionID, lm.CorrID, "error",
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
+		}
 		gt.publishStreamError(ctx, err)
 		gt.publishStreamComplete(ctx, "", usageAcc.Total())
 		resp.Error = err.Error()
@@ -491,11 +538,19 @@ func (gt *GlobalTester) handleRegistryAnnouncement(msg *guide.Message) error {
 		return nil
 	}
 
+	action := "registered"
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
 		gt.knownAgents[ann.AgentID] = ann
 	case guide.MessageTypeAgentUnregistered:
 		delete(gt.knownAgents, ann.AgentID)
+		action = "unregistered"
+	}
+	if el := gt.steering.EventLogger(); el != nil {
+		agentshared.LogAgentEvent(el, agentlog.EventRegistryEvent,
+			gt.id, "", "", "info", &agentlog.RegistryPayload{
+				AgentID: ann.AgentID, AgentType: ann.AgentType, Action: action,
+			})
 	}
 	return nil
 }

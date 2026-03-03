@@ -21,9 +21,10 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(shared.DetectRaceConditionsSkill(pi.toolRunner))
 	pi.skills.Register(shared.DetectDeadlocksSkill(pi.toolRunner))
 	pi.skills.Register(shared.DetectMemoryLeaksSkill(pi.toolRunner))
-	pi.skills.Register(shared.ReadFileSkill())
-	pi.skills.Register(shared.GlobSkill())
-	pi.skills.Register(shared.GrepSkill())
+	faFunc := func() shared.FileAccess { return pi.fileAccess }
+	pi.skills.Register(shared.ReadFileSkill(faFunc))
+	pi.skills.Register(shared.GlobSkill(faFunc))
+	pi.skills.Register(shared.GrepSkill(faFunc))
 
 	// Design validation skills (always registered — LLM selects based on context).
 	pi.skills.Register(shared.ValidateTokenUsageSkill(pi.toolRunner))

@@ -85,9 +85,11 @@ type vertexFunctionCall struct {
 }
 
 type vertexUsageMetadata struct {
-	PromptTokenCount     int `json:"promptTokenCount"`
-	CandidatesTokenCount int `json:"candidatesTokenCount"`
-	TotalTokenCount      int `json:"totalTokenCount"`
+	PromptTokenCount        int `json:"promptTokenCount"`
+	CandidatesTokenCount    int `json:"candidatesTokenCount"`
+	TotalTokenCount         int `json:"totalTokenCount"`
+	ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+	CachedContentTokenCount int `json:"cachedContentTokenCount"`
 }
 
 // codeAssistSSEReader reads Server-Sent Events from a response body.
@@ -323,13 +325,18 @@ func parseVertexGenerateResponse(raw json.RawMessage, model string) (*Response, 
 
 	if vResp.UsageMetadata != nil {
 		resp.Usage = Usage{
-			InputTokens:  vResp.UsageMetadata.PromptTokenCount,
-			OutputTokens: vResp.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:  vResp.UsageMetadata.TotalTokenCount,
+			InputTokens:     vResp.UsageMetadata.PromptTokenCount,
+			OutputTokens:    vResp.UsageMetadata.CandidatesTokenCount,
+			TotalTokens:     vResp.UsageMetadata.TotalTokenCount,
+			ReasoningTokens: vResp.UsageMetadata.ThoughtsTokenCount,
+			CacheReadTokens: vResp.UsageMetadata.CachedContentTokenCount,
 		}
 	}
 
-	resp.StopReason = vertexFinishReasonToStopReason(extractVertexFinishReason(&vResp))
+	resp.StopReason = vertexFinishReasonToStopReason(
+		extractVertexFinishReason(&vResp),
+		len(resp.ToolCalls) > 0,
+	)
 	return resp, nil
 }
 
@@ -340,13 +347,20 @@ func extractVertexFinishReason(resp *vertexStreamResponse) string {
 	return resp.Candidates[0].FinishReason
 }
 
-func vertexFinishReasonToStopReason(reason string) StopReason {
+func vertexFinishReasonToStopReason(reason string, hasToolCalls bool) StopReason {
+	if hasToolCalls {
+		return StopReasonToolUse
+	}
 	switch reason {
 	case "STOP":
 		return StopReasonEndTurn
 	case "MAX_TOKENS":
 		return StopReasonMaxTokens
-	case "SAFETY":
+	case "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
+		"IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT":
+		return StopReasonContentFilter
+	case "RECITATION", "LANGUAGE", "MALFORMED_FUNCTION_CALL",
+		"IMAGE_RECITATION":
 		return StopReasonError
 	default:
 		return StopReasonEndTurn
@@ -500,7 +514,7 @@ func (g *GoogleProvider) processCodeAssistSSE(
 
 	reader := newCodeAssistSSEReader(body)
 	var chunkIndex int
-	var totalInputTokens, totalOutputTokens int
+	var totalInputTokens, totalOutputTokens, totalReasoningTokens, totalCacheReadTokens int
 	var emittedEarlyUsage bool
 	var stopReason StopReason
 	textDelta := &providerDeltaEmitter{}
@@ -606,6 +620,8 @@ func (g *GoogleProvider) processCodeAssistSSE(
 		if vResp.UsageMetadata != nil {
 			totalInputTokens = vResp.UsageMetadata.PromptTokenCount
 			totalOutputTokens = vResp.UsageMetadata.CandidatesTokenCount
+			totalReasoningTokens = vResp.UsageMetadata.ThoughtsTokenCount
+			totalCacheReadTokens = vResp.UsageMetadata.CachedContentTokenCount
 			if !emittedEarlyUsage && totalInputTokens > 0 {
 				emittedEarlyUsage = true
 				_ = handler(&StreamChunk{
@@ -617,11 +633,11 @@ func (g *GoogleProvider) processCodeAssistSSE(
 			}
 		}
 
-		stopReason = extractVertexStopReason(vResp, stopReason)
+		stopReason = extractVertexStopReason(vResp, stopReason, len(toolCallsSeen) > 0)
 	}
 
 	if stopReason == "" {
-		stopReason = StopReasonEndTurn
+		stopReason = vertexFinishReasonToStopReason("", len(toolCallsSeen) > 0)
 	}
 
 	googleTrace("code_assist_sse", "stream_complete", map[string]any{
@@ -640,9 +656,11 @@ func (g *GoogleProvider) processCodeAssistSSE(
 		Type:       ChunkTypeEnd,
 		StopReason: stopReason,
 		Usage: &Usage{
-			InputTokens:  totalInputTokens,
-			OutputTokens: totalOutputTokens,
-			TotalTokens:  totalInputTokens + totalOutputTokens,
+			InputTokens:     totalInputTokens,
+			OutputTokens:    totalOutputTokens,
+			TotalTokens:     totalInputTokens + totalOutputTokens,
+			ReasoningTokens: totalReasoningTokens,
+			CacheReadTokens: totalCacheReadTokens,
 		},
 		Timestamp: time.Now(),
 	})
@@ -712,7 +730,7 @@ func extractVertexFunctionCalls(resp *vertexStreamResponse) []ToolCall {
 
 // extractVertexRawContent converts the first candidate's vertexContent to a
 // genai.Content, preserving thought signatures for multi-turn replay.
-func extractVertexRawContent(resp *vertexStreamResponse) *genai.Content {
+func extractVertexRawContent(resp *vertexStreamResponse) *googleSerializableContent {
 	if resp == nil || len(resp.Candidates) == 0 {
 		return nil
 	}
@@ -720,44 +738,36 @@ func extractVertexRawContent(resp *vertexStreamResponse) *genai.Content {
 	if vc == nil || len(vc.Parts) == 0 {
 		return nil
 	}
-	content := &genai.Content{Role: vc.Role}
+	sc := googleSerializableContent{Role: vc.Role}
 	for _, vp := range vc.Parts {
-		part := &genai.Part{
+		sp := googleSerializablePartItem{
+			Text:             vp.Text,
 			Thought:          vp.Thought,
 			ThoughtSignature: vp.ThoughtSignature,
 		}
-		switch {
-		case vp.FunctionCall != nil:
-			part.FunctionCall = &genai.FunctionCall{
-				ID:   vp.FunctionCall.ID,
-				Name: vp.FunctionCall.Name,
-				Args: vp.FunctionCall.Args,
-			}
-		case vp.Text != "":
-			part.Text = vp.Text
-		default:
+		if vp.FunctionCall != nil {
+			sp.FunctionCallID = vp.FunctionCall.ID
+			sp.FunctionCallName = vp.FunctionCall.Name
+			sp.FunctionCallArgs = vp.FunctionCall.Args
+		}
+		if sp.Text == "" && sp.FunctionCallName == "" && !sp.Thought {
 			continue
 		}
-		content.Parts = append(content.Parts, part)
+		sc.Parts = append(sc.Parts, sp)
 	}
-	if len(content.Parts) == 0 {
+	if len(sc.Parts) == 0 {
 		return nil
 	}
-	return content
+	return &sc
 }
 
-func extractVertexStopReason(resp *vertexStreamResponse, current StopReason) StopReason {
+func extractVertexStopReason(resp *vertexStreamResponse, current StopReason, hasToolCalls bool) StopReason {
 	if resp == nil || len(resp.Candidates) == 0 {
 		return current
 	}
-	switch resp.Candidates[0].FinishReason {
-	case "STOP":
-		return StopReasonEndTurn
-	case "MAX_TOKENS":
-		return StopReasonMaxTokens
-	case "SAFETY":
-		return StopReasonError
-	default:
+	reason := resp.Candidates[0].FinishReason
+	if reason == "" {
 		return current
 	}
+	return vertexFinishReasonToStopReason(reason, hasToolCalls)
 }

@@ -1,7 +1,6 @@
 package chat
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -27,7 +26,8 @@ const thinkingProgressMinInterval = 250 * time.Millisecond
 // spinnerFrames is a Braille dot animation sequence (matches status/spinner.go).
 var spinnerFrames = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-// thinkingMessages are rotating messages shown while waiting for the first chunk.
+// thinkingMessages are generic rotating messages shown while waiting for the
+// first chunk. Used as a fallback when no agent-specific messages exist.
 var thinkingMessages = [...]string{
 	"Thinking...",
 	"Consulting the docs...",
@@ -41,17 +41,167 @@ var thinkingMessages = [...]string{
 	"Optimizing neural pathways...",
 }
 
+// agentThinkingMessages provides fun, agent-specific status messages shown
+// while the agent is working. Each agent has a distinct personality inspired
+// by RTS unit voice lines.
+// Keyed by agent ID prefix (e.g. "architect" matches "architect_abc123").
+var agentThinkingMessages = map[string][]string{
+	"architect": {
+		"New construction options...",
+		"Cannot deploy here... recalculating...",
+		"Expanding the base...",
+		"That's a load-bearing abstraction...",
+		"Hmm, needs more layers...",
+		"Whoever built this... interesting choices...",
+		"I see the vision. Give me a moment...",
+		"Rearranging the dependency graph... again...",
+		"This calls for a hexagonal approach...",
+		"One does not simply skip the design phase...",
+	},
+	"orchestrator": {
+		"All units, move out...",
+		"Establishing command link...",
+		"Unit ready. Awaiting orders...",
+		"Rally point set. Dispatching...",
+		"I love it when a plan comes together...",
+		"Assigning agents to sectors...",
+		"Queue is deep. Prioritizing...",
+		"Everyone hold formation...",
+		"Too many cooks? I'll manage the kitchen...",
+		"Syncing the pipeline... almost there...",
+	},
+	"engineer": {
+		"I've got the tools for this...",
+		"Yes sir, right away!",
+		"Need a repair? Say no more...",
+		"Let me just... refactor that real quick...",
+		"Should be a one-liner... famous last words...",
+		"Who wrote this? ...oh wait, that was me...",
+		"Compiling. Again. Naturally...",
+		"Just one more edge case...",
+		"It works on my machine...",
+		"Trust me, I know what I'm doing...",
+	},
+	"designer": {
+		"Rendering the schematic...",
+		"Optimizing the layout...",
+		"That interface could use some love...",
+		"Form follows function... usually...",
+		"Aligning to the grid...",
+		"No, the OTHER shade of blue...",
+		"The whiteboard has spoken...",
+		"Sketching... hold on, this is good...",
+		"Component tree is looking elegant...",
+		"Less is more. Mostly...",
+	},
+	"inspector": {
+		"Scanning... I see everything...",
+		"Something's off here...",
+		"Nothing gets past me...",
+		"That's a code smell. Noted...",
+		"Running full diagnostic...",
+		"Hmm. This passed review?",
+		"Found one. There's always one...",
+		"Checking every corner...",
+		"Trust but verify. Mostly verify...",
+		"The cyclomatic complexity... it's over 9000...",
+	},
+	"tester": {
+		"If it can break, I'll find out...",
+		"All systems nominal... so far...",
+		"Let's see how this handles null...",
+		"Edge case #347. My favorite...",
+		"The happy path is boring anyway...",
+		"Fuzzing with malicious intent...",
+		"Oh this is going to be fun...",
+		"100% coverage is a state of mind...",
+		"What happens if I do THIS...",
+		"Results incoming... brace yourself...",
+	},
+	"librarian": {
+		"I know exactly where that is...",
+		"Cross-referencing the records...",
+		"Pulling files from the vault...",
+		"Shh... I'm indexing...",
+		"It's in the archive. Give me a second...",
+		"Classified material retrieved...",
+		"The codex has an entry for this...",
+		"Dewey would be proud...",
+	},
+	"academic": {
+		"Researching... do not disturb...",
+		"The literature suggests...",
+		"Fascinating. Let me dig deeper...",
+		"According to my findings...",
+		"Lab results are promising...",
+		"Theoretical models converging...",
+		"Peer review is a lonely business...",
+		"New hypothesis forming...",
+	},
+	"archivalist": {
+		"Committing to the chronicle...",
+		"History will remember this...",
+		"Preserving for future generations...",
+		"Filing under 'lessons learned'...",
+		"The record must be complete...",
+		"Timestamped and cataloged...",
+		"Another chapter written...",
+		"Nothing is ever truly deleted...",
+	},
+	"guardian": {
+		"Perimeter secure...",
+		"All defenses online...",
+		"Holding the line...",
+		"Nothing gets through...",
+		"You shall not pass... unchecked...",
+		"Validating credentials...",
+		"I don't trust that input...",
+		"Guardian protocol engaged...",
+	},
+}
+
+// thinkingMessagesForAgent returns the agent-specific message list, falling
+// back to the generic list. Agent IDs like "architect_abc123" are matched by
+// prefix against the map keys.
+func thinkingMessagesForAgent(agentID string) []string {
+	if agentID == "" {
+		return thinkingMessages[:]
+	}
+	// Exact match first, then prefix match (agent IDs often have suffixes).
+	if msgs, ok := agentThinkingMessages[agentID]; ok {
+		return msgs
+	}
+	for prefix, msgs := range agentThinkingMessages {
+		if strings.HasPrefix(agentID, prefix) {
+			return msgs
+		}
+	}
+	return thinkingMessages[:]
+}
+
+// streamSlot tracks per-stream accumulation state. Multiple slots can be
+// active concurrently when several agents stream in parallel (e.g. architect
+// and orchestrator).
+type streamSlot struct {
+	accumulator     *StreamAccumulator
+	agentID         string
+	thinkingIdx     int                // History index of thinking placeholder for this stream.
+	renderState     *streamRenderState // Incremental render state for this stream.
+	planMarkdown    string             // Rendered plan markdown for this stream.
+	planOffset      int                // Accumulator content length when plan was injected.
+}
+
 // Model is the Bubble Tea model for the chat panel.
 // It displays a scrollable history of chat entries with virtual scrolling,
 // supports LLM streaming, and handles keyboard navigation.
 type Model struct {
-	history     *History
-	viewport    *Viewport
-	accumulator *StreamAccumulator // nil when not streaming.
-	theme       *theme.Theme
-	width       int
-	height      int
-	focused     bool
+	history  *History
+	viewport *Viewport
+	streams  map[string]*streamSlot // key = correlationID; nil slots cleaned on complete.
+	theme    *theme.Theme
+	width    int
+	height   int
+	focused  bool
 
 	// Transient highlight for copy feedback.
 	highlightID    string
@@ -61,6 +211,7 @@ type Model struct {
 	thinkingIdx      int             // History index of thinking placeholder (-1 = inactive).
 	thinkingFrame    int             // Current spinner frame index.
 	thinkingMsgIdx   int             // Current fun message index.
+	thinkingAgentID  string          // Agent currently thinking (for agent-specific messages).
 	thinkingStart    time.Time       // When current thinking phase began.
 	thinkingRotateAt time.Time       // Next message rotation time.
 	retryText        string          // Retry/model-fallback status (replaces fun messages when set).
@@ -71,21 +222,24 @@ type Model struct {
 	planEntryIdx int    // History index of the plan ChatEntry (-1 = no plan entry).
 	planID       string // Correlates updates to the correct entry.
 
-	// In-stream plan embedding: when a plan snapshot arrives during an active
-	// stream, the plan markdown is composed into the stream entry rather than
-	// pushed as a separate chat entry. This gives the user one cohesive agent
-	// response: plan + approval cue.
-	streamPlanMarkdown string // rendered plan markdown for current stream (empty = none)
-	streamPlanOffset   int    // accumulator content length when plan was injected
-
 	// Render throttle: chunks buffer at full speed, but the history entry
 	// is only synced (and viewDirty set) on DecorTick or StreamComplete.
 	streamRenderPending bool
-	streamRenderState   *streamRenderState // nil when not streaming.
+
+	// Steering animation: pending entries shimmer with holographic color until acknowledged.
+	steeringPending  []steeringPendingEntry
+	steeringGradient *theme.Gradient
+	steeringStart    time.Time
 
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache string
 	viewDirty bool
+}
+
+// steeringPendingEntry tracks a single steering chat entry awaiting acknowledgment.
+type steeringPendingEntry struct {
+	idx           int    // History index (adjusted on eviction).
+	correlationID string // Matches steering_inject activity event.
 }
 
 // Verify interface compliance at compile time.
@@ -102,10 +256,12 @@ func New(th *theme.Theme, historyCapacity int) *Model {
 	return &Model{
 		history:          h,
 		viewport:         vp,
+		streams:          make(map[string]*streamSlot),
 		theme:            th,
 		thinkingIdx:      -1,
 		planEntryIdx:     -1,
 		thinkingGradient: th.Palette.ThinkingGradient(),
+		steeringGradient: th.Palette.GroupGradient(),
 	}
 }
 
@@ -234,14 +390,25 @@ var chatSuppressedEvents = map[string]bool{
 	"index_complete":     true,
 	"index_file_added":   true,
 	"index_file_removed": true,
-	"context_eviction":   true, // Internal context management.
-	"context_restore":    true,
-	"success":            true, // Generic outcome, visible from response.
+	"context_eviction":      true, // Internal context management.
+	"context_restore":       true,
+	"success":               true, // Generic outcome, visible from response.
+	"steering_checkpoint":   true, // Internal checkpoint — visible in agent panel only.
+	"steering_inject":       true, // Steering inject shown via dedicated chat entry.
+	"steering_edit":         true, // Steering edit shown via dedicated chat entry.
+	"steering_rollback":     true, // Steering rollback shown via dedicated chat entry.
 }
 
 // handleActivity converts an ActivityEventMsg into a chat entry.
 // Events already represented by dedicated chat paths are suppressed.
 func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
+	// Steering acknowledgment: transition holographic → static before suppression.
+	if ev.Event.EventType.String() == "steering_inject" && len(m.steeringPending) > 0 {
+		if corrID, _ := ev.Event.Data["correlation_id"].(string); corrID != "" {
+			m.acknowledgeSteering(corrID)
+		}
+		return nil
+	}
 	if chatSuppressedEvents[ev.Event.EventType.String()] {
 		return nil
 	}
@@ -261,29 +428,38 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 }
 
 // handleStreamStart begins accumulation. If a thinking placeholder exists,
-// it is reused; otherwise a new entry is pushed.
+// it is reused; otherwise a new entry is pushed. Multiple concurrent streams
+// are tracked in the streams map keyed by correlationID.
 func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
+	cid := start.CorrelationID
+	if m.streams == nil {
+		m.streams = make(map[string]*streamSlot)
+	}
 	chatDebugLog().Info("chat.handleStreamStart: ENTRY",
-		"correlation_id", start.CorrelationID,
+		"correlation_id", cid,
 		"agent_id", start.AgentID,
-		"has_accumulator", m.accumulator != nil,
+		"active_streams", len(m.streams),
 		"thinking_idx", m.thinkingIdx)
-	// Retry path: provider retried the stream. Reset the existing
+
+	// Retry path: provider retried an existing stream. Reset the slot's
 	// accumulator and render state instead of creating a new entry.
-	if m.accumulator != nil {
-		m.accumulator.Replace("")
-		m.streamPlanOffset = 0 // Plan stays; offset resets since LLM text cleared.
-		m.streamRenderState = &streamRenderState{}
+	if slot, ok := m.streams[cid]; ok && slot.accumulator != nil {
+		slot.accumulator.Replace("")
+		slot.planOffset = 0
+		slot.renderState = &streamRenderState{}
 		m.streamRenderPending = false
-		m.syncAccumulatorToEntry()
-		m.viewport.SetStreamState(m.streamRenderState, m.accumulator.EntryIndex())
+		m.syncSlotToEntry(slot)
+		m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
 		m.viewDirty = true
 		return nil
 	}
 
-	// Reuse existing thinking placeholder if present.
-	if m.thinkingIdx >= 0 {
+	// Reuse existing thinking placeholder for the first stream only.
+	if m.thinkingIdx >= 0 && len(m.streams) == 0 {
 		idx := m.thinkingIdx
+		if start.AgentID != "" {
+			m.thinkingAgentID = start.AgentID
+		}
 		m.history.mu.Lock()
 		if idx >= 0 && idx < m.history.count {
 			physical := m.history.logicalToPhysical(idx)
@@ -293,13 +469,18 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 			m.history.entries[physical].SessionID = start.SessionID
 		}
 		m.history.mu.Unlock()
-		m.accumulator = NewStreamAccumulator(idx)
-		m.streamRenderState = &streamRenderState{}
+		slot := &streamSlot{
+			accumulator: NewStreamAccumulator(idx),
+			agentID:     start.AgentID,
+			thinkingIdx: idx,
+			renderState: &streamRenderState{},
+		}
+		m.streams[cid] = slot
 		m.viewDirty = true
 		return nil
 	}
 
-	// No thinking placeholder — create a new entry (streaming without prior submit).
+	// New concurrent stream or no thinking placeholder — create a new entry.
 	now := time.Now()
 	entry := &ChatEntry{
 		ID:             uuid.New().String(),
@@ -318,31 +499,44 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	m.viewport.OnNewEntry()
 	if willEvict {
 		m.viewport.AdjustSelectionForEviction()
+		m.adjustSteeringIndices()
+		m.adjustStreamSlotIndices()
 	}
 	idx := m.history.Len() - 1
-	m.accumulator = NewStreamAccumulator(idx)
-	m.streamRenderState = &streamRenderState{}
-	m.startThinkingAnimation(now, idx)
+	slot := &streamSlot{
+		accumulator: NewStreamAccumulator(idx),
+		agentID:     start.AgentID,
+		thinkingIdx: idx,
+		renderState: &streamRenderState{},
+	}
+	m.streams[cid] = slot
+	// Only start the global thinking animation for the first stream.
+	if len(m.streams) == 1 {
+		m.startThinkingAnimation(now, idx)
+	}
 	return nil
 }
 
 // handleStreamChunk appends text to the accumulator. The entry is NOT synced
 // immediately — instead streamRenderPending is set and the actual sync happens
 // on the next DecorTick (100ms) or StreamComplete, reducing per-token renders.
+//
+// Thinking is NOT resolved on the first text chunk. The thinking indicator
+// stays active (thinkingIdx >= 0) so that handleStreamProgress continues to
+// receive progress messages and tickThinking keeps the spinner alive. The
+// streaming renderer shows a status footer alongside content while streaming.
+// Thinking resolves at StreamComplete (which sets ThinkingElapsed for the
+// collapsed summary) or StreamError.
 func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
-	if m.accumulator == nil {
-		chatDebugLog().Warn("chat.handleStreamChunk: NIL_ACCUMULATOR — chunk dropped",
+	slot, ok := m.streams[chunk.CorrelationID]
+	if !ok || slot.accumulator == nil {
+		chatDebugLog().Warn("chat.handleStreamChunk: NO_SLOT — chunk dropped",
 			"correlation_id", chunk.CorrelationID,
 			"text_len", len(chunk.Text))
 		return nil
 	}
 
-	// On the first chunk, transition from thinking to content phase.
-	if m.thinkingIdx >= 0 && m.accumulator.Content() == "" {
-		m.resolveThinkingEntry()
-	}
-
-	m.accumulator.Append(chunk.Text)
+	slot.accumulator.Append(chunk.Text)
 	m.streamRenderPending = true
 	return nil
 }
@@ -368,57 +562,74 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 	return nil
 }
 
-// handleStreamComplete finalizes the streaming entry.
+// handleStreamComplete finalizes a single streaming entry by correlationID.
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
+	cid := done.CorrelationID
 	chatDebugLog().Info("chat.handleStreamComplete: ENTRY",
-		"correlation_id", done.CorrelationID,
+		"correlation_id", cid,
 		"agent_id", done.AgentID,
 		"authoritative_text_len", len(done.AuthoritativeText),
-		"has_accumulator", m.accumulator != nil,
+		"active_streams", len(m.streams),
 		"thinking_idx", m.thinkingIdx,
 		"stream_render_pending", m.streamRenderPending)
-	if m.accumulator == nil {
-		chatDebugLog().Warn("chat.handleStreamComplete: NIL_ACCUMULATOR — thinking NOT cleared",
-			"correlation_id", done.CorrelationID,
+	slot, ok := m.streams[cid]
+	if !ok || slot.accumulator == nil {
+		chatDebugLog().Warn("chat.handleStreamComplete: NO_SLOT — thinking NOT cleared",
+			"correlation_id", cid,
 			"thinking_idx", m.thinkingIdx)
 		return nil
 	}
-	m.streamRenderPending = false
-	m.streamRenderState = nil
-	m.viewport.SetStreamState(nil, -1)
-	if m.thinkingIdx >= 0 {
+
+	// Remove this slot's stream state from the viewport.
+	m.viewport.RemoveStreamState(slot.accumulator.EntryIndex())
+
+	// Resolve thinking for this slot's entry if it holds the global thinking index.
+	if m.thinkingIdx >= 0 && slot.thinkingIdx == m.thinkingIdx {
 		chatDebugLog().Info("chat.handleStreamComplete: RESOLVING_THINKING",
-			"correlation_id", done.CorrelationID,
+			"correlation_id", cid,
 			"thinking_idx", m.thinkingIdx)
 		m.resolveThinkingEntry()
-	} else {
-		chatDebugLog().Info("chat.handleStreamComplete: NO_THINKING_TO_RESOLVE",
-			"correlation_id", done.CorrelationID)
 	}
+
 	if done.AuthoritativeText != "" {
-		m.accumulator.Replace(done.AuthoritativeText)
-		m.streamPlanOffset = 0
+		slot.accumulator.Replace(done.AuthoritativeText)
+		slot.planOffset = 0
 	}
-	m.accumulator.Complete()
-	m.finalizeStream()
-	m.accumulator = nil
+	slot.accumulator.Complete()
+	m.finalizeSlotStream(slot)
+	delete(m.streams, cid)
+
+	// When all streams are done, clear remaining render state.
+	if len(m.streams) == 0 {
+		m.streamRenderPending = false
+	}
+
+	// Acknowledge any pending steering entries for this correlation.
+	if len(m.steeringPending) > 0 && cid != "" {
+		m.acknowledgeSteering(cid)
+	}
+
 	chatDebugLog().Info("chat.handleStreamComplete: DONE",
-		"correlation_id", done.CorrelationID)
+		"correlation_id", cid,
+		"remaining_streams", len(m.streams))
 	return nil
 }
 
 // handleStreamError adds an error entry and cleans up the accumulator.
 func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 	m.streamRenderPending = false
-	m.streamRenderState = nil
-	m.viewport.SetStreamState(nil, -1)
-	// Finalize any partial stream.
-	if m.accumulator != nil {
-		m.accumulator.Complete()
-		m.finalizeStream()
-		m.accumulator = nil
+	// Clean up the specific slot if it exists.
+	if slot, ok := m.streams[errMsg.CorrelationID]; ok && slot.accumulator != nil {
+		m.viewport.RemoveStreamState(slot.accumulator.EntryIndex())
+		slot.accumulator.Complete()
+		m.finalizeSlotStream(slot)
+		delete(m.streams, errMsg.CorrelationID)
 	}
-	if m.thinkingIdx >= 0 {
+	// If all streams are gone, clear global viewport stream state.
+	if len(m.streams) == 0 {
+		m.viewport.ClearAllStreamStates()
+	}
+	if m.thinkingIdx >= 0 && len(m.streams) == 0 {
 		m.clearThinkingState()
 	}
 
@@ -435,14 +646,10 @@ func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 }
 
 // formatErrorForChat returns a human-readable error message suitable for the
-// chat panel. For ProviderErrors it extracts the JSON message field and maps
-// status codes to friendly labels. Falls back to the raw Error() text.
+// chat panel. Delegates to providers.FriendlyErrorMessage which handles
+// ProviderError, anthropic.Error, embedded JSON, and raw error strings.
 func formatErrorForChat(err error) string {
-	var pe *providers.ProviderError
-	if errors.As(err, &pe) {
-		return pe.UserMessage()
-	}
-	return err.Error()
+	return providers.FriendlyErrorMessage(err)
 }
 
 // handleRetryStatus logs each retry error as a chat entry and updates
@@ -540,10 +747,12 @@ func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 }
 
 // activeStreamingIndex returns the history index of the entry currently receiving
-// streaming content. Checks the accumulator first, then the thinking placeholder.
+// streaming content. Checks active stream slots first, then the thinking placeholder.
 func (m *Model) activeStreamingIndex() int {
-	if m.accumulator != nil {
-		return m.accumulator.EntryIndex()
+	for _, slot := range m.streams {
+		if slot.accumulator != nil {
+			return slot.accumulator.EntryIndex()
+		}
 	}
 	if m.thinkingIdx >= 0 {
 		return m.thinkingIdx
@@ -593,16 +802,16 @@ func (m *Model) HandlePlanUpdate(update msg.PlanUpdateMsg) {
 	content := formatPlanMarkdown(update)
 
 	// Active stream + ready plan + no plan already embedded → embed in stream.
-	// The plan markdown is stored but NOT synced to the entry yet — that would
-	// write to Content and kill the thinking spinner (the renderer only shows
-	// thinking when Content == ""). The plan will be composed into the entry
-	// naturally when the first LLM text chunk triggers resolveThinkingEntry →
-	// flushStreamRender → syncAccumulatorToEntry → composeStreamContent.
-	if m.accumulator != nil && update.Status == "ready" && m.streamPlanMarkdown == "" {
-		m.streamPlanMarkdown = content
-		m.streamPlanOffset = len(m.accumulator.Content())
-		m.planID = update.PlanID
-		return
+	// Find a slot without a plan already embedded.
+	if update.Status == "ready" {
+		for _, slot := range m.streams {
+			if slot.accumulator != nil && slot.planMarkdown == "" {
+				slot.planMarkdown = content
+				slot.planOffset = len(slot.accumulator.Content())
+				m.planID = update.PlanID
+				return
+			}
+		}
 	}
 
 	// No active stream (or non-ready status) — use the existing separate-entry path.
@@ -676,9 +885,15 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 		if m.planEntryIdx >= 0 {
 			m.planEntryIdx--
 		}
-		if m.accumulator != nil {
-			m.accumulator.AdjustIndex(-1)
+		for _, slot := range m.streams {
+			if slot.accumulator != nil {
+				slot.accumulator.AdjustIndex(-1)
+			}
+			if slot.thinkingIdx >= 0 {
+				slot.thinkingIdx--
+			}
 		}
+		m.adjustSteeringIndices()
 	}
 	m.viewDirty = true
 }
@@ -688,13 +903,11 @@ func (m *Model) PushEntry(entry *ChatEntry) {
 func (m *Model) Clear() {
 	m.history.Clear()
 	m.clearThinkingState()
-	m.accumulator = nil
+	m.clearSteeringState()
+	clear(m.streams)
 	m.streamRenderPending = false
-	m.streamRenderState = nil
 	m.planEntryIdx = -1
 	m.planID = ""
-	m.streamPlanMarkdown = ""
-	m.streamPlanOffset = 0
 	m.highlightID = ""
 	m.viewport.Reset()
 	m.viewDirty = true
@@ -730,20 +943,48 @@ func (m *Model) SetBounceOffset(offset int) {
 // without finalizing content. Used when an interrupt makes the stream
 // obsolete before a StreamCompleteMsg arrives.
 func (m *Model) AbortStream() {
-	if m.accumulator == nil {
+	if len(m.streams) == 0 {
 		return
 	}
-	m.accumulator = nil
+	clear(m.streams)
 	m.streamRenderPending = false
-	m.streamRenderState = nil
-	m.streamPlanMarkdown = ""
-	m.streamPlanOffset = 0
-	m.viewport.SetStreamState(nil, -1)
+
+	// Clear plan tracking — prevents late plan updates from embedding
+	// into the next agent's stream.
+	m.planEntryIdx = -1
+	m.planID = ""
+
+	// Clear thinking color on the active entry so it doesn't persist
+	// as muted after FinishThinking replaces the content.
+	if m.thinkingIdx >= 0 {
+		idx := m.thinkingIdx
+		m.history.mu.Lock()
+		if idx >= 0 && idx < m.history.count {
+			physical := m.history.logicalToPhysical(idx)
+			m.history.entries[physical].ThinkingColor = ""
+		}
+		m.history.mu.Unlock()
+	}
+
+	// Clear steering pending entries — prevents holographic shimmer
+	// from persisting on stale entries.
+	for _, sp := range m.steeringPending {
+		idx := sp.idx
+		m.history.mu.Lock()
+		if idx >= 0 && idx < m.history.count {
+			physical := m.history.logicalToPhysical(idx)
+			m.history.entries[physical].SteeringPending = false
+		}
+		m.history.mu.Unlock()
+	}
+	m.steeringPending = nil
+
+	m.viewport.ClearAllStreamStates()
 	m.viewDirty = true
 }
 
 // IsStreaming reports whether a response is currently being streamed.
-func (m *Model) IsStreaming() bool { return m.accumulator != nil }
+func (m *Model) IsStreaming() bool { return len(m.streams) > 0 }
 
 // HasActiveAnimation reports whether any tick-driven animation is running
 // (thinking spinner, highlight countdown, edge flash, or streaming).
@@ -752,7 +993,8 @@ func (m *Model) IsStreaming() bool { return m.accumulator != nil }
 func (m *Model) HasActiveAnimation() bool {
 	now := time.Now()
 	return m.thinkingIdx >= 0 ||
-		m.accumulator != nil ||
+		len(m.streams) > 0 ||
+		len(m.steeringPending) > 0 ||
 		!m.highlightUntil.IsZero() ||
 		m.viewport.HasEdgeFlash(now)
 }
@@ -812,6 +1054,9 @@ func (m *Model) handleDecorTick(now time.Time) {
 	// Animate thinking indicator while streaming with no content yet.
 	m.tickThinking(now)
 
+	// Animate pending steering entries with holographic shimmer.
+	m.tickSteering(now)
+
 	// Invalidate entries with active (incomplete) tool calls for live timer.
 	m.tickActiveToolCalls()
 
@@ -849,13 +1094,18 @@ func (m *Model) tickActiveToolCalls() {
 // flushStreamRender syncs accumulated stream content to the history entry
 // and marks the view dirty. Called on DecorTick (100ms) and StreamComplete.
 func (m *Model) flushStreamRender() {
-	if !m.streamRenderPending || m.accumulator == nil {
+	if !m.streamRenderPending || len(m.streams) == 0 {
 		return
 	}
 	m.streamRenderPending = false
-	m.syncAccumulatorToEntry()
-	if m.streamRenderState != nil {
-		m.viewport.SetStreamState(m.streamRenderState, m.accumulator.EntryIndex())
+	for _, slot := range m.streams {
+		if slot.accumulator == nil {
+			continue
+		}
+		m.syncSlotToEntry(slot)
+		if slot.renderState != nil {
+			m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
+		}
 	}
 	m.viewDirty = true
 }
@@ -871,8 +1121,9 @@ func (m *Model) tickThinking(now time.Time) {
 	m.thinkingFrame = (m.thinkingFrame + 1) % len(spinnerFrames)
 
 	// Rotate message every thinkingRotateInterval.
+	msgs := thinkingMessagesForAgent(m.thinkingAgentID)
 	if !now.Before(m.thinkingRotateAt) {
-		m.thinkingMsgIdx = (m.thinkingMsgIdx + 1) % len(thinkingMessages)
+		m.thinkingMsgIdx = (m.thinkingMsgIdx + 1) % len(msgs)
 		m.thinkingRotateAt = now.Add(thinkingRotateInterval)
 	}
 
@@ -881,7 +1132,7 @@ func (m *Model) tickThinking(now time.Time) {
 	if m.retryText != "" {
 		status = m.retryText
 	} else {
-		status = thinkingMessages[m.thinkingMsgIdx]
+		status = msgs[m.thinkingMsgIdx%len(msgs)]
 	}
 	text := fmt.Sprintf("%s  %.1fs",
 		spinnerFrames[m.thinkingFrame],
@@ -930,6 +1181,7 @@ func (m *Model) BeginThinking(agentType string) {
 	m.viewport.OnNewEntry()
 	if willEvict {
 		m.viewport.AdjustSelectionForEviction()
+		m.adjustSteeringIndices()
 	}
 	idx := m.history.Len() - 1
 	m.startThinkingAnimation(now, idx)
@@ -981,6 +1233,7 @@ func (m *Model) FinishThinking(entry *ChatEntry) {
 		e.Timestamp = entry.Timestamp
 		e.ThinkingText = ""
 		e.ThinkingStatus = ""
+		e.ThinkingColor = ""
 		e.ThinkingElapsed = elapsed
 		e.Streaming = false
 		e.RenderedLines = nil
@@ -1014,6 +1267,7 @@ func (m *Model) resolveThinkingEntry() {
 		m.history.entries[physical].ThinkingElapsed = elapsed
 		m.history.entries[physical].ThinkingText = ""
 		m.history.entries[physical].ThinkingStatus = ""
+		m.history.entries[physical].ThinkingColor = ""
 	}
 	m.history.mu.Unlock()
 	m.clearThinkingState()
@@ -1022,6 +1276,7 @@ func (m *Model) resolveThinkingEntry() {
 // clearThinkingState resets all thinking animation fields.
 func (m *Model) clearThinkingState() {
 	m.thinkingIdx = -1
+	m.thinkingAgentID = ""
 	m.thinkingStart = time.Time{}
 	m.retryText = ""
 	m.lastProgressSet = time.Time{}
@@ -1032,6 +1287,7 @@ func (m *Model) updateThinkingAgent(agentID string) {
 	if agentID == "" || m.thinkingIdx < 0 {
 		return
 	}
+	m.thinkingAgentID = agentID
 	idx := m.thinkingIdx
 	m.history.mu.Lock()
 	if idx >= 0 && idx < m.history.count {
@@ -1078,6 +1334,142 @@ func (m *Model) setThinkingTextNow(message string) {
 	m.viewDirty = true
 }
 
+// ---------------------------------------------------------------------------
+// Steering animation lifecycle
+// ---------------------------------------------------------------------------
+
+// maxSteeringPending bounds the tracked pending steering entries.
+// Derived from steering mailbox capacity (16) — a user cannot produce more
+// concurrent pending commands than the mailbox can hold across all agents.
+const maxSteeringPending = 16
+
+// PushSteeringEntry adds a steering message entry with holographic shimmer.
+// The entry remains animated until acknowledged by the target agent
+// (steering_inject activity) or the stream completes.
+func (m *Model) PushSteeringEntry(text, correlationID string) {
+	// Evict oldest pending entry if at capacity to prevent unbounded growth.
+	if len(m.steeringPending) >= maxSteeringPending {
+		oldest := m.steeringPending[0]
+		m.history.UpdateAt(oldest.idx, func(e *ChatEntry) {
+			e.SteeringPending = false
+			e.ThinkingColor = ""
+			e.RenderedLines = nil
+			e.CodeRegions = nil
+			e.Height = -1
+		})
+		m.steeringPending = m.steeringPending[1:]
+	}
+
+	entry := &ChatEntry{
+		ID:              uuid.New().String(),
+		Timestamp:       time.Now(),
+		Source:          SourceUser,
+		Content:         theme.IconSteer + " " + text,
+		Height:          -1,
+		SteeringPending: true,
+	}
+	willEvict := m.history.Full()
+	m.history.Push(entry)
+	m.viewport.OnNewEntry()
+	if willEvict {
+		m.viewport.AdjustSelectionForEviction()
+		if m.thinkingIdx >= 0 {
+			m.thinkingIdx--
+		}
+		if m.planEntryIdx >= 0 {
+			m.planEntryIdx--
+		}
+		for _, slot := range m.streams {
+			if slot.accumulator != nil {
+				slot.accumulator.AdjustIndex(-1)
+			}
+			if slot.thinkingIdx >= 0 {
+				slot.thinkingIdx--
+			}
+		}
+		m.adjustSteeringIndices()
+	}
+	idx := m.history.Len() - 1
+	if len(m.steeringPending) == 0 {
+		m.steeringStart = time.Now()
+	}
+	m.steeringPending = append(m.steeringPending, steeringPendingEntry{
+		idx:           idx,
+		correlationID: correlationID,
+	})
+	m.viewDirty = true
+}
+
+// acknowledgeSteering transitions all pending steering entries for the given
+// correlation from holographic to static rendering.
+func (m *Model) acknowledgeSteering(correlationID string) {
+	remaining := m.steeringPending[:0]
+	for _, sp := range m.steeringPending {
+		if sp.correlationID == correlationID {
+			m.history.UpdateAt(sp.idx, func(e *ChatEntry) {
+				e.SteeringPending = false
+				e.ThinkingColor = ""
+				e.RenderedLines = nil
+				e.CodeRegions = nil
+				e.Height = -1
+			})
+		} else {
+			remaining = append(remaining, sp)
+		}
+	}
+	m.steeringPending = remaining
+	if len(m.steeringPending) == 0 {
+		m.steeringStart = time.Time{}
+	}
+	m.viewDirty = true
+}
+
+// tickSteering updates the holographic gradient color on pending steering entries.
+func (m *Model) tickSteering(now time.Time) {
+	if len(m.steeringPending) == 0 {
+		return
+	}
+	color := ""
+	if m.steeringGradient != nil && !m.steeringStart.IsZero() {
+		color = string(m.steeringGradient.Sample(now.Sub(m.steeringStart)))
+	}
+	for _, sp := range m.steeringPending {
+		m.history.mu.Lock()
+		if sp.idx >= 0 && sp.idx < m.history.count {
+			physical := m.history.logicalToPhysical(sp.idx)
+			m.history.entries[physical].ThinkingColor = color
+			m.history.entries[physical].RenderedLines = nil
+			m.history.entries[physical].CodeRegions = nil
+			m.history.entries[physical].Height = -1
+		}
+		m.history.mu.Unlock()
+	}
+	m.viewDirty = true
+}
+
+// adjustSteeringIndices decrements all tracked steering entry indices after
+// a ring buffer eviction. Entries that fall off (idx < 0) are removed.
+func (m *Model) adjustSteeringIndices() {
+	n := 0
+	for _, sp := range m.steeringPending {
+		sp.idx--
+		if sp.idx >= 0 {
+			m.steeringPending[n] = sp
+			n++
+		}
+	}
+	m.steeringPending = m.steeringPending[:n]
+	if len(m.steeringPending) == 0 {
+		m.steeringStart = time.Time{}
+	}
+}
+
+// clearSteeringState resets all steering animation fields.
+func (m *Model) clearSteeringState() {
+	m.steeringPending = m.steeringPending[:0]
+	m.steeringStart = time.Time{}
+}
+
 func sanitizeThinkingMessage(message string) string {
 	message = strings.TrimSpace(message)
 	if message == "" {
@@ -1101,30 +1493,25 @@ func sanitizeThinkingMessage(message string) string {
 	return strings.Join(strings.Fields(cleaned.String()), " ")
 }
 
-// composeStreamContent returns the full entry content by splicing the
-// embedded plan markdown (if any) into the accumulated LLM text at the
-// recorded injection offset.
-func (m *Model) composeStreamContent() string {
-	content := m.accumulator.Content()
-	if m.streamPlanMarkdown == "" {
+// composeSlotContent returns the full entry content for a stream slot by
+// splicing the embedded plan markdown (if any) into the accumulated LLM text.
+func composeSlotContent(slot *streamSlot) string {
+	content := slot.accumulator.Content()
+	if slot.planMarkdown == "" {
 		return content
 	}
-	offset := m.streamPlanOffset
+	offset := slot.planOffset
 	if offset > len(content) {
 		offset = len(content)
 	}
-	return content[:offset] + "\n\n" + m.streamPlanMarkdown + "\n\n" + content[offset:]
+	return content[:offset] + "\n\n" + slot.planMarkdown + "\n\n" + content[offset:]
 }
 
-// syncAccumulatorToEntry writes the accumulated content back into the
-// History entry and invalidates its height. RenderedLines and CodeRegions
-// are NOT wiped — the streaming render path in renderEntry() and
-// entryHeight() always re-renders the active streaming entry regardless
-// of cached state, so wiping them would only cause unnecessary flicker
-// when the standard path is used as a fallback.
-func (m *Model) syncAccumulatorToEntry() {
-	idx := m.accumulator.EntryIndex()
-	content := m.composeStreamContent()
+// syncSlotToEntry writes the slot's accumulated content back into the
+// History entry and invalidates its height.
+func (m *Model) syncSlotToEntry(slot *streamSlot) {
+	idx := slot.accumulator.EntryIndex()
+	content := composeSlotContent(slot)
 
 	m.history.mu.Lock()
 	defer m.history.mu.Unlock()
@@ -1137,22 +1524,17 @@ func (m *Model) syncAccumulatorToEntry() {
 	m.history.entries[physical].Height = -1
 }
 
-// finalizeStream marks the streaming entry as complete.
+// finalizeSlotStream marks the streaming entry for a specific slot as complete.
 // When a plan was embedded in the stream, the entry is promoted to a
-// first-class plan entry: its ID is re-stamped to the canonical plan ID
-// and planEntryIdx is recorded. This lets the existing update-in-place
-// path in HandlePlanUpdate work for all subsequent plan snapshots without
-// any special-case logic.
-func (m *Model) finalizeStream() {
-	idx := m.accumulator.EntryIndex()
-	content := m.composeStreamContent()
-	hadPlan := m.streamPlanMarkdown != ""
+// first-class plan entry.
+func (m *Model) finalizeSlotStream(slot *streamSlot) {
+	idx := slot.accumulator.EntryIndex()
+	content := composeSlotContent(slot)
+	hadPlan := slot.planMarkdown != ""
 
 	m.history.mu.Lock()
 	if idx < 0 || idx >= m.history.count {
 		m.history.mu.Unlock()
-		m.streamPlanMarkdown = ""
-		m.streamPlanOffset = 0
 		return
 	}
 	physical := m.history.logicalToPhysical(idx)
@@ -1166,9 +1548,19 @@ func (m *Model) finalizeStream() {
 		m.planEntryIdx = idx
 	}
 	m.history.mu.Unlock()
+}
 
-	m.streamPlanMarkdown = ""
-	m.streamPlanOffset = 0
+// adjustStreamSlotIndices decrements all stream slot indices after a history
+// eviction. Called alongside adjustSteeringIndices when the ring buffer wraps.
+func (m *Model) adjustStreamSlotIndices() {
+	for _, slot := range m.streams {
+		if slot.accumulator != nil {
+			slot.accumulator.AdjustIndex(-1)
+		}
+		if slot.thinkingIdx >= 0 {
+			slot.thinkingIdx--
+		}
+	}
 }
 
 // activitySource maps an ActivityEventMsg to the appropriate ChatSource.

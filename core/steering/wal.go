@@ -14,10 +14,23 @@ type SteeringJournal struct {
 	journal *agentlog.AgentJournal
 }
 
-// OpenSteeringJournal opens or creates a steering WAL journal.
+// OpenSteeringJournal opens or creates a steering WAL journal using the
+// standard JournalConfig path resolution (SessionDir/AgentName based).
 func OpenSteeringJournal(cfg agentlog.JournalConfig) (*SteeringJournal, error) {
 	cfg.WALName = "steering"
 	j, err := agentlog.OpenJournal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &SteeringJournal{journal: j}, nil
+}
+
+// OpenSteeringJournalDirect opens a steering journal in an explicit directory.
+// Used when the caller manages directory layout (e.g., SylkDir.AgentSteeringPath).
+func OpenSteeringJournalDirect(dir string) (*SteeringJournal, error) {
+	j, err := agentlog.OpenJournalDirect(dir, agentlog.JournalConfig{
+		WALName: "steering",
+	})
 	if err != nil {
 		return nil, err
 	}

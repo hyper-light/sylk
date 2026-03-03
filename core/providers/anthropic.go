@@ -622,15 +622,25 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 		Tools:    p.convertTools(req.Tools),
 	}
 
-	if req.TopP != nil {
-		params.TopP = anthropic.Float(*req.TopP)
+	applyAnthropicToolChoice(&params, req.ToolChoice, req.DisableParallelToolUse)
+
+	params.Thinking = p.resolveThinkingConfig(req.ThinkingBudget, maxTokens)
+	thinkingEnabled := isAnthropicThinkingEnabled(params.Thinking)
+
+	// TopP and TopK are incompatible with extended thinking — the API
+	// returns 400 if they are set alongside a thinking config.
+	if !thinkingEnabled {
+		if req.TopP != nil {
+			params.TopP = anthropic.Float(*req.TopP)
+		}
+		if req.TopK != nil {
+			params.TopK = anthropic.Int(int64(*req.TopK))
+		}
 	}
 
 	if len(req.StopSequences) > 0 {
 		params.StopSequences = req.StopSequences
 	}
-
-	params.Thinking = p.resolveThinkingConfig(req.ThinkingBudget, maxTokens)
 
 	// Log the resolved thinking configuration for debugging.
 	thinkingDesc := "disabled"
@@ -650,12 +660,48 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 		"tools_count", len(req.Tools))
 
 	if p.config.EnableCaching {
-		cacheControl := anthropic.NewCacheControlEphemeralParam()
-		cacheControl.TTL = anthropicCacheTTL(p.config.PromptCacheTTL)
-		params.CacheControl = cacheControl
+		params.CacheControl = p.newCacheControl()
 	}
 
 	return params
+}
+
+// applyAnthropicToolChoice maps the provider-agnostic ToolChoice string to
+// the Anthropic SDK's ToolChoiceUnionParam. Only applied when tools are present.
+// When disableParallel is true, the DisableParallelToolUse flag is set on the
+// chosen variant (auto, any, or tool).
+func applyAnthropicToolChoice(params *anthropic.MessageNewParams, choice string, disableParallel bool) {
+	if len(params.Tools) == 0 {
+		return
+	}
+	normalized := strings.TrimSpace(strings.ToLower(choice))
+	switch normalized {
+	case "auto":
+		auto := &anthropic.ToolChoiceAutoParam{}
+		if disableParallel {
+			auto.DisableParallelToolUse = anthropic.Bool(true)
+		}
+		params.ToolChoice = anthropic.ToolChoiceUnionParam{OfAuto: auto}
+	case "any", "required":
+		any := &anthropic.ToolChoiceAnyParam{}
+		if disableParallel {
+			any.DisableParallelToolUse = anthropic.Bool(true)
+		}
+		params.ToolChoice = anthropic.ToolChoiceUnionParam{OfAny: any}
+	case "none":
+		params.ToolChoice = anthropic.ToolChoiceUnionParam{
+			OfNone: &anthropic.ToolChoiceNoneParam{},
+		}
+	case "":
+		// Empty string — let the API default.
+	default:
+		// Treat any other value as a specific tool name.
+		tc := anthropic.ToolChoiceParamOfTool(normalized)
+		if disableParallel {
+			tc.OfTool.DisableParallelToolUse = anthropic.Bool(true)
+		}
+		params.ToolChoice = tc
+	}
 }
 
 // resolveSystemPrompt returns the system prompt to use. Request-level takes
@@ -693,6 +739,21 @@ func resolveThinkingBudget(requestBudget int, configBudget int) int {
 	return configBudget
 }
 
+// isAnthropicThinkingEnabled returns true when the thinking config union has
+// an active variant (either adaptive or enabled with a budget).
+func isAnthropicThinkingEnabled(cfg anthropic.ThinkingConfigParamUnion) bool {
+	return cfg.OfAdaptive != nil || cfg.OfEnabled != nil
+}
+
+// newCacheControl returns a CacheControlEphemeralParam with the TTL derived
+// from the provider config. All cache breakpoints (top-level, per-tool,
+// per-block) must use the same TTL or the API returns 400.
+func (p *AnthropicProvider) newCacheControl() anthropic.CacheControlEphemeralParam {
+	cc := anthropic.NewCacheControlEphemeralParam()
+	cc.TTL = anthropicCacheTTL(p.config.PromptCacheTTL)
+	return cc
+}
+
 // anthropicCacheTTL converts a duration to the Anthropic cache TTL enum value.
 func anthropicCacheTTL(ttl time.Duration) anthropic.CacheControlEphemeralTTL {
 	if ttl >= time.Hour {
@@ -704,8 +765,15 @@ func anthropicCacheTTL(ttl time.Duration) anthropic.CacheControlEphemeralTTL {
 // convertMessages converts generic messages to Anthropic format.
 // Filters empty messages, normalizes tool call IDs, and merges
 // consecutive same-role messages to satisfy API constraints.
+// When prompt caching is enabled, a cache control breakpoint is set on
+// the last user text block so conversational context is cached.
 func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.MessageParam {
 	result := make([]anthropic.MessageParam, 0, len(messages))
+
+	// Track the index and block position of the last user text block so
+	// we can stamp it with a cache control breakpoint after the loop.
+	var lastUserIdx int
+	var lastUserHasText bool
 
 	for _, msg := range messages {
 		switch msg.Role {
@@ -716,6 +784,8 @@ func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.Mess
 			result = append(result, anthropic.NewUserMessage(
 				anthropic.NewTextBlock(msg.Content),
 			))
+			lastUserIdx = len(result) - 1
+			lastUserHasText = true
 
 		case RoleAssistant:
 			if strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 {
@@ -760,6 +830,17 @@ func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.Mess
 			result = append(result, anthropic.NewUserMessage(
 				anthropic.NewToolResultBlock(normalizeToolCallID(msg.ToolCallID), msg.Content, msg.IsError),
 			))
+		}
+	}
+
+	// Stamp the last user text block with a cache control breakpoint so
+	// that the conversational context up to this point is cached.
+	if p.config.EnableCaching && lastUserHasText && lastUserIdx < len(result) {
+		blocks := result[lastUserIdx].Content
+		if len(blocks) > 0 {
+			if tb := blocks[len(blocks)-1].OfText; tb != nil {
+				tb.CacheControl = p.newCacheControl()
+			}
 		}
 	}
 
@@ -825,17 +906,21 @@ func mergeAnthropicMessage(dst *anthropic.MessageParam, src anthropic.MessagePar
 	dst.Content = append(dst.Content, src.Content...)
 }
 
-// convertTools converts generic tools to Anthropic format
+// convertTools converts generic tools to Anthropic format. When prompt
+// caching is enabled, a cache control breakpoint is set on the last tool
+// so the tool definitions are cached across requests.
 func (p *AnthropicProvider) convertTools(tools []Tool) []anthropic.ToolUnionParam {
 	result := make([]anthropic.ToolUnionParam, len(tools))
 	for i, tool := range tools {
-		result[i] = anthropic.ToolUnionParam{
-			OfTool: &anthropic.ToolParam{
-				Name:        tool.Name,
-				Description: anthropic.String(tool.Description),
-				InputSchema: buildAnthropicSchema(tool.Parameters),
-			},
+		tp := &anthropic.ToolParam{
+			Name:        tool.Name,
+			Description: anthropic.String(tool.Description),
+			InputSchema: buildAnthropicSchema(tool.Parameters),
 		}
+		if p.config.EnableCaching && i == len(tools)-1 {
+			tp.CacheControl = p.newCacheControl()
+		}
+		result[i] = anthropic.ToolUnionParam{OfTool: tp}
 	}
 	return result
 }
@@ -938,6 +1023,11 @@ func (p *AnthropicProvider) convertStreamEvent(event anthropic.MessageStreamEven
 				},
 				Timestamp: time.Now(),
 			}
+		case anthropic.SignatureDelta:
+			// Signature deltas carry the opaque thinking block signature.
+			// The contentBlockTracker accumulator already captures them for
+			// multi-turn replay; no user-visible chunk is needed.
+			return nil
 		}
 
 	case anthropic.ContentBlockStartEvent:
@@ -1113,6 +1203,10 @@ func (p *AnthropicProvider) convertStopReason(reason anthropic.StopReason) StopR
 		return StopReasonStopSequence
 	case anthropic.StopReasonToolUse:
 		return StopReasonToolUse
+	case anthropic.StopReasonPauseTurn:
+		return StopReasonPauseTurn
+	case anthropic.StopReasonRefusal:
+		return StopReasonContentFilter
 	default:
 		return StopReasonEndTurn
 	}

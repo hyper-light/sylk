@@ -67,6 +67,7 @@ type Property struct {
 	Enum        []string             `json:"enum,omitempty"`
 	Items       *Property            `json:"items,omitempty"`      // For arrays
 	Properties  map[string]*Property `json:"properties,omitempty"` // For nested objects
+	Required    []string             `json:"required,omitempty"`   // For nested object required sub-properties
 	Default     any                  `json:"default,omitempty"`
 }
 

@@ -20,17 +20,18 @@ var (
 // also has an edge to Failed. Terminal states (Completed, Failed) have no
 // outgoing edges.
 var planTransitions = map[PlanStatus][]PlanStatus{
-	PlanStatusPending:       {PlanStatusAnalyzing, PlanStatusFailed},
-	PlanStatusAnalyzing:     {PlanStatusConsulting, PlanStatusFailed},
-	PlanStatusConsulting:    {PlanStatusClarifying, PlanStatusDesigning, PlanStatusFailed},
-	PlanStatusClarifying:    {PlanStatusPending, PlanStatusFailed},
-	PlanStatusDesigning:     {PlanStatusGenerating, PlanStatusFailed},
-	PlanStatusGenerating:    {PlanStatusOrchestrating, PlanStatusFailed},
-	PlanStatusOrchestrating: {PlanStatusReady, PlanStatusFailed},
-	PlanStatusReady:         {PlanStatusExecuting, PlanStatusPending, PlanStatusFailed},
+	PlanStatusPending:       {PlanStatusAnalyzing, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusAnalyzing:     {PlanStatusConsulting, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusConsulting:    {PlanStatusClarifying, PlanStatusDesigning, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusClarifying:    {PlanStatusPending, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusDesigning:     {PlanStatusGenerating, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusGenerating:    {PlanStatusOrchestrating, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusOrchestrating: {PlanStatusReady, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusReady:         {PlanStatusExecuting, PlanStatusPending, PlanStatusFailed, PlanStatusSuperseded},
 	PlanStatusExecuting:     {PlanStatusCompleted, PlanStatusFailed, PlanStatusPending},
 	PlanStatusCompleted:     {},
 	PlanStatusFailed:        {},
+	PlanStatusSuperseded:    {},
 }
 
 // guardKey identifies a specific from→to edge for guard registration.

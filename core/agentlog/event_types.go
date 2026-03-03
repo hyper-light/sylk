@@ -54,8 +54,11 @@ const (
 	EventNodeFailed       EventType = 0x0207
 	EventLayerStarted     EventType = 0x0208
 	EventLayerCompleted   EventType = 0x0209
-	EventLayerDecisionReq EventType = 0x020A
+	EventLayerDecisionReq  EventType = 0x020A
 	EventLayerDecisionRecv EventType = 0x020B
+	EventNodeAcked         EventType = 0x020C
+	EventPipelineExpanded  EventType = 0x020D
+	EventStageTransition   EventType = 0x020E
 	EventPipelineUpdate      EventType = 0x0220
 	EventPipelineStateChange EventType = 0x0221
 	EventPipelineQuerySent   EventType = 0x0222
@@ -237,6 +240,9 @@ func init() {
 	eventNames[EventLayerCompleted] = "LayerCompleted"
 	eventNames[EventLayerDecisionReq] = "LayerDecisionReq"
 	eventNames[EventLayerDecisionRecv] = "LayerDecisionRecv"
+	eventNames[EventNodeAcked] = "NodeAcked"
+	eventNames[EventPipelineExpanded] = "PipelineExpanded"
+	eventNames[EventStageTransition] = "StageTransition"
 
 	// Orchestrator — Pipeline
 	eventNames[EventPipelineUpdate] = "PipelineUpdate"
