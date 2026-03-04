@@ -94,7 +94,7 @@ func newMockRuntime(t *testing.T) *mockRuntime {
 	}
 }
 
-func (r *mockRuntime) CreateContainer(_ context.Context, spec container.ContainerSpec, _ *container.Pod) (*container.Container, error) {
+func (r *mockRuntime) CreateContainer(_ context.Context, spec container.ContainerSpec) (*container.Container, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c, err := r.createFunc(context.Background(), spec)
@@ -144,14 +144,6 @@ func (r *mockRuntime) ContainerStatus(c *container.Container) *container.Contain
 	return &container.ContainerStatus{ID: c.ID(), State: c.State()}
 }
 
-func (r *mockRuntime) CreatePod(_ context.Context, _ container.PodSpec) (*container.Pod, error) {
-	return nil, nil
-}
-
-func (r *mockRuntime) StartPod(_ context.Context, _ *container.Pod) error  { return nil }
-func (r *mockRuntime) StopPod(_ context.Context, _ *container.Pod) error   { return nil }
-func (r *mockRuntime) RemovePod(_ context.Context, _ *container.Pod) error { return nil }
-func (r *mockRuntime) PodStatus(_ *container.Pod) *container.PodStatus     { return nil }
 
 func (r *mockRuntime) createdCount() int {
 	r.mu.Lock()

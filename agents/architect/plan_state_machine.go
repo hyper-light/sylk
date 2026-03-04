@@ -231,6 +231,6 @@ func readyPlanDirective(planID string, epoch ...uint64) *guide.ResponseDirective
 		Phase:    guide.PhasePlanApproval,
 		AgentID:  "architect",
 		Metadata: metadata,
-		TTL:      readyPlanMaxAge,
+		TTL:      ReadyPlanMaxAge,
 	}
 }

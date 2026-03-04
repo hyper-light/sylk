@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 )
@@ -104,18 +103,6 @@ func normalizeConversationRequest(cr orchestratorConversationRequest) orchestrat
 // into the user message for the LLM conversation call.
 func buildConversationUserPrompt(cr orchestratorConversationRequest) string {
 	var b strings.Builder
-
-	// Prior conversation history.
-	if len(cr.History) > 0 {
-		b.WriteString("## Prior Conversation\n\n")
-		for _, turn := range cr.History {
-			b.WriteString(fmt.Sprintf("[%s] User: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.UserInput))
-			if turn.AgentReply != "" {
-				b.WriteString(fmt.Sprintf("[%s] %s: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.AgentID, turn.AgentReply))
-			}
-		}
-		b.WriteString("\n---\n\n")
-	}
 
 	// Runtime context block.
 	b.WriteString("## Runtime Context\n\n")

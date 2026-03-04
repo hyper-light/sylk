@@ -96,6 +96,9 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 		llmReq.ToolChoice = "auto"
 	}
 
+	// Prepend conversation history as multi-turn message pairs.
+	shared.PrependHistoryMessages(llmReq, cr.History)
+
 	llmCtx, cancel := context.WithTimeout(ctx, o.config.LLMTimeout)
 	defer cancel()
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())

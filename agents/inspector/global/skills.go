@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"time"
 
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -36,12 +38,28 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(requestUserClarificationSkill(gi))
 	gi.skills.Register(escalateFindingsSkill(gi))
 
+	// Diagnostics
+	gi.skills.Register(agentShared.NewSelfDiagnosticSkill(&globalInspectorDiag{gi: gi}))
+
 	// Standard reroute.
 	gi.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   gi.id,
 		SessionID: func() string { return gi.config.SessionID },
 		Publish:   gi.publishRerouteRequest,
 	}))
+}
+
+type globalInspectorDiag struct{ gi *GlobalInspector }
+
+func (d *globalInspectorDiag) AgentName() string  { return "inspector_global" }
+func (d *globalInspectorDiag) SessionID() string  { return d.gi.config.SessionID }
+func (d *globalInspectorDiag) LogsDir() string    { return agentShared.LogsDirForAgent(d.gi.steering.SessionDir(), "inspector_global") }
+func (d *globalInspectorDiag) EventLogger() *agentlog.SessionEventLogger { return d.gi.steering.EventLogger() }
+func (d *globalInspectorDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *globalInspectorDiag) RecoveryHints() []string                   { return nil }
+
+func (d *globalInspectorDiag) AgentSpecificDiagnostics() map[string]any {
+	return map[string]any{}
 }
 
 func auditLayerSkill(gi *GlobalInspector) *skills.Skill {

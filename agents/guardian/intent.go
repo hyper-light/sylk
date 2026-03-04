@@ -27,6 +27,8 @@ var checkpointKeywords = []string{
 var reportKeywords = []string{
 	"health report", "status report", "agent health", "agent status",
 	"budget status", "token usage", "cost report", "how are agents",
+	"registered", "activation", "tier", "daemon", "goroutines",
+	"memory usage", "vfs", "logs", "system status",
 }
 
 var assessKeywords = []string{

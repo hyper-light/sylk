@@ -2,48 +2,32 @@ package archivalist
 
 import (
 	"context"
+	"sync"
 
-	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
-// AnthropicMessagesClient defines the interface for Anthropic API calls
-// This allows mocking the Anthropic client in tests
-type AnthropicMessagesClient interface {
-	New(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error)
-}
-
-// RealAnthropicClient wraps the real Anthropic client
-type RealAnthropicClient struct {
-	messages *anthropic.MessageService
-}
-
-// NewRealAnthropicClient creates a wrapper around the real Anthropic client
-func NewRealAnthropicClient(client *anthropic.Client) *RealAnthropicClient {
-	return &RealAnthropicClient{messages: &client.Messages}
-}
-
-// New calls the real Anthropic API
-func (r *RealAnthropicClient) New(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
-	return r.messages.New(ctx, params)
-}
-
-// MockAnthropicClient provides a mock implementation for testing
-type MockAnthropicClient struct {
-	Response *anthropic.Message
+// MockProvider provides a mock implementation of archivalistProvider for testing
+type MockProvider struct {
+	mu       sync.Mutex
+	Response *providers.Response
 	Error    error
-	Calls    []anthropic.MessageNewParams
+	Calls    []*providers.Request
 }
 
-// NewMockAnthropicClient creates a new mock client
-func NewMockAnthropicClient() *MockAnthropicClient {
-	return &MockAnthropicClient{
-		Calls: make([]anthropic.MessageNewParams, 0),
+// NewMockProvider creates a new mock provider
+func NewMockProvider() *MockProvider {
+	return &MockProvider{
+		Calls: make([]*providers.Request, 0),
 	}
 }
 
-// New records the call and returns the configured response
-func (m *MockAnthropicClient) New(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
-	m.Calls = append(m.Calls, params)
+// Complete records the call and returns the configured response
+func (m *MockProvider) Complete(ctx context.Context, req *providers.Request) (*providers.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.Calls = append(m.Calls, req)
 	if m.Error != nil {
 		return nil, m.Error
 	}
@@ -51,12 +35,13 @@ func (m *MockAnthropicClient) New(ctx context.Context, params anthropic.MessageN
 }
 
 // SetResponse configures the mock to return a specific response
-func (m *MockAnthropicClient) SetResponse(content string, inputTokens, outputTokens int64) {
-	m.Response = &anthropic.Message{
-		Content: []anthropic.ContentBlockUnion{
-			{Type: "text", Text: content},
-		},
-		Usage: anthropic.Usage{
+func (m *MockProvider) SetResponse(content string, inputTokens, outputTokens int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.Response = &providers.Response{
+		Content: content,
+		Usage: providers.Usage{
 			InputTokens:  inputTokens,
 			OutputTokens: outputTokens,
 		},
@@ -64,18 +49,27 @@ func (m *MockAnthropicClient) SetResponse(content string, inputTokens, outputTok
 }
 
 // SetError configures the mock to return an error
-func (m *MockAnthropicClient) SetError(err error) {
+func (m *MockProvider) SetError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.Error = err
 }
 
 // Reset clears all recorded calls and responses
-func (m *MockAnthropicClient) Reset() {
+func (m *MockProvider) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.Calls = m.Calls[:0]
 	m.Response = nil
 	m.Error = nil
 }
 
-// CallCount returns the number of API calls made
-func (m *MockAnthropicClient) CallCount() int {
+// CallCount returns the number of calls made
+func (m *MockProvider) CallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	return len(m.Calls)
 }

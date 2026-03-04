@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/adalundhe/sylk/core/search"
+	"github.com/blevesearch/bleve/v2"
 )
 
 // GlobalVersionBleveStore manages per-version Bleve indices for the global knowledge graph.
@@ -293,5 +294,16 @@ func (gvbs *GlobalVersionBleveStore) Store() *BleveStore {
 	gvbs.mu.RLock()
 	defer gvbs.mu.RUnlock()
 	return gvbs.store
+}
+
+// RawIndex returns the underlying bleve.Index for direct query access.
+// Returns nil if HEAD is not open. The caller must not close it.
+func (gvbs *GlobalVersionBleveStore) RawIndex() bleve.Index {
+	gvbs.mu.RLock()
+	defer gvbs.mu.RUnlock()
+	if gvbs.store == nil || gvbs.store.Manager() == nil {
+		return nil
+	}
+	return gvbs.store.Manager().RawIndex()
 }
 

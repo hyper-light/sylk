@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"time"
 
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -40,12 +42,32 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(requestOverrideSkill(pi))
 	pi.skills.Register(getValidationStatusSkill(pi))
 
+	// Diagnostics
+	pi.skills.Register(agentShared.NewSelfDiagnosticSkill(&pipelineInspectorDiag{pi: pi}))
+
 	// Standard reroute.
 	pi.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   pi.id,
 		SessionID: func() string { return pi.config.SessionID },
 		Publish:   pi.publishRerouteRequest,
 	}))
+}
+
+type pipelineInspectorDiag struct{ pi *PipelineInspector }
+
+func (d *pipelineInspectorDiag) AgentName() string  { return "inspector_pipeline" }
+func (d *pipelineInspectorDiag) SessionID() string  { return d.pi.config.SessionID }
+func (d *pipelineInspectorDiag) LogsDir() string    { return agentShared.LogsDirForAgent(d.pi.steering.SessionDir(), "inspector_pipeline") }
+func (d *pipelineInspectorDiag) EventLogger() *agentlog.SessionEventLogger { return d.pi.steering.EventLogger() }
+func (d *pipelineInspectorDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *pipelineInspectorDiag) RecoveryHints() []string                   { return nil }
+
+func (d *pipelineInspectorDiag) AgentSpecificDiagnostics() map[string]any {
+	d.pi.mu.RLock()
+	defer d.pi.mu.RUnlock()
+	return map[string]any{
+		"criteria_count": len(d.pi.criteria),
+	}
 }
 
 func defineCriteriaSkill(pi *PipelineInspector) *skills.Skill {

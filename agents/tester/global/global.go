@@ -68,6 +68,9 @@ type GlobalTester struct {
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
 
+	// Agent pod for cross-agent coordination (Scribe feed, etc.).
+	agentPod *agentshared.AgentPod
+
 	// File access (injected per-session at runtime).
 	fileAccess versioning.FileAccess
 
@@ -277,11 +280,34 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(reportToArchitectSkill(gt))
 	gt.skills.Register(escalateFailureSkill(gt))
 
+	// Diagnostics
+	gt.skills.Register(agentshared.NewSelfDiagnosticSkill(&globalTesterDiag{gt: gt}))
+
 	gt.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   gt.id,
 		SessionID: func() string { return gt.config.SessionID },
 		Publish:   gt.publishRerouteRequest,
 	}))
+}
+
+type globalTesterDiag struct{ gt *GlobalTester }
+
+func (d *globalTesterDiag) AgentName() string  { return "tester_global" }
+func (d *globalTesterDiag) SessionID() string  { return d.gt.config.SessionID }
+func (d *globalTesterDiag) LogsDir() string    { return agentshared.LogsDirForAgent(d.gt.steering.SessionDir(), "tester_global") }
+func (d *globalTesterDiag) EventLogger() *agentlog.SessionEventLogger { return d.gt.steering.EventLogger() }
+func (d *globalTesterDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *globalTesterDiag) RecoveryHints() []string                   { return nil }
+
+func (d *globalTesterDiag) AgentSpecificDiagnostics() map[string]any {
+	d.gt.mu.RLock()
+	defer d.gt.mu.RUnlock()
+	result := map[string]any{}
+	if d.gt.currentPlan != nil {
+		result["test_plan_id"] = d.gt.currentPlan.ID
+		result["planned_cases"] = len(d.gt.currentPlan.PlannedCase)
+	}
+	return result
 }
 
 // Close shuts down the global tester.
@@ -410,6 +436,9 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		Tools: tools,
 	}
 
+	// Prepend conversation history as multi-turn message pairs.
+	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
+
 	result, err := gt.executeToolLoop(ctx, req, agentshared.SteeringLedgerFromContext(ctx))
 	if err != nil {
 		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -474,6 +503,9 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 
 	toolEmitter := agentshared.NewToolCallEmitter(gt.bus, gt.channels, "tester", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
+	ctx = agentshared.WithContextGovernor(ctx, agentshared.NewContextGovernor(
+		gt.config.Model, gt.config.MaxTokens, 0,
+	))
 	if !fwd.FireAndForget {
 		gt.publishStreamStart(ctx)
 	}
@@ -522,6 +554,10 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		completeText = ""
 	}
 	gt.publishStreamComplete(ctx, completeText, usageAcc.Total())
+
+	if gt.agentPod != nil {
+		gt.agentPod.FeedScribe("tester", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 
 	respMsg := guide.NewResponseMessage(gt.generateMessageID(), resp)
 	return gt.bus.Publish(gt.channels.Responses, respMsg)
@@ -642,6 +678,11 @@ func (gt *GlobalTester) Terminate(_ context.Context) error {
 // SetHandoffBridge assigns the handoff bridge.
 func (gt *GlobalTester) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	gt.handoffBridge = bridge
+}
+
+// SetAgentPod assigns the agent pod for cross-agent coordination.
+func (gt *GlobalTester) SetAgentPod(pod *agentshared.AgentPod) {
+	gt.agentPod = pod
 }
 
 // SetFileAccess injects the per-session file access layer.

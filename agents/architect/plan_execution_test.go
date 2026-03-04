@@ -1,14 +1,28 @@
 package architect
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 )
 
-func TestLatestReadyPlan_NoPlans(t *testing.T) {
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{},
+func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
+	t.Helper()
+	store := testPlanStore(t)
+	for _, p := range plans {
+		if p.sm == nil {
+			p.sm = NewPlanStateMachine(p.ID, p.Status)
+		}
+		_ = store.Upsert(p)
 	}
+	return &Architect{
+		planStore: store,
+		logger:    slog.Default(),
+	}
+}
+
+func TestLatestReadyPlan_NoPlans(t *testing.T) {
+	a := testArchitectWithStore(t)
 	if a.latestReadyPlan("sess1") != nil {
 		t.Error("expected nil with no plans")
 	}
@@ -16,23 +30,19 @@ func TestLatestReadyPlan_NoPlans(t *testing.T) {
 
 func TestLatestReadyPlan_EmptySessionID(t *testing.T) {
 	now := time.Now()
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"a": {ID: "a", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "a", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now},
+	)
 	if a.latestReadyPlan("") != nil {
 		t.Error("expected nil with empty session ID")
 	}
 }
 
 func TestLatestReadyPlan_NoneReady(t *testing.T) {
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"a": {ID: "a", SessionID: "sess1", Status: PlanStatusAnalyzing},
-			"b": {ID: "b", SessionID: "sess1", Status: PlanStatusDesigning},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "a", SessionID: "sess1", Status: PlanStatusAnalyzing, UpdatedAt: time.Now()},
+		&DesignPlan{ID: "b", SessionID: "sess1", Status: PlanStatusDesigning, UpdatedAt: time.Now()},
+	)
 	if a.latestReadyPlan("sess1") != nil {
 		t.Error("expected nil with no ready plans")
 	}
@@ -40,12 +50,10 @@ func TestLatestReadyPlan_NoneReady(t *testing.T) {
 
 func TestLatestReadyPlan_FiltersSession(t *testing.T) {
 	now := time.Now()
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"other": {ID: "other", SessionID: "sess-old", Status: PlanStatusReady, UpdatedAt: now},
-			"mine":  {ID: "mine", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "other", SessionID: "sess-old", Status: PlanStatusReady, UpdatedAt: now},
+		&DesignPlan{ID: "mine", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now},
+	)
 
 	plan := a.latestReadyPlan("sess1")
 	if plan == nil || plan.ID != "mine" {
@@ -64,12 +72,10 @@ func TestLatestReadyPlan_FiltersSession(t *testing.T) {
 
 func TestLatestReadyPlan_SelectsMostRecent(t *testing.T) {
 	now := time.Now()
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"old": {ID: "old", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now.Add(-5 * time.Minute)},
-			"new": {ID: "new", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now.Add(-1 * time.Minute)},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "old", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now.Add(-5 * time.Minute)},
+		&DesignPlan{ID: "new", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now.Add(-1 * time.Minute)},
+	)
 
 	plan := a.latestReadyPlan("sess1")
 	if plan == nil || plan.ID != "new" {
@@ -79,12 +85,9 @@ func TestLatestReadyPlan_SelectsMostRecent(t *testing.T) {
 
 func TestLatestStalledPlan_FindsConsultingPlan(t *testing.T) {
 	now := time.Now()
-	sm := NewPlanStateMachine("stalled", PlanStatusConsulting)
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"stalled": {ID: "stalled", SessionID: "sess1", Status: PlanStatusConsulting, UpdatedAt: now, sm: sm},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "stalled", SessionID: "sess1", Status: PlanStatusConsulting, UpdatedAt: now},
+	)
 	plan := a.latestStalledPlan("sess1")
 	if plan == nil || plan.ID != "stalled" {
 		t.Errorf("expected stalled plan, got %v", plan)
@@ -93,12 +96,9 @@ func TestLatestStalledPlan_FindsConsultingPlan(t *testing.T) {
 
 func TestLatestStalledPlan_IgnoresReadyPlan(t *testing.T) {
 	now := time.Now()
-	sm := NewPlanStateMachine("ready", PlanStatusReady)
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"ready": {ID: "ready", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now, sm: sm},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "ready", SessionID: "sess1", Status: PlanStatusReady, UpdatedAt: now},
+	)
 	if a.latestStalledPlan("sess1") != nil {
 		t.Error("expected nil for ready plan")
 	}
@@ -106,12 +106,9 @@ func TestLatestStalledPlan_IgnoresReadyPlan(t *testing.T) {
 
 func TestLatestStalledPlan_IgnoresClarifyingPlan(t *testing.T) {
 	now := time.Now()
-	sm := NewPlanStateMachine("clarifying", PlanStatusClarifying)
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"clarifying": {ID: "clarifying", SessionID: "sess1", Status: PlanStatusClarifying, UpdatedAt: now, sm: sm},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "clarifying", SessionID: "sess1", Status: PlanStatusClarifying, UpdatedAt: now},
+	)
 	if a.latestStalledPlan("sess1") != nil {
 		t.Error("expected nil for clarifying plan")
 	}
@@ -119,12 +116,9 @@ func TestLatestStalledPlan_IgnoresClarifyingPlan(t *testing.T) {
 
 func TestLatestStalledPlan_IgnoresOldPlan(t *testing.T) {
 	old := time.Now().Add(-10 * time.Minute)
-	sm := NewPlanStateMachine("old", PlanStatusConsulting)
-	a := &Architect{
-		activePlans: map[string]*DesignPlan{
-			"old": {ID: "old", SessionID: "sess1", Status: PlanStatusConsulting, UpdatedAt: old, sm: sm},
-		},
-	}
+	a := testArchitectWithStore(t,
+		&DesignPlan{ID: "old", SessionID: "sess1", Status: PlanStatusConsulting, UpdatedAt: old},
+	)
 	if a.latestStalledPlan("sess1") != nil {
 		t.Error("expected nil for plan older than stalledPlanMaxAge")
 	}

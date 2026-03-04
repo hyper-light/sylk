@@ -3,21 +3,55 @@ package archivalist
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/knowledge"
+	"github.com/adalundhe/sylk/core/knowledge/memory"
+	"github.com/adalundhe/sylk/core/knowledge/query"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
 
+// archivalistProvider is the minimal interface the Archivalist needs from its LLM.
+// Satisfied by *providers.AnthropicProvider and *gateway.GatewayProvider.
+type archivalistProvider interface {
+	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+}
+
 // Archivalist is the main agent for managing AI-generated content and conversation memory
 type Archivalist struct {
-	store        *Store
+	id     string
+	store  *Store
 	archive      *Archive
-	client       *Client
 	agentContext *AgentContext
 	config       Config
+	logger       *slog.Logger
+
+	// LLM provider (replaces direct anthropic.Client)
+	provider archivalistProvider
+	client   *Client
+
+	// Containerization
+	runMu             sync.RWMutex
+	runCtx            context.Context
+	runCancel         context.CancelFunc
+	steering          *shared.SteeringManager
+	requestSerializer *shared.RequestSerializer
+	activityPub       events.ActivityPublisher
+
+	// Request lifecycle
+	requestMu      sync.Mutex
+	requestCancels map[string]context.CancelFunc
 
 	registry         *Registry
 	eventLog         *EventLog
@@ -31,13 +65,27 @@ type Archivalist struct {
 	memory      *MemoryManager
 	toolHandler *ToolHandler
 
-	bus         guide.EventBus
-	channels    *guide.AgentChannels
-	requestSub  guide.Subscription
-	responseSub guide.Subscription
-	registrySub guide.Subscription
-	running     bool
-	knownAgents map[string]*guide.AgentAnnouncement
+	// Knowledge subsystems
+	knowledgeStore    *knowledge.KnowledgeStore
+	queryCoordinator  *query.HybridQueryCoordinator
+	memoryScorer      *memory.MemoryWeightedScorer
+	hybridMemory      *memory.HybridQueryWithMemory
+	crossAgentWeights *CrossAgentWeightManager
+
+	bus            guide.EventBus
+	channels       *guide.AgentChannels
+	requestSub     guide.Subscription
+	responseSub    guide.Subscription
+	registrySub    guide.Subscription
+	logIngestSub   guide.Subscription
+	knowledgeSub   guide.Subscription
+	running        bool
+	knownAgentsMu  sync.RWMutex
+	knownAgents    map[string]*guide.AgentAnnouncement
+
+	// Synchronous consultation bus
+	pendingMu  sync.Mutex
+	pendingBus map[string]chan *guide.Message
 
 	skills      *skills.Registry
 	skillLoader *skills.Loader
@@ -50,22 +98,47 @@ type Archivalist struct {
 
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
+
+	// Log ingest store: bounded per-agent ring buffers for cross-agent log querying.
+	logIngest *LogIngestStore
 }
 
 // Config holds configuration for the Archivalist agent
 type Config struct {
-	// Anthropic API configuration
-	AnthropicAPIKey string
+	// Canonical agent ID. If empty, generates a UUID8.
+	ID string
+
+	// LLM provider wrapper — wraps an AnthropicProvider with gateway rate limiting.
+	// If nil, LLM features (synthesis, summary generation) are disabled.
+	ProviderWrapper func(*providers.AnthropicProvider) providers.ProviderAdapter
+
+	// Model to use for LLM calls (default: claude-sonnet-4-6).
+	Model string
+
+	// System prompt and output configuration
 	SystemPrompt    string // Optional, uses DefaultSystemPrompt if empty
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
+
+	// Activity publisher for UI agent-panel updates. Nil-safe.
+	ActivityPub events.ActivityPublisher
+
+	// RequestGuard is called at handler entry to prevent activation demotion
+	// during in-flight processing. Returns a release function. Nil-safe.
+	RequestGuard func() func()
+
+	// Logging
+	Logger *slog.Logger
 
 	// Storage configuration
 	ArchivePath    string // Path to SQLite archive, defaults to .sylk/archive.db
 	TokenThreshold int    // Token threshold for archiving, defaults to 750K
 
 	// Feature flags
-	EnableArchive bool // Enable SQLite archive (L2 storage)
-	EnableRAG     bool // Enable RAG components (query cache, embeddings, synthesis)
+	EnableArchive       bool // Enable SQLite archive (L2 storage)
+	EnableRAG           bool // Enable RAG components (query cache, embeddings, synthesis)
+	EnableACTR          bool // Enable ACT-R memory scoring
+	EnableHybridQuery   bool // Enable HybridQueryCoordinator
+	EnableKnowledgeGraph bool // Enable knowledge graph traversal
 
 	// Concurrency configuration
 	MaxEvents           int           // Max events in event log (default: 10000)
@@ -79,8 +152,8 @@ type Config struct {
 	SimilarityThreshold float64 // Query similarity threshold (default: 0.95)
 }
 
-// New creates a new Archivalist agent
-func New(cfg Config) (*Archivalist, error) {
+// New creates a new Archivalist agent with provider-based LLM.
+func New(ctx context.Context, cfg Config) (*Archivalist, error) {
 	cfg = applyConfigDefaults(cfg)
 	components, err := createComponents(cfg)
 	if err != nil {
@@ -111,12 +184,17 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.ConflictHistorySize == 0 {
 		cfg.ConflictHistorySize = 100
 	}
+	if cfg.Model == "" {
+		cfg.Model = ModelSonnet45
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
 	return cfg
 }
 
 // archivalistComponents holds intermediate components for assembly
 type archivalistComponents struct {
-	client           *Client
 	archive          *Archive
 	store            *Store
 	agentContext     *AgentContext
@@ -127,15 +205,6 @@ type archivalistComponents struct {
 }
 
 func createComponents(cfg Config) (*archivalistComponents, error) {
-	client, err := NewClient(ClientConfig{
-		AnthropicAPIKey: cfg.AnthropicAPIKey,
-		SystemPrompt:    cfg.SystemPrompt,
-		MaxOutputTokens: cfg.MaxOutputTokens,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create client: %w", err)
-	}
-
 	archive, err := createArchive(cfg)
 	if err != nil {
 		return nil, err
@@ -148,7 +217,6 @@ func createComponents(cfg Config) (*archivalistComponents, error) {
 	})
 
 	return &archivalistComponents{
-		client:           client,
 		archive:          archive,
 		store:            NewStore(StoreConfig{TokenThreshold: cfg.TokenThreshold, Archive: archive}),
 		agentContext:     agentContext,
@@ -171,6 +239,11 @@ func createArchive(cfg Config) (*Archive, error) {
 }
 
 func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
+	agentID := cfg.ID
+	if agentID == "" {
+		agentID = fmt.Sprintf("archivalist_%s", uuid.New().String()[:8])
+	}
+
 	// Create skills registry and loader
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
@@ -182,25 +255,35 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 	hookRegistry := skills.NewHookRegistry()
 
 	a := &Archivalist{
-		store:            c.store,
-		archive:          c.archive,
-		client:           c.client,
-		agentContext:     c.agentContext,
-		config:           cfg,
-		registry:         c.registry,
-		eventLog:         c.eventLog,
-		conflictDetector: c.conflictDetector,
-		conflictHistory:  c.conflictHistory,
-		knownAgents:      make(map[string]*guide.AgentAnnouncement),
-		skills:           skillsRegistry,
-		skillLoader:      skillLoader,
-		hooks:            hookRegistry,
+		id:                agentID,
+		store:             c.store,
+		archive:           c.archive,
+		agentContext:      c.agentContext,
+		config:            cfg,
+		logger:            cfg.Logger,
+		activityPub:       cfg.ActivityPub,
+		registry:          c.registry,
+		eventLog:          c.eventLog,
+		conflictDetector:  c.conflictDetector,
+		conflictHistory:   c.conflictHistory,
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		pendingBus:        make(map[string]chan *guide.Message),
+		requestCancels:    make(map[string]context.CancelFunc),
+		skills:            skillsRegistry,
+		skillLoader:       skillLoader,
+		hooks:             hookRegistry,
+		steering:          shared.NewSteeringManager(),
+		requestSerializer: shared.NewRequestSerializer(),
 	}
+
+	a.steering.InitLazy("archivalist", cfg.ActivityPub)
 
 	a.defaultSessionID = c.store.GetCurrentSession().ID
 	a.sessionStores = make(map[string]*SessionStore)
 	a.crossSession = NewCrossSessionIndex(c.store, c.archive, c.eventLog)
 	a.workflowStore = NewWorkflowStore(a)
+	a.logIngest = NewLogIngestStore()
+	a.crossAgentWeights = NewCrossAgentWeightManager()
 
 	a.registerCoreSkills()
 	a.registerExtendedSkills()
@@ -242,6 +325,27 @@ func (a *Archivalist) initRAG(cfg Config) error {
 	// Create memory manager
 	a.memory = NewMemoryManager(DefaultTokenBudget())
 
+	// Wire HybridQueryCoordinator if enabled.
+	// When a KnowledgeStore is set, its coordinator is already wired via
+	// SetKnowledgeStore — skip building a local one.
+	if cfg.EnableHybridQuery && a.knowledgeStore == nil {
+		a.queryCoordinator = buildQueryCoordinator(QueryCoordinatorConfig{
+			EmbeddingStore: a.embeddings,
+		})
+	}
+
+	// Wire ACT-R memory scoring if enabled
+	if cfg.EnableACTR {
+		mi, err := buildMemoryIntegration(MemoryIntegrationConfig{
+			ArchivePath: cfg.ArchivePath,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create memory integration: %w", err)
+		}
+		a.memoryScorer = mi.scorer
+		a.hybridMemory = mi.hybrid
+	}
+
 	// Create semantic retriever
 	retriever, err := NewSemanticRetriever(SemanticRetrieverConfig{
 		DBPath:       cfg.ArchivePath,
@@ -254,9 +358,10 @@ func (a *Archivalist) initRAG(cfg Config) error {
 	}
 	a.retriever = retriever
 
-	// Create synthesizer
+	// Create synthesizer with provider-based LLM
 	a.synthesizer = NewSynthesizer(SynthesizerConfig{
-		Client:     &a.client.anthropic,
+		Provider:   a.provider,
+		Model:      cfg.Model,
 		Retriever:  a.retriever,
 		QueryCache: a.queryCache,
 	})
@@ -272,7 +377,15 @@ func (a *Archivalist) Close() error {
 	// Stop event bus subscriptions first
 	a.Stop()
 
-	// Close event log first to flush any pending writes
+	// Close knowledge subsystems
+	if a.queryCoordinator != nil {
+		a.queryCoordinator.Close()
+	}
+	if a.memoryScorer != nil {
+		a.memoryScorer.Stop()
+	}
+
+	// Close event log to flush any pending writes
 	if a.eventLog != nil {
 		a.eventLog.Close()
 	}
@@ -304,7 +417,8 @@ func (a *Archivalist) Start(bus guide.EventBus) error {
 	}
 
 	a.bus = bus
-	a.channels = guide.NewAgentChannels("archivalist", "archivalist")
+	a.channels = guide.NewAgentChannels("archivalist", a.id)
+	a.runCtx, a.runCancel = context.WithCancel(context.Background())
 
 	// Subscribe to own request channel (archivalist.requests)
 	var err error
@@ -328,7 +442,16 @@ func (a *Archivalist) Start(bus guide.EventBus) error {
 		return fmt.Errorf("failed to subscribe to %s: %w", guide.TopicAgentRegistry, err)
 	}
 
+	// Subscribe to log ingest topic for cross-agent log aggregation.
+	if a.logIngest != nil {
+		a.logIngestSub, _ = bus.SubscribeAsync(guide.TopicLogIngest, a.handleLogIngest)
+	}
+
+	// Subscribe to knowledge readiness for telemetry and cache warming.
+	a.knowledgeSub, _ = bus.SubscribeAsync(guide.TopicKnowledgeReady, a.handleKnowledgeReady)
+
 	a.running = true
+	a.logger.Info("archivalist started", "id", a.id, "channels", a.channels)
 	return nil
 }
 
@@ -338,12 +461,19 @@ func (a *Archivalist) Stop() error {
 		return nil
 	}
 
+	a.steering.CloseAll()
+	if a.runCancel != nil {
+		a.runCancel()
+	}
+
 	errs := a.unsubscribeAll()
 	a.running = false
 
 	if len(errs) > 0 {
 		return fmt.Errorf("errors during stop: %v", errs)
 	}
+
+	a.logger.Info("archivalist stopped", "id", a.id)
 	return nil
 }
 
@@ -357,6 +487,18 @@ func (a *Archivalist) unsubscribeAll() []error {
 	}
 	if err := a.unsubscribeRegistry(); err != nil {
 		errs = append(errs, err)
+	}
+	if a.logIngestSub != nil {
+		if err := a.logIngestSub.Unsubscribe(); err != nil {
+			errs = append(errs, err)
+		}
+		a.logIngestSub = nil
+	}
+	if a.knowledgeSub != nil {
+		if err := a.knowledgeSub.Unsubscribe(); err != nil {
+			errs = append(errs, err)
+		}
+		a.knowledgeSub = nil
 	}
 	return errs
 }
@@ -388,6 +530,28 @@ func (a *Archivalist) unsubscribeRegistry() error {
 	return err
 }
 
+// handleKnowledgeReady is called when a knowledge layer is promoted.
+// The coordinator already has the new searchers set atomically — this
+// handler is for awareness and telemetry side-effects only.
+func (a *Archivalist) handleKnowledgeReady(msg *guide.Message) error {
+	payload, ok := msg.GetKnowledgeReadyPayload()
+	if !ok {
+		return nil
+	}
+	a.logger.Info("knowledge layer promoted",
+		"level", payload.Level,
+		"searchers", payload.Searchers,
+	)
+	if a.activityPub != nil {
+		a.activityPub.PublishActivity(&events.ActivityEvent{
+			AgentID:   a.id,
+			EventType: events.EventTypeAgentAction,
+			Content:   fmt.Sprintf("knowledge ready: searchers %v", payload.Searchers),
+		})
+	}
+	return nil
+}
+
 // IsRunning returns true if the archivalist is actively processing bus messages
 func (a *Archivalist) IsRunning() bool {
 	return a.running
@@ -403,57 +567,151 @@ func (a *Archivalist) Channels() *guide.AgentChannels {
 	return a.channels
 }
 
+// handleLogIngest processes log entries broadcast by agents for cross-agent aggregation.
+func (a *Archivalist) handleLogIngest(msg *guide.Message) error {
+	if a.logIngest == nil {
+		return nil
+	}
+	entry, ok := msg.Payload.(agentlog.JSONLEntry)
+	if !ok {
+		return nil
+	}
+	a.logIngest.Ingest(entry)
+	return nil
+}
+
 // handleBusRequest processes incoming forwarded requests from the event bus
 func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
-	if msg.Type != guide.MessageTypeForward {
-		return nil // Ignore non-forward messages
+	if msg.Type == guide.MessageTypeAction {
+		return a.handleActionMessage(msg)
 	}
+	if msg.Type != guide.MessageTypeForward {
+		return nil
+	}
+
+	if !a.requestSerializer.Acquire(a.runCtx) {
+		return nil // parent context done, agent shutting down
+	}
+	defer a.requestSerializer.Release()
 
 	fwd, ok := msg.GetForwardedRequest()
 	if !ok {
 		return fmt.Errorf("invalid forward request payload")
 	}
 
-	// Process the request
-	ctx := context.Background()
+	a.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
+	shared.LogIncomingRequest(a.steering.EventLogger(), fwd, a.id)
+	shared.EmitDispatchACK(a.bus, fwd.Metadata, a.id, "archivalist", fwd.CorrelationID)
+	a.publishActivity(events.EventTypeAgentAction, "Processing archivalist request")
+
+	if a.config.RequestGuard != nil {
+		release := a.config.RequestGuard()
+		defer release()
+	}
+
+	// Request-scoped cancellable context.
+	reqCtx, cancel := context.WithCancel(a.runCtx)
+	a.registerRequestCancel(fwd.CorrelationID, cancel)
+	a.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	defer a.clearRequestCancel(fwd.CorrelationID)
+	defer cancel()
+
+	// Create steering ledger for this request.
+	ledger := a.steering.Create(fwd.CorrelationID, a.id, fwd.SessionID, nil, nil)
+	defer a.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
+
 	startTime := time.Now()
 
-	result, err := a.processForwardedRequest(ctx, fwd)
+	emitter := shared.NewToolCallEmitter(a.bus, a.channels, "archivalist", fwd.CorrelationID, fwd.SourceAgentID)
+	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx = shared.WithSteeringLedger(ctx, ledger)
+	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
+		EventLogger: a.steering.EventLogger(),
+		CorrID:      fwd.CorrelationID,
+		AgentID:     a.id,
+		SessionID:   fwd.SessionID,
+	})
 
-	// Don't respond if fire-and-forget
+	result, err := a.processForwardedRequest(ctx, fwd)
+	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, a.id, fwd.SessionID, time.Since(startTime), err)
+
 	if fwd.FireAndForget {
 		return nil
 	}
 
-	// Build response
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "archivalist",
+		RespondingAgentID:   a.id,
 		RespondingAgentName: "archivalist",
 		ProcessingTime:      time.Since(startTime),
 	}
 
 	if err != nil {
 		resp.Error = err.Error()
-		// Publish to error channel
-		errMsg := guide.NewErrorMessage(
-			fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-			fwd.CorrelationID,
-			"archivalist",
-			err.Error(),
-		)
+		a.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()))
+		errMsg := guide.NewErrorMessage(a.generateMessageID(), fwd.CorrelationID, a.id, err.Error())
 		return a.bus.Publish(a.channels.Errors, errMsg)
 	}
 
 	resp.Data = result
+	a.publishActivity(events.EventTypeAgentAction, "Request completed")
 
-	// Publish response to own response channel
-	respMsg := guide.NewResponseMessage(
-		fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		resp,
-	)
+	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
+}
+
+func (a *Archivalist) handleActionMessage(msg *guide.Message) error {
+	action, ok := msg.GetActionRequest()
+	if !ok || action == nil {
+		return nil
+	}
+	if a.steering.HandleAction(action) {
+		return nil
+	}
+	if action.Action == "cancel" {
+		a.cancelRequest(action.CorrelationID)
+	}
+	return nil
+}
+
+func (a *Archivalist) generateMessageID() string {
+	return fmt.Sprintf("archivalist_msg_%s", uuid.New().String())
+}
+
+func (a *Archivalist) registerRequestCancel(correlationID string, cancel context.CancelFunc) {
+	a.requestMu.Lock()
+	a.requestCancels[correlationID] = cancel
+	a.requestMu.Unlock()
+}
+
+func (a *Archivalist) clearRequestCancel(correlationID string) {
+	a.requestMu.Lock()
+	delete(a.requestCancels, correlationID)
+	a.requestMu.Unlock()
+}
+
+func (a *Archivalist) cancelRequest(correlationID string) {
+	a.requestMu.Lock()
+	cancel := a.requestCancels[correlationID]
+	delete(a.requestCancels, correlationID)
+	a.requestMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// publishActivity emits a user-visible activity event.
+func (a *Archivalist) publishActivity(eventType events.EventType, content string) {
+	if a.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, a.defaultSessionID, content)
+	evt.AgentID = a.id
+	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "archivalist"
+	evt.Data["agent_name"] = "Archivalist"
+	a.activityPub.PublishActivity(evt)
 }
 
 // processForwardedRequest handles the actual request processing
@@ -609,18 +867,22 @@ func (a *Archivalist) handleRegistryAnnouncement(msg *guide.Message) error {
 		return nil
 	}
 
+	a.knownAgentsMu.Lock()
 	switch msg.Type {
 	case guide.MessageTypeAgentRegistered:
 		a.knownAgents[ann.AgentID] = ann
 	case guide.MessageTypeAgentUnregistered:
 		delete(a.knownAgents, ann.AgentID)
 	}
+	a.knownAgentsMu.Unlock()
 
 	return nil
 }
 
 // GetKnownAgents returns all agents the archivalist knows about
 func (a *Archivalist) GetKnownAgents() map[string]*guide.AgentAnnouncement {
+	a.knownAgentsMu.RLock()
+	defer a.knownAgentsMu.RUnlock()
 	result := make(map[string]*guide.AgentAnnouncement, len(a.knownAgents))
 	for k, v := range a.knownAgents {
 		result[k] = v
@@ -2103,7 +2365,7 @@ func (a *Archivalist) ExecutePostQueryHooks(ctx context.Context, data *skills.Qu
 
 // AgentID returns the unique identifier for this agent instance.
 func (a *Archivalist) AgentID() string {
-	return "archivalist"
+	return a.id
 }
 
 // AgentType returns the type classification for this agent.
@@ -2111,12 +2373,68 @@ func (a *Archivalist) AgentType() string {
 	return "archivalist"
 }
 
+// SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+func (a *Archivalist) SetProvider(p archivalistProvider) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.provider = p
+	a.client = NewClient(ClientConfig{
+		Provider:        p,
+		Model:           a.config.Model,
+		SystemPrompt:    a.config.SystemPrompt,
+		MaxOutputTokens: a.config.MaxOutputTokens,
+	})
+}
+
+// SetKnowledgeStore wires the archivalist to use the KnowledgeStore's
+// coordinator instead of a locally-built one. The coordinator's atomic
+// searchers are set progressively as boot phases complete.
+func (a *Archivalist) SetKnowledgeStore(ks *knowledge.KnowledgeStore) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.knowledgeStore = ks
+	a.queryCoordinator = ks.Coordinator()
+}
+
+// SwapModel implements container.ModelSwappable.
+func (a *Archivalist) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	a.provider = provider
+	a.config.Model = modelID
+	a.client = NewClient(ClientConfig{
+		Provider:        provider,
+		Model:           modelID,
+		SystemPrompt:    a.config.SystemPrompt,
+		MaxOutputTokens: a.config.MaxOutputTokens,
+	})
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (a *Archivalist) CurrentModel() string {
+	a.runMu.RLock()
+	defer a.runMu.RUnlock()
+	return a.config.Model
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (a *Archivalist) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6"},
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+	}
+}
+
+// Compile-time interface check.
+var _ container.ModelSwappable = (*Archivalist)(nil)
+
 // Descriptor returns the immutable metadata describing this agent type.
 func (a *Archivalist) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:     "archivalist",
-		ModelID:       "sonnet-4.5-1m",
-		ContextWindow: 1000000,
+		ModelID:       a.config.Model,
+		ContextWindow: MaxContextTokens,
 		Category:      handoff.CategoryKnowledge,
 	}
 }

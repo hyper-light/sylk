@@ -15,6 +15,7 @@ type BridgeConfig struct {
 	QualityConfig  *QualityHookConfig
 	ContextConfig  *ContextCheckConfig
 	EvictionConfig *HandoffAwareEvictionConfig // nil for non-knowledge agents
+	BriefSource    BriefSource                 // nil = no brief generation
 }
 
 // BridgeConfigForAgent creates an appropriate BridgeConfig based on agent descriptor.
@@ -100,6 +101,9 @@ type HandoffBridge struct {
 	// Active traffic shift — non-nil during gradual handoff.
 	activeShift *TrafficShiftController
 
+	// Context brief generator — produces LLM-generated handoff summaries.
+	briefGen *BriefGenerator
+
 	turnCount atomic.Int64
 	started   atomic.Bool
 	stopCh    chan struct{}
@@ -158,6 +162,11 @@ func NewHandoffBridge(cfg BridgeConfig, agent HandoffableAgent, sup *HandoffSupe
 				_ = sup.wal.WriteOverlapEvent(entry)
 			}
 		})
+	}
+
+	// Wire brief generator from BriefSource if provided.
+	if cfg.BriefSource != nil {
+		b.briefGen = NewBriefGenerator(cfg.BriefSource)
 	}
 
 	return b
@@ -281,6 +290,9 @@ func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 	// Publish GP quality to service registry.
 	b.publishQualityUpdate(rec)
 
+	// Pre-generate brief when quality slope is negative.
+	b.maybeGenerateBrief(rec)
+
 	// If a traffic shift is active and this turn is from the new agent,
 	// increment the new-agent turn counter.
 	b.mu.RLock()
@@ -397,6 +409,40 @@ func (b *HandoffBridge) publishQualityUpdate(rec TurnRecord) {
 	}
 
 	publisher(agentID, pred.Mean, pred.StdDev)
+}
+
+// briefLookaheadTokens is the context-size lookahead for detecting quality slope.
+// Derived from typical per-turn context growth (~2000 tokens).
+const briefLookaheadTokens = 2000
+
+// briefSlopeThreshold is the minimum quality drop to trigger brief generation.
+const briefSlopeThreshold = 0.05
+
+// maybeGenerateBrief pre-generates a handoff brief when the GP predicts
+// declining quality (negative slope). This runs asynchronously and stores
+// the result for later injection into PreparedContext.
+func (b *HandoffBridge) maybeGenerateBrief(rec TurnRecord) {
+	if b.briefGen == nil {
+		return
+	}
+
+	pred := b.gp.Predict(rec.ContextSize, rec.OutputTokens, rec.ToolCalls)
+	if pred == nil {
+		return
+	}
+
+	futurePred := b.gp.Predict(rec.ContextSize+briefLookaheadTokens, rec.OutputTokens, rec.ToolCalls)
+	if futurePred == nil {
+		return
+	}
+
+	if pred.Mean <= futurePred.Mean+briefSlopeThreshold {
+		return
+	}
+
+	// Quality is dropping — pre-generate brief.
+	msgs := b.prepared.RecentMessages()
+	b.briefGen.Generate(context.Background(), msgs, b.config.Descriptor.AgentType, rec.ContextSize, rec.TurnNumber)
 }
 
 // buildShiftConfig derives a ShiftConfig from the bridge's current state.
@@ -553,6 +599,10 @@ func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
 	}
 
 	// Fallback: synchronous handoff (no parallel buffer).
+	if b.briefGen != nil {
+		b.briefGen.SetOnPreparedContext(b.prepared)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -583,6 +633,11 @@ func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
 // agent receives canary traffic first and weight ramps up as GP quality is
 // confirmed.
 func (b *HandoffBridge) executeOverlapHandoff(_ *HandoffRecommendation) {
+	// Inject latest brief into prepared context before snapshot.
+	if b.briefGen != nil {
+		b.briefGen.SetOnPreparedContext(b.prepared)
+	}
+
 	// Snapshot is already materialized — O(1) atomic read.
 	snapshot := b.parallelBuffer.Snapshot()
 	if snapshot == nil || snapshot.TotalTokens == 0 {

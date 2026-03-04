@@ -283,14 +283,9 @@ func (a *Architect) selectPlan(planID string) (*DesignPlan, error) {
 }
 
 func (a *Architect) latestPlan() *DesignPlan {
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	if len(a.activePlans) == 0 {
+	plans := a.planStore.Snapshot()
+	if len(plans) == 0 {
 		return nil
-	}
-	plans := make([]*DesignPlan, 0, len(a.activePlans))
-	for _, plan := range a.activePlans {
-		plans = append(plans, plan)
 	}
 	sort.Slice(plans, func(i, j int) bool {
 		return plans[i].UpdatedAt.After(plans[j].UpdatedAt)
@@ -375,26 +370,14 @@ func (a *Architect) persistDeclaration(plan *DesignPlan, declaration *PreDelegat
 	if plan == nil || declaration == nil {
 		return
 	}
-	var (
-		snapshotID  string
-		encoded     []byte
-		encodeError error
-	)
-	a.activePlansMu.Lock()
-	existing := a.activePlans[plan.ID]
-	if existing != nil {
-		existing.Declarations = append(existing.Declarations, declaration)
-		existing.UpdatedAt = time.Now()
-		snapshotID = existing.ID
-		encoded, encodeError = a.marshalPlanSnapshot(existing)
-	}
-	a.activePlansMu.Unlock()
-	if encodeError != nil {
-		a.logger.Warn("failed to encode declaration plan snapshot", "plan_id", snapshotID, "error", encodeError)
+	existing := a.planStore.Get(plan.ID)
+	if existing == nil {
 		return
 	}
-	if err := a.persistEncodedPlanSnapshot(snapshotID, plan.SessionID, encoded); err != nil {
-		a.logger.Warn("failed to persist declaration plan snapshot", "plan_id", snapshotID, "error", err)
+	existing.Declarations = append(existing.Declarations, declaration)
+	existing.UpdatedAt = time.Now()
+	if err := a.planStore.Upsert(existing); err != nil {
+		a.logger.Warn("failed to persist declaration plan snapshot", "plan_id", existing.ID, "error", err)
 	}
 }
 
@@ -610,31 +593,16 @@ func monitorExecutionSkill(a *Architect) *skills.Skill {
 
 
 func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates map[string]any) *DesignPlan {
-	var (
-		current     *DesignPlan
-		snapshotID  string
-		encoded     []byte
-		encodeError error
-	)
-	a.activePlansMu.Lock()
-	current = a.activePlans[plan.ID]
+	current := a.planStore.Get(plan.ID)
 	if current == nil {
-		a.activePlansMu.Unlock()
 		return plan
 	}
 	current.Revision++
 	current.UpdatedAt = time.Now()
 	current.RiskSummary = append(current.RiskSummary, reason)
 	applyPlanUpdateFields(current, updates)
-	snapshotID = current.ID
-	encoded, encodeError = a.marshalPlanSnapshot(current)
-	a.activePlansMu.Unlock()
-	if encodeError != nil {
-		a.logger.Warn("failed to encode revised plan snapshot", "plan_id", snapshotID, "error", encodeError)
-		return current
-	}
-	if err := a.persistEncodedPlanSnapshot(snapshotID, current.SessionID, encoded); err != nil {
-		a.logger.Warn("failed to persist revised plan snapshot", "plan_id", snapshotID, "error", err)
+	if err := a.planStore.Upsert(current); err != nil {
+		a.logger.Warn("failed to persist revised plan snapshot", "plan_id", current.ID, "error", err)
 	}
 	return current
 }
@@ -723,15 +691,8 @@ func (a *Architect) attachFixWorkflow(planID string, workflow *WorkflowDAG, task
 	if err != nil || plan == nil {
 		return ""
 	}
-	var (
-		currentID   string
-		encoded     []byte
-		encodeError error
-	)
-	a.activePlansMu.Lock()
-	current := a.activePlans[plan.ID]
+	current := a.planStore.Get(plan.ID)
 	if current == nil {
-		a.activePlansMu.Unlock()
 		return ""
 	}
 	current.Workflow = workflow
@@ -739,26 +700,18 @@ func (a *Architect) attachFixWorkflow(planID string, workflow *WorkflowDAG, task
 	if smErr := current.SM().TransitionTo(PlanStatusReady, current); smErr != nil {
 		a.logger.Warn("attachFixWorkflow: transition to Ready rejected",
 			"plan_id", current.ID, "error", smErr)
-		a.activePlansMu.Unlock()
 		return current.ID
 	}
 	current.Status = current.SM().State()
 	current.Epoch = current.SM().Epoch()
 	current.UpdatedAt = time.Now()
-	if a.leaseManager != nil {
-		a.leaseManager.GrantReadyLease(current)
+	if lm := a.planStore.LeaseManager(); lm != nil {
+		lm.GrantReadyLease(current)
 	}
-	currentID = current.ID
-	encoded, encodeError = a.marshalPlanSnapshot(current)
-	a.activePlansMu.Unlock()
-	if encodeError != nil {
-		a.logger.Warn("failed to encode fix workflow snapshot", "plan_id", currentID, "error", encodeError)
-		return currentID
+	if err := a.planStore.Upsert(current); err != nil {
+		a.logger.Warn("failed to persist fix workflow snapshot", "plan_id", current.ID, "error", err)
 	}
-	if err := a.persistEncodedPlanSnapshot(currentID, current.SessionID, encoded); err != nil {
-		a.logger.Warn("failed to persist fix workflow snapshot", "plan_id", currentID, "error", err)
-	}
-	return currentID
+	return current.ID
 }
 
 type interruptHandlerParams struct {
@@ -817,23 +770,14 @@ func parseInterruptHandlerParams(input json.RawMessage) (*interruptHandlerParams
 }
 
 func (a *Architect) applyInterruptAction(plan *DesignPlan, action string, reason string) *DesignPlan {
-	var (
-		current     *DesignPlan
-		snapshotID  string
-		encoded     []byte
-		encodeError error
-	)
-	a.activePlansMu.Lock()
-	current = a.activePlans[plan.ID]
+	current := a.planStore.Get(plan.ID)
 	if current == nil {
-		a.activePlansMu.Unlock()
 		return plan
 	}
 	target := interruptStatus(action, current.SM().State())
 	if smErr := current.SM().TransitionTo(target, current); smErr != nil {
 		a.logger.Warn("applyInterruptAction: transition rejected",
 			"plan_id", current.ID, "action", action, "error", smErr)
-		a.activePlansMu.Unlock()
 		return current
 	}
 	current.Status = current.SM().State()
@@ -841,15 +785,8 @@ func (a *Architect) applyInterruptAction(plan *DesignPlan, action string, reason
 		current.RiskSummary = append(current.RiskSummary, reason)
 	}
 	current.UpdatedAt = time.Now()
-	snapshotID = current.ID
-	encoded, encodeError = a.marshalPlanSnapshot(current)
-	a.activePlansMu.Unlock()
-	if encodeError != nil {
-		a.logger.Warn("failed to encode interrupted plan snapshot", "plan_id", snapshotID, "error", encodeError)
-		return current
-	}
-	if err := a.persistEncodedPlanSnapshot(snapshotID, current.SessionID, encoded); err != nil {
-		a.logger.Warn("failed to persist interrupted plan snapshot", "plan_id", snapshotID, "error", err)
+	if err := a.planStore.Upsert(current); err != nil {
+		a.logger.Warn("failed to persist interrupted plan snapshot", "plan_id", current.ID, "error", err)
 	}
 	return current
 }

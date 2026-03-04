@@ -43,7 +43,7 @@ type DAGBridgeDeps struct {
 	Buffers     *BufferRegistry
 	Scope       *concurrency.GoroutineScope
 	ActivityPub events.ActivityPublisher
-	Activator   guide.AgentActivator // optional on-demand agent activator
+	Activator   guide.PodActivator // optional on-demand pod activator
 	SessionID   string
 	AgentID     string
 }
@@ -54,7 +54,7 @@ type ActiveDAGMeta struct {
 	SessionID  string
 	Revision   int
 	Dispatcher *BusNodeDispatcher
-	Pod        *PipelinePod
+	Pod        *shared.AgentPod
 	CancelFunc context.CancelFunc
 	Unsub      func()
 	StartedAt  time.Time
@@ -74,16 +74,17 @@ type DAGBridge struct {
 	buffers   *BufferRegistry
 	scope     *concurrency.GoroutineScope
 	config    DAGBridgeConfig
-	activator guide.AgentActivator
+	activator guide.PodActivator
 	registrar PipelineRegistrar
 	sessionID string
 	agentID   string
 	logger    *slog.Logger
 
-	activityPub  events.ActivityPublisher
-	eventLogger  *agentlog.SessionEventLogger
-	activeDAGs   map[string]*ActiveDAGMeta
-	gates       map[string]*dag.DecisionGate // per-DAG decision gates
+	activityPub   events.ActivityPublisher
+	eventLogger   *agentlog.SessionEventLogger
+	activeDAGs    map[string]*ActiveDAGMeta
+	gates         map[string]*dag.DecisionGate // per-DAG decision gates
+	scribeFactory shared.ScribeFactory          // optional Scribe factory for pipeline pods
 }
 
 // NewDAGBridge creates a bridge between the DAG scheduler and orchestrator subsystems.
@@ -127,7 +128,7 @@ func (b *DAGBridge) SetBus(bus guide.EventBus) {
 }
 
 // SetActivator sets the on-demand agent activator after construction.
-func (b *DAGBridge) SetActivator(a guide.AgentActivator) {
+func (b *DAGBridge) SetActivator(a guide.PodActivator) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.activator = a
@@ -153,6 +154,13 @@ func (b *DAGBridge) SetEventLogger(el *agentlog.SessionEventLogger) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.eventLogger = el
+}
+
+// SetScribeFactory sets the Scribe factory for pipeline pods.
+func (b *DAGBridge) SetScribeFactory(f shared.ScribeFactory) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.scribeFactory = f
 }
 
 // Execute builds/receives a DAG from a plan, journals, persists, and submits to the scheduler.
@@ -203,19 +211,24 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	logger := b.logger
 	b.mu.RUnlock()
 
+	b.mu.RLock()
+	scribeFactory := b.scribeFactory
+	b.mu.RUnlock()
+
 	pod := NewPipelinePod(PipelinePodConfig{
-		DAGID:       d.ID(),
-		SessionID:   sessionID,
-		Activator:   activator,
-		Registrar:   registrar,
-		ActivityPub: b.activityPub,
-		Logger:      logger,
+		DAGID:         d.ID(),
+		SessionID:     sessionID,
+		Activator:     activator,
+		Registrar:     registrar,
+		ActivityPub:   b.activityPub,
+		Logger:        logger,
+		ScribeFactory: scribeFactory,
 	})
 
 	// 3a. Pre-activate all pipeline agent types so they are registered
 	// with the Guide and visible in the TUI before the first sub-node
 	// dispatches. Each pipeline always uses all four agent types.
-	pod.PreActivate(ctx, d)
+	pod.PreActivate(ctx)
 
 	// 3b. Create BusNodeDispatcher with pod-based per-node activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, pod)

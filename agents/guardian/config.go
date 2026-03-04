@@ -57,6 +57,13 @@ type Config struct {
 	DiffReviewEnabled      bool     // Default: true
 	SuspiciousDiffPatterns []string // Additional regex patterns
 
+	// Observability dependencies (optional).
+	ActivationController ActivationQuerier
+	ActivationMetrics    ActivationMetricsQuerier
+	DaemonController     DaemonQuerier
+	CVS                  CVSQuerier
+	VFSManager           VFSManagerQuerier
+
 	// Tool dispatch loop.
 	MaxToolRuns int // Maximum tool-call turns per conversation. Defaults to DefaultMaxToolRuns (8).
 

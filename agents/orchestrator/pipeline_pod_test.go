@@ -7,13 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
 )
 
 // --- test helpers ---
 
-// trackingActivator records HoldActive calls and returns configurable
+// trackingActivator records HoldPodActive calls and returns configurable
 // release functions and errors.
 type trackingActivator struct {
 	mu       sync.Mutex
@@ -22,13 +23,15 @@ type trackingActivator struct {
 	failOn   string // agent type that should fail
 }
 
-func (a *trackingActivator) EnsureActive(_ context.Context, agentType string) error {
+func (a *trackingActivator) EnsurePodActive(_ context.Context, _ string) error {
 	return nil
 }
 
-func (a *trackingActivator) TouchActivity(string) {}
+func (a *trackingActivator) TouchPodActivity(string) {}
 
-func (a *trackingActivator) HoldActive(_ context.Context, agentType string) (func(), error) {
+func (a *trackingActivator) PodForAgent(agentType string) string { return agentType }
+
+func (a *trackingActivator) HoldPodActive(_ context.Context, agentType string) (func(), error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -129,12 +132,12 @@ func TestPipelinePod_HoldForNode_SingleAgent(t *testing.T) {
 		Prompt:    "build it",
 	})
 
-	if err := pod.HoldForNode(context.Background(), "n1", node); err != nil {
+	if err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node)); err != nil {
 		t.Fatalf("HoldForNode: %v", err)
 	}
 
 	if got := act.holdCount(); got != 1 {
-		t.Errorf("expected 1 HoldActive call, got %d", got)
+		t.Errorf("expected 1 HoldPodActive call, got %d", got)
 	}
 	if got := reg.callCount(); got != 1 {
 		t.Errorf("expected 1 registrar call, got %d", got)
@@ -161,13 +164,13 @@ func TestPipelinePod_HoldForNode_WithCoAgents(t *testing.T) {
 		CoAgents:  []string{"designer", "inspector-pipeline"},
 	})
 
-	if err := pod.HoldForNode(context.Background(), "n1", node); err != nil {
+	if err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node)); err != nil {
 		t.Fatalf("HoldForNode: %v", err)
 	}
 
 	// engineer + designer + inspector-pipeline = 3
 	if got := act.holdCount(); got != 3 {
-		t.Errorf("expected 3 HoldActive calls, got %d: %v", got, act.calledTypes())
+		t.Errorf("expected 3 HoldPodActive calls, got %d: %v", got, act.calledTypes())
 	}
 	if got := reg.callCount(); got != 3 {
 		t.Errorf("expected 3 registrar calls, got %d", got)
@@ -191,14 +194,14 @@ func TestPipelinePod_HoldForNode_RegistrarDedup(t *testing.T) {
 			AgentType: "engineer",
 			Prompt:    "task",
 		})
-		if err := pod.HoldForNode(context.Background(), id, node); err != nil {
+		if err := pod.HoldForNode(context.Background(), id, NodeAgentTypes(node)); err != nil {
 			t.Fatalf("HoldForNode(%s): %v", id, err)
 		}
 	}
 
-	// Each node gets its own HoldActive guard.
+	// Each node gets its own HoldPodActive guard.
 	if got := act.holdCount(); got != 2 {
-		t.Errorf("expected 2 HoldActive calls, got %d", got)
+		t.Errorf("expected 2 HoldPodActive calls, got %d", got)
 	}
 	// Registrar is deduped — only called once for "engineer".
 	if got := reg.callCount(); got != 1 {
@@ -223,7 +226,7 @@ func TestPipelinePod_ReleaseForNode(t *testing.T) {
 		Prompt:    "task",
 	})
 
-	if err := pod.HoldForNode(context.Background(), "n1", node); err != nil {
+	if err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node)); err != nil {
 		t.Fatalf("HoldForNode: %v", err)
 	}
 
@@ -260,7 +263,7 @@ func TestPipelinePod_HoldForNode_ActivationFailureRollback(t *testing.T) {
 		CoAgents:  []string{"designer"},
 	})
 
-	err := pod.HoldForNode(context.Background(), "n1", node)
+	err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node))
 	if err == nil {
 		t.Fatal("expected error from failed activation")
 	}
@@ -291,7 +294,7 @@ func TestPipelinePod_HoldForNode_RegistrarFailureRollback(t *testing.T) {
 		CoAgents:  []string{"designer"},
 	})
 
-	err := pod.HoldForNode(context.Background(), "n1", node)
+	err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node))
 	if err == nil {
 		t.Fatal("expected error from failed registrar")
 	}
@@ -316,7 +319,7 @@ func TestPipelinePod_Release_AllRemainingGuards(t *testing.T) {
 			AgentType: "engineer",
 			Prompt:    "task",
 		})
-		if err := pod.HoldForNode(context.Background(), id, node); err != nil {
+		if err := pod.HoldForNode(context.Background(), id, NodeAgentTypes(node)); err != nil {
 			t.Fatalf("HoldForNode(%s): %v", id, err)
 		}
 	}
@@ -345,7 +348,7 @@ func TestPipelinePod_Release_Idempotent(t *testing.T) {
 		Prompt:    "task",
 	})
 
-	if err := pod.HoldForNode(context.Background(), "n1", node); err != nil {
+	if err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node)); err != nil {
 		t.Fatalf("HoldForNode: %v", err)
 	}
 
@@ -371,7 +374,7 @@ func TestPipelinePod_Release_ConcurrentSafe(t *testing.T) {
 			AgentType: "engineer",
 			Prompt:    "task",
 		})
-		if err := pod.HoldForNode(context.Background(), id, node); err != nil {
+		if err := pod.HoldForNode(context.Background(), id, NodeAgentTypes(node)); err != nil {
 			t.Fatalf("HoldForNode(%s): %v", id, err)
 		}
 	}
@@ -407,7 +410,7 @@ func TestPipelinePod_HoldAfterRelease_Rejected(t *testing.T) {
 		Prompt:    "task",
 	})
 
-	err := pod.HoldForNode(context.Background(), "n1", node)
+	err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node))
 	if err == nil {
 		t.Fatal("expected error from HoldForNode after Release")
 	}
@@ -425,7 +428,7 @@ func TestPipelinePod_NilActivator(t *testing.T) {
 		Prompt:    "task",
 	})
 
-	if err := pod.HoldForNode(context.Background(), "n1", node); err != nil {
+	if err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node)); err != nil {
 		t.Fatalf("expected nil activator to be a no-op, got: %v", err)
 	}
 }
@@ -445,12 +448,12 @@ func TestPipelinePod_NilRegistrar(t *testing.T) {
 		Prompt:    "task",
 	})
 
-	if err := pod.HoldForNode(context.Background(), "n1", node); err != nil {
+	if err := pod.HoldForNode(context.Background(), "n1", NodeAgentTypes(node)); err != nil {
 		t.Fatalf("HoldForNode with nil registrar: %v", err)
 	}
 
 	if got := act.holdCount(); got != 1 {
-		t.Errorf("expected 1 HoldActive call, got %d", got)
+		t.Errorf("expected 1 HoldPodActive call, got %d", got)
 	}
 
 	pod.Release()
@@ -472,15 +475,15 @@ func TestPipelinePod_RegisteredAgentTypes(t *testing.T) {
 		{ID: "n3", AgentType: "engineer", Prompt: "task3"}, // dedup
 	} {
 		node := dag.NewNode(cfg)
-		if err := pod.HoldForNode(context.Background(), cfg.ID, node); err != nil {
+		if err := pod.HoldForNode(context.Background(), cfg.ID, NodeAgentTypes(node)); err != nil {
 			t.Fatalf("HoldForNode(%d): %v", i, err)
 		}
 	}
 
 	registered := pod.RegisteredAgentTypes()
 	seen := make(map[string]struct{}, len(registered))
-	for _, t := range registered {
-		seen[t] = struct{}{}
+	for _, typ := range registered {
+		seen[typ] = struct{}{}
 	}
 
 	for _, expected := range []string{"engineer", "designer"} {
@@ -509,7 +512,7 @@ func TestPipelinePod_ActiveNodeIDs(t *testing.T) {
 			AgentType: "engineer",
 			Prompt:    "task",
 		})
-		if err := pod.HoldForNode(context.Background(), id, node); err != nil {
+		if err := pod.HoldForNode(context.Background(), id, NodeAgentTypes(node)); err != nil {
 			t.Fatalf("HoldForNode(%s): %v", id, err)
 		}
 	}
@@ -543,8 +546,8 @@ func TestCollectAgentTypes_Dedup(t *testing.T) {
 	types := collectAgentTypes(d)
 
 	seen := make(map[string]int)
-	for _, t := range types {
-		seen[t]++
+	for _, typ := range types {
+		seen[typ]++
 	}
 
 	for agentType, count := range seen {
@@ -663,11 +666,11 @@ func TestPipelinePod_PreActivate_PublishesRegisteredEvents(t *testing.T) {
 		ActivityPub: pub,
 	})
 
-	pod.PreActivate(context.Background(), nil)
+	pod.PreActivate(context.Background())
 
 	collected := pub.collected()
-	if len(collected) != len(pipelineAgentTypes) {
-		t.Fatalf("expected %d events, got %d", len(pipelineAgentTypes), len(collected))
+	if len(collected) != len(PipelineAgentTypes) {
+		t.Fatalf("expected %d events, got %d", len(PipelineAgentTypes), len(collected))
 	}
 
 	for _, evt := range collected {
@@ -677,3 +680,33 @@ func TestPipelinePod_PreActivate_PublishesRegisteredEvents(t *testing.T) {
 		}
 	}
 }
+
+// --- NodeAgentTypes tests ---
+
+func TestNodeAgentTypes_SingleAgent(t *testing.T) {
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "n1",
+		AgentType: "engineer",
+		Prompt:    "task",
+	})
+	types := NodeAgentTypes(node)
+	if len(types) != 1 || types[0] != "engineer" {
+		t.Errorf("expected [engineer], got %v", types)
+	}
+}
+
+func TestNodeAgentTypes_WithCoAgents(t *testing.T) {
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "n1",
+		AgentType: "engineer",
+		Prompt:    "task",
+		CoAgents:  []string{"designer", "inspector-pipeline"},
+	})
+	types := NodeAgentTypes(node)
+	if len(types) != 3 {
+		t.Errorf("expected 3 types, got %d: %v", len(types), types)
+	}
+}
+
+// Keep shared import referenced for SubNodeMeta type assertions.
+var _ = shared.SubNodeMeta{}

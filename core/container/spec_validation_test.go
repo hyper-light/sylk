@@ -105,68 +105,6 @@ func TestValidateContainerSpec_NegativeGracefulStop(t *testing.T) {
 	}
 }
 
-func TestValidatePodSpec_NoMainContainers(t *testing.T) {
-	spec := PodSpec{Name: "test-pod"}
-	err := ValidatePodSpec(&spec)
-	if !errors.Is(err, ErrSpecNoMainContainers) {
-		t.Fatalf("expected ErrSpecNoMainContainers, got %v", err)
-	}
-}
-
-func TestValidatePodSpec_DuplicateContainerNames(t *testing.T) {
-	c := validContainerSpec()
-	spec := PodSpec{
-		Name:           "test-pod",
-		MainContainers: []ContainerSpec{c, c},
-	}
-	err := ValidatePodSpec(&spec)
-	if !errors.Is(err, ErrSpecContainerNameDup) {
-		t.Fatalf("expected ErrSpecContainerNameDup, got %v", err)
-	}
-}
-
-func TestValidatePodSpec_DuplicateVolumeNames(t *testing.T) {
-	c := validContainerSpec()
-	spec := PodSpec{
-		Name:           "test-pod",
-		MainContainers: []ContainerSpec{c},
-		Volumes: []VolumeSpec{
-			{Name: "vol1"},
-			{Name: "vol1"},
-		},
-	}
-	err := ValidatePodSpec(&spec)
-	if !errors.Is(err, ErrSpecVolumeNameDuplicate) {
-		t.Fatalf("expected ErrSpecVolumeNameDuplicate, got %v", err)
-	}
-}
-
-func TestValidatePodSpec_MountRefsUnknownVolume(t *testing.T) {
-	c := validContainerSpec()
-	c.Mounts = []MountSpec{{Name: "nonexistent", MountPath: "/data"}}
-	spec := PodSpec{
-		Name:           "test-pod",
-		MainContainers: []ContainerSpec{c},
-	}
-	err := ValidatePodSpec(&spec)
-	if !errors.Is(err, ErrSpecMountUnknownVolume) {
-		t.Fatalf("expected ErrSpecMountUnknownVolume, got %v", err)
-	}
-}
-
-func TestValidatePodSpec_Valid(t *testing.T) {
-	c := validContainerSpec()
-	c.Mounts = []MountSpec{{Name: "shared", MountPath: "/data"}}
-	spec := PodSpec{
-		Name:           "test-pod",
-		MainContainers: []ContainerSpec{c},
-		Volumes:        []VolumeSpec{{Name: "shared"}},
-	}
-	if err := ValidatePodSpec(&spec); err != nil {
-		t.Fatalf("expected nil, got %v", err)
-	}
-}
-
 func TestDefaultContainerSpec_SetsGracefulStop(t *testing.T) {
 	spec := validContainerSpec()
 	DefaultContainerSpec(&spec)
@@ -186,14 +124,3 @@ func TestDefaultContainerSpec_InitializesMaps(t *testing.T) {
 	}
 }
 
-func TestDefaultPodSpec_SetsTerminationGrace(t *testing.T) {
-	c := validContainerSpec()
-	spec := PodSpec{
-		Name:           "test-pod",
-		MainContainers: []ContainerSpec{c},
-	}
-	DefaultPodSpec(&spec)
-	if spec.TerminationGracePeriod != defaultPodTerminationGrace {
-		t.Fatalf("expected %v, got %v", defaultPodTerminationGrace, spec.TerminationGracePeriod)
-	}
-}

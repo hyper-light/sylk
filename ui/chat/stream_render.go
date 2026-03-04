@@ -119,6 +119,11 @@ func findBoundaryBeforeOpenFence(content string, candidateBoundary int) int {
 // Returns the merged lines and code regions for the content portion only
 // (no header/summary — those are added by renderStreamingEntryFull).
 //
+// Stable content is rendered incrementally: when the stable boundary advances,
+// only the newly promoted segment (between old and new boundary) is rendered
+// and appended to cached stable lines. Already-rendered stable lines are never
+// re-rendered, preventing visible text from shifting during streaming.
+//
 // Both fragments are rendered via renderMarkdownContentRaw (no trailing-blank
 // trimming) so that inter-block separator lines survive the split. A single
 // trimTrailingBlankLines pass on the merged result produces output identical
@@ -134,13 +139,24 @@ func renderStreamingEntry(content string, width int, th *theme.Theme, cache *cod
 
 	boundary := findStableBoundary(content)
 
-	// If stable prefix grew, re-render it (includes newly completed blocks).
+	// If stable prefix grew, render only the newly promoted segment and
+	// append to the cached stable output. Since stable boundaries are at
+	// paragraph-separating blank lines outside code fences, each segment
+	// is a complete markdown block that renders independently.
 	if boundary > state.lastStableLen && boundary > 0 {
-		stableContent := content[:boundary]
+		segment := content[state.lastStableLen:boundary]
 		bodyStyle := th.AgentMessage
-		stableLines, stableRegions := renderMarkdownContentRaw(stableContent, width, bodyStyle, th, cache)
-		state.stableLines = stableLines
-		state.stableRegions = stableRegions
+		segLines, segRegions := renderMarkdownContentRaw(segment, width, bodyStyle, th, cache)
+
+		// Offset segment regions to account for existing stable lines.
+		baseOffset := len(state.stableLines)
+		for i := range segRegions {
+			segRegions[i].Start += baseOffset
+			segRegions[i].End += baseOffset
+		}
+
+		state.stableLines = append(state.stableLines, segLines...)
+		state.stableRegions = append(state.stableRegions, segRegions...)
 		state.lastStableLen = boundary
 	}
 

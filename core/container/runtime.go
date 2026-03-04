@@ -52,21 +52,13 @@ type ContainerStatus struct {
 	StopTime  time.Time
 }
 
-// PodStatus is a snapshot of a pod's current state.
-type PodStatus struct {
-	ID         PodID
-	Phase      PodPhase
-	Conditions map[PodConditionType]*PodCondition
-	Containers []ContainerStatus
-}
-
 // AgentCreator creates an agent of the given type. Injected by the caller
 // to decouple from the handoff package.
 type AgentCreator func(ctx context.Context, agentType string) (ContainerAgent, error)
 
 // ContainerRuntime is the container runtime interface (CRI equivalent).
 type ContainerRuntime interface {
-	CreateContainer(ctx context.Context, spec ContainerSpec, pod *Pod) (*Container, error)
+	CreateContainer(ctx context.Context, spec ContainerSpec) (*Container, error)
 	StartContainer(ctx context.Context, c *Container) error
 	StopContainer(ctx context.Context, c *Container) error
 	PauseContainer(ctx context.Context, c *Container) error
@@ -74,11 +66,9 @@ type ContainerRuntime interface {
 	RemoveContainer(ctx context.Context, c *Container) error
 	ContainerStatus(c *Container) *ContainerStatus
 
-	CreatePod(ctx context.Context, spec PodSpec) (*Pod, error)
-	StartPod(ctx context.Context, p *Pod) error
-	StopPod(ctx context.Context, p *Pod) error
-	RemovePod(ctx context.Context, p *Pod) error
-	PodStatus(p *Pod) *PodStatus
+	// Batch methods for pod-level activation.
+	CreateContainersForPod(ctx context.Context, podID PodID, specs []ContainerSpec) ([]*Container, error)
+	StartContainers(ctx context.Context, containers []*Container) error
 }
 
 // ProbeFactory builds probe specs for a container after its agent has been
@@ -129,7 +119,7 @@ func NewDefaultRuntime(cfg DefaultRuntimeConfig) *DefaultRuntime {
 
 // CreateContainer creates a container from a spec. Runs admission control,
 // quota checks, creates the agent, GoroutineScope, and SecurityContext.
-func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpec, pod *Pod) (*Container, error) {
+func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpec) (*Container, error) {
 	if rt.closed.Load() {
 		return nil, ErrRuntimeClosed
 	}
@@ -169,7 +159,6 @@ func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpe
 		Scope:  scope,
 		SecCtx: secCtx,
 		Agent:  agent,
-		Pod:    pod,
 	})
 
 	if rt.quota != nil {
@@ -279,181 +268,36 @@ func (rt *DefaultRuntime) ContainerStatus(c *Container) *ContainerStatus {
 	}
 }
 
-// CreatePod creates a pod with all its containers.
-func (rt *DefaultRuntime) CreatePod(ctx context.Context, spec PodSpec) (*Pod, error) {
+// CreateContainersForPod batch-creates containers for a managed pod,
+// setting the pod ID on each container for registry indexing.
+func (rt *DefaultRuntime) CreateContainersForPod(ctx context.Context, podID PodID, specs []ContainerSpec) ([]*Container, error) {
 	if rt.closed.Load() {
 		return nil, ErrRuntimeClosed
 	}
-
-	if err := ValidatePodSpec(&spec); err != nil {
-		return nil, fmt.Errorf("pod validation: %w", err)
-	}
-
-	DefaultPodSpec(&spec)
-
-	podID := PodID(uuid.New().String())
-	scope := concurrency.NewGoroutineScope(rt.parentCtx, string(podID), rt.budget)
-
-	pod := NewPod(PodConfig{
-		ID:    podID,
-		Spec:  spec,
-		Scope: scope,
-	})
-
-	initContainers, err := rt.createContainerList(ctx, spec.InitContainers, pod)
-	if err != nil {
-		return nil, fmt.Errorf("init containers: %w", err)
-	}
-	pod.SetInitContainers(initContainers)
-
-	mainContainers, err := rt.createContainerList(ctx, spec.MainContainers, pod)
-	if err != nil {
-		return nil, fmt.Errorf("main containers: %w", err)
-	}
-	pod.SetMainContainers(mainContainers)
-
-	sidecarContainers, err := rt.createContainerList(ctx, spec.SidecarContainers, pod)
-	if err != nil {
-		return nil, fmt.Errorf("sidecar containers: %w", err)
-	}
-	pod.SetSidecarContainers(sidecarContainers)
-
-	rt.registry.RegisterPod(pod)
-	return pod, nil
-}
-
-func (rt *DefaultRuntime) createContainerList(ctx context.Context, specs []ContainerSpec, pod *Pod) ([]*Container, error) {
 	containers := make([]*Container, 0, len(specs))
 	for i := range specs {
-		c, err := rt.CreateContainer(ctx, specs[i], pod)
+		c, err := rt.CreateContainer(ctx, specs[i])
 		if err != nil {
+			// Clean up already-created containers on failure.
+			for _, created := range containers {
+				_ = rt.RemoveContainer(ctx, created)
+			}
 			return nil, fmt.Errorf("container %q: %w", specs[i].Name, err)
 		}
+		c.SetPodID(podID)
 		containers = append(containers, c)
 	}
 	return containers, nil
 }
 
-// StartPod starts init containers sequentially, then main+sidecar concurrently.
-func (rt *DefaultRuntime) StartPod(ctx context.Context, p *Pod) error {
-	if err := p.Lifecycle().TransitionTo(concurrency.StateStarting); err != nil {
-		return err
-	}
-
-	if err := rt.runInitContainers(ctx, p); err != nil {
-		p.SetPhase(PodFailed)
-		_ = p.Lifecycle().TransitionToFailed(err)
-		return fmt.Errorf("init containers: %w", err)
-	}
-	p.SetCondition(PodCondition{Type: PodInitialized, Status: true})
-
-	if err := rt.startMainAndSidecars(ctx, p); err != nil {
-		p.SetPhase(PodFailed)
-		_ = p.Lifecycle().TransitionToFailed(err)
-		return fmt.Errorf("start main/sidecars: %w", err)
-	}
-
-	p.SetPhase(PodRunning)
-	p.SetCondition(PodCondition{Type: PodContainersReady, Status: true})
-	p.SetCondition(PodCondition{Type: PodReady, Status: true})
-	return p.Lifecycle().TransitionTo(concurrency.StateRunning)
-}
-
-func (rt *DefaultRuntime) runInitContainers(ctx context.Context, p *Pod) error {
-	for _, c := range p.InitContainers() {
-		if err := rt.StartContainer(ctx, c); err != nil {
-			return fmt.Errorf("init %q start: %w", c.Spec().Name, err)
-		}
-		if err := rt.waitForContainerStop(ctx, c); err != nil {
-			return fmt.Errorf("init %q: %w", c.Spec().Name, err)
-		}
-	}
-	return nil
-}
-
-func (rt *DefaultRuntime) waitForContainerStop(ctx context.Context, c *Container) error {
-	waitTimeout := c.Spec().GracefulStop * 2
-	if waitTimeout == 0 {
-		waitTimeout = defaultGracefulStopDuration * 2
-	}
-	err := c.Lifecycle().WaitForState(concurrency.StateStopped, waitTimeout)
-	if err != nil {
-		return err
-	}
-	if c.State() == concurrency.StateFailed {
-		return errors.New("container failed")
-	}
-	return nil
-}
-
-func (rt *DefaultRuntime) startMainAndSidecars(ctx context.Context, p *Pod) error {
-	for _, c := range p.SidecarContainers() {
-		if err := rt.StartContainer(ctx, c); err != nil {
-			return fmt.Errorf("sidecar %q: %w", c.Spec().Name, err)
-		}
-	}
-	for _, c := range p.MainContainers() {
-		if err := rt.StartContainer(ctx, c); err != nil {
-			return fmt.Errorf("main %q: %w", c.Spec().Name, err)
-		}
-	}
-	return nil
-}
-
-// StopPod stops all containers in reverse order: main, then sidecars.
-func (rt *DefaultRuntime) StopPod(ctx context.Context, p *Pod) error {
-	if err := p.Lifecycle().TransitionTo(concurrency.StateStopping); err != nil {
-		return err
-	}
-
-	rt.stopContainerList(ctx, p.MainContainers())
-	rt.stopContainerList(ctx, p.SidecarContainers())
-
-	p.SetPhase(p.DerivePhaseFromContainers())
-	return p.Lifecycle().TransitionTo(concurrency.StateStopped)
-}
-
-func (rt *DefaultRuntime) stopContainerList(ctx context.Context, containers []*Container) {
+// StartContainers starts multiple containers. Stops and returns error on first failure.
+func (rt *DefaultRuntime) StartContainers(ctx context.Context, containers []*Container) error {
 	for _, c := range containers {
-		if c.IsRunning() {
-			_ = rt.StopContainer(ctx, c)
+		if err := rt.StartContainer(ctx, c); err != nil {
+			return fmt.Errorf("start %q: %w", c.Spec().Name, err)
 		}
 	}
-}
-
-// RemovePod removes a pod and all its containers.
-func (rt *DefaultRuntime) RemovePod(ctx context.Context, p *Pod) error {
-	for _, c := range p.AllContainers() {
-		_ = rt.RemoveContainer(ctx, c)
-	}
-	rt.registry.UnregisterPod(p.ID())
 	return nil
-}
-
-// PodStatus returns a status snapshot.
-func (rt *DefaultRuntime) PodStatus(p *Pod) *PodStatus {
-	containers := p.AllContainers()
-	statuses := make([]ContainerStatus, 0, len(containers))
-	for _, c := range containers {
-		statuses = append(statuses, *rt.ContainerStatus(c))
-	}
-	return &PodStatus{
-		ID:         p.ID(),
-		Phase:      p.Phase(),
-		Conditions: p.conditionsSnapshot(),
-		Containers: statuses,
-	}
-}
-
-func (p *Pod) conditionsSnapshot() map[PodConditionType]*PodCondition {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	cp := make(map[PodConditionType]*PodCondition, len(p.conditions))
-	for k, v := range p.conditions {
-		cond := *v
-		cp[k] = &cond
-	}
-	return cp
 }
 
 // Registry returns the container registry.

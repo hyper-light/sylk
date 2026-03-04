@@ -76,16 +76,13 @@ func TestReaper_ClassifyAction_None(t *testing.T) {
 }
 
 func TestReaper_RemoveDiskFile(t *testing.T) {
-	dir := t.TempDir()
+	store := testPlanStore(t)
+	defer store.Close()
+
 	planID := "test-reaper-plan"
 
-	a := &Architect{
-		config:      Config{WorkingDirectory: dir},
-		activePlans: map[string]*DesignPlan{},
-	}
-
-	// Use planStoreDir to derive the correct path (matches removeDiskFile).
-	planDir := a.planStoreDir("")
+	// Create a plan file in the store's directory.
+	planDir := store.PlanDir("")
 	if err := os.MkdirAll(planDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -94,12 +91,7 @@ func TestReaper_RemoveDiskFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := &PlanReaper{
-		architect: a,
-		logger:    slog.Default(),
-	}
-
-	r.removeDiskFile(planID, "")
+	store.RemoveDiskFile(planID, "")
 
 	if _, err := os.Stat(planFile); !os.IsNotExist(err) {
 		t.Fatal("expected plan file to be removed")
@@ -107,12 +99,11 @@ func TestReaper_RemoveDiskFile(t *testing.T) {
 }
 
 func TestReaper_StartStop(t *testing.T) {
-	a := &Architect{
-		config:      Config{WorkingDirectory: t.TempDir()},
-		activePlans: map[string]*DesignPlan{},
-	}
+	store := testPlanStore(t)
+	defer store.Close()
+
 	lm := NewPlanLeaseManager(10*time.Second, 5*time.Minute)
-	r := NewPlanReaper(a, lm, slog.Default())
+	r := NewPlanReaper(store, lm, slog.Default())
 
 	r.Start()
 	time.Sleep(10 * time.Millisecond) // let the goroutine spin up

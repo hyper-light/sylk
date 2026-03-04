@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -75,6 +76,9 @@ type PipelineInspector struct {
 
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
+
+	// Agent pod for Scribe feed.
+	agentPod *agentShared.AgentPod
 
 	fileAccess versioning.FileAccess
 
@@ -160,6 +164,7 @@ func (pi *PipelineInspector) initSkills() {
 	pi.skillLoader = skills.NewLoader(pi.skills, loaderCfg)
 
 	pi.registerCoreSkills()
+	pi.skills.LoadAll()
 	pi.registerSafetyHook()
 }
 
@@ -186,6 +191,49 @@ func (pi *PipelineInspector) registerSafetyHook() {
 			}
 			return skills.HookResult{Continue: true}
 		})
+}
+
+// SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+func (pi *PipelineInspector) SetProvider(p pipelineInspectorProvider) {
+	pi.mu.Lock()
+	defer pi.mu.Unlock()
+	pi.provider = p
+}
+
+// getProvider returns the current provider under read lock.
+func (pi *PipelineInspector) getProvider() pipelineInspectorProvider {
+	pi.mu.RLock()
+	defer pi.mu.RUnlock()
+	return pi.provider
+}
+
+// SwapModel implements container.ModelSwappable.
+func (pi *PipelineInspector) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	pp, ok := provider.(pipelineInspectorProvider)
+	if !ok {
+		return fmt.Errorf("pipeline inspector swap model: provider does not satisfy pipelineInspectorProvider")
+	}
+	pi.SetProvider(pp)
+	pi.mu.Lock()
+	pi.config.Model = modelID
+	pi.mu.Unlock()
+	pi.logger.Info("model swapped", "model", modelID)
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (pi *PipelineInspector) CurrentModel() string {
+	pi.mu.RLock()
+	defer pi.mu.RUnlock()
+	return pi.config.Model
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (pi *PipelineInspector) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+	}
 }
 
 // SetWorkerType sets the worker type for design-aware prompt and validation selection.
@@ -408,28 +456,6 @@ func stageInstructions(stage string) string {
 		"validate against criteria, grade the implementation, and report results.\n"
 }
 
-// prependConversationHistory formats prior conversation turns as structured
-// text and prepends them to the user message so the LLM retains multi-turn
-// context across requests. Returns the original message unchanged when there
-// is no history.
-func prependConversationHistory(history []guide.ConversationTurn, userMessage string) string {
-	if len(history) == 0 {
-		return userMessage
-	}
-
-	var b strings.Builder
-	b.WriteString("## Prior Conversation\n\n")
-	for _, turn := range history {
-		fmt.Fprintf(&b, "[%s] User: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.UserInput)
-		if turn.AgentReply != "" {
-			fmt.Fprintf(&b, "[%s] %s: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.AgentID, turn.AgentReply)
-		}
-	}
-	b.WriteString("\n---\n\n")
-	b.WriteString(userMessage)
-	return b.String()
-}
-
 // Handle processes a forwarded request through the LLM tool loop.
 func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	// Decode structured pipeline task from orchestrator dispatch.
@@ -444,7 +470,7 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 		}
 	}
 
-	if pi.provider == nil {
+	if pi.getProvider() == nil {
 		return shared.ConversationFallback(pi.getState()), nil
 	}
 
@@ -457,18 +483,23 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 		userMessage = composePipelineUserMessage(task)
 	}
 
-	// Prepend conversation history so the LLM retains multi-turn context.
-	userMessage = prependConversationHistory(fwd.ConversationHistory, userMessage)
+	pi.mu.RLock()
+	model := pi.config.Model
+	maxTokens := pi.config.MaxTokens
+	pi.mu.RUnlock()
 
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages: []providers.Message{
 			{Role: providers.RoleUser, Content: userMessage},
 		},
-		Model:     pi.config.Model,
-		MaxTokens: pi.config.MaxTokens,
+		Model:     model,
+		MaxTokens: maxTokens,
 		Tools:     tools,
 	}
+
+	// Prepend conversation history as multi-turn message pairs.
+	agentShared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
 	result, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 	if err != nil {
@@ -534,6 +565,9 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 
 	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, "inspector-pipeline", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
+	ctx = agentShared.WithContextGovernor(ctx, agentShared.NewContextGovernor(
+		pi.config.Model, pi.config.MaxTokens, 0,
+	))
 
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(pi.bus, pi.channels, ctx, "inspector-pipeline")
@@ -571,6 +605,9 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 	}
 	respMsg := guide.NewResponseMessage(pi.generateMessageID(), resp)
+	if pi.agentPod != nil {
+		pi.agentPod.FeedScribe("inspector-pipeline", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 	return pi.bus.Publish(pi.channels.Responses, respMsg)
 }
 
@@ -719,7 +756,7 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 
 	now := time.Now()
 
-	if pi.provider == nil {
+	if pi.getProvider() == nil {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
 				lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -741,6 +778,11 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 		return result, nil
 	}
 
+	pi.mu.RLock()
+	model := pi.config.Model
+	maxTokens := pi.config.MaxTokens
+	pi.mu.RUnlock()
+
 	prompt := buildValidationPrompt(taskID, files, criteria, workerType)
 	systemPrompt := shared.PipelineInspectorSystemPromptForDomain(
 		shared.ValidationDomainFromWorkerType(workerType),
@@ -748,8 +790,8 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
-		Model:        pi.config.Model,
-		MaxTokens:    pi.config.MaxTokens,
+		Model:        model,
+		MaxTokens:    maxTokens,
 		Tools:        pi.buildToolDefinitions(),
 	}
 
@@ -856,7 +898,7 @@ func (pi *PipelineInspector) AgentType() string { return "inspector-pipeline" }
 func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:     "inspector-pipeline",
-		ModelID:       "opus-4.6",
+		ModelID:       pi.CurrentModel(),
 		ContextWindow: 200_000,
 		Category:      handoff.CategoryPipeline,
 	}
@@ -865,6 +907,11 @@ func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
 func (pi *PipelineInspector) InjectPreparedContext(_ *handoff.PreparedContext) error { return nil }
 func (pi *PipelineInspector) Terminate(_ context.Context) error                     { return pi.Stop() }
 func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess) { pi.fileAccess = fa }
+// SetAgentPod injects the agent pod for Scribe feed integration.
+func (pi *PipelineInspector) SetAgentPod(pod *agentShared.AgentPod) {
+	pi.agentPod = pod
+}
+
 func (pi *PipelineInspector) SetHandoffBridge(bridge *handoff.HandoffBridge)         { pi.handoffBridge = bridge }
 func (pi *PipelineInspector) ExtractArchivableState() *handoff.ArchivableState {
 	return &handoff.ArchivableState{

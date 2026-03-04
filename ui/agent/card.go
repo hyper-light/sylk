@@ -17,7 +17,7 @@ var statusIcons = map[AgentStatus]string{
 	StatusError:    theme.IconError,
 	StatusSuccess:  theme.IconSuccess,
 	StatusHandoff:  theme.IconHandoff,
-	StatusWaiting:  theme.IconWaiting,
+	StatusWaiting:  theme.IconIdle,
 }
 
 // selectedIndicator is the left-side marker for the currently selected card.
@@ -130,7 +130,7 @@ var statusColors = map[AgentStatus]func(*theme.Theme) lipgloss.Color{
 	StatusError:    func(th *theme.Theme) lipgloss.Color { return th.Palette.Error },
 	StatusSuccess:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Success },
 	StatusHandoff:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Warning },
-	StatusWaiting:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Subtle },
+	StatusWaiting:  func(th *theme.Theme) lipgloss.Color { return th.Palette.Muted },
 }
 
 // resolveStaticIcon returns the static display glyph for a non-active status.

@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -74,6 +75,9 @@ func (gi *GlobalInspector) executeConversationStream(
 	if len(tools) > 0 {
 		req.ToolChoice = "auto"
 	}
+
+	// Prepend conversation history as multi-turn message pairs.
+	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
 	llmCtx, cancel := context.WithTimeout(ctx, gi.config.DefaultTimeout)
 	defer cancel()
@@ -150,17 +154,6 @@ func (gi *GlobalInspector) publishThoughtProgress(ctx context.Context, thought s
 // message with conversation history and runtime context.
 func buildInspectorConversationPrompt(fwd *guide.ForwardedRequest) string {
 	var b strings.Builder
-
-	if len(fwd.ConversationHistory) > 0 {
-		b.WriteString("## Prior Conversation\n\n")
-		for _, turn := range fwd.ConversationHistory {
-			b.WriteString(fmt.Sprintf("[%s] User: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.UserInput))
-			if turn.AgentReply != "" {
-				b.WriteString(fmt.Sprintf("[%s] %s: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.AgentID, turn.AgentReply))
-			}
-		}
-		b.WriteString("\n---\n\n")
-	}
 
 	b.WriteString("## User Query\n\n")
 	b.WriteString(strings.TrimSpace(fwd.Input))

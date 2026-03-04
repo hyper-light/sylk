@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -15,11 +17,33 @@ func (a *Academic) registerCoreSkills() {
 	a.skills.Register(researchTopicSkill(a))
 	a.skills.Register(findBestPracticesSkill(a))
 	a.skills.Register(compareApproachesSkill(a))
+	a.skills.Register(consultSkill(a))
+	a.skills.Register(shared.NewSelfDiagnosticSkill(&academicDiag{a: a}))
 	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "academic",
-		SessionID: func() string { return "" },
+		SessionID: func() string { return a.config.SessionID },
 		Publish:   a.publishRerouteRequest,
 	}))
+}
+
+type academicDiag struct{ a *Academic }
+
+func (d *academicDiag) AgentName() string  { return "academic" }
+func (d *academicDiag) SessionID() string  { return d.a.config.SessionID }
+func (d *academicDiag) LogsDir() string    { return shared.LogsDirForAgent(d.a.steering.SessionDir(), "academic") }
+func (d *academicDiag) EventLogger() *agentlog.SessionEventLogger { return d.a.steering.EventLogger() }
+func (d *academicDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *academicDiag) RecoveryHints() []string                   { return nil }
+
+func (d *academicDiag) AgentSpecificDiagnostics() map[string]any {
+	d.a.requestMu.Lock()
+	inFlight := len(d.a.requestCancels)
+	d.a.requestMu.Unlock()
+	return map[string]any{
+		"in_flight_requests": inFlight,
+		"cache_size":         len(d.a.researchCache),
+		"outcome_history":    d.a.outcomeHistory.Len(),
+	}
 }
 
 func (a *Academic) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
@@ -39,6 +63,49 @@ func (a *Academic) publishRerouteRequest(reason, originalInput, suggestedTarget 
 func (a *Academic) registerExtendedSkills() {
 	a.skills.Register(recommendSolutionSkill(a))
 	a.skills.Register(validateApproachSkill(a))
+}
+
+// consultTargets enumerates valid consultation targets for the Academic.
+var consultTargets = map[string]string{
+	"librarian":   "Codebase patterns, existing implementations, and dependency information",
+	"archivalist": "Historical context on code decisions and past changes",
+}
+
+func consultSkill(a *Academic) *skills.Skill {
+	return skills.NewSkill("consult").
+		Description("Consult a domain expert agent. Targets: librarian (codebase patterns), archivalist (historical context).").
+		Domain("consultation").
+		Keywords("consult", "librarian", "archivalist", "codebase", "patterns", "history").
+		Priority(85).
+		EnumParam("target", "Agent to consult", []string{"librarian", "archivalist"}, true).
+		StringParam("query", "Consultation question", true).
+		StringParam("scope", "Scope for consultation", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Target string `json:"target"`
+				Query  string `json:"query"`
+				Scope  string `json:"scope"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if _, ok := consultTargets[params.Target]; !ok {
+				return nil, fmt.Errorf("invalid target %q: must be librarian or archivalist", params.Target)
+			}
+			if params.Query == "" {
+				return nil, fmt.Errorf("query is required")
+			}
+			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, a.config.SessionID)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"target":  params.Target,
+				"success": evidence.Success,
+				"data":    evidence.Data,
+			}, nil
+		}).
+		Build()
 }
 
 type researchTopicParams struct {
@@ -144,15 +211,11 @@ func compareApproachesSkill(a *Academic) *skills.Skill {
 		Build()
 }
 
-func (a *Academic) compareApproaches(ctx context.Context, topic string, approaches []string, criteria []string) (*ApproachComparison, error) {
+func (a *Academic) compareApproaches(ctx context.Context, topic string, approaches []string, _ []string) (*ApproachComparison, error) {
 	comparison := &ApproachComparison{
 		Topic:      topic,
 		Approaches: make([]Approach, 0, len(approaches)),
 	}
-
-	libCtx, _ := a.consultLibrarian(ctx, &ResearchQuery{
-		Query: fmt.Sprintf("compare approaches for %s: %v", topic, approaches),
-	})
 
 	for i, approachName := range approaches {
 		query := &ResearchQuery{
@@ -160,7 +223,7 @@ func (a *Academic) compareApproaches(ctx context.Context, topic string, approach
 			Intent: IntentRecall,
 		}
 
-		result, err := a.executeResearch(ctx, query, libCtx, nil)
+		result, err := a.Research(ctx, query)
 		if err != nil {
 			a.logger.Warn("failed to research approach",
 				"approach", approachName,
@@ -173,20 +236,13 @@ func (a *Academic) compareApproaches(ctx context.Context, topic string, approach
 			ID:          fmt.Sprintf("approach_%d", i),
 			Name:        approachName,
 			Description: summarizeFindings(result.Findings),
-			Pros:        extractPros(result.Findings),
-			Cons:        extractCons(result.Findings),
 			SourceIDs:   result.SourcesConsulted,
-		}
-
-		if len(criteria) > 0 {
-			approach.UseCases = matchCriteria(result.Findings, criteria)
 		}
 
 		comparison.Approaches = append(comparison.Approaches, approach)
 	}
 
 	comparison.Summary = generateComparisonSummary(comparison.Approaches)
-	comparison.RecommendedApproach, comparison.Rationale = selectRecommendedApproach(comparison.Approaches, libCtx)
 
 	return comparison, nil
 }
@@ -198,64 +254,11 @@ func summarizeFindings(findings []Finding) string {
 	return findings[0].Summary
 }
 
-func extractPros(findings []Finding) []string {
-	var pros []string
-	for _, f := range findings {
-		if f.Confidence == ConfidenceLevelHigh {
-			pros = append(pros, f.Summary)
-		}
-	}
-	return pros
-}
-
-func extractCons(findings []Finding) []string {
-	var cons []string
-	for _, f := range findings {
-		if f.Confidence == ConfidenceLevelLow {
-			cons = append(cons, f.Summary)
-		}
-	}
-	return cons
-}
-
-func matchCriteria(findings []Finding, criteria []string) []string {
-	var matched []string
-	for _, criterion := range criteria {
-		for _, f := range findings {
-			if containsSubstring(toLower(f.Summary), toLower(criterion)) {
-				matched = append(matched, criterion)
-				break
-			}
-		}
-	}
-	return matched
-}
-
 func generateComparisonSummary(approaches []Approach) string {
 	if len(approaches) == 0 {
 		return "No approaches to compare"
 	}
 	return fmt.Sprintf("Compared %d approaches", len(approaches))
-}
-
-func selectRecommendedApproach(approaches []Approach, libCtx *LibrarianContext) (string, string) {
-	if len(approaches) == 0 {
-		return "", "No approaches available"
-	}
-
-	best := approaches[0]
-	for _, a := range approaches[1:] {
-		if len(a.Pros) > len(best.Pros) && len(a.Cons) <= len(best.Cons) {
-			best = a
-		}
-	}
-
-	rationale := fmt.Sprintf("Selected %s based on having the most advantages", best.Name)
-	if libCtx != nil && len(libCtx.ExistingPatterns) > 0 {
-		rationale += " and compatibility with existing codebase patterns"
-	}
-
-	return best.ID, rationale
 }
 
 type recommendSolutionParams struct {
@@ -291,14 +294,7 @@ func (a *Academic) recommendSolution(ctx context.Context, problem string, constr
 		Domain: DomainDecisions,
 	}
 
-	libCtx, err := a.consultLibrarian(ctx, query)
-	if err != nil && a.config.RequireLibrarian {
-		return nil, fmt.Errorf("librarian consultation required but failed: %w", err)
-	}
-
-	pastOutcomes := a.outcomeHistory.GetSimilar(problem, 5)
-
-	result, err := a.executeResearch(ctx, query, libCtx, pastOutcomes)
+	result, err := a.Research(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -317,10 +313,12 @@ func (a *Academic) recommendSolution(ctx context.Context, problem string, constr
 		recommendation.Applicability = rec.Applicability
 		recommendation.Confidence = rec.Confidence
 		recommendation.SourceIDs = rec.SourceIDs
+	} else if len(result.Findings) > 0 {
+		recommendation.Solution = result.Findings[0].Summary
+		recommendation.Confidence = result.Findings[0].Confidence
 	}
 
-	recommendation.LibrarianValidated = libCtx != nil && libCtx.CodebaseMaturity != "unknown"
-
+	pastOutcomes := a.outcomeHistory.GetSimilar(problem, 5)
 	if len(pastOutcomes) > 0 {
 		recommendation.PastOutcomes = &PastOutcomesSummary{
 			Total:       len(pastOutcomes),
@@ -389,53 +387,36 @@ func validateApproachSkill(a *Academic) *skills.Skill {
 		Build()
 }
 
-func (a *Academic) validateApproach(ctx context.Context, approach string, filesAffected []string, checkConflicts bool) (*ValidationResult, error) {
-	query := &ResearchQuery{
-		Query:  approach,
-		Intent: IntentCheck,
-	}
-
-	libCtx, err := a.consultLibrarian(ctx, query)
-	if err != nil {
-		return &ValidationResult{
-			Valid:  false,
-			Reason: "Could not consult Librarian for validation",
-			Error:  err.Error(),
-		}, nil
-	}
-
+func (a *Academic) validateApproach(ctx context.Context, approach string, filesAffected []string, _ bool) (*ValidationResult, error) {
 	result := &ValidationResult{
 		Approach:      approach,
 		FilesAffected: filesAffected,
 		ValidatedAt:   time.Now(),
 	}
 
-	if libCtx == nil {
+	// Consult Librarian for codebase context
+	evidence, err := a.requestConsultation(ctx, "librarian",
+		fmt.Sprintf("Validate approach compatibility: %s", approach),
+		"", a.config.SessionID)
+	if err != nil {
 		result.Valid = false
-		result.Reason = "No codebase context available"
+		result.Reason = "Could not consult Librarian for validation"
+		result.Error = err.Error()
 		return result, nil
 	}
 
-	result.CodebaseMaturity = libCtx.CodebaseMaturity
-	result.ExistingPatterns = libCtx.ExistingPatterns
-
-	if checkConflicts && len(libCtx.ConflictingApproaches) > 0 {
+	if !evidence.Success {
 		result.Valid = false
-		result.Conflicts = libCtx.ConflictingApproaches
-		result.Reason = "Conflicts with existing approaches"
-		result.Applicability = "INCOMPATIBLE"
+		result.Reason = "Librarian consultation unsuccessful"
+		if evidence.Error != "" {
+			result.Error = evidence.Error
+		}
 		return result, nil
 	}
 
 	result.Valid = true
-	result.Reason = "Approach is compatible with codebase"
-
-	if len(libCtx.ExistingPatterns) > 0 {
-		result.Applicability = "ADAPTABLE"
-		result.Reason = "Approach can be adapted to existing patterns"
-	} else {
-		result.Applicability = "DIRECT"
-	}
+	result.Reason = "Approach validated via Librarian consultation"
+	result.Applicability = "ADAPTABLE"
 
 	return result, nil
 }
@@ -453,11 +434,7 @@ type ValidationResult struct {
 	ValidatedAt      time.Time `json:"validated_at"`
 }
 
-func (a *Academic) Skills() *skills.Registry {
-	return a.skills
-}
-
-func (a *Academic) SendToLibrarian(ctx context.Context, message string) error {
+func (a *Academic) SendToLibrarian(_ context.Context, message string) error {
 	if !a.running {
 		return fmt.Errorf("academic is not running")
 	}

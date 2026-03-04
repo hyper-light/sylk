@@ -14,6 +14,9 @@ func guardianCoreSkillNames() []string {
 		"content_scan",
 		"agent_health",
 		"review_gate",
+		"agent_logs",
+		"system_status",
+		"vfs_status",
 	}
 }
 
@@ -25,6 +28,9 @@ func guardianAllSkillNames() []string {
 		"content_scan",
 		"agent_health",
 		"review_gate",
+		"agent_logs",
+		"system_status",
+		"vfs_status",
 		"read_file",
 		"glob",
 		"grep",

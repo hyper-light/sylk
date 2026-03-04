@@ -10,6 +10,7 @@ import (
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -66,6 +67,13 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		}
 		// ── END STEERING ──
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, gt.config.MaxToolRuns, req); zone == agentshared.ZoneCritical {
+				return "", agentshared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
 		resp, err := provider.Complete(ctx, req)
 		agentshared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
@@ -78,7 +86,12 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 			return "", fmt.Errorf("global tester llm: %w", err)
 		}
 
+		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+
 		if len(resp.ToolCalls) == 0 {
+			gt.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -106,6 +119,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		}
 
 		errCount, rerouted := gt.applyToolCalls(ctx, req, resp)
+		gt.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -167,6 +181,9 @@ func (gt *GlobalTester) applyToolCalls(
 			agentshared.LogAgentEvent(lm.EventLogger, agentshared.ToolNameToEventType(call.Name),
 				lm.AgentID, lm.SessionID, lm.CorrID, "info",
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
+		}
+		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -240,6 +257,32 @@ func (gt *GlobalTester) buildToolDefinitions() []providers.Tool {
 }
 
 // --- Tool loop helpers (identical to orchestrator pattern) ---
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (gt *GlobalTester) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if gt.handoffBridge == nil {
+		return
+	}
+
+	gt.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      agentshared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
+}
 
 func marshalToolOutput(data any) (string, error) {
 	switch typed := data.(type) {

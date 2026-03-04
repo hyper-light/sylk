@@ -273,33 +273,3 @@ type HookHandler interface {
 	Execute(ctx context.Context) error
 }
 
-// PodSpec is the declarative specification for a pod (group of containers).
-type PodSpec struct {
-	Name                   string
-	Namespace              string // Session ID
-	Labels                 map[string]string
-	Annotations            map[string]string
-	InitContainers         []ContainerSpec
-	MainContainers         []ContainerSpec
-	SidecarContainers      []ContainerSpec
-	Volumes                []VolumeSpec
-	RestartPolicy          RestartPolicy
-	TerminationGracePeriod time.Duration
-	Priority               int
-	Resources              ResourceSpec // Aggregate pod resource limits
-}
-
-// AllContainerSpecs returns a combined slice of all container specs in the pod.
-func (p *PodSpec) AllContainerSpecs() []ContainerSpec {
-	total := len(p.InitContainers) + len(p.MainContainers) + len(p.SidecarContainers)
-	all := make([]ContainerSpec, 0, total)
-	all = append(all, p.InitContainers...)
-	all = append(all, p.MainContainers...)
-	all = append(all, p.SidecarContainers...)
-	return all
-}
-
-// ContainerCount returns the total number of containers in the pod.
-func (p *PodSpec) ContainerCount() int {
-	return len(p.InitContainers) + len(p.MainContainers) + len(p.SidecarContainers)
-}

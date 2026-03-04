@@ -58,7 +58,7 @@ type Container struct {
 	hookRunner  *HookRunner
 	restartCtl  *RestartController
 	agent       ContainerAgent
-	pod         *Pod // back-reference to owning pod (nil if standalone)
+	podID       PodID // owning pod ID (empty if standalone)
 	metrics     *ContainerMetrics
 
 	mu      sync.RWMutex
@@ -72,7 +72,7 @@ type ContainerConfig struct {
 	Scope     *concurrency.GoroutineScope
 	SecCtx    *csecurity.SecurityContext
 	Agent     ContainerAgent
-	Pod       *Pod
+	PodID     PodID
 }
 
 // NewContainer creates a container in the Created state. The container
@@ -96,7 +96,7 @@ func NewContainer(cfg ContainerConfig) *Container {
 		hookRunner:  hookRunner,
 		restartCtl:  rc,
 		agent:       cfg.Agent,
-		pod:         cfg.Pod,
+		podID:       cfg.PodID,
 		metrics:     &ContainerMetrics{},
 	}
 
@@ -235,9 +235,14 @@ func (c *Container) ProbeRunner() *ProbeRunner {
 	return c.probeRunner
 }
 
-// Pod returns the owning pod, or nil for standalone containers.
-func (c *Container) Pod() *Pod {
-	return c.pod
+// PodID returns the owning pod's ID, or empty for standalone containers.
+func (c *Container) PodID() PodID {
+	return c.podID
+}
+
+// SetPodID sets the owning pod's ID. Used by ManagedPod during container adoption.
+func (c *Container) SetPodID(id PodID) {
+	c.podID = id
 }
 
 // Scope returns the container's goroutine scope.

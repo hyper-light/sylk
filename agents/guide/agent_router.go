@@ -71,7 +71,7 @@ type TieredRouter struct {
 	signals *routerSignals
 
 	// On-demand agent activation for cold/demoted targets
-	activator AgentActivator
+	activator PodActivator
 
 	// Running state
 	running bool
@@ -114,7 +114,7 @@ type TieredRouterConfig struct {
 	RequestTimeout time.Duration
 
 	// Optional: on-demand agent activator for cold/demoted targets
-	Activator AgentActivator
+	Activator PodActivator
 }
 
 // NewTieredRouter creates a new agent router
@@ -197,7 +197,7 @@ func NewTieredRouter(cfg TieredRouterConfig) (*TieredRouter, error) {
 
 // SetActivator sets the on-demand agent activator for cold/demoted targets.
 // Safe to call before Start; not safe for concurrent use with routing.
-func (r *TieredRouter) SetActivator(a AgentActivator) {
+func (r *TieredRouter) SetActivator(a PodActivator) {
 	r.activator = a
 }
 
@@ -421,7 +421,8 @@ func (r *TieredRouter) TriggerAction(ctx context.Context, targetAgentID, action 
 
 	// Activate target agent if demoted/cold.
 	if r.activator != nil {
-		if err := r.activator.EnsureActive(ctx, targetType); err != nil {
+		podID := r.activator.PodForAgent(targetType)
+		if err := r.activator.EnsurePodActive(ctx, podID); err != nil {
 			r.removeOutbound(correlationID)
 			return "", fmt.Errorf("activate %s for action: %w", targetType, err)
 		}
@@ -438,7 +439,7 @@ func (r *TieredRouter) TriggerAction(ctx context.Context, targetAgentID, action 
 
 	// Touch activity after successful publish.
 	if r.activator != nil {
-		r.activator.TouchActivity(targetType)
+		r.activator.TouchPodActivity(r.activator.PodForAgent(targetType))
 	}
 
 	// Emit progress signal - programmatic action is agent-to-agent communication
@@ -635,7 +636,7 @@ func (r *TieredRouter) routeDirect(ctx context.Context, correlationID, targetAge
 		activated := false
 		if r.activator != nil {
 			targetType := r.resolveAgentType(targetAgentID)
-			if err := r.activator.EnsureActive(ctx, targetType); err == nil {
+			if err := r.activator.EnsurePodActive(ctx, r.activator.PodForAgent(targetType)); err == nil {
 				if nowReady, _ := r.readyAgents.Get(targetAgentID); nowReady {
 					activated = true
 				}
@@ -664,16 +665,17 @@ func (r *TieredRouter) routeDirect(ctx context.Context, correlationID, targetAge
 	}
 
 	// Build forwarded request
-		fwd := &ForwardedRequest{
-			CorrelationID:        correlationID,
-			ParentCorrelationID:  opts.parentCorrelationID,
-			Input:                input,
-			SourceAgentID:        r.agentID,
-			SourceAgentName:      r.agentName,
-			FireAndForget:        opts.fireAndForget,
-			Confidence:           1.0, // Direct routing has max confidence
-			ClassificationMethod: "direct",
-		}
+	fwd := &ForwardedRequest{
+		CorrelationID:        correlationID,
+		ParentCorrelationID:  opts.parentCorrelationID,
+		Input:                input,
+		SourceAgentID:        r.agentID,
+		SourceAgentName:      r.agentName,
+		FireAndForget:        opts.fireAndForget,
+		Confidence:           1.0, // Direct routing has max confidence
+		ClassificationMethod: "direct",
+		Metadata:             opts.metadata,
+	}
 
 	// Track pending request (unless fire-and-forget with no callback)
 	if !opts.fireAndForget || opts.callback != nil {
@@ -1134,6 +1136,7 @@ type routeOptions struct {
 	parentCorrelationID string
 	callback            ResponseCallback
 	timeout             time.Duration
+	metadata            map[string]any
 }
 
 func defaultRouteOptions() routeOptions {
@@ -1170,6 +1173,14 @@ func WithCallback(cb ResponseCallback) RouteOption {
 func WithTimeout(d time.Duration) RouteOption {
 	return func(o *routeOptions) {
 		o.timeout = d
+	}
+}
+
+// WithMetadata attaches opaque key-value pairs (e.g. ack_topic) to the
+// ForwardedRequest so that direct-routed messages preserve dispatch metadata.
+func WithMetadata(m map[string]any) RouteOption {
+	return func(o *routeOptions) {
+		o.metadata = m
 	}
 }
 

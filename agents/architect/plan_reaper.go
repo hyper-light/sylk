@@ -4,9 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -14,7 +11,7 @@ import (
 // retention and transitioning expired-lease plans to Failed. The goroutine
 // is tracked via context cancellation — no untracked goroutines.
 type PlanReaper struct {
-	architect    *Architect
+	store        *PlanStore
 	leaseManager *PlanLeaseManager
 	logger       *slog.Logger
 	ctx          context.Context
@@ -22,11 +19,11 @@ type PlanReaper struct {
 	done         chan struct{}
 }
 
-// NewPlanReaper creates a reaper bound to the architect's plan store.
-func NewPlanReaper(a *Architect, lm *PlanLeaseManager, logger *slog.Logger) *PlanReaper {
+// NewPlanReaper creates a reaper bound to the given PlanStore.
+func NewPlanReaper(store *PlanStore, lm *PlanLeaseManager, logger *slog.Logger) *PlanReaper {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PlanReaper{
-		architect:    a,
+		store:        store,
 		leaseManager: lm,
 		logger:       logger,
 		ctx:          ctx,
@@ -61,7 +58,7 @@ func (r *PlanReaper) loop() {
 }
 
 func (r *PlanReaper) sweep() {
-	plans := r.architect.snapshotActivePlans()
+	plans := r.store.Snapshot()
 	for _, plan := range plans {
 		action := r.classifyAction(plan)
 		r.executeAction(action, plan)
@@ -106,8 +103,8 @@ func (r *PlanReaper) executeAction(action reaperAction, plan *DesignPlan) {
 }
 
 func (r *PlanReaper) evictPlan(plan *DesignPlan) {
-	r.architect.removeActivePlan(plan.ID)
-	r.removeDiskFile(plan.ID, plan.SessionID)
+	r.store.Remove(plan.ID)
+	r.store.RemoveDiskFile(plan.ID, plan.SessionID)
 	r.logger.Info("reaper: evicted terminal plan",
 		"plan_id", plan.ID,
 		"status", plan.SM().State().String())
@@ -123,40 +120,11 @@ func (r *PlanReaper) expirePlan(plan *DesignPlan, reason string) {
 	plan.Status = plan.SM().State()
 	plan.Epoch = plan.SM().Epoch()
 	plan.UpdatedAt = time.Now()
-	_ = r.architect.persistPlanState(plan)
+	_ = r.store.Upsert(plan)
 	r.logger.Info("reaper: expired plan",
 		"plan_id", plan.ID, "reason", reason)
 }
 
-func (r *PlanReaper) removeDiskFile(planID, sessionID string) {
-	dir := r.architect.planStoreDir(sessionID)
-	path := filepath.Join(dir, strings.TrimSpace(planID)+".json")
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		r.logger.Warn("reaper: failed to remove disk file",
-			"path", path, "error", err)
-	}
-}
-
 func isTerminalPlanStatus(s PlanStatus) bool {
-	return s == PlanStatusCompleted || s == PlanStatusFailed
+	return s == PlanStatusCompleted || s == PlanStatusFailed || s == PlanStatusSuperseded
 }
-
-// snapshotActivePlans returns a shallow copy of the active plans slice for
-// safe iteration outside the lock.
-func (a *Architect) snapshotActivePlans() []*DesignPlan {
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	plans := make([]*DesignPlan, 0, len(a.activePlans))
-	for _, p := range a.activePlans {
-		plans = append(plans, p)
-	}
-	return plans
-}
-
-// removeActivePlan deletes a plan from the in-memory active set.
-func (a *Architect) removeActivePlan(planID string) {
-	a.activePlansMu.Lock()
-	defer a.activePlansMu.Unlock()
-	delete(a.activePlans, planID)
-}
-

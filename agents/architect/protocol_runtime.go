@@ -33,7 +33,7 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 
 	req = a.enrichPlanningRequest(req)
 	plan := newProtocolPlan(req)
-	a.persistPlanState(plan)
+	a.planStore.Upsert(plan)
 
 	corrID := correlationIDFromContext(ctx)
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventProtocolStarted,
@@ -111,7 +111,7 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 		return a.failAndPersistPlan(plan, err)
 	}
 	plan.CompletedAt = time.Now()
-	a.persistPlanState(plan)
+	a.planStore.Upsert(plan)
 	elapsed := time.Since(protocolStart)
 	diag.log("protocol complete elapsed=%v tasks=%d components=%d",
 		elapsed, len(plan.Tasks), len(plan.Architecture.Components))
@@ -148,7 +148,7 @@ func (a *Architect) runDeterministicProtocol(
 		plan.Status = plan.SM().State()
 		plan.Epoch = plan.SM().Epoch()
 		plan.UpdatedAt = time.Now()
-		return a.persistPlanState(plan)
+		return a.planStore.Upsert(plan)
 	}
 
 	// 1. Analyze
@@ -200,8 +200,8 @@ func (a *Architect) runDeterministicProtocol(
 	if err := transition(PlanStatusReady); err != nil {
 		return a.failAndPersistPlan(plan, err)
 	}
-	plan.LeaseExpiry = time.Now().Add(readyPlanMaxAge)
-	a.upsertActivePlan(plan)
+	plan.LeaseExpiry = time.Now().Add(ReadyPlanMaxAge)
+	a.planStore.Upsert(plan)
 
 	elapsed := time.Since(protocolStart)
 	diag.log("deterministic protocol complete elapsed=%v tasks=%d", elapsed, len(tasks))
@@ -386,7 +386,7 @@ func (r *planningProtocolRunner) run() error {
 	// The tool loop's final text turn is the plan presentation.
 	if r.plan.SM().State() == PlanStatusReady && strings.TrimSpace(text) != "" {
 		r.plan.UserResponse = sanitizePlannerConversationResponse(text)
-		return r.architect.persistPlanState(r.plan)
+		return r.architect.planStore.Upsert(r.plan)
 	}
 	return nil
 }
@@ -595,7 +595,7 @@ func (r *planningProtocolRunner) transition(status PlanStatus) error {
 	r.plan.Epoch = r.plan.SM().Epoch()  // sync epoch for JSON
 	r.plan.UpdatedAt = time.Now()
 	r.architect.publishPlanStreamProgress(r.ctx, status)
-	return r.architect.persistPlanState(r.plan)
+	return r.architect.planStore.Upsert(r.plan)
 }
 
 func validatePlanForExecution(plan *DesignPlan) error {
@@ -694,164 +694,8 @@ func validatePlanWorkflow(plan *DesignPlan) error {
 	return nil
 }
 
+// persistPlanState atomically upserts the plan to the PlanStore (in-memory + disk).
+// Kept as a convenience wrapper for call sites that need an error return.
 func (a *Architect) persistPlanState(plan *DesignPlan) error {
-	a.upsertActivePlan(plan)
-	return a.persistPlanSnapshot(plan)
-}
-
-func (a *Architect) upsertActivePlan(plan *DesignPlan) {
-	if a == nil || plan == nil || strings.TrimSpace(plan.ID) == "" {
-		return
-	}
-	a.activePlansMu.Lock()
-	defer a.activePlansMu.Unlock()
-	a.activePlans[plan.ID] = plan
-}
-
-func (a *Architect) persistPlanSnapshot(plan *DesignPlan) error {
-	if plan == nil {
-		return nil
-	}
-	encoded, err := a.marshalPlanSnapshot(plan)
-	if err != nil {
-		return err
-	}
-	return a.persistEncodedPlanSnapshot(plan.ID, plan.SessionID, encoded)
-}
-
-func (a *Architect) marshalPlanSnapshot(plan *DesignPlan) ([]byte, error) {
-	if a == nil || plan == nil || strings.TrimSpace(plan.ID) == "" {
-		return nil, nil
-	}
-	return json.MarshalIndent(plan, "", "  ")
-}
-
-func (a *Architect) persistEncodedPlanSnapshot(planID, sessionID string, encoded []byte) error {
-	if a == nil || strings.TrimSpace(planID) == "" || len(encoded) == 0 {
-		return nil
-	}
-	dir := a.planStoreDir(sessionID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	trimmedID := strings.TrimSpace(planID)
-	if trimmedID == "" {
-		return nil
-	}
-	finalPath := filepath.Join(dir, trimmedID+".json")
-	tmpPath := finalPath + ".tmp"
-	if err := os.WriteFile(tmpPath, encoded, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, finalPath)
-}
-
-func (a *Architect) planStoreDir(sessionID string) string {
-	base := a.config.WorkingDirectory
-	if strings.TrimSpace(base) == "" {
-		base = "."
-	}
-	if strings.TrimSpace(sessionID) == "" {
-		sessionID = "default"
-	}
-	return filepath.Join(base, ".sylk", "sessions", sessionID, "agents", "architect", "plans")
-}
-
-// restoreMaxAge is the maximum age of a persisted plan eligible for restore.
-// Plans older than this are stale artifacts from prior sessions.
-const restoreMaxAge = 24 * time.Hour
-
-// restoreMaxPlans caps the number of plans restored on startup to prevent
-// unbounded memory growth from accumulated plan files.
-const restoreMaxPlans = 32
-
-func (a *Architect) restorePersistedPlans() error {
-	base := a.config.WorkingDirectory
-	if strings.TrimSpace(base) == "" {
-		base = "."
-	}
-	sessionsDir := filepath.Join(base, ".sylk", "sessions")
-	sessionEntries, err := os.ReadDir(sessionsDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	cutoff := time.Now().Add(-restoreMaxAge)
-	restored := 0
-	skipped := 0
-	for _, sessionEntry := range sessionEntries {
-		if !sessionEntry.IsDir() {
-			continue
-		}
-		planDir := filepath.Join(sessionsDir, sessionEntry.Name(), "agents", "architect", "plans")
-		entries, readErr := os.ReadDir(planDir)
-		if readErr != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-				continue
-			}
-			if restored >= restoreMaxPlans {
-				_ = os.Remove(filepath.Join(planDir, entry.Name()))
-				skipped++
-				continue
-			}
-			path := filepath.Join(planDir, entry.Name())
-			if ok, restoreErr := a.restorePlanFromFile(path, cutoff); restoreErr != nil {
-				a.logger.Warn("failed to restore plan", "path", path, "error", restoreErr)
-				continue
-			} else if ok {
-				restored++
-			} else {
-				skipped++
-			}
-		}
-	}
-	a.logInfo("restorePersistedPlans: done",
-		"sessions_dir", sessionsDir, "restored", restored, "skipped", skipped)
-	return nil
-}
-
-func (a *Architect) restorePlanFromFile(path string, cutoff time.Time) (bool, error) {
-	payload, err := os.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-	var plan DesignPlan
-	if err := json.Unmarshal(payload, &plan); err != nil {
-		return false, err
-	}
-	if strings.TrimSpace(plan.ID) == "" {
-		return false, fmt.Errorf("restored plan missing id")
-	}
-	// Skip terminal-state plans only. These have no further transitions.
-	//
-	// Ready and Executing plans ARE restored — the architect may be demoted
-	// (idle timeout) while waiting for user approval or while the orchestrator
-	// executes a DAG. Without restoring Executing plans the reaper loses
-	// crash-recovery ability (expire-fail on lease timeout) and heartbeat
-	// lease renewal has no target. Staleness is handled at lookup time:
-	// latestReadyPlan applies a 30-minute age gate, the reaper expires leases,
-	// and session scoping prevents cross-session pollution.
-	switch plan.Status {
-	case PlanStatusFailed, PlanStatusCompleted, PlanStatusSuperseded:
-		_ = os.Remove(path) // Proactively clean up terminal plan files.
-		return false, nil
-	}
-	if plan.UpdatedAt.Before(cutoff) {
-		_ = os.Remove(path) // Proactively clean up old plan files.
-		return false, nil
-	}
-	plan.sm = NewPlanStateMachineWithEpoch(plan.ID, plan.Status, plan.Epoch)
-	a.logInfo("restorePlanFromFile",
-		"plan_id", plan.ID,
-		"status", plan.Status.String(),
-		"query", truncateString(plan.Query, 80),
-		"tasks", len(plan.Tasks),
-		"created_at", plan.CreatedAt.String())
-	a.upsertActivePlan(&plan)
-	return true, nil
+	return a.planStore.Upsert(plan)
 }

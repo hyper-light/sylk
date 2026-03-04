@@ -81,6 +81,9 @@ type Orchestrator struct {
 	// Handoff bridge for context-aware agent lifecycle management
 	handoffBridge *handoff.HandoffBridge
 
+	// Agent pod for cross-agent coordination (Scribe feed, etc.).
+	agentPod *shared.AgentPod
+
 	// Task router for DAG→container dispatch
 	taskRouter *TaskRouter
 
@@ -341,7 +344,7 @@ func (o *Orchestrator) SetTaskRouter(router *TaskRouter) {
 
 // SetActivator installs the on-demand agent activator, threading it to the
 // DAG bridge so BusNodeDispatchers can activate cold agents before dispatch.
-func (o *Orchestrator) SetActivator(a guide.AgentActivator) {
+func (o *Orchestrator) SetActivator(a guide.PodActivator) {
 	if o.dagBridge != nil {
 		o.dagBridge.SetActivator(a)
 	}
@@ -358,6 +361,14 @@ func (o *Orchestrator) SetRegistrar(fn PipelineRegistrar) {
 	}
 	if o.steering != nil {
 		o.dagBridge.SetEventLogger(o.steering.EventLogger())
+	}
+}
+
+// SetScribeFactory installs the Scribe factory, threading it to the DAG
+// bridge so PipelinePods can create Scribe sidecars for pipeline agents.
+func (o *Orchestrator) SetScribeFactory(f shared.ScribeFactory) {
+	if o.dagBridge != nil {
+		o.dagBridge.SetScribeFactory(f)
 	}
 }
 
@@ -813,6 +824,9 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		AgentID:     o.config.AgentID,
 		SessionID:   fwd.SessionID,
 	})
+	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
+		o.config.Model, o.config.MaxOutputTokens, 0,
+	))
 
 	if !fwd.FireAndForget {
 		o.logInfo("handleBusRequest: publishing StreamStart",
@@ -868,6 +882,10 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		completeText = ""
 	}
 	o.publishStreamComplete(ctx, completeText, usageAcc.Total())
+
+	if o.agentPod != nil {
+		o.agentPod.FeedScribe("orchestrator", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 
 	respMsg := guide.NewResponseMessage(generateMessageID(), resp)
 	return o.bus.Publish(o.channels.Responses, respMsg)
@@ -1033,7 +1051,7 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 			}
 		}
 
-		for _, pipelineType := range pipelineAgentTypes {
+		for _, pipelineType := range PipelineAgentTypes {
 			if _, active := dispatched[pipelineType]; !active {
 				o.publishPipelineAgentRegistration(pipelineType, dagID)
 			}
@@ -1562,14 +1580,6 @@ func (o *Orchestrator) publishActivity(eventType events.EventType, content strin
 	o.publishActivityWithVisibility(eventType, events.VisibilityUser, content)
 }
 
-// pipelineAgentDisplayNames maps agent type strings to their user-facing names.
-var pipelineAgentDisplayNames = map[string]string{
-	"engineer":           "Engineer",
-	"designer":           "Designer",
-	"inspector-pipeline": "Inspector",
-	"tester-pipeline":    "Tester",
-}
-
 // publishPipelineAgentActivity publishes an activity event for a pipeline
 // agent so the TUI's ensureAgent creates a panel entry. Uses agentType as
 // AgentID so one entry per agent type (not per dispatch).
@@ -1577,7 +1587,7 @@ func (o *Orchestrator) publishPipelineAgentActivity(agentType, dagID, nodeID, ta
 	if o.activityPub == nil {
 		return
 	}
-	displayName := pipelineAgentDisplayNames[agentType]
+	displayName := PipelineAgentDisplayNames[agentType]
 	if displayName == "" {
 		displayName = agentType
 	}
@@ -1600,7 +1610,7 @@ func (o *Orchestrator) publishPipelineAgentRegistration(agentType, dagID string)
 	if o.activityPub == nil {
 		return
 	}
-	displayName := pipelineAgentDisplayNames[agentType]
+	displayName := PipelineAgentDisplayNames[agentType]
 	if displayName == "" {
 		displayName = agentType
 	}
@@ -2018,6 +2028,11 @@ func (o *Orchestrator) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.handoffBridge = bridge
+}
+
+// SetAgentPod assigns the agent pod for cross-agent coordination.
+func (o *Orchestrator) SetAgentPod(pod *shared.AgentPod) {
+	o.agentPod = pod
 }
 
 // AgentID returns the orchestrator's agent identifier.

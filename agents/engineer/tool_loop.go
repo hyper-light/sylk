@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -73,6 +74,13 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 		}
 		// ── END STEERING ──
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, maxRuns, req); zone == shared.ZoneCritical {
+				return "", shared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
 		resp, err := p.Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
@@ -85,7 +93,12 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 			return "", fmt.Errorf("engineer llm: %w", err)
 		}
 
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+
 		if len(resp.ToolCalls) == 0 {
+			e.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -113,6 +126,7 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 		}
 
 		errCount, rerouted := e.applyToolCalls(ctx, req, resp)
+		e.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -178,6 +192,9 @@ func (e *Engineer) applyToolCalls(
 			shared.LogAgentEvent(lm.EventLogger, toolEvent,
 				lm.AgentID, lm.SessionID, lm.CorrID, "info",
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
+		}
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -248,4 +265,30 @@ func (e *Engineer) buildToolDefinitions() []providers.Tool {
 		})
 	}
 	return tools
+}
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (e *Engineer) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if e.handoffBridge == nil {
+		return
+	}
+
+	e.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      shared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
 }

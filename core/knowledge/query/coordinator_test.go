@@ -145,13 +145,13 @@ func TestNewHybridQueryCoordinator(t *testing.T) {
 		t.Fatal("NewHybridQueryCoordinator returned nil")
 	}
 
-	if coord.bleveSearcher != bleve {
+	if coord.bleveSearcher.Load() != bleve {
 		t.Error("bleveSearcher not set correctly")
 	}
-	if coord.vectorSearcher != vector {
+	if coord.vectorSearcher.Load() != vector {
 		t.Error("vectorSearcher not set correctly")
 	}
-	if coord.graphTraverser != graph {
+	if coord.graphTraverser.Load() != graph {
 		t.Error("graphTraverser not set correctly")
 	}
 	if coord.rrfFusion == nil {

@@ -5,36 +5,21 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/container/pod"
 )
 
-// ActivationTier represents the resource/latency tradeoff for an agent.
-//
-//	Cold: No state exists, full creation needed.
-//	Cool: State serialized on disk, moderate resume.
-//	Warm: Container paused in memory, fast resume.
-//	Hot:  Container running and ready.
-type ActivationTier int32
+// ActivationTier is the canonical tier type, defined in the pod package
+// to break the activation↔pod import cycle. Re-exported here for
+// backward compatibility with all existing activation callers.
+type ActivationTier = pod.ActivationTier
 
+// Tier constants re-exported from pod for backward compatibility.
 const (
-	TierCold ActivationTier = iota
-	TierCool
-	TierWarm
-	TierHot
+	TierCold = pod.TierCold
+	TierCool = pod.TierCool
+	TierWarm = pod.TierWarm
+	TierHot  = pod.TierHot
 )
-
-var tierNames = map[ActivationTier]string{
-	TierCold: "cold",
-	TierCool: "cool",
-	TierWarm: "warm",
-	TierHot:  "hot",
-}
-
-func (t ActivationTier) String() string {
-	if name, ok := tierNames[t]; ok {
-		return name
-	}
-	return "unknown"
-}
 
 // ActivationEntry tracks the current activation state of a single agent type.
 // All mutable fields use atomics for lock-free hot-path reads.

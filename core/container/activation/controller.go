@@ -13,6 +13,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/handoff"
 )
 
@@ -304,7 +305,7 @@ func (ac *ActivationController) EvictUnderPressure(ctx context.Context) {
 		if err := ac.DemoteTo(ctx, candidate.Entry.AgentType, target); err != nil {
 			ac.logger.Warn("pressure-driven demotion failed",
 				"agent_type", candidate.Entry.AgentType,
-				"target_tier", target.String(),
+				"target_tier", pod.TierString(target),
 				"error", err,
 			)
 			continue
@@ -424,7 +425,7 @@ func (ac *ActivationController) promoteFromCool(ctx context.Context, entry *Acti
 		return ac.promoteFromCold(ctx, entry)
 	}
 
-	c, err := ac.runtime.CreateContainer(ctx, coolEntry.Spec, nil)
+	c, err := ac.runtime.CreateContainer(ctx, coolEntry.Spec)
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +469,7 @@ func (ac *ActivationController) promoteFromCool(ctx context.Context, entry *Acti
 func (ac *ActivationController) promoteFromCold(ctx context.Context, entry *ActivationEntry) (*container.Container, error) {
 	createStart := time.Now()
 	activationFileLog().Info("DEBUG: cold_start_create_container", "agent_type", entry.AgentType)
-	c, err := ac.runtime.CreateContainer(ctx, entry.Spec, nil)
+	c, err := ac.runtime.CreateContainer(ctx, entry.Spec)
 	activationFileLog().Info("DEBUG: cold_start_create_done",
 		"agent_type", entry.AgentType,
 		"elapsed_ms", time.Since(createStart).Milliseconds(),
@@ -665,7 +666,7 @@ func (ac *ActivationController) preWarmAsync(ctx context.Context, agentType stri
 				return nil // another pre-warm or promote already in progress
 			}
 
-			c, err := ac.runtime.CreateContainer(ctx, entry.Spec, nil)
+			c, err := ac.runtime.CreateContainer(ctx, entry.Spec)
 			if err != nil {
 				entry.StoreTier(TierCold) // rollback
 				ac.logger.Warn("pre-warm container creation failed",

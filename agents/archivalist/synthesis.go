@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 // SynthesisSystemPrompt is the system prompt for the synthesis component
@@ -32,19 +32,21 @@ Never include:
 - Redundant explanations
 - Information not directly relevant to the query`
 
-// Synthesizer provides RAG synthesis using Sonnet 4.5
+// Synthesizer provides RAG synthesis using a provider-based LLM.
 type Synthesizer struct {
-	client     *anthropic.Client
+	provider   archivalistProvider
+	model      string
 	retriever  *SemanticRetriever
 	queryCache *QueryCache
 
 	systemPrompt string
-	maxTokens    int64
+	maxTokens    int
 }
 
 // SynthesizerConfig configures the synthesizer
 type SynthesizerConfig struct {
-	Client       *anthropic.Client
+	Provider     archivalistProvider
+	Model        string
 	Retriever    *SemanticRetriever
 	QueryCache   *QueryCache
 	SystemPrompt string
@@ -58,13 +60,19 @@ func NewSynthesizer(cfg SynthesizerConfig) *Synthesizer {
 		systemPrompt = SynthesisSystemPrompt
 	}
 
-	maxTokens := int64(cfg.MaxTokens)
+	maxTokens := cfg.MaxTokens
 	if maxTokens == 0 {
 		maxTokens = DefaultMaxOutputTokens
 	}
 
+	model := cfg.Model
+	if model == "" {
+		model = ModelSonnet45
+	}
+
 	return &Synthesizer{
-		client:       cfg.Client,
+		provider:     cfg.Provider,
+		model:        model,
 		retriever:    cfg.Retriever,
 		queryCache:   cfg.QueryCache,
 		systemPrompt: systemPrompt,
@@ -101,8 +109,8 @@ func (s *Synthesizer) Answer(ctx context.Context, query string, sessionID string
 		return nil, err
 	}
 
-	answer := extractAnswer(message)
-	tokensUsed := int(message.Usage.InputTokens + message.Usage.OutputTokens)
+	answer := strings.TrimSpace(message.Content)
+	tokensUsed := message.Usage.InputTokens + message.Usage.OutputTokens
 	s.cacheResponse(ctx, query, sessionID, answer, queryType)
 
 	return &SynthesisResponse{
@@ -143,31 +151,20 @@ func (s *Synthesizer) retrieveContext(ctx context.Context, query string) ([]*Ret
 	return contextResults, nil
 }
 
-func (s *Synthesizer) synthesize(ctx context.Context, prompt string) (*anthropic.Message, error) {
-	message, err := s.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.Model(ModelSonnet45),
-		MaxTokens: s.maxTokens,
-		System: []anthropic.TextBlockParam{
-			{Text: s.systemPrompt},
-		},
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
-		},
+func (s *Synthesizer) synthesize(ctx context.Context, prompt string) (*providers.Response, error) {
+	if s.provider == nil {
+		return nil, fmt.Errorf("synthesis: no LLM provider configured")
+	}
+	resp, err := s.provider.Complete(ctx, &providers.Request{
+		SystemPrompt: s.systemPrompt,
+		Model:        s.model,
+		MaxTokens:    s.maxTokens,
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("synthesis failed: %w", err)
 	}
-	return message, nil
-}
-
-func extractAnswer(message *anthropic.Message) string {
-	var answer string
-	for _, block := range message.Content {
-		if block.Type == "text" {
-			answer += block.Text
-		}
-	}
-	return answer
+	return resp, nil
 }
 
 func (s *Synthesizer) cacheResponse(ctx context.Context, query, sessionID, answer string, queryType QueryType) {
@@ -180,40 +177,18 @@ func (s *Synthesizer) cacheResponse(ctx context.Context, query, sessionID, answe
 func (s *Synthesizer) AnswerWithContext(ctx context.Context, query string, contextResults []*RetrievalResult) (*SynthesisResponse, error) {
 	startTime := time.Now()
 
-	// Build prompt with provided context
 	prompt := s.buildPrompt(query, contextResults)
-
-	// Run Sonnet for synthesis
-	message, err := s.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.Model(ModelSonnet45),
-		MaxTokens: s.maxTokens,
-		System: []anthropic.TextBlockParam{
-			{Text: s.systemPrompt},
-		},
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
-		},
-	})
+	message, err := s.synthesize(ctx, prompt)
 	if err != nil {
-		return nil, fmt.Errorf("synthesis failed: %w", err)
+		return nil, err
 	}
-
-	// Extract text content
-	var answer string
-	for _, block := range message.Content {
-		if block.Type == "text" {
-			answer += block.Text
-		}
-	}
-
-	tokensUsed := int(message.Usage.InputTokens + message.Usage.OutputTokens)
 
 	return &SynthesisResponse{
-		Answer:     answer,
+		Answer:     strings.TrimSpace(message.Content),
 		Source:     "synthesis",
 		CacheHit:   false,
 		Context:    contextResults,
-		TokensUsed: tokensUsed,
+		TokensUsed: message.Usage.InputTokens + message.Usage.OutputTokens,
 		Latency:    time.Since(startTime),
 	}, nil
 }

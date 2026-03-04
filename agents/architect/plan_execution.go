@@ -12,57 +12,24 @@ import (
 	"github.com/google/uuid"
 )
 
-// readyPlanMaxAge is the maximum age of a ready plan eligible for execution.
+// ReadyPlanMaxAge is the maximum age of a ready plan eligible for execution.
 // Plans older than this are stale (e.g. restored from disk across sessions)
 // and should not be dispatched.
-const readyPlanMaxAge = 30 * time.Minute
+const ReadyPlanMaxAge = 30 * time.Minute
 
 // latestReadyPlan returns the most recently updated plan with PlanStatusReady
-// for the given session, provided it was updated within readyPlanMaxAge.
-// Session scoping prevents restored plans from prior sessions from misleading
-// routing (e.g. triggering handlePlanFeedback for plans the user never saw).
+// for the given session, provided it was updated within ReadyPlanMaxAge.
 func (a *Architect) latestReadyPlan(sessionID string) *DesignPlan {
 	trimmed := strings.TrimSpace(sessionID)
 	if trimmed == "" {
 		architectDebugLog().Warn("handoff: LATEST_READY_PLAN_EMPTY_SESSION")
 		return nil
 	}
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	cutoff := time.Now().Add(-readyPlanMaxAge)
-	var best *DesignPlan
-	for _, plan := range a.activePlans {
-		planState := plan.SM().State()
-		planSession := strings.TrimSpace(plan.SessionID)
-		if planState != PlanStatusReady {
-			architectDebugLog().Debug("handoff: LATEST_READY_PLAN_SKIP_STATE",
-				"plan_id", plan.ID,
-				"state", planState.String(),
-				"session", planSession)
-			continue
-		}
-		if !strings.EqualFold(planSession, trimmed) {
-			architectDebugLog().Debug("handoff: LATEST_READY_PLAN_SKIP_SESSION",
-				"plan_id", plan.ID,
-				"plan_session", planSession,
-				"request_session", trimmed)
-			continue
-		}
-		if plan.UpdatedAt.Before(cutoff) {
-			architectDebugLog().Debug("handoff: LATEST_READY_PLAN_SKIP_EXPIRED",
-				"plan_id", plan.ID,
-				"updated_at", plan.UpdatedAt.String(),
-				"cutoff", cutoff.String())
-			continue
-		}
-		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
-			best = plan
-		}
-	}
+	best := a.planStore.LatestByStatus(trimmed, PlanStatusReady, ReadyPlanMaxAge)
 	if best == nil {
 		architectDebugLog().Info("handoff: LATEST_READY_PLAN_NONE_FOUND",
 			"request_session", trimmed,
-			"total_plans", len(a.activePlans))
+			"total_plans", a.planStore.Count())
 	} else {
 		architectDebugLog().Info("handoff: LATEST_READY_PLAN_FOUND",
 			"plan_id", best.ID,
@@ -173,8 +140,8 @@ func (a *Architect) dispatchPlanExecution(
 	plan.Status = plan.SM().State()
 	plan.Epoch = plan.SM().Epoch()
 	// Grant executing lease for crash recovery detection.
-	if a.leaseManager != nil {
-		a.leaseManager.GrantExecutingLease(plan, "orchestrator")
+	if lm := a.planStore.LeaseManager(); lm != nil {
+		lm.GrantExecutingLease(plan, "orchestrator")
 	}
 
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanLeased,
@@ -182,7 +149,7 @@ func (a *Architect) dispatchPlanExecution(
 		&agentlog.PlanPayload{PlanID: plan.ID, Status: "executing", Epoch: plan.Epoch})
 	summary := summarizeAutoHandoffResponse(response)
 	plan.RiskSummary = append(plan.RiskSummary, summary)
-	_ = a.persistPlanState(plan)
+	_ = a.planStore.Upsert(plan)
 	a.publishPlanSnapshot(ctx, plan)
 
 	return &ConversationResult{
@@ -206,49 +173,14 @@ func originalCIDFromContext(ctx context.Context) string {
 // a session regardless of status. Used for conversation context enrichment
 // and prior session context — not for execution eligibility.
 func (a *Architect) latestHistoricalPlanForSession(sessionID string) *DesignPlan {
-	trimmed := strings.TrimSpace(sessionID)
-	if trimmed == "" {
-		return nil
-	}
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	var best *DesignPlan
-	for _, plan := range a.activePlans {
-		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
-			continue
-		}
-		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
-			best = plan
-		}
-	}
-	return best
+	return a.planStore.LatestHistorical(sessionID)
 }
 
 // latestConsultingPlan returns the most recently updated plan in Consulting
 // or Clarifying state for the given session. Used by ask_user_question to
 // attach clarification questions to the in-flight plan.
 func (a *Architect) latestConsultingPlan(sessionID string) *DesignPlan {
-	trimmed := strings.TrimSpace(sessionID)
-	if trimmed == "" {
-		return nil
-	}
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	var best *DesignPlan
-	for _, plan := range a.activePlans {
-		state := plan.SM().State()
-		if state != PlanStatusConsulting && state != PlanStatusClarifying &&
-			state != PlanStatusAnalyzing && state != PlanStatusDesigning {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
-			continue
-		}
-		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
-			best = plan
-		}
-	}
-	return best
+	return a.planStore.LatestConsulting(sessionID)
 }
 
 // evaluateAcceptanceVerdict sends the user's response to the Guide's
@@ -306,29 +238,7 @@ const stalledPlanMaxAge = 5 * time.Minute
 // Completed/Failed (terminal or post-ready). Used to detect plans that the
 // conversation tool loop started but couldn't finish due to API errors.
 func (a *Architect) latestStalledPlan(sessionID string) *DesignPlan {
-	trimmed := strings.TrimSpace(sessionID)
-	if trimmed == "" {
-		return nil
-	}
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	cutoff := time.Now().Add(-stalledPlanMaxAge)
-	var best *DesignPlan
-	for _, plan := range a.activePlans {
-		if !isStalledState(plan.SM().State()) {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
-			continue
-		}
-		if plan.UpdatedAt.Before(cutoff) {
-			continue
-		}
-		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
-			best = plan
-		}
-	}
-	return best
+	return a.planStore.LatestStalled(sessionID, stalledPlanMaxAge)
 }
 
 func isStalledState(s PlanStatus) bool {
@@ -349,12 +259,7 @@ func (a *Architect) supersedeStalledPlans(sessionID string) {
 	if trimmed == "" {
 		return
 	}
-	a.activePlansMu.Lock()
-	defer a.activePlansMu.Unlock()
-	for _, plan := range a.activePlans {
-		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
-			continue
-		}
+	for _, plan := range a.planStore.AllForSession(trimmed) {
 		if !isStalledState(plan.SM().State()) {
 			continue
 		}
@@ -369,6 +274,7 @@ func (a *Architect) supersedeStalledPlans(sessionID string) {
 		plan.sm = NewPlanStateMachine(plan.ID, PlanStatusSuperseded)
 		plan.Status = PlanStatusSuperseded
 		plan.UpdatedAt = time.Now()
+		_ = a.planStore.Upsert(plan)
 	}
 }
 

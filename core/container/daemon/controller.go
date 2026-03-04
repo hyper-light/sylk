@@ -85,7 +85,7 @@ func (dc *DaemonSetController) ensureInstance(ctx context.Context, name string, 
 }
 
 func (dc *DaemonSetController) createAndStart(ctx context.Context, name string, spec *DaemonSetSpec) error {
-	c, err := dc.runtime.CreateContainer(ctx, spec.ContainerSpec, nil)
+	c, err := dc.runtime.CreateContainer(ctx, spec.ContainerSpec)
 	if err != nil {
 		return err
 	}

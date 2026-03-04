@@ -40,6 +40,7 @@ type Designer struct {
 	provider        designerProvider
 	providerWrapper gateway.ProviderWrapper
 	handoffBridge   *handoff.HandoffBridge
+	agentPod        *shared.AgentPod
 	activityPub     events.ActivityPublisher
 	pipelineID      string // DAG pipeline ID for TUI grouping.
 	usageAccum      *designerUsageAccumulator
@@ -443,6 +444,9 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		AgentID:     d.id,
 		SessionID:   fwd.SessionID,
 	})
+	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
+		d.config.DesignerConfig.Model, d.config.DesignerConfig.MaxTokens, 0,
+	))
 	startTime := time.Now()
 
 	result, err := d.handleDesign(ctx, fwd)
@@ -481,6 +485,9 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	d.publishActivity(events.EventTypeAgentAction, "Design task completed")
 
 	respMsg := guide.NewResponseMessage(d.generateMessageID(), resp)
+	if d.agentPod != nil {
+		d.agentPod.FeedScribe("designer", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 	return d.bus.Publish(d.channels.Responses, respMsg)
 }
 
@@ -560,6 +567,9 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		MaxTokens:       d.config.DesignerConfig.MaxTokens,
 		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
 	}
+
+	// Prepend conversation history as multi-turn message pairs.
+	shared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
 	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 		shared.LogAgentEvent(lm.EventLogger, agentlog.EventPromptComposed,
@@ -790,6 +800,11 @@ func (d *Designer) ExtractArchivableState() *handoff.ArchivableState {
 		AgentType: d.AgentType(),
 		Timestamp: time.Now(),
 	}
+}
+
+// SetAgentPod injects the agent pod for Scribe feed integration.
+func (d *Designer) SetAgentPod(pod *shared.AgentPod) {
+	d.agentPod = pod
 }
 
 // SetHandoffBridge assigns the handoff bridge for turn recording.

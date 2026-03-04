@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -32,11 +34,31 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(reportToEngineerSkill(d))
 	d.skills.Register(reportToOrchestratorSkill(d))
 
+	// Diagnostics
+	d.skills.Register(shared.NewSelfDiagnosticSkill(&designerDiag{d: d}))
+
 	d.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "designer",
 		SessionID: func() string { return d.config.SessionID },
 		Publish:   d.publishRerouteRequest,
 	}))
+}
+
+type designerDiag struct{ d *Designer }
+
+func (dd *designerDiag) AgentName() string  { return "designer" }
+func (dd *designerDiag) SessionID() string  { return dd.d.config.SessionID }
+func (dd *designerDiag) LogsDir() string    { return shared.LogsDirForAgent(dd.d.steering.SessionDir(), "designer") }
+func (dd *designerDiag) EventLogger() *agentlog.SessionEventLogger { return dd.d.steering.EventLogger() }
+func (dd *designerDiag) PeerLogsDirs() map[string]string           { return nil }
+func (dd *designerDiag) RecoveryHints() []string                   { return nil }
+
+func (dd *designerDiag) AgentSpecificDiagnostics() map[string]any {
+	dd.d.stateMu.RLock()
+	defer dd.d.stateMu.RUnlock()
+	return map[string]any{
+		"pipeline_id": dd.d.pipelineID,
+	}
 }
 
 func (d *Designer) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {

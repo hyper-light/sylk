@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -144,6 +145,13 @@ func (a *Architect) executeToolLoop(
 			"messages_detail", strings.Join(msgSummary, " | "),
 			"tools_count", len(req.Tools))
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, maxRuns, req); zone == shared.ZoneCritical {
+				return "", shared.ErrContextBudgetExhausted
+			}
+		}
+
 		a.logInfo("executeToolLoop: LLM call",
 			"stage", stage,
 			"turn", turn,
@@ -171,6 +179,10 @@ func (a *Architect) executeToolLoop(
 		} else {
 			a.logDebug("tool_loop: LLM_RESPONSE_NIL",
 				"stage", stage, "turn", turn, "err", err)
+		}
+
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && resp != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
 		}
 
 		if err != nil {
@@ -210,6 +222,7 @@ func (a *Architect) executeToolLoop(
 				"thinking_preview", truncateString(resp.Thinking, 300),
 				"model", resp.Model,
 				"tools_were_available", len(req.Tools) > 0)
+			a.recordTurn(req, resp, turn, 0, 0, turnStart)
 			return strings.TrimSpace(resp.Content), nil
 		}
 
@@ -267,6 +280,7 @@ func (a *Architect) executeToolLoop(
 			"err_count", errCount,
 			"rerouted", rerouted,
 			"messages_after", len(req.Messages))
+		a.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			a.logInfo("executeToolLoop: REROUTED",
 				"stage", stage,
@@ -356,6 +370,9 @@ func (a *Architect) applyToolCalls(
 					"err", err.Error(),
 					"error_payload", truncateString(result, 300))
 			}
+		}
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -489,4 +506,30 @@ func (a *Architect) buildToolDefinitions() []providers.Tool {
 		})
 	}
 	return tools
+}
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (a *Architect) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if a.handoffBridge == nil {
+		return
+	}
+
+	a.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      shared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
 }

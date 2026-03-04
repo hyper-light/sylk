@@ -69,6 +69,9 @@ type GlobalInspector struct {
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
 
+	// Agent pod for Scribe feed.
+	agentPod *agentShared.AgentPod
+
 	// File access (injected per-session at runtime).
 	fileAccess versioning.FileAccess
 
@@ -444,6 +447,9 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 
 	toolEmitter := agentShared.NewToolCallEmitter(gi.bus, gi.channels, "inspector", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
+	ctx = agentShared.WithContextGovernor(ctx, agentShared.NewContextGovernor(
+		gi.config.Model, gi.config.MaxTokens, 0,
+	))
 
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(gi.bus, gi.channels, ctx, "inspector")
@@ -482,6 +488,9 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		ProcessingTime:      time.Since(startTime),
 	}
 	respMsg := guide.NewResponseMessage(gi.generateMessageID(), resp)
+	if gi.agentPod != nil {
+		gi.agentPod.FeedScribe("inspector", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 	return gi.bus.Publish(gi.channels.Responses, respMsg)
 }
 
@@ -593,6 +602,11 @@ func (gi *GlobalInspector) InjectPreparedContext(_ *handoff.PreparedContext) err
 
 // Terminate shuts down the global inspector.
 func (gi *GlobalInspector) Terminate(_ context.Context) error { return gi.Close() }
+
+// SetAgentPod injects the agent pod for Scribe feed integration.
+func (gi *GlobalInspector) SetAgentPod(pod *agentShared.AgentPod) {
+	gi.agentPod = pod
+}
 
 // SetHandoffBridge sets the handoff bridge for this agent.
 func (gi *GlobalInspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {

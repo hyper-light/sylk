@@ -5,6 +5,8 @@ package engineer
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/adalundhe/sylk/agents/guide"
 )
 
 // TaskState represents the current state of a task being executed by the Engineer.
@@ -321,14 +323,15 @@ type ToolCall struct {
 }
 
 type EngineerRequest struct {
-	ID         string         `json:"id"`
-	Intent     EngineerIntent `json:"intent"`
-	TaskID     string         `json:"task_id,omitempty"`
-	Prompt     string         `json:"prompt,omitempty"`
-	Context    interface{}    `json:"context,omitempty"`
-	EngineerID string         `json:"engineer_id"`
-	SessionID  string         `json:"session_id"`
-	Timestamp  time.Time      `json:"timestamp"`
+	ID                  string                   `json:"id"`
+	Intent              EngineerIntent           `json:"intent"`
+	TaskID              string                   `json:"task_id,omitempty"`
+	Prompt              string                   `json:"prompt,omitempty"`
+	Context             interface{}              `json:"context,omitempty"`
+	ConversationHistory []guide.ConversationTurn `json:"conversation_history,omitempty"`
+	EngineerID          string                   `json:"engineer_id"`
+	SessionID           string                   `json:"session_id"`
+	Timestamp           time.Time                `json:"timestamp"`
 }
 
 type EngineerResponse struct {

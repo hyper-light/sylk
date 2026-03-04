@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -61,7 +62,7 @@ func (g *Guardian) publishStreamChunk(ctx context.Context, correlationID string,
 	}
 	event := &guide.StreamEvent{
 		Type: guide.StreamEventData,
-		Data: map[string]any{"text": text},
+		Text: text,
 	}
 	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
 }
@@ -71,13 +72,10 @@ func (g *Guardian) publishStreamComplete(ctx context.Context, correlationID stri
 	if g.bus == nil {
 		return
 	}
-	data := map[string]any{"text": text}
-	if usage != nil {
-		data["usage"] = usage
-	}
 	event := &guide.StreamEvent{
-		Type: guide.StreamEventComplete,
-		Data: data,
+		Type:  guide.StreamEventComplete,
+		Text:  strings.TrimSpace(text),
+		Usage: usage,
 	}
 	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
 }

@@ -88,6 +88,9 @@ type Engineer struct {
 	// Handoff bridge
 	handoffBridge *handoff.HandoffBridge
 
+	// Agent pod for Scribe feed.
+	agentPod *shared.AgentPod
+
 	// File access abstraction (injected per-pipeline by Orchestrator).
 	fileAccess versioning.FileAccess
 
@@ -522,6 +525,9 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		AgentID:     e.id,
 		SessionID:   fwd.SessionID,
 	})
+	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
+		e.config.EngineerConfig.Model, e.config.EngineerConfig.MaxTokens, 0,
+	))
 
 	result, err := e.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(e.steering.EventLogger(), fwd.CorrelationID, e.id, fwd.SessionID, time.Since(startTime), err)
@@ -561,6 +567,9 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	e.publishActivity(events.EventTypeAgentAction, "Implementation task completed")
 
 	respMsg := guide.NewResponseMessage(e.generateMessageID(), resp)
+	if e.agentPod != nil {
+		e.agentPod.FeedScribe("engineer", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 	return e.bus.Publish(e.channels.Responses, respMsg)
 }
 
@@ -635,13 +644,14 @@ func (e *Engineer) handleImplement(ctx context.Context, fwd *guide.ForwardedRequ
 
 	// Create task request
 	req := &EngineerRequest{
-		ID:         uuid.New().String(),
-		Intent:     IntentComplete,
-		TaskID:     taskID,
-		Prompt:     fwd.Input,
-		EngineerID: e.id,
-		SessionID:  e.config.SessionID,
-		Timestamp:  time.Now(),
+		ID:                  uuid.New().String(),
+		Intent:              IntentComplete,
+		TaskID:              taskID,
+		Prompt:              fwd.Input,
+		ConversationHistory: fwd.ConversationHistory,
+		EngineerID:          e.id,
+		SessionID:           e.config.SessionID,
+		Timestamp:           time.Now(),
 	}
 
 	// Handle the task using LLM-driven protocol
@@ -764,6 +774,9 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 		MaxTokens:       e.config.EngineerConfig.MaxTokens,
 		ReasoningEffort: e.config.EngineerConfig.ReasoningEffort,
 	}
+
+	// Prepend conversation history as multi-turn message pairs.
+	shared.PrependHistoryMessages(llmReq, req.ConversationHistory)
 
 	// Step 6: Execute tool loop
 	result, err := e.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
@@ -1019,6 +1032,11 @@ func (e *Engineer) Descriptor() handoff.AgentDescriptor {
 // InjectPreparedContext accepts a handoff context (no-op for now).
 func (e *Engineer) InjectPreparedContext(_ *handoff.PreparedContext) error {
 	return nil
+}
+
+// SetAgentPod injects the agent pod for Scribe feed integration.
+func (e *Engineer) SetAgentPod(pod *shared.AgentPod) {
+	e.agentPod = pod
 }
 
 // SetHandoffBridge sets the handoff bridge for this engineer.

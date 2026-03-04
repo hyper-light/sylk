@@ -23,7 +23,7 @@ func TestRuntime_CreateContainer(t *testing.T) {
 	rt := testRuntime(t)
 	spec := validContainerSpec()
 
-	c, err := rt.CreateContainer(context.Background(), spec, nil)
+	c, err := rt.CreateContainer(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("CreateContainer failed: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestRuntime_CreateContainerInvalidSpec(t *testing.T) {
 	rt := testRuntime(t)
 	spec := ContainerSpec{} // empty name/type
 
-	_, err := rt.CreateContainer(context.Background(), spec, nil)
+	_, err := rt.CreateContainer(context.Background(), spec)
 	if err == nil {
 		t.Fatal("expected error for invalid spec")
 	}
@@ -52,7 +52,7 @@ func TestRuntime_StartStopContainer(t *testing.T) {
 	rt := testRuntime(t)
 	spec := validContainerSpec()
 
-	c, err := rt.CreateContainer(context.Background(), spec, nil)
+	c, err := rt.CreateContainer(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("CreateContainer failed: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestRuntime_RemoveContainer(t *testing.T) {
 	rt := testRuntime(t)
 	spec := validContainerSpec()
 
-	c, err := rt.CreateContainer(context.Background(), spec, nil)
+	c, err := rt.CreateContainer(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("CreateContainer failed: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestRuntime_ContainerStatus(t *testing.T) {
 	rt := testRuntime(t)
 	spec := validContainerSpec()
 
-	c, _ := rt.CreateContainer(context.Background(), spec, nil)
+	c, _ := rt.CreateContainer(context.Background(), spec)
 	status := rt.ContainerStatus(c)
 
 	if status.ID != c.ID() {
@@ -107,92 +107,48 @@ func TestRuntime_ContainerStatus(t *testing.T) {
 	}
 }
 
-func TestRuntime_CreatePod(t *testing.T) {
+func TestRuntime_CreateContainersForPod(t *testing.T) {
 	rt := testRuntime(t)
-	podSpec := PodSpec{
-		Name: "test-pod",
-		MainContainers: []ContainerSpec{
-			{Name: "worker", AgentType: "engineer"},
-		},
-		SidecarContainers: []ContainerSpec{
-			{Name: "sidecar", AgentType: "inspector"},
-		},
+	specs := []ContainerSpec{
+		{Name: "worker", AgentType: "engineer"},
+		{Name: "sidecar", AgentType: "inspector"},
 	}
 
-	pod, err := rt.CreatePod(context.Background(), podSpec)
+	containers, err := rt.CreateContainersForPod(context.Background(), "pod-1", specs)
 	if err != nil {
-		t.Fatalf("CreatePod failed: %v", err)
+		t.Fatalf("CreateContainersForPod failed: %v", err)
+	}
+	if len(containers) != 2 {
+		t.Fatalf("expected 2 containers, got %d", len(containers))
+	}
+	for _, c := range containers {
+		if c.PodID() != "pod-1" {
+			t.Fatalf("expected pod ID pod-1, got %s", c.PodID())
+		}
 	}
 
-	if pod.Phase() != PodPending {
-		t.Fatalf("expected Pending, got %v", pod.Phase())
-	}
-	if len(pod.MainContainers()) != 1 {
-		t.Fatalf("expected 1 main container, got %d", len(pod.MainContainers()))
-	}
-	if len(pod.SidecarContainers()) != 1 {
-		t.Fatalf("expected 1 sidecar, got %d", len(pod.SidecarContainers()))
-	}
-	if rt.registry.PodCount() != 1 {
-		t.Fatalf("expected 1 pod in registry, got %d", rt.registry.PodCount())
+	// Verify registry indexing.
+	podContainers := rt.registry.ListByPod("pod-1")
+	if len(podContainers) != 2 {
+		t.Fatalf("expected 2 pod containers in registry, got %d", len(podContainers))
 	}
 }
 
-func TestRuntime_CreatePodInvalidSpec(t *testing.T) {
+func TestRuntime_StartContainers(t *testing.T) {
 	rt := testRuntime(t)
-	podSpec := PodSpec{Name: ""} // empty name
-
-	_, err := rt.CreatePod(context.Background(), podSpec)
-	if err == nil {
-		t.Fatal("expected error for invalid pod spec")
-	}
-}
-
-func TestRuntime_StopAndRemovePod(t *testing.T) {
-	rt := testRuntime(t)
-	podSpec := PodSpec{
-		Name: "test-pod",
-		MainContainers: []ContainerSpec{
-			{Name: "worker", AgentType: "engineer"},
-		},
+	specs := []ContainerSpec{
+		{Name: "a", AgentType: "engineer"},
+		{Name: "b", AgentType: "designer"},
 	}
 
-	pod, _ := rt.CreatePod(context.Background(), podSpec)
-	_ = rt.StartPod(context.Background(), pod)
-
-	if err := rt.StopPod(context.Background(), pod); err != nil {
-		t.Fatalf("StopPod failed: %v", err)
+	containers, _ := rt.CreateContainersForPod(context.Background(), "pod-2", specs)
+	if err := rt.StartContainers(context.Background(), containers); err != nil {
+		t.Fatalf("StartContainers failed: %v", err)
 	}
-
-	if err := rt.RemovePod(context.Background(), pod); err != nil {
-		t.Fatalf("RemovePod failed: %v", err)
-	}
-
-	if rt.registry.PodCount() != 0 {
-		t.Fatalf("expected 0 pods, got %d", rt.registry.PodCount())
-	}
-}
-
-func TestRuntime_PodStatus(t *testing.T) {
-	rt := testRuntime(t)
-	podSpec := PodSpec{
-		Name: "test-pod",
-		MainContainers: []ContainerSpec{
-			{Name: "worker", AgentType: "engineer"},
-		},
-	}
-
-	pod, _ := rt.CreatePod(context.Background(), podSpec)
-	status := rt.PodStatus(pod)
-
-	if status.ID != pod.ID() {
-		t.Fatalf("expected %s, got %s", pod.ID(), status.ID)
-	}
-	if status.Phase != PodPending {
-		t.Fatalf("expected Pending, got %v", status.Phase)
-	}
-	if len(status.Containers) != 1 {
-		t.Fatalf("expected 1 container status, got %d", len(status.Containers))
+	for _, c := range containers {
+		if !c.IsRunning() {
+			t.Fatalf("container %s should be running", c.Spec().Name)
+		}
 	}
 }
 
@@ -200,7 +156,7 @@ func TestRuntime_Closed(t *testing.T) {
 	rt := testRuntime(t)
 	rt.Close()
 
-	_, err := rt.CreateContainer(context.Background(), validContainerSpec(), nil)
+	_, err := rt.CreateContainer(context.Background(), validContainerSpec())
 	if !errors.Is(err, ErrRuntimeClosed) {
 		t.Fatalf("expected ErrRuntimeClosed, got %v", err)
 	}
@@ -220,16 +176,16 @@ func TestRuntime_QuotaEnforcement(t *testing.T) {
 	})
 
 	spec := validContainerSpec()
-	_, _ = rt.CreateContainer(context.Background(), spec, nil)
+	_, _ = rt.CreateContainer(context.Background(), spec)
 
 	spec2 := validContainerSpec()
 	spec2.Name = "second"
-	_, _ = rt.CreateContainer(context.Background(), spec2, nil)
+	_, _ = rt.CreateContainer(context.Background(), spec2)
 
 	// Third should fail
 	spec3 := validContainerSpec()
 	spec3.Name = "third"
-	_, err := rt.CreateContainer(context.Background(), spec3, nil)
+	_, err := rt.CreateContainer(context.Background(), spec3)
 	if err == nil {
 		t.Fatal("expected quota exceeded error")
 	}

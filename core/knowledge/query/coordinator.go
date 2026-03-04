@@ -411,16 +411,20 @@ func (mt *metricsTracker) TTL() time.Duration {
 
 // HybridQueryCoordinator orchestrates parallel execution of text, semantic,
 // and graph-based searches, fusing results using RRF with learned weights.
+//
+// Searcher fields use atomic.Pointer to support progressive knowledge boot:
+// backends can be hot-swapped while the coordinator retains learned weights,
+// metrics history, and RRF configuration across promotions.
 type HybridQueryCoordinator struct {
-	bleveSearcher        *BleveSearcher
-	vectorSearcher       *VectorSearcher
-	graphTraverser       *GraphTraverser
-	rrfFusion            *RRFFusion
-	learnedWeights       *LearnedQueryWeights
-	timeout              time.Duration
-	metricsTracker       *metricsTracker
-	domainDetectionCfg   DomainDetectionConfig
-	mu                   sync.RWMutex
+	bleveSearcher      atomic.Pointer[BleveSearcher]
+	vectorSearcher     atomic.Pointer[VectorSearcher]
+	graphTraverser     atomic.Pointer[GraphTraverser]
+	rrfFusion          *RRFFusion          // immutable after construction
+	learnedWeights     *LearnedQueryWeights // accumulates over lifetime
+	timeout            time.Duration
+	metricsTracker     *metricsTracker // accumulates over lifetime
+	domainDetectionCfg DomainDetectionConfig
+	mu                 sync.RWMutex // guards timeout + domainDetectionCfg
 }
 
 // NewHybridQueryCoordinator creates a new coordinator with the provided components.
@@ -430,16 +434,23 @@ func NewHybridQueryCoordinator(
 	vector *VectorSearcher,
 	graph *GraphTraverser,
 ) *HybridQueryCoordinator {
-	return &HybridQueryCoordinator{
-		bleveSearcher:      bleve,
-		vectorSearcher:     vector,
-		graphTraverser:     graph,
+	c := &HybridQueryCoordinator{
 		rrfFusion:          DefaultRRFFusion(),
 		learnedWeights:     NewLearnedQueryWeights(),
 		timeout:            100 * time.Millisecond,
 		metricsTracker:     newMetricsTracker(),
 		domainDetectionCfg: DefaultDomainDetectionConfig(),
 	}
+	if bleve != nil {
+		c.bleveSearcher.Store(bleve)
+	}
+	if vector != nil {
+		c.vectorSearcher.Store(vector)
+	}
+	if graph != nil {
+		c.graphTraverser.Store(graph)
+	}
+	return c
 }
 
 // NewHybridQueryCoordinatorWithOptions creates a coordinator with custom options.
@@ -461,16 +472,40 @@ func NewHybridQueryCoordinatorWithOptions(
 		timeout = 100 * time.Millisecond
 	}
 
-	return &HybridQueryCoordinator{
-		bleveSearcher:      bleve,
-		vectorSearcher:     vector,
-		graphTraverser:     graph,
+	c := &HybridQueryCoordinator{
 		rrfFusion:          rrfFusion,
 		learnedWeights:     learnedWeights,
 		timeout:            timeout,
 		metricsTracker:     newMetricsTracker(),
 		domainDetectionCfg: DefaultDomainDetectionConfig(),
 	}
+	if bleve != nil {
+		c.bleveSearcher.Store(bleve)
+	}
+	if vector != nil {
+		c.vectorSearcher.Store(vector)
+	}
+	if graph != nil {
+		c.graphTraverser.Store(graph)
+	}
+	return c
+}
+
+// SetBleveSearcher atomically sets the text search component.
+// Safe to call concurrently with Execute — in-flight queries that already
+// loaded nil will return partial results; subsequent queries use the new searcher.
+func (c *HybridQueryCoordinator) SetBleveSearcher(s *BleveSearcher) {
+	c.bleveSearcher.Store(s)
+}
+
+// SetVectorSearcher atomically sets the semantic search component.
+func (c *HybridQueryCoordinator) SetVectorSearcher(s *VectorSearcher) {
+	c.vectorSearcher.Store(s)
+}
+
+// SetGraphTraverser atomically sets the graph traversal component.
+func (c *HybridQueryCoordinator) SetGraphTraverser(t *GraphTraverser) {
+	c.graphTraverser.Store(t)
 }
 
 // SetTimeout updates the query timeout duration.
@@ -606,12 +641,12 @@ func (c *HybridQueryCoordinator) executeParallel(
 	results := make(chan searchResult, 3)
 
 	// Launch text search
-	if query.HasTextQuery() && c.bleveSearcher != nil {
+	if bleve := c.bleveSearcher.Load(); query.HasTextQuery() && bleve != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			start := time.Now()
-			textResults, err := c.bleveSearcher.Execute(ctx, query.TextQuery, c.getLimit(query))
+			textResults, err := bleve.Execute(ctx, query.TextQuery, c.getLimit(query))
 			results <- searchResult{
 				source:  "text",
 				text:    textResults,
@@ -622,12 +657,12 @@ func (c *HybridQueryCoordinator) executeParallel(
 	}
 
 	// Launch semantic search
-	if query.HasSemanticQuery() && c.vectorSearcher != nil {
+	if vector := c.vectorSearcher.Load(); query.HasSemanticQuery() && vector != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			start := time.Now()
-			semanticResults, err := c.vectorSearcher.Execute(ctx, query.SemanticVector, c.getLimit(query))
+			semanticResults, err := vector.Execute(ctx, query.SemanticVector, c.getLimit(query))
 			results <- searchResult{
 				source:   "semantic",
 				semantic: semanticResults,
@@ -638,12 +673,12 @@ func (c *HybridQueryCoordinator) executeParallel(
 	}
 
 	// Launch graph traversal
-	if query.HasGraphQuery() && c.graphTraverser != nil {
+	if graph := c.graphTraverser.Load(); query.HasGraphQuery() && graph != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			start := time.Now()
-			graphResults, err := c.graphTraverser.Execute(ctx, query.GraphPattern, c.getLimit(query))
+			graphResults, err := graph.Execute(ctx, query.GraphPattern, c.getLimit(query))
 			results <- searchResult{
 				source:  "graph",
 				graph:   graphResults,
@@ -866,17 +901,17 @@ func (c *HybridQueryCoordinator) GetQueryMetrics(queryID string) (*QueryMetrics,
 
 // BleveSearcher returns the text search component.
 func (c *HybridQueryCoordinator) BleveSearcher() *BleveSearcher {
-	return c.bleveSearcher
+	return c.bleveSearcher.Load()
 }
 
 // VectorSearcher returns the semantic search component.
 func (c *HybridQueryCoordinator) VectorSearcher() *VectorSearcher {
-	return c.vectorSearcher
+	return c.vectorSearcher.Load()
 }
 
 // GraphTraverser returns the graph traversal component.
 func (c *HybridQueryCoordinator) GraphTraverser() *GraphTraverser {
-	return c.graphTraverser
+	return c.graphTraverser.Load()
 }
 
 // RRFFusion returns the fusion component.
@@ -895,22 +930,28 @@ func (c *HybridQueryCoordinator) LearnedWeights() *LearnedQueryWeights {
 
 // IsReady returns true if at least one searcher is available.
 func (c *HybridQueryCoordinator) IsReady() bool {
-	hasBleve := c.bleveSearcher != nil && c.bleveSearcher.IsReady()
-	hasVector := c.vectorSearcher != nil && c.vectorSearcher.IsReady()
-	hasGraph := c.graphTraverser != nil && c.graphTraverser.IsReady()
-	return hasBleve || hasVector || hasGraph
+	if bleve := c.bleveSearcher.Load(); bleve != nil && bleve.IsReady() {
+		return true
+	}
+	if vector := c.vectorSearcher.Load(); vector != nil && vector.IsReady() {
+		return true
+	}
+	if graph := c.graphTraverser.Load(); graph != nil && graph.IsReady() {
+		return true
+	}
+	return false
 }
 
 // ReadySearchers returns a list of search modalities that are available.
 func (c *HybridQueryCoordinator) ReadySearchers() []string {
 	var ready []string
-	if c.bleveSearcher != nil && c.bleveSearcher.IsReady() {
+	if bleve := c.bleveSearcher.Load(); bleve != nil && bleve.IsReady() {
 		ready = append(ready, "text")
 	}
-	if c.vectorSearcher != nil && c.vectorSearcher.IsReady() {
+	if vector := c.vectorSearcher.Load(); vector != nil && vector.IsReady() {
 		ready = append(ready, "semantic")
 	}
-	if c.graphTraverser != nil && c.graphTraverser.IsReady() {
+	if graph := c.graphTraverser.Load(); graph != nil && graph.IsReady() {
 		ready = append(ready, "graph")
 	}
 	return ready

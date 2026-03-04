@@ -162,7 +162,7 @@ type Guide struct {
 	// On-demand agent activator — ensures the target agent's container
 	// is hot before forwarding a request, and resets the idle timer
 	// after successful activation and on response handling.
-	activator AgentActivator
+	activator PodActivator
 
 	// Agent registrar callback — called after on-demand activation to
 	// register the agent's routing info (capabilities, intents, channels)
@@ -1175,6 +1175,18 @@ func (g *Guide) resolveActivationType(idOrName string) string {
 	return idOrName
 }
 
+// resolvePodID maps an agent ID or name to the owning pod ID.
+// Uses resolveActivationType to get the agent type, then PodForAgent
+// to resolve the pod. Returns the agent type itself when no activator
+// is set or no mapping exists (singleton pods).
+func (g *Guide) resolvePodID(idOrName string) string {
+	agentType := g.resolveActivationType(idOrName)
+	if g.activator != nil {
+		return g.activator.PodForAgent(agentType)
+	}
+	return agentType
+}
+
 // ensureExplicitTargetReady activates and registers the target agent if it
 // isn't already known to the Guide. On-demand agents (tester, inspector) may
 // not have been pre-activated during bootstrap — their containers are created
@@ -1193,19 +1205,19 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 		return targetAgentID, nil
 	}
 
-	// Resolve UUID → type for the activation controller, which indexes
-	// by type name ("tester"), not by agent UUID.
-	activationType := g.resolveActivationType(targetAgentID)
+	// Resolve UUID → pod ID for the activation controller, which indexes
+	// by pod ID, not by agent UUID.
+	podID := g.resolvePodID(targetAgentID)
 
 	if g.activator != nil {
 		deadline, hasDL := ctx.Deadline()
 		guideFileLog().Info("DEBUG: guide_ensure_active_call",
 			"target", targetAgentID,
-			"activation_type", activationType,
+			"pod_id", podID,
 			"has_deadline", hasDL,
 			"deadline", deadline)
 		activateStart := time.Now()
-		if err := g.activator.EnsureActive(ctx, activationType); err != nil {
+		if err := g.activator.EnsurePodActive(ctx, podID); err != nil {
 			guideFileLog().Info("DEBUG: guide_ensure_active_failed",
 				"target", targetAgentID,
 				"elapsed_ms", time.Since(activateStart).Milliseconds(),
@@ -1217,7 +1229,7 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 			"elapsed_ms", time.Since(activateStart).Milliseconds())
 	}
 	if g.agentRegistrar != nil {
-		g.agentRegistrar(activationType)
+		g.agentRegistrar(g.resolveActivationType(targetAgentID))
 	}
 
 	// The original UUID still resolves — agent was just paused, not replaced.
@@ -1226,7 +1238,8 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 	}
 	// Re-activation created a new agent with a fresh UUID. Resolve via
 	// the type name which is indexed by the registry's name lookup.
-	if resolved := g.resolveAgentID(activationType); g.resolveAgent(resolved) != nil {
+	agentType := g.resolveActivationType(targetAgentID)
+	if resolved := g.resolveAgentID(agentType); g.resolveAgent(resolved) != nil {
 		return resolved, nil
 	}
 	return "", fmt.Errorf("agent %q not available after activation", targetAgentID)
@@ -1247,7 +1260,7 @@ func (g *Guide) ensureClassifiedTargetReady(ctx context.Context, targetAgentID s
 	if g.resolveAgent(targetAgentID) != nil && g.IsAgentReady(targetAgentID) {
 		guideFileLog().Info("DEBUG: target_already_registered", "target", targetAgentID)
 		if g.activator != nil {
-			g.activator.TouchActivity(g.resolveActivationType(targetAgentID))
+			g.activator.TouchPodActivity(g.resolvePodID(targetAgentID))
 		}
 		return targetAgentID
 	}
@@ -1261,7 +1274,7 @@ func (g *Guide) ensureClassifiedTargetReady(ctx context.Context, targetAgentID s
 		return targetAgentID
 	}
 	if g.activator != nil {
-		g.activator.TouchActivity(g.resolveActivationType(resolved))
+		g.activator.TouchPodActivity(g.resolvePodID(resolved))
 	}
 	if resolved != "" {
 		return resolved
@@ -3306,7 +3319,7 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 	// Touch activity for the responding agent to prevent idle demotion
 	// during active conversation flow.
 	if g.activator != nil && msg.SourceAgentID != "" {
-		g.activator.TouchActivity(msg.SourceAgentID)
+		g.activator.TouchPodActivity(g.resolvePodID(msg.SourceAgentID))
 	}
 
 	if msg.Type == MessageTypeStream {
@@ -3737,11 +3750,12 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	// the type name ("tester", "inspector") as the target.
 	resolved := g.resolveAgentID(targetAgentID)
 
-	// The activation controller indexes by type name, not UUID.
+	// The activation controller indexes by pod ID.
 	activationType := g.resolveActivationType(resolved)
+	podID := g.resolvePodID(resolved)
 
 	if g.activator != nil {
-		if err := g.activator.EnsureActive(g.processingContext(), activationType); err != nil {
+		if err := g.activator.EnsurePodActive(g.processingContext(), podID); err != nil {
 			// Check if agent is already reachable despite activation error.
 			if g.resolveAgent(resolved) == nil {
 				return fmt.Errorf("activate %s for forwarding: %w", activationType, err)
@@ -3760,7 +3774,7 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	resolved = g.resolveAgentID(targetAgentID)
 
 	if g.activator != nil {
-		g.activator.TouchActivity(activationType)
+		g.activator.TouchPodActivity(podID)
 	}
 
 	// Weighted target resolution: during overlap, multiple endpoints may
@@ -4153,7 +4167,7 @@ type ServiceQualityChecker interface {
 // SetActivator installs the on-demand agent activator used before
 // forwarding requests and after response handling to manage container
 // lifecycle (activation and idle timer reset).
-func (g *Guide) SetActivator(a AgentActivator) {
+func (g *Guide) SetActivator(a PodActivator) {
 	g.activator = a
 }
 

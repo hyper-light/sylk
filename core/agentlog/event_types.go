@@ -188,6 +188,16 @@ const (
 	EventSteeringInterrupted EventType = 0x0C04
 )
 
+// Context budget events (0x0D00–0x0DFF) — cross-cutting.
+// Any agent can write these during tool loop execution.
+const (
+	EventContextBudgetCheck   EventType = 0x0D00
+	EventContextCompaction    EventType = 0x0D01
+	EventContextEviction      EventType = 0x0D02
+	EventContextCalibration   EventType = 0x0D03
+	EventContextOutputLimited EventType = 0x0D04
+)
+
 // eventNames maps every defined EventType to its human-readable name.
 // Indexed by uint16 value for O(1) lookup.
 var eventNames [1 << 16]string
@@ -351,6 +361,13 @@ func init() {
 	eventNames[EventSteeringCommand] = "SteeringCommand"
 	eventNames[EventSteeringComplete] = "SteeringComplete"
 	eventNames[EventSteeringInterrupted] = "SteeringInterrupted"
+
+	// Context Budget
+	eventNames[EventContextBudgetCheck] = "ContextBudgetCheck"
+	eventNames[EventContextCompaction] = "ContextCompaction"
+	eventNames[EventContextEviction] = "ContextEviction"
+	eventNames[EventContextCalibration] = "ContextCalibration"
+	eventNames[EventContextOutputLimited] = "ContextOutputLimited"
 }
 
 // String returns the human-readable name for an EventType,
@@ -388,8 +405,10 @@ const (
 	rangeAcademicHi    EventType = 0x0AFF
 	rangeArchivalistLo EventType = 0x0B00
 	rangeArchivalistHi EventType = 0x0BFF
-	rangeSteeringLo    EventType = 0x0C00
-	rangeSteeringHi    EventType = 0x0CFF
+	rangeSteeringLo      EventType = 0x0C00
+	rangeSteeringHi      EventType = 0x0CFF
+	rangeContextBudgetLo EventType = 0x0D00
+	rangeContextBudgetHi EventType = 0x0DFF
 )
 
 // IsCommon returns true if the event type is in the common range.
@@ -431,6 +450,9 @@ func (e EventType) IsArchivalist() bool { return e >= rangeArchivalistLo && e <=
 // IsSteering returns true if the event type is a cross-cutting steering event.
 func (e EventType) IsSteering() bool { return e >= rangeSteeringLo && e <= rangeSteeringHi }
 
+// IsContextBudget returns true if the event type is a cross-cutting context budget event.
+func (e EventType) IsContextBudget() bool { return e >= rangeContextBudgetLo && e <= rangeContextBudgetHi }
+
 // OwnerAgent returns the agent name that owns this event type range,
 // or "unknown" for unassigned ranges.
 func (e EventType) OwnerAgent() string {
@@ -461,6 +483,8 @@ func (e EventType) OwnerAgent() string {
 		return "archivalist"
 	case e.IsSteering():
 		return "steering"
+	case e.IsContextBudget():
+		return "context_budget"
 	default:
 		return "unknown"
 	}

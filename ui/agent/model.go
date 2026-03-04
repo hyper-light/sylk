@@ -549,7 +549,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 	//  3. Pipeline agents: orchestrator creates a type-based placeholder
 	//     (e.g. ID="engineer") that the real agent's UUID replaces.
 	category := agentCategoryByType[agentType]
-	if agentType != "" && (category == "standalone" || category == "pipeline") {
+	if agentType != "" && (category == "standalone" || category == "pipeline" || category == "knowledge") {
 		if existing := m.findAgentByType(agentType); existing != nil {
 			m.promoteSeededAgent(existing, agentID, ev)
 			return
@@ -1399,6 +1399,8 @@ func (m *Model) renderListView() string {
 	contentHeight := m.height
 	lines := make([]string, 0, min(len(m.rows)*2, contentHeight))
 	var consumedLines int
+	lastContentIdx := -1 // track last rendered content row
+	footerRendered := false
 
 	for i, row := range m.rows {
 		if consumedLines >= contentHeight {
@@ -1407,12 +1409,11 @@ func (m *Model) renderListView() string {
 		selected := i == m.selected
 
 		// Per-row phase offset creates a downward-flowing prismatic wave
-		// across ALL sections when any agent is active.
-		var activeColor lipgloss.Color
-		if hasActive {
-			phase := elapsed - time.Duration(i)*groupFlowStep
-			activeColor = m.groupGradient.Sample(phase)
-		}
+		// across all sections. The gradient cycles through the idle palette
+		// when no agents are active and the full prismatic spectrum when
+		// active agents are present (swapped above).
+		phase := elapsed - time.Duration(i)*groupFlowStep
+		activeColor := m.groupGradient.Sample(phase)
 
 		switch row.Kind {
 		case rowSection:
@@ -1432,6 +1433,7 @@ func (m *Model) renderListView() string {
 			prefix := renderTreePrefix(pipelinePrefix, activeColor, m.theme)
 			lines = append(lines, RenderCard(*agent, m.width, m.theme, selected, engaged, prefix, anim))
 			consumedLines++
+			lastContentIdx = i
 
 		case rowPipeline:
 			pl := m.pipelines[row.ID]
@@ -1440,6 +1442,7 @@ func (m *Model) renderListView() string {
 			}
 			lines = append(lines, renderPipelineRow(pl, m.width, elapsed, m.gradient, m.theme, selected, activeColor, anim))
 			consumedLines++
+			lastContentIdx = i
 
 		case rowVariant:
 			v := m.variants[row.ID]
@@ -1448,18 +1451,25 @@ func (m *Model) renderListView() string {
 			}
 			lines = append(lines, renderVariantRow(v, m.width, m.theme, selected, activeColor, anim))
 			consumedLines++
+			lastContentIdx = i
 		}
 
 		// Footer gets the next phase step after the last content row.
 		if consumedLines < contentHeight && m.isGroupEnd(i) {
-			var footerColor lipgloss.Color
-			if hasActive {
-				phase := elapsed - time.Duration(i+1)*groupFlowStep
-				footerColor = m.groupGradient.Sample(phase)
-			}
+			footerPhase := elapsed - time.Duration(i+1)*groupFlowStep
+			footerColor := m.groupGradient.Sample(footerPhase)
 			lines = append(lines, renderSectionFooter(m.width, footerColor, m.theme))
 			consumedLines++
+			footerRendered = true
 		}
+	}
+
+	// If the list was truncated by height and the last visible content row
+	// didn't get a natural group-end footer, add a closing border.
+	if !footerRendered && lastContentIdx >= 0 && consumedLines < contentHeight {
+		footerPhase := elapsed - time.Duration(lastContentIdx+1)*groupFlowStep
+		footerColor := m.groupGradient.Sample(footerPhase)
+		lines = append(lines, renderSectionFooter(m.width, footerColor, m.theme))
 	}
 
 	return strings.Join(lines, "\n")

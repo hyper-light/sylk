@@ -148,6 +148,53 @@ func TestThoughtEmitter_DoublingTrigger(t *testing.T) {
 	}
 }
 
+func TestThoughtEmitter_Flush(t *testing.T) {
+	ctx := withPlannerThoughtCallback(context.Background(), func(string, string) {})
+	emitter := newThoughtEmitter(ctx)
+
+	// First delta emits (first-content trigger).
+	if got := emitter.addDelta("**Sequencing planning"); got == "" {
+		t.Fatal("first delta should emit")
+	}
+	// Add more content that doesn't hit a trigger (no sentence boundary,
+	// buffer hasn't doubled from 21 chars — needs 42).
+	if got := emitter.addDelta(" tasks and"); got != "" {
+		t.Fatal("should not emit mid-buffer")
+	}
+
+	// Flush returns the full buffer including the un-emitted tail.
+	flushed := emitter.flush()
+	if flushed != "**Sequencing planning tasks and" {
+		t.Fatalf("flush() = %q, want %q", flushed, "**Sequencing planning tasks and")
+	}
+
+	// Second flush is a no-op (nothing new).
+	if got := emitter.flush(); got != "" {
+		t.Fatalf("second flush should return empty, got %q", got)
+	}
+}
+
+func TestThoughtEmitter_FlushEmpty(t *testing.T) {
+	ctx := withPlannerThoughtCallback(context.Background(), func(string, string) {})
+	emitter := newThoughtEmitter(ctx)
+
+	// Flush on empty buffer returns nothing.
+	if got := emitter.flush(); got != "" {
+		t.Fatalf("flush on empty buffer should return empty, got %q", got)
+	}
+}
+
+func TestThoughtEmitter_FlushNoCallback(t *testing.T) {
+	emitter := newThoughtEmitter(context.Background())
+
+	emitter.addDelta("some thinking content")
+
+	// Without callback, flush should return empty (no materialization).
+	if got := emitter.flush(); got != "" {
+		t.Fatalf("flush without callback should return empty, got %q", got)
+	}
+}
+
 func TestContainsSentenceBoundary(t *testing.T) {
 	tests := []struct {
 		input string

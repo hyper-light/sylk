@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +16,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -70,6 +70,9 @@ type PipelineTester struct {
 
 	// Handoff integration.
 	handoffBridge *handoff.HandoffBridge
+
+	// Agent pod for cross-agent coordination (Scribe feed, etc.).
+	agentPod *agentshared.AgentPod
 
 	fileAccess versioning.FileAccess
 
@@ -145,6 +148,7 @@ func (pt *PipelineTester) initSkills() {
 	pt.skillLoader = skills.NewLoader(pt.skills, loaderCfg)
 
 	pt.registerCoreSkills()
+	pt.skills.LoadAll()
 }
 
 func (pt *PipelineTester) registerCoreSkills() {
@@ -155,11 +159,77 @@ func (pt *PipelineTester) registerCoreSkills() {
 	pt.skills.Register(shared.DiagnoseFailureSkill(pt.diagEngine))
 	pt.skills.Register(reportToEngineerSkill(pt))
 	pt.skills.Register(reportToDesignerSkill(pt))
+	pt.skills.Register(agentshared.NewSelfDiagnosticSkill(&pipelineTesterDiag{pt: pt}))
 	pt.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   pt.id,
 		SessionID: func() string { return pt.config.SessionID },
 		Publish:   pt.publishRerouteRequest,
 	}))
+}
+
+type pipelineTesterDiag struct{ pt *PipelineTester }
+
+func (d *pipelineTesterDiag) AgentName() string  { return "tester_pipeline" }
+func (d *pipelineTesterDiag) SessionID() string  { return d.pt.config.SessionID }
+func (d *pipelineTesterDiag) LogsDir() string    { return agentshared.LogsDirForAgent(d.pt.steering.SessionDir(), "tester_pipeline") }
+func (d *pipelineTesterDiag) EventLogger() *agentlog.SessionEventLogger { return d.pt.steering.EventLogger() }
+func (d *pipelineTesterDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *pipelineTesterDiag) RecoveryHints() []string                   { return nil }
+
+func (d *pipelineTesterDiag) AgentSpecificDiagnostics() map[string]any {
+	d.pt.mu.RLock()
+	defer d.pt.mu.RUnlock()
+	result := map[string]any{
+		"worker_type": d.pt.workerType,
+	}
+	if d.pt.currentPlan != nil {
+		result["test_plan_id"] = d.pt.currentPlan.ID
+		result["planned_cases"] = len(d.pt.currentPlan.PlannedCase)
+	}
+	return result
+}
+
+// SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
+func (pt *PipelineTester) SetProvider(p pipelineTesterProvider) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.provider = p
+}
+
+// getProvider returns the current provider under read lock.
+func (pt *PipelineTester) getProvider() pipelineTesterProvider {
+	pt.mu.RLock()
+	defer pt.mu.RUnlock()
+	return pt.provider
+}
+
+// SwapModel implements container.ModelSwappable.
+func (pt *PipelineTester) SwapModel(_ context.Context, modelID string, provider providers.ProviderAdapter) error {
+	pp, ok := provider.(pipelineTesterProvider)
+	if !ok {
+		return fmt.Errorf("pipeline tester swap model: provider does not satisfy pipelineTesterProvider")
+	}
+	pt.SetProvider(pp)
+	pt.mu.Lock()
+	pt.config.Model = modelID
+	pt.mu.Unlock()
+	pt.logger.Info("model swapped", "model", modelID)
+	return nil
+}
+
+// CurrentModel implements container.ModelSwappable.
+func (pt *PipelineTester) CurrentModel() string {
+	pt.mu.RLock()
+	defer pt.mu.RUnlock()
+	return pt.config.Model
+}
+
+// SupportedModels implements container.ModelSwappable.
+func (pt *PipelineTester) SupportedModels() []container.ModelOption {
+	return []container.ModelOption{
+		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+	}
 }
 
 // SetWorkerType sets the worker type for design-aware prompt selection.
@@ -264,51 +334,33 @@ func (pt *PipelineTester) unsubRegistry() error {
 	return err
 }
 
-// prependConversationHistory formats prior conversation turns as structured
-// text and prepends them to the user message so the LLM retains multi-turn
-// context across requests. Returns the original message unchanged when there
-// is no history.
-func prependConversationHistory(history []guide.ConversationTurn, userMessage string) string {
-	if len(history) == 0 {
-		return userMessage
-	}
-
-	var b strings.Builder
-	b.WriteString("## Prior Conversation\n\n")
-	for _, turn := range history {
-		fmt.Fprintf(&b, "[%s] User: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.UserInput)
-		if turn.AgentReply != "" {
-			fmt.Fprintf(&b, "[%s] %s: %s\n", turn.Timestamp.Format(time.TimeOnly), turn.AgentID, turn.AgentReply)
-		}
-	}
-	b.WriteString("\n---\n\n")
-	b.WriteString(userMessage)
-	return b.String()
-}
-
 // Handle processes a forwarded request through the LLM tool loop.
 func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	if pt.provider == nil {
+	if pt.getProvider() == nil {
 		return nil, fmt.Errorf("pipeline tester: no LLM provider configured")
 	}
 
 	pt.mu.RLock()
 	wt := pt.workerType
+	model := pt.config.Model
+	maxTokens := pt.config.MaxTokens
 	pt.mu.RUnlock()
 
 	systemPrompt := shared.PipelineTesterSystemPromptForWorker(wt)
 	tools := pt.buildToolDefinitions()
 
-	// Prepend conversation history so the LLM retains multi-turn context.
-	userMessage := prependConversationHistory(fwd.ConversationHistory, fwd.Input)
-
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages: []providers.Message{
-			{Role: providers.RoleUser, Content: userMessage},
+			{Role: providers.RoleUser, Content: fwd.Input},
 		},
-		Tools: tools,
+		Model:     model,
+		MaxTokens: maxTokens,
+		Tools:     tools,
 	}
+
+	// Prepend conversation history as multi-turn message pairs.
+	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
 	result, err := pt.executeToolLoop(ctx, req, agentshared.SteeringLedgerFromContext(ctx))
 	if err != nil {
@@ -374,6 +426,9 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	startTime := time.Now()
 	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, "tester-pipeline", fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
+	ctx = agentshared.WithContextGovernor(ctx, agentshared.NewContextGovernor(
+		pt.config.Model, pt.config.MaxTokens, 0,
+	))
 
 	result, err := pt.Handle(ctx, fwd)
 	agentshared.LogResponse(pt.steering.EventLogger(), fwd.CorrelationID, pt.id, fwd.SessionID, time.Since(startTime), err)
@@ -409,6 +464,10 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 	resp.Data = result
 	pt.publishActivity(events.EventTypeAgentAction, "Validation task completed")
+
+	if pt.agentPod != nil {
+		pt.agentPod.FeedScribe("tester-pipeline", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 
 	respMsg := guide.NewResponseMessage(pt.generateMessageID(), resp)
 	return pt.bus.Publish(pt.channels.Responses, respMsg)
@@ -550,12 +609,16 @@ func (pt *PipelineTester) AgentID() string { return pt.id }
 // AgentType returns the type classification.
 func (pt *PipelineTester) AgentType() string { return "tester-pipeline" }
 
-// Descriptor returns immutable metadata.
+// Descriptor returns metadata reflecting the current model.
 func (pt *PipelineTester) Descriptor() handoff.AgentDescriptor {
+	pt.mu.RLock()
+	model := pt.config.Model
+	reasoning := pt.config.ReasoningEffort
+	pt.mu.RUnlock()
 	return handoff.AgentDescriptor{
 		AgentType:       "tester-pipeline",
-		ModelID:         "gpt-5.3-codex",
-		ReasoningEffort: "xhigh",
+		ModelID:         model,
+		ReasoningEffort: reasoning,
 		ContextWindow:   200_000,
 		Category:        handoff.CategoryPipeline,
 	}
@@ -577,6 +640,11 @@ func (pt *PipelineTester) SetFileAccess(fa versioning.FileAccess) { pt.fileAcces
 // SetHandoffBridge assigns the handoff bridge.
 func (pt *PipelineTester) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	pt.handoffBridge = bridge
+}
+
+// SetAgentPod assigns the agent pod for cross-agent coordination.
+func (pt *PipelineTester) SetAgentPod(pod *agentshared.AgentPod) {
+	pt.agentPod = pod
 }
 
 // ExtractArchivableState returns state for handoff persistence.

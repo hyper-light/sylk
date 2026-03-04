@@ -65,15 +65,15 @@ type Architect struct {
 	running     bool
 	knownAgents map[string]*guide.AgentAnnouncement
 
-	// Planning state
-	activePlans map[string]*DesignPlan
-	planModes   map[string]*PlanModeState
+	// Planning state — plans live in an externally-owned PlanStore singleton
+	// that survives agent demotion/re-promotion.
+	planStore *PlanStore
+	planModes map[string]*PlanModeState
 
 	runMu         sync.RWMutex
 	runCtx        context.Context
 	runCancel     context.CancelFunc
 	knownAgentsMu sync.RWMutex
-	activePlansMu sync.RWMutex
 	planModesMu   sync.RWMutex
 	pendingMu     sync.Mutex
 	pendingBus    map[string]chan *guide.Message
@@ -82,6 +82,9 @@ type Architect struct {
 
 	// Handoff bridge integration
 	handoffBridge *handoff.HandoffBridge
+
+	// Agent pod for cross-agent coordination (Scribe feed, etc.).
+	agentPod *shared.AgentPod
 
 	// File access abstraction (DiskFileAccess, set at creation).
 	fileAccess versioning.FileAccess
@@ -94,9 +97,7 @@ type Architect struct {
 	signalBus     signal.SignalBusInterface
 	signalAdapter *guide.ChannelBusSignalAdapter // non-nil only when self-created
 
-	// Distributed plan lifecycle: lease management + background reaper.
-	leaseManager *PlanLeaseManager
-	reaper       *PlanReaper
+	// Heartbeat subscription for executing plan lease renewal.
 	heartbeatSub guide.Subscription
 
 	// Steering ledger management.
@@ -163,6 +164,9 @@ type Config struct {
 	// RequestGuard is called at handler entry to prevent activation demotion
 	// during in-flight processing. Returns a release function. Nil-safe.
 	RequestGuard func() func()
+
+	// PlanStore is the process-lifetime plan store singleton. Required.
+	PlanStore *PlanStore
 
 	// Signal bus for broadcasting degradation / time-pressure signals.
 	// Optional — if nil, the Architect creates a ChannelBusSignalAdapter
@@ -301,8 +305,8 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		logWAL:      cfg.logWAL,
 		activityPub: cfg.ActivityPub,
 		fileAccess:  cfg.FileAccess,
+		planStore:   cfg.PlanStore,
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		activePlans: make(map[string]*DesignPlan),
 		planModes:   make(map[string]*PlanModeState),
 		pendingBus:  make(map[string]chan *guide.Message),
 		inFlight:          make(map[string]context.CancelFunc),
@@ -332,14 +336,6 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-
-	architect.leaseManager = NewPlanLeaseManager(cfg.LLMRequestTimeout, readyPlanMaxAge)
-
-	guide.DebugFileLog().Info("DEBUG: architect_new_restore_plans_start")
-	if err := architect.restorePersistedPlans(); err != nil {
-		architect.logger.Warn("failed to restore persisted plans", "error", err)
-	}
-	guide.DebugFileLog().Info("DEBUG: architect_new_restore_plans_done", "elapsed_ms", time.Since(newStart).Milliseconds())
 
 	guide.DebugFileLog().Info("DEBUG: architect_new_complete", "total_elapsed_ms", time.Since(newStart).Milliseconds())
 	return architect, nil
@@ -526,10 +522,6 @@ func (a *Architect) Start(bus guide.EventBus) error {
 		}
 	}
 
-	// Start plan reaper after all subscriptions succeed.
-	a.reaper = NewPlanReaper(a, a.leaseManager, a.logger)
-	a.reaper.Start()
-
 	// Subscribe to heartbeat topic for executing plan lease renewal.
 	a.heartbeatSub, _ = bus.SubscribeAsync("plan.heartbeat", a.handlePlanHeartbeat)
 
@@ -559,12 +551,6 @@ func (a *Architect) Stop() error {
 	architectDebugLog().Info("architect: STOP_CALLED",
 		"in_flight_count", inFlightCount,
 		"agent_id", a.id)
-
-	// Stop plan reaper before unsubscribing.
-	if a.reaper != nil {
-		a.reaper.Stop()
-		a.reaper = nil
-	}
 
 	// Close self-created signal adapter (if any).
 	if a.signalAdapter != nil {
@@ -743,6 +729,9 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
+	reqCtx = shared.WithContextGovernor(reqCtx, shared.NewContextGovernor(
+		a.config.Model, a.config.MaxOutputTokens, 0,
+	))
 
 	a.registerInFlight(fwd.CorrelationID, cancel)
 	a.steering.RegisterCancel(fwd.CorrelationID, cancel)
@@ -832,6 +821,10 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		"directive_agent", directiveAgentStr(directive),
 		"complete_text_len", len(completeText))
 	a.publishPlanStreamComplete(reqCtx, completeText, usageAcc.Total(), directive)
+
+	if a.agentPod != nil {
+		a.agentPod.FeedScribe("architect", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 
 	// Publish response to own response channel
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
@@ -1166,29 +1159,7 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 // latestClarifyingPlan returns the most recently updated plan in Clarifying
 // state for the given session. Returns nil if no matching plan exists.
 func (a *Architect) latestClarifyingPlan(sessionID string) *DesignPlan {
-	trimmed := strings.TrimSpace(sessionID)
-	if trimmed == "" {
-		return nil
-	}
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	cutoff := time.Now().Add(-readyPlanMaxAge)
-	var best *DesignPlan
-	for _, plan := range a.activePlans {
-		if plan.SM().State() != PlanStatusClarifying {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmed) {
-			continue
-		}
-		if plan.UpdatedAt.Before(cutoff) {
-			continue
-		}
-		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
-			best = plan
-		}
-	}
-	return best
+	return a.planStore.LatestClarifying(sessionID)
 }
 
 // handleClarificationResponse processes the user's answer to a clarification
@@ -2133,32 +2104,17 @@ func (a *Architect) executeCreateDAG(ctx context.Context, req *ArchitectRequest)
 }
 
 func (a *Architect) executeRecall(ctx context.Context, req *ArchitectRequest) (any, error) {
-	// Return active plans matching query
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-
-	matchingPlans := make([]*DesignPlan, 0)
-	for _, plan := range a.activePlans {
-		if containsIgnoreCase(plan.Query, req.Query) {
-			matchingPlans = append(matchingPlans, plan)
-		}
-	}
-	return matchingPlans, nil
+	return a.planStore.MatchingQuery(req.Query), nil
 }
 
 func (a *Architect) executeCheck(ctx context.Context, req *ArchitectRequest) (any, error) {
-	// Check if a plan exists
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-
-	for _, plan := range a.activePlans {
-		if containsIgnoreCase(plan.Query, req.Query) {
-			return map[string]any{
-				"found":  true,
-				"plan":   plan,
-				"status": plan.Status.String(),
-			}, nil
-		}
+	plan := a.planStore.FirstMatchingQuery(req.Query)
+	if plan != nil {
+		return map[string]any{
+			"found":  true,
+			"plan":   plan,
+			"status": plan.Status.String(),
+		}, nil
 	}
 	return map[string]any{
 		"found": false,
@@ -2470,11 +2426,9 @@ func contextDeadlineString(ctx context.Context) string {
 	return fmt.Sprintf("%s (remaining: %s)", deadline.Format("15:04:05.000"), remaining.Truncate(time.Millisecond))
 }
 
-// activePlanCount returns the number of active plans in the map (for diagnostic logging).
+// activePlanCount returns the number of active plans (for diagnostic logging).
 func (a *Architect) activePlanCount() int {
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	return len(a.activePlans)
+	return a.planStore.Count()
 }
 
 func containsIgnoreCase(s, substr string) bool {
@@ -2516,23 +2470,13 @@ func extractUserResponse(data any) string {
 
 // GetActivePlan returns an active plan by ID
 func (a *Architect) GetActivePlan(id string) (*DesignPlan, bool) {
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-
-	plan, ok := a.activePlans[id]
-	return plan, ok
+	plan := a.planStore.Get(id)
+	return plan, plan != nil
 }
 
 // GetAllActivePlans returns all active plans
 func (a *Architect) GetAllActivePlans() []*DesignPlan {
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-
-	plans := make([]*DesignPlan, 0, len(a.activePlans))
-	for _, plan := range a.activePlans {
-		plans = append(plans, plan)
-	}
-	return plans
+	return a.planStore.Snapshot()
 }
 
 // =============================================================================
@@ -2542,6 +2486,11 @@ func (a *Architect) GetAllActivePlans() []*DesignPlan {
 // SetHandoffBridge sets the handoff bridge for the architect agent.
 func (a *Architect) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	a.handoffBridge = bridge
+}
+
+// SetAgentPod assigns the agent pod for cross-agent coordination.
+func (a *Architect) SetAgentPod(pod *shared.AgentPod) {
+	a.agentPod = pod
 }
 
 // AgentID returns the unique identifier for this architect instance.

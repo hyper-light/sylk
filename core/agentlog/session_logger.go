@@ -6,12 +6,26 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+const ringSize = 256
+
+// LoggerStats holds running statistics updated atomically inside LogEvent.
+type LoggerStats struct {
+	TotalCount int64     `json:"total_count"`
+	ErrorCount int64     `json:"error_count"`
+	WarnCount  int64     `json:"warn_count"`
+	LastError  time.Time `json:"last_error,omitempty"`
+}
 
 // SessionEventLogger is a unified entry point that owns both a WAL journal
 // and a JSONL writer for a single agent within a session. Supports lazy
 // binding: created before the session exists, bound when the first request
 // arrives carrying a session ID.
+//
+// It also maintains an in-memory ring buffer of recent entries and running
+// statistics, enabling zero-I/O diagnostics via RecentEntries and Stats.
 type SessionEventLogger struct {
 	mu        sync.Mutex
 	agentName string
@@ -20,6 +34,21 @@ type SessionEventLogger struct {
 	journal   *AgentJournal
 	jsonl     *JSONLWriter
 	sessionID string
+
+	// Ring buffer: fixed-size circular buffer written inside LogEvent.
+	ring    [ringSize]JSONLEntry
+	ringPos atomic.Uint32
+	ringLen atomic.Uint32 // tracks how many slots have been written (capped at ringSize)
+
+	// Running stats: updated inside LogEvent via atomics.
+	totalCount   atomic.Int64
+	errorCount   atomic.Int64
+	warnCount    atomic.Int64
+	lastErrNano  atomic.Int64
+
+	// Broadcast callback: optional, called inside LogEvent after write.
+	broadcastMu sync.RWMutex
+	broadcast   func(JSONLEntry)
 }
 
 // NewSessionEventLogger creates an unbound logger. Call BindSession to
@@ -107,22 +136,103 @@ func (s *SessionEventLogger) LogWALJSON(eventType EventType, v any) {
 	}
 }
 
-// LogEvent writes a structured entry to the JSONL file. No-op if unbound.
+// LogEvent writes a structured entry to the JSONL file, appends to the
+// in-memory ring buffer, updates running stats, and fires the broadcast
+// callback. The ring buffer and stats are always updated even if the JSONL
+// write fails. No-op if unbound.
 func (s *SessionEventLogger) LogEvent(entry JSONLEntry) {
 	if s == nil || !s.bound.Load() {
 		return
 	}
+
+	// Ring buffer write (lock-free via atomic position).
+	pos := s.ringPos.Add(1) - 1
+	s.ring[pos%ringSize] = entry
+	if cur := s.ringLen.Load(); cur < ringSize {
+		s.ringLen.CompareAndSwap(cur, min(cur+1, ringSize))
+	}
+
+	// Running stats via atomics.
+	s.totalCount.Add(1)
+	switch entry.Level {
+	case "error":
+		s.errorCount.Add(1)
+		s.lastErrNano.Store(entry.Timestamp.UnixNano())
+	case "warn":
+		s.warnCount.Add(1)
+	}
+
+	// JSONL write.
 	s.mu.Lock()
 	j := s.jsonl
 	s.mu.Unlock()
 
-	if j == nil {
+	if j != nil {
+		if err := j.Write(entry); err != nil {
+			slog.Warn("session_logger: JSONL write failed",
+				"event", entry.Event, "err", err)
+		}
+	}
+
+	// Broadcast callback (fire-and-forget).
+	s.broadcastMu.RLock()
+	fn := s.broadcast
+	s.broadcastMu.RUnlock()
+	if fn != nil {
+		fn(entry)
+	}
+}
+
+// RecentEntries returns the last n entries from the ring buffer (newest first).
+// Zero I/O — reads only from memory. Nil-safe.
+func (s *SessionEventLogger) RecentEntries(n int) []JSONLEntry {
+	if s == nil {
+		return nil
+	}
+	length := int(s.ringLen.Load())
+	if length == 0 {
+		return nil
+	}
+	if n > length {
+		n = length
+	}
+
+	pos := s.ringPos.Load()
+	result := make([]JSONLEntry, n)
+	for i := range n {
+		idx := (pos - 1 - uint32(i)) % ringSize
+		result[i] = s.ring[idx]
+	}
+	return result
+}
+
+// Stats returns an instant health pulse from running atomic counters.
+// Zero I/O — reads only from memory. Nil-safe.
+func (s *SessionEventLogger) Stats() LoggerStats {
+	if s == nil {
+		return LoggerStats{}
+	}
+	stats := LoggerStats{
+		TotalCount: s.totalCount.Load(),
+		ErrorCount: s.errorCount.Load(),
+		WarnCount:  s.warnCount.Load(),
+	}
+	if nano := s.lastErrNano.Load(); nano > 0 {
+		stats.LastError = time.Unix(0, nano)
+	}
+	return stats
+}
+
+// SetBroadcast wires a callback that is invoked for every LogEvent call
+// after the JSONL write. Used to publish log entries to the bus for
+// archivalist ingest. Pass nil to clear.
+func (s *SessionEventLogger) SetBroadcast(fn func(JSONLEntry)) {
+	if s == nil {
 		return
 	}
-	if err := j.Write(entry); err != nil {
-		slog.Warn("session_logger: JSONL write failed",
-			"event", entry.Event, "err", err)
-	}
+	s.broadcastMu.Lock()
+	s.broadcast = fn
+	s.broadcastMu.Unlock()
 }
 
 // Close closes both the WAL journal and JSONL writer. Idempotent.

@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -55,8 +56,15 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 		}
 		// ── END STEERING ──
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, pi.config.MaxToolRuns, req); zone == agentShared.ZoneCritical {
+				return "", agentShared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
-		resp, err := pi.provider.Complete(ctx, req)
+		resp, err := pi.getProvider().Complete(ctx, req)
 		agentShared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -67,9 +75,14 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 			return "", fmt.Errorf("pipeline inspector llm: %w", err)
 		}
 
+		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+
 		shared.AccumulateUsage(ctx, &resp.Usage)
 
 		if len(resp.ToolCalls) == 0 {
+			pi.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -97,6 +110,7 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 		}
 
 		errCount, rerouted := pi.applyToolCalls(ctx, req, resp)
+		pi.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -158,6 +172,9 @@ func (pi *PipelineInspector) applyToolCalls(
 				lm.AgentID, lm.SessionID, lm.CorrID, "info",
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
+		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
+		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,
@@ -199,4 +216,30 @@ func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers
 
 func (pi *PipelineInspector) buildToolDefinitions() []providers.Tool {
 	return shared.BuildToolDefinitions(pi.skills.GetLoaded())
+}
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (pi *PipelineInspector) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if pi.handoffBridge == nil {
+		return
+	}
+
+	pi.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      agentShared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
 }

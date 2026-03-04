@@ -82,6 +82,10 @@ func (a *Architect) composeUserFacingResponse(
 	// with a bounded timeout. context.WithoutCancel preserves values (stream
 	// metadata, session ID, thought callbacks) while ignoring the cancellation.
 	if ctx.Err() != nil {
+		// Reset the UI stream accumulator so the retry replaces (not appends
+		// to) partial text from the failed first attempt. Same mechanism as
+		// provider-level retries (RetryReset → publishPlanStreamStart).
+		a.publishPlanStreamStart(ctx)
 		retryTimeout := a.config.LLMRequestTimeout * composeRetryTimeoutMultiplier
 		retryCtx, cancel := context.WithTimeout(
 			context.WithoutCancel(ctx), retryTimeout)
@@ -105,6 +109,8 @@ func (a *Architect) composeUserFacingResponse(
 
 	// Text-only fallback — use tool-safe prompt to avoid the LLM generating
 	// text-based tool calls for tools it doesn't have access to.
+	// Reset UI accumulator before fallback streams fresh text.
+	a.publishPlanStreamStart(ctx)
 	planner := a.ensurePlanner(ctx)
 	if planner == nil {
 		return "", fmt.Errorf("architect planner not configured (EnableLLM may be false or API key missing)")

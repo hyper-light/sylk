@@ -506,6 +506,15 @@ const (
 	// TopicSignalAck is the topic for signal acknowledgment messages.
 	TopicSignalAck = "signal.ack"
 
+	// TopicLogIngest is where agents broadcast JSONL log entries for
+	// archivalist ingest into its living history.
+	TopicLogIngest = "logs.ingest"
+
+	// TopicKnowledgeReady is published by KnowledgeStore when a knowledge
+	// backend layer is promoted (partial or full). Active knowledge agents
+	// subscribe for cache warming and telemetry.
+	TopicKnowledgeReady = "knowledge.ready"
+
 	// UserAgentType is the agent type used for user session service endpoints.
 	UserAgentType = "user"
 )
@@ -1132,4 +1141,34 @@ func (m *Message) GetSignalPayload() (*SignalPayload, bool) {
 func (m *Message) GetSignalAckPayload() (*SignalAckPayload, bool) {
 	ap, ok := m.Payload.(*SignalAckPayload)
 	return ap, ok
+}
+
+// =============================================================================
+// Knowledge Ready Messages
+// =============================================================================
+
+// KnowledgeReadyPayload is the bus payload for knowledge layer promotions.
+type KnowledgeReadyPayload struct {
+	Level     int      `json:"level"`     // ReadinessLevel (0=none, 1=partial, 2=full)
+	Searchers []string `json:"searchers"` // from coordinator.ReadySearchers()
+}
+
+// NewKnowledgeReadyMessage creates a message announcing a knowledge promotion.
+func NewKnowledgeReadyMessage(payload *KnowledgeReadyPayload) *Message {
+	return &Message{
+		ID:            uuid.New().String(),
+		Type:          MessageTypeActivity,
+		Payload:       payload,
+		SourceAgentID: "knowledge_store",
+		Timestamp:     time.Now(),
+		Status:        messaging.StatusQueued,
+		Attempt:       1,
+		Priority:      messaging.PriorityNormal,
+	}
+}
+
+// GetKnowledgeReadyPayload extracts KnowledgeReadyPayload from message payload.
+func (m *Message) GetKnowledgeReadyPayload() (*KnowledgeReadyPayload, bool) {
+	p, ok := m.Payload.(*KnowledgeReadyPayload)
+	return p, ok
 }

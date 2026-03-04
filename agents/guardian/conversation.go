@@ -104,15 +104,22 @@ func (g *Guardian) composeWithoutLLM(req *guardianConversationRequest) (string, 
 func (g *Guardian) buildConversationMessages(req *guardianConversationRequest) []providers.Message {
 	messages := make([]providers.Message, 0, len(req.History)+1)
 
-	// Include recent conversation history.
+	// Include recent conversation history. When local history is empty
+	// (e.g. after demotion/re-promotion), seed from forwarded request history.
 	g.conversationMu.RLock()
-	for _, turn := range g.conversationHistory {
-		messages = append(messages,
-			providers.Message{Role: providers.RoleUser, Content: turn.UserInput},
-			providers.Message{Role: providers.RoleAssistant, Content: turn.AgentReply},
-		)
-	}
+	localHistory := g.conversationHistory
 	g.conversationMu.RUnlock()
+
+	if len(localHistory) == 0 && len(req.History) > 0 {
+		messages = shared.ConversationTurnsToMessages(req.History)
+	} else {
+		for _, turn := range localHistory {
+			messages = append(messages,
+				providers.Message{Role: providers.RoleUser, Content: turn.UserInput},
+				providers.Message{Role: providers.RoleAssistant, Content: turn.AgentReply},
+			)
+		}
+	}
 
 	// Current user message with intent hint.
 	userContent := req.Input

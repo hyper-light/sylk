@@ -8,7 +8,7 @@ import (
 var (
 	ErrContainerNotFound  = errors.New("container not found")
 	ErrContainerExists    = errors.New("container already registered")
-	ErrPodNotFound        = errors.New("pod not found")
+	ErrPodNotFound = errors.New("pod not found")
 )
 
 // ContainerRegistry provides thread-safe lookup of active containers.
@@ -18,7 +18,7 @@ type ContainerRegistry struct {
 	byID      map[ContainerID]*Container
 	byType    map[string]map[ContainerID]struct{} // agentType → set of IDs
 	byPod     map[PodID]map[ContainerID]struct{}  // podID → set of IDs
-	pods      map[PodID]*Pod
+	pods      map[PodID]struct{}
 }
 
 // NewContainerRegistry creates an empty registry.
@@ -27,7 +27,7 @@ func NewContainerRegistry() *ContainerRegistry {
 		byID:   make(map[ContainerID]*Container),
 		byType: make(map[string]map[ContainerID]struct{}),
 		byPod:  make(map[PodID]map[ContainerID]struct{}),
-		pods:   make(map[PodID]*Pod),
+		pods:   make(map[PodID]struct{}),
 	}
 }
 
@@ -56,14 +56,13 @@ func (r *ContainerRegistry) indexByType(c *Container) {
 }
 
 func (r *ContainerRegistry) indexByPod(c *Container) {
-	if c.pod == nil {
+	if c.podID == "" {
 		return
 	}
-	podID := c.pod.id
-	if r.byPod[podID] == nil {
-		r.byPod[podID] = make(map[ContainerID]struct{})
+	if r.byPod[c.podID] == nil {
+		r.byPod[c.podID] = make(map[ContainerID]struct{})
 	}
-	r.byPod[podID][c.id] = struct{}{}
+	r.byPod[c.podID][c.id] = struct{}{}
 }
 
 // Unregister removes a container from the registry.
@@ -93,16 +92,16 @@ func (r *ContainerRegistry) removeTypeIndex(c *Container) {
 }
 
 func (r *ContainerRegistry) removePodIndex(c *Container) {
-	if c.pod == nil {
+	if c.podID == "" {
 		return
 	}
-	podSet := r.byPod[c.pod.id]
+	podSet := r.byPod[c.podID]
 	if podSet == nil {
 		return
 	}
 	delete(podSet, c.id)
 	if len(podSet) == 0 {
-		delete(r.byPod, c.pod.id)
+		delete(r.byPod, c.podID)
 	}
 }
 
@@ -165,29 +164,26 @@ func (r *ContainerRegistry) All() []*Container {
 	return result
 }
 
-// RegisterPod adds a pod to the registry.
-func (r *ContainerRegistry) RegisterPod(p *Pod) {
+// RegisterPod records a pod ID in the registry.
+func (r *ContainerRegistry) RegisterPod(id PodID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.pods[p.id] = p
+	r.pods[id] = struct{}{}
 }
 
-// UnregisterPod removes a pod from the registry.
+// UnregisterPod removes a pod ID from the registry.
 func (r *ContainerRegistry) UnregisterPod(id PodID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.pods, id)
 }
 
-// GetPod returns the pod with the given ID, or ErrPodNotFound.
-func (r *ContainerRegistry) GetPod(id PodID) (*Pod, error) {
+// HasPod returns true if the pod ID is registered.
+func (r *ContainerRegistry) HasPod(id PodID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	p, ok := r.pods[id]
-	if !ok {
-		return nil, ErrPodNotFound
-	}
-	return p, nil
+	_, ok := r.pods[id]
+	return ok
 }
 
 // PodCount returns the number of registered pods.

@@ -10,7 +10,7 @@ import (
 	csecurity "github.com/adalundhe/sylk/core/container/security"
 )
 
-func testContainerWithID(t *testing.T, id string, agentType string, pod *Pod) *Container {
+func testContainerWithID(t *testing.T, id string, agentType string, podID PodID) *Container {
 	t.Helper()
 	ctx := context.Background()
 	scope := concurrency.NewGoroutineScope(ctx, id, nil)
@@ -31,13 +31,13 @@ func testContainerWithID(t *testing.T, id string, agentType string, pod *Pod) *C
 		Scope:  scope,
 		SecCtx: secCtx,
 		Agent:  &mockAgent{id: id, agentType: agentType},
-		Pod:    pod,
+		PodID:  podID,
 	})
 }
 
 func TestRegistry_RegisterAndGet(t *testing.T) {
 	reg := NewContainerRegistry()
-	c := testContainerWithID(t, "c1", "engineer", nil)
+	c := testContainerWithID(t, "c1", "engineer", "")
 
 	if err := reg.Register(c); err != nil {
 		t.Fatalf("Register failed: %v", err)
@@ -54,7 +54,7 @@ func TestRegistry_RegisterAndGet(t *testing.T) {
 
 func TestRegistry_DuplicateReturnsError(t *testing.T) {
 	reg := NewContainerRegistry()
-	c := testContainerWithID(t, "c1", "engineer", nil)
+	c := testContainerWithID(t, "c1", "engineer", "")
 
 	_ = reg.Register(c)
 	err := reg.Register(c)
@@ -65,7 +65,7 @@ func TestRegistry_DuplicateReturnsError(t *testing.T) {
 
 func TestRegistry_Unregister(t *testing.T) {
 	reg := NewContainerRegistry()
-	c := testContainerWithID(t, "c1", "engineer", nil)
+	c := testContainerWithID(t, "c1", "engineer", "")
 
 	_ = reg.Register(c)
 	reg.Unregister("c1")
@@ -78,9 +78,9 @@ func TestRegistry_Unregister(t *testing.T) {
 
 func TestRegistry_ListByType(t *testing.T) {
 	reg := NewContainerRegistry()
-	c1 := testContainerWithID(t, "c1", "engineer", nil)
-	c2 := testContainerWithID(t, "c2", "engineer", nil)
-	c3 := testContainerWithID(t, "c3", "inspector", nil)
+	c1 := testContainerWithID(t, "c1", "engineer", "")
+	c2 := testContainerWithID(t, "c2", "engineer", "")
+	c3 := testContainerWithID(t, "c3", "inspector", "")
 
 	_ = reg.Register(c1)
 	_ = reg.Register(c2)
@@ -100,15 +100,9 @@ func TestRegistry_ListByType(t *testing.T) {
 func TestRegistry_ListByPod(t *testing.T) {
 	reg := NewContainerRegistry()
 
-	pod := NewPod(PodConfig{
-		ID:   "pod-1",
-		Spec: PodSpec{Name: "test-pod", MainContainers: []ContainerSpec{{Name: "m", AgentType: "e"}}},
-		Scope: concurrency.NewGoroutineScope(context.Background(), "pod-1", nil),
-	})
-
-	c1 := testContainerWithID(t, "c1", "engineer", pod)
-	c2 := testContainerWithID(t, "c2", "inspector", pod)
-	c3 := testContainerWithID(t, "c3", "engineer", nil) // standalone
+	c1 := testContainerWithID(t, "c1", "engineer", "pod-1")
+	c2 := testContainerWithID(t, "c2", "inspector", "pod-1")
+	c3 := testContainerWithID(t, "c3", "engineer", "") // standalone
 
 	_ = reg.Register(c1)
 	_ = reg.Register(c2)
@@ -130,7 +124,7 @@ func TestRegistry_ConcurrentAccess(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			id := ContainerID(string(rune('a' + idx)))
-			c := testContainerWithID(t, string(id), "engineer", nil)
+			c := testContainerWithID(t, string(id), "engineer", "")
 			_ = reg.Register(c)
 			_ = reg.ListByType("engineer")
 			reg.All()
@@ -145,24 +139,17 @@ func TestRegistry_ConcurrentAccess(t *testing.T) {
 
 func TestRegistry_Pod(t *testing.T) {
 	reg := NewContainerRegistry()
-	pod := NewPod(PodConfig{
-		ID:    "pod-1",
-		Spec:  PodSpec{Name: "test-pod", MainContainers: []ContainerSpec{{Name: "m", AgentType: "e"}}},
-		Scope: concurrency.NewGoroutineScope(context.Background(), "pod-1", nil),
-	})
 
-	reg.RegisterPod(pod)
-	got, err := reg.GetPod("pod-1")
-	if err != nil {
-		t.Fatalf("GetPod failed: %v", err)
+	reg.RegisterPod("pod-1")
+	if !reg.HasPod("pod-1") {
+		t.Fatal("expected pod-1 to be registered")
 	}
-	if got.ID() != "pod-1" {
-		t.Fatalf("expected pod-1, got %s", got.ID())
+	if reg.PodCount() != 1 {
+		t.Fatalf("expected 1 pod, got %d", reg.PodCount())
 	}
 
 	reg.UnregisterPod("pod-1")
-	_, err = reg.GetPod("pod-1")
-	if !errors.Is(err, ErrPodNotFound) {
-		t.Fatalf("expected ErrPodNotFound, got %v", err)
+	if reg.HasPod("pod-1") {
+		t.Fatal("expected pod-1 to be unregistered")
 	}
 }

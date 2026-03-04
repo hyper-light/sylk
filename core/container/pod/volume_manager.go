@@ -1,0 +1,155 @@
+package pod
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/versioning"
+)
+
+// ManagedVolume is a volume whose lifecycle is tied to pod tier transitions.
+type ManagedVolume interface {
+	// Mount prepares the volume for use (called on promote to Hot).
+	Mount(ctx context.Context) error
+
+	// Unmount tears down the volume (called on demote from Hot).
+	Unmount(ctx context.Context) error
+
+	// FileAccess returns the FileAccess interface for this volume.
+	// Returns nil if the volume is not mounted.
+	FileAccess() versioning.FileAccess
+
+	// VolumeName returns the volume's name (matches VolumeSpec.Name).
+	VolumeName() string
+}
+
+// VolumeManager coordinates volume lifecycle for a pod's tier transitions.
+// Each volume is keyed by its VolumeSpec.Name.
+type VolumeManager struct {
+	mu      sync.RWMutex
+	volumes map[string]ManagedVolume // volume name → volume
+	mounts  map[string]string        // agentType → volume name
+	mounted bool
+}
+
+// VolumeManagerConfig provides construction parameters.
+type VolumeManagerConfig struct {
+	Volumes []ManagedVolume
+	// Mounts maps agent types to the volume name they should use.
+	Mounts map[string]string
+}
+
+// NewVolumeManager creates a VolumeManager with the given volumes and mount mappings.
+func NewVolumeManager(cfg VolumeManagerConfig) *VolumeManager {
+	vm := &VolumeManager{
+		volumes: make(map[string]ManagedVolume, len(cfg.Volumes)),
+		mounts:  cfg.Mounts,
+	}
+	if vm.mounts == nil {
+		vm.mounts = make(map[string]string)
+	}
+	for _, v := range cfg.Volumes {
+		vm.volumes[v.VolumeName()] = v
+	}
+	return vm
+}
+
+// MountAll mounts all managed volumes. Called during promote to Hot.
+func (vm *VolumeManager) MountAll(ctx context.Context) error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	if vm.mounted {
+		return nil
+	}
+
+	for name, v := range vm.volumes {
+		if err := v.Mount(ctx); err != nil {
+			vm.unmountAllLocked(ctx)
+			return fmt.Errorf("mount volume %q: %w", name, err)
+		}
+	}
+	vm.mounted = true
+	return nil
+}
+
+// UnmountAll unmounts all volumes. Called during demote from Hot.
+func (vm *VolumeManager) UnmountAll(ctx context.Context) error {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	if !vm.mounted {
+		return nil
+	}
+	vm.unmountAllLocked(ctx)
+	vm.mounted = false
+	return nil
+}
+
+// unmountAllLocked unmounts all volumes. Must be called with mu held.
+func (vm *VolumeManager) unmountAllLocked(ctx context.Context) {
+	for _, v := range vm.volumes {
+		_ = v.Unmount(ctx)
+	}
+}
+
+// FileAccessFor returns the FileAccess for the given agent type based
+// on the configured mount mapping. Returns nil if no mapping exists
+// or the volume is not mounted.
+func (vm *VolumeManager) FileAccessFor(agentType string) versioning.FileAccess {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+
+	volName, ok := vm.mounts[agentType]
+	if !ok {
+		return nil
+	}
+	vol, ok := vm.volumes[volName]
+	if !ok {
+		return nil
+	}
+	return vol.FileAccess()
+}
+
+// InjectFileAccess sets FileAccess on all container agents that implement
+// FileAccessConsumer. Uses the mount mapping to determine which volume
+// each agent receives.
+func (vm *VolumeManager) InjectFileAccess(containers map[string]*container.Container) {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+
+	for agentType, c := range containers {
+		volName, ok := vm.mounts[agentType]
+		if !ok {
+			continue
+		}
+		vol, ok := vm.volumes[volName]
+		if !ok {
+			continue
+		}
+		fa := vol.FileAccess()
+		if fa == nil {
+			continue
+		}
+		agent := c.Agent()
+		if consumer, ok := agent.(versioning.FileAccessConsumer); ok {
+			consumer.SetFileAccess(fa)
+		}
+	}
+}
+
+// IsMounted returns whether the volumes are currently mounted.
+func (vm *VolumeManager) IsMounted() bool {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return vm.mounted
+}
+
+// VolumeCount returns the number of registered volumes.
+func (vm *VolumeManager) VolumeCount() int {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+	return len(vm.volumes)
+}

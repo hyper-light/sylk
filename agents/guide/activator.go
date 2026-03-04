@@ -2,31 +2,40 @@ package guide
 
 import "context"
 
-// AgentActivator provides on-demand agent activation capability.
+// PodActivator provides on-demand pod activation capability.
 // Implementations must be safe for concurrent use.
-type AgentActivator interface {
-	// EnsureActive guarantees the agent of the given type is running (TierHot).
-	// Concurrent calls for the same type coalesce on a single activation.
-	EnsureActive(ctx context.Context, agentType string) error
+type PodActivator interface {
+	// EnsurePodActive guarantees the pod is at TierHot.
+	// Concurrent calls for the same pod coalesce on a single activation.
+	EnsurePodActive(ctx context.Context, podID string) error
 
-	// TouchActivity resets the idle timer for the given agent type,
+	// TouchPodActivity resets the idle timer for the given pod,
 	// preventing demotion during active conversation flow.
-	TouchActivity(agentType string)
+	TouchPodActivity(podID string)
 
-	// HoldActive activates the agent and acquires a demotion guard that
-	// prevents any tier transition while held. Returns an idempotent
-	// release function. The caller must call release when the agent is
-	// no longer required to stay hot.
-	HoldActive(ctx context.Context, agentType string) (func(), error)
+	// HoldPodActive activates the pod and acquires a demotion guard.
+	// Returns an idempotent release function.
+	HoldPodActive(ctx context.Context, podID string) (func(), error)
+
+	// PodForAgent resolves an agent type to its owning pod ID.
+	// Returns the agentType itself if no mapping exists (singleton pods).
+	PodForAgent(agentType string) string
 }
 
-// noopActivator satisfies AgentActivator with no-ops.
-// Used as a nil-safe default and in tests.
-type noopActivator struct{}
+// noopPodActivator satisfies PodActivator with no-ops.
+type noopPodActivator struct{}
 
-func (noopActivator) EnsureActive(context.Context, string) error        { return nil }
-func (noopActivator) TouchActivity(string)                              {}
-func (noopActivator) HoldActive(context.Context, string) (func(), error) { return func() {}, nil }
+func (noopPodActivator) EnsurePodActive(context.Context, string) error         { return nil }
+func (noopPodActivator) TouchPodActivity(string)                               {}
+func (noopPodActivator) HoldPodActive(context.Context, string) (func(), error) { return func() {}, nil }
+func (noopPodActivator) PodForAgent(agentType string) string                   { return agentType }
 
-// NoopActivator returns an AgentActivator that does nothing.
-func NoopActivator() AgentActivator { return noopActivator{} }
+// NoopPodActivator returns a PodActivator that does nothing.
+func NoopPodActivator() PodActivator { return noopPodActivator{} }
+
+// AgentActivator is the legacy interface alias. Deprecated: use PodActivator.
+type AgentActivator = PodActivator
+
+// NoopActivator returns a legacy-compatible no-op activator.
+// Deprecated: use NoopPodActivator.
+func NoopActivator() AgentActivator { return NoopPodActivator() }

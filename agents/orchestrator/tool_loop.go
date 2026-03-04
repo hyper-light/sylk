@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -46,6 +47,13 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 		}
 		// ── END STEERING ──
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, o.config.MaxToolRuns, req); zone == shared.ZoneCritical {
+				return "", shared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
 		resp, err := o.provider.Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
@@ -53,7 +61,12 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 			return "", fmt.Errorf("orchestrator llm: %w", err)
 		}
 
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+
 		if len(resp.ToolCalls) == 0 {
+			o.recordTurn(req, resp, turn, 0, 0, turnStart)
 			return strings.TrimSpace(resp.Content), nil
 		}
 
@@ -66,6 +79,7 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 		}
 
 		errCount, rerouted := o.applyToolCalls(ctx, req, resp)
+		o.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -109,6 +123,9 @@ func (o *Orchestrator) applyToolCalls(
 				isError = true
 				errCount++
 			}
+		}
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -260,4 +277,30 @@ func updateToolErrors(current, errCount, totalCalls int) int {
 		return current + 1
 	}
 	return 0
+}
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (o *Orchestrator) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if o.handoffBridge == nil {
+		return
+	}
+
+	o.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      shared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
 }

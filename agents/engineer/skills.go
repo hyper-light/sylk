@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/format"
@@ -48,12 +50,34 @@ func (e *Engineer) registerCoreSkills() {
 	// Communication
 	e.skills.Register(signalOrchestratorSkill(e))
 
+	// Diagnostics
+	e.skills.Register(shared.NewSelfDiagnosticSkill(&engineerDiag{e: e}))
+
 	// Reroute
 	e.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "engineer",
 		SessionID: func() string { return e.config.SessionID },
 		Publish:   e.publishRerouteRequest,
 	}))
+}
+
+type engineerDiag struct{ e *Engineer }
+
+func (d *engineerDiag) AgentName() string  { return "engineer" }
+func (d *engineerDiag) SessionID() string  { return d.e.config.SessionID }
+func (d *engineerDiag) LogsDir() string    { return shared.LogsDirForAgent(d.e.steering.SessionDir(), "engineer") }
+func (d *engineerDiag) EventLogger() *agentlog.SessionEventLogger { return d.e.steering.EventLogger() }
+func (d *engineerDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *engineerDiag) RecoveryHints() []string                   { return nil }
+
+func (d *engineerDiag) AgentSpecificDiagnostics() map[string]any {
+	d.e.requestMu.Lock()
+	inFlight := len(d.e.requestCancels)
+	d.e.requestMu.Unlock()
+	return map[string]any{
+		"in_flight_requests": inFlight,
+		"pipeline_id":       d.e.pipelineID,
+	}
 }
 
 // =============================================================================

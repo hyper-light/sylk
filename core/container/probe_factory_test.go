@@ -45,7 +45,7 @@ func TestProbeFactory_WiresProbes(t *testing.T) {
 		},
 	}
 
-	c, err := rt.CreateContainer(context.Background(), spec, nil)
+	c, err := rt.CreateContainer(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("CreateContainer: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestProbeFactory_NilAgent_SkipsFactory(t *testing.T) {
 		},
 	}
 
-	_, err := rt.CreateContainer(context.Background(), spec, nil)
+	_, err := rt.CreateContainer(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("CreateContainer: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestProbeFactory_NilFactory_NoProbes(t *testing.T) {
 		},
 	}
 
-	c, err := rt.CreateContainer(context.Background(), spec, nil)
+	c, err := rt.CreateContainer(context.Background(), spec)
 	if err != nil {
 		t.Fatalf("CreateContainer: %v", err)
 	}

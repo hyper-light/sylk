@@ -109,14 +109,14 @@ func (a *Architect) handlePlanHeartbeat(msg *guide.Message) error {
 	if !ok {
 		return nil
 	}
-	plan := a.lookupActivePlan(payload.PlanID)
+	plan := a.planStore.Get(payload.PlanID)
 	if plan == nil {
 		return nil
 	}
 	if plan.SM().Epoch() != payload.Epoch {
 		return nil
 	}
-	a.leaseManager.RenewLease(plan)
+	a.planStore.LeaseManager().RenewLease(plan)
 	return nil
 }
 
@@ -135,9 +135,3 @@ func decodePlanHeartbeat(msg *guide.Message) (PlanHeartbeatPayload, bool) {
 	return payload, true
 }
 
-// lookupActivePlan returns the plan from the active set, or nil.
-func (a *Architect) lookupActivePlan(planID string) *DesignPlan {
-	a.activePlansMu.RLock()
-	defer a.activePlansMu.RUnlock()
-	return a.activePlans[planID]
-}

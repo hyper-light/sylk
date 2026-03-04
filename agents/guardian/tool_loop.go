@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -88,6 +89,13 @@ func (g *Guardian) executeToolLoop(
 			g.toolDefsDirty = false
 		}
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, maxRuns, req); zone == shared.ZoneCritical {
+				return "", shared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
 		resp, err := provider.Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
@@ -101,12 +109,17 @@ func (g *Guardian) executeToolLoop(
 			return "", fmt.Errorf("guardian llm: %w", err)
 		}
 
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+
 		// Emit text chunks.
 		if onChunk != nil && resp.Content != "" {
 			onChunk(resp.Content)
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			g.recordTurn(req, resp, turn, 0, 0, turnStart)
 			g.logDebug("tool_loop: COMPLETE",
 				"stage", stage, "turn", turn,
 				"content_len", len(resp.Content),
@@ -135,6 +148,7 @@ func (g *Guardian) executeToolLoop(
 		}
 
 		errCount, rerouted := g.applyToolCalls(ctx, req, resp)
+		g.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -208,6 +222,9 @@ func (g *Guardian) applyToolCalls(
 				lm.AgentID, lm.SessionID, lm.CorrID, "info",
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
+		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,
@@ -229,4 +246,30 @@ func (g *Guardian) applyToolCalls(
 
 func isRerouteError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "reroute")
+}
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (g *Guardian) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if g.handoffBridge == nil {
+		return
+	}
+
+	g.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      shared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
 }

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -31,11 +33,33 @@ func (a *Architect) registerCoreSkills() {
 	a.skills.Register(gitSkill(a))
 	a.skills.Register(lspSkill(a))
 	a.skills.Register(astGrepSearchSkill(a))
+	a.skills.Register(shared.NewSelfDiagnosticSkill(&architectDiag{a: a}))
 	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "architect",
 		SessionID: func() string { return "" },
 		Publish:   a.publishRerouteRequest,
 	}))
+}
+
+type architectDiag struct{ a *Architect }
+
+func (d *architectDiag) AgentName() string  { return "architect" }
+func (d *architectDiag) SessionID() string  { return "" }
+func (d *architectDiag) LogsDir() string    { return shared.LogsDirForAgent(d.a.steering.SessionDir(), "architect") }
+func (d *architectDiag) EventLogger() *agentlog.SessionEventLogger { return d.a.steering.EventLogger() }
+func (d *architectDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *architectDiag) RecoveryHints() []string                   { return nil }
+
+func (d *architectDiag) AgentSpecificDiagnostics() map[string]any {
+	plans := d.a.planStore.Snapshot()
+	states := make(map[string]string, len(plans))
+	for _, p := range plans {
+		states[p.ID] = p.Status.String()
+	}
+	return map[string]any{
+		"active_plan_count": len(plans),
+		"plan_states":       states,
+	}
 }
 
 func (a *Architect) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
@@ -85,8 +109,10 @@ func (a *Architect) advancePlan(
 	plan.Status = plan.SM().State()
 	plan.Epoch = plan.SM().Epoch()
 	plan.UpdatedAt = time.Now()
-	if targetStatus == PlanStatusReady && a.leaseManager != nil {
-		a.leaseManager.GrantReadyLease(plan)
+	if targetStatus == PlanStatusReady {
+		if lm := a.planStore.LeaseManager(); lm != nil {
+			lm.GrantReadyLease(plan)
+		}
 	}
 	if mutate != nil {
 		mutate()
@@ -267,8 +293,8 @@ func planSkill(a *Architect) *skills.Skill {
 					return nil, err
 				}
 				// Grant ready lease
-				if a.leaseManager != nil {
-					a.leaseManager.GrantReadyLease(plan)
+				if lm := a.planStore.LeaseManager(); lm != nil {
+					lm.GrantReadyLease(plan)
 				}
 				a.publishPlanSnapshot(ctx, plan)
 				layers := planLayerCount(plan)

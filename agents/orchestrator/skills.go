@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -39,6 +41,9 @@ func (o *Orchestrator) registerCoreSkills() {
 	o.skills.Register(ingestPlanSkill(o))
 	o.skills.Register(analyzePlanSkill(o))
 
+	// Diagnostics
+	o.skills.Register(shared.NewSelfDiagnosticSkill(&orchestratorDiag{o: o}))
+
 	for _, name := range orchestratorCoreSkillNames() {
 		o.skills.Load(name)
 	}
@@ -56,7 +61,43 @@ func orchestratorCoreSkillNames() []string {
 		"query_buffer", "query_pipeline_state",
 		"query_dag_status",
 		"ingest_plan", "analyze_plan",
+		"self_diagnostic",
 	}
+}
+
+type orchestratorDiag struct{ o *Orchestrator }
+
+func (d *orchestratorDiag) AgentName() string  { return "orchestrator" }
+func (d *orchestratorDiag) SessionID() string  { return "" }
+func (d *orchestratorDiag) LogsDir() string    { return shared.LogsDirForAgent(d.o.steering.SessionDir(), "orchestrator") }
+func (d *orchestratorDiag) EventLogger() *agentlog.SessionEventLogger { return d.o.steering.EventLogger() }
+func (d *orchestratorDiag) RecoveryHints() []string                   { return nil }
+
+func (d *orchestratorDiag) PeerLogsDirs() map[string]string {
+	sessionDir := d.o.steering.SessionDir()
+	if sessionDir == "" {
+		return nil
+	}
+	peers := make(map[string]string)
+	for _, name := range []string{"engineer", "designer", "inspector_pipeline", "tester_pipeline"} {
+		dir := shared.LogsDirForAgent(sessionDir, name)
+		if dir != "" {
+			peers[name] = dir
+		}
+	}
+	return peers
+}
+
+func (d *orchestratorDiag) AgentSpecificDiagnostics() map[string]any {
+	d.o.mu.RLock()
+	defer d.o.mu.RUnlock()
+	result := map[string]any{
+		"running": d.o.running,
+	}
+	if d.o.dagBridge != nil {
+		result["dag_bridge_active"] = true
+	}
+	return result
 }
 
 func queryTaskSkill(o *Orchestrator) *skills.Skill {

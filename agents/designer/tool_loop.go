@@ -68,6 +68,13 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request, 
 		}
 		// ── END STEERING ──
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, d.config.DesignerConfig.MaxToolRuns, req); zone == shared.ZoneCritical {
+				return "", shared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
 
 		resp, err := p.Complete(ctx, req)
@@ -79,6 +86,10 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request, 
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
 			}
 			return "", fmt.Errorf("designer llm: %w", err)
+		}
+
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
 		}
 
 		d.accumulateUsage(resp)
@@ -192,6 +203,9 @@ func (d *Designer) applyToolCalls(
 				lm.AgentID, lm.SessionID, lm.CorrID, "info",
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
+		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,
@@ -274,7 +288,7 @@ func (d *Designer) recordTurn(
 		return
 	}
 
-	contextSize := estimateContextSize(req.Messages)
+	contextSize := shared.EstimateContextSize(req.Messages)
 
 	d.handoffBridge.RecordTurn(handoff.TurnRecord{
 		InputTokens:      resp.Usage.InputTokens,
@@ -291,12 +305,3 @@ func (d *Designer) recordTurn(
 	})
 }
 
-// estimateContextSize approximates total context tokens from accumulated messages.
-// Uses ~4 characters per token plus overhead per message, matching core/llm/context.go.
-func estimateContextSize(messages []providers.Message) int {
-	total := 0
-	for _, msg := range messages {
-		total += len(msg.Content)/4 + 4
-	}
-	return total
-}

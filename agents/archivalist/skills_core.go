@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -25,6 +27,10 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Register(briefingSkill(a))
 	a.skills.Register(routeToSkill(a))
 	a.skills.Register(replyToSkill(a))
+	a.skills.Register(shared.NewSelfDiagnosticSkill(&archivalistDiag{a: a}))
+	if a.logIngest != nil {
+		a.skills.Register(queryAgentLogsSkill(a.logIngest))
+	}
 	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "archivalist",
 		SessionID: func() string { return a.defaultSessionID },
@@ -36,6 +42,23 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Load("briefing")
 	a.skills.Load("route_to")
 	a.skills.Load("reply_to")
+}
+
+type archivalistDiag struct{ a *Archivalist }
+
+func (d *archivalistDiag) AgentName() string                              { return "archivalist" }
+func (d *archivalistDiag) SessionID() string                              { return d.a.defaultSessionID }
+func (d *archivalistDiag) LogsDir() string                                { return "" }
+func (d *archivalistDiag) EventLogger() *agentlog.SessionEventLogger      { return nil }
+func (d *archivalistDiag) PeerLogsDirs() map[string]string                { return nil }
+func (d *archivalistDiag) RecoveryHints() []string                        { return nil }
+
+func (d *archivalistDiag) AgentSpecificDiagnostics() map[string]any {
+	result := map[string]any{}
+	if d.a.logIngest != nil {
+		result["ingest_store_stats"] = d.a.logIngest.Stats()
+	}
+	return result
 }
 
 func (a *Archivalist) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {

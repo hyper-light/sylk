@@ -23,10 +23,6 @@ type RetrievalResult struct {
 
 // RetrievalOptions configures the retrieval
 type RetrievalOptions struct {
-	// FTS options
-	FTSLimit int  // Max results from full-text search
-	UseFTS   bool // Enable full-text search
-
 	// Embedding options
 	EmbeddingLimit int     // Max results from embedding search
 	UseEmbeddings  bool    // Enable embedding search
@@ -45,8 +41,6 @@ type RetrievalOptions struct {
 // DefaultRetrievalOptions returns sensible defaults
 func DefaultRetrievalOptions() RetrievalOptions {
 	return RetrievalOptions{
-		FTSLimit:       50,
-		UseFTS:         true,
 		EmbeddingLimit: 50,
 		UseEmbeddings:  true,
 		MinSimilarity:  0.5,
@@ -147,30 +141,11 @@ func (sr *SemanticRetriever) Retrieve(ctx context.Context, query string, opts Re
 }
 
 func (sr *SemanticRetriever) collectRetrievalResults(ctx context.Context, query string, opts RetrievalOptions) ([]*RetrievalResult, error) {
-	results := sr.gatherResults(ctx, query, opts)
-	results, err := sr.applyFTSSearch(ctx, results, query, opts)
-	if err != nil {
-		return nil, err
+	var results []*RetrievalResult
+	if sr.agentContext != nil {
+		results = sr.searchAgentContext(query, opts)
 	}
 	return sr.applyEmbeddingSearch(ctx, results, query, opts)
-}
-
-func (sr *SemanticRetriever) gatherResults(ctx context.Context, query string, opts RetrievalOptions) []*RetrievalResult {
-	if sr.agentContext == nil {
-		return nil
-	}
-	return sr.searchAgentContext(query, opts)
-}
-
-func (sr *SemanticRetriever) applyFTSSearch(ctx context.Context, results []*RetrievalResult, query string, opts RetrievalOptions) ([]*RetrievalResult, error) {
-	if !opts.UseFTS || sr.db == nil {
-		return results, nil
-	}
-	ftsResults, err := sr.searchFTS(ctx, query, opts)
-	if err != nil {
-		return nil, fmt.Errorf("FTS search failed: %w", err)
-	}
-	return append(results, ftsResults...), nil
 }
 
 func (sr *SemanticRetriever) applyEmbeddingSearch(ctx context.Context, results []*RetrievalResult, query string, opts RetrievalOptions) ([]*RetrievalResult, error) {
@@ -279,104 +254,6 @@ func (sr *SemanticRetriever) matchFile(query string, file *FileState) *Retrieval
 		ID: file.Path, Content: formatFileContent(file),
 		Score: score, Source: "memory", Category: "file", Type: "file",
 	}
-}
-
-// ftsQueryBuilder constructs FTS5 queries
-type ftsQueryBuilder struct {
-	sql  string
-	args []any
-}
-
-func newFTSQueryBuilder(ftsQuery string) *ftsQueryBuilder {
-	return &ftsQueryBuilder{
-		sql: `SELECT rc.id, rc.content, rc.category, rc.type, rc.metadata, bm25(content_fts) as score
-			FROM content_fts JOIN retrieval_content rc ON content_fts.rowid = rc.rowid
-			WHERE content_fts MATCH ?`,
-		args: []any{ftsQuery},
-	}
-}
-
-func (b *ftsQueryBuilder) addCategoryFilter(categories []string) {
-	if len(categories) == 0 {
-		return
-	}
-	b.addInFilter("rc.category", categories)
-}
-
-func (b *ftsQueryBuilder) addTypeFilter(types []string) {
-	if len(types) == 0 {
-		return
-	}
-	b.addInFilter("rc.type", types)
-}
-
-func (b *ftsQueryBuilder) addInFilter(column string, values []string) {
-	placeholders := make([]string, len(values))
-	for i, v := range values {
-		placeholders[i] = "?"
-		b.args = append(b.args, v)
-	}
-	b.sql += fmt.Sprintf(" AND %s IN (%s)", column, strings.Join(placeholders, ","))
-}
-
-func (b *ftsQueryBuilder) addSessionFilter(sessionID string) {
-	if sessionID == "" {
-		return
-	}
-	b.sql += " AND rc.session_id = ?"
-	b.args = append(b.args, sessionID)
-}
-
-func (b *ftsQueryBuilder) finalize(limit int) (string, []any) {
-	b.sql += " ORDER BY score LIMIT ?"
-	b.args = append(b.args, limit)
-	return b.sql, b.args
-}
-
-// searchFTS performs FTS5 search
-func (sr *SemanticRetriever) searchFTS(ctx context.Context, query string, opts RetrievalOptions) ([]*RetrievalResult, error) {
-	if sr.db == nil {
-		return nil, nil
-	}
-
-	builder := newFTSQueryBuilder(buildFTSQuery(query))
-	builder.addCategoryFilter(opts.Categories)
-	builder.addTypeFilter(opts.Types)
-	builder.addSessionFilter(opts.SessionID)
-	sqlQuery, args := builder.finalize(opts.FTSLimit)
-
-	return sr.executeFTSQuery(ctx, sqlQuery, args)
-}
-
-func (sr *SemanticRetriever) executeFTSQuery(ctx context.Context, query string, args []any) ([]*RetrievalResult, error) {
-	rows, err := sr.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []*RetrievalResult
-	for rows.Next() {
-		if r, err := sr.scanFTSRow(rows); err != nil {
-			return nil, err
-		} else {
-			results = append(results, r)
-		}
-	}
-	return results, nil
-}
-
-func (sr *SemanticRetriever) scanFTSRow(rows *sql.Rows) (*RetrievalResult, error) {
-	r := &RetrievalResult{Source: "fts"}
-	var metadataJSON sql.NullString
-	if err := rows.Scan(&r.ID, &r.Content, &r.Category, &r.Type, &metadataJSON, &r.Score); err != nil {
-		return nil, err
-	}
-	if metadataJSON.Valid {
-		json.Unmarshal([]byte(metadataJSON.String), &r.Metadata)
-	}
-	r.Score = 1.0 / (1.0 - r.Score)
-	return r, nil
 }
 
 // searchEmbeddings performs semantic search via embeddings
@@ -565,21 +442,6 @@ func (sr *SemanticRetriever) Delete(ctx context.Context, id string) error {
 }
 
 // Helper functions
-
-func buildFTSQuery(query string) string {
-	// Tokenize and build OR query with prefix matching
-	tokens := strings.Fields(query)
-	var parts []string
-	for _, t := range tokens {
-		// Escape special characters
-		t = strings.ReplaceAll(t, "\"", "")
-		t = strings.ReplaceAll(t, "'", "")
-		if len(t) > 0 {
-			parts = append(parts, fmt.Sprintf("%s*", t)) // Prefix matching
-		}
-	}
-	return strings.Join(parts, " OR ")
-}
 
 func deduplicateResults(results []*RetrievalResult) []*RetrievalResult {
 	seen := make(map[string]bool)

@@ -9,13 +9,9 @@ import (
 	"time"
 )
 
-func TestRestorePlanFromFile_ReadyPlanRestored(t *testing.T) {
+func TestPlanStore_RestorePlanFromFile_ReadyPlanRestored(t *testing.T) {
 	dir := t.TempDir()
-	a := &Architect{
-		config:      Config{WorkingDirectory: dir},
-		activePlans: map[string]*DesignPlan{},
-		logger:      slog.Default(),
-	}
+	lm := NewPlanLeaseManager(10*time.Second, 5*time.Minute)
 
 	now := time.Now()
 	plan := DesignPlan{
@@ -28,7 +24,7 @@ func TestRestorePlanFromFile_ReadyPlanRestored(t *testing.T) {
 		LeaseExpiry: now.Add(28 * time.Minute),
 	}
 
-	planDir := a.planStoreDir(plan.SessionID)
+	planDir := filepath.Join(dir, ".sylk", "sessions", plan.SessionID, "agents", "architect", "plans")
 	if err := os.MkdirAll(planDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -41,20 +37,12 @@ func TestRestorePlanFromFile_ReadyPlanRestored(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cutoff := now.Add(-24 * time.Hour)
-	ok, err := a.restorePlanFromFile(planPath, cutoff)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected Ready plan to be restored, but was skipped")
-	}
+	store := NewPlanStore(dir, lm, slog.Default())
+	defer store.Close()
 
-	a.activePlansMu.RLock()
-	restored := a.activePlans[plan.ID]
-	a.activePlansMu.RUnlock()
+	restored := store.Get(plan.ID)
 	if restored == nil {
-		t.Fatal("plan not found in activePlans after restore")
+		t.Fatal("plan not found in store after restore")
 	}
 	if restored.SM().State() != PlanStatusReady {
 		t.Errorf("expected Ready state, got %s", restored.SM().State())
@@ -68,13 +56,9 @@ func TestRestorePlanFromFile_ReadyPlanRestored(t *testing.T) {
 	}
 }
 
-func TestRestorePlanFromFile_ExecutingPlanRestored(t *testing.T) {
+func TestPlanStore_RestorePlanFromFile_ExecutingPlanRestored(t *testing.T) {
 	dir := t.TempDir()
-	a := &Architect{
-		config:      Config{WorkingDirectory: dir},
-		activePlans: map[string]*DesignPlan{},
-		logger:      slog.Default(),
-	}
+	lm := NewPlanLeaseManager(10*time.Second, 5*time.Minute)
 
 	now := time.Now()
 	plan := DesignPlan{
@@ -88,7 +72,7 @@ func TestRestorePlanFromFile_ExecutingPlanRestored(t *testing.T) {
 		LeaseHolder: "orchestrator",
 	}
 
-	planDir := a.planStoreDir(plan.SessionID)
+	planDir := filepath.Join(dir, ".sylk", "sessions", plan.SessionID, "agents", "architect", "plans")
 	if err := os.MkdirAll(planDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -101,20 +85,12 @@ func TestRestorePlanFromFile_ExecutingPlanRestored(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cutoff := now.Add(-24 * time.Hour)
-	ok, err := a.restorePlanFromFile(planPath, cutoff)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected Executing plan to be restored, but was skipped")
-	}
+	store := NewPlanStore(dir, lm, slog.Default())
+	defer store.Close()
 
-	a.activePlansMu.RLock()
-	restored := a.activePlans[plan.ID]
-	a.activePlansMu.RUnlock()
+	restored := store.Get(plan.ID)
 	if restored == nil {
-		t.Fatal("plan not found in activePlans after restore")
+		t.Fatal("plan not found in store after restore")
 	}
 	if restored.SM().State() != PlanStatusExecuting {
 		t.Errorf("expected Executing state, got %s", restored.SM().State())
@@ -124,17 +100,11 @@ func TestRestorePlanFromFile_ExecutingPlanRestored(t *testing.T) {
 	}
 }
 
-func TestRestorePlanFromFile_TerminalPlansSkipped(t *testing.T) {
+func TestPlanStore_RestorePlanFromFile_TerminalPlansSkipped(t *testing.T) {
 	dir := t.TempDir()
-	a := &Architect{
-		config:      Config{WorkingDirectory: dir},
-		activePlans: map[string]*DesignPlan{},
-		logger:      slog.Default(),
-	}
+	lm := NewPlanLeaseManager(10*time.Second, 5*time.Minute)
 
 	now := time.Now()
-	cutoff := now.Add(-24 * time.Hour)
-
 	terminal := []PlanStatus{
 		PlanStatusFailed,
 		PlanStatusCompleted,
@@ -149,46 +119,24 @@ func TestRestorePlanFromFile_TerminalPlansSkipped(t *testing.T) {
 			UpdatedAt: now,
 			CreatedAt: now,
 		}
-		planDir := a.planStoreDir(plan.SessionID)
-		if err := os.MkdirAll(planDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		payload, err := json.MarshalIndent(&plan, "", "  ")
-		if err != nil {
-			t.Fatal(err)
-		}
+		planDir := filepath.Join(dir, ".sylk", "sessions", plan.SessionID, "agents", "architect", "plans")
+		_ = os.MkdirAll(planDir, 0o755)
+		payload, _ := json.MarshalIndent(&plan, "", "  ")
 		planPath := filepath.Join(planDir, plan.ID+".json")
-		if err := os.WriteFile(planPath, payload, 0o644); err != nil {
-			t.Fatal(err)
-		}
-
-		ok, err := a.restorePlanFromFile(planPath, cutoff)
-		if err != nil {
-			t.Fatalf("%s: unexpected error: %v", status, err)
-		}
-		if ok {
-			t.Errorf("%s: expected terminal plan to be skipped", status)
-		}
-		if _, err := os.Stat(planPath); !os.IsNotExist(err) {
-			t.Errorf("%s: expected terminal plan file to be deleted", status)
-		}
+		_ = os.WriteFile(planPath, payload, 0o644)
 	}
 
-	a.activePlansMu.RLock()
-	count := len(a.activePlans)
-	a.activePlansMu.RUnlock()
-	if count != 0 {
-		t.Errorf("expected 0 active plans after terminal restores, got %d", count)
+	store := NewPlanStore(dir, lm, slog.Default())
+	defer store.Close()
+
+	if store.Count() != 0 {
+		t.Errorf("expected 0 active plans after terminal restores, got %d", store.Count())
 	}
 }
 
-func TestRestorePlanFromFile_StalePlanSkipped(t *testing.T) {
+func TestPlanStore_RestorePlanFromFile_StalePlanSkipped(t *testing.T) {
 	dir := t.TempDir()
-	a := &Architect{
-		config:      Config{WorkingDirectory: dir},
-		activePlans: map[string]*DesignPlan{},
-		logger:      slog.Default(),
-	}
+	lm := NewPlanLeaseManager(10*time.Second, 5*time.Minute)
 
 	old := time.Now().Add(-48 * time.Hour)
 	plan := DesignPlan{
@@ -198,25 +146,16 @@ func TestRestorePlanFromFile_StalePlanSkipped(t *testing.T) {
 		UpdatedAt: old,
 		CreatedAt: old,
 	}
-	planDir := a.planStoreDir(plan.SessionID)
-	if err := os.MkdirAll(planDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	payload, err := json.MarshalIndent(&plan, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
+	planDir := filepath.Join(dir, ".sylk", "sessions", plan.SessionID, "agents", "architect", "plans")
+	_ = os.MkdirAll(planDir, 0o755)
+	payload, _ := json.MarshalIndent(&plan, "", "  ")
 	planPath := filepath.Join(planDir, plan.ID+".json")
-	if err := os.WriteFile(planPath, payload, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	_ = os.WriteFile(planPath, payload, 0o644)
 
-	cutoff := time.Now().Add(-24 * time.Hour)
-	ok, err := a.restorePlanFromFile(planPath, cutoff)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ok {
+	store := NewPlanStore(dir, lm, slog.Default())
+	defer store.Close()
+
+	if store.Get("plan-stale") != nil {
 		t.Error("expected stale plan to be skipped")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -59,6 +60,13 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 		// ── END STEERING ──
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, gi.config.MaxToolRuns, req); zone == agentShared.ZoneCritical {
+				return "", agentShared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
 		resp, err := p.Complete(ctx, req)
 		agentShared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
@@ -71,9 +79,14 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 			return "", fmt.Errorf("global inspector llm: %w", err)
 		}
 
+		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+
 		shared.AccumulateUsage(ctx, &resp.Usage)
 
 		if len(resp.ToolCalls) == 0 {
+			gi.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -101,6 +114,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 
 		errCount, rerouted := gi.applyToolCalls(ctx, req, resp)
+		gi.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -162,6 +176,9 @@ func (gi *GlobalInspector) applyToolCalls(
 				lm.AgentID, lm.SessionID, lm.CorrID, "info",
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
 		}
+		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
+		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,
@@ -203,4 +220,30 @@ func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.T
 
 func (gi *GlobalInspector) buildToolDefinitions() []providers.Tool {
 	return shared.BuildToolDefinitions(gi.skills.GetLoaded())
+}
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (gi *GlobalInspector) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if gi.handoffBridge == nil {
+		return
+	}
+
+	gi.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      agentShared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
 }

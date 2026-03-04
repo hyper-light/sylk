@@ -16,9 +16,6 @@ var (
 	ErrSpecMountPathEmpty      = errors.New("mount path must not be empty")
 	ErrSpecVolumeNameEmpty     = errors.New("volume name must not be empty")
 	ErrSpecVolumeNameDuplicate = errors.New("duplicate volume name detected")
-	ErrSpecNoMainContainers    = errors.New("pod must have at least one main container")
-	ErrSpecContainerNameDup    = errors.New("duplicate container name in pod")
-	ErrSpecMountUnknownVolume  = errors.New("mount references unknown volume")
 	ErrSpecProbeInvalid        = errors.New("probe has invalid configuration")
 	ErrSpecGracefulStopNeg     = errors.New("graceful stop duration must not be negative")
 )
@@ -115,73 +112,6 @@ func validateGracefulStop(d time.Duration) error {
 	return nil
 }
 
-// ValidatePodSpec validates a pod specification.
-func ValidatePodSpec(spec *PodSpec) error {
-	if err := validatePodIdentity(spec); err != nil {
-		return err
-	}
-	if err := validatePodContainers(spec); err != nil {
-		return err
-	}
-	if err := validatePodVolumes(spec); err != nil {
-		return err
-	}
-	return validatePodMountRefs(spec)
-}
-
-func validatePodIdentity(spec *PodSpec) error {
-	if strings.TrimSpace(spec.Name) == "" {
-		return ErrSpecNameEmpty
-	}
-	return nil
-}
-
-func validatePodContainers(spec *PodSpec) error {
-	if len(spec.MainContainers) == 0 {
-		return ErrSpecNoMainContainers
-	}
-	names := make(map[string]struct{}, spec.ContainerCount())
-	for _, cs := range spec.AllContainerSpecs() {
-		if err := ValidateContainerSpec(&cs); err != nil {
-			return fmt.Errorf("container %q: %w", cs.Name, err)
-		}
-		if _, exists := names[cs.Name]; exists {
-			return fmt.Errorf("%w: %s", ErrSpecContainerNameDup, cs.Name)
-		}
-		names[cs.Name] = struct{}{}
-	}
-	return nil
-}
-
-func validatePodVolumes(spec *PodSpec) error {
-	names := make(map[string]struct{}, len(spec.Volumes))
-	for _, v := range spec.Volumes {
-		if strings.TrimSpace(v.Name) == "" {
-			return ErrSpecVolumeNameEmpty
-		}
-		if _, exists := names[v.Name]; exists {
-			return fmt.Errorf("%w: %s", ErrSpecVolumeNameDuplicate, v.Name)
-		}
-		names[v.Name] = struct{}{}
-	}
-	return nil
-}
-
-func validatePodMountRefs(spec *PodSpec) error {
-	volumes := make(map[string]struct{}, len(spec.Volumes))
-	for _, v := range spec.Volumes {
-		volumes[v.Name] = struct{}{}
-	}
-	for _, cs := range spec.AllContainerSpecs() {
-		for _, m := range cs.Mounts {
-			if _, exists := volumes[m.Name]; !exists {
-				return fmt.Errorf("container %q: %w: %s", cs.Name, ErrSpecMountUnknownVolume, m.Name)
-			}
-		}
-	}
-	return nil
-}
-
 // DefaultContainerSpec applies sensible defaults to a container spec.
 func DefaultContainerSpec(spec *ContainerSpec) {
 	if spec.GracefulStop == 0 {
@@ -222,26 +152,3 @@ const (
 	defaultProbeTimeout          = 5 * time.Second
 )
 
-// DefaultPodSpec applies sensible defaults to a pod spec.
-func DefaultPodSpec(spec *PodSpec) {
-	if spec.TerminationGracePeriod == 0 {
-		spec.TerminationGracePeriod = defaultPodTerminationGrace
-	}
-	if spec.Labels == nil {
-		spec.Labels = make(map[string]string)
-	}
-	if spec.Annotations == nil {
-		spec.Annotations = make(map[string]string)
-	}
-	for i := range spec.InitContainers {
-		DefaultContainerSpec(&spec.InitContainers[i])
-	}
-	for i := range spec.MainContainers {
-		DefaultContainerSpec(&spec.MainContainers[i])
-	}
-	for i := range spec.SidecarContainers {
-		DefaultContainerSpec(&spec.SidecarContainers[i])
-	}
-}
-
-const defaultPodTerminationGrace = 30 * time.Second

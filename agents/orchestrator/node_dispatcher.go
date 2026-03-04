@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/google/uuid"
 )
@@ -27,10 +28,10 @@ type ACKResult struct {
 // to pipeline agents via the EventBus with a two-phase ACK protocol.
 //
 // Per-node activation: each dispatched node atomically activates its agent
-// (HoldActive), registers it with the Guide, and acquires a demotion guard
+// (HoldPodActive), registers it with the Guide, and acquires a demotion guard
 // via the PipelinePod. Guards are released on node completion or DAG cleanup.
 //
-// When the pod is nil, the dispatcher falls back to EnsureActive on the
+// When the pod is nil, the dispatcher falls back to EnsurePodActive on the
 // activator (best-effort activation without demotion guards).
 type BusNodeDispatcher struct {
 	bus        guide.EventBus
@@ -38,8 +39,8 @@ type BusNodeDispatcher struct {
 	sessionID  string
 	dagID      string
 	buffers    *BufferRegistry
-	activator  guide.AgentActivator // fallback when pod is nil
-	pod        *PipelinePod         // per-node guard lifecycle manager
+	activator  guide.PodActivator // fallback when pod is nil
+	pod        *shared.AgentPod     // per-node guard lifecycle manager
 	ackTimeout time.Duration
 	pending    sync.Map // nodeID → chan *dag.NodeResult
 	dispatchDone sync.Map // nodeID → chan struct{}
@@ -56,9 +57,9 @@ var _ dag.NodeDispatcher = (*BusNodeDispatcher)(nil)
 //
 // The pod is the preferred activation path — it acquires demotion guards,
 // registers with the Guide, and provides full observability. When pod is
-// nil, the dispatcher falls back to activator.EnsureActive (best-effort,
+// nil, the dispatcher falls back to activator.EnsurePodActive (best-effort,
 // no demotion guards). Both may be nil for test scenarios.
-func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, buffers *BufferRegistry, activator guide.AgentActivator, pod *PipelinePod) *BusNodeDispatcher {
+func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, buffers *BufferRegistry, activator guide.PodActivator, pod *shared.AgentPod) *BusNodeDispatcher {
 	return &BusNodeDispatcher{
 		bus:        bus,
 		agentID:    agentID,
@@ -201,12 +202,12 @@ func (d *BusNodeDispatcher) extractACKResult(msg *guide.Message) *ACKResult {
 
 // activateAgents ensures the target agent and co-agents are active before
 // dispatch. Uses the PipelinePod (preferred) for per-node demotion guards
-// with full observability, falling back to EnsureActive when no pod is
+// with full observability, falling back to EnsurePodActive when no pod is
 // available.
 func (d *BusNodeDispatcher) activateAgents(ctx context.Context, node *dag.Node) error {
 	// Preferred path: pod manages guard lifecycle with observability.
 	if d.pod != nil {
-		return d.pod.HoldForNode(ctx, node.ID(), node)
+		return d.pod.HoldForNode(ctx, node.ID(), NodeAgentTypes(node))
 	}
 
 	// Fallback: best-effort activation without demotion guards.
@@ -214,11 +215,13 @@ func (d *BusNodeDispatcher) activateAgents(ctx context.Context, node *dag.Node) 
 		return nil
 	}
 
-	if err := d.activator.EnsureActive(ctx, node.AgentType()); err != nil {
+	podID := d.activator.PodForAgent(node.AgentType())
+	if err := d.activator.EnsurePodActive(ctx, podID); err != nil {
 		return fmt.Errorf("activate %s for node %s: %w", node.AgentType(), node.ID(), err)
 	}
 	for _, co := range node.CoAgents() {
-		if err := d.activator.EnsureActive(ctx, co); err != nil {
+		coPodID := d.activator.PodForAgent(co)
+		if err := d.activator.EnsurePodActive(ctx, coPodID); err != nil {
 			return fmt.Errorf("activate co-agent %s for node %s: %w", co, node.ID(), err)
 		}
 	}

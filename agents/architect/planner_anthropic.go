@@ -543,6 +543,10 @@ func (p *anthropicPlanner) streamRequest(
 		}
 		return nil
 	})
+	// Flush any remaining thought content that didn't trigger an emission.
+	if thought := emitter.flush(); thought != "" {
+		emitPlannerThought(ctx, stage, thought)
+	}
 	if err != nil {
 		// If the stream was interrupted but we accumulated partial text,
 		// treat it as a truncated result rather than discarding the work.
@@ -646,6 +650,10 @@ func (p *anthropicPlanner) streamRequestFull(
 		}
 		return nil
 	})
+	// Flush any remaining thought content that didn't trigger an emission.
+	if thought := emitter.flush(); thought != "" {
+		emitPlannerThought(ctx, stage, thought)
+	}
 
 	architectDebugLog().Debug("stream_full: STREAM_DONE",
 		"stage", stage,
@@ -902,6 +910,17 @@ func (e *thoughtEmitter) addDelta(delta string) string {
 	}
 	e.buffer.WriteString(delta)
 	if !e.shouldEmit(delta) {
+		return ""
+	}
+	e.lastEmitLen = e.buffer.Len()
+	return strings.TrimSpace(e.buffer.String())
+}
+
+// flush returns the final buffer snapshot if any content remains unEmitted
+// since the last addDelta emission. Call after the thinking block ends to
+// deliver the tail of the thought.
+func (e *thoughtEmitter) flush() string {
+	if !e.hasCallback || e.buffer.Len() == 0 || e.buffer.Len() == e.lastEmitLen {
 		return ""
 	}
 	e.lastEmitLen = e.buffer.Len()

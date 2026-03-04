@@ -209,6 +209,13 @@ func (sm *SteeringManager) EventLogger() *agentlog.SessionEventLogger {
 	return sm.eventLogger
 }
 
+// SessionDir returns the bound session directory, or "" if unbound.
+func (sm *SteeringManager) SessionDir() string {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	return sm.sessionDir
+}
+
 // Create creates and registers a new steering ledger for the given correlation.
 // Automatically passes the shared journal and activity publisher if initialized.
 func (sm *SteeringManager) Create(

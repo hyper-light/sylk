@@ -7,22 +7,48 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
 
 func (l *Librarian) registerCoreSkills() {
-	l.skills.Register(searchCodebaseSkill(l))
-	l.skills.Register(findPatternSkill(l))
+	// Domain-specific search skills (use SearchHandler when available).
+	if l.searchHandler != nil {
+		l.skills.Register(searchCodebaseSkill(l))
+		l.skills.Register(findPatternSkill(l))
+		l.skills.Register(locateSymbolSkill(l))
+	}
 	l.skills.Register(assessHealthSkill(l))
 	l.skills.Register(queryStructureSkill(l))
-	l.skills.Register(locateSymbolSkill(l))
+
+	// Codebase exploration tools (always available).
+	l.skills.Register(readFileSkill(l))
+	l.skills.Register(globSkill(l))
+	l.skills.Register(grepSkill(l))
+	l.skills.Register(gitSkill(l))
+	l.skills.Register(lspSkill(l))
+	l.skills.Register(astGrepSearchSkill(l))
+
+	// Infrastructure skills.
+	l.skills.Register(shared.NewSelfDiagnosticSkill(&librarianDiag{}))
 	l.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "librarian",
 		SessionID: func() string { return "" },
 		Publish:   l.publishRerouteRequest,
 	}))
 }
+
+type librarianDiag struct{}
+
+func (d *librarianDiag) AgentName() string                              { return "librarian" }
+func (d *librarianDiag) SessionID() string                              { return "" }
+func (d *librarianDiag) LogsDir() string                                { return "" }
+func (d *librarianDiag) EventLogger() *agentlog.SessionEventLogger      { return nil }
+func (d *librarianDiag) PeerLogsDirs() map[string]string                { return nil }
+func (d *librarianDiag) RecoveryHints() []string                        { return nil }
+func (d *librarianDiag) AgentSpecificDiagnostics() map[string]any       { return map[string]any{} }
 
 func (l *Librarian) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
 	if l.bus == nil {

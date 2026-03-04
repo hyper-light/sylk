@@ -596,6 +596,17 @@ func (m *IndexManager) IsOpen() bool {
 	return m.index != nil && !m.closed
 }
 
+// RawIndex returns the underlying bleve.Index for direct query access.
+// Returns nil if the index is not open. The caller must not close it.
+func (m *IndexManager) RawIndex() bleve.Index {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return nil
+	}
+	return m.index
+}
+
 // Path returns the filesystem path of the index.
 func (m *IndexManager) Path() string {
 	return m.config.Path

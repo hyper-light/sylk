@@ -72,6 +72,18 @@ var agentModelTable = map[string][]ModelEntry{
 		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
 		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
 	},
+	"librarian": {
+		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6"},
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+	},
+	"archivalist": {
+		{ID: "claude-sonnet-4-6", DisplayName: "Claude Sonnet 4.6"},
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+	},
+	"academic": {
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+	},
 }
 
 // DefaultModelForAgentType returns the default model ID for the given agent type.

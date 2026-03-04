@@ -30,7 +30,7 @@ func TestActivateAgents_WithPod(t *testing.T) {
 	}
 
 	if got := act.holdCount(); got != 1 {
-		t.Errorf("expected 1 HoldActive call, got %d", got)
+		t.Errorf("expected 1 HoldPodActive call, got %d", got)
 	}
 	if got := reg.callCount(); got != 1 {
 		t.Errorf("expected 1 registrar call, got %d", got)
@@ -65,7 +65,7 @@ func TestActivateAgents_WithPod_CoAgents(t *testing.T) {
 
 	// engineer + designer + inspector-pipeline = 3
 	if got := act.holdCount(); got != 3 {
-		t.Errorf("expected 3 HoldActive calls, got %d: %v", got, act.calledTypes())
+		t.Errorf("expected 3 HoldPodActive calls, got %d: %v", got, act.calledTypes())
 	}
 	if got := reg.callCount(); got != 3 {
 		t.Errorf("expected 3 registrar calls, got %d", got)
@@ -178,7 +178,7 @@ func TestReleaseAllGuards_DelegatesToPod(t *testing.T) {
 func TestActivateAgents_FallbackWithoutPod(t *testing.T) {
 	act := &trackingActivator{}
 
-	// No pod — falls back to activator.EnsureActive.
+	// No pod — falls back to activator.EnsurePodActive.
 	d := NewBusNodeDispatcher(nil, "orch", "sess", "dag1", nil, act, nil)
 
 	node := dag.NewNode(dag.NodeConfig{
@@ -192,9 +192,9 @@ func TestActivateAgents_FallbackWithoutPod(t *testing.T) {
 		t.Fatalf("activateAgents with nil pod: %v", err)
 	}
 
-	// Fallback uses EnsureActive, not HoldActive.
+	// Fallback uses EnsurePodActive, not HoldPodActive.
 	if got := act.holdCount(); got != 0 {
-		t.Errorf("expected 0 HoldActive calls (fallback uses EnsureActive), got %d", got)
+		t.Errorf("expected 0 HoldPodActive calls (fallback uses EnsurePodActive), got %d", got)
 	}
 }
 

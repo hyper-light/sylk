@@ -104,6 +104,12 @@ type Guardian struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *shared.RequestSerializer
+
+	// Handoff bridge for context-aware handoff.
+	handoffBridge *handoff.HandoffBridge
+
+	// Agent pod for Scribe feed.
+	agentPod *shared.AgentPod
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +193,7 @@ func (g *Guardian) initSkills() {
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = guardianCoreSkillNames()
-	loaderCfg.AutoLoadDomains = []string{"safety", "validation", "health", "gate"}
+	loaderCfg.AutoLoadDomains = []string{"safety", "validation", "health", "gate", "observability", "system"}
 	g.skillLoader = skills.NewLoader(g.skills, loaderCfg)
 
 	g.registerCoreSkills()
@@ -225,6 +231,16 @@ func (g *Guardian) Descriptor() handoff.AgentDescriptor {
 		ContextWindow: 8192,
 		Category:      handoff.CategoryStandalone,
 	}
+}
+
+// SetAgentPod injects the agent pod for Scribe feed integration.
+func (g *Guardian) SetAgentPod(pod *shared.AgentPod) {
+	g.agentPod = pod
+}
+
+// SetHandoffBridge stores the bridge for handoff context tracking.
+func (g *Guardian) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	g.handoffBridge = bridge
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +337,21 @@ func (g *Guardian) SupportedModels() []container.ModelOption {
 // ---------------------------------------------------------------------------
 // Deferred Git Wiring
 // ---------------------------------------------------------------------------
+
+// SetObservabilityDeps wires observability dependencies after construction.
+// Called in Phase 3, after activation and daemon controllers are available.
+// Nil arguments are silently ignored.
+func (g *Guardian) SetObservabilityDeps(ac ActivationQuerier, am ActivationMetricsQuerier, dc DaemonQuerier) {
+	if ac != nil {
+		g.config.ActivationController = ac
+	}
+	if am != nil {
+		g.config.ActivationMetrics = am
+	}
+	if dc != nil {
+		g.config.DaemonController = dc
+	}
+}
 
 // SetGitSubsystems wires git dependencies after construction. Called in
 // Phase 3 (initial boot — git goroutine just completed) or from the factory
@@ -583,6 +614,9 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		AgentID:     g.id,
 		SessionID:   fwd.SessionID,
 	})
+	reqCtx = shared.WithContextGovernor(reqCtx, shared.NewContextGovernor(
+		DefaultGuardianModel, DefaultMaxOutputTokens, 0,
+	))
 
 	// Publish stream start.
 	g.publishStreamStart(reqCtx, fwd.CorrelationID)
@@ -617,6 +651,9 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		g.publishStreamComplete(reqCtx, fwd.CorrelationID, text, nil)
 	}
 
+	if g.agentPod != nil {
+		g.agentPod.FeedScribe("guardian", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 	return g.bus.Publish(g.channels.Responses, newResponseMessage(fwd.CorrelationID, g.id, resp))
 }
 

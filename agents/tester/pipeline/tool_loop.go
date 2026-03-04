@@ -10,6 +10,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -56,8 +57,15 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		}
 		// ── END STEERING ──
 
+		// ── CONTEXT GOVERNOR ──
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			if zone := gov.BeginTurn(ctx, turn, pt.config.MaxToolRuns, req); zone == shared.ZoneCritical {
+				return "", shared.ErrContextBudgetExhausted
+			}
+		}
+
 		turnStart := time.Now()
-		resp, err := pt.provider.Complete(ctx, req)
+		resp, err := pt.getProvider().Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -68,12 +76,17 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 			return "", fmt.Errorf("pipeline tester llm: %w", err)
 		}
 
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
+			gov.Calibrate(ctx, resp, req.Messages)
+		}
+
 		if len(resp.ToolCalls) == 0 {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.TestSuitePayload{Phase: "tool_loop_completed"})
 			}
+			pt.recordTurn(req, resp, turn, 0, 0, turnStart)
 			return strings.TrimSpace(resp.Content), nil
 		}
 
@@ -96,6 +109,7 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		}
 
 		errCount, rerouted := pt.applyToolCalls(ctx, req, resp)
+		pt.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -157,6 +171,9 @@ func (pt *PipelineTester) applyToolCalls(
 			shared.LogAgentEvent(lm.EventLogger, shared.ToolNameToEventType(call.Name),
 				lm.AgentID, lm.SessionID, lm.CorrID, "info",
 				&agentlog.ToolPayload{ToolName: call.Name, Success: !isError})
+		}
+		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
+			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -231,3 +248,29 @@ func (pt *PipelineTester) buildToolDefinitions() []providers.Tool {
 
 // Tool loop helpers (marshalToolOutput, toolErrorPayload, coerceMap,
 // detectToolCallDuplicate, updateToolErrors) are in agents/shared/toolloop.go.
+
+// recordTurn feeds the handoff bridge with turn metrics from this LLM call.
+func (pt *PipelineTester) recordTurn(
+	req *providers.Request,
+	resp *providers.Response,
+	turn, toolCalls, errCount int,
+	turnStart time.Time,
+) {
+	if pt.handoffBridge == nil {
+		return
+	}
+
+	pt.handoffBridge.RecordTurn(handoff.TurnRecord{
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		ContextSize:      shared.EstimateContextSize(req.Messages),
+		ToolCalls:        toolCalls,
+		ToolSuccesses:    toolCalls - errCount,
+		TurnNumber:       turn + 1,
+		Duration:         time.Since(turnStart),
+		Timestamp:        time.Now(),
+		StopReason:       resp.StopReason,
+		CacheReadTokens:  resp.Usage.CacheReadTokens,
+		CacheWriteTokens: resp.Usage.CacheWriteTokens,
+	})
+}

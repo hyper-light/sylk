@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/container/pod"
 )
 
 // IdleMonitor periodically scans activation entries and demotes idle
@@ -129,8 +130,8 @@ func (im *IdleMonitor) evaluateEntry(ctx context.Context, entry *ActivationEntry
 	if err := im.controller.DemoteTo(ctx, entry.AgentType, targetTier); err != nil {
 		im.logger.Warn("idle demotion failed",
 			"agent_type", entry.AgentType,
-			"from_tier", tier.String(),
-			"target_tier", targetTier.String(),
+			"from_tier", pod.TierString(tier),
+			"target_tier", pod.TierString(targetTier),
 			"error", err,
 		)
 	}

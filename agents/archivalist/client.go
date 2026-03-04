@@ -3,10 +3,10 @@ package archivalist
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 const (
@@ -16,36 +16,31 @@ const (
 	// DefaultMaxOutputTokens for summary generation
 	DefaultMaxOutputTokens = 8192
 
-	// ModelSonnet45 is the model identifier for Claude Sonnet 4.5
+	// ModelSonnet45 is the model identifier for Claude Sonnet 4.6
 	ModelSonnet45 = "claude-sonnet-4-6"
 )
 
-// Client wraps the Anthropic SDK for summary generation
+// Client wraps a provider for summary generation
 type Client struct {
-	anthropic       anthropic.Client
+	provider        archivalistProvider
+	model           string
 	systemPrompt    string
-	maxOutputTokens int64
+	maxOutputTokens int
 }
 
 // ClientConfig configures the AI client
 type ClientConfig struct {
-	AnthropicAPIKey string
+	Provider        archivalistProvider
+	Model           string
 	SystemPrompt    string
 	MaxOutputTokens int
 }
 
 // NewClient creates a new AI client for summary generation
-func NewClient(cfg ClientConfig) (*Client, error) {
-	opts := []option.RequestOption{}
-	if cfg.AnthropicAPIKey != "" {
-		opts = append(opts, option.WithAPIKey(cfg.AnthropicAPIKey))
-	}
-
-	client := anthropic.NewClient(opts...)
-
-	maxTokens := int64(DefaultMaxOutputTokens)
+func NewClient(cfg ClientConfig) *Client {
+	maxTokens := DefaultMaxOutputTokens
 	if cfg.MaxOutputTokens > 0 {
-		maxTokens = int64(cfg.MaxOutputTokens)
+		maxTokens = cfg.MaxOutputTokens
 	}
 
 	systemPrompt := cfg.SystemPrompt
@@ -53,14 +48,20 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		systemPrompt = DefaultSystemPrompt
 	}
 
+	model := cfg.Model
+	if model == "" {
+		model = ModelSonnet45
+	}
+
 	return &Client{
-		anthropic:       client,
+		provider:        cfg.Provider,
+		model:           model,
 		systemPrompt:    systemPrompt,
 		maxOutputTokens: maxTokens,
-	}, nil
+	}
 }
 
-// GenerateSummary creates a summary using Claude Sonnet 4.5
+// GenerateSummary creates a summary using the configured provider
 func (c *Client) GenerateSummary(ctx context.Context, content string) (*GeneratedSummary, error) {
 	prompt := FormatSummaryPrompt(content)
 	return c.generate(ctx, prompt, nil)
@@ -72,7 +73,6 @@ func (c *Client) GenerateSummaryFromSubmissions(ctx context.Context, submissions
 		return nil, fmt.Errorf("no submissions provided")
 	}
 
-	// Build content from submissions
 	var content string
 	var sourceIDs []string
 
@@ -92,41 +92,31 @@ func (c *Client) GenerateSummaryFromSubmissions(ctx context.Context, submissions
 	return c.generate(ctx, prompt, sourceIDs)
 }
 
-// generate performs the actual API call to Claude Sonnet 4.5
+// generate performs the actual LLM call via the provider
 func (c *Client) generate(ctx context.Context, prompt string, sourceIDs []string) (*GeneratedSummary, error) {
-	message, err := c.anthropic.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.Model(ModelSonnet45),
-		MaxTokens: c.maxOutputTokens,
-		System: []anthropic.TextBlockParam{
-			{Text: c.systemPrompt},
-		},
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
-		},
+	if c.provider == nil {
+		return nil, fmt.Errorf("client: no LLM provider configured")
+	}
+
+	resp, err := c.provider.Complete(ctx, &providers.Request{
+		SystemPrompt: c.systemPrompt,
+		Model:        c.model,
+		MaxTokens:    c.maxOutputTokens,
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate summary: %w", err)
 	}
 
-	// Extract text content from response
-	var responseContent string
-	for _, block := range message.Content {
-		if block.Type == "text" {
-			responseContent += block.Text
-		}
-	}
-
-	tokensUsed := int(message.Usage.InputTokens + message.Usage.OutputTokens)
-
 	return &GeneratedSummary{
-		Content:    responseContent,
+		Content:    strings.TrimSpace(resp.Content),
 		SourceIDs:  sourceIDs,
 		CreatedAt:  time.Now(),
-		TokensUsed: tokensUsed,
+		TokensUsed: resp.Usage.InputTokens + resp.Usage.OutputTokens,
 	}, nil
 }
 
-// GeneratedSummary represents a summary created by Sonnet 4.5
+// GeneratedSummary represents a summary created by the LLM
 type GeneratedSummary struct {
 	ID         string    `json:"id"`
 	Content    string    `json:"content"`
