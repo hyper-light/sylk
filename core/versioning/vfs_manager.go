@@ -38,6 +38,7 @@ type VFSManager interface {
 	CleanupSession(sessionID SessionID) error
 	CleanupStaging(pipelineID string) error
 
+	Stats() VFSManagerStats
 	Close() error
 }
 

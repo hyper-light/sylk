@@ -56,6 +56,26 @@ func ContextGovernorFromContext(ctx context.Context) *ContextGovernor {
 	return gov
 }
 
+// ApplyContextBudget checks context governor zones and the safety ceiling,
+// stripping tools when context pressure reaches Red or turn reaches maxRuns.
+// Returns ErrContextBudgetExhausted if the context is critically full.
+// Must be called before each LLM call.
+func ApplyContextBudget(ctx context.Context, turn, maxRuns int, req *providers.Request) error {
+	if gov := ContextGovernorFromContext(ctx); gov != nil {
+		zone := gov.BeginTurn(ctx, turn, maxRuns, req)
+		switch {
+		case zone == ZoneCritical:
+			return ErrContextBudgetExhausted
+		case zone >= ZoneRed:
+			req.Tools = nil // context pressure — force synthesis
+		}
+	}
+	if turn == maxRuns {
+		req.Tools = nil // safety ceiling — force synthesis
+	}
+	return nil
+}
+
 // Initialize computes the fixed overhead (system prompt + tool definitions)
 // and marks the governor as ready. Called once per request.
 func (g *ContextGovernor) Initialize(req *providers.Request) {

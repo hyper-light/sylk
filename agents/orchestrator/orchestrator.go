@@ -402,6 +402,18 @@ func (o *Orchestrator) CloseSessionVFS(sessionID string) error {
 	return svfs.Close()
 }
 
+// AllSessionVFS returns a snapshot of all active SessionVFS instances.
+// Used by the Guardian for cross-session VFS observability.
+func (o *Orchestrator) AllSessionVFS() []*versioning.SessionVFS {
+	o.sessionVFSMu.RLock()
+	defer o.sessionVFSMu.RUnlock()
+	result := make([]*versioning.SessionVFS, 0, len(o.sessionVFS))
+	for _, svfs := range o.sessionVFS {
+		result = append(result, svfs)
+	}
+	return result
+}
+
 // SignalReady marks bootstrap as complete, unblocking the LLM event loop.
 // No-op when the LLM is disabled (bootGate is nil). Idempotent.
 func (o *Orchestrator) SignalReady() {
@@ -419,7 +431,7 @@ func applyConfigDefaults(cfg Config) Config {
 		cfg.MaxOutputTokens = 2048
 	}
 	if cfg.MaxToolRuns == 0 {
-		cfg.MaxToolRuns = 8
+		cfg.MaxToolRuns = 32
 	}
 	if cfg.LLMTimeout == 0 {
 		cfg.LLMTimeout = 90 * time.Second

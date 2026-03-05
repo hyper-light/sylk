@@ -275,7 +275,7 @@ type InspectorState struct {
 // Named constants for pipeline inspector defaults.
 const (
 	pipelineDefaultModel            = "claude-opus-4-6"
-	pipelineDefaultMaxToolRuns      = 12
+	pipelineDefaultMaxToolRuns      = 32
 	pipelineDefaultMaxTokens        = 16384
 	pipelineDefaultTimeout          = 90 * time.Second
 	pipelineDefaultMaxFeedbackLoops = 3
@@ -319,7 +319,7 @@ func DefaultPipelineInspectorConfig() PipelineInspectorConfig {
 // Named constants for global inspector defaults.
 const (
 	globalDefaultModel        = "claude-opus-4-6"
-	globalDefaultMaxToolRuns  = 16
+	globalDefaultMaxToolRuns  = 32
 	globalDefaultMaxTokens    = 16384
 	globalDefaultTimeout      = 120 * time.Second
 	globalDefaultAuditTimeout = 180 * time.Second

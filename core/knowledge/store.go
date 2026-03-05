@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 )
 
@@ -59,9 +61,10 @@ type KnowledgeStore struct {
 	bgWaiter  BackgroundIndexWaiter
 	closeable io.Closer // bleve store closer, set by caller
 
-	publisher ReadinessPublisher
-	logger    *slog.Logger
-	closeOnce sync.Once
+	publisher  ReadinessPublisher
+	logger     *slog.Logger
+	bootLogger *agentlog.BootEventLogger // nil-safe structured logger
+	closeOnce  sync.Once
 }
 
 // NewKnowledgeStore creates a store with an empty coordinator (nil searchers).
@@ -82,6 +85,31 @@ func NewKnowledgeStore(publisher ReadinessPublisher, logger *slog.Logger) *Knowl
 // Coordinator returns the single coordinator instance. Never nil after construction.
 func (ks *KnowledgeStore) Coordinator() *query.HybridQueryCoordinator {
 	return ks.coordinator
+}
+
+// SetBootLogger sets the structured event logger for knowledge lifecycle events.
+func (ks *KnowledgeStore) SetBootLogger(l *agentlog.BootEventLogger) {
+	ks.mu.Lock()
+	ks.bootLogger = l
+	ks.mu.Unlock()
+}
+
+// logKnowledge emits a structured knowledge event. No-op if bootLogger is nil.
+func (ks *KnowledgeStore) logKnowledge(eventType agentlog.EventType, level string, data any) {
+	ks.mu.Lock()
+	l := ks.bootLogger
+	ks.mu.Unlock()
+	if l == nil {
+		return
+	}
+	l.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     "boot",
+		Event:     eventType.String(),
+		EventCode: eventType,
+		Data:      data,
+	})
 }
 
 // Level returns the current readiness level.
@@ -111,6 +139,9 @@ func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter
 	close(ks.partialReady)
 
 	ks.publishEvent(ReadinessPartial)
+	ks.logKnowledge(agentlog.EventKnowledgePromotePartial, "info", &agentlog.BootPhasePayload{
+		Phase: "promote_partial",
+	})
 	ks.logger.Info("knowledge promoted to partial",
 		"searchers", ks.coordinator.ReadySearchers())
 }
@@ -126,6 +157,9 @@ func (ks *KnowledgeStore) PromoteFull() {
 	}
 
 	ks.publishEvent(ReadinessFull)
+	ks.logKnowledge(agentlog.EventKnowledgePromoteFull, "info", &agentlog.BootPhasePayload{
+		Phase: "promote_full",
+	})
 	ks.logger.Info("knowledge promoted to full",
 		"searchers", ks.coordinator.ReadySearchers())
 }
@@ -163,6 +197,16 @@ func (ks *KnowledgeStore) Close() error {
 			if e := ks.closeable.Close(); e != nil {
 				err = e
 			}
+		}
+
+		if ks.bootLogger != nil {
+			ks.bootLogger.LogEvent(agentlog.JSONLEntry{
+				Timestamp: time.Now(),
+				Level:     "info",
+				Agent:     "boot",
+				Event:     agentlog.EventKnowledgeClosed.String(),
+				EventCode: agentlog.EventKnowledgeClosed,
+			})
 		}
 	})
 	return err

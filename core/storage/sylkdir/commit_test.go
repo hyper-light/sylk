@@ -92,7 +92,7 @@ func setupCommitEnv(t *testing.T) (*SylkDir, *GlobalMeta, *CanonicalKeyIndex, *S
 func TestCommitToGlobal(t *testing.T) {
 	sd, gm, canonIdx, sess := setupCommitEnv(t)
 
-	result, err := CommitToGlobal(CommitConfig{
+	result, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:        sess,
 		SylkDir:        sd,
 		GlobalMeta:     gm,
@@ -233,7 +233,7 @@ func TestCommitToGlobalSupersession(t *testing.T) {
 	globalNodeStore.Close()
 	canonIdx.Set("file:main.go", 100)
 
-	result, err := CommitToGlobal(CommitConfig{
+	result, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:        sess,
 		SylkDir:        sd,
 		GlobalMeta:     gm,
@@ -335,7 +335,7 @@ func TestCommitToGlobalDuplicate(t *testing.T) {
 	sd, gm, canonIdx, sess := setupCommitEnv(t)
 
 	// First commit succeeds
-	_, err := CommitToGlobal(CommitConfig{
+	_, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:        sess,
 		SylkDir:        sd,
 		GlobalMeta:     gm,
@@ -346,7 +346,7 @@ func TestCommitToGlobalDuplicate(t *testing.T) {
 	}
 
 	// Second commit should fail (session already committed)
-	_, err = CommitToGlobal(CommitConfig{
+	_, err = CommitToGlobal(context.Background(), CommitConfig{
 		Session:        sess,
 		SylkDir:        sd,
 		GlobalMeta:     gm,
@@ -387,7 +387,7 @@ func TestCommitToGlobalMultipleSessions(t *testing.T) {
 		{ID: 1, CanonicalKey: "file:a.go", Name: "a.go", CreatedAt: now, SessionID: 1},
 	})
 
-	r1, err := CommitToGlobal(CommitConfig{
+	r1, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session: sess1, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 	})
 	if err != nil {
@@ -410,7 +410,7 @@ func TestCommitToGlobalMultipleSessions(t *testing.T) {
 		{ID: 10, CanonicalKey: "file:b.go", Name: "b.go", CreatedAt: now, SessionID: 2},
 	})
 
-	r2, err := CommitToGlobal(CommitConfig{
+	r2, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session: sess2, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 	})
 	if err != nil {
@@ -433,7 +433,7 @@ func TestCommitToGlobalMultipleSessions(t *testing.T) {
 		{ID: 20, CanonicalKey: "file:a.go", Name: "a.go", CreatedAt: now, SessionID: 3},
 	})
 
-	r3, err := CommitToGlobal(CommitConfig{
+	r3, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session: sess3, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 	})
 	if err != nil {
@@ -554,7 +554,7 @@ func TestCommitToGlobalOrphanDetection(t *testing.T) {
 		{SourceID: 1, TargetID: 4, Type: uint8(EdgeTypeContains), Weight: 1.0, SessionID: 1, CreatedAt: now, UpdatedAt: now},
 	})
 
-	r1, err := CommitToGlobal(CommitConfig{
+	r1, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session: sess1, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 	})
 	if err != nil {
@@ -586,7 +586,7 @@ func TestCommitToGlobalOrphanDetection(t *testing.T) {
 		// OldHelper is NOT included — it was removed from the file
 	})
 
-	r2, err := CommitToGlobal(CommitConfig{
+	r2, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session: sess2, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 	})
 	if err != nil {
@@ -689,7 +689,7 @@ func TestCommitToGlobalFileDeletion(t *testing.T) {
 		{ID: 5, CanonicalKey: "symbol:src/util.go:Util:type", Domain: 0, NodeType: uint8(NodeTypeType), Name: "Util", Path: "src/util.go", CreatedAt: now, SessionID: 1},
 	})
 
-	_, err := CommitToGlobal(CommitConfig{
+	_, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session: sess1, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 	})
 	if err != nil {
@@ -710,7 +710,7 @@ func TestCommitToGlobalFileDeletion(t *testing.T) {
 		{ID: 11, CanonicalKey: "symbol:src/main.go:Run:function", Domain: 0, NodeType: uint8(NodeTypeFunction), Name: "Run", Path: "src/main.go", CreatedAt: now, SessionID: 2},
 	})
 
-	r2, err := CommitToGlobal(CommitConfig{
+	r2, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:    sess2,
 		SylkDir:    sd,
 		GlobalMeta: gm,
@@ -796,7 +796,7 @@ func TestCommitToGlobalScopeRootsNoFalsePositives(t *testing.T) {
 		{ID: 2, CanonicalKey: "file:lib/helper.go", Domain: 0, NodeType: uint8(NodeTypeFile), Name: "helper.go", Path: "lib/helper.go", CreatedAt: now, SessionID: 1},
 	})
 
-	_, err := CommitToGlobal(CommitConfig{
+	_, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session: sess1, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 	})
 	if err != nil {
@@ -816,7 +816,7 @@ func TestCommitToGlobalScopeRootsNoFalsePositives(t *testing.T) {
 		{ID: 10, CanonicalKey: "file:src/main.go", Domain: 0, NodeType: uint8(NodeTypeFile), Name: "main.go", Path: "src/main.go", CreatedAt: now, SessionID: 2},
 	})
 
-	r2, err := CommitToGlobal(CommitConfig{
+	r2, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:    sess2,
 		SylkDir:    sd,
 		GlobalMeta: gm,
@@ -855,7 +855,7 @@ func setupCommitEnvWithBleve(t *testing.T) (*SylkDir, *GlobalMeta, *CanonicalKey
 func TestCommitToGlobalBleveIndexing(t *testing.T) {
 	sd, gm, canonIdx, sess, gvbs := setupCommitEnvWithBleve(t)
 
-	result, err := CommitToGlobal(CommitConfig{
+	result, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:          sess,
 		SylkDir:          sd,
 		GlobalMeta:       gm,
@@ -925,7 +925,7 @@ func TestCommitToGlobalBleveSupersession(t *testing.T) {
 	}
 
 	// Commit session — node 1 supersedes node 100 on "file:main.go".
-	result, err := CommitToGlobal(CommitConfig{
+	result, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:          sess,
 		SylkDir:          sd,
 		GlobalMeta:       gm,
@@ -955,7 +955,7 @@ func TestCommitToGlobalBleveNil(t *testing.T) {
 	sd, gm, canonIdx, sess := setupCommitEnv(t)
 
 	// GlobalBleveStore is nil — should not panic or error.
-	result, err := CommitToGlobal(CommitConfig{
+	result, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:          sess,
 		SylkDir:          sd,
 		GlobalMeta:       gm,
@@ -978,7 +978,7 @@ func TestCommitToGlobalBleveSearchable(t *testing.T) {
 	sd, gm, canonIdx, sess, gvbs := setupCommitEnvWithBleve(t)
 
 	// The session has a doc with Content: "package main" (from setupCommitEnv).
-	result, err := CommitToGlobal(CommitConfig{
+	result, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:          sess,
 		SylkDir:          sd,
 		GlobalMeta:       gm,
@@ -1064,7 +1064,7 @@ func TestCommitToGlobalClosesSessionBleve(t *testing.T) {
 		t.Fatalf("Index into session Bleve: %v", err)
 	}
 
-	_, err := CommitToGlobal(CommitConfig{
+	_, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:          sess,
 		SylkDir:          sd,
 		GlobalMeta:       gm,
@@ -1084,7 +1084,7 @@ func TestCommitToGlobalClosesSessionBleve(t *testing.T) {
 func TestCommitToGlobalFileLayout(t *testing.T) {
 	sd, gm, canonIdx, sess := setupCommitEnv(t)
 
-	result, err := CommitToGlobal(CommitConfig{
+	result, err := CommitToGlobal(context.Background(), CommitConfig{
 		Session:        sess,
 		SylkDir:        sd,
 		GlobalMeta:     gm,

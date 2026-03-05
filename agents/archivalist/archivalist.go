@@ -71,6 +71,7 @@ type Archivalist struct {
 	memoryScorer      *memory.MemoryWeightedScorer
 	hybridMemory      *memory.HybridQueryWithMemory
 	crossAgentWeights *CrossAgentWeightManager
+	spacingAnalyzer   *memory.SpacingAnalyzer
 
 	bus            guide.EventBus
 	channels       *guide.AgentChannels
@@ -248,7 +249,7 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
 	skillsLoaderCfg.CoreSkills = []string{"store", "query", "briefing"}
-	skillsLoaderCfg.AutoLoadDomains = []string{"memory", "chronicle"}
+	skillsLoaderCfg.AutoLoadDomains = []string{"memory", "chronicle", "knowledge"}
 	skillLoader := skills.NewLoader(skillsRegistry, skillsLoaderCfg)
 
 	// Create hook registry
@@ -344,6 +345,7 @@ func (a *Archivalist) initRAG(cfg Config) error {
 		}
 		a.memoryScorer = mi.scorer
 		a.hybridMemory = mi.hybrid
+		a.spacingAnalyzer = memory.NewSpacingAnalyzer(memory.DefaultTargetRetention)
 	}
 
 	// Create semantic retriever
@@ -542,13 +544,8 @@ func (a *Archivalist) handleKnowledgeReady(msg *guide.Message) error {
 		"level", payload.Level,
 		"searchers", payload.Searchers,
 	)
-	if a.activityPub != nil {
-		a.activityPub.PublishActivity(&events.ActivityEvent{
-			AgentID:   a.id,
-			EventType: events.EventTypeAgentAction,
-			Content:   fmt.Sprintf("knowledge ready: searchers %v", payload.Searchers),
-		})
-	}
+	a.publishSystemEvent(events.EventTypeAgentAction,
+		fmt.Sprintf("knowledge ready: searchers %v", payload.Searchers))
 	return nil
 }
 
@@ -709,6 +706,20 @@ func (a *Archivalist) publishActivity(eventType events.EventType, content string
 	evt := events.NewActivityEvent(eventType, a.defaultSessionID, content)
 	evt.AgentID = a.id
 	evt.Visibility = events.VisibilityUser
+	evt.Data["agent_type"] = "archivalist"
+	evt.Data["agent_name"] = "Archivalist"
+	a.activityPub.PublishActivity(evt)
+}
+
+// publishSystemEvent emits a system-level activity event for telemetry.
+// System events are recorded but do not change the UI panel status.
+func (a *Archivalist) publishSystemEvent(eventType events.EventType, content string) {
+	if a.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, a.defaultSessionID, content)
+	evt.AgentID = a.id
+	evt.Visibility = events.VisibilitySystem
 	evt.Data["agent_type"] = "archivalist"
 	evt.Data["agent_name"] = "Archivalist"
 	a.activityPub.PublishActivity(evt)

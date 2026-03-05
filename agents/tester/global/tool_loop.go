@@ -67,11 +67,9 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		}
 		// ── END STEERING ──
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, gt.config.MaxToolRuns, req); zone == agentshared.ZoneCritical {
-				return "", agentshared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := agentshared.ApplyContextBudget(ctx, turn, gt.config.MaxToolRuns, req); err != nil {
+			return "", err
 		}
 
 		turnStart := time.Now()
@@ -100,14 +98,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if turn == gt.config.MaxToolRuns {
-			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", gt.config.MaxToolRuns)})
-			}
-			return "", fmt.Errorf("global tester exceeded tool-call limit (%d)", gt.config.MaxToolRuns)
-		}
+
 
 		if dup, sig := detectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {

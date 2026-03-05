@@ -61,7 +61,7 @@ func DefaultConfig() Config {
 		Model:              "gemini-3-flash-preview",
 		MaxOutputTokens:    2048,
 		Temperature:        0.3,
-		MaxToolRuns:        8,
+		MaxToolRuns:        32,
 		LLMTimeout:         90 * time.Second,
 		AgentID:            "orchestrator",
 		HealthConfig:       DefaultHealthConfig(),

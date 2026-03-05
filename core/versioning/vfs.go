@@ -640,6 +640,27 @@ func (v *PipelineVFS) GetSessionID() SessionID {
 	return v.config.SessionID
 }
 
+// ResetOverlay clears all staged content, deleted paths, modifications,
+// base versions, and working content. Used after a disk flush when the
+// overlay is no longer needed (disk is source of truth).
+func (v *PipelineVFS) ResetOverlay() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.stagedContent = make(map[string][]byte)
+	v.deletedPaths = make(map[string]bool)
+	v.modifications = make(map[string]*FileModification)
+	v.baseVersions = make(map[string]VersionID)
+	v.workingContent = make(map[string][]byte)
+}
+
+// NewGlobalVFS creates a PipelineVFS for use as the session-scoped global overlay.
+// It passes nil for versionStore/blobStore since global VFS operates purely as
+// an overlay on top of disk, not through the old CVS version DAG.
+func NewGlobalVFS(cfg VFSConfig) *PipelineVFS {
+	return NewPipelineVFS(cfg, nil, nil)
+}
+
 func (v *PipelineVFS) Close() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()

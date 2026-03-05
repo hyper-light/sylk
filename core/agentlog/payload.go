@@ -274,3 +274,57 @@ type FlakyPayload struct {
 	CaseName string `json:"case_name"`
 	Evidence string `json:"evidence,omitempty"`
 }
+
+// ── Boot/Ingestion payloads ─────────────────────────────────────────────────
+
+// BootPhasePayload records boot pipeline phase timing.
+type BootPhasePayload struct {
+	Phase       string `json:"phase"`
+	DurNs       int64  `json:"dur_ns"`
+	IsIncr      bool   `json:"is_incr,omitempty"`
+	ProjectRoot string `json:"project_root,omitempty"`
+	Err         string `json:"err,omitempty"`
+}
+
+// BootResultPayload records overall boot outcome.
+type BootResultPayload struct {
+	Files    int64  `json:"files"`
+	Nodes    int64  `json:"nodes"`
+	Edges    int64  `json:"edges"`
+	Docs     int64  `json:"docs"`
+	Vectors  int64  `json:"vectors"`
+	DurNs    int64  `json:"dur_ns"`
+	Embedder string `json:"embedder"`
+	Version  string `json:"version,omitempty"`
+}
+
+// IngestPhasePayload records ingestion sub-phase metrics.
+type IngestPhasePayload struct {
+	Phase     string `json:"phase"`
+	DurNs     int64  `json:"dur_ns"`
+	FileCount int    `json:"file_count,omitempty"`
+	SymCount  int    `json:"sym_count,omitempty"`
+	LineCount int    `json:"line_count,omitempty"`
+	ByteCount int64  `json:"byte_count,omitempty"`
+	Errors    int    `json:"errors,omitempty"`
+}
+
+// CommitPhasePayload records commit phase metrics.
+type CommitPhasePayload struct {
+	Phase        string  `json:"phase"`
+	DurNs        int64   `json:"dur_ns,omitempty"`
+	NodesMerged  int     `json:"nodes_merged,omitempty"`
+	EdgesMerged  int     `json:"edges_merged,omitempty"`
+	DocsIndexed  int     `json:"docs_indexed,omitempty"`
+	OrphanedKeys int     `json:"orphaned_keys,omitempty"`
+	TombstoneRat float64 `json:"tombstone_ratio,omitempty"`
+	Version      string  `json:"version,omitempty"`
+}
+
+// BgIndexPayload records background indexer events.
+type BgIndexPayload struct {
+	Phase   string `json:"phase"`
+	Indexed int64  `json:"indexed,omitempty"`
+	Total   int64  `json:"total,omitempty"`
+	DurNs   int64  `json:"dur_ns,omitempty"`
+}

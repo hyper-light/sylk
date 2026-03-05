@@ -60,11 +60,9 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 		// ── END STEERING ──
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := agentShared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, gi.config.MaxToolRuns, req); zone == agentShared.ZoneCritical {
-				return "", agentShared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := agentShared.ApplyContextBudget(ctx, turn, gi.config.MaxToolRuns, req); err != nil {
+			return "", err
 		}
 
 		turnStart := time.Now()
@@ -95,14 +93,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if turn == gi.config.MaxToolRuns {
-			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", gi.config.MaxToolRuns)})
-			}
-			return "", fmt.Errorf("global inspector exceeded tool-call limit (%d)", gi.config.MaxToolRuns)
-		}
+
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {

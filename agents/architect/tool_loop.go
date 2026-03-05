@@ -145,11 +145,9 @@ func (a *Architect) executeToolLoop(
 			"messages_detail", strings.Join(msgSummary, " | "),
 			"tools_count", len(req.Tools))
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, maxRuns, req); zone == shared.ZoneCritical {
-				return "", shared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
+			return "", err
 		}
 
 		a.logInfo("executeToolLoop: LLM call",
@@ -248,14 +246,7 @@ func (a *Architect) executeToolLoop(
 			"turn", turn,
 			"tools", strings.Join(respToolNames, ","))
 
-		if turn == maxRuns {
-			a.logWarn("executeToolLoop: tool-call limit exceeded",
-				"stage", stage, "max_runs", maxRuns)
-			a.logDebug("tool_loop: TOOL_LIMIT_EXCEEDED",
-				"stage", stage, "max_runs", maxRuns,
-				"total_elapsed", time.Since(loopStart).String())
-			return "", fmt.Errorf("architect exceeded tool-call limit (%d)", maxRuns)
-		}
+
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			a.logWarn("executeToolLoop: duplicate tool call detected",

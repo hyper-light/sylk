@@ -116,7 +116,7 @@ func TestLiveScopeAwareOrphan(t *testing.T) {
 			t.Fatalf("IngestCodeGraph: %v", err)
 		}
 
-		result, err := CommitToGlobal(CommitConfig{
+		result, err := CommitToGlobal(context.Background(), CommitConfig{
 			Session:        sess,
 			SylkDir:        sd,
 			GlobalMeta:     gm,

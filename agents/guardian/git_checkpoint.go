@@ -197,7 +197,7 @@ func (cm *CheckpointManager) publishDirtyWarning(count int) {
 	evt := events.NewActivityEvent(events.EventTypeAgentDecision, "default",
 		fmt.Sprintf("High dirty file count: %d files (threshold: %d)", count, cm.dirtyThreshold))
 	evt.AgentID = "guardian"
-	evt.Visibility = events.VisibilityUser
+	evt.Visibility = events.VisibilitySystem
 	evt.Data["dirty_count"] = count
 	evt.Data["threshold"] = cm.dirtyThreshold
 	cm.activityPub.PublishActivity(evt)
@@ -210,7 +210,7 @@ func (cm *CheckpointManager) publishCheckpointActivity(record CheckpointRecord) 
 	evt := events.NewActivityEvent(events.EventTypeAgentAction, "default",
 		fmt.Sprintf("Safety checkpoint #%d created (%d files)", record.Seq, record.FileCount))
 	evt.AgentID = "guardian"
-	evt.Visibility = events.VisibilityUser
+	evt.Visibility = events.VisibilitySystem
 	evt.Data["checkpoint_seq"] = record.Seq
 	evt.Data["file_count"] = record.FileCount
 	cm.activityPub.PublishActivity(evt)

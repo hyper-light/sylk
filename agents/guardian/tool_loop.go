@@ -25,7 +25,6 @@ func (g *Guardian) executeToolLoop(
 	ledger *steering.SteeringLedger,
 ) (string, error) {
 	maxRuns := g.config.MaxToolRuns
-	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	consecutiveErrors := 0
 
 	provider := g.getProvider()
@@ -72,7 +71,6 @@ func (g *Guardian) executeToolLoop(
 				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
 			}
 			turn = cp.Turn
-			seen = make(map[shared.ToolCallSignature]int, maxRuns)
 			consecutiveErrors = 0
 			continue
 		}
@@ -89,17 +87,20 @@ func (g *Guardian) executeToolLoop(
 			g.toolDefsDirty = false
 		}
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, maxRuns, req); zone == shared.ZoneCritical {
-				return "", shared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
+			return "", err
 		}
 
 		turnStart := time.Now()
 		resp, err := provider.Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			// User interrupt (Ctrl+C / Esc) cancels reqCtx via steering —
+			// treat as clean abort, not an error worth logging.
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -127,26 +128,6 @@ func (g *Guardian) executeToolLoop(
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if turn == maxRuns {
-			g.logWarn("executeToolLoop: tool-call limit exceeded", "stage", stage, "max_runs", maxRuns)
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", maxRuns)})
-			}
-			return "", fmt.Errorf("guardian exceeded tool-call limit (%d)", maxRuns)
-		}
-
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
-			g.logWarn("executeToolLoop: duplicate tool call", "stage", stage, "tool", sig.Name)
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
-			}
-			return "", fmt.Errorf("guardian repeated tool call: %s", sig.Name)
-		}
-
 		errCount, rerouted := g.applyToolCalls(ctx, req, resp)
 		g.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
@@ -163,12 +144,8 @@ func (g *Guardian) executeToolLoop(
 		}
 	}
 
-	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-		shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-			lm.AgentID, lm.SessionID, lm.CorrID, "error",
-			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
-	}
-	return "", fmt.Errorf("guardian exhausted tool-call loop")
+	g.logWarn("executeToolLoop: loop exhausted, falling back to deterministic report", "stage", stage)
+	return g.generateHealthReport()
 }
 
 // applyToolCalls appends assistant message and tool results to the request.

@@ -176,11 +176,48 @@ func NewActivationController(cfg ActivationControllerConfig) (*ActivationControl
 	return ac, nil
 }
 
-// Start launches the idle monitor and pressure evaluator.
+// Start launches the idle monitor, pressure evaluator, and pre-warms
+// entries that have PreWarmOnStartup set.
 func (ac *ActivationController) Start(budget *concurrency.GoroutineBudget, quota *container.ResourceQuota) error {
 	ac.pressure = NewPressureEvaluator(budget, quota, PressureConfig{})
 	ac.idle = NewIdleMonitor(ac, ac.scope, 0)
-	return ac.idle.Start()
+	if err := ac.idle.Start(); err != nil {
+		return err
+	}
+	ac.warmStartupEntries()
+	return nil
+}
+
+// warmStartupEntries launches pre-warm activations for entries with
+// PreWarmOnStartup. Daemon entries are skipped — they are created by
+// DaemonSetController and adopted via AdoptContainer.
+func (ac *ActivationController) warmStartupEntries() {
+	for _, entry := range ac.allEntries() {
+		if !entry.Policy.PreWarmOnStartup || entry.Policy.IsDaemon {
+			continue
+		}
+		if entry.LoadTier() >= TierWarm {
+			continue
+		}
+		entry := entry
+		_ = ac.scope.Go("startup-warm-"+entry.AgentType, 0, func(ctx context.Context) error {
+			if !entry.Tier.CompareAndSwap(int32(TierCold), int32(TierCool)) {
+				return nil
+			}
+			c, err := ac.runtime.CreateContainer(ctx, entry.Spec)
+			if err != nil {
+				entry.StoreTier(TierCold)
+				ac.logger.Warn("startup pre-warm failed",
+					"agent_type", entry.AgentType, "error", err)
+				return nil
+			}
+			entry.Container.Store(c)
+			entry.StoreTier(TierWarm)
+			entry.TouchActivity()
+			ac.logger.Info("startup pre-warm complete", "agent_type", entry.AgentType)
+			return nil
+		})
+	}
 }
 
 // EnsureActive guarantees a container of the given type is in TierHot.

@@ -735,6 +735,7 @@ func (m *Message) GetAgentAnnouncement() (*AgentAnnouncement, bool) {
 func NewAgentReadyMessage(id string, info *AgentRoutingInfo) *Message {
 	announcement := &AgentAnnouncement{
 		AgentID:   info.ID,
+		AgentType: info.Type,
 		AgentName: info.Name,
 		Aliases:   info.Aliases,
 		Channels:  NewAgentChannels(info.Type, info.ID),

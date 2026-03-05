@@ -15,7 +15,7 @@ import (
 const (
 	DefaultGuardianModel       = "gpt-5.3-codex"
 	DefaultMaxOutputTokens     = 8192
-	DefaultMaxToolRuns         = 8
+	DefaultMaxToolRuns         = 32
 	DefaultCheckpointInterval  = 10 * time.Minute
 	DefaultDirtyThreshold      = 20
 	DefaultHealthCheckInterval = 15 * time.Second
@@ -65,7 +65,7 @@ type Config struct {
 	VFSManager           VFSManagerQuerier
 
 	// Tool dispatch loop.
-	MaxToolRuns int // Maximum tool-call turns per conversation. Defaults to DefaultMaxToolRuns (8).
+	MaxToolRuns int // Safety ceiling for tool-call turns. Context governor is the real budget. Defaults to DefaultMaxToolRuns (32).
 
 	// RequestGuard is called at handler entry to prevent activation demotion
 	// during in-flight processing. Returns a release function. Nil-safe.

@@ -38,13 +38,15 @@ type CVSQuerier interface {
 // CVSStatsSnapshot mirrors versioning.CVSStats without importing the
 // versioning package.
 type CVSStatsSnapshot struct {
-	TotalFiles        int64 `json:"total_files"`
-	TotalVersions     int64 `json:"total_versions"`
-	TotalOperations   int64 `json:"total_operations"`
-	ActivePipelines   int64 `json:"active_pipelines"`
-	ActiveVariants    int64 `json:"active_variants"`
-	ActiveLocks       int64 `json:"active_locks"`
-	ActiveSubscribers int64 `json:"active_subscribers"`
+	TotalFiles        int64  `json:"total_files"`
+	TotalVersions     int64  `json:"total_versions"`
+	TotalOperations   int64  `json:"total_operations"`
+	ActivePipelines   int64  `json:"active_pipelines"`
+	ActiveVariants    int64  `json:"active_variants"`
+	ActiveLocks       int64  `json:"active_locks"`
+	ActiveSubscribers int64  `json:"active_subscribers"`
+	CurrentVersion    string `json:"current_version,omitempty"`
+	WALEntries        int64  `json:"wal_entries,omitempty"`
 }
 
 // VFSManagerQuerier provides read-only access to VFS manager metrics.

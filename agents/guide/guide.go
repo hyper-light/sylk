@@ -2035,6 +2035,10 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 		if existing, ok := g.agentSubs.Get(info.ID); ok {
 			if existing.responses != nil && existing.responses.IsActive() &&
 				existing.errors != nil && existing.errors.IsActive() {
+				// Subs are healthy — skip recreation but still announce so
+				// late-starting observers (Guardian, Librarian, etc.) learn
+				// about this agent.
+				g.publishRegistryAnnouncement(info)
 				return nil
 			}
 			// Existing subs are stale — clean up before creating new ones.
@@ -2058,9 +2062,7 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 		}
 		g.agentSubs.Set(info.ID, subs)
 
-		// Publish registration announcement
-		msg := NewAgentRegisteredMessage(generateMessageID(), info)
-		_ = g.bus.Publish(TopicAgentRegistry, msg)
+		g.publishRegistryAnnouncement(info)
 	}
 
 	g.logEvent(agentlog.EventAgentRegistered, "", "info", &agentlog.RegistryPayload{
@@ -2292,6 +2294,9 @@ func (g *Guide) Start(ctx context.Context) error {
 	} else {
 		g.authSub = authSub
 	}
+
+	// Mark the guide itself as ready so registry observers see Ready=true.
+	g.MarkAgentReady("guide")
 
 	return nil
 }
@@ -3210,11 +3215,11 @@ func (g *Guide) publishRouteHandoffProgress(correlationID, sourceAgentID, target
 	if targetAgentID == "" {
 		return
 	}
+	// Send an empty message so the UI switches the thinking agent ID
+	// without overriding the per-agent rotating messages.
 	event := &StreamEvent{
-		Type: StreamEventProgress,
-		Data: &ProgressData{
-			Message: "Handing off to " + targetAgentID + "...",
-		},
+		Type:       StreamEventProgress,
+		Data:       &ProgressData{},
 		Visibility: visibility,
 		Timestamp:  time.Now(),
 	}
@@ -3865,16 +3870,63 @@ func (g *Guide) GetAllAgentChannels() map[string]*AgentChannels {
 	return g.agentChannels.Snapshot()
 }
 
-// MarkAgentReady marks an agent as ready to receive requests.
-// Called when an agent announces it has completed initialization.
+// MarkAgentReady marks an agent as ready to receive requests and
+// publishes an updated registry announcement with Ready=true so
+// observers (Guardian, Librarian, etc.) learn the agent is ready.
 func (g *Guide) MarkAgentReady(agentID string) {
 	g.readyAgents.Set(agentID, true)
+
+	// Publish a ready announcement so registry observers see Ready=true.
+	if g.bus != nil && g.running {
+		info := g.routing.GetRoutingInfo(agentID)
+		if info != nil {
+			msg := NewAgentReadyMessage(generateMessageID(), info)
+			_ = g.bus.Publish(TopicAgentRegistry, msg)
+		}
+	}
 }
 
 // IsAgentReady returns true if an agent is ready to receive requests
 func (g *Guide) IsAgentReady(agentID string) bool {
 	ready, _ := g.readyAgents.Get(agentID)
 	return ready
+}
+
+// publishRegistryAnnouncement publishes an AgentRegistered message to the
+// registry topic. Extracted so both the fresh-subscription and idempotent
+// early-return paths in Register() can announce.
+func (g *Guide) publishRegistryAnnouncement(info *AgentRoutingInfo) {
+	msg := NewAgentRegisteredMessage(generateMessageID(), info)
+	_ = g.bus.Publish(TopicAgentRegistry, msg)
+}
+
+// RegisteredAgentInfos returns a snapshot of all currently registered agent
+// routing info with their readiness state. Used to seed late-starting
+// observers (e.g. Guardian after daemon restart) so they don't need to
+// wait for re-registration events.
+func (g *Guide) RegisteredAgentInfos() []*AgentAnnouncement {
+	infos := g.routing.GetAllRoutingInfo()
+	announcements := make([]*AgentAnnouncement, 0, len(infos))
+	for _, info := range infos {
+		ann := &AgentAnnouncement{
+			AgentID:         info.ID,
+			AgentType:       info.Type,
+			AgentName:       info.Name,
+			Aliases:         info.Aliases,
+			ActionShortcuts: info.ActionShortcuts,
+		}
+		if info.Registration != nil {
+			ann.Capabilities = &info.Registration.Capabilities
+			ann.Constraints = &info.Registration.Constraints
+			ann.Description = info.Registration.Description
+		}
+		if ready, _ := g.readyAgents.Get(info.ID); ready {
+			ann.Ready = true
+			ann.ReadyAt = time.Now()
+		}
+		announcements = append(announcements, ann)
+	}
+	return announcements
 }
 
 // Stats returns Guide statistics including resilience component stats

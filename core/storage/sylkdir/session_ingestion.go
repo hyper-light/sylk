@@ -4,7 +4,6 @@ package sylkdir
 import (
 	"context"
 	"fmt"
-	"log"
 	"runtime"
 	"slices"
 	"strconv"
@@ -13,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
@@ -83,8 +83,9 @@ type SessionIngestion struct {
 	chunkRefStore *ChunkRefStore
 	embedder      embedder.Embedder
 	chunker       *UniversalChunker
-	chunkCache    ChunkCacheLookup // nil means no caching
-	nextNodeID    *uint32          // shared counter from session's BaseSnapshot
+	chunkCache    ChunkCacheLookup         // nil means no caching
+	nextNodeID    *uint32                   // shared counter from session's BaseSnapshot
+	logger        *agentlog.BootEventLogger // nil-safe structured logger
 }
 
 // NewSessionIngestion creates a new session ingestion handler.
@@ -118,6 +119,26 @@ func (s *SessionIngestion) SetEmbedder(e embedder.Embedder) {
 // SetChunkCache sets the chunk cache for content-hash-keyed chunk result caching.
 func (s *SessionIngestion) SetChunkCache(c ChunkCacheLookup) {
 	s.chunkCache = c
+}
+
+// SetLogger sets the structured event logger. Nil-safe.
+func (s *SessionIngestion) SetLogger(l *agentlog.BootEventLogger) {
+	s.logger = l
+}
+
+// logIngest emits a structured ingestion event. No-op if logger is nil.
+func (s *SessionIngestion) logIngest(eventType agentlog.EventType, level string, data any) {
+	if s.logger == nil {
+		return
+	}
+	s.logger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     "boot",
+		Event:     eventType.String(),
+		EventCode: eventType,
+		Data:      data,
+	})
 }
 
 // SessionIngestionResult contains the results of a session ingestion.
@@ -175,29 +196,36 @@ type ingestionEntities struct {
 func (s *SessionIngestion) IngestCodeGraph(ctx context.Context, graph *ingestion.CodeGraph, contentMap map[string]string) (*SessionIngestionResult, error) {
 	start := time.Now()
 
-	log.Printf("[ingest] buildEntities: files=%d symbols=%d content_entries=%d",
-		len(graph.Files), len(graph.Symbols), len(contentMap))
 	buildStart := time.Now()
 	ent := s.buildEntities(ctx, graph, contentMap)
-	log.Printf("[ingest] buildEntities done: %v (nodes=%d+%d+%d edges=%d+%d+%d docs=%d+%d embeds=%d)",
-		time.Since(buildStart),
-		len(ent.fileNodes), len(ent.symbolNodes), len(ent.chunkNodes),
-		len(ent.containsEdges), len(ent.importEdges), len(ent.chunkEdges),
-		len(ent.fileDocs), len(ent.chunkDocs), len(ent.embedTexts))
+	s.logIngest(agentlog.EventSessionBuildEntities, "info", &agentlog.IngestPhasePayload{
+		Phase:     "build_entities",
+		DurNs:     time.Since(buildStart).Nanoseconds(),
+		FileCount: len(ent.fileNodes),
+		SymCount:  len(ent.symbolNodes) + len(ent.chunkNodes),
+	})
 
 	writeStart := time.Now()
 	result, err := s.writeEntities(ctx, ent)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[ingest] writeEntities done: %v", time.Since(writeStart))
+	s.logIngest(agentlog.EventSessionWriteStores, "info", &agentlog.IngestPhasePayload{
+		Phase: "write_entities",
+		DurNs: time.Since(writeStart).Nanoseconds(),
+	})
 
 	result.FilesProcessed = len(ent.fileNodes)
 	s.updateDeltaTracker(result)
 	s.evaluateCheckpoint()
 
 	result.Duration = time.Since(start)
-	log.Printf("[ingest] IngestCodeGraph total: %v", result.Duration)
+	s.logIngest(agentlog.EventSessionCodeGraph, "info", &agentlog.IngestPhasePayload{
+		Phase:     "code_graph_total",
+		DurNs:     result.Duration.Nanoseconds(),
+		FileCount: result.FilesProcessed,
+		SymCount:  result.NodesCreated,
+	})
 	return result, nil
 }
 
@@ -214,26 +242,11 @@ func (s *SessionIngestion) buildEntities(ctx context.Context, graph *ingestion.C
 		docRefMap:   make(map[uint32]uint32, len(graph.Files)),
 	}
 
-	t := time.Now()
 	s.buildFileEntities(graph.Files, contentMap, ent)
-	log.Printf("[build] files: %v (%d)", time.Since(t), len(ent.fileNodes))
-
-	t = time.Now()
 	s.buildSymbolEntities(graph.Symbols, ent)
-	log.Printf("[build] symbols: %v (%d)", time.Since(t), len(ent.symbolNodes))
-
-	t = time.Now()
 	s.buildChunkEntities(ctx, graph, contentMap, ent)
-	log.Printf("[build] chunks: %v (%d nodes, %d docs, %d refs, %d edges)",
-		time.Since(t), len(ent.chunkNodes), len(ent.chunkDocs), len(ent.chunkRefs), len(ent.chunkEdges))
-
-	t = time.Now()
 	s.buildEdgeEntities(graph, ent)
-	log.Printf("[build] edges: %v (contains=%d imports=%d)", time.Since(t), len(ent.containsEdges), len(ent.importEdges))
-
-	t = time.Now()
 	s.buildEmbedTexts(ent)
-	log.Printf("[build] embedTexts: %v (%d)", time.Since(t), len(ent.embedTexts))
 
 	return ent
 }
@@ -581,11 +594,7 @@ func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEnti
 	// Skipped in PendingMode — entities go directly to CommitToGlobal.
 	if !pendingMode {
 		g.Go(func() error {
-			t := time.Now()
-			err := s.writeStores(gctx, allNodes, allEdges, allDocs, ent.chunkRefs, result)
-			log.Printf("[write] G1 stores: %v (nodes=%d edges=%d docs=%d refs=%d)",
-				time.Since(t), result.NodesCreated, result.EdgesCreated, result.DocsCreated, result.ChunkRefsCreated)
-			return err
+			return s.writeStores(gctx, allNodes, allEdges, allDocs, ent.chunkRefs, result)
 		})
 	}
 
@@ -594,20 +603,21 @@ func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEnti
 	var embeddings [][]float32
 	embedDone := make(chan struct{})
 	g.Go(func() error {
-		t := time.Now()
+		embedStart := time.Now()
 		var err error
 		embeddings, err = s.embedAll(gctx, ent.embedTexts)
 		close(embedDone)
-		log.Printf("[write] G2 embed: %v (%d texts)", time.Since(t), len(ent.embedTexts))
+		s.logIngest(agentlog.EventSessionWriteEmbeds, "info", &agentlog.IngestPhasePayload{
+			Phase: "embed",
+			DurNs: time.Since(embedStart).Nanoseconds(),
+			SymCount: len(ent.embedTexts),
+		})
 		return err
 	})
 
 	// G3: Index all docs into Bleve concurrently.
 	g.Go(func() error {
-		t := time.Now()
-		err := s.indexDocsIntoSessionBleve(gctx, allDocs)
-		log.Printf("[write] G3 bleve: %v (%d docs)", time.Since(t), len(allDocs))
-		return err
+		return s.indexDocsIntoSessionBleve(gctx, allDocs)
 	})
 
 	// G4: Write vectors as soon as G2 completes (overlaps with G3).
@@ -618,13 +628,11 @@ func (s *SessionIngestion) writeEntities(ctx context.Context, ent *ingestionEnti
 		case <-gctx.Done():
 			return gctx.Err()
 		}
-		t := time.Now()
 		vectors, err := s.writeVectorsWithCache(gctx, ent, embeddings)
 		if err != nil {
 			return err
 		}
 		result.VectorsCreated = len(vectors)
-		log.Printf("[write] G4 vectors: %v (%d pending)", time.Since(t), len(vectors))
 		return nil
 	})
 
@@ -643,29 +651,23 @@ func (s *SessionIngestion) writeStores(ctx context.Context, allNodes []*Node, al
 	g, _ := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		t := time.Now()
 		if err := s.nodeStore.WriteBatch(allNodes); err != nil {
 			return fmt.Errorf("write nodes: %w", err)
 		}
-		log.Printf("[stores] nodes: %v (%d)", time.Since(t), len(allNodes))
 		return nil
 	})
 
 	g.Go(func() error {
-		t := time.Now()
 		if err := s.edgeStore.WriteBatch(allEdges); err != nil {
 			return fmt.Errorf("write edges: %w", err)
 		}
-		log.Printf("[stores] edges: %v (%d)", time.Since(t), len(allEdges))
 		return nil
 	})
 
 	g.Go(func() error {
-		t := time.Now()
 		if err := s.docStore.WriteBatch(allDocs); err != nil {
 			return fmt.Errorf("write docs: %w", err)
 		}
-		log.Printf("[stores] docs: %v (%d)", time.Since(t), len(allDocs))
 		return nil
 	})
 
@@ -673,11 +675,9 @@ func (s *SessionIngestion) writeStores(ctx context.Context, allNodes []*Node, al
 		if len(chunkRefs) == 0 {
 			return nil
 		}
-		t := time.Now()
 		if err := s.chunkRefStore.WriteBatch(chunkRefs); err != nil {
 			return fmt.Errorf("write chunk refs: %w", err)
 		}
-		log.Printf("[stores] chunkRefs: %v (%d)", time.Since(t), len(chunkRefs))
 		return nil
 	})
 
@@ -814,17 +814,20 @@ func (s *SessionIngestion) IngestDirectoryWithConfig(ctx context.Context, config
 	config.SkipBleve = true
 	config.RetainContent = true
 
-	t := time.Now()
+	ingestStart := time.Now()
 	result, err := ingestion.IngestCodebase(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("ingest codebase: %w", err)
 	}
-	log.Printf("[pipeline] IngestCodebase: %v (files=%d symbols=%d lines=%d)",
-		time.Since(t), result.TotalFiles, result.TotalSymbols, result.TotalLines)
+	s.logIngest(agentlog.EventIngestParse, "info", &agentlog.IngestPhasePayload{
+		Phase:     "ingest_codebase",
+		DurNs:     time.Since(ingestStart).Nanoseconds(),
+		FileCount: result.TotalFiles,
+		SymCount:  result.TotalSymbols,
+		LineCount: result.TotalLines,
+	})
 
-	t = time.Now()
 	contentMap := buildContentMap(result.MappedFiles)
-	log.Printf("[pipeline] buildContentMap: %v (%d entries)", time.Since(t), len(contentMap))
 
 	return s.IngestCodeGraph(ctx, result.Graph, contentMap)
 }

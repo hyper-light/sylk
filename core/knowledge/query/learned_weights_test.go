@@ -1,6 +1,7 @@
 package query
 
 import (
+	"math"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/domain"
@@ -733,6 +734,38 @@ func TestLearnedQueryWeights_EmptyRanksMap(t *testing.T) {
 
 	// Should not change anything
 	assert.Equal(t, initialMean, lqw.TextWeight.Mean())
+}
+
+// =============================================================================
+// ExponentialDecay Regression Tests
+// =============================================================================
+
+func TestExponentialDecay_Identity(t *testing.T) {
+	// exp(-0/10) = exp(0) = 1.0
+	assert.InDelta(t, 1.0, exponentialDecay(0, 10), 1e-12)
+}
+
+func TestExponentialDecay_KnownValue(t *testing.T) {
+	// exp(-10/10) = exp(-1)
+	assert.InDelta(t, math.Exp(-1), exponentialDecay(10, 10), 1e-12)
+}
+
+func TestExponentialDecay_LargePositive(t *testing.T) {
+	// exp(-100/10) = exp(-10) — should be ~4.5e-5, not clipped to 0
+	expected := math.Exp(-10)
+	assert.InDelta(t, expected, exponentialDecay(100, 10), 1e-10)
+	assert.Greater(t, exponentialDecay(100, 10), 0.0)
+}
+
+func TestExponentialDecay_LargeNegative(t *testing.T) {
+	// Negative x → exp(positive) — must not be capped at 22026
+	result := exponentialDecay(-200, 10)
+	assert.InDelta(t, math.Exp(20), result, 1.0)
+}
+
+func TestExponentialDecay_ZeroScale(t *testing.T) {
+	// Zero scale should default to 1.0
+	assert.InDelta(t, math.Exp(-5), exponentialDecay(5, 0), 1e-12)
 }
 
 // =============================================================================

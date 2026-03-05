@@ -31,6 +31,7 @@ import (
 	globaltester "github.com/adalundhe/sylk/agents/tester/global"
 	pipelinetester "github.com/adalundhe/sylk/agents/tester/pipeline"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/knowledge"
@@ -46,6 +47,7 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
+	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/security"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/core/storage"
@@ -366,10 +368,18 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		slog.Default(),
 	)
 
+	// guideRef stores the live Guide instance for the Guardian factory —
+	// on daemon restart the Guardian needs to seed its agent registry.
+	var guideRef atomic.Pointer[guide.Guide]
+
+	// orchRef stores the live Orchestrator instance for Guardian VFS
+	// observability — the VFS adapters query active session VFS sets.
+	var orchRef atomic.Pointer[orchestrator.Orchestrator]
+
 	// Register agent creators. During initial boot, Guide/Orch factories
 	// call hydrateOnce.result() to wait for the shared hydration. After
 	// boot, daemon restarts read hydratedRef atomically (already stored).
-	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef, &gitSubsRef, planStore, knowledgeStore)
+	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef, &gitSubsRef, planStore, knowledgeStore, daemonCtrl, &guideRef, &orchRef)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
 
@@ -648,11 +658,13 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		cleanupInfra(runtime, containerReg, namespace, guideBus)
 		return ui.Deps{}, nil, fmt.Errorf("extract guide: %w", err)
 	}
+	guideRef.Store(g) // Publish for Guardian factory on daemon restart.
 	orch, err := extractAgent[*orchestrator.Orchestrator](containerReg, "orchestrator")
 	if err != nil {
 		cleanupInfra(runtime, containerReg, namespace, guideBus)
 		return ui.Deps{}, nil, fmt.Errorf("extract orchestrator: %w", err)
 	}
+	orchRef.Store(orch) // Publish for Guardian VFS adapter queries.
 
 	hookMut.SetGuide(g)
 	probeFact.SetIsReady(g.IsAgentReady)
@@ -675,6 +687,16 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// Pre-register routing metadata for all non-pipeline agents so the
 	// classifier can see them before their containers spin up.
 	preRegisterAgentRouting(g, identityReg)
+
+	// Seed Guardian's known-agents from the Guide's current registry so it
+	// doesn't start with total=0. Handles both initial boot (where
+	// pre-registered agents have no live announcements) and daemon restart
+	// (where prior announcements were missed).
+	if guardianResult.err == nil && guardianResult.c != nil {
+		if grd, grdErr := extractAgent[*guardian.Guardian](containerReg, "guardian"); grdErr == nil {
+			grd.SeedKnownAgents(g.RegisteredAgentInfos())
+		}
+	}
 
 	activationCtrl := actResult.ctrl
 	if activationCtrl != nil {
@@ -708,6 +730,11 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				amQuerier = &activationMetricsAdapter{m: activationCtrl.Metrics()}
 			}
 			grd.SetObservabilityDeps(acQuerier, amQuerier, &daemonQuerierAdapter{dc: daemonCtrl})
+			grd.SetVFSDeps(
+				&orchestratorCVSAdapter{orchRef: &orchRef},
+				&orchestratorVFSAdapter{orchRef: &orchRef},
+			)
+			grd.SetCostCalculator(buildCostCalculator())
 		}
 	}
 
@@ -1074,21 +1101,68 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 	// E: Knowledge boot — runs boot.Boot and promotes partial knowledge.
 	// Non-critical and potentially slow; fires fully in background.
+	//
+	// BootEventLogger is created before boot so pre-session events
+	// are durably staged. BindSession drains into the session log.
+	bootLogger, bootLogErr := agentlog.NewBootEventLogger(
+		filepath.Join(projectRoot, ".sylk"),
+	)
+	if bootLogErr != nil {
+		slog.Warn("boot logger init failed (non-critical)", "error", bootLogErr)
+	}
+	knowledgeStore.SetBootLogger(bootLogger)
+
 	phase4Remaining.Add(1)
 	_ = scope.Go("phase4-knowledge-boot", 0, func(bgCtx context.Context) error {
 		defer phase4Finish()
-		result, err := boot.Boot(bgCtx, projectRoot)
-		if err != nil {
-			slog.Warn("knowledge boot failed (non-critical)", "error", err)
+
+		// Boot is non-critical but potentially slow. Run via channel so the
+		// scope worker exits promptly on shutdown (Ctrl+C). The boot goroutine
+		// is bounded: pipeline.Run checks ctx.Err() between phases and
+		// CommitToGlobal threads ctx through internal errgroups, so it exits
+		// shortly after bgCtx cancellation. At process exit the OS reclaims.
+		type bootOut struct {
+			result *boot.PipelineResult
+			err    error
+		}
+		ch := make(chan bootOut, 1)
+		go func() {
+			r, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
+				ProjectRoot: projectRoot,
+				Logger:      bootLogger,
+			})
+			ch <- bootOut{r, err}
+		}()
+
+		select {
+		case <-bgCtx.Done():
+			return nil
+		case out := <-ch:
+			if out.err != nil {
+				slog.Warn("knowledge boot failed (non-critical)", "error", out.err)
+				return nil
+			}
+			// Build BleveSearcher from the BackgroundIndexer's already-open
+			// store when available. Opening a second store at the same path
+			// would block on bolt.DB's exclusive file lock held by the indexer.
+			var bleveSearcher *query.BleveSearcher
+			var bleveCloser io.Closer
+			if bgIdx := out.result.BackgroundIndexer; bgIdx != nil && bgIdx.BleveStore() != nil {
+				store := bgIdx.BleveStore()
+				adapter := &globalBleveAdapter{store: store}
+				bleveSearcher = query.NewBleveSearcher(adapter)
+				bleveCloser = &bleveStoreCloser{store: store}
+			} else {
+				var buildErr error
+				bleveSearcher, bleveCloser, buildErr = buildBleveSearcher(projectRoot)
+				if buildErr != nil {
+					slog.Warn("knowledge bleve open failed (non-critical)", "error", buildErr)
+					return nil
+				}
+			}
+			knowledgeStore.PromotePartial(bleveSearcher, out.result.BackgroundIndexer, bleveCloser)
 			return nil
 		}
-		bleveSearcher, bleveCloser, buildErr := buildBleveSearcher(projectRoot)
-		if buildErr != nil {
-			slog.Warn("knowledge bleve open failed (non-critical)", "error", buildErr)
-			return nil
-		}
-		knowledgeStore.PromotePartial(bleveSearcher, result.BackgroundIndexer, bleveCloser)
-		return nil
 	})
 
 	// F: Wait for BackgroundIndexer to finish, then promote to full knowledge.
@@ -1160,6 +1234,8 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 		planStore.Close()
 
+		_ = bootLogger.Close()
+
 		if ksErr := knowledgeStore.Close(); ksErr != nil {
 			errs = append(errs, ksErr)
 		}
@@ -1223,6 +1299,9 @@ func registerAgentCreators(
 	gitSubsRef *atomic.Pointer[gitBootResult],
 	planStore *architect.PlanStore,
 	knowledgeStore *knowledge.KnowledgeStore,
+	daemonCtrl *daemon.DaemonSetController,
+	guideRef *atomic.Pointer[guide.Guide],
+	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 ) {
 	// Guide — Gemini with rule-based fallback.
 	// First call blocks on hydrateOnce; subsequent calls (daemon restart)
@@ -1251,8 +1330,15 @@ func registerAgentCreators(
 	})
 
 	// Guardian — safety sidecar daemon.
+	// On daemon restart the factory must re-wire post-boot deps (observability,
+	// git, agent seeding) that Phase 3 originally set up.
 	reg.Register("guardian", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapGuardian(ctx, bus, actPub, projectRoot, openaiGw, gitSubsRef)
+		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, openaiGw, gitSubsRef)
+		if err != nil {
+			return nil, err
+		}
+		wireGuardianPostBootDeps(grd, actCtrlRef, daemonCtrl, guideRef, orchRef, openaiGw)
+		return grd, nil
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
@@ -1889,11 +1975,57 @@ func bootstrapGuardian(
 	if err != nil {
 		return nil, err
 	}
-	g.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityValidation))
 	if err := g.Start(bus); err != nil {
 		return nil, err
 	}
 	return g, nil
+}
+
+// wireGuardianPostBootDeps re-wires observability, git, and agent-seeding
+// dependencies on the Guardian. Called from the factory closure so that
+// daemon-restart instances receive the same wiring as the initial boot's
+// Phase 3. All parameters are read from atomic refs; nil-safe.
+func wireGuardianPostBootDeps(
+	grd *guardian.Guardian,
+	actCtrlRef *atomic.Pointer[activation.ActivationController],
+	daemonCtrl *daemon.DaemonSetController,
+	guideRef *atomic.Pointer[guide.Guide],
+	orchRef *atomic.Pointer[orchestrator.Orchestrator],
+	openaiGw *gateway.ProviderGateway,
+) {
+	var acQuerier guardian.ActivationQuerier
+	var amQuerier guardian.ActivationMetricsQuerier
+	if ac := actCtrlRef.Load(); ac != nil {
+		acQuerier = ac
+		amQuerier = &activationMetricsAdapter{m: ac.Metrics()}
+	}
+	var dcQuerier guardian.DaemonQuerier
+	if daemonCtrl != nil {
+		dcQuerier = &daemonQuerierAdapter{dc: daemonCtrl}
+	}
+	if ac := actCtrlRef.Load(); ac != nil {
+		grd.SetRequestGuard(func() func() {
+			return ac.AcquireRequestGuard("guardian")
+		})
+	}
+	grd.SetObservabilityDeps(acQuerier, amQuerier, dcQuerier)
+	grd.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityValidation))
+
+	// VFS observability — aggregate CVS/VFS stats across all sessions.
+	grd.SetVFSDeps(
+		&orchestratorCVSAdapter{orchRef: orchRef},
+		&orchestratorVFSAdapter{orchRef: orchRef},
+	)
+
+	// Cost calculator — derives USD-cents per LLM call from model pricing.
+	grd.SetCostCalculator(buildCostCalculator())
+
+	// Seed agent registry from the Guide's current state so the Guardian
+	// doesn't start with total=0 after daemon restart.
+	if g := guideRef.Load(); g != nil {
+		grd.SeedKnownAgents(g.RegisteredAgentInfos())
+		_ = registerAgentWithGuide(g, grd, "guardian")
+	}
 }
 
 // resolveArchitectAPIKey resolves the Anthropic API key for the architect
@@ -1937,11 +2069,10 @@ func preRegisterAgentRouting(g *guide.Guide, ids *container.AgentIdentityRegistr
 	}
 	agents := []staticInfo{
 		{"architect", architect.ArchitectRoutingInfo},
-		{"engineer", engineer.EngineerRoutingInfo},
-		{"designer", designer.DesignerRoutingInfo},
 		{"inspector", inspectorGlobal.InspectorRoutingInfo},
 		{"tester", globaltester.TesterRoutingInfo},
 		{"librarian", librarian.LibrarianRoutingInfo},
+		{"academic", academic.AcademicRoutingInfo},
 	}
 	for _, a := range agents {
 		canonicalID, ok := ids.Get(a.agentType)
@@ -2645,4 +2776,98 @@ func (a *daemonQuerierAdapter) Status() []guardian.DaemonStatusSnapshot {
 		}
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// VFS / CVS adapters — aggregate per-session VFS stats for Guardian
+// ---------------------------------------------------------------------------
+
+// orchestratorCVSAdapter implements guardian.CVSQuerier by aggregating
+// CVS stats across all of the Orchestrator's active sessions.
+type orchestratorCVSAdapter struct {
+	orchRef *atomic.Pointer[orchestrator.Orchestrator]
+}
+
+func (a *orchestratorCVSAdapter) Stats() guardian.CVSStatsSnapshot {
+	orch := a.orchRef.Load()
+	if orch == nil {
+		return guardian.CVSStatsSnapshot{}
+	}
+	var agg guardian.CVSStatsSnapshot
+	for _, svfs := range orch.AllSessionVFS() {
+		s := svfs.CVS().Stats()
+		agg.TotalFiles += s.TotalFiles
+		agg.TotalVersions += s.TotalVersions
+		agg.TotalOperations += s.TotalOperations
+		agg.ActivePipelines += s.ActivePipelines
+		agg.ActiveVariants += s.ActiveVariants
+		agg.ActiveLocks += s.ActiveLocks
+		agg.ActiveSubscribers += s.ActiveSubscribers
+
+		// New versioned WAL stats.
+		agg.CurrentVersion = svfs.CurrentVersion().String()
+		agg.WALEntries += int64(svfs.WAL().IndexLen())
+	}
+	return agg
+}
+
+// orchestratorVFSAdapter implements guardian.VFSManagerQuerier by
+// aggregating VFS manager stats across all active sessions.
+type orchestratorVFSAdapter struct {
+	orchRef *atomic.Pointer[orchestrator.Orchestrator]
+}
+
+func (a *orchestratorVFSAdapter) Stats() guardian.VFSManagerSnapshot {
+	orch := a.orchRef.Load()
+	if orch == nil {
+		return guardian.VFSManagerSnapshot{}
+	}
+	var agg guardian.VFSManagerSnapshot
+	for _, svfs := range orch.AllSessionVFS() {
+		s := svfs.VFSManager().Stats()
+		agg.ActiveVFSes += s.ActiveVFSes
+		agg.VariantGroups += s.VariantGroups
+		agg.ActiveSessions += s.ActiveSessions
+		agg.TotalPipelines += s.TotalPipelines
+	}
+	return agg
+}
+
+// ---------------------------------------------------------------------------
+// Cost calculator — derives USD-cents from model pricing
+// ---------------------------------------------------------------------------
+
+// buildCostCalculator returns a CostCalculator that looks up per-model
+// pricing from a static table. Returns 0 for unknown models. The table
+// is built once at boot from a snapshot of known model prices.
+func buildCostCalculator() guardian.CostCalculator {
+	// Static pricing table (USD per million tokens).
+	// Updated at compile-time; runtime registration is not needed because
+	// the set of models used by a running instance is fixed at build.
+	type pricing struct{ input, output float64 }
+	prices := map[string]pricing{
+		// Anthropic
+		"claude-opus-4-6":            {15.0, 75.0},
+		"claude-opus-4-5-20251101":   {15.0, 75.0},
+		"claude-sonnet-4-6":          {3.0, 15.0},
+		"claude-haiku-4-5-20251001":  {0.80, 4.0},
+		// OpenAI
+		"gpt-5.3-codex": {2.50, 10.0},
+		"gpt-5.2-codex": {2.50, 10.0},
+		// Google
+		"gemini-3.1-pro-preview": {1.25, 5.0},
+		"gemini-3-flash":         {0.075, 0.30},
+		"gemini-2.5-pro":         {1.25, 5.0},
+		"gemini-2.5-flash":       {0.075, 0.30},
+	}
+
+	return func(model string, inputTokens, outputTokens int) int64 {
+		p, ok := prices[model]
+		if !ok {
+			return 0
+		}
+		costUSD := llm.CalculateCost(int64(inputTokens), int64(outputTokens), p.input, p.output)
+		// Convert to cents, rounding down (accumulation converges).
+		return int64(costUSD * 100)
+	}
 }

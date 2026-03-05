@@ -196,7 +196,7 @@ const (
 	DefaultConsultationMaxAge  = 5 * time.Minute
 	DefaultSkillMaxLoaded      = 16
 	DefaultSkillTokenBudget    = 3200
-	DefaultMaxToolRuns         = 12
+	DefaultMaxToolRuns         = 32
 )
 
 // ---------------------------------------------------------------------------

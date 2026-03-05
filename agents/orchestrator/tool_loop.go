@@ -47,11 +47,9 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 		}
 		// ── END STEERING ──
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, o.config.MaxToolRuns, req); zone == shared.ZoneCritical {
-				return "", shared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, o.config.MaxToolRuns, req); err != nil {
+			return "", err
 		}
 
 		turnStart := time.Now()
@@ -70,9 +68,7 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if turn == o.config.MaxToolRuns {
-			return "", fmt.Errorf("orchestrator exceeded tool-call limit (%d)", o.config.MaxToolRuns)
-		}
+
 
 		if dup, sig := detectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			return "", fmt.Errorf("orchestrator repeated tool call: %s", sig.Name)

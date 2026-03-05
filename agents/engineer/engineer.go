@@ -149,7 +149,7 @@ const (
 	DefaultMaxOutputTokens = 16384
 	DefaultModel           = "gpt-5.3-codex"
 	DefaultReasoningEffort = "xhigh"
-	DefaultMaxToolRuns     = 16
+	DefaultMaxToolRuns     = 32
 	DefaultMaxTokens       = 16384
 )
 

@@ -80,12 +80,13 @@ func toActivationPolicy(pp *pod.PodPolicy) *ActivationPolicy {
 func singletonPodPolicy(desc handoff.AgentDescriptor) *pod.PodPolicy {
 	if daemonAgentTypes[desc.AgentType] {
 		return &pod.PodPolicy{
-			PodID:       desc.AgentType,
-			PodType:     pod.PodTypeDaemon,
-			MemberTypes: []string{desc.AgentType},
-			Priority:    math.MaxInt,
-			MinTier:     TierHot,
-			IsDaemon:    true,
+			PodID:            desc.AgentType,
+			PodType:          pod.PodTypeDaemon,
+			MemberTypes:      []string{desc.AgentType},
+			Priority:         math.MaxInt,
+			MinTier:          TierHot,
+			IsDaemon:         true,
+			PreWarmOnStartup: true,
 		}
 	}
 
@@ -100,7 +101,7 @@ func singletonPodPolicy(desc handoff.AgentDescriptor) *pod.PodPolicy {
 		IdleToCold:  defaults.IdleToCold,
 	}
 
-	if desc.AgentType == "architect" {
+	if preWarmAgentTypes[desc.AgentType] {
 		pp.PreWarmOnStartup = true
 	}
 

@@ -12,6 +12,7 @@ import (
 var daemonAgentTypes = map[string]bool{
 	"guide":        true,
 	"orchestrator": true,
+	"guardian":     true,
 }
 
 // categoryCostScale maps agent category to an idle-threshold scale factor.
@@ -45,18 +46,31 @@ func AgentActivationPolicies(descriptors []handoff.AgentDescriptor) []*Activatio
 	return policies
 }
 
+// preWarmAgentTypes lists agent types that should be activated at startup.
+// Knowledge agents provide reduced-precision queries when cold-started;
+// pre-warming avoids that latency on first use.
+var preWarmAgentTypes = map[string]bool{
+	"architect":   true,
+	"librarian":   true,
+	"archivalist": true,
+	"academic":    true,
+}
+
 // policyForDescriptor builds an activation policy for a single agent descriptor.
-// Daemon agents get DaemonPolicy; all others get DefaultPolicy with
-// category-scaled idle thresholds. The architect gets PreWarmOnStartup.
+// Daemon agents get DaemonPolicy; knowledge agents and the architect get
+// PreWarmOnStartup; all others get DefaultPolicy with category-scaled idle
+// thresholds.
 func policyForDescriptor(desc handoff.AgentDescriptor) *ActivationPolicy {
 	if daemonAgentTypes[desc.AgentType] {
-		return DaemonPolicy(desc.AgentType)
+		p := DaemonPolicy(desc.AgentType)
+		p.PreWarmOnStartup = true
+		return p
 	}
 
 	defaults := scaledDefaults(desc.Category)
 	policy := DefaultPolicy(desc.AgentType, defaults)
 
-	if desc.AgentType == "architect" {
+	if preWarmAgentTypes[desc.AgentType] {
 		policy.PreWarmOnStartup = true
 	}
 

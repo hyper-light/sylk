@@ -1,6 +1,7 @@
 package sylkdir
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -141,7 +142,7 @@ func TestTombstoneLifecycle(t *testing.T) {
 			t.Fatalf("WriteBatch docs: %v", err)
 		}
 
-		result, err := CommitToGlobal(CommitConfig{
+		result, err := CommitToGlobal(context.Background(), CommitConfig{
 			Session:        sess,
 			SylkDir:        sd,
 			GlobalMeta:     gm,
@@ -308,7 +309,7 @@ func TestTombstoneLifecycle(t *testing.T) {
 			t.Fatalf("WriteBatch docs: %v", err)
 		}
 
-		result, err := CommitToGlobal(CommitConfig{
+		result, err := CommitToGlobal(context.Background(), CommitConfig{
 			Session:        sess,
 			SylkDir:        sd,
 			GlobalMeta:     gm,
@@ -553,7 +554,7 @@ func TestTombstoneLifecycle(t *testing.T) {
 			t.Fatalf("WriteBatch docs: %v", err)
 		}
 
-		result, err := CommitToGlobal(CommitConfig{
+		result, err := CommitToGlobal(context.Background(), CommitConfig{
 			Session:        sess,
 			SylkDir:        sd,
 			GlobalMeta:     gm,
@@ -698,7 +699,7 @@ func TestTombstoneLifecycle(t *testing.T) {
 			{ID: d1IDs[3], CanonicalKey: "symbol:d.go:Gamma:function", Domain: 0, NodeType: uint8(NodeTypeFunction), Name: "Gamma", Path: "d.go", CreatedAt: now, SessionID: sessID},
 		})
 
-		r5a, err := CommitToGlobal(CommitConfig{
+		r5a, err := CommitToGlobal(context.Background(), CommitConfig{
 			Session: sess, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 		})
 		if err != nil {
@@ -740,7 +741,7 @@ func TestTombstoneLifecycle(t *testing.T) {
 			// Gamma is NOT included — removed from file
 		})
 
-		r5b, err := CommitToGlobal(CommitConfig{
+		r5b, err := CommitToGlobal(context.Background(), CommitConfig{
 			Session: sess2, SylkDir: sd, GlobalMeta: gm, CanonicalIndex: canonIdx,
 		})
 		if err != nil {
@@ -808,7 +809,7 @@ func TestTombstoneLifecycle(t *testing.T) {
 			{ID: firstID, CanonicalKey: "file:a.go", Domain: 0, NodeType: uint8(NodeTypeFile), Name: "a.go", Path: "a.go", CreatedAt: now, SessionID: sessID},
 		})
 
-		r6, err := CommitToGlobal(CommitConfig{
+		r6, err := CommitToGlobal(context.Background(), CommitConfig{
 			Session:        sess,
 			SylkDir:        sd,
 			GlobalMeta:     gm,

@@ -3,11 +3,12 @@ package sylkdir
 
 import (
 	"context"
-	"log"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/search"
 )
 
@@ -35,6 +36,7 @@ type BackgroundIndexer struct {
 	onComplete func() error // called after all docs indexed (e.g. recordBleveIndexed)
 	indexed    atomic.Int64
 	total      int64
+	logger     *agentlog.BootEventLogger // nil-safe
 }
 
 // NewBackgroundIndexer creates an indexer and starts a single tracked goroutine
@@ -115,7 +117,9 @@ func (bi *BackgroundIndexer) indexBatch(ids []string) {
 		return
 	}
 	if err := bi.store.IndexBatch(bi.ctx, toIndex); err != nil {
-		log.Printf("[background-indexer] batch error (graceful): %v", err)
+		bi.logBgIndex(agentlog.EventBgIndexBatch, "warn", &agentlog.BgIndexPayload{
+			Phase: "batch_error",
+		})
 		return
 	}
 	bi.indexed.Add(int64(len(toIndex)))
@@ -168,8 +172,30 @@ func (bi *BackgroundIndexer) invokeOnComplete() {
 		return
 	}
 	if err := bi.onComplete(); err != nil {
-		log.Printf("[background-indexer] onComplete error: %v", err)
+		bi.logBgIndex(agentlog.EventBgIndexCompleted, "warn", &agentlog.BgIndexPayload{
+			Phase: "on_complete_error",
+		})
 	}
+}
+
+// SetLogger sets the structured event logger. Nil-safe.
+func (bi *BackgroundIndexer) SetLogger(l *agentlog.BootEventLogger) {
+	bi.logger = l
+}
+
+// logBgIndex emits a structured background indexer event.
+func (bi *BackgroundIndexer) logBgIndex(eventType agentlog.EventType, level string, data any) {
+	if bi.logger == nil {
+		return
+	}
+	bi.logger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     "boot",
+		Event:     eventType.String(),
+		EventCode: eventType,
+		Data:      data,
+	})
 }
 
 // PromoteDocs immediately indexes specific documents for on-demand query-time
@@ -207,6 +233,14 @@ func (bi *BackgroundIndexer) Wait() {
 func (bi *BackgroundIndexer) Close() {
 	bi.cancel()
 	bi.wg.Wait()
+}
+
+// BleveStore returns the already-open GlobalVersionBleveStore used by this
+// indexer. Callers that need a BleveSearcher should build one from this store
+// instead of opening a second store at the same path — bolt.DB holds an
+// exclusive file lock that would block a concurrent open.
+func (bi *BackgroundIndexer) BleveStore() *GlobalVersionBleveStore {
+	return bi.store
 }
 
 // Progress returns the number of documents indexed so far and the total count.

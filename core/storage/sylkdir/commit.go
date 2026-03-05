@@ -4,10 +4,10 @@ package sylkdir
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/search/bleve"
 	"golang.org/x/sync/errgroup"
@@ -43,6 +43,9 @@ type CommitConfig struct {
 	// either waiting on it or letting it run asynchronously.
 	// When false (default), inline indexing runs as before.
 	DeferBleveIndexing bool
+
+	// Logger is the structured event logger for commit phases. Nil-safe.
+	Logger *agentlog.BootEventLogger
 }
 
 // CommitResult describes what the commit produced.
@@ -115,7 +118,7 @@ func ConvertToSearchDocument(vdoc *VersionDocument) *search.Document {
 //
 // When CommitWAL is non-nil, the commit is bracketed by OpCommitBegin/OpCommitEnd
 // entries. On crash recovery, FindIncompleteCommits identifies partial writes.
-func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
+func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error) {
 	start := time.Now()
 	sess := cfg.Session
 
@@ -137,7 +140,14 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sylkdir: pre-commit checkpoint: %w", err)
 	}
-	log.Printf("[commit] step1 checkpoint: %v", time.Since(t))
+	logCommitEvent(cfg.Logger, agentlog.EventCommitStarted, "info", &agentlog.CommitPhasePayload{
+		Phase: "checkpoint",
+		DurNs: time.Since(t).Nanoseconds(),
+	})
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// ── Step 2: Collect all entities from ancestor chain (parallel) ────
 	// When Pending* fields are non-nil (PendingMode), entities are already
@@ -149,7 +159,7 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 		vectors  []*VersionVector
 		chunkRefs []*ChunkRef
 	)
-	collectG, _ := errgroup.WithContext(context.Background())
+	collectG, _ := errgroup.WithContext(ctx)
 	collectG.Go(func() error {
 		if sess.PendingNodes != nil {
 			nodes = sess.PendingNodes
@@ -203,7 +213,17 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	sess.PendingDocs = nil
 	sess.PendingVectors = nil
 	sess.PendingChunkRefs = nil
-	log.Printf("[commit] step2 collect: %v (nodes=%d edges=%d docs=%d vectors=%d chunkRefs=%d)", time.Since(t), len(nodes), len(edges), len(docs), len(vectors), len(chunkRefs))
+	logCommitEvent(cfg.Logger, agentlog.EventCommitMergeNodes, "info", &agentlog.CommitPhasePayload{
+		Phase:       "collect",
+		DurNs:       time.Since(t).Nanoseconds(),
+		NodesMerged: len(nodes),
+		EdgesMerged: len(edges),
+		DocsIndexed: len(docs),
+	})
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// ── Step 3: Create version directory + snapshot or compact parent data ─
 	if err := cfg.SylkDir.CreateGlobalVersion(newVersion); err != nil {
@@ -253,7 +273,10 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	}
 	defer globalVectorStore.Close()
 
-	log.Printf("[commit] step3 snapshot/compact: %v", time.Since(t))
+	logCommitEvent(cfg.Logger, agentlog.EventCommitMergeEdges, "info", &agentlog.CommitPhasePayload{
+		Phase: "snapshot_compact",
+		DurNs: time.Since(t).Nanoseconds(),
+	})
 
 	// ── Steps 5+6: Store writes and Bleve indexing run in parallel ─────
 	// Store writes (nodes, edges, docs, vectors) and Bleve indexing write
@@ -273,21 +296,22 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 		bgIndexer      *BackgroundIndexer
 	)
 
-	commitG, gctx := errgroup.WithContext(context.Background())
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	commitG, gctx := errgroup.WithContext(ctx)
 
 	// Path A: Mutation pass → batch store writes → tombstone/orphan.
 	commitG.Go(func() error {
 		var writeErr error
-		storeResult, writeErr = commitWriteEntities(cfg, sess, newVersion, oldHead,
+		storeResult, writeErr = commitWriteEntities(gctx, cfg, sess, newVersion, oldHead,
 			nodes, edges, docs, vectors, chunkRefs, chunksStaged,
 			globalNodeStore, globalEdgeStore, globalDocStore, globalVectorStore)
 		if writeErr != nil {
 			return writeErr
 		}
-		log.Printf("[commit] step5 write stores: %v", time.Since(t))
-
 		tb, orphanedKeys, deletedFiles, writeErr = commitTombstoneOrphan(cfg, newVersion, storeResult.updates, nodes, parentTotalNodes)
-		log.Printf("[commit] step5bc tombstone+orphan: %v", time.Since(t))
 		return writeErr
 	})
 
@@ -316,13 +340,24 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 			storeResult.supersededDocIDs,
 			func() error { return recordBleveIndexed(cfg.GlobalBleveStore, cfg.GlobalMeta, newVersion) },
 		)
-		log.Printf("[commit] step6 bleve: deferred to background (%d docs)", len(docs))
+		logCommitEvent(cfg.Logger, agentlog.EventCommitBleve, "info", &agentlog.CommitPhasePayload{
+			Phase:       "bleve_deferred",
+			DocsIndexed: len(docs),
+		})
 	} else {
 		docsSuperseded = deleteSupersededBleveDocs(cfg.GlobalBleveStore, storeResult.supersededDocIDs)
 		if err := recordBleveIndexed(cfg.GlobalBleveStore, cfg.GlobalMeta, newVersion); err != nil {
 			return nil, err
 		}
-		log.Printf("[commit] step6 bleve: %v (indexed=%d superseded=%d)", time.Since(t), docsIndexed, docsSuperseded)
+		logCommitEvent(cfg.Logger, agentlog.EventCommitBleve, "info", &agentlog.CommitPhasePayload{
+			Phase:       "bleve_inline",
+			DurNs:       time.Since(t).Nanoseconds(),
+			DocsIndexed: docsIndexed,
+		})
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// ── Step 6: Update manifest + register commit ──────────────────────
@@ -379,6 +414,16 @@ func CommitToGlobal(cfg CommitConfig) (*CommitResult, error) {
 	if err := sess.Save(); err != nil {
 		return nil, fmt.Errorf("sylkdir: save session meta: %w", err)
 	}
+
+	logCommitEvent(cfg.Logger, agentlog.EventCommitCompleted, "info", &agentlog.CommitPhasePayload{
+		Phase:        "completed",
+		DurNs:        time.Since(start).Nanoseconds(),
+		NodesMerged:  len(nodes),
+		EdgesMerged:  len(edges),
+		OrphanedKeys: orphanedKeys,
+		TombstoneRat: tb.DeadRatio(uint32(len(nodes))),
+		Version:      newVersion.String(),
+	})
 
 	return &CommitResult{
 		SessionID:         sess.Meta.ID,
@@ -607,6 +652,7 @@ func remapDocRef(node *Node, sessDocIDMap, globalDocIDMap *DocIDMap) {
 // Nodes, edges, docs, and vectors use independent data files and can
 // be written in parallel via errgroup.
 func writeGlobalStores(
+	ctx context.Context,
 	sd *SylkDir, version SemanticVersion,
 	nodeStore *GlobalVersionNodeStore,
 	edgeStore *GlobalVersionEdgeStore,
@@ -616,7 +662,7 @@ func writeGlobalStores(
 	docs []*VersionDocument, vectors []*VersionVector,
 	chunkRefs []*ChunkRef, chunksStaged int,
 ) error {
-	g, _ := errgroup.WithContext(context.Background())
+	g, _ := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
 		return nodeStore.WriteBatch(nodes)
@@ -700,8 +746,8 @@ func resolveSupersededDocID(node *Node, docIDMap *DocIDMap, fallbackID uint32) s
 }
 
 // saveGlobalIndexes saves offset indexes for all global stores to disk in parallel.
-func saveGlobalIndexes(nodeStore *GlobalVersionNodeStore, edgeStore *GlobalVersionEdgeStore, docStore *GlobalVersionDocStore, vectorStore *GlobalVersionVectorStore) error {
-	g, _ := errgroup.WithContext(context.Background())
+func saveGlobalIndexes(ctx context.Context, nodeStore *GlobalVersionNodeStore, edgeStore *GlobalVersionEdgeStore, docStore *GlobalVersionDocStore, vectorStore *GlobalVersionVectorStore) error {
+	g, _ := errgroup.WithContext(ctx)
 	g.Go(func() error { return nodeStore.SaveIndexes() })
 	g.Go(func() error { return vectorStore.SaveIndexes() })
 	g.Go(func() error { return docStore.SaveIndexes() })
@@ -719,6 +765,7 @@ type storeWriteResult struct {
 
 // commitWriteEntities performs mutation pass, batch writes, supersession, and index saves.
 func commitWriteEntities(
+	ctx context.Context,
 	cfg CommitConfig, sess *Session, newVersion, oldHead SemanticVersion,
 	nodes []*Node, edges []*Edge, docs []*VersionDocument, vectors []*VersionVector,
 	chunkRefs []*ChunkRef, chunksStaged int,
@@ -726,11 +773,11 @@ func commitWriteEntities(
 ) (storeWriteResult, error) {
 	globalDocIDMap := ds.DocIDMap()
 	superseded, updates := prepareNodeMutations(cfg, nodes, globalDocIDMap)
-	if err := writeGlobalStores(cfg.SylkDir, newVersion, ns, es, ds, vs, nodes, edges, docs, vectors, chunkRefs, chunksStaged); err != nil {
+	if err := writeGlobalStores(ctx, cfg.SylkDir, newVersion, ns, es, ds, vs, nodes, edges, docs, vectors, chunkRefs, chunksStaged); err != nil {
 		return storeWriteResult{}, err
 	}
 	supersededDocIDs := applySupersessions(cfg.SylkDir, oldHead, ns, globalDocIDMap, updates)
-	if err := saveGlobalIndexes(ns, es, ds, vs); err != nil {
+	if err := saveGlobalIndexes(ctx, ns, es, ds, vs); err != nil {
 		return storeWriteResult{}, err
 	}
 	return storeWriteResult{
@@ -870,6 +917,21 @@ func recordBleveIndexed(store *GlobalVersionBleveStore, gm *GlobalMeta, ver Sema
 		return nil
 	}
 	return gm.SetLastBleveIndexed(ver)
+}
+
+// logCommitEvent emits a structured commit event. No-op if logger is nil.
+func logCommitEvent(logger *agentlog.BootEventLogger, eventType agentlog.EventType, level string, data any) {
+	if logger == nil {
+		return
+	}
+	logger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     "boot",
+		Event:     eventType.String(),
+		EventCode: eventType,
+		Data:      data,
+	})
 }
 
 // logCommitBegin writes an OpCommitBegin entry if the WAL is non-nil.

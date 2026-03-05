@@ -24,8 +24,8 @@ import (
 
 // Default configuration values.
 const (
-	DefaultLibrarianModel    = "claude-sonnet-4-5-20251001"
-	DefaultMaxToolRuns       = 12
+	DefaultLibrarianModel    = "claude-sonnet-4-6"
+	DefaultMaxToolRuns       = 32
 	DefaultMaxTokens         = 8192
 	DefaultMaxOutputTokens   = 8192
 	DefaultLLMRequestTimeout = 60 * time.Second
@@ -104,7 +104,7 @@ type Config struct {
 
 	// LLM configuration
 	EnableLLM         bool   // Enable LLM-driven conversation
-	Model             string // LLM model ID (default: claude-sonnet-4-5-20251001)
+	Model             string // LLM model ID (default: claude-sonnet-4-6)
 	AnthropicAPIKey   string // Anthropic API key
 	MaxToolRuns       int    // Maximum tool loop iterations (default: 12)
 	MaxTokens         int    // Maximum output tokens for LLM (default: 8192)
@@ -715,6 +715,20 @@ func (l *Librarian) publishActivity(eventType events.EventType, content string) 
 	l.activityPub.PublishActivity(evt)
 }
 
+// publishSystemEvent emits a system-level activity event for telemetry.
+// System events are recorded but do not change the UI panel status.
+func (l *Librarian) publishSystemEvent(eventType events.EventType, content string) {
+	if l.activityPub == nil {
+		return
+	}
+	evt := events.NewActivityEvent(eventType, l.config.SessionID, content)
+	evt.AgentID = l.id
+	evt.Visibility = events.VisibilitySystem
+	evt.Data["agent_type"] = "librarian"
+	evt.Data["agent_name"] = "Librarian"
+	l.activityPub.PublishActivity(evt)
+}
+
 // =============================================================================
 // Guide Registration
 // =============================================================================
@@ -818,7 +832,7 @@ func (l *Librarian) handleKnowledgeReady(msg *guide.Message) error {
 		"level", payload.Level,
 		"searchers", payload.Searchers,
 	)
-	l.publishActivity(events.EventTypeAgentAction,
+	l.publishSystemEvent(events.EventTypeAgentAction,
 		fmt.Sprintf("knowledge ready: searchers %v", payload.Searchers))
 	return nil
 }

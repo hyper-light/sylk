@@ -83,6 +83,8 @@ func vfsStats(g *Guardian) (any, error) {
 		"active_variants":    stats.ActiveVariants,
 		"active_locks":       stats.ActiveLocks,
 		"active_subscribers": stats.ActiveSubscribers,
+		"current_version":    stats.CurrentVersion,
+		"wal_entries":        stats.WALEntries,
 	}, nil
 }
 

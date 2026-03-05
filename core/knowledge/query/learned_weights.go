@@ -3,6 +3,7 @@
 package query
 
 import (
+	"math"
 	"sync"
 
 	"github.com/adalundhe/sylk/core/domain"
@@ -233,31 +234,7 @@ func exponentialDecay(x, scale float64) float64 {
 	if scale <= 0 {
 		scale = 1.0
 	}
-	return exp(-x / scale)
-}
-
-// exp is a simple exponential function.
-func exp(x float64) float64 {
-	// Using Taylor series approximation for small values
-	// or falling back to 0 for very negative values
-	if x < -10 {
-		return 0.0
-	}
-	if x > 10 {
-		return 22026.0 // Cap at exp(10)
-	}
-
-	// More accurate calculation using standard library behavior simulation
-	result := 1.0
-	term := 1.0
-	for i := 1; i < 20; i++ {
-		term *= x / float64(i)
-		result += term
-		if term < 1e-15 && term > -1e-15 {
-			break
-		}
-	}
-	return result
+	return math.Exp(-x / scale)
 }
 
 // updateDomainWeights updates or creates domain-specific weights.

@@ -57,11 +57,9 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		}
 		// ── END STEERING ──
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, pt.config.MaxToolRuns, req); zone == shared.ZoneCritical {
-				return "", shared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, pt.config.MaxToolRuns, req); err != nil {
+			return "", err
 		}
 
 		turnStart := time.Now()
@@ -90,14 +88,7 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if turn == pt.config.MaxToolRuns {
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", pt.config.MaxToolRuns)})
-			}
-			return "", fmt.Errorf("pipeline tester exceeded tool-call limit (%d)", pt.config.MaxToolRuns)
-		}
+
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {

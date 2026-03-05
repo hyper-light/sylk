@@ -19,6 +19,9 @@ func (a *Archivalist) registerExtendedSkills() {
 	a.skills.Register(patternSearchSkill(a))
 	a.skills.Register(failureSearchSkill(a))
 	a.skills.Register(decisionSearchSkill(a))
+	a.skills.Register(knowledgeMemorySkill(a))
+	a.skills.Register(knowledgeQuerySkill(a))
+	a.skills.Register(knowledgeInsightsSkill(a))
 }
 
 func (a *Archivalist) registerCoreSkills() {

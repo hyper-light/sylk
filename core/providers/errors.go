@@ -56,7 +56,7 @@ func (e *ProviderError) Error() string {
 	if e.StatusCode > 0 {
 		sb.WriteString(fmt.Sprintf(" (status %d)", e.StatusCode))
 	}
-	if e.Underlying != nil {
+	if e.Underlying != nil && e.Underlying.Error() != e.Message {
 		sb.WriteString(": ")
 		sb.WriteString(e.Underlying.Error())
 	}

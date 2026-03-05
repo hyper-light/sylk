@@ -198,6 +198,64 @@ const (
 	EventContextOutputLimited EventType = 0x0D04
 )
 
+// Boot pipeline events (0x0E00–0x0E1F).
+const (
+	EventBootStarted   EventType = 0x0E00
+	EventBootSetup     EventType = 0x0E01
+	EventBootDetect    EventType = 0x0E02
+	EventBootAllocate  EventType = 0x0E03
+	EventBootIngest    EventType = 0x0E04
+	EventBootCommit    EventType = 0x0E05
+	EventBootFinalize  EventType = 0x0E06
+	EventBootCompleted EventType = 0x0E07
+	EventBootSkipped   EventType = 0x0E08
+	EventBootError     EventType = 0x0E09
+)
+
+// Ingestion pipeline events (0x0E20–0x0E3F).
+const (
+	EventIngestDiscovery  EventType = 0x0E20
+	EventIngestRead       EventType = 0x0E21
+	EventIngestParse      EventType = 0x0E22
+	EventIngestAggregate  EventType = 0x0E23
+	EventIngestPersist    EventType = 0x0E24
+	EventIngestEmbedding  EventType = 0x0E25
+)
+
+// Session ingestion events (0x0E40–0x0E5F).
+const (
+	EventSessionBuildEntities EventType = 0x0E40
+	EventSessionWriteStores   EventType = 0x0E41
+	EventSessionWriteEmbeds   EventType = 0x0E42
+	EventSessionPendingMode   EventType = 0x0E43
+	EventSessionCodeGraph     EventType = 0x0E44
+)
+
+// Commit events (0x0E60–0x0E7F).
+const (
+	EventCommitStarted    EventType = 0x0E60
+	EventCommitMergeNodes EventType = 0x0E61
+	EventCommitMergeEdges EventType = 0x0E62
+	EventCommitOrphans    EventType = 0x0E63
+	EventCommitBleve      EventType = 0x0E64
+	EventCommitCompleted  EventType = 0x0E65
+)
+
+// Background indexer events (0x0E80–0x0E9F).
+const (
+	EventBgIndexStarted   EventType = 0x0E80
+	EventBgIndexBatch     EventType = 0x0E81
+	EventBgIndexPromote   EventType = 0x0E82
+	EventBgIndexCompleted EventType = 0x0E83
+)
+
+// Knowledge store events (0x0EA0–0x0EAF).
+const (
+	EventKnowledgePromotePartial EventType = 0x0EA0
+	EventKnowledgePromoteFull    EventType = 0x0EA1
+	EventKnowledgeClosed         EventType = 0x0EA2
+)
+
 // eventNames maps every defined EventType to its human-readable name.
 // Indexed by uint16 value for O(1) lookup.
 var eventNames [1 << 16]string
@@ -368,6 +426,52 @@ func init() {
 	eventNames[EventContextEviction] = "ContextEviction"
 	eventNames[EventContextCalibration] = "ContextCalibration"
 	eventNames[EventContextOutputLimited] = "ContextOutputLimited"
+
+	// Boot pipeline
+	eventNames[EventBootStarted] = "BootStarted"
+	eventNames[EventBootSetup] = "BootSetup"
+	eventNames[EventBootDetect] = "BootDetect"
+	eventNames[EventBootAllocate] = "BootAllocate"
+	eventNames[EventBootIngest] = "BootIngest"
+	eventNames[EventBootCommit] = "BootCommit"
+	eventNames[EventBootFinalize] = "BootFinalize"
+	eventNames[EventBootCompleted] = "BootCompleted"
+	eventNames[EventBootSkipped] = "BootSkipped"
+	eventNames[EventBootError] = "BootError"
+
+	// Ingestion pipeline
+	eventNames[EventIngestDiscovery] = "IngestDiscovery"
+	eventNames[EventIngestRead] = "IngestRead"
+	eventNames[EventIngestParse] = "IngestParse"
+	eventNames[EventIngestAggregate] = "IngestAggregate"
+	eventNames[EventIngestPersist] = "IngestPersist"
+	eventNames[EventIngestEmbedding] = "IngestEmbedding"
+
+	// Session ingestion
+	eventNames[EventSessionBuildEntities] = "SessionBuildEntities"
+	eventNames[EventSessionWriteStores] = "SessionWriteStores"
+	eventNames[EventSessionWriteEmbeds] = "SessionWriteEmbeds"
+	eventNames[EventSessionPendingMode] = "SessionPendingMode"
+	eventNames[EventSessionCodeGraph] = "SessionCodeGraph"
+
+	// Commit
+	eventNames[EventCommitStarted] = "CommitStarted"
+	eventNames[EventCommitMergeNodes] = "CommitMergeNodes"
+	eventNames[EventCommitMergeEdges] = "CommitMergeEdges"
+	eventNames[EventCommitOrphans] = "CommitOrphans"
+	eventNames[EventCommitBleve] = "CommitBleve"
+	eventNames[EventCommitCompleted] = "CommitCompleted"
+
+	// Background indexer
+	eventNames[EventBgIndexStarted] = "BgIndexStarted"
+	eventNames[EventBgIndexBatch] = "BgIndexBatch"
+	eventNames[EventBgIndexPromote] = "BgIndexPromote"
+	eventNames[EventBgIndexCompleted] = "BgIndexCompleted"
+
+	// Knowledge store
+	eventNames[EventKnowledgePromotePartial] = "KnowledgePromotePartial"
+	eventNames[EventKnowledgePromoteFull] = "KnowledgePromoteFull"
+	eventNames[EventKnowledgeClosed] = "KnowledgeClosed"
 }
 
 // String returns the human-readable name for an EventType,
@@ -409,6 +513,8 @@ const (
 	rangeSteeringHi      EventType = 0x0CFF
 	rangeContextBudgetLo EventType = 0x0D00
 	rangeContextBudgetHi EventType = 0x0DFF
+	rangeBootLo          EventType = 0x0E00
+	rangeBootHi          EventType = 0x0EFF
 )
 
 // IsCommon returns true if the event type is in the common range.
@@ -453,6 +559,9 @@ func (e EventType) IsSteering() bool { return e >= rangeSteeringLo && e <= range
 // IsContextBudget returns true if the event type is a cross-cutting context budget event.
 func (e EventType) IsContextBudget() bool { return e >= rangeContextBudgetLo && e <= rangeContextBudgetHi }
 
+// IsBoot returns true if the event type belongs to the boot/ingestion/knowledge range.
+func (e EventType) IsBoot() bool { return e >= rangeBootLo && e <= rangeBootHi }
+
 // OwnerAgent returns the agent name that owns this event type range,
 // or "unknown" for unassigned ranges.
 func (e EventType) OwnerAgent() string {
@@ -485,6 +594,8 @@ func (e EventType) OwnerAgent() string {
 		return "steering"
 	case e.IsContextBudget():
 		return "context_budget"
+	case e.IsBoot():
+		return "boot"
 	default:
 		return "unknown"
 	}

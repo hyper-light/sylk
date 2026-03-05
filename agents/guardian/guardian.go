@@ -338,6 +338,13 @@ func (g *Guardian) SupportedModels() []container.ModelOption {
 // Deferred Git Wiring
 // ---------------------------------------------------------------------------
 
+// SetRequestGuard wires the demotion guard after construction.
+// Must be called before the first request to prevent activation demotion
+// during in-flight LLM calls.
+func (g *Guardian) SetRequestGuard(guard func() func()) {
+	g.config.RequestGuard = guard
+}
+
 // SetObservabilityDeps wires observability dependencies after construction.
 // Called in Phase 3, after activation and daemon controllers are available.
 // Nil arguments are silently ignored.
@@ -380,6 +387,23 @@ func (g *Guardian) SetGitSubsystems(gitBus *git.GitBus, watcher *git.StatusWatch
 		})
 		g.checkpointMgr.Start(g.runCtx)
 	}
+}
+
+// SetVFSDeps wires VFS observability dependencies after construction.
+// Called in Phase 3 or from the factory closure on daemon restart.
+func (g *Guardian) SetVFSDeps(cvs CVSQuerier, vfs VFSManagerQuerier) {
+	if cvs != nil {
+		g.config.CVS = cvs
+	}
+	if vfs != nil {
+		g.config.VFSManager = vfs
+	}
+}
+
+// SetCostCalculator wires the cost calculator on the health monitor,
+// enabling per-call cost accumulation from LLM activity events.
+func (g *Guardian) SetCostCalculator(fn CostCalculator) {
+	g.healthMon.SetCostCalculator(fn)
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +488,7 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 	// Start health monitor.
 	g.healthMon.Start(ctx)
 
-	g.publishActivity(events.EventTypeAgentAction, "Guardian agent started")
+	g.publishActivityWithVisibility(events.EventTypeAgentAction, events.VisibilitySystem, "Guardian agent started")
 	g.logger.Info("guardian started", "id", g.id)
 	return nil
 }
@@ -663,6 +687,11 @@ func (g *Guardian) handleActionBusRequest(_ context.Context, msg *guide.Message)
 	if !ok || action == nil {
 		return nil
 	}
+	g.logDebug("handleActionBusRequest: action received",
+		"action", action.Action,
+		"correlation_id", action.CorrelationID,
+		"source_agent", action.SourceAgentID,
+		"target_agent", action.TargetAgentID)
 	g.steering.HandleAction(action)
 	return nil
 }
@@ -703,13 +732,47 @@ func (g *Guardian) handleRegistryAnnouncement(msg *guide.Message) error {
 		return nil
 	}
 	g.knownMu.Lock()
+	existing, exists := g.knownAgents[ann.AgentID]
+	if exists {
+		// Merge: never regress Ready from true→false, and preserve
+		// AgentType when the incoming announcement omits it.
+		if existing.Ready && !ann.Ready {
+			ann.Ready = existing.Ready
+			ann.ReadyAt = existing.ReadyAt
+		}
+		if ann.AgentType == "" && existing.AgentType != "" {
+			ann.AgentType = existing.AgentType
+		}
+	}
 	g.knownAgents[ann.AgentID] = ann
 	g.knownMu.Unlock()
+
+	action := "registered"
+	if ann.Ready {
+		action = "ready"
+	}
 	shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventRegistryEvent,
 		g.id, "", "", "info", &agentlog.RegistryPayload{
-			AgentID: ann.AgentID, AgentType: ann.AgentType, Action: "registered",
+			AgentID: ann.AgentID, AgentType: ann.AgentType, Action: action,
 		})
 	return nil
+}
+
+// SeedKnownAgents populates the registry from a snapshot of already-registered
+// agents. Call this after Phase 3 wiring (or after daemon restart) so the
+// Guardian doesn't start with an empty registry waiting for live announcements.
+func (g *Guardian) SeedKnownAgents(agents []*guide.AgentAnnouncement) {
+	g.knownMu.Lock()
+	for _, ann := range agents {
+		if ann == nil {
+			continue
+		}
+		// Only seed if we don't already have a newer entry from a live event.
+		if _, exists := g.knownAgents[ann.AgentID]; !exists {
+			g.knownAgents[ann.AgentID] = ann
+		}
+	}
+	g.knownMu.Unlock()
 }
 
 func (g *Guardian) handleActivityEvent(msg *guide.Message) error {

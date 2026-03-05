@@ -10,6 +10,11 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 )
 
+// CostCalculator computes the cost in USD-cents for a given model and token
+// counts. Implementations typically look up per-model pricing from a registry.
+// Returns 0 when pricing is unavailable.
+type CostCalculator func(model string, inputTokens, outputTokens int) int64
+
 // HealthMonitor tracks agent health, budget consumption, and anomalies.
 type HealthMonitor struct {
 	interval     time.Duration
@@ -17,10 +22,11 @@ type HealthMonitor struct {
 	tokenBudget  int64
 	costBudget   int64
 
-	mu        sync.RWMutex
-	agents    map[string]*agentHealth
-	tokenUsed int64
-	costUsed  int64
+	mu             sync.RWMutex
+	agents         map[string]*agentHealth
+	tokenUsed      int64
+	costUsed       int64
+	costCalculator CostCalculator
 
 	running bool
 	cancel  context.CancelFunc
@@ -32,6 +38,15 @@ func (hm *HealthMonitor) SetOnEvent(fn OnEventFunc) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 	hm.onEvent = fn
+}
+
+// SetCostCalculator wires a function that converts (model, input, output)
+// token counts into a cost in USD-cents. Called under the monitor lock so
+// the implementation must not block.
+func (hm *HealthMonitor) SetCostCalculator(fn CostCalculator) {
+	hm.mu.Lock()
+	defer hm.mu.Unlock()
+	hm.costCalculator = fn
 }
 
 type agentHealth struct {
@@ -124,7 +139,9 @@ func (hm *HealthMonitor) RecordRestart(agentID string) {
 	ah.RestartCount++
 }
 
-// RecordTokenUsage accumulates token usage from activity events.
+// RecordTokenUsage accumulates token and cost usage from activity events.
+// Token fields are additive; cost is derived via the CostCalculator when
+// wired, using the model name and per-call input/output token counts.
 func (hm *HealthMonitor) RecordTokenUsage(evt *events.ActivityEvent) {
 	if evt == nil || evt.Data == nil {
 		return
@@ -132,14 +149,24 @@ func (hm *HealthMonitor) RecordTokenUsage(evt *events.ActivityEvent) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
-	if tokens, ok := evt.Data["input_tokens"].(int); ok {
-		hm.tokenUsed += int64(tokens)
+	var inputTok, outputTok int
+	if v, ok := evt.Data["input_tokens"].(int); ok {
+		inputTok = v
+		hm.tokenUsed += int64(v)
 	}
-	if tokens, ok := evt.Data["output_tokens"].(int); ok {
-		hm.tokenUsed += int64(tokens)
+	if v, ok := evt.Data["output_tokens"].(int); ok {
+		outputTok = v
+		hm.tokenUsed += int64(v)
 	}
-	if tokens, ok := evt.Data["total_tokens"].(int); ok {
-		hm.tokenUsed += int64(tokens)
+	if v, ok := evt.Data["total_tokens"].(int); ok {
+		hm.tokenUsed += int64(v)
+	}
+
+	// Accumulate cost when a calculator is wired and the event carries a model.
+	if hm.costCalculator != nil {
+		if model, ok := evt.Data["model"].(string); ok && model != "" {
+			hm.costUsed += hm.costCalculator(model, inputTok, outputTok)
+		}
 	}
 }
 

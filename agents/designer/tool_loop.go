@@ -68,11 +68,9 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request, 
 		}
 		// ── END STEERING ──
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, d.config.DesignerConfig.MaxToolRuns, req); zone == shared.ZoneCritical {
-				return "", shared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, d.config.DesignerConfig.MaxToolRuns, req); err != nil {
+			return "", err
 		}
 
 		turnStart := time.Now()
@@ -104,14 +102,7 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request, 
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if turn == d.config.DesignerConfig.MaxToolRuns {
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", d.config.DesignerConfig.MaxToolRuns)})
-			}
-			return "", fmt.Errorf("designer exceeded tool-call limit (%d)", d.config.DesignerConfig.MaxToolRuns)
-		}
+
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {

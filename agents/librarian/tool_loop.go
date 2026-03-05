@@ -74,11 +74,9 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 		}
 		// ── END STEERING ──
 
-		// ── CONTEXT GOVERNOR ──
-		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-			if zone := gov.BeginTurn(ctx, turn, maxRuns, req); zone == shared.ZoneCritical {
-				return "", shared.ErrContextBudgetExhausted
-			}
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
+			return "", err
 		}
 
 		turnStart := time.Now()
@@ -107,14 +105,7 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if turn == maxRuns {
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", maxRuns)})
-			}
-			return "", fmt.Errorf("librarian exceeded tool-call limit (%d)", maxRuns)
-		}
+
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {

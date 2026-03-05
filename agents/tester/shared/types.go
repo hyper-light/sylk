@@ -149,7 +149,7 @@ func DefaultPipelineTesterConfig() PipelineTesterConfig {
 	return PipelineTesterConfig{
 		Model:           "gpt-5.3-codex",
 		ReasoningEffort: "xhigh",
-		MaxToolRuns:     12,
+		MaxToolRuns:     32,
 		MaxTokens:       16384,
 		DefaultTimeout:  60 * time.Second,
 	}
@@ -178,7 +178,7 @@ func DefaultGlobalTesterConfig() GlobalTesterConfig {
 	return GlobalTesterConfig{
 		Model:                  "gpt-5.3-codex",
 		ReasoningEffort:        "xhigh",
-		MaxToolRuns:            16,
+		MaxToolRuns:            32,
 		MaxTokens:              16384,
 		DefaultTimeout:         120 * time.Second,
 		CoverageThreshold:      80.0,

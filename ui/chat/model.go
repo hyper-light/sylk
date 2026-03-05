@@ -149,14 +149,14 @@ var agentThinkingMessages = map[string][]string{
 		"Nothing is ever truly deleted...",
 	},
 	"guardian": {
-		"Perimeter secure...",
-		"All defenses online...",
-		"Holding the line...",
-		"Nothing gets through...",
-		"You shall not pass... unchecked...",
-		"Validating credentials...",
-		"I don't trust that input...",
-		"Guardian protocol engaged...",
+		"Running the safety checklist...",
+		"Keeping an eye on things...",
+		"Double-checking everything looks good...",
+		"Making sure nothing slipped through...",
+		"Quietly watching over the workspace...",
+		"All systems nominal...",
+		"Taking a careful look around...",
+		"Just doing my rounds...",
 	},
 }
 
@@ -542,11 +542,11 @@ func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 }
 
 func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
+	m.updateThinkingAgent(progress.AgentID)
 	message := sanitizeThinkingMessage(progress.Message)
 	if message == "" {
 		return nil
 	}
-	m.updateThinkingAgent(progress.AgentID)
 	if m.thinkingIdx < 0 {
 		return nil
 	}
@@ -1286,6 +1286,12 @@ func (m *Model) updateThinkingAgent(agentID string) {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" || m.thinkingIdx < 0 {
 		return
+	}
+	// When the active agent changes (e.g. guide → architect), clear the
+	// progress override so agent-specific rotating messages take over.
+	if agentID != m.thinkingAgentID {
+		m.retryText = ""
+		m.thinkingMsgIdx = 0
 	}
 	m.thinkingAgentID = agentID
 	idx := m.thinkingIdx

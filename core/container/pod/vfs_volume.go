@@ -52,7 +52,7 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 		return nil
 	}
 
-	pipelineVFS, err := v.sessionVFS.CVS().BeginPipeline(versioning.BeginPipelineConfig{
+	pipelineVFS, err := v.sessionVFS.BeginPipeline(versioning.BeginPipelineConfig{
 		PipelineID: v.pipelineID,
 		SessionID:  v.sessionID,
 		WorkingDir: v.workingDir,
@@ -75,7 +75,11 @@ func (v *VFSVolume) Unmount(_ context.Context) error {
 
 	v.pipelineFA = nil
 	v.mounted = false
-	return v.sessionVFS.VFSManager().ClosePipelineVFS(v.pipelineID)
+
+	// Commit pipeline changes to the global VFS via MergePipe.
+	// Previously this only closed the VFS (changes were lost).
+	_, err := v.sessionVFS.CommitPipeline(v.pipelineID)
+	return err
 }
 
 func (v *VFSVolume) FileAccess() versioning.FileAccess {

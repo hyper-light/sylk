@@ -26,7 +26,7 @@ import (
 // Default configuration values.
 const (
 	DefaultModel       = "claude-opus-4-5-20250115"
-	DefaultMaxToolRuns = 12
+	DefaultMaxToolRuns = 32
 )
 
 // academicProvider is the minimal interface the Academic needs from its LLM.

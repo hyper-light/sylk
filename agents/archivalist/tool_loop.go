@@ -14,7 +14,7 @@ import (
 	"github.com/adalundhe/sylk/core/steering"
 )
 
-const defaultMaxToolRuns = 10
+const defaultMaxToolRuns = 32
 
 // executeToolLoop runs the LLM tool-call loop with steering checkpoints.
 // Complete → check ToolCalls → execute → append results → repeat.
@@ -53,6 +53,11 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 			continue
 		}
 
+		// ── CONTEXT BUDGET ──
+		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
+			return "", err
+		}
+
 		turnStart := time.Now()
 		resp, err := p.Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
@@ -62,10 +67,6 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 
 		if len(resp.ToolCalls) == 0 {
 			return strings.TrimSpace(resp.Content), nil
-		}
-
-		if turn == maxRuns {
-			return "", fmt.Errorf("archivalist exceeded tool-call limit (%d)", maxRuns)
 		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {

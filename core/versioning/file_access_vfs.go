@@ -16,6 +16,7 @@ import (
 type VFSFileAccess struct {
 	vfs        *PipelineVFS
 	workingDir string
+	readOnly   bool
 }
 
 // NewVFSFileAccess creates a FileAccess backed by a per-pipeline VFS.
@@ -26,15 +27,30 @@ func NewVFSFileAccess(vfs *PipelineVFS, workingDir string) *VFSFileAccess {
 	}
 }
 
+// NewReadOnlyVFSFileAccess creates a read-only FileAccess backed by a VFS.
+func NewReadOnlyVFSFileAccess(vfs *PipelineVFS, workingDir string) *VFSFileAccess {
+	return &VFSFileAccess{
+		vfs:        vfs,
+		workingDir: workingDir,
+		readOnly:   true,
+	}
+}
+
 func (v *VFSFileAccess) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	return v.vfs.Read(ctx, v.resolve(path))
 }
 
 func (v *VFSFileAccess) WriteFile(ctx context.Context, path string, content []byte) error {
+	if v.readOnly {
+		return ErrPermissionDenied
+	}
 	return v.vfs.Write(ctx, v.resolve(path), content)
 }
 
 func (v *VFSFileAccess) EditFile(ctx context.Context, path string, edits []FileEdit) error {
+	if v.readOnly {
+		return ErrPermissionDenied
+	}
 	resolved := v.resolve(path)
 	content, err := v.vfs.Read(ctx, resolved)
 	if err != nil {
@@ -51,6 +67,9 @@ func (v *VFSFileAccess) EditFile(ctx context.Context, path string, edits []FileE
 }
 
 func (v *VFSFileAccess) DeleteFile(ctx context.Context, path string) error {
+	if v.readOnly {
+		return ErrPermissionDenied
+	}
 	return v.vfs.Delete(ctx, v.resolve(path))
 }
 
@@ -103,7 +122,7 @@ func (v *VFSFileAccess) Stat(_ context.Context, path string) (fs.FileInfo, error
 }
 
 func (v *VFSFileAccess) WorkingDir() string { return v.workingDir }
-func (v *VFSFileAccess) IsReadOnly() bool   { return false }
+func (v *VFSFileAccess) IsReadOnly() bool   { return v.readOnly }
 
 func (v *VFSFileAccess) resolve(path string) string {
 	if filepath.IsAbs(path) {

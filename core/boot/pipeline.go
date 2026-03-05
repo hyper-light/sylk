@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/ingestion"
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder"
@@ -21,12 +21,13 @@ import (
 
 // PipelineConfig controls the boot pipeline behavior.
 type PipelineConfig struct {
-	ProjectRoot string
-	Workers     int // Unused after rewrite; kept for API compat.
-	BatchSize   int // Unused after rewrite; kept for API compat.
+	ProjectRoot  string
+	Workers      int // Unused after rewrite; kept for API compat.
+	BatchSize    int // Unused after rewrite; kept for API compat.
 	EmbedWorkers int // Unused after rewrite; kept for API compat.
-	ForceTier   *embedder.ModelTier
-	OnProgress  func(phase string, current, total int64)
+	ForceTier    *embedder.ModelTier
+	OnProgress   func(phase string, current, total int64)
+	Logger       *agentlog.BootEventLogger
 }
 
 func (c *PipelineConfig) withDefaults() *PipelineConfig {
@@ -75,6 +76,7 @@ type Pipeline struct {
 	config   *PipelineConfig
 	embedder embedder.Embedder
 	source   string
+	logger   *agentlog.BootEventLogger
 
 	errOnce sync.Once
 	err     error
@@ -97,6 +99,7 @@ func NewPipeline(ctx context.Context, config PipelineConfig) (*Pipeline, error) 
 		config:   cfg,
 		embedder: result.Embedder,
 		source:   result.Source,
+		logger:   cfg.Logger,
 	}, nil
 }
 
@@ -131,24 +134,46 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	result.IsGitRepo = isGitRepo
 	result.IsIncremental = MetaExists(projectRoot)
 
+	p.logBootEvent(agentlog.EventBootStarted, "info", &agentlog.BootPhasePayload{
+		Phase:       "started",
+		ProjectRoot: projectRoot,
+		IsIncr:      result.IsIncremental,
+	})
+
 	// Phase 1: Setup
 	setupStart := time.Now()
 	sd, gm, canonIdx, commitWAL, err := p.setupSylkDir(projectRoot)
 	if err != nil {
+		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "setup", Err: err.Error()})
 		return nil, fmt.Errorf("setup: %w", err)
 	}
 	defer sd.Unlock()
 	defer commitWAL.Close()
 	result.Phases.Setup = time.Since(setupStart)
+	p.logBootPhase(agentlog.EventBootSetup, "setup", result.Phases.Setup, nil)
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Phase 2: Change detection
 	detectStart := time.Now()
 	meta, changes, skip := p.detectChanges(ctx, projectRoot, isGitRepo)
 	result.Phases.Detect = time.Since(detectStart)
+	p.logBootPhase(agentlog.EventBootDetect, "detect", result.Phases.Detect, nil)
 
 	if skip {
+		result.BackgroundHasher = completedHasher()
 		result.Duration = time.Since(start)
+		p.logBootEvent(agentlog.EventBootSkipped, "info", &agentlog.BootPhasePayload{
+			Phase: "skipped",
+			DurNs: result.Duration.Nanoseconds(),
+		})
 		return result, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	p.reportProgress("setup", 1, 6)
@@ -157,10 +182,17 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	allocStart := time.Now()
 	sess, err := p.createSession(ctx, sd, gm, projectRoot, changes)
 	if err != nil {
+		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "allocate", Err: err.Error()})
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 	defer sess.Close()
 	result.Phases.Allocate = time.Since(allocStart)
+	p.logBootPhase(agentlog.EventBootAllocate, "allocate", result.Phases.Allocate, nil)
+
+	// Bind logger to session — drains staging into session-scoped log.
+	if p.logger != nil {
+		_ = p.logger.BindSession(sd.SessionPath(sess.Meta.StringID), sess.Meta.StringID)
+	}
 
 	p.reportProgress("allocate", 2, 6)
 
@@ -176,45 +208,79 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	// Non-nil (even empty) PendingNodes is the sentinel.
 	sess.PendingNodes = make([]*sylkdir.Node, 0)
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Phase 4: Ingest via SessionIngestion
-	log.Printf("[boot] Phase 4: Ingest starting")
 	ingestStart := time.Now()
 	ingestResult, err := p.ingest(ctx, sess, sd, projectRoot, changes)
 	if err != nil {
+		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "ingest", Err: err.Error()})
 		return nil, fmt.Errorf("ingest: %w", err)
 	}
 	result.Phases.Ingest = time.Since(ingestStart)
-	log.Printf("[boot] Phase 4: Ingest done: %v", result.Phases.Ingest)
+	p.logBootPhase(agentlog.EventBootIngest, "ingest", result.Phases.Ingest, nil)
 
 	p.reportProgress("ingest", 4, 6)
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Phase 5: Commit to global
-	log.Printf("[boot] Phase 5: Commit starting")
 	commitStart := time.Now()
-	commitResult, err := p.commitToGlobal(sess, sd, gm, canonIdx, commitWAL, projectRoot, changes)
+	commitResult, err := p.commitToGlobal(ctx, sess, sd, gm, canonIdx, commitWAL, projectRoot, changes)
 	if err != nil {
+		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "commit", Err: err.Error()})
 		return nil, fmt.Errorf("commit: %w", err)
 	}
 	result.Phases.Commit = time.Since(commitStart)
 	result.BackgroundIndexer = commitResult.BackgroundIndexer
-	log.Printf("[boot] Phase 5: Commit done: %v", result.Phases.Commit)
+	p.logBootPhase(agentlog.EventBootCommit, "commit", result.Phases.Commit, nil)
 
 	p.reportProgress("commit", 5, 6)
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Phase 6: Finalize meta
-	log.Printf("[boot] Phase 6: Finalize starting")
 	finalizeStart := time.Now()
 	p.finalizeMeta(projectRoot, isGitRepo, meta, ingestResult, commitResult, result)
 	if err := meta.Save(projectRoot); err != nil {
+		p.logBootEvent(agentlog.EventBootError, "error", &agentlog.BootPhasePayload{Phase: "finalize", Err: err.Error()})
 		return nil, fmt.Errorf("save meta: %w", err)
 	}
 	result.Phases.Finalize = time.Since(finalizeStart)
-	log.Printf("[boot] Phase 6: Finalize done: %v", result.Phases.Finalize)
+	p.logBootPhase(agentlog.EventBootFinalize, "finalize", result.Phases.Finalize, nil)
 
-	// File hashing runs asynchronously — only needed for next boot's change detection.
-	result.BackgroundHasher = p.startBackgroundHashing(projectRoot, meta)
+	// File hashing — runs synchronously under the caller's context.
+	// Previously an untracked goroutine; now bounded by ctx so
+	// the scope worker exits promptly on shutdown.
+	p.populateFileHashes(ctx, meta, projectRoot)
+	if err := ctx.Err(); err == nil {
+		if saveErr := meta.Save(projectRoot); saveErr != nil {
+			p.logBootEvent(agentlog.EventBootError, "warn", &agentlog.BootPhasePayload{
+				Phase: "background_hash",
+				Err:   saveErr.Error(),
+			})
+		}
+	}
 
+	result.BackgroundHasher = completedHasher()
 	result.Duration = time.Since(start)
+
+	p.logBootEvent(agentlog.EventBootCompleted, "info", &agentlog.BootResultPayload{
+		Files:    result.FilesProcessed,
+		Nodes:    result.NodesCreated,
+		Edges:    result.EdgesCreated,
+		Docs:     result.DocsCreated,
+		Vectors:  result.VectorsCreated,
+		DurNs:    result.Duration.Nanoseconds(),
+		Embedder: result.EmbedderSource,
+		Version:  result.CommitVersion,
+	})
 
 	p.reportProgress("done", 6, 6)
 	return result, nil
@@ -349,6 +415,7 @@ func (p *Pipeline) estimateFileCount(ctx context.Context, root string, changes [
 func (p *Pipeline) ingest(ctx context.Context, sess *sylkdir.Session, sd *sylkdir.SylkDir, root string, changes []FileChange) (*sylkdir.SessionIngestionResult, error) {
 	si := sylkdir.NewSessionIngestion(sess)
 	si.SetEmbedder(p.embedder)
+	si.SetLogger(p.logger)
 
 	cache := NewParseCache(filepath.Join(sd.CachePath(), "parse"))
 
@@ -382,6 +449,7 @@ func changesToAbsPaths(root string, changes []FileChange) map[string]bool {
 // When changes is nil (cold start), uses ScopeRoots for full scope-based orphan detection.
 // When changes is non-nil (delta), uses DeletedPaths for explicit file tombstoning.
 func (p *Pipeline) commitToGlobal(
+	ctx context.Context,
 	sess *sylkdir.Session,
 	sd *sylkdir.SylkDir,
 	gm *sylkdir.GlobalMeta,
@@ -400,13 +468,14 @@ func (p *Pipeline) commitToGlobal(
 		GlobalBleveStore:   bleveStore,
 		CommitWAL:          commitWAL,
 		DeferBleveIndexing: true,
+		Logger:             p.logger,
 	}
 	if changes == nil {
 		cfg.ScopeRoots = []string{root}
 	} else {
 		cfg.DeletedPaths = extractDeletedPaths(root, changes)
 	}
-	return sylkdir.CommitToGlobal(cfg)
+	return sylkdir.CommitToGlobal(ctx, cfg)
 }
 
 // extractDeletedPaths returns absolute paths of deleted files from the change list.
@@ -421,7 +490,6 @@ func extractDeletedPaths(root string, changes []FileChange) []string {
 }
 
 // finalizeMeta updates Meta and PipelineResult from the ingestion and commit results.
-// File hashing is deferred to startBackgroundHashing (not needed for current boot).
 func (p *Pipeline) finalizeMeta(
 	root string,
 	isGitRepo bool,
@@ -487,6 +555,9 @@ func (p *Pipeline) populateFileHashes(ctx context.Context, meta *Meta, root stri
 			defer wg.Done()
 			local := make([]hashEntry, 0, len(batch))
 			for _, f := range batch {
+				if ctx.Err() != nil {
+					break
+				}
 				rel, _ := filepath.Rel(root, f.Path)
 				if h := hashFileContents(f.Path); h != "" {
 					local = append(local, hashEntry{rel: rel, hash: h})
@@ -528,6 +599,9 @@ func hashFileContents(path string) string {
 // BackgroundHasher computes file hashes asynchronously after boot completes.
 // Hashes are only needed for the next boot's change detection, so they
 // run off the critical path. The caller can Wait() to block until done.
+// BackgroundHasher signals when file hashing is complete. After the
+// refactor to inline hashing under the caller's context, new instances
+// are returned already-done; the type is kept for API compatibility.
 type BackgroundHasher struct {
 	done chan struct{}
 }
@@ -544,19 +618,11 @@ func (bh *BackgroundHasher) Done() <-chan struct{} {
 	return bh.done
 }
 
-// startBackgroundHashing launches a goroutine to compute file hashes and
-// re-save Meta with the hashes populated. Returns a BackgroundHasher the
-// caller can Wait() on.
-func (p *Pipeline) startBackgroundHashing(root string, meta *Meta) *BackgroundHasher {
-	bh := &BackgroundHasher{done: make(chan struct{})}
-	go func() {
-		defer close(bh.done)
-		p.populateFileHashes(context.Background(), meta, root)
-		if err := meta.Save(root); err != nil {
-			log.Printf("[boot] background hash save: %v", err)
-		}
-	}()
-	return bh
+// completedHasher returns a BackgroundHasher whose channel is already closed.
+func completedHasher() *BackgroundHasher {
+	ch := make(chan struct{})
+	close(ch)
+	return &BackgroundHasher{done: ch}
 }
 
 func (p *Pipeline) setError(err error) {
@@ -572,6 +638,33 @@ func (p *Pipeline) reportProgress(phase string, current, total int64) {
 	if p.config.OnProgress != nil {
 		p.config.OnProgress(phase, current, total)
 	}
+}
+
+// logBootEvent emits a structured JSONL entry through the BootEventLogger.
+func (p *Pipeline) logBootEvent(eventType agentlog.EventType, level string, data any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     "boot",
+		Event:     eventType.String(),
+		EventCode: eventType,
+		Data:      data,
+	})
+}
+
+// logBootPhase emits a phase-timing event.
+func (p *Pipeline) logBootPhase(eventType agentlog.EventType, phase string, dur time.Duration, extra func(*agentlog.BootPhasePayload)) {
+	payload := &agentlog.BootPhasePayload{
+		Phase: phase,
+		DurNs: dur.Nanoseconds(),
+	}
+	if extra != nil {
+		extra(payload)
+	}
+	p.logBootEvent(eventType, "info", payload)
 }
 
 // Boot runs the full boot pipeline for the given project root.

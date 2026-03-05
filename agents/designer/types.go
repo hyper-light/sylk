@@ -460,7 +460,7 @@ func DefaultDesignerToolLoopConfig() DesignerConfig {
 	return DesignerConfig{
 		Model:           "gemini-3.1-pro-preview",
 		ReasoningEffort: "high",
-		MaxToolRuns:     16,
+		MaxToolRuns:     32,
 		MaxTokens:       16384,
 		DefaultTimeout:  90 * time.Second,
 	}
