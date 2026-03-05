@@ -113,8 +113,11 @@ type ResponseStream struct {
 
 // StreamUsage carries real token counts from LLM provider responses.
 type StreamUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }
 
 // StreamEvent represents an event in a response stream

@@ -61,6 +61,7 @@ type Model struct {
 	// Right section
 	authIcons     *AuthIconDisplay
 	tokens        *TokenDisplay
+	progress      *ProgressDisplay
 	droppedEvents atomic.Int64
 
 	// View cache: avoids re-rendering when no visible state changed.
@@ -80,6 +81,7 @@ func New(t *theme.Theme, mgr *session.Manager) *Model {
 		spinner:   NewSpinner(),
 		authIcons: NewAuthIconDisplay(t.StatusBar, t.StatusNormal, t.StatusError),
 		tokens:    NewTokenDisplay(t.StatusBar, t.StatusNormal),
+		progress:  NewProgressDisplay(t.StatusNormal, t.StatusBar, t.StatusBar),
 	}
 }
 
@@ -109,6 +111,8 @@ func (m *Model) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleStreamError(v)
 	case msg.EventsDroppedMsg:
 		return m.handleEventsDropped(v)
+	case msg.IndexProgressMsg:
+		return m.handleIndexProgress(v)
 	default:
 		return m, nil
 	}
@@ -192,9 +196,10 @@ func (m *Model) SetViewRingHint(hint string) {
 	m.viewDirty = true
 }
 
-// SetTokens updates the cumulative prompt and completion token counts.
-func (m *Model) SetTokens(prompt, completion int) {
-	m.tokens.Update(prompt, completion)
+// SetTokens updates the cumulative prompt, completion, cache-read, and
+// reasoning token counts.
+func (m *Model) SetTokens(prompt, completion, cacheRead, reasoning int) {
+	m.tokens.Update(prompt, completion, cacheRead, reasoning)
 	m.viewDirty = true
 }
 
@@ -222,7 +227,7 @@ func (m *Model) SetNerdFonts(detected bool) {
 // Uses m.flash rather than time-based check to guarantee the clearing
 // tick fires even when the flash deadline and the tick align exactly.
 func (m *Model) IsAnimating() bool {
-	return m.spinnerActive || m.flash != "" || m.tokens.IsAnimating()
+	return m.spinnerActive || m.flash != "" || m.tokens.IsAnimating() || m.progress.IsActive() || m.progress.IsAnimating()
 }
 
 func (m *Model) handleDecorTick(now time.Time) (tea.Model, tea.Cmd) {
@@ -236,9 +241,15 @@ func (m *Model) handleDecorTick(now time.Time) (tea.Model, tea.Cmd) {
 		m.lastTokenSpin = now
 		m.viewDirty = true
 	}
+	if m.progress.Tick() {
+		m.viewDirty = true
+	}
 	if !m.flashUntil.IsZero() && !now.Before(m.flashUntil) {
 		m.flash = ""
 		m.flashUntil = time.Time{}
+		m.viewDirty = true
+	}
+	if m.progress.CheckExpiry(now) {
 		m.viewDirty = true
 	}
 	return m, nil
@@ -291,6 +302,16 @@ func (m *Model) handleEventsDropped(v msg.EventsDroppedMsg) (tea.Model, tea.Cmd)
 	return m, nil
 }
 
+func (m *Model) handleIndexProgress(v msg.IndexProgressMsg) (tea.Model, tea.Cmd) {
+	if v.Done {
+		m.progress.Clear()
+	} else {
+		m.progress.Update(IndexPhase(v.Phase), v.Current, v.Total)
+	}
+	m.viewDirty = true
+	return m, nil
+}
+
 // -- Section renderers ------------------------------------------------------
 
 func (m *Model) renderLeft() string {
@@ -337,6 +358,10 @@ func (m *Model) renderRight() string {
 	tokens := m.tokens.View()
 
 	result := auth + sep + tokens
+
+	if pv := m.progress.View(); pv != "" {
+		result = pv + sep + result
+	}
 
 	dropped := m.droppedEvents.Load()
 	if dropped > 0 {

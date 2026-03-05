@@ -86,6 +86,9 @@ func convertComplete(d *streamDispatcher, event *guide.StreamEvent) any {
 	if event.Usage != nil {
 		complete.InputTokens = event.Usage.InputTokens
 		complete.OutputTokens = event.Usage.OutputTokens
+		complete.ReasoningTokens = event.Usage.ReasoningTokens
+		complete.CacheReadTokens = event.Usage.CacheReadTokens
+		complete.CacheWriteTokens = event.Usage.CacheWriteTokens
 	}
 	return complete
 }

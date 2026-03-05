@@ -783,8 +783,10 @@ func (g *Guardian) handleActivityEvent(msg *guide.Message) error {
 	if !ok {
 		return nil
 	}
-	// Track token usage for budget monitoring.
-	if evt.EventType == events.EventTypeLLMRequest || evt.EventType == events.EventTypeLLMResponse {
+	// Track token usage for budget monitoring. Only process response events
+	// to avoid double-counting (request events carry estimated input tokens
+	// that the response event supersedes with actuals).
+	if evt.EventType == events.EventTypeLLMResponse {
 		g.healthMon.RecordTokenUsage(evt)
 	}
 	return nil

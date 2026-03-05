@@ -47,7 +47,6 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
-	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/security"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/core/storage"
@@ -336,6 +335,16 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	googleGateway := gateway.NewProviderGateway(googleGwCfg, slog.Default())
 	anthropicGateway := gateway.NewProviderGateway(gateway.DefaultAnthropicConfig(), slog.Default())
 	openaiGateway := gateway.NewProviderGateway(gateway.DefaultOpenAIConfig(), slog.Default())
+
+	// Wire LLM usage telemetry: every provider call that flows through a
+	// gateway publishes an ActivityEvent so the Guardian's HealthMonitor
+	// can track token consumption and cost.
+	llmEventHook := providers.NewLLMEventPublisherHook(
+		providers.NewLLMEventPublisher(activityPub),
+	)
+	googleGateway.SetEventHook(llmEventHook)
+	anthropicGateway.SetEventHook(llmEventHook)
+	openaiGateway.SetEventHook(llmEventHook)
 
 	// Identity registry: generates canonical UUID8s per agent type at
 	// registration time so IDs are sticky across spin-up/spin-down cycles.
@@ -1130,6 +1139,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 			r, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
 				ProjectRoot: projectRoot,
 				Logger:      bootLogger,
+				OnProgress:  knowledgeStore.NotifyProgress,
 			})
 			ch <- bootOut{r, err}
 		}()
@@ -1270,7 +1280,8 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				slog.Warn("agent model config: save", "agent", agentType, "provider", provider, "model", modelID, "error", err)
 			}
 		},
-		AgentModelStore: modelStore,
+		AgentModelStore:  modelStore,
+		KnowledgeStore:   knowledgeStore,
 	}
 
 	return deps, cleanup, nil
@@ -2861,12 +2872,21 @@ func buildCostCalculator() guardian.CostCalculator {
 		"gemini-2.5-flash":       {0.075, 0.30},
 	}
 
-	return func(model string, inputTokens, outputTokens int) int64 {
+	return func(model string, usage *providers.Usage) int64 {
 		p, ok := prices[model]
-		if !ok {
+		if !ok || usage == nil {
 			return 0
 		}
-		costUSD := llm.CalculateCost(int64(inputTokens), int64(outputTokens), p.input, p.output)
+		// Cache reads cost 90% less at Anthropic, 50% less at OpenAI/Google.
+		// Subtract cache-read tokens from full-price input and price separately.
+		fullPriceInput := int64(usage.InputTokens - usage.CacheReadTokens)
+		cacheReadInput := int64(usage.CacheReadTokens)
+		cacheWriteInput := int64(usage.CacheWriteTokens)
+
+		costUSD := float64(fullPriceInput) / 1_000_000 * p.input
+		costUSD += float64(cacheReadInput) / 1_000_000 * (p.input * 0.1)   // 90% discount
+		costUSD += float64(cacheWriteInput) / 1_000_000 * (p.input * 1.25) // 25% surcharge
+		costUSD += float64(usage.OutputTokens) / 1_000_000 * p.output
 		// Convert to cents, rounding down (accumulation converges).
 		return int64(costUSD * 100)
 	}

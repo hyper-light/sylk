@@ -25,7 +25,7 @@ import (
 
 // Default configuration values.
 const (
-	DefaultModel       = "claude-opus-4-5-20250115"
+	DefaultModel       = "gemini-3.1-pro-preview"
 	DefaultMaxToolRuns = 32
 )
 

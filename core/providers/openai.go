@@ -1891,9 +1891,11 @@ func extractOpenAIReasoningItems(result *responses.Response) []openAIReasoningIt
 func (p *OpenAIProvider) convertResponseUsage(result responses.Response) Usage {
 	usage := result.Usage
 	return Usage{
-		InputTokens:  int(usage.InputTokens),
-		OutputTokens: int(usage.OutputTokens),
-		TotalTokens:  int(usage.TotalTokens),
+		InputTokens:     int(usage.InputTokens),
+		OutputTokens:    int(usage.OutputTokens),
+		TotalTokens:     int(usage.TotalTokens),
+		CacheReadTokens: int(usage.InputTokensDetails.CachedTokens),
+		ReasoningTokens: int(usage.OutputTokensDetails.ReasoningTokens),
 	}
 }
 

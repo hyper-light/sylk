@@ -9,9 +9,12 @@ import (
 // designerUsageAccumulator sums real token counts from multiple LLM calls
 // within a single Designer request. Thread-safe for the tool loop.
 type designerUsageAccumulator struct {
-	mu          sync.Mutex
-	inputTotal  int
-	outputTotal int
+	mu              sync.Mutex
+	inputTotal      int
+	outputTotal     int
+	reasoningTotal  int
+	cacheReadTotal  int
+	cacheWriteTotal int
 }
 
 func (a *designerUsageAccumulator) Add(usage *providers.Usage) {
@@ -21,6 +24,9 @@ func (a *designerUsageAccumulator) Add(usage *providers.Usage) {
 	a.mu.Lock()
 	a.inputTotal += usage.InputTokens
 	a.outputTotal += usage.OutputTokens
+	a.reasoningTotal += usage.ReasoningTokens
+	a.cacheReadTotal += usage.CacheReadTokens
+	a.cacheWriteTotal += usage.CacheWriteTokens
 	a.mu.Unlock()
 }
 

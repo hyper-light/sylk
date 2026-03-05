@@ -37,9 +37,12 @@ func StreamMetadataFromContext(ctx context.Context) (InspectorStreamContext, boo
 
 // InspectorUsageAccumulator tracks token usage across multiple LLM calls.
 type InspectorUsageAccumulator struct {
-	mu          sync.Mutex
-	inputTotal  int
-	outputTotal int
+	mu              sync.Mutex
+	inputTotal      int
+	outputTotal     int
+	reasoningTotal  int
+	cacheReadTotal  int
+	cacheWriteTotal int
 }
 
 type inspectorUsageAccumulatorKey struct{}
@@ -62,6 +65,9 @@ func AccumulateUsage(ctx context.Context, usage *providers.Usage) {
 	acc.mu.Lock()
 	acc.inputTotal += usage.InputTokens
 	acc.outputTotal += usage.OutputTokens
+	acc.reasoningTotal += usage.ReasoningTokens
+	acc.cacheReadTotal += usage.CacheReadTokens
+	acc.cacheWriteTotal += usage.CacheWriteTokens
 	acc.mu.Unlock()
 }
 
@@ -73,8 +79,11 @@ func (a *InspectorUsageAccumulator) Total() *guide.StreamUsage {
 		return nil
 	}
 	return &guide.StreamUsage{
-		InputTokens:  a.inputTotal,
-		OutputTokens: a.outputTotal,
+		InputTokens:      a.inputTotal,
+		OutputTokens:     a.outputTotal,
+		ReasoningTokens:  a.reasoningTotal,
+		CacheReadTokens:  a.cacheReadTotal,
+		CacheWriteTokens: a.cacheWriteTotal,
 	}
 }
 

@@ -37,6 +37,9 @@ type BackgroundIndexer struct {
 	indexed    atomic.Int64
 	total      int64
 	logger     *agentlog.BootEventLogger // nil-safe
+
+	progressMu sync.Mutex
+	progressFn func(indexed, total int64) // observer callback, fired after each batch
 }
 
 // NewBackgroundIndexer creates an indexer and starts a single tracked goroutine
@@ -123,6 +126,7 @@ func (bi *BackgroundIndexer) indexBatch(ids []string) {
 		return
 	}
 	bi.indexed.Add(int64(len(toIndex)))
+	bi.notifyProgress()
 }
 
 // claimDocs atomically claims doc IDs and converts them to search documents.
@@ -213,6 +217,7 @@ func (bi *BackgroundIndexer) PromoteDocs(ctx context.Context, docIDs []string) e
 		return err
 	}
 	bi.indexed.Add(int64(len(toIndex)))
+	bi.notifyProgress()
 	return nil
 }
 
@@ -246,4 +251,23 @@ func (bi *BackgroundIndexer) BleveStore() *GlobalVersionBleveStore {
 // Progress returns the number of documents indexed so far and the total count.
 func (bi *BackgroundIndexer) Progress() (indexed, total int64) {
 	return bi.indexed.Load(), bi.total
+}
+
+// OnProgress registers a callback that fires after each batch is indexed.
+// The callback receives the cumulative indexed count and total. Safe to call
+// concurrently; replaces any previously registered observer.
+func (bi *BackgroundIndexer) OnProgress(fn func(indexed, total int64)) {
+	bi.progressMu.Lock()
+	bi.progressFn = fn
+	bi.progressMu.Unlock()
+}
+
+// notifyProgress fires the progress observer if registered.
+func (bi *BackgroundIndexer) notifyProgress() {
+	bi.progressMu.Lock()
+	fn := bi.progressFn
+	bi.progressMu.Unlock()
+	if fn != nil {
+		fn(bi.indexed.Load(), bi.total)
+	}
 }

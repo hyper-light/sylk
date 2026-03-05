@@ -24,6 +24,11 @@ func (g *Guardian) registerCoreSkills() {
 	g.skills.Register(agentLogsSkill(g))
 	g.skills.Register(systemStatusSkill(g))
 	g.skills.Register(vfsStatusSkill(g))
+	g.skills.Register(pipelineStatusSkill(g))
+	g.skills.Register(gatewayMetricsSkill(g))
+	g.skills.Register(knowledgeStatusSkill(g))
+	g.skills.Register(concurrencyStatusSkill(g))
+	g.skills.Register(usageBreakdownSkill(g))
 	g.skills.Register(shared.NewSelfDiagnosticSkill(&guardianDiag{g: g}))
 	g.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "guardian",

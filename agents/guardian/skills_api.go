@@ -17,6 +17,11 @@ func guardianCoreSkillNames() []string {
 		"agent_logs",
 		"system_status",
 		"vfs_status",
+		"pipeline_status",
+		"gateway_metrics",
+		"knowledge_status",
+		"concurrency_status",
+		"usage_breakdown",
 	}
 }
 
@@ -31,6 +36,11 @@ func guardianAllSkillNames() []string {
 		"agent_logs",
 		"system_status",
 		"vfs_status",
+		"pipeline_status",
+		"gateway_metrics",
+		"knowledge_status",
+		"concurrency_status",
+		"usage_breakdown",
 		"read_file",
 		"glob",
 		"grep",

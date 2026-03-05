@@ -357,7 +357,7 @@ func TestLLMEventPublisherHook_OnResponse(t *testing.T) {
 	publisher := NewLLMEventPublisher(collector)
 	hook := NewLLMEventPublisherHook(publisher)
 
-	hook.OnResponse("session-1", "agent-1", "claude-3", 1000, 500, 500*time.Millisecond)
+	hook.OnResponse("session-1", "agent-1", "claude-3", &Usage{InputTokens: 1000, OutputTokens: 500}, 500*time.Millisecond)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -389,7 +389,7 @@ func TestLLMEventPublisherHook_NilSafety(t *testing.T) {
 		var hook *LLMEventPublisherHook
 		// Should not panic
 		hook.OnRequest("session", "agent", "model", 100)
-		hook.OnResponse("session", "agent", "model", 100, 50, time.Second)
+		hook.OnResponse("session", "agent", "model", &Usage{InputTokens: 100, OutputTokens: 50}, time.Second)
 		hook.OnError("session", "agent", "model", errors.New("test"))
 	})
 
@@ -397,7 +397,7 @@ func TestLLMEventPublisherHook_NilSafety(t *testing.T) {
 		hook := &LLMEventPublisherHook{publisher: nil}
 		// Should not panic
 		hook.OnRequest("session", "agent", "model", 100)
-		hook.OnResponse("session", "agent", "model", 100, 50, time.Second)
+		hook.OnResponse("session", "agent", "model", &Usage{InputTokens: 100, OutputTokens: 50}, time.Second)
 		hook.OnError("session", "agent", "model", errors.New("test"))
 	})
 }
@@ -411,7 +411,7 @@ func TestNoOpLLMEventHook(t *testing.T) {
 
 	// Should not panic, no state to verify
 	hook.OnRequest("session", "agent", "model", 100)
-	hook.OnResponse("session", "agent", "model", 100, 50, time.Second)
+	hook.OnResponse("session", "agent", "model", &Usage{InputTokens: 100, OutputTokens: 50}, time.Second)
 	hook.OnError("session", "agent", "model", errors.New("test"))
 }
 
@@ -492,7 +492,7 @@ func TestLLMEventPublisher_FullWorkflow(t *testing.T) {
 	hook.OnRequest(sessionID, agentID, model, 1500)
 
 	// 2. Response received
-	hook.OnResponse(sessionID, agentID, model, 1500, 750, 500*time.Millisecond)
+	hook.OnResponse(sessionID, agentID, model, &Usage{InputTokens: 1500, OutputTokens: 750}, 500*time.Millisecond)
 
 	evts := collector.Events()
 	if len(evts) < 2 {

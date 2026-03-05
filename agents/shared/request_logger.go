@@ -17,13 +17,13 @@ func truncate(s string, max int) string {
 	return s[:max] + "…"
 }
 
-// TokenCount safely extracts input and output token counts from a
-// possibly-nil providers.Response.
-func TokenCount(resp *providers.Response) (int, int) {
+// TokenCount safely extracts the full usage from a possibly-nil
+// providers.Response. Returns a zero Usage when resp is nil.
+func TokenCount(resp *providers.Response) providers.Usage {
 	if resp == nil {
-		return 0, 0
+		return providers.Usage{}
 	}
-	return resp.Usage.InputTokens, resp.Usage.OutputTokens
+	return resp.Usage
 }
 
 // LogAgentEvent is a generic dual-write helper that records an agent-specific
@@ -59,8 +59,8 @@ func LogLLMCallFromContext(ctx context.Context, model string, resp *providers.Re
 	if m.EventLogger == nil {
 		return
 	}
-	in, out := TokenCount(resp)
-	LogLLMCall(m.EventLogger, m.CorrID, m.AgentID, m.SessionID, model, in, out, dur, err)
+	usage := TokenCount(resp)
+	LogLLMCall(m.EventLogger, m.CorrID, m.AgentID, m.SessionID, model, &usage, dur, err)
 	if resp != nil && resp.Content != "" {
 		m.EventLogger.LogEvent(agentlog.JSONLEntry{
 			Timestamp: time.Now(),
@@ -174,9 +174,15 @@ func LogResponse(el *agentlog.SessionEventLogger, corrID, agentID, sessionID str
 }
 
 // LogLLMCall records an LLM request/response cycle.
-func LogLLMCall(el *agentlog.SessionEventLogger, corrID, agentID, sessionID, model string, inputTok, outputTok int, dur time.Duration, err error) {
+func LogLLMCall(el *agentlog.SessionEventLogger, corrID, agentID, sessionID, model string, usage *providers.Usage, dur time.Duration, err error) {
 	if el == nil {
 		return
+	}
+
+	inputTok, outputTok := 0, 0
+	if usage != nil {
+		inputTok = usage.InputTokens
+		outputTok = usage.OutputTokens
 	}
 
 	walPayload := struct {
@@ -203,6 +209,23 @@ func LogLLMCall(el *agentlog.SessionEventLogger, corrID, agentID, sessionID, mod
 	}
 	el.LogWALJSON(eventType, walPayload)
 
+	data := map[string]any{
+		"model":         model,
+		"input_tokens":  inputTok,
+		"output_tokens": outputTok,
+	}
+	if usage != nil {
+		if usage.CacheReadTokens > 0 {
+			data["cache_read_tokens"] = usage.CacheReadTokens
+		}
+		if usage.CacheWriteTokens > 0 {
+			data["cache_write_tokens"] = usage.CacheWriteTokens
+		}
+		if usage.ReasoningTokens > 0 {
+			data["reasoning_tokens"] = usage.ReasoningTokens
+		}
+	}
+
 	entry := agentlog.JSONLEntry{
 		Timestamp:  time.Now(),
 		Level:      "info",
@@ -212,11 +235,7 @@ func LogLLMCall(el *agentlog.SessionEventLogger, corrID, agentID, sessionID, mod
 		EventCode:  eventType,
 		CorrID:     corrID,
 		DurationNs: dur.Nanoseconds(),
-		Data: map[string]any{
-			"model":         model,
-			"input_tokens":  inputTok,
-			"output_tokens": outputTok,
-		},
+		Data:       data,
 	}
 	if err != nil {
 		entry.Level = "error"

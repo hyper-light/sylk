@@ -61,6 +61,11 @@ func ContextGovernorFromContext(ctx context.Context) *ContextGovernor {
 // Returns ErrContextBudgetExhausted if the context is critically full.
 // Must be called before each LLM call.
 func ApplyContextBudget(ctx context.Context, turn, maxRuns int, req *providers.Request) error {
+	// Stamp agent/session identity into request metadata so the gateway
+	// proxy can attribute usage telemetry without a package dependency on
+	// agents/shared.
+	stampRequestIdentity(ctx, req)
+
 	if gov := ContextGovernorFromContext(ctx); gov != nil {
 		zone := gov.BeginTurn(ctx, turn, maxRuns, req)
 		switch {
@@ -74,6 +79,24 @@ func ApplyContextBudget(ctx context.Context, turn, maxRuns int, req *providers.R
 		req.Tools = nil // safety ceiling — force synthesis
 	}
 	return nil
+}
+
+// stampRequestIdentity sets agent_id and session_id in the request Metadata
+// from the LogMeta carried in ctx. Idempotent — skips if already set.
+func stampRequestIdentity(ctx context.Context, req *providers.Request) {
+	m := LogMetaFromContext(ctx)
+	if m.AgentID == "" && m.SessionID == "" {
+		return
+	}
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]any, 2)
+	}
+	if _, ok := req.Metadata["agent_id"]; !ok {
+		req.Metadata["agent_id"] = m.AgentID
+	}
+	if _, ok := req.Metadata["session_id"]; !ok {
+		req.Metadata["session_id"] = m.SessionID
+	}
 }
 
 // Initialize computes the fixed overhead (system prompt + tool definitions)

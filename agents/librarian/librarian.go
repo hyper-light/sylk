@@ -24,7 +24,7 @@ import (
 
 // Default configuration values.
 const (
-	DefaultLibrarianModel    = "claude-sonnet-4-6"
+	DefaultLibrarianModel    = "gemini-3.1-pro-preview"
 	DefaultMaxToolRuns       = 32
 	DefaultMaxTokens         = 8192
 	DefaultMaxOutputTokens   = 8192
@@ -104,7 +104,7 @@ type Config struct {
 
 	// LLM configuration
 	EnableLLM         bool   // Enable LLM-driven conversation
-	Model             string // LLM model ID (default: claude-sonnet-4-6)
+	Model             string // LLM model ID (default: gemini-3.1-pro-preview)
 	AnthropicAPIKey   string // Anthropic API key
 	MaxToolRuns       int    // Maximum tool loop iterations (default: 12)
 	MaxTokens         int    // Maximum output tokens for LLM (default: 8192)

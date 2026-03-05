@@ -63,6 +63,11 @@ type StreamCompleteMsg struct {
 	InputTokens   int // Real provider input tokens (0 = unavailable).
 	OutputTokens  int // Real provider output tokens (0 = unavailable).
 
+	// Extended token fields for accurate cost/usage tracking.
+	ReasoningTokens  int // Reasoning/thinking tokens (OpenAI o-series, Google thinking).
+	CacheReadTokens  int // Prompt cache hits (Anthropic, OpenAI).
+	CacheWriteTokens int // Prompt cache writes (Anthropic).
+
 	// AuthoritativeText is the canonical response text sent by the agent.
 	// When non-empty, the chat model replaces accumulated streaming content
 	// with this value to correct any dropped or reordered chunks.
@@ -730,4 +735,18 @@ type TimePressureMsg struct {
 	Elapsed   time.Duration
 	Remaining time.Duration
 	Message   string
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge indexing progress
+// ---------------------------------------------------------------------------
+
+// IndexProgressMsg carries progress updates from the background knowledge
+// indexer. Sent periodically by a polling goroutine so the status bar can
+// render a thin progress bar.
+type IndexProgressMsg struct {
+	Phase   int   // Maps to status.IndexPhase.
+	Current int64
+	Total   int64
+	Done    bool
 }

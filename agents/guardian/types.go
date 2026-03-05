@@ -138,14 +138,15 @@ type AgentHealthSnapshot struct {
 
 // BudgetStatus summarises token/cost budget consumption.
 type BudgetStatus struct {
-	TokensUsed    int64   `json:"tokens_used"`
-	TokenBudget   int64   `json:"token_budget"` // 0 = unlimited
-	TokenPercent  float64 `json:"token_percent"`
-	CostCentsUsed int64   `json:"cost_cents_used"`
-	CostBudget    int64   `json:"cost_budget"` // 0 = unlimited
-	CostPercent   float64 `json:"cost_percent"`
-	Warning       bool    `json:"warning"`
-	Exceeded      bool    `json:"exceeded"`
+	TokensUsed      int64   `json:"tokens_used"`
+	TokenBudget     int64   `json:"token_budget"`      // 0 = unlimited
+	TokenPercent    float64 `json:"token_percent"`
+	CostCentsUsed   int64   `json:"cost_cents_used"`
+	CostBudget      int64   `json:"cost_budget"`       // 0 = unlimited
+	CostPercent     float64 `json:"cost_percent"`
+	Warning         bool    `json:"warning"`
+	Exceeded        bool    `json:"exceeded"`
+	BudgetConfigured bool  `json:"budget_configured"` // true when a spend limit is set
 }
 
 // =============================================================================

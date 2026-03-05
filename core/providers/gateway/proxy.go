@@ -66,15 +66,30 @@ func (p *GatewayProvider) Complete(ctx context.Context, req *providers.Completio
 		"gateway", p.gateway.config.Name,
 		"elapsed_ms", time.Since(admitStart).Milliseconds())
 
+	sessionID, agentID := extractRequestIdentity(req)
+	if hook := p.gateway.eventHook; hook != nil {
+		hook.OnRequest(sessionID, agentID, req.Model, 0)
+	}
+
 	ctx = p.injectRetryObserver(ctx)
 	completeStart := time.Now()
 	resp, err := p.inner.Complete(ctx, req)
+	elapsed := time.Since(completeStart)
 	p.gateway.logger.Info("DEBUG: gateway_complete_done",
 		"gateway", p.gateway.config.Name,
-		"elapsed_ms", time.Since(completeStart).Milliseconds(),
+		"elapsed_ms", elapsed.Milliseconds(),
 		"error", err)
 	p.gateway.Release(err)
 	p.detect429(err)
+
+	if hook := p.gateway.eventHook; hook != nil {
+		if err != nil {
+			hook.OnError(sessionID, agentID, req.Model, err)
+		} else {
+			hook.OnResponse(sessionID, agentID, resp.Model, &resp.Usage, elapsed)
+		}
+	}
+
 	return resp, err
 }
 
@@ -85,17 +100,26 @@ func (p *GatewayProvider) Stream(ctx context.Context, req *providers.CompletionR
 		return nil, err
 	}
 
+	sessionID, agentID := extractRequestIdentity(req)
+	if hook := p.gateway.eventHook; hook != nil {
+		hook.OnRequest(sessionID, agentID, req.Model, 0)
+	}
+
 	ctx = p.injectRetryObserver(ctx)
+	streamStart := time.Now()
 	ch, err := p.inner.Stream(ctx, req)
 	if err != nil {
 		p.gateway.Release(err)
 		p.detect429(err)
+		if hook := p.gateway.eventHook; hook != nil {
+			hook.OnError(sessionID, agentID, req.Model, err)
+		}
 		return nil, err
 	}
 
 	// Wrap the channel to release the slot when the source closes.
 	out := make(chan *providers.StreamChunk, cap(ch))
-	go p.forwardStreamChunks(ch, out)
+	go p.forwardStreamChunks(ch, out, p.gateway.eventHook, sessionID, agentID, req.Model, streamStart)
 	return out, nil
 }
 
@@ -112,10 +136,23 @@ func (p *GatewayProvider) StreamWithHandler(ctx context.Context, req *providers.
 		return err
 	}
 
+	sessionID, agentID := extractRequestIdentity(req)
+	hook := p.gateway.eventHook
+	if hook != nil {
+		hook.OnRequest(sessionID, agentID, req.Model, 0)
+	}
+
 	ctx = p.injectRetryObserver(ctx)
-	err := shp.StreamWithHandler(ctx, req, handler)
+	streamStart := time.Now()
+	wrappedHandler := p.wrapStreamHandler(handler, hook, sessionID, agentID, req.Model, streamStart)
+	err := shp.StreamWithHandler(ctx, req, wrappedHandler)
 	p.gateway.Release(err)
 	p.detect429(err)
+
+	if err != nil && hook != nil {
+		hook.OnError(sessionID, agentID, req.Model, err)
+	}
+
 	return err
 }
 
@@ -149,15 +186,59 @@ func (p *GatewayProvider) detect429(err error) {
 	}
 }
 
-// forwardStreamChunks drains src into dst and releases the gateway slot
-// when the source channel closes.
-func (p *GatewayProvider) forwardStreamChunks(src <-chan *providers.StreamChunk, dst chan<- *providers.StreamChunk) {
+// forwardStreamChunks drains src into dst, releases the gateway slot, and
+// emits an OnResponse event when the end chunk carries usage data.
+func (p *GatewayProvider) forwardStreamChunks(
+	src <-chan *providers.StreamChunk,
+	dst chan<- *providers.StreamChunk,
+	hook providers.LLMProviderEventHook,
+	sessionID, agentID, model string,
+	streamStart time.Time,
+) {
 	defer func() {
 		close(dst)
 		p.gateway.Release(nil)
 	}()
 
 	for chunk := range src {
+		if hook != nil && chunk != nil && chunk.Type == providers.ChunkTypeEnd && chunk.Usage != nil {
+			hook.OnResponse(sessionID, agentID, model, chunk.Usage, time.Since(streamStart))
+		}
 		dst <- chunk
 	}
+}
+
+// wrapStreamHandler wraps a StreamHandler to capture the end-chunk usage and
+// emit an OnResponse event. Returns the original handler when hook is nil.
+func (p *GatewayProvider) wrapStreamHandler(
+	inner providers.StreamHandler,
+	hook providers.LLMProviderEventHook,
+	sessionID, agentID, model string,
+	streamStart time.Time,
+) providers.StreamHandler {
+	if hook == nil {
+		return inner
+	}
+	return func(chunk *providers.StreamChunk) error {
+		err := inner(chunk)
+		if chunk != nil && chunk.Type == providers.ChunkTypeEnd && chunk.Usage != nil {
+			hook.OnResponse(sessionID, agentID, model, chunk.Usage, time.Since(streamStart))
+		}
+		return err
+	}
+}
+
+// extractRequestIdentity pulls session_id and agent_id from the request
+// metadata map, returning empty strings when absent.
+func extractRequestIdentity(req *providers.Request) (sessionID, agentID string) {
+	if req == nil || req.Metadata == nil {
+		return "", ""
+	}
+	if v, ok := req.Metadata["session_id"].(string); ok {
+		sessionID = v
+	}
+	if v, ok := req.Metadata["agent_id"].(string); ok {
+		agentID = v
+	}
+	return sessionID, agentID
 }

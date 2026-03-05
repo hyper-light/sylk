@@ -63,6 +63,10 @@ type Config struct {
 	DaemonController     DaemonQuerier
 	CVS                  CVSQuerier
 	VFSManager           VFSManagerQuerier
+	Pipeline             PipelineQuerier
+	Gateway              GatewayQuerier
+	Knowledge            KnowledgeQuerier
+	Concurrency          ConcurrencyQuerier
 
 	// Tool dispatch loop.
 	MaxToolRuns int // Safety ceiling for tool-call turns. Context governor is the real budget. Defaults to DefaultMaxToolRuns (32).

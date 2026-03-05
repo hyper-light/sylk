@@ -41,11 +41,17 @@ type ReadinessPublisher interface {
 	PublishKnowledgeReady(event ReadinessEvent)
 }
 
-// BackgroundIndexWaiter exposes a Ready channel for waiting on background
-// indexing completion. Satisfied by *sylkdir.BackgroundIndexer.
+// BackgroundIndexWaiter exposes a Ready channel, progress counters, and an
+// observer hook for background indexing. Satisfied by *sylkdir.BackgroundIndexer.
 type BackgroundIndexWaiter interface {
 	Ready() <-chan struct{}
+	Progress() (indexed, total int64)
+	OnProgress(fn func(indexed, total int64))
 }
+
+// ProgressObserver receives progress events from the knowledge pipeline and
+// background indexer. Set via SetProgressObserver; called from producer goroutines.
+type ProgressObserver func(phase string, current, total int64)
 
 // KnowledgeStore owns the single HybridQueryCoordinator and the underlying
 // storage resources. Agents receive the coordinator at construction time;
@@ -57,9 +63,10 @@ type KnowledgeStore struct {
 	partialReady chan struct{} // closed at ReadinessPartial
 	fullReady    chan struct{} // closed at ReadinessFull
 
-	mu        sync.Mutex // guards resource ownership for cleanup
-	bgWaiter  BackgroundIndexWaiter
-	closeable io.Closer // bleve store closer, set by caller
+	mu         sync.Mutex // guards resource ownership for cleanup
+	bgWaiter   BackgroundIndexWaiter
+	closeable  io.Closer          // bleve store closer, set by caller
+	progressFn ProgressObserver   // UI callback, guarded by mu
 
 	publisher  ReadinessPublisher
 	logger     *slog.Logger
@@ -122,6 +129,25 @@ func (ks *KnowledgeStore) BackgroundWaiter() BackgroundIndexWaiter {
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
 	return ks.bgWaiter
+}
+
+// SetProgressObserver registers a callback for pipeline and indexer progress.
+// Safe to call concurrently; replaces any previously registered observer.
+func (ks *KnowledgeStore) SetProgressObserver(fn ProgressObserver) {
+	ks.mu.Lock()
+	ks.progressFn = fn
+	ks.mu.Unlock()
+}
+
+// NotifyProgress forwards a progress event to the registered observer.
+// No-op if no observer is set. Safe as a PipelineConfig.OnProgress callback.
+func (ks *KnowledgeStore) NotifyProgress(phase string, current, total int64) {
+	ks.mu.Lock()
+	fn := ks.progressFn
+	ks.mu.Unlock()
+	if fn != nil {
+		fn(phase, current, total)
+	}
 }
 
 // PromotePartial atomically sets the bleve searcher on the coordinator and

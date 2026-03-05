@@ -29,6 +29,7 @@ import (
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/llm"
 	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/pipeline/variants"
@@ -307,6 +308,9 @@ type Deps struct {
 	// AgentModelStore provides persisted model selections so dynamically-
 	// created agents (engineer, designer, etc.) pick up previous choices.
 	AgentModelStore *agentpkg.AgentModelStore
+
+	// KnowledgeStore exposes background indexing progress for the status bar.
+	KnowledgeStore *knowledge.KnowledgeStore
 }
 
 // AgentSeed describes an agent to pre-populate in the UI agent panel.
@@ -618,6 +622,9 @@ type AppModel struct {
 	// Cumulative token counters for the status bar display.
 	totalPromptTokens     int
 	totalCompletionTokens int
+	totalCacheReadTokens  int
+	totalCacheWriteTokens int
+	totalReasoningTokens  int
 
 	// TUI-local WAL logger for suppressed/non-UI operational errors.
 	walLogger *slog.Logger
@@ -5679,7 +5686,7 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 		"correlation_id", done.CorrelationID,
 		"should_render", shouldRender)
 	delete(m.interruptedCorrelations, done.CorrelationID)
-	m.applyRealStreamUsage(done.CorrelationID, done.InputTokens, done.OutputTokens)
+	m.applyRealStreamUsage(done)
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
 	m.markQueueEntryByCorrelation(done.CorrelationID, true)
 	m.unregisterStream(done.CorrelationID)
@@ -5798,7 +5805,7 @@ func (m *AppModel) trackStreamChunk(correlationID, text string) {
 	m.streamUsage[correlationID] = state
 	m.totalCompletionTokens += added
 	if m.statusBar != nil {
-		m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+		m.updateTokenDisplay()
 	}
 }
 
@@ -5988,37 +5995,46 @@ func (m *AppModel) applyEarlyInputTokens(correlationID string, inputTokens int) 
 	m.streamUsage[correlationID] = state
 	m.totalPromptTokens += inputTokens
 	if m.statusBar != nil {
-		m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+		m.updateTokenDisplay()
 	}
 }
 
 // applyRealStreamUsage corrects the accumulated token estimate with real
 // provider-reported values when available. Called before finalizeStreamUsage
 // so the corrected values are used for context usage computation.
-func (m *AppModel) applyRealStreamUsage(correlationID string, inputTokens, outputTokens int) {
-	if inputTokens == 0 && outputTokens == 0 {
+func (m *AppModel) applyRealStreamUsage(done msg.StreamCompleteMsg) {
+	if done.InputTokens == 0 && done.OutputTokens == 0 {
 		return
 	}
-	state, ok := m.streamUsage[correlationID]
+	state, ok := m.streamUsage[done.CorrelationID]
 	if !ok {
 		return
 	}
-	if outputTokens > 0 {
+	if done.OutputTokens > 0 {
 		m.totalCompletionTokens -= state.Tokens
-		m.totalCompletionTokens += outputTokens
-		state.Tokens = outputTokens
-		m.streamUsage[correlationID] = state
+		m.totalCompletionTokens += done.OutputTokens
+		state.Tokens = done.OutputTokens
+		m.streamUsage[done.CorrelationID] = state
 	}
-	if inputTokens > 0 {
-		state.InputTokens = inputTokens
-		m.streamUsage[correlationID] = state
+	if done.InputTokens > 0 {
+		state.InputTokens = done.InputTokens
+		m.streamUsage[done.CorrelationID] = state
 		if !state.EarlyInputApplied {
-			m.totalPromptTokens += inputTokens
+			m.totalPromptTokens += done.InputTokens
 		}
 	}
-	if m.statusBar != nil {
-		m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+	m.totalCacheReadTokens += done.CacheReadTokens
+	m.totalCacheWriteTokens += done.CacheWriteTokens
+	m.totalReasoningTokens += done.ReasoningTokens
+	m.updateTokenDisplay()
+}
+
+// updateTokenDisplay pushes cumulative token counts to the status bar.
+func (m *AppModel) updateTokenDisplay() {
+	if m.statusBar == nil {
+		return
 	}
+	m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens, m.totalCacheReadTokens, m.totalReasoningTokens)
 }
 
 func normalizeAgentID(raw string) string {
@@ -6117,7 +6133,7 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	added := estimateGuideTokens(content)
 	contextUsage := m.bumpAgentContextUsage(r.AgentID, added+guideResponseOverheadTokens)
 	m.totalCompletionTokens += added
-	m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens)
+	m.updateTokenDisplay()
 	m.statusBar.SetTokenPhase(status.PhaseIdle)
 	m.publishResponseActivity(r, source, content, contextUsage)
 	agentDisplay := r.AgentID
@@ -14114,7 +14130,76 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 			return err
 		}
 	}
+	m.startIndexProgressObserver(program)
 	return nil
+}
+
+// pipelinePhaseMap maps boot pipeline phase strings to UI IndexPhase constants.
+// Pipeline "done" is deliberately absent — it only means the synchronous
+// pipeline finished, not that background indexing is complete. The real
+// Done signal comes from bgWaiter.Ready().
+var pipelinePhaseMap = map[string]status.IndexPhase{
+	"setup":    status.PhaseLoad,
+	"allocate": status.PhaseLoad,
+	"ingest":   status.PhaseEmbed,
+	"commit":   status.PhaseCommit,
+}
+
+// startIndexProgressObserver wires progress from both the boot pipeline and
+// the background indexer into the status bar. Pipeline phases fire via
+// KnowledgeStore.NotifyProgress (set in cmd/tui.go); background indexer
+// batches fire via BackgroundIndexWaiter.OnProgress.
+func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
+	ks := m.deps.KnowledgeStore
+	if ks == nil {
+		return
+	}
+	scope := m.deps.Scope
+	if scope == nil {
+		return
+	}
+
+	// Register the pipeline progress observer immediately so we catch
+	// phases that fire before the background indexer exists. Pipeline
+	// phases fire after completion, so we send current=1, total=1 to
+	// snap the stage's bar segment to full.
+	ks.SetProgressObserver(func(phase string, current, total int64) {
+		uiPhase, ok := pipelinePhaseMap[phase]
+		if !ok {
+			return // Skip unknown phases including "done"; real Done comes from bgWaiter.Ready().
+		}
+		program.Send(msg.IndexProgressMsg{
+			Phase:   int(uiPhase),
+			Current: 1,
+			Total:   1,
+		})
+	})
+
+	// Goroutine waits for partial readiness, then hooks background indexer.
+	_ = scope.Go("index-progress-observer", 0, func(bgCtx context.Context) error {
+		if err := ks.WaitForPartial(bgCtx); err != nil {
+			return nil
+		}
+		bgWaiter := ks.BackgroundWaiter()
+		if bgWaiter == nil {
+			return nil
+		}
+
+		bgWaiter.OnProgress(func(indexed, total int64) {
+			program.Send(msg.IndexProgressMsg{
+				Phase:   int(status.PhaseIndex),
+				Current: indexed,
+				Total:   total,
+			})
+		})
+
+		select {
+		case <-bgWaiter.Ready():
+			program.Send(msg.IndexProgressMsg{Phase: int(status.PhaseDone), Done: true})
+		case <-bgCtx.Done():
+		}
+		return nil
+	})
 }
 
 // ---------------------------------------------------------------------------

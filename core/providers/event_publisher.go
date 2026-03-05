@@ -70,10 +70,9 @@ type LLMProviderEventHook interface {
 	// sessionID: the current session identifier
 	// agentID: the agent that made the request
 	// model: the LLM model used
-	// inputTokens: actual input token count
-	// outputTokens: output token count
+	// usage: full token usage breakdown (input, output, cache, reasoning)
 	// duration: time from request to response
-	OnResponse(sessionID, agentID, model string, inputTokens, outputTokens int, duration time.Duration)
+	OnResponse(sessionID, agentID, model string, usage *Usage, duration time.Duration)
 
 	// OnError is called when an LLM API error occurs.
 	// sessionID: the current session identifier
@@ -130,9 +129,15 @@ func (p *LLMEventPublisher) PublishLLMRequest(sessionID, agentID, model string, 
 
 // PublishLLMResponse publishes an event when an LLM response is received.
 // Creates an EventTypeLLMResponse event with full metrics including latency.
-func (p *LLMEventPublisher) PublishLLMResponse(sessionID, agentID, model string, inputTokens, outputTokens int, duration time.Duration) error {
+func (p *LLMEventPublisher) PublishLLMResponse(sessionID, agentID, model string, usage *Usage, duration time.Duration) error {
 	if p == nil || p.bus == nil {
 		return fmt.Errorf("event publisher not initialized")
+	}
+
+	inputTokens, outputTokens := 0, 0
+	if usage != nil {
+		inputTokens = usage.InputTokens
+		outputTokens = usage.OutputTokens
 	}
 
 	// Calculate tokens per second
@@ -148,13 +153,25 @@ func (p *LLMEventPublisher) PublishLLMResponse(sessionID, agentID, model string,
 	)
 	event.AgentID = agentID
 	event.Outcome = events.OutcomeSuccess
-	event.Data = map[string]any{
+	data := map[string]any{
 		"model":          model,
 		"input_tokens":   inputTokens,
 		"output_tokens":  outputTokens,
 		"duration_ms":    duration.Milliseconds(),
 		"tokens_per_sec": tokensPerSec,
 	}
+	if usage != nil {
+		if usage.CacheReadTokens > 0 {
+			data["cache_read_tokens"] = usage.CacheReadTokens
+		}
+		if usage.CacheWriteTokens > 0 {
+			data["cache_write_tokens"] = usage.CacheWriteTokens
+		}
+		if usage.ReasoningTokens > 0 {
+			data["reasoning_tokens"] = usage.ReasoningTokens
+		}
+	}
+	event.Data = data
 	event.Category = "llm"
 
 	p.bus.PublishActivity(event)
@@ -223,11 +240,11 @@ func (h *LLMEventPublisherHook) OnRequest(sessionID, agentID, model string, toke
 
 // OnResponse implements LLMProviderEventHook.OnResponse.
 // Delegates to the underlying LLMEventPublisher.
-func (h *LLMEventPublisherHook) OnResponse(sessionID, agentID, model string, inputTokens, outputTokens int, duration time.Duration) {
+func (h *LLMEventPublisherHook) OnResponse(sessionID, agentID, model string, usage *Usage, duration time.Duration) {
 	if h == nil || h.publisher == nil {
 		return
 	}
-	_ = h.publisher.PublishLLMResponse(sessionID, agentID, model, inputTokens, outputTokens, duration)
+	_ = h.publisher.PublishLLMResponse(sessionID, agentID, model, usage, duration)
 }
 
 // OnError implements LLMProviderEventHook.OnError.
@@ -251,7 +268,7 @@ type NoOpLLMEventHook struct{}
 func (h *NoOpLLMEventHook) OnRequest(sessionID, agentID, model string, tokenCount int) {}
 
 // OnResponse implements LLMProviderEventHook.OnResponse (no-op).
-func (h *NoOpLLMEventHook) OnResponse(sessionID, agentID, model string, inputTokens, outputTokens int, duration time.Duration) {
+func (h *NoOpLLMEventHook) OnResponse(sessionID, agentID, model string, usage *Usage, duration time.Duration) {
 }
 
 // OnError implements LLMProviderEventHook.OnError (no-op).

@@ -27,6 +27,7 @@ type ProviderGateway struct {
 	closed      atomic.Bool
 	slotMu      sync.Mutex
 	logger      *slog.Logger
+	eventHook   providers.LLMProviderEventHook
 }
 
 // NewProviderGateway creates a gateway with the given configuration.
@@ -98,6 +99,13 @@ func (g *ProviderGateway) WrapProvider(inner providers.ProviderAdapter, priority
 		gateway:  g,
 		priority: priority,
 	}
+}
+
+// SetEventHook wires an LLM event hook that receives usage telemetry for
+// every request that flows through this gateway. Safe to call before any
+// provider is wrapped. Nil resets to no-op.
+func (g *ProviderGateway) SetEventHook(hook providers.LLMProviderEventHook) {
+	g.eventHook = hook
 }
 
 // Metrics returns a point-in-time snapshot of gateway counters.

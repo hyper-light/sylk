@@ -28,6 +28,8 @@ const (
 type TokenDisplay struct {
 	promptTokens     int
 	completionTokens int
+	cacheReadTokens  int
+	reasoningTokens  int
 	phase            TokenPhase
 	spinner          *Spinner
 	idleStyle        lipgloss.Style
@@ -43,10 +45,12 @@ func NewTokenDisplay(idle, active lipgloss.Style) *TokenDisplay {
 	}
 }
 
-// Update sets the prompt and completion token counts.
-func (td *TokenDisplay) Update(prompt, completion int) {
+// Update sets the prompt, completion, cache-read, and reasoning token counts.
+func (td *TokenDisplay) Update(prompt, completion, cacheRead, reasoning int) {
 	td.promptTokens = prompt
 	td.completionTokens = completion
+	td.cacheReadTokens = cacheRead
+	td.reasoningTokens = reasoning
 }
 
 // SetPhase sets which token counter is actively updating.
@@ -69,10 +73,9 @@ func (td *TokenDisplay) IsAnimating() bool {
 	return td.phase != PhaseIdle
 }
 
-// View renders the token display as "Sτ ↑in/↓out" where S is a spinner
-// slot (space when idle, animated frame when counting). The spinner is
-// placed before τ to avoid visual confusion with the directional arrows.
-// The active side is distinguished by style (color), not spinner position.
+// View renders the token display as "Sτ ↑in/↓out" with optional cache and
+// reasoning suffixes. When cache tokens are present, appends "(cache: Nk)".
+// When reasoning tokens are present, appends "(think: Nk)".
 func (td *TokenDisplay) View() string {
 	in := formatTokenCount(td.promptTokens)
 	out := formatTokenCount(td.completionTokens)
@@ -101,7 +104,18 @@ func (td *TokenDisplay) View() string {
 	inPart := inStyle.Render("↑" + in)
 	outPart := outStyle.Render("↓" + out)
 
-	return spinPart + gap + sym + inPart + sep + outPart
+	result := spinPart + gap + sym + inPart + sep + outPart
+
+	if td.cacheReadTokens > 0 {
+		cachePart := td.idleStyle.Render(" (cache:" + formatTokenCount(td.cacheReadTokens) + ")")
+		result += cachePart
+	}
+	if td.reasoningTokens > 0 {
+		thinkPart := td.idleStyle.Render(" (think:" + formatTokenCount(td.reasoningTokens) + ")")
+		result += thinkPart
+	}
+
+	return result
 }
 
 // formatTokenCount renders a token count using compact "k" notation when the

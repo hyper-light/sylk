@@ -24,9 +24,12 @@ type testerUsageAccumulatorKey struct{}
 // testerUsageAccumulator sums token counts from LLM calls
 // within a single tester request. Thread-safe for concurrent sub-calls.
 type testerUsageAccumulator struct {
-	mu          sync.Mutex
-	inputTotal  int
-	outputTotal int
+	mu              sync.Mutex
+	inputTotal      int
+	outputTotal     int
+	reasoningTotal  int
+	cacheReadTotal  int
+	cacheWriteTotal int
 }
 
 func (a *testerUsageAccumulator) Add(usage *providers.Usage) {
@@ -36,6 +39,9 @@ func (a *testerUsageAccumulator) Add(usage *providers.Usage) {
 	a.mu.Lock()
 	a.inputTotal += usage.InputTokens
 	a.outputTotal += usage.OutputTokens
+	a.reasoningTotal += usage.ReasoningTokens
+	a.cacheReadTotal += usage.CacheReadTokens
+	a.cacheWriteTotal += usage.CacheWriteTokens
 	a.mu.Unlock()
 }
 
@@ -45,7 +51,13 @@ func (a *testerUsageAccumulator) Total() *guide.StreamUsage {
 	if a.inputTotal == 0 && a.outputTotal == 0 {
 		return nil
 	}
-	return &guide.StreamUsage{InputTokens: a.inputTotal, OutputTokens: a.outputTotal}
+	return &guide.StreamUsage{
+		InputTokens:      a.inputTotal,
+		OutputTokens:     a.outputTotal,
+		ReasoningTokens:  a.reasoningTotal,
+		CacheReadTokens:  a.cacheReadTotal,
+		CacheWriteTokens: a.cacheWriteTotal,
+	}
 }
 
 func withTesterStreamContext(ctx context.Context, correlationID, sourceAgentID string) context.Context {
