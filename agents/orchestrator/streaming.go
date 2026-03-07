@@ -158,7 +158,7 @@ func (o *Orchestrator) publishStreamEvent(ctx context.Context, event *guide.Stre
 	}
 	stream := &guide.StreamResponse{
 		CorrelationID:     metadata.CorrelationID,
-		RespondingAgentID: "orchestrator",
+		RespondingAgentID: o.config.AgentID,
 		TargetAgentID:     metadata.SourceAgentID,
 		Event:             event,
 	}
@@ -167,7 +167,7 @@ func (o *Orchestrator) publishStreamEvent(ctx context.Context, event *guide.Stre
 		CorrelationID: metadata.CorrelationID,
 		Type:          guide.MessageTypeStream,
 		Payload:       stream,
-		SourceAgentID: "orchestrator",
+		SourceAgentID: o.config.AgentID,
 		TargetAgentID: metadata.SourceAgentID,
 		Timestamp:     time.Now(),
 		Status:        messaging.StatusQueued,
@@ -189,7 +189,7 @@ func (o *Orchestrator) publishStreamPush(ctx context.Context) (string, error) {
 
 	push := &guide.AgentPush{
 		PushID:   pushID,
-		AgentID:  "orchestrator",
+		AgentID:  o.config.AgentID,
 		PushType: guide.PushTypeStream,
 	}
 
@@ -201,8 +201,8 @@ func (o *Orchestrator) publishStreamPush(ctx context.Context) (string, error) {
 
 	stream := &guide.StreamResponse{
 		CorrelationID:     pushID,
-		RespondingAgentID: "orchestrator",
-		TargetAgentID:     "orchestrator",
+		RespondingAgentID: o.config.AgentID,
+		TargetAgentID:     o.config.AgentID,
 		Event:             event,
 	}
 
@@ -211,7 +211,7 @@ func (o *Orchestrator) publishStreamPush(ctx context.Context) (string, error) {
 		CorrelationID: pushID,
 		Type:          guide.MessageTypeStream,
 		Payload:       stream,
-		SourceAgentID: "orchestrator",
+		SourceAgentID: o.config.AgentID,
 		Timestamp:     time.Now(),
 		Status:        messaging.StatusQueued,
 		Attempt:       1,
@@ -236,7 +236,7 @@ func (o *Orchestrator) publishNotificationPush(content string) {
 
 	push := &guide.AgentPush{
 		PushID:   pushID,
-		AgentID:  "orchestrator",
+		AgentID:  o.config.AgentID,
 		PushType: guide.PushTypeNotification,
 		Content:  content,
 	}
@@ -249,8 +249,8 @@ func (o *Orchestrator) publishNotificationPush(content string) {
 
 	stream := &guide.StreamResponse{
 		CorrelationID:     pushID,
-		RespondingAgentID: "orchestrator",
-		TargetAgentID:     "orchestrator",
+		RespondingAgentID: o.config.AgentID,
+		TargetAgentID:     o.config.AgentID,
 		Event:             event,
 	}
 
@@ -259,7 +259,7 @@ func (o *Orchestrator) publishNotificationPush(content string) {
 		CorrelationID: pushID,
 		Type:          guide.MessageTypeStream,
 		Payload:       stream,
-		SourceAgentID: "orchestrator",
+		SourceAgentID: o.config.AgentID,
 		Timestamp:     time.Now(),
 		Status:        messaging.StatusQueued,
 		Attempt:       1,
@@ -278,7 +278,7 @@ func (o *Orchestrator) publishStreamEventForPush(pushID string, event *guide.Str
 
 	stream := &guide.StreamResponse{
 		CorrelationID:     pushID,
-		RespondingAgentID: "orchestrator",
+		RespondingAgentID: o.config.AgentID,
 		Event:             event,
 	}
 
@@ -287,7 +287,7 @@ func (o *Orchestrator) publishStreamEventForPush(pushID string, event *guide.Str
 		CorrelationID: pushID,
 		Type:          guide.MessageTypeStream,
 		Payload:       stream,
-		SourceAgentID: "orchestrator",
+		SourceAgentID: o.config.AgentID,
 		Timestamp:     time.Now(),
 		Status:        messaging.StatusQueued,
 		Attempt:       1,

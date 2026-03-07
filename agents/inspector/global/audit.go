@@ -40,6 +40,7 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 	auditPrompt := gi.buildAuditPrompt(req)
 
 	// Run LLM tool loop for analysis
+	gi.prepareSkillsForInput(auditPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: shared.GlobalInspectorSystemPrompt(),
 		Messages: []providers.Message{
@@ -49,6 +50,7 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 		MaxTokens: gi.config.MaxTokens,
 		Tools:     gi.buildToolDefinitions(),
 	}
+	gi.applyLLMRuntimeProfile(llmReq, "audit")
 
 	response, err := gi.executeToolLoop(auditCtx, llmReq, agentShared.SteeringLedgerFromContext(auditCtx))
 	if err != nil {

@@ -313,7 +313,7 @@ func TestCompressor_EntryCompression(t *testing.T) {
 		Title:    "Test Entry",
 		Content: "This is a test entry with enough content to be worth compressing. " +
 			"Adding more content to ensure we exceed the minimum size threshold.",
-		Source:    SourceModelClaudeOpus45,
+		Source:    SourceModelClaudeOpus,
 		SessionID: "sess_123",
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
@@ -348,8 +348,8 @@ func TestQueryOptimizer_Plan(t *testing.T) {
 			CategoryDecision: 500,
 		},
 		EntriesBySource: map[SourceModel]int64{
-			SourceModelClaudeOpus45: 8000,
-			SourceModelGPT52Codex:   2000,
+			SourceModelClaudeOpus: 8000,
+			SourceModelGPT54Pro:   2000,
 		},
 		AvgEntriesPerDay: 100,
 	})
@@ -424,14 +424,14 @@ func TestExporter_ExportJSONL(t *testing.T) {
 		Category: CategoryInsight,
 		Title:    "Test Entry 1",
 		Content:  "Test content 1",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 
 	store.InsertEntry(&Entry{
 		Category: CategoryDecision,
 		Title:    "Test Entry 2",
 		Content:  "Test content 2",
-		Source:   SourceModelGPT52Codex,
+		Source:   SourceModelGPT54Pro,
 	})
 
 	var buf bytes.Buffer
@@ -462,7 +462,7 @@ func TestExporter_ExportJSON(t *testing.T) {
 		Category: CategoryInsight,
 		Title:    "Test",
 		Content:  "Test content",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 
 	var buf bytes.Buffer
@@ -489,7 +489,7 @@ func TestImporter_Import(t *testing.T) {
 		Category: CategoryInsight,
 		Title:    "Test Entry",
 		Content:  "Test content for import",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 
 	var buf bytes.Buffer
@@ -524,14 +524,14 @@ func TestImporter_MergeStrategy(t *testing.T) {
 		ID:        "existing",
 		Category:  CategoryInsight,
 		Content:   "Original content",
-		Source:    SourceModelClaudeOpus45,
+		Source:    SourceModelClaudeOpus,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
 	store.InsertEntry(existingEntry)
 
 	importData := `{"type":"header","data":{"version":"1.0"}}
-{"type":"entry","data":{"id":"existing","category":"insight","content":"New content","source":"claude-opus-4-5-20251101"}}`
+{"type":"entry","data":{"id":"existing","category":"insight","content":"New content","source":"claude-opus-4-6"}}`
 
 	result, err := importer.ImportFromReader(bytes.NewReader([]byte(importData)), store, nil)
 	if err != nil {

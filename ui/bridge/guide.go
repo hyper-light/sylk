@@ -164,14 +164,14 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 			program.Send(chunk)
 		}
 	case guide.StreamEventProgress:
-		program.Send(toStreamProgressMsg(sid, cid, stream.RespondingAgentID, stream.Event))
+		program.Send(toStreamProgressMsg(sid, cid, stream.RespondingAgentID, stream.RespondingAgentName, stream.Event))
 	case guide.StreamEventComplete:
 		bridgeEventDebugLog().Info("GuideBridge: STREAM_COMPLETE_DISPATCH",
 			"correlation_id", cid,
 			"agent_id", stream.RespondingAgentID,
 			"has_directive", stream.Event.Directive != nil,
 			"text_len", len(stream.Event.Text))
-		complete := msg.StreamCompleteMsg{SessionID: sid, CorrelationID: cid, AgentID: stream.RespondingAgentID, Result: stream.Event.Data}
+		complete := msg.StreamCompleteMsg{SessionID: sid, CorrelationID: cid, AgentID: stream.RespondingAgentID, AgentName: stream.RespondingAgentName, Result: stream.Event.Data}
 		if text := streamCompleteText(stream.RespondingAgentID, stream.Event); text != "" {
 			complete.AuthoritativeText = redact.Text(text)
 		}
@@ -304,12 +304,13 @@ func streamDataText(event *guide.StreamEvent) string {
 	return ""
 }
 
-func toStreamProgressMsg(sessionID, correlationID, agentID string, event *guide.StreamEvent) msg.StreamProgressMsg {
+func toStreamProgressMsg(sessionID, correlationID, agentID, agentName string, event *guide.StreamEvent) msg.StreamProgressMsg {
 	progress := parseProgressData(event)
 	m := msg.StreamProgressMsg{
 		SessionID:     sessionID,
 		CorrelationID: correlationID,
 		AgentID:       strings.TrimSpace(agentID),
+		AgentName:     strings.TrimSpace(agentName),
 		Current:       progress.Current,
 		Total:         progress.Total,
 		Message:       redact.Text(strings.TrimSpace(progress.Message)),

@@ -99,6 +99,10 @@ func classifyByRules(input string) (Intent, Domain, string, float64) {
 		"function", "class", "method", "fix bug", "add feature", "engineer") {
 		return IntentDeclare, DomainLocal, "engineer", 0.85
 	}
+	if containsClassifierKeyword(query, "clone", "fetch repo", "fetch package",
+		"download repo", "download package", "git clone", "pull repo") {
+		return IntentFetch, DomainCode, "librarian", 0.88
+	}
 	if containsClassifierKeyword(query, "find", "search", "locate", "where", "file", "code") {
 		return IntentFind, DomainLocal, "librarian", 0.85
 	}

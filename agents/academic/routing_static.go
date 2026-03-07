@@ -19,6 +19,31 @@ func AcademicRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				DefaultIntent: guide.IntentRecall,
 				DefaultDomain: guide.DomainResearch,
 			},
+			{
+				Name:          "fetch",
+				Description:   "Fetch a remote resource for research (web page, document, repository)",
+				DefaultIntent: guide.IntentFetch,
+				DefaultDomain: guide.DomainResearch,
+			},
+		},
+
+		Triggers: guide.AgentTriggers{
+			StrongTriggers: []string{
+				"research", "paper", "best practice", "documentation",
+				"fetch url", "fetch document", "download document",
+			},
+			WeakTriggers: []string{
+				"compare", "approach", "methodology", "standard",
+			},
+			IntentTriggers: map[guide.Intent][]string{
+				guide.IntentRecall: {
+					"research", "best practice", "compare", "approach",
+				},
+				guide.IntentFetch: {
+					"fetch url", "fetch document", "download document",
+					"fetch page", "crawl",
+				},
+			},
 		},
 
 		Registration: &guide.AgentRegistration{
@@ -26,11 +51,15 @@ func AcademicRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 			Name:    "academic",
 			Aliases: []string{"research", "papers"},
 			Capabilities: guide.AgentCapabilities{
-				Intents: []guide.Intent{guide.IntentRecall},
+				Intents: []guide.Intent{guide.IntentRecall, guide.IntentFetch},
 				Domains: []guide.Domain{guide.DomainResearch},
+				Keywords: []string{
+					"research", "best practice", "recommend", "compare",
+					"fetch", "download", "url", "web", "crawl", "document",
+				},
 			},
-			Description: "Researches best practices, academic papers, and external knowledge sources, " +
-				"validating recommendations against codebase reality via the Librarian.",
+			Description: "Researches best practices, academic papers, and external knowledge sources. " +
+				"Can fetch web pages and documents. Validates against codebase reality via the Librarian.",
 		},
 	}
 }

@@ -16,7 +16,7 @@ func TestFactExtractor_ExtractDecision(t *testing.T) {
 		Category: CategoryDecision,
 		Title:    "Use PostgreSQL over MySQL",
 		Content:  "PostgreSQL has better JSON support and JSONB type for our use case",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	}
 
 	facts := extractor.ExtractAll([]*Entry{entry})
@@ -39,7 +39,7 @@ func TestFactExtractor_ExtractFailure(t *testing.T) {
 		Category: CategoryIssue,
 		Title:    "Recursive file walking",
 		Content:  "Recursive file walking without depth limit caused memory exhaustion",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 		Metadata: map[string]any{
 			"resolution": "Added max depth of 10",
 		},
@@ -64,7 +64,7 @@ func TestFactExtractor_ExtractPattern(t *testing.T) {
 		Category: CategoryCodeStyle,
 		Title:    "Error handling pattern",
 		Content:  "Always wrap errors with context using fmt.Errorf with %w",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 		Metadata: map[string]any{
 			"category": "error-handling",
 			"example":  `fmt.Errorf("failed to process: %w", err)`,
@@ -89,7 +89,7 @@ func TestFactExtractor_ExtractFromGeneral_Decision(t *testing.T) {
 		ID:       "entry-1",
 		Category: CategoryGeneral,
 		Content:  "We decided to use gRPC instead of REST for the internal API",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	}
 
 	facts := extractor.ExtractAll([]*Entry{entry})
@@ -106,7 +106,7 @@ func TestFactExtractor_ExtractFromGeneral_Failure(t *testing.T) {
 		ID:       "entry-1",
 		Category: CategoryGeneral,
 		Content:  "The approach failed because the API rate limits were exceeded",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	}
 
 	facts := extractor.ExtractAll([]*Entry{entry})
@@ -123,7 +123,7 @@ func TestFactExtractor_ExtractFileChanges(t *testing.T) {
 			ID:       "entry-1",
 			Category: CategoryGeneral,
 			Content:  "Added error handling to the process function",
-			Source:   SourceModelClaudeOpus45,
+			Source:   SourceModelClaudeOpus,
 			Metadata: map[string]any{
 				"path":        "/src/process.go",
 				"change_type": "modified",
@@ -135,7 +135,7 @@ func TestFactExtractor_ExtractFileChanges(t *testing.T) {
 			ID:       "entry-2",
 			Category: CategoryGeneral,
 			Content:  "Created new config file",
-			Source:   SourceModelClaudeOpus45,
+			Source:   SourceModelClaudeOpus,
 			Metadata: map[string]any{
 				"path":        "/config/settings.yaml",
 				"change_type": "created",

@@ -121,6 +121,7 @@ const (
 	IntentFind   Intent = "find"   // Find code, files, or symbols
 	IntentSearch Intent = "search" // Search codebase
 	IntentLocate Intent = "locate" // Locate specific items
+	IntentFetch  Intent = "fetch"  // Fetch/clone remote repository or package
 
 	// Planning intents (handled by Architect)
 	IntentPlan    Intent = "plan"    // Create a design plan
@@ -144,6 +145,7 @@ func AllIntents() []Intent {
 		IntentFind,
 		IntentSearch,
 		IntentLocate,
+		IntentFetch,
 		IntentPlan,
 		IntentDesign,
 		IntentExecute,
@@ -171,6 +173,11 @@ func (i Intent) IsCoordinationIntent() bool {
 // IsSearchIntent returns true if the intent is for search operations
 func (i Intent) IsSearchIntent() bool {
 	return i == IntentFind || i == IntentSearch || i == IntentLocate
+}
+
+// IsFetchIntent returns true if the intent is for fetching remote content
+func (i Intent) IsFetchIntent() bool {
+	return i == IntentFetch
 }
 
 // =============================================================================
@@ -373,10 +380,11 @@ type RouteResponse struct {
 }
 
 type StreamResponse struct {
-	CorrelationID     string       `json:"correlation_id"`
-	RespondingAgentID string       `json:"responding_agent_id"`
-	TargetAgentID     string       `json:"target_agent_id"`
-	Event             *StreamEvent `json:"event"`
+	CorrelationID       string       `json:"correlation_id"`
+	RespondingAgentID   string       `json:"responding_agent_id"`
+	RespondingAgentName string       `json:"responding_agent_name,omitempty"`
+	TargetAgentID       string       `json:"target_agent_id"`
+	Event               *StreamEvent `json:"event"`
 }
 
 // ForwardedRequest is what the Guide sends to the target agent

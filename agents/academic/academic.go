@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -25,7 +26,7 @@ import (
 
 // Default configuration values.
 const (
-	DefaultModel       = "gemini-3.1-pro-preview"
+	DefaultModel       = "gpt-5.4-pro"
 	DefaultMaxToolRuns = 32
 )
 
@@ -46,11 +47,13 @@ type Academic struct {
 	// LLM provider
 	provider   academicProvider
 	providerMu sync.RWMutex
+	refresher  container.ProviderRefresher
 
 	// Skills system
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	hooks       *skills.HookRegistry
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
+	toolDefsDirty bool
 
 	// Activity publisher for UI agent-panel updates.
 	activityPub events.ActivityPublisher
@@ -88,6 +91,9 @@ type Academic struct {
 
 	// Outcome tracking for maturity-aware recommendations
 	outcomeHistory *OutcomeHistory
+
+	// External fetch pipeline — wired via SetFetchPipeline after construction.
+	fetchPipeline *fetch.Pipeline
 
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
@@ -141,20 +147,18 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		logger = slog.Default()
 	}
 
-	// Create skills registry and loader
-	skillsRegistry := skills.NewRegistry()
-	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	skillsLoaderCfg.CoreSkills = []string{"research_topic", "find_best_practices", "compare_approaches"}
-	skillsLoaderCfg.AutoLoadDomains = []string{"research", "knowledge"}
-	skillLoader := skills.NewLoader(skillsRegistry, skillsLoaderCfg)
-
 	// Create hook registry
 	hookRegistry := skills.NewHookRegistry()
 
 	academicID := cfg.ID
 	if academicID == "" {
-		academicID = "academic"
+		academicID = uuid.New().String()[:8]
 	}
+
+	// Create skills registry — register skills BEFORE creating the loader.
+	// NewLoader calls loadCoreSkills() immediately, so skills must exist
+	// in the registry for the load-by-name to succeed.
+	skillsRegistry := skills.NewRegistry()
 
 	a := &Academic{
 		id:                academicID,
@@ -164,7 +168,6 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		provider:          provider,
 		activityPub:       cfg.ActivityPub,
 		skills:            skillsRegistry,
-		skillLoader:       skillLoader,
 		hooks:             hookRegistry,
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingConsults:   make(map[string]chan *guide.Message),
@@ -179,6 +182,12 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 
 	a.registerCoreSkills()
 	a.registerExtendedSkills()
+	a.registerFetchSkills()
+
+	skillsLoaderCfg := skills.DefaultLoaderConfig()
+	skillsLoaderCfg.CoreSkills = []string{"research_topic", "find_best_practices", "web_fetch"}
+	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
+	a.skillLoader = skills.NewLoader(skillsRegistry, skillsLoaderCfg)
 
 	return a, nil
 }
@@ -247,25 +256,33 @@ func (a *Academic) getProvider() academicProvider {
 	return a.provider
 }
 
+// SetProviderRefresher stores a callback that creates a fresh provider for
+// the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (a *Academic) SetProviderRefresher(fn container.ProviderRefresher) {
+	a.providerMu.Lock()
+	defer a.providerMu.Unlock()
+	a.refresher = fn
+}
+
 // ProviderType implements container.AuthRefreshable.
-func (a *Academic) ProviderType() string { return "anthropic" }
+func (a *Academic) ProviderType() string {
+	return string(container.ProviderForModel(a.CurrentModel()))
+}
 
 // RefreshProvider implements container.AuthRefreshable.
-// Re-resolves Anthropic credentials and replaces the provider.
 func (a *Academic) RefreshProvider(ctx context.Context, authMethod string) error {
-	cfg := providers.AnthropicConfig{
-		BaseConfig: providers.BaseConfig{
-			Model:     a.CurrentModel(),
-			MaxTokens: a.config.MaxOutputTokens,
-		},
-		AuthMode: authMethod,
+	a.providerMu.RLock()
+	fn := a.refresher
+	a.providerMu.RUnlock()
+	if fn == nil {
+		return nil
 	}
-	p, err := providers.NewAnthropicProvider(ctx, cfg)
+	p, err := fn(ctx, a.CurrentModel(), authMethod)
 	if err != nil {
 		return fmt.Errorf("academic refresh provider: %w", err)
 	}
 	a.SetProvider(p)
-	a.logger.Info("provider refreshed", "auth_method", authMethod)
+	a.logger.Info("provider refreshed", "model", a.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 
@@ -292,8 +309,8 @@ func (a *Academic) CurrentModel() string {
 // SupportedModels implements container.ModelSwappable.
 func (a *Academic) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
-		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 	}
 }
 
@@ -456,7 +473,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	startTime := time.Now()
 
 	// Wire tool call emitter for inline visualization.
-	emitter := shared.NewToolCallEmitter(a.bus, a.channels, "academic", fwd.CorrelationID, fwd.SourceAgentID)
+	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -481,8 +498,8 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "academic",
-		RespondingAgentName: "academic",
+		RespondingAgentID:   a.id,
+		RespondingAgentName: "Academic",
 		ProcessingTime:      time.Since(startTime),
 	}
 
@@ -504,7 +521,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
-	a.publishActivity(events.EventTypeAgentAction, "Research task completed")
+	a.publishActivity(events.EventTypeSuccess, "Research task completed")
 
 	respMsg := guide.NewResponseMessage(generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
@@ -572,6 +589,8 @@ func (a *Academic) intentHandler(intent guide.Intent) (forwardedHandler, error) 
 		return a.handleRecall, nil
 	case guide.IntentCheck:
 		return a.handleCheck, nil
+	case guide.IntentFetch:
+		return a.handleFetch, nil
 	case guide.IntentHelp:
 		return a.handleHelp, nil
 	default:
@@ -579,10 +598,45 @@ func (a *Academic) intentHandler(intent guide.Intent) (forwardedHandler, error) 
 	}
 }
 
+// handleFetch processes fetch requests. For repository clones, delegates to the
+// Librarian via bus consultation. For web URLs, uses the fetch pipeline directly.
+func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	fetchPrompt := fmt.Sprintf(
+		"The user wants to fetch or download external content. "+
+			"If the request involves a git repository, use clone_via_librarian to have the Librarian clone it into the searchable package store. "+
+			"If the request involves a web page or document, use web_fetch or fetch_document. "+
+			"Provide a clear summary of what was fetched.\n\n%s",
+		fwd.Input,
+	)
+
+	a.prepareSkillsForInput(fetchPrompt)
+	llmReq := &providers.Request{
+		SystemPrompt: a.config.SystemPrompt,
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fetchPrompt}},
+		Tools:        a.buildToolDefinitions(),
+		Model:        a.config.Model,
+		MaxTokens:    a.config.MaxOutputTokens,
+	}
+	a.applyLLMRuntimeProfile(llmReq, "fetch")
+
+	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
+
+	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("fetch failed: %w", err)
+	}
+
+	return map[string]any{
+		"type":    "fetch",
+		"content": result,
+	}, nil
+}
+
 // handleRecall processes recall (query) requests using the LLM tool loop.
 func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	systemPrompt := a.config.SystemPrompt
 
+	a.prepareSkillsForInput(fwd.Input)
 	llmReq := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
@@ -590,6 +644,7 @@ func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
+	a.applyLLMRuntimeProfile(llmReq, "recall")
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
@@ -613,6 +668,7 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 		fwd.Input,
 	)
 
+	a.prepareSkillsForInput(checkPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: checkPrompt}},
@@ -620,6 +676,7 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
+	a.applyLLMRuntimeProfile(llmReq, "check")
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
@@ -637,10 +694,10 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 func (a *Academic) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
 	return map[string]any{
 		"agent":              "academic",
-		"description":        "External research, best practices, and evidence-backed recommendations.",
-		"supported_intents":  []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentHelp},
-		"supported_domains":  []guide.Domain{guide.DomainPatterns, guide.DomainDecisions, guide.DomainLearnings},
-		"recommended_routes": []string{"@academic:recall:research", "@academic:check:research"},
+		"description":        "External research, best practices, evidence-backed recommendations, and content fetching.",
+		"supported_intents":  []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentHelp},
+		"supported_domains":  []guide.Domain{guide.DomainPatterns, guide.DomainDecisions, guide.DomainLearnings, guide.DomainResearch},
+		"recommended_routes": []string{"@academic:recall:research", "@academic:check:research", "@academic:fetch:research"},
 	}, nil
 }
 
@@ -889,6 +946,7 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 		researchPrompt += fmt.Sprintf("\nLanguage: %s", query.LanguageFilter)
 	}
 
+	a.prepareSkillsForInput(researchPrompt)
 	llmReq := &providers.Request{
 		SystemPrompt: a.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: researchPrompt}},
@@ -896,6 +954,7 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 		Model:        a.config.Model,
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
+	a.applyLLMRuntimeProfile(llmReq, "research")
 
 	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
 	if err != nil {
@@ -1099,6 +1158,12 @@ func (a *Academic) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	a.handoffBridge = bridge
 }
 
+// SetFetchPipeline wires the external fetch pipeline for web research.
+// Called during Phase 3 wiring after Guardian and quarantine are ready.
+func (a *Academic) SetFetchPipeline(p *fetch.Pipeline) {
+	a.fetchPipeline = p
+}
+
 // ExtractArchivableState returns the agent's current state for handoff persistence.
 func (a *Academic) ExtractArchivableState() *handoff.ArchivableState {
 	return &handoff.ArchivableState{
@@ -1118,12 +1183,13 @@ func (a *Academic) Registration() *guide.AgentRegistration {
 		Name:    "academic",
 		Aliases: []string{"research", "scholar"},
 		Capabilities: guide.AgentCapabilities{
-			Intents: []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentHelp},
-			Domains: []guide.Domain{guide.DomainPatterns, guide.DomainDecisions, guide.DomainLearnings},
-			Tags:    []string{"research", "best-practices", "external-knowledge"},
+			Intents: []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentHelp},
+			Domains: []guide.Domain{guide.DomainPatterns, guide.DomainDecisions, guide.DomainLearnings, guide.DomainResearch},
+			Tags:    []string{"research", "best-practices", "external-knowledge", "web-fetch"},
 			Keywords: []string{
 				"research", "best practice", "recommend", "compare",
 				"approach", "pattern", "methodology", "standard",
+				"fetch", "download", "url", "web", "crawl", "document",
 			},
 			Priority: 50,
 		},

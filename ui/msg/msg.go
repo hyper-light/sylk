@@ -25,6 +25,22 @@ type SessionEventMsg struct {
 }
 
 // ---------------------------------------------------------------------------
+// Token usage (all-agent accumulation from ChannelBus activity events)
+// ---------------------------------------------------------------------------
+
+// TokenUsageMsg carries token deltas from an LLM response activity event.
+// Published by the TokenUsageBridge for every EventTypeLLMResponse on the bus.
+type TokenUsageMsg struct {
+	InputTokens      int
+	OutputTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
+	ReasoningTokens  int
+	Model            string
+	AgentID          string
+}
+
+// ---------------------------------------------------------------------------
 // LLM streaming
 // ---------------------------------------------------------------------------
 
@@ -47,7 +63,8 @@ type StreamChunkMsg struct {
 type StreamProgressMsg struct {
 	SessionID     string
 	CorrelationID string
-	AgentID       string
+	AgentID       string // Canonical UUID of the responding agent.
+	AgentName     string // Display name for UI attribution.
 	Current       int
 	Total         int
 	Message       string
@@ -58,7 +75,8 @@ type StreamProgressMsg struct {
 type StreamCompleteMsg struct {
 	SessionID     string
 	CorrelationID string
-	AgentID       string // Responding agent ID for panel status reset.
+	AgentID       string // Canonical UUID of the responding agent.
+	AgentName     string // Display name for UI attribution.
 	Result        any
 	InputTokens   int // Real provider input tokens (0 = unavailable).
 	OutputTokens  int // Real provider output tokens (0 = unavailable).

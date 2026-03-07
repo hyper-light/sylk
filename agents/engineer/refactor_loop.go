@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -138,17 +139,18 @@ func (rl *RefactorLoop) reimplementWithFeedback(
 ) (string, error) {
 	feedbackPrompt := buildFeedbackPrompt(feedback)
 
+	rl.engineer.prepareSkillsForInput(feedbackPrompt)
 	req := &providers.Request{
 		SystemPrompt: rl.engineer.config.SystemPrompt,
 		Messages: []providers.Message{
 			{Role: providers.RoleAssistant, Content: previousResult},
 			{Role: providers.RoleUser, Content: feedbackPrompt},
 		},
-		Tools:           rl.engineer.buildToolDefinitions(),
-		Model:           rl.engineer.config.EngineerConfig.Model,
-		MaxTokens:       rl.engineer.config.EngineerConfig.MaxTokens,
-		ReasoningEffort: rl.engineer.config.EngineerConfig.ReasoningEffort,
+		Tools:     rl.engineer.buildToolDefinitions(),
+		Model:     rl.engineer.config.EngineerConfig.Model,
+		MaxTokens: rl.engineer.config.EngineerConfig.MaxTokens,
 	}
+	llmruntime.Apply(req, rl.engineer.llmRuntimeProfile())
 
 	return rl.engineer.executeToolLoop(ctx, req, shared.SteeringLedgerFromContext(ctx))
 }

@@ -209,6 +209,16 @@ func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.T
 	return shared.MarshalToolOutput(result.Data)
 }
 
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (gi *GlobalInspector) prepareSkillsForInput(input string) {
+	if gi.skillLoader == nil {
+		return
+	}
+	gi.skillLoader.LoadForInput(input)
+	gi.skillLoader.OptimizeForBudget()
+}
+
 func (gi *GlobalInspector) buildToolDefinitions() []providers.Tool {
 	return shared.BuildToolDefinitions(gi.skills.GetLoaded())
 }

@@ -1334,6 +1334,8 @@ func candidateDomainsForIntent(intent Intent) []Domain {
 		return []Domain{DomainHistory, DomainGeneral}
 	case IntentFind, IntentSearch:
 		return []Domain{DomainLocal, DomainCode, DomainGeneral}
+	case IntentFetch:
+		return []Domain{DomainCode, DomainResearch, DomainGeneral}
 	case IntentStatus:
 		return []Domain{DomainSystem, DomainGeneral}
 	default:
@@ -2529,20 +2531,32 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 	})
 
 	vis := classifyRequestVisibility(req)
-	reqCtx = withClassificationProgress(reqCtx, func(message string) {
-		g.publishGuideStreamProgress(correlationID, req.SourceAgentID, message, vis)
-	})
 
-	g.publishActivity(events.EventTypeAgentDecision, vis, "Classifying request...")
+	// Wire classification progress only when the Guide performs LLM
+	// classification. Explicit targets bypass the classifier entirely —
+	// emitting Guide-attributed progress here falsely sets the Guide to
+	// StatusThinking in the agent panel.
+	if !req.ExplicitTarget {
+		reqCtx = withClassificationProgress(reqCtx, func(message string) {
+			g.publishGuideStreamProgress(correlationID, req.SourceAgentID, message, vis)
+		})
+	}
+
+	// Only emit classification activity when the Guide actually classifies.
+	if !req.ExplicitTarget {
+		g.publishActivity(events.EventTypeAgentDecision, vis, "Classifying request...")
+	}
 	routeStart := time.Now()
 	guideFileLog().Info("DEBUG: route_start", "correlation_id", correlationID, "input_preview", truncateLogStr(req.Input, 80))
 	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, vis)
 	guideFileLog().Info("DEBUG: route_done", "correlation_id", correlationID, "elapsed_ms", time.Since(routeStart).Milliseconds(), "error", err)
 	if err != nil {
 		if g.isInterruptError(err) {
+			g.publishActivity(events.EventTypeLLMResponse, vis, "Request interrupted")
 			guideFileLog().Info("DEBUG: route_interrupted", "correlation_id", correlationID, "error", err)
 			return nil
 		}
+		g.publishActivity(events.EventTypeAgentError, vis, "Routing failed")
 		guideFileLog().Info("DEBUG: route_error", "correlation_id", correlationID, "error", err)
 		return g.publishRouteError(correlationID, req.SourceAgentID, err)
 	}
@@ -2554,9 +2568,21 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 	if g.isGuideTarget(pending.TargetAgentID) {
 		return g.respondToGuideRequest(reqCtx, pending, req)
 	}
-	g.publishActivity(events.EventTypeAgentAction, vis, "Routing to "+pending.TargetAgentID)
+	if !req.ExplicitTarget {
+		g.publishActivity(events.EventTypeAgentAction, vis, "Routing to "+pending.TargetAgentID)
+	}
 	g.publishRouteHandoffProgress(forwarded.CorrelationID, pending.SourceAgentID, pending.TargetAgentID, vis)
-	return g.publishForwardedRequest(pending.TargetAgentID, forwarded, msg.ReplyTo)
+	err = g.publishForwardedRequest(pending.TargetAgentID, forwarded, msg.ReplyTo)
+
+	// Reset Guide status to idle after forwarding. The Guide's role is
+	// finished once the request is dispatched — the target agent takes over.
+	// Without this, the Guide stays stuck at StatusActing in the agent panel.
+	// For explicit targets, no activity was emitted — skip the reset too.
+	if !req.ExplicitTarget {
+		g.publishActivity(events.EventTypeLLMResponse, vis, "Request forwarded")
+	}
+
+	return err
 }
 
 func (g *Guide) handleRerouteMessage(ctx context.Context, msg *Message) error {
@@ -3115,7 +3141,12 @@ func (g *Guide) loadedGuideSkillNames() []string {
 }
 
 func (g *Guide) routeWithRetry(ctx context.Context, req *RouteRequest, correlationID, sourceAgentID string, visibility events.EventVisibility) (*ForwardedRequest, error) {
-	g.publishGuideStreamProgress(correlationID, sourceAgentID, "Classifying request...", visibility)
+	// Skip classification progress for explicit targets — the Guide is not
+	// doing LLM classification, just routing directly. Emitting progress
+	// here falsely sets the Guide to StatusThinking in the agent panel.
+	if !req.ExplicitTarget {
+		g.publishGuideStreamProgress(correlationID, sourceAgentID, "Classifying request...", visibility)
+	}
 	result, err := g.Route(ctx, req)
 	return result, err
 }
@@ -3350,7 +3381,9 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			return nil
 		}
 		g.observeConversationResponse(pending, resp)
-		resp.RespondingAgentID = g.resolveAgentDisplayName(resp.RespondingAgentID)
+		if resp.RespondingAgentName == "" {
+			resp.RespondingAgentName = g.resolveAgentDisplayName(resp.RespondingAgentID)
+		}
 
 		return g.publishResponseToSource(pending.SourceAgentID, resp)
 	case MessageTypeStream:
@@ -3390,7 +3423,9 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		}
 		streamTarget := g.resolveStreamTarget(pending)
 		streamResp.TargetAgentID = streamTarget
-		streamResp.RespondingAgentID = g.resolveAgentDisplayName(pending.TargetAgentID)
+		if streamResp.RespondingAgentName == "" {
+			streamResp.RespondingAgentName = g.resolveAgentDisplayName(pending.TargetAgentID)
+		}
 		return g.publishStreamToSource(streamTarget, streamResp)
 	default:
 		return nil
@@ -3453,10 +3488,11 @@ func (g *Guide) handleNotificationPush(push *AgentPush, _ *Message) error {
 		{Type: StreamEventComplete, Text: push.Content, Timestamp: time.Now()},
 	} {
 		resp := &StreamResponse{
-			CorrelationID:     push.PushID,
-			RespondingAgentID: agentName,
-			TargetAgentID:     "tui",
-			Event:             event,
+			CorrelationID:      push.PushID,
+			RespondingAgentID:  push.AgentID,
+			RespondingAgentName: agentName,
+			TargetAgentID:      "tui",
+			Event:              event,
 		}
 		g.publishStreamToSource("tui", resp)
 	}

@@ -17,14 +17,14 @@ func TestSessionStore_StoreAndQuery(t *testing.T) {
 	_, err := sessionOne.StoreEntry(&Entry{
 		Category: CategoryDecision,
 		Content:  "Decision A",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 	require.NoError(t, err)
 
 	_, err = sessionTwo.StoreEntry(&Entry{
 		Category: CategoryDecision,
 		Content:  "Decision B",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 	require.NoError(t, err)
 

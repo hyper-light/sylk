@@ -17,9 +17,13 @@ var ErrContextBudgetExhausted = errors.New("context budget exhausted")
 
 type contextGovernorKey struct{}
 
-// ContextGovernor prevents context window overflow in agent tool loops via
-// three layers: per-result output limiting, per-turn compaction/eviction,
-// and adaptive calibration from provider usage feedback.
+// ContextGovernor prevents context window overflow in agent tool loops.
+//
+// It uses ground-truth anchoring: after each LLM call the provider reports
+// exact input tokens, which become the anchor. Between calls, only the
+// delta (newly appended tool results) is estimated, bounding error to one
+// turn. Three corrective layers: per-result output limiting, per-turn
+// compaction/eviction, and tool stripping at Red/Critical zones.
 type ContextGovernor struct {
 	budget      *ContextBudget
 	initialized bool
@@ -61,9 +65,6 @@ func ContextGovernorFromContext(ctx context.Context) *ContextGovernor {
 // Returns ErrContextBudgetExhausted if the context is critically full.
 // Must be called before each LLM call.
 func ApplyContextBudget(ctx context.Context, turn, maxRuns int, req *providers.Request) error {
-	// Stamp agent/session identity into request metadata so the gateway
-	// proxy can attribute usage telemetry without a package dependency on
-	// agents/shared.
 	stampRequestIdentity(ctx, req)
 
 	if gov := ContextGovernorFromContext(ctx); gov != nil {
@@ -129,10 +130,8 @@ func (g *ContextGovernor) BeginTurn(ctx context.Context, turn, maxRuns int, req 
 		g.compact(ctx, req, preserveRecentGroups)
 		g.evict(ctx, req)
 	case ZoneCritical:
-		// First try normal compaction + eviction.
 		g.compact(ctx, req, preserveRecentGroups)
 		g.evict(ctx, req)
-		// Still critical: compact ALL groups including recent ones.
 		if g.budget.Zone(req.Messages) >= ZoneCritical {
 			g.compact(ctx, req, 0)
 		}
@@ -145,18 +144,18 @@ func (g *ContextGovernor) BeginTurn(ctx context.Context, turn, maxRuns int, req 
 	return g.budget.Zone(req.Messages)
 }
 
-// Calibrate updates the token estimator using ground-truth usage from the
-// provider response.
+// Calibrate anchors the budget to the provider's ground-truth input token
+// count. This replaces all character-based estimation for the base context;
+// only the delta (messages appended after this call) is estimated.
 func (g *ContextGovernor) Calibrate(ctx context.Context, resp *providers.Response, messages []providers.Message) {
 	if !g.initialized || resp == nil || resp.Usage.InputTokens <= 0 {
 		return
 	}
 
-	estimated := g.budget.EstimateMessages(messages)
-	oldRatio := g.budget.CalibRatio()
-	g.budget.Calibrate(estimated, resp.Usage.InputTokens)
+	projected := g.budget.ProjectedInput(messages)
+	g.budget.Anchor(resp.Usage.InputTokens, len(messages))
 
-	g.logCalibration(ctx, estimated, resp.Usage.InputTokens, oldRatio, g.budget.CalibRatio())
+	g.logAnchor(ctx, projected, resp.Usage.InputTokens)
 }
 
 // LimitToolOutput truncates a tool result if it exceeds the per-result
@@ -168,9 +167,9 @@ func (g *ContextGovernor) LimitToolOutput(ctx context.Context, result, toolName 
 	}
 
 	resultTokens, _ := g.budget.counter.CountText(result)
-	currentUsed := g.currentMessageTokens()
+	projected := g.budget.ProjectedInput(*g.messages)
 	remaining := g.maxTurns - g.currentTurn
-	perResult := g.budget.PerResultBudget(currentUsed, remaining)
+	perResult := g.budget.PerResultBudget(projected, remaining)
 
 	if perResult <= 0 || resultTokens <= perResult {
 		return result
@@ -181,19 +180,12 @@ func (g *ContextGovernor) LimitToolOutput(ctx context.Context, result, toolName 
 	return limited
 }
 
-// currentMessageTokens estimates token usage of the live message slice.
-func (g *ContextGovernor) currentMessageTokens() int {
-	if g.messages == nil {
-		return 0
-	}
-	return g.budget.EstimateMessages(*g.messages)
-}
-
 func (g *ContextGovernor) compact(ctx context.Context, req *providers.Request, preserve int) {
 	counter := g.budget.counter
 	groups := IdentifyTurnGroups(req.Messages, counter)
 	freed := CompactTurnGroups(req.Messages, groups, preserve, counter)
 	if freed > 0 {
+		g.budget.InvalidateAnchor()
 		g.logCompaction(ctx, len(groups), freed)
 	}
 }
@@ -202,13 +194,11 @@ func (g *ContextGovernor) evict(ctx context.Context, req *providers.Request) {
 	counter := g.budget.counter
 	groups := IdentifyTurnGroups(req.Messages, counter)
 
-	// Only evict groups that aren't in the preserved-recent window.
 	evictable := len(groups) - preserveRecentGroups
 	if evictable <= 0 {
 		return
 	}
 
-	// Evict oldest groups one at a time until below red threshold.
 	evicted := 0
 	for evicted < evictable {
 		freshGroups := IdentifyTurnGroups(req.Messages, counter)
@@ -222,6 +212,7 @@ func (g *ContextGovernor) evict(ctx context.Context, req *providers.Request) {
 		}
 	}
 	if evicted > 0 {
+		g.budget.InvalidateAnchor()
 		g.logEviction(ctx, evicted)
 	}
 }
@@ -232,7 +223,6 @@ func truncateWithImportance(content, toolName string, budgetTokens int) string {
 	detector := tools.NewImportanceDetector(tools.DefaultImportancePatterns())
 	lines := strings.Split(content, "\n")
 
-	// Collect important lines.
 	var important []string
 	for _, line := range lines {
 		if detector.IsImportant(line) {
@@ -243,16 +233,13 @@ func truncateWithImportance(content, toolName string, budgetTokens int) string {
 		important = important[:importanceMaxLines]
 	}
 
-	// Estimate chars from budget tokens (inverse of chars/4 heuristic).
 	charBudget := budgetTokens * 4
 	summary := SummarizeToolResult(toolName, content)
 
-	// If summary fits, use it.
 	if len(summary) <= charBudget {
 		return summary
 	}
 
-	// Hard truncate the summary itself.
 	truncLen := charBudget - 20
 	if truncLen > len(summary) {
 		truncLen = len(summary)
@@ -267,8 +254,8 @@ func truncateWithImportance(content, toolName string, budgetTokens int) string {
 
 func (g *ContextGovernor) logBudgetCheck(ctx context.Context, zone BudgetZone, messages []providers.Message) {
 	LogContextEvent(ctx, agentlog.EventContextBudgetCheck, agentlog.ContextBudgetPayload{
-		EstimatedTokens: g.budget.EstimateMessages(messages),
-		AvailableBudget: g.budget.Available(),
+		EstimatedTokens: g.budget.ProjectedInput(messages),
+		AvailableBudget: g.budget.Available(messages),
 		Utilization:     g.budget.Utilization(messages),
 		Zone:            zone.String(),
 	})
@@ -287,12 +274,10 @@ func (g *ContextGovernor) logEviction(ctx context.Context, groups int) {
 	})
 }
 
-func (g *ContextGovernor) logCalibration(ctx context.Context, estimated, actual int, oldRatio, newRatio float64) {
+func (g *ContextGovernor) logAnchor(ctx context.Context, projected, actual int) {
 	LogContextEvent(ctx, agentlog.EventContextCalibration, agentlog.CalibrationPayload{
+		EstimatedInputTokens: projected,
 		ActualInputTokens:    actual,
-		EstimatedInputTokens: estimated,
-		OldRatio:             oldRatio,
-		NewRatio:             newRatio,
 	})
 }
 

@@ -1,6 +1,6 @@
 // Package pipeline implements the Pipeline Tester agent — a per-task quality
 // engineer that validates individual task implementations within pipelines.
-// It gates on Inspector completion and uses GPT-5.3 Codex with xhigh reasoning
+// It gates on Inspector completion and uses GPT-5.4 Pro with xhigh reasoning
 // to drive a 6-phase testing protocol through an OpenAI tool loop.
 package pipeline
 
@@ -12,13 +12,14 @@ import (
 	"sync"
 	"time"
 
-	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/core/agentlog"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -37,7 +38,7 @@ type PipelineTester struct {
 	config shared.PipelineTesterConfig
 	logger *slog.Logger
 
-	// LLM provider (OpenAI gpt-5.3-codex with xhigh reasoning).
+	// LLM provider (OpenAI gpt-5.4-pro with xhigh reasoning).
 	provider pipelineTesterProvider
 
 	// Activity publisher for UI agent-panel updates. Nil-safe.
@@ -46,8 +47,8 @@ type PipelineTester struct {
 
 	// State.
 	currentPlan *shared.TestPlan
-	diagnoses     map[string]*shared.DiagnosisReport
-	mu            sync.RWMutex
+	diagnoses   map[string]*shared.DiagnosisReport
+	mu          sync.RWMutex
 
 	// Diagnosis engine.
 	diagEngine shared.DiagnosisEngine
@@ -93,13 +94,13 @@ func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*Pip
 	cfg = applyConfigDefaults(cfg)
 
 	pt := &PipelineTester{
-		id:          uuid.New().String()[:8],
-		config:      cfg,
-		logger:      slog.Default().With("agent", "tester-pipeline"),
-		provider:    provider,
-		diagnoses:   make(map[string]*shared.DiagnosisReport),
-		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		diagEngine:  shared.NewDiagnosisEngine(),
+		id:                uuid.New().String()[:8],
+		config:            cfg,
+		logger:            slog.Default().With("agent", "tester-pipeline"),
+		provider:          provider,
+		diagnoses:         make(map[string]*shared.DiagnosisReport),
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		diagEngine:        shared.NewDiagnosisEngine(),
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
 	}
@@ -141,14 +142,11 @@ func (pt *PipelineTester) initSkills() {
 		"write_test",
 		"run_test_suite",
 		"diagnose_failure",
-		"report_to_engineer",
-		"report_to_designer",
 	}
-	loaderCfg.AutoLoadDomains = []string{"testing", "quality"}
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	pt.skillLoader = skills.NewLoader(pt.skills, loaderCfg)
 
 	pt.registerCoreSkills()
-	pt.skills.LoadAll()
 }
 
 func (pt *PipelineTester) registerCoreSkills() {
@@ -169,12 +167,16 @@ func (pt *PipelineTester) registerCoreSkills() {
 
 type pipelineTesterDiag struct{ pt *PipelineTester }
 
-func (d *pipelineTesterDiag) AgentName() string  { return "tester_pipeline" }
-func (d *pipelineTesterDiag) SessionID() string  { return d.pt.config.SessionID }
-func (d *pipelineTesterDiag) LogsDir() string    { return agentshared.LogsDirForAgent(d.pt.steering.SessionDir(), "tester_pipeline") }
-func (d *pipelineTesterDiag) EventLogger() *agentlog.SessionEventLogger { return d.pt.steering.EventLogger() }
-func (d *pipelineTesterDiag) PeerLogsDirs() map[string]string           { return nil }
-func (d *pipelineTesterDiag) RecoveryHints() []string                   { return nil }
+func (d *pipelineTesterDiag) AgentName() string { return "tester_pipeline" }
+func (d *pipelineTesterDiag) SessionID() string { return d.pt.config.SessionID }
+func (d *pipelineTesterDiag) LogsDir() string {
+	return agentshared.LogsDirForAgent(d.pt.steering.SessionDir(), "tester_pipeline")
+}
+func (d *pipelineTesterDiag) EventLogger() *agentlog.SessionEventLogger {
+	return d.pt.steering.EventLogger()
+}
+func (d *pipelineTesterDiag) PeerLogsDirs() map[string]string { return nil }
+func (d *pipelineTesterDiag) RecoveryHints() []string         { return nil }
 
 func (d *pipelineTesterDiag) AgentSpecificDiagnostics() map[string]any {
 	d.pt.mu.RLock()
@@ -227,7 +229,7 @@ func (pt *PipelineTester) CurrentModel() string {
 // SupportedModels implements container.ModelSwappable.
 func (pt *PipelineTester) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
 	}
 }
@@ -347,6 +349,7 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	pt.mu.RUnlock()
 
 	systemPrompt := shared.PipelineTesterSystemPromptForWorker(wt)
+	pt.prepareSkillsForInput(fwd.Input)
 	tools := pt.buildToolDefinitions()
 
 	req := &providers.Request{
@@ -358,6 +361,7 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		MaxTokens: maxTokens,
 		Tools:     tools,
 	}
+	llmruntime.Apply(req, pt.llmRuntimeProfile())
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
@@ -424,7 +428,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		SessionID:   fwd.SessionID,
 	})
 	startTime := time.Now()
-	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, "tester-pipeline", fwd.CorrelationID, fwd.SourceAgentID)
+	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, pt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
 	ctx = agentshared.WithContextGovernor(ctx, agentshared.NewContextGovernor(
 		pt.config.Model, pt.config.MaxTokens, 0,
@@ -440,8 +444,8 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "tester-pipeline",
-		RespondingAgentName: "tester-pipeline",
+		RespondingAgentID:   pt.id,
+		RespondingAgentName: "Tester Pipeline",
 		ProcessingTime:      time.Since(startTime),
 	}
 
@@ -621,6 +625,14 @@ func (pt *PipelineTester) Descriptor() handoff.AgentDescriptor {
 		ReasoningEffort: reasoning,
 		ContextWindow:   200_000,
 		Category:        handoff.CategoryPipeline,
+	}
+}
+
+func (pt *PipelineTester) llmRuntimeProfile() llmruntime.Profile {
+	pt.mu.RLock()
+	defer pt.mu.RUnlock()
+	return llmruntime.Profile{
+		ReasoningEffort: pt.config.ReasoningEffort,
 	}
 }
 

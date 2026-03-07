@@ -53,7 +53,7 @@ func TestContextGovernorBeginTurn_UninitializedIsGreen(t *testing.T) {
 	}
 }
 
-func TestContextGovernorCalibrate(t *testing.T) {
+func TestContextGovernorCalibrate_Anchors(t *testing.T) {
 	gov := NewContextGovernor("claude-opus-4-6", 4096, 0)
 	req := &providers.Request{
 		SystemPrompt: "system",
@@ -64,8 +64,12 @@ func TestContextGovernorCalibrate(t *testing.T) {
 	msgs := []providers.Message{{Role: providers.RoleUser, Content: makeString(400)}}
 	resp := &providers.Response{Usage: providers.Usage{InputTokens: 200}}
 	gov.Calibrate(context.Background(), resp, msgs)
-	if gov.budget.CalibSamples() != 1 {
-		t.Fatalf("expected 1 calibration sample, got %d", gov.budget.CalibSamples())
+
+	if !gov.budget.Anchored() {
+		t.Fatal("expected budget to be anchored after Calibrate")
+	}
+	if gov.budget.AnchorTokens() != 200 {
+		t.Fatalf("expected anchor 200, got %d", gov.budget.AnchorTokens())
 	}
 }
 
@@ -73,16 +77,32 @@ func TestContextGovernorCalibrate_NilResponse(t *testing.T) {
 	gov := NewContextGovernor("claude-opus-4-6", 4096, 0)
 	gov.Initialize(&providers.Request{SystemPrompt: "s"})
 	gov.Calibrate(context.Background(), nil, nil)
-	if gov.budget.CalibSamples() != 0 {
-		t.Fatal("should not calibrate on nil response")
+	if gov.budget.Anchored() {
+		t.Fatal("should not anchor on nil response")
+	}
+}
+
+func TestContextGovernorCalibrate_ZeroInputTokens(t *testing.T) {
+	gov := NewContextGovernor("claude-opus-4-6", 4096, 0)
+	gov.Initialize(&providers.Request{SystemPrompt: "s"})
+	gov.Calibrate(context.Background(), &providers.Response{
+		Usage: providers.Usage{InputTokens: 0},
+	}, nil)
+	if gov.budget.Anchored() {
+		t.Fatal("should not anchor on zero input tokens")
 	}
 }
 
 func TestContextGovernorLimitToolOutput_WithinBudget(t *testing.T) {
 	gov := NewContextGovernor("claude-opus-4-6", 4096, 0)
-	gov.Initialize(&providers.Request{SystemPrompt: "s"})
+	req := &providers.Request{
+		SystemPrompt: "s",
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: "hi"}},
+	}
+	gov.Initialize(req)
 	gov.currentTurn = 0
 	gov.maxTurns = 10
+	gov.messages = &req.Messages
 
 	result := "short output"
 	got := gov.LimitToolOutput(context.Background(), result, "exec")
@@ -110,7 +130,6 @@ func TestContextGovernorIntegration(t *testing.T) {
 			reserveTokens: 200,
 			fixedOverhead: 0,
 			counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
-			calibRatio:    1.0,
 			compactAt:     0.80,
 			evictAt:       0.90,
 			criticalAt:    0.95,
@@ -159,10 +178,11 @@ func TestContextGovernorIntegration(t *testing.T) {
 			Content:    limited,
 		})
 
-		// Simulate calibration feedback.
-		estimated := gov.budget.EstimateMessages(req.Messages)
+		// Simulate anchor from provider ground truth.
+		// Actual is ~10% higher than raw estimate (realistic).
+		rawEstimate := gov.budget.estimateRaw(req.Messages)
 		gov.Calibrate(ctx, &providers.Response{
-			Usage: providers.Usage{InputTokens: int(float64(estimated) * 1.1)},
+			Usage: providers.Usage{InputTokens: int(float64(rawEstimate) * 1.1)},
 		}, req.Messages)
 	}
 
@@ -192,7 +212,6 @@ func TestContextGovernorCompactionIntegrity(t *testing.T) {
 			reserveTokens: 100,
 			fixedOverhead: 0,
 			counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
-			calibRatio:    1.0,
 			compactAt:     0.80,
 			evictAt:       0.90,
 			criticalAt:    0.95,
@@ -261,7 +280,7 @@ func TestErrContextBudgetExhausted(t *testing.T) {
 	}
 }
 
-func TestContextGovernorLimitToolOutput_UsesLiveMessages(t *testing.T) {
+func TestContextGovernorLimitToolOutput_UsesProjectedInput(t *testing.T) {
 	gov := NewContextGovernor("claude-opus-4-6", 4096, 0)
 	req := &providers.Request{
 		SystemPrompt: "system",
@@ -273,9 +292,9 @@ func TestContextGovernorLimitToolOutput_UsesLiveMessages(t *testing.T) {
 	// BeginTurn stores the message reference.
 	gov.BeginTurn(context.Background(), 0, 2, req)
 
-	used := gov.currentMessageTokens()
-	if used == 0 {
-		t.Fatal("expected non-zero currentMessageTokens after BeginTurn")
+	projected := gov.budget.ProjectedInput(*gov.messages)
+	if projected == 0 {
+		t.Fatal("expected non-zero projected input after BeginTurn")
 	}
 }
 
@@ -304,7 +323,6 @@ func TestContextGovernorCritical_CompactsAllGroups(t *testing.T) {
 			reserveTokens: 100,
 			fixedOverhead: 0,
 			counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
-			calibRatio:    1.0,
 			compactAt:     0.80,
 			evictAt:       0.90,
 			criticalAt:    0.95,
@@ -345,5 +363,91 @@ func TestContextGovernorCritical_CompactsAllGroups(t *testing.T) {
 	}
 	if !anyCompacted {
 		t.Fatal("expected recent groups to be compacted in Critical zone")
+	}
+}
+
+func TestApplyContextBudget_StripToolsAtMaxRuns(t *testing.T) {
+	req := &providers.Request{
+		Messages: []providers.Message{{Role: providers.RoleUser, Content: "hi"}},
+		Tools:    []providers.Tool{{Name: "exec"}},
+	}
+	err := ApplyContextBudget(context.Background(), 5, 5, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Tools != nil {
+		t.Fatal("expected tools stripped at maxRuns")
+	}
+}
+
+func TestApplyContextBudget_RedStripsTools(t *testing.T) {
+	gov := &ContextGovernor{
+		budget: &ContextBudget{
+			modelLimit:    1000,
+			reserveTokens: 0,
+			fixedOverhead: 0,
+			counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
+			compactAt:     0.80,
+			evictAt:       0.90,
+			criticalAt:    0.95,
+		},
+		initialized: true,
+	}
+	ctx := WithContextGovernor(context.Background(), gov)
+
+	// Fill messages to Red zone (~92%).
+	req := &providers.Request{
+		Messages: []providers.Message{{Role: providers.RoleUser, Content: makeString(3700)}},
+		Tools:    []providers.Tool{{Name: "exec"}},
+	}
+	err := ApplyContextBudget(ctx, 0, 10, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Tools != nil {
+		t.Fatal("expected tools stripped in Red zone")
+	}
+}
+
+func TestAnchorInvalidatedByCompaction(t *testing.T) {
+	gov := &ContextGovernor{
+		budget: &ContextBudget{
+			modelLimit:    2000,
+			reserveTokens: 100,
+			fixedOverhead: 0,
+			counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
+			compactAt:     0.80,
+			evictAt:       0.90,
+			criticalAt:    0.95,
+		},
+		initialized: true,
+	}
+
+	// Anchor first.
+	gov.budget.Anchor(1000, 1)
+	if !gov.budget.Anchored() {
+		t.Fatal("should be anchored")
+	}
+
+	// Build messages that trigger compaction (Yellow+).
+	req := &providers.Request{
+		Messages: []providers.Message{
+			{Role: providers.RoleUser, Content: "prompt"},
+			{Role: providers.RoleAssistant, Content: "t1",
+				ToolCalls: []providers.ToolCall{{ID: "1", Name: "exec"}}},
+			{Role: providers.RoleTool, ToolCallID: "1", ToolName: "exec",
+				Content: makeString(3000)},
+			{Role: providers.RoleAssistant, Content: "t2",
+				ToolCalls: []providers.ToolCall{{ID: "2", Name: "exec"}}},
+			{Role: providers.RoleTool, ToolCallID: "2", ToolName: "exec",
+				Content: makeString(3000)},
+		},
+	}
+
+	gov.BeginTurn(context.Background(), 2, 10, req)
+
+	// After compaction, anchor should be invalidated.
+	if gov.budget.Anchored() {
+		t.Fatal("anchor should be invalidated after compaction modifies messages")
 	}
 }

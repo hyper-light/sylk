@@ -216,6 +216,16 @@ func (gt *GlobalTester) executeToolCall(ctx context.Context, call providers.Tool
 	return marshalToolOutput(result.Data)
 }
 
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (gt *GlobalTester) prepareSkillsForInput(input string) {
+	if gt.skillLoader == nil {
+		return
+	}
+	gt.skillLoader.LoadForInput(input)
+	gt.skillLoader.OptimizeForBudget()
+}
+
 // buildToolDefinitions converts loaded skills to provider tool format.
 func (gt *GlobalTester) buildToolDefinitions() []providers.Tool {
 	loaded := gt.skills.GetLoaded()

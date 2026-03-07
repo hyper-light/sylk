@@ -63,6 +63,58 @@ func (a *Academic) publishRerouteRequest(reason, originalInput, suggestedTarget 
 func (a *Academic) registerExtendedSkills() {
 	a.skills.Register(recommendSolutionSkill(a))
 	a.skills.Register(validateApproachSkill(a))
+	a.skills.Register(cloneViaLibrarianSkill(a))
+}
+
+// cloneViaLibrarianSkill lets the academic trigger a git clone through the
+// librarian. The cloned repository becomes searchable in the librarian's
+// package store, enabling follow-up queries against the cloned code.
+func cloneViaLibrarianSkill(a *Academic) *skills.Skill {
+	return skills.NewSkill("clone_via_librarian").
+		Description(
+			"Request the Librarian to clone a remote git repository for code analysis. "+
+				"The cloned code becomes searchable via the Librarian's search tools. "+
+				"Use this when you need to analyze source code from an external package.",
+		).
+		Domain("research").
+		Keywords("clone", "repository", "package", "source code", "git").
+		Priority(80).
+		TokenEstimate(300).
+		StringParam("url", "Repository URL (e.g. github.com/owner/repo)", true).
+		StringParam("reason", "Why this repository needs to be cloned", true).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				URL    string `json:"url"`
+				Reason string `json:"reason"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if params.URL == "" {
+				return nil, fmt.Errorf("url is required")
+			}
+			if params.Reason == "" {
+				return nil, fmt.Errorf("reason is required")
+			}
+
+			cloneQuery := fmt.Sprintf("Clone repository %s for analysis: %s", params.URL, params.Reason)
+			evidence, err := a.requestConsultation(ctx, "librarian", cloneQuery, "", a.config.SessionID)
+			if err != nil {
+				return map[string]any{
+					"success": false,
+					"url":     params.URL,
+					"error":   err.Error(),
+				}, nil
+			}
+
+			return map[string]any{
+				"success": evidence.Success,
+				"url":     params.URL,
+				"data":    evidence.Data,
+				"error":   evidence.Error,
+			}, nil
+		}).
+		Build()
 }
 
 // consultTargets enumerates valid consultation targets for the Academic.

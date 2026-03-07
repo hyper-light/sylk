@@ -15,9 +15,9 @@ type plannerConversationMode string
 
 const (
 	plannerConversationModeClarification plannerConversationMode = "clarification"
-	plannerConversationModeReady        plannerConversationMode = "ready"
-	plannerConversationModeConverse         plannerConversationMode = "converse"
-	plannerConversationModeFeedback         plannerConversationMode = "feedback"
+	plannerConversationModeReady         plannerConversationMode = "ready"
+	plannerConversationModeConverse      plannerConversationMode = "converse"
+	plannerConversationModeFeedback      plannerConversationMode = "feedback"
 )
 
 type plannerConversationRequest struct {
@@ -185,11 +185,11 @@ func (a *Architect) composeUserFacingResponseWithTools(
 		Messages: []providers.Message{
 			{Role: providers.RoleUser, Content: prompt},
 		},
-		MaxTokens:      maxTokens,
-		SystemPrompt:   planner.ConversationSystemPrompt(),
-		ThinkingBudget: 0, // Adaptive — let the provider handle allocation.
-		Tools:          tools,
+		MaxTokens:    maxTokens,
+		SystemPrompt: planner.ConversationSystemPrompt(),
+		Tools:        tools,
 	}
+	a.applyConversationRuntimeProfile(req, mode)
 
 	text, err := a.executeToolLoop(ctx, req, stage, request.OnChunk, shared.SteeringLedgerFromContext(ctx))
 	if err != nil {

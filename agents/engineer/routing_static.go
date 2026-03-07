@@ -62,7 +62,7 @@ func EngineerRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.7,
 			},
-			Description: "Staff-level implementation engineer. GPT-5.3 Codex with xhigh reasoning. Executes coding tasks with self-audit and consultation.",
+			Description: "Staff-level implementation engineer. GPT-5.4 Pro with xhigh reasoning. Executes coding tasks with self-audit and consultation.",
 			Priority:    70,
 		},
 	}

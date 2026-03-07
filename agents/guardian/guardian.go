@@ -17,9 +17,9 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -35,6 +35,7 @@ import (
 // Used only for on-demand escalation of ambiguous findings.
 type guardianProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
+	Stream(ctx context.Context, req *providers.Request) (<-chan *providers.StreamChunk, error)
 }
 
 // Guardian is the sidecar safety agent for the Sylk system.
@@ -46,12 +47,12 @@ type Guardian struct {
 	config Config
 	logger *slog.Logger
 
-	// LLM provider — GPT-5.3 Codex for on-demand escalation.
+	// LLM provider — GPT-5.4 Pro for on-demand escalation.
 	// Deterministic by default; LLM invoked only for ambiguous cases.
-	provider        guardianProvider
-	providerWrapper gateway.ProviderWrapper
-	providerMu      sync.RWMutex
-	model           string
+	provider   guardianProvider
+	refresher  container.ProviderRefresher
+	providerMu sync.RWMutex
+	model      string
 
 	// Skills system (Architect pattern).
 	skills        *skills.Registry
@@ -76,8 +77,16 @@ type Guardian struct {
 	gitObserver      *GitObserver
 	checkpointMgr    *CheckpointManager
 	contentValidator *ContentValidator
+	externalScanner  *ExternalContentScanner
+	contentSafety    *ContentSafetyValidator
 	healthMon        *HealthMonitor
 	diffGate         *DiffGate
+
+	// Quarantine buffer — set via SetQuarantine after construction.
+	quarantine *fetch.QuarantineBuffer
+
+	// Domain reputation — session-scoped trust tracking.
+	domainReputation *DomainReputationTracker
 
 	// File access — always read-only.
 	fileAccess versioning.FileAccess
@@ -165,15 +174,15 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 	}
 
 	g := &Guardian{
-		id:               guardianID,
-		config:           cfg,
-		logger:           cfg.Logger,
-		provider:         provider,
-		model:            DefaultGuardianModel,
-		activityPub:      cfg.ActivityPub,
-		fileAccess:       cfg.FileAccess,
-		knownAgents:      make(map[string]*guide.AgentAnnouncement),
-		pendingApprovals: make(map[string]chan ApprovalResult),
+		id:                guardianID,
+		config:            cfg,
+		logger:            cfg.Logger,
+		provider:          provider,
+		model:             DefaultGuardianModel,
+		activityPub:       cfg.ActivityPub,
+		fileAccess:        cfg.FileAccess,
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		pendingApprovals:  make(map[string]chan ApprovalResult),
 		inFlight:          make(map[string]context.CancelFunc),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
@@ -192,8 +201,8 @@ func (g *Guardian) initSkills() {
 	g.hooks = skills.NewHookRegistry()
 
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = guardianCoreSkillNames()
-	loaderCfg.AutoLoadDomains = []string{"safety", "validation", "health", "gate", "observability", "system"}
+	loaderCfg.CoreSkills = guardianPinnedSkillNames()
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	g.skillLoader = skills.NewLoader(g.skills, loaderCfg)
 
 	g.registerCoreSkills()
@@ -202,6 +211,9 @@ func (g *Guardian) initSkills() {
 
 func (g *Guardian) initSubsystems() {
 	g.contentValidator = NewContentValidator(g.config.Sanitizer, g.config.InjectionScanEnabled)
+	g.externalScanner = NewExternalContentScanner()
+	g.contentSafety = NewContentSafetyValidator()
+	g.domainReputation = NewDomainReputationTracker()
 	g.healthMon = NewHealthMonitor(g.config.HealthCheckInterval, g.config.AgentTimeoutDefault, g.config.TokenBudget, g.config.CostBudget)
 	g.healthMon.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
 		shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
@@ -226,10 +238,11 @@ func (g *Guardian) Terminate(ctx context.Context) error {
 
 func (g *Guardian) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
-		AgentType:     "guardian",
-		ModelID:       g.CurrentModel(),
-		ContextWindow: 8192,
-		Category:      handoff.CategoryStandalone,
+		AgentType:       "guardian",
+		ModelID:         g.CurrentModel(),
+		ReasoningEffort: "high",
+		ContextWindow:   8192,
+		Category:        handoff.CategoryStandalone,
 	}
 }
 
@@ -254,11 +267,12 @@ func (g *Guardian) SetProvider(p guardianProvider) {
 	g.provider = p
 }
 
-// SetProviderWrapper stores a callback for gateway rate-limiting on refresh.
-func (g *Guardian) SetProviderWrapper(w gateway.ProviderWrapper) {
+// SetProviderRefresher stores a callback that creates a fresh provider for
+// the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (g *Guardian) SetProviderRefresher(fn container.ProviderRefresher) {
 	g.providerMu.Lock()
 	defer g.providerMu.Unlock()
-	g.providerWrapper = w
+	g.refresher = fn
 }
 
 func (g *Guardian) getProvider() guardianProvider {
@@ -271,31 +285,23 @@ func (g *Guardian) getProvider() guardianProvider {
 // AuthRefreshable
 // ---------------------------------------------------------------------------
 
-func (g *Guardian) ProviderType() string { return "openai" }
+func (g *Guardian) ProviderType() string {
+	return string(container.ProviderForModel(g.CurrentModel()))
+}
 
 func (g *Guardian) RefreshProvider(ctx context.Context, authMethod string) error {
-	cfg := providers.OpenAIConfig{
-		BaseConfig: providers.BaseConfig{
-			Model:     g.CurrentModel(),
-			MaxTokens: DefaultMaxOutputTokens,
-		},
-		ReasoningEffort: "high",
-		AuthMode:        authMethod,
+	g.providerMu.RLock()
+	fn := g.refresher
+	g.providerMu.RUnlock()
+	if fn == nil {
+		return nil
 	}
-	p, err := providers.NewOpenAIProvider(ctx, cfg)
+	p, err := fn(ctx, g.CurrentModel(), authMethod)
 	if err != nil {
 		return fmt.Errorf("guardian refresh provider: %w", err)
 	}
-	g.providerMu.RLock()
-	wrapper := g.providerWrapper
-	g.providerMu.RUnlock()
-
-	var wrapped guardianProvider = p
-	if wrapper != nil {
-		wrapped = wrapper(p)
-	}
-	g.SetProvider(wrapped)
-	g.logger.Info("provider refreshed", "auth_method", authMethod)
+	g.SetProvider(p)
+	g.logger.Info("provider refreshed", "model", g.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 
@@ -329,7 +335,7 @@ func (g *Guardian) CurrentModel() string {
 
 func (g *Guardian) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
 	}
 }
@@ -389,6 +395,23 @@ func (g *Guardian) SetGitSubsystems(gitBus *git.GitBus, watcher *git.StatusWatch
 	}
 }
 
+// SetExtendedObservabilityDeps wires pipeline, gateway, knowledge, and
+// concurrency queriers after construction. Nil arguments are ignored.
+func (g *Guardian) SetExtendedObservabilityDeps(pq PipelineQuerier, gq GatewayQuerier, kq KnowledgeQuerier, cq ConcurrencyQuerier) {
+	if pq != nil {
+		g.config.Pipeline = pq
+	}
+	if gq != nil {
+		g.config.Gateway = gq
+	}
+	if kq != nil {
+		g.config.Knowledge = kq
+	}
+	if cq != nil {
+		g.config.Concurrency = cq
+	}
+}
+
 // SetVFSDeps wires VFS observability dependencies after construction.
 // Called in Phase 3 or from the factory closure on daemon restart.
 func (g *Guardian) SetVFSDeps(cvs CVSQuerier, vfs VFSManagerQuerier) {
@@ -404,6 +427,12 @@ func (g *Guardian) SetVFSDeps(cvs CVSQuerier, vfs VFSManagerQuerier) {
 // enabling per-call cost accumulation from LLM activity events.
 func (g *Guardian) SetCostCalculator(fn CostCalculator) {
 	g.healthMon.SetCostCalculator(fn)
+}
+
+// SetQuarantine wires the quarantine buffer for external content inspection.
+// Called during pipeline setup after construction.
+func (g *Guardian) SetQuarantine(q *fetch.QuarantineBuffer) {
+	g.quarantine = q
 }
 
 // ---------------------------------------------------------------------------
@@ -465,9 +494,9 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 	if g.config.GitBus != nil {
 		g.gitObserver = NewGitObserver(g.config.GitBus, g.config.ProtectedBranches, g.activityPub, g.requestApproval)
 		g.gitObserver.SetOnEvent(func(evt agentlog.EventType, level string, payload any) {
-		shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
-	})
-	g.gitObserver.Start()
+			shared.LogAgentEvent(g.steering.EventLogger(), evt, g.id, "", "", level, payload)
+		})
+		g.gitObserver.Start()
 
 		if g.config.GitWatcher != nil {
 			g.checkpointMgr = NewCheckpointManager(
@@ -669,10 +698,12 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	} else {
 		resp.Data = result
 		text := ""
+		var usage *guide.StreamUsage
 		if result != nil {
 			text = result.Response
+			usage = result.Usage
 		}
-		g.publishStreamComplete(reqCtx, fwd.CorrelationID, text, nil)
+		g.publishStreamComplete(reqCtx, fwd.CorrelationID, text, usage)
 	}
 
 	if g.agentPod != nil {
@@ -1026,16 +1057,54 @@ func (g *Guardian) buildToolDefinitions() []providers.Tool {
 	return tools
 }
 
-// ensureToolLoopSkillsLoaded loads core guardian skills for the LLM tool-call loop.
-func (g *Guardian) ensureToolLoopSkillsLoaded() {
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+// Pinned skills are always loaded; remaining skills are loaded by keyword
+// match and demand-paged via the safety hook when the LLM invokes them.
+func (g *Guardian) prepareSkillsForInput(input string, intent GuardianIntent) {
 	if g.skills == nil {
 		return
 	}
-	for _, name := range guardianCoreSkillNames() {
+	for _, name := range guardianPinnedSkillNames() {
 		g.skills.Load(name)
 	}
 	if g.skillLoader != nil {
+		g.skillLoader.LoadForInput(input)
 		g.skillLoader.OptimizeForBudget()
+	}
+	for _, name := range guardianIntentSkillNames(intent) {
+		g.skills.Load(name)
+	}
+}
+
+func guardianIntentSkillNames(intent GuardianIntent) []string {
+	switch intent {
+	case IntentAssess:
+		return []string{
+			"content_scan",
+			"review_gate",
+			"git_safety",
+			"quarantine_status",
+			"read_file",
+			"glob",
+			"grep",
+		}
+	case IntentReport:
+		return []string{
+			"agent_health",
+			"agent_logs",
+			"system_status",
+			"pipeline_status",
+			"usage_breakdown",
+			"quarantine_status",
+		}
+	case IntentCheckpoint:
+		return []string{
+			"git_safety",
+			"rollback",
+		}
+	default:
+		return nil
 	}
 }
 

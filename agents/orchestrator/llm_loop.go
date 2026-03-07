@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -17,12 +18,11 @@ const (
 	defaultBootstrapSafetyDur = 30 * time.Second
 )
 
-
 // eventSeverity classifies how urgent a bus event is.
 type eventSeverity int
 
 const (
-	severityInfo     eventSeverity = iota
+	severityInfo eventSeverity = iota
 	severityWarning
 	severityCritical
 )
@@ -171,23 +171,30 @@ func (o *Orchestrator) processBatch(ctx context.Context, batch []*busEvent) {
 // buildLLMRequest constructs a providers.Request with system prompt, tools,
 // and the given user message.
 func (o *Orchestrator) buildLLMRequest(userMessage string) *providers.Request {
+	o.prepareSkillsForInput(userMessage)
 	temp := o.config.Temperature
 	tools := o.buildToolDefinitions()
 	req := &providers.Request{
 		Messages: []providers.Message{
 			{Role: providers.RoleUser, Content: userMessage},
 		},
-		Model:           o.config.Model,
-		SystemPrompt:    DefaultSystemPrompt,
-		MaxTokens:       o.config.MaxOutputTokens,
-		Temperature:     &temp,
-		ReasoningEffort: "low",
-		Tools:           tools,
+		Model:        o.config.Model,
+		SystemPrompt: DefaultSystemPrompt,
+		MaxTokens:    o.config.MaxOutputTokens,
+		Temperature:  &temp,
+		Tools:        tools,
 	}
+	llmruntime.Apply(req, o.backgroundLLMRuntimeProfile())
 	if len(tools) > 0 {
 		req.ToolChoice = "auto"
 	}
 	return req
+}
+
+func (o *Orchestrator) backgroundLLMRuntimeProfile() llmruntime.Profile {
+	return llmruntime.Profile{
+		ReasoningEffort: "low",
+	}
 }
 
 // buildDigestMessage formats a batch of events into a markdown digest.

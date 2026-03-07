@@ -18,9 +18,8 @@ import (
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/providers/gateway"
-	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -38,8 +37,8 @@ type GlobalInspector struct {
 	logger *slog.Logger
 
 	// LLM provider (Anthropic Opus 4.6).
-	provider        inspectorProvider
-	providerWrapper gateway.ProviderWrapper
+	provider  inspectorProvider
+	refresher container.ProviderRefresher
 
 	// Tool runner for external analysis tools.
 	toolRunner *shared.ToolRunner
@@ -87,24 +86,30 @@ type GlobalInspector struct {
 	requestSerializer *agentShared.RequestSerializer
 }
 
-// New creates a new GlobalInspector instance.
-func New(cfg shared.GlobalInspectorConfig, provider inspectorProvider) (*GlobalInspector, error) {
+// New creates a new GlobalInspector instance. The provider must implement
+// both Complete and StreamWithHandler (satisfied by all gateway-wrapped providers).
+func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (*GlobalInspector, error) {
 	cfg = applyConfigDefaults(cfg)
+
+	ip, ok := provider.(inspectorProvider)
+	if !ok {
+		return nil, fmt.Errorf("inspector: provider does not support StreamWithHandler")
+	}
 
 	inspectorID := cfg.AgentID
 	if inspectorID == "" {
-		inspectorID = fmt.Sprintf("inspector_%s", uuid.New().String()[:8])
+		inspectorID = uuid.New().String()[:8]
 	}
 
 	gi := &GlobalInspector{
-		id:          inspectorID,
-		config:      cfg,
-		logger:      slog.Default().With("agent", "inspector"),
-		provider:    provider,
-		toolRunner:  shared.NewToolRunner(".", cfg.DefaultTimeout, slog.Default()),
-		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		pendingBus:  make(map[string]chan *guide.Message),
-		diffStore:   NewAuditDiffStore(cfg.MaxAge),
+		id:                inspectorID,
+		config:            cfg,
+		logger:            slog.Default().With("agent", "inspector"),
+		provider:          ip,
+		toolRunner:        shared.NewToolRunner(".", cfg.DefaultTimeout, slog.Default()),
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		pendingBus:        make(map[string]chan *guide.Message),
+		diffStore:         NewAuditDiffStore(cfg.MaxAge),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
 	}
@@ -122,10 +127,12 @@ func (gi *GlobalInspector) SetProvider(p inspectorProvider) {
 	gi.provider = p
 }
 
-// SetProviderWrapper stores a callback that re-applies gateway rate limiting
-// to fresh providers created during credential refresh.
-func (gi *GlobalInspector) SetProviderWrapper(w gateway.ProviderWrapper) {
-	gi.providerWrapper = w
+// SetProviderRefresher stores a callback that creates a fresh provider for
+// the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (gi *GlobalInspector) SetProviderRefresher(fn container.ProviderRefresher) {
+	gi.mu.Lock()
+	defer gi.mu.Unlock()
+	gi.refresher = fn
 }
 
 // getProvider returns the current provider under read lock.
@@ -136,28 +143,28 @@ func (gi *GlobalInspector) getProvider() inspectorProvider {
 }
 
 // ProviderType implements container.AuthRefreshable.
-func (gi *GlobalInspector) ProviderType() string { return "anthropic" }
+func (gi *GlobalInspector) ProviderType() string {
+	return string(container.ProviderForModel(gi.CurrentModel()))
+}
 
 // RefreshProvider implements container.AuthRefreshable.
-// Re-resolves Anthropic credentials and replaces the provider.
 func (gi *GlobalInspector) RefreshProvider(ctx context.Context, authMethod string) error {
-	cfg := providers.AnthropicConfig{
-		BaseConfig: providers.BaseConfig{
-			Model:     gi.config.Model,
-			MaxTokens: gi.config.MaxTokens,
-		},
-		AuthMode: authMethod,
+	gi.mu.RLock()
+	fn := gi.refresher
+	gi.mu.RUnlock()
+	if fn == nil {
+		return nil
 	}
-	p, err := providers.NewAnthropicProvider(ctx, cfg)
+	p, err := fn(ctx, gi.CurrentModel(), authMethod)
 	if err != nil {
 		return fmt.Errorf("inspector refresh provider: %w", err)
 	}
-	var wrapped inspectorProvider = p
-	if gi.providerWrapper != nil {
-		wrapped = gi.providerWrapper(p)
+	ip, ok := p.(inspectorProvider)
+	if !ok {
+		return fmt.Errorf("inspector refresh provider: provider does not satisfy inspectorProvider")
 	}
-	gi.SetProvider(wrapped)
-	gi.logger.Info("provider refreshed", "auth_method", authMethod)
+	gi.SetProvider(ip)
+	gi.logger.Info("provider refreshed", "model", gi.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 
@@ -187,8 +194,8 @@ func (gi *GlobalInspector) CurrentModel() string {
 // SupportedModels implements container.ModelSwappable.
 func (gi *GlobalInspector) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
-		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 	}
 }
 
@@ -222,13 +229,10 @@ func (gi *GlobalInspector) initSkills() {
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = []string{
 		"run_linter", "run_type_checker", "run_security_scan",
-		"detect_race_conditions", "detect_deadlocks", "detect_memory_leaks",
 		"read_file", "glob", "grep",
-		"audit_layer", "validate_plan_adherence",
-		"cross_reference_changes", "grade_layer_quality",
-		"escalate_findings",
+		"audit_layer",
 	}
-	loaderCfg.AutoLoadDomains = []string{"analysis", "filesystem", "audit"}
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	gi.skillLoader = skills.NewLoader(gi.skills, loaderCfg)
 
 	gi.registerCoreSkills()
@@ -371,6 +375,7 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 	}
 
 	systemPrompt := shared.GlobalInspectorSystemPrompt()
+	gi.prepareSkillsForInput(fwd.Input)
 	tools := gi.buildToolDefinitions()
 
 	req := &providers.Request{
@@ -382,6 +387,7 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 		MaxTokens: gi.config.MaxTokens,
 		Tools:     tools,
 	}
+	gi.applyLLMRuntimeProfile(req, "task")
 
 	result, err := gi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 	if err != nil {
@@ -445,7 +451,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		SessionID:   fwd.SessionID,
 	})
 
-	toolEmitter := agentShared.NewToolCallEmitter(gi.bus, gi.channels, "inspector", fwd.CorrelationID, fwd.SourceAgentID)
+	toolEmitter := agentShared.NewToolCallEmitter(gi.bus, gi.channels, gi.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
 	ctx = agentShared.WithContextGovernor(ctx, agentShared.NewContextGovernor(
 		gi.config.Model, gi.config.MaxTokens, 0,
@@ -483,7 +489,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 		CorrelationID:       fwd.CorrelationID,
 		Success:             true,
 		Data:                result,
-		RespondingAgentID:   "inspector",
+		RespondingAgentID:   gi.id,
 		RespondingAgentName: "Inspector",
 		ProcessingTime:      time.Since(startTime),
 	}

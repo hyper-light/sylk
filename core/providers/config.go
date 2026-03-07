@@ -221,14 +221,13 @@ type OpenAIConfig struct {
 // DefaultOpenAIConfig returns OpenAI defaults
 func DefaultOpenAIConfig() OpenAIConfig {
 	base := DefaultBaseConfig()
-	base.Model = "gpt-5.3-codex"
+	base.Model = "gpt-5.4-pro"
 	base.MaxTokens = 8192
 
 	return OpenAIConfig{
 		BaseConfig:      base,
 		ReasoningEffort: "xhigh",
 		AuthMode:        "api_key",
-		FallbackModel:   "gpt-5.2-codex",
 	}
 }
 

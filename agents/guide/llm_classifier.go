@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -70,9 +71,11 @@ func (c *LLMClassifier) Classify(ctx context.Context, input string) (*Classifica
 		Model:              c.model,
 		SystemPrompt:       systemPrompt,
 		Temperature:        classificationTemperature(c.config),
-		ReasoningEffort:    resolveClassifierReasoningEffort(c.config.ThinkingLevel),
 		SkipProviderSkills: true,
 	}
+	llmruntime.Apply(req, llmruntime.Profile{
+		ReasoningEffort: resolveClassifierReasoningEffort(c.config.ThinkingLevel),
+	})
 
 	completeStart := time.Now()
 	guideFileLog().Info("DEBUG: classifier_complete_start",

@@ -9,10 +9,10 @@ import (
 type SourceModel string
 
 const (
-	SourceModelGPT52Codex   SourceModel = "gpt-5.2-codex"
-	SourceModelClaudeOpus45 SourceModel = "claude-opus-4-5-20251101"
-	SourceModelUser         SourceModel = "user"
-	SourceModelArchivalist  SourceModel = "archivalist"
+	SourceModelGPT54Pro SourceModel = "gpt-5.4-pro"
+	SourceModelClaudeOpus  SourceModel = "claude-opus-4-6"
+	SourceModelUser        SourceModel = "user"
+	SourceModelArchivalist SourceModel = "archivalist"
 )
 
 // RequestType classifies incoming requests
@@ -169,8 +169,8 @@ func (r SubmissionResult) MarshalJSON() ([]byte, error) {
 // ValidSources returns the list of accepted source models for submissions
 func ValidSources() []SourceModel {
 	return []SourceModel{
-		SourceModelGPT52Codex,
-		SourceModelClaudeOpus45,
+		SourceModelGPT54Pro,
+		SourceModelClaudeOpus,
 	}
 }
 

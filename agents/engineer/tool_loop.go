@@ -227,6 +227,16 @@ func (e *Engineer) executeToolCall(ctx context.Context, call providers.ToolCall)
 	return shared.MarshalToolOutput(result.Data)
 }
 
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (e *Engineer) prepareSkillsForInput(input string) {
+	if e.skillLoader == nil {
+		return
+	}
+	e.skillLoader.LoadForInput(input)
+	e.skillLoader.OptimizeForBudget()
+}
+
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (e *Engineer) buildToolDefinitions() []providers.Tool {
 	loaded := e.skills.GetLoaded()

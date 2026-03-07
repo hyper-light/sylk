@@ -14,14 +14,14 @@ func TestCrossSessionIndex_QueryCrossSession(t *testing.T) {
 	_, err := store.InsertEntryInSession("session-1", &Entry{
 		Category: CategoryDecision,
 		Content:  "Decision A",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 	require.NoError(t, err)
 
 	_, err = store.InsertEntryInSession("session-2", &Entry{
 		Category: CategoryDecision,
 		Content:  "Decision B",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 	require.NoError(t, err)
 
@@ -46,7 +46,7 @@ func TestCrossSessionIndex_QuerySessions(t *testing.T) {
 	_, err := store.InsertEntryInSession("session-1", &Entry{
 		Category: CategoryDecision,
 		Content:  "Decision A",
-		Source:   SourceModelClaudeOpus45,
+		Source:   SourceModelClaudeOpus,
 	})
 	require.NoError(t, err)
 

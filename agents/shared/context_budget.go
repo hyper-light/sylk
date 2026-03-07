@@ -1,8 +1,6 @@
 package shared
 
 import (
-	"math"
-
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -31,25 +29,35 @@ func (z BudgetZone) String() string {
 	}
 }
 
-// ContextBudget performs token accounting with watermark zones and adaptive
-// calibration via exponential moving average of actual/estimated ratios.
+// ContextBudget performs token accounting using ground-truth anchoring.
+//
+// After every LLM call the provider reports the exact input token count.
+// The budget anchors to that number and estimates only the delta — messages
+// appended since the anchor (typically one assistant reply + tool results).
+// This bounds the estimation error to a single turn's worth of new content
+// rather than the entire context window.
+//
+// Before the first LLM response the budget uses a character-based estimate
+// of the fixed overhead (system prompt + tool definitions) plus message
+// content. This pre-anchor estimate is conservative but only used once.
 type ContextBudget struct {
 	modelLimit    int
 	reserveTokens int
-	fixedOverhead int
 	counter       *providers.ProviderTokenCounter
 
-	// Adaptive calibration: EMA of actual/estimated ratio.
-	calibRatio   float64
-	calibSamples int
+	// Ground-truth anchor from the most recent provider response.
+	anchorTokens   int // provider-reported InputTokens
+	anchorMsgCount int // len(req.Messages) at anchor time
+	anchored       bool
 
-	// Watermark fractions of available budget.
+	// Character-based overhead estimate, used only before the first anchor.
+	fixedOverhead int
+
+	// Watermark fractions of available capacity.
 	compactAt  float64 // 0.80
 	evictAt    float64 // 0.90
 	criticalAt float64 // 0.95
 }
-
-const calibrationAlpha = 0.3
 
 // NewContextBudget creates a budget tracker for the given model. Reserve is
 // the sum of max output tokens and thinking budget — tokens that the model
@@ -60,7 +68,6 @@ func NewContextBudget(model string, maxOutputTokens, thinkingBudget int) *Contex
 		modelLimit:    counter.MaxContextTokens(model),
 		reserveTokens: maxOutputTokens + thinkingBudget,
 		counter:       counter,
-		calibRatio:    1.0,
 		compactAt:     0.80,
 		evictAt:       0.90,
 		criticalAt:    0.95,
@@ -68,7 +75,8 @@ func NewContextBudget(model string, maxOutputTokens, thinkingBudget int) *Contex
 }
 
 // ComputeFixedOverhead estimates the static portion of every request — system
-// prompt and tool definitions — and caches it. Called once at governor init.
+// prompt and tool definitions — and caches it. Used only before the first
+// anchor is established.
 func (b *ContextBudget) ComputeFixedOverhead(systemPrompt string, tools []providers.Tool) {
 	promptTokens, _ := b.counter.CountText(systemPrompt)
 	msgs := []providers.Message{{Role: providers.RoleUser, Content: systemPrompt}}
@@ -78,29 +86,65 @@ func (b *ContextBudget) ComputeFixedOverhead(systemPrompt string, tools []provid
 	b.fixedOverhead = promptTokens + toolTokens
 }
 
-// Available returns the token budget available for messages (excluding the
-// fixed overhead and output reserve).
-func (b *ContextBudget) Available() int {
-	avail := b.modelLimit - b.reserveTokens - b.fixedOverhead
+// Anchor records the provider's ground-truth input token count and the
+// message count at the time of the LLM call. All subsequent utilization
+// projections use this as the base, estimating only newly appended messages.
+func (b *ContextBudget) Anchor(inputTokens, messageCount int) {
+	b.anchorTokens = inputTokens
+	b.anchorMsgCount = messageCount
+	b.anchored = true
+}
+
+// InvalidateAnchor marks the anchor as stale. Called when messages are
+// removed (steering rollback, compaction, eviction) so the next BeginTurn
+// falls back to the character-based estimate until a new anchor arrives.
+func (b *ContextBudget) InvalidateAnchor() {
+	b.anchored = false
+}
+
+// Anchored returns whether a ground-truth anchor is active.
+func (b *ContextBudget) Anchored() bool { return b.anchored }
+
+// AnchorTokens returns the last anchored input token count (for telemetry).
+func (b *ContextBudget) AnchorTokens() int { return b.anchorTokens }
+
+// Capacity returns the total input token budget: model limit minus the
+// output reserve. This is the denominator for utilization.
+func (b *ContextBudget) Capacity() int {
+	cap := b.modelLimit - b.reserveTokens
+	if cap < 0 {
+		return 0
+	}
+	return cap
+}
+
+// ProjectedInput returns the best estimate of total input tokens for the
+// given message slice. When anchored, this is anchor + delta estimate.
+// When unanchored, it falls back to fixedOverhead + character estimate.
+func (b *ContextBudget) ProjectedInput(messages []providers.Message) int {
+	if b.anchored && b.anchorMsgCount <= len(messages) {
+		delta := b.estimateRaw(messages[b.anchorMsgCount:])
+		return b.anchorTokens + delta
+	}
+	return b.fixedOverhead + b.estimateRaw(messages)
+}
+
+// Available returns the token budget remaining for new messages.
+func (b *ContextBudget) Available(messages []providers.Message) int {
+	avail := b.Capacity() - b.ProjectedInput(messages)
 	if avail < 0 {
 		return 0
 	}
 	return avail
 }
 
-// EstimateMessages returns the calibrated token estimate for the given messages.
-func (b *ContextBudget) EstimateMessages(messages []providers.Message) int {
-	raw, _ := b.counter.Count(messages)
-	return int(math.Ceil(float64(raw) * b.calibRatio))
-}
-
-// Utilization returns the fraction of available budget consumed by messages.
+// Utilization returns the fraction of capacity consumed by current input.
 func (b *ContextBudget) Utilization(messages []providers.Message) float64 {
-	avail := b.Available()
-	if avail <= 0 {
+	cap := b.Capacity()
+	if cap <= 0 {
 		return 1.0
 	}
-	return float64(b.EstimateMessages(messages)) / float64(avail)
+	return float64(b.ProjectedInput(messages)) / float64(cap)
 }
 
 // Zone returns the watermark zone for the current message set.
@@ -118,25 +162,10 @@ func (b *ContextBudget) Zone(messages []providers.Message) BudgetZone {
 	}
 }
 
-// Calibrate updates the EMA calibration ratio using ground-truth input
-// tokens from the provider response vs. the character-based estimate.
-func (b *ContextBudget) Calibrate(estimatedTokens, actualInputTokens int) {
-	if estimatedTokens <= 0 || actualInputTokens <= 0 {
-		return
-	}
-	observed := float64(actualInputTokens) / float64(estimatedTokens)
-	if b.calibSamples == 0 {
-		b.calibRatio = observed
-	} else {
-		b.calibRatio = calibrationAlpha*observed + (1-calibrationAlpha)*b.calibRatio
-	}
-	b.calibSamples++
-}
-
 // PerResultBudget computes the token budget for a single tool result based
 // on remaining capacity and remaining turns.
-func (b *ContextBudget) PerResultBudget(currentUsed, remainingTurns int) int {
-	remaining := b.Available() - currentUsed
+func (b *ContextBudget) PerResultBudget(projectedInput, remainingTurns int) int {
+	remaining := b.Capacity() - projectedInput
 	if remaining <= 0 {
 		return 0
 	}
@@ -147,11 +176,16 @@ func (b *ContextBudget) PerResultBudget(currentUsed, remainingTurns int) int {
 	return remaining / divisor
 }
 
-// CalibRatio returns the current calibration ratio (for telemetry).
-func (b *ContextBudget) CalibRatio() float64 { return b.calibRatio }
+// estimateRaw returns a character-based token estimate for messages without
+// any calibration scaling. Used only for delta estimation (small, bounded
+// content added since the last anchor).
+func (b *ContextBudget) estimateRaw(messages []providers.Message) int {
+	raw, _ := b.counter.Count(messages)
+	return raw
+}
 
-// CalibSamples returns the number of calibration samples received.
-func (b *ContextBudget) CalibSamples() int { return b.calibSamples }
+// FixedOverhead returns the character-based overhead estimate (for telemetry).
+func (b *ContextBudget) FixedOverhead() int { return b.fixedOverhead }
 
 // ModelLimit returns the model's context window size.
 func (b *ContextBudget) ModelLimit() int { return b.modelLimit }

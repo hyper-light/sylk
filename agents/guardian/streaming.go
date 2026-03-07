@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/providers"
@@ -88,6 +89,27 @@ func (g *Guardian) publishStreamComplete(ctx context.Context, correlationID stri
 		Type:  guide.StreamEventComplete,
 		Text:  strings.TrimSpace(text),
 		Usage: usage,
+	}
+	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
+}
+
+func (g *Guardian) publishThoughtProgress(ctx context.Context, correlationID string, thought string) {
+	if g.bus == nil {
+		return
+	}
+	thought = strings.TrimSpace(thought)
+	if thought == "" {
+		return
+	}
+	if len(thought) > 200 {
+		thought = thought[:197] + "..."
+	}
+	event := &guide.StreamEvent{
+		Type: guide.StreamEventProgress,
+		Data: &guide.ProgressData{
+			Message: thought,
+		},
+		Timestamp: time.Now(),
 	}
 	_ = g.bus.Publish(g.channels.Responses, newStreamMessage(correlationID, g.id, event))
 }

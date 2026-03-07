@@ -206,6 +206,16 @@ func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.To
 	return shared.MarshalToolOutput(result.Data)
 }
 
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (pt *PipelineTester) prepareSkillsForInput(input string) {
+	if pt.skillLoader == nil {
+		return
+	}
+	pt.skillLoader.LoadForInput(input)
+	pt.skillLoader.OptimizeForBudget()
+}
+
 // buildToolDefinitions converts loaded skills to provider tool format.
 func (pt *PipelineTester) buildToolDefinitions() []providers.Tool {
 	loaded := pt.skills.GetLoaded()

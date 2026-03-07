@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/search/codebase"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -26,13 +27,13 @@ type readFileParams struct {
 
 func readFileSkill(l *Librarian) *skills.Skill {
 	return skills.NewSkill("read_file").
-		Description("Read file contents for search context gathering.").
+		Description("Read file contents. Use offset and limit for large files.").
 		Domain("filesystem").
 		Keywords("read", "file", "content", "cat", "view").
 		Priority(95).
-		StringParam("path", "Path to file", true).
+		StringParam("path", "Path to file (relative to project root)", true).
 		IntParam("offset", "Starting line offset (0-based)", false).
-		IntParam("limit", "Max lines to return", false).
+		IntParam("limit", "Max lines to return (default: 1000)", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params readFileParams
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -41,7 +42,7 @@ func readFileSkill(l *Librarian) *skills.Skill {
 			if strings.TrimSpace(params.Path) == "" {
 				return nil, fmt.Errorf("path is required")
 			}
-			content, err := os.ReadFile(resolveLibrarianPath(l.config.WorkingDirectory, params.Path))
+			content, err := os.ReadFile(resolvePath(l.config.WorkingDirectory, params.Path))
 			if err != nil {
 				return nil, err
 			}
@@ -50,7 +51,7 @@ func readFileSkill(l *Librarian) *skills.Skill {
 		Build()
 }
 
-func resolveLibrarianPath(root, path string) string {
+func resolvePath(root, path string) string {
 	if filepath.IsAbs(path) {
 		return path
 	}
@@ -96,7 +97,7 @@ func clampLimit(limit int) int {
 }
 
 // ---------------------------------------------------------------------------
-// glob
+// glob — gitignore-aware, gobwas/glob file discovery
 // ---------------------------------------------------------------------------
 
 type globParams struct {
@@ -107,12 +108,12 @@ type globParams struct {
 
 func globSkill(l *Librarian) *skills.Skill {
 	return skills.NewSkill("glob").
-		Description("Find files by glob pattern for search context.").
+		Description("Find files matching a glob pattern. Supports ** for recursive matching. Respects .gitignore rules.").
 		Domain("filesystem").
-		Keywords("glob", "find files", "pattern", "match").
+		Keywords("glob", "find files", "pattern", "match", "list").
 		Priority(90).
-		StringParam("pattern", "Glob pattern", true).
-		StringParam("path", "Base path", false).
+		StringParam("pattern", "Glob pattern (e.g. '**/*.go', 'agents/**/types.go')", true).
+		StringParam("path", "Base path (default: project root)", false).
 		ArrayParam("exclude", "Excluded glob patterns", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params globParams
@@ -122,8 +123,12 @@ func globSkill(l *Librarian) *skills.Skill {
 			if strings.TrimSpace(params.Pattern) == "" {
 				return nil, fmt.Errorf("pattern is required")
 			}
-			root := resolveGlobRoot(l.config.WorkingDirectory, params.Path)
-			matches, err := runGlobSearch(root, params.Pattern, params.Exclude)
+			root := resolveRoot(l.config.WorkingDirectory, params.Path)
+			matches, err := codebase.GlobFiles(codebase.GlobConfig{
+				Root:            root,
+				Pattern:         params.Pattern,
+				ExcludePatterns: params.Exclude,
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -132,165 +137,135 @@ func globSkill(l *Librarian) *skills.Skill {
 		Build()
 }
 
-func resolveGlobRoot(workDir, path string) string {
+func resolveRoot(workDir, path string) string {
 	if strings.TrimSpace(path) == "" {
 		return workDir
 	}
-	return resolveLibrarianPath(workDir, path)
-}
-
-func runGlobSearch(root, pattern string, exclude []string) ([]string, error) {
-	results := make([]string, 0)
-	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return nil
-		}
-		if shouldExcludePath(rel, exclude) {
-			return nil
-		}
-		if matchesGlob(pattern, rel) {
-			results = append(results, rel)
-		}
-		return nil
-	})
-	return results, err
-}
-
-func shouldExcludePath(path string, excludes []string) bool {
-	for _, pattern := range excludes {
-		if matchesGlob(pattern, path) {
-			return true
-		}
-	}
-	return false
-}
-
-func matchesGlob(pattern, candidate string) bool {
-	matched, err := filepath.Match(pattern, candidate)
-	if err == nil && matched {
-		return true
-	}
-	if strings.Contains(pattern, "**") {
-		simplified := strings.ReplaceAll(pattern, "**", "*")
-		matched, _ = filepath.Match(simplified, candidate)
-		return matched
-	}
-	return false
+	return resolvePath(workDir, path)
 }
 
 // ---------------------------------------------------------------------------
-// grep
+// grep — parallel, gitignore-aware regex search with tree-sitter context
 // ---------------------------------------------------------------------------
 
 type grepParams struct {
-	Pattern    string `json:"pattern"`
-	Path       string `json:"path,omitempty"`
-	Include    string `json:"include,omitempty"`
-	MaxMatches int    `json:"max_matches,omitempty"`
-}
-
-type grepMatch struct {
-	File    string `json:"file"`
-	Line    int    `json:"line"`
-	Content string `json:"content"`
+	Pattern         string `json:"pattern"`
+	Path            string `json:"path,omitempty"`
+	Include         string `json:"include,omitempty"`
+	MaxMatches      int    `json:"max_matches,omitempty"`
+	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
+	WithSymbols     bool   `json:"with_symbols,omitempty"`
 }
 
 func grepSkill(l *Librarian) *skills.Skill {
 	return skills.NewSkill("grep").
-		Description("Search files with regex for search context extraction.").
+		Description("Search file contents with regex patterns. Parallel, gitignore-aware search across the codebase. Set with_symbols=true to annotate matches with their enclosing function/type via tree-sitter.").
 		Domain("filesystem").
-		Keywords("grep", "search", "regex", "find text").
+		Keywords("grep", "search", "regex", "find text", "ripgrep", "rg").
 		Priority(90).
 		StringParam("pattern", "Regular expression pattern", true).
-		StringParam("path", "Path to search", false).
-		StringParam("include", "Include filename pattern", false).
-		IntParam("max_matches", "Maximum number of matches", false).
+		StringParam("path", "Path to search (default: project root)", false).
+		StringParam("include", "Include filename glob pattern (e.g. '**/*.go')", false).
+		IntParam("max_matches", "Maximum number of matches (default: 200)", false).
+		BoolParam("case_insensitive", "Case-insensitive matching", false).
+		BoolParam("with_symbols", "Annotate matches with enclosing symbol name via tree-sitter", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params grepParams
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			regex, err := regexp.Compile(params.Pattern)
+			if strings.TrimSpace(params.Pattern) == "" {
+				return nil, fmt.Errorf("pattern is required")
+			}
+
+			flags := ""
+			if params.CaseInsensitive {
+				flags = "(?i)"
+			}
+			regex, err := regexp.Compile(flags + params.Pattern)
+			if err != nil {
+				return nil, fmt.Errorf("invalid regex: %w", err)
+			}
+
+			var includes []string
+			if params.Include != "" {
+				includes = []string{params.Include}
+			}
+
+			matches, err := codebase.Search(ctx, codebase.SearchConfig{
+				Root:            resolveRoot(l.config.WorkingDirectory, params.Path),
+				Pattern:         regex,
+				IncludePatterns: includes,
+				MaxMatches:      params.MaxMatches,
+				WithSymbols:     params.WithSymbols,
+			})
 			if err != nil {
 				return nil, err
 			}
-			root := resolveGlobRoot(l.config.WorkingDirectory, params.Path)
-			max := clampMaxMatches(params.MaxMatches)
-			matches, err := runGrepSearch(root, regex, params.Include, max)
-			if err != nil {
-				return nil, err
-			}
+
 			return map[string]any{
 				"pattern":   params.Pattern,
 				"matches":   matches,
 				"count":     len(matches),
-				"truncated": len(matches) >= max,
+				"truncated": len(matches) >= params.MaxMatches && params.MaxMatches > 0,
 			}, nil
 		}).
 		Build()
 }
 
-func clampMaxMatches(value int) int {
-	if value <= 0 {
-		return 100
-	}
-	return value
+// ---------------------------------------------------------------------------
+// find_symbol — tree-sitter-powered structural symbol search
+// ---------------------------------------------------------------------------
+
+type findSymbolParams struct {
+	Name    string `json:"name"`
+	Include string `json:"include,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
 }
 
-func runGrepSearch(root string, regex *regexp.Regexp, include string, max int) ([]grepMatch, error) {
-	results := make([]grepMatch, 0)
-	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil || info == nil {
-			return nil
-		}
-		if info.IsDir() {
-			return skipLibrarianDir(info.Name())
-		}
-		if include != "" && !matchesGlob(include, info.Name()) {
-			return nil
-		}
-		return appendFileMatches(root, path, regex, max, &results)
-	})
-	return results, err
-}
+func findSymbolSkill(l *Librarian) *skills.Skill {
+	return skills.NewSkill("find_symbol").
+		Description("Find functions, methods, types, and classes by name using tree-sitter structural analysis. More precise than regex grep — understands language syntax.").
+		Domain("code").
+		Keywords("symbol", "function", "method", "type", "class", "struct", "interface", "definition").
+		Priority(100).
+		StringParam("name", "Symbol name or regex pattern to match", true).
+		StringParam("include", "File glob filter (e.g. '**/*.go')", false).
+		IntParam("limit", "Max results (default: 50)", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params findSymbolParams
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if strings.TrimSpace(params.Name) == "" {
+				return nil, fmt.Errorf("name is required")
+			}
+			if params.Limit <= 0 {
+				params.Limit = 50
+			}
 
-func skipLibrarianDir(name string) error {
-	if name == ".git" || name == "vendor" || name == "node_modules" {
-		return filepath.SkipDir
-	}
-	return nil
-}
+			nameRegex, err := regexp.Compile(params.Name)
+			if err != nil {
+				return nil, fmt.Errorf("invalid name pattern: %w", err)
+			}
 
-func appendFileMatches(root, path string, regex *regexp.Regexp, max int, out *[]grepMatch) error {
-	if len(*out) >= max {
-		return filepath.SkipAll
-	}
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		rel = path
-	}
-	lines := strings.Split(string(content), "\n")
-	for idx, line := range lines {
-		if len(*out) >= max {
-			return filepath.SkipAll
-		}
-		if regex.MatchString(line) {
-			*out = append(*out, grepMatch{
-				File:    rel,
-				Line:    idx + 1,
-				Content: strings.TrimSpace(line),
-			})
-		}
-	}
-	return nil
+			var includes []string
+			if params.Include != "" {
+				includes = []string{params.Include}
+			}
+
+			symbols, err := codebase.SearchSymbols(ctx, l.config.WorkingDirectory, nameRegex, includes, params.Limit)
+			if err != nil {
+				return nil, err
+			}
+
+			return map[string]any{
+				"name":    params.Name,
+				"symbols": symbols,
+				"count":   len(symbols),
+			}, nil
+		}).
+		Build()
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +353,7 @@ func gitSkill(l *Librarian) *skills.Skill {
 	}
 
 	return skills.NewSkill("git").
-		Description("Execute git read operations for search context.\n\n"+
+		Description("Execute git read operations.\n\n"+
 			"Commands:\n"+
 			"- status: Show repository working tree status\n"+
 			"- diff: Show uncommitted diff (--no-ext-diff)\n"+

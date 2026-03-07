@@ -370,6 +370,7 @@ func (r *planningProtocolRunner) run() error {
 		SystemPrompt: system,
 		Tools:        tools,
 	}
+	r.architect.applyProtocolRuntimeProfile(req)
 
 	text, err := r.architect.executeToolLoop(
 		loopCtx, req, "planning_protocol",

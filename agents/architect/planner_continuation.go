@@ -44,7 +44,7 @@ type continuationState struct {
 	mode          continuationMode
 	progress      progressTracker
 	metrics       continuationMetrics
-	lastSnapshot  string           // accumulated text, set once per round after stitch
+	lastSnapshot  string            // accumulated text, set once per round after stitch
 	lastStructure structuralContext // structural analysis, set once per round after stitch
 }
 
@@ -316,10 +316,10 @@ func (p *anthropicPlanner) requestContinuation(
 			{Role: providers.RoleAssistant, Content: prefill},
 			{Role: providers.RoleUser, Content: contPrompt},
 		},
-		MaxTokens:      cfg.maxOutputTokens,
-		SystemPrompt:   resolvedSystem,
-		ThinkingBudget: 0,
+		MaxTokens:    cfg.maxOutputTokens,
+		SystemPrompt: resolvedSystem,
 	}
+	p.applyStreamingRuntimeProfile(req, 0)
 	return p.streamRequest(ctx, req, stage, onChunk)
 }
 

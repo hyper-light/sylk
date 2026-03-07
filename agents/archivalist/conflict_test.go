@@ -37,15 +37,15 @@ func TestConflictDetector_FileConflict_SameFile(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
 	// Register two agents
-	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 	_ = agent1
 
 	// First agent reads and modifies file
-	agentCtx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus45)
+	agentCtx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus)
 	agentCtx.RecordFileModified("/src/main.go", FileChange{
 		StartLine: 10, EndLine: 20, Description: "Change 1",
-	}, SourceModelClaudeOpus45)
+	}, SourceModelClaudeOpus)
 
 	// Second agent tries to modify same file
 	result := detector.DetectConflict(
@@ -67,14 +67,14 @@ func TestConflictDetector_FileConflict_SameFile(t *testing.T) {
 func TestConflictDetector_FileConflict_NonOverlappingRanges(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 
 	// First agent modifies lines 10-20
-	agentCtx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus45)
+	agentCtx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus)
 	agentCtx.RecordFileModified("/src/main.go", FileChange{
 		StartLine: 10, EndLine: 20, Description: "Change 1",
-	}, SourceModelClaudeOpus45)
+	}, SourceModelClaudeOpus)
 
 	// Second agent tries to modify lines 50-60 (non-overlapping)
 	result := detector.DetectConflict(
@@ -100,13 +100,13 @@ func TestConflictDetector_FileConflict_NonOverlappingRanges(t *testing.T) {
 func TestConflictDetector_FileConflict_SameAgent(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
+	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
 
 	// Agent modifies file
-	agentCtx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus45)
+	agentCtx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus)
 	agentCtx.RecordFileModified("/src/main.go", FileChange{
 		StartLine: 10, EndLine: 20, Description: "Change 1",
-	}, SourceModelClaudeOpus45)
+	}, SourceModelClaudeOpus)
 
 	// Same agent modifies again (should not conflict)
 	result := detector.DetectConflict(
@@ -129,8 +129,8 @@ func TestConflictDetector_FileConflict_SameAgent(t *testing.T) {
 func TestConflictDetector_IntentConflict(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 
 	// First agent records user wants something
 	agentCtx.RecordUserWants("Use PostgreSQL", "high", "user-1")
@@ -153,8 +153,8 @@ func TestConflictDetector_IntentConflict(t *testing.T) {
 func TestConflictDetector_ResumeConflict_DifferentTasks(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 
 	// First agent sets current task
 	agentCtx.SetCurrentTask("Implement auth", "Add JWT auth", agent1.Source)
@@ -177,15 +177,15 @@ func TestConflictDetector_ResumeConflict_DifferentTasks(t *testing.T) {
 func TestConflictDetector_PatternConflict(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 
 	// First agent registers a pattern
 	agentCtx.RegisterPattern(&Pattern{
 		Category:    "error_handling",
 		Name:        "Wrap errors",
 		Description: "Use fmt.Errorf with %w",
-		Source:      SourceModelClaudeOpus45,
+		Source:      SourceModelClaudeOpus,
 	})
 
 	// Second agent tries to register conflicting pattern
@@ -356,7 +356,7 @@ func TestConflictHistory_Capacity(t *testing.T) {
 func TestConflictDetector_VersionMismatch(t *testing.T) {
 	detector, _, registry := newTestConflictDetector(t)
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
 
 	// Increment version several times
 	registry.IncrementVersion()
@@ -380,8 +380,8 @@ func TestConflictDetector_VersionMismatch(t *testing.T) {
 func TestConflictDetector_CompetingPatterns(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 
 	// Both agents try to establish patterns in same category
 	agentCtx.RegisterPattern(&Pattern{
@@ -410,8 +410,8 @@ func TestConflictDetector_CompetingPatterns(t *testing.T) {
 func TestConflictDetector_TaskOwnershipCollision(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 
 	// First agent claims a task
 	agentCtx.SetCurrentTask("Implement feature X", "Full implementation", agent1.Source)
@@ -434,8 +434,8 @@ func TestConflictDetector_TaskOwnershipCollision(t *testing.T) {
 func TestConflictDetector_ContradictoryIntents(t *testing.T) {
 	detector, agentCtx, registry := newTestConflictDetector(t)
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT52Codex)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelGPT54Pro)
 
 	// Record that user wants something
 	agentCtx.RecordUserWants("Use microservices architecture", "high", "user")

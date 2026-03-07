@@ -15,7 +15,7 @@ import (
 func PublishToolCallStreamEvent(
 	bus guide.EventBus,
 	channels *guide.AgentChannels,
-	agentName string,
+	agentID string,
 	correlationID string,
 	sourceAgentID string,
 	event ToolCallEvent,
@@ -42,17 +42,17 @@ func PublishToolCallStreamEvent(
 
 	stream := &guide.StreamResponse{
 		CorrelationID:     correlationID,
-		RespondingAgentID: agentName,
+		RespondingAgentID: agentID,
 		TargetAgentID:     sourceAgentID,
 		Event:             streamEvent,
 	}
 
 	msg := &guide.Message{
-		ID:            fmt.Sprintf("%s_tc_%s", agentName, uuid.New().String()[:8]),
+		ID:            fmt.Sprintf("tc_%s_%s", agentID, uuid.New().String()[:8]),
 		CorrelationID: correlationID,
 		Type:          guide.MessageTypeStream,
 		Payload:       stream,
-		SourceAgentID: agentName,
+		SourceAgentID: agentID,
 		TargetAgentID: sourceAgentID,
 		Timestamp:     time.Now(),
 		Status:        messaging.StatusQueued,
@@ -69,11 +69,11 @@ func PublishToolCallStreamEvent(
 func NewToolCallEmitter(
 	bus guide.EventBus,
 	channels *guide.AgentChannels,
-	agentName string,
+	agentID string,
 	correlationID string,
 	sourceAgentID string,
 ) ToolCallEmitter {
 	return func(event ToolCallEvent) {
-		PublishToolCallStreamEvent(bus, channels, agentName, correlationID, sourceAgentID, event)
+		PublishToolCallStreamEvent(bus, channels, agentID, correlationID, sourceAgentID, event)
 	}
 }

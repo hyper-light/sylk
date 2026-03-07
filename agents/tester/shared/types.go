@@ -147,7 +147,7 @@ type PipelineTesterConfig struct {
 // DefaultPipelineTesterConfig returns sensible defaults.
 func DefaultPipelineTesterConfig() PipelineTesterConfig {
 	return PipelineTesterConfig{
-		Model:           "gpt-5.3-codex",
+		Model:           "gpt-5.4-pro",
 		ReasoningEffort: "xhigh",
 		MaxToolRuns:     32,
 		MaxTokens:       16384,
@@ -176,7 +176,7 @@ type GlobalTesterConfig struct {
 // DefaultGlobalTesterConfig returns sensible defaults.
 func DefaultGlobalTesterConfig() GlobalTesterConfig {
 	return GlobalTesterConfig{
-		Model:                  "gpt-5.3-codex",
+		Model:                  "gpt-5.4-pro",
 		ReasoningEffort:        "xhigh",
 		MaxToolRuns:            32,
 		MaxTokens:              16384,

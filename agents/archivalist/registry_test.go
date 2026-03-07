@@ -17,14 +17,14 @@ import (
 func TestRegistry_Register(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, err := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, err := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	require.NoError(t, err, "Register")
 	assert.NotEmpty(t, agent.ID, "ID should not be empty")
 	assert.Equal(t, "test-agent", agent.Name, "Name should match")
 	assert.Equal(t, "session-1", agent.SessionID, "SessionID should match")
 	assert.Equal(t, AgentStatusActive, agent.Status, "Status should be active")
-	assert.Equal(t, SourceModelClaudeOpus45, agent.Source, "Source should match")
+	assert.Equal(t, SourceModelClaudeOpus, agent.Source, "Source should match")
 	assert.False(t, agent.RegisteredAt.IsZero(), "RegisteredAt should be set")
 	assert.False(t, agent.LastSeenAt.IsZero(), "LastSeenAt should be set")
 }
@@ -32,8 +32,8 @@ func TestRegistry_Register(t *testing.T) {
 func TestRegistry_Register_WithParent(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	parent, _ := registry.Register("parent-agent", "session-1", "", SourceModelClaudeOpus45)
-	child, err := registry.Register("child-agent", "session-1", parent.ID, SourceModelClaudeOpus45)
+	parent, _ := registry.Register("parent-agent", "session-1", "", SourceModelClaudeOpus)
+	child, err := registry.Register("child-agent", "session-1", parent.ID, SourceModelClaudeOpus)
 
 	require.NoError(t, err, "Register child")
 	assert.Equal(t, parent.ID, child.ParentID, "Parent ID should match")
@@ -47,7 +47,7 @@ func TestRegistry_Register_WithParent(t *testing.T) {
 func TestRegistry_Register_InvalidParent(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	_, err := registry.Register("child-agent", "session-1", "nonexistent-parent", SourceModelClaudeOpus45)
+	_, err := registry.Register("child-agent", "session-1", "nonexistent-parent", SourceModelClaudeOpus)
 
 	assert.Error(t, err, "Register with invalid parent should fail")
 }
@@ -55,8 +55,8 @@ func TestRegistry_Register_InvalidParent(t *testing.T) {
 func TestRegistry_Register_ParentDifferentSession(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	parent, _ := registry.Register("parent-agent", "session-1", "", SourceModelClaudeOpus45)
-	_, err := registry.Register("child-agent", "session-2", parent.ID, SourceModelClaudeOpus45)
+	parent, _ := registry.Register("parent-agent", "session-1", "", SourceModelClaudeOpus)
+	_, err := registry.Register("child-agent", "session-2", parent.ID, SourceModelClaudeOpus)
 
 	assert.Error(t, err, "Register with parent in different session should fail")
 }
@@ -65,11 +65,11 @@ func TestRegistry_Register_ReactivateExisting(t *testing.T) {
 	registry := newTestRegistry(t)
 
 	// Register agent
-	agent1, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent1, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 	agent1.Status = AgentStatusIdle
 
 	// Re-register same name in same session
-	agent2, err := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent2, err := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	require.NoError(t, err, "Re-register")
 	assert.Equal(t, agent1.ID, agent2.ID, "Should return same agent")
@@ -79,7 +79,7 @@ func TestRegistry_Register_ReactivateExisting(t *testing.T) {
 func TestRegistry_Unregister(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	err := registry.Unregister(agent.ID)
 
@@ -90,9 +90,9 @@ func TestRegistry_Unregister(t *testing.T) {
 func TestRegistry_Unregister_WithChildren(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	parent, _ := registry.Register("parent", "session-1", "", SourceModelClaudeOpus45)
-	child1, _ := registry.Register("child1", "session-1", parent.ID, SourceModelClaudeOpus45)
-	child2, _ := registry.Register("child2", "session-1", parent.ID, SourceModelClaudeOpus45)
+	parent, _ := registry.Register("parent", "session-1", "", SourceModelClaudeOpus)
+	child1, _ := registry.Register("child1", "session-1", parent.ID, SourceModelClaudeOpus)
+	child2, _ := registry.Register("child2", "session-1", parent.ID, SourceModelClaudeOpus)
 
 	err := registry.Unregister(parent.ID)
 
@@ -113,7 +113,7 @@ func TestRegistry_Unregister_NotFound(t *testing.T) {
 func TestRegistry_Get(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	retrieved := registry.Get(agent.ID)
 
@@ -132,7 +132,7 @@ func TestRegistry_Get_NotFound(t *testing.T) {
 func TestRegistry_GetByName(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, _ := registry.Register("unique-name", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("unique-name", "session-1", "", SourceModelClaudeOpus)
 
 	retrieved := registry.GetByName("unique-name")
 
@@ -151,9 +151,9 @@ func TestRegistry_GetByName_NotFound(t *testing.T) {
 func TestRegistry_GetBySession(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	registry.Register("agent2", "session-1", "", SourceModelClaudeOpus45)
-	registry.Register("agent3", "session-2", "", SourceModelClaudeOpus45)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	registry.Register("agent2", "session-1", "", SourceModelClaudeOpus)
+	registry.Register("agent3", "session-2", "", SourceModelClaudeOpus)
 
 	agents := registry.GetBySession("session-1")
 
@@ -163,7 +163,7 @@ func TestRegistry_GetBySession(t *testing.T) {
 func TestRegistry_Touch(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 	originalLastSeen := agent.LastSeenAt
 	originalClock := agent.Clock
 
@@ -190,7 +190,7 @@ func TestRegistry_Touch_NotFound(t *testing.T) {
 func TestRegistry_UpdateVersion(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	err := registry.UpdateVersion(agent.ID, "v5")
 
@@ -206,7 +206,7 @@ func TestRegistry_UpdateStatuses(t *testing.T) {
 		InactiveTimeout: 100 * time.Millisecond,
 	})
 
-	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	// Wait for idle timeout
 	time.Sleep(60 * time.Millisecond)
@@ -225,8 +225,8 @@ func TestRegistry_GetActiveAgents(t *testing.T) {
 		InactiveTimeout: 100 * time.Millisecond,
 	})
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelClaudeOpus45)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-1", "", SourceModelClaudeOpus)
 
 	// Make agent2 idle
 	time.Sleep(60 * time.Millisecond)
@@ -321,7 +321,7 @@ func TestRegistry_Clock(t *testing.T) {
 func TestRegistry_SyncClock(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	// Sync with higher incoming clock
 	newClock := registry.SyncClock(agent.ID, 10)
@@ -333,9 +333,9 @@ func TestRegistry_SyncClock(t *testing.T) {
 func TestRegistry_GetAgentHierarchy(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	root, _ := registry.Register("root", "session-1", "", SourceModelClaudeOpus45)
-	child, _ := registry.Register("child", "session-1", root.ID, SourceModelClaudeOpus45)
-	grandchild, _ := registry.Register("grandchild", "session-1", child.ID, SourceModelClaudeOpus45)
+	root, _ := registry.Register("root", "session-1", "", SourceModelClaudeOpus)
+	child, _ := registry.Register("child", "session-1", root.ID, SourceModelClaudeOpus)
+	grandchild, _ := registry.Register("grandchild", "session-1", child.ID, SourceModelClaudeOpus)
 
 	hierarchy := registry.GetAgentHierarchy(grandchild.ID)
 
@@ -348,9 +348,9 @@ func TestRegistry_GetAgentHierarchy(t *testing.T) {
 func TestRegistry_GetRootAgent(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	root, _ := registry.Register("root", "session-1", "", SourceModelClaudeOpus45)
-	child, _ := registry.Register("child", "session-1", root.ID, SourceModelClaudeOpus45)
-	grandchild, _ := registry.Register("grandchild", "session-1", child.ID, SourceModelClaudeOpus45)
+	root, _ := registry.Register("root", "session-1", "", SourceModelClaudeOpus)
+	child, _ := registry.Register("child", "session-1", root.ID, SourceModelClaudeOpus)
+	grandchild, _ := registry.Register("grandchild", "session-1", child.ID, SourceModelClaudeOpus)
 
 	foundRoot := registry.GetRootAgent(grandchild.ID)
 
@@ -360,10 +360,10 @@ func TestRegistry_GetRootAgent(t *testing.T) {
 func TestRegistry_GetDescendants(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	root, _ := registry.Register("root", "session-1", "", SourceModelClaudeOpus45)
-	child1, _ := registry.Register("child1", "session-1", root.ID, SourceModelClaudeOpus45)
-	child2, _ := registry.Register("child2", "session-1", root.ID, SourceModelClaudeOpus45)
-	registry.Register("grandchild", "session-1", child1.ID, SourceModelClaudeOpus45)
+	root, _ := registry.Register("root", "session-1", "", SourceModelClaudeOpus)
+	child1, _ := registry.Register("child1", "session-1", root.ID, SourceModelClaudeOpus)
+	child2, _ := registry.Register("child2", "session-1", root.ID, SourceModelClaudeOpus)
+	registry.Register("grandchild", "session-1", child1.ID, SourceModelClaudeOpus)
 	_ = child2
 
 	descendants := registry.GetDescendants(root.ID)
@@ -374,9 +374,9 @@ func TestRegistry_GetDescendants(t *testing.T) {
 func TestRegistry_GetStats(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	registry.Register("agent2", "session-1", "", SourceModelClaudeOpus45)
-	registry.Register("agent3", "session-2", "", SourceModelClaudeOpus45)
+	registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	registry.Register("agent2", "session-1", "", SourceModelClaudeOpus)
+	registry.Register("agent3", "session-2", "", SourceModelClaudeOpus)
 	registry.IncrementVersion()
 	registry.IncrementGlobalClock()
 
@@ -411,7 +411,7 @@ func TestCoordination_SimultaneousRegistration(t *testing.T) {
 				fmt.Sprintf("agent-%d", idx),
 				"session-1",
 				"",
-				SourceModelClaudeOpus45,
+				SourceModelClaudeOpus,
 			)
 			if err == nil {
 				mu.Lock()
@@ -436,8 +436,8 @@ func TestCoordination_SimultaneousRegistration(t *testing.T) {
 func TestCoordination_OrphanedSubAgents(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	parent, _ := registry.Register("parent", "session-1", "", SourceModelClaudeOpus45)
-	child, _ := registry.Register("child", "session-1", parent.ID, SourceModelClaudeOpus45)
+	parent, _ := registry.Register("parent", "session-1", "", SourceModelClaudeOpus)
+	child, _ := registry.Register("child", "session-1", parent.ID, SourceModelClaudeOpus)
 
 	// Unregister parent (which also removes children)
 	registry.Unregister(parent.ID)
@@ -449,8 +449,8 @@ func TestCoordination_OrphanedSubAgents(t *testing.T) {
 func TestCoordination_CrossSessionAgentLookup(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus45)
-	agent2, _ := registry.Register("agent2", "session-2", "", SourceModelClaudeOpus45)
+	agent1, _ := registry.Register("agent1", "session-1", "", SourceModelClaudeOpus)
+	agent2, _ := registry.Register("agent2", "session-2", "", SourceModelClaudeOpus)
 
 	// Should be able to find agents by ID regardless of session
 	found1 := registry.Get(agent1.ID)
@@ -465,7 +465,7 @@ func TestCoordination_CrossSessionAgentLookup(t *testing.T) {
 func TestCoordination_AgentUnregisterCleanup(t *testing.T) {
 	registry := newTestRegistry(t)
 
-	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus45)
+	agent, _ := registry.Register("test-agent", "session-1", "", SourceModelClaudeOpus)
 
 	registry.Unregister(agent.ID)
 
@@ -487,7 +487,7 @@ func TestCoordination_DeepAgentHierarchy(t *testing.T) {
 			fmt.Sprintf("agent-level-%d", i),
 			"session-1",
 			parentID,
-			SourceModelClaudeOpus45,
+			SourceModelClaudeOpus,
 		)
 		require.NoError(t, err, "Register at level %d", i)
 		agents = append(agents, agent)

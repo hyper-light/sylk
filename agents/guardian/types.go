@@ -2,6 +2,8 @@ package guardian
 
 import (
 	"time"
+
+	"github.com/adalundhe/sylk/agents/guide"
 )
 
 // =============================================================================
@@ -67,18 +69,24 @@ type Finding struct {
 type FindingType string
 
 const (
-	FindingCredentialLeak  FindingType = "credential_leak"
-	FindingInjection       FindingType = "injection"
-	FindingSuspiciousDiff  FindingType = "suspicious_diff"
-	FindingBranchViolation FindingType = "branch_violation"
-	FindingHealthAnomaly   FindingType = "health_anomaly"
-	FindingBudgetWarning   FindingType = "budget_warning"
-	FindingBudgetExceeded  FindingType = "budget_exceeded"
-	FindingAgentTimeout    FindingType = "agent_timeout"
-	FindingLargeDeletion   FindingType = "large_deletion"
-	FindingSensitiveFile   FindingType = "sensitive_file"
-	FindingBinaryBlob      FindingType = "binary_blob"
+	FindingCredentialLeak   FindingType = "credential_leak"
+	FindingInjection        FindingType = "injection"
+	FindingSuspiciousDiff   FindingType = "suspicious_diff"
+	FindingBranchViolation  FindingType = "branch_violation"
+	FindingHealthAnomaly    FindingType = "health_anomaly"
+	FindingBudgetWarning    FindingType = "budget_warning"
+	FindingBudgetExceeded   FindingType = "budget_exceeded"
+	FindingAgentTimeout     FindingType = "agent_timeout"
+	FindingLargeDeletion    FindingType = "large_deletion"
+	FindingSensitiveFile    FindingType = "sensitive_file"
+	FindingBinaryBlob       FindingType = "binary_blob"
 	FindingPermissionChange FindingType = "permission_change"
+	FindingTypeTLSIssue     FindingType = "tls_issue"
+	FindingTypeCompBomb     FindingType = "compression_bomb"
+	FindingTypeBinaryExec   FindingType = "binary_executable"
+	FindingTypeXXE          FindingType = "xxe_expansion"
+	FindingTypePermEscal    FindingType = "permission_escalation"
+	FindingTypeArchiveRisk  FindingType = "archive_risk"
 )
 
 // =============================================================================
@@ -122,31 +130,31 @@ type CheckpointRecord struct {
 
 // AgentHealthSnapshot is a point-in-time health reading for a single agent.
 type AgentHealthSnapshot struct {
-	AgentID        string        `json:"agent_id"`
-	AgentType      string        `json:"agent_type"`
-	Responsive     bool          `json:"responsive"`
-	CircuitOpen    bool          `json:"circuit_open"`
-	RestartCount   int           `json:"restart_count"`
-	LastHeartbeat  time.Time     `json:"last_heartbeat"`
-	AvgResponseMs  float64       `json:"avg_response_ms"`
-	ErrorCount     int           `json:"error_count"`
-	LastError      string        `json:"last_error,omitempty"`
-	TokensUsed     int64         `json:"tokens_used"`
-	CostCentsUsed  int64         `json:"cost_cents_used"`
-	Uptime         time.Duration `json:"uptime"`
+	AgentID       string        `json:"agent_id"`
+	AgentType     string        `json:"agent_type"`
+	Responsive    bool          `json:"responsive"`
+	CircuitOpen   bool          `json:"circuit_open"`
+	RestartCount  int           `json:"restart_count"`
+	LastHeartbeat time.Time     `json:"last_heartbeat"`
+	AvgResponseMs float64       `json:"avg_response_ms"`
+	ErrorCount    int           `json:"error_count"`
+	LastError     string        `json:"last_error,omitempty"`
+	TokensUsed    int64         `json:"tokens_used"`
+	CostCentsUsed int64         `json:"cost_cents_used"`
+	Uptime        time.Duration `json:"uptime"`
 }
 
 // BudgetStatus summarises token/cost budget consumption.
 type BudgetStatus struct {
-	TokensUsed      int64   `json:"tokens_used"`
-	TokenBudget     int64   `json:"token_budget"`      // 0 = unlimited
-	TokenPercent    float64 `json:"token_percent"`
-	CostCentsUsed   int64   `json:"cost_cents_used"`
-	CostBudget      int64   `json:"cost_budget"`       // 0 = unlimited
-	CostPercent     float64 `json:"cost_percent"`
-	Warning         bool    `json:"warning"`
-	Exceeded        bool    `json:"exceeded"`
-	BudgetConfigured bool  `json:"budget_configured"` // true when a spend limit is set
+	TokensUsed       int64   `json:"tokens_used"`
+	TokenBudget      int64   `json:"token_budget"` // 0 = unlimited
+	TokenPercent     float64 `json:"token_percent"`
+	CostCentsUsed    int64   `json:"cost_cents_used"`
+	CostBudget       int64   `json:"cost_budget"` // 0 = unlimited
+	CostPercent      float64 `json:"cost_percent"`
+	Warning          bool    `json:"warning"`
+	Exceeded         bool    `json:"exceeded"`
+	BudgetConfigured bool    `json:"budget_configured"` // true when a spend limit is set
 }
 
 // =============================================================================
@@ -175,8 +183,9 @@ type DiffStats struct {
 
 // ConversationResult holds the response from a Guardian conversation.
 type ConversationResult struct {
-	Response string         `json:"response"`
-	Intent   GuardianIntent `json:"intent"`
+	Response string             `json:"response"`
+	Intent   GuardianIntent     `json:"intent"`
+	Usage    *guide.StreamUsage `json:"usage,omitempty"`
 }
 
 // ResponseText implements the guide-layer text extraction interface.

@@ -155,12 +155,15 @@ func (s *Synthesizer) synthesize(ctx context.Context, prompt string) (*providers
 	if s.provider == nil {
 		return nil, fmt.Errorf("synthesis: no LLM provider configured")
 	}
-	resp, err := s.provider.Complete(ctx, &providers.Request{
+	req := &providers.Request{
 		SystemPrompt: s.systemPrompt,
 		Model:        s.model,
 		MaxTokens:    s.maxTokens,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
-	})
+	}
+	s.applySynthesisRuntimeProfile(req)
+
+	resp, err := s.provider.Complete(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("synthesis failed: %w", err)
 	}

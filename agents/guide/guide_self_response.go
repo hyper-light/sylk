@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
 	"github.com/adalundhe/sylk/core/skills"
@@ -217,13 +218,13 @@ func (r *GuideResponder) buildRequest(request GuideSelfResponseRequest) *provide
 	messages = append(messages, providers.Message{Role: providers.RoleUser, Content: prompt})
 
 	req := &providers.Request{
-		Messages:        messages,
-		Model:           r.model,
-		SystemPrompt:    guideResponseSystemPrompt,
-		MaxTokens:       r.responseMaxTokens,
-		Temperature:     r.responseTemperature,
-		ReasoningEffort: r.reasoningEffort,
+		Messages:     messages,
+		Model:        r.model,
+		SystemPrompt: guideResponseSystemPrompt,
+		MaxTokens:    r.responseMaxTokens,
+		Temperature:  r.responseTemperature,
 	}
+	llmruntime.Apply(req, llmruntime.Profile{ReasoningEffort: r.reasoningEffort})
 	if r.toolDefs != nil {
 		req.Tools = r.toolDefs(request.Input)
 		req.ToolChoice = "auto"

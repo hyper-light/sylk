@@ -163,6 +163,16 @@ func (o *Orchestrator) executeToolCall(ctx context.Context, call providers.ToolC
 	return marshalToolOutput(result.Data)
 }
 
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (o *Orchestrator) prepareSkillsForInput(input string) {
+	if o.skillLoader == nil {
+		return
+	}
+	o.skillLoader.LoadForInput(input)
+	o.skillLoader.OptimizeForBudget()
+}
+
 // buildToolDefinitions converts loaded skills to provider tool format.
 func (o *Orchestrator) buildToolDefinitions() []providers.Tool {
 	loaded := o.skills.GetLoaded()

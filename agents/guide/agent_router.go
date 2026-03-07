@@ -781,7 +781,9 @@ func (r *TieredRouter) handleResponse(msg *Message) error {
 		}
 		r.recordCircuitSuccess(pending.TargetAgentID)
 		streamResp.TargetAgentID = pending.TargetAgentID
-		streamResp.RespondingAgentID = r.resolveAgentDisplayName(pending.TargetAgentID)
+		if streamResp.RespondingAgentName == "" {
+			streamResp.RespondingAgentName = r.resolveAgentDisplayName(pending.TargetAgentID)
+		}
 		r.invokeStreamHandler(streamResp)
 		return nil
 	default:

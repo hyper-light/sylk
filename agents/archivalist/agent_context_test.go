@@ -13,33 +13,33 @@ import (
 func TestAgentContext_RecordFileRead(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus)
 
 	state := ctx.GetFileState("/src/main.go")
 	assert.NotNil(t, state, "File state should exist")
 	assert.Equal(t, "/src/main.go", state.Path, "Path should match")
 	assert.Equal(t, "Main entry point", state.Summary, "Summary should match")
 	assert.Equal(t, FileStatusRead, state.Status, "Status should be read")
-	assert.Equal(t, SourceModelClaudeOpus45, state.Agent, "Agent should match")
+	assert.Equal(t, SourceModelClaudeOpus, state.Agent, "Agent should match")
 }
 
 func TestAgentContext_RecordFileModified(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
 	// First read the file
-	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus)
 
 	// Then modify it
 	ctx.RecordFileModified("/src/main.go", FileChange{
 		StartLine:   10,
 		EndLine:     20,
 		Description: "Added error handling",
-	}, SourceModelGPT52Codex)
+	}, SourceModelGPT54Pro)
 
 	state := ctx.GetFileState("/src/main.go")
 	assert.NotNil(t, state, "File state should exist")
 	assert.Equal(t, FileStatusModified, state.Status, "Status should be modified")
-	assert.Equal(t, SourceModelGPT52Codex, state.Agent, "Last agent should be GPT")
+	assert.Equal(t, SourceModelGPT54Pro, state.Agent, "Last agent should be GPT")
 	assert.Len(t, state.Changes, 1, "Should have one change")
 	assert.Equal(t, 10, state.Changes[0].StartLine, "StartLine should match")
 	assert.Equal(t, 20, state.Changes[0].EndLine, "EndLine should match")
@@ -48,10 +48,10 @@ func TestAgentContext_RecordFileModified(t *testing.T) {
 func TestAgentContext_RecordFileModified_MultipleChanges(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus45)
-	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 10, EndLine: 20, Description: "Change 1"}, SourceModelClaudeOpus45)
-	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 30, EndLine: 40, Description: "Change 2"}, SourceModelGPT52Codex)
-	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 50, EndLine: 60, Description: "Change 3"}, SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus)
+	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 10, EndLine: 20, Description: "Change 1"}, SourceModelClaudeOpus)
+	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 30, EndLine: 40, Description: "Change 2"}, SourceModelGPT54Pro)
+	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 50, EndLine: 60, Description: "Change 3"}, SourceModelClaudeOpus)
 
 	state := ctx.GetFileState("/src/main.go")
 	assert.Len(t, state.Changes, 3, "Should have three changes")
@@ -60,7 +60,7 @@ func TestAgentContext_RecordFileModified_MultipleChanges(t *testing.T) {
 func TestAgentContext_RecordFileCreated(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RecordFileCreated("/src/new_file.go", "New utility module", SourceModelClaudeOpus45)
+	ctx.RecordFileCreated("/src/new_file.go", "New utility module", SourceModelClaudeOpus)
 
 	state := ctx.GetFileState("/src/new_file.go")
 	assert.NotNil(t, state, "File state should exist")
@@ -73,7 +73,7 @@ func TestAgentContext_WasFileRead(t *testing.T) {
 
 	assert.False(t, ctx.WasFileRead("/src/main.go"), "File should not be marked as read")
 
-	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/main.go", "Main entry point", SourceModelClaudeOpus)
 
 	assert.True(t, ctx.WasFileRead("/src/main.go"), "File should be marked as read")
 	assert.False(t, ctx.WasFileRead("/src/other.go"), "Other file should not be marked as read")
@@ -83,17 +83,17 @@ func TestAgentContext_GetModifiedFiles(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
 	// Read some files (not modified)
-	ctx.RecordFileRead("/src/read_only.go", "Read only", SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/read_only.go", "Read only", SourceModelClaudeOpus)
 
 	// Modify some files
-	ctx.RecordFileRead("/src/modified1.go", "Modified 1", SourceModelClaudeOpus45)
-	ctx.RecordFileModified("/src/modified1.go", FileChange{StartLine: 1, EndLine: 10}, SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/modified1.go", "Modified 1", SourceModelClaudeOpus)
+	ctx.RecordFileModified("/src/modified1.go", FileChange{StartLine: 1, EndLine: 10}, SourceModelClaudeOpus)
 
-	ctx.RecordFileRead("/src/modified2.go", "Modified 2", SourceModelClaudeOpus45)
-	ctx.RecordFileModified("/src/modified2.go", FileChange{StartLine: 1, EndLine: 10}, SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/modified2.go", "Modified 2", SourceModelClaudeOpus)
+	ctx.RecordFileModified("/src/modified2.go", FileChange{StartLine: 1, EndLine: 10}, SourceModelClaudeOpus)
 
 	// Create a new file
-	ctx.RecordFileCreated("/src/new.go", "New file", SourceModelClaudeOpus45)
+	ctx.RecordFileCreated("/src/new.go", "New file", SourceModelClaudeOpus)
 
 	modified := ctx.GetModifiedFiles()
 
@@ -103,9 +103,9 @@ func TestAgentContext_GetModifiedFiles(t *testing.T) {
 func TestAgentContext_GetAllFiles(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RecordFileRead("/src/a.go", "A", SourceModelClaudeOpus45)
-	ctx.RecordFileRead("/src/b.go", "B", SourceModelClaudeOpus45)
-	ctx.RecordFileCreated("/src/c.go", "C", SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/a.go", "A", SourceModelClaudeOpus)
+	ctx.RecordFileRead("/src/b.go", "B", SourceModelClaudeOpus)
+	ctx.RecordFileCreated("/src/c.go", "C", SourceModelClaudeOpus)
 
 	files := ctx.GetAllFiles()
 
@@ -124,7 +124,7 @@ func TestAgentContext_RegisterPattern(t *testing.T) {
 		Name:        "Wrap errors",
 		Description: "Always wrap errors with context",
 		Example:     "fmt.Errorf(\"failed to do X: %w\", err)",
-		Source:      SourceModelClaudeOpus45,
+		Source:      SourceModelClaudeOpus,
 	}
 
 	ctx.RegisterPattern(pattern)
@@ -140,9 +140,9 @@ func TestAgentContext_RegisterPattern(t *testing.T) {
 func TestAgentContext_GetPatternsByCategory(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RegisterPattern(&Pattern{Category: "error_handling", Name: "Pattern 1", Source: SourceModelClaudeOpus45})
-	ctx.RegisterPattern(&Pattern{Category: "error_handling", Name: "Pattern 2", Source: SourceModelClaudeOpus45})
-	ctx.RegisterPattern(&Pattern{Category: "naming", Name: "Pattern 3", Source: SourceModelClaudeOpus45})
+	ctx.RegisterPattern(&Pattern{Category: "error_handling", Name: "Pattern 1", Source: SourceModelClaudeOpus})
+	ctx.RegisterPattern(&Pattern{Category: "error_handling", Name: "Pattern 2", Source: SourceModelClaudeOpus})
+	ctx.RegisterPattern(&Pattern{Category: "naming", Name: "Pattern 3", Source: SourceModelClaudeOpus})
 
 	errorPatterns := ctx.GetPatternsByCategory("error_handling")
 
@@ -152,9 +152,9 @@ func TestAgentContext_GetPatternsByCategory(t *testing.T) {
 func TestAgentContext_GetAllPatterns(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RegisterPattern(&Pattern{Category: "a", Name: "Pattern 1", Source: SourceModelClaudeOpus45})
-	ctx.RegisterPattern(&Pattern{Category: "b", Name: "Pattern 2", Source: SourceModelClaudeOpus45})
-	ctx.RegisterPattern(&Pattern{Category: "c", Name: "Pattern 3", Source: SourceModelClaudeOpus45})
+	ctx.RegisterPattern(&Pattern{Category: "a", Name: "Pattern 1", Source: SourceModelClaudeOpus})
+	ctx.RegisterPattern(&Pattern{Category: "b", Name: "Pattern 2", Source: SourceModelClaudeOpus})
+	ctx.RegisterPattern(&Pattern{Category: "c", Name: "Pattern 3", Source: SourceModelClaudeOpus})
 
 	patterns := ctx.GetAllPatterns()
 
@@ -164,7 +164,7 @@ func TestAgentContext_GetAllPatterns(t *testing.T) {
 func TestAgentContext_GetPattern_ByCategory(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RegisterPattern(&Pattern{Category: "error_handling", Name: "Wrap errors", Source: SourceModelClaudeOpus45})
+	ctx.RegisterPattern(&Pattern{Category: "error_handling", Name: "Wrap errors", Source: SourceModelClaudeOpus})
 
 	// GetPattern can find by category
 	pattern := ctx.GetPattern("error_handling")
@@ -184,7 +184,7 @@ func TestAgentContext_RecordFailure(t *testing.T) {
 		"Using regex for HTML parsing",
 		"HTML is not a regular language",
 		"Trying to extract data from web page",
-		SourceModelClaudeOpus45,
+		SourceModelClaudeOpus,
 	)
 
 	assert.NotEmpty(t, failure.ID, "Failure ID should be set")
@@ -202,7 +202,7 @@ func TestAgentContext_RecordFailureWithResolution(t *testing.T) {
 		"HTML is not a regular language",
 		"Trying to extract data from web page",
 		"Use goquery or htmlparser instead",
-		SourceModelClaudeOpus45,
+		SourceModelClaudeOpus,
 	)
 
 	assert.Equal(t, "Use goquery or htmlparser instead", failure.Resolution, "Resolution should be set")
@@ -211,7 +211,7 @@ func TestAgentContext_RecordFailureWithResolution(t *testing.T) {
 func TestAgentContext_CheckFailure(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RecordFailure("Bad approach", "It didn't work", "Testing", SourceModelClaudeOpus45)
+	ctx.RecordFailure("Bad approach", "It didn't work", "Testing", SourceModelClaudeOpus)
 
 	// Check for exact match
 	failure, found := ctx.CheckFailure("Bad approach")
@@ -226,7 +226,7 @@ func TestAgentContext_CheckFailure(t *testing.T) {
 func TestAgentContext_CheckFailure_PartialMatch(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RecordFailure("Using regex for HTML parsing", "Doesn't work", "Testing", SourceModelClaudeOpus45)
+	ctx.RecordFailure("Using regex for HTML parsing", "Doesn't work", "Testing", SourceModelClaudeOpus)
 
 	// Check for partial match
 	failure, found := ctx.CheckFailure("regex for HTML")
@@ -238,7 +238,7 @@ func TestAgentContext_GetRecentFailures(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
 	for i := 0; i < 10; i++ {
-		ctx.RecordFailure("Approach "+string(rune('0'+i)), "Reason", "Context", SourceModelClaudeOpus45)
+		ctx.RecordFailure("Approach "+string(rune('0'+i)), "Reason", "Context", SourceModelClaudeOpus)
 	}
 
 	recent := ctx.GetRecentFailures(5)
@@ -249,8 +249,8 @@ func TestAgentContext_GetRecentFailures(t *testing.T) {
 func TestAgentContext_GetAllFailures(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.RecordFailure("Approach 1", "Reason 1", "Context", SourceModelClaudeOpus45)
-	ctx.RecordFailure("Approach 2", "Reason 2", "Context", SourceModelGPT52Codex)
+	ctx.RecordFailure("Approach 1", "Reason 1", "Context", SourceModelClaudeOpus)
+	ctx.RecordFailure("Approach 2", "Reason 2", "Context", SourceModelGPT54Pro)
 
 	failures := ctx.GetAllFailures()
 
@@ -330,18 +330,18 @@ func TestAgentContext_GetAllIntents(t *testing.T) {
 func TestAgentContext_SetCurrentTask(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Implement authentication", "Add JWT-based auth to API", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Implement authentication", "Add JWT-based auth to API", SourceModelClaudeOpus)
 
 	state := ctx.GetResumeState()
 	assert.Equal(t, "Implement authentication", state.CurrentTask, "Task should match")
 	assert.Equal(t, "Add JWT-based auth to API", state.TaskObjective, "Objective should match")
-	assert.Equal(t, SourceModelClaudeOpus45, state.LastAgent, "Agent should match")
+	assert.Equal(t, SourceModelClaudeOpus, state.LastAgent, "Agent should match")
 }
 
 func TestAgentContext_CompleteStep(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus)
 	ctx.CompleteStep("Step 1")
 	ctx.CompleteStep("Step 2")
 	ctx.CompleteStep("Step 3")
@@ -354,7 +354,7 @@ func TestAgentContext_CompleteStep(t *testing.T) {
 func TestAgentContext_SetCurrentStep(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus)
 	ctx.SetCurrentStep("Working on database schema")
 
 	state := ctx.GetResumeState()
@@ -364,7 +364,7 @@ func TestAgentContext_SetCurrentStep(t *testing.T) {
 func TestAgentContext_SetNextSteps(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus)
 	ctx.SetNextSteps([]string{"Step A", "Step B", "Step C"})
 
 	state := ctx.GetResumeState()
@@ -375,7 +375,7 @@ func TestAgentContext_SetNextSteps(t *testing.T) {
 func TestAgentContext_AddBlocker(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus)
 	ctx.AddBlocker("Waiting for API credentials")
 	ctx.AddBlocker("Database not responding")
 
@@ -386,7 +386,7 @@ func TestAgentContext_AddBlocker(t *testing.T) {
 func TestAgentContext_RemoveBlocker(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus)
 	ctx.AddBlocker("Blocker 1")
 	ctx.AddBlocker("Blocker 2")
 	ctx.AddBlocker("Blocker 3")
@@ -400,7 +400,7 @@ func TestAgentContext_RemoveBlocker(t *testing.T) {
 func TestAgentContext_SetFilesToRead(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus)
 	ctx.SetFilesToRead([]string{"/src/main.go", "/src/config.go"})
 
 	state := ctx.GetResumeState()
@@ -410,7 +410,7 @@ func TestAgentContext_SetFilesToRead(t *testing.T) {
 func TestAgentContext_UpdateResumeState(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
-	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Task", "Objective", SourceModelClaudeOpus)
 
 	ctx.UpdateResumeState(func(rs *ResumeState) {
 		rs.CurrentStep = "Custom step"
@@ -432,17 +432,17 @@ func TestAgentContext_GetAgentBriefing(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
 	// Set up some state
-	ctx.SetCurrentTask("Implement feature X", "Full implementation", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Implement feature X", "Full implementation", SourceModelClaudeOpus)
 	ctx.CompleteStep("Design")
 	ctx.SetNextSteps([]string{"Implement", "Test"})
 	ctx.AddBlocker("Waiting for spec")
 
-	ctx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus45)
-	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 1, EndLine: 10}, SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/main.go", "Main file", SourceModelClaudeOpus)
+	ctx.RecordFileModified("/src/main.go", FileChange{StartLine: 1, EndLine: 10}, SourceModelClaudeOpus)
 
-	ctx.RegisterPattern(&Pattern{Category: "testing", Name: "Table tests", Source: SourceModelClaudeOpus45})
+	ctx.RegisterPattern(&Pattern{Category: "testing", Name: "Table tests", Source: SourceModelClaudeOpus})
 
-	ctx.RecordFailure("Bad approach", "Didn't work", "Testing", SourceModelClaudeOpus45)
+	ctx.RecordFailure("Bad approach", "Didn't work", "Testing", SourceModelClaudeOpus)
 
 	ctx.RecordUserWants("Clean code", "high", "user")
 
@@ -475,19 +475,19 @@ func TestStateTracking_FullWorkflow(t *testing.T) {
 	ctx := newTestAgentContext(t)
 
 	// Start a task
-	ctx.SetCurrentTask("Refactor authentication", "Improve auth security", SourceModelClaudeOpus45)
+	ctx.SetCurrentTask("Refactor authentication", "Improve auth security", SourceModelClaudeOpus)
 	ctx.SetNextSteps([]string{"Review current impl", "Identify vulnerabilities", "Implement fixes", "Add tests"})
 
 	// Read files
-	ctx.RecordFileRead("/src/auth/handler.go", "Auth handler", SourceModelClaudeOpus45)
-	ctx.RecordFileRead("/src/auth/middleware.go", "Auth middleware", SourceModelClaudeOpus45)
+	ctx.RecordFileRead("/src/auth/handler.go", "Auth handler", SourceModelClaudeOpus)
+	ctx.RecordFileRead("/src/auth/middleware.go", "Auth middleware", SourceModelClaudeOpus)
 
 	// Record a pattern discovered
 	ctx.RegisterPattern(&Pattern{
 		Category:    "auth",
 		Name:        "Token validation",
 		Description: "Always validate token expiry",
-		Source:      SourceModelClaudeOpus45,
+		Source:      SourceModelClaudeOpus,
 	})
 
 	// Complete first step
@@ -495,14 +495,14 @@ func TestStateTracking_FullWorkflow(t *testing.T) {
 	ctx.SetCurrentStep("Identify vulnerabilities")
 
 	// Record a failure
-	ctx.RecordFailure("Using basic string comparison for tokens", "Timing attack vulnerability", "Token validation", SourceModelClaudeOpus45)
+	ctx.RecordFailure("Using basic string comparison for tokens", "Timing attack vulnerability", "Token validation", SourceModelClaudeOpus)
 
 	// Modify a file
 	ctx.RecordFileModified("/src/auth/handler.go", FileChange{
 		StartLine:   50,
 		EndLine:     70,
 		Description: "Fixed timing attack vulnerability",
-	}, SourceModelClaudeOpus45)
+	}, SourceModelClaudeOpus)
 
 	// Complete another step
 	ctx.CompleteStep("Identify vulnerabilities")

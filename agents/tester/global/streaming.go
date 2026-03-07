@@ -136,7 +136,7 @@ func (gt *GlobalTester) publishStreamEvent(ctx context.Context, event *guide.Str
 	}
 	stream := &guide.StreamResponse{
 		CorrelationID:     metadata.CorrelationID,
-		RespondingAgentID: "tester",
+		RespondingAgentID: gt.id,
 		TargetAgentID:     metadata.SourceAgentID,
 		Event:             event,
 	}

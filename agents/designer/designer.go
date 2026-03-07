@@ -14,8 +14,8 @@ import (
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
@@ -37,13 +37,13 @@ type Designer struct {
 	config Config
 	logger *slog.Logger
 
-	provider        designerProvider
-	providerWrapper gateway.ProviderWrapper
-	handoffBridge   *handoff.HandoffBridge
-	agentPod        *shared.AgentPod
-	activityPub     events.ActivityPublisher
-	pipelineID      string // DAG pipeline ID for TUI grouping.
-	usageAccum      *designerUsageAccumulator
+	provider      designerProvider
+	refresher     container.ProviderRefresher
+	handoffBridge *handoff.HandoffBridge
+	agentPod      *shared.AgentPod
+	activityPub   events.ActivityPublisher
+	pipelineID    string // DAG pipeline ID for TUI grouping.
+	usageAccum    *designerUsageAccumulator
 
 	state    *DesignerState
 	stateMu  sync.RWMutex
@@ -112,7 +112,7 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 
 	designerID := cfg.ID
 	if designerID == "" {
-		designerID = fmt.Sprintf("designer_%s", uuid.New().String()[:8])
+		designerID = uuid.New().String()[:8]
 	}
 
 	d := &Designer{
@@ -131,7 +131,7 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 			TaskQueue: make([]string, 0),
 			StartedAt: time.Now(),
 		},
-		consultations: make([]Consultation, 0),
+		consultations:     make([]Consultation, 0),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 	}
@@ -150,10 +150,12 @@ func (d *Designer) SetProvider(p designerProvider) {
 	d.provider = p
 }
 
-// SetProviderWrapper stores a callback that re-applies gateway rate limiting
-// to fresh providers created during credential refresh.
-func (d *Designer) SetProviderWrapper(w gateway.ProviderWrapper) {
-	d.providerWrapper = w
+// SetProviderRefresher stores a callback that creates a fresh provider for
+// the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (d *Designer) SetProviderRefresher(fn container.ProviderRefresher) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	d.refresher = fn
 }
 
 // getProvider returns the current provider under read lock.
@@ -164,25 +166,24 @@ func (d *Designer) getProvider() designerProvider {
 }
 
 // ProviderType implements container.AuthRefreshable.
-func (d *Designer) ProviderType() string { return "google" }
+func (d *Designer) ProviderType() string {
+	return string(container.ProviderForModel(d.CurrentModel()))
+}
 
 // RefreshProvider implements container.AuthRefreshable.
-// Re-resolves Google credentials and replaces the provider.
 func (d *Designer) RefreshProvider(ctx context.Context, authMethod string) error {
-	cfg := providers.DefaultGoogleConfig()
-	if authMethod != "" {
-		cfg.AuthMode = authMethod
+	d.stateMu.RLock()
+	fn := d.refresher
+	d.stateMu.RUnlock()
+	if fn == nil {
+		return nil
 	}
-	p, err := providers.NewGoogleProvider(ctx, cfg)
+	p, err := fn(ctx, d.CurrentModel(), authMethod)
 	if err != nil {
 		return fmt.Errorf("designer refresh provider: %w", err)
 	}
-	var wrapped designerProvider = p
-	if d.providerWrapper != nil {
-		wrapped = d.providerWrapper(p)
-	}
-	d.SetProvider(wrapped)
-	d.logger.Info("provider refreshed", "auth_method", authMethod)
+	d.SetProvider(p)
+	d.logger.Info("provider refreshed", "model", d.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 
@@ -259,13 +260,9 @@ func (d *Designer) initSkills() {
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = []string{
 		"component_search", "component_create", "component_modify",
-		"token_validate", "token_suggest",
-		"a11y_audit", "a11y_fix_suggest", "contrast_check",
-		"request_engineer_review", "request_inspector_check",
-		"request_tester_validation", "ask_user_clarification",
-		"report_to_engineer", "report_to_orchestrator",
+		"ask_user_clarification",
 	}
-	loaderCfg.AutoLoadDomains = []string{"ui", "design", "accessibility", "collaboration"}
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	d.skillLoader = skills.NewLoader(d.skills, loaderCfg)
 
 	d.registerCoreSkills()
@@ -435,7 +432,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	ledger := d.steering.Create(fwd.CorrelationID, d.id, fwd.SessionID, nil, nil)
 	defer d.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
 
-	emitter := shared.NewToolCallEmitter(d.bus, d.channels, "designer", fwd.CorrelationID, fwd.SourceAgentID)
+	emitter := shared.NewToolCallEmitter(d.bus, d.channels, d.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -459,8 +456,8 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "designer",
-		RespondingAgentName: "designer",
+		RespondingAgentID:   d.id,
+		RespondingAgentName: "Designer",
 		ProcessingTime:      time.Since(startTime),
 	}
 
@@ -553,6 +550,7 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	d.prepareSkillsForInput(fwd.Input)
 	toolDefs := d.buildToolDefinitions()
 
 	req := &providers.Request{
@@ -563,10 +561,12 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 				Content: fwd.Input,
 			},
 		},
-		Tools:           toolDefs,
-		MaxTokens:       d.config.DesignerConfig.MaxTokens,
-		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
+		Tools:     toolDefs,
+		MaxTokens: d.config.DesignerConfig.MaxTokens,
 	}
+	llmruntime.Apply(req, llmruntime.Profile{
+		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
+	})
 
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(req, fwd.ConversationHistory)
@@ -782,7 +782,7 @@ func (d *Designer) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:       "designer",
 		ModelID:         d.CurrentModel(),
-		ReasoningEffort: "high",
+		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
 		ContextWindow:   1_000_000,
 		Category:        handoff.CategoryPipeline,
 	}

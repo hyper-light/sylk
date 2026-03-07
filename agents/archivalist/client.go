@@ -98,12 +98,15 @@ func (c *Client) generate(ctx context.Context, prompt string, sourceIDs []string
 		return nil, fmt.Errorf("client: no LLM provider configured")
 	}
 
-	resp, err := c.provider.Complete(ctx, &providers.Request{
+	req := &providers.Request{
 		SystemPrompt: c.systemPrompt,
 		Model:        c.model,
 		MaxTokens:    c.maxOutputTokens,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
-	})
+	}
+	c.applyGenerationRuntimeProfile(req)
+
+	resp, err := c.provider.Complete(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate summary: %w", err)
 	}

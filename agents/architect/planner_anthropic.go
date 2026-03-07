@@ -489,10 +489,10 @@ func (p *anthropicPlanner) requestTextStreamingOnce(
 		Messages: []providers.Message{
 			{Role: providers.RoleUser, Content: prompt},
 		},
-		MaxTokens:      maxTokens,
-		SystemPrompt:   resolvedSystem,
-		ThinkingBudget: p.resolveThinkingBudget(maxTokens),
+		MaxTokens:    maxTokens,
+		SystemPrompt: resolvedSystem,
 	}
+	p.applyStreamingRuntimeProfile(req, p.resolveThinkingBudget(maxTokens))
 	return p.streamRequest(ctx, req, stage, onChunk)
 }
 
@@ -1151,10 +1151,10 @@ type taskPayload struct {
 	Complexity      string   `json:"complexity"`
 
 	// Co-tenancy fields for compound node dispatch.
-	CoAgents          []string             `json:"co_agents,omitempty"`
-	CollaborationMode string               `json:"collaboration_mode,omitempty"`
-	MaxReviewRounds   int                  `json:"max_review_rounds,omitempty"`
-	AgentScopes       []agentScopePayload  `json:"agent_scopes,omitempty"`
+	CoAgents          []string            `json:"co_agents,omitempty"`
+	CollaborationMode string              `json:"collaboration_mode,omitempty"`
+	MaxReviewRounds   int                 `json:"max_review_rounds,omitempty"`
+	AgentScopes       []agentScopePayload `json:"agent_scopes,omitempty"`
 
 	// Rich specification fields.
 	AcceptanceCriteria  []acceptanceCriterionPayload `json:"acceptance_criteria"`

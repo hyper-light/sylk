@@ -7,7 +7,22 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-// guardianCoreSkillNames returns skills always loaded, available in every tool loop turn.
+// guardianPinnedSkillNames returns the minimal set of skills always loaded in the
+// tool definition payload. These are the skills Guardian needs for every request.
+// Remaining skills are loaded progressively via LoadForInput keyword matching and
+// demand-paged via the safety hook when the LLM invokes them.
+func guardianPinnedSkillNames() []string {
+	return []string{
+		"agent_health",
+		"system_status",
+		"ask_user_question",
+		"reroute_request",
+	}
+}
+
+// guardianCoreSkillNames returns the full set of Guardian-domain skills.
+// Used for safety hook allowlisting — all of these are permitted but not
+// necessarily loaded at init.
 func guardianCoreSkillNames() []string {
 	return []string{
 		"git_safety",
@@ -22,6 +37,7 @@ func guardianCoreSkillNames() []string {
 		"knowledge_status",
 		"concurrency_status",
 		"usage_breakdown",
+		"quarantine_status",
 	}
 }
 
@@ -41,6 +57,7 @@ func guardianAllSkillNames() []string {
 		"knowledge_status",
 		"concurrency_status",
 		"usage_breakdown",
+		"quarantine_status",
 		"read_file",
 		"glob",
 		"grep",

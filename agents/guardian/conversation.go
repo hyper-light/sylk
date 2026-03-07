@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -45,7 +46,7 @@ func (g *Guardian) executeConversation(ctx context.Context, fwd *guide.Forwarded
 	g.conversationHistory = append(g.conversationHistory, guide.ConversationTurn{
 		UserInput:  fwd.Input,
 		AgentID:    g.id,
-		AgentReply: response,
+		AgentReply: response.Response,
 		Timestamp:  time.Now(),
 	})
 	if len(g.conversationHistory) > DefaultConversationBuffer {
@@ -53,23 +54,24 @@ func (g *Guardian) executeConversation(ctx context.Context, fwd *guide.Forwarded
 	}
 	g.conversationMu.Unlock()
 
-	return &ConversationResult{
-		Response: response,
-		Intent:   intent,
-	}, nil
+	return response, nil
 }
 
 // composeUserFacingResponse runs the LLM tool loop to generate a response.
-func (g *Guardian) composeUserFacingResponse(ctx context.Context, req *guardianConversationRequest) (string, error) {
+func (g *Guardian) composeUserFacingResponse(ctx context.Context, req *guardianConversationRequest) (*ConversationResult, error) {
 	provider := g.getProvider()
 	if provider == nil {
-		return g.composeWithoutLLM(req)
+		response, err := g.composeWithoutLLM(req)
+		if err != nil {
+			return nil, err
+		}
+		return &ConversationResult{Response: response, Intent: req.Intent}, nil
 	}
 
 	systemPrompt := g.buildSystemPrompt(req.Intent)
 	messages := g.buildConversationMessages(req)
 
-	g.ensureToolLoopSkillsLoaded()
+	g.prepareSkillsForInput(req.Input, req.Intent)
 	tools := g.buildToolDefinitions()
 
 	llmReq := &providers.Request{
@@ -78,10 +80,19 @@ func (g *Guardian) composeUserFacingResponse(ctx context.Context, req *guardianC
 		MaxTokens:    DefaultMaxOutputTokens,
 		Tools:        tools,
 	}
+	llmruntime.Apply(llmReq, guardianConversationProfile(req.Intent, req.SessionID))
 
-	return g.executeToolLoop(ctx, llmReq, "conversation", func(chunk string) {
-		g.publishStreamChunk(ctx, "", chunk)
+	response, usage, err := g.executeToolLoop(ctx, llmReq, "conversation", func(chunk string) {
+		g.publishStreamChunk(ctx, shared.LogMetaFromContext(ctx).CorrID, chunk)
 	}, shared.SteeringLedgerFromContext(ctx))
+	if err != nil {
+		return nil, err
+	}
+	return &ConversationResult{
+		Response: response,
+		Intent:   req.Intent,
+		Usage:    usage,
+	}, nil
 }
 
 // composeWithoutLLM generates a deterministic response when no LLM is available.
@@ -98,6 +109,22 @@ func (g *Guardian) composeWithoutLLM(req *guardianConversationRequest) (string, 
 			"I can provide health reports and security assessments. " +
 			"Ask me about agent health, security status, or request a checkpoint.", nil
 	}
+}
+
+func guardianConversationProfile(intent GuardianIntent, sessionID string) llmruntime.Profile {
+	profile := llmruntime.Profile{
+		ReasoningSummary:  "none",
+		Verbosity:         "medium",
+		PromptCacheKey:    llmruntime.SessionPromptCacheKey("guardian", sessionID),
+		ParallelToolCalls: llmruntime.Bool(true),
+	}
+	switch intent {
+	case IntentAssess, IntentCheckpoint:
+		profile.ReasoningEffort = "high"
+	default:
+		profile.ReasoningEffort = "medium"
+	}
+	return profile
 }
 
 // buildConversationMessages constructs the LLM message history.

@@ -67,7 +67,7 @@ func replyToSkill(a *Archivalist) *skills.Skill {
 				CorrelationID:     params.CorrelationID,
 				Success:           true,
 				Data:              params.Data,
-				RespondingAgentID: "archivalist",
+				RespondingAgentID: a.id,
 			}
 			msg := guide.NewResponseMessage(generateMessageID(), response)
 			return true, a.bus.Publish(guide.TopicGuideResponses, msg)

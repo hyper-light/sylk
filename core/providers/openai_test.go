@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -11,15 +12,16 @@ import (
 	promptskills "github.com/adalundhe/sylk/skills"
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/responses"
+	"github.com/openai/openai-go/shared"
 )
 
-func TestDefaultOpenAIConfig_UsesCodex53WithFallback(t *testing.T) {
+func TestDefaultOpenAIConfig_UsesGPT54Pro(t *testing.T) {
 	cfg := DefaultOpenAIConfig()
-	if cfg.Model != "gpt-5.3-codex" {
-		t.Fatalf("expected default model gpt-5.3-codex, got %q", cfg.Model)
+	if cfg.Model != "gpt-5.4-pro" {
+		t.Fatalf("expected default model gpt-5.4-pro, got %q", cfg.Model)
 	}
-	if cfg.FallbackModel != "gpt-5.2-codex" {
-		t.Fatalf("expected default fallback model gpt-5.2-codex, got %q", cfg.FallbackModel)
+	if cfg.FallbackModel != "" {
+		t.Fatalf("expected no fallback model, got %q", cfg.FallbackModel)
 	}
 	if cfg.AuthMode != "api_key" {
 		t.Fatalf("expected default auth mode api_key, got %q", cfg.AuthMode)
@@ -46,11 +48,8 @@ func TestNormalizeOpenAIModel(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"gpt-5.3-codex", "gpt-5.3-codex"},
-		{"codex-5.3", "gpt-5.3-codex"},
-		{"codex-5.2", "gpt-5.2-codex"},
-		{"codex-5-2-20250901", "gpt-5.2-codex"},
-		{"GPT-5-3-CODEX", "gpt-5.3-codex"},
+		{"gpt-5.4-pro", "gpt-5.4-pro"},
+		{"gpt-5-4-pro", "gpt-5.4-pro"},
 		{"", ""},
 	}
 
@@ -66,11 +65,11 @@ func TestOpenAIProviderSupportsModel(t *testing.T) {
 		config: OpenAIConfig{},
 	}
 
-	if !p.SupportsModel("gpt-5.3-codex") {
-		t.Fatal("expected gpt-5.3-codex to be supported")
+	if !p.SupportsModel("gpt-5.4-pro") {
+		t.Fatal("expected gpt-5.4-pro to be supported")
 	}
-	if !p.SupportsModel("codex-5.2") {
-		t.Fatal("expected codex-5.2 alias to be supported")
+	if !p.SupportsModel("gpt-5-4-pro") {
+		t.Fatal("expected gpt-5-4-pro alias to be supported")
 	}
 	if p.SupportsModel("unknown-model") {
 		t.Fatal("expected unknown-model to be unsupported by default")
@@ -86,7 +85,7 @@ func TestOpenAIProviderBuildResponseParams_NormalizesModel(t *testing.T) {
 	p := &OpenAIProvider{
 		config: OpenAIConfig{
 			BaseConfig: BaseConfig{
-				Model:     "codex-5.2",
+				Model:     "gpt-5-4-pro",
 				MaxTokens: 1024,
 			},
 		},
@@ -96,16 +95,16 @@ func TestOpenAIProviderBuildResponseParams_NormalizesModel(t *testing.T) {
 		Messages: []Message{{Role: RoleUser, Content: "hello"}},
 	})
 
-	if got := string(params.Model); got != "gpt-5.2-codex" {
-		t.Fatalf("expected normalized model gpt-5.2-codex, got %q", got)
+	if got := string(params.Model); got != "gpt-5.4-pro" {
+		t.Fatalf("expected normalized model gpt-5.4-pro, got %q", got)
 	}
 }
 
-func TestOpenAIProviderBuildResponseParams_OmitsDefaultTemperatureForCodex(t *testing.T) {
+func TestOpenAIProviderBuildResponseParams_OmitsTemperatureForThinkingModel(t *testing.T) {
 	p := &OpenAIProvider{
 		config: OpenAIConfig{
 			BaseConfig: BaseConfig{
-				Model:       "gpt-5.3-codex",
+				Model:       "gpt-5.4-pro",
 				MaxTokens:   1024,
 				Temperature: 0.7,
 			},
@@ -116,23 +115,143 @@ func TestOpenAIProviderBuildResponseParams_OmitsDefaultTemperatureForCodex(t *te
 		Messages: []Message{{Role: RoleUser, Content: "hello"}},
 	})
 	if params.Temperature.Valid() {
-		t.Fatal("expected default temperature to be omitted for codex model")
+		t.Fatal("expected temperature to be omitted for thinking model")
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_ReasoningSummaryNoneOmitsSummary(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+			ReasoningEffort: "high",
+		},
 	}
 
-	p.config.Model = "gpt-4o"
+	params := p.buildResponseParams(&Request{
+		Messages:         []Message{{Role: RoleUser, Content: "hello"}},
+		ReasoningSummary: "none",
+	})
+
+	if params.Reasoning.Summary != "" {
+		t.Fatalf("expected reasoning summary to be omitted, got %q", params.Reasoning.Summary)
+	}
+	if params.Reasoning.Effort != shared.ReasoningEffortHigh {
+		t.Fatalf("expected reasoning effort high, got %q", params.Reasoning.Effort)
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_AppliesTextAndPromptCacheControls(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Messages:             []Message{{Role: RoleUser, Content: "hello"}},
+		Verbosity:            "low",
+		PromptCacheKey:       "guardian:session-123",
+		PromptCacheRetention: "24h",
+	})
+
+	if !params.PromptCacheKey.Valid() {
+		t.Fatal("expected prompt cache key to be set")
+	}
+	if params.PromptCacheKey.Value != "guardian:session-123" {
+		t.Fatalf("unexpected prompt cache key: %q", params.PromptCacheKey.Value)
+	}
+
+	body := marshalResponseNewParams(t, params)
+	textConfig, ok := body["text"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected text config in marshaled params, got %#v", body["text"])
+	}
+	if textConfig["verbosity"] != "low" {
+		t.Fatalf("expected verbosity low, got %#v", textConfig["verbosity"])
+	}
+	if body["prompt_cache_retention"] != "24h" {
+		t.Fatalf("expected 24h prompt cache retention, got %#v", body["prompt_cache_retention"])
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_AppliesParallelToolControls(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+		},
+	}
+
+	parallel := true
+	params := p.buildResponseParams(&Request{
+		Messages: []Message{{Role: RoleUser, Content: "hello"}},
+		Tools: []Tool{{
+			Name:        "check_status",
+			Description: "Check status",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		}},
+		ParallelToolCalls: &parallel,
+	})
+
+	if !params.ParallelToolCalls.Valid() {
+		t.Fatal("expected parallel_tool_calls to be set")
+	}
+	if !params.ParallelToolCalls.Value {
+		t.Fatal("expected parallel_tool_calls=true")
+	}
+
 	params = p.buildResponseParams(&Request{
 		Messages: []Message{{Role: RoleUser, Content: "hello"}},
+		Tools: []Tool{{
+			Name:        "check_status",
+			Description: "Check status",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		}},
+		DisableParallelToolUse: true,
 	})
-	if !params.Temperature.Valid() {
-		t.Fatal("expected default temperature to be set for non-codex model")
+
+	if !params.ParallelToolCalls.Valid() {
+		t.Fatal("expected parallel_tool_calls to be set when parallel tool use is disabled")
 	}
+	if params.ParallelToolCalls.Value {
+		t.Fatal("expected parallel_tool_calls=false when DisableParallelToolUse is set")
+	}
+}
+
+func marshalResponseNewParams(t *testing.T, params responses.ResponseNewParams) map[string]any {
+	t.Helper()
+
+	data, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	return body
 }
 
 func TestOpenAIProviderBuildResponseParams_ChatGPTSetsInstructions(t *testing.T) {
 	p := &OpenAIProvider{
 		config: OpenAIConfig{
 			BaseConfig: BaseConfig{
-				Model:     "gpt-5.3-codex",
+				Model:     "gpt-5.4-pro",
 				MaxTokens: 256,
 			},
 			AuthMode:     openAIAuthModeChatGPT,
@@ -164,7 +283,7 @@ func TestOpenAIProviderBuildResponseParams_ChatGPTFallbackInstructions(t *testin
 	p := &OpenAIProvider{
 		config: OpenAIConfig{
 			BaseConfig: BaseConfig{
-				Model:     "gpt-5.3-codex",
+				Model:     "gpt-5.4-pro",
 				MaxTokens: 256,
 			},
 			AuthMode: openAIAuthModeChatGPT,
@@ -186,7 +305,7 @@ func TestOpenAIProviderResolveSystemPrompt_AppendsSkills(t *testing.T) {
 	p := &OpenAIProvider{
 		config: OpenAIConfig{
 			BaseConfig: BaseConfig{
-				Model:     "gpt-5.3-codex",
+				Model:     "gpt-5.4-pro",
 				MaxTokens: 256,
 			},
 			SystemPrompt: "Base prompt",
@@ -212,29 +331,19 @@ func TestOpenAIProviderResolveSystemPrompt_AppendsSkills(t *testing.T) {
 	}
 }
 
-func TestSelectFallbackModel(t *testing.T) {
+func TestSelectFallbackModel_NoFallbackConfigured(t *testing.T) {
 	p := &OpenAIProvider{
-		config: OpenAIConfig{
-			FallbackModel: "gpt-5.2-codex",
-		},
+		config: OpenAIConfig{},
 	}
 
 	err := &openai.Error{
 		StatusCode: 404,
 		Code:       "model_not_found",
-		Message:    "The model gpt-5.3-codex does not exist",
+		Message:    "The model gpt-5.4-pro does not exist",
 	}
 
-	fallback, ok := p.selectFallbackModel("gpt-5.3-codex", err)
-	if !ok {
-		t.Fatal("expected fallback model selection to succeed")
-	}
-	if fallback != "gpt-5.2-codex" {
-		t.Fatalf("expected fallback gpt-5.2-codex, got %q", fallback)
-	}
-
-	if _, ok := p.selectFallbackModel("gpt-5.2-codex", err); ok {
-		t.Fatal("expected no fallback when requested model already equals fallback model")
+	if _, ok := p.selectFallbackModel("gpt-5.4-pro", err); ok {
+		t.Fatal("expected no fallback when no fallback model is configured")
 	}
 }
 
@@ -309,7 +418,7 @@ func TestOpenAIProviderStartChatGPTDeviceAuth_ReturnsChallengeImmediately(t *tes
 	}
 	provider, err := NewOpenAIProviderWithAuthService(context.Background(), OpenAIConfig{
 		BaseConfig: BaseConfig{
-			Model:     "gpt-5.3-codex",
+			Model:     "gpt-5.4-pro",
 			APIKey:    "old_token",
 			MaxTokens: 1024,
 		},
@@ -359,7 +468,7 @@ func TestOpenAIProviderStartChatGPTDeviceAuth_ReturnsChallengeImmediately(t *tes
 func TestHydrateOpenAIConfig_ChatGPTFromAuthService(t *testing.T) {
 	cfg := OpenAIConfig{
 		BaseConfig: BaseConfig{
-			Model:     "gpt-5.3-codex",
+			Model:     "gpt-5.4-pro",
 			MaxTokens: 1024,
 		},
 		AuthMode: openAIAuthModeChatGPT,
@@ -385,7 +494,7 @@ func TestHydrateOpenAIConfig_ChatGPTFromAuthService(t *testing.T) {
 func TestHydrateOpenAIConfig_ChatGPTRequiresAccountID(t *testing.T) {
 	cfg := OpenAIConfig{
 		BaseConfig: BaseConfig{
-			Model:     "gpt-5.3-codex",
+			Model:     "gpt-5.4-pro",
 			MaxTokens: 1024,
 			APIKey:    "chatgpt_token_only",
 		},

@@ -237,6 +237,16 @@ func (d *Designer) executeToolCall(ctx context.Context, call providers.ToolCall)
 	return shared.MarshalToolOutput(result.Data)
 }
 
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (d *Designer) prepareSkillsForInput(input string) {
+	if d.skillLoader == nil {
+		return
+	}
+	d.skillLoader.LoadForInput(input)
+	d.skillLoader.OptimizeForBudget()
+}
+
 // buildToolDefinitions converts loaded skills to provider tool format.
 func (d *Designer) buildToolDefinitions() []providers.Tool {
 	loaded := d.skills.GetLoaded()

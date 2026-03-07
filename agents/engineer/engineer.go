@@ -15,8 +15,8 @@ import (
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
@@ -39,7 +39,7 @@ type engineerProvider interface {
 }
 
 // Engineer is the code implementation specialist agent for the Sylk system.
-// It uses GPT-5.3 Codex with xhigh reasoning to execute individual coding
+// It uses GPT-5.4 Pro with xhigh reasoning to execute individual coding
 // tasks via an LLM-driven tool loop with self-audit.
 type Engineer struct {
 	id     string
@@ -47,8 +47,8 @@ type Engineer struct {
 	logger *slog.Logger
 
 	// LLM provider
-	provider        engineerProvider
-	providerWrapper gateway.ProviderWrapper
+	provider  engineerProvider
+	refresher container.ProviderRefresher
 
 	// State management
 	state    *EngineerState
@@ -147,7 +147,7 @@ type Config struct {
 // Default configuration values
 const (
 	DefaultMaxOutputTokens = 16384
-	DefaultModel           = "gpt-5.3-codex"
+	DefaultModel           = "gpt-5.4-pro"
 	DefaultReasoningEffort = "xhigh"
 	DefaultMaxToolRuns     = 32
 	DefaultMaxTokens       = 16384
@@ -159,7 +159,7 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 
 	engineerID := cfg.ID
 	if engineerID == "" {
-		engineerID = fmt.Sprintf("engineer_%s", uuid.New().String()[:8])
+		engineerID = uuid.New().String()[:8]
 	}
 
 	eng := &Engineer{
@@ -180,7 +180,7 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 			TaskQueue: make([]string, 0),
 			StartedAt: time.Now(),
 		},
-		consultations: make([]Consultation, 0),
+		consultations:     make([]Consultation, 0),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 	}
@@ -199,10 +199,12 @@ func (e *Engineer) SetProvider(p engineerProvider) {
 	e.provider = p
 }
 
-// SetProviderWrapper stores a callback that re-applies gateway rate limiting
-// to fresh providers created during credential refresh.
-func (e *Engineer) SetProviderWrapper(w gateway.ProviderWrapper) {
-	e.providerWrapper = w
+// SetProviderRefresher stores a callback that creates a fresh provider for
+// the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (e *Engineer) SetProviderRefresher(fn container.ProviderRefresher) {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	e.refresher = fn
 }
 
 // getProvider returns the current provider under read lock.
@@ -213,29 +215,24 @@ func (e *Engineer) getProvider() engineerProvider {
 }
 
 // ProviderType implements container.AuthRefreshable.
-func (e *Engineer) ProviderType() string { return "openai" }
+func (e *Engineer) ProviderType() string {
+	return string(container.ProviderForModel(e.CurrentModel()))
+}
 
 // RefreshProvider implements container.AuthRefreshable.
-// Re-resolves OpenAI credentials and replaces the provider.
 func (e *Engineer) RefreshProvider(ctx context.Context, authMethod string) error {
-	cfg := providers.OpenAIConfig{
-		BaseConfig: providers.BaseConfig{
-			Model:     DefaultModel,
-			MaxTokens: DefaultMaxTokens,
-		},
-		ReasoningEffort: DefaultReasoningEffort,
-		AuthMode:        authMethod,
+	e.stateMu.RLock()
+	fn := e.refresher
+	e.stateMu.RUnlock()
+	if fn == nil {
+		return nil
 	}
-	p, err := providers.NewOpenAIProvider(ctx, cfg)
+	p, err := fn(ctx, e.CurrentModel(), authMethod)
 	if err != nil {
 		return fmt.Errorf("engineer refresh provider: %w", err)
 	}
-	var wrapped engineerProvider = p
-	if e.providerWrapper != nil {
-		wrapped = e.providerWrapper(p)
-	}
-	e.SetProvider(wrapped)
-	e.logger.Info("provider refreshed", "auth_method", authMethod)
+	e.SetProvider(p)
+	e.logger.Info("provider refreshed", "model", e.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 
@@ -264,8 +261,7 @@ func (e *Engineer) CurrentModel() string {
 // SupportedModels implements container.ModelSwappable.
 func (e *Engineer) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
-		{ID: "gpt-5.2-codex", DisplayName: "GPT-5.2 Codex"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 	}
 }
 
@@ -314,10 +310,10 @@ func (e *Engineer) initSkills() {
 
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = []string{
-		"read_file", "edit_file", "write_file", "lsp",
+		"read_file", "edit_file", "write_file",
 		"glob", "grep", "run_command",
 	}
-	loaderCfg.AutoLoadDomains = []string{"code", "filesystem", "code_analysis", "code_quality"}
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	e.skillLoader = skills.NewLoader(e.skills, loaderCfg)
 
 	e.registerCoreSkills()
@@ -516,7 +512,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	startTime := time.Now()
 
 	// Wire tool call emitter for inline visualization.
-	emitter := shared.NewToolCallEmitter(e.bus, e.channels, "engineer", fwd.CorrelationID, fwd.SourceAgentID)
+	emitter := shared.NewToolCallEmitter(e.bus, e.channels, e.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -541,8 +537,8 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "engineer",
-		RespondingAgentName: "engineer",
+		RespondingAgentID:   e.id,
+		RespondingAgentName: "Engineer",
 		ProcessingTime:      time.Since(startTime),
 	}
 
@@ -766,14 +762,15 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	}
 
 	// Step 5: Build LLM request with tools
+	e.prepareSkillsForInput(req.Prompt)
 	llmReq := &providers.Request{
-		SystemPrompt:    systemPrompt,
-		Messages:        []providers.Message{{Role: providers.RoleUser, Content: req.Prompt}},
-		Tools:           e.buildToolDefinitions(),
-		Model:           e.config.EngineerConfig.Model,
-		MaxTokens:       e.config.EngineerConfig.MaxTokens,
-		ReasoningEffort: e.config.EngineerConfig.ReasoningEffort,
+		SystemPrompt: systemPrompt,
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: req.Prompt}},
+		Tools:        e.buildToolDefinitions(),
+		Model:        e.config.EngineerConfig.Model,
+		MaxTokens:    e.config.EngineerConfig.MaxTokens,
 	}
+	llmruntime.Apply(llmReq, e.llmRuntimeProfile())
 
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(llmReq, req.ConversationHistory)
@@ -1022,10 +1019,16 @@ func (e *Engineer) AgentType() string {
 func (e *Engineer) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:       "engineer",
-		ModelID:         "gpt-5.3-codex",
-		ReasoningEffort: "xhigh",
-		ContextWindow:   200_000,
+		ModelID:         e.CurrentModel(),
+		ReasoningEffort: e.config.EngineerConfig.ReasoningEffort,
+		ContextWindow:   272_000,
 		Category:        handoff.CategoryPipeline,
+	}
+}
+
+func (e *Engineer) llmRuntimeProfile() llmruntime.Profile {
+	return llmruntime.Profile{
+		ReasoningEffort: e.config.EngineerConfig.ReasoningEffort,
 	}
 }
 

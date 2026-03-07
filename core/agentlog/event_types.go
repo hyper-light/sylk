@@ -117,12 +117,22 @@ const (
 	EventApprovalReceived  EventType = 0x0604
 	EventCheckpointCreated EventType = 0x0605
 	EventRollbackExecuted  EventType = 0x0606
-	EventContentScanned    EventType = 0x0620
-	EventInjectionDetected EventType = 0x0621
+	EventContentScanned     EventType = 0x0620
+	EventInjectionDetected  EventType = 0x0621
 	EventCredentialDetected EventType = 0x0622
-	EventContentCleared    EventType = 0x0623
-	EventHealthChecked     EventType = 0x0624
-	EventHealthAlert       EventType = 0x0625
+	EventContentCleared     EventType = 0x0623
+	EventHealthChecked      EventType = 0x0624
+	EventHealthAlert        EventType = 0x0625
+
+	// Network security events.
+	EventTLSValidated       EventType = 0x0630
+	EventTLSWarning         EventType = 0x0631
+	EventTLSBlocked         EventType = 0x0632
+	EventDomainReputation   EventType = 0x0633
+	EventVulnDetected       EventType = 0x0634
+	EventFetchBlocked       EventType = 0x0635
+	EventFetchFlagged       EventType = 0x0636
+	EventFetchClean         EventType = 0x0637
 )
 
 // Inspector events (0x0700–0x07FF) — audit.wal.
@@ -369,6 +379,14 @@ func init() {
 	eventNames[EventContentCleared] = "ContentCleared"
 	eventNames[EventHealthChecked] = "HealthChecked"
 	eventNames[EventHealthAlert] = "HealthAlert"
+	eventNames[EventTLSValidated] = "TLSValidated"
+	eventNames[EventTLSWarning] = "TLSWarning"
+	eventNames[EventTLSBlocked] = "TLSBlocked"
+	eventNames[EventDomainReputation] = "DomainReputation"
+	eventNames[EventVulnDetected] = "VulnDetected"
+	eventNames[EventFetchBlocked] = "FetchBlocked"
+	eventNames[EventFetchFlagged] = "FetchFlagged"
+	eventNames[EventFetchClean] = "FetchClean"
 
 	// Inspector
 	eventNames[EventAuditStarted] = "AuditStarted"

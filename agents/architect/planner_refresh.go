@@ -29,7 +29,9 @@ func (a *Architect) PlannerAvailable() bool {
 }
 
 // ProviderType implements container.AuthRefreshable.
-func (a *Architect) ProviderType() string { return "anthropic" }
+func (a *Architect) ProviderType() string {
+	return string(container.ProviderForModel(a.CurrentModel()))
+}
 
 // RefreshProvider implements container.AuthRefreshable.
 // Delegates to RefreshPlannerAuth which clears the cached planner so
@@ -73,6 +75,6 @@ func (a *Architect) CurrentModel() string {
 func (a *Architect) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
 		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 	}
 }

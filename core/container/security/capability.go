@@ -11,6 +11,8 @@ type CapabilitySet struct {
 	subscribeTopics map[string]struct{} // Bus topics subscribable
 	pathRead        map[string]struct{} // Paths with read access
 	pathWrite       map[string]struct{} // Paths with write access
+	networkEgress   map[string]struct{} // Allowed egress domain patterns (e.g. "*.golang.org", "*")
+	networkIngress  map[string]struct{} // Allowed ingress content types (e.g. "text/html", "application/pdf")
 	canEscalate     bool                // Can request additional capabilities
 }
 
@@ -29,6 +31,31 @@ func NewCapabilitySet(
 		subscribeTopics: toSet(subscribeTopics),
 		pathRead:        toSet(pathRead),
 		pathWrite:       toSet(pathWrite),
+		networkEgress:   make(map[string]struct{}),
+		networkIngress:  make(map[string]struct{}),
+		canEscalate:     canEscalate,
+	}
+}
+
+// NewCapabilitySetFull creates a CapabilitySet with all fields including network capabilities.
+func NewCapabilitySetFull(
+	signals []string,
+	publishTopics []string,
+	subscribeTopics []string,
+	pathRead []string,
+	pathWrite []string,
+	networkEgress []string,
+	networkIngress []string,
+	canEscalate bool,
+) *CapabilitySet {
+	return &CapabilitySet{
+		signals:         toSet(signals),
+		publishTopics:   toSet(publishTopics),
+		subscribeTopics: toSet(subscribeTopics),
+		pathRead:        toSet(pathRead),
+		pathWrite:       toSet(pathWrite),
+		networkEgress:   toSet(networkEgress),
+		networkIngress:  toSet(networkIngress),
 		canEscalate:     canEscalate,
 	}
 }
@@ -41,6 +68,8 @@ func EmptyCapabilitySet() *CapabilitySet {
 		subscribeTopics: make(map[string]struct{}),
 		pathRead:        make(map[string]struct{}),
 		pathWrite:       make(map[string]struct{}),
+		networkEgress:   make(map[string]struct{}),
+		networkIngress:  make(map[string]struct{}),
 	}
 }
 
@@ -104,6 +133,52 @@ func (c *CapabilitySet) WritePaths() []string {
 	return sortedKeys(c.pathWrite)
 }
 
+// CanNetworkEgress reports whether outbound access to the given domain is permitted.
+// Supports wildcard patterns: "*" allows all, "*.example.com" allows subdomains.
+func (c *CapabilitySet) CanNetworkEgress(domain string) bool {
+	if _, ok := c.networkEgress["*"]; ok {
+		return true
+	}
+	if _, ok := c.networkEgress[domain]; ok {
+		return true
+	}
+	return matchWildcardDomain(c.networkEgress, domain)
+}
+
+// CanNetworkIngress reports whether inbound content of the given type is permitted.
+func (c *CapabilitySet) CanNetworkIngress(contentType string) bool {
+	if _, ok := c.networkIngress["*"]; ok {
+		return true
+	}
+	_, ok := c.networkIngress[contentType]
+	return ok
+}
+
+// NetworkEgressDomains returns a sorted snapshot of allowed egress domains.
+func (c *CapabilitySet) NetworkEgressDomains() []string {
+	return sortedKeys(c.networkEgress)
+}
+
+// NetworkIngressTypes returns a sorted snapshot of allowed ingress content types.
+func (c *CapabilitySet) NetworkIngressTypes() []string {
+	return sortedKeys(c.networkIngress)
+}
+
+// GrantNetworkEgress adds an egress domain capability. Returns true if newly added.
+func (c *CapabilitySet) GrantNetworkEgress(domain string) bool {
+	return addToSet(c.networkEgress, domain)
+}
+
+// GrantNetworkIngress adds an ingress content type capability. Returns true if newly added.
+func (c *CapabilitySet) GrantNetworkIngress(contentType string) bool {
+	return addToSet(c.networkIngress, contentType)
+}
+
+// RevokeNetworkEgress removes an egress domain capability. Returns true if removed.
+func (c *CapabilitySet) RevokeNetworkEgress(domain string) bool {
+	return removeFromSet(c.networkEgress, domain)
+}
+
 // GrantSignal adds a signal capability. Returns true if newly added.
 func (c *CapabilitySet) GrantSignal(signal string) bool {
 	return addToSet(c.signals, signal)
@@ -141,6 +216,8 @@ func (c *CapabilitySet) Merge(other *CapabilitySet) {
 	mergeSet(c.subscribeTopics, other.subscribeTopics)
 	mergeSet(c.pathRead, other.pathRead)
 	mergeSet(c.pathWrite, other.pathWrite)
+	mergeSet(c.networkEgress, other.networkEgress)
+	mergeSet(c.networkIngress, other.networkIngress)
 	c.canEscalate = c.canEscalate || other.canEscalate
 }
 
@@ -152,6 +229,8 @@ func (c *CapabilitySet) Clone() *CapabilitySet {
 		subscribeTopics: cloneSet(c.subscribeTopics),
 		pathRead:        cloneSet(c.pathRead),
 		pathWrite:       cloneSet(c.pathWrite),
+		networkEgress:   cloneSet(c.networkEgress),
+		networkIngress:  cloneSet(c.networkIngress),
 		canEscalate:     c.canEscalate,
 	}
 }
@@ -201,4 +280,19 @@ func sortedKeys(s map[string]struct{}) []string {
 	}
 	slices.Sort(keys)
 	return keys
+}
+
+// matchWildcardDomain checks if domain matches any "*.suffix" pattern in the set.
+// For example, "docs.golang.org" matches "*.golang.org".
+func matchWildcardDomain(patterns map[string]struct{}, domain string) bool {
+	for pattern := range patterns {
+		if len(pattern) < 3 || pattern[0] != '*' || pattern[1] != '.' {
+			continue
+		}
+		suffix := pattern[1:] // ".golang.org"
+		if len(domain) > len(suffix) && domain[len(domain)-len(suffix):] == suffix {
+			return true
+		}
+	}
+	return false
 }

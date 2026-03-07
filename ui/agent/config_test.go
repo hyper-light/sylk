@@ -62,7 +62,7 @@ func TestNewAgentModelStore_BackwardCompat_NoProvider(t *testing.T) {
     architect:
         model: claude-opus-4-6
     engineer:
-        model: gpt-5.3-codex
+        model: gpt-5.4-pro
 `)
 	if err := os.WriteFile(path, content, 0644); err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestNewAgentModelStore_BackwardCompat_NoProvider(t *testing.T) {
 	cases := map[string]struct{ model, provider string }{
 		"guide":     {"gemini-3.1-pro-preview", "google"},
 		"architect": {"claude-opus-4-6", "anthropic"},
-		"engineer":  {"gpt-5.3-codex", "openai"},
+		"engineer":  {"gpt-5.4-pro", "openai"},
 	}
 	for agentType, want := range cases {
 		entry := store.EntryFor(agentType)
@@ -200,7 +200,7 @@ func TestEnsureDefaults_BatchWrite(t *testing.T) {
 	defaults := map[string]AgentConfigEntry{
 		"guide":     {Provider: "google", Model: "gemini-3.1-pro-preview"},
 		"architect": {Provider: "anthropic", Model: "claude-opus-4-6"},
-		"engineer":  {Provider: "openai", Model: "gpt-5.3-codex"},
+		"engineer":  {Provider: "openai", Model: "gpt-5.4-pro"},
 	}
 	if err := store.EnsureDefaults(defaults); err != nil {
 		t.Fatal(err)
@@ -217,7 +217,7 @@ func TestEnsureDefaults_BatchWrite(t *testing.T) {
 	if got := store.ProviderFor("architect"); got != "anthropic" {
 		t.Errorf("architect provider missing: got %q", got)
 	}
-	if got := store.ModelFor("engineer"); got != "gpt-5.3-codex" {
+	if got := store.ModelFor("engineer"); got != "gpt-5.4-pro" {
 		t.Errorf("engineer default missing: got %q", got)
 	}
 	if got := store.ProviderFor("engineer"); got != "openai" {
@@ -331,8 +331,8 @@ func TestDeriveProvider(t *testing.T) {
 		"claude-opus-4-6":        "anthropic",
 		"claude-sonnet-4-6":      "anthropic",
 		"gemini-3.1-pro-preview": "google",
-		"gpt-5.3-codex":         "openai",
-		"gpt-5.2-codex":         "openai",
+		"gpt-5.4-pro":         "openai",
+		"gpt-5.4-pro":         "openai",
 		"unknown-model":          "",
 	}
 	for modelID, want := range cases {

@@ -57,13 +57,13 @@ func TestScale_1kFiles(t *testing.T) {
 	start := time.Now()
 	for i := 0; i < 1000; i++ {
 		path := fmt.Sprintf("/src/module%d/file%d.go", i/100, i%100)
-		ctx.RecordFileRead(path, fmt.Sprintf("File %d summary", i), SourceModelClaudeOpus45)
+		ctx.RecordFileRead(path, fmt.Sprintf("File %d summary", i), SourceModelClaudeOpus)
 		if i%3 == 0 {
 			ctx.RecordFileModified(path, FileChange{
 				StartLine:   i * 10,
 				EndLine:     i*10 + 50,
 				Description: "Modified for test",
-			}, SourceModelClaudeOpus45)
+			}, SourceModelClaudeOpus)
 		}
 	}
 	trackDuration := time.Since(start)
@@ -107,7 +107,7 @@ func TestScale_500Patterns(t *testing.T) {
 			Name:        fmt.Sprintf("Pattern %d", i),
 			Description: fmt.Sprintf("Description for pattern %d with detailed explanation", i),
 			Example:     fmt.Sprintf("// Example code for pattern %d\nfunc example() {}", i),
-			Source:      SourceModelClaudeOpus45,
+			Source:      SourceModelClaudeOpus,
 		})
 	}
 	registerDuration := time.Since(start)
@@ -147,7 +147,7 @@ func TestScale_200Failures(t *testing.T) {
 			fmt.Sprintf("%s variant %d", approaches[i%len(approaches)], i),
 			fmt.Sprintf("Reason %d: explanation of why it failed", i),
 			fmt.Sprintf("Task context %d", i),
-			SourceModelClaudeOpus45,
+			SourceModelClaudeOpus,
 		)
 	}
 	recordDuration := time.Since(start)
@@ -278,8 +278,8 @@ func TestScale_QueryPerformance(t *testing.T) {
 	}{
 		{"Single category", ArchiveQuery{Categories: []Category{CategoryInsight}, Limit: 50}},
 		{"Multiple categories", ArchiveQuery{Categories: []Category{CategoryInsight, CategoryDecision, CategoryIssue}, Limit: 50}},
-		{"Single source", ArchiveQuery{Sources: []SourceModel{SourceModelClaudeOpus45}, Limit: 50}},
-		{"Combined filters", ArchiveQuery{Categories: []Category{CategoryInsight}, Sources: []SourceModel{SourceModelClaudeOpus45}, Limit: 50}},
+		{"Single source", ArchiveQuery{Sources: []SourceModel{SourceModelClaudeOpus}, Limit: 50}},
+		{"Combined filters", ArchiveQuery{Categories: []Category{CategoryInsight}, Sources: []SourceModel{SourceModelClaudeOpus}, Limit: 50}},
 		{"Date range", ArchiveQuery{Since: timePtr(time.Now().Add(-1 * time.Hour)), Limit: 50}},
 		{"No filters, limit only", ArchiveQuery{Limit: 100}},
 	}
@@ -309,7 +309,7 @@ func TestScale_TextSearchPerformance(t *testing.T) {
 		entry := makeEntry(
 			CategoryGeneral,
 			fmt.Sprintf("Content about %s with details %d and more %s information", keyword, i, keyword),
-			SourceModelClaudeOpus45,
+			SourceModelClaudeOpus,
 		)
 		store.InsertEntry(entry)
 	}
@@ -342,7 +342,7 @@ func TestScale_ConcurrentAgentOperations(t *testing.T) {
 		agentName := fmt.Sprintf("agent-%d", agentNum)
 
 		// Register
-		resp, _ := a.RegisterAgent(agentName, "", "", SourceModelClaudeOpus45)
+		resp, _ := a.RegisterAgent(agentName, "", "", SourceModelClaudeOpus)
 		if resp == nil {
 			return
 		}
@@ -353,14 +353,14 @@ func TestScale_ConcurrentAgentOperations(t *testing.T) {
 			a.StoreEntry(ctx, makeEntry(
 				CategoryGeneral,
 				fmt.Sprintf("Work from %s operation %d", agentName, op),
-				SourceModelClaudeOpus45,
+				SourceModelClaudeOpus,
 			))
 
 			// Record files
 			a.RecordFileRead(
 				fmt.Sprintf("/src/%s/file%d.go", agentName, op),
 				"Summary",
-				SourceModelClaudeOpus45,
+				SourceModelClaudeOpus,
 			)
 
 			// Query
@@ -368,7 +368,7 @@ func TestScale_ConcurrentAgentOperations(t *testing.T) {
 
 			// Update resume
 			if op%10 == 0 {
-				a.SetCurrentTask(fmt.Sprintf("Task %d", op), "Objective", SourceModelClaudeOpus45)
+				a.SetCurrentTask(fmt.Sprintf("Task %d", op), "Objective", SourceModelClaudeOpus)
 				a.CompleteStep(fmt.Sprintf("Step %d", op))
 			}
 		}

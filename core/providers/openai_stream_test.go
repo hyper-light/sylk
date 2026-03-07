@@ -51,7 +51,7 @@ func TestOpenAIProviderGenerate_ChatGPTUsesCompletedResponse(t *testing.T) {
 		if err := writeSSE(w,
 			`{"type":"response.output_text.delta","delta":"partial ","item_id":"msg_1","output_index":0,"content_index":0,"sequence_number":1}`,
 			`{"type":"response.output_text.delta","delta":"text","item_id":"msg_1","output_index":0,"content_index":0,"sequence_number":2}`,
-			`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_123","model":"gpt-5.3-codex","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"canonical answer"}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`,
+			`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_123","model":"gpt-5.4-pro","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"canonical answer"}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}`,
 		); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -79,8 +79,8 @@ func TestOpenAIProviderGenerate_ChatGPTUsesCompletedResponse(t *testing.T) {
 	if resp.Content != "canonical answer" {
 		t.Fatalf("expected canonical completed response content, got %q", resp.Content)
 	}
-	if resp.Model != "gpt-5.3-codex" {
-		t.Fatalf("expected model gpt-5.3-codex, got %q", resp.Model)
+	if resp.Model != "gpt-5.4-pro" {
+		t.Fatalf("expected model gpt-5.4-pro, got %q", resp.Model)
 	}
 	if resp.Usage.TotalTokens != 6 {
 		t.Fatalf("expected total_tokens=6, got %d", resp.Usage.TotalTokens)
@@ -110,7 +110,7 @@ func TestOpenAIProviderStreamWithHandler_EmitsToolAndTextChunks(t *testing.T) {
 			`{"type":"response.function_call_arguments.delta","delta":"{\"path\":","item_id":"tool_1","output_index":0,"sequence_number":2}`,
 			`{"type":"response.function_call_arguments.done","arguments":"{\"path\":\"/tmp\"}","item_id":"tool_1","output_index":0,"sequence_number":3}`,
 			`{"type":"response.output_text.delta","delta":"done","item_id":"msg_1","output_index":1,"content_index":0,"sequence_number":4}`,
-			`{"type":"response.completed","sequence_number":5,"response":{"id":"resp_456","model":"gpt-5.3-codex","output":[{"id":"tool_1","type":"function_call","name":"run_test","arguments":"{\"path\":\"/tmp\"}"},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}`,
+			`{"type":"response.completed","sequence_number":5,"response":{"id":"resp_456","model":"gpt-5.4-pro","output":[{"id":"tool_1","type":"function_call","name":"run_test","arguments":"{\"path\":\"/tmp\"}"},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}`,
 		); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -198,7 +198,7 @@ func TestOpenAIProviderStreamWithHandler_EmitsReasoningChunks(t *testing.T) {
 		if err := writeSSE(w,
 			`{"type":"response.reasoning_summary_text.delta","delta":"considering options","item_id":"rsn_1","output_index":0,"summary_index":0,"sequence_number":1}`,
 			`{"type":"response.output_text.delta","delta":"final answer","item_id":"msg_1","output_index":1,"content_index":0,"sequence_number":2}`,
-			`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_reasoning","model":"gpt-5.3-codex","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"final answer"}]}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}`,
+			`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_reasoning","model":"gpt-5.4-pro","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"final answer"}]}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}`,
 		); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -319,7 +319,7 @@ func TestOpenAIProviderGenerate_ChatGPTRetryOnUnauthorizedRefreshesAuth(t *testi
 		}
 		w.Header().Set("x-request-id", "req_after_refresh")
 		if err := writeSSE(w,
-			`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_refreshed","model":"gpt-5.3-codex","status":"completed","service_tier":"default","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"after refresh"}]}],"usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}`,
+			`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_refreshed","model":"gpt-5.4-pro","status":"completed","service_tier":"default","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"after refresh"}]}],"usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}`,
 		); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -379,7 +379,7 @@ func TestOpenAIProviderStreamWithHandler_ToolEndOrderByOutputIndex(t *testing.T)
 		if err := writeSSE(w,
 			`{"type":"response.output_item.added","sequence_number":1,"output_index":2,"item":{"id":"tool_b","type":"function_call","name":"beta"}}`,
 			`{"type":"response.output_item.added","sequence_number":2,"output_index":1,"item":{"id":"tool_a","type":"function_call","name":"alpha"}}`,
-			`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_order","model":"gpt-5.3-codex","status":"completed","output":[{"id":"tool_a","type":"function_call","name":"alpha","arguments":"{}"},{"id":"tool_b","type":"function_call","name":"beta","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+			`{"type":"response.completed","sequence_number":3,"response":{"id":"resp_order","model":"gpt-5.4-pro","status":"completed","output":[{"id":"tool_a","type":"function_call","name":"alpha","arguments":"{}"},{"id":"tool_b","type":"function_call","name":"beta","arguments":"{}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
 		); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}

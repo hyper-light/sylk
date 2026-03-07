@@ -9,11 +9,13 @@ import (
 // topic access and escalation rights. Knowledge agents are unrestricted
 // workers. Pipeline agents are read-only workers.
 type agentSecurityProfile struct {
-	role          string
-	pathRead      []string
-	pathWrite     []string
-	canEscalate   bool
-	runAsReadOnly bool
+	role           string
+	pathRead       []string
+	pathWrite      []string
+	networkEgress  []string // Allowed egress domain patterns
+	networkIngress []string // Allowed ingress content types
+	canEscalate    bool
+	runAsReadOnly  bool
 }
 
 // securityProfileByCategory derives security posture from agent category.
@@ -55,12 +57,35 @@ var inspectorReadOnlyOverride = agentSecurityProfile{
 	runAsReadOnly: true,
 }
 
+// academicNetworkProfile grants the Academic agent outbound network access
+// for external research. Network egress requires user consent at fetch time
+// (enforced by core/fetch); this capability merely permits the agent to
+// attempt egress. All fetched content must pass Guardian quarantine inspection
+// before ingestion.
+var academicNetworkProfile = agentSecurityProfile{
+	role:      "worker",
+	pathRead:  []string{"*"},
+	pathWrite: []string{"*"},
+	networkEgress: []string{"*"}, // All domains; per-request consent enforced by fetch policy
+	networkIngress: []string{
+		"text/html",
+		"text/plain",
+		"application/pdf",
+		"application/json",
+		"text/markdown",
+	},
+	canEscalate:   false,
+	runAsReadOnly: false,
+}
+
 // agentTypeOverrides maps specific agent types to security profiles that
 // deviate from their category default. The global inspector is registered
 // as CategoryStandalone for bus permissions but must be filesystem read-only.
+// The academic agent is granted network egress for external research.
 var agentTypeOverrides = map[string]agentSecurityProfile{
 	"inspector":          inspectorReadOnlyOverride,
 	"inspector-pipeline": inspectorReadOnlyOverride,
+	"academic":           academicNetworkProfile,
 }
 
 // BuildSecuritySpec constructs a SecurityContextSpec for an agent based on
@@ -91,6 +116,8 @@ func BuildSecuritySpec(desc handoff.AgentDescriptor) SecurityContextSpec {
 			SubscribeTopics: subscribeTopics,
 			PathRead:        profile.pathRead,
 			PathWrite:       profile.pathWrite,
+			NetworkEgress:   profile.networkEgress,
+			NetworkIngress:  profile.networkIngress,
 			CanEscalate:     profile.canEscalate,
 		},
 		RunAsReadOnly: profile.runAsReadOnly,

@@ -1,7 +1,6 @@
 package shared
 
 import (
-	"math"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/providers"
@@ -12,9 +11,10 @@ func TestNewContextBudget(t *testing.T) {
 	if b.ModelLimit() != 200000 {
 		t.Fatalf("expected 200000, got %d", b.ModelLimit())
 	}
-	// Available = 200000 - 4096 - 8192 - 0 (no fixed overhead yet)
-	if b.Available() != 200000-4096-8192 {
-		t.Fatalf("expected %d, got %d", 200000-4096-8192, b.Available())
+	// Capacity = 200000 - 4096 - 8192
+	wantCap := 200000 - 4096 - 8192
+	if b.Capacity() != wantCap {
+		t.Fatalf("expected capacity %d, got %d", wantCap, b.Capacity())
 	}
 }
 
@@ -34,8 +34,8 @@ func TestComputeFixedOverhead(t *testing.T) {
 	if b.fixedOverhead <= 0 {
 		t.Fatal("expected positive fixed overhead")
 	}
-	if b.Available() >= 200000-4096 {
-		t.Fatal("available should decrease after computing overhead")
+	if b.FixedOverhead() != b.fixedOverhead {
+		t.Fatal("FixedOverhead() should match fixedOverhead field")
 	}
 }
 
@@ -46,7 +46,6 @@ func TestZoneThresholds(t *testing.T) {
 		reserveTokens: 0,
 		fixedOverhead: 0,
 		counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
-		calibRatio:    1.0,
 		compactAt:     0.80,
 		evictAt:       0.90,
 		criticalAt:    0.95,
@@ -78,41 +77,66 @@ func TestZoneThresholds(t *testing.T) {
 	}
 }
 
-func TestCalibrationEMA(t *testing.T) {
+func TestAnchorAndProjectedInput(t *testing.T) {
 	b := NewContextBudget("claude-opus-4-6", 4096, 0)
+	b.ComputeFixedOverhead("system prompt", nil)
 
-	// First sample: estimate=100, actual=150 → ratio = 1.5
-	b.Calibrate(100, 150)
-	if math.Abs(b.CalibRatio()-1.5) > 0.001 {
-		t.Fatalf("expected 1.5 after first sample, got %.3f", b.CalibRatio())
+	msgs := []providers.Message{
+		{Role: providers.RoleUser, Content: "hello"},
+		{Role: providers.RoleAssistant, Content: "hi there"},
 	}
 
-	// Second sample: estimate=100, actual=100 → observed=1.0
-	// EMA: 0.3*1.0 + 0.7*1.5 = 1.35
-	b.Calibrate(100, 100)
-	expected := 0.3*1.0 + 0.7*1.5
-	if math.Abs(b.CalibRatio()-expected) > 0.001 {
-		t.Fatalf("expected %.3f after second sample, got %.3f", expected, b.CalibRatio())
+	// Before anchor: uses fixedOverhead + estimateRaw.
+	preAnchor := b.ProjectedInput(msgs)
+	if preAnchor <= 0 {
+		t.Fatal("expected positive projected input before anchor")
+	}
+	if b.Anchored() {
+		t.Fatal("should not be anchored before Anchor()")
 	}
 
-	// After many 1.0 samples, should converge near 1.0.
-	for range 20 {
-		b.Calibrate(100, 100)
+	// Anchor with provider ground truth.
+	b.Anchor(500, len(msgs))
+	if !b.Anchored() {
+		t.Fatal("should be anchored after Anchor()")
 	}
-	if math.Abs(b.CalibRatio()-1.0) > 0.05 {
-		t.Fatalf("expected convergence near 1.0, got %.3f", b.CalibRatio())
+	if b.AnchorTokens() != 500 {
+		t.Fatalf("expected anchor 500, got %d", b.AnchorTokens())
+	}
+
+	// No new messages → projected = anchor exactly.
+	projected := b.ProjectedInput(msgs)
+	if projected != 500 {
+		t.Fatalf("expected projected=500 (no delta), got %d", projected)
+	}
+
+	// Append a message → projected = anchor + delta estimate.
+	msgs = append(msgs, providers.Message{Role: providers.RoleUser, Content: makeString(400)})
+	projectedWithDelta := b.ProjectedInput(msgs)
+	if projectedWithDelta <= 500 {
+		t.Fatalf("expected projected > 500 with delta, got %d", projectedWithDelta)
 	}
 }
 
-func TestCalibrationIgnoresZero(t *testing.T) {
+func TestAnchorInvalidation(t *testing.T) {
 	b := NewContextBudget("claude-opus-4-6", 4096, 0)
-	b.Calibrate(0, 100)
-	if b.CalibSamples() != 0 {
-		t.Fatal("should not count zero-estimated sample")
+	b.ComputeFixedOverhead("system", nil)
+
+	msgs := []providers.Message{{Role: providers.RoleUser, Content: "test"}}
+	b.Anchor(300, len(msgs))
+	if !b.Anchored() {
+		t.Fatal("should be anchored")
 	}
-	b.Calibrate(100, 0)
-	if b.CalibSamples() != 0 {
-		t.Fatal("should not count zero-actual sample")
+
+	b.InvalidateAnchor()
+	if b.Anchored() {
+		t.Fatal("should not be anchored after invalidation")
+	}
+
+	// After invalidation, falls back to fixedOverhead + estimateRaw.
+	projected := b.ProjectedInput(msgs)
+	if projected <= 0 {
+		t.Fatal("expected positive projected input after invalidation")
 	}
 }
 
@@ -122,13 +146,12 @@ func TestPerResultBudget(t *testing.T) {
 		reserveTokens: 0,
 		fixedOverhead: 0,
 		counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
-		calibRatio:    1.0,
 		compactAt:     0.80,
 		evictAt:       0.90,
 		criticalAt:    0.95,
 	}
 
-	// 10000 available, 5000 used, 5 remaining turns → 1000 per result
+	// 10000 capacity, 5000 projected, 5 remaining turns → 1000 per result
 	budget := b.PerResultBudget(5000, 5)
 	if budget != 1000 {
 		t.Fatalf("expected 1000, got %d", budget)
@@ -140,27 +163,61 @@ func TestPerResultBudget(t *testing.T) {
 		t.Fatalf("expected 5000, got %d", budget)
 	}
 
-	// Used exceeds available → 0
+	// Used exceeds capacity → 0
 	budget = b.PerResultBudget(15000, 5)
 	if budget != 0 {
 		t.Fatalf("expected 0, got %d", budget)
 	}
 }
 
-func TestUtilizationZeroAvailable(t *testing.T) {
+func TestUtilizationZeroCapacity(t *testing.T) {
 	b := &ContextBudget{
 		modelLimit:    1000,
 		reserveTokens: 1000,
 		fixedOverhead: 0,
 		counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
-		calibRatio:    1.0,
 		compactAt:     0.80,
 		evictAt:       0.90,
 		criticalAt:    0.95,
 	}
 	u := b.Utilization([]providers.Message{{Role: providers.RoleUser, Content: "hello"}})
 	if u != 1.0 {
-		t.Fatalf("expected 1.0 when available=0, got %.2f", u)
+		t.Fatalf("expected 1.0 when capacity=0, got %.2f", u)
+	}
+}
+
+func TestAvailableWithMessages(t *testing.T) {
+	b := &ContextBudget{
+		modelLimit:    1000,
+		reserveTokens: 0,
+		fixedOverhead: 0,
+		counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
+		compactAt:     0.80,
+		evictAt:       0.90,
+		criticalAt:    0.95,
+	}
+
+	msgs := []providers.Message{{Role: providers.RoleUser, Content: makeString(2000)}}
+	avail := b.Available(msgs)
+	if avail >= 1000 {
+		t.Fatalf("expected available < capacity with messages, got %d", avail)
+	}
+
+	// With no messages, available should equal capacity.
+	empty := b.Available(nil)
+	if empty != 1000 {
+		t.Fatalf("expected 1000 with no messages, got %d", empty)
+	}
+}
+
+func TestCapacityNonNegative(t *testing.T) {
+	b := &ContextBudget{
+		modelLimit:    100,
+		reserveTokens: 500,
+		counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
+	}
+	if b.Capacity() != 0 {
+		t.Fatalf("expected 0 when reserve > limit, got %d", b.Capacity())
 	}
 }
 

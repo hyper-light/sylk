@@ -56,7 +56,7 @@ type Skill struct {
 // InputSchema defines the JSON Schema for skill inputs
 type InputSchema struct {
 	Type       string               `json:"type"` // Always "object"
-	Properties map[string]*Property `json:"properties,omitempty"`
+	Properties map[string]*Property `json:"properties"`
 	Required   []string             `json:"required,omitempty"`
 }
 
@@ -533,12 +533,18 @@ func (r *Registry) Invoke(ctx context.Context, name string, input json.RawMessag
 // Tool Definition (for Anthropic API)
 // =============================================================================
 
-// ToToolDefinition converts a skill to Anthropic tool format
+// ToToolDefinition converts a skill to provider tool format.
 func (s *Skill) ToToolDefinition() map[string]any {
+	schema := s.InputSchema
+	if schema == nil {
+		schema = &InputSchema{Type: "object", Properties: make(map[string]*Property)}
+	} else if schema.Properties == nil {
+		schema.Properties = make(map[string]*Property)
+	}
 	return map[string]any{
 		"name":         s.Name,
 		"description":  s.Description,
-		"input_schema": s.InputSchema,
+		"input_schema": schema,
 	}
 }
 

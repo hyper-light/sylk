@@ -45,8 +45,7 @@ type OpenAIDeviceAuthResult struct {
 type OpenAIModel string
 
 const (
-	Codex_5_3 OpenAIModel = "gpt-5.3-codex"
-	Codex_5_2 OpenAIModel = "gpt-5.2-codex"
+	GPT_5_4_Pro OpenAIModel = "gpt-5.4-pro"
 )
 
 const (
@@ -60,17 +59,11 @@ const (
 
 // Supported OpenAI models (canonical slugs).
 var openaiModelCatalog = map[string]ModelInfo{
-	"gpt-5.3-codex": {ID: "gpt-5.3-codex", Name: "GPT-5.3 Codex", MaxContext: 200000},
-	"gpt-5.2-codex": {ID: "gpt-5.2-codex", Name: "GPT-5.2 Codex", MaxContext: 200000},
+	"gpt-5.4-pro": {ID: "gpt-5.4-pro", Name: "GPT-5.4 Pro", MaxContext: 272000},
 }
 
 var openaiModelAliases = map[string]string{
-	"codex-5.3":          "gpt-5.3-codex",
-	"codex-5.2":          "gpt-5.2-codex",
-	"codex-5-2-20250901": "gpt-5.2-codex",
-	"codex-5-3-20251001": "gpt-5.3-codex",
-	"gpt-5-3-codex":      "gpt-5.3-codex",
-	"gpt-5-2-codex":      "gpt-5.2-codex",
+	"gpt-5-4-pro": "gpt-5.4-pro",
 }
 
 var openAIRoleToInputRole = map[Role]responses.EasyInputMessageRole{
@@ -1469,8 +1462,7 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req *Request) (*Response,
 
 func (p *OpenAIProvider) SupportedModels() []ModelInfo {
 	return []ModelInfo{
-		openaiModelCatalog["gpt-5.3-codex"],
-		openaiModelCatalog["gpt-5.2-codex"],
+		openaiModelCatalog["gpt-5.4-pro"],
 	}
 }
 
@@ -1510,11 +1502,14 @@ func (p *OpenAIProvider) buildResponseParams(req *Request) responses.ResponseNew
 	p.applyChatGPTResponseOptions(&params, systemPrompt)
 	p.applyTemperature(&params, req, model)
 	p.applyTopP(&params, req)
-	p.applyReasoningEffort(&params, p.resolveReasoningEffort(req), model)
+	p.applyReasoning(&params, req, model)
+	p.applyTextConfig(&params, req)
 	p.applyTruncation(&params, model)
 	p.applyInclude(&params, model)
 	p.applyTools(&params, req.Tools)
+	p.applyParallelToolCalls(&params, req)
 	p.applyToolChoice(&params, req.ToolChoice)
+	p.applyPromptCache(&params, req)
 	return params
 }
 
@@ -1625,16 +1620,24 @@ func (p *OpenAIProvider) applyTopP(params *responses.ResponseNewParams, req *Req
 	params.TopP = openai.Float(*req.TopP)
 }
 
-func (p *OpenAIProvider) applyReasoningEffort(
+func (p *OpenAIProvider) applyReasoning(
 	params *responses.ResponseNewParams,
-	reasoningEffort string,
+	req *Request,
 	model string,
 ) {
-	if reasoningEffort == "" && !supportsOpenAIReasoningConfig(model) {
+	if !supportsOpenAIReasoningConfig(model) {
 		return
 	}
+
+	reasoningEffort := p.resolveReasoningEffort(req)
 	params.Reasoning = shared.ReasoningParam{}
-	params.Reasoning.Summary = shared.ReasoningSummaryAuto
+
+	if summary := resolveOpenAIReasoningSummary(req.ReasoningSummary); summary != "" {
+		params.Reasoning.Summary = summary
+	} else if strings.TrimSpace(req.ReasoningSummary) == "" {
+		params.Reasoning.Summary = shared.ReasoningSummaryAuto
+	}
+
 	if reasoningEffort == "xhigh" {
 		params.Reasoning.SetExtraFields(map[string]any{"effort": "xhigh"})
 		return
@@ -1644,9 +1647,43 @@ func (p *OpenAIProvider) applyReasoningEffort(
 	}
 }
 
+func resolveOpenAIReasoningSummary(summary string) shared.ReasoningSummary {
+	switch strings.ToLower(strings.TrimSpace(summary)) {
+	case "auto":
+		return shared.ReasoningSummaryAuto
+	case "concise":
+		return shared.ReasoningSummaryConcise
+	case "detailed":
+		return shared.ReasoningSummaryDetailed
+	default:
+		return ""
+	}
+}
+
 func supportsOpenAIReasoningConfig(model string) bool {
 	model = normalizeOpenAIModel(model)
 	return strings.HasPrefix(model, "gpt-5") || strings.HasPrefix(model, "o")
+}
+
+func (p *OpenAIProvider) applyTextConfig(params *responses.ResponseNewParams, req *Request) {
+	verbosity := resolveOpenAIVerbosity(req.Verbosity)
+	if verbosity == "" {
+		return
+	}
+	params.Text.SetExtraFields(map[string]any{"verbosity": verbosity})
+}
+
+func resolveOpenAIVerbosity(verbosity string) string {
+	switch strings.ToLower(strings.TrimSpace(verbosity)) {
+	case "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high":
+		return "high"
+	default:
+		return ""
+	}
 }
 
 func (p *OpenAIProvider) applyTruncation(params *responses.ResponseNewParams, model string) {
@@ -1676,6 +1713,18 @@ func (p *OpenAIProvider) applyTools(params *responses.ResponseNewParams, tools [
 	params.Tools = p.convertResponseTools(tools)
 }
 
+func (p *OpenAIProvider) applyParallelToolCalls(params *responses.ResponseNewParams, req *Request) {
+	if len(params.Tools) == 0 {
+		return
+	}
+	switch {
+	case req.ParallelToolCalls != nil:
+		params.ParallelToolCalls = openai.Bool(*req.ParallelToolCalls)
+	case req.DisableParallelToolUse:
+		params.ParallelToolCalls = openai.Bool(false)
+	}
+}
+
 func (p *OpenAIProvider) applyToolChoice(params *responses.ResponseNewParams, choice string) {
 	if len(params.Tools) == 0 {
 		return
@@ -1691,6 +1740,19 @@ func (p *OpenAIProvider) applyToolChoice(params *responses.ResponseNewParams, ch
 		}
 	default:
 		// "auto" or empty — let the API default.
+	}
+}
+
+func (p *OpenAIProvider) applyPromptCache(params *responses.ResponseNewParams, req *Request) {
+	key := strings.TrimSpace(req.PromptCacheKey)
+	if key != "" {
+		params.PromptCacheKey = openai.String(key)
+	}
+	switch strings.ToLower(strings.TrimSpace(req.PromptCacheRetention)) {
+	case "in-memory":
+		params.SetExtraFields(map[string]any{"prompt_cache_retention": "in-memory"})
+	case "24h":
+		params.SetExtraFields(map[string]any{"prompt_cache_retention": "24h"})
 	}
 }
 
@@ -1995,7 +2057,7 @@ func normalizeOpenAIModel(model string) string {
 
 func modelSupportsTemperature(model string) bool {
 	model = normalizeOpenAIModel(model)
-	return !(strings.HasPrefix(model, "gpt-5") && strings.Contains(model, "codex"))
+	return !(strings.HasPrefix(model, "gpt-5") && strings.Contains(model, "thinking"))
 }
 
 func (p *OpenAIProvider) selectFallbackModel(requestedModel string, err error) (string, bool) {
@@ -2074,9 +2136,13 @@ func sanitizeSchemaIterative(params map[string]any) map[string]any {
 			}
 		}
 
-		// Object nodes require additionalProperties: false for strict mode.
+		// Object nodes require additionalProperties: false and a properties
+		// field for strict mode. OpenAI rejects schemas missing properties.
 		if node["type"] == "object" {
 			node["additionalProperties"] = false
+			if _, hasProps := node["properties"]; !hasProps {
+				node["properties"] = map[string]any{}
+			}
 		}
 
 		// Array nodes require an items schema. Add a default if missing.

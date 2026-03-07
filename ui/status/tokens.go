@@ -73,11 +73,14 @@ func (td *TokenDisplay) IsAnimating() bool {
 	return td.phase != PhaseIdle
 }
 
-// View renders the token display as "Sτ ↑in/↓out" with optional cache and
-// reasoning suffixes. When cache tokens are present, appends "(cache: Nk)".
-// When reasoning tokens are present, appends "(think: Nk)".
+// View renders the token display as "Sτ ↓in/↑out". Input (prompt) tokens
+// are shown net of cache hits; output (completion) tokens point upward.
 func (td *TokenDisplay) View() string {
-	in := formatTokenCount(td.promptTokens)
+	netInput := td.promptTokens - td.cacheReadTokens
+	if netInput < 0 {
+		netInput = 0
+	}
+	in := formatTokenCount(netInput)
 	out := formatTokenCount(td.completionTokens)
 
 	spin := " "
@@ -101,21 +104,10 @@ func (td *TokenDisplay) View() string {
 	gap := td.idleStyle.Render(" ")
 	sym := td.idleStyle.Render(tokenSymbol + " ")
 	sep := td.idleStyle.Render("/")
-	inPart := inStyle.Render("↑" + in)
-	outPart := outStyle.Render("↓" + out)
+	inPart := inStyle.Render("↓" + in)
+	outPart := outStyle.Render("↑" + out)
 
-	result := spinPart + gap + sym + inPart + sep + outPart
-
-	if td.cacheReadTokens > 0 {
-		cachePart := td.idleStyle.Render(" (cache:" + formatTokenCount(td.cacheReadTokens) + ")")
-		result += cachePart
-	}
-	if td.reasoningTokens > 0 {
-		thinkPart := td.idleStyle.Render(" (think:" + formatTokenCount(td.reasoningTokens) + ")")
-		result += thinkPart
-	}
-
-	return result
+	return spinPart + gap + sym + inPart + sep + outPart
 }
 
 // formatTokenCount renders a token count using compact "k" notation when the

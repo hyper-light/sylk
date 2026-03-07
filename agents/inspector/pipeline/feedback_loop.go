@@ -76,6 +76,7 @@ func (pi *PipelineInspector) runFeedbackLoop(
 			loop+1, len(currentIssues),
 		)
 
+		pi.prepareSkillsForInput(revalidatePrompt)
 		req := &providers.Request{
 			SystemPrompt: shared.PipelineInspectorSystemPrompt(),
 			Messages: []providers.Message{
@@ -85,6 +86,7 @@ func (pi *PipelineInspector) runFeedbackLoop(
 			MaxTokens: pi.config.MaxTokens,
 			Tools:     pi.buildToolDefinitions(),
 		}
+		pi.applyLLMRuntimeProfile(req, "revalidation")
 
 		_, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 		if err != nil {

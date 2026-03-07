@@ -21,7 +21,6 @@ import (
 // Follows the academic/engineer tool loop pattern exactly.
 func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	maxRuns := l.config.MaxToolRuns
-	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	consecutiveErrors := 0
 
 	p := l.getProvider()
@@ -41,6 +40,10 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 	}
 
 	for turn := 0; turn <= maxRuns; turn++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+
 		// ── STEERING CHECKPOINT ──
 		sc := shared.DrainAndCheckpoint(ledger, req, turn, "searching", nil)
 		if sc.Rollback != nil || sc.EditReplay != nil {
@@ -62,7 +65,6 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
 			}
 			turn = cp.Turn
-			seen = make(map[shared.ToolCallSignature]int, maxRuns)
 			consecutiveErrors = 0
 			continue
 		}
@@ -74,6 +76,11 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 		}
 		// ── END STEERING ──
 
+		if l.toolDefsDirty {
+			req.Tools = l.buildToolDefinitions()
+			l.toolDefsDirty = false
+		}
+
 		// ── CONTEXT BUDGET ──
 		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
 			return "", err
@@ -83,6 +90,9 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 		resp, err := p.Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -96,24 +106,32 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			content := strings.TrimSpace(resp.Content)
+			if content == "" {
+				// Empty content with no tool calls is abnormal — the system
+				// prompt mandates tool use before answering. This happens when
+				// the context governor strips tools (ZoneRed) or the model
+				// produces a degenerate response. Inject a synthesis nudge
+				// and retry exactly once.
+				if turn < maxRuns {
+					req.Messages = append(req.Messages, providers.Message{
+						Role:    providers.RoleAssistant,
+						Content: resp.Content,
+					}, providers.Message{
+						Role:    providers.RoleUser,
+						Content: "Your previous response was empty. You MUST provide a substantive natural language answer based on the tool results you have gathered so far. Summarize your findings clearly.",
+					})
+					continue
+				}
+				return "", fmt.Errorf("librarian: LLM returned empty response after %d turns", turn)
+			}
 			l.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.GenerationPayload{Phase: "completed", ToolRuns: turn})
 			}
-			return strings.TrimSpace(resp.Content), nil
-		}
-
-
-
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
-			}
-			return "", fmt.Errorf("librarian repeated tool call: %s", sig.Name)
+			return content, nil
 		}
 
 		errCount, rerouted := l.applyToolCalls(ctx, req, resp)
@@ -152,6 +170,8 @@ func (l *Librarian) applyToolCalls(
 		ToolCalls: resp.ToolCalls,
 		Metadata:  resp.ProviderMetadata,
 	})
+
+	loadedBefore := len(l.skills.GetLoaded())
 
 	errCount := 0
 	rerouted := false
@@ -198,6 +218,11 @@ func (l *Librarian) applyToolCalls(
 			break
 		}
 	}
+
+	if len(l.skills.GetLoaded()) > loadedBefore {
+		l.toolDefsDirty = true
+	}
+
 	return errCount, rerouted
 }
 
@@ -225,6 +250,16 @@ func (l *Librarian) executeToolCall(ctx context.Context, call providers.ToolCall
 	}
 
 	return shared.MarshalToolOutput(result.Data)
+}
+
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (l *Librarian) prepareSkillsForInput(input string) {
+	if l.skillLoader == nil {
+		return
+	}
+	l.skillLoader.LoadForInput(input)
+	l.skillLoader.OptimizeForBudget()
 }
 
 // buildToolDefinitions converts loaded skills to provider Tool format.

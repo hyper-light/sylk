@@ -13,7 +13,7 @@ import (
 
 // Default configuration values.
 const (
-	DefaultGuardianModel       = "gpt-5.3-codex"
+	DefaultGuardianModel       = "gpt-5.4-pro"
 	DefaultMaxOutputTokens     = 8192
 	DefaultMaxToolRuns         = 32
 	DefaultCheckpointInterval  = 10 * time.Minute

@@ -17,8 +17,8 @@ import (
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -34,7 +34,7 @@ const (
 )
 
 // LibrarianProvider is the minimal interface the Librarian needs from its LLM.
-// Satisfied by *providers.AnthropicProvider and *gateway.GatewayProvider.
+// Satisfied by any provider wrapped through gateway.GatewayProvider.
 type LibrarianProvider interface {
 	Complete(ctx context.Context, req *providers.Request) (*providers.Response, error)
 }
@@ -49,17 +49,18 @@ type Librarian struct {
 	logger *slog.Logger
 
 	// LLM provider
-	provider        LibrarianProvider
-	providerMu      sync.RWMutex
-	providerWrapper gateway.ProviderWrapper
+	provider   LibrarianProvider
+	providerMu sync.RWMutex
+	refresher  container.ProviderRefresher
 
 	// Search and indexing
 	searchHandler *SearchHandler
 	domainFilter  *LibrarianDomainFilter
 
 	// Skills system
-	skills      *skills.Registry
-	skillLoader *skills.Loader
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	toolDefsDirty bool
 
 	// Activity publisher for UI agent-panel updates.
 	activityPub events.ActivityPublisher
@@ -89,6 +90,13 @@ type Librarian struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time.
 	requestSerializer *shared.RequestSerializer
+
+	// Agent pod for Scribe feed and cross-agent coordination.
+	agentPod *shared.AgentPod
+
+	// Clone store for remote packages.
+	cloneStore *CloneStore
+	sessionVFS *versioning.SessionVFS
 
 	// State mutex (guards id during handoff swap).
 	mu sync.Mutex
@@ -143,7 +151,7 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 
 	librarianID := cfg.ID
 	if librarianID == "" {
-		librarianID = "librarian"
+		librarianID = uuid.New().String()[:8]
 	}
 
 	l := &Librarian{
@@ -164,6 +172,10 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 	if len(provider) > 0 && provider[0] != nil {
 		l.provider = provider[0]
 	}
+
+	// Initialize clone store for remote package fetching.
+	// SessionVFS is wired later via SetSessionVFS.
+	l.cloneStore = NewCloneStore(cfg.WorkingDirectory)
 
 	l.steering.InitLazy("librarian", cfg.ActivityPub)
 	l.initSkills()
@@ -203,20 +215,35 @@ func applyConfigDefaults(cfg Config) Config {
 func (l *Librarian) initSkills() {
 	l.skills = skills.NewRegistry()
 
+	// Register skills BEFORE creating the loader. NewLoader calls
+	// loadCoreSkills() immediately, which loads by name from the registry.
+	// If skills aren't registered yet, the load silently fails and
+	// buildToolDefinitions() returns nil — the LLM never sees tool
+	// definitions and outputs tool calls as text instead of structured calls.
+	l.registerCoreSkills()
+
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = []string{
-		"search_codebase", "find_pattern", "locate_symbol",
-		"read_file", "glob", "grep", "git", "lsp", "ast_grep_search",
+		"search_codebase", "find_pattern",
+		"read_file", "glob", "grep",
 	}
-	loaderCfg.AutoLoadDomains = []string{"code", "search", "filesystem", "git_read", "lsp", "ast"}
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	l.skillLoader = skills.NewLoader(l.skills, loaderCfg)
-
-	l.registerCoreSkills()
 }
 
 // Close closes the librarian and its resources.
 func (l *Librarian) Close() error {
 	l.Stop()
+	if l.cloneStore != nil {
+		l.cloneStore.Close()
+	}
+	l.mu.Lock()
+	svfs := l.sessionVFS
+	l.sessionVFS = nil
+	l.mu.Unlock()
+	if svfs != nil {
+		svfs.Close()
+	}
 	return nil
 }
 
@@ -238,35 +265,33 @@ func (l *Librarian) getProvider() LibrarianProvider {
 	return l.provider
 }
 
-// SetProviderWrapper stores a callback that re-applies gateway rate limiting
-// to fresh providers created during credential refresh.
-func (l *Librarian) SetProviderWrapper(w gateway.ProviderWrapper) {
-	l.providerWrapper = w
+// SetProviderRefresher stores a callback that creates a fresh provider for
+// the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (l *Librarian) SetProviderRefresher(fn container.ProviderRefresher) {
+	l.providerMu.Lock()
+	defer l.providerMu.Unlock()
+	l.refresher = fn
 }
 
 // ProviderType implements container.AuthRefreshable.
-func (l *Librarian) ProviderType() string { return "anthropic" }
+func (l *Librarian) ProviderType() string {
+	return string(container.ProviderForModel(l.CurrentModel()))
+}
 
 // RefreshProvider implements container.AuthRefreshable.
-// Re-resolves Anthropic credentials and replaces the provider.
 func (l *Librarian) RefreshProvider(ctx context.Context, authMethod string) error {
-	cfg := providers.AnthropicConfig{
-		BaseConfig: providers.BaseConfig{
-			Model:     l.CurrentModel(),
-			MaxTokens: l.config.MaxTokens,
-		},
-		AuthMode: authMethod,
+	l.providerMu.RLock()
+	fn := l.refresher
+	l.providerMu.RUnlock()
+	if fn == nil {
+		return nil
 	}
-	p, err := providers.NewAnthropicProvider(ctx, cfg)
+	p, err := fn(ctx, l.CurrentModel(), authMethod)
 	if err != nil {
 		return fmt.Errorf("librarian refresh provider: %w", err)
 	}
-	var wrapped LibrarianProvider = p
-	if l.providerWrapper != nil {
-		wrapped = l.providerWrapper(p)
-	}
-	l.SetProvider(wrapped)
-	l.logger.Info("provider refreshed", "auth_method", authMethod)
+	l.SetProvider(p)
+	l.logger.Info("provider refreshed", "model", l.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 
@@ -462,7 +487,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	startTime := time.Now()
 
 	// Wire tool call emitter for inline visualization.
-	emitter := shared.NewToolCallEmitter(l.bus, l.channels, "librarian", fwd.CorrelationID, fwd.SourceAgentID)
+	emitter := shared.NewToolCallEmitter(l.bus, l.channels, l.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -487,8 +512,8 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "librarian",
-		RespondingAgentName: "librarian",
+		RespondingAgentID:   l.id,
+		RespondingAgentName: "Librarian",
 		ProcessingTime:      time.Since(startTime),
 	}
 
@@ -510,7 +535,11 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
-	l.publishActivity(events.EventTypeAgentAction, "Search task completed")
+	l.publishActivity(events.EventTypeSuccess, "Search task completed")
+
+	if l.agentPod != nil {
+		l.agentPod.FeedScribe("librarian", fwd.Input, fmt.Sprintf("%v", result), fwd.CorrelationID)
+	}
 
 	respMsg := guide.NewResponseMessage(l.generateMessageID(), resp)
 	return l.bus.Publish(l.channels.Responses, respMsg)
@@ -571,6 +600,13 @@ func (l *Librarian) handleBusResponse(msg *guide.Message) error {
 func (l *Librarian) handleRegistryAnnouncement(msg *guide.Message) error {
 	ann, ok := msg.GetAgentAnnouncement()
 	if !ok {
+		return nil
+	}
+
+	// Skip self-announcements — the librarian must not register itself
+	// in its own known-agents map. Self-registration causes incorrect
+	// routing feedback and inflates the agent panel.
+	if ann.AgentID == l.id || ann.AgentType == "librarian" {
 		return nil
 	}
 
@@ -811,6 +847,17 @@ func (l *Librarian) Terminate(_ context.Context) error {
 	return l.Stop()
 }
 
+// SetSessionVFS wires the librarian's clone store to the session VFS for
+// versioned, in-memory clone ingestion with WAL-backed disk flush.
+func (l *Librarian) SetSessionVFS(svfs *versioning.SessionVFS) {
+	l.mu.Lock()
+	l.sessionVFS = svfs
+	l.mu.Unlock()
+	if l.cloneStore != nil {
+		l.cloneStore.SetSessionVFS(svfs)
+	}
+}
+
 // SetKnowledgeStore wires the librarian to the progressive knowledge store.
 // The coordinator is used eagerly — if boot already completed, its searchers
 // are already set and the librarian starts fully operational.
@@ -835,6 +882,11 @@ func (l *Librarian) handleKnowledgeReady(msg *guide.Message) error {
 	l.publishSystemEvent(events.EventTypeAgentAction,
 		fmt.Sprintf("knowledge ready: searchers %v", payload.Searchers))
 	return nil
+}
+
+// SetAgentPod injects the agent pod for Scribe feed integration.
+func (l *Librarian) SetAgentPod(pod *shared.AgentPod) {
+	l.agentPod = pod
 }
 
 // SetHandoffBridge assigns the handoff bridge for this agent.

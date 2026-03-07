@@ -637,7 +637,7 @@ type TesterConfig struct {
 // DefaultTesterConfig returns the default configuration.
 func DefaultTesterConfig() TesterConfig {
 	return TesterConfig{
-		Model:                  "codex-5.2",
+		Model:                  "gpt-5.4-pro",
 		DefaultTimeout:         30 * time.Second,
 		CoverageThreshold:      80.0,
 		MutationScoreThreshold: 70.0,

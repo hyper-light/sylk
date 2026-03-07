@@ -16,7 +16,7 @@ type orchestratorConversationRequest struct {
 	Tasks         []taskSnap
 	Health        healthSnap
 	Alerts        []alertSnap
-	DAGs          []dagSnap
+	DAGs          []DAGSnap
 	Stats         snapshotStats
 	History       []guide.ConversationTurn
 	OnChunk       func(string)
@@ -39,7 +39,7 @@ func (o *Orchestrator) buildConversationRequest(req *guide.ForwardedRequest) orc
 		Failed:    o.state.Stats.FailedTasks,
 		Submitted: o.state.Stats.EventsSubmitted,
 	}
-	var dags []dagSnap
+	var dags []DAGSnap
 	if o.dagBridge != nil {
 		dags = o.dagBridge.DAGSnapshots(snapshotMaxDAGs)
 	}

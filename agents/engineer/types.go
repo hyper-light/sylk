@@ -154,7 +154,7 @@ func DefaultApprovedPatterns() ApprovedCommandPatterns {
 
 // EngineerConfig contains configuration options for the Engineer agent.
 type EngineerConfig struct {
-	// Model is the AI model to use (default: gpt-5.3-codex).
+	// Model is the AI model to use (default: gpt-5.4-pro).
 	Model string `json:"model"`
 	// ReasoningEffort controls the model's reasoning depth (default: xhigh).
 	ReasoningEffort string `json:"reasoning_effort"`

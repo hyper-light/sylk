@@ -20,7 +20,7 @@ func TestConcurrency_ParallelReads(t *testing.T) {
 
 	// Pre-populate store
 	for i := 0; i < 100; i++ {
-		store.InsertEntry(makeEntry(CategoryGeneral, fmt.Sprintf("Content %d", i), SourceModelClaudeOpus45))
+		store.InsertEntry(makeEntry(CategoryGeneral, fmt.Sprintf("Content %d", i), SourceModelClaudeOpus))
 	}
 
 	var readCount atomic.Int64
@@ -49,7 +49,7 @@ func TestConcurrency_ParallelWrites(t *testing.T) {
 			_, err := store.InsertEntry(makeEntry(
 				CategoryGeneral,
 				fmt.Sprintf("Content from goroutine %d, item %d", goroutine, j),
-				SourceModelClaudeOpus45,
+				SourceModelClaudeOpus,
 			))
 			if err == nil {
 				writeCount.Add(1)
@@ -68,7 +68,7 @@ func TestConcurrency_ReadDuringWrite(t *testing.T) {
 
 	// Pre-populate
 	for i := 0; i < 50; i++ {
-		store.InsertEntry(makeEntry(CategoryGeneral, "Initial content", SourceModelClaudeOpus45))
+		store.InsertEntry(makeEntry(CategoryGeneral, "Initial content", SourceModelClaudeOpus))
 	}
 
 	var wg sync.WaitGroup
@@ -83,7 +83,7 @@ func TestConcurrency_ReadDuringWrite(t *testing.T) {
 			case <-done:
 				return
 			default:
-				store.InsertEntry(makeEntry(CategoryGeneral, "New content", SourceModelClaudeOpus45))
+				store.InsertEntry(makeEntry(CategoryGeneral, "New content", SourceModelClaudeOpus))
 			}
 		}
 	}()
@@ -130,7 +130,7 @@ func TestConcurrency_RegistryContention(t *testing.T) {
 					fmt.Sprintf("agent-%d-%d", idx, j),
 					"session-1",
 					"",
-					SourceModelClaudeOpus45,
+					SourceModelClaudeOpus,
 				)
 				if err == nil {
 					registerCount.Add(1)
@@ -246,7 +246,7 @@ func launchStoreOps(wg *sync.WaitGroup, store *Store) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45))
+			store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus))
 			store.Query(ArchiveQuery{Limit: 5})
 			store.Stats()
 		}
@@ -258,7 +258,7 @@ func launchRegistryOps(wg *sync.WaitGroup, registry *Registry) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
-			agent, _ := registry.Register(fmt.Sprintf("agent-%d", i), "session-1", "", SourceModelClaudeOpus45)
+			agent, _ := registry.Register(fmt.Sprintf("agent-%d", i), "session-1", "", SourceModelClaudeOpus)
 			if agent != nil {
 				registry.Touch(agent.ID)
 				registry.Get(agent.ID)
@@ -297,7 +297,7 @@ func launchAgentContextOps(wg *sync.WaitGroup, agentCtx *AgentContext) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			agentCtx.RecordFileRead("/path/"+string(rune('0'+i%10)), "Summary", SourceModelClaudeOpus45)
+			agentCtx.RecordFileRead("/path/"+string(rune('0'+i%10)), "Summary", SourceModelClaudeOpus)
 			agentCtx.GetAllFiles()
 			agentCtx.GetAgentBriefing()
 		}
@@ -331,7 +331,7 @@ func TestConcurrency_RaceDetection(t *testing.T) {
 				fmt.Sprintf("agent-%d", goroutine),
 				"session-1",
 				"",
-				SourceModelClaudeOpus45,
+				SourceModelClaudeOpus,
 			)
 			if err != nil {
 				return
@@ -340,7 +340,7 @@ func TestConcurrency_RaceDetection(t *testing.T) {
 			// Perform operations
 			for j := 0; j < 50; j++ {
 				// Write
-				store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45))
+				store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus))
 
 				// Read
 				store.Query(ArchiveQuery{Limit: 5})
@@ -369,7 +369,7 @@ func TestConcurrency_SimultaneousFileModifications(t *testing.T) {
 	// Register agents
 	var agents []*RegisteredAgent
 	for i := 0; i < 10; i++ {
-		agent, _ := registry.Register(fmt.Sprintf("agent-%d", i), "session-1", "", SourceModelClaudeOpus45)
+		agent, _ := registry.Register(fmt.Sprintf("agent-%d", i), "session-1", "", SourceModelClaudeOpus)
 		agents = append(agents, agent)
 	}
 

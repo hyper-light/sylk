@@ -44,11 +44,24 @@ func (o *Orchestrator) registerCoreSkills() {
 	// Diagnostics
 	o.skills.Register(shared.NewSelfDiagnosticSkill(&orchestratorDiag{o: o}))
 
-	for _, name := range orchestratorCoreSkillNames() {
+	for _, name := range orchestratorPinnedSkillNames() {
 		o.skills.Load(name)
 	}
 }
 
+// orchestratorPinnedSkillNames returns the minimal set of skills always loaded
+// in the tool definition payload. Remaining skills are loaded progressively via
+// LoadForInput keyword matching and demand-paged via the safety hook.
+func orchestratorPinnedSkillNames() []string {
+	return []string{
+		"query_task", "query_workflow", "push_status",
+		"ingest_plan", "execute_dag",
+		"escalate_to_architect",
+	}
+}
+
+// orchestratorCoreSkillNames returns all orchestrator-domain skills.
+// Used for safety hook allowlisting.
 func orchestratorCoreSkillNames() []string {
 	return []string{
 		"query_task", "query_workflow", "push_status",

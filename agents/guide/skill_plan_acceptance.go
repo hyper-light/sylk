@@ -122,6 +122,7 @@ func (g *Guide) evaluatePlanAcceptance(ctx context.Context, input planAcceptance
 		MaxTokens:    planAcceptanceMaxTokens,
 		Model:        model,
 	}
+	g.applyPlanAcceptanceRuntimeProfile(req)
 
 	resp, err := provider.Complete(ctx, req)
 	if err != nil {

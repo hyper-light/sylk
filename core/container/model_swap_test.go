@@ -31,31 +31,31 @@ var _ ModelSwappable = (*mockSwappableAgent)(nil)
 func TestModelSwappableInterface(t *testing.T) {
 	agent := &mockSwappableAgent{
 		mockAgent: mockAgent{id: "test", agentType: "engineer"},
-		model:     "gpt-5.3-codex",
+		model:     "gpt-5.4-pro",
 		models: []ModelOption{
-			{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
-			{ID: "gpt-5.2-codex", DisplayName: "GPT-5.2 Codex"},
+			{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
+			{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
 		},
 	}
 
-	if got := agent.CurrentModel(); got != "gpt-5.3-codex" {
-		t.Errorf("CurrentModel() = %q, want gpt-5.3-codex", got)
+	if got := agent.CurrentModel(); got != "gpt-5.4-pro" {
+		t.Errorf("CurrentModel() = %q, want gpt-5.4-pro", got)
 	}
 
-	if err := agent.SwapModel(context.Background(), "gpt-5.2-codex", nil); err != nil {
+	if err := agent.SwapModel(context.Background(), "claude-opus-4-6", nil); err != nil {
 		t.Fatalf("SwapModel error: %v", err)
 	}
 
-	if got := agent.CurrentModel(); got != "gpt-5.2-codex" {
-		t.Errorf("CurrentModel() after swap = %q, want gpt-5.2-codex", got)
+	if got := agent.CurrentModel(); got != "claude-opus-4-6" {
+		t.Errorf("CurrentModel() after swap = %q, want claude-opus-4-6", got)
 	}
 
 	models := agent.SupportedModels()
 	if len(models) != 2 {
 		t.Fatalf("SupportedModels() len = %d, want 2", len(models))
 	}
-	if models[0].ID != "gpt-5.3-codex" {
-		t.Errorf("SupportedModels()[0].ID = %q, want gpt-5.3-codex", models[0].ID)
+	if models[0].ID != "gpt-5.4-pro" {
+		t.Errorf("SupportedModels()[0].ID = %q, want gpt-5.4-pro", models[0].ID)
 	}
 }
 
@@ -63,7 +63,7 @@ func TestBuildModelSwapper_FindsAgent(t *testing.T) {
 	reg := NewContainerRegistry()
 	agent := &mockSwappableAgent{
 		mockAgent: mockAgent{id: "eng-1", agentType: "engineer"},
-		model:     "gpt-5.3-codex",
+		model:     "gpt-5.4-pro",
 	}
 	c := testContainerWithID(t, "eng-1", "engineer", nil)
 	// Replace the mock agent with our swappable one.
@@ -79,11 +79,11 @@ func TestBuildModelSwapper_FindsAgent(t *testing.T) {
 		if !ok {
 			t.Fatal("agent does not implement ModelSwappable")
 		}
-		if err := swappable.SwapModel(context.Background(), "gpt-5.2-codex", nil); err != nil {
+		if err := swappable.SwapModel(context.Background(), "claude-opus-4-6", nil); err != nil {
 			t.Fatalf("SwapModel: %v", err)
 		}
-		if got := swappable.CurrentModel(); got != "gpt-5.2-codex" {
-			t.Errorf("CurrentModel() = %q, want gpt-5.2-codex", got)
+		if got := swappable.CurrentModel(); got != "claude-opus-4-6" {
+			t.Errorf("CurrentModel() = %q, want claude-opus-4-6", got)
 		}
 		return
 	}
@@ -99,8 +99,7 @@ func TestProviderForModel(t *testing.T) {
 		{"claude-sonnet-4-6", ProviderAnthropic},
 		{"gemini-3.1-pro-preview", ProviderGoogle},
 		{"gemini-3-flash-preview", ProviderGoogle},
-		{"gpt-5.3-codex", ProviderOpenAI},
-		{"gpt-5.2-codex", ProviderOpenAI},
+		{"gpt-5.4-pro", ProviderOpenAI},
 		{"unknown-model", ""},
 	}
 	for _, tc := range cases {

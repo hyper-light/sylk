@@ -90,7 +90,7 @@ func TestRenderModelSelector(t *testing.T) {
 	sel := modelSelector{}
 
 	output := renderModelSelector(models, 0, 40, sel, th)
-	if !strings.Contains(output, "GPT-5.3 Codex") {
+	if !strings.Contains(output, "GPT-5.4 Pro") {
 		t.Errorf("renderModelSelector missing model name, got %q", output)
 	}
 	if !strings.Contains(output, theme.IconArrowLeft) {
@@ -219,14 +219,14 @@ func TestSelectorInAllViews(t *testing.T) {
 
 	// Selector rendered via RenderSelectorLine (app.go appends it to the left panel).
 	sel := m.RenderSelectorLine()
-	if !strings.Contains(sel, "GPT-5.3 Codex") {
+	if !strings.Contains(sel, "GPT-5.4 Pro") {
 		t.Error("list view: RenderSelectorLine missing model name")
 	}
 
 	// Expanded view — selector line still works.
 	m.enterExpanded()
 	sel = m.RenderSelectorLine()
-	if !strings.Contains(sel, "GPT-5.3 Codex") {
+	if !strings.Contains(sel, "GPT-5.4 Pro") {
 		t.Error("expanded view: RenderSelectorLine missing model name")
 	}
 }
@@ -290,10 +290,10 @@ func TestSelectorDisabledForSingleModel(t *testing.T) {
 func TestDefaultModelForAgentType(t *testing.T) {
 	cases := map[string]string{
 		"guide":        "gemini-3.1-pro-preview",
-		"engineer":     "gpt-5.3-codex",
+		"engineer":     "gpt-5.4-pro",
 		"designer":     "gemini-3.1-pro-preview",
-		"inspector":    "gpt-5.3-codex",
-		"tester":       "gpt-5.3-codex",
+		"inspector":    "gpt-5.4-pro",
+		"tester":       "gpt-5.4-pro",
 		"orchestrator": "gemini-3.1-pro-preview",
 		"architect":    "claude-opus-4-6",
 	}
@@ -317,8 +317,8 @@ func TestSeedAgentSetsModelID(t *testing.T) {
 	if agent == nil {
 		t.Fatal("seeded agent not found")
 	}
-	if agent.ModelID != "gpt-5.3-codex" {
-		t.Errorf("seeded agent ModelID = %q, want gpt-5.3-codex", agent.ModelID)
+	if agent.ModelID != "gpt-5.4-pro" {
+		t.Errorf("seeded agent ModelID = %q, want gpt-5.4-pro", agent.ModelID)
 	}
 	if agent.ProviderID != "openai" {
 		t.Errorf("seeded agent ProviderID = %q, want openai", agent.ProviderID)
@@ -358,7 +358,7 @@ func TestSeedAgentWithSupportedModels(t *testing.T) {
 func TestSeedAgentWithPersistedModel(t *testing.T) {
 	m := New(theme.DefaultDark())
 	// Seed engineer with a persisted model+provider that exists in the static table.
-	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "gpt-5.2-codex", "openai")
+	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "gpt-5.4-pro", "openai")
 
 	agent := m.agents["eng-1"]
 	if agent == nil {
@@ -366,8 +366,8 @@ func TestSeedAgentWithPersistedModel(t *testing.T) {
 	}
 
 	// Persisted model is in the engineer's static model table → should be used.
-	if agent.ModelID != "gpt-5.2-codex" {
-		t.Errorf("ModelID = %q, want gpt-5.2-codex", agent.ModelID)
+	if agent.ModelID != "gpt-5.4-pro" {
+		t.Errorf("ModelID = %q, want gpt-5.4-pro", agent.ModelID)
 	}
 	if agent.ProviderID != "openai" {
 		t.Errorf("ProviderID = %q, want openai", agent.ProviderID)
@@ -399,15 +399,15 @@ func TestSeedAgentWithInvalidPersistedModel(t *testing.T) {
 	}
 
 	// Invalid persisted model → falls back to default.
-	if agent.ModelID != "gpt-5.3-codex" {
-		t.Errorf("ModelID = %q, want gpt-5.3-codex (default)", agent.ModelID)
+	if agent.ModelID != "gpt-5.4-pro" {
+		t.Errorf("ModelID = %q, want gpt-5.4-pro (default)", agent.ModelID)
 	}
 }
 
 func TestAgentModels_FallbackToStatic(t *testing.T) {
 	agent := &AgentState{AgentType: "engineer"}
 	models := agentModels(agent)
-	if len(models) != 2 || models[0].ID != "gpt-5.3-codex" {
+	if len(models) != 1 || models[0].ID != "gpt-5.4-pro" {
 		t.Errorf("agentModels fallback returned %v, want static engineer models", models)
 	}
 }

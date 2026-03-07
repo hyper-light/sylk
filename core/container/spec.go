@@ -193,6 +193,8 @@ type CapabilitySpec struct {
 	SubscribeTopics []string // Bus topics subscribable
 	PathRead        []string // Paths with read access
 	PathWrite       []string // Paths with write access
+	NetworkEgress   []string // Allowed egress domain patterns (e.g. "*.golang.org", "*")
+	NetworkIngress  []string // Allowed ingress content types (e.g. "text/html", "application/pdf")
 	CanEscalate     bool     // Can request additional capabilities at runtime
 }
 

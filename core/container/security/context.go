@@ -26,6 +26,8 @@ const (
 	ActionSignalReceive
 	ActionSecretAccess
 	ActionEscalate
+	ActionNetworkEgress  // Outbound HTTP/network requests
+	ActionNetworkIngress // Inbound data from external sources
 )
 
 // actionTypeNames maps action types to their string representation.
@@ -39,6 +41,8 @@ var actionTypeNames = map[ActionType]string{
 	ActionSignalReceive: "signal_receive",
 	ActionSecretAccess:  "secret_access",
 	ActionEscalate:      "escalate",
+	ActionNetworkEgress:  "network_egress",
+	ActionNetworkIngress: "network_ingress",
 }
 
 // String returns the string representation of an action type.
@@ -152,6 +156,10 @@ func (sc *SecurityContext) checkCapability(req AuthorizationRequest) (bool, stri
 		return sc.checkSecretAccess(req.Target)
 	case ActionEscalate:
 		return sc.capabilities.CanEscalate(), "escalation_check"
+	case ActionNetworkEgress:
+		return sc.capabilities.CanNetworkEgress(req.Target), "network_egress_check"
+	case ActionNetworkIngress:
+		return sc.capabilities.CanNetworkIngress(req.Target), "network_ingress_check"
 	default:
 		return false, "unknown_action"
 	}

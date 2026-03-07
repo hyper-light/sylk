@@ -3,6 +3,7 @@ package librarian
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -32,21 +33,28 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 		return nil, fmt.Errorf("librarian search failed: %w", err)
 	}
 
-	return map[string]any{
-		"type":    "conversation",
-		"content": result,
-	}, nil
+	// The tool loop must produce a non-empty response. An empty string
+	// propagates as a silent no-output to the user, which violates the
+	// librarian's contract of always providing a substantive answer.
+	if strings.TrimSpace(result) == "" {
+		return nil, fmt.Errorf("librarian: generated empty response for query %q", fwd.Input)
+	}
+
+	return result, nil
 }
 
 // buildLLMRequest constructs a providers.Request for the tool loop.
 func (l *Librarian) buildLLMRequest(fwd *guide.ForwardedRequest) *providers.Request {
-	return &providers.Request{
+	l.prepareSkillsForInput(fwd.Input)
+	req := &providers.Request{
 		SystemPrompt: l.config.SystemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
 		Tools:        l.buildToolDefinitions(),
 		Model:        l.config.Model,
 		MaxTokens:    l.config.MaxTokens,
 	}
+	l.applyConversationRuntimeProfile(req)
+	return req
 }
 
 // processViaIntentDispatch is the legacy path that routes by intent without LLM.
@@ -64,6 +72,8 @@ func (l *Librarian) intentHandler(intent guide.Intent) (forwardedHandler, error)
 	switch intent {
 	case guide.IntentFind, guide.IntentSearch, guide.IntentLocate:
 		return l.handleSearch, nil
+	case guide.IntentFetch:
+		return l.handleFetch, nil
 	case guide.IntentRecall:
 		return l.handleRecall, nil
 	case guide.IntentCheck:
@@ -73,6 +83,13 @@ func (l *Librarian) intentHandler(intent guide.Intent) (forwardedHandler, error)
 	default:
 		return nil, fmt.Errorf("unsupported intent: %s", intent)
 	}
+}
+
+// handleFetch processes fetch/clone requests when LLM is disabled.
+// Extracts a URL from the input and clones it. When LLM is enabled,
+// this path is not used — the LLM drives clone_repository via tool loop.
+func (l *Librarian) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	return l.executeClone(ctx, fwd.Input, "")
 }
 
 // =============================================================================
@@ -153,9 +170,9 @@ func (l *Librarian) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 func (l *Librarian) handleHelp(_ context.Context, _ *guide.ForwardedRequest) (any, error) {
 	return map[string]any{
 		"agent":              "librarian",
-		"description":        "Code and file search across the local workspace.",
-		"supported_intents":  []guide.Intent{guide.IntentFind, guide.IntentSearch, guide.IntentLocate, guide.IntentRecall, guide.IntentCheck, guide.IntentHelp},
+		"description":        "Code and file search across the local workspace and cloned remote packages.",
+		"supported_intents":  []guide.Intent{guide.IntentFind, guide.IntentSearch, guide.IntentLocate, guide.IntentFetch, guide.IntentRecall, guide.IntentCheck, guide.IntentHelp},
 		"supported_domains":  []guide.Domain{guide.DomainCode},
-		"recommended_routes": []string{"@librarian:find:code", "@librarian:search:code", "@librarian:locate:code"},
+		"recommended_routes": []string{"@librarian:find:code", "@librarian:search:code", "@librarian:locate:code", "@librarian:fetch:code"},
 	}, nil
 }

@@ -368,12 +368,13 @@ type AppModel struct {
 	overlay            overlayState
 
 	// Bridges
-	activityBridge *bridge.ActivityBridge
-	sessionBridge  *bridge.SessionBridge
-	streamBridge   *bridge.StreamBridge
-	guideBridge    *bridge.GuideBridge
-	lspBridge      *bridge.LSPBridge
-	pipelineBridge *bridge.PipelineBridge
+	activityBridge   *bridge.ActivityBridge
+	tokenUsageBridge *bridge.TokenUsageBridge
+	sessionBridge    *bridge.SessionBridge
+	streamBridge     *bridge.StreamBridge
+	guideBridge      *bridge.GuideBridge
+	lspBridge        *bridge.LSPBridge
+	pipelineBridge   *bridge.PipelineBridge
 
 	// LSP
 	lspManager    *lsp.Manager
@@ -619,12 +620,21 @@ type AppModel struct {
 	promptQueue   queue.Queue
 	queueGradient *theme.Gradient
 
-	// Cumulative token counters for the status bar display.
+	// Cumulative token counters for the status bar display (guide-only,
+	// from StreamCompleteMsg — kept for streaming animation).
 	totalPromptTokens     int
 	totalCompletionTokens int
 	totalCacheReadTokens  int
 	totalCacheWriteTokens int
 	totalReasoningTokens  int
+
+	// Bus-sourced token counters: accumulated from TokenUsageMsg which
+	// captures ALL agent LLM calls (guide, engineer, architect, etc.).
+	busInputTokens      int
+	busOutputTokens     int
+	busCacheReadTokens  int
+	busCacheWriteTokens int
+	busReasoningTokens  int
 
 	// TUI-local WAL logger for suppressed/non-UI operational errors.
 	walLogger *slog.Logger
@@ -817,6 +827,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 			nil, // clipboard — wired after construction (needs m.clipboard)
 		),
 		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.GuideBus),
+		tokenUsageBridge:       bridge.NewTokenUsageBridge("tui.token_usage", deps.GuideBus),
 		sessionBridge:          bridge.NewSessionBridge(deps.SessionManager, deps.Scope),
 		streamBridge:           bridge.NewStreamBridge(deps.Scope),
 		guideBridge:            bridge.NewGuideBridge(deps.GuideBus, deps.Scope, "default"),
@@ -2255,6 +2266,14 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, m.propagate(typed)
+	case msg.TokenUsageMsg:
+		m.busInputTokens += typed.InputTokens
+		m.busOutputTokens += typed.OutputTokens
+		m.busCacheReadTokens += typed.CacheReadTokens
+		m.busCacheWriteTokens += typed.CacheWriteTokens
+		m.busReasoningTokens += typed.ReasoningTokens
+		m.updateTokenDisplay()
+		return m, nil
 	case modal.ModalClosedMsg:
 		return m, m.handleModalClosed(typed.Result)
 	case msg.LSPDiagnosticMsg:
@@ -2454,6 +2473,7 @@ func (m *AppModel) View() string {
 func (m *AppModel) Shutdown() error {
 	m.cancel() // Cancel all in-flight Cmd contexts first.
 	m.activityBridge.Stop()
+	m.tokenUsageBridge.Stop()
 	m.sessionBridge.Stop()
 	m.streamBridge.Stop()
 	m.guideBridge.Stop()
@@ -5767,7 +5787,13 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 	delete(m.interruptedCorrelations, streamErr.CorrelationID)
 	m.finalizeStreamUsage(streamErr.CorrelationID, false, summary)
 	m.markQueueEntryByCorrelation(streamErr.CorrelationID, false)
+	// Resolve the responding agent before unregistering the stream (which
+	// removes the correlation→agent mapping).
+	errorAgentID := m.streamAgentID(streamErr.CorrelationID)
 	m.unregisterStream(streamErr.CorrelationID)
+	// The stream is over — demote the responding agent so its panel card
+	// transitions from working (Thinking/Acting) back to Idle. For terminal
+	// errors demote all active agents and pause the queue.
 	if isTerminalStreamError(streamErr.Err) {
 		m.agentPanel.DemoteAllActive()
 		// Pause the queue on terminal errors to prevent blindly dispatching
@@ -5775,6 +5801,8 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 		m.promptQueue.SetPaused(true)
 		m.recalcLayout()
 		m.viewDirty = true
+	} else {
+		m.agentPanel.DemoteAgent(errorAgentID)
 	}
 	if advCmd := m.tryAdvanceQueue(); advCmd != nil {
 		return tea.Batch(m.propagate(streamErr), advCmd)
@@ -6030,11 +6058,12 @@ func (m *AppModel) applyRealStreamUsage(done msg.StreamCompleteMsg) {
 }
 
 // updateTokenDisplay pushes cumulative token counts to the status bar.
+// Uses bus-sourced totals (all agents) rather than guide-only stream totals.
 func (m *AppModel) updateTokenDisplay() {
 	if m.statusBar == nil {
 		return
 	}
-	m.statusBar.SetTokens(m.totalPromptTokens, m.totalCompletionTokens, m.totalCacheReadTokens, m.totalReasoningTokens)
+	m.statusBar.SetTokens(m.busInputTokens, m.busOutputTokens, m.busCacheReadTokens, m.busReasoningTokens)
 }
 
 func normalizeAgentID(raw string) string {
@@ -6053,7 +6082,7 @@ func (m *AppModel) publishStreamActivity(agentID string, success bool, summary s
 	if m.deps.ActivityPub == nil {
 		return
 	}
-	id, name, agentType := resolveAgentIdentity(agentID, "")
+	id, name, agentType := m.resolveAgentIdentity(agentID, "")
 	eventType := events.EventTypeLLMResponse
 	outcome := events.OutcomeSuccess
 	content := "Streaming response complete"
@@ -6084,7 +6113,7 @@ func (m *AppModel) publishStreamStartActivity(agentID string) {
 	if m.deps.ActivityPub == nil {
 		return
 	}
-	id, name, agentType := resolveAgentIdentity(agentID, "")
+	id, name, agentType := m.resolveAgentIdentity(agentID, "")
 	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: events.EventTypeLLMRequest,
@@ -6162,7 +6191,7 @@ func (m *AppModel) publishResponseActivity(
 	if m.deps.ActivityPub == nil {
 		return
 	}
-	agentID, agentName, agentType := resolveAgentIdentity(r.AgentID, r.AgentName)
+	agentID, agentName, agentType := m.resolveAgentIdentity(r.AgentID, r.AgentName)
 	outcome := events.OutcomeSuccess
 	eventType := events.EventTypeLLMResponse
 	if source == chat.SourceError {
@@ -6184,7 +6213,11 @@ func (m *AppModel) publishResponseActivity(
 	})
 }
 
-func resolveAgentIdentity(agentID, agentName string) (string, string, string) {
+// resolveAgentIdentity resolves the canonical agent ID, display name, and
+// agent type from a response message. The type is resolved from the agent
+// panel's state (populated by prior activity events from the agent itself)
+// rather than parsed from the ID string — agent IDs are opaque UUIDs.
+func (m *AppModel) resolveAgentIdentity(agentID, agentName string) (string, string, string) {
 	id := strings.TrimSpace(agentID)
 	name := strings.TrimSpace(agentName)
 	if id == "" {
@@ -6196,9 +6229,12 @@ func resolveAgentIdentity(agentID, agentName string) (string, string, string) {
 	if name == "" {
 		name = id
 	}
-	agentType := strings.ToLower(id)
 	if strings.EqualFold(id, guideAgentID) {
 		return guideAgentID, guideAgentName, guideAgentType
+	}
+	agentType := m.agentPanel.AgentTypeOf(id)
+	if agentType == "" {
+		agentType = strings.ToLower(name)
 	}
 	return id, name, agentType
 }
@@ -14110,6 +14146,7 @@ type bridgeReadyMsg struct{}
 func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 	bridges := []bridge.Bridge{
 		m.activityBridge,
+		m.tokenUsageBridge,
 		m.sessionBridge,
 		m.streamBridge,
 		m.guideBridge,
@@ -14213,12 +14250,18 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 	promptEstimate := estimateGuideTokens(submit.Text) + guideRouteOverheadTokens
 	contextUsage := m.bumpAgentContextUsage(guideAgentID, promptEstimate)
 	m.statusBar.SetTokenPhase(status.PhaseInput)
-	m.publishGuideActivity(
-		events.EventTypeLLMRequest,
-		events.OutcomePending,
-		"Classifying and routing request",
-		contextUsage,
-	)
+	// Only attribute routing activity to the Guide when it will actually
+	// perform LLM classification. Explicit targets bypass the classifier —
+	// publishing Guide activity here falsely sets the Guide to
+	// StatusThinking in the agent panel.
+	if targetAgent == "" {
+		m.publishGuideActivity(
+			events.EventTypeLLMRequest,
+			events.OutcomePending,
+			"Classifying and routing request",
+			contextUsage,
+		)
+	}
 
 	req := &guide.RouteRequest{
 		CorrelationID:  uuid.New().String(),

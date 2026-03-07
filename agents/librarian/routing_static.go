@@ -31,6 +31,12 @@ func LibrarianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				DefaultIntent: guide.IntentLocate,
 				DefaultDomain: guide.DomainCode,
 			},
+			{
+				Name:          "clone",
+				Description:   "Clone a remote repository for local code analysis",
+				DefaultIntent: guide.IntentFetch,
+				DefaultDomain: guide.DomainCode,
+			},
 		},
 
 		Triggers: guide.AgentTriggers{
@@ -49,6 +55,12 @@ func LibrarianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				"linter",
 				"formatter",
 				"test framework",
+				"clone",
+				"clone repo",
+				"fetch repo",
+				"fetch package",
+				"download repo",
+				"git clone",
 			},
 			WeakTriggers: []string{
 				"code",
@@ -57,6 +69,8 @@ func LibrarianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				"class",
 				"method",
 				"symbol",
+				"repository",
+				"package",
 			},
 			IntentTriggers: map[guide.Intent][]string{
 				guide.IntentFind: {
@@ -78,6 +92,14 @@ func LibrarianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 					"references",
 					"implementations",
 				},
+				guide.IntentFetch: {
+					"clone",
+					"fetch repo",
+					"fetch package",
+					"download repo",
+					"git clone",
+					"pull repo",
+				},
 			},
 		},
 
@@ -90,6 +112,7 @@ func LibrarianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 					guide.IntentFind,
 					guide.IntentSearch,
 					guide.IntentLocate,
+					guide.IntentFetch,
 					guide.IntentRecall,
 					guide.IntentCheck,
 					guide.IntentHelp,
@@ -97,11 +120,12 @@ func LibrarianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				Domains: []guide.Domain{
 					guide.DomainCode,
 				},
-				Tags: []string{"search", "code", "patterns", "symbols", "tooling"},
+				Tags: []string{"search", "code", "patterns", "symbols", "tooling", "clone", "packages"},
 				Keywords: []string{
 					"find", "search", "locate", "grep", "pattern",
 					"symbol", "definition", "reference", "usage",
 					"linter", "formatter", "test", "tooling",
+					"clone", "fetch", "download", "repository", "package",
 				},
 				Priority: 80,
 			},

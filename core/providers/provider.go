@@ -49,16 +49,21 @@ type StreamHandler func(chunk *StreamChunk) error
 type StreamRequest = Request
 
 type Request struct {
-	Messages        []Message      `json:"messages"`
-	Model           string         `json:"model,omitempty"`
-	MaxTokens       int            `json:"max_tokens,omitempty"`
-	Temperature     *float64       `json:"temperature,omitempty"`
-	TopP            *float64       `json:"top_p,omitempty"`
-	StopSequences   []string       `json:"stop_sequences,omitempty"`
-	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
-	SystemPrompt    string         `json:"system_prompt,omitempty"`
-	Tools           []Tool         `json:"tools,omitempty"`
-	Metadata        map[string]any `json:"metadata,omitempty"`
+	Messages             []Message      `json:"messages"`
+	Model                string         `json:"model,omitempty"`
+	MaxTokens            int            `json:"max_tokens,omitempty"`
+	Temperature          *float64       `json:"temperature,omitempty"`
+	TopP                 *float64       `json:"top_p,omitempty"`
+	StopSequences        []string       `json:"stop_sequences,omitempty"`
+	ReasoningEffort      string         `json:"reasoning_effort,omitempty"`
+	ReasoningSummary     string         `json:"reasoning_summary,omitempty"`
+	Verbosity            string         `json:"verbosity,omitempty"`
+	PromptCacheKey       string         `json:"prompt_cache_key,omitempty"`
+	PromptCacheRetention string         `json:"prompt_cache_retention,omitempty"`
+	ParallelToolCalls    *bool          `json:"parallel_tool_calls,omitempty"`
+	SystemPrompt         string         `json:"system_prompt,omitempty"`
+	Tools                []Tool         `json:"tools,omitempty"`
+	Metadata             map[string]any `json:"metadata,omitempty"`
 
 	// ToolChoice controls function-calling behavior when Tools are present.
 	// Supported values (provider-agnostic):

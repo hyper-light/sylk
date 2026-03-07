@@ -16,7 +16,7 @@ import (
 func TestStore_InsertEntry(t *testing.T) {
 	store := newTestStore(t)
 
-	entry := makeEntry(CategoryInsight, "Test insight content", SourceModelClaudeOpus45)
+	entry := makeEntry(CategoryInsight, "Test insight content", SourceModelClaudeOpus)
 	id, err := store.InsertEntry(entry)
 
 	require.NoError(t, err, "InsertEntry")
@@ -31,7 +31,7 @@ func TestStore_InsertEntry(t *testing.T) {
 func TestStore_InsertEntry_WithExistingID(t *testing.T) {
 	store := newTestStore(t)
 
-	entry := makeEntry(CategoryInsight, "Test content", SourceModelClaudeOpus45)
+	entry := makeEntry(CategoryInsight, "Test content", SourceModelClaudeOpus)
 	entry.ID = "custom-id-123"
 
 	id, err := store.InsertEntry(entry)
@@ -44,7 +44,7 @@ func TestStore_GetEntry(t *testing.T) {
 	store := newTestStore(t)
 
 	// Insert entry
-	entry := makeEntry(CategoryDecision, "Decision content", SourceModelGPT52Codex)
+	entry := makeEntry(CategoryDecision, "Decision content", SourceModelGPT54Pro)
 	id, _ := store.InsertEntry(entry)
 
 	// Retrieve entry
@@ -53,7 +53,7 @@ func TestStore_GetEntry(t *testing.T) {
 	assert.True(t, found, "Entry should be found")
 	assert.Equal(t, id, retrieved.ID, "Retrieved ID should match")
 	assert.Equal(t, "Decision content", retrieved.Content, "Content should match")
-	assert.Equal(t, SourceModelGPT52Codex, retrieved.Source, "Source should match")
+	assert.Equal(t, SourceModelGPT54Pro, retrieved.Source, "Source should match")
 }
 
 func TestStore_GetEntry_NotFound(t *testing.T) {
@@ -67,7 +67,7 @@ func TestStore_GetEntry_NotFound(t *testing.T) {
 func TestStore_UpdateEntry(t *testing.T) {
 	store := newTestStore(t)
 
-	entry := makeEntry(CategoryIssue, "Original content", SourceModelClaudeOpus45)
+	entry := makeEntry(CategoryIssue, "Original content", SourceModelClaudeOpus)
 	id, _ := store.InsertEntry(entry)
 	originalUpdatedAt := entry.UpdatedAt
 
@@ -100,10 +100,10 @@ func TestStore_Query_ByCategory(t *testing.T) {
 	store := newTestStore(t)
 
 	// Insert entries with different categories
-	store.InsertEntry(makeEntry(CategoryInsight, "Insight 1", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryDecision, "Decision 1", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryInsight, "Insight 2", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryIssue, "Issue 1", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryInsight, "Insight 1", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryDecision, "Decision 1", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryInsight, "Insight 2", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryIssue, "Issue 1", SourceModelClaudeOpus))
 
 	results, err := store.Query(ArchiveQuery{
 		Categories: []Category{CategoryInsight},
@@ -119,32 +119,32 @@ func TestStore_Query_ByCategory(t *testing.T) {
 func TestStore_Query_BySource(t *testing.T) {
 	store := newTestStore(t)
 
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 1", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 2", SourceModelGPT52Codex))
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 3", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 1", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 2", SourceModelGPT54Pro))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 3", SourceModelClaudeOpus))
 
 	results, err := store.Query(ArchiveQuery{
-		Sources: []SourceModel{SourceModelGPT52Codex},
+		Sources: []SourceModel{SourceModelGPT54Pro},
 	})
 
 	require.NoError(t, err, "Query")
 	assert.Len(t, results, 1, "Should find 1 entry from GPT")
-	assert.Equal(t, SourceModelGPT52Codex, results[0].Source, "Source should match")
+	assert.Equal(t, SourceModelGPT54Pro, results[0].Source, "Source should match")
 }
 
 func TestStore_Query_BySessionID(t *testing.T) {
 	store := newTestStore(t)
 
 	// Insert entries in current session
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 1", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 2", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 1", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 2", SourceModelClaudeOpus))
 	currentSessionID := store.GetCurrentSession().ID
 
 	// End session and start new one
 	store.EndSession("Session summary", "Testing")
 
 	// Insert entries in new session
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 3", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 3", SourceModelClaudeOpus))
 
 	// Query for old session
 	results, err := store.Query(ArchiveQuery{
@@ -159,14 +159,14 @@ func TestStore_Query_DateRange(t *testing.T) {
 	store := newTestStore(t)
 
 	// Insert entries
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 1", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 1", SourceModelClaudeOpus))
 	time.Sleep(50 * time.Millisecond)
 
 	midTime := time.Now()
 	time.Sleep(50 * time.Millisecond)
 
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 2", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content 3", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 2", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content 3", SourceModelClaudeOpus))
 
 	// Query for entries after midTime
 	results, err := store.Query(ArchiveQuery{
@@ -180,14 +180,14 @@ func TestStore_Query_DateRange(t *testing.T) {
 func TestStore_Query_Combined(t *testing.T) {
 	store := newTestStore(t)
 
-	store.InsertEntry(makeEntry(CategoryInsight, "Insight from Claude", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryInsight, "Insight from GPT", SourceModelGPT52Codex))
-	store.InsertEntry(makeEntry(CategoryDecision, "Decision from Claude", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryInsight, "Another Claude insight", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryInsight, "Insight from Claude", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryInsight, "Insight from GPT", SourceModelGPT54Pro))
+	store.InsertEntry(makeEntry(CategoryDecision, "Decision from Claude", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryInsight, "Another Claude insight", SourceModelClaudeOpus))
 
 	results, err := store.Query(ArchiveQuery{
 		Categories: []Category{CategoryInsight},
-		Sources:    []SourceModel{SourceModelClaudeOpus45},
+		Sources:    []SourceModel{SourceModelClaudeOpus},
 	})
 
 	require.NoError(t, err, "Query")
@@ -198,7 +198,7 @@ func TestStore_Query_Limit(t *testing.T) {
 	store := newTestStore(t)
 
 	for i := 0; i < 10; i++ {
-		store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45))
+		store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus))
 	}
 
 	results, err := store.Query(ArchiveQuery{
@@ -213,7 +213,7 @@ func TestStore_QueryByCategory(t *testing.T) {
 	store := newTestStore(t)
 
 	for i := 0; i < 5; i++ {
-		store.InsertEntry(makeEntry(CategoryTaskState, "Task", SourceModelClaudeOpus45))
+		store.InsertEntry(makeEntry(CategoryTaskState, "Task", SourceModelClaudeOpus))
 	}
 
 	results := store.QueryByCategory(CategoryTaskState, 3)
@@ -224,11 +224,11 @@ func TestStore_QueryByCategory(t *testing.T) {
 func TestStore_QueryByCategory_ReturnsRecentFirst(t *testing.T) {
 	store := newTestStore(t)
 
-	store.InsertEntry(makeEntryWithTitle(CategoryInsight, "First", "First", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntryWithTitle(CategoryInsight, "First", "First", SourceModelClaudeOpus))
 	time.Sleep(10 * time.Millisecond)
-	store.InsertEntry(makeEntryWithTitle(CategoryInsight, "Second", "Second", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntryWithTitle(CategoryInsight, "Second", "Second", SourceModelClaudeOpus))
 	time.Sleep(10 * time.Millisecond)
-	store.InsertEntry(makeEntryWithTitle(CategoryInsight, "Third", "Third", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntryWithTitle(CategoryInsight, "Third", "Third", SourceModelClaudeOpus))
 
 	results := store.QueryByCategory(CategoryInsight, 2)
 
@@ -240,9 +240,9 @@ func TestStore_QueryByCategory_ReturnsRecentFirst(t *testing.T) {
 func TestStore_SearchText(t *testing.T) {
 	store := newTestStore(t)
 
-	store.InsertEntry(makeEntryWithTitle(CategoryGeneral, "Authentication", "How to implement auth", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntryWithTitle(CategoryGeneral, "Database", "Setting up PostgreSQL", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntryWithTitle(CategoryGeneral, "Auth Tokens", "JWT token handling", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntryWithTitle(CategoryGeneral, "Authentication", "How to implement auth", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntryWithTitle(CategoryGeneral, "Database", "Setting up PostgreSQL", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntryWithTitle(CategoryGeneral, "Auth Tokens", "JWT token handling", SourceModelClaudeOpus))
 
 	results, err := store.SearchText("auth", false, 10)
 
@@ -253,8 +253,8 @@ func TestStore_SearchText(t *testing.T) {
 func TestStore_SearchText_CaseInsensitive(t *testing.T) {
 	store := newTestStore(t)
 
-	store.InsertEntry(makeEntry(CategoryGeneral, "UPPERCASE content", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryGeneral, "lowercase content", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryGeneral, "UPPERCASE content", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryGeneral, "lowercase content", SourceModelClaudeOpus))
 
 	results, err := store.SearchText("CONTENT", false, 10)
 
@@ -265,17 +265,17 @@ func TestStore_SearchText_CaseInsensitive(t *testing.T) {
 func TestStore_Stats(t *testing.T) {
 	store := newTestStore(t)
 
-	store.InsertEntry(makeEntry(CategoryInsight, "Content", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryInsight, "Content", SourceModelClaudeOpus45))
-	store.InsertEntry(makeEntry(CategoryDecision, "Content", SourceModelGPT52Codex))
+	store.InsertEntry(makeEntry(CategoryInsight, "Content", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryInsight, "Content", SourceModelClaudeOpus))
+	store.InsertEntry(makeEntry(CategoryDecision, "Content", SourceModelGPT54Pro))
 
 	stats := store.Stats()
 
 	assert.Equal(t, 3, stats.TotalEntries, "Total entries")
 	assert.Equal(t, 2, stats.EntriesByCategory[CategoryInsight], "Insights count")
 	assert.Equal(t, 1, stats.EntriesByCategory[CategoryDecision], "Decisions count")
-	assert.Equal(t, 2, stats.EntriesBySource[SourceModelClaudeOpus45], "Claude entries")
-	assert.Equal(t, 1, stats.EntriesBySource[SourceModelGPT52Codex], "GPT entries")
+	assert.Equal(t, 2, stats.EntriesBySource[SourceModelClaudeOpus], "Claude entries")
+	assert.Equal(t, 1, stats.EntriesBySource[SourceModelGPT54Pro], "GPT entries")
 	assert.Greater(t, stats.HotMemoryTokens, 0, "Token count should be positive")
 }
 
@@ -284,7 +284,7 @@ func TestStore_EndSession(t *testing.T) {
 
 	originalSessionID := store.GetCurrentSession().ID
 
-	store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45))
+	store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus))
 
 	err := store.EndSession("Session completed", "Testing")
 
@@ -306,7 +306,7 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 		go func(writerID int) {
 			defer wg.Done()
 			for j := 0; j < entriesPerWriter; j++ {
-				store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45))
+				store.InsertEntry(makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus))
 			}
 		}(i)
 	}
@@ -340,7 +340,7 @@ func TestStore_TokenThreshold_TriggersArchival(t *testing.T) {
 
 	// Insert entries until we exceed threshold
 	for i := 0; i < 100; i++ {
-		store.InsertEntry(makeEntry(CategoryGeneral, "This is some content that takes up tokens", SourceModelClaudeOpus45))
+		store.InsertEntry(makeEntry(CategoryGeneral, "This is some content that takes up tokens", SourceModelClaudeOpus))
 	}
 
 	stats := store.Stats()
@@ -356,7 +356,7 @@ func TestEntry_CreateWithAllCategories(t *testing.T) {
 
 	categories := AllCategories()
 	for _, cat := range categories {
-		entry := makeEntry(cat, "Test content for "+string(cat), SourceModelClaudeOpus45)
+		entry := makeEntry(cat, "Test content for "+string(cat), SourceModelClaudeOpus)
 		id, err := store.InsertEntry(entry)
 
 		require.NoError(t, err, "InsertEntry for category "+string(cat))
@@ -371,8 +371,8 @@ func TestEntry_CreateWithAllCategories(t *testing.T) {
 func TestEntry_TokenEstimation(t *testing.T) {
 	store := newTestStore(t)
 
-	shortEntry := makeEntry(CategoryGeneral, "Short", SourceModelClaudeOpus45)
-	longEntry := makeEntry(CategoryGeneral, "This is a much longer piece of content that should have more tokens estimated", SourceModelClaudeOpus45)
+	shortEntry := makeEntry(CategoryGeneral, "Short", SourceModelClaudeOpus)
+	longEntry := makeEntry(CategoryGeneral, "This is a much longer piece of content that should have more tokens estimated", SourceModelClaudeOpus)
 
 	store.InsertEntry(shortEntry)
 	store.InsertEntry(longEntry)
@@ -383,7 +383,7 @@ func TestEntry_TokenEstimation(t *testing.T) {
 func TestEntry_MetadataFlexibility(t *testing.T) {
 	store := newTestStore(t)
 
-	entry := makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus45)
+	entry := makeEntry(CategoryGeneral, "Content", SourceModelClaudeOpus)
 	entry.Metadata = map[string]any{
 		"string_field": "value",
 		"int_field":    42,
@@ -406,11 +406,11 @@ func TestEntry_RelatedIDsIntegrity(t *testing.T) {
 	store := newTestStore(t)
 
 	// Create first entry
-	entry1 := makeEntry(CategoryDecision, "Decision 1", SourceModelClaudeOpus45)
+	entry1 := makeEntry(CategoryDecision, "Decision 1", SourceModelClaudeOpus)
 	id1, _ := store.InsertEntry(entry1)
 
 	// Create second entry related to first
-	entry2 := makeEntry(CategoryIssue, "Issue related to decision", SourceModelClaudeOpus45)
+	entry2 := makeEntry(CategoryIssue, "Issue related to decision", SourceModelClaudeOpus)
 	entry2.RelatedIDs = []string{id1}
 	id2, _ := store.InsertEntry(entry2)
 

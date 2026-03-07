@@ -206,6 +206,48 @@ type HealthPayload struct {
 	Metric  string `json:"metric,omitempty"`
 }
 
+// ── Network security payloads ────────────────────────────────────────────────
+
+// TLSPayload records a TLS certificate validation event.
+type TLSPayload struct {
+	Domain   string `json:"domain"`
+	Valid    bool   `json:"valid"`
+	Severity string `json:"severity"`           // "info" | "medium" | "high" | "critical"
+	Issue    string `json:"issue,omitempty"`     // Description of any problem found
+	Issuer   string `json:"issuer,omitempty"`    // Certificate issuer
+	Expiry   string `json:"expiry,omitempty"`    // Certificate expiration date
+	DaysLeft int    `json:"days_left,omitempty"` // Days until expiry (negative = expired)
+}
+
+// FetchSecurityPayload records a security-relevant fetch event.
+type FetchSecurityPayload struct {
+	URL          string `json:"url"`
+	Domain       string `json:"domain"`
+	Verdict      string `json:"verdict"`                 // "clean" | "flagged" | "blocked"
+	FindingCount int    `json:"finding_count"`
+	Severity     string `json:"severity"`                // Highest severity among findings
+	Detail       string `json:"detail,omitempty"`        // Brief description
+	Action       string `json:"action"`                  // "allowed" | "blocked" | "flagged"
+}
+
+// DomainReputationPayload records a domain trust assessment.
+type DomainReputationPayload struct {
+	Domain       string  `json:"domain"`
+	TrustScore   float64 `json:"trust_score"`   // 0.0–1.0
+	FetchCount   int     `json:"fetch_count"`
+	FindingCount int     `json:"finding_count"`
+	TrustLevel   string  `json:"trust_level"`   // "new" | "known" | "trusted" | "suspicious"
+}
+
+// VulnPayload records a vulnerability finding in dependencies.
+type VulnPayload struct {
+	Package  string `json:"package"`
+	Version  string `json:"version"`
+	VulnID   string `json:"vuln_id"`           // CVE or OSV identifier
+	Severity string `json:"severity"`          // "low" | "medium" | "high" | "critical"
+	Summary  string `json:"summary,omitempty"` // Brief vulnerability description
+}
+
 // ── Inspector payloads ──────────────────────────────────────────────────────
 
 // AuditPayload records an audit lifecycle event.

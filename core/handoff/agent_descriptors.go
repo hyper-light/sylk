@@ -59,6 +59,9 @@ const contextWindow1M = 1_000_000
 // contextWindow200K is the context window for models with 200K token support.
 const contextWindow200K = 200_000
 
+// contextWindow272K is the context window for GPT-5.4 Pro.
+const contextWindow272K = 272_000
+
 // defaultDescriptors returns the pre-populated agent descriptors.
 func defaultDescriptors() []AgentDescriptor {
 	return []AgentDescriptor{
@@ -68,12 +71,12 @@ func defaultDescriptors() []AgentDescriptor {
 		{AgentType: "architect", ModelID: "opus-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryKnowledge},
 		{AgentType: "guide", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone},
 		{AgentType: "orchestrator", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone},
-		{AgentType: "engineer", ModelID: "gpt-5.3-codex", ReasoningEffort: "xhigh", ContextWindow: contextWindow200K, Category: CategoryPipeline},
+		{AgentType: "engineer", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryPipeline},
 		{AgentType: "designer", ModelID: "gemini-3.1-pro-preview", ReasoningEffort: "high", ContextWindow: contextWindow1M, Category: CategoryPipeline},
 		{AgentType: "inspector", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryStandalone},
 		{AgentType: "inspector-pipeline", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryPipeline},
-		{AgentType: "tester", ModelID: "gpt-5.3-codex", ReasoningEffort: "xhigh", ContextWindow: contextWindow200K, Category: CategoryStandalone},
-		{AgentType: "tester-pipeline", ModelID: "gpt-5.3-codex", ReasoningEffort: "xhigh", ContextWindow: contextWindow200K, Category: CategoryPipeline},
-		{AgentType: "guardian", ModelID: "gpt-5.3-codex", ReasoningEffort: "high", ContextWindow: contextWindow200K, Category: CategoryStandalone},
+		{AgentType: "tester", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryStandalone},
+		{AgentType: "tester-pipeline", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryPipeline},
+		{AgentType: "guardian", ModelID: "gpt-5.4-pro", ReasoningEffort: "high", ContextWindow: contextWindow272K, Category: CategoryStandalone},
 	}
 }

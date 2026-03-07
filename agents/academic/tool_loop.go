@@ -21,7 +21,6 @@ import (
 // Follows the engineer tool loop pattern exactly.
 func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	maxRuns := a.config.MaxToolRuns
-	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	consecutiveErrors := 0
 
 	p := a.getProvider()
@@ -41,6 +40,10 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 	}
 
 	for turn := 0; turn <= maxRuns; turn++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+
 		// ── STEERING CHECKPOINT ──
 		sc := shared.DrainAndCheckpoint(ledger, req, turn, "researching", nil)
 		if sc.Rollback != nil || sc.EditReplay != nil {
@@ -62,7 +65,6 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
 			}
 			turn = cp.Turn
-			seen = make(map[shared.ToolCallSignature]int, maxRuns)
 			consecutiveErrors = 0
 			continue
 		}
@@ -74,6 +76,11 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 		}
 		// ── END STEERING ──
 
+		if a.toolDefsDirty {
+			req.Tools = a.buildToolDefinitions()
+			a.toolDefsDirty = false
+		}
+
 		// ── CONTEXT BUDGET ──
 		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
 			return "", err
@@ -83,6 +90,9 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 		resp, err := p.Complete(ctx, req)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -103,17 +113,6 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 					&agentlog.GenerationPayload{Phase: "completed", ToolRuns: turn})
 			}
 			return strings.TrimSpace(resp.Content), nil
-		}
-
-
-
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s", sig.Name)})
-			}
-			return "", fmt.Errorf("academic repeated tool call: %s", sig.Name)
 		}
 
 		errCount, rerouted := a.applyToolCalls(ctx, req, resp)
@@ -152,6 +151,8 @@ func (a *Academic) applyToolCalls(
 		ToolCalls: resp.ToolCalls,
 		Metadata:  resp.ProviderMetadata,
 	})
+
+	loadedBefore := len(a.skills.GetLoaded())
 
 	errCount := 0
 	rerouted := false
@@ -198,6 +199,11 @@ func (a *Academic) applyToolCalls(
 			break
 		}
 	}
+
+	if len(a.skills.GetLoaded()) > loadedBefore {
+		a.toolDefsDirty = true
+	}
+
 	return errCount, rerouted
 }
 
@@ -225,6 +231,16 @@ func (a *Academic) executeToolCall(ctx context.Context, call providers.ToolCall)
 	}
 
 	return shared.MarshalToolOutput(result.Data)
+}
+
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (a *Academic) prepareSkillsForInput(input string) {
+	if a.skillLoader == nil {
+		return
+	}
+	a.skillLoader.LoadForInput(input)
+	a.skillLoader.OptimizeForBudget()
 }
 
 // buildToolDefinitions converts loaded skills to provider Tool format.

@@ -660,9 +660,9 @@ func errorFromEvent(event *dag.Event) string {
 }
 
 // DAGSnapshots returns snapshot summaries for state_snapshot.
-func (b *DAGBridge) DAGSnapshots(limit int) []dagSnap {
+func (b *DAGBridge) DAGSnapshots(limit int) []DAGSnap {
 	statuses := b.scheduler.List()
-	snaps := make([]dagSnap, 0, min(len(statuses), limit))
+	snaps := make([]DAGSnap, 0, min(len(statuses), limit))
 	for _, s := range statuses {
 		b.mu.RLock()
 		meta := b.activeDAGs[s.ID]
@@ -675,7 +675,7 @@ func (b *DAGBridge) DAGSnapshots(limit int) []dagSnap {
 			dur = time.Since(meta.StartedAt).Truncate(time.Second).String()
 		}
 
-		snaps = append(snaps, dagSnap{
+		snaps = append(snaps, DAGSnap{
 			ID:           s.ID,
 			PlanID:       planID,
 			State:        s.State.String(),

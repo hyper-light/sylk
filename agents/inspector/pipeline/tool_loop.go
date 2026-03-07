@@ -205,6 +205,16 @@ func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers
 	return shared.MarshalToolOutput(result.Data)
 }
 
+// prepareSkillsForInput progressively loads skills relevant to the user's
+// input and optimizes to stay within the tool-definition token budget.
+func (pi *PipelineInspector) prepareSkillsForInput(input string) {
+	if pi.skillLoader == nil {
+		return
+	}
+	pi.skillLoader.LoadForInput(input)
+	pi.skillLoader.OptimizeForBudget()
+}
+
 func (pi *PipelineInspector) buildToolDefinitions() []providers.Tool {
 	return shared.BuildToolDefinitions(pi.skills.GetLoaded())
 }

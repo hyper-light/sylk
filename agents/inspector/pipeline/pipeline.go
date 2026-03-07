@@ -95,18 +95,18 @@ type PipelineInspector struct {
 }
 
 // New creates a new PipelineInspector instance.
-func New(cfg shared.PipelineInspectorConfig, provider pipelineInspectorProvider) (*PipelineInspector, error) {
+func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter) (*PipelineInspector, error) {
 	cfg = applyConfigDefaults(cfg)
 
 	pi := &PipelineInspector{
-		id:          uuid.New().String()[:8],
-		config:      cfg,
-		logger:      slog.Default().With("agent", "inspector-pipeline"),
-		provider:    provider,
-		toolRunner:  shared.NewToolRunner(".", cfg.DefaultTimeout, slog.Default()),
-		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		pendingBus:  make(map[string]chan *guide.Message),
-		criteria:    make(map[string]*shared.InspectorCriteria),
+		id:                uuid.New().String()[:8],
+		config:            cfg,
+		logger:            slog.Default().With("agent", "inspector-pipeline"),
+		provider:          provider,
+		toolRunner:        shared.NewToolRunner(".", cfg.DefaultTimeout, slog.Default()),
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		pendingBus:        make(map[string]chan *guide.Message),
+		criteria:          make(map[string]*shared.InspectorCriteria),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
 	}
@@ -154,17 +154,13 @@ func (pi *PipelineInspector) initSkills() {
 	loaderCfg := skills.DefaultLoaderConfig()
 	loaderCfg.CoreSkills = []string{
 		"run_linter", "run_type_checker", "run_security_scan",
-		"detect_race_conditions", "detect_deadlocks",
 		"read_file", "glob", "grep",
 		"define_criteria", "validate_criteria",
-		"grade_task_quality", "request_correction",
-		"get_validation_status",
 	}
-	loaderCfg.AutoLoadDomains = []string{"analysis", "filesystem", "validation"}
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	pi.skillLoader = skills.NewLoader(pi.skills, loaderCfg)
 
 	pi.registerCoreSkills()
-	pi.skills.LoadAll()
 	pi.registerSafetyHook()
 }
 
@@ -231,8 +227,8 @@ func (pi *PipelineInspector) CurrentModel() string {
 // SupportedModels implements container.ModelSwappable.
 func (pi *PipelineInspector) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
-		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "gemini-3.1-pro-preview", DisplayName: "Gemini 3.1 Pro"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 	}
 }
 
@@ -475,13 +471,14 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	}
 
 	systemPrompt := shared.PipelineInspectorSystemPrompt()
-	tools := pi.buildToolDefinitions()
 
 	// Build user message: structured for pipeline tasks, raw for conversation.
 	userMessage := fwd.Input
 	if task != nil {
 		userMessage = composePipelineUserMessage(task)
 	}
+	pi.prepareSkillsForInput(userMessage)
+	tools := pi.buildToolDefinitions()
 
 	pi.mu.RLock()
 	model := pi.config.Model
@@ -497,6 +494,7 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 		MaxTokens: maxTokens,
 		Tools:     tools,
 	}
+	pi.applyLLMRuntimeProfile(req, "task")
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentShared.PrependHistoryMessages(req, fwd.ConversationHistory)
@@ -563,7 +561,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		SessionID:   fwd.SessionID,
 	})
 
-	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, "inspector-pipeline", fwd.CorrelationID, fwd.SourceAgentID)
+	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, pi.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
 	ctx = agentShared.WithContextGovernor(ctx, agentShared.NewContextGovernor(
 		pi.config.Model, pi.config.MaxTokens, 0,
@@ -600,8 +598,8 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 		CorrelationID:       fwd.CorrelationID,
 		Success:             true,
 		Data:                result,
-		RespondingAgentID:   "inspector-pipeline",
-		RespondingAgentName: "inspector-pipeline",
+		RespondingAgentID:   pi.id,
+		RespondingAgentName: "Inspector Pipeline",
 		ProcessingTime:      time.Since(startTime),
 	}
 	respMsg := guide.NewResponseMessage(pi.generateMessageID(), resp)
@@ -787,6 +785,7 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 	systemPrompt := shared.PipelineInspectorSystemPromptForDomain(
 		shared.ValidationDomainFromWorkerType(workerType),
 	)
+	pi.prepareSkillsForInput(prompt)
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
@@ -794,6 +793,7 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 		MaxTokens:    maxTokens,
 		Tools:        pi.buildToolDefinitions(),
 	}
+	pi.applyLLMRuntimeProfile(req, "validation")
 
 	_, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
 	if err != nil {
@@ -892,7 +892,7 @@ func (pi *PipelineInspector) publishActivity(eventType events.EventType, content
 
 // --- HandoffInjectable ---
 
-func (pi *PipelineInspector) AgentID() string  { return pi.id }
+func (pi *PipelineInspector) AgentID() string   { return pi.id }
 func (pi *PipelineInspector) AgentType() string { return "inspector-pipeline" }
 
 func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
@@ -905,14 +905,17 @@ func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
 }
 
 func (pi *PipelineInspector) InjectPreparedContext(_ *handoff.PreparedContext) error { return nil }
-func (pi *PipelineInspector) Terminate(_ context.Context) error                     { return pi.Stop() }
-func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess) { pi.fileAccess = fa }
+func (pi *PipelineInspector) Terminate(_ context.Context) error                      { return pi.Stop() }
+func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess)                 { pi.fileAccess = fa }
+
 // SetAgentPod injects the agent pod for Scribe feed integration.
 func (pi *PipelineInspector) SetAgentPod(pod *agentShared.AgentPod) {
 	pi.agentPod = pod
 }
 
-func (pi *PipelineInspector) SetHandoffBridge(bridge *handoff.HandoffBridge)         { pi.handoffBridge = bridge }
+func (pi *PipelineInspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {
+	pi.handoffBridge = bridge
+}
 func (pi *PipelineInspector) ExtractArchivableState() *handoff.ArchivableState {
 	return &handoff.ArchivableState{
 		AgentID:   pi.AgentID(),

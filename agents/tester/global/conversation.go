@@ -8,6 +8,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -59,6 +60,7 @@ func (gt *GlobalTester) handleConversation(ctx context.Context, req *guide.Forwa
 func (gt *GlobalTester) executeConversationLLM(ctx context.Context, cr testerConversationRequest) (*ConversationResult, error) {
 	systemPrompt := shared.TesterConversationSystemPrompt()
 	userMessage := buildTesterConversationUserPrompt(cr)
+	gt.prepareSkillsForInput(userMessage)
 	tools := gt.buildConversationToolDefinitions()
 
 	llmReq := &providers.Request{
@@ -69,6 +71,7 @@ func (gt *GlobalTester) executeConversationLLM(ctx context.Context, cr testerCon
 		MaxTokens:    testerConversationMaxTokens,
 		Tools:        tools,
 	}
+	llmruntime.Apply(llmReq, gt.llmRuntimeProfile())
 	if len(tools) > 0 {
 		llmReq.ToolChoice = "auto"
 	}
@@ -95,13 +98,13 @@ func (gt *GlobalTester) executeConversationLLM(ctx context.Context, cr testerCon
 
 // testerConversationRequest holds runtime fields for a conversation turn.
 type testerConversationRequest struct {
-	SessionID   string
-	UserQuery   string
-	Diagnoses   int
-	TestPlan    string
-	Harness     string
-	AgentIDs    []string
-	History     []guide.ConversationTurn
+	SessionID string
+	UserQuery string
+	Diagnoses int
+	TestPlan  string
+	Harness   string
+	AgentIDs  []string
+	History   []guide.ConversationTurn
 }
 
 // buildConversationRequest extracts runtime context from the global tester state

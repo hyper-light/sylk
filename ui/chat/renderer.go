@@ -297,6 +297,7 @@ func renderCodeBlockUncached(lines []string, lang, content string, width int, th
 	sepStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
 
 	codeWidth := max(width-gutterWidth, 1)
+	contGutter := strings.Repeat(" ", gutterWidth)
 	result := make([]string, 0, len(lines))
 	for i, line := range lines {
 		var regions []codepkg.HighlightRegion
@@ -309,16 +310,103 @@ func renderCodeBlockUncached(lines []string, lang, content string, width int, th
 		highlighted := hl.HighlightLine(line, i, regions)
 
 		visWidth := lipgloss.Width(highlighted)
-		switch {
-		case visWidth > codeWidth:
-			highlighted = truncateStyledCode(highlighted, codeWidth)
-		case visWidth < codeWidth:
-			highlighted += strings.Repeat(" ", codeWidth-visWidth)
+		if visWidth <= codeWidth {
+			if visWidth < codeWidth {
+				highlighted += strings.Repeat(" ", codeWidth-visWidth)
+			}
+			result = append(result, num+sep+highlighted)
+		} else {
+			// Wrap long lines: split highlighted text at codeWidth
+			// boundaries, preserving ANSI styles across segments.
+			wrapped := wrapStyledCode(highlighted, codeWidth)
+			for j, seg := range wrapped {
+				if j == 0 {
+					result = append(result, num+sep+seg)
+				} else {
+					result = append(result, contGutter+seg)
+				}
+			}
 		}
-
-		result = append(result, num+sep+highlighted)
 	}
 	return result
+}
+
+// wrapStyledCode splits a styled string into segments of maxWidth visible
+// columns, preserving ANSI escape sequences across segment boundaries.
+// Each segment is reset-terminated; subsequent segments replay the active
+// style state from the prior segment's end.
+func wrapStyledCode(s string, maxWidth int) []string {
+	if maxWidth <= 0 {
+		return []string{""}
+	}
+
+	var segments []string
+	var buf strings.Builder
+	var activeStyle strings.Builder // accumulated ANSI sequences
+	vis := 0
+	i := 0
+
+	for i < len(s) {
+		if s[i] == '\x1b' {
+			// Consume the entire ANSI escape sequence.
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) && !isCSITerminator(s[j]) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+			}
+			seq := s[i:j]
+			buf.WriteString(seq)
+			// Track style: reset clears, other SGR sequences accumulate.
+			if seq == "\x1b[0m" || seq == "\x1b[m" {
+				activeStyle.Reset()
+			} else {
+				activeStyle.WriteString(seq)
+			}
+			i = j
+			continue
+		}
+
+		// Visible character — if adding it exceeds maxWidth, break.
+		if vis >= maxWidth {
+			buf.WriteString("\x1b[0m")
+			seg := buf.String()
+			padWidth := maxWidth - vis
+			if padWidth > 0 {
+				seg += strings.Repeat(" ", padWidth)
+			}
+			segments = append(segments, seg)
+			buf.Reset()
+			// Replay active style into the new segment.
+			buf.WriteString(activeStyle.String())
+			vis = 0
+		}
+
+		_, size := utf8.DecodeRuneInString(s[i:])
+		buf.WriteString(s[i : i+size])
+		vis++
+		i += size
+	}
+
+	// Flush remaining content.
+	if buf.Len() > 0 || vis > 0 {
+		buf.WriteString("\x1b[0m")
+		seg := buf.String()
+		if vis < maxWidth {
+			// Pad to full width so the code background fills the line.
+			seg = buf.String()[:buf.Len()-len("\x1b[0m")] + strings.Repeat(" ", maxWidth-vis) + "\x1b[0m"
+		}
+		segments = append(segments, seg)
+	}
+
+	if len(segments) == 0 {
+		return []string{strings.Repeat(" ", maxWidth)}
+	}
+	return segments
 }
 
 // truncateStyledCode truncates a styled string to fit within maxWidth visible

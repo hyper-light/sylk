@@ -147,8 +147,8 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	skillsLoaderCfg.CoreSkills = orchestratorCoreSkillNames()
-	skillsLoaderCfg.AutoLoadDomains = []string{"orchestration", "monitoring"}
+	skillsLoaderCfg.CoreSkills = orchestratorPinnedSkillNames()
+	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	skillLoader := skills.NewLoader(skillsRegistry, skillsLoaderCfg)
 	hookRegistry := skills.NewHookRegistry()
 
@@ -823,7 +823,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	ctx = withOrchestratorStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx, usageAcc := withOrchestratorUsageAccumulator(ctx)
 
-	toolEmitter := shared.NewToolCallEmitter(o.bus, o.channels, "orchestrator", fwd.CorrelationID, fwd.SourceAgentID)
+	toolEmitter := shared.NewToolCallEmitter(o.bus, o.channels, o.config.AgentID, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = shared.WithToolCallEmitter(ctx, toolEmitter)
 
 	// Create steering ledger for this request.
@@ -862,8 +862,8 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "orchestrator",
-		RespondingAgentName: "orchestrator",
+		RespondingAgentID:   o.config.AgentID,
+		RespondingAgentName: "Orchestrator",
 		ProcessingTime:      time.Since(startTime),
 	}
 
@@ -1469,6 +1469,15 @@ func (o *Orchestrator) GetSummary(ctx context.Context) (*OrchestratorSummary, er
 	return summary, nil
 }
 
+// GetDAGSnapshots returns point-in-time DAG execution snapshots.
+// Returns nil when no DAG bridge is configured.
+func (o *Orchestrator) GetDAGSnapshots(limit int) []DAGSnap {
+	if o.dagBridge == nil {
+		return nil
+	}
+	return o.dagBridge.DAGSnapshots(limit)
+}
+
 func (o *Orchestrator) generateOverview() string {
 	return fmt.Sprintf(
 		"Orchestrator monitoring %d workflows with %d active tasks. "+
@@ -1545,8 +1554,8 @@ func (o *Orchestrator) summarizeTasks() TasksSummary {
 func (o *Orchestrator) GetRoutingInfo() *guide.AgentRoutingInfo {
 	return &guide.AgentRoutingInfo{
 		ID:      o.config.AgentID,
-		Type:    o.config.AgentID,
-		Name:    "orchestrator",
+		Type:    "orchestrator",
+		Name:    "Orchestrator",
 		Aliases: []string{"orch"},
 		Registration: &guide.AgentRegistration{
 			ID:          o.config.AgentID,

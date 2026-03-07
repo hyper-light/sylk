@@ -30,8 +30,8 @@ type archivalistProvider interface {
 
 // Archivalist is the main agent for managing AI-generated content and conversation memory
 type Archivalist struct {
-	id     string
-	store  *Store
+	id           string
+	store        *Store
 	archive      *Archive
 	agentContext *AgentContext
 	config       Config
@@ -73,24 +73,25 @@ type Archivalist struct {
 	crossAgentWeights *CrossAgentWeightManager
 	spacingAnalyzer   *memory.SpacingAnalyzer
 
-	bus            guide.EventBus
-	channels       *guide.AgentChannels
-	requestSub     guide.Subscription
-	responseSub    guide.Subscription
-	registrySub    guide.Subscription
-	logIngestSub   guide.Subscription
-	knowledgeSub   guide.Subscription
-	running        bool
-	knownAgentsMu  sync.RWMutex
-	knownAgents    map[string]*guide.AgentAnnouncement
+	bus           guide.EventBus
+	channels      *guide.AgentChannels
+	requestSub    guide.Subscription
+	responseSub   guide.Subscription
+	registrySub   guide.Subscription
+	logIngestSub  guide.Subscription
+	knowledgeSub  guide.Subscription
+	running       bool
+	knownAgentsMu sync.RWMutex
+	knownAgents   map[string]*guide.AgentAnnouncement
 
 	// Synchronous consultation bus
 	pendingMu  sync.Mutex
 	pendingBus map[string]chan *guide.Message
 
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	hooks       *skills.HookRegistry
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
+	toolDefsDirty bool
 
 	defaultSessionID string
 	sessionStores    map[string]*SessionStore
@@ -135,10 +136,11 @@ type Config struct {
 	TokenThreshold int    // Token threshold for archiving, defaults to 750K
 
 	// Feature flags
-	EnableArchive       bool // Enable SQLite archive (L2 storage)
-	EnableRAG           bool // Enable RAG components (query cache, embeddings, synthesis)
-	EnableACTR          bool // Enable ACT-R memory scoring
-	EnableHybridQuery   bool // Enable HybridQueryCoordinator
+	EnableLLM            bool // Enable LLM-driven conversation path (tool loop)
+	EnableArchive        bool // Enable SQLite archive (L2 storage)
+	EnableRAG            bool // Enable RAG components (query cache, embeddings, synthesis)
+	EnableACTR           bool // Enable ACT-R memory scoring
+	EnableHybridQuery    bool // Enable HybridQueryCoordinator
 	EnableKnowledgeGraph bool // Enable knowledge graph traversal
 
 	// Concurrency configuration
@@ -242,17 +244,10 @@ func createArchive(cfg Config) (*Archive, error) {
 func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 	agentID := cfg.ID
 	if agentID == "" {
-		agentID = fmt.Sprintf("archivalist_%s", uuid.New().String()[:8])
+		agentID = uuid.New().String()[:8]
 	}
 
-	// Create skills registry and loader
 	skillsRegistry := skills.NewRegistry()
-	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	skillsLoaderCfg.CoreSkills = []string{"store", "query", "briefing"}
-	skillsLoaderCfg.AutoLoadDomains = []string{"memory", "chronicle", "knowledge"}
-	skillLoader := skills.NewLoader(skillsRegistry, skillsLoaderCfg)
-
-	// Create hook registry
 	hookRegistry := skills.NewHookRegistry()
 
 	a := &Archivalist{
@@ -271,7 +266,6 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 		pendingBus:        make(map[string]chan *guide.Message),
 		requestCancels:    make(map[string]context.CancelFunc),
 		skills:            skillsRegistry,
-		skillLoader:       skillLoader,
 		hooks:             hookRegistry,
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
@@ -286,8 +280,15 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 	a.logIngest = NewLogIngestStore()
 	a.crossAgentWeights = NewCrossAgentWeightManager()
 
+	// Register skills BEFORE creating the loader — NewLoader calls
+	// loadCoreSkills() immediately and skills must already exist.
 	a.registerCoreSkills()
 	a.registerExtendedSkills()
+
+	skillsLoaderCfg := skills.DefaultLoaderConfig()
+	skillsLoaderCfg.CoreSkills = []string{"store", "query", "briefing"}
+	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
+	a.skillLoader = skills.NewLoader(skillsRegistry, skillsLoaderCfg)
 
 	return a
 }
@@ -619,7 +620,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 
 	startTime := time.Now()
 
-	emitter := shared.NewToolCallEmitter(a.bus, a.channels, "archivalist", fwd.CorrelationID, fwd.SourceAgentID)
+	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
@@ -652,7 +653,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
-	a.publishActivity(events.EventTypeAgentAction, "Request completed")
+	a.publishActivity(events.EventTypeSuccess, "Request completed")
 
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
 	return a.bus.Publish(a.channels.Responses, respMsg)
@@ -725,17 +726,40 @@ func (a *Archivalist) publishSystemEvent(eventType events.EventType, content str
 	a.activityPub.PublishActivity(evt)
 }
 
-// processForwardedRequest handles the actual request processing
+// processForwardedRequest handles the actual request processing.
+// When LLM is enabled and a provider is available, builds a providers.Request
+// and runs the tool loop. Falls back to direct intent-dispatch otherwise.
 func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if a.config.EnableLLM && a.getProvider() != nil {
+		return a.processViaLLM(ctx, fwd)
+	}
 	handler, err := a.intentHandler(fwd.Intent)
 	if err != nil {
 		return nil, err
 	}
-	return a.executeForwarded(ctx, handler, fwd)
+	return handler(ctx, fwd)
 }
 
-func (a *Archivalist) executeForwarded(ctx context.Context, handler forwardedHandler, fwd *guide.ForwardedRequest) (any, error) {
-	return handler(ctx, fwd)
+// processViaLLM builds an LLM request with tools and runs the tool loop.
+func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	a.prepareSkillsForInput(fwd.Input)
+	llmReq := &providers.Request{
+		SystemPrompt: a.config.SystemPrompt,
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: fwd.Input}},
+		Tools:        a.buildToolDefinitions(),
+		Model:        a.config.Model,
+		MaxTokens:    a.config.MaxOutputTokens,
+	}
+	a.applyConversationRuntimeProfile(llmReq)
+
+	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
+
+	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("archivalist failed: %w", err)
+	}
+
+	return result, nil
 }
 
 type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error)
@@ -807,7 +831,7 @@ func ensureQueryLimit(query *ArchiveQuery, fallback int) {
 func (a *Archivalist) handleStore(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	entry := &Entry{
 		Content: fwd.Input,
-		Source:  SourceModelClaudeOpus45, // Default, could be extracted from metadata
+		Source:  SourceModelClaudeOpus, // Default, could be extracted from metadata
 	}
 
 	// Map domain to category
@@ -844,7 +868,7 @@ func (a *Archivalist) handleCheck(ctx context.Context, fwd *guide.ForwardedReque
 
 // handleDeclare processes declare (intent announcement) requests
 func (a *Archivalist) handleDeclare(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
-	a.agentContext.SetCurrentTask(fwd.Input, "", SourceModelClaudeOpus45)
+	a.agentContext.SetCurrentTask(fwd.Input, "", SourceModelClaudeOpus)
 	return map[string]any{"declared": true, "task": fwd.Input}, nil
 }
 
@@ -1582,7 +1606,7 @@ func (a *Archivalist) handleRegister(ctx context.Context, req *Request) Response
 		req.Register.Name,
 		req.Register.Session,
 		req.Register.ParentID,
-		SourceModelClaudeOpus45, // Default source
+		SourceModelClaudeOpus, // Default source
 	)
 	if err != nil {
 		return ErrorResponse(err.Error())

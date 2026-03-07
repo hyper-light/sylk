@@ -108,6 +108,11 @@ func (g *ProviderGateway) SetEventHook(hook providers.LLMProviderEventHook) {
 	g.eventHook = hook
 }
 
+// Name returns the gateway's configured name (e.g. "google-oauth", "anthropic").
+func (g *ProviderGateway) Name() string {
+	return g.config.Name
+}
+
 // Metrics returns a point-in-time snapshot of gateway counters.
 func (g *ProviderGateway) Metrics() MetricsSnapshot {
 	return g.metrics.Snapshot()

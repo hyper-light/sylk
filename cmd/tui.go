@@ -34,16 +34,16 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
-	"github.com/adalundhe/sylk/core/knowledge"
-	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/container/activation"
 	"github.com/adalundhe/sylk/core/container/daemon"
 	"github.com/adalundhe/sylk/core/container/network"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
-	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/knowledge"
+	"github.com/adalundhe/sylk/core/knowledge/query"
+	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -350,7 +350,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// registration time so IDs are sticky across spin-up/spin-down cycles.
 	identityReg := container.NewAgentIdentityRegistry([]string{
 		"architect", "engineer", "designer", "inspector", "tester",
-		"librarian", "archivalist", "academic",
+		"librarian", "archivalist", "academic", "orchestrator",
 	})
 
 	// actCtrlRef holds the activation controller pointer for lazy factory
@@ -388,7 +388,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// Register agent creators. During initial boot, Guide/Orch factories
 	// call hydrateOnce.result() to wait for the shared hydration. After
 	// boot, daemon restarts read hydratedRef atomically (already stored).
-	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef, &gitSubsRef, planStore, knowledgeStore, daemonCtrl, &guideRef, &orchRef)
+	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef, &gitSubsRef, planStore, knowledgeStore, daemonCtrl, &guideRef, &orchRef, budget)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
 
@@ -743,6 +743,12 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				&orchestratorCVSAdapter{orchRef: &orchRef},
 				&orchestratorVFSAdapter{orchRef: &orchRef},
 			)
+			grd.SetExtendedObservabilityDeps(
+				&pipelineQuerierAdapter{orchRef: &orchRef},
+				&gatewayQuerierAdapter{gateways: []*gateway.ProviderGateway{googleGateway, anthropicGateway, openaiGateway}},
+				&knowledgeQuerierAdapter{store: knowledgeStore},
+				&concurrencyQuerierAdapter{budget: budget},
+			)
 			grd.SetCostCalculator(buildCostCalculator())
 		}
 	}
@@ -789,7 +795,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	orch.SetTaskRouter(orchestrator.NewTaskRouter(orchestrator.TaskRouterConfig{
 		Bus:       guideBus,
 		Scope:     scope,
-		AgentID:   "orchestrator",
+		AgentID:   orch.AgentID(),
 		SessionID: "default",
 	}))
 	if activator != nil {
@@ -1020,6 +1026,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				return nil
 			}
 			_ = registerAgentWithGuide(g, lib, "librarian")
+			wireGlobalAgentPod(lib, "librarian", scribeFactory, activator, activityPub, slog.Default())
 			return nil
 		})
 		_ = scope.Go("phase4-activate-archivalist", phase4ActivationTimeout, func(bgCtx context.Context) error {
@@ -1280,8 +1287,8 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				slog.Warn("agent model config: save", "agent", agentType, "provider", provider, "model", modelID, "error", err)
 			}
 		},
-		AgentModelStore:  modelStore,
-		KnowledgeStore:   knowledgeStore,
+		AgentModelStore: modelStore,
+		KnowledgeStore:  knowledgeStore,
 	}
 
 	return deps, cleanup, nil
@@ -1313,6 +1320,7 @@ func registerAgentCreators(
 	daemonCtrl *daemon.DaemonSetController,
 	guideRef *atomic.Pointer[guide.Guide],
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
+	budget *concurrency.GoroutineBudget,
 ) {
 	// Guide — Gemini with rule-based fallback.
 	// First call blocks on hydrateOnce; subsequent calls (daemon restart)
@@ -1332,23 +1340,25 @@ func registerAgentCreators(
 	})
 
 	// Orchestrator — pipeline coordinator.
+	orchestratorID, _ := ids.Get("orchestrator")
 	reg.Register("orchestrator", func(ctx context.Context) (container.ContainerAgent, error) {
 		h := hydrateOnce.result()
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapOrchestrator(ctx, bus, actPub, projectRoot, h, googleGw)
+		return bootstrapOrchestrator(ctx, orchestratorID, bus, actPub, projectRoot, h, googleGw)
 	})
 
 	// Guardian — safety sidecar daemon.
 	// On daemon restart the factory must re-wire post-boot deps (observability,
 	// git, agent seeding) that Phase 3 originally set up.
 	reg.Register("guardian", func(ctx context.Context) (container.ContainerAgent, error) {
-		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, openaiGw, gitSubsRef)
+		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, gitSubsRef)
 		if err != nil {
 			return nil, err
 		}
-		wireGuardianPostBootDeps(grd, actCtrlRef, daemonCtrl, guideRef, orchRef, openaiGw)
+		wireGuardianPostBootDeps(grd, actCtrlRef, daemonCtrl, guideRef, orchRef, openaiGw,
+			[]*gateway.ProviderGateway{googleGw, anthropicGw, openaiGw}, knowledgeStore, budget)
 		return grd, nil
 	})
 
@@ -1373,23 +1383,16 @@ func registerOnDemandAgentCreators(
 	// Librarian — codebase search specialist with LLM-driven conversation.
 	librarianID, _ := ids.Get("librarian")
 	reg.Register("librarian", func(ctx context.Context) (container.ContainerAgent, error) {
-		anthropicCfg := providers.AnthropicConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     librarian.DefaultLibrarianModel,
-				MaxTokens: librarian.DefaultMaxTokens,
-			},
-			AuthMode: resolveAnthropicAuthMode(),
-		}
-		libProvider, err := providers.NewAnthropicProvider(ctx, anthropicCfg)
+		model := librarian.DefaultLibrarianModel
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("librarian provider: %w", err)
 		}
-		wrapped := anthropicGw.WrapProvider(libProvider, gateway.PriorityExecution)
 
 		libCfg := librarian.Config{
 			ID:               librarianID,
 			EnableLLM:        true,
-			Model:            librarian.DefaultLibrarianModel,
+			Model:            model,
 			AnthropicAPIKey:  providers.ResolveAnthropicAPIKey(""),
 			ActivityPub:      actPub,
 			WorkingDirectory: projectRoot,
@@ -1403,9 +1406,18 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
-		l.SetProviderWrapper(anthropicGw.Wrapper(gateway.PriorityExecution))
+		l.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
 		l.SetKnowledgeStore(knowledgeStore)
+
+		// Create a SessionVFS for the librarian's clone store.
+		svfs := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+			SessionID:  versioning.SessionID("librarian-" + librarianID),
+			WorkingDir: projectRoot,
+		})
+		l.SetSessionVFS(svfs)
+
 		if startErr := l.Start(bus); startErr != nil {
+			svfs.Close()
 			return nil, startErr
 		}
 		return l, nil
@@ -1414,22 +1426,15 @@ func registerOnDemandAgentCreators(
 	// Archivalist — historical data, patterns, failures.
 	archivalistID, _ := ids.Get("archivalist")
 	reg.Register("archivalist", func(ctx context.Context) (container.ContainerAgent, error) {
-		anthropicCfg := providers.AnthropicConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     archivalist.ModelSonnet45,
-				MaxTokens: archivalist.DefaultMaxOutputTokens,
-			},
-			AuthMode: resolveAnthropicAuthMode(),
-		}
-		archProvider, err := providers.NewAnthropicProvider(ctx, anthropicCfg)
+		model := archivalist.ModelSonnet45
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("archivalist provider: %w", err)
 		}
-		wrapped := anthropicGw.WrapProvider(archProvider, gateway.PriorityExecution)
 
 		archCfg := archivalist.Config{
-			ID:               archivalistID,
-			ActivityPub:      actPub,
+			ID:                archivalistID,
+			ActivityPub:       actPub,
 			EnableHybridQuery: true,
 			EnableACTR:        true,
 		}
@@ -1453,22 +1458,14 @@ func registerOnDemandAgentCreators(
 	// Academic — research, academic papers, best practices.
 	academicID, _ := ids.Get("academic")
 	reg.Register("academic", func(ctx context.Context) (container.ContainerAgent, error) {
-		anthropicCfg := providers.AnthropicConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     "claude-opus-4-5-20250115",
-				MaxTokens: 16384,
-			},
-			AuthMode: resolveAnthropicAuthMode(),
-		}
-		academicProvider, err := providers.NewAnthropicProvider(ctx, anthropicCfg)
+		model := academic.DefaultModel
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("academic provider: %w", err)
 		}
-		wrapped := anthropicGw.WrapProvider(academicProvider, gateway.PriorityExecution)
 		acaCfg := academic.Config{
-			ID:              academicID,
-			AnthropicAPIKey: providers.ResolveAnthropicAPIKey(""),
-			ActivityPub:     actPub,
+			ID:          academicID,
+			ActivityPub: actPub,
 		}
 		if ac := actCtrlRef.Load(); ac != nil {
 			acaCfg.RequestGuard = func() func() {
@@ -1479,6 +1476,7 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
+		a.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
 		if startErr := a.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1488,23 +1486,16 @@ func registerOnDemandAgentCreators(
 	// Global Inspector — cross-file architectural quality auditor.
 	inspectorID, _ := ids.Get("inspector")
 	reg.Register("inspector", func(ctx context.Context) (container.ContainerAgent, error) {
-		anthropicCfg := providers.AnthropicConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     "claude-opus-4-6",
-				MaxTokens: 16384,
-			},
-			AuthMode: resolveAnthropicAuthMode(),
-		}
-		provider, err := providers.NewAnthropicProvider(ctx, anthropicCfg)
+		model := "claude-opus-4-6"
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("global inspector provider: %w", err)
 		}
-		wrapped := anthropicGw.WrapProvider(provider, gateway.PriorityValidation)
-		gi, err := inspectorGlobal.New(inspectorShared.GlobalInspectorConfig{AgentID: inspectorID}, wrapped)
+		gi, err := inspectorGlobal.New(inspectorShared.GlobalInspectorConfig{AgentID: inspectorID, Model: model}, wrapped)
 		if err != nil {
 			return nil, err
 		}
-		gi.SetProviderWrapper(anthropicGw.Wrapper(gateway.PriorityValidation))
+		gi.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityValidation))
 		if startErr := gi.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1513,18 +1504,11 @@ func registerOnDemandAgentCreators(
 
 	// Pipeline Inspector — per-task quality validation.
 	reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
-		anthropicCfg := providers.AnthropicConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     "claude-opus-4-6",
-				MaxTokens: 16384,
-			},
-			AuthMode: resolveAnthropicAuthMode(),
-		}
-		provider, err := providers.NewAnthropicProvider(ctx, anthropicCfg)
+		model := "claude-opus-4-6"
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
 		}
-		wrapped := anthropicGw.WrapProvider(provider, gateway.PriorityValidation)
 		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{}, wrapped)
 		if err != nil {
 			return nil, err
@@ -1537,30 +1521,23 @@ func registerOnDemandAgentCreators(
 	})
 
 	// Global Tester — cross-pipeline SDET.
-	// Provider creation is best-effort: when the OpenAI API key is missing the
+	// Provider creation is best-effort: when the API key is missing the
 	// tester starts in degraded mode — static conversation replies still work,
 	// LLM-dependent paths return a clear error.
 	testerID, _ := ids.Get("tester")
 	reg.Register("tester", func(ctx context.Context) (container.ContainerAgent, error) {
-		openaiCfg := providers.OpenAIConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     "gpt-5.3-codex",
-				MaxTokens: 16384,
-			},
-			ReasoningEffort: "xhigh",
-			AuthMode:        "api_key",
-		}
+		model := "gpt-5.4-pro"
 		var wrapped providers.Provider
-		if provider, provErr := providers.NewOpenAIProvider(ctx, openaiCfg); provErr != nil {
-			slog.Warn("tester: OpenAI provider unavailable, LLM features disabled", "error", provErr)
+		if provider, provErr := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation); provErr != nil {
+			slog.Warn("tester: provider unavailable, LLM features disabled", "error", provErr)
 		} else {
-			wrapped = openaiGw.WrapProvider(provider, gateway.PriorityValidation)
+			wrapped = provider
 		}
-		gt, err := globaltester.New(shared.GlobalTesterConfig{AgentID: testerID}, wrapped)
+		gt, err := globaltester.New(shared.GlobalTesterConfig{AgentID: testerID, Model: model}, wrapped)
 		if err != nil {
 			return nil, err
 		}
-		gt.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityValidation))
+		gt.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityValidation))
 		if startErr := gt.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1569,19 +1546,11 @@ func registerOnDemandAgentCreators(
 
 	// Pipeline Tester — per-task QE.
 	reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
-		openaiCfg := providers.OpenAIConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     "gpt-5.3-codex",
-				MaxTokens: 16384,
-			},
-			ReasoningEffort: "xhigh",
-			AuthMode:        "api_key",
-		}
-		provider, err := providers.NewOpenAIProvider(ctx, openaiCfg)
+		model := "gpt-5.4-pro"
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
-		wrapped := openaiGw.WrapProvider(provider, gateway.PriorityValidation)
 		pt, err := pipelinetester.New(shared.PipelineTesterConfig{}, wrapped)
 		if err != nil {
 			return nil, err
@@ -1596,19 +1565,11 @@ func registerOnDemandAgentCreators(
 	// Engineer — code implementation.
 	engineerID, _ := ids.Get("engineer")
 	reg.Register("engineer", func(ctx context.Context) (container.ContainerAgent, error) {
-		openaiCfg := providers.OpenAIConfig{
-			BaseConfig: providers.BaseConfig{
-				Model:     "gpt-5.3-codex",
-				MaxTokens: 16384,
-			},
-			ReasoningEffort: "xhigh",
-			AuthMode:        "api_key",
+		model := "gpt-5.4-pro"
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
+		if err != nil {
+			return nil, fmt.Errorf("engineer provider: %w", err)
 		}
-		engProvider, engProvErr := providers.NewOpenAIProvider(ctx, openaiCfg)
-		if engProvErr != nil {
-			return nil, fmt.Errorf("engineer provider: %w", engProvErr)
-		}
-		wrapped := openaiGw.WrapProvider(engProvider, gateway.PriorityExecution)
 		engCfg := engineer.Config{ID: engineerID, ActivityPub: actPub}
 		if ac := actCtrlRef.Load(); ac != nil {
 			engCfg.RequestGuard = func() func() {
@@ -1619,24 +1580,21 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
-		e.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityExecution))
+		e.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
 		if startErr := e.Start(bus); startErr != nil {
 			return nil, startErr
 		}
 		return e, nil
 	})
 
-	// Designer — LLM-driven design implementation via Gemini 3.1 Pro Preview.
+	// Designer — LLM-driven design implementation.
 	designerID, _ := ids.Get("designer")
 	reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
-		googleCfg := providers.DefaultGoogleConfig()
-		googleCfg.Model = string(providers.Gemini31Pro)
-		googleCfg.MaxTokens = 16384
-		provider, err := providers.NewGoogleProvider(ctx, googleCfg)
+		model := string(providers.Gemini31Pro)
+		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
 		if err != nil {
-			return nil, fmt.Errorf("designer google provider: %w", err)
+			return nil, fmt.Errorf("designer provider: %w", err)
 		}
-		wrapped := googleGw.WrapProvider(provider, gateway.PriorityExecution)
 		desCfg := designer.Config{ID: designerID, ActivityPub: actPub}
 		if ac := actCtrlRef.Load(); ac != nil {
 			desCfg.RequestGuard = func() func() {
@@ -1647,7 +1605,7 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
-		d.SetProviderWrapper(googleGw.Wrapper(gateway.PriorityExecution))
+		d.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
 		if startErr := d.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1951,22 +1909,15 @@ func bootstrapGuardian(
 	bus guide.EventBus,
 	actPub events.ActivityPublisher,
 	projectRoot string,
-	openaiGw *gateway.ProviderGateway,
+	googleGw, anthropicGw, openaiGw *gateway.ProviderGateway,
 	gitSubsRef *atomic.Pointer[gitBootResult],
 ) (*guardian.Guardian, error) {
-	openaiCfg := providers.OpenAIConfig{
-		BaseConfig: providers.BaseConfig{
-			Model:     "gpt-5.3-codex",
-			MaxTokens: 8192,
-		},
-		ReasoningEffort: "high",
-		AuthMode:        "api_key",
-	}
+	model := guardian.DefaultGuardianModel
 	var wrapped providers.Provider
-	if p, err := providers.NewOpenAIProvider(ctx, openaiCfg); err != nil {
-		slog.Warn("guardian: OpenAI provider unavailable, LLM features disabled", "error", err)
+	if p, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation); err != nil {
+		slog.Warn("guardian: provider unavailable, LLM features disabled", "error", err)
 	} else {
-		wrapped = openaiGw.WrapProvider(p, gateway.PriorityValidation)
+		wrapped = p
 	}
 
 	cfg := guardian.Config{
@@ -2003,6 +1954,9 @@ func wireGuardianPostBootDeps(
 	guideRef *atomic.Pointer[guide.Guide],
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 	openaiGw *gateway.ProviderGateway,
+	allGateways []*gateway.ProviderGateway,
+	knowledgeStore *knowledge.KnowledgeStore,
+	budget *concurrency.GoroutineBudget,
 ) {
 	var acQuerier guardian.ActivationQuerier
 	var amQuerier guardian.ActivationMetricsQuerier
@@ -2020,12 +1974,20 @@ func wireGuardianPostBootDeps(
 		})
 	}
 	grd.SetObservabilityDeps(acQuerier, amQuerier, dcQuerier)
-	grd.SetProviderWrapper(openaiGw.Wrapper(gateway.PriorityValidation))
+	grd.SetProviderRefresher(buildProviderRefresher(allGateways[0], allGateways[1], allGateways[2], gateway.PriorityValidation))
 
 	// VFS observability — aggregate CVS/VFS stats across all sessions.
 	grd.SetVFSDeps(
 		&orchestratorCVSAdapter{orchRef: orchRef},
 		&orchestratorVFSAdapter{orchRef: orchRef},
+	)
+
+	// Extended observability — pipeline, gateway, knowledge, concurrency.
+	grd.SetExtendedObservabilityDeps(
+		&pipelineQuerierAdapter{orchRef: orchRef},
+		&gatewayQuerierAdapter{gateways: allGateways},
+		&knowledgeQuerierAdapter{store: knowledgeStore},
+		&concurrencyQuerierAdapter{budget: budget},
 	)
 
 	// Cost calculator — derives USD-cents per LLM call from model pricing.
@@ -2207,6 +2169,77 @@ func buildModelSwapper(
 	}
 }
 
+// buildProviderRefresher returns a ProviderRefresher for the given priority
+// that creates a fresh provider for any model/auth-method combination.
+func buildProviderRefresher(
+	googleGw, anthropicGw, openaiGw *gateway.ProviderGateway,
+	priority gateway.RequestPriority,
+) container.ProviderRefresher {
+	return func(ctx context.Context, modelID, authMethod string) (providers.ProviderAdapter, error) {
+		return createRefreshProvider(ctx, modelID, authMethod, googleGw, anthropicGw, openaiGw, priority)
+	}
+}
+
+// createRefreshProvider creates a raw provider for the given model ID and
+// auth method, then wraps it with the correct gateway at the specified priority.
+func createRefreshProvider(
+	ctx context.Context,
+	modelID, authMethod string,
+	googleGw, anthropicGw, openaiGw *gateway.ProviderGateway,
+	priority gateway.RequestPriority,
+) (providers.ProviderAdapter, error) {
+	switch container.ProviderForModel(modelID) {
+	case container.ProviderAnthropic:
+		am := authMethod
+		if am == "" {
+			am = resolveAnthropicAuthMode()
+		}
+		raw, err := providers.NewAnthropicProvider(ctx, providers.AnthropicConfig{
+			BaseConfig: providers.BaseConfig{
+				Model:     modelID,
+				MaxTokens: container.SwapMaxTokens,
+			},
+			AuthMode: am,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return anthropicGw.WrapProvider(raw, priority), nil
+	case container.ProviderGoogle:
+		cfg := providers.DefaultGoogleConfig()
+		cfg.Model = modelID
+		cfg.MaxTokens = container.SwapMaxTokens
+		if authMethod != "" {
+			cfg.AuthMode = authMethod
+		} else if pref := credentials.LoadAuthPref("google"); pref != "" {
+			cfg.AuthMode = normalizeAuthPref(pref)
+		}
+		raw, err := providers.NewGoogleProvider(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return googleGw.WrapProvider(raw, priority), nil
+	case container.ProviderOpenAI:
+		am := authMethod
+		if am == "" {
+			am = "api_key"
+		}
+		raw, err := providers.NewOpenAIProvider(ctx, providers.OpenAIConfig{
+			BaseConfig: providers.BaseConfig{
+				Model:     modelID,
+				MaxTokens: container.SwapMaxTokens,
+			},
+			AuthMode: am,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return openaiGw.WrapProvider(raw, priority), nil
+	default:
+		return nil, fmt.Errorf("unknown provider for model %q", modelID)
+	}
+}
+
 // createSwapProvider creates a raw provider for the given model ID, then
 // wraps it with the correct gateway at the specified priority.
 func createSwapProvider(
@@ -2246,8 +2279,7 @@ func createSwapProvider(
 				Model:     modelID,
 				MaxTokens: container.SwapMaxTokens,
 			},
-			ReasoningEffort: "xhigh",
-			AuthMode:        "api_key",
+			AuthMode: "api_key",
 		})
 		if err != nil {
 			return nil, err
@@ -2372,7 +2404,7 @@ func normalizeAuthPref(pref string) string {
 	}
 }
 
-func bootstrapOrchestrator(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway) (*orchestrator.Orchestrator, error) {
+func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway) (*orchestrator.Orchestrator, error) {
 	googleCfg := defaultOrchestratorGoogleConfig()
 
 	// Best-effort provider creation. If Google auth isn't available yet,
@@ -2386,6 +2418,7 @@ func bootstrapOrchestrator(ctx context.Context, bus guide.EventBus, actPub event
 	}
 
 	cfg := orchestrator.DefaultConfig()
+	cfg.AgentID = agentID
 	cfg.EnableLLM = true
 	if provErr == nil && provider != nil {
 		cfg.GoogleConfig = &googleCfg
@@ -2753,17 +2786,17 @@ type activationMetricsAdapter struct {
 func (a *activationMetricsAdapter) Snapshot() map[string]int64 {
 	s := a.m.Snapshot()
 	return map[string]int64{
-		"activations_total":    s.ActivationsTotal,
-		"cold_starts":          s.ColdStarts,
-		"cool_starts":          s.CoolStarts,
-		"warm_starts":          s.WarmStarts,
-		"hot_hits":             s.HotHits,
-		"coalesced_requests":   s.CoalescedRequests,
-		"demotions_to_warm":    s.DemotionsToWarm,
-		"demotions_to_cool":    s.DemotionsToCool,
-		"demotions_to_cold":    s.DemotionsToCold,
-		"predictor_hits":       s.PredictorHits,
-		"predictor_misses":     s.PredictorMisses,
+		"activations_total":     s.ActivationsTotal,
+		"cold_starts":           s.ColdStarts,
+		"cool_starts":           s.CoolStarts,
+		"warm_starts":           s.WarmStarts,
+		"hot_hits":              s.HotHits,
+		"coalesced_requests":    s.CoalescedRequests,
+		"demotions_to_warm":     s.DemotionsToWarm,
+		"demotions_to_cool":     s.DemotionsToCool,
+		"demotions_to_cold":     s.DemotionsToCold,
+		"predictor_hits":        s.PredictorHits,
+		"predictor_misses":      s.PredictorMisses,
 		"evictions_by_pressure": s.EvictionsByPressure,
 	}
 }
@@ -2845,6 +2878,157 @@ func (a *orchestratorVFSAdapter) Stats() guardian.VFSManagerSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Extended observability adapters — Pipeline, Gateway, Knowledge, Concurrency
+// ---------------------------------------------------------------------------
+
+// pipelineQuerierAdapter implements guardian.PipelineQuerier by delegating
+// to the Orchestrator's summary and DAG snapshot methods.
+type pipelineQuerierAdapter struct {
+	orchRef *atomic.Pointer[orchestrator.Orchestrator]
+}
+
+func (a *pipelineQuerierAdapter) Summary() (*guardian.PipelineSummarySnapshot, error) {
+	orch := a.orchRef.Load()
+	if orch == nil {
+		return &guardian.PipelineSummarySnapshot{}, nil
+	}
+	s, err := orch.GetSummary(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &guardian.PipelineSummarySnapshot{
+		Overview:        s.Overview,
+		ActiveWorkflows: s.Workflows.Running,
+		TotalWorkflows:  s.Workflows.Total,
+		ActiveTasks:     s.Tasks.Running,
+		CompletedTasks:  s.Tasks.Completed,
+		FailedTasks:     s.Tasks.Failed,
+		TotalTasks:      s.Tasks.Total,
+	}, nil
+}
+
+func (a *pipelineQuerierAdapter) DAGSnapshots(limit int) []guardian.DAGSnapshot {
+	orch := a.orchRef.Load()
+	if orch == nil {
+		return nil
+	}
+	snaps := orch.GetDAGSnapshots(limit)
+	out := make([]guardian.DAGSnapshot, len(snaps))
+	for i, s := range snaps {
+		out[i] = guardian.DAGSnapshot{
+			ID:           s.ID,
+			PlanID:       s.PlanID,
+			State:        s.State,
+			CurrentLayer: s.CurrentLayer,
+			TotalLayers:  s.TotalLayers,
+			Progress:     s.Progress,
+			NodesFailed:  s.NodesFailed,
+			Duration:     s.Duration,
+		}
+	}
+	return out
+}
+
+// gatewayQuerierAdapter implements guardian.GatewayQuerier by aggregating
+// metrics from all provider gateways.
+type gatewayQuerierAdapter struct {
+	gateways []*gateway.ProviderGateway
+}
+
+func (a *gatewayQuerierAdapter) AllMetrics() map[string]guardian.GatewayMetricsSnapshot {
+	out := make(map[string]guardian.GatewayMetricsSnapshot, len(a.gateways))
+	for _, gw := range a.gateways {
+		m := gw.Metrics()
+		name := gw.Name()
+		out[name] = guardian.GatewayMetricsSnapshot{
+			Name:        name,
+			Admitted:    m.Admitted,
+			Rejected:    m.Rejected,
+			Queued:      m.Queued,
+			Completed:   m.Completed,
+			RateLimited: m.RateLimited,
+			Errors429:   m.Errors429,
+			Inflight:    m.Inflight,
+			TotalWaitMs: m.TotalWaitNs / 1_000_000,
+		}
+	}
+	return out
+}
+
+// knowledgeQuerierAdapter implements guardian.KnowledgeQuerier by
+// delegating to *knowledge.KnowledgeStore and its coordinator.
+type knowledgeQuerierAdapter struct {
+	store *knowledge.KnowledgeStore
+}
+
+func (a *knowledgeQuerierAdapter) Status() guardian.KnowledgeStatusSnapshot {
+	level := a.store.Level()
+	labels := [3]string{"none", "partial", "full"}
+	label := labels[0]
+	if int(level) < len(labels) {
+		label = labels[level]
+	}
+
+	var searchers []string
+	if coord := a.store.Coordinator(); coord != nil {
+		searchers = coord.ReadySearchers()
+	}
+
+	return guardian.KnowledgeStatusSnapshot{
+		ReadinessLevel: int(level),
+		ReadinessLabel: label,
+		ReadySearchers: searchers,
+	}
+}
+
+func (a *knowledgeQuerierAdapter) QueryMetrics() guardian.KnowledgeQueryMetrics {
+	coord := a.store.Coordinator()
+	if coord == nil {
+		return guardian.KnowledgeQueryMetrics{}
+	}
+	m := coord.GetAverageMetrics()
+	if m == nil {
+		return guardian.KnowledgeQueryMetrics{}
+	}
+	return guardian.KnowledgeQueryMetrics{
+		TextLatencyMs:       m.TextLatency.Milliseconds(),
+		SemanticLatencyMs:   m.SemanticLatency.Milliseconds(),
+		GraphLatencyMs:      m.GraphLatency.Milliseconds(),
+		FusionLatencyMs:     m.FusionLatency.Milliseconds(),
+		TotalLatencyMs:      m.TotalLatency.Milliseconds(),
+		TextContributed:     m.TextContributed,
+		SemanticContributed: m.SemanticContributed,
+		GraphContributed:    m.GraphContributed,
+	}
+}
+
+func (a *knowledgeQuerierAdapter) IngestionProgress() (indexed, total int64) {
+	w := a.store.BackgroundWaiter()
+	if w == nil {
+		return 0, 0
+	}
+	return w.Progress()
+}
+
+// concurrencyQuerierAdapter implements guardian.ConcurrencyQuerier by
+// delegating to *concurrency.GoroutineBudget.
+type concurrencyQuerierAdapter struct {
+	budget *concurrency.GoroutineBudget
+}
+
+func (a *concurrencyQuerierAdapter) GoroutineStats() guardian.GoroutineBudgetSnapshot {
+	return guardian.GoroutineBudgetSnapshot{
+		TotalActive: a.budget.TotalActive(),
+		SystemLimit: a.budget.SystemLimit(),
+		AgentCount:  a.budget.AgentCount(),
+	}
+}
+
+func (a *concurrencyQuerierAdapter) LLMGateStats() guardian.LLMGateSnapshot {
+	return guardian.LLMGateSnapshot{}
+}
+
+// ---------------------------------------------------------------------------
 // Cost calculator — derives USD-cents from model pricing
 // ---------------------------------------------------------------------------
 
@@ -2858,13 +3042,11 @@ func buildCostCalculator() guardian.CostCalculator {
 	type pricing struct{ input, output float64 }
 	prices := map[string]pricing{
 		// Anthropic
-		"claude-opus-4-6":            {15.0, 75.0},
-		"claude-opus-4-5-20251101":   {15.0, 75.0},
-		"claude-sonnet-4-6":          {3.0, 15.0},
-		"claude-haiku-4-5-20251001":  {0.80, 4.0},
+		"claude-opus-4-6":           {15.0, 75.0},
+		"claude-sonnet-4-6":         {3.0, 15.0},
+		"claude-haiku-4-5-20251001": {0.80, 4.0},
 		// OpenAI
-		"gpt-5.3-codex": {2.50, 10.0},
-		"gpt-5.2-codex": {2.50, 10.0},
+		"gpt-5.4-pro": {2.50, 10.0},
 		// Google
 		"gemini-3.1-pro-preview": {1.25, 5.0},
 		"gemini-3-flash":         {0.075, 0.30},

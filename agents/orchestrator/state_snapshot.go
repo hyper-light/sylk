@@ -22,7 +22,7 @@ type stateSnapshot struct {
 	Health     healthSnap        `json:"health"`
 	Alerts     []alertSnap       `json:"alerts"`
 	Stats      snapshotStats     `json:"stats"`
-	DAGs       []dagSnap         `json:"dags,omitempty"`
+	DAGs       []DAGSnap         `json:"dags,omitempty"`
 	Buffers    []bufferSnap      `json:"buffers,omitempty"`
 	Pipeline   []pipelineSnap    `json:"pipeline,omitempty"`
 }
@@ -62,7 +62,7 @@ type snapshotStats struct {
 	Submitted int64 `json:"submitted"`
 }
 
-type dagSnap struct {
+type DAGSnap struct {
 	ID           string  `json:"id"`
 	PlanID       string  `json:"plan_id"`
 	State        string  `json:"state"`

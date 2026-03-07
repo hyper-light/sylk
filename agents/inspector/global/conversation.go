@@ -60,6 +60,7 @@ func (gi *GlobalInspector) executeConversationStream(
 ) (*ConversationResult, error) {
 	systemPrompt := shared.GlobalInspectorConversationSystemPrompt()
 	userMessage := buildInspectorConversationPrompt(fwd)
+	gi.prepareSkillsForInput(userMessage)
 	tools := gi.buildConversationToolDefinitions()
 
 	temp := float64(inspectorConversationTemp)
@@ -72,6 +73,7 @@ func (gi *GlobalInspector) executeConversationStream(
 		Temperature:  &temp,
 		Tools:        tools,
 	}
+	gi.applyLLMRuntimeProfile(req, "conversation")
 	if len(tools) > 0 {
 		req.ToolChoice = "auto"
 	}

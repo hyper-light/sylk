@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -23,9 +24,10 @@ func (g *Guardian) executeToolLoop(
 	stage string,
 	onChunk func(string),
 	ledger *steering.SteeringLedger,
-) (string, error) {
+) (string, *guide.StreamUsage, error) {
 	maxRuns := g.config.MaxToolRuns
 	consecutiveErrors := 0
+	usageAcc := &guardianUsageAccumulator{}
 
 	provider := g.getProvider()
 	if provider == nil {
@@ -34,7 +36,7 @@ func (g *Guardian) executeToolLoop(
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
 		}
-		return "", fmt.Errorf("guardian: no LLM provider configured")
+		return "", nil, fmt.Errorf("guardian: no LLM provider configured")
 	}
 
 	g.logDebug("tool_loop: START",
@@ -47,7 +49,7 @@ func (g *Guardian) executeToolLoop(
 	for turn := 0; turn <= maxRuns; turn++ {
 		if ctx.Err() != nil {
 			g.logWarn("executeToolLoop: context cancelled", "stage", stage, "turn", turn)
-			return "", ctx.Err()
+			return "", usageAcc.Total(), ctx.Err()
 		}
 
 		// ── STEERING CHECKPOINT ──
@@ -76,7 +78,7 @@ func (g *Guardian) executeToolLoop(
 		}
 		if sc.ShouldPause {
 			if err := ledger.WaitForResume(ctx); err != nil {
-				return "", err
+				return "", usageAcc.Total(), err
 			}
 			continue
 		}
@@ -89,17 +91,17 @@ func (g *Guardian) executeToolLoop(
 
 		// ── CONTEXT BUDGET ──
 		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
-			return "", err
+			return "", usageAcc.Total(), err
 		}
 
 		turnStart := time.Now()
-		resp, err := provider.Complete(ctx, req)
+		resp, err := g.streamToolLoopTurn(ctx, provider, req, onChunk)
 		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
 		if err != nil {
 			// User interrupt (Ctrl+C / Esc) cancels reqCtx via steering —
 			// treat as clean abort, not an error worth logging.
 			if ctx.Err() != nil {
-				return "", ctx.Err()
+				return "", usageAcc.Total(), ctx.Err()
 			}
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -107,16 +109,12 @@ func (g *Guardian) executeToolLoop(
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
 			}
 			g.logWarn("executeToolLoop: LLM error", "stage", stage, "turn", turn, "err", err)
-			return "", fmt.Errorf("guardian llm: %w", err)
+			return "", usageAcc.Total(), fmt.Errorf("guardian llm: %w", err)
 		}
+		usageAcc.Add(&resp.Usage)
 
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
-		}
-
-		// Emit text chunks.
-		if onChunk != nil && resp.Content != "" {
-			onChunk(resp.Content)
 		}
 
 		if len(resp.ToolCalls) == 0 {
@@ -125,13 +123,13 @@ func (g *Guardian) executeToolLoop(
 				"stage", stage, "turn", turn,
 				"content_len", len(resp.Content),
 				"total_elapsed", time.Since(loopStart).String())
-			return strings.TrimSpace(resp.Content), nil
+			return strings.TrimSpace(resp.Content), usageAcc.Total(), nil
 		}
 
 		errCount, rerouted := g.applyToolCalls(ctx, req, resp)
 		g.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
-			return "", skills.ErrRerouteRequested
+			return "", usageAcc.Total(), skills.ErrRerouteRequested
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
@@ -140,12 +138,56 @@ func (g *Guardian) executeToolLoop(
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
 					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
 			}
-			return "", fmt.Errorf("guardian tool calls failed %d consecutive turns", consecutiveErrors)
+			return "", usageAcc.Total(), fmt.Errorf("guardian tool calls failed %d consecutive turns", consecutiveErrors)
 		}
 	}
 
 	g.logWarn("executeToolLoop: loop exhausted, falling back to deterministic report", "stage", stage)
-	return g.generateHealthReport()
+	report, err := g.generateHealthReport()
+	return report, usageAcc.Total(), err
+}
+
+func (g *Guardian) streamToolLoopTurn(
+	ctx context.Context,
+	provider guardianProvider,
+	req *providers.Request,
+	onChunk func(string),
+) (*providers.Response, error) {
+	chunks, err := provider.Stream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	var thoughts strings.Builder
+	collector := providers.NewStreamCollector(func(chunk *providers.StreamChunk) {
+		switch chunk.Type {
+		case providers.ChunkTypeStart:
+			thoughts.Reset()
+			if chunk.RetryReset {
+				g.publishStreamStart(ctx, correlationID)
+			}
+		case providers.ChunkTypeText:
+			if onChunk != nil && chunk.Text != "" {
+				onChunk(chunk.Text)
+			}
+		case providers.ChunkTypeThought:
+			thoughts.WriteString(chunk.Text)
+			g.publishThoughtProgress(ctx, correlationID, thoughts.String())
+		}
+	})
+
+	var streamErr error
+	for chunk := range chunks {
+		collector.Add(chunk)
+		if chunk.Type == providers.ChunkTypeError {
+			streamErr = fmt.Errorf("stream error: %s", chunk.Text)
+		}
+	}
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	return collector.Response(), nil
 }
 
 // applyToolCalls appends assistant message and tool results to the request.

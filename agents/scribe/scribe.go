@@ -222,6 +222,7 @@ func (s *Scribe) generateCommentary(ctx context.Context) (string, error) {
 		SystemPrompt: fmt.Sprintf(scribeSystemPrompt, s.parentAgentType),
 		Messages:     msgs,
 	}
+	s.applyCommentaryRuntimeProfile(req)
 
 	resp, err := s.provider.Complete(ctx, req)
 	if err != nil {

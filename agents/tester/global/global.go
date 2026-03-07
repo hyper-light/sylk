@@ -1,7 +1,7 @@
 // Package global implements the Global Tester agent — a cross-pipeline SDET
 // that architects and runs integration/e2e/cross-cutting tests after a batch
 // of concurrent pipelines completes. It gates on Inspector completion and uses
-// GPT-5.3 Codex with xhigh reasoning to drive a 7-phase testing protocol.
+// GPT-5.4 Pro with xhigh reasoning to drive a 7-phase testing protocol.
 package global
 
 import (
@@ -12,16 +12,16 @@ import (
 	"sync"
 	"time"
 
-	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
-	"github.com/adalundhe/sylk/core/agentlog"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/providers/gateway"
-	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -38,16 +38,16 @@ type GlobalTester struct {
 	config shared.GlobalTesterConfig
 	logger *slog.Logger
 
-	// LLM provider (OpenAI gpt-5.3-codex with xhigh reasoning).
-	provider        globalTesterProvider
-	providerWrapper gateway.ProviderWrapper
+	// LLM provider (OpenAI gpt-5.4-pro with xhigh reasoning).
+	provider  globalTesterProvider
+	refresher container.ProviderRefresher
 
 	// State.
-	currentPlan *shared.TestPlan
-	harness       *TestHarness
-	batchContext   *shared.BatchContext
-	diagnoses     map[string]*shared.DiagnosisReport
-	mu            sync.RWMutex
+	currentPlan  *shared.TestPlan
+	harness      *TestHarness
+	batchContext *shared.BatchContext
+	diagnoses    map[string]*shared.DiagnosisReport
+	mu           sync.RWMutex
 
 	// Diagnosis engine.
 	diagEngine shared.DiagnosisEngine
@@ -87,22 +87,22 @@ type GlobalTester struct {
 }
 
 // New creates a new GlobalTester instance.
-func New(cfg shared.GlobalTesterConfig, provider globalTesterProvider) (*GlobalTester, error) {
+func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*GlobalTester, error) {
 	cfg = applyConfigDefaults(cfg)
 
 	testerID := cfg.AgentID
 	if testerID == "" {
-		testerID = fmt.Sprintf("tester_%s", uuid.New().String()[:8])
+		testerID = uuid.New().String()[:8]
 	}
 
 	gt := &GlobalTester{
-		id:          testerID,
-		config:      cfg,
-		logger:      slog.Default().With("agent", "tester"),
-		provider:    provider,
-		diagnoses:   make(map[string]*shared.DiagnosisReport),
-		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		diagEngine:  shared.NewDiagnosisEngine(),
+		id:                testerID,
+		config:            cfg,
+		logger:            slog.Default().With("agent", "tester"),
+		provider:          provider,
+		diagnoses:         make(map[string]*shared.DiagnosisReport),
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		diagEngine:        shared.NewDiagnosisEngine(),
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
 	}
@@ -123,10 +123,12 @@ func (gt *GlobalTester) SetProvider(p providers.Provider) {
 	gt.provider = p
 }
 
-// SetProviderWrapper stores a callback that re-applies gateway rate limiting
-// to fresh providers created during credential refresh.
-func (gt *GlobalTester) SetProviderWrapper(w gateway.ProviderWrapper) {
-	gt.providerWrapper = w
+// SetProviderRefresher stores a callback that creates a fresh provider for
+// the current model and auth method. Set by cmd/tui.go at bootstrap.
+func (gt *GlobalTester) SetProviderRefresher(fn container.ProviderRefresher) {
+	gt.mu.Lock()
+	defer gt.mu.Unlock()
+	gt.refresher = fn
 }
 
 // HasProvider reports whether an LLM provider is currently configured.
@@ -144,29 +146,24 @@ func (gt *GlobalTester) getProvider() globalTesterProvider {
 }
 
 // ProviderType implements container.AuthRefreshable.
-func (gt *GlobalTester) ProviderType() string { return "openai" }
+func (gt *GlobalTester) ProviderType() string {
+	return string(container.ProviderForModel(gt.CurrentModel()))
+}
 
 // RefreshProvider implements container.AuthRefreshable.
-// Re-resolves OpenAI credentials and replaces the provider.
 func (gt *GlobalTester) RefreshProvider(ctx context.Context, authMethod string) error {
-	cfg := providers.OpenAIConfig{
-		BaseConfig: providers.BaseConfig{
-			Model:     gt.config.Model,
-			MaxTokens: gt.config.MaxTokens,
-		},
-		ReasoningEffort: gt.config.ReasoningEffort,
-		AuthMode:        authMethod,
+	gt.mu.RLock()
+	fn := gt.refresher
+	gt.mu.RUnlock()
+	if fn == nil {
+		return nil
 	}
-	p, err := providers.NewOpenAIProvider(ctx, cfg)
+	p, err := fn(ctx, gt.CurrentModel(), authMethod)
 	if err != nil {
 		return fmt.Errorf("tester refresh provider: %w", err)
 	}
-	if gt.providerWrapper != nil {
-		gt.SetProvider(gt.providerWrapper(p))
-	} else {
-		gt.SetProvider(p)
-	}
-	gt.logger.Info("provider refreshed", "auth_method", authMethod)
+	gt.SetProvider(p)
+	gt.logger.Info("provider refreshed", "model", gt.CurrentModel(), "auth_method", authMethod)
 	return nil
 }
 
@@ -192,7 +189,7 @@ func (gt *GlobalTester) CurrentModel() string {
 // SupportedModels implements container.ModelSwappable.
 func (gt *GlobalTester) SupportedModels() []container.ModelOption {
 	return []container.ModelOption{
-		{ID: "gpt-5.3-codex", DisplayName: "GPT-5.3 Codex"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
 		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
 	}
 }
@@ -243,18 +240,8 @@ func (gt *GlobalTester) initSkills() {
 		"write_test",
 		"run_test_suite",
 		"diagnose_failure",
-		"analyze_batch",
-		"analyze_integration_risks",
-		"plan_integration_tests",
-		"plan_e2e_tests",
-		"build_harness",
-		"write_integration_test",
-		"write_e2e_test",
-		"report_to_orchestrator",
-		"report_to_architect",
-		"escalate_failure",
 	}
-	loaderCfg.AutoLoadDomains = []string{"testing", "quality"}
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	gt.skillLoader = skills.NewLoader(gt.skills, loaderCfg)
 
 	gt.registerCoreSkills()
@@ -292,12 +279,16 @@ func (gt *GlobalTester) registerCoreSkills() {
 
 type globalTesterDiag struct{ gt *GlobalTester }
 
-func (d *globalTesterDiag) AgentName() string  { return "tester_global" }
-func (d *globalTesterDiag) SessionID() string  { return d.gt.config.SessionID }
-func (d *globalTesterDiag) LogsDir() string    { return agentshared.LogsDirForAgent(d.gt.steering.SessionDir(), "tester_global") }
-func (d *globalTesterDiag) EventLogger() *agentlog.SessionEventLogger { return d.gt.steering.EventLogger() }
-func (d *globalTesterDiag) PeerLogsDirs() map[string]string           { return nil }
-func (d *globalTesterDiag) RecoveryHints() []string                   { return nil }
+func (d *globalTesterDiag) AgentName() string { return "tester_global" }
+func (d *globalTesterDiag) SessionID() string { return d.gt.config.SessionID }
+func (d *globalTesterDiag) LogsDir() string {
+	return agentshared.LogsDirForAgent(d.gt.steering.SessionDir(), "tester_global")
+}
+func (d *globalTesterDiag) EventLogger() *agentlog.SessionEventLogger {
+	return d.gt.steering.EventLogger()
+}
+func (d *globalTesterDiag) PeerLogsDirs() map[string]string { return nil }
+func (d *globalTesterDiag) RecoveryHints() []string         { return nil }
 
 func (d *globalTesterDiag) AgentSpecificDiagnostics() map[string]any {
 	d.gt.mu.RLock()
@@ -426,6 +417,7 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 	}
 
 	systemPrompt := shared.GlobalTesterSystemPrompt()
+	gt.prepareSkillsForInput(fwd.Input)
 	tools := gt.buildToolDefinitions()
 
 	req := &providers.Request{
@@ -435,6 +427,7 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		},
 		Tools: tools,
 	}
+	llmruntime.Apply(req, gt.llmRuntimeProfile())
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
@@ -501,7 +494,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 		SessionID:   fwd.SessionID,
 	})
 
-	toolEmitter := agentshared.NewToolCallEmitter(gt.bus, gt.channels, "tester", fwd.CorrelationID, fwd.SourceAgentID)
+	toolEmitter := agentshared.NewToolCallEmitter(gt.bus, gt.channels, gt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
 	ctx = agentshared.WithContextGovernor(ctx, agentshared.NewContextGovernor(
 		gt.config.Model, gt.config.MaxTokens, 0,
@@ -520,7 +513,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,
 		Success:             err == nil,
-		RespondingAgentID:   "tester",
+		RespondingAgentID:   gt.id,
 		RespondingAgentName: "Tester",
 		ProcessingTime:      time.Since(startTime),
 	}
@@ -658,10 +651,16 @@ func (gt *GlobalTester) AgentType() string { return "tester" }
 func (gt *GlobalTester) Descriptor() handoff.AgentDescriptor {
 	return handoff.AgentDescriptor{
 		AgentType:       "tester",
-		ModelID:         "gpt-5.3-codex",
-		ReasoningEffort: "xhigh",
-		ContextWindow:   200_000,
+		ModelID:         gt.CurrentModel(),
+		ReasoningEffort: gt.config.ReasoningEffort,
+		ContextWindow:   272_000,
 		Category:        handoff.CategoryStandalone,
+	}
+}
+
+func (gt *GlobalTester) llmRuntimeProfile() llmruntime.Profile {
+	return llmruntime.Profile{
+		ReasoningEffort: gt.config.ReasoningEffort,
 	}
 }
 

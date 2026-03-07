@@ -676,6 +676,15 @@ func (m *Model) findAgentByType(agentType string) *AgentState {
 	return nil
 }
 
+// AgentTypeOf returns the agent type for a given canonical ID.
+// Returns "" when the ID is not known to the panel.
+func (m *Model) AgentTypeOf(agentID string) string {
+	if a, ok := m.agents[agentID]; ok {
+		return a.AgentType
+	}
+	return ""
+}
+
 // updateAgentStatus applies the table-driven EventType->AgentStatus mapping.
 func (m *Model) updateAgentStatus(agentID string, ev msg.ActivityEventMsg) {
 	agent, ok := m.agents[agentID]

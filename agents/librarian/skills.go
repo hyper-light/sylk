@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -27,9 +28,18 @@ func (l *Librarian) registerCoreSkills() {
 	l.skills.Register(readFileSkill(l))
 	l.skills.Register(globSkill(l))
 	l.skills.Register(grepSkill(l))
+	l.skills.Register(findSymbolSkill(l))
 	l.skills.Register(gitSkill(l))
 	l.skills.Register(lspSkill(l))
 	l.skills.Register(astGrepSearchSkill(l))
+
+	// Knowledge graph search (available when knowledge store is wired).
+	l.skills.Register(knowledgeSearchSkill(l))
+
+	// Remote package cloning (always available).
+	l.skills.Register(cloneRepositorySkill(l))
+	l.skills.Register(listPackagesSkill(l))
+	l.skills.Register(removePackageSkill(l))
 
 	// Infrastructure skills.
 	l.skills.Register(shared.NewSelfDiagnosticSkill(&librarianDiag{}))
@@ -461,6 +471,69 @@ func locateSymbolSkill(l *Librarian) *skills.Skill {
 			}
 
 			return buildSymbolResponse(params, resp), nil
+		}).
+		Build()
+}
+
+type knowledgeSearchParams struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+func knowledgeSearchSkill(l *Librarian) *skills.Skill {
+	return skills.NewSkill("knowledge_search").
+		Description("Search the knowledge graph and document index for code architecture, patterns, relationships, and historical context. Use this to answer questions about the codebase structure, agent definitions, configurations, and inter-component relationships.").
+		Domain("code").
+		Keywords("knowledge", "graph", "search", "architecture", "relationship", "pattern", "agent", "config").
+		Priority(100).
+		StringParam("query", "Natural language search query", true).
+		IntParam("limit", "Maximum number of results (default: 10)", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params knowledgeSearchParams
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if params.Query == "" {
+				return nil, fmt.Errorf("query is required")
+			}
+			if params.Limit == 0 {
+				params.Limit = 10
+			}
+
+			l.mu.Lock()
+			ks := l.knowledgeStore
+			l.mu.Unlock()
+
+			if ks == nil {
+				return nil, fmt.Errorf("knowledge store not available (indexing may still be in progress)")
+			}
+			coord := ks.Coordinator()
+			if coord == nil {
+				return nil, fmt.Errorf("knowledge coordinator not initialized")
+			}
+
+			results, err := coord.Execute(ctx, &query.HybridQuery{
+				TextQuery: params.Query,
+				Limit:     params.Limit,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("knowledge search: %w", err)
+			}
+
+			entries := make([]map[string]any, 0, len(results))
+			for _, r := range results {
+				entries = append(entries, map[string]any{
+					"id":      r.ID,
+					"content": r.Content,
+					"score":   r.Score,
+					"source":  r.Source.String(),
+				})
+			}
+			return map[string]any{
+				"results": entries,
+				"count":   len(entries),
+				"query":   params.Query,
+			}, nil
 		}).
 		Build()
 }

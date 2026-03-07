@@ -10,6 +10,7 @@ import (
 	"github.com/adalundhe/sylk/agents/architect"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -79,6 +80,7 @@ func (o *Orchestrator) handleConversation(ctx context.Context, req *guide.Forwar
 func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestratorConversationRequest) (*ConversationResult, error) {
 	systemPrompt := OrchestratorConversationSystemPrompt()
 	userMessage := buildConversationUserPrompt(cr)
+	o.prepareSkillsForInput(userMessage)
 	tools := o.buildConversationToolDefinitions()
 
 	temp := float64(conversationTemp)
@@ -92,6 +94,7 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 		Temperature:  &temp,
 		Tools:        tools,
 	}
+	llmruntime.Apply(llmReq, o.conversationLLMRuntimeProfile())
 	if len(tools) > 0 {
 		llmReq.ToolChoice = "auto"
 	}
@@ -187,6 +190,7 @@ func (o *Orchestrator) generateIngestionSummary(
 		MaxTokens:    conversationMaxTokens,
 		Temperature:  &temp,
 	}
+	llmruntime.Apply(llmReq, o.conversationLLMRuntimeProfile())
 
 	llmCtx, cancel := context.WithTimeout(ctx, ingestionLLMTimeout)
 	defer cancel()
@@ -208,6 +212,10 @@ func (o *Orchestrator) generateIngestionSummary(
 		Response: trimmed,
 		Intent:   "ingestion_ack",
 	}, nil
+}
+
+func (o *Orchestrator) conversationLLMRuntimeProfile() llmruntime.Profile {
+	return llmruntime.Profile{}
 }
 
 // buildIngestionSummaryPrompt composes the user message for the LLM to
