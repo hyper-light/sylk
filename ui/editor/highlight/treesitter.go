@@ -30,6 +30,10 @@ type Highlighter struct {
 	language   string
 	grammarOK  bool
 	grammarErr bool
+
+	cachedContent string
+	cachedRegions [][]HighlightRegion
+	cacheValid    bool
 }
 
 // NewHighlighter creates a Highlighter with the given theme.
@@ -47,6 +51,7 @@ func (h *Highlighter) Close() {
 		h.parser.Close()
 		h.parser = nil
 	}
+	h.clearCache()
 }
 
 // Tree returns the current parse tree, or nil if no grammar is loaded or
@@ -66,12 +71,21 @@ func (h *Highlighter) Highlight(content string, language string) [][]HighlightRe
 	if language != h.language {
 		h.setLanguage(language)
 	}
+	if h.cacheValid && content == h.cachedContent {
+		return h.cachedRegions
+	}
+
+	var regions [][]HighlightRegion
 	if h.grammarOK {
-		if regions := h.highlightTreeSitter(content); regions != nil {
-			return regions
+		if tsRegions := h.highlightTreeSitter(content); tsRegions != nil {
+			regions = tsRegions
 		}
 	}
-	return highlightKeyword(content, language)
+	if regions == nil {
+		regions = highlightKeyword(content, language)
+	}
+	h.storeCache(content, regions)
+	return regions
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +96,7 @@ func (h *Highlighter) setLanguage(language string) {
 	h.language = language
 	h.grammarOK = false
 	h.grammarErr = false
+	h.clearCache()
 	if h.tree != nil {
 		h.tree.Close()
 		h.tree = nil
@@ -101,6 +116,18 @@ func (h *Highlighter) setLanguage(language string) {
 		return
 	}
 	h.grammarOK = true
+}
+
+func (h *Highlighter) clearCache() {
+	h.cachedContent = ""
+	h.cachedRegions = nil
+	h.cacheValid = false
+}
+
+func (h *Highlighter) storeCache(content string, regions [][]HighlightRegion) {
+	h.cachedContent = content
+	h.cachedRegions = regions
+	h.cacheValid = true
 }
 
 func (h *Highlighter) highlightTreeSitter(content string) [][]HighlightRegion {

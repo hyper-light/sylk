@@ -3,9 +3,36 @@ package theme
 import (
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+)
+
+const (
+	borderPhaseBucket   = 100 * time.Millisecond
+	borderFrameCacheCap = 64
+	ansiReset           = "\x1b[0m"
+)
+
+type borderFrameKey struct {
+	gradient    *Gradient
+	innerW      int
+	innerH      int
+	phaseBucket int64
+}
+
+type borderFrame struct {
+	top    string
+	bottom string
+	left   []string
+	right  []string
+}
+
+var (
+	borderFrameCacheMu sync.Mutex
+	borderFrameCache   = make(map[borderFrameKey]borderFrame)
 )
 
 // RenderGradientBorder wraps content in a rounded border where each border
@@ -24,97 +51,23 @@ func RenderGradientBorder(content string, g *Gradient, elapsed time.Duration, in
 		return content
 	}
 
-	// Split content into lines and pad/truncate to exact inner dimensions.
-	// Manual processing avoids lipgloss re-wrapping ANSI-dense content
-	// (e.g. per-character selection styling) which can produce extra lines.
-	lines := strings.Split(content, "\n")
-	if len(lines) > innerH {
-		lines = lines[:innerH]
-	}
-	pad := strings.Repeat(" ", innerW)
-	for len(lines) < innerH {
-		lines = append(lines, pad)
-	}
-	for i, line := range lines {
-		w := lipgloss.Width(line)
-		switch {
-		case w < innerW:
-			lines[i] = line + strings.Repeat(" ", innerW-w)
-		case w > innerW:
-			// Truncate oversized lines (e.g. cursor trailing space
-			// extending past contentWidth). MaxWidth may wrap instead
-			// of truncate, so take only the first line to prevent
-			// embedded newlines from corrupting the border structure.
-			rendered := lipgloss.NewStyle().MaxWidth(innerW).Render(line)
-			if idx := strings.Index(rendered, "\n"); idx >= 0 {
-				rendered = rendered[:idx]
-			}
-			lines[i] = rendered
-		}
-	}
-
-	nRows := len(lines)
-	borderW := innerW + 2
-	perim := 2 * (borderW + nRows)
-
-	// Phase spread: total gradient time visible around the border at any
-	// instant. 3×FocusRingFlowStep keeps the same visual spread as the
-	// old 4-side approach but distributed smoothly per character.
-	totalSpread := 3 * FocusRingFlowStep
-	phasePerChar := totalSpread / time.Duration(perim)
-
-	bd := lipgloss.RoundedBorder()
+	lines := normalizeBorderLines(content, innerW, innerH)
+	frame := cachedBorderFrame(g, elapsed, innerW, len(lines))
 
 	// Estimate: border chars ~20 bytes each (ANSI), content ~innerW,
 	// newlines, plus reset sequences.
 	var b strings.Builder
-	b.Grow((borderW + 40) * (nRows + 2))
-
-	// Top border: ╭─...─╮ (positions 0..borderW-1, left to right).
-	for i := range borderW {
-		ch := bd.Top
-		switch i {
-		case 0:
-			ch = bd.TopLeft
-		case borderW - 1:
-			ch = bd.TopRight
-		}
-		writeColoredChar(&b, g, elapsed, i, phasePerChar, ch)
-	}
-	b.WriteString("\x1b[0m\n")
-
-	// Content rows with │ borders.
+	b.Grow((innerW + 40) * (len(lines) + 2))
+	b.WriteString(frame.top)
+	b.WriteByte('\n')
 	for r, line := range lines {
-		// Left │ — perimeter goes bottom-to-top on left side.
-		leftPos := perim - 1 - r
-		writeColoredChar(&b, g, elapsed, leftPos, phasePerChar, bd.Left)
-		b.WriteString("\x1b[0m")
-
+		b.WriteString(frame.left[r])
 		b.WriteString(line)
-
-		// Reset content styling before right border.
-		b.WriteString("\x1b[0m")
-
-		// Right │ — perimeter goes top-to-bottom on right side.
-		rightPos := borderW + r
-		writeColoredChar(&b, g, elapsed, rightPos, phasePerChar, bd.Right)
-		b.WriteString("\x1b[0m\n")
+		b.WriteString(ansiReset)
+		b.WriteString(frame.right[r])
+		b.WriteByte('\n')
 	}
-
-	// Bottom border: ╰─...─╯ (right-to-left in perimeter order).
-	for i := range borderW {
-		ch := bd.Bottom
-		switch i {
-		case 0:
-			ch = bd.BottomLeft
-		case borderW - 1:
-			ch = bd.BottomRight
-		}
-		// Column i maps to perimeter position right-to-left.
-		pos := borderW + nRows + (borderW - 1 - i)
-		writeColoredChar(&b, g, elapsed, pos, phasePerChar, ch)
-	}
-	b.WriteString("\x1b[0m")
+	b.WriteString(frame.bottom)
 
 	result := b.String()
 
@@ -127,6 +80,129 @@ func RenderGradientBorder(content string, g *Gradient, elapsed time.Duration, in
 	}
 
 	return result
+}
+
+func normalizeBorderLines(content string, innerW, innerH int) []string {
+	if innerW < 0 {
+		innerW = 0
+	}
+	if innerH < 0 {
+		innerH = 0
+	}
+
+	lines := strings.Split(content, "\n")
+	if len(lines) > innerH {
+		lines = lines[:innerH]
+	}
+
+	pad := strings.Repeat(" ", innerW)
+	for len(lines) < innerH {
+		lines = append(lines, pad)
+	}
+
+	for i, line := range lines {
+		w := ansi.StringWidth(line)
+		switch {
+		case w < innerW:
+			lines[i] = line + pad[:innerW-w]
+		case w > innerW:
+			lines[i] = ansi.Truncate(line, innerW, "")
+		}
+	}
+
+	return lines
+}
+
+func cachedBorderFrame(g *Gradient, elapsed time.Duration, innerW, innerH int) borderFrame {
+	key := borderFrameKey{
+		gradient:    g,
+		innerW:      innerW,
+		innerH:      innerH,
+		phaseBucket: int64(elapsed / borderPhaseBucket),
+	}
+
+	borderFrameCacheMu.Lock()
+	frame, ok := borderFrameCache[key]
+	borderFrameCacheMu.Unlock()
+	if ok {
+		return frame
+	}
+
+	frame = buildBorderFrame(g, time.Duration(key.phaseBucket)*borderPhaseBucket, innerW, innerH)
+
+	borderFrameCacheMu.Lock()
+	if len(borderFrameCache) >= borderFrameCacheCap {
+		clear(borderFrameCache)
+	}
+	borderFrameCache[key] = frame
+	borderFrameCacheMu.Unlock()
+
+	return frame
+}
+
+func buildBorderFrame(g *Gradient, elapsed time.Duration, innerW, innerH int) borderFrame {
+	borderW := innerW + 2
+	perim := 2 * (borderW + innerH)
+
+	totalSpread := 3 * FocusRingFlowStep
+	phasePerChar := time.Duration(0)
+	if perim > 0 {
+		phasePerChar = totalSpread / time.Duration(perim)
+	}
+
+	bd := lipgloss.RoundedBorder()
+	frame := borderFrame{
+		left:  make([]string, innerH),
+		right: make([]string, innerH),
+	}
+
+	var top strings.Builder
+	top.Grow(borderW * 20)
+	for i := 0; i < borderW; i++ {
+		ch := bd.Top
+		switch i {
+		case 0:
+			ch = bd.TopLeft
+		case borderW - 1:
+			ch = bd.TopRight
+		}
+		writeColoredChar(&top, g, elapsed, i, phasePerChar, ch)
+	}
+	top.WriteString(ansiReset)
+	frame.top = top.String()
+
+	for r := 0; r < innerH; r++ {
+		leftPos := perim - 1 - r
+		rightPos := borderW + r
+
+		var left, right strings.Builder
+		left.Grow(24)
+		right.Grow(24)
+		writeColoredChar(&left, g, elapsed, leftPos, phasePerChar, bd.Left)
+		left.WriteString(ansiReset)
+		writeColoredChar(&right, g, elapsed, rightPos, phasePerChar, bd.Right)
+		right.WriteString(ansiReset)
+		frame.left[r] = left.String()
+		frame.right[r] = right.String()
+	}
+
+	var bottom strings.Builder
+	bottom.Grow(borderW * 20)
+	for i := 0; i < borderW; i++ {
+		ch := bd.Bottom
+		switch i {
+		case 0:
+			ch = bd.BottomLeft
+		case borderW - 1:
+			ch = bd.BottomRight
+		}
+		pos := borderW + innerH + (borderW - 1 - i)
+		writeColoredChar(&bottom, g, elapsed, pos, phasePerChar, ch)
+	}
+	bottom.WriteString(ansiReset)
+	frame.bottom = bottom.String()
+
+	return frame
 }
 
 // writeColoredChar appends a border character colored by the gradient at the

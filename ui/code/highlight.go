@@ -32,6 +32,10 @@ type Highlighter struct {
 	tsLang     string             // current tree-sitter language name
 	grammarOK  bool               // grammar loaded successfully
 	grammarErr bool               // grammar load failed (don't retry)
+
+	cachedContent string
+	cachedRegions [][]HighlightRegion
+	cacheValid    bool
 }
 
 // NewHighlighter creates a Highlighter that uses the given theme's syntax
@@ -69,6 +73,7 @@ func (h *Highlighter) Close() {
 		h.parser.Close()
 		h.parser = nil
 	}
+	h.clearCache()
 }
 
 // HighlightLine applies highlight regions to a single line string and returns
@@ -224,12 +229,21 @@ func (h *Highlighter) HighlightContent(content string, language string) [][]High
 	if language != h.tsLang {
 		h.setTreeSitterLang(language)
 	}
+	if h.cacheValid && content == h.cachedContent {
+		return h.cachedRegions
+	}
+
+	var regions [][]HighlightRegion
 	if h.grammarOK {
-		if regions := h.highlightTreeSitter(content); regions != nil {
-			return regions
+		if tsRegions := h.highlightTreeSitter(content); tsRegions != nil {
+			regions = tsRegions
 		}
 	}
-	return h.highlightRegex(content, language)
+	if regions == nil {
+		regions = h.highlightRegex(content, language)
+	}
+	h.storeCache(content, regions)
+	return regions
 }
 
 // highlightRegex produces regions using the regex/keyword scanner fallback.
@@ -259,6 +273,7 @@ func (h *Highlighter) setTreeSitterLang(language string) {
 	h.tsLang = language
 	h.grammarOK = false
 	h.grammarErr = false
+	h.clearCache()
 	if h.tree != nil {
 		h.tree.Close()
 		h.tree = nil
@@ -278,6 +293,18 @@ func (h *Highlighter) setTreeSitterLang(language string) {
 		return
 	}
 	h.grammarOK = true
+}
+
+func (h *Highlighter) clearCache() {
+	h.cachedContent = ""
+	h.cachedRegions = nil
+	h.cacheValid = false
+}
+
+func (h *Highlighter) storeCache(content string, regions [][]HighlightRegion) {
+	h.cachedContent = content
+	h.cachedRegions = regions
+	h.cacheValid = true
 }
 
 // highlightTreeSitter parses content and walks leaf nodes to collect regions.
@@ -552,9 +579,9 @@ func addNodeByteRegions(regions [][]HighlightRegion, node *treesitter.Node, cat 
 
 // lineScanner performs regex-based syntax detection on a single line.
 type lineScanner struct {
-	keywordSet  map[string]struct{}
-	numberRe    *regexp.Regexp
-	constantRe  *regexp.Regexp
+	keywordSet map[string]struct{}
+	numberRe   *regexp.Regexp
+	constantRe *regexp.Regexp
 }
 
 // numberPattern matches integer and float literals (decimal, hex, octal, binary).
