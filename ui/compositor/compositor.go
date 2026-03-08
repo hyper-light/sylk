@@ -40,6 +40,12 @@ type Compositor struct {
 	inputDirty  bool
 	statusDirty bool
 
+	// Row-level dirty tracking for incremental recomposition.
+	mainDirtyRows   map[int]struct{}
+	queueDirtyRows  map[int]struct{}
+	inputDirtyRows  map[int]struct{}
+	statusDirtyRows map[int]struct{}
+
 	// Per-slot dirty flags (control which components re-render).
 	slotDirty map[SlotID]bool
 
@@ -51,8 +57,12 @@ type Compositor struct {
 // New creates an empty Compositor.
 func New() Compositor {
 	return Compositor{
-		slotLines: make(map[SlotID][]string),
-		slotDirty: make(map[SlotID]bool),
+		slotLines:       make(map[SlotID][]string),
+		slotDirty:       make(map[SlotID]bool),
+		mainDirtyRows:   make(map[int]struct{}),
+		queueDirtyRows:  make(map[int]struct{}),
+		inputDirtyRows:  make(map[int]struct{}),
+		statusDirtyRows: make(map[int]struct{}),
 	}
 }
 
@@ -74,6 +84,10 @@ func (c *Compositor) SetStructure(colSlots []SlotID, mainH, queueH, inputH, stat
 	c.queueDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
+	clear(c.mainDirtyRows)
+	clear(c.queueDirtyRows)
+	clear(c.inputDirtyRows)
+	clear(c.statusDirtyRows)
 	c.slotDirty = make(map[SlotID]bool, len(colSlots)+3)
 	for _, id := range colSlots {
 		c.slotDirty[id] = true
@@ -85,38 +99,19 @@ func (c *Compositor) SetStructure(colSlots []SlotID, mainH, queueH, inputH, stat
 	c.joined = ""
 }
 
-// SetSlotLines stores new bordered output for a slot and marks the
-// appropriate section dirty.
+// SetSlotLines stores new bordered output for a slot and marks only the
+// visible rows that actually changed dirty.
 func (c *Compositor) SetSlotLines(id SlotID, lines []string) {
+	prev := c.slotLines[id]
 	c.slotLines[id] = lines
 	c.slotDirty[id] = true
-	switch id {
-	case SlotQueue:
-		c.queueDirty = true
-	case SlotInput:
-		c.inputDirty = true
-	case SlotStatus:
-		c.statusDirty = true
-	default:
-		c.mainDirty = true
-	}
+	c.markChangedRows(id, prev, lines)
 	c.hasCache = false
 }
 
-// MarkDirty marks a specific slot as needing re-rendering and its
-// section as needing recomposition.
+// MarkDirty marks a specific slot as needing re-rendering.
 func (c *Compositor) MarkDirty(id SlotID) {
 	c.slotDirty[id] = true
-	switch id {
-	case SlotQueue:
-		c.queueDirty = true
-	case SlotInput:
-		c.inputDirty = true
-	case SlotStatus:
-		c.statusDirty = true
-	default:
-		c.mainDirty = true
-	}
 	c.hasCache = false
 }
 
@@ -138,6 +133,10 @@ func (c *Compositor) InvalidateAll() {
 	c.queueDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
+	clear(c.mainDirtyRows)
+	clear(c.queueDirtyRows)
+	clear(c.inputDirtyRows)
+	clear(c.statusDirtyRows)
 	for _, id := range c.colSlots {
 		c.slotDirty[id] = true
 	}
@@ -156,22 +155,40 @@ func (c *Compositor) CachedFrame() string { return c.joined }
 // Compose rebuilds dirty sections of the frame and returns the joined string.
 // Skips the O(n) strings.Join when no section was actually modified.
 func (c *Compositor) Compose() string {
-	dirty := c.mainDirty || c.queueDirty || c.inputDirty || c.statusDirty
+	dirty := c.mainDirty || c.queueDirty || c.inputDirty || c.statusDirty ||
+		len(c.mainDirtyRows) > 0 || len(c.queueDirtyRows) > 0 ||
+		len(c.inputDirtyRows) > 0 || len(c.statusDirtyRows) > 0
 	if c.mainDirty {
 		c.spliceMain()
 		c.mainDirty = false
+		clear(c.mainDirtyRows)
+	} else if len(c.mainDirtyRows) > 0 {
+		c.spliceMainRows(c.mainDirtyRows)
+		clear(c.mainDirtyRows)
 	}
 	if c.queueDirty {
 		c.spliceVertical(c.queueStart, SlotQueue)
 		c.queueDirty = false
+		clear(c.queueDirtyRows)
+	} else if len(c.queueDirtyRows) > 0 {
+		c.spliceVerticalRows(c.queueStart, SlotQueue, c.queueDirtyRows)
+		clear(c.queueDirtyRows)
 	}
 	if c.inputDirty {
 		c.spliceVertical(c.inputStart, SlotInput)
 		c.inputDirty = false
+		clear(c.inputDirtyRows)
+	} else if len(c.inputDirtyRows) > 0 {
+		c.spliceVerticalRows(c.inputStart, SlotInput, c.inputDirtyRows)
+		clear(c.inputDirtyRows)
 	}
 	if c.statusDirty {
 		c.spliceVertical(c.statusStart, SlotStatus)
 		c.statusDirty = false
+		clear(c.statusDirtyRows)
+	} else if len(c.statusDirtyRows) > 0 {
+		c.spliceVerticalRows(c.statusStart, SlotStatus, c.statusDirtyRows)
+		clear(c.statusDirtyRows)
 	}
 	// Clear per-slot dirty flags.
 	clear(c.slotDirty)
@@ -185,6 +202,16 @@ func (c *Compositor) Compose() string {
 // spliceMain recomposes all main-area rows from cached column slot lines.
 func (c *Compositor) spliceMain() {
 	for row := range c.mainH {
+		c.lines[row] = c.spliceRow(row)
+	}
+}
+
+// spliceMainRows recomposes only the requested main-area rows.
+func (c *Compositor) spliceMainRows(rows map[int]struct{}) {
+	for row := range rows {
+		if row < 0 || row >= c.mainH {
+			continue
+		}
 		c.lines[row] = c.spliceRow(row)
 	}
 }
@@ -215,12 +242,26 @@ func (c *Compositor) slotLine(id SlotID, row int) string {
 // spliceVertical copies a vertical slot's cached lines into the frame
 // starting at the given offset.
 func (c *Compositor) spliceVertical(start int, id SlotID) {
-	sl := c.slotLines[id]
-	for i, line := range sl {
+	for i := 0; i < c.sectionHeight(id); i++ {
 		idx := start + i
-		if idx < len(c.lines) {
-			c.lines[idx] = line
+		if idx >= len(c.lines) {
+			break
 		}
+		c.lines[idx] = c.slotLine(id, i)
+	}
+}
+
+// spliceVerticalRows updates only the changed rows for a vertical slot.
+func (c *Compositor) spliceVerticalRows(start int, id SlotID, rows map[int]struct{}) {
+	for row := range rows {
+		if row < 0 || row >= c.sectionHeight(id) {
+			continue
+		}
+		idx := start + row
+		if idx >= len(c.lines) {
+			continue
+		}
+		c.lines[idx] = c.slotLine(id, row)
 	}
 }
 
@@ -241,6 +282,10 @@ func (c *Compositor) AdjustVerticalSections(newMainH, newQueueH, newInputH int, 
 	c.queueDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
+	clear(c.mainDirtyRows)
+	clear(c.queueDirtyRows)
+	clear(c.inputDirtyRows)
+	clear(c.statusDirtyRows)
 	c.slotDirty[chatSlot] = true
 	c.slotDirty[SlotQueue] = true
 	c.slotDirty[SlotInput] = true
@@ -294,6 +339,10 @@ func (c *Compositor) ResizeVerticalQuick(mainH, queueH, inputH, statusH int) {
 	c.queueDirty = true
 	c.inputDirty = true
 	c.statusDirty = true
+	clear(c.mainDirtyRows)
+	clear(c.queueDirtyRows)
+	clear(c.inputDirtyRows)
+	clear(c.statusDirtyRows)
 
 	c.hasCache = false
 	c.joined = ""
@@ -315,4 +364,46 @@ func (c *Compositor) AllMainSlotsCached() bool {
 // callers that need to feed bordered output into SetSlotLines.
 func SplitLines(s string) []string {
 	return strings.Split(s, "\n")
+}
+
+func (c *Compositor) markChangedRows(id SlotID, prev, next []string) {
+	switch id {
+	case SlotQueue:
+		c.diffSlotRows(c.queueDirtyRows, prev, next, c.sectionHeight(SlotQueue))
+	case SlotInput:
+		c.diffSlotRows(c.inputDirtyRows, prev, next, c.sectionHeight(SlotInput))
+	case SlotStatus:
+		c.diffSlotRows(c.statusDirtyRows, prev, next, c.sectionHeight(SlotStatus))
+	default:
+		c.diffSlotRows(c.mainDirtyRows, prev, next, c.mainH)
+	}
+}
+
+func (c *Compositor) diffSlotRows(dst map[int]struct{}, prev, next []string, visibleRows int) {
+	for row := 0; row < visibleRows; row++ {
+		if lineAt(prev, row) == lineAt(next, row) {
+			continue
+		}
+		dst[row] = struct{}{}
+	}
+}
+
+func (c *Compositor) sectionHeight(id SlotID) int {
+	switch id {
+	case SlotQueue:
+		return max(c.inputStart-c.queueStart, 0)
+	case SlotInput:
+		return max(c.statusStart-c.inputStart, 0)
+	case SlotStatus:
+		return max(len(c.lines)-c.statusStart, 0)
+	default:
+		return c.mainH
+	}
+}
+
+func lineAt(lines []string, row int) string {
+	if row >= 0 && row < len(lines) {
+		return lines[row]
+	}
+	return ""
 }

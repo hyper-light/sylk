@@ -244,6 +244,33 @@ func TestModel_NeedsDecorTick(t *testing.T) {
 	}
 }
 
+func TestModel_NeedsHighFrequencyDecorTick(t *testing.T) {
+	model := New(theme.DefaultDark())
+
+	if model.NeedsHighFrequencyDecorTick() {
+		t.Fatal("NeedsHighFrequencyDecorTick() = true with no agents or pipelines")
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_idle",
+			EventType: events.EventTypeToolResult,
+			Timestamp: time.Now(),
+			AgentID:   "guide",
+			Content:   "idle",
+			Data:      map[string]any{"agent_name": "guide", "agent_type": "guide"},
+		},
+	})
+	if model.NeedsHighFrequencyDecorTick() {
+		t.Fatal("NeedsHighFrequencyDecorTick() = true with only idle agents")
+	}
+
+	pushAgentActivity(model, "architect", "architect")
+	if !model.NeedsHighFrequencyDecorTick() {
+		t.Fatal("NeedsHighFrequencyDecorTick() = false with active agent")
+	}
+}
+
 func TestModel_IsTerminalPipelineStatus(t *testing.T) {
 	terminals := []string{"completed", "failed", "cancelled"}
 	for _, s := range terminals {

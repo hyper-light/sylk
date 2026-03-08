@@ -23,19 +23,19 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
-	coreerrors "github.com/adalundhe/sylk/core/errors"
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/detect"
+	coreerrors "github.com/adalundhe/sylk/core/errors"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/llm"
+	"github.com/adalundhe/sylk/core/lsp"
+	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/pipeline/variants"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/lsp"
-	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/core/storage"
@@ -84,9 +84,15 @@ const tickFastInterval = 16 * time.Millisecond
 // Derived from: swipe decay timeout is 300ms; 200ms provides ≥1 sample.
 const tickSlowInterval = 200 * time.Millisecond
 
-// decorTickInterval drives low-frequency UI effects (spinners, flashes).
-// 100ms (~10fps) keeps visuals smooth while reducing idle CPU.
-const decorTickInterval = 100 * time.Millisecond
+// decorTickActiveInterval drives high-frequency low-cost UI effects
+// (spinners, flashes, holographic activity, queue shimmer).
+// 100ms (~10fps) keeps active motion smooth.
+const decorTickActiveInterval = 100 * time.Millisecond
+
+// decorTickIdleInterval drives resting shimmer and focus-ring motion when the
+// UI is otherwise idle. Slowing this path cuts resting CPU substantially
+// while preserving visible motion.
+const decorTickIdleInterval = 300 * time.Millisecond
 
 // blinkHalfPeriod is the duration between cursor visibility toggles.
 // Derived from: standard terminal cursor blink rate (~530ms per phase).
@@ -99,6 +105,14 @@ const (
 	tickIdle tickRate = iota // No tick scheduled.
 	tickSlow                 // 200ms — swipe decay.
 	tickFast                 // 16ms — scroll, bounce, flash, spinner.
+)
+
+type decorCadence uint8
+
+const (
+	decorCadenceOff decorCadence = iota
+	decorCadenceIdle
+	decorCadenceActive
 )
 
 // shutdownGrace is the grace period for goroutine shutdown.
@@ -266,7 +280,7 @@ var defaultTabOrder = []component.FocusID{
 // Deps holds all core system references needed by the TUI.
 // The caller (cmd.go) is responsible for constructing and providing these.
 type Deps struct {
-	ActivityPub events.ActivityPublisher
+	ActivityPub    events.ActivityPublisher
 	SessionManager *session.Manager
 	GuideBus       guide.EventBus
 	StreamManager  *guide.StreamManager
@@ -471,10 +485,11 @@ type AppModel struct {
 	focusRingStart      time.Time       // Epoch for focus ring shimmer.
 
 	// Demand-driven tick chain state.
-	tickGen  uint64   // Generation counter; incremented on tick chain transitions.
-	tickRate tickRate // Current tick chain speed (idle/slow/fast).
-	decorGen uint64   // Generation counter for decor tick chain.
-	decorOn  bool     // Whether decor tick chain is active.
+	tickGen      uint64       // Generation counter; incremented on tick chain transitions.
+	tickRate     tickRate     // Current tick chain speed (idle/slow/fast).
+	decorGen     uint64       // Generation counter for decor tick chain.
+	decorOn      bool         // Whether decor tick chain is active.
+	decorCadence decorCadence // Current decor cadence (idle vs active).
 
 	// Centralized cursor blink timer (one-shot at blinkHalfPeriod).
 	blinkGen   uint64    // Generation counter; bumped on interactive events to reset blink.
@@ -606,15 +621,15 @@ type AppModel struct {
 	escGen     uint64
 
 	// Guide context usage estimate for agent panel rendering.
-	guideContextTokens int
-	guideContextUsage  float64
-	agentContextTokens map[string]int
-	streamUsage        map[string]streamUsageEntry
-	streamedResponses  map[string]streamedResponseState
-	activeStreams            map[string]*activeStreamEntry // key = correlationID
+	guideContextTokens      int
+	guideContextUsage       float64
+	agentContextTokens      map[string]int
+	streamUsage             map[string]streamUsageEntry
+	streamedResponses       map[string]streamedResponseState
+	activeStreams           map[string]*activeStreamEntry // key = correlationID
 	interruptedCorrelations map[string]struct{}           // Correlation IDs killed by interrupt.
-	engagedAgentID          string              // Sticky agent the user is conversing with.
-	manualTargetAgent  string
+	engagedAgentID          string                        // Sticky agent the user is conversing with.
+	manualTargetAgent       string
 
 	// Prompt queue: stacks follow-up prompts while agents stream.
 	promptQueue   queue.Queue
@@ -659,7 +674,7 @@ type streamedResponseState struct {
 type activeStreamEntry struct {
 	CorrelationID string
 	AgentID       string
-	SteeringPace  string    // "auto", "step", "paused" — tracks current pace for UI display.
+	SteeringPace  string // "auto", "step", "paused" — tracks current pace for UI display.
 	StartedAt     time.Time
 }
 
@@ -850,10 +865,10 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		streamedResponses:      make(map[string]streamedResponseState),
 		activeStreams:          make(map[string]*activeStreamEntry),
 		oauthSessions:          newOAuthSessionManager(),
-		focusGradient:       th.Palette.IdleFocusRingGradient(),
-		idleFocusGradient:   th.Palette.IdleFocusRingGradient(),
-		activeFocusGradient: th.Palette.FocusRingGradient(),
-		focusRingStart:      time.Now(),
+		focusGradient:          th.Palette.IdleFocusRingGradient(),
+		idleFocusGradient:      th.Palette.IdleFocusRingGradient(),
+		activeFocusGradient:    th.Palette.FocusRingGradient(),
+		focusRingStart:         time.Now(),
 	}
 
 	app.promptQueue = queue.New(queue.MaxCapacity)
@@ -4641,8 +4656,8 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	}
 
 	// Agent panel shimmer + dot animation.
-	agentActive := m.agentPanel.HasActiveAgent()
-	if m.agentPanel.NeedsDecorTick() {
+	agentActive := m.hasActiveAgent()
+	if m.agentPanel != nil && m.agentPanel.NeedsDecorTick() {
 		if agentActive {
 			m.agentPanel.AdvanceDotFrame()
 		}
@@ -4651,24 +4666,21 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	}
 
 	// Session panel dot animation — sync agent activity and advance frame.
-	m.sessionPanel.SetAgentActive(agentActive)
-	if agentActive {
+	if m.sessionPanel != nil {
+		m.sessionPanel.SetAgentActive(agentActive)
+	}
+	if agentActive && m.sessionPanel != nil {
 		m.sessionPanel.AdvanceDotFrame()
 		m.comp.MarkDirty(compositor.SlotLeft)
 		changed = true
 	}
 
 	// Swap focus ring gradient: full prismatic when active agents, subdued when idle.
-	if agentActive {
-		m.focusGradient = m.activeFocusGradient
-	} else {
-		m.focusGradient = m.idleFocusGradient
-	}
+	m.focusGradient = m.currentFocusGradient()
 
-	// Focus ring border shimmer — mark the focused panel slot and input.
+	// Focus ring border shimmer — only the currently focused slot participates.
 	if m.focusGradient != nil {
 		m.comp.MarkDirty(m.focusBorderGroup())
-		m.comp.MarkDirty(compositor.SlotInput)
 		changed = true
 	}
 
@@ -10573,7 +10585,7 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 	// Input panel click: begin drag selection at click point.
 	inputTop := m.height - m.prevInputH - statusBarHeight
 	if mouse.Y >= inputTop && mouse.Y < inputTop+m.prevInputH {
-		contentX := mouse.X - 1           // skip left border
+		contentX := mouse.X - 1            // skip left border
 		contentY := mouse.Y - inputTop - 1 // skip top border
 		if contentX >= 0 && contentY >= 0 {
 			m.input.DragStart(contentX, contentY)
@@ -13210,6 +13222,10 @@ func (m *AppModel) detectDirtySlots() {
 		m.comp.MarkDirty(curGrp)
 		m.prevFocusGrp = curGrp
 	}
+	if curGrad := m.currentFocusGradient(); curGrad != m.focusGradient {
+		m.focusGradient = curGrad
+		m.comp.MarkDirty(curGrp)
+	}
 
 	// Chord state change: the chord hint overlay can appear on any content
 	// slot depending on layout mode, so invalidate all slots.
@@ -13397,6 +13413,7 @@ func (m *AppModel) renderDirtySlots() {
 // theme, replacing the old per-side approach that produced visible color
 // jumps at corners. Called once per frame before any slot rendering.
 func (m *AppModel) applyFocusRingShimmer(th *theme.Theme) {
+	m.focusGradient = m.currentFocusGradient()
 	if m.focusGradient == nil {
 		return
 	}
@@ -13406,7 +13423,9 @@ func (m *AppModel) applyFocusRingShimmer(th *theme.Theme) {
 	th.ActiveBorderRender = func(content string, innerW, innerH, maxH int) string {
 		return theme.RenderGradientBorder(content, g, elapsed, innerW, innerH, maxH)
 	}
-	m.input.SetFocusBorderRender(th.ActiveBorderRender)
+	if m.focus != nil && m.focus.Current() == component.FocusInput {
+		m.input.SetFocusBorderRender(th.ActiveBorderRender)
+	}
 }
 
 // renderQueueStrip renders the prompt queue between chat and input.
@@ -14411,11 +14430,11 @@ func (m *AppModel) needsFastTick() bool {
 		!m.bounceSettled()
 }
 
-// needsDecorTick reports whether low-frequency UI effects are active.
-func (m *AppModel) needsDecorTick() bool {
+// needsActiveDecorTick reports whether high-frequency decor effects are active.
+func (m *AppModel) needsActiveDecorTick() bool {
 	now := time.Now()
-	return m.chat.HasActiveAnimation() ||
-		m.statusBar.IsAnimating() ||
+	return (m.chat != nil && m.chat.HasActiveAnimation()) ||
+		(m.statusBar != nil && m.statusBar.IsAnimating()) ||
 		now.Before(m.tabArrowFlashLeftUntil) ||
 		now.Before(m.tabArrowFlashRightUntil) ||
 		(m.commitTree != nil && m.commitTree.NeedsDecorTick()) ||
@@ -14424,8 +14443,54 @@ func (m *AppModel) needsDecorTick() bool {
 		(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick()) ||
 		(m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick()) ||
 		(m.planView != nil && m.planView.NeedsDecorTick()) ||
-		m.agentPanel.NeedsDecorTick() ||
-		m.focusGradient != nil
+		(!m.promptQueue.IsEmpty() && !m.promptQueue.IsPaused()) ||
+		(m.agentPanel != nil && m.agentPanel.NeedsHighFrequencyDecorTick()) ||
+		(m.currentFocusGradient() != nil && m.hasActiveAgent())
+}
+
+// needsIdleDecorTick reports whether any resting decor effects are active.
+func (m *AppModel) needsIdleDecorTick() bool {
+	return m.needsActiveDecorTick() ||
+		(m.agentPanel != nil && m.agentPanel.NeedsDecorTick()) ||
+		m.currentFocusGradient() != nil
+}
+
+// needsDecorTick reports whether any decor effect is active at all.
+func (m *AppModel) needsDecorTick() bool {
+	return m.decorDemand() != decorCadenceOff
+}
+
+func (m *AppModel) decorDemand() decorCadence {
+	switch {
+	case m.needsActiveDecorTick():
+		return decorCadenceActive
+	case m.needsIdleDecorTick():
+		return decorCadenceIdle
+	default:
+		return decorCadenceOff
+	}
+}
+
+func decorIntervalFor(c decorCadence) time.Duration {
+	switch c {
+	case decorCadenceActive:
+		return decorTickActiveInterval
+	case decorCadenceIdle:
+		return decorTickIdleInterval
+	default:
+		return decorTickIdleInterval
+	}
+}
+
+func (m *AppModel) hasActiveAgent() bool {
+	return m.agentPanel != nil && m.agentPanel.HasActiveAgent()
+}
+
+func (m *AppModel) currentFocusGradient() *theme.Gradient {
+	if m.hasActiveAgent() {
+		return m.activeFocusGradient
+	}
+	return m.idleFocusGradient
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
@@ -14493,25 +14558,38 @@ func (m *AppModel) ensureTickAfterDispatch() tea.Cmd {
 
 // ensureDecorTick starts the decor tick chain if needed.
 func (m *AppModel) ensureDecorTick() tea.Cmd {
-	if m.decorOn {
+	desired := m.decorDemand()
+	if desired == decorCadenceOff {
+		m.decorOn = false
+		m.decorCadence = decorCadenceOff
+		return nil
+	}
+	if m.decorOn && m.decorCadence == desired {
 		return nil
 	}
 	m.decorOn = true
+	m.decorCadence = desired
 	m.decorGen++
 	gen := m.decorGen
-	return tea.Tick(decorTickInterval, func(t time.Time) tea.Msg {
+	return tea.Tick(decorIntervalFor(desired), func(t time.Time) tea.Msg {
 		return msg.DecorTickMsg{Time: t, Gen: gen}
 	})
 }
 
 // continueDecorTickChain schedules the next decor tick if effects remain.
 func (m *AppModel) continueDecorTickChain() tea.Cmd {
-	if !m.needsDecorTick() {
+	desired := m.decorDemand()
+	if desired == decorCadenceOff {
 		m.decorOn = false
+		m.decorCadence = decorCadenceOff
 		return nil
 	}
+	if desired != m.decorCadence {
+		m.decorCadence = desired
+		m.decorGen++
+	}
 	gen := m.decorGen
-	return tea.Tick(decorTickInterval, func(t time.Time) tea.Msg {
+	return tea.Tick(decorIntervalFor(m.decorCadence), func(t time.Time) tea.Msg {
 		return msg.DecorTickMsg{Time: t, Gen: gen}
 	})
 }

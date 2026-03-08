@@ -871,12 +871,32 @@ func (m *Model) AdvanceDotFrame() {
 	m.DecrementSelectorFlash()
 }
 
-// NeedsDecorTick reports whether the agent panel has active shimmer animations.
-// True when any agent is actively working (dot/ripple/full shimmer) or a
-// pipeline is active. Idle agents still shimmer with the subdued gradient,
-// so agents existing is sufficient.
+// NeedsDecorTick reports whether the agent panel has any decor-driven
+// animation demand. Idle agents keep their subdued shimmer, so the presence
+// of agents is enough to require low-frequency decor updates.
 func (m *Model) NeedsDecorTick() bool {
 	if len(m.agents) > 0 {
+		return true
+	}
+	if m.selector.flash > 0 {
+		return true
+	}
+	for _, pl := range m.pipelines {
+		if !isTerminalPipelineStatus(pl.Status) {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsHighFrequencyDecorTick reports whether the agent panel needs the
+// active decor cadence. This is reserved for visibly dynamic states:
+// active agents, active pipelines, and selector flash transitions.
+func (m *Model) NeedsHighFrequencyDecorTick() bool {
+	if m == nil {
+		return false
+	}
+	if m.selector.flash > 0 || m.HasActiveAgent() {
 		return true
 	}
 	for _, pl := range m.pipelines {
