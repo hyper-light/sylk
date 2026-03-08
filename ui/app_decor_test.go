@@ -61,6 +61,27 @@ func TestApplyFocusRingShimmerSkipsUnfocusedInput(t *testing.T) {
 	}
 }
 
+func TestFocusBorderFrameChangedCoalescesIdlePhase(t *testing.T) {
+	th := theme.DefaultDark()
+	app := &AppModel{
+		idleFocusGradient:     th.Palette.IdleFocusRingGradient(),
+		activeFocusGradient:   th.Palette.FocusRingGradient(),
+		focusRingStart:        time.Now().Add(-2 * time.Second),
+		lastFocusBorderBucket: -1,
+	}
+
+	base := app.focusRingStart.Add(2 * time.Second)
+	if !app.focusBorderFrameChanged(base) {
+		t.Fatal("focusBorderFrameChanged() = false for first idle bucket")
+	}
+	if app.focusBorderFrameChanged(base.Add(50 * time.Millisecond)) {
+		t.Fatal("focusBorderFrameChanged() = true within same idle bucket")
+	}
+	if !app.focusBorderFrameChanged(base.Add(idleFocusBorderPhaseStep)) {
+		t.Fatal("focusBorderFrameChanged() = false after idle bucket boundary")
+	}
+}
+
 func pushDecorAgentActivity(panel *agentpkg.Model, eventType events.EventType, agentID string) {
 	if panel == nil {
 		return

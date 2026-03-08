@@ -316,6 +316,7 @@ type Model struct {
 	idleGroupGradient   *theme.Gradient           // Idle: green→jade→blue→white.
 	activeGroupGradient *theme.Gradient           // Active: full prismatic spectrum.
 	rippleGradient      *theme.Gradient           // Per-character ripple for active agent text.
+	idleDecorBucket     int64                     // Quantized idle shimmer phase to avoid redundant repaints.
 }
 
 // Verify interface compliance at compile time.
@@ -345,6 +346,7 @@ func New(th *theme.Theme) *Model {
 		idleGroupGradient:   idleGroup,
 		activeGroupGradient: th.Palette.GroupGradient(),
 		rippleGradient:      th.Palette.ThinkingGradient(),
+		idleDecorBucket:     -1,
 	}
 }
 
@@ -869,6 +871,58 @@ func (m *Model) DemoteAgent(agentID string) {
 func (m *Model) AdvanceDotFrame() {
 	m.dotFrame = (m.dotFrame + 1) % dotAnimFrameCount
 	m.DecrementSelectorFlash()
+}
+
+const idleDecorPhaseStep = 600 * time.Millisecond
+
+// AdvanceDecor updates the panel's decor state and reports whether a repaint is
+// visually necessary at the given tick time.
+func (m *Model) AdvanceDecor(now time.Time) bool {
+	if m == nil {
+		return false
+	}
+	if m.selector.flash > 0 {
+		if m.HasActiveAgent() {
+			m.AdvanceDotFrame()
+		} else {
+			m.DecrementSelectorFlash()
+		}
+		return true
+	}
+	for _, pl := range m.pipelines {
+		if !isTerminalPipelineStatus(pl.Status) {
+			return true
+		}
+	}
+	if m.HasActiveAgent() {
+		m.AdvanceDotFrame()
+		return true
+	}
+	if len(m.agents) == 0 {
+		return false
+	}
+	bucket := int64(now.Sub(m.shimmerStart) / idleDecorPhaseStep)
+	if bucket == m.idleDecorBucket {
+		return false
+	}
+	m.idleDecorBucket = bucket
+	return true
+}
+
+// NextIdleDecorDelay returns the time until the next visible idle shimmer
+// phase change. Active animations and selector flash are handled elsewhere.
+func (m *Model) NextIdleDecorDelay(now time.Time) time.Duration {
+	if m == nil || len(m.agents) == 0 || m.HasActiveAgent() || m.selector.flash > 0 {
+		return 0
+	}
+	elapsed := now.Sub(m.shimmerStart)
+	bucket := elapsed / idleDecorPhaseStep
+	next := m.shimmerStart.Add((bucket + 1) * idleDecorPhaseStep)
+	delay := next.Sub(now)
+	if delay <= 0 {
+		return time.Millisecond
+	}
+	return delay
 }
 
 // NeedsDecorTick reports whether the agent panel has any decor-driven

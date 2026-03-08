@@ -114,11 +114,12 @@ func normalizeBorderLines(content string, innerW, innerH int) []string {
 }
 
 func cachedBorderFrame(g *Gradient, elapsed time.Duration, innerW, innerH int) borderFrame {
+	normalized := normalizeGradientElapsed(g, elapsed)
 	key := borderFrameKey{
 		gradient:    g,
 		innerW:      innerW,
 		innerH:      innerH,
-		phaseBucket: int64(elapsed / borderPhaseBucket),
+		phaseBucket: int64(normalized / borderPhaseBucket),
 	}
 
 	borderFrameCacheMu.Lock()
@@ -144,7 +145,10 @@ func buildBorderFrame(g *Gradient, elapsed time.Duration, innerW, innerH int) bo
 	borderW := innerW + 2
 	perim := 2 * (borderW + innerH)
 
-	totalSpread := 3 * FocusRingFlowStep
+	totalSpread := g.Duration()
+	if totalSpread <= 0 {
+		totalSpread = borderPhaseBucket
+	}
 	phasePerChar := time.Duration(0)
 	if perim > 0 {
 		phasePerChar = totalSpread / time.Duration(perim)
@@ -203,6 +207,21 @@ func buildBorderFrame(g *Gradient, elapsed time.Duration, innerW, innerH int) bo
 	frame.bottom = bottom.String()
 
 	return frame
+}
+
+func normalizeGradientElapsed(g *Gradient, elapsed time.Duration) time.Duration {
+	if g == nil {
+		return elapsed
+	}
+	duration := g.Duration()
+	if duration <= 0 {
+		return elapsed
+	}
+	normalized := elapsed % duration
+	if normalized < 0 {
+		normalized += duration
+	}
+	return normalized
 }
 
 // writeColoredChar appends a border character colored by the gradient at the

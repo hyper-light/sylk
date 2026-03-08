@@ -495,6 +495,32 @@ func TestModel_NeedsDecorTick_RequiresActiveAgentOrAgents(t *testing.T) {
 	}
 }
 
+func TestModel_AdvanceDecorCoalescesIdlePhase(t *testing.T) {
+	model := New(theme.DefaultDark())
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_idle",
+			EventType: events.EventTypeToolResult,
+			Timestamp: time.Now(),
+			AgentID:   "guide",
+			Content:   "idle",
+			Data:      map[string]any{"agent_name": "guide", "agent_type": "guide"},
+		},
+	})
+
+	base := model.shimmerStart.Add(2 * time.Second)
+	if !model.AdvanceDecor(base) {
+		t.Fatal("AdvanceDecor() = false for first idle bucket")
+	}
+	if model.AdvanceDecor(base.Add(200 * time.Millisecond)) {
+		t.Fatal("AdvanceDecor() = true within same idle bucket")
+	}
+	if !model.AdvanceDecor(base.Add(idleDecorPhaseStep)) {
+		t.Fatal("AdvanceDecor() = false after idle bucket boundary")
+	}
+}
+
 func TestModel_SeedAgent(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)

@@ -59,3 +59,26 @@ func TestCachedBorderFrameBucketsReuseFrames(t *testing.T) {
 		t.Fatalf("len(borderFrameCache) = %d, want 1", cacheSize)
 	}
 }
+
+func TestCachedBorderFrameReusesAcrossGradientCycle(t *testing.T) {
+	borderFrameCacheMu.Lock()
+	clear(borderFrameCache)
+	borderFrameCacheMu.Unlock()
+
+	g := DefaultDark().Palette.FocusRingGradient()
+
+	first := cachedBorderFrame(g, 110*time.Millisecond, 8, 3)
+	second := cachedBorderFrame(g, g.Duration()+110*time.Millisecond, 8, 3)
+
+	if first.top != second.top || first.bottom != second.bottom {
+		t.Fatal("expected same cached border frame across one full gradient cycle")
+	}
+
+	borderFrameCacheMu.Lock()
+	cacheSize := len(borderFrameCache)
+	borderFrameCacheMu.Unlock()
+
+	if cacheSize != 1 {
+		t.Fatalf("len(borderFrameCache) = %d, want 1", cacheSize)
+	}
+}

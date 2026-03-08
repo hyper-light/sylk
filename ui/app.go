@@ -94,6 +94,11 @@ const decorTickActiveInterval = 100 * time.Millisecond
 // while preserving visible motion.
 const decorTickIdleInterval = 300 * time.Millisecond
 
+// idleFocusBorderPhaseStep is the resting focus-ring redraw cadence. Keeping
+// it slower than the active path cuts idle CPU, while the border renderer's
+// full-perimeter phase spread preserves continuous circulation.
+const idleFocusBorderPhaseStep = 200 * time.Millisecond
+
 // blinkHalfPeriod is the duration between cursor visibility toggles.
 // Derived from: standard terminal cursor blink rate (~530ms per phase).
 const blinkHalfPeriod = 530 * time.Millisecond
@@ -479,10 +484,11 @@ type AppModel struct {
 	tabArrowFlashRightUntil time.Time
 
 	// Focus ring shimmer.
-	focusGradient       *theme.Gradient // Current gradient for focus ring border.
-	idleFocusGradient   *theme.Gradient // Subdued blue→white gradient (no active agents).
-	activeFocusGradient *theme.Gradient // Full prismatic gradient (active agents).
-	focusRingStart      time.Time       // Epoch for focus ring shimmer.
+	focusGradient         *theme.Gradient // Current gradient for focus ring border.
+	idleFocusGradient     *theme.Gradient // Subdued blue→white gradient (no active agents).
+	activeFocusGradient   *theme.Gradient // Full prismatic gradient (active agents).
+	focusRingStart        time.Time       // Epoch for focus ring shimmer.
+	lastFocusBorderBucket int64           // Quantized idle focus-ring phase.
 
 	// Demand-driven tick chain state.
 	tickGen      uint64       // Generation counter; incremented on tick chain transitions.
@@ -869,6 +875,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		idleFocusGradient:      th.Palette.IdleFocusRingGradient(),
 		activeFocusGradient:    th.Palette.FocusRingGradient(),
 		focusRingStart:         time.Now(),
+		lastFocusBorderBucket:  -1,
 	}
 
 	app.promptQueue = queue.New(queue.MaxCapacity)
@@ -2482,6 +2489,26 @@ func (m *AppModel) View() string {
 	m.renderDirtySlots()
 	m.viewDirty = false
 	return m.comp.Compose()
+}
+
+// FrameData exposes structured frame metadata for the most recently rendered
+// composited view. Overlay modes fall back to Bubble Tea's string renderer.
+func (m *AppModel) FrameData() tea.FrameData {
+	if !m.ready {
+		return tea.FrameData{}
+	}
+	switch m.overlay {
+	case overlayNone:
+		snapshot := m.comp.Snapshot()
+		return tea.FrameData{
+			Lines:     snapshot.Lines,
+			DirtyRows: snapshot.DirtyRows,
+			Version:   snapshot.Version,
+			Full:      snapshot.Full,
+		}
+	default:
+		return tea.FrameData{}
+	}
 }
 
 // Shutdown gracefully stops all bridges and waits for goroutine cleanup.
@@ -4657,10 +4684,7 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 
 	// Agent panel shimmer + dot animation.
 	agentActive := m.hasActiveAgent()
-	if m.agentPanel != nil && m.agentPanel.NeedsDecorTick() {
-		if agentActive {
-			m.agentPanel.AdvanceDotFrame()
-		}
+	if m.agentPanel != nil && m.agentPanel.AdvanceDecor(tick.Time) {
 		m.comp.MarkDirty(compositor.SlotLeft)
 		changed = true
 	}
@@ -4679,7 +4703,7 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	m.focusGradient = m.currentFocusGradient()
 
 	// Focus ring border shimmer — only the currently focused slot participates.
-	if m.focusGradient != nil {
+	if m.focusBorderFrameChanged(now) {
 		m.comp.MarkDirty(m.focusBorderGroup())
 		changed = true
 	}
@@ -14482,6 +14506,29 @@ func decorIntervalFor(c decorCadence) time.Duration {
 	}
 }
 
+func (m *AppModel) nextIdleDecorInterval(now time.Time) time.Duration {
+	delay := decorTickIdleInterval
+	if !m.hasActiveAgent() {
+		if focusDelay := m.nextIdleFocusBorderDelay(now); focusDelay > 0 {
+			delay = minDuration(delay, focusDelay)
+		}
+		if agentDelay := m.nextIdleAgentDecorDelay(now); agentDelay > 0 {
+			delay = minDuration(delay, agentDelay)
+		}
+	}
+	return delay
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
+}
+
 func (m *AppModel) hasActiveAgent() bool {
 	return m.agentPanel != nil && m.agentPanel.HasActiveAgent()
 }
@@ -14491,6 +14538,42 @@ func (m *AppModel) currentFocusGradient() *theme.Gradient {
 		return m.activeFocusGradient
 	}
 	return m.idleFocusGradient
+}
+
+func (m *AppModel) focusBorderFrameChanged(now time.Time) bool {
+	if m.currentFocusGradient() == nil {
+		return false
+	}
+	if m.hasActiveAgent() {
+		return true
+	}
+	bucket := int64(now.Sub(m.focusRingStart) / idleFocusBorderPhaseStep)
+	if bucket == m.lastFocusBorderBucket {
+		return false
+	}
+	m.lastFocusBorderBucket = bucket
+	return true
+}
+
+func (m *AppModel) nextIdleFocusBorderDelay(now time.Time) time.Duration {
+	if m.currentFocusGradient() == nil || m.hasActiveAgent() {
+		return 0
+	}
+	elapsed := now.Sub(m.focusRingStart)
+	bucket := elapsed / idleFocusBorderPhaseStep
+	next := m.focusRingStart.Add((bucket + 1) * idleFocusBorderPhaseStep)
+	delay := next.Sub(now)
+	if delay <= 0 {
+		return time.Millisecond
+	}
+	return delay
+}
+
+func (m *AppModel) nextIdleAgentDecorDelay(now time.Time) time.Duration {
+	if m.agentPanel == nil || m.hasActiveAgent() {
+		return 0
+	}
+	return m.agentPanel.NextIdleDecorDelay(now)
 }
 
 // needsSlowTick reports whether any non-blink, non-LSP debounce needs
@@ -14571,7 +14654,11 @@ func (m *AppModel) ensureDecorTick() tea.Cmd {
 	m.decorCadence = desired
 	m.decorGen++
 	gen := m.decorGen
-	return tea.Tick(decorIntervalFor(desired), func(t time.Time) tea.Msg {
+	interval := decorIntervalFor(desired)
+	if desired == decorCadenceIdle {
+		interval = m.nextIdleDecorInterval(time.Now())
+	}
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return msg.DecorTickMsg{Time: t, Gen: gen}
 	})
 }
@@ -14589,7 +14676,11 @@ func (m *AppModel) continueDecorTickChain() tea.Cmd {
 		m.decorGen++
 	}
 	gen := m.decorGen
-	return tea.Tick(decorIntervalFor(m.decorCadence), func(t time.Time) tea.Msg {
+	interval := decorIntervalFor(m.decorCadence)
+	if m.decorCadence == decorCadenceIdle {
+		interval = m.nextIdleDecorInterval(time.Now())
+	}
+	return tea.Tick(interval, func(t time.Time) tea.Msg {
 		return msg.DecorTickMsg{Time: t, Gen: gen}
 	})
 }

@@ -263,3 +263,34 @@ func TestInvalidateAllIncludesQueue(t *testing.T) {
 		t.Fatal("expected queue dirty after InvalidateAll")
 	}
 }
+
+func TestSnapshotTracksVersionAndAbsoluteDirtyRows(t *testing.T) {
+	c := New()
+	c.SetStructure([]SlotID{SlotCenter}, 2, 0, 1, 1)
+	c.SetSlotLines(SlotCenter, []string{"chat-0", "chat-1"})
+	c.SetSlotLines(SlotInput, []string{"input-0"})
+	c.SetSlotLines(SlotStatus, []string{"status-0"})
+	c.Compose()
+
+	first := c.Snapshot()
+	if first.Version != 1 {
+		t.Fatalf("first.Version = %d, want 1", first.Version)
+	}
+	if !first.Full {
+		t.Fatal("expected first snapshot to be a full frame")
+	}
+
+	c.SetSlotLines(SlotInput, []string{"input-1"})
+	c.Compose()
+
+	second := c.Snapshot()
+	if second.Version != 2 {
+		t.Fatalf("second.Version = %d, want 2", second.Version)
+	}
+	if second.Full {
+		t.Fatal("expected incremental snapshot after input-only update")
+	}
+	if len(second.DirtyRows) != 1 || second.DirtyRows[0] != 2 {
+		t.Fatalf("second.DirtyRows = %v, want [2]", second.DirtyRows)
+	}
+}

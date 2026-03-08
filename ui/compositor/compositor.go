@@ -52,6 +52,20 @@ type Compositor struct {
 	// Cached joined string.
 	joined   string
 	hasCache bool
+
+	frameVersion       uint64
+	lastFrameDirtyRows []int
+	lastFrameFull      bool
+}
+
+// FrameSnapshot captures the compositor's current lines plus metadata for the
+// most recently composed frame. Lines are borrowed from the compositor and
+// should not be retained without copying.
+type FrameSnapshot struct {
+	Lines     []string
+	DirtyRows []int
+	Version   uint64
+	Full      bool
 }
 
 // New creates an empty Compositor.
@@ -152,10 +166,26 @@ func (c *Compositor) HasCache() bool { return c.hasCache }
 // CachedFrame returns the last composed frame string.
 func (c *Compositor) CachedFrame() string { return c.joined }
 
+// Snapshot returns the current frame lines plus metadata describing the most
+// recent composition. DirtyRows are absolute row indices within Lines.
+func (c *Compositor) Snapshot() FrameSnapshot {
+	snapshot := FrameSnapshot{
+		Lines:   c.lines,
+		Version: c.frameVersion,
+		Full:    c.lastFrameFull,
+	}
+	if len(c.lastFrameDirtyRows) > 0 {
+		snapshot.DirtyRows = append([]int(nil), c.lastFrameDirtyRows...)
+	}
+	return snapshot
+}
+
 // Compose rebuilds dirty sections of the frame and returns the joined string.
 // Skips the O(n) strings.Join when no section was actually modified.
 func (c *Compositor) Compose() string {
-	dirty := c.mainDirty || c.queueDirty || c.inputDirty || c.statusDirty ||
+	fullDirty := c.frameVersion == 0 || c.mainDirty || c.queueDirty || c.inputDirty || c.statusDirty
+	dirtyRows := c.collectDirtyRows()
+	dirty := fullDirty ||
 		len(c.mainDirtyRows) > 0 || len(c.queueDirtyRows) > 0 ||
 		len(c.inputDirtyRows) > 0 || len(c.statusDirtyRows) > 0
 	if c.mainDirty {
@@ -194,6 +224,16 @@ func (c *Compositor) Compose() string {
 	clear(c.slotDirty)
 	if dirty {
 		c.joined = strings.Join(c.lines, "\n")
+		c.frameVersion++
+		c.lastFrameFull = fullDirty
+		if fullDirty {
+			c.lastFrameDirtyRows = nil
+		} else {
+			c.lastFrameDirtyRows = dirtyRows
+		}
+	} else {
+		c.lastFrameFull = false
+		c.lastFrameDirtyRows = nil
 	}
 	c.hasCache = true
 	return c.joined
@@ -406,4 +446,25 @@ func lineAt(lines []string, row int) string {
 		return lines[row]
 	}
 	return ""
+}
+
+func (c *Compositor) collectDirtyRows() []int {
+	total := len(c.mainDirtyRows) + len(c.queueDirtyRows) + len(c.inputDirtyRows) + len(c.statusDirtyRows)
+	if total == 0 {
+		return nil
+	}
+	rows := make([]int, 0, total)
+	for row := range c.mainDirtyRows {
+		rows = append(rows, row)
+	}
+	for row := range c.queueDirtyRows {
+		rows = append(rows, c.queueStart+row)
+	}
+	for row := range c.inputDirtyRows {
+		rows = append(rows, c.inputStart+row)
+	}
+	for row := range c.statusDirtyRows {
+		rows = append(rows, c.statusStart+row)
+	}
+	return rows
 }
