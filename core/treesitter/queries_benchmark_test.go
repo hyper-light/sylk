@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	sitter "github.com/tree-sitter/go-tree-sitter"
+	sitter "github.com/adalundhe/sylk/third_party/go_tree_sitter"
 )
 
 // BenchmarkManualExtraction benchmarks the current manual traversal approach.

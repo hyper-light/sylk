@@ -20,14 +20,21 @@ import (
 // GetRoutingInfo implements guide.AgentRouter interface.
 // Returns the Archivalist's routing configuration.
 func (a *Archivalist) GetRoutingInfo() *guide.AgentRoutingInfo {
-	return ArchivalistRoutingInfo()
+	return archivalistRoutingInfo(a.id)
 }
 
 // ArchivalistRoutingInfo returns the Archivalist's routing configuration.
 // This can be used to register with the Guide even without an Archivalist instance.
 func ArchivalistRoutingInfo() *guide.AgentRoutingInfo {
+	return archivalistRoutingInfo("archivalist")
+}
+
+func archivalistRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
+	if canonicalID == "" {
+		canonicalID = "archivalist"
+	}
 	return &guide.AgentRoutingInfo{
-		ID:   "archivalist",
+		ID:   canonicalID,
 		Type: "archivalist",
 		Name: "archivalist",
 
@@ -62,14 +69,21 @@ func ArchivalistRoutingInfo() *guide.AgentRoutingInfo {
 		},
 
 		// Registration with capabilities and constraints
-		Registration: ArchivalistRegistration(),
+		Registration: archivalistRegistration(canonicalID),
 	}
 }
 
 // ArchivalistRegistration returns the Guide registration for the Archivalist
 func ArchivalistRegistration() *guide.AgentRegistration {
+	return archivalistRegistration("archivalist")
+}
+
+func archivalistRegistration(canonicalID string) *guide.AgentRegistration {
+	if canonicalID == "" {
+		canonicalID = "archivalist"
+	}
 	return &guide.AgentRegistration{
-		ID:      "archivalist",
+		ID:      canonicalID,
 		Name:    "archivalist",
 		Aliases: []string{"arch"},
 		Capabilities: guide.AgentCapabilities{

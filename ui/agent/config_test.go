@@ -331,8 +331,7 @@ func TestDeriveProvider(t *testing.T) {
 		"claude-opus-4-6":        "anthropic",
 		"claude-sonnet-4-6":      "anthropic",
 		"gemini-3.1-pro-preview": "google",
-		"gpt-5.4-pro":         "openai",
-		"gpt-5.4-pro":         "openai",
+		"gpt-5.4-pro":            "openai",
 		"unknown-model":          "",
 	}
 	for modelID, want := range cases {

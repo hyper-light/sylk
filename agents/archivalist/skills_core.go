@@ -16,6 +16,9 @@ func (a *Archivalist) registerExtendedSkills() {
 	a.skills.Register(workflowHistorySkill(a))
 	a.skills.Register(tokenSavingsSkill(a))
 	a.skills.Register(sessionTimelineSkill(a))
+	a.skills.Register(storeResearchPaperSkill(a))
+	a.skills.Register(researchPapersSkill(a))
+	a.skills.Register(researchPlanningBriefSkill(a))
 	a.skills.Register(patternSearchSkill(a))
 	a.skills.Register(failureSearchSkill(a))
 	a.skills.Register(decisionSearchSkill(a))
@@ -49,12 +52,12 @@ func (a *Archivalist) registerCoreSkills() {
 
 type archivalistDiag struct{ a *Archivalist }
 
-func (d *archivalistDiag) AgentName() string                              { return "archivalist" }
-func (d *archivalistDiag) SessionID() string                              { return d.a.defaultSessionID }
-func (d *archivalistDiag) LogsDir() string                                { return "" }
-func (d *archivalistDiag) EventLogger() *agentlog.SessionEventLogger      { return nil }
-func (d *archivalistDiag) PeerLogsDirs() map[string]string                { return nil }
-func (d *archivalistDiag) RecoveryHints() []string                        { return nil }
+func (d *archivalistDiag) AgentName() string                         { return "archivalist" }
+func (d *archivalistDiag) SessionID() string                         { return d.a.defaultSessionID }
+func (d *archivalistDiag) LogsDir() string                           { return "" }
+func (d *archivalistDiag) EventLogger() *agentlog.SessionEventLogger { return nil }
+func (d *archivalistDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *archivalistDiag) RecoveryHints() []string                   { return nil }
 
 func (d *archivalistDiag) AgentSpecificDiagnostics() map[string]any {
 	result := map[string]any{}

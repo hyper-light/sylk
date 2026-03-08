@@ -11,9 +11,9 @@ import (
 
 // Sentinel errors for plan state machine transitions.
 var (
-	ErrIllegalTransition    = errors.New("illegal plan state transition")
+	ErrIllegalTransition     = errors.New("illegal plan state transition")
 	ErrTransitionGuardFailed = errors.New("transition guard rejected")
-	ErrTransitionRace       = errors.New("concurrent transition race")
+	ErrTransitionRace        = errors.New("concurrent transition race")
 )
 
 // planTransitions defines the legal state graph. Every non-terminal state
@@ -26,8 +26,8 @@ var planTransitions = map[PlanStatus][]PlanStatus{
 	PlanStatusClarifying:    {PlanStatusPending, PlanStatusFailed, PlanStatusSuperseded},
 	PlanStatusDesigning:     {PlanStatusGenerating, PlanStatusFailed, PlanStatusSuperseded},
 	PlanStatusGenerating:    {PlanStatusOrchestrating, PlanStatusFailed, PlanStatusSuperseded},
-	PlanStatusOrchestrating: {PlanStatusReady, PlanStatusFailed, PlanStatusSuperseded},
-	PlanStatusReady:         {PlanStatusExecuting, PlanStatusPending, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusOrchestrating: {PlanStatusReady, PlanStatusExecuting, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusReady:         {PlanStatusOrchestrating, PlanStatusExecuting, PlanStatusPending, PlanStatusFailed, PlanStatusSuperseded},
 	PlanStatusExecuting:     {PlanStatusCompleted, PlanStatusFailed, PlanStatusPending},
 	PlanStatusCompleted:     {},
 	PlanStatusFailed:        {},

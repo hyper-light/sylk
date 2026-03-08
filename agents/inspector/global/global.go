@@ -487,7 +487,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	})
 
 	if !fwd.FireAndForget {
-		shared.PublishStreamStart(gi.bus, gi.channels, ctx, "inspector")
+		shared.PublishStreamStart(gi.bus, gi.channels, ctx, gi.id)
 	}
 
 	result, err := gi.Handle(ctx, fwd)
@@ -503,8 +503,8 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		shared.PublishStreamError(gi.bus, gi.channels, ctx, "inspector", err)
-		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, "inspector", "", usageAcc.Total())
+		shared.PublishStreamError(gi.bus, gi.channels, ctx, gi.id, err)
+		shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, "", usageAcc.Total())
 		errMsg := guide.NewErrorMessage(gi.generateMessageID(), fwd.CorrelationID, gi.id, err.Error())
 		return gi.bus.Publish(gi.channels.Errors, errMsg)
 	}
@@ -512,7 +512,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	// For streamed conversations, include the authoritative text in the
 	// completion event so the chat model can correct dropped/reordered chunks.
 	completeText := extractInspectorUserResponse(result)
-	shared.PublishStreamComplete(gi.bus, gi.channels, ctx, "inspector", completeText, usageAcc.Total())
+	shared.PublishStreamComplete(gi.bus, gi.channels, ctx, gi.id, completeText, usageAcc.Total())
 
 	resp := &guide.RouteResponse{
 		CorrelationID:       fwd.CorrelationID,

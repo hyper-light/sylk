@@ -16,6 +16,7 @@ func archivalistVisibleSkillNames() []string {
 func archivalistMutatingSkillNames() []string {
 	return []string{
 		"store",
+		"store_research_paper",
 		"route_to",
 		"reply_to",
 		"knowledge_memory",

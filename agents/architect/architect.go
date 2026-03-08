@@ -69,9 +69,11 @@ type Architect struct {
 
 	// Planning state — plans live in an externally-owned PlanStore singleton
 	// that survives agent demotion/re-promotion.
-	planStore     *PlanStore
-	ownsPlanStore bool
-	planModes     map[string]*PlanModeState
+	planStore        *PlanStore
+	ownsPlanStore    bool
+	controlStore     *ArchitectControlStore
+	ownsControlStore bool
+	planModes        map[string]*PlanModeState
 
 	runMu         sync.RWMutex
 	runCtx        context.Context
@@ -170,6 +172,10 @@ type Config struct {
 
 	// PlanStore is the process-lifetime plan store singleton. Required.
 	PlanStore *PlanStore
+
+	// ControlStore persists Architect control-plane state such as delegated
+	// continuations and mirrored plan snapshots. Optional; created lazily when nil.
+	ControlStore *ArchitectControlStore
 
 	// Signal bus for broadcasting degradation / time-pressure signals.
 	// Optional — if nil, the Architect creates a ChannelBusSignalAdapter
@@ -304,6 +310,19 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		)
 		ownedPlanStore = true
 	}
+	ownedControlStore := false
+	if cfg.ControlStore == nil {
+		controlPath := filepath.Join(cfg.WorkingDirectory, ".sylk", "state", "architect.db")
+		if err := os.MkdirAll(filepath.Dir(controlPath), 0o755); err != nil {
+			return nil, fmt.Errorf("create architect state directory: %w", err)
+		}
+		store, err := OpenArchitectControlStore(defaultArchitectControlStoreConfig(controlPath))
+		if err != nil {
+			return nil, err
+		}
+		cfg.ControlStore = store
+		ownedControlStore = true
+	}
 
 	architectID := cfg.ID
 	if architectID == "" {
@@ -320,6 +339,8 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		fileAccess:        cfg.FileAccess,
 		planStore:         cfg.PlanStore,
 		ownsPlanStore:     ownedPlanStore,
+		controlStore:      cfg.ControlStore,
+		ownsControlStore:  ownedControlStore,
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		planModes:         make(map[string]*PlanModeState),
 		pendingBus:        make(map[string]chan *guide.Message),
@@ -329,6 +350,22 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 	}
 
 	architect.steering.InitLazy("architect", cfg.ActivityPub)
+	if architect.planStore != nil {
+		architect.planStore.SetMirror(func(plan *DesignPlan) error {
+			if architect.controlStore == nil {
+				return nil
+			}
+			return architect.controlStore.UpsertPlan(plan)
+		})
+		for _, plan := range architect.planStore.Snapshot() {
+			if plan == nil || architect.controlStore == nil {
+				continue
+			}
+			if err := architect.controlStore.UpsertPlan(plan); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	guide.DebugFileLog().Info("DEBUG: architect_new_init_cross_domain")
 	architect.initCrossDomain(cfg)
@@ -487,9 +524,17 @@ func (a *Architect) Close() error {
 		a.tools = nil
 	}
 	if a.ownsPlanStore && a.planStore != nil {
+		a.planStore.SetMirror(nil)
 		a.planStore.Close()
 		a.planStore = nil
 		a.ownsPlanStore = false
+	} else if a.planStore != nil {
+		a.planStore.SetMirror(nil)
+	}
+	if a.ownsControlStore && a.controlStore != nil {
+		_ = a.controlStore.Close()
+		a.controlStore = nil
+		a.ownsControlStore = false
 	}
 	if a.logWAL == nil {
 		return stopErr
@@ -1142,10 +1187,9 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 	}
 
 	// When a ready plan exists, evaluate the user's response using the
-	// Guide's purpose-built acceptance evaluator before routing. This
-	// prevents misrouting when the Guide's general intent classifier labels
-	// an approval as IntentPlan instead of IntentExecute — approvals always
-	// go through the deterministic dispatch path, never the LLM tool loop.
+	// same Guardian-gated acceptance flow the tool loop uses. This keeps
+	// deterministic routing and LLM-driven routing on the same continuation
+	// path instead of maintaining separate sync-only logic.
 	if plan := a.latestReadyPlan(sessionIDFromForwarded(fwd)); plan != nil {
 		architectDebugLog().Info("handoff: READY_PLAN_FOUND",
 			"plan_id", plan.ID,
@@ -1155,39 +1199,30 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 			"user_input", fwd.Input,
 			"is_approval_signal", isApprovalSignal(fwd.Input),
 			"current_model", a.config.Model)
-		verdict, evalErr := a.evaluateAcceptanceVerdict(ctx, plan, fwd.Input)
-		architectDebugLog().Info("handoff: ACCEPTANCE_VERDICT",
-			"plan_id", plan.ID,
-			"verdict", string(verdict),
-			"eval_err", evalErr,
-			"user_input_preview", truncateString(fwd.Input, 200))
-		if evalErr != nil {
-			a.logWarn("handleConversation: acceptance evaluation failed",
-				"plan_id", plan.ID,
-				"error", evalErr)
-			// Short-circuit: if the user's input is a clear approval signal,
-			// dispatch deterministically instead of falling to the LLM path.
-			// This avoids the LLM "talking about handoff" failure mode when
-			// the Guide's evaluator is temporarily unreachable.
-			if isApprovalSignal(fwd.Input) {
-				a.logInfo("handleConversation: ROUTE=direct_dispatch (approval signal fallback)",
-					"plan_id", plan.ID,
-					"eval_error", evalErr)
-				return a.handleExecute(ctx, fwd)
+		if plan.PendingWork != nil {
+			message := strings.TrimSpace(plan.PendingWork.Message)
+			if message == "" {
+				message = "I already have a pending operation on this plan and will update you shortly."
 			}
-			return a.handlePlanFeedback(ctx, fwd, plan)
+			return &ConversationResult{
+				Response: message,
+				Intent:   IntentConverse,
+			}, nil
 		}
-		switch verdict {
-		case verdictAccept:
-			a.logInfo("handleConversation: ROUTE=direct_dispatch (acceptance evaluator: accept)",
-				"plan_id", plan.ID)
-			return a.handleExecute(ctx, fwd)
-		default:
-			a.logInfo("handleConversation: ROUTE=plan_feedback (acceptance evaluator: "+string(verdict)+")",
+		result, err := a.invokeConversationTool(ctx, "route_plan_acceptance", routePlanAcceptanceParams{
+			PlanID:       plan.ID,
+			UserResponse: fwd.Input,
+		}, IntentConverse)
+		if err != nil {
+			a.logWarn("handleConversation: route_plan_acceptance invocation failed",
 				"plan_id", plan.ID,
-				"plan_age", time.Since(plan.UpdatedAt).String())
-			return a.handlePlanFeedback(ctx, fwd, plan)
+				"error", err)
+			return &ConversationResult{
+				Response: "I couldn't start the plan approval flow right now: " + err.Error(),
+				Intent:   IntentConverse,
+			}, nil
 		}
+		return result, nil
 	}
 
 	req := &ArchitectRequest{
@@ -1425,6 +1460,12 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 
 	plan := a.latestReadyPlan(sessionIDFromForwarded(fwd))
 	if plan == nil {
+		if pending := a.planStore.LatestByStatus(sessionIDFromForwarded(fwd), PlanStatusOrchestrating, ReadyPlanMaxAge); pending != nil {
+			return &ConversationResult{
+				Response: "That plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
+				Intent:   IntentExecute,
+			}, nil
+		}
 		a.logInfo("handleExecute: no ready plan found")
 		architectDebugLog().Warn("handoff: EXECUTE_NO_READY_PLAN",
 			"session_id", sessionIDFromForwarded(fwd),
@@ -1535,6 +1576,16 @@ func forwardedRequestParams(fwd *guide.ForwardedRequest) map[string]any {
 // handleBusResponse processes responses to requests we made
 func (a *Architect) handleBusResponse(msg *guide.Message) error {
 	a.deliverPendingBusMessage(msg)
+	if a.hasPendingBusWait(msg.CorrelationID) {
+		a.logger.Debug("received response for synchronous waiter", "correlation_id", msg.CorrelationID, "type", msg.Type)
+		return nil
+	}
+	if err := a.handleContinuationResponse(msg); err != nil {
+		a.logWarn("handleBusResponse: continuation processing failed",
+			"correlation_id", msg.CorrelationID,
+			"error", err)
+		return err
+	}
 	a.logger.Debug("received response", "correlation_id", msg.CorrelationID, "type", msg.Type)
 	return nil
 }

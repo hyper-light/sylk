@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/llmruntime"
@@ -1151,6 +1152,7 @@ type taskListPayload struct {
 
 type taskPayload struct {
 	ID              string   `json:"id"`
+	Slug            string   `json:"slug,omitempty"`
 	Name            string   `json:"name"`
 	Description     string   `json:"description"`
 	AgentType       string   `json:"agent_type"`
@@ -1211,6 +1213,7 @@ func (p taskPayload) toTask(index int) *AtomicTask {
 	}
 	task := &AtomicTask{
 		ID:                  taskID,
+		Slug:                strings.TrimSpace(p.Slug),
 		Name:                strings.TrimSpace(p.Name),
 		Description:         strings.TrimSpace(p.Description),
 		AgentType:           normalizeTaskAgentType(p.AgentType),
@@ -1527,6 +1530,7 @@ Return JSON only, exactly:
   "tasks": [
     {
       "id": "task_1",
+      "slug": "short-kebab-case-label",
       "name": "Short imperative name",
       "description": "Detailed implementation description. Include what to build, how it fits the architecture, and key design decisions. Be specific enough that an agent can implement without follow-up questions.",
       "agent_type": "engineer|designer",
@@ -1595,6 +1599,7 @@ Hard limits:
 - Each task MUST have at least 2 acceptance_criteria with priority "must"
 - Each task MUST have at least 1 affected_files entry
 - Each task MUST have implementation_guide (minimum 2 sentences)
+- Each task MUST have a unique slug in lowercase kebab-case suitable for the pipeline panel (examples: "auth-checkout", "payment-retry")
 - guidelines: 1-4 items per task
 - test_requirements: 1-4 items per task
 - examples: 0-2 per task (include for non-trivial tasks)
@@ -1702,24 +1707,47 @@ func firstNonEmptyMapString(item map[string]any) []string {
 }
 
 func normalizeTaskGraph(tasks []*AtomicTask) []*AtomicTask {
-	ensureTaskIDs(tasks)
+	aliases := ensureTaskIdentity(tasks)
 	idSet := buildTaskIDSet(tasks)
 	nameIndex := buildTaskNameIndex(tasks)
 	for _, task := range tasks {
-		normalizeTask(task, idSet, nameIndex)
+		normalizeTask(task, idSet, nameIndex, aliases)
 	}
 	return tasks
 }
 
-func ensureTaskIDs(tasks []*AtomicTask) {
+func ensureTaskIdentity(tasks []*AtomicTask) map[string]string {
+	aliases := make(map[string]string, len(tasks)*2)
+	idSeen := make(map[string]int, len(tasks))
+	slugSeen := make(map[string]int, len(tasks))
+
 	for i, task := range tasks {
 		if task == nil {
 			continue
 		}
-		if strings.TrimSpace(task.ID) == "" {
-			task.ID = fmt.Sprintf("task_%d", i+1)
+
+		baseSlug := taskSlugCandidate(task, i)
+		task.Slug = uniqueTaskSlug(baseSlug, slugSeen)
+
+		rawID := strings.TrimSpace(task.ID)
+		baseID := canonicalTaskID(rawID)
+		if baseID == "" {
+			baseID = canonicalTaskID("task_" + strings.ReplaceAll(task.Slug, "-", "_"))
+		}
+		task.ID = uniqueTaskID(baseID, idSeen)
+
+		if rawID != "" {
+			if _, exists := aliases[rawID]; !exists {
+				aliases[rawID] = task.ID
+			}
+		}
+		if baseID != "" {
+			if _, exists := aliases[baseID]; !exists {
+				aliases[baseID] = task.ID
+			}
 		}
 	}
+	return aliases
 }
 
 func buildTaskIDSet(tasks []*AtomicTask) map[string]struct{} {
@@ -1741,28 +1769,36 @@ func buildTaskNameIndex(tasks []*AtomicTask) map[string]string {
 		}
 		key := canonicalTaskKey(task.Name)
 		if key != "" {
+			if _, exists := index[key]; exists {
+				continue
+			}
 			index[key] = task.ID
 		}
 	}
 	return index
 }
 
-func normalizeTask(task *AtomicTask, idSet map[string]struct{}, nameIndex map[string]string) {
+func normalizeTask(task *AtomicTask, idSet map[string]struct{}, nameIndex map[string]string, aliases map[string]string) {
 	if task == nil {
 		return
 	}
 	task.AgentType = normalizeTaskAgentType(task.AgentType)
-	task.Dependencies = normalizeDependencies(task.Dependencies, idSet, nameIndex)
+	task.Dependencies = normalizeDependencies(task.Dependencies, idSet, nameIndex, aliases)
 	if len(task.SuccessCriteria) == 0 {
 		task.SuccessCriteria = []string{"Task completed"}
 	}
 }
 
-func normalizeDependencies(dependencies []string, idSet map[string]struct{}, nameIndex map[string]string) []string {
+func normalizeDependencies(
+	dependencies []string,
+	idSet map[string]struct{},
+	nameIndex map[string]string,
+	aliases map[string]string,
+) []string {
 	result := make([]string, 0, len(dependencies))
 	seen := map[string]struct{}{}
 	for _, dependency := range dependencies {
-		mapped := mapDependency(dependency, idSet, nameIndex)
+		mapped := mapDependency(dependency, idSet, nameIndex, aliases)
 		if mapped == "" {
 			continue
 		}
@@ -1775,7 +1811,12 @@ func normalizeDependencies(dependencies []string, idSet map[string]struct{}, nam
 	return result
 }
 
-func mapDependency(dependency string, idSet map[string]struct{}, nameIndex map[string]string) string {
+func mapDependency(
+	dependency string,
+	idSet map[string]struct{},
+	nameIndex map[string]string,
+	aliases map[string]string,
+) string {
 	trimmed := strings.TrimSpace(dependency)
 	if trimmed == "" {
 		return ""
@@ -1783,11 +1824,120 @@ func mapDependency(dependency string, idSet map[string]struct{}, nameIndex map[s
 	if _, ok := idSet[trimmed]; ok {
 		return trimmed
 	}
+	if value, ok := aliases[trimmed]; ok {
+		return value
+	}
+	if value, ok := aliases[canonicalTaskID(trimmed)]; ok {
+		return value
+	}
 	key := canonicalTaskKey(trimmed)
 	if value, ok := nameIndex[key]; ok {
 		return value
 	}
 	return ""
+}
+
+func taskSlugForTask(task *AtomicTask, fallbackIndex int) string {
+	if task == nil {
+		return uniqueTaskSlug(fmt.Sprintf("task-%d", fallbackIndex+1), map[string]int{})
+	}
+	if slug := slugifyTaskValue(task.Slug); slug != "" {
+		return slug
+	}
+	return taskSlugCandidate(task, fallbackIndex)
+}
+
+func taskSlugCandidate(task *AtomicTask, index int) string {
+	if task == nil {
+		return fmt.Sprintf("task-%d", index+1)
+	}
+	candidates := []string{
+		task.Slug,
+		task.Name,
+		task.Description,
+	}
+	for _, candidate := range candidates {
+		if slug := slugifyTaskValue(candidate); slug != "" {
+			return slug
+		}
+	}
+	for _, file := range task.AffectedFiles {
+		if slug := slugifyTaskValue(file.Path); slug != "" {
+			return slug
+		}
+	}
+	return fmt.Sprintf("task-%d", index+1)
+}
+
+func uniqueTaskSlug(base string, seen map[string]int) string {
+	base = slugifyTaskValue(base)
+	if base == "" {
+		base = "task"
+	}
+	seen[base]++
+	if seen[base] == 1 {
+		return base
+	}
+	return fmt.Sprintf("%s-%d", base, seen[base])
+}
+
+func uniqueTaskID(base string, seen map[string]int) string {
+	base = canonicalTaskID(base)
+	if base == "" {
+		base = "task"
+	}
+	seen[base]++
+	if seen[base] == 1 {
+		return base
+	}
+	return fmt.Sprintf("%s_%d", base, seen[base])
+}
+
+func canonicalTaskID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	lastUnderscore := false
+	for _, r := range strings.ToLower(raw) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(r)
+			lastUnderscore = false
+		case r == '_' || r == '-' || unicode.IsSpace(r) || r == '/' || r == ':' || r == '.':
+			if !lastUnderscore && b.Len() > 0 {
+				b.WriteByte('_')
+				lastUnderscore = true
+			}
+		}
+	}
+	id := strings.Trim(b.String(), "_")
+	return id
+}
+
+func slugifyTaskValue(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	lastDash := false
+	for _, r := range strings.ToLower(raw) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(r)
+			lastDash = false
+		case r == '-' || r == '_' || unicode.IsSpace(r) || r == '/' || r == ':' || r == '.':
+			if !lastDash && b.Len() > 0 {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 func canonicalTaskKey(value string) string {

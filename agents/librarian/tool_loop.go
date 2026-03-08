@@ -136,6 +136,7 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
+		shared.AccumulateUsage(ctx, &resp.Usage)
 
 		// ── NO TOOL CALLS → RETURN ANSWER ──
 		if len(resp.ToolCalls) == 0 {

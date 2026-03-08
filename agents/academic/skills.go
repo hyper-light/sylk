@@ -28,9 +28,11 @@ func (a *Academic) registerCoreSkills() {
 
 type academicDiag struct{ a *Academic }
 
-func (d *academicDiag) AgentName() string  { return "academic" }
-func (d *academicDiag) SessionID() string  { return d.a.config.SessionID }
-func (d *academicDiag) LogsDir() string    { return shared.LogsDirForAgent(d.a.steering.SessionDir(), "academic") }
+func (d *academicDiag) AgentName() string { return "academic" }
+func (d *academicDiag) SessionID() string { return d.a.config.SessionID }
+func (d *academicDiag) LogsDir() string {
+	return shared.LogsDirForAgent(d.a.steering.SessionDir(), "academic")
+}
 func (d *academicDiag) EventLogger() *agentlog.SessionEventLogger { return d.a.steering.EventLogger() }
 func (d *academicDiag) PeerLogsDirs() map[string]string           { return nil }
 func (d *academicDiag) RecoveryHints() []string                   { return nil }
@@ -61,6 +63,7 @@ func (a *Academic) publishRerouteRequest(reason, originalInput, suggestedTarget 
 }
 
 func (a *Academic) registerExtendedSkills() {
+	a.skills.Register(authorResearchPaperSkill(a))
 	a.skills.Register(recommendSolutionSkill(a))
 	a.skills.Register(validateApproachSkill(a))
 	a.skills.Register(cloneViaLibrarianSkill(a))

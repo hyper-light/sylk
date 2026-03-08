@@ -43,9 +43,11 @@ func (a *Architect) registerCoreSkills() {
 
 type architectDiag struct{ a *Architect }
 
-func (d *architectDiag) AgentName() string  { return "architect" }
-func (d *architectDiag) SessionID() string  { return "" }
-func (d *architectDiag) LogsDir() string    { return shared.LogsDirForAgent(d.a.steering.SessionDir(), "architect") }
+func (d *architectDiag) AgentName() string { return "architect" }
+func (d *architectDiag) SessionID() string { return "" }
+func (d *architectDiag) LogsDir() string {
+	return shared.LogsDirForAgent(d.a.steering.SessionDir(), "architect")
+}
 func (d *architectDiag) EventLogger() *agentlog.SessionEventLogger { return d.a.steering.EventLogger() }
 func (d *architectDiag) PeerLogsDirs() map[string]string           { return nil }
 func (d *architectDiag) RecoveryHints() []string                   { return nil }
@@ -479,8 +481,8 @@ func planWorkflowSkill(a *Architect) *skills.Skill {
 		StringParam("plan_id", "Plan identifier to attach fix DAG to (for fix)", false).
 		StringParam("session_id", "Session identifier (for fix)", false).
 		ArrayParam("corrections", "Correction list from inspector/tester feedback (for fix)", "object", false).
-		Usage("Use during plan formulation to organize atomic tasks into a dependency graph. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance followed by handle_plan_acceptance_result.").
-		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires: route_plan_acceptance → Guide verdict → handle_plan_acceptance_result.").
+		Usage("Use during plan formulation to organize atomic tasks into a dependency graph. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance and let the Architect resume asynchronously when approval completes.").
+		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires route_plan_acceptance and an asynchronous handoff to the orchestrator.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params planWorkflowInput
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -589,9 +591,8 @@ func generateTasksNextAction(autoApprove bool) string {
 
 	if autoApprove {
 		return base + " Then invoke route_plan_acceptance with the plan_id " +
-			"and a brief summary as user_response. When it returns the Guide's " +
-			"verdict, invoke handle_plan_acceptance_result with the verdict details. " +
-			"On accept, the plan dispatches to the orchestrator automatically."
+			"and a brief summary as user_response. After invoking it, STOP. " +
+			"The approval and orchestrator handoff continue asynchronously."
 	}
 	return base + " Then invite the user to approve or request changes — " +
 		"use your own natural phrasing, not a scripted template. " +

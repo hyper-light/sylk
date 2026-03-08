@@ -1,23 +1,22 @@
 package container
 
 import (
+	"strings"
 	"sync"
-
-	"github.com/google/uuid"
 )
 
-// AgentIdentityRegistry generates and stores canonical UUID IDs per agent
-// type. IDs are pure UUIDs (no type prefix) — required for the direct
-// communication protocol where agents address each other by ID alone.
-// IDs are sticky — the same canonical ID is returned across spin-up
-// and spin-down cycles. Thread-safe; bounded to one entry per agent type.
+// AgentIdentityRegistry generates and stores canonical IDs per agent type.
+// For singleton specialists, the canonical ID is the stable human-readable
+// agent type itself (for example, "architect" or "librarian"). That keeps
+// Guide pre-registration, activation, routing, and UI identity aligned on a
+// single name across spin-up and spin-down cycles.
 //
-// The registry also maintains a reverse index (ID → type) so callers can
-// resolve an agent's type from its opaque ID without parsing conventions.
+// The registry also maintains a reverse index (ID -> type) so callers can
+// resolve an agent's type from its canonical ID without additional lookup.
 type AgentIdentityRegistry struct {
 	mu      sync.RWMutex
-	ids     map[string]string // agentType -> canonical UUID8
-	reverse map[string]string // canonical UUID8 -> agentType
+	ids     map[string]string // agentType -> canonical ID
+	reverse map[string]string // canonical ID -> agentType
 }
 
 // NewAgentIdentityRegistry creates a registry and pre-generates canonical
@@ -28,15 +27,21 @@ func NewAgentIdentityRegistry(agentTypes []string) *AgentIdentityRegistry {
 		ids:     make(map[string]string, len(agentTypes)),
 		reverse: make(map[string]string, len(agentTypes)),
 	}
-	for _, t := range agentTypes {
-		id := generateCanonicalID()
-		r.ids[t] = id
-		r.reverse[id] = t
+	for _, rawType := range agentTypes {
+		agentType := strings.TrimSpace(rawType)
+		if agentType == "" {
+			continue
+		}
+		if _, exists := r.ids[agentType]; exists {
+			continue
+		}
+		r.ids[agentType] = agentType
+		r.reverse[agentType] = agentType
 	}
 	return r
 }
 
-// Get returns the canonical UUID8 for the given agent type.
+// Get returns the canonical ID for the given agent type.
 func (r *AgentIdentityRegistry) Get(agentType string) (string, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -51,10 +56,4 @@ func (r *AgentIdentityRegistry) TypeOf(canonicalID string) (string, bool) {
 	defer r.mu.RUnlock()
 	t, ok := r.reverse[canonicalID]
 	return t, ok
-}
-
-// generateCanonicalID produces a pure UUID8 with no type prefix.
-// Example: "a1b2c3d4".
-func generateCanonicalID() string {
-	return uuid.New().String()[:8]
 }

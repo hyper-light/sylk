@@ -105,6 +105,7 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
+		shared.AccumulateUsage(ctx, &resp.Usage)
 
 		if len(resp.ToolCalls) == 0 {
 			a.recordTurn(req, resp, turn, 0, 0, turnStart)

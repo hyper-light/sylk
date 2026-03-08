@@ -29,6 +29,8 @@ type PlanStore struct {
 	leaseManager *PlanLeaseManager
 	logger       *slog.Logger
 	reaper       *PlanReaper
+	mirrorMu     sync.RWMutex
+	mirror       func(*DesignPlan) error
 }
 
 // NewPlanStore creates a PlanStore rooted at baseDir, restores persisted plans
@@ -69,7 +71,10 @@ func (s *PlanStore) Upsert(plan *DesignPlan) error {
 	s.mu.Lock()
 	s.plans[plan.ID] = plan
 	s.mu.Unlock()
-	return s.persistSnapshot(plan)
+	if err := s.persistSnapshot(plan); err != nil {
+		return err
+	}
+	return s.mirrorPlan(plan)
 }
 
 // Get returns the plan for the given ID, or nil.
@@ -102,6 +107,14 @@ func (s *PlanStore) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.plans)
+}
+
+// SetMirror registers a secondary persistence hook invoked after each plan
+// snapshot is written locally. Passing nil removes the mirror.
+func (s *PlanStore) SetMirror(mirror func(*DesignPlan) error) {
+	s.mirrorMu.Lock()
+	s.mirror = mirror
+	s.mirrorMu.Unlock()
 }
 
 // -------------------------------------------------------------------------
@@ -307,6 +320,16 @@ func (s *PlanStore) persistSnapshot(plan *DesignPlan) error {
 		return err
 	}
 	return os.Rename(tmpPath, finalPath)
+}
+
+func (s *PlanStore) mirrorPlan(plan *DesignPlan) error {
+	s.mirrorMu.RLock()
+	mirror := s.mirror
+	s.mirrorMu.RUnlock()
+	if mirror == nil || plan == nil {
+		return nil
+	}
+	return mirror(plan)
 }
 
 // PlanDir returns the directory path for plan files in the given session.

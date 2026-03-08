@@ -36,7 +36,7 @@ const (
 type ConversationResult struct {
 	Response      string
 	Intent        ArchitectIntent
-	HandoffTarget string                  // Non-empty when this result triggered a handoff (e.g. "orchestrator").
+	HandoffTarget string                   // Non-empty when this result triggered a handoff (e.g. "orchestrator").
 	Directive     *guide.ResponseDirective // Carried to StreamEventComplete.
 }
 
@@ -146,12 +146,24 @@ type DesignPlan struct {
 	CompletedAt            time.Time
 
 	// Distributed lifecycle fields for epoch-based stale detection and lease management.
-	Epoch       uint64    `json:"epoch"`
-	LeaseExpiry time.Time `json:"lease_expiry"`
-	LeaseHolder string    `json:"lease_holder,omitempty"`
+	Epoch       uint64               `json:"epoch"`
+	LeaseExpiry time.Time            `json:"lease_expiry"`
+	LeaseHolder string               `json:"lease_holder,omitempty"`
+	PendingWork *PendingContinuation `json:"pending_work,omitempty"`
 
 	// sm is not serialized; reconstructed on restore or creation.
 	sm *PlanStateMachine `json:"-"`
+}
+
+type PendingContinuation struct {
+	Kind          string    `json:"kind"`
+	Status        string    `json:"status"`
+	TargetAgentID string    `json:"target_agent_id,omitempty"`
+	CorrelationID string    `json:"correlation_id,omitempty"`
+	ToolName      string    `json:"tool_name,omitempty"`
+	Message       string    `json:"message,omitempty"`
+	CreatedAt     time.Time `json:"created_at,omitempty"`
+	ExpiresAt     time.Time `json:"expires_at,omitempty"`
 }
 
 // SM returns the plan's state machine, lazily initializing from the
@@ -325,6 +337,7 @@ func (c TaskComplexity) String() string {
 
 type AtomicTask struct {
 	ID              string
+	Slug            string
 	Name            string
 	Description     string
 	AgentType       string
@@ -371,13 +384,13 @@ type AcceptanceCriterion struct {
 // AgentScope defines a single agent's responsibilities within a compound task.
 // The Architect's LLM produces these to tell each agent exactly what to do.
 type AgentScope struct {
-	AgentType           string               `json:"agent_type"`
-	Role                string               `json:"role"` // "primary" | "co_agent"
+	AgentType           string                `json:"agent_type"`
+	Role                string                `json:"role"` // "primary" | "co_agent"
 	AcceptanceCriteria  []AcceptanceCriterion `json:"acceptance_criteria"`
-	ImplementationGuide string               `json:"implementation_guide"`
-	AffectedFiles       []TaskFileTarget     `json:"affected_files"`
-	Guidelines          []string             `json:"guidelines"`
-	TestRequirements    []string             `json:"test_requirements"`
+	ImplementationGuide string                `json:"implementation_guide"`
+	AffectedFiles       []TaskFileTarget      `json:"affected_files"`
+	Guidelines          []string              `json:"guidelines"`
+	TestRequirements    []string              `json:"test_requirements"`
 }
 
 // TaskExample provides a concrete code or pattern example for the task.
@@ -562,6 +575,7 @@ type PlanHandoff struct {
 // includes all rich specification fields.
 type HandoffTask struct {
 	ID                  string                `json:"id"`
+	Slug                string                `json:"slug,omitempty"`
 	Name                string                `json:"name"`
 	Description         string                `json:"description"`
 	AgentType           string                `json:"agent_type"`

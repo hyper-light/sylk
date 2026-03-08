@@ -96,6 +96,7 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request, 
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 
+		shared.AccumulateUsage(ctx, &resp.Usage)
 		d.accumulateUsage(resp)
 
 		if len(resp.ToolCalls) == 0 {

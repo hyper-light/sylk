@@ -67,8 +67,11 @@ var variantStateIcons = map[string]string{
 // pipelinePrefix is the tree connector for pipeline member agents.
 const pipelinePrefix = " \u2502 " // " │ "
 
+// pipelineHeaderPrefix renders a pipeline subheading within the Pipelines section.
+const pipelineHeaderPrefix = " \u2502  \u2500 " // " │  ─ "
+
 // variantPrefix is the dotted tree connector for variant rows.
-const variantPrefix = " \u250a " // " ┊ "
+const variantPrefix = " \u2502  \u250a " // " │  ┊ "
 
 // renderPipelineRow renders a pipeline header row.
 // Layout: [indicator] [task-id] [status] [progress-bar] [loop/max]
@@ -76,7 +79,7 @@ const variantPrefix = " \u250a " // " ┊ "
 // group color; the task-id additionally gets a ripple shimmer via anim.
 func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme, selected bool, activeColor lipgloss.Color, anim AnimState) string {
 	// Task ID — always bold, matching renderSectionHeader.
-	taskLabel := truncate(pl.TaskID, 16)
+	taskLabel := truncate(pipelineDisplayLabel(pl), 24)
 	var name string
 	if activeColor != "" && anim.Ripple {
 		hGrad := anim.RippleGrad
@@ -94,6 +97,7 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 		}
 		name = nameStyle.Render(taskLabel)
 	}
+	prefix := renderTreePrefix(pipelineHeaderPrefix, activeColor, th)
 
 	// Status label.
 	statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtext)
@@ -106,11 +110,7 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 	loopStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
 	loopLabel := loopStyle.Render(fmt.Sprintf("%d/%d", pl.LoopCount, pl.MaxLoops))
 
-	if selected {
-		indicator := th.AgentActive.Render(theme.IconExpand)
-		return fmt.Sprintf("%s %s %s %s %s", indicator, name, statusLabel, bar, loopLabel)
-	}
-	return fmt.Sprintf("%s %s %s %s", name, statusLabel, bar, loopLabel)
+	return fmt.Sprintf("%s%s %s %s %s", prefix, name, statusLabel, bar, loopLabel)
 }
 
 // renderProgressBar renders a 5-cell shimmer progress bar.
@@ -223,13 +223,18 @@ func renderExpandedPipeline(pl *PipelineState, width, height int, th *theme.Them
 
 	lines := []string{
 		fmt.Sprintf("  %s %s", labelStyle.Render("Task:"), valueStyle.Render(pl.TaskID)),
+	}
+	if pl.TaskLabel != "" && pl.TaskLabel != pl.TaskID {
+		lines = append(lines, fmt.Sprintf("  %s %s", labelStyle.Render("Label:"), valueStyle.Render(pl.TaskLabel)))
+	}
+	lines = append(lines,
 		fmt.Sprintf("  %s %s", labelStyle.Render("Status:"), valueStyle.Render(pl.Status)),
 		fmt.Sprintf("  %s %s", labelStyle.Render("Phase:"), valueStyle.Render(tddPhaseLabel(pl.Status))),
 		fmt.Sprintf("  %s %s", labelStyle.Render("Loop:"), valueStyle.Render(fmt.Sprintf("%d / %d", pl.LoopCount, pl.MaxLoops))),
 		fmt.Sprintf("  %s %s", labelStyle.Render("Worker:"), valueStyle.Render(pl.WorkerType)),
 		renderDetailSeparator(width, th),
 		fmt.Sprintf("  %s %d agent(s)", labelStyle.Render("Members:"), len(pl.Members)),
-	}
+	)
 
 	end := min(len(lines), height)
 	return strings.Join(lines[:end], "\n")

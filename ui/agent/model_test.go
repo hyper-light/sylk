@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -268,6 +269,7 @@ func TestModel_PipelineRowsLayout(t *testing.T) {
 	model.Update(msg.PipelineStateMsg{
 		PipelineID: "pl-1",
 		TaskID:     "task-abc",
+		TaskLabel:  "auth-checkout",
 		Status:     "implement",
 		LoopCount:  2,
 		MaxLoops:   5,
@@ -307,27 +309,79 @@ func TestModel_PipelineRowsLayout(t *testing.T) {
 	// 1: global section
 	// 2: guide (standalone)
 	// 3: spacer
-	// 4: pl-1 pipeline header
-	// 5: eng-1 agent
-	// 6: var-a8f2 variant
-	if len(model.rows) < 7 {
-		t.Fatalf("rows count = %d, want >= 7", len(model.rows))
+	// 4: pipelines section
+	// 5: pl-1 pipeline header
+	// 6: eng-1 agent
+	// 7: var-a8f2 variant
+	if len(model.rows) < 8 {
+		t.Fatalf("rows count = %d, want >= 8", len(model.rows))
 	}
 
 	if model.rows[3].Kind != rowSpacer {
 		t.Fatalf("rows[3] = %+v, want spacer", model.rows[3])
 	}
 
-	if model.rows[4].Kind != rowPipeline || model.rows[4].ID != "pl-1" {
-		t.Fatalf("rows[4] = %+v, want pipeline pl-1", model.rows[4])
+	if model.rows[4].Kind != rowSection || model.rows[4].Label != "pipelines" {
+		t.Fatalf("rows[4] = %+v, want section pipelines", model.rows[4])
 	}
 
-	if model.rows[5].Kind != rowAgent || model.rows[5].ID != "eng-1" {
-		t.Fatalf("rows[5] = %+v, want agent eng-1", model.rows[5])
+	if model.rows[5].Kind != rowPipeline || model.rows[5].ID != "pl-1" {
+		t.Fatalf("rows[5] = %+v, want pipeline pl-1", model.rows[5])
 	}
 
-	if model.rows[6].Kind != rowVariant || model.rows[6].ID != "var-a8f2" {
-		t.Fatalf("rows[6] = %+v, want variant var-a8f2", model.rows[6])
+	if model.rows[6].Kind != rowAgent || model.rows[6].ID != "eng-1" {
+		t.Fatalf("rows[6] = %+v, want agent eng-1", model.rows[6])
+	}
+
+	if model.rows[7].Kind != rowVariant || model.rows[7].ID != "var-a8f2" {
+		t.Fatalf("rows[7] = %+v, want variant var-a8f2", model.rows[7])
+	}
+
+	pl := model.pipelines["pl-1"]
+	if pl == nil {
+		t.Fatal("expected pipeline state for pl-1")
+	}
+	if pl.TaskLabel != "auth-checkout" {
+		t.Fatalf("pipeline TaskLabel = %q, want auth-checkout", pl.TaskLabel)
+	}
+}
+
+func TestModel_PipelineAgentsAreScopedPerPipeline(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	for _, pipelineID := range []string{"task_auth_checkout", "task_payment_retry"} {
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_" + pipelineID,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   pipelineID + ":engineer",
+				Data: map[string]any{
+					"agent_name":  "Engineer",
+					"agent_type":  "engineer",
+					"pipeline_id": pipelineID,
+					"task_id":     pipelineID,
+					"task_slug":   strings.ReplaceAll(strings.TrimPrefix(pipelineID, "task_"), "_", "-"),
+				},
+			},
+		})
+	}
+
+	model.ensureRows()
+
+	if len(model.pipelines) != 2 {
+		t.Fatalf("pipeline count = %d, want 2", len(model.pipelines))
+	}
+	if got := len(model.agents); got != 2 {
+		t.Fatalf("agent count = %d, want 2", got)
+	}
+	if model.findPipelineAgent("engineer", "task_auth_checkout") == nil {
+		t.Fatal("expected engineer row for task_auth_checkout")
+	}
+	if model.findPipelineAgent("engineer", "task_payment_retry") == nil {
+		t.Fatal("expected engineer row for task_payment_retry")
 	}
 }
 

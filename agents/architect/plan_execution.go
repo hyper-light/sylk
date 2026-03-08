@@ -2,7 +2,6 @@ package architect
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -39,10 +38,10 @@ func (a *Architect) latestReadyPlan(sessionID string) *DesignPlan {
 	return best
 }
 
-// dispatchPlanExecution validates the handoff payload, routes it synchronously
-// to the orchestrator, and transitions the plan to Executing on success.
-// Emits a StreamEventReroute BEFORE the sync call so the TUI switches to the
-// orchestrator agent while the orchestrator is actively processing.
+// dispatchPlanExecution validates the handoff payload, persists a pending
+// handoff continuation, and publishes an explicit-target request to the
+// orchestrator through the Guide without blocking the architect loop. The
+// eventual orchestrator response is handled asynchronously in handleBusResponse.
 func (a *Architect) dispatchPlanExecution(
 	ctx context.Context,
 	_ *ArchitectRequest,
@@ -70,6 +69,13 @@ func (a *Architect) dispatchPlanExecution(
 		}, true
 	}
 
+	if plan.PendingWork != nil && plan.PendingWork.Kind == string(continuationKindPlanHandoff) {
+		return &ConversationResult{
+			Response: "The plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
+			Intent:   IntentExecute,
+		}, true
+	}
+
 	payload := buildHandoffPayload(plan, "user-approved execution")
 	if !isPlanHandoffPayloadValid(payload) {
 		a.logWarn("dispatchPlanExecution: invalid handoff payload",
@@ -81,79 +87,70 @@ func (a *Architect) dispatchPlanExecution(
 		}, true
 	}
 
-	a.publishPlanSnapshot(ctx, plan)
-
-	// Generate the orchestrator's correlation ID for the sync call.
 	orchCID := "corr_" + uuid.NewString()
-
-	a.logInfo("dispatchPlanExecution: BLOCKING CALL to requestRouteSync",
-		"plan_id", plan.ID,
-		"orch_cid", orchCID,
-		"payload_len", len(payload),
-		"ctx_deadline", contextDeadlineString(ctx))
-
-	// The orchestrator handles its own push to the TUI via the agent push
-	// mechanism — no reroute event needed from the architect.
-
-	request := &guide.RouteRequest{
-		Input:         payload,
-		CorrelationID: orchCID,
-		TargetAgentID: "orchestrator",
-		SessionID:     plan.SessionID,
+	if plan.SM().State() == PlanStatusReady {
+		if err := plan.SM().TransitionTo(PlanStatusOrchestrating, plan); err != nil {
+			return &ConversationResult{
+				Response: "The plan is no longer in a ready state: " + err.Error(),
+				Intent:   IntentExecute,
+			}, true
+		}
 	}
-
-	handoffStart := time.Now()
-	response, err := a.requestRouteSync(ctx, request)
-	handoffElapsed := time.Since(handoffStart)
-	a.logInfo("dispatchPlanExecution: requestRouteSync returned",
-		"plan_id", plan.ID,
-		"blocked_for", handoffElapsed.String(),
-		"has_response", response != nil,
-		"has_error", err != nil)
-	if err != nil {
-		a.logWarn("dispatchPlanExecution: route failed", "plan_id", plan.ID, "error", err)
+	plan.Status = plan.SM().State()
+	plan.Epoch = plan.SM().Epoch()
+	plan.UpdatedAt = time.Now().UTC()
+	userMessage := "Plan handoff queued to the orchestrator. I'll update you when it confirms ingestion."
+	record := &ArchitectContinuation{
+		ID:                      "cont_" + uuid.NewString(),
+		Kind:                    continuationKindPlanHandoff,
+		State:                   continuationStatusPending,
+		PlanID:                  plan.ID,
+		SessionID:               plan.SessionID,
+		TargetAgentID:           "orchestrator",
+		ResponseCorrelationID:   orchCID,
+		InvocationCorrelationID: originalCIDFromContext(ctx),
+		RequestJSON:             payload,
+		CreatedAt:               time.Now().UTC(),
+		ExpiresAt:               time.Now().UTC().Add(routeSyncTimeout),
+	}
+	if err := a.recordPendingContinuation(plan, record, userMessage); err != nil {
+		return &ConversationResult{
+			Response: "I couldn't persist the plan handoff state: " + err.Error(),
+			Intent:   IntentExecute,
+		}, true
+	}
+	if _, ok := architectStreamMetadataFromContext(ctx); ok {
+		a.publishPlanSnapshot(ctx, plan)
+	}
+	request := &guide.RouteRequest{
+		Input:               payload,
+		CorrelationID:       orchCID,
+		ParentCorrelationID: originalCIDFromContext(ctx),
+		TargetAgentID:       "orchestrator",
+		SessionID:           plan.SessionID,
+	}
+	if err := a.publishRouteRequest(request); err != nil {
+		a.logWarn("dispatchPlanExecution: async publish failed", "plan_id", plan.ID, "error", err)
+		if plan.SM().State() == PlanStatusOrchestrating {
+			if transitionErr := plan.SM().TransitionTo(PlanStatusReady, plan); transitionErr == nil {
+				plan.Status = plan.SM().State()
+				plan.Epoch = plan.SM().Epoch()
+			}
+		}
+		_ = a.clearPlanPendingContinuation(plan, orchCID)
+		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		_ = a.persistPlanState(plan)
 		return &ConversationResult{
 			Response: "I tried to dispatch the plan but hit an error: " + err.Error() + "\nWant me to try again?",
 			Intent:   IntentExecute,
 		}, true
 	}
 
-	if !isHandoffSuccess(response) {
-		summary := summarizeAutoHandoffResponse(response)
-		a.logWarn("dispatchPlanExecution: orchestrator rejected", "plan_id", plan.ID, "summary", summary)
-		return &ConversationResult{
-			Response: "The orchestrator rejected the handoff: " + summary + "\nWant me to try again?",
-			Intent:   IntentExecute,
-		}, true
-	}
-
-	// Orchestrator confirmed ingestion — CAS transition Ready→Executing.
-	// ReadyDirective is derived from SM state, so transitioning to Executing
-	// automatically makes it return nil.
-	if err := plan.SM().TransitionTo(PlanStatusExecuting, plan); err != nil {
-		a.logWarn("dispatchPlanExecution: transition to Executing failed", "plan_id", plan.ID, "error", err)
-		return &ConversationResult{
-			Response: "The plan is no longer in a ready state: " + err.Error(),
-			Intent:   IntentExecute,
-		}, true
-	}
-	plan.Status = plan.SM().State()
-	plan.Epoch = plan.SM().Epoch()
-	// Grant executing lease for crash recovery detection.
-	if lm := a.planStore.LeaseManager(); lm != nil {
-		lm.GrantExecutingLease(plan, "orchestrator")
-	}
-
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanLeased,
 		a.id, plan.SessionID, orchCID, "info",
-		&agentlog.PlanPayload{PlanID: plan.ID, Status: "executing", Epoch: plan.Epoch})
-	summary := summarizeAutoHandoffResponse(response)
-	plan.RiskSummary = append(plan.RiskSummary, summary)
-	_ = a.planStore.Upsert(plan)
-	a.publishPlanSnapshot(ctx, plan)
-
+		&agentlog.PlanPayload{PlanID: plan.ID, Status: "orchestrating", Epoch: plan.Epoch})
 	return &ConversationResult{
-		Response:      fmt.Sprintf("Plan dispatched to the orchestrator. %s", summary),
+		Response:      userMessage,
 		Intent:        IntentExecute,
 		HandoffTarget: "orchestrator",
 	}, true
@@ -181,51 +178,6 @@ func (a *Architect) latestHistoricalPlanForSession(sessionID string) *DesignPlan
 // attach clarification questions to the in-flight plan.
 func (a *Architect) latestConsultingPlan(sessionID string) *DesignPlan {
 	return a.planStore.LatestConsulting(sessionID)
-}
-
-// evaluateAcceptanceVerdict sends the user's response to the Guide's
-// purpose-built acceptance evaluator and returns the verdict
-// (accept/modify/reject). This is the same evaluator that the
-// route_plan_acceptance skill calls internally, extracted for deterministic
-// routing in handleConversation so that plan approvals never depend on the
-// LLM choosing to invoke the right tool.
-func (a *Architect) evaluateAcceptanceVerdict(
-	ctx context.Context,
-	plan *DesignPlan,
-	userResponse string,
-) (acceptanceVerdict, error) {
-	architectDebugLog().Info("handoff: EVAL_ACCEPTANCE_START",
-		"plan_id", plan.ID,
-		"user_response", truncateString(userResponse, 300),
-		"bus_available", a.running && a.bus != nil)
-	if !a.running || a.bus == nil {
-		return "", fmt.Errorf("bus unavailable for acceptance evaluation")
-	}
-	payload := buildPlanAcceptancePayload(plan, userResponse)
-	result, err := a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
-	if err != nil {
-		architectDebugLog().Warn("handoff: EVAL_ACCEPTANCE_BUS_ERROR",
-			"plan_id", plan.ID,
-			"error", err.Error())
-		return "", err
-	}
-	par, ok := result.(*planAcceptanceResult)
-	if !ok || par == nil {
-		architectDebugLog().Warn("handoff: EVAL_ACCEPTANCE_BAD_RESULT",
-			"plan_id", plan.ID,
-			"result_type", fmt.Sprintf("%T", result))
-		return "", fmt.Errorf("unexpected result type from acceptance evaluation: %T", result)
-	}
-	verdict := acceptanceVerdict(strings.TrimSpace(strings.ToLower(par.Result)))
-	architectDebugLog().Info("handoff: EVAL_ACCEPTANCE_VERDICT",
-		"plan_id", plan.ID,
-		"verdict", string(verdict),
-		"raw_result", par.Result,
-		"user_response_preview", truncateString(userResponse, 100))
-	if verdict == "" {
-		return "", fmt.Errorf("empty verdict from acceptance evaluation")
-	}
-	return verdict, nil
 }
 
 // stalledPlanMaxAge is the maximum age of a plan eligible for stall recovery.

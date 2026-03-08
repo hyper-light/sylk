@@ -116,12 +116,12 @@ type GuideResponseMsg struct {
 // The Guide broadcasts this when an agent invokes the reroute_request skill
 // and the request is being re-classified to a different agent.
 type StreamRerouteMsg struct {
-	SessionID              string
-	CorrelationID          string // New correlation ID for the rerouted request.
-	OriginalCorrelationID  string // Correlation ID of the original request being rerouted.
-	FromAgentID            string // Agent that requested the reroute.
-	ToAgentID              string // New target agent (may be empty if not yet classified).
-	Reason                 string // Why the reroute happened.
+	SessionID             string
+	CorrelationID         string // New correlation ID for the rerouted request.
+	OriginalCorrelationID string // Correlation ID of the original request being rerouted.
+	FromAgentID           string // Agent that requested the reroute.
+	ToAgentID             string // New target agent (may be empty if not yet classified).
+	Reason                string // Why the reroute happened.
 }
 
 // RetryStatusMsg reports a retry or model-fallback attempt during Guide processing.
@@ -639,6 +639,7 @@ type PlanViewToggleMsg struct{}
 type PipelineStateMsg struct {
 	PipelineID string
 	TaskID     string
+	TaskLabel  string
 	Status     string // TDD phase or lifecycle status.
 	WorkerType string // Agent type running the pipeline.
 	LoopCount  int
@@ -728,12 +729,12 @@ type ToolCallEventMsg struct {
 	SessionID     string
 	CorrelationID string
 	AgentID       string
-	Phase         int           // 0 = start, 1 = complete.
+	Phase         int // 0 = start, 1 = complete.
 	ToolName      string
 	ArgsSummary   string
-	FullArgs      string        // Pretty-printed JSON (for expanded view).
-	Output        string        // Truncated result (for expanded view, max 512 chars).
-	ErrorMsg      string        // Error text on failure.
+	FullArgs      string // Pretty-printed JSON (for expanded view).
+	Output        string // Truncated result (for expanded view, max 512 chars).
+	ErrorMsg      string // Error text on failure.
 	StartedAt     time.Time
 	Duration      time.Duration
 	Success       bool
@@ -765,7 +766,7 @@ type TimePressureMsg struct {
 // indexer. Sent periodically by a polling goroutine so the status bar can
 // render a thin progress bar.
 type IndexProgressMsg struct {
-	Phase   int   // Maps to status.IndexPhase.
+	Phase   int // Maps to status.IndexPhase.
 	Current int64
 	Total   int64
 	Done    bool

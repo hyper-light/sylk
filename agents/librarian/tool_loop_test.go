@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // mockProvider is a test double that replays a sequence of LLM responses.
@@ -62,8 +63,26 @@ func newTestLibrarian(provider LibrarianProvider) *Librarian {
 		}).
 		Build())
 	l.skills.Load("echo")
+	l.tools = newTestToolRuntime(l.skills, "echo")
 
 	return l
+}
+
+func newTestToolRuntime(registry *skills.Registry, visible ...string) *toolruntime.Runtime {
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: registry,
+		Manifest: toolruntime.BuildManifestFromRegistry(toolruntime.ManifestBuildConfig{
+			AgentID:          "test-librarian",
+			CapabilityScope:  "librarian.test",
+			Registry:         registry,
+			VisibleByDefault: visible,
+		}),
+		State: toolruntime.NewState(),
+	})
+	if err != nil {
+		panic(fmt.Sprintf("initialize test tool runtime: %v", err))
+	}
+	return tools
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +246,7 @@ func TestExecuteToolLoop_ConsecutiveErrors(t *testing.T) {
 			return nil, fmt.Errorf("intentional failure")
 		}).
 		Build())
+	l.tools = newTestToolRuntime(l.skills, "echo", "fail_always")
 
 	failCall := func(id string) providers.ToolCall {
 		return providers.ToolCall{
@@ -321,11 +341,11 @@ func TestExecuteToolCall_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result == "" {
+	if result.Output == "" {
 		t.Error("expected non-empty result")
 	}
-	if !contains(result, "hello") {
-		t.Errorf("expected result to contain 'hello', got %q", result)
+	if !contains(result.Output, "hello") {
+		t.Errorf("expected result to contain 'hello', got %q", result.Output)
 	}
 }
 

@@ -20,8 +20,8 @@ import (
 
 // protocolMaxToolRuns is the tool-call budget for the agent-driven planning
 // protocol. The protocol needs ~6-8 skill calls (analyze, consult, design,
-// generate_tasks, plus potentially ask_user_question, route_plan_acceptance,
-// and handle_plan_acceptance_result). 16 provides headroom.
+// generate_tasks, plus potentially ask_user_question and route_plan_acceptance).
+// 16 provides headroom.
 const protocolMaxToolRuns = 16
 
 func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectRequest) (*DesignPlan, error) {
@@ -421,9 +421,9 @@ Always pass plan_id to plan and consult skills. Do not skip phases 1, 2, 4, or 5
 
 Exception — auto-approve (when approval_required is false):
 Skip the approval cue in step 6. Instead, after the brief assessment, invoke
-route_plan_acceptance with the plan_id and a brief user_response summary. When
-route_plan_acceptance returns the Guide's verdict, invoke handle_plan_acceptance_result
-with the verdict. On "accept", this dispatches the plan to the orchestrator automatically.`
+route_plan_acceptance with the plan_id and a brief user_response summary.
+After invoking it, STOP. The approval and orchestrator handoff continue
+asynchronously.`
 
 // buildProtocolPrompt constructs the user message that seeds the tool loop.
 func (r *planningProtocolRunner) buildProtocolPrompt() string {

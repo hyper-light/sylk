@@ -83,6 +83,7 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
+		shared.AccumulateUsage(ctx, &resp.Usage)
 
 		if len(resp.ToolCalls) == 0 {
 			pt.recordTurn(req, resp, turn, 0, 0, turnStart)

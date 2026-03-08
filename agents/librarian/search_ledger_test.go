@@ -79,13 +79,15 @@ func TestSearchLedger_SaturationResetsOnNewFile(t *testing.T) {
 		`{"count":1,"matches":[{"file":"a.go","line":1,"content":"x"}]}`)
 	sl.Record(1, "grep", `{"pattern":"bar"}`,
 		`{"count":1,"matches":[{"file":"a.go","line":5,"content":"bar"}]}`)
+	sl.Record(2, "find_symbol", `{"name":"Foo"}`,
+		`{"count":1,"symbols":[{"file":"a.go","name":"Foo","kind":"function","start_line":10,"end_line":20}]}`)
 
 	if !sl.IsSaturated() {
 		t.Fatal("should be saturated")
 	}
 
 	// New search finds a new file — saturation breaks.
-	sl.Record(2, "grep", `{"pattern":"baz"}`,
+	sl.Record(3, "grep", `{"pattern":"baz"}`,
 		`{"count":1,"matches":[{"file":"new.go","line":1,"content":"baz"}]}`)
 
 	if sl.IsSaturated() {
@@ -134,6 +136,8 @@ func TestSearchLedger_SaturatedSummaryContainsWarning(t *testing.T) {
 		`{"count":1,"matches":[{"file":"a.go","line":1,"content":"x"}]}`)
 	sl.Record(1, "grep", `{"pattern":"bar"}`,
 		`{"count":1,"matches":[{"file":"a.go","line":5,"content":"bar"}]}`)
+	sl.Record(2, "find_symbol", `{"name":"Foo"}`,
+		`{"count":1,"symbols":[{"file":"a.go","name":"Foo","kind":"function","start_line":10,"end_line":20}]}`)
 
 	summary := sl.EvidenceSummary()
 	if !strings.Contains(summary, "SATURATED") {

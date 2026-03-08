@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	sitter "github.com/tree-sitter/go-tree-sitter"
+	sitter "github.com/adalundhe/sylk/third_party/go_tree_sitter"
 )
 
 //go:embed queries/*.scm

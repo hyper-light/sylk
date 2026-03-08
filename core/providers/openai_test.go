@@ -180,6 +180,28 @@ func TestOpenAIProviderBuildResponseParams_AppliesTextAndPromptCacheControls(t *
 	}
 }
 
+func TestOpenAIProviderBuildResponseParams_NormalizesLegacyPromptCacheRetention(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Messages:             []Message{{Role: RoleUser, Content: "hello"}},
+		PromptCacheKey:       "architect:session-123",
+		PromptCacheRetention: "in-memory",
+	})
+
+	body := marshalResponseNewParams(t, params)
+	if body["prompt_cache_retention"] != "in_memory" {
+		t.Fatalf("expected normalized in_memory prompt cache retention, got %#v", body["prompt_cache_retention"])
+	}
+}
+
 func TestOpenAIProviderBuildResponseParams_AppliesParallelToolControls(t *testing.T) {
 	p := &OpenAIProvider{
 		config: OpenAIConfig{

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -23,6 +24,8 @@ func (l *Librarian) registerCoreSkills() {
 	}
 	l.skills.Register(assessHealthSkill(l))
 	l.skills.Register(queryStructureSkill(l))
+	l.skills.Register(repoBriefSkill(l))
+	l.skills.Register(symbolReferenceGraphSkill(l))
 
 	// Codebase exploration tools (always available).
 	l.skills.Register(readFileSkill(l))
@@ -52,13 +55,13 @@ func (l *Librarian) registerCoreSkills() {
 
 type librarianDiag struct{}
 
-func (d *librarianDiag) AgentName() string                              { return "librarian" }
-func (d *librarianDiag) SessionID() string                              { return "" }
-func (d *librarianDiag) LogsDir() string                                { return "" }
-func (d *librarianDiag) EventLogger() *agentlog.SessionEventLogger      { return nil }
-func (d *librarianDiag) PeerLogsDirs() map[string]string                { return nil }
-func (d *librarianDiag) RecoveryHints() []string                        { return nil }
-func (d *librarianDiag) AgentSpecificDiagnostics() map[string]any       { return map[string]any{} }
+func (d *librarianDiag) AgentName() string                         { return "librarian" }
+func (d *librarianDiag) SessionID() string                         { return "" }
+func (d *librarianDiag) LogsDir() string                           { return "" }
+func (d *librarianDiag) EventLogger() *agentlog.SessionEventLogger { return nil }
+func (d *librarianDiag) PeerLogsDirs() map[string]string           { return nil }
+func (d *librarianDiag) RecoveryHints() []string                   { return nil }
+func (d *librarianDiag) AgentSpecificDiagnostics() map[string]any  { return map[string]any{} }
 
 func (l *Librarian) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
 	if l.bus == nil {
@@ -410,16 +413,30 @@ func queryStructureSkill(l *Librarian) *skills.Skill {
 				params.Depth = 3
 			}
 
+			brief, err := l.buildRepositoryBrief(ctx, repoBriefParams{
+				Focus: params.Focus,
+				Depth: params.Depth,
+			})
+			if err != nil {
+				return nil, err
+			}
+
 			structure := map[string]any{
-				"depth":       params.Depth,
-				"focus":       params.Focus,
-				"directories": l.domainFilter.CodeContentPatterns(),
+				"depth":             params.Depth,
+				"focus":             params.Focus,
+				"directory_tree":    brief.Summary.DirectoryStructure,
+				"key_paths":         brief.Summary.KeyPaths,
+				"entry_points":      brief.Summary.EntryPoints,
+				"languages":         brief.Summary.Languages,
+				"dependencies":      brief.Summary.Dependencies,
+				"inferred_commands": brief.InferredCommands,
 			}
 
 			if params.IncludeStats {
 				structure["stats"] = map[string]any{
-					"estimated_files":       "unknown",
-					"estimated_directories": "unknown",
+					"estimated_files":       len(brief.Summary.KeyPaths),
+					"estimated_directories": strings.Count(brief.Summary.DirectoryStructure, "/"),
+					"module_count":          len(brief.Modules),
 				}
 			}
 

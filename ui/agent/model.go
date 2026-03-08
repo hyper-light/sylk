@@ -96,11 +96,11 @@ type AgentState struct {
 type rowKind int
 
 const (
-	rowSection rowKind = iota // Non-selectable section header.
-	rowSpacer                 // Non-selectable spacer with left border.
-	rowAgent                  // Selectable agent card.
-	rowPipeline               // Selectable pipeline header.
-	rowVariant                // Selectable variant sub-row.
+	rowSection  rowKind = iota // Non-selectable section header.
+	rowSpacer                  // Non-selectable spacer with left border.
+	rowAgent                   // Selectable agent card.
+	rowPipeline                // Selectable pipeline header.
+	rowVariant                 // Selectable variant sub-row.
 )
 
 // isNonSelectable reports whether a row kind cannot be selected by the user.
@@ -120,6 +120,7 @@ type listRow struct {
 type PipelineState struct {
 	ID         string
 	TaskID     string
+	TaskLabel  string
 	Status     string
 	LoopCount  int
 	MaxLoops   int
@@ -214,14 +215,14 @@ const maxAgentOrder = maxAgents
 // eventTypeToStatus maps core EventType values to the AgentStatus they produce.
 // This table-driven dispatch replaces a switch cascade.
 var eventTypeToStatus = map[events.EventType]AgentStatus{
-	events.EventTypeAgentAction:   StatusActing,
-	events.EventTypeAgentDecision: StatusThinking,
-	events.EventTypeAgentError:    StatusError,
-	events.EventTypeToolCall:      StatusActing,
-	events.EventTypeToolResult:    StatusIdle,
-	events.EventTypeToolTimeout:   StatusError,
-	events.EventTypeLLMRequest:    StatusThinking,
-	events.EventTypeLLMResponse:   StatusIdle,
+	events.EventTypeAgentAction:     StatusActing,
+	events.EventTypeAgentDecision:   StatusThinking,
+	events.EventTypeAgentError:      StatusError,
+	events.EventTypeToolCall:        StatusActing,
+	events.EventTypeToolResult:      StatusIdle,
+	events.EventTypeToolTimeout:     StatusError,
+	events.EventTypeLLMRequest:      StatusThinking,
+	events.EventTypeLLMResponse:     StatusIdle,
 	events.EventTypeSuccess:         StatusSuccess,
 	events.EventTypeFailure:         StatusError,
 	events.EventTypeAgentRegistered: StatusWaiting,
@@ -285,17 +286,17 @@ func isActiveStatus(s AgentStatus) bool { return activeStatuses[s] }
 type Model struct {
 	agents    map[string]*AgentState
 	streams   map[string]*AgentEventStream
-	order     []string // Agent IDs in insertion order (bounded by maxAgentOrder).
-	engagedID string   // Agent ID the user is conversing with (sticky until reroute/override).
-	selected  int      // Index into m.rows for list view navigation.
-	expanded     string    // Agent ID of the expanded detail view ("" if none).
-	view         viewState // Current view state.
-	eventSel     int       // Selected event index in expanded view (logical, 0=oldest, -1=tail-follow).
-	scrollOff    int       // Scroll offset for event detail view.
-	theme        *theme.Theme
-	width        int
-	height       int
-	focused      bool
+	order     []string  // Agent IDs in insertion order (bounded by maxAgentOrder).
+	engagedID string    // Agent ID the user is conversing with (sticky until reroute/override).
+	selected  int       // Index into m.rows for list view navigation.
+	expanded  string    // Agent ID of the expanded detail view ("" if none).
+	view      viewState // Current view state.
+	eventSel  int       // Selected event index in expanded view (logical, 0=oldest, -1=tail-follow).
+	scrollOff int       // Scroll offset for event detail view.
+	theme     *theme.Theme
+	width     int
+	height    int
+	focused   bool
 
 	dotFrame int // Current frame index for the filling-circle dot animation.
 
@@ -304,17 +305,17 @@ type Model struct {
 	modelStore *AgentModelStore // Persisted model selections (nil-safe).
 
 	// Pipeline & variant state.
-	pipelines     map[string]*PipelineState  // Pipeline ID → state.
-	variants      map[string]*VariantState   // Variant ID → state.
-	pipelineOrder []string                   // Pipeline IDs in insertion order.
-	rows          []listRow                  // Flattened display list, rebuilt lazily.
-	rowsDirty     bool                       // True when rows need rebuilding.
-	shimmerStart       time.Time     // Epoch for gradient shimmer animation.
-	gradient           *theme.Gradient // Pipeline progress shimmer gradient.
-	groupGradient      *theme.Gradient // Active: full prismatic. Swapped on HasActiveAgent.
-	idleGroupGradient  *theme.Gradient // Idle: green→jade→blue→white.
-	activeGroupGradient *theme.Gradient // Active: full prismatic spectrum.
-	rippleGradient     *theme.Gradient // Per-character ripple for active agent text.
+	pipelines           map[string]*PipelineState // Pipeline ID → state.
+	variants            map[string]*VariantState  // Variant ID → state.
+	pipelineOrder       []string                  // Pipeline IDs in insertion order.
+	rows                []listRow                 // Flattened display list, rebuilt lazily.
+	rowsDirty           bool                      // True when rows need rebuilding.
+	shimmerStart        time.Time                 // Epoch for gradient shimmer animation.
+	gradient            *theme.Gradient           // Pipeline progress shimmer gradient.
+	groupGradient       *theme.Gradient           // Active: full prismatic. Swapped on HasActiveAgent.
+	idleGroupGradient   *theme.Gradient           // Idle: green→jade→blue→white.
+	activeGroupGradient *theme.Gradient           // Active: full prismatic spectrum.
+	rippleGradient      *theme.Gradient           // Per-character ripple for active agent text.
 }
 
 // Verify interface compliance at compile time.
@@ -528,7 +529,6 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	return nil
 }
 
-
 // ensureAgent creates an agent entry if it does not exist, respecting the bound.
 // For standalone agents (one-per-type), re-keys the existing entry to the new
 // UUID instead of creating a duplicate. This handles two cases:
@@ -541,16 +541,22 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 
 	agentType := extractString(ev.Event.Data, "agent_type")
 
-	// For standalone and pipeline agents there should be exactly one panel
-	// entry per type. Find any existing entry with the same type and re-key
-	// it to the new UUID. This covers:
+	// Standalone and knowledge agents are singleton rows per type. Pipeline
+	// agents are singleton rows per (type, pipeline_id). Find any existing
+	// matching entry and re-key it to the new UUID. This covers:
 	//  1. Seeded placeholder (ID == AgentType) promoted on first activation.
 	//  2. Re-activation after demotion: old UUID entry promoted to new UUID.
-	//  3. Pipeline agents: orchestrator creates a type-based placeholder
-	//     (e.g. ID="engineer") that the real agent's UUID replaces.
 	category := agentCategoryByType[agentType]
-	if agentType != "" && (category == "standalone" || category == "pipeline" || category == "knowledge") {
-		if existing := m.findAgentByType(agentType); existing != nil {
+	pipelineID := extractString(ev.Event.Data, "pipeline_id")
+	if agentType != "" {
+		var existing *AgentState
+		switch category {
+		case "pipeline":
+			existing = m.findPipelineAgent(agentType, pipelineID)
+		case "standalone", "knowledge":
+			existing = m.findAgentByType(agentType)
+		}
+		if existing != nil {
 			m.promoteSeededAgent(existing, agentID, ev)
 			return
 		}
@@ -564,8 +570,6 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 	if agentName == "" {
 		agentName = agentID
 	}
-
-	pipelineID := extractString(ev.Event.Data, "pipeline_id")
 
 	modelID := defaultModelForAgent(agentType)
 	providerID := deriveProvider(modelID)
@@ -601,12 +605,20 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 		pl, ok := m.pipelines[pipelineID]
 		if !ok && len(m.pipelines) < maxPipelines {
 			taskID := extractString(ev.Event.Data, "task_id")
+			taskLabel := extractString(ev.Event.Data, "task_slug")
 			if taskID == "" {
-				taskID = pipelineShortID(pipelineID)
+				taskID = pipelineID
+			}
+			if taskLabel == "" {
+				taskLabel = taskID
+			}
+			if taskLabel == "" {
+				taskLabel = pipelineShortID(pipelineID)
 			}
 			pl = &PipelineState{
 				ID:        pipelineID,
 				TaskID:    taskID,
+				TaskLabel: taskLabel,
 				Status:    "executing",
 				CreatedAt: time.Now(),
 			}
@@ -614,6 +626,15 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 			m.pipelineOrder = append(m.pipelineOrder, pipelineID)
 		}
 		if pl != nil && len(pl.Members) < maxAgents {
+			if pl.TaskID == "" {
+				pl.TaskID = extractString(ev.Event.Data, "task_id")
+			}
+			if pl.TaskLabel == "" {
+				pl.TaskLabel = extractString(ev.Event.Data, "task_slug")
+				if pl.TaskLabel == "" {
+					pl.TaskLabel = pl.TaskID
+				}
+			}
 			pl.Members = append(pl.Members, agentID)
 		}
 	}
@@ -670,6 +691,15 @@ func (m *Model) promoteSeededAgent(placeholder *AgentState, realID string, ev ms
 func (m *Model) findAgentByType(agentType string) *AgentState {
 	for _, agent := range m.agents {
 		if agent.AgentType == agentType {
+			return agent
+		}
+	}
+	return nil
+}
+
+func (m *Model) findPipelineAgent(agentType, pipelineID string) *AgentState {
+	for _, agent := range m.agents {
+		if agent.AgentType == agentType && agent.PipelineID == pipelineID {
 			return agent
 		}
 	}
@@ -755,7 +785,14 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 		}
 	}
 
-	pl.TaskID = ps.TaskID
+	if ps.TaskID != "" {
+		pl.TaskID = ps.TaskID
+	}
+	if ps.TaskLabel != "" {
+		pl.TaskLabel = ps.TaskLabel
+	} else if pl.TaskLabel == "" {
+		pl.TaskLabel = pl.TaskID
+	}
 	pl.Status = ps.Status
 	pl.LoopCount = ps.LoopCount
 	pl.MaxLoops = ps.MaxLoops
@@ -1004,7 +1041,7 @@ func (m *Model) SelectorActive() bool {
 // ---------------------------------------------------------------------------
 
 // rebuildRows computes the flat row list from agents, pipelines, and variants.
-// Sections: standalone → pipeline groups → knowledge.
+// Sections: standalone → knowledge → pipelines.
 func (m *Model) rebuildRows() {
 	m.rowsDirty = false
 
@@ -1038,8 +1075,8 @@ func (m *Model) rebuildRows() {
 	m.sortAgentsByDisplayOrder(standalone)
 	m.sortAgentsByDisplayOrder(knowledge)
 
-	// Estimate capacity: sections + agents + pipelines + variants.
-	capacity := 3 + len(m.order) + len(m.pipelineOrder) + len(m.variants)
+	// Estimate capacity: sections + agents + pipelines + variants + spacers.
+	capacity := 4 + len(m.order) + len(m.pipelineOrder)*2 + len(m.variants)
 	rows := make([]listRow, 0, capacity)
 
 	// Standalone section.
@@ -1051,29 +1088,34 @@ func (m *Model) rebuildRows() {
 		}
 	}
 
-	// Pipeline sections.
-	for _, plID := range m.pipelineOrder {
-		pl := m.pipelines[plID]
-		if pl == nil {
-			continue
-		}
-		rows = append(rows, listRow{Kind: rowSpacer})
-		rows = append(rows, listRow{Kind: rowPipeline, ID: plID, Label: pl.TaskID})
-		for _, agentID := range pipelineMembers[plID] {
-			rows = append(rows, listRow{Kind: rowAgent, ID: agentID, PipelineID: plID})
-		}
-		// Append variants for this pipeline.
-		for _, v := range m.variantsForPipeline(plID) {
-			rows = append(rows, listRow{Kind: rowVariant, ID: v.ID, PipelineID: plID})
-		}
-	}
-
 	// Knowledge section.
 	if len(knowledge) > 0 {
 		rows = append(rows, listRow{Kind: rowSpacer})
 		rows = append(rows, listRow{Kind: rowSection, Label: "knowledge"})
 		for _, id := range knowledge {
 			rows = append(rows, listRow{Kind: rowAgent, ID: id})
+		}
+	}
+
+	// Pipelines section.
+	if len(m.pipelineOrder) > 0 {
+		rows = append(rows, listRow{Kind: rowSpacer})
+		rows = append(rows, listRow{Kind: rowSection, Label: "pipelines"})
+		for idx, plID := range m.pipelineOrder {
+			pl := m.pipelines[plID]
+			if pl == nil {
+				continue
+			}
+			rows = append(rows, listRow{Kind: rowPipeline, ID: plID, Label: pipelineDisplayLabel(pl)})
+			for _, agentID := range pipelineMembers[plID] {
+				rows = append(rows, listRow{Kind: rowAgent, ID: agentID, PipelineID: plID})
+			}
+			for _, v := range m.variantsForPipeline(plID) {
+				rows = append(rows, listRow{Kind: rowVariant, ID: v.ID, PipelineID: plID})
+			}
+			if idx < len(m.pipelineOrder)-1 {
+				rows = append(rows, listRow{Kind: rowSpacer})
+			}
 		}
 	}
 
@@ -1402,7 +1444,7 @@ func (m *Model) renderListView() string {
 		HasActive:       hasActive,
 		Ripple:          ripple,
 		RippleGrad:      m.rippleGradient,      // ThinkingGradient for active agents.
-		HolographicGrad: m.activeGroupGradient,  // Full prismatic for selected active agent.
+		HolographicGrad: m.activeGroupGradient, // Full prismatic for selected active agent.
 	}
 
 	contentHeight := m.height
@@ -1523,23 +1565,15 @@ func renderTreePrefix(glyph string, activeColor lipgloss.Color, th *theme.Theme)
 // row produces a visible color shift across 3-5 rows without strobing.
 const groupFlowStep = 250 * time.Millisecond
 
-// isGroupEnd reports whether row at index i is the last content row before
-// the next section header, pipeline header, or end of list.
+// isGroupEnd reports whether row at index i is the last content row in the
+// list. The Agents panel uses a single closing footer at the bottom.
 func (m *Model) isGroupEnd(i int) bool {
 	row := m.rows[i]
 	// Non-selectable rows (section headers, spacers) don't get footers.
 	if row.Kind.isNonSelectable() {
 		return false
 	}
-
-	// Last row in the entire list.
-	if i+1 >= len(m.rows) {
-		return true
-	}
-
-	next := m.rows[i+1]
-	// A section or pipeline header starts a new group.
-	return next.Kind == rowSection || next.Kind == rowPipeline
+	return i+1 >= len(m.rows)
 }
 
 // sectionFooterFraction is the fraction of panel width used for the footer rule.
@@ -1765,6 +1799,19 @@ func pipelineShortID(id string) string {
 		return clean[:shortLen]
 	}
 	return id
+}
+
+func pipelineDisplayLabel(pl *PipelineState) string {
+	if pl == nil {
+		return ""
+	}
+	if strings.TrimSpace(pl.TaskLabel) != "" {
+		return pl.TaskLabel
+	}
+	if strings.TrimSpace(pl.TaskID) != "" {
+		return pl.TaskID
+	}
+	return pipelineShortID(pl.ID)
 }
 
 // extractFloat safely extracts a float64 value from a map.

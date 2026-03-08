@@ -157,6 +157,51 @@ type RepositoryInfo struct {
 	IndexStats *IndexStats    `json:"index_stats,omitempty"`
 }
 
+type RepositoryCommand struct {
+	Kind       string   `json:"kind"`
+	Command    string   `json:"command"`
+	Confidence float64  `json:"confidence"`
+	Evidence   []string `json:"evidence,omitempty"`
+}
+
+type RepositoryModule struct {
+	Name           string   `json:"name"`
+	Path           string   `json:"path"`
+	Ecosystem      string   `json:"ecosystem"`
+	DependencyFile string   `json:"dependency_file"`
+	Dependencies   []string `json:"dependencies,omitempty"`
+}
+
+type OwnershipRule struct {
+	Pattern string   `json:"pattern"`
+	Owners  []string `json:"owners"`
+	Source  string   `json:"source"`
+}
+
+type RepositoryHotspot struct {
+	Path         string   `json:"path"`
+	ChangeCount  int      `json:"change_count"`
+	Contributors []string `json:"contributors,omitempty"`
+}
+
+type SymbolReferenceNode struct {
+	Name           string   `json:"name"`
+	Kind           string   `json:"kind"`
+	DefinitionFile string   `json:"definition_file"`
+	ReferenceCount int      `json:"reference_count"`
+	RelatedFiles   []string `json:"related_files,omitempty"`
+}
+
+type RepositoryBrief struct {
+	Root             string                `json:"root"`
+	Summary          *CodebaseSummary      `json:"summary,omitempty"`
+	InferredCommands []RepositoryCommand   `json:"inferred_commands,omitempty"`
+	Modules          []RepositoryModule    `json:"modules,omitempty"`
+	Ownership        []OwnershipRule       `json:"ownership,omitempty"`
+	Hotspots         []RepositoryHotspot   `json:"hotspots,omitempty"`
+	SymbolGraph      []SymbolReferenceNode `json:"symbol_graph,omitempty"`
+}
+
 type FileRange struct {
 	StartLine int `json:"start_line"`
 	EndLine   int `json:"end_line"`

@@ -30,6 +30,7 @@ func (g *Guardian) registerCoreSkills() {
 	g.skills.Register(concurrencyStatusSkill(g))
 	g.skills.Register(usageBreakdownSkill(g))
 	g.skills.Register(quarantineStatusSkill(g))
+	g.skills.Register(toolExecutionControlSkill(g))
 	g.skills.Register(shared.NewSelfDiagnosticSkill(&guardianDiag{g: g}))
 	g.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "guardian",
@@ -40,9 +41,11 @@ func (g *Guardian) registerCoreSkills() {
 
 type guardianDiag struct{ g *Guardian }
 
-func (d *guardianDiag) AgentName() string  { return "guardian" }
-func (d *guardianDiag) SessionID() string  { return "" }
-func (d *guardianDiag) LogsDir() string    { return shared.LogsDirForAgent(d.g.steering.SessionDir(), "guardian") }
+func (d *guardianDiag) AgentName() string { return "guardian" }
+func (d *guardianDiag) SessionID() string { return "" }
+func (d *guardianDiag) LogsDir() string {
+	return shared.LogsDirForAgent(d.g.steering.SessionDir(), "guardian")
+}
 func (d *guardianDiag) EventLogger() *agentlog.SessionEventLogger { return d.g.steering.EventLogger() }
 func (d *guardianDiag) RecoveryHints() []string                   { return nil }
 

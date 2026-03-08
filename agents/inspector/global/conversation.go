@@ -123,7 +123,7 @@ func (gi *GlobalInspector) handleConversationChunk(
 	switch chunk.Type {
 	case providers.ChunkTypeStart:
 		if chunk.RetryReset {
-			shared.PublishStreamStart(gi.bus, gi.channels, ctx, "inspector")
+			shared.PublishStreamStart(gi.bus, gi.channels, ctx, gi.id)
 		}
 		text.Reset()
 		thoughts.Reset()

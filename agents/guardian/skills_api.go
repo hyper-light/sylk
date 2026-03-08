@@ -37,6 +37,7 @@ func guardianToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("concurrency_status", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("usage_breakdown", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("quarantine_status", toolruntime.EffectReadOnly, toolruntime.DomainValidation, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("tool_execution_control", toolruntime.EffectReadOnly, toolruntime.DomainControl, toolruntime.ExecutionModeLocal, toolruntime.WithSearchable(false)),
 		toolruntime.NewToolPolicy("read_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("glob", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("grep", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),

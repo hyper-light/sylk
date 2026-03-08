@@ -76,6 +76,7 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
+		shared.AccumulateUsage(ctx, &resp.Usage)
 
 		if len(resp.ToolCalls) == 0 {
 			return strings.TrimSpace(resp.Content), nil

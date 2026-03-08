@@ -53,8 +53,8 @@ func consultSkill(a *Architect) *skills.Skill {
 			}
 			if !a.isAgentRegistered(p.Target) {
 				return map[string]any{
-					"target": p.Target,
-					"status": "not_registered",
+					"target":  p.Target,
+					"status":  "not_registered",
 					"message": fmt.Sprintf("agent %q is not registered; skip or choose a different target", p.Target),
 				}, nil
 			}
@@ -513,6 +513,7 @@ func buildPlanHandoff(plan *DesignPlan, trigger string) *PlanHandoff {
 func atomicTaskToHandoff(t *AtomicTask) *HandoffTask {
 	h := &HandoffTask{
 		ID:                  t.ID,
+		Slug:                taskSlugForTask(t, 0),
 		Name:                t.Name,
 		Description:         t.Description,
 		AgentType:           t.AgentType,
@@ -591,7 +592,6 @@ func monitorExecutionSkill(a *Architect) *skills.Skill {
 		Build()
 }
 
-
 func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates map[string]any) *DesignPlan {
 	current := a.planStore.Get(plan.ID)
 	if current == nil {
@@ -642,7 +642,6 @@ func parsePlanStatus(status string, fallback PlanStatus) PlanStatus {
 	}
 	return fallback
 }
-
 
 func buildFixTasks(corrections []any) []*AtomicTask {
 	tasks := make([]*AtomicTask, 0, len(corrections))
@@ -976,7 +975,6 @@ func ensurePlanFileExists(path string, taskDescription string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-
 func writePlanFile(path string, content string, appendMode bool) error {
 	if !appendMode {
 		return os.WriteFile(path, []byte(content), 0644)
@@ -989,7 +987,6 @@ func writePlanFile(path string, content string, appendMode bool) error {
 	_, err = file.WriteString(content)
 	return err
 }
-
 
 type askUserQuestionParams struct {
 	SessionID string           `json:"session_id,omitempty"`
@@ -1022,11 +1019,21 @@ func askUserQuestionSkill(a *Architect) *skills.Skill {
 			// can detect that clarification was requested.
 			if plan := a.latestConsultingPlan(sessionID); plan != nil {
 				plan.ClarificationQuestions = extractQuestionTexts(params.Questions)
+				if plan.SM().State() == PlanStatusConsulting {
+					if err := plan.SM().TransitionTo(PlanStatusClarifying, plan); err == nil {
+						plan.Status = plan.SM().State()
+						plan.Epoch = plan.SM().Epoch()
+					}
+				}
+				plan.UpdatedAt = time.Now().UTC()
+				_ = a.persistPlanState(plan)
 			}
+			userMessage := formatClarificationNotification(params.Questions)
 			return map[string]any{
-				"status":     "clarification_required",
-				"session_id": sessionID,
-				"questions":  params.Questions,
+				"status":       "clarification_required",
+				"session_id":   sessionID,
+				"questions":    params.Questions,
+				"user_message": userMessage,
 			}, nil
 		}).
 		Build()
@@ -1044,6 +1051,22 @@ func extractQuestionTexts(questions []map[string]any) []string {
 		texts = append(texts, text)
 	}
 	return texts
+}
+
+func formatClarificationNotification(questions []map[string]any) string {
+	if len(questions) == 0 {
+		return "I need clarification before I can continue."
+	}
+	var b strings.Builder
+	b.WriteString("I need clarification before I can continue:\n")
+	for i, q := range questions {
+		text := strings.TrimSpace(fmt.Sprint(q["question"]))
+		if text == "" || text == "<nil>" {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("%d. %s\n", i+1, text))
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func (a *Architect) getPlanMode(sessionID string) (*PlanModeState, error) {
@@ -1160,9 +1183,9 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 		TokenEstimate(300).
 		StringParam("query", "Synthesized planning query capturing all requirements, constraints, and scope gathered from the conversation", true).
 		StringParam("session_id", "Session identifier for plan tracking", false).
-		Usage("Invoke to create a new plan. Returns plan_id and protocol instructions. "+
-			"Then invoke the planning skills yourself using the returned plan_id: "+
-			"plan(analyze) → consult(pre_planning) → plan(design) → plan(generate_tasks). "+
+		Usage("Invoke to create a new plan. Returns plan_id and protocol instructions. " +
+			"Then invoke the planning skills yourself using the returned plan_id: " +
+			"plan(analyze) → consult(pre_planning) → plan(design) → plan(generate_tasks). " +
 			"Do NOT wait — drive the protocol immediately after receiving the plan_id.").
 		BestPractice("Synthesize the full conversation context into the query — do not just repeat the user's last message.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -1200,7 +1223,7 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 				"plan_id":    plan.ID,
 				"session_id": sessionID,
 				"status":     plan.Status.String(),
-				"protocol": startPlanningProtocolInstructions(a.config.AutoApprove),
+				"protocol":   startPlanningProtocolInstructions(a.config.AutoApprove),
 			}, nil
 		}).
 		Build()
@@ -1225,8 +1248,7 @@ func startPlanningProtocolInstructions(autoApprove bool) string {
 	if autoApprove {
 		return base + "\n" +
 			"7. Invoke route_plan_acceptance with the plan_id and a brief summary as user_response.\n" +
-			"8. When route_plan_acceptance returns the Guide's verdict, invoke handle_plan_acceptance_result " +
-			"with the verdict details. On accept, the plan dispatches to the orchestrator automatically."
+			"8. After invoking route_plan_acceptance, STOP. The approval and orchestrator handoff continue asynchronously."
 	}
 	return base + "\n" +
 		"   Invite the user to approve or request changes — use natural phrasing, not a template.\n" +
@@ -1244,13 +1266,13 @@ type routePlanAcceptanceParams struct {
 
 func routePlanAcceptanceSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("route_plan_acceptance").
-		Description("Route a ready plan and user response to the Guide for acceptance evaluation.").
+		Description("Queue a ready plan and user response for Guide acceptance evaluation after Guardian approval.").
 		Domain("coordination").
 		Keywords("plan", "acceptance", "evaluate", "approve", "reject", "feedback").
 		Priority(100).
 		StringParam("plan_id", "Plan identifier (uses latest ready plan if omitted)", false).
 		StringParam("user_response", "The user's verbatim response to the plan", true).
-		Usage("Use IMMEDIATELY after the user responds to a presented plan. Packages the plan text, plan ID, plan name, and user response into a structured payload and routes it to the Guide's evaluate-plan-acceptance skill. All four payload fields are derived by the handler — do NOT attempt to construct the evaluation payload manually. The Guide returns accept/modify/reject with optional modification notes.").
+		Usage("Use IMMEDIATELY after the user responds to a presented plan. Packages the plan text, plan ID, plan name, and user response into a structured payload and queues it for the Guide's evaluate-plan-acceptance skill. All four payload fields are derived by the handler — do NOT attempt to construct the evaluation payload manually. This tool returns a pending status and the Architect resumes automatically when the Guide responds.").
 		Example(`{"plan_id": "plan_abc", "user_response": "Looks good, but swap the task order for steps 2 and 3."}`).
 		BestPractice("Always call this skill for user responses to ready plans — do not classify acceptance yourself.").
 		BestPractice("If the result is 'modify', read the modifications list and apply changes via plan action=revise before re-presenting.").
@@ -1286,7 +1308,7 @@ func routePlanAcceptanceSkill(a *Architect) *skills.Skill {
 				"plan_id", plan.ID,
 				"payload_plan_len", len(payload.Plan),
 				"payload_plan_name", payload.PlanName)
-			result, err := a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
+			result, err := a.submitPlanAcceptanceEvaluation(ctx, plan, payload)
 			if err != nil {
 				architectDebugLog().Warn("route_plan_acceptance: GUIDE_ERROR",
 					"error", err.Error(),
@@ -1397,17 +1419,54 @@ func derivePlanName(plan *DesignPlan) string {
 	return plan.ID
 }
 
-// routePlanAcceptanceToGuide serializes the payload and sends it to the Guide
-// for evaluation via the bus. Returns the Guide's structured response.
-func (a *Architect) routePlanAcceptanceToGuide(
+// submitPlanAcceptanceEvaluation serializes the payload, records a durable
+// continuation, and publishes a Guide-routed evaluation request without
+// blocking the Architect loop.
+func (a *Architect) submitPlanAcceptanceEvaluation(
 	ctx context.Context,
-	sessionID string,
+	plan *DesignPlan,
 	payload *planAcceptancePayload,
-) (any, error) {
+) (map[string]any, error) {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		architectDebugLog().Warn("routePlanAcceptanceToGuide: ENCODE_ERROR", "error", err.Error())
 		return nil, fmt.Errorf("failed to encode acceptance payload: %w", err)
+	}
+	if a == nil || !a.running || a.bus == nil {
+		return nil, fmt.Errorf("bus unavailable for acceptance evaluation")
+	}
+	if plan != nil && plan.PendingWork != nil && plan.PendingWork.Kind == string(continuationKindAcceptanceEval) {
+		message := strings.TrimSpace(plan.PendingWork.Message)
+		if message == "" {
+			message = "I'm already reviewing your response against the current plan and will update you shortly."
+		}
+		return map[string]any{
+			"status":         "acceptance_evaluation_pending",
+			"plan_id":        plan.ID,
+			"correlation_id": plan.PendingWork.CorrelationID,
+			"target_agent":   plan.PendingWork.TargetAgentID,
+			"user_message":   message,
+		}, nil
+	}
+
+	sessionID := plan.SessionID
+	correlationID := "accept_" + uuid.NewString()
+	userMessage := "I'm reviewing your response against the current plan now. I'll update you shortly."
+	record := &ArchitectContinuation{
+		ID:                      "cont_" + uuid.NewString(),
+		Kind:                    continuationKindAcceptanceEval,
+		State:                   continuationStatusPending,
+		PlanID:                  plan.ID,
+		SessionID:               sessionID,
+		TargetAgentID:           "guide",
+		ResponseCorrelationID:   correlationID,
+		InvocationCorrelationID: originalCIDFromContext(ctx),
+		RequestJSON:             string(encoded),
+		CreatedAt:               time.Now().UTC(),
+		ExpiresAt:               time.Now().UTC().Add(routeSyncTimeout),
+	}
+	if err := a.recordPendingContinuation(plan, record, userMessage); err != nil {
+		return nil, err
 	}
 
 	architectDebugLog().Info("routePlanAcceptanceToGuide: SENDING_TO_GUIDE",
@@ -1420,26 +1479,29 @@ func (a *Architect) routePlanAcceptanceToGuide(
 		"ctx_deadline", contextDeadlineString(ctx))
 
 	req := &guide.RouteRequest{
-		Input:         "evaluate-plan-acceptance: " + string(encoded),
-		TargetAgentID: "guide",
-		SessionID:     sessionID,
+		CorrelationID:       correlationID,
+		ParentCorrelationID: originalCIDFromContext(ctx),
+		Input:               "evaluate-plan-acceptance: " + string(encoded),
+		TargetAgentID:       "guide",
+		SessionID:           sessionID,
 	}
 
-	response, err := a.requestRouteSync(ctx, req)
-	if err != nil {
-		architectDebugLog().Warn("routePlanAcceptanceToGuide: ROUTE_SYNC_ERROR",
+	if err := a.publishRouteRequest(req); err != nil {
+		architectDebugLog().Warn("routePlanAcceptanceToGuide: PUBLISH_ERROR",
 			"error", err.Error(),
 			"plan_id", payload.PlanID,
-			"session_id", sessionID,
-			"ctx_err", ctx.Err())
+			"session_id", sessionID)
+		_ = a.clearPlanPendingContinuation(plan, correlationID)
+		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
 		return nil, fmt.Errorf("guide acceptance evaluation failed: %w", err)
 	}
-
-	architectDebugLog().Info("routePlanAcceptanceToGuide: ROUTE_SYNC_RESPONSE",
-		"plan_id", payload.PlanID,
-		"response_nil", response == nil)
-
-	return extractAcceptanceResult(response, payload)
+	return map[string]any{
+		"status":         "acceptance_evaluation_pending",
+		"plan_id":        payload.PlanID,
+		"correlation_id": correlationID,
+		"target_agent":   "guide",
+		"user_message":   userMessage,
+	}, nil
 }
 
 // extractAcceptanceResult unwraps the Guide's response into a
@@ -1666,9 +1728,9 @@ func (a *Architect) actOnAccept(ctx context.Context, plan *DesignPlan) (any, err
 // actOnModify applies the user's modifications to the plan, then re-routes
 // the updated plan + user response back through the Guide for re-approval.
 func (a *Architect) actOnModify(
-	ctx context.Context,
+	_ context.Context,
 	plan *DesignPlan,
-	userResponse string,
+	_ string,
 	modifications []string,
 ) (any, error) {
 	a.logInfo("actOnModify: applying modifications",
@@ -1678,18 +1740,11 @@ func (a *Architect) actOnModify(
 	reason := formatModificationReason(modifications)
 	a.applyPlanRevision(plan, reason, nil)
 
-	payload := buildPlanAcceptancePayload(plan, userResponse)
-	guideResult, err := a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
-	if err != nil {
-		return nil, fmt.Errorf("re-evaluation after modify failed: %w", err)
-	}
-
 	return map[string]any{
 		"action":           "modify",
 		"plan_id":          plan.ID,
 		"revision":         plan.Revision,
 		"modifications":    modifications,
-		"re_evaluation":    guideResult,
 		"directive":        "re_approval_requested",
 		"awaiting_user":    true,
 		"response_to_user": formatModifyResponse(modifications),
@@ -1699,9 +1754,9 @@ func (a *Architect) actOnModify(
 // actOnReject records the rejection, then re-routes the plan + user response
 // back through the Guide so the user can provide clarification or correction.
 func (a *Architect) actOnReject(
-	ctx context.Context,
+	_ context.Context,
 	plan *DesignPlan,
-	userResponse string,
+	_ string,
 	modifications []string,
 ) (any, error) {
 	a.logInfo("actOnReject: plan rejected",
@@ -1714,18 +1769,11 @@ func (a *Architect) actOnReject(
 	}
 	a.applyPlanRevision(plan, reason, nil)
 
-	payload := buildPlanAcceptancePayload(plan, userResponse)
-	guideResult, err := a.routePlanAcceptanceToGuide(ctx, plan.SessionID, payload)
-	if err != nil {
-		return nil, fmt.Errorf("re-evaluation after reject failed: %w", err)
-	}
-
 	return map[string]any{
 		"action":           "reject",
 		"plan_id":          plan.ID,
 		"revision":         plan.Revision,
 		"modifications":    modifications,
-		"re_evaluation":    guideResult,
 		"directive":        "clarification_requested",
 		"awaiting_user":    true,
 		"response_to_user": formatRejectResponse(modifications),

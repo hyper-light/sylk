@@ -391,11 +391,8 @@ If the user's response signals acceptance (e.g., "yes", "yep", "looks good", "go
 "approved", "ship it", or similar affirmative):
 1. Invoke route_plan_acceptance with the plan_id from the context JSON and the user's verbatim
    response as user_response. Do NOT write a text reply first — invoke the tool immediately.
-2. When route_plan_acceptance returns the Guide's verdict, invoke handle_plan_acceptance_result
-   with the verdict details (plan_id, result, user_response). On "accept", the plan dispatches
-   to the orchestrator automatically.
-3. After handle_plan_acceptance_result confirms dispatch, write a brief acknowledgment
-   (e.g., "Plan dispatched — the orchestrator is picking it up now.").
+2. After invoking route_plan_acceptance, STOP. The acceptance evaluation and any follow-on
+   orchestrator handoff resume asynchronously — do not wait in the current turn for a verdict.
 
 If the user is requesting MODIFICATIONS (e.g., "swap steps 2 and 3", "add error handling",
 "change the agent type for task 2"):
@@ -508,7 +505,7 @@ General rules:
 func toolsForConversationMode(mode plannerConversationMode) []string {
 	switch mode {
 	case plannerConversationModeFeedback, plannerConversationModeReady:
-		return []string{"route_plan_acceptance", "handle_plan_acceptance_result", "ask_user_question"}
+		return []string{"route_plan_acceptance", "ask_user_question"}
 	default:
 		return nil
 	}

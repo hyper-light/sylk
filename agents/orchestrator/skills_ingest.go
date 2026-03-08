@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/architect"
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
@@ -180,6 +181,7 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 			SessionID:   h.SessionID,
 			Metadata: map[string]any{
 				"agent_type":           ht.AgentType,
+				"task_slug":            ht.Slug,
 				"complexity":           ht.Complexity,
 				"estimated_tokens":     ht.EstimatedTokens,
 				"success_criteria":     ht.SuccessCriteria,
@@ -518,6 +520,7 @@ func buildNodePrompt(ht *architect.HandoffTask) string {
 func buildNodeContext(ht *architect.HandoffTask) map[string]any {
 	ctx := map[string]any{
 		"task_id":          ht.ID,
+		"task_slug":        ht.Slug,
 		"task_name":        ht.Name,
 		"agent_type":       ht.AgentType,
 		"complexity":       ht.Complexity,

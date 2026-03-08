@@ -35,8 +35,8 @@ func TestApplyStageOpenAIGuardianAssess(t *testing.T) {
 	if req.PromptCacheKey != "guardian:sess-1" {
 		t.Fatalf("PromptCacheKey = %q, want guardian:sess-1", req.PromptCacheKey)
 	}
-	if req.PromptCacheRetention != "in-memory" {
-		t.Fatalf("PromptCacheRetention = %q, want in-memory", req.PromptCacheRetention)
+	if req.PromptCacheRetention != "in_memory" {
+		t.Fatalf("PromptCacheRetention = %q, want in_memory", req.PromptCacheRetention)
 	}
 	if EmitsThoughts(req) {
 		t.Fatal("EmitsThoughts(req) = true, want false")

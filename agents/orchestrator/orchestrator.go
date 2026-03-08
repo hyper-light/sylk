@@ -1010,8 +1010,8 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 
 	// Propagate dispatch-protocol keys into node context so they flow
 	// through TaskRouter → Guide → ForwardedRequest.Metadata → agent.
-	// dag_id and node_id are needed by pipeline agents to include
-	// pipeline_id in their activity events for TUI panel grouping.
+	// dag_id and node_id are needed for runtime context; task_id carries the
+	// stable plan task identity that the TUI groups pipeline agents under.
 	if nodeCtx == nil {
 		nodeCtx = make(map[string]any)
 	}
@@ -1030,6 +1030,8 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	// Extract pipeline stage from sub-node context if present.
 	pipelineStage := ""
 	pipelineParentID := ""
+	pipelineTaskID := ""
+	pipelineTaskSlug := ""
 	if nodeCtx != nil {
 		if stage, ok := nodeCtx["pipeline_stage"].(string); ok {
 			pipelineStage = stage
@@ -1037,6 +1039,18 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		if parentID, ok := nodeCtx["pipeline_parent_id"].(string); ok {
 			pipelineParentID = parentID
 		}
+		if stableTaskID, ok := nodeCtx["task_id"].(string); ok {
+			pipelineTaskID = stableTaskID
+		}
+		if stableTaskSlug, ok := nodeCtx["task_slug"].(string); ok {
+			pipelineTaskSlug = stableTaskSlug
+		}
+	}
+	if pipelineTaskID == "" {
+		pipelineTaskID = pipelineParentID
+	}
+	if pipelineTaskID == "" {
+		pipelineTaskID = nodeID
 	}
 
 	// Task starts as Queued — transitions to Running when ACK arrives.
@@ -1085,13 +1099,13 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	if nodeID != "" && agentType != "" {
 		dispatched := make(map[string]struct{})
 
-		o.publishPipelineAgentActivity(agentType, dagID, nodeID, taskID)
+		o.publishPipelineAgentActivity(agentType, pipelineTaskID, nodeID, pipelineTaskSlug)
 		dispatched[agentType] = struct{}{}
 
 		if coAgents, ok := data["co_agents"].([]any); ok {
 			for _, co := range coAgents {
 				if coType, ok := co.(string); ok {
-					o.publishPipelineAgentActivity(coType, dagID, nodeID, taskID)
+					o.publishPipelineAgentActivity(coType, pipelineTaskID, nodeID, pipelineTaskSlug)
 					dispatched[coType] = struct{}{}
 				}
 			}
@@ -1099,7 +1113,7 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 
 		for _, pipelineType := range PipelineAgentTypes {
 			if _, active := dispatched[pipelineType]; !active {
-				o.publishPipelineAgentRegistration(pipelineType, dagID)
+				o.publishPipelineAgentRegistration(pipelineType, pipelineTaskID, pipelineTaskSlug)
 			}
 		}
 	}
@@ -1638,47 +1652,62 @@ func (o *Orchestrator) publishActivity(eventType events.EventType, content strin
 }
 
 // publishPipelineAgentActivity publishes an activity event for a pipeline
-// agent so the TUI's ensureAgent creates a panel entry. Uses agentType as
-// AgentID so one entry per agent type (not per dispatch).
-func (o *Orchestrator) publishPipelineAgentActivity(agentType, dagID, nodeID, taskID string) {
+// agent so the TUI's ensureAgent creates a pipeline-scoped panel entry.
+func (o *Orchestrator) publishPipelineAgentActivity(agentType, pipelineID, nodeID, taskSlug string) {
 	if o.activityPub == nil {
 		return
 	}
+	panelAgentID := pipelinePanelAgentID(pipelineID, agentType)
 	displayName := PipelineAgentDisplayNames[agentType]
 	if displayName == "" {
 		displayName = agentType
 	}
 	evt := events.NewActivityEvent(events.EventTypeAgentAction, o.config.SessionID,
 		fmt.Sprintf("Processing pipeline task: %s", nodeID))
-	evt.AgentID = agentType
+	evt.AgentID = panelAgentID
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = agentType
 	evt.Data["agent_name"] = displayName
-	evt.Data["pipeline_id"] = dagID
+	evt.Data["pipeline_id"] = pipelineID
 	evt.Data["node_id"] = nodeID
-	evt.Data["task_id"] = taskID
+	evt.Data["task_id"] = pipelineID
+	if taskSlug != "" {
+		evt.Data["task_slug"] = taskSlug
+	}
 	o.activityPub.PublishActivity(evt)
 }
 
 // publishPipelineAgentRegistration publishes a registration event for a
 // pipeline agent that is present but not yet dispatched. Uses
 // EventTypeAgentRegistered so the TUI shows the agent as waiting (not active).
-func (o *Orchestrator) publishPipelineAgentRegistration(agentType, dagID string) {
+func (o *Orchestrator) publishPipelineAgentRegistration(agentType, pipelineID, taskSlug string) {
 	if o.activityPub == nil {
 		return
 	}
+	panelAgentID := pipelinePanelAgentID(pipelineID, agentType)
 	displayName := PipelineAgentDisplayNames[agentType]
 	if displayName == "" {
 		displayName = agentType
 	}
 	evt := events.NewActivityEvent(events.EventTypeAgentRegistered, o.config.SessionID,
 		fmt.Sprintf("Pipeline agent registered: %s", agentType))
-	evt.AgentID = agentType
+	evt.AgentID = panelAgentID
 	evt.Visibility = events.VisibilityUser
 	evt.Data["agent_type"] = agentType
 	evt.Data["agent_name"] = displayName
-	evt.Data["pipeline_id"] = dagID
+	evt.Data["pipeline_id"] = pipelineID
+	evt.Data["task_id"] = pipelineID
+	if taskSlug != "" {
+		evt.Data["task_slug"] = taskSlug
+	}
 	o.activityPub.PublishActivity(evt)
+}
+
+func pipelinePanelAgentID(pipelineID, agentType string) string {
+	if pipelineID == "" {
+		return agentType
+	}
+	return pipelineID + ":" + agentType
 }
 
 // publishActivityWithVisibility sends an activity event with explicit visibility.

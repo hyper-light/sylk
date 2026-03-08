@@ -42,16 +42,17 @@ type Designer struct {
 	handoffBridge *handoff.HandoffBridge
 	agentPod      *shared.AgentPod
 	activityPub   events.ActivityPublisher
-	pipelineID    string // DAG pipeline ID for TUI grouping.
+	pipelineID    string // Stable task-level pipeline ID for TUI grouping.
+	pipelineSlug  string
 	usageAccum    *designerUsageAccumulator
 
 	state    *DesignerState
 	stateMu  sync.RWMutex
 	failures map[string]*FailureRecord
 
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	tools       *toolruntime.Runtime
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
 	bus         guide.EventBus
@@ -425,8 +426,13 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	d.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	shared.LogIncomingRequest(d.steering.EventLogger(), fwd, d.id)
 
-	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
+		d.pipelineID = taskID
+	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
 		d.pipelineID = dagID
+	}
+	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
+		d.pipelineSlug = taskSlug
 	}
 
 	shared.EmitDispatchACK(d.bus, fwd.Metadata, d.id, "designer", fwd.CorrelationID)
@@ -449,7 +455,9 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	defer d.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
 
 	emitter := shared.NewToolCallEmitter(d.bus, d.channels, d.id, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
+	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
 		EventLogger: d.steering.EventLogger(),
@@ -468,6 +476,9 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		Bus: d.bus, Channels: d.channels,
 		AgentID: d.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
+	if !fwd.FireAndForget {
+		shared.PublishStreamStart(d.bus, d.channels, ctx, d.id)
+	}
 	startTime := time.Now()
 
 	result, err := d.handleDesign(ctx, fwd)
@@ -491,6 +502,8 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
+		shared.PublishStreamError(d.bus, d.channels, ctx, d.id, err)
+		shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
 		resp.Error = err.Error()
 		d.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
@@ -503,6 +516,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	shared.PublishStreamComplete(d.bus, d.channels, ctx, d.id, "", usageAcc.Total())
 	d.publishActivity(events.EventTypeAgentAction, "Design task completed")
 
 	respMsg := guide.NewResponseMessage(d.generateMessageID(), resp)
@@ -701,6 +715,10 @@ func (d *Designer) publishActivity(eventType events.EventType, content string) {
 	evt.Data["agent_name"] = "Designer"
 	if d.pipelineID != "" {
 		evt.Data["pipeline_id"] = d.pipelineID
+		evt.Data["task_id"] = d.pipelineID
+	}
+	if d.pipelineSlug != "" {
+		evt.Data["task_slug"] = d.pipelineSlug
 	}
 	d.activityPub.PublishActivity(evt)
 }

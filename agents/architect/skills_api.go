@@ -37,7 +37,7 @@ func architectToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("validate_pre_delegation", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("monitor_execution", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("route_plan_acceptance", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("handle_plan_acceptance_result", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("handle_plan_acceptance_result", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("ask_user_question", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("read_research_paper", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("read_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),

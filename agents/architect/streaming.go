@@ -303,8 +303,8 @@ func (a *Architect) publishHandoffReroute(ctx context.Context, toAgentID, origin
 		Type: guide.StreamEventReroute,
 		Data: map[string]string{
 			"from_agent":              "architect",
-			"to_agent":               toAgentID,
-			"reason":                 "plan handoff",
+			"to_agent":                toAgentID,
+			"reason":                  "plan handoff",
 			"original_correlation_id": originalCID,
 			"new_correlation_id":      newCID,
 		},
@@ -361,11 +361,15 @@ func (a *Architect) publishPlanSnapshot(ctx context.Context, plan *DesignPlan) {
 	if plan == nil {
 		return
 	}
+	componentCount := 0
+	if plan.Architecture != nil {
+		componentCount = len(plan.Architecture.Components)
+	}
 	a.logInfo("publishPlanSnapshot",
 		"plan_id", plan.ID,
 		"status", plan.Status.String(),
 		"tasks", len(plan.Tasks),
-		"components", len(plan.Architecture.Components))
+		"components", componentCount)
 	snapshot := buildPlanSnapshotData(plan)
 	a.publishPlanStreamEvent(ctx, &guide.StreamEvent{
 		Type:      guide.StreamEventData,
@@ -381,6 +385,7 @@ func buildPlanSnapshotData(plan *DesignPlan) map[string]any {
 	for _, t := range plan.Tasks {
 		task := map[string]any{
 			"ID":        t.ID,
+			"Slug":      taskSlugForTask(t, 0),
 			"Name":      t.Name,
 			"AgentType": t.AgentType,
 			"Status":    t.Status.String(),

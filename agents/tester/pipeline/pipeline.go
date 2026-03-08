@@ -42,8 +42,9 @@ type PipelineTester struct {
 	provider pipelineTesterProvider
 
 	// Activity publisher for UI agent-panel updates. Nil-safe.
-	activityPub events.ActivityPublisher
-	pipelineID  string // DAG pipeline ID for TUI grouping.
+	activityPub  events.ActivityPublisher
+	pipelineID   string // Stable task-level pipeline ID for TUI grouping.
+	pipelineSlug string
 
 	// State.
 	currentPlan *shared.TestPlan
@@ -420,8 +421,13 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	pt.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	agentshared.LogIncomingRequest(pt.steering.EventLogger(), fwd, pt.id)
 
-	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
+		pt.pipelineID = taskID
+	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
 		pt.pipelineID = dagID
+	}
+	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
+		pt.pipelineSlug = taskSlug
 	}
 
 	agentshared.EmitDispatchACK(pt.bus, fwd.Metadata, pt.id, "tester-pipeline", fwd.CorrelationID)
@@ -435,6 +441,8 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	defer pt.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
 
 	ctx := reqCtx
+	ctx = agentshared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx, usageAcc := agentshared.WithUsageAccumulator(ctx)
 	ctx = agentshared.WithSteeringLedger(ctx, ledger)
 	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{
 		EventLogger: pt.steering.EventLogger(),
@@ -456,6 +464,9 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 		Bus: pt.bus, Channels: pt.channels,
 		AgentID: pt.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
+	if !fwd.FireAndForget {
+		agentshared.PublishStreamStart(pt.bus, pt.channels, ctx, pt.id)
+	}
 
 	result, err := pt.Handle(ctx, fwd)
 	agentshared.LogResponse(pt.steering.EventLogger(), fwd.CorrelationID, pt.id, fwd.SessionID, time.Since(startTime), err)
@@ -478,6 +489,8 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
+		agentshared.PublishStreamError(pt.bus, pt.channels, ctx, pt.id, err)
+		agentshared.PublishStreamComplete(pt.bus, pt.channels, ctx, pt.id, "", usageAcc.Total())
 		resp.Error = err.Error()
 		pt.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
@@ -490,6 +503,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	agentshared.PublishStreamComplete(pt.bus, pt.channels, ctx, pt.id, "", usageAcc.Total())
 	pt.publishActivity(events.EventTypeAgentAction, "Validation task completed")
 
 	if pt.agentPod != nil {
@@ -628,6 +642,10 @@ func (pt *PipelineTester) publishActivity(eventType events.EventType, content st
 	evt.Data["agent_name"] = "Tester"
 	if pt.pipelineID != "" {
 		evt.Data["pipeline_id"] = pt.pipelineID
+		evt.Data["task_id"] = pt.pipelineID
+	}
+	if pt.pipelineSlug != "" {
+		evt.Data["task_slug"] = pt.pipelineSlug
 	}
 	pt.activityPub.PublishActivity(evt)
 }

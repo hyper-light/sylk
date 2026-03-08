@@ -3,7 +3,7 @@ package treesitter
 import (
 	"sync"
 
-	sitter "github.com/tree-sitter/go-tree-sitter"
+	sitter "github.com/adalundhe/sylk/third_party/go_tree_sitter"
 )
 
 type Parser struct {

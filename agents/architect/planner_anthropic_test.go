@@ -50,6 +50,38 @@ func TestNormalizeTaskGraph_MapsDependencyNameToID(t *testing.T) {
 	}
 }
 
+func TestNormalizeTaskGraph_AssignsUniqueTaskIDsAndSlugs(t *testing.T) {
+	tasks := []*AtomicTask{
+		{ID: "Task 1", Name: "Auth Checkout", AgentType: "engineer"},
+		{ID: "Task 1", Name: "Auth Checkout", AgentType: "designer", Dependencies: []string{"Task 1"}},
+		{Name: "Payment Retry", AgentType: "engineer", Dependencies: []string{"Auth Checkout"}},
+	}
+
+	normalized := normalizeTaskGraph(tasks)
+
+	if normalized[0].ID != "task_1" {
+		t.Fatalf("first ID = %q, want task_1", normalized[0].ID)
+	}
+	if normalized[1].ID != "task_1_2" {
+		t.Fatalf("second ID = %q, want task_1_2", normalized[1].ID)
+	}
+	if normalized[0].Slug != "auth-checkout" {
+		t.Fatalf("first slug = %q, want auth-checkout", normalized[0].Slug)
+	}
+	if normalized[1].Slug != "auth-checkout-2" {
+		t.Fatalf("second slug = %q, want auth-checkout-2", normalized[1].Slug)
+	}
+	if normalized[2].Slug != "payment-retry" {
+		t.Fatalf("third slug = %q, want payment-retry", normalized[2].Slug)
+	}
+	if len(normalized[1].Dependencies) != 1 || normalized[1].Dependencies[0] != "task_1" {
+		t.Fatalf("second dependencies = %v, want [task_1]", normalized[1].Dependencies)
+	}
+	if len(normalized[2].Dependencies) != 1 || normalized[2].Dependencies[0] != "task_1" {
+		t.Fatalf("third dependencies = %v, want [task_1]", normalized[2].Dependencies)
+	}
+}
+
 func TestContainsIgnoreCase(t *testing.T) {
 	if !containsIgnoreCase("Architect Planner", "planner") {
 		t.Fatal("expected containsIgnoreCase to match case-insensitive substring")

@@ -167,11 +167,11 @@ func (o *Orchestrator) executeToolCall(ctx context.Context, call providers.ToolC
 	}
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
-		correlationID = o.state.AgentID + "-local"
+		correlationID = o.config.AgentID + "-local"
 	}
 	return o.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         o.state.AgentID,
+		AgentID:         o.config.AgentID,
 		CorrelationID:   correlationID,
 		CapabilityScope: o.toolRuntime().CapabilityScope(),
 	})
@@ -203,14 +203,14 @@ func (o *Orchestrator) toolInvocations(ctx context.Context, calls []providers.To
 	}
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
-		correlationID = o.state.AgentID + "-local"
+		correlationID = o.config.AgentID + "-local"
 	}
 	scope := o.toolRuntime().CapabilityScope()
 	invocations := make([]toolruntime.Invocation, 0, len(calls))
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         o.state.AgentID,
+			AgentID:         o.config.AgentID,
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

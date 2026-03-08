@@ -350,7 +350,7 @@ func (a *Academic) Start(bus guide.EventBus) error {
 	}
 
 	a.bus = bus
-	a.channels = guide.NewAgentChannels("academic", "academic")
+	a.channels = guide.NewAgentChannels("academic", a.id)
 
 	// Subscribe to own request channel (academic.requests)
 	var err error
@@ -492,7 +492,9 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
+	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
 		EventLogger: a.steering.EventLogger(),
@@ -511,6 +513,9 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		Bus: a.bus, Channels: a.channels,
 		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
+	if !fwd.FireAndForget {
+		shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+	}
 
 	result, err := a.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, "academic", fwd.SessionID, time.Since(startTime), err)
@@ -535,6 +540,8 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
+		shared.PublishStreamError(a.bus, a.channels, ctx, a.id, err)
+		shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
 		resp.Error = err.Error()
 		a.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Research failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
@@ -547,6 +554,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
 	a.publishActivity(events.EventTypeSuccess, "Research task completed")
 
 	respMsg := guide.NewResponseMessage(generateMessageID(), resp)

@@ -2,89 +2,38 @@ package shared
 
 import (
 	"context"
-	"fmt"
-	"sync"
-	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-// InspectorStreamContext carries streaming correlation data through context.
-type InspectorStreamContext struct {
-	CorrelationID string
-	SourceAgentID string
-}
+// InspectorStreamContext preserves the historical inspector-specific type
+// while delegating to the shared stream context implementation.
+type InspectorStreamContext = agentshared.StreamContext
 
-type inspectorStreamContextKey struct{}
+// InspectorUsageAccumulator preserves the historical inspector-specific type
+// while delegating to the shared accumulator implementation.
+type InspectorUsageAccumulator = agentshared.UsageAccumulator
 
 // WithStreamContext attaches streaming metadata to a context.
 func WithStreamContext(ctx context.Context, correlationID, sourceAgentID string) context.Context {
-	return context.WithValue(ctx, inspectorStreamContextKey{}, InspectorStreamContext{
-		CorrelationID: correlationID,
-		SourceAgentID: sourceAgentID,
-	})
+	return agentshared.WithStreamContext(ctx, correlationID, sourceAgentID)
 }
 
 // StreamMetadataFromContext extracts streaming metadata from a context.
 func StreamMetadataFromContext(ctx context.Context) (InspectorStreamContext, bool) {
-	metadata, ok := ctx.Value(inspectorStreamContextKey{}).(InspectorStreamContext)
-	if !ok || metadata.CorrelationID == "" {
-		return InspectorStreamContext{}, false
-	}
-	return metadata, true
+	return agentshared.StreamMetadataFromContext(ctx)
 }
-
-// InspectorUsageAccumulator tracks token usage across multiple LLM calls.
-type InspectorUsageAccumulator struct {
-	mu              sync.Mutex
-	inputTotal      int
-	outputTotal     int
-	reasoningTotal  int
-	cacheReadTotal  int
-	cacheWriteTotal int
-}
-
-type inspectorUsageAccumulatorKey struct{}
 
 // WithUsageAccumulator creates a context with an attached usage accumulator.
 func WithUsageAccumulator(ctx context.Context) (context.Context, *InspectorUsageAccumulator) {
-	acc := &InspectorUsageAccumulator{}
-	return context.WithValue(ctx, inspectorUsageAccumulatorKey{}, acc), acc
+	return agentshared.WithUsageAccumulator(ctx)
 }
 
 // AccumulateUsage adds provider usage to the context's accumulator.
 func AccumulateUsage(ctx context.Context, usage *providers.Usage) {
-	if usage == nil {
-		return
-	}
-	acc, ok := ctx.Value(inspectorUsageAccumulatorKey{}).(*InspectorUsageAccumulator)
-	if !ok || acc == nil {
-		return
-	}
-	acc.mu.Lock()
-	acc.inputTotal += usage.InputTokens
-	acc.outputTotal += usage.OutputTokens
-	acc.reasoningTotal += usage.ReasoningTokens
-	acc.cacheReadTotal += usage.CacheReadTokens
-	acc.cacheWriteTotal += usage.CacheWriteTokens
-	acc.mu.Unlock()
-}
-
-// Total returns the accumulated usage as a StreamUsage.
-func (a *InspectorUsageAccumulator) Total() *guide.StreamUsage {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.inputTotal == 0 && a.outputTotal == 0 {
-		return nil
-	}
-	return &guide.StreamUsage{
-		InputTokens:      a.inputTotal,
-		OutputTokens:     a.outputTotal,
-		ReasoningTokens:  a.reasoningTotal,
-		CacheReadTokens:  a.cacheReadTotal,
-		CacheWriteTokens: a.cacheWriteTotal,
-	}
+	agentshared.AccumulateUsage(ctx, usage)
 }
 
 // PublishStreamEvent publishes a stream event to the bus.
@@ -95,46 +44,17 @@ func PublishStreamEvent(
 	agentID string,
 	event *guide.StreamEvent,
 ) {
-	metadata, ok := StreamMetadataFromContext(ctx)
-	if !ok {
-		return
-	}
-
-	stream := &guide.StreamResponse{
-		CorrelationID:     metadata.CorrelationID,
-		RespondingAgentID: agentID,
-		TargetAgentID:     metadata.SourceAgentID,
-		Event:             event,
-	}
-
-	msg := &guide.Message{
-		ID:            fmt.Sprintf("%s_stream_%d", agentID, time.Now().UnixNano()),
-		CorrelationID: metadata.CorrelationID,
-		Type:          guide.MessageTypeStream,
-		Payload:       stream,
-		SourceAgentID: agentID,
-		TargetAgentID: metadata.SourceAgentID,
-		Timestamp:     time.Now(),
-	}
-
-	_ = bus.Publish(channels.Responses, msg)
+	agentshared.PublishStreamEvent(bus, channels, ctx, agentID, event)
 }
 
 // PublishStreamStart emits a stream start event.
 func PublishStreamStart(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID string) {
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
-		Type:      guide.StreamEventStart,
-		Timestamp: time.Now(),
-	})
+	agentshared.PublishStreamStart(bus, channels, ctx, agentID)
 }
 
 // PublishStreamChunk emits a text data chunk.
 func PublishStreamChunk(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID, text string) {
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
-		Type:      guide.StreamEventData,
-		Text:      text,
-		Timestamp: time.Now(),
-	})
+	agentshared.PublishStreamChunk(bus, channels, ctx, agentID, text)
 }
 
 // PublishStreamComplete emits a stream completion event.
@@ -145,19 +65,10 @@ func PublishStreamComplete(
 	agentID, text string,
 	usage *guide.StreamUsage,
 ) {
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
-		Type:      guide.StreamEventComplete,
-		Text:      text,
-		Usage:     usage,
-		Timestamp: time.Now(),
-	})
+	agentshared.PublishStreamComplete(bus, channels, ctx, agentID, text, usage)
 }
 
 // PublishStreamError emits a stream error event.
 func PublishStreamError(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID string, err error) {
-	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
-		Type:      guide.StreamEventError,
-		Data:      map[string]string{"error": err.Error()},
-		Timestamp: time.Now(),
-	})
+	agentshared.PublishStreamError(bus, channels, ctx, agentID, err)
 }

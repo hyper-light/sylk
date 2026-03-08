@@ -1748,11 +1748,19 @@ func (p *OpenAIProvider) applyPromptCache(params *responses.ResponseNewParams, r
 	if key != "" {
 		params.PromptCacheKey = openai.String(key)
 	}
-	switch strings.ToLower(strings.TrimSpace(req.PromptCacheRetention)) {
-	case "in-memory":
-		params.SetExtraFields(map[string]any{"prompt_cache_retention": "in-memory"})
+	if retention := normalizeOpenAIPromptCacheRetention(req.PromptCacheRetention); retention != "" {
+		params.SetExtraFields(map[string]any{"prompt_cache_retention": retention})
+	}
+}
+
+func normalizeOpenAIPromptCacheRetention(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "in_memory", "in-memory", "in memory":
+		return "in_memory"
 	case "24h":
-		params.SetExtraFields(map[string]any{"prompt_cache_retention": "24h"})
+		return "24h"
+	default:
+		return ""
 	}
 }
 

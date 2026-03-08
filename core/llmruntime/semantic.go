@@ -327,7 +327,7 @@ func applyCacheAffinity(profile *Profile, affinity CacheAffinity, opts ApplyOpti
 			profile.PromptCacheKey = SessionPromptCacheKey(opts.AgentID, opts.SessionID)
 		}
 		if strings.TrimSpace(profile.PromptCacheRetention) == "" {
-			profile.PromptCacheRetention = "in-memory"
+			profile.PromptCacheRetention = "in_memory"
 		}
 	case CacheAffinitySticky:
 		if profile.UsePromptCache == nil {

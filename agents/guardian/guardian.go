@@ -717,6 +717,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		err        error
 	)
 	if skillName := guardianDirectSkillName(fwd); skillName != "" {
+		reqCtx = withGuardianDirectSourceAgentID(reqCtx, fwd.SourceAgentID)
 		result, streamText, err = g.executeDirectSkill(reqCtx, skillName, fwd.Input)
 	} else {
 		var conversationResult *ConversationResult
@@ -822,42 +823,8 @@ func (g *Guardian) handleToolExecutionControlAction(
 	if !ok || req == nil {
 		return g.publishToolControlReply(msg, action, nil, fmt.Errorf("invalid guardian tool control request payload"))
 	}
-	grant, err := g.evaluateToolExecutionControl(action, req)
+	grant, err := g.evaluateToolExecutionControl(action.SourceAgentID, req)
 	return g.publishToolControlReply(msg, action, grant, err)
-}
-
-func (g *Guardian) evaluateToolExecutionControl(
-	action *guide.ActionRequest,
-	req *toolruntime.GuardianControlRequest,
-) (*toolruntime.GuardianControlGrant, error) {
-	if action == nil || req == nil {
-		return nil, fmt.Errorf("guardian tool control request is required")
-	}
-	if strings.TrimSpace(req.AgentID) == "" || strings.TrimSpace(req.CorrelationID) == "" || strings.TrimSpace(req.CapabilityScope) == "" {
-		return nil, fmt.Errorf("guardian tool control request is missing invocation identity")
-	}
-	if action.SourceAgentID != "" && req.AgentID != action.SourceAgentID {
-		return nil, fmt.Errorf("guardian tool control source mismatch: %q != %q", req.AgentID, action.SourceAgentID)
-	}
-	if req.Policy.Execution != toolruntime.ExecutionModeGuardian {
-		return nil, fmt.Errorf("tool %q is not marked for guardian-controlled execution", req.ToolName)
-	}
-	if !req.Policy.ApprovalSensitive {
-		return nil, fmt.Errorf("tool %q is not marked approval-sensitive", req.ToolName)
-	}
-
-	return &toolruntime.GuardianControlGrant{
-		GrantID:           uuid.New().String(),
-		AgentID:           req.AgentID,
-		CorrelationID:     req.CorrelationID,
-		CapabilityScope:   req.CapabilityScope,
-		ToolName:          req.ToolName,
-		ArgumentsHash:     req.ArgumentsHash,
-		PolicyFingerprint: req.PolicyFingerprint,
-		Approved:          true,
-		Reason:            "guardian-approved deterministic control-plane grant",
-		ExpiresAt:         time.Now().Add(30 * time.Second),
-	}, nil
 }
 
 func (g *Guardian) publishToolControlReply(

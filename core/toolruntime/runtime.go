@@ -201,26 +201,33 @@ func (r *Runtime) ValidateBatch(invocations []Invocation) error {
 
 func (r *Runtime) Execute(ctx context.Context, inv Invocation) (ExecutionResult, error) {
 	rawResult, err := r.ExecuteRaw(ctx, inv)
-	if err != nil {
-		return ExecutionResult{
-			ToolName:        rawResult.ToolName,
-			ToolDefsDirty:   rawResult.ToolDefsDirty,
-			ActivatedSkills: append([]string(nil), rawResult.ActivatedSkills...),
-		}, err
-	}
-	output, err := marshalOutput(rawResult.Data)
-	if err != nil {
-		return ExecutionResult{}, err
-	}
-	return ExecutionResult{
-		Output:          output,
+	result := ExecutionResult{
 		ToolName:        rawResult.ToolName,
 		ToolDefsDirty:   rawResult.ToolDefsDirty,
 		ActivatedSkills: append([]string(nil), rawResult.ActivatedSkills...),
-	}, nil
+	}
+	if rawResult.Data != nil {
+		output, marshalErr := marshalOutput(rawResult.Data)
+		if marshalErr != nil {
+			if err == nil {
+				return ExecutionResult{}, marshalErr
+			}
+		} else {
+			result.Output = output
+		}
+	}
+	return result, err
 }
 
 func (r *Runtime) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecutionResult, error) {
+	return r.executeRaw(ctx, inv, nil)
+}
+
+func (r *Runtime) executeRaw(
+	ctx context.Context,
+	inv Invocation,
+	approvedGrant *GuardianControlGrant,
+) (RawExecutionResult, error) {
 	if r == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
 	}
@@ -314,11 +321,20 @@ func (r *Runtime) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecutionR
 	}
 
 	if policy.ApprovalSensitive || policy.Execution == ExecutionModeGuardian {
-		if err := r.obtainGuardianGrant(ctx, inv, policy, raw, toolData.Input); err != nil {
-			if postErr := r.runPostHooks(ctx, toolData, nil, err); postErr != nil {
+		if approvedGrant != nil {
+			req := guardianControlRequest(inv, policy, raw, toolData.Input, r.manifest)
+			if err := approvedGrant.Validate(req); err != nil {
+				if postErr := r.runPostHooks(ctx, toolData, nil, err); postErr != nil {
+					return RawExecutionResult{}, postErr
+				}
+				return RawExecutionResult{}, err
+			}
+		} else if err := r.obtainGuardianGrant(ctx, inv, policy, raw, toolData.Input); err != nil {
+			payload, _ := skills.DelegatedPayload(err)
+			if postErr := r.runPostHooks(ctx, toolData, payload, err); postErr != nil {
 				return RawExecutionResult{}, postErr
 			}
-			return RawExecutionResult{}, err
+			return RawExecutionResult{Data: payload, ToolName: name}, err
 		}
 	}
 
@@ -412,6 +428,32 @@ func (r *Runtime) invokeLocal(ctx context.Context, name string, input map[string
 	return r.registry.Invoke(ctx, name, payload), nil
 }
 
+func guardianControlRequest(
+	inv Invocation,
+	policy ToolPolicy,
+	raw string,
+	input map[string]any,
+	manifest *PolicyManifest,
+) GuardianControlRequest {
+	fingerprint := ""
+	if manifest != nil {
+		fingerprint = manifest.Fingerprint()
+	}
+	return GuardianControlRequest{
+		AgentID:           inv.AgentID,
+		CorrelationID:     inv.CorrelationID,
+		CapabilityScope:   inv.CapabilityScope,
+		ToolName:          inv.ToolCall.Name,
+		ToolID:            inv.ToolCall.ID,
+		Arguments:         raw,
+		ArgumentsHash:     HashArguments(raw),
+		Input:             cloneMap(input),
+		Policy:            policy,
+		PolicyFingerprint: fingerprint,
+		Timestamp:         time.Now(),
+	}
+}
+
 func (r *Runtime) obtainGuardianGrant(
 	ctx context.Context,
 	inv Invocation,
@@ -425,19 +467,7 @@ func (r *Runtime) obtainGuardianGrant(
 	if r.controlPlane == nil {
 		return fmt.Errorf("tool %q requires guardian-controlled execution but no guardian control plane is configured", inv.ToolCall.Name)
 	}
-	req := GuardianControlRequest{
-		AgentID:           inv.AgentID,
-		CorrelationID:     inv.CorrelationID,
-		CapabilityScope:   inv.CapabilityScope,
-		ToolName:          inv.ToolCall.Name,
-		ToolID:            inv.ToolCall.ID,
-		Arguments:         raw,
-		ArgumentsHash:     HashArguments(raw),
-		Input:             cloneMap(input),
-		Policy:            policy,
-		PolicyFingerprint: r.manifest.Fingerprint(),
-		Timestamp:         time.Now(),
-	}
+	req := guardianControlRequest(inv, policy, raw, input, r.manifest)
 	grant, err := r.controlPlane.RequestGrant(ctx, req)
 	if err != nil {
 		return err

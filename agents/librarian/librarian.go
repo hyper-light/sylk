@@ -505,7 +505,9 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(l.bus, l.channels, l.id, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
+	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
 		EventLogger: l.steering.EventLogger(),
@@ -524,6 +526,9 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		Bus: l.bus, Channels: l.channels,
 		AgentID: l.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
+	if !fwd.FireAndForget {
+		shared.PublishStreamStart(l.bus, l.channels, ctx, l.id)
+	}
 
 	result, err := l.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(l.steering.EventLogger(), fwd.CorrelationID, l.id, fwd.SessionID, time.Since(startTime), err)
@@ -548,6 +553,8 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
+		shared.PublishStreamError(l.bus, l.channels, ctx, l.id, err)
+		shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
 		resp.Error = err.Error()
 		l.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Search failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
@@ -560,6 +567,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	shared.PublishStreamComplete(l.bus, l.channels, ctx, l.id, "", usageAcc.Total())
 	l.publishActivity(events.EventTypeSuccess, "Search task completed")
 
 	if l.agentPod != nil {

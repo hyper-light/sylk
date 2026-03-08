@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -646,6 +647,8 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx = shared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
 		EventLogger: a.steering.EventLogger(),
@@ -664,6 +667,9 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		Bus: a.bus, Channels: a.channels,
 		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
+	if !fwd.FireAndForget {
+		shared.PublishStreamStart(a.bus, a.channels, ctx, a.id)
+	}
 
 	result, err := a.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, a.id, fwd.SessionID, time.Since(startTime), err)
@@ -681,6 +687,8 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	}
 
 	if err != nil {
+		shared.PublishStreamError(a.bus, a.channels, ctx, a.id, err)
+		shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
 		resp.Error = err.Error()
 		a.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Request failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(a.generateMessageID(), fwd.CorrelationID, a.id, err.Error())
@@ -688,6 +696,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	shared.PublishStreamComplete(a.bus, a.channels, ctx, a.id, "", usageAcc.Total())
 	a.publishActivity(events.EventTypeSuccess, "Request completed")
 
 	respMsg := guide.NewResponseMessage(a.generateMessageID(), resp)
@@ -702,8 +711,11 @@ func (a *Archivalist) handleActionMessage(msg *guide.Message) error {
 	if a.steering.HandleAction(action) {
 		return nil
 	}
-	if action.Action == "cancel" {
+	switch action.Action {
+	case "cancel":
 		a.cancelRequest(action.CorrelationID)
+	case archivalistStorePaperAction:
+		return a.handleStoreResearchPaperAction(action)
 	}
 	return nil
 }

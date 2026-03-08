@@ -307,6 +307,9 @@ func extractDispatchMetadata(ctx map[string]any) map[string]any {
 	if taskID, _ := ctx["task_id"].(string); taskID != "" {
 		meta["task_id"] = taskID
 	}
+	if taskSlug, _ := ctx["task_slug"].(string); taskSlug != "" {
+		meta["task_slug"] = taskSlug
+	}
 	if agentType, _ := ctx["agent_type"].(string); agentType != "" {
 		meta["agent_type"] = agentType
 	}

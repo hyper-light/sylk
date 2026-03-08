@@ -183,6 +183,72 @@ type ResearchResult struct {
 	GeneratedAt time.Time `json:"generated_at"`
 }
 
+// ResearchConstraint captures a hard requirement that should survive handoff to planning.
+type ResearchConstraint struct {
+	// Name is the short identifier for the constraint.
+	Name string `json:"name"`
+	// Description explains the operational impact of the constraint.
+	Description string `json:"description"`
+}
+
+// ResearchInvariant captures a property the resulting design must preserve.
+type ResearchInvariant struct {
+	// Name is the short invariant identifier.
+	Name string `json:"name"`
+	// Description explains what must remain true.
+	Description string `json:"description"`
+}
+
+// ArchitectureOption captures one candidate architecture from the research.
+type ArchitectureOption struct {
+	// ID is the unique option identifier.
+	ID string `json:"id"`
+	// Name is the short option name.
+	Name string `json:"name"`
+	// Summary explains the option.
+	Summary string `json:"summary"`
+	// Pros lists key advantages.
+	Pros []string `json:"pros,omitempty"`
+	// Cons lists key disadvantages.
+	Cons []string `json:"cons,omitempty"`
+	// Fit explains when the option is appropriate.
+	Fit string `json:"fit,omitempty"`
+	// Risks lists operational or implementation risks.
+	Risks []string `json:"risks,omitempty"`
+	// Confidence is the confidence level for this option.
+	Confidence ConfidenceLevel `json:"confidence,omitempty"`
+	// SourceIDs references supporting sources.
+	SourceIDs []string `json:"source_ids,omitempty"`
+}
+
+// CodebaseApplicability summarizes how well the research fits the current repository reality.
+type CodebaseApplicability struct {
+	// Summary is the overall applicability assessment.
+	Summary string `json:"summary"`
+	// MatchingPatterns captures relevant existing repo patterns.
+	MatchingPatterns []string `json:"matching_patterns,omitempty"`
+	// Conflicts captures design tensions with the current codebase.
+	Conflicts []string `json:"conflicts,omitempty"`
+	// RequiredChanges captures likely repo changes needed to adopt the proposal.
+	RequiredChanges []string `json:"required_changes,omitempty"`
+	// Confidence is a 0.0-1.0 applicability score.
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+// ArchitectHandoff captures the distilled planning payload intended for the Architect.
+type ArchitectHandoff struct {
+	// PlanningSummary is the concise handoff summary for planning.
+	PlanningSummary string `json:"planning_summary"`
+	// RecommendedOptionID points at the preferred option.
+	RecommendedOptionID string `json:"recommended_option_id,omitempty"`
+	// RequiredDecisions lists unresolved planning decisions.
+	RequiredDecisions []string `json:"required_decisions,omitempty"`
+	// SuggestedTasks lists likely initial planning tasks.
+	SuggestedTasks []string `json:"suggested_tasks,omitempty"`
+	// AcceptanceSignals lists what success should look like.
+	AcceptanceSignals []string `json:"acceptance_signals,omitempty"`
+}
+
 // AcademicResearchPaper represents a comprehensive research paper generated
 // during context compaction at the 85% threshold.
 type AcademicResearchPaper struct {
@@ -194,22 +260,48 @@ type AcademicResearchPaper struct {
 	SessionID string `json:"session_id"`
 	// ContextUsage is the context window usage at generation time.
 	ContextUsage float64 `json:"context_usage"`
+	// ResearchSlug is the stable identifier for this research line.
+	ResearchSlug string `json:"research_slug,omitempty"`
+	// Version is the paper revision number for the slug.
+	Version int `json:"version,omitempty"`
 	// Title is the paper title.
 	Title string `json:"title"`
 	// Abstract summarizes the findings.
 	Abstract string `json:"abstract"`
+	// ProblemFraming captures the user/work objective this paper addresses.
+	ProblemFraming string `json:"problem_framing,omitempty"`
+	// Constraints captures hard requirements discovered during research.
+	Constraints []ResearchConstraint `json:"constraints,omitempty"`
+	// Invariants captures properties the implementation should preserve.
+	Invariants []ResearchInvariant `json:"invariants,omitempty"`
 	// TopicsResearched lists topics covered.
 	TopicsResearched []string `json:"topics_researched"`
 	// KeyFindings are the main findings.
 	KeyFindings []Finding `json:"key_findings"`
 	// SourcesCited are references used.
 	SourcesCited []Source `json:"sources_cited"`
+	// OptionMatrix captures the main candidate architectures.
+	OptionMatrix []ArchitectureOption `json:"option_matrix,omitempty"`
+	// RejectedOptions lists rejected approaches and why they were dropped.
+	RejectedOptions []string `json:"rejected_options,omitempty"`
+	// TradeOffs captures important design trade-offs surfaced by the research.
+	TradeOffs []string `json:"trade_offs,omitempty"`
+	// CodebaseApplicability captures fit against the current repository.
+	CodebaseApplicability *CodebaseApplicability `json:"codebase_applicability,omitempty"`
 	// Recommendations are actionable recommendations.
 	Recommendations []string `json:"recommendations"`
+	// MigrationConcerns captures migration-specific risks or requirements.
+	MigrationConcerns []string `json:"migration_concerns,omitempty"`
+	// OperationalConcerns captures runtime and operations concerns.
+	OperationalConcerns []string `json:"operational_concerns,omitempty"`
 	// OpenQuestions are unresolved questions.
 	OpenQuestions []string `json:"open_questions"`
 	// RelatedTopics are topics for future research.
 	RelatedTopics []string `json:"related_topics"`
+	// ArchitectHandoff captures the distilled planning handoff for the Architect.
+	ArchitectHandoff *ArchitectHandoff `json:"architect_handoff,omitempty"`
+	// PaperPath is the on-disk artifact path when persisted.
+	PaperPath string `json:"paper_path,omitempty"`
 }
 
 // IngestRequest represents a request to ingest a new source.

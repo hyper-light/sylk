@@ -15,6 +15,7 @@ func academicVisibleSkillNames() []string {
 
 func academicMutatingSkillNames() []string {
 	return []string{
+		"author_research_paper",
 		"clone_via_librarian",
 		"reroute_request",
 	}

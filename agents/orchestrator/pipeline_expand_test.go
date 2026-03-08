@@ -282,3 +282,21 @@ func TestValidateHandoff_RejectNonPipelineAgentTypes(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildNodeContext_IncludesStableTaskIdentity(t *testing.T) {
+	ht := &architect.HandoffTask{
+		ID:        "task_auth_checkout",
+		Slug:      "auth-checkout",
+		Name:      "Implement auth checkout",
+		AgentType: "engineer",
+	}
+
+	ctx := buildNodeContext(ht)
+
+	if got, _ := ctx["task_id"].(string); got != "task_auth_checkout" {
+		t.Fatalf("task_id = %q, want task_auth_checkout", got)
+	}
+	if got, _ := ctx["task_slug"].(string); got != "auth-checkout" {
+		t.Fatalf("task_slug = %q, want auth-checkout", got)
+	}
+}

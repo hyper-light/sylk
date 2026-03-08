@@ -1,7 +1,6 @@
 package container
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -14,13 +13,8 @@ func TestNewAgentIdentityRegistry(t *testing.T) {
 		if !ok {
 			t.Fatalf("Get(%q) returned not-ok", agentType)
 		}
-		if !strings.HasPrefix(id, agentType+"_") {
-			t.Errorf("Get(%q) = %q, want prefix %q_", agentType, id, agentType)
-		}
-		// UUID8 suffix should be 8 hex chars.
-		suffix := strings.TrimPrefix(id, agentType+"_")
-		if len(suffix) != 8 {
-			t.Errorf("UUID8 suffix %q has len %d, want 8", suffix, len(suffix))
+		if id != agentType {
+			t.Errorf("Get(%q) = %q, want %q", agentType, id, agentType)
 		}
 	}
 }
@@ -55,5 +49,21 @@ func TestIdentityRegistryUniqueness(t *testing.T) {
 			t.Fatalf("ID collision: %q and %q both got %q", prev, agentType, id)
 		}
 		seen[id] = agentType
+	}
+}
+
+func TestIdentityRegistryTypeOf(t *testing.T) {
+	reg := NewAgentIdentityRegistry([]string{"architect", "librarian"})
+
+	agentType, ok := reg.TypeOf("architect")
+	if !ok {
+		t.Fatal("TypeOf(architect) returned not-ok")
+	}
+	if agentType != "architect" {
+		t.Fatalf("TypeOf(architect) = %q, want architect", agentType)
+	}
+
+	if _, ok := reg.TypeOf("dc484039"); ok {
+		t.Fatal("TypeOf(unknown id) should return false")
 	}
 }

@@ -1,7 +1,7 @@
 package treesitter
 
 import (
-	sitter "github.com/tree-sitter/go-tree-sitter"
+	sitter "github.com/adalundhe/sylk/third_party/go_tree_sitter"
 )
 
 type Tree struct {

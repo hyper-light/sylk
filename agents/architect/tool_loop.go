@@ -260,13 +260,14 @@ func (a *Architect) executeToolLoop(
 		}
 
 		toolStart := time.Now()
-		errCount, rerouted := a.applyToolCalls(ctx, req, resp)
+		errCount, rerouted, delegated, delegatedMessage := a.applyToolCalls(ctx, req, resp)
 		a.logInfo("executeToolLoop: tool calls applied",
 			"stage", stage,
 			"turn", turn,
 			"tool_elapsed", time.Since(toolStart).String(),
 			"err_count", errCount,
-			"rerouted", rerouted)
+			"rerouted", rerouted,
+			"delegated", delegated)
 		a.logDebug("tool_loop: TOOLS_APPLIED",
 			"stage", stage,
 			"turn", turn,
@@ -281,6 +282,14 @@ func (a *Architect) executeToolLoop(
 				"turn", turn,
 				"total_elapsed", time.Since(loopStart).String())
 			return "", skills.ErrRerouteRequested
+		}
+		if delegated {
+			a.logInfo("executeToolLoop: DELEGATED",
+				"stage", stage,
+				"turn", turn,
+				"message_len", len(delegatedMessage),
+				"total_elapsed", time.Since(loopStart).String())
+			return strings.TrimSpace(delegatedMessage), nil
 		}
 		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
@@ -300,7 +309,7 @@ func (a *Architect) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
-) (int, bool) {
+) (int, bool, bool, string) {
 	req.Messages = append(req.Messages, providers.Message{
 		Role:      providers.RoleAssistant,
 		Content:   strings.TrimSpace(resp.Content),
@@ -310,6 +319,8 @@ func (a *Architect) applyToolCalls(
 
 	errCount := 0
 	rerouted := false
+	delegated := false
+	delegatedMessage := ""
 	for i, call := range resp.ToolCalls {
 		if ctx.Err() != nil {
 			a.logWarn("applyToolCalls: context cancelled mid-loop",
@@ -356,6 +367,18 @@ func (a *Architect) applyToolCalls(
 				result = `{"rerouted": true}`
 				a.logInfo("applyToolCalls: reroute requested by tool",
 					"tool_name", call.Name)
+			} else if errors.Is(err, skills.ErrDelegatedRequested) {
+				delegated = true
+				delegatedMessage = toolOutputUserMessage(result)
+				if delegatedMessage == "" {
+					delegatedMessage = strings.TrimSpace(result)
+				}
+				if delegatedMessage == "" {
+					delegatedMessage = skills.DelegatedMessage(err)
+				}
+				a.logInfo("applyToolCalls: delegated operation requested by tool",
+					"tool_name", call.Name,
+					"message", delegatedMessage)
 			} else {
 				result = shared.ToolErrorPayload(err)
 				isError = true
@@ -379,12 +402,12 @@ func (a *Architect) applyToolCalls(
 			Content:    result,
 			IsError:    isError,
 		})
-		if rerouted {
+		if rerouted || delegated {
 			break
 		}
 	}
 
-	return errCount, rerouted
+	return errCount, rerouted, delegated, delegatedMessage
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.

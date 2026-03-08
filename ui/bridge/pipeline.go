@@ -12,10 +12,10 @@ import (
 )
 
 const (
-	pipelineBridgeName     = "bridge.pipeline"
-	pipelineEventBuffer    = 64
-	variantEventBuffer     = 64
-	pipelineDrainTimeout   = 0 // Zero uses scope's max lifetime.
+	pipelineBridgeName   = "bridge.pipeline"
+	pipelineEventBuffer  = 64
+	variantEventBuffer   = 64
+	pipelineDrainTimeout = 0 // Zero uses scope's max lifetime.
 )
 
 // PipelineBridge converts core pipeline and variant events into Bubble Tea
@@ -120,6 +120,7 @@ func toPipelineStateMsg(evt tdd.PipelineEvent) msg.PipelineStateMsg {
 	return msg.PipelineStateMsg{
 		PipelineID: evt.PipelineID,
 		TaskID:     evt.TaskID,
+		TaskLabel:  evt.TaskID,
 		Status:     string(evt.NewStatus),
 		LoopCount:  evt.LoopCount,
 	}

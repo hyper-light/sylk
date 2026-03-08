@@ -43,8 +43,9 @@ type PipelineInspector struct {
 	provider pipelineInspectorProvider
 
 	// Activity publisher for UI agent-panel updates. Nil-safe.
-	activityPub events.ActivityPublisher
-	pipelineID  string // DAG pipeline ID for TUI grouping.
+	activityPub  events.ActivityPublisher
+	pipelineID   string // Stable task-level pipeline ID for TUI grouping.
+	pipelineSlug string
 
 	// Tool runner for external analysis tools.
 	toolRunner *shared.ToolRunner
@@ -590,8 +591,13 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	pi.steering.BindSession(filepath.Join(".sylk", "sessions", fwd.SessionID), fwd.SessionID)
 	agentShared.LogIncomingRequest(pi.steering.EventLogger(), fwd, pi.id)
 
-	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
+		pi.pipelineID = taskID
+	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
 		pi.pipelineID = dagID
+	}
+	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
+		pi.pipelineSlug = taskSlug
 	}
 
 	agentShared.EmitDispatchACK(pi.bus, fwd.Metadata, pi.id, "inspector-pipeline", fwd.CorrelationID)
@@ -632,7 +638,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	})
 
 	if !fwd.FireAndForget {
-		shared.PublishStreamStart(pi.bus, pi.channels, ctx, "inspector-pipeline")
+		shared.PublishStreamStart(pi.bus, pi.channels, ctx, pi.id)
 	}
 
 	result, err := pi.Handle(ctx, fwd)
@@ -648,14 +654,14 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
-		shared.PublishStreamError(pi.bus, pi.channels, ctx, "inspector-pipeline", err)
-		shared.PublishStreamComplete(pi.bus, pi.channels, ctx, "inspector-pipeline", "", usageAcc.Total())
+		shared.PublishStreamError(pi.bus, pi.channels, ctx, pi.id, err)
+		shared.PublishStreamComplete(pi.bus, pi.channels, ctx, pi.id, "", usageAcc.Total())
 		pi.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(pi.generateMessageID(), fwd.CorrelationID, pi.id, err.Error())
 		return pi.bus.Publish(pi.channels.Errors, errMsg)
 	}
 
-	shared.PublishStreamComplete(pi.bus, pi.channels, ctx, "inspector-pipeline", "", usageAcc.Total())
+	shared.PublishStreamComplete(pi.bus, pi.channels, ctx, pi.id, "", usageAcc.Total())
 	pi.publishActivity(events.EventTypeAgentAction, "Inspection task completed")
 
 	resp := &guide.RouteResponse{
@@ -935,6 +941,10 @@ func (pi *PipelineInspector) publishActivity(eventType events.EventType, content
 	evt.Data["agent_name"] = "Inspector"
 	if pi.pipelineID != "" {
 		evt.Data["pipeline_id"] = pi.pipelineID
+		evt.Data["task_id"] = pi.pipelineID
+	}
+	if pi.pipelineSlug != "" {
+		evt.Data["task_slug"] = pi.pipelineSlug
 	}
 	pi.activityPub.PublishActivity(evt)
 }

@@ -56,19 +56,19 @@ type Engineer struct {
 	failures map[string]*FailureRecord // taskID -> failure record
 
 	// Skills system
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	tools       *toolruntime.Runtime
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
 	// Activity publisher for UI agent-panel updates.
 	activityPub events.ActivityPublisher
 
-	// pipelineID tracks the DAG pipeline this agent belongs to.
-	// Set from ForwardedRequest.Metadata["dag_id"] on dispatch;
-	// included in activity events so the TUI groups the agent under
-	// the correct pipeline section.
-	pipelineID string
+	// pipelineID tracks the stable task-level pipeline identity for the
+	// current dispatch. It is derived from ForwardedRequest.Metadata["task_id"]
+	// so the TUI can group sub-stage agents under the correct task pipeline.
+	pipelineID   string
+	pipelineSlug string
 
 	// Event bus integration
 	bus         guide.EventBus
@@ -502,8 +502,13 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	shared.LogIncomingRequest(e.steering.EventLogger(), fwd, e.id)
 
 	// Track pipeline association for activity event grouping.
-	if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
+	if taskID, _ := fwd.Metadata["task_id"].(string); taskID != "" {
+		e.pipelineID = taskID
+	} else if dagID, _ := fwd.Metadata["dag_id"].(string); dagID != "" {
 		e.pipelineID = dagID
+	}
+	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
+		e.pipelineSlug = taskSlug
 	}
 
 	shared.EmitDispatchACK(e.bus, fwd.Metadata, e.id, "engineer", fwd.CorrelationID)
@@ -529,7 +534,9 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(e.bus, e.channels, e.id, fwd.CorrelationID, fwd.SourceAgentID)
-	ctx := shared.WithToolCallEmitter(reqCtx, emitter)
+	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
+	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)
 	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
 		EventLogger: e.steering.EventLogger(),
@@ -550,6 +557,9 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		Bus: e.bus, Channels: e.channels,
 		AgentID: e.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
 	})
+	if !fwd.FireAndForget {
+		shared.PublishStreamStart(e.bus, e.channels, ctx, e.id)
+	}
 
 	result, err := e.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(e.steering.EventLogger(), fwd.CorrelationID, e.id, fwd.SessionID, time.Since(startTime), err)
@@ -574,6 +584,8 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
 				&agentlog.ErrorPayload{Error: fmt.Sprintf("request failed: %v", err)})
 		}
+		shared.PublishStreamError(e.bus, e.channels, ctx, e.id, err)
+		shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
 		resp.Error = err.Error()
 		e.publishActivity(events.EventTypeAgentError, fmt.Sprintf("Task failed: %s", err.Error()))
 		errMsg := guide.NewErrorMessage(
@@ -586,6 +598,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	}
 
 	resp.Data = result
+	shared.PublishStreamComplete(e.bus, e.channels, ctx, e.id, "", usageAcc.Total())
 	e.publishActivity(events.EventTypeAgentAction, "Implementation task completed")
 
 	respMsg := guide.NewResponseMessage(e.generateMessageID(), resp)
@@ -943,6 +956,10 @@ func (e *Engineer) publishActivity(eventType events.EventType, content string) {
 	evt.Data["agent_name"] = "Engineer"
 	if e.pipelineID != "" {
 		evt.Data["pipeline_id"] = e.pipelineID
+		evt.Data["task_id"] = e.pipelineID
+	}
+	if e.pipelineSlug != "" {
+		evt.Data["task_slug"] = e.pipelineSlug
 	}
 	e.activityPub.PublishActivity(evt)
 }
