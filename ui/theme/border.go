@@ -24,19 +24,33 @@ func RenderGradientBorder(content string, g *Gradient, elapsed time.Duration, in
 		return content
 	}
 
-	// Size content to inner dimensions (no border).
-	sized := lipgloss.NewStyle().
-		Width(innerW).
-		Height(innerH).
-		Render(content)
-
-	lines := strings.Split(sized, "\n")
+	// Split content into lines and pad/truncate to exact inner dimensions.
+	// Manual processing avoids lipgloss re-wrapping ANSI-dense content
+	// (e.g. per-character selection styling) which can produce extra lines.
+	lines := strings.Split(content, "\n")
 	if len(lines) > innerH {
 		lines = lines[:innerH]
 	}
 	pad := strings.Repeat(" ", innerW)
 	for len(lines) < innerH {
 		lines = append(lines, pad)
+	}
+	for i, line := range lines {
+		w := lipgloss.Width(line)
+		switch {
+		case w < innerW:
+			lines[i] = line + strings.Repeat(" ", innerW-w)
+		case w > innerW:
+			// Truncate oversized lines (e.g. cursor trailing space
+			// extending past contentWidth). MaxWidth may wrap instead
+			// of truncate, so take only the first line to prevent
+			// embedded newlines from corrupting the border structure.
+			rendered := lipgloss.NewStyle().MaxWidth(innerW).Render(line)
+			if idx := strings.Index(rendered, "\n"); idx >= 0 {
+				rendered = rendered[:idx]
+			}
+			lines[i] = rendered
+		}
 	}
 
 	nRows := len(lines)

@@ -5,12 +5,30 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-// Librarian currently uses provider defaults for conversation/tool-loop
-// requests. Keeping the profile here makes later tuning agent-owned.
 func (l *Librarian) applyConversationRuntimeProfile(req *providers.Request) {
-	llmruntime.Apply(req, l.conversationRuntimeProfile())
+	llmruntime.ApplyStage(req, l.conversationStageProfile(), llmruntime.ApplyOptions{
+		Model:     librarianRuntimeModel(req, l.CurrentModel()),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "librarian",
+		SessionID: l.config.SessionID,
+	})
 }
 
-func (l *Librarian) conversationRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{}
+func (l *Librarian) conversationStageProfile() llmruntime.StageProfile {
+	return llmruntime.ResolveAgentStageProfile("librarian", "search")
+}
+
+func librarianRuntimeProfiles() []llmruntime.StageProfile {
+	return llmruntime.AgentProfiles("librarian")
+}
+
+func librarianDefaultRuntimeProfile() string {
+	return llmruntime.AgentDefaultProfile("librarian")
+}
+
+func librarianRuntimeModel(req *providers.Request, fallback string) string {
+	if req != nil && req.Model != "" {
+		return req.Model
+	}
+	return fallback
 }

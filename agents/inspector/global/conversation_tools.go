@@ -7,11 +7,12 @@ import "github.com/adalundhe/sylk/core/providers"
 // mutating audit results or triggering analysis runs.
 func conversationAllowedSkills() []string {
 	return []string{
+		"search_skills",
 		"read_file",
 		"glob",
 		"grep",
 		"escalate_findings",
-		"reroute",
+		"reroute_request",
 	}
 }
 

@@ -3,9 +3,12 @@ package handoff
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/adalundhe/sylk/core/llmruntime"
 )
 
 // BridgeConfig configures a HandoffBridge for a specific agent.
@@ -26,9 +29,10 @@ func BridgeConfigForAgent(desc AgentDescriptor) BridgeConfig {
 	if evalInterval < 5*time.Second {
 		evalInterval = 5 * time.Second
 	}
+	evalInterval = llmruntime.AdjustEvalInterval(evalInterval, desc.RuntimeProfiles)
 
 	// Context threshold: start evaluating at 75% of window.
-	contextThreshold := 0.75
+	contextThreshold := llmruntime.AdjustContextThreshold(0.75, desc.RuntimeProfiles)
 
 	managerCfg := DefaultHandoffManagerConfig()
 	managerCfg.EvaluationInterval = evalInterval
@@ -62,6 +66,7 @@ func BridgeConfigForAgent(desc AgentDescriptor) BridgeConfig {
 		if evCfg.PreserveRecentTurns < 3 {
 			evCfg.PreserveRecentTurns = 3
 		}
+		evCfg.PreserveRecentTurns = llmruntime.AdjustPreserveRecentTurns(evCfg.PreserveRecentTurns, desc.RuntimeProfiles)
 		cfg.EvictionConfig = evCfg
 	}
 
@@ -238,7 +243,7 @@ func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 	// Feed prepared context with a synthetic message.
 	b.prepared.AddMessage(Message{
 		Role:       "turn",
-		Content:    fmt.Sprintf("turn %d: ctx=%d tools=%d", turn, rec.ContextSize, rec.ToolCalls),
+		Content:    turnSummary(turn, rec),
 		TokenCount: rec.OutputTokens,
 		Timestamp:  rec.Timestamp,
 	})
@@ -373,7 +378,7 @@ func (b *HandoffBridge) feedParallelBuffer(turn int64, rec TurnRecord, flushed F
 	b.parallelBuffer.Ingest(
 		Message{
 			Role:       "turn",
-			Content:    fmt.Sprintf("turn %d: ctx=%d tools=%d", turn, rec.ContextSize, rec.ToolCalls),
+			Content:    turnSummary(turn, rec),
 			TokenCount: rec.OutputTokens,
 			Timestamp:  rec.Timestamp,
 		},
@@ -390,6 +395,17 @@ func (b *HandoffBridge) feedParallelBuffer(turn int64, rec TurnRecord, flushed F
 	} else {
 		b.parallelBuffer.UpdateGP(pred)
 	}
+}
+
+func turnSummary(turn int64, rec TurnRecord) string {
+	summary := fmt.Sprintf("turn %d: ctx=%d tools=%d", turn, rec.ContextSize, rec.ToolCalls)
+	if strings.TrimSpace(rec.Stage) != "" {
+		summary += " stage=" + strings.TrimSpace(rec.Stage)
+	}
+	if strings.TrimSpace(rec.RuntimeProfile) != "" {
+		summary += " profile=" + strings.TrimSpace(rec.RuntimeProfile)
+	}
+	return summary
 }
 
 // publishQualityUpdate sends the current GP prediction to the quality publisher.

@@ -1,5 +1,7 @@
 package input
 
+import "github.com/mattn/go-runewidth"
+
 // runeSpan is a half-open rune range [Start, End) within an actual line.
 type runeSpan struct {
 	Start int
@@ -31,15 +33,26 @@ func computeWrap(lines [][]rune, width int) *wrapState {
 	return ws
 }
 
+// runeSliceWidth returns the total cell width of a rune slice.
+func runeSliceWidth(rs []rune) int {
+	w := 0
+	for _, r := range rs {
+		w += runewidth.RuneWidth(r)
+	}
+	return w
+}
+
 // wrapLine computes visual-line spans for a single actual line.
+// Width is measured in terminal cells, not runes, so wide characters
+// (emoji, CJK) are correctly accounted for.
 func wrapLine(line []rune, width int) []runeSpan {
-	n := len(line)
-	if n <= width {
-		return []runeSpan{{Start: 0, End: n}}
+	if runeSliceWidth(line) <= width {
+		return []runeSpan{{Start: 0, End: len(line)}}
 	}
 
 	var spans []runeSpan
 	pos := 0
+	n := len(line)
 
 	for pos < n {
 		// On continuation segments, skip leading whitespace.
@@ -54,39 +67,46 @@ func wrapLine(line []rune, width int) []runeSpan {
 
 		segStart := pos
 		segEnd := pos
+		segCells := 0
 
-		for segEnd < n && segEnd-segStart < width {
+		for segEnd < n && segCells < width {
 			// Find next word (including its leading whitespace).
 			wordStart := segEnd
-			// Skip whitespace — belongs to the upcoming word.
 			for wordStart < n && isWrapSpace(line[wordStart]) {
 				wordStart++
 			}
-			// Skip non-whitespace.
 			wordEnd := wordStart
 			for wordEnd < n && !isWrapSpace(line[wordEnd]) {
 				wordEnd++
 			}
 
-			// Word boundary is at wordEnd; the chunk is [segEnd, wordEnd).
-			chunkLen := wordEnd - segEnd
-			used := segEnd - segStart
+			// Measure the chunk [segEnd, wordEnd) in cells.
+			chunkCells := runeSliceWidth(line[segEnd:wordEnd])
 
-			if used+chunkLen <= width {
-				// Chunk fits on this visual line.
+			if segCells+chunkCells <= width {
 				segEnd = wordEnd
+				segCells += chunkCells
 				continue
 			}
 
 			// Chunk does not fit.
-			if used > 0 {
+			if segCells > 0 {
 				// Finalize current segment; new segment starts at segEnd.
 				break
 			}
 
 			// Current segment is empty — single chunk > width.
-			// Character-wrap: take exactly width runes.
-			segEnd = segStart + width
+			// Character-wrap: take runes until we fill the width.
+			cells := 0
+			for segEnd < wordEnd {
+				rw := runewidth.RuneWidth(line[segEnd])
+				if cells+rw > width {
+					break
+				}
+				cells += rw
+				segEnd++
+			}
+			segCells = cells
 			break
 		}
 
@@ -110,7 +130,21 @@ func isWrapSpace(r rune) bool {
 	return r == ' ' || r == '\t'
 }
 
+// graphemeLen returns the number of runes in the grapheme cluster starting
+// at index i. A cluster is a base rune followed by zero-width combining runes
+// (variation selectors, ZWJ, combining marks). Grouping these runes ensures
+// that per-character ANSI styling does not split emoji sequences, which would
+// cause terminals to render variation selectors as standalone visible chars.
+func graphemeLen(runes []rune, i int) int {
+	n := 1
+	for i+n < len(runes) && runewidth.RuneWidth(runes[i+n]) == 0 {
+		n++
+	}
+	return n
+}
+
 // actualToVisual maps an actual (row, col) to a visual (vRow, vCol).
+// vCol is measured in rune offset within the segment, not cell width.
 // Columns in gaps between spans (stripped whitespace) map to the end
 // of the preceding visual line.
 func (ws *wrapState) actualToVisual(row, col int) (vRow, vCol int) {

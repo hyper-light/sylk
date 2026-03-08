@@ -146,3 +146,70 @@ func TestClear_DestroysHistory(t *testing.T) {
 		t.Fatalf("history should be empty after Clear, got %d turns", len(history))
 	}
 }
+
+func TestGuideApplyConversationFlow_UsesWorkPreferenceForLowConfidenceGuideTarget(t *testing.T) {
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	defer func() { _ = bus.Close() }()
+
+	g, err := NewWithClassifier(NewRuleClassifierClient(), Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "session-1",
+	})
+	if err != nil {
+		t.Fatalf("new guide: %v", err)
+	}
+
+	if err := g.Register(&AgentRoutingInfo{
+		ID:   "engineer",
+		Type: "engineer",
+		Name: "engineer",
+		Registration: &AgentRegistration{
+			ID:   "engineer",
+			Name: "engineer",
+			Capabilities: AgentCapabilities{
+				Intents: []Intent{IntentComplete, IntentCheck, IntentHelp},
+				Domains: []Domain{DomainCode, DomainFiles, DomainGeneral},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("register engineer: %v", err)
+	}
+
+	req := &RouteRequest{
+		Input:         "can you keep going on that?",
+		SessionID:     "session-1",
+		SourceAgentID: "tui",
+		Timestamp:     time.Now(),
+		Metadata: map[string]any{
+			"dag_id":  "dag-123",
+			"task_id": "task-123",
+		},
+	}
+	g.observeRoutedConversationTarget(req, &RouteResult{
+		Intent:      IntentComplete,
+		Domain:      DomainCode,
+		TargetAgent: TargetAgent("engineer"),
+		Confidence:  0.95,
+	}, "engineer")
+
+	classification := &RouteResult{
+		Intent:               IntentUnknown,
+		Domain:               DomainGeneral,
+		TargetAgent:          TargetGuide,
+		Confidence:           0.42,
+		Action:               RouteActionSuggest,
+		ClassificationMethod: "llm",
+	}
+
+	updated, target := g.applyConversationFlow(context.Background(), req, classification, "guide")
+	if target != "engineer" {
+		t.Fatalf("target = %q, want engineer", target)
+	}
+	if updated == nil || updated.TargetAgent != TargetAgent("engineer") {
+		t.Fatalf("updated target = %v, want engineer", updated.TargetAgent)
+	}
+	if !strings.Contains(updated.ClassificationMethod, "work_state") {
+		t.Fatalf("classification method = %q, want work_state suffix", updated.ClassificationMethod)
+	}
+}

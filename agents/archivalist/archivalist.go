@@ -19,6 +19,7 @@ import (
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/google/uuid"
 )
 
@@ -91,6 +92,7 @@ type Archivalist struct {
 	skills        *skills.Registry
 	skillLoader   *skills.Loader
 	hooks         *skills.HookRegistry
+	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
 	defaultSessionID string
@@ -163,6 +165,9 @@ func New(ctx context.Context, cfg Config) (*Archivalist, error) {
 		return nil, err
 	}
 	archivalist := assembleArchivalist(cfg, components)
+	if err := archivalist.initToolRuntime(); err != nil {
+		return nil, err
+	}
 	if cfg.EnableRAG {
 		if err := archivalist.initRAG(cfg); err != nil {
 			return nil, fmt.Errorf("failed to initialize RAG: %w", err)
@@ -286,11 +291,26 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 	a.registerExtendedSkills()
 
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	skillsLoaderCfg.CoreSkills = []string{"store", "query", "briefing"}
+	skillsLoaderCfg.CoreSkills = archivalistVisibleSkillNames()
 	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	a.skillLoader = skills.NewLoader(skillsRegistry, skillsLoaderCfg)
 
 	return a
+}
+
+func (a *Archivalist) initToolRuntime() error {
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: a.skills,
+		Hooks:    a.hooks,
+		Manifest: archivalistToolManifest(a.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize archivalist tool runtime: %w", err)
+	}
+	a.tools = tools
+	a.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 // initRAG initializes RAG components
@@ -377,6 +397,10 @@ func (a *Archivalist) initRAG(cfg Config) error {
 
 // Close closes the archivalist and its resources
 func (a *Archivalist) Close() error {
+	if a.tools != nil {
+		a.tools.Close()
+		a.tools = nil
+	}
 	// Stop event bus subscriptions first
 	a.Stop()
 
@@ -629,6 +653,17 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
+	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
+	if a.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = shared.WithContextGovernor(ctx, gov)
+	ctx = shared.WithProgressPublisher(ctx, &shared.ProgressPublisher{
+		Bus: a.bus, Channels: a.channels,
+		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	result, err := a.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, a.id, fwd.SessionID, time.Since(startTime), err)
@@ -754,7 +789,10 @@ func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedReq
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
-	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return a.executeToolLoop(ctx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("archivalist failed: %w", err)
 	}
@@ -2233,11 +2271,34 @@ func (a *Archivalist) QueryContext(ctx context.Context, query string) (*Synthesi
 
 // HandleToolCall processes a tool call from an agent
 func (a *Archivalist) HandleToolCall(ctx context.Context, toolName string, input []byte) (string, error) {
-	if a.toolHandler == nil {
-		return "", fmt.Errorf("tool handler not initialized")
+	if a.toolRuntime() == nil {
+		return "", fmt.Errorf("tool runtime is not configured")
 	}
-
-	return a.toolHandler.Handle(ctx, toolName, input)
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		return "", fmt.Errorf("tool name is required")
+	}
+	if _, err := a.toolRuntime().Activate(name); err != nil {
+		return "", err
+	}
+	raw := strings.TrimSpace(string(input))
+	if raw == "" {
+		raw = "{}"
+	}
+	result, err := a.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall: providers.ToolCall{
+			ID:        "archivalist-direct",
+			Name:      name,
+			Arguments: raw,
+		},
+		AgentID:         a.id,
+		CorrelationID:   a.id + "-direct",
+		CapabilityScope: a.toolRuntime().CapabilityScope(),
+	})
+	if result.ToolDefsDirty {
+		a.toolDefsDirty = true
+	}
+	return result.Output, err
 }
 
 // GetQueryCacheStats returns query cache statistics
@@ -2281,7 +2342,19 @@ func (a *Archivalist) GetMemoryStats() *MemoryStats {
 
 // GetToolDefinitions returns all available tool definitions
 func (a *Archivalist) GetToolDefinitions() []ToolDefinition {
-	return AllToolDefinitions()
+	tools := a.buildToolDefinitions()
+	if len(tools) == 0 {
+		return nil
+	}
+	defs := make([]ToolDefinition, 0, len(tools))
+	for _, tool := range tools {
+		defs = append(defs, ToolDefinition{
+			Name:        tool.Name,
+			Description: tool.Description,
+			InputSchema: tool.Parameters,
+		})
+	}
+	return defs
 }
 
 // IndexContent adds content to the RAG retrieval index
@@ -2329,7 +2402,21 @@ func (a *Archivalist) Hooks() *skills.HookRegistry {
 
 // RegisterSkill registers a skill with the Archivalist's skill registry
 func (a *Archivalist) RegisterSkill(skill *skills.Skill) error {
-	return a.skills.Register(skill)
+	if skill == nil {
+		return fmt.Errorf("skill is required")
+	}
+	name := strings.TrimSpace(skill.Name)
+	if name == "" {
+		return fmt.Errorf("skill name is required")
+	}
+	if a.toolRuntime() == nil || !a.toolRuntime().Allows(name) {
+		return fmt.Errorf("skill %q is outside archivalist capability scope %q", name, archivalistToolManifest(a.skills).CapabilityScope)
+	}
+	if err := a.skills.Register(skill); err != nil {
+		return err
+	}
+	a.toolDefsDirty = true
+	return nil
 }
 
 // LoadSkillsForInput loads skills based on input keywords
@@ -2339,7 +2426,7 @@ func (a *Archivalist) LoadSkillsForInput(input string) []string {
 
 // GetLoadedSkillDefinitions returns tool definitions for all loaded skills
 func (a *Archivalist) GetLoadedSkillDefinitions() []map[string]any {
-	return a.skills.GetToolDefinitions()
+	return shared.ProviderToolsToDefinitions(a.buildToolDefinitions())
 }
 
 // RegisterPrePromptHook registers a hook that runs before LLM prompts
@@ -2466,11 +2553,14 @@ var _ container.ModelSwappable = (*Archivalist)(nil)
 
 // Descriptor returns the immutable metadata describing this agent type.
 func (a *Archivalist) Descriptor() handoff.AgentDescriptor {
+	modelID := a.config.Model
 	return handoff.AgentDescriptor{
-		AgentType:     "archivalist",
-		ModelID:       a.config.Model,
-		ContextWindow: MaxContextTokens,
-		Category:      handoff.CategoryKnowledge,
+		AgentType:             "archivalist",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryKnowledge,
+		RuntimeProfiles:       archivalistRuntimeProfiles(),
+		DefaultRuntimeProfile: archivalistDefaultRuntimeProfile(),
 	}
 }
 

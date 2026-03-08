@@ -47,6 +47,7 @@ type conversationFlowState struct {
 	UpdatedAt     time.Time
 	agents        map[string]conversationAgentState
 	pending       *pendingPlan // Architect plan awaiting user approval.
+	work          sessionWorkState
 }
 
 // pendingPlan tracks an architect plan awaiting user approval.
@@ -66,6 +67,16 @@ type conversationAgentState struct {
 	history      []ConversationTurn // ring buffer, cap = maxConversationTurns
 	historyHead  int                // next write position
 	historyCount int                // valid entries (≤ maxConversationTurns)
+}
+
+type sessionWorkState struct {
+	Kind         string
+	PrimaryAgent string
+	PlanID       string
+	DAGID        string
+	TaskID       string
+	ArtifactRefs []string
+	UpdatedAt    time.Time
 }
 
 // ConversationSessionSnapshot captures active session conversation state.
@@ -232,6 +243,87 @@ func (m *ConversationFlowManager) suggestTargetByACTR(
 		return "", false
 	}
 	return strings.ToLower(strings.TrimSpace(state.ActiveAgentID)), true
+}
+
+func (m *ConversationFlowManager) ObserveWorkRoute(
+	sessionID string,
+	targetAgentID string,
+	result *RouteResult,
+	metadata map[string]any,
+) {
+	if m == nil {
+		return
+	}
+	trimmedSession := strings.TrimSpace(sessionID)
+	normalizedTarget := strings.ToLower(strings.TrimSpace(targetAgentID))
+	if trimmedSession == "" || normalizedTarget == "" || isGuideTargetID(normalizedTarget) {
+		return
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	state, ok := m.sessions[trimmedSession]
+	if !ok {
+		state = conversationFlowState{agents: map[string]conversationAgentState{}}
+	} else if state.agents == nil {
+		state.agents = map[string]conversationAgentState{}
+	}
+	work := state.work
+	work.Kind = inferWorkKind(normalizedTarget, result, metadata)
+	work.PrimaryAgent = normalizedTarget
+	work.PlanID = firstNonEmptyString(metadataString(metadata, "plan_id"), work.PlanID)
+	work.DAGID = firstNonEmptyString(metadataString(metadata, "dag_id"), work.DAGID)
+	work.TaskID = firstNonEmptyString(metadataString(metadata, "task_id"), work.TaskID)
+	work.ArtifactRefs = mergeArtifactRefs(work.ArtifactRefs,
+		metadataString(metadata, "paper_path"),
+		metadataString(metadata, "research_slug"),
+		metadataString(metadata, "workflow_id"),
+		metadataString(metadata, "dag_id"),
+		metadataString(metadata, "plan_id"),
+	)
+	work.UpdatedAt = now
+	state.work = work
+	state.UpdatedAt = now
+	m.sessions[trimmedSession] = state
+	m.mu.Unlock()
+}
+
+func (m *ConversationFlowManager) WorkPreferredTarget(sessionID string) (string, bool) {
+	state, ok := m.sessionState(sessionID)
+	if !ok {
+		return "", false
+	}
+	target := strings.ToLower(strings.TrimSpace(state.work.PrimaryAgent))
+	if !isConversationAgent(target) {
+		return "", false
+	}
+	return target, true
+}
+
+func (m *ConversationFlowManager) WorkMetadata(sessionID string) map[string]any {
+	state, ok := m.sessionState(sessionID)
+	if !ok {
+		return nil
+	}
+	work := state.work
+	if strings.TrimSpace(work.Kind) == "" && strings.TrimSpace(work.PrimaryAgent) == "" {
+		return nil
+	}
+	meta := map[string]any{
+		"work_kind":      work.Kind,
+		"work_agent":     work.PrimaryAgent,
+		"work_artifacts": append([]string(nil), work.ArtifactRefs...),
+	}
+	if work.PlanID != "" {
+		meta["work_plan_id"] = work.PlanID
+	}
+	if work.DAGID != "" {
+		meta["work_dag_id"] = work.DAGID
+	}
+	if work.TaskID != "" {
+		meta["work_task_id"] = work.TaskID
+	}
+	return meta
 }
 
 func (m *ConversationFlowManager) sessionState(sessionID string) (conversationFlowState, bool) {
@@ -684,12 +776,14 @@ func (g *Guide) observeUserConversationSignal(request *RouteRequest) {
 	g.conversation.ObserveUserInput(request.SessionID, request.Input)
 }
 
-func (g *Guide) observeRoutedConversationTarget(request *RouteRequest, targetAgentID string) {
+func (g *Guide) observeRoutedConversationTarget(request *RouteRequest, classification *RouteResult, targetAgentID string) {
 	if g == nil || g.conversation == nil || request == nil {
 		return
 	}
 	g.conversation.ObserveRoutedRequest(request.SessionID, targetAgentID)
 	g.conversation.RecordUserInput(request.SessionID, targetAgentID, request.Input)
+	g.conversation.ObserveWorkRoute(request.SessionID, targetAgentID, classification,
+		mergeForwardMetadata(workMetadataFromClassification(classification), request.Metadata))
 	if g.sessionRouter != nil && request.SessionID != "" && isConversationAgent(targetAgentID) {
 		g.sessionRouter.SetPreferredAgent(request.SessionID, targetAgentID, 8)
 	}
@@ -752,17 +846,56 @@ func (g *Guide) applyConversationFlow(
 	if g == nil || g.conversation == nil || request == nil {
 		return classification, targetAgentID
 	}
+	if updated, updatedTarget, ok := g.applyWorkPreference(ctx, request, classification, targetAgentID); ok {
+		g.observeRoutedConversationTarget(request, updated, updatedTarget)
+		return updated, updatedTarget
+	}
 	desiredTarget, ok := g.conversation.SuggestedTarget(request.SessionID, targetAgentID, classification)
 	if !ok {
-		g.observeRoutedConversationTarget(request, targetAgentID)
+		g.observeRoutedConversationTarget(request, classification, targetAgentID)
 		return classification, targetAgentID
 	}
 	updated := remapClassificationTarget(classification, desiredTarget)
 	updated.Intent = g.supportedIntentForTarget(desiredTarget, updated.Intent)
 	updated.Domain = g.supportedDomainForTarget(desiredTarget, updated.Domain, updated.Intent)
 	updated, targetAgentID = g.ensureRoutableClassification(ctx, updated, desiredTarget)
-	g.observeRoutedConversationTarget(request, targetAgentID)
+	g.observeRoutedConversationTarget(request, updated, targetAgentID)
 	return updated, targetAgentID
+}
+
+func (g *Guide) applyWorkPreference(
+	ctx context.Context,
+	request *RouteRequest,
+	classification *RouteResult,
+	targetAgentID string,
+) (*RouteResult, string, bool) {
+	if g == nil || g.conversation == nil || request == nil || request.ExplicitTarget {
+		return nil, "", false
+	}
+	if classification != nil && !g.shouldUseWorkPreference(classification, targetAgentID) {
+		return nil, "", false
+	}
+	preferred, ok := g.conversation.WorkPreferredTarget(request.SessionID)
+	if !ok || strings.EqualFold(preferred, targetAgentID) {
+		return nil, "", false
+	}
+	updated := remapClassificationTarget(classification, preferred)
+	updated.ClassificationMethod = appendClassificationMethod(updated.ClassificationMethod, "work_state")
+	updated.Reason = "session work context routed to active specialist"
+	updated.Intent = g.supportedIntentForTarget(preferred, updated.Intent)
+	updated.Domain = g.supportedDomainForTarget(preferred, updated.Domain, updated.Intent)
+	updated, targetAgentID = g.ensureRoutableClassification(ctx, updated, preferred)
+	return updated, targetAgentID, true
+}
+
+func (g *Guide) shouldUseWorkPreference(classification *RouteResult, targetAgentID string) bool {
+	if classification == nil {
+		return true
+	}
+	if isGuideTargetID(targetAgentID) || isUnknownOrEmptyTarget(targetAgentID) {
+		return true
+	}
+	return classification.Confidence < 0.55
 }
 
 func remapClassificationTarget(classification *RouteResult, targetAgentID string) *RouteResult {
@@ -799,6 +932,99 @@ func appendClassificationMethod(base string, suffix string) string {
 		return trimmedBase
 	}
 	return trimmedBase + "+" + trimmedSuffix
+}
+
+func inferWorkKind(targetAgentID string, result *RouteResult, metadata map[string]any) string {
+	target := strings.ToLower(strings.TrimSpace(targetAgentID))
+	switch {
+	case target == "academic":
+		return "research"
+	case target == "architect":
+		return "planning"
+	case target == "librarian":
+		return "grounding"
+	case target == "archivalist":
+		return "memory"
+	case target == "engineer" || target == "designer":
+		return "implementation"
+	case strings.HasPrefix(target, "inspector"):
+		return "validation"
+	case target == "guardian":
+		return "safety"
+	case target == "orchestrator":
+		return "workflow"
+	}
+	if metadataString(metadata, "dag_id") != "" || metadataString(metadata, "task_id") != "" {
+		return "implementation"
+	}
+	if metadataString(metadata, "plan_id") != "" {
+		return "planning"
+	}
+	if result != nil {
+		switch result.Intent {
+		case IntentPlan, IntentDesign:
+			return "planning"
+		case IntentExecute, IntentComplete:
+			return "implementation"
+		case IntentFind, IntentSearch, IntentLocate:
+			return "grounding"
+		case IntentRecall, IntentCheck:
+			return "memory"
+		}
+	}
+	return "general"
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	value, _ := metadata[key]
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" && value != "<nil>" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func mergeArtifactRefs(existing []string, refs ...string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(refs))
+	out := make([]string, 0, len(existing)+len(refs))
+	for _, ref := range existing {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
+	}
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" || ref == "<nil>" {
+			continue
+		}
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+		seen[ref] = struct{}{}
+		out = append(out, ref)
+	}
+	return out
+}
+
+func workMetadataFromClassification(classification *RouteResult) map[string]any {
+	if classification == nil {
+		return nil
+	}
+	return classification.PhaseMetadata
 }
 
 func (g *Guide) supportedIntentForTarget(targetAgentID string, current Intent) Intent {

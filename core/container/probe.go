@@ -87,10 +87,15 @@ const maxProbeIterations = 100_000
 func (pr *ProbeRunner) runProbeLoop(ctx context.Context, spec ProbeSpec, state *probeState) {
 	pr.waitInitialDelay(ctx, spec)
 
+	// Execute immediately so health state is established before the first
+	// ticker period elapses. Without this, there's a full-period gap where
+	// started=true but healthy=false, causing transient "unhealthy" reports.
+	pr.executeProbe(ctx, spec, state)
+	state.started.Store(true)
+
 	ticker := time.NewTicker(spec.Period)
 	defer ticker.Stop()
 
-	state.started.Store(true)
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,13 +159,17 @@ func (pr *ProbeRunner) updateProbeState(spec ProbeSpec, state *probeState, resul
 }
 
 // IsHealthy returns true if the probe of the given type has met its
-// success threshold. Returns false if the probe type is not configured.
+// success threshold. Returns true if the probe type is not configured
+// or if the probe has not yet started (still in initial delay).
 func (pr *ProbeRunner) IsHealthy(probeType ProbeType) bool {
 	pr.mu.RLock()
 	state, ok := pr.probes[probeType]
 	pr.mu.RUnlock()
 	if !ok {
 		return true // no probe configured means implicitly healthy
+	}
+	if !state.started.Load() {
+		return true // probe in initial delay — assume healthy until first check
 	}
 	return state.healthy.Load()
 }

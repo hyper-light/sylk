@@ -22,6 +22,8 @@ var toolCallSpinnerIndex int
 
 // renderToolCalls renders all tool call records as inline blocks.
 // Returns the rendered lines and tool call region metadata for click handling.
+// Active (incomplete) tool calls render with a holographic gradient shimmer
+// distinct from the thinking animation.
 func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]string, []ToolCallRegion) {
 	if len(calls) == 0 || width <= 0 {
 		return nil, nil
@@ -38,16 +40,22 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 		toolCallSpinnerIndex = (toolCallSpinnerIndex + 1) % len(toolCallSpinnerFrames)
 	}
 
+	// Build the gradient once per render pass (only when active calls exist).
+	var grad *theme.Gradient
+	if hasActive {
+		grad = th.Palette.ToolCallGradient()
+	}
+
 	var lines []string
 	var regions []ToolCallRegion
 
 	for i := range calls {
 		start := len(lines)
 		if calls[i].Expanded {
-			expanded := renderToolCallExpanded(calls[i], width, th)
+			expanded := renderToolCallExpanded(calls[i], width, th, grad)
 			lines = append(lines, expanded...)
 		} else {
-			lines = append(lines, renderToolCallCollapsed(calls[i], width, th))
+			lines = append(lines, renderToolCallCollapsed(calls[i], width, th, grad))
 		}
 		regions = append(regions, ToolCallRegion{
 			Start:     start,
@@ -56,15 +64,22 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 		})
 	}
 
+	// Trailing spacer line below the tool call block.
+	lines = append(lines, "")
+
 	return lines, regions
 }
 
 // renderToolCallCollapsed renders a single-line collapsed tool call.
-// Format: ▸ ⚡ tool_name args_summary                        0.3s
-func renderToolCallCollapsed(tc ToolCallRecord, width int, th *theme.Theme) string {
+// Format: ▸ ⏻ tool_name args_summary                        0.3s
+// Active calls use gradient-sampled colors; completed calls use static styles.
+func renderToolCallCollapsed(tc ToolCallRecord, width int, th *theme.Theme, grad *theme.Gradient) string {
 	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	toolStyle := lipgloss.NewStyle().Foreground(th.Palette.Info).Bold(true)
-	iconStyle := lipgloss.NewStyle().Foreground(th.Palette.Info)
+
+	// Select colors: gradient shimmer for active, static for completed.
+	activeColor := activeToolColor(tc, th, grad)
+	toolStyle := lipgloss.NewStyle().Foreground(activeColor).Bold(true)
+	iconStyle := lipgloss.NewStyle().Foreground(activeColor)
 
 	var b strings.Builder
 
@@ -79,15 +94,20 @@ func renderToolCallCollapsed(tc ToolCallRecord, width int, th *theme.Theme) stri
 	// Tool name.
 	b.WriteString(toolStyle.Render(tc.ToolName))
 
-	// Args summary.
+	// Args summary — gradient for active, muted for completed.
 	if tc.ArgsSummary != "" {
 		b.WriteByte(' ')
-		b.WriteString(mutedStyle.Render(tc.ArgsSummary))
+		if !tc.Completed && grad != nil {
+			argsStyle := lipgloss.NewStyle().Foreground(activeColor)
+			b.WriteString(argsStyle.Render(tc.ArgsSummary))
+		} else {
+			b.WriteString(mutedStyle.Render(tc.ArgsSummary))
+		}
 	}
 
 	// Right-aligned: status indicator + duration.
 	dur := formatToolCallDuration(tc)
-	statusStr := formatToolCallStatus(tc, th)
+	statusStr := formatToolCallStatus(tc, th, grad)
 	rightPart := statusStr + dur
 
 	leftWidth := lipgloss.Width(b.String())
@@ -104,11 +124,14 @@ func renderToolCallCollapsed(tc ToolCallRecord, width int, th *theme.Theme) stri
 }
 
 // renderToolCallExpanded renders the expanded detail block.
-func renderToolCallExpanded(tc ToolCallRecord, width int, th *theme.Theme) []string {
+// Active calls use gradient-sampled colors for the header; completed calls use static styles.
+func renderToolCallExpanded(tc ToolCallRecord, width int, th *theme.Theme, grad *theme.Gradient) []string {
 	mutedStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	toolStyle := lipgloss.NewStyle().Foreground(th.Palette.Info).Bold(true)
-	iconStyle := lipgloss.NewStyle().Foreground(th.Palette.Info)
 	errStyle := lipgloss.NewStyle().Foreground(th.Palette.Error)
+
+	activeColor := activeToolColor(tc, th, grad)
+	toolStyle := lipgloss.NewStyle().Foreground(activeColor).Bold(true)
+	iconStyle := lipgloss.NewStyle().Foreground(activeColor)
 
 	lines := make([]string, 0, 8)
 
@@ -121,11 +144,16 @@ func renderToolCallExpanded(tc ToolCallRecord, width int, th *theme.Theme) []str
 	header.WriteString(toolStyle.Render(tc.ToolName))
 	if tc.ArgsSummary != "" {
 		header.WriteByte(' ')
-		header.WriteString(mutedStyle.Render(tc.ArgsSummary))
+		if !tc.Completed && grad != nil {
+			argsStyle := lipgloss.NewStyle().Foreground(activeColor)
+			header.WriteString(argsStyle.Render(tc.ArgsSummary))
+		} else {
+			header.WriteString(mutedStyle.Render(tc.ArgsSummary))
+		}
 	}
 
 	dur := formatToolCallDuration(tc)
-	statusStr := formatToolCallStatus(tc, th)
+	statusStr := formatToolCallStatus(tc, th, grad)
 	rightPart := statusStr + dur
 	leftWidth := lipgloss.Width(header.String())
 	rightWidth := lipgloss.Width(rightPart)
@@ -179,28 +207,71 @@ func formatToolCallDuration(tc ToolCallRecord) string {
 	return formatToolDuration(tc.Duration)
 }
 
-// formatToolCallStatus returns the status indicator (spinner or error icon).
-func formatToolCallStatus(tc ToolCallRecord, th *theme.Theme) string {
+// blockedSubstrings are error message fragments that indicate a tool call was
+// blocked for security or OS-level reasons rather than a runtime failure.
+var blockedSubstrings = [...]string{
+	"permission denied",
+	"access denied",
+	"forbidden",
+	"not permitted",
+	"blocked",
+	"quarantine",
+	"security",
+}
+
+// isBlockedError reports whether the error message indicates a security or
+// OS-level block rather than a runtime failure.
+func isBlockedError(errMsg string) bool {
+	lower := strings.ToLower(errMsg)
+	for _, sub := range blockedSubstrings {
+		if strings.Contains(lower, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// activeToolColor returns the gradient-sampled color for an active tool call,
+// or the static Info color for completed calls.
+func activeToolColor(tc ToolCallRecord, th *theme.Theme, grad *theme.Gradient) lipgloss.Color {
+	if !tc.Completed && grad != nil {
+		return grad.Sample(time.Since(tc.StartedAt))
+	}
+	return th.Palette.Info
+}
+
+// formatToolCallStatus returns the status indicator (spinner, error, or blocked icon).
+// Active calls color the spinner with the gradient; completed calls use static styles.
+func formatToolCallStatus(tc ToolCallRecord, th *theme.Theme, grad *theme.Gradient) string {
 	if !tc.Completed {
-		spinStyle := lipgloss.NewStyle().Foreground(th.Palette.Info)
+		color := activeToolColor(tc, th, grad)
+		spinStyle := lipgloss.NewStyle().Foreground(color)
 		return spinStyle.Render(toolCallSpinnerFrames[toolCallSpinnerIndex]) + " "
 	}
 	if !tc.Success {
 		errStyle := lipgloss.NewStyle().Foreground(th.Palette.Error)
-		return errStyle.Render(theme.IconToolCallError) + " "
+		icon := theme.IconToolCallError
+		if isBlockedError(tc.ErrorMsg) {
+			icon = theme.IconToolCallBlocked
+		}
+		return errStyle.Render(icon) + " "
 	}
 	return ""
 }
 
 // formatToolDuration formats a duration as a compact string.
-// Examples: "0.3s", "1.2s", "12.4s", "1m03s".
+// Examples: "3ms", "120ms", "1.2s", "12.4s", "1m03s".
 func formatToolDuration(d time.Duration) string {
-	if d < time.Minute {
+	switch {
+	case d < 100*time.Millisecond:
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	case d < time.Minute:
 		return fmt.Sprintf("%.1fs", d.Seconds())
+	default:
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm%02ds", mins, secs)
 	}
-	mins := int(d.Minutes())
-	secs := int(d.Seconds()) % 60
-	return fmt.Sprintf("%dm%02ds", mins, secs)
 }
 
 // formatToolArgs formats JSON args as indented key-value lines for expanded view.

@@ -18,6 +18,7 @@ import (
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -60,6 +61,7 @@ type Librarian struct {
 	// Skills system
 	skills        *skills.Registry
 	skillLoader   *skills.Loader
+	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
 	// Activity publisher for UI agent-panel updates.
@@ -69,14 +71,14 @@ type Librarian struct {
 	knowledgeStore *knowledge.KnowledgeStore
 
 	// Event bus integration
-	bus           guide.EventBus
-	channels      *guide.AgentChannels
-	requestSub    guide.Subscription
-	responseSub   guide.Subscription
-	registrySub   guide.Subscription
-	knowledgeSub  guide.Subscription
-	running       bool
-	knownAgents map[string]*guide.AgentAnnouncement
+	bus          guide.EventBus
+	channels     *guide.AgentChannels
+	requestSub   guide.Subscription
+	responseSub  guide.Subscription
+	registrySub  guide.Subscription
+	knowledgeSub guide.Subscription
+	running      bool
+	knownAgents  map[string]*guide.AgentAnnouncement
 
 	// Request-scoped context lifecycle (mirrors academic pattern).
 	runCtx         context.Context
@@ -111,12 +113,12 @@ type Config struct {
 	ID string
 
 	// LLM configuration
-	EnableLLM         bool   // Enable LLM-driven conversation
-	Model             string // LLM model ID (default: gemini-3.1-pro-preview)
-	AnthropicAPIKey   string // Anthropic API key
-	MaxToolRuns       int    // Maximum tool loop iterations (default: 12)
-	MaxTokens         int    // Maximum output tokens for LLM (default: 8192)
-	WorkingDirectory  string // Root directory for file operations
+	EnableLLM        bool   // Enable LLM-driven conversation
+	Model            string // LLM model ID (default: gemini-3.1-pro-preview)
+	AnthropicAPIKey  string // Anthropic API key
+	MaxToolRuns      int    // Maximum tool loop iterations (default: 12)
+	MaxTokens        int    // Maximum output tokens for LLM (default: 8192)
+	WorkingDirectory string // Root directory for file operations
 
 	// System prompt configuration
 	SystemPrompt    string // Optional, uses DefaultSystemPrompt if empty
@@ -178,7 +180,9 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 	l.cloneStore = NewCloneStore(cfg.WorkingDirectory)
 
 	l.steering.InitLazy("librarian", cfg.ActivityPub)
-	l.initSkills()
+	if err := l.initSkills(); err != nil {
+		return nil, err
+	}
 
 	return l, nil
 }
@@ -212,7 +216,7 @@ func applyConfigDefaults(cfg Config) Config {
 	return cfg
 }
 
-func (l *Librarian) initSkills() {
+func (l *Librarian) initSkills() error {
 	l.skills = skills.NewRegistry()
 
 	// Register skills BEFORE creating the loader. NewLoader calls
@@ -223,16 +227,29 @@ func (l *Librarian) initSkills() {
 	l.registerCoreSkills()
 
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"search_codebase", "find_pattern",
-		"read_file", "glob", "grep",
-	}
+	loaderCfg.CoreSkills = librarianVisibleSkillNames()
 	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	l.skillLoader = skills.NewLoader(l.skills, loaderCfg)
+
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: l.skills,
+		Manifest: librarianToolManifest(l.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize librarian tool runtime: %w", err)
+	}
+	l.tools = tools
+	l.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 // Close closes the librarian and its resources.
 func (l *Librarian) Close() error {
+	if l.tools != nil {
+		l.tools.Close()
+		l.tools = nil
+	}
 	l.Stop()
 	if l.cloneStore != nil {
 		l.cloneStore.Close()
@@ -496,9 +513,17 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		AgentID:     l.id,
 		SessionID:   fwd.SessionID,
 	})
-	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
-		l.config.Model, l.config.MaxTokens, 0,
-	))
+	gov := shared.NewContextGovernor(l.config.Model, l.config.MaxTokens, 0)
+	if l.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return l.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = shared.WithContextGovernor(ctx, gov)
+	ctx = shared.WithProgressPublisher(ctx, &shared.ProgressPublisher{
+		Bus: l.bus, Channels: l.channels,
+		AgentID: l.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	result, err := l.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(l.steering.EventLogger(), fwd.CorrelationID, l.id, fwd.SessionID, time.Since(startTime), err)
@@ -798,7 +823,7 @@ func (l *Librarian) Skills() *skills.Registry {
 
 // GetToolDefinitions returns tool definitions for all loaded skills.
 func (l *Librarian) GetToolDefinitions() []map[string]any {
-	return l.skills.GetToolDefinitions()
+	return shared.ProviderToolsToDefinitions(l.buildToolDefinitions())
 }
 
 // =============================================================================
@@ -825,11 +850,14 @@ func (l *Librarian) AgentType() string {
 
 // Descriptor returns the immutable metadata describing this agent type.
 func (l *Librarian) Descriptor() handoff.AgentDescriptor {
+	modelID := l.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:     "librarian",
-		ModelID:       l.CurrentModel(),
-		ContextWindow: 200000,
-		Category:      handoff.CategoryKnowledge,
+		AgentType:             "librarian",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryKnowledge,
+		RuntimeProfiles:       librarianRuntimeProfiles(),
+		DefaultRuntimeProfile: librarianDefaultRuntimeProfile(),
 	}
 }
 

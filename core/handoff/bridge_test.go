@@ -2,6 +2,7 @@ package handoff
 
 import (
 	"context"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -321,7 +322,7 @@ func TestBridgeConfigForAgent_Standalone(t *testing.T) {
 
 	cfg := BridgeConfigForAgent(desc)
 
-	if cfg.Descriptor != desc {
+	if !reflect.DeepEqual(cfg.Descriptor, desc) {
 		t.Error("descriptor mismatch")
 	}
 	if cfg.EvictionConfig != nil {

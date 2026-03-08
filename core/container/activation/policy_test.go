@@ -4,6 +4,8 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/container/pod"
 )
 
 func TestDefaultPolicy(t *testing.T) {
@@ -89,8 +91,8 @@ func TestTier_String(t *testing.T) {
 		TierHot:  "hot",
 	}
 	for tier, expected := range tests {
-		if tier.String() != expected {
-			t.Fatalf("expected %q, got %q", expected, tier.String())
+		if got := pod.TierString(tier); got != expected {
+			t.Fatalf("expected %q, got %q", expected, got)
 		}
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/agents/librarian"
 	globaltester "github.com/adalundhe/sylk/agents/tester/global"
 	"github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -69,7 +70,7 @@ func TestAllAgentsRegisterWithGuide(t *testing.T) {
 		{
 			name: "archivalist",
 			createAgent: func() (guide.AgentRouter, error) {
-				return archivalist.New(archivalist.Config{})
+				return archivalist.New(context.Background(), archivalist.Config{})
 			},
 			expectedID: "archivalist",
 		},
@@ -145,7 +146,7 @@ func TestAllAgentsRegisterWithGuide(t *testing.T) {
 
 	// Test Academic separately since it uses Registration() instead of GetRoutingInfo()
 	t.Run("academic", func(t *testing.T) {
-		acad, err := academic.New(academic.Config{})
+		acad, err := academic.New(academic.Config{}, nil)
 		require.NoError(t, err, "failed to create academic agent")
 
 		registration := acad.Registration()
@@ -261,6 +262,27 @@ func TestAgentRegistrationPublishesAnnouncement(t *testing.T) {
 	}
 }
 
+type mockStreamingProvider struct{}
+
+func (m *mockStreamingProvider) Name() string { return "mock-streaming" }
+func (m *mockStreamingProvider) SupportedModels() []providers.ModelInfo {
+	return nil
+}
+func (m *mockStreamingProvider) Complete(context.Context, *providers.Request) (*providers.Response, error) {
+	return &providers.Response{}, nil
+}
+func (m *mockStreamingProvider) Stream(context.Context, *providers.Request) (<-chan *providers.StreamChunk, error) {
+	ch := make(chan *providers.StreamChunk)
+	close(ch)
+	return ch, nil
+}
+func (m *mockStreamingProvider) StreamWithHandler(context.Context, *providers.Request, providers.StreamHandler) error {
+	return nil
+}
+func (m *mockStreamingProvider) CountTokens([]providers.Message) (int, error) { return 0, nil }
+func (m *mockStreamingProvider) MaxContextTokens(string) int                  { return 0 }
+func (m *mockStreamingProvider) HealthCheck(context.Context) error            { return nil }
+
 func TestEventBusSubscriptions(t *testing.T) {
 	t.Skip("Skipping due to Guide shutdown deadlock - see guide.go:903")
 
@@ -300,7 +322,7 @@ func TestEventBusSubscriptions(t *testing.T) {
 		{
 			name: "academic_receives_requests",
 			startAgent: func(bus guide.EventBus) error {
-				acad, err := academic.New(academic.Config{})
+				acad, err := academic.New(academic.Config{}, nil)
 				if err != nil {
 					return err
 				}
@@ -312,7 +334,7 @@ func TestEventBusSubscriptions(t *testing.T) {
 		{
 			name: "archivalist_receives_requests",
 			startAgent: func(bus guide.EventBus) error {
-				arch, err := archivalist.New(archivalist.Config{})
+				arch, err := archivalist.New(context.Background(), archivalist.Config{})
 				if err != nil {
 					return err
 				}
@@ -360,7 +382,7 @@ func TestMultipleAgentRegistration(t *testing.T) {
 			return librarian.New(librarian.Config{SearchSystem: &mockSearchSystem{}})
 		},
 		func() (guide.AgentRouter, error) {
-			return archivalist.New(archivalist.Config{})
+			return archivalist.New(context.Background(), archivalist.Config{})
 		},
 		func() (guide.AgentRouter, error) {
 			return architect.New(context.Background(), architect.Config{})
@@ -498,7 +520,7 @@ func TestRoutingInfoCapabilities(t *testing.T) {
 		{
 			name: "inspector_capabilities",
 			createAgent: func() (guide.AgentRouter, error) {
-				return inspGlobal.New(inspShared.GlobalInspectorConfig{}, nil)
+				return inspGlobal.New(inspShared.GlobalInspectorConfig{}, &mockStreamingProvider{})
 			},
 			expectedIntents:  []guide.Intent{guide.IntentCheck},
 			expectedDomains:  []guide.Domain{guide.DomainCode},

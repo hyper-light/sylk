@@ -82,6 +82,23 @@ func (p Palette) PipelineGradient() *Gradient {
 	}, gradientCycleDuration)
 }
 
+// toolCallCycleDuration is a tighter cycle for the tool call execution shimmer.
+// 3 seconds produces visible motion that reads as "processing" rather than "thinking".
+const toolCallCycleDuration = 3 * time.Second
+
+// ToolCallGradient returns a cool-spectrum gradient for active tool call
+// visualization. Teal → sapphire → lavender → primary produces a mechanical,
+// "executing" feel distinct from the warm spectral ThinkingGradient.
+func (p Palette) ToolCallGradient() *Gradient {
+	return NewGradient([]lipgloss.Color{
+		p.Teal,     // teal ~170°
+		p.Sapphire, // sapphire ~200°
+		p.Lavender, // lavender ~230°
+		p.Primary,  // blue ~220°
+		p.Sapphire, // return through sapphire for smooth wrap
+	}, toolCallCycleDuration)
+}
+
 // Duration returns the cycle duration of the gradient.
 func (g *Gradient) Duration() time.Duration {
 	return g.duration

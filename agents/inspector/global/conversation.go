@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -86,10 +87,14 @@ func (gi *GlobalInspector) executeConversationStream(
 
 	var text strings.Builder
 	var thoughts strings.Builder
+	allowThoughts := false
+	if llmruntime.EmitsThoughts(req) {
+		allowThoughts = true
+	}
 
 	p := gi.getProvider()
 	err := p.StreamWithHandler(llmCtx, req, func(chunk *providers.StreamChunk) error {
-		return gi.handleConversationChunk(ctx, chunk, &text, &thoughts)
+		return gi.handleConversationChunk(ctx, chunk, &text, &thoughts, allowThoughts)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("inspector conversation stream: %w", err)
@@ -113,6 +118,7 @@ func (gi *GlobalInspector) handleConversationChunk(
 	chunk *providers.StreamChunk,
 	text *strings.Builder,
 	thoughts *strings.Builder,
+	allowThoughts bool,
 ) error {
 	switch chunk.Type {
 	case providers.ChunkTypeStart:
@@ -125,10 +131,12 @@ func (gi *GlobalInspector) handleConversationChunk(
 		text.WriteString(chunk.Text)
 		shared.PublishStreamChunk(gi.bus, gi.channels, ctx, "inspector", chunk.Text)
 	case providers.ChunkTypeThought:
-		thoughts.WriteString(chunk.Text)
-		thought := strings.TrimSpace(thoughts.String())
-		if thought != "" {
-			gi.publishThoughtProgress(ctx, thought)
+		if allowThoughts {
+			thoughts.WriteString(chunk.Text)
+			thought := strings.TrimSpace(thoughts.String())
+			if thought != "" {
+				gi.publishThoughtProgress(ctx, thought)
+			}
 		}
 	case providers.ChunkTypeEnd:
 		if chunk.Usage != nil {

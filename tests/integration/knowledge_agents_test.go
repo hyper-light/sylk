@@ -38,8 +38,8 @@ func TestLibrarianSearchFunctionality(t *testing.T) {
 	assert.True(t, lib.IsRunning())
 	assert.NotNil(t, lib.Bus())
 	assert.NotNil(t, lib.Channels())
-	assert.Equal(t, guide.TopicRequests("librarian", "librarian"), lib.Channels().Requests)
-	assert.Equal(t, guide.TopicResponses("librarian", "librarian"), lib.Channels().Responses)
+	assert.Equal(t, guide.TopicRequests("librarian", lib.AgentID()), lib.Channels().Requests)
+	assert.Equal(t, guide.TopicResponses("librarian", lib.AgentID()), lib.Channels().Responses)
 }
 
 type mockSearchSystemWithData struct {
@@ -90,7 +90,7 @@ func TestLibrarianStartStop(t *testing.T) {
 }
 
 func TestAcademicRegistration(t *testing.T) {
-	acad, err := academic.New(academic.Config{})
+	acad, err := academic.New(academic.Config{}, nil)
 	require.NoError(t, err)
 
 	reg := acad.Registration()
@@ -116,7 +116,7 @@ func TestAcademicStartStop(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	acad, err := academic.New(academic.Config{})
+	acad, err := academic.New(academic.Config{}, nil)
 	require.NoError(t, err)
 
 	assert.False(t, acad.IsRunning())
@@ -137,7 +137,7 @@ func TestArchivalistStartStop(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
-	arch, err := archivalist.New(archivalist.Config{})
+	arch, err := archivalist.New(context.Background(), archivalist.Config{})
 	require.NoError(t, err)
 
 	assert.False(t, arch.IsRunning())
@@ -155,7 +155,7 @@ func TestArchivalistStartStop(t *testing.T) {
 }
 
 func TestArchivalistRoutingInfo(t *testing.T) {
-	arch, err := archivalist.New(archivalist.Config{})
+	arch, err := archivalist.New(context.Background(), archivalist.Config{})
 	require.NoError(t, err)
 
 	routingInfo := arch.GetRoutingInfo()
@@ -181,10 +181,10 @@ func TestKnowledgeAgentsConcurrentStart(t *testing.T) {
 	lib, err := librarian.New(librarian.Config{SearchSystem: &mockSearchSystem{}})
 	require.NoError(t, err)
 
-	acad, err := academic.New(academic.Config{})
+	acad, err := academic.New(academic.Config{}, nil)
 	require.NoError(t, err)
 
-	arch, err := archivalist.New(archivalist.Config{})
+	arch, err := archivalist.New(context.Background(), archivalist.Config{})
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -293,53 +293,54 @@ func TestKnowledgeAgentsEventBusSubscriptions(t *testing.T) {
 	defer bus.Close()
 
 	tests := []struct {
-		name    string
-		agentID string
-		start   func() error
-		stop    func() error
+		name  string
+		start func() (string, string, error)
 	}{
 		{
-			name:    "librarian",
-			agentID: "librarian",
-			start: func() error {
+			name: "librarian",
+			start: func() (string, string, error) {
 				lib, err := librarian.New(librarian.Config{SearchSystem: &mockSearchSystem{}})
 				if err != nil {
-					return err
+					return "", "", err
 				}
-				return lib.Start(bus)
+				if err := lib.Start(bus); err != nil {
+					return "", "", err
+				}
+				return lib.Channels().Requests, lib.Channels().Responses, nil
 			},
 		},
 		{
-			name:    "academic",
-			agentID: "academic",
-			start: func() error {
-				acad, err := academic.New(academic.Config{})
+			name: "academic",
+			start: func() (string, string, error) {
+				acad, err := academic.New(academic.Config{}, nil)
 				if err != nil {
-					return err
+					return "", "", err
 				}
-				return acad.Start(bus)
+				if err := acad.Start(bus); err != nil {
+					return "", "", err
+				}
+				return acad.Channels().Requests, acad.Channels().Responses, nil
 			},
 		},
 		{
-			name:    "archivalist",
-			agentID: "archivalist",
-			start: func() error {
-				arch, err := archivalist.New(archivalist.Config{})
+			name: "archivalist",
+			start: func() (string, string, error) {
+				arch, err := archivalist.New(context.Background(), archivalist.Config{})
 				if err != nil {
-					return err
+					return "", "", err
 				}
-				return arch.Start(bus)
+				if err := arch.Start(bus); err != nil {
+					return "", "", err
+				}
+				return arch.Channels().Requests, arch.Channels().Responses, nil
 			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.start()
+			requestTopic, responseTopic, err := tc.start()
 			require.NoError(t, err)
-
-			requestTopic := guide.AgentTopic(tc.agentID, tc.agentID, guide.ChannelTypeRequests)
-			responseTopic := guide.AgentTopic(tc.agentID, tc.agentID, guide.ChannelTypeResponses)
 
 			reqCount := bus.TopicSubscriberCount(requestTopic)
 			assert.Greater(t, reqCount, 0, "should have request subscription")
@@ -357,7 +358,7 @@ func TestLibrarianRoutingInfo(t *testing.T) {
 	routingInfo := lib.GetRoutingInfo()
 	require.NotNil(t, routingInfo)
 
-	assert.Equal(t, "librarian", routingInfo.ID)
+	assert.Equal(t, lib.AgentID(), routingInfo.ID)
 	assert.Equal(t, "librarian", routingInfo.Name)
 
 	require.NotNil(t, routingInfo.Registration)

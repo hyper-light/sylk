@@ -22,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -49,9 +50,11 @@ type PipelineInspector struct {
 	toolRunner *shared.ToolRunner
 
 	// Skills.
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	hooks       *skills.HookRegistry
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
+	tools         *toolruntime.Runtime
+	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
 	bus         guide.EventBus
@@ -67,9 +70,11 @@ type PipelineInspector struct {
 	pendingBus map[string]chan *guide.Message
 
 	// State.
-	criteria map[string]*shared.InspectorCriteria
-	state    *shared.InspectorState
-	mu       sync.RWMutex
+	criteria  map[string]*shared.InspectorCriteria
+	taskFiles map[string][]string
+	results   map[string]*shared.InspectorResult
+	state     *shared.InspectorState
+	mu        sync.RWMutex
 
 	// Worker type for design-aware prompt selection.
 	workerType string
@@ -107,6 +112,8 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingBus:        make(map[string]chan *guide.Message),
 		criteria:          make(map[string]*shared.InspectorCriteria),
+		taskFiles:         make(map[string][]string),
+		results:           make(map[string]*shared.InspectorResult),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
 	}
@@ -114,7 +121,9 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 	pi.steering.InitLazy("inspector-pipeline", nil)
 
 	pi.initState()
-	pi.initSkills()
+	if err := pi.initSkills(); err != nil {
+		return nil, err
+	}
 	return pi, nil
 }
 
@@ -147,21 +156,29 @@ func (pi *PipelineInspector) initState() {
 	}
 }
 
-func (pi *PipelineInspector) initSkills() {
+func (pi *PipelineInspector) initSkills() error {
 	pi.skills = skills.NewRegistry()
 	pi.hooks = skills.NewHookRegistry()
 
-	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"run_linter", "run_type_checker", "run_security_scan",
-		"read_file", "glob", "grep",
-		"define_criteria", "validate_criteria",
-	}
-	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
-	pi.skillLoader = skills.NewLoader(pi.skills, loaderCfg)
-
 	pi.registerCoreSkills()
 	pi.registerSafetyHook()
+
+	loaderCfg := skills.DefaultLoaderConfig()
+	loaderCfg.CoreSkills = pipelineInspectorVisibleSkillNames()
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
+	pi.skillLoader = skills.NewLoader(pi.skills, loaderCfg)
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: pi.skills,
+		Hooks:    pi.hooks,
+		Manifest: pipelineInspectorToolManifest(pi.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize pipeline inspector tool runtime: %w", err)
+	}
+	pi.tools = tools
+	pi.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 func (pi *PipelineInspector) registerSafetyHook() {
@@ -175,7 +192,8 @@ func (pi *PipelineInspector) registerSafetyHook() {
 		"request_override": true, "get_validation_status": true,
 		"validate_token_usage": true, "validate_accessibility": true,
 		"validate_component_api": true, "validate_design_consistency": true,
-		"reroute": true,
+		"reroute_request": true,
+		"self_diagnostic": true,
 	}
 	pi.hooks.RegisterPreToolCallHook("inspector_pipeline_safety", skills.HookPriorityHigh,
 		func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
@@ -241,6 +259,10 @@ func (pi *PipelineInspector) SetWorkerType(wt string) {
 
 // Close shuts down the pipeline inspector.
 func (pi *PipelineInspector) Close() error {
+	if pi.tools != nil {
+		pi.tools.Close()
+		pi.tools = nil
+	}
 	return pi.Stop()
 }
 
@@ -378,6 +400,35 @@ func composePipelineUserMessage(task *pipelineTaskFields) string {
 	b.WriteString(coalesce(task.Prompt, "No task description provided."))
 	b.WriteString("\n\n")
 
+	if files := affectedPathsFromTask(task); len(files) > 0 {
+		b.WriteString("### Affected Files\n\n")
+		for _, file := range files {
+			fmt.Fprintf(&b, "- %s\n", file)
+		}
+		b.WriteString("\n")
+	}
+	if successCriteria := decodeStringList(task.Context, "success_criteria"); len(successCriteria) > 0 {
+		b.WriteString("### Success Criteria\n\n")
+		for _, item := range successCriteria {
+			fmt.Fprintf(&b, "- %s\n", item)
+		}
+		b.WriteString("\n")
+	}
+	if testRequirements := decodeStringList(task.Context, "test_requirements"); len(testRequirements) > 0 {
+		b.WriteString("### Test Requirements\n\n")
+		for _, item := range testRequirements {
+			fmt.Fprintf(&b, "- %s\n", item)
+		}
+		b.WriteString("\n")
+	}
+	if riskFactors := decodeStringList(task.Context, "risk_factors"); len(riskFactors) > 0 {
+		b.WriteString("### Risk Factors\n\n")
+		for _, item := range riskFactors {
+			fmt.Fprintf(&b, "- %s\n", item)
+		}
+		b.WriteString("\n")
+	}
+
 	b.WriteString(formatParentResults(task.ParentResults))
 	b.WriteString(stageInstructions(stage))
 
@@ -475,6 +526,8 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	// Build user message: structured for pipeline tasks, raw for conversation.
 	userMessage := fwd.Input
 	if task != nil {
+		pi.SetWorkerType(task.AgentType)
+		pi.seedCriteriaFromTask(task)
 		userMessage = composePipelineUserMessage(task)
 	}
 	pi.prepareSkillsForInput(userMessage)
@@ -499,7 +552,10 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	// Prepend conversation history as multi-turn message pairs.
 	agentShared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
-	result, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
+	ledger := agentShared.SteeringLedgerFromContext(ctx)
+	result, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return pi.executeToolLoop(ctx, req, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("pipeline inspector tool loop: %w", err)
 	}
@@ -563,9 +619,17 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 
 	toolEmitter := agentShared.NewToolCallEmitter(pi.bus, pi.channels, pi.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
-	ctx = agentShared.WithContextGovernor(ctx, agentShared.NewContextGovernor(
-		pi.config.Model, pi.config.MaxTokens, 0,
-	))
+	gov := agentShared.NewContextGovernor(pi.config.Model, pi.config.MaxTokens, 0)
+	if pi.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return pi.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = agentShared.WithContextGovernor(ctx, gov)
+	ctx = agentShared.WithProgressPublisher(ctx, &agentShared.ProgressPublisher{
+		Bus: pi.bus, Channels: pi.channels,
+		AgentID: pi.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(pi.bus, pi.channels, ctx, "inspector-pipeline")
@@ -654,7 +718,13 @@ func (pi *PipelineInspector) getState() *shared.InspectorState {
 func (pi *PipelineInspector) getCurrentIssues() []shared.ValidationIssue {
 	pi.mu.RLock()
 	defer pi.mu.RUnlock()
-	return nil // issues tracked per-request in tool loop
+	if pi.state == nil || pi.state.CurrentTaskID == "" {
+		return nil
+	}
+	if result := pi.results[pi.state.CurrentTaskID]; result != nil {
+		return result.Issues
+	}
+	return nil
 }
 
 func (pi *PipelineInspector) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
@@ -711,8 +781,10 @@ func (pi *PipelineInspector) GetRoutingInfo() *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.6,
 			},
-			Description: "Pipeline quality inspector. Validates individual task output with LLM-driven analysis tools and TDD criteria.",
-			Priority:    70,
+			Description:           "Pipeline quality inspector. Validates individual task output with LLM-driven analysis tools and TDD criteria.",
+			Priority:              70,
+			RuntimeProfiles:       pipelineInspectorRuntimeProfiles(),
+			DefaultRuntimeProfile: pipelineInspectorDefaultRuntimeProfile(),
 		},
 	}
 }
@@ -744,6 +816,20 @@ func (pi *PipelineInspector) DefineCriteria(taskID string, criteria *shared.Insp
 	}
 }
 
+func (pi *PipelineInspector) storeValidationResult(result *shared.InspectorResult) {
+	if result == nil {
+		return
+	}
+	pi.mu.Lock()
+	pi.results[result.TaskID] = result
+	if pi.state != nil {
+		pi.state.CurrentTaskID = result.TaskID
+		pi.state.LastActiveAt = time.Now()
+		pi.state.IssuesFound += len(result.Issues)
+	}
+	pi.mu.Unlock()
+}
+
 // ValidateAgainstCriteria validates files against stored criteria (TDD Phase 4).
 // Uses the LLM tool loop when a provider is available; falls back to a basic
 // passing result otherwise.
@@ -751,76 +837,39 @@ func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID
 	pi.mu.RLock()
 	criteria := pi.criteria[taskID]
 	pi.mu.RUnlock()
+	if criteria == nil {
+		return nil, fmt.Errorf("no criteria defined for task %s", taskID)
+	}
 
 	now := time.Now()
-
-	if pi.getProvider() == nil {
-		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
-				lm.AgentID, lm.SessionID, lm.CorrID, "warn",
-				&agentlog.ValidationPayload{Phase: "stub_pass", TaskID: taskID, Success: true})
-		}
-		result := &shared.InspectorResult{
-			TaskID:             taskID,
-			Mode:               "pipeline",
-			Passed:             true,
-			Issues:             []shared.ValidationIssue{},
-			CriteriaMet:        criteriaIDs(criteria),
-			CriteriaFailed:     []string{},
-			QualityGateResults: gateResults(criteria),
-			FeedbackHistory:    []shared.InspectorFeedback{},
-			StartedAt:          now,
-			CompletedAt:        time.Now(),
-			LoopCount:          1,
-		}
-		return result, nil
-	}
-
-	pi.mu.RLock()
-	model := pi.config.Model
-	maxTokens := pi.config.MaxTokens
-	pi.mu.RUnlock()
-
-	prompt := buildValidationPrompt(taskID, files, criteria, workerType)
-	systemPrompt := shared.PipelineInspectorSystemPromptForDomain(
-		shared.ValidationDomainFromWorkerType(workerType),
-	)
-	pi.prepareSkillsForInput(prompt)
-	req := &providers.Request{
-		SystemPrompt: systemPrompt,
-		Messages:     []providers.Message{{Role: providers.RoleUser, Content: prompt}},
-		Model:        model,
-		MaxTokens:    maxTokens,
-		Tools:        pi.buildToolDefinitions(),
-	}
-	pi.applyLLMRuntimeProfile(req, "validation")
-
-	_, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
+	eval, err := pi.runDeterministicValidation(ctx, files, workerType, criteria)
 	if err != nil {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 				lm.AgentID, lm.SessionID, lm.CorrID, "error",
-				&agentlog.ErrorPayload{Error: fmt.Sprintf("validation tool loop: %v", err)})
+				&agentlog.ErrorPayload{Error: fmt.Sprintf("deterministic validation failed: %v", err)})
 		}
-		return nil, fmt.Errorf("validation tool loop: %w", err)
+		return nil, err
 	}
 
 	result := &shared.InspectorResult{
 		TaskID:             taskID,
 		Mode:               "pipeline",
-		Passed:             true,
-		Issues:             []shared.ValidationIssue{},
-		CriteriaMet:        criteriaIDs(criteria),
-		CriteriaFailed:     []string{},
-		QualityGateResults: gateResults(criteria),
+		Passed:             !shared.HasBlockingIssues(eval.Issues) && len(eval.CriteriaFailed) == 0,
+		Issues:             eval.Issues,
+		CriteriaMet:        eval.CriteriaMet,
+		CriteriaFailed:     eval.CriteriaFailed,
+		QualityGateResults: eval.QualityGateResults,
+		FeedbackHistory:    []shared.InspectorFeedback{},
 		StartedAt:          now,
 		CompletedAt:        time.Now(),
 		LoopCount:          1,
 	}
+	pi.storeValidationResult(result)
 	if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 		agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
 			lm.AgentID, lm.SessionID, lm.CorrID, "info",
-			&agentlog.ValidationPayload{Phase: "validated", TaskID: taskID, Success: true})
+			&agentlog.ValidationPayload{Phase: "validated", TaskID: taskID, Success: result.Passed})
 	}
 	return result, nil
 }
@@ -896,11 +945,14 @@ func (pi *PipelineInspector) AgentID() string   { return pi.id }
 func (pi *PipelineInspector) AgentType() string { return "inspector-pipeline" }
 
 func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
+	modelID := pi.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:     "inspector-pipeline",
-		ModelID:       pi.CurrentModel(),
-		ContextWindow: 200_000,
-		Category:      handoff.CategoryPipeline,
+		AgentType:             "inspector-pipeline",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryPipeline,
+		RuntimeProfiles:       pipelineInspectorRuntimeProfiles(),
+		DefaultRuntimeProfile: pipelineInspectorDefaultRuntimeProfile(),
 	}
 }
 

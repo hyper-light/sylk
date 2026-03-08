@@ -151,16 +151,16 @@ func TestContextGovernorIntegration(t *testing.T) {
 
 	for turn := range maxRuns {
 		zone := gov.BeginTurn(ctx, turn, maxRuns, req)
+		if hasCompactedToolResult(req.Messages) {
+			compactionTriggered = true
+		}
 		if zone == ZoneCritical {
 			// This is acceptable — we've exhausted the budget.
 			break
 		}
-		if zone >= ZoneYellow {
-			compactionTriggered = true
-		}
 
 		// Simulate LLM response with tool call.
-		toolCallContent := "assistant turn " + makeString(100)
+		toolCallContent := "assistant turn " + makeString(500)
 		req.Messages = append(req.Messages, providers.Message{
 			Role:      providers.RoleAssistant,
 			Content:   toolCallContent,
@@ -168,8 +168,9 @@ func TestContextGovernorIntegration(t *testing.T) {
 			ToolCalls: []providers.ToolCall{{ID: "tc" + string(rune('0'+turn)), Name: "exec"}},
 		})
 
-		// Simulate tool result (800 chars ≈ 200 tokens).
-		toolOutput := makeString(800)
+		// Simulate a large tool result that should eventually force compaction
+		// even with a more accurate token counter.
+		toolOutput := makeString(4000)
 		limited := gov.LimitToolOutput(ctx, toolOutput, "exec")
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
@@ -213,8 +214,8 @@ func TestContextGovernorCompactionIntegrity(t *testing.T) {
 			fixedOverhead: 0,
 			counter:       providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig()),
 			compactAt:     0.80,
-			evictAt:       0.90,
-			criticalAt:    0.95,
+			evictAt:       2.00,
+			criticalAt:    3.00,
 		},
 		initialized: true,
 	}
@@ -227,23 +228,31 @@ func TestContextGovernorCompactionIntegrity(t *testing.T) {
 			{Role: providers.RoleAssistant, Content: "t1",
 				ToolCalls: []providers.ToolCall{{ID: "1", Name: "exec"}}},
 			{Role: providers.RoleTool, ToolCallID: "1", ToolName: "exec",
-				Content: makeString(2000)},
+				Content: makeString(2600)},
 			// Turn 2
 			{Role: providers.RoleAssistant, Content: "t2",
 				ToolCalls: []providers.ToolCall{{ID: "2", Name: "exec"}}},
 			{Role: providers.RoleTool, ToolCallID: "2", ToolName: "exec",
-				Content: makeString(2000)},
+				Content: makeString(2600)},
 			// Turn 3
 			{Role: providers.RoleAssistant, Content: "t3",
 				ToolCalls: []providers.ToolCall{{ID: "3", Name: "exec"}}},
 			{Role: providers.RoleTool, ToolCallID: "3", ToolName: "exec",
-				Content: makeString(2000)},
+				Content: makeString(2600)},
 			// Turn 4 (recent, should be preserved)
 			{Role: providers.RoleAssistant, Content: "t4",
 				ToolCalls: []providers.ToolCall{{ID: "4", Name: "exec"}}},
 			{Role: providers.RoleTool, ToolCallID: "4", ToolName: "exec",
 				Content: "recent output"},
 		},
+	}
+	for gov.budget.Zone(req.Messages) < ZoneYellow {
+		req.Messages[2].Content += makeString(100)
+		req.Messages[4].Content += makeString(100)
+		req.Messages[6].Content += makeString(100)
+		if len(req.Messages[2].Content) > 12000 {
+			t.Fatal("failed to construct yellow-zone test fixture")
+		}
 	}
 
 	zone := gov.BeginTurn(context.Background(), 4, 10, req)
@@ -269,6 +278,15 @@ func TestContextGovernorCompactionIntegrity(t *testing.T) {
 	if !anyCompacted {
 		t.Fatal("expected at least one compacted tool result")
 	}
+}
+
+func hasCompactedToolResult(messages []providers.Message) bool {
+	for _, msg := range messages {
+		if msg.Role == providers.RoleTool && strings.HasPrefix(msg.Content, "[") {
+			return true
+		}
+	}
+	return false
 }
 
 func TestErrContextBudgetExhausted(t *testing.T) {

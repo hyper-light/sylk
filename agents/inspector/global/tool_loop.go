@@ -12,9 +12,11 @@ import (
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
@@ -27,6 +29,11 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 	}
 
 	for turn := 0; turn <= gi.config.MaxToolRuns; turn++ {
+		if gi.toolDefsDirty {
+			req.Tools = gi.buildToolDefinitions()
+			gi.toolDefsDirty = false
+		}
+
 		// ── STEERING CHECKPOINT ──
 		sc := agentShared.DrainAndCheckpoint(ledger, req, turn, "inspecting", nil)
 		if sc.Rollback != nil || sc.EditReplay != nil {
@@ -66,8 +73,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 
 		turnStart := time.Now()
-		resp, err := p.Complete(ctx, req)
-		agentShared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
+		resp, err := agentShared.CompleteWithWatchdog(ctx, p, req, agentShared.AgentDisplayName("inspector"))
 		if err != nil {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -93,7 +99,9 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-
+		if err := gi.toolRuntime().ValidateBatch(gi.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
+		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -143,9 +151,15 @@ func (gi *GlobalInspector) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := agentShared.TimedToolCall(ctx, "inspector", call, func() (string, error) {
-			return gi.executeToolCall(ctx, call)
+			execResult, execErr = gi.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			gi.toolDefsDirty = true
+		}
 		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
@@ -184,10 +198,10 @@ func (gi *GlobalInspector) applyToolCalls(
 	return errCount, rerouted
 }
 
-func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
+func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
-		return "", fmt.Errorf("tool name is required")
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -195,18 +209,18 @@ func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.T
 		raw = "{}"
 	}
 	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
-
-	result := gi.skills.Invoke(ctx, name, json.RawMessage(raw))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
+	correlationID := agentShared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = gi.id + "-local"
 	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return shared.MarshalToolOutput(result.Data)
+	return gi.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         gi.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: gi.toolRuntime().CapabilityScope(),
+	})
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -220,7 +234,33 @@ func (gi *GlobalInspector) prepareSkillsForInput(input string) {
 }
 
 func (gi *GlobalInspector) buildToolDefinitions() []providers.Tool {
-	return shared.BuildToolDefinitions(gi.skills.GetLoaded())
+	gi.toolRuntime().SyncActiveFromLoaded()
+	return gi.toolRuntime().BuildToolDefinitions()
+}
+
+func (gi *GlobalInspector) toolRuntime() *toolruntime.Runtime {
+	return gi.tools
+}
+
+func (gi *GlobalInspector) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
+		return nil
+	}
+	correlationID := agentShared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = gi.id + "-local"
+	}
+	scope := gi.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         gi.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
+		})
+	}
+	return invocations
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
@@ -243,6 +283,8 @@ func (gi *GlobalInspector) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,

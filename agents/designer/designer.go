@@ -14,9 +14,9 @@ import (
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -51,6 +51,8 @@ type Designer struct {
 
 	skills      *skills.Registry
 	skillLoader *skills.Loader
+	tools       *toolruntime.Runtime
+	toolDefsDirty bool
 
 	bus         guide.EventBus
 	channels    *guide.AgentChannels
@@ -138,7 +140,9 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 
 	d.steering.InitLazy("designer", nil)
 
-	d.initSkills()
+	if err := d.initSkills(); err != nil {
+		return nil, err
+	}
 
 	return d, nil
 }
@@ -254,18 +258,26 @@ func applyConfigDefaults(cfg Config) Config {
 	return cfg
 }
 
-func (d *Designer) initSkills() {
+func (d *Designer) initSkills() error {
 	d.skills = skills.NewRegistry()
+	d.registerCoreSkills()
 
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"component_search", "component_create", "component_modify",
-		"ask_user_clarification",
-	}
+	loaderCfg.CoreSkills = designerVisibleSkillNames()
 	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	d.skillLoader = skills.NewLoader(d.skills, loaderCfg)
 
-	d.registerCoreSkills()
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: d.skills,
+		Manifest: designerToolManifest(d.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize designer tool runtime: %w", err)
+	}
+	d.tools = tools
+	d.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 func (d *Designer) ID() string {
@@ -273,6 +285,10 @@ func (d *Designer) ID() string {
 }
 
 func (d *Designer) Close() error {
+	if d.tools != nil {
+		d.tools.Close()
+		d.tools = nil
+	}
 	d.Stop()
 	return nil
 }
@@ -441,9 +457,17 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 		AgentID:     d.id,
 		SessionID:   fwd.SessionID,
 	})
-	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
-		d.config.DesignerConfig.Model, d.config.DesignerConfig.MaxTokens, 0,
-	))
+	gov := shared.NewContextGovernor(d.config.DesignerConfig.Model, d.config.DesignerConfig.MaxTokens, 0)
+	if d.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return d.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = shared.WithContextGovernor(ctx, gov)
+	ctx = shared.WithProgressPublisher(ctx, &shared.ProgressPublisher{
+		Bus: d.bus, Channels: d.channels,
+		AgentID: d.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 	startTime := time.Now()
 
 	result, err := d.handleDesign(ctx, fwd)
@@ -564,9 +588,7 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		Tools:     toolDefs,
 		MaxTokens: d.config.DesignerConfig.MaxTokens,
 	}
-	llmruntime.Apply(req, llmruntime.Profile{
-		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
-	})
+	d.applyDesignRuntimeProfile(req)
 
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(req, fwd.ConversationHistory)
@@ -577,7 +599,10 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 			&agentlog.DesignPayload{Phase: "prompt_composed"})
 	}
 
-	result, err := d.executeToolLoop(ctx, req, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return d.executeToolLoop(ctx, req, ledger)
+	})
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -760,7 +785,7 @@ func (d *Designer) Skills() *skills.Registry {
 }
 
 func (d *Designer) GetToolDefinitions() []map[string]any {
-	return d.skills.GetToolDefinitions()
+	return shared.ProviderToolsToDefinitions(d.buildToolDefinitions())
 }
 
 // =============================================================================
@@ -779,12 +804,15 @@ func (d *Designer) AgentType() string {
 
 // Descriptor returns immutable metadata for the handoff system.
 func (d *Designer) Descriptor() handoff.AgentDescriptor {
+	modelID := d.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:       "designer",
-		ModelID:         d.CurrentModel(),
-		ReasoningEffort: d.config.DesignerConfig.ReasoningEffort,
-		ContextWindow:   1_000_000,
-		Category:        handoff.CategoryPipeline,
+		AgentType:             "designer",
+		ModelID:               modelID,
+		ReasoningEffort:       d.config.DesignerConfig.ReasoningEffort,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryPipeline,
+		RuntimeProfiles:       designerRuntimeProfiles(),
+		DefaultRuntimeProfile: designerDefaultRuntimeProfile(),
 	}
 }
 

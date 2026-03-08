@@ -88,7 +88,10 @@ func (pi *PipelineInspector) runFeedbackLoop(
 		}
 		pi.applyLLMRuntimeProfile(req, "revalidation")
 
-		_, err := pi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
+		ledger := agentShared.SteeringLedgerFromContext(ctx)
+		_, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+			return pi.executeToolLoop(ctx, req, ledger)
+		})
 		if err != nil {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,

@@ -22,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -58,6 +59,7 @@ type Guardian struct {
 	skills        *skills.Registry
 	skillLoader   *skills.Loader
 	hooks         *skills.HookRegistry
+	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
 	// Activity publisher — emit events, never maintain own journal.
@@ -190,13 +192,15 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 
 	g.steering.InitLazy("guardian", cfg.ActivityPub)
 
-	g.initSkills()
+	if err := g.initSkills(); err != nil {
+		return nil, err
+	}
 	g.initSubsystems()
 
 	return g, nil
 }
 
-func (g *Guardian) initSkills() {
+func (g *Guardian) initSkills() error {
 	g.skills = skills.NewRegistry()
 	g.hooks = skills.NewHookRegistry()
 
@@ -207,6 +211,18 @@ func (g *Guardian) initSkills() {
 
 	g.registerCoreSkills()
 	registerGuardianSafetyHook(g.hooks, g.skills, guardianAllSkillNames())
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: g.skills,
+		Hooks:    g.hooks,
+		Manifest: guardianToolManifest(),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize guardian tool runtime: %w", err)
+	}
+	g.tools = tools
+	g.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 func (g *Guardian) initSubsystems() {
@@ -237,12 +253,15 @@ func (g *Guardian) Terminate(ctx context.Context) error {
 // ---------------------------------------------------------------------------
 
 func (g *Guardian) Descriptor() handoff.AgentDescriptor {
+	modelID := g.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:       "guardian",
-		ModelID:         g.CurrentModel(),
-		ReasoningEffort: "high",
-		ContextWindow:   8192,
-		Category:        handoff.CategoryStandalone,
+		AgentType:             "guardian",
+		ModelID:               modelID,
+		ReasoningEffort:       "high",
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryStandalone,
+		RuntimeProfiles:       guardianRuntimeProfiles(),
+		DefaultRuntimeProfile: guardianDefaultRuntimeProfile(),
 	}
 }
 
@@ -576,6 +595,11 @@ func (g *Guardian) Stop() error {
 	}
 	g.pendingMu.Unlock()
 
+	if g.tools != nil {
+		g.tools.Close()
+		g.tools = nil
+	}
+
 	g.logger.Info("guardian stopped", "id", g.id)
 	return nil
 }
@@ -667,15 +691,42 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		AgentID:     g.id,
 		SessionID:   fwd.SessionID,
 	})
-	reqCtx = shared.WithContextGovernor(reqCtx, shared.NewContextGovernor(
-		DefaultGuardianModel, DefaultMaxOutputTokens, 0,
+	gov := shared.NewContextGovernor(DefaultGuardianModel, DefaultMaxOutputTokens, 0)
+	if g.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return g.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	reqCtx = shared.WithContextGovernor(reqCtx, gov)
+	reqCtx = shared.WithProgressPublisher(reqCtx, &shared.ProgressPublisher{
+		Bus: g.bus, Channels: g.channels,
+		AgentID: g.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
+	reqCtx = shared.WithToolCallEmitter(reqCtx, shared.NewToolCallEmitter(
+		g.bus, g.channels, g.id, fwd.CorrelationID, fwd.SourceAgentID,
 	))
 
 	// Publish stream start.
 	g.publishStreamStart(reqCtx, fwd.CorrelationID)
 
-	// Execute conversation.
-	result, err := g.executeConversation(reqCtx, fwd)
+	// Execute either a deterministic direct skill or the conversation loop.
+	var (
+		result     any
+		streamText string
+		usage      *guide.StreamUsage
+		err        error
+	)
+	if skillName := guardianDirectSkillName(fwd); skillName != "" {
+		result, streamText, err = g.executeDirectSkill(reqCtx, skillName, fwd.Input)
+	} else {
+		var conversationResult *ConversationResult
+		conversationResult, err = g.executeConversation(reqCtx, fwd)
+		if conversationResult != nil {
+			result = conversationResult
+			streamText = conversationResult.Response
+			usage = conversationResult.Usage
+		}
+	}
 	shared.LogResponse(g.steering.EventLogger(), fwd.CorrelationID, g.id, fwd.SessionID, time.Since(startTime), err)
 
 	// Build response.
@@ -697,13 +748,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		g.publishStreamComplete(reqCtx, fwd.CorrelationID, resp.Error, nil)
 	} else {
 		resp.Data = result
-		text := ""
-		var usage *guide.StreamUsage
-		if result != nil {
-			text = result.Response
-			usage = result.Usage
-		}
-		g.publishStreamComplete(reqCtx, fwd.CorrelationID, text, usage)
+		g.publishStreamComplete(reqCtx, fwd.CorrelationID, streamText, usage)
 	}
 
 	if g.agentPod != nil {
@@ -712,7 +757,42 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 	return g.bus.Publish(g.channels.Responses, newResponseMessage(fwd.CorrelationID, g.id, resp))
 }
 
-func (g *Guardian) handleActionBusRequest(_ context.Context, msg *guide.Message) error {
+func guardianDirectSkillName(fwd *guide.ForwardedRequest) string {
+	if fwd == nil || len(fwd.Metadata) == 0 {
+		return ""
+	}
+	name, _ := fwd.Metadata["direct_skill"].(string)
+	return strings.TrimSpace(name)
+}
+
+func (g *Guardian) executeDirectSkill(ctx context.Context, name string, input string) (any, string, error) {
+	result := g.InvokeSkill(ctx, name, json.RawMessage(input))
+	if result == nil {
+		return nil, "", fmt.Errorf("guardian direct skill %q returned no result", name)
+	}
+	if !result.Success {
+		return nil, "", fmt.Errorf("guardian direct skill %q: %s", name, result.Error)
+	}
+	return result.Data, formatGuardianDirectSkillOutput(result.Data), nil
+}
+
+func formatGuardianDirectSkillOutput(data any) string {
+	if data == nil {
+		return ""
+	}
+	if payload, ok := data.(map[string]any); ok {
+		if message, _ := payload["user_message"].(string); strings.TrimSpace(message) != "" {
+			return strings.TrimSpace(message)
+		}
+	}
+	bytes, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Sprintf("%v", data)
+	}
+	return string(bytes)
+}
+
+func (g *Guardian) handleActionBusRequest(ctx context.Context, msg *guide.Message) error {
 	g.logInfo("handleActionBusRequest", "correlation_id", msg.CorrelationID)
 	action, ok := msg.GetActionRequest()
 	if !ok || action == nil {
@@ -723,8 +803,87 @@ func (g *Guardian) handleActionBusRequest(_ context.Context, msg *guide.Message)
 		"correlation_id", action.CorrelationID,
 		"source_agent", action.SourceAgentID,
 		"target_agent", action.TargetAgentID)
+	if action.Action == "tool_execution_control" {
+		return g.handleToolExecutionControlAction(ctx, msg, action)
+	}
 	g.steering.HandleAction(action)
 	return nil
+}
+
+func (g *Guardian) handleToolExecutionControlAction(
+	_ context.Context,
+	msg *guide.Message,
+	action *guide.ActionRequest,
+) error {
+	if action == nil {
+		return nil
+	}
+	req, ok := action.Data.(*toolruntime.GuardianControlRequest)
+	if !ok || req == nil {
+		return g.publishToolControlReply(msg, action, nil, fmt.Errorf("invalid guardian tool control request payload"))
+	}
+	grant, err := g.evaluateToolExecutionControl(action, req)
+	return g.publishToolControlReply(msg, action, grant, err)
+}
+
+func (g *Guardian) evaluateToolExecutionControl(
+	action *guide.ActionRequest,
+	req *toolruntime.GuardianControlRequest,
+) (*toolruntime.GuardianControlGrant, error) {
+	if action == nil || req == nil {
+		return nil, fmt.Errorf("guardian tool control request is required")
+	}
+	if strings.TrimSpace(req.AgentID) == "" || strings.TrimSpace(req.CorrelationID) == "" || strings.TrimSpace(req.CapabilityScope) == "" {
+		return nil, fmt.Errorf("guardian tool control request is missing invocation identity")
+	}
+	if action.SourceAgentID != "" && req.AgentID != action.SourceAgentID {
+		return nil, fmt.Errorf("guardian tool control source mismatch: %q != %q", req.AgentID, action.SourceAgentID)
+	}
+	if req.Policy.Execution != toolruntime.ExecutionModeGuardian {
+		return nil, fmt.Errorf("tool %q is not marked for guardian-controlled execution", req.ToolName)
+	}
+	if !req.Policy.ApprovalSensitive {
+		return nil, fmt.Errorf("tool %q is not marked approval-sensitive", req.ToolName)
+	}
+
+	return &toolruntime.GuardianControlGrant{
+		GrantID:           uuid.New().String(),
+		AgentID:           req.AgentID,
+		CorrelationID:     req.CorrelationID,
+		CapabilityScope:   req.CapabilityScope,
+		ToolName:          req.ToolName,
+		ArgumentsHash:     req.ArgumentsHash,
+		PolicyFingerprint: req.PolicyFingerprint,
+		Approved:          true,
+		Reason:            "guardian-approved deterministic control-plane grant",
+		ExpiresAt:         time.Now().Add(30 * time.Second),
+	}, nil
+}
+
+func (g *Guardian) publishToolControlReply(
+	msg *guide.Message,
+	action *guide.ActionRequest,
+	grant *toolruntime.GuardianControlGrant,
+	err error,
+) error {
+	if g.bus == nil || msg == nil || msg.ReplyTo == nil || strings.TrimSpace(msg.ReplyTo.Topic) == "" {
+		return err
+	}
+	resp := &guide.RouteResponse{
+		CorrelationID:       action.CorrelationID,
+		Success:             err == nil,
+		RespondingAgentID:   g.id,
+		RespondingAgentName: "guardian",
+		ProcessingTime:      0,
+		Data:                grant,
+	}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	reply := guide.NewResponseMessage(uuid.New().String(), resp)
+	reply.CorrelationID = action.CorrelationID
+	reply.SourceAgentID = g.id
+	return g.bus.Publish(msg.ReplyTo.Topic, reply)
 }
 
 func (g *Guardian) handleBusResponse(msg *guide.Message) error {
@@ -942,41 +1101,47 @@ func (g *Guardian) logDebug(msg string, args ...any) {
 // Tool Loop Support
 // ---------------------------------------------------------------------------
 
-// executeToolCall invokes a skill by name with JSON arguments.
-func (g *Guardian) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
-	name := strings.TrimSpace(call.Name)
-	if name == "" {
-		return "", fmt.Errorf("tool name is required")
-	}
-
-	raw := strings.TrimSpace(call.Arguments)
-	if raw == "" {
-		raw = "{}"
-	}
-	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
-	}
-
-	result := g.InvokeSkill(ctx, name, json.RawMessage(raw))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
-	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return shared.MarshalToolOutput(result.Data)
+// executeToolCall invokes a scoped tool via the shared runtime kernel while
+// preserving Guardian's outer-loop ownership.
+func (g *Guardian) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	return g.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         g.id,
+		CorrelationID:   shared.LogMetaFromContext(ctx).CorrID,
+		CapabilityScope: g.toolRuntime().CapabilityScope(),
+	})
 }
 
 // InvokeSkill executes a skill with hook enforcement.
 func (g *Guardian) InvokeSkill(ctx context.Context, name string, input json.RawMessage) *skills.Result {
-	g.ensureSkillLoaded(name)
-	if err := g.runPreToolHooks(ctx, name, input); err != nil {
+	if g.toolRuntime() == nil {
+		return &skills.Result{SkillName: name, Success: false, Error: "tool runtime is not configured"}
+	}
+	if _, err := g.toolRuntime().Activate(name); err != nil {
 		return &skills.Result{SkillName: name, Success: false, Error: err.Error()}
 	}
-	result := g.skills.Invoke(ctx, name, input)
-	g.runPostToolHooks(ctx, name, input, result)
-	return result
+	raw := strings.TrimSpace(string(input))
+	if raw == "" {
+		raw = "{}"
+	}
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = "invoke_" + uuid.NewString()
+	}
+	execResult, err := g.toolRuntime().ExecuteRaw(ctx, toolruntime.Invocation{
+		ToolCall: providers.ToolCall{
+			ID:        "invoke_" + uuid.NewString(),
+			Name:      name,
+			Arguments: raw,
+		},
+		AgentID:         g.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: g.toolRuntime().CapabilityScope(),
+	})
+	if err != nil {
+		return &skills.Result{SkillName: name, Success: false, Error: err.Error()}
+	}
+	return &skills.Result{SkillName: name, Success: true, Data: execResult.Data}
 }
 
 func (g *Guardian) runPreToolHooks(ctx context.Context, name string, input json.RawMessage) error {
@@ -1028,39 +1193,18 @@ func (g *Guardian) ensureSkillLoaded(name string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (g *Guardian) buildToolDefinitions() []providers.Tool {
-	loaded := g.skills.GetLoaded()
-	if len(loaded) == 0 {
-		return nil
-	}
+	g.toolRuntime().SyncActiveFromLoaded()
+	return g.toolRuntime().BuildToolDefinitions()
+}
 
-	tools := make([]providers.Tool, 0, len(loaded))
-	for _, skill := range loaded {
-		def := skill.ToToolDefinition()
-		name, _ := def["name"].(string)
-		if name == "" {
-			continue
-		}
-		description, _ := def["description"].(string)
-		parameters := shared.CoerceMap(def["input_schema"])
-		if len(parameters) == 0 {
-			parameters = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, providers.Tool{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
-		})
-	}
-	return tools
+func (g *Guardian) toolRuntime() *toolruntime.Runtime {
+	return g.tools
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
 // input and optimizes to stay within the tool-definition token budget.
 // Pinned skills are always loaded; remaining skills are loaded by keyword
-// match and demand-paged via the safety hook when the LLM invokes them.
+// match and demand-paged by the shared tool runtime when the LLM invokes them.
 func (g *Guardian) prepareSkillsForInput(input string, intent GuardianIntent) {
 	if g.skills == nil {
 		return
@@ -1074,6 +1218,9 @@ func (g *Guardian) prepareSkillsForInput(input string, intent GuardianIntent) {
 	}
 	for _, name := range guardianIntentSkillNames(intent) {
 		g.skills.Load(name)
+	}
+	if g.tools != nil {
+		g.tools.SyncActiveFromLoaded()
 	}
 }
 

@@ -235,6 +235,9 @@ func (m *Model) View(cursorVisible bool) string {
 	} else {
 		m.viewCache = m.borderStyle().Width(cw).Render(body)
 	}
+	// Guarantee exactly m.height lines so the compositor never receives
+	// a mismatched line count that would corrupt adjacent slots.
+	m.viewCache = enforceLineCount(m.viewCache, m.height)
 	m.viewDirty = false
 	return m.viewCache
 }
@@ -771,6 +774,24 @@ func (m *Model) clear() {
 	m.completer.Dismiss()
 }
 
+// ClearInput resets the input buffer without affecting command history.
+func (m *Model) ClearInput() {
+	m.lines = [][]rune{nil}
+	m.cursorRow = 0
+	m.cursorCol = 0
+	m.scrollOff = 0
+	m.sel.active = false
+	m.wrapDirty = true
+	m.mdDirty = true
+	m.md = nil
+	m.completer.Dismiss()
+}
+
+// IsEmpty reports whether the input buffer contains no text.
+func (m *Model) IsEmpty() bool {
+	return m.isEmpty()
+}
+
 // insertRunes inserts runes at the cursor position.
 func (m *Model) insertRunes(rs []rune) {
 	line := m.lines[m.cursorRow]
@@ -1027,15 +1048,32 @@ func (m *Model) contentWidth() int {
 }
 
 // renderBody renders the visible visual lines with cursor and placeholder.
+// Always produces exactly maxHeight newline-separated lines so the border
+// renderer receives a deterministic number of rows on every frame.
 func (m *Model) renderBody(cursorVisible bool) string {
 	if m.isEmpty() && !m.focused {
 		return m.theme.Placeholder.Render(m.placeholder)
 	}
 	m.ensureWrap()
+
+	// Clamp scrollOff defensively — rapid cursor movement between frames
+	// can leave scrollOff past the valid range.
+	maxOff := m.wrap.visualTotal - m.maxHeight
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.scrollOff > maxOff {
+		m.scrollOff = maxOff
+	}
+	if m.scrollOff < 0 {
+		m.scrollOff = 0
+	}
+
 	end := min(m.scrollOff+m.maxHeight, m.wrap.visualTotal)
+	rendered := 0
 	var b strings.Builder
 	for vRow := m.scrollOff; vRow < end; vRow++ {
-		if vRow > m.scrollOff {
+		if rendered > 0 {
 			b.WriteByte('\n')
 		}
 		actualRow, segIdx := m.wrap.visualRowToSegment(vRow)
@@ -1049,6 +1087,31 @@ func (m *Model) renderBody(cursorVisible bool) string {
 			segment := m.lines[actualRow][span.Start:span.End]
 			b.WriteString(m.renderVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible))
 		}
+		rendered++
+	}
+	// Pad to exactly maxHeight lines so the border height is deterministic.
+	for rendered < m.maxHeight {
+		if rendered > 0 {
+			b.WriteByte('\n')
+		}
+		rendered++
+	}
+	return b.String()
+}
+
+// enforceLineCount pads or truncates s to exactly n newline-separated lines.
+func enforceLineCount(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) == n {
+		return s
+	}
+	if len(lines) > n {
+		return strings.Join(lines[:n], "\n")
+	}
+	var b strings.Builder
+	b.WriteString(s)
+	for range n - len(lines) {
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
@@ -1059,6 +1122,13 @@ func (m *Model) renderVisualLine(segment []rune, actualRow, segOffset, segIdx in
 	lineStr := string(segment)
 	needsCursor := m.focused && actualRow == m.cursorRow &&
 		m.cursorCol >= segOffset && m.cursorCol <= segOffset+len(segment)
+	// Cursor at the exact end of a non-last segment belongs to the next
+	// visual line. Rendering a trailing cursor space here would exceed
+	// contentWidth, causing the border renderer to wrap or truncate.
+	isLastSeg := segIdx == len(m.wrap.segments[actualRow])-1
+	if needsCursor && !isLastSeg && m.cursorCol == segOffset+len(segment) {
+		needsCursor = false
+	}
 
 	// localCol is the cursor column relative to this segment.
 	localCol := m.cursorCol - segOffset
@@ -1097,9 +1167,18 @@ func (m *Model) renderVisualLine(segment []rune, actualRow, segOffset, segIdx in
 	return m.renderCursorWithGhostLocal(segment, lineStr, localCol, cursorVisible, ghost)
 }
 
+// mdRenderKey encodes the final rendering style for a character position.
+// Cursor and selection override markdown styling; characters with the same
+// key are batched into a single ANSI span to avoid splitting grapheme clusters.
+type mdRenderKey struct {
+	sel selRegionKind
+	md  mdStyleKind
+}
+
 // renderMdVisualLine renders a visual-line segment with markdown styling.
-// The segment contains display runes (hidden delimiters removed).
-// segOffset is the display-column offset within the display rune array.
+// Uses region-based ANSI: consecutive characters sharing the same final style
+// are batched into a single span, preventing grapheme cluster splits that cause
+// terminals to misrender variation selectors and combining characters.
 func (m *Model) renderMdVisualLine(segment []rune, actualRow, segOffset, segIdx int, cursorVisible bool) string {
 	if actualRow >= len(m.md.lines) {
 		return m.renderVisualLine(segment, actualRow, segOffset, segIdx, cursorVisible)
@@ -1111,44 +1190,69 @@ func (m *Model) renderMdVisualLine(segment []rune, actualRow, segOffset, segIdx 
 	dispCursorCol := ml.rawColToDisplay(rawCursorCol)
 	needsCursor := m.focused && actualRow == m.cursorRow &&
 		dispCursorCol >= segOffset && dispCursorCol <= segOffset+len(segment)
+	isLastSeg := segIdx == len(m.wrap.segments[actualRow])-1
+	if needsCursor && !isLastSeg && dispCursorCol == segOffset+len(segment) {
+		needsCursor = false
+	}
 	localCol := dispCursorCol - segOffset
 
-	// Build styled output character by character.
-	var b strings.Builder
 	selStyle := lipgloss.NewStyle().Background(m.theme.Palette.Selection)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
-	for i, r := range segment {
-		dispCol := segOffset + i
-		kind := ml.regionAt(dispCol)
-		ch := string(r)
+	var b strings.Builder
+	var run []rune
+	runKey := mdRenderKey{}
 
-		// Determine if this position is selected.
-		isSel := m.sel.active && m.selContainsDisplay(actualRow, dispCol, ml)
-
-		// Apply markdown style.
-		styled := ch
-		if kind != mdNone {
-			styled = m.mdStyle.styleFor(kind).Render(ch)
+	flush := func() {
+		if len(run) == 0 {
+			return
 		}
-
-		// Apply selection overlay.
-		if isSel {
-			styled = selStyle.Render(ch)
+		s := string(run)
+		switch runKey.sel {
+		case selCursor:
+			b.WriteString(cursorStyle.Render(s))
+		case selHigh:
+			b.WriteString(selStyle.Render(s))
+		default:
+			if runKey.md != mdNone {
+				b.WriteString(m.mdStyle.styleFor(runKey.md).Render(s))
+			} else {
+				b.WriteString(s)
+			}
 		}
-
-		// Apply cursor overlay.
-		if needsCursor && cursorVisible && i == localCol {
-			styled = cursorStyle.Render(ch)
-		}
-
-		b.WriteString(styled)
+		run = run[:0]
 	}
 
-	// Cursor at end of segment.
+	i := 0
+	for i < len(segment) {
+		gl := graphemeLen(segment, i)
+		dispCol := segOffset + i
+
+		// Determine priority: cursor > selection > markdown > plain.
+		var key mdRenderKey
+		if needsCursor && cursorVisible && i == localCol {
+			key.sel = selCursor
+		} else if m.sel.active && m.selContainsDisplay(actualRow, dispCol, ml) {
+			key.sel = selHigh
+		} else {
+			key.md = ml.regionAt(dispCol)
+		}
+
+		if key != runKey {
+			flush()
+			runKey = key
+		}
+		run = append(run, segment[i:i+gl]...)
+		i += gl
+	}
+	flush()
+
+	// Cursor at end of segment — only add trailing indicator if it won't
+	// push the line past contentWidth.
 	if needsCursor && localCol >= len(segment) {
+		room := m.contentWidth() - runeSliceWidth(segment)
 		ghost := m.completer.GhostSuffix()
-		if len(ghost) > 0 {
+		if len(ghost) > 0 && room > 0 {
 			ghostRunes := []rune(ghost)
 			mutedStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 			if cursorVisible {
@@ -1159,7 +1263,7 @@ func (m *Model) renderMdVisualLine(segment []rune, actualRow, segOffset, segIdx 
 			if len(ghostRunes) > 1 {
 				b.WriteString(mutedStyle.Render(string(ghostRunes[1:])))
 			}
-		} else if cursorVisible {
+		} else if cursorVisible && room > 0 {
 			b.WriteString(cursorStyle.Render(" "))
 		}
 	}
@@ -1175,6 +1279,8 @@ func (m *Model) selContainsDisplay(actualRow, dispCol int, ml mdLine) bool {
 }
 
 // applySelectionHighlight renders a segment with selection background highlight.
+// Iterates by grapheme cluster so zero-width combining runes (variation
+// selectors, ZWJ) stay grouped with their base character across ANSI spans.
 func (m *Model) applySelectionHighlight(segment []rune, actualRow, segOffset int) string {
 	selStyle := lipgloss.NewStyle().Background(m.theme.Palette.Selection)
 
@@ -1195,46 +1301,87 @@ func (m *Model) applySelectionHighlight(segment []rune, actualRow, segOffset int
 		run = run[:0]
 	}
 
-	for i, r := range segment {
+	i := 0
+	for i < len(segment) {
+		gl := graphemeLen(segment, i)
 		col := segOffset + i
 		sel := m.sel.containsPos(m.cursorRow, m.cursorCol, actualRow, col)
 		if sel != inSel {
 			flush()
 			inSel = sel
 		}
-		run = append(run, r)
+		run = append(run, segment[i:i+gl]...)
+		i += gl
 	}
 	flush()
 	return b.String()
 }
 
-// renderSelectionWithCursor renders a segment with selection background and
-// cursor overlay in a single pass, preventing the cursor from stripping
-// selection styling.
+// selRegionKind classifies a character's rendering style during selection.
+type selRegionKind int8
+
+const (
+	selPlain  selRegionKind = iota // No styling.
+	selHigh                        // Selection background.
+	selCursor                      // Cursor (reverse video).
+)
+
+// renderSelectionWithCursor renders a segment using region-based ANSI styling.
+// Consecutive characters with the same style are batched into a single ANSI
+// span, preventing grapheme cluster splits that cause terminals to misrender
+// variation selectors and other combining characters as visible glyphs.
 func (m *Model) renderSelectionWithCursor(segment []rune, actualRow, segOffset int, needsCursor bool, localCol int, cursorVisible bool, ghost string) string {
 	selStyle := lipgloss.NewStyle().Background(m.theme.Palette.Selection)
 	cursorStyle := lipgloss.NewStyle().Reverse(true)
 
 	var b strings.Builder
-	for i, r := range segment {
-		col := segOffset + i
-		ch := string(r)
-		isSel := m.sel.containsPos(m.cursorRow, m.cursorCol, actualRow, col)
+	var run []rune
+	runKind := selPlain
 
-		if needsCursor && cursorVisible && i == localCol {
-			b.WriteString(cursorStyle.Render(ch))
-		} else if isSel {
-			b.WriteString(selStyle.Render(ch))
-		} else {
-			b.WriteString(ch)
+	flush := func() {
+		if len(run) == 0 {
+			return
 		}
+		s := string(run)
+		switch runKind {
+		case selHigh:
+			b.WriteString(selStyle.Render(s))
+		case selCursor:
+			b.WriteString(cursorStyle.Render(s))
+		default:
+			b.WriteString(s)
+		}
+		run = run[:0]
 	}
 
-	// Cursor at end of segment.
+	i := 0
+	for i < len(segment) {
+		gl := graphemeLen(segment, i)
+		col := segOffset + i
+
+		kind := selPlain
+		if needsCursor && cursorVisible && i == localCol {
+			kind = selCursor
+		} else if m.sel.containsPos(m.cursorRow, m.cursorCol, actualRow, col) {
+			kind = selHigh
+		}
+
+		if kind != runKind {
+			flush()
+			runKind = kind
+		}
+		run = append(run, segment[i:i+gl]...)
+		i += gl
+	}
+	flush()
+
+	// Cursor at end of segment — only add trailing indicator if it won't
+	// push the line past contentWidth (which breaks the border renderer).
 	if needsCursor && localCol >= len(segment) {
+		room := m.contentWidth() - runeSliceWidth(segment)
 		ghostRunes := []rune(ghost)
 		mutedStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
-		if len(ghostRunes) > 0 {
+		if len(ghostRunes) > 0 && room > 0 {
 			if cursorVisible {
 				b.WriteString(cursorStyle.Render(string(ghostRunes[:1])))
 			} else {
@@ -1243,7 +1390,7 @@ func (m *Model) renderSelectionWithCursor(segment []rune, actualRow, segOffset i
 			if len(ghostRunes) > 1 {
 				b.WriteString(mutedStyle.Render(string(ghostRunes[1:])))
 			}
-		} else if cursorVisible {
+		} else if cursorVisible && room > 0 {
 			b.WriteString(cursorStyle.Render(" "))
 		}
 	} else if needsCursor && len(ghost) > 0 {
@@ -1284,8 +1431,9 @@ func (m *Model) renderCursorWithGhostLocal(seg []rune, segStr string, localCol i
 		return segStr + mutedStyle.Render(string(ghostRunes[:1])) + tail
 	}
 
-	// No ghost: standard end-of-segment cursor.
-	if cursorVisible {
+	// No ghost: standard end-of-segment cursor. Only add trailing space
+	// if it won't push the line past contentWidth.
+	if cursorVisible && runeSliceWidth(seg) < m.contentWidth() {
 		return segStr + cursorStyle.Render(" ")
 	}
 	return segStr
@@ -1321,9 +1469,10 @@ func renderStyledCursorAt(seg []rune, localCol int, styler func(string) (string,
 	if localCol >= len(seg) {
 		return textStyler(string(seg)) + cursorStyle.Render(" "), hint
 	}
+	gl := graphemeLen(seg, localCol)
 	before := textStyler(string(seg[:localCol]))
-	under := cursorStyle.Render(string(seg[localCol : localCol+1]))
-	after := textStyler(string(seg[localCol+1:]))
+	under := cursorStyle.Render(string(seg[localCol : localCol+gl]))
+	after := textStyler(string(seg[localCol+gl:]))
 	return before + under + after, hint
 }
 
@@ -1336,9 +1485,10 @@ func renderCursorAt(seg []rune, segStr string, localCol int, cursorVisible bool)
 	if localCol >= len(seg) {
 		return segStr + cursorStyle.Render(" ")
 	}
+	gl := graphemeLen(seg, localCol)
 	before := string(seg[:localCol])
-	under := string(seg[localCol : localCol+1])
-	after := string(seg[localCol+1:])
+	under := string(seg[localCol : localCol+gl])
+	after := string(seg[localCol+gl:])
 	return before + cursorStyle.Render(under) + after
 }
 

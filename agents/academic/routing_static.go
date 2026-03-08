@@ -60,6 +60,8 @@ func AcademicRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 			},
 			Description: "Researches best practices, academic papers, and external knowledge sources. " +
 				"Can fetch web pages and documents. Validates against codebase reality via the Librarian.",
+			RuntimeProfiles:       academicRuntimeProfiles(),
+			DefaultRuntimeProfile: academicDefaultRuntimeProfile(),
 		},
 	}
 }

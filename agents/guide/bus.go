@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/google/uuid"
 )
@@ -655,9 +656,11 @@ type AgentAnnouncement struct {
 	Channels *AgentChannels `json:"channels,omitempty"`
 
 	// What the agent handles (for registered events)
-	Capabilities *AgentCapabilities `json:"capabilities,omitempty"`
-	Constraints  *AgentConstraints  `json:"constraints,omitempty"`
-	Description  string             `json:"description,omitempty"`
+	Capabilities          *AgentCapabilities        `json:"capabilities,omitempty"`
+	Constraints           *AgentConstraints         `json:"constraints,omitempty"`
+	Description           string                    `json:"description,omitempty"`
+	RuntimeProfiles       []llmruntime.StageProfile `json:"runtime_profiles,omitempty"`
+	DefaultRuntimeProfile string                    `json:"default_runtime_profile,omitempty"`
 
 	// Available action shortcuts (for registered events)
 	ActionShortcuts []ActionShortcut `json:"action_shortcuts,omitempty"`
@@ -685,6 +688,8 @@ func NewAgentRegisteredMessage(id string, info *AgentRoutingInfo) *Message {
 		announcement.Capabilities = &info.Registration.Capabilities
 		announcement.Constraints = &info.Registration.Constraints
 		announcement.Description = info.Registration.Description
+		announcement.RuntimeProfiles = append([]llmruntime.StageProfile(nil), info.Registration.RuntimeProfiles...)
+		announcement.DefaultRuntimeProfile = info.Registration.DefaultRuntimeProfile
 	}
 
 	if id == "" {

@@ -94,15 +94,15 @@ func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}
 	waitCh := r.registerPending(corrID, task)
 
 	req := &guide.RouteRequest{
-		CorrelationID:  corrID,
-		Input:          encodeTaskInput(task),
-		TargetAgentID:  task.AgentType,
-		ExplicitTarget: true,
-		SourceAgentID:  r.agentID,
+		CorrelationID:   corrID,
+		Input:           encodeTaskInput(task),
+		TargetAgentID:   task.AgentType,
+		ExplicitTarget:  true,
+		SourceAgentID:   r.agentID,
 		SourceAgentName: "orchestrator",
-		SessionID:      task.SessionID,
-		Timestamp:      time.Now(),
-		Metadata:       extractDispatchMetadata(task.Context),
+		SessionID:       task.SessionID,
+		Timestamp:       time.Now(),
+		Metadata:        extractDispatchMetadata(task.Context),
 	}
 
 	msg := guide.NewRequestMessage(generateMessageID(), req)
@@ -303,6 +303,12 @@ func extractDispatchMetadata(ctx map[string]any) map[string]any {
 	}
 	if nodeID, _ := ctx["node_id"].(string); nodeID != "" {
 		meta["node_id"] = nodeID
+	}
+	if taskID, _ := ctx["task_id"].(string); taskID != "" {
+		meta["task_id"] = taskID
+	}
+	if agentType, _ := ctx["agent_type"].(string); agentType != "" {
+		meta["agent_type"] = agentType
 	}
 	if len(meta) == 0 {
 		return nil

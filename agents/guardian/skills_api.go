@@ -5,70 +5,61 @@ import (
 	"fmt"
 
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // guardianPinnedSkillNames returns the minimal set of skills always loaded in the
 // tool definition payload. These are the skills Guardian needs for every request.
 // Remaining skills are loaded progressively via LoadForInput keyword matching and
-// demand-paged via the safety hook when the LLM invokes them.
+// demand-paged by the shared tool runtime when the LLM invokes them.
 func guardianPinnedSkillNames() []string {
-	return []string{
-		"agent_health",
-		"system_status",
-		"ask_user_question",
-		"reroute_request",
-	}
-}
-
-// guardianCoreSkillNames returns the full set of Guardian-domain skills.
-// Used for safety hook allowlisting — all of these are permitted but not
-// necessarily loaded at init.
-func guardianCoreSkillNames() []string {
-	return []string{
-		"git_safety",
-		"content_scan",
-		"agent_health",
-		"review_gate",
-		"agent_logs",
-		"system_status",
-		"vfs_status",
-		"pipeline_status",
-		"gateway_metrics",
-		"knowledge_status",
-		"concurrency_status",
-		"usage_breakdown",
-		"quarantine_status",
-	}
+	return filterSyntheticGuardianRuntimeTools(guardianToolManifest().DefaultVisibleNames())
 }
 
 // guardianAllSkillNames returns all skills including filesystem read tools and reroute.
 func guardianAllSkillNames() []string {
-	return []string{
-		"git_safety",
-		"rollback",
-		"content_scan",
-		"agent_health",
-		"review_gate",
-		"agent_logs",
-		"system_status",
-		"vfs_status",
-		"pipeline_status",
-		"gateway_metrics",
-		"knowledge_status",
-		"concurrency_status",
-		"usage_breakdown",
-		"quarantine_status",
-		"read_file",
-		"glob",
-		"grep",
-		"ask_user_question",
-		"reroute_request",
-	}
+	return guardianToolManifest().AllowedNames()
 }
 
-// registerGuardianSafetyHook validates only allowed skills are invoked.
-// Demand-pages unloaded skills on first use.
-func registerGuardianSafetyHook(hooks *skills.HookRegistry, registry *skills.Registry, allowed []string) {
+func guardianToolManifest() *toolruntime.PolicyManifest {
+	return toolruntime.NewManifest("guardian", "guardian.control",
+		toolruntime.NewToolPolicy("git_safety", toolruntime.EffectReadOnly, toolruntime.DomainGit, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("rollback", toolruntime.EffectMutating, toolruntime.DomainGit, toolruntime.ExecutionModeLocalWorker, toolruntime.WithApprovalSensitive()),
+		toolruntime.NewToolPolicy("content_scan", toolruntime.EffectReadOnly, toolruntime.DomainValidation, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("agent_health", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("review_gate", toolruntime.EffectReadOnly, toolruntime.DomainValidation, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("agent_logs", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("system_status", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("vfs_status", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("pipeline_status", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("gateway_metrics", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("knowledge_status", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("concurrency_status", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("usage_breakdown", toolruntime.EffectReadOnly, toolruntime.DomainObservability, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("quarantine_status", toolruntime.EffectReadOnly, toolruntime.DomainValidation, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("read_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("glob", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("grep", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("ask_user_question", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("reroute_request", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
+	)
+}
+
+func filterSyntheticGuardianRuntimeTools(names []string) []string {
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == toolruntime.SearchToolName {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
+}
+
+// registerGuardianSafetyHook validates only allowed tools are invoked.
+func registerGuardianSafetyHook(hooks *skills.HookRegistry, _ *skills.Registry, allowed []string) {
 	if hooks == nil {
 		return
 	}
@@ -87,13 +78,6 @@ func registerGuardianSafetyHook(hooks *skills.HookRegistry, registry *skills.Reg
 				return skills.HookResult{
 					Continue: false,
 					Error:    fmt.Errorf("SECURITY VIOLATION: Guardian is not permitted to execute tool %q", data.ToolName),
-				}
-			}
-			// Demand-page: load the skill if allowed but not yet loaded.
-			if registry != nil {
-				skill := registry.Get(data.ToolName)
-				if skill != nil && !skill.Loaded {
-					registry.Load(data.ToolName)
 				}
 			}
 			return skills.HookResult{Continue: true}

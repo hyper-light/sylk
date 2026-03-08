@@ -12,9 +12,11 @@ import (
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // executeToolLoop runs the LLM tool-call loop bounded by config.MaxToolRuns.
@@ -23,6 +25,11 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 	consecutiveErrors := 0
 
 	for turn := 0; turn <= pi.config.MaxToolRuns; turn++ {
+		if pi.toolDefsDirty {
+			req.Tools = pi.buildToolDefinitions()
+			pi.toolDefsDirty = false
+		}
+
 		// ── STEERING CHECKPOINT ──
 		sc := agentShared.DrainAndCheckpoint(ledger, req, turn, "inspecting", nil)
 		if sc.Rollback != nil || sc.EditReplay != nil {
@@ -62,8 +69,7 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 		}
 
 		turnStart := time.Now()
-		resp, err := pi.getProvider().Complete(ctx, req)
-		agentShared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
+		resp, err := agentShared.CompleteWithWatchdog(ctx, pi.getProvider(), req, agentShared.AgentDisplayName("inspector-pipeline"))
 		if err != nil {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -89,7 +95,9 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-
+		if err := pi.toolRuntime().ValidateBatch(pi.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
+		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -139,9 +147,15 @@ func (pi *PipelineInspector) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := agentShared.TimedToolCall(ctx, "inspector-pipeline", call, func() (string, error) {
-			return pi.executeToolCall(ctx, call)
+			execResult, execErr = pi.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			pi.toolDefsDirty = true
+		}
 		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
@@ -180,10 +194,10 @@ func (pi *PipelineInspector) applyToolCalls(
 	return errCount, rerouted
 }
 
-func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
+func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
-		return "", fmt.Errorf("tool name is required")
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -191,18 +205,18 @@ func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers
 		raw = "{}"
 	}
 	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
-
-	result := pi.skills.Invoke(ctx, name, json.RawMessage(raw))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
+	correlationID := agentShared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = pi.id + "-local"
 	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return shared.MarshalToolOutput(result.Data)
+	return pi.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         pi.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: pi.toolRuntime().CapabilityScope(),
+	})
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -216,7 +230,33 @@ func (pi *PipelineInspector) prepareSkillsForInput(input string) {
 }
 
 func (pi *PipelineInspector) buildToolDefinitions() []providers.Tool {
-	return shared.BuildToolDefinitions(pi.skills.GetLoaded())
+	pi.toolRuntime().SyncActiveFromLoaded()
+	return pi.toolRuntime().BuildToolDefinitions()
+}
+
+func (pi *PipelineInspector) toolRuntime() *toolruntime.Runtime {
+	return pi.tools
+}
+
+func (pi *PipelineInspector) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
+		return nil
+	}
+	correlationID := agentShared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = pi.id + "-local"
+	}
+	scope := pi.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         pi.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
+		})
+	}
+	return invocations
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
@@ -239,6 +279,8 @@ func (pi *PipelineInspector) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,

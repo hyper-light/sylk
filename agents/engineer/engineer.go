@@ -15,9 +15,9 @@ import (
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -58,6 +58,8 @@ type Engineer struct {
 	// Skills system
 	skills      *skills.Registry
 	skillLoader *skills.Loader
+	tools       *toolruntime.Runtime
+	toolDefsDirty bool
 
 	// Activity publisher for UI agent-panel updates.
 	activityPub events.ActivityPublisher
@@ -187,7 +189,9 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 
 	eng.steering.InitLazy("engineer", nil)
 
-	eng.initSkills()
+	if err := eng.initSkills(); err != nil {
+		return nil, err
+	}
 
 	return eng, nil
 }
@@ -305,18 +309,26 @@ func applyConfigDefaults(cfg Config) Config {
 	return cfg
 }
 
-func (e *Engineer) initSkills() {
+func (e *Engineer) initSkills() error {
 	e.skills = skills.NewRegistry()
+	e.registerCoreSkills()
 
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"read_file", "edit_file", "write_file",
-		"glob", "grep", "run_command",
-	}
+	loaderCfg.CoreSkills = engineerVisibleSkillNames()
 	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	e.skillLoader = skills.NewLoader(e.skills, loaderCfg)
 
-	e.registerCoreSkills()
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: e.skills,
+		Manifest: engineerToolManifest(e.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize engineer tool runtime: %w", err)
+	}
+	e.tools = tools
+	e.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 // ID returns the engineer's unique identifier
@@ -335,6 +347,10 @@ func (e *Engineer) SetCanonicalID(id string) {
 
 // Close closes the engineer and its resources
 func (e *Engineer) Close() error {
+	if e.tools != nil {
+		e.tools.Close()
+		e.tools = nil
+	}
 	e.Stop()
 	return nil
 }
@@ -521,9 +537,19 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 		AgentID:     e.id,
 		SessionID:   fwd.SessionID,
 	})
-	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
+	gov := shared.NewContextGovernor(
 		e.config.EngineerConfig.Model, e.config.EngineerConfig.MaxTokens, 0,
-	))
+	)
+	if e.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return e.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = shared.WithContextGovernor(ctx, gov)
+	ctx = shared.WithProgressPublisher(ctx, &shared.ProgressPublisher{
+		Bus: e.bus, Channels: e.channels,
+		AgentID: e.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	result, err := e.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(e.steering.EventLogger(), fwd.CorrelationID, e.id, fwd.SessionID, time.Since(startTime), err)
@@ -770,13 +796,16 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 		Model:        e.config.EngineerConfig.Model,
 		MaxTokens:    e.config.EngineerConfig.MaxTokens,
 	}
-	llmruntime.Apply(llmReq, e.llmRuntimeProfile())
+	e.applyLLMRuntimeProfile(llmReq, "implementation")
 
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(llmReq, req.ConversationHistory)
 
 	// Step 6: Execute tool loop
-	result, err := e.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return e.executeToolLoop(ctx, llmReq, ledger)
+	})
 	if err != nil {
 		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
 			e.id, "", "", "error", &agentlog.ErrorPayload{Error: err.Error()})
@@ -802,7 +831,9 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 			providers.Message{Role: providers.RoleAssistant, Content: result},
 			providers.Message{Role: providers.RoleUser, Content: e.buildAuditFeedback(verdict)},
 		)
-		result, err = e.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+		result, err = shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+			return e.executeToolLoop(ctx, llmReq, ledger)
+		})
 		if err != nil {
 			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
 				e.id, "", "", "error", &agentlog.ErrorPayload{Error: fmt.Sprintf("audit re-implement: %v", err)})
@@ -998,7 +1029,7 @@ func (e *Engineer) Skills() *skills.Registry {
 
 // GetToolDefinitions returns tool definitions for all loaded skills
 func (e *Engineer) GetToolDefinitions() []map[string]any {
-	return e.skills.GetToolDefinitions()
+	return shared.ProviderToolsToDefinitions(e.buildToolDefinitions())
 }
 
 // =============================================================================
@@ -1017,18 +1048,15 @@ func (e *Engineer) AgentType() string {
 
 // Descriptor returns the agent's descriptor for handoff operations.
 func (e *Engineer) Descriptor() handoff.AgentDescriptor {
+	modelID := e.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:       "engineer",
-		ModelID:         e.CurrentModel(),
-		ReasoningEffort: e.config.EngineerConfig.ReasoningEffort,
-		ContextWindow:   272_000,
-		Category:        handoff.CategoryPipeline,
-	}
-}
-
-func (e *Engineer) llmRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{
-		ReasoningEffort: e.config.EngineerConfig.ReasoningEffort,
+		AgentType:             "engineer",
+		ModelID:               modelID,
+		ReasoningEffort:       e.config.EngineerConfig.ReasoningEffort,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryPipeline,
+		RuntimeProfiles:       engineerRuntimeProfiles(),
+		DefaultRuntimeProfile: engineerDefaultRuntimeProfile(),
 	}
 }
 

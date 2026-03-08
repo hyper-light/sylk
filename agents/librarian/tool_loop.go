@@ -11,17 +11,28 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // executeToolLoop runs the LLM tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
-// Follows the academic/engineer tool loop pattern exactly.
+//
+// The librarian's tool loop differs from other agents in that it maintains
+// a SearchLedger that tracks all search evidence across turns. The ledger
+// detects search saturation (repeated/overlapping results) and injects an
+// evidence summary into the LLM context so the model knows what it has
+// found and when to stop searching. This prevents both the "repeated tool
+// call" abort and the "exceeded tool-call limit" abort by giving the LLM
+// data-driven signals to synthesize an answer.
 func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
 	maxRuns := l.config.MaxToolRuns
+	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	consecutiveErrors := 0
+	searchLedger := NewSearchLedger()
 
 	p := l.getProvider()
 	if p == nil {
@@ -65,6 +76,7 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
 			}
 			turn = cp.Turn
+			seen = make(map[shared.ToolCallSignature]int, maxRuns)
 			consecutiveErrors = 0
 			continue
 		}
@@ -81,14 +93,34 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 			l.toolDefsDirty = false
 		}
 
+		// ── SEARCH SATURATION CHECK ──
+		// When the search ledger detects saturation (consecutive searches
+		// returning only already-seen files), strip tools to force synthesis.
+		// This is data-driven — no magic turn thresholds.
+		if searchLedger.IsSaturated() {
+			req.Tools = nil
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
+					lm.AgentID, lm.SessionID, lm.CorrID, "info",
+					&agentlog.GenerationPayload{Phase: "search_saturated", ToolRuns: turn})
+			}
+		}
+
+		// ── EVIDENCE SUMMARY INJECTION ──
+		// After the first search turn, inject the evidence summary so the LLM
+		// sees what it has found and can make informed decisions about whether
+		// to continue searching or synthesize.
+		if summary := searchLedger.EvidenceSummary(); summary != "" {
+			injectEvidenceSummary(req, summary)
+		}
+
 		// ── CONTEXT BUDGET ──
 		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
 			return "", err
 		}
 
 		turnStart := time.Now()
-		resp, err := p.Complete(ctx, req)
-		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
+		resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("librarian"))
 		if err != nil {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
@@ -105,14 +137,13 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 
+		// ── NO TOOL CALLS → RETURN ANSWER ──
 		if len(resp.ToolCalls) == 0 {
 			content := strings.TrimSpace(resp.Content)
 			if content == "" {
-				// Empty content with no tool calls is abnormal — the system
-				// prompt mandates tool use before answering. This happens when
-				// the context governor strips tools (ZoneRed) or the model
-				// produces a degenerate response. Inject a synthesis nudge
-				// and retry exactly once.
+				// Empty content with no tool calls — the context governor may
+				// have stripped tools, or the model produced a degenerate
+				// response. Inject a synthesis nudge and retry exactly once.
 				if turn < maxRuns {
 					req.Messages = append(req.Messages, providers.Message{
 						Role:    providers.RoleAssistant,
@@ -134,7 +165,61 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 			return content, nil
 		}
 
-		errCount, rerouted := l.applyToolCalls(ctx, req, resp)
+		// ── DUPLICATE DETECTION ──
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s (forcing synthesis)", sig.Name)})
+			}
+			// The LLM is stuck calling the same tool with the same args.
+			// Strip tools and inject the evidence summary to force synthesis.
+			req.Messages = append(req.Messages, providers.Message{
+				Role:      providers.RoleAssistant,
+				Content:   resp.Content,
+				ToolCalls: resp.ToolCalls,
+				Metadata:  resp.ProviderMetadata,
+			})
+			for _, call := range resp.ToolCalls {
+				req.Messages = append(req.Messages, providers.Message{
+					Role:       providers.RoleTool,
+					ToolCallID: call.ID,
+					ToolName:   call.Name,
+					Content:    fmt.Sprintf(`{"error":"Duplicate search — you already called %s with identical arguments. Use your existing results."}`, call.Name),
+					IsError:    true,
+				})
+			}
+			req.Tools = nil // force synthesis on next turn
+			continue
+		}
+
+		// ── TOOL-CALL LIMIT ──
+		if turn == maxRuns {
+			// Tools were stripped by ApplyContextBudget but the LLM still
+			// emitted tool calls. Return any text content as a partial answer.
+			if content := strings.TrimSpace(resp.Content); content != "" {
+				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.GenerationPayload{Phase: "completed_at_limit", ToolRuns: turn})
+				}
+				l.recordTurn(req, resp, turn, 0, 0, turnStart)
+				return content, nil
+			}
+			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+					lm.AgentID, lm.SessionID, lm.CorrID, "error",
+					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", maxRuns)})
+			}
+			return "", fmt.Errorf("librarian exceeded tool-call limit (%d)", maxRuns)
+		}
+
+		if err := l.toolRuntime().ValidateBatch(l.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
+		}
+
+		// ── EXECUTE TOOL CALLS ──
+		errCount, rerouted := l.applyToolCalls(ctx, req, resp, turn, searchLedger)
 		l.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
@@ -158,11 +243,36 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 	return "", fmt.Errorf("librarian exhausted tool-call loop")
 }
 
+// injectEvidenceSummary appends or replaces the evidence summary at the
+// end of the message list. The summary is placed as the final message
+// so the LLM sees it as current context right before generating its
+// response. If a prior evidence summary exists at the tail, it is
+// replaced in-place to avoid unbounded growth.
+func injectEvidenceSummary(req *providers.Request, summary string) {
+	// Replace existing tail evidence summary if present.
+	if n := len(req.Messages); n > 0 {
+		tail := &req.Messages[n-1]
+		if tail.Role == providers.RoleUser &&
+			strings.HasPrefix(tail.Content, "[SEARCH EVIDENCE LEDGER]") {
+			tail.Content = summary
+			return
+		}
+	}
+	// Append new evidence summary.
+	req.Messages = append(req.Messages, providers.Message{
+		Role:    providers.RoleUser,
+		Content: summary,
+	})
+}
+
 // applyToolCalls appends the assistant message and tool results to the request.
+// Records each search tool's results into the SearchLedger.
 func (l *Librarian) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
+	turn int,
+	searchLedger *SearchLedger,
 ) (int, bool) {
 	req.Messages = append(req.Messages, providers.Message{
 		Role:      providers.RoleAssistant,
@@ -179,9 +289,15 @@ func (l *Librarian) applyToolCalls(
 		if ctx.Err() != nil {
 			break
 		}
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := shared.TimedToolCall(ctx, "librarian", call, func() (string, error) {
-			return l.executeToolCall(ctx, call)
+			execResult, execErr = l.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			l.toolDefsDirty = true
+		}
 		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
@@ -207,6 +323,12 @@ func (l *Librarian) applyToolCalls(
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil && !isError {
 			result = gov.LimitToolOutput(ctx, result, call.Name)
 		}
+
+		// Record successful search results into the ledger.
+		if !isError {
+			searchLedger.Record(turn, call.Name, call.Arguments, result)
+		}
+
 		req.Messages = append(req.Messages, providers.Message{
 			Role:       providers.RoleTool,
 			ToolCallID: call.ID,
@@ -227,10 +349,10 @@ func (l *Librarian) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (l *Librarian) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
+func (l *Librarian) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
-		return "", fmt.Errorf("tool name is required")
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -238,18 +360,18 @@ func (l *Librarian) executeToolCall(ctx context.Context, call providers.ToolCall
 		raw = "{}"
 	}
 	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
-
-	result := l.skills.Invoke(ctx, name, json.RawMessage(raw))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = l.id + "-local"
 	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return shared.MarshalToolOutput(result.Data)
+	return l.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         l.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: l.toolRuntime().CapabilityScope(),
+	})
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -264,33 +386,33 @@ func (l *Librarian) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (l *Librarian) buildToolDefinitions() []providers.Tool {
-	loaded := l.skills.GetLoaded()
-	if len(loaded) == 0 {
+	l.toolRuntime().SyncActiveFromLoaded()
+	return l.toolRuntime().BuildToolDefinitions()
+}
+
+func (l *Librarian) toolRuntime() *toolruntime.Runtime {
+	return l.tools
+}
+
+func (l *Librarian) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
 		return nil
 	}
-
-	tools := make([]providers.Tool, 0, len(loaded))
-	for _, skill := range loaded {
-		def := skill.ToToolDefinition()
-		name, _ := def["name"].(string)
-		if name == "" {
-			continue
-		}
-		description, _ := def["description"].(string)
-		parameters := shared.CoerceMap(def["input_schema"])
-		if len(parameters) == 0 {
-			parameters = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, providers.Tool{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = l.id + "-local"
+	}
+	scope := l.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         l.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
 		})
 	}
-	return tools
+	return invocations
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
@@ -313,6 +435,8 @@ func (l *Librarian) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,

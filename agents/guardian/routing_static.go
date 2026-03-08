@@ -84,8 +84,10 @@ func GuardianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.6,
 			},
-			Description: "Safety sidecar — git mutation gating, content validation, credential detection, agent health monitoring.",
-			Priority:    95,
+			Description:           "Safety sidecar — git mutation gating, content validation, credential detection, agent health monitoring.",
+			Priority:              95,
+			RuntimeProfiles:       guardianRuntimeProfiles(),
+			DefaultRuntimeProfile: guardianDefaultRuntimeProfile(),
 		},
 	}
 }

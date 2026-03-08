@@ -14,15 +14,16 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
+	"github.com/adalundhe/sylk/core/toolruntime"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -46,9 +47,11 @@ type Orchestrator struct {
 	registrySub guide.Subscription
 	running     bool
 
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	hooks       *skills.HookRegistry
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
+	tools         *toolruntime.Runtime
+	toolDefsDirty bool
 
 	healthMonitor *HealthMonitor
 	healthCache   *HealthCache
@@ -58,7 +61,7 @@ type Orchestrator struct {
 	// LLM integration
 	provider  OrchestratorProvider // LLM provider (nil = fallback mode)
 	eventCh   chan *busEvent       // buffered channel for LLM event loop
-	bootGate  *bootstrapGate           // signal-based readiness gate for LLM loop
+	bootGate  *bootstrapGate       // signal-based readiness gate for LLM loop
 	llmCtx    context.Context
 	llmCancel context.CancelFunc
 	llmWg     sync.WaitGroup // tracks the LLM loop goroutine
@@ -93,6 +96,10 @@ type Orchestrator struct {
 
 	// Auth credential change subscription.
 	authSub guide.Subscription
+
+	// Sync RPC (for Guardian preflight and other direct consultations).
+	pendingMu  sync.Mutex
+	pendingBus map[string]chan *guide.Message
 
 	// refreshProvider re-resolves the LLM provider on auth changes.
 	// Set via SetProviderRefresher from bootstrap. The authMethod parameter
@@ -146,25 +153,21 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 	}
 
 	skillsRegistry := skills.NewRegistry()
-	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	skillsLoaderCfg.CoreSkills = orchestratorPinnedSkillNames()
-	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
-	skillLoader := skills.NewLoader(skillsRegistry, skillsLoaderCfg)
 	hookRegistry := skills.NewHookRegistry()
 
 	o := &Orchestrator{
-		config:      cfg,
-		state:       NewState(cfg.SessionID),
-		skills:      skillsRegistry,
-		skillLoader: skillLoader,
-		hooks:       hookRegistry,
-		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		activityPub: activityPub,
-		sessionVFS:  make(map[string]*versioning.SessionVFS),
-		logger:      logger,
-		logWAL:      logCloser,
+		config:            cfg,
+		state:             NewState(cfg.SessionID),
+		skills:            skillsRegistry,
+		hooks:             hookRegistry,
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		activityPub:       activityPub,
+		sessionVFS:        make(map[string]*versioning.SessionVFS),
+		logger:            logger,
+		logWAL:            logCloser,
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
+		pendingBus:        make(map[string]chan *guide.Message),
 	}
 
 	if provider != nil {
@@ -196,6 +199,21 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 	}
 
 	o.registerCoreSkills()
+	skillsLoaderCfg := skills.DefaultLoaderConfig()
+	skillsLoaderCfg.CoreSkills = orchestratorPinnedSkillNames()
+	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
+	o.skillLoader = skills.NewLoader(skillsRegistry, skillsLoaderCfg)
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: o.skills,
+		Hooks:    o.hooks,
+		Manifest: orchestratorToolManifest(o.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize orchestrator tool runtime: %w", err)
+	}
+	o.tools = tools
+	o.tools.SyncActiveFromLoaded()
 
 	return o, nil
 }
@@ -620,6 +638,10 @@ func (o *Orchestrator) Stop() error {
 	if o.scope != nil {
 		o.scope.Shutdown(5*time.Second, 10*time.Second)
 	}
+	if o.tools != nil {
+		o.tools.Close()
+		o.tools = nil
+	}
 
 	o.mu.Lock()
 	errs := o.unsubscribeAll()
@@ -836,9 +858,17 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		AgentID:     o.config.AgentID,
 		SessionID:   fwd.SessionID,
 	})
-	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
-		o.config.Model, o.config.MaxOutputTokens, 0,
-	))
+	gov := shared.NewContextGovernor(o.config.Model, o.config.MaxOutputTokens, 0)
+	if o.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return o.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = shared.WithContextGovernor(ctx, gov)
+	ctx = shared.WithProgressPublisher(ctx, &shared.ProgressPublisher{
+		Bus: o.bus, Channels: o.channels,
+		AgentID: o.config.AgentID, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	if !fwd.FireAndForget {
 		o.logInfo("handleBusRequest: publishing StreamStart",
@@ -904,6 +934,10 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 }
 
 func (o *Orchestrator) handleBusResponse(msg *guide.Message) error {
+	if o.deliverPendingMessage(msg) {
+		return nil
+	}
+
 	o.mu.RLock()
 	router := o.taskRouter
 	o.mu.RUnlock()
@@ -930,21 +964,21 @@ func (o *Orchestrator) handleRegistryAnnouncement(msg *guide.Message) error {
 		o.knownAgents[ann.AgentID] = ann
 		o.healthMonitor.RegisterAgent(ann.AgentID)
 		o.pushEvent(&busEvent{
-			Topic:    guide.TopicAgentRegistry,
+			Topic:     guide.TopicAgentRegistry,
 			Timestamp: time.Now(),
-			Severity: severityInfo,
-			Summary:  fmt.Sprintf("Agent %q registered", ann.AgentID),
-			Data:     map[string]any{"agent_id": ann.AgentID},
+			Severity:  severityInfo,
+			Summary:   fmt.Sprintf("Agent %q registered", ann.AgentID),
+			Data:      map[string]any{"agent_id": ann.AgentID},
 		})
 	case guide.MessageTypeAgentUnregistered:
 		delete(o.knownAgents, ann.AgentID)
 		o.healthMonitor.UnregisterAgent(ann.AgentID)
 		o.pushEvent(&busEvent{
-			Topic:    guide.TopicAgentRegistry,
+			Topic:     guide.TopicAgentRegistry,
 			Timestamp: time.Now(),
-			Severity: severityInfo,
-			Summary:  fmt.Sprintf("Agent %q unregistered", ann.AgentID),
-			Data:     map[string]any{"agent_id": ann.AgentID},
+			Severity:  severityInfo,
+			Summary:   fmt.Sprintf("Agent %q unregistered", ann.AgentID),
+			Data:      map[string]any{"agent_id": ann.AgentID},
 		})
 	}
 
@@ -1038,11 +1072,11 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	o.mu.Unlock()
 
 	o.pushEvent(&busEvent{
-		Topic:    "tasks.dispatch",
+		Topic:     "tasks.dispatch",
 		Timestamp: now,
-		Severity: severityInfo,
-		Summary:  fmt.Sprintf("Task %q dispatched to agent %s", name, agentID),
-		Data:     map[string]any{"task_id": taskID, "agent_id": agentID, "workflow_id": workflowID},
+		Severity:  severityInfo,
+		Summary:   fmt.Sprintf("Task %q dispatched to agent %s", name, agentID),
+		Data:      map[string]any{"task_id": taskID, "agent_id": agentID, "workflow_id": workflowID},
 	})
 
 	// Publish pipeline agent activity so the TUI panel shows ALL pipeline agents.
@@ -1141,11 +1175,11 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	o.submitTaskEventAsync(task)
 
 	o.pushEvent(&busEvent{
-		Topic:    "tasks.complete",
+		Topic:     "tasks.complete",
 		Timestamp: now,
-		Severity: severityInfo,
-		Summary:  fmt.Sprintf("Task %q completed on agent %s", task.Name, task.AssignedAgentID),
-		Data:     map[string]any{"task_id": taskID, "agent_id": task.AssignedAgentID},
+		Severity:  severityInfo,
+		Summary:   fmt.Sprintf("Task %q completed on agent %s", task.Name, task.AssignedAgentID),
+		Data:      map[string]any{"task_id": taskID, "agent_id": task.AssignedAgentID},
 	})
 
 	return nil
@@ -1187,11 +1221,11 @@ func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 	o.submitTaskEventAsync(task)
 
 	o.pushEvent(&busEvent{
-		Topic:    "tasks.failed",
+		Topic:     "tasks.failed",
 		Timestamp: now,
-		Severity: severityCritical,
-		Summary:  fmt.Sprintf("Task %q failed on agent %s: %s", task.Name, task.AssignedAgentID, errorMsg),
-		Data:     map[string]any{"task_id": taskID, "agent_id": task.AssignedAgentID, "error": errorMsg},
+		Severity:  severityCritical,
+		Summary:   fmt.Sprintf("Task %q failed on agent %s: %s", task.Name, task.AssignedAgentID, errorMsg),
+		Data:      map[string]any{"task_id": taskID, "agent_id": task.AssignedAgentID, "error": errorMsg},
 	})
 
 	return nil
@@ -1235,11 +1269,11 @@ func (o *Orchestrator) handleWorkflowStatus(msg *guide.Message) error {
 	}
 
 	o.pushEvent(&busEvent{
-		Topic:    "workflows.status",
+		Topic:     "workflows.status",
 		Timestamp: time.Now(),
-		Severity: sev,
-		Summary:  fmt.Sprintf("Workflow %q status: %s (phase: %s)", workflowID, statusStr, phase),
-		Data:     map[string]any{"workflow_id": workflowID, "status": statusStr, "phase": phase},
+		Severity:  sev,
+		Summary:   fmt.Sprintf("Workflow %q status: %s (phase: %s)", workflowID, statusStr, phase),
+		Data:      map[string]any{"workflow_id": workflowID, "status": statusStr, "phase": phase},
 	})
 
 	return nil
@@ -1567,6 +1601,8 @@ func (o *Orchestrator) GetRoutingInfo() *guide.AgentRoutingInfo {
 				Intents: []guide.Intent{guide.IntentChat, guide.IntentStatus, guide.IntentRecall, guide.IntentHelp},
 				Domains: []guide.Domain{guide.DomainTasks, "workflow", "health"},
 			},
+			RuntimeProfiles:       orchestratorRuntimeProfiles(),
+			DefaultRuntimeProfile: orchestratorDefaultRuntimeProfile(),
 		},
 		ActionShortcuts: []guide.ActionShortcut{
 			{Name: "status", DefaultIntent: guide.IntentStatus, DefaultDomain: "workflow"},
@@ -2068,11 +2104,14 @@ func (o *Orchestrator) AgentType() string {
 
 // Descriptor returns the agent descriptor for handoff decisions.
 func (o *Orchestrator) Descriptor() handoff.AgentDescriptor {
+	modelID := o.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:     "orchestrator",
-		ModelID:       o.CurrentModel(),
-		ContextWindow: 1_000_000,
-		Category:      handoff.CategoryStandalone,
+		AgentType:             "orchestrator",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryStandalone,
+		RuntimeProfiles:       orchestratorRuntimeProfiles(),
+		DefaultRuntimeProfile: orchestratorDefaultRuntimeProfile(),
 	}
 }
 

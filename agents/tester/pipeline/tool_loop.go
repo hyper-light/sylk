@@ -11,9 +11,11 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // executeToolLoop runs the model tool-call loop: Complete → check ToolCalls →
@@ -24,6 +26,11 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 	consecutiveErrors := 0
 
 	for turn := 0; turn <= pt.config.MaxToolRuns; turn++ {
+		if pt.toolDefsDirty {
+			req.Tools = pt.buildToolDefinitions()
+			pt.toolDefsDirty = false
+		}
+
 		// ── STEERING CHECKPOINT ──
 		sc := shared.DrainAndCheckpoint(ledger, req, turn, "testing", nil)
 		if sc.Rollback != nil || sc.EditReplay != nil {
@@ -63,8 +70,7 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		}
 
 		turnStart := time.Now()
-		resp, err := pt.getProvider().Complete(ctx, req)
-		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
+		resp, err := shared.CompleteWithWatchdog(ctx, pt.getProvider(), req, shared.AgentDisplayName("tester-pipeline"))
 		if err != nil {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -79,16 +85,18 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		}
 
 		if len(resp.ToolCalls) == 0 {
+			pt.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
 					&agentlog.TestSuitePayload{Phase: "tool_loop_completed"})
 			}
-			pt.recordTurn(req, resp, turn, 0, 0, turnStart)
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-
+		if err := pt.toolRuntime().ValidateBatch(pt.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
+		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -139,9 +147,15 @@ func (pt *PipelineTester) applyToolCalls(
 	errCount := 0
 	rerouted := false
 	for _, call := range resp.ToolCalls {
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := shared.TimedToolCall(ctx, "tester-pipeline", call, func() (string, error) {
-			return pt.executeToolCall(ctx, call)
+			execResult, execErr = pt.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			pt.toolDefsDirty = true
+		}
 		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
@@ -181,10 +195,10 @@ func (pt *PipelineTester) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
+func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
-		return "", fmt.Errorf("tool name is required")
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -192,18 +206,18 @@ func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.To
 		raw = "{}"
 	}
 	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
-
-	result := pt.skills.Invoke(ctx, name, json.RawMessage(raw))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = pt.id + "-local"
 	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return shared.MarshalToolOutput(result.Data)
+	return pt.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         pt.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: pt.toolRuntime().CapabilityScope(),
+	})
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -218,33 +232,33 @@ func (pt *PipelineTester) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider tool format.
 func (pt *PipelineTester) buildToolDefinitions() []providers.Tool {
-	loaded := pt.skills.GetLoaded()
-	if len(loaded) == 0 {
+	pt.toolRuntime().SyncActiveFromLoaded()
+	return pt.toolRuntime().BuildToolDefinitions()
+}
+
+func (pt *PipelineTester) toolRuntime() *toolruntime.Runtime {
+	return pt.tools
+}
+
+func (pt *PipelineTester) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
 		return nil
 	}
-
-	tools := make([]providers.Tool, 0, len(loaded))
-	for _, skill := range loaded {
-		def := skill.ToToolDefinition()
-		name, _ := def["name"].(string)
-		if name == "" {
-			continue
-		}
-		description, _ := def["description"].(string)
-		parameters := shared.CoerceMap(def["input_schema"])
-		if len(parameters) == 0 {
-			parameters = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, providers.Tool{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = pt.id + "-local"
+	}
+	scope := pt.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         pt.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
 		})
 	}
-	return tools
+	return invocations
 }
 
 // Tool loop helpers (marshalToolOutput, toolErrorPayload, coerceMap,
@@ -270,6 +284,8 @@ func (pt *PipelineTester) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,

@@ -19,9 +19,9 @@ import (
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -54,8 +54,10 @@ type PipelineTester struct {
 	diagEngine shared.DiagnosisEngine
 
 	// Skills.
-	skills      *skills.Registry
-	skillLoader *skills.Loader
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	tools         *toolruntime.Runtime
+	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
 	bus         guide.EventBus
@@ -107,7 +109,9 @@ func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*Pip
 
 	pt.steering.InitLazy("tester-pipeline", nil)
 
-	pt.initSkills()
+	if err := pt.initSkills(); err != nil {
+		return nil, err
+	}
 	return pt, nil
 }
 
@@ -131,22 +135,26 @@ func applyConfigDefaults(cfg shared.PipelineTesterConfig) shared.PipelineTesterC
 	return cfg
 }
 
-func (pt *PipelineTester) initSkills() {
+func (pt *PipelineTester) initSkills() error {
 	pt.skills = skills.NewRegistry()
 
+	pt.registerCoreSkills()
+
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"check_inspector_gate",
-		"analyze_risk",
-		"plan_tests",
-		"write_test",
-		"run_test_suite",
-		"diagnose_failure",
-	}
+	loaderCfg.CoreSkills = pipelineTesterVisibleSkillNames()
 	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	pt.skillLoader = skills.NewLoader(pt.skills, loaderCfg)
-
-	pt.registerCoreSkills()
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: pt.skills,
+		Manifest: pipelineTesterToolManifest(pt.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize pipeline tester tool runtime: %w", err)
+	}
+	pt.tools = tools
+	pt.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 func (pt *PipelineTester) registerCoreSkills() {
@@ -243,6 +251,10 @@ func (pt *PipelineTester) SetWorkerType(wt string) {
 
 // Close shuts down the pipeline tester.
 func (pt *PipelineTester) Close() error {
+	if pt.tools != nil {
+		pt.tools.Close()
+		pt.tools = nil
+	}
 	return pt.Stop()
 }
 
@@ -361,12 +373,15 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		MaxTokens: maxTokens,
 		Tools:     tools,
 	}
-	llmruntime.Apply(req, pt.llmRuntimeProfile())
+	pt.applyLLMRuntimeProfile(req, "validation")
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
-	result, err := pt.executeToolLoop(ctx, req, agentshared.SteeringLedgerFromContext(ctx))
+	ledger := agentshared.SteeringLedgerFromContext(ctx)
+	result, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return pt.executeToolLoop(ctx, req, ledger)
+	})
 	if err != nil {
 		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -430,9 +445,17 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	startTime := time.Now()
 	toolEmitter := agentshared.NewToolCallEmitter(pt.bus, pt.channels, pt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
-	ctx = agentshared.WithContextGovernor(ctx, agentshared.NewContextGovernor(
-		pt.config.Model, pt.config.MaxTokens, 0,
-	))
+	gov := agentshared.NewContextGovernor(pt.config.Model, pt.config.MaxTokens, 0)
+	if pt.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return pt.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = agentshared.WithContextGovernor(ctx, gov)
+	ctx = agentshared.WithProgressPublisher(ctx, &agentshared.ProgressPublisher{
+		Bus: pt.bus, Channels: pt.channels,
+		AgentID: pt.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	result, err := pt.Handle(ctx, fwd)
 	agentshared.LogResponse(pt.steering.EventLogger(), fwd.CorrelationID, pt.id, fwd.SessionID, time.Since(startTime), err)
@@ -554,8 +577,10 @@ func (pt *PipelineTester) GetRoutingInfo() *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.6,
 			},
-			Description: "Pipeline quality engineer. Validates individual task output with 6-phase LLM-driven testing protocol.",
-			Priority:    65,
+			Description:           "Pipeline quality engineer. Validates individual task output with 6-phase LLM-driven testing protocol.",
+			Priority:              65,
+			RuntimeProfiles:       pipelineTesterRuntimeProfiles(),
+			DefaultRuntimeProfile: pipelineTesterDefaultRuntimeProfile(),
 		},
 	}
 }
@@ -620,19 +645,13 @@ func (pt *PipelineTester) Descriptor() handoff.AgentDescriptor {
 	reasoning := pt.config.ReasoningEffort
 	pt.mu.RUnlock()
 	return handoff.AgentDescriptor{
-		AgentType:       "tester-pipeline",
-		ModelID:         model,
-		ReasoningEffort: reasoning,
-		ContextWindow:   200_000,
-		Category:        handoff.CategoryPipeline,
-	}
-}
-
-func (pt *PipelineTester) llmRuntimeProfile() llmruntime.Profile {
-	pt.mu.RLock()
-	defer pt.mu.RUnlock()
-	return llmruntime.Profile{
-		ReasoningEffort: pt.config.ReasoningEffort,
+		AgentType:             "tester-pipeline",
+		ModelID:               model,
+		ReasoningEffort:       reasoning,
+		ContextWindow:         handoff.ContextWindowForModel(model),
+		Category:              handoff.CategoryPipeline,
+		RuntimeProfiles:       pipelineTesterRuntimeProfiles(),
+		DefaultRuntimeProfile: pipelineTesterDefaultRuntimeProfile(),
 	}
 }
 

@@ -12,8 +12,10 @@ type Profile struct {
 	ReasoningEffort      string `json:"reasoning_effort,omitempty"`
 	ReasoningSummary     string `json:"reasoning_summary,omitempty"`
 	Verbosity            string `json:"verbosity,omitempty"`
+	IncludeThoughts      *bool  `json:"include_thoughts,omitempty"`
 	PromptCacheKey       string `json:"prompt_cache_key,omitempty"`
 	PromptCacheRetention string `json:"prompt_cache_retention,omitempty"`
+	UsePromptCache       *bool  `json:"use_prompt_cache,omitempty"`
 	ParallelToolCalls    *bool  `json:"parallel_tool_calls,omitempty"`
 	ThinkingBudget       *int   `json:"thinking_budget,omitempty"`
 	DisableParallelTools *bool  `json:"disable_parallel_tools,omitempty"`
@@ -34,11 +36,17 @@ func Apply(req *providers.Request, profile Profile) {
 	if value := strings.TrimSpace(profile.Verbosity); value != "" {
 		req.Verbosity = value
 	}
+	if profile.IncludeThoughts != nil {
+		req.IncludeThoughts = Bool(*profile.IncludeThoughts)
+	}
 	if value := strings.TrimSpace(profile.PromptCacheKey); value != "" {
 		req.PromptCacheKey = value
 	}
 	if value := strings.TrimSpace(profile.PromptCacheRetention); value != "" {
 		req.PromptCacheRetention = value
+	}
+	if profile.UsePromptCache != nil {
+		req.UsePromptCache = Bool(*profile.UsePromptCache)
 	}
 	if profile.ParallelToolCalls != nil {
 		req.ParallelToolCalls = Bool(*profile.ParallelToolCalls)

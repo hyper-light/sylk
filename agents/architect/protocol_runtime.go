@@ -370,13 +370,16 @@ func (r *planningProtocolRunner) run() error {
 		SystemPrompt: system,
 		Tools:        tools,
 	}
-	r.architect.applyProtocolRuntimeProfile(req)
+	r.architect.applyProtocolRuntimeProfile(req, r.plan.SessionID)
 
-	text, err := r.architect.executeToolLoop(
-		loopCtx, req, "planning_protocol",
-		func(chunk string) { r.architect.publishPlanStreamChunk(r.ctx, chunk) },
-		shared.SteeringLedgerFromContext(loopCtx),
-	)
+	ledger := shared.SteeringLedgerFromContext(loopCtx)
+	text, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return r.architect.executeToolLoop(
+			loopCtx, req, "planning_protocol",
+			func(chunk string) { r.architect.publishPlanStreamChunk(r.ctx, chunk) },
+			ledger,
+		)
+	})
 	if err != nil {
 		return err
 	}

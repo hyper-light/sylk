@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,8 +20,8 @@ type podTrackingActivator struct {
 }
 
 func (a *podTrackingActivator) EnsurePodActive(_ context.Context, _ string) error { return nil }
-func (a *podTrackingActivator) TouchPodActivity(string)                          {}
-func (a *podTrackingActivator) PodForAgent(agentType string) string              { return agentType }
+func (a *podTrackingActivator) TouchPodActivity(string)                           {}
+func (a *podTrackingActivator) PodForAgent(agentType string) string               { return agentType }
 
 func (a *podTrackingActivator) HoldPodActive(_ context.Context, agentType string) (func(), error) {
 	a.mu.Lock()

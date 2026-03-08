@@ -40,6 +40,7 @@ import (
 	"github.com/adalundhe/sylk/core/container/network"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/knowledge/query"
@@ -1937,6 +1938,13 @@ func bootstrapGuardian(
 	if err != nil {
 		return nil, err
 	}
+
+	// Wire quarantine buffer for external content inspection.
+	g.SetQuarantine(fetch.NewQuarantineBuffer(
+		guardian.DefaultQuarantineMaxItems,
+		guardian.DefaultQuarantineMaxBytes,
+	))
+
 	if err := g.Start(bus); err != nil {
 		return nil, err
 	}
@@ -1996,6 +2004,11 @@ func wireGuardianPostBootDeps(
 	// Seed agent registry from the Guide's current state so the Guardian
 	// doesn't start with total=0 after daemon restart.
 	if g := guideRef.Load(); g != nil {
+		// Reap agents stuck in not-ready state before seeding — prevents
+		// stale registrations from persisting across daemon restarts.
+		if reaped := g.ReapStaleRegistrations(); reaped > 0 {
+			slog.Info("guardian post-boot: reaped stale agent registrations", "count", reaped)
+		}
 		grd.SeedKnownAgents(g.RegisteredAgentInfos())
 		_ = registerAgentWithGuide(g, grd, "guardian")
 	}

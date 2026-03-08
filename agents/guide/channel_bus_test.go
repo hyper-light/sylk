@@ -514,14 +514,16 @@ func TestChannelBus_WildcardSubscription_SingleSegment(t *testing.T) {
 	bus.Publish("pipeline.update.designer", &guide.Message{ID: "msg-des"})
 	bus.Publish("pipeline.update.inspector", &guide.Message{ID: "msg-ins"})
 
-	for _, wantID := range []string{"msg-eng", "msg-des", "msg-ins"} {
+	var gotIDs []string
+	for range 3 {
 		select {
 		case msg := <-received:
-			assert.Equal(t, wantID, msg.ID)
+			gotIDs = append(gotIDs, msg.ID)
 		case <-time.After(time.Second):
-			t.Fatalf("timeout waiting for %s", wantID)
+			t.Fatal("timeout waiting for wildcard delivery")
 		}
 	}
+	assert.ElementsMatch(t, []string{"msg-eng", "msg-des", "msg-ins"}, gotIDs)
 }
 
 func TestChannelBus_WildcardSubscription_NoFalseMatch(t *testing.T) {

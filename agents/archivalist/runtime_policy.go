@@ -5,28 +5,56 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-// Archivalist currently leaves runtime tuning to provider defaults for its
-// conversational tool-loop path.
 func (a *Archivalist) applyConversationRuntimeProfile(req *providers.Request) {
-	llmruntime.Apply(req, a.conversationRuntimeProfile())
+	llmruntime.ApplyStage(req, a.conversationStageProfile(), llmruntime.ApplyOptions{
+		Model:     archivalistRuntimeModel(req, a.CurrentModel()),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "archivalist",
+		SessionID: a.GetDefaultSession(),
+	})
 }
 
-func (a *Archivalist) conversationRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{}
+func (a *Archivalist) conversationStageProfile() llmruntime.StageProfile {
+	return llmruntime.ResolveAgentStageProfile("archivalist", "conversation")
 }
 
 func (c *Client) applyGenerationRuntimeProfile(req *providers.Request) {
-	llmruntime.Apply(req, c.generationRuntimeProfile())
+	llmruntime.ApplyStage(req, c.generationStageProfile(), llmruntime.ApplyOptions{
+		Model:     archivalistRuntimeModel(req, c.model),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "archivalist",
+		SessionID: "",
+	})
 }
 
-func (c *Client) generationRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{}
+func (c *Client) generationStageProfile() llmruntime.StageProfile {
+	return llmruntime.ResolveAgentStageProfile("archivalist", "generation")
 }
 
 func (s *Synthesizer) applySynthesisRuntimeProfile(req *providers.Request) {
-	llmruntime.Apply(req, s.synthesisRuntimeProfile())
+	llmruntime.ApplyStage(req, s.synthesisStageProfile(), llmruntime.ApplyOptions{
+		Model:     archivalistRuntimeModel(req, s.model),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "archivalist",
+		SessionID: "",
+	})
 }
 
-func (s *Synthesizer) synthesisRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{}
+func (s *Synthesizer) synthesisStageProfile() llmruntime.StageProfile {
+	return llmruntime.ResolveAgentStageProfile("archivalist", "synthesis")
+}
+
+func archivalistRuntimeProfiles() []llmruntime.StageProfile {
+	return llmruntime.AgentProfiles("archivalist")
+}
+
+func archivalistDefaultRuntimeProfile() string {
+	return llmruntime.AgentDefaultProfile("archivalist")
+}
+
+func archivalistRuntimeModel(req *providers.Request, fallback string) string {
+	if req != nil && req.Model != "" {
+		return req.Model
+	}
+	return fallback
 }

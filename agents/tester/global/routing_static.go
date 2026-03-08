@@ -41,8 +41,10 @@ func TesterRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.6,
 			},
-			Description: "Cross-pipeline SDET. Architects integration/e2e test strategies with 7-phase LLM-driven protocol.",
-			Priority:    70,
+			Description:           "Cross-pipeline SDET. Architects integration/e2e test strategies with 7-phase LLM-driven protocol.",
+			Priority:              70,
+			RuntimeProfiles:       testerRuntimeProfiles(),
+			DefaultRuntimeProfile: testerDefaultRuntimeProfile(),
 		},
 	}
 }

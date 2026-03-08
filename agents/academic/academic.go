@@ -21,6 +21,7 @@ import (
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/google/uuid"
 )
 
@@ -53,6 +54,7 @@ type Academic struct {
 	skills        *skills.Registry
 	skillLoader   *skills.Loader
 	hooks         *skills.HookRegistry
+	tools         *toolruntime.Runtime
 	toolDefsDirty bool
 
 	// Activity publisher for UI agent-panel updates.
@@ -110,7 +112,7 @@ type Config struct {
 	MaxOutputTokens int    // Optional, uses DefaultMaxOutputTokens if 0
 
 	// Model configuration
-	Model       string // LLM model ID (default: claude-opus-4-5-20250115)
+	Model       string // LLM model ID (default: gpt-5.4-pro)
 	MaxToolRuns int    // Maximum tool loop iterations (default: 12)
 
 	// ActivityPub publishes activity events so the UI agent panel tracks
@@ -185,9 +187,21 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 	a.registerFetchSkills()
 
 	skillsLoaderCfg := skills.DefaultLoaderConfig()
-	skillsLoaderCfg.CoreSkills = []string{"research_topic", "find_best_practices", "web_fetch"}
+	skillsLoaderCfg.CoreSkills = academicVisibleSkillNames()
 	skillsLoaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	a.skillLoader = skills.NewLoader(skillsRegistry, skillsLoaderCfg)
+
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: a.skills,
+		Hooks:    a.hooks,
+		Manifest: academicToolManifest(a.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize academic tool runtime: %w", err)
+	}
+	a.tools = tools
+	a.tools.SyncActiveFromLoaded()
 
 	return a, nil
 }
@@ -234,6 +248,10 @@ func applyConfigDefaults(cfg Config) Config {
 
 // Close closes the Academic agent and its resources.
 func (a *Academic) Close() error {
+	if a.tools != nil {
+		a.tools.Close()
+		a.tools = nil
+	}
 	a.Stop()
 	return nil
 }
@@ -482,9 +500,17 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		AgentID:     "academic",
 		SessionID:   fwd.SessionID,
 	})
-	ctx = shared.WithContextGovernor(ctx, shared.NewContextGovernor(
-		a.config.Model, a.config.MaxOutputTokens, 0,
-	))
+	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
+	if a.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = shared.WithContextGovernor(ctx, gov)
+	ctx = shared.WithProgressPublisher(ctx, &shared.ProgressPublisher{
+		Bus: a.bus, Channels: a.channels,
+		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	result, err := a.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, "academic", fwd.SessionID, time.Since(startTime), err)
@@ -621,7 +647,10 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
-	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return a.executeToolLoop(ctx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("fetch failed: %w", err)
 	}
@@ -648,7 +677,10 @@ func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
-	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return a.executeToolLoop(ctx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("research recall failed: %w", err)
 	}
@@ -680,7 +712,10 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
-	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return a.executeToolLoop(ctx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("research check failed: %w", err)
 	}
@@ -956,7 +991,10 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 	}
 	a.applyLLMRuntimeProfile(llmReq, "research")
 
-	result, err := a.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return a.executeToolLoop(ctx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("research failed: %w", err)
 	}
@@ -1130,11 +1168,14 @@ func (a *Academic) AgentType() string {
 
 // Descriptor returns the immutable metadata describing this agent type.
 func (a *Academic) Descriptor() handoff.AgentDescriptor {
+	modelID := a.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:     "academic",
-		ModelID:       a.CurrentModel(),
-		ContextWindow: 200000,
-		Category:      handoff.CategoryKnowledge,
+		AgentType:             "academic",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryKnowledge,
+		RuntimeProfiles:       academicRuntimeProfiles(),
+		DefaultRuntimeProfile: academicDefaultRuntimeProfile(),
 	}
 }
 
@@ -1196,8 +1237,10 @@ func (a *Academic) Registration() *guide.AgentRegistration {
 		Constraints: guide.AgentConstraints{
 			MinConfidence: 0.5,
 		},
-		Description: "Researches external knowledge, best practices, and technical approaches. Always validates against codebase reality via Librarian.",
-		Priority:    50,
+		Description:           "Researches external knowledge, best practices, and technical approaches. Always validates against codebase reality via Librarian.",
+		Priority:              50,
+		RuntimeProfiles:       academicRuntimeProfiles(),
+		DefaultRuntimeProfile: academicDefaultRuntimeProfile(),
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"github.com/adalundhe/sylk/agents/architect"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -94,7 +93,7 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 		Temperature:  &temp,
 		Tools:        tools,
 	}
-	llmruntime.Apply(llmReq, o.conversationLLMRuntimeProfile())
+	o.applyConversationRuntimeProfile(llmReq)
 	if len(tools) > 0 {
 		llmReq.ToolChoice = "auto"
 	}
@@ -106,7 +105,10 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 	defer cancel()
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
 
-	response, err := o.executeToolLoop(llmCtx, llmReq, shared.SteeringLedgerFromContext(llmCtx))
+	ledger := shared.SteeringLedgerFromContext(llmCtx)
+	response, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return o.executeToolLoop(llmCtx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator conversation: %w", err)
 	}
@@ -190,7 +192,7 @@ func (o *Orchestrator) generateIngestionSummary(
 		MaxTokens:    conversationMaxTokens,
 		Temperature:  &temp,
 	}
-	llmruntime.Apply(llmReq, o.conversationLLMRuntimeProfile())
+	o.applyConversationRuntimeProfile(llmReq)
 
 	llmCtx, cancel := context.WithTimeout(ctx, ingestionLLMTimeout)
 	defer cancel()
@@ -212,10 +214,6 @@ func (o *Orchestrator) generateIngestionSummary(
 		Response: trimmed,
 		Intent:   "ingestion_ack",
 	}, nil
-}
-
-func (o *Orchestrator) conversationLLMRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{}
 }
 
 // buildIngestionSummaryPrompt composes the user message for the LLM to

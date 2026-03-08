@@ -18,6 +18,7 @@ import (
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -778,11 +779,11 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		// the OOM that was previously possible when conversation-flow
 		// remapped an explicit guide request back to the architect.
 		if request.ExplicitTarget && !explicitGuideFollowupAllowed(request.TargetAgentID) {
-			g.observeRoutedConversationTarget(request, targetAgentID)
+			g.observeRoutedConversationTarget(request, classification, targetAgentID)
 		} else if explicitGuideFollowupAllowed(request.TargetAgentID) {
 			classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 		} else {
-			g.observeRoutedConversationTarget(request, targetAgentID)
+			g.observeRoutedConversationTarget(request, classification, targetAgentID)
 		}
 		return classification, targetAgentID, nil
 	}
@@ -967,7 +968,8 @@ func emitClassificationProgress(ctx context.Context, message string) {
 
 func (g *Guide) finalizeClassification(ctx context.Context, input string, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
 	classification, targetAgentID = g.ensureRoutableClassification(ctx, classification, targetAgentID)
-	return g.applyGuidePreferencePolicy(input, classification, targetAgentID)
+	classification, targetAgentID = g.applyGuidePreferencePolicy(input, classification, targetAgentID)
+	return g.assignRuntimeProfile(classification, targetAgentID), targetAgentID
 }
 
 // finalizeClassificationWithExclude wraps finalizeClassification and checks
@@ -995,6 +997,7 @@ func (g *Guide) finalizeClassificationWithExclude(
 			}
 			if reg.Accepts(classification) {
 				classification.TargetAgent = TargetAgent(reg.ID)
+				classification.RuntimeProfile = defaultRuntimeProfileName(reg)
 				classification.Reason = "rerouted away from excluded agent " + targetAgentID
 				return classification, reg.ID
 			}
@@ -1126,6 +1129,35 @@ func (g *Guide) classificationSupportedByTarget(classification *RouteResult, tar
 		return true
 	}
 	return g.agentSupportsIntent(targetAgentID, classification.Intent)
+}
+
+func (g *Guide) assignRuntimeProfile(classification *RouteResult, targetAgentID string) *RouteResult {
+	if classification == nil || targetAgentID == "" {
+		return classification
+	}
+	agent := g.resolveAgent(targetAgentID)
+	if agent == nil || len(agent.RuntimeProfiles) == 0 {
+		return classification
+	}
+	if profile := llmruntime.MatchStage(agent.RuntimeProfiles, string(classification.Intent), string(classification.Domain)); profile != nil {
+		classification.RuntimeProfile = profile.Name
+		return classification
+	}
+	classification.RuntimeProfile = defaultRuntimeProfileName(agent)
+	return classification
+}
+
+func defaultRuntimeProfileName(agent *AgentRegistration) string {
+	if agent == nil {
+		return ""
+	}
+	if strings.TrimSpace(agent.DefaultRuntimeProfile) != "" {
+		return agent.DefaultRuntimeProfile
+	}
+	if len(agent.RuntimeProfiles) > 0 {
+		return agent.RuntimeProfiles[0].Name
+	}
+	return ""
 }
 
 // resolveAgent looks up an agent registration by ID first, then by name/alias.
@@ -1614,6 +1646,10 @@ func (g *Guide) resolveCorrelationID(request *RouteRequest) string {
 }
 
 func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *RouteResult, correlationID string) *ForwardedRequest {
+	metadata := mergeForwardMetadata(
+		g.conversationWorkMetadata(request.SessionID),
+		mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
+	)
 	fwd := &ForwardedRequest{
 		CorrelationID:        correlationID,
 		ParentCorrelationID:  request.ParentCorrelationID,
@@ -1631,7 +1667,7 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		CrossDomain:          classification.CrossDomain,
 		Hops:                 request.Hops,
 		ConversationHistory:  g.conversationHistory(request.SessionID, string(classification.TargetAgent)),
-		Metadata:             mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
+		Metadata:             metadata,
 	}
 	return fwd
 }
@@ -1650,6 +1686,13 @@ func mergeForwardMetadata(phase, request map[string]any) map[string]any {
 		merged[k] = v
 	}
 	return merged
+}
+
+func (g *Guide) conversationWorkMetadata(sessionID string) map[string]any {
+	if g == nil || g.conversation == nil {
+		return nil
+	}
+	return g.conversation.WorkMetadata(sessionID)
 }
 
 func (g *Guide) conversationHistory(sessionID string, targetAgentID string) []ConversationTurn {
@@ -2463,9 +2506,35 @@ func (g *Guide) handleRequestMessage(msg *Message) error {
 		return g.handleRerouteMessage(ctx, msg)
 	case MessageTypeUserInterrupt:
 		return g.handleUserInterruptMessage(msg)
+	case MessageTypeAction:
+		return g.forwardActionMessage(msg)
 	default:
 		return nil
 	}
+}
+
+// forwardActionMessage extracts the ActionRequest from an incoming action
+// message and republishes it to the target agent's request topic. This bridges
+// UI-originated steering commands (steer/edit/rollback/pace/cancel) through
+// the Guide to the agent's handleActionBusRequest handler.
+func (g *Guide) forwardActionMessage(msg *Message) error {
+	action, ok := msg.GetActionRequest()
+	if !ok || action == nil {
+		return nil
+	}
+
+	resolved := g.resolveAgentID(action.TargetAgentID)
+	topic := g.agentRequestTopic(resolved)
+
+	g.logEvent(agentlog.EventForwardDispatched, action.CorrelationID, "info", &agentlog.ForwardPayload{
+		TargetAgent: resolved,
+		Intent:      "action:" + action.Action,
+	})
+
+	// Republish the original message on the target agent's request topic.
+	// The message already carries the ActionRequest payload; the target
+	// agent's handleBusRequest switch on MessageTypeAction handles it.
+	return g.bus.Publish(topic, msg)
 }
 
 func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) error {
@@ -2664,8 +2733,8 @@ func (g *Guide) publishRerouteEvent(correlationID, sourceAgentID string, reroute
 		Type: StreamEventReroute,
 		Data: map[string]string{
 			"from_agent":              reroute.SourceAgentID,
-			"to_agent":               reroute.SuggestedTarget,
-			"reason":                 reroute.Reason,
+			"to_agent":                reroute.SuggestedTarget,
+			"reason":                  reroute.Reason,
 			"original_correlation_id": reroute.OriginalCorrelationID,
 			"new_correlation_id":      correlationID,
 		},
@@ -2981,7 +3050,6 @@ func (g *Guide) refreshAuthWithMode(ctx context.Context, mode string, strict boo
 	}
 	return nil
 }
-
 
 // SwapModel implements container.ModelSwappable.
 // Installs the pre-built, gateway-wrapped provider and rewires the
@@ -3488,11 +3556,11 @@ func (g *Guide) handleNotificationPush(push *AgentPush, _ *Message) error {
 		{Type: StreamEventComplete, Text: push.Content, Timestamp: time.Now()},
 	} {
 		resp := &StreamResponse{
-			CorrelationID:      push.PushID,
-			RespondingAgentID:  push.AgentID,
+			CorrelationID:       push.PushID,
+			RespondingAgentID:   push.AgentID,
 			RespondingAgentName: agentName,
-			TargetAgentID:      "tui",
-			Event:              event,
+			TargetAgentID:       "tui",
+			Event:               event,
 		}
 		g.publishStreamToSource("tui", resp)
 	}
@@ -3696,7 +3764,6 @@ func (g *Guide) userInterruptAction(req *UserInterruptRequest, pending *PendingR
 		Timestamp:     time.Now(),
 	}
 }
-
 
 // handleErrorMessage processes incoming error messages from agent error channels
 func (g *Guide) handleErrorMessage(msg *Message) error {
@@ -3928,6 +3995,28 @@ func (g *Guide) IsAgentReady(agentID string) bool {
 	return ready
 }
 
+// ReapStaleRegistrations removes agents that are registered but stuck in
+// not-ready state with no active bus subscriptions. This cleans up agents
+// that registered but never completed initialization (e.g. constructor
+// failure after registration, activation race).
+func (g *Guide) ReapStaleRegistrations() int {
+	snapshot := g.readyAgents.Snapshot()
+	reaped := 0
+	for id, ready := range snapshot {
+		if ready {
+			continue
+		}
+		// Not ready — check if subscriptions are alive.
+		if g.hasActiveAgentSubs(id) {
+			continue
+		}
+		slog.Info("guide: reaping stale agent registration", "agent_id", id)
+		g.Unregister(id)
+		reaped++
+	}
+	return reaped
+}
+
 // publishRegistryAnnouncement publishes an AgentRegistered message to the
 // registry topic. Extracted so both the fresh-subscription and idempotent
 // early-return paths in Register() can announce.
@@ -3955,6 +4044,8 @@ func (g *Guide) RegisteredAgentInfos() []*AgentAnnouncement {
 			ann.Capabilities = &info.Registration.Capabilities
 			ann.Constraints = &info.Registration.Constraints
 			ann.Description = info.Registration.Description
+			ann.RuntimeProfiles = append([]llmruntime.StageProfile(nil), info.Registration.RuntimeProfiles...)
+			ann.DefaultRuntimeProfile = info.Registration.DefaultRuntimeProfile
 		}
 		if ready, _ := g.readyAgents.Get(info.ID); ready {
 			ann.Ready = true
@@ -4063,12 +4154,14 @@ func (g *Guide) GetRegisteredAgentAnnouncements() []*AgentAnnouncement {
 	for _, reg := range agents {
 		info := g.routing.GetRoutingInfo(reg.ID)
 		ann := &AgentAnnouncement{
-			AgentID:      reg.ID,
-			AgentName:    reg.Name,
-			Aliases:      reg.Aliases,
-			Description:  reg.Description,
-			Capabilities: &reg.Capabilities,
-			Constraints:  &reg.Constraints,
+			AgentID:               reg.ID,
+			AgentName:             reg.Name,
+			Aliases:               reg.Aliases,
+			Description:           reg.Description,
+			Capabilities:          &reg.Capabilities,
+			Constraints:           &reg.Constraints,
+			RuntimeProfiles:       append([]llmruntime.StageProfile(nil), reg.RuntimeProfiles...),
+			DefaultRuntimeProfile: reg.DefaultRuntimeProfile,
 		}
 		if info != nil {
 			ann.ActionShortcuts = info.ActionShortcuts
@@ -4209,10 +4302,12 @@ func (g *Guide) Descriptor() handoff.AgentDescriptor {
 		modelID = "haiku-4.5-200k"
 	}
 	return handoff.AgentDescriptor{
-		AgentType:     "guide",
-		ModelID:       modelID,
-		ContextWindow: 200_000,
-		Category:      handoff.CategoryStandalone,
+		AgentType:             "guide",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryStandalone,
+		RuntimeProfiles:       guideRuntimeProfiles(),
+		DefaultRuntimeProfile: guideDefaultRuntimeProfile(),
 	}
 }
 

@@ -3,9 +3,12 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/tester"
+	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/google/uuid"
 )
 
@@ -51,10 +54,27 @@ func (pt *PipelineTester) runTests(ctx context.Context, req *tester.TesterReques
 		"packages": packages,
 		"race":     true,
 	})
-	result := pt.skills.Invoke(ctx, "run_test_suite", input)
-	if result != nil && result.Success {
-		_ = result.Data
+	if _, err := pt.toolRuntime().Activate("run_test_suite"); err != nil {
+		return nil, fmt.Errorf("activate run_test_suite: %w", err)
 	}
+	correlationID := req.ID
+	if correlationID == "" {
+		correlationID = suiteResult.SuiteID
+	}
+	execResult, err := pt.toolRuntime().ExecuteRaw(ctx, toolruntime.Invocation{
+		ToolCall: providers.ToolCall{
+			ID:        uuid.New().String(),
+			Name:      "run_test_suite",
+			Arguments: string(input),
+		},
+		AgentID:         pt.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: pt.toolRuntime().CapabilityScope(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("execute run_test_suite: %w", err)
+	}
+	_ = execResult
 
 	pt.aggregateSuiteResults(suiteResult)
 	suiteResult.CompletedAt = time.Now()

@@ -614,8 +614,8 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 		System: []anthropic.TextBlockParam{
 			{Text: systemPrompt},
 		},
-		Messages: p.convertMessages(req.Messages),
-		Tools:    p.convertTools(req.Tools),
+		Messages: p.convertMessages(req.Messages, p.requestUsesPromptCache(req)),
+		Tools:    p.convertTools(req.Tools, p.requestUsesPromptCache(req)),
 	}
 
 	applyAnthropicToolChoice(&params, req.ToolChoice, req.DisableParallelToolUse)
@@ -655,7 +655,7 @@ func (p *AnthropicProvider) buildParams(req *Request) anthropic.MessageNewParams
 		"max_tokens", maxTokens,
 		"tools_count", len(req.Tools))
 
-	if p.config.EnableCaching {
+	if p.requestUsesPromptCache(req) {
 		params.CacheControl = p.newCacheControl()
 	}
 
@@ -763,7 +763,14 @@ func anthropicCacheTTL(ttl time.Duration) anthropic.CacheControlEphemeralTTL {
 // consecutive same-role messages to satisfy API constraints.
 // When prompt caching is enabled, a cache control breakpoint is set on
 // the last user text block so conversational context is cached.
-func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.MessageParam {
+func (p *AnthropicProvider) requestUsesPromptCache(req *Request) bool {
+	if req != nil && req.UsePromptCache != nil {
+		return *req.UsePromptCache
+	}
+	return p.config.EnableCaching
+}
+
+func (p *AnthropicProvider) convertMessages(messages []Message, usePromptCache bool) []anthropic.MessageParam {
 	result := make([]anthropic.MessageParam, 0, len(messages))
 
 	// Track the index and block position of the last user text block so
@@ -831,7 +838,7 @@ func (p *AnthropicProvider) convertMessages(messages []Message) []anthropic.Mess
 
 	// Stamp the last user text block with a cache control breakpoint so
 	// that the conversational context up to this point is cached.
-	if p.config.EnableCaching && lastUserHasText && lastUserIdx < len(result) {
+	if usePromptCache && lastUserHasText && lastUserIdx < len(result) {
 		blocks := result[lastUserIdx].Content
 		if len(blocks) > 0 {
 			if tb := blocks[len(blocks)-1].OfText; tb != nil {
@@ -905,7 +912,7 @@ func mergeAnthropicMessage(dst *anthropic.MessageParam, src anthropic.MessagePar
 // convertTools converts generic tools to Anthropic format. When prompt
 // caching is enabled, a cache control breakpoint is set on the last tool
 // so the tool definitions are cached across requests.
-func (p *AnthropicProvider) convertTools(tools []Tool) []anthropic.ToolUnionParam {
+func (p *AnthropicProvider) convertTools(tools []Tool, usePromptCache bool) []anthropic.ToolUnionParam {
 	result := make([]anthropic.ToolUnionParam, len(tools))
 	for i, tool := range tools {
 		tp := &anthropic.ToolParam{
@@ -913,7 +920,7 @@ func (p *AnthropicProvider) convertTools(tools []Tool) []anthropic.ToolUnionPara
 			Description: anthropic.String(tool.Description),
 			InputSchema: buildAnthropicSchema(tool.Parameters),
 		}
-		if p.config.EnableCaching && i == len(tools)-1 {
+		if usePromptCache && i == len(tools)-1 {
 			tp.CacheControl = p.newCacheControl()
 		}
 		result[i] = anthropic.ToolUnionParam{OfTool: tp}

@@ -109,8 +109,10 @@ func ArchitectRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalFuture,
 				MinConfidence: 0.6,
 			},
-			Description: "System design and planning specialist. Creates atomic tasks and workflow DAGs using Pre-Delegation Planning Protocol.",
-			Priority:    90,
+			Description:           "System design and planning specialist. Creates atomic tasks and workflow DAGs using Pre-Delegation Planning Protocol.",
+			Priority:              90,
+			RuntimeProfiles:       architectRuntimeProfiles(),
+			DefaultRuntimeProfile: architectDefaultRuntimeProfile(),
 		},
 	}
 }

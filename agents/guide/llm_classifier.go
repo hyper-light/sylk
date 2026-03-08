@@ -73,8 +73,11 @@ func (c *LLMClassifier) Classify(ctx context.Context, input string) (*Classifica
 		Temperature:        classificationTemperature(c.config),
 		SkipProviderSkills: true,
 	}
-	llmruntime.Apply(req, llmruntime.Profile{
-		ReasoningEffort: resolveClassifierReasoningEffort(c.config.ThinkingLevel),
+	llmruntime.ApplyStage(req, guideClassifierStageProfile(c.config.ThinkingLevel), llmruntime.ApplyOptions{
+		Model:     guideRuntimeModel(req, c.model),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "guide",
+		SessionID: "",
 	})
 
 	completeStart := time.Now()

@@ -49,8 +49,10 @@ func InspectorRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.6,
 			},
-			Description: "Global quality inspector. Cross-file architectural auditing, plan adherence validation, and DAG layer gating.",
-			Priority:    75,
+			Description:           "Global quality inspector. Cross-file architectural auditing, plan adherence validation, and DAG layer gating.",
+			Priority:              75,
+			RuntimeProfiles:       inspectorRuntimeProfiles(),
+			DefaultRuntimeProfile: inspectorDefaultRuntimeProfile(),
 		},
 	}
 }

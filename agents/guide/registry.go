@@ -144,8 +144,10 @@ func GuideRegistration() *AgentRegistration {
 		Constraints: AgentConstraints{
 			// Guide handles any temporal focus for its domains
 		},
-		Description: "Intent-based routing, help, and system status",
-		Priority:    50,
+		Description:           "Intent-based routing, help, and system status",
+		Priority:              50,
+		RuntimeProfiles:       guideRuntimeProfiles(),
+		DefaultRuntimeProfile: guideDefaultRuntimeProfile(),
 	}
 }
 

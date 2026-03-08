@@ -65,7 +65,7 @@ func TestBuildModelSwapper_FindsAgent(t *testing.T) {
 		mockAgent: mockAgent{id: "eng-1", agentType: "engineer"},
 		model:     "gpt-5.4-pro",
 	}
-	c := testContainerWithID(t, "eng-1", "engineer", nil)
+	c := testContainerWithID(t, "eng-1", "engineer", "")
 	// Replace the mock agent with our swappable one.
 	c.agent = agent
 	if err := reg.Register(c); err != nil {

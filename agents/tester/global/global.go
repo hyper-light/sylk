@@ -18,9 +18,9 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -53,8 +53,10 @@ type GlobalTester struct {
 	diagEngine shared.DiagnosisEngine
 
 	// Skills.
-	skills      *skills.Registry
-	skillLoader *skills.Loader
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	tools         *toolruntime.Runtime
+	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
 	bus         guide.EventBus
@@ -109,7 +111,9 @@ func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*Gl
 
 	gt.steering.InitLazy("tester", nil)
 
-	gt.initSkills()
+	if err := gt.initSkills(); err != nil {
+		return nil, err
+	}
 	return gt, nil
 }
 
@@ -229,22 +233,26 @@ func applyConfigDefaults(cfg shared.GlobalTesterConfig) shared.GlobalTesterConfi
 	return cfg
 }
 
-func (gt *GlobalTester) initSkills() {
+func (gt *GlobalTester) initSkills() error {
 	gt.skills = skills.NewRegistry()
 
+	gt.registerCoreSkills()
+
 	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"check_inspector_gate",
-		"analyze_risk",
-		"plan_tests",
-		"write_test",
-		"run_test_suite",
-		"diagnose_failure",
-	}
+	loaderCfg.CoreSkills = globalTesterVisibleSkillNames()
 	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
 	gt.skillLoader = skills.NewLoader(gt.skills, loaderCfg)
-
-	gt.registerCoreSkills()
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: gt.skills,
+		Manifest: globalTesterToolManifest(gt.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize global tester tool runtime: %w", err)
+	}
+	gt.tools = tools
+	gt.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 func (gt *GlobalTester) registerCoreSkills() {
@@ -303,6 +311,10 @@ func (d *globalTesterDiag) AgentSpecificDiagnostics() map[string]any {
 
 // Close shuts down the global tester.
 func (gt *GlobalTester) Close() error {
+	if gt.tools != nil {
+		gt.tools.Close()
+		gt.tools = nil
+	}
 	return gt.Stop()
 }
 
@@ -427,12 +439,15 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		},
 		Tools: tools,
 	}
-	llmruntime.Apply(req, gt.llmRuntimeProfile())
+	gt.applyLLMRuntimeProfile(req, "testing")
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)
 
-	result, err := gt.executeToolLoop(ctx, req, agentshared.SteeringLedgerFromContext(ctx))
+	ledger := agentshared.SteeringLedgerFromContext(ctx)
+	result, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return gt.executeToolLoop(ctx, req, ledger)
+	})
 	if err != nil {
 		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -496,9 +511,17 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 
 	toolEmitter := agentshared.NewToolCallEmitter(gt.bus, gt.channels, gt.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentshared.WithToolCallEmitter(ctx, toolEmitter)
-	ctx = agentshared.WithContextGovernor(ctx, agentshared.NewContextGovernor(
-		gt.config.Model, gt.config.MaxTokens, 0,
-	))
+	gov := agentshared.NewContextGovernor(gt.config.Model, gt.config.MaxTokens, 0)
+	if gt.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return gt.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = agentshared.WithContextGovernor(ctx, gov)
+	ctx = agentshared.WithProgressPublisher(ctx, &agentshared.ProgressPublisher{
+		Bus: gt.bus, Channels: gt.channels,
+		AgentID: gt.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 	if !fwd.FireAndForget {
 		gt.publishStreamStart(ctx)
 	}
@@ -649,18 +672,15 @@ func (gt *GlobalTester) AgentType() string { return "tester" }
 
 // Descriptor returns immutable metadata.
 func (gt *GlobalTester) Descriptor() handoff.AgentDescriptor {
+	modelID := gt.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:       "tester",
-		ModelID:         gt.CurrentModel(),
-		ReasoningEffort: gt.config.ReasoningEffort,
-		ContextWindow:   272_000,
-		Category:        handoff.CategoryStandalone,
-	}
-}
-
-func (gt *GlobalTester) llmRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{
-		ReasoningEffort: gt.config.ReasoningEffort,
+		AgentType:             "tester",
+		ModelID:               modelID,
+		ReasoningEffort:       gt.config.ReasoningEffort,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryStandalone,
+		RuntimeProfiles:       testerRuntimeProfiles(),
+		DefaultRuntimeProfile: testerDefaultRuntimeProfile(),
 	}
 }
 

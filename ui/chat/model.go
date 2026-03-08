@@ -705,9 +705,10 @@ func formatRetryDelay(d time.Duration) string {
 }
 
 // handleToolCallEvent processes a tool call start or completion event by
-// updating the active streaming entry's ToolCalls list.
+// updating the matching streaming entry's ToolCalls list. Matches by
+// correlationID first, then falls back to the thinking placeholder.
 func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
-	idx := m.activeStreamingIndex()
+	idx := m.streamingIndexForCorrelation(ev.CorrelationID)
 	if idx < 0 {
 		return nil
 	}
@@ -744,6 +745,19 @@ func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 		e.Height = -1
 	})
 	return nil
+}
+
+// streamingIndexForCorrelation returns the history index for a specific
+// correlationID. Checks stream slots first (exact match), then falls back
+// to the thinking placeholder (tool calls may arrive before StreamStart).
+func (m *Model) streamingIndexForCorrelation(correlationID string) int {
+	if slot, ok := m.streams[correlationID]; ok && slot.accumulator != nil {
+		return slot.accumulator.EntryIndex()
+	}
+	if m.thinkingIdx >= 0 {
+		return m.thinkingIdx
+	}
+	return -1
 }
 
 // activeStreamingIndex returns the history index of the entry currently receiving

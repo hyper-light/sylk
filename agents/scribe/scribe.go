@@ -195,19 +195,88 @@ func (s *Scribe) processFeed(ctx context.Context, feed shared.ScribeFeed) {
 	s.forwardToArchivalist(commentary, feed.CorrelationID)
 }
 
-// scribeSystemPrompt is the system prompt template for commentary generation.
-const scribeSystemPrompt = `You are a Scribe — a silent observer maintaining running notes on a %s agent's work. Your output goes to the Archivalist for long-term memory.
-
-For each turn, provide a concise JSON commentary:
-{
+func scribeSystemPrompt(parentAgentType string) string {
+	schema := `{
   "summary": "What happened this turn",
   "progress": "Overall task progress",
   "decisions": "Key decisions or trade-offs made",
-  "state": "Current working state (files, variables, blockers)",
+  "state": "Current working state",
   "risk": "Any risks, regressions, or concerns"
-}
+}`
+	focus := "Capture the specialist's concrete work and preserve only the details another agent would need later."
 
-Be specific, factual, and concise. No opinions or suggestions — just observational notes.`
+	switch strings.ToLower(strings.TrimSpace(parentAgentType)) {
+	case "academic":
+		schema = `{
+  "summary": "Research progress this turn",
+  "thesis": "Core proposal or framing",
+  "findings": "Key findings or cited evidence",
+  "tradeoffs": "Trade-offs or rejected approaches",
+  "handoff_delta": "What changed for the eventual architect handoff",
+  "risk": "Open questions or weak evidence"
+}`
+		focus = "Preserve proposal quality, evidence, and architectural trade-offs for downstream planning."
+	case "architect":
+		schema = `{
+  "summary": "Planning progress this turn",
+  "plan_delta": "What changed in the plan, DAG, or task breakdown",
+  "decisions": "Planning decisions or assumptions",
+  "state": "Current plan status and unresolved dependencies",
+  "risk": "Execution or scoping risks"
+}`
+		focus = "Track plan evolution, assumptions, and anything that affects execution readiness."
+	case "engineer", "designer":
+		schema = `{
+  "summary": "Implementation progress this turn",
+  "files": "Files touched or intended to be touched",
+  "tests": "Validation or test outcomes",
+  "state": "Current implementation state and blockers",
+  "risk": "Regression or correctness concerns"
+}`
+		focus = "Preserve concrete implementation deltas, touched files, and validation evidence."
+	case "inspector", "inspector-pipeline", "inspector-global":
+		schema = `{
+  "summary": "Validation progress this turn",
+  "criteria": "Criteria checked or failed",
+  "issues": "Blocking findings and file targets",
+  "corrections": "Corrections or escalations requested",
+  "risk": "Residual quality or architectural concerns"
+}`
+		focus = "Capture failures, remediation guidance, and what remains unsafe to proceed."
+	case "guardian":
+		schema = `{
+  "summary": "Safety progress this turn",
+  "assessments": "Checks or gates executed",
+  "decisions": "Approvals, warnings, or denials",
+  "state": "Current safety posture",
+  "risk": "Outstanding safety risks"
+}`
+		focus = "Preserve safety decisions, approval requirements, and risk signals."
+	case "orchestrator":
+		schema = `{
+  "summary": "Workflow progress this turn",
+  "critical_path": "Critical path or DAG state changes",
+  "coordination": "Interventions, escalations, or reroutes",
+  "state": "Current workflow state",
+  "risk": "Stalls, failed nodes, or bottlenecks"
+}`
+		focus = "Track workflow health, critical path changes, and interventions that affect execution."
+	}
+
+	return fmt.Sprintf(
+		`You are a Scribe — a silent observer maintaining running notes on a %s agent's work. Your output goes to the Archivalist for long-term memory.
+
+%s
+
+For each turn, provide a concise JSON commentary:
+%s
+
+Be specific, factual, and concise. No opinions or suggestions — just observational notes.`,
+		parentAgentType,
+		focus,
+		schema,
+	)
+}
 
 // generateCommentary calls the LLM to produce commentary on recent turns.
 func (s *Scribe) generateCommentary(ctx context.Context) (string, error) {
@@ -219,7 +288,7 @@ func (s *Scribe) generateCommentary(ctx context.Context) (string, error) {
 	req := &providers.Request{
 		Model:        s.model,
 		MaxTokens:    512,
-		SystemPrompt: fmt.Sprintf(scribeSystemPrompt, s.parentAgentType),
+		SystemPrompt: scribeSystemPrompt(s.parentAgentType),
 		Messages:     msgs,
 	}
 	s.applyCommentaryRuntimeProfile(req)
@@ -288,11 +357,14 @@ func (s *Scribe) AgentType() string { return "scribe-" + s.parentAgentType }
 
 // Descriptor returns the Scribe's agent descriptor for handoff.
 func (s *Scribe) Descriptor() handoff.AgentDescriptor {
+	modelID := s.model
 	return handoff.AgentDescriptor{
-		AgentType:     "scribe-" + s.parentAgentType,
-		ModelID:       s.model,
-		ContextWindow: 1_000_000, // Gemini 3 Flash context window
-		Category:      handoff.CategoryStandalone,
+		AgentType:             "scribe-" + s.parentAgentType,
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryStandalone,
+		RuntimeProfiles:       scribeRuntimeProfiles(),
+		DefaultRuntimeProfile: scribeDefaultRuntimeProfile(),
 	}
 }
 

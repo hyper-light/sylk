@@ -29,3 +29,16 @@ type OutputLimitedPayload struct {
 	LimitedLen   int    `json:"limited_len"`
 	BudgetTokens int    `json:"budget_tokens"`
 }
+
+// HandoffTriggeredPayload records a context-exhaustion handoff.
+type HandoffTriggeredPayload struct {
+	Reason string `json:"reason"`
+	Zone   string `json:"zone"`
+}
+
+// ThinkingDeeplyPayload records a TTFT watchdog firing.
+type ThinkingDeeplyPayload struct {
+	AgentName   string `json:"agent_name"`
+	ElapsedMs   int64  `json:"elapsed_ms"`
+	Deliberation string `json:"deliberation"`
+}

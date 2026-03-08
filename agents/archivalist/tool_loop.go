@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 const defaultMaxToolRuns = 32
@@ -65,9 +65,7 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 			return "", err
 		}
 
-		turnStart := time.Now()
-		resp, err := p.Complete(ctx, req)
-		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
+		resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("archivalist"))
 		if err != nil {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
@@ -81,6 +79,10 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 
 		if len(resp.ToolCalls) == 0 {
 			return strings.TrimSpace(resp.Content), nil
+		}
+
+		if err := a.toolRuntime().ValidateBatch(a.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
 		}
 
 		errCount, rerouted := a.applyToolCalls(ctx, req, resp)
@@ -119,9 +121,15 @@ func (a *Archivalist) applyToolCalls(
 			break
 		}
 
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := shared.TimedToolCall(ctx, "archivalist", call, func() (string, error) {
-			return a.HandleToolCall(ctx, call.Name, []byte(call.Arguments))
+			execResult, execErr = a.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			a.toolDefsDirty = true
+		}
 
 		isError := false
 		if err != nil {
@@ -165,6 +173,31 @@ func (a *Archivalist) applyToolCalls(
 	return errCount, rerouted
 }
 
+func (a *Archivalist) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	name := strings.TrimSpace(call.Name)
+	if name == "" {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
+	}
+	raw := strings.TrimSpace(call.Arguments)
+	if raw == "" {
+		raw = "{}"
+	}
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = a.id + "-local"
+	}
+	return a.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall: providers.ToolCall{
+			ID:        call.ID,
+			Name:      name,
+			Arguments: raw,
+		},
+		AgentID:         a.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: a.toolRuntime().CapabilityScope(),
+	})
+}
+
 // prepareSkillsForInput progressively loads skills relevant to the user's
 // input and optimizes to stay within the tool-definition token budget.
 func (a *Archivalist) prepareSkillsForInput(input string) {
@@ -177,33 +210,33 @@ func (a *Archivalist) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (a *Archivalist) buildToolDefinitions() []providers.Tool {
-	loaded := a.skills.GetLoaded()
-	if len(loaded) == 0 {
+	a.toolRuntime().SyncActiveFromLoaded()
+	return a.toolRuntime().BuildToolDefinitions()
+}
+
+func (a *Archivalist) toolRuntime() *toolruntime.Runtime {
+	return a.tools
+}
+
+func (a *Archivalist) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
 		return nil
 	}
-
-	tools := make([]providers.Tool, 0, len(loaded))
-	for _, skill := range loaded {
-		def := skill.ToToolDefinition()
-		name, _ := def["name"].(string)
-		if name == "" {
-			continue
-		}
-		description, _ := def["description"].(string)
-		parameters := shared.CoerceMap(def["input_schema"])
-		if len(parameters) == 0 {
-			parameters = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, providers.Tool{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = a.id + "-local"
+	}
+	scope := a.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         a.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
 		})
 	}
-	return tools
+	return invocations
 }
 
 // getProvider returns the current LLM provider, guarded by runMu.

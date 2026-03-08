@@ -32,7 +32,7 @@ func TestEngineerCreation(t *testing.T) {
 	assert.Equal(t, "engineer", routingInfo.Name)
 	assert.Equal(t, "engineer", routingInfo.Type)
 	assert.NotEmpty(t, routingInfo.ID)
-	assert.Contains(t, routingInfo.ID, "engineer_")
+	assert.Equal(t, eng.AgentID(), routingInfo.ID)
 }
 
 func TestEngineerStartStop(t *testing.T) {
@@ -357,7 +357,7 @@ func TestExecutionAgentsEventBusSubscriptions(t *testing.T) {
 				if err != nil {
 					return channelIDs{}, err
 				}
-				return channelIDs{"engineer", "engineer"}, eng.Start(bus)
+				return channelIDs{"engineer", eng.AgentID()}, eng.Start(bus)
 			},
 		},
 		{

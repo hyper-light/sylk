@@ -58,8 +58,10 @@ type Request struct {
 	ReasoningEffort      string         `json:"reasoning_effort,omitempty"`
 	ReasoningSummary     string         `json:"reasoning_summary,omitempty"`
 	Verbosity            string         `json:"verbosity,omitempty"`
+	IncludeThoughts      *bool          `json:"include_thoughts,omitempty"`
 	PromptCacheKey       string         `json:"prompt_cache_key,omitempty"`
 	PromptCacheRetention string         `json:"prompt_cache_retention,omitempty"`
+	UsePromptCache       *bool          `json:"use_prompt_cache,omitempty"`
 	ParallelToolCalls    *bool          `json:"parallel_tool_calls,omitempty"`
 	SystemPrompt         string         `json:"system_prompt,omitempty"`
 	Tools                []Tool         `json:"tools,omitempty"`

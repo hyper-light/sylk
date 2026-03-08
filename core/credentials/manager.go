@@ -81,7 +81,9 @@ func (m *Manager) SetAPIKey(ctx context.Context, provider, key string, verifier 
 
 	if m.keychain.Available() {
 		service := fmt.Sprintf("sylk:%s", m.profile)
-		return m.keychain.Set(service, provider, key)
+		if err := m.keychain.Set(service, provider, key); err == nil {
+			return nil
+		}
 	}
 
 	return m.encFile.Set(m.profile, provider, key)

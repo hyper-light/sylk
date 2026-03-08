@@ -133,8 +133,10 @@ func LibrarianRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.6,
 			},
-			Description: "Code search and pattern detection. SINGLE SOURCE OF TRUTH for formatters, linters, test frameworks, and coding patterns.",
-			Priority:    80,
+			Description:           "Code search and pattern detection. SINGLE SOURCE OF TRUTH for formatters, linters, test frameworks, and coding patterns.",
+			Priority:              80,
+			RuntimeProfiles:       librarianRuntimeProfiles(),
+			DefaultRuntimeProfile: librarianDefaultRuntimeProfile(),
 		},
 	}
 }

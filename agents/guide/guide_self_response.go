@@ -133,7 +133,9 @@ func (r *GuideResponder) respondInternal(
 		if err != nil {
 			return "", nil, fmt.Errorf("guide model %s: %w", r.model, err)
 		}
-		emitGuideThought(guardedCtx, resp.Thinking)
+		if llmruntime.EmitsThoughts(req) {
+			emitGuideThought(guardedCtx, resp.Thinking)
+		}
 
 		if len(resp.ToolCalls) == 0 {
 			text := strings.TrimSpace(resp.Content)
@@ -224,7 +226,12 @@ func (r *GuideResponder) buildRequest(request GuideSelfResponseRequest) *provide
 		MaxTokens:    r.responseMaxTokens,
 		Temperature:  r.responseTemperature,
 	}
-	llmruntime.Apply(req, llmruntime.Profile{ReasoningEffort: r.reasoningEffort})
+	llmruntime.ApplyStage(req, guideSelfResponseStageProfile(r.reasoningEffort), llmruntime.ApplyOptions{
+		Model:     guideRuntimeModel(req, r.model),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "guide",
+		SessionID: request.SessionID,
+	})
 	if r.toolDefs != nil {
 		req.Tools = r.toolDefs(request.Input)
 		req.ToolChoice = "auto"

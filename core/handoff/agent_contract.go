@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -44,11 +45,13 @@ func (c AgentCategory) String() string {
 // AgentDescriptor is immutable metadata about an agent type.
 // It describes the agent's model, context window, and handoff category.
 type AgentDescriptor struct {
-	AgentType       string        `json:"agent_type"`
-	ModelID         string        `json:"model_id"`
-	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
-	ContextWindow   int           `json:"context_window"`
-	Category        AgentCategory `json:"category"`
+	AgentType             string                    `json:"agent_type"`
+	ModelID               string                    `json:"model_id"`
+	ReasoningEffort       string                    `json:"reasoning_effort,omitempty"`
+	ContextWindow         int                       `json:"context_window"`
+	Category              AgentCategory             `json:"category"`
+	RuntimeProfiles       []llmruntime.StageProfile `json:"runtime_profiles,omitempty"`
+	DefaultRuntimeProfile string                    `json:"default_runtime_profile,omitempty"`
 }
 
 // ArchivableState captures agent state for handoff persistence.
@@ -87,19 +90,21 @@ type ContextEvictable interface {
 
 // TurnRecord captures metrics from a single agent turn.
 type TurnRecord struct {
-	InputTokens   int           `json:"input_tokens"`
-	OutputTokens  int           `json:"output_tokens"`
-	ContextSize   int           `json:"context_size"`
-	ToolCalls     int           `json:"tool_calls"`
-	ToolSuccesses int           `json:"tool_successes"`
-	TurnNumber    int           `json:"turn_number"`
-	Duration      time.Duration `json:"duration"`
-	Timestamp     time.Time     `json:"timestamp"`
+	InputTokens    int           `json:"input_tokens"`
+	OutputTokens   int           `json:"output_tokens"`
+	ContextSize    int           `json:"context_size"`
+	ToolCalls      int           `json:"tool_calls"`
+	ToolSuccesses  int           `json:"tool_successes"`
+	TurnNumber     int           `json:"turn_number"`
+	Duration       time.Duration `json:"duration"`
+	Timestamp      time.Time     `json:"timestamp"`
+	Stage          string        `json:"stage,omitempty"`
+	RuntimeProfile string        `json:"runtime_profile,omitempty"`
 
 	// Provider response signals (omitempty for backward compat).
-	StopReason       providers.StopReason    `json:"stop_reason,omitempty"`
-	CacheReadTokens  int                     `json:"cache_read_tokens,omitempty"`
-	CacheWriteTokens int                     `json:"cache_write_tokens,omitempty"`
+	StopReason       providers.StopReason `json:"stop_reason,omitempty"`
+	CacheReadTokens  int                  `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int                  `json:"cache_write_tokens,omitempty"`
 
 	// Stream metrics snapshot (nil when not available).
 	StreamMetrics *providers.StreamMetrics `json:"stream_metrics,omitempty"`

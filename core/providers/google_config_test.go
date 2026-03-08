@@ -91,3 +91,33 @@ func TestGoogleBuildGenerateConfig_IncludesRequestTools(t *testing.T) {
 		t.Fatalf("expected 1 tool in config, got %d", len(cfg.Tools))
 	}
 }
+
+func TestGoogleBuildGenerateConfig_HonorsIncludeThoughts(t *testing.T) {
+	provider := &GoogleProvider{
+		config: GoogleConfig{
+			BaseConfig: BaseConfig{
+				MaxTokens: 1024,
+			},
+		},
+	}
+
+	req := &Request{
+		ReasoningEffort: "high",
+		IncludeThoughts: boolPtr(false),
+	}
+
+	cfg := provider.buildGenerateConfig(req)
+	if cfg.ThinkingConfig == nil {
+		t.Fatal("expected ThinkingConfig to be set")
+	}
+	if cfg.ThinkingConfig.IncludeThoughts {
+		t.Fatal("expected IncludeThoughts=false")
+	}
+	if cfg.ThinkingConfig.ThinkingLevel != "HIGH" {
+		t.Fatalf("ThinkingLevel = %q, want HIGH", cfg.ThinkingConfig.ThinkingLevel)
+	}
+}
+
+func boolPtr(v bool) *bool {
+	return &v
+}

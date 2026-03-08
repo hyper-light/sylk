@@ -6,51 +6,62 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
+	"github.com/google/uuid"
 )
 
 func architectCoreSkillNames() []string {
-	return []string{
-		"plan",
-		"plan_workflow",
-		"start_planning",
-		"consult",
-		"pre_delegation_declare",
-		"validate_pre_delegation",
-		"monitor_execution",
-		"route_plan_acceptance",
-		"handle_plan_acceptance_result",
-		"ask_user_question",
-	}
+	return filterSyntheticRuntimeTools(architectToolManifest().DefaultVisibleNames())
 }
 
 func architectAllSkillNames() []string {
-	return []string{
-		"plan",
-		"plan_workflow",
-		"start_planning",
-		"consult",
-		"plan_mode",
-		"git",
-		"lsp",
-		"interrupt_handler",
-		"pre_delegation_declare",
-		"validate_pre_delegation",
-		"monitor_execution",
-		"route_plan_acceptance",
-		"handle_plan_acceptance_result",
-		"ask_user_question",
-		"read_research_paper",
-		"read_file",
-		"glob",
-		"grep",
-		"ast_grep_search",
-		"reroute_request",
-	}
+	return architectToolManifest().AllowedNames()
 }
 
-func registerArchitectSafetyHook(hooks *skills.HookRegistry, registry *skills.Registry, allowed []string) {
+func architectToolManifest() *toolruntime.PolicyManifest {
+	return toolruntime.NewManifest("architect", "architect.default",
+		toolruntime.NewToolPolicy("plan", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("plan_workflow", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("start_planning", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("consult", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("plan_mode", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("git", toolruntime.EffectReadOnly, toolruntime.DomainGit, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("lsp", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("interrupt_handler", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("pre_delegation_declare", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("validate_pre_delegation", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("monitor_execution", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("route_plan_acceptance", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("handle_plan_acceptance_result", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("ask_user_question", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("read_research_paper", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("read_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("glob", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("grep", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("ast_grep_search", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy("reroute_request", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
+		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
+		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
+	)
+}
+
+func filterSyntheticRuntimeTools(names []string) []string {
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == toolruntime.SearchToolName {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
+}
+
+func registerArchitectSafetyHook(hooks *skills.HookRegistry, _ *skills.Registry, allowed []string) {
 	if hooks == nil {
 		return
 	}
@@ -69,15 +80,6 @@ func registerArchitectSafetyHook(hooks *skills.HookRegistry, registry *skills.Re
 				return skills.HookResult{
 					Continue: false,
 					Error:    fmt.Errorf("SECURITY VIOLATION: Architect is not permitted to execute tool %q", data.ToolName),
-				}
-			}
-			// Demand-page: load the skill if it's allowed but not yet loaded.
-			// This is the "page fault handler" — the skill was in the address
-			// space (registered + allowed) but not resident (not loaded).
-			if registry != nil {
-				skill := registry.Get(data.ToolName)
-				if skill != nil && !skill.Loaded {
-					registry.Load(data.ToolName)
 				}
 			}
 			return skills.HookResult{Continue: true}
@@ -102,7 +104,21 @@ func (a *Architect) Hooks() *skills.HookRegistry {
 
 // RegisterSkill registers a skill at runtime.
 func (a *Architect) RegisterSkill(skill *skills.Skill) error {
-	return a.skills.Register(skill)
+	if skill == nil {
+		return fmt.Errorf("skill is required")
+	}
+	name := strings.TrimSpace(skill.Name)
+	if name == "" {
+		return fmt.Errorf("skill name is required")
+	}
+	if a.toolRuntime() == nil || !a.toolRuntime().Allows(name) {
+		return fmt.Errorf("skill %q is outside architect capability scope %q", name, architectToolManifest().CapabilityScope)
+	}
+	if err := a.skills.Register(skill); err != nil {
+		return err
+	}
+	a.toolDefsDirty = true
+	return nil
 }
 
 // PrepareToolDefinitionsForRequest progressively loads relevant skills and returns loaded tool definitions.
@@ -133,12 +149,12 @@ func (a *Architect) LoadSkillsForContext(ctx skills.LoadContext) skills.LoadResu
 
 // GetLoadedSkillDefinitions returns tool definitions for loaded skills.
 func (a *Architect) GetLoadedSkillDefinitions() []map[string]any {
-	return a.skills.GetToolDefinitions()
+	return architectProviderToolsToDefinitions(a.buildToolDefinitions())
 }
 
 // GetToolDefinitions returns tool definitions for loaded skills.
 func (a *Architect) GetToolDefinitions() []map[string]any {
-	return a.skills.GetToolDefinitions()
+	return architectProviderToolsToDefinitions(a.buildToolDefinitions())
 }
 
 // RegisterPrePromptHook registers a pre-prompt hook.
@@ -179,13 +195,34 @@ func (a *Architect) ExecutePostPromptHooks(
 
 // InvokeSkill executes a skill with hook enforcement.
 func (a *Architect) InvokeSkill(ctx context.Context, name string, input json.RawMessage) *skills.Result {
-	a.ensureSkillLoaded(name)
-	if err := a.runPreToolHooks(ctx, name, input); err != nil {
+	if a.toolRuntime() == nil {
+		return &skills.Result{SkillName: name, Success: false, Error: "tool runtime is not configured"}
+	}
+	if _, err := a.toolRuntime().Activate(name); err != nil {
 		return &skills.Result{SkillName: name, Success: false, Error: err.Error()}
 	}
-	result := a.skills.Invoke(ctx, name, input)
-	a.runPostToolHooks(ctx, name, input, result)
-	return result
+	raw := strings.TrimSpace(string(input))
+	if raw == "" {
+		raw = "{}"
+	}
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = "invoke_" + uuid.NewString()
+	}
+	execResult, err := a.toolRuntime().ExecuteRaw(ctx, toolruntime.Invocation{
+		ToolCall: providers.ToolCall{
+			ID:        "invoke_" + uuid.NewString(),
+			Name:      name,
+			Arguments: raw,
+		},
+		AgentID:         a.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: a.toolRuntime().CapabilityScope(),
+	})
+	if err != nil {
+		return &skills.Result{SkillName: name, Success: false, Error: err.Error()}
+	}
+	return &skills.Result{SkillName: name, Success: true, Data: execResult.Data}
 }
 
 func (a *Architect) runPreToolHooks(ctx context.Context, name string, input json.RawMessage) error {
@@ -246,7 +283,7 @@ func (a *Architect) ensureSkillLoaded(name string) {
 
 // ensureToolLoopSkillsLoaded loads core architect skills so they are available
 // as tool definitions for the LLM tool-call loop. Remaining skills are
-// demand-paged via the safety hook when the LLM calls them — reducing initial
+// demand-paged by the shared tool runtime when the LLM calls them — reducing initial
 // tool definitions from ~47 (~5500 tokens) to ~14 (~1700 tokens).
 func (a *Architect) ensureToolLoopSkillsLoaded() {
 	if a.skills == nil {
@@ -257,6 +294,9 @@ func (a *Architect) ensureToolLoopSkillsLoaded() {
 	}
 	if a.skillLoader != nil {
 		a.skillLoader.OptimizeForBudget()
+	}
+	if a.tools != nil {
+		a.tools.SyncActiveFromLoaded()
 	}
 }
 
@@ -275,6 +315,24 @@ func (a *Architect) prepareSkillsForRequest(req *ArchitectRequest) {
 	for _, name := range architectPinnedSkills(req) {
 		a.ensureSkillLoaded(name)
 	}
+	if a.tools != nil {
+		a.tools.SyncActiveFromLoaded()
+	}
+}
+
+func architectProviderToolsToDefinitions(tools []providers.Tool) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	result := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		result = append(result, map[string]any{
+			"name":         tool.Name,
+			"description":  tool.Description,
+			"input_schema": tool.Parameters,
+		})
+	}
+	return result
 }
 
 func architectSkillInputs(req *ArchitectRequest) []string {

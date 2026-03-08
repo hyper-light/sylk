@@ -194,7 +194,10 @@ func TestLLMEventPublisher_PublishLLMResponse(t *testing.T) {
 
 	t.Run("publishes_response_event", func(t *testing.T) {
 		duration := 500 * time.Millisecond
-		err := publisher.PublishLLMResponse("session-1", "agent-1", "claude-3-opus", 1000, 500, duration)
+		err := publisher.PublishLLMResponse("session-1", "agent-1", "claude-3-opus", &Usage{
+			InputTokens:  1000,
+			OutputTokens: 500,
+		}, duration)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -239,7 +242,10 @@ func TestLLMEventPublisher_PublishLLMResponse(t *testing.T) {
 	})
 
 	t.Run("zero_duration_no_panic", func(t *testing.T) {
-		err := publisher.PublishLLMResponse("session", "agent", "model", 100, 50, 0)
+		err := publisher.PublishLLMResponse("session", "agent", "model", &Usage{
+			InputTokens:  100,
+			OutputTokens: 50,
+		}, 0)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -247,7 +253,10 @@ func TestLLMEventPublisher_PublishLLMResponse(t *testing.T) {
 
 	t.Run("nil_publisher_returns_error", func(t *testing.T) {
 		var nilPublisher *LLMEventPublisher
-		err := nilPublisher.PublishLLMResponse("session", "agent", "model", 100, 50, time.Second)
+		err := nilPublisher.PublishLLMResponse("session", "agent", "model", &Usage{
+			InputTokens:  100,
+			OutputTokens: 50,
+		}, time.Second)
 		if err == nil {
 			t.Error("expected error for nil publisher")
 		}
@@ -456,7 +465,10 @@ func TestLLMEventPublisher_Concurrent(t *testing.T) {
 
 		go func(idx int) {
 			defer wg.Done()
-			_ = publisher.PublishLLMResponse("session", "agent", "model", idx*100, idx*50, time.Duration(idx)*time.Millisecond)
+			_ = publisher.PublishLLMResponse("session", "agent", "model", &Usage{
+				InputTokens:  idx * 100,
+				OutputTokens: idx * 50,
+			}, time.Duration(idx)*time.Millisecond)
 		}(i)
 
 		go func(idx int) {

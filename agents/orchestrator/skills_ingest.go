@@ -82,9 +82,14 @@ func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, er
 		return nil, fmt.Errorf("plan handoff validation failed: %w", err)
 	}
 
+	preflight, err := o.guardianPreflightPlan(ctx, &handoff)
+	if err != nil {
+		return nil, fmt.Errorf("guardian preflight failed: %w", err)
+	}
+
 	// Build orchestrator state from the handoff.
 	wfID := "wf_" + handoff.PlanID
-	o.createWorkflowAndTasks(&handoff, wfID)
+	o.createWorkflowAndTasks(&handoff, wfID, preflight)
 
 	// Build DAG from task graph.
 	d, err := buildDAGFromHandoff(&handoff)
@@ -113,16 +118,19 @@ func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, er
 			"task_count":  len(handoff.Tasks),
 			"layer_count": len(handoff.ExecutionLayers),
 			"trigger":     handoff.Trigger,
+			"guardian":    preflight.summaryPayload(),
 		},
 	})
 
 	return map[string]any{
-		"ingested":    true,
-		"plan_id":     handoff.PlanID,
-		"dag_id":      dagID,
-		"workflow_id":  wfID,
-		"task_count":  len(handoff.Tasks),
-		"layer_count": len(handoff.ExecutionLayers),
+		"ingested":       true,
+		"plan_id":        handoff.PlanID,
+		"dag_id":         dagID,
+		"workflow_id":    wfID,
+		"task_count":     len(handoff.Tasks),
+		"layer_count":    len(handoff.ExecutionLayers),
+		"guardian_gate":  preflight.summaryPayload(),
+		"guardian_clean": preflight.Clean(),
 	}, nil
 }
 
@@ -151,7 +159,7 @@ func validateHandoff(h *architect.PlanHandoff) error {
 }
 
 // createWorkflowAndTasks populates orchestrator state with workflow and task records.
-func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID string) {
+func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID string, preflight *guardianPlanPreflight) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
@@ -174,6 +182,7 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 				"agent_type":           ht.AgentType,
 				"complexity":           ht.Complexity,
 				"estimated_tokens":     ht.EstimatedTokens,
+				"success_criteria":     ht.SuccessCriteria,
 				"acceptance_criteria":  ht.AcceptanceCriteria,
 				"guidelines":           ht.Guidelines,
 				"implementation_guide": ht.ImplementationGuide,
@@ -182,19 +191,24 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 				"risk_factors":         ht.RiskFactors,
 			},
 		}
+		if preflight != nil {
+			if taskPreflight, ok := preflight.Tasks[ht.ID]; ok {
+				o.state.Tasks[ht.ID].Metadata["guardian_preflight"] = taskPreflight
+			}
+		}
 	}
 
 	o.state.Workflows[wfID] = &WorkflowState{
-		ID:             wfID,
-		Name:           fmt.Sprintf("Plan %s", h.PlanID),
-		Description:    h.Query,
-		Status:         WorkflowStatusRunning,
-		TaskIDs:        taskIDs,
-		PendingIDs:     taskIDs,
-		StartedAt:      now,
-		UpdatedAt:      now,
-		LeadAgentID:    "architect",
-		SessionID:      h.SessionID,
+		ID:          wfID,
+		Name:        fmt.Sprintf("Plan %s", h.PlanID),
+		Description: h.Query,
+		Status:      WorkflowStatusRunning,
+		TaskIDs:     taskIDs,
+		PendingIDs:  taskIDs,
+		StartedAt:   now,
+		UpdatedAt:   now,
+		LeadAgentID: "architect",
+		SessionID:   h.SessionID,
 		Metadata: map[string]any{
 			"plan_id":          h.PlanID,
 			"revision":         h.Revision,
@@ -204,9 +218,176 @@ func (o *Orchestrator) createWorkflowAndTasks(h *architect.PlanHandoff, wfID str
 			"execution_layers": h.ExecutionLayers,
 		},
 	}
+	if preflight != nil {
+		o.state.Workflows[wfID].Metadata["guardian_preflight"] = preflight.summaryPayload()
+	}
 
 	o.state.Stats.TotalWorkflows++
 	o.state.Stats.ActiveWorkflows++
+}
+
+type guardianTaskPreflight struct {
+	TaskID           string   `json:"task_id"`
+	AgentType        string   `json:"agent_type"`
+	Clean            bool     `json:"clean"`
+	RequiresApproval bool     `json:"requires_approval"`
+	Warnings         []string `json:"warnings,omitempty"`
+	BlockingFindings []string `json:"blocking_findings,omitempty"`
+	UserMessage      string   `json:"user_message,omitempty"`
+}
+
+type guardianPlanPreflight struct {
+	PlanID string
+	Tasks  map[string]*guardianTaskPreflight
+}
+
+func (g *guardianPlanPreflight) Clean() bool {
+	if g == nil {
+		return true
+	}
+	for _, task := range g.Tasks {
+		if task == nil {
+			continue
+		}
+		if !task.Clean || len(task.BlockingFindings) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (g *guardianPlanPreflight) summaryPayload() map[string]any {
+	if g == nil {
+		return map[string]any{"clean": true}
+	}
+	warnings := 0
+	blocking := 0
+	requiresApproval := false
+	results := make([]map[string]any, 0, len(g.Tasks))
+	for _, task := range g.Tasks {
+		if task == nil {
+			continue
+		}
+		warnings += len(task.Warnings)
+		blocking += len(task.BlockingFindings)
+		requiresApproval = requiresApproval || task.RequiresApproval
+		results = append(results, map[string]any{
+			"task_id":           task.TaskID,
+			"agent_type":        task.AgentType,
+			"clean":             task.Clean,
+			"requires_approval": task.RequiresApproval,
+			"warnings":          task.Warnings,
+			"blocking_findings": task.BlockingFindings,
+			"user_message":      task.UserMessage,
+		})
+	}
+	return map[string]any{
+		"plan_id":             g.PlanID,
+		"clean":               g.Clean(),
+		"requires_approval":   requiresApproval,
+		"warning_count":       warnings,
+		"blocking_count":      blocking,
+		"task_preflight_runs": results,
+	}
+}
+
+func (o *Orchestrator) guardianPreflightPlan(ctx context.Context, handoff *architect.PlanHandoff) (*guardianPlanPreflight, error) {
+	if handoff == nil {
+		return nil, fmt.Errorf("plan handoff is required")
+	}
+
+	preflight := &guardianPlanPreflight{
+		PlanID: handoff.PlanID,
+		Tasks:  make(map[string]*guardianTaskPreflight, len(handoff.Tasks)),
+	}
+	for _, task := range handoff.Tasks {
+		payload := map[string]any{
+			"action":               "preflight_task",
+			"plan_id":              handoff.PlanID,
+			"task_id":              task.ID,
+			"agent_type":           task.AgentType,
+			"complexity":           task.Complexity,
+			"affected_files":       affectedFilePaths(task.AffectedFiles),
+			"risk_factors":         task.RiskFactors,
+			"test_requirements":    task.TestRequirements,
+			"guidelines":           task.Guidelines,
+			"implementation_guide": task.ImplementationGuide,
+		}
+		respMsg, err := o.requestRouteSync(ctx, "guardian", payload, map[string]any{
+			"direct_skill": "review_gate",
+			"plan_id":      handoff.PlanID,
+			"task_id":      task.ID,
+		})
+		if err != nil {
+			return nil, err
+		}
+		resp, ok := respMsg.GetRouteResponse()
+		if !ok || resp == nil {
+			return nil, fmt.Errorf("guardian preflight returned invalid response for task %s", task.ID)
+		}
+		if !resp.Success {
+			return nil, fmt.Errorf("guardian preflight rejected task %s: %s", task.ID, resp.Error)
+		}
+		taskPreflight, err := decodeGuardianTaskPreflight(resp.Data)
+		if err != nil {
+			return nil, fmt.Errorf("decode guardian preflight for task %s: %w", task.ID, err)
+		}
+		preflight.Tasks[task.ID] = taskPreflight
+		if taskPreflight.UserMessage != "" {
+			level := "info"
+			if len(taskPreflight.BlockingFindings) > 0 {
+				level = "error"
+			} else if len(taskPreflight.Warnings) > 0 || taskPreflight.RequiresApproval {
+				level = "warning"
+			}
+			_ = o.publishStatusMessage(taskPreflight.UserMessage, level)
+		}
+	}
+	return preflight, nil
+}
+
+func decodeGuardianTaskPreflight(data any) (*guardianTaskPreflight, error) {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("marshal guardian payload: %w", err)
+	}
+	var result guardianTaskPreflight
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal guardian payload: %w", err)
+	}
+	return &result, nil
+}
+
+func affectedFilePaths(files []architect.TaskFileTarget) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		if strings.TrimSpace(file.Path) == "" {
+			continue
+		}
+		paths = append(paths, file.Path)
+	}
+	return paths
+}
+
+func (o *Orchestrator) publishStatusMessage(message, level string) error {
+	if o.bus == nil || !o.running {
+		return nil
+	}
+	msg := &guide.Message{
+		ID:            generateMessageID(),
+		Type:          guide.MessageTypeResponse,
+		SourceAgentID: o.config.AgentID,
+		Payload:       message,
+		Metadata: map[string]any{
+			"level":  level,
+			"source": "orchestrator",
+		},
+		Timestamp: time.Now(),
+	}
+	return o.bus.Publish("orchestrator.status", msg)
 }
 
 // buildDAGFromHandoff constructs a dag.DAG from the PlanHandoff task graph.
@@ -347,6 +528,21 @@ func buildNodeContext(ht *architect.HandoffTask) map[string]any {
 	}
 	if len(ht.AcceptanceCriteria) > 0 {
 		ctx["acceptance_criteria"] = ht.AcceptanceCriteria
+	}
+	if len(ht.SuccessCriteria) > 0 {
+		ctx["success_criteria"] = ht.SuccessCriteria
+	}
+	if len(ht.Guidelines) > 0 {
+		ctx["guidelines"] = ht.Guidelines
+	}
+	if ht.ImplementationGuide != "" {
+		ctx["implementation_guide"] = ht.ImplementationGuide
+	}
+	if len(ht.TestRequirements) > 0 {
+		ctx["test_requirements"] = ht.TestRequirements
+	}
+	if len(ht.RiskFactors) > 0 {
+		ctx["risk_factors"] = ht.RiskFactors
 	}
 	if len(ht.CoAgents) > 0 {
 		ctx["co_agents"] = ht.CoAgents
@@ -536,15 +732,15 @@ func analyzePlanJSON(planJSON string) (any, error) {
 
 	for _, t := range handoff.Tasks {
 		summary := map[string]any{
-			"id":          t.ID,
-			"name":        t.Name,
-			"agent_type":  t.AgentType,
-			"complexity":  t.Complexity,
-			"deps":        len(t.Dependencies),
-			"files":       len(t.AffectedFiles),
-			"tests":       len(t.TestRequirements),
-			"risks":       len(t.RiskFactors),
-			"acceptance":  len(t.AcceptanceCriteria),
+			"id":         t.ID,
+			"name":       t.Name,
+			"agent_type": t.AgentType,
+			"complexity": t.Complexity,
+			"deps":       len(t.Dependencies),
+			"files":      len(t.AffectedFiles),
+			"tests":      len(t.TestRequirements),
+			"risks":      len(t.RiskFactors),
+			"acceptance": len(t.AcceptanceCriteria),
 		}
 		taskSummaries = append(taskSummaries, summary)
 		complexityDist[t.Complexity]++
@@ -562,19 +758,19 @@ func analyzePlanJSON(planJSON string) (any, error) {
 	}
 
 	return map[string]any{
-		"plan_id":             handoff.PlanID,
-		"query":               handoff.Query,
-		"task_count":          len(handoff.Tasks),
-		"layer_count":         len(handoff.ExecutionLayers),
-		"execution_layers":    handoff.ExecutionLayers,
-		"critical_path":       handoff.CriticalPath,
-		"total_tokens":        totalTokens,
+		"plan_id":                 handoff.PlanID,
+		"query":                   handoff.Query,
+		"task_count":              len(handoff.Tasks),
+		"layer_count":             len(handoff.ExecutionLayers),
+		"execution_layers":        handoff.ExecutionLayers,
+		"critical_path":           handoff.CriticalPath,
+		"total_tokens":            totalTokens,
 		"complexity_distribution": complexityDist,
-		"agent_distribution":  agentDist,
-		"tasks":               taskSummaries,
-		"risk_summary":        handoff.RiskSummary,
-		"all_risk_factors":    allRisks,
-		"source":              "plan_json",
+		"agent_distribution":      agentDist,
+		"tasks":                   taskSummaries,
+		"risk_summary":            handoff.RiskSummary,
+		"all_risk_factors":        allRisks,
+		"source":                  "plan_json",
 	}, nil
 }
 

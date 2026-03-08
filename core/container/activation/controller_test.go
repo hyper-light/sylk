@@ -144,6 +144,31 @@ func (r *mockRuntime) ContainerStatus(c *container.Container) *container.Contain
 	return &container.ContainerStatus{ID: c.ID(), State: c.State()}
 }
 
+func (r *mockRuntime) CreateContainersForPod(ctx context.Context, podID container.PodID, specs []container.ContainerSpec) ([]*container.Container, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	containers := make([]*container.Container, 0, len(specs))
+	for _, spec := range specs {
+		c, err := r.createFunc(ctx, spec)
+		if err != nil {
+			return nil, err
+		}
+		c.SetPodID(podID)
+		r.created = append(r.created, c)
+		containers = append(containers, c)
+	}
+	return containers, nil
+}
+
+func (r *mockRuntime) StartContainers(ctx context.Context, containers []*container.Container) error {
+	for _, ctr := range containers {
+		if err := r.StartContainer(ctx, ctr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (r *mockRuntime) createdCount() int {
 	r.mu.Lock()

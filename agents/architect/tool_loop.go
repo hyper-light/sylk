@@ -2,7 +2,6 @@ package architect
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,9 +9,11 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // toolRunsOverrideKey allows protocol code to override the default MaxToolRuns
@@ -246,7 +247,9 @@ func (a *Architect) executeToolLoop(
 			"turn", turn,
 			"tools", strings.Join(respToolNames, ","))
 
-
+		if err := a.tools.ValidateBatch(a.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
+		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			a.logWarn("executeToolLoop: duplicate tool call detected",
@@ -305,8 +308,6 @@ func (a *Architect) applyToolCalls(
 		Metadata:  resp.ProviderMetadata,
 	})
 
-	loadedBefore := len(a.skills.GetLoaded())
-
 	errCount := 0
 	rerouted := false
 	for i, call := range resp.ToolCalls {
@@ -326,9 +327,15 @@ func (a *Architect) applyToolCalls(
 			"tool_id", call.ID,
 			"args_preview", truncateString(call.Arguments, 500))
 		callStart := time.Now()
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := shared.TimedToolCall(ctx, "architect", call, func() (string, error) {
-			return a.executeToolCall(ctx, call)
+			execResult, execErr = a.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			a.toolDefsDirty = true
+		}
 		a.logInfo("applyToolCalls: tool returned",
 			"tool_name", call.Name,
 			"tool_index", i,
@@ -377,14 +384,6 @@ func (a *Architect) applyToolCalls(
 		}
 	}
 
-	// Detect demand-paged skills loaded during this turn.
-	if len(a.skills.GetLoaded()) > loadedBefore {
-		a.toolDefsDirty = true
-		a.logDebug("tool_apply: SKILLS_DEMAND_PAGED",
-			"loaded_before", loadedBefore,
-			"loaded_after", len(a.skills.GetLoaded()))
-	}
-
 	return errCount, rerouted
 }
 
@@ -397,56 +396,41 @@ func (a *Architect) applyToolCalls(
 // would cause bus-based skills (consult_librarian, etc.) to block in
 // requestRouteSync for up to 60s after the request is cancelled, preventing
 // bus shutdown (the handler goroutine holds a WaitGroup reference).
-func (a *Architect) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
+func (a *Architect) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
-	if name == "" {
-		return "", fmt.Errorf("tool name is required")
-	}
-
 	raw := strings.TrimSpace(call.Arguments)
 	if raw == "" {
 		raw = "{}"
 	}
-	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
-	}
 
-	a.logInfo("executeToolCall: invoking skill",
-		"skill", name,
+	a.logInfo("executeToolCall: invoking tool",
+		"tool", name,
 		"args_len", len(raw),
 		"ctx_deadline", contextDeadlineString(ctx))
 	a.logDebug("tool_exec: INVOKE",
-		"skill", name,
+		"tool", name,
 		"args", truncateString(raw, 1000))
 	invokeStart := time.Now()
-	result := a.InvokeSkill(ctx, name, json.RawMessage(raw))
+	result, err := a.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         a.id,
+		CorrelationID:   shared.LogMetaFromContext(ctx).CorrID,
+		CapabilityScope: a.toolRuntime().CapabilityScope(),
+	})
 	elapsed := time.Since(invokeStart)
-	a.logInfo("executeToolCall: skill returned",
-		"skill", name,
+	a.logInfo("executeToolCall: tool returned",
+		"tool", name,
 		"elapsed", elapsed.String(),
-		"success", result != nil && result.Success,
-		"has_result", result != nil)
+		"tool_defs_dirty", result.ToolDefsDirty,
+		"activated_skills", strings.Join(result.ActivatedSkills, ","),
+		"err", err)
 	a.logDebug("tool_exec: RESULT",
-		"skill", name,
+		"tool", name,
 		"elapsed", elapsed.String(),
-		"success", result != nil && result.Success,
-		"error", resultError(result))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
-	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return shared.MarshalToolOutput(result.Data)
-}
-
-// resultError extracts the error string from a skill result, or empty string.
-func resultError(r *skills.Result) string {
-	if r == nil {
-		return "<nil result>"
-	}
-	return r.Error
+		"tool_defs_dirty", result.ToolDefsDirty,
+		"activated_skills", strings.Join(result.ActivatedSkills, ","),
+		"error", err)
+	return result, err
 }
 
 // filterToolsByNames returns only the tools whose names are in the allowed set.
@@ -470,33 +454,30 @@ func filterToolsByNames(tools []providers.Tool, allowed []string) []providers.To
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (a *Architect) buildToolDefinitions() []providers.Tool {
-	loaded := a.skills.GetLoaded()
-	if len(loaded) == 0 {
+	a.toolRuntime().SyncActiveFromLoaded()
+	return a.toolRuntime().BuildToolDefinitions()
+}
+
+func (a *Architect) toolRuntime() *toolruntime.Runtime {
+	return a.tools
+}
+
+func (a *Architect) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
 		return nil
 	}
-
-	tools := make([]providers.Tool, 0, len(loaded))
-	for _, skill := range loaded {
-		def := skill.ToToolDefinition()
-		name, _ := def["name"].(string)
-		if name == "" {
-			continue
-		}
-		description, _ := def["description"].(string)
-		parameters := shared.CoerceMap(def["input_schema"])
-		if len(parameters) == 0 {
-			parameters = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, providers.Tool{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	scope := a.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         a.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
 		})
 	}
-	return tools
+	return invocations
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
@@ -519,6 +500,8 @@ func (a *Architect) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,

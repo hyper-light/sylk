@@ -140,6 +140,8 @@ func TestKnowledgeMemory_RecordAccess(t *testing.T) {
 func TestKnowledgeMemory_RecordOutcome(t *testing.T) {
 	a := newKnowledgeTestArchivalist(t)
 	ctx := context.Background()
+	seedNode(t, a, "node-a")
+	seedNode(t, a, "node-b")
 
 	input, _ := json.Marshal(map[string]any{
 		"action":     "record_outcome",

@@ -5,17 +5,30 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-// Pipeline Inspector keeps runtime policy selection in the agent package even
-// when the current stages rely on provider defaults.
 func (pi *PipelineInspector) applyLLMRuntimeProfile(req *providers.Request, stage string) {
-	llmruntime.Apply(req, pi.llmRuntimeProfile(stage))
+	llmruntime.ApplyStage(req, pi.llmStageProfile(stage), llmruntime.ApplyOptions{
+		Model:     pipelineInspectorRuntimeModel(req, pi.CurrentModel()),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "inspector-pipeline",
+		SessionID: pi.config.SessionID,
+	})
 }
 
-func (pi *PipelineInspector) llmRuntimeProfile(stage string) llmruntime.Profile {
-	switch stage {
-	case "task", "validation", "revalidation":
-		return llmruntime.Profile{}
-	default:
-		return llmruntime.Profile{}
+func (pi *PipelineInspector) llmStageProfile(stage string) llmruntime.StageProfile {
+	return llmruntime.ResolveAgentStageProfile("inspector-pipeline", stage)
+}
+
+func pipelineInspectorRuntimeProfiles() []llmruntime.StageProfile {
+	return llmruntime.AgentProfiles("inspector-pipeline")
+}
+
+func pipelineInspectorDefaultRuntimeProfile() string {
+	return llmruntime.AgentDefaultProfile("inspector-pipeline")
+}
+
+func pipelineInspectorRuntimeModel(req *providers.Request, fallback string) string {
+	if req != nil && req.Model != "" {
+		return req.Model
 	}
+	return fallback
 }

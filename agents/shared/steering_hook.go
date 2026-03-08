@@ -115,6 +115,120 @@ func processCommands(
 	return result
 }
 
+// DrainFinalSteering performs an atomic drain of the steering mailbox when the
+// tool loop is about to exit (LLM returned no tool calls). If actionable
+// commands (steer/rollback/edit) are present, it prepares req.Messages for
+// re-entry and returns true. Pace/resume commands are applied without re-entry.
+//
+// For steers: appends the assistant's current response followed by the
+// formatted steer text as a user message. Events are published.
+//
+// For rollback/edit: re-deposits the command so the next DrainAndCheckpoint
+// handles truncation and state restoration. The assistant response is appended
+// so the checkpoint's MessageCount is correct on re-entry.
+//
+// The caller must decrement the turn counter before continuing to avoid
+// consuming turn budget on steering re-entries.
+//
+// Nil-safe: returns false when ledger is nil.
+func DrainFinalSteering(
+	ledger *steering.SteeringLedger,
+	req *providers.Request,
+	assistantContent string,
+) bool {
+	if ledger == nil {
+		return false
+	}
+	cmds := ledger.Mailbox.Drain()
+	if len(cmds) == 0 {
+		return false
+	}
+
+	reenter := false
+	var steerTexts []string
+
+	for _, cmd := range cmds {
+		switch cmd.Type {
+		case steering.CommandSteer:
+			steerTexts = append(steerTexts, cmd.Text)
+			ledger.PublishSteeringEvent(events.EventTypeSteeringInject, cmd)
+			reenter = true
+		case steering.CommandRollback, steering.CommandEdit:
+			// Re-deposit so DrainAndCheckpoint handles truncation + state restore.
+			ledger.Mailbox.Deposit(cmd)
+			reenter = true
+		case steering.CommandPace:
+			ledger.SetPace(cmd.Pace)
+		case steering.CommandResume:
+			ledger.SetPace(steering.PaceAuto)
+		}
+	}
+
+	if !reenter {
+		return false
+	}
+
+	// Append the assistant's in-progress response so the LLM sees context.
+	// For rollback/edit, DrainAndCheckpoint truncates past the checkpoint.
+	req.Messages = append(req.Messages, providers.Message{
+		Role:    providers.RoleAssistant,
+		Content: assistantContent,
+	})
+
+	if len(steerTexts) > 0 {
+		req.Messages = append(req.Messages, steering.FormatSteeringMessages(steerTexts))
+	}
+
+	return true
+}
+
+// MaxSteerReentries bounds how many times the outer turn loop can re-enter
+// for steering. Derived from mailbox capacity — a single drain cannot yield
+// more commands than the ring buffer holds.
+const MaxSteerReentries = 16
+
+// ExecuteTurnLoop wraps an inner tool loop with Codex-style outer turn
+// boundary handling. After the inner loop returns successfully (err == nil),
+// it drains the steering mailbox for pending commands:
+//
+//   - Steer: appends assistant content + steer text to req.Messages, re-enters.
+//   - Rollback/Edit: re-deposits the command for the inner loop's
+//     DrainAndCheckpoint to handle on re-entry.
+//   - Pace/Resume: applied without re-entry.
+//
+// Bounded by MaxSteerReentries. Nil-safe: when ledger is nil, calls
+// innerLoop exactly once.
+func ExecuteTurnLoop(
+	ledger *steering.SteeringLedger,
+	req *providers.Request,
+	innerLoop func() (string, error),
+) (string, error) {
+	if ledger == nil {
+		return innerLoop()
+	}
+
+	var lastContent string
+	for range MaxSteerReentries + 1 {
+		content, err := innerLoop()
+		if err != nil {
+			return content, err
+		}
+
+		lastContent = content
+
+		if !DrainFinalSteering(ledger, req, content) {
+			return content, nil
+		}
+		// DrainFinalSteering mutated req.Messages:
+		//   steer   → appended assistant + steer text
+		//   rb/edit → appended assistant, re-deposited command
+		// Inner loop's DrainAndCheckpoint handles the rest on re-entry.
+	}
+
+	// Exhausted steering re-entries. Return last successful content.
+	return lastContent, nil
+}
+
 func checkPace(ledger *steering.SteeringLedger) SteeringResult {
 	pace := ledger.Pace()
 	return SteeringResult{

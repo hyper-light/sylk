@@ -50,21 +50,38 @@ func (q *Queue) Peek() (Entry, bool) {
 	return q.entries[0], true
 }
 
-// Advance removes a terminal (completed/failed/cancelled) head entry and
-// returns the next pending entry. Returns false if the queue is empty, the
-// head is non-terminal, or no pending entry follows.
+// Advance removes terminal head entries and returns the first pending entry.
+// Returns false if no pending entry is available.
 func (q *Queue) Advance() (Entry, bool) {
-	// Drain all terminal entries from the head.
-	for len(q.entries) > 0 && q.entries[0].State.IsTerminal() {
-		q.entries = q.entries[1:]
+	q.compact()
+	for i := range q.entries {
+		if q.entries[i].State == StatePending {
+			return q.entries[i], true
+		}
 	}
-	if len(q.entries) == 0 {
-		return Entry{}, false
+	return Entry{}, false
+}
+
+// AdvanceReady returns the first pending entry per distinct target agent,
+// skipping agents that are already busy. The isBusy predicate receives a
+// target agent ID and returns true if that agent has an active stream.
+// At most one entry per agent is returned to prevent dispatch conflicts.
+func (q *Queue) AdvanceReady(isBusy func(agentID string) bool) []Entry {
+	q.compact()
+	claimed := make(map[string]bool)
+	var ready []Entry
+	for i := range q.entries {
+		e := &q.entries[i]
+		if e.State != StatePending {
+			continue
+		}
+		if claimed[e.TargetAgent] || isBusy(e.TargetAgent) {
+			continue
+		}
+		claimed[e.TargetAgent] = true
+		ready = append(ready, *e)
 	}
-	if q.entries[0].State != StatePending {
-		return Entry{}, false
-	}
-	return q.entries[0], true
+	return ready
 }
 
 // Cancel marks the entry with the given ID as Cancelled.
@@ -218,6 +235,22 @@ func (q *Queue) ActiveEntry() (Entry, bool) {
 		}
 	}
 	return Entry{}, false
+}
+
+// ActiveEntryByCorrelation returns the active entry matching the given
+// correlation ID, or false if none matches.
+func (q *Queue) ActiveEntryByCorrelation(correlationID string) (Entry, bool) {
+	for _, e := range q.entries {
+		if (e.State == StateActive || e.State == StateDispatching) && e.CorrelationID == correlationID {
+			return e, true
+		}
+	}
+	return Entry{}, false
+}
+
+// Find returns a pointer to the entry with the given ID, or nil.
+func (q *Queue) Find(id string) *Entry {
+	return q.find(id)
 }
 
 // find returns a pointer to the entry with the given ID, or nil.

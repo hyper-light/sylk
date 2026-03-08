@@ -1244,7 +1244,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.LSPFlushMsg:
 		return m, m.handleLSPFlush(typed)
 	case msg.QueueAdvanceMsg:
-		return m, m.dispatchQueueHead()
+		return m, m.dispatchQueueEntries(typed.EntryIDs)
 	case msg.FocusPanelMsg:
 		return m, m.handleFocusPanel(typed)
 	case msg.PlanUpdateMsg:
@@ -2715,10 +2715,8 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.statusBar.SetFlash("Queue paused")
 		} else {
 			m.statusBar.SetFlash("Queue resumed")
-			// Try to advance if we just unpaused and no streams are active.
-			if !m.hasActiveStreams() {
-				return m, m.tryAdvanceQueue()
-			}
+			// Try to advance — entries targeting free agents dispatch immediately.
+			return m, m.tryAdvanceQueue()
 		}
 		m.comp.MarkDirty(compositor.SlotQueue)
 		m.viewDirty = true
@@ -2926,6 +2924,12 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.syncManualTargetFromAgentSelection()
 			return m, cmd
 		}
+		// If the input panel has content, clear it on first Esc.
+		if !m.input.IsEmpty() {
+			m.input.ClearInput()
+			return m, nil
+		}
+
 		now := time.Now()
 		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
 			m.escPressCount++
@@ -3244,26 +3248,14 @@ func (m *AppModel) handleSubmit(submit msg.SubmitPromptMsg) tea.Cmd {
 	submit.TargetAgent = targetAgent
 	submit.SessionID = m.resolveRouteSessionID(submit.SessionID)
 
-	// If any agents are streaming, either steer the target agent or enqueue.
-	if m.hasActiveStreams() {
-		// Find the active stream for the target agent (or engaged agent).
-		steerTarget := targetAgent
-		if steerTarget == "" {
-			steerTarget = m.engagedAgentID
-		}
-		if stream := m.activeStreamForAgent(steerTarget); stream != nil {
-			return m.publishSteerAction(submit.Text)
-		}
-		// Target agent is not streaming — queue for after the active request completes.
-		_, ok := m.promptQueue.Enqueue(uuid.New().String(), submit.Text, submit.TargetAgent, submit.SessionID)
-		if !ok {
-			m.pushSystemChat(fmt.Sprintf("%d requests pending. Please wait before sending another message!", m.promptQueue.PendingCount()))
-			return nil
-		}
-		m.recalcLayout() // Queue strip appeared or grew.
-		m.comp.MarkDirty(compositor.SlotQueue)
-		m.viewDirty = true
-		return nil
+	// If the target agent is already streaming, steer it. Otherwise dispatch
+	// normally — multiple agents can run concurrently.
+	steerTarget := targetAgent
+	if steerTarget == "" {
+		steerTarget = m.engagedAgentID
+	}
+	if stream := m.activeStreamForAgent(steerTarget); stream != nil {
+		return m.publishSteerAction(submit.Text)
 	}
 
 	// Push a user entry to chat.
@@ -4333,55 +4325,66 @@ func (m *AppModel) hasActiveStreams() bool {
 	return len(m.activeStreams) > 0
 }
 
-// tryAdvanceQueue dispatches the next pending queue entry if the queue is
-// non-empty and not paused. Returns a Cmd that re-enters handleSubmit, or nil.
+// tryAdvanceQueue finds all pending queue entries whose target agents are free
+// and dispatches them concurrently. Returns a Cmd or nil.
 func (m *AppModel) tryAdvanceQueue() tea.Cmd {
 	if m.promptQueue.IsPaused() || m.promptQueue.IsEmpty() {
 		return nil
 	}
-	entry, ok := m.promptQueue.Advance()
-	if !ok {
+	ready := m.promptQueue.AdvanceReady(func(agentID string) bool {
+		return m.activeStreamForAgent(agentID) != nil
+	})
+	if len(ready) == 0 {
 		m.recalcLayout()
 		m.viewDirty = true
 		return nil
 	}
-	m.promptQueue.MarkDispatching(entry.ID)
-	// Dispatch as a deferred BubbleTea command so it runs in a clean Update cycle.
+	ids := make([]string, len(ready))
+	for i, e := range ready {
+		m.promptQueue.MarkDispatching(e.ID)
+		ids[i] = e.ID
+	}
 	return func() tea.Msg {
-		return msg.QueueAdvanceMsg{}
+		return msg.QueueAdvanceMsg{EntryIDs: ids}
 	}
 }
 
-// dispatchQueueHead sends the head queue entry through the normal submit path.
-func (m *AppModel) dispatchQueueHead() tea.Cmd {
-	entry, ok := m.promptQueue.Peek()
-	if !ok || entry.State != queue.StateDispatching {
-		return nil
-	}
-	submit := msg.SubmitPromptMsg{
-		Text:        entry.Text,
-		TargetAgent: entry.TargetAgent,
-		SessionID:   entry.SessionID,
-	}
-	// Active streams are clear, so handleSubmit will dispatch normally.
-	cmd := m.handleSubmit(submit)
-	// Mark the queue entry as active with the latest correlation ID.
-	if m.hasActiveStreams() {
-		for cid := range m.activeStreams {
-			m.promptQueue.MarkActive(entry.ID, cid)
-			break
+// dispatchQueueEntries dispatches one or more queue entries through the
+// normal submit path. Each entry targets a different agent.
+func (m *AppModel) dispatchQueueEntries(entryIDs []string) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, id := range entryIDs {
+		entry := m.promptQueue.Find(id)
+		if entry == nil || entry.State != queue.StateDispatching {
+			continue
+		}
+		submit := msg.SubmitPromptMsg{
+			Text:        entry.Text,
+			TargetAgent: entry.TargetAgent,
+			SessionID:   entry.SessionID,
+		}
+		cmd := m.handleSubmit(submit)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		// Find the stream that was just created for this agent.
+		if stream := m.activeStreamForAgent(entry.TargetAgent); stream != nil {
+			m.promptQueue.MarkActive(id, stream.CorrelationID)
 		}
 	}
 	m.recalcLayout()
 	m.viewDirty = true
-	return cmd
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 // markQueueEntryByCorrelation marks a queue entry as completed or failed based
 // on its correlation ID. No-op if no queue entry matches the correlation ID.
 func (m *AppModel) markQueueEntryByCorrelation(correlationID string, success bool) {
-	active, ok := m.promptQueue.ActiveEntry()
-	if !ok || active.CorrelationID != correlationID {
+	active, ok := m.promptQueue.ActiveEntryByCorrelation(correlationID)
+	if !ok {
 		return
 	}
 	if success {

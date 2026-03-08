@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,9 +11,11 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // executeToolLoop runs the LLM tool-call loop: stream → check ToolCalls →
@@ -126,6 +129,10 @@ func (g *Guardian) executeToolLoop(
 			return strings.TrimSpace(resp.Content), usageAcc.Total(), nil
 		}
 
+		if err := g.tools.ValidateBatch(g.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", usageAcc.Total(), err
+		}
+
 		errCount, rerouted := g.applyToolCalls(ctx, req, resp)
 		g.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
@@ -172,8 +179,10 @@ func (g *Guardian) streamToolLoopTurn(
 				onChunk(chunk.Text)
 			}
 		case providers.ChunkTypeThought:
-			thoughts.WriteString(chunk.Text)
-			g.publishThoughtProgress(ctx, correlationID, thoughts.String())
+			if llmruntime.EmitsThoughts(req) {
+				thoughts.WriteString(chunk.Text)
+				g.publishThoughtProgress(ctx, correlationID, thoughts.String())
+			}
 		}
 	})
 
@@ -203,8 +212,6 @@ func (g *Guardian) applyToolCalls(
 		Metadata:  resp.ProviderMetadata,
 	})
 
-	loadedBefore := len(g.skills.GetLoaded())
-
 	errCount := 0
 	rerouted := false
 	for i, call := range resp.ToolCalls {
@@ -212,9 +219,15 @@ func (g *Guardian) applyToolCalls(
 			break
 		}
 		callStart := time.Now()
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := shared.TimedToolCall(ctx, "guardian", call, func() (string, error) {
-			return g.executeToolCall(ctx, call)
+			execResult, execErr = g.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			g.toolDefsDirty = true
+		}
 		g.logDebug("tool_apply: EXECUTE_DONE",
 			"tool_name", call.Name, "tool_index", i,
 			"elapsed", time.Since(callStart).String(),
@@ -256,15 +269,29 @@ func (g *Guardian) applyToolCalls(
 		}
 	}
 
-	if len(g.skills.GetLoaded()) > loadedBefore {
-		g.toolDefsDirty = true
-	}
-
 	return errCount, rerouted
 }
 
 func isRerouteError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "reroute")
+	return errors.Is(err, skills.ErrRerouteRequested)
+}
+
+func (g *Guardian) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
+		return nil
+	}
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	scope := g.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         g.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
+		})
+	}
+	return invocations
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
@@ -287,6 +314,8 @@ func (g *Guardian) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,

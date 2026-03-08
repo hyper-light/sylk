@@ -18,12 +18,13 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/dag"
-	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/domain"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/signal"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -50,6 +51,7 @@ type Architect struct {
 	skills      *skills.Registry
 	skillLoader *skills.Loader
 	hooks       *skills.HookRegistry
+	tools       *toolruntime.Runtime
 	planner     planningLLM
 	plannerMu   sync.RWMutex
 
@@ -67,8 +69,9 @@ type Architect struct {
 
 	// Planning state — plans live in an externally-owned PlanStore singleton
 	// that survives agent demotion/re-promotion.
-	planStore *PlanStore
-	planModes map[string]*PlanModeState
+	planStore     *PlanStore
+	ownsPlanStore bool
+	planModes     map[string]*PlanModeState
 
 	runMu         sync.RWMutex
 	runCtx        context.Context
@@ -181,12 +184,12 @@ type Config struct {
 
 // Default configuration values
 const (
-	DefaultMaxOutputTokens   = 16384
-	DefaultThinkingBudget    = 8192
-	DefaultArchitectModel    = "claude-opus-4-6"
-	DefaultLLMRequestTimeout = 120 * time.Second
-	DefaultLLMRetryMax       = 3
-	DefaultPromptCacheTTL    = 1 * time.Hour
+	DefaultMaxOutputTokens     = 16384
+	DefaultThinkingBudget      = 8192
+	DefaultArchitectModel      = "claude-opus-4-6"
+	DefaultLLMRequestTimeout   = 120 * time.Second
+	DefaultLLMRetryMax         = 3
+	DefaultPromptCacheTTL      = 1 * time.Hour
 	DefaultCrossDomainTimeout  = 30 * time.Second
 	DefaultMaxConcurrent       = 3
 	DefaultSimilarityThreshold = 0.8
@@ -292,6 +295,16 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		return nil, ctx.Err()
 	}
 
+	ownedPlanStore := false
+	if cfg.PlanStore == nil {
+		cfg.PlanStore = NewPlanStore(
+			cfg.WorkingDirectory,
+			NewPlanLeaseManager(cfg.LLMRequestTimeout, ReadyPlanMaxAge),
+			cfg.Logger,
+		)
+		ownedPlanStore = true
+	}
+
 	architectID := cfg.ID
 	if architectID == "" {
 		architectID = "architect"
@@ -299,16 +312,17 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 
 	guide.DebugFileLog().Info("DEBUG: architect_new_struct_init")
 	architect := &Architect{
-		id:          architectID,
-		config:      cfg,
-		logger:      cfg.Logger,
-		logWAL:      cfg.logWAL,
-		activityPub: cfg.ActivityPub,
-		fileAccess:  cfg.FileAccess,
-		planStore:   cfg.PlanStore,
-		knownAgents: make(map[string]*guide.AgentAnnouncement),
-		planModes:   make(map[string]*PlanModeState),
-		pendingBus:  make(map[string]chan *guide.Message),
+		id:                architectID,
+		config:            cfg,
+		logger:            cfg.Logger,
+		logWAL:            cfg.logWAL,
+		activityPub:       cfg.ActivityPub,
+		fileAccess:        cfg.FileAccess,
+		planStore:         cfg.PlanStore,
+		ownsPlanStore:     ownedPlanStore,
+		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		planModes:         make(map[string]*PlanModeState),
+		pendingBus:        make(map[string]chan *guide.Message),
 		inFlight:          make(map[string]context.CancelFunc),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
@@ -321,7 +335,9 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 	guide.DebugFileLog().Info("DEBUG: architect_new_init_synthesizer")
 	architect.initSynthesizer(cfg)
 	guide.DebugFileLog().Info("DEBUG: architect_new_init_skills")
-	architect.initSkills()
+	if err := architect.initSkills(); err != nil {
+		return nil, err
+	}
 
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -436,7 +452,7 @@ func (a *Architect) initSynthesizer(cfg Config) {
 	})
 }
 
-func (a *Architect) initSkills() {
+func (a *Architect) initSkills() error {
 	a.skills = skills.NewRegistry()
 	a.hooks = skills.NewHookRegistry()
 	a.registerCoreSkills()
@@ -448,11 +464,33 @@ func (a *Architect) initSkills() {
 	loaderCfg.AutoLoadDomains = nil
 	a.skillLoader = skills.NewLoader(a.skills, loaderCfg)
 	registerArchitectSafetyHook(a.hooks, a.skills, architectAllSkillNames())
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry:             a.skills,
+		Hooks:                a.hooks,
+		Manifest:             architectToolManifest(),
+		State:                toolruntime.NewState(),
+		GuardianControlPlane: newArchitectGuardianControlPlane(a),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize architect tool runtime: %w", err)
+	}
+	a.tools = tools
+	a.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 // Close closes the architect and its resources
 func (a *Architect) Close() error {
 	stopErr := a.Stop()
+	if a.tools != nil {
+		a.tools.Close()
+		a.tools = nil
+	}
+	if a.ownsPlanStore && a.planStore != nil {
+		a.planStore.Close()
+		a.planStore = nil
+		a.ownsPlanStore = false
+	}
 	if a.logWAL == nil {
 		return stopErr
 	}
@@ -729,8 +767,19 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
-	reqCtx = shared.WithContextGovernor(reqCtx, shared.NewContextGovernor(
-		a.config.Model, a.config.MaxOutputTokens, 0,
+	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
+	if a.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return a.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	reqCtx = shared.WithContextGovernor(reqCtx, gov)
+	reqCtx = shared.WithProgressPublisher(reqCtx, &shared.ProgressPublisher{
+		Bus: a.bus, Channels: a.channels,
+		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
+	reqCtx = shared.WithToolCallEmitter(reqCtx, shared.NewToolCallEmitter(
+		a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID,
 	))
 
 	a.registerInFlight(fwd.CorrelationID, cancel)
@@ -1193,7 +1242,7 @@ func (a *Architect) handleClarificationResponse(ctx context.Context, fwd *guide.
 		Timestamp: time.Now(),
 		Params: map[string]any{
 			"skip_clarification": true,
-			"prior_plan_id":     plan.ID,
+			"prior_plan_id":      plan.ID,
 		},
 		ConversationHistory: fwd.ConversationHistory,
 	}
@@ -2513,11 +2562,14 @@ func (a *Architect) AgentType() string {
 
 // Descriptor returns the immutable agent descriptor for handoff participation.
 func (a *Architect) Descriptor() handoff.AgentDescriptor {
+	modelID := a.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:     "architect",
-		ModelID:       "opus-4.5-200k",
-		ContextWindow: 200000,
-		Category:      handoff.CategoryKnowledge,
+		AgentType:             "architect",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryKnowledge,
+		RuntimeProfiles:       architectRuntimeProfiles(),
+		DefaultRuntimeProfile: architectDefaultRuntimeProfile(),
 	}
 }
 

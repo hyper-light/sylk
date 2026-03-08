@@ -319,7 +319,7 @@ func (p *anthropicPlanner) requestContinuation(
 		MaxTokens:    cfg.maxOutputTokens,
 		SystemPrompt: resolvedSystem,
 	}
-	p.applyStreamingRuntimeProfile(req, 0)
+	p.applyStreamingRuntimeProfile(req, stage, 0, architectSessionIDFromContext(ctx))
 	return p.streamRequest(ctx, req, stage, onChunk)
 }
 

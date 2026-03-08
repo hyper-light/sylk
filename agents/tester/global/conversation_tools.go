@@ -11,11 +11,12 @@ import "github.com/adalundhe/sylk/core/providers"
 // to gate direct chat on Inspector completion.
 func conversationAllowedSkills() []string {
 	return []string{
+		"search_skills",
 		"analyze_risk",
 		"analyze_batch",
 		"analyze_integration_risks",
 		"diagnose_failure",
-		"reroute",
+		"reroute_request",
 	}
 }
 

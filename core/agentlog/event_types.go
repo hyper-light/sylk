@@ -206,6 +206,8 @@ const (
 	EventContextEviction      EventType = 0x0D02
 	EventContextCalibration   EventType = 0x0D03
 	EventContextOutputLimited EventType = 0x0D04
+	EventHandoffTriggered     EventType = 0x0D05
+	EventThinkingDeeply       EventType = 0x0D06
 )
 
 // Boot pipeline events (0x0E00–0x0E1F).
@@ -444,6 +446,8 @@ func init() {
 	eventNames[EventContextEviction] = "ContextEviction"
 	eventNames[EventContextCalibration] = "ContextCalibration"
 	eventNames[EventContextOutputLimited] = "ContextOutputLimited"
+	eventNames[EventHandoffTriggered] = "HandoffTriggered"
+	eventNames[EventThinkingDeeply] = "ThinkingDeeply"
 
 	// Boot pipeline
 	eventNames[EventBootStarted] = "BootStarted"

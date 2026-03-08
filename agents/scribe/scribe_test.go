@@ -2,6 +2,7 @@ package scribe
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,11 +17,11 @@ import (
 // --- test helpers ---
 
 type mockProvider struct {
-	mu        sync.Mutex
-	calls     int
-	response  string
-	err       error
-	lastReq   *providers.Request
+	mu       sync.Mutex
+	calls    int
+	response string
+	err      error
+	lastReq  *providers.Request
 }
 
 func (p *mockProvider) Complete(_ context.Context, req *providers.Request) (*providers.Response, error) {
@@ -41,10 +42,10 @@ func (p *mockProvider) callCount() int {
 }
 
 type mockBus struct {
-	mu         sync.Mutex
-	published  []*guide.Message
-	topics     []string
-	subs       map[string]guide.MessageHandler
+	mu        sync.Mutex
+	published []*guide.Message
+	topics    []string
+	subs      map[string]guide.MessageHandler
 }
 
 func newMockBus() *mockBus {
@@ -63,7 +64,7 @@ func (b *mockBus) Subscribe(topic string, handler guide.MessageHandler) (guide.S
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.subs[topic] = handler
-	return &mockSub{}, nil
+	return &mockSub{topic: topic}, nil
 }
 
 func (b *mockBus) SubscribeAsync(topic string, handler guide.MessageHandler) (guide.Subscription, error) {
@@ -87,16 +88,26 @@ func (b *mockBus) lastTopic() string {
 	return b.topics[len(b.topics)-1]
 }
 
-type mockSub struct{ unsubscribed atomic.Bool }
+type mockSub struct {
+	topic        string
+	unsubscribed atomic.Bool
+}
 
-func (s *mockSub) Unsubscribe() { s.unsubscribed.Store(true) }
+func (s *mockSub) Topic() string { return s.topic }
+func (s *mockSub) Unsubscribe() error {
+	s.unsubscribed.Store(true)
+	return nil
+}
+func (s *mockSub) IsActive() bool {
+	return !s.unsubscribed.Load()
+}
 
 // --- Scribe tests ---
 
 func newTestScope(t *testing.T) *concurrency.GoroutineScope {
 	t.Helper()
-	scope := concurrency.NewGoroutineScope("test-scribe", context.Background(), nil, 0)
-	t.Cleanup(func() { _ = scope.Shutdown(context.Background()) })
+	scope := concurrency.NewGoroutineScope(context.Background(), "test-scribe", nil)
+	t.Cleanup(func() { _ = scope.Shutdown(50*time.Millisecond, 100*time.Millisecond) })
 	return scope
 }
 
@@ -208,6 +219,18 @@ func TestScribe_Feed_ProcessesAndForwards(t *testing.T) {
 
 	if err := s.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestScribeSystemPrompt_IsSpecializedByAgent(t *testing.T) {
+	engineerPrompt := scribeSystemPrompt("engineer")
+	if !strings.Contains(engineerPrompt, `"files"`) || !strings.Contains(engineerPrompt, `"tests"`) {
+		t.Fatalf("engineer prompt missing implementation fields: %s", engineerPrompt)
+	}
+
+	academicPrompt := scribeSystemPrompt("academic")
+	if !strings.Contains(academicPrompt, `"thesis"`) || !strings.Contains(academicPrompt, `"handoff_delta"`) {
+		t.Fatalf("academic prompt missing research fields: %s", academicPrompt)
 	}
 }
 

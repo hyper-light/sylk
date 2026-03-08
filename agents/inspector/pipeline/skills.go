@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 )
@@ -55,12 +55,16 @@ func (pi *PipelineInspector) registerCoreSkills() {
 
 type pipelineInspectorDiag struct{ pi *PipelineInspector }
 
-func (d *pipelineInspectorDiag) AgentName() string  { return "inspector_pipeline" }
-func (d *pipelineInspectorDiag) SessionID() string  { return d.pi.config.SessionID }
-func (d *pipelineInspectorDiag) LogsDir() string    { return agentShared.LogsDirForAgent(d.pi.steering.SessionDir(), "inspector_pipeline") }
-func (d *pipelineInspectorDiag) EventLogger() *agentlog.SessionEventLogger { return d.pi.steering.EventLogger() }
-func (d *pipelineInspectorDiag) PeerLogsDirs() map[string]string           { return nil }
-func (d *pipelineInspectorDiag) RecoveryHints() []string                   { return nil }
+func (d *pipelineInspectorDiag) AgentName() string { return "inspector_pipeline" }
+func (d *pipelineInspectorDiag) SessionID() string { return d.pi.config.SessionID }
+func (d *pipelineInspectorDiag) LogsDir() string {
+	return agentShared.LogsDirForAgent(d.pi.steering.SessionDir(), "inspector_pipeline")
+}
+func (d *pipelineInspectorDiag) EventLogger() *agentlog.SessionEventLogger {
+	return d.pi.steering.EventLogger()
+}
+func (d *pipelineInspectorDiag) PeerLogsDirs() map[string]string { return nil }
+func (d *pipelineInspectorDiag) RecoveryHints() []string         { return nil }
 
 func (d *pipelineInspectorDiag) AgentSpecificDiagnostics() map[string]any {
 	d.pi.mu.RLock()
@@ -139,18 +143,32 @@ func validateCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 
 			pi.mu.RLock()
 			criteria, ok := pi.criteria[params.TaskID]
+			files := append([]string(nil), pi.taskFiles[params.TaskID]...)
+			workerType := pi.workerType
 			pi.mu.RUnlock()
 
 			if !ok {
 				return nil, fmt.Errorf("no criteria defined for task %s", params.TaskID)
 			}
-
+			if len(params.Files) > 0 {
+				files = params.Files
+			}
+			result, err := pi.ValidateAgainstCriteria(ctx, params.TaskID, files, workerType)
+			if err != nil {
+				return nil, err
+			}
 			return map[string]any{
-				"task_id":        params.TaskID,
-				"criteria_found": true,
-				"criteria_count": len(criteria.SuccessCriteria),
-				"gates_count":    len(criteria.QualityGates),
-				"files_to_check": params.Files,
+				"task_id":              params.TaskID,
+				"criteria_found":       true,
+				"criteria_count":       len(criteria.SuccessCriteria),
+				"gates_count":          len(criteria.QualityGates),
+				"files_to_check":       params.Files,
+				"passed":               result.Passed,
+				"issue_count":          len(result.Issues),
+				"criteria_met":         result.CriteriaMet,
+				"criteria_failed":      result.CriteriaFailed,
+				"quality_gate_results": result.QualityGateResults,
+				"issues":               result.Issues,
 			}, nil
 		}).
 		Build()
@@ -170,19 +188,21 @@ func gradeTaskQualitySkill(pi *PipelineInspector) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-
-			grade := shared.QualityGrade{
-				Correctness: 1.0,
-				Robustness:  1.0,
-				Performance: 1.0,
-				Security:    1.0,
-				Adherence:   1.0,
+			pi.mu.RLock()
+			result := pi.results[params.TaskID]
+			workerType := pi.workerType
+			pi.mu.RUnlock()
+			if result == nil {
+				return nil, fmt.Errorf("no validation result available for task %s", params.TaskID)
 			}
 
+			grade := qualityGradeForResult(result, workerType)
+
 			return map[string]any{
-				"task_id": params.TaskID,
-				"grade":   grade,
-				"overall": grade.Overall(),
+				"task_id":     params.TaskID,
+				"grade":       grade,
+				"overall":     grade.OverallForDomain(shared.ValidationDomainFromWorkerType(workerType)),
+				"issue_count": len(result.Issues),
 			}, nil
 		}).
 		Build()

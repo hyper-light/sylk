@@ -3,6 +3,8 @@ package guide
 import (
 	"regexp"
 	"time"
+
+	"github.com/adalundhe/sylk/core/llmruntime"
 )
 
 // RerouteRequest is published by an agent's reroute_request skill when the
@@ -452,10 +454,11 @@ type PendingRequest struct {
 // RouteResult represents the result of routing a request
 type RouteResult struct {
 	// Classification results
-	Intent        Intent        `json:"intent"`
-	Domain        Domain        `json:"domain"`
-	TargetAgent   TargetAgent   `json:"target_agent"`
-	TemporalFocus TemporalFocus `json:"temporal_focus"`
+	Intent         Intent        `json:"intent"`
+	Domain         Domain        `json:"domain"`
+	TargetAgent    TargetAgent   `json:"target_agent"`
+	RuntimeProfile string        `json:"runtime_profile,omitempty"`
+	TemporalFocus  TemporalFocus `json:"temporal_focus"`
 
 	// Extracted entities
 	Entities *ExtractedEntities `json:"entities,omitempty"`
@@ -707,6 +710,13 @@ type AgentRegistration struct {
 
 	// Priority for routing conflicts (higher = preferred)
 	Priority int `json:"priority"`
+
+	// RuntimeProfiles describe the agent's stage-level LLM behavior.
+	RuntimeProfiles []llmruntime.StageProfile `json:"runtime_profiles,omitempty"`
+
+	// DefaultRuntimeProfile is the profile name to assume when no explicit
+	// intent/domain match exists.
+	DefaultRuntimeProfile string `json:"default_runtime_profile,omitempty"`
 }
 
 // AgentCapabilities declares what an agent can handle
@@ -828,6 +838,8 @@ func (r *AgentRegistration) MatchScore(result *RouteResult) int {
 	if r.Constraints.TemporalFocus != "" && r.Constraints.TemporalFocus == result.TemporalFocus {
 		score += 5
 	}
+
+	score += llmruntime.RouteScoreBonus(r.RuntimeProfiles, string(result.Intent), string(result.Domain))
 
 	return score
 }

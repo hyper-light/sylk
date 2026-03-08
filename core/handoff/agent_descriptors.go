@@ -1,6 +1,10 @@
 package handoff
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/adalundhe/sylk/core/llmruntime"
+)
 
 // DescriptorRegistry maps agent type strings to their AgentDescriptor.
 // It is pre-populated with known agent types and supports runtime registration.
@@ -65,18 +69,18 @@ const contextWindow272K = 272_000
 // defaultDescriptors returns the pre-populated agent descriptors.
 func defaultDescriptors() []AgentDescriptor {
 	return []AgentDescriptor{
-		{AgentType: "librarian", ModelID: "sonnet-4.5-1m", ContextWindow: contextWindow1M, Category: CategoryKnowledge},
-		{AgentType: "archivalist", ModelID: "sonnet-4.5-1m", ContextWindow: contextWindow1M, Category: CategoryKnowledge},
-		{AgentType: "academic", ModelID: "opus-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryKnowledge},
-		{AgentType: "architect", ModelID: "opus-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryKnowledge},
-		{AgentType: "guide", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone},
-		{AgentType: "orchestrator", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone},
-		{AgentType: "engineer", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryPipeline},
-		{AgentType: "designer", ModelID: "gemini-3.1-pro-preview", ReasoningEffort: "high", ContextWindow: contextWindow1M, Category: CategoryPipeline},
-		{AgentType: "inspector", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryStandalone},
-		{AgentType: "inspector-pipeline", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryPipeline},
-		{AgentType: "tester", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryStandalone},
-		{AgentType: "tester-pipeline", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryPipeline},
-		{AgentType: "guardian", ModelID: "gpt-5.4-pro", ReasoningEffort: "high", ContextWindow: contextWindow272K, Category: CategoryStandalone},
+		{AgentType: "librarian", ModelID: "sonnet-4.5-1m", ContextWindow: contextWindow1M, Category: CategoryKnowledge, RuntimeProfiles: llmruntime.AgentProfiles("librarian"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("librarian")},
+		{AgentType: "archivalist", ModelID: "sonnet-4.5-1m", ContextWindow: contextWindow1M, Category: CategoryKnowledge, RuntimeProfiles: llmruntime.AgentProfiles("archivalist"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("archivalist")},
+		{AgentType: "academic", ModelID: "opus-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryKnowledge, RuntimeProfiles: llmruntime.AgentProfiles("academic"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("academic")},
+		{AgentType: "architect", ModelID: "opus-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryKnowledge, RuntimeProfiles: llmruntime.AgentProfiles("architect"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("architect")},
+		{AgentType: "guide", ModelID: "haiku-4.5-200k", ContextWindow: contextWindow200K, Category: CategoryStandalone, RuntimeProfiles: llmruntime.AgentProfiles("guide"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("guide")},
+		{AgentType: "orchestrator", ModelID: "gemini-3-flash-preview", ContextWindow: contextWindow1M, Category: CategoryStandalone, RuntimeProfiles: llmruntime.AgentProfiles("orchestrator"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("orchestrator")},
+		{AgentType: "engineer", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryPipeline, RuntimeProfiles: llmruntime.AgentProfiles("engineer"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("engineer")},
+		{AgentType: "designer", ModelID: "gemini-3.1-pro-preview", ReasoningEffort: "high", ContextWindow: contextWindow1M, Category: CategoryPipeline, RuntimeProfiles: llmruntime.AgentProfiles("designer"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("designer")},
+		{AgentType: "inspector", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryStandalone, RuntimeProfiles: llmruntime.AgentProfiles("inspector"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("inspector")},
+		{AgentType: "inspector-pipeline", ModelID: "opus-4.6", ContextWindow: contextWindow200K, Category: CategoryPipeline, RuntimeProfiles: llmruntime.AgentProfiles("inspector-pipeline"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("inspector-pipeline")},
+		{AgentType: "tester", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryStandalone, RuntimeProfiles: llmruntime.AgentProfiles("tester"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("tester")},
+		{AgentType: "tester-pipeline", ModelID: "gpt-5.4-pro", ReasoningEffort: "xhigh", ContextWindow: contextWindow272K, Category: CategoryPipeline, RuntimeProfiles: llmruntime.AgentProfiles("tester-pipeline"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("tester-pipeline")},
+		{AgentType: "guardian", ModelID: "gpt-5.4-pro", ReasoningEffort: "high", ContextWindow: contextWindow272K, Category: CategoryStandalone, RuntimeProfiles: llmruntime.AgentProfiles("guardian"), DefaultRuntimeProfile: llmruntime.AgentDefaultProfile("guardian")},
 	}
 }

@@ -189,9 +189,12 @@ func (a *Architect) composeUserFacingResponseWithTools(
 		SystemPrompt: planner.ConversationSystemPrompt(),
 		Tools:        tools,
 	}
-	a.applyConversationRuntimeProfile(req, mode)
+	a.applyConversationRuntimeProfile(req, mode, request.SessionID)
 
-	text, err := a.executeToolLoop(ctx, req, stage, request.OnChunk, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	text, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return a.executeToolLoop(ctx, req, stage, request.OnChunk, ledger)
+	})
 	if err != nil {
 		a.logDebug("compose_with_tools: TOOL_LOOP_ERROR",
 			"stage", stage,

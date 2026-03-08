@@ -1,0 +1,886 @@
+package toolruntime
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
+)
+
+const (
+	SearchToolName      = "search_skills"
+	defaultSearchLimit  = 5
+	maxSearchResults    = 10
+	maxDescriptionItems = 2
+)
+
+type Config struct {
+	Registry             *skills.Registry
+	Hooks                *skills.HookRegistry
+	Manifest             *PolicyManifest
+	State                *State
+	SearchLimit          int
+	GuardianControlPlane GuardianControlPlane
+}
+
+type ExecutionResult struct {
+	Output          string
+	ToolName        string
+	ToolDefsDirty   bool
+	ActivatedSkills []string
+}
+
+type RawExecutionResult struct {
+	Data            any
+	ToolName        string
+	ToolDefsDirty   bool
+	ActivatedSkills []string
+}
+
+type Runtime struct {
+	registry     *skills.Registry
+	hooks        *skills.HookRegistry
+	manifest     *PolicyManifest
+	state        *State
+	searchLimit  int
+	worker       *SerialWorker
+	controlPlane GuardianControlPlane
+}
+
+type searchRequest struct {
+	Query    string   `json:"query"`
+	Limit    int      `json:"limit,omitempty"`
+	Activate *bool    `json:"activate,omitempty"`
+	Domains  []string `json:"domains,omitempty"`
+}
+
+type searchMatch struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Domain      string   `json:"domain,omitempty"`
+	Keywords    []string `json:"keywords,omitempty"`
+	Active      bool     `json:"active"`
+	Loaded      bool     `json:"loaded"`
+	Score       int      `json:"score"`
+}
+
+func New(cfg Config) (*Runtime, error) {
+	searchLimit := cfg.SearchLimit
+	if searchLimit <= 0 {
+		searchLimit = defaultSearchLimit
+	}
+	if searchLimit > maxSearchResults {
+		searchLimit = maxSearchResults
+	}
+
+	state := cfg.State
+	if state == nil {
+		state = NewState()
+	}
+
+	runtime := &Runtime{
+		registry:     cfg.Registry,
+		hooks:        cfg.Hooks,
+		manifest:     cfg.Manifest,
+		state:        state,
+		searchLimit:  searchLimit,
+		worker:       NewSerialWorker(16),
+		controlPlane: cfg.GuardianControlPlane,
+	}
+	if err := runtime.manifest.Validate(runtime.registry, runtime.controlPlane != nil); err != nil {
+		runtime.worker.Close()
+		return nil, err
+	}
+	runtime.state.Activate(runtime.manifest.DefaultVisibleNames()...)
+	return runtime, nil
+}
+
+func (r *Runtime) Close() {
+	if r == nil || r.worker == nil {
+		return
+	}
+	r.worker.Close()
+}
+
+func (r *Runtime) CapabilityScope() string {
+	if r == nil || r.manifest == nil {
+		return ""
+	}
+	return r.manifest.CapabilityScope
+}
+
+func (r *Runtime) Allows(name string) bool {
+	if r == nil || r.manifest == nil {
+		return false
+	}
+	_, ok := r.manifest.Policy(name)
+	return ok
+}
+
+func (r *Runtime) Activate(names ...string) ([]string, error) {
+	if r == nil || r.manifest == nil {
+		return nil, fmt.Errorf("tool runtime is not configured")
+	}
+	allowed := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := r.manifest.Policy(name); !ok {
+			return nil, fmt.Errorf("SECURITY VIOLATION: agent %q is not permitted to activate tool %q", r.manifest.AgentID, name)
+		}
+		allowed = append(allowed, name)
+	}
+	return r.state.Activate(allowed...), nil
+}
+
+func (r *Runtime) SyncActiveFromLoaded() []string {
+	if r == nil || r.registry == nil || r.manifest == nil {
+		return nil
+	}
+	loaded := r.registry.GetLoaded()
+	names := make([]string, 0, len(loaded))
+	for _, skill := range loaded {
+		if skill == nil {
+			continue
+		}
+		if _, ok := r.manifest.Policy(skill.Name); !ok {
+			continue
+		}
+		names = append(names, skill.Name)
+	}
+	return r.state.Activate(names...)
+}
+
+func (r *Runtime) BuildToolDefinitions() []providers.Tool {
+	if r == nil {
+		return nil
+	}
+	tools := make([]providers.Tool, 0)
+	for _, name := range r.state.Snapshot() {
+		policy, ok := r.manifest.Policy(name)
+		if !ok {
+			continue
+		}
+		if name == SearchToolName {
+			tools = append(tools, searchToolDefinition(policy))
+			continue
+		}
+		skill := r.registry.Get(name)
+		if skill == nil {
+			continue
+		}
+		tools = append(tools, r.skillToProviderTool(skill, policy))
+	}
+	sort.Slice(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
+	return tools
+}
+
+// ValidateBatch validates identity and scope for each invocation in the batch.
+// Mixed effect domains are allowed; schedulers may use domain metadata later to
+// decide ordering or parallelism, but admission should not reject them.
+func (r *Runtime) ValidateBatch(invocations []Invocation) error {
+	if r == nil || len(invocations) == 0 {
+		return nil
+	}
+	for _, inv := range invocations {
+		if _, _, err := r.validateInvocation(inv); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Runtime) Execute(ctx context.Context, inv Invocation) (ExecutionResult, error) {
+	rawResult, err := r.ExecuteRaw(ctx, inv)
+	if err != nil {
+		return ExecutionResult{
+			ToolName:        rawResult.ToolName,
+			ToolDefsDirty:   rawResult.ToolDefsDirty,
+			ActivatedSkills: append([]string(nil), rawResult.ActivatedSkills...),
+		}, err
+	}
+	output, err := marshalOutput(rawResult.Data)
+	if err != nil {
+		return ExecutionResult{}, err
+	}
+	return ExecutionResult{
+		Output:          output,
+		ToolName:        rawResult.ToolName,
+		ToolDefsDirty:   rawResult.ToolDefsDirty,
+		ActivatedSkills: append([]string(nil), rawResult.ActivatedSkills...),
+	}, nil
+}
+
+func (r *Runtime) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecutionResult, error) {
+	if r == nil {
+		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
+	}
+	name, policy, err := r.validateInvocation(inv)
+	if err != nil {
+		return RawExecutionResult{}, err
+	}
+	if !r.state.IsActive(name) {
+		return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
+	}
+
+	inputMap, raw, err := decodeInputObject(inv.ToolCall.Arguments)
+	if err != nil {
+		return RawExecutionResult{}, fmt.Errorf("tool arguments for %q: %w", name, err)
+	}
+
+	toolData := &skills.ToolCallHookData{
+		ToolName: name,
+		ToolID:   inv.ToolCall.ID,
+		AgentID:  inv.AgentID,
+		Input:    cloneMap(inputMap),
+		Metadata: map[string]any{
+			"raw_json":         raw,
+			"correlation_id":   inv.CorrelationID,
+			"capability_scope": inv.CapabilityScope,
+		},
+	}
+
+	if r.hooks != nil {
+		updated, hookResult, hookErr := r.hooks.ExecutePreToolCallHooks(ctx, toolData)
+		if hookErr != nil {
+			return RawExecutionResult{}, hookErr
+		}
+		if updated != nil {
+			toolData = updated
+		}
+		if toolData.ToolName == "" {
+			toolData.ToolName = name
+		}
+		if toolData.ToolID == "" {
+			toolData.ToolID = inv.ToolCall.ID
+		}
+		if toolData.AgentID == "" {
+			toolData.AgentID = inv.AgentID
+		}
+		if toolData.Metadata == nil {
+			toolData.Metadata = map[string]any{}
+		}
+		toolData.Metadata["correlation_id"] = inv.CorrelationID
+		toolData.Metadata["capability_scope"] = inv.CapabilityScope
+		toolData.Metadata["raw_json"] = raw
+		if hookResult.SkipExecution {
+			output := strings.TrimSpace(hookResult.SkipResponse)
+			if postErr := r.runPostHooks(ctx, toolData, output, nil); postErr != nil {
+				return RawExecutionResult{}, postErr
+			}
+			return RawExecutionResult{Data: output, ToolName: toolData.ToolName}, nil
+		}
+		if !hookResult.Continue {
+			if hookResult.Error != nil {
+				return RawExecutionResult{}, hookResult.Error
+			}
+			return RawExecutionResult{}, fmt.Errorf("tool call blocked: %s", toolData.ToolName)
+		}
+
+		name = strings.TrimSpace(toolData.ToolName)
+		nextPolicy, ok := r.manifest.Policy(name)
+		if !ok {
+			return RawExecutionResult{}, fmt.Errorf("SECURITY VIOLATION: agent %q is not permitted to execute tool %q", inv.AgentID, name)
+		}
+		policy = nextPolicy
+		if !r.state.IsActive(name) {
+			return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
+		}
+	}
+
+	if name == SearchToolName {
+		payload, activated, execErr := r.executeSearch(toolData.Input)
+		if postErr := r.runPostHooks(ctx, toolData, payload, execErr); postErr != nil {
+			return RawExecutionResult{}, postErr
+		}
+		if execErr != nil {
+			return RawExecutionResult{}, execErr
+		}
+		return RawExecutionResult{
+			Data:            payload,
+			ToolName:        name,
+			ToolDefsDirty:   len(activated) > 0,
+			ActivatedSkills: activated,
+		}, nil
+	}
+
+	if policy.ApprovalSensitive || policy.Execution == ExecutionModeGuardian {
+		if err := r.obtainGuardianGrant(ctx, inv, policy, raw, toolData.Input); err != nil {
+			if postErr := r.runPostHooks(ctx, toolData, nil, err); postErr != nil {
+				return RawExecutionResult{}, postErr
+			}
+			return RawExecutionResult{}, err
+		}
+	}
+
+	result, err := r.executePolicy(ctx, name, toolData.Input, policy)
+	if postErr := r.runPostHooks(ctx, toolData, resultData(result), resultError(result)); postErr != nil {
+		return RawExecutionResult{}, postErr
+	}
+	if err != nil {
+		return RawExecutionResult{}, err
+	}
+	if result == nil {
+		return RawExecutionResult{}, fmt.Errorf("tool %q returned nil", name)
+	}
+	if !result.Success {
+		return RawExecutionResult{}, resultToError(name, result)
+	}
+	return RawExecutionResult{
+		Data:     result.Data,
+		ToolName: name,
+	}, nil
+}
+
+func (r *Runtime) validateInvocation(inv Invocation) (string, ToolPolicy, error) {
+	if r.manifest == nil {
+		return "", ToolPolicy{}, fmt.Errorf("tool policy manifest is not configured")
+	}
+	name := strings.TrimSpace(inv.ToolCall.Name)
+	if name == "" {
+		return "", ToolPolicy{}, fmt.Errorf("tool name is required")
+	}
+	if strings.TrimSpace(inv.AgentID) == "" {
+		return "", ToolPolicy{}, fmt.Errorf("agent_id is required for tool invocation")
+	}
+	if strings.TrimSpace(inv.CorrelationID) == "" {
+		return "", ToolPolicy{}, fmt.Errorf("correlation_id is required for tool invocation")
+	}
+	if strings.TrimSpace(inv.CapabilityScope) == "" {
+		return "", ToolPolicy{}, fmt.Errorf("capability_scope is required for tool invocation")
+	}
+	if inv.AgentID != r.manifest.AgentID {
+		return "", ToolPolicy{}, fmt.Errorf("tool invocation agent mismatch: %q != %q", inv.AgentID, r.manifest.AgentID)
+	}
+	if inv.CapabilityScope != r.manifest.CapabilityScope {
+		return "", ToolPolicy{}, fmt.Errorf("tool invocation capability scope mismatch: %q != %q", inv.CapabilityScope, r.manifest.CapabilityScope)
+	}
+	policy, ok := r.manifest.Policy(name)
+	if !ok {
+		return "", ToolPolicy{}, fmt.Errorf("SECURITY VIOLATION: agent %q is not permitted to execute tool %q", inv.AgentID, name)
+	}
+	return name, policy, nil
+}
+
+func (r *Runtime) executePolicy(ctx context.Context, name string, input map[string]any, policy ToolPolicy) (*skills.Result, error) {
+	run := func() (any, error) {
+		return r.invokeLocal(ctx, name, input)
+	}
+	switch policy.Execution {
+	case ExecutionModeLocal:
+		value, err := run()
+		if err != nil {
+			return nil, err
+		}
+		return value.(*skills.Result), nil
+	case ExecutionModeLocalWorker, ExecutionModeGuardian:
+		value, err := r.worker.Do(ctx, run)
+		if err != nil {
+			return nil, err
+		}
+		result, _ := value.(*skills.Result)
+		return result, nil
+	default:
+		return nil, fmt.Errorf("unsupported execution mode %q for tool %q", policy.Execution, name)
+	}
+}
+
+func (r *Runtime) invokeLocal(ctx context.Context, name string, input map[string]any) (*skills.Result, error) {
+	if r.registry == nil {
+		return nil, fmt.Errorf("tool registry is not available")
+	}
+	skill := r.registry.Get(name)
+	if skill == nil {
+		return nil, fmt.Errorf("tool %q is not registered", name)
+	}
+	if !skill.Loaded {
+		_ = r.registry.Load(name)
+	}
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("marshal tool input for %q: %w", name, err)
+	}
+	return r.registry.Invoke(ctx, name, payload), nil
+}
+
+func (r *Runtime) obtainGuardianGrant(
+	ctx context.Context,
+	inv Invocation,
+	policy ToolPolicy,
+	raw string,
+	input map[string]any,
+) error {
+	if r.manifest != nil && r.manifest.AgentID == "guardian" {
+		return nil
+	}
+	if r.controlPlane == nil {
+		return fmt.Errorf("tool %q requires guardian-controlled execution but no guardian control plane is configured", inv.ToolCall.Name)
+	}
+	req := GuardianControlRequest{
+		AgentID:           inv.AgentID,
+		CorrelationID:     inv.CorrelationID,
+		CapabilityScope:   inv.CapabilityScope,
+		ToolName:          inv.ToolCall.Name,
+		ToolID:            inv.ToolCall.ID,
+		Arguments:         raw,
+		ArgumentsHash:     HashArguments(raw),
+		Input:             cloneMap(input),
+		Policy:            policy,
+		PolicyFingerprint: r.manifest.Fingerprint(),
+		Timestamp:         time.Now(),
+	}
+	grant, err := r.controlPlane.RequestGrant(ctx, req)
+	if err != nil {
+		return err
+	}
+	return grant.Validate(req)
+}
+
+func (r *Runtime) executeSearch(input map[string]any) (map[string]any, []string, error) {
+	var req searchRequest
+	if input != nil {
+		payload, err := json.Marshal(input)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal search request: %w", err)
+		}
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, nil, fmt.Errorf("invalid search request: %w", err)
+		}
+	}
+	query := strings.TrimSpace(req.Query)
+	if query == "" {
+		return nil, nil, fmt.Errorf("query is required")
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = r.searchLimit
+	}
+	if limit > maxSearchResults {
+		limit = maxSearchResults
+	}
+	activate := true
+	if req.Activate != nil {
+		activate = *req.Activate
+	}
+	domainFilter := make(map[string]struct{}, len(req.Domains))
+	for _, domain := range req.Domains {
+		domain = strings.TrimSpace(strings.ToLower(domain))
+		if domain == "" {
+			continue
+		}
+		domainFilter[domain] = struct{}{}
+	}
+
+	type rankedSkill struct {
+		skill  *skills.Skill
+		policy ToolPolicy
+		score  int
+	}
+	ranked := make([]rankedSkill, 0)
+	queryTerms := tokenize(query)
+	for _, skill := range r.registry.GetAll() {
+		if skill == nil {
+			continue
+		}
+		policy, ok := r.manifest.Policy(skill.Name)
+		if !ok || !policy.Searchable {
+			continue
+		}
+		if len(domainFilter) > 0 {
+			if _, ok := domainFilter[strings.ToLower(strings.TrimSpace(string(policy.Domain)))]; !ok {
+				continue
+			}
+		}
+		score := scoreSkill(query, queryTerms, skill)
+		if score <= 0 {
+			continue
+		}
+		ranked = append(ranked, rankedSkill{skill: skill, policy: policy, score: score})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score > ranked[j].score
+		}
+		return ranked[i].skill.Name < ranked[j].skill.Name
+	})
+	if len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+
+	matches := make([]searchMatch, 0, len(ranked))
+	activateNames := make([]string, 0, len(ranked))
+	for _, entry := range ranked {
+		matches = append(matches, searchMatch{
+			Name:        entry.skill.Name,
+			Description: compileToolDescription(entry.skill, entry.policy),
+			Domain:      string(entry.policy.Domain),
+			Keywords:    append([]string(nil), entry.skill.Keywords...),
+			Active:      r.state.IsActive(entry.skill.Name),
+			Loaded:      entry.skill.Loaded,
+			Score:       entry.score,
+		})
+		if activate {
+			activateNames = append(activateNames, entry.skill.Name)
+		}
+	}
+	activated := r.state.Activate(activateNames...)
+	payload := map[string]any{
+		"query":              query,
+		"matches":            matches,
+		"activated_skills":   activated,
+		"result_count":       len(matches),
+		"active_skill_count": len(r.state.Snapshot()),
+	}
+	return payload, activated, nil
+}
+
+func (r *Runtime) runPostHooks(ctx context.Context, toolData *skills.ToolCallHookData, output any, err error) error {
+	if r.hooks == nil || toolData == nil {
+		return nil
+	}
+	postData := &skills.ToolCallHookData{
+		ToolName: toolData.ToolName,
+		ToolID:   toolData.ToolID,
+		AgentID:  toolData.AgentID,
+		Input:    cloneMap(toolData.Input),
+		Output:   output,
+		Error:    err,
+		Metadata: cloneMap(toolData.Metadata),
+	}
+	_, _, hookErr := r.hooks.ExecutePostToolCallHooks(ctx, postData)
+	return hookErr
+}
+
+func (r *Runtime) skillToProviderTool(skill *skills.Skill, policy ToolPolicy) providers.Tool {
+	parameters := inputSchemaToMap(skill)
+	if len(parameters) == 0 {
+		parameters = map[string]any{
+			"type":       "object",
+			"properties": map[string]any{},
+		}
+	}
+	return providers.Tool{
+		Name:        strings.TrimSpace(skill.Name),
+		Description: compileToolDescription(skill, policy),
+		Parameters:  parameters,
+	}
+}
+
+func searchToolDefinition(policy ToolPolicy) providers.Tool {
+	return providers.Tool{
+		Name: SearchToolName,
+		Description: strings.Join([]string{
+			"Search the current agent's scoped capability manifest.",
+			"Use this when the right tool is not active yet and you need to discover or activate additional tools for later turns.",
+			"Effect: " + string(policy.Effect) + ".",
+			"Domain: " + string(policy.Domain) + ".",
+		}, " "),
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "Natural-language description of the capability you need.",
+				},
+				"limit": map[string]any{
+					"type":        "integer",
+					"description": "Maximum number of matches to return.",
+					"default":     defaultSearchLimit,
+				},
+				"activate": map[string]any{
+					"type":        "boolean",
+					"description": "When true, matching tools are activated into the current active tool set for subsequent turns.",
+					"default":     true,
+				},
+				"domains": map[string]any{
+					"type":        "array",
+					"description": "Optional effect-domain filters.",
+					"items": map[string]any{
+						"type": "string",
+					},
+				},
+			},
+			"required": []string{"query"},
+		},
+	}
+}
+
+func decodeInputObject(arguments string) (map[string]any, string, error) {
+	raw := strings.TrimSpace(arguments)
+	if raw == "" {
+		raw = "{}"
+	}
+	if !json.Valid([]byte(raw)) {
+		return nil, raw, fmt.Errorf("must be valid JSON")
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return nil, raw, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if decoded == nil {
+		return map[string]any{}, raw, nil
+	}
+	object, ok := decoded.(map[string]any)
+	if !ok {
+		return nil, raw, fmt.Errorf("must be a JSON object")
+	}
+	return object, raw, nil
+}
+
+func inputSchemaToMap(skill *skills.Skill) map[string]any {
+	if skill == nil {
+		return nil
+	}
+	schema := skill.InputSchema
+	if schema == nil {
+		schema = &skills.InputSchema{
+			Type:       "object",
+			Properties: map[string]*skills.Property{},
+		}
+	}
+	if schema.Properties == nil {
+		schema.Properties = map[string]*skills.Property{}
+	}
+	payload, err := json.Marshal(schema)
+	if err != nil {
+		return nil
+	}
+	var result map[string]any
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return nil
+	}
+	return result
+}
+
+func compileToolDescription(skill *skills.Skill, policy ToolPolicy) string {
+	if skill == nil {
+		return ""
+	}
+	parts := make([]string, 0, 8)
+	if base := strings.TrimSpace(skill.Description); base != "" {
+		parts = append(parts, base)
+	}
+	parts = append(parts, "Effect: "+string(policy.Effect)+".")
+	parts = append(parts, "Domain: "+string(policy.Domain)+".")
+	parts = append(parts, "Execution: "+string(policy.Execution)+".")
+	if usage := compactSentence(skill.UsageDoc); usage != "" {
+		parts = append(parts, "Use when: "+usage)
+	}
+	if len(skill.BestPractices) > 0 {
+		parts = append(parts, "Best practices: "+joinExamples(skill.BestPractices))
+	}
+	if len(skill.Examples) > 0 {
+		parts = append(parts, "Examples: "+joinExamples(skill.Examples))
+	}
+	if len(skill.Keywords) > 0 {
+		parts = append(parts, "Keywords: "+strings.Join(uniqueSortedStrings(skill.Keywords), ", ")+".")
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
+func compactSentence(text string) string {
+	text = strings.TrimSpace(strings.Join(strings.Fields(text), " "))
+	if text == "" {
+		return ""
+	}
+	if len(text) > 220 {
+		text = strings.TrimSpace(text[:220]) + "..."
+	}
+	if strings.HasSuffix(text, ".") {
+		return text
+	}
+	return text + "."
+}
+
+func joinExamples(items []string) string {
+	trimmed := make([]string, 0, maxDescriptionItems)
+	for _, item := range items {
+		item = compactSentence(item)
+		if item == "" {
+			continue
+		}
+		trimmed = append(trimmed, item)
+		if len(trimmed) >= maxDescriptionItems {
+			break
+		}
+	}
+	return strings.Join(trimmed, " ")
+}
+
+func tokenize(text string) []string {
+	text = strings.ToLower(text)
+	replacer := strings.NewReplacer("_", " ", "-", " ", "/", " ", ".", " ", ",", " ", ":", " ")
+	text = replacer.Replace(text)
+	return uniqueSortedStrings(strings.Fields(text))
+}
+
+func scoreSkill(query string, queryTerms []string, skill *skills.Skill) int {
+	if skill == nil {
+		return 0
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	name := strings.ToLower(skill.Name)
+	description := strings.ToLower(skill.Description)
+	domain := strings.ToLower(skill.Domain)
+	usage := strings.ToLower(skill.UsageDoc)
+	keywords := strings.ToLower(strings.Join(skill.Keywords, " "))
+	examples := strings.ToLower(strings.Join(skill.Examples, " "))
+	practices := strings.ToLower(strings.Join(skill.BestPractices, " "))
+	properties := strings.ToLower(strings.Join(schemaPropertyTerms(skill.InputSchema), " "))
+
+	score := 0
+	if query != "" {
+		if strings.Contains(name, query) {
+			score += 60
+		}
+		if strings.Contains(description, query) {
+			score += 30
+		}
+		if strings.Contains(usage, query) {
+			score += 24
+		}
+	}
+	for _, term := range queryTerms {
+		switch {
+		case term == "":
+			continue
+		case strings.Contains(name, term):
+			score += 14
+		}
+		if strings.Contains(keywords, term) {
+			score += 12
+		}
+		if strings.Contains(domain, term) {
+			score += 10
+		}
+		if strings.Contains(description, term) {
+			score += 8
+		}
+		if strings.Contains(usage, term) {
+			score += 7
+		}
+		if strings.Contains(properties, term) {
+			score += 6
+		}
+		if strings.Contains(examples, term) {
+			score += 4
+		}
+		if strings.Contains(practices, term) {
+			score += 4
+		}
+	}
+	if skill.Loaded {
+		score += 2
+	}
+	return score
+}
+
+func schemaPropertyTerms(schema *skills.InputSchema) []string {
+	if schema == nil {
+		return nil
+	}
+	terms := make([]string, 0, len(schema.Properties)*2)
+	for name, prop := range schema.Properties {
+		if name != "" {
+			terms = append(terms, name)
+		}
+		if prop != nil && prop.Description != "" {
+			terms = append(terms, prop.Description)
+		}
+	}
+	return terms
+}
+
+func marshalOutput(data any) (string, error) {
+	switch typed := data.(type) {
+	case string:
+		return typed, nil
+	case fmt.Stringer:
+		return typed.String(), nil
+	default:
+		payload, err := json.Marshal(data)
+		if err != nil {
+			return "", fmt.Errorf("marshal tool output: %w", err)
+		}
+		return string(payload), nil
+	}
+}
+
+func resultToError(name string, result *skills.Result) error {
+	if result == nil {
+		return fmt.Errorf("tool %q returned nil", name)
+	}
+	if result.Success {
+		return nil
+	}
+	if result.Err != nil {
+		return fmt.Errorf("tool %q failed: %w", name, result.Err)
+	}
+	if msg := strings.TrimSpace(result.Error); msg != "" {
+		return fmt.Errorf("tool %q failed: %s", name, msg)
+	}
+	return fmt.Errorf("tool %q failed", name)
+}
+
+func resultData(result *skills.Result) any {
+	if result == nil {
+		return nil
+	}
+	return result.Data
+}
+
+func resultError(result *skills.Result) error {
+	if result == nil {
+		return fmt.Errorf("tool returned nil result")
+	}
+	if result.Success {
+		return nil
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+	if msg := strings.TrimSpace(result.Error); msg != "" {
+		return fmt.Errorf("%s", msg)
+	}
+	return fmt.Errorf("tool execution failed")
+}
+
+func uniqueSortedStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		set[item] = struct{}{}
+	}
+	result := make([]string, 0, len(set))
+	for item := range set {
+		result = append(result, item)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func cloneMap(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return map[string]any{}
+	}
+	result := make(map[string]any, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
+}

@@ -28,7 +28,10 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
-	result, err := l.executeToolLoop(ctx, llmReq, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return l.executeToolLoop(ctx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("librarian search failed: %w", err)
 	}

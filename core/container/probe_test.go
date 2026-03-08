@@ -174,6 +174,41 @@ func TestProbeRunner_InitialDelay(t *testing.T) {
 	}
 }
 
+func TestProbeRunner_HealthyDuringInitialDelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scope := concurrency.NewGoroutineScope(ctx, "test", nil)
+
+	pr := NewProbeRunner(scope, nil)
+	specs := []ProbeSpec{{
+		Type:             ProbeLiveness,
+		Handler:          &failProbe{},
+		InitialDelay:     200 * time.Millisecond,
+		Period:           20 * time.Millisecond,
+		Timeout:          50 * time.Millisecond,
+		SuccessThreshold: 1,
+		FailureThreshold: 1,
+	}}
+
+	if err := pr.Start(specs); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// During initial delay, probe hasn't started — should be healthy
+	if !pr.IsHealthy(ProbeLiveness) {
+		t.Fatal("should be healthy during initial delay")
+	}
+	if !pr.IsAlive() {
+		t.Fatal("should be alive during initial delay")
+	}
+
+	// After initial delay + probe period, fail probe runs → unhealthy
+	time.Sleep(300 * time.Millisecond)
+	if pr.IsAlive() {
+		t.Fatal("should not be alive after failing probe executes")
+	}
+}
+
 func TestProbeRunner_HasStarted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

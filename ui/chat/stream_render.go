@@ -217,6 +217,9 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 		summaryLines = wrapLine(summaryText, width, summaryStyle)
 	}
 
+	// Inline tool call visualization (mirrors RenderEntry phase 2b).
+	toolCallLines, toolCallRegions := renderToolCalls(entry.ToolCalls, width, th)
+
 	contentLines, codeRegions := renderStreamingEntry(entry.Content, width, th, cache, state)
 
 	// Streaming status footer: when content is present but the stream is
@@ -238,19 +241,28 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 				statusText += "  " + mdLines[0]
 			}
 		}
-		statusLines = []string{truncateToWidth(statusText, width)}
+		statusLines = []string{"", statusStyle.Render(truncateToWidth(statusText, width))}
 	}
 
-	// Pre-allocate: 1 header + summary + content + status + 1 trailing spacer.
-	lines := make([]string, 0, 2+len(summaryLines)+len(contentLines)+len(statusLines))
+	// Pre-allocate: 1 header + summary + tool calls + content + status + 1 trailing spacer.
+	lines := make([]string, 0, 2+len(summaryLines)+len(toolCallLines)+len(contentLines)+len(statusLines))
 	lines = append(lines, header)
 	lines = append(lines, summaryLines...)
+	lines = append(lines, toolCallLines...)
 	lines = append(lines, contentLines...)
 	lines = append(lines, statusLines...)
 	lines = append(lines, "")
 
-	// Offset code region indices to account for the header + summary.
-	headerOffset := headerLines + len(summaryLines)
+	// Offset tool call region indices to account for header + summary.
+	tcOffset := headerLines + len(summaryLines)
+	for i := range toolCallRegions {
+		toolCallRegions[i].Start += tcOffset
+		toolCallRegions[i].End += tcOffset
+	}
+	entry.ToolCallRegions = toolCallRegions
+
+	// Offset code region indices to account for header + summary + tool calls.
+	headerOffset := headerLines + len(summaryLines) + len(toolCallLines)
 	for i := range codeRegions {
 		codeRegions[i].Start += headerOffset
 		codeRegions[i].End += headerOffset

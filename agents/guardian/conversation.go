@@ -8,7 +8,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -80,11 +79,17 @@ func (g *Guardian) composeUserFacingResponse(ctx context.Context, req *guardianC
 		MaxTokens:    DefaultMaxOutputTokens,
 		Tools:        tools,
 	}
-	llmruntime.Apply(llmReq, guardianConversationProfile(req.Intent, req.SessionID))
+	g.applyConversationRuntimeProfile(llmReq, req.Intent, req.SessionID)
 
-	response, usage, err := g.executeToolLoop(ctx, llmReq, "conversation", func(chunk string) {
-		g.publishStreamChunk(ctx, shared.LogMetaFromContext(ctx).CorrID, chunk)
-	}, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	var usage *guide.StreamUsage
+	response, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		content, u, loopErr := g.executeToolLoop(ctx, llmReq, "conversation", func(chunk string) {
+			g.publishStreamChunk(ctx, shared.LogMetaFromContext(ctx).CorrID, chunk)
+		}, ledger)
+		usage = u
+		return content, loopErr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -109,22 +114,6 @@ func (g *Guardian) composeWithoutLLM(req *guardianConversationRequest) (string, 
 			"I can provide health reports and security assessments. " +
 			"Ask me about agent health, security status, or request a checkpoint.", nil
 	}
-}
-
-func guardianConversationProfile(intent GuardianIntent, sessionID string) llmruntime.Profile {
-	profile := llmruntime.Profile{
-		ReasoningSummary:  "none",
-		Verbosity:         "medium",
-		PromptCacheKey:    llmruntime.SessionPromptCacheKey("guardian", sessionID),
-		ParallelToolCalls: llmruntime.Bool(true),
-	}
-	switch intent {
-	case IntentAssess, IntentCheckpoint:
-		profile.ReasoningEffort = "high"
-	default:
-		profile.ReasoningEffort = "medium"
-	}
-	return profile
 }
 
 // buildConversationMessages constructs the LLM message history.

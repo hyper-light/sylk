@@ -5,17 +5,30 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-// Global Inspector keeps runtime selection at the agent layer even when the
-// current policy is just "use provider defaults".
 func (gi *GlobalInspector) applyLLMRuntimeProfile(req *providers.Request, stage string) {
-	llmruntime.Apply(req, gi.llmRuntimeProfile(stage))
+	llmruntime.ApplyStage(req, gi.llmStageProfile(stage), llmruntime.ApplyOptions{
+		Model:     inspectorRuntimeModel(req, gi.CurrentModel()),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "inspector",
+		SessionID: gi.config.SessionID,
+	})
 }
 
-func (gi *GlobalInspector) llmRuntimeProfile(stage string) llmruntime.Profile {
-	switch stage {
-	case "conversation", "task", "audit":
-		return llmruntime.Profile{}
-	default:
-		return llmruntime.Profile{}
+func (gi *GlobalInspector) llmStageProfile(stage string) llmruntime.StageProfile {
+	return llmruntime.ResolveAgentStageProfile("inspector", stage)
+}
+
+func inspectorRuntimeProfiles() []llmruntime.StageProfile {
+	return llmruntime.AgentProfiles("inspector")
+}
+
+func inspectorDefaultRuntimeProfile() string {
+	return llmruntime.AgentDefaultProfile("inspector")
+}
+
+func inspectorRuntimeModel(req *providers.Request, fallback string) string {
+	if req != nil && req.Model != "" {
+		return req.Model
 	}
+	return fallback
 }

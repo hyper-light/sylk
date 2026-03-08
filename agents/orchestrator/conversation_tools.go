@@ -7,6 +7,7 @@ import "github.com/adalundhe/sylk/core/providers"
 // mutating workflows, DAGs, or health metrics.
 func conversationAllowedSkills() []string {
 	return []string{
+		"search_skills",
 		"query_task",
 		"query_workflow",
 		"generate_summary",

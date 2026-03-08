@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -567,8 +568,13 @@ func TestCollectAgentTypes_EmptyDAG(t *testing.T) {
 	d := dag.NewDAG("empty", dag.ExecutionPolicy{})
 	types := collectAgentTypes(d)
 
-	if len(types) != 2 {
-		t.Errorf("expected 2 types for empty DAG, got %d: %v", len(types), types)
+	if len(types) != len(PipelineAgentTypes) {
+		t.Errorf("expected %d types for empty DAG, got %d: %v", len(PipelineAgentTypes), len(types), types)
+	}
+	for _, expected := range PipelineAgentTypes {
+		if !slices.Contains(types, expected) {
+			t.Errorf("missing expected pipeline agent type %q in %v", expected, types)
+		}
 	}
 }
 

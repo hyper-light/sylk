@@ -686,10 +686,12 @@ type ModelSwapResultMsg struct {
 // Prompt queue
 // ---------------------------------------------------------------------------
 
-// QueueAdvanceMsg signals that the prompt queue should attempt to dispatch
-// the next pending entry. Sent as a deferred message after a stream
-// completes or fails, so advancement happens in a clean Update cycle.
-type QueueAdvanceMsg struct{}
+// QueueAdvanceMsg signals that the prompt queue should dispatch one or more
+// pending entries. EntryIDs lists the specific entries to dispatch; when
+// empty, the handler dispatches all ready entries (backward-compatible).
+type QueueAdvanceMsg struct {
+	EntryIDs []string
+}
 
 // ---------------------------------------------------------------------------
 // Tool call visualization

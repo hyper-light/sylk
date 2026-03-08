@@ -159,7 +159,7 @@ type grepParams struct {
 
 func grepSkill(l *Librarian) *skills.Skill {
 	return skills.NewSkill("grep").
-		Description("Search file contents with regex patterns. Parallel, gitignore-aware search across the codebase. Set with_symbols=true to annotate matches with their enclosing function/type via tree-sitter.").
+		Description("Parallel, gitignore-aware regex search across the codebase (pure-Go ripgrep equivalent). For finding symbol definitions/references, prefer find_symbol which uses tree-sitter structural analysis. Set with_symbols=true to annotate matches with their enclosing function/type via tree-sitter.").
 		Domain("filesystem").
 		Keywords("grep", "search", "regex", "find text", "ripgrep", "rg").
 		Priority(90).

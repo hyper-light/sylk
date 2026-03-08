@@ -11,18 +11,25 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // executeToolLoop runs the model tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
 func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
-	seen := make(map[toolCallSignature]int, o.config.MaxToolRuns)
+	seen := make(map[shared.ToolCallSignature]int, o.config.MaxToolRuns)
 	consecutiveErrors := 0
 
 	for turn := 0; turn <= o.config.MaxToolRuns; turn++ {
+		if o.toolDefsDirty {
+			req.Tools = o.buildToolDefinitions()
+			o.toolDefsDirty = false
+		}
+
 		// ── STEERING CHECKPOINT ──
 		sc := shared.DrainAndCheckpoint(ledger, req, turn, "orchestrating", nil)
 		if sc.Rollback != nil || sc.EditReplay != nil {
@@ -35,7 +42,7 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
 			}
 			turn = cp.Turn
-			seen = make(map[toolCallSignature]int, o.config.MaxToolRuns)
+			seen = make(map[shared.ToolCallSignature]int, o.config.MaxToolRuns)
 			consecutiveErrors = 0
 			continue
 		}
@@ -53,8 +60,7 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 		}
 
 		turnStart := time.Now()
-		resp, err := o.provider.Complete(ctx, req)
-		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
+		resp, err := shared.CompleteWithWatchdog(ctx, o.provider, req, shared.AgentDisplayName("orchestrator"))
 		if err != nil {
 			return "", fmt.Errorf("orchestrator llm: %w", err)
 		}
@@ -68,9 +74,11 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 			return strings.TrimSpace(resp.Content), nil
 		}
 
+		if err := o.toolRuntime().ValidateBatch(o.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
+		}
 
-
-		if dup, sig := detectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			return "", fmt.Errorf("orchestrator repeated tool call: %s", sig.Name)
 		}
 
@@ -79,7 +87,7 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
-		consecutiveErrors = updateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
+		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
 		if consecutiveErrors >= 2 {
 			return "", fmt.Errorf("orchestrator tool calls failed %d consecutive turns", consecutiveErrors)
 		}
@@ -106,16 +114,22 @@ func (o *Orchestrator) applyToolCalls(
 	rerouted := false
 	for _, call := range resp.ToolCalls {
 		o.publishActivity(events.EventTypeToolResult, call.Name)
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := shared.TimedToolCall(ctx, "orchestrator", call, func() (string, error) {
-			return o.executeToolCall(ctx, call)
+			execResult, execErr = o.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			o.toolDefsDirty = true
+		}
 		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
 				rerouted = true
 				result = `{"rerouted": true}`
 			} else {
-				result = toolErrorPayload(err)
+				result = shared.ToolErrorPayload(err)
 				isError = true
 				errCount++
 			}
@@ -138,10 +152,10 @@ func (o *Orchestrator) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (o *Orchestrator) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
+func (o *Orchestrator) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
-		return "", fmt.Errorf("tool name is required")
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -149,18 +163,18 @@ func (o *Orchestrator) executeToolCall(ctx context.Context, call providers.ToolC
 		raw = "{}"
 	}
 	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
-
-	result := o.skills.Invoke(ctx, name, json.RawMessage(raw))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = o.state.AgentID + "-local"
 	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return marshalToolOutput(result.Data)
+	return o.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         o.state.AgentID,
+		CorrelationID:   correlationID,
+		CapabilityScope: o.toolRuntime().CapabilityScope(),
+	})
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -175,114 +189,33 @@ func (o *Orchestrator) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider tool format.
 func (o *Orchestrator) buildToolDefinitions() []providers.Tool {
-	loaded := o.skills.GetLoaded()
-	if len(loaded) == 0 {
+	o.toolRuntime().SyncActiveFromLoaded()
+	return o.toolRuntime().BuildToolDefinitions()
+}
+
+func (o *Orchestrator) toolRuntime() *toolruntime.Runtime {
+	return o.tools
+}
+
+func (o *Orchestrator) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
 		return nil
 	}
-
-	tools := make([]providers.Tool, 0, len(loaded))
-	for _, skill := range loaded {
-		def := skill.ToToolDefinition()
-		name, _ := def["name"].(string)
-		if name == "" {
-			continue
-		}
-		description, _ := def["description"].(string)
-		parameters := coerceMap(def["input_schema"])
-		if len(parameters) == 0 {
-			parameters = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, providers.Tool{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = o.state.AgentID + "-local"
+	}
+	scope := o.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         o.state.AgentID,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
 		})
 	}
-	return tools
-}
-
-func marshalToolOutput(data any) (string, error) {
-	switch typed := data.(type) {
-	case string:
-		return typed, nil
-	case fmt.Stringer:
-		return typed.String(), nil
-	default:
-		payload, err := json.Marshal(data)
-		if err != nil {
-			return "", fmt.Errorf("marshal tool output: %w", err)
-		}
-		return string(payload), nil
-	}
-}
-
-func toolErrorPayload(err error) string {
-	if err == nil {
-		return ""
-	}
-	payload, marshalErr := json.Marshal(map[string]any{
-		"error": strings.TrimSpace(err.Error()),
-	})
-	if marshalErr != nil {
-		return `{"error":"tool execution failed"}`
-	}
-	return string(payload)
-}
-
-func coerceMap(value any) map[string]any {
-	if value == nil {
-		return nil
-	}
-	if mapped, ok := value.(map[string]any); ok {
-		return mapped
-	}
-	payload, err := json.Marshal(value)
-	if err != nil {
-		return nil
-	}
-	var mapped map[string]any
-	if err := json.Unmarshal(payload, &mapped); err != nil {
-		return nil
-	}
-	return mapped
-}
-
-type toolCallSignature struct {
-	Name      string
-	Arguments string
-}
-
-func detectToolCallDuplicate(calls []providers.ToolCall, seen map[toolCallSignature]int) (bool, toolCallSignature) {
-	batch := make([]toolCallSignature, 0, len(calls))
-	for _, call := range calls {
-		sig := toolCallSignature{
-			Name:      strings.TrimSpace(call.Name),
-			Arguments: strings.TrimSpace(call.Arguments),
-		}
-		batch = append(batch, sig)
-	}
-
-	allDup := true
-	var firstDup toolCallSignature
-	for _, sig := range batch {
-		seen[sig]++
-		if seen[sig] <= 1 {
-			allDup = false
-		} else if firstDup.Name == "" {
-			firstDup = sig
-		}
-	}
-	return allDup, firstDup
-}
-
-func updateToolErrors(current, errCount, totalCalls int) int {
-	if totalCalls > 0 && errCount == totalCalls {
-		return current + 1
-	}
-	return 0
+	return invocations
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
@@ -305,6 +238,8 @@ func (o *Orchestrator) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,

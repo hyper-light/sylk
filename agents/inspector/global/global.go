@@ -19,6 +19,7 @@ import (
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
@@ -44,9 +45,11 @@ type GlobalInspector struct {
 	toolRunner *shared.ToolRunner
 
 	// Skills.
-	skills      *skills.Registry
-	skillLoader *skills.Loader
-	hooks       *skills.HookRegistry
+	skills        *skills.Registry
+	skillLoader   *skills.Loader
+	hooks         *skills.HookRegistry
+	tools         *toolruntime.Runtime
+	toolDefsDirty bool
 
 	// Bus (standard agent pattern).
 	bus         guide.EventBus
@@ -116,7 +119,9 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 
 	gi.steering.InitLazy("inspector", nil)
 
-	gi.initSkills()
+	if err := gi.initSkills(); err != nil {
+		return nil, err
+	}
 	return gi, nil
 }
 
@@ -222,21 +227,29 @@ func applyConfigDefaults(cfg shared.GlobalInspectorConfig) shared.GlobalInspecto
 	return cfg
 }
 
-func (gi *GlobalInspector) initSkills() {
+func (gi *GlobalInspector) initSkills() error {
 	gi.skills = skills.NewRegistry()
 	gi.hooks = skills.NewHookRegistry()
 
-	loaderCfg := skills.DefaultLoaderConfig()
-	loaderCfg.CoreSkills = []string{
-		"run_linter", "run_type_checker", "run_security_scan",
-		"read_file", "glob", "grep",
-		"audit_layer",
-	}
-	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
-	gi.skillLoader = skills.NewLoader(gi.skills, loaderCfg)
-
 	gi.registerCoreSkills()
 	gi.registerSafetyHook()
+
+	loaderCfg := skills.DefaultLoaderConfig()
+	loaderCfg.CoreSkills = globalInspectorVisibleSkillNames()
+	loaderCfg.AutoLoadDomains = nil // progressive loading — no blanket domain loading
+	gi.skillLoader = skills.NewLoader(gi.skills, loaderCfg)
+	tools, err := toolruntime.New(toolruntime.Config{
+		Registry: gi.skills,
+		Hooks:    gi.hooks,
+		Manifest: globalInspectorToolManifest(gi.skills),
+		State:    toolruntime.NewState(),
+	})
+	if err != nil {
+		return fmt.Errorf("initialize global inspector tool runtime: %w", err)
+	}
+	gi.tools = tools
+	gi.tools.SyncActiveFromLoaded()
+	return nil
 }
 
 func (gi *GlobalInspector) registerSafetyHook() {
@@ -248,7 +261,8 @@ func (gi *GlobalInspector) registerSafetyHook() {
 		"audit_layer": true, "validate_plan_adherence": true,
 		"cross_reference_changes": true, "grade_layer_quality": true,
 		"request_architect_research": true, "request_user_clarification": true,
-		"escalate_findings": true, "reroute": true,
+		"escalate_findings": true, "reroute_request": true,
+		"self_diagnostic": true,
 	}
 	gi.hooks.RegisterPreToolCallHook("inspector_global_safety", skills.HookPriorityHigh,
 		func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
@@ -264,6 +278,10 @@ func (gi *GlobalInspector) registerSafetyHook() {
 
 // Close shuts down the global inspector.
 func (gi *GlobalInspector) Close() error {
+	if gi.tools != nil {
+		gi.tools.Close()
+		gi.tools = nil
+	}
 	gi.diffStore.Close()
 	return gi.Stop()
 }
@@ -389,7 +407,10 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 	}
 	gi.applyLLMRuntimeProfile(req, "task")
 
-	result, err := gi.executeToolLoop(ctx, req, agentShared.SteeringLedgerFromContext(ctx))
+	ledger := agentShared.SteeringLedgerFromContext(ctx)
+	result, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return gi.executeToolLoop(ctx, req, ledger)
+	})
 	if err != nil {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -453,9 +474,17 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 
 	toolEmitter := agentShared.NewToolCallEmitter(gi.bus, gi.channels, gi.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx = agentShared.WithToolCallEmitter(ctx, toolEmitter)
-	ctx = agentShared.WithContextGovernor(ctx, agentShared.NewContextGovernor(
-		gi.config.Model, gi.config.MaxTokens, 0,
-	))
+	gov := agentShared.NewContextGovernor(gi.config.Model, gi.config.MaxTokens, 0)
+	if gi.handoffBridge != nil {
+		gov.OnBudgetExhausted = func(bctx context.Context) error {
+			return gi.handoffBridge.ForceHandoff(bctx, "context budget exhausted")
+		}
+	}
+	ctx = agentShared.WithContextGovernor(ctx, gov)
+	ctx = agentShared.WithProgressPublisher(ctx, &agentShared.ProgressPublisher{
+		Bus: gi.bus, Channels: gi.channels,
+		AgentID: gi.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
 
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(gi.bus, gi.channels, ctx, "inspector")
@@ -595,11 +624,14 @@ func (gi *GlobalInspector) AgentType() string { return "inspector" }
 
 // Descriptor returns the handoff descriptor for this agent.
 func (gi *GlobalInspector) Descriptor() handoff.AgentDescriptor {
+	modelID := gi.CurrentModel()
 	return handoff.AgentDescriptor{
-		AgentType:     "inspector",
-		ModelID:       "opus-4.6",
-		ContextWindow: 200_000,
-		Category:      handoff.CategoryStandalone,
+		AgentType:             "inspector",
+		ModelID:               modelID,
+		ContextWindow:         handoff.ContextWindowForModel(modelID),
+		Category:              handoff.CategoryStandalone,
+		RuntimeProfiles:       inspectorRuntimeProfiles(),
+		DefaultRuntimeProfile: inspectorDefaultRuntimeProfile(),
 	}
 }
 

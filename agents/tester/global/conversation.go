@@ -8,7 +8,6 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -71,7 +70,7 @@ func (gt *GlobalTester) executeConversationLLM(ctx context.Context, cr testerCon
 		MaxTokens:    testerConversationMaxTokens,
 		Tools:        tools,
 	}
-	llmruntime.Apply(llmReq, gt.llmRuntimeProfile())
+	gt.applyLLMRuntimeProfile(llmReq, "conversation")
 	if len(tools) > 0 {
 		llmReq.ToolChoice = "auto"
 	}
@@ -82,7 +81,10 @@ func (gt *GlobalTester) executeConversationLLM(ctx context.Context, cr testerCon
 	llmCtx, cancel := context.WithTimeout(ctx, gt.config.DefaultTimeout)
 	defer cancel()
 
-	response, err := gt.executeToolLoop(llmCtx, llmReq, agentshared.SteeringLedgerFromContext(llmCtx))
+	ledger := agentshared.SteeringLedgerFromContext(llmCtx)
+	response, err := agentshared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return gt.executeToolLoop(llmCtx, llmReq, ledger)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("tester conversation: %w", err)
 	}

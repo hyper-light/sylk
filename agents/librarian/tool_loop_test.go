@@ -52,13 +52,16 @@ func newTestLibrarian(provider LibrarianProvider) *Librarian {
 		Domain("test").
 		StringParam("text", "text to echo", true).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
-			var params struct{ Text string `json:"text"` }
+			var params struct {
+				Text string `json:"text"`
+			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, err
 			}
 			return map[string]string{"echoed": params.Text}, nil
 		}).
 		Build())
+	l.skills.Load("echo")
 
 	return l
 }
@@ -123,25 +126,32 @@ func TestExecuteToolLoop_ToolCallThenText(t *testing.T) {
 	}
 }
 
-func TestExecuteToolLoop_DuplicateDetection(t *testing.T) {
+func TestExecuteToolLoop_DuplicateDetection_ForcesSynthesis(t *testing.T) {
+	// After a duplicate is detected, tools are stripped and the LLM
+	// is called again. The third response has no tool calls — it should
+	// produce the final answer.
 	sameCall := providers.ToolCall{ID: "tc1", Name: "echo", Arguments: `{"text":"same"}`}
 	mp := &mockProvider{
 		responses: []*providers.Response{
 			{ToolCalls: []providers.ToolCall{sameCall}, Usage: providers.Usage{}},
 			{ToolCalls: []providers.ToolCall{{ID: "tc2", Name: "echo", Arguments: `{"text":"same"}`}}, Usage: providers.Usage{}},
+			{Content: "Synthesized answer from prior results.", Usage: providers.Usage{}},
 		},
 	}
 	l := newTestLibrarian(mp)
 
-	_, err := l.executeToolLoop(context.Background(), &providers.Request{
+	result, err := l.executeToolLoop(context.Background(), &providers.Request{
 		Messages: []providers.Message{{Role: providers.RoleUser, Content: "test"}},
 	}, nil)
 
-	if err == nil {
-		t.Fatal("expected duplicate detection error, got nil")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := err.Error(); !contains(got, "repeated tool call") {
-		t.Errorf("expected 'repeated tool call' error, got %q", got)
+	if result != "Synthesized answer from prior results." {
+		t.Errorf("expected synthesized answer, got %q", result)
+	}
+	if mp.calls != 3 {
+		t.Errorf("expected 3 LLM calls (search, dup, synthesis), got %d", mp.calls)
 	}
 }
 
@@ -219,7 +229,11 @@ func TestExecuteToolLoop_ConsecutiveErrors(t *testing.T) {
 		Build())
 
 	failCall := func(id string) providers.ToolCall {
-		return providers.ToolCall{ID: id, Name: "fail_always", Arguments: "{}"}
+		return providers.ToolCall{
+			ID:        id,
+			Name:      "fail_always",
+			Arguments: fmt.Sprintf(`{"attempt":"%s"}`, id),
+		}
 	}
 
 	mp := &mockProvider{

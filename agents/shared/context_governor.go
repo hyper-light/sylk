@@ -15,6 +15,11 @@ import (
 // bring it below threshold.
 var ErrContextBudgetExhausted = errors.New("context budget exhausted")
 
+// ErrHandoffTriggered is returned when context exhaustion triggered a
+// successful handoff via the OverlapCoordinator. The tool loop should
+// exit gracefully — the new agent instance continues the work.
+var ErrHandoffTriggered = errors.New("handoff triggered: context budget exhausted")
+
 type contextGovernorKey struct{}
 
 // ContextGovernor prevents context window overflow in agent tool loops.
@@ -32,6 +37,12 @@ type ContextGovernor struct {
 	currentTurn int
 	maxTurns    int
 	messages    *[]providers.Message // live pointer into req.Messages
+
+	// OnBudgetExhausted is called when the context reaches Critical zone
+	// and all compaction/eviction has failed. If it returns nil, the
+	// handoff was successful and ApplyContextBudget returns
+	// ErrHandoffTriggered instead of ErrContextBudgetExhausted.
+	OnBudgetExhausted func(ctx context.Context) error
 }
 
 const (
@@ -71,6 +82,16 @@ func ApplyContextBudget(ctx context.Context, turn, maxRuns int, req *providers.R
 		zone := gov.BeginTurn(ctx, turn, maxRuns, req)
 		switch {
 		case zone == ZoneCritical:
+			if gov.OnBudgetExhausted != nil {
+				if err := gov.OnBudgetExhausted(ctx); err == nil {
+					LogContextEvent(ctx, agentlog.EventHandoffTriggered,
+						agentlog.HandoffTriggeredPayload{
+							Reason: "context budget exhausted",
+							Zone:   zone.String(),
+						})
+					return ErrHandoffTriggered
+				}
+			}
 			return ErrContextBudgetExhausted
 		case zone >= ZoneRed:
 			req.Tools = nil // context pressure — force synthesis

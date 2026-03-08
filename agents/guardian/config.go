@@ -22,6 +22,15 @@ const (
 	DefaultAgentTimeout        = 5 * time.Minute
 	DefaultApprovalTTL         = 2 * time.Minute
 	DefaultConversationBuffer  = 10
+
+	// Budget defaults — soft limits that trigger warnings at 80% and
+	// findings at 100%. Zero means unlimited (no enforcement).
+	DefaultTokenBudget int64 = 5_000_000 // ~5M tokens per session
+	DefaultCostBudget  int64 = 2_000     // 2000 cents = $20 USD per session
+
+	// Quarantine buffer defaults.
+	DefaultQuarantineMaxItems       = 256
+	DefaultQuarantineMaxBytes int64 = 64 * 1024 * 1024 // 64 MiB
 )
 
 // Config holds configuration for the Guardian agent.
@@ -98,6 +107,12 @@ func applyDefaults(cfg Config) Config {
 	}
 	if cfg.MaxToolRuns == 0 {
 		cfg.MaxToolRuns = DefaultMaxToolRuns
+	}
+	if cfg.TokenBudget == 0 {
+		cfg.TokenBudget = DefaultTokenBudget
+	}
+	if cfg.CostBudget == 0 {
+		cfg.CostBudget = DefaultCostBudget
 	}
 	// Content validation enabled by default.
 	// Bool zero-value is false, so we use a helper to detect "not set".

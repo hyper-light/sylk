@@ -460,9 +460,9 @@ func (a *Archivalist) loadRecentMemories(ctx context.Context, limit int) ([]*mem
 	limit = clampLimit(limit, 30, 300)
 	db := a.memoryScorer.Store().DB()
 	rows, err := db.QueryContext(ctx, `
-		SELECT node_id FROM memories
+		SELECT id FROM nodes
 		WHERE memory_activation IS NOT NULL
-		ORDER BY updated_at DESC
+		ORDER BY last_accessed_at DESC, access_count DESC
 		LIMIT ?
 	`, limit)
 	if err != nil {
@@ -474,7 +474,7 @@ func (a *Archivalist) loadRecentMemories(ctx context.Context, limit int) ([]*mem
 	for rows.Next() {
 		var nodeID string
 		if err := rows.Scan(&nodeID); err != nil {
-			return nil, fmt.Errorf("scan node_id: %w", err)
+			return nil, fmt.Errorf("scan node id: %w", err)
 		}
 		mem, err := a.memoryScorer.Store().GetMemory(ctx, nodeID, domain.DomainArchivalist)
 		if err != nil {

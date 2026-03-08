@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/dag"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	promptskill "github.com/adalundhe/sylk/core/promptskills"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
@@ -492,7 +493,7 @@ func (p *anthropicPlanner) requestTextStreamingOnce(
 		MaxTokens:    maxTokens,
 		SystemPrompt: resolvedSystem,
 	}
-	p.applyStreamingRuntimeProfile(req, p.resolveThinkingBudget(maxTokens))
+	p.applyStreamingRuntimeProfile(req, stage, p.resolveThinkingBudget(maxTokens), architectSessionIDFromContext(ctx))
 	return p.streamRequest(ctx, req, stage, onChunk)
 }
 
@@ -529,8 +530,10 @@ func (p *anthropicPlanner) streamRequest(
 				onChunk(chunk.Text)
 			}
 		case providers.ChunkTypeThought:
-			if thought := emitter.addDelta(chunk.Text); thought != "" {
-				emitPlannerThought(ctx, stage, thought)
+			if llmruntime.EmitsThoughts(req) {
+				if thought := emitter.addDelta(chunk.Text); thought != "" {
+					emitPlannerThought(ctx, stage, thought)
+				}
 			}
 		case providers.ChunkTypeEnd:
 			if chunk.Usage != nil {
@@ -544,8 +547,10 @@ func (p *anthropicPlanner) streamRequest(
 		return nil
 	})
 	// Flush any remaining thought content that didn't trigger an emission.
-	if thought := emitter.flush(); thought != "" {
-		emitPlannerThought(ctx, stage, thought)
+	if llmruntime.EmitsThoughts(req) {
+		if thought := emitter.flush(); thought != "" {
+			emitPlannerThought(ctx, stage, thought)
+		}
 	}
 	if err != nil {
 		// If the stream was interrupted but we accumulated partial text,
@@ -628,8 +633,10 @@ func (p *anthropicPlanner) streamRequestFull(
 			}
 		case providers.ChunkTypeThought:
 			thoughtChunks++
-			if thought := emitter.addDelta(chunk.Text); thought != "" {
-				emitPlannerThought(ctx, stage, thought)
+			if llmruntime.EmitsThoughts(req) {
+				if thought := emitter.addDelta(chunk.Text); thought != "" {
+					emitPlannerThought(ctx, stage, thought)
+				}
 			}
 		case providers.ChunkTypeToolStart, providers.ChunkTypeToolDelta, providers.ChunkTypeToolEnd:
 			toolChunks++
@@ -651,8 +658,10 @@ func (p *anthropicPlanner) streamRequestFull(
 		return nil
 	})
 	// Flush any remaining thought content that didn't trigger an emission.
-	if thought := emitter.flush(); thought != "" {
-		emitPlannerThought(ctx, stage, thought)
+	if llmruntime.EmitsThoughts(req) {
+		if thought := emitter.flush(); thought != "" {
+			emitPlannerThought(ctx, stage, thought)
+		}
 	}
 
 	architectDebugLog().Debug("stream_full: STREAM_DONE",

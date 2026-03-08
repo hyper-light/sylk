@@ -9,7 +9,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -150,9 +149,12 @@ func (rl *RefactorLoop) reimplementWithFeedback(
 		Model:     rl.engineer.config.EngineerConfig.Model,
 		MaxTokens: rl.engineer.config.EngineerConfig.MaxTokens,
 	}
-	llmruntime.Apply(req, rl.engineer.llmRuntimeProfile())
+	rl.engineer.applyLLMRuntimeProfile(req, "implementation")
 
-	return rl.engineer.executeToolLoop(ctx, req, shared.SteeringLedgerFromContext(ctx))
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	return shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return rl.engineer.executeToolLoop(ctx, req, ledger)
+	})
 }
 
 func parseTesterFeedback(evidence *shared.ConsultationEvidence) (*shared.TestFeedback, error) {

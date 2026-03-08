@@ -399,7 +399,7 @@ const (
 // Supported Google models
 var googleModels = map[string]bool{
 	"gemini-3.1-pro-preview": true, // Google Gemini 3.1 Pro Preview (1M context)
-	"gemini-3-flash-preview":         true, // Google Gemini 3 Flash (1M context)
+	"gemini-3-flash-preview": true, // Google Gemini 3 Flash (1M context)
 }
 
 const googleServiceAccountCredentialProvider = "google_service_account"
@@ -429,11 +429,11 @@ func NewGoogleProviderWithAuthService(
 ) (*GoogleProvider, error) {
 	googleTrace("provider_init", "start", map[string]any{
 		"auth_mode":       strings.TrimSpace(config.AuthMode),
-		"model":          strings.TrimSpace(config.Model),
-		"project_id":     strings.TrimSpace(config.ProjectID),
-		"use_vertex_ai":  config.UseVertexAI,
+		"model":           strings.TrimSpace(config.Model),
+		"project_id":      strings.TrimSpace(config.ProjectID),
+		"use_vertex_ai":   config.UseVertexAI,
 		"use_code_assist": config.UseCodeAssist,
-		"has_api_key":    strings.TrimSpace(config.APIKey) != "",
+		"has_api_key":     strings.TrimSpace(config.APIKey) != "",
 	})
 	applyGoogleProviderDefaults(&config)
 	if err := hydrateGoogleConfig(ctx, &config, authService); err != nil {
@@ -456,10 +456,10 @@ func NewGoogleProviderWithAuthService(
 		return nil, err
 	}
 	googleTrace("provider_init", "client_config_built", map[string]any{
-		"backend":        googleBackendName(config.UseVertexAI),
+		"backend":         googleBackendName(config.UseVertexAI),
 		"has_http_client": clientConfig.HTTPClient != nil,
-		"has_api_key":    clientConfig.APIKey != "",
-		"has_project":    clientConfig.Project != "",
+		"has_api_key":     clientConfig.APIKey != "",
+		"has_project":     clientConfig.Project != "",
 	})
 	client, err := genai.NewClient(ctx, clientConfig)
 	if err != nil {
@@ -483,7 +483,7 @@ func NewGoogleProviderWithAuthService(
 		})
 	}
 	googleTrace("provider_init", "success", map[string]any{
-		"auth_mode":            strings.TrimSpace(config.AuthMode),
+		"auth_mode":           strings.TrimSpace(config.AuthMode),
 		"model":               strings.TrimSpace(config.Model),
 		"use_vertex_ai":       config.UseVertexAI,
 		"use_code_assist":     config.UseCodeAssist,
@@ -564,11 +564,11 @@ func NewGoogleProviderFromHydrated(
 		return nil, fmt.Errorf("google provider: hydrated auth is nil")
 	}
 	googleTrace("provider_init", "from_hydrated_start", map[string]any{
-		"auth_mode":       strings.TrimSpace(config.AuthMode),
-		"model":           strings.TrimSpace(config.Model),
+		"auth_mode":        strings.TrimSpace(config.AuthMode),
+		"model":            strings.TrimSpace(config.Model),
 		"hydrated_project": strings.TrimSpace(hydrated.ProjectID),
-		"hydrated_ca":     hydrated.UseCodeAssist,
-		"hydrated_vertex": hydrated.UseVertexAI,
+		"hydrated_ca":      hydrated.UseCodeAssist,
+		"hydrated_vertex":  hydrated.UseVertexAI,
 	})
 	applyGoogleProviderDefaults(&config)
 
@@ -748,8 +748,8 @@ func hydrateGoogleOAuthConfig(
 		googleTrace("hydrate_oauth", "resolve_success", map[string]any{
 			"has_access_token":    auth.AccessToken != "",
 			"has_refresh_token":   auth.RefreshToken != "",
-			"project_id":         strings.TrimSpace(auth.ProjectID),
-			"location":           strings.TrimSpace(auth.Location),
+			"project_id":          strings.TrimSpace(auth.ProjectID),
+			"location":            strings.TrimSpace(auth.Location),
 			"code_assist_project": strings.TrimSpace(auth.CodeAssistProject),
 			"code_assist_tier_id": strings.TrimSpace(auth.CodeAssistTierID),
 		})
@@ -765,9 +765,9 @@ func hydrateGoogleOAuthConfig(
 		// Code Assist provisions a managed project for free-tier users.
 		if config.ProjectID == "" && auth.CodeAssistProject == "" {
 			googleTrace("hydrate_oauth", "code_assist_setup_start", map[string]any{
-				"config_project_id":   "",
-				"auth_code_assist":    "",
-				"endpoint":            oauth.CodeAssistEndpointForTrace(),
+				"config_project_id": "",
+				"auth_code_assist":  "",
+				"endpoint":          oauth.CodeAssistEndpointForTrace(),
 			})
 			httpClient := oauth.NewGoogleOAuthHTTPClient(authService, nil)
 			result, setupErr := oauth.SetupCodeAssist(ctx, httpClient, "")
@@ -803,7 +803,7 @@ func hydrateGoogleOAuthConfig(
 				config.ProjectID = auth.CodeAssistProject
 			}
 			googleTrace("hydrate_oauth", "code_assist_applied", map[string]any{
-				"project_id":     config.ProjectID,
+				"project_id":      config.ProjectID,
 				"use_code_assist": true,
 			})
 		}
@@ -815,11 +815,11 @@ func hydrateGoogleOAuthConfig(
 
 		googleTrace("hydrate_oauth", "final_config", map[string]any{
 			"auth_mode":       strings.TrimSpace(config.AuthMode),
-			"project_id":     strings.TrimSpace(config.ProjectID),
-			"use_vertex_ai":  config.UseVertexAI,
+			"project_id":      strings.TrimSpace(config.ProjectID),
+			"use_vertex_ai":   config.UseVertexAI,
 			"use_code_assist": config.UseCodeAssist,
-			"model":          strings.TrimSpace(config.Model),
-			"api_key_set":    strings.TrimSpace(config.APIKey) != "",
+			"model":           strings.TrimSpace(config.Model),
+			"api_key_set":     strings.TrimSpace(config.APIKey) != "",
 		})
 		return nil
 	}
@@ -1137,14 +1137,14 @@ func (g *GoogleProvider) UsesCodeAssist() bool {
 // Generate performs a non-streaming completion request with retry.
 func (g *GoogleProvider) Generate(ctx context.Context, req *Request) (*Response, error) {
 	googleTrace("generate", "start", map[string]any{
-		"req_model":          strings.TrimSpace(req.Model),
-		"config_model":       strings.TrimSpace(g.config.Model),
+		"req_model":           strings.TrimSpace(req.Model),
+		"config_model":        strings.TrimSpace(g.config.Model),
 		"code_assist_project": g.codeAssistProject,
-		"use_code_assist":    g.codeAssistProject != "",
-		"use_vertex_ai":      g.config.UseVertexAI,
-		"auth_mode":          strings.TrimSpace(g.config.AuthMode),
-		"message_count":      len(req.Messages),
-		"has_system_prompt":  strings.TrimSpace(req.SystemPrompt) != "",
+		"use_code_assist":     g.codeAssistProject != "",
+		"use_vertex_ai":       g.config.UseVertexAI,
+		"auth_mode":           strings.TrimSpace(g.config.AuthMode),
+		"message_count":       len(req.Messages),
+		"has_system_prompt":   strings.TrimSpace(req.SystemPrompt) != "",
 	})
 	resp, err := retryGoogleGenerate(ctx, g.config.BaseConfig, func(ctx context.Context) (*Response, error) {
 		if g.codeAssistProject != "" {
@@ -1158,9 +1158,9 @@ func (g *GoogleProvider) Generate(ctx context.Context, req *Request) (*Response,
 			model = g.config.Model
 		}
 		googleTrace("generate", "using_genai_sdk", map[string]any{
-			"model":        model,
+			"model":         model,
 			"use_vertex_ai": g.config.UseVertexAI,
-			"backend":      googleBackendName(g.config.UseVertexAI),
+			"backend":       googleBackendName(g.config.UseVertexAI),
 		})
 		contents := g.convertMessages(req.Messages)
 		genConfig := g.buildGenerateConfig(req)
@@ -1505,11 +1505,15 @@ func (g *GoogleProvider) buildGenerateConfig(req *Request) *genai.GenerateConten
 	if maxTokens == 0 {
 		maxTokens = g.config.MaxTokens
 	}
+	includeThoughts := true
+	if req.IncludeThoughts != nil {
+		includeThoughts = *req.IncludeThoughts
+	}
 
 	config := &genai.GenerateContentConfig{
 		MaxOutputTokens: int32(maxTokens),
 		ThinkingConfig: &genai.ThinkingConfig{
-			IncludeThoughts: true,
+			IncludeThoughts: includeThoughts,
 			ThinkingLevel:   googleThinkingLevel(req.ReasoningEffort),
 		},
 	}
@@ -1914,7 +1918,7 @@ const googleRawContentKey = "google_raw_content"
 // The raw *genai.Content pointer approach fails because map[string]any
 // deserializes to map[string]any, not *genai.Content.
 type googleSerializableContent struct {
-	Role  string                    `json:"role"`
+	Role  string                       `json:"role"`
 	Parts []googleSerializablePartItem `json:"parts"`
 }
 

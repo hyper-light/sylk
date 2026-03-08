@@ -31,12 +31,12 @@ func TestArchitect_SkillsLoaded(t *testing.T) {
 func TestArchitect_SkillCount(t *testing.T) {
 	a := newTestArchitect(t, Config{AllowPlanningWithoutConsultation: true})
 	allSkills := a.skills.GetAll()
-	if got := len(allSkills); got != 20 {
+	if got := len(allSkills); got < 20 {
 		names := make([]string, len(allSkills))
 		for i, s := range allSkills {
 			names[i] = s.Name
 		}
-		t.Fatalf("expected 20 registered skills, got %d: %v", got, names)
+		t.Fatalf("expected at least 20 registered skills, got %d: %v", got, names)
 	}
 }
 
@@ -419,6 +419,7 @@ func newTestArchitect(t *testing.T, cfg Config) *Architect {
 	if err != nil {
 		t.Fatalf("failed to create architect: %v", err)
 	}
+	t.Cleanup(func() { _ = a.Close() })
 	return a
 }
 

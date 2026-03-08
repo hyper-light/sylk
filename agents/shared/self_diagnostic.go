@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,26 +17,26 @@ import (
 // diagnostic data to the shared self_diagnostic skill.
 type AgentDiagnosticProvider interface {
 	AgentName() string
-	LogsDir() string                            // own agent's logs dir ("" if unbound)
+	LogsDir() string // own agent's logs dir ("" if unbound)
 	SessionID() string
-	EventLogger() *agentlog.SessionEventLogger  // for ring buffer + stats
-	PeerLogsDirs() map[string]string            // agent_name → logs_dir (orchestrator/guardian only, nil for others)
+	EventLogger() *agentlog.SessionEventLogger // for ring buffer + stats
+	PeerLogsDirs() map[string]string           // agent_name → logs_dir (orchestrator/guardian only, nil for others)
 	AgentSpecificDiagnostics() map[string]any
 	RecoveryHints() []string
 }
 
 // DiagnosticReport is the structured output of the self_diagnostic skill.
 type DiagnosticReport struct {
-	Agent         string                `json:"agent"`
-	SessionID     string                `json:"session_id"`
-	Query         string                `json:"query,omitempty"`
-	Stats         agentlog.LoggerStats  `json:"stats"`
-	RecentRing    []agentlog.JSONLEntry `json:"recent_ring,omitempty"`
-	LogSummary    *agentlog.LogSummary  `json:"log_summary,omitempty"`
+	Agent         string                          `json:"agent"`
+	SessionID     string                          `json:"session_id"`
+	Query         string                          `json:"query,omitempty"`
+	Stats         agentlog.LoggerStats            `json:"stats"`
+	RecentRing    []agentlog.JSONLEntry           `json:"recent_ring,omitempty"`
+	LogSummary    *agentlog.LogSummary            `json:"log_summary,omitempty"`
 	PeerSummaries map[string]*agentlog.LogSummary `json:"peer_summaries,omitempty"`
-	AgentState    map[string]any        `json:"agent_state,omitempty"`
-	RecoveryHints []string              `json:"recovery_hints,omitempty"`
-	LogsAvailable bool                  `json:"logs_available"`
+	AgentState    map[string]any                  `json:"agent_state,omitempty"`
+	RecoveryHints []string                        `json:"recovery_hints,omitempty"`
+	LogsAvailable bool                            `json:"logs_available"`
 }
 
 type diagnosticInput struct {
@@ -104,6 +105,7 @@ func diagnosticHandler(p AgentDiagnosticProvider) skills.Handler {
 			q := buildLogQuery(logsDir, in)
 			entries, err := agentlog.ReadLogs(ctx, q)
 			if err == nil {
+				entries = mergeDiagnosticEntries(entries, filterDiagnosticEntries(el.RecentEntries(64), q))
 				summary := agentlog.Summarize(entries)
 				report.LogSummary = &summary
 			}
@@ -116,6 +118,7 @@ func diagnosticHandler(p AgentDiagnosticProvider) skills.Handler {
 				q := buildLogQuery(peerDir, in)
 				entries, err := agentlog.ReadLogs(ctx, q)
 				if err == nil {
+					entries = mergeDiagnosticEntries(entries, filterDiagnosticEntries(el.RecentEntries(64), q))
 					summary := agentlog.Summarize(entries)
 					if report.PeerSummaries == nil {
 						report.PeerSummaries = make(map[string]*agentlog.LogSummary)
@@ -148,6 +151,67 @@ func buildLogQuery(dir string, in diagnosticInput) agentlog.LogQuery {
 	}
 
 	return q
+}
+
+func filterDiagnosticEntries(entries []agentlog.JSONLEntry, q agentlog.LogQuery) []agentlog.JSONLEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	filtered := make([]agentlog.JSONLEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !q.Since.IsZero() && entry.Timestamp.Before(q.Since) {
+			continue
+		}
+		if !q.Until.IsZero() && entry.Timestamp.After(q.Until) {
+			continue
+		}
+		if len(q.Levels) > 0 && !slices.Contains(q.Levels, entry.Level) {
+			continue
+		}
+		if len(q.EventCodes) > 0 && !slices.Contains(q.EventCodes, entry.EventCode) {
+			continue
+		}
+		if q.CorrID != "" && entry.CorrID != q.CorrID {
+			continue
+		}
+		if q.HasError && entry.Error == "" {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func mergeDiagnosticEntries(primary, fallback []agentlog.JSONLEntry) []agentlog.JSONLEntry {
+	if len(fallback) == 0 {
+		return primary
+	}
+	seen := make(map[string]struct{}, len(primary))
+	merged := make([]agentlog.JSONLEntry, 0, len(primary)+len(fallback))
+	for _, entry := range primary {
+		merged = append(merged, entry)
+		seen[diagnosticEntryKey(entry)] = struct{}{}
+	}
+	for _, entry := range fallback {
+		key := diagnosticEntryKey(entry)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		merged = append(merged, entry)
+		seen[key] = struct{}{}
+	}
+	return merged
+}
+
+func diagnosticEntryKey(entry agentlog.JSONLEntry) string {
+	return fmt.Sprintf("%d|%s|%s|%s|%s|%s",
+		entry.Timestamp.UnixNano(),
+		entry.Level,
+		entry.Agent,
+		entry.Event,
+		entry.CorrID,
+		entry.Error,
+	)
 }
 
 func formatDiagnosticReport(r DiagnosticReport) string {

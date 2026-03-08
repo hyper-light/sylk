@@ -94,8 +94,10 @@ func ArchivalistRegistration() *guide.AgentRegistration {
 			RetrospectiveOnly: true,
 			TemporalFocus:     guide.TemporalPast,
 		},
-		Description: "Historical data, patterns, failures, decisions, learnings",
-		Priority:    100,
+		Description:           "Historical data, patterns, failures, decisions, learnings",
+		Priority:              100,
+		RuntimeProfiles:       archivalistRuntimeProfiles(),
+		DefaultRuntimeProfile: archivalistDefaultRuntimeProfile(),
 	}
 }
 

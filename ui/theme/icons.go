@@ -28,8 +28,9 @@ const (
 	IconTool   = "⚡"
 
 	// Tool call visualization
-	IconToolCall      = "⚙"
-	IconToolCallError = "⚠"
+	IconToolCall        = "⏻"
+	IconToolCallError   = "✕"
+	IconToolCallBlocked = "⊘"
 
 	// Status bar
 	IconSpinner  = "◐"

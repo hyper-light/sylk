@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -70,7 +69,7 @@ func (e *Engineer) selfAudit(ctx context.Context, result, criteria string) (*Aud
 		Model:     e.config.EngineerConfig.Model,
 		MaxTokens: 4096,
 	}
-	llmruntime.Apply(req, e.llmRuntimeProfile())
+	e.applyLLMRuntimeProfile(req, "audit")
 
 	resp, err := p.Complete(ctx, req)
 	if err != nil {

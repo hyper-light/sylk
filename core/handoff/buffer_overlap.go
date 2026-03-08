@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/llmruntime"
 )
 
 // OverlapPhase tracks the overlap lifecycle.
@@ -128,6 +130,9 @@ func NewOverlapCoordinator(desc AgentDescriptor) *OverlapCoordinator {
 	creation := time.Duration(maxInt(4, cw/50_000)) * time.Second
 	warmup := time.Duration(maxInt(2, cw/100_000)) * time.Second
 	drain := time.Duration(maxInt(4, cw/50_000)) * time.Second
+	creation = llmruntime.AdjustOverlapTimeout(creation, desc.RuntimeProfiles)
+	warmup = llmruntime.AdjustOverlapTimeout(warmup, desc.RuntimeProfiles)
+	drain = llmruntime.AdjustOverlapTimeout(drain, desc.RuntimeProfiles)
 	total := creation + warmup + drain + 5*time.Second
 
 	return &OverlapCoordinator{

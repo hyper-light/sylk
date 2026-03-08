@@ -5,17 +5,30 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-// Academic currently relies on provider defaults for runtime tuning. Keep the
-// selection logic here so future policy changes stay agent-owned.
 func (a *Academic) applyLLMRuntimeProfile(req *providers.Request, stage string) {
-	llmruntime.Apply(req, a.llmRuntimeProfile(stage))
+	llmruntime.ApplyStage(req, a.llmStageProfile(stage), llmruntime.ApplyOptions{
+		Model:     academicRuntimeModel(req, a.CurrentModel()),
+		MaxTokens: req.MaxTokens,
+		AgentID:   "academic",
+		SessionID: a.config.SessionID,
+	})
 }
 
-func (a *Academic) llmRuntimeProfile(stage string) llmruntime.Profile {
-	switch stage {
-	case "fetch", "recall", "check", "research":
-		return llmruntime.Profile{}
-	default:
-		return llmruntime.Profile{}
+func (a *Academic) llmStageProfile(stage string) llmruntime.StageProfile {
+	return llmruntime.ResolveAgentStageProfile("academic", stage)
+}
+
+func academicRuntimeProfiles() []llmruntime.StageProfile {
+	return llmruntime.AgentProfiles("academic")
+}
+
+func academicDefaultRuntimeProfile() string {
+	return llmruntime.AgentDefaultProfile("academic")
+}
+
+func academicRuntimeModel(req *providers.Request, fallback string) string {
+	if req != nil && req.Model != "" {
+		return req.Model
 	}
+	return fallback
 }

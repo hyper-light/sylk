@@ -3,6 +3,8 @@ package global
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	agentShared "github.com/adalundhe/sylk/agents/shared"
@@ -35,6 +37,7 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 		LayerIdx:  req.LayerIdx,
 		StartedAt: startTime,
 	}
+	gi.applyDeterministicAuditPrepass(req, result)
 
 	// Build audit prompt from diffs and plan
 	auditPrompt := gi.buildAuditPrompt(req)
@@ -52,7 +55,10 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 	}
 	gi.applyLLMRuntimeProfile(llmReq, "audit")
 
-	response, err := gi.executeToolLoop(auditCtx, llmReq, agentShared.SteeringLedgerFromContext(auditCtx))
+	ledger := agentShared.SteeringLedgerFromContext(auditCtx)
+	response, err := agentShared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return gi.executeToolLoop(auditCtx, llmReq, ledger)
+	})
 	if err != nil {
 		if lm.EventLogger != nil {
 			agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -141,14 +147,149 @@ func (gi *GlobalInspector) buildAuditPrompt(req *shared.LayerAuditRequest) strin
 }
 
 func (gi *GlobalInspector) parseAuditResponse(response string, result *shared.AuditResult) {
-	// The LLM tool loop will have already invoked tools and generated findings.
-	// The response text contains the LLM's summary judgment.
-	// Tool call results are accumulated during the tool loop.
-	// This is a simplified parser -- real implementation would parse structured
-	// tool outputs from the conversation history.
+	if strings.TrimSpace(response) == "" || result == nil {
+		return
+	}
+	// Deterministic prepass owns the structured result today. The LLM response
+	// is preserved for future enrichment but must not overwrite precomputed
+	// adherence and finding state with placeholder values.
+}
+
+func (gi *GlobalInspector) applyDeterministicAuditPrepass(
+	req *shared.LayerAuditRequest,
+	result *shared.AuditResult,
+) {
+	if req == nil || result == nil {
+		return
+	}
+
+	fileOwners := make(map[string][]string)
+	tasksCovered := make([]string, 0, len(req.NodeResults))
+	tasksMissing := make([]string, 0, len(req.NodeResults))
+	deviations := make([]string, 0)
+
+	for nodeID, nodeResult := range req.NodeResults {
+		if nodeResult == nil {
+			tasksMissing = append(tasksMissing, nodeID)
+			deviations = append(deviations, fmt.Sprintf("node %s has no execution result", nodeID))
+			continue
+		}
+		if nodeResult.Success {
+			tasksCovered = append(tasksCovered, nodeID)
+		} else {
+			tasksMissing = append(tasksMissing, nodeID)
+			issue := shared.ValidationIssue{
+				ID:       "node_failed_" + nodeID,
+				Severity: shared.High,
+				File:     "",
+				Message:  fmt.Sprintf("Node %s failed before layer completion: %s", nodeID, strings.TrimSpace(nodeResult.Error)),
+				RuleID:   "global/node-failure",
+				Domain:   shared.DomainCode,
+			}
+			result.Issues = append(result.Issues, issue)
+			result.HighCount++
+			deviations = append(deviations, fmt.Sprintf("node %s failed: %s", nodeID, strings.TrimSpace(nodeResult.Error)))
+			result.Recommendations = append(result.Recommendations, shared.Recommendation{
+				Type:        shared.RecommendEngineerRework,
+				Description: fmt.Sprintf("Rework failed node %s before the next layer executes.", nodeID),
+				Priority:    shared.High,
+				TargetAgent: "engineer",
+			})
+		}
+	}
+
+	for nodeID, diff := range req.NodeDiffs {
+		if diff == nil || len(diff.ModifiedFiles) == 0 {
+			if _, ok := req.NodeResults[nodeID]; ok {
+				deviations = append(deviations, fmt.Sprintf("node %s completed without any captured file modifications", nodeID))
+			}
+			continue
+		}
+		for _, modified := range diff.ModifiedFiles {
+			path := strings.TrimSpace(modified.Path)
+			if path == "" {
+				continue
+			}
+			fileOwners[path] = append(fileOwners[path], nodeID)
+		}
+	}
+
+	for path, owners := range fileOwners {
+		if len(owners) < 2 {
+			continue
+		}
+		sort.Strings(owners)
+		result.CrossFileIssues = append(result.CrossFileIssues, shared.CrossFileIssue{
+			Files:       []string{path},
+			Description: fmt.Sprintf("Multiple nodes modified %s in the same layer: %s", path, strings.Join(owners, ", ")),
+			Severity:    shared.High,
+			Category:    shared.CrossFileTypeInconsistency,
+		})
+		result.Issues = append(result.Issues, shared.ValidationIssue{
+			ID:       "shared_file_" + sanitizeAuditID(path),
+			Severity: shared.High,
+			File:     path,
+			Message:  fmt.Sprintf("Multiple nodes modified %s in the same layer.", path),
+			RuleID:   "global/shared-file-touch",
+			Domain:   shared.DomainCode,
+		})
+		result.HighCount++
+		deviations = append(deviations, fmt.Sprintf("shared file touched by multiple nodes: %s", path))
+		result.Recommendations = append(result.Recommendations, shared.Recommendation{
+			Type:        shared.RecommendPlanRevision,
+			Description: fmt.Sprintf("Revisit task boundaries for %s; multiple nodes touched the same file in one layer.", path),
+			Priority:    shared.High,
+			TargetAgent: "architect",
+		})
+	}
 
 	result.PlanAdherence = shared.PlanAdherenceScore{
-		Score: 1.0,
+		Score:        adherenceScore(len(tasksMissing), result.HighCount, result.CriticalCount, len(deviations)),
+		TasksCovered: uniqueSortedStrings(tasksCovered),
+		TasksMissing: uniqueSortedStrings(tasksMissing),
+		Deviations:   uniqueSortedStrings(deviations),
 	}
-	_ = response
+}
+
+func adherenceScore(taskMisses, highCount, criticalCount, deviations int) float64 {
+	score := 1.0
+	score -= float64(taskMisses) * 0.20
+	score -= float64(highCount) * 0.10
+	score -= float64(criticalCount) * 0.20
+	score -= float64(deviations) * 0.03
+	if score < 0 {
+		return 0
+	}
+	return score
+}
+
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sanitizeAuditID(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	replacer := strings.NewReplacer("/", "_", ".", "_", "-", "_", " ", "_")
+	value = replacer.Replace(value)
+	if value == "" {
+		return "audit"
+	}
+	return value
 }

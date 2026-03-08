@@ -8,7 +8,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/events"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -157,7 +156,10 @@ func (o *Orchestrator) processBatch(ctx context.Context, batch []*busEvent) {
 	defer cancel()
 	llmCtx = providers.WithRetryObserver(llmCtx, o.retryObserver())
 
-	_, err := o.executeToolLoop(llmCtx, req, shared.SteeringLedgerFromContext(llmCtx))
+	ledger := shared.SteeringLedgerFromContext(llmCtx)
+	_, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
+		return o.executeToolLoop(llmCtx, req, ledger)
+	})
 	if err != nil {
 		if batchMaxSeverity(batch) >= severityCritical {
 			o.publishActivity(events.EventTypeAgentError, "LLM analysis failed, using fallback")
@@ -184,17 +186,11 @@ func (o *Orchestrator) buildLLMRequest(userMessage string) *providers.Request {
 		Temperature:  &temp,
 		Tools:        tools,
 	}
-	llmruntime.Apply(req, o.backgroundLLMRuntimeProfile())
+	o.applyBackgroundRuntimeProfile(req)
 	if len(tools) > 0 {
 		req.ToolChoice = "auto"
 	}
 	return req
-}
-
-func (o *Orchestrator) backgroundLLMRuntimeProfile() llmruntime.Profile {
-	return llmruntime.Profile{
-		ReasoningEffort: "low",
-	}
 }
 
 // buildDigestMessage formats a batch of events into a markdown digest.

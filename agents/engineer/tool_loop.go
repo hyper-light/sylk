@@ -11,9 +11,11 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // executeToolLoop runs the LLM tool-call loop: Complete → check ToolCalls →
@@ -41,6 +43,11 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 	}
 
 	for turn := 0; turn <= maxRuns; turn++ {
+		if e.toolDefsDirty {
+			req.Tools = e.buildToolDefinitions()
+			e.toolDefsDirty = false
+		}
+
 		// ── STEERING CHECKPOINT ──
 		sc := shared.DrainAndCheckpoint(ledger, req, turn, "executing", nil)
 		if sc.Rollback != nil || sc.EditReplay != nil {
@@ -80,8 +87,7 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 		}
 
 		turnStart := time.Now()
-		resp, err := p.Complete(ctx, req)
-		shared.LogLLMCallFromContext(ctx, req.Model, resp, time.Since(turnStart), err)
+		resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("engineer"))
 		if err != nil {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
@@ -105,7 +111,9 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-
+		if err := e.tools.ValidateBatch(e.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+			return "", err
+		}
 
 		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -159,9 +167,15 @@ func (e *Engineer) applyToolCalls(
 		if ctx.Err() != nil {
 			break
 		}
+		var execResult toolruntime.ExecutionResult
+		var execErr error
 		result, err := shared.TimedToolCall(ctx, "engineer", call, func() (string, error) {
-			return e.executeToolCall(ctx, call)
+			execResult, execErr = e.executeToolCall(ctx, call)
+			return execResult.Output, execErr
 		})
+		if execResult.ToolDefsDirty {
+			e.toolDefsDirty = true
+		}
 		isError := false
 		if err != nil {
 			if errors.Is(err, skills.ErrRerouteRequested) {
@@ -202,10 +216,10 @@ func (e *Engineer) applyToolCalls(
 }
 
 // executeToolCall invokes a skill by name with JSON arguments.
-func (e *Engineer) executeToolCall(ctx context.Context, call providers.ToolCall) (string, error) {
+func (e *Engineer) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
-		return "", fmt.Errorf("tool name is required")
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -213,18 +227,18 @@ func (e *Engineer) executeToolCall(ctx context.Context, call providers.ToolCall)
 		raw = "{}"
 	}
 	if !json.Valid([]byte(raw)) {
-		return "", fmt.Errorf("tool arguments for %q are not valid JSON", name)
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
-
-	result := e.skills.Invoke(ctx, name, json.RawMessage(raw))
-	if result == nil {
-		return "", fmt.Errorf("tool %q returned nil", name)
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = e.id + "-local"
 	}
-	if !result.Success {
-		return "", fmt.Errorf("tool %q failed: %s", name, strings.TrimSpace(result.Error))
-	}
-
-	return shared.MarshalToolOutput(result.Data)
+	return e.toolRuntime().Execute(ctx, toolruntime.Invocation{
+		ToolCall:        call,
+		AgentID:         e.id,
+		CorrelationID:   correlationID,
+		CapabilityScope: e.toolRuntime().CapabilityScope(),
+	})
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -239,33 +253,33 @@ func (e *Engineer) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (e *Engineer) buildToolDefinitions() []providers.Tool {
-	loaded := e.skills.GetLoaded()
-	if len(loaded) == 0 {
+	e.toolRuntime().SyncActiveFromLoaded()
+	return e.toolRuntime().BuildToolDefinitions()
+}
+
+func (e *Engineer) toolRuntime() *toolruntime.Runtime {
+	return e.tools
+}
+
+func (e *Engineer) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	if len(calls) == 0 {
 		return nil
 	}
-
-	tools := make([]providers.Tool, 0, len(loaded))
-	for _, skill := range loaded {
-		def := skill.ToToolDefinition()
-		name, _ := def["name"].(string)
-		if name == "" {
-			continue
-		}
-		description, _ := def["description"].(string)
-		parameters := shared.CoerceMap(def["input_schema"])
-		if len(parameters) == 0 {
-			parameters = map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
-			}
-		}
-		tools = append(tools, providers.Tool{
-			Name:        name,
-			Description: description,
-			Parameters:  parameters,
+	correlationID := shared.LogMetaFromContext(ctx).CorrID
+	if correlationID == "" {
+		correlationID = e.id + "-local"
+	}
+	scope := e.toolRuntime().CapabilityScope()
+	invocations := make([]toolruntime.Invocation, 0, len(calls))
+	for _, call := range calls {
+		invocations = append(invocations, toolruntime.Invocation{
+			ToolCall:        call,
+			AgentID:         e.id,
+			CorrelationID:   correlationID,
+			CapabilityScope: scope,
 		})
 	}
-	return tools
+	return invocations
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
@@ -288,6 +302,8 @@ func (e *Engineer) recordTurn(
 		TurnNumber:       turn + 1,
 		Duration:         time.Since(turnStart),
 		Timestamp:        time.Now(),
+		Stage:            llmruntime.StageFromRequest(req),
+		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
 		StopReason:       resp.StopReason,
 		CacheReadTokens:  resp.Usage.CacheReadTokens,
 		CacheWriteTokens: resp.Usage.CacheWriteTokens,
