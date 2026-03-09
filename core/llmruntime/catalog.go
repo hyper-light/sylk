@@ -12,6 +12,16 @@ var agentProfileCatalog = map[string]agentProfileSet{
 		defaultProfile: "research",
 		profiles: []StageProfile{
 			{
+				Name:              "conversation",
+				Intents:           []string{"chat", "help", "recall", "check", "fetch"},
+				Domains:           []string{"research", "patterns", "decisions", "learnings", "general"},
+				Deliberation:      DeliberationMedium,
+				ResponseDetail:    ResponseDetailNormal,
+				ToolParallelism:   ToolParallelismSerial,
+				CacheAffinity:     CacheAffinitySession,
+				ThoughtVisibility: ThoughtVisibilitySummary,
+			},
+			{
 				Name:              "research",
 				Intents:           []string{"recall", "check"},
 				Domains:           []string{"research", "patterns", "decisions", "learnings"},

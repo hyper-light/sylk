@@ -202,3 +202,73 @@ func TestGuardianControlPlane_RequestGrantQueuesGuideRoutedContinuation(t *testi
 		t.Fatalf("expected direct skill metadata, got %+v", req.Metadata)
 	}
 }
+
+func TestSubmitRequirementsResearchHandoff_QueuesAcademicDelegation(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-clarify",
+		SessionID: "sess-1",
+		Query:     "Build a production-ready observability platform",
+		Status:    PlanStatusConsulting,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	a.running = true
+	a.bus = &testBus{}
+	a.knownAgents = map[string]*guide.AgentAnnouncement{
+		"academic": {AgentID: "academic-1", AgentType: "academic"},
+	}
+
+	_, err := a.submitRequirementsResearchHandoff(
+		withArchitectSessionID(context.Background(), plan.SessionID),
+		&routeRequirementsResearchParams{
+			PlanID:              plan.ID,
+			OriginalInput:       plan.Query,
+			Reason:              "The request does not define scope, constraints, or success criteria.",
+			ResearchGoal:        "Clarify scope, operational constraints, and success metrics.",
+			MissingRequirements: []string{"Target services", "Retention requirements", "Success metrics"},
+		},
+	)
+	if !errors.Is(err, skills.ErrDelegatedRequested) {
+		t.Fatalf("expected delegated sentinel, got %v", err)
+	}
+	if plan.SM().State() != PlanStatusClarifying {
+		t.Fatalf("expected plan to transition to clarifying, got %s", plan.SM().State())
+	}
+	if plan.PendingWork == nil || plan.PendingWork.Kind != string(continuationKindAcademicHandoff) {
+		t.Fatalf("expected academic handoff continuation on plan, got %+v", plan.PendingWork)
+	}
+	record, loadErr := a.controlStore.GetContinuationByResponseCorrelation(plan.PendingWork.CorrelationID)
+	if loadErr != nil {
+		t.Fatalf("load continuation: %v", loadErr)
+	}
+	if record == nil || record.TargetAgentID != "academic-1" {
+		t.Fatalf("expected academic continuation record, got %+v", record)
+	}
+	if got := plan.ClarificationQuestions; len(got) != 3 {
+		t.Fatalf("expected clarification questions to be persisted, got %+v", got)
+	}
+	bus := a.bus.(*testBus)
+	if len(bus.published) != 1 {
+		t.Fatalf("expected one published route request, got %d", len(bus.published))
+	}
+	if bus.published[0].topic != guide.TopicGuideRequests {
+		t.Fatalf("expected publish to guide requests, got %s", bus.published[0].topic)
+	}
+	req, ok := bus.published[0].msg.GetRouteRequest()
+	if !ok || req == nil {
+		t.Fatalf("expected route request payload, got %#v", bus.published[0].msg.Payload)
+	}
+	if req.TargetAgentID != "academic-1" {
+		t.Fatalf("expected academic direct target, got %q", req.TargetAgentID)
+	}
+	if req.Metadata["handoff_kind"] != "requirements_clarification" {
+		t.Fatalf("expected requirements handoff metadata, got %+v", req.Metadata)
+	}
+	if visible, _ := req.Metadata["user_facing_handoff"].(bool); !visible {
+		t.Fatalf("expected user-facing handoff metadata, got %+v", req.Metadata)
+	}
+}

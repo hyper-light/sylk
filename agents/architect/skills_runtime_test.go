@@ -204,6 +204,93 @@ func TestArchitect_PlanModeTodoFlow(t *testing.T) {
 	}
 }
 
+func TestArchitect_StartPlanning_ReusesRequestScopedPlan(t *testing.T) {
+	a := newTestArchitect(t, Config{AllowPlanningWithoutConsultation: true})
+
+	ctx := withArchitectSessionID(context.Background(), "sess-reuse")
+	ctx = withArchitectStreamContext(ctx, "corr-reuse", "tui")
+	payload, err := json.Marshal(map[string]any{"query": "Create a hello world CLI"})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	first := a.InvokeSkill(ctx, "start_planning", payload)
+	if first == nil || !first.Success {
+		t.Fatalf("first start_planning failed: %+v", first)
+	}
+	firstData, ok := first.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("first result data type = %T", first.Data)
+	}
+	firstPlanID, _ := firstData["plan_id"].(string)
+	if firstPlanID == "" {
+		t.Fatal("first plan_id is empty")
+	}
+
+	second := a.InvokeSkill(ctx, "start_planning", payload)
+	if second == nil || !second.Success {
+		t.Fatalf("second start_planning failed: %+v", second)
+	}
+	secondData, ok := second.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("second result data type = %T", second.Data)
+	}
+	secondPlanID, _ := secondData["plan_id"].(string)
+	if secondPlanID != firstPlanID {
+		t.Fatalf("second plan_id = %q, want %q", secondPlanID, firstPlanID)
+	}
+	if reused, _ := secondData["reused"].(bool); !reused {
+		t.Fatal("expected second start_planning call to report reused=true")
+	}
+}
+
+func TestArchitect_GenerateTasks_ReusesReadyPlanArtifacts(t *testing.T) {
+	a := newTestArchitect(t, Config{AllowPlanningWithoutConsultation: true})
+
+	plan := &DesignPlan{
+		ID:        "plan-ready",
+		SessionID: "sess-ready",
+		Status:    PlanStatusReady,
+		UpdatedAt: time.Now(),
+		CreatedAt: time.Now(),
+		Architecture: &SolutionArchitecture{
+			Name: "cli",
+			Components: []ComponentSpec{
+				{Name: "cli"},
+			},
+		},
+		Tasks: []*AtomicTask{
+			{ID: "task-1", Name: "create cli", Complexity: ComplexityLow, EstimatedTokens: 120},
+		},
+		Workflow: &WorkflowDAG{
+			Status: WorkflowStatusPending,
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusReady)
+	if err := a.persistPlanState(plan); err != nil {
+		t.Fatalf("persist plan: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"action":  "generate_tasks",
+		"plan_id": plan.ID,
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	result := a.InvokeSkill(context.Background(), "plan", payload)
+	if result == nil || !result.Success {
+		t.Fatalf("generate_tasks failed: %+v", result)
+	}
+	data, ok := result.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("result data type = %T", result.Data)
+	}
+	if reused, _ := data["reused"].(bool); !reused {
+		t.Fatal("expected generate_tasks to reuse ready plan artifacts")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch coverage tests for consolidated skills
 // ---------------------------------------------------------------------------

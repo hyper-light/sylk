@@ -92,3 +92,74 @@ func TestPublishStreamLifecycleUsesContextMetadata(t *testing.T) {
 		t.Fatalf("unexpected complete usage: %+v", complete.Event.Usage)
 	}
 }
+
+func TestPublishIntermediateToolTurnPublishesToolTurnContent(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	channels := guide.NewAgentChannels("tester", "agent-1")
+	streamCh := make(chan *guide.StreamResponse, 4)
+	sub, err := bus.SubscribeAsync(channels.Responses, func(msg *guide.Message) error {
+		stream, ok := msg.GetStreamResponse()
+		if ok && stream != nil {
+			streamCh <- stream
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe stream: %v", err)
+	}
+	defer sub.Unsubscribe()
+
+	ctx := WithStreamContext(context.Background(), "corr-2", "tui")
+	PublishIntermediateToolTurn(bus, channels, ctx, "agent-1", &providers.Response{
+		Content: "Inspecting the repository before I answer.",
+		ToolCalls: []providers.ToolCall{{
+			ID:        "tool-1",
+			Name:      "search_skills",
+			Arguments: `{"query":"repo"}`,
+		}},
+	})
+
+	select {
+	case stream := <-streamCh:
+		if stream.Event == nil || stream.Event.Type != guide.StreamEventData {
+			t.Fatalf("unexpected stream event: %+v", stream.Event)
+		}
+		if got := stream.Event.Text; got != "Inspecting the repository before I answer.\n\n" {
+			t.Fatalf("stream text = %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for intermediate tool turn chunk")
+	}
+}
+
+func TestIntermediateToolTurnText_FallsBackToThinking(t *testing.T) {
+	got := IntermediateToolTurnText(&providers.Response{
+		Thinking: "Checking packaging guidance and reconciling it with current Python recommendations.",
+		ToolCalls: []providers.ToolCall{{
+			ID:        "tool-1",
+			Name:      "research_topic",
+			Arguments: `{"topic":"python packaging"}`,
+		}},
+	})
+
+	want := "Checking packaging guidance and reconciling it with current Python recommendations.\n\n"
+	if got != want {
+		t.Fatalf("IntermediateToolTurnText thinking fallback = %q, want %q", got, want)
+	}
+}
+
+func TestIntermediateToolTurnText_FallsBackToToolSummary(t *testing.T) {
+	got := IntermediateToolTurnText(&providers.Response{
+		ToolCalls: []providers.ToolCall{
+			{ID: "tool-1", Name: "research_topic", Arguments: `{"topic":"python packaging"}`},
+			{ID: "tool-2", Name: "search_skills", Arguments: `{"query":"packaging"}`},
+		},
+	})
+
+	want := "Working through this with research topic and search skills.\n\n"
+	if got != want {
+		t.Fatalf("IntermediateToolTurnText tool summary fallback = %q, want %q", got, want)
+	}
+}

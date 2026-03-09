@@ -52,6 +52,21 @@ type Runtime struct {
 	controlPlane GuardianControlPlane
 }
 
+// Surface is the tool-runtime execution/build surface for a single request
+// context. Runtime implements the shared/session-scoped surface, while
+// RequestView overlays transient request-only tool activation without mutating
+// the shared runtime state.
+type Surface interface {
+	AgentID() string
+	CapabilityScope() string
+	Allows(name string) bool
+	SyncActiveFromLoaded() []string
+	BuildToolDefinitions() []providers.Tool
+	ValidateBatch([]Invocation) error
+	Execute(context.Context, Invocation) (ExecutionResult, error)
+	ExecuteApproved(context.Context, Invocation, *GuardianControlGrant) (ExecutionResult, error)
+}
+
 type searchRequest struct {
 	Query    string   `json:"query"`
 	Limit    int      `json:"limit,omitempty"`
@@ -114,6 +129,13 @@ func (r *Runtime) CapabilityScope() string {
 	return r.manifest.CapabilityScope
 }
 
+func (r *Runtime) AgentID() string {
+	if r == nil || r.manifest == nil {
+		return ""
+	}
+	return r.manifest.AgentID
+}
+
 func (r *Runtime) Allows(name string) bool {
 	if r == nil || r.manifest == nil {
 		return false
@@ -126,6 +148,32 @@ func (r *Runtime) Activate(names ...string) ([]string, error) {
 	if r == nil || r.manifest == nil {
 		return nil, fmt.Errorf("tool runtime is not configured")
 	}
+	allowed, err := r.allowedToolNames(names...)
+	if err != nil {
+		return nil, err
+	}
+	return r.activateNames(allowed, nil), nil
+}
+
+func (r *Runtime) RequestView(names ...string) (*RequestView, error) {
+	if r == nil || r.manifest == nil {
+		return nil, fmt.Errorf("tool runtime is not configured")
+	}
+	allowed, err := r.allowedToolNames(names...)
+	if err != nil {
+		return nil, err
+	}
+	view := &RequestView{
+		runtime:         r,
+		transientActive: make(map[string]struct{}, len(allowed)),
+	}
+	for _, name := range allowed {
+		view.transientActive[name] = struct{}{}
+	}
+	return view, nil
+}
+
+func (r *Runtime) allowedToolNames(names ...string) ([]string, error) {
 	allowed := make([]string, 0, len(names))
 	for _, name := range names {
 		name = strings.TrimSpace(name)
@@ -137,10 +185,14 @@ func (r *Runtime) Activate(names ...string) ([]string, error) {
 		}
 		allowed = append(allowed, name)
 	}
-	return r.state.Activate(allowed...), nil
+	return allowed, nil
 }
 
 func (r *Runtime) SyncActiveFromLoaded() []string {
+	return r.syncActiveFromLoaded(nil)
+}
+
+func (r *Runtime) syncActiveFromLoaded(transientActive map[string]struct{}) []string {
 	if r == nil || r.registry == nil || r.manifest == nil {
 		return nil
 	}
@@ -155,15 +207,19 @@ func (r *Runtime) SyncActiveFromLoaded() []string {
 		}
 		names = append(names, skill.Name)
 	}
-	return r.state.Activate(names...)
+	return r.activateNames(names, transientActive)
 }
 
 func (r *Runtime) BuildToolDefinitions() []providers.Tool {
+	return r.buildToolDefinitions(nil)
+}
+
+func (r *Runtime) buildToolDefinitions(transientActive map[string]struct{}) []providers.Tool {
 	if r == nil {
 		return nil
 	}
 	tools := make([]providers.Tool, 0)
-	for _, name := range r.state.Snapshot() {
+	for _, name := range r.activeSnapshot(transientActive) {
 		policy, ok := r.manifest.Policy(name)
 		if !ok {
 			continue
@@ -220,13 +276,14 @@ func (r *Runtime) Execute(ctx context.Context, inv Invocation) (ExecutionResult,
 }
 
 func (r *Runtime) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecutionResult, error) {
-	return r.executeRaw(ctx, inv, nil)
+	return r.executeRaw(ctx, inv, nil, nil)
 }
 
 func (r *Runtime) executeRaw(
 	ctx context.Context,
 	inv Invocation,
 	approvedGrant *GuardianControlGrant,
+	transientActive map[string]struct{},
 ) (RawExecutionResult, error) {
 	if r == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
@@ -235,7 +292,7 @@ func (r *Runtime) executeRaw(
 	if err != nil {
 		return RawExecutionResult{}, err
 	}
-	if !r.state.IsActive(name) {
+	if !r.isActive(name, transientActive) {
 		return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 	}
 
@@ -299,13 +356,13 @@ func (r *Runtime) executeRaw(
 			return RawExecutionResult{}, fmt.Errorf("SECURITY VIOLATION: agent %q is not permitted to execute tool %q", inv.AgentID, name)
 		}
 		policy = nextPolicy
-		if !r.state.IsActive(name) {
+		if !r.isActive(name, transientActive) {
 			return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 		}
 	}
 
 	if name == SearchToolName {
-		payload, activated, execErr := r.executeSearch(toolData.Input)
+		payload, activated, execErr := r.executeSearch(toolData.Input, transientActive)
 		if postErr := r.runPostHooks(ctx, toolData, payload, execErr); postErr != nil {
 			return RawExecutionResult{}, postErr
 		}
@@ -418,6 +475,9 @@ func (r *Runtime) invokeLocal(ctx context.Context, name string, input map[string
 	if skill == nil {
 		return nil, fmt.Errorf("tool %q is not registered", name)
 	}
+	if skill.ProviderTool != nil && skill.ProviderTool.ResolvedKind() != skills.ProviderToolKindFunction {
+		return nil, fmt.Errorf("tool %q is provider-native and cannot be executed locally", name)
+	}
 	if !skill.Loaded {
 		_ = r.registry.Load(name)
 	}
@@ -475,7 +535,7 @@ func (r *Runtime) obtainGuardianGrant(
 	return grant.Validate(req)
 }
 
-func (r *Runtime) executeSearch(input map[string]any) (map[string]any, []string, error) {
+func (r *Runtime) executeSearch(input map[string]any, transientActive map[string]struct{}) (map[string]any, []string, error) {
 	var req searchRequest
 	if input != nil {
 		payload, err := json.Marshal(input)
@@ -554,7 +614,7 @@ func (r *Runtime) executeSearch(input map[string]any) (map[string]any, []string,
 			Description: compileToolDescription(entry.skill, entry.policy),
 			Domain:      string(entry.policy.Domain),
 			Keywords:    append([]string(nil), entry.skill.Keywords...),
-			Active:      r.state.IsActive(entry.skill.Name),
+			Active:      r.isActive(entry.skill.Name, transientActive),
 			Loaded:      entry.skill.Loaded,
 			Score:       entry.score,
 		})
@@ -562,15 +622,72 @@ func (r *Runtime) executeSearch(input map[string]any) (map[string]any, []string,
 			activateNames = append(activateNames, entry.skill.Name)
 		}
 	}
-	activated := r.state.Activate(activateNames...)
+	activated := r.activateNames(activateNames, transientActive)
 	payload := map[string]any{
 		"query":              query,
 		"matches":            matches,
 		"activated_skills":   activated,
 		"result_count":       len(matches),
-		"active_skill_count": len(r.state.Snapshot()),
+		"active_skill_count": len(r.activeSnapshot(transientActive)),
 	}
 	return payload, activated, nil
+}
+
+func (r *Runtime) isActive(name string, transientActive map[string]struct{}) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return false
+	}
+	if transientActive != nil {
+		if _, ok := transientActive[trimmed]; ok {
+			return true
+		}
+	}
+	return r.state.IsActive(trimmed)
+}
+
+func (r *Runtime) activateNames(names []string, transientActive map[string]struct{}) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	if transientActive == nil {
+		return r.state.Activate(names...)
+	}
+
+	activated := make([]string, 0, len(names))
+	for _, name := range names {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" || r.isActive(trimmed, transientActive) {
+			continue
+		}
+		transientActive[trimmed] = struct{}{}
+		activated = append(activated, trimmed)
+	}
+	return activated
+}
+
+func (r *Runtime) activeSnapshot(transientActive map[string]struct{}) []string {
+	base := r.state.Snapshot()
+	if len(transientActive) == 0 {
+		return base
+	}
+	union := make(map[string]struct{}, len(base)+len(transientActive))
+	for _, name := range base {
+		union[name] = struct{}{}
+	}
+	for name := range transientActive {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		union[trimmed] = struct{}{}
+	}
+	names := make([]string, 0, len(union))
+	for name := range union {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (r *Runtime) runPostHooks(ctx context.Context, toolData *skills.ToolCallHookData, output any, err error) error {
@@ -591,6 +708,9 @@ func (r *Runtime) runPostHooks(ctx context.Context, toolData *skills.ToolCallHoo
 }
 
 func (r *Runtime) skillToProviderTool(skill *skills.Skill, policy ToolPolicy) providers.Tool {
+	if skill != nil && skill.ProviderTool != nil {
+		return skillProviderToolToProviderTool(skill, policy)
+	}
 	parameters := inputSchemaToMap(skill)
 	if len(parameters) == 0 {
 		parameters = map[string]any{
@@ -599,10 +719,52 @@ func (r *Runtime) skillToProviderTool(skill *skills.Skill, policy ToolPolicy) pr
 		}
 	}
 	return providers.Tool{
+		Kind:        providers.ToolKindFunction,
 		Name:        strings.TrimSpace(skill.Name),
 		Description: compileToolDescription(skill, policy),
 		Parameters:  parameters,
 	}
+}
+
+func skillProviderToolToProviderTool(skill *skills.Skill, policy ToolPolicy) providers.Tool {
+	if skill == nil || skill.ProviderTool == nil {
+		return providers.Tool{}
+	}
+	tool := providers.Tool{
+		Name: strings.TrimSpace(skill.Name),
+	}
+	if description := strings.TrimSpace(skill.ProviderTool.Description); description != "" {
+		tool.Description = description
+	} else {
+		tool.Description = compileToolDescription(skill, policy)
+	}
+	switch skill.ProviderTool.ResolvedKind() {
+	case skills.ProviderToolKindNativeWebSearch:
+		tool.Kind = providers.ToolKindNativeWebSearch
+		if skill.ProviderTool.WebSearch != nil {
+			tool.WebSearch = &providers.WebSearchOptions{
+				SearchContextSize: providers.WebSearchContextSize(skill.ProviderTool.WebSearch.SearchContextSize),
+				AllowedDomains:    append([]string(nil), skill.ProviderTool.WebSearch.AllowedDomains...),
+				BlockedDomains:    append([]string(nil), skill.ProviderTool.WebSearch.BlockedDomains...),
+				MaxUses:           skill.ProviderTool.WebSearch.MaxUses,
+				Strict:            skill.ProviderTool.WebSearch.Strict,
+				DeferLoading:      skill.ProviderTool.WebSearch.DeferLoading,
+				EnableURLContext:  skill.ProviderTool.WebSearch.EnableURLContext,
+			}
+			if skill.ProviderTool.WebSearch.UserLocation != nil {
+				tool.WebSearch.UserLocation = &providers.WebSearchUserLocation{
+					City:     skill.ProviderTool.WebSearch.UserLocation.City,
+					Country:  skill.ProviderTool.WebSearch.UserLocation.Country,
+					Region:   skill.ProviderTool.WebSearch.UserLocation.Region,
+					Timezone: skill.ProviderTool.WebSearch.UserLocation.Timezone,
+				}
+			}
+		}
+	default:
+		tool.Kind = providers.ToolKindFunction
+		tool.Parameters = inputSchemaToMap(skill)
+	}
+	return tool
 }
 
 func searchToolDefinition(policy ToolPolicy) providers.Tool {

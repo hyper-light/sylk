@@ -204,6 +204,27 @@ func (m *Model) agentSortKey(id string) int {
 	return agentDisplayOrderSentinel
 }
 
+func resolveAgentCategory(agentType, pipelineID string) string {
+	agentType = strings.TrimSpace(agentType)
+	pipelineID = strings.TrimSpace(pipelineID)
+	if pipelineID != "" {
+		switch agentType {
+		case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+			return "pipeline"
+		}
+	}
+	return agentCategoryByType[agentType]
+}
+
+func canonicalPipelineAgentID(agentType, pipelineID string) string {
+	agentType = strings.TrimSpace(agentType)
+	pipelineID = strings.TrimSpace(pipelineID)
+	if resolveAgentCategory(agentType, pipelineID) != "pipeline" || pipelineID == "" {
+		return ""
+	}
+	return pipelineID + ":" + agentType
+}
+
 // maxAgents is the upper bound on tracked agents to prevent unbounded growth.
 // Derived from typical multi-agent systems: 32 concurrent agents covers
 // orchestrator + guide + architects + engineers + inspectors + specialists.
@@ -285,6 +306,7 @@ func isActiveStatus(s AgentStatus) bool { return activeStatuses[s] }
 // Model is the Bubble Tea model for the agent dashboard panel.
 type Model struct {
 	agents    map[string]*AgentState
+	aliases   map[string]string // Runtime/ephemeral agent IDs → canonical panel row IDs.
 	streams   map[string]*AgentEventStream
 	order     []string  // Agent IDs in insertion order (bounded by maxAgentOrder).
 	engagedID string    // Agent ID the user is conversing with (sticky until reroute/override).
@@ -331,6 +353,7 @@ func New(th *theme.Theme) *Model {
 	idleGroup := th.Palette.IdleGroupGradient()
 	return &Model{
 		agents:              make(map[string]*AgentState, maxAgents),
+		aliases:             make(map[string]string, maxAgents*2),
 		streams:             make(map[string]*AgentEventStream, maxAgents),
 		order:               make([]string, 0, maxAgentOrder),
 		pipelines:           make(map[string]*PipelineState, maxPipelines),
@@ -437,18 +460,26 @@ func (m *Model) SetSize(width, height int) {
 
 // handleActivity processes an activity event to update agent state.
 func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
-	agentID := ev.Event.AgentID
+	rawAgentID := strings.TrimSpace(ev.Event.AgentID)
+	agentID := m.canonicalizeAgentID(rawAgentID, ev)
 	vis := ev.Event.Visibility
 	eventDebugLog().Info("agent_panel: activity",
-		"agent_id", agentID,
+		"agent_id", rawAgentID,
+		"panel_agent_id", agentID,
 		"event_type", ev.Event.EventType,
 		"visibility", vis,
 		"content", ev.Event.Content,
 		"outcome", ev.Event.Outcome,
 		"timestamp", ev.Event.Timestamp.Format(time.RFC3339Nano))
-	if agentID == "" {
+	if rawAgentID == "" && agentID == "" {
 		return nil
 	}
+	if agentID == "" {
+		agentID = rawAgentID
+	}
+
+	m.rehomeDuplicateAgentRows(agentID, ev)
+	m.rememberAgentAliases(agentID, rawAgentID, ev)
 
 	// System events (health checks, fire-and-forget) are recorded for
 	// debugging but never update panel status or promote agents.
@@ -457,7 +488,8 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 		return nil
 	}
 
-	m.ensureAgent(agentID, ev)
+	agentID = m.ensureAgent(agentID, ev)
+	m.rememberAgentAliases(agentID, rawAgentID, ev)
 
 	// Agent-to-agent events update status (so the card shows work) but
 	// do NOT demote the previous active agent or auto-select.
@@ -482,10 +514,11 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 // messages (e.g. "Analyzing requirements...", "Dispatching task 1/3...") in
 // the agent panel cards alongside the chat panel's thinking placeholder.
 func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
-	agentID := strings.TrimSpace(progress.AgentID)
+	agentID := m.resolveAgentID(strings.TrimSpace(progress.AgentID))
 	vis := progress.Visibility
 	eventDebugLog().Info("agent_panel: stream_progress",
-		"agent_id", agentID,
+		"agent_id", progress.AgentID,
+		"panel_agent_id", agentID,
 		"visibility", vis,
 		"message", progress.Message,
 		"correlation_id", progress.CorrelationID,
@@ -518,7 +551,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 // when a stream finishes. This is the normal completion counterpart to
 // handleStreamProgress (which sets StatusThinking on progress events).
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
-	agentID := strings.TrimSpace(done.AgentID)
+	agentID := m.resolveAgentID(strings.TrimSpace(done.AgentID))
 	if agentID == "" {
 		return nil
 	}
@@ -531,14 +564,86 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	return nil
 }
 
+func (m *Model) canonicalizeAgentID(agentID string, ev msg.ActivityEventMsg) string {
+	if panelID := canonicalPipelineAgentID(
+		extractString(ev.Event.Data, "agent_type"),
+		extractPipelineID(ev.Event.Data),
+	); panelID != "" {
+		return panelID
+	}
+	return m.resolveAgentID(agentID)
+}
+
+func (m *Model) resolveAgentID(agentID string) string {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return ""
+	}
+	seen := make(map[string]struct{}, 4)
+	current := agentID
+	for current != "" {
+		if _, ok := seen[current]; ok {
+			break
+		}
+		seen[current] = struct{}{}
+		next, ok := m.aliases[current]
+		if !ok || strings.TrimSpace(next) == "" || next == current {
+			break
+		}
+		current = strings.TrimSpace(next)
+	}
+	return current
+}
+
+func (m *Model) rememberAgentAliases(canonicalID, rawAgentID string, ev msg.ActivityEventMsg) {
+	canonicalID = strings.TrimSpace(canonicalID)
+	rawAgentID = strings.TrimSpace(rawAgentID)
+	if canonicalID == "" {
+		return
+	}
+	m.aliases[canonicalID] = canonicalID
+	if rawAgentID != "" {
+		m.aliases[rawAgentID] = canonicalID
+	}
+	if runtimeID := extractString(ev.Event.Data, "runtime_agent_id"); runtimeID != "" {
+		m.aliases[runtimeID] = canonicalID
+	}
+}
+
+func (m *Model) rehomeDuplicateAgentRows(canonicalID string, ev msg.ActivityEventMsg) {
+	canonicalID = strings.TrimSpace(canonicalID)
+	if canonicalID == "" {
+		return
+	}
+	for _, candidateID := range []string{
+		strings.TrimSpace(ev.Event.AgentID),
+		extractString(ev.Event.Data, "runtime_agent_id"),
+	} {
+		candidateID = strings.TrimSpace(candidateID)
+		if candidateID == "" || candidateID == canonicalID {
+			continue
+		}
+		candidate := m.agents[candidateID]
+		if candidate == nil {
+			continue
+		}
+		if existing := m.agents[canonicalID]; existing != nil {
+			m.absorbDuplicateAgent(candidateID, canonicalID)
+			continue
+		}
+		m.promoteSeededAgent(candidate, canonicalID, ev)
+	}
+}
+
 // ensureAgent creates an agent entry if it does not exist, respecting the bound.
 // For standalone agents (one-per-type), re-keys the existing entry to the new
 // UUID instead of creating a duplicate. This handles two cases:
 //  1. Seeded placeholder (ID == AgentType) promoted on first activation.
 //  2. Re-activation after demotion: old UUID entry promoted to new UUID.
-func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
-	if _, exists := m.agents[agentID]; exists {
-		return
+func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
+	if existing, exists := m.agents[agentID]; exists {
+		m.reconcileExistingAgent(existing, ev)
+		return agentID
 	}
 
 	agentType := extractString(ev.Event.Data, "agent_type")
@@ -548,8 +653,11 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 	// matching entry and re-key it to the new UUID. This covers:
 	//  1. Seeded placeholder (ID == AgentType) promoted on first activation.
 	//  2. Re-activation after demotion: old UUID entry promoted to new UUID.
-	category := agentCategoryByType[agentType]
-	pipelineID := extractString(ev.Event.Data, "pipeline_id")
+	pipelineID := extractPipelineID(ev.Event.Data)
+	category := resolveAgentCategory(agentType, pipelineID)
+	if category != "pipeline" {
+		pipelineID = ""
+	}
 	if agentType != "" {
 		var existing *AgentState
 		switch category {
@@ -559,13 +667,12 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 			existing = m.findAgentByType(agentType)
 		}
 		if existing != nil {
-			m.promoteSeededAgent(existing, agentID, ev)
-			return
+			return m.promoteSeededAgent(existing, agentID, ev)
 		}
 	}
 
 	if len(m.agents) >= maxAgents {
-		return
+		return agentID
 	}
 
 	agentName := extractString(ev.Event.Data, "agent_name")
@@ -606,7 +713,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 	if pipelineID != "" {
 		pl, ok := m.pipelines[pipelineID]
 		if !ok && len(m.pipelines) < maxPipelines {
-			taskID := extractString(ev.Event.Data, "task_id")
+			taskID := extractPipelineTaskID(ev.Event.Data)
 			taskLabel := extractString(ev.Event.Data, "task_slug")
 			if taskID == "" {
 				taskID = pipelineID
@@ -629,7 +736,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 		}
 		if pl != nil && len(pl.Members) < maxAgents {
 			if pl.TaskID == "" {
-				pl.TaskID = extractString(ev.Event.Data, "task_id")
+				pl.TaskID = extractPipelineTaskID(ev.Event.Data)
 			}
 			if pl.TaskLabel == "" {
 				pl.TaskLabel = extractString(ev.Event.Data, "task_slug")
@@ -637,16 +744,64 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) {
 					pl.TaskLabel = pl.TaskID
 				}
 			}
-			pl.Members = append(pl.Members, agentID)
+			if !slices.Contains(pl.Members, agentID) {
+				pl.Members = append(pl.Members, agentID)
+			}
 		}
 	}
 
+	return agentID
+}
+
+func (m *Model) reconcileExistingAgent(agent *AgentState, ev msg.ActivityEventMsg) {
+	if agent == nil {
+		return
+	}
+	agentType := extractString(ev.Event.Data, "agent_type")
+	pipelineID := extractPipelineID(ev.Event.Data)
+	if agentType != "" {
+		agent.AgentType = agentType
+	}
+	category := resolveAgentCategory(agent.AgentType, pipelineID)
+	if category != "" {
+		agent.Category = category
+	}
+	if category == "pipeline" && pipelineID != "" {
+		agent.PipelineID = pipelineID
+	} else if category != "pipeline" {
+		agent.PipelineID = ""
+	}
+	if name := extractString(ev.Event.Data, "agent_name"); name != "" {
+		if agent.Name == "" || agent.Name == agent.ID || agent.Name == agent.AgentType {
+			agent.Name = name
+		}
+	}
+	if category == "pipeline" && pipelineID != "" {
+		m.ensurePipelineMembership(agent.ID, pipelineID, ev)
+	}
 }
 
 // promoteSeededAgent replaces a seeded placeholder entry with the real agent ID.
 // The existing stream is preserved; only the map key and order slice are updated.
-func (m *Model) promoteSeededAgent(placeholder *AgentState, realID string, ev msg.ActivityEventMsg) {
+func (m *Model) promoteSeededAgent(placeholder *AgentState, realID string, ev msg.ActivityEventMsg) string {
 	oldID := placeholder.ID
+	realID = strings.TrimSpace(realID)
+	if realID == "" {
+		m.reconcileExistingAgent(placeholder, ev)
+		return oldID
+	}
+
+	if oldID == realID {
+		m.reconcileExistingAgent(placeholder, ev)
+		return realID
+	}
+
+	if !isPlaceholderAgentID(oldID, placeholder.AgentType, placeholder.PipelineID) &&
+		placeholder.PipelineID != "" &&
+		isPlaceholderAgentID(realID, extractString(ev.Event.Data, "agent_type"), extractPipelineID(ev.Event.Data)) {
+		m.reconcileExistingAgent(placeholder, ev)
+		return oldID
+	}
 
 	// Update the agent state. Preserve the existing display name (e.g.
 	// "Tester") — only adopt the event name when the placeholder has none.
@@ -684,6 +839,162 @@ func (m *Model) promoteSeededAgent(placeholder *AgentState, realID string, ev ms
 		m.expanded = realID
 	}
 
+	for pipelineID, pl := range m.pipelines {
+		replaced := false
+		for i, id := range pl.Members {
+			if id == oldID {
+				pl.Members[i] = realID
+				replaced = true
+			}
+		}
+		if replaced {
+			m.dedupePipelineMembers(pipelineID)
+		}
+	}
+
+	m.reconcileExistingAgent(placeholder, ev)
+	m.rowsDirty = true
+	return realID
+}
+
+func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.ActivityEventMsg) {
+	pipelineID = strings.TrimSpace(pipelineID)
+	if pipelineID == "" {
+		return
+	}
+	pl, ok := m.pipelines[pipelineID]
+	if !ok {
+		if len(m.pipelines) >= maxPipelines {
+			return
+		}
+		taskID := extractPipelineTaskID(ev.Event.Data)
+		taskLabel := extractString(ev.Event.Data, "task_slug")
+		if taskID == "" {
+			taskID = pipelineID
+		}
+		if taskLabel == "" {
+			taskLabel = taskID
+		}
+		if taskLabel == "" {
+			taskLabel = pipelineShortID(pipelineID)
+		}
+		pl = &PipelineState{
+			ID:        pipelineID,
+			TaskID:    taskID,
+			TaskLabel: taskLabel,
+			Status:    "executing",
+			CreatedAt: time.Now(),
+		}
+		m.pipelines[pipelineID] = pl
+		m.pipelineOrder = append(m.pipelineOrder, pipelineID)
+	}
+	if pl.TaskID == "" {
+		pl.TaskID = extractPipelineTaskID(ev.Event.Data)
+	}
+	if pl.TaskLabel == "" {
+		pl.TaskLabel = extractString(ev.Event.Data, "task_slug")
+		if pl.TaskLabel == "" {
+			pl.TaskLabel = pl.TaskID
+		}
+	}
+	if !slices.Contains(pl.Members, agentID) {
+		pl.Members = append(pl.Members, agentID)
+	}
+}
+
+func (m *Model) dedupePipelineMembers(pipelineID string) {
+	pl := m.pipelines[pipelineID]
+	if pl == nil || len(pl.Members) < 2 {
+		return
+	}
+	seen := make(map[string]struct{}, len(pl.Members))
+	filtered := pl.Members[:0]
+	for _, id := range pl.Members {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		filtered = append(filtered, id)
+	}
+	pl.Members = filtered
+}
+
+func isPlaceholderAgentID(agentID, agentType, pipelineID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	agentType = strings.TrimSpace(agentType)
+	pipelineID = strings.TrimSpace(pipelineID)
+	if agentID == "" {
+		return false
+	}
+	if agentType != "" && agentID == agentType {
+		return true
+	}
+	return agentID == canonicalPipelineAgentID(agentType, pipelineID)
+}
+
+func (m *Model) absorbDuplicateAgent(srcID, dstID string) {
+	src := m.agents[srcID]
+	dst := m.agents[dstID]
+	if src == nil || dst == nil || srcID == dstID {
+		return
+	}
+	if dst.Name == "" {
+		dst.Name = src.Name
+	}
+	if dst.AgentType == "" {
+		dst.AgentType = src.AgentType
+	}
+	if dst.Category == "" {
+		dst.Category = src.Category
+	}
+	if dst.PipelineID == "" {
+		dst.PipelineID = src.PipelineID
+	}
+	if dst.TaskSummary == "" {
+		dst.TaskSummary = src.TaskSummary
+	}
+	if dst.ContextUsage == 0 {
+		dst.ContextUsage = src.ContextUsage
+	}
+	if dst.Status == StatusIdle && src.Status != StatusIdle {
+		dst.Status = src.Status
+	}
+	if srcStream := m.streams[srcID]; srcStream != nil {
+		dstStream := m.streams[dstID]
+		if dstStream == nil {
+			dstStream = NewAgentEventStream()
+			m.streams[dstID] = dstStream
+		}
+		for _, event := range srcStream.Last(srcStream.Len()) {
+			dstStream.Push(event)
+		}
+	}
+	delete(m.agents, srcID)
+	delete(m.streams, srcID)
+	delete(m.aliases, srcID)
+	for i, id := range m.order {
+		if id == srcID {
+			m.order = append(m.order[:i], m.order[i+1:]...)
+			break
+		}
+	}
+	for pipelineID, pl := range m.pipelines {
+		if pl == nil {
+			continue
+		}
+		for i, id := range pl.Members {
+			if id == srcID {
+				pl.Members[i] = dstID
+			}
+		}
+		m.dedupePipelineMembers(pipelineID)
+	}
+	if m.engagedID == srcID {
+		m.engagedID = dstID
+	}
+	if m.expanded == srcID {
+		m.expanded = dstID
+	}
 	m.rowsDirty = true
 }
 
@@ -711,6 +1022,7 @@ func (m *Model) findPipelineAgent(agentType, pipelineID string) *AgentState {
 // AgentTypeOf returns the agent type for a given canonical ID.
 // Returns "" when the ID is not known to the panel.
 func (m *Model) AgentTypeOf(agentID string) string {
+	agentID = m.resolveAgentID(agentID)
 	if a, ok := m.agents[agentID]; ok {
 		return a.AgentType
 	}
@@ -792,8 +1104,6 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 	}
 	if ps.TaskLabel != "" {
 		pl.TaskLabel = ps.TaskLabel
-	} else if pl.TaskLabel == "" {
-		pl.TaskLabel = pl.TaskID
 	}
 	pl.Status = ps.Status
 	pl.LoopCount = ps.LoopCount
@@ -859,7 +1169,11 @@ func (m *Model) DemoteAllActive() {
 // in an active status. Used on handoff to clear the routing agent (e.g. guide)
 // without disturbing other concurrent active agents.
 func (m *Model) DemoteAgent(agentID string) {
-	agent := m.findAgentByType(agentID)
+	agentID = m.resolveAgentID(agentID)
+	agent, ok := m.agents[agentID]
+	if !ok {
+		agent = m.findAgentByType(agentID)
+	}
 	if agent != nil && isActiveStatus(agent.Status) {
 		agent.Status = StatusIdle
 		m.rowsDirty = true
@@ -1123,6 +1437,10 @@ func (m *Model) rebuildRows() {
 	var standalone, knowledge []string
 	pipelineMembers := make(map[string][]string, len(m.pipelineOrder))
 	for _, plID := range m.pipelineOrder {
+		if pl := m.pipelines[plID]; pl != nil {
+			pipelineMembers[plID] = append([]string(nil), pl.Members...)
+			continue
+		}
 		pipelineMembers[plID] = nil
 	}
 
@@ -1133,7 +1451,7 @@ func (m *Model) rebuildRows() {
 		}
 		if agent.PipelineID != "" {
 			if _, ok := pipelineMembers[agent.PipelineID]; ok {
-				pipelineMembers[agent.PipelineID] = append(pipelineMembers[agent.PipelineID], agentID)
+				pipelineMembers[agent.PipelineID] = appendUniqueAgentID(pipelineMembers[agent.PipelineID], agentID)
 				continue
 			}
 		}
@@ -1148,6 +1466,9 @@ func (m *Model) rebuildRows() {
 	// Sort each section by canonical display order.
 	m.sortAgentsByDisplayOrder(standalone)
 	m.sortAgentsByDisplayOrder(knowledge)
+	for plID := range pipelineMembers {
+		m.sortAgentsByDisplayOrder(pipelineMembers[plID])
+	}
 
 	// Estimate capacity: sections + agents + pipelines + variants + spacers.
 	capacity := 4 + len(m.order) + len(m.pipelineOrder)*2 + len(m.variants)
@@ -1194,6 +1515,15 @@ func (m *Model) rebuildRows() {
 	}
 
 	m.rows = rows
+}
+
+func appendUniqueAgentID(ids []string, agentID string) []string {
+	for _, existing := range ids {
+		if existing == agentID {
+			return ids
+		}
+	}
+	return append(ids, agentID)
 }
 
 // variantsForPipeline returns variants belonging to the given pipeline in stable order.
@@ -1522,13 +1852,18 @@ func (m *Model) renderListView() string {
 	}
 
 	contentHeight := m.height
+	rowBudget := contentHeight
+	if contentHeight > 1 {
+		rowBudget = contentHeight - 1
+	}
 	lines := make([]string, 0, min(len(m.rows)*2, contentHeight))
 	var consumedLines int
 	lastContentIdx := -1 // track last rendered content row
-	footerRendered := false
+	start, end := m.visibleListWindow(rowBudget)
 
-	for i, row := range m.rows {
-		if consumedLines >= contentHeight {
+	for i := start; i < end; i++ {
+		row := m.rows[i]
+		if consumedLines >= rowBudget {
 			break
 		}
 		selected := i == m.selected
@@ -1578,26 +1913,67 @@ func (m *Model) renderListView() string {
 			consumedLines++
 			lastContentIdx = i
 		}
-
-		// Footer gets the next phase step after the last content row.
-		if consumedLines < contentHeight && m.isGroupEnd(i) {
-			footerPhase := elapsed - time.Duration(i+1)*groupFlowStep
-			footerColor := m.groupGradient.Sample(footerPhase)
-			lines = append(lines, renderSectionFooter(m.width, footerColor, m.theme))
-			consumedLines++
-			footerRendered = true
-		}
 	}
 
-	// If the list was truncated by height and the last visible content row
-	// didn't get a natural group-end footer, add a closing border.
-	if !footerRendered && lastContentIdx >= 0 && consumedLines < contentHeight {
+	if lastContentIdx >= 0 && consumedLines < contentHeight {
 		footerPhase := elapsed - time.Duration(lastContentIdx+1)*groupFlowStep
 		footerColor := m.groupGradient.Sample(footerPhase)
 		lines = append(lines, renderSectionFooter(m.width, footerColor, m.theme))
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func (m *Model) visibleListWindow(rowBudget int) (start, end int) {
+	total := len(m.rows)
+	if rowBudget <= 0 || total == 0 {
+		return 0, 0
+	}
+	if total <= rowBudget {
+		return 0, total
+	}
+
+	if !m.focused && m.shouldPreferPipelineViewport() {
+		start = total - rowBudget
+		if start < 0 {
+			start = 0
+		}
+		return start, total
+	}
+
+	start = clampIndex(m.selected-rowBudget/2, total)
+	maxStart := total - rowBudget
+	if start > maxStart {
+		start = maxStart
+	}
+	if start < 0 {
+		start = 0
+	}
+	end = start + rowBudget
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+func (m *Model) shouldPreferPipelineViewport() bool {
+	if len(m.pipelineOrder) == 0 {
+		return false
+	}
+	for _, pipelineID := range m.pipelineOrder {
+		if pl := m.pipelines[pipelineID]; pl != nil && !isTerminalPipelineStatus(pl.Status) {
+			return true
+		}
+	}
+	for _, agent := range m.agents {
+		if agent == nil || agent.PipelineID == "" {
+			continue
+		}
+		if isActiveStatus(agent.Status) || agent.Status == StatusWaiting {
+			return true
+		}
+	}
+	return false
 }
 
 // renderSectionHeader renders a section label. When activeColor is non-empty,
@@ -1638,17 +2014,6 @@ func renderTreePrefix(glyph string, activeColor lipgloss.Color, th *theme.Theme)
 // At 10fps with a 6-second cycle (8 colors, 750ms per segment), 250ms per
 // row produces a visible color shift across 3-5 rows without strobing.
 const groupFlowStep = 250 * time.Millisecond
-
-// isGroupEnd reports whether row at index i is the last content row in the
-// list. The Agents panel uses a single closing footer at the bottom.
-func (m *Model) isGroupEnd(i int) bool {
-	row := m.rows[i]
-	// Non-selectable rows (section headers, spacers) don't get footers.
-	if row.Kind.isNonSelectable() {
-		return false
-	}
-	return i+1 >= len(m.rows)
-}
 
 // sectionFooterFraction is the fraction of panel width used for the footer rule.
 // Derived from the design spec: 1/4 to 1/3. We use 1/4 as the minimum for compactness.
@@ -1861,6 +2226,17 @@ func extractString(data map[string]any, key string) string {
 		return ""
 	}
 	return s
+}
+
+func extractPipelineTaskID(data map[string]any) string {
+	return extractString(data, "task_id")
+}
+
+func extractPipelineID(data map[string]any) string {
+	if taskID := extractPipelineTaskID(data); taskID != "" {
+		return taskID
+	}
+	return extractString(data, "pipeline_id")
 }
 
 // pipelineShortID derives a short display label from a pipeline/DAG ID.

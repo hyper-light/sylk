@@ -26,6 +26,7 @@ func (a *Architect) registerCoreSkills() {
 	a.skills.Register(monitorExecutionSkill(a))
 	a.skills.Register(interruptHandlerSkill(a))
 	a.skills.Register(askUserQuestionSkill(a))
+	a.skills.Register(routeRequirementsResearchSkill(a))
 	a.skills.Register(readResearchPaperSkill(a))
 	a.skills.Register(readFileSkill(a))
 	a.skills.Register(globSkill(a))
@@ -105,8 +106,11 @@ func (a *Architect) advancePlan(
 	if plan == nil {
 		return fmt.Errorf("advancePlan: plan is nil")
 	}
-	if err := plan.SM().TransitionTo(targetStatus, plan); err != nil {
-		return fmt.Errorf("advancePlan: %w", err)
+	currentStatus := plan.SM().State()
+	if currentStatus != targetStatus {
+		if err := plan.SM().TransitionTo(targetStatus, plan); err != nil {
+			return fmt.Errorf("advancePlan: %w", err)
+		}
 	}
 	plan.Status = plan.SM().State()
 	plan.Epoch = plan.SM().Epoch()
@@ -121,6 +125,31 @@ func (a *Architect) advancePlan(
 	}
 	a.publishPlanStreamProgress(ctx, targetStatus)
 	return a.persistPlanState(plan)
+}
+
+func planPhaseRank(status PlanStatus) int {
+	switch status {
+	case PlanStatusPending:
+		return 0
+	case PlanStatusAnalyzing:
+		return 1
+	case PlanStatusConsulting, PlanStatusClarifying:
+		return 2
+	case PlanStatusDesigning:
+		return 3
+	case PlanStatusGenerating:
+		return 4
+	case PlanStatusOrchestrating:
+		return 5
+	case PlanStatusReady, PlanStatusExecuting, PlanStatusCompleted:
+		return 6
+	default:
+		return -1
+	}
+}
+
+func hasReachedPlanPhase(current, target PlanStatus) bool {
+	return planPhaseRank(current) >= planPhaseRank(target)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +180,20 @@ func planSkill(a *Architect) *skills.Skill {
 		"analyze": func(ctx context.Context, p *planInput) (any, error) {
 			if strings.TrimSpace(p.Query) == "" {
 				return nil, fmt.Errorf("query is required for action=analyze")
+			}
+			if plan, ok := a.resolveProtocolPlan(p.PlanID); ok &&
+				hasReachedPlanPhase(plan.SM().State(), PlanStatusAnalyzing) &&
+				plan.Requirements != nil {
+				return map[string]any{
+					"requirements": plan.Requirements,
+					"analysis": map[string]any{
+						"goal_count":       len(plan.Requirements.Goals),
+						"constraint_count": len(plan.Requirements.Constraints),
+						"scope":            plan.Requirements.Scope,
+					},
+					"plan_status": plan.SM().State().String(),
+					"reused":      true,
+				}, nil
 			}
 			reqParams := map[string]any{}
 			if p.Scope != "" {
@@ -189,6 +232,19 @@ func planSkill(a *Architect) *skills.Skill {
 			requirements := p.Requirements
 			var codebasePatterns *CodebasePatterns
 			if hasPlan {
+				if hasReachedPlanPhase(plan.SM().State(), PlanStatusDesigning) &&
+					plan.Architecture != nil {
+					return map[string]any{
+						"architecture": plan.Architecture,
+						"summary": map[string]any{
+							"component_count": len(plan.Architecture.Components),
+							"interface_count": len(plan.Architecture.Interfaces),
+							"pattern_count":   len(plan.Architecture.Patterns),
+						},
+						"plan_status": plan.SM().State().String(),
+						"reused":      true,
+					}, nil
+				}
 				// In protocol mode, use the plan's accumulated state.
 				requirements = plan.Requirements
 				codebasePatterns = plan.CodebasePatterns
@@ -234,6 +290,28 @@ func planSkill(a *Architect) *skills.Skill {
 				AllowParallel:    p.AllowParallel,
 			}
 			if hasPlan {
+				if hasReachedPlanPhase(plan.SM().State(), PlanStatusGenerating) &&
+					len(plan.Tasks) > 0 && plan.Workflow != nil {
+					totalTokens := 0
+					complexityCounts := map[string]int{}
+					for _, task := range plan.Tasks {
+						totalTokens += task.EstimatedTokens
+						complexityCounts[task.Complexity.String()]++
+					}
+					return map[string]any{
+						"tasks": plan.Tasks,
+						"summary": map[string]any{
+							"task_count":        len(plan.Tasks),
+							"total_tokens":      totalTokens,
+							"complexity_counts": complexityCounts,
+						},
+						"plan_status":  plan.SM().State().String(),
+						"layer_count":  planLayerCount(plan),
+						"task_summary": firstTaskName(plan),
+						"next_action":  generateTasksNextAction(a.config.AutoApprove),
+						"reused":       true,
+					}, nil
+				}
 				architecture = plan.Architecture
 				if plan.Constraints != nil {
 					constraints = plan.Constraints

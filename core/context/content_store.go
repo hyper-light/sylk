@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -383,7 +384,7 @@ func (s *UniversalContentStore) hybridSearch(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		bleveResults, bleveErr = s.searchBleve(ctx, query, limit*2)
+		bleveResults, bleveErr = s.searchBleve(ctx, query, filters, limit*2)
 	}()
 	go func() {
 		defer wg.Done()
@@ -401,6 +402,7 @@ func (s *UniversalContentStore) hybridSearch(
 func (s *UniversalContentStore) searchBleve(
 	ctx context.Context,
 	query string,
+	filters *SearchFilters,
 	limit int,
 ) ([]*ContentEntry, error) {
 	req := &search.SearchRequest{
@@ -413,26 +415,61 @@ func (s *UniversalContentStore) searchBleve(
 		return nil, err
 	}
 
-	return s.bleveResultsToEntries(result), nil
+	return s.bleveResultsToEntries(result, filters)
 }
 
-func (s *UniversalContentStore) bleveResultsToEntries(result *search.SearchResult) []*ContentEntry {
+func (s *UniversalContentStore) bleveResultsToEntries(result *search.SearchResult, filters *SearchFilters) ([]*ContentEntry, error) {
 	entries := make([]*ContentEntry, 0, len(result.Documents))
-	for _, doc := range result.Documents {
-		entry := s.documentToEntry(&doc.Document, doc.Score)
-		entries = append(entries, entry)
+	if len(result.Documents) == 0 {
+		return entries, nil
 	}
-	return entries
+
+	orderedIDs := make([]string, 0, len(result.Documents))
+	for _, doc := range result.Documents {
+		orderedIDs = append(orderedIDs, doc.Document.ID)
+	}
+
+	hydrated, err := s.queryEntriesByIDs(orderedIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	byID := make(map[string]*ContentEntry, len(hydrated))
+	for _, entry := range hydrated {
+		byID[entry.ID] = entry
+	}
+
+	for _, doc := range result.Documents {
+		if entry, ok := byID[doc.Document.ID]; ok {
+			if !entryMatchesFilters(entry, filters) {
+				continue
+			}
+			entries = append(entries, cloneEntryWithScore(entry, doc.Score))
+			continue
+		}
+		entry := s.documentToEntry(&doc.Document, doc.Score)
+		if entryMatchesFilters(entry, filters) {
+			entries = append(entries, entry)
+		}
+	}
+	return entries, nil
 }
 
 func (s *UniversalContentStore) documentToEntry(doc *search.Document, score float64) *ContentEntry {
-	return &ContentEntry{
+	entry := &ContentEntry{
 		ID:          doc.ID,
 		Content:     doc.Content,
 		ContentType: ContentTypeCodeFile,
 		Keywords:    doc.Symbols,
-		Metadata:    map[string]string{"score": fmt.Sprintf("%.4f", score)},
 	}
+	if doc.Path != "" {
+		entry.RelatedFiles = []string{doc.Path}
+	}
+	entry.Metadata = map[string]string{"score": fmt.Sprintf("%.4f", score)}
+	if doc.Language != "" {
+		entry.Metadata["language"] = doc.Language
+	}
+	return entry
 }
 
 func (s *UniversalContentStore) searchDB(
@@ -476,7 +513,11 @@ func (s *UniversalContentStore) applyFilters(
 
 	query, args = applySessionFilter(query, args, filters)
 	query, args = applyAgentFilter(query, args, filters)
+	query, args = applyAgentTypesFilter(query, args, filters)
+	query, args = applyContentTypesFilter(query, args, filters)
 	query, args = applyTurnRangeFilter(query, args, filters)
+	query, args = applyTimeRangeFilter(query, args, filters)
+	query, args = applyKeywordFilter(query, args, filters)
 	return query, args
 }
 
@@ -496,10 +537,81 @@ func applyAgentFilter(query string, args []any, filters *SearchFilters) (string,
 	return query, args
 }
 
+func applyAgentTypesFilter(query string, args []any, filters *SearchFilters) (string, []any) {
+	if filters == nil || len(filters.AgentTypes) == 0 {
+		return query, args
+	}
+
+	placeholders := make([]string, 0, len(filters.AgentTypes))
+	for _, agentType := range filters.AgentTypes {
+		agentType = strings.TrimSpace(agentType)
+		if agentType == "" {
+			continue
+		}
+		placeholders = append(placeholders, "?")
+		args = append(args, agentType)
+	}
+	if len(placeholders) == 0 {
+		return query, args
+	}
+	query += " AND agent_type IN (" + strings.Join(placeholders, ",") + ")"
+	return query, args
+}
+
+func applyContentTypesFilter(query string, args []any, filters *SearchFilters) (string, []any) {
+	if filters == nil || len(filters.ContentTypes) == 0 {
+		return query, args
+	}
+
+	placeholders := make([]string, 0, len(filters.ContentTypes))
+	for _, contentType := range filters.ContentTypes {
+		if strings.TrimSpace(string(contentType)) == "" {
+			continue
+		}
+		placeholders = append(placeholders, "?")
+		args = append(args, string(contentType))
+	}
+	if len(placeholders) == 0 {
+		return query, args
+	}
+	query += " AND content_type IN (" + strings.Join(placeholders, ",") + ")"
+	return query, args
+}
+
 func applyTurnRangeFilter(query string, args []any, filters *SearchFilters) (string, []any) {
 	if filters.HasTurnRange() {
 		query += " AND turn_number >= ? AND turn_number <= ?"
 		args = append(args, filters.TurnRange[0], filters.TurnRange[1])
+	}
+	return query, args
+}
+
+func applyTimeRangeFilter(query string, args []any, filters *SearchFilters) (string, []any) {
+	if filters == nil {
+		return query, args
+	}
+	if !filters.TimeRange[0].IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, filters.TimeRange[0].Unix())
+	}
+	if !filters.TimeRange[1].IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, filters.TimeRange[1].Unix())
+	}
+	return query, args
+}
+
+func applyKeywordFilter(query string, args []any, filters *SearchFilters) (string, []any) {
+	if filters == nil || len(filters.Keywords) == 0 {
+		return query, args
+	}
+	for _, keyword := range filters.Keywords {
+		keyword = strings.TrimSpace(keyword)
+		if keyword == "" {
+			continue
+		}
+		query += " AND keywords LIKE ?"
+		args = append(args, "%"+keyword+"%")
 	}
 	return query, args
 }
@@ -624,6 +736,77 @@ func (s *UniversalContentStore) sortByScoreDesc(scored []scoredEntry) {
 			}
 		}
 	}
+}
+
+func cloneEntryWithScore(entry *ContentEntry, score float64) *ContentEntry {
+	if entry == nil {
+		return nil
+	}
+	clone := entry.Clone()
+	if clone.Metadata == nil {
+		clone.Metadata = make(map[string]string)
+	}
+	clone.Metadata["score"] = fmt.Sprintf("%.4f", score)
+	return clone
+}
+
+func entryMatchesFilters(entry *ContentEntry, filters *SearchFilters) bool {
+	if filters == nil || entry == nil {
+		return true
+	}
+	if filters.HasSessionFilter() && entry.SessionID != filters.SessionID {
+		return false
+	}
+	if filters.HasAgentFilter() && entry.AgentID != filters.AgentID {
+		return false
+	}
+	if len(filters.AgentTypes) > 0 && !containsStringFilter(filters.AgentTypes, entry.AgentType) {
+		return false
+	}
+	if len(filters.ContentTypes) > 0 && !containsContentTypeFilter(filters.ContentTypes, entry.ContentType) {
+		return false
+	}
+	if filters.HasTurnRange() && (entry.TurnNumber < filters.TurnRange[0] || entry.TurnNumber > filters.TurnRange[1]) {
+		return false
+	}
+	if filters.HasTimeRange() {
+		if !filters.TimeRange[0].IsZero() && entry.Timestamp.Before(filters.TimeRange[0]) {
+			return false
+		}
+		if !filters.TimeRange[1].IsZero() && entry.Timestamp.After(filters.TimeRange[1]) {
+			return false
+		}
+	}
+	if len(filters.Keywords) > 0 {
+		for _, keyword := range filters.Keywords {
+			if !containsStringFilter(entry.Keywords, keyword) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func containsStringFilter(values []string, target string) bool {
+	target = strings.TrimSpace(strings.ToLower(target))
+	if target == "" {
+		return true
+	}
+	for _, value := range values {
+		if strings.TrimSpace(strings.ToLower(value)) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsContentTypeFilter(values []ContentType, target ContentType) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // GetByIDs retrieves entries by their IDs.

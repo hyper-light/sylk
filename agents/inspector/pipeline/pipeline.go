@@ -103,9 +103,13 @@ type PipelineInspector struct {
 // New creates a new PipelineInspector instance.
 func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter) (*PipelineInspector, error) {
 	cfg = applyConfigDefaults(cfg)
+	agentID := strings.TrimSpace(cfg.AgentID)
+	if agentID == "" {
+		agentID = uuid.New().String()[:8]
+	}
 
 	pi := &PipelineInspector{
-		id:                uuid.New().String()[:8],
+		id:                agentID,
 		config:            cfg,
 		logger:            slog.Default().With("agent", "inspector-pipeline"),
 		provider:          provider,
@@ -608,7 +612,14 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	defer cancel()
 
 	ctx := reqCtx
-	ctx = shared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentShared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentShared.WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type":  "inspector-pipeline",
+		"agent_name":  "Inspector",
+		"pipeline_id": pi.pipelineID,
+		"task_id":     pi.pipelineID,
+		"task_slug":   pi.pipelineSlug,
+	})
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	startTime := time.Now()
 

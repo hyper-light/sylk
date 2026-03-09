@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/core/domain"
@@ -208,18 +209,20 @@ func knowledgeQuerySkill(a *Archivalist) *skills.Skill {
 		BoolParam("apply_memory", "Apply ACT-R memory weighting", false).
 		BoolParam("filter_retrieval", "Filter by retrieval probability", false).
 		StringParam("agent_type", "Source agent for feedback", false).
+		ArrayParam("result_ids", "Retrieved entry IDs to attribute feedback against", "string", false).
 		BoolParam("was_useful", "Feedback signal", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p struct {
-				Action          string `json:"action"`
-				Text            string `json:"text"`
-				Domain          string `json:"domain"`
-				Limit           int    `json:"limit"`
-				Explore         bool   `json:"explore"`
-				ApplyMemory     *bool  `json:"apply_memory"`
-				FilterRetrieval bool   `json:"filter_retrieval"`
-				AgentType       string `json:"agent_type"`
-				WasUseful       bool   `json:"was_useful"`
+				Action          string   `json:"action"`
+				Text            string   `json:"text"`
+				Domain          string   `json:"domain"`
+				Limit           int      `json:"limit"`
+				Explore         bool     `json:"explore"`
+				ApplyMemory     *bool    `json:"apply_memory"`
+				FilterRetrieval bool     `json:"filter_retrieval"`
+				AgentType       string   `json:"agent_type"`
+				ResultIDs       []string `json:"result_ids"`
+				WasUseful       bool     `json:"was_useful"`
 			}
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, err
@@ -229,7 +232,7 @@ func knowledgeQuerySkill(a *Archivalist) *skills.Skill {
 			case "search":
 				return a.knowledgeSearch(ctx, p.Text, p.Domain, p.Limit, p.Explore, p.ApplyMemory, p.FilterRetrieval)
 			case "search_feedback":
-				return a.knowledgeSearchFeedback(p.AgentType, p.WasUseful)
+				return a.knowledgeSearchFeedback(ctx, p.AgentType, p.ResultIDs, p.WasUseful)
 			case "readiness":
 				return a.knowledgeReadiness()
 			default:
@@ -279,12 +282,36 @@ func (a *Archivalist) knowledgeSearch(
 	}, nil
 }
 
-func (a *Archivalist) knowledgeSearchFeedback(agentType string, wasUseful bool) (any, error) {
+func (a *Archivalist) knowledgeSearchFeedback(ctx context.Context, agentType string, resultIDs []string, wasUseful bool) (any, error) {
 	if a.crossAgentWeights == nil {
 		return nil, errCrossAgentWeightsUnavailable
 	}
-	a.crossAgentWeights.RecordOutcome(agentType, wasUseful)
-	return map[string]any{"recorded": true}, nil
+
+	recordedFor := make([]string, 0, len(resultIDs)+1)
+	for _, resultID := range resultIDs {
+		entry, ok := a.GetEntry(ctx, resultID)
+		if !ok || entry == nil {
+			continue
+		}
+		origin := originAgentType(entry)
+		if origin == "" {
+			continue
+		}
+		a.crossAgentWeights.RecordOutcome(origin, wasUseful)
+		recordedFor = append(recordedFor, origin)
+	}
+
+	if strings.TrimSpace(agentType) != "" {
+		a.crossAgentWeights.RecordOutcome(agentType, wasUseful)
+		recordedFor = append(recordedFor, agentType)
+	}
+
+	recordedFor = uniqueSearchTerms(recordedFor)
+	return map[string]any{
+		"recorded":        len(recordedFor) > 0,
+		"recorded_for":    recordedFor,
+		"used_result_ids": len(resultIDs) > 0,
+	}, nil
 }
 
 func (a *Archivalist) knowledgeReadiness() (any, error) {

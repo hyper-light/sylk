@@ -120,6 +120,12 @@ const (
 	decorCadenceActive
 )
 
+type slotBorderMeta struct {
+	focused bool
+	w       int
+	h       int
+}
+
 // shutdownGrace is the grace period for goroutine shutdown.
 // Derived from: once contexts are cancelled, goroutines exit within ms.
 const shutdownGrace = 1 * time.Second
@@ -512,6 +518,12 @@ type AppModel struct {
 	comp      compositor.Compositor
 	viewDirty bool
 
+	// Border-only redraw reuse for focused main slots. When only the animated
+	// border changes, cached inner content can be reused instead of rerunning
+	// the underlying panel render path.
+	slotBodyCache       map[compositor.SlotID]string
+	slotBorderOnlyDirty map[compositor.SlotID]bool
+
 	// Compositor dirty-detection state.
 	prevFocusGrp  compositor.SlotID // Border group of previous focus.
 	prevOverlay   overlayState      // Detect overlay transitions.
@@ -664,6 +676,11 @@ type AppModel struct {
 
 type streamUsageEntry struct {
 	AgentID           string
+	AgentType         string
+	AgentName         string
+	PipelineID        string
+	TaskID            string
+	TaskSlug          string
 	Tokens            int // Estimated/real output tokens.
 	InputTokens       int // Real input tokens from the provider (context window occupancy).
 	StartedAt         time.Time
@@ -680,6 +697,11 @@ type streamedResponseState struct {
 type activeStreamEntry struct {
 	CorrelationID string
 	AgentID       string
+	AgentType     string
+	AgentName     string
+	PipelineID    string
+	TaskID        string
+	TaskSlug      string
 	SteeringPace  string // "auto", "step", "paused" — tracks current pace for UI display.
 	StartedAt     time.Time
 }
@@ -1276,12 +1298,12 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.PipelineStateMsg:
 		comp, cmd := m.agentPanel.Update(typed)
 		m.agentPanel = comp.(*agentpkg.Model)
-		m.comp.MarkDirty(compositor.SlotLeft)
+		m.markSlotDirty(compositor.SlotLeft)
 		return m, cmd
 	case msg.VariantStateMsg:
 		comp, cmd := m.agentPanel.Update(typed)
 		m.agentPanel = comp.(*agentpkg.Model)
-		m.comp.MarkDirty(compositor.SlotLeft)
+		m.markSlotDirty(compositor.SlotLeft)
 		return m, cmd
 	case msg.OpenEditorMsg:
 		return m, m.handleOpenEditor(typed)
@@ -2492,22 +2514,22 @@ func (m *AppModel) View() string {
 }
 
 // FrameData exposes structured frame metadata for the most recently rendered
-// composited view. Overlay modes fall back to Bubble Tea's string renderer.
-func (m *AppModel) FrameData() tea.FrameData {
+// composited view. Overlay modes fall back to a zero-value snapshot.
+func (m *AppModel) FrameData() compositor.FrameSnapshot {
 	if !m.ready {
-		return tea.FrameData{}
+		return compositor.FrameSnapshot{}
 	}
 	switch m.overlay {
 	case overlayNone:
 		snapshot := m.comp.Snapshot()
-		return tea.FrameData{
+		return compositor.FrameSnapshot{
 			Lines:     snapshot.Lines,
 			DirtyRows: snapshot.DirtyRows,
 			Version:   snapshot.Version,
 			Full:      snapshot.Full,
 		}
 	default:
-		return tea.FrameData{}
+		return compositor.FrameSnapshot{}
 	}
 }
 
@@ -2760,7 +2782,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Try to advance — entries targeting free agents dispatch immediately.
 			return m, m.tryAdvanceQueue()
 		}
-		m.comp.MarkDirty(compositor.SlotQueue)
+		m.markSlotDirty(compositor.SlotQueue)
 		m.viewDirty = true
 		return m, nil
 	}
@@ -2770,7 +2792,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(pending) > 0 {
 			m.promptQueue.Cancel(pending[0].ID)
 			m.recalcLayout()
-			m.comp.MarkDirty(compositor.SlotQueue)
+			m.markSlotDirty(compositor.SlotQueue)
 			m.viewDirty = true
 			m.statusBar.SetFlash("Cancelled queued prompt")
 		}
@@ -2781,7 +2803,7 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		n := m.promptQueue.CancelAll()
 		if n > 0 {
 			m.recalcLayout()
-			m.comp.MarkDirty(compositor.SlotQueue)
+			m.markSlotDirty(compositor.SlotQueue)
 			m.viewDirty = true
 			m.statusBar.SetFlash(fmt.Sprintf("Cancelled %d queued prompts", n))
 		}
@@ -3394,7 +3416,7 @@ func (m *AppModel) deactivateLogin() {
 	m.loginPanel.Deactivate()
 	m.overlay = overlayNone
 	m.viewDirty = true
-	m.comp.InvalidateAll()
+	m.invalidateRenderedSlots()
 }
 
 func (m *AppModel) cancelLoginFlow() {
@@ -4309,22 +4331,72 @@ func interruptAgentDisplayName(agentID string) string {
 // registerStream adds a stream to the active set. Idempotent — no-op if
 // the correlationID is already registered. Multiple agents can stream
 // concurrently (e.g. architect + orchestrator).
-func (m *AppModel) registerStream(correlationID, agentID string) {
-	correlationID = strings.TrimSpace(correlationID)
+func logicalStreamPipelineID(pipelineID, taskID string) string {
+	if trimmed := strings.TrimSpace(taskID); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(pipelineID)
+}
+
+func streamPanelAgentID(agentID, agentType, pipelineID string) string {
+	agentType = strings.TrimSpace(agentType)
+	pipelineID = strings.TrimSpace(pipelineID)
+	if pipelineID != "" {
+		switch agentType {
+		case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+			return pipelineID + ":" + agentType
+		}
+	}
+	return normalizeAgentID(firstNonEmpty(agentID, agentType))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func cloneActiveStreamEntry(entry *activeStreamEntry) *activeStreamEntry {
+	if entry == nil {
+		return nil
+	}
+	cloned := *entry
+	return &cloned
+}
+
+func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
+	correlationID := strings.TrimSpace(start.CorrelationID)
 	if correlationID == "" {
-		return
+		return false
 	}
 	if m.activeStreams == nil {
 		m.activeStreams = make(map[string]*activeStreamEntry)
 	}
-	if _, exists := m.activeStreams[correlationID]; exists {
-		return
+	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
+	canonicalAgentID := streamPanelAgentID(start.AgentID, start.AgentType, logicalPipelineID)
+	if existing, exists := m.activeStreams[correlationID]; exists {
+		existing.AgentID = firstNonEmpty(canonicalAgentID, existing.AgentID)
+		existing.AgentType = firstNonEmpty(start.AgentType, existing.AgentType)
+		existing.AgentName = firstNonEmpty(start.AgentName, existing.AgentName)
+		existing.PipelineID = firstNonEmpty(logicalPipelineID, existing.PipelineID)
+		existing.TaskID = firstNonEmpty(start.TaskID, existing.TaskID)
+		existing.TaskSlug = firstNonEmpty(start.TaskSlug, existing.TaskSlug)
+		return false
 	}
 	m.activeStreams[correlationID] = &activeStreamEntry{
 		CorrelationID: correlationID,
-		AgentID:       normalizeAgentID(agentID),
+		AgentID:       canonicalAgentID,
+		AgentType:     strings.TrimSpace(start.AgentType),
+		AgentName:     strings.TrimSpace(start.AgentName),
+		PipelineID:    logicalPipelineID,
+		TaskID:        strings.TrimSpace(start.TaskID),
+		TaskSlug:      strings.TrimSpace(start.TaskSlug),
 		StartedAt:     time.Now(),
 	}
+	return true
 }
 
 // shouldRenderStreamEvent returns true when the correlationID belongs to
@@ -4484,7 +4556,13 @@ func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 	}
 	// Register the new stream for the rerouted agent.
 	if reroute.CorrelationID != "" {
-		m.registerStream(reroute.CorrelationID, normalizeAgentID(reroute.ToAgentID))
+		m.registerStream(msg.StreamStartMsg{
+			SessionID:     reroute.SessionID,
+			CorrelationID: reroute.CorrelationID,
+			AgentID:       normalizeAgentID(reroute.ToAgentID),
+			AgentType:     normalizeAgentID(reroute.ToAgentID),
+			AgentName:     reroute.ToAgentID,
+		})
 	}
 	// Demote the handing-off agent (e.g. guide) so it no longer shows as active.
 	if reroute.FromAgentID != "" && m.agentPanel != nil {
@@ -4623,7 +4701,7 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	}
 	if tabFlashChanged {
 		changed = true
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 	}
 
 	// Refresh ring hint during streaming (activity badge changes) at decor rate.
@@ -4634,33 +4712,33 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 
 	// Queue strip gradient animation (only when non-empty and not paused).
 	if !m.promptQueue.IsEmpty() && !m.promptQueue.IsPaused() {
-		m.comp.MarkDirty(compositor.SlotQueue)
+		m.markSlotDirty(compositor.SlotQueue)
 		changed = true
 	}
 
 	// Commit tree loading spinner (time-based, redraws each decor tick).
 	if m.commitTree != nil && m.commitTree.NeedsDecorTick() {
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
 
 	// Diff view loading spinner (frame-counter, advanced each decor tick).
 	if m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick() {
 		m.diffView.AdvanceSpinner()
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
 
 	// Merge diff view loading spinner.
 	if m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick() {
 		m.mergeDiffView.AdvanceSpinner()
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
 
 	// Conflict view loading spinner (time-based, redraws each decor tick).
 	if m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick() {
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
 
@@ -4668,9 +4746,9 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	if m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick() {
 		m.gitPanel.MarkViewDirty()
 		if m.layout.Mode() == layout.FourColumn {
-			m.comp.MarkDirty(compositor.SlotCenterLeft)
+			m.markSlotDirty(compositor.SlotCenterLeft)
 		} else {
-			m.comp.MarkDirty(compositor.SlotLeft)
+			m.markSlotDirty(compositor.SlotLeft)
 		}
 		changed = true
 	}
@@ -4678,14 +4756,14 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	// Plan viewer spinner animation.
 	if m.planView != nil && m.planView.NeedsDecorTick() {
 		m.planView.MarkViewDirty()
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
 
 	// Agent panel shimmer + dot animation.
 	agentActive := m.hasActiveAgent()
 	if m.agentPanel != nil && m.agentPanel.AdvanceDecor(tick.Time) {
-		m.comp.MarkDirty(compositor.SlotLeft)
+		m.markSlotDirty(compositor.SlotLeft)
 		changed = true
 	}
 
@@ -4695,16 +4773,23 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	}
 	if agentActive && m.sessionPanel != nil {
 		m.sessionPanel.AdvanceDotFrame()
-		m.comp.MarkDirty(compositor.SlotLeft)
+		m.markSlotDirty(compositor.SlotLeft)
 		changed = true
 	}
 
 	// Swap focus ring gradient: full prismatic when active agents, subdued when idle.
 	m.focusGradient = m.currentFocusGradient()
 
+	if m.input != nil && m.focusGradient != nil && m.input.CanScroll() {
+		if m.input.SetScrollIndicatorColor(m.focusGradient.Sample(now.Sub(m.focusRingStart))) {
+			m.markSlotDirty(compositor.SlotInput)
+			changed = true
+		}
+	}
+
 	// Focus ring border shimmer — only the currently focused slot participates.
 	if m.focusBorderFrameChanged(now) {
-		m.comp.MarkDirty(m.focusBorderGroup())
+		m.markSlotBorderDirty(m.focusBorderGroup())
 		changed = true
 	}
 
@@ -4733,12 +4818,12 @@ func (m *AppModel) handlePlanUpdate(update msg.PlanUpdateMsg) tea.Cmd {
 		comp, cmd := m.planView.Update(update)
 		m.planView = comp.(*planview.Model)
 		if cmd != nil {
-			m.comp.MarkDirty(compositor.SlotCenter)
+			m.markSlotDirty(compositor.SlotCenter)
 			m.viewDirty = true
 			return cmd
 		}
 	}
-	m.comp.MarkDirty(compositor.SlotCenter)
+	m.markSlotDirty(compositor.SlotCenter)
 	m.viewDirty = true
 	return nil
 }
@@ -4749,7 +4834,7 @@ func (m *AppModel) handlePlanViewToggle() tea.Cmd {
 	}
 	comp, cmd := m.planView.Update(msg.PlanViewToggleMsg{})
 	m.planView = comp.(*planview.Model)
-	m.comp.MarkDirty(compositor.SlotRight)
+	m.markSlotDirty(compositor.SlotRight)
 	m.viewDirty = true
 	return cmd
 }
@@ -5685,8 +5770,8 @@ func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd 
 		return nil
 	}
 	m.recordStreamStart(start.CorrelationID)
-	m.trackStreamStart(start.CorrelationID, start.AgentID)
-	m.registerStream(start.CorrelationID, start.AgentID)
+	m.trackStreamStart(start)
+	m.registerStream(start)
 	newAgent := normalizeAgentID(start.AgentID)
 	// When a non-guide agent starts streaming, the guide's routing work is done.
 	// Demote it so it no longer shows as active in the agent panel.
@@ -5700,7 +5785,7 @@ func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd 
 	if m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
 		m.statusBar.SetFlash(m.engagedAgentID + " -> " + newAgent)
 	}
-	m.publishStreamStartActivity(start.AgentID)
+	m.publishStreamStartActivity(start)
 	m.statusBar.SetTokenPhase(status.PhaseOutput)
 	return m.propagate(start)
 }
@@ -5725,7 +5810,21 @@ func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd 
 }
 
 func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg) tea.Cmd {
-	m.registerStream(progress.CorrelationID, progress.AgentID)
+	start := msg.StreamStartMsg{
+		SessionID:     progress.SessionID,
+		CorrelationID: progress.CorrelationID,
+		AgentID:       progress.AgentID,
+		AgentType:     progress.AgentType,
+		AgentName:     progress.AgentName,
+		PipelineID:    progress.PipelineID,
+		TaskID:        progress.TaskID,
+		TaskSlug:      progress.TaskSlug,
+	}
+	m.trackStreamStart(start)
+	created := m.registerStream(start)
+	if created {
+		m.publishStreamStartActivity(start)
+	}
 	progress.Message = redactSecrets(progress.Message)
 	if !m.shouldRenderStreamEvent(progress.CorrelationID) {
 		return nil
@@ -5849,14 +5948,26 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 	return m.propagate(streamErr)
 }
 
-func (m *AppModel) trackStreamStart(correlationID, agentID string) {
+func (m *AppModel) trackStreamStart(start msg.StreamStartMsg) {
+	correlationID := strings.TrimSpace(start.CorrelationID)
 	if correlationID == "" {
 		return
 	}
-	m.streamUsage[correlationID] = streamUsageEntry{
-		AgentID:   normalizeAgentID(agentID),
-		StartedAt: time.Now(),
+	entry, ok := m.streamUsage[correlationID]
+	if !ok {
+		entry = streamUsageEntry{StartedAt: time.Now()}
 	}
+	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
+	entry.AgentID = streamPanelAgentID(start.AgentID, start.AgentType, logicalPipelineID)
+	entry.AgentType = strings.TrimSpace(start.AgentType)
+	entry.AgentName = strings.TrimSpace(start.AgentName)
+	entry.PipelineID = logicalPipelineID
+	entry.TaskID = strings.TrimSpace(start.TaskID)
+	entry.TaskSlug = strings.TrimSpace(start.TaskSlug)
+	if entry.StartedAt.IsZero() {
+		entry.StartedAt = time.Now()
+	}
+	m.streamUsage[correlationID] = entry
 }
 
 func (m *AppModel) trackStreamChunk(correlationID, text string) {
@@ -6030,7 +6141,7 @@ func (m *AppModel) finalizeStreamUsage(correlationID string, success bool, summa
 	} else {
 		contextUsage = m.bumpAgentContextUsage(state.AgentID, state.Tokens+guideResponseOverheadTokens)
 	}
-	m.publishStreamActivity(state.AgentID, success, summary, contextUsage)
+	m.publishStreamActivity(correlationID, success, summary, contextUsage)
 
 	if m.statusBar != nil && len(m.streamUsage) == 0 {
 		m.statusBar.SetTokenPhase(status.PhaseIdle)
@@ -6117,11 +6228,72 @@ func redactedError(err error) error {
 	return redact.Error(err)
 }
 
-func (m *AppModel) publishStreamActivity(agentID string, success bool, summary string, contextUsage float64) {
+func (m *AppModel) streamIdentityForCorrelation(correlationID string) (string, string, string, map[string]any) {
+	var (
+		agentID    string
+		agentName  string
+		agentType  string
+		pipelineID string
+		taskID     string
+		taskSlug   string
+		runtimeID  string
+	)
+	if entry, ok := m.activeStreams[strings.TrimSpace(correlationID)]; ok && entry != nil {
+		agentID = entry.AgentID
+		agentName = entry.AgentName
+		agentType = entry.AgentType
+		pipelineID = entry.PipelineID
+		taskID = entry.TaskID
+		taskSlug = entry.TaskSlug
+	}
+	if usage, ok := m.streamUsage[strings.TrimSpace(correlationID)]; ok {
+		agentID = firstNonEmpty(agentID, usage.AgentID)
+		agentName = firstNonEmpty(agentName, usage.AgentName)
+		agentType = firstNonEmpty(agentType, usage.AgentType)
+		pipelineID = firstNonEmpty(pipelineID, usage.PipelineID)
+		taskID = firstNonEmpty(taskID, usage.TaskID)
+		taskSlug = firstNonEmpty(taskSlug, usage.TaskSlug)
+	}
+	pipelineID = logicalStreamPipelineID(pipelineID, taskID)
+	canonicalID := streamPanelAgentID(agentID, agentType, pipelineID)
+	if canonicalID == "" {
+		canonicalID = normalizeAgentID(firstNonEmpty(agentID, agentType, guideAgentID))
+	}
+	if strings.TrimSpace(agentName) == "" {
+		agentName = canonicalID
+	}
+	if strings.TrimSpace(agentType) == "" {
+		if m.agentPanel != nil {
+			agentType = m.agentPanel.AgentTypeOf(canonicalID)
+		}
+	}
+	if strings.TrimSpace(agentType) == "" {
+		agentType = strings.ToLower(strings.TrimSpace(agentName))
+	}
+	data := map[string]any{
+		"agent_type": agentType,
+		"agent_name": agentName,
+	}
+	if pipelineID = strings.TrimSpace(pipelineID); pipelineID != "" {
+		data["pipeline_id"] = pipelineID
+	}
+	if taskID = strings.TrimSpace(taskID); taskID != "" {
+		data["task_id"] = taskID
+	}
+	if taskSlug = strings.TrimSpace(taskSlug); taskSlug != "" {
+		data["task_slug"] = taskSlug
+	}
+	if runtimeID = strings.TrimSpace(agentID); runtimeID != "" && runtimeID != canonicalID {
+		data["runtime_agent_id"] = runtimeID
+	}
+	return canonicalID, agentName, agentType, data
+}
+
+func (m *AppModel) publishStreamActivity(correlationID string, success bool, summary string, contextUsage float64) {
 	if m.deps.ActivityPub == nil {
 		return
 	}
-	id, name, agentType := m.resolveAgentIdentity(agentID, "")
+	id, name, agentType, data := m.streamIdentityForCorrelation(correlationID)
 	eventType := events.EventTypeLLMResponse
 	outcome := events.OutcomeSuccess
 	content := "Streaming response complete"
@@ -6133,6 +6305,9 @@ func (m *AppModel) publishStreamActivity(agentID string, success bool, summary s
 			content = summarizeActivityContent(trimmed)
 		}
 	}
+	data["agent_name"] = name
+	data["agent_type"] = agentType
+	data["context_usage"] = contextUsage
 	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: eventType,
@@ -6140,30 +6315,44 @@ func (m *AppModel) publishStreamActivity(agentID string, success bool, summary s
 		AgentID:   id,
 		Content:   content,
 		Outcome:   outcome,
-		Data: map[string]any{
-			"agent_type":    agentType,
-			"agent_name":    name,
-			"context_usage": contextUsage,
-		},
+		Data:      data,
 	})
 }
 
-func (m *AppModel) publishStreamStartActivity(agentID string) {
+func (m *AppModel) publishStreamStartActivity(start msg.StreamStartMsg) {
 	if m.deps.ActivityPub == nil {
 		return
 	}
-	id, name, agentType := m.resolveAgentIdentity(agentID, "")
+	pipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
+	canonicalID := streamPanelAgentID(start.AgentID, start.AgentType, pipelineID)
+	panelAgentType := ""
+	if m.agentPanel != nil {
+		panelAgentType = m.agentPanel.AgentTypeOf(canonicalID)
+	}
+	data := map[string]any{
+		"agent_type": firstNonEmpty(start.AgentType, panelAgentType),
+		"agent_name": firstNonEmpty(start.AgentName, canonicalID),
+	}
+	if pipelineID != "" {
+		data["pipeline_id"] = pipelineID
+	}
+	if taskID := strings.TrimSpace(start.TaskID); taskID != "" {
+		data["task_id"] = taskID
+	}
+	if taskSlug := strings.TrimSpace(start.TaskSlug); taskSlug != "" {
+		data["task_slug"] = taskSlug
+	}
+	if runtimeID := strings.TrimSpace(start.AgentID); runtimeID != "" && runtimeID != canonicalID {
+		data["runtime_agent_id"] = runtimeID
+	}
 	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: events.EventTypeLLMRequest,
 		Timestamp: time.Now(),
-		AgentID:   id,
+		AgentID:   canonicalID,
 		Content:   "Streaming response started",
 		Outcome:   events.OutcomePending,
-		Data: map[string]any{
-			"agent_type": agentType,
-			"agent_name": name,
-		},
+		Data:      data,
 	})
 }
 
@@ -6197,13 +6386,18 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		source = chat.SourceError
 		content = redactSecrets(r.Err.Error())
 	}
+	streamEntry := cloneActiveStreamEntry(m.activeStreams[strings.TrimSpace(r.CorrelationID)])
 	m.unregisterStream(r.CorrelationID)
 	added := estimateGuideTokens(content)
-	contextUsage := m.bumpAgentContextUsage(r.AgentID, added+guideResponseOverheadTokens)
+	contextAgentID := r.AgentID
+	if streamEntry != nil {
+		contextAgentID = firstNonEmpty(streamEntry.AgentID, contextAgentID)
+	}
+	contextUsage := m.bumpAgentContextUsage(contextAgentID, added+guideResponseOverheadTokens)
 	m.totalCompletionTokens += added
 	m.updateTokenDisplay()
 	m.statusBar.SetTokenPhase(status.PhaseIdle)
-	m.publishResponseActivity(r, source, content, contextUsage)
+	m.publishResponseActivity(r, source, content, contextUsage, streamEntry)
 	agentDisplay := r.AgentID
 	if r.AgentName != "" {
 		agentDisplay = r.AgentName
@@ -6226,16 +6420,60 @@ func (m *AppModel) publishResponseActivity(
 	source chat.ChatSource,
 	content string,
 	contextUsage float64,
+	streamEntry *activeStreamEntry,
 ) {
 	if m.deps.ActivityPub == nil {
 		return
 	}
-	agentID, agentName, agentType := m.resolveAgentIdentity(r.AgentID, r.AgentName)
+	streamAgentID := ""
+	streamAgentType := ""
+	streamAgentName := ""
+	streamPipelineID := ""
+	streamTaskID := ""
+	streamTaskSlug := ""
+	if streamEntry != nil {
+		streamAgentID = streamEntry.AgentID
+		streamAgentType = streamEntry.AgentType
+		streamAgentName = streamEntry.AgentName
+		streamPipelineID = streamEntry.PipelineID
+		streamTaskID = streamEntry.TaskID
+		streamTaskSlug = streamEntry.TaskSlug
+	}
+	streamPipelineID = logicalStreamPipelineID(streamPipelineID, streamTaskID)
+	agentID := streamPanelAgentID(firstNonEmpty(r.AgentID, streamAgentID), streamAgentType, streamPipelineID)
+	agentName := firstNonEmpty(streamAgentName, r.AgentName)
+	panelAgentType := ""
+	if m.agentPanel != nil {
+		panelAgentType = m.agentPanel.AgentTypeOf(agentID)
+	}
+	agentType := firstNonEmpty(streamAgentType, panelAgentType)
+	if agentID == "" || agentID == guideAgentID {
+		agentID, agentName, agentType = m.resolveAgentIdentity(r.AgentID, r.AgentName)
+	}
 	outcome := events.OutcomeSuccess
 	eventType := events.EventTypeLLMResponse
 	if source == chat.SourceError {
 		outcome = events.OutcomeFailure
 		eventType = events.EventTypeAgentError
+	}
+	data := map[string]any{
+		"agent_type":    agentType,
+		"agent_name":    firstNonEmpty(agentName, agentID),
+		"context_usage": contextUsage,
+	}
+	if streamEntry != nil {
+		if pipelineID := strings.TrimSpace(streamPipelineID); pipelineID != "" {
+			data["pipeline_id"] = pipelineID
+		}
+		if taskID := strings.TrimSpace(streamTaskID); taskID != "" {
+			data["task_id"] = taskID
+		}
+		if taskSlug := strings.TrimSpace(streamTaskSlug); taskSlug != "" {
+			data["task_slug"] = taskSlug
+		}
+		if runtimeID := strings.TrimSpace(r.AgentID); runtimeID != "" && runtimeID != agentID {
+			data["runtime_agent_id"] = runtimeID
+		}
 	}
 	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
@@ -6244,11 +6482,7 @@ func (m *AppModel) publishResponseActivity(
 		AgentID:   agentID,
 		Content:   summarizeActivityContent(content),
 		Outcome:   outcome,
-		Data: map[string]any{
-			"agent_type":    agentType,
-			"agent_name":    agentName,
-			"context_usage": contextUsage,
-		},
+		Data:      data,
 	})
 }
 
@@ -12694,6 +12928,12 @@ func (m *AppModel) recalcLayout() {
 
 	// Full invalidation — section + per-slot caches cleared.
 	m.comp.SetStructure(m.compositorColumns(), mainHeight, queueH, inputH, statusBarHeight)
+	if m.slotBodyCache != nil {
+		clear(m.slotBodyCache)
+	}
+	if m.slotBorderOnlyDirty != nil {
+		clear(m.slotBorderOnlyDirty)
+	}
 	m.prevInputH = inputH
 }
 
@@ -12745,6 +12985,12 @@ func (m *AppModel) handleInputGrowth(newInputH int) {
 		if slot != chatSlot {
 			m.comp.TruncateSlot(slot, mainHeight)
 		}
+	}
+	if m.slotBodyCache != nil {
+		clear(m.slotBodyCache)
+	}
+	if m.slotBorderOnlyDirty != nil {
+		clear(m.slotBorderOnlyDirty)
 	}
 
 	m.prevInputH = newInputH
@@ -13201,26 +13447,85 @@ func (m *AppModel) focusBorderGroup() compositor.SlotID {
 	}
 }
 
+func (m *AppModel) ensureSlotCaches() {
+	if m.slotBodyCache == nil {
+		m.slotBodyCache = make(map[compositor.SlotID]string)
+	}
+	if m.slotBorderOnlyDirty == nil {
+		m.slotBorderOnlyDirty = make(map[compositor.SlotID]bool)
+	}
+}
+
+func (m *AppModel) invalidateRenderedSlots() {
+	m.comp.InvalidateAll()
+	if m.slotBodyCache != nil {
+		clear(m.slotBodyCache)
+	}
+	if m.slotBorderOnlyDirty != nil {
+		clear(m.slotBorderOnlyDirty)
+	}
+}
+
+func (m *AppModel) markSlotDirty(id compositor.SlotID) {
+	if id == 0 {
+		return
+	}
+	if m.slotBorderOnlyDirty != nil {
+		delete(m.slotBorderOnlyDirty, id)
+	}
+	m.comp.MarkDirty(id)
+}
+
+func (m *AppModel) markSlotBorderDirty(id compositor.SlotID) {
+	if id == 0 {
+		return
+	}
+	m.ensureSlotCaches()
+	m.slotBorderOnlyDirty[id] = true
+	m.comp.MarkDirty(id)
+}
+
+func (m *AppModel) consumeBorderOnlySlot(id compositor.SlotID) bool {
+	if m.slotBorderOnlyDirty == nil || !m.slotBorderOnlyDirty[id] {
+		return false
+	}
+	delete(m.slotBorderOnlyDirty, id)
+	return true
+}
+
+func (m *AppModel) cacheSlotBody(id compositor.SlotID, content string) {
+	m.ensureSlotCaches()
+	m.slotBodyCache[id] = content
+}
+
+func (m *AppModel) cachedSlotBody(id compositor.SlotID) (string, bool) {
+	if m.slotBodyCache == nil {
+		return "", false
+	}
+	content, ok := m.slotBodyCache[id]
+	return content, ok
+}
+
 // detectDirtySlots checks component dirty state and state transitions,
 // marking the appropriate compositor slots for re-rendering.
 func (m *AppModel) detectDirtySlots() {
 	// Overlay transitions: full invalidation.
 	if m.overlay != m.prevOverlay {
-		m.comp.InvalidateAll()
+		m.invalidateRenderedSlots()
 		m.prevOverlay = m.overlay
 		return
 	}
 
 	// Edit mode transitions: code panel changes completely.
 	if m.viewMode == ViewEdit != m.prevEditMode {
-		m.comp.InvalidateAll()
+		m.invalidateRenderedSlots()
 		m.prevEditMode = m.viewMode == ViewEdit
 		return
 	}
 
 	// Git mode transitions: panels swap completely.
 	if (m.viewMode == ViewGit) != (m.prevGitMode == ViewGit) {
-		m.comp.InvalidateAll()
+		m.invalidateRenderedSlots()
 		m.prevGitMode = m.viewMode
 		return
 	}
@@ -13242,36 +13547,36 @@ func (m *AppModel) detectDirtySlots() {
 	// Focus border group change: mark old + new groups dirty.
 	curGrp := m.focusBorderGroup()
 	if curGrp != m.prevFocusGrp {
-		m.comp.MarkDirty(m.prevFocusGrp)
-		m.comp.MarkDirty(curGrp)
+		m.markSlotDirty(m.prevFocusGrp)
+		m.markSlotDirty(curGrp)
 		m.prevFocusGrp = curGrp
 	}
 	if curGrad := m.currentFocusGradient(); curGrad != m.focusGradient {
 		m.focusGradient = curGrad
-		m.comp.MarkDirty(curGrp)
+		m.markSlotDirty(curGrp)
 	}
 
 	// Chord state change: the chord hint overlay can appear on any content
 	// slot depending on layout mode, so invalidate all slots.
 	if m.chord != m.prevChord {
-		m.comp.InvalidateAll()
+		m.invalidateRenderedSlots()
 		m.prevChord = m.chord
 	}
 
 	// Ring cycling: mark affected slot dirty.
 	if m.leftRing.index != m.prevLeftRing {
-		m.comp.MarkDirty(compositor.SlotLeft)
+		m.markSlotDirty(compositor.SlotLeft)
 		m.prevLeftRing = m.leftRing.index
 	}
 	if m.rightRing.index != m.prevRightRing {
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 		m.prevRightRing = m.rightRing.index
 	}
 
 	// Tab hover state change: close icon highlight, markdown tooltip.
 	hoverKey := [5]int{m.tabHoverClose, int(m.tabHoverPane), m.previewTabHoverClose, m.mdPreviewTabHoverClose, m.mdTooltipTab}
 	if hoverKey != m.prevHoverKey {
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 		m.prevHoverKey = hoverKey
 	}
 
@@ -13279,31 +13584,31 @@ func (m *AppModel) detectDirtySlots() {
 	if m.chat.ViewDirty() {
 		switch m.layout.Mode() {
 		case layout.TwoColumn:
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		case layout.SingleColumn:
-			m.comp.MarkDirty(compositor.SlotLeft)
+			m.markSlotDirty(compositor.SlotLeft)
 		default:
-			m.comp.MarkDirty(compositor.SlotCenter)
+			m.markSlotDirty(compositor.SlotCenter)
 		}
 	}
 	if m.fileTree.ViewDirty() {
 		if m.layout.Mode() == layout.FourColumn {
-			m.comp.MarkDirty(compositor.SlotCenterLeft)
+			m.markSlotDirty(compositor.SlotCenterLeft)
 		} else {
-			m.comp.MarkDirty(compositor.SlotLeft)
+			m.markSlotDirty(compositor.SlotLeft)
 		}
 	}
 	if m.input.ViewDirty() {
-		m.comp.MarkDirty(compositor.SlotInput)
+		m.markSlotDirty(compositor.SlotInput)
 	}
 	if m.statusBar.ViewDirty() {
-		m.comp.MarkDirty(compositor.SlotStatus)
+		m.markSlotDirty(compositor.SlotStatus)
 	}
 
 	// Editor dirty check.
 	if m.viewMode == ViewEdit {
 		if ps := m.paneEditors[m.focusedPane]; ps != nil && ps.editor.ViewDirty() {
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		}
 	}
 
@@ -13315,26 +13620,26 @@ func (m *AppModel) detectDirtySlots() {
 		m.syncStagedFiles()
 		if m.gitPanel.ViewDirty() {
 			if m.layout.Mode() == layout.FourColumn {
-				m.comp.MarkDirty(compositor.SlotCenterLeft)
+				m.markSlotDirty(compositor.SlotCenterLeft)
 			} else {
-				m.comp.MarkDirty(compositor.SlotLeft)
+				m.markSlotDirty(compositor.SlotLeft)
 			}
 		}
 		if m.commitTree.ViewDirty() {
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		}
 	}
 
 	// Diff view dirty check.
 	if m.diffViewActive && m.diffView != nil {
 		if m.diffView.ViewDirty() {
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		}
 		if m.diffView.FileListDirty() {
 			if m.layout.Mode() == layout.FourColumn {
-				m.comp.MarkDirty(compositor.SlotCenterLeft)
+				m.markSlotDirty(compositor.SlotCenterLeft)
 			} else {
-				m.comp.MarkDirty(compositor.SlotLeft)
+				m.markSlotDirty(compositor.SlotLeft)
 			}
 		}
 	}
@@ -13342,13 +13647,13 @@ func (m *AppModel) detectDirtySlots() {
 	// Conflict view dirty check.
 	if m.conflictViewActive && m.conflictView != nil {
 		if m.conflictView.ViewDirty() {
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		}
 		if m.conflictView.FileListDirty() {
 			if m.layout.Mode() == layout.FourColumn {
-				m.comp.MarkDirty(compositor.SlotCenterLeft)
+				m.markSlotDirty(compositor.SlotCenterLeft)
 			} else {
-				m.comp.MarkDirty(compositor.SlotLeft)
+				m.markSlotDirty(compositor.SlotLeft)
 			}
 		}
 	}
@@ -13356,13 +13661,13 @@ func (m *AppModel) detectDirtySlots() {
 	// Merge diff view dirty check.
 	if m.mergeDiffViewActive && m.mergeDiffView != nil {
 		if m.mergeDiffView.ViewDirty() {
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		}
 		if m.mergeDiffView.FileListDirty() {
 			if m.layout.Mode() == layout.FourColumn {
-				m.comp.MarkDirty(compositor.SlotCenterLeft)
+				m.markSlotDirty(compositor.SlotCenterLeft)
 			} else {
-				m.comp.MarkDirty(compositor.SlotLeft)
+				m.markSlotDirty(compositor.SlotLeft)
 			}
 		}
 	}
@@ -13370,27 +13675,27 @@ func (m *AppModel) detectDirtySlots() {
 	// Preview panel: no view cache, so mark dirty whenever it is focused
 	// (cursor blink changes its output on every blink cycle).
 	if m.hasPreview() && m.isPreviewFocused() {
-		m.comp.MarkDirty(compositor.SlotRight)
+		m.markSlotDirty(compositor.SlotRight)
 	}
 
 	// Blink phase changed: mark the slot(s) owning the active cursor.
 	if m.blinkDirty {
 		m.blinkDirty = false
 		if m.viewMode == ViewEdit {
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		}
 		if m.focus.Current() == component.FocusInput {
-			m.comp.MarkDirty(compositor.SlotInput)
+			m.markSlotDirty(compositor.SlotInput)
 		}
 		if m.fileTree.NeedsBlink() {
 			if m.layout.Mode() == layout.FourColumn {
-				m.comp.MarkDirty(compositor.SlotCenterLeft)
+				m.markSlotDirty(compositor.SlotCenterLeft)
 			} else {
-				m.comp.MarkDirty(compositor.SlotLeft)
+				m.markSlotDirty(compositor.SlotLeft)
 			}
 		}
 		if m.hasPreview() && m.isPreviewFocused() {
-			m.comp.MarkDirty(compositor.SlotRight)
+			m.markSlotDirty(compositor.SlotRight)
 		}
 	}
 
@@ -13409,15 +13714,15 @@ func (m *AppModel) renderDirtySlots() {
 	}
 	if m.comp.IsDirty(compositor.SlotCenterLeft) {
 		m.comp.SetSlotLines(compositor.SlotCenterLeft,
-			compositor.SplitLines(m.renderSlotCenterLeft(th)))
+			compositor.SplitLines(m.renderCacheableSlot(compositor.SlotCenterLeft, th)))
 	}
 	if m.comp.IsDirty(compositor.SlotCenter) {
 		m.comp.SetSlotLines(compositor.SlotCenter,
-			compositor.SplitLines(m.renderSlotCenter(th)))
+			compositor.SplitLines(m.renderCacheableSlot(compositor.SlotCenter, th)))
 	}
 	if m.comp.IsDirty(compositor.SlotRight) {
 		m.comp.SetSlotLines(compositor.SlotRight,
-			compositor.SplitLines(m.renderSlotRight(th)))
+			compositor.SplitLines(m.renderCacheableSlot(compositor.SlotRight, th)))
 	}
 	if m.comp.IsDirty(compositor.SlotQueue) {
 		m.comp.SetSlotLines(compositor.SlotQueue,
@@ -13431,6 +13736,167 @@ func (m *AppModel) renderDirtySlots() {
 		m.comp.SetSlotLines(compositor.SlotStatus,
 			compositor.SplitLines(m.statusBar.View()))
 	}
+}
+
+func (m *AppModel) renderCacheableSlot(id compositor.SlotID, th *theme.Theme) string {
+	meta, ok := m.cacheableSlotBorderMeta(id)
+	if !ok {
+		return m.renderNonCacheableSlot(id, th)
+	}
+	if m.consumeBorderOnlySlot(id) {
+		if content, ok := m.cachedSlotBody(id); ok {
+			return m.renderBordered(content, meta.focused, meta.w, meta.h, th)
+		}
+	}
+	content, ok := m.cacheableSlotContent(id, th)
+	if !ok {
+		return m.renderNonCacheableSlot(id, th)
+	}
+	m.cacheSlotBody(id, content)
+	return m.renderBordered(content, meta.focused, meta.w, meta.h, th)
+}
+
+func (m *AppModel) renderNonCacheableSlot(id compositor.SlotID, th *theme.Theme) string {
+	switch id {
+	case compositor.SlotCenterLeft:
+		return m.renderSlotCenterLeft(th)
+	case compositor.SlotCenter:
+		return m.renderSlotCenter(th)
+	case compositor.SlotRight:
+		return m.renderSlotRight(th)
+	default:
+		return ""
+	}
+}
+
+func (m *AppModel) cacheableSlotContent(id compositor.SlotID, th *theme.Theme) (string, bool) {
+	switch id {
+	case compositor.SlotCenterLeft:
+		return m.slotCenterLeftContent(th), true
+	case compositor.SlotCenter:
+		return m.slotCenterContent(th), true
+	case compositor.SlotRight:
+		return m.slotRightContent(th), true
+	default:
+		return "", false
+	}
+}
+
+func (m *AppModel) cacheableSlotBorderMeta(id compositor.SlotID) (slotBorderMeta, bool) {
+	switch id {
+	case compositor.SlotCenterLeft:
+		return m.slotCenterLeftBorderMeta(), true
+	case compositor.SlotCenter:
+		return m.slotCenterBorderMeta(), true
+	case compositor.SlotRight:
+		return m.slotRightBorderMeta(), true
+	default:
+		return slotBorderMeta{}, false
+	}
+}
+
+func (m *AppModel) slotCenterContent(th *theme.Theme) string {
+	return m.overlayChordHint(m.chat.View(), component.FocusChat, th)
+}
+
+func (m *AppModel) slotCenterBorderMeta() slotBorderMeta {
+	w, h := m.layout.GetPanelSize(component.FocusChat)
+	return slotBorderMeta{
+		focused: m.focus.IsFocused(component.FocusChat),
+		w:       w,
+		h:       h,
+	}
+}
+
+func (m *AppModel) slotCenterLeftContent(th *theme.Theme) string {
+	switch {
+	case m.conflictViewActive && m.conflictView != nil:
+		return m.conflictView.FileListView(m.cursorVisible)
+	case m.mergeDiffViewActive && m.mergeDiffView != nil:
+		return m.mergeDiffView.FileListView(m.cursorVisible)
+	case m.diffViewActive && m.diffView != nil:
+		return m.diffView.FileListView(m.cursorVisible)
+	case m.viewMode == ViewGit:
+		return m.gitPanel.View(m.cursorVisible)
+	default:
+		return m.fileTree.View(m.cursorVisible)
+	}
+}
+
+func (m *AppModel) slotCenterLeftBorderMeta() slotBorderMeta {
+	w, h := m.layout.GetPanelSize(component.FocusFileTree)
+	focused := m.focus.Current() == component.FocusFileTree
+	switch {
+	case m.conflictViewActive && m.conflictView != nil:
+		focused = m.focus.Current() == component.FocusConflictFileList
+	case m.mergeDiffViewActive && m.mergeDiffView != nil:
+		focused = m.focus.Current() == component.FocusMergeDiffFileList
+	case m.diffViewActive && m.diffView != nil:
+		focused = m.focus.Current() == component.FocusDiffFileList
+	case m.viewMode == ViewGit:
+		focused = m.focus.Current() == component.FocusGitPanel
+	}
+	return slotBorderMeta{focused: focused, w: w, h: h}
+}
+
+func (m *AppModel) slotRightContent(th *theme.Theme) string {
+	switch {
+	case m.conflictViewActive && m.conflictView != nil:
+		return m.overlayBlockedChord(m.overlayChordHint(m.conflictView.View(m.cursorVisible), component.FocusCodeViewer, th))
+	case m.mergeDiffViewActive && m.mergeDiffView != nil:
+		return m.overlayBlockedChord(m.overlayChordHint(m.mergeDiffView.View(m.cursorVisible), component.FocusCodeViewer, th))
+	case m.diffViewActive:
+		return m.overlayBlockedChord(m.overlayChordHint(m.diffView.View(m.cursorVisible), component.FocusCodeViewer, th))
+	}
+	if m.layout.Mode() == layout.TwoColumn {
+		right := m.rightRing.current()
+		switch right {
+		case component.FocusCodeViewer:
+			return m.overlayChordHint(m.codePanelView(), component.FocusCodeViewer, th)
+		case component.FocusCommitTree:
+			return m.overlayBlockedChord(m.overlayChordHint(m.commitTree.View(m.cursorVisible), component.FocusCodeViewer, th))
+		default:
+			return m.overlayChordHint(m.panelContent(right), right, th)
+		}
+	}
+	if m.viewMode == ViewGit {
+		return m.overlayBlockedChord(m.overlayChordHint(m.commitTree.View(m.cursorVisible), component.FocusCodeViewer, th))
+	}
+	return m.overlayChordHint(m.codePanelView(), component.FocusCodeViewer, th)
+}
+
+func (m *AppModel) slotRightBorderMeta() slotBorderMeta {
+	switch {
+	case m.conflictViewActive && m.conflictView != nil:
+		w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+		return slotBorderMeta{focused: m.focus.Current() == component.FocusConflictView, w: w, h: h}
+	case m.mergeDiffViewActive && m.mergeDiffView != nil:
+		w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+		return slotBorderMeta{focused: m.isMergeDiffPaneFocused(), w: w, h: h}
+	case m.diffViewActive:
+		w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+		return slotBorderMeta{focused: m.isDiffPaneFocused(), w: w, h: h}
+	}
+	if m.layout.Mode() == layout.TwoColumn {
+		right := m.rightRing.current()
+		switch right {
+		case component.FocusCodeViewer:
+			w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+			return slotBorderMeta{focused: m.isCodePanelFocused(), w: w, h: h}
+		case component.FocusCommitTree:
+			w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+			return slotBorderMeta{focused: m.focus.Current() == component.FocusCommitTree, w: w, h: h}
+		default:
+			w, h := m.layout.GetPanelSize(right)
+			return slotBorderMeta{focused: m.focus.IsFocused(right), w: w, h: h}
+		}
+	}
+	if m.viewMode == ViewGit {
+		w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+		return slotBorderMeta{focused: m.focus.Current() == component.FocusCommitTree, w: w, h: h}
+	}
+	w, h := m.layout.GetPanelSize(component.FocusCodeViewer)
+	return slotBorderMeta{focused: m.isCodePanelFocused(), w: w, h: h}
 }
 
 // applyFocusRingShimmer sets per-character gradient border rendering on the
@@ -14318,7 +14784,13 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 		SessionID:      submit.SessionID,
 		Timestamp:      time.Now(),
 	}
-	m.registerStream(req.CorrelationID, thinkingAgentType(targetAgent))
+	m.registerStream(msg.StreamStartMsg{
+		SessionID:     submit.SessionID,
+		CorrelationID: req.CorrelationID,
+		AgentID:       thinkingAgentType(targetAgent),
+		AgentType:     thinkingAgentType(targetAgent),
+		AgentName:     thinkingAgentType(targetAgent),
+	})
 
 	if !m.guideRequestAvailable() {
 		return func() tea.Msg {

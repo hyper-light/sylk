@@ -316,7 +316,7 @@ func (pi *PipelineInspector) runValidationTool(
 			Name:      toolName,
 			Arguments: string(rawArgs),
 		},
-		AgentID:         pi.id,
+		AgentID:         pi.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: pi.toolRuntime().CapabilityScope(),
 	})

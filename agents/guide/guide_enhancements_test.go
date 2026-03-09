@@ -131,10 +131,14 @@ func TestGuide_ExplicitGuideTargetRespondsToSource(t *testing.T) {
 		_ = g.Stop()
 	}()
 
-	respCh := make(chan *guide.Message, 8)
+	respCh := make(chan *guide.RouteResponse, 1)
 	sub, err := bus.Subscribe(guide.TopicResponses("tui", "tui"), func(m *guide.Message) error {
+		resp, ok := m.GetRouteResponse()
+		if !ok || resp == nil {
+			return nil
+		}
 		select {
-		case respCh <- m:
+		case respCh <- resp:
 		default:
 		}
 		return nil
@@ -157,11 +161,7 @@ func TestGuide_ExplicitGuideTargetRespondsToSource(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case busMsg := <-respCh:
-			resp, ok := busMsg.GetRouteResponse()
-			if !ok {
-				continue
-			}
+		case resp := <-respCh:
 			assert.Equal(t, req.CorrelationID, resp.CorrelationID)
 			assert.True(t, resp.Success)
 			text, ok := resp.Data.(string)
@@ -203,10 +203,14 @@ func TestGuide_ExplicitGuideTarget_UsesConfiguredSelfResponder(t *testing.T) {
 		_ = g.Stop()
 	}()
 
-	respCh := make(chan *guide.Message, 8)
+	respCh := make(chan *guide.RouteResponse, 1)
 	sub, err := bus.Subscribe(guide.TopicResponses("tui", "tui"), func(m *guide.Message) error {
+		resp, ok := m.GetRouteResponse()
+		if !ok || resp == nil {
+			return nil
+		}
 		select {
-		case respCh <- m:
+		case respCh <- resp:
 		default:
 		}
 		return nil
@@ -229,11 +233,7 @@ func TestGuide_ExplicitGuideTarget_UsesConfiguredSelfResponder(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case busMsg := <-respCh:
-			resp, ok := busMsg.GetRouteResponse()
-			if !ok {
-				continue
-			}
+		case resp := <-respCh:
 			text, ok := resp.Data.(string)
 			require.True(t, ok, "expected string response data")
 			assert.Equal(t, "real guide response", text)

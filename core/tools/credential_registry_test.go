@@ -163,7 +163,6 @@ func TestToolCredentialRegistry_DefaultTools(t *testing.T) {
 	expectedWithCredentials := map[string][]string{
 		"generate_embeddings": {"openai"},
 		"create_pr":           {"github"},
-		"web_search":          {"serpapi"},
 	}
 
 	for tool, expectedCreds := range expectedWithCredentials {
@@ -193,6 +192,7 @@ func TestToolCredentialRegistry_DefaultNoCredentials(t *testing.T) {
 	registry := NewToolCredentialRegistry()
 
 	noCredentialTools := []string{
+		"web_search",
 		"read_file", "write_file", "list_directory",
 		"execute_command", "grep_search", "find_files",
 		"git_status", "git_diff", "git_commit",
@@ -249,7 +249,7 @@ func TestGlobalFunctions(t *testing.T) {
 		t.Error("global GetRequiredCredentials should work")
 	}
 
-	if !RequiresCredentials("web_search") {
-		t.Error("global RequiresCredentials should work")
+	if RequiresCredentials("web_search") {
+		t.Error("web_search should not require a separate credential")
 	}
 }

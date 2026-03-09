@@ -117,13 +117,31 @@ func (b *PipelineBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 
 // toPipelineStateMsg converts a core PipelineEvent to a UI message.
 func toPipelineStateMsg(evt tdd.PipelineEvent) msg.PipelineStateMsg {
+	pipelineID := evt.TaskID
+	if pipelineID == "" {
+		pipelineID = evt.PipelineID
+	}
+	if pipelineID == "" {
+		pipelineID = evt.RuntimePipelineID
+	}
 	return msg.PipelineStateMsg{
-		PipelineID: evt.PipelineID,
-		TaskID:     evt.TaskID,
-		TaskLabel:  evt.TaskID,
+		PipelineID: pipelineID,
+		TaskID:     firstNonEmpty(evt.TaskID, pipelineID),
+		TaskLabel:  evt.TaskSlug,
 		Status:     string(evt.NewStatus),
 		LoopCount:  evt.LoopCount,
+		MaxLoops:   evt.MaxLoops,
+		WorkerType: string(evt.WorkerType),
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // toVariantStateMsg converts a core VariantEvent to a UI message.

@@ -106,6 +106,7 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 	pipeline := &Pipeline{
 		ID:                id,
 		TaskID:            cfg.TaskID,
+		TaskSlug:          cfg.TaskSlug,
 		SessionID:         cfg.SessionID,
 		DAGNodeID:         cfg.DAGNodeID,
 		WorkerType:        cfg.WorkerType,

@@ -15,12 +15,15 @@ func TestModelsForAgent(t *testing.T) {
 		wantLen   int
 	}{
 		{"guide", 2},
-		{"engineer", 2},
+		{"engineer", 1},
 		{"designer", 2},
 		{"inspector", 2},
 		{"tester", 2},
 		{"orchestrator", 2},
 		{"architect", 2},
+		{"librarian", 2},
+		{"archivalist", 2},
+		{"academic", 2},
 	}
 	for _, tc := range cases {
 		models := modelsForAgent(tc.agentType)
@@ -277,10 +280,10 @@ func TestSelectorDisabledForSingleModel(t *testing.T) {
 	m.SetSize(80, 20)
 	m.SetFocused(true)
 
-	// Librarian has no models in the model table.
-	pushAgentActivity(m, "librarian", "librarian")
+	// Engineer currently exposes a single model, so selector mode stays disabled.
+	pushAgentActivity(m, "engineer", "engineer")
 
-	// Selector should not enter for agents without models.
+	// Selector should not enter for agents without multiple models.
 	m.enterSelector()
 	if m.selector.active {
 		t.Error("selector should not activate for agents without multiple models")

@@ -218,11 +218,16 @@ type OpenAIConfig struct {
 	SystemPrompt string `json:"system_prompt" yaml:"system_prompt"`
 }
 
+const defaultOpenAIRequestTimeout time.Duration = 0
+
 // DefaultOpenAIConfig returns OpenAI defaults
 func DefaultOpenAIConfig() OpenAIConfig {
 	base := DefaultBaseConfig()
 	base.Model = "gpt-5.4-pro"
 	base.MaxTokens = 8192
+	// Follow Codex's transport posture: no hard per-request timeout by default.
+	// Callers can still supply an explicit timeout when they want one.
+	base.Timeout = defaultOpenAIRequestTimeout
 
 	return OpenAIConfig{
 		BaseConfig:      base,

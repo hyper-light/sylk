@@ -77,6 +77,7 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 		shared.AccumulateUsage(ctx, &resp.Usage)
+		shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			return strings.TrimSpace(resp.Content), nil
@@ -193,7 +194,7 @@ func (a *Archivalist) executeToolCall(ctx context.Context, call providers.ToolCa
 			Name:      name,
 			Arguments: raw,
 		},
-		AgentID:         a.id,
+		AgentID:         a.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: a.toolRuntime().CapabilityScope(),
 	})
@@ -232,7 +233,7 @@ func (a *Archivalist) toolInvocations(ctx context.Context, calls []providers.Too
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         a.id,
+			AgentID:         a.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

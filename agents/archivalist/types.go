@@ -9,7 +9,7 @@ import (
 type SourceModel string
 
 const (
-	SourceModelGPT54Pro SourceModel = "gpt-5.4-pro"
+	SourceModelGPT54Pro    SourceModel = "gpt-5.4-pro"
 	SourceModelClaudeOpus  SourceModel = "claude-opus-4-6"
 	SourceModelUser        SourceModel = "user"
 	SourceModelArchivalist SourceModel = "archivalist"
@@ -77,16 +77,24 @@ type EntryLink struct {
 
 // ArchiveQuery specifies parameters for querying the archive
 type ArchiveQuery struct {
-	Categories      []Category    `json:"categories,omitempty"`
-	Sources         []SourceModel `json:"sources,omitempty"`
-	SessionIDs      []string      `json:"session_ids,omitempty"`
-	Since           *time.Time    `json:"since,omitempty"`
-	Until           *time.Time    `json:"until,omitempty"`
-	SearchText      string        `json:"search_text,omitempty"`
-	Limit           int           `json:"limit,omitempty"`
-	IDs             []string      `json:"ids,omitempty"`
-	IncludeArchived bool          `json:"include_archived"`
+	Categories       []Category       `json:"categories,omitempty"`
+	Sources          []SourceModel    `json:"sources,omitempty"`
+	SessionIDs       []string         `json:"session_ids,omitempty"`
+	Since            *time.Time       `json:"since,omitempty"`
+	Until            *time.Time       `json:"until,omitempty"`
+	SearchText       string           `json:"search_text,omitempty"`
+	Limit            int              `json:"limit,omitempty"`
+	IDs              []string         `json:"ids,omitempty"`
+	IncludeArchived  bool             `json:"include_archived"`
+	CrossAgentPolicy CrossAgentPolicy `json:"cross_agent_policy,omitempty"`
 }
+
+type CrossAgentPolicy string
+
+const (
+	CrossAgentPolicyBounded CrossAgentPolicy = "bounded"
+	CrossAgentPolicyInclude CrossAgentPolicy = "include"
+)
 
 type WorkflowQuery struct {
 	SessionID string `json:"session_id,omitempty"`

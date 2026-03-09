@@ -84,6 +84,7 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 		}
 
 		shared.AccumulateUsage(ctx, &resp.Usage)
+		agentShared.PublishIntermediateToolTurn(pi.bus, pi.channels, ctx, pi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			pi.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -213,7 +214,7 @@ func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers
 	}
 	return pi.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         pi.id,
+		AgentID:         pi.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: pi.toolRuntime().CapabilityScope(),
 	})
@@ -251,7 +252,7 @@ func (pi *PipelineInspector) toolInvocations(ctx context.Context, calls []provid
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         pi.id,
+			AgentID:         pi.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

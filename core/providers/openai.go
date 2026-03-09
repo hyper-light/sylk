@@ -262,19 +262,22 @@ func buildOpenAIClientOptions(config OpenAIConfig) []option.RequestOption {
 
 func resolveOpenAITimeout(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
-		return DefaultBaseConfig().Timeout
+		return defaultOpenAIRequestTimeout
 	}
 	return timeout
 }
 
 func buildBaseOpenAIClientOptions(config OpenAIConfig, timeout time.Duration) []option.RequestOption {
-	return []option.RequestOption{
+	opts := []option.RequestOption{
 		option.WithAPIKey(config.APIKey),
 		option.WithMaxRetries(config.MaxRetries),
-		option.WithRequestTimeout(timeout),
 		option.WithHTTPClient(newDefaultOpenAIHTTPClient(timeout)),
 		option.WithHeader("User-Agent", defaultOpenAIUserAgent),
 	}
+	if timeout > 0 {
+		opts = append(opts, option.WithRequestTimeout(timeout))
+	}
+	return opts
 }
 
 func appendOptionalOpenAIClientOptions(opts []option.RequestOption, config OpenAIConfig) []option.RequestOption {
@@ -1451,6 +1454,10 @@ func (p *OpenAIProvider) DefaultModel() string {
 	return p.config.Model
 }
 
+func (p *OpenAIProvider) RequestTimeout() time.Duration {
+	return resolveOpenAITimeout(p.config.Timeout)
+}
+
 // Close cleans up any resources
 func (p *OpenAIProvider) Close() error {
 	return nil
@@ -1835,24 +1842,84 @@ func openAIInputRole(role Role) (responses.EasyInputMessageRole, bool) {
 }
 
 func (p *OpenAIProvider) convertResponseTools(tools []Tool) []responses.ToolUnionParam {
-	result := make([]responses.ToolUnionParam, len(tools))
-	for i, tool := range tools {
-		params := sanitizeSchemaIterative(tool.Parameters)
-		// Only enable strict mode when the schema is strict-compatible:
-		// all properties must be in the required array and
-		// additionalProperties must be false. Schemas with optional
-		// parameters (required array shorter than properties) cannot
-		// use strict mode — OpenAI rejects them at request time.
-		strict := isStrictCompatible(params)
-		result[i] = responses.ToolParamOfFunction(tool.Name, params, strict)
-		if tool.Description != "" {
-			desc := openai.String(tool.Description)
-			function := result[i].OfFunction
-			function.Description = desc
-			result[i].OfFunction = function
+	result := make([]responses.ToolUnionParam, 0, len(tools))
+	for _, tool := range tools {
+		switch tool.ResolvedKind() {
+		case ToolKindNativeWebSearch:
+			result = append(result, openAIWebSearchToolParam(tool))
+		default:
+			params := sanitizeSchemaIterative(tool.Parameters)
+			// Only enable strict mode when the schema is strict-compatible:
+			// all properties must be in the required array and
+			// additionalProperties must be false. Schemas with optional
+			// parameters (required array shorter than properties) cannot
+			// use strict mode — OpenAI rejects them at request time.
+			strict := isStrictCompatible(params)
+			param := responses.ToolParamOfFunction(tool.Name, params, strict)
+			if tool.Description != "" {
+				desc := openai.String(tool.Description)
+				function := param.OfFunction
+				function.Description = desc
+				param.OfFunction = function
+			}
+			result = append(result, param)
 		}
 	}
 	return result
+}
+
+func openAIWebSearchToolParam(tool Tool) responses.ToolUnionParam {
+	param := responses.WebSearchToolParam{
+		Type: responses.WebSearchToolTypeWebSearchPreview2025_03_11,
+	}
+	if tool.WebSearch != nil {
+		if size := resolveOpenAIWebSearchContextSize(tool.WebSearch.SearchContextSize); size != "" {
+			param.SearchContextSize = size
+		}
+		if location := openAIWebSearchUserLocation(tool.WebSearch.UserLocation); location != nil {
+			param.UserLocation = *location
+		}
+	}
+	return responses.ToolUnionParam{OfWebSearchPreview: &param}
+}
+
+func resolveOpenAIWebSearchContextSize(size WebSearchContextSize) responses.WebSearchToolSearchContextSize {
+	switch strings.ToLower(strings.TrimSpace(string(size))) {
+	case "low":
+		return responses.WebSearchToolSearchContextSizeLow
+	case "high":
+		return responses.WebSearchToolSearchContextSizeHigh
+	case "medium":
+		return responses.WebSearchToolSearchContextSizeMedium
+	default:
+		return ""
+	}
+}
+
+func openAIWebSearchUserLocation(location *WebSearchUserLocation) *responses.WebSearchToolUserLocationParam {
+	if location == nil {
+		return nil
+	}
+	if strings.TrimSpace(location.City) == "" &&
+		strings.TrimSpace(location.Country) == "" &&
+		strings.TrimSpace(location.Region) == "" &&
+		strings.TrimSpace(location.Timezone) == "" {
+		return nil
+	}
+	param := &responses.WebSearchToolUserLocationParam{}
+	if city := strings.TrimSpace(location.City); city != "" {
+		param.City = openai.String(city)
+	}
+	if country := strings.TrimSpace(location.Country); country != "" {
+		param.Country = openai.String(country)
+	}
+	if region := strings.TrimSpace(location.Region); region != "" {
+		param.Region = openai.String(region)
+	}
+	if timezone := strings.TrimSpace(location.Timezone); timezone != "" {
+		param.Timezone = openai.String(timezone)
+	}
+	return param
 }
 
 // isStrictCompatible returns true when the JSON schema is compatible with
@@ -2065,7 +2132,16 @@ func normalizeOpenAIModel(model string) string {
 
 func modelSupportsTemperature(model string) bool {
 	model = normalizeOpenAIModel(model)
-	return !(strings.HasPrefix(model, "gpt-5") && strings.Contains(model, "thinking"))
+	if model == "" {
+		return true
+	}
+	// Reasoning-capable Responses models such as GPT-5 and o-series ignore or
+	// reject default temperature controls; leave temperature unset unless the
+	// caller explicitly overrides it at request time.
+	if strings.HasPrefix(model, "gpt-5") || strings.HasPrefix(model, "o") {
+		return false
+	}
+	return true
 }
 
 func (p *OpenAIProvider) selectFallbackModel(requestedModel string, err error) (string, bool) {

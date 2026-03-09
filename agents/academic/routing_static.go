@@ -51,11 +51,12 @@ func AcademicRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 			Name:    "academic",
 			Aliases: []string{"research", "papers"},
 			Capabilities: guide.AgentCapabilities{
-				Intents: []guide.Intent{guide.IntentRecall, guide.IntentFetch},
+				Intents: []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentHelp, guide.IntentChat},
 				Domains: []guide.Domain{guide.DomainResearch},
 				Keywords: []string{
 					"research", "best practice", "recommend", "compare",
 					"fetch", "download", "url", "web", "crawl", "document",
+					"chat", "advice", "recommendation",
 				},
 			},
 			Description: "Researches best practices, academic papers, and external knowledge sources. " +

@@ -1810,22 +1810,30 @@ func resolveGoogleFunctionResponseName(toolName string, toolCallID string) strin
 
 // convertTools converts generic tools to Gemini format
 func (g *GoogleProvider) convertTools(tools []Tool) []*genai.Tool {
-	declarations := make([]*genai.FunctionDeclaration, len(tools))
-
-	for i, tool := range tools {
-		// Convert the full JSON Schema to Gemini schema format
-		schema := convertJSONSchemaToGenaiSchema(tool.Parameters)
-
-		declarations[i] = &genai.FunctionDeclaration{
-			Name:        tool.Name,
-			Description: tool.Description,
-			Parameters:  schema,
+	if len(tools) == 0 {
+		return nil
+	}
+	aggregate := &genai.Tool{}
+	for _, tool := range tools {
+		switch tool.ResolvedKind() {
+		case ToolKindNativeWebSearch:
+			aggregate.GoogleSearch = &genai.GoogleSearch{}
+			if tool.WebSearch != nil && tool.WebSearch.EnableURLContext {
+				aggregate.URLContext = &genai.URLContext{}
+			}
+		default:
+			schema := convertJSONSchemaToGenaiSchema(tool.Parameters)
+			aggregate.FunctionDeclarations = append(aggregate.FunctionDeclarations, &genai.FunctionDeclaration{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  schema,
+			})
 		}
 	}
-
-	return []*genai.Tool{
-		{FunctionDeclarations: declarations},
+	if len(aggregate.FunctionDeclarations) == 0 && aggregate.GoogleSearch == nil && aggregate.URLContext == nil {
+		return nil
 	}
+	return []*genai.Tool{aggregate}
 }
 
 // convertJSONSchemaToGenaiSchema converts a JSON Schema to genai.Schema

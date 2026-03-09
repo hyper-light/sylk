@@ -49,6 +49,25 @@ func setupTestStore(t *testing.T) (*UniversalContentStore, func()) {
 	return store, cleanup
 }
 
+func waitForIndexedEntries(t *testing.T, store *UniversalContentStore, want int64) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		count, err := store.EntryCount()
+		if err == nil && count >= want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	count, err := store.EntryCount()
+	if err != nil {
+		t.Fatalf("failed to read entry count: %v", err)
+	}
+	t.Fatalf("timed out waiting for %d indexed entries; got %d", want, count)
+}
+
 func TestNewUniversalContentStore(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -233,6 +252,116 @@ func TestSearch_WithFilters(t *testing.T) {
 		if r.SessionID != "" && r.SessionID != "session1" {
 			t.Errorf("expected session1, got: %s", r.SessionID)
 		}
+	}
+}
+
+func TestSearch_HydratesBleveResultsWithMetadataAndSession(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	entry := &ContentEntry{
+		SessionID:    "session-hydrated",
+		AgentID:      "agent-hydrated",
+		AgentType:    "academic",
+		ContentType:  ContentTypeResearchPaper,
+		Content:      "hydrated searchable content for provenance",
+		TokenCount:   10,
+		Timestamp:    time.Now(),
+		TurnNumber:   3,
+		Keywords:     []string{"hydrated", "paper"},
+		RelatedFiles: []string{"docs/research.md"},
+		Metadata: map[string]string{
+			"language": "markdown",
+			"kind":     "academic_research_paper",
+		},
+	}
+
+	if err := store.IndexContent(entry); err != nil {
+		t.Fatalf("IndexContent failed: %v", err)
+	}
+	waitForIndexedEntries(t, store, 1)
+
+	results, err := store.Search("provenance", &SearchFilters{SessionID: "session-hydrated"}, 10)
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+
+	result := results[0]
+	if result.SessionID != "session-hydrated" {
+		t.Fatalf("expected hydrated session_id, got %q", result.SessionID)
+	}
+	if result.AgentType != "academic" {
+		t.Fatalf("expected hydrated agent_type academic, got %q", result.AgentType)
+	}
+	if result.ContentType != ContentTypeResearchPaper {
+		t.Fatalf("expected hydrated content type research_paper, got %q", result.ContentType)
+	}
+	if len(result.RelatedFiles) != 1 || result.RelatedFiles[0] != "docs/research.md" {
+		t.Fatalf("expected hydrated related file, got %#v", result.RelatedFiles)
+	}
+	if result.Metadata["kind"] != "academic_research_paper" {
+		t.Fatalf("expected hydrated metadata kind, got %#v", result.Metadata)
+	}
+}
+
+func TestSearch_AppliesAgentTypeContentTypeTimeAndKeywordFilters(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	now := time.Now()
+	entries := []*ContentEntry{
+		{
+			SessionID:   "session-filters",
+			AgentID:     "agent-a",
+			AgentType:   "academic",
+			ContentType: ContentTypeResearchPaper,
+			Content:     "shared filtered knowledge academic",
+			TokenCount:  10,
+			Timestamp:   now.Add(-2 * time.Minute),
+			TurnNumber:  2,
+			Keywords:    []string{"research", "auth"},
+		},
+		{
+			SessionID:   "session-filters",
+			AgentID:     "agent-b",
+			AgentType:   "engineer",
+			ContentType: ContentTypeCodeFile,
+			Content:     "shared filtered knowledge engineer",
+			TokenCount:  10,
+			Timestamp:   now,
+			TurnNumber:  4,
+			Keywords:    []string{"code", "auth"},
+		},
+	}
+
+	for _, entry := range entries {
+		if err := store.IndexContent(entry); err != nil {
+			t.Fatalf("IndexContent failed: %v", err)
+		}
+	}
+	waitForIndexedEntries(t, store, 2)
+
+	results, err := store.Search("shared", &SearchFilters{
+		SessionID:    "session-filters",
+		AgentTypes:   []string{"academic"},
+		ContentTypes: []ContentType{ContentTypeResearchPaper},
+		TimeRange:    [2]time.Time{now.Add(-5 * time.Minute), now.Add(-time.Minute)},
+		Keywords:     []string{"research", "auth"},
+	}, 10)
+	if err != nil {
+		t.Fatalf("Search failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 filtered result, got %d", len(results))
+	}
+	if results[0].AgentType != "academic" {
+		t.Fatalf("expected academic result, got %q", results[0].AgentType)
+	}
+	if results[0].ContentType != ContentTypeResearchPaper {
+		t.Fatalf("expected research paper result, got %q", results[0].ContentType)
 	}
 }
 

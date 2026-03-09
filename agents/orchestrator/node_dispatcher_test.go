@@ -3,8 +3,11 @@ package orchestrator
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/dag"
+	"github.com/google/uuid"
 )
 
 func TestActivateAgents_WithPod(t *testing.T) {
@@ -217,4 +220,131 @@ func TestReleaseGuard_NilPod(t *testing.T) {
 	// Should not panic.
 	d.ReleaseGuard("n1")
 	d.ReleaseAllGuards()
+}
+
+func TestBuildDispatchMessage_UsesStableTaskIdentityFromContext(t *testing.T) {
+	d := NewBusNodeDispatcher(nil, "orch", "sess", "dag1", nil, nil, nil)
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1:inspect",
+		AgentType: "inspector-pipeline",
+		Prompt:    "inspect",
+		Context: map[string]any{
+			"task_id":   "task_1",
+			"task_slug": "hello-cli",
+		},
+	})
+
+	msg := d.buildDispatchMessage(node, nil, "ack.topic")
+	payload, ok := msg.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T, want map[string]any", msg.Payload)
+	}
+
+	if got, _ := payload["task_id"].(string); got != "task_1" {
+		t.Fatalf("task_id = %q, want task_1", got)
+	}
+	if got, _ := payload["task_slug"].(string); got != "hello-cli" {
+		t.Fatalf("task_slug = %q, want hello-cli", got)
+	}
+}
+
+func TestBuildDispatchMessage_FallsBackToNodeIDWhenTaskIdentityMissing(t *testing.T) {
+	d := NewBusNodeDispatcher(nil, "orch", "sess", "dag1", nil, nil, nil)
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1:execute",
+		AgentType: "engineer",
+		Prompt:    "implement",
+	})
+
+	msg := d.buildDispatchMessage(node, nil, "ack.topic")
+	payload, ok := msg.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T, want map[string]any", msg.Payload)
+	}
+
+	if got, _ := payload["task_id"].(string); got != "task_1:execute" {
+		t.Fatalf("task_id = %q, want task_1:execute", got)
+	}
+}
+
+func TestBuildDispatchMessage_DoesNotInventUUIDTaskIDs(t *testing.T) {
+	d := NewBusNodeDispatcher(nil, "orch", "sess", "dag1", nil, nil, nil)
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1",
+		AgentType: "engineer",
+		Prompt:    "implement",
+		Context: map[string]any{
+			"task_id": "task_1",
+		},
+	})
+
+	msg := d.buildDispatchMessage(node, nil, "ack.topic")
+	payload, ok := msg.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("payload type = %T, want map[string]any", msg.Payload)
+	}
+
+	if got, _ := payload["task_id"].(string); got == "" {
+		t.Fatal("task_id should not be empty")
+	} else if _, err := uuid.Parse(got); err == nil {
+		t.Fatalf("task_id = %q, unexpectedly looks like a generated UUID", got)
+	}
+}
+
+func TestAcknowledge_UnblocksDispatchWithoutAgentAckTopic(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	dispatcher := NewBusNodeDispatcher(bus, "orch", "sess", "dag-1", nil, nil, nil)
+	node := dag.NewNode(dag.NodeConfig{
+		ID:        "task_1:inspect",
+		AgentType: "inspector-pipeline",
+		Prompt:    "inspect",
+	})
+
+	resultCh := make(chan *dag.NodeResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := dispatcher.Dispatch(context.Background(), node, nil)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- result
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for dispatcher.DispatchDone(node.ID()) == nil {
+		select {
+		case <-deadline:
+			t.Fatal("dispatch did not start")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if ok := dispatcher.Acknowledge(node.ID(), &ACKResult{
+		AgentID:   "inspector-pipeline",
+		AgentType: "inspector-pipeline",
+		AckedAt:   time.Now(),
+	}); !ok {
+		t.Fatal("expected synthetic ACK to be accepted")
+	}
+
+	dispatcher.OnNodeComplete(node.ID(), &dag.NodeResult{
+		NodeID: node.ID(),
+		State:  dag.NodeStateSucceeded,
+		Output: "ok",
+	})
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("dispatch returned error: %v", err)
+	case result := <-resultCh:
+		if result == nil || result.State != dag.NodeStateSucceeded {
+			t.Fatalf("result = %#v, want succeeded", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dispatch result")
+	}
 }

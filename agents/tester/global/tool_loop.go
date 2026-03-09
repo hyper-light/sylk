@@ -93,6 +93,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		if gov := agentshared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
+		gt.publishStreamChunk(ctx, agentshared.IntermediateToolTurnText(resp))
 
 		if len(resp.ToolCalls) == 0 {
 			gt.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -224,7 +225,7 @@ func (gt *GlobalTester) executeToolCall(ctx context.Context, call providers.Tool
 	}
 	return gt.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         gt.id,
+		AgentID:         gt.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: gt.toolRuntime().CapabilityScope(),
 	})
@@ -293,7 +294,7 @@ func (gt *GlobalTester) toolInvocations(ctx context.Context, calls []providers.T
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         gt.id,
+			AgentID:         gt.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

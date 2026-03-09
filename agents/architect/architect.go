@@ -2232,6 +2232,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		"ctx_deadline", contextDeadlineString(ctx),
 		"planner_available", a.ensurePlanner(ctx) != nil)
 	ctx = withArchitectSessionID(ctx, req.SessionID)
+	ctx = withArchitectConversationContext(ctx, req.Query, req.ConversationHistory)
 	ctx = withPlannerThoughtCallback(ctx, func(stage string, thought string) {
 		a.publishPlanThought(ctx, stage, thought)
 	})
@@ -2251,6 +2252,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	a.logInfo("executeConversation: calling composeUserFacingResponse",
 		"has_plan_summary", request.PlanSummary != "",
 		"has_prior_query", request.PriorQuery != "")
+	requestCorrelationID := originalCIDFromContext(ctx)
 	composeStart := time.Now()
 	response, composeErr := a.composeUserFacingResponse(ctx, request)
 	a.logInfo("executeConversation: composeUserFacingResponse returned",
@@ -2273,7 +2275,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 				"plan_id", plan.ID,
 				"session_id", req.SessionID,
 				"phase", string(result.Directive.Phase))
-		} else if stalled := a.latestStalledPlan(req.SessionID); stalled != nil {
+		} else if stalled := a.latestStalledPlanForRequest(req.SessionID, requestCorrelationID); stalled != nil {
 			// The tool loop started a plan (via start_planning) but
 			// couldn't complete it — e.g. API overloaded mid-protocol.
 			// Recover via deterministic protocol so the plan reaches Ready.
@@ -2307,7 +2309,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		}, nil
 	}
 	// Check for stalled plans before falling back to conversationFallback.
-	if stalled := a.latestStalledPlan(req.SessionID); stalled != nil {
+	if stalled := a.latestStalledPlanForRequest(req.SessionID, requestCorrelationID); stalled != nil {
 		a.recoverStalledPlan(ctx, stalled)
 		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
 			userResp := fallbackReadyUserResponse(nil, plan)

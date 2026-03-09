@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,17 +35,18 @@ type ACKResult struct {
 // When the pod is nil, the dispatcher falls back to EnsurePodActive on the
 // activator (best-effort activation without demotion guards).
 type BusNodeDispatcher struct {
-	bus        guide.EventBus
-	agentID    string
-	sessionID  string
-	dagID      string
-	buffers    *BufferRegistry
-	activator  guide.PodActivator // fallback when pod is nil
-	pod        *shared.AgentPod     // per-node guard lifecycle manager
-	ackTimeout time.Duration
-	pending    sync.Map // nodeID → chan *dag.NodeResult
+	bus          guide.EventBus
+	agentID      string
+	sessionID    string
+	dagID        string
+	buffers      *BufferRegistry
+	activator    guide.PodActivator // fallback when pod is nil
+	pod          *shared.AgentPod   // per-node guard lifecycle manager
+	ackTimeout   time.Duration
+	pending      sync.Map // nodeID → chan *dag.NodeResult
 	dispatchDone sync.Map // nodeID → chan struct{}
-	ackResults sync.Map // nodeID → *ACKResult
+	ackResults   sync.Map // nodeID → *ACKResult
+	ackWaiters   sync.Map // nodeID → chan *ACKResult
 
 	// onACK is called when an agent ACKs a node dispatch. Optional.
 	onACK func(nodeID string, ack *ACKResult)
@@ -99,10 +101,13 @@ func (d *BusNodeDispatcher) GetACKResult(nodeID string) *ACKResult {
 func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
 	ch := make(chan *dag.NodeResult, 1)
 	done := make(chan struct{})
+	ackCh := make(chan *ACKResult, 1)
 	d.pending.Store(node.ID(), ch)
 	d.dispatchDone.Store(node.ID(), done)
+	d.ackWaiters.Store(node.ID(), ackCh)
 	defer d.pending.Delete(node.ID())
 	defer d.dispatchDone.Delete(node.ID())
+	defer d.ackWaiters.Delete(node.ID())
 	defer close(done)
 
 	// Activate target agent if demoted/cold.
@@ -115,7 +120,7 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	msg := d.buildDispatchMessage(node, parentResults, ackTopic)
 
 	// Phase 1: Dispatch + ACK
-	ack, err := d.dispatchAndWaitACK(ctx, node, msg, ackTopic)
+	ack, err := d.dispatchAndWaitACK(ctx, node, msg, ackTopic, ackCh)
 	if err != nil {
 		return nil, err
 	}
@@ -140,18 +145,13 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 }
 
 // dispatchAndWaitACK publishes the task dispatch and waits for ACK.
-func (d *BusNodeDispatcher) dispatchAndWaitACK(ctx context.Context, node *dag.Node, msg *guide.Message, ackTopic string) (*ACKResult, error) {
-	ackCh := make(chan *ACKResult, 1)
-
+func (d *BusNodeDispatcher) dispatchAndWaitACK(ctx context.Context, node *dag.Node, msg *guide.Message, ackTopic string, ackCh <-chan *ACKResult) (*ACKResult, error) {
 	sub, err := d.bus.Subscribe(ackTopic, func(ackMsg *guide.Message) error {
 		if ackMsg.Type != guide.MessageTypeAck {
 			return nil
 		}
 		ack := d.extractACKResult(ackMsg)
-		select {
-		case ackCh <- ack:
-		default:
-		}
+		d.Acknowledge(node.ID(), ack)
 		return nil
 	})
 	if err != nil {
@@ -175,6 +175,28 @@ func (d *BusNodeDispatcher) dispatchAndWaitACK(ctx context.Context, node *dag.No
 			return nil, fmt.Errorf("node %s: %w", node.ID(), dag.ErrDispatchNotAcked)
 		}
 		return nil, ctx.Err()
+	}
+}
+
+// Acknowledge resolves the pending ACK wait for a dispatched node.
+// It is safe to call from multiple sources; only the first ACK is retained.
+func (d *BusNodeDispatcher) Acknowledge(nodeID string, ack *ACKResult) bool {
+	if ack == nil {
+		return false
+	}
+	val, ok := d.ackWaiters.Load(strings.TrimSpace(nodeID))
+	if !ok {
+		return false
+	}
+	ch, _ := val.(chan *ACKResult)
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- ack:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -255,7 +277,7 @@ func (d *BusNodeDispatcher) buildDispatchMessage(node *dag.Node, parentResults m
 		}
 	}
 
-	taskID := uuid.New().String()
+	taskID, taskSlug := dispatchTaskIdentity(node)
 
 	payload := map[string]any{
 		"task_id":        taskID,
@@ -267,6 +289,9 @@ func (d *BusNodeDispatcher) buildDispatchMessage(node *dag.Node, parentResults m
 		"parent_results": parentSummaries,
 		"ack_topic":      ackTopic,
 		"ack_deadline":   time.Now().Add(d.ackTimeout),
+	}
+	if taskSlug != "" {
+		payload["task_slug"] = taskSlug
 	}
 
 	if node.IsCompound() {
@@ -287,6 +312,25 @@ func (d *BusNodeDispatcher) buildDispatchMessage(node *dag.Node, parentResults m
 		},
 		Timestamp: time.Now(),
 	}
+}
+
+func dispatchTaskIdentity(node *dag.Node) (string, string) {
+	if node == nil {
+		return "", ""
+	}
+	var taskID, taskSlug string
+	if ctx := node.Context(); ctx != nil {
+		if id, ok := ctx["task_id"].(string); ok {
+			taskID = strings.TrimSpace(id)
+		}
+		if slug, ok := ctx["task_slug"].(string); ok {
+			taskSlug = strings.TrimSpace(slug)
+		}
+	}
+	if taskID == "" {
+		taskID = strings.TrimSpace(node.ID())
+	}
+	return taskID, taskSlug
 }
 
 // ackTopicForNode returns the unique ACK topic for a node dispatch.

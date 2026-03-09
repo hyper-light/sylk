@@ -434,6 +434,61 @@ func EmitsThoughts(req *providers.Request) bool {
 	return ThoughtVisibilityFromRequest(req) != ThoughtVisibilityHidden
 }
 
+func IsUserFacingSource(sourceAgentID string) bool {
+	return strings.EqualFold(strings.TrimSpace(sourceAgentID), "tui")
+}
+
+func PromoteForUserFacingTurn(req *providers.Request, sourceAgentID string, visibility ThoughtVisibility) {
+	if !IsUserFacingSource(sourceAgentID) {
+		return
+	}
+	PromoteThoughtVisibility(req, visibility)
+}
+
+func PromoteThoughtVisibility(req *providers.Request, visibility ThoughtVisibility) {
+	if req == nil || visibility == ThoughtVisibilityDefault {
+		return
+	}
+	current := ThoughtVisibilityFromRequest(req)
+	if thoughtVisibilityRank(current) > thoughtVisibilityRank(visibility) {
+		visibility = current
+	}
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]any)
+	}
+	req.Metadata[metadataThoughtVisibilityKey] = string(visibility)
+	req.Metadata[metadataEmitThoughtsKey] = visibility != ThoughtVisibilityHidden
+
+	switch visibility {
+	case ThoughtVisibilityHidden:
+		req.ReasoningSummary = "none"
+		req.IncludeThoughts = Bool(false)
+	case ThoughtVisibilitySummary:
+		if strings.TrimSpace(req.ReasoningSummary) == "" || strings.EqualFold(strings.TrimSpace(req.ReasoningSummary), "none") {
+			req.ReasoningSummary = "concise"
+		}
+		req.IncludeThoughts = Bool(true)
+	case ThoughtVisibilityFull:
+		if strings.TrimSpace(req.ReasoningSummary) == "" || strings.EqualFold(strings.TrimSpace(req.ReasoningSummary), "none") || strings.EqualFold(strings.TrimSpace(req.ReasoningSummary), "concise") {
+			req.ReasoningSummary = "detailed"
+		}
+		req.IncludeThoughts = Bool(true)
+	}
+}
+
+func thoughtVisibilityRank(visibility ThoughtVisibility) int {
+	switch visibility {
+	case ThoughtVisibilityHidden:
+		return 1
+	case ThoughtVisibilitySummary:
+		return 2
+	case ThoughtVisibilityFull:
+		return 3
+	default:
+		return 0
+	}
+}
+
 func MatchStage(profiles []StageProfile, intent, domain string) *StageProfile {
 	intent = strings.ToLower(strings.TrimSpace(intent))
 	domain = strings.ToLower(strings.TrimSpace(domain))

@@ -7,9 +7,10 @@ import (
 
 func academicVisibleSkillNames() []string {
 	return []string{
-		"research_topic",
-		"find_best_practices",
+		"consult",
+		"web_search",
 		"web_fetch",
+		"fetch_document",
 	}
 }
 
@@ -21,12 +22,32 @@ func academicMutatingSkillNames() []string {
 	}
 }
 
+func academicRecursiveSkillNames() []string {
+	return []string{
+		"research_topic",
+		"find_best_practices",
+		"compare_approaches",
+		"recommend_solution",
+		"author_research_paper",
+	}
+}
+
 func academicToolManifest(registry *skills.Registry) *toolruntime.PolicyManifest {
-	return toolruntime.BuildManifestFromRegistry(toolruntime.ManifestBuildConfig{
+	manifest := toolruntime.BuildManifestFromRegistry(toolruntime.ManifestBuildConfig{
 		AgentID:          "academic",
 		CapabilityScope:  "academic.default",
 		Registry:         registry,
 		VisibleByDefault: academicVisibleSkillNames(),
 		Mutating:         academicMutatingSkillNames(),
 	})
+	for _, name := range academicRecursiveSkillNames() {
+		policy, ok := manifest.Tools[name]
+		if !ok {
+			continue
+		}
+		policy.VisibleByDefault = false
+		policy.Searchable = false
+		manifest.Tools[name] = policy
+	}
+	return manifest
 }

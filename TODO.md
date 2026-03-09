@@ -26319,7 +26319,7 @@ Agent-to-credential permission mappings.
 
 #### Default Scopes
 - [x] Librarian: openai, anthropic, voyage (NO github, aws)
-- [x] Academic: openai, anthropic, google, serpapi (NO github, aws)
+- [x] Academic: openai, anthropic, google (NO github, aws)
 - [x] Archivalist: openai, anthropic (NO github, aws)
 - [x] Engineer: openai, anthropic, github (RequireAuth for github)
 - [x] Designer: openai, anthropic, figma (RequireAuth for figma)
@@ -26534,7 +26534,7 @@ Metadata declaring tool credential requirements.
 - [x] Register all tools with credential requirements
 - [x] generate_embeddings: ["openai"]
 - [x] create_pr: ["github"]
-- [x] web_search: ["serpapi"]
+- [x] web_search: [] (provider-native; no separate credential)
 - [x] read_file, write_file: [] (no credentials)
 
 #### GetToolMetadata Function

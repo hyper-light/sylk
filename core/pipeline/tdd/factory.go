@@ -21,6 +21,7 @@ type AgentFactory struct {
 	testerConfig    shared.PipelineTesterConfig
 	engineerConfig  engineer.Config
 	designerConfig  designer.Config
+	designerFactory func(context.Context, designer.Config) (*designer.Designer, error)
 	logger          *slog.Logger
 }
 
@@ -30,6 +31,7 @@ type AgentFactoryConfig struct {
 	TesterConfig    shared.PipelineTesterConfig
 	EngineerConfig  engineer.Config
 	DesignerConfig  designer.Config
+	DesignerFactory func(context.Context, designer.Config) (*designer.Designer, error)
 	Logger          *slog.Logger
 }
 
@@ -44,6 +46,7 @@ func NewAgentFactory(cfg AgentFactoryConfig) *AgentFactory {
 		testerConfig:    cfg.TesterConfig,
 		engineerConfig:  cfg.EngineerConfig,
 		designerConfig:  cfg.DesignerConfig,
+		designerFactory: cfg.DesignerFactory,
 		logger:          logger,
 	}
 }
@@ -75,14 +78,7 @@ func (f *AgentFactory) CreateWorker(ctx context.Context, wt WorkerType) (WorkerA
 		}
 		return &engineerWorker{eng: eng}, nil
 	case WorkerDesigner:
-		googleCfg := providers.DefaultGoogleConfig()
-		googleCfg.Model = string(providers.Gemini31Pro)
-		googleCfg.MaxTokens = 16384
-		provider, err := providers.NewGoogleProvider(ctx, googleCfg)
-		if err != nil {
-			return nil, fmt.Errorf("create designer google provider: %w", err)
-		}
-		des, err := designer.New(f.designerConfig, provider)
+		des, err := f.createDesigner(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("create designer: %w", err)
 		}
@@ -90,6 +86,20 @@ func (f *AgentFactory) CreateWorker(ctx context.Context, wt WorkerType) (WorkerA
 	default:
 		return nil, fmt.Errorf("unknown worker type: %s", wt)
 	}
+}
+
+func (f *AgentFactory) createDesigner(ctx context.Context) (*designer.Designer, error) {
+	if f.designerFactory != nil {
+		return f.designerFactory(ctx, f.designerConfig)
+	}
+	googleCfg := providers.DefaultGoogleConfig()
+	googleCfg.Model = string(providers.Gemini31Pro)
+	googleCfg.MaxTokens = 16384
+	provider, err := providers.NewGoogleProvider(ctx, googleCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create designer google provider: %w", err)
+	}
+	return designer.New(f.designerConfig, provider)
 }
 
 // CreateCoWorkers creates worker agents for each co-tenant type.
@@ -121,12 +131,12 @@ type PriorOutputSetter interface {
 
 // engineerWorker adapts the Engineer agent to the WorkerAgent interface.
 type engineerWorker struct {
-	eng        *engineer.Engineer
-	taskPrompt string
+	eng         *engineer.Engineer
+	taskPrompt  string
 	priorOutput *WorkerResult
 }
 
-func (w *engineerWorker) SetTaskPrompt(prompt string)        { w.taskPrompt = prompt }
+func (w *engineerWorker) SetTaskPrompt(prompt string)         { w.taskPrompt = prompt }
 func (w *engineerWorker) SetPriorOutput(result *WorkerResult) { w.priorOutput = result }
 
 func (w *engineerWorker) Execute(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error) {
@@ -158,7 +168,7 @@ type designerWorker struct {
 	priorOutput *WorkerResult
 }
 
-func (w *designerWorker) SetTaskPrompt(prompt string)        { w.taskPrompt = prompt }
+func (w *designerWorker) SetTaskPrompt(prompt string)         { w.taskPrompt = prompt }
 func (w *designerWorker) SetPriorOutput(result *WorkerResult) { w.priorOutput = result }
 
 func (w *designerWorker) Execute(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error) {

@@ -175,7 +175,7 @@ func (a *Archivalist) StoreResearchPaper(ctx context.Context, params *storeResea
 		Title:    strings.TrimSpace(params.Title),
 		Content:  buildResearchPaperEntryContent(params),
 		Source:   SourceModelArchivalist,
-		Metadata: map[string]any{
+		Metadata: normalizeCrossAgentMetadata(map[string]any{
 			"kind":                  researchPaperKind,
 			"research_slug":         strings.TrimSpace(params.ResearchSlug),
 			"version":               normalizeResearchPaperVersion(params.Version),
@@ -189,7 +189,7 @@ func (a *Archivalist) StoreResearchPaper(ctx context.Context, params *storeResea
 			"architect_summary":     strings.TrimSpace(params.ArchitectSummary),
 			"recommended_option_id": strings.TrimSpace(params.RecommendedOptionID),
 			"origin_agent":          "academic",
-		},
+		}, "", "academic"),
 	}
 
 	result := a.StoreEntry(ctx, entry)
@@ -337,18 +337,18 @@ func researchPaperRecordFromEntry(entry *Entry) (ResearchPaperRecord, bool) {
 	record := ResearchPaperRecord{
 		EntryID:             entry.ID,
 		SessionID:           entry.SessionID,
-		ResearchSlug:        metadataString(entry.Metadata, "research_slug"),
+		ResearchSlug:        researchMetadataString(entry.Metadata, "research_slug"),
 		Version:             metadataInt(entry.Metadata, "version"),
-		Title:               firstNonEmpty(entry.Title, metadataString(entry.Metadata, "title")),
-		Abstract:            metadataString(entry.Metadata, "abstract"),
-		ProblemFraming:      metadataString(entry.Metadata, "problem_framing"),
-		PaperPath:           metadataString(entry.Metadata, "paper_path"),
+		Title:               firstNonEmpty(entry.Title, researchMetadataString(entry.Metadata, "title")),
+		Abstract:            researchMetadataString(entry.Metadata, "abstract"),
+		ProblemFraming:      researchMetadataString(entry.Metadata, "problem_framing"),
+		PaperPath:           researchMetadataString(entry.Metadata, "paper_path"),
 		Topics:              metadataStrings(entry.Metadata, "topics_researched"),
 		Recommendations:     metadataStrings(entry.Metadata, "recommendations"),
 		OpenQuestions:       metadataStrings(entry.Metadata, "open_questions"),
 		RelatedTopics:       metadataStrings(entry.Metadata, "related_topics"),
-		ArchitectSummary:    metadataString(entry.Metadata, "architect_summary"),
-		RecommendedOptionID: metadataString(entry.Metadata, "recommended_option_id"),
+		ArchitectSummary:    researchMetadataString(entry.Metadata, "architect_summary"),
+		RecommendedOptionID: researchMetadataString(entry.Metadata, "recommended_option_id"),
 		CreatedAt:           entry.CreatedAt,
 	}
 	if record.Title == "" {
@@ -420,9 +420,10 @@ func (a *Archivalist) queryRelatedResearchEntries(
 ) []ResearchLinkedEntry {
 	searchText := strings.Join(terms[:researchMin(len(terms), 4)], " ")
 	query := ArchiveQuery{
-		Categories: []Category{category},
-		SearchText: searchText,
-		Limit:      researchMax(limit*2, limit),
+		Categories:       []Category{category},
+		SearchText:       searchText,
+		Limit:            researchMax(limit*2, limit),
+		CrossAgentPolicy: CrossAgentPolicyInclude,
 	}
 	if !includeAllSessions && strings.TrimSpace(sessionID) != "" {
 		query.SessionIDs = []string{sessionID}
@@ -478,17 +479,12 @@ func filterResearchStrings(items []string) []string {
 	return result
 }
 
-func metadataString(metadata map[string]any, key string) string {
-	if metadata == nil {
+func researchMetadataString(metadata map[string]any, key string) string {
+	value, ok := metadataString(metadata, key)
+	if !ok {
 		return ""
 	}
-	value, _ := metadata[key]
-	switch typed := value.(type) {
-	case string:
-		return strings.TrimSpace(typed)
-	default:
-		return ""
-	}
+	return strings.TrimSpace(value)
 }
 
 func metadataStrings(metadata map[string]any, key string) []string {

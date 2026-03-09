@@ -42,6 +42,7 @@ func newTestPipeline(taskID string) *Pipeline {
 	return &Pipeline{
 		ID:        "test-pipeline-1",
 		TaskID:    taskID,
+		TaskSlug:  "auth-checkout",
 		SessionID: "test-session",
 		DAGNodeID: "test-node",
 		Status:    StatusPending,
@@ -402,8 +403,14 @@ func TestTDDExecutor_EventsEmitted(t *testing.T) {
 		if first.NewStatus != StatusDefiningCriteria {
 			t.Errorf("first event NewStatus = %s, want %s", first.NewStatus, StatusDefiningCriteria)
 		}
-		if first.PipelineID != pipeline.ID {
-			t.Errorf("event PipelineID = %s, want %s", first.PipelineID, pipeline.ID)
+		if first.PipelineID != pipeline.TaskID {
+			t.Errorf("event PipelineID = %s, want %s", first.PipelineID, pipeline.TaskID)
+		}
+		if first.RuntimePipelineID != pipeline.ID {
+			t.Errorf("event RuntimePipelineID = %s, want %s", first.RuntimePipelineID, pipeline.ID)
+		}
+		if first.TaskSlug != pipeline.TaskSlug {
+			t.Errorf("event TaskSlug = %s, want %s", first.TaskSlug, pipeline.TaskSlug)
 		}
 	}
 }

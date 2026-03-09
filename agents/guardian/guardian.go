@@ -1073,7 +1073,7 @@ func (g *Guardian) logDebug(msg string, args ...any) {
 func (g *Guardian) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
 	return g.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         g.id,
+		AgentID:         g.toolRuntime().AgentID(),
 		CorrelationID:   shared.LogMetaFromContext(ctx).CorrID,
 		CapabilityScope: g.toolRuntime().CapabilityScope(),
 	})
@@ -1101,7 +1101,7 @@ func (g *Guardian) InvokeSkill(ctx context.Context, name string, input json.RawM
 			Name:      name,
 			Arguments: raw,
 		},
-		AgentID:         g.id,
+		AgentID:         g.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: g.toolRuntime().CapabilityScope(),
 	})

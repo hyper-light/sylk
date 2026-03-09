@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +152,46 @@ func TestModel_HandlePipelineState(t *testing.T) {
 
 	if !model.rowsDirty {
 		t.Fatal("rowsDirty should be true after pipeline state update")
+	}
+}
+
+func TestModel_PipelineStateAllowsLaterTaskSlugPromotion(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		Status:     "executing",
+	})
+
+	pl := model.pipelines["task_auth_checkout"]
+	if pl == nil {
+		t.Fatal("expected pipeline state")
+	}
+	if pl.TaskLabel != "" {
+		t.Fatalf("pipeline TaskLabel = %q, want empty", pl.TaskLabel)
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_eng_slug",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "implementing",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	if pl.TaskLabel != "auth-checkout" {
+		t.Fatalf("pipeline TaskLabel = %q, want auth-checkout", pl.TaskLabel)
 	}
 }
 
@@ -338,7 +379,7 @@ func TestModel_PipelineRowsLayout(t *testing.T) {
 	// 3: spacer
 	// 4: pipelines section
 	// 5: pl-1 pipeline header
-	// 6: eng-1 agent
+	// 6: pl-1:engineer agent
 	// 7: var-a8f2 variant
 	if len(model.rows) < 8 {
 		t.Fatalf("rows count = %d, want >= 8", len(model.rows))
@@ -356,8 +397,8 @@ func TestModel_PipelineRowsLayout(t *testing.T) {
 		t.Fatalf("rows[5] = %+v, want pipeline pl-1", model.rows[5])
 	}
 
-	if model.rows[6].Kind != rowAgent || model.rows[6].ID != "eng-1" {
-		t.Fatalf("rows[6] = %+v, want agent eng-1", model.rows[6])
+	if model.rows[6].Kind != rowAgent || model.rows[6].ID != "pl-1:engineer" {
+		t.Fatalf("rows[6] = %+v, want agent pl-1:engineer", model.rows[6])
 	}
 
 	if model.rows[7].Kind != rowVariant || model.rows[7].ID != "var-a8f2" {
@@ -409,6 +450,351 @@ func TestModel_PipelineAgentsAreScopedPerPipeline(t *testing.T) {
 	}
 	if model.findPipelineAgent("engineer", "task_payment_retry") == nil {
 		t.Fatal("expected engineer row for task_payment_retry")
+	}
+}
+
+func TestModel_OrchestratorStaysGlobalEvenWithPipelineMetadata(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "orchestrator", "orchestrator")
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_orch_pipeline",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "orchestrator",
+			Content:   "Coordinating pipeline",
+			Data: map[string]any{
+				"agent_name":  "Orchestrator",
+				"agent_type":  "orchestrator",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	model.ensureRows()
+	if model.findPipelineAgent("orchestrator", "task_auth_checkout") != nil {
+		t.Fatal("did not expect orchestrator pipeline row")
+	}
+	orch := model.agents["orchestrator"]
+	if orch == nil {
+		t.Fatal("expected global orchestrator row")
+	}
+	if orch.PipelineID != "" {
+		t.Fatalf("orchestrator PipelineID = %q, want empty", orch.PipelineID)
+	}
+}
+
+func TestModel_ViewKeepsClosingFooterBelowPipelines(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 8)
+	model.SetFocused(true)
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "pl-1",
+		TaskID:     "task-abc",
+		TaskLabel:  "auth-checkout",
+		Status:     "implement",
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_eng_footer",
+			EventType: events.EventTypeLLMRequest,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "implementing",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "pl-1",
+			},
+		},
+	})
+	pushAgentActivity(model, "guide", "guide")
+
+	lines := strings.Split(model.View(), "\n")
+	if len(lines) != 8 {
+		t.Fatalf("rendered lines = %d, want 8", len(lines))
+	}
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "╰") {
+		t.Fatalf("expected closing footer on last line, got %q", last)
+	}
+}
+
+func TestModel_ViewPrefersActivePipelineViewportWhenUnfocused(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 8)
+	model.SetFocused(false)
+
+	// Fill upper sections so the pipelines block would be pushed below the fold
+	// without viewport re-anchoring.
+	pushAgentActivity(model, "guide", "guide")
+	pushAgentActivity(model, "architect", "architect")
+	pushAgentActivity(model, "orchestrator", "orchestrator")
+	pushAgentActivity(model, "librarian", "librarian")
+	pushAgentActivity(model, "academic", "academic")
+	pushAgentActivity(model, "archivalist", "archivalist")
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_worker",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "task_auth_checkout:inspector-pipeline",
+			Content:   "Processing pipeline task: task_auth_checkout:inspect",
+			Data: map[string]any{
+				"agent_name":  "Inspector",
+				"agent_type":  "inspector-pipeline",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_engineer",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_auth_checkout:engineer",
+			Content:   "Pipeline agent registered: engineer",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	view := stripANSI(model.View())
+	if !strings.Contains(view, "pipelines") {
+		t.Fatalf("expected pipelines section in view, got %q", view)
+	}
+	if !strings.Contains(view, "auth-checkout") {
+		t.Fatalf("expected pipeline slug in view, got %q", view)
+	}
+	if !strings.Contains(view, "Engineer") {
+		t.Fatalf("expected pipeline engineer row in view, got %q", view)
+	}
+	lines := strings.Split(view, "\n")
+	if last := lines[len(lines)-1]; !strings.Contains(last, "╰") {
+		t.Fatalf("expected closing footer on last line, got %q", last)
+	}
+}
+
+var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string {
+	return ansiPattern.ReplaceAllString(s, "")
+}
+
+func TestModel_PipelineActivityUsesCanonicalPipelineRowID(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_designer_pipeline",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "designer",
+			Content:   "Processing design task",
+			Data: map[string]any{
+				"agent_name":  "Designer",
+				"agent_type":  "designer",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	if _, exists := model.agents["designer"]; exists {
+		t.Fatal("unexpected standalone designer row")
+	}
+	agent := model.agents["task_auth_checkout:designer"]
+	if agent == nil {
+		t.Fatal("expected canonical pipeline designer row")
+	}
+	if agent.PipelineID != "task_auth_checkout" {
+		t.Fatalf("pipeline id = %q, want task_auth_checkout", agent.PipelineID)
+	}
+}
+
+func TestModel_TaskIDOverridesRuntimePipelineIDForPipelineAgents(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_designer_runtime_pipeline",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "designer",
+			Content:   "Processing design task",
+			Data: map[string]any{
+				"agent_name":  "Designer",
+				"agent_type":  "designer",
+				"pipeline_id": "runtime-pipeline-123",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	agent := model.agents["task_auth_checkout:designer"]
+	if agent == nil {
+		t.Fatal("expected canonical pipeline designer row")
+	}
+	if agent.PipelineID != "task_auth_checkout" {
+		t.Fatalf("pipeline id = %q, want task_auth_checkout", agent.PipelineID)
+	}
+	if _, exists := model.agents["runtime-pipeline-123:designer"]; exists {
+		t.Fatal("unexpected runtime pipeline keyed designer row")
+	}
+}
+
+func TestModel_PipelineAliasAbsorbsMetadataPoorFollowOnEvents(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_start",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "inspector-pipeline",
+			Content:   "Validating implementation quality",
+			Data: map[string]any{
+				"agent_name":  "Inspector",
+				"agent_type":  "inspector-pipeline",
+				"pipeline_id": "task_payment_retry",
+				"task_id":     "task_payment_retry",
+				"task_slug":   "payment-retry",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_llm_follow_on",
+			EventType: events.EventTypeLLMRequest,
+			Timestamp: time.Now(),
+			AgentID:   "inspector-pipeline",
+			Content:   "thinking",
+			Data: map[string]any{
+				"model": "claude-opus-4-6",
+			},
+		},
+	})
+
+	if got := len(model.agents); got != 1 {
+		t.Fatalf("agent count = %d, want 1", got)
+	}
+	agent := model.agents["task_payment_retry:inspector-pipeline"]
+	if agent == nil {
+		t.Fatal("expected canonical pipeline inspector row")
+	}
+	if agent.Status != StatusThinking {
+		t.Fatalf("status = %v, want StatusThinking", agent.Status)
+	}
+}
+
+func TestModel_PipelineMetadataRehomesEarlierBadRuntimeRow(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_bad_first",
+			EventType: events.EventTypeLLMRequest,
+			Timestamp: time.Now(),
+			AgentID:   "designer",
+			Content:   "thinking",
+			Data: map[string]any{
+				"model": "gemini-3.1-pro-preview",
+			},
+		},
+	})
+
+	if model.agents["designer"] == nil {
+		t.Fatal("expected initial bad runtime row")
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_fixup",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "designer",
+			Content:   "Processing design task",
+			Data: map[string]any{
+				"agent_name":  "Designer",
+				"agent_type":  "designer",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	if _, exists := model.agents["designer"]; exists {
+		t.Fatal("bad runtime row was not rehomed")
+	}
+	if model.agents["task_auth_checkout:designer"] == nil {
+		t.Fatal("expected canonical pipeline row after rehome")
+	}
+}
+
+func TestModel_StreamProgressResolvesRuntimeAliasToPipelineRow(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_wrapped",
+			EventType: events.EventTypeAgentAction,
+			Timestamp: time.Now(),
+			AgentID:   "task_auth_checkout:engineer",
+			Content:   "Processing implementation task",
+			Data: map[string]any{
+				"agent_name":       "Engineer",
+				"agent_type":       "engineer",
+				"pipeline_id":      "task_auth_checkout",
+				"task_id":          "task_auth_checkout",
+				"task_slug":        "auth-checkout",
+				"runtime_agent_id": "engineer",
+			},
+		},
+	})
+
+	_, _ = model.Update(msg.StreamProgressMsg{
+		AgentID:    "engineer",
+		Message:    "Applying patch",
+		Visibility: events.VisibilityUser,
+	})
+
+	agent := model.agents["task_auth_checkout:engineer"]
+	if agent == nil {
+		t.Fatal("expected canonical pipeline engineer row")
+	}
+	if agent.Status != StatusThinking {
+		t.Fatalf("status = %v, want StatusThinking", agent.Status)
+	}
+	if agent.TaskSummary != "Applying patch" {
+		t.Fatalf("task summary = %q, want Applying patch", agent.TaskSummary)
 	}
 }
 
@@ -649,9 +1035,9 @@ func TestModel_RegisteredTransition(t *testing.T) {
 		},
 	})
 
-	agent := model.agents["eng-1"]
+	agent := model.agents["dag-1:engineer"]
 	if agent == nil {
-		t.Fatal("agent eng-1 not created on registration event")
+		t.Fatal("agent dag-1:engineer not created on registration event")
 	}
 	if agent.Status != StatusWaiting {
 		t.Fatalf("status after registration = %v, want StatusWaiting", agent.Status)

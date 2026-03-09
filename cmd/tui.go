@@ -258,8 +258,27 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 
 	guideBus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 
-	// Create BusActivityPublisher that routes activity events through the ChannelBus.
-	activityPub := guide.NewBusActivityPublisher(guideBus)
+	// Route all activity through a metadata-caching wrapper so follow-on LLM/tool
+	// telemetry can be attached to the correct agent row even when the source
+	// event omits type or pipeline metadata.
+	activityPub := events.NewMetadataCachingPublisher(
+		guide.NewBusActivityPublisher(guideBus),
+		map[string]events.AgentIdentityMetadata{
+			"guide":              {AgentType: "guide", AgentName: "Guide"},
+			"architect":          {AgentType: "architect", AgentName: "Architect"},
+			"guardian":           {AgentType: "guardian", AgentName: "Guardian"},
+			"orchestrator":       {AgentType: "orchestrator", AgentName: "Orchestrator"},
+			"inspector":          {AgentType: "inspector", AgentName: "Inspector"},
+			"tester":             {AgentType: "tester", AgentName: "Tester"},
+			"librarian":          {AgentType: "librarian", AgentName: "Librarian"},
+			"archivalist":        {AgentType: "archivalist", AgentName: "Archivalist"},
+			"academic":           {AgentType: "academic", AgentName: "Academic"},
+			"engineer":           {AgentType: "engineer", AgentName: "Engineer"},
+			"designer":           {AgentType: "designer", AgentName: "Designer"},
+			"inspector-pipeline": {AgentType: "inspector-pipeline", AgentName: "Inspector"},
+			"tester-pipeline":    {AgentType: "tester-pipeline", AgentName: "Tester"},
+		},
+	)
 	streamMgr := guide.NewStreamManager(guide.DefaultStreamConfig())
 
 	sessionMgr := session.NewManager(session.ManagerConfig{
@@ -351,6 +370,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// registration time so IDs are sticky across spin-up/spin-down cycles.
 	identityReg := container.NewAgentIdentityRegistry([]string{
 		"architect", "engineer", "designer", "inspector", "tester",
+		"inspector-pipeline", "tester-pipeline",
 		"librarian", "archivalist", "academic", "orchestrator",
 	})
 
@@ -382,14 +402,23 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// on daemon restart the Guardian needs to seed its agent registry.
 	var guideRef atomic.Pointer[guide.Guide]
 
+	// guardianRef stores the live Guardian instance for Academic fetch
+	// inspection wiring and post-boot daemon restarts.
+	var guardianRef atomic.Pointer[guardian.Guardian]
+
 	// orchRef stores the live Orchestrator instance for Guardian VFS
 	// observability — the VFS adapters query active session VFS sets.
 	var orchRef atomic.Pointer[orchestrator.Orchestrator]
 
+	// quarantineRef stores the shared external-content quarantine buffer.
+	// Academic fetch pipelines reuse this so Guardian inspection and
+	// quarantine status observe the same entries.
+	var quarantineRef atomic.Pointer[fetch.QuarantineBuffer]
+
 	// Register agent creators. During initial boot, Guide/Orch factories
 	// call hydrateOnce.result() to wait for the shared hydration. After
 	// boot, daemon restarts read hydratedRef atomically (already stored).
-	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef, &gitSubsRef, planStore, knowledgeStore, daemonCtrl, &guideRef, &orchRef, budget)
+	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, &actCtrlRef, &gitSubsRef, planStore, knowledgeStore, daemonCtrl, &guideRef, &guardianRef, &orchRef, &quarantineRef, budget)
 
 	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
 
@@ -687,6 +716,7 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// Wire Guardian: extract from container, register with Guide, wire git subsystems.
 	if guardianResult.err == nil && guardianResult.c != nil {
 		if grd, grdErr := extractAgent[*guardian.Guardian](containerReg, "guardian"); grdErr == nil {
+			guardianRef.Store(grd)
 			_ = registerAgentWithGuide(g, grd, "guardian")
 			if gitRes.bus != nil {
 				grd.SetGitSubsystems(gitRes.bus, gitRes.watcher)
@@ -1320,7 +1350,9 @@ func registerAgentCreators(
 	knowledgeStore *knowledge.KnowledgeStore,
 	daemonCtrl *daemon.DaemonSetController,
 	guideRef *atomic.Pointer[guide.Guide],
+	guardianRef *atomic.Pointer[guardian.Guardian],
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
+	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
 	budget *concurrency.GoroutineBudget,
 ) {
 	// Guide — Gemini with rule-based fallback.
@@ -1354,17 +1386,18 @@ func registerAgentCreators(
 	// On daemon restart the factory must re-wire post-boot deps (observability,
 	// git, agent seeding) that Phase 3 originally set up.
 	reg.Register("guardian", func(ctx context.Context) (container.ContainerAgent, error) {
-		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, gitSubsRef)
+		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, gitSubsRef, quarantineRef)
 		if err != nil {
 			return nil, err
 		}
+		guardianRef.Store(grd)
 		wireGuardianPostBootDeps(grd, actCtrlRef, daemonCtrl, guideRef, orchRef, openaiGw,
 			[]*gateway.ProviderGateway{googleGw, anthropicGw, openaiGw}, knowledgeStore, budget)
 		return grd, nil
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, actCtrlRef, knowledgeStore)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, actCtrlRef, knowledgeStore, guardianRef, quarantineRef)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
@@ -1380,6 +1413,8 @@ func registerOnDemandAgentCreators(
 	openaiGw *gateway.ProviderGateway,
 	actCtrlRef *atomic.Pointer[activation.ActivationController],
 	knowledgeStore *knowledge.KnowledgeStore,
+	guardianRef *atomic.Pointer[guardian.Guardian],
+	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
 ) {
 	// Librarian — codebase search specialist with LLM-driven conversation.
 	librarianID, _ := ids.Get("librarian")
@@ -1478,6 +1513,7 @@ func registerOnDemandAgentCreators(
 			return nil, err
 		}
 		a.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
+		a.SetFetchPipeline(buildAcademicFetchPipeline(projectRoot, guardianRef, quarantineRef))
 		if startErr := a.Start(bus); startErr != nil {
 			return nil, startErr
 		}
@@ -1504,13 +1540,14 @@ func registerOnDemandAgentCreators(
 	})
 
 	// Pipeline Inspector — per-task quality validation.
+	pipelineInspectorID, _ := ids.Get("inspector-pipeline")
 	reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
 		model := "claude-opus-4-6"
 		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
 		}
-		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{}, wrapped)
+		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{AgentID: pipelineInspectorID}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -1546,13 +1583,14 @@ func registerOnDemandAgentCreators(
 	})
 
 	// Pipeline Tester — per-task QE.
+	pipelineTesterID, _ := ids.Get("tester-pipeline")
 	reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
 		model := "gpt-5.4-pro"
 		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
-		pt, err := pipelinetester.New(shared.PipelineTesterConfig{}, wrapped)
+		pt, err := pipelinetester.New(shared.PipelineTesterConfig{AgentID: pipelineTesterID}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -1912,6 +1950,7 @@ func bootstrapGuardian(
 	projectRoot string,
 	googleGw, anthropicGw, openaiGw *gateway.ProviderGateway,
 	gitSubsRef *atomic.Pointer[gitBootResult],
+	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
 ) (*guardian.Guardian, error) {
 	model := guardian.DefaultGuardianModel
 	var wrapped providers.Provider
@@ -1940,10 +1979,14 @@ func bootstrapGuardian(
 	}
 
 	// Wire quarantine buffer for external content inspection.
-	g.SetQuarantine(fetch.NewQuarantineBuffer(
+	q := fetch.NewQuarantineBuffer(
 		guardian.DefaultQuarantineMaxItems,
 		guardian.DefaultQuarantineMaxBytes,
-	))
+	)
+	g.SetQuarantine(q)
+	if quarantineRef != nil {
+		quarantineRef.Store(q)
+	}
 
 	if err := g.Start(bus); err != nil {
 		return nil, err
@@ -2012,6 +2055,64 @@ func wireGuardianPostBootDeps(
 		grd.SeedKnownAgents(g.RegisteredAgentInfos())
 		_ = registerAgentWithGuide(g, grd, "guardian")
 	}
+}
+
+func buildAcademicFetchPipeline(
+	_ string,
+	guardianRef *atomic.Pointer[guardian.Guardian],
+	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
+) *fetch.Pipeline {
+	autoApprove := make([]string, 0, len(security.DefaultSafeDomains()))
+	for domain := range security.DefaultSafeDomains() {
+		autoApprove = append(autoApprove, domain)
+	}
+
+	policy := fetch.NewFetchPolicy(fetch.DefaultPolicyConfig())
+	consent := fetch.NewConsentGate(fetch.ConsentGateConfig{
+		AutoApproveDomains: autoApprove,
+		Callback: func(_ context.Context, proposal *fetch.FetchProposal) (*fetch.ConsentResult, error) {
+			domain := ""
+			if proposal != nil {
+				domain = proposal.Domain
+			}
+			return &fetch.ConsentResult{
+				Granted: false,
+				Reason:  fmt.Sprintf("interactive fetch consent is not configured for %q; only pre-approved documentation and package domains are allowed", domain),
+			}, nil
+		},
+	})
+
+	quarantine := (*fetch.QuarantineBuffer)(nil)
+	if quarantineRef != nil {
+		quarantine = quarantineRef.Load()
+	}
+	if quarantine == nil {
+		quarantine = fetch.NewQuarantineBuffer(
+			guardian.DefaultQuarantineMaxItems,
+			guardian.DefaultQuarantineMaxBytes,
+		)
+	}
+
+	return fetch.NewPipeline(fetch.PipelineConfig{
+		Policy:     policy,
+		Consent:    consent,
+		Quarantine: quarantine,
+		Client: fetch.NewClient(fetch.ClientConfig{
+			MaxBytes: policy.MaxBytes(),
+		}),
+		Extractor: fetch.NewContentExtractor(),
+		Inspect: func(ctx context.Context, entry *fetch.QuarantineEntry) (fetch.QuarantineVerdict, []fetch.InspectionFinding, error) {
+			if guardianRef == nil {
+				return fetch.VerdictBlocked, nil, fmt.Errorf("guardian inspection is unavailable")
+			}
+			grd := guardianRef.Load()
+			if grd == nil {
+				return fetch.VerdictBlocked, nil, fmt.Errorf("guardian inspection is unavailable")
+			}
+			return grd.InspectQuarantinedContent(ctx, entry)
+		},
+		Logger: slog.Default(),
+	})
 }
 
 // resolveArchitectAPIKey resolves the Anthropic API key for the architect

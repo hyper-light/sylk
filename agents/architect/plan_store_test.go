@@ -179,6 +179,95 @@ func TestPlanStore_LatestByStatus_Expired(t *testing.T) {
 	}
 }
 
+func TestPlanStore_LatestReusableForRequest(t *testing.T) {
+	store := testPlanStore(t)
+	defer store.Close()
+
+	now := time.Now()
+	old := &DesignPlan{
+		ID:                   "old",
+		SessionID:            "sess-1",
+		Status:               PlanStatusGenerating,
+		RequestCorrelationID: "corr-1",
+		UpdatedAt:            now.Add(-2 * time.Minute),
+	}
+	old.sm = NewPlanStateMachine(old.ID, old.Status)
+	reusable := &DesignPlan{
+		ID:                   "ready",
+		SessionID:            "sess-1",
+		Status:               PlanStatusReady,
+		RequestCorrelationID: "corr-1",
+		UpdatedAt:            now.Add(-30 * time.Second),
+	}
+	reusable.sm = NewPlanStateMachine(reusable.ID, reusable.Status)
+	terminal := &DesignPlan{
+		ID:                   "done",
+		SessionID:            "sess-1",
+		Status:               PlanStatusCompleted,
+		RequestCorrelationID: "corr-1",
+		UpdatedAt:            now,
+	}
+	terminal.sm = NewPlanStateMachine(terminal.ID, terminal.Status)
+	other := &DesignPlan{
+		ID:                   "other",
+		SessionID:            "sess-1",
+		Status:               PlanStatusConsulting,
+		RequestCorrelationID: "corr-2",
+		UpdatedAt:            now,
+	}
+	other.sm = NewPlanStateMachine(other.ID, other.Status)
+
+	_ = store.Upsert(old)
+	_ = store.Upsert(reusable)
+	_ = store.Upsert(terminal)
+	_ = store.Upsert(other)
+
+	got := store.LatestReusableForRequest("sess-1", "corr-1")
+	if got == nil || got.ID != "ready" {
+		t.Fatalf("LatestReusableForRequest = %v, want ready", got)
+	}
+}
+
+func TestPlanStore_LatestStalledForRequest(t *testing.T) {
+	store := testPlanStore(t)
+	defer store.Close()
+
+	now := time.Now()
+	wanted := &DesignPlan{
+		ID:                   "stalled",
+		SessionID:            "sess-1",
+		Status:               PlanStatusConsulting,
+		RequestCorrelationID: "corr-1",
+		UpdatedAt:            now,
+	}
+	wanted.sm = NewPlanStateMachine(wanted.ID, wanted.Status)
+	otherRequest := &DesignPlan{
+		ID:                   "other-request",
+		SessionID:            "sess-1",
+		Status:               PlanStatusGenerating,
+		RequestCorrelationID: "corr-2",
+		UpdatedAt:            now.Add(5 * time.Second),
+	}
+	otherRequest.sm = NewPlanStateMachine(otherRequest.ID, otherRequest.Status)
+	old := &DesignPlan{
+		ID:                   "old",
+		SessionID:            "sess-1",
+		Status:               PlanStatusAnalyzing,
+		RequestCorrelationID: "corr-1",
+		UpdatedAt:            now.Add(-10 * time.Minute),
+	}
+	old.sm = NewPlanStateMachine(old.ID, old.Status)
+
+	_ = store.Upsert(wanted)
+	_ = store.Upsert(otherRequest)
+	_ = store.Upsert(old)
+
+	got := store.LatestStalledForRequest("sess-1", "corr-1", stalledPlanMaxAge)
+	if got == nil || got.ID != "stalled" {
+		t.Fatalf("LatestStalledForRequest = %v, want stalled", got)
+	}
+}
+
 func TestPlanStore_RestoreFromDisk(t *testing.T) {
 	dir := t.TempDir()
 	lm := NewPlanLeaseManager(10*time.Second, 5*time.Minute)

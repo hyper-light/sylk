@@ -913,19 +913,75 @@ func mergeAnthropicMessage(dst *anthropic.MessageParam, src anthropic.MessagePar
 // caching is enabled, a cache control breakpoint is set on the last tool
 // so the tool definitions are cached across requests.
 func (p *AnthropicProvider) convertTools(tools []Tool, usePromptCache bool) []anthropic.ToolUnionParam {
-	result := make([]anthropic.ToolUnionParam, len(tools))
+	result := make([]anthropic.ToolUnionParam, 0, len(tools))
 	for i, tool := range tools {
-		tp := &anthropic.ToolParam{
-			Name:        tool.Name,
-			Description: anthropic.String(tool.Description),
-			InputSchema: buildAnthropicSchema(tool.Parameters),
+		lastTool := usePromptCache && i == len(tools)-1
+		switch tool.ResolvedKind() {
+		case ToolKindNativeWebSearch:
+			result = append(result, p.anthropicWebSearchTool(tool, lastTool))
+		default:
+			tp := &anthropic.ToolParam{
+				Name:        tool.Name,
+				Description: anthropic.String(tool.Description),
+				InputSchema: buildAnthropicSchema(tool.Parameters),
+			}
+			if lastTool {
+				tp.CacheControl = p.newCacheControl()
+			}
+			result = append(result, anthropic.ToolUnionParam{OfTool: tp})
 		}
-		if usePromptCache && i == len(tools)-1 {
-			tp.CacheControl = p.newCacheControl()
-		}
-		result[i] = anthropic.ToolUnionParam{OfTool: tp}
 	}
 	return result
+}
+
+func (p *AnthropicProvider) anthropicWebSearchTool(tool Tool, usePromptCache bool) anthropic.ToolUnionParam {
+	param := &anthropic.WebSearchTool20260209Param{}
+	if tool.WebSearch != nil {
+		param.AllowedDomains = append([]string(nil), tool.WebSearch.AllowedDomains...)
+		param.BlockedDomains = append([]string(nil), tool.WebSearch.BlockedDomains...)
+		if tool.WebSearch.MaxUses > 0 {
+			param.MaxUses = anthropic.Int(int64(tool.WebSearch.MaxUses))
+		}
+		if tool.WebSearch.Strict {
+			param.Strict = anthropic.Bool(true)
+		}
+		if tool.WebSearch.DeferLoading {
+			param.DeferLoading = anthropic.Bool(true)
+		}
+		if location := anthropicWebSearchUserLocation(tool.WebSearch.UserLocation); location != nil {
+			param.UserLocation = *location
+		}
+	}
+	if usePromptCache {
+		param.CacheControl = p.newCacheControl()
+	}
+	return anthropic.ToolUnionParam{OfWebSearchTool20260209: param}
+}
+
+func anthropicWebSearchUserLocation(location *WebSearchUserLocation) *anthropic.UserLocationParam {
+	if location == nil {
+		return nil
+	}
+	if strings.TrimSpace(location.City) == "" &&
+		strings.TrimSpace(location.Country) == "" &&
+		strings.TrimSpace(location.Region) == "" &&
+		strings.TrimSpace(location.Timezone) == "" {
+		return nil
+	}
+	param := &anthropic.UserLocationParam{}
+	if city := strings.TrimSpace(location.City); city != "" {
+		param.City = anthropic.String(city)
+	}
+	if country := strings.TrimSpace(location.Country); country != "" {
+		param.Country = anthropic.String(country)
+	}
+	if region := strings.TrimSpace(location.Region); region != "" {
+		param.Region = anthropic.String(region)
+	}
+	if timezone := strings.TrimSpace(location.Timezone); timezone != "" {
+		param.Timezone = anthropic.String(timezone)
+	}
+	return param
 }
 
 func buildAnthropicSchema(params map[string]any) anthropic.ToolInputSchemaParam {

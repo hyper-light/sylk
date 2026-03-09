@@ -149,3 +149,55 @@ func TestGuideRoute_PromotesChatToHelpForSpecialistTarget(t *testing.T) {
 	assert.Equal(t, guide.IntentHelp, forwarded.Intent)
 	assert.NotContains(t, forwarded.ClassificationMethod, "guide_fallback")
 }
+
+func TestGuideRoute_NormalizesAcademicIntentBeforeGuideFallback(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+
+	classifier := &fixedClassifierClient{payload: map[string]any{
+		"is_retrospective": false,
+		"intent":           "design",
+		"domain":           "planning",
+		"target_agent":     "academic",
+		"confidence":       0.95,
+	}}
+	g, err := guide.NewWithClassifier(classifier, guide.Config{
+		Bus:       bus,
+		AgentID:   "guide",
+		SessionID: "test-session",
+	})
+	require.NoError(t, err)
+
+	err = g.Register(&guide.AgentRoutingInfo{
+		ID:   "academic",
+		Type: "academic",
+		Name: "academic",
+		Registration: &guide.AgentRegistration{
+			ID:   "academic",
+			Name: "academic",
+			Capabilities: guide.AgentCapabilities{
+				Intents: []guide.Intent{
+					guide.IntentRecall,
+					guide.IntentCheck,
+					guide.IntentFetch,
+					guide.IntentHelp,
+					guide.IntentChat,
+				},
+				Domains: []guide.Domain{guide.DomainResearch},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	forwarded, err := g.Route(context.Background(), &guide.RouteRequest{
+		Input:         "How would you implement Oauth?",
+		SourceAgentID: "tui",
+		Timestamp:     time.Now(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "academic", forwarded.TargetAgentID)
+	assert.Equal(t, guide.DomainResearch, forwarded.Domain)
+	assert.NotContains(t, forwarded.ClassificationMethod, "guide_fallback")
+}

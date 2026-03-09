@@ -15,7 +15,7 @@ type InspectFunc func(ctx context.Context, entry *QuarantineEntry) (QuarantineVe
 
 // IngestFunc is called to ingest approved content into the knowledge
 // graph and document DB via JointDocIngestion.
-type IngestFunc func(ctx context.Context, entry *QuarantineEntry, provenance *Provenance) error
+type IngestFunc func(ctx context.Context, entry *QuarantineEntry, provenance *Provenance, extracted *ExtractResult) error
 
 // Pipeline orchestrates the full fetch-to-ingest flow:
 //
@@ -26,6 +26,7 @@ type Pipeline struct {
 	consent    *ConsentGate
 	quarantine *QuarantineBuffer
 	client     *Client
+	extractor  *ContentExtractor
 	inspect    InspectFunc
 	ingest     IngestFunc
 	logger     *slog.Logger
@@ -37,6 +38,7 @@ type PipelineConfig struct {
 	Consent    *ConsentGate
 	Quarantine *QuarantineBuffer
 	Client     *Client
+	Extractor  *ContentExtractor
 	Inspect    InspectFunc
 	Ingest     IngestFunc
 	Logger     *slog.Logger
@@ -53,6 +55,7 @@ func NewPipeline(cfg PipelineConfig) *Pipeline {
 		consent:    cfg.Consent,
 		quarantine: cfg.Quarantine,
 		client:     cfg.Client,
+		extractor:  cfg.Extractor,
 		inspect:    cfg.Inspect,
 		ingest:     cfg.Ingest,
 		logger:     logger,
@@ -61,22 +64,25 @@ func NewPipeline(cfg PipelineConfig) *Pipeline {
 
 // FetchRequest describes what to fetch and why.
 type FetchRequest struct {
-	URL         string // Target URL
-	SourceAgent string // Agent requesting the fetch
-	Reason      string // Human-readable reason for the fetch
-	SessionID   string // Session context
+	URL         string                    // Target URL
+	SourceAgent string                    // Agent requesting the fetch
+	Reason      string                    // Human-readable reason for the fetch
+	SessionID   string                    // Session context
 	SecurityCtx *security.SecurityContext // Capability check
 }
 
 // FetchResponse carries the outcome of a pipeline execution.
 type FetchResponse struct {
-	Success    bool               `json:"success"`
-	URL        string             `json:"url"`
-	Verdict    QuarantineVerdict  `json:"verdict"`
-	Findings   []InspectionFinding `json:"findings,omitempty"`
-	Provenance *Provenance        `json:"provenance,omitempty"`
-	Error      string             `json:"error,omitempty"`
-	Duration   time.Duration      `json:"duration"`
+	Success         bool                `json:"success"`
+	URL             string              `json:"url"`
+	Verdict         QuarantineVerdict   `json:"verdict"`
+	Findings        []InspectionFinding `json:"findings,omitempty"`
+	Provenance      *Provenance         `json:"provenance,omitempty"`
+	Ingested        bool                `json:"ingested"`
+	Extracted       *ExtractResult      `json:"extracted,omitempty"`
+	ExtractionError string              `json:"extraction_error,omitempty"`
+	Error           string              `json:"error,omitempty"`
+	Duration        time.Duration       `json:"duration"`
 }
 
 // Execute runs the full pipeline for a single URL. Returns a FetchResponse
@@ -209,9 +215,19 @@ func (p *Pipeline) Execute(ctx context.Context, req *FetchRequest) *FetchRespons
 			ApprovedBy:   approvedByFromConsent(consentID),
 		}
 
-		if err := p.ingest(ctx, released, provenance); err != nil {
-			resp.Error = fmt.Sprintf("ingestion failed: %v", err)
-			return resp
+		extracted, extractErr := p.extract(released)
+		if extractErr != nil {
+			resp.ExtractionError = extractErr.Error()
+		} else {
+			resp.Extracted = extracted
+		}
+
+		if p.ingest != nil {
+			if err := p.ingest(ctx, released, provenance, extracted); err != nil {
+				resp.Error = fmt.Sprintf("ingestion failed: %v", err)
+				return resp
+			}
+			resp.Ingested = true
 		}
 
 		resp.Success = true
@@ -224,6 +240,17 @@ func (p *Pipeline) Execute(ctx context.Context, req *FetchRequest) *FetchRespons
 
 	resp.Error = "unexpected verdict"
 	return resp
+}
+
+func (p *Pipeline) extract(entry *QuarantineEntry) (*ExtractResult, error) {
+	if entry == nil {
+		return nil, fmt.Errorf("quarantine entry is required")
+	}
+	extractor := p.extractor
+	if extractor == nil {
+		extractor = NewContentExtractor()
+	}
+	return extractor.Extract(entry.Content, entry.ContentType)
 }
 
 func extractDomain(rawURL string) string {

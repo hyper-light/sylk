@@ -141,6 +141,9 @@ Validate an approach against the codebase.
 }
 ```
 
+### web_search
+Search the public web using the provider's native web-search capability to discover relevant sources when you do not already know the URL.
+
 ### web_fetch
 Fetch a web page through the secure pipeline (quarantine + Guardian inspection).
 ```json
@@ -253,6 +256,7 @@ All fetched content passes through a 5-layer security pipeline:
 - When you need authoritative documentation to answer a question
 - When comparing approaches requires checking current best practices
 - When validating a recommendation against official sources
+- When you need to discover candidate sources before you know which URL to fetch
 
 ### When NOT to Fetch
 - When you already have sufficient knowledge to answer
@@ -260,8 +264,10 @@ All fetched content passes through a 5-layer security pipeline:
 - When the content would be of low quality or unverifiable
 
 ### Fetch Etiquette
+- Use `web_search` first when you need to discover authoritative sources or current references
 - Always provide a clear `reason` explaining why the content is needed
 - Prefer official documentation and established sources over random pages
+- After discovery, fetch the specific source with `web_fetch` or `fetch_document` before relying on detailed claims
 - Use `fetch_document` for PDFs and papers that should be permanently ingested
 - Use `web_fetch` for quick reference lookups
 - Use `crawl_links` sparingly — only when exploring a documentation site

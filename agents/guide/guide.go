@@ -203,6 +203,11 @@ type Guide struct {
 	requestCancelMu sync.Mutex
 	requestCancels  map[string]context.CancelFunc
 
+	responseMsgMu        sync.Mutex
+	responseMessagesSeen map[string]time.Time
+	completedPendingMu   sync.Mutex
+	completedPendings    map[string]completedPendingRoute
+
 	// streamReroutes stores CID → stream target agent ID for rerouted
 	// streams. Populated when a reroute event arrives (before the pending
 	// for the new CID may exist). Applied to the pending's
@@ -212,6 +217,11 @@ type Guide struct {
 	streamReroutes   map[string]string
 
 	classifyGroup singleflight.Group
+}
+
+type completedPendingRoute struct {
+	pending *PendingRequest
+	seenAt  time.Time
 }
 
 // agentSubscriptions holds the Guide's subscriptions to an agent's channels
@@ -312,32 +322,34 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 	selfResponder := resolveGuideSelfResponder(cfg, nil, "", nil)
 
 	guide := &Guide{
-		router:         router,
-		config:         cfg,
-		bus:            cfg.Bus,
-		activityPub:    cfg.ActivityPub,
-		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
-		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
-		readyAgents:    NewStringMap[bool](DefaultShardCount),
-		typeIndex:      NewStringMap[string](DefaultShardCount),
-		registry:       registry,
-		routing:        routing,
-		triggers:       NewTriggerDetector(routing),
-		pending:        NewPendingStore(pendingCfg),
-		routeCache:     NewRouteCache(cacheCfg),
-		circuits:       circuits,
-		health:         health,
-		dlq:            dlq,
-		pendingCleanup: pendingCleanup,
-		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
-		skills:         skillsRegistry,
-		skillLoader:    nil,
-		hooks:          hookRegistry,
-		selfResponder:  selfResponder,
-		sessionID:      cfg.SessionID,
-		agentID:        agentID,
-		requestCancels: make(map[string]context.CancelFunc),
-		streamReroutes: make(map[string]string),
+		router:               router,
+		config:               cfg,
+		bus:                  cfg.Bus,
+		activityPub:          cfg.ActivityPub,
+		agentSubs:            NewStringMap[*agentSubscriptions](DefaultShardCount),
+		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
+		readyAgents:          NewStringMap[bool](DefaultShardCount),
+		typeIndex:            NewStringMap[string](DefaultShardCount),
+		registry:             registry,
+		routing:              routing,
+		triggers:             NewTriggerDetector(routing),
+		pending:              NewPendingStore(pendingCfg),
+		routeCache:           NewRouteCache(cacheCfg),
+		circuits:             circuits,
+		health:               health,
+		dlq:                  dlq,
+		pendingCleanup:       pendingCleanup,
+		observer:             NewConsultationObserver(cfg.Bus, cfg.SessionID),
+		skills:               skillsRegistry,
+		skillLoader:          nil,
+		hooks:                hookRegistry,
+		selfResponder:        selfResponder,
+		sessionID:            cfg.SessionID,
+		agentID:              agentID,
+		requestCancels:       make(map[string]context.CancelFunc),
+		responseMessagesSeen: make(map[string]time.Time),
+		completedPendings:    make(map[string]completedPendingRoute),
+		streamReroutes:       make(map[string]string),
 	}
 
 	guide.registerCoreSkills()
@@ -485,33 +497,35 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 	selfResponder := resolveGuideSelfResponder(cfg, nil, "", nil)
 
 	guide := &Guide{
-		router:         router,
-		config:         cfg,
-		bus:            cfg.Bus,
-		activityPub:    cfg.ActivityPub,
-		agentSubs:      NewStringMap[*agentSubscriptions](DefaultShardCount),
-		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
-		readyAgents:    NewStringMap[bool](DefaultShardCount),
-		typeIndex:      NewStringMap[string](DefaultShardCount),
-		registry:       registry,
-		routing:        routing,
-		triggers:       NewTriggerDetector(routing),
-		pending:        NewPendingStore(pendingCfg),
-		routeCache:     NewRouteCache(cacheCfg),
-		circuits:       circuits,
-		health:         health,
-		dlq:            dlq,
-		pendingCleanup: pendingCleanup,
-		observer:       NewConsultationObserver(cfg.Bus, cfg.SessionID),
-		skills:         skillsRegistry,
-		skillLoader:    nil,
-		hooks:          hookRegistry,
-		selfResponder:  selfResponder,
-		googleConfig:   cfg.GoogleConfig,
-		sessionID:      cfg.SessionID,
-		agentID:        agentID,
-		requestCancels: make(map[string]context.CancelFunc),
-		streamReroutes: make(map[string]string),
+		router:               router,
+		config:               cfg,
+		bus:                  cfg.Bus,
+		activityPub:          cfg.ActivityPub,
+		agentSubs:            NewStringMap[*agentSubscriptions](DefaultShardCount),
+		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
+		readyAgents:          NewStringMap[bool](DefaultShardCount),
+		typeIndex:            NewStringMap[string](DefaultShardCount),
+		registry:             registry,
+		routing:              routing,
+		triggers:             NewTriggerDetector(routing),
+		pending:              NewPendingStore(pendingCfg),
+		routeCache:           NewRouteCache(cacheCfg),
+		circuits:             circuits,
+		health:               health,
+		dlq:                  dlq,
+		pendingCleanup:       pendingCleanup,
+		observer:             NewConsultationObserver(cfg.Bus, cfg.SessionID),
+		skills:               skillsRegistry,
+		skillLoader:          nil,
+		hooks:                hookRegistry,
+		selfResponder:        selfResponder,
+		googleConfig:         cfg.GoogleConfig,
+		sessionID:            cfg.SessionID,
+		agentID:              agentID,
+		requestCancels:       make(map[string]context.CancelFunc),
+		responseMessagesSeen: make(map[string]time.Time),
+		completedPendings:    make(map[string]completedPendingRoute),
+		streamReroutes:       make(map[string]string),
 	}
 
 	guide.registerCoreSkills()
@@ -649,6 +663,110 @@ func newGuideStreamManager(cfg *StreamConfig) *StreamManager {
 		return NewStreamManager(DefaultStreamConfig())
 	}
 	return NewStreamManager(*cfg)
+}
+
+func (g *Guide) responseTrackingTTL() time.Duration {
+	var ttl time.Duration
+	if g != nil && g.pending != nil && g.pending.defaultTimeout > ttl {
+		ttl = g.pending.defaultTimeout
+	}
+	if g != nil && g.streams != nil && g.streams.config.StreamTimeout > ttl {
+		ttl = g.streams.config.StreamTimeout
+	}
+	if ttl > 0 {
+		return ttl
+	}
+	pendingTTL := DefaultPendingStoreConfig().DefaultTimeout
+	streamTTL := DefaultStreamConfig().StreamTimeout
+	if streamTTL > pendingTTL {
+		return streamTTL
+	}
+	return pendingTTL
+}
+
+func (g *Guide) markResponseMessageSeen(messageID string) bool {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return false
+	}
+	now := time.Now()
+	ttl := g.responseTrackingTTL()
+	g.responseMsgMu.Lock()
+	defer g.responseMsgMu.Unlock()
+	if seenAt, ok := g.responseMessagesSeen[messageID]; ok && now.Sub(seenAt) <= ttl {
+		return true
+	}
+	for id, seenAt := range g.responseMessagesSeen {
+		if now.Sub(seenAt) > ttl {
+			delete(g.responseMessagesSeen, id)
+		}
+	}
+	g.responseMessagesSeen[messageID] = now
+	return false
+}
+
+func (g *Guide) rememberCompletedPending(pending *PendingRequest) {
+	if g == nil || pending == nil || pending.CorrelationID == "" {
+		return
+	}
+	now := time.Now()
+	ttl := g.responseTrackingTTL()
+	g.completedPendingMu.Lock()
+	defer g.completedPendingMu.Unlock()
+	for correlationID, entry := range g.completedPendings {
+		if now.Sub(entry.seenAt) > ttl {
+			delete(g.completedPendings, correlationID)
+		}
+	}
+	g.completedPendings[pending.CorrelationID] = completedPendingRoute{
+		pending: pending,
+		seenAt:  now,
+	}
+}
+
+func (g *Guide) completedPending(correlationID string) *PendingRequest {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return nil
+	}
+	now := time.Now()
+	ttl := g.responseTrackingTTL()
+	g.completedPendingMu.Lock()
+	defer g.completedPendingMu.Unlock()
+	entry, ok := g.completedPendings[correlationID]
+	if !ok {
+		return nil
+	}
+	if now.Sub(entry.seenAt) > ttl {
+		delete(g.completedPendings, correlationID)
+		return nil
+	}
+	return entry.pending
+}
+
+func (g *Guide) forgetCompletedPending(correlationID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	g.completedPendingMu.Lock()
+	delete(g.completedPendings, correlationID)
+	g.completedPendingMu.Unlock()
+}
+
+func (g *Guide) ensureTrackedStream(correlationID, sessionID string) {
+	if g == nil || g.streams == nil {
+		return
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" || g.streams.GetStream(correlationID) != nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = g.sessionID
+	}
+	_, _ = g.streams.CreateStream(correlationID, sessionID)
 }
 
 func newGuideDomainClassifier(cfg *DomainClassifierConfig) (*DomainClassifier, error) {
@@ -1020,7 +1138,7 @@ func isExcludedAgent(agentID string, excludeAgents []string) bool {
 
 func (g *Guide) ensureRoutableClassification(ctx context.Context, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
 	target := classificationTargetAgentID(targetAgentID, classification)
-	classification = g.normalizeConversationalIntentForTarget(classification, target)
+	classification = g.normalizeClassificationForTarget(classification, target)
 	if g.classificationSupportedByTarget(classification, target) {
 		return classification, target
 	}
@@ -1033,11 +1151,47 @@ func (g *Guide) ensureRoutableClassification(ctx context.Context, classification
 		target = resolved
 		classification.TargetAgent = TargetAgent(target)
 	}
+	classification = g.normalizeClassificationForTarget(classification, target)
 	if g.classificationSupportedByTarget(classification, target) {
 		return classification, target
 	}
 	fallback := g.guideFallbackClassification(classification)
 	return fallback, string(fallback.TargetAgent)
+}
+
+func (g *Guide) normalizeClassificationForTarget(
+	classification *RouteResult,
+	targetAgentID string,
+) *RouteResult {
+	if classification == nil || targetAgentID == "" || g.isGuideTarget(targetAgentID) {
+		return classification
+	}
+	normalized := g.normalizeConversationalIntentForTarget(classification, targetAgentID)
+	if normalized == nil {
+		return nil
+	}
+	if shouldNormalizeSpecialistIntent(normalized.Intent) {
+		if supported := g.supportedIntentForTarget(targetAgentID, normalized.Intent); supported != normalized.Intent {
+			promoted := *normalized
+			promoted.Intent = supported
+			normalized = &promoted
+		}
+	}
+	if supported := g.supportedDomainForTarget(targetAgentID, normalized.Domain, normalized.Intent); supported != normalized.Domain {
+		promoted := *normalized
+		promoted.Domain = supported
+		normalized = &promoted
+	}
+	return normalized
+}
+
+func shouldNormalizeSpecialistIntent(intent Intent) bool {
+	switch intent {
+	case IntentChat, IntentHelp, IntentStatus, IntentUnknown:
+		return false
+	default:
+		return true
+	}
 }
 
 func (g *Guide) normalizeConversationalIntentForTarget(
@@ -1781,8 +1935,13 @@ func (g *Guide) HandleResponse(ctx context.Context, response *RouteResponse) (*P
 	// Look up and remove pending request
 	pending := g.pending.Remove(response.CorrelationID)
 	if pending == nil {
-		return nil, fmt.Errorf("no pending request for correlation ID: %s", response.CorrelationID)
+		pending = g.completedPending(response.CorrelationID)
+		if pending == nil {
+			return nil, fmt.Errorf("no pending request for correlation ID: %s", response.CorrelationID)
+		}
+		return pending, nil
 	}
+	g.rememberCompletedPending(pending)
 
 	g.logEvent(agentlog.EventResponseCorrelated, response.CorrelationID, "info", &agentlog.CorrelationPayload{
 		SourceAgent: response.RespondingAgentID,
@@ -2807,7 +2966,8 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 		if handleErr != nil {
 			return nil
 		}
-		return g.publishResponseToSource(resolved.SourceAgentID, resp)
+		publishErr := g.publishResponseToSource(resolved.SourceAgentID, resp)
+		return publishErr
 	}
 
 	g.publishGuideStreamStart(pending.CorrelationID, pending.SourceAgentID)
@@ -2865,7 +3025,8 @@ func (g *Guide) respondToGuideRequest(ctx context.Context, pending *PendingReque
 	if handleErr != nil {
 		return nil
 	}
-	return g.publishResponseToSource(resolved.SourceAgentID, resp)
+	publishErr := g.publishResponseToSource(resolved.SourceAgentID, resp)
+	return publishErr
 }
 
 func (g *Guide) generateGuideReply(
@@ -3410,6 +3571,13 @@ func (g *Guide) registeredAgentIDs() []string {
 }
 
 func (g *Guide) handleResponseMessage(msg *Message) error {
+	if msg == nil {
+		return nil
+	}
+	if g.markResponseMessageSeen(msg.ID) {
+		return nil
+	}
+
 	ctx := g.processingContext()
 	if err := ctx.Err(); err != nil {
 		DebugFileLog().Warn("handleResponseMessage: PROCESSING_CTX_CANCELLED",
@@ -3477,10 +3645,17 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 			return g.handleAgentPush(streamResp, msg)
 		}
 
+		pending := g.pending.Get(streamResp.CorrelationID)
+		if pending == nil {
+			pending = g.completedPending(streamResp.CorrelationID)
+		}
+		if pending != nil {
+			g.ensureTrackedStream(streamResp.CorrelationID, g.resolveSessionID(pending))
+		}
+
 		g.recordIncomingStreamEvent(streamResp)
 		g.observeStreamDirective(streamResp)
 		g.observeStreamReroute(streamResp)
-		pending := g.pending.Get(streamResp.CorrelationID)
 		if pending == nil {
 			if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete {
 				DebugFileLog().Warn("handleResponseMessage: STREAM_COMPLETE_NO_PENDING",
@@ -3494,7 +3669,14 @@ func (g *Guide) handleResponseMessage(msg *Message) error {
 		if streamResp.RespondingAgentName == "" {
 			streamResp.RespondingAgentName = g.resolveAgentDisplayName(pending.TargetAgentID)
 		}
-		return g.publishStreamToSource(streamTarget, streamResp)
+		publishErr := g.publishStreamToSource(streamTarget, streamResp)
+		if streamResp.Event != nil && streamResp.Event.Type == StreamEventComplete {
+			g.forgetCompletedPending(streamResp.CorrelationID)
+			if g.streams != nil {
+				g.streams.CloseStream(streamResp.CorrelationID)
+			}
+		}
+		return publishErr
 	default:
 		return nil
 	}

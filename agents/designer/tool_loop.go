@@ -98,6 +98,7 @@ func (d *Designer) executeToolLoop(ctx context.Context, req *providers.Request, 
 
 		shared.AccumulateUsage(ctx, &resp.Usage)
 		d.accumulateUsage(resp)
+		shared.PublishIntermediateToolTurn(d.bus, d.channels, ctx, d.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			d.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -246,7 +247,7 @@ func (d *Designer) executeToolCall(ctx context.Context, call providers.ToolCall)
 	}
 	return d.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         d.id,
+		AgentID:         d.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: d.toolRuntime().CapabilityScope(),
 	})
@@ -285,7 +286,7 @@ func (d *Designer) toolInvocations(ctx context.Context, calls []providers.ToolCa
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         d.id,
+			AgentID:         d.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

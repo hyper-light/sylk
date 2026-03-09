@@ -386,6 +386,7 @@ type StreamResponse struct {
 	RespondingAgentID   string       `json:"responding_agent_id"`
 	RespondingAgentName string       `json:"responding_agent_name,omitempty"`
 	TargetAgentID       string       `json:"target_agent_id"`
+	Metadata            map[string]any `json:"metadata,omitempty"`
 	Event               *StreamEvent `json:"event"`
 }
 

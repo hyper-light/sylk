@@ -436,7 +436,7 @@ func (a *Architect) executeToolCall(ctx context.Context, call providers.ToolCall
 	invokeStart := time.Now()
 	result, err := a.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         a.id,
+		AgentID:         a.toolRuntime().AgentID(),
 		CorrelationID:   shared.LogMetaFromContext(ctx).CorrID,
 		CapabilityScope: a.toolRuntime().CapabilityScope(),
 	})
@@ -495,7 +495,7 @@ func (a *Architect) toolInvocations(ctx context.Context, calls []providers.ToolC
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         a.id,
+			AgentID:         a.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

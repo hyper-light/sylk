@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
@@ -78,6 +79,7 @@ const (
 // PipelineConfig holds the configuration for creating a TDD pipeline.
 type PipelineConfig struct {
 	TaskID          string
+	TaskSlug        string
 	SessionID       string
 	DAGNodeID       string
 	WorkerType      WorkerType
@@ -86,8 +88,8 @@ type PipelineConfig struct {
 	PipelineTimeout time.Duration
 	Priority        int
 	InitialCriteria *inspShared.InspectorCriteria
-	TaskPrompt      string            // Full task prompt from buildNodePrompt
-	CoWorkerTypes   []WorkerType      // Co-tenant worker types (sequential order)
+	TaskPrompt      string                // Full task prompt from buildNodePrompt
+	CoWorkerTypes   []WorkerType          // Co-tenant worker types (sequential order)
 	AgentPrompts    map[WorkerType]string // Per-agent scoped prompts (compound only)
 }
 
@@ -95,6 +97,7 @@ type PipelineConfig struct {
 type Pipeline struct {
 	ID        string
 	TaskID    string
+	TaskSlug  string
 	SessionID string
 	DAGNodeID string
 
@@ -149,20 +152,29 @@ type PipelineResult struct {
 
 // PipelineEvent is emitted on every status change.
 type PipelineEvent struct {
-	PipelineID string
-	TaskID     string
-	SessionID  string
-	OldStatus  PipelineStatus
-	NewStatus  PipelineStatus
-	WorkerType WorkerType
-	LoopCount  int
-	MaxLoops   int
-	Timestamp  time.Time
-	Error      string
+	PipelineID        string
+	RuntimePipelineID string
+	TaskID            string
+	TaskSlug          string
+	SessionID         string
+	OldStatus         PipelineStatus
+	NewStatus         PipelineStatus
+	WorkerType        WorkerType
+	LoopCount         int
+	MaxLoops          int
+	Timestamp         time.Time
+	Error             string
 }
 
 // WorkerAgent is the interface that engineer and designer adapters implement.
 type WorkerAgent interface {
 	Execute(ctx context.Context, criteria *inspShared.InspectorCriteria, inspectorFeedback *InspectorFeedback, testerFeedback *TesterFeedback) (*WorkerResult, error)
 	Close() error
+}
+
+func logicalPipelineID(taskID, runtimePipelineID string) string {
+	if trimmed := strings.TrimSpace(taskID); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(runtimePipelineID)
 }

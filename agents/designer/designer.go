@@ -456,6 +456,13 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 
 	emitter := shared.NewToolCallEmitter(d.bus, d.channels, d.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = shared.WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type":  "designer",
+		"agent_name":  "Designer",
+		"pipeline_id": d.pipelineID,
+		"task_id":     d.pipelineID,
+		"task_slug":   d.pipelineSlug,
+	})
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)

@@ -14,7 +14,7 @@ func newMockToolRequirements() *mockToolRequirements {
 		requirements: map[string][]string{
 			"generate_embeddings": {"openai"},
 			"create_pr":           {"github"},
-			"web_search":          {"serpapi"},
+			"web_search":          {},
 			"multi_tool":          {"openai", "github"},
 			"read_file":           {},
 		},

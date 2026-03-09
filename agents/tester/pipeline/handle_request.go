@@ -67,7 +67,7 @@ func (pt *PipelineTester) runTests(ctx context.Context, req *tester.TesterReques
 			Name:      "run_test_suite",
 			Arguments: string(input),
 		},
-		AgentID:         pt.id,
+		AgentID:         pt.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: pt.toolRuntime().CapabilityScope(),
 	})

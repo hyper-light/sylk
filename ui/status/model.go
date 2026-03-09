@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -125,20 +126,21 @@ func (m *Model) View() string {
 		return m.viewCache
 	}
 
+	contentWidth := max(m.width-statusBarInset*2, 1)
+	right := m.renderRightFitted(contentWidth)
+	rightWidth := lipgloss.Width(right)
+	sep := m.theme.StatusBar.Render(separatorChar)
+	sepWidth := lipgloss.Width(sep)
 	left := m.renderLeft()
 	center := m.renderCenter()
-	right := m.renderRight()
+	leftSection := m.renderLeftSectionFitted(contentWidth, left, center, rightWidth, sepWidth)
 
-	sep := m.theme.StatusBar.Render(separatorChar)
-
-	contentWidth := max(m.width-statusBarInset*2, 1)
-
-	leftSection := left + sep + center
-	fixedWidth := lipgloss.Width(leftSection) + lipgloss.Width(sep) + lipgloss.Width(right)
-	padWidth := max(contentWidth-fixedWidth-m.authIcons.WidthCorrection(), 0)
-
-	padding := m.theme.StatusBar.Render(repeatSpace(padWidth))
-	content := leftSection + padding + sep + right
+	content := right
+	if leftSection != "" {
+		padWidth := max(contentWidth-lipgloss.Width(leftSection)-sepWidth-rightWidth-m.authIcons.WidthCorrection(), 0)
+		padding := m.theme.StatusBar.Render(repeatSpace(padWidth))
+		content = leftSection + padding + sep + right
+	}
 
 	m.viewCache = lipgloss.NewStyle().
 		Width(contentWidth).
@@ -352,6 +354,41 @@ func (m *Model) renderCenter() string {
 	return m.theme.StatusBar.Render("ready")
 }
 
+func (m *Model) renderLeftSectionFitted(contentWidth int, left, center string, rightWidth, sepWidth int) string {
+	available := contentWidth - rightWidth - sepWidth - m.authIcons.WidthCorrection()
+	if available <= 0 {
+		return ""
+	}
+
+	leftWidth := lipgloss.Width(left)
+	if leftWidth >= available {
+		return ansi.Truncate(left, available, "")
+	}
+
+	remaining := available - leftWidth
+	if remaining <= 0 {
+		return left
+	}
+	if lipgloss.Width(center) == 0 {
+		return left
+	}
+
+	if remaining <= sepWidth {
+		return left
+	}
+
+	centerBudget := remaining - sepWidth
+	centerFitted := center
+	if lipgloss.Width(center) > centerBudget {
+		centerFitted = ansi.Truncate(center, centerBudget, "")
+	}
+	if lipgloss.Width(centerFitted) == 0 {
+		return left
+	}
+
+	return left + m.theme.StatusBar.Render(separatorChar) + centerFitted
+}
+
 func (m *Model) renderRight() string {
 	auth := m.authIcons.View()
 	sep := m.theme.StatusBar.Render(separatorChar)
@@ -371,6 +408,42 @@ func (m *Model) renderRight() string {
 	}
 
 	return result
+}
+
+func (m *Model) renderRightFitted(maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+
+	auth := m.authIcons.View()
+	sep := m.theme.StatusBar.Render(separatorChar)
+	tokens := m.tokens.View()
+	progress := m.progress.View()
+
+	dropped := ""
+	if count := m.droppedEvents.Load(); count > 0 {
+		dropped = m.theme.StatusWarning.Render(
+			fmt.Sprintf(" %s%d", droppedWarningPrefix, count),
+		)
+	}
+
+	candidates := []string{
+		m.renderRight(),
+		auth + sep + tokens,
+		tokens + dropped,
+		tokens,
+	}
+	if progress != "" {
+		candidates = append([]string{progress + sep + auth + sep + tokens}, candidates...)
+	}
+
+	for _, candidate := range candidates {
+		if lipgloss.Width(candidate) <= maxWidth {
+			return candidate
+		}
+	}
+
+	return ansi.Truncate(tokens, maxWidth, "")
 }
 
 // -- Helpers ----------------------------------------------------------------

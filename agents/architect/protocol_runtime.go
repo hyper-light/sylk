@@ -32,7 +32,7 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 		"ctx_deadline", contextDeadlineString(ctx))
 
 	req = a.enrichPlanningRequest(req)
-	plan := newProtocolPlan(req)
+	plan := newProtocolPlan(req, originalCIDFromContext(ctx))
 	a.planStore.Upsert(plan)
 
 	corrID := correlationIDFromContext(ctx)
@@ -62,6 +62,7 @@ func (a *Architect) runPlanningProtocol(ctx context.Context, req *ArchitectReque
 	plannerCtx := withPlannerThoughtCallback(opCtx, func(stage string, thought string) {
 		a.publishPlanThought(opCtx, stage, thought)
 	})
+	plannerCtx = withArchitectConversationContext(plannerCtx, req.Query, req.ConversationHistory)
 	plannerCtx = withStreamRetryResetEmitter(plannerCtx, func() {
 		a.publishPlanStreamStart(opCtx)
 	})
@@ -275,7 +276,7 @@ func (a *Architect) priorSessionContext(sessionID string) map[string]any {
 	return context
 }
 
-func newProtocolPlan(req *ArchitectRequest) *DesignPlan {
+func newProtocolPlan(req *ArchitectRequest, requestCorrelationID string) *DesignPlan {
 	if req == nil {
 		plan := &DesignPlan{ID: uuid.NewString(), Status: PlanStatusFailed, Error: "nil request"}
 		plan.sm = NewPlanStateMachine(plan.ID, PlanStatusFailed)
@@ -292,6 +293,7 @@ func newProtocolPlan(req *ArchitectRequest) *DesignPlan {
 		Consultations: map[string]*ConsultationEvidence{},
 		CreatedAt:     now,
 		UpdatedAt:     now,
+		RequestCorrelationID: strings.TrimSpace(requestCorrelationID),
 	}
 	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusPending)
 	return plan
@@ -401,9 +403,14 @@ const protocolPhaseInstructions = `You drive the planning protocol by invoking s
 
 1. **Analyze**: Invoke plan with action=analyze, plan_id, and the user's query.
 2. **Consult**: Invoke consult with mode=pre_planning and plan_id.
-3. **Clarify** (conditional): Review the analysis results. If critical ambiguities
-   would lead to a wrong plan, invoke ask_user_question. If you do, STOP and do
-   not invoke further skills. If requirements are clear, proceed to Design.
+3. **Clarify** (conditional): Review the analysis results. If the request is still
+   broadly vague or underspecified and needs exploratory clarification or
+   requirements-shaping before you can plan responsibly, invoke
+   route_requirements_research and STOP. Use ask_user_question only for one or
+   two narrow, concrete decisions that the user can answer directly. If the
+   blocker is codebase evidence or historical implementation context, use
+   consult with the Librarian or Archivalist instead of handing the user away.
+   If requirements are clear, proceed to Design.
 4. **Design**: Invoke plan with action=design and plan_id.
 5. **Generate**: Invoke plan with action=generate_tasks and plan_id.
    This automatically creates the workflow and validates the plan.

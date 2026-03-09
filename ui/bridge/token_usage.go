@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"sync"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -50,7 +51,7 @@ func (b *TokenUsageBridge) Stop() {
 	})
 }
 
-func (b *TokenUsageBridge) Name() string       { return tokenUsageBridgeName }
+func (b *TokenUsageBridge) Name() string        { return tokenUsageBridgeName }
 func (b *TokenUsageBridge) DroppedCount() int64 { return 0 }
 
 func (b *TokenUsageBridge) forwardHandler(program TeaProgram) guide.MessageHandler {
@@ -66,23 +67,60 @@ func (b *TokenUsageBridge) forwardHandler(program TeaProgram) guide.MessageHandl
 		if v, ok := evt.Data["model"].(string); ok {
 			um.Model = v
 		}
-		if v, ok := evt.Data["input_tokens"].(int); ok {
+		if v, ok := intFromAny(evt.Data["input_tokens"]); ok {
 			um.InputTokens = v
 		}
-		if v, ok := evt.Data["output_tokens"].(int); ok {
+		if v, ok := intFromAny(evt.Data["output_tokens"]); ok {
 			um.OutputTokens = v
 		}
-		if v, ok := evt.Data["cache_read_tokens"].(int); ok {
+		if v, ok := intFromAny(evt.Data["cache_read_tokens"]); ok {
 			um.CacheReadTokens = v
 		}
-		if v, ok := evt.Data["cache_write_tokens"].(int); ok {
+		if v, ok := intFromAny(evt.Data["cache_write_tokens"]); ok {
 			um.CacheWriteTokens = v
 		}
-		if v, ok := evt.Data["reasoning_tokens"].(int); ok {
+		if v, ok := intFromAny(evt.Data["reasoning_tokens"]); ok {
 			um.ReasoningTokens = v
 		}
 
 		program.Send(um)
 		return nil
+	}
+}
+
+func intFromAny(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int8:
+		return int(n), true
+	case int16:
+		return int(n), true
+	case int32:
+		return int(n), true
+	case int64:
+		return int(n), true
+	case uint:
+		return int(n), true
+	case uint8:
+		return int(n), true
+	case uint16:
+		return int(n), true
+	case uint32:
+		return int(n), true
+	case uint64:
+		return int(n), true
+	case float32:
+		return int(n), true
+	case float64:
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(i), true
+	default:
+		return 0, false
 	}
 }

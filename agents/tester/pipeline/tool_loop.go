@@ -84,6 +84,7 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 		shared.AccumulateUsage(ctx, &resp.Usage)
+		shared.PublishIntermediateToolTurn(pt.bus, pt.channels, ctx, pt.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			pt.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -215,7 +216,7 @@ func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.To
 	}
 	return pt.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         pt.id,
+		AgentID:         pt.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: pt.toolRuntime().CapabilityScope(),
 	})
@@ -254,7 +255,7 @@ func (pt *PipelineTester) toolInvocations(ctx context.Context, calls []providers
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         pt.id,
+			AgentID:         pt.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

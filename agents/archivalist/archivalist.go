@@ -879,9 +879,11 @@ func ensureQueryLimit(query *ArchiveQuery, fallback int) {
 
 // handleStore processes store requests
 func (a *Archivalist) handleStore(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	metadata := normalizeCrossAgentMetadata(fwd.Metadata, fwd.SourceAgentID, fwd.SourceAgentName)
 	entry := &Entry{
-		Content: fwd.Input,
-		Source:  SourceModelClaudeOpus, // Default, could be extracted from metadata
+		Content:  fwd.Input,
+		Source:   extractEntrySourceModel(metadata),
+		Metadata: metadata,
 	}
 
 	// Map domain to category
@@ -1161,7 +1163,10 @@ func (a *Archivalist) Query(ctx context.Context, query ArchiveQuery) ([]*Entry, 
 		return nil, err
 	}
 
-	entries, err := a.store.Query(queryValue)
+	entries, err := a.store.Query(a.expandQueryForBoundedInfluence(queryValue))
+	if err == nil {
+		entries = a.applyBoundedCrossAgentInfluence(queryValue, entries)
+	}
 	hookErr := a.runPostQueryHooks(ctx, queryData, entries, err)
 	if hookErr != nil && err == nil {
 		return nil, hookErr
@@ -2303,7 +2308,7 @@ func (a *Archivalist) HandleToolCall(ctx context.Context, toolName string, input
 			Name:      name,
 			Arguments: raw,
 		},
-		AgentID:         a.id,
+		AgentID:         a.toolRuntime().AgentID(),
 		CorrelationID:   a.id + "-direct",
 		CapabilityScope: a.toolRuntime().CapabilityScope(),
 	})
@@ -2326,7 +2331,26 @@ func (a *Archivalist) QueryCrossSession(ctx context.Context, query ArchiveQuery)
 	if a.crossSession == nil {
 		return nil, fmt.Errorf("cross session index not available")
 	}
-	return a.crossSession.QueryCrossSession(query)
+	results, err := a.crossSession.QueryCrossSession(a.expandQueryForBoundedInfluence(query))
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]*Entry, 0, len(results))
+	for _, result := range results {
+		entries = append(entries, result.Entry)
+	}
+	entries = a.applyBoundedCrossAgentInfluence(query, entries)
+	cross := make([]CrossSessionResult, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		cross = append(cross, CrossSessionResult{
+			SessionID: entry.SessionID,
+			Entry:     entry,
+		})
+	}
+	return cross, nil
 }
 
 func (a *Archivalist) QuerySessions(ctx context.Context, query ArchiveQuery) ([]*Session, error) {

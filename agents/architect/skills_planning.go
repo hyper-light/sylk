@@ -97,8 +97,22 @@ func consultSkill(a *Architect) *skills.Skill {
 				},
 			}
 			if hasPlan {
-				if err := a.advancePlan(ctx, plan, PlanStatusConsulting, nil); err != nil {
-					return nil, err
+				if consultationTargetsSatisfied(plan, req, a.config.ConsultationMaxAge) {
+					plan.CodebasePatterns = extractLibrarianPatterns(plan)
+					if err := a.persistPlanState(plan); err != nil {
+						return nil, err
+					}
+					return map[string]any{
+						"ready":         true,
+						"consultations": plan.Consultations,
+						"required":      mandatoryConsultationTargets(req),
+						"reused":        true,
+					}, nil
+				}
+				if !hasReachedPlanPhase(plan.SM().State(), PlanStatusConsulting) {
+					if err := a.advancePlan(ctx, plan, PlanStatusConsulting, nil); err != nil {
+						return nil, err
+					}
 				}
 			}
 			if err := a.enforceConsultationGate(ctx, plan, req); err != nil {
@@ -364,6 +378,23 @@ func isConsultationFresh(evidence *ConsultationEvidence, maxAge time.Duration) b
 		return false
 	}
 	return time.Since(evidence.ReceivedAt) <= maxAge
+}
+
+func consultationTargetsSatisfied(plan *DesignPlan, req *ArchitectRequest, maxAge time.Duration) bool {
+	if plan == nil {
+		return false
+	}
+	required := mandatoryConsultationTargets(req)
+	if len(required) == 0 {
+		return true
+	}
+	for _, target := range required {
+		evidence := plan.Consultations[target]
+		if evidence == nil || !evidence.Success || !isConsultationFresh(evidence, maxAge) {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Architect) persistDeclaration(plan *DesignPlan, declaration *PreDelegationDeclaration) {
@@ -1001,7 +1032,7 @@ func askUserQuestionSkill(a *Architect) *skills.Skill {
 		Priority(70).
 		StringParam("session_id", "Session identifier", false).
 		ArrayParam("questions", "Question objects with options", "object", true).
-		Usage("Use as a last resort when the Architect cannot resolve ambiguity through consultation or plan analysis alone. Creates a structured clarification request with multiple-choice options. Do NOT use for routine planning decisions — exhaust consultation evidence first.").
+		Usage("Use as a last resort when the Architect cannot resolve one or two narrow ambiguities through consultation or plan analysis alone. Creates a structured clarification request with multiple-choice options. Do NOT use this for broad, underspecified requests that need exploratory clarification — use route_requirements_research for that.").
 		Example(`{"session_id": "sess_abc", "questions": [{"question": "Which authentication method should we use?", "options": [{"label": "OAuth2", "description": "External provider flow"}, {"label": "JWT", "description": "Self-issued tokens"}]}]}`).
 		BestPractice("Provide concrete options whenever possible — open-ended questions slow the workflow significantly.").
 		BestPractice("Batch related questions into a single call rather than asking one at a time.").
@@ -1037,6 +1068,256 @@ func askUserQuestionSkill(a *Architect) *skills.Skill {
 			}, nil
 		}).
 		Build()
+}
+
+type routeRequirementsResearchParams struct {
+	PlanID              string   `json:"plan_id,omitempty"`
+	OriginalInput       string   `json:"original_input"`
+	Reason              string   `json:"reason"`
+	ResearchGoal        string   `json:"research_goal,omitempty"`
+	KnownContext        []string `json:"known_context,omitempty"`
+	MissingRequirements []string `json:"missing_requirements,omitempty"`
+}
+
+type requirementsResearchHandoffPayload struct {
+	PlanID              string   `json:"plan_id,omitempty"`
+	OriginalInput       string   `json:"original_input"`
+	Reason              string   `json:"reason"`
+	ResearchGoal        string   `json:"research_goal,omitempty"`
+	KnownContext        []string `json:"known_context,omitempty"`
+	MissingRequirements []string `json:"missing_requirements,omitempty"`
+}
+
+func routeRequirementsResearchSkill(a *Architect) *skills.Skill {
+	return skills.NewSkill("route_requirements_research").
+		Description("Hand the conversation to the Academic when the request is too vague or underspecified for reliable planning.").
+		Domain("coordination").
+		Keywords("underspecified", "vague", "requirements", "research", "clarify", "academic").
+		Priority(95).
+		StringParam("plan_id", "Current plan identifier when this handoff occurs mid-protocol", false).
+		StringParam("original_input", "The user's implementation request or latest relevant message", true).
+		StringParam("reason", "Why the Architect cannot safely plan yet", true).
+		StringParam("research_goal", "What the Academic should help clarify or research", false).
+		ArrayParam("known_context", "Facts or constraints already established", "string", false).
+		ArrayParam("missing_requirements", "Concrete gaps that must be clarified before planning", "string", false).
+		Usage("Use when the implementation request is still too vague or underspecified to produce a responsible plan. This performs a Guide-routed user handoff to the Academic so the problem can be clarified before planning continues. Prefer this over ask_user_question when the user needs exploratory clarification or requirements-shaping, not just one narrow decision.").
+		Example(`{"original_input":"Build a production-ready observability system for our platform.","reason":"The request does not define scope, target workloads, retention, compliance constraints, or success criteria.","research_goal":"Clarify scope, operational constraints, and the minimum viable rollout plan.","missing_requirements":["Target services and traffic profile","Required retention/compliance constraints","Primary success metrics"]}`).
+		BestPractice("Use ask_user_question for one or two concrete decisions. Use this tool when the user first needs help defining the problem space well enough to plan.").
+		BestPractice("Do NOT use this when the blocker is codebase or change-history evidence. In that case, consult the Librarian or Archivalist instead of handing the user away.").
+		BestPractice("Pass the user's real request in original_input and summarize the missing requirements precisely — that context becomes the Academic's hidden handoff brief.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			params, err := parseRouteRequirementsResearchParams(input)
+			if err != nil {
+				return nil, err
+			}
+			return a.submitRequirementsResearchHandoff(ctx, params)
+		}).
+		Build()
+}
+
+func parseRouteRequirementsResearchParams(input json.RawMessage) (*routeRequirementsResearchParams, error) {
+	var params routeRequirementsResearchParams
+	if err := json.Unmarshal(input, &params); err != nil {
+		return nil, fmt.Errorf("invalid parameters: %w", err)
+	}
+	params.PlanID = strings.TrimSpace(params.PlanID)
+	params.OriginalInput = strings.TrimSpace(params.OriginalInput)
+	params.Reason = strings.TrimSpace(params.Reason)
+	params.ResearchGoal = strings.TrimSpace(params.ResearchGoal)
+	params.KnownContext = dedupeNonEmptyStrings(params.KnownContext)
+	params.MissingRequirements = dedupeNonEmptyStrings(params.MissingRequirements)
+	if params.Reason == "" {
+		return nil, fmt.Errorf("reason is required")
+	}
+	return &params, nil
+}
+
+func (a *Architect) submitRequirementsResearchHandoff(
+	ctx context.Context,
+	params *routeRequirementsResearchParams,
+) (map[string]any, error) {
+	if a == nil || params == nil {
+		return nil, fmt.Errorf("requirements research handoff is not configured")
+	}
+	if !a.running || a.bus == nil {
+		return nil, fmt.Errorf("bus unavailable for academic handoff")
+	}
+
+	sessionID := normalizeSessionID(architectSessionIDFromContext(ctx))
+	targetAgentID := a.knownAgentIDByType("academic", "academic")
+	originalInput, handoffHistory := architectHandoffContext(ctx)
+	if params.OriginalInput != "" {
+		originalInput = params.OriginalInput
+	}
+	if strings.TrimSpace(originalInput) == "" {
+		return nil, fmt.Errorf("original_input is required for academic handoff")
+	}
+	plan := a.resolveRequirementsResearchPlan(params.PlanID, sessionID)
+	if plan != nil && plan.PendingWork != nil && plan.PendingWork.Kind == string(continuationKindAcademicHandoff) {
+		message := strings.TrimSpace(plan.PendingWork.Message)
+		if message == "" {
+			message = "I'm already routing this request through the Academic so we can sharpen the requirements before planning."
+		}
+		return map[string]any{
+			"status":         "requirements_research_pending",
+			"plan_id":        plan.ID,
+			"correlation_id": plan.PendingWork.CorrelationID,
+			"target_agent":   plan.PendingWork.TargetAgentID,
+			"user_message":   message,
+		}, nil
+	}
+
+	payload := &requirementsResearchHandoffPayload{
+		PlanID:              params.PlanID,
+		OriginalInput:       originalInput,
+		Reason:              params.Reason,
+		ResearchGoal:        params.ResearchGoal,
+		KnownContext:        append([]string(nil), params.KnownContext...),
+		MissingRequirements: append([]string(nil), params.MissingRequirements...),
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode academic handoff: %w", err)
+	}
+	rawArgs, _ := json.Marshal(params)
+
+	correlationID := "academic_" + uuid.NewString()
+	userMessage := "This request is still too vague for me to plan responsibly. I'm handing you to the Academic to sharpen the requirements and constraints before I continue."
+	record := &ArchitectContinuation{
+		ID:                      "cont_" + uuid.NewString(),
+		Kind:                    continuationKindAcademicHandoff,
+		State:                   continuationStatusPending,
+		PlanID:                  planID(plan),
+		SessionID:               sessionID,
+		TargetAgentID:           targetAgentID,
+		ResponseCorrelationID:   correlationID,
+		InvocationCorrelationID: originalCIDFromContext(ctx),
+		ToolName:                "route_requirements_research",
+		RawArguments:            string(rawArgs),
+		RequestJSON:             string(encoded),
+		CreatedAt:               time.Now().UTC(),
+		ExpiresAt:               time.Now().UTC().Add(routeSyncTimeout),
+	}
+	if err := a.recordPendingContinuation(plan, record, userMessage); err != nil {
+		return nil, err
+	}
+
+	req := &guide.RouteRequest{
+		Input:               originalInput,
+		CorrelationID:       correlationID,
+		ParentCorrelationID: originalCIDFromContext(ctx),
+		TargetAgentID:       targetAgentID,
+		SessionID:           sessionID,
+		Metadata: map[string]any{
+			"user_facing_handoff":       true,
+			"handoff_kind":              "requirements_clarification",
+			"handoff_from":              "architect",
+			"handoff_reason":            params.Reason,
+			"handoff_research_goal":     params.ResearchGoal,
+			"handoff_known_context":     append([]string(nil), params.KnownContext...),
+			"handoff_missing_questions": append([]string(nil), params.MissingRequirements...),
+			"original_request_agent":    "architect",
+		},
+	}
+	if plan != nil {
+		req.Metadata["plan_id"] = plan.ID
+	}
+	if strings.TrimSpace(handoffHistory) != "" {
+		req.Metadata["handoff_conversation_history"] = handoffHistory
+	}
+	if err := a.publishRouteRequest(req); err != nil {
+		if plan != nil {
+			_ = a.clearPlanPendingContinuation(plan, correlationID)
+		}
+		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		return nil, fmt.Errorf("academic handoff failed: %w", err)
+	}
+
+	if plan != nil {
+		a.markPlanClarifyingForResearch(plan, params.MissingRequirements)
+	}
+	if originalCID := originalCIDFromContext(ctx); originalCID != "" {
+		a.publishHandoffReroute(ctx, targetAgentID, "requirements clarification handoff", originalCID, correlationID)
+	}
+
+	payloadMap := map[string]any{
+		"status":         "requirements_research_pending",
+		"plan_id":        planID(plan),
+		"correlation_id": correlationID,
+		"target_agent":   targetAgentID,
+		"user_message":   userMessage,
+	}
+	return nil, skills.NewDelegatedError(payloadMap, userMessage)
+}
+
+func (a *Architect) resolveRequirementsResearchPlan(planID, sessionID string) *DesignPlan {
+	if a == nil || a.planStore == nil {
+		return nil
+	}
+	if trimmed := strings.TrimSpace(planID); trimmed != "" {
+		return a.planStore.Get(trimmed)
+	}
+	if plan := a.latestConsultingPlan(sessionID); plan != nil {
+		return plan
+	}
+	return a.latestClarifyingPlan(sessionID)
+}
+
+func (a *Architect) markPlanClarifyingForResearch(plan *DesignPlan, missing []string) {
+	if a == nil || plan == nil {
+		return
+	}
+	if len(missing) > 0 {
+		plan.ClarificationQuestions = append([]string(nil), missing...)
+	}
+	if plan.SM().State() == PlanStatusConsulting && len(plan.ClarificationQuestions) > 0 {
+		if err := plan.SM().TransitionTo(PlanStatusClarifying, plan); err == nil {
+			plan.Status = plan.SM().State()
+			plan.Epoch = plan.SM().Epoch()
+		}
+	}
+	plan.UpdatedAt = time.Now().UTC()
+	_ = a.persistPlanState(plan)
+}
+
+func dedupeNonEmptyStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func planID(plan *DesignPlan) string {
+	if plan == nil {
+		return ""
+	}
+	return strings.TrimSpace(plan.ID)
+}
+
+func architectHandoffContext(ctx context.Context) (string, string) {
+	if ctx == nil {
+		return "", ""
+	}
+	payload, ok := architectConversationContextFromContext(ctx)
+	if !ok {
+		return "", ""
+	}
+	query := strings.TrimSpace(payload.UserQuery)
+	history := formatConversationHistory(payload.ConversationHistory)
+	return query, strings.TrimSpace(history)
 }
 
 // extractQuestionTexts pulls the "question" string from each question
@@ -1172,6 +1453,35 @@ type startPlanningInput struct {
 	SessionID string `json:"session_id,omitempty"`
 }
 
+func (a *Architect) reusablePlanForRequest(sessionID, requestCorrelationID string) *DesignPlan {
+	if strings.TrimSpace(requestCorrelationID) == "" {
+		return nil
+	}
+	return a.planStore.LatestReusableForRequest(sessionID, requestCorrelationID)
+}
+
+func (a *Architect) supersedeDuplicateRequestPlans(sessionID, requestCorrelationID, keepPlanID string) {
+	if strings.TrimSpace(requestCorrelationID) == "" {
+		return
+	}
+	for _, candidate := range a.planStore.ActiveDuplicateRequestPlans(sessionID, requestCorrelationID) {
+		if candidate == nil || strings.TrimSpace(candidate.ID) == strings.TrimSpace(keepPlanID) {
+			continue
+		}
+		if candidate.SM().State() == PlanStatusSuperseded {
+			continue
+		}
+		if err := candidate.SM().TransitionTo(PlanStatusSuperseded, candidate); err != nil {
+			continue
+		}
+		candidate.Status = candidate.SM().State()
+		candidate.Epoch = candidate.SM().Epoch()
+		candidate.UpdatedAt = time.Now().UTC()
+		candidate.Error = "superseded duplicate request plan"
+		_ = a.persistPlanState(candidate)
+	}
+}
+
 func startPlanningSkill(a *Architect) *skills.Skill {
 	return skills.NewSkill("start_planning").
 		Description("Create a new plan and return the plan_id. "+
@@ -1201,6 +1511,22 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 			if sessionID == "" {
 				sessionID = normalizeSessionID(params.SessionID)
 			}
+			requestCorrelationID := originalCIDFromContext(ctx)
+			if reusable := a.reusablePlanForRequest(sessionID, requestCorrelationID); reusable != nil {
+				a.supersedeDuplicateRequestPlans(sessionID, requestCorrelationID, reusable.ID)
+				a.logInfo("start_planning: reusing request-scoped plan",
+					"plan_id", reusable.ID,
+					"session_id", sessionID,
+					"request_correlation_id", requestCorrelationID,
+					"status", reusable.SM().State().String())
+				return map[string]any{
+					"plan_id":    reusable.ID,
+					"session_id": sessionID,
+					"status":     reusable.SM().State().String(),
+					"protocol":   startPlanningProtocolInstructions(a.config.AutoApprove),
+					"reused":     true,
+				}, nil
+			}
 			req := &ArchitectRequest{
 				ID:        uuid.NewString(),
 				Intent:    IntentPlan,
@@ -1209,11 +1535,15 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 				Timestamp: time.Now(),
 			}
 			req = a.enrichPlanningRequest(req)
-			plan := newProtocolPlan(req)
-			a.persistPlanState(plan)
+			plan := newProtocolPlan(req, requestCorrelationID)
+			if err := a.persistPlanState(plan); err != nil {
+				return nil, err
+			}
+			a.supersedeDuplicateRequestPlans(sessionID, requestCorrelationID, plan.ID)
 			a.logInfo("start_planning: plan created",
 				"plan_id", plan.ID,
 				"session_id", sessionID,
+				"request_correlation_id", requestCorrelationID,
 				"query", truncateString(query, 120))
 
 			shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanCreated,
@@ -1224,6 +1554,7 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 				"session_id": sessionID,
 				"status":     plan.Status.String(),
 				"protocol":   startPlanningProtocolInstructions(a.config.AutoApprove),
+				"reused":     false,
 			}, nil
 		}).
 		Build()
@@ -1238,7 +1569,9 @@ func startPlanningProtocolInstructions(autoApprove bool) string {
 		"Invoke these skills in order:\n" +
 		"1. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
 		"2. consult(mode=pre_planning, plan_id=<plan_id>)\n" +
-		"3. If critical ambiguities exist, invoke ask_user_question and STOP.\n" +
+		"3. If the request is still broadly vague or underspecified, invoke route_requirements_research and STOP. " +
+		"Use ask_user_question only for one or two narrow decisions. If the blocker is codebase or history evidence, " +
+		"consult the Librarian or Archivalist instead.\n" +
 		"4. plan(action=design, plan_id=<plan_id>)\n" +
 		"5. plan(action=generate_tasks, plan_id=<plan_id>) — auto-creates workflow and validates.\n" +
 		"6. The system renders the plan structure separately in the UI — the user already sees it.\n" +

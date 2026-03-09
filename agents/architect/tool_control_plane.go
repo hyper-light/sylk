@@ -144,15 +144,26 @@ func (c *architectGuardianControlPlane) guardianAgentID() string {
 	if c == nil || c.owner == nil {
 		return "guardian"
 	}
-	c.owner.knownAgentsMu.RLock()
-	defer c.owner.knownAgentsMu.RUnlock()
-	for _, ann := range c.owner.knownAgents {
+	return c.owner.knownAgentIDByType("guardian", "guardian")
+}
+
+func (a *Architect) knownAgentIDByType(agentType, fallback string) string {
+	if a == nil {
+		return fallback
+	}
+	targetType := strings.TrimSpace(agentType)
+	if targetType == "" {
+		return fallback
+	}
+	a.knownAgentsMu.RLock()
+	defer a.knownAgentsMu.RUnlock()
+	for _, ann := range a.knownAgents {
 		if ann == nil {
 			continue
 		}
-		if ann.AgentType == "guardian" && ann.AgentID != "" {
-			return ann.AgentID
+		if ann.AgentType == targetType && strings.TrimSpace(ann.AgentID) != "" {
+			return strings.TrimSpace(ann.AgentID)
 		}
 	}
-	return "guardian"
+	return fallback
 }

@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -14,6 +15,13 @@ import (
 
 // borderSize is the vertical space consumed by the input border (top + bottom).
 const borderSize = 2
+
+const (
+	inputScrollIndicatorLeftPaddingWidth  = 1
+	inputScrollIndicatorWidth             = 1
+	inputScrollIndicatorRightPaddingWidth = 1
+	inputScrollIndicatorGutterWidth       = inputScrollIndicatorLeftPaddingWidth + inputScrollIndicatorWidth + inputScrollIndicatorRightPaddingWidth
+)
 
 // Model is the prompt input component.
 type Model struct {
@@ -31,8 +39,8 @@ type Model struct {
 	sel selection // Anchor+cursor range selection.
 
 	// Markdown display state.
-	md      *mdDisplay    // Parsed markdown mapping (nil if none).
-	mdDirty bool          // True when lines have changed since last parse.
+	md      *mdDisplay     // Parsed markdown mapping (nil if none).
+	mdDirty bool           // True when lines have changed since last parse.
 	mdStyle *mdInputStyles // Cached markdown styles.
 
 	history   *InputHistory
@@ -56,6 +64,8 @@ type Model struct {
 	// focusBorderRender, when set, replaces the lipgloss border style with
 	// per-character gradient border rendering for the focus ring shimmer.
 	focusBorderRender func(content string, innerW, innerH, maxH int) string
+
+	scrollIndicatorColor lipgloss.Color
 
 	// View cache: avoids re-rendering when no visible state changed.
 	viewCache      string
@@ -220,9 +230,8 @@ func (m *Model) View(cursorVisible bool) string {
 	}
 
 	body := m.renderBody(cursorVisible)
-
-	// Right-align a submit hint when the input is empty.
 	cw := m.contentWidth()
+	// Right-align a submit hint when the input is empty.
 	if m.isEmpty() {
 		hint := m.theme.Placeholder.Render("enter ↵")
 		if gap := cw - lipgloss.Width(body) - lipgloss.Width(hint); gap > 0 {
@@ -310,17 +319,26 @@ func (m *Model) ensureWrap() {
 		return
 	}
 	m.ensureMd()
+	m.wrap = m.computeWrapForWidth(m.contentWidth())
+	if m.wrap.visualTotal > m.maxHeight && m.contentWidth() > 1 {
+		m.wrap = m.computeWrapForWidth(m.contentWidth() - inputScrollIndicatorGutterWidth)
+	}
+	m.wrapDirty = false
+}
+
+func (m *Model) computeWrapForWidth(width int) *wrapState {
+	if width < 1 {
+		width = 1
+	}
 	if m.md != nil {
 		// Wrap on display text (with hidden delimiters removed).
 		dispLines := make([][]rune, len(m.lines))
 		for i, line := range m.lines {
 			dispLines[i] = m.md.displayRunes(i, line)
 		}
-		m.wrap = computeWrap(dispLines, m.contentWidth())
-	} else {
-		m.wrap = computeWrap(m.lines, m.contentWidth())
+		return computeWrap(dispLines, width)
 	}
-	m.wrapDirty = false
+	return computeWrap(m.lines, width)
 }
 
 // VisualLineCount returns the number of visual lines after word wrapping.
@@ -390,8 +408,8 @@ var selectionKeys = []keyEntry{
 
 // normalKeys are dispatched when the completer is not active.
 var normalKeys = []keyEntry{
-	{matchKey("enter"), actionSubmit},
 	{matchKey("shift+enter"), actionNewline},
+	{matchKey("enter"), actionSubmit},
 	{matchKey("up"), actionUp},
 	{matchKey("down"), actionDown},
 	{matchKey("tab"), actionTab},
@@ -667,7 +685,7 @@ func (m *Model) ClickAt(x, y int) {
 		vRow = m.wrap.visualTotal - 1
 	}
 
-	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, x)
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, m.clampInputX(x))
 	m.clampCol()
 	m.skipHiddenDelimiters(1)
 	m.viewDirty = true
@@ -678,7 +696,7 @@ func (m *Model) DragStart(x, y int) {
 	m.completer.Dismiss()
 	m.ensureWrap()
 	vRow := max(min(m.scrollOff+y, m.wrap.visualTotal-1), 0)
-	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, x)
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, m.clampInputX(x))
 	m.clampCol()
 	m.sel = selection{
 		anchorRow: m.cursorRow,
@@ -695,7 +713,7 @@ func (m *Model) DragTo(x, y int) {
 	}
 	m.ensureWrap()
 	vRow := max(min(m.scrollOff+y, m.wrap.visualTotal-1), 0)
-	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, max(x, 0))
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, m.clampInputX(x))
 	m.clampCol()
 	m.scrollIntoView()
 	m.viewDirty = true
@@ -1029,6 +1047,17 @@ func (m *Model) SetFocusBorderRender(fn func(content string, innerW, innerH, max
 	m.viewDirty = true
 }
 
+// SetScrollIndicatorColor updates the animated accent color used by the input
+// scroll indicators. Returns true when the rendered view changed.
+func (m *Model) SetScrollIndicatorColor(color lipgloss.Color) bool {
+	if string(m.scrollIndicatorColor) == string(color) {
+		return false
+	}
+	m.scrollIndicatorColor = color
+	m.viewDirty = true
+	return true
+}
+
 // borderStyle returns the appropriate border style based on focus state.
 func (m *Model) borderStyle() lipgloss.Style {
 	if m.focused {
@@ -1045,6 +1074,29 @@ func (m *Model) contentWidth() int {
 		return 1
 	}
 	return w
+}
+
+func (m *Model) textRenderWidth() int {
+	width := m.contentWidth()
+	if m.hasScrollIndicatorGutter() {
+		width -= inputScrollIndicatorGutterWidth
+	}
+	if width < 1 {
+		return 1
+	}
+	return width
+}
+
+func (m *Model) hasScrollIndicatorGutter() bool {
+	return m.wrap != nil && m.wrap.visualTotal > m.maxHeight
+}
+
+func (m *Model) clampInputX(x int) int {
+	maxX := m.textRenderWidth() - 1
+	if maxX < 0 {
+		return 0
+	}
+	return max(min(x, maxX), 0)
 }
 
 // renderBody renders the visible visual lines with cursor and placeholder.
@@ -1069,34 +1121,92 @@ func (m *Model) renderBody(cursorVisible bool) string {
 		m.scrollOff = 0
 	}
 
+	showGutter := m.hasScrollIndicatorGutter()
+	textWidth := m.textRenderWidth()
+	canScrollUp := m.scrollOff > 0
+	canScrollDown := m.scrollOff < maxOff
 	end := min(m.scrollOff+m.maxHeight, m.wrap.visualTotal)
 	rendered := 0
-	var b strings.Builder
+	lines := make([]string, 0, m.maxHeight)
 	for vRow := m.scrollOff; vRow < end; vRow++ {
-		if rendered > 0 {
-			b.WriteByte('\n')
-		}
 		actualRow, segIdx := m.wrap.visualRowToSegment(vRow)
 		span := m.wrap.segments[actualRow][segIdx]
 
+		var line string
 		if m.md != nil {
 			dispRunes := m.md.displayRunes(actualRow, m.lines[actualRow])
 			segment := dispRunes[span.Start:span.End]
-			b.WriteString(m.renderMdVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible))
+			line = m.renderMdVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible)
 		} else {
 			segment := m.lines[actualRow][span.Start:span.End]
-			b.WriteString(m.renderVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible))
+			line = m.renderVisualLine(segment, actualRow, span.Start, segIdx, cursorVisible)
 		}
+		if showGutter {
+			line = fitRenderedLineWidth(line, textWidth)
+			line += strings.Repeat(" ", inputScrollIndicatorLeftPaddingWidth) +
+				m.renderScrollIndicator(rendered, canScrollUp, canScrollDown) +
+				strings.Repeat(" ", inputScrollIndicatorRightPaddingWidth)
+		}
+		lines = append(lines, line)
 		rendered++
 	}
 	// Pad to exactly maxHeight lines so the border height is deterministic.
 	for rendered < m.maxHeight {
-		if rendered > 0 {
-			b.WriteByte('\n')
+		if showGutter {
+			lines = append(lines,
+				strings.Repeat(" ", textWidth)+
+					strings.Repeat(" ", inputScrollIndicatorLeftPaddingWidth)+
+					m.renderScrollIndicator(rendered, canScrollUp, canScrollDown)+
+					strings.Repeat(" ", inputScrollIndicatorRightPaddingWidth),
+			)
+		} else {
+			lines = append(lines, "")
 		}
 		rendered++
 	}
-	return b.String()
+	return strings.Join(lines, "\n")
+}
+
+func fitRenderedLineWidth(line string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(line) > width {
+		line = ansi.Truncate(line, width, "")
+	}
+	if gap := width - ansi.StringWidth(line); gap > 0 {
+		line += strings.Repeat(" ", gap)
+	}
+	return line
+}
+
+func (m *Model) renderScrollIndicator(visibleRow int, canScrollUp, canScrollDown bool) string {
+	glyph := " "
+	if m.maxHeight <= 1 {
+		switch {
+		case canScrollUp && canScrollDown:
+			glyph = "⇕"
+		case canScrollUp:
+			glyph = "⇑"
+		case canScrollDown:
+			glyph = "⇓"
+		}
+	} else {
+		switch {
+		case visibleRow == 0 && canScrollUp:
+			glyph = "⇑"
+		case visibleRow == m.maxHeight-1 && canScrollDown:
+			glyph = "⇓"
+		}
+	}
+	if glyph == " " {
+		return glyph
+	}
+	style := lipgloss.NewStyle().Foreground(m.theme.Palette.Secondary).Bold(true)
+	if m.scrollIndicatorColor != "" {
+		style = style.Foreground(m.scrollIndicatorColor)
+	}
+	return style.Render(glyph)
 }
 
 // enforceLineCount pads or truncates s to exactly n newline-separated lines.
@@ -1250,7 +1360,7 @@ func (m *Model) renderMdVisualLine(segment []rune, actualRow, segOffset, segIdx 
 	// Cursor at end of segment — only add trailing indicator if it won't
 	// push the line past contentWidth.
 	if needsCursor && localCol >= len(segment) {
-		room := m.contentWidth() - runeSliceWidth(segment)
+		room := m.textRenderWidth() - runeSliceWidth(segment)
 		ghost := m.completer.GhostSuffix()
 		if len(ghost) > 0 && room > 0 {
 			ghostRunes := []rune(ghost)
@@ -1378,7 +1488,7 @@ func (m *Model) renderSelectionWithCursor(segment []rune, actualRow, segOffset i
 	// Cursor at end of segment — only add trailing indicator if it won't
 	// push the line past contentWidth (which breaks the border renderer).
 	if needsCursor && localCol >= len(segment) {
-		room := m.contentWidth() - runeSliceWidth(segment)
+		room := m.textRenderWidth() - runeSliceWidth(segment)
 		ghostRunes := []rune(ghost)
 		mutedStyle := lipgloss.NewStyle().Foreground(m.theme.Palette.Muted)
 		if len(ghostRunes) > 0 && room > 0 {
@@ -1433,7 +1543,7 @@ func (m *Model) renderCursorWithGhostLocal(seg []rune, segStr string, localCol i
 
 	// No ghost: standard end-of-segment cursor. Only add trailing space
 	// if it won't push the line past contentWidth.
-	if cursorVisible && runeSliceWidth(seg) < m.contentWidth() {
+	if cursorVisible && runeSliceWidth(seg) < m.textRenderWidth() {
 		return segStr + cursorStyle.Render(" ")
 	}
 	return segStr

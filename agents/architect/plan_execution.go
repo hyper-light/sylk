@@ -193,10 +193,28 @@ func (a *Architect) latestStalledPlan(sessionID string) *DesignPlan {
 	return a.planStore.LatestStalled(sessionID, stalledPlanMaxAge)
 }
 
+func (a *Architect) latestStalledPlanForRequest(sessionID, requestCorrelationID string) *DesignPlan {
+	if strings.TrimSpace(requestCorrelationID) == "" {
+		return a.latestStalledPlan(sessionID)
+	}
+	return a.planStore.LatestStalledForRequest(sessionID, requestCorrelationID, stalledPlanMaxAge)
+}
+
 func isStalledState(s PlanStatus) bool {
 	switch s {
 	case PlanStatusPending, PlanStatusAnalyzing, PlanStatusConsulting,
 		PlanStatusDesigning, PlanStatusGenerating, PlanStatusOrchestrating:
+		return true
+	default:
+		return false
+	}
+}
+
+func isReusablePlanningState(s PlanStatus) bool {
+	switch s {
+	case PlanStatusPending, PlanStatusAnalyzing, PlanStatusConsulting,
+		PlanStatusClarifying, PlanStatusDesigning, PlanStatusGenerating,
+		PlanStatusOrchestrating, PlanStatusReady:
 		return true
 	default:
 		return false

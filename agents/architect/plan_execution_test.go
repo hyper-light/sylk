@@ -124,6 +124,30 @@ func TestLatestStalledPlan_IgnoresOldPlan(t *testing.T) {
 	}
 }
 
+func TestLatestStalledPlanForRequest_FiltersByCorrelation(t *testing.T) {
+	now := time.Now()
+	a := testArchitectWithStore(t,
+		&DesignPlan{
+			ID:                   "wanted",
+			SessionID:            "sess1",
+			Status:               PlanStatusConsulting,
+			RequestCorrelationID: "corr-1",
+			UpdatedAt:            now,
+		},
+		&DesignPlan{
+			ID:                   "other",
+			SessionID:            "sess1",
+			Status:               PlanStatusGenerating,
+			RequestCorrelationID: "corr-2",
+			UpdatedAt:            now.Add(time.Second),
+		},
+	)
+	plan := a.latestStalledPlanForRequest("sess1", "corr-1")
+	if plan == nil || plan.ID != "wanted" {
+		t.Fatalf("latestStalledPlanForRequest = %v, want wanted", plan)
+	}
+}
+
 func TestIsStalledState(t *testing.T) {
 	stalled := []PlanStatus{
 		PlanStatusPending, PlanStatusAnalyzing, PlanStatusConsulting,

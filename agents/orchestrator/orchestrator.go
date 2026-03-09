@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -996,6 +997,7 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	}
 
 	taskID, _ := data["task_id"].(string)
+	taskSlug, _ := data["task_slug"].(string)
 	workflowID, _ := data["workflow_id"].(string)
 	name, _ := data["name"].(string)
 	agentID, _ := data["agent_id"].(string)
@@ -1030,8 +1032,7 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	// Extract pipeline stage from sub-node context if present.
 	pipelineStage := ""
 	pipelineParentID := ""
-	pipelineTaskID := ""
-	pipelineTaskSlug := ""
+	pipelineTaskID, pipelineTaskSlug := canonicalPipelineTaskIdentity(taskID, taskSlug, nodeCtx, nodeID)
 	if nodeCtx != nil {
 		if stage, ok := nodeCtx["pipeline_stage"].(string); ok {
 			pipelineStage = stage
@@ -1039,18 +1040,6 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		if parentID, ok := nodeCtx["pipeline_parent_id"].(string); ok {
 			pipelineParentID = parentID
 		}
-		if stableTaskID, ok := nodeCtx["task_id"].(string); ok {
-			pipelineTaskID = stableTaskID
-		}
-		if stableTaskSlug, ok := nodeCtx["task_slug"].(string); ok {
-			pipelineTaskSlug = stableTaskSlug
-		}
-	}
-	if pipelineTaskID == "" {
-		pipelineTaskID = pipelineParentID
-	}
-	if pipelineTaskID == "" {
-		pipelineTaskID = nodeID
 	}
 
 	// Task starts as Queued — transitions to Running when ACK arrives.
@@ -1111,7 +1100,7 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 			}
 		}
 
-		for _, pipelineType := range PipelineAgentTypes {
+		for _, pipelineType := range PipelinePanelAgentTypes {
 			if _, active := dispatched[pipelineType]; !active {
 				o.publishPipelineAgentRegistration(pipelineType, pipelineTaskID, pipelineTaskSlug)
 			}
@@ -1147,10 +1136,35 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 				Severity:  severityCritical,
 				Summary:   fmt.Sprintf("Route failed for node %s: %s", nodeID, routeErr),
 			})
+		} else if o.dagBridge != nil {
+			o.dagBridge.AcknowledgeDispatch(dagID, nodeID, agentID, agentType)
 		}
 	}
 
 	return nil
+}
+
+func canonicalPipelineTaskIdentity(taskID, taskSlug string, nodeCtx map[string]any, nodeID string) (string, string) {
+	canonicalTaskID := strings.TrimSpace(taskID)
+	canonicalTaskSlug := strings.TrimSpace(taskSlug)
+
+	if nodeCtx != nil {
+		if canonicalTaskSlug == "" {
+			if ctxSlug, ok := nodeCtx["task_slug"].(string); ok {
+				canonicalTaskSlug = strings.TrimSpace(ctxSlug)
+			}
+		}
+		if canonicalTaskID == "" {
+			if ctxTaskID, ok := nodeCtx["task_id"].(string); ok {
+				canonicalTaskID = strings.TrimSpace(ctxTaskID)
+			}
+		}
+	}
+	if canonicalTaskID == "" {
+		canonicalTaskID = strings.TrimSpace(nodeID)
+	}
+
+	return canonicalTaskID, canonicalTaskSlug
 }
 
 func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {

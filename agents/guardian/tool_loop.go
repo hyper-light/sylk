@@ -160,17 +160,19 @@ func (g *Guardian) streamToolLoopTurn(
 	req *providers.Request,
 	onChunk func(string),
 ) (*providers.Response, error) {
+	if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+		llmruntime.PromoteForUserFacingTurn(req, pp.SourceAgentID, llmruntime.ThoughtVisibilitySummary)
+	}
 	chunks, err := provider.Stream(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
-	var thoughts strings.Builder
+	emitter := shared.NewThoughtEmitter(llmruntime.EmitsThoughts(req))
 	collector := providers.NewStreamCollector(func(chunk *providers.StreamChunk) {
 		switch chunk.Type {
 		case providers.ChunkTypeStart:
-			thoughts.Reset()
 			if chunk.RetryReset {
 				g.publishStreamStart(ctx, correlationID)
 			}
@@ -180,8 +182,9 @@ func (g *Guardian) streamToolLoopTurn(
 			}
 		case providers.ChunkTypeThought:
 			if llmruntime.EmitsThoughts(req) {
-				thoughts.WriteString(chunk.Text)
-				g.publishThoughtProgress(ctx, correlationID, thoughts.String())
+				if thought := emitter.AddDelta(chunk.Text); thought != "" {
+					g.publishThoughtProgress(ctx, correlationID, thought)
+				}
 			}
 		}
 	})
@@ -192,6 +195,9 @@ func (g *Guardian) streamToolLoopTurn(
 		if chunk.Type == providers.ChunkTypeError {
 			streamErr = fmt.Errorf("stream error: %s", chunk.Text)
 		}
+	}
+	if thought := emitter.Flush(); thought != "" {
+		g.publishThoughtProgress(ctx, correlationID, thought)
 	}
 	if streamErr != nil {
 		return nil, streamErr
@@ -286,7 +292,7 @@ func (g *Guardian) toolInvocations(ctx context.Context, calls []providers.ToolCa
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         g.id,
+			AgentID:         g.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

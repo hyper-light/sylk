@@ -178,6 +178,92 @@ func (s *PlanStore) LatestStalled(sessionID string, maxAge time.Duration) *Desig
 	return best
 }
 
+// LatestStalledForRequest returns the most recently updated stalled plan for a
+// specific request correlation inside a session.
+func (s *PlanStore) LatestStalledForRequest(sessionID, requestCorrelationID string, maxAge time.Duration) *DesignPlan {
+	trimmedSession := strings.TrimSpace(sessionID)
+	trimmedRequest := strings.TrimSpace(requestCorrelationID)
+	if trimmedSession == "" || trimmedRequest == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cutoff := time.Now().Add(-maxAge)
+	var best *DesignPlan
+	for _, plan := range s.plans {
+		if !isStalledState(plan.SM().State()) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmedSession) {
+			continue
+		}
+		if strings.TrimSpace(plan.RequestCorrelationID) != trimmedRequest {
+			continue
+		}
+		if plan.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	return best
+}
+
+// LatestReusableForRequest returns the newest non-terminal plan for a specific
+// request correlation. Used to make repeated planning invocations idempotent.
+func (s *PlanStore) LatestReusableForRequest(sessionID, requestCorrelationID string) *DesignPlan {
+	trimmedSession := strings.TrimSpace(sessionID)
+	trimmedRequest := strings.TrimSpace(requestCorrelationID)
+	if trimmedSession == "" || trimmedRequest == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var best *DesignPlan
+	for _, plan := range s.plans {
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmedSession) {
+			continue
+		}
+		if strings.TrimSpace(plan.RequestCorrelationID) != trimmedRequest {
+			continue
+		}
+		if !isReusablePlanningState(plan.SM().State()) {
+			continue
+		}
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	return best
+}
+
+// ActiveDuplicateRequestPlans returns all non-terminal plans for a request
+// correlation so callers can supersede artifacts from prior buggy retries.
+func (s *PlanStore) ActiveDuplicateRequestPlans(sessionID, requestCorrelationID string) []*DesignPlan {
+	trimmedSession := strings.TrimSpace(sessionID)
+	trimmedRequest := strings.TrimSpace(requestCorrelationID)
+	if trimmedSession == "" || trimmedRequest == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*DesignPlan
+	for _, plan := range s.plans {
+		if !strings.EqualFold(strings.TrimSpace(plan.SessionID), trimmedSession) {
+			continue
+		}
+		if strings.TrimSpace(plan.RequestCorrelationID) != trimmedRequest {
+			continue
+		}
+		if !isReusablePlanningState(plan.SM().State()) {
+			continue
+		}
+		result = append(result, plan)
+	}
+	return result
+}
+
 // LatestClarifying returns the most recently updated plan in Clarifying
 // state for the given session. Returns nil if no matching plan exists.
 func (s *PlanStore) LatestClarifying(sessionID string) *DesignPlan {

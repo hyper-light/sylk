@@ -88,6 +88,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 
 		shared.AccumulateUsage(ctx, &resp.Usage)
+		agentShared.PublishIntermediateToolTurn(gi.bus, gi.channels, ctx, gi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			gi.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -217,7 +218,7 @@ func (gi *GlobalInspector) executeToolCall(ctx context.Context, call providers.T
 	}
 	return gi.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         gi.id,
+		AgentID:         gi.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: gi.toolRuntime().CapabilityScope(),
 	})
@@ -255,7 +256,7 @@ func (gi *GlobalInspector) toolInvocations(ctx context.Context, calls []provider
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         gi.id,
+			AgentID:         gi.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

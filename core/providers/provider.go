@@ -133,10 +133,85 @@ const (
 	RoleTool      Role = "tool"
 )
 
+type ToolKind string
+
+const (
+	ToolKindFunction        ToolKind = "function"
+	ToolKindNativeWebSearch ToolKind = "native_web_search"
+)
+
+type WebSearchContextSize string
+
+const (
+	WebSearchContextSizeLow    WebSearchContextSize = "low"
+	WebSearchContextSizeMedium WebSearchContextSize = "medium"
+	WebSearchContextSizeHigh   WebSearchContextSize = "high"
+)
+
+type WebSearchUserLocation struct {
+	City     string `json:"city,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+type WebSearchOptions struct {
+	SearchContextSize WebSearchContextSize   `json:"search_context_size,omitempty"`
+	UserLocation      *WebSearchUserLocation `json:"user_location,omitempty"`
+	AllowedDomains    []string               `json:"allowed_domains,omitempty"`
+	BlockedDomains    []string               `json:"blocked_domains,omitempty"`
+	MaxUses           int                    `json:"max_uses,omitempty"`
+	Strict            bool                   `json:"strict,omitempty"`
+	DeferLoading      bool                   `json:"defer_loading,omitempty"`
+	EnableURLContext  bool                   `json:"enable_url_context,omitempty"`
+}
+
 type Tool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
+	Kind        ToolKind          `json:"kind,omitempty"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	Parameters  map[string]any    `json:"parameters"`
+	WebSearch   *WebSearchOptions `json:"web_search,omitempty"`
+}
+
+func (t Tool) ResolvedKind() ToolKind {
+	if t.Kind == "" {
+		return ToolKindFunction
+	}
+	return t.Kind
+}
+
+func (t Tool) Clone() Tool {
+	clone := t
+	if t.Parameters != nil {
+		clone.Parameters = cloneToolMap(t.Parameters)
+	}
+	if t.WebSearch != nil {
+		ws := *t.WebSearch
+		if t.WebSearch.UserLocation != nil {
+			location := *t.WebSearch.UserLocation
+			ws.UserLocation = &location
+		}
+		if len(t.WebSearch.AllowedDomains) > 0 {
+			ws.AllowedDomains = append([]string(nil), t.WebSearch.AllowedDomains...)
+		}
+		if len(t.WebSearch.BlockedDomains) > 0 {
+			ws.BlockedDomains = append([]string(nil), t.WebSearch.BlockedDomains...)
+		}
+		clone.WebSearch = &ws
+	}
+	return clone
+}
+
+func cloneToolMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 type ToolCall struct {

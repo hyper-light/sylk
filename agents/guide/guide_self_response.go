@@ -47,6 +47,8 @@ type guideEarlyUsageEmitter func(inputTokens int)
 type guideThoughtEmitterKey struct{}
 type guideEarlyUsageEmitterKey struct{}
 
+const guideStreamedTextMetadataKey = "guide_streamed_text"
+
 // NewGuideResponder creates a provider-agnostic self-responder for Guide.
 func NewGuideResponder(provider providers.ProviderAdapter, model string, cfg RouterConfig) GuideSelfResponder {
 	return &GuideResponder{
@@ -127,14 +129,9 @@ func (r *GuideResponder) respondInternal(
 		// is stateless (no ledger), so DrainAndCheckpoint would be a no-op.
 		// When guide gets its own ledger, use core/steering directly here.
 
-		turnStart := time.Now()
-		resp, err := r.provider.Complete(guardedCtx, req)
-		logClassifierLLMCall(r.eventLogger, r.model, resp, time.Since(turnStart), err)
+		resp, err := r.completeTurn(guardedCtx, req, onChunk)
 		if err != nil {
 			return "", nil, fmt.Errorf("guide model %s: %w", r.model, err)
-		}
-		if llmruntime.EmitsThoughts(req) {
-			emitGuideThought(guardedCtx, resp.Thinking)
 		}
 
 		if len(resp.ToolCalls) == 0 {
@@ -142,7 +139,7 @@ func (r *GuideResponder) respondInternal(
 			if text == "" {
 				return "", nil, fmt.Errorf("guide model %s returned empty response", r.model)
 			}
-			if onChunk != nil {
+			if onChunk != nil && !guideResponseStreamedText(resp) {
 				if err := onChunk(text); err != nil {
 					return "", nil, err
 				}
@@ -169,6 +166,154 @@ func (r *GuideResponder) respondInternal(
 	}
 
 	return "", nil, fmt.Errorf("guide model %s exhausted tool-call loop", r.model)
+}
+
+func (r *GuideResponder) completeTurn(
+	ctx context.Context,
+	req *providers.Request,
+	onChunk func(string) error,
+) (*providers.Response, error) {
+	if onChunk != nil {
+		llmruntime.PromoteThoughtVisibility(req, llmruntime.ThoughtVisibilitySummary)
+		result, err := r.streamTurn(ctx, req, onChunk)
+		if err == nil && guideStreamResponseUsable(result.resp) {
+			return result.resp, nil
+		}
+		if result.sawChunks {
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("guide model %s returned unusable streamed response", r.model)
+		}
+	}
+
+	turnStart := time.Now()
+	resp, err := r.provider.Complete(ctx, req)
+	logClassifierLLMCall(r.eventLogger, r.model, resp, time.Since(turnStart), err)
+	if err != nil {
+		return nil, err
+	}
+	if llmruntime.EmitsThoughts(req) {
+		emitGuideThought(ctx, resp.Thinking)
+	}
+	if onChunk != nil {
+		if text := guideIntermediateToolTurnText(resp); text != "" {
+			if err := onChunk(text); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return resp, nil
+}
+
+func guideStreamResponseUsable(resp *providers.Response) bool {
+	if resp == nil {
+		return false
+	}
+	return strings.TrimSpace(resp.Content) != "" ||
+		strings.TrimSpace(resp.Thinking) != "" ||
+		len(resp.ToolCalls) > 0
+}
+
+type guideStreamTurnResult struct {
+	resp      *providers.Response
+	sawChunks bool
+}
+
+func (r *GuideResponder) streamTurn(
+	ctx context.Context,
+	req *providers.Request,
+	onChunk func(string) error,
+) (guideStreamTurnResult, error) {
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	chunks, err := r.provider.Stream(streamCtx, req)
+	if err != nil {
+		return guideStreamTurnResult{}, err
+	}
+
+	turnStart := time.Now()
+	emitter := guideThoughtStreamEmitter{enabled: llmruntime.EmitsThoughts(req)}
+	sawChunks := false
+	streamedText := false
+	var callbackErr error
+	collector := providers.NewStreamCollector(func(chunk *providers.StreamChunk) {
+		if chunk == nil {
+			return
+		}
+		switch chunk.Type {
+		case providers.ChunkTypeText:
+			if chunk.Text == "" || onChunk == nil {
+				return
+			}
+			if err := onChunk(chunk.Text); err != nil {
+				callbackErr = err
+				cancel()
+				return
+			}
+			streamedText = true
+		case providers.ChunkTypeThought:
+			if thought := emitter.addDelta(chunk.Text); thought != "" {
+				emitGuideThought(ctx, thought)
+			}
+		}
+	})
+
+	var streamErr error
+	for chunk := range chunks {
+		if chunk != nil {
+			sawChunks = true
+		}
+		collector.Add(chunk)
+		if chunk != nil && chunk.Type == providers.ChunkTypeError {
+			streamErr = fmt.Errorf("stream error: %s", chunk.Text)
+		}
+	}
+	if thought := emitter.flush(); thought != "" {
+		emitGuideThought(ctx, thought)
+	}
+	resp := collector.Response()
+	if streamedText {
+		markGuideResponseStreamedText(resp)
+	}
+	logClassifierLLMCall(r.eventLogger, r.model, resp, time.Since(turnStart), streamErr)
+	if callbackErr != nil {
+		return guideStreamTurnResult{resp: resp, sawChunks: sawChunks}, callbackErr
+	}
+	if streamErr != nil {
+		return guideStreamTurnResult{resp: resp, sawChunks: sawChunks}, streamErr
+	}
+	return guideStreamTurnResult{resp: resp, sawChunks: sawChunks}, nil
+}
+
+func guideIntermediateToolTurnText(resp *providers.Response) string {
+	if resp == nil || len(resp.ToolCalls) == 0 {
+		return ""
+	}
+	content := strings.TrimSpace(resp.Content)
+	if content == "" {
+		return ""
+	}
+	return content + "\n\n"
+}
+
+func markGuideResponseStreamedText(resp *providers.Response) {
+	if resp == nil {
+		return
+	}
+	if resp.ProviderMetadata == nil {
+		resp.ProviderMetadata = make(map[string]any)
+	}
+	resp.ProviderMetadata[guideStreamedTextMetadataKey] = true
+}
+
+func guideResponseStreamedText(resp *providers.Response) bool {
+	if resp == nil || resp.ProviderMetadata == nil {
+		return false
+	}
+	value, _ := resp.ProviderMetadata[guideStreamedTextMetadataKey].(bool)
+	return value
 }
 
 // guideToolCallSignature identifies a unique tool invocation by name and arguments.
@@ -384,6 +529,48 @@ func appendThoughtDelta(buffer *strings.Builder, delta string) string {
 		buffer.WriteString(delta)
 	}
 	return strings.TrimSpace(buffer.String())
+}
+
+type guideThoughtStreamEmitter struct {
+	buffer      strings.Builder
+	lastEmitLen int
+	enabled     bool
+}
+
+func (e *guideThoughtStreamEmitter) addDelta(delta string) string {
+	if delta == "" || !e.enabled {
+		if delta != "" {
+			e.buffer.WriteString(delta)
+		}
+		return ""
+	}
+	e.buffer.WriteString(delta)
+	if !guideShouldEmitThought(delta, e.buffer.Len(), e.lastEmitLen) {
+		return ""
+	}
+	e.lastEmitLen = e.buffer.Len()
+	return strings.TrimSpace(e.buffer.String())
+}
+
+func (e *guideThoughtStreamEmitter) flush() string {
+	if !e.enabled || e.buffer.Len() == 0 || e.buffer.Len() == e.lastEmitLen {
+		return ""
+	}
+	e.lastEmitLen = e.buffer.Len()
+	return strings.TrimSpace(e.buffer.String())
+}
+
+func guideShouldEmitThought(delta string, bufferLen, lastEmitLen int) bool {
+	if lastEmitLen == 0 {
+		return true
+	}
+	for _, ch := range delta {
+		switch ch {
+		case '.', '!', '?', '\n':
+			return true
+		}
+	}
+	return bufferLen >= lastEmitLen*2
 }
 
 func buildGuideResponsePrompt(request GuideSelfResponseRequest) string {

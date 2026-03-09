@@ -11,9 +11,35 @@ import (
 )
 
 func (a *Academic) registerFetchSkills() {
+	a.skills.Register(webSearchSkill())
 	a.skills.Register(webFetchSkill(a))
 	a.skills.Register(fetchDocumentSkill(a))
 	a.skills.Register(crawlLinksSkill(a))
+}
+
+func webSearchSkill() *skills.Skill {
+	return skills.NewSkill("web_search").
+		Description(
+			"Search the public web using the model provider's native search capability. "+
+				"Use this to discover authoritative sources when you do not already know the URL. "+
+				"After discovering a source, use web_fetch or fetch_document to retrieve it through the secure pipeline.",
+		).
+		Domain("research").
+		Keywords("search", "web", "internet", "google", "discover", "find sources", "documentation", "papers").
+		Usage("Use when you need to discover candidate sources on the public web before fetching them through Sylk's guarded fetch pipeline.").
+		Example("Search official Go and PostgreSQL sources before recommending connection-pooling practices.").
+		Example("Search for standards, RFCs, vendor docs, and academic papers when the URL is not already known.").
+		BestPractice("Prefer official documentation, standards bodies, project maintainers, and primary-source papers over secondary commentary.").
+		BestPractice("After discovery, fetch the selected source with web_fetch or fetch_document before relying on specific details.").
+		Priority(95).
+		TokenEstimate(220).
+		ProviderTool(skills.ProviderTool{
+			Kind: skills.ProviderToolKindNativeWebSearch,
+			WebSearch: &skills.WebSearchOptions{
+				SearchContextSize: skills.WebSearchContextSizeHigh,
+			},
+		}).
+		Build()
 }
 
 // webFetchSkill fetches a URL through the secure pipeline and returns
@@ -53,13 +79,14 @@ func webFetchSkill(a *Academic) *skills.Skill {
 }
 
 // fetchDocumentSkill fetches a document (PDF, HTML, Markdown) and extracts
-// readable text, then ingests it into the knowledge graph.
+// readable text, then ingests it into the knowledge graph when an ingest
+// backend is configured.
 func fetchDocumentSkill(a *Academic) *skills.Skill {
 	return skills.NewSkill("fetch_document").
 		Description(
-			"Fetch and ingest a document (PDF, HTML, Markdown, plain text) into "+
-				"the knowledge graph. Content is security-scanned, extracted to text, "+
-				"chunked, embedded, and indexed. Returns extracted text preview and "+
+			"Fetch a document (PDF, HTML, Markdown, plain text) and ingest it into "+
+				"the knowledge graph when ingestion is configured. Content is security-scanned, extracted to text, "+
+				"and, when enabled, chunked, embedded, and indexed. Returns extracted text preview and "+
 				"ingestion statistics.",
 		).
 		Domain("research").
@@ -169,10 +196,24 @@ func (a *Academic) executeFetch(ctx context.Context, url, reason string) (any, e
 		"verdict":  resp.Verdict.String(),
 		"duration": resp.Duration.String(),
 	}
+	if resp.ExtractionError != "" {
+		result["extraction_error"] = resp.ExtractionError
+	}
+	if resp.Extracted != nil {
+		result["content"] = truncateStr(resp.Extracted.Text, 12000)
+		result["word_count"] = resp.Extracted.WordCount
+		if resp.Extracted.Title != "" {
+			result["title"] = resp.Extracted.Title
+		}
+		if resp.Extracted.Language != "" {
+			result["language"] = resp.Extracted.Language
+		}
+		result["content_truncated"] = len(resp.Extracted.Text) > 12000
+	}
 	if resp.Provenance != nil {
 		result["content_hash"] = resp.Provenance.ContentHash
 		result["fetched_at"] = resp.Provenance.FetchedAt.Format(time.RFC3339)
-		result["ingested"] = true
+		result["ingested"] = resp.Ingested
 	}
 	return result, nil
 }
@@ -211,12 +252,23 @@ func (a *Academic) executeFetchDocument(ctx context.Context, url, reason string)
 		"url":      resp.URL,
 		"verdict":  resp.Verdict.String(),
 		"duration": resp.Duration.String(),
-		"ingested": true,
+	}
+	if resp.ExtractionError != "" {
+		result["extraction_error"] = resp.ExtractionError
+	}
+	if resp.Extracted != nil {
+		result["text_preview"] = truncateStr(resp.Extracted.Text, 16000)
+		result["word_count"] = resp.Extracted.WordCount
+		if resp.Extracted.Title != "" {
+			result["title"] = resp.Extracted.Title
+		}
+		result["preview_truncated"] = len(resp.Extracted.Text) > 16000
 	}
 	if resp.Provenance != nil {
 		result["content_hash"] = resp.Provenance.ContentHash
 		result["fetched_at"] = resp.Provenance.FetchedAt.Format(time.RFC3339)
 		result["finding_count"] = resp.Provenance.FindingCount
+		result["ingested"] = resp.Ingested
 	}
 	return result, nil
 }
@@ -257,7 +309,17 @@ func (a *Academic) executeCrawl(
 
 	if rootResp.Provenance != nil {
 		result["content_hash"] = rootResp.Provenance.ContentHash
-		result["ingested"] = true
+		result["ingested"] = rootResp.Ingested
+	}
+	if rootResp.ExtractionError != "" {
+		result["extraction_error"] = rootResp.ExtractionError
+	}
+	if rootResp.Extracted != nil {
+		result["content"] = truncateStr(rootResp.Extracted.Text, 12000)
+		result["word_count"] = rootResp.Extracted.WordCount
+		if rootResp.Extracted.Title != "" {
+			result["title"] = rootResp.Extracted.Title
+		}
 	}
 
 	if !followLinks {
@@ -290,6 +352,9 @@ func (a *Academic) executeCrawl(
 		}
 		if !linkResp.Success {
 			entry["error"] = linkResp.Error
+		} else if linkResp.Extracted != nil {
+			entry["content_preview"] = truncateStr(linkResp.Extracted.Text, 4000)
+			entry["word_count"] = linkResp.Extracted.WordCount
 		}
 		linkedResults = append(linkedResults, entry)
 	}
@@ -334,4 +399,3 @@ func truncateStr(s string, maxLen int) string {
 	}
 	return s[:maxLen] + "..."
 }
-

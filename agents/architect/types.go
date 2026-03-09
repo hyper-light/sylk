@@ -141,6 +141,7 @@ type DesignPlan struct {
 	ClarificationQuestions []string
 	Assumptions            []string
 	UserResponse           string
+	RequestCorrelationID   string
 	UpdatedAt              time.Time
 	CreatedAt              time.Time
 	CompletedAt            time.Time

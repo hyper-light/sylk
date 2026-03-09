@@ -131,3 +131,42 @@ func TestFormatErrorForChat_PlainError(t *testing.T) {
 		t.Fatalf("expected plain message, got %q", got)
 	}
 }
+
+func TestHandlePlanUpdate_DoesNotDuplicateEmbeddedReadyPlan(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("architect")
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-plan",
+		AgentID:       "architect",
+	})
+	m = comp.(*Model)
+
+	update := msg.PlanUpdateMsg{
+		PlanID:        "plan-1",
+		CorrelationID: "corr-plan",
+		Status:        "ready",
+		Tasks: []msg.PlanTaskSnapshot{
+			{ID: "task-1", Name: "Create CLI", AgentType: "engineer"},
+		},
+	}
+	m.HandlePlanUpdate(update)
+	m.HandlePlanUpdate(update)
+
+	comp, _ = m.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-plan",
+		AgentID:           "architect",
+		AuthoritativeText: "Plan ready for approval.",
+	})
+	m = comp.(*Model)
+
+	if m.history.Len() != 1 {
+		t.Fatalf("history len = %d, want 1", m.history.Len())
+	}
+	view := m.View()
+	if strings.Count(view, "## Plan") > 1 {
+		t.Fatalf("expected embedded plan to render once, got view %q", view)
+	}
+}

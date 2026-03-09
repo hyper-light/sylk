@@ -2,7 +2,6 @@ package archivalist
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -217,7 +216,7 @@ func (s *Store) Query(q ArchiveQuery) ([]*Entry, error) {
 		return nil, err
 	}
 
-	s.sortByCreatedDesc(results)
+	sortEntriesForQuery(results, q)
 	return s.applyResultLimit(results, q.Limit), nil
 }
 
@@ -250,12 +249,6 @@ func (s *Store) mergeArchivedQuery(results []*Entry, q ArchiveQuery) ([]*Entry, 
 	return s.mergeUniqueEntries(results, archived), nil
 }
 
-func (s *Store) sortByCreatedDesc(results []*Entry) {
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].CreatedAt.After(results[j].CreatedAt)
-	})
-}
-
 // QueryByCategory retrieves entries in a specific category
 func (s *Store) QueryByCategory(category Category, limit int) []*Entry {
 	s.mu.RLock()
@@ -277,12 +270,11 @@ func (s *Store) QueryByCategory(category Category, limit int) []*Entry {
 
 // SearchText performs text search across hot memory and optionally archive
 func (s *Store) SearchText(text string, includeArchived bool, limit int) ([]*Entry, error) {
-	results := s.searchHotMemory(text)
-	results, err := s.mergeArchivedResults(results, text, includeArchived, limit)
-	if err != nil {
-		return nil, err
-	}
-	return s.applyResultLimit(results, limit), nil
+	return s.Query(ArchiveQuery{
+		SearchText:      text,
+		IncludeArchived: includeArchived,
+		Limit:           limit,
+	})
 }
 
 func (s *Store) searchHotMemory(text string) []*Entry {
@@ -299,7 +291,7 @@ func (s *Store) searchHotMemory(text string) []*Entry {
 }
 
 func (s *Store) entryMatchesText(entry *Entry, text string) bool {
-	return containsIgnoreCase(entry.Content, text) || containsIgnoreCase(entry.Title, text)
+	return entryMatchesSearchText(entry, text)
 }
 
 func (s *Store) mergeArchivedResults(results []*Entry, text string, includeArchived bool, limit int) ([]*Entry, error) {
@@ -527,6 +519,9 @@ func (s *Store) matchesQuery(entry *Entry, q ArchiveQuery) bool {
 	if !s.matchesIDFilter(entry, q.IDs) {
 		return false
 	}
+	if !s.matchesSearchText(entry, q.SearchText) {
+		return false
+	}
 	return s.matchesDateRange(entry, q.Since, q.Until)
 }
 
@@ -566,6 +561,10 @@ func (s *Store) matchesDateRange(entry *Entry, since, until *time.Time) bool {
 		return false
 	}
 	return true
+}
+
+func (s *Store) matchesSearchText(entry *Entry, searchText string) bool {
+	return entryMatchesSearchText(entry, searchText)
 }
 
 func containsCategory(slice []Category, item Category) bool {

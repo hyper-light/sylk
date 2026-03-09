@@ -29,19 +29,26 @@ type GatewayProvider struct {
 
 // Compile-time interface checks.
 var (
-	_ providers.ProviderAdapter      = (*GatewayProvider)(nil)
+	_ providers.ProviderAdapter       = (*GatewayProvider)(nil)
 	_ providers.StreamHandlerProvider = (*GatewayProvider)(nil)
 )
 
 // --- Passthrough methods (no admission required) ---
 
-func (p *GatewayProvider) Name() string                          { return p.inner.Name() }
+func (p *GatewayProvider) Name() string                           { return p.inner.Name() }
 func (p *GatewayProvider) SupportedModels() []providers.ModelInfo { return p.inner.SupportedModels() }
 func (p *GatewayProvider) CountTokens(msgs []providers.Message) (int, error) {
 	return p.inner.CountTokens(msgs)
 }
-func (p *GatewayProvider) MaxContextTokens(model string) int { return p.inner.MaxContextTokens(model) }
+func (p *GatewayProvider) MaxContextTokens(model string) int     { return p.inner.MaxContextTokens(model) }
 func (p *GatewayProvider) HealthCheck(ctx context.Context) error { return p.inner.HealthCheck(ctx) }
+
+func (p *GatewayProvider) RequestTimeout() time.Duration {
+	if reporter, ok := p.inner.(interface{ RequestTimeout() time.Duration }); ok {
+		return reporter.RequestTimeout()
+	}
+	return 0
+}
 
 // --- Gated methods (admission required) ---
 

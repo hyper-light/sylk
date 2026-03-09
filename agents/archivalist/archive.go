@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -378,6 +379,16 @@ func (qb *queryBuilder) addDateFilter(column string, value *time.Time, op string
 	qb.args = append(qb.args, value)
 }
 
+func (qb *queryBuilder) addTextFilter(searchText string) {
+	searchText = strings.TrimSpace(searchText)
+	if searchText == "" {
+		return
+	}
+	pattern := "%" + searchText + "%"
+	qb.conditions = append(qb.conditions, "(COALESCE(title, '') LIKE ? OR content LIKE ? OR COALESCE(metadata, '') LIKE ?)")
+	qb.args = append(qb.args, pattern, pattern, pattern)
+}
+
 // Query searches the archive based on the query parameters
 func (a *Archive) Query(q ArchiveQuery) ([]*Entry, error) {
 	qb := &queryBuilder{}
@@ -388,16 +399,27 @@ func (a *Archive) Query(q ArchiveQuery) ([]*Entry, error) {
 	qb.addInFilter("id", q.IDs)
 	qb.addDateFilter("created_at", q.Since, ">=")
 	qb.addDateFilter("created_at", q.Until, "<=")
+	qb.addTextFilter(q.SearchText)
 
-	query := a.buildSelectQuery(qb.conditions, q.Limit)
-	return a.executeQuery(query, qb.args)
+	query := a.buildSelectQuery(qb.conditions, q.Limit, strings.TrimSpace(q.SearchText) != "")
+	entries, err := a.executeQuery(query, qb.args)
+	if err != nil {
+		return nil, err
+	}
+	sortEntriesForQuery(entries, q)
+	if q.Limit > 0 && len(entries) > q.Limit {
+		entries = entries[:q.Limit]
+	}
+	return entries, nil
 }
 
-func (a *Archive) buildSelectQuery(conditions []string, limit int) string {
+func (a *Archive) buildSelectQuery(conditions []string, limit int, disableSQLLimit bool) string {
 	query := baseEntrySelectQuery()
 	query = addEntryConditions(query, conditions)
 	query = addEntryOrder(query)
-	query = addEntryLimit(query, limit)
+	if !disableSQLLimit {
+		query = addEntryLimit(query, limit)
+	}
 	return query
 }
 
@@ -439,33 +461,10 @@ func (a *Archive) executeQuery(query string, args []interface{}) ([]*Entry, erro
 
 // SearchText performs full-text search on archived entries
 func (a *Archive) SearchText(searchText string, limit int) ([]*Entry, error) {
-	query := entrySearchQuery(limit)
-	rows, err := a.db.Query(query, searchText)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search entries: %w", err)
-	}
-	defer rows.Close()
-
-	entries, err := scanEntryRows(rows)
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan entry: %w", err)
-	}
-	return entries, nil
-}
-
-func entrySearchQuery(limit int) string {
-	query := `
-		SELECT e.id, e.category, e.title, e.content, e.source, e.session_id,
-		       e.created_at, e.updated_at, e.archived_at, e.tokens_estimate, e.metadata, e.related_ids
-		FROM entries e
-		JOIN entries_fts fts ON e.id = fts.id
-		WHERE entries_fts MATCH ?
-		ORDER BY rank
-	`
-	if limit <= 0 {
-		return query
-	}
-	return query + fmt.Sprintf(" LIMIT %d", limit)
+	return a.Query(ArchiveQuery{
+		SearchText: searchText,
+		Limit:      limit,
+	})
 }
 
 func scanEntryRows(rows *sql.Rows) ([]*Entry, error) {

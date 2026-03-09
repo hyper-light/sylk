@@ -39,6 +39,7 @@ func architectToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("route_plan_acceptance", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("handle_plan_acceptance_result", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("ask_user_question", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
+		toolruntime.NewToolPolicy("route_requirements_research", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("read_research_paper", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("read_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("glob", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
@@ -215,7 +216,7 @@ func (a *Architect) InvokeSkill(ctx context.Context, name string, input json.Raw
 			Name:      name,
 			Arguments: raw,
 		},
-		AgentID:         a.id,
+		AgentID:         a.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: a.toolRuntime().CapabilityScope(),
 	})

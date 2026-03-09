@@ -18,12 +18,12 @@ import (
 const (
 	phaseTDDLoop concurrency.PipelinePhase = "tdd_loop"
 
-	defaultPhaseTimeout    = 5 * time.Minute
-	defaultMaxLoops        = 5
-	validationGoroutines   = 2
-	validationTimeout      = 10 * time.Minute
-	scopeShutdownGrace     = 10 * time.Second
-	scopeShutdownHard      = 30 * time.Second
+	defaultPhaseTimeout  = 5 * time.Minute
+	defaultMaxLoops      = 5
+	validationGoroutines = 2
+	validationTimeout    = 10 * time.Minute
+	scopeShutdownGrace   = 10 * time.Second
+	scopeShutdownHard    = 30 * time.Second
 )
 
 // domainFromWorkerType maps a WorkerType to its corresponding ValidationDomain.
@@ -526,17 +526,20 @@ func (e *TDDExecutor) emitEvent(old, new PipelineStatus, loop int, errMsg string
 		return
 	}
 	e.mu.RLock()
+	panelPipelineID := logicalPipelineID(e.pipeline.TaskID, e.pipeline.ID)
 	evt := PipelineEvent{
-		PipelineID: e.pipeline.ID,
-		TaskID:     e.pipeline.TaskID,
-		SessionID:  e.pipeline.SessionID,
-		OldStatus:  old,
-		NewStatus:  new,
-		WorkerType: e.pipeline.WorkerType,
-		LoopCount:  loop,
-		MaxLoops:   e.maxLoops,
-		Timestamp:  time.Now(),
-		Error:      errMsg,
+		PipelineID:        panelPipelineID,
+		RuntimePipelineID: e.pipeline.ID,
+		TaskID:            e.pipeline.TaskID,
+		TaskSlug:          e.pipeline.TaskSlug,
+		SessionID:         e.pipeline.SessionID,
+		OldStatus:         old,
+		NewStatus:         new,
+		WorkerType:        e.pipeline.WorkerType,
+		LoopCount:         loop,
+		MaxLoops:          e.maxLoops,
+		Timestamp:         time.Now(),
+		Error:             errMsg,
 	}
 	e.mu.RUnlock()
 	e.onEvent(evt)
@@ -550,7 +553,10 @@ func (e *TDDExecutor) emitAgentActivity(eventType events.EventType, agentName, c
 	}
 	e.mu.RLock()
 	sessionID := e.pipeline.SessionID
-	pipelineID := e.pipeline.ID
+	pipelineID := logicalPipelineID(e.pipeline.TaskID, e.pipeline.ID)
+	taskID := e.pipeline.TaskID
+	taskSlug := e.pipeline.TaskSlug
+	runtimePipelineID := e.pipeline.ID
 	workerType := string(e.pipeline.WorkerType)
 	e.mu.RUnlock()
 
@@ -558,6 +564,13 @@ func (e *TDDExecutor) emitAgentActivity(eventType events.EventType, agentName, c
 	evt.AgentID = agentName
 	evt.Category = "pipeline"
 	evt.Data["pipeline_id"] = pipelineID
+	evt.Data["task_id"] = taskID
+	if taskSlug != "" {
+		evt.Data["task_slug"] = taskSlug
+	}
+	if runtimePipelineID != "" && runtimePipelineID != pipelineID {
+		evt.Data["runtime_pipeline_id"] = runtimePipelineID
+	}
 	evt.Data["agent_type"] = agentName
 	evt.Data["worker_type"] = workerType
 	e.activityPub.PublishActivity(evt)

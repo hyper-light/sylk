@@ -18,10 +18,9 @@ type mockCredentialProvider struct {
 func newMockCredentialProvider() *mockCredentialProvider {
 	return &mockCredentialProvider{
 		secrets: map[string]string{
-			"github":  "ghp_mock_github_token_12345678901234567890",
-			"openai":  "sk-mockopenaikey1234567890abcdef",
-			"serpapi": "mock_serpapi_key_1234567890",
-			"aws":     "AKIAIOSFODNN7EXAMPLE",
+			"github": "ghp_mock_github_token_12345678901234567890",
+			"openai": "sk-mockopenaikey1234567890abcdef",
+			"aws":    "AKIAIOSFODNN7EXAMPLE",
 		},
 	}
 }
@@ -140,7 +139,7 @@ func TestScopeEnforcement_OrchestratorDeniedAllCredentials(t *testing.T) {
 	})
 	defer broker.Stop()
 
-	providers := []string{"github", "openai", "aws", "serpapi"}
+	providers := []string{"github", "openai", "aws"}
 
 	for _, p := range providers {
 		_, err := broker.RequestCredential(
@@ -369,7 +368,7 @@ func TestToolRegistry_CorrectCredentialMapping(t *testing.T) {
 	}{
 		{"generate_embeddings", []string{"openai"}},
 		{"create_pr", []string{"github"}},
-		{"web_search", []string{"serpapi"}},
+		{"web_search", []string{}},
 		{"read_file", []string{}},
 		{"write_file", []string{}},
 	}

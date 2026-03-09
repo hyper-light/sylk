@@ -55,6 +55,133 @@ func TestBuildToolDefinitions_UsesActiveSetNotRegistryLoading(t *testing.T) {
 	}
 }
 
+func TestRequestView_TransientActivationDoesNotMutateSharedActiveSet(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("visible_tool", "Visible tool"))
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("reroute_request", "Request scoped tool"))
+
+	rt := mustNewRuntime(t, registry, manifestWithSearch("academic", "academic.default",
+		NewToolPolicy("visible_tool", EffectReadOnly, DomainFilesystem, ExecutionModeLocal, WithVisibleByDefault()),
+		NewToolPolicy("reroute_request", EffectMutating, DomainControl, ExecutionModeLocalWorker),
+	))
+
+	baseTools := rt.BuildToolDefinitions()
+	if containsTool(baseTools, "reroute_request") {
+		t.Fatal("request-scoped tool should not be visible in shared tool definitions")
+	}
+
+	view, err := rt.RequestView("reroute_request")
+	if err != nil {
+		t.Fatalf("request view: %v", err)
+	}
+	viewTools := view.BuildToolDefinitions()
+	if !containsTool(viewTools, "reroute_request") {
+		t.Fatal("request-scoped tool should be visible inside the request view")
+	}
+
+	_, err = view.Execute(context.Background(), Invocation{
+		ToolCall:        providers.ToolCall{ID: "call-reroute", Name: "reroute_request", Arguments: `{}`},
+		AgentID:         "academic",
+		CorrelationID:   "corr-reroute",
+		CapabilityScope: "academic.default",
+	})
+	if err != nil {
+		t.Fatalf("request view should admit transient tool execution, got %v", err)
+	}
+
+	if _, err := rt.Execute(context.Background(), Invocation{
+		ToolCall:        providers.ToolCall{ID: "call-reroute-shared", Name: "reroute_request", Arguments: `{}`},
+		AgentID:         "academic",
+		CorrelationID:   "corr-reroute-shared",
+		CapabilityScope: "academic.default",
+	}); err == nil || !strings.Contains(err.Error(), "active tool set") {
+		t.Fatalf("shared runtime should still reject transient tool outside request view, got %v", err)
+	}
+
+	finalTools := rt.BuildToolDefinitions()
+	if containsTool(finalTools, "reroute_request") {
+		t.Fatal("request-scoped activation leaked into shared tool definitions")
+	}
+}
+
+func TestRequestView_SyncActiveFromLoadedDoesNotMutateSharedActiveSet(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("loaded_tool", "Loaded tool"))
+	registry.Load("loaded_tool")
+
+	rt := mustNewRuntime(t, registry, manifestWithSearch("academic", "academic.default",
+		NewToolPolicy("loaded_tool", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
+	))
+
+	if containsTool(rt.BuildToolDefinitions(), "loaded_tool") {
+		t.Fatal("loaded tool should not be visible in shared definitions before activation")
+	}
+
+	view, err := rt.RequestView()
+	if err != nil {
+		t.Fatalf("request view: %v", err)
+	}
+	activated := view.SyncActiveFromLoaded()
+	if len(activated) != 1 || activated[0] != "loaded_tool" {
+		t.Fatalf("loaded-tool activation = %v, want [loaded_tool]", activated)
+	}
+	if !containsTool(view.BuildToolDefinitions(), "loaded_tool") {
+		t.Fatal("loaded tool should be visible inside request view after sync")
+	}
+	if containsTool(rt.BuildToolDefinitions(), "loaded_tool") {
+		t.Fatal("request-view sync should not leak loaded tool into shared definitions")
+	}
+}
+
+func TestRequestView_SearchActivationRemainsTransient(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, skills.NewSkill("grep").
+		Description("Search file contents by pattern.").
+		StringParam("pattern", "Pattern", true).
+		Domain("filesystem").
+		Keywords("search", "pattern", "files").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var payload map[string]any
+			_ = json.Unmarshal(input, &payload)
+			return map[string]any{"pattern": payload["pattern"]}, nil
+		}).
+		Build())
+	rt := mustNewRuntime(t, registry, manifestWithSearch("academic", "academic.default",
+		NewToolPolicy("grep", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
+	))
+
+	view, err := rt.RequestView()
+	if err != nil {
+		t.Fatalf("request view: %v", err)
+	}
+	searchResult, err := view.Execute(context.Background(), Invocation{
+		ToolCall:        providers.ToolCall{ID: "search-1", Name: SearchToolName, Arguments: `{"query":"search files by pattern","activate":true}`},
+		AgentID:         "academic",
+		CorrelationID:   "corr-search",
+		CapabilityScope: "academic.default",
+	})
+	if err != nil {
+		t.Fatalf("unexpected search error: %v", err)
+	}
+	if !searchResult.ToolDefsDirty {
+		t.Fatal("expected transient search activation to dirty tool definitions")
+	}
+	if !containsTool(view.BuildToolDefinitions(), "grep") {
+		t.Fatal("request-view search activation should expose grep inside the request view")
+	}
+	if containsTool(rt.BuildToolDefinitions(), "grep") {
+		t.Fatal("request-view search activation should not leak into shared definitions")
+	}
+	if _, err := rt.Execute(context.Background(), Invocation{
+		ToolCall:        providers.ToolCall{ID: "grep-shared", Name: "grep", Arguments: `{"pattern":"TODO"}`},
+		AgentID:         "academic",
+		CorrelationID:   "corr-shared",
+		CapabilityScope: "academic.default",
+	}); err == nil || !strings.Contains(err.Error(), "active tool set") {
+		t.Fatalf("shared runtime should still reject transiently activated grep, got %v", err)
+	}
+}
+
 func TestExecute_RejectsInvocationIdentityMismatch(t *testing.T) {
 	registry := skills.NewRegistry()
 	mustRegisterSkill(t, registry, newRuntimeTestSkill("echo", "Echo tool"))

@@ -608,11 +608,31 @@ func (a *Academic) handleActionMessage(msg *guide.Message) error {
 
 // processForwardedRequest handles the actual request processing.
 func (a *Academic) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if a.shouldHandleConversation(fwd) {
+		return a.handleConversation(ctx, fwd)
+	}
 	handler, err := a.intentHandler(fwd.Intent)
 	if err != nil {
 		return nil, err
 	}
 	return handler(ctx, fwd)
+}
+
+func (a *Academic) shouldHandleConversation(fwd *guide.ForwardedRequest) bool {
+	if fwd == nil {
+		return false
+	}
+	if academicConversationHandoffFromForwarded(fwd) == nil {
+		if strings.TrimSpace(strings.ToLower(fwd.SourceAgentID)) != "tui" {
+			return false
+		}
+	}
+	switch fwd.Intent {
+	case guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 type forwardedHandler func(context.Context, *guide.ForwardedRequest) (any, error)
@@ -627,9 +647,208 @@ func (a *Academic) intentHandler(intent guide.Intent) (forwardedHandler, error) 
 		return a.handleFetch, nil
 	case guide.IntentHelp:
 		return a.handleHelp, nil
+	case guide.IntentChat, guide.IntentUnknown:
+		return a.handleConversation, nil
 	default:
 		return nil, fmt.Errorf("unsupported intent for academic: %s", intent)
 	}
+}
+
+func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	query := strings.TrimSpace(fwd.Input)
+	if query == "" {
+		return &ConversationResult{
+			Response: "Tell me what you want researched or checked, and I’ll work through it with you.",
+			Intent:   fwd.Intent,
+		}, nil
+	}
+
+	handoff := academicConversationHandoffFromForwarded(fwd)
+	toolSurface := toolruntime.Surface(a.toolRuntime())
+	if handoff != nil && a.toolRuntime() != nil {
+		if view, err := a.toolRuntime().RequestView("reroute_request"); err == nil {
+			toolSurface = view
+		}
+	}
+	a.prepareSkillsForInput(query)
+	llmReq := &providers.Request{
+		SystemPrompt: buildAcademicConversationSystemPrompt(a.config.SystemPrompt, handoff),
+		Messages:     []providers.Message{{Role: providers.RoleUser, Content: query}},
+		Tools:        a.buildToolDefinitionsWithSurface(toolSurface),
+		Model:        a.config.Model,
+		MaxTokens:    a.config.MaxOutputTokens,
+	}
+	a.applyLLMRuntimeProfile(llmReq, "conversation")
+	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
+
+	ledger := shared.SteeringLedgerFromContext(ctx)
+	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
+		return a.executeToolLoop(ctx, llmReq, ledger, toolSurface)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("academic conversation failed: %w", err)
+	}
+	return &ConversationResult{
+		Response: result,
+		Intent:   fwd.Intent,
+	}, nil
+}
+
+type academicConversationHandoff struct {
+	Kind             string
+	From             string
+	Reason           string
+	ResearchGoal     string
+	ConversationHist string
+	KnownContext     []string
+	MissingQuestions []string
+}
+
+func academicConversationHandoffFromForwarded(fwd *guide.ForwardedRequest) *academicConversationHandoff {
+	if fwd == nil || fwd.Metadata == nil {
+		return nil
+	}
+	userFacing, _ := fwd.Metadata["user_facing_handoff"].(bool)
+	if !userFacing {
+		return nil
+	}
+	handoff := &academicConversationHandoff{
+		Kind:             metadataTrimmedString(fwd.Metadata, "handoff_kind"),
+		From:             metadataTrimmedString(fwd.Metadata, "handoff_from"),
+		Reason:           metadataTrimmedString(fwd.Metadata, "handoff_reason"),
+		ResearchGoal:     metadataTrimmedString(fwd.Metadata, "handoff_research_goal"),
+		ConversationHist: metadataTrimmedString(fwd.Metadata, "handoff_conversation_history"),
+		KnownContext:     metadataStringSlice(fwd.Metadata, "handoff_known_context"),
+		MissingQuestions: metadataStringSlice(fwd.Metadata, "handoff_missing_questions"),
+	}
+	if handoff.Kind == "" {
+		handoff.Kind = "conversation_handoff"
+	}
+	if handoff.From == "" {
+		handoff.From = strings.TrimSpace(fwd.SourceAgentID)
+	}
+	return handoff
+}
+
+func buildAcademicConversationSystemPrompt(base string, handoff *academicConversationHandoff) string {
+	sections := []string{
+		strings.TrimSpace(base),
+		strings.TrimSpace(AcademicConversationPrompt),
+	}
+	if handoff != nil {
+		sections = append(sections, academicConversationHandoffPrompt(handoff))
+	}
+	filtered := make([]string, 0, len(sections))
+	for _, section := range sections {
+		if section != "" {
+			filtered = append(filtered, section)
+		}
+	}
+	return strings.Join(filtered, "\n\n---\n\n")
+}
+
+func academicConversationHandoffPrompt(handoff *academicConversationHandoff) string {
+	if handoff == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Architect Handoff\n\n")
+	b.WriteString("You are taking over a live user conversation from the Architect because the request is not yet specific enough for safe implementation planning.\n")
+	b.WriteString("Your job is to help the user make the problem concrete enough for planning: clarify scope, constraints, environments, success criteria, decision points, and any missing research-backed defaults.\n")
+	b.WriteString("Stay conversational and user-facing. Do not mention hidden routing mechanics unless the user explicitly asks.\n")
+	if reason := strings.TrimSpace(handoff.Reason); reason != "" {
+		b.WriteString("\nHandoff reason: ")
+		b.WriteString(reason)
+		b.WriteString("\n")
+	}
+	if goal := strings.TrimSpace(handoff.ResearchGoal); goal != "" {
+		b.WriteString("Research goal: ")
+		b.WriteString(goal)
+		b.WriteString("\n")
+	}
+	if len(handoff.KnownContext) > 0 {
+		b.WriteString("Known context:\n")
+		for _, item := range handoff.KnownContext {
+			b.WriteString("- ")
+			b.WriteString(item)
+			b.WriteString("\n")
+		}
+	}
+	if history := strings.TrimSpace(handoff.ConversationHist); history != "" {
+		b.WriteString("Conversation so far:\n")
+		b.WriteString(history)
+		b.WriteString("\n")
+	}
+	if len(handoff.MissingQuestions) > 0 {
+		b.WriteString("Missing requirements to resolve:\n")
+		for _, item := range handoff.MissingQuestions {
+			b.WriteString("- ")
+			b.WriteString(item)
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("When the request is concrete enough for implementation planning, invoke reroute_request with suggested_target=\"architect\" so the conversation returns through the Guide. In the handoff reason, summarize why the requirements are now concrete enough to plan.")
+	return strings.TrimSpace(b.String())
+}
+
+func metadataTrimmedString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	raw, ok := metadata[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	trimmed := strings.TrimSpace(fmt.Sprint(raw))
+	if trimmed == "<nil>" {
+		return ""
+	}
+	return trimmed
+}
+
+func metadataStringSlice(metadata map[string]any, key string) []string {
+	if metadata == nil {
+		return nil
+	}
+	raw, ok := metadata[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch values := raw.(type) {
+	case []string:
+		return trimAndFilterStrings(values)
+	case []any:
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			trimmed := strings.TrimSpace(fmt.Sprint(value))
+			if trimmed == "" || trimmed == "<nil>" {
+				continue
+			}
+			result = append(result, trimmed)
+		}
+		return result
+	default:
+		trimmed := strings.TrimSpace(fmt.Sprint(values))
+		if trimmed == "" || trimmed == "<nil>" {
+			return nil
+		}
+		return []string{trimmed}
+	}
+}
+
+func trimAndFilterStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		result = append(result, trimmed)
+	}
+	return result
 }
 
 // handleFetch processes fetch requests. For repository clones, delegates to the
@@ -638,7 +857,8 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 	fetchPrompt := fmt.Sprintf(
 		"The user wants to fetch or download external content. "+
 			"If the request involves a git repository, use clone_via_librarian to have the Librarian clone it into the searchable package store. "+
-			"If the request involves a web page or document, use web_fetch or fetch_document. "+
+			"If the request involves a web page or document and you do not already know the URL, use web_search first. "+
+			"Once you know the URL, use web_fetch or fetch_document. "+
 			"Provide a clear summary of what was fetched.\n\n%s",
 		fwd.Input,
 	)
@@ -657,7 +877,7 @@ func (a *Academic) handleFetch(ctx context.Context, fwd *guide.ForwardedRequest)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger)
+		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fetch failed: %w", err)
@@ -687,7 +907,7 @@ func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger)
+		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
 	})
 	if err != nil {
 		return nil, fmt.Errorf("research recall failed: %w", err)
@@ -703,7 +923,7 @@ func (a *Academic) handleRecall(ctx context.Context, fwd *guide.ForwardedRequest
 func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	checkPrompt := fmt.Sprintf(
 		"Verify the following claim against your knowledge of best practices, "+
-			"research, and technical standards. Use your tools to consult the "+
+			"research, and technical standards. Use web_search when fresh external sources are needed, and use your tools to consult the "+
 			"Librarian for codebase context. Provide a structured assessment:\n\n%s",
 		fwd.Input,
 	)
@@ -722,7 +942,7 @@ func (a *Academic) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger)
+		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
 	})
 	if err != nil {
 		return nil, fmt.Errorf("research check failed: %w", err)
@@ -979,7 +1199,8 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 	// Build LLM request
 	researchPrompt := fmt.Sprintf(
 		"Research the following topic thoroughly. Use your tools to consult "+
-			"the Librarian for codebase context and validate findings.\n\n"+
+			"the Librarian for codebase context and validate findings. "+
+			"Use web_search to discover external sources when you do not already know the right URLs, then fetch primary sources before relying on specifics.\n\n"+
 			"Topic: %s", query.Query,
 	)
 	if query.Domain != "" {
@@ -1001,7 +1222,7 @@ func (a *Academic) Research(ctx context.Context, query *ResearchQuery) (*Researc
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return a.executeToolLoop(ctx, llmReq, ledger)
+		return a.executeToolLoop(ctx, llmReq, ledger, a.toolRuntime())
 	})
 	if err != nil {
 		return nil, fmt.Errorf("research failed: %w", err)
@@ -1232,13 +1453,14 @@ func (a *Academic) Registration() *guide.AgentRegistration {
 		Name:    "academic",
 		Aliases: []string{"research", "scholar"},
 		Capabilities: guide.AgentCapabilities{
-			Intents: []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentHelp},
+			Intents: []guide.Intent{guide.IntentRecall, guide.IntentCheck, guide.IntentFetch, guide.IntentHelp, guide.IntentChat},
 			Domains: []guide.Domain{guide.DomainPatterns, guide.DomainDecisions, guide.DomainLearnings, guide.DomainResearch},
 			Tags:    []string{"research", "best-practices", "external-knowledge", "web-fetch"},
 			Keywords: []string{
 				"research", "best practice", "recommend", "compare",
 				"approach", "pattern", "methodology", "standard",
 				"fetch", "download", "url", "web", "crawl", "document",
+				"chat", "advise", "recommendation",
 			},
 			Priority: 50,
 		},

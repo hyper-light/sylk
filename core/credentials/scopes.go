@@ -51,7 +51,7 @@ func defaultCredentialScopes() []*CredentialScope {
 		},
 		{
 			AgentType:   "academic",
-			Allowed:     []string{"openai", "anthropic", "google", "serpapi"},
+			Allowed:     []string{"openai", "anthropic", "google"},
 			Denied:      []string{"github", "aws"},
 			RequireAuth: false,
 		},

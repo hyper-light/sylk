@@ -1,6 +1,6 @@
 module github.com/adalundhe/sylk
 
-go 1.24.3
+go 1.25.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.26.0
@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/harmonica v0.2.0
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/charmbracelet/x/ansi v0.10.1
 	github.com/dgraph-io/ristretto v0.2.0
 	github.com/ebitengine/purego v0.10.0
 	github.com/epiclabs-io/diff3 v0.0.0-20241115194849-280ec18688b6
@@ -20,24 +21,39 @@ require (
 	github.com/gobwas/glob v0.2.3
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/mattn/go-pointer v0.0.1
 	github.com/mattn/go-runewidth v0.0.16
 	github.com/mattn/go-sqlite3 v1.14.34
 	github.com/openai/openai-go v1.12.0
 	github.com/sergi/go-diff v1.4.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
-	github.com/tree-sitter/go-tree-sitter v0.24.0
+	github.com/tree-sitter/tree-sitter-c v0.21.5-0.20240818205408-927da1f210eb
+	github.com/tree-sitter/tree-sitter-cpp v0.22.4-0.20240818224355-b1a4e2b25148
+	github.com/tree-sitter/tree-sitter-embedded-template v0.21.1-0.20240819044651-ffbf64942c33
+	github.com/tree-sitter/tree-sitter-go v0.21.3-0.20240818010209-8c0f0e7a6012
+	github.com/tree-sitter/tree-sitter-html v0.20.5-0.20240818004741-d11201a263d0
+	github.com/tree-sitter/tree-sitter-java v0.21.1-0.20240824015150-576d8097e495
+	github.com/tree-sitter/tree-sitter-javascript v0.21.5-0.20240818005344-15887341e5b5
+	github.com/tree-sitter/tree-sitter-json v0.21.1-0.20240818005659-bdd69eb8c8a5
+	github.com/tree-sitter/tree-sitter-php v0.22.9-0.20240819002312-a552625b56c1
+	github.com/tree-sitter/tree-sitter-python v0.21.1-0.20240818005537-55a9b8a4fbfb
+	github.com/tree-sitter/tree-sitter-ruby v0.21.1-0.20240818211811-7dbc1e2d0e2d
+	github.com/tree-sitter/tree-sitter-rust v0.21.3-0.20240818005432-2b43eafe6447
+	github.com/uptrace/bun v1.2.18
+	github.com/uptrace/bun/dialect/sqlitedialect v1.2.18
+	github.com/uptrace/bun/driver/sqliteshim v1.2.18
 	github.com/viterin/vek v0.4.3
 	github.com/yuin/goldmark v1.7.16
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.41.0
 	golang.org/x/term v0.40.0
-	golang.org/x/tools v0.41.0
+	golang.org/x/tools v0.42.0
 	gonum.org/v1/gonum v0.17.0
 	google.golang.org/genai v1.47.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.44.0
+	modernc.org/sqlite v1.46.1
 )
 
 require (
@@ -70,7 +86,6 @@ require (
 	github.com/blevesearch/zapx/v16 v16.2.8 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/colorprofile v0.2.3-0.20250311203215-f60798e515dc // indirect
-	github.com/charmbracelet/x/ansi v0.10.1 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.13-0.20250311204145-2c3ea96c31dd // indirect
 	github.com/charmbracelet/x/term v0.2.1 // indirect
 	github.com/chewxy/math32 v1.11.1 // indirect
@@ -89,12 +104,12 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
+	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/json-iterator/go v0.0.0-20171115153421-f7279a603ede // indirect
 	github.com/kevinburke/ssh_config v1.2.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
-	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
@@ -103,6 +118,7 @@ require (
 	github.com/pjbgf/sha1cd v0.3.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/skeema/knownhosts v1.3.1 // indirect
@@ -112,20 +128,23 @@ require (
 	github.com/tidwall/match v1.2.0 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
+	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
 	github.com/viterin/partial v1.1.0 // indirect
+	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
-	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
-	golang.org/x/mod v0.32.0 // indirect
-	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
+	golang.org/x/mod v0.33.0 // indirect
+	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1 // indirect
 	google.golang.org/grpc v1.66.2 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
-	modernc.org/libc v1.67.4 // indirect
+	modernc.org/libc v1.68.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )

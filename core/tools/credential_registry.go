@@ -43,7 +43,7 @@ func defaultToolCredentials() []*ToolCredentialMetadata {
 		{Name: "create_issue", RequiredCredentials: []string{"github"}},
 		{Name: "list_prs", RequiredCredentials: []string{"github"}},
 		{Name: "merge_pr", RequiredCredentials: []string{"github"}},
-		{Name: "web_search", RequiredCredentials: []string{"serpapi"}},
+		{Name: "web_search", RequiredCredentials: []string{}},
 		{Name: "fetch_url", RequiredCredentials: []string{}},
 		{Name: "read_file", RequiredCredentials: []string{}},
 		{Name: "write_file", RequiredCredentials: []string{}},

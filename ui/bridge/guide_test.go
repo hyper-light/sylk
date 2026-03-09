@@ -115,8 +115,8 @@ func TestToGuideMsg_HumanizesArchitectClarificationEnvelope(t *testing.T) {
 			"ID":      "response-2",
 			"Success": true,
 			"Data": map[string]any{
-				"Status": "clarifying",
-				"UserResponse":        "I recommend starting with Google and Entra for phase 1 enterprise SSO.",
+				"Status":       "clarifying",
+				"UserResponse": "I recommend starting with Google and Entra for phase 1 enterprise SSO.",
 				"ClarificationQuestions": []any{
 					"Which OAuth providers are in scope for phase 1?",
 					"Which client surfaces are in scope (web/mobile/CLI)?",
@@ -264,6 +264,35 @@ func TestGuideBridgeDispatchStream_ProgressEmitsProgressMsg(t *testing.T) {
 	}
 	if progress.Message != "Designing architecture options..." {
 		t.Fatalf("unexpected progress message: %q", progress.Message)
+	}
+}
+
+func TestGuideBridgeDispatchStream_PreservesPipelineMetadata(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	b.dispatchStream(&guide.StreamResponse{
+		CorrelationID:     "corr-pipeline",
+		RespondingAgentID: "dc484039",
+		Metadata: map[string]any{
+			"agent_type":  "designer",
+			"agent_name":  "Designer",
+			"pipeline_id": "task_auth_checkout",
+			"task_id":     "task_auth_checkout",
+			"task_slug":   "auth-checkout",
+		},
+		Event: &guide.StreamEvent{Type: guide.StreamEventStart},
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(program.messages))
+	}
+	start, ok := program.messages[0].(uimsg.StreamStartMsg)
+	if !ok {
+		t.Fatalf("expected StreamStartMsg, got %T", program.messages[0])
+	}
+	if start.AgentType != "designer" || start.PipelineID != "task_auth_checkout" || start.TaskSlug != "auth-checkout" {
+		t.Fatalf("unexpected pipeline metadata: %+v", start)
 	}
 }
 

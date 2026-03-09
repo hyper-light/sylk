@@ -187,6 +187,7 @@ type streamSlot struct {
 	agentID         string
 	thinkingIdx     int                // History index of thinking placeholder for this stream.
 	renderState     *streamRenderState // Incremental render state for this stream.
+	planID          string             // Plan ID embedded in this stream, if any.
 	planMarkdown    string             // Rendered plan markdown for this stream.
 	planOffset      int                // Accumulator content length when plan was injected.
 }
@@ -818,8 +819,16 @@ func (m *Model) HandlePlanUpdate(update msg.PlanUpdateMsg) {
 	// Active stream + ready plan + no plan already embedded → embed in stream.
 	// Find a slot without a plan already embedded.
 	if update.Status == "ready" {
+		if slot, ok := m.streams[update.CorrelationID]; ok && slot.accumulator != nil {
+			slot.planID = update.PlanID
+			slot.planMarkdown = content
+			slot.planOffset = len(slot.accumulator.Content())
+			m.planID = update.PlanID
+			return
+		}
 		for _, slot := range m.streams {
-			if slot.accumulator != nil && slot.planMarkdown == "" {
+			if slot.accumulator != nil && (slot.planMarkdown == "" || slot.planID == update.PlanID) {
+				slot.planID = update.PlanID
 				slot.planMarkdown = content
 				slot.planOffset = len(slot.accumulator.Content())
 				m.planID = update.PlanID
@@ -1563,9 +1572,10 @@ func (m *Model) finalizeSlotStream(slot *streamSlot) {
 	m.history.entries[physical].RenderedLines = nil
 	m.history.entries[physical].CodeRegions = nil
 	m.history.entries[physical].Height = -1
-	if hadPlan && m.planID != "" {
-		m.history.entries[physical].ID = "plan-" + m.planID
+	if hadPlan && slot.planID != "" {
+		m.history.entries[physical].ID = "plan-" + slot.planID
 		m.planEntryIdx = idx
+		m.planID = slot.planID
 	}
 	m.history.mu.Unlock()
 }

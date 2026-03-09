@@ -18126,7 +18126,7 @@ var DefaultCredentialScopes = map[string]*CredentialScope{
     },
     "academic": {
         AgentType: "academic",
-        Allowed:   []string{"openai", "anthropic", "google", "serpapi"}, // LLM + search
+        Allowed:   []string{"openai", "anthropic", "google"}, // LLM providers with native search support
         Denied:    []string{"github", "aws"},
     },
     "archivalist": {
@@ -18496,7 +18496,7 @@ var ToolRegistry = map[string]*ToolMetadata{
     },
     "web_search": {
         Name:                "web_search",
-        RequiredCredentials: []string{"serpapi"},
+        RequiredCredentials: []string{},
     },
     // Tools that don't need credentials
     "read_file": {

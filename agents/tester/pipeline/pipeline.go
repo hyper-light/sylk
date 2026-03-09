@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,9 +96,13 @@ type PipelineTester struct {
 // New creates a new PipelineTester instance.
 func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*PipelineTester, error) {
 	cfg = applyConfigDefaults(cfg)
+	agentID := strings.TrimSpace(cfg.AgentID)
+	if agentID == "" {
+		agentID = uuid.New().String()[:8]
+	}
 
 	pt := &PipelineTester{
-		id:                uuid.New().String()[:8],
+		id:                agentID,
 		config:            cfg,
 		logger:            slog.Default().With("agent", "tester-pipeline"),
 		provider:          provider,
@@ -442,6 +447,13 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 	ctx := reqCtx
 	ctx = agentshared.WithStreamContext(ctx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = agentshared.WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type":  "tester-pipeline",
+		"agent_name":  "Tester",
+		"pipeline_id": pt.pipelineID,
+		"task_id":     pt.pipelineID,
+		"task_slug":   pt.pipelineSlug,
+	})
 	ctx, usageAcc := agentshared.WithUsageAccumulator(ctx)
 	ctx = agentshared.WithSteeringLedger(ctx, ledger)
 	ctx = agentshared.WithLogMeta(ctx, agentshared.LogMeta{

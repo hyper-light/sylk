@@ -38,8 +38,19 @@ var PipelineAgentTypes = [4]string{
 	"designer",
 }
 
+// PipelinePanelAgentTypes are the agent rows shown for each pipeline in the UI.
+// Only task-scoped worker agents belong in the pipeline section; the
+// orchestrator remains a global control-plane agent.
+var PipelinePanelAgentTypes = [4]string{
+	"inspector-pipeline",
+	"tester-pipeline",
+	"engineer",
+	"designer",
+}
+
 // PipelineAgentDisplayNames maps agent type strings to user-facing names.
 var PipelineAgentDisplayNames = map[string]string{
+	"orchestrator":       "Orchestrator",
 	"engineer":           "Engineer",
 	"designer":           "Designer",
 	"inspector-pipeline": "Inspector",
@@ -50,16 +61,17 @@ var PipelineAgentDisplayNames = map[string]string{
 // This is a thin wrapper for backward compatibility.
 func NewPipelinePod(cfg PipelinePodConfig) *shared.AgentPod {
 	return shared.NewAgentPod(shared.AgentPodConfig{
-		PodID:         cfg.DAGID,
-		SessionID:     cfg.SessionID,
-		Activator:     cfg.Activator,
-		Managed:       cfg.Managed,
-		Registrar:     shared.PodRegistrar(cfg.Registrar),
-		ActivityPub:   cfg.ActivityPub,
-		Logger:        cfg.Logger,
-		MemberTypes:   PipelineAgentTypes[:],
-		DisplayNames:  PipelineAgentDisplayNames,
-		ScribeFactory: cfg.ScribeFactory,
+		PodID:                  cfg.DAGID,
+		SessionID:              cfg.SessionID,
+		Activator:              cfg.Activator,
+		Managed:                cfg.Managed,
+		Registrar:              shared.PodRegistrar(cfg.Registrar),
+		ActivityPub:            cfg.ActivityPub,
+		RegistrationVisibility: events.VisibilitySystem,
+		Logger:                 cfg.Logger,
+		MemberTypes:            PipelineAgentTypes[:],
+		DisplayNames:           PipelineAgentDisplayNames,
+		ScribeFactory:          cfg.ScribeFactory,
 	})
 }
 

@@ -49,6 +49,11 @@ type StreamStartMsg struct {
 	SessionID     string
 	CorrelationID string
 	AgentID       string // Responding agent ID for badge display.
+	AgentType     string
+	AgentName     string
+	PipelineID    string
+	TaskID        string
+	TaskSlug      string
 }
 
 // StreamChunkMsg carries a streaming text chunk from an LLM response.
@@ -65,6 +70,10 @@ type StreamProgressMsg struct {
 	CorrelationID string
 	AgentID       string // Canonical UUID of the responding agent.
 	AgentName     string // Display name for UI attribution.
+	AgentType     string
+	PipelineID    string
+	TaskID        string
+	TaskSlug      string
 	Current       int
 	Total         int
 	Message       string
@@ -77,6 +86,10 @@ type StreamCompleteMsg struct {
 	CorrelationID string
 	AgentID       string // Canonical UUID of the responding agent.
 	AgentName     string // Display name for UI attribution.
+	AgentType     string
+	PipelineID    string
+	TaskID        string
+	TaskSlug      string
 	Result        any
 	InputTokens   int // Real provider input tokens (0 = unavailable).
 	OutputTokens  int // Real provider output tokens (0 = unavailable).

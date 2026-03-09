@@ -56,16 +56,16 @@ func tightRateLimitConfig() GatewayConfig {
 
 // mockProvider implements ProviderAdapter + StreamHandlerProvider for tests.
 type mockProvider struct {
-	completeFn       func(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error)
-	streamFn         func(ctx context.Context, req *providers.CompletionRequest) (<-chan *providers.StreamChunk, error)
-	streamHandlerFn  func(ctx context.Context, req *providers.StreamRequest, handler providers.StreamHandler) error
+	completeFn      func(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error)
+	streamFn        func(ctx context.Context, req *providers.CompletionRequest) (<-chan *providers.StreamChunk, error)
+	streamHandlerFn func(ctx context.Context, req *providers.StreamRequest, handler providers.StreamHandler) error
 }
 
-func (m *mockProvider) Name() string                            { return "mock" }
-func (m *mockProvider) SupportedModels() []providers.ModelInfo  { return nil }
+func (m *mockProvider) Name() string                                   { return "mock" }
+func (m *mockProvider) SupportedModels() []providers.ModelInfo         { return nil }
 func (m *mockProvider) CountTokens(_ []providers.Message) (int, error) { return 0, nil }
-func (m *mockProvider) MaxContextTokens(_ string) int           { return 100000 }
-func (m *mockProvider) HealthCheck(_ context.Context) error     { return nil }
+func (m *mockProvider) MaxContextTokens(_ string) int                  { return 100000 }
+func (m *mockProvider) HealthCheck(_ context.Context) error            { return nil }
 
 func (m *mockProvider) Complete(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error) {
 	if m.completeFn != nil {
@@ -92,11 +92,27 @@ func (m *mockProvider) StreamWithHandler(ctx context.Context, req *providers.Str
 }
 
 var (
-	_ providers.ProviderAdapter      = (*mockProvider)(nil)
+	_ providers.ProviderAdapter       = (*mockProvider)(nil)
 	_ providers.StreamHandlerProvider = (*mockProvider)(nil)
 )
 
+type timeoutMockProvider struct {
+	mockProvider
+	timeout time.Duration
+}
+
+func (m *timeoutMockProvider) RequestTimeout() time.Duration { return m.timeout }
+
 // --- Scheduler tests ---
+
+func TestGatewayProvider_RequestTimeoutPassthrough(t *testing.T) {
+	gw := NewProviderGateway(fastConfig(), nil)
+	wrapped := gw.WrapProvider(&timeoutMockProvider{timeout: 42 * time.Second}, PriorityExecution)
+
+	if got, want := wrapped.RequestTimeout(), 42*time.Second; got != want {
+		t.Fatalf("RequestTimeout() = %v, want %v", got, want)
+	}
+}
 
 func TestScheduler_EnqueueAndSignalNext(t *testing.T) {
 	s := NewScheduler(4, 2.0)

@@ -151,9 +151,10 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 
 	switch stream.Event.Type {
 	case guide.StreamEventStart:
-		program.Send(msg.StreamStartMsg{SessionID: sid, CorrelationID: cid, AgentID: stream.RespondingAgentID})
+		program.Send(parseStreamStartMsg(sid, cid, stream))
 	case guide.StreamEventData:
 		if planMsg, ok := tryPlanUpdateMsg(stream.Event); ok {
+			planMsg.CorrelationID = cid
 			program.Send(planMsg)
 			return
 		}
@@ -164,14 +165,14 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 			program.Send(chunk)
 		}
 	case guide.StreamEventProgress:
-		program.Send(toStreamProgressMsg(sid, cid, stream.RespondingAgentID, stream.RespondingAgentName, stream.Event))
+		program.Send(toStreamProgressMsg(sid, cid, stream))
 	case guide.StreamEventComplete:
 		bridgeEventDebugLog().Info("GuideBridge: STREAM_COMPLETE_DISPATCH",
 			"correlation_id", cid,
 			"agent_id", stream.RespondingAgentID,
 			"has_directive", stream.Event.Directive != nil,
 			"text_len", len(stream.Event.Text))
-		complete := msg.StreamCompleteMsg{SessionID: sid, CorrelationID: cid, AgentID: stream.RespondingAgentID, AgentName: stream.RespondingAgentName, Result: stream.Event.Data}
+		complete := parseStreamCompleteMsg(sid, cid, stream)
 		if text := streamCompleteText(stream.RespondingAgentID, stream.Event); text != "" {
 			complete.AuthoritativeText = redact.Text(text)
 		}
@@ -203,6 +204,23 @@ func (b *GuideBridge) dispatchStream(stream *guide.StreamResponse, program TeaPr
 	case guide.StreamEventToolCall:
 		program.Send(parseToolCallEventMsg(sid, cid, stream.RespondingAgentID, stream.Event))
 	}
+}
+
+func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamResponse) msg.StreamStartMsg {
+	result := msg.StreamStartMsg{
+		SessionID:     sessionID,
+		CorrelationID: correlationID,
+	}
+	if stream == nil {
+		return result
+	}
+	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
+	result.AgentName = strings.TrimSpace(stream.RespondingAgentName)
+	result.AgentType = streamMetadataString(stream, "agent_type")
+	result.PipelineID = streamMetadataString(stream, "pipeline_id")
+	result.TaskID = streamMetadataString(stream, "task_id")
+	result.TaskSlug = streamMetadataString(stream, "task_slug")
+	return result
 }
 
 func parseStreamRerouteMsg(sessionID, correlationID string, event *guide.StreamEvent) msg.StreamRerouteMsg {
@@ -304,13 +322,25 @@ func streamDataText(event *guide.StreamEvent) string {
 	return ""
 }
 
-func toStreamProgressMsg(sessionID, correlationID, agentID, agentName string, event *guide.StreamEvent) msg.StreamProgressMsg {
+func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamResponse) msg.StreamProgressMsg {
+	var event *guide.StreamEvent
+	agentID := ""
+	agentName := ""
+	if stream != nil {
+		event = stream.Event
+		agentID = strings.TrimSpace(stream.RespondingAgentID)
+		agentName = strings.TrimSpace(stream.RespondingAgentName)
+	}
 	progress := parseProgressData(event)
 	m := msg.StreamProgressMsg{
 		SessionID:     sessionID,
 		CorrelationID: correlationID,
-		AgentID:       strings.TrimSpace(agentID),
-		AgentName:     strings.TrimSpace(agentName),
+		AgentID:       agentID,
+		AgentName:     agentName,
+		AgentType:     streamMetadataString(stream, "agent_type"),
+		PipelineID:    streamMetadataString(stream, "pipeline_id"),
+		TaskID:        streamMetadataString(stream, "task_id"),
+		TaskSlug:      streamMetadataString(stream, "task_slug"),
 		Current:       progress.Current,
 		Total:         progress.Total,
 		Message:       redact.Text(strings.TrimSpace(progress.Message)),
@@ -319,6 +349,38 @@ func toStreamProgressMsg(sessionID, correlationID, agentID, agentName string, ev
 		m.Visibility = event.Visibility
 	}
 	return m
+}
+
+func parseStreamCompleteMsg(sessionID, correlationID string, stream *guide.StreamResponse) msg.StreamCompleteMsg {
+	result := msg.StreamCompleteMsg{
+		SessionID:     sessionID,
+		CorrelationID: correlationID,
+	}
+	if stream == nil {
+		return result
+	}
+	result.AgentID = strings.TrimSpace(stream.RespondingAgentID)
+	result.AgentName = strings.TrimSpace(stream.RespondingAgentName)
+	result.AgentType = streamMetadataString(stream, "agent_type")
+	result.PipelineID = streamMetadataString(stream, "pipeline_id")
+	result.TaskID = streamMetadataString(stream, "task_id")
+	result.TaskSlug = streamMetadataString(stream, "task_slug")
+	if stream.Event != nil {
+		result.Result = stream.Event.Data
+	}
+	return result
+}
+
+func streamMetadataString(stream *guide.StreamResponse, key string) string {
+	if stream == nil || len(stream.Metadata) == 0 {
+		return ""
+	}
+	value, ok := stream.Metadata[key]
+	if !ok {
+		return ""
+	}
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
 }
 
 func parseProgressData(event *guide.StreamEvent) guide.ProgressData {

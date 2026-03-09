@@ -137,6 +137,7 @@ func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request,
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 		shared.AccumulateUsage(ctx, &resp.Usage)
+		shared.PublishIntermediateToolTurn(l.bus, l.channels, ctx, l.id, resp)
 
 		// ── NO TOOL CALLS → RETURN ANSWER ──
 		if len(resp.ToolCalls) == 0 {
@@ -369,7 +370,7 @@ func (l *Librarian) executeToolCall(ctx context.Context, call providers.ToolCall
 	}
 	return l.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         l.id,
+		AgentID:         l.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: l.toolRuntime().CapabilityScope(),
 	})
@@ -408,7 +409,7 @@ func (l *Librarian) toolInvocations(ctx context.Context, calls []providers.ToolC
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         l.id,
+			AgentID:         l.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

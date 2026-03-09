@@ -81,12 +81,14 @@ func (h *HandoffIngester) IngestHandoff(ctx context.Context, record *HandoffReco
 func (h *HandoffIngester) buildEntry(record *HandoffRecord) *Entry {
 	category := BuildHandoffCategory(record.AgentType)
 
-	metadata := map[string]any{
+	metadata := normalizeCrossAgentMetadata(map[string]any{
 		"handoff_index":         record.HandoffIndex,
 		"context_usage_percent": record.ContextUsage,
 		"handoff_reason":        record.HandoffReason,
 		"pipeline_id":           record.PipelineID,
-	}
+		"origin_agent_type":     record.AgentType,
+		"origin_source_type":    "handoff",
+	}, "", record.AgentType)
 
 	content := h.buildContent(record)
 
@@ -171,14 +173,17 @@ func (h *HandoffIngester) QueryHandoffsByPattern(
 	pattern string,
 	limit int,
 ) ([]*HandoffRecord, error) {
-	entries, err := h.archivalist.SearchText(ctx, pattern, false, limit)
+	entries, err := h.archivalist.Query(ctx, ArchiveQuery{
+		SearchText:       pattern,
+		Categories:       handoffCategories(),
+		Limit:            limit,
+		CrossAgentPolicy: CrossAgentPolicyInclude,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
-	// Filter to only handoff categories
-	filtered := filterHandoffEntries(entries)
-	return h.entriesToRecords(filtered), nil
+	return h.entriesToRecords(entries), nil
 }
 
 // entriesToRecords converts archivalist entries to handoff records.

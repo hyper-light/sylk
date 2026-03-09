@@ -101,6 +101,7 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 		shared.AccumulateUsage(ctx, &resp.Usage)
+		shared.PublishIntermediateToolTurn(e.bus, e.channels, ctx, e.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
 			e.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -236,7 +237,7 @@ func (e *Engineer) executeToolCall(ctx context.Context, call providers.ToolCall)
 	}
 	return e.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         e.id,
+		AgentID:         e.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: e.toolRuntime().CapabilityScope(),
 	})
@@ -275,7 +276,7 @@ func (e *Engineer) toolInvocations(ctx context.Context, calls []providers.ToolCa
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         e.id,
+			AgentID:         e.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

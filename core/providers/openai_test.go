@@ -20,11 +20,20 @@ func TestDefaultOpenAIConfig_UsesGPT54Pro(t *testing.T) {
 	if cfg.Model != "gpt-5.4-pro" {
 		t.Fatalf("expected default model gpt-5.4-pro, got %q", cfg.Model)
 	}
+	if cfg.Timeout != defaultOpenAIRequestTimeout {
+		t.Fatalf("expected default timeout %v, got %v", defaultOpenAIRequestTimeout, cfg.Timeout)
+	}
 	if cfg.FallbackModel != "" {
 		t.Fatalf("expected no fallback model, got %q", cfg.FallbackModel)
 	}
 	if cfg.AuthMode != "api_key" {
 		t.Fatalf("expected default auth mode api_key, got %q", cfg.AuthMode)
+	}
+}
+
+func TestResolveOpenAITimeout_UsesOpenAISpecificDefault(t *testing.T) {
+	if got := resolveOpenAITimeout(0); got != defaultOpenAIRequestTimeout {
+		t.Fatalf("resolveOpenAITimeout(0) = %v, want %v", got, defaultOpenAIRequestTimeout)
 	}
 }
 
@@ -116,6 +125,28 @@ func TestOpenAIProviderBuildResponseParams_OmitsTemperatureForThinkingModel(t *t
 	})
 	if params.Temperature.Valid() {
 		t.Fatal("expected temperature to be omitted for thinking model")
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_AppliesTemperatureForNonReasoningModel(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:       "gpt-4.1",
+				MaxTokens:   1024,
+				Temperature: 0.7,
+			},
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Messages: []Message{{Role: RoleUser, Content: "hello"}},
+	})
+	if !params.Temperature.Valid() {
+		t.Fatal("expected temperature to be set for non-reasoning model")
+	}
+	if params.Temperature.Value != 0.7 {
+		t.Fatalf("temperature = %v, want 0.7", params.Temperature.Value)
 	}
 }
 
@@ -251,6 +282,73 @@ func TestOpenAIProviderBuildResponseParams_AppliesParallelToolControls(t *testin
 	}
 	if params.ParallelToolCalls.Value {
 		t.Fatal("expected parallel_tool_calls=false when DisableParallelToolUse is set")
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_IncludesNativeWebSearchTool(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Messages: []Message{{Role: RoleUser, Content: "research Go error handling"}},
+		Tools: []Tool{
+			{
+				Kind: ToolKindNativeWebSearch,
+				Name: "web_search",
+				WebSearch: &WebSearchOptions{
+					SearchContextSize: WebSearchContextSizeHigh,
+					UserLocation: &WebSearchUserLocation{
+						Country:  "US",
+						Timezone: "America/Chicago",
+					},
+				},
+			},
+			{
+				Name:        "web_fetch",
+				Description: "Fetch a URL",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"url": map[string]any{"type": "string"},
+					},
+					"required":             []string{"url"},
+					"additionalProperties": false,
+				},
+			},
+		},
+	})
+
+	body := marshalResponseNewParams(t, params)
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 2 {
+		t.Fatalf("expected 2 tools in marshaled params, got %#v", body["tools"])
+	}
+
+	first, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first tool object, got %#v", tools[0])
+	}
+	if first["type"] != "web_search_preview_2025_03_11" {
+		t.Fatalf("expected native web search tool type, got %#v", first["type"])
+	}
+	if first["search_context_size"] != "high" {
+		t.Fatalf("expected high search context size, got %#v", first["search_context_size"])
+	}
+	userLocation, ok := first["user_location"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected user_location object, got %#v", first["user_location"])
+	}
+	if userLocation["country"] != "US" {
+		t.Fatalf("expected country US, got %#v", userLocation["country"])
+	}
+	if userLocation["timezone"] != "America/Chicago" {
+		t.Fatalf("expected timezone America/Chicago, got %#v", userLocation["timezone"])
 	}
 }
 

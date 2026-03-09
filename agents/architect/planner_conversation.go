@@ -347,6 +347,11 @@ Requirements:
 		return `Write the next user-facing response.
 
 Planning flow:
+0. If the request is still too vague or underspecified to start responsible planning,
+   invoke route_requirements_research instead of start_planning. Use that tool when the
+   user first needs help shaping the problem, scope, constraints, or success criteria.
+   Use ask_user_question only for one or two narrow decisions after the plan is already
+   mostly understood.
 1. When the user confirms they want to proceed with planning, invoke start_planning with a
    comprehensive query synthesizing all gathered requirements.
 2. After start_planning returns, it gives you a plan_id and protocol instructions. Follow those
@@ -381,6 +386,12 @@ Requirements:
 - Draw on your architectural expertise — be opinionated with clear reasoning.
 - For general conversation (no planning intent), engage naturally. If the conversation
   leads to a concrete task, ask if they'd like you to create a plan.
+- If the conversation reveals that the problem is too underspecified to plan safely,
+  hand the user to the Academic via route_requirements_research instead of pretending
+  the missing requirements are already known.
+- If the blocker is missing repository evidence or historical context inside this codebase,
+  stay in the Architect and consult the Librarian or Archivalist instead of handing the
+  user to the Academic.
 - Keep a natural, collaborative tone.
 - Do not use canned lead-ins or boilerplate.`
 	case plannerConversationModeFeedback:

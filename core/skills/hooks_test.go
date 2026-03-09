@@ -218,6 +218,25 @@ func TestHookRegistry_ExecuteToolCallHooks_SkipExecution(t *testing.T) {
 	}
 }
 
+func TestHookRegistry_ExecuteToolCallHooks_NoHooksContinue(t *testing.T) {
+	registry := NewHookRegistry()
+	data := &ToolCallHookData{ToolName: "search_skills"}
+
+	got, result, err := registry.ExecutePreToolCallHooks(context.Background(), data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != data {
+		t.Fatalf("expected original tool call data pointer to be returned")
+	}
+	if !result.Continue {
+		t.Fatal("expected no-hook tool execution to continue")
+	}
+	if result.SkipExecution {
+		t.Fatal("expected no-hook tool execution not to be skipped")
+	}
+}
+
 func TestHookRegistry_ExecuteStoreHooks_ModifiesData(t *testing.T) {
 	registry := NewHookRegistry()
 
@@ -240,6 +259,22 @@ func TestHookRegistry_ExecuteStoreHooks_ModifiesData(t *testing.T) {
 	}
 }
 
+func TestHookRegistry_ExecuteStoreHooks_NoHooksContinue(t *testing.T) {
+	registry := NewHookRegistry()
+	data := &StoreHookData{Entry: "original"}
+
+	got, result, err := registry.ExecutePreStoreHooks(context.Background(), data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != data {
+		t.Fatalf("expected original store hook data pointer to be returned")
+	}
+	if !result.Continue {
+		t.Fatal("expected no-hook store execution to continue")
+	}
+}
+
 func TestHookRegistry_ExecuteQueryHooks_ModifiesData(t *testing.T) {
 	registry := NewHookRegistry()
 
@@ -259,6 +294,22 @@ func TestHookRegistry_ExecuteQueryHooks_ModifiesData(t *testing.T) {
 	}
 	if result.Query != "updated" {
 		t.Fatalf("expected updated query, got %v", result.Query)
+	}
+}
+
+func TestHookRegistry_ExecuteQueryHooks_NoHooksContinue(t *testing.T) {
+	registry := NewHookRegistry()
+	data := &QueryHookData{Query: "original"}
+
+	got, result, err := registry.ExecutePreQueryHooks(context.Background(), data)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != data {
+		t.Fatalf("expected original query hook data pointer to be returned")
+	}
+	if !result.Continue {
+		t.Fatal("expected no-hook query execution to continue")
 	}
 }
 

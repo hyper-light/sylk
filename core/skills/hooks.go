@@ -562,7 +562,11 @@ func appendInjectedContext(current *PromptHookData, injectedContext string) *Pro
 
 func (r *HookRegistry) executeToolCallHooks(ctx context.Context, hooks []ToolCallHook, data *ToolCallHookData) (*ToolCallHookData, HookResult, error) {
 	current := data
-	var lastResult HookResult
+	lastResult := HookResult{Continue: true}
+
+	if len(hooks) == 0 {
+		return current, lastResult, nil
+	}
 
 	for _, hook := range hooks {
 		select {
@@ -596,7 +600,11 @@ func (r *HookRegistry) executeToolCallHooks(ctx context.Context, hooks []ToolCal
 
 func (r *HookRegistry) executeStoreHooks(ctx context.Context, hooks []StoreHook, data *StoreHookData) (*StoreHookData, HookResult, error) {
 	current := data
-	lastResult := HookResult{}
+	lastResult := HookResult{Continue: true}
+
+	if len(hooks) == 0 {
+		return current, lastResult, nil
+	}
 
 	for _, hook := range hooks {
 		result, err := executeStoreHook(ctx, hook, current)
@@ -639,7 +647,11 @@ func updateStoreHookData(current *StoreHookData, result HookResult) *StoreHookDa
 
 func (r *HookRegistry) executeQueryHooks(ctx context.Context, hooks []QueryHook, data *QueryHookData) (*QueryHookData, HookResult, error) {
 	current := data
-	lastResult := HookResult{}
+	lastResult := HookResult{Continue: true}
+
+	if len(hooks) == 0 {
+		return current, lastResult, nil
+	}
 
 	for _, hook := range hooks {
 		result, err := executeQueryHook(ctx, hook, current)

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -84,7 +85,7 @@ type DAGBridge struct {
 	eventLogger   *agentlog.SessionEventLogger
 	activeDAGs    map[string]*ActiveDAGMeta
 	gates         map[string]*dag.DecisionGate // per-DAG decision gates
-	scribeFactory shared.ScribeFactory          // optional Scribe factory for pipeline pods
+	scribeFactory shared.ScribeFactory         // optional Scribe factory for pipeline pods
 }
 
 // NewDAGBridge creates a bridge between the DAG scheduler and orchestrator subsystems.
@@ -766,4 +767,26 @@ func (b *DAGBridge) ResolveDecision(dagID string, decision dag.DecisionKind) {
 		return
 	}
 	gate.ResolveDecision(dagID, decision)
+}
+
+// AcknowledgeDispatch records that the routing fabric has accepted a node
+// dispatch. This provides a durable ACK path even if the agent-side ack_topic
+// path is delayed or unavailable.
+func (b *DAGBridge) AcknowledgeDispatch(dagID, nodeID, agentID, agentType string) bool {
+	b.mu.RLock()
+	meta := b.activeDAGs[dagID]
+	b.mu.RUnlock()
+	if meta == nil || meta.Dispatcher == nil {
+		return false
+	}
+	resolvedAgentID := strings.TrimSpace(agentID)
+	if resolvedAgentID == "" {
+		resolvedAgentID = strings.TrimSpace(agentType)
+	}
+	ack := &ACKResult{
+		AgentID:   resolvedAgentID,
+		AgentType: strings.TrimSpace(agentType),
+		AckedAt:   time.Now(),
+	}
+	return meta.Dispatcher.Acknowledge(nodeID, ack)
 }

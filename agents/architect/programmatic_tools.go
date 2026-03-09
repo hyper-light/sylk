@@ -37,7 +37,7 @@ func (a *Architect) invokeConversationTool(
 			Name:      name,
 			Arguments: string(raw),
 		},
-		AgentID:         a.id,
+		AgentID:         a.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: a.toolRuntime().CapabilityScope(),
 	})

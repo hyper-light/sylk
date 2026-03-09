@@ -535,6 +535,13 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(e.bus, e.channels, e.id, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	ctx = shared.WithStreamContextMetadata(ctx, map[string]any{
+		"agent_type":  "engineer",
+		"agent_name":  "Engineer",
+		"pipeline_id": e.pipelineID,
+		"task_id":     e.pipelineID,
+		"task_slug":   e.pipelineSlug,
+	})
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
 	ctx = shared.WithSteeringLedger(ctx, ledger)

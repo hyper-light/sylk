@@ -123,6 +123,8 @@ func (a *Architect) handleContinuationResponse(msg *guide.Message) error {
 		return a.handleAcceptanceEvaluationContinuation(msg, record)
 	case continuationKindPlanHandoff:
 		return a.handlePlanHandoffContinuation(msg, record)
+	case continuationKindAcademicHandoff:
+		return a.handleAcademicRequirementsHandoffContinuation(msg, record)
 	default:
 		return nil
 	}
@@ -175,7 +177,7 @@ func (a *Architect) handleGuardianApprovalContinuation(
 			Name:      record.ToolName,
 			Arguments: record.RawArguments,
 		},
-		AgentID:         a.id,
+		AgentID:         a.toolRuntime().AgentID(),
 		CorrelationID:   req.CorrelationID,
 		CapabilityScope: req.CapabilityScope,
 	}, grant)
@@ -325,6 +327,34 @@ func (a *Architect) handlePlanHandoffContinuation(
 	}
 	a.publishNotificationPush(message)
 	return nil
+}
+
+func (a *Architect) handleAcademicRequirementsHandoffContinuation(
+	msg *guide.Message,
+	record *ArchitectContinuation,
+) error {
+	resp, respJSON, err := routeResponseFromMessage(msg)
+	plan := a.planForContinuation(record)
+	if err != nil {
+		if plan != nil {
+			_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+		}
+		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		return err
+	}
+	if plan != nil {
+		_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+	}
+	if !resp.Success {
+		summary := strings.TrimSpace(resp.Error)
+		if summary == "" {
+			summary = "the Academic handoff did not complete successfully"
+		}
+		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, summary)
+		a.publishNotificationPush("I couldn't complete the Academic handoff: " + summary)
+		return nil
+	}
+	return a.controlStore.CompleteContinuation(record, continuationStatusCompleted, respJSON, "")
 }
 
 func (a *Architect) planForContinuation(record *ArchitectContinuation) *DesignPlan {

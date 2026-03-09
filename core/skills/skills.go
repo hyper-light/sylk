@@ -33,6 +33,10 @@ type Skill struct {
 	// Handler executes the skill
 	Handler Handler `json:"-"`
 
+	// ProviderTool declares that this skill should be exposed as a native
+	// provider-backed tool instead of a locally executed function tool.
+	ProviderTool *ProviderTool `json:"provider_tool,omitempty"`
+
 	// Loading state
 	Loaded   bool `json:"loaded"`
 	Priority int  `json:"priority"` // Higher = load first
@@ -73,6 +77,71 @@ type Property struct {
 
 // Handler executes a skill with the given input
 type Handler func(ctx context.Context, input json.RawMessage) (any, error)
+
+type ProviderToolKind string
+
+const (
+	ProviderToolKindFunction        ProviderToolKind = "function"
+	ProviderToolKindNativeWebSearch ProviderToolKind = "native_web_search"
+)
+
+type WebSearchContextSize string
+
+const (
+	WebSearchContextSizeLow    WebSearchContextSize = "low"
+	WebSearchContextSizeMedium WebSearchContextSize = "medium"
+	WebSearchContextSizeHigh   WebSearchContextSize = "high"
+)
+
+type WebSearchUserLocation struct {
+	City     string `json:"city,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+type WebSearchOptions struct {
+	SearchContextSize WebSearchContextSize   `json:"search_context_size,omitempty"`
+	UserLocation      *WebSearchUserLocation `json:"user_location,omitempty"`
+	AllowedDomains    []string               `json:"allowed_domains,omitempty"`
+	BlockedDomains    []string               `json:"blocked_domains,omitempty"`
+	MaxUses           int                    `json:"max_uses,omitempty"`
+	Strict            bool                   `json:"strict,omitempty"`
+	DeferLoading      bool                   `json:"defer_loading,omitempty"`
+	EnableURLContext  bool                   `json:"enable_url_context,omitempty"`
+}
+
+type ProviderTool struct {
+	Kind        ProviderToolKind  `json:"kind,omitempty"`
+	Description string            `json:"description,omitempty"`
+	WebSearch   *WebSearchOptions `json:"web_search,omitempty"`
+}
+
+func (t ProviderTool) ResolvedKind() ProviderToolKind {
+	if t.Kind == "" {
+		return ProviderToolKindFunction
+	}
+	return t.Kind
+}
+
+func (t ProviderTool) Clone() ProviderTool {
+	clone := t
+	if t.WebSearch != nil {
+		ws := *t.WebSearch
+		if t.WebSearch.UserLocation != nil {
+			location := *t.WebSearch.UserLocation
+			ws.UserLocation = &location
+		}
+		if len(t.WebSearch.AllowedDomains) > 0 {
+			ws.AllowedDomains = append([]string(nil), t.WebSearch.AllowedDomains...)
+		}
+		if len(t.WebSearch.BlockedDomains) > 0 {
+			ws.BlockedDomains = append([]string(nil), t.WebSearch.BlockedDomains...)
+		}
+		clone.WebSearch = &ws
+	}
+	return clone
+}
 
 // Result is the result of a skill invocation
 type Result struct {
@@ -246,6 +315,13 @@ func (b *Builder) Handler(h Handler) *Builder {
 	return b
 }
 
+// ProviderTool exposes the skill as a native provider-backed tool definition.
+func (b *Builder) ProviderTool(tool ProviderTool) *Builder {
+	toolCopy := tool.Clone()
+	b.skill.ProviderTool = &toolCopy
+	return b
+}
+
 // Build returns the constructed skill
 func (b *Builder) Build() *Skill {
 	return b.skill
@@ -366,8 +442,8 @@ func (r *Registry) Register(skill *Skill) error {
 	if skill.Name == "" {
 		return fmt.Errorf("skill name is required")
 	}
-	if skill.Handler == nil {
-		return fmt.Errorf("skill handler is required")
+	if skill.Handler == nil && skill.ProviderTool == nil {
+		return fmt.Errorf("skill handler or provider tool is required")
 	}
 
 	r.mu.Lock()

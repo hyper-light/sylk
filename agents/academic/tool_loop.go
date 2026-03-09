@@ -21,9 +21,17 @@ import (
 // executeToolLoop runs the LLM tool-call loop: Complete → check ToolCalls →
 // execute → append results → repeat, bounded by config.MaxToolRuns.
 // Follows the engineer tool loop pattern exactly.
-func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
+func (a *Academic) executeToolLoop(
+	ctx context.Context,
+	req *providers.Request,
+	ledger *steering.SteeringLedger,
+	surface toolruntime.Surface,
+) (string, error) {
 	maxRuns := a.config.MaxToolRuns
 	consecutiveErrors := 0
+	if surface == nil {
+		surface = a.toolRuntime()
+	}
 
 	p := a.getProvider()
 	if p == nil {
@@ -79,7 +87,7 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 		// ── END STEERING ──
 
 		if a.toolDefsDirty {
-			req.Tools = a.buildToolDefinitions()
+			req.Tools = a.buildToolDefinitionsWithSurface(surface)
 			a.toolDefsDirty = false
 		}
 
@@ -89,7 +97,7 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 		}
 
 		turnStart := time.Now()
-		resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("academic"))
+		resp, streamed, err := a.completeLLMTurn(ctx, p, req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
@@ -106,6 +114,9 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
 		shared.AccumulateUsage(ctx, &resp.Usage)
+		if !streamed {
+			shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
+		}
 
 		if len(resp.ToolCalls) == 0 {
 			a.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -117,11 +128,11 @@ func (a *Academic) executeToolLoop(ctx context.Context, req *providers.Request, 
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if err := a.toolRuntime().ValidateBatch(a.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+		if err := surface.ValidateBatch(a.toolInvocationsWithSurface(ctx, resp.ToolCalls, surface)); err != nil {
 			return "", err
 		}
 
-		errCount, rerouted := a.applyToolCalls(ctx, req, resp)
+		errCount, rerouted := a.applyToolCalls(ctx, req, resp, surface)
 		a.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
@@ -150,6 +161,7 @@ func (a *Academic) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
+	surface toolruntime.Surface,
 ) (int, bool) {
 	req.Messages = append(req.Messages, providers.Message{
 		Role:      providers.RoleAssistant,
@@ -169,7 +181,7 @@ func (a *Academic) applyToolCalls(
 		var execResult toolruntime.ExecutionResult
 		var execErr error
 		result, err := shared.TimedToolCall(ctx, "academic", call, func() (string, error) {
-			execResult, execErr = a.executeToolCall(ctx, call)
+			execResult, execErr = a.executeToolCallWithSurface(ctx, call, surface)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
@@ -221,9 +233,20 @@ func (a *Academic) applyToolCalls(
 
 // executeToolCall invokes a skill by name with JSON arguments.
 func (a *Academic) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	return a.executeToolCallWithSurface(ctx, call, a.toolRuntime())
+}
+
+func (a *Academic) executeToolCallWithSurface(
+	ctx context.Context,
+	call providers.ToolCall,
+	surface toolruntime.Surface,
+) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
+	}
+	if surface == nil {
+		surface = a.toolRuntime()
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -237,11 +260,11 @@ func (a *Academic) executeToolCall(ctx context.Context, call providers.ToolCall)
 	if correlationID == "" {
 		correlationID = a.id + "-local"
 	}
-	return a.toolRuntime().Execute(ctx, toolruntime.Invocation{
+	return surface.Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         a.id,
+		AgentID:         surface.AgentID(),
 		CorrelationID:   correlationID,
-		CapabilityScope: a.toolRuntime().CapabilityScope(),
+		CapabilityScope: surface.CapabilityScope(),
 	})
 }
 
@@ -257,8 +280,15 @@ func (a *Academic) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (a *Academic) buildToolDefinitions() []providers.Tool {
-	a.toolRuntime().SyncActiveFromLoaded()
-	return a.toolRuntime().BuildToolDefinitions()
+	return a.buildToolDefinitionsWithSurface(a.toolRuntime())
+}
+
+func (a *Academic) buildToolDefinitionsWithSurface(surface toolruntime.Surface) []providers.Tool {
+	if surface == nil {
+		return nil
+	}
+	surface.SyncActiveFromLoaded()
+	return surface.BuildToolDefinitions()
 }
 
 func (a *Academic) toolRuntime() *toolruntime.Runtime {
@@ -266,24 +296,179 @@ func (a *Academic) toolRuntime() *toolruntime.Runtime {
 }
 
 func (a *Academic) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	return a.toolInvocationsWithSurface(ctx, calls, a.toolRuntime())
+}
+
+func (a *Academic) toolInvocationsWithSurface(
+	ctx context.Context,
+	calls []providers.ToolCall,
+	surface toolruntime.Surface,
+) []toolruntime.Invocation {
 	if len(calls) == 0 {
 		return nil
+	}
+	if surface == nil {
+		surface = a.toolRuntime()
 	}
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = a.id + "-local"
 	}
-	scope := a.toolRuntime().CapabilityScope()
+	scope := surface.CapabilityScope()
 	invocations := make([]toolruntime.Invocation, 0, len(calls))
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         a.id,
+			AgentID:         surface.AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})
 	}
 	return invocations
+}
+
+func (a *Academic) completeLLMTurn(
+	ctx context.Context,
+	p academicProvider,
+	req *providers.Request,
+) (*providers.Response, bool, error) {
+	if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+		llmruntime.PromoteForUserFacingTurn(req, pp.SourceAgentID, llmruntime.ThoughtVisibilitySummary)
+	}
+	if sp, ok := p.(academicStreamingProvider); ok {
+		resp, err := a.streamLLMTurn(ctx, sp, req)
+		return resp, true, err
+	}
+
+	resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("academic"))
+	retryTimeout, shouldRetry := academicLLMRetryTimeout(p)
+	if err == nil || !shouldRetryAcademicDeadline(ctx, err, shouldRetry) {
+		return resp, false, err
+	}
+
+	retryCtx, cancel := academicRetryContext(ctx, retryTimeout)
+	defer cancel()
+
+	resp, err = shared.CompleteWithWatchdog(retryCtx, p, req, shared.AgentDisplayName("academic"))
+	return resp, false, err
+}
+
+type academicStreamingProvider interface {
+	academicProvider
+	Stream(ctx context.Context, req *providers.Request) (<-chan *providers.StreamChunk, error)
+}
+
+func (a *Academic) streamLLMTurn(
+	ctx context.Context,
+	p academicStreamingProvider,
+	req *providers.Request,
+) (*providers.Response, error) {
+	chunks, err := p.Stream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	cancelWatchdog := shared.StartThinkingWatchdog(ctx, req, shared.AgentDisplayName("academic"))
+	defer cancelWatchdog()
+
+	var (
+		streamErr         error
+		firstVisibleChunk bool
+	)
+	emitter := shared.NewThoughtEmitter(llmruntime.EmitsThoughts(req))
+
+	collector := providers.NewStreamCollector(func(chunk *providers.StreamChunk) {
+		if chunk == nil {
+			return
+		}
+		switch chunk.Type {
+		case providers.ChunkTypeText:
+			if chunk.Text == "" {
+				return
+			}
+			if !firstVisibleChunk {
+				cancelWatchdog()
+				firstVisibleChunk = true
+			}
+			shared.PublishStreamChunk(a.bus, a.channels, ctx, a.id, chunk.Text)
+		case providers.ChunkTypeThought:
+			if chunk.Text == "" {
+				return
+			}
+			if !firstVisibleChunk {
+				cancelWatchdog()
+				firstVisibleChunk = true
+			}
+			if thought := emitter.AddDelta(chunk.Text); thought != "" {
+				a.publishThoughtProgress(ctx, thought)
+			}
+		}
+	})
+
+	for chunk := range chunks {
+		collector.Add(chunk)
+		if chunk != nil && chunk.Type == providers.ChunkTypeError {
+			streamErr = fmt.Errorf("stream error: %s", chunk.Text)
+		}
+	}
+	if thought := emitter.Flush(); thought != "" {
+		a.publishThoughtProgress(ctx, thought)
+	}
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	return collector.Response(), nil
+}
+
+func (a *Academic) publishThoughtProgress(ctx context.Context, thought string) {
+	pp := shared.ProgressPublisherFromContext(ctx)
+	if pp == nil {
+		return
+	}
+	thought = strings.TrimSpace(thought)
+	if thought == "" {
+		return
+	}
+	pp.Publish(thought)
+}
+
+func shouldRetryAcademicDeadline(ctx context.Context, err error, hasRetryTimeout bool) bool {
+	if err == nil {
+		return false
+	}
+	if !hasRetryTimeout {
+		return false
+	}
+	if ctx == nil {
+		return errors.Is(err, context.DeadlineExceeded)
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+func academicRetryContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(ctx)
+	retryCtx, cancel := context.WithTimeout(base, timeout)
+	stop := context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return retryCtx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func academicLLMRetryTimeout(p academicProvider) (time.Duration, bool) {
+	if reporter, ok := p.(interface{ RequestTimeout() time.Duration }); ok {
+		if timeout := reporter.RequestTimeout(); timeout > 0 {
+			return timeout, true
+		}
+	}
+	return 0, false
 }
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.

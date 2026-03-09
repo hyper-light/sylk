@@ -68,6 +68,7 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
 			gov.Calibrate(ctx, resp, req.Messages)
 		}
+		o.publishStreamChunk(ctx, shared.IntermediateToolTurnText(resp))
 
 		if len(resp.ToolCalls) == 0 {
 			o.recordTurn(req, resp, turn, 0, 0, turnStart)
@@ -171,7 +172,7 @@ func (o *Orchestrator) executeToolCall(ctx context.Context, call providers.ToolC
 	}
 	return o.toolRuntime().Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         o.config.AgentID,
+		AgentID:         o.toolRuntime().AgentID(),
 		CorrelationID:   correlationID,
 		CapabilityScope: o.toolRuntime().CapabilityScope(),
 	})
@@ -210,7 +211,7 @@ func (o *Orchestrator) toolInvocations(ctx context.Context, calls []providers.To
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         o.config.AgentID,
+			AgentID:         o.toolRuntime().AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

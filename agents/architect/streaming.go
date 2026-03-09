@@ -32,6 +32,12 @@ type streamRetryResetEmitterKey struct{}
 // skill handlers (e.g. start_planning) can inherit it without relying on the
 // LLM to echo it back as a tool parameter.
 type architectSessionIDKey struct{}
+type architectConversationContextKey struct{}
+
+type architectConversationContext struct {
+	UserQuery           string
+	ConversationHistory []guide.ConversationTurn
+}
 
 func withArchitectSessionID(ctx context.Context, sessionID string) context.Context {
 	return context.WithValue(ctx, architectSessionIDKey{}, strings.TrimSpace(sessionID))
@@ -40,6 +46,23 @@ func withArchitectSessionID(ctx context.Context, sessionID string) context.Conte
 func architectSessionIDFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(architectSessionIDKey{}).(string)
 	return v
+}
+
+func withArchitectConversationContext(
+	ctx context.Context,
+	userQuery string,
+	history []guide.ConversationTurn,
+) context.Context {
+	payload := architectConversationContext{
+		UserQuery:           strings.TrimSpace(userQuery),
+		ConversationHistory: append([]guide.ConversationTurn(nil), history...),
+	}
+	return context.WithValue(ctx, architectConversationContextKey{}, payload)
+}
+
+func architectConversationContextFromContext(ctx context.Context) (architectConversationContext, bool) {
+	payload, ok := ctx.Value(architectConversationContextKey{}).(architectConversationContext)
+	return payload, ok
 }
 
 func withStreamRetryResetEmitter(ctx context.Context, emitter streamRetryResetEmitter) context.Context {
@@ -297,14 +320,18 @@ func (a *Architect) publishPlanStreamComplete(ctx context.Context, userResponse 
 // publishHandoffReroute emits a StreamEventReroute so the TUI switches
 // the engaged agent indicator from "architect" to the handoff target.
 // originalCID is the architect's stream CID (to be cleared in the TUI).
-// newCID is the orchestrator's request CID (for the TUI to track).
-func (a *Architect) publishHandoffReroute(ctx context.Context, toAgentID, originalCID, newCID string) {
+// newCID is the target agent's request CID (for the TUI to track).
+func (a *Architect) publishHandoffReroute(ctx context.Context, toAgentID, reason, originalCID, newCID string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "agent handoff"
+	}
 	a.publishPlanStreamEvent(ctx, &guide.StreamEvent{
 		Type: guide.StreamEventReroute,
 		Data: map[string]string{
 			"from_agent":              "architect",
 			"to_agent":                toAgentID,
-			"reason":                  "plan handoff",
+			"reason":                  reason,
 			"original_correlation_id": originalCID,
 			"new_correlation_id":      newCID,
 		},

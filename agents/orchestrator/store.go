@@ -1,12 +1,11 @@
 package orchestrator
 
 import (
-	"database/sql"
 	_ "embed"
 	"fmt"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/adalundhe/sylk/core/database"
 )
 
 //go:embed schema.sql
@@ -15,7 +14,7 @@ var schemaSQL string
 // Store provides SQLite persistence for orchestrator state.
 // WAL-mode SQLite with connection pooling — mirrors core/vectorgraphdb/db.go.
 type Store struct {
-	db   *sql.DB
+	db   *database.BunSQLiteDB
 	path string
 }
 
@@ -40,20 +39,19 @@ func DefaultStoreConfig(dbPath string) StoreConfig {
 
 // OpenStore opens or creates the orchestrator SQLite database.
 func OpenStore(cfg StoreConfig) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_synchronous=normal", cfg.Path)
-
-	db, err := sql.Open("sqlite", dsn)
+	db, err := database.OpenBunSQLite(database.BunSQLiteConfig{
+		Path:        cfg.Path,
+		MaxOpen:     cfg.MaxOpenConns,
+		MaxIdle:     cfg.MaxIdleConns,
+		MaxLifetime: cfg.ConnMaxLifetime,
+		BusyTimeout: 5 * time.Second,
+		EnableWAL:   true,
+		ForeignKeys: true,
+		CacheSize:   -2000,
+		Synchronous: "normal",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator store: open: %w", err)
-	}
-
-	db.SetMaxOpenConns(cfg.MaxOpenConns)
-	db.SetMaxIdleConns(cfg.MaxIdleConns)
-	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
-
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("orchestrator store: ping: %w", err)
 	}
 
 	return &Store{db: db, path: cfg.Path}, nil
@@ -61,8 +59,7 @@ func OpenStore(cfg StoreConfig) (*Store, error) {
 
 // Migrate executes the embedded schema.sql.
 func (s *Store) Migrate() error {
-	_, err := s.db.Exec(schemaSQL)
-	if err != nil {
+	if err := s.db.ExecSchema(nil, schemaSQL); err != nil {
 		return fmt.Errorf("orchestrator store: migrate: %w", err)
 	}
 	return nil

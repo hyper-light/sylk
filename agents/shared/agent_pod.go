@@ -70,6 +70,10 @@ type AgentPodConfig struct {
 	Activator    guide.PodActivator
 	Registrar    PodRegistrar
 	ActivityPub  events.ActivityPublisher
+	// RegistrationVisibility controls the visibility of synthesized
+	// registration events emitted during pre-activation. Zero defaults to
+	// events.VisibilityUser for backward compatibility.
+	RegistrationVisibility events.EventVisibility
 	Logger       *slog.Logger
 	Scope        *concurrency.GoroutineScope
 	MemberTypes  []string
@@ -118,6 +122,7 @@ type AgentPod struct {
 	managed      *pod.ManagedPod
 	registrar    PodRegistrar
 	activityPub  events.ActivityPublisher
+	regVis       events.EventVisibility
 	logger       *slog.Logger
 	scope        *concurrency.GoroutineScope
 	memberTypes  []string
@@ -143,6 +148,10 @@ type AgentPod struct {
 
 // NewAgentPod creates a pod with the given configuration.
 func NewAgentPod(cfg AgentPodConfig) *AgentPod {
+	regVis := cfg.RegistrationVisibility
+	if regVis == 0 {
+		regVis = events.VisibilityUser
+	}
 	return &AgentPod{
 		podID:         cfg.PodID,
 		sessionID:     cfg.SessionID,
@@ -150,6 +159,7 @@ func NewAgentPod(cfg AgentPodConfig) *AgentPod {
 		managed:       cfg.Managed,
 		registrar:     cfg.Registrar,
 		activityPub:   cfg.ActivityPub,
+		regVis:        regVis,
 		logger:        cfg.Logger,
 		scope:         cfg.Scope,
 		memberTypes:   cfg.MemberTypes,
@@ -421,7 +431,7 @@ func (p *AgentPod) publishActivity(agentType string) {
 	evt := events.NewActivityEvent(events.EventTypeAgentRegistered, p.sessionID,
 		fmt.Sprintf("Agent registered: %s", agentType))
 	evt.AgentID = agentType
-	evt.Visibility = events.VisibilityUser
+	evt.Visibility = p.regVis
 	evt.Data["agent_type"] = agentType
 	evt.Data["agent_name"] = displayName
 	evt.Data["pod_id"] = p.podID

@@ -3,6 +3,8 @@ package shared
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,10 +12,13 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
+const streamedTextMetadataKey = "shared_streamed_text"
+
 // StreamContext carries streaming correlation data through context.
 type StreamContext struct {
 	CorrelationID string
 	SourceAgentID string
+	Metadata      map[string]any
 }
 
 type streamContextKey struct{}
@@ -24,6 +29,24 @@ func WithStreamContext(ctx context.Context, correlationID, sourceAgentID string)
 		CorrelationID: correlationID,
 		SourceAgentID: sourceAgentID,
 	})
+}
+
+// WithStreamContextMetadata attaches stable metadata such as pipeline identity
+// to an existing stream context so UI layers can preserve canonical rows.
+func WithStreamContextMetadata(ctx context.Context, metadata map[string]any) context.Context {
+	if ctx == nil || len(metadata) == 0 {
+		return ctx
+	}
+	current, ok := ctx.Value(streamContextKey{}).(StreamContext)
+	if !ok || current.CorrelationID == "" {
+		return ctx
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	current.Metadata = cloned
+	return context.WithValue(ctx, streamContextKey{}, current)
 }
 
 // StreamMetadataFromContext extracts streaming metadata from a context.
@@ -105,6 +128,7 @@ func PublishStreamEvent(
 		CorrelationID:     metadata.CorrelationID,
 		RespondingAgentID: agentID,
 		TargetAgentID:     metadata.SourceAgentID,
+		Metadata:          cloneStreamMetadata(metadata.Metadata),
 		Event:             event,
 	}
 
@@ -119,6 +143,17 @@ func PublishStreamEvent(
 	}
 
 	_ = bus.Publish(channels.Responses, msg)
+}
+
+func cloneStreamMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 // PublishStreamStart emits a stream start event.
@@ -136,6 +171,118 @@ func PublishStreamChunk(bus guide.EventBus, channels *guide.AgentChannels, ctx c
 		Text:      text,
 		Timestamp: time.Now(),
 	})
+}
+
+// IntermediateToolTurnText returns assistant text worth surfacing immediately
+// for a tool-using turn. Final text-only turns continue to flow through the
+// normal complete event path.
+func IntermediateToolTurnText(resp *providers.Response) string {
+	if resp == nil || len(resp.ToolCalls) == 0 {
+		return ""
+	}
+	content := strings.TrimSpace(resp.Content)
+	if content == "" {
+		content = summarizeIntermediateThinking(resp.Thinking)
+	}
+	if content == "" {
+		content = summarizeIntermediateToolCalls(resp.ToolCalls)
+	}
+	if content == "" {
+		return ""
+	}
+	return content + "\n\n"
+}
+
+func MarkResponseStreamedText(resp *providers.Response) {
+	if resp == nil {
+		return
+	}
+	if resp.ProviderMetadata == nil {
+		resp.ProviderMetadata = make(map[string]any)
+	}
+	resp.ProviderMetadata[streamedTextMetadataKey] = true
+}
+
+func ResponseStreamedText(resp *providers.Response) bool {
+	if resp == nil || resp.ProviderMetadata == nil {
+		return false
+	}
+	value, _ := resp.ProviderMetadata[streamedTextMetadataKey].(bool)
+	return value
+}
+
+func summarizeIntermediateThinking(thinking string) string {
+	thinking = strings.Join(strings.Fields(strings.TrimSpace(thinking)), " ")
+	if thinking == "" {
+		return ""
+	}
+	const maxLen = 320
+	if len(thinking) <= maxLen {
+		return thinking
+	}
+	cut := strings.LastIndex(thinking[:maxLen], " ")
+	if cut < 0 {
+		cut = maxLen
+	}
+	return strings.TrimSpace(thinking[:cut]) + "..."
+}
+
+func summarizeIntermediateToolCalls(calls []providers.ToolCall) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(calls))
+	seen := make(map[string]struct{}, len(calls))
+	for _, call := range calls {
+		name := humanizeToolName(call.Name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	slices.Sort(names)
+	switch len(names) {
+	case 1:
+		return "Working through this with " + names[0] + "."
+	case 2:
+		return "Working through this with " + names[0] + " and " + names[1] + "."
+	default:
+		head := strings.Join(names[:len(names)-1], ", ")
+		return "Working through this with " + head + ", and " + names[len(names)-1] + "."
+	}
+}
+
+func humanizeToolName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	name = strings.ReplaceAll(name, "_", " ")
+	return strings.Join(strings.Fields(name), " ")
+}
+
+// PublishIntermediateToolTurn emits assistant text for tool-using turns so the
+// user sees progress before the loop reaches its final answer.
+func PublishIntermediateToolTurn(
+	bus guide.EventBus,
+	channels *guide.AgentChannels,
+	ctx context.Context,
+	agentID string,
+	resp *providers.Response,
+) {
+	if ResponseStreamedText(resp) {
+		return
+	}
+	if text := IntermediateToolTurnText(resp); text != "" {
+		PublishStreamChunk(bus, channels, ctx, agentID, text)
+	}
 }
 
 // PublishStreamComplete emits a stream completion event.
