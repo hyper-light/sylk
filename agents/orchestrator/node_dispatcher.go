@@ -42,11 +42,13 @@ type BusNodeDispatcher struct {
 	buffers      *BufferRegistry
 	activator    guide.PodActivator // fallback when pod is nil
 	pod          *shared.AgentPod   // per-node guard lifecycle manager
+	podResolver  func(*dag.Node) *shared.AgentPod
 	ackTimeout   time.Duration
 	pending      sync.Map // nodeID → chan *dag.NodeResult
 	dispatchDone sync.Map // nodeID → chan struct{}
 	ackResults   sync.Map // nodeID → *ACKResult
 	ackWaiters   sync.Map // nodeID → chan *ACKResult
+	nodePods     sync.Map // nodeID → *shared.AgentPod
 
 	// onACK is called when an agent ACKs a node dispatch. Optional.
 	onACK func(nodeID string, ack *ACKResult)
@@ -84,6 +86,12 @@ func (d *BusNodeDispatcher) SetACKCallback(fn func(nodeID string, ack *ACKResult
 	d.onACK = fn
 }
 
+// SetPodResolver installs a node-aware pod resolver. When present, it
+// overrides the single-pod field for dispatch/guard lifecycle.
+func (d *BusNodeDispatcher) SetPodResolver(fn func(*dag.Node) *shared.AgentPod) {
+	d.podResolver = fn
+}
+
 // GetACKResult returns the ACK data for a node, or nil if not yet acked.
 func (d *BusNodeDispatcher) GetACKResult(nodeID string) *ACKResult {
 	val, ok := d.ackResults.Load(nodeID)
@@ -105,6 +113,10 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	d.pending.Store(node.ID(), ch)
 	d.dispatchDone.Store(node.ID(), done)
 	d.ackWaiters.Store(node.ID(), ackCh)
+	if pod := d.resolvePod(node); pod != nil {
+		d.nodePods.Store(node.ID(), pod)
+		defer d.nodePods.Delete(node.ID())
+	}
 	defer d.pending.Delete(node.ID())
 	defer d.dispatchDone.Delete(node.ID())
 	defer d.ackWaiters.Delete(node.ID())
@@ -227,9 +239,11 @@ func (d *BusNodeDispatcher) extractACKResult(msg *guide.Message) *ACKResult {
 // with full observability, falling back to EnsurePodActive when no pod is
 // available.
 func (d *BusNodeDispatcher) activateAgents(ctx context.Context, node *dag.Node) error {
+	pod := d.resolvePod(node)
+
 	// Preferred path: pod manages guard lifecycle with observability.
-	if d.pod != nil {
-		return d.pod.HoldForNode(ctx, node.ID(), NodeAgentTypes(node))
+	if pod != nil {
+		return pod.HoldForNode(ctx, node.ID(), NodeAgentTypes(node))
 	}
 
 	// Fallback: best-effort activation without demotion guards.
@@ -253,6 +267,12 @@ func (d *BusNodeDispatcher) activateAgents(ctx context.Context, node *dag.Node) 
 // ReleaseGuard releases the demotion guard for a specific node via the pod.
 // No-op when the pod is nil. Safe to call multiple times.
 func (d *BusNodeDispatcher) ReleaseGuard(nodeID string) {
+	if pod, ok := d.nodePods.Load(nodeID); ok {
+		if resolved, ok := pod.(*shared.AgentPod); ok && resolved != nil {
+			resolved.ReleaseForNode(nodeID)
+		}
+		return
+	}
 	if d.pod != nil {
 		d.pod.ReleaseForNode(nodeID)
 	}
@@ -265,6 +285,15 @@ func (d *BusNodeDispatcher) ReleaseAllGuards() {
 	if d.pod != nil {
 		d.pod.Release()
 	}
+}
+
+func (d *BusNodeDispatcher) resolvePod(node *dag.Node) *shared.AgentPod {
+	if d.podResolver != nil && node != nil {
+		if pod := d.podResolver(node); pod != nil {
+			return pod
+		}
+	}
+	return d.pod
 }
 
 // buildDispatchMessage constructs the task dispatch bus message.

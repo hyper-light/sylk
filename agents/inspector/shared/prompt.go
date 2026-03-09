@@ -3,6 +3,8 @@ package shared
 import (
 	"strings"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/prompts"
 )
 
@@ -73,7 +75,10 @@ func GlobalInspectorSystemPrompt() string {
 		globalProtocol + promptSeparator +
 		globalAudit + promptSeparator +
 		InspectorSkillsPolicy + promptSeparator +
-		InspectorGuardrails
+		InspectorGuardrails + promptSeparator +
+		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
+			DefaultView: versioning.WorkspaceViewGlobal,
+		})
 }
 
 // GlobalConversationPrompt returns the global conversation prompt.
@@ -88,6 +93,9 @@ func GlobalInspectorConversationSystemPrompt() string {
 		globalSystem,
 		InspectorGuardrails,
 		globalConversation,
+		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
+			DefaultView: versioning.WorkspaceViewGlobal,
+		}),
 	}, promptSeparator)
 }
 

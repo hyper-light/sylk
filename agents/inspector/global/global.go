@@ -75,7 +75,8 @@ type GlobalInspector struct {
 	agentPod *agentShared.AgentPod
 
 	// File access (injected per-session at runtime).
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// Request lifecycle.
 	runCtx    context.Context
@@ -258,6 +259,7 @@ func (gi *GlobalInspector) registerSafetyHook() {
 		"run_security_scan": true, "check_coverage": true, "analyze_complexity": true,
 		"detect_race_conditions": true, "detect_deadlocks": true, "detect_memory_leaks": true,
 		"read_file": true, "glob": true, "grep": true,
+		"read_workspace_file": true, "workspace_glob": true, "workspace_grep": true, "inspect_workspace_state": true, "summarize_workspace_state": true,
 		"audit_layer": true, "validate_plan_adherence": true,
 		"cross_reference_changes": true, "grade_layer_quality": true,
 		"request_architect_research": true, "request_user_clarification": true,
@@ -378,6 +380,7 @@ func (gi *GlobalInspector) unsubRegistry() error {
 
 // Handle processes a forwarded request with intent dispatch.
 func (gi *GlobalInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	switch fwd.Intent {
 	case guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
 		return gi.handleConversation(ctx, fwd)
@@ -453,7 +456,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 	agentShared.LogIncomingRequest(gi.steering.EventLogger(), fwd, gi.id)
 
 	reqCtx, cancel := context.WithCancel(gi.runCtx)
-	gi.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	gi.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
 	ctx := reqCtx
@@ -654,6 +657,11 @@ func (gi *GlobalInspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 // SetFileAccess injects the per-session file access layer.
 func (gi *GlobalInspector) SetFileAccess(fa versioning.FileAccess) {
 	gi.fileAccess = fa
+}
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (gi *GlobalInspector) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	gi.workspaceViews = views
 }
 
 // ExtractArchivableState returns the archivable state of this agent.

@@ -6,8 +6,8 @@ import (
 )
 
 // FileAccess abstracts file operations for agents. Implementations provide
-// direct disk I/O, per-pipeline VFS overlay, or per-session CVS-backed
-// access depending on the agent's role in the system.
+// direct disk I/O, per-pipeline in-memory VFS overlay, or per-session global
+// in-memory overlay access depending on the agent's role in the system.
 type FileAccess interface {
 	// ReadFile reads the entire contents of a file.
 	ReadFile(ctx context.Context, path string) ([]byte, error)
@@ -62,8 +62,15 @@ type GrepMatch struct {
 
 // FileAccessConsumer is implemented by agents that receive FileAccess at
 // runtime rather than at creation time. Pipeline agents receive per-pipeline
-// VFS access when dispatched; global agents receive per-session CVS access
-// when a session starts.
+// VFS access when dispatched; global agents receive per-session global-overlay
+// access when a session starts.
 type FileAccessConsumer interface {
 	SetFileAccess(fa FileAccess)
+}
+
+// WorkspaceViewsConsumer is implemented by agents that can inspect multiple
+// workspace layers explicitly: committed disk, session-global overlay, and
+// task-local pipeline overlay.
+type WorkspaceViewsConsumer interface {
+	SetWorkspaceViews(views WorkspaceViewAccess)
 }

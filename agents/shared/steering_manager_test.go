@@ -298,7 +298,7 @@ func TestSteeringManagerJournalPassthrough(t *testing.T) {
 func TestCancelEntryFireIdempotent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	entry := sm.RegisterCancel("corr-cancel-1", cancel)
+	entry := sm.RegisterCancel("corr-cancel-1", "session-1", cancel)
 
 	if entry.IsFired() {
 		t.Fatal("should not be fired before Fire()")
@@ -322,7 +322,7 @@ func TestCancelEntryFireIdempotent(t *testing.T) {
 func TestCancelEntryHooksRunInOrder(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	entry := sm.RegisterCancel("corr-hooks", cancel)
+	entry := sm.RegisterCancel("corr-hooks", "session-1", cancel)
 
 	var order []int
 	entry.AddHook(func() { order = append(order, 1) })
@@ -344,7 +344,7 @@ func TestCancelEntryHooksRunInOrder(t *testing.T) {
 func TestCancelEntryAddHookAfterFire(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	entry := sm.RegisterCancel("corr-late-hook", cancel)
+	entry := sm.RegisterCancel("corr-late-hook", "session-1", cancel)
 
 	entry.Fire()
 
@@ -359,7 +359,7 @@ func TestCancelEntryAddHookAfterFire(t *testing.T) {
 func TestCancelEntryDoneChannel(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	entry := sm.RegisterCancel("corr-done", cancel)
+	entry := sm.RegisterCancel("corr-done", "session-1", cancel)
 
 	select {
 	case <-entry.Done():
@@ -380,7 +380,7 @@ func TestCancelEntryDoneChannel(t *testing.T) {
 func TestSteeringManagerCancelRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	sm.RegisterCancel("corr-cr", cancel)
+	sm.RegisterCancel("corr-cr", "session-1", cancel)
 
 	found := sm.CancelRequest("corr-cr")
 	if !found {
@@ -399,7 +399,7 @@ func TestSteeringManagerCancelRequest(t *testing.T) {
 func TestSteeringManagerIsCancelled(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	sm.RegisterCancel("corr-ic", cancel)
+	sm.RegisterCancel("corr-ic", "session-1", cancel)
 
 	if sm.IsCancelled("corr-ic") {
 		t.Fatal("should not be cancelled before CancelRequest")
@@ -416,7 +416,7 @@ func TestSteeringManagerIsCancelled(t *testing.T) {
 func TestSteeringManagerHandleCancelAction(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	sm.RegisterCancel("corr-action", cancel)
+	sm.RegisterCancel("corr-action", "session-1", cancel)
 
 	handled := sm.HandleAction(&guide.ActionRequest{
 		Action:        "cancel",
@@ -433,7 +433,7 @@ func TestSteeringManagerHandleCancelAction(t *testing.T) {
 func TestSteeringManagerHandleCancelActionFromData(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	sm.RegisterCancel("corr-from-data", cancel)
+	sm.RegisterCancel("corr-from-data", "session-1", cancel)
 
 	handled := sm.HandleAction(&guide.ActionRequest{
 		Action:        "interrupt",
@@ -450,12 +450,54 @@ func TestSteeringManagerHandleCancelActionFromData(t *testing.T) {
 	}
 }
 
+func TestSteeringManagerHandleSessionCancelAction(t *testing.T) {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	sm := NewSteeringManager()
+	sm.RegisterCancel("corr-session-1", "session-1", cancel1)
+	sm.RegisterCancel("corr-session-2", "session-1", cancel2)
+
+	handled := sm.HandleAction(&guide.ActionRequest{
+		Action: "cancel",
+		Data: map[string]any{
+			"session_id": "session-1",
+			"scope":      "session",
+		},
+	})
+	if !handled {
+		t.Fatal("session cancel action should be handled")
+	}
+	if ctx1.Err() == nil || ctx2.Err() == nil {
+		t.Fatal("all session contexts should be cancelled via HandleAction")
+	}
+}
+
+func TestSteeringManagerCancelSession(t *testing.T) {
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	sm := NewSteeringManager()
+	sm.RegisterCancel("corr-s1-a", "session-1", cancel1)
+	sm.RegisterCancel("corr-s1-b", "session-1", cancel2)
+	sm.RegisterCancel("corr-s2-a", "session-2", cancel3)
+
+	if got := sm.CancelSession("session-1"); got != 2 {
+		t.Fatalf("CancelSession() = %d, want 2", got)
+	}
+	if ctx1.Err() == nil || ctx2.Err() == nil {
+		t.Fatal("session-1 contexts should be cancelled")
+	}
+	if ctx3.Err() != nil {
+		t.Fatal("session-2 context should remain active")
+	}
+}
+
 func TestSteeringManagerCloseAllFiresCancels(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
-	sm.RegisterCancel("corr-ca1", cancel1)
-	sm.RegisterCancel("corr-ca2", cancel2)
+	sm.RegisterCancel("corr-ca1", "session-1", cancel1)
+	sm.RegisterCancel("corr-ca2", "session-2", cancel2)
 
 	sm.CloseAll()
 
@@ -471,7 +513,7 @@ func TestSteeringManagerCloseRemovesCancelEntry(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	sm := NewSteeringManager()
 	sm.Create("corr-close", "a", "s", nil, nil)
-	sm.RegisterCancel("corr-close", cancel)
+	sm.RegisterCancel("corr-close", "s", cancel)
 
 	sm.Close("corr-close", false)
 

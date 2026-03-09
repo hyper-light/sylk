@@ -12,7 +12,7 @@ import (
 // VersioningSkills manages filesystem versioning skills using the new
 // WAL-based architecture (no branches, no DAGStore).
 type VersioningSkills struct {
-	wal         *VersionedWAL
+	wal         SemanticWAL
 	diskFlusher *DiskFlusher
 	differ      Differ
 	sessionID   SessionID
@@ -20,7 +20,7 @@ type VersioningSkills struct {
 
 // VersioningSkillsConfig configuration for versioning skills.
 type VersioningSkillsConfig struct {
-	WAL         *VersionedWAL
+	WAL         SemanticWAL
 	DiskFlusher *DiskFlusher
 	Differ      Differ
 	SessionID   SessionID

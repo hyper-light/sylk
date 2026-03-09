@@ -470,6 +470,7 @@ func buildGuideResponseSystemPrompt() string {
 	sections := []string{
 		strings.TrimSpace(GuideSystemPrompt),
 		strings.TrimSpace(guideResponseBaseSystemPrompt),
+		strings.TrimSpace(buildGuideWorkspaceContext()),
 	}
 	nonEmpty := make([]string, 0, len(sections))
 	for _, section := range sections {
@@ -479,6 +480,19 @@ func buildGuideResponseSystemPrompt() string {
 		nonEmpty = append(nonEmpty, section)
 	}
 	return strings.Join(nonEmpty, "\n\n---\n\n")
+}
+
+func buildGuideWorkspaceContext() string {
+	return strings.TrimSpace(`# Workspace Layers
+
+Treat on-disk files as the committed source of truth for the actual codebase. Session and pipeline overlays are in-progress working state layered on top.
+
+- Disk: committed repository state on disk. This is the authoritative actual codebase state.
+- Global VFS: session-scoped merged but uncommitted work.
+- Pipeline VFS: task-scoped unmerged in-progress work for the active pipeline.
+
+Default read/write tools for this agent operate on the disk view unless a tool explicitly says otherwise.
+Use read_workspace_file, workspace_glob, workspace_grep, inspect_workspace_state, and summarize_workspace_state whenever you need to compare disk against merged or task-local in-progress work.`)
 }
 
 func withGuideThoughtEmitter(ctx context.Context, emit guideThoughtEmitter) context.Context {

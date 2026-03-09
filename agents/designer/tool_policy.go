@@ -8,6 +8,11 @@ import (
 func designerVisibleSkillNames() []string {
 	return []string{
 		"component_search",
+		"read_workspace_file",
+		"workspace_glob",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
 		"component_create",
 		"component_modify",
 		"ask_user_clarification",

@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -31,6 +32,11 @@ func (l *Librarian) registerCoreSkills() {
 	l.skills.Register(readFileSkill(l))
 	l.skills.Register(globSkill(l))
 	l.skills.Register(grepSkill(l))
+	l.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return l.workspaceViews }, nil))
+	l.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return l.workspaceViews }, nil))
+	l.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return l.workspaceViews }, nil))
+	l.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return l.workspaceViews }, nil))
+	l.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return l.workspaceViews }, nil))
 	l.skills.Register(findSymbolSkill(l))
 	l.skills.Register(gitSkill(l))
 	l.skills.Register(lspSkill(l))

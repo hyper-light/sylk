@@ -27,10 +27,11 @@ type GuardEntry struct {
 
 // ManagedPodConfig provides construction parameters for a ManagedPod.
 type ManagedPodConfig struct {
-	ID      PodID
-	Policy  *PodPolicy
-	Runtime container.ContainerRuntime
-	Logger  *slog.Logger
+	ID            PodID
+	Policy        *PodPolicy
+	Runtime       container.ContainerRuntime
+	Logger        *slog.Logger
+	VolumeManager *VolumeManager
 }
 
 // ManagedPod owns the lifecycle of a group of containers that activate
@@ -42,6 +43,7 @@ type ManagedPod struct {
 	policy  *PodPolicy
 	runtime container.ContainerRuntime
 	logger  *slog.Logger
+	volumes *VolumeManager
 
 	// Tier state (Cold → Cool → Warm → Hot).
 	tier atomic.Int32
@@ -61,6 +63,9 @@ type ManagedPod struct {
 
 	// Metrics.
 	metrics PodMetrics
+
+	specsMu sync.RWMutex
+	specs   []container.ContainerSpec
 }
 
 // NewManagedPod creates a pod with the given configuration.
@@ -71,6 +76,7 @@ func NewManagedPod(cfg ManagedPodConfig) *ManagedPod {
 		policy:     cfg.Policy,
 		runtime:    cfg.Runtime,
 		logger:     cfg.Logger,
+		volumes:    cfg.VolumeManager,
 		containers: make(map[string]*container.Container),
 		nodeGuards: make(map[string]*GuardEntry),
 	}
@@ -189,6 +195,7 @@ func (p *ManagedPod) ContainerCount() int {
 // Creates and starts containers for all member types using the runtime.
 // Caller must provide ContainerSpecs matching the pod's member types.
 func (p *ManagedPod) Promote(ctx context.Context, specs []container.ContainerSpec) error {
+	p.cacheSpecs(specs)
 	current := p.LoadTier()
 	if current == TierHot {
 		p.metrics.HotHits.Add(1)
@@ -209,17 +216,25 @@ func (p *ManagedPod) Promote(ctx context.Context, specs []container.ContainerSpe
 }
 
 func (p *ManagedPod) promoteFromCold(ctx context.Context, specs []container.ContainerSpec) error {
+	specs = p.resolveSpecs(specs)
+	if err := p.mountVolumes(ctx); err != nil {
+		return fmt.Errorf("pod %s: mount volumes: %w", p.id, err)
+	}
 	containers, err := p.runtime.CreateContainersForPod(ctx, container.PodID(p.id), specs)
 	if err != nil {
+		p.unmountVolumes(ctx)
 		return fmt.Errorf("pod %s: create containers: %w", p.id, err)
 	}
+	p.indexContainers(containers, specs)
+	p.injectFileAccess()
 
 	if err := p.runtime.StartContainers(ctx, containers); err != nil {
 		p.cleanupContainers(ctx, containers)
+		p.ClearContainers()
+		p.unmountVolumes(ctx)
 		return fmt.Errorf("pod %s: start containers: %w", p.id, err)
 	}
 
-	p.indexContainers(containers, specs)
 	p.StoreTier(TierHot)
 	p.touchActivity()
 	p.metrics.ColdStarts.Add(1)
@@ -233,18 +248,25 @@ func (p *ManagedPod) promoteFromCold(ctx context.Context, specs []container.Cont
 }
 
 func (p *ManagedPod) promoteFromCool(ctx context.Context, specs []container.ContainerSpec) error {
-	// Cool→Hot: recreate containers (state restoration handled by caller).
+	specs = p.resolveSpecs(specs)
+	if err := p.mountVolumes(ctx); err != nil {
+		return fmt.Errorf("pod %s: mount volumes from cool: %w", p.id, err)
+	}
 	containers, err := p.runtime.CreateContainersForPod(ctx, container.PodID(p.id), specs)
 	if err != nil {
+		p.unmountVolumes(ctx)
 		return fmt.Errorf("pod %s: create containers from cool: %w", p.id, err)
 	}
+	p.indexContainers(containers, specs)
+	p.injectFileAccess()
 
 	if err := p.runtime.StartContainers(ctx, containers); err != nil {
 		p.cleanupContainers(ctx, containers)
+		p.ClearContainers()
+		p.unmountVolumes(ctx)
 		return fmt.Errorf("pod %s: start containers from cool: %w", p.id, err)
 	}
 
-	p.indexContainers(containers, specs)
 	p.StoreTier(TierHot)
 	p.touchActivity()
 	p.metrics.CoolStarts.Add(1)
@@ -335,6 +357,7 @@ func (p *ManagedPod) demoteWarmToCool(ctx context.Context) error {
 	}
 
 	p.ClearContainers()
+	p.unmountVolumes(ctx)
 	p.StoreTier(TierCool)
 	p.metrics.DemotionsToCool.Add(1)
 
@@ -345,7 +368,7 @@ func (p *ManagedPod) demoteWarmToCool(ctx context.Context) error {
 }
 
 func (p *ManagedPod) demoteCoolToCold(ctx context.Context) error {
-	_ = ctx // Cool→Cold is metadata-only cleanup; no containers to stop.
+	_ = ctx
 	p.StoreTier(TierCold)
 	p.metrics.DemotionsToCold.Add(1)
 
@@ -466,6 +489,53 @@ func (p *ManagedPod) indexContainers(containers []*container.Container, specs []
 			p.containers[specs[i].AgentType] = c
 		}
 	}
+}
+
+func (p *ManagedPod) injectFileAccess() {
+	if p.volumes == nil {
+		return
+	}
+	p.volumes.InjectFileAccess(p.allContainersSnapshot())
+}
+
+func (p *ManagedPod) mountVolumes(ctx context.Context) error {
+	if p.volumes == nil {
+		return nil
+	}
+	return p.volumes.MountAll(ctx)
+}
+
+func (p *ManagedPod) unmountVolumes(ctx context.Context) {
+	if p.volumes == nil {
+		return
+	}
+	_ = p.volumes.UnmountAll(ctx)
+}
+
+func (p *ManagedPod) cacheSpecs(specs []container.ContainerSpec) {
+	if len(specs) == 0 {
+		return
+	}
+	p.specsMu.Lock()
+	defer p.specsMu.Unlock()
+	p.specs = append(p.specs[:0], specs...)
+}
+
+func (p *ManagedPod) resolveSpecs(specs []container.ContainerSpec) []container.ContainerSpec {
+	if len(specs) > 0 {
+		return specs
+	}
+	p.specsMu.RLock()
+	defer p.specsMu.RUnlock()
+	if len(p.specs) == 0 {
+		return nil
+	}
+	return append([]container.ContainerSpec(nil), p.specs...)
+}
+
+// SetSpecs primes the pod with the specs needed for a future lazy promotion.
+func (p *ManagedPod) SetSpecs(specs []container.ContainerSpec) {
+	p.cacheSpecs(specs)
 }
 
 // allContainersSnapshot returns a copy of the containers map.

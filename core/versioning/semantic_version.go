@@ -27,6 +27,9 @@ func compareUint32(a, b uint32) int {
 	if a < b {
 		return -1
 	}
+	if a == b {
+		return 0
+	}
 	return 1
 }
 

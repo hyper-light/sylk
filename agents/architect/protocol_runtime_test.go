@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,6 +132,50 @@ func TestPlanStore_RestorePlanFromFile_TerminalPlansSkipped(t *testing.T) {
 
 	if store.Count() != 0 {
 		t.Errorf("expected 0 active plans after terminal restores, got %d", store.Count())
+	}
+}
+
+func TestValidateTaskContract_RequiresWorkspaceAndWorkerPackets(t *testing.T) {
+	task := &AtomicTask{
+		ID:                  "task_checkout",
+		Description:         "Implement checkout flow",
+		AgentType:           "engineer",
+		SuccessCriteria:     []string{"checkout works"},
+		AcceptanceCriteria:  []AcceptanceCriterion{{Given: "a cart", When: "checkout is submitted", Then: "order is placed", Priority: "must"}},
+		ImplementationGuide: "Implement the checkout handler and wire the submission path.",
+		AffectedFiles:       []TaskFileTarget{{Path: "ui/checkout/page.tsx", Operation: "modify"}},
+		Workspace: TaskWorkspaceSpec{
+			BaseVersion: "session_head",
+			ReadSet:     []string{"ui/checkout/page.tsx", "ui/checkout/styles.css"},
+			WriteSet:    []string{"ui/checkout/page.tsx", "ui/checkout/styles.css"},
+		},
+		CoAgents: []string{"designer"},
+		WorkerPackets: []WorkerPacket{
+			{
+				AgentType:           "engineer",
+				Role:                "primary",
+				ImplementationGuide: "Implement checkout flow.",
+				ReadSet:             []string{"ui/checkout/page.tsx"},
+				WriteSet:            []string{"ui/checkout/page.tsx"},
+			},
+			{
+				AgentType:           "designer",
+				Role:                "co_agent",
+				ImplementationGuide: "Refine spacing.",
+				ReadSet:             []string{"ui/checkout/styles.css"},
+				WriteSet:            []string{"ui/checkout/styles.css"},
+			},
+		},
+	}
+
+	if err := validateTaskContract(task); err != nil {
+		t.Fatalf("validateTaskContract() unexpected error: %v", err)
+	}
+
+	task.WorkerPackets[1].WriteSet = []string{"outside/scope.css"}
+	err := validateTaskContract(task)
+	if err == nil || !strings.Contains(err.Error(), "outside workspace") {
+		t.Fatalf("expected outside workspace error, got %v", err)
 	}
 }
 

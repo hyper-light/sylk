@@ -41,11 +41,12 @@ type Config struct {
 	Logger    *slog.Logger
 
 	// External dependencies.
-	ActivityPub events.ActivityPublisher
-	FileAccess  versioning.FileAccess
-	GitBus      *git.GitBus
-	GitWatcher  *git.StatusWatcher
-	Sanitizer   *security.SecretSanitizer
+	ActivityPub    events.ActivityPublisher
+	FileAccess     versioning.FileAccess
+	WorkspaceViews versioning.WorkspaceViewAccess
+	GitBus         *git.GitBus
+	GitWatcher     *git.StatusWatcher
+	Sanitizer      *security.SecretSanitizer
 
 	// Git Safety.
 	CheckpointInterval time.Duration // Default: 10min

@@ -9,6 +9,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/providers"
 	coreskills "github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (g *Guide) prepareGuideSelfResponseTools(input string) []providers.Tool {
@@ -81,6 +82,7 @@ func (g *Guide) executeGuideSelfResponseToolCall(ctx context.Context, name strin
 	if g == nil || g.skills == nil {
 		return "", fmt.Errorf("guide skills are not available")
 	}
+	ctx = versioning.WithSessionID(ctx, g.sessionID)
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "", fmt.Errorf("tool name is required")

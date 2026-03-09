@@ -20,6 +20,11 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(componentSearchSkill(d))
 	d.skills.Register(componentCreateSkill(d))
 	d.skills.Register(componentModifySkill(d))
+	d.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
+	d.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
+	d.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
+	d.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
+	d.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
 	d.skills.Register(tokenValidateSkill(d))
 	d.skills.Register(tokenSuggestSkill(d))
 	d.skills.Register(a11yAuditSkill(d))
@@ -46,12 +51,16 @@ func (d *Designer) registerCoreSkills() {
 
 type designerDiag struct{ d *Designer }
 
-func (dd *designerDiag) AgentName() string  { return "designer" }
-func (dd *designerDiag) SessionID() string  { return dd.d.config.SessionID }
-func (dd *designerDiag) LogsDir() string    { return shared.LogsDirForAgent(dd.d.steering.SessionDir(), "designer") }
-func (dd *designerDiag) EventLogger() *agentlog.SessionEventLogger { return dd.d.steering.EventLogger() }
-func (dd *designerDiag) PeerLogsDirs() map[string]string           { return nil }
-func (dd *designerDiag) RecoveryHints() []string                   { return nil }
+func (dd *designerDiag) AgentName() string { return "designer" }
+func (dd *designerDiag) SessionID() string { return dd.d.config.SessionID }
+func (dd *designerDiag) LogsDir() string {
+	return shared.LogsDirForAgent(dd.d.steering.SessionDir(), "designer")
+}
+func (dd *designerDiag) EventLogger() *agentlog.SessionEventLogger {
+	return dd.d.steering.EventLogger()
+}
+func (dd *designerDiag) PeerLogsDirs() map[string]string { return nil }
+func (dd *designerDiag) RecoveryHints() []string         { return nil }
 
 func (dd *designerDiag) AgentSpecificDiagnostics() map[string]any {
 	dd.d.stateMu.RLock()

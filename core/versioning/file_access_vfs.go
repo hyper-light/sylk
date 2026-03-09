@@ -88,7 +88,7 @@ func (v *VFSFileAccess) ListDir(ctx context.Context, dir string) ([]fs.DirEntry,
 		full := filepath.Join(resolved, name)
 		info, statErr := os.Stat(full)
 		if statErr != nil {
-			entries = append(entries, vfsDirEntry{name: name, isDir: false})
+			entries = append(entries, vfsDirEntry{name: name, isDir: v.vfs.HasVisibleDescendant(full)})
 			continue
 		}
 		entries = append(entries, vfsDirEntry{
@@ -136,6 +136,23 @@ func (v *VFSFileAccess) resolve(path string) string {
 
 // vfsGlob walks the VFS overlay (staged + disk - deleted) to find matching files.
 func (v *VFSFileAccess) vfsGlob(ctx context.Context, root, pattern string, exclude []string) ([]string, error) {
+	if candidates := v.visibleCandidates(root); len(candidates) > 0 {
+		matches := make([]string, 0, len(candidates))
+		for _, absPath := range candidates {
+			rel, err := filepath.Rel(root, absPath)
+			if err != nil || strings.HasPrefix(rel, "..") {
+				continue
+			}
+			if isExcluded(rel, exclude) {
+				continue
+			}
+			if matchGlob(rel, pattern) {
+				matches = append(matches, rel)
+			}
+		}
+		return matches, nil
+	}
+
 	diskMatches, err := diskGlob(root, pattern, exclude)
 	if err != nil {
 		return nil, err
@@ -184,6 +201,10 @@ func (v *VFSFileAccess) vfsGlob(ctx context.Context, root, pattern string, exclu
 
 // vfsGrep searches files through VFS (overlay reads).
 func (v *VFSFileAccess) vfsGrep(ctx context.Context, root string, re *regexp.Regexp, include string, contextLines, maxMatches int) ([]GrepMatch, error) {
+	if candidates := v.visibleCandidates(root); len(candidates) > 0 {
+		return v.grepCandidates(ctx, root, candidates, re, include, contextLines, maxMatches)
+	}
+
 	var matches []GrepMatch
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -237,6 +258,66 @@ func (v *VFSFileAccess) vfsGrep(ctx context.Context, root string, re *regexp.Reg
 	return matches, err
 }
 
+func (v *VFSFileAccess) visibleCandidates(root string) []string {
+	if v.vfs == nil {
+		return nil
+	}
+	if len(v.vfs.AllowedPaths()) == 0 {
+		return nil
+	}
+	return v.vfs.VisiblePaths(root)
+}
+
+func (v *VFSFileAccess) grepCandidates(
+	ctx context.Context,
+	root string,
+	candidates []string,
+	re *regexp.Regexp,
+	include string,
+	contextLines, maxMatches int,
+) ([]GrepMatch, error) {
+	matches := make([]GrepMatch, 0)
+	for _, path := range candidates {
+		name := filepath.Base(path)
+		if include != "" {
+			matched, _ := filepath.Match(include, name)
+			if !matched {
+				continue
+			}
+		}
+		if isBinaryExt(name) {
+			continue
+		}
+
+		content, err := v.vfs.Read(ctx, path)
+		if err != nil {
+			continue
+		}
+
+		relPath, _ := filepath.Rel(root, path)
+		lines := strings.Split(string(content), "\n")
+		for i, line := range lines {
+			if len(matches) >= maxMatches {
+				return matches, nil
+			}
+			if re.MatchString(line) {
+				m := GrepMatch{
+					File:    relPath,
+					Line:    i + 1,
+					Content: strings.TrimSpace(line),
+				}
+				if contextLines > 0 {
+					start := max(0, i-contextLines)
+					end := min(len(lines), i+contextLines+1)
+					m.Context = strings.Join(lines[start:end], "\n")
+				}
+				matches = append(matches, m)
+			}
+		}
+	}
+	return matches, nil
+}
+
 // vfsDirEntry implements fs.DirEntry for VFS list results.
 type vfsDirEntry struct {
 	name  string
@@ -245,6 +326,6 @@ type vfsDirEntry struct {
 }
 
 func (e vfsDirEntry) Name() string               { return e.name }
-func (e vfsDirEntry) IsDir() bool                 { return e.isDir }
-func (e vfsDirEntry) Type() fs.FileMode           { return 0 }
-func (e vfsDirEntry) Info() (fs.FileInfo, error)   { return e.info, nil }
+func (e vfsDirEntry) IsDir() bool                { return e.isDir }
+func (e vfsDirEntry) Type() fs.FileMode          { return 0 }
+func (e vfsDirEntry) Info() (fs.FileInfo, error) { return e.info, nil }

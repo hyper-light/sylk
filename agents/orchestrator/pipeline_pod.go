@@ -13,11 +13,12 @@ import (
 
 // PipelineRegistrar registers an activated agent with the Guide's routing
 // layer. It is called once per unique agent type per pipeline.
-type PipelineRegistrar func(ctx context.Context, agentType string) error
+type PipelineRegistrar func(ctx context.Context, podID, agentType string) error
 
 // PipelinePodConfig groups the dependencies for creating a pipeline pod.
 type PipelinePodConfig struct {
 	DAGID         string
+	PodID         string
 	SessionID     string
 	Activator     guide.PodActivator
 	Registrar     PipelineRegistrar
@@ -60,12 +61,21 @@ var PipelineAgentDisplayNames = map[string]string{
 // NewPipelinePod creates an AgentPod configured for pipeline use.
 // This is a thin wrapper for backward compatibility.
 func NewPipelinePod(cfg PipelinePodConfig) *shared.AgentPod {
+	podID := cfg.PodID
+	if podID == "" {
+		podID = cfg.DAGID
+	}
 	return shared.NewAgentPod(shared.AgentPodConfig{
-		PodID:                  cfg.DAGID,
-		SessionID:              cfg.SessionID,
-		Activator:              cfg.Activator,
-		Managed:                cfg.Managed,
-		Registrar:              shared.PodRegistrar(cfg.Registrar),
+		PodID:     podID,
+		SessionID: cfg.SessionID,
+		Activator: cfg.Activator,
+		Managed:   cfg.Managed,
+		Registrar: func(ctx context.Context, agentType string) error {
+			if cfg.Registrar == nil {
+				return nil
+			}
+			return cfg.Registrar(ctx, podID, agentType)
+		},
 		ActivityPub:            cfg.ActivityPub,
 		RegistrationVisibility: events.VisibilitySystem,
 		Logger:                 cfg.Logger,

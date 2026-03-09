@@ -144,6 +144,18 @@ func TestPendingStore_GetByTarget(t *testing.T) {
 	assert.Len(t, target2Requests, 1)
 }
 
+func TestPendingStore_GetBySession(t *testing.T) {
+	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())
+
+	store.Add(&guide.RouteRequest{Input: "q1", SourceAgentID: "s1", SessionID: "sess-1"}, nil, "target-1")
+	store.Add(&guide.RouteRequest{Input: "q2", SourceAgentID: "s2", SessionID: "sess-1"}, nil, "target-2")
+	store.Add(&guide.RouteRequest{Input: "q3", SourceAgentID: "s3", SessionID: "sess-2"}, nil, "target-2")
+
+	assert.Len(t, store.GetBySession("sess-1"), 2)
+	assert.Len(t, store.GetBySession("sess-2"), 1)
+	assert.Nil(t, store.GetBySession("unknown"))
+}
+
 // TestPendingStore_CleanupExpired tests expiration cleanup
 func TestPendingStore_CleanupExpired(t *testing.T) {
 	// Use very short timeout for testing
@@ -211,15 +223,17 @@ func TestPendingStore_CountByTarget(t *testing.T) {
 func TestPendingStore_RemoveUpdatesIndexes(t *testing.T) {
 	store := guide.NewPendingStore(guide.DefaultPendingStoreConfig())
 
-	corrID := store.Add(&guide.RouteRequest{Input: "q1", SourceAgentID: "s1"}, nil, "t1")
+	corrID := store.Add(&guide.RouteRequest{Input: "q1", SourceAgentID: "s1", SessionID: "sess-1"}, nil, "t1")
 
 	assert.Equal(t, 1, store.CountBySource("s1"))
 	assert.Equal(t, 1, store.CountByTarget("t1"))
+	assert.Len(t, store.GetBySession("sess-1"), 1)
 
 	store.Remove(corrID)
 
 	assert.Equal(t, 0, store.CountBySource("s1"))
 	assert.Equal(t, 0, store.CountByTarget("t1"))
+	assert.Len(t, store.GetBySession("sess-1"), 0)
 }
 
 // TestPendingStore_DefaultConfig tests default config values

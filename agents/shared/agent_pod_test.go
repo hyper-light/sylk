@@ -8,6 +8,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/container"
+	containerpod "github.com/adalundhe/sylk/core/container/pod"
 )
 
 // --- test helpers ---
@@ -101,6 +105,27 @@ type mockScribe struct {
 	feedMu  sync.Mutex
 }
 
+type managedPodTestAgent struct {
+	id        string
+	agentType string
+}
+
+func (a *managedPodTestAgent) AgentID() string                   { return a.id }
+func (a *managedPodTestAgent) AgentType() string                 { return a.agentType }
+func (a *managedPodTestAgent) Terminate(_ context.Context) error { return nil }
+
+func managedPodTestRuntime() *container.DefaultRuntime {
+	budget := concurrency.NewGoroutineBudget(new(atomic.Int32))
+	reg := container.NewContainerRegistry()
+	return container.NewDefaultRuntime(container.DefaultRuntimeConfig{
+		Budget:   budget,
+		Registry: reg,
+		CreateAgent: func(_ context.Context, agentType string) (container.ContainerAgent, error) {
+			return &managedPodTestAgent{id: agentType + "-1", agentType: agentType}, nil
+		},
+	})
+}
+
 func (s *mockScribe) Start() error {
 	s.started.Store(true)
 	return nil
@@ -150,6 +175,45 @@ func TestAgentPod_HoldForNode_SingleAgent(t *testing.T) {
 	}
 
 	pod.Release()
+}
+
+func TestAgentPod_HoldForNode_LazilyPromotesManagedPod(t *testing.T) {
+	rt := managedPodTestRuntime()
+	members := []string{"engineer"}
+	managed := containerpod.NewManagedPod(containerpod.ManagedPodConfig{
+		ID: "task-1",
+		Policy: &containerpod.PodPolicy{
+			PodID:       "task-1",
+			PodType:     containerpod.PodTypePipeline,
+			MemberTypes: members,
+		},
+		Runtime: rt,
+	})
+	managed.SetSpecs([]container.ContainerSpec{{
+		Name:      "engineer",
+		AgentType: "engineer",
+		Resources: container.ResourceSpec{GoroutineLimit: 2},
+	}})
+
+	reg := &podTrackingRegistrar{}
+	pod := NewAgentPod(AgentPodConfig{
+		PodID:     "task-1",
+		Managed:   managed,
+		Registrar: reg.register,
+	})
+
+	if managed.LoadTier() != containerpod.TierCold {
+		t.Fatalf("initial tier = %v, want cold", managed.LoadTier())
+	}
+	if err := pod.HoldForNode(context.Background(), "n1", []string{"engineer"}); err != nil {
+		t.Fatalf("HoldForNode: %v", err)
+	}
+	if managed.LoadTier() != containerpod.TierHot {
+		t.Fatalf("tier after HoldForNode = %v, want hot", managed.LoadTier())
+	}
+	if managed.ContainerCount() != 1 {
+		t.Fatalf("container count = %d, want 1", managed.ContainerCount())
+	}
 }
 
 func TestAgentPod_HoldForNode_WithCoAgents(t *testing.T) {

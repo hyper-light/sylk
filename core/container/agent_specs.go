@@ -58,8 +58,8 @@ func (r *AgentSpecRegistry) Descriptors() *handoff.DescriptorRegistry {
 //   - Pipeline category → FileAccessVFS
 //   - All others → FileAccessDisk
 var fileAccessTypeByAgent = map[string]FileAccessType{
-	"inspector": FileAccessGlobal, // Global Inspector — per-session CVS
-	"tester":    FileAccessGlobal, // Global Tester — per-session CVS
+	"inspector": FileAccessGlobal, // Global Inspector — per-session global overlay
+	"tester":    FileAccessGlobal, // Global Tester — per-session global overlay
 }
 
 // fileAccessForAgent derives the file access type for an agent. Specific

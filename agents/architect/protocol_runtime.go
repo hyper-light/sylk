@@ -284,15 +284,15 @@ func newProtocolPlan(req *ArchitectRequest, requestCorrelationID string) *Design
 	}
 	now := time.Now()
 	plan := &DesignPlan{
-		ID:            uuid.NewString(),
-		SessionID:     req.SessionID,
-		Query:         req.Query,
-		Status:        PlanStatusPending,
-		Revision:      1,
-		Constraints:   extractConstraints(req.Params),
-		Consultations: map[string]*ConsultationEvidence{},
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:                   uuid.NewString(),
+		SessionID:            req.SessionID,
+		Query:                req.Query,
+		Status:               PlanStatusPending,
+		Revision:             1,
+		Constraints:          extractConstraints(req.Params),
+		Consultations:        map[string]*ConsultationEvidence{},
+		CreatedAt:            now,
+		UpdatedAt:            now,
 		RequestCorrelationID: strings.TrimSpace(requestCorrelationID),
 	}
 	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusPending)
@@ -668,6 +668,12 @@ func validateTaskContract(task *AtomicTask) error {
 	if task == nil {
 		return fmt.Errorf("task is nil")
 	}
+	if len(task.WorkerPackets) == 0 {
+		task.WorkerPackets = normalizeWorkerPackets(task)
+	}
+	if len(task.Workspace.ReadSet) == 0 || len(task.Workspace.WriteSet) == 0 {
+		task.Workspace = normalizeTaskWorkspace(task)
+	}
 	if strings.TrimSpace(task.ID) == "" {
 		return fmt.Errorf("task id is required")
 	}
@@ -686,7 +692,61 @@ func validateTaskContract(task *AtomicTask) error {
 	if len(task.AffectedFiles) == 0 {
 		return fmt.Errorf("task %s affected files are required", task.ID)
 	}
+	if len(task.Workspace.ReadSet) == 0 {
+		return fmt.Errorf("task %s workspace read_set is required", task.ID)
+	}
+	if len(task.Workspace.WriteSet) == 0 {
+		return fmt.Errorf("task %s workspace write_set is required", task.ID)
+	}
+	if len(task.WorkerPackets) == 0 {
+		return fmt.Errorf("task %s worker packets are required", task.ID)
+	}
+	workspaceRead := stringSet(task.Workspace.ReadSet...)
+	workspaceWrite := stringSet(task.Workspace.WriteSet...)
+	packetAgents := make(map[string]struct{}, len(task.WorkerPackets))
+	hasPrimary := false
+	for _, packet := range task.WorkerPackets {
+		agentType := strings.TrimSpace(packet.AgentType)
+		if agentType == "" {
+			return fmt.Errorf("task %s worker packet agent_type is required", task.ID)
+		}
+		if _, exists := packetAgents[agentType]; exists {
+			return fmt.Errorf("task %s has duplicate worker packet for %s", task.ID, agentType)
+		}
+		packetAgents[agentType] = struct{}{}
+		if agentType == task.AgentType {
+			hasPrimary = true
+		}
+		for _, path := range packet.ReadSet {
+			if _, ok := workspaceRead[strings.TrimSpace(path)]; !ok {
+				return fmt.Errorf("task %s worker packet %s read_set path %s is outside workspace", task.ID, agentType, path)
+			}
+		}
+		for _, path := range packet.WriteSet {
+			if _, ok := workspaceWrite[strings.TrimSpace(path)]; !ok {
+				return fmt.Errorf("task %s worker packet %s write_set path %s is outside workspace", task.ID, agentType, path)
+			}
+		}
+	}
+	if !hasPrimary {
+		return fmt.Errorf("task %s is missing a primary worker packet for %s", task.ID, task.AgentType)
+	}
+	for _, coAgent := range task.CoAgents {
+		if _, ok := packetAgents[strings.TrimSpace(coAgent)]; !ok {
+			return fmt.Errorf("task %s is missing worker packet for co-agent %s", task.ID, coAgent)
+		}
+	}
 	return nil
+}
+
+func stringSet(values ...string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			set[trimmed] = struct{}{}
+		}
+	}
+	return set
 }
 
 func validatePlanWorkflow(plan *DesignPlan) error {

@@ -343,27 +343,44 @@ func (a *Architect) handleCancelAction(req *guide.ActionRequest) error {
 		return nil
 	}
 	correlationID := cancelCorrelationID(req)
-	if correlationID == "" {
-		return a.publishActionFailure(req, errors.New("cancel action missing correlation id"))
+	sessionID := cancelSessionID(req)
+	if correlationID == "" && sessionID == "" {
+		return a.publishActionFailure(req, errors.New("cancel action missing correlation id or session id"))
 	}
-	cancelled := a.cancelInFlight(correlationID)
-	if a.steering != nil {
-		a.steering.CancelRequest(correlationID)
+
+	cancelledCount := 0
+	if correlationID != "" {
+		cancelled := a.cancelInFlight(correlationID)
+		if a.steering != nil {
+			cancelled = a.steering.CancelRequest(correlationID) || cancelled
+		}
+		if cancelled {
+			cancelledCount = 1
+		}
+	} else if a.steering != nil {
+		cancelledCount = a.steering.CancelSession(sessionID)
 	}
 
 	// Supersede any stalled plans for this session so the next request
 	// starts fresh rather than recovering old plans with stale intent.
-	if sessionID := cancelSessionID(req); sessionID != "" {
+	if sessionID != "" {
 		a.supersedeStalledPlans(sessionID)
 	}
 
 	if req.FireAndForget {
 		return nil
 	}
-	return a.publishActionSuccess(req, map[string]any{
-		"correlation_id": correlationID,
-		"cancelled":      cancelled,
-	})
+	data := map[string]any{
+		"cancelled": cancelledCount > 0,
+	}
+	if correlationID != "" {
+		data["correlation_id"] = correlationID
+	}
+	if sessionID != "" {
+		data["session_id"] = sessionID
+		data["cancelled_count"] = cancelledCount
+	}
+	return a.publishActionSuccess(req, data)
 }
 
 func cancelSessionID(req *guide.ActionRequest) string {

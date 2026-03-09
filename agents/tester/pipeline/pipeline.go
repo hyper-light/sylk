@@ -79,7 +79,8 @@ type PipelineTester struct {
 	// Agent pod for cross-agent coordination (Scribe feed, etc.).
 	agentPod *agentshared.AgentPod
 
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// Request lifecycle.
 	runCtx    context.Context
@@ -169,6 +170,11 @@ func (pt *PipelineTester) registerCoreSkills() {
 	pt.skills.Register(shared.WriteTestSkill())
 	pt.skills.Register(shared.RunTestSuiteSkill())
 	pt.skills.Register(shared.DiagnoseFailureSkill(pt.diagEngine))
+	pt.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
+	pt.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
+	pt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
+	pt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
+	pt.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(reportToEngineerSkill(pt))
 	pt.skills.Register(reportToDesignerSkill(pt))
 	pt.skills.Register(agentshared.NewSelfDiagnosticSkill(&pipelineTesterDiag{pt: pt}))
@@ -360,20 +366,36 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		return nil, fmt.Errorf("pipeline tester: no LLM provider configured")
 	}
 
+	task := agentshared.DecodePipelineTaskInput(fwd.Input)
+	userMessage := fwd.Input
+
 	pt.mu.RLock()
 	wt := pt.workerType
 	model := pt.config.Model
 	maxTokens := pt.config.MaxTokens
 	pt.mu.RUnlock()
+	if task != nil {
+		if workerType := agentshared.PipelineWorkerType(task); workerType != "" {
+			pt.SetWorkerType(workerType)
+			wt = workerType
+		}
+		userMessage = agentshared.ComposePipelineTaskUserPrompt(task)
+		if workspaceContext := agentshared.BuildTaskWorkspaceRuntimeContext(ctx, pt.workspaceViews, task); workspaceContext != "" {
+			userMessage += "\n\n" + workspaceContext
+		}
+	}
 
 	systemPrompt := shared.PipelineTesterSystemPromptForWorker(wt)
-	pt.prepareSkillsForInput(fwd.Input)
+	if task != nil {
+		systemPrompt = agentshared.AppendPipelineSystemContext(systemPrompt, task)
+	}
+	pt.prepareSkillsForInput(userMessage)
 	tools := pt.buildToolDefinitions()
 
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages: []providers.Message{
-			{Role: providers.RoleUser, Content: fwd.Input},
+			{Role: providers.RoleUser, Content: userMessage},
 		},
 		Model:     model,
 		MaxTokens: maxTokens,
@@ -439,7 +461,8 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	pt.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
 
 	reqCtx, cancel := context.WithCancel(pt.runCtx)
-	pt.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	pt.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
 	ledger := pt.steering.Create(fwd.CorrelationID, pt.id, fwd.SessionID, nil, nil)
@@ -697,6 +720,11 @@ func (pt *PipelineTester) Terminate(_ context.Context) error {
 
 // SetFileAccess assigns the per-pipeline file access layer.
 func (pt *PipelineTester) SetFileAccess(fa versioning.FileAccess) { pt.fileAccess = fa }
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (pt *PipelineTester) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	pt.workspaceViews = views
+}
 
 // SetHandoffBridge assigns the handoff bridge.
 func (pt *PipelineTester) SetHandoffBridge(bridge *handoff.HandoffBridge) {

@@ -25,6 +25,9 @@ type PendingStore struct {
 	// Index by target agent for monitoring
 	byTarget map[string]map[string]struct{}
 
+	// Index by session for session-scoped interrupt cleanup.
+	bySession map[string]map[string]struct{}
+
 	// Configuration
 	defaultTimeout time.Duration
 	maxPerAgent    int
@@ -57,6 +60,7 @@ func NewPendingStore(cfg PendingStoreConfig) *PendingStore {
 		pending:        make(map[string]*PendingRequest),
 		bySource:       make(map[string]map[string]struct{}),
 		byTarget:       make(map[string]map[string]struct{}),
+		bySession:      make(map[string]map[string]struct{}),
 		defaultTimeout: cfg.DefaultTimeout,
 		maxPerAgent:    cfg.MaxPerAgent,
 	}
@@ -103,6 +107,12 @@ func (ps *PendingStore) Add(req *RouteRequest, classification *RouteResult, targ
 		ps.byTarget[targetAgentID] = make(map[string]struct{})
 	}
 	ps.byTarget[targetAgentID][corrID] = struct{}{}
+	if req.SessionID != "" {
+		if ps.bySession[req.SessionID] == nil {
+			ps.bySession[req.SessionID] = make(map[string]struct{})
+		}
+		ps.bySession[req.SessionID][corrID] = struct{}{}
+	}
 
 	return corrID
 }
@@ -127,6 +137,12 @@ func (ps *PendingStore) Set(correlationID string, pending *PendingRequest) {
 			ps.byTarget[pending.TargetAgentID] = make(map[string]struct{})
 		}
 		ps.byTarget[pending.TargetAgentID][correlationID] = struct{}{}
+	}
+	if pending.Request != nil && pending.Request.SessionID != "" {
+		if ps.bySession[pending.Request.SessionID] == nil {
+			ps.bySession[pending.Request.SessionID] = make(map[string]struct{})
+		}
+		ps.bySession[pending.Request.SessionID][correlationID] = struct{}{}
 	}
 }
 
@@ -166,6 +182,14 @@ func (ps *PendingStore) Remove(correlationID string) *PendingRequest {
 			delete(ps.byTarget, pending.TargetAgentID)
 		}
 	}
+	if pending.Request != nil {
+		if sessionIdx := ps.bySession[pending.Request.SessionID]; sessionIdx != nil {
+			delete(sessionIdx, correlationID)
+			if len(sessionIdx) == 0 {
+				delete(ps.bySession, pending.Request.SessionID)
+			}
+		}
+	}
 
 	return pending
 }
@@ -195,6 +219,25 @@ func (ps *PendingStore) GetByTarget(targetAgentID string) []*PendingRequest {
 	defer ps.mu.RUnlock()
 
 	corrIDs := ps.byTarget[targetAgentID]
+	if corrIDs == nil {
+		return nil
+	}
+
+	result := make([]*PendingRequest, 0, len(corrIDs))
+	for corrID := range corrIDs {
+		if pending := ps.pending[corrID]; pending != nil {
+			result = append(result, pending)
+		}
+	}
+	return result
+}
+
+// GetBySession returns all pending requests in a session.
+func (ps *PendingStore) GetBySession(sessionID string) []*PendingRequest {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	corrIDs := ps.bySession[sessionID]
 	if corrIDs == nil {
 		return nil
 	}
@@ -240,6 +283,14 @@ func (ps *PendingStore) CleanupExpired() []*PendingRequest {
 				delete(targetIdx, corrID)
 				if len(targetIdx) == 0 {
 					delete(ps.byTarget, pending.TargetAgentID)
+				}
+			}
+			if pending.Request != nil {
+				if sessionIdx := ps.bySession[pending.Request.SessionID]; sessionIdx != nil {
+					delete(sessionIdx, corrID)
+					if len(sessionIdx) == 0 {
+						delete(ps.bySession, pending.Request.SessionID)
+					}
 				}
 			}
 		}

@@ -92,7 +92,8 @@ type Architect struct {
 	agentPod *shared.AgentPod
 
 	// File access abstraction (DiskFileAccess, set at creation).
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// toolDefsDirty is set when demand-paged skills are loaded mid-loop,
 	// triggering a tool definition rebuild on the next LLM turn.
@@ -153,7 +154,8 @@ type Config struct {
 	// without waiting for user approval. Default: false.
 
 	// File access (optional — if nil, Architect uses direct disk I/O).
-	FileAccess versioning.FileAccess
+	FileAccess     versioning.FileAccess
+	WorkspaceViews versioning.WorkspaceViewAccess
 
 	// PlannerProviderWrapper wraps the raw Anthropic provider for rate limiting.
 	// The returned value must implement PlannerStreamProvider (e.g. *gateway.GatewayProvider).
@@ -337,6 +339,7 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		logWAL:            cfg.logWAL,
 		activityPub:       cfg.ActivityPub,
 		fileAccess:        cfg.FileAccess,
+		workspaceViews:    cfg.WorkspaceViews,
 		planStore:         cfg.PlanStore,
 		ownsPlanStore:     ownedPlanStore,
 		controlStore:      cfg.ControlStore,
@@ -398,6 +401,9 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
 	}
+	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
+		DefaultView: versioning.WorkspaceViewGlobal,
+	})
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
@@ -828,7 +834,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	))
 
 	a.registerInFlight(fwd.CorrelationID, cancel)
-	a.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearInFlight(fwd.CorrelationID)
 	defer cancel()
 	if !fwd.FireAndForget {
@@ -1634,6 +1640,7 @@ func (a *Architect) Handle(ctx context.Context, req *ArchitectRequest) (*Archite
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
+	ctx = withArchitectSessionID(ctx, req.SessionID)
 	a.logInfo("Handle: entry",
 		"req_id", req.ID,
 		"intent", string(req.Intent),

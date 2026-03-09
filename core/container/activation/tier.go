@@ -27,6 +27,7 @@ type ActivationEntry struct {
 	AgentType       string
 	Tier            atomic.Int32                        // stores ActivationTier
 	Container       atomic.Pointer[container.Container] // non-nil when Warm or Hot
+	Prewarming      atomic.Bool
 	Spec            container.ContainerSpec
 	LastActive      atomic.Int64 // UnixNano timestamp
 	ActivationCount atomic.Int64

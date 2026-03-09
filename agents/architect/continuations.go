@@ -112,8 +112,11 @@ func (a *Architect) handleContinuationResponse(msg *guide.Message) error {
 	if a == nil || a.controlStore == nil || msg == nil || strings.TrimSpace(msg.CorrelationID) == "" {
 		return nil
 	}
-	record, err := a.controlStore.GetContinuationByResponseCorrelation(msg.CorrelationID)
-	if err != nil || record == nil || record.State != continuationStatusPending {
+	if !isTerminalContinuationMessage(msg) {
+		return nil
+	}
+	record, err := a.controlStore.ClaimPendingContinuationByResponseCorrelation(msg.CorrelationID)
+	if err != nil || record == nil {
 		return err
 	}
 	switch record.Kind {
@@ -368,12 +371,38 @@ func routeResponseFromMessage(msg *guide.Message) (*guide.RouteResponse, string,
 	if msg == nil {
 		return nil, "", fmt.Errorf("route response message is nil")
 	}
+	if msg.Type == guide.MessageTypeError {
+		errText, ok := msg.GetError()
+		if !ok || strings.TrimSpace(errText) == "" {
+			errText = "route error"
+		}
+		resp := &guide.RouteResponse{
+			CorrelationID:     msg.CorrelationID,
+			Success:           false,
+			Error:             strings.TrimSpace(errText),
+			RespondingAgentID: msg.SourceAgentID,
+		}
+		encoded, _ := json.Marshal(resp)
+		return resp, string(encoded), nil
+	}
 	resp, ok := msg.GetRouteResponse()
 	if !ok || resp == nil {
 		return nil, "", fmt.Errorf("message %q did not contain a route response", msg.CorrelationID)
 	}
 	encoded, _ := json.Marshal(resp)
 	return resp, string(encoded), nil
+}
+
+func isTerminalContinuationMessage(msg *guide.Message) bool {
+	if msg == nil {
+		return false
+	}
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeGuardianControlRequest(raw string) (toolruntime.GuardianControlRequest, error) {

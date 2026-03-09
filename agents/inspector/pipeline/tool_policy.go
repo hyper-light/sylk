@@ -11,8 +11,13 @@ func pipelineInspectorVisibleSkillNames() []string {
 		"run_type_checker",
 		"run_security_scan",
 		"read_file",
+		"read_workspace_file",
 		"glob",
+		"workspace_glob",
 		"grep",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
 		"define_criteria",
 		"validate_criteria",
 	}

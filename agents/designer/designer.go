@@ -66,7 +66,8 @@ type Designer struct {
 	consultations []Consultation
 	consultMu     sync.RWMutex
 
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// Request-scoped context lifecycle (mirrors architect/engineer pattern).
 	runCtx         context.Context
@@ -445,8 +446,9 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 
 	// Request-scoped cancellable context.
 	reqCtx, cancel := context.WithCancel(d.runCtx)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	d.registerRequestCancel(fwd.CorrelationID, cancel)
-	d.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	d.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer d.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
@@ -595,15 +597,25 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	d.prepareSkillsForInput(fwd.Input)
+	systemPrompt := d.config.SystemPrompt
+	userMessage := fwd.Input
+	if task := shared.DecodePipelineTaskInput(fwd.Input); task != nil {
+		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, task)
+		userMessage = shared.ComposePipelineTaskUserPrompt(task)
+		if workspaceContext := shared.BuildTaskWorkspaceRuntimeContext(ctx, d.workspaceViews, task); workspaceContext != "" {
+			userMessage += "\n\n" + workspaceContext
+		}
+	}
+
+	d.prepareSkillsForInput(userMessage)
 	toolDefs := d.buildToolDefinitions()
 
 	req := &providers.Request{
-		SystemPrompt: d.config.SystemPrompt,
+		SystemPrompt: systemPrompt,
 		Messages: []providers.Message{
 			{
 				Role:    providers.RoleUser,
-				Content: fwd.Input,
+				Content: userMessage,
 			},
 		},
 		Tools:     toolDefs,
@@ -867,6 +879,9 @@ func (d *Designer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 
 // SetFileAccess assigns the per-pipeline file access layer.
 func (d *Designer) SetFileAccess(fa versioning.FileAccess) { d.fileAccess = fa }
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (d *Designer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) { d.workspaceViews = views }
 
 // Terminate gracefully shuts down the designer agent.
 func (d *Designer) Terminate(_ context.Context) error {

@@ -9,6 +9,11 @@ func pipelineTesterVisibleSkillNames() []string {
 	return []string{
 		"analyze_risk",
 		"plan_tests",
+		"read_workspace_file",
+		"workspace_glob",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
 		"write_test",
 		"run_test_suite",
 		"diagnose_failure",

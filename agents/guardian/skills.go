@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (g *Guardian) registerCoreSkills() {
@@ -20,6 +21,11 @@ func (g *Guardian) registerCoreSkills() {
 	g.skills.Register(readFileSkill(g))
 	g.skills.Register(globSkill(g))
 	g.skills.Register(grepSkill(g))
+	g.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
 	g.skills.Register(askUserQuestionSkill(g))
 	g.skills.Register(agentLogsSkill(g))
 	g.skills.Register(systemStatusSkill(g))

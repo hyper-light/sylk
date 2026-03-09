@@ -889,13 +889,22 @@ type ActionRequest struct {
 	Timestamp           time.Time `json:"timestamp"`
 }
 
+type UserInterruptScope string
+
+const (
+	UserInterruptScopeRequest UserInterruptScope = "request"
+	UserInterruptScopeSession UserInterruptScope = "session"
+)
+
 // UserInterruptRequest represents a user-driven cancellation for an in-flight
-// routed request.
+// routed request, or for all in-flight requests in a session.
 type UserInterruptRequest struct {
-	CorrelationID string    `json:"correlation_id"`
-	SourceAgentID string    `json:"source_agent_id"`
-	Reason        string    `json:"reason,omitempty"`
-	Timestamp     time.Time `json:"timestamp"`
+	CorrelationID string             `json:"correlation_id"`
+	SessionID     string             `json:"session_id,omitempty"`
+	SourceAgentID string             `json:"source_agent_id"`
+	Scope         UserInterruptScope `json:"scope,omitempty"`
+	Reason        string             `json:"reason,omitempty"`
+	Timestamp     time.Time          `json:"timestamp"`
 }
 
 // NewActionMessage creates a message for an action request

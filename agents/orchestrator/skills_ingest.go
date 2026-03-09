@@ -413,7 +413,7 @@ func buildDAGFromHandoff(h *architect.PlanHandoff) (*dag.DAG, error) {
 
 	for _, ht := range h.Tasks {
 		prompt := buildNodePrompt(ht)
-		nodeCtx := buildNodeContext(ht)
+		nodeCtx := buildNodeContext(h, ht)
 		cfg := dag.NodeConfig{
 			ID:           ht.ID,
 			AgentType:    ht.AgentType,
@@ -517,7 +517,7 @@ func buildNodePrompt(ht *architect.HandoffTask) string {
 }
 
 // buildNodeContext creates the structured context map for a DAG node.
-func buildNodeContext(ht *architect.HandoffTask) map[string]any {
+func buildNodeContext(h *architect.PlanHandoff, ht *architect.HandoffTask) map[string]any {
 	ctx := map[string]any{
 		"task_id":          ht.ID,
 		"task_slug":        ht.Slug,
@@ -547,6 +547,12 @@ func buildNodeContext(ht *architect.HandoffTask) map[string]any {
 	if len(ht.RiskFactors) > 0 {
 		ctx["risk_factors"] = ht.RiskFactors
 	}
+	if ht.Workspace.BaseVersion != "" || len(ht.Workspace.ReadSet) > 0 || len(ht.Workspace.WriteSet) > 0 || len(ht.Workspace.TestSurface) > 0 || len(ht.Workspace.PrefetchPaths) > 0 {
+		ctx["workspace"] = ht.Workspace
+	}
+	if len(ht.WorkerPackets) > 0 {
+		ctx["worker_packets"] = ht.WorkerPackets
+	}
 	if len(ht.CoAgents) > 0 {
 		ctx["co_agents"] = ht.CoAgents
 		ctx["collaboration_mode"] = ht.CollaborationMode
@@ -554,7 +560,70 @@ func buildNodeContext(ht *architect.HandoffTask) map[string]any {
 	if len(ht.AgentScopes) > 0 {
 		ctx["agent_scopes"] = ht.AgentScopes
 	}
+	ctx["big_picture"] = buildBigPictureBrief(h)
+	ctx["task_intent"] = buildTaskIntentContext(ht)
 	return ctx
+}
+
+func buildBigPictureBrief(h *architect.PlanHandoff) map[string]any {
+	if h == nil {
+		return nil
+	}
+	brief := map[string]any{
+		"goal":          strings.TrimSpace(h.Query),
+		"risk_summary":  append([]string(nil), h.RiskSummary...),
+		"assumptions":   append([]string(nil), h.Assumptions...),
+		"critical_path": append([]string(nil), h.CriticalPath...),
+	}
+	if h.Requirements != nil {
+		brief["requirements"] = append([]string(nil), h.Requirements.Goals...)
+		brief["constraints"] = append([]string(nil), h.Requirements.Constraints...)
+	}
+	if h.Architecture != nil {
+		brief["architecture_summary"] = summarizeArchitecture(h.Architecture)
+	}
+	return brief
+}
+
+func buildTaskIntentContext(ht *architect.HandoffTask) map[string]any {
+	if ht == nil {
+		return nil
+	}
+	return map[string]any{
+		"task_name":            ht.Name,
+		"why_this_task_exists": ht.Description,
+		"user_visible_outcome": strings.Join(ht.SuccessCriteria, "; "),
+		"architectural_role":   ht.AgentType,
+		"upstream_inputs":      append([]string(nil), ht.Dependencies...),
+	}
+}
+
+func summarizeArchitecture(arch *architect.SolutionArchitecture) string {
+	if arch == nil {
+		return ""
+	}
+	var parts []string
+	if name := strings.TrimSpace(arch.Name); name != "" {
+		parts = append(parts, name)
+	}
+	if desc := strings.TrimSpace(arch.Description); desc != "" {
+		parts = append(parts, desc)
+	}
+	if len(arch.Patterns) > 0 {
+		parts = append(parts, "patterns: "+strings.Join(arch.Patterns, ", "))
+	}
+	if len(arch.Components) > 0 {
+		componentNames := make([]string, 0, len(arch.Components))
+		for _, component := range arch.Components {
+			if name := strings.TrimSpace(component.Name); name != "" {
+				componentNames = append(componentNames, name)
+			}
+		}
+		if len(componentNames) > 0 {
+			parts = append(parts, "components: "+strings.Join(componentNames, ", "))
+		}
+	}
+	return strings.Join(parts, " | ")
 }
 
 func constraintConcurrency(c *architect.PlanConstraints) int {

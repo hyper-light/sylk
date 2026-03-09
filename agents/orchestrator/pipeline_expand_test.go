@@ -284,6 +284,7 @@ func TestValidateHandoff_RejectNonPipelineAgentTypes(t *testing.T) {
 }
 
 func TestBuildNodeContext_IncludesStableTaskIdentity(t *testing.T) {
+	h := &architect.PlanHandoff{Query: "Implement auth checkout"}
 	ht := &architect.HandoffTask{
 		ID:        "task_auth_checkout",
 		Slug:      "auth-checkout",
@@ -291,7 +292,7 @@ func TestBuildNodeContext_IncludesStableTaskIdentity(t *testing.T) {
 		AgentType: "engineer",
 	}
 
-	ctx := buildNodeContext(ht)
+	ctx := buildNodeContext(h, ht)
 
 	if got, _ := ctx["task_id"].(string); got != "task_auth_checkout" {
 		t.Fatalf("task_id = %q, want task_auth_checkout", got)

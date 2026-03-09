@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -836,17 +837,23 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	// PipelineRegistrar: when a PipelinePod activates agents for a DAG,
 	// this callback extracts each agent from the container registry and
 	// registers its routing info with the Guide.
-	orch.SetRegistrar(func(ctx context.Context, agentType string) error {
-		containers := containerReg.ListByType(agentType)
-		if len(containers) == 0 {
-			return fmt.Errorf("no container for agent type %s after activation", agentType)
+	orch.SetRegistrar(func(ctx context.Context, podID, agentType string) error {
+		c := findRegisteredPodContainer(containerReg, podID, agentType)
+		if c == nil {
+			return fmt.Errorf("no container for pod %s agent type %s after activation", podID, agentType)
 		}
-		agent := containers[0].Agent()
-		router, ok := agent.(guide.AgentRouter)
+		router, ok := c.Agent().(guide.AgentRouter)
 		if !ok {
 			return nil
 		}
-		return registerAgentWithGuide(g, router, agentType)
+		info := router.GetRoutingInfo()
+		if isTaskScopedPipelineWorker(podID, agentType) {
+			info = taskScopedWorkerRoutingInfo(info, podID, agentType)
+		}
+		return registerRoutingInfoWithGuide(g, info)
+	})
+	orch.SetTaskPodInfra(runtime, specReg, func(sessionID string) *versioning.SessionVFS {
+		return orch.EnsureSessionVFS(sessionID, projectRoot)
 	})
 
 	// ScribeFactory: creates Gemini 3 Flash sidecars for pipeline pods.
@@ -1299,20 +1306,21 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	}
 
 	deps := ui.Deps{
-		ActivityPub:       activityPub,
-		SessionManager:    sessionMgr,
-		GuideBus:          guideBus,
-		StreamManager:     streamMgr,
-		Guide:             g,
-		Scope:             scope,
-		AuthRegistry:      authRegistry,
-		NerdFontsDetected: fontRes.detected,
-		GitClient:         gitRes.client,
-		GitWatcher:        gitRes.watcher,
-		GitBus:            gitRes.bus,
-		SafetyGuard:       gitRes.guard,
-		SeedAgents:        seeds,
-		ModelSwap:         modelSwapper,
+		ActivityPub:        activityPub,
+		SessionManager:     sessionMgr,
+		GuideBus:           guideBus,
+		StreamManager:      streamMgr,
+		Guide:              g,
+		Scope:              scope,
+		AuthRegistry:       authRegistry,
+		InterruptAllAgents: makeInterruptAllAgentsFn(activationCtrl, guideBus),
+		NerdFontsDetected:  fontRes.detected,
+		GitClient:          gitRes.client,
+		GitWatcher:         gitRes.watcher,
+		GitBus:             gitRes.bus,
+		SafetyGuard:        gitRes.guard,
+		SeedAgents:         seeds,
+		ModelSwap:          modelSwapper,
 		ModelSave: func(agentType, provider, modelID string) {
 			if err := modelStore.SetEntry(agentType, provider, modelID); err != nil {
 				slog.Warn("agent model config: save", "agent", agentType, "provider", provider, "model", modelID, "error", err)
@@ -1323,6 +1331,63 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	}
 
 	return deps, cleanup, nil
+}
+
+func makeInterruptAllAgentsFn(
+	activationCtrl *activation.ActivationController,
+	bus guide.EventBus,
+) func(sessionID, reason string) error {
+	if activationCtrl == nil && bus == nil {
+		return nil
+	}
+	return func(sessionID, reason string) error {
+		var errs []error
+		reason = strings.TrimSpace(reason)
+		if activationCtrl != nil && bus != nil {
+			actionData := map[string]any{
+				"session_id": sessionID,
+				"scope":      "session",
+			}
+			if reason != "" {
+				actionData["reason"] = reason
+			}
+			for _, agentType := range activationCtrl.ActiveAgentTypes() {
+				if strings.TrimSpace(agentType) == "" || agentType == "guide" {
+					continue
+				}
+				action := &guide.ActionRequest{
+					SourceAgentID: "tui",
+					TargetAgentID: agentType,
+					Action:        "cancel",
+					Data:          actionData,
+					FireAndForget: true,
+					Timestamp:     time.Now(),
+				}
+				if err := bus.Publish(
+					guide.TopicRequests(agentType, agentType),
+					guide.NewActionMessage("", action),
+				); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+		if bus != nil && strings.TrimSpace(sessionID) != "" {
+			interruptReq := &guide.UserInterruptRequest{
+				SessionID:     sessionID,
+				SourceAgentID: "tui",
+				Scope:         guide.UserInterruptScopeSession,
+				Reason:        reason,
+				Timestamp:     time.Now(),
+			}
+			if err := bus.Publish(
+				guide.TopicGuideRequests,
+				guide.NewUserInterruptMessage("", interruptReq),
+			); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	}
 }
 
 // =============================================================================
@@ -1363,13 +1428,24 @@ func registerAgentCreators(
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw)
+		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw, projectRoot, func(sessionID string) *versioning.SessionVFS {
+			if orch := orchRef.Load(); orch != nil {
+				return orch.GetSessionVFS(sessionID)
+			}
+			return nil
+		})
 	})
 
-	// Architect — Anthropic LLM planner. Gets read-only DiskFileAccess.
+	// Architect — Anthropic LLM planner. Reads through session-scoped global
+	// overlay when a session is active, falling back to read-only disk access.
 	architectID, _ := ids.Get("architect")
 	reg.Register("architect", func(ctx context.Context) (container.ContainerAgent, error) {
-		return bootstrapArchitect(ctx, architectID, bus, actPub, projectRoot, anthropicGw, actCtrlRef, planStore)
+		return bootstrapArchitect(ctx, architectID, bus, actPub, projectRoot, anthropicGw, actCtrlRef, planStore, func(sessionID string) *versioning.SessionVFS {
+			if orch := orchRef.Load(); orch != nil {
+				return orch.GetSessionVFS(sessionID)
+			}
+			return nil
+		})
 	})
 
 	// Orchestrator — pipeline coordinator.
@@ -1386,7 +1462,12 @@ func registerAgentCreators(
 	// On daemon restart the factory must re-wire post-boot deps (observability,
 	// git, agent seeding) that Phase 3 originally set up.
 	reg.Register("guardian", func(ctx context.Context) (container.ContainerAgent, error) {
-		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, gitSubsRef, quarantineRef)
+		grd, err := bootstrapGuardian(ctx, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, gitSubsRef, quarantineRef, func(sessionID string) *versioning.SessionVFS {
+			if orch := orchRef.Load(); orch != nil {
+				return orch.GetSessionVFS(sessionID)
+			}
+			return nil
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -1397,7 +1478,7 @@ func registerAgentCreators(
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, actCtrlRef, knowledgeStore, guardianRef, quarantineRef)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, actCtrlRef, knowledgeStore, guardianRef, orchRef, quarantineRef)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
@@ -1414,6 +1495,7 @@ func registerOnDemandAgentCreators(
 	actCtrlRef *atomic.Pointer[activation.ActivationController],
 	knowledgeStore *knowledge.KnowledgeStore,
 	guardianRef *atomic.Pointer[guardian.Guardian],
+	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
 ) {
 	// Librarian — codebase search specialist with LLM-driven conversation.
@@ -1473,6 +1555,17 @@ func registerOnDemandAgentCreators(
 			ActivityPub:       actPub,
 			EnableHybridQuery: true,
 			EnableACTR:        true,
+			WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+				DefaultView: versioning.WorkspaceViewGlobal,
+				WorkingDir:  projectRoot,
+				SessionLookup: func(sessionID string) *versioning.SessionVFS {
+					if orch := orchRef.Load(); orch != nil {
+						return orch.GetSessionVFS(sessionID)
+					}
+					return nil
+				},
+				DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
+			}),
 		}
 		if ac := actCtrlRef.Load(); ac != nil {
 			archCfg.RequestGuard = func() func() {
@@ -1502,6 +1595,17 @@ func registerOnDemandAgentCreators(
 		acaCfg := academic.Config{
 			ID:          academicID,
 			ActivityPub: actPub,
+			WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+				DefaultView: versioning.WorkspaceViewDisk,
+				WorkingDir:  projectRoot,
+				SessionLookup: func(sessionID string) *versioning.SessionVFS {
+					if orch := orchRef.Load(); orch != nil {
+						return orch.GetSessionVFS(sessionID)
+					}
+					return nil
+				},
+				DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
+			}),
 		}
 		if ac := actCtrlRef.Load(); ac != nil {
 			acaCfg.RequestGuard = func() func() {
@@ -1532,6 +1636,27 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
+		gi.SetFileAccess(versioning.NewSessionRoutingFileAccess(
+			true,
+			func(sessionID string) *versioning.SessionVFS {
+				if orch := orchRef.Load(); orch != nil {
+					return orch.GetSessionVFS(sessionID)
+				}
+				return nil
+			},
+			versioning.NewDiskFileAccess(projectRoot, true),
+		))
+		gi.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView: versioning.WorkspaceViewGlobal,
+			WorkingDir:  projectRoot,
+			SessionLookup: func(sessionID string) *versioning.SessionVFS {
+				if orch := orchRef.Load(); orch != nil {
+					return orch.GetSessionVFS(sessionID)
+				}
+				return nil
+			},
+			DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
+		}))
 		gi.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityValidation))
 		if startErr := gi.Start(bus); startErr != nil {
 			return nil, startErr
@@ -1542,12 +1667,16 @@ func registerOnDemandAgentCreators(
 	// Pipeline Inspector — per-task quality validation.
 	pipelineInspectorID, _ := ids.Get("inspector-pipeline")
 	reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
+		agentID := pipelineInspectorID
+		if workerID := pipelineWorkerAgentID(ctx, "inspector-pipeline"); workerID != "" {
+			agentID = workerID
+		}
 		model := "claude-opus-4-6"
 		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
 		}
-		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{AgentID: pipelineInspectorID}, wrapped)
+		pi, err := inspectorPipeline.New(inspectorShared.PipelineInspectorConfig{AgentID: agentID}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -1575,6 +1704,27 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
+		gt.SetFileAccess(versioning.NewSessionRoutingFileAccess(
+			false,
+			func(sessionID string) *versioning.SessionVFS {
+				if orch := orchRef.Load(); orch != nil {
+					return orch.GetSessionVFS(sessionID)
+				}
+				return nil
+			},
+			versioning.NewDiskFileAccess(projectRoot, false),
+		))
+		gt.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView: versioning.WorkspaceViewGlobal,
+			WorkingDir:  projectRoot,
+			SessionLookup: func(sessionID string) *versioning.SessionVFS {
+				if orch := orchRef.Load(); orch != nil {
+					return orch.GetSessionVFS(sessionID)
+				}
+				return nil
+			},
+			DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
+		}))
 		gt.SetProviderRefresher(buildProviderRefresher(googleGw, anthropicGw, openaiGw, gateway.PriorityValidation))
 		if startErr := gt.Start(bus); startErr != nil {
 			return nil, startErr
@@ -1585,12 +1735,16 @@ func registerOnDemandAgentCreators(
 	// Pipeline Tester — per-task QE.
 	pipelineTesterID, _ := ids.Get("tester-pipeline")
 	reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
+		agentID := pipelineTesterID
+		if workerID := pipelineWorkerAgentID(ctx, "tester-pipeline"); workerID != "" {
+			agentID = workerID
+		}
 		model := "gpt-5.4-pro"
 		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
-		pt, err := pipelinetester.New(shared.PipelineTesterConfig{AgentID: pipelineTesterID}, wrapped)
+		pt, err := pipelinetester.New(shared.PipelineTesterConfig{AgentID: agentID}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -1604,12 +1758,16 @@ func registerOnDemandAgentCreators(
 	// Engineer — code implementation.
 	engineerID, _ := ids.Get("engineer")
 	reg.Register("engineer", func(ctx context.Context) (container.ContainerAgent, error) {
+		agentID := engineerID
+		if workerID := pipelineWorkerAgentID(ctx, "engineer"); workerID != "" {
+			agentID = workerID
+		}
 		model := "gpt-5.4-pro"
 		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("engineer provider: %w", err)
 		}
-		engCfg := engineer.Config{ID: engineerID, ActivityPub: actPub}
+		engCfg := engineer.Config{ID: agentID, ActivityPub: actPub}
 		if ac := actCtrlRef.Load(); ac != nil {
 			engCfg.RequestGuard = func() func() {
 				return ac.AcquireRequestGuard("engineer")
@@ -1629,12 +1787,16 @@ func registerOnDemandAgentCreators(
 	// Designer — LLM-driven design implementation.
 	designerID, _ := ids.Get("designer")
 	reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
+		agentID := designerID
+		if workerID := pipelineWorkerAgentID(ctx, "designer"); workerID != "" {
+			agentID = workerID
+		}
 		model := string(providers.Gemini31Pro)
 		wrapped, err := createSwapProvider(ctx, model, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("designer provider: %w", err)
 		}
-		desCfg := designer.Config{ID: designerID, ActivityPub: actPub}
+		desCfg := designer.Config{ID: agentID, ActivityPub: actPub}
 		if ac := actCtrlRef.Load(); ac != nil {
 			desCfg.RequestGuard = func() func() {
 				return ac.AcquireRequestGuard("designer")
@@ -1853,7 +2015,7 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 // When hydrated is non-nil, it reuses pre-resolved auth (skipping duplicate
 // OAuth + Code Assist setup). If provider auth is unavailable, it falls back
 // to a local rule-based classifier so the UI can launch without authorization.
-func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway) (*guide.Guide, error) {
+func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway, projectRoot string, sessionVFSLookup func(string) *versioning.SessionVFS) (*guide.Guide, error) {
 	googleCfg := defaultGuideGoogleConfig()
 	cfg := guide.Config{
 		Bus:          bus,
@@ -1861,6 +2023,13 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.A
 		AgentID:      "guide",
 		SessionID:    "default",
 		GoogleConfig: &googleCfg,
+		WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView:      versioning.WorkspaceViewDisk,
+			DefaultSessionID: "default",
+			WorkingDir:       projectRoot,
+			SessionLookup:    sessionVFSLookup,
+			DiskFallback:     versioning.NewDiskFileAccess(projectRoot, true),
+		}),
 	}
 
 	promptSkills := guide.DiscoverGuidePromptSkills(guide.GuideGoSkills())
@@ -1894,7 +2063,7 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.A
 	return g, nil
 }
 
-func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, anthropicGw *gateway.ProviderGateway, actCtrlRef *atomic.Pointer[activation.ActivationController], planStore *architect.PlanStore) (*architect.Architect, error) {
+func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, anthropicGw *gateway.ProviderGateway, actCtrlRef *atomic.Pointer[activation.ActivationController], planStore *architect.PlanStore, sessionVFSLookup func(string) *versioning.SessionVFS) (*architect.Architect, error) {
 	bootstrapStart := time.Now()
 	deadline, hasDL := ctx.Deadline()
 	guide.DebugFileLog().Info("DEBUG: bootstrap_architect_start", "has_deadline", hasDL, "deadline", deadline)
@@ -1908,9 +2077,19 @@ func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.Event
 		EnableLLM:       true,
 		Model:           architect.DefaultArchitectModel,
 		AnthropicAPIKey: apiKey,
-		FileAccess:      versioning.NewDiskFileAccess(projectRoot, true),
-		ActivityPub:     actPub,
-		PlanStore:       planStore,
+		FileAccess: versioning.NewSessionRoutingFileAccess(
+			true,
+			sessionVFSLookup,
+			versioning.NewDiskFileAccess(projectRoot, true),
+		),
+		WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView:   versioning.WorkspaceViewGlobal,
+			WorkingDir:    projectRoot,
+			SessionLookup: sessionVFSLookup,
+			DiskFallback:  versioning.NewDiskFileAccess(projectRoot, true),
+		}),
+		ActivityPub: actPub,
+		PlanStore:   planStore,
 		PlannerProviderWrapper: func(p *providers.AnthropicProvider) architect.PlannerStreamProvider {
 			return anthropicGw.WrapProvider(p, gateway.PriorityPlanning)
 		},
@@ -1951,6 +2130,7 @@ func bootstrapGuardian(
 	googleGw, anthropicGw, openaiGw *gateway.ProviderGateway,
 	gitSubsRef *atomic.Pointer[gitBootResult],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
+	sessionVFSLookup func(string) *versioning.SessionVFS,
 ) (*guardian.Guardian, error) {
 	model := guardian.DefaultGuardianModel
 	var wrapped providers.Provider
@@ -1962,8 +2142,18 @@ func bootstrapGuardian(
 
 	cfg := guardian.Config{
 		ActivityPub: actPub,
-		FileAccess:  versioning.NewDiskFileAccess(projectRoot, true),
-		Sanitizer:   security.NewSecretSanitizer(),
+		FileAccess: versioning.NewSessionRoutingFileAccess(
+			true,
+			sessionVFSLookup,
+			versioning.NewDiskFileAccess(projectRoot, true),
+		),
+		WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView:   versioning.WorkspaceViewGlobal,
+			WorkingDir:    projectRoot,
+			SessionLookup: sessionVFSLookup,
+			DiskFallback:  versioning.NewDiskFileAccess(projectRoot, true),
+		}),
+		Sanitizer: security.NewSecretSanitizer(),
 	}
 
 	// Wire git subsystems from atomic ref (available on daemon restart,
@@ -2137,13 +2327,79 @@ func registerAgentWithGuide(g *guide.Guide, router guide.AgentRouter, _ string) 
 	if g == nil || router == nil {
 		return nil
 	}
-	if err := g.RegisterRouter(router); err != nil {
+	return registerRoutingInfoWithGuide(g, router.GetRoutingInfo())
+}
+
+func registerRoutingInfoWithGuide(g *guide.Guide, info *guide.AgentRoutingInfo) error {
+	if g == nil || info == nil {
+		return nil
+	}
+	if err := g.Register(info); err != nil {
 		return err
 	}
 	// Use the agent's own routing ID (UUID) — Register() stores
 	// readyAgents keyed by info.ID, not by agentType.
-	g.MarkAgentReady(router.GetRoutingInfo().ID)
+	g.MarkAgentReady(info.ID)
 	return nil
+}
+
+func findRegisteredPodContainer(reg *container.ContainerRegistry, podID, agentType string) *container.Container {
+	if reg == nil {
+		return nil
+	}
+	if podID != "" {
+		for _, ctr := range reg.ListByPod(container.PodID(podID)) {
+			if ctr == nil {
+				continue
+			}
+			if ctr.Spec().AgentType == agentType {
+				return ctr
+			}
+		}
+	}
+	containers := reg.ListByType(agentType)
+	if len(containers) == 0 {
+		return nil
+	}
+	return containers[0]
+}
+
+func isTaskScopedPipelineWorker(podID, agentType string) bool {
+	if strings.TrimSpace(podID) == "" || podID == agentType {
+		return false
+	}
+	switch agentType {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return true
+	default:
+		return false
+	}
+}
+
+func taskScopedWorkerRoutingInfo(info *guide.AgentRoutingInfo, podID, agentType string) *guide.AgentRoutingInfo {
+	if info == nil {
+		return nil
+	}
+	cloned := *info
+	cloned.Name = orchestrator.TaskScopedRoutingName("", podID, agentType)
+	cloned.Aliases = nil
+	cloned.ActionShortcuts = nil
+	cloned.Triggers = guide.AgentTriggers{}
+	if info.Registration != nil {
+		reg := *info.Registration
+		reg.Name = cloned.Name
+		reg.Aliases = nil
+		cloned.Registration = &reg
+	}
+	return &cloned
+}
+
+func pipelineWorkerAgentID(ctx context.Context, agentType string) string {
+	podID, ok := container.CreationPodIDFromContext(ctx)
+	if !ok || !isTaskScopedPipelineWorker(string(podID), agentType) {
+		return ""
+	}
+	return orchestrator.TaskScopedAgentID(string(podID), agentType)
 }
 
 // preRegisterAgentRouting pre-registers static routing metadata for all
@@ -2937,11 +3193,11 @@ func (a *daemonQuerierAdapter) Status() []guardian.DaemonStatusSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// VFS / CVS adapters — aggregate per-session VFS stats for Guardian
+// VFS adapters — aggregate per-session VFS stats for Guardian
 // ---------------------------------------------------------------------------
 
-// orchestratorCVSAdapter implements guardian.CVSQuerier by aggregating
-// CVS stats across all of the Orchestrator's active sessions.
+// orchestratorCVSAdapter implements guardian.CVSQuerier by aggregating live
+// SessionVFS stats across all of the Orchestrator's active sessions.
 type orchestratorCVSAdapter struct {
 	orchRef *atomic.Pointer[orchestrator.Orchestrator]
 }
@@ -2953,18 +3209,16 @@ func (a *orchestratorCVSAdapter) Stats() guardian.CVSStatsSnapshot {
 	}
 	var agg guardian.CVSStatsSnapshot
 	for _, svfs := range orch.AllSessionVFS() {
-		s := svfs.CVS().Stats()
-		agg.TotalFiles += s.TotalFiles
+		s := svfs.Stats()
+		agg.TotalFiles += s.TrackedFiles
 		agg.TotalVersions += s.TotalVersions
 		agg.TotalOperations += s.TotalOperations
 		agg.ActivePipelines += s.ActivePipelines
 		agg.ActiveVariants += s.ActiveVariants
 		agg.ActiveLocks += s.ActiveLocks
 		agg.ActiveSubscribers += s.ActiveSubscribers
-
-		// New versioned WAL stats.
-		agg.CurrentVersion = svfs.CurrentVersion().String()
-		agg.WALEntries += int64(svfs.WAL().IndexLen())
+		agg.CurrentVersion = s.CurrentVersion.String()
+		agg.WALEntries += s.WALEntries
 	}
 	return agg
 }

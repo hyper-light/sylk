@@ -82,6 +82,49 @@ func TestNormalizeTaskGraph_AssignsUniqueTaskIDsAndSlugs(t *testing.T) {
 	}
 }
 
+func TestNormalizeTaskGraph_DerivesWorkspaceAndWorkerPackets(t *testing.T) {
+	tasks := []*AtomicTask{
+		{
+			Name:      "Build checkout UI",
+			AgentType: "engineer",
+			AffectedFiles: []TaskFileTarget{
+				{Path: "ui/checkout/page.tsx", Operation: "modify"},
+			},
+			AgentScopes: []AgentScope{
+				{
+					AgentType:           "engineer",
+					Role:                "primary",
+					ImplementationGuide: "Wire the checkout flow.",
+					AffectedFiles:       []TaskFileTarget{{Path: "ui/checkout/page.tsx", Operation: "modify"}},
+					TestRequirements:    []string{"checkout submit succeeds"},
+				},
+				{
+					AgentType:           "designer",
+					Role:                "co_agent",
+					ImplementationGuide: "Refine spacing and states.",
+					AffectedFiles:       []TaskFileTarget{{Path: "ui/checkout/styles.css", Operation: "modify"}},
+				},
+			},
+		},
+	}
+
+	normalized := normalizeTaskGraph(tasks)
+	task := normalized[0]
+
+	if task.Workspace.BaseVersion != "session_head" {
+		t.Fatalf("workspace base version = %q, want session_head", task.Workspace.BaseVersion)
+	}
+	if len(task.Workspace.WriteSet) < 2 {
+		t.Fatalf("workspace write set = %v, want derived file coverage", task.Workspace.WriteSet)
+	}
+	if len(task.WorkerPackets) != 2 {
+		t.Fatalf("worker packets = %d, want 2", len(task.WorkerPackets))
+	}
+	if task.WorkerPackets[0].AgentType != "engineer" || task.WorkerPackets[1].AgentType != "designer" {
+		t.Fatalf("worker packets = %+v, want engineer/designer packets", task.WorkerPackets)
+	}
+}
+
 func TestContainsIgnoreCase(t *testing.T) {
 	if !containsIgnoreCase("Architect Planner", "planner") {
 		t.Fatal("expected containsIgnoreCase to match case-insensitive substring")

@@ -90,18 +90,18 @@ func (d *DefaultStatePreserver) Inject(agent container.ContainerAgent, state *ha
 
 // ActivationControllerConfig provides construction parameters.
 type ActivationControllerConfig struct {
-	Runtime        container.ContainerRuntime
-	Registry       *container.ContainerRegistry
-	Scope          *concurrency.GoroutineScope
-	Preserver      StatePreserver
-	Policies       []*ActivationPolicy
-	StorageDir     string          // For CoolStore state files
-	WarmPoolCap    int             // Max Warm containers
-	CoolStoreCap   int             // Max Cool entries on disk
-	Predictor      PredictorConfig // Co-activation predictor tuning
-	Pressure       PressureConfig  // Pressure evaluation tuning
-	ScanPeriod     int             // Idle scan period in ms (0 = derived)
-	Logger         *slog.Logger    // Structured logger (nil = slog.Default())
+	Runtime      container.ContainerRuntime
+	Registry     *container.ContainerRegistry
+	Scope        *concurrency.GoroutineScope
+	Preserver    StatePreserver
+	Policies     []*ActivationPolicy
+	StorageDir   string          // For CoolStore state files
+	WarmPoolCap  int             // Max Warm containers
+	CoolStoreCap int             // Max Cool entries on disk
+	Predictor    PredictorConfig // Co-activation predictor tuning
+	Pressure     PressureConfig  // Pressure evaluation tuning
+	ScanPeriod   int             // Idle scan period in ms (0 = derived)
+	Logger       *slog.Logger    // Structured logger (nil = slog.Default())
 }
 
 // PressureSource evaluates resource pressure and produces eviction candidates.
@@ -199,24 +199,14 @@ func (ac *ActivationController) warmStartupEntries() {
 		if entry.LoadTier() >= TierWarm {
 			continue
 		}
-		entry := entry
-		_ = ac.scope.Go("startup-warm-"+entry.AgentType, 0, func(ctx context.Context) error {
-			if !entry.Tier.CompareAndSwap(int32(TierCold), int32(TierCool)) {
-				return nil
-			}
-			c, err := ac.runtime.CreateContainer(ctx, entry.Spec)
-			if err != nil {
-				entry.StoreTier(TierCold)
-				ac.logger.Warn("startup pre-warm failed",
-					"agent_type", entry.AgentType, "error", err)
-				return nil
-			}
-			entry.Container.Store(c)
-			entry.StoreTier(TierWarm)
-			entry.TouchActivity()
-			ac.logger.Info("startup pre-warm complete", "agent_type", entry.AgentType)
-			return nil
-		})
+		if err := ac.prepareWarmEntry(context.Background(), entry); err != nil {
+			ac.logger.Warn("startup pre-warm failed",
+				"agent_type", entry.AgentType,
+				"error", err,
+			)
+			continue
+		}
+		ac.logger.Info("startup pre-warm complete", "agent_type", entry.AgentType)
 	}
 }
 
@@ -239,6 +229,9 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 	entry, err := ac.getEntry(agentType)
 	if err != nil {
 		activationFileLog().Info("DEBUG: ensure_active_entry_error", "agent_type", agentType, "error", err)
+		return nil, err
+	}
+	if err := ac.waitForWarmPreparation(ctx, entry); err != nil {
 		return nil, err
 	}
 
@@ -432,17 +425,28 @@ func (ac *ActivationController) promote(ctx context.Context, entry *ActivationEn
 func (ac *ActivationController) promoteFromWarm(ctx context.Context, entry *ActivationEntry) (*container.Container, error) {
 	c := ac.warmPool.Take(entry.AgentType)
 	if c == nil {
+		c = entry.Container.Load()
+	}
+	if c == nil {
 		ac.logger.Info("warm pool miss, falling back to cold start",
 			"agent_type", entry.AgentType,
 		)
 		return ac.promoteFromCold(ctx, entry)
 	}
 
-	if err := ac.runtime.ResumeContainer(ctx, c); err != nil {
+	if err := ac.resumeWarmContainer(ctx, c); err != nil {
 		ac.logger.Warn("warm resume failed, falling back to cold start",
 			"agent_type", entry.AgentType,
 			"error", err,
 		)
+		if removeErr := ac.stopAndRemove(context.Background(), c); removeErr != nil {
+			ac.logger.Warn("warm container cleanup failed after resume error",
+				"agent_type", entry.AgentType,
+				"error", removeErr,
+			)
+		}
+		entry.Container.Store(nil)
+		entry.StoreTier(TierCold)
 		return ac.promoteFromCold(ctx, entry)
 	}
 
@@ -571,7 +575,11 @@ func (ac *ActivationController) demote(ctx context.Context, entry *ActivationEnt
 		if err != nil {
 			return err
 		}
-		current = entry.LoadTier()
+		next := entry.LoadTier()
+		if next >= current {
+			return nil
+		}
+		current = next
 	}
 	return nil
 }
@@ -694,57 +702,17 @@ func (ac *ActivationController) preWarmAsync(ctx context.Context, agentType stri
 		}
 
 		if scopeErr := ac.scope.Go("prewarm-"+predicted, 0, func(ctx context.Context) error {
-			// CAS guard: only one pre-warm goroutine wins the Cold→Cool transition.
-			// Losers see a non-Cold tier and bail, preventing container leaks.
-			if entry.LoadTier() >= TierWarm {
-				return nil
-			}
-			if !entry.Tier.CompareAndSwap(int32(TierCold), int32(TierCool)) {
+			if entry.LoadTier() >= TierWarm || entry.Prewarming.Load() {
 				return nil // another pre-warm or promote already in progress
 			}
-
-			c, err := ac.runtime.CreateContainer(ctx, entry.Spec)
-			if err != nil {
-				entry.StoreTier(TierCold) // rollback
-				ac.logger.Warn("pre-warm container creation failed",
+			if err := ac.prepareWarmEntry(ctx, entry); err != nil {
+				ac.logger.Warn("pre-warm failed",
 					"agent_type", predicted,
 					"error", err,
 				)
 				return nil
 			}
-			if err := ac.runtime.StartContainer(ctx, c); err != nil {
-				if removeErr := ac.runtime.RemoveContainer(ctx, c); removeErr != nil {
-					ac.logger.Warn("pre-warm cleanup failed after start error",
-						"agent_type", predicted,
-						"error", removeErr,
-					)
-				}
-				entry.StoreTier(TierCold)
-				return nil
-			}
-			if err := ac.runtime.PauseContainer(ctx, c); err != nil {
-				if stopErr := ac.stopAndRemove(ctx, c); stopErr != nil {
-					ac.logger.Warn("pre-warm cleanup failed after pause error",
-						"agent_type", predicted,
-						"error", stopErr,
-					)
-				}
-				entry.StoreTier(TierCold)
-				return nil
-			}
-
-			evicted := ac.warmPool.Put(predicted, c)
-			entry.Container.Store(c)
-			entry.StoreTier(TierWarm)
 			ac.metrics.PredictorHits.Add(1)
-			if evicted != nil {
-				if err := ac.stopAndRemove(ctx, evicted); err != nil {
-					ac.logger.Warn("pre-warm eviction cleanup failed",
-						"agent_type", predicted,
-						"error", err,
-					)
-				}
-			}
 			return nil
 		}); scopeErr != nil {
 			ac.logger.Warn("failed to launch pre-warm goroutine",
@@ -765,7 +733,11 @@ func (ac *ActivationController) teardownEntry(ctx context.Context, entry *Activa
 			err = ac.stopAndRemove(ctx, c)
 		}
 	case TierWarm:
-		if c := ac.warmPool.Take(entry.AgentType); c != nil {
+		c := ac.warmPool.Take(entry.AgentType)
+		if c == nil {
+			c = entry.Container.Load()
+		}
+		if c != nil {
 			err = ac.stopAndRemove(ctx, c)
 		}
 	case TierCool:
@@ -781,6 +753,82 @@ func (ac *ActivationController) teardownEntry(ctx context.Context, entry *Activa
 	entry.Container.Store(nil)
 	entry.StoreTier(TierCold)
 	return err
+}
+
+func (ac *ActivationController) waitForWarmPreparation(ctx context.Context, entry *ActivationEntry) error {
+	if entry == nil {
+		return nil
+	}
+	for entry.Prewarming.Load() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil
+}
+
+func (ac *ActivationController) prepareWarmEntry(ctx context.Context, entry *ActivationEntry) error {
+	if entry == nil {
+		return nil
+	}
+	if entry.LoadTier() >= TierWarm {
+		return nil
+	}
+	if !entry.Prewarming.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer entry.Prewarming.Store(false)
+
+	c, err := ac.runtime.CreateContainer(ctx, entry.Spec)
+	if err != nil {
+		return err
+	}
+	if err := ac.runtime.StartContainer(ctx, c); err != nil {
+		if removeErr := ac.runtime.RemoveContainer(ctx, c); removeErr != nil {
+			ac.logger.Warn("warm preparation cleanup failed after start error",
+				"agent_type", entry.AgentType,
+				"error", removeErr,
+			)
+		}
+		return err
+	}
+	if err := ac.runtime.PauseContainer(ctx, c); err != nil {
+		if stopErr := ac.stopAndRemove(ctx, c); stopErr != nil {
+			ac.logger.Warn("warm preparation cleanup failed after pause error",
+				"agent_type", entry.AgentType,
+				"error", stopErr,
+			)
+		}
+		return err
+	}
+
+	evicted := ac.warmPool.Put(entry.AgentType, c)
+	entry.Container.Store(c)
+	entry.StoreTier(TierWarm)
+	entry.TouchActivity()
+	if evicted != nil {
+		if err := ac.stopAndRemove(ctx, evicted); err != nil {
+			ac.logger.Warn("warm preparation eviction cleanup failed",
+				"agent_type", entry.AgentType,
+				"error", err,
+			)
+		}
+	}
+	return nil
+}
+
+func (ac *ActivationController) resumeWarmContainer(ctx context.Context, c *container.Container) error {
+	switch {
+	case c == nil:
+		return nil
+	case c.IsRunning():
+		return nil
+	case c.IsPaused():
+		return ac.runtime.ResumeContainer(ctx, c)
+	default:
+		return ac.runtime.StartContainer(ctx, c)
+	}
 }
 
 func (ac *ActivationController) teardownContainerAsync(ctx context.Context, c *container.Container) {
@@ -902,6 +950,19 @@ func (ac *ActivationController) EntryCount() int {
 	ac.mu.RLock()
 	defer ac.mu.RUnlock()
 	return len(ac.entries)
+}
+
+// ActiveAgentTypes returns the currently hot agent types.
+func (ac *ActivationController) ActiveAgentTypes() []string {
+	entries := ac.allEntries()
+	active := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.LoadTier() != TierHot {
+			continue
+		}
+		active = append(active, entry.AgentType)
+	}
+	return active
 }
 
 // TierOf returns the current tier of the given agent type.

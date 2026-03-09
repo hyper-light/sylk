@@ -74,7 +74,7 @@ type FileAccessType int
 const (
 	FileAccessDisk   FileAccessType = iota // Direct disk I/O (Architect, Guide, Librarian, etc.)
 	FileAccessVFS                          // Per-pipeline VFS overlay (Engineer, Designer, Pipeline Inspector/Tester)
-	FileAccessGlobal                       // Per-session CVS-backed (Global Inspector, Global Tester)
+	FileAccessGlobal                       // Per-session in-memory global overlay (Global Inspector, Global Tester)
 )
 
 var fileAccessTypeNames = map[FileAccessType]string{
@@ -274,4 +274,3 @@ type HookAction struct {
 type HookHandler interface {
 	Execute(ctx context.Context) error
 }
-

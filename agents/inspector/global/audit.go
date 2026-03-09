@@ -41,6 +41,9 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 
 	// Build audit prompt from diffs and plan
 	auditPrompt := gi.buildAuditPrompt(req)
+	if summary := gi.buildWorkspaceAuditContext(auditCtx, req); summary != "" {
+		auditPrompt += "\n\n" + summary
+	}
 
 	// Run LLM tool loop for analysis
 	gi.prepareSkillsForInput(auditPrompt)
@@ -144,6 +147,38 @@ func (gi *GlobalInspector) buildAuditPrompt(req *shared.LayerAuditRequest) strin
 		"Grade the layer quality. Escalate any blocking findings."
 
 	return prompt
+}
+
+func (gi *GlobalInspector) buildWorkspaceAuditContext(ctx context.Context, req *shared.LayerAuditRequest) string {
+	if gi == nil || gi.workspaceViews == nil || req == nil {
+		return ""
+	}
+	paths := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, diff := range req.NodeDiffs {
+		if diff == nil {
+			continue
+		}
+		for _, modified := range diff.ModifiedFiles {
+			path := strings.TrimSpace(modified.Path)
+			if path == "" {
+				continue
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) == 0 {
+		return ""
+	}
+	summary, err := gi.workspaceViews.SummarizePaths(ctx, paths, "")
+	if err != nil {
+		return "## Workspace Snapshot\n\n- unavailable: " + strings.TrimSpace(err.Error())
+	}
+	return agentShared.FormatWorkspaceSummary(summary)
 }
 
 func (gi *GlobalInspector) parseAuditResponse(response string, result *shared.AuditResult) {

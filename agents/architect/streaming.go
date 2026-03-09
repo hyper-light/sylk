@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 type architectStreamContext struct {
@@ -40,7 +41,9 @@ type architectConversationContext struct {
 }
 
 func withArchitectSessionID(ctx context.Context, sessionID string) context.Context {
-	return context.WithValue(ctx, architectSessionIDKey{}, strings.TrimSpace(sessionID))
+	sessionID = strings.TrimSpace(sessionID)
+	ctx = versioning.WithSessionID(ctx, sessionID)
+	return context.WithValue(ctx, architectSessionIDKey{}, sessionID)
 }
 
 func architectSessionIDFromContext(ctx context.Context) string {

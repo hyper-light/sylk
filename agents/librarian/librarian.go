@@ -97,8 +97,9 @@ type Librarian struct {
 	agentPod *shared.AgentPod
 
 	// Clone store for remote packages.
-	cloneStore *CloneStore
-	sessionVFS *versioning.SessionVFS
+	cloneStore     *CloneStore
+	sessionVFS     *versioning.SessionVFS
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// State mutex (guards id during handoff swap).
 	mu sync.Mutex
@@ -165,6 +166,12 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
+		workspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView:      versioning.WorkspaceViewDisk,
+			DefaultSessionID: cfg.SessionID,
+			WorkingDir:       cfg.WorkingDirectory,
+			DiskFallback:     versioning.NewDiskFileAccess(cfg.WorkingDirectory, true),
+		}),
 	}
 
 	if cfg.SearchSystem != nil {
@@ -191,6 +198,10 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
 	}
+	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
+		DefaultView:     versioning.WorkspaceViewDisk,
+		IncludePipeline: true,
+	})
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
@@ -492,8 +503,9 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(l.runCtx)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	l.registerRequestCancel(fwd.CorrelationID, cancel)
-	l.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	l.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer l.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
@@ -888,6 +900,22 @@ func (l *Librarian) Terminate(_ context.Context) error {
 func (l *Librarian) SetSessionVFS(svfs *versioning.SessionVFS) {
 	l.mu.Lock()
 	l.sessionVFS = svfs
+	if svfs != nil {
+		l.workspaceViews = versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView:      versioning.WorkspaceViewDisk,
+			DefaultSessionID: l.config.SessionID,
+			WorkingDir:       l.config.WorkingDirectory,
+			Session:          svfs,
+			DiskFallback:     versioning.NewDiskFileAccess(l.config.WorkingDirectory, true),
+		})
+	} else {
+		l.workspaceViews = versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+			DefaultView:      versioning.WorkspaceViewDisk,
+			DefaultSessionID: l.config.SessionID,
+			WorkingDir:       l.config.WorkingDirectory,
+			DiskFallback:     versioning.NewDiskFileAccess(l.config.WorkingDirectory, true),
+		})
+	}
 	l.mu.Unlock()
 	if l.cloneStore != nil {
 		l.cloneStore.SetSessionVFS(svfs)

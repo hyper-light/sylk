@@ -391,6 +391,18 @@ func (o *Orchestrator) SetScribeFactory(f shared.ScribeFactory) {
 	}
 }
 
+// SetTaskPodInfra wires the runtime/spec/session-VFS dependencies needed for
+// real task-scoped pipeline pods.
+func (o *Orchestrator) SetTaskPodInfra(
+	runtime container.ContainerRuntime,
+	specReg *container.AgentSpecRegistry,
+	sessionVFS func(sessionID string) *versioning.SessionVFS,
+) {
+	if o.dagBridge != nil {
+		o.dagBridge.SetTaskPodInfra(runtime, specReg, sessionVFS)
+	}
+}
+
 // SetSessionVFS associates a SessionVFS with the given session. Called when
 // the Orchestrator creates a new session's CVS infrastructure.
 func (o *Orchestrator) SetSessionVFS(sessionID string, svfs *versioning.SessionVFS) {
@@ -404,6 +416,26 @@ func (o *Orchestrator) GetSessionVFS(sessionID string) *versioning.SessionVFS {
 	o.sessionVFSMu.RLock()
 	defer o.sessionVFSMu.RUnlock()
 	return o.sessionVFS[sessionID]
+}
+
+// EnsureSessionVFS returns the session VFS for sessionID, creating it on first
+// use with the provided working directory.
+func (o *Orchestrator) EnsureSessionVFS(sessionID, workingDir string) *versioning.SessionVFS {
+	if svfs := o.GetSessionVFS(sessionID); svfs != nil {
+		return svfs
+	}
+
+	o.sessionVFSMu.Lock()
+	defer o.sessionVFSMu.Unlock()
+	if svfs := o.sessionVFS[sessionID]; svfs != nil {
+		return svfs
+	}
+	svfs := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+		SessionID:  versioning.SessionID(sessionID),
+		WorkingDir: workingDir,
+	})
+	o.sessionVFS[sessionID] = svfs
+	return svfs
 }
 
 // CloseSessionVFS tears down the VFS infrastructure for a session.
@@ -813,7 +845,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	shared.LogIncomingRequest(o.steering.EventLogger(), fwd, o.config.AgentID)
 
 	reqCtx, cancel := context.WithCancel(o.runCtx)
-	cancelEntry := o.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	cancelEntry := o.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
 	// Cascading cancel: when this request is interrupted, cancel all
@@ -1033,6 +1065,12 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	pipelineStage := ""
 	pipelineParentID := ""
 	pipelineTaskID, pipelineTaskSlug := canonicalPipelineTaskIdentity(taskID, taskSlug, nodeCtx, nodeID)
+	if pipelineTaskID != "" {
+		taskID = pipelineTaskID
+	}
+	if pipelineTaskSlug != "" {
+		taskSlug = pipelineTaskSlug
+	}
 	if nodeCtx != nil {
 		if stage, ok := nodeCtx["pipeline_stage"].(string); ok {
 			pipelineStage = stage
@@ -1085,19 +1123,17 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	// Publish pipeline agent activity so the TUI panel shows ALL pipeline agents.
 	// Dispatched agents (primary + co-agents) get AgentAction (active work).
 	// Remaining pipeline agents get AgentRegistered (present but idle).
+	coAgents := decodeDispatchAgentTypes(data["co_agents"])
+
 	if nodeID != "" && agentType != "" {
 		dispatched := make(map[string]struct{})
 
 		o.publishPipelineAgentActivity(agentType, pipelineTaskID, nodeID, pipelineTaskSlug)
 		dispatched[agentType] = struct{}{}
 
-		if coAgents, ok := data["co_agents"].([]any); ok {
-			for _, co := range coAgents {
-				if coType, ok := co.(string); ok {
-					o.publishPipelineAgentActivity(coType, pipelineTaskID, nodeID, pipelineTaskSlug)
-					dispatched[coType] = struct{}{}
-				}
-			}
+		for _, coType := range coAgents {
+			o.publishPipelineAgentActivity(coType, pipelineTaskID, nodeID, pipelineTaskSlug)
+			dispatched[coType] = struct{}{}
 		}
 
 		for _, pipelineType := range PipelinePanelAgentTypes {
@@ -1112,8 +1148,9 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 		pipelineTask := &PipelineTask{
 			NodeID:        nodeID,
 			DAGID:         dagID,
-			TaskID:        taskID,
+			TaskID:        pipelineTaskID,
 			AgentType:     agentType,
+			TargetAgentID: pipelineWorkerTargetAgentID(pipelineTaskID, agentType),
 			Prompt:        prompt,
 			Context:       nodeCtx,
 			ParentResults: parentResults,
@@ -1129,7 +1166,20 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 			}
 		}
 
-		if routeErr := router.RouteWithLifecycle(pipelineTask, done); routeErr != nil {
+		routeDispatch := func() error {
+			if pipelineStage == string(StageExecute) && len(coAgents) > 0 {
+				compoundTask := &CompoundPipelineTask{
+					PipelineTask:      *pipelineTask,
+					CoAgents:          coAgents,
+					CollaborationMode: parseDispatchCollaborationMode(data["collaboration_mode"]),
+					MaxReviewRounds:   intValue(data["max_review_rounds"]),
+				}
+				return router.RouteCompoundWithLifecycle(context.Background(), compoundTask, done)
+			}
+			return router.RouteWithLifecycle(pipelineTask, done)
+		}
+
+		if routeErr := routeDispatch(); routeErr != nil {
 			o.pushEvent(&busEvent{
 				Topic:     "tasks.dispatch",
 				Timestamp: time.Now(),
@@ -1142,6 +1192,43 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	}
 
 	return nil
+}
+
+func decodeDispatchAgentTypes(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		result := make([]string, 0, len(typed))
+		for _, entry := range typed {
+			if s, ok := entry.(string); ok && strings.TrimSpace(s) != "" {
+				result = append(result, strings.TrimSpace(s))
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func parseDispatchCollaborationMode(value any) dag.CollaborationMode {
+	raw, _ := value.(string)
+	return parseHandoffCollaborationMode(raw)
+}
+
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
+	}
 }
 
 func canonicalPipelineTaskIdentity(taskID, taskSlug string, nodeCtx map[string]any, nodeID string) (string, string) {
@@ -1165,6 +1252,20 @@ func canonicalPipelineTaskIdentity(taskID, taskSlug string, nodeCtx map[string]a
 	}
 
 	return canonicalTaskID, canonicalTaskSlug
+}
+
+func pipelineWorkerTargetAgentID(taskID, agentType string) string {
+	taskID = strings.TrimSpace(taskID)
+	agentType = strings.TrimSpace(agentType)
+	if taskID == "" {
+		return agentType
+	}
+	switch agentType {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return TaskScopedAgentID(taskID, agentType)
+	default:
+		return agentType
+	}
 }
 
 func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {

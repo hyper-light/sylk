@@ -1175,6 +1175,8 @@ type taskPayload struct {
 	AffectedFiles       []taskFileTargetPayload      `json:"affected_files"`
 	TestRequirements    []string                     `json:"test_requirements"`
 	RiskFactors         []string                     `json:"risk_factors"`
+	Workspace           taskWorkspacePayload         `json:"workspace,omitempty"`
+	WorkerPackets       []workerPacketPayload        `json:"worker_packets,omitempty"`
 }
 
 type acceptanceCriterionPayload struct {
@@ -1206,6 +1208,28 @@ type agentScopePayload struct {
 	TestRequirements    []string                     `json:"test_requirements"`
 }
 
+type taskWorkspacePayload struct {
+	BaseVersion   string   `json:"base_version,omitempty"`
+	ReadSet       []string `json:"read_set,omitempty"`
+	WriteSet      []string `json:"write_set,omitempty"`
+	TestSurface   []string `json:"test_surface,omitempty"`
+	PrefetchPaths []string `json:"prefetch_paths,omitempty"`
+}
+
+type workerPacketPayload struct {
+	AgentType           string                       `json:"agent_type"`
+	Role                string                       `json:"role"`
+	Objective           string                       `json:"objective,omitempty"`
+	Responsibilities    []string                     `json:"responsibilities,omitempty"`
+	AcceptanceCriteria  []acceptanceCriterionPayload `json:"acceptance_criteria,omitempty"`
+	ImplementationGuide string                       `json:"implementation_guide,omitempty"`
+	AffectedFiles       []taskFileTargetPayload      `json:"affected_files,omitempty"`
+	ReadSet             []string                     `json:"read_set,omitempty"`
+	WriteSet            []string                     `json:"write_set,omitempty"`
+	Guidelines          []string                     `json:"guidelines,omitempty"`
+	TestRequirements    []string                     `json:"test_requirements,omitempty"`
+}
+
 func (p taskPayload) toTask(index int) *AtomicTask {
 	taskID := strings.TrimSpace(p.ID)
 	if taskID == "" {
@@ -1229,6 +1253,8 @@ func (p taskPayload) toTask(index int) *AtomicTask {
 		AffectedFiles:       toTaskFileTargets(p.AffectedFiles),
 		TestRequirements:    nonEmptySlice(p.TestRequirements),
 		RiskFactors:         nonEmptySlice(p.RiskFactors),
+		Workspace:           toTaskWorkspaceSpec(p.Workspace),
+		WorkerPackets:       toWorkerPackets(p.WorkerPackets),
 	}
 
 	// Populate co-tenancy fields when the LLM specifies them.
@@ -1271,6 +1297,40 @@ func toAgentScopes(payloads []agentScopePayload) []AgentScope {
 		scopes = append(scopes, scope)
 	}
 	return scopes
+}
+
+func toTaskWorkspaceSpec(payload taskWorkspacePayload) TaskWorkspaceSpec {
+	return TaskWorkspaceSpec{
+		BaseVersion:   strings.TrimSpace(payload.BaseVersion),
+		ReadSet:       nonEmptySlice(payload.ReadSet),
+		WriteSet:      nonEmptySlice(payload.WriteSet),
+		TestSurface:   nonEmptySlice(payload.TestSurface),
+		PrefetchPaths: nonEmptySlice(payload.PrefetchPaths),
+	}
+}
+
+func toWorkerPackets(payloads []workerPacketPayload) []WorkerPacket {
+	if len(payloads) == 0 {
+		return nil
+	}
+	packets := make([]WorkerPacket, 0, len(payloads))
+	for _, p := range payloads {
+		packet := WorkerPacket{
+			AgentType:           normalizeTaskAgentType(p.AgentType),
+			Role:                normalizeAgentRole(p.Role),
+			Objective:           strings.TrimSpace(p.Objective),
+			Responsibilities:    nonEmptySlice(p.Responsibilities),
+			AcceptanceCriteria:  toAcceptanceCriteria(p.AcceptanceCriteria),
+			ImplementationGuide: strings.TrimSpace(p.ImplementationGuide),
+			AffectedFiles:       toTaskFileTargets(p.AffectedFiles),
+			ReadSet:             nonEmptySlice(p.ReadSet),
+			WriteSet:            nonEmptySlice(p.WriteSet),
+			Guidelines:          nonEmptySlice(p.Guidelines),
+			TestRequirements:    nonEmptySlice(p.TestRequirements),
+		}
+		packets = append(packets, packet)
+	}
+	return packets
 }
 
 func normalizeAgentRole(raw string) string {
@@ -1578,6 +1638,28 @@ Return JSON only, exactly:
           "reason": "Why this file is affected"
         }
       ],
+      "workspace": {
+        "base_version": "session_head",
+        "read_set": ["path/or/glob/needed/for/context"],
+        "write_set": ["path/or/glob/the-task-may-mutate"],
+        "test_surface": ["tests/or/packages/to-run"],
+        "prefetch_paths": ["high-value context paths to preload"]
+      },
+      "worker_packets": [
+        {
+          "agent_type": "engineer",
+          "role": "primary|co_agent",
+          "objective": "Short execution objective for this worker",
+          "responsibilities": ["Concrete responsibility 1", "Concrete responsibility 2"],
+          "acceptance_criteria": [{"given": "...", "when": "...", "then": "...", "priority": "must"}],
+          "implementation_guide": "Step-by-step for THIS worker only",
+          "affected_files": [{"path": "...", "operation": "create", "reason": "..."}],
+          "read_set": ["paths this worker must read"],
+          "write_set": ["paths this worker may mutate"],
+          "guidelines": ["Constraint specific to this worker"],
+          "test_requirements": ["Tests this worker must satisfy"]
+        }
+      ],
       "test_requirements": [
         "Specific test case that must pass"
       ],
@@ -1600,6 +1682,8 @@ Hard limits:
 - Each task MUST have at least 1 affected_files entry
 - Each task MUST have implementation_guide (minimum 2 sentences)
 - Each task MUST have a unique slug in lowercase kebab-case suitable for the pipeline panel (examples: "auth-checkout", "payment-retry")
+- Each task MUST have workspace with at least 1 write_set entry and enough read_set coverage for the assigned work.
+- worker_packets are REQUIRED for every task. Include 1 packet for single-agent tasks, or 1 packet per participating worker for compound tasks.
 - guidelines: 1-4 items per task
 - test_requirements: 1-4 items per task
 - examples: 0-2 per task (include for non-trivial tasks)
@@ -1610,10 +1694,13 @@ Hard limits:
   2. Identify co-agents (who act after the primary): the complementary agent type
   3. Set collaboration_mode: "sequential" (primary acts, co-agent follows) or "adversarial" (co-agent can push back, bounded by max_review_rounds)
   4. Provide agent_scopes: REQUIRED when co_agents is non-empty. Each agent MUST have its own scoped acceptance_criteria, implementation_guide, affected_files, and guidelines.
+  5. Provide worker_packets: REQUIRED for the primary agent and every co-agent. These are the execution packets consumed by inspector/tester/engineer/designer.
   Classification: tasks with styled components/layouts/theming → primary: designer, co_agents: ["engineer"]. Tasks with UI + state/API/logic → primary: engineer, co_agents: ["designer"]. Pure backend or pure design → no co_agents.
   Execution model: primary agent executes first, producing files. Co-agents execute sequentially after, receiving the primary's changed files as context.
 - max_review_rounds: omit or 0 for sequential mode. Set 1-3 for adversarial mode (bounds review iterations).
 - agent_scopes: REQUIRED when co_agents is non-empty. 1 scope per agent (primary + each co-agent). Each scope must have at least 1 acceptance_criteria with priority "must". Omit entirely for single-agent tasks.
+- workspace: REQUIRED. read_set should cover the code and docs needed to reason locally; write_set should be the narrowest safe mutation surface; test_surface should name the packages/files/commands the tester must exercise; prefetch_paths should preload especially relevant context in large repos.
+- worker_packets: REQUIRED. read_set/write_set inside each worker packet must stay within the task workspace. Use them to divide engineer/designer work cleanly and keep the task collision-free.
 `
 }
 
@@ -1787,6 +1874,143 @@ func normalizeTask(task *AtomicTask, idSet map[string]struct{}, nameIndex map[st
 	if len(task.SuccessCriteria) == 0 {
 		task.SuccessCriteria = []string{"Task completed"}
 	}
+	task.WorkerPackets = normalizeWorkerPackets(task)
+	task.Workspace = normalizeTaskWorkspace(task)
+}
+
+func normalizeWorkerPackets(task *AtomicTask) []WorkerPacket {
+	if task == nil {
+		return nil
+	}
+
+	packets := make([]WorkerPacket, 0, max(len(task.WorkerPackets), len(task.AgentScopes)+1))
+	seen := make(map[string]struct{})
+
+	appendPacket := func(packet WorkerPacket) {
+		packet.AgentType = normalizeTaskAgentType(packet.AgentType)
+		if packet.AgentType == "" {
+			return
+		}
+		if _, ok := seen[packet.AgentType]; ok {
+			return
+		}
+		seen[packet.AgentType] = struct{}{}
+		packet.Role = normalizeAgentRole(packet.Role)
+		packet.Responsibilities = nonEmptySlice(packet.Responsibilities)
+		packet.Guidelines = nonEmptySlice(packet.Guidelines)
+		packet.TestRequirements = nonEmptySlice(packet.TestRequirements)
+		packet.ReadSet = nonEmptySlice(packet.ReadSet)
+		packet.WriteSet = nonEmptySlice(packet.WriteSet)
+		packets = append(packets, packet)
+	}
+
+	for _, packet := range task.WorkerPackets {
+		appendPacket(packet)
+	}
+	for _, scope := range task.AgentScopes {
+		appendPacket(WorkerPacket{
+			AgentType:           scope.AgentType,
+			Role:                scope.Role,
+			AcceptanceCriteria:  scope.AcceptanceCriteria,
+			ImplementationGuide: scope.ImplementationGuide,
+			AffectedFiles:       scope.AffectedFiles,
+			Guidelines:          scope.Guidelines,
+			TestRequirements:    scope.TestRequirements,
+			Objective:           task.Name,
+		})
+	}
+
+	if len(packets) == 0 {
+		appendPacket(WorkerPacket{
+			AgentType:           task.AgentType,
+			Role:                "primary",
+			Objective:           task.Name,
+			AcceptanceCriteria:  task.AcceptanceCriteria,
+			ImplementationGuide: task.ImplementationGuide,
+			AffectedFiles:       task.AffectedFiles,
+			Guidelines:          task.Guidelines,
+			TestRequirements:    task.TestRequirements,
+			WriteSet:            taskFilePaths(task.AffectedFiles),
+		})
+	}
+
+	return packets
+}
+
+func normalizeTaskWorkspace(task *AtomicTask) TaskWorkspaceSpec {
+	if task == nil {
+		return TaskWorkspaceSpec{}
+	}
+	readSet := append([]string(nil), task.Workspace.ReadSet...)
+	writeSet := append([]string(nil), task.Workspace.WriteSet...)
+	testSurface := append([]string(nil), task.Workspace.TestSurface...)
+	prefetch := append([]string(nil), task.Workspace.PrefetchPaths...)
+
+	affected := taskFilePaths(task.AffectedFiles)
+	readSet = appendUniqueStrings(readSet, affected...)
+	writeSet = appendUniqueStrings(writeSet, affected...)
+	for _, packet := range task.WorkerPackets {
+		readSet = appendUniqueStrings(readSet, packet.ReadSet...)
+		writeSet = appendUniqueStrings(writeSet, packet.WriteSet...)
+		readSet = appendUniqueStrings(readSet, taskFilePaths(packet.AffectedFiles)...)
+		writeSet = appendUniqueStrings(writeSet, taskFilePaths(packet.AffectedFiles)...)
+	}
+
+	if len(testSurface) == 0 {
+		testSurface = appendUniqueStrings(testSurface, writeSet...)
+	}
+	prefetch = appendUniqueStrings(prefetch, readSet...)
+
+	return TaskWorkspaceSpec{
+		BaseVersion:   firstNonEmpty(strings.TrimSpace(task.Workspace.BaseVersion), "session_head"),
+		ReadSet:       nonEmptySlice(readSet),
+		WriteSet:      nonEmptySlice(writeSet),
+		TestSurface:   nonEmptySlice(testSurface),
+		PrefetchPaths: nonEmptySlice(prefetch),
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func taskFilePaths(files []TaskFileTarget) []string {
+	result := make([]string, 0, len(files))
+	for _, file := range files {
+		if path := strings.TrimSpace(file.Path); path != "" {
+			result = append(result, path)
+		}
+	}
+	return result
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	if len(values) == 0 {
+		return dst
+	}
+	seen := make(map[string]struct{}, len(dst))
+	for _, existing := range dst {
+		if trimmed := strings.TrimSpace(existing); trimmed != "" {
+			seen[trimmed] = struct{}{}
+		}
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		dst = append(dst, value)
+	}
+	return dst
 }
 
 func normalizeDependencies(

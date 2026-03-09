@@ -117,3 +117,38 @@ func TestArchitectControlStore_ConcurrentUpsertPlan_NoBusy(t *testing.T) {
 		t.Fatalf("concurrent upsert failed: %v", err)
 	}
 }
+
+func TestArchitectControlStore_ClaimPendingContinuation_IsSingleWinner(t *testing.T) {
+	store := testArchitectControlStore(t)
+	record := &ArchitectContinuation{
+		ID:                    "cont-1",
+		Kind:                  continuationKindPlanHandoff,
+		State:                 continuationStatusPending,
+		SessionID:             "sess-1",
+		TargetAgentID:         "orchestrator",
+		ResponseCorrelationID: "corr-1",
+		CreatedAt:             time.Now().UTC(),
+	}
+	if err := store.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	first, err := store.ClaimPendingContinuationByResponseCorrelation("corr-1")
+	if err != nil {
+		t.Fatalf("claim continuation: %v", err)
+	}
+	if first == nil {
+		t.Fatal("expected first claim to succeed")
+	}
+	if first.State != continuationStatusProcessing {
+		t.Fatalf("claimed state = %s, want processing", first.State)
+	}
+
+	second, err := store.ClaimPendingContinuationByResponseCorrelation("corr-1")
+	if err != nil {
+		t.Fatalf("second claim continuation: %v", err)
+	}
+	if second != nil {
+		t.Fatalf("expected second claim to lose, got %+v", second)
+	}
+}

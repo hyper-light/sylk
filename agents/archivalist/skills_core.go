@@ -9,6 +9,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (a *Archivalist) registerExtendedSkills() {
@@ -31,6 +32,11 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Register(storeSkill(a))
 	a.skills.Register(querySkill(a))
 	a.skills.Register(briefingSkill(a))
+	a.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return a.workspaceViews }, nil))
+	a.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return a.workspaceViews }, nil))
+	a.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return a.workspaceViews }, nil))
+	a.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return a.workspaceViews }, nil))
+	a.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return a.workspaceViews }, nil))
 	a.skills.Register(routeToSkill(a))
 	a.skills.Register(replyToSkill(a))
 	a.skills.Register(shared.NewSelfDiagnosticSkill(&archivalistDiag{a: a}))

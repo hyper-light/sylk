@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 var ErrPendingNotFound = errors.New("pending request not found")
@@ -48,6 +49,11 @@ func (g *Guide) registerCoreSkills() {
 	g.skills.Register(routingHistorySkill(g))
 	g.skills.Register(agentCapabilitySkill(g))
 	g.skills.Register(evaluatePlanAcceptanceSkill(g))
+	g.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
 }
 
 func (g *Guide) registerExtendedSkills() {
@@ -644,7 +650,6 @@ func closeSessionSkill(g *Guide) *skills.Skill {
 		}).
 		Build()
 }
-
 
 func resolveGuideSkillSessionID(g *Guide, candidate string) string {
 	sessionID := strings.TrimSpace(candidate)

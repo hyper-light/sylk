@@ -21,6 +21,11 @@ type ManagedVolume interface {
 	// Returns nil if the volume is not mounted.
 	FileAccess() versioning.FileAccess
 
+	// WorkspaceViews returns explicit disk/global/pipeline view access for this
+	// volume when available. Returns nil when the volume does not expose layered
+	// workspace state.
+	WorkspaceViews() versioning.WorkspaceViewAccess
+
 	// VolumeName returns the volume's name (matches VolumeSpec.Name).
 	VolumeName() string
 }
@@ -136,6 +141,9 @@ func (vm *VolumeManager) InjectFileAccess(containers map[string]*container.Conta
 		agent := c.Agent()
 		if consumer, ok := agent.(versioning.FileAccessConsumer); ok {
 			consumer.SetFileAccess(fa)
+		}
+		if viewsConsumer, ok := agent.(versioning.WorkspaceViewsConsumer); ok {
+			viewsConsumer.SetWorkspaceViews(vol.WorkspaceViews())
 		}
 	}
 }

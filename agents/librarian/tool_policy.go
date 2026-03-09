@@ -11,8 +11,13 @@ func librarianVisibleSkillNames() []string {
 		"find_pattern",
 		"find_symbol",
 		"read_file",
+		"read_workspace_file",
 		"glob",
+		"workspace_glob",
 		"grep",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
 		"knowledge_search",
 	}
 }

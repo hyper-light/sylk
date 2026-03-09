@@ -91,7 +91,8 @@ type Guardian struct {
 	domainReputation *DomainReputationTracker
 
 	// File access — always read-only.
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// User approval flow.
 	pendingMu        sync.Mutex
@@ -183,6 +184,7 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 		model:             DefaultGuardianModel,
 		activityPub:       cfg.ActivityPub,
 		fileAccess:        cfg.FileAccess,
+		workspaceViews:    cfg.WorkspaceViews,
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingApprovals:  make(map[string]chan ApprovalResult),
 		inFlight:          make(map[string]context.CancelFunc),
@@ -676,8 +678,9 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	g.registerInFlight(fwd.CorrelationID, cancel)
-	g.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	g.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer g.clearInFlight(fwd.CorrelationID)
 	defer cancel()
 

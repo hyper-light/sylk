@@ -74,7 +74,8 @@ type GlobalTester struct {
 	agentPod *agentshared.AgentPod
 
 	// File access (injected per-session at runtime).
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// Request lifecycle.
 	runCtx    context.Context
@@ -262,6 +263,11 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(shared.WriteTestSkill())
 	gt.skills.Register(shared.RunTestSuiteSkill())
 	gt.skills.Register(shared.DiagnoseFailureSkill(gt.diagEngine))
+	gt.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
+	gt.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
+	gt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
+	gt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
+	gt.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 
 	// Global-tester-specific skills.
 	gt.skills.Register(analyzeBatchSkill(gt))
@@ -414,6 +420,7 @@ func (gt *GlobalTester) unsubRegistry() error {
 // intents (Check, Recall) route to the full LLM tool loop with the testing
 // system prompt.
 func (gt *GlobalTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	switch fwd.Intent {
 	case guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
 		return gt.handleConversation(ctx, fwd)
@@ -489,7 +496,7 @@ func (gt *GlobalTester) handleBusRequest(msg *guide.Message) error {
 	agentshared.LogIncomingRequest(gt.steering.EventLogger(), fwd, gt.id)
 
 	reqCtx, cancel := context.WithCancel(gt.runCtx)
-	gt.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	gt.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
 	ctx := reqCtx
@@ -707,6 +714,11 @@ func (gt *GlobalTester) SetAgentPod(pod *agentshared.AgentPod) {
 // SetFileAccess injects the per-session file access layer.
 func (gt *GlobalTester) SetFileAccess(fa versioning.FileAccess) {
 	gt.fileAccess = fa
+}
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (gt *GlobalTester) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	gt.workspaceViews = views
 }
 
 // ExtractArchivableState returns state for handoff persistence.

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -156,6 +157,8 @@ type PipelineVFS struct {
 	blobStore      BlobStore
 	baseVersions   map[string]VersionID
 	workingContent map[string][]byte
+	visiblePaths   map[string]struct{}
+	baseReader     func(string) ([]byte, error)
 }
 
 type VersionStore interface {
@@ -175,6 +178,7 @@ func NewPipelineVFS(cfg VFSConfig, versionStore VersionStore, blobStore BlobStor
 		blobStore:      blobStore,
 		baseVersions:   make(map[string]VersionID),
 		workingContent: make(map[string][]byte),
+		visiblePaths:   make(map[string]struct{}),
 	}
 }
 
@@ -205,6 +209,21 @@ func (v *PipelineVFS) readContent(absPath string) ([]byte, error) {
 
 	if content, ok := v.stagedContent[absPath]; ok {
 		return cloneBytes(content), nil
+	}
+
+	if content, ok := v.workingContent[absPath]; ok {
+		return cloneBytes(content), nil
+	}
+
+	if v.baseReader != nil {
+		content, err := v.baseReader(absPath)
+		if err == nil {
+			return cloneBytes(content), nil
+		}
+		if errors.Is(err, ErrFileNotFound) || os.IsNotExist(err) {
+			return nil, ErrFileNotFound
+		}
+		return nil, err
 	}
 
 	return v.readFromDisk(absPath)
@@ -270,9 +289,9 @@ func (v *PipelineVFS) stageWrite(absPath string, content []byte) error {
 	baseVersion := v.getBaseVersion(absPath)
 
 	contentHash := ComputeContentHash(content)
-	sanitizedContent := v.sanitizeContent(absPath, content)
-
-	v.stagedContent[absPath] = cloneBytes(sanitizedContent)
+	v.stagedContent[absPath] = cloneBytes(content)
+	delete(v.deletedPaths, absPath)
+	v.visiblePaths[absPath] = struct{}{}
 	v.modifications[absPath] = &FileModification{
 		OriginalPath: absPath,
 		StagingPath:  v.getStagingPath(absPath),
@@ -298,11 +317,28 @@ func (v *PipelineVFS) determineWriteOp(absPath string) (FileOp, []byte) {
 		return FileOpModify, nil
 	}
 
-	existing, err := v.readFromDisk(absPath)
+	existing, err := v.readExistingContent(absPath)
 	if err == ErrFileNotFound {
 		return FileOpCreate, nil
 	}
 	return FileOpModify, existing
+}
+
+func (v *PipelineVFS) readExistingContent(absPath string) ([]byte, error) {
+	if content, ok := v.workingContent[absPath]; ok {
+		return cloneBytes(content), nil
+	}
+	if v.baseReader != nil {
+		content, err := v.baseReader(absPath)
+		if err == nil {
+			return cloneBytes(content), nil
+		}
+		if errors.Is(err, ErrFileNotFound) || os.IsNotExist(err) {
+			return nil, ErrFileNotFound
+		}
+		return nil, err
+	}
+	return v.readFromDisk(absPath)
 }
 
 func (v *PipelineVFS) getBaseVersion(absPath string) VersionID {
@@ -371,6 +407,7 @@ func (v *PipelineVFS) stageDelete(absPath string) error {
 	baseVersion := v.getBaseVersion(absPath)
 
 	v.deletedPaths[absPath] = true
+	v.visiblePaths[absPath] = struct{}{}
 	v.modifications[absPath] = &FileModification{
 		OriginalPath: absPath,
 		Operation:    FileOpDelete,
@@ -389,7 +426,7 @@ func (v *PipelineVFS) getDeleteContent(absPath string) ([]byte, error) {
 		return content, nil
 	}
 
-	existing, err := v.readFromDisk(absPath)
+	existing, err := v.readExistingContent(absPath)
 	if err != nil {
 		return nil, err
 	}
@@ -421,6 +458,21 @@ func (v *PipelineVFS) fileExists(absPath string) (bool, error) {
 		return true, nil
 	}
 
+	if _, ok := v.workingContent[absPath]; ok {
+		return true, nil
+	}
+
+	if _, ok := v.visiblePaths[absPath]; ok && v.baseReader != nil {
+		_, err := v.baseReader(absPath)
+		if err == nil {
+			return true, nil
+		}
+		if errors.Is(err, ErrFileNotFound) || os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
 	return v.existsOnDisk(absPath)
 }
 
@@ -446,6 +498,10 @@ func (v *PipelineVFS) List(ctx context.Context, dir string) ([]string, error) {
 	absDir, err := v.resolvePath(dir)
 	if err != nil {
 		return nil, err
+	}
+
+	if v.hasSparseWorkspace() {
+		return v.listVisibleEntries(absDir), nil
 	}
 
 	files, err := v.listDiskFiles(absDir)
@@ -494,6 +550,55 @@ func (v *PipelineVFS) addStagedFiles(files []string, absDir string) []string {
 		}
 	}
 	return files
+}
+
+func (v *PipelineVFS) hasSparseWorkspace() bool {
+	return len(v.config.AllowedPaths) > 0
+}
+
+func (v *PipelineVFS) listVisibleEntries(absDir string) []string {
+	seen := make(map[string]struct{})
+	files := make([]string, 0, len(v.visiblePaths)+len(v.stagedContent))
+	for _, absPath := range v.visibleCandidatePathsLocked() {
+		if v.deletedPaths[absPath] {
+			continue
+		}
+		rel, err := filepath.Rel(absDir, absPath)
+		if err != nil || rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		name := rel
+		if idx := strings.IndexRune(rel, filepath.Separator); idx >= 0 {
+			name = rel[:idx]
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		files = append(files, name)
+	}
+	slices.Sort(files)
+	return files
+}
+
+func (v *PipelineVFS) visibleCandidatePathsLocked() []string {
+	paths := make([]string, 0, len(v.visiblePaths)+len(v.stagedContent))
+	seen := make(map[string]struct{}, len(v.visiblePaths)+len(v.stagedContent))
+	for path := range v.visiblePaths {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	for path := range v.stagedContent {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
 }
 
 func containsString(slice []string, s string) bool {
@@ -640,6 +745,112 @@ func (v *PipelineVFS) GetSessionID() SessionID {
 	return v.config.SessionID
 }
 
+// AllowedPaths returns the normalized sparse workspace bounds for this VFS.
+func (v *PipelineVFS) AllowedPaths() []string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if len(v.config.AllowedPaths) == 0 {
+		return nil
+	}
+	out := make([]string, len(v.config.AllowedPaths))
+	copy(out, v.config.AllowedPaths)
+	return out
+}
+
+// VisiblePaths returns tracked visible file paths under root. Paths are
+// absolute and reflect seeded workspace files plus staged additions.
+func (v *PipelineVFS) VisiblePaths(root string) []string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	if root == "" {
+		root = v.config.WorkingDir
+	}
+	if !filepath.IsAbs(root) {
+		root = filepath.Join(v.config.WorkingDir, root)
+	}
+	root = filepath.Clean(root)
+
+	paths := make([]string, 0, len(v.visiblePaths)+len(v.stagedContent))
+	for _, absPath := range v.visibleCandidatePathsLocked() {
+		if v.deletedPaths[absPath] {
+			continue
+		}
+		if !isUnderPath(absPath, root) {
+			continue
+		}
+		paths = append(paths, absPath)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// RegisterVisiblePath records a path as part of this pipeline's sparse
+// workspace even if the file does not yet exist.
+func (v *PipelineVFS) RegisterVisiblePath(path string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if path == "" {
+		return
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(v.config.WorkingDir, path)
+	}
+	v.visiblePaths[filepath.Clean(path)] = struct{}{}
+}
+
+// SeedFile primes this pipeline with a base snapshot from the session-global
+// overlay so reads stay inside in-memory session truth.
+func (v *PipelineVFS) SeedFile(path string, content []byte) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if path == "" {
+		return
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(v.config.WorkingDir, path)
+	}
+	path = filepath.Clean(path)
+	v.visiblePaths[path] = struct{}{}
+	v.workingContent[path] = cloneBytes(content)
+}
+
+// SetBaseReader installs the authoritative base reader used for sparse
+// workspace reads when a tracked file is not locally staged.
+func (v *PipelineVFS) SetBaseReader(reader func(string) ([]byte, error)) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.baseReader = reader
+}
+
+// KnownFileCount returns the number of tracked visible paths in this VFS.
+func (v *PipelineVFS) KnownFileCount() int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return len(v.visibleCandidatePathsLocked())
+}
+
+// HasVisibleDescendant reports whether path has any tracked visible children.
+func (v *PipelineVFS) HasVisibleDescendant(path string) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(v.config.WorkingDir, path)
+	}
+	path = filepath.Clean(path)
+	prefix := path + string(filepath.Separator)
+	for _, candidate := range v.visibleCandidatePathsLocked() {
+		if v.deletedPaths[candidate] {
+			continue
+		}
+		if strings.HasPrefix(candidate, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // ResetOverlay clears all staged content, deleted paths, modifications,
 // base versions, and working content. Used after a disk flush when the
 // overlay is no longer needed (disk is source of truth).
@@ -652,6 +863,7 @@ func (v *PipelineVFS) ResetOverlay() {
 	v.modifications = make(map[string]*FileModification)
 	v.baseVersions = make(map[string]VersionID)
 	v.workingContent = make(map[string][]byte)
+	v.visiblePaths = make(map[string]struct{})
 }
 
 // NewGlobalVFS creates a PipelineVFS for use as the session-scoped global overlay.
@@ -675,6 +887,7 @@ func (v *PipelineVFS) Close() error {
 	v.modifications = nil
 	v.workingContent = nil
 	v.baseVersions = nil
+	v.visiblePaths = nil
 
 	return nil
 }
@@ -762,6 +975,21 @@ func (tx *pipelineTx) readContent(absPath string) ([]byte, error) {
 		return cloneBytes(content), nil
 	}
 
+	if content, ok := tx.vfs.workingContent[absPath]; ok {
+		return cloneBytes(content), nil
+	}
+
+	if tx.vfs.baseReader != nil {
+		content, err := tx.vfs.baseReader(absPath)
+		if err == nil {
+			return cloneBytes(content), nil
+		}
+		if errors.Is(err, ErrFileNotFound) || os.IsNotExist(err) {
+			return nil, ErrFileNotFound
+		}
+		return nil, err
+	}
+
 	return tx.vfs.readFromDisk(absPath)
 }
 
@@ -783,6 +1011,7 @@ func (tx *pipelineTx) Write(ctx context.Context, path string, content []byte) er
 	}
 
 	delete(tx.deleted, absPath)
+	tx.vfs.visiblePaths[absPath] = struct{}{}
 	tx.staged[absPath] = cloneBytes(content)
 	return nil
 }
@@ -805,6 +1034,7 @@ func (tx *pipelineTx) Delete(ctx context.Context, path string) error {
 	}
 
 	delete(tx.staged, absPath)
+	tx.vfs.visiblePaths[absPath] = struct{}{}
 	tx.deleted[absPath] = true
 	return nil
 }

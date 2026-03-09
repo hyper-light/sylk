@@ -27,9 +27,10 @@ const (
 type continuationStatus string
 
 const (
-	continuationStatusPending   continuationStatus = "pending"
-	continuationStatusCompleted continuationStatus = "completed"
-	continuationStatusFailed    continuationStatus = "failed"
+	continuationStatusPending    continuationStatus = "pending"
+	continuationStatusProcessing continuationStatus = "processing"
+	continuationStatusCompleted  continuationStatus = "completed"
+	continuationStatusFailed     continuationStatus = "failed"
 )
 
 type ArchitectControlStore struct {
@@ -246,6 +247,65 @@ func (s *ArchitectControlStore) GetContinuationByResponseCorrelation(correlation
 	return row.toContinuation(), nil
 }
 
+func (s *ArchitectControlStore) ClaimPendingContinuationByResponseCorrelation(correlationID string) (*ArchitectContinuation, error) {
+	if s == nil || s.db == nil || correlationID == "" {
+		return nil, nil
+	}
+
+	var claimed *ArchitectContinuation
+	err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
+		row := new(architectContinuationRow)
+		if err := tx.NewSelect().
+			Model(row).
+			Where("response_correlation_id = ?", correlationID).
+			Limit(1).
+			Scan(ctx); err != nil {
+			if err == sql.ErrNoRows {
+				return nil
+			}
+			return err
+		}
+		if continuationStatus(row.State) != continuationStatusPending {
+			return nil
+		}
+
+		res, err := tx.NewUpdate().
+			Model((*architectContinuationRow)(nil)).
+			Set("state = ?", string(continuationStatusProcessing)).
+			Where("continuation_id = ?", row.ContinuationID).
+			Where("state = ?", string(continuationStatusPending)).
+			Returning("").
+			Exec(ctx)
+		if err != nil {
+			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return nil
+		}
+
+		if err := insertContinuationEvent(ctx, tx, newArchitectContinuationEventRow(
+			row.ContinuationID,
+			string(continuationStatusProcessing),
+			"claimed",
+			"",
+		)); err != nil {
+			return err
+		}
+
+		row.State = string(continuationStatusProcessing)
+		claimed = row.toContinuation()
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("architect control store: claim continuation: %w", err)
+	}
+	return claimed, nil
+}
+
 func (s *ArchitectControlStore) CompleteContinuation(
 	record *ArchitectContinuation,
 	state continuationStatus,
@@ -268,17 +328,25 @@ func (s *ArchitectControlStore) CompleteContinuation(
 	event := newArchitectContinuationEventRow(record.ID, string(state), note, responseJSON)
 
 	if err := s.db.RunInWriteTx(context.Background(), func(ctx context.Context, tx bun.Tx) error {
-		_, err := tx.NewUpdate().
+		res, err := tx.NewUpdate().
 			Model((*architectContinuationRow)(nil)).
 			Set("state = ?", string(state)).
 			Set("response_json = ?", nullableString(record.ResponseJSON)).
 			Set("error_text = ?", nullableString(record.ErrorText)).
 			Set("completed_at = ?", nullableTimePtr(record.CompletedAt)).
 			Where("continuation_id = ?", record.ID).
+			Where("state IN (?)", bun.In([]string{string(continuationStatusPending), string(continuationStatusProcessing)})).
 			Returning("").
 			Exec(ctx)
 		if err != nil {
 			return err
+		}
+		rowsAffected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return nil
 		}
 		return insertContinuationEvent(ctx, tx, event)
 	}); err != nil {

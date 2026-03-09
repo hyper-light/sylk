@@ -1,6 +1,7 @@
 package versioning
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -9,15 +10,15 @@ import (
 const DefaultMergeBuffer = 64
 
 var (
-	ErrMergePipeClosed         = errors.New("merge pipe is closed")
-	ErrMergePipelineNotFound   = errors.New("pipeline not registered with merge pipe")
-	ErrMergePipelineExists     = errors.New("pipeline already registered")
+	ErrMergePipeClosed       = errors.New("merge pipe is closed")
+	ErrMergePipelineNotFound = errors.New("pipeline not registered with merge pipe")
+	ErrMergePipelineExists   = errors.New("pipeline already registered")
 )
 
 // MergePipeConfig configures a MergePipe.
 type MergePipeConfig struct {
 	GlobalVFS   *PipelineVFS
-	WAL         *VersionedWAL
+	WAL         SemanticWAL
 	OTEngine    OTEngine
 	Resolver    ConflictResolver
 	MergeBuffer int // channel capacity, default DefaultMergeBuffer
@@ -29,7 +30,7 @@ type MergePipeConfig struct {
 type MergePipe struct {
 	mu        sync.Mutex
 	globalVFS *PipelineVFS
-	wal       *VersionedWAL
+	wal       SemanticWAL
 	ot        OTEngine
 	resolver  ConflictResolver
 	pipelines map[string]pipelineReg
@@ -86,6 +87,11 @@ func (mp *MergePipe) Start() {
 
 // RegisterPipeline records the current WAL version as the pipeline's base.
 func (mp *MergePipe) RegisterPipeline(pipelineID string) error {
+	return mp.RegisterPipelineAt(pipelineID, mp.wal.CurrentVersion())
+}
+
+// RegisterPipelineAt records an explicit base version for a pipeline.
+func (mp *MergePipe) RegisterPipelineAt(pipelineID string, base SemanticVersion) error {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
@@ -98,7 +104,7 @@ func (mp *MergePipe) RegisterPipeline(pipelineID string) error {
 	}
 
 	mp.pipelines[pipelineID] = pipelineReg{
-		baseVersion: mp.wal.CurrentVersion(),
+		baseVersion: base,
 	}
 	return nil
 }
@@ -249,18 +255,17 @@ func (mp *MergePipe) transformMods(ctx context.Context, mods []FileModification,
 	// Transform pipeline ops against accumulated ops.
 	transformed, err := mp.ot.TransformBatch(pipeOps, accOps)
 	if err != nil {
-		// On conflict, try resolver.
-		return mp.resolveAndApply(ctx, mods, accOps)
+		return mp.resolveAndApply(ctx, mods, accOps, err)
 	}
 
 	return opsToMods(transformed, mods), nil
 }
 
-func (mp *MergePipe) resolveAndApply(ctx context.Context, mods []FileModification, accOps []*Operation) ([]FileModification, error) {
-	// Fallback: apply mods as-is (resolver accepted first option via NoOpConflictResolver).
+func (mp *MergePipe) resolveAndApply(ctx context.Context, mods []FileModification, accOps []*Operation, transformErr error) ([]FileModification, error) {
 	_ = ctx
+	_ = mods
 	_ = accOps
-	return mods, nil
+	return nil, transformErr
 }
 
 // applyToGlobal writes transformed modifications to the global VFS and builds WAL deltas.
@@ -268,6 +273,10 @@ func (mp *MergePipe) applyToGlobal(ctx context.Context, mods []FileModification)
 	deltas := make([]WALFileDelta, 0, len(mods))
 
 	for _, m := range mods {
+		if err := mp.validateModAgainstGlobal(ctx, m); err != nil {
+			return nil, err
+		}
+
 		old := mp.readOldContent(ctx, m.OriginalPath)
 		delta := WALFileDelta{
 			Path:       m.OriginalPath,
@@ -283,6 +292,55 @@ func (mp *MergePipe) applyToGlobal(ctx context.Context, mods []FileModification)
 	}
 
 	return deltas, nil
+}
+
+func (mp *MergePipe) validateModAgainstGlobal(ctx context.Context, m FileModification) error {
+	current, err := mp.globalVFS.Read(ctx, m.OriginalPath)
+	currentExists := err == nil
+	if err != nil && !errors.Is(err, ErrFileNotFound) {
+		return err
+	}
+
+	switch m.Operation {
+	case FileOpCreate:
+		if currentExists {
+			return &ConflictError{Conflict: buildMergeConflict(m, current)}
+		}
+	case FileOpDelete, FileOpModify:
+		if !currentExists {
+			return &ConflictError{Conflict: buildMergeConflict(m, nil)}
+		}
+		if !bytes.Equal(current, m.OldContent) {
+			return &ConflictError{Conflict: buildMergeConflict(m, current)}
+		}
+	}
+	return nil
+}
+
+func buildMergeConflict(m FileModification, current []byte) *Conflict {
+	ours := modToOperation(m)
+	currentOp := NewOperation(
+		m.BaseVersion,
+		m.OriginalPath,
+		NewOffsetTarget(0, len(current)),
+		OpReplace,
+		current,
+		m.OldContent,
+		"",
+		"",
+		"",
+		NewVectorClock(),
+	)
+	return &Conflict{
+		Op1:         ours,
+		Op2:         &currentOp,
+		Type:        ConflictTypeOverlappingEdit,
+		Description: "global file changed since pipeline base snapshot",
+		Resolutions: []Resolution{
+			{Label: "Keep pipeline change", Description: "Apply the pipeline modification", ResultOp: ours},
+			{Label: "Keep current global", Description: "Preserve the newer global content", ResultOp: &currentOp},
+		},
+	}
 }
 
 func (mp *MergePipe) readOldContent(ctx context.Context, path string) []byte {

@@ -120,6 +120,10 @@ func NewDefaultRuntime(cfg DefaultRuntimeConfig) *DefaultRuntime {
 // CreateContainer creates a container from a spec. Runs admission control,
 // quota checks, creates the agent, GoroutineScope, and SecurityContext.
 func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpec) (*Container, error) {
+	return rt.createContainer(ctx, spec, "")
+}
+
+func (rt *DefaultRuntime) createContainer(ctx context.Context, spec ContainerSpec, podID PodID) (*Container, error) {
 	if rt.closed.Load() {
 		return nil, ErrRuntimeClosed
 	}
@@ -134,7 +138,7 @@ func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpe
 
 	agentStart := time.Now()
 	runtimeFileLog().Info("DEBUG: runtime_create_agent_start", "agent_type", spec.AgentType)
-	agent, err := rt.createAgentForSpec(ctx, &spec)
+	agent, err := rt.createAgentForSpec(WithCreationContext(ctx, spec, podID), &spec)
 	runtimeFileLog().Info("DEBUG: runtime_create_agent_done",
 		"agent_type", spec.AgentType,
 		"elapsed_ms", time.Since(agentStart).Milliseconds(),
@@ -159,13 +163,23 @@ func (rt *DefaultRuntime) CreateContainer(ctx context.Context, spec ContainerSpe
 		Scope:  scope,
 		SecCtx: secCtx,
 		Agent:  agent,
+		PodID:  podID,
 	})
 
 	if rt.quota != nil {
 		rt.quota.Reserve(&spec)
 	}
 
-	return c, rt.registry.Register(c)
+	if err := rt.registry.Register(c); err != nil {
+		if rt.quota != nil {
+			rt.quota.Release(&spec)
+		}
+		if rt.budget != nil {
+			rt.budget.UnregisterAgent(string(c.ID()))
+		}
+		return nil, err
+	}
+	return c, nil
 }
 
 func (rt *DefaultRuntime) admitSpec(spec *ContainerSpec) error {
@@ -274,28 +288,85 @@ func (rt *DefaultRuntime) CreateContainersForPod(ctx context.Context, podID PodI
 	if rt.closed.Load() {
 		return nil, ErrRuntimeClosed
 	}
+	if rt.registry != nil {
+		rt.registry.RegisterPod(podID)
+	}
 	containers := make([]*Container, 0, len(specs))
 	for i := range specs {
-		c, err := rt.CreateContainer(ctx, specs[i])
+		c, err := rt.createContainer(ctx, specs[i], podID)
 		if err != nil {
 			// Clean up already-created containers on failure.
 			for _, created := range containers {
 				_ = rt.RemoveContainer(ctx, created)
 			}
+			if rt.registry != nil {
+				rt.registry.UnregisterPod(podID)
+			}
 			return nil, fmt.Errorf("container %q: %w", specs[i].Name, err)
 		}
-		c.SetPodID(podID)
 		containers = append(containers, c)
 	}
 	return containers, nil
 }
 
-// StartContainers starts multiple containers. Stops and returns error on first failure.
+// StartContainers starts multiple containers with role ordering and rollback.
 func (rt *DefaultRuntime) StartContainers(ctx context.Context, containers []*Container) error {
+	if len(containers) == 0 {
+		return nil
+	}
+
+	var initContainers []*Container
+	var mainContainers []*Container
 	for _, c := range containers {
-		if err := rt.StartContainer(ctx, c); err != nil {
-			return fmt.Errorf("start %q: %w", c.Spec().Name, err)
+		if c == nil {
+			continue
 		}
+		if c.Spec().Role == RoleInit {
+			initContainers = append(initContainers, c)
+			continue
+		}
+		mainContainers = append(mainContainers, c)
+	}
+
+	started := make([]*Container, 0, len(containers))
+	rollback := func() {
+		for i := len(started) - 1; i >= 0; i-- {
+			_ = rt.StopContainer(ctx, started[i])
+		}
+	}
+
+	for _, c := range initContainers {
+		if err := rt.StartContainer(ctx, c); err != nil {
+			rollback()
+			return fmt.Errorf("start init %q: %w", c.Spec().Name, err)
+		}
+		started = append(started, c)
+	}
+
+	type startResult struct {
+		container *Container
+		err       error
+	}
+	results := make(chan startResult, len(mainContainers))
+	var wg sync.WaitGroup
+	for _, c := range mainContainers {
+		ctr := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- startResult{container: ctr, err: rt.StartContainer(ctx, ctr)}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	for result := range results {
+		if result.err != nil {
+			rollback()
+			return fmt.Errorf("start %q: %w", result.container.Spec().Name, result.err)
+		}
+		started = append(started, result.container)
 	}
 	return nil
 }

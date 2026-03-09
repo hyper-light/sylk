@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type PipelineTask struct {
 	DAGID         string         `json:"dag_id"`
 	TaskID        string         `json:"task_id"`
 	AgentType     string         `json:"agent_type"`
+	TargetAgentID string         `json:"target_agent_id,omitempty"`
 	Prompt        string         `json:"prompt"`
 	Context       map[string]any `json:"context,omitempty"`
 	ParentResults map[string]any `json:"parent_results,omitempty"`
@@ -96,7 +98,7 @@ func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}
 	req := &guide.RouteRequest{
 		CorrelationID:   corrID,
 		Input:           encodeTaskInput(task),
-		TargetAgentID:   task.AgentType,
+		TargetAgentID:   routeTargetAgentID(task),
 		ExplicitTarget:  true,
 		SourceAgentID:   r.agentID,
 		SourceAgentName: "orchestrator",
@@ -142,6 +144,9 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	if msg == nil || msg.CorrelationID == "" {
 		return false
 	}
+	if !isTerminalRouteMessage(msg) {
+		return false
+	}
 
 	r.pendingMu.Lock()
 	pr := r.pending[msg.CorrelationID]
@@ -168,6 +173,14 @@ func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message)
 		r.publishFailure(task, fmt.Errorf("route cancelled for node %s", task.NodeID))
 		return
 	}
+	if msg.Type == guide.MessageTypeError {
+		errText, ok := msg.GetError()
+		if !ok || errText == "" {
+			errText = fmt.Sprintf("route error for node %s", task.NodeID)
+		}
+		r.publishFailure(task, fmt.Errorf("%s", errText))
+		return
+	}
 	resp, ok := msg.GetRouteResponse()
 	if !ok || resp == nil {
 		r.publishFailure(task, fmt.Errorf("invalid route response for node %s", task.NodeID))
@@ -179,6 +192,18 @@ func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message)
 	}
 
 	r.publishSucceeded(task, resp.Data)
+}
+
+func isTerminalRouteMessage(msg *guide.Message) bool {
+	if msg == nil {
+		return false
+	}
+	switch msg.Type {
+	case guide.MessageTypeResponse, guide.MessageTypeError:
+		return true
+	default:
+		return false
+	}
 }
 
 // CancelAllPending cancels all in-flight pipeline routes by publishing a
@@ -209,7 +234,7 @@ func (r *TaskRouter) CancelAllPending(reason string) {
 		action := &guide.ActionRequest{
 			CorrelationID: corrID,
 			SourceAgentID: r.agentID,
-			TargetAgentID: pr.task.AgentType,
+			TargetAgentID: routeTargetAgentID(pr.task),
 			Action:        "cancel",
 			Data: map[string]any{
 				"correlation_id": corrID,
@@ -263,7 +288,7 @@ func (r *TaskRouter) publishPipelineUpdate(task *PipelineTask, status string, ou
 		DAGID:     task.DAGID,
 		NodeID:    task.NodeID,
 		TaskID:    task.TaskID,
-		AgentID:   r.agentID,
+		AgentID:   routeTargetAgentID(task),
 		AgentType: task.AgentType,
 		Status:    status,
 		Progress:  1.0,
@@ -341,41 +366,41 @@ type CompoundPipelineTask struct {
 	PrimaryResult     *dag.NodeResult       `json:"-"`
 }
 
+// RouteCompoundWithLifecycle executes a compound task in a tracked goroutine
+// and emits a single pipeline update for the parent node.
+func (r *TaskRouter) RouteCompoundWithLifecycle(ctx context.Context, task *CompoundPipelineTask, done <-chan struct{}) error {
+	if task == nil {
+		return fmt.Errorf("compound task cannot be nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return r.scope.Go("route-compound-"+task.NodeID, 0, func(routeCtx context.Context) error {
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		result, err := r.RouteCompound(routeCtx, task)
+		if err != nil {
+			r.publishFailure(&task.PipelineTask, err)
+			return nil
+		}
+		r.publishSucceeded(&task.PipelineTask, compoundResultOutput(result))
+		return nil
+	})
+}
+
 // RouteCompound dispatches a compound pipeline task: first to the primary
 // agent, then to each co-agent for review. In adversarial mode, co-agents
 // can push back for bounded revision rounds.
 func (r *TaskRouter) RouteCompound(ctx context.Context, task *CompoundPipelineTask) (*dag.CompoundNodeResult, error) {
-	// Step 1: Route to primary agent
-	primaryCh := make(chan *guide.Message, 1)
-	corrID := "pipe_" + uuid.NewString()[:12]
-
-	r.pendingMu.Lock()
-	r.pending[corrID] = &pendingRoute{task: &task.PipelineTask, ch: primaryCh}
-	r.pendingMu.Unlock()
-	defer r.clearPending(corrID)
-
-	req := &guide.RouteRequest{
-		CorrelationID:   corrID,
-		Input:           encodeTaskInput(&task.PipelineTask),
-		TargetAgentID:   task.AgentType,
-		ExplicitTarget:  true,
-		SourceAgentID:   r.agentID,
-		SourceAgentName: "orchestrator",
-		SessionID:       task.SessionID,
-		Timestamp:       time.Now(),
-		Metadata:        extractDispatchMetadata(task.Context),
-	}
-	msg := guide.NewRequestMessage(generateMessageID(), req)
-	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+	primaryMsg, err := r.routeSingle(ctx, &task.PipelineTask)
+	if err != nil {
 		return nil, fmt.Errorf("route compound primary: %w", err)
-	}
-
-	// Wait for primary result
-	var primaryMsg *guide.Message
-	select {
-	case primaryMsg = <-primaryCh:
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
 
 	if primaryMsg == nil {
@@ -462,41 +487,15 @@ func (r *TaskRouter) routeCoAgent(
 	primaryOutput any,
 	round int,
 ) (*dag.NodeResult, error) {
-	corrID := "co_" + uuid.NewString()[:12]
-	ch := make(chan *guide.Message, 1)
-
-	r.pendingMu.Lock()
-	r.pending[corrID] = &pendingRoute{task: &task.PipelineTask, ch: ch}
-	r.pendingMu.Unlock()
-	defer r.clearPending(corrID)
-
-	coInput, _ := json.Marshal(map[string]any{
-		"review_request":  true,
-		"primary_output":  primaryOutput,
-		"original_prompt": task.Prompt,
-		"round":           round,
-	})
-
-	req := &guide.RouteRequest{
-		CorrelationID:   corrID,
-		Input:           string(coInput),
-		TargetAgentID:   coAgent,
-		ExplicitTarget:  true,
-		SourceAgentID:   r.agentID,
-		SourceAgentName: "orchestrator",
-		SessionID:       task.SessionID,
-		Timestamp:       time.Now(),
-	}
-	msg := guide.NewRequestMessage(generateMessageID(), req)
-	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+	respMsg, err := r.routeSingle(ctx, r.buildCoAgentTask(task, coAgent, primaryOutput, round))
+	if err != nil {
 		return nil, fmt.Errorf("route co-agent %s: %w", coAgent, err)
 	}
 
-	select {
-	case respMsg := <-ch:
-		if respMsg == nil {
-			return &dag.NodeResult{State: dag.NodeStateFailed, Error: fmt.Errorf("co-agent route cancelled")}, nil
-		}
+	switch {
+	case respMsg == nil:
+		return &dag.NodeResult{State: dag.NodeStateFailed, Error: fmt.Errorf("co-agent route cancelled")}, nil
+	default:
 		coResp, ok := respMsg.GetRouteResponse()
 		if !ok || coResp == nil {
 			return &dag.NodeResult{State: dag.NodeStateFailed, Error: fmt.Errorf("invalid co-agent response")}, nil
@@ -511,9 +510,118 @@ func (r *TaskRouter) routeCoAgent(
 			Output: coResp.Data,
 			Error:  parseCoError(coResp),
 		}, nil
+	}
+}
+
+func (r *TaskRouter) routeSingle(ctx context.Context, task *PipelineTask) (*guide.Message, error) {
+	if task == nil {
+		return nil, fmt.Errorf("pipeline task cannot be nil")
+	}
+	corrID := "pipe_" + uuid.NewString()[:12]
+	waitCh := r.registerPending(corrID, task)
+	defer r.clearPending(corrID)
+
+	req := &guide.RouteRequest{
+		CorrelationID:   corrID,
+		Input:           encodeTaskInput(task),
+		TargetAgentID:   routeTargetAgentID(task),
+		ExplicitTarget:  true,
+		SourceAgentID:   r.agentID,
+		SourceAgentName: "orchestrator",
+		SessionID:       task.SessionID,
+		Timestamp:       time.Now(),
+		Metadata:        extractDispatchMetadata(task.Context),
+	}
+	msg := guide.NewRequestMessage(generateMessageID(), req)
+	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
+		return nil, err
+	}
+
+	select {
+	case resp := <-waitCh:
+		return resp, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func (r *TaskRouter) buildCoAgentTask(task *CompoundPipelineTask, coAgent string, primaryOutput any, round int) *PipelineTask {
+	ctx := make(map[string]any, len(task.Context)+4)
+	for k, v := range task.Context {
+		ctx[k] = v
+	}
+	ctx["compound_role"] = "co_agent"
+	ctx["primary_agent_type"] = task.AgentType
+	ctx["review_round"] = round + 1
+	ctx["agent_type"] = coAgent
+
+	parentResults := make(map[string]any, len(task.ParentResults)+1)
+	for k, v := range task.ParentResults {
+		parentResults[k] = v
+	}
+	parentResults[task.NodeID] = map[string]any{
+		"state":  dag.NodeStateSucceeded.String(),
+		"output": primaryOutput,
+	}
+
+	return &PipelineTask{
+		NodeID:        task.NodeID,
+		DAGID:         task.DAGID,
+		TaskID:        task.TaskID,
+		AgentType:     coAgent,
+		TargetAgentID: pipelineWorkerTargetAgentID(task.TaskID, coAgent),
+		Prompt:        scopedCompoundPrompt(task.Context, coAgent, task.Prompt),
+		Context:       ctx,
+		ParentResults: parentResults,
+		SessionID:     task.SessionID,
+	}
+}
+
+func scopedCompoundPrompt(ctx map[string]any, agentType, fallback string) string {
+	if ctx != nil {
+		if scoped, ok := ctx["agent_prompts"].(map[string]string); ok {
+			if prompt := strings.TrimSpace(scoped[agentType]); prompt != "" {
+				return prompt
+			}
+		}
+		if scoped, ok := ctx["agent_prompts"].(map[string]any); ok {
+			if prompt, _ := scoped[agentType].(string); strings.TrimSpace(prompt) != "" {
+				return strings.TrimSpace(prompt)
+			}
+		}
+	}
+	return fallback
+}
+
+func compoundResultOutput(result *dag.CompoundNodeResult) map[string]any {
+	if result == nil {
+		return nil
+	}
+	output := map[string]any{
+		"consensus":          result.Consensus,
+		"review_rounds_used": result.ReviewRoundsUsed,
+	}
+	if result.PrimaryResult != nil {
+		output["primary_output"] = result.PrimaryResult.Output
+	}
+	if len(result.CoResults) > 0 {
+		coResults := make(map[string]any, len(result.CoResults))
+		for agentType, res := range result.CoResults {
+			if res == nil {
+				continue
+			}
+			entry := map[string]any{"state": res.State.String()}
+			if res.Output != nil {
+				entry["output"] = res.Output
+			}
+			if res.Error != nil {
+				entry["error"] = res.Error.Error()
+			}
+			coResults[agentType] = entry
+		}
+		output["co_results"] = coResults
+	}
+	return output
 }
 
 func parseCoError(resp *guide.RouteResponse) error {
@@ -521,4 +629,14 @@ func parseCoError(resp *guide.RouteResponse) error {
 		return nil
 	}
 	return fmt.Errorf("%s", resp.Error)
+}
+
+func routeTargetAgentID(task *PipelineTask) string {
+	if task == nil {
+		return ""
+	}
+	if target := strings.TrimSpace(task.TargetAgentID); target != "" {
+		return target
+	}
+	return strings.TrimSpace(task.AgentType)
 }

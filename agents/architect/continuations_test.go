@@ -272,3 +272,80 @@ func TestSubmitRequirementsResearchHandoff_QueuesAcademicDelegation(t *testing.T
 		t.Fatalf("expected user-facing handoff metadata, got %+v", req.Metadata)
 	}
 }
+
+func TestHandleContinuationResponse_IgnoresStreamMessages(t *testing.T) {
+	a := testArchitectWithControlStore(t, nil)
+	record := &ArchitectContinuation{
+		ID:                    "cont-stream",
+		Kind:                  continuationKindAcademicHandoff,
+		State:                 continuationStatusPending,
+		SessionID:             "sess-1",
+		TargetAgentID:         "academic-1",
+		ResponseCorrelationID: "corr-stream",
+		RequestJSON:           `{"query":"clarify"}`,
+		CreatedAt:             time.Now().UTC(),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	msg := &guide.Message{
+		ID:            "stream-msg",
+		CorrelationID: "corr-stream",
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID: "corr-stream",
+		},
+	}
+	if err := a.handleContinuationResponse(msg); err != nil {
+		t.Fatalf("handleContinuationResponse(stream): %v", err)
+	}
+
+	stored, err := a.controlStore.GetContinuationByResponseCorrelation("corr-stream")
+	if err != nil {
+		t.Fatalf("load continuation: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("expected continuation to remain present")
+	}
+	if stored.State != continuationStatusPending {
+		t.Fatalf("state = %s, want pending", stored.State)
+	}
+}
+
+func TestHandleContinuationResponse_ErrorMessageFailsContinuation(t *testing.T) {
+	a := testArchitectWithControlStore(t, nil)
+	record := &ArchitectContinuation{
+		ID:                    "cont-error",
+		Kind:                  continuationKindAcademicHandoff,
+		State:                 continuationStatusPending,
+		SessionID:             "sess-1",
+		TargetAgentID:         "academic-1",
+		ResponseCorrelationID: "corr-error",
+		RequestJSON:           `{"query":"clarify"}`,
+		CreatedAt:             time.Now().UTC(),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	msg := guide.NewErrorMessage("", "corr-error", "guide", "route failed")
+	msg.CorrelationID = "corr-error"
+	if err := a.handleContinuationResponse(msg); err != nil {
+		t.Fatalf("handleContinuationResponse(error): %v", err)
+	}
+
+	stored, err := a.controlStore.GetContinuationByResponseCorrelation("corr-error")
+	if err != nil {
+		t.Fatalf("load continuation: %v", err)
+	}
+	if stored == nil {
+		t.Fatal("expected continuation to remain present")
+	}
+	if stored.State != continuationStatusFailed {
+		t.Fatalf("state = %s, want failed", stored.State)
+	}
+	if stored.ErrorText != "route failed" {
+		t.Fatalf("error_text = %q, want route failed", stored.ErrorText)
+	}
+}

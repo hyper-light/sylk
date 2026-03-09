@@ -18,7 +18,7 @@ type FlushResult struct {
 // DiskFlusherConfig configures a DiskFlusher.
 type DiskFlusherConfig struct {
 	GlobalVFS  *PipelineVFS
-	WAL        *VersionedWAL
+	WAL        SemanticWAL
 	WorkingDir string
 }
 
@@ -26,7 +26,7 @@ type DiskFlusherConfig struct {
 // WAL checkpoint entries (major version bumps).
 type DiskFlusher struct {
 	globalVFS  *PipelineVFS
-	wal        *VersionedWAL
+	wal        SemanticWAL
 	workingDir string
 }
 

@@ -21,6 +21,7 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -106,6 +107,8 @@ type Archivalist struct {
 
 	// Log ingest store: bounded per-agent ring buffers for cross-agent log querying.
 	logIngest *LogIngestStore
+
+	workspaceViews versioning.WorkspaceViewAccess
 }
 
 // Config holds configuration for the Archivalist agent
@@ -156,6 +159,10 @@ type Config struct {
 	EmbeddingsPath      string  // Path to embeddings database
 	QueryCacheSize      int     // Max cached queries (default: 10000)
 	SimilarityThreshold float64 // Query similarity threshold (default: 0.95)
+
+	// WorkspaceViews provides explicit disk/global/pipeline read access for
+	// session-memory grounding.
+	WorkspaceViews versioning.WorkspaceViewAccess
 }
 
 // New creates a new Archivalist agent with provider-based LLM.
@@ -199,6 +206,10 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
+		DefaultView:     versioning.WorkspaceViewGlobal,
+		IncludePipeline: true,
+	})
 	return cfg
 }
 
@@ -275,6 +286,7 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 		hooks:             hookRegistry,
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
+		workspaceViews:    cfg.WorkspaceViews,
 	}
 
 	a.steering.InitLazy("archivalist", cfg.ActivityPub)
@@ -635,7 +647,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 	// Request-scoped cancellable context.
 	reqCtx, cancel := context.WithCancel(a.runCtx)
 	a.registerRequestCancel(fwd.CorrelationID, cancel)
-	a.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
@@ -656,6 +668,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		AgentID:     a.id,
 		SessionID:   fwd.SessionID,
 	})
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
@@ -2552,6 +2565,11 @@ func (a *Archivalist) SetKnowledgeStore(ks *knowledge.KnowledgeStore) {
 	defer a.runMu.Unlock()
 	a.knowledgeStore = ks
 	a.queryCoordinator = ks.Coordinator()
+}
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (a *Archivalist) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	a.workspaceViews = views
 }
 
 // SwapModel implements container.ModelSwappable.

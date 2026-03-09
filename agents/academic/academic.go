@@ -22,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
@@ -97,6 +98,8 @@ type Academic struct {
 	// External fetch pipeline — wired via SetFetchPipeline after construction.
 	fetchPipeline *fetch.Pipeline
 
+	workspaceViews versioning.WorkspaceViewAccess
+
 	// Handoff integration
 	handoffBridge *handoff.HandoffBridge
 }
@@ -138,6 +141,10 @@ type Config struct {
 
 	// Logger
 	Logger *slog.Logger
+
+	// WorkspaceViews provides explicit disk/global/pipeline read access for
+	// codebase-aware research grounding.
+	WorkspaceViews versioning.WorkspaceViewAccess
 }
 
 // New creates a new Academic agent with the given LLM provider.
@@ -178,6 +185,7 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		outcomeHistory:    NewOutcomeHistory(cfg.OutcomeHistoryLimit),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
+		workspaceViews:    cfg.WorkspaceViews,
 	}
 
 	a.steering.InitLazy("academic", cfg.ActivityPub)
@@ -210,6 +218,10 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
 	}
+	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
+		DefaultView:     versioning.WorkspaceViewDisk,
+		IncludePipeline: true,
+	})
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
@@ -480,7 +492,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(a.runCtx)
 	a.registerRequestCancel(fwd.CorrelationID, cancel)
-	a.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer a.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
@@ -502,6 +514,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		AgentID:     "academic",
 		SessionID:   fwd.SessionID,
 	})
+	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
 	gov := shared.NewContextGovernor(a.config.Model, a.config.MaxOutputTokens, 0)
 	if a.handoffBridge != nil {
 		gov.OnBudgetExhausted = func(bctx context.Context) error {
@@ -1432,6 +1445,11 @@ func (a *Academic) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 // Called during Phase 3 wiring after Guardian and quarantine are ready.
 func (a *Academic) SetFetchPipeline(p *fetch.Pipeline) {
 	a.fetchPipeline = p
+}
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (a *Academic) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	a.workspaceViews = views
 }
 
 // ExtractArchivableState returns the agent's current state for handoff persistence.

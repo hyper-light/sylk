@@ -13,6 +13,7 @@ type mockVolume struct {
 	name     string
 	mounted  bool
 	fa       versioning.FileAccess
+	views    versioning.WorkspaceViewAccess
 	mountErr error
 }
 
@@ -36,6 +37,13 @@ func (v *mockVolume) FileAccess() versioning.FileAccess {
 		return nil
 	}
 	return v.fa
+}
+
+func (v *mockVolume) WorkspaceViews() versioning.WorkspaceViewAccess {
+	if !v.mounted {
+		return nil
+	}
+	return v.views
 }
 
 // --- tests ---

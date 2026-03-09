@@ -3,6 +3,8 @@ package shared
 import (
 	"strings"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/adalundhe/sylk/prompts"
 )
 
@@ -60,7 +62,10 @@ func GlobalTesterSystemPrompt() string {
 		TestPlanningStrategy + "\n\n" +
 		HarnessDesign + "\n\n" +
 		TesterSkillsPolicy + "\n\n" +
-		TesterGuardrails
+		TesterGuardrails + "\n\n" +
+		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
+			DefaultView: versioning.WorkspaceViewGlobal,
+		})
 }
 
 // TesterConversationSystemPrompt returns the system prompt for conversation mode.
@@ -69,6 +74,8 @@ func GlobalTesterSystemPrompt() string {
 // (gate prerequisite) are excluded so the LLM responds to direct user chat
 // without blocking on pipeline prerequisites.
 func TesterConversationSystemPrompt() string {
-	return strings.TrimSpace(TesterConversationPrompt)
+	return strings.TrimSpace(agentshared.AppendWorkspaceViewContext(
+		TesterConversationPrompt,
+		agentshared.WorkspacePromptOptions{DefaultView: versioning.WorkspaceViewGlobal},
+	))
 }
-

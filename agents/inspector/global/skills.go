@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
-	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (gi *GlobalInspector) registerCoreSkills() {
@@ -28,6 +31,11 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(shared.ReadFileSkill(faFunc))
 	gi.skills.Register(shared.GlobSkill(faFunc))
 	gi.skills.Register(shared.GrepSkill(faFunc))
+	gi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
+	gi.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
+	gi.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
+	gi.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
+	gi.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
 
 	// Global-specific skills.
 	gi.skills.Register(auditLayerSkill(gi))
@@ -51,12 +59,16 @@ func (gi *GlobalInspector) registerCoreSkills() {
 
 type globalInspectorDiag struct{ gi *GlobalInspector }
 
-func (d *globalInspectorDiag) AgentName() string  { return "inspector_global" }
-func (d *globalInspectorDiag) SessionID() string  { return d.gi.config.SessionID }
-func (d *globalInspectorDiag) LogsDir() string    { return agentShared.LogsDirForAgent(d.gi.steering.SessionDir(), "inspector_global") }
-func (d *globalInspectorDiag) EventLogger() *agentlog.SessionEventLogger { return d.gi.steering.EventLogger() }
-func (d *globalInspectorDiag) PeerLogsDirs() map[string]string           { return nil }
-func (d *globalInspectorDiag) RecoveryHints() []string                   { return nil }
+func (d *globalInspectorDiag) AgentName() string { return "inspector_global" }
+func (d *globalInspectorDiag) SessionID() string { return d.gi.config.SessionID }
+func (d *globalInspectorDiag) LogsDir() string {
+	return agentShared.LogsDirForAgent(d.gi.steering.SessionDir(), "inspector_global")
+}
+func (d *globalInspectorDiag) EventLogger() *agentlog.SessionEventLogger {
+	return d.gi.steering.EventLogger()
+}
+func (d *globalInspectorDiag) PeerLogsDirs() map[string]string { return nil }
+func (d *globalInspectorDiag) RecoveryHints() []string         { return nil }
 
 func (d *globalInspectorDiag) AgentSpecificDiagnostics() map[string]any {
 	return map[string]any{}
@@ -117,7 +129,7 @@ func validatePlanAdherenceSkill(_ *GlobalInspector) *skills.Skill {
 		Priority(100).
 		StringParam("plan_snapshot", "Serialized plan to validate against", true).
 		ArrayParam("implemented_tasks", "List of implemented task IDs", "string", false).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				PlanSnapshot     string   `json:"plan_snapshot"`
 				ImplementedTasks []string `json:"implemented_tasks"`
@@ -126,29 +138,30 @@ func validatePlanAdherenceSkill(_ *GlobalInspector) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			score := shared.PlanAdherenceScore{
-				Score:        1.0,
-				TasksCovered: params.ImplementedTasks,
-			}
+			score, parseErr := evaluatePlanAdherence(params.PlanSnapshot, params.ImplementedTasks)
 
-			return map[string]any{
+			result := map[string]any{
 				"score":         score.Score,
 				"tasks_covered": score.TasksCovered,
 				"tasks_missing": score.TasksMissing,
 				"deviations":    score.Deviations,
-			}, nil
+			}
+			if parseErr != nil {
+				result["parse_error"] = parseErr.Error()
+			}
+			return result, nil
 		}).
 		Build()
 }
 
-func crossReferenceChangesSkill(_ *GlobalInspector) *skills.Skill {
+func crossReferenceChangesSkill(gi *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("cross_reference_changes").
 		Description("Detect cross-file issues: interface mismatches, import cycles, type inconsistencies, shared state races.").
 		Domain("audit").
 		Keywords("cross-file", "interface", "import", "type", "race").
 		Priority(95).
 		ArrayParam("files", "Files to cross-reference", "string", true).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				Files []string `json:"files"`
 			}
@@ -156,12 +169,18 @@ func crossReferenceChangesSkill(_ *GlobalInspector) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			// Cross-file analysis is performed by the LLM reading files
-			// and reasoning about relationships. This skill provides structure.
-			return map[string]any{
+			result := map[string]any{
 				"files_analyzed":    len(params.Files),
 				"cross_file_issues": []shared.CrossFileIssue{},
-			}, nil
+			}
+			if gi != nil && gi.workspaceViews != nil && len(params.Files) > 0 {
+				if summary, err := gi.workspaceViews.SummarizePaths(ctx, params.Files, ""); err == nil {
+					result["workspace_summary"] = summary
+				} else {
+					result["workspace_summary_error"] = err.Error()
+				}
+			}
+			return result, nil
 		}).
 		Build()
 }
@@ -199,6 +218,110 @@ func gradeLayerQualitySkill(_ *GlobalInspector) *skills.Skill {
 			}, nil
 		}).
 		Build()
+}
+
+func evaluatePlanAdherence(planSnapshot string, implementedTasks []string) (shared.PlanAdherenceScore, error) {
+	expectedTasks, err := parsePlanTaskIDs(planSnapshot)
+	implemented := normalizeTaskIDs(implementedTasks)
+	score := shared.PlanAdherenceScore{
+		TasksCovered: make([]string, 0),
+		TasksMissing: make([]string, 0),
+		Deviations:   make([]string, 0),
+	}
+	if err != nil {
+		score.Deviations = append(score.Deviations, "unable to parse plan snapshot for adherence validation")
+		score.TasksCovered = implemented
+		sort.Strings(score.TasksCovered)
+		return score, err
+	}
+	if len(expectedTasks) == 0 {
+		score.TasksCovered = implemented
+		if len(implemented) > 0 {
+			score.Score = 1.0
+		}
+		return score, err
+	}
+	implementedSet := make(map[string]struct{}, len(implemented))
+	for _, taskID := range implemented {
+		implementedSet[taskID] = struct{}{}
+	}
+	for _, taskID := range expectedTasks {
+		if _, ok := implementedSet[taskID]; ok {
+			score.TasksCovered = append(score.TasksCovered, taskID)
+		} else {
+			score.TasksMissing = append(score.TasksMissing, taskID)
+			score.Deviations = append(score.Deviations, fmt.Sprintf("planned task %s is missing from implemented_tasks", taskID))
+		}
+	}
+	expectedSet := make(map[string]struct{}, len(expectedTasks))
+	for _, taskID := range expectedTasks {
+		expectedSet[taskID] = struct{}{}
+	}
+	for _, taskID := range implemented {
+		if _, ok := expectedSet[taskID]; !ok {
+			score.Deviations = append(score.Deviations, fmt.Sprintf("implemented_tasks includes unexpected task %s", taskID))
+		}
+	}
+	total := len(expectedTasks)
+	if total > 0 {
+		score.Score = float64(len(score.TasksCovered)) / float64(total)
+		penalty := float64(len(score.Deviations)-len(score.TasksMissing)) * 0.05
+		score.Score -= penalty
+		if score.Score < 0 {
+			score.Score = 0
+		}
+	}
+	sort.Strings(score.TasksCovered)
+	sort.Strings(score.TasksMissing)
+	sort.Strings(score.Deviations)
+	return score, err
+}
+
+func parsePlanTaskIDs(planSnapshot string) ([]string, error) {
+	if strings.TrimSpace(planSnapshot) == "" {
+		return nil, fmt.Errorf("plan_snapshot is empty")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(planSnapshot), &decoded); err != nil {
+		return nil, err
+	}
+	rawTasks, ok := decoded["Tasks"]
+	if !ok {
+		rawTasks = decoded["tasks"]
+	}
+	taskEntries, _ := rawTasks.([]any)
+	taskIDs := make([]string, 0, len(taskEntries))
+	for _, entry := range taskEntries {
+		task, _ := entry.(map[string]any)
+		if task == nil {
+			continue
+		}
+		for _, key := range []string{"ID", "id"} {
+			if value, _ := task[key].(string); strings.TrimSpace(value) != "" {
+				taskIDs = append(taskIDs, strings.TrimSpace(value))
+				break
+			}
+		}
+	}
+	return normalizeTaskIDs(taskIDs), nil
+}
+
+func normalizeTaskIDs(taskIDs []string) []string {
+	seen := make(map[string]struct{}, len(taskIDs))
+	result := make([]string, 0, len(taskIDs))
+	for _, taskID := range taskIDs {
+		trimmed := strings.TrimSpace(taskID)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {

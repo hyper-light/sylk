@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	sitter "github.com/adalundhe/sylk/third_party/go_tree_sitter"
@@ -15,7 +16,7 @@ func BenchmarkManualExtraction(b *testing.B) {
 	tool := NewTreeSitterTool()
 
 	// Find Go files in the Sylk codebase for benchmarking
-	goFiles := collectGoFiles(b, "/home/ada/Projects/sylk", 50)
+	goFiles := collectGoFiles(b, repoRoot(b), 50)
 	if len(goFiles) == 0 {
 		b.Skip("No Go files found for benchmarking")
 	}
@@ -61,7 +62,7 @@ func BenchmarkQueryExtraction(b *testing.B) {
 	}
 
 	// Find Go files in the Sylk codebase for benchmarking
-	goFiles := collectGoFiles(b, "/home/ada/Projects/sylk", 50)
+	goFiles := collectGoFiles(b, repoRoot(b), 50)
 	if len(goFiles) == 0 {
 		b.Skip("No Go files found for benchmarking")
 	}
@@ -113,7 +114,7 @@ func BenchmarkManualSingleFile(b *testing.B) {
 	tool := NewTreeSitterTool()
 
 	// Use tool.go as the benchmark file (it's the largest)
-	content, err := os.ReadFile("/home/ada/Projects/sylk/core/treesitter/tool.go")
+	content, err := os.ReadFile(filepath.Join(repoRoot(b), "core", "treesitter", "tool.go"))
 	if err != nil {
 		b.Skipf("Failed to read tool.go: %v", err)
 	}
@@ -141,7 +142,7 @@ func BenchmarkQuerySingleFile(b *testing.B) {
 		b.Skipf("Failed to load Go grammar: %v", err)
 	}
 
-	content, err := os.ReadFile("/home/ada/Projects/sylk/core/treesitter/tool.go")
+	content, err := os.ReadFile(filepath.Join(repoRoot(b), "core", "treesitter", "tool.go"))
 	if err != nil {
 		b.Skipf("Failed to read tool.go: %v", err)
 	}
@@ -179,7 +180,7 @@ func BenchmarkParseOnly(b *testing.B) {
 		b.Skipf("Failed to load Go grammar: %v", err)
 	}
 
-	content, err := os.ReadFile("/home/ada/Projects/sylk/core/treesitter/tool.go")
+	content, err := os.ReadFile(filepath.Join(repoRoot(b), "core", "treesitter", "tool.go"))
 	if err != nil {
 		b.Skipf("Failed to read tool.go: %v", err)
 	}
@@ -216,7 +217,7 @@ func TestQueryCorrectness(t *testing.T) {
 	}
 
 	// Test on queries.go itself
-	content, err := os.ReadFile("/home/ada/Projects/sylk/core/treesitter/queries.go")
+	content, err := os.ReadFile(filepath.Join(repoRoot(t), "core", "treesitter", "queries.go"))
 	if err != nil {
 		t.Fatalf("Failed to read queries.go: %v", err)
 	}
@@ -302,6 +303,15 @@ func collectGoFiles(tb testing.TB, root string, maxFiles int) []string {
 		tb.Logf("Walk error: %v", err)
 	}
 	return files
+}
+
+func repoRoot(tb testing.TB) string {
+	tb.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		tb.Fatal("runtime.Caller(0) failed")
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
 }
 
 // BenchmarkCGoOverhead measures the overhead of CGo calls.

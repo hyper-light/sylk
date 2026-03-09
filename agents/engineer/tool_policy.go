@@ -8,10 +8,15 @@ import (
 func engineerVisibleSkillNames() []string {
 	return []string{
 		"read_file",
+		"read_workspace_file",
 		"edit_file",
 		"write_file",
 		"glob",
+		"workspace_glob",
 		"grep",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
 		"run_command",
 	}
 }

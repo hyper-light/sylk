@@ -66,9 +66,10 @@ func (e *CancelEntry) AddHook(fn func()) {
 // SteeringManager manages per-correlation steering ledgers for an agent.
 // Thread-safe for concurrent bus handler access.
 type SteeringManager struct {
-	mu      sync.Mutex
-	ledgers map[string]*steering.SteeringLedger
-	cancels map[string]*CancelEntry
+	mu        sync.Mutex
+	ledgers   map[string]*steering.SteeringLedger
+	cancels   map[string]*CancelEntry
+	bySession map[string]map[string]struct{}
 
 	// Shared journal + activity publisher, passed to every new ledger.
 	journal     *steering.SteeringJournal
@@ -83,8 +84,9 @@ type SteeringManager struct {
 // NewSteeringManager creates a new SteeringManager.
 func NewSteeringManager() *SteeringManager {
 	return &SteeringManager{
-		ledgers: make(map[string]*steering.SteeringLedger),
-		cancels: make(map[string]*CancelEntry),
+		ledgers:   make(map[string]*steering.SteeringLedger),
+		cancels:   make(map[string]*CancelEntry),
+		bySession: make(map[string]map[string]struct{}),
 	}
 }
 
@@ -253,6 +255,12 @@ func (sm *SteeringManager) Close(correlationID string, interrupted bool) {
 	l := sm.ledgers[correlationID]
 	delete(sm.ledgers, correlationID)
 	delete(sm.cancels, correlationID)
+	for sessionID, corrIDs := range sm.bySession {
+		delete(corrIDs, correlationID)
+		if len(corrIDs) == 0 {
+			delete(sm.bySession, sessionID)
+		}
+	}
 	sm.mu.Unlock()
 	if l != nil {
 		l.Close(interrupted)
@@ -268,6 +276,7 @@ func (sm *SteeringManager) CloseAll() {
 		cancelEntries = append(cancelEntries, ce)
 	}
 	sm.cancels = make(map[string]*CancelEntry)
+	sm.bySession = make(map[string]map[string]struct{})
 
 	all := make([]*steering.SteeringLedger, 0, len(sm.ledgers))
 	for _, l := range sm.ledgers {
@@ -298,13 +307,20 @@ func (sm *SteeringManager) CloseAll() {
 
 // RegisterCancel creates and stores a CancelEntry for the given correlation.
 // Returns the entry so agents can add cleanup hooks via AddHook.
-func (sm *SteeringManager) RegisterCancel(correlationID string, cancel context.CancelFunc) *CancelEntry {
+func (sm *SteeringManager) RegisterCancel(correlationID, sessionID string, cancel context.CancelFunc) *CancelEntry {
 	entry := &CancelEntry{
 		cancelFn: cancel,
 		done:     make(chan struct{}),
 	}
 	sm.mu.Lock()
 	sm.cancels[correlationID] = entry
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID != "" {
+		if sm.bySession[sessionID] == nil {
+			sm.bySession[sessionID] = make(map[string]struct{})
+		}
+		sm.bySession[sessionID][correlationID] = struct{}{}
+	}
 	sm.mu.Unlock()
 	return entry
 }
@@ -320,6 +336,32 @@ func (sm *SteeringManager) CancelRequest(correlationID string) bool {
 	}
 	entry.Fire()
 	return true
+}
+
+// CancelSession fires all cancel entries registered for the given session.
+// Returns the number of in-flight requests signaled.
+func (sm *SteeringManager) CancelSession(sessionID string) int {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return 0
+	}
+	sm.mu.Lock()
+	corrIDs := sm.bySession[sessionID]
+	if len(corrIDs) == 0 {
+		sm.mu.Unlock()
+		return 0
+	}
+	entries := make([]*CancelEntry, 0, len(corrIDs))
+	for correlationID := range corrIDs {
+		if entry := sm.cancels[correlationID]; entry != nil {
+			entries = append(entries, entry)
+		}
+	}
+	sm.mu.Unlock()
+	for _, entry := range entries {
+		entry.Fire()
+	}
+	return len(entries)
 }
 
 // IsCancelled reports whether the cancel entry for the given correlation
@@ -359,10 +401,14 @@ func (sm *SteeringManager) HandleAction(req *guide.ActionRequest) bool {
 
 func (sm *SteeringManager) handleCancel(req *guide.ActionRequest) bool {
 	correlationID := extractCancelCorrelationID(req)
-	if correlationID == "" {
+	if correlationID != "" {
+		return sm.CancelRequest(correlationID)
+	}
+	sessionID := extractCancelSessionID(req)
+	if sessionID == "" {
 		return false
 	}
-	return sm.CancelRequest(correlationID)
+	return sm.CancelSession(sessionID) > 0
 }
 
 // extractCancelCorrelationID extracts the correlation ID from a cancel action.
@@ -378,6 +424,18 @@ func extractCancelCorrelationID(req *guide.ActionRequest) string {
 	}
 	// Fallback: use req.CorrelationID
 	return strings.TrimSpace(req.CorrelationID)
+}
+
+func extractCancelSessionID(req *guide.ActionRequest) string {
+	if req == nil {
+		return ""
+	}
+	if data, ok := req.Data.(map[string]any); ok {
+		if sid, ok := data["session_id"].(string); ok {
+			return strings.TrimSpace(sid)
+		}
+	}
+	return ""
 }
 
 func (sm *SteeringManager) handleSteer(req *guide.ActionRequest) bool {

@@ -3,14 +3,13 @@ package versioning
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 )
 
 // SessionVFS owns the per-session versioning infrastructure:
 // a global VFS overlay, MergePipe (OT-based pipeline→global merges),
-// VersionedWAL (disk-backed WAL with semantic versioning), DiskFlusher
+// an in-memory semantic WAL, DiskFlusher
 // (global→disk with checkpoint), and VFSManager (pipeline VFS lifecycle).
 type SessionVFS struct {
 	mu sync.Mutex
@@ -19,7 +18,7 @@ type SessionVFS struct {
 	workingDir  string
 	globalVFS   *PipelineVFS
 	mergePipe   *MergePipe
-	wal         *VersionedWAL
+	wal         SemanticWAL
 	diskFlusher *DiskFlusher
 	vfsManager  VFSManager
 	otEngine    OTEngine
@@ -34,29 +33,51 @@ type SessionVFS struct {
 	opLog     OperationLog
 	oldWAL    WriteAheadLog
 
-	closed bool
+	pipelines map[string]*sessionPipeline
+	closed    bool
+}
+
+// SessionVFSStats captures live in-memory session VFS state without routing
+// through the legacy CVS compatibility layer.
+type SessionVFSStats struct {
+	TrackedFiles      int64
+	TotalVersions     int64
+	TotalOperations   int64
+	ActivePipelines   int64
+	ActiveVariants    int64
+	ActiveLocks       int64
+	ActiveSubscribers int64
+	CurrentVersion    SemanticVersion
+	WALEntries        int64
+}
+
+type sessionPipelineState string
+
+const (
+	sessionPipelineActive    sessionPipelineState = "active"
+	sessionPipelineFailed    sessionPipelineState = "failed"
+	sessionPipelineCommitted sessionPipelineState = "committed"
+)
+
+type sessionPipeline struct {
+	Config      BeginPipelineConfig
+	VFS         *PipelineVFS
+	BaseVersion SemanticVersion
+	State       sessionPipelineState
+	LastError   error
 }
 
 // SessionVFSConfig configures the per-session VFS infrastructure.
 type SessionVFSConfig struct {
-	SessionID  SessionID
-	WorkingDir string
+	SessionID   SessionID
+	WorkingDir  string
+	StorageRoot string // Deprecated: live SessionVFS state is in-memory.
 }
 
 // NewSessionVFS creates an isolated set of versioning subsystems for a session.
 func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
-	walDir := filepath.Join(os.TempDir(), "sylk", "sessions", string(cfg.SessionID), "wal")
-	stagingDir := filepath.Join(os.TempDir(), "sylk", "sessions", string(cfg.SessionID))
-
 	otEngine := NewOTEngine()
-
-	// Open disk-backed WAL.
-	vwal, err := OpenVersionedWAL(VersionedWALConfig{Dir: walDir})
-	if err != nil {
-		// Fallback: use temp dir if configured dir fails.
-		tmpDir, _ := os.MkdirTemp("", "sylk-wal-*")
-		vwal, _ = OpenVersionedWAL(VersionedWALConfig{Dir: tmpDir})
-	}
+	vwal := NewMemoryVersionedWAL()
 
 	// Create global VFS overlay (no version/blob store needed).
 	globalVFS := NewGlobalVFS(VFSConfig{
@@ -79,19 +100,22 @@ func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
 		WorkingDir: cfg.WorkingDir,
 	})
 
-	// Create simplified VFSManager (no VersionStore/BlobStore needed).
-	vfsMgr := NewMemoryVFSManager(VFSManagerConfig{
-		BaseDir: stagingDir,
-	})
-
-	// Start merge goroutine.
-	mp.Start()
-
 	// Legacy stores for CVS shim backward compatibility.
 	blobStore := NewMemoryBlobStore()
 	dagStore := NewMemoryDAGStore()
 	opLog := NewMemoryOperationLog()
 	oldWAL := NewMemoryWAL()
+
+	// Create VFSManager backed by the new SessionVFS stores so history and
+	// versioned reads can operate against real in-memory version/blob state.
+	versionStore := &dagVersionStoreAdapter{dag: dagStore}
+	vfsMgr := NewMemoryVFSManager(VFSManagerConfig{
+		VersionStore: versionStore,
+		BlobStore:    blobStore,
+	})
+
+	// Start merge goroutine.
+	mp.Start()
 
 	cvs := NewCVS(CVSConfig{
 		VFSManager: vfsMgr,
@@ -116,6 +140,7 @@ func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
 		dagStore:    dagStore,
 		opLog:       opLog,
 		oldWAL:      oldWAL,
+		pipelines:   make(map[string]*sessionPipeline),
 	}
 
 	s.cvsShim = NewCVSShim(s)
@@ -131,22 +156,56 @@ func (s *SessionVFS) BeginPipeline(cfg BeginPipelineConfig) (*PipelineVFS, error
 		return nil, ErrVFSClosed
 	}
 
+	if existing := s.pipelines[cfg.PipelineID]; existing != nil && existing.VFS != nil {
+		switch existing.State {
+		case sessionPipelineActive, sessionPipelineFailed:
+			return existing.VFS, nil
+		}
+	}
+
 	vfsCfg := VFSConfig{
-		PipelineID: cfg.PipelineID,
-		SessionID:  cfg.SessionID,
-		WorkingDir: cfg.WorkingDir,
-		AgentID:    cfg.AgentID,
-		AgentRole:  cfg.AgentRole,
+		PipelineID:   cfg.PipelineID,
+		SessionID:    cfg.SessionID,
+		WorkingDir:   cfg.WorkingDir,
+		AgentID:      cfg.AgentID,
+		AgentRole:    cfg.AgentRole,
+		AllowedPaths: normalizeAllowedPaths(cfg.WorkingDir, cfg.Files),
 	}
 
 	pipelineVFS, err := s.vfsManager.CreatePipelineVFS(vfsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("session vfs: begin pipeline: %w", err)
 	}
+	pipelineVFS.SetBaseReader(func(path string) ([]byte, error) {
+		return s.globalVFS.Read(context.Background(), path)
+	})
+	for _, path := range vfsCfg.AllowedPaths {
+		pipelineVFS.RegisterVisiblePath(path)
+		content, readErr := s.globalVFS.Read(context.Background(), path)
+		if readErr == nil {
+			pipelineVFS.SeedFile(path, content)
+		}
+	}
 
-	if err := s.mergePipe.RegisterPipeline(cfg.PipelineID); err != nil {
+	baseVersion := s.wal.CurrentVersion()
+	if err := s.mergePipe.RegisterPipelineAt(cfg.PipelineID, baseVersion); err != nil {
 		s.vfsManager.ClosePipelineVFS(cfg.PipelineID)
 		return nil, fmt.Errorf("session vfs: register pipeline: %w", err)
+	}
+
+	s.pipelines[cfg.PipelineID] = &sessionPipeline{
+		Config: BeginPipelineConfig{
+			PipelineID:  cfg.PipelineID,
+			SessionID:   cfg.SessionID,
+			BaseVersion: cfg.BaseVersion,
+			AgentID:     cfg.AgentID,
+			AgentRole:   cfg.AgentRole,
+			WorkingDir:  cfg.WorkingDir,
+			Files:       append([]string(nil), cfg.Files...),
+		},
+		VFS:         pipelineVFS,
+		BaseVersion: baseVersion,
+		State:       sessionPipelineActive,
 	}
 
 	return pipelineVFS, nil
@@ -154,7 +213,7 @@ func (s *SessionVFS) BeginPipeline(cfg BeginPipelineConfig) (*PipelineVFS, error
 
 // CommitPipeline extracts modifications from the pipeline VFS, merges them
 // into the global VFS via MergePipe (OT transform), and closes the pipeline.
-func (s *SessionVFS) CommitPipeline(pipelineID string) (SemanticVersion, error) {
+func (s *SessionVFS) CommitPipeline(ctx context.Context, pipelineID string) (SemanticVersion, error) {
 	mods, err := s.extractPipelineMods(pipelineID)
 	if err != nil {
 		return SemanticVersion{}, err
@@ -162,19 +221,28 @@ func (s *SessionVFS) CommitPipeline(pipelineID string) (SemanticVersion, error) 
 
 	// Merge outside of s.mu — the merge goroutine is independent.
 	ver, mergeErr := s.mergePipe.Merge(
-		contextWithoutCancel(),
+		contextWithoutCancel(ctx),
 		pipelineID,
 		mods,
 	)
 
-	// Close the pipeline VFS regardless of merge outcome.
-	s.mu.Lock()
-	s.vfsManager.ClosePipelineVFS(pipelineID)
-	s.mu.Unlock()
-
 	if mergeErr != nil {
+		s.mu.Lock()
+		if pipe := s.pipelines[pipelineID]; pipe != nil {
+			pipe.State = sessionPipelineFailed
+			pipe.LastError = mergeErr
+		}
+		s.mu.Unlock()
 		return SemanticVersion{}, fmt.Errorf("session vfs: merge pipeline: %w", mergeErr)
 	}
+
+	s.mu.Lock()
+	if pipe := s.pipelines[pipelineID]; pipe != nil {
+		pipe.State = sessionPipelineCommitted
+	}
+	_ = s.vfsManager.ClosePipelineVFS(pipelineID)
+	delete(s.pipelines, pipelineID)
+	s.mu.Unlock()
 	return ver, nil
 }
 
@@ -203,7 +271,9 @@ func (s *SessionVFS) RollbackPipeline(pipelineID string) error {
 	}
 
 	s.mergePipe.UnregisterPipeline(pipelineID)
-	return s.vfsManager.ClosePipelineVFS(pipelineID)
+	err := s.vfsManager.ClosePipelineVFS(pipelineID)
+	delete(s.pipelines, pipelineID)
+	return err
 }
 
 // GlobalVFS returns the session-scoped global VFS overlay.
@@ -215,11 +285,39 @@ func (s *SessionVFS) MergePipe() *MergePipe { return s.mergePipe }
 // DiskFlusher returns the session's disk flusher.
 func (s *SessionVFS) DiskFlusher() *DiskFlusher { return s.diskFlusher }
 
-// WAL returns the session's versioned WAL.
-func (s *SessionVFS) WAL() *VersionedWAL { return s.wal }
+// WAL returns the session's live semantic WAL.
+func (s *SessionVFS) WAL() SemanticWAL { return s.wal }
 
 // CurrentVersion returns the current semantic version from the WAL.
 func (s *SessionVFS) CurrentVersion() SemanticVersion { return s.wal.CurrentVersion() }
+
+// Stats returns live in-memory session VFS metrics for observability and
+// health reporting.
+func (s *SessionVFS) Stats() SessionVFSStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	managerStats := s.vfsManager.Stats()
+	trackedFiles := int64(s.globalVFS.KnownFileCount())
+	for _, pipe := range s.pipelines {
+		if pipe == nil || pipe.VFS == nil {
+			continue
+		}
+		trackedFiles += int64(pipe.VFS.KnownFileCount())
+	}
+
+	return SessionVFSStats{
+		TrackedFiles:      trackedFiles,
+		TotalVersions:     int64(s.wal.IndexLen()),
+		TotalOperations:   int64(s.wal.IndexLen()),
+		ActivePipelines:   int64(len(s.pipelines)),
+		ActiveVariants:    int64(managerStats.VariantGroups),
+		ActiveLocks:       0,
+		ActiveSubscribers: 0,
+		CurrentVersion:    s.wal.CurrentVersion(),
+		WALEntries:        int64(s.wal.IndexLen()),
+	}
+}
 
 // CVS returns the CVS shim for backward compatibility.
 func (s *SessionVFS) CVS() CVS { return s.cvsShim }
@@ -248,6 +346,15 @@ func (s *SessionVFS) NewGlobalFileAccess(readOnly bool) FileAccess {
 func (s *SessionVFS) NewPipelineFileAccess(vfs *PipelineVFS) FileAccess {
 	return NewVFSFileAccess(vfs, s.workingDir)
 }
+
+// NewReadOnlyPipelineFileAccess creates a read-only FileAccess backed by a
+// per-pipeline VFS.
+func (s *SessionVFS) NewReadOnlyPipelineFileAccess(vfs *PipelineVFS) FileAccess {
+	return NewReadOnlyVFSFileAccess(vfs, s.workingDir)
+}
+
+// WorkingDir returns the session working directory bound to this VFS.
+func (s *SessionVFS) WorkingDir() string { return s.workingDir }
 
 // Close shuts down all session subsystems.
 func (s *SessionVFS) Close() error {
@@ -284,8 +391,64 @@ func (s *SessionVFS) Close() error {
 // contextWithoutCancel returns a context that is never cancelled.
 // Used for merge operations that should complete even if the
 // requesting context is cancelled.
-func contextWithoutCancel() context.Context {
-	return context.Background()
+func (s *SessionVFS) PipelineFileAccess(pipelineID string) (FileAccess, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil, ErrVFSClosed
+	}
+	pipe := s.pipelines[pipelineID]
+	if pipe == nil || pipe.VFS == nil {
+		return nil, ErrVFSNotFound
+	}
+	return s.NewPipelineFileAccess(pipe.VFS), nil
+}
+
+// ReadOnlyPipelineFileAccess returns a read-only FileAccess for a pipeline VFS.
+func (s *SessionVFS) ReadOnlyPipelineFileAccess(pipelineID string) (FileAccess, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil, ErrVFSClosed
+	}
+	pipe := s.pipelines[pipelineID]
+	if pipe == nil || pipe.VFS == nil {
+		return nil, ErrVFSNotFound
+	}
+	return s.NewReadOnlyPipelineFileAccess(pipe.VFS), nil
+}
+
+func normalizeAllowedPaths(workingDir string, files []string) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	allowed := make([]string, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		path := file
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(workingDir, path)
+		}
+		path = filepath.Clean(path)
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		allowed = append(allowed, path)
+	}
+	return allowed
+}
+
+func contextWithoutCancel(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
 }
 
 // dagVersionStoreAdapter adapts a DAGStore to the VersionStore interface

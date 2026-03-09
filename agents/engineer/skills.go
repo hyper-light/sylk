@@ -20,6 +20,7 @@ import (
 	"github.com/adalundhe/sylk/core/format"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (e *Engineer) registerCoreSkills() {
@@ -30,6 +31,11 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(runCommandSkill(e))
 	e.skills.Register(globSkill(e))
 	e.skills.Register(grepSkill(e))
+	e.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
+	e.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
+	e.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
+	e.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
+	e.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
 
 	// Code analysis & quality
 	e.skills.Register(lspSkill(e))
@@ -63,9 +69,11 @@ func (e *Engineer) registerCoreSkills() {
 
 type engineerDiag struct{ e *Engineer }
 
-func (d *engineerDiag) AgentName() string  { return "engineer" }
-func (d *engineerDiag) SessionID() string  { return d.e.config.SessionID }
-func (d *engineerDiag) LogsDir() string    { return shared.LogsDirForAgent(d.e.steering.SessionDir(), "engineer") }
+func (d *engineerDiag) AgentName() string { return "engineer" }
+func (d *engineerDiag) SessionID() string { return d.e.config.SessionID }
+func (d *engineerDiag) LogsDir() string {
+	return shared.LogsDirForAgent(d.e.steering.SessionDir(), "engineer")
+}
 func (d *engineerDiag) EventLogger() *agentlog.SessionEventLogger { return d.e.steering.EventLogger() }
 func (d *engineerDiag) PeerLogsDirs() map[string]string           { return nil }
 func (d *engineerDiag) RecoveryHints() []string                   { return nil }
@@ -76,7 +84,7 @@ func (d *engineerDiag) AgentSpecificDiagnostics() map[string]any {
 	d.e.requestMu.Unlock()
 	return map[string]any{
 		"in_flight_requests": inFlight,
-		"pipeline_id":       d.e.pipelineID,
+		"pipeline_id":        d.e.pipelineID,
 	}
 }
 
@@ -748,7 +756,6 @@ func grepSkill(e *Engineer) *skills.Skill {
 		}).
 		Build()
 }
-
 
 // =============================================================================
 // lsp - Language Server Protocol code intelligence

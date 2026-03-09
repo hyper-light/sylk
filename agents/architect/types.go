@@ -361,6 +361,8 @@ type AtomicTask struct {
 	AffectedFiles       []TaskFileTarget
 	TestRequirements    []string
 	RiskFactors         []string
+	Workspace           TaskWorkspaceSpec
+	WorkerPackets       []WorkerPacket
 
 	// Co-tenancy fields for compound node dispatch.
 	CoAgents          []string
@@ -392,6 +394,33 @@ type AgentScope struct {
 	AffectedFiles       []TaskFileTarget      `json:"affected_files"`
 	Guidelines          []string              `json:"guidelines"`
 	TestRequirements    []string              `json:"test_requirements"`
+}
+
+// TaskWorkspaceSpec declares the sparse repository surface a task pipeline
+// needs mounted into its in-memory VFS.
+type TaskWorkspaceSpec struct {
+	BaseVersion   string   `json:"base_version,omitempty"`
+	ReadSet       []string `json:"read_set,omitempty"`
+	WriteSet      []string `json:"write_set,omitempty"`
+	TestSurface   []string `json:"test_surface,omitempty"`
+	PrefetchPaths []string `json:"prefetch_paths,omitempty"`
+}
+
+// WorkerPacket is the per-agent execution contract the Architect emits for
+// pipeline-local workers. It is more concrete than free-form guidance and is
+// used by the inspector/tester/engineer/designer path directly.
+type WorkerPacket struct {
+	AgentType           string                `json:"agent_type"`
+	Role                string                `json:"role"` // "primary" | "co_agent"
+	Objective           string                `json:"objective,omitempty"`
+	Responsibilities    []string              `json:"responsibilities,omitempty"`
+	AcceptanceCriteria  []AcceptanceCriterion `json:"acceptance_criteria,omitempty"`
+	ImplementationGuide string                `json:"implementation_guide,omitempty"`
+	AffectedFiles       []TaskFileTarget      `json:"affected_files,omitempty"`
+	ReadSet             []string              `json:"read_set,omitempty"`
+	WriteSet            []string              `json:"write_set,omitempty"`
+	Guidelines          []string              `json:"guidelines,omitempty"`
+	TestRequirements    []string              `json:"test_requirements,omitempty"`
 }
 
 // TaskExample provides a concrete code or pattern example for the task.
@@ -592,6 +621,8 @@ type HandoffTask struct {
 	AffectedFiles       []TaskFileTarget      `json:"affected_files,omitempty"`
 	TestRequirements    []string              `json:"test_requirements,omitempty"`
 	RiskFactors         []string              `json:"risk_factors,omitempty"`
+	Workspace           TaskWorkspaceSpec     `json:"workspace,omitempty"`
+	WorkerPackets       []WorkerPacket        `json:"worker_packets,omitempty"`
 	CoAgents            []string              `json:"co_agents,omitempty"`
 	CollaborationMode   string                `json:"collaboration_mode,omitempty"`
 	MaxReviewRounds     int                   `json:"max_review_rounds,omitempty"`

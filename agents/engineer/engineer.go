@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,7 +95,8 @@ type Engineer struct {
 	agentPod *shared.AgentPod
 
 	// File access abstraction (injected per-pipeline by Orchestrator).
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// Self-audit configuration
 	auditConfig AuditConfig
@@ -521,8 +523,9 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(e.runCtx)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
 	e.registerRequestCancel(fwd.CorrelationID, cancel)
-	e.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	e.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer e.clearRequestCancel(fwd.CorrelationID)
 	defer cancel()
 
@@ -683,13 +686,26 @@ func (e *Engineer) intentHandler(intent guide.Intent) (forwardedHandler, error) 
 // handleImplement processes implementation requests (coding tasks)
 func (e *Engineer) handleImplement(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	taskID := uuid.New().String()
+	prompt := fwd.Input
+	var pipelineTask *shared.PipelineTaskInput
+	if task := shared.DecodePipelineTaskInput(fwd.Input); task != nil {
+		pipelineTask = task
+		if strings.TrimSpace(task.TaskID) != "" {
+			taskID = task.TaskID
+		}
+		prompt = shared.ComposePipelineTaskUserPrompt(task)
+		if workspaceContext := shared.BuildTaskWorkspaceRuntimeContext(ctx, e.workspaceViews, task); workspaceContext != "" {
+			prompt += "\n\n" + workspaceContext
+		}
+	}
 
 	// Create task request
 	req := &EngineerRequest{
 		ID:                  uuid.New().String(),
 		Intent:              IntentComplete,
 		TaskID:              taskID,
-		Prompt:              fwd.Input,
+		Prompt:              prompt,
+		PipelineTask:        pipelineTask,
 		ConversationHistory: fwd.ConversationHistory,
 		EngineerID:          e.id,
 		SessionID:           e.config.SessionID,
@@ -803,6 +819,9 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 
 	// Step 4: Compose system prompt + consultation context
 	systemPrompt := e.config.SystemPrompt
+	if req.PipelineTask != nil {
+		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, req.PipelineTask)
+	}
 	if consultContext != "" {
 		systemPrompt += "\n\n---\n\n# Consultation Context\n\n" + consultContext
 	}
@@ -1103,6 +1122,11 @@ func (e *Engineer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 // Called by the Orchestrator when dispatching the engineer to a pipeline.
 func (e *Engineer) SetFileAccess(fa versioning.FileAccess) {
 	e.fileAccess = fa
+}
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (e *Engineer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	e.workspaceViews = views
 }
 
 // SetEscalator injects the confidence-based escalation evaluator.

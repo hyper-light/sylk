@@ -94,10 +94,10 @@ func newMockRuntime(t *testing.T) *mockRuntime {
 	}
 }
 
-func (r *mockRuntime) CreateContainer(_ context.Context, spec container.ContainerSpec) (*container.Container, error) {
+func (r *mockRuntime) CreateContainer(ctx context.Context, spec container.ContainerSpec) (*container.Container, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	c, err := r.createFunc(context.Background(), spec)
+	c, err := r.createFunc(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -300,6 +300,84 @@ func TestController_PromoteFromWarm(t *testing.T) {
 	}
 }
 
+func TestController_EnsureActive_UsesStartupPrewarmedContainer(t *testing.T) {
+	cfg := testControllerConfig(t)
+	rt := cfg.Runtime.(*mockRuntime)
+	for _, policy := range cfg.Policies {
+		if policy.AgentType == "architect" {
+			policy.PreWarmOnStartup = true
+		}
+	}
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ac.warmStartupEntries()
+
+	if rt.createdCount() != 1 {
+		t.Fatalf("expected 1 container created during startup prewarm, got %d", rt.createdCount())
+	}
+	if rt.started != 1 {
+		t.Fatalf("expected startup prewarm to start container once, got %d", rt.started)
+	}
+	if rt.paused != 1 {
+		t.Fatalf("expected startup prewarm to pause container once, got %d", rt.paused)
+	}
+
+	c, err := ac.EnsureActive(testCtx(t), "architect")
+	if err != nil {
+		t.Fatalf("EnsureActive after startup prewarm: %v", err)
+	}
+	if c == nil {
+		t.Fatal("expected non-nil container")
+	}
+	if rt.createdCount() != 1 {
+		t.Fatalf("expected no second container creation on EnsureActive, got %d", rt.createdCount())
+	}
+	if rt.resumed != 1 {
+		t.Fatalf("expected warm container resume on activation, got %d", rt.resumed)
+	}
+}
+
+func TestController_PromoteFromWarm_FallsBackToEntryContainer(t *testing.T) {
+	cfg := testControllerConfig(t)
+	rt := cfg.Runtime.(*mockRuntime)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	warm := newMockContainer(t, "engineer")
+	if err := warm.Start(context.Background()); err != nil {
+		t.Fatalf("start warm container: %v", err)
+	}
+	if err := warm.Pause(); err != nil {
+		t.Fatalf("pause warm container: %v", err)
+	}
+
+	entry, err := ac.getEntry("engineer")
+	if err != nil {
+		t.Fatalf("getEntry: %v", err)
+	}
+	entry.Container.Store(warm)
+	entry.StoreTier(TierWarm)
+
+	c, err := ac.EnsureActive(testCtx(t), "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive from entry fallback warm: %v", err)
+	}
+	if c != warm {
+		t.Fatalf("expected existing warm container, got %v want %v", c, warm)
+	}
+	if rt.createdCount() != 0 {
+		t.Fatalf("expected no cold-start container creation, got %d", rt.createdCount())
+	}
+	if rt.resumed != 1 {
+		t.Fatalf("expected one resume from warm fallback, got %d", rt.resumed)
+	}
+}
+
 func TestController_FullCycle_ColdHotWarmCoolCold(t *testing.T) {
 	cfg := testControllerConfig(t)
 	ac, err := NewActivationController(cfg)
@@ -481,6 +559,26 @@ func TestController_RegisterPolicy_Runtime(t *testing.T) {
 
 	if ac.EntryCount() != 4 { // 3 from config + 1 new
 		t.Fatalf("expected 4 entries, got %d", ac.EntryCount())
+	}
+}
+
+func TestController_ActiveAgentTypes(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	if got := ac.ActiveAgentTypes(); len(got) != 0 {
+		t.Fatalf("ActiveAgentTypes() initially = %v, want empty", got)
+	}
+
+	_, _ = ac.EnsureActive(testCtx(t), "engineer")
+	_, _ = ac.EnsureActive(testCtx(t), "architect")
+
+	got := ac.ActiveAgentTypes()
+	if len(got) != 2 {
+		t.Fatalf("ActiveAgentTypes() len = %d, want 2 (%v)", len(got), got)
 	}
 }
 
@@ -746,6 +844,42 @@ func TestController_DemoteWarmToCool_BlockedByActiveRequests(t *testing.T) {
 	assertTier(t, ac, "engineer", TierWarm)
 
 	release()
+}
+
+func TestController_DemoteTo_StopsWhenGuardBlocksProgress(t *testing.T) {
+	cfg := testControllerConfig(t)
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+	_, err = ac.EnsureActive(ctx, "engineer")
+	if err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+	if err := ac.DemoteTo(ctx, "engineer", TierWarm); err != nil {
+		t.Fatalf("DemoteTo Warm: %v", err)
+	}
+
+	release := ac.AcquireRequestGuard("engineer")
+	defer release()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ac.DemoteTo(ctx, "engineer", TierCool)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DemoteTo Cool: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DemoteTo should return even when guard blocks progress")
+	}
+
+	assertTier(t, ac, "engineer", TierWarm)
 }
 
 func TestController_DemoteWarmToCool_ProceedsAfterRelease(t *testing.T) {

@@ -10,6 +10,11 @@ func archivalistVisibleSkillNames() []string {
 		"store",
 		"query",
 		"briefing",
+		"read_workspace_file",
+		"workspace_glob",
+		"workspace_grep",
+		"inspect_workspace_state",
+		"summarize_workspace_state",
 	}
 }
 

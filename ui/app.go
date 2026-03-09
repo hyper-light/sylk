@@ -291,13 +291,14 @@ var defaultTabOrder = []component.FocusID{
 // Deps holds all core system references needed by the TUI.
 // The caller (cmd.go) is responsible for constructing and providing these.
 type Deps struct {
-	ActivityPub    events.ActivityPublisher
-	SessionManager *session.Manager
-	GuideBus       guide.EventBus
-	StreamManager  *guide.StreamManager
-	Guide          *guide.Guide
-	Scope          *concurrency.GoroutineScope
-	AuthRegistry   *credentials.AuthRegistry
+	ActivityPub        events.ActivityPublisher
+	SessionManager     *session.Manager
+	GuideBus           guide.EventBus
+	StreamManager      *guide.StreamManager
+	Guide              *guide.Guide
+	Scope              *concurrency.GoroutineScope
+	AuthRegistry       *credentials.AuthRegistry
+	InterruptAllAgents func(sessionID, reason string) error
 
 	// SignalStop restores default signal handling and cancels the parent
 	// context. Called after the Bubble Tea program exits so that a second
@@ -4128,58 +4129,55 @@ func (m *AppModel) interruptAllActiveRoutes(reason string) tea.Cmd {
 	for _, entry := range m.activeStreams {
 		targets = append(targets, *entry)
 	}
-	// If no active streams (e.g. double-Esc already unregistered the only
-	// stream), fall back to the single-target path and ensure the flash
-	// reflects that all agents are interrupted.
-	if len(targets) == 0 {
-		cmd := m.interruptActiveRoute(reason)
-		m.statusBar.SetFlash("All agents interrupted")
-		return cmd
-	}
 
-	// UI cleanup — same as interruptActiveRoute but for all streams.
-	m.chat.MuteThinking("")
-	m.chat.AbortStream()
-	if m.interruptedCorrelations == nil {
-		m.interruptedCorrelations = make(map[string]struct{})
-	}
-	for _, t := range targets {
-		m.interruptedCorrelations[t.CorrelationID] = struct{}{}
-		m.finalizeStreamUsage(t.CorrelationID, false, "interrupted")
-		m.markQueueEntryByCorrelation(t.CorrelationID, false)
-		m.unregisterStream(t.CorrelationID)
-	}
-	m.pushInterruptedChatMessage("all agents")
-	m.agentPanel.DemoteAllActive()
-	if m.statusBar != nil {
-		m.statusBar.SetTokenPhase(status.PhaseIdle)
-	}
-	if !m.promptQueue.IsEmpty() {
-		m.promptQueue.SetPaused(true)
-		m.recalcLayout()
-		m.viewDirty = true
+	if len(targets) > 0 {
+		// UI cleanup — same as interruptActiveRoute but for all visible streams.
+		m.chat.MuteThinking("")
+		m.chat.AbortStream()
+		if m.interruptedCorrelations == nil {
+			m.interruptedCorrelations = make(map[string]struct{})
+		}
+		for _, t := range targets {
+			m.interruptedCorrelations[t.CorrelationID] = struct{}{}
+			m.finalizeStreamUsage(t.CorrelationID, false, "interrupted")
+			m.markQueueEntryByCorrelation(t.CorrelationID, false)
+			m.unregisterStream(t.CorrelationID)
+		}
+		m.pushInterruptedChatMessage("all agents")
+		m.agentPanel.DemoteAllActive()
+		if m.statusBar != nil {
+			m.statusBar.SetTokenPhase(status.PhaseIdle)
+		}
+		if !m.promptQueue.IsEmpty() {
+			m.promptQueue.SetPaused(true)
+			m.recalcLayout()
+			m.viewDirty = true
+		}
 	}
 	m.statusBar.SetFlash("All agents interrupted")
 
-	if m.deps.GuideBus == nil {
-		return nil
-	}
-
-	// Build interrupt messages for every active stream.
-	messages := make([]*guide.Message, 0, len(targets))
-	for _, t := range targets {
-		req := &guide.UserInterruptRequest{
-			CorrelationID: t.CorrelationID,
-			SourceAgentID: sourceAgentTUI,
-			Reason:        strings.TrimSpace(reason),
-			Timestamp:     time.Now(),
-		}
-		messages = append(messages, guide.NewUserInterruptMessage("", req))
-	}
-
 	return func() tea.Msg {
-		for _, busMsg := range messages {
-			_ = m.deps.GuideBus.Publish(guide.TopicGuideRequests, busMsg)
+		if m.deps.InterruptAllAgents != nil {
+			sessionID := m.resolveRouteSessionID("")
+			if err := m.deps.InterruptAllAgents(sessionID, strings.TrimSpace(reason)); err != nil {
+				return msg.StreamErrorMsg{
+					SessionID:     sessionID,
+					CorrelationID: "",
+					Err:           err,
+				}
+			}
+			return nil
+		}
+		if m.deps.GuideBus != nil {
+			for _, t := range targets {
+				req := &guide.UserInterruptRequest{
+					CorrelationID: t.CorrelationID,
+					SourceAgentID: sourceAgentTUI,
+					Reason:        strings.TrimSpace(reason),
+					Timestamp:     time.Now(),
+				}
+				_ = m.deps.GuideBus.Publish(guide.TopicGuideRequests, guide.NewUserInterruptMessage("", req))
+			}
 		}
 		return nil
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"golang.org/x/sync/singleflight"
@@ -155,7 +156,8 @@ type Guide struct {
 	sessionID string
 	agentID   string
 	// Session-scoped conversation flow tracking for interactive handoffs.
-	conversation *ConversationFlowManager
+	conversation   *ConversationFlowManager
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// Handoff bridge for context-exhaustion lifecycle management
 	handoffBridge *handoff.HandoffBridge
@@ -274,6 +276,10 @@ type Config struct {
 
 	// ActivityPub for publishing agent activity events to the UI panel.
 	ActivityPub events.ActivityPublisher
+
+	// WorkspaceViews provides explicit disk/global/pipeline read access for
+	// guide self-response and steering interactions about active work.
+	WorkspaceViews versioning.WorkspaceViewAccess
 }
 
 // DefaultConfig returns sensible defaults
@@ -346,6 +352,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		selfResponder:        selfResponder,
 		sessionID:            cfg.SessionID,
 		agentID:              agentID,
+		workspaceViews:       cfg.WorkspaceViews,
 		requestCancels:       make(map[string]context.CancelFunc),
 		responseMessagesSeen: make(map[string]time.Time),
 		completedPendings:    make(map[string]completedPendingRoute),
@@ -416,7 +423,7 @@ func resolveRouteCacheConfig(cfg Config) RouteCacheConfig {
 func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.HookRegistry) {
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := guideSkillsLoaderConfig(cfg)
-	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents", "self_diagnostic", "evaluate_plan_acceptance"}
+	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents", "self_diagnostic", "evaluate_plan_acceptance", "read_workspace_file", "workspace_glob", "workspace_grep", "inspect_workspace_state", "summarize_workspace_state"}
 	skillsLoaderCfg.AutoLoadDomains = nil
 
 	hooks := skills.NewHookRegistry()
@@ -429,6 +436,7 @@ func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.Hoo
 		"agents": true, "conversation_context": true, "route_to": true, "reply_to": true, "broadcast": true,
 		"task_interact": true, "get_routing_history": true, "get_agent_capabilities": true,
 		"self_diagnostic": true, "evaluate_plan_acceptance": true,
+		"read_workspace_file": true, "workspace_glob": true, "workspace_grep": true, "inspect_workspace_state": true, "summarize_workspace_state": true,
 		"sessions": true, "metrics": true, "switch_session": true, "create_session": true, "close_session": true,
 	}
 
@@ -522,6 +530,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		googleConfig:         cfg.GoogleConfig,
 		sessionID:            cfg.SessionID,
 		agentID:              agentID,
+		workspaceViews:       cfg.WorkspaceViews,
 		requestCancels:       make(map[string]context.CancelFunc),
 		responseMessagesSeen: make(map[string]time.Time),
 		completedPendings:    make(map[string]completedPendingRoute),
@@ -627,6 +636,7 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		activeModel:    model,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
+		workspaceViews: cfg.WorkspaceViews,
 		requestCancels: make(map[string]context.CancelFunc),
 		streamReroutes: make(map[string]string),
 	}
@@ -3818,6 +3828,10 @@ func (g *Guide) cancelRequestContext(correlationID string) bool {
 
 func (g *Guide) handleUserInterruptMessage(msg *Message) error {
 	req, correlationID := g.interruptRequestFromMessage(msg)
+	if req != nil && req.Scope == UserInterruptScopeSession && strings.TrimSpace(req.SessionID) != "" {
+		g.handleSessionInterrupt(req)
+		return nil
+	}
 	if correlationID == "" {
 		return nil
 	}
@@ -3834,6 +3848,45 @@ func (g *Guide) handleUserInterruptMessage(msg *Message) error {
 		g.streams.CloseStream(correlationID)
 	}
 	return nil
+}
+
+func (g *Guide) handleSessionInterrupt(req *UserInterruptRequest) {
+	if g == nil || g.pending == nil || req == nil {
+		return
+	}
+	sessionID := strings.TrimSpace(req.SessionID)
+	if sessionID == "" {
+		return
+	}
+
+	pendings := g.pending.GetBySession(sessionID)
+	for _, snapshot := range pendings {
+		if snapshot == nil {
+			continue
+		}
+		correlationID := strings.TrimSpace(snapshot.CorrelationID)
+		if correlationID == "" {
+			continue
+		}
+		g.cancelRequestContext(correlationID)
+		pending := g.pending.Remove(correlationID)
+		if pending == nil {
+			continue
+		}
+		g.reclaimRequestEpoch(correlationID, pending)
+		g.forwardUserInterruptToTarget(req, pending)
+		if g.streams != nil {
+			g.streams.CloseStream(correlationID)
+		}
+	}
+
+	if g.conversation != nil {
+		g.conversation.ClearStickiness(sessionID)
+	}
+	if g.sessionRouter != nil {
+		g.sessionRouter.RemoveSession(sessionID)
+	}
+	g.clearSelfResponseHistory()
 }
 
 // reclaimRequestEpoch sweeps all request-scoped state tagged with the given

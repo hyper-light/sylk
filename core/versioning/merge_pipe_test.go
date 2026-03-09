@@ -2,6 +2,8 @@ package versioning
 
 import (
 	"context"
+	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -150,4 +152,45 @@ func TestMergePipe_ContextCancellation(t *testing.T) {
 	mp.closed = true
 	close(mp.stopCh)
 	close(mp.doneCh)
+}
+
+func TestMergePipe_RejectsStaleGlobalStateConflict(t *testing.T) {
+	dir := t.TempDir()
+	wal := NewMemoryVersionedWAL()
+	globalVFS := NewGlobalVFS(VFSConfig{
+		PipelineID: "global",
+		WorkingDir: dir,
+	})
+	defer globalVFS.Close()
+
+	ctx := context.Background()
+	target := filepath.Join(dir, "a.go")
+	if err := globalVFS.Write(ctx, target, []byte("current")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	mp := NewMergePipe(MergePipeConfig{
+		GlobalVFS: globalVFS,
+		WAL:       wal,
+		OTEngine:  NewOTEngine(),
+	})
+	mp.Start()
+	defer mp.Stop()
+
+	if err := mp.RegisterPipeline("pipe1"); err != nil {
+		t.Fatalf("RegisterPipeline: %v", err)
+	}
+
+	_, err := mp.Merge(ctx, "pipe1", []FileModification{
+		{
+			OriginalPath: target,
+			Operation:    FileOpModify,
+			OldContent:   []byte("stale"),
+			NewContent:   []byte("pipeline"),
+		},
+	})
+	var conflictErr *ConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("expected conflict error, got %v", err)
+	}
 }

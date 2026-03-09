@@ -5,7 +5,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -86,7 +85,8 @@ type PipelineInspector struct {
 	// Agent pod for Scribe feed.
 	agentPod *agentShared.AgentPod
 
-	fileAccess versioning.FileAccess
+	fileAccess     versioning.FileAccess
+	workspaceViews versioning.WorkspaceViewAccess
 
 	// Request lifecycle.
 	runCtx    context.Context
@@ -192,6 +192,7 @@ func (pi *PipelineInspector) registerSafetyHook() {
 		"run_security_scan": true, "check_coverage": true, "analyze_complexity": true,
 		"detect_race_conditions": true, "detect_deadlocks": true, "detect_memory_leaks": true,
 		"read_file": true, "glob": true, "grep": true,
+		"read_workspace_file": true, "workspace_glob": true, "workspace_grep": true, "inspect_workspace_state": true, "summarize_workspace_state": true,
 		"define_criteria": true, "validate_criteria": true,
 		"grade_task_quality": true, "request_correction": true,
 		"request_override": true, "get_validation_status": true,
@@ -361,83 +362,29 @@ func (pi *PipelineInspector) unsubRegistry() error {
 	return err
 }
 
-// pipelineTaskFields holds the decoded fields from a JSON-encoded PipelineTask.
-// Defined locally to avoid importing the orchestrator package.
-type pipelineTaskFields struct {
-	NodeID        string         `json:"node_id"`
-	DAGID         string         `json:"dag_id"`
-	TaskID        string         `json:"task_id"`
-	AgentType     string         `json:"agent_type"`
-	Prompt        string         `json:"prompt"`
-	Context       map[string]any `json:"context,omitempty"`
-	ParentResults map[string]any `json:"parent_results,omitempty"`
-	SessionID     string         `json:"session_id"`
-}
+// pipelineTaskFields aliases the shared pipeline task wire contract so the
+// inspector, tester, engineer, and designer all consume the same payload.
+type pipelineTaskFields = agentShared.PipelineTaskInput
 
 // decodePipelineTask tries to decode fwd.Input as a JSON PipelineTask.
 // Returns nil if the input is not a valid pipeline task.
 func decodePipelineTask(input string) *pipelineTaskFields {
-	trimmed := strings.TrimSpace(input)
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return nil
-	}
-	var task pipelineTaskFields
-	if err := json.Unmarshal([]byte(trimmed), &task); err != nil {
-		return nil
-	}
-	if task.NodeID == "" || task.AgentType == "" {
-		return nil
-	}
-	return &task
+	return agentShared.DecodePipelineTaskInput(input)
 }
 
 // composePipelineUserMessage builds a structured LLM user message from
 // decoded pipeline task fields. This replaces the raw JSON blob with a
 // clear, actionable instruction the LLM can act on.
 func composePipelineUserMessage(task *pipelineTaskFields) string {
-	stage := extractPipelineStage(task.Context)
-
-	var b strings.Builder
-	b.WriteString("## Pipeline Task Assignment\n\n")
-	fmt.Fprintf(&b, "**Stage**: %s | **Node**: %s | **Task ID**: %s\n\n", stage, task.NodeID, task.TaskID)
-
-	b.WriteString("### Task Description\n\n")
-	b.WriteString(coalesce(task.Prompt, "No task description provided."))
-	b.WriteString("\n\n")
-
-	if files := affectedPathsFromTask(task); len(files) > 0 {
-		b.WriteString("### Affected Files\n\n")
-		for _, file := range files {
-			fmt.Fprintf(&b, "- %s\n", file)
-		}
-		b.WriteString("\n")
+	base := agentShared.ComposePipelineTaskUserPrompt(task)
+	instructions := strings.TrimSpace(stageInstructions(extractPipelineStage(task.Context)))
+	if instructions == "" {
+		return base
 	}
-	if successCriteria := decodeStringList(task.Context, "success_criteria"); len(successCriteria) > 0 {
-		b.WriteString("### Success Criteria\n\n")
-		for _, item := range successCriteria {
-			fmt.Fprintf(&b, "- %s\n", item)
-		}
-		b.WriteString("\n")
+	if strings.TrimSpace(base) == "" {
+		return instructions
 	}
-	if testRequirements := decodeStringList(task.Context, "test_requirements"); len(testRequirements) > 0 {
-		b.WriteString("### Test Requirements\n\n")
-		for _, item := range testRequirements {
-			fmt.Fprintf(&b, "- %s\n", item)
-		}
-		b.WriteString("\n")
-	}
-	if riskFactors := decodeStringList(task.Context, "risk_factors"); len(riskFactors) > 0 {
-		b.WriteString("### Risk Factors\n\n")
-		for _, item := range riskFactors {
-			fmt.Fprintf(&b, "- %s\n", item)
-		}
-		b.WriteString("\n")
-	}
-
-	b.WriteString(formatParentResults(task.ParentResults))
-	b.WriteString(stageInstructions(stage))
-
-	return b.String()
+	return base + "\n\n" + instructions
 }
 
 // extractPipelineStage reads the pipeline_stage from task context.
@@ -451,60 +398,18 @@ func extractPipelineStage(ctx map[string]any) string {
 	return "unknown"
 }
 
-// coalesce returns the first non-empty string.
-func coalesce(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
-}
-
-// formatParentResults renders upstream node results as markdown for the LLM.
-func formatParentResults(results map[string]any) string {
-	if len(results) == 0 {
-		return ""
-	}
-
-	var b strings.Builder
-	b.WriteString("### Upstream Results\n\n")
-	for nodeID, result := range results {
-		b.WriteString(formatSingleResult(nodeID, result))
-	}
-	return b.String()
-}
-
-// formatSingleResult renders one parent node's result as markdown.
-func formatSingleResult(nodeID string, result any) string {
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return ""
-	}
-
-	var b strings.Builder
-	state, _ := resultMap["state"].(string)
-	fmt.Fprintf(&b, "**%s** (state: %s)\n", nodeID, state)
-
-	if output := resultMap["output"]; output != nil {
-		outputJSON, err := json.MarshalIndent(output, "  ", "  ")
-		if err == nil {
-			fmt.Fprintf(&b, "```json\n%s\n```\n", outputJSON)
-		}
-	}
-	b.WriteByte('\n')
-	return b.String()
-}
-
 // stageInstructions returns stage-specific instructions for the LLM.
 func stageInstructions(stage string) string {
 	if stage == "inspect" {
 		return "### Instructions\n\n" +
 			"This is the **inspect** stage (pre-implementation). Execute the validation protocol:\n" +
+			"0. Inspect the workspace snapshot and use `summarize_workspace_state` or `inspect_workspace_state` if any layer mismatch or unavailable view needs clarification\n" +
 			"1. Define success criteria for this task using `define_criteria`\n" +
 			"2. If upstream results contain implementation files, run analysis tools\n" +
 			"3. Grade and report using `grade_task_quality` and `get_validation_status`\n"
 	}
 	return "### Instructions\n\n" +
-		"Execute the full validation protocol: define/retrieve criteria, run analysis tools, " +
+		"Execute the full validation protocol: inspect the workspace snapshot first, define/retrieve criteria, run analysis tools, " +
 		"validate against criteria, grade the implementation, and report results.\n"
 }
 
@@ -531,9 +436,15 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	// Build user message: structured for pipeline tasks, raw for conversation.
 	userMessage := fwd.Input
 	if task != nil {
-		pi.SetWorkerType(task.AgentType)
+		if workerType := agentShared.PipelineWorkerType(task); workerType != "" {
+			pi.SetWorkerType(workerType)
+		}
 		pi.seedCriteriaFromTask(task)
 		userMessage = composePipelineUserMessage(task)
+		if workspaceContext := agentShared.BuildTaskWorkspaceRuntimeContext(ctx, pi.workspaceViews, task); workspaceContext != "" {
+			userMessage += "\n\n" + workspaceContext
+		}
+		systemPrompt = agentShared.AppendPipelineSystemContext(systemPrompt, task)
 	}
 	pi.prepareSkillsForInput(userMessage)
 	tools := pi.buildToolDefinitions()
@@ -608,7 +519,8 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	pi.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
 
 	reqCtx, cancel := context.WithCancel(pi.runCtx)
-	pi.steering.RegisterCancel(fwd.CorrelationID, cancel)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	pi.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
 	ctx := reqCtx
@@ -980,6 +892,9 @@ func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
 func (pi *PipelineInspector) InjectPreparedContext(_ *handoff.PreparedContext) error { return nil }
 func (pi *PipelineInspector) Terminate(_ context.Context) error                      { return pi.Stop() }
 func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess)                 { pi.fileAccess = fa }
+func (pi *PipelineInspector) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	pi.workspaceViews = views
+}
 
 // SetAgentPod injects the agent pod for Scribe feed integration.
 func (pi *PipelineInspector) SetAgentPod(pod *agentShared.AgentPod) {

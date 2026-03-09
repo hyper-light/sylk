@@ -66,6 +66,10 @@ func compileCriteriaFromTask(task *pipelineTaskFields) *shared.InspectorCriteria
 	if task == nil || strings.TrimSpace(task.TaskID) == "" {
 		return nil
 	}
+	workerType := agentShared.PipelineWorkerType(task)
+	if workerType == "" {
+		workerType = task.AgentType
+	}
 
 	successCriteria := decodeStringList(task.Context, "success_criteria")
 	guidelines := decodeStringList(task.Context, "guidelines")
@@ -76,9 +80,9 @@ func compileCriteriaFromTask(task *pipelineTaskFields) *shared.InspectorCriteria
 
 	criteria := &shared.InspectorCriteria{
 		TaskID:          task.TaskID,
-		Domain:          shared.ValidationDomainFromWorkerType(task.AgentType),
+		Domain:          shared.ValidationDomainFromWorkerType(workerType),
 		SuccessCriteria: make([]shared.SuccessCriterion, 0, len(successCriteria)+len(acceptanceCriteria)+3),
-		QualityGates:    defaultQualityGates(task.AgentType, len(testRequirements) > 0),
+		QualityGates:    defaultQualityGates(workerType, len(testRequirements) > 0),
 		Constraints:     make([]shared.Constraint, 0, len(guidelines)+len(riskFactors)),
 		CreatedAt:       time.Now(),
 	}
@@ -499,13 +503,28 @@ func decodeStringList(ctx map[string]any, key string) []string {
 	if ctx == nil {
 		return nil
 	}
-	raw, ok := ctx[key]
-	if !ok || raw == nil {
+	return decodeAnyStringList(ctx[key])
+}
+
+func decodeMap(ctx map[string]any, key string) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	value, ok := ctx[key]
+	if !ok || value == nil {
+		return nil
+	}
+	typed, _ := value.(map[string]any)
+	return typed
+}
+
+func decodeAnyStringList(raw any) []string {
+	if raw == nil {
 		return nil
 	}
 	switch values := raw.(type) {
 	case []string:
-		return values
+		return append([]string(nil), values...)
 	case []any:
 		out := make([]string, 0, len(values))
 		for _, value := range values {
@@ -560,6 +579,8 @@ func affectedPathsFromTask(task *pipelineTaskFields) []string {
 		}
 		paths = append(paths, file.Path)
 	}
+	paths = append(paths, decodeAnyStringList(decodeMap(task.Context, "workspace")["write_set"])...)
+	paths = append(paths, decodeAnyStringList(decodeMap(task.Context, "workspace")["test_surface"])...)
 	return normalizeValidationPaths(paths)
 }
 

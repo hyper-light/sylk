@@ -79,7 +79,7 @@ type trackingRegistrar struct {
 	failOn string
 }
 
-func (r *trackingRegistrar) register(_ context.Context, agentType string) error {
+func (r *trackingRegistrar) register(_ context.Context, _ string, agentType string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, agentType)

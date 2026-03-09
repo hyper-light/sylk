@@ -142,7 +142,7 @@ func (s *CloneStore) Clone(ctx context.Context, repoURL, branch string) (*CloneE
 	}
 
 	// Commit pipeline → OT merge into global VFS.
-	if _, err := svfs.CommitPipeline(pipelineID); err != nil {
+	if _, err := svfs.CommitPipeline(ctx, pipelineID); err != nil {
 		return nil, fmt.Errorf("commit pipeline for %s: %w", key, err)
 	}
 

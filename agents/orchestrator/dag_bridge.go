@@ -15,8 +15,11 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/container"
+	containerpod "github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // DAGBridgeConfig configures DAG execution parameters.
@@ -56,6 +59,7 @@ type ActiveDAGMeta struct {
 	Revision   int
 	Dispatcher *BusNodeDispatcher
 	Pod        *shared.AgentPod
+	TaskPods   map[string]*shared.AgentPod
 	CancelFunc context.CancelFunc
 	Unsub      func()
 	StartedAt  time.Time
@@ -67,19 +71,22 @@ type ActiveDAGMeta struct {
 
 // DAGBridge wires the dag.Scheduler into the orchestrator's bus/WAL/store/buffers.
 type DAGBridge struct {
-	mu        sync.RWMutex
-	scheduler *dag.Scheduler
-	bus       guide.EventBus
-	store     *Store
-	journal   *OrchestratorJournal
-	buffers   *BufferRegistry
-	scope     *concurrency.GoroutineScope
-	config    DAGBridgeConfig
-	activator guide.PodActivator
-	registrar PipelineRegistrar
-	sessionID string
-	agentID   string
-	logger    *slog.Logger
+	mu         sync.RWMutex
+	scheduler  *dag.Scheduler
+	bus        guide.EventBus
+	store      *Store
+	journal    *OrchestratorJournal
+	buffers    *BufferRegistry
+	scope      *concurrency.GoroutineScope
+	config     DAGBridgeConfig
+	activator  guide.PodActivator
+	registrar  PipelineRegistrar
+	runtime    container.ContainerRuntime
+	specReg    *container.AgentSpecRegistry
+	sessionVFS func(sessionID string) *versioning.SessionVFS
+	sessionID  string
+	agentID    string
+	logger     *slog.Logger
 
 	activityPub   events.ActivityPublisher
 	eventLogger   *agentlog.SessionEventLogger
@@ -143,6 +150,20 @@ func (b *DAGBridge) SetRegistrar(fn PipelineRegistrar) {
 	b.registrar = fn
 }
 
+// SetTaskPodInfra wires the runtime/spec/VFS dependencies required to build
+// real task-scoped pipeline pods.
+func (b *DAGBridge) SetTaskPodInfra(
+	runtime container.ContainerRuntime,
+	specReg *container.AgentSpecRegistry,
+	sessionVFS func(sessionID string) *versioning.SessionVFS,
+) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.runtime = runtime
+	b.specReg = specReg
+	b.sessionVFS = sessionVFS
+}
+
 // SetLogger sets the structured logger for pipeline pod diagnostics.
 func (b *DAGBridge) SetLogger(l *slog.Logger) {
 	b.mu.Lock()
@@ -203,36 +224,35 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		return "", fmt.Errorf("dag bridge: store insert: %w", err)
 	}
 
-	// 3. Create PipelinePod for per-node guard lifecycle management.
-	//    The pod acquires demotion guards per-node (not bulk), deduplicates
-	//    registrar calls, and provides full activation observability.
+	// 3. Create task-scoped pipeline pods so task_id is the canonical
+	// execution, routing, and filesystem boundary.
 	b.mu.RLock()
 	activator := b.activator
 	registrar := b.registrar
 	logger := b.logger
+	runtime := b.runtime
+	specReg := b.specReg
+	sessionVFS := b.sessionVFS
 	b.mu.RUnlock()
 
 	b.mu.RLock()
 	scribeFactory := b.scribeFactory
 	b.mu.RUnlock()
 
-	pod := NewPipelinePod(PipelinePodConfig{
-		DAGID:         d.ID(),
-		SessionID:     sessionID,
-		Activator:     activator,
-		Registrar:     registrar,
-		ActivityPub:   b.activityPub,
-		Logger:        logger,
-		ScribeFactory: scribeFactory,
+	taskPods, err := b.buildTaskPods(ctx, d, sessionID, runtime, specReg, registrar, logger, scribeFactory, sessionVFS)
+	if err != nil {
+		return "", err
+	}
+
+	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
+	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
+	dispatcher.SetPodResolver(func(node *dag.Node) *shared.AgentPod {
+		if node == nil {
+			return nil
+		}
+		taskID, _ := dispatchTaskIdentity(node)
+		return taskPods[taskID]
 	})
-
-	// 3a. Pre-activate all pipeline agent types so they are registered
-	// with the Guide and visible in the TUI before the first sub-node
-	// dispatches. Each pipeline always uses all four agent types.
-	pod.PreActivate(ctx)
-
-	// 3b. Create BusNodeDispatcher with pod-based per-node activation.
-	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, pod)
 	dagID := d.ID()
 
 	// 3c. Create decision gate for this DAG
@@ -255,6 +275,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		PlanID:     planID,
 		SessionID:  sessionID,
 		Dispatcher: dispatcher,
+		TaskPods:   taskPods,
 		CancelFunc: dagCancel,
 		StartedAt:  time.Now(),
 		SubNodeMap: subNodeMap,
@@ -267,12 +288,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.activeDAGs[d.ID()].Unsub = unsub
 	b.mu.Unlock()
 
-	// 6. Store pod in meta for cleanup and sub-node tracking.
-	b.mu.Lock()
-	b.activeDAGs[d.ID()].Pod = pod
-	b.mu.Unlock()
-
-	// 6b. Register expanded sub-nodes with the pod for per-node observability.
+	// 6. Register expanded sub-nodes with their task pod for per-node observability.
 	//     Sorted iteration ensures deterministic registration order.
 	for _, subNodeID := range slices.Sorted(maps.Keys(subNodeMap)) {
 		parentNodeID := subNodeMap[subNodeID]
@@ -286,19 +302,30 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 			return "", fmt.Errorf("dag bridge: %s", errMsg)
 		}
 		stage := string(StageFromSubNodeID(subNodeID))
-		pod.RegisterSubNode(subNodeID, parentNodeID, stage, node.AgentType())
+		taskID, _ := dispatchTaskIdentity(node)
+		if pod := taskPods[taskID]; pod != nil {
+			pod.RegisterSubNode(subNodeID, parentNodeID, stage, node.AgentType())
+		}
 	}
 
-	// 6c. Wire ACK callback now that the pod is available.
+	// 6b. Wire ACK callback now that the task pods are available.
 	dispatcher.SetACKCallback(func(nodeID string, ack *ACKResult) {
 		b.journal.LogNodeAcked(dagID, nodeID, ack.AgentID)
-		if _, isSub := subNodeMap[nodeID]; isSub {
+		if _, isSub := subNodeMap[nodeID]; !isSub {
+			return
+		}
+		node, ok := d.GetNode(nodeID)
+		if !ok {
+			return
+		}
+		taskID, _ := dispatchTaskIdentity(node)
+		if pod := taskPods[taskID]; pod != nil {
 			pod.RecordSubNodeACK(nodeID, ack.AgentID, ack.AckedAt)
 		}
 	})
 
 	// 7. Submit to scheduler (async execution)
-	_, err := b.scheduler.Submit(dagCtx, d, dispatcher)
+	_, err = b.scheduler.Submit(dagCtx, d, dispatcher)
 	if err != nil {
 		dagCancel()
 		b.cleanupDAG(d.ID())
@@ -308,6 +335,236 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	}
 
 	return d.ID(), nil
+}
+
+func (b *DAGBridge) buildTaskPods(
+	ctx context.Context,
+	d *dag.DAG,
+	sessionID string,
+	runtime container.ContainerRuntime,
+	specReg *container.AgentSpecRegistry,
+	registrar PipelineRegistrar,
+	logger *slog.Logger,
+	scribeFactory shared.ScribeFactory,
+	sessionVFSLookup func(sessionID string) *versioning.SessionVFS,
+) (map[string]*shared.AgentPod, error) {
+	taskDefs := collectPipelineTaskPods(d)
+	if len(taskDefs) == 0 {
+		return nil, nil
+	}
+	if runtime == nil || specReg == nil || sessionVFSLookup == nil {
+		return nil, fmt.Errorf("dag bridge: task pipeline infra not configured")
+	}
+
+	svfs := sessionVFSLookup(sessionID)
+	if svfs == nil {
+		return nil, fmt.Errorf("dag bridge: session VFS not configured for session %s", sessionID)
+	}
+
+	taskPods := make(map[string]*shared.AgentPod, len(taskDefs))
+	for _, taskDef := range taskDefs {
+		managed, specs, err := buildTaskManagedPod(taskDef, sessionID, runtime, specReg, svfs, logger)
+		if err != nil {
+			releaseTaskPods(taskPods)
+			return nil, err
+		}
+		managed.SetSpecs(specs)
+
+		taskPod := NewPipelinePod(PipelinePodConfig{
+			PodID:         taskDef.TaskID,
+			SessionID:     sessionID,
+			Registrar:     registrar,
+			ActivityPub:   b.activityPub,
+			Logger:        logger,
+			ScribeFactory: scribeFactory,
+			Managed:       managed,
+		})
+		taskPods[taskDef.TaskID] = taskPod
+	}
+
+	return taskPods, nil
+}
+
+type pipelineTaskPodDef struct {
+	TaskID   string
+	TaskSlug string
+	Files    []string
+}
+
+func collectPipelineTaskPods(d *dag.DAG) []pipelineTaskPodDef {
+	if d == nil {
+		return nil
+	}
+	byTask := make(map[string]*pipelineTaskPodDef)
+	for _, node := range d.Nodes() {
+		if !isPipelineTaskNode(node) {
+			continue
+		}
+		taskID, taskSlug := dispatchTaskIdentity(node)
+		if taskID == "" {
+			continue
+		}
+		def := byTask[taskID]
+		if def == nil {
+			def = &pipelineTaskPodDef{TaskID: taskID, TaskSlug: taskSlug}
+			byTask[taskID] = def
+		}
+		if def.TaskSlug == "" {
+			def.TaskSlug = taskSlug
+		}
+		def.Files = appendUniqueStrings(def.Files, extractAffectedFiles(node.Context())...)
+	}
+
+	taskIDs := slices.Sorted(maps.Keys(byTask))
+	result := make([]pipelineTaskPodDef, 0, len(taskIDs))
+	for _, taskID := range taskIDs {
+		result = append(result, *byTask[taskID])
+	}
+	return result
+}
+
+func isPipelineTaskNode(node *dag.Node) bool {
+	if node == nil {
+		return false
+	}
+	switch node.AgentType() {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractAffectedFiles(ctx map[string]any) []string {
+	if len(ctx) == 0 {
+		return nil
+	}
+	var files []string
+	var appendPaths func(value any)
+	appendPaths = func(value any) {
+		switch typed := value.(type) {
+		case []string:
+			files = appendUniqueStrings(files, typed...)
+		case []any:
+			for _, entry := range typed {
+				switch item := entry.(type) {
+				case string:
+					files = appendUniqueStrings(files, item)
+				case map[string]any:
+					if path, _ := item["path"].(string); strings.TrimSpace(path) != "" {
+						files = appendUniqueStrings(files, strings.TrimSpace(path))
+					}
+				}
+			}
+		case map[string]any:
+			for _, key := range []string{"read_set", "write_set", "test_surface", "prefetch_paths"} {
+				appendPaths(typed[key])
+			}
+		}
+	}
+	appendPaths(ctx["affected_files"])
+	appendPaths(ctx["workspace"])
+	return files
+}
+
+func appendUniqueStrings(dst []string, values ...string) []string {
+	if len(values) == 0 {
+		return dst
+	}
+	seen := make(map[string]struct{}, len(dst))
+	for _, existing := range dst {
+		seen[existing] = struct{}{}
+	}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		dst = append(dst, value)
+	}
+	return dst
+}
+
+func buildTaskManagedPod(
+	task pipelineTaskPodDef,
+	sessionID string,
+	runtime container.ContainerRuntime,
+	specReg *container.AgentSpecRegistry,
+	svfs *versioning.SessionVFS,
+	logger *slog.Logger,
+) (*containerpod.ManagedPod, []container.ContainerSpec, error) {
+	policy := &containerpod.PodPolicy{
+		PodID:       task.TaskID,
+		PodType:     containerpod.PodTypePipeline,
+		MemberTypes: PipelineAgentTypes[:],
+		MinTier:     containerpod.TierCold,
+		IdleToWarm:  30 * time.Second,
+		IdleToCool:  90 * time.Second,
+		IdleToCold:  5 * time.Minute,
+	}
+
+	volumeManager := containerpod.NewVolumeManager(containerpod.VolumeManagerConfig{
+		Volumes: []containerpod.ManagedVolume{
+			containerpod.NewVFSVolume(containerpod.VFSVolumeConfig{
+				Name:       "workspace",
+				PipelineID: task.TaskID,
+				SessionID:  versioning.SessionID(sessionID),
+				WorkingDir: svfs.WorkingDir(),
+				SessionVFS: svfs,
+				Files:      task.Files,
+			}),
+		},
+		Mounts: map[string]string{
+			"engineer":           "workspace",
+			"designer":           "workspace",
+			"inspector-pipeline": "workspace",
+			"tester-pipeline":    "workspace",
+		},
+	})
+
+	managed := containerpod.NewManagedPod(containerpod.ManagedPodConfig{
+		ID:            task.TaskID,
+		Policy:        policy,
+		Runtime:       runtime,
+		Logger:        logger,
+		VolumeManager: volumeManager,
+	})
+
+	specs := make([]container.ContainerSpec, 0, len(PipelineAgentTypes))
+	for _, agentType := range PipelineAgentTypes {
+		spec, err := specReg.SpecForAgent(agentType)
+		if err != nil {
+			return nil, nil, fmt.Errorf("task pod %s: spec for %s: %w", task.TaskID, agentType, err)
+		}
+		spec.Name = TaskScopedAgentID(task.TaskID, agentType)
+		if spec.Labels == nil {
+			spec.Labels = make(map[string]string, 3)
+		}
+		spec.Labels["task_id"] = task.TaskID
+		if task.TaskSlug != "" {
+			spec.Labels["task_slug"] = task.TaskSlug
+		}
+		specs = append(specs, spec)
+	}
+
+	return managed, specs, nil
+}
+
+func releaseTaskPods(taskPods map[string]*shared.AgentPod) {
+	for _, pod := range taskPods {
+		if pod == nil {
+			continue
+		}
+		if managed := pod.ManagedPod(); managed != nil {
+			_ = managed.Demote(context.Background(), containerpod.TierCold)
+			managed.Release()
+		}
+		pod.Release()
+	}
 }
 
 // Cancel cancels a running DAG.
@@ -466,6 +723,7 @@ func (b *DAGBridge) Close() error {
 	b.mu.Unlock()
 
 	for _, meta := range remaining {
+		releaseTaskPods(meta.TaskPods)
 		if meta.Pod != nil {
 			meta.Pod.Release()
 		}
@@ -598,6 +856,7 @@ func (b *DAGBridge) cleanupDAG(dagID string) {
 	}
 	// Release pod guards directly (pod.Release is idempotent and logs
 	// diagnostic summaries of unreleased nodes).
+	releaseTaskPods(meta.TaskPods)
 	if meta.Pod != nil {
 		meta.Pod.Release()
 	}

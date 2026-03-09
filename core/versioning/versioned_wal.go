@@ -25,9 +25,9 @@ var (
 
 // VersionedWALConfig configures a disk-backed versioned WAL.
 type VersionedWALConfig struct {
-	Dir            string // .sylk/sessions/{sid}/wal/
-	RetainedMajors int    // default DefaultRetainedMajors
-	MaxIndexEntries int   // default DefaultMaxIndexEntries
+	Dir             string // .sylk/sessions/{sid}/wal/
+	RetainedMajors  int    // default DefaultRetainedMajors
+	MaxIndexEntries int    // default DefaultMaxIndexEntries
 }
 
 // VersionIndex is a lightweight in-memory entry pointing to a WAL file on disk.
@@ -53,6 +53,8 @@ type VersionedWAL struct {
 	retained int
 	maxIndex int
 }
+
+var _ SemanticWAL = (*VersionedWAL)(nil)
 
 // OpenVersionedWAL opens or creates a versioned WAL at the configured directory.
 // If index.json exists it is loaded; otherwise the index is rebuilt from a dir scan.

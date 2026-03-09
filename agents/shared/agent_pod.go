@@ -65,19 +65,19 @@ type ScribeFactory func(parentAgentType string, logger *slog.Logger) (Scribe, er
 
 // AgentPodConfig configures an AgentPod.
 type AgentPodConfig struct {
-	PodID        string
-	SessionID    string
-	Activator    guide.PodActivator
-	Registrar    PodRegistrar
-	ActivityPub  events.ActivityPublisher
+	PodID       string
+	SessionID   string
+	Activator   guide.PodActivator
+	Registrar   PodRegistrar
+	ActivityPub events.ActivityPublisher
 	// RegistrationVisibility controls the visibility of synthesized
 	// registration events emitted during pre-activation. Zero defaults to
 	// events.VisibilityUser for backward compatibility.
 	RegistrationVisibility events.EventVisibility
-	Logger       *slog.Logger
-	Scope        *concurrency.GoroutineScope
-	MemberTypes  []string
-	DisplayNames map[string]string
+	Logger                 *slog.Logger
+	Scope                  *concurrency.GoroutineScope
+	MemberTypes            []string
+	DisplayNames           map[string]string
 
 	// ScribeFactory creates Scribes for each member type. Nil = no Scribes.
 	ScribeFactory ScribeFactory
@@ -376,6 +376,11 @@ func (p *AgentPod) RegisteredAgentTypes() []string {
 // Otherwise falls back to the PodActivator.
 func (p *AgentPod) acquireGuard(ctx context.Context, agentType string) (func(), error) {
 	if p.managed != nil {
+		if p.managed.LoadTier() != pod.TierHot {
+			if err := p.managed.Promote(ctx, nil); err != nil {
+				return nil, err
+			}
+		}
 		return p.managed.AcquireRequestGuard(), nil
 	}
 	if p.activator != nil {

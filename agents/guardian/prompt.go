@@ -1,6 +1,11 @@
 package guardian
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/versioning"
+)
 
 // =============================================================================
 // System Prompt Modules
@@ -104,6 +109,10 @@ func (g *Guardian) buildSystemPrompt(intent GuardianIntent) string {
 	default:
 		modules = append(modules, guardianGuardrails, guardianSkillsGuide)
 	}
+
+	modules = append(modules, shared.BuildWorkspaceViewContext(shared.WorkspacePromptOptions{
+		DefaultView: versioning.WorkspaceViewGlobal,
+	}))
 
 	return strings.Join(modules, "\n\n---\n\n")
 }

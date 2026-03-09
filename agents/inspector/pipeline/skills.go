@@ -10,6 +10,7 @@ import (
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (pi *PipelineInspector) registerCoreSkills() {
@@ -27,6 +28,11 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(shared.ReadFileSkill(faFunc))
 	pi.skills.Register(shared.GlobSkill(faFunc))
 	pi.skills.Register(shared.GrepSkill(faFunc))
+	pi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
+	pi.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
+	pi.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
+	pi.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
+	pi.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
 
 	// Design validation skills (always registered — LLM selects based on context).
 	pi.skills.Register(shared.ValidateTokenUsageSkill(pi.toolRunner))

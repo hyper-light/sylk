@@ -56,7 +56,7 @@ func (c *CVSShim) BeginPipeline(cfg BeginPipelineConfig) (*PipelineVFS, error) {
 }
 
 func (c *CVSShim) CommitPipeline(pipelineID string) ([]VersionID, error) {
-	ver, err := c.session.CommitPipeline(pipelineID)
+	ver, err := c.session.CommitPipeline(context.Background(), pipelineID)
 	if err != nil {
 		return nil, err
 	}

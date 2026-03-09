@@ -10,17 +10,18 @@ import (
 	"strings"
 )
 
-// GlobalVFSFileAccess provides per-session CVS-backed file access for global
-// agents (Global Inspector, Global Tester). Reads from the session's CVS
-// committed state, falling back to disk for unversioned files. Writes go
-// through CVS staging.
+// GlobalVFSFileAccess provides per-session file access for global agents
+// (Global Inspector, Global Tester). It is a compatibility adapter over the
+// session versioning facade; reads prefer session state and fall back to disk
+// for untracked files, while writes flow through the session versioning layer.
 type GlobalVFSFileAccess struct {
 	cvs        CVS
 	workingDir string
 	readOnly   bool
 }
 
-// NewGlobalVFSFileAccess creates a FileAccess backed by a session's CVS.
+// NewGlobalVFSFileAccess creates a FileAccess backed by a session versioning
+// facade.
 func NewGlobalVFSFileAccess(cvs CVS, workingDir string, readOnly bool) *GlobalVFSFileAccess {
 	return &GlobalVFSFileAccess{
 		cvs:        cvs,
