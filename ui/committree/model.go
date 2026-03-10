@@ -132,33 +132,33 @@ type commitDismissMsg struct{}
 
 // toolbarButton identifies a toolbar button in the bottom bar.
 const (
-	toolbarCreate     = iota // Branch view: create a new branch.
-	toolbarMerge             // Branch view: merge selected branch.
-	toolbarBack              // Commit view: return to branch tree.
-	toolbarDiff              // Commit view: show diff for selected commit.
-	toolbarDiffOk            // Diff mode: confirm diff.
-	toolbarDiffCancel        // Diff mode: cancel diff.
-	toolbarMergeOk           // Merge mode: confirm merge.
-	toolbarMergeAbort        // Merge mode: abort merge.
-	toolbarPull              // Branch view: pull highlighted branch from remote.
-	toolbarPush              // Branch view: push highlighted branch to remote.
-	toolbarReset             // Commit view: enter reset mode.
-	toolbarResetHard         // Reset mode: hard reset.
-	toolbarResetMixed        // Reset mode: mixed reset.
-	toolbarResetSoft         // Reset mode: soft reset.
-	toolbarResetAbort        // Reset mode: cancel.
-	toolbarRevert            // Commit view: revert selected commit.
-	toolbarRevertOk          // Revert mode: confirm revert.
-	toolbarRevertAbort       // Revert mode: cancel revert.
-	toolbarCherryPick        // Commit view: enter cherry-pick mode.
-	toolbarCherryPickOk      // Cherry-pick mode: confirm.
-	toolbarCherryPickAbort   // Cherry-pick mode: cancel.
-	toolbarRebase            // Commit view: enter interactive rebase.
-	toolbarConflictContinue  // Conflict mode: continue after resolution.
-	toolbarConflictBypass    // Conflict mode: bypass (commit as-is).
-	toolbarConflictAbort     // Conflict mode: abort operation.
-	toolbarRebasePlanOk      // Rebase plan: confirm plan.
-	toolbarRebasePlanAbort   // Rebase plan: cancel.
+	toolbarCreate           = iota // Branch view: create a new branch.
+	toolbarMerge                   // Branch view: merge selected branch.
+	toolbarBack                    // Commit view: return to branch tree.
+	toolbarDiff                    // Commit view: show diff for selected commit.
+	toolbarDiffOk                  // Diff mode: confirm diff.
+	toolbarDiffCancel              // Diff mode: cancel diff.
+	toolbarMergeOk                 // Merge mode: confirm merge.
+	toolbarMergeAbort              // Merge mode: abort merge.
+	toolbarPull                    // Branch view: pull highlighted branch from remote.
+	toolbarPush                    // Branch view: push highlighted branch to remote.
+	toolbarReset                   // Commit view: enter reset mode.
+	toolbarResetHard               // Reset mode: hard reset.
+	toolbarResetMixed              // Reset mode: mixed reset.
+	toolbarResetSoft               // Reset mode: soft reset.
+	toolbarResetAbort              // Reset mode: cancel.
+	toolbarRevert                  // Commit view: revert selected commit.
+	toolbarRevertOk                // Revert mode: confirm revert.
+	toolbarRevertAbort             // Revert mode: cancel revert.
+	toolbarCherryPick              // Commit view: enter cherry-pick mode.
+	toolbarCherryPickOk            // Cherry-pick mode: confirm.
+	toolbarCherryPickAbort         // Cherry-pick mode: cancel.
+	toolbarRebase                  // Commit view: enter interactive rebase.
+	toolbarConflictContinue        // Conflict mode: continue after resolution.
+	toolbarConflictBypass          // Conflict mode: bypass (commit as-is).
+	toolbarConflictAbort           // Conflict mode: abort operation.
+	toolbarRebasePlanOk            // Rebase plan: confirm plan.
+	toolbarRebasePlanAbort         // Rebase plan: cancel.
 )
 
 // CreateBranchRequestMsg is emitted when the user confirms a branch name
@@ -243,7 +243,7 @@ type RebaseStartMsg struct {
 
 // RebasePlanItem describes one step in the interactive rebase plan.
 type RebasePlanItem struct {
-	Action  int    // Maps to git.RebaseAction
+	Action  int // Maps to git.RebaseAction
 	Hash    string
 	Subject string
 }
@@ -315,7 +315,7 @@ type Model struct {
 
 	// Delete confirmation state.
 	deleteConfirmActive bool
-	deleteConfirmYes   bool // true = (y)es highlighted, false = (n)o highlighted
+	deleteConfirmYes    bool // true = (y)es highlighted, false = (n)o highlighted
 
 	// Commit view state.
 	nodes       []TreeNode
@@ -359,9 +359,9 @@ type Model struct {
 	revertMode bool
 
 	// Cherry-pick mode state.
-	cherryPickMode       bool
-	cherryPickSelections []diffSelection
-	cherryPickTarget     string // Selected target branch name.
+	cherryPickMode           bool
+	cherryPickSelections     []diffSelection
+	cherryPickTarget         string   // Selected target branch name.
 	branchPickerActive       bool     // Target branch dropdown open.
 	branchPickerCursor       int      // Highlighted item index.
 	branchPickerScroll       int      // Scroll offset for the picker list.
@@ -370,12 +370,12 @@ type Model struct {
 	branchPickerFilterActive bool     // Filter input is active (/ or alt+f).
 
 	// Conflict resolution mode state.
-	conflictMode    bool
-	conflictOp      int // SequencerOp that caused the conflict.
-	conflictTotal   int
-	conflictCurrent int
-	conflictSubject string   // Subject of the conflicting commit.
-	conflictFiles   []string // Paths with conflicts.
+	conflictMode     bool
+	conflictOp       int // SequencerOp that caused the conflict.
+	conflictTotal    int
+	conflictCurrent  int
+	conflictSubject  string          // Subject of the conflicting commit.
+	conflictFiles    []string        // Paths with conflicts.
 	conflictResolved map[string]bool // path → resolved.
 
 	// Interactive rebase plan state.
@@ -1968,102 +1968,129 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 	if len(m.branches) == 0 {
 		return nil
 	}
-
-	// Diff/merge mode (not toolbar-focused): Enter/Space toggle selection, Esc exits.
-	if (m.diffMode || m.mergeMode) && !m.toolbarFocused && m.expandedIdx < 0 {
-		switch km.String() {
-		case "enter", " ":
-			if m.mergeMode {
-				m.toggleMergeSelection()
-			} else {
-				m.toggleBranchDiffSelection()
-			}
-		case "esc":
-			if m.mergeMode {
-				m.exitMergeMode()
-			} else {
-				m.exitBranchDiffMode()
-			}
-		case "j", "down", "shift+down":
-			m.moveBranchDown()
-		case "k", "up", "shift+up":
-			m.moveBranchUp()
-		case "l", "right":
-			m.moveBranchRight()
-		case "h", "left":
-			m.moveBranchLeft()
-		case "g":
-			m.branchIdx = 0
-		case "G":
-			m.branchIdx = len(m.branches) - 1
-		case "ctrl+d":
-			for range m.halfBranchPage() {
-				m.moveBranchDown()
-			}
-		case "ctrl+u":
-			for range m.halfBranchPage() {
-				m.moveBranchUp()
-			}
-		case "tab":
-			m.cycleCommitToolbar(1)
-			m.viewDirty = true
-			return nil
-		case "shift+tab":
-			m.cycleCommitToolbar(-1)
-			m.viewDirty = true
-			return nil
-		default:
-			return nil
-		}
-		m.ensureBranchVisible()
-		m.viewDirty = true
-		return nil
+	if cmd, handled := m.handleBranchSelectionModeKey(km); handled {
+		return cmd
 	}
-
-	// Expanded card: route to action handler.
 	if m.expandedIdx >= 0 {
 		return m.handleExpandedKey(km)
 	}
+	if cmd, handled := m.handleBranchToolbarFocusedKey(km); handled {
+		return cmd
+	}
+	return m.handleBranchNavigationKey(km)
+}
 
-	// Toolbar-focused: handle toolbar keys.
-	if m.toolbarFocused {
-		switch km.String() {
-		case "tab":
-			m.cycleCommitToolbar(1)
-			m.viewDirty = true
-			return nil
-		case "shift+tab":
-			m.cycleCommitToolbar(-1)
-			m.viewDirty = true
-			return nil
-		case "h", "left":
-			m.cycleCommitToolbar(-1)
-			if !m.toolbarFocused {
-				m.toolbarFocused = true // left/right don't exit focus
-			}
-			m.viewDirty = true
-			return nil
-		case "l", "right":
-			m.cycleCommitToolbar(1)
-			if !m.toolbarFocused {
-				m.toolbarFocused = true // left/right don't exit focus
-			}
-			m.viewDirty = true
-			return nil
-		case "enter", " ":
-			m.viewDirty = true
-			return m.executeToolbarAction()
-		case "esc", "q":
-			m.toolbarFocused = false
-			m.viewDirty = true
-			return nil
-		default:
-			m.toolbarFocused = false
-			return m.handleBranchKey(km)
+func (m *Model) handleBranchSelectionModeKey(km tea.KeyMsg) (tea.Cmd, bool) {
+	if (!m.diffMode && !m.mergeMode) || m.toolbarFocused || m.expandedIdx >= 0 {
+		return nil, false
+	}
+	switch km.String() {
+	case "enter", " ":
+		m.toggleBranchSelectionMode()
+	case "esc":
+		m.exitBranchSelectionMode()
+	case "tab":
+		return m.cycleBranchToolbarKey(1), true
+	case "shift+tab":
+		return m.cycleBranchToolbarKey(-1), true
+	default:
+		if !m.applyBranchNavigationKey(km.String()) {
+			return nil, true
 		}
 	}
+	m.finalizeBranchKeyNavigation()
+	return nil, true
+}
 
+func (m *Model) toggleBranchSelectionMode() {
+	if m.mergeMode {
+		m.toggleMergeSelection()
+		return
+	}
+	m.toggleBranchDiffSelection()
+}
+
+func (m *Model) exitBranchSelectionMode() {
+	if m.mergeMode {
+		m.exitMergeMode()
+		return
+	}
+	m.exitBranchDiffMode()
+}
+
+func (m *Model) handleBranchToolbarFocusedKey(km tea.KeyMsg) (tea.Cmd, bool) {
+	if !m.toolbarFocused {
+		return nil, false
+	}
 	switch km.String() {
+	case "tab":
+		return m.cycleBranchToolbarKey(1), true
+	case "shift+tab":
+		return m.cycleBranchToolbarKey(-1), true
+	case "h", "left":
+		return m.moveFocusedToolbarKey(-1), true
+	case "l", "right":
+		return m.moveFocusedToolbarKey(1), true
+	case "enter", " ":
+		m.viewDirty = true
+		return m.executeToolbarAction(), true
+	case "esc", "q":
+		m.toolbarFocused = false
+		m.viewDirty = true
+		return nil, true
+	default:
+		m.toolbarFocused = false
+		return m.handleBranchKey(km), true
+	}
+}
+
+func (m *Model) moveFocusedToolbarKey(delta int) tea.Cmd {
+	m.cycleCommitToolbar(delta)
+	if !m.toolbarFocused {
+		m.toolbarFocused = true
+	}
+	m.viewDirty = true
+	return nil
+}
+
+func (m *Model) cycleBranchToolbarKey(delta int) tea.Cmd {
+	m.cycleCommitToolbar(delta)
+	m.viewDirty = true
+	return nil
+}
+
+func (m *Model) handleBranchNavigationKey(km tea.KeyMsg) tea.Cmd {
+	switch km.String() {
+	case "tab":
+		return m.focusFirstBranchToolbarButton()
+	case "shift+tab":
+		m.expandBranch()
+		return nil
+	case "enter":
+		return m.enterBranch()
+	default:
+		if !m.applyBranchNavigationKey(km.String()) {
+			return nil
+		}
+	}
+	m.finalizeBranchKeyNavigation()
+	return nil
+}
+
+func (m *Model) focusFirstBranchToolbarButton() tea.Cmd {
+	buttons := m.toolbarButtons()
+	first := m.firstEnabledToolbar(buttons)
+	if first < 0 {
+		return nil
+	}
+	m.toolbarFocused = true
+	m.toolbarAction = first
+	m.viewDirty = true
+	return nil
+}
+
+func (m *Model) applyBranchNavigationKey(key string) bool {
+	switch key {
 	case "j", "down", "shift+down":
 		m.moveBranchDown()
 	case "k", "up", "shift+up":
@@ -2084,27 +2111,15 @@ func (m *Model) handleBranchKey(km tea.KeyMsg) tea.Cmd {
 		for range m.halfBranchPage() {
 			m.moveBranchUp()
 		}
-	case "tab":
-		buttons := m.toolbarButtons()
-		first := m.firstEnabledToolbar(buttons)
-		if first < 0 {
-			return nil
-		}
-		m.toolbarFocused = true
-		m.toolbarAction = first
-		m.viewDirty = true
-		return nil
-	case "shift+tab":
-		m.expandBranch()
-	case "enter":
-		return m.enterBranch()
 	default:
-		return nil
+		return false
 	}
+	return true
+}
 
+func (m *Model) finalizeBranchKeyNavigation() {
 	m.ensureBranchVisible()
 	m.viewDirty = true
-	return nil
 }
 
 // nextEnabledToolbar returns the next enabled toolbar index from `from` in the
@@ -2687,216 +2702,305 @@ func (m *Model) executeExpandedAction() tea.Cmd {
 	return nil
 }
 
-// executeToolbarAction emits the message for the currently selected toolbar
-// button. toolbarAction uses the unified index space: left buttons first,
-// then right buttons.
-func (m *Model) executeToolbarAction() tea.Cmd {
+type toolbarActionHandler func(*Model) tea.Cmd
+
+var toolbarActionHandlers = map[int]toolbarActionHandler{
+	toolbarCreate:           (*Model).executeToolbarCreate,
+	toolbarMerge:            (*Model).executeToolbarMerge,
+	toolbarBack:             (*Model).executeToolbarBack,
+	toolbarReset:            (*Model).executeToolbarReset,
+	toolbarResetHard:        (*Model).executeToolbarResetHard,
+	toolbarResetMixed:       (*Model).executeToolbarResetMixed,
+	toolbarResetSoft:        (*Model).executeToolbarResetSoft,
+	toolbarResetAbort:       (*Model).executeToolbarResetAbort,
+	toolbarRevert:           (*Model).executeToolbarRevert,
+	toolbarRevertOk:         (*Model).executeToolbarRevertOk,
+	toolbarRevertAbort:      (*Model).executeToolbarRevertAbort,
+	toolbarDiff:             (*Model).executeToolbarDiff,
+	toolbarDiffOk:           (*Model).executeToolbarDiffOk,
+	toolbarDiffCancel:       (*Model).executeToolbarDiffCancel,
+	toolbarMergeOk:          (*Model).executeToolbarMergeOk,
+	toolbarMergeAbort:       (*Model).executeToolbarMergeAbort,
+	toolbarPull:             (*Model).executeToolbarPull,
+	toolbarPush:             (*Model).executeToolbarPush,
+	toolbarCherryPick:       (*Model).executeToolbarCherryPick,
+	toolbarCherryPickOk:     (*Model).executeToolbarCherryPickOk,
+	toolbarCherryPickAbort:  (*Model).executeToolbarCherryPickAbort,
+	toolbarRebase:           (*Model).executeToolbarRebase,
+	toolbarConflictContinue: (*Model).executeToolbarConflictContinue,
+	toolbarConflictBypass:   (*Model).executeToolbarConflictBypass,
+	toolbarConflictAbort:    (*Model).executeToolbarConflictAbort,
+	toolbarRebasePlanOk:     (*Model).executeToolbarRebasePlanOk,
+	toolbarRebasePlanAbort:  (*Model).executeToolbarRebasePlanAbort,
+}
+
+func (m *Model) selectedToolbarButton() (int, bool) {
 	left := m.diffToolbarLeftButtons()
 	right := m.toolbarButtons()
 	all := slices.Concat(left, right)
 	if m.toolbarAction < 0 || m.toolbarAction >= len(all) {
+		return 0, false
+	}
+	button := all[m.toolbarAction]
+	if !m.isToolbarButtonEnabled(button) {
+		return 0, false
+	}
+	return button, true
+}
+
+// executeToolbarAction emits the message for the currently selected toolbar
+// button. toolbarAction uses the unified index space: left buttons first,
+// then right buttons.
+func (m *Model) executeToolbarAction() tea.Cmd {
+	button, ok := m.selectedToolbarButton()
+	if !ok {
 		return nil
 	}
-	if !m.isToolbarButtonEnabled(all[m.toolbarAction]) {
+	handler, ok := toolbarActionHandlers[button]
+	if !ok {
 		return nil
 	}
-	switch all[m.toolbarAction] {
-	case toolbarCreate:
-		if m.diffMode {
-			m.exitBranchDiffMode()
-		}
-		if m.mergeMode {
-			m.exitMergeMode()
-		}
-		m.activateCreateInput()
-		return nil
-	case toolbarMerge:
-		if m.diffMode {
-			m.exitBranchDiffMode()
-		}
-		if m.mergeMode {
-			m.exitMergeMode()
-		} else {
-			m.enterMergeMode()
-		}
-		return nil
-	case toolbarBack:
-		if m.diffMode {
-			m.exitDiffMode()
-		}
-		if m.resetMode {
-			m.exitResetMode()
-		}
-		if m.revertMode {
-			m.exitRevertMode()
-		}
-		m.ExitToBranches()
-		return nil
-	case toolbarReset:
-		if m.diffMode {
-			m.exitDiffMode()
-		}
-		if m.resetMode {
-			m.exitResetMode()
-		} else {
-			m.enterResetMode()
-		}
-		return nil
-	case toolbarResetHard:
-		hash := m.SelectedHash()
-		m.exitResetMode()
-		if hash == "" {
-			return nil
-		}
-		return func() tea.Msg { return ResetRequestMsg{Hash: hash, Mode: "hard"} }
-	case toolbarResetMixed:
-		hash := m.SelectedHash()
-		m.exitResetMode()
-		if hash == "" {
-			return nil
-		}
-		return func() tea.Msg { return ResetRequestMsg{Hash: hash, Mode: "mixed"} }
-	case toolbarResetSoft:
-		hash := m.SelectedHash()
-		m.exitResetMode()
-		if hash == "" {
-			return nil
-		}
-		return func() tea.Msg { return ResetRequestMsg{Hash: hash, Mode: "soft"} }
-	case toolbarResetAbort:
-		m.exitResetMode()
-		return nil
-	case toolbarRevert:
-		if m.resetMode {
-			m.exitResetMode()
-		}
-		if m.revertMode {
-			m.exitRevertMode()
-		} else {
-			m.enterRevertMode()
-		}
-		return nil
-	case toolbarRevertOk:
-		hash := m.SelectedHash()
-		m.exitRevertMode()
-		if hash == "" {
-			return nil
-		}
-		return func() tea.Msg { return RevertRequestMsg{Hash: hash} }
-	case toolbarRevertAbort:
-		m.exitRevertMode()
-		return nil
-	case toolbarDiff:
-		if m.mergeMode {
-			m.exitMergeMode()
-		}
-		if m.mode == viewBranches {
-			if m.diffMode {
-				m.exitBranchDiffMode()
-			} else {
-				m.enterBranchDiffMode()
-			}
-		} else {
-			if m.diffMode {
-				m.exitDiffMode()
-			} else {
-				m.enterDiffMode()
-			}
-		}
-		return nil
-	case toolbarDiffOk:
-		if m.mode == viewBranches {
-			hashes := m.BranchDiffHashes()
-			names := m.BranchDiffSelections()
-			m.exitBranchDiffMode()
-			return func() tea.Msg { return BranchDiffCompareMsg{Hashes: hashes, Names: names} }
-		}
-		hashes := m.DiffSelections()
+	return handler(m)
+}
+
+func (m *Model) executeToolbarCreate() tea.Cmd {
+	if m.diffMode {
+		m.exitBranchDiffMode()
+	}
+	if m.mergeMode {
+		m.exitMergeMode()
+	}
+	m.activateCreateInput()
+	return nil
+}
+
+func (m *Model) executeToolbarMerge() tea.Cmd {
+	if m.diffMode {
+		m.exitBranchDiffMode()
+	}
+	if m.mergeMode {
+		m.exitMergeMode()
+	} else {
+		m.enterMergeMode()
+	}
+	return nil
+}
+
+func (m *Model) executeToolbarBack() tea.Cmd {
+	if m.diffMode {
 		m.exitDiffMode()
-		return func() tea.Msg { return DiffCompareMsg{Hashes: hashes} }
-	case toolbarDiffCancel:
-		if m.mode == viewBranches {
+	}
+	if m.resetMode {
+		m.exitResetMode()
+	}
+	if m.revertMode {
+		m.exitRevertMode()
+	}
+	m.ExitToBranches()
+	return nil
+}
+
+func (m *Model) executeToolbarReset() tea.Cmd {
+	if m.diffMode {
+		m.exitDiffMode()
+	}
+	if m.resetMode {
+		m.exitResetMode()
+	} else {
+		m.enterResetMode()
+	}
+	return nil
+}
+
+func (m *Model) executeToolbarResetHard() tea.Cmd {
+	return m.executeToolbarResetRequest("hard")
+}
+
+func (m *Model) executeToolbarResetMixed() tea.Cmd {
+	return m.executeToolbarResetRequest("mixed")
+}
+
+func (m *Model) executeToolbarResetSoft() tea.Cmd {
+	return m.executeToolbarResetRequest("soft")
+}
+
+func (m *Model) executeToolbarResetRequest(mode string) tea.Cmd {
+	hash := m.SelectedHash()
+	m.exitResetMode()
+	if hash == "" {
+		return nil
+	}
+	return func() tea.Msg { return ResetRequestMsg{Hash: hash, Mode: mode} }
+}
+
+func (m *Model) executeToolbarResetAbort() tea.Cmd {
+	m.exitResetMode()
+	return nil
+}
+
+func (m *Model) executeToolbarRevert() tea.Cmd {
+	if m.resetMode {
+		m.exitResetMode()
+	}
+	if m.revertMode {
+		m.exitRevertMode()
+	} else {
+		m.enterRevertMode()
+	}
+	return nil
+}
+
+func (m *Model) executeToolbarRevertOk() tea.Cmd {
+	hash := m.SelectedHash()
+	m.exitRevertMode()
+	if hash == "" {
+		return nil
+	}
+	return func() tea.Msg { return RevertRequestMsg{Hash: hash} }
+}
+
+func (m *Model) executeToolbarRevertAbort() tea.Cmd {
+	m.exitRevertMode()
+	return nil
+}
+
+func (m *Model) executeToolbarDiff() tea.Cmd {
+	if m.mergeMode {
+		m.exitMergeMode()
+	}
+	if m.mode == viewBranches {
+		if m.diffMode {
 			m.exitBranchDiffMode()
 		} else {
-			m.exitDiffMode()
+			m.enterBranchDiffMode()
 		}
 		return nil
-	case toolbarMergeOk:
-		hashes := m.MergeHashes()
-		names := m.MergeNames()
-		m.exitMergeMode()
-		return func() tea.Msg { return MergeDiffCompareMsg{Hashes: hashes, Names: names} }
-	case toolbarMergeAbort:
-		m.exitMergeMode()
-		return nil
-	case toolbarPull:
-		name := m.selectedBranchName()
-		if name == "" {
-			return nil
-		}
-		return func() tea.Msg { return PullBranchMsg{Name: name} }
-	case toolbarPush:
-		name := m.selectedBranchName()
-		if name == "" {
-			return nil
-		}
-		return func() tea.Msg { return PushBranchMsg{Name: name} }
+	}
+	if m.diffMode {
+		m.exitDiffMode()
+	} else {
+		m.enterDiffMode()
+	}
+	return nil
+}
 
-	case toolbarCherryPick:
-		if m.cherryPickMode {
-			m.exitCherryPickMode()
-		} else {
-			m.enterCherryPickMode()
-		}
+func (m *Model) executeToolbarDiffOk() tea.Cmd {
+	if m.mode == viewBranches {
+		hashes := m.BranchDiffHashes()
+		names := m.BranchDiffSelections()
+		m.exitBranchDiffMode()
+		return func() tea.Msg { return BranchDiffCompareMsg{Hashes: hashes, Names: names} }
+	}
+	hashes := m.DiffSelections()
+	m.exitDiffMode()
+	return func() tea.Msg { return DiffCompareMsg{Hashes: hashes} }
+}
+
+func (m *Model) executeToolbarDiffCancel() tea.Cmd {
+	if m.mode == viewBranches {
+		m.exitBranchDiffMode()
+	} else {
+		m.exitDiffMode()
+	}
+	return nil
+}
+
+func (m *Model) executeToolbarMergeOk() tea.Cmd {
+	hashes := m.MergeHashes()
+	names := m.MergeNames()
+	m.exitMergeMode()
+	return func() tea.Msg { return MergeDiffCompareMsg{Hashes: hashes, Names: names} }
+}
+
+func (m *Model) executeToolbarMergeAbort() tea.Cmd {
+	m.exitMergeMode()
+	return nil
+}
+
+func (m *Model) executeToolbarPull() tea.Cmd {
+	name := m.selectedBranchName()
+	if name == "" {
 		return nil
-	case toolbarCherryPickOk:
-		if m.branchPickerActive {
-			// Confirm currently highlighted branch.
-			items := m.filteredBranchItems()
-			if len(items) == 0 {
-				return nil
-			}
-			selected := items[m.branchPickerCursor]
-			m.closeBranchPicker()
-			hashes := m.CherryPickSelections()
-			m.exitCherryPickMode()
-			return func() tea.Msg {
-				return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
-			}
-		}
-		// Open branch picker.
-		m.openBranchPicker()
+	}
+	return func() tea.Msg { return PullBranchMsg{Name: name} }
+}
+
+func (m *Model) executeToolbarPush() tea.Cmd {
+	name := m.selectedBranchName()
+	if name == "" {
 		return nil
-	case toolbarCherryPickAbort:
+	}
+	return func() tea.Msg { return PushBranchMsg{Name: name} }
+}
+
+func (m *Model) executeToolbarCherryPick() tea.Cmd {
+	if m.cherryPickMode {
 		m.exitCherryPickMode()
-		return nil
+	} else {
+		m.enterCherryPickMode()
+	}
+	return nil
+}
 
-	case toolbarRebase:
-		// Open branch picker for rebase onto target.
+func (m *Model) executeToolbarCherryPickOk() tea.Cmd {
+	if !m.branchPickerActive {
 		m.openBranchPicker()
 		return nil
+	}
+	items := m.filteredBranchItems()
+	if len(items) == 0 {
+		return nil
+	}
+	selected := items[m.branchPickerCursor]
+	m.closeBranchPicker()
+	hashes := m.CherryPickSelections()
+	m.exitCherryPickMode()
+	return func() tea.Msg {
+		return CherryPickRequestMsg{Hashes: hashes, TargetBranch: selected}
+	}
+}
 
-	case toolbarConflictContinue:
-		return func() tea.Msg { return SequencerContinueMsg{} }
-	case toolbarConflictBypass:
-		return func() tea.Msg { return SequencerBypassMsg{} }
-	case toolbarConflictAbort:
-		return func() tea.Msg { return SequencerAbortMsg{} }
+func (m *Model) executeToolbarCherryPickAbort() tea.Cmd {
+	m.exitCherryPickMode()
+	return nil
+}
 
-	case toolbarRebasePlanOk:
-		plan := make([]RebasePlanItem, len(m.rebasePlan))
-		for i, e := range m.rebasePlan {
-			plan[i] = RebasePlanItem{Action: e.action, Hash: e.hash, Subject: e.subject}
-		}
-		onto := m.rebaseOnto
-		m.ExitRebasePlan()
-		return func() tea.Msg {
+func (m *Model) executeToolbarRebase() tea.Cmd {
+	m.openBranchPicker()
+	return nil
+}
+
+func (m *Model) executeToolbarConflictContinue() tea.Cmd {
+	return func() tea.Msg { return SequencerContinueMsg{} }
+}
+
+func (m *Model) executeToolbarConflictBypass() tea.Cmd {
+	return func() tea.Msg { return SequencerBypassMsg{} }
+}
+
+func (m *Model) executeToolbarConflictAbort() tea.Cmd {
+	return func() tea.Msg { return SequencerAbortMsg{} }
+}
+
+func (m *Model) executeToolbarRebasePlanOk() tea.Cmd {
+	plan := m.snapshotRebasePlan()
+	onto := m.rebaseOnto
+	m.ExitRebasePlan()
+	return func() tea.Msg {
 		return RebaseStartMsg{OntoBranch: onto, SourceBranch: m.activeBranch, Plan: plan}
 	}
-	case toolbarRebasePlanAbort:
-		m.ExitRebasePlan()
-		return nil
+}
+
+func (m *Model) snapshotRebasePlan() []RebasePlanItem {
+	plan := make([]RebasePlanItem, len(m.rebasePlan))
+	for i, e := range m.rebasePlan {
+		plan[i] = RebasePlanItem{Action: e.action, Hash: e.hash, Subject: e.subject}
 	}
+	return plan
+}
+
+func (m *Model) executeToolbarRebasePlanAbort() tea.Cmd {
+	m.ExitRebasePlan()
 	return nil
 }
 

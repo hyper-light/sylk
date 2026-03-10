@@ -176,151 +176,123 @@ func canonicalIntentScore(
 	return score
 }
 
+var intentTransitionScores = map[Intent]map[Intent]int{
+	IntentChat: {
+		IntentHelp:   118,
+		IntentStatus: 95,
+	},
+	IntentHelp: {
+		IntentChat:   100,
+		IntentStatus: 92,
+	},
+	IntentStatus: {
+		IntentCheck:  118,
+		IntentHelp:   94,
+		IntentRecall: 88,
+	},
+	IntentUnknown: {
+		IntentHelp:   110,
+		IntentStatus: 102,
+		IntentRecall: 92,
+		IntentCheck:  92,
+		IntentChat:   84,
+	},
+	IntentPlan: {
+		IntentDesign:  124,
+		IntentExecute: 112,
+		IntentHelp:    106,
+		IntentRecall:  96,
+		IntentCheck:   90,
+	},
+	IntentDesign: {
+		IntentPlan:   124,
+		IntentHelp:   110,
+		IntentRecall: 98,
+		IntentCheck:  92,
+	},
+	IntentExecute: {
+		IntentComplete: 122,
+		IntentPlan:     110,
+		IntentStatus:   96,
+		IntentHelp:     88,
+	},
+	IntentRecall: {
+		IntentCheck:  120,
+		IntentFetch:  114,
+		IntentHelp:   96,
+		IntentFind:   88,
+		IntentSearch: 88,
+		IntentLocate: 88,
+	},
+	IntentCheck: {
+		IntentRecall: 120,
+		IntentStatus: 112,
+		IntentHelp:   96,
+		IntentFind:   88,
+		IntentSearch: 88,
+		IntentLocate: 88,
+	},
+	IntentFetch: {
+		IntentRecall: 116,
+		IntentSearch: 110,
+		IntentFind:   110,
+		IntentLocate: 110,
+		IntentHelp:   92,
+		IntentCheck:  88,
+	},
+	IntentFind: {
+		IntentFind:   124,
+		IntentSearch: 124,
+		IntentLocate: 124,
+		IntentFetch:  110,
+		IntentRecall: 92,
+		IntentCheck:  92,
+		IntentHelp:   84,
+	},
+	IntentSearch: {
+		IntentFind:   124,
+		IntentSearch: 124,
+		IntentLocate: 124,
+		IntentFetch:  110,
+		IntentRecall: 92,
+		IntentCheck:  92,
+		IntentHelp:   84,
+	},
+	IntentLocate: {
+		IntentFind:   124,
+		IntentSearch: 124,
+		IntentLocate: 124,
+		IntentFetch:  110,
+		IntentRecall: 92,
+		IntentCheck:  92,
+		IntentHelp:   84,
+	},
+	IntentStore: {
+		IntentDeclare:  112,
+		IntentComplete: 112,
+		IntentHelp:     72,
+		IntentCheck:    72,
+		IntentRecall:   72,
+	},
+	IntentDeclare: {
+		IntentStore:    118,
+		IntentComplete: 118,
+		IntentHelp:     72,
+	},
+	IntentComplete: {
+		IntentDeclare: 118,
+		IntentExecute: 118,
+		IntentStatus:  90,
+		IntentHelp:    72,
+	},
+}
+
 func intentTransitionScore(current Intent, candidate Intent) int {
 	if current == candidate {
 		return 140
 	}
-	switch current {
-	case IntentChat:
-		switch candidate {
-		case IntentHelp:
-			return 118
-		case IntentStatus:
-			return 95
-		case IntentChat:
-			return 140
-		}
-	case IntentHelp:
-		switch candidate {
-		case IntentChat:
-			return 100
-		case IntentStatus:
-			return 92
-		case IntentHelp:
-			return 140
-		}
-	case IntentStatus:
-		switch candidate {
-		case IntentCheck:
-			return 118
-		case IntentHelp:
-			return 94
-		case IntentRecall:
-			return 88
-		}
-	case IntentUnknown:
-		switch candidate {
-		case IntentHelp:
-			return 110
-		case IntentStatus:
-			return 102
-		case IntentRecall, IntentCheck:
-			return 92
-		case IntentChat:
-			return 84
-		}
-	case IntentPlan:
-		switch candidate {
-		case IntentDesign:
-			return 124
-		case IntentExecute:
-			return 112
-		case IntentHelp:
-			return 106
-		case IntentRecall:
-			return 96
-		case IntentCheck:
-			return 90
-		}
-	case IntentDesign:
-		switch candidate {
-		case IntentPlan:
-			return 124
-		case IntentHelp:
-			return 110
-		case IntentRecall:
-			return 98
-		case IntentCheck:
-			return 92
-		}
-	case IntentExecute:
-		switch candidate {
-		case IntentComplete:
-			return 122
-		case IntentPlan:
-			return 110
-		case IntentStatus:
-			return 96
-		case IntentHelp:
-			return 88
-		}
-	case IntentRecall:
-		switch candidate {
-		case IntentCheck:
-			return 120
-		case IntentFetch:
-			return 114
-		case IntentHelp:
-			return 96
-		case IntentFind, IntentSearch, IntentLocate:
-			return 88
-		}
-	case IntentCheck:
-		switch candidate {
-		case IntentRecall:
-			return 120
-		case IntentStatus:
-			return 112
-		case IntentHelp:
-			return 96
-		case IntentFind, IntentSearch, IntentLocate:
-			return 88
-		}
-	case IntentFetch:
-		switch candidate {
-		case IntentRecall:
-			return 116
-		case IntentSearch, IntentFind, IntentLocate:
-			return 110
-		case IntentHelp:
-			return 92
-		case IntentCheck:
-			return 88
-		}
-	case IntentFind, IntentSearch, IntentLocate:
-		switch candidate {
-		case IntentFind, IntentSearch, IntentLocate:
-			return 124
-		case IntentFetch:
-			return 110
-		case IntentRecall, IntentCheck:
-			return 92
-		case IntentHelp:
-			return 84
-		}
-	case IntentStore:
-		switch candidate {
-		case IntentDeclare, IntentComplete:
-			return 112
-		case IntentHelp, IntentCheck, IntentRecall:
-			return 72
-		}
-	case IntentDeclare:
-		switch candidate {
-		case IntentStore, IntentComplete:
-			return 118
-		case IntentHelp:
-			return 72
-		}
-	case IntentComplete:
-		switch candidate {
-		case IntentDeclare, IntentExecute:
-			return 118
-		case IntentStatus:
-			return 90
-		case IntentHelp:
-			return 72
-		}
+	if candidates, ok := intentTransitionScores[current]; ok {
+		return candidates[candidate]
 	}
 	return 0
 }
@@ -373,86 +345,135 @@ func canonicalDomainScore(
 	return score
 }
 
+type domainKeywordScorer func(Intent, routeCanonicalizationFeatures) int
+
+var domainKeywordScorers = map[Domain]domainKeywordScorer{
+	DomainCode:       scoreCodeDomainKeywords,
+	DomainFiles:      scoreFilesDomainKeywords,
+	DomainDesign:     scoreDesignDomainKeywords,
+	DomainTasks:      scoreTasksDomainKeywords,
+	DomainWorkflow:   scoreWorkflowDomainKeywords,
+	DomainHealth:     scoreHealthDomainKeywords,
+	DomainSystem:     scoreSystemDomainKeywords,
+	DomainResearch:   scoreResearchDomainKeywords,
+	DomainCompliance: scoreComplianceDomainKeywords,
+	DomainPatterns:   scorePatternsDomainKeywords,
+	DomainFailures:   scoreFailuresDomainKeywords,
+	DomainDecisions:  scoreDecisionsDomainKeywords,
+	DomainLearnings:  scoreLearningsDomainKeywords,
+	DomainIntents:    scoreIntentsDomainKeywords,
+}
+
 func domainKeywordScore(candidate Domain, intent Intent, features routeCanonicalizationFeatures) int {
+	if scorer, ok := domainKeywordScorers[candidate]; ok {
+		return scorer(intent, features)
+	}
+	return 0
+}
+
+func scoreCodeDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
 	score := 0
-	switch candidate {
-	case DomainCode:
-		if features.code {
-			score += 20
-		}
-		if features.testing || features.compliance {
-			score += 10
-		}
-	case DomainFiles:
-		if features.files {
-			score += 26
-		}
-	case DomainDesign:
-		if features.design {
-			score += 24
-		}
-		if intent == IntentPlan || intent == IntentDesign {
-			score += 12
-		}
-	case DomainTasks:
-		if features.tasks || features.workflow || features.approval {
-			score += 24
-		}
-		if intent == IntentExecute {
-			score += 18
-		}
-	case DomainWorkflow:
-		if features.workflow || features.status {
-			score += 26
-		}
-	case DomainHealth:
-		if features.health {
-			score += 30
-		}
-	case DomainSystem:
-		if features.status || features.health {
-			score += 18
-		}
-	case DomainResearch:
-		if features.research {
-			score += 24
-		}
-	case DomainCompliance:
-		if features.compliance || features.security {
-			score += 24
-		}
-	case DomainPatterns:
-		if features.patterns {
-			score += 26
-		} else if features.history {
-			score += 14
-		}
-	case DomainFailures:
-		if features.failures {
-			score += 30
-		} else if features.history {
-			score += 14
-		}
-	case DomainDecisions:
-		if features.decisions {
-			score += 32
-		} else if features.history {
-			score += 14
-		}
-	case DomainLearnings:
-		if features.learnings {
-			score += 28
-		} else if features.history {
-			score += 14
-		}
-	case DomainIntents:
-		if features.intents {
-			score += 28
-		} else if features.history {
-			score += 14
-		}
+	if features.code {
+		score += 20
+	}
+	if features.testing || features.compliance {
+		score += 10
 	}
 	return score
+}
+
+func scoreFilesDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	if features.files {
+		return 26
+	}
+	return 0
+}
+
+func scoreDesignDomainKeywords(intent Intent, features routeCanonicalizationFeatures) int {
+	score := 0
+	if features.design {
+		score += 24
+	}
+	if intent == IntentPlan || intent == IntentDesign {
+		score += 12
+	}
+	return score
+}
+
+func scoreTasksDomainKeywords(intent Intent, features routeCanonicalizationFeatures) int {
+	score := 0
+	if features.tasks || features.workflow || features.approval {
+		score += 24
+	}
+	if intent == IntentExecute {
+		score += 18
+	}
+	return score
+}
+
+func scoreWorkflowDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	if features.workflow || features.status {
+		return 26
+	}
+	return 0
+}
+
+func scoreHealthDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	if features.health {
+		return 30
+	}
+	return 0
+}
+
+func scoreSystemDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	if features.status || features.health {
+		return 18
+	}
+	return 0
+}
+
+func scoreResearchDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	if features.research {
+		return 24
+	}
+	return 0
+}
+
+func scoreComplianceDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	if features.compliance || features.security {
+		return 24
+	}
+	return 0
+}
+
+func scorePatternsDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	return historyBackedDomainKeywordScore(features.patterns, features.history, 26)
+}
+
+func scoreFailuresDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	return historyBackedDomainKeywordScore(features.failures, features.history, 30)
+}
+
+func scoreDecisionsDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	return historyBackedDomainKeywordScore(features.decisions, features.history, 32)
+}
+
+func scoreLearningsDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	return historyBackedDomainKeywordScore(features.learnings, features.history, 28)
+}
+
+func scoreIntentsDomainKeywords(_ Intent, features routeCanonicalizationFeatures) int {
+	return historyBackedDomainKeywordScore(features.intents, features.history, 28)
+}
+
+func historyBackedDomainKeywordScore(primary bool, history bool, primaryScore int) int {
+	if primary {
+		return primaryScore
+	}
+	if history {
+		return 14
+	}
+	return 0
 }
 
 func canonicalIntentCandidates(agent *AgentRegistration, classification *RouteResult) []Intent {

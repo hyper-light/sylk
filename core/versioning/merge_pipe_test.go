@@ -2,7 +2,7 @@ package versioning
 
 import (
 	"context"
-	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -154,7 +154,7 @@ func TestMergePipe_ContextCancellation(t *testing.T) {
 	close(mp.doneCh)
 }
 
-func TestMergePipe_RejectsStaleGlobalStateConflict(t *testing.T) {
+func TestMergePipe_PreciseDisjointSameFileMerges(t *testing.T) {
 	dir := t.TempDir()
 	wal := NewMemoryVersionedWAL()
 	globalVFS := NewGlobalVFS(VFSConfig{
@@ -165,8 +165,8 @@ func TestMergePipe_RejectsStaleGlobalStateConflict(t *testing.T) {
 
 	ctx := context.Background()
 	target := filepath.Join(dir, "a.go")
-	if err := globalVFS.Write(ctx, target, []byte("current")); err != nil {
-		t.Fatalf("Write: %v", err)
+	if err := os.WriteFile(target, []byte("abcdef"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
 
 	mp := NewMergePipe(MergePipeConfig{
@@ -180,17 +180,37 @@ func TestMergePipe_RejectsStaleGlobalStateConflict(t *testing.T) {
 	if err := mp.RegisterPipeline("pipe1"); err != nil {
 		t.Fatalf("RegisterPipeline: %v", err)
 	}
+	if err := mp.RegisterPipeline("pipe2"); err != nil {
+		t.Fatalf("RegisterPipeline: %v", err)
+	}
 
-	_, err := mp.Merge(ctx, "pipe1", []FileModification{
+	if _, err := mp.Merge(ctx, "pipe1", []FileModification{
 		{
 			OriginalPath: target,
 			Operation:    FileOpModify,
-			OldContent:   []byte("stale"),
-			NewContent:   []byte("pipeline"),
+			OldContent:   []byte("abcdef"),
+			NewContent:   []byte("abQQcdef"),
 		},
-	})
-	var conflictErr *ConflictError
-	if !errors.As(err, &conflictErr) {
-		t.Fatalf("expected conflict error, got %v", err)
+	}); err != nil {
+		t.Fatalf("Merge pipe1: %v", err)
+	}
+
+	if _, err := mp.Merge(ctx, "pipe2", []FileModification{
+		{
+			OriginalPath: target,
+			Operation:    FileOpModify,
+			OldContent:   []byte("abcdef"),
+			NewContent:   []byte("abcdeZZf"),
+		},
+	}); err != nil {
+		t.Fatalf("Merge pipe2: %v", err)
+	}
+
+	content, err := globalVFS.Read(ctx, target)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(content) != "abQQcdeZZf" {
+		t.Fatalf("content = %q, want %q", string(content), "abQQcdeZZf")
 	}
 }

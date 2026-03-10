@@ -28,10 +28,13 @@ func TestRunCommandRejectsShellControlOperators(t *testing.T) {
 func TestRunCommandMaterializesPipelineVFSWrites(t *testing.T) {
 	root := t.TempDir()
 
-	svfs := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
 		SessionID:  "sess-1",
 		WorkingDir: root,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	pipe, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
 		PipelineID: "task-1",
 		SessionID:  "sess-1",

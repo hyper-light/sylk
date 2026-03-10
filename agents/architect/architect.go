@@ -1053,6 +1053,9 @@ func (a *Architect) processForwardedRequest(ctx context.Context, fwd *guide.Forw
 	a.logInfo("processForwardedRequest: resolving intent handler",
 		"intent", string(fwd.Intent),
 		"ctx_deadline", contextDeadlineString(ctx))
+	if controlResult, handled, controlErr := a.handleControlPlaneForward(ctx, fwd); handled {
+		return controlResult, controlErr
+	}
 	architectDebugLog().Info("handoff: PROCESS_FWD_REQUEST",
 		"intent", string(fwd.Intent),
 		"user_input", truncateString(fwd.Input, 300),

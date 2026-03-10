@@ -2,6 +2,7 @@ package versioning
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -142,4 +143,57 @@ func TestDiskFlusher_EmptyFlush(t *testing.T) {
 	if result.FilesWritten != 0 {
 		t.Errorf("FilesWritten = %d, want 0", result.FilesWritten)
 	}
+}
+
+func TestDiskFlusher_FlushRollbackOnCheckpointFailure(t *testing.T) {
+	dir := t.TempDir()
+	backing := NewMemoryVersionedWAL()
+
+	globalVFS := NewGlobalVFS(VFSConfig{
+		PipelineID: "global",
+		WorkingDir: dir,
+	})
+	defer globalVFS.Close()
+
+	target := filepath.Join(dir, "rolled-back.txt")
+	if err := os.WriteFile(target, []byte("committed"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := globalVFS.Write(context.Background(), target, []byte("draft")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	df := NewDiskFlusher(DiskFlusherConfig{
+		GlobalVFS:  globalVFS,
+		WAL:        failingCheckpointWAL{SemanticWAL: backing},
+		WorkingDir: dir,
+	})
+
+	if _, err := df.Flush(context.Background()); err == nil {
+		t.Fatal("Flush error = nil, want checkpoint failure")
+	}
+
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(content) != "committed" {
+		t.Fatalf("disk content = %q, want %q", string(content), "committed")
+	}
+
+	overlay, err := globalVFS.Read(context.Background(), target)
+	if err != nil {
+		t.Fatalf("GlobalVFS.Read: %v", err)
+	}
+	if string(overlay) != "draft" {
+		t.Fatalf("overlay content = %q, want %q", string(overlay), "draft")
+	}
+}
+
+type failingCheckpointWAL struct {
+	SemanticWAL
+}
+
+func (w failingCheckpointWAL) AppendCheckpoint([]WALFileDelta) (SemanticVersion, error) {
+	return SemanticVersion{}, errors.New("checkpoint unavailable")
 }

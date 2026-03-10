@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -1240,15 +1241,32 @@ func (m *AppModel) postDispatchCmds(dispatchCmd tea.Cmd, scheduleBlink bool) tea
 }
 
 // dispatch is the main message handler.
-func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
-	switch typed := raw.(type) {
-	case tea.WindowSizeMsg:
-		return m, m.handleResize(typed)
-	case tea.KeyMsg:
-		return m.handleKey(typed)
-	case tea.MouseMsg:
-		return m, m.handleMouse(typed)
-	case msg.SubmitPromptMsg:
+type appMsgDispatchRoute func(*AppModel, tea.Msg) (tea.Model, tea.Cmd)
+
+func appMsgCmdRoute[T any](fn func(*AppModel, T) tea.Cmd) appMsgDispatchRoute {
+	return func(m *AppModel, raw tea.Msg) (tea.Model, tea.Cmd) {
+		return m, fn(m, raw.(T))
+	}
+}
+
+func appMsgModelRoute[T any](fn func(*AppModel, T) (tea.Model, tea.Cmd)) appMsgDispatchRoute {
+	return func(m *AppModel, raw tea.Msg) (tea.Model, tea.Cmd) {
+		return fn(m, raw.(T))
+	}
+}
+
+func appMsgStateRoute[T any](fn func(*AppModel, T)) appMsgDispatchRoute {
+	return func(m *AppModel, raw tea.Msg) (tea.Model, tea.Cmd) {
+		fn(m, raw.(T))
+		return m, nil
+	}
+}
+
+var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
+	reflect.TypeFor[tea.WindowSizeMsg](): appMsgCmdRoute((*AppModel).handleResize),
+	reflect.TypeFor[tea.KeyMsg]():        appMsgModelRoute((*AppModel).handleKey),
+	reflect.TypeFor[tea.MouseMsg]():      appMsgCmdRoute((*AppModel).handleMouse),
+	reflect.TypeFor[msg.SubmitPromptMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.SubmitPromptMsg) tea.Cmd {
 		if m.editCmdInput {
 			m.editCmdInput = false
 			m.input.SetLineStyler(nil)
@@ -1257,7 +1275,7 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				m.focusCodePanel()
 				m.syncFocusState()
 			}
-			return m, exCmd
+			return exCmd
 		}
 		if m.viewMode == ViewEdit && isInlineExCommand(typed.Text) {
 			exCmd := m.handleExCommand(typed.Text)
@@ -1265,89 +1283,79 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				m.focusCodePanel()
 				m.syncFocusState()
 			}
-			return m, exCmd
+			return exCmd
 		}
 		if cmd, ok := parseChatCommand(typed.Text); ok {
-			return m, m.handleChatCommand(cmd, typed)
+			return m.handleChatCommand(cmd, typed)
 		}
-		return m, m.handleSubmit(typed)
-	case msg.LoginResultMsg:
-		return m, m.handleLoginResult(typed)
-	case msg.ModelChangeMsg:
-		return m, m.handleModelChange(typed)
-	case msg.ModelSwapResultMsg:
-		return m, m.handleModelSwapResult(typed)
-	case oauthSessionStartedMsg:
-		return m, m.handleOAuthSessionStarted(typed)
-	case msg.AuthStatusMsg:
+		return m.handleSubmit(typed)
+	}),
+	reflect.TypeFor[msg.LoginResultMsg]():     appMsgCmdRoute((*AppModel).handleLoginResult),
+	reflect.TypeFor[msg.ModelChangeMsg]():     appMsgCmdRoute((*AppModel).handleModelChange),
+	reflect.TypeFor[msg.ModelSwapResultMsg](): appMsgCmdRoute((*AppModel).handleModelSwapResult),
+	reflect.TypeFor[oauthSessionStartedMsg](): appMsgCmdRoute((*AppModel).handleOAuthSessionStarted),
+	reflect.TypeFor[msg.AuthStatusMsg](): appMsgStateRoute(func(m *AppModel, typed msg.AuthStatusMsg) {
 		for provider, available := range typed.Providers {
 			m.statusBar.SetAuthStatus(provider, available)
 		}
 		if method, ok := typed.Methods["openai"]; ok {
 			m.agentPanel.SetOpenAIAuthMethod(method)
 		}
-		return m, nil
-	case msg.InterruptMsg:
-		return m, m.handleInterrupt()
-	case msg.QuitConfirmMsg:
-		return m, m.handleQuit()
-	case msg.TickMsg:
-		return m, m.handleTick(typed)
-	case msg.DecorTickMsg:
-		return m, m.handleDecorTick(typed)
-	case msg.BlinkMsg:
-		return m, m.handleBlink(typed)
-	case msg.ResizeSettleMsg:
+	}),
+	reflect.TypeFor[msg.InterruptMsg]():   appMsgCmdRoute(func(m *AppModel, _ msg.InterruptMsg) tea.Cmd { return m.handleInterrupt() }),
+	reflect.TypeFor[msg.QuitConfirmMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.QuitConfirmMsg) tea.Cmd { return m.handleQuit() }),
+	reflect.TypeFor[msg.TickMsg]():        appMsgCmdRoute((*AppModel).handleTick),
+	reflect.TypeFor[msg.DecorTickMsg]():   appMsgCmdRoute((*AppModel).handleDecorTick),
+	reflect.TypeFor[msg.BlinkMsg]():       appMsgCmdRoute((*AppModel).handleBlink),
+	reflect.TypeFor[msg.ResizeSettleMsg](): appMsgStateRoute(func(m *AppModel, typed msg.ResizeSettleMsg) {
 		if typed.Gen == m.resizeGen {
 			// Full recalc: recalcLayout() → SetStructure() clears all
 			// caches and marks every slot dirty — no separate InvalidateAll needed.
 			m.recalcLayout()
 			m.viewDirty = true
 		}
-		return m, nil
-	case msg.LSPFlushMsg:
-		return m, m.handleLSPFlush(typed)
-	case msg.QueueAdvanceMsg:
-		return m, m.dispatchQueueEntries(typed.EntryIDs)
-	case msg.FocusPanelMsg:
-		return m, m.handleFocusPanel(typed)
-	case msg.PlanUpdateMsg:
-		return m, m.handlePlanUpdate(typed)
-	case msg.PlanViewToggleMsg:
-		return m, m.handlePlanViewToggle()
-	case msg.PipelineStateMsg:
+	}),
+	reflect.TypeFor[msg.LSPFlushMsg]():     appMsgCmdRoute((*AppModel).handleLSPFlush),
+	reflect.TypeFor[msg.QueueAdvanceMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.QueueAdvanceMsg) tea.Cmd { return m.dispatchQueueEntries(typed.EntryIDs) }),
+	reflect.TypeFor[msg.FocusPanelMsg]():   appMsgCmdRoute((*AppModel).handleFocusPanel),
+	reflect.TypeFor[msg.PlanUpdateMsg]():   appMsgCmdRoute((*AppModel).handlePlanUpdate),
+	reflect.TypeFor[msg.PlanViewToggleMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.PlanViewToggleMsg) tea.Cmd {
+		return m.handlePlanViewToggle()
+	}),
+	reflect.TypeFor[msg.PipelineStateMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.PipelineStateMsg) tea.Cmd {
 		comp, cmd := m.agentPanel.Update(typed)
 		m.agentPanel = comp.(*agentpkg.Model)
 		m.markSlotDirty(compositor.SlotLeft)
-		return m, cmd
-	case msg.VariantStateMsg:
+		return cmd
+	}),
+	reflect.TypeFor[msg.VariantStateMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.VariantStateMsg) tea.Cmd {
 		comp, cmd := m.agentPanel.Update(typed)
 		m.agentPanel = comp.(*agentpkg.Model)
 		m.markSlotDirty(compositor.SlotLeft)
-		return m, cmd
-	case msg.OpenEditorMsg:
-		return m, m.handleOpenEditor(typed)
-	case msg.CloseEditorMsg:
-		return m, m.handleCloseEditor()
-	case msg.FileOpenMsg:
+		return cmd
+	}),
+	reflect.TypeFor[msg.OpenEditorMsg]():  appMsgCmdRoute((*AppModel).handleOpenEditor),
+	reflect.TypeFor[msg.CloseEditorMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.CloseEditorMsg) tea.Cmd { return m.handleCloseEditor() }),
+	reflect.TypeFor[msg.FileOpenMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.FileOpenMsg) tea.Cmd {
 		// Dismiss preview only when opening a NEW file (not already a tab).
 		// Tab switches (shift+tab) should keep the preview visible.
 		if m.hasPreview() && !m.isExistingTab(typed.Path) {
 			m.dismissPreview()
 		}
-		return m, m.handleFileOpen(typed)
-	case msg.FilePreviewMsg:
-		return m, m.handleFilePreview(typed)
-	case msg.FileTreeEntryCreatedMsg:
+		return m.handleFileOpen(typed)
+	}),
+	reflect.TypeFor[msg.FilePreviewMsg](): appMsgCmdRoute((*AppModel).handleFilePreview),
+	reflect.TypeFor[msg.FileTreeEntryCreatedMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.FileTreeEntryCreatedMsg) tea.Cmd {
 		m.nudgeGitWatcher()
-		if !typed.IsDir {
-			return m, func() tea.Msg { return msg.FileOpenMsg{Path: typed.Path} }
+		if typed.IsDir {
+			return nil
 		}
-		return m, nil
-	case msg.FileTreeEntryRenamedMsg:
+		return func() tea.Msg { return msg.FileOpenMsg{Path: typed.Path} }
+	}),
+	reflect.TypeFor[msg.FileTreeEntryRenamedMsg](): appMsgStateRoute(func(m *AppModel, _ msg.FileTreeEntryRenamedMsg) {
 		m.nudgeGitWatcher()
-		return m, nil
-	case msg.FileTreeEntryDeletedMsg:
+	}),
+	reflect.TypeFor[msg.FileTreeEntryDeletedMsg](): appMsgStateRoute(func(m *AppModel, typed msg.FileTreeEntryDeletedMsg) {
 		m.nudgeGitWatcher()
 		if m.codePanel.FilePath() == typed.Path {
 			m.codePanel.ClearFile()
@@ -1356,8 +1364,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.focusedEditor().ClearFile()
 		}
 		m.fileTree.SetActiveFile("")
-		return m, nil
-	case msg.GitStatusMsg:
+	}),
+	reflect.TypeFor[msg.GitStatusMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.GitStatusMsg) tea.Cmd {
 		m.fileTree.SetGitStatus(typed.StatusMap, typed.TrackedSet, typed.TrackedDirs)
 		cmds := []tea.Cmd{m.gitWatchCmd(), m.detectSequencerStateCmd()}
 		if m.viewMode == ViewGit {
@@ -1367,8 +1375,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.loadBranchDAGCmd(m.commitTree.ActiveBranch(), defaultBranch))
 			}
 		}
-		return m, tea.Batch(cmds...)
-	case gitQuickStatusMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[gitQuickStatusMsg](): appMsgStateRoute(func(m *AppModel, typed gitQuickStatusMsg) {
 		if m.commitTree != nil {
 			m.commitTree.SetWorkingTreeStatus(typed.dirty, typed.conflicts)
 			m.commitTree.SetHasIndexStaged(typed.hasIndexStaged)
@@ -1376,8 +1385,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitPanel != nil {
 			m.gitPanel.SetHasStash(typed.hasStash)
 		}
-		return m, nil
-	case gitBranchesLoadedMsg:
+	}),
+	reflect.TypeFor[gitBranchesLoadedMsg](): appMsgCmdRoute(func(m *AppModel, typed gitBranchesLoadedMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.SetBranches(typed.branches, typed.defaultBranch)
 			m.commitTree.SetWorkingTreeStatus(typed.dirty, typed.conflicts)
@@ -1386,22 +1395,19 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if m.gitPanel != nil {
 			m.gitPanel.SetHasStash(typed.hasStash)
 		}
-		// Fire async divergence + stash badge loading.
-		return m, tea.Batch(m.computeDivergenceBatchCmd(), m.loadBranchStashesCmd())
-
-	case msg.DivergenceLoadedMsg:
+		return tea.Batch(m.computeDivergenceBatchCmd(), m.loadBranchStashesCmd())
+	}),
+	reflect.TypeFor[msg.DivergenceLoadedMsg](): appMsgStateRoute(func(m *AppModel, typed msg.DivergenceLoadedMsg) {
 		if m.gitPanel != nil && len(typed.Info) > 0 {
 			m.gitPanel.SetDivergence(typed.Info)
 		}
-		return m, nil
-
-	case branchStashesLoadedMsg:
+	}),
+	reflect.TypeFor[branchStashesLoadedMsg](): appMsgStateRoute(func(m *AppModel, typed branchStashesLoadedMsg) {
 		if m.gitPanel != nil && len(typed.stashes) > 0 {
 			m.gitPanel.SetBranchStashes(typed.stashes)
 		}
-		return m, nil
-
-	case msg.SequencerFileStateMsg:
+	}),
+	reflect.TypeFor[msg.SequencerFileStateMsg](): appMsgStateRoute(func(m *AppModel, typed msg.SequencerFileStateMsg) {
 		if typed.State != nil && typed.State.Active {
 			step := fmt.Sprintf("%d/%d", typed.State.CurrentStep+1, typed.State.TotalSteps)
 			prompt := strings.ToTitle(typed.State.Type[:1]) + typed.State.Type[1:] + "ing " + step
@@ -1410,22 +1416,21 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.statusBar.SetPrompt(prompt)
 			m.statusBar.SetMode(strings.ToUpper(typed.State.Type))
-		} else {
-			m.statusBar.ClearPrompt()
+			return
 		}
-		return m, nil
-
-	case committree.BranchSelectedMsg:
-		if m.viewMode == ViewGit && m.gitBus != nil {
-			defaultBranch := ""
-			if m.commitTree != nil {
-				defaultBranch = m.commitTree.GetDefaultBranch()
-			}
-			return m, m.loadBranchDAGCmd(typed.Name, defaultBranch)
+		m.statusBar.ClearPrompt()
+	}),
+	reflect.TypeFor[committree.BranchSelectedMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.BranchSelectedMsg) tea.Cmd {
+		if m.viewMode != ViewGit || m.gitBus == nil {
+			return nil
 		}
-		return m, nil
-
-	case gitpanel.BranchCheckedOutMsg:
+		defaultBranch := ""
+		if m.commitTree != nil {
+			defaultBranch = m.commitTree.GetDefaultBranch()
+		}
+		return m.loadBranchDAGCmd(typed.Name, defaultBranch)
+	}),
+	reflect.TypeFor[gitpanel.BranchCheckedOutMsg](): appMsgCmdRoute(func(m *AppModel, typed gitpanel.BranchCheckedOutMsg) tea.Cmd {
 		m.statusBar.SetFlash("Switched to " + typed.Name)
 		m.nudgeGitWatcher()
 		var cmds []tea.Cmd
@@ -1433,7 +1438,6 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		// Check if the new branch has a saved stash.
 		if m.gitBus != nil {
 			bus := m.gitBus
 			name := typed.Name
@@ -1449,9 +1453,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				return nil
 			})
 		}
-		return m, tea.Batch(cmds...)
-
-	case gitpanel.CommitCheckedOutMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[gitpanel.CommitCheckedOutMsg](): appMsgCmdRoute(func(m *AppModel, typed gitpanel.CommitCheckedOutMsg) tea.Cmd {
 		m.statusBar.SetFlash("Checked out " + typed.Hash[:min(len(typed.Hash), 8)])
 		m.nudgeGitWatcher()
 		var cmds []tea.Cmd
@@ -1459,58 +1463,55 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case gitpanel.BranchCheckoutBlockedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[gitpanel.BranchCheckoutBlockedMsg](): appMsgStateRoute(func(m *AppModel, typed gitpanel.BranchCheckoutBlockedMsg) {
 		m.statusBar.SetFlash(typed.Reason)
-		return m, nil
-
-	case committree.BranchSwitchMsg:
-		if m.gitBus != nil {
-			bus := m.gitBus
-			name := typed.Name
-			return m, func() tea.Msg {
-				// Auto-stash dirty files for the current branch before switching.
-				branches, bErr := bus.ListBranches()
-				if bErr == nil {
-					for _, b := range branches {
-						if !b.IsHead {
-							continue
-						}
-						statuses, _, _ := bus.UncommittedFileStatuses()
-						if len(statuses) > 0 {
-							paths := make([]string, 0, len(statuses))
-							for p := range statuses {
-								paths = append(paths, p)
-							}
-							_, _ = bus.StashForBranch(b.Name, paths)
-						}
-						break
+	}),
+	reflect.TypeFor[committree.BranchSwitchMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.BranchSwitchMsg) tea.Cmd {
+		if m.gitBus == nil {
+			return nil
+		}
+		bus := m.gitBus
+		name := typed.Name
+		return func() tea.Msg {
+			branches, bErr := bus.ListBranches()
+			if bErr == nil {
+				for _, b := range branches {
+					if !b.IsHead {
+						continue
 					}
+					statuses, _, _ := bus.UncommittedFileStatuses()
+					if len(statuses) > 0 {
+						paths := make([]string, 0, len(statuses))
+						for p := range statuses {
+							paths = append(paths, p)
+						}
+						_, _ = bus.StashForBranch(b.Name, paths)
+					}
+					break
 				}
-
-				if err := bus.CheckoutBranch(name); err != nil {
-					return gitpanel.BranchCheckoutBlockedMsg{Reason: err.Error()}
-				}
-				return gitpanel.BranchCheckedOutMsg{Name: name}
 			}
-		}
-		return m, nil
-
-	case committree.BranchDeleteMsg:
-		if m.gitBus != nil {
-			bus := m.gitBus
-			name := typed.Name
-			return m, func() tea.Msg {
-				if err := bus.DeleteBranch(name); err != nil {
-					return branchDeleteFailedMsg{reason: err.Error()}
-				}
-				return branchDeletedMsg{name: name}
+			if err := bus.CheckoutBranch(name); err != nil {
+				return gitpanel.BranchCheckoutBlockedMsg{Reason: err.Error()}
 			}
+			return gitpanel.BranchCheckedOutMsg{Name: name}
 		}
-		return m, nil
-
-	case branchDeletedMsg:
+	}),
+	reflect.TypeFor[committree.BranchDeleteMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.BranchDeleteMsg) tea.Cmd {
+		if m.gitBus == nil {
+			return nil
+		}
+		bus := m.gitBus
+		name := typed.Name
+		return func() tea.Msg {
+			if err := bus.DeleteBranch(name); err != nil {
+				return branchDeleteFailedMsg{reason: err.Error()}
+			}
+			return branchDeletedMsg{name: name}
+		}
+	}),
+	reflect.TypeFor[branchDeletedMsg](): appMsgCmdRoute(func(m *AppModel, typed branchDeletedMsg) tea.Cmd {
 		m.statusBar.SetFlash("Deleted branch " + typed.name)
 		m.nudgeGitWatcher()
 		var cmds []tea.Cmd
@@ -1518,13 +1519,12 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case branchDeleteFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[branchDeleteFailedMsg](): appMsgStateRoute(func(m *AppModel, typed branchDeleteFailedMsg) {
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case mergeBranchDoneMsg:
+	}),
+	reflect.TypeFor[mergeBranchDoneMsg](): appMsgCmdRoute(func(m *AppModel, typed mergeBranchDoneMsg) tea.Cmd {
 		m.exitMergeDiffView()
 		flash := "Merged " + typed.source + " → " + typed.target
 		if typed.deleted {
@@ -1540,43 +1540,40 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case mergeBranchFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[mergeBranchFailedMsg](): appMsgStateRoute(func(m *AppModel, typed mergeBranchFailedMsg) {
 		if m.mergeDiffView != nil {
 			m.mergeDiffView.SetMergeError("Merge failed: " + typed.reason)
-		} else {
-			m.statusBar.SetFlash("Merge failed: " + typed.reason)
+			return
 		}
-		return m, nil
-
-	case committree.CreateBranchRequestMsg:
-		if m.gitBus != nil {
-			if typed.AtHash == "" {
-				m.commitTree.RecordBranchParent(typed.Name, typed.ParentBranch)
-			}
-			bus := m.gitBus
-			name, parent, atHash := typed.Name, typed.ParentBranch, typed.AtHash
-			return m, func() tea.Msg {
-				var hash string
-				if atHash != "" {
-					hash = atHash
-				} else {
-					var err error
-					hash, err = bus.BranchTipHash(parent)
-					if err != nil {
-						return branchCreateFailedMsg{reason: err.Error()}
-					}
-				}
-				if err := bus.CreateBranch(name, hash); err != nil {
+		m.statusBar.SetFlash("Merge failed: " + typed.reason)
+	}),
+	reflect.TypeFor[committree.CreateBranchRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.CreateBranchRequestMsg) tea.Cmd {
+		if m.gitBus == nil {
+			return nil
+		}
+		if typed.AtHash == "" {
+			m.commitTree.RecordBranchParent(typed.Name, typed.ParentBranch)
+		}
+		bus := m.gitBus
+		name, parent, atHash := typed.Name, typed.ParentBranch, typed.AtHash
+		return func() tea.Msg {
+			hash := atHash
+			if hash == "" {
+				var err error
+				hash, err = bus.BranchTipHash(parent)
+				if err != nil {
 					return branchCreateFailedMsg{reason: err.Error()}
 				}
-				return branchCreatedMsg{name: name}
 			}
+			if err := bus.CreateBranch(name, hash); err != nil {
+				return branchCreateFailedMsg{reason: err.Error()}
+			}
+			return branchCreatedMsg{name: name}
 		}
-		return m, nil
-
-	case branchCreatedMsg:
+	}),
+	reflect.TypeFor[branchCreatedMsg](): appMsgCmdRoute(func(m *AppModel, typed branchCreatedMsg) tea.Cmd {
 		m.statusBar.SetFlash("Created branch " + typed.name)
 		m.nudgeGitWatcher()
 		var cmds []tea.Cmd
@@ -1584,37 +1581,33 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case branchCreateFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[branchCreateFailedMsg](): appMsgStateRoute(func(m *AppModel, typed branchCreateFailedMsg) {
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case committree.CommitRequestMsg:
-		if m.gitBus != nil && m.gitPanel != nil {
-			paths := m.gitPanel.StagedFilePaths()
-			message := typed.Message
-			if len(paths) == 0 {
-				m.statusBar.SetFlash("No files staged")
-				return m, nil
-			}
-			// Route through pre-commit pipeline (large file + secret scan).
-			return m, m.preCommitCheckCmd(paths, message)
+	}),
+	reflect.TypeFor[committree.CommitRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.CommitRequestMsg) tea.Cmd {
+		if m.gitBus == nil || m.gitPanel == nil {
+			return nil
 		}
-		return m, nil
-
-	case msg.PreCommitCleanMsg:
-		// Pre-commit checks passed — proceed with actual commit.
+		paths := m.gitPanel.StagedFilePaths()
+		if len(paths) == 0 {
+			m.statusBar.SetFlash("No files staged")
+			return nil
+		}
+		return m.preCommitCheckCmd(paths, typed.Message)
+	}),
+	reflect.TypeFor[msg.PreCommitCleanMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.PreCommitCleanMsg) tea.Cmd {
 		bus := m.gitBus
 		paths, message := typed.Paths, typed.Message
-		return m, func() tea.Msg {
+		return func() tea.Msg {
 			if err := bus.CommitFiles(paths, message); err != nil {
 				return commitFailedMsg{reason: err.Error()}
 			}
 			return commitSucceededMsg{message: message}
 		}
-
-	case msg.LargeFilesDetectedMsg:
+	}),
+	reflect.TypeFor[msg.LargeFilesDetectedMsg](): appMsgStateRoute(func(m *AppModel, typed msg.LargeFilesDetectedMsg) {
 		items := make([]modal.ListModalItem, len(typed.Files))
 		for i, f := range typed.Files {
 			badge := formatFileSize(f.Size)
@@ -1634,9 +1627,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingCommitPaths = typed.Paths
 		m.pendingCommitMessage = typed.Message
 		m.pendingCommitPhase = 1
-		return m, nil
-
-	case msg.SecretsDetectedMsg:
+	}),
+	reflect.TypeFor[msg.SecretsDetectedMsg](): appMsgStateRoute(func(m *AppModel, typed msg.SecretsDetectedMsg) {
 		items := make([]modal.ListModalItem, len(typed.Findings))
 		for i, f := range typed.Findings {
 			items[i] = modal.ListModalItem{
@@ -1653,9 +1645,8 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingCommitPaths = typed.Paths
 		m.pendingCommitMessage = typed.Message
 		m.pendingCommitPhase = 2
-		return m, nil
-
-	case commitSucceededMsg:
+	}),
+	reflect.TypeFor[commitSucceededMsg](): appMsgCmdRoute(func(m *AppModel, typed commitSucceededMsg) tea.Cmd {
 		m.statusBar.SetFlash("Committed: " + typed.message)
 		m.nudgeGitWatcher()
 		var cmds []tea.Cmd
@@ -1667,32 +1658,32 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			_, doneCmd := m.commitTree.Update(committree.CommitDoneMsg{OK: true, Message: typed.message})
 			cmds = append(cmds, doneCmd)
 		}
-		return m, tea.Batch(cmds...)
-
-	case commitFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[commitFailedMsg](): appMsgCmdRoute(func(m *AppModel, typed commitFailedMsg) tea.Cmd {
 		m.statusBar.SetFlash(typed.reason)
-		if m.commitTree != nil {
-			_, doneCmd := m.commitTree.Update(committree.CommitDoneMsg{OK: false, Message: typed.reason})
-			return m, doneCmd
+		if m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case gitpanel.StashRequestMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage(fmt.Sprintf("Stashing %d files...", typed.Count))
-			bus := m.gitBus
-			paths := typed.Paths
-			count := typed.Count
-			return m, func() tea.Msg {
-				if err := bus.StashFiles(paths); err != nil {
-					return stashFailedMsg{reason: err.Error()}
-				}
-				return stashSucceededMsg{count: count}
+		_, doneCmd := m.commitTree.Update(committree.CommitDoneMsg{OK: false, Message: typed.reason})
+		return doneCmd
+	}),
+	reflect.TypeFor[gitpanel.StashRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed gitpanel.StashRequestMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
+		}
+		m.commitTree.SetLoadingMessage(fmt.Sprintf("Stashing %d files...", typed.Count))
+		bus := m.gitBus
+		paths := typed.Paths
+		count := typed.Count
+		return func() tea.Msg {
+			if err := bus.StashFiles(paths); err != nil {
+				return stashFailedMsg{reason: err.Error()}
 			}
+			return stashSucceededMsg{count: count}
 		}
-		return m, nil
-
-	case stashSucceededMsg:
+	}),
+	reflect.TypeFor[stashSucceededMsg](): appMsgCmdRoute(func(m *AppModel, typed stashSucceededMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -1703,29 +1694,28 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case stashFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[stashFailedMsg](): appMsgStateRoute(func(m *AppModel, typed stashFailedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case gitpanel.UnstashRequestMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Unstashing files...")
-			bus := m.gitBus
-			return m, func() tea.Msg {
-				if err := bus.UnstashFiles(); err != nil {
-					return unstashFailedMsg{reason: err.Error()}
-				}
-				return unstashSucceededMsg{}
-			}
+	}),
+	reflect.TypeFor[gitpanel.UnstashRequestMsg](): appMsgCmdRoute(func(m *AppModel, _ gitpanel.UnstashRequestMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case unstashSucceededMsg:
+		m.commitTree.SetLoadingMessage("Unstashing files...")
+		bus := m.gitBus
+		return func() tea.Msg {
+			if err := bus.UnstashFiles(); err != nil {
+				return unstashFailedMsg{reason: err.Error()}
+			}
+			return unstashSucceededMsg{}
+		}
+	}),
+	reflect.TypeFor[unstashSucceededMsg](): appMsgCmdRoute(func(m *AppModel, _ unstashSucceededMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -1736,30 +1726,29 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case unstashFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[unstashFailedMsg](): appMsgStateRoute(func(m *AppModel, typed unstashFailedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case committree.PullBranchMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Pulling " + typed.Name + "...")
-			bus := m.gitBus
-			name := typed.Name
-			return m, func() tea.Msg {
-				if err := bus.PullBranch(name, ""); err != nil {
-					return pullFailedMsg{reason: err.Error()}
-				}
-				return pullSucceededMsg{name: name}
-			}
+	}),
+	reflect.TypeFor[committree.PullBranchMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.PullBranchMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case pullSucceededMsg:
+		m.commitTree.SetLoadingMessage("Pulling " + typed.Name + "...")
+		bus := m.gitBus
+		name := typed.Name
+		return func() tea.Msg {
+			if err := bus.PullBranch(name, ""); err != nil {
+				return pullFailedMsg{reason: err.Error()}
+			}
+			return pullSucceededMsg{name: name}
+		}
+	}),
+	reflect.TypeFor[pullSucceededMsg](): appMsgCmdRoute(func(m *AppModel, typed pullSucceededMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -1770,30 +1759,29 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case pullFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[pullFailedMsg](): appMsgStateRoute(func(m *AppModel, typed pullFailedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case committree.PushBranchMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Pushing " + typed.Name + "...")
-			bus := m.gitBus
-			name := typed.Name
-			return m, func() tea.Msg {
-				if err := bus.PushBranch(name, ""); err != nil {
-					return pushFailedMsg{reason: err.Error()}
-				}
-				return pushSucceededMsg{name: name}
-			}
+	}),
+	reflect.TypeFor[committree.PushBranchMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.PushBranchMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case pushSucceededMsg:
+		m.commitTree.SetLoadingMessage("Pushing " + typed.Name + "...")
+		bus := m.gitBus
+		name := typed.Name
+		return func() tea.Msg {
+			if err := bus.PushBranch(name, ""); err != nil {
+				return pushFailedMsg{reason: err.Error()}
+			}
+			return pushSucceededMsg{name: name}
+		}
+	}),
+	reflect.TypeFor[pushSucceededMsg](): appMsgCmdRoute(func(m *AppModel, typed pushSucceededMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -1804,39 +1792,38 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case pushFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[pushFailedMsg](): appMsgStateRoute(func(m *AppModel, typed pushFailedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case committree.ResetRequestMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Resetting (" + typed.Mode + ")...")
-			bus := m.gitBus
-			hash, modeStr := typed.Hash, typed.Mode
-			var mode git.ResetMode
-			switch modeStr {
-			case "hard":
-				mode = git.ResetHard
-			case "mixed":
-				mode = git.ResetMixed
-			case "soft":
-				mode = git.ResetSoft
-			}
-			return m, func() tea.Msg {
-				if err := bus.Reset(hash, mode); err != nil {
-					return resetFailedMsg{reason: err.Error()}
-				}
-				return resetSucceededMsg{mode: modeStr}
-			}
+	}),
+	reflect.TypeFor[committree.ResetRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.ResetRequestMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case resetSucceededMsg:
+		m.commitTree.SetLoadingMessage("Resetting (" + typed.Mode + ")...")
+		bus := m.gitBus
+		hash, modeStr := typed.Hash, typed.Mode
+		mode := git.ResetMode(0)
+		switch modeStr {
+		case "hard":
+			mode = git.ResetHard
+		case "mixed":
+			mode = git.ResetMixed
+		case "soft":
+			mode = git.ResetSoft
+		}
+		return func() tea.Msg {
+			if err := bus.Reset(hash, mode); err != nil {
+				return resetFailedMsg{reason: err.Error()}
+			}
+			return resetSucceededMsg{mode: modeStr}
+		}
+	}),
+	reflect.TypeFor[resetSucceededMsg](): appMsgCmdRoute(func(m *AppModel, typed resetSucceededMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -1847,30 +1834,29 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case resetFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[resetFailedMsg](): appMsgStateRoute(func(m *AppModel, typed resetFailedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case committree.RevertRequestMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Reverting...")
-			bus := m.gitBus
-			hash := typed.Hash
-			return m, func() tea.Msg {
-				if err := bus.Revert(hash); err != nil {
-					return revertFailedMsg{reason: err.Error()}
-				}
-				return revertSucceededMsg{hash: hash}
-			}
+	}),
+	reflect.TypeFor[committree.RevertRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.RevertRequestMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case revertSucceededMsg:
+		m.commitTree.SetLoadingMessage("Reverting...")
+		bus := m.gitBus
+		hash := typed.Hash
+		return func() tea.Msg {
+			if err := bus.Revert(hash); err != nil {
+				return revertFailedMsg{reason: err.Error()}
+			}
+			return revertSucceededMsg{hash: hash}
+		}
+	}),
+	reflect.TypeFor[revertSucceededMsg](): appMsgCmdRoute(func(m *AppModel, typed revertSucceededMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -1881,29 +1867,28 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case revertFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[revertFailedMsg](): appMsgStateRoute(func(m *AppModel, typed revertFailedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	case committree.CommitCheckoutRequestMsg:
-		if m.gitBus != nil {
-			bus := m.gitBus
-			hash := typed.Hash
-			return m, func() tea.Msg {
-				if err := bus.CheckoutCommit(hash); err != nil {
-					return commitCheckoutFailedMsg{reason: err.Error()}
-				}
-				return commitCheckoutSucceededMsg{hash: hash}
-			}
+	}),
+	reflect.TypeFor[committree.CommitCheckoutRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.CommitCheckoutRequestMsg) tea.Cmd {
+		if m.gitBus == nil {
+			return nil
 		}
-		return m, nil
-
-	case commitCheckoutSucceededMsg:
+		bus := m.gitBus
+		hash := typed.Hash
+		return func() tea.Msg {
+			if err := bus.CheckoutCommit(hash); err != nil {
+				return commitCheckoutFailedMsg{reason: err.Error()}
+			}
+			return commitCheckoutSucceededMsg{hash: hash}
+		}
+	}),
+	reflect.TypeFor[commitCheckoutSucceededMsg](): appMsgCmdRoute(func(m *AppModel, typed commitCheckoutSucceededMsg) tea.Cmd {
 		m.statusBar.SetFlash("Checked out " + typed.hash[:min(len(typed.hash), 8)])
 		m.nudgeGitWatcher()
 		var cmds []tea.Cmd
@@ -1911,45 +1896,38 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case commitCheckoutFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[commitCheckoutFailedMsg](): appMsgStateRoute(func(m *AppModel, typed commitCheckoutFailedMsg) {
 		m.statusBar.SetFlash(typed.reason)
-		return m, nil
-
-	// --- Sequencer operations (cherry-pick, rebase, merge) ---
-
-	case committree.CherryPickRequestMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Checking cherry-pick...")
-			m.mergeLabels = nil
-			hashes, target := typed.Hashes, typed.TargetBranch
-			m.pendingSeqOp = &pendingSequencerOp{
-				op: "cherry-pick", hashes: hashes, target: target,
-			}
-			// Run integration detection first.
-			return m, m.detectIntegrationCmd(hashes, target, nil)
+	}),
+	reflect.TypeFor[committree.CherryPickRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.CherryPickRequestMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case committree.RebaseStartMsg:
-		if m.gitBus != nil && m.commitTree != nil {
-			m.commitTree.SetLoadingMessage("Checking rebase...")
-			m.mergeLabels = nil
-			onto := typed.OntoBranch
-			plan := make([]git.RebasePlanEntry, len(typed.Plan))
-			for i, p := range typed.Plan {
-				plan[i] = git.RebasePlanEntry{Action: git.RebaseAction(p.Action), Hash: p.Hash}
-			}
-			m.pendingSeqOp = &pendingSequencerOp{
-				op: "rebase", target: onto, sourceBranch: typed.SourceBranch, plan: plan,
-			}
-			// Run conflict preview.
-			return m, m.conflictPreviewRebaseCmd(onto, typed.SourceBranch)
+		m.commitTree.SetLoadingMessage("Checking cherry-pick...")
+		m.mergeLabels = nil
+		hashes, target := typed.Hashes, typed.TargetBranch
+		m.pendingSeqOp = &pendingSequencerOp{op: "cherry-pick", hashes: hashes, target: target}
+		return m.detectIntegrationCmd(hashes, target, nil)
+	}),
+	reflect.TypeFor[committree.RebaseStartMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.RebaseStartMsg) tea.Cmd {
+		if m.gitBus == nil || m.commitTree == nil {
+			return nil
 		}
-		return m, nil
-
-	case sequencerResultMsg:
+		m.commitTree.SetLoadingMessage("Checking rebase...")
+		m.mergeLabels = nil
+		onto := typed.OntoBranch
+		plan := make([]git.RebasePlanEntry, len(typed.Plan))
+		for i, p := range typed.Plan {
+			plan[i] = git.RebasePlanEntry{Action: git.RebaseAction(p.Action), Hash: p.Hash}
+		}
+		m.pendingSeqOp = &pendingSequencerOp{
+			op: "rebase", target: onto, sourceBranch: typed.SourceBranch, plan: plan,
+		}
+		return m.conflictPreviewRebaseCmd(onto, typed.SourceBranch)
+	}),
+	reflect.TypeFor[sequencerResultMsg](): appMsgCmdRoute(func(m *AppModel, typed sequencerResultMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -1978,13 +1956,11 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.enterConflictView(data)
 			m.statusBar.SetFlash("Conflict at step " + fmt.Sprintf("%d/%d", status.CurrentStep+1, status.TotalSteps))
-			return m, nil
+			return nil
 		}
-		// nil status = completed cleanly.
 		m.exitConflictView()
 		m.nudgeGitWatcher()
 		m.finishMergeIfPending()
-
 		var cmds []tea.Cmd
 		if m.gitPanel != nil {
 			cmds = append(cmds, m.gitPanel.LoadData())
@@ -1996,9 +1972,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.loadBranchDAGCmd(branch, m.commitTree.GetDefaultBranch()))
 			}
 		}
-		return m, tea.Batch(cmds...)
-
-	case sequencerFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[sequencerFailedMsg](): appMsgCmdRoute(func(m *AppModel, typed sequencerFailedMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -2010,9 +1986,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case sequencerAbortedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[sequencerAbortedMsg](): appMsgCmdRoute(func(m *AppModel, _ sequencerAbortedMsg) tea.Cmd {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
@@ -2025,56 +2001,54 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.gitPanel.LoadData())
 		}
 		cmds = append(cmds, m.quickGitStatusCmd(), m.loadGitBranchesCmd())
-		return m, tea.Batch(cmds...)
-
-	case sequencerAbortFailedMsg:
+		return tea.Batch(cmds...)
+	}),
+	reflect.TypeFor[sequencerAbortFailedMsg](): appMsgStateRoute(func(m *AppModel, typed sequencerAbortFailedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.ClearLoadingMessage()
 		}
 		m.statusBar.SetFlash(typed.reason)
 		m.nudgeGitWatcher()
-		return m, nil
-
-	case conflictview.ConflictResolveFileMsg:
+	}),
+	reflect.TypeFor[conflictview.ConflictResolveFileMsg](): appMsgCmdRoute(func(m *AppModel, typed conflictview.ConflictResolveFileMsg) tea.Cmd {
 		bus := m.gitBus
 		path := typed.Path
 		res := int(typed.Resolution)
 		oursHash := typed.OursHash
 		theirsHash := typed.TheirsHash
-		return m, func() tea.Msg {
+		return func() tea.Msg {
 			if err := bus.ResolveConflictFile(path, res, oursHash, theirsHash); err != nil {
 				return conflictResolveFailedMsg{path: path, reason: err.Error()}
 			}
 			return conflictResolveWrittenMsg{path: path}
 		}
-
-	case conflictview.ConflictWriteContentMsg:
+	}),
+	reflect.TypeFor[conflictview.ConflictWriteContentMsg](): appMsgCmdRoute(func(m *AppModel, typed conflictview.ConflictWriteContentMsg) tea.Cmd {
 		bus := m.gitBus
-		return m, func() tea.Msg {
+		return func() tea.Msg {
 			if err := bus.WriteWorktreeFile(typed.Path, typed.Content); err != nil {
 				return conflictResolveFailedMsg{path: typed.Path, reason: err.Error()}
 			}
 			return conflictResolveWrittenMsg{path: typed.Path}
 		}
-
-	case conflictview.SyntaxValidationRequestMsg:
+	}),
+	reflect.TypeFor[conflictview.SyntaxValidationRequestMsg](): appMsgCmdRoute(func(m *AppModel, _ conflictview.SyntaxValidationRequestMsg) tea.Cmd {
 		if m.conflictView == nil {
-			return m, nil
+			return nil
 		}
 		entries := m.conflictView.Entries()
-		return m, func() tea.Msg {
+		return func() tea.Msg {
 			warnings := conflictview.ValidateResolvedFiles(entries)
 			return conflictview.SyntaxValidationResultMsg{Warnings: warnings}
 		}
-
-	case conflictview.SyntaxValidationResultMsg:
+	}),
+	reflect.TypeFor[conflictview.SyntaxValidationResultMsg](): appMsgCmdRoute(func(m *AppModel, typed conflictview.SyntaxValidationResultMsg) tea.Cmd {
 		if len(typed.Warnings) == 0 || typed.Proceed {
-			// No warnings or user confirmed — proceed with continue.
 			if m.conflictView != nil {
 				m.conflictView.SetLoading(true)
 			}
 			bus := m.gitBus
-			return m, func() tea.Msg {
+			return func() tea.Msg {
 				status, err := bus.SequencerContinue()
 				if err != nil {
 					return sequencerFailedMsg{reason: err.Error()}
@@ -2082,7 +2056,6 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				return sequencerResultMsg{status: status}
 			}
 		}
-		// Show warning modal.
 		items := make([]modal.ListModalItem, len(typed.Warnings))
 		for i, w := range typed.Warnings {
 			items[i] = modal.ListModalItem{
@@ -2098,133 +2071,116 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.modalOverlay.Push(lm)
 		m.overlay = overlayModal
 		m.pendingSyntaxValidation = true
-		return m, nil
-
-	case conflictview.SequencerContinueMsg:
+		return nil
+	}),
+	reflect.TypeFor[conflictview.SequencerContinueMsg](): appMsgCmdRoute(func(m *AppModel, _ conflictview.SequencerContinueMsg) tea.Cmd {
 		if m.conflictView != nil {
 			m.conflictView.SetLoading(true)
 		}
 		bus := m.gitBus
-		return m, func() tea.Msg {
+		return func() tea.Msg {
 			status, err := bus.SequencerContinue()
 			if err != nil {
 				return sequencerFailedMsg{reason: err.Error()}
 			}
 			return sequencerResultMsg{status: status}
 		}
-
-	case conflictview.SequencerBypassMsg:
+	}),
+	reflect.TypeFor[conflictview.SequencerBypassMsg](): appMsgCmdRoute(func(m *AppModel, _ conflictview.SequencerBypassMsg) tea.Cmd {
 		bus := m.gitBus
-		return m, func() tea.Msg {
+		return func() tea.Msg {
 			status, err := bus.SequencerBypass()
 			if err != nil {
 				return sequencerFailedMsg{reason: err.Error()}
 			}
 			return sequencerResultMsg{status: status}
 		}
-
-	case conflictview.SequencerAbortMsg:
-		// Preserve state before aborting (backup ref + stash dirty files).
-		return m, m.preserveAbortCmd("sequencer")
-
-	case conflictview.BaseContentRequestMsg:
-		return m, m.fetchBaseContentCmd(typed.Path, typed.BaseHash)
-
-	case conflictview.BaseContentResponseMsg:
+	}),
+	reflect.TypeFor[conflictview.SequencerAbortMsg](): appMsgCmdRoute(func(m *AppModel, _ conflictview.SequencerAbortMsg) tea.Cmd {
+		return m.preserveAbortCmd("sequencer")
+	}),
+	reflect.TypeFor[conflictview.BaseContentRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed conflictview.BaseContentRequestMsg) tea.Cmd {
+		return m.fetchBaseContentCmd(typed.Path, typed.BaseHash)
+	}),
+	reflect.TypeFor[conflictview.BaseContentResponseMsg](): appMsgStateRoute(func(m *AppModel, typed conflictview.BaseContentResponseMsg) {
 		if m.conflictView != nil && typed.Err == nil {
 			m.conflictView.SetBaseContent(typed.Path, typed.Content)
 		}
-		return m, nil
-
-	case conflictview.StepPreviewRequestMsg:
-		return m, m.fetchStepPreviewCmd(typed.Hash)
-
-	case conflictview.StepPreviewResponseMsg:
+	}),
+	reflect.TypeFor[conflictview.StepPreviewRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed conflictview.StepPreviewRequestMsg) tea.Cmd {
+		return m.fetchStepPreviewCmd(typed.Hash)
+	}),
+	reflect.TypeFor[conflictview.StepPreviewResponseMsg](): appMsgStateRoute(func(m *AppModel, typed conflictview.StepPreviewResponseMsg) {
 		if m.conflictView != nil && typed.Preview != nil {
 			m.conflictView.SetStepPreview(typed.Preview)
 		}
-		return m, nil
-
-	case conflictview.SequencerUndoStepMsg:
-		return m, m.sequencerUndoStepCmd()
-
-	case conflictResolveWrittenMsg:
+	}),
+	reflect.TypeFor[conflictview.SequencerUndoStepMsg](): appMsgCmdRoute(func(m *AppModel, _ conflictview.SequencerUndoStepMsg) tea.Cmd {
+		return m.sequencerUndoStepCmd()
+	}),
+	reflect.TypeFor[conflictResolveWrittenMsg](): appMsgStateRoute(func(m *AppModel, _ conflictResolveWrittenMsg) {
 		m.nudgeGitWatcher()
-		return m, nil
-
-	case conflictResolveFailedMsg:
+	}),
+	reflect.TypeFor[conflictResolveFailedMsg](): appMsgStateRoute(func(m *AppModel, typed conflictResolveFailedMsg) {
 		m.statusBar.SetFlash("Resolve failed: " + typed.reason)
-		return m, nil
-
-	case msg.ConflictPreviewMsg:
-		return m, m.handleConflictPreview(typed)
-
-	case msg.IntegrationDetectedMsg:
-		return m, m.handleIntegrationDetected(typed)
-
-	case msg.AbortPreservedMsg:
-		return m, m.handleAbortPreserved(typed)
-
-	case msg.BranchStashAvailableMsg:
-		return m, m.handleBranchStashAvailable(typed)
-
-	case msg.BranchStashRestoredMsg:
+	}),
+	reflect.TypeFor[msg.ConflictPreviewMsg]():      appMsgCmdRoute((*AppModel).handleConflictPreview),
+	reflect.TypeFor[msg.IntegrationDetectedMsg]():  appMsgCmdRoute((*AppModel).handleIntegrationDetected),
+	reflect.TypeFor[msg.AbortPreservedMsg]():       appMsgCmdRoute((*AppModel).handleAbortPreserved),
+	reflect.TypeFor[msg.BranchStashAvailableMsg](): appMsgCmdRoute((*AppModel).handleBranchStashAvailable),
+	reflect.TypeFor[msg.BranchStashRestoredMsg](): appMsgStateRoute(func(m *AppModel, typed msg.BranchStashRestoredMsg) {
 		if typed.Err != nil {
 			m.statusBar.SetFlash("Stash restore failed: " + typed.Err.Error())
-		} else {
-			m.statusBar.SetFlash("Branch stash restored")
-			m.nudgeGitWatcher()
+			return
 		}
-		return m, nil
-
-	case editor.ConflictResolvedMsg:
+		m.statusBar.SetFlash("Branch stash restored")
+		m.nudgeGitWatcher()
+	}),
+	reflect.TypeFor[editor.ConflictResolvedMsg](): appMsgStateRoute(func(m *AppModel, typed editor.ConflictResolvedMsg) {
 		if m.conflictViewActive && m.conflictView != nil {
 			m.conflictView.MarkResolvedByPath(typed.Path)
 		}
-		return m, nil
-
-	case msg.GitOpEventMsg:
-		// Nudge unconditionally — mutations may have partially changed state
-		// even on error (e.g. sequencer processed some steps before failing).
+	}),
+	reflect.TypeFor[msg.GitOpEventMsg](): appMsgStateRoute(func(m *AppModel, _ msg.GitOpEventMsg) {
 		m.nudgeGitWatcher()
-		return m, nil
-
-	case gitBranchDAGLoadedMsg:
+	}),
+	reflect.TypeFor[gitBranchDAGLoadedMsg](): appMsgStateRoute(func(m *AppModel, typed gitBranchDAGLoadedMsg) {
 		if m.commitTree != nil {
 			m.commitTree.SetDAGNodesWithStats(typed.nodes, typed.stats, typed.graphRows, typed.maxGraphLane)
 		}
-		return m, nil
-	case gitBranchFullyLoadedMsg:
-		if m.commitTree != nil && typed.branch == m.commitTree.ActiveBranch() {
-			if len(typed.nodes) == 0 {
-				m.commitTree.ExitToBranches()
-				m.statusBar.SetFlash("No commits found for " + typed.branch)
-			} else {
-				m.commitTree.SetNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
-			}
+	}),
+	reflect.TypeFor[gitBranchFullyLoadedMsg](): appMsgStateRoute(func(m *AppModel, typed gitBranchFullyLoadedMsg) {
+		if m.commitTree == nil || typed.branch != m.commitTree.ActiveBranch() {
+			return
 		}
-		return m, nil
-	case committree.LoadMoreMsg:
-		return m, m.loadMoreCommitsCmd()
-	case gitMoreCommitsLoadedMsg:
+		if len(typed.nodes) == 0 {
+			m.commitTree.ExitToBranches()
+			m.statusBar.SetFlash("No commits found for " + typed.branch)
+			return
+		}
+		m.commitTree.SetNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
+	}),
+	reflect.TypeFor[committree.LoadMoreMsg](): appMsgCmdRoute(func(m *AppModel, _ committree.LoadMoreMsg) tea.Cmd {
+		return m.loadMoreCommitsCmd()
+	}),
+	reflect.TypeFor[gitMoreCommitsLoadedMsg](): appMsgStateRoute(func(m *AppModel, typed gitMoreCommitsLoadedMsg) {
 		if m.commitTree != nil && typed.branch == m.commitTree.ActiveBranch() {
 			m.commitTree.AppendNodesWithStats(typed.nodes, typed.stats, typed.hasMore)
 		}
-		return m, nil
-
-	case committree.DiffCompareMsg:
+	}),
+	reflect.TypeFor[committree.DiffCompareMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.DiffCompareMsg) tea.Cmd {
 		m.diffHashes = typed.Hashes
 		m.diffLabels = nil
 		m.setDiffLoading(true)
-		return m, m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
-
-	case committree.BranchDiffCompareMsg:
+		return m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
+	}),
+	reflect.TypeFor[committree.BranchDiffCompareMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.BranchDiffCompareMsg) tea.Cmd {
 		m.diffHashes = typed.Hashes
 		m.diffLabels = typed.Names
 		m.setDiffLoading(true)
-		return m, m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
-
-	case msg.DiffViewDataMsg:
+		return m.fetchDiffDataCmd(m.diffHashes, CompareModeChain)
+	}),
+	reflect.TypeFor[msg.DiffViewDataMsg](): appMsgStateRoute(func(m *AppModel, typed msg.DiffViewDataMsg) {
 		pairs := make([]diffview.DiffPair, len(typed.Pairs))
 		for i, p := range typed.Pairs {
 			pairs[i] = diffview.DiffPair{
@@ -2239,26 +2195,24 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setDiffLoading(false)
 		m.enterDiffView(pairs, diffview.CompareMode(typed.Mode))
-		return m, nil
-
-	case diffview.ExitDiffViewMsg:
+	}),
+	reflect.TypeFor[diffview.ExitDiffViewMsg](): appMsgStateRoute(func(m *AppModel, _ diffview.ExitDiffViewMsg) {
 		m.exitDiffView()
-		return m, nil
-
-	case diffview.ChangeCompareModeMsg:
-		if len(m.diffHashes) >= 2 {
-			m.setDiffLoading(true)
-			return m, m.fetchDiffDataCmd(m.diffHashes, typed.Mode)
+	}),
+	reflect.TypeFor[diffview.ChangeCompareModeMsg](): appMsgCmdRoute(func(m *AppModel, typed diffview.ChangeCompareModeMsg) tea.Cmd {
+		if len(m.diffHashes) < 2 {
+			return nil
 		}
-		return m, nil
-
-	case committree.MergeDiffCompareMsg:
+		m.setDiffLoading(true)
+		return m.fetchDiffDataCmd(m.diffHashes, typed.Mode)
+	}),
+	reflect.TypeFor[committree.MergeDiffCompareMsg](): appMsgCmdRoute(func(m *AppModel, typed committree.MergeDiffCompareMsg) tea.Cmd {
 		m.mergeHashes = typed.Hashes
 		m.mergeLabels = typed.Names
 		m.setMergeDiffLoading(true)
-		return m, m.fetchMergeDiffDataCmd(typed.Hashes, typed.Names)
-
-	case msg.MergeDiffViewDataMsg:
+		return m.fetchMergeDiffDataCmd(typed.Hashes, typed.Names)
+	}),
+	reflect.TypeFor[msg.MergeDiffViewDataMsg](): appMsgStateRoute(func(m *AppModel, typed msg.MergeDiffViewDataMsg) {
 		pairs := make([]diffview.DiffPair, len(typed.Pairs))
 		for i, p := range typed.Pairs {
 			pairs[i] = diffview.DiffPair{
@@ -2273,13 +2227,11 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setMergeDiffLoading(false)
 		m.enterMergeDiffView(pairs)
-		return m, nil
-
-	case mergediff.ExitMergeDiffViewMsg:
+	}),
+	reflect.TypeFor[mergediff.ExitMergeDiffViewMsg](): appMsgStateRoute(func(m *AppModel, _ mergediff.ExitMergeDiffViewMsg) {
 		m.exitMergeDiffView()
-		return m, nil
-
-	case mergediff.MergeBranchMsg:
+	}),
+	reflect.TypeFor[mergediff.MergeBranchMsg](): appMsgCmdRoute(func(m *AppModel, typed mergediff.MergeBranchMsg) tea.Cmd {
 		if m.gitBus != nil && len(m.mergeLabels) >= 2 {
 			m.pendingSeqOp = &pendingSequencerOp{
 				op:     "merge",
@@ -2287,77 +2239,67 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 				target: m.mergeLabels[1],
 				delete: typed.DeleteSource,
 			}
-			return m, m.conflictPreviewMergeCmd(m.mergeLabels[0], m.mergeLabels[1])
+			return m.conflictPreviewMergeCmd(m.mergeLabels[0], m.mergeLabels[1])
 		}
-		return m, m.executeMergeBranch(typed.DeleteSource)
-
-	case msg.FileReplacedMsg:
-		return m, m.handleFileReplaced(typed)
-	case msg.MultiFileReplaceDoneMsg:
-		return m, m.handleMultiFileReplaceDone(typed)
-	case msg.StreamStartMsg:
-		return m, m.handleStreamStartTelemetry(typed)
-	case msg.StreamChunkMsg:
-		return m, m.handleStreamChunkTelemetry(typed)
-	case msg.StreamProgressMsg:
-		return m, m.handleStreamProgressTelemetry(typed)
-	case msg.StreamCompleteMsg:
-		return m, m.handleStreamCompleteTelemetry(typed)
-	case msg.StreamErrorMsg:
-		return m, m.handleStreamErrorTelemetry(typed)
-	case msg.StreamRerouteMsg:
-		return m, m.handleStreamReroute(typed)
-	case msg.GuideResponseMsg:
-		return m, m.handleGuideResponse(typed)
-	case msg.RetryStatusMsg:
+		return m.executeMergeBranch(typed.DeleteSource)
+	}),
+	reflect.TypeFor[msg.FileReplacedMsg]():         appMsgCmdRoute((*AppModel).handleFileReplaced),
+	reflect.TypeFor[msg.MultiFileReplaceDoneMsg](): appMsgCmdRoute((*AppModel).handleMultiFileReplaceDone),
+	reflect.TypeFor[msg.StreamStartMsg]():          appMsgCmdRoute((*AppModel).handleStreamStartTelemetry),
+	reflect.TypeFor[msg.StreamChunkMsg]():          appMsgCmdRoute((*AppModel).handleStreamChunkTelemetry),
+	reflect.TypeFor[msg.StreamProgressMsg]():       appMsgCmdRoute((*AppModel).handleStreamProgressTelemetry),
+	reflect.TypeFor[msg.StreamCompleteMsg]():       appMsgCmdRoute((*AppModel).handleStreamCompleteTelemetry),
+	reflect.TypeFor[msg.StreamErrorMsg]():          appMsgCmdRoute((*AppModel).handleStreamErrorTelemetry),
+	reflect.TypeFor[msg.StreamRerouteMsg]():        appMsgCmdRoute((*AppModel).handleStreamReroute),
+	reflect.TypeFor[msg.GuideResponseMsg]():        appMsgCmdRoute((*AppModel).handleGuideResponse),
+	reflect.TypeFor[msg.RetryStatusMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.RetryStatusMsg) tea.Cmd {
 		if typed.CorrelationID != "" {
 			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
-				return m, nil
+				return nil
 			}
 		}
-		return m, m.propagate(typed)
-	case msg.ToolCallEventMsg:
+		return m.propagate(typed)
+	}),
+	reflect.TypeFor[msg.ToolCallEventMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ToolCallEventMsg) tea.Cmd {
 		if typed.CorrelationID != "" {
 			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
-				return m, nil
+				return nil
 			}
 		}
-		return m, m.propagate(typed)
-	case msg.ActivityEventMsg:
+		return m.propagate(typed)
+	}),
+	reflect.TypeFor[msg.ActivityEventMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ActivityEventMsg) tea.Cmd {
 		if typed.Event != nil && typed.Event.CorrelationID != "" {
 			if _, interrupted := m.interruptedCorrelations[typed.Event.CorrelationID]; interrupted {
-				return m, nil
+				return nil
 			}
 		}
-		return m, m.propagate(typed)
-	case msg.TokenUsageMsg:
+		return m.propagate(typed)
+	}),
+	reflect.TypeFor[msg.TokenUsageMsg](): appMsgStateRoute(func(m *AppModel, typed msg.TokenUsageMsg) {
 		m.busInputTokens += typed.InputTokens
 		m.busOutputTokens += typed.OutputTokens
 		m.busCacheReadTokens += typed.CacheReadTokens
 		m.busCacheWriteTokens += typed.CacheWriteTokens
 		m.busReasoningTokens += typed.ReasoningTokens
 		m.updateTokenDisplay()
-		return m, nil
-	case modal.ModalClosedMsg:
-		return m, m.handleModalClosed(typed.Result)
-	case msg.LSPDiagnosticMsg:
-		return m, m.handleLSPDiagnostic(typed)
-	case msg.LSPProvisionDoneMsg:
+	}),
+	reflect.TypeFor[modal.ModalClosedMsg](): appMsgCmdRoute(func(m *AppModel, typed modal.ModalClosedMsg) tea.Cmd {
+		return m.handleModalClosed(typed.Result)
+	}),
+	reflect.TypeFor[msg.LSPDiagnosticMsg](): appMsgCmdRoute((*AppModel).handleLSPDiagnostic),
+	reflect.TypeFor[msg.LSPProvisionDoneMsg](): appMsgStateRoute(func(_ *AppModel, typed msg.LSPProvisionDoneMsg) {
 		if typed.Err == nil {
 			detect.ClearCache()
 		}
-		return m, nil
-	case msg.LSPServerMissingMsg:
-		return m, m.handleLSPServerMissing(typed)
-	case msg.LSPServerInstalledMsg:
-		return m, m.handleLSPServerInstalled(typed)
-	case mode.StandaloneResult:
-		// Forward standalone operator results (gd) to the inline editor.
+	}),
+	reflect.TypeFor[msg.LSPServerMissingMsg]():   appMsgCmdRoute((*AppModel).handleLSPServerMissing),
+	reflect.TypeFor[msg.LSPServerInstalledMsg](): appMsgCmdRoute((*AppModel).handleLSPServerInstalled),
+	reflect.TypeFor[mode.StandaloneResult](): appMsgCmdRoute(func(m *AppModel, typed mode.StandaloneResult) tea.Cmd {
 		_, cmd := m.focusedEditor().Update(typed)
-		return m, cmd
-	case msg.LSPHoverRequestMsg:
-		// Sync hover tracking so the staleness check in LSPHoverMsg passes
-		// regardless of whether hover was triggered by K or mouse.
+		return cmd
+	}),
+	reflect.TypeFor[msg.LSPHoverRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPHoverRequestMsg) tea.Cmd {
 		m.hoverMouseLine = typed.Line
 		m.hoverMouseCol = typed.Col
 		wordStart, _ := m.focusedEditor().WordBoundsAt(typed.Line, typed.Col)
@@ -2365,112 +2307,109 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.hoverForPreview = false
 		m.pendingHoverSymbol = ""
 		m.pendingHoverPkgPath = ""
-		return m, tea.Batch(
+		return tea.Batch(
 			m.lspHoverCmd(typed.FilePath, typed.Line, typed.Col),
 			m.lspDefinitionCmd(typed.FilePath, typed.Line, typed.Col, true),
 		)
-	case msg.LSPMouseHoverTickMsg:
-		return m, m.handleMouseHoverTick(typed)
-	case msg.LSPHoverMsg:
+	}),
+	reflect.TypeFor[msg.LSPMouseHoverTickMsg](): appMsgCmdRoute((*AppModel).handleMouseHoverTick),
+	reflect.TypeFor[msg.LSPHoverMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPHoverMsg) tea.Cmd {
 		if m.hoverForPreview {
-			return m, m.handlePreviewHoverMsg(typed)
+			return m.handlePreviewHoverMsg(typed)
 		}
-		// Discard stale hover responses if the mouse has moved to a different word.
 		wordStart, _ := m.focusedEditor().WordBoundsAt(typed.Line, typed.Col)
 		if typed.Line != m.hoverMouseLine || wordStart != m.hoverMouseWordStart {
-			return m, nil
+			return nil
 		}
 		m.focusedEditor().Update(typed)
-		// Apply definition info that arrived before the hover content.
 		if m.focusedEditor().HoverActive() && m.pendingHoverSymbol != "" {
 			m.focusedEditor().SetHoverDefinition(m.pendingHoverSymbol, m.pendingHoverPkgPath)
 			m.pendingHoverSymbol = ""
 			m.pendingHoverPkgPath = ""
 		}
-		return m, nil
-	case msg.LSPDefinitionRequestMsg:
-		return m, m.lspDefinitionCmd(typed.FilePath, typed.Line, typed.Col, typed.ForHover)
-	case msg.LSPDefinitionMsg:
+		return nil
+	}),
+	reflect.TypeFor[msg.LSPDefinitionRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPDefinitionRequestMsg) tea.Cmd {
+		return m.lspDefinitionCmd(typed.FilePath, typed.Line, typed.Col, typed.ForHover)
+	}),
+	reflect.TypeFor[msg.LSPDefinitionMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPDefinitionMsg) tea.Cmd {
 		if typed.ForHover {
-			return m, m.handleHoverDefinition(typed)
+			return m.handleHoverDefinition(typed)
 		}
 		_, cmd := m.focusedEditor().Update(typed)
-		return m, cmd
-	case msg.LSPCompletionRequestMsg:
-		// Flush pending didChange so the server sees the latest buffer content.
+		return cmd
+	}),
+	reflect.TypeFor[msg.LSPCompletionRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPCompletionRequestMsg) tea.Cmd {
 		var flushContent string
 		if m.focusedEditor().LSPDirty() {
 			m.focusedEditor().ClearLSPDirty()
 			flushContent = m.focusedEditor().Content()
 		}
-		return m, m.lspCompletionCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
-	case msg.LSPCompletionMsg:
+		return m.lspCompletionCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
+	}),
+	reflect.TypeFor[msg.LSPCompletionMsg](): appMsgStateRoute(func(m *AppModel, typed msg.LSPCompletionMsg) {
 		m.focusedEditor().Update(typed)
-		return m, nil
-	case msg.LSPSignatureHelpRequestMsg:
-		// Flush pending didChange so the server sees the trigger character.
+	}),
+	reflect.TypeFor[msg.LSPSignatureHelpRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPSignatureHelpRequestMsg) tea.Cmd {
 		var flushContent string
 		if m.focusedEditor().LSPDirty() {
 			m.focusedEditor().ClearLSPDirty()
 			flushContent = m.focusedEditor().Content()
 		}
-		return m, m.lspSignatureHelpCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
-	case msg.LSPSignatureHelpMsg:
+		return m.lspSignatureHelpCmd(typed.FilePath, typed.Line, typed.Col, flushContent)
+	}),
+	reflect.TypeFor[msg.LSPSignatureHelpMsg](): appMsgStateRoute(func(m *AppModel, typed msg.LSPSignatureHelpMsg) {
 		m.focusedEditor().Update(typed)
-		return m, nil
-	case msg.LSPDocHighlightTickMsg:
-		return m, m.handleDocHighlightTick(typed)
-	case msg.LSPDocumentHighlightMsg:
+	}),
+	reflect.TypeFor[msg.LSPDocHighlightTickMsg](): appMsgCmdRoute((*AppModel).handleDocHighlightTick),
+	reflect.TypeFor[msg.LSPDocumentHighlightMsg](): appMsgStateRoute(func(m *AppModel, typed msg.LSPDocumentHighlightMsg) {
 		m.focusedEditor().Update(typed)
-		return m, nil
-	case msg.LSPReferencesRequestMsg:
-		return m, m.lspReferencesCmd(typed.FilePath, typed.Line, typed.Col)
-	case msg.LSPReferencesMsg:
-		return m, m.handleLSPReferences(typed)
-	case msg.LSPDocumentSymbolMsg:
-		return m, m.handleLSPDocumentSymbol(typed)
-	case msg.LSPFormatRequestMsg:
+	}),
+	reflect.TypeFor[msg.LSPReferencesRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPReferencesRequestMsg) tea.Cmd {
+		return m.lspReferencesCmd(typed.FilePath, typed.Line, typed.Col)
+	}),
+	reflect.TypeFor[msg.LSPReferencesMsg]():     appMsgCmdRoute((*AppModel).handleLSPReferences),
+	reflect.TypeFor[msg.LSPDocumentSymbolMsg](): appMsgCmdRoute((*AppModel).handleLSPDocumentSymbol),
+	reflect.TypeFor[msg.LSPFormatRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.LSPFormatRequestMsg) tea.Cmd {
 		var flushContent string
 		if m.focusedEditor().LSPDirty() {
 			m.focusedEditor().ClearLSPDirty()
 			flushContent = m.focusedEditor().Content()
 		}
-		return m, m.lspFormatCmd(typed.FilePath, flushContent, m.focusedEditor().EditGeneration())
-	case msg.LSPPrepareRenameMsg:
-		return m, m.handleLSPPrepareRename(typed)
-	case msg.LSPRenameMsg:
-		return m, m.handleLSPRename(typed)
-	case msg.LSPFormatMsg:
-		return m, m.handleLSPFormat(typed)
-	case msg.TabNextMsg:
-		return m, m.nextTab()
-	case msg.TabPrevMsg:
-		return m, m.prevTab()
-	case msg.TabJumpMsg:
-		return m, m.switchToTab(typed.Index)
-	case msg.TabCloseRequestMsg:
-		return m, m.closeTabByPath(typed.Path)
-	case msg.EscDisambiguateTickMsg:
+		return m.lspFormatCmd(typed.FilePath, flushContent, m.focusedEditor().EditGeneration())
+	}),
+	reflect.TypeFor[msg.LSPPrepareRenameMsg](): appMsgCmdRoute((*AppModel).handleLSPPrepareRename),
+	reflect.TypeFor[msg.LSPRenameMsg]():        appMsgCmdRoute((*AppModel).handleLSPRename),
+	reflect.TypeFor[msg.LSPFormatMsg]():        appMsgCmdRoute((*AppModel).handleLSPFormat),
+	reflect.TypeFor[msg.TabNextMsg]():          appMsgCmdRoute(func(m *AppModel, _ msg.TabNextMsg) tea.Cmd { return m.nextTab() }),
+	reflect.TypeFor[msg.TabPrevMsg]():          appMsgCmdRoute(func(m *AppModel, _ msg.TabPrevMsg) tea.Cmd { return m.prevTab() }),
+	reflect.TypeFor[msg.TabJumpMsg]():          appMsgCmdRoute(func(m *AppModel, typed msg.TabJumpMsg) tea.Cmd { return m.switchToTab(typed.Index) }),
+	reflect.TypeFor[msg.TabCloseRequestMsg]():  appMsgCmdRoute(func(m *AppModel, typed msg.TabCloseRequestMsg) tea.Cmd { return m.closeTabByPath(typed.Path) }),
+	reflect.TypeFor[msg.EscDisambiguateTickMsg](): appMsgModelRoute(func(m *AppModel, typed msg.EscDisambiguateTickMsg) (tea.Model, tea.Cmd) {
 		if m.escPending && typed.Gen == m.escGen {
 			m.escPending = false
 			m.escGen++
 			return m.dispatchKey(m.escKey)
 		}
 		return m, nil
-	case msg.ChordBlockedExpireMsg:
+	}),
+	reflect.TypeFor[msg.ChordBlockedExpireMsg](): appMsgStateRoute(func(m *AppModel, _ msg.ChordBlockedExpireMsg) {
 		if m.chordBlocked {
 			m.chord = chordNone
 			m.chordBlocked = false
 		}
+	}),
+	reflect.TypeFor[msg.NerdFontsResultMsg](): appMsgStateRoute(func(*AppModel, msg.NerdFontsResultMsg) {}),
+}
+
+func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
+	if raw == nil {
 		return m, nil
-	case msg.NerdFontsResultMsg:
-		// Don't switch icon mode mid-session — the terminal won't render
-		// newly-installed Nerd Font glyphs until restarted. The install
-		// takes effect on the next app launch.
-		return m, nil
-	default:
-		return m, m.propagate(raw)
 	}
+	if handler, ok := appMsgDispatchRoutes[reflect.TypeOf(raw)]; ok {
+		return handler(m, raw)
+	}
+	return m, m.propagate(raw)
 }
 
 // View renders the complete TUI layout using the frame compositor.
@@ -2696,61 +2635,119 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m.dispatchKey(key)
 }
 
-func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Ctrl+C / Ctrl+Shift+C: copy selection in edit mode, otherwise interrupt.
-	ks := key.String()
-	if ks == "ctrl+c" || ks == "ctrl+shift+c" {
-		if m.viewMode == ViewEdit && m.focusedEditor().HasSelection() {
-			text := m.focusedEditor().SelectedText()
-			if err := m.clipboard.Set(text); err != nil {
-				m.statusBar.SetFlash("Copy failed")
-			} else {
-				m.statusBar.SetFlash("Copied!")
-			}
-			m.focusedEditor().ClearSelection()
-			return m, nil
-		}
-		if m.focus.Current() == component.FocusInput && m.input.HasSelection() {
-			text := m.input.SelectedText()
-			if err := m.clipboard.Set(text); err != nil {
-				m.statusBar.SetFlash("Copy failed")
-			} else {
-				m.statusBar.SetFlash("Copied!")
-			}
-			m.input.ClearSelection()
-			return m, nil
-		}
-		if ks == "ctrl+c" {
-			result := m.interruptHandler.HandleCtrlC()
-			return m, func() tea.Msg { return result }
-		}
-		return m, nil
-	}
+type appKeyDispatchRoute func(*AppModel, tea.KeyMsg, string) (tea.Model, tea.Cmd, bool)
 
-	// Save-before-close prompt intercepts all keys while active.
-	if m.pendingClosePrompt {
-		return m.handleSavePromptKey(key)
+func keyPredicateRoute(
+	pred func(*AppModel, tea.KeyMsg, string) bool,
+	fn func(*AppModel, tea.KeyMsg, string) (tea.Model, tea.Cmd),
+) appKeyDispatchRoute {
+	return func(m *AppModel, key tea.KeyMsg, ks string) (tea.Model, tea.Cmd, bool) {
+		if !pred(m, key, ks) {
+			return nil, nil, false
+		}
+		model, cmd := fn(m, key, ks)
+		return model, cmd, true
 	}
+}
 
-	// Alt+Shift+U then A/S/P → toggle [All], stash, or unstash.
-	// Must precede Select-all so Alt+A doesn't get consumed.
-	if m.pendingUncommittedAll {
-		m.pendingUncommittedAll = false
-		if m.gitPanel != nil {
-			switch {
-			case ks == "a" || ks == "A" || ks == "alt+a" || ks == "alt+A":
+func keyStringRoute(
+	expected string,
+	fn func(*AppModel, tea.KeyMsg, string) (tea.Model, tea.Cmd),
+) appKeyDispatchRoute {
+	return keyPredicateRoute(
+		func(_ *AppModel, _ tea.KeyMsg, ks string) bool { return ks == expected },
+		fn,
+	)
+}
+
+func (m *AppModel) allowOverlayToggle(ks string) bool {
+	now := time.Now()
+	if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		return false
+	}
+	m.lastToggleKey = ks
+	m.lastToggleAt = now
+	m.chord = chordNone
+	return true
+}
+
+func warpSlotFromKey(ks string) (int, bool) {
+	if len(ks) != 5 || !strings.HasPrefix(ks, "alt+") {
+		return 0, false
+	}
+	slot := ks[4]
+	if slot < '1' || slot > '9' {
+		return 0, false
+	}
+	return int(slot - '1'), true
+}
+
+func shiftedWarpSlotFromKey(ks string) (int, bool) {
+	if len(ks) != 5 || !strings.HasPrefix(ks, "alt+") {
+		return 0, false
+	}
+	idx, ok := shiftDigitSlot[ks[4]]
+	return idx, ok
+}
+
+var appKeyDispatchRoutes = []appKeyDispatchRoute{
+	keyPredicateRoute(
+		func(_ *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "ctrl+c" || ks == "ctrl+shift+c" },
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.viewMode == ViewEdit && m.focusedEditor().HasSelection() {
+				text := m.focusedEditor().SelectedText()
+				if err := m.clipboard.Set(text); err != nil {
+					m.statusBar.SetFlash("Copy failed")
+				} else {
+					m.statusBar.SetFlash("Copied!")
+				}
+				m.focusedEditor().ClearSelection()
+				return m, nil
+			}
+			if m.focus.Current() == component.FocusInput && m.input.HasSelection() {
+				text := m.input.SelectedText()
+				if err := m.clipboard.Set(text); err != nil {
+					m.statusBar.SetFlash("Copy failed")
+				} else {
+					m.statusBar.SetFlash("Copied!")
+				}
+				m.input.ClearSelection()
+				return m, nil
+			}
+			if ks == "ctrl+c" {
+				result := m.interruptHandler.HandleCtrlC()
+				return m, func() tea.Msg { return result }
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.pendingClosePrompt },
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			return m.handleSavePromptKey(key)
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.pendingUncommittedAll },
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			m.pendingUncommittedAll = false
+			if m.gitPanel == nil {
+				return m, nil
+			}
+			switch ks {
+			case "a", "A", "alt+a", "alt+A":
 				m.gitPanel.ToggleUncommittedAll()
 				return m, nil
-			case ks == "s" || ks == "S" || ks == "alt+s" || ks == "alt+S":
+			case "s", "S", "alt+s", "alt+S":
 				return m, m.gitPanel.StashAll()
-			case ks == "p" || ks == "P" || ks == "alt+p" || ks == "alt+P":
+			case "p", "P", "alt+p", "alt+P":
 				return m, m.gitPanel.TriggerUnstash()
+			default:
+				return m, nil
 			}
-		}
-	}
-
-	// Select all in the focused component (Alt+Shift+A).
-	if key.String() == "alt+A" {
+		},
+	),
+	keyStringRoute("alt+A", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 		switch {
 		case m.viewMode == ViewEdit && m.isEditorFocused():
 			m.focusedEditor().SelectAll()
@@ -2758,163 +2755,182 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.SelectAll()
 		}
 		return m, nil
-	}
-
-	// Ctrl+X / Ctrl+Shift+X: cut selection to clipboard.
-	if ks == "ctrl+x" || ks == "ctrl+shift+x" {
-		var text string
-		switch {
-		case m.viewMode == ViewEdit && m.isEditorFocused():
-			text = m.focusedEditor().CutSelection()
-		case m.focus.Current() == component.FocusInput && m.input.HasSelection():
-			text = m.input.CutSelection()
-		}
-		if text != "" {
-			if err := m.clipboard.Set(text); err != nil {
-				m.statusBar.SetFlash("Cut failed")
-			} else {
-				m.statusBar.SetFlash("Cut!")
+	}),
+	keyPredicateRoute(
+		func(_ *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "ctrl+x" || ks == "ctrl+shift+x" },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			var text string
+			switch {
+			case m.viewMode == ViewEdit && m.isEditorFocused():
+				text = m.focusedEditor().CutSelection()
+			case m.focus.Current() == component.FocusInput && m.input.HasSelection():
+				text = m.input.CutSelection()
 			}
-		}
-		return m, nil
-	}
-
-	// Undo in the editor (Alt+Z, only when editor is focused).
-	if key.String() == "alt+z" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		m.focusedEditor().Undo()
-		return m, nil
-	}
-
-	// Redo in the editor (Alt+Shift+Z, only when editor is focused).
-	if key.String() == "alt+Z" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		m.focusedEditor().Redo()
-		return m, nil
-	}
-
-	// Queue shortcuts (active regardless of view mode).
-	// Alt+Shift+Space: toggle queue pause/resume.
-	if ks == "alt+ " && !m.promptQueue.IsEmpty() {
-		paused := m.promptQueue.TogglePause()
-		if paused {
-			m.statusBar.SetFlash("Queue paused")
-		} else {
-			m.statusBar.SetFlash("Queue resumed")
-			// Try to advance — entries targeting free agents dispatch immediately.
-			return m, m.tryAdvanceQueue()
-		}
-		m.markSlotDirty(compositor.SlotQueue)
-		m.viewDirty = true
-		return m, nil
-	}
-	// Alt+K: cancel top pending queue entry.
-	if ks == "alt+k" && !m.promptQueue.IsEmpty() {
-		pending := m.promptQueue.PendingEntries()
-		if len(pending) > 0 {
-			m.promptQueue.Cancel(pending[0].ID)
-			m.recalcLayout()
-			m.markSlotDirty(compositor.SlotQueue)
-			m.viewDirty = true
-			m.statusBar.SetFlash("Cancelled queued prompt")
-		}
-		return m, nil
-	}
-	// Alt+Shift+K: cancel all queued entries.
-	if ks == "alt+K" && !m.promptQueue.IsEmpty() {
-		n := m.promptQueue.CancelAll()
-		if n > 0 {
-			m.recalcLayout()
-			m.markSlotDirty(compositor.SlotQueue)
-			m.viewDirty = true
-			m.statusBar.SetFlash(fmt.Sprintf("Cancelled %d queued prompts", n))
-		}
-		return m, nil
-	}
-
-	// Alt+;: toggle steering pace (auto → step → paused → auto).
-	// Only active when an agent is processing a request.
-	if ks == "alt+;" && m.hasActiveStreams() {
-		return m, m.toggleSteeringPace()
-	}
-
-	// Alt+R: find references for symbol under cursor (edit mode).
-	if ks == "alt+r" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		fp := m.focusedEditor().FilePath()
-		if fp != "" {
-			return m, m.lspReferencesCmd(fp, m.focusedEditor().CursorLine(), m.focusedEditor().CursorCol())
-		}
-		return m, nil
-	}
-
-	// Alt+Shift+. (alt+>): toggle document symbols for current file (edit mode).
-	if ks == "alt+>" && m.viewMode == ViewEdit {
-		if m.fileTree.InDocSymbolsMode() {
-			m.fileTree.ExitDocSymbols()
+			if text != "" {
+				if err := m.clipboard.Set(text); err != nil {
+					m.statusBar.SetFlash("Cut failed")
+				} else {
+					m.statusBar.SetFlash("Cut!")
+				}
+			}
 			return m, nil
-		}
-		fp := m.focusedEditor().FilePath()
-		if fp != "" {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+z" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.focusedEditor().Undo()
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+Z" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.focusedEditor().Redo()
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+ " && !m.promptQueue.IsEmpty() },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			paused := m.promptQueue.TogglePause()
+			if paused {
+				m.statusBar.SetFlash("Queue paused")
+			} else {
+				m.statusBar.SetFlash("Queue resumed")
+				return m, m.tryAdvanceQueue()
+			}
+			m.markSlotDirty(compositor.SlotQueue)
+			m.viewDirty = true
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+k" && !m.promptQueue.IsEmpty() },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			pending := m.promptQueue.PendingEntries()
+			if len(pending) > 0 {
+				m.promptQueue.Cancel(pending[0].ID)
+				m.recalcLayout()
+				m.markSlotDirty(compositor.SlotQueue)
+				m.viewDirty = true
+				m.statusBar.SetFlash("Cancelled queued prompt")
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+K" && !m.promptQueue.IsEmpty() },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			n := m.promptQueue.CancelAll()
+			if n > 0 {
+				m.recalcLayout()
+				m.markSlotDirty(compositor.SlotQueue)
+				m.viewDirty = true
+				m.statusBar.SetFlash(fmt.Sprintf("Cancelled %d queued prompts", n))
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+;" && m.hasActiveStreams() },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			return m, m.toggleSteeringPace()
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+r" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			fp := m.focusedEditor().FilePath()
+			if fp == "" {
+				return m, nil
+			}
+			return m, m.lspReferencesCmd(fp, m.focusedEditor().CursorLine(), m.focusedEditor().CursorCol())
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+>" && m.viewMode == ViewEdit },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			if m.fileTree.InDocSymbolsMode() {
+				m.fileTree.ExitDocSymbols()
+				return m, nil
+			}
+			fp := m.focusedEditor().FilePath()
+			if fp == "" {
+				return m, nil
+			}
 			return m, m.lspDocumentSymbolCmd(fp)
-		}
-		return m, nil
-	}
-
-	// Alt+1..9: set or teleport warp point.
-	if len(ks) == 5 && ks[:4] == "alt+" && ks[4] >= '1' && ks[4] <= '9' {
-		idx := int(ks[4] - '1')
-		if m.warpPoints[idx] != nil {
-			return m, m.teleportToWarp(idx)
-		}
-		if m.viewMode == ViewEdit {
-			m.setWarpPoint(idx)
-		}
-		return m, nil
-	}
-
-	// Alt+Shift+1..9: clear warp point.
-	if len(ks) == 5 && ks[:4] == "alt+" {
-		if idx, ok := shiftDigitSlot[ks[4]]; ok {
+		},
+	),
+	keyPredicateRoute(
+		func(_ *AppModel, _ tea.KeyMsg, ks string) bool {
+			_, ok := warpSlotFromKey(ks)
+			return ok
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			idx, _ := warpSlotFromKey(ks)
+			if m.warpPoints[idx] != nil {
+				return m, m.teleportToWarp(idx)
+			}
+			if m.viewMode == ViewEdit {
+				m.setWarpPoint(idx)
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(_ *AppModel, _ tea.KeyMsg, ks string) bool {
+			_, ok := shiftedWarpSlotFromKey(ks)
+			return ok
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			idx, _ := shiftedWarpSlotFromKey(ks)
 			m.clearWarpPoint(idx)
 			return m, nil
-		}
-	}
-
-	// Alt+T toggles the tabs panel in the file tree (edit mode only).
-	if ks == "alt+t" && m.viewMode == ViewEdit {
-		return m, m.toggleTabsPanel()
-	}
-
-	// Alt+Enter: dismiss preview when preview focused, close tab otherwise.
-	if ks == "alt+enter" && m.viewMode == ViewEdit {
-		if m.isPreviewFocused() {
-			m.dismissPreview()
-			return m, nil
-		}
-		if m.mdPreviewPane != 0 && m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane) {
-			m.dismissMarkdownPreview()
-			return m, nil
-		}
-		if m.focus.Current() == component.FocusFileTree && m.fileTree.InTabsMode() {
-			if p := m.fileTree.TabCursorPath(); p != "" {
-				return m, m.closeTabByPath(p)
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+t" && m.viewMode == ViewEdit },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			return m, m.toggleTabsPanel()
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+enter" && m.viewMode == ViewEdit },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			if m.isPreviewFocused() {
+				m.dismissPreview()
+				return m, nil
+			}
+			if m.mdPreviewPane != 0 && m.focus.Current() == pane.PaneFocusID(m.mdPreviewPane) {
+				m.dismissMarkdownPreview()
+				return m, nil
+			}
+			if m.focus.Current() == component.FocusFileTree && m.fileTree.InTabsMode() {
+				if p := m.fileTree.TabCursorPath(); p != "" {
+					return m, m.closeTabByPath(p)
+				}
+				return m, nil
+			}
+			if m.isEditorFocused() {
+				idx := m.activeTabIndex()
+				if idx >= 0 {
+					return m, m.closeTab(idx)
+				}
 			}
 			return m, nil
-		}
-		if m.isEditorFocused() {
-			idx := m.activeTabIndex()
-			if idx >= 0 {
-				return m, m.closeTab(idx)
-			}
-		}
-		return m, nil
-	}
-
-	// Alt+C switches to chat mode.
-	if key.String() == "alt+c" {
+		},
+	),
+	keyStringRoute("alt+c", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 		return m, m.switchToChatMode()
-	}
-
-	// Alt+G switches to git mode.
-	if key.String() == "alt+g" {
+	}),
+	keyStringRoute("alt+g", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 		if m.viewMode == ViewGit {
 			return m, nil
 		}
@@ -2923,407 +2939,452 @@ func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.enterGitMode()
-	}
-
-	// Alt+E switches to edit mode.
-	if key.String() == "alt+e" {
+	}),
+	keyStringRoute("alt+e", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 		if m.viewMode == ViewEdit {
 			return m, nil
 		}
 		return m, m.toggleEditMode()
-	}
-
-	// Alt+H toggles the Field Manual help overlay.
-	if key.String() == "alt+h" {
+	}),
+	keyStringRoute("alt+h", func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
 		m.toggleFieldManual()
 		return m, nil
-	}
-
-	// Escape: close references panel if active, abort command input,
-	// route to editor in edit mode, or double-tap to interrupt agent.
-	// When an overlay is active, skip — overlays handle their own Esc.
-	if key.String() == "esc" && m.overlay == overlayNone {
-		// Git panel: close gear dropdown or exit header focus.
-		if m.viewMode == ViewGit && m.gitPanel != nil && m.focus.Current() == component.FocusGitPanel {
-			comp, cmd := m.gitPanel.Update(key)
-			m.gitPanel = comp.(*gitpanel.Model)
-			return m, cmd
-		}
-		if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode() || m.fileTree.InTabsMode()) && m.focus.Current() == component.FocusFileTree {
-			m.fileTree.Update(key)
-			return m, nil
-		}
-		if m.editCmdInput {
-			m.exitCmdInput()
-			return m, nil
-		}
-		if m.viewMode == ViewEdit && m.isEditorFocused() {
-			comp, cmd := m.focusedEditor().Update(key)
-			m.paneEditors[m.focusedPane].editor = comp.(*editor.Model)
-			return m, cmd
-		}
-		if m.viewMode == ViewGit && m.focus.Current() == component.FocusCommitTree &&
-			(m.commitTree.InCommitView() || m.commitTree.InCreateInput() || m.commitTree.NeedsEscRouting()) {
-			comp, cmd := m.commitTree.Update(key)
-			m.commitTree = comp.(*committree.Model)
-			return m, cmd
-		}
-		// Conflict view ESC: content pane → focus file list, file list → abort sequencer.
-		if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictView {
-			m.focus.SetFocus(component.FocusConflictFileList)
-			m.syncFocusState()
-			return m, nil
-		}
-		if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictFileList {
-			return m, m.preserveAbortCmd("sequencer")
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList && m.mergeDiffView.FileSearchActive() {
-			m.mergeDiffView.UpdateFileList("esc")
-			return m, nil
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList {
-			m.exitMergeDiffView()
-			return m, nil
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil && m.isMergeDiffPaneFocused() {
-			cmd := m.mergeDiffView.Update(key)
-			return m, cmd
-		}
-		if m.diffViewActive && m.diffView != nil && m.focus.Current() == component.FocusDiffFileList && m.diffView.FileSearchActive() {
-			m.diffView.UpdateFileList("esc")
-			return m, nil
-		}
-		if m.diffViewActive && m.diffView != nil && m.focus.Current() == component.FocusDiffFileList {
-			m.exitDiffView()
-			return m, nil
-		}
-		if m.diffViewActive && m.diffView != nil && m.isDiffPaneFocused() {
-			cmd := m.diffView.Update(key)
-			return m, cmd
-		}
-		// Agent panel sub-views consume Esc to back out before double-tap interrupt.
-		if m.focus.Current() == component.FocusAgentPanel && m.agentPanel.InSubView() {
-			comp, cmd := m.agentPanel.Update(key)
-			m.agentPanel = comp.(*agentpkg.Model)
-			m.syncManualTargetFromAgentSelection()
-			return m, cmd
-		}
-		// If the input panel has content, clear it on first Esc.
-		if !m.input.IsEmpty() {
-			m.input.ClearInput()
-			return m, nil
-		}
-
-		now := time.Now()
-		if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
-			m.escPressCount++
-			m.lastEscTime = now
-			if m.escPressCount == 2 {
-				// Double-Esc: interrupt selected/engaged agent only.
-				// Call first, then set flash — interruptActiveRoute sets its own
-				// flash which would overwrite the hint if set beforehand.
-				cmd := m.interruptActiveRoute("esc")
-				m.statusBar.SetFlash("Agent interrupted · Esc again to interrupt all")
+	}),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "esc" && m.overlay == overlayNone },
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			if m.viewMode == ViewGit && m.gitPanel != nil && m.focus.Current() == component.FocusGitPanel {
+				comp, cmd := m.gitPanel.Update(key)
+				m.gitPanel = comp.(*gitpanel.Model)
 				return m, cmd
 			}
-			// Triple-Esc (or more): interrupt ALL active agents.
-			m.lastEscTime = time.Time{}
-			m.escPressCount = 0
-			return m, m.interruptAllActiveRoutes("esc-all")
-		}
-		m.lastEscTime = now
-		m.escPressCount = 1
-		m.statusBar.SetFlash("Press Esc again to interrupt agent")
-		return m, nil
-	}
+			if (m.fileTree.InReferencesMode() || m.fileTree.InDocSymbolsMode() || m.fileTree.InTabsMode()) &&
+				m.focus.Current() == component.FocusFileTree {
+				m.fileTree.Update(key)
+				return m, nil
+			}
+			if m.editCmdInput {
+				m.exitCmdInput()
+				return m, nil
+			}
+			if m.viewMode == ViewEdit && m.isEditorFocused() {
+				comp, cmd := m.focusedEditor().Update(key)
+				m.paneEditors[m.focusedPane].editor = comp.(*editor.Model)
+				return m, cmd
+			}
+			if m.viewMode == ViewGit && m.focus.Current() == component.FocusCommitTree &&
+				(m.commitTree.InCommitView() || m.commitTree.InCreateInput() || m.commitTree.NeedsEscRouting()) {
+				comp, cmd := m.commitTree.Update(key)
+				m.commitTree = comp.(*committree.Model)
+				return m, cmd
+			}
+			if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictView {
+				m.focus.SetFocus(component.FocusConflictFileList)
+				m.syncFocusState()
+				return m, nil
+			}
+			if m.conflictViewActive && m.conflictView != nil && m.focus.Current() == component.FocusConflictFileList {
+				return m, m.preserveAbortCmd("sequencer")
+			}
+			if m.mergeDiffViewActive && m.mergeDiffView != nil &&
+				m.focus.Current() == component.FocusMergeDiffFileList &&
+				m.mergeDiffView.FileSearchActive() {
+				m.mergeDiffView.UpdateFileList("esc")
+				return m, nil
+			}
+			if m.mergeDiffViewActive && m.mergeDiffView != nil && m.focus.Current() == component.FocusMergeDiffFileList {
+				m.exitMergeDiffView()
+				return m, nil
+			}
+			if m.mergeDiffViewActive && m.mergeDiffView != nil && m.isMergeDiffPaneFocused() {
+				return m, m.mergeDiffView.Update(key)
+			}
+			if m.diffViewActive && m.diffView != nil &&
+				m.focus.Current() == component.FocusDiffFileList &&
+				m.diffView.FileSearchActive() {
+				m.diffView.UpdateFileList("esc")
+				return m, nil
+			}
+			if m.diffViewActive && m.diffView != nil && m.focus.Current() == component.FocusDiffFileList {
+				m.exitDiffView()
+				return m, nil
+			}
+			if m.diffViewActive && m.diffView != nil && m.isDiffPaneFocused() {
+				return m, m.diffView.Update(key)
+			}
+			if m.focus.Current() == component.FocusAgentPanel && m.agentPanel.InSubView() {
+				comp, cmd := m.agentPanel.Update(key)
+				m.agentPanel = comp.(*agentpkg.Model)
+				m.syncManualTargetFromAgentSelection()
+				return m, cmd
+			}
+			if !m.input.IsEmpty() {
+				m.input.ClearInput()
+				return m, nil
+			}
 
-	// Shift+Tab in edit mode: cycle to next tab.
-	if ks == "shift+tab" && m.viewMode == ViewEdit &&
-		m.isEditorFocused() &&
-		len(m.focusedTabOrder()) > 0 {
-		return m, m.nextTab()
-	}
-
-	// Colon in edit mode normal: activate command input panel.
-	if key.String() == ":" && m.viewMode == ViewEdit &&
-		m.isEditorFocused() &&
-		m.focusedEditor().IsNormalMode() {
-		m.enterCmdInput()
-		return m, nil
-	}
-
-	// Overlay key capture: active overlays consume all keys.
-	if m.overlay == overlayEditor {
-		comp, cmd := m.editorOverlay.Update(key)
-		m.editorOverlay = comp.(*editor.Model)
-		return m, cmd
-	}
-	if m.overlay == overlayModal && m.modalOverlay.Active() {
-		comp, cmd := m.modalOverlay.Update(key)
-		m.modalOverlay = comp.(*modal.Model)
-		return m, cmd
-	}
-	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
-		comp, cmd := m.searchOverlay.Update(key)
-		m.searchOverlay = comp.(*search.Model)
-		return m, cmd
-	}
-	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
-		comp, cmd := m.fieldManualOverlay.Update(key)
-		m.fieldManualOverlay = comp.(*fieldmanual.Model)
-		if !m.fieldManualOverlay.Visible() {
-			m.overlay = overlayNone
-		}
-		return m, cmd
-	}
-	if m.overlay == overlayLogin && m.loginPanel.Active() {
-		done, result, cmd := m.loginPanel.Update(key)
-		if done {
-			return m, tea.Batch(cmd, m.handleLoginPanelResult(result))
-		}
-		return m, cmd
-	}
-	// Ctrl+P toggles the search overlay (unless the editor completion popup
-	// is active, where Ctrl+P navigates to the previous item).
-	if key.String() == "ctrl+p" && !m.focusedEditor().CompletionActive() {
-		m.toggleSearch()
-		return m, nil
-	}
-
-	// Alt+F toggles the in-file find bar when the editor has focus.
-	if ks == "alt+f" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+			now := time.Now()
+			if !m.lastEscTime.IsZero() && now.Sub(m.lastEscTime) <= time.Second {
+				m.escPressCount++
+				m.lastEscTime = now
+				if m.escPressCount == 2 {
+					cmd := m.interruptActiveRoute("esc")
+					m.statusBar.SetFlash("Agent interrupted · Esc again to interrupt all")
+					return m, cmd
+				}
+				m.lastEscTime = time.Time{}
+				m.escPressCount = 0
+				return m, m.interruptAllActiveRoutes("esc-all")
+			}
+			m.lastEscTime = now
+			m.escPressCount = 1
+			m.statusBar.SetFlash("Press Esc again to interrupt agent")
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone // dismiss chord hint — only one overlay at a time
-		m.focusedEditor().ToggleFindBar()
-		return m, nil
-	}
-
-	// Alt+Shift+R toggles the in-file find-and-replace bar when the editor has focus.
-	if ks == "alt+R" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "shift+tab" && m.viewMode == ViewEdit && m.isEditorFocused() && len(m.focusedTabOrder()) > 0
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			return m, m.nextTab()
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == ":" && m.viewMode == ViewEdit && m.isEditorFocused() && m.focusedEditor().IsNormalMode()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.enterCmdInput()
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		m.focusedEditor().ToggleReplaceBar()
-		return m, nil
-	}
-
-	// Alt+F toggles search/filter when the file tree or git panel has focus.
-	// In tabs mode it toggles the tab filter; otherwise multi-file search.
-	if ks == "alt+f" && m.focus.Current() == component.FocusFileTree {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.overlay == overlayEditor },
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			comp, cmd := m.editorOverlay.Update(key)
+			m.editorOverlay = comp.(*editor.Model)
+			return m, cmd
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool {
+			return m.overlay == overlayModal && m.modalOverlay.Active()
+		},
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			comp, cmd := m.modalOverlay.Update(key)
+			m.modalOverlay = comp.(*modal.Model)
+			return m, cmd
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool {
+			return m.overlay == overlaySearch && m.searchOverlay.Visible()
+		},
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			comp, cmd := m.searchOverlay.Update(key)
+			m.searchOverlay = comp.(*search.Model)
+			return m, cmd
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool {
+			return m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible()
+		},
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			comp, cmd := m.fieldManualOverlay.Update(key)
+			m.fieldManualOverlay = comp.(*fieldmanual.Model)
+			if !m.fieldManualOverlay.Visible() {
+				m.overlay = overlayNone
+			}
+			return m, cmd
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool {
+			return m.overlay == overlayLogin && m.loginPanel.Active()
+		},
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			done, result, cmd := m.loginPanel.Update(key)
+			if done {
+				return m, tea.Batch(cmd, m.handleLoginPanelResult(result))
+			}
+			return m, cmd
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "ctrl+p" && !m.focusedEditor().CompletionActive()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.toggleSearch()
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		if m.fileTree.InTabsMode() {
-			m.fileTree.ToggleTabFilter()
-		} else {
-			m.fileTree.ToggleSearch()
-		}
-		return m, nil
-	}
-
-	// Alt+F toggles search/filter when the git explorer panel has focus.
-	if ks == "alt+f" && m.viewMode == ViewGit && m.focus.Current() == component.FocusGitPanel && m.gitPanel != nil {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+f" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.focusedEditor().ToggleFindBar()
+			}
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		m.gitPanel.ToggleSearch()
-		return m, nil
-	}
-
-	// Alt+F toggles file search when the merge diff file list has focus.
-	if ks == "alt+f" && m.mergeDiffViewActive && m.focus.Current() == component.FocusMergeDiffFileList && m.mergeDiffView != nil {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+R" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.focusedEditor().ToggleReplaceBar()
+			}
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		m.mergeDiffView.ToggleFileSearch()
-		return m, nil
-	}
-
-	// Alt+F toggles the in-file find bar when a merge diff pane has focus.
-	if ks == "alt+f" && m.mergeDiffViewActive && m.isMergeDiffPaneFocused() && m.mergeDiffView != nil {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+f" && m.focus.Current() == component.FocusFileTree
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				if m.fileTree.InTabsMode() {
+					m.fileTree.ToggleTabFilter()
+				} else {
+					m.fileTree.ToggleSearch()
+				}
+			}
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		m.mergeDiffView.ToggleFindBar()
-		return m, nil
-	}
-
-	// Alt+F toggles file search when the diff file list has focus.
-	if ks == "alt+f" && m.diffViewActive && m.focus.Current() == component.FocusDiffFileList && m.diffView != nil {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+f" && m.viewMode == ViewGit && m.focus.Current() == component.FocusGitPanel && m.gitPanel != nil
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.gitPanel.ToggleSearch()
+			}
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		m.diffView.ToggleFileSearch()
-		return m, nil
-	}
-
-	// Alt+F toggles the in-file find bar when a diff pane has focus.
-	if ks == "alt+f" && m.diffViewActive && m.isDiffPaneFocused() && m.diffView != nil {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+f" && m.mergeDiffViewActive &&
+				m.focus.Current() == component.FocusMergeDiffFileList &&
+				m.mergeDiffView != nil
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.mergeDiffView.ToggleFileSearch()
+			}
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		m.diffView.ToggleFindBar()
-		return m, nil
-	}
-
-	// Alt+Shift+R toggles multi-file replace when the file tree has focus.
-	if ks == "alt+R" && m.focus.Current() == component.FocusFileTree {
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+f" && m.mergeDiffViewActive && m.isMergeDiffPaneFocused() && m.mergeDiffView != nil
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.mergeDiffView.ToggleFindBar()
+			}
 			return m, nil
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-		m.chord = chordNone
-		m.fileTree.ToggleReplace()
-		return m, nil
-	}
-
-	// Alt+Shift+F triggers LSP formatting when the editor has focus.
-	if ks == "alt+F" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		if fp := m.focusedEditor().FilePath(); fp != "" {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+f" && m.diffViewActive &&
+				m.focus.Current() == component.FocusDiffFileList &&
+				m.diffView != nil
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.diffView.ToggleFileSearch()
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+f" && m.diffViewActive && m.isDiffPaneFocused() && m.diffView != nil
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.diffView.ToggleFindBar()
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+R" && m.focus.Current() == component.FocusFileTree
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if m.allowOverlayToggle(ks) {
+				m.fileTree.ToggleReplace()
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+F" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			fp := m.focusedEditor().FilePath()
+			if fp == "" {
+				return m, nil
+			}
 			var flushContent string
 			if m.focusedEditor().LSPDirty() {
 				m.focusedEditor().ClearLSPDirty()
 				flushContent = m.focusedEditor().Content()
 			}
 			return m, m.lspFormatCmd(fp, flushContent, m.focusedEditor().EditGeneration())
-		}
-	}
-
-	// Alt+Shift+S: save the current editor buffer.
-	if ks == "alt+S" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		m.saveEditorBuffer()
-		return m, nil
-	}
-
-	// Ctrl+Left/Right in edit mode: pagination-aware tab navigation.
-	if m.viewMode == ViewEdit && len(m.focusedTabOrder()) > 1 {
-		if ks == "ctrl+left" {
-			return m, m.tabNavLeft()
-		}
-		if ks == "ctrl+right" {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+S" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.saveEditorBuffer()
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return m.viewMode == ViewEdit && len(m.focusedTabOrder()) > 1 && (ks == "ctrl+left" || ks == "ctrl+right")
+		},
+		func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd) {
+			if ks == "ctrl+left" {
+				return m, m.tabNavLeft()
+			}
 			return m, m.tabNavRight()
-		}
-	}
-
-	// Alt+Shift+E: toggle between file explorer and last active editor pane.
-	if ks == "alt+E" && m.viewMode == ViewEdit {
-		if m.focus.Current() == component.FocusFileTree {
-			m.focusCodePanel()
-		} else {
-			m.focus.SetFocus(component.FocusFileTree)
-		}
-		m.syncFocusState()
-		return m, nil
-	}
-
-	// Alt+| (alt+shift+\): vertical split on focused editor pane.
-	if ks == "alt+|" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		m.splitPane(pane.SplitVertical)
-		return m, nil
-	}
-
-	// Alt+_ (alt+shift+-): horizontal split on focused editor pane.
-	if ks == "alt+_" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		m.splitPane(pane.SplitHorizontal)
-		return m, nil
-	}
-
-	// Alt+Shift+M: toggle markdown preview for the active file.
-	if ks == "alt+M" && m.viewMode == ViewEdit && m.isEditorFocused() {
-		if m.mdPreviewPane != 0 {
-			m.dismissMarkdownPreview()
-		} else if isMarkdownFile(m.focusedEditor().FilePath()) {
-			m.openMarkdownPreview(m.focusedEditor().FilePath())
-		}
-		return m, nil
-	}
-
-	// Alt+Shift+W: close focused pane.
-	if ks == "alt+W" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
-		m.closePane()
-		return m, nil
-	}
-
-	// Alt+]: grow focused pane (take space from sibling).
-	if ks == "alt+]" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
-		if m.paneTree.AdjustRatio(m.focusedPane, ratioStep) {
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool { return ks == "alt+E" && m.viewMode == ViewEdit },
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			if m.focus.Current() == component.FocusFileTree {
+				m.focusCodePanel()
+			} else {
+				m.focus.SetFocus(component.FocusFileTree)
+			}
+			m.syncFocusState()
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+|" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.splitPane(pane.SplitVertical)
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+_" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.splitPane(pane.SplitHorizontal)
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+M" && m.viewMode == ViewEdit && m.isEditorFocused()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			if m.mdPreviewPane != 0 {
+				m.dismissMarkdownPreview()
+			} else if isMarkdownFile(m.focusedEditor().FilePath()) {
+				m.openMarkdownPreview(m.focusedEditor().FilePath())
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+W" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.closePane()
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+]" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			if m.paneTree.AdjustRatio(m.focusedPane, ratioStep) {
+				m.resizeInlineEditor()
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+[" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			if m.paneTree.AdjustRatio(m.focusedPane, -ratioStep) {
+				m.resizeInlineEditor()
+			}
+			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, ks string) bool {
+			return ks == "alt+=" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf()
+		},
+		func(m *AppModel, _ tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			m.paneTree.Equalize()
 			m.resizeInlineEditor()
+			m.statusBar.SetFlash("Splits equalized")
+			return m, nil
+		},
+	),
+	func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd, bool) {
+		cmd, handled := m.handleChord(key)
+		if !handled {
+			return nil, nil, false
 		}
-		return m, nil
-	}
-
-	// Alt+[: shrink focused pane (give space to sibling).
-	if ks == "alt+[" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
-		if m.paneTree.AdjustRatio(m.focusedPane, -ratioStep) {
-			m.resizeInlineEditor()
+		return m, cmd, true
+	},
+	func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd, bool) {
+		if m.viewMode != ViewGit || m.gitPanel == nil {
+			return nil, nil, false
 		}
-		return m, nil
-	}
-
-	// Alt+=: equalize all split ratios.
-	if ks == "alt+=" && m.viewMode == ViewEdit && m.paneTree != nil && !m.paneTree.IsLeaf() {
-		m.paneTree.Equalize()
-		m.resizeInlineEditor()
-		m.statusBar.SetFlash("Splits equalized")
-		return m, nil
-	}
-
-	// Two-key chord: S then Left/Right (sessions), A then Left/Right (agents).
-	if cmd, handled := m.handleChord(key); handled {
-		return m, cmd
-	}
-
-	// Git tab navigation shortcuts (must precede spatial focus so
-	// Alt+Shift+Left/Right reaches tab cycling when the git panel is focused).
-	if m.viewMode == ViewGit && m.gitPanel != nil {
-		if cmd, handled := m.handleGitTabShortcut(ks); handled {
-			return m, cmd
+		cmd, handled := m.handleGitTabShortcut(ks)
+		if !handled {
+			return nil, nil, false
 		}
-	}
-
-	// Alt+Shift+arrow moves focus spatially between panels.
-	if target, ok := m.spatialFocusTarget(key.String()); ok {
+		return m, cmd, true
+	},
+	func(m *AppModel, _ tea.KeyMsg, ks string) (tea.Model, tea.Cmd, bool) {
+		target, ok := m.spatialFocusTarget(ks)
+		if !ok {
+			return nil, nil, false
+		}
 		m.focus.SetFocus(target)
 		m.syncFocusState()
-		return m, nil
-	}
+		return m, nil, true
+	},
+}
 
-	// Delegate to focused component.
+func (m *AppModel) dispatchKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	ks := key.String()
+	for _, route := range appKeyDispatchRoutes {
+		if model, cmd, handled := route(m, key, ks); handled {
+			return model, cmd
+		}
+	}
 	return m, m.propagateToFocused(key)
 }
 
@@ -4696,24 +4757,43 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	}
 
 	changed := false
+	changed = m.advanceStatusDecor(tick, changed)
+	changed = m.advanceChatDecor(tick, changed)
+	changed = m.expireTabArrowFlash(tick.Time, changed)
+	changed = m.refreshStreamingRingHint(changed)
+	changed = m.advanceQueueStripDecor(changed)
+	changed = m.advanceRightPanelDecor(changed)
+	changed = m.advanceGitPanelDecor(changed)
+	changed = m.advanceSidebarDecor(tick.Time, changed)
+	changed = m.advanceFocusDecor(tick.Time, changed)
 
-	// Status spinner + flash countdown.
-	if m.statusBar.IsAnimating() {
-		model, cmd := m.statusBar.Update(tick)
-		_ = cmd // status.Update never returns a cmd currently.
-		m.statusBar = model.(*status.Model)
-		changed = changed || m.statusBar.ViewDirty()
+	if changed {
+		m.viewDirty = true
 	}
 
-	// Chat highlight / edge flash.
-	if m.chat.HasActiveAnimation() {
-		chatComp, _ := m.chat.Update(tick)
-		m.chat = chatComp.(*chat.Model)
-		changed = true
-	}
+	return m.continueDecorTickChain()
+}
 
-	// Tab arrow flash expiry.
-	now := tick.Time
+func (m *AppModel) advanceStatusDecor(tick msg.DecorTickMsg, changed bool) bool {
+	if !m.statusBar.IsAnimating() {
+		return changed
+	}
+	model, cmd := m.statusBar.Update(tick)
+	_ = cmd
+	m.statusBar = model.(*status.Model)
+	return changed || m.statusBar.ViewDirty()
+}
+
+func (m *AppModel) advanceChatDecor(tick msg.DecorTickMsg, changed bool) bool {
+	if !m.chat.HasActiveAnimation() {
+		return changed
+	}
+	chatComp, _ := m.chat.Update(tick)
+	m.chat = chatComp.(*chat.Model)
+	return true
+}
+
+func (m *AppModel) expireTabArrowFlash(now time.Time, changed bool) bool {
 	tabFlashChanged := false
 	if (m.tabArrowFlashLeftUntil != (time.Time{})) && !now.Before(m.tabArrowFlashLeftUntil) {
 		m.tabArrowFlashLeftUntil = time.Time{}
@@ -4724,74 +4804,70 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 		tabFlashChanged = true
 	}
 	if tabFlashChanged {
-		changed = true
 		m.markSlotDirty(compositor.SlotRight)
+		return true
 	}
+	return changed
+}
 
-	// Refresh ring hint during streaming (activity badge changes) at decor rate.
-	if (!m.leftRing.empty() || !m.rightRing.empty()) && m.chat.IsStreaming() {
-		m.statusBar.SetViewRingHint(m.buildRingHint())
-		changed = true
+func (m *AppModel) refreshStreamingRingHint(changed bool) bool {
+	if (m.leftRing.empty() && m.rightRing.empty()) || !m.chat.IsStreaming() {
+		return changed
 	}
+	m.statusBar.SetViewRingHint(m.buildRingHint())
+	return true
+}
 
-	// Queue strip gradient animation (only when non-empty and not paused).
-	if !m.promptQueue.IsEmpty() && !m.promptQueue.IsPaused() {
-		m.markSlotDirty(compositor.SlotQueue)
-		changed = true
+func (m *AppModel) advanceQueueStripDecor(changed bool) bool {
+	if m.promptQueue.IsEmpty() || m.promptQueue.IsPaused() {
+		return changed
 	}
+	m.markSlotDirty(compositor.SlotQueue)
+	return true
+}
 
-	// Commit tree loading spinner (time-based, redraws each decor tick).
+func (m *AppModel) advanceRightPanelDecor(changed bool) bool {
 	if m.commitTree != nil && m.commitTree.NeedsDecorTick() {
 		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
-
-	// Diff view loading spinner (frame-counter, advanced each decor tick).
 	if m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick() {
 		m.diffView.AdvanceSpinner()
 		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
-
-	// Merge diff view loading spinner.
 	if m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick() {
 		m.mergeDiffView.AdvanceSpinner()
 		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
-
-	// Conflict view loading spinner (time-based, redraws each decor tick).
 	if m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick() {
 		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
-
-	// Git panel loading bar (time-based, redraws each decor tick).
-	if m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick() {
-		m.gitPanel.MarkViewDirty()
-		if m.layout.Mode() == layout.FourColumn {
-			m.markSlotDirty(compositor.SlotCenterLeft)
-		} else {
-			m.markSlotDirty(compositor.SlotLeft)
-		}
-		changed = true
-	}
-
-	// Plan viewer spinner animation.
 	if m.planView != nil && m.planView.NeedsDecorTick() {
 		m.planView.MarkViewDirty()
 		m.markSlotDirty(compositor.SlotRight)
 		changed = true
 	}
+	return changed
+}
 
-	// Agent panel shimmer + dot animation.
+func (m *AppModel) advanceGitPanelDecor(changed bool) bool {
+	if m.viewMode != ViewGit || m.gitPanel == nil || !m.gitPanel.NeedsDecorTick() {
+		return changed
+	}
+	m.gitPanel.MarkViewDirty()
+	m.markSlotDirty(m.sidebarFileListSlot())
+	return true
+}
+
+func (m *AppModel) advanceSidebarDecor(now time.Time, changed bool) bool {
 	agentActive := m.hasActiveAgent()
-	if m.agentPanel != nil && m.agentPanel.AdvanceDecor(tick.Time) {
+	if m.agentPanel != nil && m.agentPanel.AdvanceDecor(now) {
 		m.markSlotDirty(compositor.SlotLeft)
 		changed = true
 	}
-
-	// Session panel dot animation — sync agent activity and advance frame.
 	if m.sessionPanel != nil {
 		m.sessionPanel.SetAgentActive(agentActive)
 	}
@@ -4800,28 +4876,22 @@ func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 		m.markSlotDirty(compositor.SlotLeft)
 		changed = true
 	}
+	return changed
+}
 
-	// Swap focus ring gradient: full prismatic when active agents, subdued when idle.
+func (m *AppModel) advanceFocusDecor(now time.Time, changed bool) bool {
 	m.focusGradient = m.currentFocusGradient()
-
 	if m.input != nil && m.focusGradient != nil && m.input.CanScroll() {
 		if m.input.SetScrollIndicatorColor(m.focusGradient.Sample(now.Sub(m.focusRingStart))) {
 			m.markSlotDirty(compositor.SlotInput)
 			changed = true
 		}
 	}
-
-	// Focus ring border shimmer — only the currently focused slot participates.
 	if m.focusBorderFrameChanged(now) {
 		m.markSlotBorderDirty(m.focusBorderGroup())
 		changed = true
 	}
-
-	if changed {
-		m.viewDirty = true
-	}
-
-	return m.continueDecorTickChain()
+	return changed
 }
 
 func (m *AppModel) handleFocusPanel(fp msg.FocusPanelMsg) tea.Cmd {
@@ -10544,7 +10614,32 @@ const swipeCooldown = 500 * time.Millisecond
 // using spring-based scrolling, handles click-to-copy on chat messages,
 // and handles text selection in the code panel.
 // Mouse events are consumed when a full-screen overlay is active.
+type appMouseHandler func(*AppModel, tea.MouseMsg) (tea.Cmd, bool)
+
+var appMouseHandlers = []appMouseHandler{
+	(*AppModel).handleOverlayMouse,
+	(*AppModel).handleHoverPopupWheelMouse,
+	(*AppModel).handleEditorMotionHoverMouse,
+	(*AppModel).handleGitPanelHoverMouse,
+	(*AppModel).handleMergeDiffMotionMouse,
+	(*AppModel).handleDiffViewMotionMouse,
+	(*AppModel).handleConflictViewMotionMouse,
+	(*AppModel).handleCommitTreeHoverMouse,
+	(*AppModel).handleSelectorHoverMouse,
+	(*AppModel).handleInputWheelMouse,
+	(*AppModel).handleMouseButtonMouse,
+}
+
 func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
+	for _, handler := range appMouseHandlers {
+		if cmd, handled := handler(m, mouse); handled {
+			return cmd
+		}
+	}
+	return nil
+}
+
+func (m *AppModel) handleOverlayMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
 	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
 		switch mouse.Button {
 		case tea.MouseButtonWheelUp:
@@ -10552,7 +10647,7 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		case tea.MouseButtonWheelDown:
 			m.searchOverlay.ScrollDown()
 		}
-		return nil
+		return nil, true
 	}
 	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
 		switch mouse.Button {
@@ -10561,177 +10656,190 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		case tea.MouseButtonWheelDown:
 			m.fieldManualOverlay.ScrollDown()
 		}
-		return nil
+		return nil, true
 	}
 	if m.overlay == overlayModal {
-		return nil
+		return nil, true
 	}
-	if m.overlay == overlayLogin && m.loginPanel.Active() {
-		// Content starts at Y=1 (top border), X=1 (left border).
-		localX := mouse.X - 1
-		localY := mouse.Y - 1
-		if mouse.Action == tea.MouseActionMotion && localX >= 0 && localY >= 0 {
-			m.loginPanel.HandleMouseMotion(localX, localY)
-			return nil
+	if m.overlay != overlayLogin || !m.loginPanel.Active() {
+		return nil, false
+	}
+	localX := mouse.X - 1
+	localY := mouse.Y - 1
+	if mouse.Action == tea.MouseActionMotion && localX >= 0 && localY >= 0 {
+		m.loginPanel.HandleMouseMotion(localX, localY)
+		return nil, true
+	}
+	if mouse.Button == tea.MouseButtonLeft && mouse.Action == tea.MouseActionPress && localX >= 0 && localY >= 0 {
+		done, result, cmd := m.loginPanel.HandleClick(localX, localY)
+		if done {
+			return tea.Batch(cmd, m.handleLoginPanelResult(result)), true
 		}
-		if mouse.Button == tea.MouseButtonLeft && mouse.Action == tea.MouseActionPress {
-			if localX >= 0 && localY >= 0 {
-				done, result, cmd := m.loginPanel.HandleClick(localX, localY)
-				if done {
-					return tea.Batch(cmd, m.handleLoginPanelResult(result))
-				}
-				return cmd
-			}
-		}
-		return nil
+		return cmd, true
 	}
+	return nil, true
+}
 
-	// Route wheel events to the hover popup when it is active and the
-	// cursor is over it, instead of scrolling the underlying panel.
-	if m.viewMode == ViewEdit && m.focusedEditor().HoverActive() && isWheelEvent(mouse) {
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
-			// Check preview hover popup scroll first.
-			if m.previewPanel.HoverActive() {
-				pvx, pvy := m.previewPaneLocalCoords(mouse.X, mouse.Y)
-				pvy -= tabbar.Height
-				if m.previewPanel.IsInsideHoverPopup(pvx, pvy) {
-					switch mouse.Button {
-					case tea.MouseButtonWheelUp:
-						m.previewPanel.ScrollHoverUp()
-					case tea.MouseButtonWheelDown:
-						m.previewPanel.ScrollHoverDown()
-					}
-					return nil
-				}
-			}
-
-			vx, vy := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
-			if len(m.focusedTabOrder()) > 0 {
-				vy -= tabbar.Height
-			}
-			vy -= m.focusedEditor().FindBarHeight()
-			if m.focusedEditor().IsInsideHoverPopup(vx, vy) {
-				switch mouse.Button {
-				case tea.MouseButtonWheelUp:
-					m.focusedEditor().ScrollHoverUp()
-				case tea.MouseButtonWheelDown:
-					m.focusedEditor().ScrollHoverDown()
-				}
-				return nil
-			}
-		}
+func (m *AppModel) handleHoverPopupWheelMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.viewMode != ViewEdit || !m.focusedEditor().HoverActive() || !isWheelEvent(mouse) || !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return nil, false
 	}
-
-	// Handle motion events for hover before button-specific routing.
-	// Some terminals send MouseButtonLeft for motion after a click-release
-	// instead of MouseButtonNone. Routing hover here ensures it works
-	// regardless of reported button, as long as we're not mid-drag.
-	if m.viewMode == ViewEdit && mouse.Action == tea.MouseActionMotion && !m.editorMouseDown && m.tabDragIdx < 0 {
-		m.updateTabHoverClose(mouse)
-		m.updateFileTreeTabHover(mouse)
-		return m.handleEditorMouseHover(mouse)
-	}
-
-	// Git mode: track divider hover for resize cursor feedback.
-	// Skip when diff view is active — the left panel shows the file list.
-	if m.viewMode == ViewGit && !m.diffViewActive && m.gitPanel != nil && mouse.Action == tea.MouseActionMotion && !m.gitPanel.IsDragging() {
-		panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
-		panelX := m.fileTreePanelX()
-		contentLeft := panelX + 1
-		contentRight := panelX + panelW - 1
-		contentTop := 1
-		contentBottom := 1 + max(panelH-panelBorderSize, 0)
-		if mouse.X >= contentLeft && mouse.X < contentRight &&
-			mouse.Y >= contentTop && mouse.Y < contentBottom {
-			viewX := mouse.X - contentLeft
-			viewY := mouse.Y - contentTop
-			m.gitPanel.HandleMouseHover(viewX, viewY)
-		} else {
-			m.gitPanel.ClearHover()
-		}
-	}
-
-	// Merge diff view: forward motion events for toolbar hover tracking.
-	if m.mergeDiffViewActive && m.mergeDiffView != nil && mouse.Action == tea.MouseActionMotion {
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
-			panelX := m.codePanelX()
-			viewX := mouse.X - panelX - 1
-			viewY := mouse.Y - 1
-			localMouse := tea.MouseMsg{
-				X: viewX, Y: viewY,
-				Action: mouse.Action, Button: mouse.Button,
-			}
-			m.mergeDiffView.Update(localMouse)
-		}
-	}
-
-	// Diff view: forward motion events for toolbar hover tracking.
-	if m.diffViewActive && m.diffView != nil && mouse.Action == tea.MouseActionMotion {
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
-			panelX := m.codePanelX()
-			viewX := mouse.X - panelX - 1
-			viewY := mouse.Y - 1
-			localMouse := tea.MouseMsg{
-				X: viewX, Y: viewY,
-				Action: mouse.Action, Button: mouse.Button,
-			}
-			m.diffView.Update(localMouse)
-		}
-	}
-
-	// Conflict view: forward motion events for toolbar hover tracking.
-	if m.conflictViewActive && m.conflictView != nil && mouse.Action == tea.MouseActionMotion {
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
-			panelX := m.codePanelX()
-			viewX := mouse.X - panelX - 1
-			viewY := mouse.Y - 1
-			localMouse := tea.MouseMsg{
-				X: viewX, Y: viewY,
-				Action: mouse.Action, Button: mouse.Button,
-			}
-			m.conflictView.Update(localMouse)
-		}
-	}
-
-	// Git mode: track toolbar button hover for commit tree panel.
-	// Skip when diff/merge diff view is active — their toolbars handle hover directly.
-	if m.viewMode == ViewGit && !m.diffViewActive && !m.mergeDiffViewActive && m.commitTree != nil && mouse.Action == tea.MouseActionMotion {
-		panelW, panelH := m.layout.GetPanelSize(component.FocusCodeViewer)
-		panelX := m.codePanelX()
-		contentLeft := panelX + 1
-		contentRight := panelX + panelW - 1
-		contentTop := 1
-		contentBottom := 1 + max(panelH-panelBorderSize, 0)
-		if mouse.X >= contentLeft && mouse.X < contentRight &&
-			mouse.Y >= contentTop && mouse.Y < contentBottom {
-			viewX := mouse.X - contentLeft
-			viewY := mouse.Y - contentTop
-			m.commitTree.HandleToolbarHover(viewX, viewY)
-		} else {
-			m.commitTree.ClearHover()
-		}
-	}
-
-	// Model selector hover: update arrow highlight on motion over the selector line.
-	if mouse.Action == tea.MouseActionMotion {
-		m.updateSelectorHover(mouse)
-	}
-
-	// Route wheel events to input when focused and scrollable.
-	if m.focus.Current() == component.FocusInput && m.input.CanScroll() {
-		inputTop := m.height - m.prevInputH - statusBarHeight
-		if mouse.Y >= inputTop && mouse.Y < inputTop+m.prevInputH {
+	if m.previewPanel.HoverActive() {
+		pvx, pvy := m.previewPaneLocalCoords(mouse.X, mouse.Y)
+		pvy -= tabbar.Height
+		if m.previewPanel.IsInsideHoverPopup(pvx, pvy) {
 			switch mouse.Button {
 			case tea.MouseButtonWheelUp:
-				m.input.ScrollUp()
-				return nil
+				m.previewPanel.ScrollHoverUp()
 			case tea.MouseButtonWheelDown:
-				m.input.ScrollDown()
-				return nil
+				m.previewPanel.ScrollHoverDown()
 			}
+			return nil, true
 		}
 	}
 
+	vx, vy := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+	if len(m.focusedTabOrder()) > 0 {
+		vy -= tabbar.Height
+	}
+	vy -= m.focusedEditor().FindBarHeight()
+	if !m.focusedEditor().IsInsideHoverPopup(vx, vy) {
+		return nil, false
+	}
+	switch mouse.Button {
+	case tea.MouseButtonWheelUp:
+		m.focusedEditor().ScrollHoverUp()
+	case tea.MouseButtonWheelDown:
+		m.focusedEditor().ScrollHoverDown()
+	}
+	return nil, true
+}
+
+func (m *AppModel) handleEditorMotionHoverMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.viewMode != ViewEdit || mouse.Action != tea.MouseActionMotion || m.editorMouseDown || m.tabDragIdx >= 0 {
+		return nil, false
+	}
+	m.updateTabHoverClose(mouse)
+	m.updateFileTreeTabHover(mouse)
+	return m.handleEditorMouseHover(mouse), true
+}
+
+func (m *AppModel) handleGitPanelHoverMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.viewMode != ViewGit || m.diffViewActive || m.gitPanel == nil || mouse.Action != tea.MouseActionMotion || m.gitPanel.IsDragging() {
+		return nil, false
+	}
+	panelW, panelH := m.layout.GetPanelSize(component.FocusFileTree)
+	panelX := m.fileTreePanelX()
+	contentLeft := panelX + 1
+	contentRight := panelX + panelW - 1
+	contentTop := 1
+	contentBottom := 1 + max(panelH-panelBorderSize, 0)
+	if mouse.X >= contentLeft && mouse.X < contentRight &&
+		mouse.Y >= contentTop && mouse.Y < contentBottom {
+		viewX := mouse.X - contentLeft
+		viewY := mouse.Y - contentTop
+		m.gitPanel.HandleMouseHover(viewX, viewY)
+	} else {
+		m.gitPanel.ClearHover()
+	}
+	return nil, false
+}
+
+func (m *AppModel) handleMergeDiffMotionMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if !m.mergeDiffViewActive || m.mergeDiffView == nil || mouse.Action != tea.MouseActionMotion || !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return nil, false
+	}
+	panelX := m.codePanelX()
+	localMouse := tea.MouseMsg{
+		X:      mouse.X - panelX - 1,
+		Y:      mouse.Y - 1,
+		Action: mouse.Action,
+		Button: mouse.Button,
+	}
+	m.mergeDiffView.Update(localMouse)
+	return nil, false
+}
+
+func (m *AppModel) handleDiffViewMotionMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if !m.diffViewActive || m.diffView == nil || mouse.Action != tea.MouseActionMotion || !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return nil, false
+	}
+	panelX := m.codePanelX()
+	localMouse := tea.MouseMsg{
+		X:      mouse.X - panelX - 1,
+		Y:      mouse.Y - 1,
+		Action: mouse.Action,
+		Button: mouse.Button,
+	}
+	m.diffView.Update(localMouse)
+	return nil, false
+}
+
+func (m *AppModel) handleConflictViewMotionMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if !m.conflictViewActive || m.conflictView == nil || mouse.Action != tea.MouseActionMotion || !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return nil, false
+	}
+	panelX := m.codePanelX()
+	localMouse := tea.MouseMsg{
+		X:      mouse.X - panelX - 1,
+		Y:      mouse.Y - 1,
+		Action: mouse.Action,
+		Button: mouse.Button,
+	}
+	m.conflictView.Update(localMouse)
+	return nil, false
+}
+
+func (m *AppModel) handleCommitTreeHoverMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.viewMode != ViewGit || m.diffViewActive || m.mergeDiffViewActive || m.commitTree == nil || mouse.Action != tea.MouseActionMotion {
+		return nil, false
+	}
+	panelW, panelH := m.layout.GetPanelSize(component.FocusCodeViewer)
+	panelX := m.codePanelX()
+	contentLeft := panelX + 1
+	contentRight := panelX + panelW - 1
+	contentTop := 1
+	contentBottom := 1 + max(panelH-panelBorderSize, 0)
+	if mouse.X >= contentLeft && mouse.X < contentRight &&
+		mouse.Y >= contentTop && mouse.Y < contentBottom {
+		viewX := mouse.X - contentLeft
+		viewY := mouse.Y - contentTop
+		m.commitTree.HandleToolbarHover(viewX, viewY)
+	} else {
+		m.commitTree.ClearHover()
+	}
+	return nil, false
+}
+
+func (m *AppModel) handleSelectorHoverMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if mouse.Action != tea.MouseActionMotion {
+		return nil, false
+	}
+	m.updateSelectorHover(mouse)
+	return nil, false
+}
+
+func (m *AppModel) handleInputWheelMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.focus.Current() != component.FocusInput || !m.input.CanScroll() {
+		return nil, false
+	}
+	inputTop := m.height - m.prevInputH - statusBarHeight
+	if mouse.Y < inputTop || mouse.Y >= inputTop+m.prevInputH {
+		return nil, false
+	}
+	switch mouse.Button {
+	case tea.MouseButtonWheelUp:
+		m.input.ScrollUp()
+		return nil, true
+	case tea.MouseButtonWheelDown:
+		m.input.ScrollDown()
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+func (m *AppModel) handleMouseButtonMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
 	switch mouse.Button {
 	case tea.MouseButtonWheelUp:
 		if mouse.Alt {
@@ -10739,20 +10847,25 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 		} else {
 			m.applyScrollImpulse(mouse.X, mouse.Y, -scrollImpulse)
 		}
+		return nil, true
 	case tea.MouseButtonWheelDown:
 		if mouse.Alt {
 			m.applySwipeImpulse(mouse.X, 1)
 		} else {
 			m.applyScrollImpulse(mouse.X, mouse.Y, scrollImpulse)
 		}
+		return nil, true
 	case tea.MouseButtonWheelLeft:
 		m.applySwipeImpulse(mouse.X, -1)
+		return nil, true
 	case tea.MouseButtonWheelRight:
 		m.applySwipeImpulse(mouse.X, 1)
+		return nil, true
 	case tea.MouseButtonLeft:
-		return m.handleLeftClick(mouse)
+		return m.handleLeftClick(mouse), true
+	default:
+		return nil, false
 	}
-	return nil
 }
 
 // isWheelEvent reports whether the mouse event is a scroll wheel action.
@@ -10987,96 +11100,144 @@ func (m *AppModel) handleAgentPanelClick(screenX, screenY int) tea.Cmd {
 // so we fall back to the active leftRing panel. In TwoColumn/ThreeColumn
 // modes the fixed candidate IDs are mapped to the current ring occupant.
 func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
-	// When merge diff view is active, route scrolls to its focused pane.
-	if m.mergeDiffViewActive && m.mergeDiffView != nil && m.isInsideCodePanel(x, y) {
+	if panelID, ok := m.overlayPanelForScroll(x, y); ok {
+		return panelID, true
+	}
+	mode := m.layout.Mode()
+	if mode == layout.SingleColumn {
+		return m.singleColumnPanelForScroll(x, y)
+	}
+	return m.multiColumnPanelForScroll(x, y, mode)
+}
+
+func (m *AppModel) overlayPanelForScroll(x, y int) (component.FocusID, bool) {
+	if !m.isInsideCodePanel(x, y) {
+		return 0, false
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
 		return pane.PaneFocusID(m.mergeDiffView.FocusedPane()), true
 	}
-	// When diff view is active, route scrolls to the diff view's focused pane.
-	if m.diffViewActive && m.diffView != nil && m.isInsideCodePanel(x, y) {
+	if m.diffViewActive && m.diffView != nil {
 		return pane.PaneFocusID(m.diffView.FocusedPane()), true
 	}
-	// When conflict view is active, route code panel scrolls to the conflict view.
-	if m.conflictViewActive && m.conflictView != nil && m.isInsideCodePanel(x, y) {
+	if m.conflictViewActive && m.conflictView != nil {
 		return component.FocusConflictView, true
 	}
+	return 0, false
+}
 
-	mode := m.layout.Mode()
-
-	if mode == layout.SingleColumn {
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			if !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree {
-				return component.FocusMergeDiffFileList, true
-			}
-			return component.FocusMergeDiffView, true
-		}
-		if m.diffViewActive && m.diffView != nil {
-			// File-tree ring slot → diff file list; everything else → diff pane.
-			if !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree {
-				return component.FocusDiffFileList, true
-			}
-			return component.FocusDiffView, true
-		}
-		if m.conflictViewActive && m.conflictView != nil {
-			if !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree {
-				return component.FocusConflictFileList, true
-			}
-			return component.FocusConflictView, true
-		}
-		if m.leftRing.empty() {
-			return 0, false
-		}
-		if current := m.leftRing.current(); current == component.FocusSessionPanel || current == component.FocusAgentPanel {
-			if m.isInsideAgentsSection(x, y) {
-				return component.FocusAgentPanel, true
-			}
-			if m.isInsideLeftPanelContent(x, y) {
-				return component.FocusSessionPanel, true
-			}
-		}
-		return m.leftRing.current(), true
+func (m *AppModel) singleColumnPanelForScroll(x, y int) (component.FocusID, bool) {
+	if panelID, ok := m.singleColumnOverlayPanelForScroll(); ok {
+		return panelID, true
 	}
+	if m.leftRing.empty() {
+		return 0, false
+	}
+	current := m.leftRing.current()
+	if current != component.FocusSessionPanel && current != component.FocusAgentPanel {
+		return current, true
+	}
+	if m.isInsideAgentsSection(x, y) {
+		return component.FocusAgentPanel, true
+	}
+	if m.isInsideLeftPanelContent(x, y) {
+		return component.FocusSessionPanel, true
+	}
+	return current, true
+}
 
+func (m *AppModel) singleColumnOverlayPanelForScroll() (component.FocusID, bool) {
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		if m.singleColumnFileTreeVisible() {
+			return component.FocusMergeDiffFileList, true
+		}
+		return component.FocusMergeDiffView, true
+	}
+	if m.diffViewActive && m.diffView != nil {
+		if m.singleColumnFileTreeVisible() {
+			return component.FocusDiffFileList, true
+		}
+		return component.FocusDiffView, true
+	}
+	if m.conflictViewActive && m.conflictView != nil {
+		if m.singleColumnFileTreeVisible() {
+			return component.FocusConflictFileList, true
+		}
+		return component.FocusConflictView, true
+	}
+	return 0, false
+}
+
+func (m *AppModel) singleColumnFileTreeVisible() bool {
+	return !m.leftRing.empty() && m.leftRing.current() == component.FocusFileTree
+}
+
+func (m *AppModel) multiColumnPanelForScroll(x, y int, mode layout.LayoutMode) (component.FocusID, bool) {
 	panelID, ok := m.layout.PanelAtX(x)
 	if !ok {
 		return 0, false
 	}
-
 	resolved := m.resolveRingPanel(panelID, mode)
-	if panelID == component.FocusSessionPanel && (resolved == component.FocusSessionPanel || resolved == component.FocusAgentPanel) {
-		if m.isInsideAgentsSection(x, y) {
-			return component.FocusAgentPanel, true
-		}
-		if m.isInsideLeftPanelContent(x, y) {
-			return component.FocusSessionPanel, true
+	if panelID == component.FocusSessionPanel {
+		if panelID, ok := m.sessionPanelScrollTarget(resolved, x, y); ok {
+			return panelID, true
 		}
 	}
+	if panelID, ok := m.overlayFileListPanelForScroll(resolved); ok {
+		return panelID, true
+	}
+	if panelID, ok := m.editCodePanelForScroll(resolved, x, y); ok {
+		return panelID, true
+	}
+	return resolved, true
+}
 
-	// Merge diff view: route file-tree slot scrolls to the merge diff file list.
-	if m.mergeDiffViewActive && m.mergeDiffView != nil && resolved == component.FocusFileTree {
+func (m *AppModel) sessionPanelScrollTarget(
+	resolved component.FocusID,
+	x, y int,
+) (component.FocusID, bool) {
+	if resolved != component.FocusSessionPanel && resolved != component.FocusAgentPanel {
+		return 0, false
+	}
+	if m.isInsideAgentsSection(x, y) {
+		return component.FocusAgentPanel, true
+	}
+	if m.isInsideLeftPanelContent(x, y) {
+		return component.FocusSessionPanel, true
+	}
+	return 0, false
+}
+
+func (m *AppModel) overlayFileListPanelForScroll(resolved component.FocusID) (component.FocusID, bool) {
+	if resolved != component.FocusFileTree {
+		return 0, false
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
 		return component.FocusMergeDiffFileList, true
 	}
-	// Diff view: route file-tree slot scrolls to the diff file list.
-	if m.diffViewActive && m.diffView != nil && resolved == component.FocusFileTree {
+	if m.diffViewActive && m.diffView != nil {
 		return component.FocusDiffFileList, true
 	}
-	// Conflict view: route file-tree slot scrolls to the conflict file list.
-	if m.conflictViewActive && m.conflictView != nil && resolved == component.FocusFileTree {
+	if m.conflictViewActive && m.conflictView != nil {
 		return component.FocusConflictFileList, true
 	}
+	return 0, false
+}
 
-	// In edit mode, route scrolls within the code panel to the pane
-	// under the cursor using tree-based hit testing.
-	if resolved == component.FocusCodeViewer && m.viewMode == ViewEdit && m.paneTree != nil {
-		// Full markdown preview mode: all scrolls go to the mdPreview.
-		if m.isFullMdPreview() {
-			return pane.PaneFocusID(m.mdPreviewPane), true
-		}
-		if pid, ok := m.hitTestPane(x, y); ok {
-			return pane.PaneFocusID(pid), true
-		}
+func (m *AppModel) editCodePanelForScroll(
+	resolved component.FocusID,
+	x, y int,
+) (component.FocusID, bool) {
+	if resolved != component.FocusCodeViewer || m.viewMode != ViewEdit || m.paneTree == nil {
+		return 0, false
 	}
-
-	return resolved, true
+	if m.isFullMdPreview() {
+		return pane.PaneFocusID(m.mdPreviewPane), true
+	}
+	if pid, ok := m.hitTestPane(x, y); ok {
+		return pane.PaneFocusID(pid), true
+	}
+	return 0, false
 }
 
 // resolveRingPanel maps a fixed candidate panel ID to the actual panel
@@ -11205,163 +11366,140 @@ func (m *AppModel) applyScrollDelta(panelID component.FocusID, delta int) {
 	}
 }
 
-// scrollOneLine scrolls the identified panel by one line in the given direction.
-// Returns true if the scroll was consumed, false if the panel hit a boundary.
-func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool {
-	switch panelID {
-	case component.FocusChat:
-		if direction < 0 {
-			return m.chat.ScrollUp()
+type panelScrollRoute func(*AppModel, int) bool
+
+func scrollByDirection(direction int, up, down func() bool) bool {
+	if direction < 0 {
+		return up()
+	}
+	return down()
+}
+
+func scrollByDirectionCount(direction int, up, down func(int) bool) bool {
+	if direction < 0 {
+		return up(1)
+	}
+	return down(1)
+}
+
+var panelScrollRoutes = map[component.FocusID]panelScrollRoute{
+	component.FocusChat: func(m *AppModel, direction int) bool {
+		return scrollByDirection(direction, m.chat.ScrollUp, m.chat.ScrollDown)
+	},
+	component.FocusConflictFileList: func(m *AppModel, direction int) bool {
+		if !m.conflictViewActive || m.conflictView == nil {
+			return true
 		}
-		return m.chat.ScrollDown()
-	case component.FocusConflictFileList:
-		if m.conflictViewActive && m.conflictView != nil {
-			if direction < 0 {
-				return m.conflictView.ScrollFileListUp()
-			}
-			return m.conflictView.ScrollFileListDown()
+		return scrollByDirection(direction, m.conflictView.ScrollFileListUp, m.conflictView.ScrollFileListDown)
+	},
+	component.FocusConflictView: func(m *AppModel, direction int) bool {
+		if !m.conflictViewActive || m.conflictView == nil {
+			return true
 		}
-		return true
-	case component.FocusConflictView:
-		if m.conflictViewActive && m.conflictView != nil {
-			if direction < 0 {
-				return m.conflictView.ScrollUp()
-			}
-			return m.conflictView.ScrollDown()
+		return scrollByDirection(direction, m.conflictView.ScrollUp, m.conflictView.ScrollDown)
+	},
+	component.FocusMergeDiffFileList: func(m *AppModel, direction int) bool {
+		if !m.mergeDiffViewActive || m.mergeDiffView == nil {
+			return true
 		}
-		return true
-	case component.FocusMergeDiffFileList:
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			if direction < 0 {
-				return m.mergeDiffView.ScrollFileListUp()
-			}
-			return m.mergeDiffView.ScrollFileListDown()
+		return scrollByDirection(direction, m.mergeDiffView.ScrollFileListUp, m.mergeDiffView.ScrollFileListDown)
+	},
+	component.FocusMergeDiffView: func(m *AppModel, direction int) bool {
+		if m.mergeDiffView == nil {
+			return true
 		}
-		return true
-	case component.FocusMergeDiffView:
-		if m.mergeDiffView != nil {
-			if direction < 0 {
-				return m.mergeDiffView.ScrollUp()
-			}
-			return m.mergeDiffView.ScrollDown()
+		return scrollByDirection(direction, m.mergeDiffView.ScrollUp, m.mergeDiffView.ScrollDown)
+	},
+	component.FocusDiffFileList: func(m *AppModel, direction int) bool {
+		if !m.diffViewActive || m.diffView == nil {
+			return true
 		}
-		return true
-	case component.FocusDiffFileList:
-		if m.diffViewActive && m.diffView != nil {
-			if direction < 0 {
-				return m.diffView.ScrollFileListUp()
-			}
-			return m.diffView.ScrollFileListDown()
+		return scrollByDirection(direction, m.diffView.ScrollFileListUp, m.diffView.ScrollFileListDown)
+	},
+	component.FocusDiffView: func(m *AppModel, direction int) bool {
+		if m.diffView == nil {
+			return true
 		}
-		return true
-	case component.FocusDiffView:
-		if m.diffView != nil {
-			if direction < 0 {
-				return m.diffView.ScrollUp()
-			}
-			return m.diffView.ScrollDown()
-		}
-		return true
-	case component.FocusCodeViewer:
-		if m.conflictViewActive && m.conflictView != nil {
-			if direction < 0 {
-				return m.conflictView.ScrollUp()
-			}
-			return m.conflictView.ScrollDown()
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			if direction < 0 {
-				return m.mergeDiffView.ScrollUp()
-			}
-			return m.mergeDiffView.ScrollDown()
-		}
-		if m.diffViewActive && m.diffView != nil {
-			if direction < 0 {
-				return m.diffView.ScrollUp()
-			}
-			return m.diffView.ScrollDown()
-		}
-		if m.viewMode == ViewGit && m.commitTree != nil {
-			if direction < 0 {
-				return m.commitTree.ScrollUp()
-			}
-			return m.commitTree.ScrollDown()
-		}
-		if direction < 0 {
-			return m.codePanel.ScrollUp()
-		}
-		return m.codePanel.ScrollDown()
-	case component.FocusFileTree:
-		if m.viewMode == ViewGit && m.gitPanel != nil {
-			if direction < 0 {
-				return m.gitPanel.ScrollUp()
-			}
-			return m.gitPanel.ScrollDown()
-		}
-		if direction < 0 {
-			return m.fileTree.ScrollUp()
-		}
-		return m.fileTree.ScrollDown()
-	case component.FocusSessionPanel:
+		return scrollByDirection(direction, m.diffView.ScrollUp, m.diffView.ScrollDown)
+	},
+	component.FocusCodeViewer: func(m *AppModel, direction int) bool {
+		return m.scrollCodeViewerOneLine(direction)
+	},
+	component.FocusFileTree: func(m *AppModel, direction int) bool {
+		return m.scrollFileTreeOneLine(direction)
+	},
+	component.FocusSessionPanel: func(*AppModel, int) bool {
 		return false
-	case component.FocusAgentPanel:
-		if direction < 0 {
-			return m.agentPanel.ScrollUp()
-		}
-		return m.agentPanel.ScrollDown()
-	case component.FocusGitPanel:
+	},
+	component.FocusAgentPanel: func(m *AppModel, direction int) bool {
+		return scrollByDirection(direction, m.agentPanel.ScrollUp, m.agentPanel.ScrollDown)
+	},
+	component.FocusGitPanel: func(m *AppModel, direction int) bool {
 		if m.gitPanel == nil {
 			return true
 		}
-		if direction < 0 {
-			return m.gitPanel.ScrollUp()
-		}
-		return m.gitPanel.ScrollDown()
-	case component.FocusCommitTree:
+		return scrollByDirection(direction, m.gitPanel.ScrollUp, m.gitPanel.ScrollDown)
+	},
+	component.FocusCommitTree: func(m *AppModel, direction int) bool {
 		if m.commitTree == nil {
 			return true
 		}
-		if direction < 0 {
-			return m.commitTree.ScrollUp()
-		}
-		return m.commitTree.ScrollDown()
-	default:
-		if !pane.IsPaneFocus(panelID) {
-			return true
-		}
-		// Merge diff sub-pane scroll.
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			if direction < 0 {
-				return m.mergeDiffView.ScrollUp()
-			}
-			return m.mergeDiffView.ScrollDown()
-		}
-		// Diff sub-pane scroll.
-		if m.diffViewActive && m.diffView != nil {
-			if direction < 0 {
-				return m.diffView.ScrollUp()
-			}
-			return m.diffView.ScrollDown()
-		}
-		pid := pane.PaneIDFromFocus(panelID)
-		if pid == m.previewPane {
-			if direction < 0 {
-				return m.previewPanel.ScrollUp(1)
-			}
-			return m.previewPanel.ScrollDown(1)
-		}
-		if pid == m.mdPreviewPane {
-			if direction < 0 {
-				return m.mdPreviewPanel.ScrollUp(1)
-			}
-			return m.mdPreviewPanel.ScrollDown(1)
-		}
-		if ps, ok := m.paneEditors[pid]; ok {
-			if direction < 0 {
-				return ps.editor.ScrollUp()
-			}
-			return ps.editor.ScrollDown()
-		}
+		return scrollByDirection(direction, m.commitTree.ScrollUp, m.commitTree.ScrollDown)
+	},
+}
+
+func (m *AppModel) scrollCodeViewerOneLine(direction int) bool {
+	if m.conflictViewActive && m.conflictView != nil {
+		return scrollByDirection(direction, m.conflictView.ScrollUp, m.conflictView.ScrollDown)
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return scrollByDirection(direction, m.mergeDiffView.ScrollUp, m.mergeDiffView.ScrollDown)
+	}
+	if m.diffViewActive && m.diffView != nil {
+		return scrollByDirection(direction, m.diffView.ScrollUp, m.diffView.ScrollDown)
+	}
+	if m.viewMode == ViewGit && m.commitTree != nil {
+		return scrollByDirection(direction, m.commitTree.ScrollUp, m.commitTree.ScrollDown)
+	}
+	return scrollByDirection(direction, m.codePanel.ScrollUp, m.codePanel.ScrollDown)
+}
+
+func (m *AppModel) scrollFileTreeOneLine(direction int) bool {
+	if m.viewMode == ViewGit && m.gitPanel != nil {
+		return scrollByDirection(direction, m.gitPanel.ScrollUp, m.gitPanel.ScrollDown)
+	}
+	return scrollByDirection(direction, m.fileTree.ScrollUp, m.fileTree.ScrollDown)
+}
+
+func (m *AppModel) scrollPaneOneLine(panelID component.FocusID, direction int) bool {
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return scrollByDirection(direction, m.mergeDiffView.ScrollUp, m.mergeDiffView.ScrollDown)
+	}
+	if m.diffViewActive && m.diffView != nil {
+		return scrollByDirection(direction, m.diffView.ScrollUp, m.diffView.ScrollDown)
+	}
+
+	pid := pane.PaneIDFromFocus(panelID)
+	if pid == m.previewPane {
+		return scrollByDirectionCount(direction, m.previewPanel.ScrollUp, m.previewPanel.ScrollDown)
+	}
+	if pid == m.mdPreviewPane {
+		return scrollByDirectionCount(direction, m.mdPreviewPanel.ScrollUp, m.mdPreviewPanel.ScrollDown)
+	}
+	if ps, ok := m.paneEditors[pid]; ok {
+		return scrollByDirection(direction, ps.editor.ScrollUp, ps.editor.ScrollDown)
+	}
+	return true
+}
+
+// scrollOneLine scrolls the identified panel by one line in the given direction.
+// Returns true if the scroll was consumed, false if the panel hit a boundary.
+func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool {
+	if handler, ok := panelScrollRoutes[panelID]; ok {
+		return handler(m, direction)
+	}
+	if pane.IsPaneFocus(panelID) {
+		return m.scrollPaneOneLine(panelID, direction)
 	}
 	return true
 }
@@ -11880,152 +12018,160 @@ func (m *AppModel) paneViewCoords(screenX, screenY int) (pane.PaneID, int, int, 
 // handleEditorMouse handles all left-button mouse actions (press, drag,
 // release) inside the code panel during edit mode. Returns (consumed, cmd).
 func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
-	// Release always clears tracking, even outside the panel.
 	if mouse.Action == tea.MouseActionRelease {
-		cmd := m.finalizeCrossPaneDrop()
-		m.editorMouseDown = false
-		m.editorDragging = false
-		m.inputMouseDown = false // Cross-panel release safety.
-		m.tabDragIdx = -1
-		m.tabDragSourcePane = 0
-		m.tabDropTarget = 0
+		return m.handleEditorMouseRelease()
+	}
+	if consumed, cmd := m.handleFullPreviewMouse(mouse); consumed {
 		return true, cmd
 	}
-
-	// Full-preview mode: all code panel clicks route to the preview.
-	// Only split mode needs the per-half routing below.
-	if m.hasPreview() && len(m.focusedTabOrder()) == 0 {
-		if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
-			viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
-			if viewY < tabbar.Height {
-				codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
-				cfg := tabbar.Config{
-					Tabs: []tabbar.Tab{{
-						Path:        m.previewPanel.FilePath(),
-						Modified:    false,
-						LabelPrefix: "Preview: ",
-					}},
-					Active:    0,
-					Width:     max(codeW-panelBorderSize, 1),
-					NerdFonts: m.nerdFontsDetected,
-					Theme:     m.config.Theme(),
-				}
-				hit := tabbar.HitTest(cfg, viewX)
-				if hit.TabIndex >= 0 && hit.IsClose {
-					m.dismissPreview()
-					return true, nil
-				}
-			} else {
-				// Content click: position the cursor.
-				m.previewPanel.SetCursorFromViewport(viewX, viewY-tabbar.Height)
-			}
-			m.focus.SetFocus(pane.PaneFocusID(m.previewPane))
-			m.syncFocusState()
-		}
-		return true, nil
+	if consumed, cmd := m.handleFullMarkdownPreviewMouse(mouse); consumed {
+		return true, cmd
 	}
-
-	// Full markdown preview mode: all code panel clicks route to the mdPreview.
-	if m.isFullMdPreview() {
-		if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
-			viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
-			if viewY < tabbar.Height {
-				codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
-				cfg := tabbar.Config{
-					Tabs: []tabbar.Tab{{
-						Path:        m.mdPreviewPanel.FilePath(),
-						Modified:    false,
-						LabelPrefix: "Markdown: ",
-					}},
-					Active:    0,
-					Width:     max(codeW-panelBorderSize, 1),
-					NerdFonts: m.nerdFontsDetected,
-					Theme:     m.config.Theme(),
-				}
-				hit := tabbar.HitTest(cfg, viewX)
-				if hit.TabIndex >= 0 && hit.IsClose {
-					m.dismissMarkdownPreview()
-					return true, nil
-				}
-			}
-			m.focus.SetFocus(pane.PaneFocusID(m.mdPreviewPane))
-			m.syncFocusState()
-		}
-		return true, nil
+	if consumed, cmd := m.handleTabDragMouseMotion(mouse); consumed {
+		return true, cmd
 	}
-
-	// Tab bar drag: reorder within pane or detect cross-pane drop target.
-	if mouse.Action == tea.MouseActionMotion && m.tabDragIdx >= 0 {
-		m.tabDropTarget = 0
-
-		// Multi-pane tree mode: use tree-based hit testing.
-		if m.paneTree != nil && !m.paneTree.IsLeaf() {
-			pid, localX, _, ok := m.paneViewCoords(mouse.X, mouse.Y)
-			if !ok {
-				return true, nil
-			}
-			if pid == m.tabDragSourcePane && pid != m.previewPane {
-				return m.handleTabDragReorder(localX)
-			}
-			if pid != m.tabDragSourcePane && pid != m.previewPane {
-				if _, isEditor := m.paneEditors[pid]; isEditor {
-					m.tabDropTarget = pid
-				}
-			}
-			return true, nil
-		}
-
-		// Legacy split mode: preview-to-editor detection.
-		if m.tabDragSourcePane == m.previewPane && !m.isInsidePreviewHalf(mouse.X) {
-			m.tabDropTarget = m.focusedPane
-			return true, nil
-		}
-
-		// Single-pane intra-pane reorder (existing behavior).
-		viewX, _ := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
-		return m.handleTabDragReorder(viewX)
+	if consumed, cmd := m.handleEditorDragMouseMotion(mouse); consumed {
+		return true, cmd
 	}
-
-	// Motion while dragging: extend selection even if the pointer left
-	// the panel bounds (clamp handled by the editor).
-	// Suppressed when multi-cursor is active — visual mode and multi-cursor
-	// are mutually exclusive, so drag-select is disabled until cursors are
-	// cleared (Esc).
-	if mouse.Action == tea.MouseActionMotion && m.editorMouseDown {
-		if m.focusedEditor().HasMultiCursor() {
-			return true, nil
-		}
-		viewX, viewY := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
-		if len(m.focusedTabOrder()) > 0 {
-			viewY -= tabbar.Height
-		}
-		viewY -= m.focusedEditor().FindBarHeight()
-		if !m.editorDragging {
-			m.focusedEditor().StartDragSelection()
-			m.editorDragging = true
-		}
-		m.focusedEditor().ExtendDragSelection(viewX, viewY)
-		return true, nil
-	}
-
-	// Press: must be inside the code panel.
 	if mouse.Action != tea.MouseActionPress {
 		return false, nil
 	}
-
 	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
 		return false, nil
 	}
-
-	// Multi-pane mode: route via tree-based hit test.
 	if m.paneTree != nil && !m.paneTree.IsLeaf() {
 		return m.handleMultiPanePress(mouse)
 	}
+	if consumed, cmd := m.handlePreviewSplitPress(mouse); consumed {
+		return true, cmd
+	}
+	return m.handleEditorPaneClick(mouse)
+}
 
-	// Single-pane / legacy preview-split path.
+func (m *AppModel) handleEditorMouseRelease() (bool, tea.Cmd) {
+	cmd := m.finalizeCrossPaneDrop()
+	m.editorMouseDown = false
+	m.editorDragging = false
+	m.inputMouseDown = false
+	m.tabDragIdx = -1
+	m.tabDragSourcePane = 0
+	m.tabDropTarget = 0
+	return true, cmd
+}
 
-	// In preview split mode, clicks on the preview half focus the preview
-	// panel. Tab bar close clicks dismiss the preview.
+func (m *AppModel) handleFullPreviewMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	if !m.hasPreview() || len(m.focusedTabOrder()) != 0 {
+		return false, nil
+	}
+	if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
+		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		if viewY < tabbar.Height {
+			codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.previewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Preview: ",
+				}},
+				Active:    0,
+				Width:     max(codeW-panelBorderSize, 1),
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, viewX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissPreview()
+				return true, nil
+			}
+		} else {
+			m.previewPanel.SetCursorFromViewport(viewX, viewY-tabbar.Height)
+		}
+		m.focus.SetFocus(pane.PaneFocusID(m.previewPane))
+		m.syncFocusState()
+	}
+	return true, nil
+}
+
+func (m *AppModel) handleFullMarkdownPreviewMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	if !m.isFullMdPreview() {
+		return false, nil
+	}
+	if mouse.Action == tea.MouseActionPress && m.isInsideCodePanel(mouse.X, mouse.Y) {
+		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		if viewY < tabbar.Height {
+			codeW, _ := m.layout.GetPanelSize(component.FocusCodeViewer)
+			cfg := tabbar.Config{
+				Tabs: []tabbar.Tab{{
+					Path:        m.mdPreviewPanel.FilePath(),
+					Modified:    false,
+					LabelPrefix: "Markdown: ",
+				}},
+				Active:    0,
+				Width:     max(codeW-panelBorderSize, 1),
+				NerdFonts: m.nerdFontsDetected,
+				Theme:     m.config.Theme(),
+			}
+			hit := tabbar.HitTest(cfg, viewX)
+			if hit.TabIndex >= 0 && hit.IsClose {
+				m.dismissMarkdownPreview()
+				return true, nil
+			}
+		}
+		m.focus.SetFocus(pane.PaneFocusID(m.mdPreviewPane))
+		m.syncFocusState()
+	}
+	return true, nil
+}
+
+func (m *AppModel) handleTabDragMouseMotion(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	if mouse.Action != tea.MouseActionMotion || m.tabDragIdx < 0 {
+		return false, nil
+	}
+	m.tabDropTarget = 0
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		pid, localX, _, ok := m.paneViewCoords(mouse.X, mouse.Y)
+		if !ok {
+			return true, nil
+		}
+		if pid == m.tabDragSourcePane && pid != m.previewPane {
+			return m.handleTabDragReorder(localX)
+		}
+		if pid != m.tabDragSourcePane && pid != m.previewPane {
+			if _, isEditor := m.paneEditors[pid]; isEditor {
+				m.tabDropTarget = pid
+			}
+		}
+		return true, nil
+	}
+	if m.tabDragSourcePane == m.previewPane && !m.isInsidePreviewHalf(mouse.X) {
+		m.tabDropTarget = m.focusedPane
+		return true, nil
+	}
+	viewX, _ := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+	return m.handleTabDragReorder(viewX)
+}
+
+func (m *AppModel) handleEditorDragMouseMotion(mouse tea.MouseMsg) (bool, tea.Cmd) {
+	if mouse.Action != tea.MouseActionMotion || !m.editorMouseDown {
+		return false, nil
+	}
+	if m.focusedEditor().HasMultiCursor() {
+		return true, nil
+	}
+	viewX, viewY := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+	if len(m.focusedTabOrder()) > 0 {
+		viewY -= tabbar.Height
+	}
+	viewY -= m.focusedEditor().FindBarHeight()
+	if !m.editorDragging {
+		m.focusedEditor().StartDragSelection()
+		m.editorDragging = true
+	}
+	m.focusedEditor().ExtendDragSelection(viewX, viewY)
+	return true, nil
+}
+
+func (m *AppModel) handlePreviewSplitPress(mouse tea.MouseMsg) (bool, tea.Cmd) {
 	if m.isInsidePreviewHalf(mouse.X) {
 		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
 		if viewY < tabbar.Height {
@@ -12059,8 +12205,7 @@ func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		m.syncFocusState()
 		return true, nil
 	}
-
-	return m.handleEditorPaneClick(mouse)
+	return false, nil
 }
 
 // handleMultiPanePress routes a press event to the correct pane in multi-pane
@@ -12708,157 +12853,204 @@ func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// propagateToFocused sends a key message only to the currently focused component.
-func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
-	focused := m.focus.Current()
+type focusedKeyHandler func(*AppModel, tea.KeyMsg) tea.Cmd
 
-	switch focused {
-	case component.FocusInput:
-		prevVisual := m.input.VisualLineCount()
-		comp, cmd := m.input.Update(key)
-		m.input = comp.(*inputpkg.Model)
-		if m.input.VisualLineCount() != prevVisual {
-			m.recalcLayout()
-		}
-		return cmd
-	case component.FocusChat:
-		comp, cmd := m.chat.Update(key)
-		m.chat = comp.(*chat.Model)
-		return cmd
-	case component.FocusSessionPanel:
-		comp, cmd := m.sessionPanel.Update(key)
-		m.sessionPanel = comp.(*sessionpkg.Model)
-		return cmd
-	case component.FocusAgentPanel:
-		comp, cmd := m.agentPanel.Update(key)
-		m.agentPanel = comp.(*agentpkg.Model)
-		m.syncManualTargetFromAgentSelection()
-		return cmd
-	case component.FocusCodeViewer:
-		// Non-edit mode: route to read-only code viewer.
-		comp, cmd := m.codePanel.Update(key)
-		m.codePanel = comp.(*codepkg.Model)
-		return cmd
-	case component.FocusFileTree:
-		comp, cmd := m.fileTree.Update(key)
-		m.fileTree = comp.(*filetree.Model)
-		return cmd
-	case component.FocusKnowledge:
-		comp, cmd := m.knowledgePanel.Update(key)
-		m.knowledgePanel = comp.(*knowledgepkg.Model)
-		return cmd
-	case component.FocusGitPanel:
-		comp, cmd := m.gitPanel.Update(key)
-		m.gitPanel = comp.(*gitpanel.Model)
-		m.syncStagedFiles()
-		return cmd
-	case component.FocusCommitTree:
-		comp, cmd := m.commitTree.Update(key)
-		m.commitTree = comp.(*committree.Model)
-		return cmd
-	case component.FocusConflictView:
-		if m.conflictViewActive && m.conflictView != nil {
-			return m.conflictView.Update(key)
-		}
-		return nil
-	case component.FocusConflictFileList:
+var focusedKeyHandlers = map[component.FocusID]focusedKeyHandler{
+	component.FocusInput:        (*AppModel).propagateToInput,
+	component.FocusChat:         (*AppModel).propagateToChat,
+	component.FocusSessionPanel: (*AppModel).propagateToSessionPanel,
+	component.FocusAgentPanel:   (*AppModel).propagateToAgentPanel,
+	component.FocusCodeViewer:   (*AppModel).propagateToCodeViewer,
+	component.FocusFileTree:     (*AppModel).propagateToFileTree,
+	component.FocusKnowledge:    (*AppModel).propagateToKnowledgePanel,
+	component.FocusGitPanel:     (*AppModel).propagateToGitPanel,
+	component.FocusCommitTree:   (*AppModel).propagateToCommitTree,
+	component.FocusConflictView: (*AppModel).propagateToConflictView,
+	component.FocusConflictFileList: func(m *AppModel, key tea.KeyMsg) tea.Cmd {
 		if m.conflictViewActive && m.conflictView != nil {
 			return m.conflictView.UpdateFileList(key.String())
 		}
 		return nil
-	case component.FocusMergeDiffView:
-		if m.mergeDiffView != nil {
-			cmd := m.mergeDiffView.Update(key)
-			m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
-			m.syncFocusState()
-			return cmd
-		}
-		return nil
-	case component.FocusMergeDiffFileList:
+	},
+	component.FocusMergeDiffView: (*AppModel).propagateToMergeDiffView,
+	component.FocusMergeDiffFileList: func(m *AppModel, key tea.KeyMsg) tea.Cmd {
 		if m.mergeDiffViewActive && m.mergeDiffView != nil {
 			m.mergeDiffView.UpdateFileList(key.String())
 		}
 		return nil
-	case component.FocusDiffView:
-		if m.diffView != nil {
-			cmd := m.diffView.Update(key)
-			m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
-			m.syncFocusState()
-			return cmd
-		}
-		return nil
-	case component.FocusDiffFileList:
+	},
+	component.FocusDiffView: (*AppModel).propagateToDiffView,
+	component.FocusDiffFileList: func(m *AppModel, key tea.KeyMsg) tea.Cmd {
 		if m.diffViewActive && m.diffView != nil {
 			m.diffView.UpdateFileList(key.String())
 		}
 		return nil
+	},
+}
+
+// propagateToFocused sends a key message only to the currently focused component.
+func (m *AppModel) propagateToFocused(key tea.KeyMsg) tea.Cmd {
+	focused := m.focus.Current()
+	if handler, ok := focusedKeyHandlers[focused]; ok {
+		return handler(m, key)
+	}
+	return m.propagateToPaneFocus(focused, key)
+}
+
+func (m *AppModel) propagateToInput(key tea.KeyMsg) tea.Cmd {
+	prevVisual := m.input.VisualLineCount()
+	comp, cmd := m.input.Update(key)
+	m.input = comp.(*inputpkg.Model)
+	if m.input.VisualLineCount() != prevVisual {
+		m.recalcLayout()
+	}
+	return cmd
+}
+
+func (m *AppModel) propagateToChat(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.chat.Update(key)
+	m.chat = comp.(*chat.Model)
+	return cmd
+}
+
+func (m *AppModel) propagateToSessionPanel(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.sessionPanel.Update(key)
+	m.sessionPanel = comp.(*sessionpkg.Model)
+	return cmd
+}
+
+func (m *AppModel) propagateToAgentPanel(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.agentPanel.Update(key)
+	m.agentPanel = comp.(*agentpkg.Model)
+	m.syncManualTargetFromAgentSelection()
+	return cmd
+}
+
+func (m *AppModel) propagateToCodeViewer(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.codePanel.Update(key)
+	m.codePanel = comp.(*codepkg.Model)
+	return cmd
+}
+
+func (m *AppModel) propagateToFileTree(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.fileTree.Update(key)
+	m.fileTree = comp.(*filetree.Model)
+	return cmd
+}
+
+func (m *AppModel) propagateToKnowledgePanel(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.knowledgePanel.Update(key)
+	m.knowledgePanel = comp.(*knowledgepkg.Model)
+	return cmd
+}
+
+func (m *AppModel) propagateToGitPanel(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.gitPanel.Update(key)
+	m.gitPanel = comp.(*gitpanel.Model)
+	m.syncStagedFiles()
+	return cmd
+}
+
+func (m *AppModel) propagateToCommitTree(key tea.KeyMsg) tea.Cmd {
+	comp, cmd := m.commitTree.Update(key)
+	m.commitTree = comp.(*committree.Model)
+	return cmd
+}
+
+func (m *AppModel) propagateToConflictView(key tea.KeyMsg) tea.Cmd {
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.conflictView.Update(key)
+	}
+	return nil
+}
+
+func (m *AppModel) propagateToMergeDiffView(key tea.KeyMsg) tea.Cmd {
+	if m.mergeDiffView == nil {
+		return nil
+	}
+	cmd := m.mergeDiffView.Update(key)
+	m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
+	m.syncFocusState()
+	return cmd
+}
+
+func (m *AppModel) propagateToDiffView(key tea.KeyMsg) tea.Cmd {
+	if m.diffView == nil {
+		return nil
+	}
+	cmd := m.diffView.Update(key)
+	m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+	m.syncFocusState()
+	return cmd
+}
+
+func (m *AppModel) propagateToPaneFocus(focused component.FocusID, key tea.KeyMsg) tea.Cmd {
+	if !pane.IsPaneFocus(focused) {
+		return nil
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.propagateToMergeDiffView(key)
+	}
+	if m.diffViewActive && m.diffView != nil {
+		return m.propagateToDiffView(key)
+	}
+	pid := pane.PaneIDFromFocus(focused)
+	if pid == m.previewPane {
+		return m.propagateToPreviewPane(key)
+	}
+	if pid == m.mdPreviewPane {
+		return m.propagateToMarkdownPreviewPane(key)
+	}
+	return m.propagateToEditorPane(pid, key)
+}
+
+func (m *AppModel) propagateToPreviewPane(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case "alt+enter":
+		m.dismissPreview()
+		return nil
+	case "enter":
+		return m.openFromPreview()
 	default:
-		if !pane.IsPaneFocus(focused) {
-			return nil
-		}
-		// Merge diff sub-pane: route keys to the merge diff view.
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			cmd := m.mergeDiffView.Update(key)
-			m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
-			m.syncFocusState()
-			return cmd
-		}
-		// Diff sub-pane: route keys to the diff view.
-		if m.diffViewActive && m.diffView != nil {
-			cmd := m.diffView.Update(key)
-			// Re-sync app-level focus after the diff view processes the key,
-			// since ]f/[f and other actions may change the focused pane.
-			m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
-			m.syncFocusState()
-			return cmd
-		}
-		pid := pane.PaneIDFromFocus(focused)
-		if pid == m.previewPane {
-			// Preview is read-only. Only scroll navigation and close/open actions.
-			switch key.String() {
-			case "alt+enter":
-				m.dismissPreview()
-				return nil
-			case "enter":
-				return m.openFromPreview()
-			default:
-				_, cmd := m.previewPanel.Update(key)
-				return cmd
-			}
-		}
-		if pid == m.mdPreviewPane {
-			switch key.String() {
-			case "alt+enter", "q":
-				m.dismissMarkdownPreview()
-				return nil
-			default:
-				_, cmd := m.mdPreviewPanel.Update(key)
-				return cmd
-			}
-		}
-		ps, ok := m.paneEditors[pid]
-		if !ok {
-			return nil
-		}
-		wasMod := ps.editor.Modified()
-		comp, cmd := ps.editor.Update(key)
-		ps.editor = comp.(*editor.Model)
-		if ps.editor.Modified() != wasMod {
-			m.refreshTabsModified()
-		}
-		line := ps.editor.CursorLine()
-		col := ps.editor.CursorCol()
-		if ps.editor.IsWordCharAtPos(line, col) {
-			m.highlightLine = line
-			m.highlightCol = col
-			hlCmd := tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
-				return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
-			})
-			return tea.Batch(cmd, hlCmd)
-		}
-		ps.editor.ClearHighlightRanges()
+		_, cmd := m.previewPanel.Update(key)
 		return cmd
 	}
+}
+
+func (m *AppModel) propagateToMarkdownPreviewPane(key tea.KeyMsg) tea.Cmd {
+	switch key.String() {
+	case "alt+enter", "q":
+		m.dismissMarkdownPreview()
+		return nil
+	default:
+		_, cmd := m.mdPreviewPanel.Update(key)
+		return cmd
+	}
+}
+
+func (m *AppModel) propagateToEditorPane(pid pane.PaneID, key tea.KeyMsg) tea.Cmd {
+	ps, ok := m.paneEditors[pid]
+	if !ok {
+		return nil
+	}
+	wasMod := ps.editor.Modified()
+	comp, cmd := ps.editor.Update(key)
+	ps.editor = comp.(*editor.Model)
+	if ps.editor.Modified() != wasMod {
+		m.refreshTabsModified()
+	}
+	line := ps.editor.CursorLine()
+	col := ps.editor.CursorCol()
+	if ps.editor.IsWordCharAtPos(line, col) {
+		m.highlightLine = line
+		m.highlightCol = col
+		hlCmd := tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+			return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+		})
+		return tea.Batch(cmd, hlCmd)
+	}
+	ps.editor.ClearHighlightRanges()
+	return cmd
 }
 
 // ---------------------------------------------------------------------------
@@ -13629,61 +13821,95 @@ func (m *AppModel) cachedSlotBody(id compositor.SlotID) (string, bool) {
 // detectDirtySlots checks component dirty state and state transitions,
 // marking the appropriate compositor slots for re-rendering.
 func (m *AppModel) detectDirtySlots() {
-	// Overlay transitions: full invalidation.
-	if m.overlay != m.prevOverlay {
-		m.invalidateRenderedSlots()
-		m.prevOverlay = m.overlay
+	if m.invalidateForOverlayTransition() ||
+		m.invalidateForEditModeTransition() ||
+		m.invalidateForGitModeTransition() ||
+		m.handleInputHeightTransition() {
 		return
 	}
+	m.updateFocusBorderDirty()
+	m.invalidateForChordChange()
+	m.updateRingDirty()
+	m.updateHoverDirty()
+	m.detectChatDirtySlot()
+	m.detectFileTreeDirtySlot()
+	m.detectChromeDirtySlots()
+	m.detectEditorDirtySlot()
+	m.detectGitDirtySlots()
+	m.detectDiffViewDirtySlots()
+	m.detectConflictViewDirtySlots()
+	m.detectMergeDiffViewDirtySlots()
+	m.detectPreviewDirtySlot()
+	m.detectBlinkDirtySlots()
 
-	// Edit mode transitions: code panel changes completely.
-	if m.viewMode == ViewEdit != m.prevEditMode {
-		m.invalidateRenderedSlots()
-		m.prevEditMode = m.viewMode == ViewEdit
-		return
+	// Left panel (session+agent): no viewDirty — always mark if main dirty.
+	// The compositor avoids re-rendering unless the slot is already dirty.
+}
+
+func (m *AppModel) invalidateForOverlayTransition() bool {
+	if m.overlay == m.prevOverlay {
+		return false
 	}
+	m.invalidateRenderedSlots()
+	m.prevOverlay = m.overlay
+	return true
+}
 
-	// Git mode transitions: panels swap completely.
-	if (m.viewMode == ViewGit) != (m.prevGitMode == ViewGit) {
-		m.invalidateRenderedSlots()
-		m.prevGitMode = m.viewMode
-		return
+func (m *AppModel) invalidateForEditModeTransition() bool {
+	editMode := m.viewMode == ViewEdit
+	if editMode == m.prevEditMode {
+		return false
 	}
+	m.invalidateRenderedSlots()
+	m.prevEditMode = editMode
+	return true
+}
 
-	// Input height change: when the input GROWS and all main-area slots
-	// have cached output, use a targeted update that only re-renders the
-	// center column and input. Side panels keep truncated cached output,
-	// avoiding the content shift that causes full-screen flicker.
-	// When the input SHRINKS (submit/delete), fall back to full recalcLayout.
-	if newInputH := m.inputHeight(); newInputH != m.prevInputH {
-		if newInputH > m.prevInputH && m.comp.AllMainSlotsCached() {
-			m.handleInputGrowth(newInputH)
-		} else {
-			m.recalcLayout()
-		}
-		return
+func (m *AppModel) invalidateForGitModeTransition() bool {
+	if (m.viewMode == ViewGit) == (m.prevGitMode == ViewGit) {
+		return false
 	}
+	m.invalidateRenderedSlots()
+	m.prevGitMode = m.viewMode
+	return true
+}
 
-	// Focus border group change: mark old + new groups dirty.
+func (m *AppModel) handleInputHeightTransition() bool {
+	newInputH := m.inputHeight()
+	if newInputH == m.prevInputH {
+		return false
+	}
+	if newInputH > m.prevInputH && m.comp.AllMainSlotsCached() {
+		m.handleInputGrowth(newInputH)
+	} else {
+		m.recalcLayout()
+	}
+	return true
+}
+
+func (m *AppModel) updateFocusBorderDirty() {
 	curGrp := m.focusBorderGroup()
 	if curGrp != m.prevFocusGrp {
 		m.markSlotDirty(m.prevFocusGrp)
 		m.markSlotDirty(curGrp)
 		m.prevFocusGrp = curGrp
 	}
-	if curGrad := m.currentFocusGradient(); curGrad != m.focusGradient {
+	curGrad := m.currentFocusGradient()
+	if curGrad != m.focusGradient {
 		m.focusGradient = curGrad
 		m.markSlotDirty(curGrp)
 	}
+}
 
-	// Chord state change: the chord hint overlay can appear on any content
-	// slot depending on layout mode, so invalidate all slots.
-	if m.chord != m.prevChord {
-		m.invalidateRenderedSlots()
-		m.prevChord = m.chord
+func (m *AppModel) invalidateForChordChange() {
+	if m.chord == m.prevChord {
+		return
 	}
+	m.invalidateRenderedSlots()
+	m.prevChord = m.chord
+}
 
-	// Ring cycling: mark affected slot dirty.
+func (m *AppModel) updateRingDirty() {
 	if m.leftRing.index != m.prevLeftRing {
 		m.markSlotDirty(compositor.SlotLeft)
 		m.prevLeftRing = m.leftRing.index
@@ -13692,135 +13918,139 @@ func (m *AppModel) detectDirtySlots() {
 		m.markSlotDirty(compositor.SlotRight)
 		m.prevRightRing = m.rightRing.index
 	}
+}
 
-	// Tab hover state change: close icon highlight, markdown tooltip.
+func (m *AppModel) updateHoverDirty() {
 	hoverKey := [5]int{m.tabHoverClose, int(m.tabHoverPane), m.previewTabHoverClose, m.mdPreviewTabHoverClose, m.mdTooltipTab}
-	if hoverKey != m.prevHoverKey {
-		m.markSlotDirty(compositor.SlotRight)
-		m.prevHoverKey = hoverKey
+	if hoverKey == m.prevHoverKey {
+		return
 	}
+	m.markSlotDirty(compositor.SlotRight)
+	m.prevHoverKey = hoverKey
+}
 
-	// Component dirty checks.
-	if m.chat.ViewDirty() {
-		switch m.layout.Mode() {
-		case layout.TwoColumn:
-			m.markSlotDirty(compositor.SlotRight)
-		case layout.SingleColumn:
-			m.markSlotDirty(compositor.SlotLeft)
-		default:
-			m.markSlotDirty(compositor.SlotCenter)
-		}
+func (m *AppModel) detectChatDirtySlot() {
+	if !m.chat.ViewDirty() {
+		return
 	}
-	if m.fileTree.ViewDirty() {
-		if m.layout.Mode() == layout.FourColumn {
-			m.markSlotDirty(compositor.SlotCenterLeft)
-		} else {
-			m.markSlotDirty(compositor.SlotLeft)
-		}
+	m.markSlotDirty(m.chatSlot())
+}
+
+func (m *AppModel) chatSlot() compositor.SlotID {
+	switch m.layout.Mode() {
+	case layout.TwoColumn:
+		return compositor.SlotRight
+	case layout.SingleColumn:
+		return compositor.SlotLeft
+	default:
+		return compositor.SlotCenter
 	}
+}
+
+func (m *AppModel) detectFileTreeDirtySlot() {
+	if !m.fileTree.ViewDirty() {
+		return
+	}
+	m.markSlotDirty(m.sidebarFileListSlot())
+}
+
+func (m *AppModel) sidebarFileListSlot() compositor.SlotID {
+	if m.layout.Mode() == layout.FourColumn {
+		return compositor.SlotCenterLeft
+	}
+	return compositor.SlotLeft
+}
+
+func (m *AppModel) detectChromeDirtySlots() {
 	if m.input.ViewDirty() {
 		m.markSlotDirty(compositor.SlotInput)
 	}
 	if m.statusBar.ViewDirty() {
 		m.markSlotDirty(compositor.SlotStatus)
 	}
+}
 
-	// Editor dirty check.
-	if m.viewMode == ViewEdit {
-		if ps := m.paneEditors[m.focusedPane]; ps != nil && ps.editor.ViewDirty() {
-			m.markSlotDirty(compositor.SlotRight)
-		}
+func (m *AppModel) detectEditorDirtySlot() {
+	if m.viewMode != ViewEdit {
+		return
 	}
-
-	// Git mode dirty checks — skip when diff view is overlaying.
-	if m.viewMode == ViewGit && !m.diffViewActive && m.gitPanel != nil {
-		// Keep commit tree staged-files state in sync every frame.
-		// syncStagedFiles is cheap (iterates a small slice) and ensures
-		// the [Commit] badge reacts immediately to staging changes.
-		m.syncStagedFiles()
-		if m.gitPanel.ViewDirty() {
-			if m.layout.Mode() == layout.FourColumn {
-				m.markSlotDirty(compositor.SlotCenterLeft)
-			} else {
-				m.markSlotDirty(compositor.SlotLeft)
-			}
-		}
-		if m.commitTree.ViewDirty() {
-			m.markSlotDirty(compositor.SlotRight)
-		}
+	if ps := m.paneEditors[m.focusedPane]; ps != nil && ps.editor.ViewDirty() {
+		m.markSlotDirty(compositor.SlotRight)
 	}
+}
 
-	// Diff view dirty check.
-	if m.diffViewActive && m.diffView != nil {
-		if m.diffView.ViewDirty() {
-			m.markSlotDirty(compositor.SlotRight)
-		}
-		if m.diffView.FileListDirty() {
-			if m.layout.Mode() == layout.FourColumn {
-				m.markSlotDirty(compositor.SlotCenterLeft)
-			} else {
-				m.markSlotDirty(compositor.SlotLeft)
-			}
-		}
+func (m *AppModel) detectGitDirtySlots() {
+	if m.viewMode != ViewGit || m.diffViewActive || m.gitPanel == nil {
+		return
 	}
-
-	// Conflict view dirty check.
-	if m.conflictViewActive && m.conflictView != nil {
-		if m.conflictView.ViewDirty() {
-			m.markSlotDirty(compositor.SlotRight)
-		}
-		if m.conflictView.FileListDirty() {
-			if m.layout.Mode() == layout.FourColumn {
-				m.markSlotDirty(compositor.SlotCenterLeft)
-			} else {
-				m.markSlotDirty(compositor.SlotLeft)
-			}
-		}
+	m.syncStagedFiles()
+	if m.gitPanel.ViewDirty() {
+		m.markSlotDirty(m.sidebarFileListSlot())
 	}
-
-	// Merge diff view dirty check.
-	if m.mergeDiffViewActive && m.mergeDiffView != nil {
-		if m.mergeDiffView.ViewDirty() {
-			m.markSlotDirty(compositor.SlotRight)
-		}
-		if m.mergeDiffView.FileListDirty() {
-			if m.layout.Mode() == layout.FourColumn {
-				m.markSlotDirty(compositor.SlotCenterLeft)
-			} else {
-				m.markSlotDirty(compositor.SlotLeft)
-			}
-		}
+	if m.commitTree.ViewDirty() {
+		m.markSlotDirty(compositor.SlotRight)
 	}
+}
 
-	// Preview panel: no view cache, so mark dirty whenever it is focused
-	// (cursor blink changes its output on every blink cycle).
+func (m *AppModel) detectDiffViewDirtySlots() {
+	if !m.diffViewActive || m.diffView == nil {
+		return
+	}
+	if m.diffView.ViewDirty() {
+		m.markSlotDirty(compositor.SlotRight)
+	}
+	if m.diffView.FileListDirty() {
+		m.markSlotDirty(m.sidebarFileListSlot())
+	}
+}
+
+func (m *AppModel) detectConflictViewDirtySlots() {
+	if !m.conflictViewActive || m.conflictView == nil {
+		return
+	}
+	if m.conflictView.ViewDirty() {
+		m.markSlotDirty(compositor.SlotRight)
+	}
+	if m.conflictView.FileListDirty() {
+		m.markSlotDirty(m.sidebarFileListSlot())
+	}
+}
+
+func (m *AppModel) detectMergeDiffViewDirtySlots() {
+	if !m.mergeDiffViewActive || m.mergeDiffView == nil {
+		return
+	}
+	if m.mergeDiffView.ViewDirty() {
+		m.markSlotDirty(compositor.SlotRight)
+	}
+	if m.mergeDiffView.FileListDirty() {
+		m.markSlotDirty(m.sidebarFileListSlot())
+	}
+}
+
+func (m *AppModel) detectPreviewDirtySlot() {
 	if m.hasPreview() && m.isPreviewFocused() {
 		m.markSlotDirty(compositor.SlotRight)
 	}
+}
 
-	// Blink phase changed: mark the slot(s) owning the active cursor.
-	if m.blinkDirty {
-		m.blinkDirty = false
-		if m.viewMode == ViewEdit {
-			m.markSlotDirty(compositor.SlotRight)
-		}
-		if m.focus.Current() == component.FocusInput {
-			m.markSlotDirty(compositor.SlotInput)
-		}
-		if m.fileTree.NeedsBlink() {
-			if m.layout.Mode() == layout.FourColumn {
-				m.markSlotDirty(compositor.SlotCenterLeft)
-			} else {
-				m.markSlotDirty(compositor.SlotLeft)
-			}
-		}
-		if m.hasPreview() && m.isPreviewFocused() {
-			m.markSlotDirty(compositor.SlotRight)
-		}
+func (m *AppModel) detectBlinkDirtySlots() {
+	if !m.blinkDirty {
+		return
 	}
-
-	// Left panel (session+agent): no viewDirty — always mark if main dirty.
-	// The compositor avoids re-rendering unless the slot is already dirty.
+	m.blinkDirty = false
+	if m.viewMode == ViewEdit {
+		m.markSlotDirty(compositor.SlotRight)
+	}
+	if m.focus.Current() == component.FocusInput {
+		m.markSlotDirty(compositor.SlotInput)
+	}
+	if m.fileTree.NeedsBlink() {
+		m.markSlotDirty(m.sidebarFileListSlot())
+	}
+	if m.hasPreview() && m.isPreviewFocused() {
+		m.markSlotDirty(compositor.SlotRight)
+	}
 }
 
 // renderDirtySlots re-renders only the compositor slots that are dirty.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // FlushResult summarizes the outcome of flushing the global VFS to disk.
@@ -20,6 +21,7 @@ type DiskFlusherConfig struct {
 	GlobalVFS  *PipelineVFS
 	WAL        SemanticWAL
 	WorkingDir string
+	DraftMu    *sync.Mutex
 }
 
 // DiskFlusher writes global VFS overlay changes to disk and creates
@@ -28,6 +30,7 @@ type DiskFlusher struct {
 	globalVFS  *PipelineVFS
 	wal        SemanticWAL
 	workingDir string
+	draftMu    *sync.Mutex
 }
 
 // NewDiskFlusher creates a new DiskFlusher.
@@ -36,6 +39,7 @@ func NewDiskFlusher(cfg DiskFlusherConfig) *DiskFlusher {
 		globalVFS:  cfg.GlobalVFS,
 		wal:        cfg.WAL,
 		workingDir: cfg.WorkingDir,
+		draftMu:    cfg.DraftMu,
 	}
 }
 
@@ -47,28 +51,35 @@ func (df *DiskFlusher) PendingChanges() []FileModification {
 // Flush writes all pending changes from the global VFS to disk,
 // creates a WAL checkpoint (major version bump), and clears the overlay.
 func (df *DiskFlusher) Flush(ctx context.Context) (*FlushResult, error) {
+	if df.draftMu != nil {
+		df.draftMu.Lock()
+		defer df.draftMu.Unlock()
+	}
+
 	mods := df.globalVFS.GetModifications()
 	if len(mods) == 0 {
 		return &FlushResult{Version: df.wal.CurrentVersion()}, nil
 	}
 
 	result := &FlushResult{}
-	deltas := make([]WALFileDelta, 0, len(mods))
+	plans, deltas, err := df.buildFlushPlans(ctx, mods)
+	if err != nil {
+		return result, err
+	}
+	defer cleanupFlushPlans(plans)
 
-	for _, mod := range mods {
-		if ctx.Err() != nil {
-			return result, ctx.Err()
+	if err := df.applyFlushPlans(ctx, plans, result); err != nil {
+		if rollbackErr := df.rollbackFlushPlans(plans); rollbackErr != nil {
+			return result, fmt.Errorf("disk flusher: apply flush plans: %w (rollback failed: %v)", err, rollbackErr)
 		}
-
-		delta, err := df.flushMod(mod, result)
-		if err != nil {
-			return result, err
-		}
-		deltas = append(deltas, delta)
+		return result, err
 	}
 
 	ver, err := df.wal.AppendCheckpoint(deltas)
 	if err != nil {
+		if rollbackErr := df.rollbackFlushPlans(plans); rollbackErr != nil {
+			return result, fmt.Errorf("disk flusher: checkpoint: %w (rollback failed: %v)", err, rollbackErr)
+		}
 		return result, fmt.Errorf("disk flusher: checkpoint: %w", err)
 	}
 	result.Version = ver
@@ -77,32 +88,142 @@ func (df *DiskFlusher) Flush(ctx context.Context) (*FlushResult, error) {
 	return result, nil
 }
 
-func (df *DiskFlusher) flushMod(mod FileModification, result *FlushResult) (WALFileDelta, error) {
-	resolved := df.resolve(mod.OriginalPath)
-	oldContent := df.readDiskContent(resolved)
+type flushPlan struct {
+	mod        FileModification
+	resolved   string
+	oldContent []byte
+	existed    bool
+	tempPath   string
+	applied    bool
+}
 
-	delta := WALFileDelta{
-		Path:       mod.OriginalPath,
-		Op:         WALDeltaOpFromFileOp(mod.Operation),
-		NewContent: mod.NewContent,
-		OldContent: oldContent,
+func (df *DiskFlusher) buildFlushPlans(ctx context.Context, mods []FileModification) ([]flushPlan, []WALFileDelta, error) {
+	plans := make([]flushPlan, 0, len(mods))
+	deltas := make([]WALFileDelta, 0, len(mods))
+
+	for _, mod := range mods {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+
+		resolved := df.resolve(mod.OriginalPath)
+		oldContent, existed := df.readDiskContent(resolved)
+		plan := flushPlan{
+			mod:        mod,
+			resolved:   resolved,
+			oldContent: oldContent,
+			existed:    existed,
+		}
+
+		if mod.Operation != FileOpDelete {
+			tempPath, err := df.stageTempFile(resolved, mod.NewContent)
+			if err != nil {
+				return nil, nil, err
+			}
+			plan.tempPath = tempPath
+		}
+
+		deltas = append(deltas, WALFileDelta{
+			Path:       mod.OriginalPath,
+			Op:         WALDeltaOpFromFileOp(mod.Operation),
+			NewContent: cloneBytes(mod.NewContent),
+			OldContent: cloneBytes(oldContent),
+		})
+		plans = append(plans, plan)
 	}
 
-	switch mod.Operation {
+	return plans, deltas, nil
+}
+
+func (df *DiskFlusher) applyFlushPlans(ctx context.Context, plans []flushPlan, result *FlushResult) error {
+	for i := range plans {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := df.applyFlushPlan(&plans[i], result); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (df *DiskFlusher) applyFlushPlan(plan *flushPlan, result *FlushResult) error {
+	switch plan.mod.Operation {
 	case FileOpDelete:
-		if err := df.deleteFromDisk(resolved); err != nil {
-			return delta, err
+		if err := df.deleteFromDisk(plan.resolved); err != nil {
+			return err
 		}
 		result.FilesDeleted++
 	default:
-		if err := df.writeToDisk(resolved, mod.NewContent); err != nil {
-			return delta, err
+		if err := df.commitTempFile(plan.tempPath, plan.resolved); err != nil {
+			return err
 		}
 		result.FilesWritten++
-		result.BytesWritten += int64(len(mod.NewContent))
+		result.BytesWritten += int64(len(plan.mod.NewContent))
 	}
+	plan.applied = true
+	return nil
+}
 
-	return delta, nil
+func (df *DiskFlusher) rollbackFlushPlans(plans []flushPlan) error {
+	var firstErr error
+	for i := len(plans) - 1; i >= 0; i-- {
+		plan := plans[i]
+		if !plan.applied {
+			continue
+		}
+		var err error
+		if plan.existed {
+			err = df.writeToDisk(plan.resolved, plan.oldContent)
+		} else {
+			err = df.deleteFromDisk(plan.resolved)
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func cleanupFlushPlans(plans []flushPlan) {
+	for _, plan := range plans {
+		if plan.tempPath == "" {
+			continue
+		}
+		_ = os.Remove(plan.tempPath)
+	}
+}
+
+func (df *DiskFlusher) stageTempFile(resolved string, content []byte) (string, error) {
+	if err := os.MkdirAll(filepath.Dir(resolved), 0755); err != nil {
+		return "", fmt.Errorf("disk flusher: mkdir temp dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(resolved), ".sylk-flush-*")
+	if err != nil {
+		return "", fmt.Errorf("disk flusher: create temp file: %w", err)
+	}
+	defer tmp.Close()
+
+	if _, err := tmp.Write(content); err != nil {
+		return "", fmt.Errorf("disk flusher: write temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return "", fmt.Errorf("disk flusher: sync temp file: %w", err)
+	}
+	return tmp.Name(), nil
+}
+
+func (df *DiskFlusher) commitTempFile(tempPath, resolved string) error {
+	if tempPath == "" {
+		return fmt.Errorf("disk flusher: missing staged file for %s", resolved)
+	}
+	if err := os.MkdirAll(filepath.Dir(resolved), 0755); err != nil {
+		return fmt.Errorf("disk flusher: mkdir: %w", err)
+	}
+	if err := os.Rename(tempPath, resolved); err != nil {
+		return fmt.Errorf("disk flusher: rename temp file: %w", err)
+	}
+	return nil
 }
 
 // RollbackToVersion restores state to a target version.
@@ -183,12 +304,12 @@ func (df *DiskFlusher) resolve(path string) string {
 	return filepath.Join(df.workingDir, path)
 }
 
-func (df *DiskFlusher) readDiskContent(resolved string) []byte {
+func (df *DiskFlusher) readDiskContent(resolved string) ([]byte, bool) {
 	content, err := os.ReadFile(resolved)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return content
+	return content, true
 }
 
 func (df *DiskFlusher) writeToDisk(resolved string, content []byte) error {

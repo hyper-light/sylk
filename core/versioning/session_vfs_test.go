@@ -9,10 +9,13 @@ import (
 
 func TestNewSessionVFS(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	if svfs.CVS() == nil {
@@ -36,20 +39,23 @@ func TestNewSessionVFS(t *testing.T) {
 	if svfs.WAL() == nil {
 		t.Fatal("WAL should not be nil")
 	}
-	if _, ok := svfs.WAL().(*MemoryVersionedWAL); !ok {
-		t.Fatalf("expected in-memory semantic WAL, got %T", svfs.WAL())
+	if _, ok := svfs.WAL().(*VersionedWAL); !ok {
+		t.Fatalf("expected disk-backed semantic WAL, got %T", svfs.WAL())
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".sylk", "sessions", "test-session", "vfs")); !os.IsNotExist(err) {
-		t.Fatalf("expected no on-disk session VFS root, stat err=%v", err)
+	if _, err := os.Stat(filepath.Join(dir, ".sylk", "sessions", "test-session", "versioning", "wal")); err != nil {
+		t.Fatalf("expected on-disk semantic WAL root, stat err=%v", err)
 	}
 }
 
 func TestSessionVFS_BeginPipelineSeedsFromGlobalOverlay(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	ctx := context.Background()
@@ -79,10 +85,13 @@ func TestSessionVFS_BeginPipelineSeedsFromGlobalOverlay(t *testing.T) {
 
 func TestSessionVFS_StatsReflectLiveState(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	ctx := context.Background()
@@ -110,10 +119,13 @@ func TestSessionVFS_StatsReflectLiveState(t *testing.T) {
 
 func TestSessionVFS_NewDiskFileAccess(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	fa := svfs.NewDiskFileAccess(true)
@@ -130,10 +142,13 @@ func TestSessionVFS_NewDiskFileAccess(t *testing.T) {
 
 func TestSessionVFS_NewGlobalFileAccess(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	fa := svfs.NewGlobalFileAccess(false)
@@ -145,12 +160,95 @@ func TestSessionVFS_NewGlobalFileAccess(t *testing.T) {
 	}
 }
 
-func TestSessionVFS_BeginAndCommitPipeline(t *testing.T) {
+func TestSessionVFS_GlobalDraftWritesAdvanceWAL(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	fa := svfs.NewGlobalFileAccess(false)
+	target := filepath.Join(dir, "draft.txt")
+	if err := fa.WriteFile(context.Background(), target, []byte("draft")); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if ver := svfs.CurrentVersion(); ver.Minor != 1 {
+		t.Fatalf("CurrentVersion minor = %d, want 1", ver.Minor)
+	}
+
+	content, err := svfs.GlobalVFS().Read(context.Background(), target)
+	if err != nil {
+		t.Fatalf("GlobalVFS.Read: %v", err)
+	}
+	if string(content) != "draft" {
+		t.Fatalf("content = %q, want %q", string(content), "draft")
+	}
+}
+
+func TestSessionVFS_FlushCommitsDraftAndSeedsNextPipelineFromDisk(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "test-session",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	ctx := context.Background()
+	target := filepath.Join(dir, "pkg", "state.txt")
+	if err := svfs.NewGlobalFileAccess(false).WriteFile(ctx, target, []byte("draft-1")); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := svfs.DiskFlusher().Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	onDisk, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(onDisk) != "draft-1" {
+		t.Fatalf("disk content = %q, want %q", string(onDisk), "draft-1")
+	}
+
+	if mods := svfs.GlobalVFS().GetModifications(); len(mods) != 0 {
+		t.Fatalf("global overlay retained %d modifications after flush", len(mods))
+	}
+
+	pVFS, err := svfs.BeginPipeline(BeginPipelineConfig{
+		PipelineID: "pipe-after-flush",
+		SessionID:  "test-session",
+		WorkingDir: dir,
+		Files:      []string{target},
+	})
+	if err != nil {
+		t.Fatalf("BeginPipeline: %v", err)
+	}
+
+	content, err := pVFS.Read(ctx, target)
+	if err != nil {
+		t.Fatalf("pipeline read: %v", err)
+	}
+	if string(content) != "draft-1" {
+		t.Fatalf("pipeline content = %q, want %q", string(content), "draft-1")
+	}
+}
+
+func TestSessionVFS_BeginAndCommitPipeline(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "test-session",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	pVFS, err := svfs.BeginPipeline(BeginPipelineConfig{
@@ -189,13 +287,16 @@ func TestSessionVFS_BeginAndCommitPipeline(t *testing.T) {
 
 func TestSessionVFS_RollbackPipeline(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
-	_, err := svfs.BeginPipeline(BeginPipelineConfig{
+	_, err = svfs.BeginPipeline(BeginPipelineConfig{
 		PipelineID: "pipe1",
 		SessionID:  "test-session",
 		WorkingDir: dir,
@@ -216,10 +317,13 @@ func TestSessionVFS_RollbackPipeline(t *testing.T) {
 
 func TestSessionVFS_DoubleClose(t *testing.T) {
 	dir := t.TempDir()
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "test-session",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 
 	if err := svfs.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)

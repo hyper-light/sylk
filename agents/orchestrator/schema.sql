@@ -82,6 +82,53 @@ CREATE TABLE IF NOT EXISTS plan_versions (
     PRIMARY KEY (plan_id, version)
 );
 
+-- Validation / remediation control plane
+CREATE TABLE IF NOT EXISTS validation_epochs (
+    epoch_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    workflow_ids_json TEXT,
+    dag_ids_json TEXT,
+    task_ids_json TEXT,
+    plan_id TEXT,
+    summary TEXT,
+    validator_verdict_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME
+);
+
+CREATE TABLE IF NOT EXISTS execution_holds (
+    hold_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    epoch_id TEXT,
+    remediation_case_id TEXT,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    summary TEXT,
+    created_by_agent_id TEXT NOT NULL,
+    created_by_agent_type TEXT NOT NULL,
+    released_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS remediation_cases (
+    case_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    epoch_id TEXT,
+    hold_id TEXT NOT NULL,
+    plan_id TEXT,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME
+);
+
 -- Indexes derived from query patterns
 CREATE INDEX IF NOT EXISTS idx_dag_exec_plan ON dag_executions(plan_id);
 CREATE INDEX IF NOT EXISTS idx_dag_exec_session ON dag_executions(session_id);
@@ -93,6 +140,9 @@ CREATE INDEX IF NOT EXISTS idx_task_updates_node ON task_updates(node_id);
 CREATE INDEX IF NOT EXISTS idx_task_updates_created ON task_updates(created_at);
 CREATE INDEX IF NOT EXISTS idx_pipeline_state_dag ON pipeline_state(dag_id);
 CREATE INDEX IF NOT EXISTS idx_plan_versions_session ON plan_versions(session_id);
+CREATE INDEX IF NOT EXISTS idx_validation_epochs_session ON validation_epochs(session_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_execution_holds_session ON execution_holds(session_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_remediation_cases_session ON remediation_cases(session_id, status, updated_at);
 
 -- Task coordination ledger (authoritative per-task coordination state)
 CREATE TABLE IF NOT EXISTS coordination_actions (

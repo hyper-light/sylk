@@ -396,40 +396,71 @@ func requestUserClarificationSkill(gi *GlobalInspector) *skills.Skill {
 
 func escalateFindingsSkill(gi *GlobalInspector) *skills.Skill {
 	return skills.NewSkill("escalate_findings").
-		Description("Publish audit findings to the audit.results topic.").
+		Description("Submit blocking or corrective audit findings to the Orchestrator validation control plane.").
 		Domain("audit").
 		Keywords("escalate", "publish", "findings").
 		Priority(95).
 		StringParam("dag_id", "DAG identifier", true).
 		IntParam("layer_idx", "Layer index", true).
 		BoolParam("blocking", "Whether findings are blocking", true).
+		StringParam("summary", "Optional finding summary", false).
+		StringParam("details", "Optional additional details", false).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				DAGID    string `json:"dag_id"`
 				LayerIdx int    `json:"layer_idx"`
 				Blocking bool   `json:"blocking"`
+				Summary  string `json:"summary"`
+				Details  string `json:"details"`
 			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			// Publish to audit.results topic if bus is available
 			if gi.bus != nil {
-				payload := map[string]any{
-					"dag_id":    params.DAGID,
-					"layer_idx": params.LayerIdx,
-					"blocking":  params.Blocking,
-					"source":    gi.id,
+				kind := agentShared.ValidationVerdictPassWithFindings
+				severity := agentShared.ValidationSeverityWarning
+				if params.Blocking {
+					kind = agentShared.ValidationVerdictNeedsArchitectRemediation
+					severity = agentShared.ValidationSeverityHigh
 				}
-				payloadJSON, _ := json.Marshal(payload)
-				msg := &guide.Message{
-					ID:            gi.generateMessageID(),
-					Type:          guide.MessageTypeAuditResult,
-					Payload:       string(payloadJSON),
-					SourceAgentID: gi.id,
-					Timestamp:     time.Now(),
+				summary := strings.TrimSpace(params.Summary)
+				if summary == "" {
+					if params.Blocking {
+						summary = fmt.Sprintf("Global inspector found blocking issues in DAG %s layer %d.", params.DAGID, params.LayerIdx)
+					} else {
+						summary = fmt.Sprintf("Global inspector reported follow-up findings for DAG %s layer %d.", params.DAGID, params.LayerIdx)
+					}
 				}
-				_ = gi.bus.Publish("audit.results", msg)
+				payload := &agentShared.ValidationVerdictPayload{
+					Kind:               kind,
+					Severity:           severity,
+					ValidatorAgentID:   gi.id,
+					ValidatorType:      "global-inspector",
+					SessionID:          gi.config.SessionID,
+					DAGIDs:             []string{params.DAGID},
+					ShouldPause:        params.Blocking,
+					Summary:            summary,
+					Details:            strings.TrimSpace(params.Details),
+					RecommendedActions: []string{"architect_remediation"},
+					CreatedAt:          time.Now().UTC(),
+				}
+				body, _ := json.Marshal(payload)
+				req := &guide.RouteRequest{
+					Input:           string(body),
+					SourceAgentID:   gi.id,
+					SourceAgentName: "inspector",
+					TargetAgentID:   "orchestrator",
+					ExplicitTarget:  true,
+					FireAndForget:   true,
+					SessionID:       gi.config.SessionID,
+					Timestamp:       time.Now(),
+					Metadata: map[string]any{
+						"control_plane_kind": agentShared.ControlPlaneKindValidationVerdict,
+						"layer_idx":          params.LayerIdx,
+					},
+				}
+				_ = gi.bus.Publish(guide.TopicGuideRequests, guide.NewRequestMessage(gi.generateMessageID(), req))
 			}
 
 			return map[string]any{

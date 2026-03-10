@@ -92,7 +92,8 @@ type Orchestrator struct {
 	agentPod *shared.AgentPod
 
 	// Task router for DAG→container dispatch
-	taskRouter *TaskRouter
+	taskRouter   *TaskRouter
+	dispatchGate *dispatchHoldGate
 
 	// Per-session VFS infrastructure (maps sessionID → SessionVFS).
 	sessionVFS   map[string]*versioning.SessionVFS
@@ -172,6 +173,7 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 		pendingBus:        make(map[string]chan *guide.Message),
+		dispatchGate:      newDispatchHoldGate(),
 	}
 
 	if provider != nil {
@@ -283,6 +285,12 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		ActivityPub: activityPub,
 		SessionID:   cfg.SessionID,
 		AgentID:     cfg.AgentID,
+	})
+	o.dagBridge.SetDispatchPermitWaiter(func(ctx context.Context, sessionID, dagID string) error {
+		if o.dispatchGate == nil {
+			return nil
+		}
+		return o.dispatchGate.wait(ctx, sessionID, dagID)
 	})
 
 	return nil
@@ -444,10 +452,14 @@ func (o *Orchestrator) EnsureSessionVFS(sessionID, workingDir string) *versionin
 	if svfs := o.sessionVFS[sessionID]; svfs != nil {
 		return svfs
 	}
-	svfs := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
 		SessionID:  versioning.SessionID(sessionID),
 		WorkingDir: workingDir,
 	})
+	if err != nil {
+		o.logWarnMsg("initialize session VFS", "session_id", sessionID, "error", err)
+		return nil
+	}
 	o.sessionVFS[sessionID] = svfs
 	return svfs
 }
@@ -580,6 +592,11 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 
 	// Wire data plane if available
 	if o.dagBridge != nil {
+		if o.store != nil && o.dispatchGate != nil {
+			if hold, holdErr := o.store.GetActiveExecutionHold(o.config.SessionID); holdErr == nil && hold != nil {
+				o.dispatchGate.activate(o.config.SessionID)
+			}
+		}
 		o.dagBridge.SetBus(bus)
 		o.subscribePipelineTopics()
 		o.subscribeDAGTopics()
@@ -744,6 +761,10 @@ func (o *Orchestrator) Handle(ctx context.Context, req *guide.ForwardedRequest) 
 		"intent", string(req.Intent),
 		"correlation_id", req.CorrelationID,
 		"input_prefix", truncateForLog(req.Input, 120))
+
+	if controlResult, handled, controlErr := o.handleControlPlaneForward(ctx, req); handled {
+		return controlResult, controlErr
+	}
 
 	// Detect structured plan handoff payloads from the architect.
 	// On match, ingest mechanically then route through the conversation
@@ -1330,9 +1351,6 @@ func pipelineWorkerTargetAgentID(taskID, agentType string) string {
 }
 
 func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
 	data, ok := msg.Payload.(map[string]any)
 	if !ok {
 		return nil
@@ -1341,12 +1359,53 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	taskID, _ := data["task_id"].(string)
 	result := data["result"]
 
+	o.mu.Lock()
 	task, ok := o.state.Tasks[taskID]
 	if !ok {
+		o.mu.Unlock()
+		return nil
+	}
+	o.mu.Unlock()
+
+	mergeErr := o.commitTaskDraft(context.Background(), task)
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	task = o.state.Tasks[taskID]
+	if task == nil {
+		return nil
+	}
+	now := time.Now()
+	if mergeErr != nil {
+		task.Status = TaskStatusFailed
+		task.CompletedAt = &now
+		task.Error = mergeErr.Error()
+		o.state.Stats.FailedTasks++
+
+		o.healthMonitor.RecordTaskFailed(task.AssignedAgentID, taskID, mergeErr.Error())
+		o.updateWorkflowProgress(task.WorkflowID)
+
+		if o.dagBridge != nil {
+			if nodeID, hasNode := data["node_id"].(string); hasNode && nodeID != "" {
+				o.dagBridge.NotifyNodeComplete(nodeID, convertTaskFailedToNodeResult(task))
+			}
+		}
+
+		o.submitTaskEventAsync(task)
+		if o.coordination != nil {
+			_ = o.coordination.ReleaseTaskClaims(context.Background(), taskID)
+		}
+
+		o.pushEvent(&busEvent{
+			Topic:     "tasks.failed",
+			Timestamp: now,
+			Severity:  severityCritical,
+			Summary:   fmt.Sprintf("Task %q failed during draft merge on agent %s: %s", task.Name, task.AssignedAgentID, mergeErr.Error()),
+			Data:      map[string]any{"task_id": taskID, "agent_id": task.AssignedAgentID, "error": mergeErr.Error()},
+		})
 		return nil
 	}
 
-	now := time.Now()
 	task.Status = TaskStatusCompleted
 	task.CompletedAt = &now
 	task.Result = result
@@ -1379,9 +1438,6 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 }
 
 func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
 	data, ok := msg.Payload.(map[string]any)
 	if !ok {
 		return nil
@@ -1390,11 +1446,24 @@ func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 	taskID, _ := data["task_id"].(string)
 	errorMsg, _ := data["error"].(string)
 
+	o.mu.Lock()
 	task, ok := o.state.Tasks[taskID]
 	if !ok {
+		o.mu.Unlock()
 		return nil
 	}
+	o.mu.Unlock()
 
+	if rollbackErr := o.rollbackTaskDraft(task); rollbackErr != nil {
+		errorMsg = firstNonEmpty(errorMsg, rollbackErr.Error())
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	task = o.state.Tasks[taskID]
+	if task == nil {
+		return nil
+	}
 	now := time.Now()
 	task.Status = TaskStatusFailed
 	task.CompletedAt = &now

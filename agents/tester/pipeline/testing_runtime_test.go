@@ -179,10 +179,13 @@ func newGoPipelineTesterWithVFS(t *testing.T) (*PipelineTester, context.Context,
 	mustWriteTestFile(t, filepath.Join(root, "go.mod"), "module example.com/tester\n\ngo 1.24.0\n")
 	mustWriteTestFile(t, filepath.Join(root, "pkg/service/service.go"), "package service\n\nfunc Add(a, b int) int { return a + b }\n")
 
-	svfs := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
 		SessionID:  "sess-1",
 		WorkingDir: root,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	pipe, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
 		PipelineID: "task-1",
 		SessionID:  "sess-1",

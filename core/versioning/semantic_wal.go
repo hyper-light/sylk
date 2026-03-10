@@ -1,8 +1,9 @@
 package versioning
 
 // SemanticWAL is the live version log contract used by SessionVFS, MergePipe,
-// DiskFlusher, and versioning skills. Session-scoped VFS uses an in-memory
-// implementation; durable stores may provide their own implementation.
+// DiskFlusher, and versioning skills. Session-scoped VFS defaults to the
+// durable VersionedWAL, though tests and alternate runtimes may substitute a
+// different implementation.
 type SemanticWAL interface {
 	AppendDelta(pipelineID string, deltas []WALFileDelta) (SemanticVersion, error)
 	AppendCheckpoint(deltas []WALFileDelta) (SemanticVersion, error)

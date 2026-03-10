@@ -150,6 +150,79 @@ type gitBootResult struct {
 
 type hydrateResult struct{ hydrated *providers.HydratedGoogleAuth }
 
+type modelSwapperFunc func(ctx context.Context, agentType, modelID string) error
+
+type bootstrapPhase1 struct {
+	ctx         context.Context
+	projectRoot string
+	start       time.Time
+
+	scope         *concurrency.GoroutineScope
+	guideBus      guide.EventBus
+	activityPub   events.ActivityPublisher
+	streamMgr     *guide.StreamManager
+	sessionMgr    *session.Manager
+	descriptors   *handoff.DescriptorRegistry
+	budget        *concurrency.GoroutineBudget
+	containerReg  *container.ContainerRegistry
+	serviceReg    *network.ServiceRegistry
+	specReg       *container.AgentSpecRegistry
+	quota         *container.ResourceQuota
+	hookMut       *lifecycleHookMutator
+	probeFact     *probeFactoryHolder
+	runtime       *container.DefaultRuntime
+	namespace     *network.NetworkNamespace
+	daemonCtrl    *daemon.DaemonSetController
+	daemonSpecMap map[string]container.ContainerSpec
+
+	authRegistry *credentials.AuthRegistry
+	guideCfg     providers.GoogleConfig
+	hydrateOnce  *hydrateOnceCell
+	hydratedRef  atomic.Pointer[providers.HydratedGoogleAuth]
+
+	googleGateway    *gateway.ProviderGateway
+	anthropicGateway *gateway.ProviderGateway
+	openaiGateway    *gateway.ProviderGateway
+
+	identityReg *container.AgentIdentityRegistry
+	actCtrlRef  atomic.Pointer[activation.ActivationController]
+	gitSubsRef  atomic.Pointer[gitBootResult]
+
+	planStore      *architect.PlanStore
+	knowledgeStore *knowledge.KnowledgeStore
+
+	guideRef      atomic.Pointer[guide.Guide]
+	guardianRef   atomic.Pointer[guardian.Guardian]
+	orchRef       atomic.Pointer[orchestrator.Orchestrator]
+	quarantineRef atomic.Pointer[fetch.QuarantineBuffer]
+}
+
+type bootstrapPhase2 struct {
+	guideResult    daemonContainerResult
+	orchResult     daemonContainerResult
+	guardianResult daemonContainerResult
+	actResult      activationCtrlResult
+	fontRes        fontResult
+	gitRes         gitBootResult
+}
+
+type bootstrapPhase3 struct {
+	guide          *guide.Guide
+	orch           *orchestrator.Orchestrator
+	activationCtrl *activation.ActivationController
+	activator      guide.PodActivator
+	scribeFactory  agentShared.ScribeFactory
+}
+
+type bootstrapPhase4 struct {
+	seeds         []ui.AgentSeed
+	modelStore    *agentpkg.AgentModelStore
+	modelSwapper  modelSwapperFunc
+	phase4Done    chan struct{}
+	supervisorRef atomic.Pointer[handoff.HandoffSupervisor]
+	bootLogger    *agentlog.BootEventLogger
+}
+
 // busReadinessPublisher adapts knowledge.ReadinessPublisher to the guide EventBus.
 type busReadinessPublisher struct {
 	bus guide.EventBus
@@ -243,27 +316,46 @@ func (h *hydrateOnceCell) result() *providers.HydratedGoogleAuth {
 func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.Deps, func() error, error) {
 	_ = mockMode
 	start := time.Now()
+	loadBootstrapDotenv(projectRoot)
 
-	// Load .env.local before anything reads environment variables.
-	// Existing env vars take priority — LoadDotenv never overrides.
+	phase1 := buildBootstrapPhase1(ctx, projectRoot, start)
+	phase2, err := runBootstrapPhase2(phase1)
+	if err != nil {
+		return ui.Deps{}, nil, err
+	}
+	phase3, err := wireBootstrapPhase3(phase1, phase2)
+	if err != nil {
+		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
+		return ui.Deps{}, nil, err
+	}
+	phase4, err := startBootstrapPhase4(phase1, phase2, phase3)
+	if err != nil {
+		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
+		return ui.Deps{}, nil, err
+	}
+	slog.Info("bootstrap critical path complete", "elapsed", time.Since(start))
+	return buildBootstrapDeps(phase1, phase2, phase3, phase4), buildBootstrapCleanup(phase1, phase3, phase4), nil
+}
+
+func loadBootstrapDotenv(projectRoot string) {
 	if err := boot.LoadDotenv(projectRoot); err != nil && !os.IsNotExist(err) {
 		slog.Warn("failed to load .env.local", "error", err)
 	}
+}
 
-	// =================================================================
-	// Phase 1: Infrastructure (sequential, ~15ms)
-	// =================================================================
+func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Time) *bootstrapPhase1 {
+	phase1 := &bootstrapPhase1{
+		ctx:         ctx,
+		projectRoot: projectRoot,
+		start:       start,
+	}
 
-	scope := concurrency.NewGoroutineScope(ctx, "tui", nil)
-	scope.SetMaxLifetime(24 * time.Hour)
+	phase1.scope = concurrency.NewGoroutineScope(ctx, "tui", nil)
+	phase1.scope.SetMaxLifetime(24 * time.Hour)
 
-	guideBus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
-
-	// Route all activity through a metadata-caching wrapper so follow-on LLM/tool
-	// telemetry can be attached to the correct agent row even when the source
-	// event omits type or pipeline metadata.
-	activityPub := events.NewMetadataCachingPublisher(
-		guide.NewBusActivityPublisher(guideBus),
+	phase1.guideBus = guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	phase1.activityPub = events.NewMetadataCachingPublisher(
+		guide.NewBusActivityPublisher(phase1.guideBus),
 		map[string]events.AgentIdentityMetadata{
 			"guide":              {AgentType: "guide", AgentName: "Guide"},
 			"architect":          {AgentType: "architect", AgentName: "Architect"},
@@ -280,295 +372,196 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 			"tester-pipeline":    {AgentType: "tester-pipeline", AgentName: "Tester"},
 		},
 	)
-	streamMgr := guide.NewStreamManager(guide.DefaultStreamConfig())
+	phase1.streamMgr = guide.NewStreamManager(guide.DefaultStreamConfig())
+	phase1.sessionMgr = session.NewManager(session.ManagerConfig{Scope: phase1.scope})
+	phase1.descriptors = handoff.NewDescriptorRegistry()
 
-	sessionMgr := session.NewManager(session.ManagerConfig{
-		Scope: scope,
-	})
-
-	descriptors := handoff.NewDescriptorRegistry()
 	pressureLevel := new(atomic.Int32)
-	budget := concurrency.NewGoroutineBudget(pressureLevel)
-	containerReg := container.NewContainerRegistry()
-	serviceReg := network.NewServiceRegistry()
-	specReg := container.NewAgentSpecRegistry(descriptors)
-	quota := container.NewResourceQuota(quotaFromSpecs(specReg))
+	phase1.budget = concurrency.NewGoroutineBudget(pressureLevel)
+	phase1.containerReg = container.NewContainerRegistry()
+	phase1.serviceReg = network.NewServiceRegistry()
+	phase1.specReg = container.NewAgentSpecRegistry(phase1.descriptors)
+	phase1.quota = container.NewResourceQuota(quotaFromSpecs(phase1.specReg))
 
 	creatorReg := container.NewAgentCreatorRegistry()
+	phase1.hookMut = &lifecycleHookMutator{serviceReg: phase1.serviceReg}
+	admission := container.NewAdmissionController(nil, []container.SpecMutator{phase1.hookMut})
+	phase1.probeFact = &probeFactoryHolder{}
 
-	hookMut := &lifecycleHookMutator{serviceReg: serviceReg}
-	admission := container.NewAdmissionController(nil, []container.SpecMutator{hookMut})
-
-	probeFact := &probeFactoryHolder{}
-
-	runtime := container.NewDefaultRuntime(container.DefaultRuntimeConfig{
-		Budget:       budget,
-		Registry:     containerReg,
-		Quota:        quota,
+	phase1.runtime = container.NewDefaultRuntime(container.DefaultRuntimeConfig{
+		Budget:       phase1.budget,
+		Registry:     phase1.containerReg,
+		Quota:        phase1.quota,
 		Admission:    admission,
 		CreateAgent:  creatorReg.Creator(),
-		ProbeFactory: probeFact.Build,
+		ProbeFactory: phase1.probeFact.Build,
 		ParentCtx:    ctx,
 	})
 
-	policies := container.BuildNetworkPolicies(descriptors.All())
+	policies := container.BuildNetworkPolicies(phase1.descriptors.All())
 	busBridge := network.NewBusBridge(func(topic, sourceAgent, targetAgent string, payload []byte) error {
 		msg := guide.NewBridgeMessage(sourceAgent, targetAgent, payload)
-		return guideBus.Publish(topic, msg)
+		return phase1.guideBus.Publish(topic, msg)
 	})
-	namespace := network.NewNetworkNamespace(network.NetworkNamespaceConfig{
+	phase1.namespace = network.NewNetworkNamespace(network.NetworkNamespaceConfig{
 		PodID:    "system",
 		Policies: policies,
 		Sink:     busBridge,
 	})
 
-	// Prepare daemon specs for parallel container creation.
-	daemonCtrl := daemon.NewDaemonSetController(runtime, containerReg)
-	daemonSpecs := daemon.AgentDaemonSetSpecs(specReg)
+	phase1.daemonCtrl = daemon.NewDaemonSetController(phase1.runtime, phase1.containerReg)
+	daemonSpecs := daemon.AgentDaemonSetSpecs(phase1.specReg)
 	for _, spec := range daemonSpecs {
-		daemonCtrl.Apply(spec)
+		phase1.daemonCtrl.Apply(spec)
 	}
-	daemonSpecMap := make(map[string]container.ContainerSpec, len(daemonSpecs))
+	phase1.daemonSpecMap = make(map[string]container.ContainerSpec, len(daemonSpecs))
 	for _, spec := range daemonSpecs {
-		daemonSpecMap[spec.Name] = spec.ContainerSpec
+		phase1.daemonSpecMap[spec.Name] = spec.ContainerSpec
 	}
 
-	// =================================================================
-	// Phase 1.5: Google config + gateways (hydration deferred to Phase 2)
-	// =================================================================
-	// Hydration runs as a Phase 2 goroutine. Guide and Orchestrator
-	// factories block on hydrateOnce.result() — exactly one hydration
-	// call, shared by all consumers. Non-daemon factories (restart /
-	// on-demand) read hydratedRef atomically after the initial boot.
-
-	// AuthRegistry is the centralized runtime auth source. Seed it before
-	// provider bootstrap so factories read canonical provider auth modes
-	// from the registry instead of direct config-file lookups.
 	authResolver := buildAuthResolver()
 	authPublisher := chainPublishers(
-		buildAuthPublisher(guideBus),
-		buildOnDemandAuthRefresher(containerReg),
+		buildAuthPublisher(phase1.guideBus),
+		buildOnDemandAuthRefresher(phase1.containerReg),
 	)
-	authRegistry := credentials.NewAuthRegistry(authResolver, nil, authPublisher, slog.Default())
-	authRegistry.PrimeAll()
+	phase1.authRegistry = credentials.NewAuthRegistry(authResolver, nil, authPublisher, slog.Default())
+	phase1.authRegistry.PrimeAll()
 
-	guideCfg := defaultGuideGoogleConfig(authRegistry)
-	hydrateOnce := newHydrateOnce()
-	var hydratedRef atomic.Pointer[providers.HydratedGoogleAuth]
+	phase1.guideCfg = defaultGuideGoogleConfig(phase1.authRegistry)
+	phase1.hydrateOnce = newHydrateOnce()
 
-	// Create provider gateways for cross-agent rate limiting coordination.
-	// Select rate limit profile based on actual auth mode, not hydration status.
-	var googleGwCfg gateway.GatewayConfig
-	if guideCfg.AuthMode == providers.GoogleAuthModeOAuth {
-		googleGwCfg = gateway.DefaultGoogleOAuthConfig()
-	} else {
-		googleGwCfg = gateway.DefaultGoogleAPIKeyConfig()
+	googleGatewayCfg := gateway.DefaultGoogleAPIKeyConfig()
+	if phase1.guideCfg.AuthMode == providers.GoogleAuthModeOAuth {
+		googleGatewayCfg = gateway.DefaultGoogleOAuthConfig()
 	}
-	googleGateway := gateway.NewProviderGateway(googleGwCfg, slog.Default())
-	anthropicGateway := gateway.NewProviderGateway(gateway.DefaultAnthropicConfig(), slog.Default())
-	openaiGateway := gateway.NewProviderGateway(gateway.DefaultOpenAIConfig(), slog.Default())
+	phase1.googleGateway = gateway.NewProviderGateway(googleGatewayCfg, slog.Default())
+	phase1.anthropicGateway = gateway.NewProviderGateway(gateway.DefaultAnthropicConfig(), slog.Default())
+	phase1.openaiGateway = gateway.NewProviderGateway(gateway.DefaultOpenAIConfig(), slog.Default())
 
-	// Wire LLM usage telemetry: every provider call that flows through a
-	// gateway publishes an ActivityEvent so the Guardian's HealthMonitor
-	// can track token consumption and cost.
 	llmEventHook := providers.NewLLMEventPublisherHook(
-		providers.NewLLMEventPublisher(activityPub),
+		providers.NewLLMEventPublisher(phase1.activityPub),
 	)
-	googleGateway.SetEventHook(llmEventHook)
-	anthropicGateway.SetEventHook(llmEventHook)
-	openaiGateway.SetEventHook(llmEventHook)
+	phase1.googleGateway.SetEventHook(llmEventHook)
+	phase1.anthropicGateway.SetEventHook(llmEventHook)
+	phase1.openaiGateway.SetEventHook(llmEventHook)
 
-	// Identity registry: generates canonical UUID8s per agent type at
-	// registration time so IDs are sticky across spin-up/spin-down cycles.
-	identityReg := container.NewAgentIdentityRegistry([]string{
+	phase1.identityReg = container.NewAgentIdentityRegistry([]string{
 		"architect", "engineer", "designer", "inspector", "tester",
 		"inspector-pipeline", "tester-pipeline",
 		"librarian", "archivalist", "academic", "orchestrator",
 	})
-
-	// actCtrlRef holds the activation controller pointer for lazy factory
-	// closures. It is set after the controller is created in Phase 2;
-	// factory closures read it when the agent is first activated.
-	var actCtrlRef atomic.Pointer[activation.ActivationController]
-
-	// gitSubsRef holds git subsystem results for the Guardian factory
-	// closure. On initial boot (Phase 2), the git goroutine hasn't
-	// completed yet so the factory reads nil → Guardian starts without
-	// git. On daemon restart (reconciler-driven), the reference is
-	// populated → Guardian starts fully wired immediately.
-	var gitSubsRef atomic.Pointer[gitBootResult]
-
-	// Plan store — process-lifetime singleton surviving architect demotion/re-promotion.
 	planLeaseManager := architect.NewPlanLeaseManager(architect.DefaultLLMRequestTimeout, architect.ReadyPlanMaxAge)
-	planStore := architect.NewPlanStore(projectRoot, planLeaseManager, slog.Default())
-
-	// Knowledge store — process-lifetime singleton that owns the
-	// HybridQueryCoordinator. Created with nil searchers; backends
-	// are hot-swapped as boot phases complete.
-	knowledgeStore := knowledge.NewKnowledgeStore(
-		&busReadinessPublisher{bus: guideBus},
+	phase1.planStore = architect.NewPlanStore(projectRoot, planLeaseManager, slog.Default())
+	phase1.knowledgeStore = knowledge.NewKnowledgeStore(
+		&busReadinessPublisher{bus: phase1.guideBus},
 		slog.Default(),
 	)
 
-	// guideRef stores the live Guide instance for the Guardian factory —
-	// on daemon restart the Guardian needs to seed its agent registry.
-	var guideRef atomic.Pointer[guide.Guide]
-
-	// guardianRef stores the live Guardian instance for Academic fetch
-	// inspection wiring and post-boot daemon restarts.
-	var guardianRef atomic.Pointer[guardian.Guardian]
-
-	// orchRef stores the live Orchestrator instance for Guardian VFS
-	// observability — the VFS adapters query active session VFS sets.
-	var orchRef atomic.Pointer[orchestrator.Orchestrator]
-
-	// quarantineRef stores the shared external-content quarantine buffer.
-	// Academic fetch pipelines reuse this so Guardian inspection and
-	// quarantine status observe the same entries.
-	var quarantineRef atomic.Pointer[fetch.QuarantineBuffer]
-
-	// Register agent creators. During initial boot, Guide/Orch factories
-	// call hydrateOnce.result() to wait for the shared hydration. After
-	// boot, daemon restarts read hydratedRef atomically (already stored).
-	registerAgentCreators(creatorReg, identityReg, guideBus, activityPub, projectRoot, hydrateOnce, &hydratedRef, googleGateway, anthropicGateway, openaiGateway, authRegistry, &actCtrlRef, &gitSubsRef, planStore, knowledgeStore, daemonCtrl, &guideRef, &guardianRef, &orchRef, &quarantineRef, budget)
-
-	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
-
-	// =================================================================
-	// Phase 2: Parallel creation
-	// =================================================================
-	// Guide and Orchestrator are critical — any failure aborts startup.
-	// ActivationCtrl, HealthSyncer, Fonts, and Git are non-critical.
-
-	phase2Start := time.Now()
-
-	// parallelCancel is a cancellation handle used to signal early abort
-	// when a critical goroutine fails. Agent factories receive the
-	// long-lived `ctx` (signal context) so their run-contexts survive
-	// Phase 2 — the cancel context is never passed to them.
-	_, parallelCancel := context.WithCancel(ctx)
-
-	const (
-		hydrateMaxAttempts = 3
-		hydrateRetryDelay  = 500 * time.Millisecond
+	registerAgentCreators(
+		creatorReg,
+		phase1.identityReg,
+		phase1.guideBus,
+		phase1.activityPub,
+		projectRoot,
+		phase1.hydrateOnce,
+		&phase1.hydratedRef,
+		phase1.googleGateway,
+		phase1.anthropicGateway,
+		phase1.openaiGateway,
+		phase1.authRegistry,
+		&phase1.actCtrlRef,
+		&phase1.gitSubsRef,
+		phase1.planStore,
+		phase1.knowledgeStore,
+		phase1.daemonCtrl,
+		&phase1.guideRef,
+		&phase1.guardianRef,
+		&phase1.orchRef,
+		&phase1.quarantineRef,
+		phase1.budget,
 	)
 
-	guideCh := make(chan daemonContainerResult, 1)
-	orchCh := make(chan daemonContainerResult, 1)
-	guardianCh := make(chan daemonContainerResult, 1)
-	activationCh := make(chan activationCtrlResult, 1)
-	healthCh := make(chan error, 1)
-	fontCh := make(chan fontResult, 1)
-	gitCh := make(chan gitBootResult, 1)
-	hydrateCh := make(chan hydrateResult, 1)
-	// A: Guide container — uses the long-lived `ctx` for CreateContainer
-	// so the agent's run-context outlives Phase 2.
+	slog.Info("bootstrap phase 1 complete", "elapsed", time.Since(start))
+	return phase1
+}
+
+func startDaemonContainerBootstrap(
+	ctx context.Context,
+	runtime *container.DefaultRuntime,
+	specMap map[string]container.ContainerSpec,
+	name string,
+	ch chan<- daemonContainerResult,
+) {
 	go func() {
-		spec, ok := daemonSpecMap["guide"]
+		spec, ok := specMap[name]
 		if !ok {
-			guideCh <- daemonContainerResult{err: fmt.Errorf("no daemon spec for guide")}
+			ch <- daemonContainerResult{err: fmt.Errorf("no daemon spec for %s", name)}
 			return
 		}
 		c, err := runtime.CreateContainer(ctx, spec)
 		if err != nil {
-			guideCh <- daemonContainerResult{err: err}
+			ch <- daemonContainerResult{err: err}
 			return
 		}
 		if err := runtime.StartContainer(ctx, c); err != nil {
 			_ = runtime.RemoveContainer(ctx, c)
-			guideCh <- daemonContainerResult{err: err}
+			ch <- daemonContainerResult{err: err}
 			return
 		}
-		guideCh <- daemonContainerResult{c: c}
+		ch <- daemonContainerResult{c: c}
 	}()
+}
 
-	// B: Orchestrator container
+func startActivationControllerBootstrap(phase1 *bootstrapPhase1, ch chan<- activationCtrlResult) {
 	go func() {
-		spec, ok := daemonSpecMap["orchestrator"]
-		if !ok {
-			orchCh <- daemonContainerResult{err: fmt.Errorf("no daemon spec for orchestrator")}
-			return
-		}
-		c, err := runtime.CreateContainer(ctx, spec)
-		if err != nil {
-			orchCh <- daemonContainerResult{err: err}
-			return
-		}
-		if err := runtime.StartContainer(ctx, c); err != nil {
-			_ = runtime.RemoveContainer(ctx, c)
-			orchCh <- daemonContainerResult{err: err}
-			return
-		}
-		orchCh <- daemonContainerResult{c: c}
-	}()
-
-	// B2: Guardian container (non-critical)
-	go func() {
-		spec, ok := daemonSpecMap["guardian"]
-		if !ok {
-			guardianCh <- daemonContainerResult{err: fmt.Errorf("no daemon spec for guardian")}
-			return
-		}
-		c, err := runtime.CreateContainer(ctx, spec)
-		if err != nil {
-			guardianCh <- daemonContainerResult{err: err}
-			return
-		}
-		if err := runtime.StartContainer(ctx, c); err != nil {
-			_ = runtime.RemoveContainer(ctx, c)
-			guardianCh <- daemonContainerResult{err: err}
-			return
-		}
-		guardianCh <- daemonContainerResult{c: c}
-	}()
-
-	// C: ActivationController
-	go func() {
-		activationPolicies := activation.AgentActivationPolicies(descriptors.All())
+		activationPolicies := activation.AgentActivationPolicies(phase1.descriptors.All())
 		storageDir, err := activationStorageDir()
 		if err != nil {
-			activationCh <- activationCtrlResult{err: err}
+			ch <- activationCtrlResult{err: err}
 			return
 		}
 		ctrl, err := activation.NewActivationController(activation.ActivationControllerConfig{
-			Runtime:    runtime,
-			Registry:   containerReg,
-			Scope:      scope,
+			Runtime:    phase1.runtime,
+			Registry:   phase1.containerReg,
+			Scope:      phase1.scope,
 			Policies:   activationPolicies,
 			StorageDir: storageDir,
 		})
 		if err != nil {
-			activationCh <- activationCtrlResult{err: err}
+			ch <- activationCtrlResult{err: err}
 			return
 		}
-		if err := ctrl.Start(budget, quota); err != nil {
-			activationCh <- activationCtrlResult{err: err}
+		if err := ctrl.Start(phase1.budget, phase1.quota); err != nil {
+			ch <- activationCtrlResult{err: err}
 			return
 		}
-		activationCh <- activationCtrlResult{ctrl: ctrl}
+		ch <- activationCtrlResult{ctrl: ctrl}
 	}()
+}
 
-	// D: HealthSyncer
+func startHealthSyncerBootstrap(phase1 *bootstrapPhase1, ch chan<- error) {
 	go func() {
 		syncer := container.NewHealthSyncer(container.HealthSyncerConfig{
-			ContainerRegistry: containerReg,
-			ServiceRegistry:   serviceReg,
-			Scope:             scope,
+			ContainerRegistry: phase1.containerReg,
+			ServiceRegistry:   phase1.serviceReg,
+			Scope:             phase1.scope,
 		})
-		healthCh <- syncer.Start()
+		ch <- syncer.Start()
 	}()
+}
 
-	// E: Fonts
+func startFontBootstrap(ch chan<- fontResult) {
 	go func() {
-		fontCh <- fontResult{detected: fonts.Detected()}
+		ch <- fontResult{detected: fonts.Detected()}
 	}()
+}
 
-	// F: Git
+func startGitBootstrap(projectRoot string, gitSubsRef *atomic.Pointer[gitBootResult], ch chan<- gitBootResult) {
 	go func() {
 		var result gitBootResult
 		gc, err := git.NewGitClient(projectRoot)
 		if err != nil || !gc.IsGitRepo() {
-			gitCh <- result
+			ch <- result
 			return
 		}
 		result.client = gc
@@ -580,20 +573,29 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 			result.guard = sg
 		}
 		gitSubsRef.Store(&result)
-		gitCh <- result
+		ch <- result
 	}()
+}
 
-	// G: Hydration — runs concurrently with all other Phase 2 goroutines.
-	// Guide and Orch factories block on hydrateOnce.result() so all
-	// three share a single hydration call. hydratedRef is stored for
-	// daemon restart factories that read it atomically after boot.
+func startHydrationBootstrap(
+	ctx context.Context,
+	guideCfg providers.GoogleConfig,
+	hydrateOnce *hydrateOnceCell,
+	hydratedRef *atomic.Pointer[providers.HydratedGoogleAuth],
+	ch chan<- hydrateResult,
+) {
+	const (
+		hydrateMaxAttempts = 3
+		hydrateRetryDelay  = 500 * time.Millisecond
+	)
+
 	go func() {
-		var h *providers.HydratedGoogleAuth
+		var hydrated *providers.HydratedGoogleAuth
 		for attempt := 1; attempt <= hydrateMaxAttempts; attempt++ {
 			result, err := providers.HydrateGoogleAuth(ctx, guideCfg)
 			if err == nil {
-				h = result
-				hydratedRef.Store(h)
+				hydrated = result
+				hydratedRef.Store(hydrated)
 				break
 			}
 			slog.Warn("google auth hydration attempt failed",
@@ -607,210 +609,180 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				}
 			}
 		}
-		hydrateOnce.resolve(h)
-		hydrateCh <- hydrateResult{hydrated: h}
+		hydrateOnce.resolve(hydrated)
+		ch <- hydrateResult{hydrated: hydrated}
 	}()
+}
 
-	// Collect results. Use select with nil-channel disabling to drain
-	// all 8 channels. Critical errors cancel remaining goroutines.
+func cleanupPhase2Critical(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) {
+	for _, c := range []*container.Container{phase2.guideResult.c, phase2.orchResult.c} {
+		if c != nil {
+			_ = phase1.runtime.StopContainer(context.Background(), c)
+			_ = phase1.runtime.RemoveContainer(context.Background(), c)
+		}
+	}
+	cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
+}
+
+func runBootstrapPhase2(phase1 *bootstrapPhase1) (bootstrapPhase2, error) {
+	phase2Start := time.Now()
+	_, parallelCancel := context.WithCancel(phase1.ctx)
+	defer parallelCancel()
+
+	guideCh := make(chan daemonContainerResult, 1)
+	orchCh := make(chan daemonContainerResult, 1)
+	guardianCh := make(chan daemonContainerResult, 1)
+	activationCh := make(chan activationCtrlResult, 1)
+	healthCh := make(chan error, 1)
+	fontCh := make(chan fontResult, 1)
+	gitCh := make(chan gitBootResult, 1)
+	hydrateCh := make(chan hydrateResult, 1)
+
+	startDaemonContainerBootstrap(phase1.ctx, phase1.runtime, phase1.daemonSpecMap, "guide", guideCh)
+	startDaemonContainerBootstrap(phase1.ctx, phase1.runtime, phase1.daemonSpecMap, "orchestrator", orchCh)
+	startDaemonContainerBootstrap(phase1.ctx, phase1.runtime, phase1.daemonSpecMap, "guardian", guardianCh)
+	startActivationControllerBootstrap(phase1, activationCh)
+	startHealthSyncerBootstrap(phase1, healthCh)
+	startFontBootstrap(fontCh)
+	startGitBootstrap(phase1.projectRoot, &phase1.gitSubsRef, gitCh)
+	startHydrationBootstrap(phase1.ctx, phase1.guideCfg, phase1.hydrateOnce, &phase1.hydratedRef, hydrateCh)
+
 	var (
-		guideResult    daemonContainerResult
-		orchResult     daemonContainerResult
-		guardianResult daemonContainerResult
-		actResult      activationCtrlResult
-		fontRes        fontResult
-		gitRes         gitBootResult
-		criticalErr    error
+		phase2      bootstrapPhase2
+		criticalErr error
 	)
 
 	for completed := 0; completed < 8; completed++ {
 		select {
 		case r := <-guideCh:
-			guideResult = r
+			phase2.guideResult = r
 			if r.err != nil && criticalErr == nil {
 				criticalErr = fmt.Errorf("guide container: %w", r.err)
 				parallelCancel()
 			}
 			guideCh = nil
-
 		case r := <-orchCh:
-			orchResult = r
+			phase2.orchResult = r
 			if r.err != nil && criticalErr == nil {
 				criticalErr = fmt.Errorf("orchestrator container: %w", r.err)
 				parallelCancel()
 			}
 			orchCh = nil
-
 		case r := <-guardianCh:
-			guardianResult = r
+			phase2.guardianResult = r
 			if r.err != nil {
 				slog.Warn("guardian container failed during parallel bootstrap", "error", r.err)
 			}
 			guardianCh = nil
-
 		case r := <-activationCh:
-			actResult = r
+			phase2.actResult = r
 			if r.err != nil {
 				slog.Warn("activation controller failed during parallel bootstrap", "error", r.err)
 			}
 			activationCh = nil
-
 		case err := <-healthCh:
 			if err != nil {
 				slog.Warn("health syncer start failed", "error", err)
 			}
 			healthCh = nil
-
 		case r := <-fontCh:
-			fontRes = r
+			phase2.fontRes = r
 			fontCh = nil
-
 		case r := <-gitCh:
-			gitRes = r
+			phase2.gitRes = r
 			gitCh = nil
-
 		case <-hydrateCh:
 			hydrateCh = nil
-
 		}
 	}
-	parallelCancel()
 
 	if criticalErr != nil {
-		// Clean up any containers that were successfully created.
-		for _, c := range []*container.Container{guideResult.c, orchResult.c} {
-			if c != nil {
-				_ = runtime.StopContainer(context.Background(), c)
-				_ = runtime.RemoveContainer(context.Background(), c)
-			}
-		}
-		cleanupInfra(runtime, containerReg, namespace, guideBus)
-		return ui.Deps{}, nil, criticalErr
+		cleanupPhase2Critical(phase1, phase2)
+		return phase2, criticalErr
 	}
 
-	// Inject pre-created containers into the DaemonSetController so the
-	// periodic reconciler manages them going forward.
-	daemonCtrl.InjectInstance("guide", guideResult.c)
-	daemonCtrl.InjectInstance("orchestrator", orchResult.c)
-	if guardianResult.err == nil && guardianResult.c != nil {
-		daemonCtrl.InjectInstance("guardian", guardianResult.c)
+	phase1.daemonCtrl.InjectInstance("guide", phase2.guideResult.c)
+	phase1.daemonCtrl.InjectInstance("orchestrator", phase2.orchResult.c)
+	if phase2.guardianResult.err == nil && phase2.guardianResult.c != nil {
+		phase1.daemonCtrl.InjectInstance("guardian", phase2.guardianResult.c)
 	}
 
 	slog.Info("bootstrap phase 2 complete", "elapsed", time.Since(phase2Start))
+	return phase2, nil
+}
 
-	// =================================================================
-	// Phase 3: Wiring (sequential, depends on Phase 2 results)
-	// =================================================================
-
+func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (bootstrapPhase3, error) {
 	phase3Start := time.Now()
 
-	g, err := extractAgent[*guide.Guide](containerReg, "guide")
+	g, err := extractAgent[*guide.Guide](phase1.containerReg, "guide")
 	if err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus)
-		return ui.Deps{}, nil, fmt.Errorf("extract guide: %w", err)
+		return bootstrapPhase3{}, fmt.Errorf("extract guide: %w", err)
 	}
-	guideRef.Store(g) // Publish for Guardian factory on daemon restart.
-	orch, err := extractAgent[*orchestrator.Orchestrator](containerReg, "orchestrator")
+	phase1.guideRef.Store(g)
+
+	orch, err := extractAgent[*orchestrator.Orchestrator](phase1.containerReg, "orchestrator")
 	if err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus)
-		return ui.Deps{}, nil, fmt.Errorf("extract orchestrator: %w", err)
+		return bootstrapPhase3{}, fmt.Errorf("extract orchestrator: %w", err)
 	}
-	orchRef.Store(orch) // Publish for Guardian VFS adapter queries.
+	phase1.orchRef.Store(orch)
 
-	hookMut.SetGuide(g)
-	probeFact.SetIsReady(g.IsAgentReady)
-
+	phase1.hookMut.SetGuide(g)
+	phase1.probeFact.SetIsReady(g.IsAgentReady)
 	if err := registerOrchestratorWithGuide(g, orch); err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus)
-		return ui.Deps{}, nil, fmt.Errorf("register orchestrator: %w", err)
+		return bootstrapPhase3{}, fmt.Errorf("register orchestrator: %w", err)
 	}
 
-	// Wire Guardian: extract from container, register with Guide, wire git subsystems.
-	if guardianResult.err == nil && guardianResult.c != nil {
-		if grd, grdErr := extractAgent[*guardian.Guardian](containerReg, "guardian"); grdErr == nil {
-			guardianRef.Store(grd)
-			_ = registerAgentWithGuide(g, grd, "guardian")
-			if gitRes.bus != nil {
-				grd.SetGitSubsystems(gitRes.bus, gitRes.watcher)
-			}
-		}
+	phase3 := bootstrapPhase3{
+		guide:          g,
+		orch:           orch,
+		activationCtrl: phase2.actResult.ctrl,
 	}
-
-	// Pre-register routing metadata for all non-pipeline agents so the
-	// classifier can see them before their containers spin up.
-	preRegisterAgentRouting(g, identityReg)
-
-	// Seed Guardian's known-agents from the Guide's current registry so it
-	// doesn't start with total=0. Handles both initial boot (where
-	// pre-registered agents have no live announcements) and daemon restart
-	// (where prior announcements were missed).
-	if guardianResult.err == nil && guardianResult.c != nil {
-		if grd, grdErr := extractAgent[*guardian.Guardian](containerReg, "guardian"); grdErr == nil {
-			grd.SeedKnownAgents(g.RegisteredAgentInfos())
-		}
-	}
-
-	activationCtrl := actResult.ctrl
-	if activationCtrl != nil {
-		actCtrlRef.Store(activationCtrl)
-	}
-
-	// Adopt bootstrap daemon containers so their activation entries start
-	// at TierHot. Without this, EnsureActive sees TierCold and cold-starts
-	// a duplicate instance.
-	if activationCtrl != nil {
-		if _, err := activationCtrl.AdoptContainer("guide", guideResult.c); err != nil {
+	if phase3.activationCtrl != nil {
+		phase1.actCtrlRef.Store(phase3.activationCtrl)
+		if _, err := phase3.activationCtrl.AdoptContainer("guide", phase2.guideResult.c); err != nil {
 			slog.Warn("adopt guide container", "error", err)
 		}
-		if _, err := activationCtrl.AdoptContainer("orchestrator", orchResult.c); err != nil {
+		if _, err := phase3.activationCtrl.AdoptContainer("orchestrator", phase2.orchResult.c); err != nil {
 			slog.Warn("adopt orchestrator container", "error", err)
 		}
-		if guardianResult.err == nil && guardianResult.c != nil {
-			if _, err := activationCtrl.AdoptContainer("guardian", guardianResult.c); err != nil {
+		if phase2.guardianResult.err == nil && phase2.guardianResult.c != nil {
+			if _, err := phase3.activationCtrl.AdoptContainer("guardian", phase2.guardianResult.c); err != nil {
 				slog.Warn("adopt guardian container", "error", err)
 			}
 		}
 	}
 
-	// Wire guardian observability dependencies (activation + daemon controllers).
-	if guardianResult.err == nil && guardianResult.c != nil {
-		if grd, grdErr := extractAgent[*guardian.Guardian](containerReg, "guardian"); grdErr == nil {
-			var acQuerier guardian.ActivationQuerier
-			var amQuerier guardian.ActivationMetricsQuerier
-			if activationCtrl != nil {
-				acQuerier = activationCtrl
-				amQuerier = &activationMetricsAdapter{m: activationCtrl.Metrics()}
+	preRegisterAgentRouting(g, phase1.identityReg)
+
+	if phase2.guardianResult.err == nil && phase2.guardianResult.c != nil {
+		if grd, grdErr := extractAgent[*guardian.Guardian](phase1.containerReg, "guardian"); grdErr == nil {
+			phase1.guardianRef.Store(grd)
+			if phase2.gitRes.bus != nil {
+				grd.SetGitSubsystems(phase2.gitRes.bus, phase2.gitRes.watcher)
 			}
-			grd.SetObservabilityDeps(acQuerier, amQuerier, &daemonQuerierAdapter{dc: daemonCtrl})
-			grd.SetVFSDeps(
-				&orchestratorCVSAdapter{orchRef: &orchRef},
-				&orchestratorVFSAdapter{orchRef: &orchRef},
+			wireGuardianPostBootDeps(
+				grd,
+				&phase1.actCtrlRef,
+				phase1.daemonCtrl,
+				&phase1.guideRef,
+				&phase1.orchRef,
+				phase1.authRegistry,
+				phase1.openaiGateway,
+				[]*gateway.ProviderGateway{phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway},
+				phase1.knowledgeStore,
+				phase1.budget,
 			)
-			grd.SetExtendedObservabilityDeps(
-				&pipelineQuerierAdapter{orchRef: &orchRef},
-				&gatewayQuerierAdapter{gateways: []*gateway.ProviderGateway{googleGateway, anthropicGateway, openaiGateway}},
-				&knowledgeQuerierAdapter{store: knowledgeStore},
-				&concurrencyQuerierAdapter{budget: budget},
-			)
-			grd.SetCostCalculator(buildCostCalculator())
 		}
 	}
 
-	var activator guide.PodActivator
-	if activationCtrl != nil {
-		activator = activation.NewControllerPodActivator(activationCtrl)
-		g.SetActivator(activator)
+	if phase3.activationCtrl != nil {
+		phase3.activator = activation.NewControllerPodActivator(phase3.activationCtrl)
+		g.SetActivator(phase3.activator)
 	}
-	g.SetServiceRegistry(serviceReg)
-	g.SetProviderWrapper(googleGateway.Wrapper(gateway.PriorityUserInteractive))
-
-	// Agent registrar: bridges on-demand activation → routing registration.
-	// When the Guide activates an agent lazily (via ensureExplicitTargetReady),
-	// the PostStartHook only marks readiness. This callback extracts the agent
-	// from the container registry and registers its routing info (capabilities,
-	// intents, channels) with the Guide.
+	g.SetServiceRegistry(phase1.serviceReg)
+	g.SetProviderWrapper(phase1.googleGateway.Wrapper(gateway.PriorityUserInteractive))
 	g.SetAgentRegistrar(func(agentType string) {
-		containers := containerReg.ListByType(agentType)
+		containers := phase1.containerReg.ListByType(agentType)
 		if len(containers) == 0 {
 			return
 		}
@@ -820,26 +792,20 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		}
 	})
 
-	// Wire orchestrator to refresh its own Google provider on auth events.
 	orch.SetProviderRefresher(func(refreshCtx context.Context, authMethod string) {
-		refreshOrchestratorProvider(refreshCtx, orch, googleGateway, authRegistry, authMethod)
+		refreshOrchestratorProvider(refreshCtx, orch, phase1.googleGateway, phase1.authRegistry, authMethod)
 	})
-
 	orch.SetTaskRouter(orchestrator.NewTaskRouter(orchestrator.TaskRouterConfig{
-		Bus:       guideBus,
-		Scope:     scope,
+		Bus:       phase1.guideBus,
+		Scope:     phase1.scope,
 		AgentID:   orch.AgentID(),
 		SessionID: "default",
 	}))
-	if activator != nil {
-		orch.SetActivator(activator)
+	if phase3.activator != nil {
+		orch.SetActivator(phase3.activator)
 	}
-
-	// PipelineRegistrar: when a PipelinePod activates agents for a DAG,
-	// this callback extracts each agent from the container registry and
-	// registers its routing info with the Guide.
 	orch.SetRegistrar(func(ctx context.Context, podID, agentType string) error {
-		c := findRegisteredPodContainer(containerReg, podID, agentType)
+		c := findRegisteredPodContainer(phase1.containerReg, podID, agentType)
 		if c == nil {
 			return fmt.Errorf("no container for pod %s agent type %s after activation", podID, agentType)
 		}
@@ -853,42 +819,146 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		}
 		return registerRoutingInfoWithGuide(g, info)
 	})
-	orch.SetTaskPodInfra(runtime, specReg, func(sessionID string) *versioning.SessionVFS {
-		return orch.EnsureSessionVFS(sessionID, projectRoot)
+	orch.SetTaskPodInfra(phase1.runtime, phase1.specReg, func(sessionID string) *versioning.SessionVFS {
+		return orch.EnsureSessionVFS(sessionID, phase1.projectRoot)
 	})
 
-	// ScribeFactory: creates Gemini 3 Flash sidecars for pipeline pods.
-	// The factory captures the Google gateway, bus, and scope — each
-	// Scribe gets a gateway-wrapped provider for rate limiting.
-	scribeFactory := buildScribeFactory(ctx, googleGateway, authRegistry, guideBus, scope)
-	if scribeFactory != nil {
-		orch.SetScribeFactory(scribeFactory)
+	phase3.scribeFactory = buildScribeFactory(
+		phase1.ctx,
+		phase1.googleGateway,
+		phase1.authRegistry,
+		phase1.guideBus,
+		phase1.scope,
+	)
+	if phase3.scribeFactory != nil {
+		orch.SetScribeFactory(phase3.scribeFactory)
 	}
 
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
+	return phase3, nil
+}
 
-	// =================================================================
-	// Phase 4: Critical path (session + seeds) + background activation
-	// =================================================================
+func schedulePhase4Task(
+	scope *concurrency.GoroutineScope,
+	name string,
+	timeout time.Duration,
+	remaining *atomic.Int32,
+	onDone func(),
+	task func(context.Context) error,
+) {
+	remaining.Add(1)
+	_ = scope.Go(name, timeout, func(bgCtx context.Context) error {
+		defer onDone()
+		return task(bgCtx)
+	})
+}
 
-	phase4Start := time.Now()
+func schedulePhase4Activation(
+	phase1 *bootstrapPhase1,
+	phase3 bootstrapPhase3,
+	name string,
+	timeout time.Duration,
+	remaining *atomic.Int32,
+	activationsRemaining *atomic.Int32,
+	activationsDone chan struct{},
+	onDone func(),
+	logTiming bool,
+	onReady func(context.Context) error,
+) {
+	activationsRemaining.Add(1)
+	schedulePhase4Task(phase1.scope, "phase4-activate-"+name, timeout, remaining, onDone, func(bgCtx context.Context) error {
+		defer func() {
+			if activationsRemaining.Add(-1) == 0 {
+				close(activationsDone)
+			}
+		}()
 
-	defaultSession, err := sessionMgr.Create(ctx, session.DefaultConfig())
+		start := time.Now()
+		if logTiming {
+			deadline, hasDeadline := bgCtx.Deadline()
+			slog.Info("phase4: "+name+" activation start", "has_deadline", hasDeadline, "deadline", deadline)
+		}
+		if _, err := phase3.activationCtrl.EnsureActive(bgCtx, name); err != nil {
+			attrs := []any{"error", err}
+			if logTiming {
+				attrs = append(attrs, "elapsed_ms", time.Since(start).Milliseconds())
+			}
+			slog.Warn("phase4: "+name+" activation failed", attrs...)
+			return nil
+		}
+		if logTiming {
+			slog.Info("phase4: "+name+" activation done", "elapsed_ms", time.Since(start).Milliseconds())
+		}
+		if bgCtx.Err() != nil || onReady == nil {
+			return nil
+		}
+		return onReady(bgCtx)
+	})
+}
+
+func registerPhase4Architect(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error {
+	arch, err := extractAgent[*architect.Architect](phase1.containerReg, "architect")
 	if err != nil {
-		cleanupInfra(runtime, containerReg, namespace, guideBus)
-		return ui.Deps{}, nil, fmt.Errorf("default session: %w", err)
+		return nil
 	}
-	_ = sessionMgr.Switch(defaultSession.ID())
+	_ = registerArchitectWithGuide(phase3.guide, arch)
+	wireGlobalAgentPod(arch, "architect", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	return nil
+}
 
-	orch.SignalReady()
+func registerPhase4Inspector(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error {
+	inspectorAgent, err := extractAgent[*inspectorGlobal.GlobalInspector](phase1.containerReg, "inspector")
+	if err != nil {
+		return nil
+	}
+	_ = registerAgentWithGuide(phase3.guide, inspectorAgent, "inspector")
+	wireGlobalAgentPod(inspectorAgent, "inspector", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	return nil
+}
 
-	// Load persisted agent model selections from the config file.
-	configPath := filepath.Join(projectRoot, ".sylk", "config.yaml")
-	modelStore := agentpkg.NewAgentModelStore(configPath)
+func registerPhase4Tester(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error {
+	testerAgent, err := extractAgent[*globaltester.GlobalTester](phase1.containerReg, "tester")
+	if err != nil {
+		return nil
+	}
+	_ = registerAgentWithGuide(phase3.guide, testerAgent, "tester")
+	wireGlobalAgentPod(testerAgent, "tester", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	return nil
+}
 
-	// Seeds use placeholder IDs (agent type names). The UI's
-	// ensureAgent/promoteSeededAgent re-keys to UUIDs when activity
-	// events arrive from pre-activated agents.
+func registerPhase4Librarian(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error {
+	lib, err := extractAgent[*librarian.Librarian](phase1.containerReg, "librarian")
+	if err != nil {
+		return nil
+	}
+	_ = registerAgentWithGuide(phase3.guide, lib, "librarian")
+	wireGlobalAgentPod(lib, "librarian", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	return nil
+}
+
+func registerPhase4Archivalist(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error {
+	archivalistAgent, err := extractAgent[*archivalist.Archivalist](phase1.containerReg, "archivalist")
+	if err != nil {
+		return nil
+	}
+	_ = registerAgentWithGuide(phase3.guide, archivalistAgent, "archivalist")
+	return nil
+}
+
+func startBootstrapPhase4(
+	phase1 *bootstrapPhase1,
+	phase2 bootstrapPhase2,
+	phase3 bootstrapPhase3,
+) (*bootstrapPhase4, error) {
+	phase4Start := time.Now()
+	defaultSession, err := phase1.sessionMgr.Create(phase1.ctx, session.DefaultConfig())
+	if err != nil {
+		return nil, fmt.Errorf("default session: %w", err)
+	}
+	_ = phase1.sessionMgr.Switch(defaultSession.ID())
+	phase3.orch.SignalReady()
+
+	modelStore := agentpkg.NewAgentModelStore(filepath.Join(phase1.projectRoot, ".sylk", "config.yaml"))
 	seeds := []ui.AgentSeed{
 		{ID: "guide", AgentType: "guide", Name: "Guide"},
 		{ID: "architect", AgentType: "architect", Name: "Architect"},
@@ -899,23 +969,16 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		{ID: "archivalist", AgentType: "archivalist", Name: "Archivalist"},
 		{ID: "academic", AgentType: "academic", Name: "Academic"},
 	}
-
-	// Populate per-agent supported models from the container registry.
-	populateSeedModels(seeds, containerReg)
-
-	// Enrich seeds with persisted model+provider selections so the UI shows the
-	// user's previous choice immediately on boot.
+	populateSeedModels(seeds, phase1.containerReg)
 	for i := range seeds {
 		entry := modelStore.EntryFor(seeds[i].AgentType)
-		seeds[i].PersistedModelID = resolvePersistedModelForCurrentAuth(entry.Model, entry.Provider, authRegistry)
+		seeds[i].PersistedModelID = resolvePersistedModelForCurrentAuth(entry.Model, entry.Provider, phase1.authRegistry)
 		seeds[i].PersistedProviderID = entry.Provider
 	}
-
-	// Write defaults for any agent not yet in the config file.
 	agentDefaults := make(map[string]agentpkg.AgentConfigEntry, len(seeds))
-	for _, s := range seeds {
-		if dflt := agentpkg.DefaultModelForAgentType(s.AgentType); dflt != "" {
-			agentDefaults[s.AgentType] = agentpkg.AgentConfigEntry{
+	for _, seed := range seeds {
+		if dflt := agentpkg.DefaultModelForAgentType(seed.AgentType); dflt != "" {
+			agentDefaults[seed.AgentType] = agentpkg.AgentConfigEntry{
 				Provider: agentpkg.DeriveProvider(dflt),
 				Model:    dflt,
 			}
@@ -925,269 +988,110 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		slog.Warn("agent model config: ensure defaults", "error", err)
 	}
 
-	// Build the model swapper early so phase4 goroutines can apply
-	// persisted models after activation.
-	modelSwapper := buildModelSwapper(containerReg, authRegistry, googleGateway, anthropicGateway, openaiGateway)
+	phase4 := &bootstrapPhase4{
+		seeds:        seeds,
+		modelStore:   modelStore,
+		modelSwapper: buildModelSwapper(phase1.containerReg, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway),
+		phase4Done:   make(chan struct{}),
+	}
 
-	// Background Phase 4: agent pre-activations, handoff supervisor,
-	// and auth probe run after deps are returned. Each child is a
-	// tracked scope.Go — no coordinator goroutine, no WaitGroup. An
-	// atomic counter tracks completion; the last goroutine out performs
-	// the late-register step and closes phase4Done.
-	var supervisorRef atomic.Pointer[handoff.HandoffSupervisor]
-	phase4Done := make(chan struct{})
+	bootLogger, bootLogErr := agentlog.NewBootEventLogger(filepath.Join(phase1.projectRoot, ".sylk"))
+	if bootLogErr != nil {
+		slog.Warn("boot logger init failed (non-critical)", "error", bootLogErr)
+	}
+	phase4.bootLogger = bootLogger
+	phase1.knowledgeStore.SetBootLogger(bootLogger)
 
-	// Atomic counter: each goroutine decrements on exit (via defer).
-	// The last one to finish (counter reaches 0) runs late-register
-	// and closes phase4Done. No blocking Wait — each goroutine
-	// responds to context cancellation independently.
-	var phase4Remaining atomic.Int32
-
+	var (
+		phase4Remaining      atomic.Int32
+		activationsRemaining atomic.Int32
+	)
+	activationsDone := make(chan struct{})
 	phase4Finish := func() {
 		if phase4Remaining.Add(-1) > 0 {
 			return
 		}
-		// Last goroutine out — run late-register then signal done.
-		if sup := supervisorRef.Load(); sup != nil {
-			if arch, archErr := extractAgent[*architect.Architect](containerReg, "architect"); archErr == nil {
-				sup.Factory().RegisterCreator("architect",
-					func(_ context.Context) (handoff.HandoffableAgent, error) {
-						return arch, nil
-					})
+		if sup := phase4.supervisorRef.Load(); sup != nil {
+			if arch, archErr := extractAgent[*architect.Architect](phase1.containerReg, "architect"); archErr == nil {
+				sup.Factory().RegisterCreator("architect", func(context.Context) (handoff.HandoffableAgent, error) {
+					return arch, nil
+				})
 				registerHandoffAgent(sup, arch)
 			}
 		}
 		slog.Info("bootstrap phase 4 background complete", "elapsed", time.Since(phase4Start))
-		close(phase4Done)
+		close(phase4.phase4Done)
 	}
 
-	// A: Agent pre-activations (6 tracked goroutines)
-	//
-	// Each goroutine gets an explicit timeout via scope.Go so the worker
-	// context carries a bounded deadline. If activation exceeds the
-	// budget, the context cancels and EnsureActive returns immediately.
 	const phase4ActivationTimeout = 45 * time.Second
-
-	// activationsDone is closed after all activation goroutines finish,
-	// so the boot-model-swap goroutine can wait without deadlocking phase4Done.
-	activationsDone := make(chan struct{})
-	var activationsRemaining atomic.Int32
-
-	if activationCtrl != nil {
-		activationsRemaining.Add(6)
-		phase4Remaining.Add(6)
-		_ = scope.Go("phase4-activate-architect", phase4ActivationTimeout, func(bgCtx context.Context) error {
-			defer phase4Finish()
-			defer func() {
-				if activationsRemaining.Add(-1) == 0 {
-					close(activationsDone)
-				}
-			}()
-			p4Start := time.Now()
-			deadline, hasDL := bgCtx.Deadline()
-			slog.Info("phase4: architect activation start", "has_deadline", hasDL, "deadline", deadline)
-			if _, err := activationCtrl.EnsureActive(bgCtx, "architect"); err != nil {
-				slog.Warn("phase4: architect activation failed", "error", err, "elapsed_ms", time.Since(p4Start).Milliseconds())
-				return nil
-			}
-			slog.Info("phase4: architect activation done", "elapsed_ms", time.Since(p4Start).Milliseconds())
-			if bgCtx.Err() != nil {
-				return nil
-			}
-			arch, err := extractAgent[*architect.Architect](containerReg, "architect")
-			if err != nil {
-				return nil
-			}
-			_ = registerArchitectWithGuide(g, arch)
-			wireGlobalAgentPod(arch, "architect", scribeFactory, activator, activityPub, slog.Default())
-			return nil
+	if phase3.activationCtrl != nil {
+		schedulePhase4Activation(phase1, phase3, "architect", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, true, func(context.Context) error {
+			return registerPhase4Architect(phase1, phase3)
 		})
-		_ = scope.Go("phase4-activate-inspector", phase4ActivationTimeout, func(bgCtx context.Context) error {
-			defer phase4Finish()
-			defer func() {
-				if activationsRemaining.Add(-1) == 0 {
-					close(activationsDone)
-				}
-			}()
-			if _, err := activationCtrl.EnsureActive(bgCtx, "inspector"); err != nil {
-				slog.Warn("phase4: inspector activation failed", "error", err)
-				return nil
-			}
-			if bgCtx.Err() != nil {
-				return nil
-			}
-			gi, err := extractAgent[*inspectorGlobal.GlobalInspector](containerReg, "inspector")
-			if err != nil {
-				return nil
-			}
-			_ = registerAgentWithGuide(g, gi, "inspector")
-			wireGlobalAgentPod(gi, "inspector", scribeFactory, activator, activityPub, slog.Default())
-			return nil
+		schedulePhase4Activation(phase1, phase3, "inspector", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+			return registerPhase4Inspector(phase1, phase3)
 		})
-		_ = scope.Go("phase4-activate-tester", phase4ActivationTimeout, func(bgCtx context.Context) error {
-			defer phase4Finish()
-			defer func() {
-				if activationsRemaining.Add(-1) == 0 {
-					close(activationsDone)
-				}
-			}()
-			if _, err := activationCtrl.EnsureActive(bgCtx, "tester"); err != nil {
-				slog.Warn("phase4: tester activation failed", "error", err)
-				return nil
-			}
-			if bgCtx.Err() != nil {
-				return nil
-			}
-			gt, err := extractAgent[*globaltester.GlobalTester](containerReg, "tester")
-			if err != nil {
-				return nil
-			}
-			_ = registerAgentWithGuide(g, gt, "tester")
-			wireGlobalAgentPod(gt, "tester", scribeFactory, activator, activityPub, slog.Default())
-			return nil
+		schedulePhase4Activation(phase1, phase3, "tester", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+			return registerPhase4Tester(phase1, phase3)
 		})
-		_ = scope.Go("phase4-activate-librarian", phase4ActivationTimeout, func(bgCtx context.Context) error {
-			defer phase4Finish()
-			defer func() {
-				if activationsRemaining.Add(-1) == 0 {
-					close(activationsDone)
-				}
-			}()
-			if _, err := activationCtrl.EnsureActive(bgCtx, "librarian"); err != nil {
-				slog.Warn("phase4: librarian activation failed", "error", err)
-				return nil
-			}
-			if bgCtx.Err() != nil {
-				return nil
-			}
-			lib, err := extractAgent[*librarian.Librarian](containerReg, "librarian")
-			if err != nil {
-				return nil
-			}
-			_ = registerAgentWithGuide(g, lib, "librarian")
-			wireGlobalAgentPod(lib, "librarian", scribeFactory, activator, activityPub, slog.Default())
-			return nil
+		schedulePhase4Activation(phase1, phase3, "librarian", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+			return registerPhase4Librarian(phase1, phase3)
 		})
-		_ = scope.Go("phase4-activate-archivalist", phase4ActivationTimeout, func(bgCtx context.Context) error {
-			defer phase4Finish()
-			defer func() {
-				if activationsRemaining.Add(-1) == 0 {
-					close(activationsDone)
-				}
-			}()
-			if _, err := activationCtrl.EnsureActive(bgCtx, "archivalist"); err != nil {
-				slog.Warn("phase4: archivalist activation failed", "error", err)
-				return nil
-			}
-			if bgCtx.Err() != nil {
-				return nil
-			}
-			arch, err := extractAgent[*archivalist.Archivalist](containerReg, "archivalist")
-			if err != nil {
-				return nil
-			}
-			_ = registerAgentWithGuide(g, arch, "archivalist")
-			return nil
+		schedulePhase4Activation(phase1, phase3, "archivalist", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+			return registerPhase4Archivalist(phase1, phase3)
 		})
-		_ = scope.Go("phase4-activate-academic", phase4ActivationTimeout, func(bgCtx context.Context) error {
-			defer phase4Finish()
-			defer func() {
-				if activationsRemaining.Add(-1) == 0 {
-					close(activationsDone)
-				}
-			}()
-			if _, err := activationCtrl.EnsureActive(bgCtx, "academic"); err != nil {
-				slog.Warn("phase4: academic activation failed", "error", err)
-				return nil
-			}
-			return nil
-		})
+		schedulePhase4Activation(phase1, phase3, "academic", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, nil)
 	} else {
 		close(activationsDone)
 	}
 
-	// B: Handoff supervisor (tolerates nil arch)
-	phase4Remaining.Add(1)
-	_ = scope.Go("phase4-handoff-supervisor", 0, func(_ context.Context) error {
-		defer phase4Finish()
-		sup := bootstrapHandoffSupervisor(g, nil, orch, serviceReg, containerReg, activationCtrl)
+	schedulePhase4Task(phase1.scope, "phase4-handoff-supervisor", 0, &phase4Remaining, phase4Finish, func(context.Context) error {
+		sup := bootstrapHandoffSupervisor(phase3.guide, nil, phase3.orch, phase1.serviceReg, phase1.containerReg, phase3.activationCtrl)
 		if sup != nil {
-			supervisorRef.Store(sup)
+			phase4.supervisorRef.Store(sup)
 		}
 		return nil
 	})
-
-	// C: Auth probe
-	phase4Remaining.Add(1)
-	_ = scope.Go("phase4-auth-probe", 0, func(_ context.Context) error {
-		defer phase4Finish()
-		authRegistry.ProbeAll()
+	schedulePhase4Task(phase1.scope, "phase4-auth-probe", 0, &phase4Remaining, phase4Finish, func(context.Context) error {
+		phase1.authRegistry.ProbeAll()
 		return nil
 	})
-
-	// D: Apply persisted model+provider to agent backends.
-	// Runs after activations so SwapModel targets live agents.
-	phase4Remaining.Add(1)
-	_ = scope.Go("phase4-boot-model-swap", phase4ActivationTimeout, func(bgCtx context.Context) error {
-		defer phase4Finish()
-		// Wait for activations to complete before swapping.
+	schedulePhase4Task(phase1.scope, "phase4-boot-model-swap", phase4ActivationTimeout, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
 		select {
 		case <-activationsDone:
 		case <-bgCtx.Done():
 			return nil
 		}
-		for _, s := range seeds {
+		for _, seed := range phase4.seeds {
 			if bgCtx.Err() != nil {
 				return nil
 			}
-			dflt := agentpkg.DefaultModelForAgentType(s.AgentType)
-			persisted := modelStore.ModelFor(s.AgentType)
+			dflt := agentpkg.DefaultModelForAgentType(seed.AgentType)
+			persisted := phase4.modelStore.ModelFor(seed.AgentType)
 			if persisted == "" || persisted == dflt {
 				continue
 			}
-			if err := modelSwapper(bgCtx, s.AgentType, persisted); err != nil {
-				slog.Warn("boot model swap failed", "agent", s.AgentType, "model", persisted, "error", err)
+			if err := phase4.modelSwapper(bgCtx, seed.AgentType, persisted); err != nil {
+				slog.Warn("boot model swap failed", "agent", seed.AgentType, "model", persisted, "error", err)
 			} else {
-				slog.Info("boot model swap applied", "agent", s.AgentType, "model", persisted)
+				slog.Info("boot model swap applied", "agent", seed.AgentType, "model", persisted)
 			}
 		}
 		return nil
 	})
-
-	// E: Knowledge boot — runs boot.Boot and promotes partial knowledge.
-	// Non-critical and potentially slow; fires fully in background.
-	//
-	// BootEventLogger is created before boot so pre-session events
-	// are durably staged. BindSession drains into the session log.
-	bootLogger, bootLogErr := agentlog.NewBootEventLogger(
-		filepath.Join(projectRoot, ".sylk"),
-	)
-	if bootLogErr != nil {
-		slog.Warn("boot logger init failed (non-critical)", "error", bootLogErr)
-	}
-	knowledgeStore.SetBootLogger(bootLogger)
-
-	phase4Remaining.Add(1)
-	_ = scope.Go("phase4-knowledge-boot", 0, func(bgCtx context.Context) error {
-		defer phase4Finish()
-
-		// Boot is non-critical but potentially slow. Run via channel so the
-		// scope worker exits promptly on shutdown (Ctrl+C). The boot goroutine
-		// is bounded: pipeline.Run checks ctx.Err() between phases and
-		// CommitToGlobal threads ctx through internal errgroups, so it exits
-		// shortly after bgCtx cancellation. At process exit the OS reclaims.
+	schedulePhase4Task(phase1.scope, "phase4-knowledge-boot", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
 		type bootOut struct {
 			result *boot.PipelineResult
 			err    error
 		}
 		ch := make(chan bootOut, 1)
 		go func() {
-			r, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
-				ProjectRoot: projectRoot,
-				Logger:      bootLogger,
-				OnProgress:  knowledgeStore.NotifyProgress,
+			result, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
+				ProjectRoot: phase1.projectRoot,
+				Logger:      phase4.bootLogger,
+				OnProgress:  phase1.knowledgeStore.NotifyProgress,
 			})
-			ch <- bootOut{r, err}
+			ch <- bootOut{result: result, err: err}
 		}()
 
 		select {
@@ -1198,11 +1102,10 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				slog.Warn("knowledge boot failed (non-critical)", "error", out.err)
 				return nil
 			}
-			// Build BleveSearcher from the BackgroundIndexer's already-open
-			// store when available. Opening a second store at the same path
-			// would block on bolt.DB's exclusive file lock held by the indexer.
-			var bleveSearcher *query.BleveSearcher
-			var bleveCloser io.Closer
+			var (
+				bleveSearcher *query.BleveSearcher
+				bleveCloser   io.Closer
+			)
 			if bgIdx := out.result.BackgroundIndexer; bgIdx != nil && bgIdx.BleveStore() != nil {
 				store := bgIdx.BleveStore()
 				adapter := &globalBleveAdapter{store: store}
@@ -1210,128 +1113,121 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 				bleveCloser = &bleveStoreCloser{store: store}
 			} else {
 				var buildErr error
-				bleveSearcher, bleveCloser, buildErr = buildBleveSearcher(projectRoot)
+				bleveSearcher, bleveCloser, buildErr = buildBleveSearcher(phase1.projectRoot)
 				if buildErr != nil {
 					slog.Warn("knowledge bleve open failed (non-critical)", "error", buildErr)
 					return nil
 				}
 			}
-			knowledgeStore.PromotePartial(bleveSearcher, out.result.BackgroundIndexer, bleveCloser)
+			phase1.knowledgeStore.PromotePartial(bleveSearcher, out.result.BackgroundIndexer, bleveCloser)
 			return nil
 		}
 	})
-
-	// F: Wait for BackgroundIndexer to finish, then promote to full knowledge.
-	phase4Remaining.Add(1)
-	_ = scope.Go("phase4-bleve-ready", 0, func(bgCtx context.Context) error {
-		defer phase4Finish()
-		if err := knowledgeStore.WaitForPartial(bgCtx); err != nil {
+	schedulePhase4Task(phase1.scope, "phase4-bleve-ready", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
+		if err := phase1.knowledgeStore.WaitForPartial(bgCtx); err != nil {
 			return nil
 		}
-		bgWaiter := knowledgeStore.BackgroundWaiter()
+		bgWaiter := phase1.knowledgeStore.BackgroundWaiter()
 		if bgWaiter == nil {
-			knowledgeStore.PromoteFull()
+			phase1.knowledgeStore.PromoteFull()
 			return nil
 		}
 		select {
 		case <-bgWaiter.Ready():
-			knowledgeStore.PromoteFull()
+			phase1.knowledgeStore.PromoteFull()
 		case <-bgCtx.Done():
 		}
 		return nil
 	})
 
-	slog.Info("bootstrap critical path complete", "elapsed", time.Since(start))
+	return phase4, nil
+}
 
-	// =================================================================
-	// Cleanup — ordered teardown
-	// =================================================================
-
-	cleanup := func() error {
+func buildBootstrapCleanup(
+	phase1 *bootstrapPhase1,
+	phase3 bootstrapPhase3,
+	phase4 *bootstrapPhase4,
+) func() error {
+	return func() error {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer shutdownCancel()
 
-		// Phase 4 goroutines are tracked by the scope — scope.Shutdown
-		// (called from app.Shutdown) already cancels their contexts and
-		// waits for completion. A non-blocking drain avoids a redundant
-		// blocking wait that would stall exit.
 		select {
-		case <-phase4Done:
+		case <-phase4.phase4Done:
 		default:
 		}
 
 		var errs []error
-
-		if sup := supervisorRef.Load(); sup != nil {
+		if sup := phase4.supervisorRef.Load(); sup != nil {
 			if stopErr := sup.Stop(); stopErr != nil {
 				errs = append(errs, stopErr)
 			}
 		}
-
-		if activationCtrl != nil {
-			if shutErr := activationCtrl.Shutdown(shutdownCtx); shutErr != nil {
-				errs = append(errs, shutErr)
+		if phase3.activationCtrl != nil {
+			if err := phase3.activationCtrl.Shutdown(shutdownCtx); err != nil {
+				errs = append(errs, err)
 			}
 		}
-
-		for _, c := range containerReg.All() {
+		for _, c := range phase1.containerReg.All() {
 			if c.IsRunning() {
-				if stopErr := runtime.StopContainer(shutdownCtx, c); stopErr != nil {
-					errs = append(errs, stopErr)
+				if err := phase1.runtime.StopContainer(shutdownCtx, c); err != nil {
+					errs = append(errs, err)
 				}
 			}
-			if removeErr := runtime.RemoveContainer(shutdownCtx, c); removeErr != nil {
-				errs = append(errs, removeErr)
+			if err := phase1.runtime.RemoveContainer(shutdownCtx, c); err != nil {
+				errs = append(errs, err)
 			}
 		}
 
-		namespace.Close()
-		runtime.Close()
-
-		planStore.Close()
-
-		_ = bootLogger.Close()
-
-		if ksErr := knowledgeStore.Close(); ksErr != nil {
-			errs = append(errs, ksErr)
+		phase1.namespace.Close()
+		phase1.runtime.Close()
+		phase1.planStore.Close()
+		if phase4.bootLogger != nil {
+			_ = phase4.bootLogger.Close()
 		}
-
-		googleGateway.Stop()
-		anthropicGateway.Stop()
-		openaiGateway.Stop()
-
-		if busErr := guideBus.Close(); busErr != nil {
-			errs = append(errs, busErr)
+		if err := phase1.knowledgeStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		phase1.googleGateway.Stop()
+		phase1.anthropicGateway.Stop()
+		phase1.openaiGateway.Stop()
+		if err := phase1.guideBus.Close(); err != nil {
+			errs = append(errs, err)
 		}
 		return errors.Join(errs...)
 	}
+}
 
-	deps := ui.Deps{
-		ActivityPub:        activityPub,
-		SessionManager:     sessionMgr,
-		GuideBus:           guideBus,
-		StreamManager:      streamMgr,
-		Guide:              g,
-		Scope:              scope,
-		AuthRegistry:       authRegistry,
-		InterruptAllAgents: makeInterruptAllAgentsFn(activationCtrl, guideBus),
-		NerdFontsDetected:  fontRes.detected,
-		GitClient:          gitRes.client,
-		GitWatcher:         gitRes.watcher,
-		GitBus:             gitRes.bus,
-		SafetyGuard:        gitRes.guard,
-		SeedAgents:         seeds,
-		ModelSwap:          modelSwapper,
+func buildBootstrapDeps(
+	phase1 *bootstrapPhase1,
+	phase2 bootstrapPhase2,
+	phase3 bootstrapPhase3,
+	phase4 *bootstrapPhase4,
+) ui.Deps {
+	return ui.Deps{
+		ActivityPub:        phase1.activityPub,
+		SessionManager:     phase1.sessionMgr,
+		GuideBus:           phase1.guideBus,
+		StreamManager:      phase1.streamMgr,
+		Guide:              phase3.guide,
+		Scope:              phase1.scope,
+		AuthRegistry:       phase1.authRegistry,
+		InterruptAllAgents: makeInterruptAllAgentsFn(phase3.activationCtrl, phase1.guideBus),
+		NerdFontsDetected:  phase2.fontRes.detected,
+		GitClient:          phase2.gitRes.client,
+		GitWatcher:         phase2.gitRes.watcher,
+		GitBus:             phase2.gitRes.bus,
+		SafetyGuard:        phase2.gitRes.guard,
+		SeedAgents:         phase4.seeds,
+		ModelSwap:          phase4.modelSwapper,
 		ModelSave: func(agentType, provider, modelID string) {
-			if err := modelStore.SetEntry(agentType, provider, modelID); err != nil {
+			if err := phase4.modelStore.SetEntry(agentType, provider, modelID); err != nil {
 				slog.Warn("agent model config: save", "agent", agentType, "provider", provider, "model", modelID, "error", err)
 			}
 		},
-		AgentModelStore: modelStore,
-		KnowledgeStore:  knowledgeStore,
+		AgentModelStore: phase4.modelStore,
+		KnowledgeStore:  phase1.knowledgeStore,
 	}
-
-	return deps, cleanup, nil
 }
 
 func makeInterruptAllAgentsFn(
@@ -1485,6 +1381,48 @@ func registerAgentCreators(
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
 // These are created lazily by the ActivationController when the Guide routes to them.
+type onDemandAgentCreatorDeps struct {
+	reg            *container.AgentCreatorRegistry
+	ids            *container.AgentIdentityRegistry
+	bus            guide.EventBus
+	actPub         events.ActivityPublisher
+	projectRoot    string
+	googleGw       *gateway.ProviderGateway
+	anthropicGw    *gateway.ProviderGateway
+	openaiGw       *gateway.ProviderGateway
+	authRegistry   *credentials.AuthRegistry
+	actCtrlRef     *atomic.Pointer[activation.ActivationController]
+	knowledgeStore *knowledge.KnowledgeStore
+	guardianRef    *atomic.Pointer[guardian.Guardian]
+	orchRef        *atomic.Pointer[orchestrator.Orchestrator]
+	quarantineRef  *atomic.Pointer[fetch.QuarantineBuffer]
+}
+
+func (d onDemandAgentCreatorDeps) sessionLookup(sessionID string) *versioning.SessionVFS {
+	if orch := d.orchRef.Load(); orch != nil {
+		return orch.GetSessionVFS(sessionID)
+	}
+	return nil
+}
+
+func (d onDemandAgentCreatorDeps) workspaceViews(defaultView versioning.WorkspaceView) *versioning.SessionWorkspaceViews {
+	return versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		DefaultView:   defaultView,
+		WorkingDir:    d.projectRoot,
+		SessionLookup: d.sessionLookup,
+		DiskFallback:  versioning.NewDiskFileAccess(d.projectRoot, true),
+	})
+}
+
+func (d onDemandAgentCreatorDeps) requestGuard(agentName string) func() func() {
+	if ac := d.actCtrlRef.Load(); ac != nil {
+		return func() func() {
+			return ac.AcquireRequestGuard(agentName)
+		}
+	}
+	return nil
+}
+
 func registerOnDemandAgentCreators(
 	reg *container.AgentCreatorRegistry,
 	ids *container.AgentIdentityRegistry,
@@ -1501,11 +1439,38 @@ func registerOnDemandAgentCreators(
 	orchRef *atomic.Pointer[orchestrator.Orchestrator],
 	quarantineRef *atomic.Pointer[fetch.QuarantineBuffer],
 ) {
-	// Librarian — codebase search specialist with LLM-driven conversation.
-	librarianID, _ := ids.Get("librarian")
-	reg.Register("librarian", func(ctx context.Context) (container.ContainerAgent, error) {
+	deps := onDemandAgentCreatorDeps{
+		reg:            reg,
+		ids:            ids,
+		bus:            bus,
+		actPub:         actPub,
+		projectRoot:    projectRoot,
+		googleGw:       googleGw,
+		anthropicGw:    anthropicGw,
+		openaiGw:       openaiGw,
+		authRegistry:   authRegistry,
+		actCtrlRef:     actCtrlRef,
+		knowledgeStore: knowledgeStore,
+		guardianRef:    guardianRef,
+		orchRef:        orchRef,
+		quarantineRef:  quarantineRef,
+	}
+	registerOnDemandKnowledgeAgentCreators(deps)
+	registerOnDemandQualityAgentCreators(deps)
+	registerOnDemandImplementationAgentCreators(deps)
+}
+
+func registerOnDemandKnowledgeAgentCreators(deps onDemandAgentCreatorDeps) {
+	registerLibrarianAgentCreator(deps)
+	registerArchivalistAgentCreator(deps)
+	registerAcademicAgentCreator(deps)
+}
+
+func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
+	librarianID, _ := deps.ids.Get("librarian")
+	deps.reg.Register("librarian", func(ctx context.Context) (container.ContainerAgent, error) {
 		model := librarian.DefaultLibrarianModel
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("librarian provider: %w", err)
 		}
@@ -1515,124 +1480,110 @@ func registerOnDemandAgentCreators(
 			EnableLLM:        true,
 			Model:            model,
 			AnthropicAPIKey:  providers.ResolveAnthropicAPIKey(""),
-			ActivityPub:      actPub,
-			WorkingDirectory: projectRoot,
+			ActivityPub:      deps.actPub,
+			WorkingDirectory: deps.projectRoot,
 		}
-		if ac := actCtrlRef.Load(); ac != nil {
-			libCfg.RequestGuard = func() func() {
-				return ac.AcquireRequestGuard("librarian")
-			}
+		if guard := deps.requestGuard("librarian"); guard != nil {
+			libCfg.RequestGuard = guard
 		}
 		l, err := librarian.New(libCfg, wrapped)
 		if err != nil {
 			return nil, err
 		}
-		l.SetProviderRefresher(buildProviderRefresher(authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
-		l.SetKnowledgeStore(knowledgeStore)
+		l.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
+		l.SetKnowledgeStore(deps.knowledgeStore)
 
-		// Create a SessionVFS for the librarian's clone store.
-		svfs := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+		svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
 			SessionID:  versioning.SessionID("librarian-" + librarianID),
-			WorkingDir: projectRoot,
+			WorkingDir: deps.projectRoot,
 		})
+		if err != nil {
+			return nil, err
+		}
 		l.SetSessionVFS(svfs)
 
-		if startErr := l.Start(bus); startErr != nil {
+		if startErr := l.Start(deps.bus); startErr != nil {
 			svfs.Close()
 			return nil, startErr
 		}
 		return l, nil
 	})
+}
 
-	// Archivalist — historical data, patterns, failures.
-	archivalistID, _ := ids.Get("archivalist")
-	reg.Register("archivalist", func(ctx context.Context) (container.ContainerAgent, error) {
+func registerArchivalistAgentCreator(deps onDemandAgentCreatorDeps) {
+	archivalistID, _ := deps.ids.Get("archivalist")
+	deps.reg.Register("archivalist", func(ctx context.Context) (container.ContainerAgent, error) {
 		model := archivalist.ModelSonnet45
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("archivalist provider: %w", err)
 		}
 
 		archCfg := archivalist.Config{
 			ID:                archivalistID,
-			ActivityPub:       actPub,
+			ActivityPub:       deps.actPub,
 			EnableHybridQuery: true,
 			EnableACTR:        true,
-			WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-				DefaultView: versioning.WorkspaceViewGlobal,
-				WorkingDir:  projectRoot,
-				SessionLookup: func(sessionID string) *versioning.SessionVFS {
-					if orch := orchRef.Load(); orch != nil {
-						return orch.GetSessionVFS(sessionID)
-					}
-					return nil
-				},
-				DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
-			}),
+			WorkspaceViews:    deps.workspaceViews(versioning.WorkspaceViewGlobal),
 		}
-		if ac := actCtrlRef.Load(); ac != nil {
-			archCfg.RequestGuard = func() func() {
-				return ac.AcquireRequestGuard("archivalist")
-			}
+		if guard := deps.requestGuard("archivalist"); guard != nil {
+			archCfg.RequestGuard = guard
 		}
 		a, err := archivalist.New(ctx, archCfg)
 		if err != nil {
 			return nil, err
 		}
 		a.SetProvider(wrapped)
-		a.SetKnowledgeStore(knowledgeStore)
-		if startErr := a.Start(bus); startErr != nil {
+		a.SetKnowledgeStore(deps.knowledgeStore)
+		if startErr := a.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return a, nil
 	})
+}
 
-	// Academic — research, academic papers, best practices.
-	academicID, _ := ids.Get("academic")
-	reg.Register("academic", func(ctx context.Context) (container.ContainerAgent, error) {
-		model := effectiveModelForCurrentAuth(authRegistry, academic.DefaultModel)
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
+func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
+	academicID, _ := deps.ids.Get("academic")
+	deps.reg.Register("academic", func(ctx context.Context) (container.ContainerAgent, error) {
+		model := effectiveModelForCurrentAuth(deps.authRegistry, academic.DefaultModel)
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("academic provider: %w", err)
 		}
 		acaCfg := academic.Config{
-			ID:          academicID,
-			Model:       model,
-			ActivityPub: actPub,
-			WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-				DefaultView: versioning.WorkspaceViewDisk,
-				WorkingDir:  projectRoot,
-				SessionLookup: func(sessionID string) *versioning.SessionVFS {
-					if orch := orchRef.Load(); orch != nil {
-						return orch.GetSessionVFS(sessionID)
-					}
-					return nil
-				},
-				DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
-			}),
+			ID:             academicID,
+			Model:          model,
+			ActivityPub:    deps.actPub,
+			WorkspaceViews: deps.workspaceViews(versioning.WorkspaceViewDisk),
 		}
-		if ac := actCtrlRef.Load(); ac != nil {
-			acaCfg.RequestGuard = func() func() {
-				return ac.AcquireRequestGuard("academic")
-			}
+		if guard := deps.requestGuard("academic"); guard != nil {
+			acaCfg.RequestGuard = guard
 		}
 		a, err := academic.New(acaCfg, wrapped)
 		if err != nil {
 			return nil, err
 		}
-		a.SetProviderRefresher(buildProviderRefresher(authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
-		a.SetFetchPipeline(buildAcademicFetchPipeline(projectRoot, guardianRef, quarantineRef))
-		if startErr := a.Start(bus); startErr != nil {
+		a.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
+		a.SetFetchPipeline(buildAcademicFetchPipeline(deps.projectRoot, deps.guardianRef, deps.quarantineRef))
+		if startErr := a.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return a, nil
 	})
+}
 
-	// Global Inspector — cross-file architectural quality auditor.
-	inspectorID, _ := ids.Get("inspector")
-	reg.Register("inspector", func(ctx context.Context) (container.ContainerAgent, error) {
+func registerOnDemandQualityAgentCreators(deps onDemandAgentCreatorDeps) {
+	registerGlobalInspectorAgentCreator(deps)
+	registerPipelineInspectorAgentCreator(deps)
+	registerGlobalTesterAgentCreator(deps)
+	registerPipelineTesterAgentCreator(deps)
+}
+
+func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
+	inspectorID, _ := deps.ids.Get("inspector")
+	deps.reg.Register("inspector", func(ctx context.Context) (container.ContainerAgent, error) {
 		model := "claude-opus-4-6"
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("global inspector provider: %w", err)
 		}
@@ -1642,41 +1593,27 @@ func registerOnDemandAgentCreators(
 		}
 		gi.SetFileAccess(versioning.NewSessionRoutingFileAccess(
 			true,
-			func(sessionID string) *versioning.SessionVFS {
-				if orch := orchRef.Load(); orch != nil {
-					return orch.GetSessionVFS(sessionID)
-				}
-				return nil
-			},
-			versioning.NewDiskFileAccess(projectRoot, true),
+			deps.sessionLookup,
+			versioning.NewDiskFileAccess(deps.projectRoot, true),
 		))
-		gi.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-			DefaultView: versioning.WorkspaceViewGlobal,
-			WorkingDir:  projectRoot,
-			SessionLookup: func(sessionID string) *versioning.SessionVFS {
-				if orch := orchRef.Load(); orch != nil {
-					return orch.GetSessionVFS(sessionID)
-				}
-				return nil
-			},
-			DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
-		}))
-		gi.SetProviderRefresher(buildProviderRefresher(authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation))
-		if startErr := gi.Start(bus); startErr != nil {
+		gi.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
+		gi.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
+		if startErr := gi.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return gi, nil
 	})
+}
 
-	// Pipeline Inspector — per-task quality validation.
-	pipelineInspectorID, _ := ids.Get("inspector-pipeline")
-	reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
+func registerPipelineInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
+	pipelineInspectorID, _ := deps.ids.Get("inspector-pipeline")
+	deps.reg.Register("inspector-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := pipelineInspectorID
 		if workerID := pipelineWorkerAgentID(ctx, "inspector-pipeline"); workerID != "" {
 			agentID = workerID
 		}
 		model := "claude-opus-4-6"
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline inspector provider: %w", err)
 		}
@@ -1684,22 +1621,20 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
-		pi.SetActivityPublisher(actPub)
-		if startErr := pi.Start(bus); startErr != nil {
+		pi.SetActivityPublisher(deps.actPub)
+		if startErr := pi.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return pi, nil
 	})
+}
 
-	// Global Tester — cross-pipeline SDET.
-	// Provider creation is best-effort: when the API key is missing the
-	// tester starts in degraded mode — static conversation replies still work,
-	// LLM-dependent paths return a clear error.
-	testerID, _ := ids.Get("tester")
-	reg.Register("tester", func(ctx context.Context) (container.ContainerAgent, error) {
-		model := effectiveModelForCurrentAuth(authRegistry, "gpt-5.4-pro")
+func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
+	testerID, _ := deps.ids.Get("tester")
+	deps.reg.Register("tester", func(ctx context.Context) (container.ContainerAgent, error) {
+		model := effectiveModelForCurrentAuth(deps.authRegistry, "gpt-5.4-pro")
 		var wrapped providers.Provider
-		if provider, provErr := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation); provErr != nil {
+		if provider, provErr := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation); provErr != nil {
 			slog.Warn("tester: provider unavailable, LLM features disabled", "error", provErr)
 		} else {
 			wrapped = provider
@@ -1710,41 +1645,27 @@ func registerOnDemandAgentCreators(
 		}
 		gt.SetFileAccess(versioning.NewSessionRoutingFileAccess(
 			false,
-			func(sessionID string) *versioning.SessionVFS {
-				if orch := orchRef.Load(); orch != nil {
-					return orch.GetSessionVFS(sessionID)
-				}
-				return nil
-			},
-			versioning.NewDiskFileAccess(projectRoot, false),
+			deps.sessionLookup,
+			versioning.NewDiskFileAccess(deps.projectRoot, false),
 		))
-		gt.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-			DefaultView: versioning.WorkspaceViewGlobal,
-			WorkingDir:  projectRoot,
-			SessionLookup: func(sessionID string) *versioning.SessionVFS {
-				if orch := orchRef.Load(); orch != nil {
-					return orch.GetSessionVFS(sessionID)
-				}
-				return nil
-			},
-			DiskFallback: versioning.NewDiskFileAccess(projectRoot, true),
-		}))
-		gt.SetProviderRefresher(buildProviderRefresher(authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation))
-		if startErr := gt.Start(bus); startErr != nil {
+		gt.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
+		gt.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
+		if startErr := gt.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return gt, nil
 	})
+}
 
-	// Pipeline Tester — per-task QE.
-	pipelineTesterID, _ := ids.Get("tester-pipeline")
-	reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
+func registerPipelineTesterAgentCreator(deps onDemandAgentCreatorDeps) {
+	pipelineTesterID, _ := deps.ids.Get("tester-pipeline")
+	deps.reg.Register("tester-pipeline", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := pipelineTesterID
 		if workerID := pipelineWorkerAgentID(ctx, "tester-pipeline"); workerID != "" {
 			agentID = workerID
 		}
-		model := effectiveModelForCurrentAuth(authRegistry, "gpt-5.4-pro")
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityValidation)
+		model := effectiveModelForCurrentAuth(deps.authRegistry, "gpt-5.4-pro")
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline tester provider: %w", err)
 		}
@@ -1752,67 +1673,70 @@ func registerOnDemandAgentCreators(
 		if err != nil {
 			return nil, err
 		}
-		pt.SetActivityPublisher(actPub)
-		if startErr := pt.Start(bus); startErr != nil {
+		pt.SetActivityPublisher(deps.actPub)
+		if startErr := pt.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return pt, nil
 	})
+}
 
-	// Engineer — code implementation.
-	engineerID, _ := ids.Get("engineer")
-	reg.Register("engineer", func(ctx context.Context) (container.ContainerAgent, error) {
+func registerOnDemandImplementationAgentCreators(deps onDemandAgentCreatorDeps) {
+	registerEngineerAgentCreator(deps)
+	registerDesignerAgentCreator(deps)
+}
+
+func registerEngineerAgentCreator(deps onDemandAgentCreatorDeps) {
+	engineerID, _ := deps.ids.Get("engineer")
+	deps.reg.Register("engineer", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := engineerID
 		if workerID := pipelineWorkerAgentID(ctx, "engineer"); workerID != "" {
 			agentID = workerID
 		}
-		model := effectiveModelForCurrentAuth(authRegistry, "gpt-5.4-pro")
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
+		model := effectiveModelForCurrentAuth(deps.authRegistry, "gpt-5.4-pro")
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("engineer provider: %w", err)
 		}
-		engCfg := engineer.Config{ID: agentID, ActivityPub: actPub}
+		engCfg := engineer.Config{ID: agentID, ActivityPub: deps.actPub}
 		engCfg.EngineerConfig.Model = model
-		if ac := actCtrlRef.Load(); ac != nil {
-			engCfg.RequestGuard = func() func() {
-				return ac.AcquireRequestGuard("engineer")
-			}
+		if guard := deps.requestGuard("engineer"); guard != nil {
+			engCfg.RequestGuard = guard
 		}
 		e, err := engineer.New(engCfg, wrapped)
 		if err != nil {
 			return nil, err
 		}
-		e.SetProviderRefresher(buildProviderRefresher(authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
-		if startErr := e.Start(bus); startErr != nil {
+		e.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
+		if startErr := e.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return e, nil
 	})
+}
 
-	// Designer — LLM-driven design implementation.
-	designerID, _ := ids.Get("designer")
-	reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
+func registerDesignerAgentCreator(deps onDemandAgentCreatorDeps) {
+	designerID, _ := deps.ids.Get("designer")
+	deps.reg.Register("designer", func(ctx context.Context) (container.ContainerAgent, error) {
 		agentID := designerID
 		if workerID := pipelineWorkerAgentID(ctx, "designer"); workerID != "" {
 			agentID = workerID
 		}
 		model := string(providers.Gemini31Pro)
-		wrapped, err := createSwapProvider(ctx, model, authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution)
+		wrapped, err := createSwapProvider(ctx, model, deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution)
 		if err != nil {
 			return nil, fmt.Errorf("designer provider: %w", err)
 		}
-		desCfg := designer.Config{ID: agentID, ActivityPub: actPub}
-		if ac := actCtrlRef.Load(); ac != nil {
-			desCfg.RequestGuard = func() func() {
-				return ac.AcquireRequestGuard("designer")
-			}
+		desCfg := designer.Config{ID: agentID, ActivityPub: deps.actPub}
+		if guard := deps.requestGuard("designer"); guard != nil {
+			desCfg.RequestGuard = guard
 		}
 		d, err := designer.New(desCfg, wrapped)
 		if err != nil {
 			return nil, err
 		}
-		d.SetProviderRefresher(buildProviderRefresher(authRegistry, googleGw, anthropicGw, openaiGw, gateway.PriorityExecution))
-		if startErr := d.Start(bus); startErr != nil {
+		d.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
+		if startErr := d.Start(deps.bus); startErr != nil {
 			return nil, startErr
 		}
 		return d, nil

@@ -22,6 +22,7 @@ type SessionVFS struct {
 	diskFlusher *DiskFlusher
 	vfsManager  VFSManager
 	otEngine    OTEngine
+	draftMu     *sync.Mutex
 
 	// Legacy CVS shim for backward compatibility during transition.
 	cvsShim *CVSShim
@@ -71,13 +72,17 @@ type sessionPipeline struct {
 type SessionVFSConfig struct {
 	SessionID   SessionID
 	WorkingDir  string
-	StorageRoot string // Deprecated: live SessionVFS state is in-memory.
+	StorageRoot string
 }
 
 // NewSessionVFS creates an isolated set of versioning subsystems for a session.
-func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
+func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 	otEngine := NewOTEngine()
-	vwal := NewMemoryVersionedWAL()
+	vwal, err := openSessionSemanticWAL(cfg)
+	if err != nil {
+		return nil, err
+	}
+	draftMu := &sync.Mutex{}
 
 	// Create global VFS overlay (no version/blob store needed).
 	globalVFS := NewGlobalVFS(VFSConfig{
@@ -91,6 +96,7 @@ func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
 		GlobalVFS: globalVFS,
 		WAL:       vwal,
 		OTEngine:  otEngine,
+		DraftMu:   draftMu,
 	})
 
 	// Create DiskFlusher wired to global VFS + WAL.
@@ -98,6 +104,7 @@ func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
 		GlobalVFS:  globalVFS,
 		WAL:        vwal,
 		WorkingDir: cfg.WorkingDir,
+		DraftMu:    draftMu,
 	})
 
 	// Legacy stores for CVS shim backward compatibility.
@@ -135,6 +142,7 @@ func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
 		diskFlusher: df,
 		vfsManager:  vfsMgr,
 		otEngine:    otEngine,
+		draftMu:     draftMu,
 		cvs:         cvs,
 		blobStore:   blobStore,
 		dagStore:    dagStore,
@@ -144,7 +152,7 @@ func NewSessionVFS(cfg SessionVFSConfig) *SessionVFS {
 	}
 
 	s.cvsShim = NewCVSShim(s)
-	return s
+	return s, nil
 }
 
 // BeginPipeline creates a new pipeline VFS and registers it with the MergePipe.
@@ -232,6 +240,8 @@ func (s *SessionVFS) CommitPipeline(ctx context.Context, pipelineID string) (Sem
 			pipe.State = sessionPipelineFailed
 			pipe.LastError = mergeErr
 		}
+		_ = s.vfsManager.ClosePipelineVFS(pipelineID)
+		delete(s.pipelines, pipelineID)
 		s.mu.Unlock()
 		return SemanticVersion{}, fmt.Errorf("session vfs: merge pipeline: %w", mergeErr)
 	}
@@ -244,6 +254,14 @@ func (s *SessionVFS) CommitPipeline(ctx context.Context, pipelineID string) (Sem
 	delete(s.pipelines, pipelineID)
 	s.mu.Unlock()
 	return ver, nil
+}
+
+// HasPipeline reports whether a task/pipeline draft is currently tracked.
+func (s *SessionVFS) HasPipeline(pipelineID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pipe := s.pipelines[pipelineID]
+	return pipe != nil && pipe.VFS != nil
 }
 
 func (s *SessionVFS) extractPipelineMods(pipelineID string) ([]FileModification, error) {
@@ -274,6 +292,15 @@ func (s *SessionVFS) RollbackPipeline(pipelineID string) error {
 	err := s.vfsManager.ClosePipelineVFS(pipelineID)
 	delete(s.pipelines, pipelineID)
 	return err
+}
+
+// RollbackPipelineIfTracked rolls back and cleans up a tracked pipeline draft
+// when present, returning whether a draft existed.
+func (s *SessionVFS) RollbackPipelineIfTracked(pipelineID string) (bool, error) {
+	if !s.HasPipeline(pipelineID) {
+		return false, nil
+	}
+	return true, s.RollbackPipeline(pipelineID)
 }
 
 // GlobalVFS returns the session-scoped global VFS overlay.
@@ -339,7 +366,7 @@ func (s *SessionVFS) NewGlobalFileAccess(readOnly bool) FileAccess {
 	if readOnly {
 		return NewReadOnlyVFSFileAccess(s.globalVFS, s.workingDir)
 	}
-	return NewVFSFileAccess(s.globalVFS, s.workingDir)
+	return NewGlobalDraftFileAccess(s)
 }
 
 // NewPipelineFileAccess creates a VFSFileAccess backed by a per-pipeline VFS.

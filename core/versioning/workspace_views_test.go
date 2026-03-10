@@ -13,10 +13,13 @@ func TestSessionWorkspaceViews_ReadAcrossDiskGlobalAndPipeline(t *testing.T) {
 		t.Fatalf("seed disk: %v", err)
 	}
 
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "sess-1",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	ctx := WithSessionID(context.Background(), "sess-1")
@@ -74,10 +77,13 @@ func TestSessionWorkspaceViews_InspectPathShowsLayerDifferences(t *testing.T) {
 	if err := NewDiskFileAccess(dir, false).WriteFile(context.Background(), "hello.txt", []byte("disk")); err != nil {
 		t.Fatalf("seed disk: %v", err)
 	}
-	svfs := NewSessionVFS(SessionVFSConfig{
+	svfs, err := NewSessionVFS(SessionVFSConfig{
 		SessionID:  "sess-1",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	ctx := WithSessionID(context.Background(), "sess-1")

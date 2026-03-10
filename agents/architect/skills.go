@@ -181,241 +181,6 @@ type planInput struct {
 }
 
 func planSkill(a *Architect) *skills.Skill {
-	type handler = func(context.Context, *planInput) (any, error)
-	dispatch := map[string]handler{
-		"analyze": func(ctx context.Context, p *planInput) (any, error) {
-			if strings.TrimSpace(p.Query) == "" {
-				return nil, fmt.Errorf("query is required for action=analyze")
-			}
-			if plan, ok := a.resolveProtocolPlan(p.PlanID); ok &&
-				hasReachedPlanPhase(plan.SM().State(), PlanStatusAnalyzing) &&
-				plan.Requirements != nil {
-				return map[string]any{
-					"requirements": plan.Requirements,
-					"analysis": map[string]any{
-						"goal_count":       len(plan.Requirements.Goals),
-						"constraint_count": len(plan.Requirements.Constraints),
-						"scope":            plan.Requirements.Scope,
-					},
-					"plan_status": plan.SM().State().String(),
-					"reused":      true,
-				}, nil
-			}
-			reqParams := map[string]any{}
-			if p.Scope != "" {
-				reqParams["scope"] = p.Scope
-			}
-			if len(p.Goals) > 0 {
-				reqParams["goals"] = p.Goals
-			}
-			if len(p.Constraints) > 0 {
-				reqParams["constraints"] = p.Constraints
-			}
-			requirements, err := a.analyzeRequirements(ctx, p.Query, reqParams)
-			if err != nil {
-				return nil, err
-			}
-			result := map[string]any{
-				"requirements": requirements,
-				"analysis": map[string]any{
-					"goal_count":       len(requirements.Goals),
-					"constraint_count": len(requirements.Constraints),
-					"scope":            requirements.Scope,
-				},
-			}
-			if plan, ok := a.resolveProtocolPlan(p.PlanID); ok {
-				if err := a.advancePlan(ctx, plan, PlanStatusAnalyzing, func() {
-					plan.Requirements = requirements
-				}); err != nil {
-					return nil, err
-				}
-				result["plan_status"] = plan.SM().State().String()
-			}
-			return result, nil
-		},
-		"design": func(ctx context.Context, p *planInput) (any, error) {
-			plan, hasPlan := a.resolveProtocolPlan(p.PlanID)
-			requirements := p.Requirements
-			var codebasePatterns *CodebasePatterns
-			if hasPlan {
-				if hasReachedPlanPhase(plan.SM().State(), PlanStatusDesigning) &&
-					plan.Architecture != nil {
-					return map[string]any{
-						"architecture": plan.Architecture,
-						"summary": map[string]any{
-							"component_count": len(plan.Architecture.Components),
-							"interface_count": len(plan.Architecture.Interfaces),
-							"pattern_count":   len(plan.Architecture.Patterns),
-						},
-						"plan_status": plan.SM().State().String(),
-						"reused":      true,
-					}, nil
-				}
-				// In protocol mode, use the plan's accumulated state.
-				requirements = plan.Requirements
-				codebasePatterns = plan.CodebasePatterns
-			}
-			if requirements == nil {
-				return nil, fmt.Errorf("requirements is required for action=design")
-			}
-			if codebasePatterns == nil && len(p.Patterns) > 0 {
-				codebasePatterns = &CodebasePatterns{
-					Patterns: make([]PatternInfo, len(p.Patterns)),
-				}
-				for i, pat := range p.Patterns {
-					codebasePatterns.Patterns[i] = PatternInfo{Name: pat}
-				}
-			}
-			architecture, err := a.designArchitecture(ctx, requirements, codebasePatterns)
-			if err != nil {
-				return nil, err
-			}
-			result := map[string]any{
-				"architecture": architecture,
-				"summary": map[string]any{
-					"component_count": len(architecture.Components),
-					"interface_count": len(architecture.Interfaces),
-					"pattern_count":   len(architecture.Patterns),
-				},
-			}
-			if hasPlan {
-				if err := a.advancePlan(ctx, plan, PlanStatusDesigning, func() {
-					plan.Architecture = architecture
-				}); err != nil {
-					return nil, err
-				}
-				result["plan_status"] = plan.SM().State().String()
-			}
-			return result, nil
-		},
-		"generate_tasks": func(ctx context.Context, p *planInput) (any, error) {
-			plan, hasPlan := a.resolveProtocolPlan(p.PlanID)
-			architecture := p.Architecture
-			constraints := &PlanConstraints{
-				MaxTasksPerAgent: p.MaxTasksPerAgent,
-				AllowParallel:    p.AllowParallel,
-			}
-			if hasPlan {
-				if hasReachedPlanPhase(plan.SM().State(), PlanStatusGenerating) &&
-					len(plan.Tasks) > 0 && plan.Workflow != nil {
-					totalTokens := 0
-					complexityCounts := map[string]int{}
-					for _, task := range plan.Tasks {
-						totalTokens += task.EstimatedTokens
-						complexityCounts[task.Complexity.String()]++
-					}
-					return map[string]any{
-						"tasks": plan.Tasks,
-						"summary": map[string]any{
-							"task_count":        len(plan.Tasks),
-							"total_tokens":      totalTokens,
-							"complexity_counts": complexityCounts,
-						},
-						"plan_status":  plan.SM().State().String(),
-						"layer_count":  planLayerCount(plan),
-						"task_summary": firstTaskName(plan),
-						"next_action":  generateTasksNextAction(a.config.AutoApprove),
-						"reused":       true,
-					}, nil
-				}
-				architecture = plan.Architecture
-				if plan.Constraints != nil {
-					constraints = plan.Constraints
-				}
-			}
-			if architecture == nil {
-				return nil, fmt.Errorf("architecture is required for action=generate_tasks")
-			}
-			if constraints.MaxTasksPerAgent == 0 {
-				constraints.MaxTasksPerAgent = 5
-			}
-			tasks, err := a.generateAtomicTasks(ctx, architecture, constraints)
-			if err != nil {
-				return nil, err
-			}
-			totalTokens := 0
-			complexityCounts := map[string]int{}
-			for _, task := range tasks {
-				totalTokens += task.EstimatedTokens
-				complexityCounts[task.Complexity.String()]++
-			}
-			result := map[string]any{
-				"tasks": tasks,
-				"summary": map[string]any{
-					"task_count":        len(tasks),
-					"total_tokens":      totalTokens,
-					"complexity_counts": complexityCounts,
-				},
-			}
-			if hasPlan {
-				// Generating → attach tasks
-				if err := a.advancePlan(ctx, plan, PlanStatusGenerating, func() {
-					plan.Tasks = tasks
-				}); err != nil {
-					return nil, err
-				}
-				// Auto-chain: workflow DAG
-				workflow, wErr := a.createWorkflowDAG(ctx, plan.Tasks)
-				if wErr != nil {
-					return nil, wErr
-				}
-				if err := a.advancePlan(ctx, plan, PlanStatusOrchestrating, func() {
-					plan.Workflow = workflow
-				}); err != nil {
-					return nil, err
-				}
-				// Auto-chain: validate + declaration
-				if vErr := validatePlanForExecution(plan); vErr != nil {
-					return nil, vErr
-				}
-				declaration := buildAutoDeclaration(plan)
-				if dErr := a.validateDeclaration(declaration); dErr != nil {
-					plan.RiskSummary = append(plan.RiskSummary, "declaration validation warning: "+dErr.Error())
-				}
-				plan.Declarations = append(plan.Declarations, declaration)
-				a.publishDeclaration(declaration, plan.SessionID)
-				// Transition to Ready
-				if err := a.advancePlan(ctx, plan, PlanStatusReady, nil); err != nil {
-					return nil, err
-				}
-				// Grant ready lease
-				if lm := a.planStore.LeaseManager(); lm != nil {
-					lm.GrantReadyLease(plan)
-				}
-				a.publishPlanSnapshot(ctx, plan)
-				layers := planLayerCount(plan)
-				result["plan_status"] = plan.SM().State().String()
-				result["layer_count"] = layers
-				result["task_summary"] = firstTaskName(plan)
-				result["next_action"] = generateTasksNextAction(a.config.AutoApprove)
-			}
-			return result, nil
-		},
-		"estimate": func(_ context.Context, p *planInput) (any, error) {
-			if strings.TrimSpace(p.Description) == "" {
-				return nil, fmt.Errorf("description is required for action=estimate")
-			}
-			estimate := estimateTaskComplexity(p.Description, p.Context)
-			return map[string]any{"estimate": estimate}, nil
-		},
-		"revise": func(_ context.Context, p *planInput) (any, error) {
-			if strings.TrimSpace(p.Reason) == "" {
-				return nil, fmt.Errorf("reason is required for action=revise")
-			}
-			plan, err := a.selectPlan(p.PlanID)
-			if err != nil {
-				return nil, err
-			}
-			updated := a.applyPlanRevision(plan, p.Reason, p.Updates)
-			return map[string]any{
-				"plan_id":  updated.ID,
-				"revision": updated.Revision,
-				"status":   updated.Status.String(),
-				"updated":  updated.UpdatedAt,
-			}, nil
-		},
-	}
-
 	return skills.NewSkill("plan").
 		Description("Plan operations for analyzing requirements, designing architecture, generating tasks, estimating complexity, and revising plans.\n\n"+
 			"Actions:\n"+
@@ -479,13 +244,247 @@ func planSkill(a *Architect) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			fn, ok := dispatch[params.Action]
+			fn, ok := planSkillHandlers[params.Action]
 			if !ok {
 				return nil, fmt.Errorf("unknown plan action: %q", params.Action)
 			}
-			return fn(ctx, &params)
+			return fn(a, ctx, &params)
 		}).
 		Build()
+}
+
+type planSkillHandler func(*Architect, context.Context, *planInput) (any, error)
+
+var planSkillHandlers = map[string]planSkillHandler{
+	"analyze":        handlePlanSkillAnalyze,
+	"design":         handlePlanSkillDesign,
+	"generate_tasks": handlePlanSkillGenerateTasks,
+	"estimate":       handlePlanSkillEstimate,
+	"revise":         handlePlanSkillRevise,
+}
+
+func handlePlanSkillAnalyze(a *Architect, ctx context.Context, p *planInput) (any, error) {
+	if strings.TrimSpace(p.Query) == "" {
+		return nil, fmt.Errorf("query is required for action=analyze")
+	}
+	if plan, ok := a.resolveProtocolPlan(p.PlanID); ok &&
+		hasReachedPlanPhase(plan.SM().State(), PlanStatusAnalyzing) &&
+		plan.Requirements != nil {
+		return map[string]any{
+			"requirements": plan.Requirements,
+			"analysis":     requirementsAnalysisSummary(plan.Requirements),
+			"plan_status":  plan.SM().State().String(),
+			"reused":       true,
+		}, nil
+	}
+	reqParams := map[string]any{}
+	if p.Scope != "" {
+		reqParams["scope"] = p.Scope
+	}
+	if len(p.Goals) > 0 {
+		reqParams["goals"] = p.Goals
+	}
+	if len(p.Constraints) > 0 {
+		reqParams["constraints"] = p.Constraints
+	}
+	requirements, err := a.analyzeRequirements(ctx, p.Query, reqParams)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{
+		"requirements": requirements,
+		"analysis":     requirementsAnalysisSummary(requirements),
+	}
+	if plan, ok := a.resolveProtocolPlan(p.PlanID); ok {
+		if err := a.advancePlan(ctx, plan, PlanStatusAnalyzing, func() {
+			plan.Requirements = requirements
+		}); err != nil {
+			return nil, err
+		}
+		result["plan_status"] = plan.SM().State().String()
+	}
+	return result, nil
+}
+
+func handlePlanSkillDesign(a *Architect, ctx context.Context, p *planInput) (any, error) {
+	plan, hasPlan := a.resolveProtocolPlan(p.PlanID)
+	requirements := p.Requirements
+	var codebasePatterns *CodebasePatterns
+	if hasPlan {
+		if hasReachedPlanPhase(plan.SM().State(), PlanStatusDesigning) &&
+			plan.Architecture != nil {
+			return map[string]any{
+				"architecture": plan.Architecture,
+				"summary":      architectureSummary(plan.Architecture),
+				"plan_status":  plan.SM().State().String(),
+				"reused":       true,
+			}, nil
+		}
+		requirements = plan.Requirements
+		codebasePatterns = plan.CodebasePatterns
+	}
+	if requirements == nil {
+		return nil, fmt.Errorf("requirements is required for action=design")
+	}
+	if codebasePatterns == nil && len(p.Patterns) > 0 {
+		codebasePatterns = &CodebasePatterns{
+			Patterns: make([]PatternInfo, len(p.Patterns)),
+		}
+		for i, pat := range p.Patterns {
+			codebasePatterns.Patterns[i] = PatternInfo{Name: pat}
+		}
+	}
+	architecture, err := a.designArchitecture(ctx, requirements, codebasePatterns)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{
+		"architecture": architecture,
+		"summary":      architectureSummary(architecture),
+	}
+	if hasPlan {
+		if err := a.advancePlan(ctx, plan, PlanStatusDesigning, func() {
+			plan.Architecture = architecture
+		}); err != nil {
+			return nil, err
+		}
+		result["plan_status"] = plan.SM().State().String()
+	}
+	return result, nil
+}
+
+func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInput) (any, error) {
+	plan, hasPlan := a.resolveProtocolPlan(p.PlanID)
+	architecture := p.Architecture
+	constraints := &PlanConstraints{
+		MaxTasksPerAgent: p.MaxTasksPerAgent,
+		AllowParallel:    p.AllowParallel,
+	}
+	if hasPlan {
+		if hasReachedPlanPhase(plan.SM().State(), PlanStatusGenerating) &&
+			len(plan.Tasks) > 0 && plan.Workflow != nil {
+			return map[string]any{
+				"tasks":        plan.Tasks,
+				"summary":      taskGenerationSummary(plan.Tasks),
+				"plan_status":  plan.SM().State().String(),
+				"layer_count":  planLayerCount(plan),
+				"task_summary": firstTaskName(plan),
+				"next_action":  generateTasksNextAction(a.config.AutoApprove),
+				"reused":       true,
+			}, nil
+		}
+		architecture = plan.Architecture
+		if plan.Constraints != nil {
+			constraints = plan.Constraints
+		}
+	}
+	if architecture == nil {
+		return nil, fmt.Errorf("architecture is required for action=generate_tasks")
+	}
+	if constraints.MaxTasksPerAgent == 0 {
+		constraints.MaxTasksPerAgent = 5
+	}
+	tasks, err := a.generateAtomicTasks(ctx, architecture, constraints)
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]any{
+		"tasks":   tasks,
+		"summary": taskGenerationSummary(tasks),
+	}
+	if !hasPlan {
+		return result, nil
+	}
+	if err := a.advancePlan(ctx, plan, PlanStatusGenerating, func() {
+		plan.Tasks = tasks
+	}); err != nil {
+		return nil, err
+	}
+	workflow, wErr := a.createWorkflowDAG(ctx, plan.Tasks)
+	if wErr != nil {
+		return nil, wErr
+	}
+	if err := a.advancePlan(ctx, plan, PlanStatusOrchestrating, func() {
+		plan.Workflow = workflow
+	}); err != nil {
+		return nil, err
+	}
+	if vErr := validatePlanForExecution(plan); vErr != nil {
+		return nil, vErr
+	}
+	declaration := buildAutoDeclaration(plan)
+	if dErr := a.validateDeclaration(declaration); dErr != nil {
+		plan.RiskSummary = append(plan.RiskSummary, "declaration validation warning: "+dErr.Error())
+	}
+	plan.Declarations = append(plan.Declarations, declaration)
+	a.publishDeclaration(declaration, plan.SessionID)
+	if err := a.advancePlan(ctx, plan, PlanStatusReady, nil); err != nil {
+		return nil, err
+	}
+	if lm := a.planStore.LeaseManager(); lm != nil {
+		lm.GrantReadyLease(plan)
+	}
+	a.publishPlanSnapshot(ctx, plan)
+	result["plan_status"] = plan.SM().State().String()
+	result["layer_count"] = planLayerCount(plan)
+	result["task_summary"] = firstTaskName(plan)
+	result["next_action"] = generateTasksNextAction(a.config.AutoApprove)
+	return result, nil
+}
+
+func handlePlanSkillEstimate(_ *Architect, _ context.Context, p *planInput) (any, error) {
+	if strings.TrimSpace(p.Description) == "" {
+		return nil, fmt.Errorf("description is required for action=estimate")
+	}
+	estimate := estimateTaskComplexity(p.Description, p.Context)
+	return map[string]any{"estimate": estimate}, nil
+}
+
+func handlePlanSkillRevise(a *Architect, _ context.Context, p *planInput) (any, error) {
+	if strings.TrimSpace(p.Reason) == "" {
+		return nil, fmt.Errorf("reason is required for action=revise")
+	}
+	plan, err := a.selectPlan(p.PlanID)
+	if err != nil {
+		return nil, err
+	}
+	updated := a.applyPlanRevision(plan, p.Reason, p.Updates)
+	return map[string]any{
+		"plan_id":  updated.ID,
+		"revision": updated.Revision,
+		"status":   updated.Status.String(),
+		"updated":  updated.UpdatedAt,
+	}, nil
+}
+
+func requirementsAnalysisSummary(requirements *Requirements) map[string]any {
+	return map[string]any{
+		"goal_count":       len(requirements.Goals),
+		"constraint_count": len(requirements.Constraints),
+		"scope":            requirements.Scope,
+	}
+}
+
+func architectureSummary(architecture *SolutionArchitecture) map[string]any {
+	return map[string]any{
+		"component_count": len(architecture.Components),
+		"interface_count": len(architecture.Interfaces),
+		"pattern_count":   len(architecture.Patterns),
+	}
+}
+
+func taskGenerationSummary(tasks []*AtomicTask) map[string]any {
+	totalTokens := 0
+	complexityCounts := map[string]int{}
+	for _, task := range tasks {
+		totalTokens += task.EstimatedTokens
+		complexityCounts[task.Complexity.String()]++
+	}
+	return map[string]any{
+		"task_count":        len(tasks),
+		"total_tokens":      totalTokens,
+		"complexity_counts": complexityCounts,
+	}
 }
 
 // ---------------------------------------------------------------------------

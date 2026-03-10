@@ -35,20 +35,21 @@ type ACKResult struct {
 // When the pod is nil, the dispatcher falls back to EnsurePodActive on the
 // activator (best-effort activation without demotion guards).
 type BusNodeDispatcher struct {
-	bus          guide.EventBus
-	agentID      string
-	sessionID    string
-	dagID        string
-	buffers      *BufferRegistry
-	activator    guide.PodActivator // fallback when pod is nil
-	pod          *shared.AgentPod   // per-node guard lifecycle manager
-	podResolver  func(*dag.Node) *shared.AgentPod
-	ackTimeout   time.Duration
-	pending      sync.Map // nodeID → chan *dag.NodeResult
-	dispatchDone sync.Map // nodeID → chan struct{}
-	ackResults   sync.Map // nodeID → *ACKResult
-	ackWaiters   sync.Map // nodeID → chan *ACKResult
-	nodePods     sync.Map // nodeID → *shared.AgentPod
+	bus                guide.EventBus
+	agentID            string
+	sessionID          string
+	dagID              string
+	buffers            *BufferRegistry
+	activator          guide.PodActivator // fallback when pod is nil
+	pod                *shared.AgentPod   // per-node guard lifecycle manager
+	podResolver        func(*dag.Node) *shared.AgentPod
+	ackTimeout         time.Duration
+	pending            sync.Map // nodeID → chan *dag.NodeResult
+	dispatchDone       sync.Map // nodeID → chan struct{}
+	ackResults         sync.Map // nodeID → *ACKResult
+	ackWaiters         sync.Map // nodeID → chan *ACKResult
+	nodePods           sync.Map // nodeID → *shared.AgentPod
+	waitDispatchPermit func(context.Context, string, string) error
 
 	// onACK is called when an agent ACKs a node dispatch. Optional.
 	onACK func(nodeID string, ack *ACKResult)
@@ -79,6 +80,12 @@ func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, 
 // SetACKTimeout overrides the default ACK timeout.
 func (d *BusNodeDispatcher) SetACKTimeout(timeout time.Duration) {
 	d.ackTimeout = timeout
+}
+
+// SetDispatchPermitWaiter installs a callback that may block before new node
+// dispatches are published. Used to enforce orchestrator execution holds.
+func (d *BusNodeDispatcher) SetDispatchPermitWaiter(fn func(context.Context, string, string) error) {
+	d.waitDispatchPermit = fn
 }
 
 // SetACKCallback registers a function called on every successful ACK.
@@ -125,6 +132,12 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	// Activate target agent if demoted/cold.
 	if err := d.activateAgents(ctx, node); err != nil {
 		return nil, err
+	}
+
+	if d.waitDispatchPermit != nil {
+		if err := d.waitDispatchPermit(ctx, d.sessionID, d.dagID); err != nil {
+			return nil, err
+		}
 	}
 
 	// Build and publish dispatch message with ACK topic.

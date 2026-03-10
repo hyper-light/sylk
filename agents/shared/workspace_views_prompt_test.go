@@ -14,10 +14,13 @@ func TestBuildTaskWorkspaceRuntimeContext_IncludesSummarySections(t *testing.T) 
 	if err := versioning.NewDiskFileAccess(dir, false).WriteFile(context.Background(), "hello.txt", []byte("disk")); err != nil {
 		t.Fatalf("seed disk: %v", err)
 	}
-	svfs := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
 		SessionID:  "sess-1",
 		WorkingDir: dir,
 	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
 	defer svfs.Close()
 
 	ctx := versioning.WithSessionID(context.Background(), "sess-1")

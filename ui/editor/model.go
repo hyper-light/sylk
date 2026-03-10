@@ -71,12 +71,12 @@ type Model struct {
 	modified bool
 
 	// Viewport.
-	scrollOffset      int
-	scrollLeftCol     int // horizontal scroll offset in display columns
-	bounceOffset      int
-	lastScrollCursor  int // cursor Pos at last adjustScroll; enables free scroll in multi-cursor
-	width         int
-	height        int
+	scrollOffset     int
+	scrollLeftCol    int // horizontal scroll offset in display columns
+	bounceOffset     int
+	lastScrollCursor int // cursor Pos at last adjustScroll; enables free scroll in multi-cursor
+	width            int
+	height           int
 
 	// LSP diagnostics for the current file.
 	diagnostics []lsp.Diagnostic
@@ -321,7 +321,7 @@ func (m *Model) ViewContent(cursorVisible bool) string {
 		m.vc.multiCursor = !m.state.Cursors.IsSingle()
 		m.vc.valid = true
 		m.vc.cursorOK = true
-		m.vc.postValid = false    // Force full post-processing.
+		m.vc.postValid = false     // Force full post-processing.
 		m.vc.cursorWidthOK = false // Invalidate cached cursor line width.
 	} else if !m.vc.cursorOK {
 		if m.vc.multiCursor {
@@ -2900,185 +2900,233 @@ func (m *Model) ViewDirty() bool { return !m.vc.valid || !m.vc.cursorOK }
 
 func handleKeyMsg(m *Model, incoming tea.Msg) (component.Component, tea.Cmd) {
 	key := incoming.(tea.KeyMsg)
+	if cmd, handled := m.handleKeyInterception(key); handled {
+		return m, cmd
+	}
+	return m, m.handleDispatchedKey(key)
+}
 
-	// Hover interaction: scroll with j/k, go-to-definition with Enter,
-	// dismiss with Esc or any other key.
+func (m *Model) handleKeyInterception(key tea.KeyMsg) (tea.Cmd, bool) {
 	if m.hoverActive {
 		if cmd, handled := m.handleHoverKey(key); handled {
-			return m, cmd
+			return cmd, true
 		}
 	}
-
-	// Completion popup key interception in insert mode.
-	if m.completionEngine.Active() && m.currentMode == mode.ModeInsert {
-		switch key.Type {
-		case tea.KeyTab, tea.KeyEnter:
-			m.acceptCompletion()
-			m.syncStatusLine()
-			return m, nil
-		case tea.KeyEsc:
-			m.completionEngine.Dismiss()
-			m.syncStatusLine()
-			return m, nil
-		case tea.KeyCtrlN, tea.KeyDown:
-			m.completionEngine.Next()
-			return m, nil
-		case tea.KeyCtrlP, tea.KeyUp:
-			m.completionEngine.Prev()
-			return m, nil
-		}
-		// All other keys fall through to normal insert mode dispatch,
-		// then retrigger completion after the buffer edit.
+	if cmd, handled := m.handleCompletionPopupKey(key); handled {
+		return cmd, true
 	}
-
-	// Replace/find bar key interception — all keys go to the active bar.
 	if m.replaceActive {
-		return m.handleReplaceBarKey(key)
+		_, cmd := m.handleReplaceBarKey(key)
+		return cmd, true
 	}
 	if m.findActive {
-		return m.handleFindKey(key)
+		_, cmd := m.handleFindKey(key)
+		return cmd, true
 	}
-
-	// Delete/backspace with active selection: delete the selected range
-	// before clearing the selection or dispatching the key.
 	if m.HasSelection() && (key.Type == tea.KeyBackspace || key.Type == tea.KeyDelete) {
 		m.deleteSelection()
-		return m, nil
+		return nil, true
 	}
-
-	// Shift+arrow: enter or extend visual-char selection.
-	// Left/right use simple increment to allow crossing line boundaries
-	// (standard text editor behaviour); up/down use line-based motions.
 	if isShiftArrow(key) {
-		anchor := m.state.Cursor
-		switch key.String() {
-		case "shift+right":
-			m.state.Cursor = min(m.state.Cursor+1, m.buf.Length())
-		case "shift+left":
-			m.state.Cursor = max(m.state.Cursor-1, 0)
-		default:
-			mr := motion.ExecuteMotion(shiftArrowMotion(key), m.state.Buffer, m.state.LineIndex, m.state.Cursor, 1)
-			m.state.Cursor = mr.End
-		}
-		m.state.SyncCursorPos()
-		if !isVisualMode(m.currentMode) {
-			m.visualMode = mode.NewVisualMode(m.theme, anchor, mode.VisualChar)
-			m.currentMode = mode.ModeVisual
-		}
-		m.visualMode.State.CursorPos = m.state.Cursor
-		m.syncStatusLine()
-		return m, nil
+		return nil, m.handleShiftArrowKey(key)
 	}
-
-	// Normal mode key interceptions.
-	if m.currentMode == mode.ModeNormal {
-		switch key.Type {
-		case tea.KeyCtrlO:
-			return m.jumpBack()
-		case tea.KeyCtrlI:
-			return m.jumpForward()
-		case tea.KeyEsc:
-			if !m.state.Cursors.IsSingle() {
-				m.state.Cursors.ClearSecondary()
-				p := m.state.Cursors.Primary()
-				m.state.Cursor = p.Pos
-				m.state.CursorLine = p.Line
-				m.state.CursorCol = p.Col
-				m.syncStatusLine()
-				m.invalidateView()
-				return m, nil
-			}
-			if m.jumpList.CanBack() {
-				return m.jumpBack()
-			}
-		}
+	if cmd, handled := m.handleNormalModeInterception(key); handled {
+		return cmd, true
 	}
-
-	// K in normal mode: request LSP hover at cursor position.
-	if m.currentMode == mode.ModeNormal && len(key.Runes) == 1 && key.Runes[0] == 'K' {
-		return m, func() tea.Msg {
+	if m.isHoverRequestKey(key) {
+		return func() tea.Msg {
 			return msg.LSPHoverRequestMsg{
 				FilePath: m.filePath,
 				Line:     m.state.CursorLine,
 				Col:      m.state.CursorCol,
 			}
+		}, true
+	}
+	return nil, false
+}
+
+func (m *Model) handleCompletionPopupKey(key tea.KeyMsg) (tea.Cmd, bool) {
+	if !m.completionEngine.Active() || m.currentMode != mode.ModeInsert {
+		return nil, false
+	}
+	switch key.Type {
+	case tea.KeyTab, tea.KeyEnter:
+		m.acceptCompletion()
+		m.syncStatusLine()
+	case tea.KeyEsc:
+		m.completionEngine.Dismiss()
+		m.syncStatusLine()
+	case tea.KeyCtrlN, tea.KeyDown:
+		m.completionEngine.Next()
+	case tea.KeyCtrlP, tea.KeyUp:
+		m.completionEngine.Prev()
+	default:
+		return nil, false
+	}
+	return nil, true
+}
+
+func (m *Model) handleShiftArrowKey(key tea.KeyMsg) bool {
+	anchor := m.state.Cursor
+	switch key.String() {
+	case "shift+right":
+		m.state.Cursor = min(m.state.Cursor+1, m.buf.Length())
+	case "shift+left":
+		m.state.Cursor = max(m.state.Cursor-1, 0)
+	default:
+		mr := motion.ExecuteMotion(shiftArrowMotion(key), m.state.Buffer, m.state.LineIndex, m.state.Cursor, 1)
+		m.state.Cursor = mr.End
+	}
+	m.state.SyncCursorPos()
+	if !isVisualMode(m.currentMode) {
+		m.visualMode = mode.NewVisualMode(m.theme, anchor, mode.VisualChar)
+		m.currentMode = mode.ModeVisual
+	}
+	m.visualMode.State.CursorPos = m.state.Cursor
+	m.syncStatusLine()
+	return true
+}
+
+func (m *Model) handleNormalModeInterception(key tea.KeyMsg) (tea.Cmd, bool) {
+	if m.currentMode != mode.ModeNormal {
+		return nil, false
+	}
+	switch key.Type {
+	case tea.KeyCtrlO:
+		_, cmd := m.jumpBack()
+		return cmd, true
+	case tea.KeyCtrlI:
+		_, cmd := m.jumpForward()
+		return cmd, true
+	case tea.KeyEsc:
+		if !m.state.Cursors.IsSingle() {
+			m.collapseToPrimaryCursor()
+			return nil, true
+		}
+		if m.jumpList.CanBack() {
+			_, cmd := m.jumpBack()
+			return cmd, true
 		}
 	}
+	return nil, false
+}
 
+func (m *Model) collapseToPrimaryCursor() {
+	m.state.Cursors.ClearSecondary()
+	p := m.state.Cursors.Primary()
+	m.state.Cursor = p.Pos
+	m.state.CursorLine = p.Line
+	m.state.CursorCol = p.Col
+	m.syncStatusLine()
+	m.invalidateView()
+}
+
+func (m *Model) isHoverRequestKey(key tea.KeyMsg) bool {
+	return m.currentMode == mode.ModeNormal && len(key.Runes) == 1 && key.Runes[0] == 'K'
+}
+
+type keyDispatchSnapshot struct {
+	prevCursorLine int
+	prevCursorCol  int
+	prevVersion    uint64
+}
+
+func (m *Model) handleDispatchedKey(key tea.KeyMsg) tea.Cmd {
+	snapshot := m.prepareKeyDispatch()
+	next, cmd := m.dispatchKeyByCursorMode(key)
+	m.applyKeyModeTransition(next)
+	bufChanged := m.buf.Version() != snapshot.prevVersion
+	m.applyKeyBufferEffects(snapshot.prevCursorLine, bufChanged)
+	cmd = m.applyInsertModeKeyEffects(key, cmd, bufChanged)
+	cursorMoved := m.state.CursorLine != snapshot.prevCursorLine || m.state.CursorCol != snapshot.prevCursorCol
+	m.clearHighlightsForKeyTransition(snapshot, cursorMoved, bufChanged)
+	m.clearJumpMarkerForKeyTransition(cursorMoved, bufChanged)
+	m.syncStatusLine()
+	return cmd
+}
+
+func (m *Model) prepareKeyDispatch() keyDispatchSnapshot {
 	m.syncCursorContext()
-	prevCursorLine := m.state.CursorLine
-	prevCursorCol := m.state.CursorCol
-	prevVersion := m.buf.Version()
-	var next mode.Mode
-	var cmd tea.Cmd
-	if m.state.Cursors.IsSingle() {
-		next, cmd = m.dispatchKey(key)
-	} else {
-		next, cmd = m.dispatchKeyMultiCursor(key)
+	return keyDispatchSnapshot{
+		prevCursorLine: m.state.CursorLine,
+		prevCursorCol:  m.state.CursorCol,
+		prevVersion:    m.buf.Version(),
 	}
+}
+
+func (m *Model) dispatchKeyByCursorMode(key tea.KeyMsg) (mode.Mode, tea.Cmd) {
+	if m.state.Cursors.IsSingle() {
+		return m.dispatchKey(key)
+	}
+	return m.dispatchKeyMultiCursor(key)
+}
+
+func (m *Model) applyKeyModeTransition(next mode.Mode) {
 	if next != m.currentMode {
 		m.transitionMode(next)
 	}
-	bufChanged := m.buf.Version() != prevVersion
+}
+
+func (m *Model) applyKeyBufferEffects(prevCursorLine int, bufChanged bool) {
+	if !bufChanged {
+		return
+	}
+	m.editGeneration++
+	m.modified = true
+	m.lspDirty = true
+	m.lastEditAt = time.Now()
+	m.clearDiagnosticsOnLine(prevCursorLine)
+	if m.state.CursorLine != prevCursorLine {
+		m.clearDiagnosticsOnLine(m.state.CursorLine)
+	}
+	m.rehighlight()
+}
+
+func (m *Model) applyInsertModeKeyEffects(key tea.KeyMsg, cmd tea.Cmd, bufChanged bool) tea.Cmd {
+	if m.currentMode != mode.ModeInsert {
+		return cmd
+	}
 	if bufChanged {
-		m.editGeneration++
-		m.modified = true
-		m.lspDirty = true
-		m.lastEditAt = time.Now()
-		// Clear stale diagnostics on edited lines so gutter signs vanish
-		// immediately when the user fixes an issue. The server will
-		// re-publish if the error persists after the didChange flush.
-		m.clearDiagnosticsOnLine(prevCursorLine)
-		if m.state.CursorLine != prevCursorLine {
-			m.clearDiagnosticsOnLine(m.state.CursorLine)
-		}
-		m.rehighlight()
-	}
-
-	// Trigger completion in insert mode after buffer edits.
-	if m.currentMode == mode.ModeInsert && bufChanged {
 		compCmd := m.triggerCompletion()
-		cmd = tea.Batch(cmd, compCmd)
-	}
-
-	// Trigger signature help in insert mode on specific chars.
-	if m.currentMode == mode.ModeInsert && bufChanged {
 		sigCmd := m.triggerSignatureHelp(key)
-		cmd = tea.Batch(cmd, sigCmd)
+		return tea.Batch(cmd, compCmd, sigCmd)
 	}
-
-	// Dismiss completion and signature help when buffer didn't change in
-	// insert mode (e.g. arrow keys moved cursor away from context).
-	if m.currentMode == mode.ModeInsert && !bufChanged {
-		if m.completionEngine.Active() {
-			m.completionEngine.Dismiss()
-		}
-		if m.sigHelpActive {
-			m.DismissSignatureHelp()
-		}
+	if m.completionEngine.Active() {
+		m.completionEngine.Dismiss()
 	}
-
-	// Clear document highlights when the cursor moves to a different word.
-	cursorMoved := m.state.CursorLine != prevCursorLine || m.state.CursorCol != prevCursorCol
-	if (cursorMoved || bufChanged) && len(m.highlightRanges) > 0 {
-		sameWord := !bufChanged && prevCursorLine == m.state.CursorLine
-		if sameWord {
-			ps, pe := m.WordBoundsAt(prevCursorLine, prevCursorCol)
-			ns, ne := m.WordBoundsAt(m.state.CursorLine, m.state.CursorCol)
-			sameWord = ps == ns && pe == ne && ps != pe
-		}
-		if !sameWord {
-			m.highlightRanges = nil
-		}
+	if m.sigHelpActive {
+		m.DismissSignatureHelp()
 	}
+	return cmd
+}
 
-	// Clear jump marker on any cursor movement or buffer change.
+func (m *Model) clearHighlightsForKeyTransition(
+	snapshot keyDispatchSnapshot,
+	cursorMoved bool,
+	bufChanged bool,
+) {
+	if len(m.highlightRanges) == 0 || (!cursorMoved && !bufChanged) {
+		return
+	}
+	if m.cursorStayedOnSameWord(snapshot, bufChanged) {
+		return
+	}
+	m.highlightRanges = nil
+}
+
+func (m *Model) cursorStayedOnSameWord(snapshot keyDispatchSnapshot, bufChanged bool) bool {
+	if bufChanged || snapshot.prevCursorLine != m.state.CursorLine {
+		return false
+	}
+	ps, pe := m.WordBoundsAt(snapshot.prevCursorLine, snapshot.prevCursorCol)
+	ns, ne := m.WordBoundsAt(m.state.CursorLine, m.state.CursorCol)
+	return ps == ns && pe == ne && ps != pe
+}
+
+func (m *Model) clearJumpMarkerForKeyTransition(cursorMoved bool, bufChanged bool) {
 	if m.jumpActive && (cursorMoved || bufChanged) {
 		m.jumpActive = false
 	}
-
-	m.syncStatusLine()
-	return m, cmd
 }
 
 // isVisualMode reports whether a mode is one of the visual sub-modes.
@@ -3477,15 +3525,15 @@ type renderLineCtx struct {
 	// lineAt returns the content of line i. For full renders this indexes
 	// into a pre-split slice; for cursor-only patching it uses
 	// LineIndex + PieceTable.Substring to avoid splitting the entire buffer.
-	lineAt       func(i int) string
-	totalLines   int
-	gutterWidth  int
-	defaultStyle lipgloss.Style
-	hasSelection bool
-	selStartLine int
-	selStartCol  int
-	selEndLine   int
-	selEndCol    int
+	lineAt        func(i int) string
+	totalLines    int
+	gutterWidth   int
+	defaultStyle  lipgloss.Style
+	hasSelection  bool
+	selStartLine  int
+	selStartCol   int
+	selEndLine    int
+	selEndCol     int
 	cursorVisible bool // Current blink phase (true = cursor shown).
 }
 

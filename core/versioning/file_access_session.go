@@ -81,6 +81,9 @@ func (s *SessionRoutingFileAccess) resolve(ctx context.Context) FileAccess {
 			}
 		}
 	}
+	if !s.readOnly {
+		return newGuardedFallbackFileAccess(s.fallback)
+	}
 	if s.fallback != nil {
 		return s.fallback
 	}

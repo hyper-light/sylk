@@ -21,6 +21,7 @@ type MergePipeConfig struct {
 	WAL         SemanticWAL
 	OTEngine    OTEngine
 	Resolver    ConflictResolver
+	DraftMu     *sync.Mutex
 	MergeBuffer int // channel capacity, default DefaultMergeBuffer
 }
 
@@ -33,6 +34,7 @@ type MergePipe struct {
 	wal       SemanticWAL
 	ot        OTEngine
 	resolver  ConflictResolver
+	draftMu   *sync.Mutex
 	pipelines map[string]pipelineReg
 	mergeCh   chan mergeRequest
 	stopCh    chan struct{}
@@ -56,6 +58,11 @@ type mergeResult struct {
 	err     error
 }
 
+type transformedFileMod struct {
+	mod FileModification
+	ops []*Operation
+}
+
 // NewMergePipe creates a new MergePipe. Call Start() to launch the merge goroutine.
 func NewMergePipe(cfg MergePipeConfig) *MergePipe {
 	bufSize := cfg.MergeBuffer
@@ -73,6 +80,7 @@ func NewMergePipe(cfg MergePipeConfig) *MergePipe {
 		wal:       cfg.WAL,
 		ot:        cfg.OTEngine,
 		resolver:  resolver,
+		draftMu:   cfg.DraftMu,
 		pipelines: make(map[string]pipelineReg),
 		mergeCh:   make(chan mergeRequest, bufSize),
 		stopCh:    make(chan struct{}),
@@ -208,6 +216,11 @@ func (mp *MergePipe) executeMerge(req mergeRequest) mergeResult {
 		return mergeResult{version: mp.wal.CurrentVersion()}
 	}
 
+	if mp.draftMu != nil {
+		mp.draftMu.Lock()
+		defer mp.draftMu.Unlock()
+	}
+
 	transformed, err := mp.transformMods(req.ctx, req.mods, reg.baseVersion)
 	if err != nil {
 		return mergeResult{err: err}
@@ -226,69 +239,56 @@ func (mp *MergePipe) executeMerge(req mergeRequest) mergeResult {
 	return mergeResult{version: ver}
 }
 
-// transformMods converts pipeline FileModifications into OT-transformed ops
-// against any concurrent changes since the pipeline's base version.
-func (mp *MergePipe) transformMods(ctx context.Context, mods []FileModification, base SemanticVersion) ([]FileModification, error) {
+// transformMods converts pipeline FileModifications into precise
+// OT-transformed operations against any accepted global changes since the
+// pipeline's base version.
+func (mp *MergePipe) transformMods(ctx context.Context, mods []FileModification, base SemanticVersion) ([]transformedFileMod, error) {
 	accumulated, err := mp.wal.GetDeltasSince(base)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(accumulated) == 0 {
-		return mods, nil
-	}
-
-	// Convert accumulated WAL deltas to OT Operations.
-	var accOps []*Operation
+	accOpsByPath := make(map[string][]*Operation, len(accumulated))
 	for _, entry := range accumulated {
 		for _, d := range entry.Deltas {
-			accOps = append(accOps, walDeltaToOperation(d, entry.PipelineID))
+			accOpsByPath[d.Path] = append(accOpsByPath[d.Path], preciseOperationsForDelta(d, entry.PipelineID)...)
 		}
 	}
 
-	// Convert pipeline mods to OT Operations.
-	pipeOps := make([]*Operation, 0, len(mods))
+	result := make([]transformedFileMod, 0, len(mods))
 	for _, m := range mods {
-		pipeOps = append(pipeOps, modToOperation(m))
+		sourceOps := preciseOperationsForModification(m)
+		transformed := make([]*Operation, 0, len(sourceOps))
+		for _, op := range sourceOps {
+			next, transformErr := mp.transformOperation(ctx, op, accOpsByPath[m.OriginalPath], transformed)
+			if transformErr != nil {
+				return nil, transformErr
+			}
+			if isNoOpOperation(next) {
+				continue
+			}
+			transformed = append(transformed, next)
+		}
+		result = append(result, transformedFileMod{mod: m, ops: transformed})
 	}
 
-	// Transform pipeline ops against accumulated ops.
-	transformed, err := mp.ot.TransformBatch(pipeOps, accOps)
-	if err != nil {
-		return mp.resolveAndApply(ctx, mods, accOps, err)
-	}
-
-	return opsToMods(transformed, mods), nil
+	return result, nil
 }
 
-func (mp *MergePipe) resolveAndApply(ctx context.Context, mods []FileModification, accOps []*Operation, transformErr error) ([]FileModification, error) {
-	_ = ctx
-	_ = mods
-	_ = accOps
-	return nil, transformErr
-}
-
-// applyToGlobal writes transformed modifications to the global VFS and builds WAL deltas.
-func (mp *MergePipe) applyToGlobal(ctx context.Context, mods []FileModification) ([]WALFileDelta, error) {
+// applyToGlobal materializes transformed operations into the global draft VFS
+// and emits one semantic WAL delta per resulting file change.
+func (mp *MergePipe) applyToGlobal(ctx context.Context, mods []transformedFileMod) ([]WALFileDelta, error) {
 	deltas := make([]WALFileDelta, 0, len(mods))
 
-	for _, m := range mods {
-		if err := mp.validateModAgainstGlobal(ctx, m); err != nil {
-			return nil, err
+	for _, tm := range mods {
+		delta, applyErr := mp.applyTransformedModToGlobal(ctx, tm)
+		if applyErr != nil {
+			return nil, applyErr
 		}
-
-		old := mp.readOldContent(ctx, m.OriginalPath)
-		delta := WALFileDelta{
-			Path:       m.OriginalPath,
-			Op:         WALDeltaOpFromFileOp(m.Operation),
-			NewContent: m.NewContent,
-			OldContent: old,
+		if delta == nil {
+			continue
 		}
-
-		if err := mp.applyModToGlobal(ctx, m); err != nil {
-			return nil, err
-		}
-		deltas = append(deltas, delta)
+		deltas = append(deltas, *delta)
 	}
 
 	return deltas, nil

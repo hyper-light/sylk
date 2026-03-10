@@ -26,14 +26,14 @@ func (c *CVSShim) Read(ctx context.Context, filePath string) ([]byte, error) {
 }
 
 func (c *CVSShim) Write(ctx context.Context, filePath string, content []byte, _ WriteMetadata) (VersionID, error) {
-	if err := c.session.globalVFS.Write(ctx, filePath, content); err != nil {
+	if err := c.session.ApplyGlobalWrite(ctx, filePath, content); err != nil {
 		return VersionID{}, err
 	}
 	return VersionID{}, nil
 }
 
 func (c *CVSShim) Delete(ctx context.Context, filePath string, _ WriteMetadata) (VersionID, error) {
-	if err := c.session.globalVFS.Delete(ctx, filePath); err != nil {
+	if err := c.session.ApplyGlobalDelete(ctx, filePath); err != nil {
 		return VersionID{}, err
 	}
 	return VersionID{}, nil

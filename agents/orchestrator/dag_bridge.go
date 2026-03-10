@@ -74,22 +74,23 @@ type ActiveDAGMeta struct {
 
 // DAGBridge wires the dag.Scheduler into the orchestrator's bus/WAL/store/buffers.
 type DAGBridge struct {
-	mu         sync.RWMutex
-	scheduler  *dag.Scheduler
-	bus        guide.EventBus
-	store      *Store
-	journal    *OrchestratorJournal
-	buffers    *BufferRegistry
-	scope      *concurrency.GoroutineScope
-	config     DAGBridgeConfig
-	activator  guide.PodActivator
-	registrar  PipelineRegistrar
-	runtime    container.ContainerRuntime
-	specReg    *container.AgentSpecRegistry
-	sessionVFS func(sessionID string) *versioning.SessionVFS
-	sessionID  string
-	agentID    string
-	logger     *slog.Logger
+	mu                 sync.RWMutex
+	scheduler          *dag.Scheduler
+	bus                guide.EventBus
+	store              *Store
+	journal            *OrchestratorJournal
+	buffers            *BufferRegistry
+	scope              *concurrency.GoroutineScope
+	config             DAGBridgeConfig
+	activator          guide.PodActivator
+	registrar          PipelineRegistrar
+	runtime            container.ContainerRuntime
+	specReg            *container.AgentSpecRegistry
+	sessionVFS         func(sessionID string) *versioning.SessionVFS
+	waitDispatchPermit func(ctx context.Context, sessionID, dagID string) error
+	sessionID          string
+	agentID            string
+	logger             *slog.Logger
 
 	activityPub   events.ActivityPublisher
 	eventLogger   *agentlog.SessionEventLogger
@@ -167,6 +168,15 @@ func (b *DAGBridge) SetTaskPodInfra(
 	b.sessionVFS = sessionVFS
 }
 
+// SetDispatchPermitWaiter installs a callback invoked before a node dispatch
+// is published onto the bus. Used by the orchestrator control plane to pause
+// new pipeline work while validation/remediation holds are active.
+func (b *DAGBridge) SetDispatchPermitWaiter(fn func(ctx context.Context, sessionID, dagID string) error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.waitDispatchPermit = fn
+}
+
 // SetLogger sets the structured logger for pipeline pod diagnostics.
 func (b *DAGBridge) SetLogger(l *slog.Logger) {
 	b.mu.Lock()
@@ -236,6 +246,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	runtime := b.runtime
 	specReg := b.specReg
 	sessionVFS := b.sessionVFS
+	waitDispatchPermit := b.waitDispatchPermit
 	b.mu.RUnlock()
 
 	b.mu.RLock()
@@ -252,6 +263,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
+	dispatcher.SetDispatchPermitWaiter(waitDispatchPermit)
 	dispatcher.SetPodResolver(func(node *dag.Node) *shared.AgentPod {
 		if node == nil {
 			return nil
@@ -1028,10 +1040,12 @@ func (b *DAGBridge) compositeGate() dag.LayerGate {
 		gate, ok := b.gates[dagID]
 		b.mu.RUnlock()
 
-		if !ok {
-			return nil
+		if ok {
+			if err := gate.Gate()(ctx, dagID, layerIdx, nodeResults); err != nil {
+				return err
+			}
 		}
-		return gate.Gate()(ctx, dagID, layerIdx, nodeResults)
+		return b.flushLayerDraftToDisk(ctx, dagID, layerIdx)
 	}
 }
 
