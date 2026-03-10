@@ -10877,138 +10877,29 @@ func isWheelEvent(mouse tea.MouseMsg) bool {
 // handleLeftClick dispatches left-button events to the file tree,
 // inline editor (in edit mode), and chat panels.
 func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
-	// Edit mode: handle press, drag, and release in the code panel.
 	if m.viewMode == ViewEdit {
 		if consumed, cmd := m.handleEditorMouse(mouse); consumed {
 			return cmd
 		}
 	}
-
-	// Git mode: forward motion/release during column drag operations.
-	if m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.IsDragging() {
-		viewX := mouse.X - m.fileTreePanelX() - 1
-		if mouse.Action == tea.MouseActionMotion {
-			m.gitPanel.HandleMouseMotion(viewX)
-			return nil
-		}
-		if mouse.Action == tea.MouseActionRelease {
-			m.gitPanel.HandleMouseRelease()
-			return nil
-		}
+	if cmd, handled := m.handleGitDragLeftClick(mouse); handled {
+		return cmd
 	}
-
-	// Input panel drag: finalize on release, extend selection on motion.
-	if mouse.Action == tea.MouseActionRelease && m.inputMouseDown {
-		m.inputMouseDown = false
-		return nil
+	if cmd, handled := m.handleInputDragLeftClick(mouse); handled {
+		return cmd
 	}
-	if mouse.Action == tea.MouseActionMotion && m.inputMouseDown {
-		inputTop := m.height - m.prevInputH - statusBarHeight
-		contentX := max(mouse.X-1, 0)
-		contentY := max(mouse.Y-inputTop-1, 0)
-		m.input.DragTo(contentX, contentY)
-		return nil
-	}
-
 	if mouse.Action != tea.MouseActionPress {
 		return nil
 	}
-
-	// Conflict view: route left-click events to file list and content pane.
-	if m.conflictViewActive && m.conflictView != nil && mouse.Button == tea.MouseButtonLeft {
-		m.handleConflictFileListClick(mouse.X, mouse.Y)
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
-			panelX := m.codePanelX()
-			viewX := mouse.X - panelX - 1
-			viewY := mouse.Y - 1
-			localMouse := tea.MouseMsg{
-				X: viewX, Y: viewY,
-				Action: mouse.Action, Button: mouse.Button,
-			}
-			cmd := m.conflictView.Update(localMouse)
-			m.focus.SetFocus(component.FocusConflictView)
-			m.syncFocusState()
-			return cmd
-		}
-		return nil
+	if cmd, handled := m.handleOverlayLeftClick(mouse); handled {
+		return cmd
 	}
-
-	// Merge diff view: route left-click events to file list and panes.
-	if m.mergeDiffViewActive && m.mergeDiffView != nil && mouse.Button == tea.MouseButtonLeft {
-		m.handleMergeDiffFileListClick(mouse.X, mouse.Y)
-
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
-			panelX := m.codePanelX()
-			viewX := mouse.X - panelX - 1
-			viewY := mouse.Y - 1
-			isPaneClick := m.mergeDiffView.IsPaneClick(viewY)
-			localMouse := tea.MouseMsg{
-				X: viewX, Y: viewY,
-				Action: mouse.Action, Button: mouse.Button,
-			}
-			cmd := m.mergeDiffView.Update(localMouse)
-			if isPaneClick {
-				m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
-				m.syncFocusState()
-			}
-			return cmd
-		}
-		return nil
-	}
-
-	// Diff view: route left-click events to the diff file list and diff panes.
-	// Wheel events are routed via applyScrollImpulse → scrollOneLine.
-	if m.diffViewActive && m.diffView != nil && mouse.Button == tea.MouseButtonLeft {
-		// Diff file list (left panel, occupies the FileTree slot).
-		m.handleDiffFileListClick(mouse.X, mouse.Y)
-
-		// Diff panes / tab bar / toolbar (right panel).
-		if m.isInsideCodePanel(mouse.X, mouse.Y) {
-			panelX := m.codePanelX()
-			viewX := mouse.X - panelX - 1
-			viewY := mouse.Y - 1
-			isPaneClick := m.diffView.IsPaneClick(viewY)
-			localMouse := tea.MouseMsg{
-				X: viewX, Y: viewY,
-				Action: mouse.Action, Button: mouse.Button,
-			}
-			cmd := m.diffView.Update(localMouse)
-			// Only update app-level pane focus for clicks in the pane content
-			// area — tab bar and toolbar clicks should not steal pane focus.
-			if isPaneClick {
-				m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
-				m.syncFocusState()
-			}
-			return cmd
-		}
-		return nil
-	}
-
-	// Git mode: route to git panel and commit tree.
 	if m.viewMode == ViewGit {
-		if cmd := m.handleGitPanelClick(mouse.X, mouse.Y); cmd != nil {
-			return cmd
-		}
-		if cmd := m.handleCommitTreeClick(mouse.X, mouse.Y); cmd != nil {
-			return cmd
-		}
+		return m.handleGitModeLeftClick(mouse)
+	}
+	if handled := m.handleInputPanelPress(mouse); handled {
 		return nil
 	}
-
-	// Input panel click: begin drag selection at click point.
-	inputTop := m.height - m.prevInputH - statusBarHeight
-	if mouse.Y >= inputTop && mouse.Y < inputTop+m.prevInputH {
-		contentX := mouse.X - 1            // skip left border
-		contentY := mouse.Y - inputTop - 1 // skip top border
-		if contentX >= 0 && contentY >= 0 {
-			m.input.DragStart(contentX, contentY)
-			m.inputMouseDown = true
-			m.focus.SetFocus(component.FocusInput)
-			m.syncFocusState()
-			return nil
-		}
-	}
-
 	if cmd := m.handleAgentSelectorClick(mouse.X, mouse.Y); cmd != nil {
 		return cmd
 	}
@@ -11020,6 +10911,132 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 		return cmd
 	}
 	return m.handleChatClick(mouse.X, mouse.Y)
+}
+
+func (m *AppModel) handleGitDragLeftClick(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.viewMode != ViewGit || m.gitPanel == nil || !m.gitPanel.IsDragging() {
+		return nil, false
+	}
+	viewX := mouse.X - m.fileTreePanelX() - 1
+	switch mouse.Action {
+	case tea.MouseActionMotion:
+		m.gitPanel.HandleMouseMotion(viewX)
+		return nil, true
+	case tea.MouseActionRelease:
+		m.gitPanel.HandleMouseRelease()
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+func (m *AppModel) handleInputDragLeftClick(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if mouse.Action == tea.MouseActionRelease && m.inputMouseDown {
+		m.inputMouseDown = false
+		return nil, true
+	}
+	if mouse.Action != tea.MouseActionMotion || !m.inputMouseDown {
+		return nil, false
+	}
+	inputTop := m.height - m.prevInputH - statusBarHeight
+	contentX := max(mouse.X-1, 0)
+	contentY := max(mouse.Y-inputTop-1, 0)
+	m.input.DragTo(contentX, contentY)
+	return nil, true
+}
+
+func (m *AppModel) handleOverlayLeftClick(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if mouse.Button != tea.MouseButtonLeft {
+		return nil, false
+	}
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.handleConflictOverlayLeftClick(mouse), true
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.handleMergeDiffOverlayLeftClick(mouse), true
+	}
+	if m.diffViewActive && m.diffView != nil {
+		return m.handleDiffOverlayLeftClick(mouse), true
+	}
+	return nil, false
+}
+
+func (m *AppModel) handleConflictOverlayLeftClick(mouse tea.MouseMsg) tea.Cmd {
+	m.handleConflictFileListClick(mouse.X, mouse.Y)
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return nil
+	}
+	cmd := m.conflictView.Update(m.codePanelLocalMouse(mouse))
+	m.focus.SetFocus(component.FocusConflictView)
+	m.syncFocusState()
+	return cmd
+}
+
+func (m *AppModel) handleMergeDiffOverlayLeftClick(mouse tea.MouseMsg) tea.Cmd {
+	m.handleMergeDiffFileListClick(mouse.X, mouse.Y)
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return nil
+	}
+	localMouse := m.codePanelLocalMouse(mouse)
+	isPaneClick := m.mergeDiffView.IsPaneClick(localMouse.Y)
+	cmd := m.mergeDiffView.Update(localMouse)
+	if isPaneClick {
+		m.focus.SetFocus(pane.PaneFocusID(m.mergeDiffView.FocusedPane()))
+		m.syncFocusState()
+	}
+	return cmd
+}
+
+func (m *AppModel) handleDiffOverlayLeftClick(mouse tea.MouseMsg) tea.Cmd {
+	m.handleDiffFileListClick(mouse.X, mouse.Y)
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return nil
+	}
+	localMouse := m.codePanelLocalMouse(mouse)
+	isPaneClick := m.diffView.IsPaneClick(localMouse.Y)
+	cmd := m.diffView.Update(localMouse)
+	if isPaneClick {
+		m.focus.SetFocus(pane.PaneFocusID(m.diffView.FocusedPane()))
+		m.syncFocusState()
+	}
+	return cmd
+}
+
+func (m *AppModel) codePanelLocalMouse(mouse tea.MouseMsg) tea.MouseMsg {
+	panelX := m.codePanelX()
+	return tea.MouseMsg{
+		X:      mouse.X - panelX - 1,
+		Y:      mouse.Y - 1,
+		Action: mouse.Action,
+		Button: mouse.Button,
+	}
+}
+
+func (m *AppModel) handleGitModeLeftClick(mouse tea.MouseMsg) tea.Cmd {
+	if cmd := m.handleGitPanelClick(mouse.X, mouse.Y); cmd != nil {
+		return cmd
+	}
+	if cmd := m.handleCommitTreeClick(mouse.X, mouse.Y); cmd != nil {
+		return cmd
+	}
+	return nil
+}
+
+func (m *AppModel) handleInputPanelPress(mouse tea.MouseMsg) bool {
+	inputTop := m.height - m.prevInputH - statusBarHeight
+	if mouse.Y < inputTop || mouse.Y >= inputTop+m.prevInputH {
+		return false
+	}
+	contentX := mouse.X - 1
+	contentY := mouse.Y - inputTop - 1
+	if contentX < 0 || contentY < 0 {
+		return false
+	}
+	m.input.DragStart(contentX, contentY)
+	m.inputMouseDown = true
+	m.focus.SetFocus(component.FocusInput)
+	m.syncFocusState()
+	return true
 }
 
 // agentSelectorScreenY returns the screen Y of the model selector line.
@@ -14356,7 +14373,9 @@ func (m *AppModel) renderSlotRight(th *theme.Theme) string {
 // renderSingleColumnSlot renders the single visible panel in SingleColumn mode.
 func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	active := m.leftRing.current()
-
+	if rendered, ok := m.renderSingleColumnOverlaySlot(active, th); ok {
+		return rendered
+	}
 	switch active {
 	case component.FocusSessionPanel:
 		content := m.overlayChordHint(m.renderLeftPanel(th), active, th)
@@ -14364,64 +14383,103 @@ func (m *AppModel) renderSingleColumnSlot(th *theme.Theme) string {
 	case component.FocusCodeViewer:
 		return m.renderCodePanelBordered(th)
 	case component.FocusFileTree:
-		if m.conflictViewActive && m.conflictView != nil {
-			return m.renderConflictFileListBordered(th)
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			return m.renderMergeDiffFileListBordered(th)
-		}
-		if m.diffViewActive && m.diffView != nil {
-			return m.renderDiffFileListBordered(th)
-		}
-		content := m.overlayChordHint(m.fileTree.View(m.cursorVisible), active, th)
-		return m.renderPanel(content, active, th)
+		return m.renderSingleColumnFileTreeSlot(active, th)
 	case component.FocusGitPanel:
 		return m.renderGitPanelBordered(th)
 	case component.FocusCommitTree:
 		return m.renderGitCommitTreeBordered(th)
-	case component.FocusConflictView:
-		if m.conflictViewActive && m.conflictView != nil {
-			return m.renderConflictViewBordered(th)
-		}
-		return m.renderCodePanelBordered(th)
-	case component.FocusConflictFileList:
-		if m.conflictViewActive && m.conflictView != nil {
-			return m.renderConflictFileListBordered(th)
-		}
-		return m.renderGitPanelBordered(th)
-	case component.FocusMergeDiffView:
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			return m.renderMergeDiffViewBordered(th)
-		}
-		return m.renderCodePanelBordered(th)
-	case component.FocusMergeDiffFileList:
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			return m.renderMergeDiffFileListBordered(th)
-		}
-		return m.renderGitPanelBordered(th)
-	case component.FocusDiffView:
-		if m.diffViewActive && m.diffView != nil {
-			return m.renderDiffViewBordered(th)
-		}
-		return m.renderCodePanelBordered(th)
-	case component.FocusDiffFileList:
-		if m.diffViewActive && m.diffView != nil {
-			return m.renderDiffFileListBordered(th)
-		}
-		return m.renderGitPanelBordered(th)
 	default:
-		if m.conflictViewActive && m.conflictView != nil {
-			return m.renderConflictViewBordered(th)
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			return m.renderMergeDiffViewBordered(th)
-		}
-		if m.diffViewActive && m.diffView != nil {
-			return m.renderDiffViewBordered(th)
-		}
-		content := m.overlayChordHint(m.panelContent(active), active, th)
-		return m.renderPanel(content, active, th)
+		return m.renderSingleColumnDefaultSlot(active, th)
 	}
+}
+
+func (m *AppModel) renderSingleColumnOverlaySlot(active component.FocusID, th *theme.Theme) (string, bool) {
+	switch active {
+	case component.FocusConflictView:
+		return m.renderSingleColumnConflictViewSlot(th), true
+	case component.FocusConflictFileList:
+		return m.renderSingleColumnConflictFileListSlot(th), true
+	case component.FocusMergeDiffView:
+		return m.renderSingleColumnMergeDiffViewSlot(th), true
+	case component.FocusMergeDiffFileList:
+		return m.renderSingleColumnMergeDiffFileListSlot(th), true
+	case component.FocusDiffView:
+		return m.renderSingleColumnDiffViewSlot(th), true
+	case component.FocusDiffFileList:
+		return m.renderSingleColumnDiffFileListSlot(th), true
+	default:
+		return "", false
+	}
+}
+
+func (m *AppModel) renderSingleColumnFileTreeSlot(active component.FocusID, th *theme.Theme) string {
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.renderConflictFileListBordered(th)
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.renderMergeDiffFileListBordered(th)
+	}
+	if m.diffViewActive && m.diffView != nil {
+		return m.renderDiffFileListBordered(th)
+	}
+	content := m.overlayChordHint(m.fileTree.View(m.cursorVisible), active, th)
+	return m.renderPanel(content, active, th)
+}
+
+func (m *AppModel) renderSingleColumnConflictViewSlot(th *theme.Theme) string {
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.renderConflictViewBordered(th)
+	}
+	return m.renderCodePanelBordered(th)
+}
+
+func (m *AppModel) renderSingleColumnConflictFileListSlot(th *theme.Theme) string {
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.renderConflictFileListBordered(th)
+	}
+	return m.renderGitPanelBordered(th)
+}
+
+func (m *AppModel) renderSingleColumnMergeDiffViewSlot(th *theme.Theme) string {
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.renderMergeDiffViewBordered(th)
+	}
+	return m.renderCodePanelBordered(th)
+}
+
+func (m *AppModel) renderSingleColumnMergeDiffFileListSlot(th *theme.Theme) string {
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.renderMergeDiffFileListBordered(th)
+	}
+	return m.renderGitPanelBordered(th)
+}
+
+func (m *AppModel) renderSingleColumnDiffViewSlot(th *theme.Theme) string {
+	if m.diffViewActive && m.diffView != nil {
+		return m.renderDiffViewBordered(th)
+	}
+	return m.renderCodePanelBordered(th)
+}
+
+func (m *AppModel) renderSingleColumnDiffFileListSlot(th *theme.Theme) string {
+	if m.diffViewActive && m.diffView != nil {
+		return m.renderDiffFileListBordered(th)
+	}
+	return m.renderGitPanelBordered(th)
+}
+
+func (m *AppModel) renderSingleColumnDefaultSlot(active component.FocusID, th *theme.Theme) string {
+	if m.conflictViewActive && m.conflictView != nil {
+		return m.renderConflictViewBordered(th)
+	}
+	if m.mergeDiffViewActive && m.mergeDiffView != nil {
+		return m.renderMergeDiffViewBordered(th)
+	}
+	if m.diffViewActive && m.diffView != nil {
+		return m.renderDiffViewBordered(th)
+	}
+	content := m.overlayChordHint(m.panelContent(active), active, th)
+	return m.renderPanel(content, active, th)
 }
 
 // renderLeftSlot renders the left column for the given panel ID.
