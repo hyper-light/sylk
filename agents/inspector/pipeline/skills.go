@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
@@ -48,6 +50,23 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(requestOverrideSkill(pi))
 	pi.skills.Register(getValidationStatusSkill(pi))
 
+	for _, skill := range agentShared.CoordinationSkills(agentShared.CoordinationSkillConfig{
+		Client: agentShared.CoordinationClient{
+			BusProvider:     func() guide.EventBus { return pi.bus },
+			SourceAgentID:   func() string { return pi.id },
+			SourceAgentType: func() string { return "inspector-pipeline" },
+			SessionID:       func() string { return pi.config.SessionID },
+			RegisterPending: pi.registerPendingWait,
+			ClearPending:    pi.clearPendingWait,
+			Timeout:         routeSyncTimeout,
+		},
+		CurrentTaskID:   func() string { return pi.pipelineID },
+		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(pi.pipelineName, pi.pipelineSlug) },
+		WorkerType:      func() string { return "inspector-pipeline" },
+	}) {
+		pi.skills.Register(skill)
+	}
+
 	// Diagnostics
 	pi.skills.Register(agentShared.NewSelfDiagnosticSkill(&pipelineInspectorDiag{pi: pi}))
 
@@ -57,6 +76,15 @@ func (pi *PipelineInspector) registerCoreSkills() {
 		SessionID: func() string { return pi.config.SessionID },
 		Publish:   pi.publishRerouteRequest,
 	}))
+}
+
+func firstNonEmptyCoordinationName(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 type pipelineInspectorDiag struct{ pi *PipelineInspector }
@@ -85,11 +113,27 @@ func defineCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 		Description("Define success criteria and quality gates for a task (TDD Phase 1).").
 		Domain("validation").
 		Keywords("criteria", "define", "quality", "gate").
+		BestPractice("Provide numeric quality gate thresholds as numbers when possible; the runtime also accepts numeric strings for robustness.").
+		Example(`{"task_id":"task_1","success_criteria":[{"id":"criterion_1","description":"CLI prints Hello, world!","verifiable":true,"verification_method":"stdout_match"}],"quality_gates":[{"name":"coverage_min","metric":"coverage","threshold":80,"operator":">="}],"constraints":[{"type":"dependency","description":"Use argparse only","required":true}]}`).
 		Priority(100).
 		StringParam("task_id", "Unique identifier for the task", true).
-		ArrayParam("success_criteria", "List of success criteria", "object", false).
-		ArrayParam("quality_gates", "List of quality gates", "object", false).
-		ArrayParam("constraints", "List of constraints", "object", false).
+		ArrayObjectParam("success_criteria", "List of success criteria", map[string]*skills.Property{
+			"id":                  {Type: "string", Description: "Stable criterion identifier"},
+			"description":         {Type: "string", Description: "What must be true for the task to pass"},
+			"verifiable":          {Type: "boolean", Description: "Whether this criterion can be checked automatically"},
+			"verification_method": {Type: "string", Description: "How the criterion should be verified"},
+		}, []string{"description"}, false).
+		ArrayObjectParam("quality_gates", "List of measurable quality gates", map[string]*skills.Property{
+			"name":      {Type: "string", Description: "Stable quality gate identifier"},
+			"metric":    {Type: "string", Description: "Metric being measured, such as coverage or blocking_issues"},
+			"threshold": {Type: "number", Description: "Numeric threshold that must be met"},
+			"operator":  {Type: "string", Description: "Comparison operator: >=, <=, >, <, ==, !="},
+		}, []string{"metric", "threshold"}, false).
+		ArrayObjectParam("constraints", "List of implementation constraints", map[string]*skills.Property{
+			"type":        {Type: "string", Description: "Constraint category"},
+			"description": {Type: "string", Description: "Constraint details"},
+			"required":    {Type: "boolean", Description: "Whether the constraint is mandatory"},
+		}, []string{"description"}, false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
 				TaskID          string                    `json:"task_id"`
@@ -103,28 +147,124 @@ func defineCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 			if params.TaskID == "" {
 				return nil, fmt.Errorf("task_id is required")
 			}
+			taskID, resolved := pi.resolveTaskID(params.TaskID)
+			if taskID == "" {
+				taskID = strings.TrimSpace(params.TaskID)
+			}
 
 			criteria := &shared.InspectorCriteria{
-				TaskID:          params.TaskID,
+				TaskID:          taskID,
 				SuccessCriteria: params.SuccessCriteria,
 				QualityGates:    params.QualityGates,
 				Constraints:     params.Constraints,
 				CreatedAt:       time.Now(),
 			}
+			if err := normalizeDefinedCriteria(criteria); err != nil {
+				return nil, err
+			}
 
-			pi.mu.Lock()
-			pi.criteria[params.TaskID] = criteria
-			pi.mu.Unlock()
+			pi.DefineCriteria(taskID, criteria)
 
-			return map[string]any{
-				"task_id":           params.TaskID,
+			response := map[string]any{
+				"task_id":           taskID,
 				"criteria_defined":  true,
 				"criteria_count":    len(criteria.SuccessCriteria),
 				"gates_count":       len(criteria.QualityGates),
 				"constraints_count": len(criteria.Constraints),
-			}, nil
+			}
+			if resolved && strings.TrimSpace(params.TaskID) != "" && strings.TrimSpace(params.TaskID) != taskID {
+				response["requested_task_id"] = strings.TrimSpace(params.TaskID)
+			}
+			return response, nil
 		}).
 		Build()
+}
+
+func normalizeDefinedCriteria(criteria *shared.InspectorCriteria) error {
+	if criteria == nil {
+		return fmt.Errorf("criteria are required")
+	}
+	for i := range criteria.SuccessCriteria {
+		criterion := &criteria.SuccessCriteria[i]
+		criterion.ID = strings.TrimSpace(criterion.ID)
+		criterion.Description = strings.TrimSpace(criterion.Description)
+		criterion.VerificationMethod = strings.TrimSpace(criterion.VerificationMethod)
+		if criterion.Description == "" {
+			return fmt.Errorf("success_criteria[%d].description is required", i)
+		}
+		if criterion.ID == "" {
+			criterion.ID = fmt.Sprintf("criterion_%d", i+1)
+		}
+		if criterion.VerificationMethod == "" {
+			if criterion.Verifiable {
+				criterion.VerificationMethod = "automated_check"
+			} else {
+				criterion.VerificationMethod = "manual_review"
+			}
+		}
+	}
+
+	for i := range criteria.QualityGates {
+		gate := &criteria.QualityGates[i]
+		gate.Name = strings.TrimSpace(gate.Name)
+		gate.Metric = strings.TrimSpace(gate.Metric)
+		gate.Operator = normalizeQualityGateOperator(gate.Operator, gate.Metric, gate.Threshold)
+
+		if gate.Metric == "" {
+			return fmt.Errorf("quality_gates[%d].metric is required", i)
+		}
+		if gate.Operator == "" {
+			return fmt.Errorf("quality_gates[%d].operator is invalid", i)
+		}
+		if gate.Name == "" {
+			gate.Name = fmt.Sprintf("%s_%d", sanitizeCriterionID(gate.Metric), i+1)
+		}
+	}
+
+	for i := range criteria.Constraints {
+		constraint := &criteria.Constraints[i]
+		constraint.Type = strings.TrimSpace(constraint.Type)
+		constraint.Description = strings.TrimSpace(constraint.Description)
+		if constraint.Description == "" {
+			return fmt.Errorf("constraints[%d].description is required", i)
+		}
+		if constraint.Type == "" {
+			constraint.Type = "requirement"
+		}
+	}
+
+	return nil
+}
+
+func normalizeQualityGateOperator(operator, metric string, threshold float64) string {
+	switch strings.TrimSpace(strings.ToLower(operator)) {
+	case ">=", "gte":
+		return ">="
+	case "<=", "lte":
+		return "<="
+	case ">":
+		return ">"
+	case "<":
+		return "<"
+	case "==", "=", "eq":
+		return "=="
+	case "!=", "<>", "neq":
+		return "!="
+	case "":
+		lowerMetric := strings.ToLower(strings.TrimSpace(metric))
+		if threshold == 0 && (strings.Contains(lowerMetric, "issue") ||
+			strings.Contains(lowerMetric, "error") ||
+			strings.Contains(lowerMetric, "warning") ||
+			strings.Contains(lowerMetric, "failure") ||
+			strings.Contains(lowerMetric, "violation") ||
+			strings.Contains(lowerMetric, "defect") ||
+			strings.Contains(lowerMetric, "bug")) {
+			return "=="
+		}
+		return ">="
+	default:
+		return ""
+	}
 }
 
 func validateCriteriaSkill(pi *PipelineInspector) *skills.Skill {
@@ -146,36 +286,44 @@ func validateCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 			if params.TaskID == "" {
 				return nil, fmt.Errorf("task_id is required")
 			}
+			taskID, resolved := pi.resolveTaskID(params.TaskID)
+			if taskID == "" {
+				taskID = strings.TrimSpace(params.TaskID)
+			}
 
 			pi.mu.RLock()
-			criteria, ok := pi.criteria[params.TaskID]
-			files := append([]string(nil), pi.taskFiles[params.TaskID]...)
+			criteria, ok := pi.criteria[taskID]
+			files := append([]string(nil), pi.taskFiles[taskID]...)
 			workerType := pi.workerType
 			pi.mu.RUnlock()
 
 			if !ok {
-				return nil, fmt.Errorf("no criteria defined for task %s", params.TaskID)
+				return nil, fmt.Errorf("no criteria defined for task %s", taskID)
 			}
 			if len(params.Files) > 0 {
 				files = params.Files
 			}
-			result, err := pi.ValidateAgainstCriteria(ctx, params.TaskID, files, workerType)
+			result, err := pi.ValidateAgainstCriteria(ctx, taskID, files, workerType)
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{
-				"task_id":              params.TaskID,
+			response := map[string]any{
+				"task_id":              taskID,
 				"criteria_found":       true,
 				"criteria_count":       len(criteria.SuccessCriteria),
 				"gates_count":          len(criteria.QualityGates),
-				"files_to_check":       params.Files,
+				"files_to_check":       files,
 				"passed":               result.Passed,
 				"issue_count":          len(result.Issues),
 				"criteria_met":         result.CriteriaMet,
 				"criteria_failed":      result.CriteriaFailed,
 				"quality_gate_results": result.QualityGateResults,
 				"issues":               result.Issues,
-			}, nil
+			}
+			if resolved && strings.TrimSpace(params.TaskID) != "" && strings.TrimSpace(params.TaskID) != taskID {
+				response["requested_task_id"] = strings.TrimSpace(params.TaskID)
+			}
+			return response, nil
 		}).
 		Build()
 }
@@ -194,22 +342,45 @@ func gradeTaskQualitySkill(pi *PipelineInspector) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
+			taskID, resolved := pi.resolveTaskID(params.TaskID)
+			if taskID == "" {
+				taskID = strings.TrimSpace(params.TaskID)
+			}
+			if taskID == "" {
+				return nil, fmt.Errorf("task_id is required")
+			}
 			pi.mu.RLock()
-			result := pi.results[params.TaskID]
+			result := pi.results[taskID]
+			criteria := pi.criteria[taskID]
+			files := append([]string(nil), pi.taskFiles[taskID]...)
 			workerType := pi.workerType
 			pi.mu.RUnlock()
+			validationRan := false
 			if result == nil {
-				return nil, fmt.Errorf("no validation result available for task %s", params.TaskID)
+				if criteria == nil {
+					return nil, fmt.Errorf("no validation result available for task %s", taskID)
+				}
+				validated, err := pi.ValidateAgainstCriteria(ctx, taskID, files, workerType)
+				if err != nil {
+					return nil, fmt.Errorf("validate task %s before grading: %w", taskID, err)
+				}
+				result = validated
+				validationRan = true
 			}
 
 			grade := qualityGradeForResult(result, workerType)
 
-			return map[string]any{
-				"task_id":     params.TaskID,
-				"grade":       grade,
-				"overall":     grade.OverallForDomain(shared.ValidationDomainFromWorkerType(workerType)),
-				"issue_count": len(result.Issues),
-			}, nil
+			response := map[string]any{
+				"task_id":        taskID,
+				"grade":          grade,
+				"overall":        grade.OverallForDomain(shared.ValidationDomainFromWorkerType(workerType)),
+				"issue_count":    len(result.Issues),
+				"validation_ran": validationRan,
+			}
+			if resolved && strings.TrimSpace(params.TaskID) != "" && strings.TrimSpace(params.TaskID) != taskID {
+				response["requested_task_id"] = strings.TrimSpace(params.TaskID)
+			}
+			return response, nil
 		}).
 		Build()
 }

@@ -6,9 +6,39 @@ import (
 	"testing"
 )
 
-// newTestRegistry builds an AuthRegistry with a stub probe that checks the
-// given key map. The returned slice collects published events.
-func newTestRegistry(keys map[string]string) (*AuthRegistry, *[]AuthEvent) {
+type testAuthPrefStore struct {
+	mu    sync.Mutex
+	prefs map[string]string
+}
+
+func newTestAuthPrefStore(prefs map[string]string) *testAuthPrefStore {
+	cloned := make(map[string]string, len(prefs))
+	for provider, method := range prefs {
+		cloned[provider] = method
+	}
+	return &testAuthPrefStore{prefs: cloned}
+}
+
+func (s *testAuthPrefStore) Load(provider string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.prefs[provider]
+}
+
+func (s *testAuthPrefStore) Save(provider, authMode string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prefs == nil {
+		s.prefs = make(map[string]string)
+	}
+	s.prefs[provider] = authMode
+	return nil
+}
+
+func newTestRegistry(
+	resolver map[string]map[string]bool,
+	prefs map[string]string,
+) (*AuthRegistry, *[]AuthEvent) {
 	var published []AuthEvent
 	var mu sync.Mutex
 	publisher := func(event AuthEvent) {
@@ -17,161 +47,164 @@ func newTestRegistry(keys map[string]string) (*AuthRegistry, *[]AuthEvent) {
 		mu.Unlock()
 	}
 
-	probe := func(providerType string) bool {
-		key, ok := keys[providerType]
-		return ok && key != ""
+	resolve := func(providerType string) map[string]bool {
+		methods := resolver[providerType]
+		cloned := make(map[string]bool, len(methods))
+		for method, available := range methods {
+			cloned[method] = available
+		}
+		return cloned
 	}
 
-	reg := NewAuthRegistry(probe, publisher, slog.Default())
+	reg := NewAuthRegistry(resolve, newTestAuthPrefStore(prefs), publisher, slog.Default())
 	return reg, &published
 }
 
-func TestProbeAll_MixedAvailability(t *testing.T) {
-	reg, published := newTestRegistry(map[string]string{
-		"google": "gkey",
-		"openai": "okey",
-		// anthropic missing
-	})
+func TestProbeAll_ResolvesPreferredAndFallbackMethods(t *testing.T) {
+	reg, published := newTestRegistry(
+		map[string]map[string]bool{
+			"google":    {"service_account": true},
+			"anthropic": {"oauth": true},
+			"openai":    {"chatgpt": true},
+		},
+		map[string]string{
+			"google":    "oauth",
+			"anthropic": "api_key",
+			"openai":    "oauth",
+		},
+	)
 
 	reg.ProbeAll()
 
-	if len(*published) != 2 {
-		t.Fatalf("expected 2 events, got %d", len(*published))
+	if len(*published) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(*published))
 	}
 
-	// Verify google and openai are available.
-	for _, ev := range *published {
-		if !ev.Available {
-			t.Errorf("expected Available=true for %s", ev.ProviderType)
-		}
-		if ev.ProviderType != "google" && ev.ProviderType != "openai" {
-			t.Errorf("unexpected provider %s", ev.ProviderType)
-		}
+	if got := reg.ActiveMethod("google"); got != "service_account" {
+		t.Fatalf("google active method = %q, want service_account", got)
+	}
+	if got := reg.PreferredMethod("google"); got != "oauth" {
+		t.Fatalf("google preferred method = %q, want oauth", got)
 	}
 
-	if reg.IsAvailable("anthropic") {
-		t.Error("anthropic should not be available")
+	if got := reg.ActiveMethod("anthropic"); got != "oauth" {
+		t.Fatalf("anthropic active method = %q, want oauth", got)
 	}
-}
-
-func TestNotifyCredentialChanged_Publishes(t *testing.T) {
-	reg, published := newTestRegistry(map[string]string{
-		"openai": "key123",
-	})
-
-	reg.NotifyCredentialChanged("openai", "api_key")
-
-	if len(*published) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(*published))
+	if got := reg.PreferredMethod("anthropic"); got != "api_key" {
+		t.Fatalf("anthropic preferred method = %q, want api_key", got)
 	}
-	ev := (*published)[0]
-	if ev.ProviderType != "openai" || !ev.Available || ev.AuthMethod != "api_key" {
-		t.Errorf("unexpected event: %+v", ev)
+
+	// OpenAI legacy "oauth" preference is canonicalized to "chatgpt".
+	if got := reg.ActiveMethod("openai"); got != "chatgpt" {
+		t.Fatalf("openai active method = %q, want chatgpt", got)
+	}
+	if got := reg.PreferredMethod("openai"); got != "chatgpt" {
+		t.Fatalf("openai preferred method = %q, want chatgpt", got)
 	}
 }
 
-func TestIsAvailable_CorrectState(t *testing.T) {
-	reg, _ := newTestRegistry(map[string]string{
-		"google": "gkey",
-	})
+func TestNotifyCredentialChanged_PersistsCanonicalProviderMethod(t *testing.T) {
+	store := newTestAuthPrefStore(nil)
+	var published []AuthEvent
+	reg := NewAuthRegistry(
+		func(providerType string) map[string]bool {
+			if providerType == "openai" {
+				return map[string]bool{"chatgpt": true}
+			}
+			return nil
+		},
+		store,
+		func(event AuthEvent) { published = append(published, event) },
+		slog.Default(),
+	)
 
-	reg.ProbeAll()
+	reg.NotifyCredentialChanged("openai", "oauth")
 
-	if !reg.IsAvailable("google") {
-		t.Error("google should be available")
+	if got := store.Load("openai"); got != "chatgpt" {
+		t.Fatalf("stored openai method = %q, want chatgpt", got)
 	}
-	if reg.IsAvailable("openai") {
-		t.Error("openai should not be available")
+	if got := reg.ActiveMethod("openai"); got != "chatgpt" {
+		t.Fatalf("active openai method = %q, want chatgpt", got)
 	}
-	if reg.IsAvailable("anthropic") {
-		t.Error("anthropic should not be available")
+	if len(published) != 1 {
+		t.Fatalf("expected 1 published event, got %d", len(published))
 	}
-}
-
-func TestLatest_Bounded(t *testing.T) {
-	reg, _ := newTestRegistry(map[string]string{
-		"google":    "g",
-		"anthropic": "a",
-		"openai":    "o",
-	})
-
-	reg.ProbeAll()
-
-	reg.mu.RLock()
-	count := len(reg.latest)
-	reg.mu.RUnlock()
-
-	if count != 3 {
-		t.Errorf("expected exactly 3 entries in latest, got %d", count)
+	if published[0].AuthMethod != "chatgpt" {
+		t.Fatalf("published method = %q, want chatgpt", published[0].AuthMethod)
 	}
 }
 
-func TestNotifyCredentialChanged_NormalizesMethod(t *testing.T) {
-	reg, published := newTestRegistry(map[string]string{
-		"openai": "key",
-	})
+func TestPrimeAll_SeedsUnavailableProvidersWithoutPublishing(t *testing.T) {
+	reg, published := newTestRegistry(
+		map[string]map[string]bool{
+			"google": {},
+		},
+		map[string]string{
+			"google": "oauth",
+		},
+	)
 
-	// Login panel sends "apikey" without underscore.
-	reg.NotifyCredentialChanged("openai", "apikey")
+	reg.PrimeAll()
 
-	if len(*published) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(*published))
+	if len(*published) != 0 {
+		t.Fatalf("expected 0 published events, got %d", len(*published))
 	}
-	ev := (*published)[0]
-	if ev.AuthMethod != "api_key" {
-		t.Errorf("expected normalized 'api_key', got %q", ev.AuthMethod)
+	if reg.IsAvailable("google") {
+		t.Fatal("google should be unavailable")
 	}
-}
-
-func TestActiveMethod_ReturnsCurrentMethod(t *testing.T) {
-	reg, _ := newTestRegistry(map[string]string{
-		"google": "gkey",
-	})
-
-	// Before any probe, ActiveMethod returns "".
-	if m := reg.ActiveMethod("google"); m != "" {
-		t.Errorf("expected empty before probe, got %q", m)
+	if got := reg.PreferredMethod("google"); got != "oauth" {
+		t.Fatalf("preferred google method = %q, want oauth", got)
 	}
-
-	reg.ProbeAll()
-
-	// After probe, ActiveMethod returns the stored method.
-	m := reg.ActiveMethod("google")
-	if m == "" {
-		t.Error("expected non-empty method after probe")
-	}
-
-	// Unknown provider returns "".
-	if m := reg.ActiveMethod("nonexistent"); m != "" {
-		t.Errorf("expected empty for unknown provider, got %q", m)
+	if got := reg.ActiveMethod("google"); got != "" {
+		t.Fatalf("active google method = %q, want empty", got)
 	}
 }
 
-func TestActiveMethod_UnavailableReturnsEmpty(t *testing.T) {
-	reg, _ := newTestRegistry(map[string]string{})
+func TestState_ReturnsMethodAvailabilitySnapshot(t *testing.T) {
+	reg, _ := newTestRegistry(
+		map[string]map[string]bool{
+			"google": {
+				"oauth":           true,
+				"service_account": true,
+			},
+		},
+		map[string]string{
+			"google": "oauth",
+		},
+	)
 
-	reg.NotifyCredentialChanged("google", "oauth")
+	reg.PrimeAll()
+	state := reg.State("google")
 
-	// Probe returns false — credentials unavailable.
-	if m := reg.ActiveMethod("google"); m != "" {
-		t.Errorf("expected empty for unavailable provider, got %q", m)
+	if !state.Available {
+		t.Fatal("expected google to be available")
+	}
+	if !state.AvailableMethods["oauth"] {
+		t.Fatal("expected oauth availability")
+	}
+	if !state.AvailableMethods["service_account"] {
+		t.Fatal("expected service_account availability")
+	}
+	if state.AvailableMethods["api_key"] {
+		t.Fatal("did not expect api_key availability")
 	}
 }
 
-func TestNormalizeMethod(t *testing.T) {
+func TestCanonicalAuthMethod(t *testing.T) {
 	tests := []struct {
-		input string
-		want  string
+		provider string
+		input    string
+		want     string
 	}{
-		{"apikey", "api_key"},
-		{"api_key", "api_key"},
-		{"oauth", "oauth"},
-		{"chatgpt", "chatgpt"},
-		{"", ""},
+		{provider: "openai", input: "oauth", want: "chatgpt"},
+		{provider: "openai", input: "apikey", want: "api_key"},
+		{provider: "google", input: "oauth", want: "oauth"},
+		{provider: "anthropic", input: "apikey", want: "api_key"},
+		{provider: "anthropic", input: "", want: ""},
 	}
-	for _, tt := range tests {
-		if got := normalizeMethod(tt.input); got != tt.want {
-			t.Errorf("normalizeMethod(%q) = %q, want %q", tt.input, got, tt.want)
+	for _, tc := range tests {
+		if got := CanonicalAuthMethod(tc.provider, tc.input); got != tc.want {
+			t.Fatalf("CanonicalAuthMethod(%q, %q) = %q, want %q", tc.provider, tc.input, got, tc.want)
 		}
 	}
 }

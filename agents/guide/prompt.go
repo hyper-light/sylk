@@ -25,6 +25,7 @@ type ClassificationPromptRuntime struct {
 	ActiveConversationScore  float64
 	PendingPlanID            string
 	PendingPlanAgent         string
+	AgentCapabilitySummary   string
 }
 
 // BuildClassificationPrompt composes prompt modules based on request content.
@@ -78,7 +79,9 @@ func classificationRuntimeSection(runtime *ClassificationPromptRuntime) string {
 	}
 	sessionID := strings.TrimSpace(runtime.SessionID)
 	activeAgent := strings.TrimSpace(runtime.ActiveConversationAgent)
-	if sessionID == "" && activeAgent == "" {
+	capabilitySummary := strings.TrimSpace(runtime.AgentCapabilitySummary)
+	hasConversationContext := sessionID != "" || activeAgent != ""
+	if !hasConversationContext && capabilitySummary == "" && pendingPlanRuntimeSection(runtime) == "" {
 		return ""
 	}
 	ageSec := runtime.ActiveConversationAgeSec
@@ -96,29 +99,36 @@ func classificationRuntimeSection(runtime *ClassificationPromptRuntime) string {
 	if score > 1 {
 		score = 1
 	}
-	lines := []string{
-		"## Runtime Conversation Context",
-		"Use this as a tie-breaker for ambiguous follow-up prompts only.",
-	}
-	if sessionID != "" {
-		lines = append(lines, "- session_id: "+sessionID)
-	}
-	if activeAgent != "" {
-		lines = append(lines, "- active_conversation_agent: "+activeAgent)
-	}
-	if turns > 0 {
-		lines = append(lines, fmt.Sprintf("- active_conversation_turns: %d", turns))
-	}
-	if ageSec > 0 {
-		lines = append(lines, fmt.Sprintf("- active_conversation_age_seconds: %d", ageSec))
-	}
-	if score > 0 {
-		lines = append(lines, fmt.Sprintf("- active_conversation_score: %.2f", score))
+	sections := make([]string, 0, 3)
+	if hasConversationContext {
+		lines := []string{
+			"## Runtime Conversation Context",
+			"Use this as a tie-breaker for ambiguous follow-up prompts only.",
+		}
+		if sessionID != "" {
+			lines = append(lines, "- session_id: "+sessionID)
+		}
+		if activeAgent != "" {
+			lines = append(lines, "- active_conversation_agent: "+activeAgent)
+		}
+		if turns > 0 {
+			lines = append(lines, fmt.Sprintf("- active_conversation_turns: %d", turns))
+		}
+		if ageSec > 0 {
+			lines = append(lines, fmt.Sprintf("- active_conversation_age_seconds: %d", ageSec))
+		}
+		if score > 0 {
+			lines = append(lines, fmt.Sprintf("- active_conversation_score: %.2f", score))
+		}
+		sections = append(sections, strings.Join(lines, "\n"))
 	}
 	if pendingSection := pendingPlanRuntimeSection(runtime); pendingSection != "" {
-		lines = append(lines, "", pendingSection)
+		sections = append(sections, pendingSection)
 	}
-	return strings.Join(lines, "\n")
+	if capabilitySummary != "" {
+		sections = append(sections, capabilitySummary)
+	}
+	return strings.Join(sections, "\n\n")
 }
 
 func pendingPlanRuntimeSection(runtime *ClassificationPromptRuntime) string {
@@ -143,7 +153,7 @@ func pendingPlanRuntimeSection(runtime *ClassificationPromptRuntime) string {
 	lines = append(lines,
 		`Any approval or execution phrase ("yes", "ok", "sure", "lgtm", "go ahead",`,
 		`"hand it off", "ship it", "do it", "execute", "proceed", "approved", "let's go")`,
-		`should be classified as intent=execute, domain=planning, target_agent=architect`,
+		`should be classified as intent=execute, domain=tasks, target_agent=architect`,
 		`when a plan is pending. Do NOT classify these as intent=plan — they are approvals.`,
 	)
 	return strings.Join(lines, "\n")

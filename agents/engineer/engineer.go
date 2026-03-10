@@ -70,6 +70,7 @@ type Engineer struct {
 	// so the TUI can group sub-stage agents under the correct task pipeline.
 	pipelineID   string
 	pipelineSlug string
+	pipelineName string
 
 	// Event bus integration
 	bus         guide.EventBus
@@ -299,6 +300,12 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.EngineerConfig.MaxConcurrentTasks == 0 {
 		cfg.EngineerConfig.MaxConcurrentTasks = 1
 	}
+	if !cfg.EngineerConfig.EnableFileWrites {
+		cfg.EngineerConfig.EnableFileWrites = true
+	}
+	if !cfg.EngineerConfig.EnableCommands {
+		cfg.EngineerConfig.EnableCommands = true
+	}
 	if cfg.EngineerConfig.MemoryThreshold.CheckpointThreshold == 0 {
 		cfg.EngineerConfig.MemoryThreshold = DefaultMemoryThreshold()
 	}
@@ -512,6 +519,9 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		e.pipelineSlug = taskSlug
 	}
+	if taskName, _ := fwd.Metadata["task_name"].(string); taskName != "" {
+		e.pipelineName = taskName
+	}
 
 	shared.EmitDispatchACK(e.bus, fwd.Metadata, e.id, "engineer", fwd.CorrelationID)
 	e.publishActivity(events.EventTypeAgentAction, "Processing implementation task")
@@ -569,6 +579,9 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	})
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(e.bus, e.channels, ctx, e.id)
+		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+			pp.Publish("Reviewing task criteria, active test failures, and task-local workspace before implementing changes.")
+		}
 	}
 
 	result, err := e.processForwardedRequest(ctx, fwd)

@@ -206,6 +206,7 @@ func newAnthropicPlanner(ctx context.Context, cfg Config, logger *slog.Logger, g
 			RetryBaseDelay: defaults.RetryBaseDelay,
 			RetryMaxDelay:  defaults.RetryMaxDelay,
 		},
+		AuthMode:         cfg.AnthropicAuthMode,
 		EnableCaching:    !cfg.DisablePromptCache,
 		PromptCacheTTL:   cfg.PromptCacheTTL,
 		SystemPrompt:     buildPlannerSystemPrompt(cfg.SystemPrompt),
@@ -939,16 +940,7 @@ func (e *thoughtEmitter) flush() string {
 
 // shouldEmit returns true when a snapshot should be published.
 func (e *thoughtEmitter) shouldEmit(delta string) bool {
-	// First non-empty content.
-	if e.lastEmitLen == 0 {
-		return true
-	}
-	// Sentence boundary in this delta.
-	if containsSentenceBoundary(delta) {
-		return true
-	}
-	// Buffer doubled since last emit.
-	return e.buffer.Len() >= e.lastEmitLen*2
+	return containsSentenceBoundary(delta)
 }
 
 // containsSentenceBoundary returns true if s contains a sentence-ending

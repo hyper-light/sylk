@@ -173,15 +173,13 @@ func TestThoughtEmitter_BatchesEmissions(t *testing.T) {
 	ctx := withPlannerThoughtCallback(context.Background(), func(string, string) {})
 	emitter := newThoughtEmitter(ctx)
 
-	// First non-empty delta always emits (first-content trigger).
-	if got := emitter.addDelta("Clarifying"); got == "" {
-		t.Fatal("first non-empty delta should emit")
+	// Incomplete prefixes stay buffered until a sentence boundary arrives.
+	if got := emitter.addDelta("Clarifying"); got != "" {
+		t.Fatalf("incomplete prefix should stay buffered, got %q", got)
 	}
 
-	// Mid-word fragment — may or may not emit depending on doubling.
-	// " questions" (10 chars) brings buffer from 10 to 20, which is >= 10*2 → doubling.
-	if got := emitter.addDelta(" questions"); got == "" {
-		t.Fatal("doubling trigger should emit after buffer doubles")
+	if got := emitter.addDelta(" questions"); got != "" {
+		t.Fatalf("still incomplete without punctuation, got %q", got)
 	}
 
 	// Sentence boundary (period) triggers emission.
@@ -205,21 +203,17 @@ func TestThoughtEmitter_DoublingTrigger(t *testing.T) {
 	ctx := withPlannerThoughtCallback(context.Background(), func(string, string) {})
 	emitter := newThoughtEmitter(ctx)
 
-	// First delta emits (first-content trigger), set lastEmitLen.
-	got := emitter.addDelta("a")
-	if got == "" {
-		t.Fatal("first delta should emit")
+	if got := emitter.addDelta("a"); got != "" {
+		t.Fatalf("prefix should stay buffered, got %q", got)
 	}
-	// "b" brings buffer to len=2 which is >= lastEmitLen(1)*2 → doubling trigger.
-	if got := emitter.addDelta("b"); got != "ab" {
-		t.Fatalf("doubling trigger should emit 'ab', got %q", got)
+	if got := emitter.addDelta("b"); got != "" {
+		t.Fatalf("prefix should stay buffered, got %q", got)
 	}
-	// Now lastEmitLen=2. Need buffer >= 4 to trigger again.
 	if got := emitter.addDelta("c"); got != "" {
-		t.Fatalf("should not emit at len=3, got %q", got)
+		t.Fatalf("prefix should stay buffered, got %q", got)
 	}
-	if got := emitter.addDelta("d"); got != "abcd" {
-		t.Fatalf("doubling trigger at len=4 should emit 'abcd', got %q", got)
+	if got := emitter.addDelta("d."); got != "abcd." {
+		t.Fatalf("sentence boundary should emit %q, got %q", "abcd.", got)
 	}
 }
 
@@ -227,12 +221,9 @@ func TestThoughtEmitter_Flush(t *testing.T) {
 	ctx := withPlannerThoughtCallback(context.Background(), func(string, string) {})
 	emitter := newThoughtEmitter(ctx)
 
-	// First delta emits (first-content trigger).
-	if got := emitter.addDelta("**Sequencing planning"); got == "" {
-		t.Fatal("first delta should emit")
+	if got := emitter.addDelta("**Sequencing planning"); got != "" {
+		t.Fatalf("incomplete prefix should stay buffered, got %q", got)
 	}
-	// Add more content that doesn't hit a trigger (no sentence boundary,
-	// buffer hasn't doubled from 21 chars — needs 42).
 	if got := emitter.addDelta(" tasks and"); got != "" {
 		t.Fatal("should not emit mid-buffer")
 	}

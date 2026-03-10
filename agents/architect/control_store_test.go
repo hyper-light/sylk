@@ -152,3 +152,44 @@ func TestArchitectControlStore_ClaimPendingContinuation_IsSingleWinner(t *testin
 		t.Fatalf("expected second claim to lose, got %+v", second)
 	}
 }
+
+func TestArchitectControlStore_LatestActiveContinuationForSession(t *testing.T) {
+	store := testArchitectControlStore(t)
+	now := time.Now().UTC()
+	for _, record := range []*ArchitectContinuation{
+		{
+			ID:                    "cont-old",
+			Kind:                  continuationKindGuardianApproval,
+			State:                 continuationStatusPending,
+			PlanID:                "plan-1",
+			SessionID:             "sess-1",
+			TargetAgentID:         "guardian",
+			ResponseCorrelationID: "corr-old",
+			CreatedAt:             now.Add(-time.Minute),
+			ExpiresAt:             now.Add(time.Minute),
+		},
+		{
+			ID:                    "cont-new",
+			Kind:                  continuationKindAcceptanceEval,
+			State:                 continuationStatusPending,
+			PlanID:                "plan-2",
+			SessionID:             "sess-1",
+			TargetAgentID:         "guide",
+			ResponseCorrelationID: "corr-new",
+			CreatedAt:             now,
+			ExpiresAt:             now.Add(time.Minute),
+		},
+	} {
+		if err := store.PutContinuation(record); err != nil {
+			t.Fatalf("put continuation: %v", err)
+		}
+	}
+
+	record, err := store.LatestActiveContinuationForSession("sess-1", now)
+	if err != nil {
+		t.Fatalf("LatestActiveContinuationForSession: %v", err)
+	}
+	if record == nil || record.ID != "cont-new" {
+		t.Fatalf("record = %+v, want cont-new", record)
+	}
+}

@@ -2,13 +2,10 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/tester"
-	"github.com/adalundhe/sylk/core/providers"
-	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/google/uuid"
 )
 
@@ -21,6 +18,8 @@ func (pt *PipelineTester) HandleRequest(ctx context.Context, req *tester.TesterR
 	}
 
 	switch req.Intent {
+	case tester.IntentCreateTests:
+		return pt.createTests(ctx, req)
 	case tester.IntentRunTests:
 		return pt.runTests(ctx, req)
 	case tester.IntentCoverage:
@@ -34,51 +33,12 @@ func (pt *PipelineTester) HandleRequest(ctx context.Context, req *tester.TesterR
 func (pt *PipelineTester) runTests(ctx context.Context, req *tester.TesterRequest) (*tester.TesterResponse, error) {
 	startTime := time.Now()
 
-	suiteResult := &tester.TestSuiteResult{
-		SuiteID:   uuid.New().String(),
-		Name:      "test_run",
-		StartedAt: startTime,
-		Results:   []tester.TestResult{},
-	}
-
 	packages := req.Packages
-	if len(packages) == 0 {
-		packages = req.Files
-	}
-	if len(packages) == 0 {
-		packages = []string{"./..."}
-	}
-
-	// Invoke the run_test_suite skill for each package set.
-	input, _ := json.Marshal(map[string]any{
-		"packages": packages,
-		"race":     true,
-	})
-	if _, err := pt.toolRuntime().Activate("run_test_suite"); err != nil {
-		return nil, fmt.Errorf("activate run_test_suite: %w", err)
-	}
-	correlationID := req.ID
-	if correlationID == "" {
-		correlationID = suiteResult.SuiteID
-	}
-	execResult, err := pt.toolRuntime().ExecuteRaw(ctx, toolruntime.Invocation{
-		ToolCall: providers.ToolCall{
-			ID:        uuid.New().String(),
-			Name:      "run_test_suite",
-			Arguments: string(input),
-		},
-		AgentID:         pt.toolRuntime().AgentID(),
-		CorrelationID:   correlationID,
-		CapabilityScope: pt.toolRuntime().CapabilityScope(),
-	})
+	execResult, err := pt.executeSuite(ctx, pt.currentHarnessState(), packages, req.Files, req.TestNames, true, false, 60)
 	if err != nil {
-		return nil, fmt.Errorf("execute run_test_suite: %w", err)
+		return nil, fmt.Errorf("run test suite: %w", err)
 	}
-	_ = execResult
-
-	pt.aggregateSuiteResults(suiteResult)
-	suiteResult.CompletedAt = time.Now()
-	suiteResult.Duration = suiteResult.CompletedAt.Sub(startTime)
+	suiteResult := suiteResultFromExecution(execResult, startTime)
 
 	return &tester.TesterResponse{
 		ID:          uuid.New().String(),
@@ -107,22 +67,4 @@ func (pt *PipelineTester) coverageReport(req *tester.TesterRequest) (*tester.Tes
 		CoverageReport: report,
 		Timestamp:      time.Now(),
 	}, nil
-}
-
-func (pt *PipelineTester) aggregateSuiteResults(suite *tester.TestSuiteResult) {
-	suite.TotalTests = len(suite.Results)
-	for _, result := range suite.Results {
-		switch result.Status {
-		case tester.StatusPassed:
-			suite.Passed++
-		case tester.StatusFailed:
-			suite.Failed++
-		case tester.StatusSkipped:
-			suite.Skipped++
-		case tester.StatusError:
-			suite.Errors++
-		case tester.StatusFlaky:
-			suite.FlakyDetected++
-		}
-	}
 }

@@ -143,9 +143,13 @@ func hydrateAnthropicConfig(
 
 func normalizeAnthropicHydrationFields(config *AnthropicConfig) {
 	config.APIKey = strings.TrimSpace(config.APIKey)
-	config.AuthMode = strings.TrimSpace(config.AuthMode)
+	config.AuthMode = normalizeAnthropicAuthModeValue(config.AuthMode)
 	if config.AuthMode == "" {
-		config.AuthMode = AnthropicAuthModeAPIKey
+		if config.APIKey != "" {
+			config.AuthMode = AnthropicAuthModeAPIKey
+		} else {
+			config.AuthMode = ResolveAnthropicAuthMode("")
+		}
 	}
 }
 
@@ -244,6 +248,48 @@ func isAnthropicLongContextModel(model string) bool {
 	return strings.TrimSpace(model) == string(SonnetLongContext)
 }
 
+func normalizeAnthropicAuthModeValue(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "":
+		return ""
+	case "apikey":
+		return AnthropicAuthModeAPIKey
+	case AnthropicAuthModeAPIKey:
+		return AnthropicAuthModeAPIKey
+	case AnthropicAuthModeOAuth:
+		return AnthropicAuthModeOAuth
+	default:
+		return strings.TrimSpace(mode)
+	}
+}
+
+func resolveAnthropicAuthMode(configured, pref string, hasAPIKey, hasOAuth bool) string {
+	if mode := normalizeAnthropicAuthModeValue(configured); mode != "" {
+		return mode
+	}
+	if mode := normalizeAnthropicAuthModeValue(pref); mode != "" {
+		return mode
+	}
+	if hasAPIKey {
+		return AnthropicAuthModeAPIKey
+	}
+	if hasOAuth {
+		return AnthropicAuthModeOAuth
+	}
+	return AnthropicAuthModeAPIKey
+}
+
+// ResolveAnthropicAuthMode resolves the effective Anthropic auth mode from
+// explicit config, stored auth preference, and available credential state.
+func ResolveAnthropicAuthMode(configured string) string {
+	return resolveAnthropicAuthMode(
+		configured,
+		"",
+		ResolveAnthropicAPIKey("") != "",
+		hasStoredAnthropicOAuthAuth(context.Background()),
+	)
+}
+
 // ResolveAnthropicAPIKey resolves the Anthropic API key from config, env, secure store, or llm provider.
 func ResolveAnthropicAPIKey(configured string) string {
 	if key := strings.TrimSpace(configured); key != "" {
@@ -276,6 +322,14 @@ func resolveAnthropicSecureKey() string {
 		return ""
 	}
 	return strings.TrimSpace(key)
+}
+
+func hasStoredAnthropicOAuthAuth(ctx context.Context) bool {
+	auth, err := oauth.NewAnthropicAuthService(oauth.AnthropicAuthServiceConfig{}).Load(ctx)
+	if err != nil || auth == nil {
+		return false
+	}
+	return strings.TrimSpace(auth.AccessToken) != ""
 }
 
 func (p *AnthropicProvider) getClient() *anthropic.Client {

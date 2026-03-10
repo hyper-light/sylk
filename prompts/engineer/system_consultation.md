@@ -12,7 +12,7 @@
 
 ## Consultation Protocol
 
-1. Use `consult_librarian`, `consult_archivalist`, or `consult_academic` skills
+1. Use `consult` with `target: "librarian"`, `target: "archivalist"`, or `target: "academic"`
 2. Consultations are **synchronous** — you will receive the result before proceeding
 3. Results are cached — do NOT re-consult the same agent for the same query
 4. Attach consultation evidence to your implementation context

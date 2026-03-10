@@ -38,6 +38,73 @@ func (a *Architect) latestReadyPlan(sessionID string) *DesignPlan {
 	return best
 }
 
+// latestActivePendingPlan returns the most recently updated plan for the
+// session that still has a live pending continuation attached.
+func (a *Architect) latestActivePendingPlan(sessionID string) *DesignPlan {
+	trimmed := strings.TrimSpace(sessionID)
+	if trimmed == "" || a == nil || a.planStore == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	var best *DesignPlan
+	for _, plan := range a.planStore.AllForSession(trimmed) {
+		if !planHasActivePendingWork(plan, now) {
+			continue
+		}
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	if best == nil && a.controlStore != nil {
+		record, err := a.controlStore.LatestActiveContinuationForSession(trimmed, now)
+		if err == nil && record != nil {
+			best = a.reconcileContinuationRecord(record)
+		}
+	}
+	return best
+}
+
+func planHasActivePendingWork(plan *DesignPlan, now time.Time) bool {
+	if plan == nil || plan.PendingWork == nil {
+		return false
+	}
+	switch plan.SM().State() {
+	case PlanStatusCompleted, PlanStatusFailed, PlanStatusSuperseded:
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(plan.PendingWork.Status))
+	if status != "" &&
+		status != string(continuationStatusPending) &&
+		status != string(continuationStatusProcessing) {
+		return false
+	}
+	if !plan.PendingWork.ExpiresAt.IsZero() && now.After(plan.PendingWork.ExpiresAt) {
+		return false
+	}
+	return true
+}
+
+func pendingPlanUserMessage(plan *DesignPlan) string {
+	if plan == nil || plan.PendingWork == nil {
+		return "I already have work in flight for this plan and will update you shortly."
+	}
+	if message := strings.TrimSpace(plan.PendingWork.Message); message != "" {
+		return message
+	}
+	switch strings.TrimSpace(plan.PendingWork.Kind) {
+	case string(continuationKindGuardianApproval):
+		return "The latest plan response is still going through Guardian approval. I'll update you shortly."
+	case string(continuationKindAcceptanceEval):
+		return "I'm still reviewing your response against the current plan and will update you shortly."
+	case string(continuationKindPlanHandoff):
+		return "That plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion."
+	case string(continuationKindAcademicHandoff):
+		return "The latest plan is still waiting on requirements research. I'll update you shortly."
+	default:
+		return "I already have work in flight for this plan and will update you shortly."
+	}
+}
+
 // dispatchPlanExecution validates the handoff payload, persists a pending
 // handoff continuation, and publishes an explicit-target request to the
 // orchestrator through the Guide without blocking the architect loop. The

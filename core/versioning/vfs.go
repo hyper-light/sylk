@@ -910,11 +910,23 @@ func (v *PipelineVFS) resolvePath(path string) (string, error) {
 
 func (v *PipelineVFS) isPathAllowed(absPath string) bool {
 	if len(v.config.AllowedPaths) == 0 {
-		return isUnderPath(absPath, v.config.WorkingDir)
+		return isUnderPath(absPath, v.config.WorkingDir) || v.isVisiblePathAllowed(absPath)
 	}
 
 	for _, allowed := range v.config.AllowedPaths {
 		if isUnderPath(absPath, allowed) {
+			return true
+		}
+	}
+	return v.isVisiblePathAllowed(absPath)
+}
+
+func (v *PipelineVFS) isVisiblePathAllowed(absPath string) bool {
+	if len(v.visiblePaths) == 0 {
+		return false
+	}
+	for visible := range v.visiblePaths {
+		if isUnderPath(absPath, visible) {
 			return true
 		}
 	}

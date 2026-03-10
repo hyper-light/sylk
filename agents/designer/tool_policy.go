@@ -7,6 +7,7 @@ import (
 
 func designerVisibleSkillNames() []string {
 	return []string{
+		"search_skills",
 		"component_search",
 		"read_workspace_file",
 		"workspace_glob",
@@ -16,6 +17,13 @@ func designerVisibleSkillNames() []string {
 		"component_create",
 		"component_modify",
 		"ask_user_clarification",
+		"coord_query_view",
+		"coord_watch_updates",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
 	}
 }
 
@@ -27,6 +35,11 @@ func designerMutatingSkillNames() []string {
 		"request_inspector_check",
 		"request_tester_validation",
 		"ask_user_clarification",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
 		"report_to_engineer",
 		"report_to_orchestrator",
 		"reroute_request",

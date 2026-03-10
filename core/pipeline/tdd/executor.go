@@ -208,11 +208,13 @@ func (e *TDDExecutor) phaseCreateTests(ctx context.Context) error {
 	e.mu.RLock()
 	taskID := e.pipeline.TaskID
 	workerType := string(e.pipeline.WorkerType)
+	taskPrompt := e.pipeline.TaskPrompt
 	e.mu.RUnlock()
 
 	req := &tester.TesterRequest{
-		Intent:     tester.IntentRunTests,
-		Files:      []string{taskID},
+		Intent:     tester.IntentCreateTests,
+		TaskID:     taskID,
+		TaskPrompt: taskPrompt,
 		WorkerType: workerType,
 	}
 	resp, err := e.tester.HandleRequest(ctx, req)

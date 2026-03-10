@@ -44,3 +44,19 @@ func TestClassificationRuntimeSection_IncludesPendingPlan(t *testing.T) {
 		t.Fatalf("expected pending_plan_agent in prompt")
 	}
 }
+
+func TestBuildClassificationPromptWithRuntime_IncludesLiveCapabilityMap(t *testing.T) {
+	prompt := BuildClassificationPromptWithRuntime("how would you implement oauth?", &ClassificationPromptRuntime{
+		AgentCapabilitySummary: strings.Join([]string{
+			"## Live Agent Capability Map",
+			"These live registry constraints are authoritative.",
+			"- academic: intents=recall,check,fetch,help,chat; domains=research",
+		}, "\n"),
+	})
+	if !strings.Contains(prompt, "Live Agent Capability Map") {
+		t.Fatalf("expected live capability map section in prompt")
+	}
+	if !strings.Contains(prompt, "academic: intents=recall,check,fetch,help,chat; domains=research") {
+		t.Fatalf("expected academic capability line in prompt")
+	}
+}

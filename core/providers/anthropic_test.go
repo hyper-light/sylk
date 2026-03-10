@@ -74,3 +74,57 @@ func marshalAnthropicParams(t *testing.T, params any) map[string]any {
 	}
 	return body
 }
+
+func TestResolveAnthropicAuthMode(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+		pref       string
+		hasAPIKey  bool
+		hasOAuth   bool
+		want       string
+	}{
+		{
+			name:       "configured apikey normalizes",
+			configured: "apikey",
+			want:       AnthropicAuthModeAPIKey,
+		},
+		{
+			name:       "configured oauth wins",
+			configured: AnthropicAuthModeOAuth,
+			pref:       AnthropicAuthModeAPIKey,
+			hasAPIKey:  true,
+			want:       AnthropicAuthModeOAuth,
+		},
+		{
+			name:      "stored preference wins",
+			pref:      AnthropicAuthModeOAuth,
+			hasAPIKey: true,
+			want:      AnthropicAuthModeOAuth,
+		},
+		{
+			name:      "api key preferred without preference",
+			hasAPIKey: true,
+			hasOAuth:  true,
+			want:      AnthropicAuthModeAPIKey,
+		},
+		{
+			name:     "oauth used when only oauth exists",
+			hasOAuth: true,
+			want:     AnthropicAuthModeOAuth,
+		},
+		{
+			name: "defaults to api key",
+			want: AnthropicAuthModeAPIKey,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveAnthropicAuthMode(tc.configured, tc.pref, tc.hasAPIKey, tc.hasOAuth)
+			if got != tc.want {
+				t.Fatalf("resolveAnthropicAuthMode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

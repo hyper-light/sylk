@@ -233,7 +233,6 @@ func (sr *SessionRouter) Route(ctx context.Context, sessionID string, request *R
 	}
 
 	result = sr.applyPreferencesIfNeeded(result, prefs, hasPrefs)
-	sr.cacheRouteResult(cache, prefs, hasCache, hasPrefs, request, result)
 
 	return result, nil
 }
@@ -365,23 +364,24 @@ func (sr *SessionRouter) applyPreferencesIfNeeded(result *RouteResult, prefs *Se
 	return sr.applyPreferences(result, prefs)
 }
 
-func (sr *SessionRouter) cacheRouteResult(cache *RouteCache, prefs *SessionRoutingPrefs, hasCache bool, hasPrefs bool, request *RouteRequest, result *RouteResult) {
+func (sr *SessionRouter) cacheRouteResult(cache *RouteCache, prefs *SessionRoutingPrefs, hasCache bool, hasPrefs bool, request *RouteRequest, result *RouteResult) bool {
 	sr.cacheSessionResult(cache, hasCache, request, result)
-	sr.cacheGlobalResult(prefs, hasPrefs, request, result)
+	return sr.cacheGlobalResult(prefs, hasPrefs, request, result)
 }
 
 func (sr *SessionRouter) cacheSessionResult(cache *RouteCache, hasCache bool, request *RouteRequest, result *RouteResult) {
-	if !hasCache || result.ClassificationMethod != "llm" {
+	if !hasCache || !shouldPersistLearnedClassification(result.ClassificationMethod) {
 		return
 	}
 	cache.Set(request.Input, result)
 }
 
-func (sr *SessionRouter) cacheGlobalResult(prefs *SessionRoutingPrefs, hasPrefs bool, request *RouteRequest, result *RouteResult) {
+func (sr *SessionRouter) cacheGlobalResult(prefs *SessionRoutingPrefs, hasPrefs bool, request *RouteRequest, result *RouteResult) bool {
 	if !sr.shouldCacheGlobal(prefs, hasPrefs, result) {
-		return
+		return false
 	}
 	sr.guide.routeCache.Set(request.Input, result)
+	return true
 }
 
 func (sr *SessionRouter) shouldCacheGlobal(prefs *SessionRoutingPrefs, hasPrefs bool, result *RouteResult) bool {
@@ -391,7 +391,24 @@ func (sr *SessionRouter) shouldCacheGlobal(prefs *SessionRoutingPrefs, hasPrefs 
 	if !prefs.PopulateGlobalCache {
 		return false
 	}
-	return result.ClassificationMethod == "llm"
+	return shouldPersistLearnedClassification(result.ClassificationMethod)
+}
+
+func (sr *SessionRouter) CacheFinalizedClassification(request *RouteRequest, result *RouteResult) bool {
+	if sr == nil || request == nil || result == nil {
+		return false
+	}
+	sessionID := strings.TrimSpace(request.SessionID)
+	if sessionID == "" {
+		if sr.guide == nil || sr.guide.routeCache == nil || !shouldPersistLearnedClassification(result.ClassificationMethod) {
+			return false
+		}
+		sr.guide.routeCache.Set(request.Input, result)
+		return true
+	}
+	cache := sr.GetOrCreateSession(sessionID)
+	prefs := sr.snapshotSessionPrefs(sessionID)
+	return sr.cacheRouteResult(cache, prefs, true, true, request, result)
 }
 
 // matchRules tries to match input against session rules

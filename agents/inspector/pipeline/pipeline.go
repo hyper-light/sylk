@@ -45,6 +45,7 @@ type PipelineInspector struct {
 	activityPub  events.ActivityPublisher
 	pipelineID   string // Stable task-level pipeline ID for TUI grouping.
 	pipelineSlug string
+	pipelineName string
 
 	// Tool runner for external analysis tools.
 	toolRunner *shared.ToolRunner
@@ -188,6 +189,10 @@ func (pi *PipelineInspector) initSkills() error {
 
 func (pi *PipelineInspector) registerSafetyHook() {
 	allowed := map[string]bool{
+		"search_skills":    true,
+		"coord_query_view": true, "coord_watch_updates": true,
+		"coord_claim_scope": true, "coord_release_scope": true,
+		"coord_publish_artifact": true, "coord_request_review": true, "coord_resolve_artifact": true,
 		"run_linter": true, "run_type_checker": true, "run_formatter_check": true,
 		"run_security_scan": true, "check_coverage": true, "analyze_complexity": true,
 		"detect_race_conditions": true, "detect_deadlocks": true, "detect_memory_leaks": true,
@@ -405,7 +410,7 @@ func stageInstructions(stage string) string {
 			"This is the **inspect** stage (pre-implementation). Execute the validation protocol:\n" +
 			"0. Inspect the workspace snapshot and use `summarize_workspace_state` or `inspect_workspace_state` if any layer mismatch or unavailable view needs clarification\n" +
 			"1. Define success criteria for this task using `define_criteria`\n" +
-			"2. If upstream results contain implementation files, run analysis tools\n" +
+			"2. If upstream results contain implementation files, run analysis tools and validate against criteria using `validate_criteria`\n" +
 			"3. Grade and report using `grade_task_quality` and `get_validation_status`\n"
 	}
 	return "### Instructions\n\n" +
@@ -514,6 +519,9 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		pi.pipelineSlug = taskSlug
 	}
+	if taskName, _ := fwd.Metadata["task_name"].(string); taskName != "" {
+		pi.pipelineName = taskName
+	}
 
 	agentShared.EmitDispatchACK(pi.bus, fwd.Metadata, pi.id, "inspector-pipeline", fwd.CorrelationID)
 	pi.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
@@ -562,6 +570,9 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(pi.bus, pi.channels, ctx, pi.id)
+		if pp := agentShared.ProgressPublisherFromContext(ctx); pp != nil {
+			pp.Publish("Inspecting the task contract, acceptance criteria, and workspace layers to derive concrete implementation failures.")
+		}
 	}
 
 	result, err := pi.Handle(ctx, fwd)
@@ -656,6 +667,53 @@ func (pi *PipelineInspector) getCurrentIssues() []shared.ValidationIssue {
 	return nil
 }
 
+func (pi *PipelineInspector) resolveTaskID(requested string) (string, bool) {
+	requested = strings.TrimSpace(requested)
+
+	pi.mu.RLock()
+	defer pi.mu.RUnlock()
+
+	current := ""
+	if pi.state != nil {
+		current = strings.TrimSpace(pi.state.CurrentTaskID)
+	}
+
+	if requested != "" {
+		if requested == current {
+			return requested, false
+		}
+		if pi.criteria[requested] != nil || pi.results[requested] != nil || len(pi.taskFiles[requested]) > 0 {
+			return requested, false
+		}
+		if current != "" {
+			return current, true
+		}
+		return requested, false
+	}
+
+	if current != "" {
+		return current, true
+	}
+
+	if len(pi.criteria) == 1 {
+		for taskID := range pi.criteria {
+			return taskID, true
+		}
+	}
+	if len(pi.results) == 1 {
+		for taskID := range pi.results {
+			return taskID, true
+		}
+	}
+	if len(pi.taskFiles) == 1 {
+		for taskID := range pi.taskFiles {
+			return taskID, true
+		}
+	}
+
+	return "", false
+}
+
 func (pi *PipelineInspector) publishRerouteRequest(reason, originalInput, suggestedTarget string) error {
 	if pi.bus == nil {
 		return fmt.Errorf("pipeline inspector bus not available")
@@ -738,10 +796,12 @@ func (pi *PipelineInspector) DefineCriteria(taskID string, criteria *shared.Insp
 		pi.state.CurrentTaskID = taskID
 		pi.state.LastActiveAt = time.Now()
 	}
-	if el := pi.steering.EventLogger(); el != nil {
-		agentShared.LogAgentEvent(el, agentlog.EventValidationStarted,
-			pi.id, "", "", "info",
-			&agentlog.ValidationPayload{Phase: "criteria_defined", TaskID: taskID})
+	if pi.steering != nil {
+		if el := pi.steering.EventLogger(); el != nil {
+			agentShared.LogAgentEvent(el, agentlog.EventValidationStarted,
+				pi.id, "", "", "info",
+				&agentlog.ValidationPayload{Phase: "criteria_defined", TaskID: taskID})
+		}
 	}
 }
 

@@ -7,6 +7,10 @@ import (
 
 func pipelineTesterVisibleSkillNames() []string {
 	return []string{
+		"search_skills",
+		"check_inspector_gate",
+		"detect_test_harness",
+		"prepare_test_harness",
 		"analyze_risk",
 		"plan_tests",
 		"read_workspace_file",
@@ -17,6 +21,15 @@ func pipelineTesterVisibleSkillNames() []string {
 		"write_test",
 		"run_test_suite",
 		"diagnose_failure",
+		"report_to_engineer",
+		"report_to_designer",
+		"coord_query_view",
+		"coord_watch_updates",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
 	}
 }
 
@@ -26,6 +39,11 @@ func pipelineTesterMutatingSkillNames() []string {
 		"run_test_suite",
 		"report_to_engineer",
 		"report_to_designer",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
 		"reroute_request",
 	}
 }

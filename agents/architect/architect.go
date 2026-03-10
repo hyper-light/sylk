@@ -125,6 +125,7 @@ type Config struct {
 
 	// LLM planning configuration
 	EnableLLM          bool
+	AnthropicAuthMode  string
 	AnthropicAPIKey    string
 	Model              string
 	ThinkingBudget     int
@@ -369,6 +370,7 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 			}
 		}
 	}
+	architect.reconcilePendingContinuations()
 
 	guide.DebugFileLog().Info("DEBUG: architect_new_init_cross_domain")
 	architect.initCrossDomain(cfg)
@@ -406,6 +408,13 @@ func applyConfigDefaults(cfg Config) Config {
 	})
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
+	}
+	if cfg.AnthropicAuthMode == "" {
+		if strings.TrimSpace(cfg.AnthropicAPIKey) != "" {
+			cfg.AnthropicAuthMode = providers.AnthropicAuthModeAPIKey
+		} else {
+			cfg.AnthropicAuthMode = providers.ResolveAnthropicAuthMode("")
+		}
 	}
 	if cfg.Model == "" {
 		cfg.Model = DefaultArchitectModel
@@ -1459,14 +1468,30 @@ func (a *Architect) feedbackReadyDirective(plan *DesignPlan) *guide.ResponseDire
 func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	a.logInfo("handleExecute: entry",
 		"input", truncateString(fwd.Input, 80))
+	sessionID := sessionIDFromForwarded(fwd)
 	architectDebugLog().Info("handoff: EXECUTE_ENTRY",
 		"user_input", truncateString(fwd.Input, 200),
-		"session_id", sessionIDFromForwarded(fwd),
+		"session_id", sessionID,
 		"has_metadata", fwd.Metadata != nil)
 
-	plan := a.latestReadyPlan(sessionIDFromForwarded(fwd))
+	now := time.Now().UTC()
+	plan := a.latestReadyPlan(sessionID)
+	if plan != nil && planHasActivePendingWork(plan, now) {
+		return &ConversationResult{
+			Response: pendingPlanUserMessage(plan),
+			Intent:   IntentExecute,
+		}, nil
+	}
+	if pending := a.latestActivePendingPlan(sessionID); pending != nil {
+		if plan == nil || pending.ID == plan.ID || !plan.UpdatedAt.After(pending.UpdatedAt) {
+			return &ConversationResult{
+				Response: pendingPlanUserMessage(pending),
+				Intent:   IntentExecute,
+			}, nil
+		}
+	}
 	if plan == nil {
-		if pending := a.planStore.LatestByStatus(sessionIDFromForwarded(fwd), PlanStatusOrchestrating, ReadyPlanMaxAge); pending != nil {
+		if pending := a.planStore.LatestByStatus(sessionID, PlanStatusOrchestrating, ReadyPlanMaxAge); pending != nil {
 			return &ConversationResult{
 				Response: "That plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
 				Intent:   IntentExecute,
@@ -1474,7 +1499,7 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 		}
 		a.logInfo("handleExecute: no ready plan found")
 		architectDebugLog().Warn("handoff: EXECUTE_NO_READY_PLAN",
-			"session_id", sessionIDFromForwarded(fwd),
+			"session_id", sessionID,
 			"active_plans", a.activePlanCount())
 		return &ConversationResult{
 			Response: "There's no ready plan to execute. Describe what you'd like to build and I'll create one.",
@@ -2362,7 +2387,7 @@ func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequ
 		a.logWarn("conversationFallback: no planner configured")
 		return &ConversationResult{
 			Response: "I can't generate a detailed plan right now — my LLM planner is not configured. " +
-				"Please ensure an Anthropic API key is available (ANTHROPIC_API_KEY environment variable or the secure credential store).",
+				"Please ensure Anthropic credentials are available (OAuth login or ANTHROPIC_API_KEY / secure credential store).",
 			Intent: req.Intent,
 		}, nil
 	}

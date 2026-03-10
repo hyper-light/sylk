@@ -1,9 +1,11 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -45,6 +47,7 @@ type OpenAIDeviceAuthResult struct {
 type OpenAIModel string
 
 const (
+	GPT_5_4     OpenAIModel = "gpt-5.4"
 	GPT_5_4_Pro OpenAIModel = "gpt-5.4-pro"
 )
 
@@ -55,14 +58,17 @@ const (
 	// Mirrors Codex chatgpt-mode backend routing.
 	defaultChatGPTCodexBaseURL = "https://chatgpt.com/backend-api/codex"
 	defaultOpenAIUserAgent     = "sylk/1.0 (+https://github.com/adalundhe/sylk)"
+	defaultOpenAIOriginator    = "sylk_cli_go"
 )
 
 // Supported OpenAI models (canonical slugs).
 var openaiModelCatalog = map[string]ModelInfo{
+	"gpt-5.4":     {ID: "gpt-5.4", Name: "GPT-5.4", MaxContext: 272000},
 	"gpt-5.4-pro": {ID: "gpt-5.4-pro", Name: "GPT-5.4 Pro", MaxContext: 272000},
 }
 
 var openaiModelAliases = map[string]string{
+	"gpt-5-4":     "gpt-5.4",
 	"gpt-5-4-pro": "gpt-5.4-pro",
 }
 
@@ -376,6 +382,7 @@ type requestObserver struct {
 	requestID  string
 	retryCount int
 	response   *http.Response
+	bodyText   string
 }
 
 func newRequestObserver() *requestObserver {
@@ -394,9 +401,59 @@ func (o *requestObserver) options() []option.RequestOption {
 					o.retryCount = n
 				}
 			}
-			return next(req)
+			resp, err := next(req)
+			o.captureErrorBody(resp)
+			return resp, err
 		}),
 	}
+}
+
+func (o *requestObserver) captureErrorBody(resp *http.Response) {
+	if o == nil || resp == nil || resp.StatusCode < http.StatusBadRequest || resp.Body == nil {
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	o.bodyText = strings.TrimSpace(string(body))
+}
+
+func (p *OpenAIProvider) buildResponseRequestOptions(
+	req *Request,
+	observer *requestObserver,
+) []option.RequestOption {
+	opts := make([]option.RequestOption, 0, 4)
+	if observer != nil {
+		opts = append(opts, observer.options()...)
+	}
+	if sessionID := resolveOpenAIRequestSessionID(req); sessionID != "" {
+		opts = append(opts, option.WithHeader("session_id", sessionID))
+	}
+	if originator := resolveOpenAIRequestOriginator(req); originator != "" {
+		opts = append(opts, option.WithHeader("originator", originator))
+	}
+	return opts
+}
+
+func resolveOpenAIRequestSessionID(req *Request) string {
+	if req == nil || req.Metadata == nil {
+		return ""
+	}
+	value, _ := req.Metadata["session_id"].(string)
+	return strings.TrimSpace(value)
+}
+
+func resolveOpenAIRequestOriginator(req *Request) string {
+	if req != nil && req.Metadata != nil {
+		if value, ok := req.Metadata["originator"].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return defaultOpenAIOriginator
 }
 
 func (o *requestObserver) metadata() map[string]any {
@@ -412,6 +469,9 @@ func (o *requestObserver) metadata() map[string]any {
 		if v := strings.TrimSpace(o.response.Header.Get("openai-processing-ms")); v != "" {
 			metadata["processing_ms"] = v
 		}
+	}
+	if o.bodyText != "" {
+		metadata["http_error_body"] = o.bodyText
 	}
 	return metadata
 }
@@ -691,7 +751,7 @@ func (p *OpenAIProvider) runChatGPTGenerateAttempt(ctx context.Context, req *Req
 func (p *OpenAIProvider) generateStandard(ctx context.Context, req *Request) (*Response, error) {
 	params := p.buildResponseParams(req)
 	requestedModel := string(params.Model)
-	resp, err := p.runStandardGenerateAttempt(ctx, params)
+	resp, err := p.runStandardGenerateAttempt(ctx, req, params)
 	if err == nil {
 		return resp, nil
 	}
@@ -701,7 +761,7 @@ func (p *OpenAIProvider) generateStandard(ctx context.Context, req *Request) (*R
 	}
 	retryReq := *req
 	retryReq.Model = fallbackModel
-	resp, err = p.runStandardGenerateAttempt(ctx, p.buildResponseParams(&retryReq))
+	resp, err = p.runStandardGenerateAttempt(ctx, &retryReq, p.buildResponseParams(&retryReq))
 	if err != nil {
 		return nil, wrapOpenAIProviderError("generate", err)
 	}
@@ -713,9 +773,13 @@ func (p *OpenAIProvider) generateStandard(ctx context.Context, req *Request) (*R
 	return resp, nil
 }
 
-func (p *OpenAIProvider) runStandardGenerateAttempt(ctx context.Context, params responses.ResponseNewParams) (*Response, error) {
+func (p *OpenAIProvider) runStandardGenerateAttempt(
+	ctx context.Context,
+	req *Request,
+	params responses.ResponseNewParams,
+) (*Response, error) {
 	observer := newRequestObserver()
-	result, err := p.getClient().Responses.New(ctx, params, observer.options()...)
+	result, err := p.getClient().Responses.New(ctx, params, p.buildResponseRequestOptions(req, observer)...)
 	if err != nil {
 		return nil, err
 	}
@@ -785,10 +849,10 @@ func coalesceStopReason(reason StopReason) StopReason {
 func (p *OpenAIProvider) resolveStreamResponseModel(req *Request) string {
 	if req != nil {
 		if model := normalizeOpenAIModel(req.Model); model != "" {
-			return model
+			return ResolveOpenAIModelForAuth(model, p.config.AuthMode)
 		}
 	}
-	return normalizeOpenAIModel(p.config.Model)
+	return ResolveOpenAIModelForAuth(p.config.Model, p.config.AuthMode)
 }
 
 func (p *OpenAIProvider) StreamWithHandler(ctx context.Context, req *Request, handler StreamHandler) error {
@@ -1004,7 +1068,11 @@ func newOpenAIResponseStreamRunner(
 ) *openAIResponseStreamRunner {
 	observer := newRequestObserver()
 	params := provider.buildResponseParams(req)
-	stream := provider.getClient().Responses.NewStreaming(ctx, params, observer.options()...)
+	stream := provider.getClient().Responses.NewStreaming(
+		ctx,
+		params,
+		provider.buildResponseRequestOptions(req, observer)...,
+	)
 	runner := &openAIResponseStreamRunner{
 		provider:           provider,
 		observer:           observer,
@@ -1088,8 +1156,20 @@ func (r *openAIResponseStreamRunner) consumeStreamError() error {
 	if err == nil {
 		return nil
 	}
+	err = enrichOpenAIStreamError(err, r.observer)
 	r.emitBestEffortErrorChunk(r.chunkIndex+1, err.Error())
 	return fmt.Errorf("openai stream: %w", err)
+}
+
+func enrichOpenAIStreamError(err error, observer *requestObserver) error {
+	if err == nil || observer == nil {
+		return err
+	}
+	body := strings.TrimSpace(observer.bodyText)
+	if body == "" || strings.Contains(err.Error(), body) {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, body)
 }
 
 func (r *openAIResponseStreamRunner) emitBestEffortErrorChunk(index int, message string) {
@@ -1469,6 +1549,7 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req *Request) (*Response,
 
 func (p *OpenAIProvider) SupportedModels() []ModelInfo {
 	return []ModelInfo{
+		openaiModelCatalog["gpt-5.4"],
 		openaiModelCatalog["gpt-5.4-pro"],
 	}
 }
@@ -1501,7 +1582,7 @@ func (p *OpenAIProvider) buildResponseParams(req *Request) responses.ResponseNew
 	params := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(model),
 		Input: responses.ResponseNewParamsInputUnion{
-			OfInputItemList: p.convertResponseMessages(req.Messages, systemPrompt),
+			OfInputItemList: p.convertResponseMessages(req.Messages, systemPrompt, p.config.AuthMode != openAIAuthModeChatGPT),
 		},
 	}
 	p.applyStore(&params)
@@ -1516,7 +1597,7 @@ func (p *OpenAIProvider) buildResponseParams(req *Request) responses.ResponseNew
 	p.applyTools(&params, req.Tools)
 	p.applyParallelToolCalls(&params, req)
 	p.applyToolChoice(&params, req.ToolChoice)
-	p.applyPromptCache(&params, req)
+	p.applyPromptCache(&params, req, model)
 	return params
 }
 
@@ -1530,9 +1611,9 @@ func ensureProviderRequest(req *Request) *Request {
 func (p *OpenAIProvider) resolveRequestModel(req *Request) string {
 	model := normalizeOpenAIModel(req.Model)
 	if model != "" {
-		return model
+		return ResolveOpenAIModelForAuth(model, p.config.AuthMode)
 	}
-	return normalizeOpenAIModel(p.config.Model)
+	return ResolveOpenAIModelForAuth(p.config.Model, p.config.AuthMode)
 }
 
 func (p *OpenAIProvider) resolveSystemPrompt(req *Request) string {
@@ -1694,9 +1775,16 @@ func resolveOpenAIVerbosity(verbosity string) string {
 }
 
 func (p *OpenAIProvider) applyTruncation(params *responses.ResponseNewParams, model string) {
-	if supportsOpenAIReasoningConfig(model) {
+	if supportsOpenAITruncationConfig(model, p.config.AuthMode) {
 		params.Truncation = responses.ResponseNewParamsTruncationAuto
 	}
+}
+
+func supportsOpenAITruncationConfig(model string, authMode string) bool {
+	if authMode == openAIAuthModeChatGPT {
+		return false
+	}
+	return supportsOpenAIReasoningConfig(model)
 }
 
 // applyInclude requests encrypted reasoning content so that reasoning items
@@ -1750,13 +1838,25 @@ func (p *OpenAIProvider) applyToolChoice(params *responses.ResponseNewParams, ch
 	}
 }
 
-func (p *OpenAIProvider) applyPromptCache(params *responses.ResponseNewParams, req *Request) {
+func (p *OpenAIProvider) applyPromptCache(params *responses.ResponseNewParams, req *Request, model string) {
 	key := strings.TrimSpace(req.PromptCacheKey)
 	if key != "" {
 		params.PromptCacheKey = openai.String(key)
 	}
+	if !supportsOpenAIPromptCacheRetention(model) {
+		return
+	}
 	if retention := normalizeOpenAIPromptCacheRetention(req.PromptCacheRetention); retention != "" {
 		params.SetExtraFields(map[string]any{"prompt_cache_retention": retention})
+	}
+}
+
+func supportsOpenAIPromptCacheRetention(model string) bool {
+	switch normalizeOpenAIModel(model) {
+	case string(GPT_5_4_Pro):
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1771,10 +1871,15 @@ func normalizeOpenAIPromptCacheRetention(value string) string {
 	}
 }
 
-func (p *OpenAIProvider) convertResponseMessages(messages []Message, systemPrompt string) responses.ResponseInputParam {
+func (p *OpenAIProvider) convertResponseMessages(messages []Message, systemPrompt string, includeSystemPrompt bool) responses.ResponseInputParam {
 	result := make(responses.ResponseInputParam, 0, len(messages)+1)
-	appendSystemPromptMessage(&result, systemPrompt)
+	if includeSystemPrompt {
+		appendSystemPromptMessage(&result, systemPrompt)
+	}
 	for _, msg := range messages {
+		if !includeSystemPrompt && msg.Role == RoleSystem {
+			continue
+		}
 		appendConvertedMessage(&result, msg)
 	}
 	return result
@@ -2128,6 +2233,21 @@ func normalizeOpenAIModel(model string) string {
 		return canonical
 	}
 	return model
+}
+
+// ResolveOpenAIModelForAuth maps unsupported ChatGPT-account model slugs to a
+// supported equivalent while leaving API-key requests untouched.
+func ResolveOpenAIModelForAuth(model string, authMode string) string {
+	model = normalizeOpenAIModel(model)
+	if authMode != openAIAuthModeChatGPT {
+		return model
+	}
+	switch model {
+	case string(GPT_5_4_Pro):
+		return string(GPT_5_4)
+	default:
+		return model
+	}
 }
 
 func modelSupportsTemperature(model string) bool {

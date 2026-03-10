@@ -31,11 +31,12 @@ type PipelineTask struct {
 
 // TaskRouterConfig provides construction parameters for TaskRouter.
 type TaskRouterConfig struct {
-	Bus       guide.EventBus
-	Scope     *concurrency.GoroutineScope
-	AgentID   string
-	SessionID string
-	Logger    *slog.Logger
+	Bus                       guide.EventBus
+	Scope                     *concurrency.GoroutineScope
+	AgentID                   string
+	SessionID                 string
+	Logger                    *slog.Logger
+	StreamMirrorTargetAgentID string
 }
 
 // TaskRouter routes DAG-dispatched tasks to pipeline agents through
@@ -43,11 +44,12 @@ type TaskRouterConfig struct {
 // flows through guide.requests → request.<type>.<id> → response.<type>.<id>,
 // enforcing audit, rate limiting, and policy.
 type TaskRouter struct {
-	bus       guide.EventBus
-	scope     *concurrency.GoroutineScope
-	agentID   string
-	sessionID string
-	logger    *slog.Logger
+	bus                  guide.EventBus
+	scope                *concurrency.GoroutineScope
+	agentID              string
+	sessionID            string
+	logger               *slog.Logger
+	streamMirrorTargetID string
 
 	pendingMu sync.Mutex
 	pending   map[string]*pendingRoute // correlationID → pending
@@ -67,12 +69,13 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 		logger = slog.Default()
 	}
 	return &TaskRouter{
-		bus:       cfg.Bus,
-		scope:     cfg.Scope,
-		agentID:   cfg.AgentID,
-		sessionID: cfg.SessionID,
-		logger:    logger,
-		pending:   make(map[string]*pendingRoute),
+		bus:                  cfg.Bus,
+		scope:                cfg.Scope,
+		agentID:              cfg.AgentID,
+		sessionID:            cfg.SessionID,
+		logger:               logger,
+		streamMirrorTargetID: defaultStreamMirrorTarget(cfg.StreamMirrorTargetAgentID),
+		pending:              make(map[string]*pendingRoute),
 	}
 }
 
@@ -144,6 +147,9 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	if msg == nil || msg.CorrelationID == "" {
 		return false
 	}
+	if msg.Type == guide.MessageTypeStream {
+		return r.mirrorStreamToUser(msg)
+	}
 	if !isTerminalRouteMessage(msg) {
 		return false
 	}
@@ -164,6 +170,87 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	default:
 	}
 	return true
+}
+
+func defaultStreamMirrorTarget(target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "tui"
+	}
+	return target
+}
+
+func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
+	if msg == nil || msg.CorrelationID == "" {
+		return false
+	}
+	stream, ok := msg.GetStreamResponse()
+	if !ok || stream == nil || stream.Event == nil {
+		return false
+	}
+
+	r.pendingMu.Lock()
+	pr := r.pending[msg.CorrelationID]
+	if pr == nil || pr.closed {
+		r.pendingMu.Unlock()
+		return false
+	}
+	r.pendingMu.Unlock()
+
+	if r.streamMirrorTargetID == "" || r.bus == nil {
+		return true
+	}
+
+	mirrored := &guide.StreamResponse{
+		CorrelationID:       stream.CorrelationID,
+		RespondingAgentID:   firstNonEmpty(stream.RespondingAgentID, msg.SourceAgentID, routeTargetAgentID(pr.task)),
+		RespondingAgentName: firstNonEmpty(stream.RespondingAgentName, pr.task.AgentType),
+		TargetAgentID:       r.streamMirrorTargetID,
+		Metadata:            cloneMetadata(stream.Metadata),
+		Event:               cloneStreamEvent(stream.Event),
+	}
+	mirroredMsg := &guide.Message{
+		ID:            generateMessageID(),
+		CorrelationID: mirrored.CorrelationID,
+		Type:          guide.MessageTypeStream,
+		Payload:       mirrored,
+		SourceAgentID: mirrored.RespondingAgentID,
+		TargetAgentID: r.streamMirrorTargetID,
+		Timestamp:     time.Now(),
+	}
+	if err := r.bus.Publish(guide.TopicResponses(r.streamMirrorTargetID, r.streamMirrorTargetID), mirroredMsg); err != nil {
+		r.logger.Warn("mirror pipeline stream to user", "correlation_id", msg.CorrelationID, "error", err)
+	}
+	return true
+}
+
+func cloneMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneStreamEvent(event *guide.StreamEvent) *guide.StreamEvent {
+	if event == nil {
+		return nil
+	}
+	cloned := *event
+	return &cloned
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // handleRouteResponse extracts the pipeline agent's result from the
@@ -334,6 +421,9 @@ func extractDispatchMetadata(ctx map[string]any) map[string]any {
 	}
 	if taskSlug, _ := ctx["task_slug"].(string); taskSlug != "" {
 		meta["task_slug"] = taskSlug
+	}
+	if taskName, _ := ctx["task_name"].(string); taskName != "" {
+		meta["task_name"] = taskName
 	}
 	if agentType, _ := ctx["agent_type"].(string); agentType != "" {
 		meta["agent_type"] = agentType

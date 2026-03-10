@@ -51,6 +51,64 @@ func TestRenderEntry_ThinkingPhaseNormalizesWhitespace(t *testing.T) {
 	}
 }
 
+func TestBadgeLabel_HumanizesPipelineCompositeAgentID(t *testing.T) {
+	entry := &ChatEntry{
+		Source:    SourceAgent,
+		AgentType: "task_auth_checkout:inspector-pipeline",
+	}
+
+	if got := badgeLabel(entry); got != "Auth Checkout: Inspector" {
+		t.Fatalf("badgeLabel = %q, want %q", got, "Auth Checkout: Inspector")
+	}
+	if got := badgeAgentType(entry); got != "inspector-pipeline" {
+		t.Fatalf("badgeAgentType = %q, want %q", got, "inspector-pipeline")
+	}
+}
+
+func TestBadgeLabel_UsesCanonicalPipelineAgentIDWhenTypeIsSemantic(t *testing.T) {
+	entry := &ChatEntry{
+		Source:    SourceAgent,
+		AgentType: "inspector-pipeline",
+		AgentID:   "task_payment_retry:inspector-pipeline",
+	}
+
+	if got := badgeLabel(entry); got != "Payment Retry: Inspector" {
+		t.Fatalf("badgeLabel = %q, want %q", got, "Payment Retry: Inspector")
+	}
+}
+
+func TestBadgeLabel_PrefersTaskMetadataOverRawPipelineIdentity(t *testing.T) {
+	entry := &ChatEntry{
+		Source:    SourceAgent,
+		AgentType: "inspector-pipeline",
+		AgentID:   "task_12__inspector-pipeline",
+		TaskName:  "Payment retry",
+		TaskSlug:  "payment_retry",
+	}
+
+	if got := badgeLabel(entry); got != "Payment Retry: Inspector" {
+		t.Fatalf("badgeLabel = %q, want %q", got, "Payment Retry: Inspector")
+	}
+	if got := badgeAgentType(entry); got != "inspector-pipeline" {
+		t.Fatalf("badgeAgentType = %q, want %q", got, "inspector-pipeline")
+	}
+}
+
+func TestBadgeLabel_HumanizesLegacyTaskScopedPipelineWorkerID(t *testing.T) {
+	entry := &ChatEntry{
+		Source:    SourceAgent,
+		AgentType: "task_12__inspector-pipeline",
+		AgentID:   "task_12__inspector-pipeline",
+	}
+
+	if got := badgeLabel(entry); got != "12: Inspector" {
+		t.Fatalf("badgeLabel = %q, want %q", got, "12: Inspector")
+	}
+	if got := badgeAgentType(entry); got != "inspector-pipeline" {
+		t.Fatalf("badgeAgentType = %q, want %q", got, "inspector-pipeline")
+	}
+}
+
 // TestStreamRenderHeightMatch demonstrates a height mismatch between the
 // standard renderContent path and the streaming renderStreamingEntry path.
 //

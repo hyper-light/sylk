@@ -994,8 +994,11 @@ func TestDefaultApprovedPatternsMatchCommands(t *testing.T) {
 
 		// Python commands
 		{"python -m pytest", true, "python pytest"},
+		{"python hello.py", true, "python local script"},
+		{"python3 hello.py", true, "python3 local script"},
 		{"python -m unittest", true, "python unittest"},
 		{"python -m pip install", true, "python pip"},
+		{"pytest -q", true, "pytest direct"},
 
 		// File inspection commands
 		{"ls -la", true, "ls"},
@@ -1005,6 +1008,7 @@ func TestDefaultApprovedPatternsMatchCommands(t *testing.T) {
 		{"grep pattern file.txt", true, "grep"},
 		{"find . -name '*.go'", true, "find"},
 		{"wc -l file.txt", true, "wc"},
+		{"pnpm test", true, "pnpm test"},
 	}
 
 	for _, tt := range tests {

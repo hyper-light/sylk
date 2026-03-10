@@ -28,6 +28,7 @@ func TestOpenAILive_Codex53Generate(t *testing.T) {
 
 	resp, err := provider.Generate(ctx, &Request{
 		Messages: []Message{{Role: RoleUser, Content: "Reply with exactly: sylk-live-ok"}},
+		Metadata: map[string]any{"session_id": "live-openai-api-key"},
 	})
 	if err != nil {
 		t.Fatalf("Generate() error: %v", err)
@@ -62,6 +63,7 @@ func TestOpenAILive_ChatGPTCodex53Generate(t *testing.T) {
 
 	resp, err := provider.Generate(ctx, &Request{
 		Messages: []Message{{Role: RoleUser, Content: "Reply with exactly: sylk-chatgpt-live-ok"}},
+		Metadata: map[string]any{"session_id": "live-openai-chatgpt"},
 	})
 	if err != nil {
 		t.Fatalf("Generate() error: %v", err)

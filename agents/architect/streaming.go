@@ -260,11 +260,32 @@ func formatPlanThoughtMessage(stage string, thought string) string {
 	if thought == "" {
 		return ""
 	}
+	if !hasTerminalThoughtBoundary(thought) {
+		thought += "..."
+	}
 	stage = humanizePlanThoughtStage(stage)
 	if stage == "" {
 		return thought
 	}
 	return stage + ": " + thought
+}
+
+func hasTerminalThoughtBoundary(thought string) bool {
+	thought = strings.TrimSpace(thought)
+	if thought == "" {
+		return false
+	}
+	for i := len(thought) - 1; i >= 0; i-- {
+		switch thought[i] {
+		case '.', '!', '?':
+			return true
+		case ' ', '\t', '\n', '\r':
+			continue
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func humanizePlanThoughtStage(stage string) string {

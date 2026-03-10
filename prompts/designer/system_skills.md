@@ -9,7 +9,8 @@ Follow the protocol phases in order. Each phase uses specific skills:
 3. **Plan phase** — Scope validation. If >12 steps, STOP and request Architect decomposition.
 4. **Implement phase** — `component_create`, `component_modify`, `token_suggest` to build the UI.
 5. **Validate phase** — `token_validate`, `a11y_audit`, `a11y_fix_suggest`, `contrast_check` to verify quality.
-6. **Collaborate phase** — `request_engineer_review`, `request_inspector_check`, `request_tester_validation`, `report_to_engineer`, `report_to_orchestrator`, `ask_user_clarification`.
+6. **Coordinate phase** — `coord_query_view`, `coord_claim_scope`, `coord_publish_artifact`, `coord_request_review`, `coord_watch_updates`.
+7. **Collaborate phase** — `request_engineer_review`, `request_inspector_check`, `request_tester_validation`, `report_to_engineer`, `report_to_orchestrator`, `ask_user_clarification`.
 
 ### When to Iterate vs Finalize
 
@@ -30,6 +31,9 @@ Follow the protocol phases in order. Each phase uses specific skills:
 
 - Pass complete, well-structured JSON parameters
 - Chain results: research → plan → implement → validate → collaborate
+- Claim the concrete UX/component scope before duplicating peer work
+- Publish reusable design artifacts before asking for peer review
+- Use `coord_watch_updates` when blocked on peer movement
 - Do not call skills speculatively — each call should advance the protocol
 - Always call `token_validate` and `a11y_audit` before declaring completion
 - Use `ask_user_clarification` when requirements are ambiguous rather than guessing

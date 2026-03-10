@@ -128,9 +128,15 @@ func DefaultApprovedPatterns() ApprovedCommandPatterns {
 			`^git\s+(status|diff|log|show|branch|checkout|add|commit|stash)`,
 			`^make\s+\w+`,
 			`^npm\s+(install|run|test|build)`,
+			`^pnpm\s+(install|run|test|build|exec|dlx)`,
 			`^yarn\s+(install|run|test|build)`,
 			`^cargo\s+(build|test|run|check|fmt|clippy)`,
-			`^python\s+-m\s+(pytest|unittest|pip)`,
+			`^python(?:3)?\s+-m\s+(pytest|unittest|pip)`,
+			`^python(?:3)?\s+[A-Za-z0-9_./-]+\.py(?:\s+.*)?$`,
+			`^pytest(?:\s+.*)?$`,
+			`^node\s+[A-Za-z0-9_./-]+\.(js|cjs|mjs)(?:\s+.*)?$`,
+			`^bash\s+[A-Za-z0-9_./-]+\.sh(?:\s+.*)?$`,
+			`^sh\s+[A-Za-z0-9_./-]+\.sh(?:\s+.*)?$`,
 			`^ls\s+`,
 			`^cat\s+`,
 			`^head\s+`,
@@ -220,6 +226,12 @@ type CommandExecution struct {
 	StartTime time.Time `json:"start_time"`
 	// WorkingDir is the directory the command was executed in.
 	WorkingDir string `json:"working_dir"`
+	// ExecutionMode records the execution isolation mode selected by the planner.
+	ExecutionMode string `json:"execution_mode,omitempty"`
+	// ExecutionStrategy records the backend strategy selected by the planner.
+	ExecutionStrategy string `json:"execution_strategy,omitempty"`
+	// Materialized reports whether compatibility workspace materialization was used.
+	Materialized bool `json:"materialized,omitempty"`
 }
 
 // MemoryThreshold defines context window usage thresholds for the Engineer.

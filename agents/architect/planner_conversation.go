@@ -113,7 +113,7 @@ func (a *Architect) composeUserFacingResponse(
 	a.publishPlanStreamStart(ctx)
 	planner := a.ensurePlanner(ctx)
 	if planner == nil {
-		return "", fmt.Errorf("architect planner not configured (EnableLLM may be false or API key missing)")
+		return "", fmt.Errorf("architect planner not configured (EnableLLM may be false or Anthropic auth is unavailable)")
 	}
 	textOnlyRequest := request
 	textOnlyRequest.textOnly = true

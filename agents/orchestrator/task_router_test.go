@@ -284,7 +284,7 @@ func TestTaskRouter_DeliverResponseIgnoresUnknownCorrelation(t *testing.T) {
 	assert.False(t, consumed)
 }
 
-func TestTaskRouter_DeliverResponseIgnoresStreamMessages(t *testing.T) {
+func TestTaskRouter_DeliverResponse_MirrorsPipelineStreamToTUI(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -312,6 +312,16 @@ func TestTaskRouter_DeliverResponseIgnoresStreamMessages(t *testing.T) {
 	require.NoError(t, err)
 	defer guideSub.Unsubscribe()
 
+	tuiCh := make(chan *guide.StreamResponse, 1)
+	tuiSub, err := bus.SubscribeAsync(guide.TopicResponses("tui", "tui"), func(msg *guide.Message) error {
+		if stream, ok := msg.GetStreamResponse(); ok {
+			tuiCh <- stream
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer tuiSub.Unsubscribe()
+
 	err = router.Route(task)
 	require.NoError(t, err)
 
@@ -327,10 +337,33 @@ func TestTaskRouter_DeliverResponseIgnoresStreamMessages(t *testing.T) {
 		CorrelationID: corrID,
 		Type:          guide.MessageTypeStream,
 		Payload: &guide.StreamResponse{
-			CorrelationID: corrID,
+			CorrelationID:     corrID,
+			RespondingAgentID: "task-1:engineer",
+			Metadata: map[string]any{
+				"agent_type":  "engineer",
+				"task_id":     "task-1",
+				"task_slug":   "hello-cli",
+				"pipeline_id": "task-1",
+			},
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{Message: "Implementing task"},
+			},
 		},
 	}
-	assert.False(t, router.DeliverResponse(streamMsg))
+	assert.True(t, router.DeliverResponse(streamMsg))
+
+	select {
+	case mirrored := <-tuiCh:
+		require.NotNil(t, mirrored)
+		assert.Equal(t, corrID, mirrored.CorrelationID)
+		assert.Equal(t, "tui", mirrored.TargetAgentID)
+		assert.Equal(t, "task-1:engineer", mirrored.RespondingAgentID)
+		assert.Equal(t, "engineer", mirrored.Metadata["agent_type"])
+		assert.Equal(t, "task-1", mirrored.Metadata["task_id"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirrored stream was not published to the TUI response topic")
+	}
 
 	resp := &guide.RouteResponse{
 		CorrelationID:     corrID,

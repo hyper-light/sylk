@@ -93,3 +93,81 @@ CREATE INDEX IF NOT EXISTS idx_task_updates_node ON task_updates(node_id);
 CREATE INDEX IF NOT EXISTS idx_task_updates_created ON task_updates(created_at);
 CREATE INDEX IF NOT EXISTS idx_pipeline_state_dag ON pipeline_state(dag_id);
 CREATE INDEX IF NOT EXISTS idx_plan_versions_session ON plan_versions(session_id);
+
+-- Task coordination ledger (authoritative per-task coordination state)
+CREATE TABLE IF NOT EXISTS coordination_actions (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    task_name TEXT,
+    kind TEXT NOT NULL,
+    actor_agent_id TEXT NOT NULL,
+    actor_type TEXT NOT NULL,
+    idempotency_key TEXT,
+    payload_json TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS coordination_claims (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    task_name TEXT,
+    scope_kind TEXT NOT NULL,
+    scope_key TEXT NOT NULL,
+    purpose TEXT,
+    mode TEXT NOT NULL,
+    state TEXT NOT NULL,
+    owner_agent_id TEXT NOT NULL,
+    owner_type TEXT NOT NULL,
+    idempotency_key TEXT,
+    evidence_json TEXT,
+    lease_expires_at DATETIME NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS coordination_artifacts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    task_name TEXT,
+    kind TEXT NOT NULL,
+    title TEXT,
+    summary TEXT NOT NULL,
+    scope_kind TEXT,
+    scope_key TEXT,
+    status TEXT NOT NULL,
+    producer_agent_id TEXT NOT NULL,
+    producer_type TEXT NOT NULL,
+    idempotency_key TEXT,
+    payload_json TEXT,
+    evidence_json TEXT,
+    upstream_artifact_ids_json TEXT,
+    supersedes_artifact_id TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS coordination_reviews (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    requester_agent_id TEXT NOT NULL,
+    requester_type TEXT NOT NULL,
+    reviewer_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    criteria_json TEXT,
+    status TEXT NOT NULL,
+    idempotency_key TEXT,
+    result_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_coord_actions_task ON coordination_actions(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_coord_actions_actor ON coordination_actions(actor_agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_coord_claims_task ON coordination_claims(task_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_coord_claims_scope ON coordination_claims(task_id, scope_kind, scope_key, state);
+CREATE INDEX IF NOT EXISTS idx_coord_artifacts_task ON coordination_artifacts(task_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_coord_artifacts_kind ON coordination_artifacts(task_id, kind, updated_at);
+CREATE INDEX IF NOT EXISTS idx_coord_reviews_task ON coordination_reviews(task_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_coord_reviews_artifact ON coordination_reviews(artifact_id, status);

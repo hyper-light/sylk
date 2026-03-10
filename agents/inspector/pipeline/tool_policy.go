@@ -7,6 +7,7 @@ import (
 
 func pipelineInspectorVisibleSkillNames() []string {
 	return []string{
+		"search_skills",
 		"run_linter",
 		"run_type_checker",
 		"run_security_scan",
@@ -20,6 +21,15 @@ func pipelineInspectorVisibleSkillNames() []string {
 		"summarize_workspace_state",
 		"define_criteria",
 		"validate_criteria",
+		"grade_task_quality",
+		"get_validation_status",
+		"coord_query_view",
+		"coord_watch_updates",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
 	}
 }
 
@@ -28,6 +38,11 @@ func pipelineInspectorMutatingSkillNames() []string {
 		"define_criteria",
 		"request_correction",
 		"request_override",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
 		"reroute_request",
 	}
 }

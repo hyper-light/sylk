@@ -3,7 +3,10 @@
 package shared
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +135,35 @@ type SuccessCriterion struct {
 	VerificationMethod string `json:"verification_method"`
 }
 
+func (s *SuccessCriterion) UnmarshalJSON(data []byte) error {
+	type rawSuccessCriterion struct {
+		ID                 string `json:"id"`
+		Description        string `json:"description"`
+		Verifiable         any    `json:"verifiable"`
+		VerificationMethod string `json:"verification_method"`
+	}
+
+	var raw rawSuccessCriterion
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	s.ID = strings.TrimSpace(raw.ID)
+	s.Description = strings.TrimSpace(raw.Description)
+	s.VerificationMethod = strings.TrimSpace(raw.VerificationMethod)
+
+	if raw.Verifiable == nil {
+		s.Verifiable = false
+		return nil
+	}
+	value, err := parseFlexibleBool(raw.Verifiable)
+	if err != nil {
+		return fmt.Errorf("verifiable: %w", err)
+	}
+	s.Verifiable = value
+	return nil
+}
+
 // QualityGate represents a measurable quality threshold.
 type QualityGate struct {
 	// Name identifies this quality gate.
@@ -148,6 +180,31 @@ type QualityGate struct {
 	Operator string `json:"operator"`
 }
 
+func (q *QualityGate) UnmarshalJSON(data []byte) error {
+	type rawQualityGate struct {
+		Name      string `json:"name"`
+		Threshold any    `json:"threshold"`
+		Metric    string `json:"metric"`
+		Operator  string `json:"operator"`
+	}
+
+	var raw rawQualityGate
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	q.Name = strings.TrimSpace(raw.Name)
+	q.Metric = strings.TrimSpace(raw.Metric)
+	q.Operator = strings.TrimSpace(raw.Operator)
+
+	threshold, err := parseFlexibleFloat64(raw.Threshold)
+	if err != nil {
+		return fmt.Errorf("threshold: %w", err)
+	}
+	q.Threshold = threshold
+	return nil
+}
+
 // Constraint represents a restriction or requirement for the implementation.
 type Constraint struct {
 	// Type categorizes the constraint (e.g., "performance", "security", "style").
@@ -158,6 +215,81 @@ type Constraint struct {
 
 	// Required indicates whether this constraint is mandatory.
 	Required bool `json:"required"`
+}
+
+func (c *Constraint) UnmarshalJSON(data []byte) error {
+	type rawConstraint struct {
+		Type        string `json:"type"`
+		Description string `json:"description"`
+		Required    any    `json:"required"`
+	}
+
+	var raw rawConstraint
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	c.Type = strings.TrimSpace(raw.Type)
+	c.Description = strings.TrimSpace(raw.Description)
+
+	if raw.Required == nil {
+		c.Required = false
+		return nil
+	}
+	value, err := parseFlexibleBool(raw.Required)
+	if err != nil {
+		return fmt.Errorf("required: %w", err)
+	}
+	c.Required = value
+	return nil
+}
+
+func parseFlexibleFloat64(value any) (float64, error) {
+	switch typed := value.(type) {
+	case nil:
+		return 0, fmt.Errorf("value is required")
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) {
+			return 0, fmt.Errorf("must be a finite number")
+		}
+		return typed, nil
+	case string:
+		trimmed := strings.TrimSpace(strings.TrimSuffix(typed, "%"))
+		if trimmed == "" {
+			return 0, fmt.Errorf("value is required")
+		}
+		parsed, err := strconv.ParseFloat(trimmed, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid number %q", typed)
+		}
+		if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return 0, fmt.Errorf("must be a finite number")
+		}
+		return parsed, nil
+	default:
+		return 0, fmt.Errorf("unsupported value type %T", value)
+	}
+}
+
+func parseFlexibleBool(value any) (bool, error) {
+	switch typed := value.(type) {
+	case nil:
+		return false, fmt.Errorf("value is required")
+	case bool:
+		return typed, nil
+	case string:
+		trimmed := strings.TrimSpace(strings.ToLower(typed))
+		if trimmed == "" {
+			return false, fmt.Errorf("value is required")
+		}
+		parsed, err := strconv.ParseBool(trimmed)
+		if err != nil {
+			return false, fmt.Errorf("invalid boolean %q", typed)
+		}
+		return parsed, nil
+	default:
+		return false, fmt.Errorf("unsupported value type %T", value)
+	}
 }
 
 // InspectorResult represents the final result of an inspection.

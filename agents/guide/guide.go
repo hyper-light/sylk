@@ -897,7 +897,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 			// in the agent's declared intents.
 			targetAgentID = classificationTargetAgentID(request.TargetAgentID, classification)
 		} else {
-			classification, targetAgentID = g.ensureRoutableClassification(ctx, classification, request.TargetAgentID)
+			classification, targetAgentID = g.ensureRoutableClassification(ctx, request.Input, classification, request.TargetAgentID)
 		}
 
 		// Explicit non-guide targets should bypass conversation-flow
@@ -925,7 +925,9 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 			return nil, "", err
 		}
 		guideFileLog().Info("DEBUG: finalize_start", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
-		classification, targetAgentID = g.finalizeClassificationWithExclude(ctx, request.Input, classification, targetAgentID)
+		classification, targetAgentID = g.finalizeClassification(ctx, request.Input, classification, targetAgentID)
+		g.persistLearnedClassification(request, classification)
+		classification, targetAgentID = g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
 		guideFileLog().Info("DEBUG: finalize_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 		guideFileLog().Info("DEBUG: conversation_flow_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
@@ -940,7 +942,9 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 			Confidence:  classification.Confidence,
 		})
 		classification = g.applyDomainHints(classification, domainCtx)
-		classification, targetAgentID = g.finalizeClassificationWithExclude(ctx, request.Input, classification, targetAgentID)
+		classification, targetAgentID = g.finalizeClassification(ctx, request.Input, classification, targetAgentID)
+		g.persistLearnedClassification(request, classification)
+		classification, targetAgentID = g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 		return classification, targetAgentID, nil
 	}
@@ -952,7 +956,9 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		return nil, "", err
 	}
 	guideFileLog().Info("DEBUG: finalize_start", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
-	classification, targetAgentID = g.finalizeClassificationWithExclude(ctx, request.Input, classification, targetAgentID)
+	classification, targetAgentID = g.finalizeClassification(ctx, request.Input, classification, targetAgentID)
+	g.persistLearnedClassification(request, classification)
+	classification, targetAgentID = g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
 	guideFileLog().Info("DEBUG: finalize_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 	classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 	guideFileLog().Info("DEBUG: conversation_flow_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
@@ -990,8 +996,7 @@ func (g *Guide) tryConversationFastPath(ctx context.Context, request *RouteReque
 		ClassificationMethod: "conversation_fast_path",
 		Reason:               "active conversation agent with high activation score",
 	}
-	result.Intent = g.supportedIntentForTarget(activeAgentID, result.Intent)
-	result.Domain = g.supportedDomainForTarget(activeAgentID, result.Domain, result.Intent)
+	result, activeAgentID = g.ensureRoutableClassification(ctx, request.Input, result, activeAgentID)
 	// NOTE: Do NOT call observeRoutedConversationTarget here. The fast path
 	// must not boost its own ACT-R activation — otherwise each hit refreshes
 	// UpdatedAt and increments Turns, creating a self-reinforcing loop that
@@ -1015,12 +1020,21 @@ func (g *Guide) applyPendingPlanMetadata(sessionID string, classification *Route
 		return
 	}
 	switch {
-	case classification.Intent == IntentExecute && classification.Domain == DomainPlanning:
+	case classification.Intent == IntentExecute && isArchitectPlanningDomain(classification.Domain):
 		classification.PhaseMetadata = map[string]any{"plan_id": pending.PlanID, "epoch": pending.Epoch}
 		g.conversation.ClearPendingPlan(sessionID)
-	case classification.Intent == IntentPlan && classification.Domain == DomainPlanning:
+	case classification.Intent == IntentPlan && isArchitectPlanningDomain(classification.Domain):
 		classification.PhaseMetadata = map[string]any{"plan_id": pending.PlanID, "epoch": pending.Epoch}
 		g.conversation.ClearPendingPlan(sessionID)
+	}
+}
+
+func isArchitectPlanningDomain(domain Domain) bool {
+	switch domain {
+	case DomainPlanning, DomainDesign, DomainTasks:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1058,23 +1072,24 @@ func explicitGuideFollowupAllowed(targetAgentID string) bool {
 }
 
 func (g *Guide) augmentClassificationContext(ctx context.Context, request *RouteRequest) context.Context {
-	if g == nil || request == nil || g.conversation == nil {
-		return ctx
-	}
-	snapshot, ok := g.conversation.Snapshot(request.SessionID)
-	if !ok {
+	if g == nil || request == nil {
 		return ctx
 	}
 	cc := ClassificationContext{
-		SessionID:               request.SessionID,
-		ActiveConversationAgent: snapshot.ActiveAgentID,
-		ActiveConversationTurns: snapshot.Turns,
-		ActiveConversationAge:   int(snapshot.Age.Seconds()),
-		ActiveConversationScore: snapshot.ActivationHint,
+		AgentCapabilitySummary: g.classificationCapabilitySummary(),
 	}
-	if pp := g.conversation.PendingPlan(request.SessionID); pp != nil {
-		cc.PendingPlanID = pp.PlanID
-		cc.PendingPlanAgent = pp.AgentID
+	if g.conversation != nil {
+		if snapshot, ok := g.conversation.Snapshot(request.SessionID); ok {
+			cc.SessionID = request.SessionID
+			cc.ActiveConversationAgent = snapshot.ActiveAgentID
+			cc.ActiveConversationTurns = snapshot.Turns
+			cc.ActiveConversationAge = int(snapshot.Age.Seconds())
+			cc.ActiveConversationScore = snapshot.ActivationHint
+		}
+		if pp := g.conversation.PendingPlan(request.SessionID); pp != nil {
+			cc.PendingPlanID = pp.PlanID
+			cc.PendingPlanAgent = pp.AgentID
+		}
 	}
 	return withClassificationContext(ctx, cc)
 }
@@ -1095,7 +1110,7 @@ func emitClassificationProgress(ctx context.Context, message string) {
 }
 
 func (g *Guide) finalizeClassification(ctx context.Context, input string, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
-	classification, targetAgentID = g.ensureRoutableClassification(ctx, classification, targetAgentID)
+	classification, targetAgentID = g.ensureRoutableClassification(ctx, input, classification, targetAgentID)
 	classification, targetAgentID = g.applyGuidePreferencePolicy(input, classification, targetAgentID)
 	return g.assignRuntimeProfile(classification, targetAgentID), targetAgentID
 }
@@ -1110,6 +1125,14 @@ func (g *Guide) finalizeClassificationWithExclude(
 	targetAgentID string,
 ) (*RouteResult, string) {
 	classification, targetAgentID = g.finalizeClassification(ctx, input, classification, targetAgentID)
+	return g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
+}
+
+func (g *Guide) applyExcludedTargetFallback(
+	ctx context.Context,
+	classification *RouteResult,
+	targetAgentID string,
+) (*RouteResult, string) {
 	excludeAgents := rerouteExcludeAgentsFromContext(ctx)
 	if len(excludeAgents) == 0 {
 		return classification, targetAgentID
@@ -1146,9 +1169,14 @@ func isExcludedAgent(agentID string, excludeAgents []string) bool {
 	return false
 }
 
-func (g *Guide) ensureRoutableClassification(ctx context.Context, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
+func (g *Guide) ensureRoutableClassification(
+	ctx context.Context,
+	input string,
+	classification *RouteResult,
+	targetAgentID string,
+) (*RouteResult, string) {
 	target := classificationTargetAgentID(targetAgentID, classification)
-	classification = g.normalizeClassificationForTarget(classification, target)
+	classification = g.normalizeClassificationForTarget(input, classification, target)
 	if g.classificationSupportedByTarget(classification, target) {
 		return classification, target
 	}
@@ -1161,7 +1189,7 @@ func (g *Guide) ensureRoutableClassification(ctx context.Context, classification
 		target = resolved
 		classification.TargetAgent = TargetAgent(target)
 	}
-	classification = g.normalizeClassificationForTarget(classification, target)
+	classification = g.normalizeClassificationForTarget(input, classification, target)
 	if g.classificationSupportedByTarget(classification, target) {
 		return classification, target
 	}
@@ -1170,62 +1198,11 @@ func (g *Guide) ensureRoutableClassification(ctx context.Context, classification
 }
 
 func (g *Guide) normalizeClassificationForTarget(
+	input string,
 	classification *RouteResult,
 	targetAgentID string,
 ) *RouteResult {
-	if classification == nil || targetAgentID == "" || g.isGuideTarget(targetAgentID) {
-		return classification
-	}
-	normalized := g.normalizeConversationalIntentForTarget(classification, targetAgentID)
-	if normalized == nil {
-		return nil
-	}
-	if shouldNormalizeSpecialistIntent(normalized.Intent) {
-		if supported := g.supportedIntentForTarget(targetAgentID, normalized.Intent); supported != normalized.Intent {
-			promoted := *normalized
-			promoted.Intent = supported
-			normalized = &promoted
-		}
-	}
-	if supported := g.supportedDomainForTarget(targetAgentID, normalized.Domain, normalized.Intent); supported != normalized.Domain {
-		promoted := *normalized
-		promoted.Domain = supported
-		normalized = &promoted
-	}
-	return normalized
-}
-
-func shouldNormalizeSpecialistIntent(intent Intent) bool {
-	switch intent {
-	case IntentChat, IntentHelp, IntentStatus, IntentUnknown:
-		return false
-	default:
-		return true
-	}
-}
-
-func (g *Guide) normalizeConversationalIntentForTarget(
-	classification *RouteResult,
-	targetAgentID string,
-) *RouteResult {
-	if classification == nil || targetAgentID == "" || g.isGuideTarget(targetAgentID) {
-		return classification
-	}
-	if classification.Intent != IntentChat {
-		return classification
-	}
-	// Keep chat when target explicitly supports it.
-	if g.agentSupportsIntent(targetAgentID, IntentChat) {
-		return classification
-	}
-	// Promote chat to help for specialists that support conversational help but
-	// do not advertise chat intent.
-	if !g.agentSupportsIntent(targetAgentID, IntentHelp) {
-		return classification
-	}
-	promoted := *classification
-	promoted.Intent = IntentHelp
-	return &promoted
+	return g.canonicalizeClassificationForTarget(input, classification, targetAgentID)
 }
 
 func (g *Guide) applyGuidePreferencePolicy(input string, classification *RouteResult, targetAgentID string) (*RouteResult, string) {
@@ -1292,7 +1269,13 @@ func (g *Guide) classificationSupportedByTarget(classification *RouteResult, tar
 	if g.isGuideTarget(targetAgentID) {
 		return true
 	}
-	return g.agentSupportsIntent(targetAgentID, classification.Intent)
+	agent := g.resolveAgent(targetAgentID)
+	if agent == nil {
+		return false
+	}
+	check := *classification
+	check.TargetAgent = TargetAgent(targetAgentID)
+	return agent.Accepts(&check)
 }
 
 func (g *Guide) assignRuntimeProfile(classification *RouteResult, targetAgentID string) *RouteResult {
@@ -1523,17 +1506,19 @@ func (g *Guide) supportedDomainForTarget(targetAgentID string, current Domain, i
 func candidateDomainsForIntent(intent Intent) []Domain {
 	switch intent {
 	case IntentPlan, IntentDesign:
-		return []Domain{DomainDesign, DomainTasks, DomainGeneral}
+		return []Domain{DomainDesign, DomainTasks, DomainPlanning, DomainGeneral}
 	case IntentCheck:
-		return []Domain{DomainCode, DomainDesign, DomainGeneral}
+		return []Domain{DomainCode, DomainCompliance, DomainTesting, DomainDesign, DomainSystem, DomainGeneral}
 	case IntentRecall:
-		return []Domain{DomainHistory, DomainGeneral}
+		return []Domain{DomainHistory, DomainResearch, DomainPatterns, DomainFailures, DomainDecisions, DomainLearnings, DomainIntents, DomainGeneral}
 	case IntentFind, IntentSearch:
-		return []Domain{DomainLocal, DomainCode, DomainGeneral}
+		return []Domain{DomainCode, DomainFiles, DomainLocal, DomainGeneral}
 	case IntentFetch:
-		return []Domain{DomainCode, DomainResearch, DomainGeneral}
+		return []Domain{DomainResearch, DomainCode, DomainFiles, DomainGeneral}
 	case IntentStatus:
-		return []Domain{DomainSystem, DomainGeneral}
+		return []Domain{DomainWorkflow, DomainHealth, DomainSystem, DomainTasks, DomainGeneral}
+	case IntentExecute:
+		return []Domain{DomainTasks, DomainWorkflow, DomainPlanning, DomainGeneral}
 	default:
 		return []Domain{DomainGeneral, DomainSystem}
 	}
@@ -1685,7 +1670,6 @@ func (g *Guide) classifyWithRouter(ctx context.Context, request *RouteRequest, d
 
 	classification = g.applyDomainHints(classification, domainCtx)
 	targetAgentID := string(classification.TargetAgent)
-	g.cacheAndBroadcastClassification(request, classification)
 	return classification, targetAgentID, nil
 }
 
@@ -1699,7 +1683,6 @@ func (g *Guide) classifyWithSessionRouter(
 		return nil, "", err
 	}
 	classification = g.applyDomainHints(classification, domainCtx)
-	g.cacheAndBroadcastClassification(request, classification)
 	return classification, string(classification.TargetAgent), nil
 }
 
@@ -1762,13 +1745,61 @@ func mapGuideDomainHint(raw string) (Domain, TargetAgent, bool) {
 	}
 }
 
-func (g *Guide) cacheAndBroadcastClassification(request *RouteRequest, classification *RouteResult) {
-	if classification.ClassificationMethod != "llm" {
+func (g *Guide) persistLearnedClassification(request *RouteRequest, classification *RouteResult) {
+	if g == nil || request == nil || classification == nil {
 		return
 	}
-	g.routeCache.Set(request.Input, classification)
+	if !shouldPersistLearnedClassification(classification.ClassificationMethod) {
+		return
+	}
+	globalChanged := g.learnedRouteChanged(request.Input, classification)
+	globalStored := false
+	if request.SessionID != "" && g.sessionRouter != nil {
+		globalStored = g.sessionRouter.CacheFinalizedClassification(request, classification)
+	} else if g.routeCache != nil {
+		g.routeCache.Set(request.Input, classification)
+		globalStored = true
+	}
+	if !globalStored || !globalChanged {
+		return
+	}
 	g.upsertRouteVersion(request.Input, classification)
-	g.broadcastLearnedRoute(request.Input, classification)
+	if hasClassificationMethodToken(classification.ClassificationMethod, "llm") {
+		g.broadcastLearnedRoute(request.Input, classification)
+	}
+}
+
+func shouldPersistLearnedClassification(method string) bool {
+	return hasClassificationMethodToken(method, "llm") ||
+		hasClassificationMethodToken(method, "cache") ||
+		hasClassificationMethodToken(method, "session_cache")
+}
+
+func (g *Guide) learnedRouteChanged(input string, classification *RouteResult) bool {
+	if g == nil || classification == nil {
+		return false
+	}
+	if g.routeVersions != nil {
+		existing := g.routeVersions.GetRouteByInput(normalizeInput(input))
+		if existing == nil {
+			return true
+		}
+		return existing.TargetAgentID != string(classification.TargetAgent) ||
+			existing.Intent != classification.Intent ||
+			existing.Domain != classification.Domain ||
+			existing.Confidence != classification.Confidence
+	}
+	if g.routeCache == nil {
+		return true
+	}
+	cached := g.routeCache.Get(input)
+	if cached == nil {
+		return true
+	}
+	return cached.TargetAgentID != string(classification.TargetAgent) ||
+		cached.Intent != classification.Intent ||
+		cached.Domain != classification.Domain ||
+		cached.Confidence != classification.Confidence
 }
 
 func (g *Guide) upsertRouteVersion(input string, result *RouteResult) {

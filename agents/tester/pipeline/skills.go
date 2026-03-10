@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
+	"strings"
 
-	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/pipeline/coordination"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -38,43 +38,40 @@ func reportToEngineerSkill(pt *PipelineTester) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			if pt.bus == nil {
-				return nil, fmt.Errorf("bus not available")
+			taskID := strings.TrimSpace(pt.pipelineID)
+			if taskID == "" {
+				return nil, fmt.Errorf("tester task context unavailable")
 			}
-
-			feedback := map[string]any{
-				"type":          "test_failure",
-				"test_name":     p.TestName,
-				"error_message": p.ErrorMessage,
-				"root_cause":    p.RootCause,
-				"suggested_fix": p.SuggestedFix,
-				"file":          p.File,
-				"line":          p.Line,
-				"from_agent":    pt.id,
+			artifact, err := pt.coordinationClient().PublishArtifact(ctx, coordination.PublishArtifactInput{
+				TaskID:    taskID,
+				TaskName:  pt.currentTaskName(),
+				Kind:      "verification_result",
+				Summary:   fmt.Sprintf("%s failed in %s", p.TestName, p.File),
+				ScopeKind: coordination.ScopeKindTestSurface,
+				ScopeKey:  strings.TrimSpace(p.TestName),
+				Payload: map[string]any{
+					"test_name":     p.TestName,
+					"error_message": p.ErrorMessage,
+					"root_cause":    p.RootCause,
+					"suggested_fix": p.SuggestedFix,
+					"file":          p.File,
+					"line":          p.Line,
+				},
+				Evidence: testerEvidenceRefs(p.File),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			req := &guide.RouteRequest{
-				Input:           fmt.Sprintf("Test failure report: %s in %s", p.TestName, p.File),
-				SourceAgentID:   pt.id,
-				SourceAgentName: "tester-pipeline",
-				TargetAgentID:   "engineer",
-				FireAndForget:   true,
-				SessionID:       pt.config.SessionID,
-				Timestamp:       time.Now(),
+			review, err := pt.coordinationClient().RequestReview(ctx, coordination.RequestReviewInput{
+				TaskID:       taskID,
+				ArtifactID:   artifact.ID,
+				ReviewerType: "engineer",
+				Summary:      fmt.Sprintf("Address failing test %s", p.TestName),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			msg := guide.NewRequestMessage(pt.generateMessageID(), req)
-			msg.Metadata = feedback
-
-			if err := pt.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-				return nil, fmt.Errorf("publish to engineer: %w", err)
-			}
-
-			return map[string]any{
-				"reported":  true,
-				"target":    "engineer",
-				"test_name": p.TestName,
-			}, nil
+			return map[string]any{"reported": true, "target": "engineer", "artifact_id": artifact.ID, "review_id": review.ID}, nil
 		}).
 		Build()
 }
@@ -109,49 +106,48 @@ func reportToDesignerSkill(pt *PipelineTester) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 
-			if pt.bus == nil {
-				return nil, fmt.Errorf("bus not available")
+			taskID := strings.TrimSpace(pt.pipelineID)
+			if taskID == "" {
+				return nil, fmt.Errorf("tester task context unavailable")
 			}
-
-			feedbackType := "test_failure"
-			if p.DesignIssue != "" {
-				feedbackType = "design_test_failure"
+			artifact, err := pt.coordinationClient().PublishArtifact(ctx, coordination.PublishArtifactInput{
+				TaskID:    taskID,
+				TaskName:  pt.currentTaskName(),
+				Kind:      "verification_result",
+				Summary:   fmt.Sprintf("%s surfaced a design issue", p.TestName),
+				ScopeKind: coordination.ScopeKindUXSurface,
+				ScopeKey:  strings.TrimSpace(p.File),
+				Payload: map[string]any{
+					"test_name":         p.TestName,
+					"error_message":     p.ErrorMessage,
+					"root_cause":        p.RootCause,
+					"suggested_fix":     p.SuggestedFix,
+					"file":              p.File,
+					"design_issue":      p.DesignIssue,
+					"design_suggestion": p.DesignSuggestion,
+				},
+				Evidence: testerEvidenceRefs(p.File),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			feedback := map[string]any{
-				"type":              feedbackType,
-				"test_name":         p.TestName,
-				"error_message":     p.ErrorMessage,
-				"root_cause":        p.RootCause,
-				"suggested_fix":     p.SuggestedFix,
-				"file":              p.File,
-				"design_issue":      p.DesignIssue,
-				"design_suggestion": p.DesignSuggestion,
-				"from_agent":        pt.id,
+			review, err := pt.coordinationClient().RequestReview(ctx, coordination.RequestReviewInput{
+				TaskID:       taskID,
+				ArtifactID:   artifact.ID,
+				ReviewerType: "designer",
+				Summary:      fmt.Sprintf("Review design implications for failing test %s", p.TestName),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			req := &guide.RouteRequest{
-				Input:           fmt.Sprintf("Test failure report: %s in %s", p.TestName, p.File),
-				SourceAgentID:   pt.id,
-				SourceAgentName: "tester-pipeline",
-				TargetAgentID:   "designer",
-				FireAndForget:   true,
-				SessionID:       pt.config.SessionID,
-				Timestamp:       time.Now(),
-			}
-
-			msg := guide.NewRequestMessage(pt.generateMessageID(), req)
-			msg.Metadata = feedback
-
-			if err := pt.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-				return nil, fmt.Errorf("publish to designer: %w", err)
-			}
-
-			return map[string]any{
-				"reported":  true,
-				"target":    "designer",
-				"test_name": p.TestName,
-			}, nil
+			return map[string]any{"reported": true, "target": "designer", "artifact_id": artifact.ID, "review_id": review.ID}, nil
 		}).
 		Build()
+}
+
+func testerEvidenceRefs(file string) []coordination.EvidenceRef {
+	if strings.TrimSpace(file) == "" {
+		return nil
+	}
+	return []coordination.EvidenceRef{{Kind: "file", Value: strings.TrimSpace(file)}}
 }

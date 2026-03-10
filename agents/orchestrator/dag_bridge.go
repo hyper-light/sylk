@@ -19,6 +19,7 @@ import (
 	containerpod "github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/pipeline/taskstate"
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
@@ -66,7 +67,9 @@ type ActiveDAGMeta struct {
 
 	// SubNodeMap maps expanded sub-node IDs to their original parent
 	// node IDs. Populated during pipeline expansion.
-	SubNodeMap map[string]string // subNodeID → parentNodeID
+	SubNodeMap   map[string]string // subNodeID → parentNodeID
+	SubNodeTasks map[string]taskPipelineRef
+	TaskLabels   map[string]string
 }
 
 // DAGBridge wires the dag.Scheduler into the orchestrator's bus/WAL/store/buffers.
@@ -243,6 +246,9 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	if err != nil {
 		return "", err
 	}
+	for _, taskDef := range collectPipelineTaskPods(d) {
+		publishTaskPipelineState(bus, b.agentID, taskDef.TaskID, taskDef.TaskSlug, taskstate.StatusPending, "")
+	}
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
@@ -272,13 +278,15 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	dagCtx, dagCancel := context.WithCancel(context.WithoutCancel(ctx))
 	b.mu.Lock()
 	b.activeDAGs[d.ID()] = &ActiveDAGMeta{
-		PlanID:     planID,
-		SessionID:  sessionID,
-		Dispatcher: dispatcher,
-		TaskPods:   taskPods,
-		CancelFunc: dagCancel,
-		StartedAt:  time.Now(),
-		SubNodeMap: subNodeMap,
+		PlanID:       planID,
+		SessionID:    sessionID,
+		Dispatcher:   dispatcher,
+		TaskPods:     taskPods,
+		CancelFunc:   dagCancel,
+		StartedAt:    time.Now(),
+		SubNodeMap:   subNodeMap,
+		SubNodeTasks: make(map[string]taskPipelineRef, len(subNodeMap)),
+		TaskLabels:   make(map[string]string, len(taskPods)),
 	}
 	b.mu.Unlock()
 
@@ -303,6 +311,23 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		}
 		stage := string(StageFromSubNodeID(subNodeID))
 		taskID, _ := dispatchTaskIdentity(node)
+		b.mu.Lock()
+		if meta := b.activeDAGs[d.ID()]; meta != nil {
+			taskLabel := ""
+			if ctx := node.Context(); ctx != nil {
+				taskLabel, _ = ctx["task_slug"].(string)
+			}
+			meta.SubNodeTasks[subNodeID] = taskPipelineRef{
+				TaskID:    taskID,
+				TaskLabel: taskLabel,
+				Stage:     stage,
+				AgentType: node.AgentType(),
+			}
+			if taskID != "" && taskLabel != "" {
+				meta.TaskLabels[taskID] = taskLabel
+			}
+		}
+		b.mu.Unlock()
 		if pod := taskPods[taskID]; pod != nil {
 			pod.RegisterSubNode(subNodeID, parentNodeID, stage, node.AgentType())
 		}
@@ -768,6 +793,7 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 		case dag.EventNodeCompleted:
 			b.journal.LogNodeResult(dagID, event.NodeID, "succeeded", "")
 			b.updateProgressFromScheduler(dagID)
+			b.publishCompletedTaskPipelineState(dagID, event.NodeID)
 			shared.LogAgentEvent(el, agentlog.EventNodeCompleted,
 				b.agentID, b.sessionID, "", "info",
 				&agentlog.DAGPayload{DAGID: dagID, NodeID: event.NodeID, State: "succeeded"})
@@ -803,11 +829,44 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 		case dag.EventDAGCancelled:
 			b.journal.LogDAGCancel(dagID, "cancelled via scheduler")
 			b.store.UpdateDAGState(dagID, "cancelled", "")
+			b.publishCancelledTaskPipelineStates(dagID)
 			b.cleanupDAG(dagID)
 			shared.LogAgentEvent(el, agentlog.EventDAGCancelled,
 				b.agentID, b.sessionID, "", "info",
 				&agentlog.DAGPayload{DAGID: dagID, State: "cancelled"})
 		}
+	}
+}
+
+func (b *DAGBridge) publishCompletedTaskPipelineState(dagID, nodeID string) {
+	b.mu.RLock()
+	meta := b.activeDAGs[dagID]
+	b.mu.RUnlock()
+	if meta == nil {
+		return
+	}
+	ref, ok := meta.SubNodeTasks[nodeID]
+	if !ok || strings.TrimSpace(ref.Stage) != string(StageExecute) {
+		return
+	}
+	b.mu.RLock()
+	bus := b.bus
+	b.mu.RUnlock()
+	publishTaskPipelineState(bus, b.agentID, ref.TaskID, ref.TaskLabel, taskstate.StatusCompleted, ref.AgentType)
+}
+
+func (b *DAGBridge) publishCancelledTaskPipelineStates(dagID string) {
+	b.mu.RLock()
+	meta := b.activeDAGs[dagID]
+	b.mu.RUnlock()
+	if meta == nil {
+		return
+	}
+	b.mu.RLock()
+	bus := b.bus
+	b.mu.RUnlock()
+	for taskID, taskLabel := range meta.TaskLabels {
+		publishTaskPipelineState(bus, b.agentID, taskID, taskLabel, taskstate.StatusCancelled, "")
 	}
 }
 

@@ -18,12 +18,16 @@
 ### Judgment & Consultation (Priority 85)
 - `consult` — Query domain experts (target: librarian, archivalist, or academic)
 - `audit` — Self-audit code for quality issues
+- `coord_query_view` — Read the current task coordination ledger
+- `coord_watch_updates` — Wait for coordination changes from peers
 
 ### Execution & Reporting (Priority 80–70)
 - `run_command` — Execute approved shell commands
 - `report_confidence` — Report confidence assessment for escalation
 - `discover_project_tools` — Scan for build tools and frameworks
 - `signal_orchestrator` — Signal progress, questions, or blocks
+- `coord_claim_scope` / `coord_release_scope` — Claim and release concrete implementation scope
+- `coord_publish_artifact` / `coord_request_review` / `coord_resolve_artifact` — Publish concrete artifacts and coordinate peer review
 
 ### Routing
 - `reroute` — Request rerouting to a different agent
@@ -38,3 +42,4 @@
 6. **Consult before implementing.** Ask domain experts for context, not after the fact.
 7. **Audit before completion.** Self-audit code quality before reporting confidence.
 8. **One concern per tool call.** Keep tool calls focused and atomic.
+9. **Coordinate before overlap.** Claim shared scope before editing overlapping areas and watch for peer updates when blocked.

@@ -263,7 +263,7 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(shared.WriteTestSkill())
 	gt.skills.Register(shared.RunTestSuiteSkill())
 	gt.skills.Register(shared.DiagnoseFailureSkill(gt.diagEngine))
-	gt.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
+	gt.skills.Register(shared.NewTesterReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 	gt.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 	gt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 	gt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))

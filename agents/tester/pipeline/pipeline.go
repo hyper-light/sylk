@@ -46,10 +46,14 @@ type PipelineTester struct {
 	activityPub  events.ActivityPublisher
 	pipelineID   string // Stable task-level pipeline ID for TUI grouping.
 	pipelineSlug string
+	pipelineName string
 
 	// State.
 	currentPlan *shared.TestPlan
+	currentTask *agentshared.PipelineTaskInput
+	harness     *testHarnessState
 	diagnoses   map[string]*shared.DiagnosisReport
+	gatePassed  bool
 	mu          sync.RWMutex
 
 	// Diagnosis engine.
@@ -69,6 +73,8 @@ type PipelineTester struct {
 	registrySub guide.Subscription
 	running     bool
 	knownAgents map[string]*guide.AgentAnnouncement
+	pendingMu   sync.Mutex
+	pendingBus  map[string]chan *guide.Message
 
 	// Worker type for design-aware prompt selection.
 	workerType string
@@ -109,6 +115,7 @@ func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*Pip
 		provider:          provider,
 		diagnoses:         make(map[string]*shared.DiagnosisReport),
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
+		pendingBus:        make(map[string]chan *guide.Message),
 		diagEngine:        shared.NewDiagnosisEngine(),
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
@@ -165,24 +172,52 @@ func (pt *PipelineTester) initSkills() error {
 }
 
 func (pt *PipelineTester) registerCoreSkills() {
-	pt.skills.Register(shared.AnalyzeRiskSkill())
-	pt.skills.Register(shared.PlanTestsSkill())
-	pt.skills.Register(shared.WriteTestSkill())
-	pt.skills.Register(shared.RunTestSuiteSkill())
+	pt.skills.Register(checkInspectorGateSkill(pt))
+	pt.skills.Register(detectTestHarnessSkill(pt))
+	pt.skills.Register(prepareTestHarnessSkill(pt))
+	pt.skills.Register(analyzeRiskSkill(pt))
+	pt.skills.Register(planTestsSkill(pt))
+	pt.skills.Register(writeTestSkill(pt))
+	pt.skills.Register(runTestSuiteSkill(pt))
 	pt.skills.Register(shared.DiagnoseFailureSkill(pt.diagEngine))
-	pt.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
+	pt.skills.Register(shared.NewTesterReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(reportToEngineerSkill(pt))
 	pt.skills.Register(reportToDesignerSkill(pt))
+	for _, skill := range agentshared.CoordinationSkills(agentshared.CoordinationSkillConfig{
+		Client: agentshared.CoordinationClient{
+			BusProvider:     func() guide.EventBus { return pt.bus },
+			SourceAgentID:   func() string { return pt.id },
+			SourceAgentType: func() string { return "tester-pipeline" },
+			SessionID:       func() string { return pt.config.SessionID },
+			RegisterPending: pt.registerPendingWait,
+			ClearPending:    pt.clearPendingWait,
+			Timeout:         agentshared.DefaultConsultationTimeout,
+		},
+		CurrentTaskID:   func() string { return pt.pipelineID },
+		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(pt.pipelineName, pt.pipelineSlug) },
+		WorkerType:      func() string { return "tester-pipeline" },
+	}) {
+		pt.skills.Register(skill)
+	}
 	pt.skills.Register(agentshared.NewSelfDiagnosticSkill(&pipelineTesterDiag{pt: pt}))
 	pt.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   pt.id,
 		SessionID: func() string { return pt.config.SessionID },
 		Publish:   pt.publishRerouteRequest,
 	}))
+}
+
+func firstNonEmptyCoordinationName(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 type pipelineTesterDiag struct{ pt *PipelineTester }
@@ -367,6 +402,8 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	}
 
 	task := agentshared.DecodePipelineTaskInput(fwd.Input)
+	prevRuntime := pt.swapTaskRuntime(task, gatePassedForTask(task))
+	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
 
 	pt.mu.RLock()
@@ -456,6 +493,9 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		pt.pipelineSlug = taskSlug
 	}
+	if taskName, _ := fwd.Metadata["task_name"].(string); taskName != "" {
+		pt.pipelineName = taskName
+	}
 
 	agentshared.EmitDispatchACK(pt.bus, fwd.Metadata, pt.id, "tester-pipeline", fwd.CorrelationID)
 	pt.publishActivity(events.EventTypeAgentAction, "Validating implementation quality")
@@ -501,6 +541,9 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 	})
 	if !fwd.FireAndForget {
 		agentshared.PublishStreamStart(pt.bus, pt.channels, ctx, pt.id)
+		if pp := agentshared.ProgressPublisherFromContext(ctx); pp != nil {
+			pp.Publish("Translating task and inspector criteria into executable tests and validating the current failure surface.")
+		}
 	}
 
 	result, err := pt.Handle(ctx, fwd)
@@ -551,6 +594,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 func (pt *PipelineTester) handleBusResponse(msg *guide.Message) error {
 	pt.logger.Debug("received response", "correlation_id", msg.CorrelationID)
+	pt.deliverPendingMessage(msg)
 	return nil
 }
 

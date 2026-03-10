@@ -3,6 +3,7 @@ package agent
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,8 @@ var tddPhases = [4]string{
 
 // progressBarCells is the fixed number of cells in the pipeline shimmer bar.
 const progressBarCells = 4
+
+const pipelineProgressGlyph = "\u25a0" // ■
 
 // tddPhaseIndex returns the 0-based index for a TDD phase status, or -1.
 func tddPhaseIndex(status string) int {
@@ -67,8 +70,8 @@ var variantStateIcons = map[string]string{
 // pipelinePrefix is the tree connector for pipeline member agents.
 const pipelinePrefix = " \u2502 " // " │ "
 
-// pipelineHeaderPrefix renders a pipeline subheading within the Pipelines section.
-const pipelineHeaderPrefix = " \u2502  \u2500 " // " │  ─ "
+// pipelineHeaderIndent renders the pipeline subheading gutter within the Pipelines section.
+const pipelineHeaderIndent = " \u2502  " // " │  "
 
 // variantPrefix is the dotted tree connector for variant rows.
 const variantPrefix = " \u2502  \u250a " // " │  ┊ "
@@ -77,7 +80,7 @@ const variantPrefix = " \u2502  \u250a " // " │  ┊ "
 // Layout: [indicator] [task-id] [status] [progress-bar] [loop/max]
 // When activeColor is non-empty the indicator and task-id use the holographic
 // group color; the task-id additionally gets a ripple shimmer via anim.
-func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme, selected bool, activeColor lipgloss.Color, anim AnimState) string {
+func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme, selected bool, activeColor lipgloss.Color, anim AnimState, collapsed bool) string {
 	// Task ID — always bold, matching renderSectionHeader.
 	taskLabel := truncate(pipelineDisplayLabel(pl), 24)
 	var name string
@@ -97,7 +100,7 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 		}
 		name = nameStyle.Render(taskLabel)
 	}
-	prefix := renderTreePrefix(pipelineHeaderPrefix, activeColor, th)
+	prefix := renderTreePrefix(pipelineHeaderPrefix(collapsed), activeColor, th)
 
 	// Status label.
 	statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtext)
@@ -106,44 +109,104 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 	// Progress bar.
 	bar := renderProgressBar(pl.Status, elapsed, grad, th)
 
-	// Loop counter.
+	// Counter: real loop progress when available, otherwise phase progress.
 	loopStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	loopLabel := loopStyle.Render(fmt.Sprintf("%d/%d", pl.LoopCount, pl.MaxLoops))
+	loopLabel := loopStyle.Render(formatPipelineCounterLabel(pl.Status, pl.LoopCount, pl.MaxLoops))
 
 	return fmt.Sprintf("%s%s %s %s %s", prefix, name, statusLabel, bar, loopLabel)
 }
 
-// renderProgressBar renders a 5-cell shimmer progress bar.
-// Filled cells use gradient sampling; empty cells use muted "░".
-func renderProgressBar(status string, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme) string {
-	filled := tddPhaseIndex(status) + 1
-	if filled < 0 {
-		filled = 0
+func pipelineHeaderPrefix(collapsed bool) string {
+	marker := "\u2500" // ─
+	if collapsed {
+		marker = "+"
 	}
-	if isTerminalPipelineStatus(status) {
-		filled = progressBarCells
-	}
+	return pipelineHeaderIndent + marker + " "
+}
 
-	emptyCell := lipgloss.NewStyle().Foreground(th.Palette.Muted).Render("\u2591") // ░
+// renderProgressBar renders a 4-cell shimmer progress bar.
+// All cells use the same square glyph so the bar doesn't visually collapse as
+// phases advance. Future phases still animate, but on a dimmed version of the
+// active gradient.
+func renderProgressBar(status string, elapsed time.Duration, grad *theme.Gradient, th *theme.Theme) string {
+	filled := activePipelineCells(status)
 
 	var cells [progressBarCells]string
 	for i := range progressBarCells {
-		if i < filled {
-			// Shimmer: sample gradient at position+time offset.
-			offset := float64(i) / float64(progressBarCells)
-			phase := elapsed.Seconds() * 0.5
-			t := math.Mod(offset+phase, 1.0)
-			if t < 0 {
-				t += 1.0
-			}
-			color := grad.Sample(time.Duration(t * float64(grad.Duration())))
-			cells[i] = lipgloss.NewStyle().Foreground(color).Render("\u25fc") // ◼
-		} else {
-			cells[i] = emptyCell
+		offset := float64(i) / float64(progressBarCells)
+		phase := elapsed.Seconds() * 0.5
+		t := math.Mod(offset+phase, 1.0)
+		if t < 0 {
+			t += 1.0
 		}
+		color := grad.Sample(time.Duration(t * float64(grad.Duration())))
+		if i >= filled {
+			color = blendPipelineColor(color, th.Palette.Muted, 0.72)
+		}
+		cells[i] = lipgloss.NewStyle().Foreground(color).Bold(true).Render(pipelineProgressGlyph)
 	}
 
 	return strings.Join(cells[:], "")
+}
+
+func activePipelineCells(status string) int {
+	if isTerminalPipelineStatus(status) {
+		return progressBarCells
+	}
+	filled := tddPhaseIndex(status) + 1
+	if filled < 0 {
+		return 0
+	}
+	if filled > progressBarCells {
+		return progressBarCells
+	}
+	return filled
+}
+
+func formatPipelineCounterLabel(status string, loopCount, maxLoops int) string {
+	if maxLoops > 0 {
+		if loopCount < 0 {
+			loopCount = 0
+		}
+		return fmt.Sprintf("%d/%d", loopCount, maxLoops)
+	}
+	return fmt.Sprintf("%d/%d", activePipelineCells(status), progressBarCells)
+}
+
+func blendPipelineColor(base, target lipgloss.Color, targetWeight float64) lipgloss.Color {
+	if targetWeight <= 0 {
+		return base
+	}
+	if targetWeight >= 1 {
+		return target
+	}
+	br, bg, bb := parsePipelineColor(base)
+	tr, tg, tb := parsePipelineColor(target)
+	keepWeight := 1.0 - targetWeight
+	r := uint8(float64(br)*keepWeight + float64(tr)*targetWeight + 0.5)
+	g := uint8(float64(bg)*keepWeight + float64(tg)*targetWeight + 0.5)
+	b := uint8(float64(bb)*keepWeight + float64(tb)*targetWeight + 0.5)
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, b))
+}
+
+func parsePipelineColor(color lipgloss.Color) (uint8, uint8, uint8) {
+	s := strings.TrimPrefix(string(color), "#")
+	if len(s) != 6 {
+		return 0, 0, 0
+	}
+	r, err := strconv.ParseUint(s[0:2], 16, 8)
+	if err != nil {
+		return 0, 0, 0
+	}
+	g, err := strconv.ParseUint(s[2:4], 16, 8)
+	if err != nil {
+		return 0, 0, 0
+	}
+	b, err := strconv.ParseUint(s[4:6], 16, 8)
+	if err != nil {
+		return 0, 0, 0
+	}
+	return uint8(r), uint8(g), uint8(b)
 }
 
 // ---------------------------------------------------------------------------

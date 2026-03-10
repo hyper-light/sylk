@@ -197,10 +197,17 @@ func renderBadge(entry *ChatEntry, th *theme.Theme) string {
 }
 
 // badgeLabel returns the human-readable name for the badge.
-// For agent entries it uses the AgentType; otherwise the source label.
+// For pipeline agents, it renders a task-scoped label like
+// "Auth Checkout: Inspector" while keeping the semantic agent type available
+// separately for styling.
 func badgeLabel(entry *ChatEntry) string {
-	if entry.Source == SourceAgent && entry.AgentType != "" {
-		return entry.AgentType
+	if entry.Source == SourceAgent {
+		if label, ok := pipelineBadgeLabel(entry); ok {
+			return label
+		}
+		if entry.AgentType != "" {
+			return entry.AgentType
+		}
 	}
 	return sourceLabel(entry.Source)
 }
@@ -208,9 +215,138 @@ func badgeLabel(entry *ChatEntry) string {
 // badgeStyle selects the lipgloss style for the badge based on source.
 func badgeStyle(entry *ChatEntry, th *theme.Theme) lipgloss.Style {
 	if entry.Source == SourceAgent {
-		return th.AgentBadge(entry.AgentType)
+		return th.AgentBadge(badgeAgentType(entry))
 	}
 	return messageStyle(entry.Source, th)
+}
+
+func badgeAgentType(entry *ChatEntry) string {
+	raw := strings.TrimSpace(entry.AgentType)
+	if raw == "" {
+		raw = strings.TrimSpace(entry.AgentID)
+	}
+	if _, agentPart, ok := splitPipelineBadgeIdentity(raw); ok {
+		raw = agentPart
+	}
+	return strings.TrimSpace(raw)
+}
+
+func pipelineBadgeLabel(entry *ChatEntry) (string, bool) {
+	taskLabel := humanizePipelineTaskLabel(firstNonEmpty(
+		strings.TrimSpace(entry.TaskName),
+		strings.TrimSpace(entry.TaskSlug),
+		strings.TrimSpace(entry.TaskID),
+	))
+	if taskLabel != "" {
+		agentLabel := humanizePipelineAgentLabel(badgeAgentType(entry))
+		if agentLabel == "" {
+			return taskLabel, true
+		}
+		return taskLabel + ": " + agentLabel, true
+	}
+
+	raw := strings.TrimSpace(entry.AgentID)
+	if raw == "" {
+		raw = strings.TrimSpace(entry.AgentType)
+	}
+	if raw == "" {
+		return "", false
+	}
+
+	taskPart, agentPart, ok := splitPipelineBadgeIdentity(raw)
+	if !ok {
+		taskPart = ""
+		agentPart = raw
+	}
+
+	agentLabel := humanizePipelineAgentLabel(agentPart)
+	if taskPart == "" {
+		if agentLabel != "" && agentLabel != agentPart {
+			return agentLabel, true
+		}
+		return "", false
+	}
+
+	parsedTaskLabel := humanizePipelineTaskLabel(taskPart)
+	if parsedTaskLabel == "" {
+		return "", false
+	}
+	if agentLabel == "" {
+		agentLabel = humanizePipelineAgentLabel(badgeAgentType(entry))
+	}
+	if agentLabel == "" {
+		return parsedTaskLabel, true
+	}
+	return parsedTaskLabel + ": " + agentLabel, true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func splitPipelineBadgeIdentity(raw string) (taskPart, agentPart string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	if idx := strings.LastIndex(raw, ":"); idx >= 0 && idx < len(raw)-1 {
+		return strings.TrimSpace(raw[:idx]), strings.TrimSpace(raw[idx+1:]), true
+	}
+	if idx := strings.LastIndex(raw, "__"); idx >= 0 && idx+2 < len(raw) {
+		return strings.TrimSpace(raw[:idx]), strings.TrimSpace(raw[idx+2:]), true
+	}
+	return "", raw, false
+}
+
+func humanizePipelineTaskLabel(task string) string {
+	task = strings.TrimSpace(task)
+	task = strings.TrimPrefix(task, "task_")
+	task = strings.ReplaceAll(task, "-", " ")
+	task = strings.ReplaceAll(task, "_", " ")
+	return titleWords(task)
+}
+
+func humanizePipelineAgentLabel(agent string) string {
+	agent = strings.TrimSpace(agent)
+	switch agent {
+	case "inspector-pipeline":
+		return "Inspector"
+	case "tester-pipeline":
+		return "Tester"
+	case "engineer":
+		return "Engineer"
+	case "designer":
+		return "Designer"
+	}
+	if agent == "" {
+		return ""
+	}
+	return titleWords(strings.ReplaceAll(agent, "-", " "))
+}
+
+func titleWords(value string) string {
+	parts := strings.Fields(strings.TrimSpace(value))
+	for i, part := range parts {
+		parts[i] = titleWord(part)
+	}
+	return strings.Join(parts, " ")
+}
+
+func titleWord(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	r, size := utf8.DecodeRuneInString(value)
+	if r == utf8.RuneError && size == 0 {
+		return ""
+	}
+	return strings.ToUpper(string(r)) + strings.ToLower(value[size:])
 }
 
 // messageStyle returns the theme style for a given source.
@@ -531,4 +667,3 @@ func forceBreak(word string, width int, style lipgloss.Style, current *strings.B
 	}
 	return lines
 }
-

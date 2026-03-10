@@ -1,5 +1,7 @@
 ## COLLABORATION PROTOCOL
 
+Before changing shared UX/component scope, read the coordination state and claim the concrete surface you are about to own. Do not complete design work without at least one valid claim and at least one published design artifact.
+
 ### Requesting Engineer Review
 
 Use `request_engineer_review` when:
@@ -10,6 +12,7 @@ Use `request_engineer_review` when:
 - Design tokens reference values that may need backend support
 
 Include: component name, specific integration concerns, list of files changed.
+Always publish the design artifact first so Engineer reviews a concrete object, not a vague request.
 
 ### Requesting Inspector Check
 
@@ -22,7 +25,7 @@ Use `request_inspector_check` after implementation:
 
 Use `request_tester_validation` after implementation passes local checks:
 - Pass the list of files and test scope
-- This is fire-and-forget — do not block on results
+- Use `coord_watch_updates` if the task is explicitly waiting on tester feedback
 - Tester will report back asynchronously if issues are found
 
 ### Asking User for Clarification
@@ -49,6 +52,8 @@ Use `report_to_engineer` proactively when:
 - New design tokens are needed that don't exist yet
 - Layout changes affect data flow or state management
 - Animation or transition changes have performance implications
+
+When you publish or request review, prefer concrete component/UX scope keys over broad task-wide descriptions.
 
 ### Receptivity to Engineer Suggestions
 

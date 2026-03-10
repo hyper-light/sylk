@@ -20,6 +20,8 @@ import (
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/pipeline/coordination"
+	"github.com/adalundhe/sylk/core/pipeline/taskstate"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
@@ -75,6 +77,7 @@ type Orchestrator struct {
 	journal        *OrchestratorJournal
 	bufferRegistry *BufferRegistry
 	dagBridge      *DAGBridge
+	coordination   *CoordinationService
 	scope          *concurrency.GoroutineScope
 
 	// Pipeline subscriptions
@@ -259,6 +262,17 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		return fmt.Errorf("orchestrator: create buffer registry: %w", err)
 	}
 	o.bufferRegistry = buffers
+
+	coordSvc, err := NewCoordinationService(store, DefaultCoordinationServiceConfig())
+	if err != nil {
+		journal.Close()
+		store.Close()
+		return fmt.Errorf("orchestrator: create coordination service: %w", err)
+	}
+	coordSvc.SetArchiveEmitter(func(ctx context.Context, event *coordination.ArchivalEvent) {
+		o.submitCoordinationEventAsync(event)
+	})
+	o.coordination = coordSvc
 
 	// DAG Bridge
 	o.dagBridge = NewDAGBridge(cfg.DAGConfig, DAGBridgeDeps{
@@ -659,6 +673,9 @@ func (o *Orchestrator) Stop() error {
 	if o.bufferRegistry != nil {
 		o.bufferRegistry.Close()
 	}
+	if o.coordination != nil {
+		o.coordination.Close()
+	}
 	if o.dagBridge != nil {
 		o.dagBridge.Close()
 	}
@@ -823,6 +840,9 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 	if msg.Type == guide.MessageTypeAction {
 		action, ok := msg.GetActionRequest()
 		if ok && action != nil {
+			if handled, err := o.handleCoordinationAction(o.runCtx, action); handled {
+				return err
+			}
 			o.steering.HandleAction(action)
 		}
 		return nil
@@ -1112,6 +1132,47 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	router := o.taskRouter
 	o.mu.Unlock()
 
+	pipelineStatus := pipelinePhaseStatus(pipelineStage)
+	if pipelineTaskID != "" && pipelineStatus != "" {
+		publishTaskPipelineState(o.bus, o.config.AgentID, pipelineTaskID, pipelineTaskSlug, pipelineStatus, agentType)
+	}
+
+	if o.coordination != nil && pipelineTaskID != "" {
+		taskNameForCoordination := ""
+		if ctxTaskName, ok := nodeCtx["task_name"].(string); ok {
+			taskNameForCoordination = strings.TrimSpace(ctxTaskName)
+		}
+		packet, err := o.coordination.QueryView(context.Background(), coordination.QueryViewInput{
+			TaskID:     pipelineTaskID,
+			TaskName:   firstNonEmpty(taskNameForCoordination, strings.TrimSpace(name), pipelineTaskSlug),
+			WorkerType: strings.TrimSpace(agentType),
+		})
+		if err != nil {
+			o.logWarnMsg("build coordination packet", "task_id", pipelineTaskID, "agent_type", agentType, "error", err)
+		} else if packet != nil {
+			if packet.Packet != nil && o.config.ArchivalistEnabled {
+				precedents, precedentErr := o.queryCoordinationPrecedents(context.Background(),
+					firstNonEmpty(taskNameForCoordination, strings.TrimSpace(name)),
+					pipelineTaskSlug,
+					strings.TrimSpace(agentType),
+				)
+				if precedentErr != nil {
+					o.logWarnMsg("build coordination precedents", "task_id", pipelineTaskID, "agent_type", agentType, "error", precedentErr)
+				} else if len(precedents) > 0 {
+					packet.Packet.HistoricalPrecedents = precedents
+					packet.Packet.Summary = buildWorkerSummary(strings.TrimSpace(agentType), packet.Packet)
+				}
+			}
+			if nodeCtx == nil {
+				nodeCtx = make(map[string]any)
+			}
+			nodeCtx["coordination_view"] = packet.View
+			if packet.Packet != nil {
+				nodeCtx["coordination_packet"] = packet.Packet
+			}
+		}
+	}
+
 	o.pushEvent(&busEvent{
 		Topic:     "tasks.dispatch",
 		Timestamp: now,
@@ -1128,17 +1189,17 @@ func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
 	if nodeID != "" && agentType != "" {
 		dispatched := make(map[string]struct{})
 
-		o.publishPipelineAgentActivity(agentType, pipelineTaskID, nodeID, pipelineTaskSlug)
+		o.publishPipelineAgentActivity(agentType, pipelineTaskID, nodeID, pipelineTaskSlug, string(pipelineStatus))
 		dispatched[agentType] = struct{}{}
 
 		for _, coType := range coAgents {
-			o.publishPipelineAgentActivity(coType, pipelineTaskID, nodeID, pipelineTaskSlug)
+			o.publishPipelineAgentActivity(coType, pipelineTaskID, nodeID, pipelineTaskSlug, string(pipelineStatus))
 			dispatched[coType] = struct{}{}
 		}
 
 		for _, pipelineType := range PipelinePanelAgentTypes {
 			if _, active := dispatched[pipelineType]; !active {
-				o.publishPipelineAgentRegistration(pipelineType, pipelineTaskID, pipelineTaskSlug)
+				o.publishPipelineAgentRegistration(pipelineType, pipelineTaskID, pipelineTaskSlug, string(pipelineStatus))
 			}
 		}
 	}
@@ -1302,6 +1363,9 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	}
 
 	o.submitTaskEventAsync(task)
+	if o.coordination != nil {
+		_ = o.coordination.ReleaseTaskClaims(context.Background(), taskID)
+	}
 
 	o.pushEvent(&busEvent{
 		Topic:     "tasks.complete",
@@ -1348,6 +1412,9 @@ func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 	}
 
 	o.submitTaskEventAsync(task)
+	if o.coordination != nil {
+		_ = o.coordination.ReleaseTaskClaims(context.Background(), taskID)
+	}
 
 	o.pushEvent(&busEvent{
 		Topic:     "tasks.failed",
@@ -1768,7 +1835,7 @@ func (o *Orchestrator) publishActivity(eventType events.EventType, content strin
 
 // publishPipelineAgentActivity publishes an activity event for a pipeline
 // agent so the TUI's ensureAgent creates a pipeline-scoped panel entry.
-func (o *Orchestrator) publishPipelineAgentActivity(agentType, pipelineID, nodeID, taskSlug string) {
+func (o *Orchestrator) publishPipelineAgentActivity(agentType, pipelineID, nodeID, taskSlug, pipelineStatus string) {
 	if o.activityPub == nil {
 		return
 	}
@@ -1789,13 +1856,16 @@ func (o *Orchestrator) publishPipelineAgentActivity(agentType, pipelineID, nodeI
 	if taskSlug != "" {
 		evt.Data["task_slug"] = taskSlug
 	}
+	if pipelineStatus != "" {
+		evt.Data["pipeline_status"] = pipelineStatus
+	}
 	o.activityPub.PublishActivity(evt)
 }
 
 // publishPipelineAgentRegistration publishes a registration event for a
 // pipeline agent that is present but not yet dispatched. Uses
 // EventTypeAgentRegistered so the TUI shows the agent as waiting (not active).
-func (o *Orchestrator) publishPipelineAgentRegistration(agentType, pipelineID, taskSlug string) {
+func (o *Orchestrator) publishPipelineAgentRegistration(agentType, pipelineID, taskSlug, pipelineStatus string) {
 	if o.activityPub == nil {
 		return
 	}
@@ -1814,6 +1884,9 @@ func (o *Orchestrator) publishPipelineAgentRegistration(agentType, pipelineID, t
 	evt.Data["task_id"] = pipelineID
 	if taskSlug != "" {
 		evt.Data["task_slug"] = taskSlug
+	}
+	if pipelineStatus != "" {
+		evt.Data["pipeline_status"] = pipelineStatus
 	}
 	o.activityPub.PublishActivity(evt)
 }
@@ -2019,6 +2092,32 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 		Timestamp: update.Timestamp,
 	}
 	o.bufferRegistry.Push(entry)
+
+	stage := strings.TrimSpace(update.Stage)
+	if stage == "" {
+		stage = strings.TrimSpace(string(StageFromSubNodeID(update.NodeID)))
+	}
+	if update.TaskID != "" {
+		switch update.Status {
+		case "failed", "timed_out":
+			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
+		case "cancelled":
+			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusCancelled, update.AgentType)
+		case "succeeded":
+			if stage == string(StageExecute) {
+				publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusValidating, update.AgentType)
+			}
+		}
+	}
+
+	if update.Status == "succeeded" && o.coordination != nil {
+		if err := o.coordination.ValidateWorkerCompletion(context.Background(), update.TaskID, update.AgentType, update.AgentID); err != nil {
+			update.Status = "failed"
+			update.Error = err.Error()
+			update.Message = firstNonEmpty(update.Message, "coordination contract violation")
+			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
+		}
+	}
 
 	if isTerminalStatus(update.Status) {
 		result := convertPipelineToNodeResult(update)

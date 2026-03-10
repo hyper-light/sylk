@@ -597,7 +597,7 @@ func normalizeIntent(raw string) Intent {
 }
 
 func normalizeDomain(raw string) Domain {
-	domain := Domain(strings.ToLower(strings.TrimSpace(raw))).Canonical()
+	domain := Domain(strings.ToLower(strings.TrimSpace(raw)))
 	if domain == DomainUnknown {
 		return domain
 	}

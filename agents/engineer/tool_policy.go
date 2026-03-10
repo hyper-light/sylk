@@ -7,8 +7,10 @@ import (
 
 func engineerVisibleSkillNames() []string {
 	return []string{
+		"search_skills",
 		"read_file",
 		"read_workspace_file",
+		"lsp",
 		"edit_file",
 		"write_file",
 		"glob",
@@ -17,7 +19,22 @@ func engineerVisibleSkillNames() []string {
 		"workspace_grep",
 		"inspect_workspace_state",
 		"summarize_workspace_state",
+		"discover_project_tools",
+		"discover_code_patterns",
+		"format",
+		"lint",
+		"consult",
+		"coord_query_view",
+		"coord_watch_updates",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
+		"audit",
 		"run_command",
+		"report_confidence",
+		"signal_orchestrator",
 	}
 }
 
@@ -28,6 +45,11 @@ func engineerMutatingSkillNames() []string {
 		"run_command",
 		"format",
 		"consult",
+		"coord_claim_scope",
+		"coord_release_scope",
+		"coord_publish_artifact",
+		"coord_request_review",
+		"coord_resolve_artifact",
 		"signal_orchestrator",
 		"report_confidence",
 		"reroute_request",

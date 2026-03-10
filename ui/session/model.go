@@ -157,6 +157,20 @@ func (m *Model) SetSize(width, height int) {
 	m.height = max(height, 0)
 }
 
+// PreferredHeight returns the content height the session list would like to
+// consume, capped by maxHeight. This lets the left panel allocate the agents
+// section dynamically instead of hard-splitting the column 50/50.
+func (m *Model) PreferredHeight(maxHeight int) int {
+	if maxHeight <= 0 {
+		return 0
+	}
+	if len(m.summaries) == 0 {
+		return 1
+	}
+	visibleEntries := min(len(m.summaries), max(maxHeight-1, 1))
+	return min(visibleEntries+1, maxHeight)
+}
+
 // ---------------------------------------------------------------------------
 // Message handlers
 // ---------------------------------------------------------------------------

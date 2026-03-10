@@ -256,6 +256,7 @@ var modelContextLimits = map[string]int{
 	"claude-opus-4-6":           200000,
 	"claude-sonnet-4-6":         1000000,
 	"claude-haiku-4-5-20251001": 200000,
+	"gpt-5.4":                   272000,
 	"gpt-5.4-pro":               272000,
 	"gemini-3.1-pro-preview":    2000000,
 	"gemini-3-flash":            1000000,

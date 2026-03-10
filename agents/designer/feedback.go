@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/pipeline/coordination"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -31,40 +33,38 @@ func requestEngineerReviewSkill(d *Designer) *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			if d.bus == nil {
-				return nil, fmt.Errorf("bus not available")
+			taskID := strings.TrimSpace(d.pipelineID)
+			if taskID == "" {
+				return nil, fmt.Errorf("designer task context unavailable")
 			}
-
-			feedback := map[string]any{
-				"type":                 "review_request",
-				"component_name":      p.ComponentName,
-				"integration_concerns": p.IntegrationConcerns,
-				"files_changed":       p.FilesChanged,
-				"from_agent":          d.id,
+			artifact, err := d.coordinationClient().PublishArtifact(ctx, coordination.PublishArtifactInput{
+				TaskID:    taskID,
+				TaskName:  d.currentTaskName(),
+				Kind:      "ux_contract",
+				Title:     strings.TrimSpace(p.ComponentName),
+				Summary:   strings.TrimSpace(p.IntegrationConcerns),
+				ScopeKind: coordination.ScopeKindComponent,
+				ScopeKey:  strings.TrimSpace(p.ComponentName),
+				Payload: map[string]any{
+					"files_changed":        p.FilesChanged,
+					"integration_concerns": p.IntegrationConcerns,
+				},
+				Evidence: evidenceFromFiles(p.FilesChanged),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			req := &guide.RouteRequest{
-				Input:           fmt.Sprintf("Design review request: %s — %s", p.ComponentName, p.IntegrationConcerns),
-				SourceAgentID:   d.id,
-				SourceAgentName: "designer",
-				TargetAgentID:   "engineer",
-				FireAndForget:   true,
-				SessionID:       d.config.SessionID,
-				Timestamp:       time.Now(),
+			review, err := d.coordinationClient().RequestReview(ctx, coordination.RequestReviewInput{
+				TaskID:       taskID,
+				ArtifactID:   artifact.ID,
+				ReviewerType: "engineer",
+				Summary:      fmt.Sprintf("Review the UX integration implications for %s", p.ComponentName),
+				Criteria:     []string{"API boundaries", "shared state", "integration impact"},
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			msg := guide.NewRequestMessage(d.generateMessageID(), req)
-			msg.Metadata = feedback
-
-			if err := d.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-				return nil, fmt.Errorf("publish to engineer: %w", err)
-			}
-
-			return map[string]any{
-				"requested":      true,
-				"target":         "engineer",
-				"component_name": p.ComponentName,
-			}, nil
+			return map[string]any{"requested": true, "target": "engineer", "artifact_id": artifact.ID, "review_id": review.ID}, nil
 		}).
 		Build()
 }
@@ -88,37 +88,36 @@ func requestInspectorCheckSkill(d *Designer) *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			if d.bus == nil {
-				return nil, fmt.Errorf("bus not available")
+			taskID := strings.TrimSpace(d.pipelineID)
+			if taskID == "" {
+				return nil, fmt.Errorf("designer task context unavailable")
 			}
-
-			req := &guide.RouteRequest{
-				Input:           fmt.Sprintf("Inspect files for %s: %v", p.CheckType, p.Files),
-				SourceAgentID:   d.id,
-				SourceAgentName: "designer",
-				TargetAgentID:   "inspector-pipeline",
-				FireAndForget:   true,
-				SessionID:       d.config.SessionID,
-				Timestamp:       time.Now(),
+			artifact, err := d.coordinationClient().PublishArtifact(ctx, coordination.PublishArtifactInput{
+				TaskID:    taskID,
+				TaskName:  d.currentTaskName(),
+				Kind:      "design_validation_request",
+				Summary:   fmt.Sprintf("Inspector validation requested: %s", p.CheckType),
+				ScopeKind: coordination.ScopeKindComponent,
+				ScopeKey:  strings.Join(p.Files, ","),
+				Payload: map[string]any{
+					"files":      p.Files,
+					"check_type": p.CheckType,
+				},
+				Evidence: evidenceFromFiles(p.Files),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			msg := guide.NewRequestMessage(d.generateMessageID(), req)
-			msg.Metadata = map[string]any{
-				"type":       "inspection_request",
-				"files":      p.Files,
-				"check_type": p.CheckType,
-				"from_agent": d.id,
+			review, err := d.coordinationClient().RequestReview(ctx, coordination.RequestReviewInput{
+				TaskID:       taskID,
+				ArtifactID:   artifact.ID,
+				ReviewerType: "inspector-pipeline",
+				Summary:      fmt.Sprintf("Validate design work for %s", p.CheckType),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			if err := d.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-				return nil, fmt.Errorf("publish to inspector: %w", err)
-			}
-
-			return map[string]any{
-				"requested":  true,
-				"target":     "inspector-pipeline",
-				"check_type": p.CheckType,
-			}, nil
+			return map[string]any{"requested": true, "target": "inspector-pipeline", "artifact_id": artifact.ID, "review_id": review.ID}, nil
 		}).
 		Build()
 }
@@ -142,37 +141,36 @@ func requestTesterValidationSkill(d *Designer) *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			if d.bus == nil {
-				return nil, fmt.Errorf("bus not available")
+			taskID := strings.TrimSpace(d.pipelineID)
+			if taskID == "" {
+				return nil, fmt.Errorf("designer task context unavailable")
 			}
-
-			req := &guide.RouteRequest{
-				Input:           fmt.Sprintf("Test validation for %s scope: %v", p.TestScope, p.Files),
-				SourceAgentID:   d.id,
-				SourceAgentName: "designer",
-				TargetAgentID:   "tester-pipeline",
-				FireAndForget:   true,
-				SessionID:       d.config.SessionID,
-				Timestamp:       time.Now(),
+			artifact, err := d.coordinationClient().PublishArtifact(ctx, coordination.PublishArtifactInput{
+				TaskID:    taskID,
+				TaskName:  d.currentTaskName(),
+				Kind:      "design_validation_request",
+				Summary:   fmt.Sprintf("Tester validation requested for %s", p.TestScope),
+				ScopeKind: coordination.ScopeKindUXSurface,
+				ScopeKey:  strings.Join(p.Files, ","),
+				Payload: map[string]any{
+					"files":      p.Files,
+					"test_scope": p.TestScope,
+				},
+				Evidence: evidenceFromFiles(p.Files),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			msg := guide.NewRequestMessage(d.generateMessageID(), req)
-			msg.Metadata = map[string]any{
-				"type":       "test_request",
-				"files":      p.Files,
-				"test_scope": p.TestScope,
-				"from_agent": d.id,
+			review, err := d.coordinationClient().RequestReview(ctx, coordination.RequestReviewInput{
+				TaskID:       taskID,
+				ArtifactID:   artifact.ID,
+				ReviewerType: "tester-pipeline",
+				Summary:      fmt.Sprintf("Validate the design against %s tests", p.TestScope),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			if err := d.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-				return nil, fmt.Errorf("publish to tester: %w", err)
-			}
-
-			return map[string]any{
-				"requested":  true,
-				"target":     "tester-pipeline",
-				"test_scope": p.TestScope,
-			}, nil
+			return map[string]any{"requested": true, "target": "tester-pipeline", "artifact_id": artifact.ID, "review_id": review.ID}, nil
 		}).
 		Build()
 }
@@ -256,40 +254,27 @@ func reportToEngineerSkill(d *Designer) *skills.Skill {
 			if err := json.Unmarshal(input, &p); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			if d.bus == nil {
-				return nil, fmt.Errorf("bus not available")
+			taskID := strings.TrimSpace(d.pipelineID)
+			if taskID == "" {
+				return nil, fmt.Errorf("designer task context unavailable")
 			}
-
-			feedback := map[string]any{
-				"type":              "design_decision",
-				"design_decision":   p.DesignDecision,
-				"affected_files":    p.AffectedFiles,
-				"integration_notes": p.IntegrationNotes,
-				"from_agent":        d.id,
+			artifact, err := d.coordinationClient().PublishArtifact(ctx, coordination.PublishArtifactInput{
+				TaskID:    taskID,
+				TaskName:  d.currentTaskName(),
+				Kind:      "design_decision",
+				Summary:   strings.TrimSpace(p.DesignDecision),
+				ScopeKind: coordination.ScopeKindComponent,
+				ScopeKey:  strings.Join(p.AffectedFiles, ","),
+				Payload: map[string]any{
+					"affected_files":    p.AffectedFiles,
+					"integration_notes": p.IntegrationNotes,
+				},
+				Evidence: evidenceFromFiles(p.AffectedFiles),
+			})
+			if err != nil {
+				return nil, err
 			}
-
-			req := &guide.RouteRequest{
-				Input:           fmt.Sprintf("Design decision report: %s", p.DesignDecision),
-				SourceAgentID:   d.id,
-				SourceAgentName: "designer",
-				TargetAgentID:   "engineer",
-				FireAndForget:   true,
-				SessionID:       d.config.SessionID,
-				Timestamp:       time.Now(),
-			}
-
-			msg := guide.NewRequestMessage(d.generateMessageID(), req)
-			msg.Metadata = feedback
-
-			if err := d.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-				return nil, fmt.Errorf("publish to engineer: %w", err)
-			}
-
-			return map[string]any{
-				"reported":         true,
-				"target":           "engineer",
-				"design_decision":  p.DesignDecision,
-			}, nil
+			return map[string]any{"reported": true, "artifact_id": artifact.ID, "target": "engineer"}, nil
 		}).
 		Build()
 }
@@ -350,4 +335,17 @@ func reportToOrchestratorSkill(d *Designer) *skills.Skill {
 			}, nil
 		}).
 		Build()
+}
+
+func evidenceFromFiles(files []string) []coordination.EvidenceRef {
+	if len(files) == 0 {
+		return nil
+	}
+	evidence := make([]coordination.EvidenceRef, 0, len(files))
+	for _, file := range files {
+		if trimmed := strings.TrimSpace(file); trimmed != "" {
+			evidence = append(evidence, coordination.EvidenceRef{Kind: "file", Value: trimmed})
+		}
+	}
+	return evidence
 }

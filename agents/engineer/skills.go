@@ -45,6 +45,23 @@ func (e *Engineer) registerCoreSkills() {
 	// Consultation
 	e.skills.Register(consultSkill(e))
 
+	for _, skill := range shared.CoordinationSkills(shared.CoordinationSkillConfig{
+		Client: shared.CoordinationClient{
+			BusProvider:     func() guide.EventBus { return e.bus },
+			SourceAgentID:   func() string { return e.id },
+			SourceAgentType: func() string { return "engineer" },
+			SessionID:       func() string { return e.config.SessionID },
+			RegisterPending: func(correlationID string) <-chan *guide.Message { return e.registerPendingConsult(correlationID) },
+			ClearPending:    e.clearPendingConsult,
+			Timeout:         routeSyncTimeout,
+		},
+		CurrentTaskID:   func() string { return e.pipelineID },
+		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(e.pipelineName, e.pipelineSlug) },
+		WorkerType:      func() string { return "engineer" },
+	}) {
+		e.skills.Register(skill)
+	}
+
 	// Discovery
 	e.skills.Register(discoverProjectToolsSkill(e))
 	e.skills.Register(discoverCodePatternsSkill(e))
@@ -65,6 +82,15 @@ func (e *Engineer) registerCoreSkills() {
 		SessionID: func() string { return e.config.SessionID },
 		Publish:   e.publishRerouteRequest,
 	}))
+}
+
+func firstNonEmptyCoordinationName(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 type engineerDiag struct{ e *Engineer }
@@ -566,6 +592,10 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("command execution is disabled")
 			}
 
+			if commandHasUnsafeShellSyntax(params.Command) {
+				return nil, fmt.Errorf("shell control operators are not allowed in run_command")
+			}
+
 			// Check if command is approved
 			if !isCommandApproved(params.Command, e.config.EngineerConfig.ApprovedCommands) {
 				return nil, fmt.Errorf("command not approved: %s", params.Command)
@@ -576,10 +606,11 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("command is blocked: %s", params.Command)
 			}
 
-			workDir := params.WorkingDir
-			if workDir == "" {
-				workDir = e.config.EngineerConfig.WorkingDirectory
+			execCtx, err := e.commandExecutionContext(ctx, params.WorkingDir)
+			if err != nil {
+				return nil, fmt.Errorf("prepare execution workspace: %w", err)
 			}
+			defer execCtx.cleanup()
 
 			timeout := time.Duration(params.TimeoutMs) * time.Millisecond
 			if timeout <= 0 {
@@ -590,14 +621,14 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 			defer cancel()
 
 			cmd := exec.CommandContext(ctx, "sh", "-c", params.Command)
-			cmd.Dir = workDir
+			cmd.Dir = execCtx.workDir
 
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout = &stdout
 			cmd.Stderr = &stderr
 
 			startTime := time.Now()
-			err := cmd.Run()
+			err = cmd.Run()
 			duration := time.Since(startTime)
 
 			exitCode := 0
@@ -610,13 +641,16 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 			}
 
 			return &CommandExecution{
-				Command:    params.Command,
-				ExitCode:   exitCode,
-				Stdout:     stdout.String(),
-				Stderr:     stderr.String(),
-				Duration:   duration,
-				StartTime:  startTime,
-				WorkingDir: workDir,
+				Command:           params.Command,
+				ExitCode:          exitCode,
+				Stdout:            stdout.String(),
+				Stderr:            stderr.String(),
+				Duration:          duration,
+				StartTime:         startTime,
+				WorkingDir:        execCtx.workDir,
+				ExecutionMode:     string(execCtx.plan.Mode),
+				ExecutionStrategy: string(execCtx.plan.Strategy),
+				Materialized:      execCtx.plan.RequiresMaterialize,
 			}, nil
 		}).
 		Build()
@@ -636,6 +670,18 @@ func isCommandBlocked(command string, approved ApprovedCommandPatterns) bool {
 	for _, pattern := range approved.Blocklist {
 		matched, err := regexp.MatchString(pattern, command)
 		if err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+func commandHasUnsafeShellSyntax(command string) bool {
+	if strings.ContainsRune(command, '\n') || strings.ContainsRune(command, '\r') || strings.ContainsRune(command, 0) {
+		return true
+	}
+	for _, fragment := range []string{"&&", "||", ";", "|", "`", "$(", "${", ">", "<"} {
+		if strings.Contains(command, fragment) {
 			return true
 		}
 	}

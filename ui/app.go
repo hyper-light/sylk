@@ -126,6 +126,13 @@ type slotBorderMeta struct {
 	h       int
 }
 
+type leftPanelSections struct {
+	sessionRect   pane.Rect
+	agentsRect    pane.Rect
+	agentsHeaderY int
+	selectorY     int
+}
+
 // shutdownGrace is the grace period for goroutine shutdown.
 // Derived from: once contexts are cancelled, goroutines exit within ms.
 const shutdownGrace = 1 * time.Second
@@ -375,6 +382,8 @@ type AppModel struct {
 	// Layout
 	layout *layout.Manager
 	focus  *layout.FocusManager
+
+	leftPanelSections leftPanelSections
 
 	// Panel components
 	chat           *chat.Model
@@ -681,6 +690,7 @@ type streamUsageEntry struct {
 	AgentName         string
 	PipelineID        string
 	TaskID            string
+	TaskName          string
 	TaskSlug          string
 	Tokens            int // Estimated/real output tokens.
 	InputTokens       int // Real input tokens from the provider (context window occupancy).
@@ -702,6 +712,7 @@ type activeStreamEntry struct {
 	AgentName     string
 	PipelineID    string
 	TaskID        string
+	TaskName      string
 	TaskSlug      string
 	SteeringPace  string // "auto", "step", "paused" — tracks current pace for UI display.
 	StartedAt     time.Time
@@ -914,6 +925,9 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 	if deps.AgentModelStore != nil {
 		app.agentPanel.SetModelStore(deps.AgentModelStore)
 	}
+	if deps.AuthRegistry != nil {
+		app.agentPanel.SetOpenAIAuthMethod(deps.AuthRegistry.ActiveMethod("openai"))
+	}
 
 	// Pre-populate agent panel with known agents from bootstrap.
 	for _, seed := range deps.SeedAgents {
@@ -986,7 +1000,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 
 	// Pipeline bridge — optional, only created when the pipeline subsystem is active.
 	if deps.PipelineManager != nil || deps.VariantRegistry != nil {
-		app.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.VariantRegistry, deps.Scope)
+		app.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.GuideBus, deps.VariantRegistry, deps.Scope)
 		if deps.PipelineManager != nil {
 			deps.PipelineManager.SetOnEvent(app.pipelineBridge.OnPipelineEvent)
 		}
@@ -1130,10 +1144,12 @@ func (m *AppModel) deferredAuthPollCmd() tea.Cmd {
 	return func() tea.Msg {
 		time.Sleep(200 * time.Millisecond)
 		statuses := make(map[string]bool, len(providers))
+		methods := make(map[string]string, len(providers))
 		for _, p := range providers {
 			statuses[p] = reg.IsAvailable(p)
+			methods[p] = reg.ActiveMethod(p)
 		}
-		return msg.AuthStatusMsg{Providers: statuses}
+		return msg.AuthStatusMsg{Providers: statuses, Methods: methods}
 	}
 }
 
@@ -1266,6 +1282,9 @@ func (m *AppModel) dispatch(raw tea.Msg) (tea.Model, tea.Cmd) {
 	case msg.AuthStatusMsg:
 		for provider, available := range typed.Providers {
 			m.statusBar.SetAuthStatus(provider, available)
+		}
+		if method, ok := typed.Methods["openai"]; ok {
+			m.agentPanel.SetOpenAIAuthMethod(method)
 		}
 		return m, nil
 	case msg.InterruptMsg:
@@ -3751,14 +3770,19 @@ func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
 		if m.loginPanel.Active() {
 			m.deactivateLogin()
 		}
-		// Persist the auth mode preference so it survives restarts.
-		_ = credentials.SaveAuthPref(result.Provider, result.Method)
 		m.statusBar.SetFlash(fmt.Sprintf("Authenticated with %s via %s",
 			loginProviderLabel(result.Provider), loginMethodLabel(result.Method)))
-		// Notify the AuthRegistry so all agents of this provider type
-		// receive the credential update via the event bus.
+		// The AuthRegistry is the runtime auth source of truth. It persists
+		// the preferred provider auth mode and broadcasts the effective
+		// provider state to the rest of the system.
 		if m.deps.AuthRegistry != nil {
 			m.deps.AuthRegistry.NotifyCredentialChanged(result.Provider, result.Method)
+			m.agentPanel.SetOpenAIAuthMethod(m.deps.AuthRegistry.ActiveMethod("openai"))
+		} else {
+			_ = credentials.SaveAuthPref(result.Provider, result.Method)
+			if strings.EqualFold(result.Provider, "openai") {
+				m.agentPanel.SetOpenAIAuthMethod(result.Method)
+			}
 		}
 		m.statusBar.SetAuthStatus(result.Provider, true)
 		return nil
@@ -4381,6 +4405,7 @@ func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
 		existing.AgentName = firstNonEmpty(start.AgentName, existing.AgentName)
 		existing.PipelineID = firstNonEmpty(logicalPipelineID, existing.PipelineID)
 		existing.TaskID = firstNonEmpty(start.TaskID, existing.TaskID)
+		existing.TaskName = firstNonEmpty(start.TaskName, existing.TaskName)
 		existing.TaskSlug = firstNonEmpty(start.TaskSlug, existing.TaskSlug)
 		return false
 	}
@@ -4391,6 +4416,7 @@ func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
 		AgentName:     strings.TrimSpace(start.AgentName),
 		PipelineID:    logicalPipelineID,
 		TaskID:        strings.TrimSpace(start.TaskID),
+		TaskName:      strings.TrimSpace(start.TaskName),
 		TaskSlug:      strings.TrimSpace(start.TaskSlug),
 		StartedAt:     time.Now(),
 	}
@@ -5816,6 +5842,7 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 		AgentName:     progress.AgentName,
 		PipelineID:    progress.PipelineID,
 		TaskID:        progress.TaskID,
+		TaskName:      progress.TaskName,
 		TaskSlug:      progress.TaskSlug,
 	}
 	m.trackStreamStart(start)
@@ -5961,6 +5988,7 @@ func (m *AppModel) trackStreamStart(start msg.StreamStartMsg) {
 	entry.AgentName = strings.TrimSpace(start.AgentName)
 	entry.PipelineID = logicalPipelineID
 	entry.TaskID = strings.TrimSpace(start.TaskID)
+	entry.TaskName = strings.TrimSpace(start.TaskName)
 	entry.TaskSlug = strings.TrimSpace(start.TaskSlug)
 	if entry.StartedAt.IsZero() {
 		entry.StartedAt = time.Now()
@@ -6396,6 +6424,14 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	m.updateTokenDisplay()
 	m.statusBar.SetTokenPhase(status.PhaseIdle)
 	m.publishResponseActivity(r, source, content, contextUsage, streamEntry)
+	streamTaskID := ""
+	streamTaskName := ""
+	streamTaskSlug := ""
+	if streamEntry != nil {
+		streamTaskID = strings.TrimSpace(streamEntry.TaskID)
+		streamTaskName = strings.TrimSpace(streamEntry.TaskName)
+		streamTaskSlug = strings.TrimSpace(streamEntry.TaskSlug)
+	}
 	agentDisplay := r.AgentID
 	if r.AgentName != "" {
 		agentDisplay = r.AgentName
@@ -6406,6 +6442,9 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		Source:    source,
 		AgentType: agentDisplay,
 		AgentID:   r.AgentID,
+		TaskID:    streamTaskID,
+		TaskName:  streamTaskName,
+		TaskSlug:  streamTaskSlug,
 		Content:   content,
 		Height:    -1,
 	}
@@ -6428,6 +6467,7 @@ func (m *AppModel) publishResponseActivity(
 	streamAgentName := ""
 	streamPipelineID := ""
 	streamTaskID := ""
+	streamTaskName := ""
 	streamTaskSlug := ""
 	if streamEntry != nil {
 		streamAgentID = streamEntry.AgentID
@@ -6435,6 +6475,7 @@ func (m *AppModel) publishResponseActivity(
 		streamAgentName = streamEntry.AgentName
 		streamPipelineID = streamEntry.PipelineID
 		streamTaskID = streamEntry.TaskID
+		streamTaskName = streamEntry.TaskName
 		streamTaskSlug = streamEntry.TaskSlug
 	}
 	streamPipelineID = logicalStreamPipelineID(streamPipelineID, streamTaskID)
@@ -6465,6 +6506,9 @@ func (m *AppModel) publishResponseActivity(
 		}
 		if taskID := strings.TrimSpace(streamTaskID); taskID != "" {
 			data["task_id"] = taskID
+		}
+		if taskName := strings.TrimSpace(streamTaskName); taskName != "" {
+			data["task_name"] = taskName
 		}
 		if taskSlug := strings.TrimSpace(streamTaskSlug); taskSlug != "" {
 			data["task_slug"] = taskSlug
@@ -10855,6 +10899,9 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 	if cmd := m.handleAgentSelectorClick(mouse.X, mouse.Y); cmd != nil {
 		return cmd
 	}
+	if cmd := m.handleAgentPanelClick(mouse.X, mouse.Y); cmd != nil {
+		return cmd
+	}
 
 	if cmd := m.handleFileTreeClick(mouse.X, mouse.Y); cmd != nil {
 		return cmd
@@ -10867,11 +10914,21 @@ func (m *AppModel) handleLeftClick(mouse tea.MouseMsg) tea.Cmd {
 // i.e. the row just above the bottom border = leftH - 2 (0-indexed).
 // Returns -1 if the left panel is not visible.
 func (m *AppModel) agentSelectorScreenY() int {
-	_, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
-	if leftH < 3 {
+	if m.leftPanelSections.selectorY <= 0 {
 		return -1
 	}
-	return leftH - 2
+	return m.leftPanelSections.selectorY
+}
+
+func (m *AppModel) isInsideLeftPanelContent(x, y int) bool {
+	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
+	rect := pane.Rect{X: 1, Y: 1, W: max(leftW-panelBorderSize, 1), H: max(leftH-panelBorderSize, 1)}
+	return x >= rect.X && x < rect.X+rect.W && y >= rect.Y && y < rect.Y+rect.H
+}
+
+func (m *AppModel) isInsideAgentsSection(x, y int) bool {
+	rect := m.leftPanelSections.agentsRect
+	return rect.W > 0 && rect.H > 0 && x >= rect.X && x < rect.X+rect.W && y >= rect.Y && y < rect.Y+rect.H
 }
 
 // updateSelectorHover updates arrow hover state when the cursor moves
@@ -10908,6 +10965,20 @@ func (m *AppModel) handleAgentSelectorClick(screenX, screenY int) tea.Cmd {
 	m.focus.SetFocus(component.FocusAgentPanel)
 	m.syncFocusState()
 	return m.agentPanel.HandleSelectorClick(localX)
+}
+
+func (m *AppModel) handleAgentPanelClick(screenX, screenY int) tea.Cmd {
+	if !m.isInsideAgentsSection(screenX, screenY) {
+		return nil
+	}
+	rect := m.leftPanelSections.agentsRect
+	localY := screenY - rect.Y
+	if localY < 0 || localY >= rect.H {
+		return nil
+	}
+	m.focus.SetFocus(component.FocusAgentPanel)
+	m.syncFocusState()
+	return m.agentPanel.HandleListClick(localY)
 }
 
 // panelForScroll resolves the panel under screen coordinate x, accounting
@@ -10954,6 +11025,14 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 		if m.leftRing.empty() {
 			return 0, false
 		}
+		if current := m.leftRing.current(); current == component.FocusSessionPanel || current == component.FocusAgentPanel {
+			if m.isInsideAgentsSection(x, y) {
+				return component.FocusAgentPanel, true
+			}
+			if m.isInsideLeftPanelContent(x, y) {
+				return component.FocusSessionPanel, true
+			}
+		}
 		return m.leftRing.current(), true
 	}
 
@@ -10963,6 +11042,14 @@ func (m *AppModel) panelForScroll(x, y int) (component.FocusID, bool) {
 	}
 
 	resolved := m.resolveRingPanel(panelID, mode)
+	if panelID == component.FocusSessionPanel && (resolved == component.FocusSessionPanel || resolved == component.FocusAgentPanel) {
+		if m.isInsideAgentsSection(x, y) {
+			return component.FocusAgentPanel, true
+		}
+		if m.isInsideLeftPanelContent(x, y) {
+			return component.FocusSessionPanel, true
+		}
+	}
 
 	// Merge diff view: route file-tree slot scrolls to the merge diff file list.
 	if m.mergeDiffViewActive && m.mergeDiffView != nil && resolved == component.FocusFileTree {
@@ -11216,8 +11303,8 @@ func (m *AppModel) scrollOneLine(panelID component.FocusID, direction int) bool 
 		}
 		return m.fileTree.ScrollDown()
 	case component.FocusSessionPanel:
-		// Left column contains both session and agent panels; scroll goes to agent
-		// only when it has scrollable content (expanded/detail views).
+		return false
+	case component.FocusAgentPanel:
 		if direction < 0 {
 			return m.agentPanel.ScrollUp()
 		}
@@ -12800,6 +12887,40 @@ const panelBorderSize = 2
 // Derived from: 2 headers (1 line each) + 1 divider (1 line + 1 top padding) = 4.
 const leftPanelOverhead = 4
 
+// minAgentSectionHeight is the minimum content height reserved for the Agents
+// subsection above the selector row. This keeps Knowledge and Pipelines usable
+// even when the Sessions list is short or the terminal is tight.
+const minAgentSectionHeight = 6
+
+func computeLeftPanelSections(leftW, leftH, selectorLines, preferredSessionHeight int) leftPanelSections {
+	innerLeftW := max(leftW-panelBorderSize, 1)
+	innerLeftH := max(leftH-panelBorderSize, 1)
+	contentH := max(innerLeftH-leftPanelOverhead, 2)
+	minAgentTotalH := max(minAgentSectionHeight+selectorLines, 1)
+	maxSessionH := max(contentH-minAgentTotalH, 1)
+	sessionH := min(max(preferredSessionHeight, 1), maxSessionH)
+	agentTotalH := contentH - sessionH
+	agentContentH := max(agentTotalH-selectorLines, 1)
+
+	// Screen-space coordinates inside the bordered left panel content area.
+	contentX := 1
+	contentY := 1
+	sessionTop := contentY + 1
+	agentsHeaderY := contentY + 1 + sessionH + 2
+	agentsTop := agentsHeaderY + 1
+	selectorY := contentY + innerLeftH - selectorLines
+	if selectorY < agentsTop {
+		selectorY = agentsTop
+	}
+
+	return leftPanelSections{
+		sessionRect:   pane.Rect{X: contentX, Y: sessionTop, W: innerLeftW, H: sessionH},
+		agentsRect:    pane.Rect{X: contentX, Y: agentsTop, W: innerLeftW, H: agentContentH},
+		agentsHeaderY: agentsHeaderY,
+		selectorY:     selectorY,
+	}
+}
+
 // inputMaxVisualLines computes the dynamic maximum content lines for the input.
 // Derived from: total height - status bar - main area minimum - input border.
 func (m *AppModel) inputMaxVisualLines() int {
@@ -12878,12 +12999,13 @@ func (m *AppModel) recalcLayout() {
 	// Left panel: split between session (top) and agent (bottom).
 	leftW, leftH := m.layout.GetPanelSize(component.FocusSessionPanel)
 	innerLeftW := max(leftW-panelBorderSize, 1)
-	innerLeftH := max(leftH-panelBorderSize, 1)
-	contentH := max(innerLeftH-leftPanelOverhead, 2)
-	sessionH := contentH / 2
-	agentH := contentH - sessionH
+	sessionPreferredH := m.sessionPanel.PreferredHeight(max(leftH-panelBorderSize-leftPanelOverhead, 1))
+	sections := computeLeftPanelSections(leftW, leftH, m.agentPanel.SelectorLineCount(), sessionPreferredH)
+	m.leftPanelSections = sections
+	sessionH := sections.sessionRect.H
+	agentH := sections.agentsRect.H
 	m.sessionPanel.SetSize(innerLeftW, sessionH)
-	m.agentPanel.SetSize(innerLeftW, agentH)
+	m.agentPanel.SetSize(innerLeftW, max(agentH, 1))
 
 	// File tree panel.
 	treeW, treeH := m.layout.GetPanelSize(component.FocusFileTree)

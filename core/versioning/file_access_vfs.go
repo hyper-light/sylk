@@ -124,6 +124,27 @@ func (v *VFSFileAccess) Stat(_ context.Context, path string) (fs.FileInfo, error
 func (v *VFSFileAccess) WorkingDir() string { return v.workingDir }
 func (v *VFSFileAccess) IsReadOnly() bool   { return v.readOnly }
 
+// RegisterVisiblePath widens this pipeline VFS to include an exact new path
+// before the first write. This keeps sparse task bounds intact while allowing
+// adjacent test and harness files to be created deliberately.
+func (v *VFSFileAccess) RegisterVisiblePath(path string) {
+	if path == "" {
+		return
+	}
+	v.vfs.RegisterVisiblePath(v.resolve(path))
+}
+
+// VisiblePaths returns the current visible pipeline-local paths rooted under
+// the provided directory.
+func (v *VFSFileAccess) VisiblePaths(root string) []string {
+	return v.vfs.VisiblePaths(v.resolve(root))
+}
+
+// Modifications returns the staged pipeline-local overlay changes.
+func (v *VFSFileAccess) Modifications() []FileModification {
+	return v.vfs.GetModifications()
+}
+
 func (v *VFSFileAccess) resolve(path string) string {
 	if filepath.IsAbs(path) {
 		return path

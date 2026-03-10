@@ -89,7 +89,10 @@ func classifyByRules(input string) (Intent, Domain, string, float64) {
 	}
 	if containsClassifierKeyword(query, "plan", "architecture", "break down", "decompose",
 		"strategy", "workflow", "coordinate", "orchestrate", "build") {
-		return IntentPlan, DomainPlanning, "architect", 0.88
+		if containsClassifierKeyword(query, "break down", "decompose", "workflow", "coordinate", "orchestrate") {
+			return IntentPlan, DomainTasks, "architect", 0.88
+		}
+		return IntentPlan, DomainDesign, "architect", 0.88
 	}
 	if containsClassifierKeyword(query, "design", "ui", "ux", "layout", "component",
 		"visual", "style", "css", "mockup", "wireframe") {
@@ -97,24 +100,33 @@ func classifyByRules(input string) (Intent, Domain, string, float64) {
 	}
 	if containsClassifierKeyword(query, "implement", "write", "refactor",
 		"function", "class", "method", "fix bug", "add feature", "engineer") {
-		return IntentDeclare, DomainLocal, "engineer", 0.85
+		return IntentComplete, DomainCode, "engineer", 0.85
 	}
 	if containsClassifierKeyword(query, "clone", "fetch repo", "fetch package",
 		"download repo", "download package", "git clone", "pull repo") {
 		return IntentFetch, DomainCode, "librarian", 0.88
 	}
 	if containsClassifierKeyword(query, "find", "search", "locate", "where", "file", "code") {
-		return IntentFind, DomainLocal, "librarian", 0.85
+		return IntentFind, DomainCode, "librarian", 0.85
 	}
 	if containsClassifierKeyword(query, "test", "qa", "coverage") {
-		return IntentCheck, DomainTesting, "tester", 0.82
+		return IntentCheck, DomainCode, "tester", 0.82
 	}
 	if containsClassifierKeyword(query, "review", "compliance", "requirement", "lint", "inspect") {
-		return IntentCheck, DomainCompliance, "inspector", 0.82
+		return IntentCheck, DomainCode, "inspector", 0.82
 	}
 	if containsClassifierKeyword(query, "history", "pattern", "failure", "learning",
 		"lesson", "what happened", "last time") {
-		return IntentRecall, DomainHistory, "archivalist", 0.82
+		switch {
+		case containsClassifierKeyword(query, "failure", "failed", "regression", "incident", "error"):
+			return IntentRecall, DomainFailures, "archivalist", 0.82
+		case containsClassifierKeyword(query, "learning", "lesson"):
+			return IntentRecall, DomainLearnings, "archivalist", 0.82
+		case containsClassifierKeyword(query, "decision", "why did we", "rationale", "tradeoff"):
+			return IntentRecall, DomainDecisions, "archivalist", 0.82
+		default:
+			return IntentRecall, DomainPatterns, "archivalist", 0.82
+		}
 	}
 	if containsClassifierKeyword(query, "research", "paper", "best practice", "documentation") {
 		return IntentRecall, DomainResearch, "academic", 0.80

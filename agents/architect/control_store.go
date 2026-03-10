@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/core/database"
@@ -245,6 +246,86 @@ func (s *ArchitectControlStore) GetContinuationByResponseCorrelation(correlation
 		return nil, fmt.Errorf("architect control store: get continuation: %w", err)
 	}
 	return row.toContinuation(), nil
+}
+
+func (s *ArchitectControlStore) LatestActiveContinuationForSession(sessionID string, now time.Time) (*ArchitectContinuation, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(sessionID) == "" {
+		return nil, nil
+	}
+
+	row := new(architectContinuationRow)
+	err := s.db.Bun().
+		NewSelect().
+		Model(row).
+		Where("session_id = ?", strings.TrimSpace(sessionID)).
+		Where("plan_id IS NOT NULL").
+		Where("plan_id != ''").
+		Where("state IN (?)", bun.In([]string{string(continuationStatusPending), string(continuationStatusProcessing)})).
+		Where("(expires_at IS NULL OR expires_at >= ?)", now.UTC()).
+		OrderExpr("created_at DESC").
+		Limit(1).
+		Scan(context.Background())
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("architect control store: latest active continuation: %w", err)
+	}
+	return row.toContinuation(), nil
+}
+
+func (s *ArchitectControlStore) ListActiveContinuations(now time.Time) ([]*ArchitectContinuation, error) {
+	if s == nil || s.db == nil {
+		return nil, nil
+	}
+
+	var rows []architectContinuationRow
+	if err := s.db.Bun().
+		NewSelect().
+		Model(&rows).
+		Where("plan_id IS NOT NULL").
+		Where("plan_id != ''").
+		Where("state IN (?)", bun.In([]string{string(continuationStatusPending), string(continuationStatusProcessing)})).
+		Where("(expires_at IS NULL OR expires_at >= ?)", now.UTC()).
+		OrderExpr("created_at DESC").
+		Scan(context.Background()); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("architect control store: list active continuations: %w", err)
+	}
+	result := make([]*ArchitectContinuation, 0, len(rows))
+	for i := range rows {
+		result = append(result, rows[i].toContinuation())
+	}
+	return result, nil
+}
+
+func (s *ArchitectControlStore) GetPlan(planID string) (*DesignPlan, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(planID) == "" {
+		return nil, nil
+	}
+
+	row := new(architectPlanRow)
+	err := s.db.Bun().
+		NewSelect().
+		Model(row).
+		Where("plan_id = ?", strings.TrimSpace(planID)).
+		Limit(1).
+		Scan(context.Background())
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("architect control store: get plan: %w", err)
+	}
+
+	var plan DesignPlan
+	if err := json.Unmarshal([]byte(row.PlanJSON), &plan); err != nil {
+		return nil, fmt.Errorf("architect control store: decode plan: %w", err)
+	}
+	plan.sm = NewPlanStateMachineWithEpoch(plan.ID, plan.Status, plan.Epoch)
+	return &plan, nil
 }
 
 func (s *ArchitectControlStore) ClaimPendingContinuationByResponseCorrelation(correlationID string) (*ArchitectContinuation, error) {

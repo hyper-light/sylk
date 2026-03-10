@@ -296,6 +296,28 @@ func (b *Builder) ArrayParam(name, description, itemType string, required bool) 
 	return b
 }
 
+// ArrayObjectParam adds an array parameter whose items are typed objects.
+func (b *Builder) ArrayObjectParam(
+	name, description string,
+	properties map[string]*Property,
+	itemRequired []string,
+	required bool,
+) *Builder {
+	b.skill.InputSchema.Properties[name] = &Property{
+		Type:        "array",
+		Description: description,
+		Items: &Property{
+			Type:       "object",
+			Properties: properties,
+			Required:   append([]string(nil), itemRequired...),
+		},
+	}
+	if required {
+		b.skill.InputSchema.Required = append(b.skill.InputSchema.Required, name)
+	}
+	return b
+}
+
 // ObjectParam adds an object parameter
 func (b *Builder) ObjectParam(name, description string, properties map[string]*Property, required bool) *Builder {
 	b.skill.InputSchema.Properties[name] = &Property{

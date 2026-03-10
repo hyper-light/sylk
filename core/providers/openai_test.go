@@ -57,6 +57,8 @@ func TestNormalizeOpenAIModel(t *testing.T) {
 		in   string
 		want string
 	}{
+		{"gpt-5.4", "gpt-5.4"},
+		{"gpt-5-4", "gpt-5.4"},
 		{"gpt-5.4-pro", "gpt-5.4-pro"},
 		{"gpt-5-4-pro", "gpt-5.4-pro"},
 		{"", ""},
@@ -77,8 +79,14 @@ func TestOpenAIProviderSupportsModel(t *testing.T) {
 	if !p.SupportsModel("gpt-5.4-pro") {
 		t.Fatal("expected gpt-5.4-pro to be supported")
 	}
+	if !p.SupportsModel("gpt-5.4") {
+		t.Fatal("expected gpt-5.4 to be supported")
+	}
 	if !p.SupportsModel("gpt-5-4-pro") {
 		t.Fatal("expected gpt-5-4-pro alias to be supported")
+	}
+	if !p.SupportsModel("gpt-5-4") {
+		t.Fatal("expected gpt-5-4 alias to be supported")
 	}
 	if p.SupportsModel("unknown-model") {
 		t.Fatal("expected unknown-model to be unsupported by default")
@@ -106,6 +114,51 @@ func TestOpenAIProviderBuildResponseParams_NormalizesModel(t *testing.T) {
 
 	if got := string(params.Model); got != "gpt-5.4-pro" {
 		t.Fatalf("expected normalized model gpt-5.4-pro, got %q", got)
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_ChatGPTRemapsGPT54Pro(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+			AuthMode: openAIAuthModeChatGPT,
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Model:    "gpt-5.4-pro",
+		Messages: []Message{{Role: RoleUser, Content: "hello"}},
+	})
+
+	if got := string(params.Model); got != "gpt-5.4" {
+		t.Fatalf("expected chatgpt auth to remap gpt-5.4-pro to gpt-5.4, got %q", got)
+	}
+	if params.Truncation != "" {
+		t.Fatalf("expected truncation to be omitted in chatgpt mode, got %q", params.Truncation)
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_APIKeyReasoningModelSetsTruncation(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+			AuthMode: openAIAuthModeAPIKey,
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Model:    "gpt-5.4-pro",
+		Messages: []Message{{Role: RoleUser, Content: "hello"}},
+	})
+
+	if params.Truncation != responses.ResponseNewParamsTruncationAuto {
+		t.Fatalf("expected truncation auto for api-key reasoning model, got %q", params.Truncation)
 	}
 }
 
@@ -230,6 +283,61 @@ func TestOpenAIProviderBuildResponseParams_NormalizesLegacyPromptCacheRetention(
 	body := marshalResponseNewParams(t, params)
 	if body["prompt_cache_retention"] != "in_memory" {
 		t.Fatalf("expected normalized in_memory prompt cache retention, got %#v", body["prompt_cache_retention"])
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_GPT54OmitsPromptCacheRetention(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4",
+				MaxTokens: 1024,
+			},
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Messages:             []Message{{Role: RoleUser, Content: "hello"}},
+		PromptCacheKey:       "guardian:session-123",
+		PromptCacheRetention: "24h",
+	})
+
+	body := marshalResponseNewParams(t, params)
+	if body["prompt_cache_key"] != "guardian:session-123" {
+		t.Fatalf("expected prompt cache key to remain set, got %#v", body["prompt_cache_key"])
+	}
+	if _, ok := body["prompt_cache_retention"]; ok {
+		t.Fatalf("expected prompt_cache_retention to be omitted for gpt-5.4, got %#v", body["prompt_cache_retention"])
+	}
+}
+
+func TestOpenAIProviderBuildResponseParams_ChatGPTGPT54OmitsPromptCacheRetention(t *testing.T) {
+	p := &OpenAIProvider{
+		config: OpenAIConfig{
+			BaseConfig: BaseConfig{
+				Model:     "gpt-5.4-pro",
+				MaxTokens: 1024,
+			},
+			AuthMode: openAIAuthModeChatGPT,
+		},
+	}
+
+	params := p.buildResponseParams(&Request{
+		Model:                "gpt-5.4-pro",
+		Messages:             []Message{{Role: RoleUser, Content: "hello"}},
+		PromptCacheKey:       "guardian:session-123",
+		PromptCacheRetention: "24h",
+	})
+
+	body := marshalResponseNewParams(t, params)
+	if got := string(params.Model); got != "gpt-5.4" {
+		t.Fatalf("expected chatgpt auth to remap gpt-5.4-pro to gpt-5.4, got %q", got)
+	}
+	if body["prompt_cache_key"] != "guardian:session-123" {
+		t.Fatalf("expected prompt cache key to remain set, got %#v", body["prompt_cache_key"])
+	}
+	if _, ok := body["prompt_cache_retention"]; ok {
+		t.Fatalf("expected prompt_cache_retention to be omitted for chatgpt gpt-5.4, got %#v", body["prompt_cache_retention"])
 	}
 }
 
@@ -380,7 +488,10 @@ func TestOpenAIProviderBuildResponseParams_ChatGPTSetsInstructions(t *testing.T)
 	}
 
 	params := p.buildResponseParams(&Request{
-		Messages: []Message{{Role: RoleUser, Content: "hello"}},
+		Messages: []Message{
+			{Role: RoleSystem, Content: "legacy system message that should be omitted"},
+			{Role: RoleUser, Content: "hello"},
+		},
 	})
 	if !params.Instructions.Valid() {
 		t.Fatal("expected instructions to be set in chatgpt mode")
@@ -396,6 +507,22 @@ func TestOpenAIProviderBuildResponseParams_ChatGPTSetsInstructions(t *testing.T)
 	}
 	if params.MaxOutputTokens.Valid() {
 		t.Fatal("expected max_output_tokens to be omitted in chatgpt mode")
+	}
+
+	body := marshalResponseNewParams(t, params)
+	input, ok := body["input"].([]any)
+	if !ok {
+		t.Fatalf("expected input array, got %#v", body["input"])
+	}
+	if len(input) != 1 {
+		t.Fatalf("expected only user input item in chatgpt mode, got %#v", input)
+	}
+	first, ok := input[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first input item object, got %#v", input[0])
+	}
+	if first["role"] != "user" {
+		t.Fatalf("expected first input item role user, got %#v", first["role"])
 	}
 }
 

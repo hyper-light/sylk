@@ -44,6 +44,7 @@ type Designer struct {
 	activityPub   events.ActivityPublisher
 	pipelineID    string // Stable task-level pipeline ID for TUI grouping.
 	pipelineSlug  string
+	pipelineName  string
 	usageAccum    *designerUsageAccumulator
 
 	state    *DesignerState
@@ -65,6 +66,8 @@ type Designer struct {
 
 	consultations []Consultation
 	consultMu     sync.RWMutex
+	pendingMu     sync.Mutex
+	pendingBus    map[string]chan *guide.Message
 
 	fileAccess     versioning.FileAccess
 	workspaceViews versioning.WorkspaceViewAccess
@@ -136,6 +139,7 @@ func New(cfg Config, provider designerProvider) (*Designer, error) {
 			StartedAt: time.Now(),
 		},
 		consultations:     make([]Consultation, 0),
+		pendingBus:        make(map[string]chan *guide.Message),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
 	}
@@ -435,6 +439,9 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	if taskSlug, _ := fwd.Metadata["task_slug"].(string); taskSlug != "" {
 		d.pipelineSlug = taskSlug
 	}
+	if taskName, _ := fwd.Metadata["task_name"].(string); taskName != "" {
+		d.pipelineName = taskName
+	}
 
 	shared.EmitDispatchACK(d.bus, fwd.Metadata, d.id, "designer", fwd.CorrelationID)
 	d.publishActivity(events.EventTypeAgentAction, "Processing design task")
@@ -487,6 +494,9 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	})
 	if !fwd.FireAndForget {
 		shared.PublishStreamStart(d.bus, d.channels, ctx, d.id)
+		if pp := shared.ProgressPublisherFromContext(ctx); pp != nil {
+			pp.Publish("Reviewing UX criteria, design constraints, and task-local workspace before updating the implementation.")
+		}
 	}
 	startTime := time.Now()
 
@@ -658,6 +668,7 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 
 func (d *Designer) handleBusResponse(msg *guide.Message) error {
 	d.logger.Debug("received response", "correlation_id", msg.CorrelationID)
+	d.deliverPendingMessage(msg)
 	return nil
 }
 

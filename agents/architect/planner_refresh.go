@@ -10,12 +10,13 @@ import (
 
 // RefreshPlannerAuth clears cached planner state so the next planning call
 // re-resolves credentials from secure storage/environment.
-func (a *Architect) RefreshPlannerAuth() {
+func (a *Architect) RefreshPlannerAuth(authMethod string) {
 	if a == nil {
 		return
 	}
 	a.plannerMu.Lock()
 	a.config.AnthropicAPIKey = ""
+	a.config.AnthropicAuthMode = providers.ResolveAnthropicAuthMode(authMethod)
 	a.planner = nil
 	a.plannerMu.Unlock()
 }
@@ -38,8 +39,8 @@ func (a *Architect) ProviderType() string {
 // the next call re-resolves credentials. The authMethod parameter is
 // accepted for interface compliance; the planner lazy-resolves its
 // own credentials on next use.
-func (a *Architect) RefreshProvider(_ context.Context, _ string) error {
-	a.RefreshPlannerAuth()
+func (a *Architect) RefreshProvider(_ context.Context, authMethod string) error {
+	a.RefreshPlannerAuth(authMethod)
 	return nil
 }
 

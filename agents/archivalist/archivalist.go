@@ -790,6 +790,9 @@ func (a *Archivalist) publishSystemEvent(eventType events.EventType, content str
 // When LLM is enabled and a provider is available, builds a providers.Request
 // and runs the tool loop. Falls back to direct intent-dispatch otherwise.
 func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	if result, ok, err := a.maybeHandleCoordinationPrecedentQuery(ctx, fwd); ok {
+		return result, err
+	}
 	if a.config.EnableLLM && a.getProvider() != nil {
 		return a.processViaLLM(ctx, fwd)
 	}
@@ -798,6 +801,70 @@ func (a *Archivalist) processForwardedRequest(ctx context.Context, fwd *guide.Fo
 		return nil, err
 	}
 	return handler(ctx, fwd)
+}
+
+func (a *Archivalist) maybeHandleCoordinationPrecedentQuery(ctx context.Context, fwd *guide.ForwardedRequest) (any, bool, error) {
+	if fwd == nil || len(fwd.Metadata) == 0 {
+		return nil, false, nil
+	}
+	flag, _ := fwd.Metadata["coordination_precedent_query"].(bool)
+	if !flag {
+		return nil, false, nil
+	}
+
+	taskName, _ := fwd.Metadata["task_name"].(string)
+	taskSlug, _ := fwd.Metadata["task_slug"].(string)
+	workerType, _ := fwd.Metadata["worker_type"].(string)
+	limit := 4
+	switch value := fwd.Metadata["limit"].(type) {
+	case int:
+		if value > 0 {
+			limit = value
+		}
+	case float64:
+		if value > 0 {
+			limit = int(value)
+		}
+	}
+
+	searchText := strings.TrimSpace(taskName)
+	if searchText == "" {
+		searchText = strings.TrimSpace(taskSlug)
+	}
+	query := ArchiveQuery{
+		Categories:       []Category{CategoryDecision, CategoryInsight, CategoryIssue, CategoryGeneral},
+		SearchText:       searchText,
+		Limit:            limit,
+		IncludeArchived:  true,
+		CrossAgentPolicy: CrossAgentPolicyInclude,
+	}
+	results, err := a.QueryCrossSession(ctx, query)
+	if err != nil {
+		return nil, true, err
+	}
+
+	precedents := make([]map[string]any, 0, len(results))
+	for _, result := range results {
+		if result.Entry == nil {
+			continue
+		}
+		summary := strings.TrimSpace(result.Entry.Content)
+		if summary == "" {
+			summary = strings.TrimSpace(result.Entry.Title)
+		}
+		precedents = append(precedents, map[string]any{
+			"id":         result.Entry.ID,
+			"session_id": result.SessionID,
+			"category":   result.Entry.Category,
+			"title":      result.Entry.Title,
+			"summary":    summary,
+			"metadata":   result.Entry.Metadata,
+		})
+		if len(precedents) >= limit {
+			break
+		}
+	}
+	return map[string]any{"precedents": precedents, "worker_type": workerType}, true, nil
 }
 
 // processViaLLM builds an LLM request with tools and runs the tool loop.

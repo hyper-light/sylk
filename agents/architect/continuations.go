@@ -59,6 +59,108 @@ func (a *Architect) recordPendingContinuation(
 	return a.persistPlanState(plan)
 }
 
+func pendingContinuationFromRecord(record *ArchitectContinuation) *PendingContinuation {
+	if record == nil {
+		return nil
+	}
+	return &PendingContinuation{
+		Kind:          string(record.Kind),
+		Status:        string(record.State),
+		TargetAgentID: record.TargetAgentID,
+		CorrelationID: record.ResponseCorrelationID,
+		ToolName:      record.ToolName,
+		CreatedAt:     record.CreatedAt,
+		ExpiresAt:     record.ExpiresAt,
+	}
+}
+
+func (a *Architect) reconcilePlanPendingContinuation(plan *DesignPlan, record *ArchitectContinuation) (*DesignPlan, error) {
+	if a == nil || plan == nil || record == nil {
+		return plan, nil
+	}
+	now := time.Now().UTC()
+	if !recordIsActive(record, now) {
+		return plan, nil
+	}
+	if plan.PendingWork != nil &&
+		plan.PendingWork.CorrelationID == record.ResponseCorrelationID &&
+		planHasActivePendingWork(plan, now) {
+		return plan, nil
+	}
+	if plan.PendingWork != nil && planHasActivePendingWork(plan, now) {
+		currentCreated := plan.PendingWork.CreatedAt
+		if !currentCreated.IsZero() && currentCreated.After(record.CreatedAt) {
+			return plan, nil
+		}
+	}
+	plan.PendingWork = pendingContinuationFromRecord(record)
+	if plan.UpdatedAt.Before(record.CreatedAt) {
+		plan.UpdatedAt = record.CreatedAt
+	}
+	return plan, a.persistPlanState(plan)
+}
+
+func recordIsActive(record *ArchitectContinuation, now time.Time) bool {
+	if record == nil {
+		return false
+	}
+	switch record.State {
+	case continuationStatusPending, continuationStatusProcessing:
+	default:
+		return false
+	}
+	if !record.ExpiresAt.IsZero() && now.After(record.ExpiresAt) {
+		return false
+	}
+	return true
+}
+
+func (a *Architect) restorePlanForContinuation(record *ArchitectContinuation) *DesignPlan {
+	if a == nil || a.controlStore == nil || a.planStore == nil || record == nil || strings.TrimSpace(record.PlanID) == "" {
+		return nil
+	}
+	plan, err := a.controlStore.GetPlan(record.PlanID)
+	if err != nil || plan == nil {
+		return nil
+	}
+	if err := a.planStore.Upsert(plan); err != nil {
+		return nil
+	}
+	return plan
+}
+
+func (a *Architect) reconcileContinuationRecord(record *ArchitectContinuation) *DesignPlan {
+	if a == nil || record == nil || strings.TrimSpace(record.PlanID) == "" {
+		return nil
+	}
+	plan := a.planForContinuation(record)
+	if plan == nil {
+		plan = a.restorePlanForContinuation(record)
+	}
+	if plan == nil {
+		return nil
+	}
+	reconciled, err := a.reconcilePlanPendingContinuation(plan, record)
+	if err != nil {
+		return plan
+	}
+	return reconciled
+}
+
+func (a *Architect) reconcilePendingContinuations() {
+	if a == nil || a.controlStore == nil {
+		return
+	}
+	records, err := a.controlStore.ListActiveContinuations(time.Now().UTC())
+	if err != nil {
+		a.logWarn("reconcilePendingContinuations: list failed", "error", err)
+		return
+	}
+	for _, record := range records {
+		a.reconcileContinuationRecord(record)
+	}
+}
+
 func (a *Architect) clearPlanPendingContinuation(plan *DesignPlan, correlationID string) error {
 	if a == nil || plan == nil || plan.PendingWork == nil {
 		return nil

@@ -698,6 +698,7 @@ type TesterState struct {
 type TesterIntent string
 
 const (
+	IntentCreateTests    TesterIntent = "create_tests"
 	IntentRunTests       TesterIntent = "run_tests"
 	IntentCoverage       TesterIntent = "coverage"
 	IntentMutation       TesterIntent = "mutation"
@@ -710,6 +711,7 @@ const (
 // ValidTesterIntents returns all valid tester intents.
 func ValidTesterIntents() []TesterIntent {
 	return []TesterIntent{
+		IntentCreateTests,
 		IntentRunTests,
 		IntentCoverage,
 		IntentMutation,
@@ -733,6 +735,12 @@ type TesterRequest struct {
 
 	// Files to test.
 	Files []string `json:"files,omitempty"`
+
+	// TaskID identifies the pipeline task being tested or scaffolded.
+	TaskID string `json:"task_id,omitempty"`
+
+	// TaskPrompt is the scoped task brief used to synthesize tests.
+	TaskPrompt string `json:"task_prompt,omitempty"`
 
 	// TestNames specific tests to run.
 	TestNames []string `json:"test_names,omitempty"`
@@ -788,6 +796,9 @@ type TesterResponse struct {
 
 	// CoverageGaps identified.
 	CoverageGaps []CoverageGap `json:"coverage_gaps,omitempty"`
+
+	// CreatedFiles lists test or harness files created for this request.
+	CreatedFiles []string `json:"created_files,omitempty"`
 
 	// Error message if failed.
 	Error string `json:"error,omitempty"`

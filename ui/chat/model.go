@@ -183,13 +183,13 @@ func thinkingMessagesForAgent(agentID string) []string {
 // active concurrently when several agents stream in parallel (e.g. architect
 // and orchestrator).
 type streamSlot struct {
-	accumulator     *StreamAccumulator
-	agentID         string
-	thinkingIdx     int                // History index of thinking placeholder for this stream.
-	renderState     *streamRenderState // Incremental render state for this stream.
-	planID          string             // Plan ID embedded in this stream, if any.
-	planMarkdown    string             // Rendered plan markdown for this stream.
-	planOffset      int                // Accumulator content length when plan was injected.
+	accumulator  *StreamAccumulator
+	agentID      string
+	thinkingIdx  int                // History index of thinking placeholder for this stream.
+	renderState  *streamRenderState // Incremental render state for this stream.
+	planID       string             // Plan ID embedded in this stream, if any.
+	planMarkdown string             // Rendered plan markdown for this stream.
+	planOffset   int                // Accumulator content length when plan was injected.
 }
 
 // Model is the Bubble Tea model for the chat panel.
@@ -379,25 +379,25 @@ func (m *Model) CompensateInputGrowth(oldHeight, newHeight int) {
 // represented in chat by dedicated paths (streaming, GuideResponseMsg,
 // user input) and should not create duplicate entries.
 var chatSuppressedEvents = map[string]bool{
-	"llm_response":       true, // Duplicates streaming/FinishThinking response.
-	"llm_request":        true, // Internal LLM call, not user-facing.
-	"user_prompt":        true, // Duplicates user input entry.
-	"user_clarification": true, // Duplicates user input entry.
-	"agent_action":       true, // Internal agent operation.
-	"agent_decision":     true, // Internal routing decision.
-	"tool_call":          true, // Internal tool invocation.
-	"tool_result":        true, // Internal tool output.
-	"index_start":        true, // Internal indexing lifecycle.
-	"index_complete":     true,
-	"index_file_added":   true,
-	"index_file_removed": true,
-	"context_eviction":      true, // Internal context management.
-	"context_restore":       true,
-	"success":               true, // Generic outcome, visible from response.
-	"steering_checkpoint":   true, // Internal checkpoint — visible in agent panel only.
-	"steering_inject":       true, // Steering inject shown via dedicated chat entry.
-	"steering_edit":         true, // Steering edit shown via dedicated chat entry.
-	"steering_rollback":     true, // Steering rollback shown via dedicated chat entry.
+	"llm_response":        true, // Duplicates streaming/FinishThinking response.
+	"llm_request":         true, // Internal LLM call, not user-facing.
+	"user_prompt":         true, // Duplicates user input entry.
+	"user_clarification":  true, // Duplicates user input entry.
+	"agent_action":        true, // Internal agent operation.
+	"agent_decision":      true, // Internal routing decision.
+	"tool_call":           true, // Internal tool invocation.
+	"tool_result":         true, // Internal tool output.
+	"index_start":         true, // Internal indexing lifecycle.
+	"index_complete":      true,
+	"index_file_added":    true,
+	"index_file_removed":  true,
+	"context_eviction":    true, // Internal context management.
+	"context_restore":     true,
+	"success":             true, // Generic outcome, visible from response.
+	"steering_checkpoint": true, // Internal checkpoint — visible in agent panel only.
+	"steering_inject":     true, // Steering inject shown via dedicated chat entry.
+	"steering_edit":       true, // Steering edit shown via dedicated chat entry.
+	"steering_rollback":   true, // Steering rollback shown via dedicated chat entry.
 }
 
 // handleActivity converts an ActivityEventMsg into a chat entry.
@@ -419,6 +419,9 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 		Source:     activitySource(ev),
 		AgentType:  agentTypeFromData(ev),
 		AgentID:    ev.Event.AgentID,
+		TaskID:     activityStringData(ev, "task_id"),
+		TaskName:   activityStringData(ev, "task_name"),
+		TaskSlug:   activityStringData(ev, "task_slug"),
 		SessionID:  ev.Event.SessionID,
 		Content:    ev.Event.Content,
 		Height:     -1,
@@ -468,6 +471,9 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 				m.history.entries[physical].AgentType = start.AgentID
 			}
 			m.history.entries[physical].SessionID = start.SessionID
+			m.history.entries[physical].TaskID = strings.TrimSpace(start.TaskID)
+			m.history.entries[physical].TaskName = strings.TrimSpace(start.TaskName)
+			m.history.entries[physical].TaskSlug = strings.TrimSpace(start.TaskSlug)
 		}
 		m.history.mu.Unlock()
 		slot := &streamSlot{
@@ -488,6 +494,10 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		Timestamp:      now,
 		Source:         SourceAgent,
 		AgentType:      start.AgentID,
+		AgentID:        start.AgentID,
+		TaskID:         strings.TrimSpace(start.TaskID),
+		TaskName:       strings.TrimSpace(start.TaskName),
+		TaskSlug:       strings.TrimSpace(start.TaskSlug),
 		SessionID:      start.SessionID,
 		Content:        "",
 		Height:         -1,
@@ -1253,6 +1263,9 @@ func (m *Model) FinishThinking(entry *ChatEntry) {
 		e.Source = entry.Source
 		e.AgentType = entry.AgentType
 		e.AgentID = entry.AgentID
+		e.TaskID = entry.TaskID
+		e.TaskName = entry.TaskName
+		e.TaskSlug = entry.TaskSlug
 		e.Timestamp = entry.Timestamp
 		e.ThinkingText = ""
 		e.ThinkingStatus = ""
@@ -1632,4 +1645,19 @@ func agentTypeFromData(ev msg.ActivityEventMsg) string {
 		return ""
 	}
 	return s
+}
+
+func activityStringData(ev msg.ActivityEventMsg, key string) string {
+	if ev.Event.Data == nil {
+		return ""
+	}
+	val, ok := ev.Event.Data[key]
+	if !ok {
+		return ""
+	}
+	s, ok := val.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
 }

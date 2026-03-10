@@ -1,9 +1,12 @@
 package architect
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/adalundhe/sylk/agents/guide"
 )
 
 func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
@@ -145,6 +148,145 @@ func TestLatestStalledPlanForRequest_FiltersByCorrelation(t *testing.T) {
 	plan := a.latestStalledPlanForRequest("sess1", "corr-1")
 	if plan == nil || plan.ID != "wanted" {
 		t.Fatalf("latestStalledPlanForRequest = %v, want wanted", plan)
+	}
+}
+
+func TestLatestActivePendingPlan_SelectsMostRecent(t *testing.T) {
+	now := time.Now().UTC()
+	a := testArchitectWithStore(t,
+		&DesignPlan{
+			ID:        "older",
+			SessionID: "sess1",
+			Status:    PlanStatusReady,
+			UpdatedAt: now.Add(-time.Minute),
+			PendingWork: &PendingContinuation{
+				Kind:      string(continuationKindGuardianApproval),
+				Status:    string(continuationStatusPending),
+				Message:   "older pending",
+				ExpiresAt: now.Add(time.Minute),
+			},
+		},
+		&DesignPlan{
+			ID:        "newer",
+			SessionID: "sess1",
+			Status:    PlanStatusReady,
+			UpdatedAt: now,
+			PendingWork: &PendingContinuation{
+				Kind:      string(continuationKindAcceptanceEval),
+				Status:    string(continuationStatusPending),
+				Message:   "newer pending",
+				ExpiresAt: now.Add(time.Minute),
+			},
+		},
+	)
+
+	plan := a.latestActivePendingPlan("sess1")
+	if plan == nil || plan.ID != "newer" {
+		t.Fatalf("latestActivePendingPlan = %v, want newer", plan)
+	}
+}
+
+func TestLatestActivePendingPlan_IgnoresExpiredPendingWork(t *testing.T) {
+	now := time.Now().UTC()
+	a := testArchitectWithStore(t,
+		&DesignPlan{
+			ID:        "expired",
+			SessionID: "sess1",
+			Status:    PlanStatusReady,
+			UpdatedAt: now,
+			PendingWork: &PendingContinuation{
+				Kind:      string(continuationKindGuardianApproval),
+				Status:    string(continuationStatusPending),
+				Message:   "expired pending",
+				ExpiresAt: now.Add(-time.Second),
+			},
+		},
+	)
+
+	if plan := a.latestActivePendingPlan("sess1"); plan != nil {
+		t.Fatalf("latestActivePendingPlan = %v, want nil", plan)
+	}
+}
+
+func TestHandleExecute_ReturnsPendingMessageWhenPlanWorkIsInFlight(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-1",
+		SessionID: "sess1",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:      string(continuationKindGuardianApproval),
+			Status:    string(continuationStatusPending),
+			Message:   "Guardian is reviewing the plan response.",
+			ExpiresAt: now.Add(time.Minute),
+		},
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleExecute(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: "sess1",
+	})
+	if err != nil {
+		t.Fatalf("handleExecute error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleExecute result type = %T, want *ConversationResult", result)
+	}
+	if conv.Response != "Guardian is reviewing the plan response." {
+		t.Fatalf("response = %q, want pending message", conv.Response)
+	}
+	if conv.Intent != IntentExecute {
+		t.Fatalf("intent = %s, want execute", conv.Intent)
+	}
+}
+
+func TestHandleExecute_RehydratesOrphanedPendingContinuationFromControlStore(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-orphan",
+		SessionID: "sess1",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+	}
+	a := testArchitectWithControlStore(t, plan)
+	record := &ArchitectContinuation{
+		ID:                    "cont-1",
+		Kind:                  continuationKindGuardianApproval,
+		State:                 continuationStatusPending,
+		PlanID:                plan.ID,
+		SessionID:             plan.SessionID,
+		TargetAgentID:         "guardian",
+		ResponseCorrelationID: "corr-1",
+		CreatedAt:             now.Add(5 * time.Second),
+		ExpiresAt:             now.Add(time.Minute),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	result, err := a.handleExecute(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: "sess1",
+	})
+	if err != nil {
+		t.Fatalf("handleExecute error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleExecute result type = %T, want *ConversationResult", result)
+	}
+	if conv.Response != "The latest plan response is still going through Guardian approval. I'll update you shortly." {
+		t.Fatalf("response = %q, want guardian pending message", conv.Response)
+	}
+	stored := a.planStore.Get(plan.ID)
+	if stored == nil || stored.PendingWork == nil {
+		t.Fatal("expected orphaned continuation to be reattached to plan")
+	}
+	if stored.PendingWork.CorrelationID != "corr-1" {
+		t.Fatalf("correlation_id = %q, want corr-1", stored.PendingWork.CorrelationID)
 	}
 }
 

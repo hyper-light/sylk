@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -92,6 +93,204 @@ func TestOpenAIProviderGenerate_ChatGPTUsesCompletedResponse(t *testing.T) {
 	if !streamEnabled {
 		t.Fatal("expected streaming request payload to set stream=true")
 	}
+}
+
+func TestOpenAIProviderGenerate_ChatGPTGPT54OmitsPromptCacheRetention(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, "invalid json payload", http.StatusBadRequest)
+			return
+		}
+
+		if err := writeSSE(w,
+			`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_omitted_retention","model":"gpt-5.4","status":"completed","service_tier":"default","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-access-token"
+	cfg.BaseURL = server.URL
+	cfg.AuthMode = openAIAuthModeChatGPT
+	cfg.ChatGPTAccountID = "acct_123"
+	cfg.Model = "gpt-5.4-pro"
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	resp, err := provider.Generate(context.Background(), &Request{
+		Model:                "gpt-5.4-pro",
+		Messages:             []Message{{Role: RoleUser, Content: "say ok"}},
+		PromptCacheKey:       "guardian:session-123",
+		PromptCacheRetention: "24h",
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Fatalf("unexpected response content %q", resp.Content)
+	}
+	if payload["model"] != "gpt-5.4" {
+		t.Fatalf("expected outbound model gpt-5.4, got %#v", payload["model"])
+	}
+	if payload["prompt_cache_key"] != "guardian:session-123" {
+		t.Fatalf("expected prompt_cache_key to remain set, got %#v", payload["prompt_cache_key"])
+	}
+	if _, ok := payload["prompt_cache_retention"]; ok {
+		t.Fatalf("expected prompt_cache_retention to be omitted, got %#v", payload["prompt_cache_retention"])
+	}
+}
+
+func TestOpenAIProviderGenerate_ChatGPTSendsConversationHeaders(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	var (
+		mu            sync.Mutex
+		sessionID     string
+		originator    string
+		accountID     string
+		authorization string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		mu.Lock()
+		sessionID = r.Header.Get("session_id")
+		originator = r.Header.Get("originator")
+		accountID = r.Header.Get("ChatGPT-Account-Id")
+		authorization = r.Header.Get("Authorization")
+		mu.Unlock()
+
+		if err := writeSSE(w,
+			`{"type":"response.completed","sequence_number":1,"response":{"id":"resp_headers","model":"gpt-5.4-pro","status":"completed","service_tier":"default","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-access-token"
+	cfg.BaseURL = server.URL
+	cfg.AuthMode = openAIAuthModeChatGPT
+	cfg.ChatGPTAccountID = "acct_123"
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	resp, err := provider.Generate(context.Background(), &Request{
+		Messages: []Message{{Role: RoleUser, Content: "say ok"}},
+		Metadata: map[string]any{
+			"session_id": "session-123",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if resp.Content != "ok" {
+		t.Fatalf("unexpected response content %q", resp.Content)
+	}
+
+	mu.Lock()
+	gotSessionID := sessionID
+	gotOriginator := originator
+	gotAccountID := accountID
+	gotAuthorization := authorization
+	mu.Unlock()
+
+	if gotSessionID != "session-123" {
+		t.Fatalf("session_id header = %q, want %q", gotSessionID, "session-123")
+	}
+	if gotOriginator != defaultOpenAIOriginator {
+		t.Fatalf("originator header = %q, want %q", gotOriginator, defaultOpenAIOriginator)
+	}
+	if gotAccountID != "acct_123" {
+		t.Fatalf("ChatGPT-Account-Id header = %q, want %q", gotAccountID, "acct_123")
+	}
+	if gotAuthorization != "Bearer test-access-token" {
+		t.Fatalf("authorization header = %q, want %q", gotAuthorization, "Bearer test-access-token")
+	}
+}
+
+func TestOpenAIProviderGenerate_ChatGPTBadRequestIncludesErrorBody(t *testing.T) {
+	if !canListenLocalTCP() {
+		t.Skip("local TCP listeners are not permitted in this environment")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"message":"session_id header is required","type":"invalid_request_error","param":"session_id","code":"invalid_value"}`)
+	}))
+	defer server.Close()
+
+	cfg := DefaultOpenAIConfig()
+	cfg.APIKey = "test-access-token"
+	cfg.BaseURL = server.URL
+	cfg.AuthMode = openAIAuthModeChatGPT
+	cfg.ChatGPTAccountID = "acct_123"
+
+	provider, err := NewOpenAIProvider(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewOpenAIProvider() error = %v", err)
+	}
+
+	_, err = provider.Generate(context.Background(), &Request{
+		Messages: []Message{{Role: RoleUser, Content: "say ok"}},
+		Metadata: map[string]any{
+			"session_id": "session-123",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected Generate() error")
+	}
+	if !containsAll(err.Error(),
+		"openai stream",
+		"400 Bad Request",
+		"session_id header is required",
+	) {
+		t.Fatalf("unexpected error string: %v", err)
+	}
+}
+
+func containsAll(s string, parts ...string) bool {
+	for _, part := range parts {
+		if !strings.Contains(s, part) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestOpenAIProviderStreamWithHandler_EmitsToolAndTextChunks(t *testing.T) {

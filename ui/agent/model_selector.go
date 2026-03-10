@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"github.com/adalundhe/sylk/core/credentials"
+	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -105,7 +107,7 @@ func defaultModelForAgent(agentType string) string {
 // Pure functions
 // ---------------------------------------------------------------------------
 
-// agentModels returns the model list for an agent. Prefers the per-agent
+// agentModels returns the raw model list for an agent. Prefers the per-agent
 // SupportedModels list when populated; falls back to the static provider table.
 func agentModels(agent *AgentState) []ModelEntry {
 	if agent == nil {
@@ -117,10 +119,55 @@ func agentModels(agent *AgentState) []ModelEntry {
 	return modelsForAgent(agent.AgentType)
 }
 
+func modelsForAgentForAuth(agentType, openAIAuthMethod string) []ModelEntry {
+	return authAwareModelEntries(modelsForAgent(agentType), openAIAuthMethod)
+}
+
+func agentModelsForAuth(agent *AgentState, openAIAuthMethod string) []ModelEntry {
+	if agent == nil {
+		return nil
+	}
+	if len(agent.SupportedModels) > 0 {
+		return authAwareModelEntries(agent.SupportedModels, openAIAuthMethod)
+	}
+	return modelsForAgentForAuth(agent.AgentType, openAIAuthMethod)
+}
+
 // modelsForAgent returns the static model list for the given agent type, or nil.
 // Used as a fallback for dynamically discovered agents without SupportedModels.
 func modelsForAgent(agentType string) []ModelEntry {
 	return agentModelTable[agentType]
+}
+
+func authAwareModelEntries(entries []ModelEntry, openAIAuthMethod string) []ModelEntry {
+	if credentials.CanonicalAuthMethod("openai", openAIAuthMethod) != "chatgpt" {
+		return entries
+	}
+	filtered := make([]ModelEntry, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		mappedID := resolveModelForOpenAIAuth(entry.ID, openAIAuthMethod)
+		displayName := entry.DisplayName
+		if mappedID == string(providers.GPT_5_4) && entry.ID != mappedID {
+			displayName = "GPT-5.4"
+		}
+		if _, ok := seen[mappedID]; ok {
+			continue
+		}
+		filtered = append(filtered, ModelEntry{
+			ID:          mappedID,
+			DisplayName: displayName,
+		})
+		seen[mappedID] = struct{}{}
+	}
+	return filtered
+}
+
+func resolveModelForOpenAIAuth(modelID, openAIAuthMethod string) string {
+	if deriveProvider(modelID) != "openai" {
+		return modelID
+	}
+	return providers.ResolveOpenAIModelForAuth(modelID, openAIAuthMethod)
 }
 
 // modelIndex returns the index of currentID in models, or 0 if not found.

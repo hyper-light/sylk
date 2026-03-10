@@ -856,9 +856,7 @@ func (g *Guide) applyConversationFlow(
 		return classification, targetAgentID
 	}
 	updated := remapClassificationTarget(classification, desiredTarget)
-	updated.Intent = g.supportedIntentForTarget(desiredTarget, updated.Intent)
-	updated.Domain = g.supportedDomainForTarget(desiredTarget, updated.Domain, updated.Intent)
-	updated, targetAgentID = g.ensureRoutableClassification(ctx, updated, desiredTarget)
+	updated, targetAgentID = g.ensureRoutableClassification(ctx, request.Input, updated, desiredTarget)
 	g.observeRoutedConversationTarget(request, updated, targetAgentID)
 	return updated, targetAgentID
 }
@@ -882,9 +880,7 @@ func (g *Guide) applyWorkPreference(
 	updated := remapClassificationTarget(classification, preferred)
 	updated.ClassificationMethod = appendClassificationMethod(updated.ClassificationMethod, "work_state")
 	updated.Reason = "session work context routed to active specialist"
-	updated.Intent = g.supportedIntentForTarget(preferred, updated.Intent)
-	updated.Domain = g.supportedDomainForTarget(preferred, updated.Domain, updated.Intent)
-	updated, targetAgentID = g.ensureRoutableClassification(ctx, updated, preferred)
+	updated, targetAgentID = g.ensureRoutableClassification(ctx, request.Input, updated, preferred)
 	return updated, targetAgentID, true
 }
 

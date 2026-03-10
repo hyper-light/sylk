@@ -219,6 +219,7 @@ func parseStreamStartMsg(sessionID, correlationID string, stream *guide.StreamRe
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
 	result.TaskID = streamMetadataString(stream, "task_id")
+	result.TaskName = streamMetadataString(stream, "task_name")
 	result.TaskSlug = streamMetadataString(stream, "task_slug")
 	return result
 }
@@ -340,6 +341,7 @@ func toStreamProgressMsg(sessionID, correlationID string, stream *guide.StreamRe
 		AgentType:     streamMetadataString(stream, "agent_type"),
 		PipelineID:    streamMetadataString(stream, "pipeline_id"),
 		TaskID:        streamMetadataString(stream, "task_id"),
+		TaskName:      streamMetadataString(stream, "task_name"),
 		TaskSlug:      streamMetadataString(stream, "task_slug"),
 		Current:       progress.Current,
 		Total:         progress.Total,
@@ -364,6 +366,7 @@ func parseStreamCompleteMsg(sessionID, correlationID string, stream *guide.Strea
 	result.AgentType = streamMetadataString(stream, "agent_type")
 	result.PipelineID = streamMetadataString(stream, "pipeline_id")
 	result.TaskID = streamMetadataString(stream, "task_id")
+	result.TaskName = streamMetadataString(stream, "task_name")
 	result.TaskSlug = streamMetadataString(stream, "task_slug")
 	if stream.Event != nil {
 		result.Result = stream.Event.Data

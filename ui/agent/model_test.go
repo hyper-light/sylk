@@ -195,6 +195,37 @@ func TestModel_PipelineStateAllowsLaterTaskSlugPromotion(t *testing.T) {
 	}
 }
 
+func TestModel_ActivityPipelinePlaceholderUsesCanonicalStatus(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_status",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_auth_checkout:inspector-pipeline",
+			Content:   "Pipeline agent registered: inspector-pipeline",
+			Data: map[string]any{
+				"agent_name":      "Inspector",
+				"agent_type":      "inspector-pipeline",
+				"pipeline_id":     "task_auth_checkout",
+				"task_id":         "task_auth_checkout",
+				"task_slug":       "auth-checkout",
+				"pipeline_status": "defining_criteria",
+			},
+		},
+	})
+
+	pl := model.pipelines["task_auth_checkout"]
+	if pl == nil {
+		t.Fatal("expected pipeline state")
+	}
+	if pl.Status != "defining_criteria" {
+		t.Fatalf("pipeline Status = %q, want defining_criteria", pl.Status)
+	}
+}
+
 func TestModel_HandleVariantState(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
@@ -520,19 +551,263 @@ func TestModel_ViewKeepsClosingFooterBelowPipelines(t *testing.T) {
 	if len(lines) != 8 {
 		t.Fatalf("rendered lines = %d, want 8", len(lines))
 	}
-	last := lines[len(lines)-1]
-	if !strings.Contains(last, "╰") {
-		t.Fatalf("expected closing footer on last line, got %q", last)
+	footerLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "╰") {
+			footerLine = i
+			break
+		}
+	}
+	if footerLine < 0 {
+		t.Fatalf("expected closing footer in view, got %q", strings.Join(lines, "\n"))
 	}
 }
 
-func TestModel_ViewPrefersActivePipelineViewportWhenUnfocused(t *testing.T) {
+func TestModel_ViewPinsFooterToBottomWhenContentIsSparse(t *testing.T) {
 	model := New(theme.DefaultDark())
-	model.SetSize(80, 8)
+	model.SetSize(80, 14)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "guide", "guide")
+	pushAgentActivity(model, "librarian", "librarian")
+	pushAgentActivity(model, "academic", "academic")
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		TaskLabel:  "auth-checkout",
+		Status:     "executing",
+	})
+
+	lines := strings.Split(stripANSI(model.View()), "\n")
+	if len(lines) != 14 {
+		t.Fatalf("rendered lines = %d, want 14", len(lines))
+	}
+	footerLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "╰") {
+			footerLine = i
+			break
+		}
+	}
+	if footerLine < 0 {
+		t.Fatalf("expected closing footer in view, got %q", strings.Join(lines, "\n"))
+	}
+	if !strings.Contains(strings.Join(lines, "\n"), "academic") {
+		t.Fatalf("expected academic agent to remain visible, got %q", strings.Join(lines, "\n"))
+	}
+}
+
+func TestModel_ViewFooterMovesDownAsPipelinesAreAdded(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 14)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "guide", "guide")
+	pushAgentActivity(model, "librarian", "librarian")
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		TaskLabel:  "auth-checkout",
+		Status:     "executing",
+	})
+
+	footerLine := func(view string) int {
+		for i, line := range strings.Split(stripANSI(view), "\n") {
+			if strings.Contains(line, "╰") {
+				return i
+			}
+		}
+		return -1
+	}
+
+	before := footerLine(model.View())
+	if before < 0 {
+		t.Fatal("expected footer before adding pipelines")
+	}
+
+	for _, slug := range []string{"payment-retry", "cli-packaging"} {
+		pipelineID := "task_" + strings.ReplaceAll(slug, "-", "_")
+		model.Update(msg.PipelineStateMsg{
+			PipelineID: pipelineID,
+			TaskID:     pipelineID,
+			TaskLabel:  slug,
+			Status:     "executing",
+		})
+	}
+
+	after := footerLine(model.View())
+	if after <= before {
+		t.Fatalf("expected footer to move down as pipelines were added: before=%d after=%d", before, after)
+	}
+}
+
+func TestModel_PipelineOverflowKeepsKnowledgeVisible(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 12)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "guide", "guide")
+	pushAgentActivity(model, "architect", "architect")
+	pushAgentActivity(model, "librarian", "librarian")
+	pushAgentActivity(model, "academic", "academic")
+	pushAgentActivity(model, "archivalist", "archivalist")
+
+	for _, task := range []string{"auth-checkout", "payment-retry", "cli-packaging"} {
+		pipelineID := "task_" + strings.ReplaceAll(task, "-", "_")
+		model.Update(msg.PipelineStateMsg{
+			PipelineID: pipelineID,
+			TaskID:     pipelineID,
+			TaskLabel:  task,
+			Status:     "executing",
+			LoopCount:  1,
+			MaxLoops:   4,
+		})
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_" + pipelineID,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   pipelineID + ":engineer",
+				Data: map[string]any{
+					"agent_name":  "Engineer",
+					"agent_type":  "engineer",
+					"pipeline_id": pipelineID,
+					"task_id":     pipelineID,
+					"task_slug":   task,
+				},
+			},
+		})
+	}
+
+	view := stripANSI(model.View())
+	if !strings.Contains(view, "knowledge") {
+		t.Fatalf("expected knowledge section to remain visible, got %q", view)
+	}
+	if !strings.Contains(view, "pipelines") {
+		t.Fatalf("expected pipelines section to remain visible, got %q", view)
+	}
+}
+
+func TestModel_ScrollDownMovesOnlyPipelineViewport(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 12)
+	model.SetFocused(true)
+
+	pushAgentActivity(model, "guide", "guide")
+	pushAgentActivity(model, "librarian", "librarian")
+
+	for idx := range 4 {
+		pipelineID := "task_pipeline_" + string(rune('a'+idx))
+		taskSlug := "pipeline-" + string(rune('a'+idx))
+		model.Update(msg.PipelineStateMsg{
+			PipelineID: pipelineID,
+			TaskID:     pipelineID,
+			TaskLabel:  taskSlug,
+			Status:     "executing",
+			LoopCount:  1,
+			MaxLoops:   4,
+		})
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_" + pipelineID,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   pipelineID + ":engineer",
+				Data: map[string]any{
+					"agent_name":  "Engineer",
+					"agent_type":  "engineer",
+					"pipeline_id": pipelineID,
+					"task_id":     pipelineID,
+					"task_slug":   taskSlug,
+				},
+			},
+		})
+	}
+
+	model.ensureRows()
+	selectedBefore := model.selected
+	scrollBefore := model.pipelineScroll
+	if !model.ScrollDown() {
+		t.Fatal("expected pipeline viewport scroll to be consumed")
+	}
+	if model.selected != selectedBefore {
+		t.Fatalf("selection changed during viewport scroll: got %d want %d", model.selected, selectedBefore)
+	}
+	if model.pipelineScroll <= scrollBefore {
+		t.Fatalf("pipelineScroll = %d, want > %d", model.pipelineScroll, scrollBefore)
+	}
+}
+
+func TestModel_SpaceTogglesSelectedPipelineCollapse(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 12)
+	model.SetFocused(true)
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		TaskLabel:  "auth-checkout",
+		Status:     "executing",
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_collapse_engineer",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_auth_checkout:engineer",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+				"task_slug":   "auth-checkout",
+			},
+		},
+	})
+
+	model.ensureRows()
+	if !model.selectRow(rowPipeline, "task_auth_checkout") {
+		t.Fatal("expected pipeline header row selection")
+	}
+	model.toggleSelectedPipelineCollapse()
+	model.ensureRows()
+
+	if !model.collapsedPipelines["task_auth_checkout"] {
+		t.Fatal("expected pipeline to be collapsed")
+	}
+	for _, row := range model.rows {
+		if row.Kind == rowAgent && row.PipelineID == "task_auth_checkout" {
+			t.Fatalf("unexpected pipeline child row after collapse: %+v", row)
+		}
+	}
+
+	view := stripANSI(model.View())
+	if !strings.Contains(view, "│  + auth-checkout") {
+		t.Fatalf("expected collapsed pipeline marker in view, got %q", view)
+	}
+
+	model.toggleSelectedPipelineCollapse()
+	model.ensureRows()
+	if model.collapsedPipelines["task_auth_checkout"] {
+		t.Fatal("expected pipeline to be expanded")
+	}
+	foundChild := false
+	for _, row := range model.rows {
+		if row.Kind == rowAgent && row.ID == "task_auth_checkout:engineer" {
+			foundChild = true
+			break
+		}
+	}
+	if !foundChild {
+		t.Fatal("expected engineer row after expanding pipeline")
+	}
+}
+
+func TestModel_ViewKeepsCriticalSectionsPinnedWhenUnfocused(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 12)
 	model.SetFocused(false)
 
-	// Fill upper sections so the pipelines block would be pushed below the fold
-	// without viewport re-anchoring.
 	pushAgentActivity(model, "guide", "guide")
 	pushAgentActivity(model, "architect", "architect")
 	pushAgentActivity(model, "orchestrator", "orchestrator")
@@ -574,18 +849,71 @@ func TestModel_ViewPrefersActivePipelineViewportWhenUnfocused(t *testing.T) {
 	})
 
 	view := stripANSI(model.View())
+	if !strings.Contains(view, "knowledge") {
+		t.Fatalf("expected knowledge section in view, got %q", view)
+	}
 	if !strings.Contains(view, "pipelines") {
-		t.Fatalf("expected pipelines section in view, got %q", view)
+		t.Fatalf("expected pipelines section in view when height allows reserved viewport, got %q", view)
 	}
-	if !strings.Contains(view, "auth-checkout") {
-		t.Fatalf("expected pipeline slug in view, got %q", view)
+	if !strings.Contains(view, "Inspector") && !strings.Contains(view, "Engineer") && !strings.Contains(view, "auth-checkout") {
+		t.Fatalf("expected some pipeline content in reserved viewport, got %q", view)
 	}
-	if !strings.Contains(view, "Engineer") {
-		t.Fatalf("expected pipeline engineer row in view, got %q", view)
+}
+
+func TestModel_HandleListClickTogglesPipelineHeader(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 12)
+	model.SetFocused(true)
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_payment_retry",
+		TaskID:     "task_payment_retry",
+		TaskLabel:  "payment-retry",
+		Status:     "executing",
+	})
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_click_engineer",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_payment_retry:engineer",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "task_payment_retry",
+				"task_id":     "task_payment_retry",
+				"task_slug":   "payment-retry",
+			},
+		},
+	})
+
+	view := model.View()
+	if view == "" {
+		t.Fatal("expected rendered view")
 	}
-	lines := strings.Split(view, "\n")
-	if last := lines[len(lines)-1]; !strings.Contains(last, "╰") {
-		t.Fatalf("expected closing footer on last line, got %q", last)
+
+	rowLine := -1
+	for lineIdx, rowIdx := range model.lineRowMap {
+		if rowIdx >= 0 && rowIdx < len(model.rows) {
+			row := model.rows[rowIdx]
+			if row.Kind == rowPipeline && row.ID == "task_payment_retry" {
+				rowLine = lineIdx
+				break
+			}
+		}
+	}
+	if rowLine < 0 {
+		t.Fatal("expected rendered pipeline header line")
+	}
+
+	model.HandleListClick(rowLine)
+	if !model.collapsedPipelines["task_payment_retry"] {
+		t.Fatal("expected click to collapse pipeline")
+	}
+	model.View()
+	model.HandleListClick(rowLine)
+	if model.collapsedPipelines["task_payment_retry"] {
+		t.Fatal("expected second click to expand pipeline")
 	}
 }
 

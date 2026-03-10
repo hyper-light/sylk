@@ -46,3 +46,31 @@ func TestEngineerSystemCorePrompt_DoesNotDuplicateModuleHeadings(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
+	required := []string{
+		"`discover_project_tools`",
+		"`discover_code_patterns`",
+		"`consult`",
+		"`audit`",
+		"`run_command`",
+	}
+	for _, marker := range required {
+		if !strings.Contains(DefaultEngineerSystemPrompt, marker) {
+			t.Fatalf("expected default engineer prompt to contain %q", marker)
+		}
+	}
+
+	legacyAliases := []string{
+		"consult_librarian",
+		"consult_archivalist",
+		"consult_academic",
+		"audit_implementation",
+		"run_tests",
+	}
+	for _, marker := range legacyAliases {
+		if strings.Contains(DefaultEngineerSystemPrompt, marker) {
+			t.Fatalf("default engineer prompt still contains legacy tool alias %q", marker)
+		}
+	}
+}

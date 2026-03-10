@@ -109,6 +109,23 @@ func BuildPipelineSystemContext(task *PipelineTaskInput) string {
 		writeListSection(&b, "Worker Guidelines", decodeAnyStringList(packet["guidelines"]))
 		writeListSection(&b, "Worker Test Requirements", decodeAnyStringList(packet["test_requirements"]))
 	}
+	if coordPacket := decodeMap(task.Context, "coordination_packet"); len(coordPacket) > 0 {
+		b.WriteString("\n## Coordination State\n")
+		writeLabeledScalar(&b, "Summary", coordPacket["summary"])
+		writeListSection(&b, "Required Coordination Protocol", summarizeCoordinationContract(coordPacket["contract"]))
+		writeListSection(&b, "Active Claims You Already Hold", summarizeCoordinationClaims(coordPacket["my_claims"]))
+		writeListSection(&b, "Peer Claims To Avoid Duplicating", summarizeCoordinationClaims(coordPacket["peer_claims"]))
+		writeListSection(&b, "Relevant Existing Artifacts", summarizeCoordinationArtifacts(coordPacket["relevant_artifacts"]))
+		writeListSection(&b, "Pending Review Requests", summarizeCoordinationReviews(coordPacket["pending_reviews"]))
+		writeListSection(&b, "Historical Coordination Precedents", summarizeCoordinationPrecedents(coordPacket["historical_precedents"]))
+		b.WriteString("\nCoordination Rules:\n")
+		b.WriteString("- Query and reuse the current coordination state before rediscovering work.\n")
+		b.WriteString("- Claim scope before starting duplicative work.\n")
+		b.WriteString("- Publish artifacts for decisions, findings, or plans that peers will need.\n")
+		b.WriteString("- Request review against a specific artifact when you need another worker's input.\n")
+		b.WriteString("- Use coordination watch updates when waiting on peer movement instead of blind polling.\n")
+		b.WriteString("- Release or resolve claims when you finish or hand work off.\n")
+	}
 	return strings.TrimSpace(b.String())
 }
 
@@ -332,4 +349,126 @@ func writeListSection(b *strings.Builder, title string, items []string) {
 		}
 		fmt.Fprintf(b, "- %s\n", item)
 	}
+}
+
+func summarizeCoordinationClaims(value any) []string {
+	entries, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		claim, _ := entry.(map[string]any)
+		scopeKind, _ := claim["scope_kind"].(string)
+		scopeKey, _ := claim["scope_key"].(string)
+		purpose, _ := claim["purpose"].(string)
+		ownerType, _ := claim["owner_type"].(string)
+		line := strings.TrimSpace(fmt.Sprintf("%s %s", scopeKind, scopeKey))
+		if ownerType != "" {
+			line = strings.TrimSpace(fmt.Sprintf("%s (%s)", line, ownerType))
+		}
+		if purpose != "" {
+			line = strings.TrimSpace(fmt.Sprintf("%s — %s", line, purpose))
+		}
+		if line != "" {
+			items = append(items, line)
+		}
+	}
+	return items
+}
+
+func summarizeCoordinationArtifacts(value any) []string {
+	entries, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		artifact, _ := entry.(map[string]any)
+		kind, _ := artifact["kind"].(string)
+		summary, _ := artifact["summary"].(string)
+		producerType, _ := artifact["producer_type"].(string)
+		line := strings.TrimSpace(kind)
+		if producerType != "" {
+			line = strings.TrimSpace(fmt.Sprintf("%s from %s", line, producerType))
+		}
+		if summary != "" {
+			line = strings.TrimSpace(fmt.Sprintf("%s — %s", line, summary))
+		}
+		if line != "" {
+			items = append(items, line)
+		}
+	}
+	return items
+}
+
+func summarizeCoordinationReviews(value any) []string {
+	entries, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		review, _ := entry.(map[string]any)
+		artifactID, _ := review["artifact_id"].(string)
+		summary, _ := review["summary"].(string)
+		line := strings.TrimSpace(artifactID)
+		if summary != "" {
+			line = strings.TrimSpace(fmt.Sprintf("%s — %s", line, summary))
+		}
+		if line != "" {
+			items = append(items, line)
+		}
+	}
+	return items
+}
+
+func summarizeCoordinationContract(value any) []string {
+	contract, ok := value.(map[string]any)
+	if !ok || len(contract) == 0 {
+		return nil
+	}
+	items := make([]string, 0, 4)
+	if summary, _ := contract["summary"].(string); strings.TrimSpace(summary) != "" {
+		items = append(items, strings.TrimSpace(summary))
+	}
+	if minClaims, ok := contract["minimum_claims"].(float64); ok && int(minClaims) > 0 {
+		items = append(items, fmt.Sprintf("Minimum claims before completion: %d", int(minClaims)))
+	}
+	if minArtifacts, ok := contract["minimum_artifacts"].(float64); ok && int(minArtifacts) > 0 {
+		items = append(items, fmt.Sprintf("Minimum artifacts before completion: %d", int(minArtifacts)))
+	}
+	if kinds := decodeAnyStringList(contract["preferred_artifact_kinds"]); len(kinds) > 0 {
+		items = append(items, "Preferred artifact kinds: "+strings.Join(kinds, ", "))
+	}
+	return items
+}
+
+func summarizeCoordinationPrecedents(value any) []string {
+	entries, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	items := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		precedent, _ := entry.(map[string]any)
+		category, _ := precedent["category"].(string)
+		title, _ := precedent["title"].(string)
+		summary, _ := precedent["summary"].(string)
+		sessionID, _ := precedent["session_id"].(string)
+		line := strings.TrimSpace(summary)
+		if line == "" {
+			line = strings.TrimSpace(title)
+		}
+		if category != "" {
+			line = strings.TrimSpace(fmt.Sprintf("[%s] %s", category, line))
+		}
+		if sessionID != "" {
+			line = strings.TrimSpace(fmt.Sprintf("%s (%s)", line, sessionID))
+		}
+		if line != "" {
+			items = append(items, line)
+		}
+	}
+	return items
 }

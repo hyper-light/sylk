@@ -41,6 +41,7 @@ func PipelineTesterSystemPrompt() string {
 	return PipelineSystemPrompt + "\n\n" +
 		DiagnosisMethodology + "\n\n" +
 		TestPlanningStrategy + "\n\n" +
+		HarnessDesign + "\n\n" +
 		TesterSkillsPolicy + "\n\n" +
 		TesterGuardrails
 }

@@ -14,7 +14,7 @@ const defaultCapacity = 10_000
 type ChatSource int
 
 const (
-	SourceUser   ChatSource = iota
+	SourceUser ChatSource = iota
 	SourceAgent
 	SourceSystem
 	SourceTool
@@ -32,10 +32,10 @@ type CodeRegion struct {
 // ToolCallRecord tracks a single tool invocation for inline display.
 type ToolCallRecord struct {
 	ToolName    string
-	ArgsSummary string        // Compact one-liner (from SummarizeToolArgs).
-	FullArgs    string        // Pretty-printed JSON (for expanded view).
-	Output      string        // Truncated tool output (max 512 chars).
-	ErrorMsg    string        // Error message on failure.
+	ArgsSummary string // Compact one-liner (from SummarizeToolArgs).
+	FullArgs    string // Pretty-printed JSON (for expanded view).
+	Output      string // Truncated tool output (max 512 chars).
+	ErrorMsg    string // Error message on failure.
 	StartedAt   time.Time
 	Duration    time.Duration
 	Success     bool
@@ -57,6 +57,9 @@ type ChatEntry struct {
 	Source        ChatSource
 	AgentType     string
 	AgentID       string
+	TaskID        string
+	TaskName      string
+	TaskSlug      string
 	SessionID     string
 	Content       string       // Raw content (markdown).
 	RenderedLines []string     // Cached rendered output lines (lazily computed).

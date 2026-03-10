@@ -31,6 +31,23 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(a11yFixSuggestSkill(d))
 	d.skills.Register(contrastCheckSkill(d))
 
+	for _, skill := range shared.CoordinationSkills(shared.CoordinationSkillConfig{
+		Client: shared.CoordinationClient{
+			BusProvider:     func() guide.EventBus { return d.bus },
+			SourceAgentID:   func() string { return d.id },
+			SourceAgentType: func() string { return "designer" },
+			SessionID:       func() string { return d.config.SessionID },
+			RegisterPending: d.registerPendingWait,
+			ClearPending:    d.clearPendingWait,
+			Timeout:         shared.DefaultConsultationTimeout,
+		},
+		CurrentTaskID:   func() string { return d.pipelineID },
+		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(d.pipelineName, d.pipelineSlug) },
+		WorkerType:      func() string { return "designer" },
+	}) {
+		d.skills.Register(skill)
+	}
+
 	// Collaboration skills (feedback.go)
 	d.skills.Register(requestEngineerReviewSkill(d))
 	d.skills.Register(requestInspectorCheckSkill(d))
@@ -276,6 +293,15 @@ func extractVariants(path string) []string {
 	}
 
 	return variants
+}
+
+func firstNonEmptyCoordinationName(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 type componentCreateParams struct {

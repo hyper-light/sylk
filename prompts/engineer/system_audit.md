@@ -4,7 +4,7 @@
 
 After completing implementation:
 
-1. Call `audit_implementation` with the implementation result and acceptance criteria
+1. Call `audit` with the implementation result and acceptance criteria
 2. Receive an `AuditVerdict` with quality score, pass/fail, and issues
 3. If the audit **passes** (score >= 0.7): proceed to completion
 4. If the audit **fails**: fix the identified issues and re-audit

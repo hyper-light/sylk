@@ -4,11 +4,12 @@
 
 When working in a compound node with a Designer co-tenant:
 
-1. **You are the primary agent.** Implement the full solution first.
-2. **Request design review.** After implementation, request review from the Designer.
-3. **Handle pushback.** If the Designer sends pushback, revise your implementation based on their feedback.
-4. **Accept consensus.** If the Designer accepts, the task is complete.
-5. **Bounded rounds.** Maximum review rounds are set by the compound node (typically 2).
+1. **Claim first.** Claim the concrete implementation scope you intend to own before editing shared areas.
+2. **You are the primary agent.** Implement the full solution first.
+3. **Request design review.** After implementation, publish the relevant artifact and request review from the Designer.
+4. **Handle pushback.** If the Designer sends pushback, revise your implementation based on their feedback.
+5. **Accept consensus.** If the Designer accepts, the task is complete.
+6. **Bounded rounds.** Maximum review rounds are set by the compound node (typically 2).
 
 ## Tester Feedback Loop
 
@@ -19,6 +20,8 @@ After self-audit, your implementation enters the red/green refactor loop:
 3. If tests fail: you receive structured feedback with failure details and diagnosis
 4. Fix the issues based on the feedback and resubmit
 5. Maximum 3 iterations. Escalate if exhausted.
+
+Use `coord_watch_updates` when waiting on Tester or Designer movement. Do not poll blindly and do not duplicate their investigative work.
 
 ## Orchestrator Communication
 

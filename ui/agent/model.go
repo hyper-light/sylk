@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/ui/component"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -83,8 +84,9 @@ type AgentState struct {
 	ModelID      string  // Currently assigned model ID (e.g. "claude-opus-4-6").
 	ProviderID   string  // Provider for ModelID (e.g. "anthropic", "google", "openai").
 
-	// SupportedModels is the per-agent model list from the backend.
-	// When non-empty, overrides the static provider-based model table.
+	// SupportedModels is the raw per-agent model list from the backend.
+	// When non-empty, it overrides the static provider-based model table and
+	// is filtered at render/selection time for auth-aware model availability.
 	SupportedModels []ModelEntry
 }
 
@@ -271,6 +273,9 @@ func viewKeyActions() map[viewState]map[string]keyAction {
 			"up":    func(m *Model) tea.Cmd { m.moveSelection(-1); return nil },
 			"enter": func(m *Model) tea.Cmd { m.enterExpanded(); return nil },
 			"tab":   func(m *Model) tea.Cmd { m.enterSelector(); return nil },
+			" ":     func(m *Model) tea.Cmd { m.toggleSelectedPipelineCollapse(); return nil },
+			"left":  func(m *Model) tea.Cmd { m.collapseSelectedPipeline(); return nil },
+			"right": func(m *Model) tea.Cmd { m.expandSelectedPipeline(); return nil },
 		},
 		viewExpanded: {
 			"j":     func(m *Model) tea.Cmd { m.moveEventSelection(1); return nil },
@@ -323,13 +328,17 @@ type Model struct {
 	dotFrame int // Current frame index for the filling-circle dot animation.
 
 	// Model selector state.
-	selector   modelSelector
-	modelStore *AgentModelStore // Persisted model selections (nil-safe).
+	selector         modelSelector
+	modelStore       *AgentModelStore // Persisted model selections (nil-safe).
+	openAIAuthMethod string
 
 	// Pipeline & variant state.
 	pipelines           map[string]*PipelineState // Pipeline ID → state.
 	variants            map[string]*VariantState  // Variant ID → state.
 	pipelineOrder       []string                  // Pipeline IDs in insertion order.
+	pipelineScroll      int                       // Scroll offset for the pipelines subsection in list view.
+	collapsedPipelines  map[string]bool           // Pipeline ID → collapsed state in list view.
+	lineRowMap          []int                     // Rendered list-view line → row index (-1 when not a selectable row line).
 	rows                []listRow                 // Flattened display list, rebuilt lazily.
 	rowsDirty           bool                      // True when rows need rebuilding.
 	shimmerStart        time.Time                 // Epoch for gradient shimmer animation.
@@ -359,6 +368,7 @@ func New(th *theme.Theme) *Model {
 		pipelines:           make(map[string]*PipelineState, maxPipelines),
 		variants:            make(map[string]*VariantState, maxPipelines*maxVariantsPerPipeline),
 		pipelineOrder:       make([]string, 0, maxPipelines),
+		collapsedPipelines:  make(map[string]bool, maxPipelines),
 		theme:               th,
 		view:                viewList,
 		eventSel:            -1,
@@ -370,6 +380,7 @@ func New(th *theme.Theme) *Model {
 		activeGroupGradient: th.Palette.GroupGradient(),
 		rippleGradient:      th.Palette.ThinkingGradient(),
 		idleDecorBucket:     -1,
+		openAIAuthMethod:    credentials.DefaultAuthMethod("openai"),
 	}
 }
 
@@ -377,6 +388,24 @@ func New(th *theme.Theme) *Model {
 // agents pick up the user's previous model selection.
 func (m *Model) SetModelStore(store *AgentModelStore) {
 	m.modelStore = store
+}
+
+// SetOpenAIAuthMethod updates the panel's auth-aware OpenAI model view.
+func (m *Model) SetOpenAIAuthMethod(method string) {
+	canonical := credentials.CanonicalAuthMethod("openai", method)
+	if canonical == "" {
+		canonical = credentials.DefaultAuthMethod("openai")
+	}
+	if m.openAIAuthMethod == canonical {
+		return
+	}
+	m.openAIAuthMethod = canonical
+	for _, agent := range m.agents {
+		m.reconcileAgentModel(agent)
+	}
+	if agent := m.selectedAgent(); agent != nil && len(m.agentModels(agent)) <= 1 && m.selector.active {
+		m.exitSelector()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -681,11 +710,15 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 	}
 
 	modelID := defaultModelForAgent(agentType)
+	models := m.modelsForAgentType(agentType)
+	if len(models) > 0 {
+		modelID = models[0].ID
+	}
 	providerID := deriveProvider(modelID)
 	if m.modelStore != nil {
 		entry := m.modelStore.EntryFor(agentType)
 		if entry.Model != "" {
-			modelID = entry.Model
+			modelID = m.resolveAgentModelID(models, entry.Model)
 			providerID = entry.Provider
 			if providerID == "" {
 				providerID = deriveProvider(modelID)
@@ -708,8 +741,8 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 	m.order = append(m.order, agentID)
 	m.rowsDirty = true
 
-	// Register as pipeline member, creating the pipeline entry on-demand
-	// when it arrives from a DAG dispatch (no PipelineStateMsg for DAGs).
+	// Register as pipeline member, creating the pipeline entry on-demand when
+	// activity wins the race with the canonical pipeline-state message.
 	if pipelineID != "" {
 		pl, ok := m.pipelines[pipelineID]
 		if !ok && len(m.pipelines) < maxPipelines {
@@ -724,11 +757,15 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 			if taskLabel == "" {
 				taskLabel = pipelineShortID(pipelineID)
 			}
+			status := pipelineStatusFromEvent(ev.Event.Data)
+			if status == "" {
+				status = "pending"
+			}
 			pl = &PipelineState{
 				ID:        pipelineID,
 				TaskID:    taskID,
 				TaskLabel: taskLabel,
-				Status:    "executing",
+				Status:    status,
 				CreatedAt: time.Now(),
 			}
 			m.pipelines[pipelineID] = pl
@@ -878,11 +915,15 @@ func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.Acti
 		if taskLabel == "" {
 			taskLabel = pipelineShortID(pipelineID)
 		}
+		status := pipelineStatusFromEvent(ev.Event.Data)
+		if status == "" {
+			status = "pending"
+		}
 		pl = &PipelineState{
 			ID:        pipelineID,
 			TaskID:    taskID,
 			TaskLabel: taskLabel,
-			Status:    "executing",
+			Status:    status,
 			CreatedAt: time.Now(),
 		}
 		m.pipelines[pipelineID] = pl
@@ -900,6 +941,14 @@ func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.Acti
 	if !slices.Contains(pl.Members, agentID) {
 		pl.Members = append(pl.Members, agentID)
 	}
+}
+
+func pipelineStatusFromEvent(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	status, _ := data["pipeline_status"].(string)
+	return strings.TrimSpace(status)
 }
 
 func (m *Model) dedupePipelineMembers(pipelineID string) {
@@ -1079,21 +1128,35 @@ func (m *Model) pushAgentEvent(agentID string, ev msg.ActivityEventMsg) {
 
 // handlePipelineState creates or updates a pipeline state entry.
 func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
-	pl, exists := m.pipelines[ps.PipelineID]
+	canonicalID := strings.TrimSpace(ps.PipelineID)
+	if canonicalID == "" {
+		canonicalID = strings.TrimSpace(ps.TaskID)
+	}
+	if canonicalID == "" {
+		canonicalID = strings.TrimSpace(ps.RuntimePipelineID)
+	}
+	if canonicalID == "" {
+		return nil
+	}
+	if runtimeID := strings.TrimSpace(ps.RuntimePipelineID); runtimeID != "" && runtimeID != canonicalID {
+		m.rehomePipelineState(runtimeID, canonicalID)
+	}
+
+	pl, exists := m.pipelines[canonicalID]
 	if !exists {
 		if len(m.pipelines) >= maxPipelines {
 			return nil
 		}
 		pl = &PipelineState{
-			ID:        ps.PipelineID,
+			ID:        canonicalID,
 			CreatedAt: time.Now(),
 		}
-		m.pipelines[ps.PipelineID] = pl
-		m.pipelineOrder = append(m.pipelineOrder, ps.PipelineID)
+		m.pipelines[canonicalID] = pl
+		m.pipelineOrder = append(m.pipelineOrder, canonicalID)
 
 		// Populate members from agents that arrived before the pipeline.
 		for _, agentID := range m.order {
-			if a := m.agents[agentID]; a != nil && a.PipelineID == ps.PipelineID {
+			if a := m.agents[agentID]; a != nil && a.PipelineID == canonicalID {
 				pl.Members = append(pl.Members, agentID)
 			}
 		}
@@ -1112,6 +1175,95 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 	m.rowsDirty = true
 
 	return nil
+}
+
+func (m *Model) rehomePipelineState(sourceID, targetID string) {
+	sourceID = strings.TrimSpace(sourceID)
+	targetID = strings.TrimSpace(targetID)
+	if sourceID == "" || targetID == "" || sourceID == targetID {
+		return
+	}
+
+	src := m.pipelines[sourceID]
+	if src == nil {
+		return
+	}
+
+	dst := m.pipelines[targetID]
+	if dst == nil {
+		delete(m.pipelines, sourceID)
+		src.ID = targetID
+		m.pipelines[targetID] = src
+		for i, id := range m.pipelineOrder {
+			if id == sourceID {
+				m.pipelineOrder[i] = targetID
+				break
+			}
+		}
+		if m.expanded == sourceID {
+			m.expanded = targetID
+		}
+		if m.collapsedPipelines[sourceID] {
+			m.collapsedPipelines[targetID] = true
+			delete(m.collapsedPipelines, sourceID)
+		}
+		dst = src
+	} else {
+		m.mergePipelineState(dst, src)
+		delete(m.pipelines, sourceID)
+		delete(m.collapsedPipelines, sourceID)
+		for i := 0; i < len(m.pipelineOrder); i++ {
+			if m.pipelineOrder[i] != sourceID {
+				continue
+			}
+			m.pipelineOrder = append(m.pipelineOrder[:i], m.pipelineOrder[i+1:]...)
+			i--
+		}
+		if m.expanded == sourceID {
+			m.expanded = targetID
+		}
+	}
+
+	for _, agent := range m.agents {
+		if agent != nil && agent.PipelineID == sourceID {
+			agent.PipelineID = targetID
+		}
+	}
+	for _, variant := range m.variants {
+		if variant != nil && variant.PipelineID == sourceID {
+			variant.PipelineID = targetID
+		}
+	}
+	m.dedupePipelineMembers(targetID)
+	m.rowsDirty = true
+}
+
+func (m *Model) mergePipelineState(dst, src *PipelineState) {
+	if dst == nil || src == nil || dst == src {
+		return
+	}
+	if dst.TaskID == "" {
+		dst.TaskID = src.TaskID
+	}
+	if dst.TaskLabel == "" {
+		dst.TaskLabel = src.TaskLabel
+	}
+	if dst.Status == "" {
+		dst.Status = src.Status
+	}
+	if dst.LoopCount == 0 && src.LoopCount > 0 {
+		dst.LoopCount = src.LoopCount
+	}
+	if dst.MaxLoops == 0 && src.MaxLoops > 0 {
+		dst.MaxLoops = src.MaxLoops
+	}
+	if dst.WorkerType == "" {
+		dst.WorkerType = src.WorkerType
+	}
+	if dst.CreatedAt.IsZero() || (!src.CreatedAt.IsZero() && src.CreatedAt.Before(dst.CreatedAt)) {
+		dst.CreatedAt = src.CreatedAt
+	}
+	dst.Members = append(dst.Members, src.Members...)
 }
 
 // handleVariantState creates or updates a variant state entry.
@@ -1323,7 +1475,7 @@ func (m *Model) enterSelector() {
 	if agent == nil {
 		return
 	}
-	models := agentModels(agent)
+	models := m.agentModels(agent)
 	if len(models) <= 1 {
 		return
 	}
@@ -1376,7 +1528,7 @@ func (m *Model) cycleModelPrev() tea.Cmd {
 	if agent == nil {
 		return nil
 	}
-	models := agentModels(agent)
+	models := m.agentModels(agent)
 	if len(models) <= 1 {
 		return nil
 	}
@@ -1392,7 +1544,7 @@ func (m *Model) cycleModelNext() tea.Cmd {
 	if agent == nil {
 		return nil
 	}
-	models := agentModels(agent)
+	models := m.agentModels(agent)
 	if len(models) <= 1 {
 		return nil
 	}
@@ -1502,11 +1654,13 @@ func (m *Model) rebuildRows() {
 				continue
 			}
 			rows = append(rows, listRow{Kind: rowPipeline, ID: plID, Label: pipelineDisplayLabel(pl)})
-			for _, agentID := range pipelineMembers[plID] {
-				rows = append(rows, listRow{Kind: rowAgent, ID: agentID, PipelineID: plID})
-			}
-			for _, v := range m.variantsForPipeline(plID) {
-				rows = append(rows, listRow{Kind: rowVariant, ID: v.ID, PipelineID: plID})
+			if !m.collapsedPipelines[plID] {
+				for _, agentID := range pipelineMembers[plID] {
+					rows = append(rows, listRow{Kind: rowAgent, ID: agentID, PipelineID: plID})
+				}
+				for _, v := range m.variantsForPipeline(plID) {
+					rows = append(rows, listRow{Kind: rowVariant, ID: v.ID, PipelineID: plID})
+				}
 			}
 			if idx < len(m.pipelineOrder)-1 {
 				rows = append(rows, listRow{Kind: rowSpacer})
@@ -1549,6 +1703,7 @@ func (m *Model) ensureRows() {
 func (m *Model) clampToSelectable() {
 	if len(m.rows) == 0 {
 		m.selected = 0
+		m.pipelineScroll = 0
 		return
 	}
 	m.selected = clampIndex(m.selected, len(m.rows))
@@ -1565,10 +1720,12 @@ func (m *Model) clampToSelectable() {
 		for i := m.selected - 1; i >= 0; i-- {
 			if !m.rows[i].Kind.isNonSelectable() {
 				m.selected = i
+				m.ensureSelectedPipelineRowVisible()
 				return
 			}
 		}
 	}
+	m.ensureSelectedPipelineRowVisible()
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,6 +1737,8 @@ func (m *Model) clampToSelectable() {
 // scroll should not change agent selection.
 func (m *Model) ScrollUp() bool {
 	switch m.view {
+	case viewList:
+		return m.scrollPipelineViewport(-1)
 	case viewExpanded:
 		m.moveEventSelection(-1)
 		return true
@@ -1596,6 +1755,8 @@ func (m *Model) ScrollUp() bool {
 // scroll should not change agent selection.
 func (m *Model) ScrollDown() bool {
 	switch m.view {
+	case viewList:
+		return m.scrollPipelineViewport(1)
 	case viewExpanded:
 		m.moveEventSelection(1)
 		return true
@@ -1644,7 +1805,8 @@ func (m *Model) SelectByID(agentID string) bool {
 
 // SeedAgent creates an idle agent entry without requiring an activity event.
 // Used during bootstrap to pre-populate the panel with known agents.
-// When supportedModels is non-empty, it overrides the static model table.
+// When supportedModels is non-empty, it stores the raw backend model list and
+// overrides the static model table.
 // persistedModelID, when non-empty and present in the model list, overrides the
 // default model so the UI shows the user's persisted selection on boot.
 // persistedProviderID is stored alongside the model; when empty, derived from modelID.
@@ -1657,16 +1819,10 @@ func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEnt
 		return
 	}
 	category := agentCategoryByType[agentType]
-	models := supportedModels
-	if len(models) == 0 {
-		models = modelsForAgent(agentType)
-	}
-	modelID := defaultModelForAgent(agentType)
-	if len(supportedModels) > 0 {
-		modelID = supportedModels[0].ID
-	}
-	if persistedModelID != "" && modelInList(models, persistedModelID) {
-		modelID = persistedModelID
+	models := m.visibleModelEntries(agentType, supportedModels)
+	modelID := m.resolveAgentModelID(models, "")
+	if persistedModelID != "" {
+		modelID = m.resolveAgentModelID(models, persistedModelID)
 	}
 	providerID := persistedProviderID
 	if providerID == "" {
@@ -1755,6 +1911,50 @@ func (m *Model) moveSelection(delta int) {
 		return
 	}
 	m.selected = next
+	m.ensureSelectedPipelineRowVisible()
+}
+
+func (m *Model) toggleSelectedPipelineCollapse() {
+	m.setSelectedPipelineCollapsed(nil)
+}
+
+func (m *Model) collapseSelectedPipeline() {
+	collapsed := true
+	m.setSelectedPipelineCollapsed(&collapsed)
+}
+
+func (m *Model) expandSelectedPipeline() {
+	collapsed := false
+	m.setSelectedPipelineCollapsed(&collapsed)
+}
+
+func (m *Model) setSelectedPipelineCollapsed(forceState *bool) {
+	m.ensureRows()
+	if len(m.rows) == 0 {
+		return
+	}
+	idx := clampIndex(m.selected, len(m.rows))
+	row := m.rows[idx]
+	if row.Kind != rowPipeline {
+		return
+	}
+
+	current := m.collapsedPipelines[row.ID]
+	next := !current
+	if forceState != nil {
+		next = *forceState
+	}
+	if next == current {
+		return
+	}
+	if next {
+		m.collapsedPipelines[row.ID] = true
+	} else {
+		delete(m.collapsedPipelines, row.ID)
+	}
+	m.rowsDirty = true
+	m.ensureRows()
+	m.selectRow(row.Kind, row.ID)
 }
 
 // enterExpanded transitions from list view to expanded view for the selected row.
@@ -1851,77 +2051,430 @@ func (m *Model) renderListView() string {
 		HolographicGrad: m.activeGroupGradient, // Full prismatic for selected active agent.
 	}
 
+	if m.pipelineSectionIndex() >= 0 {
+		return m.renderSectionedListView(elapsed, anim)
+	}
+
+	return m.renderFlatListView(elapsed, anim)
+}
+
+func (m *Model) renderFlatListView(elapsed time.Duration, anim AnimState) string {
 	contentHeight := m.height
 	rowBudget := contentHeight
-	if contentHeight > 1 {
-		rowBudget = contentHeight - 1
-	}
+	m.resetLineRowMap()
 	lines := make([]string, 0, min(len(m.rows)*2, contentHeight))
 	var consumedLines int
-	lastContentIdx := -1 // track last rendered content row
+	lastContentIdx := -1
 	start, end := m.visibleListWindow(rowBudget)
 
 	for i := start; i < end; i++ {
-		row := m.rows[i]
 		if consumedLines >= rowBudget {
 			break
 		}
-		selected := i == m.selected
-
-		// Per-row phase offset creates a downward-flowing prismatic wave
-		// across all sections. The gradient cycles through the idle palette
-		// when no agents are active and the full prismatic spectrum when
-		// active agents are present (swapped above).
-		phase := elapsed - time.Duration(i)*groupFlowStep
-		activeColor := m.groupGradient.Sample(phase)
-
-		switch row.Kind {
-		case rowSection:
-			lines = append(lines, renderSectionHeader(row.Label, activeColor, m.theme))
-			consumedLines++
-
-		case rowSpacer:
-			lines = append(lines, renderSpacer(activeColor, m.theme))
-			consumedLines++
-
-		case rowAgent:
-			agent, ok := m.agents[row.ID]
-			if !ok {
-				continue
-			}
-			engaged := m.engagedID != "" && row.ID == m.engagedID
-			prefix := renderTreePrefix(pipelinePrefix, activeColor, m.theme)
-			lines = append(lines, RenderCard(*agent, m.width, m.theme, selected, engaged, prefix, anim))
-			consumedLines++
-			lastContentIdx = i
-
-		case rowPipeline:
-			pl := m.pipelines[row.ID]
-			if pl == nil {
-				continue
-			}
-			lines = append(lines, renderPipelineRow(pl, m.width, elapsed, m.gradient, m.theme, selected, activeColor, anim))
-			consumedLines++
-			lastContentIdx = i
-
-		case rowVariant:
-			v := m.variants[row.ID]
-			if v == nil {
-				continue
-			}
-			lines = append(lines, renderVariantRow(v, m.width, m.theme, selected, activeColor, anim))
-			consumedLines++
+		line, ok, isContent := m.renderListRow(m.rows[i], i, elapsed, anim)
+		if !ok {
+			continue
+		}
+		lines = append(lines, line)
+		m.recordRenderedRow(consumedLines, i)
+		consumedLines++
+		if isContent {
 			lastContentIdx = i
 		}
 	}
 
-	if lastContentIdx >= 0 && consumedLines < contentHeight {
+	lines = m.finalizeListLines(lines, contentHeight, lastContentIdx, elapsed)
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) string {
+	contentHeight := max(m.height, 0)
+	if contentHeight == 0 {
+		return ""
+	}
+
+	contentBudget := contentHeight
+	preEnd, preludeStart, bodyStart, ok := m.pipelineSectionLayout()
+	if !ok {
+		return m.renderFlatListView(elapsed, anim)
+	}
+	preludeCount := bodyStart - preludeStart
+	bodyCount := len(m.rows) - bodyStart
+	pipelineReserve := m.pipelineReserve(contentBudget, preludeCount, bodyCount)
+	preVisible := m.compactPrePipelineRows(preEnd, max(contentBudget-pipelineReserve, 0))
+	m.resetLineRowMap()
+	lines := make([]string, 0, min(len(m.rows)+1, contentHeight))
+	lastContentIdx := -1
+
+	for lineIdx, rowIdx := range preVisible {
+		line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
+		if !renderOK {
+			continue
+		}
+		lines = append(lines, line)
+		m.recordRenderedRow(lineIdx, rowIdx)
+		if isContent {
+			lastContentIdx = rowIdx
+		}
+	}
+
+	remainingHeight := contentBudget - len(lines)
+	for rowIdx := preludeStart; rowIdx < bodyStart && remainingHeight > 0; rowIdx++ {
+		line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
+		if !renderOK {
+			continue
+		}
+		lineIdx := len(lines)
+		lines = append(lines, line)
+		m.recordRenderedRow(lineIdx, rowIdx)
+		remainingHeight--
+		if isContent {
+			lastContentIdx = rowIdx
+		}
+	}
+
+	if remainingHeight > 0 && bodyCount > 0 {
+		m.clampPipelineScroll(bodyCount, remainingHeight)
+		start, end := m.visiblePipelineWindow(bodyCount, remainingHeight)
+		for localIdx := start; localIdx < end; localIdx++ {
+			rowIdx := bodyStart + localIdx
+			line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
+			if !renderOK {
+				continue
+			}
+			lineIdx := len(lines)
+			lines = append(lines, line)
+			m.recordRenderedRow(lineIdx, rowIdx)
+			if isContent {
+				lastContentIdx = rowIdx
+			}
+		}
+	}
+
+	lines = m.finalizeListLines(lines, contentHeight, lastContentIdx, elapsed)
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) renderListRow(row listRow, rowIndex int, elapsed time.Duration, anim AnimState) (string, bool, bool) {
+	selected := rowIndex == m.selected
+	phase := elapsed - time.Duration(rowIndex)*groupFlowStep
+	activeColor := m.groupGradient.Sample(phase)
+
+	switch row.Kind {
+	case rowSection:
+		return renderSectionHeader(row.Label, activeColor, m.theme), true, false
+	case rowSpacer:
+		return renderSpacer(activeColor, m.theme), true, false
+	case rowAgent:
+		agent, ok := m.agents[row.ID]
+		if !ok {
+			return "", false, false
+		}
+		engaged := m.engagedID != "" && row.ID == m.engagedID
+		prefix := renderTreePrefix(pipelinePrefix, activeColor, m.theme)
+		return RenderCard(*agent, m.width, m.theme, selected, engaged, prefix, anim), true, true
+	case rowPipeline:
+		pl := m.pipelines[row.ID]
+		if pl == nil {
+			return "", false, false
+		}
+		return renderPipelineRow(pl, m.width, elapsed, m.gradient, m.theme, selected, activeColor, anim, m.collapsedPipelines[row.ID]), true, true
+	case rowVariant:
+		v := m.variants[row.ID]
+		if v == nil {
+			return "", false, false
+		}
+		return renderVariantRow(v, m.width, m.theme, selected, activeColor, anim), true, true
+	default:
+		return "", false, false
+	}
+}
+
+func (m *Model) resetLineRowMap() {
+	if m.height <= 0 {
+		m.lineRowMap = nil
+		return
+	}
+	if cap(m.lineRowMap) < m.height {
+		m.lineRowMap = make([]int, m.height)
+	} else {
+		m.lineRowMap = m.lineRowMap[:m.height]
+	}
+	for i := range m.lineRowMap {
+		m.lineRowMap[i] = -1
+	}
+}
+
+func (m *Model) recordRenderedRow(lineIdx, rowIdx int) {
+	if lineIdx < 0 || lineIdx >= len(m.lineRowMap) {
+		return
+	}
+	m.lineRowMap[lineIdx] = rowIdx
+}
+
+func (m *Model) finalizeListLines(lines []string, targetHeight, lastContentIdx int, elapsed time.Duration) []string {
+	if targetHeight <= 0 {
+		return lines
+	}
+	if lastContentIdx >= 0 && len(lines) < targetHeight {
 		footerPhase := elapsed - time.Duration(lastContentIdx+1)*groupFlowStep
 		footerColor := m.groupGradient.Sample(footerPhase)
 		lines = append(lines, renderSectionFooter(m.width, footerColor, m.theme))
 	}
+	return lines
+}
 
-	return strings.Join(lines, "\n")
+func (m *Model) pipelineSectionIndex() int {
+	for idx, row := range m.rows {
+		if row.Kind == rowSection && row.Label == "pipelines" {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (m *Model) pipelineSectionLayout() (preEnd, preludeStart, bodyStart int, ok bool) {
+	sectionIdx := m.pipelineSectionIndex()
+	if sectionIdx < 0 {
+		return 0, 0, 0, false
+	}
+	preludeStart = sectionIdx
+	if preludeStart > 0 && m.rows[preludeStart-1].Kind == rowSpacer {
+		preludeStart--
+	}
+	bodyStart = min(sectionIdx+1, len(m.rows))
+	return preludeStart, preludeStart, bodyStart, true
+}
+
+func (m *Model) pipelineReserve(contentBudget, preludeCount, bodyCount int) int {
+	if contentBudget <= 0 {
+		return 0
+	}
+	reserve := preludeCount
+	if bodyCount > 0 {
+		reserve++
+	}
+	if reserve > contentBudget {
+		return contentBudget
+	}
+	return reserve
+}
+
+func (m *Model) compactPrePipelineRows(preEnd, budget int) []int {
+	if budget <= 0 || preEnd <= 0 {
+		return nil
+	}
+	if preEnd <= budget {
+		rows := make([]int, preEnd)
+		for i := range preEnd {
+			rows[i] = i
+		}
+		return rows
+	}
+
+	type rowBlock struct {
+		indices []int
+		minKeep int
+	}
+
+	var blocks []rowBlock
+	for idx := 0; idx < preEnd; {
+		start := idx
+		idx++
+		for idx < preEnd {
+			if m.rows[idx].Kind == rowSpacer && idx+1 < preEnd && m.rows[idx+1].Kind == rowSection {
+				break
+			}
+			idx++
+		}
+		block := rowBlock{
+			indices: make([]int, 0, idx-start),
+			minKeep: min(idx-start, 2),
+		}
+		for rowIdx := start; rowIdx < idx; rowIdx++ {
+			block.indices = append(block.indices, rowIdx)
+		}
+		blocks = append(blocks, block)
+	}
+
+	total := 0
+	lengths := make([]int, len(blocks))
+	for i, block := range blocks {
+		lengths[i] = len(block.indices)
+		total += lengths[i]
+	}
+	for total > budget {
+		trimmed := false
+		for blockIdx := len(blocks) - 1; blockIdx >= 0 && total > budget; blockIdx-- {
+			if lengths[blockIdx] > blocks[blockIdx].minKeep {
+				lengths[blockIdx]--
+				total--
+				trimmed = true
+			}
+		}
+		if trimmed {
+			continue
+		}
+		for blockIdx := len(blocks) - 1; blockIdx >= 0 && total > budget; blockIdx-- {
+			if lengths[blockIdx] > 0 {
+				lengths[blockIdx]--
+				total--
+			}
+		}
+	}
+
+	rows := make([]int, 0, budget)
+	for blockIdx, block := range blocks {
+		rows = append(rows, block.indices[:lengths[blockIdx]]...)
+	}
+	return rows
+}
+
+func (m *Model) clampPipelineScroll(totalRows, viewportHeight int) {
+	if viewportHeight <= 0 {
+		m.pipelineScroll = 0
+		return
+	}
+	maxScroll := max(totalRows-viewportHeight, 0)
+	if m.pipelineScroll > maxScroll {
+		m.pipelineScroll = maxScroll
+	}
+	if m.pipelineScroll < 0 {
+		m.pipelineScroll = 0
+	}
+}
+
+func (m *Model) visiblePipelineWindow(totalRows, viewportHeight int) (start, end int) {
+	if viewportHeight <= 0 || totalRows == 0 {
+		return 0, 0
+	}
+	if totalRows <= viewportHeight {
+		m.pipelineScroll = 0
+		return 0, totalRows
+	}
+
+	maxScroll := totalRows - viewportHeight
+	scroll := m.pipelineScroll
+	if !m.focused && scroll == 0 && m.shouldPreferPipelineViewport() {
+		scroll = maxScroll
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+	if m.focused || m.pipelineScroll != 0 {
+		m.pipelineScroll = scroll
+	}
+	return scroll, scroll + viewportHeight
+}
+
+func (m *Model) pipelineViewportMetrics() (bodyStart, bodyCount, viewportHeight int, ok bool) {
+	m.ensureRows()
+	preEnd, preludeStart, pipelineBodyStart, found := m.pipelineSectionLayout()
+	if !found {
+		return 0, 0, 0, false
+	}
+	bodyCount = len(m.rows) - pipelineBodyStart
+	if bodyCount == 0 {
+		return pipelineBodyStart, 0, 0, true
+	}
+	preludeCount := pipelineBodyStart - preludeStart
+	contentHeight := max(m.height, 0)
+	footerHeight := 0
+	if contentHeight > 1 {
+		footerHeight = 1
+	}
+	contentBudget := max(contentHeight-footerHeight, 0)
+	preVisible := m.compactPrePipelineRows(preEnd, max(contentBudget-m.pipelineReserve(contentBudget, preludeCount, bodyCount), 0))
+	remaining := max(contentBudget-len(preVisible), 0)
+	preludeVisible := min(preludeCount, remaining)
+	viewportHeight = max(remaining-preludeVisible, 0)
+	return pipelineBodyStart, bodyCount, viewportHeight, true
+}
+
+func (m *Model) rowIndexAtLine(line int) (int, bool) {
+	if m.view != viewList || line < 0 || line >= len(m.lineRowMap) {
+		return 0, false
+	}
+	rowIdx := m.lineRowMap[line]
+	if rowIdx < 0 || rowIdx >= len(m.rows) {
+		return 0, false
+	}
+	return rowIdx, true
+}
+
+// HandleListClick processes a click inside the list view area.
+// Pipeline headers toggle collapse; other selectable rows are simply selected.
+func (m *Model) HandleListClick(y int) tea.Cmd {
+	m.ensureRows()
+	rowIdx, ok := m.rowIndexAtLine(y)
+	if !ok {
+		return nil
+	}
+	row := m.rows[rowIdx]
+	if row.Kind.isNonSelectable() {
+		return nil
+	}
+	m.selected = rowIdx
+	m.ensureSelectedPipelineRowVisible()
+	if row.Kind == rowPipeline {
+		m.toggleSelectedPipelineCollapse()
+	}
+	return nil
+}
+
+func (m *Model) ensureSelectedPipelineRowVisible() {
+	pipelineStart, bodyCount, viewportHeight, ok := m.pipelineViewportMetrics()
+	if !ok || viewportHeight <= 0 || bodyCount <= viewportHeight {
+		return
+	}
+	if m.selected < pipelineStart {
+		return
+	}
+	localIdx := m.selected - pipelineStart
+	if localIdx < 0 || localIdx >= bodyCount {
+		return
+	}
+	if localIdx < m.pipelineScroll {
+		m.pipelineScroll = localIdx
+		return
+	}
+	if localIdx >= m.pipelineScroll+viewportHeight {
+		m.pipelineScroll = localIdx - viewportHeight + 1
+	}
+}
+
+func (m *Model) scrollPipelineViewport(delta int) bool {
+	_, bodyCount, viewportHeight, ok := m.pipelineViewportMetrics()
+	if !ok || viewportHeight <= 0 || bodyCount <= viewportHeight || delta == 0 {
+		return false
+	}
+	maxScroll := bodyCount - viewportHeight
+	next := m.pipelineScroll + delta
+	if next < 0 {
+		next = 0
+	}
+	if next > maxScroll {
+		next = maxScroll
+	}
+	if next == m.pipelineScroll {
+		return false
+	}
+	m.pipelineScroll = next
+	return true
+}
+
+func (m *Model) selectRow(kind rowKind, id string) bool {
+	for idx, row := range m.rows {
+		if row.Kind == kind && row.ID == id {
+			m.selected = idx
+			m.ensureSelectedPipelineRowVisible()
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Model) visibleListWindow(rowBudget int) (start, end int) {
@@ -2116,7 +2669,7 @@ func (m *Model) RenderSelectorLine() string {
 	if agent == nil {
 		return ""
 	}
-	models := agentModels(agent)
+	models := m.agentModels(agent)
 	if len(models) == 0 {
 		return ""
 	}
@@ -2131,7 +2684,7 @@ func (m *Model) HandleSelectorClick(x int) tea.Cmd {
 	if agent == nil {
 		return nil
 	}
-	models := agentModels(agent)
+	models := m.agentModels(agent)
 	idx := modelIndex(models, agent.ModelID)
 	hit := selectorArrowHitTest(x, m.width, models, idx)
 	switch hit {
@@ -2149,7 +2702,7 @@ func (m *Model) HandleSelectorHover(x int) {
 	if agent == nil {
 		return
 	}
-	models := agentModels(agent)
+	models := m.agentModels(agent)
 	idx := modelIndex(models, agent.ModelID)
 	hit := selectorArrowHitTest(x, m.width, models, idx)
 	m.selector.hoverLeft = hit == selectorFocusLeft
@@ -2165,6 +2718,59 @@ func (m *Model) ClearSelectorHover() {
 // SelectorLineCount returns the number of lines the selector occupies.
 func (m *Model) SelectorLineCount() int {
 	return selectorLineCount
+}
+
+func (m *Model) currentOpenAIAuthMethod() string {
+	canonical := credentials.CanonicalAuthMethod("openai", m.openAIAuthMethod)
+	if canonical == "" {
+		return credentials.DefaultAuthMethod("openai")
+	}
+	return canonical
+}
+
+func (m *Model) modelsForAgentType(agentType string) []ModelEntry {
+	return modelsForAgentForAuth(agentType, m.currentOpenAIAuthMethod())
+}
+
+func (m *Model) visibleModelEntries(agentType string, supportedModels []ModelEntry) []ModelEntry {
+	if len(supportedModels) > 0 {
+		return authAwareModelEntries(supportedModels, m.currentOpenAIAuthMethod())
+	}
+	return m.modelsForAgentType(agentType)
+}
+
+func (m *Model) agentModels(agent *AgentState) []ModelEntry {
+	return agentModelsForAuth(agent, m.currentOpenAIAuthMethod())
+}
+
+func (m *Model) resolveAgentModelID(models []ModelEntry, preferredID string) string {
+	if preferredID != "" {
+		resolved := resolveModelForOpenAIAuth(preferredID, m.currentOpenAIAuthMethod())
+		if modelInList(models, resolved) {
+			return resolved
+		}
+		if modelInList(models, preferredID) {
+			return preferredID
+		}
+	}
+	if len(models) > 0 {
+		return models[0].ID
+	}
+	return preferredID
+}
+
+func (m *Model) reconcileAgentModel(agent *AgentState) {
+	if agent == nil {
+		return
+	}
+	models := m.agentModels(agent)
+	if len(models) == 0 {
+		return
+	}
+	agent.ModelID = m.resolveAgentModelID(models, agent.ModelID)
+	if agent.ProviderID == "" || agent.ProviderID != deriveProvider(agent.ModelID) {
+		agent.ProviderID = deriveProvider(agent.ModelID)
+	}
 }
 
 // PersistedModelFor returns the persisted model for agentType, falling back to

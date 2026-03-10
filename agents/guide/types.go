@@ -202,6 +202,8 @@ const (
 	DomainFiles      Domain = "files"      // File system operations, file metadata
 	DomainDesign     Domain = "design"     // Architecture, system design, structural decisions
 	DomainTasks      Domain = "tasks"      // Task breakdown, work items, orchestration
+	DomainWorkflow   Domain = "workflow"   // Workflow execution and DAG/runtime progress
+	DomainHealth     Domain = "health"     // Runtime health, budgets, anomalies
 	DomainPatterns   Domain = "patterns"   // Recurring patterns, conventions, idioms
 	DomainFailures   Domain = "failures"   // Past failures, error patterns, regressions
 	DomainDecisions  Domain = "decisions"  // Architectural decisions, rationale, trade-offs
@@ -224,6 +226,8 @@ func AllDomains() []Domain {
 		DomainFiles,
 		DomainDesign,
 		DomainTasks,
+		DomainWorkflow,
+		DomainHealth,
 		DomainPatterns,
 		DomainFailures,
 		DomainDecisions,
@@ -255,6 +259,8 @@ func (d Domain) Canonical() Domain {
 		return DomainLocal
 	case DomainTasks:
 		return DomainPlanning
+	case DomainWorkflow, DomainHealth:
+		return DomainSystem
 	case DomainDesign:
 		return DomainResearch
 	default:
@@ -278,6 +284,7 @@ const (
 	TargetOrchestrator TargetAgent = "orchestrator" // Pipeline execution
 	TargetDesigner     TargetAgent = "designer"     // Design implementation
 	TargetEngineer     TargetAgent = "engineer"     // Code implementation
+	TargetGuardian     TargetAgent = "guardian"     // Safety, security, compliance, health
 	TargetInspector    TargetAgent = "inspector"    // Code review, validation
 	TargetTester       TargetAgent = "tester"       // Test creation, execution
 	TargetUnknown      TargetAgent = "unknown"      // Could not determine target
@@ -294,6 +301,7 @@ func AllTargetAgents() []TargetAgent {
 		TargetOrchestrator,
 		TargetDesigner,
 		TargetEngineer,
+		TargetGuardian,
 		TargetInspector,
 		TargetTester,
 	}
@@ -382,12 +390,12 @@ type RouteResponse struct {
 }
 
 type StreamResponse struct {
-	CorrelationID       string       `json:"correlation_id"`
-	RespondingAgentID   string       `json:"responding_agent_id"`
-	RespondingAgentName string       `json:"responding_agent_name,omitempty"`
-	TargetAgentID       string       `json:"target_agent_id"`
+	CorrelationID       string         `json:"correlation_id"`
+	RespondingAgentID   string         `json:"responding_agent_id"`
+	RespondingAgentName string         `json:"responding_agent_name,omitempty"`
+	TargetAgentID       string         `json:"target_agent_id"`
 	Metadata            map[string]any `json:"metadata,omitempty"`
-	Event               *StreamEvent `json:"event"`
+	Event               *StreamEvent   `json:"event"`
 }
 
 // ForwardedRequest is what the Guide sends to the target agent

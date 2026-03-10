@@ -53,6 +53,7 @@ type StreamStartMsg struct {
 	AgentName     string
 	PipelineID    string
 	TaskID        string
+	TaskName      string
 	TaskSlug      string
 }
 
@@ -73,6 +74,7 @@ type StreamProgressMsg struct {
 	AgentType     string
 	PipelineID    string
 	TaskID        string
+	TaskName      string
 	TaskSlug      string
 	Current       int
 	Total         int
@@ -89,6 +91,7 @@ type StreamCompleteMsg struct {
 	AgentType     string
 	PipelineID    string
 	TaskID        string
+	TaskName      string
 	TaskSlug      string
 	Result        any
 	InputTokens   int // Real provider input tokens (0 = unavailable).
@@ -582,7 +585,8 @@ type DiffViewPair struct {
 // ProbeAll completes. Dispatched by a deferred Init cmd so the status bar
 // icons update once the AuthRegistry is populated.
 type AuthStatusMsg struct {
-	Providers map[string]bool // provider → available
+	Providers map[string]bool   // provider → available
+	Methods   map[string]string // provider → active auth method
 }
 
 // ---------------------------------------------------------------------------
@@ -650,13 +654,14 @@ type PlanViewToggleMsg struct{}
 
 // PipelineStateMsg carries a pipeline state update for the agent panel.
 type PipelineStateMsg struct {
-	PipelineID string
-	TaskID     string
-	TaskLabel  string
-	Status     string // TDD phase or lifecycle status.
-	WorkerType string // Agent type running the pipeline.
-	LoopCount  int
-	MaxLoops   int
+	PipelineID        string
+	RuntimePipelineID string
+	TaskID            string
+	TaskLabel         string
+	Status            string // TDD phase or lifecycle status.
+	WorkerType        string // Agent type running the pipeline.
+	LoopCount         int
+	MaxLoops          int
 }
 
 // VariantStateMsg carries a variant state update for the agent panel.

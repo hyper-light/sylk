@@ -39,6 +39,19 @@ func TestModelsForAgent_Unknown(t *testing.T) {
 	}
 }
 
+func TestModelsForAgentForAuth_ChatGPTRewritesOpenAIModels(t *testing.T) {
+	models := modelsForAgentForAuth("engineer", "chatgpt")
+	if len(models) != 1 {
+		t.Fatalf("models len = %d, want 1", len(models))
+	}
+	if models[0].ID != "gpt-5.4" {
+		t.Fatalf("model ID = %q, want gpt-5.4", models[0].ID)
+	}
+	if models[0].DisplayName != "GPT-5.4" {
+		t.Fatalf("display name = %q, want GPT-5.4", models[0].DisplayName)
+	}
+}
+
 func TestModelIndex(t *testing.T) {
 	models := modelsForAgent("inspector")
 
@@ -280,8 +293,10 @@ func TestSelectorDisabledForSingleModel(t *testing.T) {
 	m.SetSize(80, 20)
 	m.SetFocused(true)
 
-	// Engineer currently exposes a single model, so selector mode stays disabled.
-	pushAgentActivity(m, "engineer", "engineer")
+	// A seeded agent with one supported model should keep selector mode disabled.
+	m.SeedAgent("single", "engineer", "Engineer", []ModelEntry{
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
+	}, "", "")
 
 	// Selector should not enter for agents without multiple models.
 	m.enterSelector()
@@ -377,6 +392,24 @@ func TestSeedAgentWithPersistedModel(t *testing.T) {
 	}
 }
 
+func TestSeedAgentWithChatGPTAuthUsesVisibleOpenAIModel(t *testing.T) {
+	m := New(theme.DefaultDark())
+	m.SetOpenAIAuthMethod("chatgpt")
+	m.SeedAgent("eng-1", "engineer", "Engineer", nil, "gpt-5.4-pro", "openai")
+
+	agent := m.agents["eng-1"]
+	if agent == nil {
+		t.Fatal("seeded agent not found")
+	}
+	if agent.ModelID != "gpt-5.4" {
+		t.Fatalf("ModelID = %q, want gpt-5.4", agent.ModelID)
+	}
+	models := m.agentModels(agent)
+	if len(models) != 1 || models[0].ID != "gpt-5.4" {
+		t.Fatalf("agentModels = %+v, want only gpt-5.4", models)
+	}
+}
+
 func TestSeedAgentWithPersistedProviderDerived(t *testing.T) {
 	m := New(theme.DefaultDark())
 	// Seed with persisted model but empty provider — should derive from model.
@@ -412,6 +445,39 @@ func TestAgentModels_FallbackToStatic(t *testing.T) {
 	models := agentModels(agent)
 	if len(models) != 1 || models[0].ID != "gpt-5.4-pro" {
 		t.Errorf("agentModels fallback returned %v, want static engineer models", models)
+	}
+}
+
+func TestSetOpenAIAuthMethod_ReconcilesDisplayedModel(t *testing.T) {
+	m := New(theme.DefaultDark())
+	m.SeedAgent("architect", "architect", "Architect", []ModelEntry{
+		{ID: "gpt-5.4", DisplayName: "GPT-5.4"},
+		{ID: "gpt-5.4-pro", DisplayName: "GPT-5.4 Pro"},
+		{ID: "claude-opus-4-6", DisplayName: "Claude Opus 4.6"},
+	}, "gpt-5.4-pro", "openai")
+
+	agent := m.agents["architect"]
+	if agent == nil {
+		t.Fatal("seeded agent not found")
+	}
+	if agent.ModelID != "gpt-5.4-pro" {
+		t.Fatalf("initial ModelID = %q, want gpt-5.4-pro", agent.ModelID)
+	}
+
+	m.SetOpenAIAuthMethod("chatgpt")
+
+	if agent.ModelID != "gpt-5.4" {
+		t.Fatalf("ModelID after auth change = %q, want gpt-5.4", agent.ModelID)
+	}
+	models := m.agentModels(agent)
+	if len(models) != 2 {
+		t.Fatalf("filtered models len = %d, want 2", len(models))
+	}
+	if models[0].ID != "gpt-5.4" {
+		t.Fatalf("first filtered model = %q, want gpt-5.4", models[0].ID)
+	}
+	if models[1].ID != "claude-opus-4-6" {
+		t.Fatalf("second filtered model = %q, want claude-opus-4-6", models[1].ID)
 	}
 }
 

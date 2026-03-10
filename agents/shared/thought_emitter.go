@@ -38,13 +38,7 @@ func (e *ThoughtEmitter) Flush() string {
 }
 
 func (e *ThoughtEmitter) shouldEmit(delta string) bool {
-	if e.lastEmitLen == 0 {
-		return true
-	}
-	if ContainsSentenceBoundary(delta) {
-		return true
-	}
-	return e.buffer.Len() >= e.lastEmitLen*2
+	return ContainsSentenceBoundary(delta)
 }
 
 func ContainsSentenceBoundary(s string) bool {

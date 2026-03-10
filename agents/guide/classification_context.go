@@ -16,6 +16,7 @@ type ClassificationContext struct {
 	ActiveConversationScore float64
 	PendingPlanID           string
 	PendingPlanAgent        string
+	AgentCapabilitySummary  string
 }
 
 func withClassificationContext(ctx context.Context, value ClassificationContext) context.Context {
@@ -54,6 +55,7 @@ func normalizeClassificationContext(value ClassificationContext) ClassificationC
 	value.ActiveConversationAgent = strings.TrimSpace(value.ActiveConversationAgent)
 	value.PendingPlanID = strings.TrimSpace(value.PendingPlanID)
 	value.PendingPlanAgent = strings.TrimSpace(value.PendingPlanAgent)
+	value.AgentCapabilitySummary = strings.TrimSpace(value.AgentCapabilitySummary)
 	if value.ActiveConversationTurns < 0 {
 		value.ActiveConversationTurns = 0
 	}
@@ -70,7 +72,7 @@ func normalizeClassificationContext(value ClassificationContext) ClassificationC
 }
 
 func (c ClassificationContext) hasRuntimeSignals() bool {
-	return c.SessionID != "" || c.ActiveConversationAgent != "" || c.PendingPlanID != ""
+	return c.SessionID != "" || c.ActiveConversationAgent != "" || c.PendingPlanID != "" || c.AgentCapabilitySummary != ""
 }
 
 func (c ClassificationContext) promptRuntime() *ClassificationPromptRuntime {
@@ -85,5 +87,6 @@ func (c ClassificationContext) promptRuntime() *ClassificationPromptRuntime {
 		ActiveConversationScore:  c.ActiveConversationScore,
 		PendingPlanID:            c.PendingPlanID,
 		PendingPlanAgent:         c.PendingPlanAgent,
+		AgentCapabilitySummary:   c.AgentCapabilitySummary,
 	}
 }
