@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -166,12 +167,12 @@ func New(cfg Config, provider ...LibrarianProvider) (*Librarian, error) {
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
-		workspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		workspaceViews: authority.RestrictWorkspaceViews("librarian", versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 			DefaultView:      versioning.WorkspaceViewDisk,
 			DefaultSessionID: cfg.SessionID,
 			WorkingDir:       cfg.WorkingDirectory,
 			DiskFallback:     versioning.NewDiskFileAccess(cfg.WorkingDirectory, true),
-		}),
+		})),
 	}
 
 	if cfg.SearchSystem != nil {
@@ -198,10 +199,7 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
 	}
-	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
-		DefaultView:     versioning.WorkspaceViewDisk,
-		IncludePipeline: true,
-	})
+	cfg.SystemPrompt = shared.AppendDiskOnlyContext(cfg.SystemPrompt)
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
@@ -264,13 +262,6 @@ func (l *Librarian) Close() error {
 	l.Stop()
 	if l.cloneStore != nil {
 		l.cloneStore.Close()
-	}
-	l.mu.Lock()
-	svfs := l.sessionVFS
-	l.sessionVFS = nil
-	l.mu.Unlock()
-	if svfs != nil {
-		svfs.Close()
 	}
 	return nil
 }
@@ -504,6 +495,12 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(l.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return l.bus },
+		SourceAgentID:   func() string { return l.id },
+		SourceAgentType: "librarian",
+		SourceAgentName: "Librarian",
+	})
 	l.registerRequestCancel(fwd.CorrelationID, cancel)
 	l.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer l.clearRequestCancel(fwd.CorrelationID)
@@ -895,31 +892,18 @@ func (l *Librarian) Terminate(_ context.Context) error {
 	return l.Stop()
 }
 
-// SetSessionVFS wires the librarian's clone store to the session VFS for
-// versioned, in-memory clone ingestion with WAL-backed disk flush.
-func (l *Librarian) SetSessionVFS(svfs *versioning.SessionVFS) {
+// SetSessionVFS is intentionally a no-op. The librarian reads committed disk
+// state only and does not consume the global or pipeline VFS layers.
+func (l *Librarian) SetSessionVFS(_ *versioning.SessionVFS) {
 	l.mu.Lock()
-	l.sessionVFS = svfs
-	if svfs != nil {
-		l.workspaceViews = versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-			DefaultView:      versioning.WorkspaceViewDisk,
-			DefaultSessionID: l.config.SessionID,
-			WorkingDir:       l.config.WorkingDirectory,
-			Session:          svfs,
-			DiskFallback:     versioning.NewDiskFileAccess(l.config.WorkingDirectory, true),
-		})
-	} else {
-		l.workspaceViews = versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-			DefaultView:      versioning.WorkspaceViewDisk,
-			DefaultSessionID: l.config.SessionID,
-			WorkingDir:       l.config.WorkingDirectory,
-			DiskFallback:     versioning.NewDiskFileAccess(l.config.WorkingDirectory, true),
-		})
-	}
-	l.mu.Unlock()
-	if l.cloneStore != nil {
-		l.cloneStore.SetSessionVFS(svfs)
-	}
+	defer l.mu.Unlock()
+	l.sessionVFS = nil
+	l.workspaceViews = authority.RestrictWorkspaceViews("librarian", versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		DefaultView:      versioning.WorkspaceViewDisk,
+		DefaultSessionID: l.config.SessionID,
+		WorkingDir:       l.config.WorkingDirectory,
+		DiskFallback:     versioning.NewDiskFileAccess(l.config.WorkingDirectory, true),
+	}))
 }
 
 // SetKnowledgeStore wires the librarian to the progressive knowledge store.

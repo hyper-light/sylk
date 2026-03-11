@@ -87,7 +87,7 @@ func BuildManifestFromRegistry(cfg ManifestBuildConfig) *PolicyManifest {
 		manifest.Tools[SearchToolName] = searchPolicy
 	}
 
-	return manifest
+	return ApplyAuthorityProfile(manifest.AgentID, manifest)
 }
 
 func InferEffectDomain(domain string) EffectDomain {

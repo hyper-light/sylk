@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	corecontext "github.com/adalundhe/sylk/core/context"
 	"github.com/adalundhe/sylk/core/domain"
@@ -352,7 +353,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		selfResponder:        selfResponder,
 		sessionID:            cfg.SessionID,
 		agentID:              agentID,
-		workspaceViews:       cfg.WorkspaceViews,
+		workspaceViews:       authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
 		requestCancels:       make(map[string]context.CancelFunc),
 		responseMessagesSeen: make(map[string]time.Time),
 		completedPendings:    make(map[string]completedPendingRoute),
@@ -530,7 +531,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		googleConfig:         cfg.GoogleConfig,
 		sessionID:            cfg.SessionID,
 		agentID:              agentID,
-		workspaceViews:       cfg.WorkspaceViews,
+		workspaceViews:       authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
 		requestCancels:       make(map[string]context.CancelFunc),
 		responseMessagesSeen: make(map[string]time.Time),
 		completedPendings:    make(map[string]completedPendingRoute),
@@ -636,7 +637,7 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		activeModel:    model,
 		sessionID:      cfg.SessionID,
 		agentID:        agentID,
-		workspaceViews: cfg.WorkspaceViews,
+		workspaceViews: authority.RestrictWorkspaceViews("guide", cfg.WorkspaceViews),
 		requestCancels: make(map[string]context.CancelFunc),
 		streamReroutes: make(map[string]string),
 	}
@@ -4549,6 +4550,12 @@ func (g *Guide) LoadSkillsForContext(ctx skills.LoadContext) skills.LoadResult {
 // SetHandoffBridge attaches a HandoffBridge to this Guide instance.
 func (g *Guide) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	g.handoffBridge = bridge
+}
+
+// SetCanonicalID overwrites the Guide's internal ID so a replacement
+// instance can assume the original routing identity after handoff.
+func (g *Guide) SetCanonicalID(id string) {
+	g.config.AgentID = id
 }
 
 // AgentID returns the unique identifier for this Guide instance.

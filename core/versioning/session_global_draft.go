@@ -19,6 +19,18 @@ func (s *SessionVFS) ApplyGlobalWrite(ctx context.Context, path string, content 
 	return err
 }
 
+func (s *SessionVFS) ApplyGlobalMkdir(ctx context.Context, path string) error {
+	mod, ok, err := s.buildGlobalMkdirModification(ctx, path)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	_, err = s.mergeGlobalDraftModifications(ctx, path, []FileModification{mod})
+	return err
+}
+
 func (s *SessionVFS) ApplyGlobalDelete(ctx context.Context, path string) error {
 	mod, ok, err := s.buildGlobalDeleteModification(ctx, path)
 	if err != nil {
@@ -81,6 +93,26 @@ func (s *SessionVFS) buildGlobalDeleteModification(ctx context.Context, path str
 		Operation:    FileOpDelete,
 		Timestamp:    time.Now(),
 		OldContent:   cloneBytes(current),
+	}, true, nil
+}
+
+func (s *SessionVFS) buildGlobalMkdirModification(ctx context.Context, path string) (FileModification, bool, error) {
+	fa := NewVFSFileAccess(s.globalVFS, s.workingDir)
+	resolved := fa.resolve(path)
+	info, err := s.globalVFS.Stat(ctx, resolved)
+	if err == nil {
+		if info.IsDir() {
+			return FileModification{}, false, nil
+		}
+		return FileModification{}, false, ErrFileExists
+	}
+	if err != nil && err != ErrFileNotFound {
+		return FileModification{}, false, err
+	}
+	return FileModification{
+		OriginalPath: resolved,
+		Operation:    FileOpMkdir,
+		Timestamp:    time.Now(),
 	}, true, nil
 }
 

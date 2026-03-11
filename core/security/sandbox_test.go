@@ -5,8 +5,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func skipIfSocketRestricted(t *testing.T, err error) {
+	t.Helper()
+	if err != nil && strings.Contains(err.Error(), "operation not permitted") {
+		t.Skipf("loopback sockets unavailable in this environment: %v", err)
+	}
+}
 
 func TestSandbox_DisabledByDefault(t *testing.T) {
 	cfg := DefaultSandboxConfig()
@@ -303,6 +311,7 @@ func TestNetworkProxy_StartStop(t *testing.T) {
 	}
 
 	if err := np.Start(); err != nil {
+		skipIfSocketRestricted(t, err)
 		t.Fatalf("failed to start proxy: %v", err)
 	}
 
@@ -328,7 +337,10 @@ func TestSandbox_Stop(t *testing.T) {
 	}, nil)
 
 	if sandbox.networkProxy != nil {
-		sandbox.networkProxy.Start()
+		if err := sandbox.networkProxy.Start(); err != nil {
+			skipIfSocketRestricted(t, err)
+			t.Fatalf("failed to start proxy: %v", err)
+		}
 	}
 
 	sandbox.Stop()

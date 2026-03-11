@@ -950,3 +950,53 @@ func TestController_IdleMonitor_SkipsDemotionWithActiveRequests(t *testing.T) {
 
 	release()
 }
+
+func TestController_LifecycleCallbacks(t *testing.T) {
+	cfg := testControllerConfig(t)
+	activated := make(chan string, 2)
+	removed := make(chan string, 1)
+	cfg.OnActivated = func(c *container.Container) {
+		if c == nil {
+			return
+		}
+		activated <- c.Spec().AgentType
+	}
+	cfg.OnRemoved = func(c *container.Container) {
+		if c == nil {
+			return
+		}
+		removed <- c.Spec().AgentType
+	}
+
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+	if _, err := ac.EnsureActive(ctx, "engineer"); err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+
+	select {
+	case got := <-activated:
+		if got != "engineer" {
+			t.Fatalf("activated callback = %q, want %q", got, "engineer")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected activated callback")
+	}
+
+	if err := ac.DemoteTo(ctx, "engineer", TierCold); err != nil {
+		t.Fatalf("DemoteTo cold: %v", err)
+	}
+
+	select {
+	case got := <-removed:
+		if got != "engineer" {
+			t.Fatalf("removed callback = %q, want %q", got, "engineer")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected removed callback")
+	}
+}

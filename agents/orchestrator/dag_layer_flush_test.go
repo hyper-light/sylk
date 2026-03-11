@@ -12,8 +12,9 @@ import (
 func TestDAGBridgeCompositeGate_FlushesGlobalDraftToDisk(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
-		SessionID:  "sess-1",
-		WorkingDir: dir,
+		SessionID:       "sess-1",
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 	if err != nil {
 		t.Fatalf("NewSessionVFS: %v", err)

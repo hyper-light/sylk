@@ -22,7 +22,7 @@ import (
 const walSegmentCapacity = 1 << 16
 
 const (
-	sessionWALPrefix     = "session.wal."
+	sessionWALPrefix      = "session.wal."
 	sessionCheckpointFile = "session.checkpoint"
 )
 
@@ -256,11 +256,11 @@ func (w *SessionWAL) LogChunkRefBatch(refs []*WALChunkRefData) error {
 // SessionReplayHandler holds optional callbacks for each session OpType.
 // Nil callbacks are silently skipped during replay.
 type SessionReplayHandler struct {
-	OnNodeInsert   func(*WALNodeData) error
-	OnNodeDelete   func(*WALNodeData) error
-	OnEdgeInsert   func(*WALEdgeData) error
-	OnEdgeUpdate   func(*WALEdgeData) error
-	OnEdgeDelete   func(*WALEdgeData) error
+	OnNodeInsert     func(*WALNodeData) error
+	OnNodeDelete     func(*WALNodeData) error
+	OnEdgeInsert     func(*WALEdgeData) error
+	OnEdgeUpdate     func(*WALEdgeData) error
+	OnEdgeDelete     func(*WALEdgeData) error
 	OnVectorInsert   func(*WALVectorData) error
 	OnDocInsert      func(*WALDocData) error
 	OnChunkRefInsert func(*WALChunkRefData) error
@@ -740,10 +740,10 @@ func (w *SessionWAL) saveCheckpoint(seq uint64) error {
 	binary.LittleEndian.PutUint64(data, seq)
 
 	tmpPath := w.checkpointPath() + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	if err := writeFileSync(tmpPath, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, w.checkpointPath())
+	return durableRename(tmpPath, w.checkpointPath())
 }
 
 func (w *SessionWAL) gcSegments(segments []uint64) error {

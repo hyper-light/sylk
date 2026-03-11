@@ -9,7 +9,7 @@ import (
 // RunGoVet runs go vet and parses the diagnostic output from stderr.
 func RunGoVet(ctx context.Context, runner *ToolRunner, paths []string) []ValidationIssue {
 	if !runner.Available("go") {
-		return nil
+		return unavailableToolIssues("go")
 	}
 
 	args := []string{"vet"}
@@ -17,7 +17,7 @@ func RunGoVet(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 
 	result, err := runner.Exec(ctx, "go", args...)
 	if err != nil {
-		return nil
+		return executionFailureIssues("go-vet", err)
 	}
 
 	// go vet outputs diagnostics to stderr

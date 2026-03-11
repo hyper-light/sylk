@@ -30,9 +30,10 @@ func TestDiskFlusher_Flush(t *testing.T) {
 	}
 
 	df := NewDiskFlusher(DiskFlusherConfig{
-		GlobalVFS:  globalVFS,
-		WAL:        wal,
-		WorkingDir: dir,
+		GlobalVFS:       globalVFS,
+		WAL:             wal,
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 
 	pending := df.PendingChanges()
@@ -91,9 +92,10 @@ func TestDiskFlusher_RollbackMajor(t *testing.T) {
 	// Modify through global VFS, then flush.
 	globalVFS.Write(ctx, filePath, []byte("modified"))
 	df := NewDiskFlusher(DiskFlusherConfig{
-		GlobalVFS:  globalVFS,
-		WAL:        wal,
-		WorkingDir: dir,
+		GlobalVFS:       globalVFS,
+		WAL:             wal,
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 	df.Flush(ctx) // major 1
 
@@ -131,9 +133,10 @@ func TestDiskFlusher_EmptyFlush(t *testing.T) {
 	defer globalVFS.Close()
 
 	df := NewDiskFlusher(DiskFlusherConfig{
-		GlobalVFS:  globalVFS,
-		WAL:        wal,
-		WorkingDir: dir,
+		GlobalVFS:       globalVFS,
+		WAL:             wal,
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 
 	result, err := df.Flush(context.Background())
@@ -164,9 +167,10 @@ func TestDiskFlusher_FlushRollbackOnCheckpointFailure(t *testing.T) {
 	}
 
 	df := NewDiskFlusher(DiskFlusherConfig{
-		GlobalVFS:  globalVFS,
-		WAL:        failingCheckpointWAL{SemanticWAL: backing},
-		WorkingDir: dir,
+		GlobalVFS:       globalVFS,
+		WAL:             failingCheckpointWAL{SemanticWAL: backing},
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 
 	if _, err := df.Flush(context.Background()); err == nil {

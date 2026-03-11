@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (o *Orchestrator) registerCoreSkills() {
@@ -28,6 +29,11 @@ func (o *Orchestrator) registerCoreSkills() {
 	o.skills.Register(broadcastStatusSkill(o))
 	o.skills.Register(queryAgentHealthSkill(o))
 	o.skills.Register(queryHealthHistorySkill(o))
+	o.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
+	o.skills.Register(versioning.NewWorkspaceGlobSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
+	o.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
+	o.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
+	o.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
 
 	// DAG execution skills (registered after store/bridge are wired)
 	o.skills.Register(executeDAGSkill(o))
@@ -57,6 +63,7 @@ func orchestratorPinnedSkillNames() []string {
 		"query_task", "query_workflow", "push_status",
 		"ingest_plan", "execute_dag",
 		"escalate_to_architect",
+		"read_workspace_file", "inspect_workspace_state",
 	}
 }
 
@@ -70,6 +77,9 @@ func orchestratorCoreSkillNames() []string {
 		"read_plan_file", "escalate_to_architect",
 		"broadcast_status", "query_agent_health",
 		"query_health_history",
+		"read_workspace_file", "workspace_glob",
+		"workspace_grep", "inspect_workspace_state",
+		"summarize_workspace_state",
 		"execute_dag", "cancel_dag", "modify_dag",
 		"query_buffer", "query_pipeline_state",
 		"query_dag_status",

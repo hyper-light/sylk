@@ -1,27 +1,20 @@
 package versioning
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 )
 
-func openSessionSemanticWAL(cfg SessionVFSConfig) (SemanticWAL, error) {
-	dir := strings.TrimSpace(cfg.StorageRoot)
-	if dir == "" {
-		dir = filepath.Join(
-			cfg.WorkingDir,
-			".sylk",
-			"sessions",
-			string(cfg.SessionID),
-			"versioning",
-			"wal",
-		)
-	}
+var ErrPersistentSessionStateDisabled = errors.New("session vfs: persistent session state is disabled in strict RAM mode")
 
-	wal, err := OpenVersionedWAL(VersionedWALConfig{Dir: dir})
-	if err != nil {
-		return nil, fmt.Errorf("session vfs: open semantic wal %s: %w", dir, err)
+func openSessionSemanticWAL(cfg SessionVFSConfig) (SemanticWAL, error) {
+	if cfg.PersistSessionState {
+		return nil, ErrPersistentSessionStateDisabled
 	}
-	return wal, nil
+	if strings.TrimSpace(cfg.StorageRoot) != "" {
+		return nil, fmt.Errorf("session vfs: storage root %s: %w", filepath.Clean(cfg.StorageRoot), ErrPersistentSessionStateDisabled)
+	}
+	return NewMemoryVersionedWAL(), nil
 }

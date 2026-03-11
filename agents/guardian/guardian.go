@@ -15,6 +15,8 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
@@ -97,6 +99,7 @@ type Guardian struct {
 	// User approval flow.
 	pendingMu        sync.Mutex
 	pendingApprovals map[string]chan ApprovalResult
+	commandRules     *commandapproval.RuleStore
 
 	// Conversation state.
 	conversationHistory []guide.ConversationTurn
@@ -183,10 +186,11 @@ func New(cfg Config, provider guardianProvider) (*Guardian, error) {
 		provider:          provider,
 		model:             DefaultGuardianModel,
 		activityPub:       cfg.ActivityPub,
-		fileAccess:        cfg.FileAccess,
-		workspaceViews:    cfg.WorkspaceViews,
+		fileAccess:        authority.RestrictFileAccess("guardian", cfg.FileAccess),
+		workspaceViews:    authority.RestrictWorkspaceViews("guardian", cfg.WorkspaceViews),
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingApprovals:  make(map[string]chan ApprovalResult),
+		commandRules:      commandapproval.NewRuleStore(""),
 		inFlight:          make(map[string]context.CancelFunc),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
@@ -245,6 +249,14 @@ func (g *Guardian) initSubsystems() {
 
 func (g *Guardian) AgentID() string   { return g.id }
 func (g *Guardian) AgentType() string { return "guardian" }
+
+// SetCanonicalID preserves the routing identity across handoff replacement.
+func (g *Guardian) SetCanonicalID(id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	g.id = id
+}
 
 func (g *Guardian) Terminate(ctx context.Context) error {
 	return g.Stop()
@@ -454,6 +466,13 @@ func (g *Guardian) SetCostCalculator(fn CostCalculator) {
 // Called during pipeline setup after construction.
 func (g *Guardian) SetQuarantine(q *fetch.QuarantineBuffer) {
 	g.quarantine = q
+}
+
+func (g *Guardian) SetCommandApprovalStore(store *commandapproval.RuleStore) {
+	if g == nil || store == nil {
+		return
+	}
+	g.commandRules = store
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +890,9 @@ func (g *Guardian) handleBusResponse(msg *guide.Message) error {
 			if approved, aOk := payload["approved"].(bool); aOk {
 				result.Approved = approved
 			}
+			if decision, dOk := payload["decision"].(string); dOk {
+				result.Decision = ApprovalDecision(strings.TrimSpace(decision))
+			}
 			if reason, rOk := payload["reason"].(string); rOk {
 				result.Reason = reason
 			}
@@ -958,6 +980,11 @@ func (g *Guardian) handleActivityEvent(msg *guide.Message) error {
 
 // requestApproval sends a proposal to the user and blocks until approved/denied/timeout.
 func (g *Guardian) requestApproval(ctx context.Context, proposal *GitMutationProposal) (bool, error) {
+	result, err := g.requestApprovalDetailed(ctx, proposal)
+	return result.Approved, err
+}
+
+func (g *Guardian) requestApprovalDetailed(ctx context.Context, proposal *GitMutationProposal) (ApprovalResult, error) {
 	correlationID := uuid.New().String()
 	proposal.CorrelationID = correlationID
 
@@ -978,7 +1005,7 @@ func (g *Guardian) requestApproval(ctx context.Context, proposal *GitMutationPro
 			Verdict: "pending", Reason: proposal.Reason,
 		})
 	if err := g.bus.Publish(guide.TopicGuideRequests, newProposalMessage(correlationID, proposal)); err != nil {
-		return false, fmt.Errorf("publish proposal: %w", err)
+		return ApprovalResult{}, fmt.Errorf("publish proposal: %w", err)
 	}
 
 	// Wait for approval with TTL.
@@ -995,19 +1022,19 @@ func (g *Guardian) requestApproval(ctx context.Context, proposal *GitMutationPro
 			g.id, "", correlationID, "info", &agentlog.DiffPayload{
 				Verdict: action, Reason: result.Reason,
 			})
-		return result.Approved, nil
+		return result, nil
 	case <-timer.C:
 		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
 			g.id, "", correlationID, "warn", &agentlog.DiffPayload{
 				Verdict: "timeout",
 			})
-		return false, fmt.Errorf("approval timed out after %v", DefaultApprovalTTL)
+		return ApprovalResult{}, fmt.Errorf("approval timed out after %v", DefaultApprovalTTL)
 	case <-ctx.Done():
 		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
 			g.id, "", correlationID, "warn", &agentlog.DiffPayload{
 				Verdict: "cancelled",
 			})
-		return false, ctx.Err()
+		return ApprovalResult{}, ctx.Err()
 	}
 }
 

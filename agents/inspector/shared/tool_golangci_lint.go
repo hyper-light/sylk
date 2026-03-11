@@ -27,7 +27,7 @@ type golangciLintPos struct {
 // RunGolangCILint runs golangci-lint with JSON output and parses the results.
 func RunGolangCILint(ctx context.Context, runner *ToolRunner, paths []string) []ValidationIssue {
 	if !runner.Available("golangci-lint") {
-		return nil
+		return unavailableToolIssues("golangci-lint")
 	}
 
 	args := []string{"run", "--out-format", "json"}
@@ -35,12 +35,12 @@ func RunGolangCILint(ctx context.Context, runner *ToolRunner, paths []string) []
 
 	result, err := runner.Exec(ctx, "golangci-lint", args...)
 	if err != nil {
-		return nil
+		return executionFailureIssues("golangci-lint", err)
 	}
 
 	var output golangciLintOutput
 	if err := json.Unmarshal(result.Stdout, &output); err != nil {
-		return nil
+		return parseFailureIssues("golangci-lint", err)
 	}
 
 	issues := make([]ValidationIssue, 0, len(output.Issues))

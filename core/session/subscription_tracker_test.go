@@ -27,7 +27,8 @@ func TestNewGlobalSubscriptionTracker(t *testing.T) {
 }
 
 func TestNewGlobalSubscriptionTracker_DefaultPath(t *testing.T) {
-	home := os.Getenv("HOME")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
 	expectedDir := filepath.Join(home, ".sylk", "shared")
 
 	os.RemoveAll(expectedDir)

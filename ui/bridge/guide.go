@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/redact"
@@ -124,6 +125,10 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 	if busMsg == nil {
 		return
 	}
+	if proposal, ok := decodeCommandApprovalProposal(busMsg); ok {
+		program.Send(msg.CommandApprovalRequestMsg{Proposal: proposal})
+		return
+	}
 	if resp, ok := busMsg.GetRouteResponse(); ok {
 		program.Send(toGuideMsg(resp))
 		return
@@ -139,6 +144,31 @@ func (b *GuideBridge) dispatch(busMsg *guide.Message, program TeaProgram) {
 			Err:           guideError(redact.Text(errText)),
 		})
 	}
+}
+
+func decodeCommandApprovalProposal(busMsg *guide.Message) (*commandapproval.Proposal, bool) {
+	if busMsg == nil || busMsg.Type != guide.MessageTypeProposal || busMsg.Payload == nil {
+		return nil, false
+	}
+	if typed, ok := busMsg.Payload.(*commandapproval.Proposal); ok && typed != nil {
+		return typed, true
+	}
+	if typed, ok := busMsg.Payload.(commandapproval.Proposal); ok {
+		proposal := typed
+		return &proposal, true
+	}
+	raw, err := json.Marshal(busMsg.Payload)
+	if err != nil {
+		return nil, false
+	}
+	var proposal commandapproval.Proposal
+	if err := json.Unmarshal(raw, &proposal); err != nil {
+		return nil, false
+	}
+	if strings.TrimSpace(proposal.CorrelationID) == "" || strings.TrimSpace(proposal.Command) == "" {
+		return nil, false
+	}
+	return &proposal, true
 }
 
 // dispatchStream converts a StreamResponse into the matching stream tea message.

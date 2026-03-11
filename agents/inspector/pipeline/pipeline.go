@@ -16,10 +16,12 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -48,7 +50,8 @@ type PipelineInspector struct {
 	pipelineName string
 
 	// Tool runner for external analysis tools.
-	toolRunner *shared.ToolRunner
+	toolRunner      *shared.ToolRunner
+	executionBroker purevfs.ExecutionBroker
 
 	// Skills.
 	skills        *skills.Registry
@@ -114,7 +117,6 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 		config:            cfg,
 		logger:            slog.Default().With("agent", "inspector-pipeline"),
 		provider:          provider,
-		toolRunner:        shared.NewToolRunner(".", cfg.DefaultTimeout, slog.Default()),
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingBus:        make(map[string]chan *guide.Message),
 		criteria:          make(map[string]*shared.InspectorCriteria),
@@ -122,7 +124,19 @@ func New(cfg shared.PipelineInspectorConfig, provider providers.ProviderAdapter)
 		results:           make(map[string]*shared.InspectorResult),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
+		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
+	pi.toolRunner = shared.NewToolRunner(shared.ToolRunnerConfig{
+		WorkingDir:    ".",
+		Timeout:       cfg.DefaultTimeout,
+		Logger:        slog.Default(),
+		AgentID:       agentID,
+		AgentType:     "inspector-pipeline",
+		SessionID:     func() string { return pi.config.SessionID },
+		FileAccess:    func() versioning.FileAccess { return pi.fileAccess },
+		Broker:        func() purevfs.ExecutionBroker { return pi.executionBroker },
+		RequireBroker: true,
+	})
 
 	pi.steering.InitLazy("inspector-pipeline", nil)
 
@@ -528,6 +542,12 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 
 	reqCtx, cancel := context.WithCancel(pi.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = agentShared.WithGuardianCommandGate(reqCtx, agentShared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return pi.bus },
+		SourceAgentID:   func() string { return pi.id },
+		SourceAgentType: "inspector-pipeline",
+		SourceAgentName: "Inspector",
+	})
 	pi.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
@@ -934,7 +954,16 @@ func (pi *PipelineInspector) publishActivity(eventType events.EventType, content
 
 // --- HandoffInjectable ---
 
-func (pi *PipelineInspector) AgentID() string   { return pi.id }
+func (pi *PipelineInspector) AgentID() string { return pi.id }
+
+// SetCanonicalID overwrites the inspector's internal ID so a replacement
+// instance can assume the original routing identity after handoff.
+func (pi *PipelineInspector) SetCanonicalID(id string) {
+	pi.mu.Lock()
+	defer pi.mu.Unlock()
+	pi.id = id
+}
+
 func (pi *PipelineInspector) AgentType() string { return "inspector-pipeline" }
 
 func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
@@ -951,9 +980,15 @@ func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
 
 func (pi *PipelineInspector) InjectPreparedContext(_ *handoff.PreparedContext) error { return nil }
 func (pi *PipelineInspector) Terminate(_ context.Context) error                      { return pi.Stop() }
-func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess)                 { pi.fileAccess = fa }
+func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess) {
+	pi.fileAccess = authority.RestrictFileAccess("inspector-pipeline", fa)
+}
 func (pi *PipelineInspector) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
-	pi.workspaceViews = views
+	pi.workspaceViews = authority.RestrictWorkspaceViews("inspector-pipeline", views)
+}
+
+func (pi *PipelineInspector) SetExecutionBroker(broker purevfs.ExecutionBroker) {
+	pi.executionBroker = broker
 }
 
 // SetAgentPod injects the agent pod for Scribe feed integration.

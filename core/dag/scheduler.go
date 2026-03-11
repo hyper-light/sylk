@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 )
@@ -181,7 +182,32 @@ func (s *Scheduler) registerExecution(dag *DAG, executor *Executor) {
 func (s *Scheduler) runExecution(ctx context.Context, dag *DAG, dispatcher NodeDispatcher, executor *Executor) {
 	defer s.releaseDAGSlot()
 
+	s.emitEvent(&Event{
+		Type:      EventExecutionRunStarted,
+		DAGID:     dag.ID(),
+		Timestamp: time.Now(),
+		Data: map[string]any{
+			"nodes_total": dag.NodeCount(),
+		},
+	})
+
 	result, err := executor.Execute(ctx, dag, dispatcher)
+	finishData := map[string]any{}
+	if result != nil {
+		finishData["state"] = result.State.String()
+		finishData["nodes_succeeded"] = result.NodesSucceeded
+		finishData["nodes_failed"] = result.NodesFailed
+		finishData["nodes_skipped"] = result.NodesSkipped
+	}
+	if err != nil {
+		finishData["error"] = err.Error()
+	}
+	s.emitEvent(&Event{
+		Type:      EventExecutionRunFinished,
+		DAGID:     dag.ID(),
+		Timestamp: time.Now(),
+		Data:      finishData,
+	})
 	s.updateExecutionStatus(dag, result)
 	s.emitExecutionFailure(dag, result, err)
 }

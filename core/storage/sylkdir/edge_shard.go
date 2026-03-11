@@ -528,11 +528,11 @@ func (s *EdgeShardStore) writeNodeIndex(path string, index map[uint32][]int64, s
 	}
 
 	tmpFile := path + ".tmp"
-	if err := os.WriteFile(tmpFile, buf, 0644); err != nil {
+	if err := writeFileSync(tmpFile, buf, 0o644); err != nil {
 		return fmt.Errorf("sylkdir: failed to write index: %w", err)
 	}
 
-	if err := os.Rename(tmpFile, path); err != nil {
+	if err := durableRename(tmpFile, path); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("sylkdir: failed to rename index: %w", err)
 	}

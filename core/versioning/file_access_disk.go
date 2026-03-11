@@ -29,6 +29,13 @@ func (d *DiskFileAccess) ReadFile(_ context.Context, path string) ([]byte, error
 	return os.ReadFile(d.resolve(path))
 }
 
+func (d *DiskFileAccess) MkdirAll(_ context.Context, path string) error {
+	if d.readOnly {
+		return fmt.Errorf("disk file access is read-only")
+	}
+	return os.MkdirAll(d.resolve(path), 0755)
+}
+
 func (d *DiskFileAccess) WriteFile(_ context.Context, path string, content []byte) error {
 	if d.readOnly {
 		return fmt.Errorf("disk file access is read-only")

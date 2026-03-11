@@ -2,6 +2,8 @@ module github.com/adalundhe/sylk
 
 go 1.25.0
 
+replace github.com/charmbracelet/bubbletea => ./third_party/bubbletea
+
 require (
 	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/arnodel/golua v0.1.2
@@ -45,6 +47,7 @@ require (
 )
 
 require (
+	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5 // indirect
 	cloud.google.com/go v0.116.0 // indirect
 	cloud.google.com/go/auth v0.9.3 // indirect
 	cloud.google.com/go/compute/metadata v0.5.0 // indirect
@@ -120,6 +123,7 @@ require (
 	github.com/viterin/partial v1.1.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+	github.com/winfsp/cgofuse v1.6.0 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect

@@ -23,6 +23,10 @@ func (g *guardedFallbackFileAccess) ReadFile(ctx context.Context, path string) (
 	return g.fallback.ReadFile(ctx, path)
 }
 
+func (g *guardedFallbackFileAccess) MkdirAll(context.Context, string) error {
+	return ErrNoActiveSessionVFS
+}
+
 func (g *guardedFallbackFileAccess) WriteFile(context.Context, string, []byte) error {
 	return ErrNoActiveSessionVFS
 }

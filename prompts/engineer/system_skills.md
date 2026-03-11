@@ -22,7 +22,7 @@
 - `coord_watch_updates` — Wait for coordination changes from peers
 
 ### Execution & Reporting (Priority 80–70)
-- `run_command` — Execute approved shell commands
+- `run_command` — Execute shell commands, escalating unapproved ones through Guardian approval
 - `report_confidence` — Report confidence assessment for escalation
 - `discover_project_tools` — Scan for build tools and frameworks
 - `signal_orchestrator` — Signal progress, questions, or blocks

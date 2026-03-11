@@ -9,7 +9,7 @@ import (
 // RunMemoryAnalyzer runs go build with escape analysis flags and parses output.
 func RunMemoryAnalyzer(ctx context.Context, runner *ToolRunner, paths []string) []ValidationIssue {
 	if !runner.Available("go") {
-		return nil
+		return unavailableToolIssues("go")
 	}
 
 	args := []string{"build", "-gcflags=-m -m"}
@@ -17,7 +17,7 @@ func RunMemoryAnalyzer(ctx context.Context, runner *ToolRunner, paths []string) 
 
 	result, err := runner.Exec(ctx, "go", args...)
 	if err != nil {
-		return nil
+		return executionFailureIssues("escape-analysis", err)
 	}
 
 	return parseEscapeAnalysis(string(result.Stderr))

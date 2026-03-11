@@ -2,6 +2,7 @@ package versioning
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -14,15 +15,20 @@ import (
 type SessionVFS struct {
 	mu sync.Mutex
 
-	sessionID   SessionID
-	workingDir  string
-	globalVFS   *PipelineVFS
-	mergePipe   *MergePipe
-	wal         SemanticWAL
-	diskFlusher *DiskFlusher
-	vfsManager  VFSManager
-	otEngine    OTEngine
-	draftMu     *sync.Mutex
+	sessionID           SessionID
+	workingDir          string
+	snapshotFS          vfsMutableBaseFS
+	baseFS              vfsBaseFS
+	baseImage           *workspaceImageHandle
+	globalVFS           *PipelineVFS
+	mergePipe           *MergePipe
+	wal                 SemanticWAL
+	diskFlusher         *DiskFlusher
+	vfsManager          VFSManager
+	otEngine            OTEngine
+	draftMu             *sync.Mutex
+	persistSessionState bool
+	allowDiskExport     bool
 
 	// Legacy CVS shim for backward compatibility during transition.
 	cvsShim *CVSShim
@@ -70,9 +76,12 @@ type sessionPipeline struct {
 
 // SessionVFSConfig configures the per-session VFS infrastructure.
 type SessionVFSConfig struct {
-	SessionID   SessionID
-	WorkingDir  string
-	StorageRoot string
+	SessionID              SessionID
+	WorkingDir             string
+	StorageRoot            string
+	PersistSessionState    bool
+	AllowDiskExport        bool
+	WorkspaceImageMaxBytes int64
 }
 
 // NewSessionVFS creates an isolated set of versioning subsystems for a session.
@@ -83,6 +92,10 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 		return nil, err
 	}
 	draftMu := &sync.Mutex{}
+	baseFS, snapshotFS, baseImage, err := sessionBaseFS(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	// Create global VFS overlay (no version/blob store needed).
 	globalVFS := NewGlobalVFS(VFSConfig{
@@ -90,6 +103,7 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 		SessionID:  cfg.SessionID,
 		WorkingDir: cfg.WorkingDir,
 	})
+	globalVFS.SetBaseFS(baseFS)
 
 	// Create MergePipe wired to global VFS + WAL + OT.
 	mp := NewMergePipe(MergePipeConfig{
@@ -101,10 +115,12 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 
 	// Create DiskFlusher wired to global VFS + WAL.
 	df := NewDiskFlusher(DiskFlusherConfig{
-		GlobalVFS:  globalVFS,
-		WAL:        vwal,
-		WorkingDir: cfg.WorkingDir,
-		DraftMu:    draftMu,
+		GlobalVFS:       globalVFS,
+		WAL:             vwal,
+		SnapshotFS:      snapshotFS,
+		WorkingDir:      cfg.WorkingDir,
+		DraftMu:         draftMu,
+		AllowDiskExport: cfg.AllowDiskExport,
 	})
 
 	// Legacy stores for CVS shim backward compatibility.
@@ -134,25 +150,43 @@ func NewSessionVFS(cfg SessionVFSConfig) (*SessionVFS, error) {
 	})
 
 	s := &SessionVFS{
-		sessionID:   cfg.SessionID,
-		workingDir:  cfg.WorkingDir,
-		globalVFS:   globalVFS,
-		mergePipe:   mp,
-		wal:         vwal,
-		diskFlusher: df,
-		vfsManager:  vfsMgr,
-		otEngine:    otEngine,
-		draftMu:     draftMu,
-		cvs:         cvs,
-		blobStore:   blobStore,
-		dagStore:    dagStore,
-		opLog:       opLog,
-		oldWAL:      oldWAL,
-		pipelines:   make(map[string]*sessionPipeline),
+		sessionID:           cfg.SessionID,
+		workingDir:          cfg.WorkingDir,
+		snapshotFS:          snapshotFS,
+		baseFS:              baseFS,
+		baseImage:           baseImage,
+		globalVFS:           globalVFS,
+		mergePipe:           mp,
+		wal:                 vwal,
+		diskFlusher:         df,
+		vfsManager:          vfsMgr,
+		otEngine:            otEngine,
+		draftMu:             draftMu,
+		persistSessionState: cfg.PersistSessionState,
+		allowDiskExport:     cfg.AllowDiskExport,
+		cvs:                 cvs,
+		blobStore:           blobStore,
+		dagStore:            dagStore,
+		opLog:               opLog,
+		oldWAL:              oldWAL,
+		pipelines:           make(map[string]*sessionPipeline),
 	}
 
 	s.cvsShim = NewCVSShim(s)
+	if err := s.replayDraftFromWAL(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+func sessionBaseFS(cfg SessionVFSConfig) (vfsBaseFS, vfsMutableBaseFS, *workspaceImageHandle, error) {
+	baseImage, err := acquireWorkspaceImage(cfg)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("session vfs: acquire workspace image: %w", err)
+	}
+	baseFS := newWorkspaceImageFS(baseImage)
+	return baseFS, baseFS, baseImage, nil
 }
 
 // BeginPipeline creates a new pipeline VFS and registers it with the MergePipe.
@@ -187,12 +221,9 @@ func (s *SessionVFS) BeginPipeline(cfg BeginPipelineConfig) (*PipelineVFS, error
 	pipelineVFS.SetBaseReader(func(path string) ([]byte, error) {
 		return s.globalVFS.Read(context.Background(), path)
 	})
+	pipelineVFS.SetBaseFS(pipelineOverlayBaseFS{vfs: s.globalVFS})
 	for _, path := range vfsCfg.AllowedPaths {
 		pipelineVFS.RegisterVisiblePath(path)
-		content, readErr := s.globalVFS.Read(context.Background(), path)
-		if readErr == nil {
-			pipelineVFS.SeedFile(path, content)
-		}
 	}
 
 	baseVersion := s.wal.CurrentVersion()
@@ -357,6 +388,9 @@ func (s *SessionVFS) SessionID() SessionID { return s.sessionID }
 
 // NewDiskFileAccess creates a DiskFileAccess for agents that bypass VFS.
 func (s *SessionVFS) NewDiskFileAccess(readOnly bool) FileAccess {
+	if s.baseFS != nil {
+		return NewBaseFSFileAccess(s.baseFS, s.workingDir)
+	}
 	return NewDiskFileAccess(s.workingDir, readOnly)
 }
 
@@ -405,6 +439,10 @@ func (s *SessionVFS) Close() error {
 	if err := s.globalVFS.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if s.baseImage != nil {
+		s.baseImage.Release()
+		s.baseImage = nil
+	}
 	// Close legacy CVS.
 	if s.cvs != nil {
 		if err := s.cvs.Close(); err != nil && firstErr == nil {
@@ -445,6 +483,37 @@ func (s *SessionVFS) ReadOnlyPipelineFileAccess(pipelineID string) (FileAccess, 
 		return nil, ErrVFSNotFound
 	}
 	return s.NewReadOnlyPipelineFileAccess(pipe.VFS), nil
+}
+
+func (s *SessionVFS) replayDraftFromWAL() error {
+	checkpoint, ok := s.wal.LatestCheckpoint()
+	base := VersionZero
+	if ok {
+		base = checkpoint
+	}
+	entries, err := s.wal.GetDeltasSince(base)
+	if err != nil {
+		return fmt.Errorf("session vfs: replay WAL: %w", err)
+	}
+	for _, entry := range entries {
+		for _, delta := range entry.Deltas {
+			switch delta.Op {
+			case WALDeltaOpCreate, WALDeltaOpModify:
+				if err := s.globalVFS.Write(context.Background(), delta.Path, delta.NewContent); err != nil {
+					return fmt.Errorf("session vfs: replay write %s: %w", delta.Path, err)
+				}
+			case WALDeltaOpDelete:
+				if err := s.globalVFS.Delete(context.Background(), delta.Path); err != nil && !errors.Is(err, ErrFileNotFound) {
+					return fmt.Errorf("session vfs: replay delete %s: %w", delta.Path, err)
+				}
+			case WALDeltaOpMkdir:
+				if err := s.globalVFS.MkdirAll(context.Background(), delta.Path); err != nil && !errors.Is(err, ErrFileExists) {
+					return fmt.Errorf("session vfs: replay mkdir %s: %w", delta.Path, err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func normalizeAllowedPaths(workingDir string, files []string) []string {

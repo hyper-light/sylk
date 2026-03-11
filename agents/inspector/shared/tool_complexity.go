@@ -30,24 +30,32 @@ func RunComplexity(ctx context.Context, runner *ToolRunner, paths []string, maxC
 	if runner.Available("gocyclo") {
 		args := append([]string{"-over", strconv.Itoa(maxCyclomatic)}, paths...)
 		result, err := runner.Exec(ctx, "gocyclo", args...)
-		if err == nil {
+		if err != nil {
+			issues = append(issues, executionFailureIssues("gocyclo", err)...)
+		} else {
 			for _, issue := range parseComplexityOutput(result.Stdout, "cyclomatic", maxCyclomatic, idx) {
 				issues = append(issues, issue)
 				idx++
 			}
 		}
+	} else {
+		issues = append(issues, unavailableToolIssues("gocyclo")...)
 	}
 
 	// Cognitive complexity
 	if runner.Available("gocognit") {
 		args := append([]string{"-over", strconv.Itoa(maxCognitive)}, paths...)
 		result, err := runner.Exec(ctx, "gocognit", args...)
-		if err == nil {
+		if err != nil {
+			issues = append(issues, executionFailureIssues("gocognit", err)...)
+		} else {
 			for _, issue := range parseComplexityOutput(result.Stdout, "cognitive", maxCognitive, idx) {
 				issues = append(issues, issue)
 				idx++
 			}
 		}
+	} else {
+		issues = append(issues, unavailableToolIssues("gocognit")...)
 	}
 
 	return DeduplicateIssues(issues)

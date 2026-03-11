@@ -22,7 +22,7 @@ func guardianAllSkillNames() []string {
 }
 
 func guardianToolManifest() *toolruntime.PolicyManifest {
-	return toolruntime.NewManifest("guardian", "guardian.control",
+	return toolruntime.ApplyAuthorityProfile("guardian", toolruntime.NewManifest("guardian", "guardian.control",
 		toolruntime.NewToolPolicy("git_safety", toolruntime.EffectReadOnly, toolruntime.DomainGit, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("rollback", toolruntime.EffectMutating, toolruntime.DomainGit, toolruntime.ExecutionModeLocalWorker, toolruntime.WithApprovalSensitive()),
 		toolruntime.NewToolPolicy("content_scan", toolruntime.EffectReadOnly, toolruntime.DomainValidation, toolruntime.ExecutionModeLocal),
@@ -50,7 +50,7 @@ func guardianToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("reroute_request", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
-	)
+	))
 }
 
 func filterSyntheticGuardianRuntimeTools(names []string) []string {

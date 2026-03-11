@@ -17,10 +17,12 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -85,8 +87,9 @@ type PipelineTester struct {
 	// Agent pod for cross-agent coordination (Scribe feed, etc.).
 	agentPod *agentshared.AgentPod
 
-	fileAccess     versioning.FileAccess
-	workspaceViews versioning.WorkspaceViewAccess
+	fileAccess      versioning.FileAccess
+	workspaceViews  versioning.WorkspaceViewAccess
+	executionBroker purevfs.ExecutionBroker
 
 	// Request lifecycle.
 	runCtx    context.Context
@@ -119,6 +122,7 @@ func New(cfg shared.PipelineTesterConfig, provider pipelineTesterProvider) (*Pip
 		diagEngine:        shared.NewDiagnosisEngine(),
 		steering:          agentshared.NewSteeringManager(),
 		requestSerializer: agentshared.NewRequestSerializer(),
+		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
 
 	pt.steering.InitLazy("tester-pipeline", nil)
@@ -172,6 +176,10 @@ func (pt *PipelineTester) initSkills() error {
 }
 
 func (pt *PipelineTester) registerCoreSkills() {
+	pt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
+	pt.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
+	pt.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
+	pt.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
 	pt.skills.Register(checkInspectorGateSkill(pt))
 	pt.skills.Register(detectTestHarnessSkill(pt))
 	pt.skills.Register(prepareTestHarnessSkill(pt))
@@ -502,6 +510,12 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 	reqCtx, cancel := context.WithCancel(pt.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = agentshared.WithGuardianCommandGate(reqCtx, agentshared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return pt.bus },
+		SourceAgentID:   func() string { return pt.id },
+		SourceAgentType: "tester-pipeline",
+		SourceAgentName: "Tester",
+	})
 	pt.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer cancel()
 
@@ -732,6 +746,14 @@ func (pt *PipelineTester) publishActivity(eventType events.EventType, content st
 // AgentID returns the unique identifier.
 func (pt *PipelineTester) AgentID() string { return pt.id }
 
+// SetCanonicalID overwrites the tester's internal ID so a replacement
+// instance can assume the original routing identity after handoff.
+func (pt *PipelineTester) SetCanonicalID(id string) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.id = id
+}
+
 // AgentType returns the type classification.
 func (pt *PipelineTester) AgentType() string { return "tester-pipeline" }
 
@@ -763,11 +785,18 @@ func (pt *PipelineTester) Terminate(_ context.Context) error {
 }
 
 // SetFileAccess assigns the per-pipeline file access layer.
-func (pt *PipelineTester) SetFileAccess(fa versioning.FileAccess) { pt.fileAccess = fa }
+func (pt *PipelineTester) SetFileAccess(fa versioning.FileAccess) {
+	pt.fileAccess = authority.RestrictFileAccess("tester-pipeline", fa)
+}
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (pt *PipelineTester) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
-	pt.workspaceViews = views
+	pt.workspaceViews = authority.RestrictWorkspaceViews("tester-pipeline", views)
+}
+
+// SetExecutionBroker overrides the strict execution broker.
+func (pt *PipelineTester) SetExecutionBroker(broker purevfs.ExecutionBroker) {
+	pt.executionBroker = broker
 }
 
 // SetHandoffBridge assigns the handoff bridge.

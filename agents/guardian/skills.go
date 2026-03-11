@@ -37,6 +37,7 @@ func (g *Guardian) registerCoreSkills() {
 	g.skills.Register(usageBreakdownSkill(g))
 	g.skills.Register(quarantineStatusSkill(g))
 	g.skills.Register(toolExecutionControlSkill(g))
+	g.skills.Register(commandExecutionControlSkill(g))
 	g.skills.Register(shared.NewSelfDiagnosticSkill(&guardianDiag{g: g}))
 	g.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "guardian",

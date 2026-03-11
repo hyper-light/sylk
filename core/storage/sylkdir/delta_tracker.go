@@ -115,10 +115,10 @@ func (d *DeltaTracker) Persist() error {
 	}
 
 	tmpPath := d.path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	if err := writeFileSync(tmpPath, data, 0o644); err != nil {
 		return fmt.Errorf("delta tracker: write: %w", err)
 	}
-	return os.Rename(tmpPath, d.path)
+	return durableRename(tmpPath, d.path)
 }
 
 // Load reads a persisted snapshot from disk and restores counters.

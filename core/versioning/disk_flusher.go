@@ -2,11 +2,14 @@ package versioning
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 )
+
+var ErrDiskExportDisabled = errors.New("disk export is disabled for this session")
 
 // FlushResult summarizes the outcome of flushing the global VFS to disk.
 type FlushResult struct {
@@ -18,28 +21,34 @@ type FlushResult struct {
 
 // DiskFlusherConfig configures a DiskFlusher.
 type DiskFlusherConfig struct {
-	GlobalVFS  *PipelineVFS
-	WAL        SemanticWAL
-	WorkingDir string
-	DraftMu    *sync.Mutex
+	GlobalVFS       *PipelineVFS
+	WAL             SemanticWAL
+	SnapshotFS      vfsMutableBaseFS
+	WorkingDir      string
+	DraftMu         *sync.Mutex
+	AllowDiskExport bool
 }
 
 // DiskFlusher writes global VFS overlay changes to disk and creates
 // WAL checkpoint entries (major version bumps).
 type DiskFlusher struct {
-	globalVFS  *PipelineVFS
-	wal        SemanticWAL
-	workingDir string
-	draftMu    *sync.Mutex
+	globalVFS       *PipelineVFS
+	wal             SemanticWAL
+	snapshotFS      vfsMutableBaseFS
+	workingDir      string
+	draftMu         *sync.Mutex
+	allowDiskExport bool
 }
 
 // NewDiskFlusher creates a new DiskFlusher.
 func NewDiskFlusher(cfg DiskFlusherConfig) *DiskFlusher {
 	return &DiskFlusher{
-		globalVFS:  cfg.GlobalVFS,
-		wal:        cfg.WAL,
-		workingDir: cfg.WorkingDir,
-		draftMu:    cfg.DraftMu,
+		globalVFS:       cfg.GlobalVFS,
+		wal:             cfg.WAL,
+		snapshotFS:      cfg.SnapshotFS,
+		workingDir:      cfg.WorkingDir,
+		draftMu:         cfg.DraftMu,
+		allowDiskExport: cfg.AllowDiskExport,
 	}
 }
 
@@ -51,6 +60,9 @@ func (df *DiskFlusher) PendingChanges() []FileModification {
 // Flush writes all pending changes from the global VFS to disk,
 // creates a WAL checkpoint (major version bump), and clears the overlay.
 func (df *DiskFlusher) Flush(ctx context.Context) (*FlushResult, error) {
+	if !df.allowDiskExport {
+		return nil, ErrDiskExportDisabled
+	}
 	if df.draftMu != nil {
 		df.draftMu.Lock()
 		defer df.draftMu.Unlock()
@@ -83,6 +95,11 @@ func (df *DiskFlusher) Flush(ctx context.Context) (*FlushResult, error) {
 		return result, fmt.Errorf("disk flusher: checkpoint: %w", err)
 	}
 	result.Version = ver
+	if df.snapshotFS != nil {
+		if err := df.snapshotFS.ApplyModifications(mods); err != nil {
+			return result, fmt.Errorf("disk flusher: advance RAM base: %w", err)
+		}
+	}
 
 	df.globalVFS.ResetOverlay()
 	return result, nil
@@ -115,7 +132,7 @@ func (df *DiskFlusher) buildFlushPlans(ctx context.Context, mods []FileModificat
 			existed:    existed,
 		}
 
-		if mod.Operation != FileOpDelete {
+		if mod.Operation != FileOpDelete && mod.Operation != FileOpMkdir {
 			tempPath, err := df.stageTempFile(resolved, mod.NewContent)
 			if err != nil {
 				return nil, nil, err
@@ -154,6 +171,10 @@ func (df *DiskFlusher) applyFlushPlan(plan *flushPlan, result *FlushResult) erro
 			return err
 		}
 		result.FilesDeleted++
+	case FileOpMkdir:
+		if err := df.mkdirOnDisk(plan.resolved); err != nil {
+			return err
+		}
 	default:
 		if err := df.commitTempFile(plan.tempPath, plan.resolved); err != nil {
 			return err
@@ -173,9 +194,16 @@ func (df *DiskFlusher) rollbackFlushPlans(plans []flushPlan) error {
 			continue
 		}
 		var err error
-		if plan.existed {
+		switch {
+		case plan.mod.Operation == FileOpMkdir:
+			if plan.existed {
+				err = nil
+			} else {
+				err = df.deleteEmptyDir(plan.resolved)
+			}
+		case plan.existed:
 			err = df.writeToDisk(plan.resolved, plan.oldContent)
-		} else {
+		default:
 			err = df.deleteFromDisk(plan.resolved)
 		}
 		if err != nil && firstErr == nil {
@@ -230,6 +258,9 @@ func (df *DiskFlusher) commitTempFile(tempPath, resolved string) error {
 // Major version targets: reverse deltas in both disk and global VFS.
 // Minor version targets: reverse deltas in global VFS overlay only.
 func (df *DiskFlusher) RollbackToVersion(ctx context.Context, target SemanticVersion) error {
+	if !df.allowDiskExport {
+		return ErrDiskExportDisabled
+	}
 	current := df.wal.CurrentVersion()
 	if target.Compare(current) >= 0 {
 		return nil
@@ -293,6 +324,10 @@ func (df *DiskFlusher) applyInverseDelta(ctx context.Context, d WALFileDelta, to
 		if toDisk {
 			return df.writeToDisk(df.resolve(d.Path), d.OldContent)
 		}
+	case WALDeltaOpMkdir:
+		if toDisk {
+			return df.deleteEmptyDir(df.resolve(d.Path))
+		}
 	}
 	return nil
 }
@@ -319,10 +354,25 @@ func (df *DiskFlusher) writeToDisk(resolved string, content []byte) error {
 	return os.WriteFile(resolved, content, 0644)
 }
 
+func (df *DiskFlusher) mkdirOnDisk(resolved string) error {
+	if err := os.MkdirAll(resolved, 0755); err != nil {
+		return fmt.Errorf("disk flusher: mkdir dir: %w", err)
+	}
+	return nil
+}
+
 func (df *DiskFlusher) deleteFromDisk(resolved string) error {
 	err := os.Remove(resolved)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("disk flusher: remove: %w", err)
+	}
+	return nil
+}
+
+func (df *DiskFlusher) deleteEmptyDir(resolved string) error {
+	err := os.Remove(resolved)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("disk flusher: remove dir: %w", err)
 	}
 	return nil
 }

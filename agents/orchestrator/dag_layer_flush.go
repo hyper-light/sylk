@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func (b *DAGBridge) flushLayerDraftToDisk(ctx context.Context, dagID string, layerIdx int) error {
@@ -27,7 +28,10 @@ func (b *DAGBridge) flushLayerDraftToDisk(ctx context.Context, dagID string, lay
 		return nil
 	}
 
-	result, err := svfs.DiskFlusher().Flush(ctx)
+	result, err := versioning.PromoteSessionDraft(ctx, svfs, versioning.PromotionRequest{
+		Mode:   versioning.PromotionModeDeterministic,
+		Reason: "dag-layer-flush",
+	})
 	if err != nil {
 		b.publishActivity(events.EventTypeAgentError,
 			fmt.Sprintf("Failed to commit DAG layer %d draft changes: %v", layerIdx, err))

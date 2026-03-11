@@ -15,12 +15,12 @@ import (
 
 // CommitConfig holds the dependencies required to commit a session to global.
 type CommitConfig struct {
-	Session  *Session
-	SylkDir  *SylkDir // Required for version directory creation
-	GlobalMeta *GlobalMeta
-	CanonicalIndex *CanonicalKeyIndex
+	Session          *Session
+	SylkDir          *SylkDir // Required for version directory creation
+	GlobalMeta       *GlobalMeta
+	CanonicalIndex   *CanonicalKeyIndex
 	GlobalBleveStore *GlobalVersionBleveStore // nil means skip Bleve indexing
-	CommitWAL *CommitWAL // nil means skip commit WAL bracketing
+	CommitWAL        *CommitWAL               // nil means skip commit WAL bracketing
 
 	// Vectors are collected but not written to IVF here.
 	// IVF integration is Phase 5.
@@ -51,6 +51,7 @@ type CommitConfig struct {
 // CommitResult describes what the commit produced.
 type CommitResult struct {
 	SessionID        uint32
+	CommitID         string
 	PreCommitVersion SemanticVersion // Session version after minor bump
 	GlobalVersion    SemanticVersion // Global version after major bump
 
@@ -128,7 +129,10 @@ func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error
 
 	// ── Step 0: Calculate version + WAL bracket begin ───────────────────
 	oldHead := cfg.GlobalMeta.GetHead()
-	newVersion := oldHead.BumpMajor()
+	newVersion, err := cfg.GlobalMeta.AllocateGlobalVersion()
+	if err != nil {
+		return nil, fmt.Errorf("sylkdir: allocate global version: %w", err)
+	}
 
 	if err := logCommitBegin(cfg.CommitWAL, sess.Meta.ID, newVersion); err != nil {
 		return nil, err
@@ -153,10 +157,10 @@ func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error
 	// When Pending* fields are non-nil (PendingMode), entities are already
 	// in memory from writeEntities — no disk read needed.
 	var (
-		nodes    []*Node
-		edges    []*Edge
-		docs     []*VersionDocument
-		vectors  []*VersionVector
+		nodes     []*Node
+		edges     []*Edge
+		docs      []*VersionDocument
+		vectors   []*VersionVector
 		chunkRefs []*ChunkRef
 	)
 	collectG, _ := errgroup.WithContext(ctx)
@@ -332,7 +336,45 @@ func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error
 		return nil, fmt.Errorf("sylkdir: commit parallel: %w", err)
 	}
 
-	// After both paths complete: finalize Bleve.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// ── Step 6: Publish global commit atomically ───────────────────────
+	deadCount := tb.Count()
+
+	// TotalNodes and TotalVectors are derived from the offset index count,
+	// which reflects the true global total (inherited parent + session data).
+	// TotalEdges and TotalDocs are session-only counts; the inherited
+	// per-version files are not re-scanned (acceptable for non-critical stats).
+	gv := GlobalVersion{
+		ID:         newVersion,
+		ParentID:   oldHead,
+		SessionID:  sess.Meta.ID,
+		SessionVer: preCommitVer,
+		CreatedAt:  time.Now().UTC(),
+		Stats: GlobalVersionStats{
+			TotalNodes:     globalNodeStore.CountForVersion(newVersion),
+			TotalEdges:     uint32(len(edges)),
+			TotalVectors:   globalVectorStore.CountForVersion(newVersion),
+			TotalDocs:      uint32(len(docs)),
+			TombstoneCount: deadCount,
+		},
+	}
+	commitID, err := cfg.GlobalMeta.PublishCommit(gv, sess.Meta.ID, preCommitVer)
+	if err != nil {
+		return nil, fmt.Errorf("sylkdir: publish global commit: %w", err)
+	}
+
+	// WAL bracket end — commit is now durable.
+	if err := logCommitEnd(cfg.CommitWAL, sess.Meta.ID, newVersion); err != nil {
+		return nil, err
+	}
+	if err := cfg.CanonicalIndex.Save(); err != nil {
+		return nil, fmt.Errorf("sylkdir: save canonical index: %w", err)
+	}
+
+	// After publication: finalize derived Bleve state.
 	if cfg.DeferBleveIndexing {
 		bgIndexer = NewBackgroundIndexer(
 			cfg.GlobalBleveStore,
@@ -354,48 +396,6 @@ func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error
 			DurNs:       time.Since(t).Nanoseconds(),
 			DocsIndexed: docsIndexed,
 		})
-	}
-
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	// ── Step 6: Update manifest + register commit ──────────────────────
-	deadCount := tb.Count()
-
-	// TotalNodes and TotalVectors are derived from the offset index count,
-	// which reflects the true global total (inherited parent + session data).
-	// TotalEdges and TotalDocs are session-only counts; the inherited
-	// per-version files are not re-scanned (acceptable for non-critical stats).
-	gv := GlobalVersion{
-		ID:         newVersion,
-		ParentID:   oldHead,
-		SessionID:  sess.Meta.ID,
-		SessionVer: preCommitVer,
-		CreatedAt:  time.Now().UTC(),
-		Stats: GlobalVersionStats{
-			TotalNodes:     globalNodeStore.CountForVersion(newVersion),
-			TotalEdges:     uint32(len(edges)),
-			TotalVectors:   globalVectorStore.CountForVersion(newVersion),
-			TotalDocs:      uint32(len(docs)),
-			TombstoneCount: deadCount,
-		},
-	}
-	if err := cfg.GlobalMeta.AddVersion(gv); err != nil {
-		return nil, fmt.Errorf("sylkdir: add global version: %w", err)
-	}
-	if err := cfg.GlobalMeta.SetHead(newVersion); err != nil {
-		return nil, fmt.Errorf("sylkdir: set global head: %w", err)
-	}
-
-	// Legacy: also call RegisterCommit for backwards compat with committed_sessions
-	if err := cfg.GlobalMeta.RegisterCommit(sess.Meta.ID, preCommitVer); err != nil {
-		return nil, fmt.Errorf("sylkdir: register commit: %w", err)
-	}
-
-	// WAL bracket end — commit is now durable.
-	if err := logCommitEnd(cfg.CommitWAL, sess.Meta.ID, newVersion); err != nil {
-		return nil, err
 	}
 
 	// ── Step 7: Mark session as committed ──────────────────────────────
@@ -427,6 +427,7 @@ func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error
 
 	return &CommitResult{
 		SessionID:         sess.Meta.ID,
+		CommitID:          commitID,
 		PreCommitVersion:  preCommitVer,
 		GlobalVersion:     newVersion,
 		NodesMerged:       len(nodes),
@@ -441,10 +442,10 @@ func CommitToGlobal(ctx context.Context, cfg CommitConfig) (*CommitResult, error
 		TombstoneRatio:    tb.DeadRatio(uint32(len(nodes))),
 		OrphanedKeys:      orphanedKeys,
 		DeletedFiles:      deletedFiles,
-		Superseded:       storeResult.superseded,
-		StagedVectors:    vectors,
-		StagedDocs:       docs,
-		Duration:         time.Since(start),
+		Superseded:        storeResult.superseded,
+		StagedVectors:     vectors,
+		StagedDocs:        docs,
+		Duration:          time.Since(start),
 	}, nil
 }
 
@@ -797,7 +798,7 @@ func commitTombstoneOrphan(
 		return nil, 0, 0, err
 	}
 	orphanedKeys, deletedFiles := detectOrphans(cfg, nodes, tb, parentTotalNodes)
-	return tb, orphanedKeys, deletedFiles, saveTombstoneAndCanonical(tb, cfg.CanonicalIndex)
+	return tb, orphanedKeys, deletedFiles, saveTombstone(tb)
 }
 
 // loadAndMarkTombstones loads the tombstone bitmap and marks superseded nodes as dead.
@@ -813,12 +814,12 @@ func loadAndMarkTombstones(cfg CommitConfig, newVersion SemanticVersion, updates
 	return tb, nil
 }
 
-// saveTombstoneAndCanonical persists the tombstone bitmap and canonical index to disk.
-func saveTombstoneAndCanonical(tb *TombstoneBitmap, canonIdx *CanonicalKeyIndex) error {
+// saveTombstone persists the tombstone bitmap to disk.
+func saveTombstone(tb *TombstoneBitmap) error {
 	if err := tb.Save(); err != nil {
 		return fmt.Errorf("sylkdir: save tombstone bitmap: %w", err)
 	}
-	return canonIdx.Save()
+	return nil
 }
 
 // closeAndGetSessionBlevePath closes the session Bleve and returns its path.

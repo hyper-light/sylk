@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -19,6 +18,7 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
 	coretest "github.com/adalundhe/sylk/core/test"
@@ -1451,11 +1451,11 @@ func (pt *PipelineTester) executeSuite(ctx context.Context, harness *testHarness
 	}
 }
 
-func (pt *PipelineTester) executionPlan(harness *testHarnessState, workDir string) (purevfs.ExecutionPlan, error) {
+func (pt *PipelineTester) executionPlan(ctx context.Context, harness *testHarnessState, workDir string) (purevfs.ExecutionPlan, error) {
 	overlay, overlayDeletes := overlayState(pt.fileAccess)
-	planner := purevfs.NewExecutionPlanner(nil, purevfs.HostCompatibilityCapabilities())
+	planner := purevfs.NewExecutionPlanner(nil, pt.executionCapabilities(ctx))
 	return planner.Plan(purevfs.ExecutionRequest{
-		Mode:           purevfs.ExecutionModeCompatibility,
+		Mode:           purevfs.ExecutionModeStrictNoDisk,
 		Intent:         purevfs.ExecutionIntentTest,
 		Language:       harness.Language,
 		FrameworkID:    string(harness.FrameworkID),
@@ -1464,6 +1464,39 @@ func (pt *PipelineTester) executionPlan(harness *testHarnessState, workDir strin
 		Overlay:        overlay,
 		OverlayDeletes: overlayDeletes,
 	})
+}
+
+func (pt *PipelineTester) executionCapabilities(ctx context.Context) purevfs.ExecutionCapabilities {
+	if pt.executionBroker == nil {
+		return purevfs.ExecutionCapabilities{}
+	}
+	caps, err := pt.executionBroker.Capabilities(ctx)
+	if err != nil {
+		return purevfs.ExecutionCapabilities{}
+	}
+	return caps
+}
+
+func (pt *PipelineTester) executionWorkspace(allowWrites bool) purevfs.ExecutionFS {
+	if pt.fileAccess == nil {
+		return versioning.NewDiskFileAccess(pt.workingDir(), true)
+	}
+	if allowWrites && testerWorkspaceWritesAllowed(pt.fileAccess) {
+		return pt.fileAccess
+	}
+	return purevfs.ReadOnlyExecutionFS(pt.fileAccess)
+}
+
+func testerWorkspaceWritesAllowed(fa versioning.FileAccess) bool {
+	if fa == nil || fa.IsReadOnly() {
+		return false
+	}
+	switch fa.(type) {
+	case *versioning.DiskFileAccess:
+		return false
+	default:
+		return true
+	}
 }
 
 func overlayState(fa versioning.FileAccess) (bool, bool) {
@@ -1487,18 +1520,13 @@ func overlayState(fa versioning.FileAccess) (bool, bool) {
 
 func (pt *PipelineTester) runGoTestSuite(ctx context.Context, harness *testHarnessState, packages, files, testNames []string, race, verbose bool, timeoutSeconds int) (map[string]any, error) {
 	workDir := pt.workingDir()
-	plan, err := pt.executionPlan(harness, workDir)
+	plan, err := pt.executionPlan(ctx, harness, workDir)
 	if err != nil {
 		return nil, err
 	}
-	cleanup := func() {}
-	if plan.RequiresMaterialize {
-		workDir, cleanup, err = pt.materializeWorkspace(ctx)
-		if err != nil {
-			return nil, err
-		}
+	if plan.RequiresMaterialize || !plan.RequiresBroker {
+		return nil, purevfs.ErrStrictExecutionUnavailable
 	}
-	defer cleanup()
 
 	args := []string{"test", "-json", "-count=1"}
 	if plan.Strategy == purevfs.StrategyGoOverlayManifest {
@@ -1528,6 +1556,17 @@ func (pt *PipelineTester) runGoTestSuite(ctx context.Context, harness *testHarne
 		patterns = []string{"./..."}
 	}
 	args = append(args, patterns...)
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+		Command:       "go " + strings.Join(args, " "),
+		WorkingDir:    workDir,
+		WorkspaceRoot: pt.workingDir(),
+		ToolName:      "go_test",
+		AgentID:       pt.id,
+		AgentType:     "tester-pipeline",
+		SessionID:     versioning.SessionIDFromContext(ctx),
+	}); err != nil {
+		return nil, err
+	}
 
 	cmdCtx := ctx
 	if timeoutSeconds > 0 {
@@ -1536,21 +1575,29 @@ func (pt *PipelineTester) runGoTestSuite(ctx context.Context, harness *testHarne
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(cmdCtx, "go", args...)
-	cmd.Dir = workDir
-	output, err := cmd.CombinedOutput()
+	output := []byte(nil)
+	if pt.executionBroker == nil {
+		return nil, purevfs.ErrStrictExecutionUnavailable
+	}
+	runResult, err := pt.executionBroker.Run(cmdCtx, purevfs.BrokerRunRequest{
+		Plan:      plan,
+		Argv:      append([]string{"go"}, args...),
+		Workspace: pt.executionWorkspace(true),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("go test: %w", err)
+	}
+	output = append(output, runResult.Stdout...)
+	output = append(output, runResult.Stderr...)
 	result := parseGoTestJSON(output)
 	result["command"] = "go " + strings.Join(args, " ")
 	result["execution_strategy"] = plan.Strategy
 	result["execution_mode"] = plan.Mode
-	result["run_dir"] = workDir
+	result["run_dir"] = plan.WorkingDir
 	result["materialized"] = plan.RequiresMaterialize
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			result["exit_code"] = exitErr.ExitCode()
-		} else {
-			return nil, fmt.Errorf("go test: %w", err)
-		}
+	result["truncated"] = runResult.StdoutTruncated || runResult.StderrTruncated
+	if runResult.ExitCode != 0 {
+		result["exit_code"] = runResult.ExitCode
 	}
 	return result, nil
 }
@@ -1609,19 +1656,13 @@ func (pt *PipelineTester) buildGoOverlay(ctx context.Context) (string, func(), e
 
 func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarnessState, packages, files, testNames []string, verbose bool, timeoutSeconds int) (map[string]any, error) {
 	workDir := pt.workingDir()
-	runDir := workDir
-	cleanup := func() {}
-	plan, err := pt.executionPlan(harness, workDir)
+	plan, err := pt.executionPlan(ctx, harness, workDir)
 	if err != nil {
 		return nil, err
 	}
-	if plan.RequiresMaterialize {
-		runDir, cleanup, err = pt.materializeWorkspace(ctx)
-		if err != nil {
-			return nil, err
-		}
+	if plan.RequiresMaterialize || !plan.RequiresBroker {
+		return nil, purevfs.ErrStrictExecutionUnavailable
 	}
-	defer cleanup()
 
 	command := harness.RunCommand
 	if len(files) == 1 && strings.TrimSpace(files[0]) != "" {
@@ -1633,24 +1674,35 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 	if len(args) == 0 {
 		return nil, fmt.Errorf("empty test command")
 	}
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+		Command:       command,
+		WorkingDir:    workDir,
+		WorkspaceRoot: pt.workingDir(),
+		ToolName:      string(harness.FrameworkID),
+		AgentID:       pt.id,
+		AgentType:     "tester-pipeline",
+		SessionID:     versioning.SessionIDFromContext(ctx),
+	}); err != nil {
+		return nil, err
+	}
 	cmdCtx := ctx
 	if timeoutSeconds > 0 {
 		var cancel context.CancelFunc
 		cmdCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(cmdCtx, args[0], args[1:]...)
-	cmd.Dir = runDir
-	output, err := cmd.CombinedOutput()
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			return nil, err
-		}
+	if pt.executionBroker == nil {
+		return nil, purevfs.ErrStrictExecutionUnavailable
 	}
-	passed := exitCode == 0
+	runResult, err := pt.executionBroker.Run(cmdCtx, purevfs.BrokerRunRequest{
+		Plan:      plan,
+		Argv:      args,
+		Workspace: pt.executionWorkspace(true),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", args[0], err)
+	}
+	passed := runResult.ExitCode == 0
 	return map[string]any{
 		"framework":          harness.FrameworkID,
 		"command":            command,
@@ -1660,12 +1712,13 @@ func (pt *PipelineTester) runGenericSuite(ctx context.Context, harness *testHarn
 		"files":              files,
 		"passed":             boolToCount(passed),
 		"failed":             boolToCount(!passed),
-		"output":             string(output),
-		"exit_code":          exitCode,
-		"truncated":          false,
+		"output":             string(runResult.Stdout),
+		"stderr":             string(runResult.Stderr),
+		"exit_code":          runResult.ExitCode,
+		"truncated":          runResult.StdoutTruncated || runResult.StderrTruncated,
 		"verbose":            verbose,
-		"run_dir":            runDir,
-		"materialized":       runDir != workDir,
+		"run_dir":            plan.WorkingDir,
+		"materialized":       plan.RequiresMaterialize,
 	}, nil
 }
 

@@ -29,220 +29,35 @@ import (
 // call" abort and the "exceeded tool-call limit" abort by giving the LLM
 // data-driven signals to synthesize an answer.
 func (l *Librarian) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
-	maxRuns := l.config.MaxToolRuns
-	seen := make(map[shared.ToolCallSignature]int, maxRuns)
-	consecutiveErrors := 0
-	searchLedger := NewSearchLedger()
-
-	p := l.getProvider()
-	if p == nil {
-		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-			shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-				lm.AgentID, lm.SessionID, lm.CorrID, "error",
-				&agentlog.ErrorPayload{Error: "no LLM provider configured"})
-		}
-		return "", fmt.Errorf("librarian: no LLM provider configured")
+	loop := newToolLoopState(l, ctx, req, ledger)
+	provider, err := loop.provider()
+	if err != nil {
+		return "", err
 	}
+	loop.logStart()
 
-	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-		shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationStarted,
-			lm.AgentID, lm.SessionID, lm.CorrID, "info",
-			&agentlog.GenerationPayload{Phase: "started"})
-	}
-
-	for turn := 0; turn <= maxRuns; turn++ {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-
-		// ── STEERING CHECKPOINT ──
-		sc := shared.DrainAndCheckpoint(ledger, req, turn, "searching", nil)
-		if sc.Rollback != nil || sc.EditReplay != nil {
-			cp := sc.Rollback
-			if cp == nil {
-				cp = sc.EditReplay
-			}
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				action := "rollback"
-				if sc.EditReplay != nil {
-					action = "edit_replay"
-				}
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventSteeringCheckpoint,
-					lm.AgentID, lm.SessionID, lm.CorrID, "info",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("%s at turn %d", action, cp.Turn)})
-			}
-			req.Messages = req.Messages[:cp.MessageCount]
-			if sc.EditReplay != nil {
-				req.Messages = append(req.Messages, providers.Message{Role: providers.RoleUser, Content: sc.EditText})
-			}
-			turn = cp.Turn
-			seen = make(map[shared.ToolCallSignature]int, maxRuns)
-			consecutiveErrors = 0
-			continue
-		}
-		if sc.ShouldPause {
-			if err := ledger.WaitForResume(ctx); err != nil {
-				return "", err
-			}
-			continue
-		}
-		// ── END STEERING ──
-
-		if l.toolDefsDirty {
-			req.Tools = l.buildToolDefinitions()
-			l.toolDefsDirty = false
-		}
-
-		// ── SEARCH SATURATION CHECK ──
-		// When the search ledger detects saturation (consecutive searches
-		// returning only already-seen files), strip tools to force synthesis.
-		// This is data-driven — no magic turn thresholds.
-		if searchLedger.IsSaturated() {
-			req.Tools = nil
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
-					lm.AgentID, lm.SessionID, lm.CorrID, "info",
-					&agentlog.GenerationPayload{Phase: "search_saturated", ToolRuns: turn})
-			}
-		}
-
-		// ── EVIDENCE SUMMARY INJECTION ──
-		// After the first search turn, inject the evidence summary so the LLM
-		// sees what it has found and can make informed decisions about whether
-		// to continue searching or synthesize.
-		if summary := searchLedger.EvidenceSummary(); summary != "" {
-			injectEvidenceSummary(req, summary)
-		}
-
-		// ── CONTEXT BUDGET ──
-		if err := shared.ApplyContextBudget(ctx, turn, maxRuns, req); err != nil {
-			return "", err
-		}
-
-		turnStart := time.Now()
-		resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("librarian"))
+	for turn := 0; turn <= loop.maxRuns; turn++ {
+		nextTurn, shouldContinue, err := loop.prepareTurn(turn)
 		if err != nil {
-			if ctx.Err() != nil {
-				return "", ctx.Err()
-			}
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("llm: %v", err)})
-			}
-			return "", fmt.Errorf("librarian llm: %w", err)
+			return "", err
 		}
-
-		if gov := shared.ContextGovernorFromContext(ctx); gov != nil {
-			gov.Calibrate(ctx, resp, req.Messages)
-		}
-		shared.AccumulateUsage(ctx, &resp.Usage)
-		shared.PublishIntermediateToolTurn(l.bus, l.channels, ctx, l.id, resp)
-
-		// ── NO TOOL CALLS → RETURN ANSWER ──
-		if len(resp.ToolCalls) == 0 {
-			content := strings.TrimSpace(resp.Content)
-			if content == "" {
-				// Empty content with no tool calls — the context governor may
-				// have stripped tools, or the model produced a degenerate
-				// response. Inject a synthesis nudge and retry exactly once.
-				if turn < maxRuns {
-					req.Messages = append(req.Messages, providers.Message{
-						Role:    providers.RoleAssistant,
-						Content: resp.Content,
-					}, providers.Message{
-						Role:    providers.RoleUser,
-						Content: "Your previous response was empty. You MUST provide a substantive natural language answer based on the tool results you have gathered so far. Summarize your findings clearly.",
-					})
-					continue
-				}
-				return "", fmt.Errorf("librarian: LLM returned empty response after %d turns", turn)
-			}
-			l.recordTurn(req, resp, turn, 0, 0, turnStart)
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
-					lm.AgentID, lm.SessionID, lm.CorrID, "info",
-					&agentlog.GenerationPayload{Phase: "completed", ToolRuns: turn})
-			}
-			return content, nil
-		}
-
-		// ── DUPLICATE DETECTION ──
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "warn",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("repeated tool call: %s (forcing synthesis)", sig.Name)})
-			}
-			// The LLM is stuck calling the same tool with the same args.
-			// Strip tools and inject the evidence summary to force synthesis.
-			req.Messages = append(req.Messages, providers.Message{
-				Role:      providers.RoleAssistant,
-				Content:   resp.Content,
-				ToolCalls: resp.ToolCalls,
-				Metadata:  resp.ProviderMetadata,
-			})
-			for _, call := range resp.ToolCalls {
-				req.Messages = append(req.Messages, providers.Message{
-					Role:       providers.RoleTool,
-					ToolCallID: call.ID,
-					ToolName:   call.Name,
-					Content:    fmt.Sprintf(`{"error":"Duplicate search — you already called %s with identical arguments. Use your existing results."}`, call.Name),
-					IsError:    true,
-				})
-			}
-			req.Tools = nil // force synthesis on next turn
+		if shouldContinue {
+			turn = nextTurn
 			continue
 		}
 
-		// ── TOOL-CALL LIMIT ──
-		if turn == maxRuns {
-			// Tools were stripped by ApplyContextBudget but the LLM still
-			// emitted tool calls. Return any text content as a partial answer.
-			if content := strings.TrimSpace(resp.Content); content != "" {
-				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-					shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
-						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
-						&agentlog.GenerationPayload{Phase: "completed_at_limit", ToolRuns: turn})
-				}
-				l.recordTurn(req, resp, turn, 0, 0, turnStart)
-				return content, nil
-			}
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("exceeded tool-call limit (%d)", maxRuns)})
-			}
-			return "", fmt.Errorf("librarian exceeded tool-call limit (%d)", maxRuns)
-		}
-
-		if err := l.toolRuntime().ValidateBatch(l.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+		resp, turnStart, err := loop.completeTurn(provider)
+		if err != nil {
 			return "", err
 		}
 
-		// ── EXECUTE TOOL CALLS ──
-		errCount, rerouted := l.applyToolCalls(ctx, req, resp, turn, searchLedger)
-		l.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
-		if rerouted {
-			return "", skills.ErrRerouteRequested
-		}
-		consecutiveErrors = shared.UpdateToolErrors(consecutiveErrors, errCount, len(resp.ToolCalls))
-		if consecutiveErrors >= shared.MaxConsecutiveToolErrors {
-			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-					lm.AgentID, lm.SessionID, lm.CorrID, "error",
-					&agentlog.ErrorPayload{Error: fmt.Sprintf("tool calls failed %d consecutive turns", consecutiveErrors)})
-			}
-			return "", fmt.Errorf("librarian tool calls failed %d consecutive turns", consecutiveErrors)
+		result, done, err := loop.finishTurn(resp, turn, turnStart)
+		if done || err != nil {
+			return result, err
 		}
 	}
 
-	if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
-		shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
-			lm.AgentID, lm.SessionID, lm.CorrID, "error",
-			&agentlog.ErrorPayload{Error: "exhausted tool-call loop"})
-	}
-	return "", fmt.Errorf("librarian exhausted tool-call loop")
+	return "", loop.exhaustedError()
 }
 
 // injectEvidenceSummary appends or replaces the evidence summary at the

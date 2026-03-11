@@ -3,10 +3,30 @@ package embedder
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func newEmbedderTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("loopback sockets unavailable in this environment: %v", err)
+		}
+		t.Fatalf("failed to listen for test server: %v", err)
+	}
+
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Listener = listener
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv
+}
 
 func TestNewEmbedder_DefaultReturnsHybridLocal(t *testing.T) {
 	ResetHardwareCache()
@@ -171,7 +191,7 @@ func TestNewEmbedder_EnableHighQuality_FallsBackOnInsufficientRAM(t *testing.T) 
 func TestNewEmbedder_VoyageWithHighQuality_ValidKey(t *testing.T) {
 	ResetHardwareCache()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newEmbedderTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer valid-test-key" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -183,7 +203,6 @@ func TestNewEmbedder_VoyageWithHighQuality_ValidKey(t *testing.T) {
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
-	defer server.Close()
 
 	ctx := context.Background()
 	result, err := NewEmbedder(ctx, FactoryConfig{
@@ -208,7 +227,7 @@ func TestNewEmbedder_VoyageWithHighQuality_ValidKey(t *testing.T) {
 func TestNewEmbedder_VoyageWithHighQuality_InvalidKey_FallsBack(t *testing.T) {
 	ResetHardwareCache()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newEmbedderTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		json.NewEncoder(w).Encode(voyageErrorResponse{
 			Error: struct {
@@ -218,7 +237,6 @@ func TestNewEmbedder_VoyageWithHighQuality_InvalidKey_FallsBack(t *testing.T) {
 			}{Message: "invalid api key", Type: "authentication_error"},
 		})
 	}))
-	defer server.Close()
 
 	ctx := context.Background()
 	result, err := NewEmbedder(ctx, FactoryConfig{
@@ -252,14 +270,13 @@ func TestNewEmbedder_VoyageWithHighQuality_InvalidKey_FallsBack(t *testing.T) {
 func TestNewEmbedder_VoyageWithoutHighQuality_UsesVoyageDirectly(t *testing.T) {
 	ResetHardwareCache()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newEmbedderTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := voyageResponse{
 			Data:  []voyageEmbeddingData{{Embedding: make([]float32, voyageCode3Dim), Index: 0}},
 			Model: string(VoyageCode3),
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
-	defer server.Close()
 
 	ctx := context.Background()
 	result, err := NewEmbedder(ctx, FactoryConfig{

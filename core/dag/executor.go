@@ -398,31 +398,46 @@ func (e *Executor) releaseLayerSlot() {
 }
 
 func (e *Executor) launchNodeExecution(wg *sync.WaitGroup, node *Node, errState *layerErrorState) {
+	if e.scope == nil {
+		e.executeNodeInline(wg, node, errState)
+		return
+	}
+	e.executeNodeScoped(wg, node, errState)
+}
+
+func (e *Executor) executeNodeInline(wg *sync.WaitGroup, node *Node, errState *layerErrorState) {
+	wg.Add(1)
+	atomic.AddInt32(&e.nodesRunning, 1)
+	defer wg.Done()
+	defer atomic.AddInt32(&e.nodesRunning, -1)
+	defer e.releaseLayerSlot()
+
+	errState.record(e.executeNode(node))
+}
+
+func (e *Executor) executeNodeScoped(wg *sync.WaitGroup, node *Node, errState *layerErrorState) {
 	wg.Add(1)
 	atomic.AddInt32(&e.nodesRunning, 1)
 
-	e.dispatchNodeExecution(wg, node, errState)
-}
-
-func (e *Executor) dispatchNodeExecution(wg *sync.WaitGroup, node *Node, errState *layerErrorState) {
-	nodeRef := node
-	if e.scope == nil {
+	err := e.scope.Go("dag.executor.node", e.resolveNodeTimeout(node), func(ctx context.Context) error {
 		defer wg.Done()
 		defer atomic.AddInt32(&e.nodesRunning, -1)
 		defer e.releaseLayerSlot()
 
-		errState.record(e.executeNode(nodeRef))
+		errState.record(e.executeNode(node))
+		return nil
+	})
+	if err == nil {
 		return
 	}
 
-	_ = e.scope.Go("dag.executor.node", e.resolveNodeTimeout(nodeRef), func(ctx context.Context) error {
-		defer wg.Done()
-		defer atomic.AddInt32(&e.nodesRunning, -1)
-		defer e.releaseLayerSlot()
-
-		errState.record(e.executeNode(nodeRef))
-		return nil
-	})
+	// If the scoped launch is rejected, fail the node immediately instead of
+	// leaking the waitgroup and hanging the entire DAG.
+	wg.Done()
+	atomic.AddInt32(&e.nodesRunning, -1)
+	e.releaseLayerSlot()
+	e.recordNodeResult(node, failedDispatchResult(node.ID(), err, 0))
+	errState.record(err)
 }
 
 func (e *Executor) executeNode(node *Node) error {
@@ -548,6 +563,7 @@ func (e *Executor) dispatchNode(node *Node, parentResults map[string]*NodeResult
 	nodeID := node.ID()
 	e.markNodeQueued(node, nodeID)
 	e.markNodeDispatched(node, nodeID)
+	e.markNodeStarted(node, nodeID)
 
 	ctx, cancel := e.nodeContext(timeout)
 	defer cancel()

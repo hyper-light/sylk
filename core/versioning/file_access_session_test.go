@@ -2,6 +2,7 @@ package versioning
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -55,5 +56,42 @@ func TestSessionRoutingFileAccess_DeniesWritableFallbackWithoutSession(t *testin
 	}
 	if exists {
 		t.Fatal("expected writable fallback to be denied without touching disk")
+	}
+}
+
+func TestSessionRoutingFileAccess_MkdirAllUsesSessionGlobalOverlay(t *testing.T) {
+	dir := t.TempDir()
+	svfs, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:  "sess-1",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	defer svfs.Close()
+
+	router := NewSessionRoutingFileAccess(false, func(sessionID string) *SessionVFS {
+		if sessionID == "sess-1" {
+			return svfs
+		}
+		return nil
+	}, NewDiskFileAccess(dir, false))
+
+	ctx := WithSessionID(context.Background(), "sess-1")
+	targetDir := filepath.Join("draft", "generated")
+	if err := router.MkdirAll(ctx, targetDir); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	info, err := svfs.NewGlobalFileAccess(false).Stat(ctx, targetDir)
+	if err != nil {
+		t.Fatalf("global Stat: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("expected routed mkdir target to exist as a directory in the global draft")
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, targetDir)); !os.IsNotExist(err) {
+		t.Fatalf("expected disk path to remain absent before flush, stat err=%v", err)
 	}
 }

@@ -2,14 +2,32 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
+	"github.com/adalundhe/sylk/core/purevfs"
 	coretest "github.com/adalundhe/sylk/core/test"
 	"github.com/adalundhe/sylk/core/versioning"
 )
+
+type stubExecutionBroker struct {
+	caps purevfs.ExecutionCapabilities
+	run  func(context.Context, purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error)
+}
+
+func (s stubExecutionBroker) Capabilities(context.Context) (purevfs.ExecutionCapabilities, error) {
+	return s.caps, nil
+}
+
+func (s stubExecutionBroker) Run(ctx context.Context, req purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+	if s.run == nil {
+		return nil, purevfs.ErrStrictExecutionUnavailable
+	}
+	return s.run(ctx, req)
+}
 
 func TestPipelineTesterDetectHarness_SelectsGoAndDefaultOutput(t *testing.T) {
 	root := t.TempDir()
@@ -59,8 +77,9 @@ func TestPipelineTesterWriteTestArtifact_CreatesSiblingTestInSparseVFS(t *testin
 	}
 }
 
-func TestPipelineTesterRunGoTestSuite_UsesOverlayForStagedTests(t *testing.T) {
+func TestPipelineTesterRunGoTestSuite_RequiresStrictBroker(t *testing.T) {
 	pt, ctx, _ := newGoPipelineTesterWithVFS(t)
+	pt.SetExecutionBroker(stubExecutionBroker{})
 
 	harness, err := pt.detectHarness(ctx, []string{"pkg/service/service.go"}, "Write Add tests", "engineer")
 	if err != nil {
@@ -75,15 +94,46 @@ func TestPipelineTesterRunGoTestSuite_UsesOverlayForStagedTests(t *testing.T) {
 		t.Fatalf("writeTestArtifact: %v", err)
 	}
 
+	_, err = pt.executeSuite(ctx, harness, nil, []string{"pkg/service/service.go"}, nil, false, true, 30)
+	if !errors.Is(err, purevfs.ErrStrictExecutionUnavailable) {
+		t.Fatalf("executeSuite error = %v, want %v", err, purevfs.ErrStrictExecutionUnavailable)
+	}
+}
+
+func TestPipelineTesterRunGoTestSuite_UsesStrictBroker(t *testing.T) {
+	pt, ctx, _ := newGoPipelineTesterWithVFS(t)
+	pt.SetExecutionBroker(stubExecutionBroker{
+		caps: purevfs.StrictBrokerCapabilities(),
+		run: func(context.Context, purevfs.BrokerRunRequest) (*purevfs.BrokerRunResult, error) {
+			output := `{"Action":"pass","Package":"example.com/tester/pkg/service","Test":"TestAdd","Elapsed":0.01}` + "\n"
+			return &purevfs.BrokerRunResult{
+				ExitCode: 0,
+				Stdout:   []byte(output),
+			}, nil
+		},
+	})
+
+	harness, err := pt.detectHarness(ctx, []string{"pkg/service/service.go"}, "Write Add tests", "engineer")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
+		Name:       "TestAdd",
+		TargetFile: "pkg/service/service.go",
+	}, "pkg/service/service_test.go", "func TestAdd(t *testing.T) {\n\tif got := Add(2, 3); got != 5 {\n\t\tt.Fatalf(\"got %d, want 5\", got)\n\t}\n}\n")
+	if err != nil {
+		t.Fatalf("writeTestArtifact: %v", err)
+	}
+
 	result, err := pt.executeSuite(ctx, harness, nil, []string{"pkg/service/service.go"}, nil, false, true, 30)
 	if err != nil {
 		t.Fatalf("executeSuite: %v", err)
 	}
-	if got := intValue(result["failed"]); got != 0 {
-		t.Fatalf("failed = %d, want 0; output=%s", got, result["output"])
+	if got := result["passed"]; got != 1 {
+		t.Fatalf("passed = %v, want 1", got)
 	}
-	if got := intValue(result["passed"]); got < 1 {
-		t.Fatalf("passed = %d, want at least 1; output=%s", got, result["output"])
+	if got := result["execution_strategy"]; got != purevfs.StrategyProcessBroker {
+		t.Fatalf("strategy = %v, want %v", got, purevfs.StrategyProcessBroker)
 	}
 }
 

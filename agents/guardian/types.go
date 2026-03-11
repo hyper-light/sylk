@@ -105,10 +105,20 @@ type GitMutationProposal struct {
 	Timestamp     time.Time      `json:"timestamp"`
 }
 
+type ApprovalDecision string
+
+const (
+	ApprovalAllowOnce   ApprovalDecision = "allow_once"
+	ApprovalAllowAlways ApprovalDecision = "allow_always"
+	ApprovalDenyOnce    ApprovalDecision = "deny_once"
+	ApprovalDenyAlways  ApprovalDecision = "deny_always"
+)
+
 // ApprovalResult carries the outcome of a user approval request.
 type ApprovalResult struct {
-	Approved bool   `json:"approved"`
-	Reason   string `json:"reason,omitempty"`
+	Approved bool             `json:"approved"`
+	Decision ApprovalDecision `json:"decision,omitempty"`
+	Reason   string           `json:"reason,omitempty"`
 }
 
 // =============================================================================

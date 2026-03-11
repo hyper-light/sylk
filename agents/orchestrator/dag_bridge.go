@@ -207,6 +207,13 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	if bus == nil {
 		return "", fmt.Errorf("dag bridge: bus not set")
 	}
+	b.logTrace("dag_execute_begin", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":       d.ID(),
+		"plan_id":      planID,
+		"session_id":   sessionID,
+		"nodes_total":  d.NodeCount(),
+		"layers_total": d.LayerCount(),
+	})
 
 	// 0. Expand pipeline-eligible nodes into sub-DAGs.
 	expanded, subNodeMap := ExpandDAG(d)
@@ -217,6 +224,12 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 			&agentlog.PipelinePayload{PipelineID: d.ID(), Stage: "expanded"})
 		d = expanded
 	}
+	b.logTrace("dag_execute_expanded", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":            d.ID(),
+		"expanded_nodes":    d.NodeCount(),
+		"expanded_layers":   d.LayerCount(),
+		"expanded_subnodes": len(subNodeMap),
+	})
 
 	// 1. WAL: LogDAGStart
 	dagJSON, _ := d.MarshalJSON()
@@ -236,6 +249,11 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	); err != nil {
 		return "", fmt.Errorf("dag bridge: store insert: %w", err)
 	}
+	b.logTrace("dag_execute_store_inserted", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":       d.ID(),
+		"nodes_total":  d.NodeCount(),
+		"layers_total": d.LayerCount(),
+	})
 
 	// 3. Create task-scoped pipeline pods so task_id is the canonical
 	// execution, routing, and filesystem boundary.
@@ -255,14 +273,35 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 
 	taskPods, err := b.buildTaskPods(ctx, d, sessionID, runtime, specReg, registrar, logger, scribeFactory, sessionVFS)
 	if err != nil {
-		return "", err
+		b.logTrace("dag_execute_task_pods_failed", agentlog.EventError, map[string]any{
+			"dag_id": d.ID(),
+			"error":  err.Error(),
+		})
+		return "", b.abortPreSubmitDAG(d.ID(), err)
 	}
+	b.logTrace("dag_execute_task_pods_built", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":         d.ID(),
+		"task_pod_count": len(taskPods),
+	})
+	if err := preActivateTaskPods(ctx, taskPods); err != nil {
+		b.logTrace("dag_execute_task_pods_preactivate_failed", agentlog.EventError, map[string]any{
+			"dag_id": d.ID(),
+			"error":  err.Error(),
+		})
+		releaseTaskPods(taskPods)
+		return "", b.abortPreSubmitDAG(d.ID(), err)
+	}
+	b.logTrace("dag_execute_task_pods_preactivated", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":         d.ID(),
+		"task_pod_count": len(taskPods),
+	})
 	for _, taskDef := range collectPipelineTaskPods(d) {
 		publishTaskPipelineState(bus, b.agentID, taskDef.TaskID, taskDef.TaskSlug, taskstate.StatusPending, "")
 	}
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
+	dispatcher.SetEventLogger(b.eventLogger)
 	dispatcher.SetDispatchPermitWaiter(waitDispatchPermit)
 	dispatcher.SetPodResolver(func(node *dag.Node) *shared.AgentPod {
 		if node == nil {
@@ -307,6 +346,9 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.mu.Lock()
 	b.activeDAGs[d.ID()].Unsub = unsub
 	b.mu.Unlock()
+	b.logTrace("dag_execute_subscribed", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id": d.ID(),
+	})
 
 	// 6. Register expanded sub-nodes with their task pod for per-node observability.
 	//     Sorted iteration ensures deterministic registration order.
@@ -362,16 +404,35 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	})
 
 	// 7. Submit to scheduler (async execution)
+	b.logTrace("dag_execute_submit_begin", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id": d.ID(),
+	})
 	_, err = b.scheduler.Submit(dagCtx, d, dispatcher)
 	if err != nil {
 		dagCancel()
 		b.cleanupDAG(d.ID())
 		b.journal.LogDAGAbort(d.ID(), err.Error())
 		b.store.UpdateDAGState(d.ID(), "failed", err.Error())
+		b.logTrace("dag_execute_submit_failed", agentlog.EventError, map[string]any{
+			"dag_id": d.ID(),
+			"error":  err.Error(),
+		})
 		return "", fmt.Errorf("dag bridge: submit: %w", err)
 	}
+	b.logTrace("dag_execute_submit_ok", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id": d.ID(),
+	})
 
 	return d.ID(), nil
+}
+
+func (b *DAGBridge) abortPreSubmitDAG(dagID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	b.journal.LogDAGAbort(dagID, err.Error())
+	b.store.UpdateDAGState(dagID, "failed", err.Error())
+	return err
 }
 
 func (b *DAGBridge) buildTaskPods(
@@ -604,6 +665,19 @@ func releaseTaskPods(taskPods map[string]*shared.AgentPod) {
 	}
 }
 
+func preActivateTaskPods(ctx context.Context, taskPods map[string]*shared.AgentPod) error {
+	for _, taskID := range slices.Sorted(maps.Keys(taskPods)) {
+		pod := taskPods[taskID]
+		if pod == nil {
+			continue
+		}
+		if err := pod.PreActivateStrict(ctx); err != nil {
+			return fmt.Errorf("task pod %s: pre-activate: %w", taskID, err)
+		}
+	}
+	return nil
+}
+
 // Cancel cancels a running DAG.
 func (b *DAGBridge) Cancel(dagID, reason string) error {
 	b.mu.Lock()
@@ -742,6 +816,10 @@ func (b *DAGBridge) RecoverFromWAL(ctx context.Context) error {
 		// the architect to re-submit.
 		b.journal.LogDAGAbort(entry.DAGID, "crash recovery: marked as failed")
 		b.store.UpdateDAGState(entry.DAGID, "failed", "crash recovery: incomplete at startup")
+		b.logTrace("dag_recovery_mark_failed", agentlog.EventError, map[string]any{
+			"dag_id":      entry.DAGID,
+			"prior_state": row.State,
+		})
 		b.publishActivity(events.EventTypeAgentError,
 			fmt.Sprintf("DAG %s recovered from crash (marked failed)", entry.DAGID))
 	}
@@ -780,6 +858,31 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 
 		el := b.eventLogger
 		switch event.Type {
+		case dag.EventExecutionRunStarted:
+			b.logTrace("dag_execution_run_started", agentlog.EventRegistryEvent, map[string]any{
+				"dag_id": dagID,
+			})
+
+		case dag.EventExecutionRunFinished:
+			b.logTrace("dag_execution_run_finished", agentlog.EventRegistryEvent, map[string]any{
+				"dag_id":          dagID,
+				"result_state":    stringFromEventData(event.Data, "state"),
+				"nodes_succeeded": intFromEventData(event.Data, "nodes_succeeded"),
+				"nodes_failed":    intFromEventData(event.Data, "nodes_failed"),
+				"nodes_skipped":   intFromEventData(event.Data, "nodes_skipped"),
+				"error":           stringFromEventData(event.Data, "error"),
+			})
+
+		case dag.EventLayerStarted:
+			shared.LogAgentEvent(el, agentlog.EventLayerStarted,
+				b.agentID, b.sessionID, "", "info",
+				&agentlog.DAGPayload{DAGID: dagID, State: "layer_started", Layer: event.Layer})
+
+		case dag.EventLayerCompleted:
+			shared.LogAgentEvent(el, agentlog.EventLayerCompleted,
+				b.agentID, b.sessionID, "", "info",
+				&agentlog.DAGPayload{DAGID: dagID, State: "layer_completed", Layer: event.Layer})
+
 		case dag.EventNodeDispatched:
 			b.journal.LogNodeDispatch(dagID, event.NodeID, "")
 			shared.LogAgentEvent(el, agentlog.EventNodeDispatched,
@@ -847,6 +950,32 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 				b.agentID, b.sessionID, "", "info",
 				&agentlog.DAGPayload{DAGID: dagID, State: "cancelled"})
 		}
+	}
+}
+
+func stringFromEventData(data map[string]any, key string) string {
+	if data == nil {
+		return ""
+	}
+	value, _ := data[key].(string)
+	return value
+}
+
+func intFromEventData(data map[string]any, key string) int {
+	if data == nil {
+		return 0
+	}
+	switch value := data[key].(type) {
+	case int:
+		return value
+	case int32:
+		return int(value)
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
 	}
 }
 

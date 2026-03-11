@@ -12,6 +12,9 @@ func pipelineInspectorVisibleSkillNames() []string {
 		"run_type_checker",
 		"run_security_scan",
 		"read_file",
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"read_workspace_file",
 		"glob",
 		"workspace_glob",
@@ -36,6 +39,9 @@ func pipelineInspectorVisibleSkillNames() []string {
 func pipelineInspectorMutatingSkillNames() []string {
 	return []string{
 		"define_criteria",
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"request_correction",
 		"request_override",
 		"coord_claim_scope",

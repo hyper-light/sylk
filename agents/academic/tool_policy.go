@@ -11,11 +11,6 @@ func academicVisibleSkillNames() []string {
 		"web_search",
 		"web_fetch",
 		"fetch_document",
-		"read_workspace_file",
-		"workspace_glob",
-		"workspace_grep",
-		"inspect_workspace_state",
-		"summarize_workspace_state",
 	}
 }
 

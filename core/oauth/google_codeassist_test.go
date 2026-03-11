@@ -3,8 +3,10 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -17,8 +19,26 @@ func restoreCodeAssistEndpoint(url string) {
 	codeAssistEndpoint = url
 }
 
+func newCodeAssistTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("loopback sockets unavailable in this environment: %v", err)
+		}
+		t.Fatalf("failed to listen for test server: %v", err)
+	}
+
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Listener = listener
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func TestSetupCodeAssist_AlreadyOnboarded(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCodeAssistTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := loadCodeAssistResponse{
 			CurrentTier:             &codeAssistTier{ID: "free-tier", Name: "Free"},
 			CloudAICompanionProject: "proj-123",
@@ -26,7 +46,6 @@ func TestSetupCodeAssist_AlreadyOnboarded(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	}))
-	defer srv.Close()
 
 	orig := codeAssistEndpoint
 	t.Cleanup(func() { restoreCodeAssistEndpoint(orig) })
@@ -46,7 +65,7 @@ func TestSetupCodeAssist_AlreadyOnboarded(t *testing.T) {
 
 func TestSetupCodeAssist_OnboardAndPoll(t *testing.T) {
 	var callCount atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCodeAssistTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := callCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 
@@ -73,7 +92,6 @@ func TestSetupCodeAssist_OnboardAndPoll(t *testing.T) {
 			json.NewEncoder(w).Encode(op)
 		}
 	}))
-	defer srv.Close()
 
 	orig := codeAssistEndpoint
 	t.Cleanup(func() { restoreCodeAssistEndpoint(orig) })
@@ -92,7 +110,7 @@ func TestSetupCodeAssist_OnboardAndPoll(t *testing.T) {
 }
 
 func TestSetupCodeAssist_Ineligible(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCodeAssistTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := loadCodeAssistResponse{
 			IneligibleTiers: []ineligibleTier{
 				{TierID: "paid", ReasonCode: "NO_BILLING", ReasonMessage: "billing not configured"},
@@ -101,7 +119,6 @@ func TestSetupCodeAssist_Ineligible(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	}))
-	defer srv.Close()
 
 	orig := codeAssistEndpoint
 	t.Cleanup(func() { restoreCodeAssistEndpoint(orig) })
@@ -119,11 +136,10 @@ func TestSetupCodeAssist_ContextCanceled(t *testing.T) {
 
 	// Use a server that never responds — the canceled context should
 	// cause the HTTP call to fail immediately.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCodeAssistTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Should never reach here with canceled context.
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer srv.Close()
 
 	orig := codeAssistEndpoint
 	t.Cleanup(func() { restoreCodeAssistEndpoint(orig) })
@@ -208,7 +224,7 @@ func TestExtractOperationProjectID_Nil(t *testing.T) {
 
 func TestSetupCodeAssist_OnboardImmediateComplete(t *testing.T) {
 	var callCount atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCodeAssistTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := callCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 
@@ -232,7 +248,6 @@ func TestSetupCodeAssist_OnboardImmediateComplete(t *testing.T) {
 			json.NewEncoder(w).Encode(op)
 		}
 	}))
-	defer srv.Close()
 
 	orig := codeAssistEndpoint
 	t.Cleanup(func() { restoreCodeAssistEndpoint(orig) })
@@ -248,11 +263,10 @@ func TestSetupCodeAssist_OnboardImmediateComplete(t *testing.T) {
 }
 
 func TestSetupCodeAssist_ServerError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newCodeAssistTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte("internal error"))
 	}))
-	defer srv.Close()
 
 	orig := codeAssistEndpoint
 	t.Cleanup(func() { restoreCodeAssistEndpoint(orig) })

@@ -48,6 +48,7 @@ type PipelineResult struct {
 	Duration         time.Duration
 	EmbedderSource   string
 	CommitVersion    string
+	CommitID         string
 	Phases           PhaseTiming
 
 	// BackgroundIndexer is non-nil when Bleve indexing was deferred.
@@ -318,6 +319,17 @@ func (p *Pipeline) setupSylkDir(root string) (*sylkdir.SylkDir, *sylkdir.GlobalM
 		return nil, nil, nil, nil, fmt.Errorf("open commit wal: %w", err)
 	}
 
+	if _, err := sylkdir.RunRecovery(sylkdir.RecoveryConfig{
+		SylkDir:        sd,
+		GlobalMeta:     gm,
+		CanonicalIndex: canonIdx,
+		CommitWAL:      commitWAL,
+	}); err != nil {
+		_ = commitWAL.Close()
+		sd.Unlock()
+		return nil, nil, nil, nil, fmt.Errorf("run recovery: %w", err)
+	}
+
 	return sd, gm, canonIdx, commitWAL, nil
 }
 
@@ -514,6 +526,7 @@ func (p *Pipeline) finalizeMeta(
 	result.VectorsCreated = int64(ir.VectorsCreated)
 	result.ChunkRefsCreated = int64(ir.ChunkRefsCreated)
 	result.CommitVersion = cr.GlobalVersion.String()
+	result.CommitID = cr.CommitID
 }
 
 // populateFileHashes discovers all project files and records their content hashes

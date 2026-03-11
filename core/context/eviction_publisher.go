@@ -200,6 +200,10 @@ type EvictionEventPublisher struct {
 
 	// wg tracks pending async operations.
 	wg sync.WaitGroup
+
+	// pending tracks buffered events so Flush waits for publication, not just
+	// channel drain.
+	pending sync.WaitGroup
 }
 
 // NewEvictionEventPublisher creates a new EvictionEventPublisher.
@@ -240,6 +244,7 @@ func (p *EvictionEventPublisher) processBuffer() {
 		if p.bus != nil {
 			p.bus.PublishActivity(event)
 		}
+		p.pending.Done()
 	}
 }
 
@@ -517,10 +522,22 @@ func (p *EvictionEventPublisher) UpdateSession(sessionID, agentID string) {
 // publishAsync sends an event to the buffer for async publishing.
 // This is non-blocking - if the buffer is full, the event is dropped.
 func (p *EvictionEventPublisher) publishAsync(event *events.ActivityEvent) error {
+	if event == nil {
+		return nil
+	}
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return nil
+	}
+	p.pending.Add(1)
 	select {
 	case p.buffer <- event:
+		p.mu.RUnlock()
 		return nil
 	default:
+		p.pending.Done()
+		p.mu.RUnlock()
 		// Buffer full, drop event (non-blocking behavior)
 		return nil
 	}
@@ -528,10 +545,7 @@ func (p *EvictionEventPublisher) publishAsync(event *events.ActivityEvent) error
 
 // Flush waits for all pending events to be published.
 func (p *EvictionEventPublisher) Flush() {
-	// Drain the buffer by waiting for it to empty
-	for len(p.buffer) > 0 {
-		time.Sleep(time.Millisecond)
-	}
+	p.pending.Wait()
 }
 
 // Close closes the publisher and waits for pending events.

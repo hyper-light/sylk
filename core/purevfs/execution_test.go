@@ -2,6 +2,8 @@ package purevfs
 
 import (
 	"errors"
+	"os"
+	"path"
 	"testing"
 )
 
@@ -23,7 +25,7 @@ func TestExecutionPlannerStrictRequiresBroker(t *testing.T) {
 func TestExecutionPlannerCompatibilityUsesGoOverlayFastPath(t *testing.T) {
 	planner := NewExecutionPlanner(nil, HostCompatibilityCapabilities())
 
-	plan, err := planner.Plan(ExecutionRequest{
+	_, err := planner.Plan(ExecutionRequest{
 		Mode:           ExecutionModeCompatibility,
 		Intent:         ExecutionIntentTest,
 		Language:       "go",
@@ -33,21 +35,15 @@ func TestExecutionPlannerCompatibilityUsesGoOverlayFastPath(t *testing.T) {
 		Overlay:        true,
 		OverlayDeletes: false,
 	})
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	if plan.Strategy != StrategyGoOverlayManifest {
-		t.Fatalf("strategy = %s, want %s", plan.Strategy, StrategyGoOverlayManifest)
-	}
-	if plan.RequiresMaterialize {
-		t.Fatal("expected go overlay fast path to avoid materialization")
+	if !errors.Is(err, ErrStrictExecutionUnavailable) {
+		t.Fatalf("Plan error = %v, want %v", err, ErrStrictExecutionUnavailable)
 	}
 }
 
 func TestExecutionPlannerCompatibilityFallsBackToMaterialization(t *testing.T) {
 	planner := NewExecutionPlanner(nil, HostCompatibilityCapabilities())
 
-	plan, err := planner.Plan(ExecutionRequest{
+	_, err := planner.Plan(ExecutionRequest{
 		Mode:           ExecutionModeCompatibility,
 		Intent:         ExecutionIntentTest,
 		Language:       "python",
@@ -57,14 +53,8 @@ func TestExecutionPlannerCompatibilityFallsBackToMaterialization(t *testing.T) {
 		Overlay:        true,
 		OverlayDeletes: true,
 	})
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	if plan.Strategy != StrategyWorkspaceMaterialize {
-		t.Fatalf("strategy = %s, want %s", plan.Strategy, StrategyWorkspaceMaterialize)
-	}
-	if !plan.RequiresMaterialize {
-		t.Fatal("expected materialization fallback")
+	if !errors.Is(err, ErrStrictExecutionUnavailable) {
+		t.Fatalf("Plan error = %v, want %v", err, ErrStrictExecutionUnavailable)
 	}
 }
 
@@ -90,5 +80,53 @@ func TestExecutionPlannerGenericCommandPlan(t *testing.T) {
 	}
 	if got := plan.Env["TMPDIR"]; got != "/tmp" {
 		t.Fatalf("TMPDIR = %q, want /tmp", got)
+	}
+}
+
+func TestExecutionPlannerProjectsToolchainsIntoBrokerPath(t *testing.T) {
+	planner := NewExecutionPlanner(nil, StrictBrokerCapabilities())
+
+	plan, err := planner.Plan(ExecutionRequest{
+		Mode:          ExecutionModeStrictNoDisk,
+		Intent:        ExecutionIntentBuild,
+		Language:      "go",
+		WorkspaceRoot: "/workspace",
+	})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := plan.Env["PATH"]; got != executionToolchainRoot {
+		t.Fatalf("PATH = %q, want %q", got, executionToolchainRoot)
+	}
+	found := false
+	want := path.Join(executionToolchainRoot, "go")
+	for _, mount := range plan.Mounts {
+		if mount.Kind != MountToolchain {
+			continue
+		}
+		if mount.VirtualPath == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("toolchain mount %q missing from %#v", want, plan.Mounts)
+	}
+}
+
+func TestTranslateExecutionEnvValueRewritesPathLists(t *testing.T) {
+	plan := ExecutionPlan{
+		Mounts: []MountSpec{
+			{
+				Kind:        MountToolchain,
+				VirtualPath: executionToolchainPath("go"),
+			},
+		},
+	}
+	value := executionToolchainRoot + string(os.PathListSeparator) + "/usr/bin"
+	got := translateExecutionEnvValue(plan, "/sandbox", value)
+	want := mountedExecPath("/sandbox", executionToolchainRoot) + string(os.PathListSeparator) + "/usr/bin"
+	if got != want {
+		t.Fatalf("translateExecutionEnvValue(...) = %q, want %q", got, want)
 	}
 }

@@ -11,6 +11,9 @@ func globalInspectorVisibleSkillNames() []string {
 		"run_type_checker",
 		"run_security_scan",
 		"read_file",
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"read_workspace_file",
 		"glob",
 		"workspace_glob",
@@ -24,6 +27,9 @@ func globalInspectorVisibleSkillNames() []string {
 
 func globalInspectorMutatingSkillNames() []string {
 	return []string{
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"request_architect_research",
 		"request_user_clarification",
 		"escalate_findings",

@@ -5,9 +5,12 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "sylk",
-	Short: "Sylk - An AI agent framework",
-	Long:  `Sylk is a powerful AI agent framework for building intelligent assistants.`,
+	Use:          "sylk",
+	Short:        "Launch the interactive terminal UI",
+	Long:         `Launch Sylk's terminal UI with multi-agent chat, session management, and code viewing.`,
+	Args:         cobra.NoArgs,
+	RunE:         runTUI,
+	SilenceUsage: true,
 }
 
 func Execute() error {

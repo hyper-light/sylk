@@ -6,7 +6,6 @@ import (
 	"os/signal"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/adalundhe/sylk/core/concurrency"
 )
@@ -38,7 +37,7 @@ func (h *OSSignalHandler) Start() {
 	}
 
 	h.running = true
-	signal.Notify(h.sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGTSTP)
+	signal.Notify(h.sigCh, handledSignals()...)
 	go h.listen()
 }
 
@@ -56,12 +55,12 @@ func (h *OSSignalHandler) listen() {
 func (h *OSSignalHandler) handleSignal(sig os.Signal) {
 	ctx := context.Background()
 
-	switch sig {
-	case syscall.SIGINT:
+	switch {
+	case isInterruptSignal(sig):
 		h.handleInterrupt(ctx)
-	case syscall.SIGTERM:
+	case isTerminateSignal(sig):
 		h.handleTerminate(ctx)
-	case syscall.SIGTSTP:
+	case isSuspendSignal(sig):
 		h.handleSuspend(ctx)
 	}
 }

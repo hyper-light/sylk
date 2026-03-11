@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
@@ -185,7 +186,7 @@ func New(cfg Config, provider academicProvider) (*Academic, error) {
 		outcomeHistory:    NewOutcomeHistory(cfg.OutcomeHistoryLimit),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
-		workspaceViews:    cfg.WorkspaceViews,
+		workspaceViews:    authority.RestrictWorkspaceViews("academic", cfg.WorkspaceViews),
 	}
 
 	a.steering.InitLazy("academic", cfg.ActivityPub)
@@ -218,10 +219,7 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
 	}
-	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
-		DefaultView:     versioning.WorkspaceViewDisk,
-		IncludePipeline: true,
-	})
+	cfg.SystemPrompt = shared.AppendNoFilesystemContext(cfg.SystemPrompt)
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
@@ -504,6 +502,12 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 
 	// Wire tool call emitter for inline visualization.
 	emitter := shared.NewToolCallEmitter(a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID)
+	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return a.bus },
+		SourceAgentID:   func() string { return a.id },
+		SourceAgentType: "academic",
+		SourceAgentName: "Academic",
+	})
 	ctx := shared.WithStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
 	ctx, usageAcc := shared.WithUsageAccumulator(ctx)
 	ctx = shared.WithToolCallEmitter(ctx, emitter)
@@ -1408,6 +1412,14 @@ func (a *Academic) AgentType() string {
 	return "academic"
 }
 
+// SetCanonicalID preserves the routing identity across handoff replacement.
+func (a *Academic) SetCanonicalID(id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	a.id = id
+}
+
 // Descriptor returns the immutable metadata describing this agent type.
 func (a *Academic) Descriptor() handoff.AgentDescriptor {
 	modelID := a.CurrentModel()
@@ -1449,7 +1461,7 @@ func (a *Academic) SetFetchPipeline(p *fetch.Pipeline) {
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (a *Academic) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
-	a.workspaceViews = views
+	a.workspaceViews = authority.RestrictWorkspaceViews("academic", views)
 }
 
 // ExtractArchivableState returns the agent's current state for handoff persistence.

@@ -35,7 +35,7 @@ type Viewport struct {
 	viewHeight         int
 	viewWidth          int
 	following          bool      // Auto-scroll to bottom on new content.
-	layoutCompensation int       // Accumulated scrollOff from input-growth layout changes.
+	layoutCompensation int       // Layout-induced portion of scrollOff for later absorption.
 	highlightID        string    // Entry ID to highlight (empty = none).
 	highlightStart     int       // First entry-relative line to highlight (inclusive).
 	highlightEnd       int       // Last entry-relative line to highlight (exclusive).
@@ -84,6 +84,8 @@ const chatPadding = 2
 // SetSize updates the viewport dimensions. When viewWidth changes,
 // all entry render caches are invalidated (rendered at wrong width).
 func (vp *Viewport) SetSize(width, height int) {
+	oldHeight := vp.viewHeight
+	oldWidth := vp.viewWidth
 	newWidth := max(width-chatPadding, 0)
 	if newWidth != vp.viewWidth {
 		vp.invalidateAllEntryHeights()
@@ -91,40 +93,37 @@ func (vp *Viewport) SetSize(width, height int) {
 	}
 	vp.viewWidth = newWidth
 	vp.viewHeight = max(height, 0)
+	if newWidth == oldWidth {
+		vp.CompensateInputGrowth(oldHeight, vp.viewHeight)
+	}
+	vp.scrollOff = min(max(vp.scrollOff, 0), vp.maxScrollOffset())
 }
 
 // CompensateInputGrowth adjusts scrollOff to keep the top of the viewport
-// stable when the chat panel height changes due to input panel growth/shrink.
-// When the viewport shrinks (input grew), the bottom line is dropped instead
-// of the top, preventing a full-screen redraw. When the viewport grows back
-// (input shrank, e.g. on submit), only the layout-induced portion of scrollOff
-// is absorbed — any user-initiated scroll offset is preserved.
+// stable when layout changes alter the chat height without changing width.
 func (vp *Viewport) CompensateInputGrowth(oldHeight, newHeight int) {
 	if oldHeight == newHeight || oldHeight == 0 || newHeight == 0 {
 		return
 	}
 	delta := oldHeight - newHeight
-	if delta > 0 && vp.following {
-		// Viewport shrank: offset scrollOff to keep top line stable.
-		// Bottom content is absorbed by the growing input.
+	if delta > 0 {
 		vp.scrollOff += delta
 		vp.layoutCompensation += delta
-		vp.following = false
-	} else if delta < 0 && vp.layoutCompensation > 0 {
-		// Viewport grew back: absorb previous compensation.
-		absorption := min(-delta, vp.layoutCompensation)
-		vp.scrollOff = max(0, vp.scrollOff-absorption)
-		vp.layoutCompensation -= absorption
-		if vp.scrollOff == 0 {
-			vp.following = true
-		}
+		return
 	}
+	if vp.layoutCompensation == 0 {
+		return
+	}
+	absorption := min(-delta, vp.layoutCompensation)
+	vp.scrollOff = max(0, vp.scrollOff-absorption)
+	vp.layoutCompensation -= absorption
 }
 
 // ScrollUp scrolls up by one line. Returns true if the scroll was applied,
 // false if already at the top boundary.
 func (vp *Viewport) ScrollUp() bool {
 	vp.following = false
+	vp.layoutCompensation = 0
 	prev := vp.scrollOff
 	vp.scrollOff = min(vp.scrollOff+1, vp.maxScrollOffset())
 	return vp.scrollOff != prev
@@ -133,6 +132,7 @@ func (vp *Viewport) ScrollUp() bool {
 // ScrollDown scrolls down by one line. Returns true if the scroll was applied,
 // false if already at the bottom boundary.
 func (vp *Viewport) ScrollDown() bool {
+	vp.layoutCompensation = 0
 	prev := vp.scrollOff
 	vp.scrollOff = max(vp.scrollOff-1, 0)
 	vp.following = vp.scrollOff == 0
@@ -146,12 +146,14 @@ const pageOverlap = 1
 // PageUp scrolls up by one page minus overlap.
 func (vp *Viewport) PageUp() {
 	vp.following = false
+	vp.layoutCompensation = 0
 	step := max(vp.viewHeight-pageOverlap, 1)
 	vp.scrollOff = min(vp.scrollOff+step, vp.maxScrollOffset())
 }
 
 // PageDown scrolls down by one page minus overlap.
 func (vp *Viewport) PageDown() {
+	vp.layoutCompensation = 0
 	step := max(vp.viewHeight-pageOverlap, 1)
 	vp.scrollOff = max(vp.scrollOff-step, 0)
 	vp.following = vp.scrollOff == 0
@@ -160,6 +162,7 @@ func (vp *Viewport) PageDown() {
 // ToTop scrolls to the oldest content and clears selection.
 func (vp *Viewport) ToTop() {
 	vp.following = false
+	vp.layoutCompensation = 0
 	vp.scrollOff = vp.maxScrollOffset()
 	vp.ClearSelection()
 }
@@ -167,6 +170,7 @@ func (vp *Viewport) ToTop() {
 // ToBottom scrolls to the newest content, re-enables follow mode, and clears selection.
 func (vp *Viewport) ToBottom() {
 	vp.scrollOff = 0
+	vp.layoutCompensation = 0
 	vp.following = true
 	vp.ClearSelection()
 }
@@ -354,6 +358,7 @@ func (vp *Viewport) scrollToSelected() {
 // [rangeStart, rangeEnd) is visible within the viewport.
 // When the range is taller than the viewport, the top is preferred.
 func (vp *Viewport) scrollRangeIntoView(rangeStart, rangeEnd int) {
+	vp.layoutCompensation = 0
 	total := vp.totalLines()
 	bottom := total - vp.scrollOff
 	top := bottom - vp.viewHeight
@@ -415,6 +420,8 @@ func entryRegions(entry *ChatEntry) []selectionRegion {
 // increased by the new entry's line count so the user's view stays stable.
 func (vp *Viewport) OnNewEntry() {
 	if vp.following {
+		vp.scrollOff = 0
+		vp.layoutCompensation = 0
 		return
 	}
 	newIdx := vp.history.Len() - 1

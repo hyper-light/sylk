@@ -15,9 +15,11 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -42,7 +44,8 @@ type GlobalInspector struct {
 	refresher container.ProviderRefresher
 
 	// Tool runner for external analysis tools.
-	toolRunner *shared.ToolRunner
+	toolRunner      *shared.ToolRunner
+	executionBroker purevfs.ExecutionBroker
 
 	// Skills.
 	skills        *skills.Registry
@@ -110,13 +113,24 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		config:            cfg,
 		logger:            slog.Default().With("agent", "inspector"),
 		provider:          ip,
-		toolRunner:        shared.NewToolRunner(".", cfg.DefaultTimeout, slog.Default()),
 		knownAgents:       make(map[string]*guide.AgentAnnouncement),
 		pendingBus:        make(map[string]chan *guide.Message),
 		diffStore:         NewAuditDiffStore(cfg.MaxAge),
 		steering:          agentShared.NewSteeringManager(),
 		requestSerializer: agentShared.NewRequestSerializer(),
+		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
+	gi.toolRunner = shared.NewToolRunner(shared.ToolRunnerConfig{
+		WorkingDir:    ".",
+		Timeout:       cfg.DefaultTimeout,
+		Logger:        slog.Default(),
+		AgentID:       inspectorID,
+		AgentType:     "inspector",
+		SessionID:     func() string { return gi.config.SessionID },
+		FileAccess:    func() versioning.FileAccess { return gi.fileAccess },
+		Broker:        func() purevfs.ExecutionBroker { return gi.executionBroker },
+		RequireBroker: true,
+	})
 
 	gi.steering.InitLazy("inspector", nil)
 
@@ -381,6 +395,12 @@ func (gi *GlobalInspector) unsubRegistry() error {
 // Handle processes a forwarded request with intent dispatch.
 func (gi *GlobalInspector) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = agentShared.WithGuardianCommandGate(ctx, agentShared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return gi.bus },
+		SourceAgentID:   func() string { return gi.id },
+		SourceAgentType: "inspector",
+		SourceAgentName: "Inspector",
+	})
 	switch fwd.Intent {
 	case guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
 		return gi.handleConversation(ctx, fwd)
@@ -656,12 +676,16 @@ func (gi *GlobalInspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 
 // SetFileAccess injects the per-session file access layer.
 func (gi *GlobalInspector) SetFileAccess(fa versioning.FileAccess) {
-	gi.fileAccess = fa
+	gi.fileAccess = authority.RestrictFileAccess("inspector", fa)
 }
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (gi *GlobalInspector) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
-	gi.workspaceViews = views
+	gi.workspaceViews = authority.RestrictWorkspaceViews("inspector", views)
+}
+
+func (gi *GlobalInspector) SetExecutionBroker(broker purevfs.ExecutionBroker) {
+	gi.executionBroker = broker
 }
 
 // ExtractArchivableState returns the archivable state of this agent.

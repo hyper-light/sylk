@@ -26,7 +26,7 @@ type gosecIssue struct {
 // RunGoSec runs gosec with JSON output and parses results.
 func RunGoSec(ctx context.Context, runner *ToolRunner, paths []string) []ValidationIssue {
 	if !runner.Available("gosec") {
-		return nil
+		return unavailableToolIssues("gosec")
 	}
 
 	args := []string{"-fmt=json", "-quiet"}
@@ -34,12 +34,12 @@ func RunGoSec(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 
 	result, err := runner.Exec(ctx, "gosec", args...)
 	if err != nil {
-		return nil
+		return executionFailureIssues("gosec", err)
 	}
 
 	var output gosecOutput
 	if err := json.Unmarshal(result.Stdout, &output); err != nil {
-		return nil
+		return parseFailureIssues("gosec", err)
 	}
 
 	issues := make([]ValidationIssue, 0, len(output.Issues))

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -40,11 +39,22 @@ func (v *VFSFileAccess) ReadFile(ctx context.Context, path string) ([]byte, erro
 	return v.vfs.Read(ctx, v.resolve(path))
 }
 
+func (v *VFSFileAccess) MkdirAll(ctx context.Context, path string) error {
+	if v.readOnly {
+		return ErrPermissionDenied
+	}
+	resolved := v.resolve(path)
+	v.registerVisibleHierarchy(resolved)
+	return v.vfs.MkdirAll(ctx, resolved)
+}
+
 func (v *VFSFileAccess) WriteFile(ctx context.Context, path string, content []byte) error {
 	if v.readOnly {
 		return ErrPermissionDenied
 	}
-	return v.vfs.Write(ctx, v.resolve(path), content)
+	resolved := v.resolve(path)
+	v.registerVisibleHierarchy(resolved)
+	return v.vfs.Write(ctx, resolved, content)
 }
 
 func (v *VFSFileAccess) EditFile(ctx context.Context, path string, edits []FileEdit) error {
@@ -86,7 +96,7 @@ func (v *VFSFileAccess) ListDir(ctx context.Context, dir string) ([]fs.DirEntry,
 	entries := make([]fs.DirEntry, 0, len(names))
 	for _, name := range names {
 		full := filepath.Join(resolved, name)
-		info, statErr := os.Stat(full)
+		info, statErr := v.vfs.Stat(ctx, full)
 		if statErr != nil {
 			entries = append(entries, vfsDirEntry{name: name, isDir: v.vfs.HasVisibleDescendant(full)})
 			continue
@@ -117,8 +127,8 @@ func (v *VFSFileAccess) Grep(ctx context.Context, root, pattern, include string,
 	return v.vfsGrep(ctx, resolvedRoot, re, include, contextLines, maxMatches)
 }
 
-func (v *VFSFileAccess) Stat(_ context.Context, path string) (fs.FileInfo, error) {
-	return os.Stat(v.resolve(path))
+func (v *VFSFileAccess) Stat(ctx context.Context, path string) (fs.FileInfo, error) {
+	return v.vfs.Stat(ctx, v.resolve(path))
 }
 
 func (v *VFSFileAccess) WorkingDir() string { return v.workingDir }
@@ -131,7 +141,7 @@ func (v *VFSFileAccess) RegisterVisiblePath(path string) {
 	if path == "" {
 		return
 	}
-	v.vfs.RegisterVisiblePath(v.resolve(path))
+	v.registerVisibleHierarchy(v.resolve(path))
 }
 
 // VisiblePaths returns the current visible pipeline-local paths rooted under
@@ -153,6 +163,15 @@ func (v *VFSFileAccess) resolve(path string) string {
 		return path
 	}
 	return filepath.Join(v.workingDir, path)
+}
+
+func (v *VFSFileAccess) registerVisibleHierarchy(resolved string) {
+	for current := filepath.Clean(resolved); current != "" && isUnderPath(current, v.workingDir); current = filepath.Dir(current) {
+		v.vfs.RegisterVisiblePath(current)
+		if current == filepath.Clean(v.workingDir) {
+			break
+		}
+	}
 }
 
 // vfsGlob walks the VFS overlay (staged + disk - deleted) to find matching files.

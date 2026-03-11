@@ -35,41 +35,31 @@ func needsMaterializedWorkspace(fa versioning.FileAccess) bool {
 }
 
 func (e *Engineer) commandExecutionContext(ctx context.Context, requested string) (commandExecContext, error) {
-	workspaceRoot := e.effectiveWorkingDirectory()
-	plan, err := e.executionPlan(requested)
+	plan, err := e.executionPlan(ctx, requested)
 	if err != nil {
 		return commandExecContext{}, err
 	}
-	execRoot := workspaceRoot
-	cleanup := func() {}
-
-	if plan.RequiresMaterialize {
-		tmpDir, tmpCleanup, err := e.materializeWorkspace(ctx)
-		if err != nil {
-			return commandExecContext{}, err
-		}
-		execRoot = tmpDir
-		cleanup = tmpCleanup
+	if plan.RequiresMaterialize || !plan.RequiresBroker {
+		return commandExecContext{}, purevfs.ErrStrictExecutionUnavailable
 	}
-
-	runDir := resolveCommandWorkingDir(workspaceRoot, execRoot, requested)
+	runDir := plan.WorkingDir
 	if strings.TrimSpace(runDir) == "" {
 		runDir = "."
 	}
 	plan.WorkingDir = runDir
 	return commandExecContext{
 		workDir: runDir,
-		cleanup: cleanup,
+		cleanup: func() {},
 		plan:    plan,
 	}, nil
 }
 
-func (e *Engineer) executionPlan(requested string) (purevfs.ExecutionPlan, error) {
+func (e *Engineer) executionPlan(ctx context.Context, requested string) (purevfs.ExecutionPlan, error) {
 	overlay, overlayDeletes := overlayState(e.fileAccess)
 	workspaceRoot := e.effectiveWorkingDirectory()
-	planner := purevfs.NewExecutionPlanner(nil, purevfs.HostCompatibilityCapabilities())
+	planner := purevfs.NewExecutionPlanner(nil, e.executionCapabilities(ctx))
 	return planner.Plan(purevfs.ExecutionRequest{
-		Mode:           purevfs.ExecutionModeCompatibility,
+		Mode:           purevfs.ExecutionModeStrictNoDisk,
 		Intent:         purevfs.ExecutionIntentCommand,
 		Language:       inferExecutionLanguage(workspaceRoot, e.fileAccess),
 		WorkspaceRoot:  workspaceRoot,
@@ -77,6 +67,39 @@ func (e *Engineer) executionPlan(requested string) (purevfs.ExecutionPlan, error
 		Overlay:        overlay,
 		OverlayDeletes: overlayDeletes,
 	})
+}
+
+func (e *Engineer) executionCapabilities(ctx context.Context) purevfs.ExecutionCapabilities {
+	if e.executionBroker == nil {
+		return purevfs.ExecutionCapabilities{}
+	}
+	caps, err := e.executionBroker.Capabilities(ctx)
+	if err != nil {
+		return purevfs.ExecutionCapabilities{}
+	}
+	return caps
+}
+
+func (e *Engineer) executionWorkspace(allowWrites bool) purevfs.ExecutionFS {
+	if e.fileAccess == nil {
+		return versioning.NewDiskFileAccess(e.effectiveWorkingDirectory(), true)
+	}
+	if allowWrites && strictWorkspaceWritesAllowed(e.fileAccess) {
+		return e.fileAccess
+	}
+	return purevfs.ReadOnlyExecutionFS(e.fileAccess)
+}
+
+func strictWorkspaceWritesAllowed(fa versioning.FileAccess) bool {
+	if fa == nil || fa.IsReadOnly() {
+		return false
+	}
+	switch fa.(type) {
+	case *versioning.DiskFileAccess:
+		return false
+	default:
+		return true
+	}
 }
 
 func inferExecutionLanguage(workspaceRoot string, fa versioning.FileAccess) string {

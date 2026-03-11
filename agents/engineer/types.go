@@ -232,6 +232,8 @@ type CommandExecution struct {
 	ExecutionStrategy string `json:"execution_strategy,omitempty"`
 	// Materialized reports whether compatibility workspace materialization was used.
 	Materialized bool `json:"materialized,omitempty"`
+	// Truncated reports whether command output was clipped by broker limits.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // MemoryThreshold defines context window usage thresholds for the Engineer.

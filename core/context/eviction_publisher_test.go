@@ -11,6 +11,13 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 )
 
+func flushEvictionPublisher(p *EvictionEventPublisher) {
+	if p == nil {
+		return
+	}
+	p.Flush()
+}
+
 // =============================================================================
 // AE.3.5 EvictionReason Tests
 // =============================================================================
@@ -148,6 +155,7 @@ func TestPublishEvictionStarted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) != 1 {
@@ -216,6 +224,7 @@ func TestPublishItemEvicted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -284,6 +293,7 @@ func TestPublishItemEvicted_WithMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -322,6 +332,7 @@ func TestPublishEvictionCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -376,6 +387,7 @@ func TestPublishEvictionCompleted_WithItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -428,6 +440,7 @@ func TestPublishEvictionCompleted_ItemsTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -460,6 +473,7 @@ func TestPublishEvictionFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -500,6 +514,7 @@ func TestPublishBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -548,6 +563,7 @@ func TestPublishBatch_VerboseLevel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -627,6 +643,7 @@ func TestUpdateSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	flushEvictionPublisher(publisher)
 
 	evts := collector.Events()
 	if len(evts) == 0 {
@@ -703,6 +720,7 @@ func TestEvictionHookInterface(t *testing.T) {
 
 	// Test OnEvictionStarted
 	hook.OnEvictionStarted("agent-1", EvictionReasonMemoryPressure, 1000)
+	flushEvictionPublisher(publisher)
 
 	if collector.EventCount() == 0 {
 		t.Fatal("expected at least one event from OnEvictionStarted")
@@ -722,6 +740,7 @@ func TestEvictionHookInterface(t *testing.T) {
 		Reason:      EvictionReasonMemoryPressure,
 	}
 	hook.OnEvictionCompleted(batch)
+	flushEvictionPublisher(publisher)
 
 	if collector.EventCount() == 0 {
 		t.Fatal("expected at least one event from OnEvictionCompleted")
@@ -731,6 +750,7 @@ func TestEvictionHookInterface(t *testing.T) {
 
 	// Test OnEvictionFailed
 	hook.OnEvictionFailed("agent-1", EvictionReasonMemoryPressure, errors.New("test error"))
+	flushEvictionPublisher(publisher)
 
 	if collector.EventCount() == 0 {
 		t.Fatal("expected at least one event from OnEvictionFailed")

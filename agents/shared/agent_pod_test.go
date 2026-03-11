@@ -671,3 +671,25 @@ func TestAgentPod_NoScribeFactory(t *testing.T) {
 
 	pod.Release()
 }
+
+func TestAgentPod_PreActivateStrict_FailsAndReleasesGuards(t *testing.T) {
+	act := &podTrackingActivator{}
+	reg := &podTrackingRegistrar{failOn: "designer"}
+	pod := NewAgentPod(AgentPodConfig{
+		PodID:       "pod-1",
+		Activator:   act,
+		Registrar:   reg.register,
+		MemberTypes: []string{"engineer", "designer"},
+	})
+
+	err := pod.PreActivateStrict(context.Background())
+	if err == nil {
+		t.Fatal("expected strict pre-activation error")
+	}
+	if act.releaseCount() != 2 {
+		t.Fatalf("expected 2 guard releases, got %d", act.releaseCount())
+	}
+	if pod.ActiveGuardCount() != 0 {
+		t.Fatalf("expected 0 active guards, got %d", pod.ActiveGuardCount())
+	}
+}

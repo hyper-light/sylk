@@ -27,6 +27,10 @@ func (g *GlobalDraftFileAccess) ReadFile(ctx context.Context, path string) ([]by
 	return g.delegate.ReadFile(ctx, path)
 }
 
+func (g *GlobalDraftFileAccess) MkdirAll(ctx context.Context, path string) error {
+	return g.session.ApplyGlobalMkdir(ctx, path)
+}
+
 func (g *GlobalDraftFileAccess) WriteFile(ctx context.Context, path string, content []byte) error {
 	return g.session.ApplyGlobalWrite(ctx, path, content)
 }

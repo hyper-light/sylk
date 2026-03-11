@@ -480,103 +480,153 @@ func (m *Model) Update(msg tea.Msg) (component.Component, tea.Cmd) {
 // The default branch (detected from the repository) is placed last (bottom
 // of the tree) and other branches are ordered newest-first above it.
 func (m *Model) SetBranches(branches []BranchNode, defaultBranch string) {
-	// Remember the currently selected and expanded branch names so we can
-	// restore them after the data refresh (reloads happen on every git
-	// status change).
-	var prevName, expandedName string
+	state := m.captureBranchRefreshState()
+	m.defaultBranch = defaultBranch
+	m.applyKnownBranchParents(branches)
+	m.branches = sortBranchesForTree(branches, defaultBranch)
+	m.recomputeOffshootLayout()
+	m.restoreBranchSelection(state.prevName)
+	m.restoreExpandedBranch(state.expandedName, state.prevAction)
+	m.finishBranchRefresh(state.prevScroll)
+}
+
+type branchRefreshState struct {
+	prevName     string
+	expandedName string
+	prevAction   int
+	prevScroll   int
+}
+
+func (m *Model) captureBranchRefreshState() branchRefreshState {
+	state := branchRefreshState{
+		prevAction: m.expandedAction,
+		prevScroll: m.branchScrollOff,
+	}
 	if m.branchIdx >= 0 && m.branchIdx < len(m.branches) {
-		prevName = m.branches[m.branchIdx].Name
+		state.prevName = m.branches[m.branchIdx].Name
 	}
 	if m.expandedIdx >= 0 && m.expandedIdx < len(m.branches) {
-		expandedName = m.branches[m.expandedIdx].Name
+		state.expandedName = m.branches[m.expandedIdx].Name
 	}
-	prevAction := m.expandedAction
-	prevScroll := m.branchScrollOff
+	return state
+}
 
-	m.defaultBranch = defaultBranch
-
-	// Apply known parent relationships from UI-initiated branch creation.
-	// Only fill in when inference left the parent empty; inferred parents
-	// are derived from the current topology and take precedence.
+func (m *Model) applyKnownBranchParents(branches []BranchNode) {
 	for i := range branches {
 		if branches[i].Parent != "" {
 			continue
 		}
-		if p, ok := m.branchParents[branches[i].Name]; ok && p != branches[i].Name {
-			branches[i].Parent = p
+		if parent, ok := m.knownBranchParent(branches[i].Name); ok {
+			branches[i].Parent = parent
 		}
 	}
+}
 
-	// Sort: default branch last, newest-first by AuthorTime. Sibling
-	// ordering within depth tiers is handled by recomputeOffshootLayout
-	// (which uses CreatedTime for stable ordering when reflogs exist).
+func (m *Model) knownBranchParent(name string) (string, bool) {
+	parent, ok := m.branchParents[name]
+	if !ok || parent == name {
+		return "", false
+	}
+	return parent, true
+}
+
+func sortBranchesForTree(branches []BranchNode, defaultBranch string) []BranchNode {
 	slices.SortStableFunc(branches, func(a, b BranchNode) int {
-		// Detached HEAD always sorts first.
-		if a.IsDetached != b.IsDetached {
-			if a.IsDetached {
-				return -1
-			}
-			return 1
-		}
-		ap := a.Name == defaultBranch
-		bp := b.Name == defaultBranch
-		if ap != bp {
-			if ap {
-				return 1
-			}
-			return -1
-		}
-		return b.AuthorTime.Compare(a.AuthorTime) // newest first
+		return compareBranchesForTree(defaultBranch, a, b)
 	})
-	branches = groupChildrenAfterParent(branches)
+	return groupChildrenAfterParent(branches)
+}
 
-	m.branches = branches
-	m.recomputeOffshootLayout()
+func compareBranchesForTree(defaultBranch string, a, b BranchNode) int {
+	if cmp := compareDetachedBranches(a, b); cmp != 0 {
+		return cmp
+	}
+	if cmp := compareDefaultBranchOrder(defaultBranch, a, b); cmp != 0 {
+		return cmp
+	}
+	return b.AuthorTime.Compare(a.AuthorTime)
+}
 
-	// Restore selection to the previously selected branch if still present.
-	// On first load (no prevName), default to the HEAD branch.
+func compareDetachedBranches(a, b BranchNode) int {
+	if a.IsDetached == b.IsDetached {
+		return 0
+	}
+	if a.IsDetached {
+		return -1
+	}
+	return 1
+}
+
+func compareDefaultBranchOrder(defaultBranch string, a, b BranchNode) int {
+	aDefault := a.Name == defaultBranch
+	bDefault := b.Name == defaultBranch
+	if aDefault == bDefault {
+		return 0
+	}
+	if aDefault {
+		return 1
+	}
+	return -1
+}
+
+func (m *Model) restoreBranchSelection(prevName string) {
 	m.branchIdx = 0
-	if prevName != "" {
-		for i, b := range m.branches {
-			if b.Name == prevName {
-				m.branchIdx = i
-				break
-			}
-		}
-	} else {
-		for i, b := range m.branches {
-			if b.IsHead {
-				m.branchIdx = i
-				break
-			}
+	if idx, ok := findBranchByName(m.branches, prevName); ok {
+		m.branchIdx = idx
+		return
+	}
+	if idx := headBranchIndex(m.branches); idx >= 0 {
+		m.branchIdx = idx
+	}
+}
+
+func findBranchByName(branches []BranchNode, name string) (int, bool) {
+	if name == "" {
+		return 0, false
+	}
+	for i, branch := range branches {
+		if branch.Name == name {
+			return i, true
 		}
 	}
+	return 0, false
+}
 
-	// Restore expanded card if the branch still exists.
+func headBranchIndex(branches []BranchNode) int {
+	for i, branch := range branches {
+		if branch.IsHead {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *Model) restoreExpandedBranch(expandedName string, prevAction int) {
 	m.expandedIdx = -1
 	m.expandedAction = 0
-	if expandedName != "" {
-		for i, b := range m.branches {
-			if b.Name == expandedName {
-				m.expandedIdx = i
-				m.expandedAction = prevAction
-				break
-			}
-		}
+	if idx, ok := findBranchByName(m.branches, expandedName); ok {
+		m.expandedIdx = idx
+		m.expandedAction = prevAction
 	}
+}
 
+func (m *Model) finishBranchRefresh(prevScroll int) {
 	m.branchScrollOff = prevScroll
 	m.invalidateCardCache()
-	// Preserve active views; only reset to branches when no drill-down,
-	// picker, or plan is active.
-	switch m.mode {
-	case viewCommits, viewBranchPick, viewRebasePlan:
-		// Keep the current view.
-	default:
+	if !m.keepBranchViewMode() {
 		m.mode = viewBranches
 	}
 	m.viewDirty = true
 	m.ensureBranchVisible()
+}
+
+func (m *Model) keepBranchViewMode() bool {
+	switch m.mode {
+	case viewCommits, viewBranchPick, viewRebasePlan:
+		return true
+	default:
+		return false
+	}
 }
 
 // SetWorkingTreeStatus updates the working tree dirty/conflicts flags used
@@ -1068,107 +1118,142 @@ func (m *Model) branchCardHeight(flatIdx int) int {
 // Clicking an action badge on an expanded card executes that action.
 func (m *Model) clickBranchView(viewX, viewY int) tea.Cmd {
 	m.debugLogClick(viewX, viewY)
-	if len(m.branches) == 0 {
+	normalizedY, ok := m.branchClickY(viewY)
+	if !ok {
 		return nil
+	}
+	target, ok := m.branchClickTargetAt(viewX, normalizedY)
+	if !ok {
+		return nil
+	}
+	if cmd, handled := m.handleExpandedBranchClick(target, viewX); handled {
+		return cmd
+	}
+	m.selectBranchTarget(target.idx)
+	return nil
+}
+
+type branchClickTarget struct {
+	idx      int
+	cardLeft int
+	cardW    int
+	localY   int
+}
+
+func (m *Model) branchClickY(viewY int) (int, bool) {
+	if len(m.branches) == 0 {
+		return 0, false
 	}
 	viewY -= m.viewTopPad()
 	if viewY < 0 {
-		return nil
+		return 0, false
 	}
+	return viewY, true
+}
 
-	oc := m.offshootCount()
-	offRows := m.offshootRowCount()
-	cols := m.effectiveCols()
+func (m *Model) branchClickTargetAt(viewX, viewY int) (branchClickTarget, bool) {
+	targetRow, localY, ok := m.findBranchRowAtY(viewY)
+	if !ok {
+		return branchClickTarget{}, false
+	}
+	return m.resolveBranchClickTarget(viewX, targetRow, localY)
+}
 
-	// Walk rows to find which row the click lands in, tracking cumulative Y.
+func (m *Model) findBranchRowAtY(viewY int) (int, int, bool) {
 	y := 0
-	targetRow := -1
-	localY := 0
-	endRow := m.totalBranchRows()
-	for rowIdx := m.branchScrollOff; rowIdx < endRow; rowIdx++ {
-		rh := m.branchRowLines(rowIdx)
-		if viewY >= y && viewY < y+rh {
-			targetRow = rowIdx
-			localY = viewY - y
-			break
+	for rowIdx := m.branchScrollOff; rowIdx < m.totalBranchRows(); rowIdx++ {
+		rowHeight := m.branchRowLines(rowIdx)
+		if viewY >= y && viewY < y+rowHeight {
+			return rowIdx, viewY - y, true
 		}
-		y += rh
+		y += rowHeight
 	}
-	if targetRow < 0 {
-		return nil
+	return 0, 0, false
+}
+
+func (m *Model) resolveBranchClickTarget(viewX, targetRow, localY int) (branchClickTarget, bool) {
+	if targetRow < m.offshootRowCount() {
+		return m.resolveOffshootBranchClickTarget(viewX, targetRow, localY)
 	}
-
-	// Determine the flat branch index from row + column.
-	targetIdx := -1
-	cardLeft := 0
-	cardW := 0
-
-	if targetRow < offRows {
-		// Offshoot row — use grid-based positioning matching render.
-		row := m.offRows[targetRow]
-		cardW = offshootCardWidth(m.width, cols)
-		totalGrid := cols*cardW + max(cols-1, 0)*branchCardGap
-		leftMargin := trunkAlignedMargin(m.width, totalGrid)
-
-		hitIdx := -1
-		for i, flatIdx := range row {
-			ci := m.offGridCol[flatIdx]
-			cl := leftMargin + ci*(cardW+branchCardGap)
-			if viewX >= cl && viewX < cl+cardW {
-				hitIdx = i
-				cardLeft = cl
-				break
-			}
-		}
-		if hitIdx < 0 {
-			return nil
-		}
-		targetIdx = row[hitIdx]
-	} else if targetRow == offRows {
-		// Primary branch — check X bounds same as offshoots.
-		cardW = primaryCardWidth(m.width)
-		cardLeft = trunkAlignedMargin(m.width, cardW)
-		if viewX < cardLeft || viewX >= cardLeft+cardW {
-			return nil
-		}
-		targetIdx = oc
-	} else {
-		return nil
+	if targetRow == m.offshootRowCount() {
+		return m.resolvePrimaryBranchClickTarget(viewX, localY)
 	}
+	return branchClickTarget{}, false
+}
 
-	// If clicking the expanded card's expansion area (divider, action line,
-	// confirm/input, bottom border), test against computed hit regions with
-	// both X and Y coordinates to prevent cross-line interference.
-	if m.expandedIdx == targetIdx {
-		cardH := m.branchCardHeight(targetIdx)
-		localX := viewX - cardLeft - 1 // -1 for left border "│"
-		m.debugLogCardHit(targetIdx, localY, localX, cardLeft, cardW, cardH)
-		if localY >= 3 && localY < cardH {
-			if localX >= 0 {
-				for _, r := range m.expandedHitRegions() {
-					if localY == r.Y && localX >= r.XMin && localX < r.XMax {
-						return m.handleCardHit(r, localX)
-					}
-				}
-			}
-			m.viewDirty = true
-			return nil
+func (m *Model) resolveOffshootBranchClickTarget(viewX, targetRow, localY int) (branchClickTarget, bool) {
+	row := m.offRows[targetRow]
+	cols := m.effectiveCols()
+	cardW := offshootCardWidth(m.width, cols)
+	totalGrid := cols*cardW + max(cols-1, 0)*branchCardGap
+	leftMargin := trunkAlignedMargin(m.width, totalGrid)
+	for _, flatIdx := range row {
+		cardLeft := leftMargin + m.offGridCol[flatIdx]*(cardW+branchCardGap)
+		if viewX >= cardLeft && viewX < cardLeft+cardW {
+			return branchClickTarget{idx: flatIdx, cardLeft: cardLeft, cardW: cardW, localY: localY}, true
 		}
 	}
+	return branchClickTarget{}, false
+}
 
+func (m *Model) resolvePrimaryBranchClickTarget(viewX, localY int) (branchClickTarget, bool) {
+	cardW := primaryCardWidth(m.width)
+	cardLeft := trunkAlignedMargin(m.width, cardW)
+	if viewX < cardLeft || viewX >= cardLeft+cardW {
+		return branchClickTarget{}, false
+	}
+	return branchClickTarget{
+		idx:      m.offshootCount(),
+		cardLeft: cardLeft,
+		cardW:    cardW,
+		localY:   localY,
+	}, true
+}
+
+func (m *Model) handleExpandedBranchClick(target branchClickTarget, viewX int) (tea.Cmd, bool) {
+	if m.expandedIdx != target.idx {
+		return nil, false
+	}
+	cardH := m.branchCardHeight(target.idx)
+	localX := viewX - target.cardLeft - 1
+	m.debugLogCardHit(target.idx, target.localY, localX, target.cardLeft, target.cardW, cardH)
+	if target.localY < 3 || target.localY >= cardH {
+		return nil, false
+	}
+	if region, ok := m.expandedCardHitRegion(target.localY, localX); ok {
+		return m.handleCardHit(region, localX), true
+	}
+	m.viewDirty = true
+	return nil, true
+}
+
+func (m *Model) expandedCardHitRegion(localY, localX int) (cardHitRegion, bool) {
+	if localX < 0 {
+		return cardHitRegion{}, false
+	}
+	for _, region := range m.expandedHitRegions() {
+		if localY == region.Y && localX >= region.XMin && localX < region.XMax {
+			return region, true
+		}
+	}
+	return cardHitRegion{}, false
+}
+
+func (m *Model) selectBranchTarget(targetIdx int) {
 	if m.branchIdx == targetIdx {
 		m.expandBranch()
 	} else {
-		// Collapse any expanded card before switching selection.
-		if m.expandedIdx >= 0 {
-			m.collapseBranch()
-		}
-		m.branchIdx = targetIdx
+		m.selectBranchCard(targetIdx)
 	}
-
 	m.ensureBranchVisible()
 	m.viewDirty = true
-	return nil
+}
+
+func (m *Model) selectBranchCard(targetIdx int) {
+	if m.expandedIdx >= 0 {
+		m.collapseBranch()
+	}
+	m.branchIdx = targetIdx
 }
 
 // clickActionBadge selects the badge at the given action index and executes
@@ -3069,112 +3154,187 @@ func (m *Model) moveBranchLeft() {
 
 // handleCommitKey processes keys in commit cards view.
 // Tab/shift+tab cycle through toolbar buttons; enter executes when focused.
-func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
-	// Esc exits the active mode before returning to branches.
-	if km.String() == "esc" {
-		if m.cherryPickMode {
-			m.exitCherryPickMode()
-			return nil
-		}
-		if m.revertMode {
-			m.exitRevertMode()
-			return nil
-		}
-		if m.resetMode {
-			m.exitResetMode()
-			return nil
-		}
-		if m.diffMode {
-			m.exitDiffMode()
-			return nil
-		}
-		m.ExitToBranches()
-		return nil
-	}
+type commitModeAction struct {
+	active func(*Model) bool
+	run    func(*Model)
+}
 
+var commitExitActions = []commitModeAction{
+	{active: func(m *Model) bool { return m.cherryPickMode }, run: (*Model).exitCherryPickMode},
+	{active: func(m *Model) bool { return m.revertMode }, run: (*Model).exitRevertMode},
+	{active: func(m *Model) bool { return m.resetMode }, run: (*Model).exitResetMode},
+	{active: func(m *Model) bool { return m.diffMode }, run: (*Model).exitDiffMode},
+}
+
+var commitToggleActions = []commitModeAction{
+	{active: func(m *Model) bool { return m.cherryPickMode }, run: (*Model).toggleCherryPickSelection},
+	{active: func(m *Model) bool { return m.diffMode }, run: (*Model).toggleDiffSelection},
+}
+
+var commitToolbarCycles = map[string]int{
+	"tab":       1,
+	"shift+tab": -1,
+}
+
+var commitNavHandlers = map[string]func(*Model){
+	"j":          (*Model).commitNavDown,
+	"down":       (*Model).commitNavDown,
+	"shift+down": (*Model).commitNavDown,
+	"k":          (*Model).commitNavUp,
+	"up":         (*Model).commitNavUp,
+	"shift+up":   (*Model).commitNavUp,
+	"g":          (*Model).commitNavFirst,
+	"G":          (*Model).commitNavLast,
+	"ctrl+d":     (*Model).commitHalfPageDown,
+	"ctrl+u":     (*Model).commitHalfPageUp,
+}
+
+func (m *Model) handleCommitKey(km tea.KeyMsg) tea.Cmd {
+	ks := km.String()
+	if cmd, handled := m.handleCommitEscapeKey(ks); handled {
+		return cmd
+	}
 	if len(m.nodes) == 0 {
 		return nil
 	}
-
-	// In cherry-pick mode, Enter/Space toggle selection.
-	if m.cherryPickMode && !m.toolbarFocused {
-		switch km.String() {
-		case "enter", " ":
-			m.toggleCherryPickSelection()
-			return nil
-		}
-	}
-
-	// In diff mode, Enter/Space toggle the current commit's selection.
-	if m.diffMode && !m.toolbarFocused {
-		switch km.String() {
-		case "enter", " ":
-			m.toggleDiffSelection()
-			return nil
-		}
-	}
-
-	switch km.String() {
-	case "tab":
-		m.cycleCommitToolbar(1)
-		m.viewDirty = true
+	if m.handleCommitSelectionToggle(ks) {
 		return nil
-	case "shift+tab":
-		m.cycleCommitToolbar(-1)
-		m.viewDirty = true
-		return nil
-	case "enter", " ":
-		if m.toolbarFocused {
-			m.viewDirty = true
-			return m.executeToolbarAction()
-		}
-		// Non-toolbar Enter: checkout the selected commit.
-		hash := m.SelectedHash()
-		if hash != "" {
-			return func() tea.Msg { return CommitCheckoutRequestMsg{Hash: hash} }
-		}
 	}
-
+	if cmd, handled := m.handleCommitToolbarKey(ks); handled {
+		return cmd
+	}
 	m.toolbarFocused = false
-
 	if m.dagMode && len(m.dagSections) > 0 {
 		return m.handleCommitDAGKey(km)
 	}
+	return m.handleCommitNavigationKey(ks)
+}
 
-	prev := m.selectedIdx
+func (m *Model) handleCommitEscapeKey(ks string) (tea.Cmd, bool) {
+	if ks != "esc" {
+		return nil, false
+	}
+	if m.runCommitAction(commitExitActions) {
+		return nil, true
+	}
+	m.ExitToBranches()
+	return nil, true
+}
 
-	switch km.String() {
-	case "j", "down", "shift+down":
-		m.moveDown(1)
-	case "k", "up", "shift+up":
-		m.moveUp(1)
-	case "g":
-		m.selectedIdx = 0
-	case "G":
-		m.selectedIdx = len(m.nodes) - 1
-	case "ctrl+d":
-		m.moveDown(m.halfPage())
-	case "ctrl+u":
-		m.moveUp(m.halfPage())
-	default:
+func (m *Model) runCommitAction(actions []commitModeAction) bool {
+	for _, action := range actions {
+		if action.active(m) {
+			action.run(m)
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) handleCommitSelectionToggle(ks string) bool {
+	if !m.commitToggleAllowed(ks) {
+		return false
+	}
+	return m.runCommitAction(commitToggleActions)
+}
+
+func (m *Model) commitToggleAllowed(ks string) bool {
+	return isCommitActivateKey(ks) && !m.toolbarFocused
+}
+
+func (m *Model) handleCommitToolbarKey(ks string) (tea.Cmd, bool) {
+	if delta, ok := commitToolbarCycles[ks]; ok {
+		m.cycleCommitToolbar(delta)
+		m.viewDirty = true
+		return nil, true
+	}
+	if !isCommitActivateKey(ks) {
+		return nil, false
+	}
+	return m.handleCommitActivation(), true
+}
+
+func (m *Model) handleCommitActivation() tea.Cmd {
+	if m.toolbarFocused {
+		m.viewDirty = true
+		return m.executeToolbarAction()
+	}
+	return m.checkoutSelectedCommit()
+}
+
+func (m *Model) checkoutSelectedCommit() tea.Cmd {
+	hash := m.SelectedHash()
+	if hash == "" {
 		return nil
 	}
+	return func() tea.Msg { return CommitCheckoutRequestMsg{Hash: hash} }
+}
 
+func isCommitActivateKey(ks string) bool {
+	return ks == "enter" || ks == " "
+}
+
+func (m *Model) handleCommitNavigationKey(ks string) tea.Cmd {
+	prev := m.selectedIdx
+	if !m.applyCommitNavigation(ks) {
+		return nil
+	}
 	m.ensureVisible()
 	m.viewDirty = true
+	return m.commitSelectionChangeCmd(prev)
+}
 
+func (m *Model) applyCommitNavigation(ks string) bool {
+	handler, ok := commitNavHandlers[ks]
+	if !ok {
+		return false
+	}
+	handler(m)
+	return true
+}
+
+func (m *Model) commitNavDown() {
+	m.moveDown(1)
+}
+
+func (m *Model) commitNavUp() {
+	m.moveUp(1)
+}
+
+func (m *Model) commitNavFirst() {
+	m.selectedIdx = 0
+}
+
+func (m *Model) commitNavLast() {
+	m.selectedIdx = len(m.nodes) - 1
+}
+
+func (m *Model) commitHalfPageDown() {
+	m.moveDown(m.halfPage())
+}
+
+func (m *Model) commitHalfPageUp() {
+	m.moveUp(m.halfPage())
+}
+
+func (m *Model) commitSelectionChangeCmd(prev int) tea.Cmd {
 	var cmds []tea.Cmd
 	if m.selectedIdx != prev {
 		cmds = append(cmds, m.selectionCmd())
 	}
 	if m.needsLoadMore() {
-		m.loadingMore = true
-		m.loadingEpoch = time.Now()
-		m.loadingBarUntil = time.Now().Add(minLoadingBarDuration)
-		m.viewDirty = true
-		cmds = append(cmds, func() tea.Msg { return LoadMoreMsg{} })
+		cmds = append(cmds, m.startLoadMoreCmd())
 	}
 	return tea.Batch(cmds...)
+}
+
+func (m *Model) startLoadMoreCmd() tea.Cmd {
+	now := time.Now()
+	m.loadingMore = true
+	m.loadingEpoch = now
+	m.loadingBarUntil = now.Add(minLoadingBarDuration)
+	m.viewDirty = true
+	return func() tea.Msg { return LoadMoreMsg{} }
 }
 
 // handleCommitDAGKey processes keys when in DAG trunk-and-offshoots mode.
@@ -3602,105 +3762,142 @@ func (m *Model) ExitRebasePlan() {
 // handleBranchPickerKey processes keys when the branch picker dropdown is open.
 // Filter is activated with / or alt+f (matching other panels). Navigation uses
 // j/k, Tab cycles the toolbar, Enter confirms the highlighted branch.
+var branchPickerNavHandlers = map[string]func(*Model, []string){
+	"j":      (*Model).branchPickerMoveDown,
+	"down":   (*Model).branchPickerMoveDown,
+	"k":      (*Model).branchPickerMoveUp,
+	"up":     (*Model).branchPickerMoveUp,
+	"g":      (*Model).branchPickerMoveFirst,
+	"G":      (*Model).branchPickerMoveLast,
+	"ctrl+d": (*Model).branchPickerHalfPageDown,
+	"ctrl+u": (*Model).branchPickerHalfPageUp,
+}
+
 func (m *Model) handleBranchPickerKey(km tea.KeyMsg) tea.Cmd {
-	// When the filter input is active, route typing there.
 	if m.branchPickerFilterActive {
 		return m.handlePickerFilterKey(km)
 	}
-
 	items := m.filteredBranchItems()
 	ks := km.String()
-
-	switch ks {
-	case "tab":
-		m.hoverButtonIdx = -1
-		m.cycleCommitToolbar(1)
-		m.viewDirty = true
+	if cmd, handled := m.handleBranchPickerToolbarKey(ks); handled {
+		return cmd
+	}
+	if cmd, handled := m.handleBranchPickerEscapeKey(ks); handled {
+		return cmd
+	}
+	if cmd, handled := m.handleBranchPickerConfirmKey(ks, items); handled {
+		return cmd
+	}
+	if m.applyBranchPickerNavigation(ks, items) {
 		return nil
-	case "shift+tab":
-		m.hoverButtonIdx = -1
-		m.cycleCommitToolbar(-1)
-		m.viewDirty = true
-		return nil
-	case "esc":
-		if m.toolbarFocused {
-			m.toolbarFocused = false
-			m.viewDirty = true
-			return nil
-		}
-		if m.branchPickerFilter != "" {
-			m.branchPickerFilter = ""
-			m.branchPickerCursor = 0
-			m.viewDirty = true
-			return nil
-		}
-		m.closeBranchPicker()
-		if m.cherryPickMode {
-			m.exitCherryPickMode()
-		}
-		return nil
-	case "enter", " ":
-		if m.toolbarFocused {
-			m.viewDirty = true
-			return m.executeToolbarAction()
-		}
-		if len(items) == 0 {
-			return nil
-		}
-		return m.confirmBranchPicker(items[m.branchPickerCursor])
-	case "j", "down":
-		m.toolbarFocused = false
-		if m.branchPickerCursor < len(items)-1 {
-			m.branchPickerCursor++
-		}
-		m.viewDirty = true
-		return nil
-	case "k", "up":
-		m.toolbarFocused = false
-		if m.branchPickerCursor > 0 {
-			m.branchPickerCursor--
-		}
-		m.viewDirty = true
-		return nil
-	case "g":
-		m.toolbarFocused = false
-		m.branchPickerCursor = 0
-		m.viewDirty = true
-		return nil
-	case "G":
-		m.toolbarFocused = false
-		if len(items) > 0 {
-			m.branchPickerCursor = len(items) - 1
-		}
-		m.viewDirty = true
-		return nil
-	case "ctrl+d":
-		m.toolbarFocused = false
-		half := max(m.contentHeight()/2, 1)
-		for range half {
-			if m.branchPickerCursor < len(items)-1 {
-				m.branchPickerCursor++
-			}
-		}
-		m.viewDirty = true
-		return nil
-	case "ctrl+u":
-		m.toolbarFocused = false
-		half := max(m.contentHeight()/2, 1)
-		for range half {
-			if m.branchPickerCursor > 0 {
-				m.branchPickerCursor--
-			}
-		}
-		m.viewDirty = true
-		return nil
-	case "/", "alt+f":
-		m.branchPickerFilterActive = true
-		m.toolbarFocused = false
-		m.viewDirty = true
+	}
+	if m.handleBranchPickerFilterShortcut(ks) {
 		return nil
 	}
 	return nil
+}
+
+func (m *Model) handleBranchPickerToolbarKey(ks string) (tea.Cmd, bool) {
+	if delta, ok := commitToolbarCycles[ks]; ok {
+		m.hoverButtonIdx = -1
+		m.cycleCommitToolbar(delta)
+		m.viewDirty = true
+		return nil, true
+	}
+	return nil, false
+}
+
+func (m *Model) handleBranchPickerEscapeKey(ks string) (tea.Cmd, bool) {
+	if ks != "esc" {
+		return nil, false
+	}
+	if m.toolbarFocused {
+		m.toolbarFocused = false
+		m.viewDirty = true
+		return nil, true
+	}
+	if m.branchPickerFilter != "" {
+		m.branchPickerFilter = ""
+		m.branchPickerCursor = 0
+		m.viewDirty = true
+		return nil, true
+	}
+	m.closeBranchPicker()
+	if m.cherryPickMode {
+		m.exitCherryPickMode()
+	}
+	return nil, true
+}
+
+func (m *Model) handleBranchPickerConfirmKey(ks string, items []string) (tea.Cmd, bool) {
+	if !isCommitActivateKey(ks) {
+		return nil, false
+	}
+	if m.toolbarFocused {
+		m.viewDirty = true
+		return m.executeToolbarAction(), true
+	}
+	if len(items) == 0 {
+		return nil, true
+	}
+	return m.confirmBranchPicker(items[m.branchPickerCursor]), true
+}
+
+func (m *Model) applyBranchPickerNavigation(ks string, items []string) bool {
+	handler, ok := branchPickerNavHandlers[ks]
+	if !ok {
+		return false
+	}
+	m.toolbarFocused = false
+	handler(m, items)
+	m.viewDirty = true
+	return true
+}
+
+func (m *Model) handleBranchPickerFilterShortcut(ks string) bool {
+	if ks != "/" && ks != "alt+f" {
+		return false
+	}
+	m.branchPickerFilterActive = true
+	m.toolbarFocused = false
+	m.viewDirty = true
+	return true
+}
+
+func (m *Model) branchPickerMoveDown(items []string) {
+	m.branchPickerStep(1, items)
+}
+
+func (m *Model) branchPickerMoveUp(items []string) {
+	m.branchPickerStep(-1, items)
+}
+
+func (m *Model) branchPickerMoveFirst(items []string) {
+	m.setBranchPickerCursor(0, items)
+}
+
+func (m *Model) branchPickerMoveLast(items []string) {
+	m.setBranchPickerCursor(len(items)-1, items)
+}
+
+func (m *Model) branchPickerHalfPageDown(items []string) {
+	m.branchPickerStep(max(m.contentHeight()/2, 1), items)
+}
+
+func (m *Model) branchPickerHalfPageUp(items []string) {
+	m.branchPickerStep(-max(m.contentHeight()/2, 1), items)
+}
+
+func (m *Model) branchPickerStep(delta int, items []string) {
+	m.setBranchPickerCursor(m.branchPickerCursor+delta, items)
+}
+
+func (m *Model) setBranchPickerCursor(cursor int, items []string) {
+	if len(items) == 0 {
+		m.branchPickerCursor = 0
+		return
+	}
+	m.branchPickerCursor = clampInt(cursor, 0, len(items)-1)
 }
 
 // handlePickerFilterKey processes keys when the branch picker filter input is active.
@@ -3945,6 +4142,46 @@ func (m *Model) deactivateRebaseFilter() {
 	m.viewDirty = true
 }
 
+type rebasePlanKeyHandler func(*Model, int) tea.Cmd
+
+var rebasePlanActionKeys = map[string]int{
+	"p": 0,
+	"r": 1,
+	"s": 2,
+	"f": 3,
+	"e": 4,
+	"d": 5,
+}
+
+var rebasePlanKeyHandlers = map[string]rebasePlanKeyHandler{
+	"esc":        rebaseEscapeKey,
+	"shift+down": rebaseSelectionKey(1),
+	"shift+up":   rebaseSelectionKey(-1),
+	"j":          rebaseCursorKey(1),
+	"down":       rebaseCursorKey(1),
+	"k":          rebaseCursorKey(-1),
+	"up":         rebaseCursorKey(-1),
+	"J":          rebaseReorderKey(1),
+	"K":          rebaseReorderKey(-1),
+	"l":          rebaseCycleActionKey(1),
+	"right":      rebaseCycleActionKey(1),
+	"enter":      rebaseCycleActionKey(1),
+	" ":          rebaseCycleActionKey(1),
+	"h":          rebaseCycleActionKey(-1),
+	"left":       rebaseCycleActionKey(-1),
+	"/":          rebaseActivateFilterKey,
+	"alt+f":      rebaseActivateFilterKey,
+	"tab":        rebaseToolbarKey(1),
+	"shift+tab":  rebaseToolbarKey(-1),
+}
+
+var rebaseFilterKeyHandlers = map[string]func(*Model) tea.Cmd{
+	"esc":       (*Model).handleRebaseFilterEscape,
+	"enter":     (*Model).handleRebaseFilterAccept,
+	"down":      (*Model).handleRebaseFilterAccept,
+	"backspace": (*Model).handleRebaseFilterBackspace,
+}
+
 // handleRebasePlanKey processes keys in the interactive rebase plan editor.
 func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 	if len(m.rebasePlan) == 0 {
@@ -3956,134 +4193,129 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 		return m.handleRebaseFilterKey(km)
 	}
 
-	n := m.rebaseVisibleLen()
-	ks := km.String()
+	if action, ok := rebasePlanActionKeys[km.String()]; ok {
+		m.setRebaseAction(action)
+		return nil
+	}
 
-	switch ks {
-	case "esc":
-		// Layered escape: toolbar → filter → multi-select → exit.
-		if m.toolbarFocused {
-			m.toolbarFocused = false
-			m.viewDirty = true
-			return nil
-		}
-		if len(m.rebaseFilterQuery) > 0 {
-			m.deactivateRebaseFilter()
-			return nil
-		}
-		if m.rebaseSelAnchor >= 0 {
-			m.rebaseSelAnchor = -1
-			m.viewDirty = true
-			return nil
-		}
-		m.ExitRebasePlan()
+	if handler, ok := rebasePlanKeyHandlers[km.String()]; ok {
+		return handler(m, m.rebaseVisibleLen())
+	}
+
+	return nil
+}
+
+func rebaseEscapeKey(m *Model, _ int) tea.Cmd { return m.handleRebaseEscape() }
+
+func rebaseSelectionKey(delta int) rebasePlanKeyHandler {
+	return func(m *Model, n int) tea.Cmd {
+		m.extendRebaseSelection(delta, n)
 		return nil
-	case "shift+down":
-		if m.rebaseSelAnchor < 0 {
-			m.rebaseSelAnchor = m.rebaseCursor
-		}
-		if m.rebaseCursor < n-1 {
-			m.rebaseCursor++
-		}
-		m.ensureRebaseCursorVisible()
-		m.viewDirty = true
+	}
+}
+
+func rebaseCursorKey(delta int) rebasePlanKeyHandler {
+	return func(m *Model, n int) tea.Cmd {
+		m.moveRebaseCursor(delta, n)
 		return nil
-	case "shift+up":
-		if m.rebaseSelAnchor < 0 {
-			m.rebaseSelAnchor = m.rebaseCursor
-		}
-		if m.rebaseCursor > 0 {
-			m.rebaseCursor--
-		}
-		m.ensureRebaseCursorVisible()
-		m.viewDirty = true
+	}
+}
+
+func rebaseReorderKey(delta int) rebasePlanKeyHandler {
+	return func(m *Model, n int) tea.Cmd {
+		m.reorderRebaseEntry(delta, n)
 		return nil
-	case "j", "down":
-		m.rebaseSelAnchor = -1
-		if m.rebaseCursor < n-1 {
-			m.rebaseCursor++
-		}
-		m.ensureRebaseCursorVisible()
-		m.viewDirty = true
-		return nil
-	case "k", "up":
-		m.rebaseSelAnchor = -1
-		if m.rebaseCursor > 0 {
-			m.rebaseCursor--
-		}
-		m.ensureRebaseCursorVisible()
-		m.viewDirty = true
-		return nil
-	case "J":
-		// Reorder disabled when filter/sort is active.
-		if m.rebaseFiltered != nil {
-			return nil
-		}
-		m.rebaseSelAnchor = -1
-		if m.rebaseCursor < n-1 {
-			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor+1] =
-				m.rebasePlan[m.rebaseCursor+1], m.rebasePlan[m.rebaseCursor]
-			m.rebaseCursor++
-			m.ensureRebaseCursorVisible()
-			m.viewDirty = true
-		}
-		return nil
-	case "K":
-		if m.rebaseFiltered != nil {
-			return nil
-		}
-		m.rebaseSelAnchor = -1
-		if m.rebaseCursor > 0 {
-			m.rebasePlan[m.rebaseCursor], m.rebasePlan[m.rebaseCursor-1] =
-				m.rebasePlan[m.rebaseCursor-1], m.rebasePlan[m.rebaseCursor]
-			m.rebaseCursor--
-			m.ensureRebaseCursorVisible()
-			m.viewDirty = true
-		}
-		return nil
-	case "p":
-		m.setRebaseAction(0)
-		return nil
-	case "r":
-		m.setRebaseAction(1)
-		return nil
-	case "s":
-		m.setRebaseAction(2)
-		return nil
-	case "f":
-		m.setRebaseAction(3)
-		return nil
-	case "e":
-		m.setRebaseAction(4)
-		return nil
-	case "d":
-		m.setRebaseAction(5)
-		return nil
-	case "l", "right", "enter", " ":
-		if m.toolbarFocused {
-			m.viewDirty = true
-			return m.executeToolbarAction()
-		}
-		m.cycleRebaseAction(1)
-		return nil
-	case "h", "left":
-		m.cycleRebaseAction(-1)
-		return nil
-	case "/", "alt+f":
-		m.rebaseFilterActive = true
-		m.toolbarFocused = false
-		m.viewDirty = true
-		return nil
-	case "tab":
-		m.cycleCommitToolbar(1)
-		m.viewDirty = true
-		return nil
-	case "shift+tab":
-		m.cycleCommitToolbar(-1)
+	}
+}
+
+func rebaseCycleActionKey(delta int) rebasePlanKeyHandler {
+	return func(m *Model, _ int) tea.Cmd {
+		return m.advanceRebaseAction(delta)
+	}
+}
+
+func rebaseActivateFilterKey(m *Model, _ int) tea.Cmd {
+	m.activateRebaseFilter()
+	return nil
+}
+
+func rebaseToolbarKey(delta int) rebasePlanKeyHandler {
+	return func(m *Model, _ int) tea.Cmd {
+		m.cycleCommitToolbar(delta)
 		m.viewDirty = true
 		return nil
 	}
+}
+
+func (m *Model) handleRebaseEscape() tea.Cmd {
+	switch {
+	case m.toolbarFocused:
+		m.toolbarFocused = false
+		m.viewDirty = true
+	case len(m.rebaseFilterQuery) > 0:
+		m.deactivateRebaseFilter()
+	case m.rebaseSelAnchor >= 0:
+		m.rebaseSelAnchor = -1
+		m.viewDirty = true
+	default:
+		m.ExitRebasePlan()
+	}
 	return nil
+}
+
+func (m *Model) extendRebaseSelection(delta, n int) {
+	if m.rebaseSelAnchor < 0 {
+		m.rebaseSelAnchor = m.rebaseCursor
+	}
+	m.shiftRebaseCursor(delta, n)
+}
+
+func (m *Model) moveRebaseCursor(delta, n int) {
+	m.rebaseSelAnchor = -1
+	m.shiftRebaseCursor(delta, n)
+}
+
+func (m *Model) shiftRebaseCursor(delta, n int) {
+	switch {
+	case delta > 0 && m.rebaseCursor < n-1:
+		m.rebaseCursor++
+	case delta < 0 && m.rebaseCursor > 0:
+		m.rebaseCursor--
+	}
+	m.ensureRebaseCursorVisible()
+	m.viewDirty = true
+}
+
+func (m *Model) reorderRebaseEntry(delta, n int) {
+	if m.rebaseFiltered != nil {
+		return
+	}
+
+	target := m.rebaseCursor + delta
+	if target < 0 || target >= n {
+		return
+	}
+
+	m.rebaseSelAnchor = -1
+	m.rebasePlan[m.rebaseCursor], m.rebasePlan[target] = m.rebasePlan[target], m.rebasePlan[m.rebaseCursor]
+	m.rebaseCursor = target
+	m.ensureRebaseCursorVisible()
+	m.viewDirty = true
+}
+
+func (m *Model) advanceRebaseAction(delta int) tea.Cmd {
+	if m.toolbarFocused && delta > 0 {
+		m.viewDirty = true
+		return m.executeToolbarAction()
+	}
+	m.cycleRebaseAction(delta)
+	return nil
+}
+
+func (m *Model) activateRebaseFilter() {
+	m.rebaseFilterActive = true
+	m.toolbarFocused = false
+	m.viewDirty = true
 }
 
 // handleRebaseFilterKey processes keys when the rebase plan filter input
@@ -4091,44 +4323,54 @@ func (m *Model) handleRebasePlanKey(km tea.KeyMsg) tea.Cmd {
 // Enter keeps the filter and returns focus to entries, Backspace on empty
 // deactivates.
 func (m *Model) handleRebaseFilterKey(km tea.KeyMsg) tea.Cmd {
-	switch km.String() {
-	case "esc":
+	if handler, ok := rebaseFilterKeyHandlers[km.String()]; ok {
+		return handler(m)
+	}
+
+	switch km.Type {
+	case tea.KeyRunes:
+		m.appendRebaseFilter(km.Runes...)
+	case tea.KeySpace:
+		m.appendRebaseFilter(' ')
+	}
+	return nil
+}
+
+func (m *Model) handleRebaseFilterEscape() tea.Cmd {
+	m.deactivateRebaseFilter()
+	return nil
+}
+
+func (m *Model) handleRebaseFilterAccept() tea.Cmd {
+	m.rebaseFilterActive = false
+	m.viewDirty = true
+	return nil
+}
+
+func (m *Model) handleRebaseFilterBackspace() tea.Cmd {
+	if len(m.rebaseFilterQuery) == 0 {
 		m.deactivateRebaseFilter()
 		return nil
-	case "enter", "down":
-		m.rebaseFilterActive = false
-		m.viewDirty = true
-		return nil
-	case "backspace":
-		if len(m.rebaseFilterQuery) > 0 {
-			m.rebaseFilterQuery = m.rebaseFilterQuery[:len(m.rebaseFilterQuery)-1]
-			m.rebuildRebaseFiltered()
-			m.rebaseCursor = 0
-			m.rebasePlanScroll = 0
-			m.rebaseSelAnchor = -1
-			m.viewDirty = true
-		} else {
-			m.deactivateRebaseFilter()
-		}
-		return nil
-	default:
-		if km.Type == tea.KeyRunes {
-			m.rebaseFilterQuery = append(m.rebaseFilterQuery, km.Runes...)
-			m.rebuildRebaseFiltered()
-			m.rebaseCursor = 0
-			m.rebasePlanScroll = 0
-			m.rebaseSelAnchor = -1
-			m.viewDirty = true
-		} else if km.Type == tea.KeySpace {
-			m.rebaseFilterQuery = append(m.rebaseFilterQuery, ' ')
-			m.rebuildRebaseFiltered()
-			m.rebaseCursor = 0
-			m.rebasePlanScroll = 0
-			m.rebaseSelAnchor = -1
-			m.viewDirty = true
-		}
-		return nil
 	}
+	m.rebaseFilterQuery = m.rebaseFilterQuery[:len(m.rebaseFilterQuery)-1]
+	m.resetRebaseFilterResults()
+	return nil
+}
+
+func (m *Model) appendRebaseFilter(runes ...rune) {
+	if len(runes) == 0 {
+		return
+	}
+	m.rebaseFilterQuery = append(m.rebaseFilterQuery, runes...)
+	m.resetRebaseFilterResults()
+}
+
+func (m *Model) resetRebaseFilterResults() {
+	m.rebuildRebaseFiltered()
+	m.rebaseCursor = 0
+	m.rebasePlanScroll = 0
+	m.rebaseSelAnchor = -1
+	m.viewDirty = true
 }
 
 // clickRebasePlanView handles clicks on the rebase plan.

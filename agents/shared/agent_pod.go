@@ -178,49 +178,87 @@ func (p *AgentPod) ManagedPod() *pod.ManagedPod {
 
 // PreActivate activates and registers all member types upfront so they
 // are visible in the TUI and subscribed to the bus before the first
-// dispatch. Starts Scribes if ScribeFactory is set.
+// dispatch. Best-effort: failures are logged and skipped.
 func (p *AgentPod) PreActivate(ctx context.Context) {
+	_ = p.preActivate(ctx, false)
+}
+
+// PreActivateStrict activates and registers all member types upfront,
+// returning an error on the first activation/registration failure.
+func (p *AgentPod) PreActivateStrict(ctx context.Context) error {
+	return p.preActivate(ctx, true)
+}
+
+func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
 	if p.activator == nil && p.managed == nil {
-		return
+		return nil
 	}
 
-	var releases []func()
-	var activated []string
+	releases := make([]func(), 0, len(p.memberTypes))
+	activated := make([]string, 0, len(p.memberTypes))
 
 	for _, agentType := range p.memberTypes {
-		release, err := p.acquireGuard(ctx, agentType)
+		release, err := p.preActivateMember(ctx, agentType)
 		if err != nil {
-			if p.logger != nil {
-				p.logger.Warn("agent pod: pre-activate failed",
-					"pod_id", p.podID, "agent_type", agentType, "error", err)
+			if strict {
+				releaseAll(releases)
+				return err
 			}
 			continue
 		}
 		releases = append(releases, release)
-
-		if err := p.registerOnce(ctx, agentType); err != nil {
-			if p.logger != nil {
-				p.logger.Warn("agent pod: pre-register failed",
-					"pod_id", p.podID, "agent_type", agentType, "error", err)
-			}
-			continue
-		}
 		activated = append(activated, agentType)
 		p.publishActivity(agentType)
 		p.logActivation(preActivateNodeID, agentType)
 	}
 
-	if len(releases) > 0 {
-		p.guardsMu.Lock()
-		p.nodeGuards[preActivateNodeID] = &PodGuardEntry{
-			AgentTypes: activated,
-			Releases:   releases,
-			AcquiredAt: time.Now(),
-		}
-		p.guardsMu.Unlock()
-	}
-
+	p.storePreActivationGuards(activated, releases)
 	p.startScribes()
+	return nil
+}
+
+func (p *AgentPod) preActivateMember(ctx context.Context, agentType string) (func(), error) {
+	release, err := p.acquireGuard(ctx, agentType)
+	if err != nil {
+		p.logPreActivateFailure("pre-activate failed", agentType, err)
+		return nil, fmt.Errorf("agent pod %s: pre-activate %s: %w", p.podID, agentType, err)
+	}
+	if err := p.registerOnce(ctx, agentType); err != nil {
+		release()
+		p.logPreActivateFailure("pre-register failed", agentType, err)
+		return nil, fmt.Errorf("agent pod %s: pre-register %s: %w", p.podID, agentType, err)
+	}
+	return release, nil
+}
+
+func (p *AgentPod) logPreActivateFailure(message, agentType string, err error) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Warn("agent pod: "+message,
+		"pod_id", p.podID,
+		"agent_type", agentType,
+		"error", err,
+	)
+}
+
+func (p *AgentPod) storePreActivationGuards(agentTypes []string, releases []func()) {
+	if len(releases) == 0 {
+		return
+	}
+	p.guardsMu.Lock()
+	p.nodeGuards[preActivateNodeID] = &PodGuardEntry{
+		AgentTypes: agentTypes,
+		Releases:   releases,
+		AcquiredAt: time.Now(),
+	}
+	p.guardsMu.Unlock()
+}
+
+func releaseAll(releases []func()) {
+	for _, release := range releases {
+		release()
+	}
 }
 
 // HoldForNode atomically activates every agent type in agentTypes,

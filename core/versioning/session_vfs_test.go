@@ -2,6 +2,7 @@ package versioning
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,8 +11,9 @@ import (
 func TestNewSessionVFS(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{
-		SessionID:  "test-session",
-		WorkingDir: dir,
+		SessionID:       "test-session",
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 	if err != nil {
 		t.Fatalf("NewSessionVFS: %v", err)
@@ -39,19 +41,20 @@ func TestNewSessionVFS(t *testing.T) {
 	if svfs.WAL() == nil {
 		t.Fatal("WAL should not be nil")
 	}
-	if _, ok := svfs.WAL().(*VersionedWAL); !ok {
-		t.Fatalf("expected disk-backed semantic WAL, got %T", svfs.WAL())
+	if _, ok := svfs.WAL().(*MemoryVersionedWAL); !ok {
+		t.Fatalf("expected in-memory semantic WAL, got %T", svfs.WAL())
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".sylk", "sessions", "test-session", "versioning", "wal")); err != nil {
-		t.Fatalf("expected on-disk semantic WAL root, stat err=%v", err)
+	if _, err := os.Stat(filepath.Join(dir, ".sylk", "sessions", "test-session", "versioning", "wal")); !os.IsNotExist(err) {
+		t.Fatalf("expected no on-disk semantic WAL root, stat err=%v", err)
 	}
 }
 
 func TestSessionVFS_BeginPipelineSeedsFromGlobalOverlay(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{
-		SessionID:  "test-session",
-		WorkingDir: dir,
+		SessionID:       "test-session",
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 	if err != nil {
 		t.Fatalf("NewSessionVFS: %v", err)
@@ -192,8 +195,9 @@ func TestSessionVFS_GlobalDraftWritesAdvanceWAL(t *testing.T) {
 func TestSessionVFS_FlushCommitsDraftAndSeedsNextPipelineFromDisk(t *testing.T) {
 	dir := t.TempDir()
 	svfs, err := NewSessionVFS(SessionVFSConfig{
-		SessionID:  "test-session",
-		WorkingDir: dir,
+		SessionID:       "test-session",
+		WorkingDir:      dir,
+		AllowDiskExport: true,
 	})
 	if err != nil {
 		t.Fatalf("NewSessionVFS: %v", err)
@@ -237,6 +241,70 @@ func TestSessionVFS_FlushCommitsDraftAndSeedsNextPipelineFromDisk(t *testing.T) 
 	}
 	if string(content) != "draft-1" {
 		t.Fatalf("pipeline content = %q, want %q", string(content), "draft-1")
+	}
+}
+
+func TestSessionVFS_DoesNotReplayGlobalDraftAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	cfg := SessionVFSConfig{
+		SessionID:  "test-session",
+		WorkingDir: dir,
+	}
+
+	svfs, err := NewSessionVFS(cfg)
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+
+	ctx := context.Background()
+	targetDir := filepath.Join(dir, "draft", "generated")
+	if err := svfs.NewGlobalFileAccess(false).MkdirAll(ctx, targetDir); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := svfs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := os.Stat(targetDir); !os.IsNotExist(err) {
+		t.Fatalf("expected draft directory to remain off-disk before flush, stat err=%v", err)
+	}
+
+	reopened, err := NewSessionVFS(cfg)
+	if err != nil {
+		t.Fatalf("reopen NewSessionVFS: %v", err)
+	}
+	defer reopened.Close()
+
+	_, err = reopened.NewGlobalFileAccess(false).Stat(ctx, targetDir)
+	if !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("Stat after reopen error = %v, want %v", err, ErrFileNotFound)
+	}
+	exists, err := reopened.NewGlobalFileAccess(false).Exists(ctx, targetDir)
+	if err != nil {
+		t.Fatalf("Exists after reopen: %v", err)
+	}
+	if exists {
+		t.Fatal("expected global draft directory to disappear after reopen in strict RAM mode")
+	}
+}
+
+func dirEntryNamesFS(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
+}
+
+func TestNewSessionVFS_RejectsPersistentSessionState(t *testing.T) {
+	dir := t.TempDir()
+	_, err := NewSessionVFS(SessionVFSConfig{
+		SessionID:           "test-session",
+		WorkingDir:          dir,
+		PersistSessionState: true,
+	})
+	if !errors.Is(err, ErrPersistentSessionStateDisabled) {
+		t.Fatalf("NewSessionVFS error = %v, want %v", err, ErrPersistentSessionStateDisabled)
 	}
 }
 

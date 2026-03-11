@@ -8,6 +8,10 @@ import (
 func designerVisibleSkillNames() []string {
 	return []string{
 		"search_skills",
+		"read_file",
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"component_search",
 		"read_workspace_file",
 		"workspace_glob",
@@ -31,6 +35,9 @@ func designerMutatingSkillNames() []string {
 	return []string{
 		"component_create",
 		"component_modify",
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"request_engineer_review",
 		"request_inspector_check",
 		"request_tester_validation",

@@ -24,6 +24,7 @@ const (
 	WALDeltaOpCreate WALDeltaOp = 0
 	WALDeltaOpModify WALDeltaOp = 1
 	WALDeltaOpDelete WALDeltaOp = 2
+	WALDeltaOpMkdir  WALDeltaOp = 3
 )
 
 // WALDeltaOpFromFileOp converts a FileOp to WALDeltaOp.
@@ -35,6 +36,8 @@ func WALDeltaOpFromFileOp(op FileOp) WALDeltaOp {
 		return WALDeltaOpModify
 	case FileOpDelete:
 		return WALDeltaOpDelete
+	case FileOpMkdir:
+		return WALDeltaOpMkdir
 	default:
 		return WALDeltaOpModify
 	}

@@ -15,7 +15,9 @@ func RunGoFmt(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 	if runner.Available("gofmt") {
 		args := append([]string{"-l"}, paths...)
 		result, err := runner.Exec(ctx, "gofmt", args...)
-		if err == nil {
+		if err != nil {
+			issues = append(issues, executionFailureIssues("gofmt", err)...)
+		} else {
 			for _, file := range parseFileList(result.Stdout) {
 				issues = append(issues, ValidationIssue{
 					ID:       fmt.Sprintf("fmt_%d", idx),
@@ -27,13 +29,17 @@ func RunGoFmt(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 				idx++
 			}
 		}
+	} else {
+		issues = append(issues, unavailableToolIssues("gofmt")...)
 	}
 
 	// goimports check
 	if runner.Available("goimports") {
 		args := append([]string{"-l"}, paths...)
 		result, err := runner.Exec(ctx, "goimports", args...)
-		if err == nil {
+		if err != nil {
+			issues = append(issues, executionFailureIssues("goimports", err)...)
+		} else {
 			for _, file := range parseFileList(result.Stdout) {
 				issues = append(issues, ValidationIssue{
 					ID:       fmt.Sprintf("imports_%d", idx),
@@ -45,6 +51,8 @@ func RunGoFmt(ctx context.Context, runner *ToolRunner, paths []string) []Validat
 				idx++
 			}
 		}
+	} else {
+		issues = append(issues, unavailableToolIssues("goimports")...)
 	}
 
 	return DeduplicateIssues(issues)

@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/dag"
@@ -50,11 +51,12 @@ type Orchestrator struct {
 	registrySub guide.Subscription
 	running     bool
 
-	skills        *skills.Registry
-	skillLoader   *skills.Loader
-	hooks         *skills.HookRegistry
-	tools         *toolruntime.Runtime
-	toolDefsDirty bool
+	skills         *skills.Registry
+	skillLoader    *skills.Loader
+	hooks          *skills.HookRegistry
+	tools          *toolruntime.Runtime
+	toolDefsDirty  bool
+	workspaceViews versioning.WorkspaceViewAccess
 
 	healthMonitor *HealthMonitor
 	healthCache   *HealthCache
@@ -142,6 +144,11 @@ func (o *Orchestrator) logWarnMsg(msg string, args ...any) {
 	if o != nil && o.logger != nil {
 		o.logger.Warn(msg, args...)
 	}
+}
+
+// SetWorkspaceViews injects explicit disk/global/pipeline read access.
+func (o *Orchestrator) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	o.workspaceViews = authority.RestrictWorkspaceViews("orchestrator", views)
 }
 
 // New creates a new Orchestrator agent. The optional GoogleProvider enables
@@ -453,8 +460,9 @@ func (o *Orchestrator) EnsureSessionVFS(sessionID, workingDir string) *versionin
 		return svfs
 	}
 	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
-		SessionID:  versioning.SessionID(sessionID),
-		WorkingDir: workingDir,
+		SessionID:       versioning.SessionID(sessionID),
+		WorkingDir:      workingDir,
+		AllowDiskExport: true,
 	})
 	if err != nil {
 		o.logWarnMsg("initialize session VFS", "session_id", sessionID, "error", err)
@@ -631,6 +639,14 @@ func (o *Orchestrator) subscribeToTaskEvents() {
 	for _, t := range topics {
 		if sub, err := o.bus.SubscribeAsync(t.topic, t.handler); err == nil {
 			o.taskSubs = append(o.taskSubs, sub)
+			o.logTrace("task_topic_subscribed", agentlog.EventRegistryEvent, map[string]any{
+				"topic": t.topic,
+			})
+		} else {
+			o.logTrace("task_topic_subscribe_failed", agentlog.EventError, map[string]any{
+				"topic": t.topic,
+				"error": err.Error(),
+			})
 		}
 	}
 }
@@ -1061,218 +1077,59 @@ func (o *Orchestrator) handleRegistryAnnouncement(msg *guide.Message) error {
 
 // Task event handlers
 func (o *Orchestrator) handleTaskDispatch(msg *guide.Message) error {
-	o.mu.Lock()
-
-	data, ok := msg.Payload.(map[string]any)
+	o.logTrace("task_dispatch_received", agentlog.EventTaskDispatched, map[string]any{
+		"source_agent_id": msg.SourceAgentID,
+		"message_type":    msg.Type,
+	})
+	dispatch, ok := parseTaskDispatchMessage(msg)
 	if !ok {
-		o.mu.Unlock()
+		o.logTrace("task_dispatch_parse_failed", agentlog.EventError, map[string]any{
+			"source_agent_id": msg.SourceAgentID,
+		})
 		return nil
 	}
-
-	taskID, _ := data["task_id"].(string)
-	taskSlug, _ := data["task_slug"].(string)
-	workflowID, _ := data["workflow_id"].(string)
-	name, _ := data["name"].(string)
-	agentID, _ := data["agent_id"].(string)
-
-	// DAG-specific fields from BusNodeDispatcher
-	nodeID, _ := data["node_id"].(string)
-	agentType, _ := data["agent_type"].(string)
-	prompt, _ := data["prompt"].(string)
-	nodeCtx, _ := data["context"].(map[string]any)
-	parentResults, _ := data["parent_results"].(map[string]any)
-	dagID, _ := data["dag_id"].(string)
-
-	// Propagate dispatch-protocol keys into node context so they flow
-	// through TaskRouter → Guide → ForwardedRequest.Metadata → agent.
-	// dag_id and node_id are needed for runtime context; task_id carries the
-	// stable plan task identity that the TUI groups pipeline agents under.
-	if nodeCtx == nil {
-		nodeCtx = make(map[string]any)
-	}
-	if ackTopic, ok := data["ack_topic"].(string); ok && ackTopic != "" {
-		nodeCtx["ack_topic"] = ackTopic
-	}
-	if dagID != "" {
-		nodeCtx["dag_id"] = dagID
-	}
-	if nodeID != "" {
-		nodeCtx["node_id"] = nodeID
-	}
-
-	now := time.Now()
-
-	// Extract pipeline stage from sub-node context if present.
-	pipelineStage := ""
-	pipelineParentID := ""
-	pipelineTaskID, pipelineTaskSlug := canonicalPipelineTaskIdentity(taskID, taskSlug, nodeCtx, nodeID)
-	if pipelineTaskID != "" {
-		taskID = pipelineTaskID
-	}
-	if pipelineTaskSlug != "" {
-		taskSlug = pipelineTaskSlug
-	}
-	if nodeCtx != nil {
-		if stage, ok := nodeCtx["pipeline_stage"].(string); ok {
-			pipelineStage = stage
-		}
-		if parentID, ok := nodeCtx["pipeline_parent_id"].(string); ok {
-			pipelineParentID = parentID
-		}
-	}
-
-	// Task starts as Queued — transitions to Running when ACK arrives.
-	initialStatus := TaskStatusQueued
-	if agentID != "" {
-		initialStatus = TaskStatusRunning
-	}
-
-	task := &TaskRecord{
-		ID:               taskID,
-		WorkflowID:       workflowID,
-		Name:             name,
-		Status:           initialStatus,
-		AssignedAgentID:  agentID,
-		AssignedAt:       &now,
-		CreatedAt:        now,
-		StartedAt:        &now,
-		SessionID:        o.config.SessionID,
-		PipelineStage:    pipelineStage,
-		PipelineParentID: pipelineParentID,
-	}
-
-	o.state.Tasks[taskID] = task
-	o.healthMonitor.RecordTaskStart(agentType, taskID)
-
-	if workflowID != "" {
-		if wf, ok := o.state.Workflows[workflowID]; ok {
-			wf.TaskIDs = append(wf.TaskIDs, taskID)
-		}
-	}
-
-	router := o.taskRouter
-	o.mu.Unlock()
-
-	pipelineStatus := pipelinePhaseStatus(pipelineStage)
-	if pipelineTaskID != "" && pipelineStatus != "" {
-		publishTaskPipelineState(o.bus, o.config.AgentID, pipelineTaskID, pipelineTaskSlug, pipelineStatus, agentType)
-	}
-
-	if o.coordination != nil && pipelineTaskID != "" {
-		taskNameForCoordination := ""
-		if ctxTaskName, ok := nodeCtx["task_name"].(string); ok {
-			taskNameForCoordination = strings.TrimSpace(ctxTaskName)
-		}
-		packet, err := o.coordination.QueryView(context.Background(), coordination.QueryViewInput{
-			TaskID:     pipelineTaskID,
-			TaskName:   firstNonEmpty(taskNameForCoordination, strings.TrimSpace(name), pipelineTaskSlug),
-			WorkerType: strings.TrimSpace(agentType),
-		})
-		if err != nil {
-			o.logWarnMsg("build coordination packet", "task_id", pipelineTaskID, "agent_type", agentType, "error", err)
-		} else if packet != nil {
-			if packet.Packet != nil && o.config.ArchivalistEnabled {
-				precedents, precedentErr := o.queryCoordinationPrecedents(context.Background(),
-					firstNonEmpty(taskNameForCoordination, strings.TrimSpace(name)),
-					pipelineTaskSlug,
-					strings.TrimSpace(agentType),
-				)
-				if precedentErr != nil {
-					o.logWarnMsg("build coordination precedents", "task_id", pipelineTaskID, "agent_type", agentType, "error", precedentErr)
-				} else if len(precedents) > 0 {
-					packet.Packet.HistoricalPrecedents = precedents
-					packet.Packet.Summary = buildWorkerSummary(strings.TrimSpace(agentType), packet.Packet)
-				}
-			}
-			if nodeCtx == nil {
-				nodeCtx = make(map[string]any)
-			}
-			nodeCtx["coordination_view"] = packet.View
-			if packet.Packet != nil {
-				nodeCtx["coordination_packet"] = packet.Packet
-			}
-		}
-	}
-
-	o.pushEvent(&busEvent{
-		Topic:     "tasks.dispatch",
-		Timestamp: now,
-		Severity:  severityInfo,
-		Summary:   fmt.Sprintf("Task %q dispatched to agent %s", name, agentID),
-		Data:      map[string]any{"task_id": taskID, "agent_id": agentID, "workflow_id": workflowID},
+	o.logTrace("task_dispatch_parsed", agentlog.EventTaskDispatched, map[string]any{
+		"dag_id":      dispatch.dagID,
+		"node_id":     dispatch.nodeID,
+		"task_id":     dispatch.taskID,
+		"agent_type":  dispatch.agentType,
+		"task_slug":   dispatch.taskSlug,
+		"task_stage":  dispatch.pipelineStage,
+		"co_agents":   dispatch.coAgents,
+		"workflow_id": dispatch.workflowID,
 	})
 
-	// Publish pipeline agent activity so the TUI panel shows ALL pipeline agents.
-	// Dispatched agents (primary + co-agents) get AgentAction (active work).
-	// Remaining pipeline agents get AgentRegistered (present but idle).
-	coAgents := decodeDispatchAgentTypes(data["co_agents"])
-
-	if nodeID != "" && agentType != "" {
-		dispatched := make(map[string]struct{})
-
-		o.publishPipelineAgentActivity(agentType, pipelineTaskID, nodeID, pipelineTaskSlug, string(pipelineStatus))
-		dispatched[agentType] = struct{}{}
-
-		for _, coType := range coAgents {
-			o.publishPipelineAgentActivity(coType, pipelineTaskID, nodeID, pipelineTaskSlug, string(pipelineStatus))
-			dispatched[coType] = struct{}{}
-		}
-
-		for _, pipelineType := range PipelinePanelAgentTypes {
-			if _, active := dispatched[pipelineType]; !active {
-				o.publishPipelineAgentRegistration(pipelineType, pipelineTaskID, pipelineTaskSlug, string(pipelineStatus))
-			}
-		}
-	}
-
-	// Route to containerized pipeline agent for DAG-originated dispatches.
-	if router != nil && nodeID != "" {
-		pipelineTask := &PipelineTask{
-			NodeID:        nodeID,
-			DAGID:         dagID,
-			TaskID:        pipelineTaskID,
-			AgentType:     agentType,
-			TargetAgentID: pipelineWorkerTargetAgentID(pipelineTaskID, agentType),
-			Prompt:        prompt,
-			Context:       nodeCtx,
-			ParentResults: parentResults,
-			SessionID:     o.config.SessionID,
-		}
-
-		// Look up the dispatch lifecycle channel so the route goroutine
-		// exits when the executor's Dispatch call returns.
-		var done <-chan struct{}
-		if o.dagBridge != nil {
-			if dispatcher := o.dagBridge.GetDispatcherForDAG(dagID); dispatcher != nil {
-				done = dispatcher.DispatchDone(nodeID)
-			}
-		}
-
-		routeDispatch := func() error {
-			if pipelineStage == string(StageExecute) && len(coAgents) > 0 {
-				compoundTask := &CompoundPipelineTask{
-					PipelineTask:      *pipelineTask,
-					CoAgents:          coAgents,
-					CollaborationMode: parseDispatchCollaborationMode(data["collaboration_mode"]),
-					MaxReviewRounds:   intValue(data["max_review_rounds"]),
-				}
-				return router.RouteCompoundWithLifecycle(context.Background(), compoundTask, done)
-			}
-			return router.RouteWithLifecycle(pipelineTask, done)
-		}
-
-		if routeErr := routeDispatch(); routeErr != nil {
-			o.pushEvent(&busEvent{
-				Topic:     "tasks.dispatch",
-				Timestamp: time.Now(),
-				Severity:  severityCritical,
-				Summary:   fmt.Sprintf("Route failed for node %s: %s", nodeID, routeErr),
-			})
-		} else if o.dagBridge != nil {
-			o.dagBridge.AcknowledgeDispatch(dagID, nodeID, agentID, agentType)
-		}
-	}
-
+	router := o.registerTaskDispatch(dispatch)
+	o.logTrace("task_dispatch_registered", agentlog.EventTaskDispatched, map[string]any{
+		"dag_id":     dispatch.dagID,
+		"node_id":    dispatch.nodeID,
+		"task_id":    dispatch.taskID,
+		"agent_type": dispatch.agentType,
+	})
+	pipelineStatus := o.publishTaskDispatchPipelineState(dispatch)
+	o.logTrace("task_dispatch_pipeline_state_published", agentlog.EventPipelineStateChange, map[string]any{
+		"dag_id":          dispatch.dagID,
+		"node_id":         dispatch.nodeID,
+		"task_id":         dispatch.taskID,
+		"pipeline_status": pipelineStatus,
+	})
+	o.enrichTaskDispatchCoordination(dispatch)
+	o.pushEvent(dispatch.event())
+	o.publishTaskDispatchAgents(dispatch, pipelineStatus)
+	o.logTrace("task_dispatch_agents_published", agentlog.EventTaskDispatched, map[string]any{
+		"dag_id":          dispatch.dagID,
+		"node_id":         dispatch.nodeID,
+		"task_id":         dispatch.taskID,
+		"agent_type":      dispatch.agentType,
+		"pipeline_status": pipelineStatus,
+	})
+	o.routeTaskDispatch(router, dispatch)
+	o.logTrace("task_dispatch_handled", agentlog.EventTaskDispatched, map[string]any{
+		"dag_id":     dispatch.dagID,
+		"node_id":    dispatch.nodeID,
+		"task_id":    dispatch.taskID,
+		"agent_type": dispatch.agentType,
+	})
 	return nil
 }
 
@@ -2397,6 +2254,14 @@ func (o *Orchestrator) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.handoffBridge = bridge
+}
+
+// SetCanonicalID overwrites the orchestrator's internal ID so a replacement
+// instance can assume the original routing identity after handoff.
+func (o *Orchestrator) SetCanonicalID(id string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.config.AgentID = id
 }
 
 // SetAgentPod assigns the agent pod for cross-agent coordination.

@@ -12,11 +12,13 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/toolruntime"
 	"github.com/adalundhe/sylk/core/versioning"
@@ -96,8 +98,9 @@ type Engineer struct {
 	agentPod *shared.AgentPod
 
 	// File access abstraction (injected per-pipeline by Orchestrator).
-	fileAccess     versioning.FileAccess
-	workspaceViews versioning.WorkspaceViewAccess
+	fileAccess      versioning.FileAccess
+	workspaceViews  versioning.WorkspaceViewAccess
+	executionBroker purevfs.ExecutionBroker
 
 	// Self-audit configuration
 	auditConfig AuditConfig
@@ -188,6 +191,7 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 		consultations:     make([]Consultation, 0),
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
+		executionBroker:   purevfs.DefaultExecutionBroker(),
 	}
 
 	eng.steering.InitLazy("engineer", nil)
@@ -534,6 +538,12 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 	// Process the request with a cancellable request-scoped context.
 	reqCtx, cancel := context.WithCancel(e.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return e.bus },
+		SourceAgentID:   func() string { return e.id },
+		SourceAgentType: "engineer",
+		SourceAgentName: "Engineer",
+	})
 	e.registerRequestCancel(fwd.CorrelationID, cancel)
 	e.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer e.clearRequestCancel(fwd.CorrelationID)
@@ -1134,12 +1144,17 @@ func (e *Engineer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 // SetFileAccess injects the FileAccess implementation for this pipeline.
 // Called by the Orchestrator when dispatching the engineer to a pipeline.
 func (e *Engineer) SetFileAccess(fa versioning.FileAccess) {
-	e.fileAccess = fa
+	e.fileAccess = authority.RestrictFileAccess("engineer", fa)
 }
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (e *Engineer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
-	e.workspaceViews = views
+	e.workspaceViews = authority.RestrictWorkspaceViews("engineer", views)
+}
+
+// SetExecutionBroker overrides the strict execution broker.
+func (e *Engineer) SetExecutionBroker(broker purevfs.ExecutionBroker) {
+	e.executionBroker = broker
 }
 
 // SetEscalator injects the confidence-based escalation evaluator.

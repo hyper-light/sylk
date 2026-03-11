@@ -8,6 +8,10 @@ import (
 func pipelineTesterVisibleSkillNames() []string {
 	return []string{
 		"search_skills",
+		"read_file",
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"check_inspector_gate",
 		"detect_test_harness",
 		"prepare_test_harness",
@@ -19,6 +23,9 @@ func pipelineTesterVisibleSkillNames() []string {
 		"inspect_workspace_state",
 		"summarize_workspace_state",
 		"write_test",
+		"write_file",
+		"edit_file",
+		"create_directory",
 		"run_test_suite",
 		"diagnose_failure",
 		"report_to_engineer",

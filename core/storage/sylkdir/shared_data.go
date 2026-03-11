@@ -206,6 +206,9 @@ func (sdf *SharedDataFile) ReplaceFile(newPath string) error {
 	if err := os.Rename(newPath, sdf.path); err != nil {
 		return fmt.Errorf("replace: rename: %w", err)
 	}
+	if err := syncPathDir(sdf.path); err != nil {
+		return fmt.Errorf("replace: sync dir: %w", err)
+	}
 
 	f, err := os.OpenFile(sdf.path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {

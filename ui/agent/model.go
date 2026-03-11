@@ -129,6 +129,7 @@ type PipelineState struct {
 	WorkerType string
 	Members    []string // Agent IDs belonging to this pipeline.
 	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // VariantState holds the current state of a pipeline variant.
@@ -772,6 +773,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 			m.pipelineOrder = append(m.pipelineOrder, pipelineID)
 		}
 		if pl != nil && len(pl.Members) < maxAgents {
+			applyPipelineActivityState(pl, ev)
 			if pl.TaskID == "" {
 				pl.TaskID = extractPipelineTaskID(ev.Event.Data)
 			}
@@ -929,6 +931,7 @@ func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.Acti
 		m.pipelines[pipelineID] = pl
 		m.pipelineOrder = append(m.pipelineOrder, pipelineID)
 	}
+	applyPipelineActivityState(pl, ev)
 	if pl.TaskID == "" {
 		pl.TaskID = extractPipelineTaskID(ev.Event.Data)
 	}
@@ -949,6 +952,57 @@ func pipelineStatusFromEvent(data map[string]any) string {
 	}
 	status, _ := data["pipeline_status"].(string)
 	return strings.TrimSpace(status)
+}
+
+func applyPipelineActivityState(pl *PipelineState, ev msg.ActivityEventMsg) {
+	if pl == nil {
+		return
+	}
+	if status := pipelineStatusFromEvent(ev.Event.Data); status != "" && pipelineEventIsCurrent(pl, ev.Event.Timestamp) {
+		pl.Status = status
+		recordPipelineUpdate(pl, ev.Event.Timestamp)
+	}
+}
+
+func applyPipelineStateUpdate(pl *PipelineState, ps msg.PipelineStateMsg) {
+	if pl == nil {
+		return
+	}
+	if ps.Status != "" {
+		pl.Status = ps.Status
+	}
+	if ps.WorkerType != "" {
+		pl.WorkerType = ps.WorkerType
+	}
+	if ps.LoopCount > 0 || pl.LoopCount == 0 {
+		pl.LoopCount = ps.LoopCount
+	}
+	if ps.MaxLoops > 0 || pl.MaxLoops == 0 {
+		pl.MaxLoops = ps.MaxLoops
+	}
+	recordPipelineUpdate(pl, ps.Timestamp)
+}
+
+func pipelineEventIsCurrent(pl *PipelineState, ts time.Time) bool {
+	if pl == nil || pl.UpdatedAt.IsZero() || ts.IsZero() {
+		return true
+	}
+	return !ts.Before(pl.UpdatedAt)
+}
+
+func recordPipelineUpdate(pl *PipelineState, ts time.Time) {
+	if pl == nil {
+		return
+	}
+	if ts.IsZero() {
+		if pl.UpdatedAt.IsZero() {
+			pl.UpdatedAt = time.Now()
+		}
+		return
+	}
+	if pl.UpdatedAt.IsZero() || ts.After(pl.UpdatedAt) {
+		pl.UpdatedAt = ts
+	}
 }
 
 func (m *Model) dedupePipelineMembers(pipelineID string) {
@@ -1168,10 +1222,7 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 	if ps.TaskLabel != "" {
 		pl.TaskLabel = ps.TaskLabel
 	}
-	pl.Status = ps.Status
-	pl.LoopCount = ps.LoopCount
-	pl.MaxLoops = ps.MaxLoops
-	pl.WorkerType = ps.WorkerType
+	applyPipelineStateUpdate(pl, ps)
 	m.rowsDirty = true
 
 	return nil

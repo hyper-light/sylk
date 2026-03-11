@@ -11,6 +11,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/google/uuid"
 )
@@ -50,6 +51,7 @@ type BusNodeDispatcher struct {
 	ackWaiters         sync.Map // nodeID → chan *ACKResult
 	nodePods           sync.Map // nodeID → *shared.AgentPod
 	waitDispatchPermit func(context.Context, string, string) error
+	eventLogger        *agentlog.SessionEventLogger
 
 	// onACK is called when an agent ACKs a node dispatch. Optional.
 	onACK func(nodeID string, ack *ACKResult)
@@ -93,6 +95,11 @@ func (d *BusNodeDispatcher) SetACKCallback(fn func(nodeID string, ack *ACKResult
 	d.onACK = fn
 }
 
+// SetEventLogger installs the session JSONL logger for dispatch traces.
+func (d *BusNodeDispatcher) SetEventLogger(el *agentlog.SessionEventLogger) {
+	d.eventLogger = el
+}
+
 // SetPodResolver installs a node-aware pod resolver. When present, it
 // overrides the single-pod field for dispatch/guard lifecycle.
 func (d *BusNodeDispatcher) SetPodResolver(fn func(*dag.Node) *shared.AgentPod) {
@@ -114,6 +121,7 @@ func (d *BusNodeDispatcher) GetACKResult(nodeID string) *ACKResult {
 // Phase 1: Publish task dispatch with ack_topic, wait for agent ACK.
 // Phase 2: Block on result channel for execution completion.
 func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parentResults map[string]*dag.NodeResult) (*dag.NodeResult, error) {
+	d.logNodeTrace(node, "dispatch_enter", agentlog.EventTaskDispatched, nil)
 	ch := make(chan *dag.NodeResult, 1)
 	done := make(chan struct{})
 	ackCh := make(chan *ACKResult, 1)
@@ -130,14 +138,24 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	defer close(done)
 
 	// Activate target agent if demoted/cold.
+	d.logNodeTrace(node, "dispatch_activate_begin", agentlog.EventTaskDispatched, nil)
 	if err := d.activateAgents(ctx, node); err != nil {
+		d.logNodeTrace(node, "dispatch_activate_failed", agentlog.EventError, map[string]any{
+			"error": err.Error(),
+		})
 		return nil, err
 	}
+	d.logNodeTrace(node, "dispatch_activate_ok", agentlog.EventTaskDispatched, nil)
 
 	if d.waitDispatchPermit != nil {
+		d.logNodeTrace(node, "dispatch_permit_wait_begin", agentlog.EventTaskDispatched, nil)
 		if err := d.waitDispatchPermit(ctx, d.sessionID, d.dagID); err != nil {
+			d.logNodeTrace(node, "dispatch_permit_wait_failed", agentlog.EventError, map[string]any{
+				"error": err.Error(),
+			})
 			return nil, err
 		}
+		d.logNodeTrace(node, "dispatch_permit_wait_ok", agentlog.EventTaskDispatched, nil)
 	}
 
 	// Build and publish dispatch message with ACK topic.
@@ -147,6 +165,9 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	// Phase 1: Dispatch + ACK
 	ack, err := d.dispatchAndWaitACK(ctx, node, msg, ackTopic, ackCh)
 	if err != nil {
+		d.logNodeTrace(node, "dispatch_ack_failed", agentlog.EventError, map[string]any{
+			"error": err.Error(),
+		})
 		return nil, err
 	}
 
@@ -159,18 +180,33 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 	if d.onACK != nil {
 		d.onACK(node.ID(), ack)
 	}
+	d.logNodeTrace(node, "dispatch_acked", agentlog.EventNodeAcked, map[string]any{
+		"ack_agent_id":   ack.AgentID,
+		"ack_agent_type": ack.AgentType,
+	})
 
 	// Phase 2: Wait for result
 	select {
 	case result := <-ch:
+		if result != nil {
+			d.logNodeTrace(node, "dispatch_result_received", agentlog.EventNodeCompleted, map[string]any{
+				"result_state": result.State.String(),
+			})
+		}
 		return result, nil
 	case <-ctx.Done():
+		d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
+			"error": ctx.Err().Error(),
+		})
 		return nil, ctx.Err()
 	}
 }
 
 // dispatchAndWaitACK publishes the task dispatch and waits for ACK.
 func (d *BusNodeDispatcher) dispatchAndWaitACK(ctx context.Context, node *dag.Node, msg *guide.Message, ackTopic string, ackCh <-chan *ACKResult) (*ACKResult, error) {
+	d.logNodeTrace(node, "dispatch_ack_subscribe_begin", agentlog.EventTaskDispatched, map[string]any{
+		"ack_topic": ackTopic,
+	})
 	sub, err := d.bus.Subscribe(ackTopic, func(ackMsg *guide.Message) error {
 		if ackMsg.Type != guide.MessageTypeAck {
 			return nil
@@ -180,13 +216,27 @@ func (d *BusNodeDispatcher) dispatchAndWaitACK(ctx context.Context, node *dag.No
 		return nil
 	})
 	if err != nil {
+		d.logNodeTrace(node, "dispatch_ack_subscribe_failed", agentlog.EventError, map[string]any{
+			"ack_topic": ackTopic,
+			"error":     err.Error(),
+		})
 		return nil, fmt.Errorf("subscribe ack topic for node %s: %w", node.ID(), err)
 	}
 	defer sub.Unsubscribe()
+	d.logNodeTrace(node, "dispatch_ack_subscribe_ok", agentlog.EventTaskDispatched, map[string]any{
+		"ack_topic": ackTopic,
+	})
 
 	if err := d.bus.Publish("tasks.dispatch", msg); err != nil {
+		d.logNodeTrace(node, "dispatch_publish_failed", agentlog.EventError, map[string]any{
+			"ack_topic": ackTopic,
+			"error":     err.Error(),
+		})
 		return nil, fmt.Errorf("dispatch node %s: %w", node.ID(), err)
 	}
+	d.logNodeTrace(node, "dispatch_published", agentlog.EventTaskDispatched, map[string]any{
+		"ack_topic": ackTopic,
+	})
 
 	ackDeadline := d.ackTimeout
 	ackCtx, ackCancel := context.WithTimeout(ctx, ackDeadline)
@@ -194,13 +244,34 @@ func (d *BusNodeDispatcher) dispatchAndWaitACK(ctx context.Context, node *dag.No
 
 	select {
 	case ack := <-ackCh:
+		d.logNodeTrace(node, "dispatch_ack_received", agentlog.EventNodeAcked, map[string]any{
+			"ack_agent_id":   ack.AgentID,
+			"ack_agent_type": ack.AgentType,
+		})
 		return ack, nil
 	case <-ackCtx.Done():
+		d.logNodeTrace(node, "dispatch_ack_wait_expired", agentlog.EventError, map[string]any{
+			"error": ackCtx.Err().Error(),
+		})
 		if errors.Is(ackCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
 			return nil, fmt.Errorf("node %s: %w", node.ID(), dag.ErrDispatchNotAcked)
 		}
 		return nil, ctx.Err()
 	}
+}
+
+func (d *BusNodeDispatcher) logNodeTrace(node *dag.Node, event string, eventCode agentlog.EventType, data map[string]any) {
+	trace := map[string]any{
+		"dag_id": d.dagID,
+	}
+	if node != nil {
+		trace["node_id"] = node.ID()
+		trace["agent_type"] = node.AgentType()
+	}
+	for key, value := range data {
+		trace[key] = value
+	}
+	d.logTrace(event, eventCode, trace)
 }
 
 // Acknowledge resolves the pending ACK wait for a dispatched node.

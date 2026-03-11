@@ -12,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -188,6 +189,7 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
 	}
+	cfg.SystemPrompt = shared.AppendNoFilesystemContext(cfg.SystemPrompt)
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
@@ -206,10 +208,6 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
-		DefaultView:     versioning.WorkspaceViewGlobal,
-		IncludePipeline: true,
-	})
 	return cfg
 }
 
@@ -286,7 +284,7 @@ func assembleArchivalist(cfg Config, c *archivalistComponents) *Archivalist {
 		hooks:             hookRegistry,
 		steering:          shared.NewSteeringManager(),
 		requestSerializer: shared.NewRequestSerializer(),
-		workspaceViews:    cfg.WorkspaceViews,
+		workspaceViews:    authority.RestrictWorkspaceViews("archivalist", cfg.WorkspaceViews),
 	}
 
 	a.steering.InitLazy("archivalist", cfg.ActivityPub)
@@ -2611,6 +2609,14 @@ func (a *Archivalist) AgentType() string {
 	return "archivalist"
 }
 
+// SetCanonicalID preserves the routing identity across handoff replacement.
+func (a *Archivalist) SetCanonicalID(id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	a.id = id
+}
+
 // SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
 func (a *Archivalist) SetProvider(p archivalistProvider) {
 	a.runMu.Lock()
@@ -2636,7 +2642,7 @@ func (a *Archivalist) SetKnowledgeStore(ks *knowledge.KnowledgeStore) {
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (a *Archivalist) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
-	a.workspaceViews = views
+	a.workspaceViews = authority.RestrictWorkspaceViews("archivalist", views)
 }
 
 // SwapModel implements container.ModelSwappable.

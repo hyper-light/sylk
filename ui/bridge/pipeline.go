@@ -174,6 +174,7 @@ func toTaskPipelineStateMsg(evt taskstate.Event) msg.PipelineStateMsg {
 		WorkerType: evt.WorkerType,
 		LoopCount:  evt.LoopCount,
 		MaxLoops:   evt.MaxLoops,
+		Timestamp:  evt.Timestamp,
 	}
 }
 
@@ -195,6 +196,7 @@ func toPipelineStateMsg(evt tdd.PipelineEvent) msg.PipelineStateMsg {
 		LoopCount:         evt.LoopCount,
 		MaxLoops:          evt.MaxLoops,
 		WorkerType:        string(evt.WorkerType),
+		Timestamp:         evt.Timestamp,
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
@@ -258,6 +259,10 @@ func (gt *GlobalTester) initSkills() error {
 
 func (gt *GlobalTester) registerCoreSkills() {
 	// Shared skills.
+	gt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
+	gt.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
+	gt.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
+	gt.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
 	gt.skills.Register(shared.AnalyzeRiskSkill())
 	gt.skills.Register(shared.PlanTestsSkill())
 	gt.skills.Register(shared.WriteTestSkill())
@@ -421,6 +426,12 @@ func (gt *GlobalTester) unsubRegistry() error {
 // system prompt.
 func (gt *GlobalTester) Handle(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
 	ctx = versioning.WithSessionID(ctx, fwd.SessionID)
+	ctx = agentshared.WithGuardianCommandGate(ctx, agentshared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return gt.bus },
+		SourceAgentID:   func() string { return gt.id },
+		SourceAgentType: "tester",
+		SourceAgentName: "Tester",
+	})
 	switch fwd.Intent {
 	case guide.IntentHelp, guide.IntentChat, guide.IntentUnknown:
 		return gt.handleConversation(ctx, fwd)
@@ -713,12 +724,12 @@ func (gt *GlobalTester) SetAgentPod(pod *agentshared.AgentPod) {
 
 // SetFileAccess injects the per-session file access layer.
 func (gt *GlobalTester) SetFileAccess(fa versioning.FileAccess) {
-	gt.fileAccess = fa
+	gt.fileAccess = authority.RestrictFileAccess("tester", fa)
 }
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
 func (gt *GlobalTester) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
-	gt.workspaceViews = views
+	gt.workspaceViews = authority.RestrictWorkspaceViews("tester", views)
 }
 
 // ExtractArchivableState returns state for handoff persistence.

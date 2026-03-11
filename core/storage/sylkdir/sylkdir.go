@@ -336,7 +336,6 @@ func (s *SylkDir) GlobalVersionPath(version SemanticVersion) string {
 	return filepath.Join(s.GlobalVersionsPath(), version.DirName())
 }
 
-
 // CommitWALPath returns the path to the global commit WAL directory.
 func (s *SylkDir) CommitWALPath() string {
 	return filepath.Join(s.RootPath(), "wal")
@@ -455,6 +454,9 @@ func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("sylkdir: create global version dir %s: %w", dir, err)
 		}
+		if err := syncCreatedDir(dir); err != nil {
+			return fmt.Errorf("sylkdir: sync global version dir %s: %w", dir, err)
+		}
 	}
 
 	// Create version meta.json
@@ -466,7 +468,7 @@ func (s *SylkDir) CreateGlobalVersion(version SemanticVersion) error {
 	if err != nil {
 		return fmt.Errorf("sylkdir: marshal version meta: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(versionPath, "meta.json"), data, 0644); err != nil {
+	if err := durableWriteFile(filepath.Join(versionPath, "meta.json"), data, 0o644); err != nil {
 		return fmt.Errorf("sylkdir: write version meta: %w", err)
 	}
 
@@ -565,12 +567,10 @@ func (s *SylkDir) CompactGlobalData(parent, target SemanticVersion) error {
 		return err
 	}
 
-	// Data file compaction: rewrite shared data files to remove unreferenced records.
-	// Collect live offsets from ALL global version indexes, compact each data file,
-	// and remap all version indexes to the new offsets.
-	if err := s.compactDataFiles(target); err != nil {
-		return fmt.Errorf("sylkdir: compact data files: %w", err)
-	}
+	// Shared data files remain append-only here. Rewriting them inline would
+	// mutate historical committed versions during a future commit, which breaks
+	// rollback/version semantics. Physical data-file compaction belongs in a
+	// separate maintenance pass that publishes new generations atomically.
 
 	return nil
 }
@@ -620,8 +620,6 @@ func compactOffsetIndex(parentPath, targetPath string, tb *TombstoneBitmap) erro
 
 	return targetIdx.Save()
 }
-
-
 
 // compactDocIndex removes dead entries from the parent's doc offset index.
 // Uses DocRef from live nodes to determine which docs to keep.

@@ -1,7 +1,6 @@
 package engineer
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,10 +14,12 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/escalation"
 	"github.com/adalundhe/sylk/core/format"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -28,6 +29,7 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(readFileSkill(e))
 	e.skills.Register(writeFileSkill(e))
 	e.skills.Register(editFileSkill(e))
+	e.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return e.fileAccess }))
 	e.skills.Register(runCommandSkill(e))
 	e.skills.Register(globSkill(e))
 	e.skills.Register(grepSkill(e))
@@ -571,7 +573,7 @@ type runCommandParams struct {
 
 func runCommandSkill(e *Engineer) *skills.Skill {
 	return skills.NewSkill("run_command").
-		Description("Execute a shell command. Only approved command patterns are allowed for safety.").
+		Description("Execute a shell command. Pre-approved commands run directly; other commands are routed through Guardian approval.").
 		Domain("code").
 		Keywords("run", "execute", "command", "shell", "bash").
 		Priority(80).
@@ -596,14 +598,21 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("shell control operators are not allowed in run_command")
 			}
 
-			// Check if command is approved
-			if !isCommandApproved(params.Command, e.config.EngineerConfig.ApprovedCommands) {
-				return nil, fmt.Errorf("command not approved: %s", params.Command)
-			}
-
 			// Check blocklist
 			if isCommandBlocked(params.Command, e.config.EngineerConfig.ApprovedCommands) {
 				return nil, fmt.Errorf("command is blocked: %s", params.Command)
+			}
+
+			if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+				Command:       params.Command,
+				WorkingDir:    params.WorkingDir,
+				WorkspaceRoot: e.effectiveWorkingDirectory(),
+				ToolName:      "run_command",
+				AgentID:       e.id,
+				AgentType:     "engineer",
+				SessionID:     versioning.SessionIDFromContext(ctx),
+			}); err != nil {
+				return nil, err
 			}
 
 			execCtx, err := e.commandExecutionContext(ctx, params.WorkingDir)
@@ -620,37 +629,31 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
-			cmd := exec.CommandContext(ctx, "sh", "-c", params.Command)
-			cmd.Dir = execCtx.workDir
-
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout = &stdout
-			cmd.Stderr = &stderr
-
 			startTime := time.Now()
-			err = cmd.Run()
-			duration := time.Since(startTime)
-
-			exitCode := 0
-			if err != nil {
-				if exitErr, ok := err.(*exec.ExitError); ok {
-					exitCode = exitErr.ExitCode()
-				} else {
-					return nil, fmt.Errorf("failed to execute command: %w", err)
-				}
+			if e.executionBroker == nil {
+				return nil, purevfs.ErrStrictExecutionUnavailable
 			}
-
+			runResult, err := e.executionBroker.Run(ctx, purevfs.BrokerRunRequest{
+				Plan:      execCtx.plan,
+				Argv:      purevfs.ShellCommandArgv(params.Command),
+				Workspace: e.executionWorkspace(true),
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to execute command: %w", err)
+			}
+			duration := time.Since(startTime)
 			return &CommandExecution{
 				Command:           params.Command,
-				ExitCode:          exitCode,
-				Stdout:            stdout.String(),
-				Stderr:            stderr.String(),
+				ExitCode:          runResult.ExitCode,
+				Stdout:            string(runResult.Stdout),
+				Stderr:            string(runResult.Stderr),
 				Duration:          duration,
 				StartTime:         startTime,
 				WorkingDir:        execCtx.workDir,
 				ExecutionMode:     string(execCtx.plan.Mode),
 				ExecutionStrategy: string(execCtx.plan.Strategy),
 				Materialized:      execCtx.plan.RequiresMaterialize,
+				Truncated:         runResult.StdoutTruncated || runResult.StderrTruncated,
 			}, nil
 		}).
 		Build()
@@ -825,7 +828,7 @@ func lspSkill(e *Engineer) *skills.Skill {
 				return nil, fmt.Errorf("file is required for %s", subcommand)
 			}
 			loc := lspLocation(p.File, p.Line, p.Column)
-			output, status := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, subcommand, loc)
+			output, status := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), subcommand, loc)
 			if status != "ok" {
 				return map[string]any{"status": status, "reason": output}, nil
 			}
@@ -845,7 +848,7 @@ func lspSkill(e *Engineer) *skills.Skill {
 			if argument == "" {
 				argument = "."
 			}
-			output, status := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, "symbols", argument)
+			output, status := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), "symbols", argument)
 			if status != "ok" {
 				return map[string]any{"status": status, "reason": output}, nil
 			}
@@ -853,8 +856,8 @@ func lspSkill(e *Engineer) *skills.Skill {
 		},
 		"call_hierarchy": func(ctx context.Context, p *lspInput) (any, error) {
 			loc := lspLocation(p.File, p.Line, p.Column)
-			refs, refsStatus := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, "references", loc)
-			defn, defStatus := runGoplsCommand(ctx, e.config.EngineerConfig.WorkingDirectory, "definition", loc)
+			refs, refsStatus := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), "references", loc)
+			defn, defStatus := e.runGoplsCommand(ctx, e.effectiveWorkingDirectory(), "definition", loc)
 			if refsStatus != "ok" && defStatus != "ok" {
 				return map[string]any{"status": "unavailable", "reason": refs}, nil
 			}
@@ -905,27 +908,61 @@ func lspLocation(file string, line, column int) string {
 	return fmt.Sprintf("%s:%d:%d", file, line, column)
 }
 
-func runGoplsCommand(ctx context.Context, workDir, subcommand, arg string) (string, string) {
+func (e *Engineer) runGoplsCommand(ctx context.Context, workDir, subcommand, arg string) (string, string) {
 	if detect.Which("gopls") == "" {
 		return "gopls is not installed", "unavailable"
 	}
-	output, err := runToolInDir(ctx, workDir, "gopls", subcommand, arg)
+	output, err := e.runToolInDir(ctx, workDir, false, "gopls", subcommand, arg)
 	if err != nil {
 		return err.Error(), "error"
 	}
 	return output, "ok"
 }
 
-func runToolInDir(ctx context.Context, dir, bin string, args ...string) (string, error) {
+func (e *Engineer) runToolInDir(ctx context.Context, dir string, allowWorkspaceWrite bool, bin string, args ...string) (string, error) {
+	if _, err := commandapproval.Authorize(ctx, commandapproval.NewEvaluator(nil), commandapproval.Request{
+		Command:       strings.Join(append([]string{bin}, args...), " "),
+		WorkingDir:    dir,
+		WorkspaceRoot: e.effectiveWorkingDirectory(),
+		ToolName:      bin,
+	}); err != nil {
+		return "", err
+	}
 	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(callCtx, bin, args...)
-	cmd.Dir = dir
-	output, err := cmd.CombinedOutput()
+
+	execCtx, err := e.commandExecutionContext(callCtx, dir)
 	if err != nil {
-		return "", fmt.Errorf("%s %s failed: %w\n%s", bin, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+		return "", err
 	}
-	return strings.TrimSpace(string(output)), nil
+	defer execCtx.cleanup()
+
+	if e.executionBroker == nil || !execCtx.plan.RequiresBroker {
+		return "", purevfs.ErrStrictExecutionUnavailable
+	}
+	runResult, err := e.executionBroker.Run(callCtx, purevfs.BrokerRunRequest{
+		Plan:      execCtx.plan,
+		Argv:      append([]string{bin}, args...),
+		Workspace: e.executionWorkspace(allowWorkspaceWrite),
+	})
+	if err != nil {
+		return "", err
+	}
+	output := strings.TrimSpace(joinCommandOutput(runResult.Stdout, runResult.Stderr))
+	if runResult.ExitCode != 0 {
+		return "", fmt.Errorf("%s %s failed: exit code %d\n%s", bin, strings.Join(args, " "), runResult.ExitCode, output)
+	}
+	return output, nil
+}
+
+func joinCommandOutput(stdout, stderr []byte) string {
+	if len(stdout) == 0 {
+		return string(stderr)
+	}
+	if len(stderr) == 0 {
+		return string(stdout)
+	}
+	return string(stdout) + "\n" + string(stderr)
 }
 
 // =============================================================================
@@ -958,7 +995,7 @@ func formatSkill(e *Engineer) *skills.Skill {
 			if p.File == "" {
 				return nil, fmt.Errorf("file is required for check")
 			}
-			root := e.config.EngineerConfig.WorkingDirectory
+			root := e.effectiveWorkingDirectory()
 			f := selector.SelectFormatter(root, p.File)
 			if f == nil {
 				return map[string]any{"formatted": true, "reason": "no formatter available for extension"}, nil
@@ -969,7 +1006,7 @@ func formatSkill(e *Engineer) *skills.Skill {
 			}
 			fullPath := resolvePath(root, p.File)
 			args := substituteFileArg(checkArgs, fullPath)
-			output, err := runToolInDir(ctx, root, f.Command, args...)
+			output, err := e.runToolInDir(ctx, root, false, f.Command, args...)
 			if err != nil {
 				return map[string]any{"formatted": false, "formatter": string(f.ID), "output": err.Error()}, nil
 			}
@@ -979,21 +1016,21 @@ func formatSkill(e *Engineer) *skills.Skill {
 			if p.File == "" {
 				return nil, fmt.Errorf("file is required for apply")
 			}
-			root := e.config.EngineerConfig.WorkingDirectory
+			root := e.effectiveWorkingDirectory()
 			f := selector.SelectFormatter(root, p.File)
 			if f == nil {
 				return map[string]any{"success": false, "reason": "no formatter available for extension"}, nil
 			}
 			fullPath := resolvePath(root, p.File)
 			args := substituteFileArg(f.Args, fullPath)
-			_, err := runToolInDir(ctx, root, f.Command, args...)
+			_, err := e.runToolInDir(ctx, root, true, f.Command, args...)
 			if err != nil {
 				return map[string]any{"success": false, "formatter": string(f.ID), "error": err.Error()}, nil
 			}
 			return map[string]any{"success": true, "formatter": string(f.ID)}, nil
 		},
 		"detect": func(_ context.Context, p *formatInput) (any, error) {
-			root := e.config.EngineerConfig.WorkingDirectory
+			root := e.effectiveWorkingDirectory()
 			all := selector.DetectFormatters(root, p.File)
 			detected := make([]map[string]any, 0, len(all))
 			for _, d := range all {
@@ -1089,7 +1126,7 @@ func lintSkill(e *Engineer) *skills.Skill {
 
 	dispatch := map[string]handler{
 		"run": func(ctx context.Context, p *lintInput) (any, error) {
-			root := e.config.EngineerConfig.WorkingDirectory
+			root := e.effectiveWorkingDirectory()
 			linter := selectLinter(root, p.Paths)
 			if linter == nil {
 				return map[string]any{"issues": []lintIssue{}, "linter": "none", "reason": "no linter detected"}, nil
@@ -1099,7 +1136,7 @@ func lintSkill(e *Engineer) *skills.Skill {
 				args = linter.fixArgs
 			}
 			args = append(args, p.Paths...)
-			output, err := runToolInDir(ctx, root, linter.command, args...)
+			output, err := e.runToolInDir(ctx, root, p.Fix, linter.command, args...)
 			if err != nil {
 				exitErr := &exec.ExitError{}
 				if !errors.As(err, &exitErr) {
@@ -1114,7 +1151,7 @@ func lintSkill(e *Engineer) *skills.Skill {
 			return map[string]any{"linter": linter.id, "output": output, "fix": p.Fix}, nil
 		},
 		"detect": func(_ context.Context, _ *lintInput) (any, error) {
-			root := e.config.EngineerConfig.WorkingDirectory
+			root := e.effectiveWorkingDirectory()
 			detected := detectLinters(root)
 			result := make([]map[string]string, 0, len(detected))
 			for _, l := range detected {

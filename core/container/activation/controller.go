@@ -102,6 +102,8 @@ type ActivationControllerConfig struct {
 	Pressure     PressureConfig  // Pressure evaluation tuning
 	ScanPeriod   int             // Idle scan period in ms (0 = derived)
 	Logger       *slog.Logger    // Structured logger (nil = slog.Default())
+	OnActivated  func(*container.Container)
+	OnRemoved    func(*container.Container)
 }
 
 // PressureSource evaluates resource pressure and produces eviction candidates.
@@ -129,6 +131,9 @@ type ActivationController struct {
 	metrics   *ActivationMetrics
 	logger    *slog.Logger
 	closed    atomic.Bool
+
+	onActivated func(*container.Container)
+	onRemoved   func(*container.Container)
 }
 
 // NewActivationController creates and initializes the controller.
@@ -152,17 +157,19 @@ func NewActivationController(cfg ActivationControllerConfig) (*ActivationControl
 	coolStore.SetLogger(logger)
 
 	ac := &ActivationController{
-		entries:   make(map[string]*ActivationEntry, len(cfg.Policies)),
-		gate:      NewActivationGate(),
-		warmPool:  NewWarmPool(cfg.WarmPoolCap),
-		coolStore: coolStore,
-		predictor: NewActivationPredictor(cfg.Predictor),
-		runtime:   cfg.Runtime,
-		registry:  cfg.Registry,
-		preserver: preserver,
-		scope:     cfg.Scope,
-		metrics:   &ActivationMetrics{},
-		logger:    logger,
+		entries:     make(map[string]*ActivationEntry, len(cfg.Policies)),
+		gate:        NewActivationGate(),
+		warmPool:    NewWarmPool(cfg.WarmPoolCap),
+		coolStore:   coolStore,
+		predictor:   NewActivationPredictor(cfg.Predictor),
+		runtime:     cfg.Runtime,
+		registry:    cfg.Registry,
+		preserver:   preserver,
+		scope:       cfg.Scope,
+		metrics:     &ActivationMetrics{},
+		logger:      logger,
+		onActivated: cfg.OnActivated,
+		onRemoved:   cfg.OnRemoved,
 	}
 
 	for _, policy := range cfg.Policies {
@@ -240,6 +247,7 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 		if c := entry.Container.Load(); c != nil && c.IsRunning() {
 			ac.metrics.HotHits.Add(1)
 			entry.TouchActivity()
+			ac.notifyActivated(c)
 			activationFileLog().Info("DEBUG: ensure_active_hot_hit", "agent_type", agentType)
 			return c, nil
 		}
@@ -265,6 +273,7 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 
 	entry.TouchActivity()
 	entry.ActivationCount.Add(1)
+	ac.notifyActivated(c)
 
 	// Record for predictor and trigger pre-warming asynchronously.
 	ac.predictor.Record(agentType)
@@ -379,6 +388,18 @@ func (ac *ActivationController) Shutdown(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// SetLifecycleCallbacks updates the activation lifecycle callbacks used to
+// observe container hot/removal transitions.
+func (ac *ActivationController) SetLifecycleCallbacks(
+	onActivated func(*container.Container),
+	onRemoved func(*container.Container),
+) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	ac.onActivated = onActivated
+	ac.onRemoved = onRemoved
 }
 
 // promote brings an entry to TierHot from whatever tier it currently occupies.
@@ -871,7 +892,35 @@ func (ac *ActivationController) stopAndRemove(ctx context.Context, c *container.
 			)
 		}
 	}
-	return ac.runtime.RemoveContainer(ctx, c)
+	err := ac.runtime.RemoveContainer(ctx, c)
+	if err == nil {
+		ac.notifyRemoved(c)
+	}
+	return err
+}
+
+func (ac *ActivationController) notifyActivated(c *container.Container) {
+	if c == nil {
+		return
+	}
+	ac.mu.RLock()
+	fn := ac.onActivated
+	ac.mu.RUnlock()
+	if fn != nil {
+		fn(c)
+	}
+}
+
+func (ac *ActivationController) notifyRemoved(c *container.Container) {
+	if c == nil {
+		return
+	}
+	ac.mu.RLock()
+	fn := ac.onRemoved
+	ac.mu.RUnlock()
+	if fn != nil {
+		fn(c)
+	}
 }
 
 func (ac *ActivationController) getEntry(agentType string) (*ActivationEntry, error) {
@@ -903,6 +952,7 @@ func (ac *ActivationController) AdoptContainer(agentType string, c *container.Co
 	entry.Container.Store(c)
 	entry.StoreTier(TierHot)
 	entry.TouchActivity()
+	ac.notifyActivated(c)
 	return c, nil
 }
 

@@ -27,14 +27,14 @@ type branchEntry struct {
 	behindCount       int  // commits in default not reachable from this branch
 	behindCountCapped bool // true if behind count hit the counting limit
 
-	additions, deletions                   int
+	additions, deletions                    int
 	filesAdded, filesModified, filesDeleted int
-	hasFileStats bool // true when file-level stats are populated
-	hasLineStats bool // true when line-level stats are populated
+	hasFileStats                            bool // true when file-level stats are populated
+	hasLineStats                            bool // true when line-level stats are populated
 
 	// Upstream divergence (from ComputeDivergenceBatch).
-	upstream     string // e.g. "origin/main"
-	aheadCount   int
+	upstream       string // e.g. "origin/main"
+	aheadCount     int
 	behindUpstream int
 	hasDivergence  bool // true when divergence data is populated
 	hasBranchStash bool // true when a branch-associated stash exists
@@ -56,6 +56,24 @@ type branchesTab struct {
 
 // branchCommitLimit is the maximum commits counted per branch before capping.
 const branchCommitLimit = 1000
+
+type branchColumnRenderer func(branchEntry, int, bool, theme.Palette, bool) string
+
+var branchCellRenderers = map[ColumnID]branchColumnRenderer{
+	"status":         renderBranchStatusCell,
+	"name":           renderBranchNameCell,
+	"hash":           renderBranchHashCell,
+	"subject":        renderBranchSubjectCell,
+	"time":           renderBranchTimeCell,
+	"commits":        renderBranchCommitsCell,
+	"changed":        renderBranchChangedCell,
+	"added":          renderBranchAddedCell,
+	"removed":        renderBranchRemovedCell,
+	"files":          renderBranchFilesCell,
+	"files_added":    renderBranchFilesAddedCell,
+	"files_modified": renderBranchFilesModifiedCell,
+	"files_deleted":  renderBranchFilesDeletedCell,
+}
 
 // loadBranches fetches branches from the git client and converts them to
 // branchEntry values. The HEAD branch is annotated with working tree state.
@@ -147,149 +165,114 @@ func loadBranches(gc *git.GitBus, statLevel git.DiffStatLevel) []branchEntry {
 // renderBranchCell renders a single column cell for a branch entry.
 func renderBranchCell(e branchEntry, colID ColumnID, width int, selected bool, th *theme.Theme, dirtyTree bool) string {
 	p := th.Palette
-	padStyle := cellPadStyle(selected, p)
 	greyOut := dirtyTree && !e.isHead
-
-	switch colID {
-	case "status":
-		return renderBranchBadge(e, width, selected, p)
-
-	case "name":
-		style := lipgloss.NewStyle().Foreground(p.Foreground).Bold(true)
-		if e.isHead {
-			style = style.Foreground(p.Primary)
-		}
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		label := " " + e.name
-		label += renderDivergenceSuffix(e, p)
-		if e.hasBranchStash {
-			label += " " + lipgloss.NewStyle().Foreground(p.Lavender).Render("S")
-		}
-		return fitCell(label, width, style)
-
-	case "hash":
-		style := lipgloss.NewStyle().Foreground(p.Primary)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(e.shortHash, width, style)
-
-	case "subject":
-		style := lipgloss.NewStyle().Foreground(p.Subtext)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(e.subject, width, style)
-
-	case "time":
-		style := lipgloss.NewStyle().Foreground(p.Muted)
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(relativeTime(e.time), width, style)
-
-	case "commits":
-		text := strconv.Itoa(e.commitCount)
-		if e.commitCountCapped {
-			text += "+"
-		}
-		if e.behindCount > 0 {
-			behind := strconv.Itoa(e.behindCount)
-			if e.behindCountCapped {
-				behind += "+"
-			}
-			text += " -" + behind
-		}
-		style := lipgloss.NewStyle().Foreground(p.Muted)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(text, width, style)
-
-	case "changed":
-		style := lipgloss.NewStyle().Foreground(p.Muted)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(strconv.Itoa(e.additions+e.deletions), width, style)
-
-	case "added":
-		style := lipgloss.NewStyle().Foreground(p.Success)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(strconv.Itoa(e.additions), width, style)
-
-	case "removed":
-		style := lipgloss.NewStyle().Foreground(p.Error)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(strconv.Itoa(e.deletions), width, style)
-
-	case "files":
-		style := lipgloss.NewStyle().Foreground(p.Muted)
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(strconv.Itoa(e.filesAdded+e.filesModified+e.filesDeleted), width, style)
-
-	case "files_added":
-		style := lipgloss.NewStyle().Foreground(p.Success)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(strconv.Itoa(e.filesAdded), width, style)
-
-	case "files_modified":
-		style := lipgloss.NewStyle().Foreground(p.Warning)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(strconv.Itoa(e.filesModified), width, style)
-
-	case "files_deleted":
-		style := lipgloss.NewStyle().Foreground(p.Error)
-		if greyOut {
-			style = style.Foreground(p.Muted)
-		}
-		if selected {
-			style = style.Background(p.Selection)
-		}
-		return fitCell(strconv.Itoa(e.filesDeleted), width, style)
-
-	default:
-		return padStyle.Render(strings.Repeat(" ", width))
+	render, ok := branchCellRenderers[colID]
+	if !ok {
+		return blankBranchCell(width, selected, p)
 	}
+	return render(e, width, selected, p, greyOut)
+}
+
+func blankBranchCell(width int, selected bool, p theme.Palette) string {
+	return cellPadStyle(selected, p).Render(strings.Repeat(" ", width))
+}
+
+func renderBranchStatusCell(e branchEntry, width int, selected bool, p theme.Palette, _ bool) string {
+	return renderBranchBadge(e, width, selected, p)
+}
+
+func renderBranchNameCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(branchNameLabel(e, p), width, branchNameStyle(e, p, selected, greyOut))
+}
+
+func renderBranchHashCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(e.shortHash, width, branchCellStyle(p.Primary, selected, p, greyOut))
+}
+
+func renderBranchSubjectCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(e.subject, width, branchCellStyle(p.Subtext, selected, p, greyOut))
+}
+
+func renderBranchTimeCell(e branchEntry, width int, selected bool, p theme.Palette, _ bool) string {
+	return fitCell(relativeTime(e.time), width, selectedCellStyle(p.Muted, selected, p))
+}
+
+func renderBranchCommitsCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(branchCommitSummary(e), width, branchCellStyle(p.Muted, selected, p, greyOut))
+}
+
+func renderBranchChangedCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(strconv.Itoa(e.additions+e.deletions), width, branchCellStyle(p.Muted, selected, p, greyOut))
+}
+
+func renderBranchAddedCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(strconv.Itoa(e.additions), width, branchCellStyle(p.Success, selected, p, greyOut))
+}
+
+func renderBranchRemovedCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(strconv.Itoa(e.deletions), width, branchCellStyle(p.Error, selected, p, greyOut))
+}
+
+func renderBranchFilesCell(e branchEntry, width int, selected bool, p theme.Palette, _ bool) string {
+	return fitCell(strconv.Itoa(e.filesAdded+e.filesModified+e.filesDeleted), width, selectedCellStyle(p.Muted, selected, p))
+}
+
+func renderBranchFilesAddedCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(strconv.Itoa(e.filesAdded), width, branchCellStyle(p.Success, selected, p, greyOut))
+}
+
+func renderBranchFilesModifiedCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(strconv.Itoa(e.filesModified), width, branchCellStyle(p.Warning, selected, p, greyOut))
+}
+
+func renderBranchFilesDeletedCell(e branchEntry, width int, selected bool, p theme.Palette, greyOut bool) string {
+	return fitCell(strconv.Itoa(e.filesDeleted), width, branchCellStyle(p.Error, selected, p, greyOut))
+}
+
+func branchNameStyle(e branchEntry, p theme.Palette, selected, greyOut bool) lipgloss.Style {
+	base := p.Foreground
+	if e.isHead {
+		base = p.Primary
+	}
+	return branchCellStyle(base, selected, p, greyOut).Bold(true)
+}
+
+func branchCellStyle(base lipgloss.Color, selected bool, p theme.Palette, greyOut bool) lipgloss.Style {
+	if greyOut {
+		base = p.Muted
+	}
+	return selectedCellStyle(base, selected, p)
+}
+
+func selectedCellStyle(base lipgloss.Color, selected bool, p theme.Palette) lipgloss.Style {
+	style := lipgloss.NewStyle().Foreground(base)
+	if selected {
+		style = style.Background(p.Selection)
+	}
+	return style
+}
+
+func branchNameLabel(e branchEntry, p theme.Palette) string {
+	label := " " + e.name + renderDivergenceSuffix(e, p)
+	if e.hasBranchStash {
+		label += " " + lipgloss.NewStyle().Foreground(p.Lavender).Render("S")
+	}
+	return label
+}
+
+func branchCommitSummary(e branchEntry) string {
+	text := strconv.Itoa(e.commitCount)
+	if e.commitCountCapped {
+		text += "+"
+	}
+	if e.behindCount > 0 {
+		behind := strconv.Itoa(e.behindCount)
+		if e.behindCountCapped {
+			behind += "+"
+		}
+		text += " -" + behind
+	}
+	return text
 }
 
 // renderDivergenceSuffix returns a styled ahead/behind indicator for upstream divergence.

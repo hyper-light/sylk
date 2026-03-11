@@ -156,7 +156,7 @@ func (tb *TombstoneBitmap) Save() error {
 		return fmt.Errorf("tombstone: close: %w", err)
 	}
 
-	return os.Rename(tmpPath, tb.path)
+	return durableRename(tmpPath, tb.path)
 }
 
 // Load reads the bitmap from disk. If the file does not exist,

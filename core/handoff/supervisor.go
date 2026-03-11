@@ -46,6 +46,10 @@ type HandoffSupervisor struct {
 	// Quality publisher — propagated to all bridges.
 	qualityPublisher func(agentID string, quality, stdDev float64)
 
+	// Brief source — propagated to all bridges so handoffs can request
+	// Archivalist-backed summaries instead of falling back to raw snapshots.
+	briefSource BriefSource
+
 	// Traffic shift callbacks — wired by bootstrap.
 	onShiftBegin func(oldID string, newAgent HandoffableAgent)
 	updateWeight func(agentID string, weight float64)
@@ -157,6 +161,15 @@ func (s *HandoffSupervisor) RegisterAgent(agent HandoffableAgent) (*HandoffBridg
 		return nil, fmt.Errorf("supervisor not started")
 	}
 
+	s.mu.RLock()
+	if existing := s.bridges[agent.AgentID()]; existing != nil {
+		s.mu.RUnlock()
+		return existing, nil
+	}
+	publisher := s.qualityPublisher
+	briefSource := s.briefSource
+	s.mu.RUnlock()
+
 	desc, ok := s.descriptors.Get(agent.AgentType())
 	if !ok {
 		// Register with a reasonable default.
@@ -165,12 +178,12 @@ func (s *HandoffSupervisor) RegisterAgent(agent HandoffableAgent) (*HandoffBridg
 	}
 
 	cfg := BridgeConfigForAgent(desc)
+	if cfg.BriefSource == nil {
+		cfg.BriefSource = briefSource
+	}
 	bridge := NewHandoffBridge(cfg, agent, s)
 
 	// Propagate quality publisher to the new bridge.
-	s.mu.RLock()
-	publisher := s.qualityPublisher
-	s.mu.RUnlock()
 	if publisher != nil {
 		bridge.SetQualityPublisher(publisher)
 	}
@@ -226,6 +239,29 @@ func (s *HandoffSupervisor) SetAgentReplacedCallback(fn func(string, string, Han
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onAgentReplaced = fn
+}
+
+// SetBriefSource sets the brief source bridges use to generate handoff
+// summaries. Propagated to all existing and future bridges.
+func (s *HandoffSupervisor) SetBriefSource(source BriefSource) {
+	s.mu.Lock()
+	s.briefSource = source
+	bridges := make([]*HandoffBridge, 0, len(s.bridges))
+	for _, b := range s.bridges {
+		bridges = append(bridges, b)
+	}
+	s.mu.Unlock()
+
+	for _, b := range bridges {
+		b.mu.Lock()
+		b.config.BriefSource = source
+		if source == nil {
+			b.briefGen = nil
+		} else {
+			b.briefGen = NewBriefGenerator(source)
+		}
+		b.mu.Unlock()
+	}
 }
 
 // SetQualityPublisher sets the callback that bridges use to publish

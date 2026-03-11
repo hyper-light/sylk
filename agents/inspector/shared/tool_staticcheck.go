@@ -26,7 +26,7 @@ type staticcheckLocation struct {
 // RunStaticcheck runs staticcheck with JSON output and parses results.
 func RunStaticcheck(ctx context.Context, runner *ToolRunner, paths []string) []ValidationIssue {
 	if !runner.Available("staticcheck") {
-		return nil
+		return unavailableToolIssues("staticcheck")
 	}
 
 	args := []string{"-f", "json"}
@@ -34,7 +34,7 @@ func RunStaticcheck(ctx context.Context, runner *ToolRunner, paths []string) []V
 
 	result, err := runner.Exec(ctx, "staticcheck", args...)
 	if err != nil {
-		return nil
+		return executionFailureIssues("staticcheck", err)
 	}
 
 	var issues []ValidationIssue

@@ -471,12 +471,6 @@ func TestCompactGlobalDataFiles(t *testing.T) {
 	nodeStore.SaveIndexes()
 	docStore.SaveIndexes()
 
-	// Record the initial data file sizes.
-	nodeFileInfo, _ := os.Stat(sd.GlobalNodeDataPath())
-	initialNodeSize := nodeFileInfo.Size()
-	docFileInfo, _ := os.Stat(sd.GlobalDocDataPath())
-	initialDocSize := docFileInfo.Size()
-
 	nodeStore.Close()
 	docStore.Close()
 
@@ -505,16 +499,19 @@ func TestCompactGlobalDataFiles(t *testing.T) {
 		t.Fatalf("CompactGlobalData: %v", err)
 	}
 
-	// Verify: node data file should be smaller (node 2 removed).
-	nodeFileInfoAfter, _ := os.Stat(sd.GlobalNodeDataPath())
-	if nodeFileInfoAfter.Size() >= initialNodeSize {
-		t.Errorf("node data file not compacted: before=%d, after=%d", initialNodeSize, nodeFileInfoAfter.Size())
+	// Verify: v1 remains readable after creating a compacted v2 snapshot.
+	nodeStoreV1, err := NewGlobalVersionNodeStore(sd, v1)
+	if err != nil {
+		t.Fatalf("NewGlobalVersionNodeStore v1: %v", err)
 	}
+	defer nodeStoreV1.Close()
 
-	// Verify: doc data file should be smaller (doc for node 2 removed).
-	docFileInfoAfter, _ := os.Stat(sd.GlobalDocDataPath())
-	if docFileInfoAfter.Size() >= initialDocSize {
-		t.Errorf("doc data file not compacted: before=%d, after=%d", initialDocSize, docFileInfoAfter.Size())
+	node2V1, err := nodeStoreV1.ReadFromVersion(v1, 2)
+	if err != nil {
+		t.Fatalf("read node 2 from v1 after compact: %v", err)
+	}
+	if node2V1.ID != 2 {
+		t.Fatalf("node 2 from v1 = %d, want 2", node2V1.ID)
 	}
 
 	// Verify: v2's node index can read surviving nodes (1 and 3).

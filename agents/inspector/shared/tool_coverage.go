@@ -3,7 +3,6 @@ package shared
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,34 +14,26 @@ const defaultCoverageThreshold = 80.0
 // RunCoverage runs go test with coverage and parses the per-function output.
 func RunCoverage(ctx context.Context, runner *ToolRunner, paths []string, threshold float64) []ValidationIssue {
 	if !runner.Available("go") {
-		return nil
+		return unavailableToolIssues("go")
 	}
 
 	if threshold <= 0 {
 		threshold = defaultCoverageThreshold
 	}
 
-	coverFile := filepath.Join(os.TempDir(), fmt.Sprintf("sylk_cover_%d.out", os.Getpid()))
-	defer os.Remove(coverFile)
-
-	// Run tests with coverage
-	testArgs := []string{"test", "-coverprofile=" + coverFile, "-count=1"}
-	testArgs = append(testArgs, paths...)
-
-	testResult, err := runner.Exec(ctx, "go", testArgs...)
-	if err != nil {
-		return nil
+	coverFile := filepath.Join(runner.LogicalTempDir(), "sylk_cover.out")
+	command := "go test -coverprofile=" + coverFile + " -count=1"
+	if len(paths) == 0 {
+		command += " ./..."
+	} else {
+		command += " " + strings.Join(paths, " ")
 	}
-	_ = testResult
-
-	// Parse coverage output
-	coverArgs := []string{"tool", "cover", "-func=" + coverFile}
-	coverResult, err := runner.Exec(ctx, "go", coverArgs...)
+	command += " && go tool cover -func=" + coverFile
+	testResult, err := runner.ExecShell(ctx, command)
 	if err != nil {
-		return nil
+		return executionFailureIssues("coverage", err)
 	}
-
-	return parseCoverageOutput(string(coverResult.Stdout), threshold)
+	return parseCoverageOutput(string(testResult.Stdout), threshold)
 }
 
 func parseCoverageOutput(output string, threshold float64) []ValidationIssue {

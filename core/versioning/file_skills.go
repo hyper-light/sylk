@@ -9,8 +9,16 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
+// FileAccessProvider resolves the current FileAccess at invocation time.
+type FileAccessProvider func() FileAccess
+
 // NewReadFileSkill creates a read_file skill backed by the given FileAccess.
 func NewReadFileSkill(fa FileAccess) *skills.Skill {
+	return NewReadFileSkillFunc(func() FileAccess { return fa })
+}
+
+// NewReadFileSkillFunc creates a read_file skill backed by a late-bound FileAccess.
+func NewReadFileSkillFunc(getFA FileAccessProvider) *skills.Skill {
 	return skills.NewSkill("read_file").
 		Description("Read the contents of a file. Returns file content with optional offset and limit for large files.").
 		Domain("filesystem").
@@ -30,6 +38,11 @@ func NewReadFileSkill(fa FileAccess) *skills.Skill {
 			}
 			if params.Path == "" {
 				return nil, fmt.Errorf("path is required")
+			}
+
+			fa, err := resolveSkillFileAccess(getFA)
+			if err != nil {
+				return nil, err
 			}
 
 			content, err := fa.ReadFile(ctx, params.Path)
@@ -73,6 +86,11 @@ func NewReadFileSkill(fa FileAccess) *skills.Skill {
 
 // NewWriteFileSkill creates a write_file skill backed by the given FileAccess.
 func NewWriteFileSkill(fa FileAccess) *skills.Skill {
+	return NewWriteFileSkillFunc(func() FileAccess { return fa })
+}
+
+// NewWriteFileSkillFunc creates a write_file skill backed by a late-bound FileAccess.
+func NewWriteFileSkillFunc(getFA FileAccessProvider) *skills.Skill {
 	return skills.NewSkill("write_file").
 		Description("Write content to a file. Creates the file if it doesn't exist, overwrites if it does.").
 		Domain("filesystem").
@@ -90,6 +108,11 @@ func NewWriteFileSkill(fa FileAccess) *skills.Skill {
 			}
 			if params.Path == "" {
 				return nil, fmt.Errorf("path is required")
+			}
+
+			fa, err := resolveSkillFileAccess(getFA)
+			if err != nil {
+				return nil, err
 			}
 			if fa.IsReadOnly() {
 				return nil, fmt.Errorf("file writes are disabled")
@@ -119,6 +142,11 @@ func NewWriteFileSkill(fa FileAccess) *skills.Skill {
 
 // NewEditFileSkill creates an edit_file skill backed by the given FileAccess.
 func NewEditFileSkill(fa FileAccess) *skills.Skill {
+	return NewEditFileSkillFunc(func() FileAccess { return fa })
+}
+
+// NewEditFileSkillFunc creates an edit_file skill backed by a late-bound FileAccess.
+func NewEditFileSkillFunc(getFA FileAccessProvider) *skills.Skill {
 	return skills.NewSkill("edit_file").
 		Description("Edit specific sections of a file using search and replace. Each edit specifies old text to find and new text to replace it with.").
 		Domain("filesystem").
@@ -142,6 +170,10 @@ func NewEditFileSkill(fa FileAccess) *skills.Skill {
 			}
 			if len(params.Edits) == 0 {
 				return nil, fmt.Errorf("at least one edit is required")
+			}
+			fa, err := resolveSkillFileAccess(getFA)
+			if err != nil {
+				return nil, err
 			}
 			if fa.IsReadOnly() {
 				return nil, fmt.Errorf("file writes are disabled")
@@ -175,6 +207,48 @@ func NewEditFileSkill(fa FileAccess) *skills.Skill {
 				"lines_before":  len(oldLines),
 				"lines_after":   len(newLines),
 				"success":       true,
+			}, nil
+		}).
+		Build()
+}
+
+// NewCreateDirectorySkill creates a create_directory skill backed by the given FileAccess.
+func NewCreateDirectorySkill(fa FileAccess) *skills.Skill {
+	return NewCreateDirectorySkillFunc(func() FileAccess { return fa })
+}
+
+// NewCreateDirectorySkillFunc creates a create_directory skill backed by a late-bound FileAccess.
+func NewCreateDirectorySkillFunc(getFA FileAccessProvider) *skills.Skill {
+	return skills.NewSkill("create_directory").
+		Description("Create a directory path in the active workspace or VFS. Missing parent directories are created automatically.").
+		Domain("filesystem").
+		Keywords("mkdir", "directory", "folder", "create", "path").
+		Priority(92).
+		StringParam("path", "Directory path to create", true).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			var params struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			if strings.TrimSpace(params.Path) == "" {
+				return nil, fmt.Errorf("path is required")
+			}
+
+			fa, err := resolveSkillFileAccess(getFA)
+			if err != nil {
+				return nil, err
+			}
+			if fa.IsReadOnly() {
+				return nil, fmt.Errorf("directory creation is disabled")
+			}
+			if err := fa.MkdirAll(ctx, params.Path); err != nil {
+				return nil, fmt.Errorf("failed to create directory: %w", err)
+			}
+			return map[string]any{
+				"path":    params.Path,
+				"created": true,
 			}, nil
 		}).
 		Build()
@@ -218,6 +292,17 @@ func NewGlobSkill(fa FileAccess) *skills.Skill {
 			}, nil
 		}).
 		Build()
+}
+
+func resolveSkillFileAccess(getFA FileAccessProvider) (FileAccess, error) {
+	if getFA == nil {
+		return nil, fmt.Errorf("file access is unavailable")
+	}
+	fa := getFA()
+	if fa == nil {
+		return nil, fmt.Errorf("file access is unavailable")
+	}
+	return fa, nil
 }
 
 // NewGrepSkill creates a grep skill backed by the given FileAccess.

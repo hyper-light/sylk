@@ -387,6 +387,10 @@ func (w *Workspace) WriteFile(branch, filePath string, content []byte, mode fs.F
 	return w.writeBody(branch, filePath, body, mode, JournalCreate, JournalModify)
 }
 
+func (w *Workspace) WriteFileBody(branch, filePath string, body *FileBody, mode fs.FileMode) (SnapshotID, error) {
+	return w.writeBody(branch, filePath, body, mode, JournalCreate, JournalModify)
+}
+
 func (w *Workspace) SeedRealFile(branch, filePath, realPath string, mode fs.FileMode, size int64) (SnapshotID, error) {
 	body := NewRealFileBody(realPath, size)
 	return w.writeBody(branch, filePath, body, mode, JournalSeed, JournalSeed)

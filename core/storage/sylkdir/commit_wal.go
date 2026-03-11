@@ -739,10 +739,10 @@ func (w *CommitWAL) saveCheckpoint(seq uint64) error {
 	binary.LittleEndian.PutUint64(data, seq)
 
 	tmpPath := w.checkpointPath() + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	if err := writeFileSync(tmpPath, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, w.checkpointPath())
+	return durableRename(tmpPath, w.checkpointPath())
 }
 
 func (w *CommitWAL) gcSegments(segments []uint64) error {

@@ -688,6 +688,188 @@ func TestGlobalMetaVersionBumpTypes(t *testing.T) {
 	}
 }
 
+func TestGlobalMetaCommitGraphInitialized(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	meta := NewGlobalMetaFromSylkDir(sd)
+	if err := meta.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	graph := meta.GetCommitGraph()
+	if graph == nil {
+		t.Fatal("commit graph should be initialized")
+	}
+	if graph.DefaultRef != "main" {
+		t.Fatalf("default ref = %q, want main", graph.DefaultRef)
+	}
+	if graph.ActiveRef != "main" {
+		t.Fatalf("active ref = %q, want main", graph.ActiveRef)
+	}
+	if graph.HeadCommitID == "" {
+		t.Fatal("head commit should not be empty")
+	}
+	if graph.Refs["main"] != graph.HeadCommitID {
+		t.Fatalf("main ref = %q, want head %q", graph.Refs["main"], graph.HeadCommitID)
+	}
+	if len(graph.Commits) != 1 {
+		t.Fatalf("commit count = %d, want 1", len(graph.Commits))
+	}
+}
+
+func TestGlobalMetaAllocateGlobalVersionAcrossBranching(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	meta := NewGlobalMetaFromSylkDir(sd)
+	if err := meta.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	v2, err := meta.AllocateGlobalVersion()
+	if err != nil {
+		t.Fatalf("AllocateGlobalVersion v2: %v", err)
+	}
+	if _, err := meta.PublishCommit(GlobalVersion{
+		ID:        v2,
+		ParentID:  meta.GetHead(),
+		SessionID: 1,
+		CreatedAt: time.Now().UTC(),
+	}, 1, SemanticVersion{Major: 1, Minor: 0, Patch: 1}); err != nil {
+		t.Fatalf("PublishCommit v2: %v", err)
+	}
+
+	root := SemanticVersion{Major: 1, Minor: 0, Patch: 0}
+	if err := meta.Checkout(root); err != nil {
+		t.Fatalf("Checkout root: %v", err)
+	}
+
+	v3, err := meta.AllocateGlobalVersion()
+	if err != nil {
+		t.Fatalf("AllocateGlobalVersion v3: %v", err)
+	}
+	if !v3.Equal(SemanticVersion{Major: 3, Minor: 0, Patch: 0}) {
+		t.Fatalf("allocated version after branching = %s, want v3.0.0", v3.String())
+	}
+}
+
+func TestGlobalMetaDetachedPublishDoesNotMoveBranchRef(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	meta := NewGlobalMetaFromSylkDir(sd)
+	if err := meta.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	root := meta.GetHead()
+	v2, err := meta.AllocateGlobalVersion()
+	if err != nil {
+		t.Fatalf("AllocateGlobalVersion v2: %v", err)
+	}
+	mainCommit, err := meta.PublishCommit(GlobalVersion{
+		ID:        v2,
+		ParentID:  root,
+		SessionID: 1,
+		CreatedAt: time.Now().UTC(),
+	}, 1, SemanticVersion{Major: 1, Minor: 0, Patch: 1})
+	if err != nil {
+		t.Fatalf("PublishCommit v2: %v", err)
+	}
+
+	if err := meta.Checkout(root); err != nil {
+		t.Fatalf("Checkout root: %v", err)
+	}
+	if got := meta.GetActiveRef(); got != "" {
+		t.Fatalf("active ref after detached checkout = %q, want empty", got)
+	}
+
+	v3, err := meta.AllocateGlobalVersion()
+	if err != nil {
+		t.Fatalf("AllocateGlobalVersion v3: %v", err)
+	}
+	detachedCommit, err := meta.PublishCommit(GlobalVersion{
+		ID:        v3,
+		ParentID:  root,
+		SessionID: 2,
+		CreatedAt: time.Now().UTC(),
+	}, 2, SemanticVersion{Major: 1, Minor: 0, Patch: 2})
+	if err != nil {
+		t.Fatalf("PublishCommit detached: %v", err)
+	}
+
+	if detachedCommit == mainCommit {
+		t.Fatal("detached commit should get a distinct commit ID")
+	}
+	if got := meta.GetActiveRef(); got != "" {
+		t.Fatalf("active ref after detached publish = %q, want empty", got)
+	}
+	graph := meta.GetCommitGraph()
+	if graph.Refs["main"] != mainCommit {
+		t.Fatalf("main ref moved to %q, want %q", graph.Refs["main"], mainCommit)
+	}
+	if meta.GetHeadCommitID() != detachedCommit {
+		t.Fatalf("head commit = %q, want detached commit %q", meta.GetHeadCommitID(), detachedCommit)
+	}
+	if !meta.GetHead().Equal(v3) {
+		t.Fatalf("HEAD version = %s, want %s", meta.GetHead().String(), v3.String())
+	}
+}
+
+func TestGlobalMetaCreateAndCheckoutBranch(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	meta := NewGlobalMetaFromSylkDir(sd)
+	if err := meta.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	v2, err := meta.AllocateGlobalVersion()
+	if err != nil {
+		t.Fatalf("AllocateGlobalVersion v2: %v", err)
+	}
+	v2Commit, err := meta.PublishCommit(GlobalVersion{
+		ID:        v2,
+		ParentID:  meta.GetHead(),
+		SessionID: 1,
+		CreatedAt: time.Now().UTC(),
+	}, 1, SemanticVersion{Major: 1, Minor: 0, Patch: 1})
+	if err != nil {
+		t.Fatalf("PublishCommit v2: %v", err)
+	}
+
+	if err := meta.CreateBranch("feature"); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := meta.CheckoutBranch("feature"); err != nil {
+		t.Fatalf("CheckoutBranch: %v", err)
+	}
+	if got := meta.GetActiveRef(); got != "feature" {
+		t.Fatalf("active ref = %q, want feature", got)
+	}
+	if got := meta.GetHeadCommitID(); got != v2Commit {
+		t.Fatalf("head commit = %q, want %q", got, v2Commit)
+	}
+	graph := meta.GetCommitGraph()
+	if graph.Refs["feature"] != v2Commit {
+		t.Fatalf("feature ref = %q, want %q", graph.Refs["feature"], v2Commit)
+	}
+}
+
 // TestGlobalMetaCommitFileRoundTrip reads the raw meta.json off disk after
 // commits and verifies that every SemanticVersion field serialises correctly.
 func TestGlobalMetaCommitFileRoundTrip(t *testing.T) {
@@ -747,8 +929,8 @@ func TestGlobalMetaCommitFileRoundTrip(t *testing.T) {
 
 	// committed_sessions must contain two entries with correct shapes
 	var sessions []struct {
-		SessionID     uint32 `json:"session_id"`
-		FinalVersion  struct {
+		SessionID    uint32 `json:"session_id"`
+		FinalVersion struct {
 			Major uint16 `json:"major"`
 			Minor uint16 `json:"minor"`
 			Patch uint16 `json:"patch"`

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -64,6 +63,8 @@ type GlobalMeta struct {
 	CommittedSessions []CommittedSession `json:"committed_sessions"`
 	// Manifest tracks the version DAG for cumulative snapshots.
 	Manifest *GlobalVersionManifest `json:"manifest,omitempty"`
+	// CommitGraph tracks immutable commits and mutable refs over storage versions.
+	CommitGraph *GlobalCommitGraph `json:"commit_graph,omitempty"`
 	// LastBleveIndexedVersion is the last global version whose documents were
 	// fully indexed in Bleve. Used for crash recovery: if HEAD > this value,
 	// the Bleve index must be rebuilt from the HEAD version's JSONL.
@@ -82,7 +83,7 @@ type GlobalMeta struct {
 func NewGlobalMeta(metaPath string) *GlobalMeta {
 	return &GlobalMeta{
 		path:              metaPath,
-		SchemaVersion:     2, // v2 includes global versioning
+		SchemaVersion:     2,                                             // v2 includes global versioning
 		Version:           SemanticVersion{Major: 0, Minor: 0, Patch: 0}, // Initial version
 		NextNodeID:        1,
 		NextSessionID:     1,
@@ -119,6 +120,7 @@ func (m *GlobalMeta) Load() error {
 	if m.Manifest != nil && m.Manifest.Versions == nil {
 		m.Manifest.Versions = make([]GlobalVersion, 0)
 	}
+	m.ensureCommitGraphLocked()
 
 	m.loaded = true
 	return nil
@@ -140,45 +142,71 @@ func (m *GlobalMeta) saveUnlocked() error {
 	if err != nil {
 		return fmt.Errorf("sylkdir: failed to marshal meta: %w", err)
 	}
-
-	// Write to temp file first
-	dir := filepath.Dir(m.path)
-	tmpFile, err := os.CreateTemp(dir, "meta.*.tmp")
-	if err != nil {
-		return fmt.Errorf("sylkdir: failed to create temp file: %w", err)
+	if err := durableWriteFile(m.path, data, 0o644); err != nil {
+		return fmt.Errorf("sylkdir: failed to persist meta: %w", err)
 	}
-	tmpPath := tmpFile.Name()
+	return nil
+}
 
-	// Ensure cleanup on error
-	success := false
-	defer func() {
-		if !success {
-			os.Remove(tmpPath)
+type globalMetaState struct {
+	Version                 SemanticVersion
+	CommittedSessions       []CommittedSession
+	Manifest                *GlobalVersionManifest
+	CommitGraph             *GlobalCommitGraph
+	LastBleveIndexedVersion *SemanticVersion
+}
+
+func (m *GlobalMeta) snapshotState() globalMetaState {
+	state := globalMetaState{
+		Version:           m.Version,
+		CommittedSessions: append([]CommittedSession(nil), m.CommittedSessions...),
+	}
+	if m.Manifest != nil {
+		versions := append([]GlobalVersion(nil), m.Manifest.Versions...)
+		state.Manifest = &GlobalVersionManifest{
+			Head:     m.Manifest.Head,
+			Versions: versions,
 		}
-	}()
-
-	// Write data
-	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("sylkdir: failed to write temp file: %w", err)
 	}
-
-	// Sync to disk
-	if err := tmpFile.Sync(); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("sylkdir: failed to sync temp file: %w", err)
+	state.CommitGraph = copyGlobalCommitGraph(m.CommitGraph)
+	if m.LastBleveIndexedVersion != nil {
+		v := *m.LastBleveIndexedVersion
+		state.LastBleveIndexedVersion = &v
 	}
+	return state
+}
 
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("sylkdir: failed to close temp file: %w", err)
+func (m *GlobalMeta) restoreState(state globalMetaState) {
+	m.Version = state.Version
+	m.CommittedSessions = append([]CommittedSession(nil), state.CommittedSessions...)
+	if state.Manifest == nil {
+		m.Manifest = nil
+	} else {
+		versions := append([]GlobalVersion(nil), state.Manifest.Versions...)
+		m.Manifest = &GlobalVersionManifest{
+			Head:     state.Manifest.Head,
+			Versions: versions,
+		}
 	}
-
-	// Atomic rename
-	if err := os.Rename(tmpPath, m.path); err != nil {
-		return fmt.Errorf("sylkdir: failed to rename temp file: %w", err)
+	m.CommitGraph = copyGlobalCommitGraph(state.CommitGraph)
+	if state.LastBleveIndexedVersion == nil {
+		m.LastBleveIndexedVersion = nil
+	} else {
+		v := *state.LastBleveIndexedVersion
+		m.LastBleveIndexedVersion = &v
 	}
+}
 
-	success = true
+func (m *GlobalMeta) mutateAndSave(apply func() error) error {
+	snapshot := m.snapshotState()
+	if err := apply(); err != nil {
+		m.restoreState(snapshot)
+		return err
+	}
+	if err := m.saveUnlocked(); err != nil {
+		m.restoreState(snapshot)
+		return err
+	}
 	return nil
 }
 
@@ -205,6 +233,11 @@ func (m *GlobalMeta) initWithManifest(initialVersion SemanticVersion) error {
 			},
 		},
 	}
+	m.CommitGraph = &GlobalCommitGraph{
+		DefaultRef: defaultGlobalRef,
+		ActiveRef:  defaultGlobalRef,
+	}
+	m.ensureCommitGraphLocked()
 	m.loaded = true
 
 	return m.saveUnlocked()
@@ -319,6 +352,87 @@ func (m *GlobalMeta) RegisterCommit(sessionID uint32, finalVersion SemanticVersi
 	return nil
 }
 
+// PublishCommit atomically appends a global version, moves HEAD, and records the session commit.
+func (m *GlobalMeta) PublishCommit(gv GlobalVersion, sessionID uint32, finalVersion SemanticVersion) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return "", ErrMetaNotLoaded
+	}
+	if m.Manifest == nil {
+		return "", fmt.Errorf("sylkdir: manifest not initialized")
+	}
+	m.ensureCommitGraphLocked()
+
+	var commitID string
+
+	err := m.mutateAndSave(func() error {
+		m.ensureCommitGraphLocked()
+		for _, existing := range m.Manifest.Versions {
+			if existing.ID.Equal(gv.ID) {
+				return fmt.Errorf("sylkdir: version %s already exists", gv.ID.String())
+			}
+		}
+		for _, cs := range m.CommittedSessions {
+			if cs.SessionID == sessionID {
+				return fmt.Errorf("sylkdir: session %d already committed", sessionID)
+			}
+		}
+		if _, exists := commitByVersion(m.CommitGraph.Commits, gv.ID); exists {
+			return fmt.Errorf("sylkdir: commit for version %s already exists", gv.ID.String())
+		}
+		newID, err := newGlobalCommitID()
+		if err != nil {
+			return err
+		}
+		commitID = newID
+
+		m.Manifest.Versions = append(m.Manifest.Versions, gv)
+		m.Manifest.Head = gv.ID
+		m.Version = gv.ID
+		m.CommittedSessions = append(m.CommittedSessions, CommittedSession{
+			SessionID:     sessionID,
+			FinalVersion:  finalVersion,
+			GlobalVersion: gv.ID,
+			CommittedAt:   time.Now().UTC(),
+		})
+		parents := make([]string, 0, 1)
+		if m.CommitGraph != nil && m.CommitGraph.HeadCommitID != "" {
+			parents = append(parents, m.CommitGraph.HeadCommitID)
+		}
+		m.CommitGraph.Commits = append(m.CommitGraph.Commits, GlobalCommit{
+			ID:              commitID,
+			StorageVersion:  gv.ID,
+			ParentCommitIDs: parents,
+			SessionID:       sessionID,
+			SessionVer:      finalVersion,
+			CreatedAt:       gv.CreatedAt,
+			Stats:           gv.Stats,
+		})
+		m.CommitGraph.HeadCommitID = commitID
+		if m.CommitGraph.DefaultRef == "" {
+			m.CommitGraph.DefaultRef = defaultGlobalRef
+		}
+		if m.CommitGraph.Refs == nil {
+			m.CommitGraph.Refs = make(map[string]string)
+		}
+		if m.CommitGraph.ActiveRef == "" && len(m.CommitGraph.Refs) == 0 {
+			m.CommitGraph.ActiveRef = m.CommitGraph.DefaultRef
+		}
+		if m.CommitGraph.ActiveRef != "" {
+			m.CommitGraph.Refs[m.CommitGraph.ActiveRef] = commitID
+		} else if _, ok := m.CommitGraph.Refs[m.CommitGraph.DefaultRef]; !ok {
+			m.CommitGraph.Refs[m.CommitGraph.DefaultRef] = commitID
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return commitID, nil
+}
+
 // IsSessionCommitted returns true if the session has been committed.
 func (m *GlobalMeta) IsSessionCommitted(sessionID uint32) bool {
 	m.mu.Lock()
@@ -424,6 +538,7 @@ func (m *GlobalMeta) GetHead() SemanticVersion {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.ensureCommitGraphLocked()
 	if m.Manifest == nil {
 		return SemanticVersion{}
 	}
@@ -442,16 +557,70 @@ func (m *GlobalMeta) SetHead(version SemanticVersion) error {
 	if m.Manifest == nil {
 		return fmt.Errorf("sylkdir: manifest not initialized")
 	}
+	m.ensureCommitGraphLocked()
+
+	commit, ok := commitByVersion(m.CommitGraph.Commits, version)
+	if !ok {
+		m.CommitGraph = buildCommitGraphFromManifest(m.Manifest)
+		commit, ok = commitByVersion(m.CommitGraph.Commits, version)
+		if !ok {
+			return ErrVersionNotFound
+		}
+	}
 
 	oldHead := m.Manifest.Head
 	m.Manifest.Head = version
+	oldCommitHead := m.CommitGraph.HeadCommitID
+	oldActiveRef := m.CommitGraph.ActiveRef
+	m.CommitGraph.HeadCommitID = commit.ID
+	m.CommitGraph.ActiveRef = ""
 
 	if err := m.saveUnlocked(); err != nil {
 		m.Manifest.Head = oldHead
+		m.CommitGraph.HeadCommitID = oldCommitHead
+		m.CommitGraph.ActiveRef = oldActiveRef
 		return fmt.Errorf("sylkdir: failed to persist head update: %w", err)
 	}
 
 	return nil
+}
+
+// RepairState atomically replaces recovery-managed metadata fields.
+func (m *GlobalMeta) RepairState(
+	manifest *GlobalVersionManifest,
+	version SemanticVersion,
+	committed []CommittedSession,
+	commitGraph *GlobalCommitGraph,
+	lastBleve *SemanticVersion,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.loaded {
+		return ErrMetaNotLoaded
+	}
+
+	return m.mutateAndSave(func() error {
+		if manifest == nil {
+			m.Manifest = nil
+		} else {
+			versions := append([]GlobalVersion(nil), manifest.Versions...)
+			m.Manifest = &GlobalVersionManifest{
+				Head:     manifest.Head,
+				Versions: versions,
+			}
+		}
+		m.CommitGraph = copyGlobalCommitGraph(commitGraph)
+		m.Version = version
+		m.CommittedSessions = append([]CommittedSession(nil), committed...)
+		if lastBleve == nil {
+			m.LastBleveIndexedVersion = nil
+		} else {
+			v := *lastBleve
+			m.LastBleveIndexedVersion = &v
+		}
+		return nil
+	})
 }
 
 // GetAncestorChain returns the version chain from HEAD to root.
@@ -503,11 +672,34 @@ func (m *GlobalMeta) AddVersion(v GlobalVersion) error {
 			return fmt.Errorf("sylkdir: version %s already exists", v.ID.String())
 		}
 	}
+	m.ensureCommitGraphLocked()
 
 	m.Manifest.Versions = append(m.Manifest.Versions, v)
+	appendedCommit := false
+	if _, exists := commitByVersion(m.CommitGraph.Commits, v.ID); !exists {
+		parents := make([]string, 0, 1)
+		if !v.ParentID.IsZero() {
+			if parent, ok := commitByVersion(m.CommitGraph.Commits, v.ParentID); ok {
+				parents = append(parents, parent.ID)
+			}
+		}
+		m.CommitGraph.Commits = append(m.CommitGraph.Commits, GlobalCommit{
+			ID:              legacyCommitID(v.ID),
+			StorageVersion:  v.ID,
+			ParentCommitIDs: parents,
+			SessionID:       v.SessionID,
+			SessionVer:      v.SessionVer,
+			CreatedAt:       v.CreatedAt,
+			Stats:           v.Stats,
+		})
+		appendedCommit = true
+	}
 
 	if err := m.saveUnlocked(); err != nil {
 		m.Manifest.Versions = m.Manifest.Versions[:len(m.Manifest.Versions)-1]
+		if appendedCommit {
+			m.CommitGraph.Commits = m.CommitGraph.Commits[:len(m.CommitGraph.Commits)-1]
+		}
 		return fmt.Errorf("sylkdir: failed to persist version addition: %w", err)
 	}
 
@@ -540,6 +732,11 @@ func (m *GlobalMeta) InitManifest(initialVersion SemanticVersion) error {
 			},
 		},
 	}
+	m.CommitGraph = &GlobalCommitGraph{
+		DefaultRef: defaultGlobalRef,
+		ActiveRef:  defaultGlobalRef,
+	}
+	m.ensureCommitGraphLocked()
 
 	// Also set the Version field to match
 	m.Version = initialVersion
@@ -562,6 +759,7 @@ func (m *GlobalMeta) GetManifest() *GlobalVersionManifest {
 	if m.Manifest == nil {
 		return nil
 	}
+	m.ensureCommitGraphLocked()
 
 	// Return a copy
 	versions := make([]GlobalVersion, len(m.Manifest.Versions))
@@ -638,27 +836,32 @@ func (m *GlobalMeta) Checkout(version SemanticVersion) error {
 	if m.Manifest == nil {
 		return fmt.Errorf("sylkdir: manifest not initialized")
 	}
+	m.ensureCommitGraphLocked()
 
 	// Verify the version exists in the manifest
-	found := false
-	for _, v := range m.Manifest.Versions {
-		if v.ID.Equal(version) {
-			found = true
-			break
-		}
-	}
+	commit, found := commitByVersion(m.CommitGraph.Commits, version)
 	if !found {
-		return ErrVersionNotFound
+		m.CommitGraph = buildCommitGraphFromManifest(m.Manifest)
+		commit, found = commitByVersion(m.CommitGraph.Commits, version)
+		if !found {
+			return ErrVersionNotFound
+		}
 	}
 
 	// Update HEAD
 	oldHead := m.Manifest.Head
 	m.Manifest.Head = version
 	m.Version = version
+	oldCommitHead := m.CommitGraph.HeadCommitID
+	oldActiveRef := m.CommitGraph.ActiveRef
+	m.CommitGraph.HeadCommitID = commit.ID
+	m.CommitGraph.ActiveRef = ""
 
 	if err := m.saveUnlocked(); err != nil {
 		m.Manifest.Head = oldHead
 		m.Version = oldHead
+		m.CommitGraph.HeadCommitID = oldCommitHead
+		m.CommitGraph.ActiveRef = oldActiveRef
 		return fmt.Errorf("sylkdir: failed to persist checkout: %w", err)
 	}
 
@@ -705,11 +908,10 @@ func (m *GlobalMeta) SetLastBleveIndexed(v SemanticVersion) error {
 		return ErrMetaNotLoaded
 	}
 
-	old := m.LastBleveIndexedVersion
-	m.LastBleveIndexedVersion = &v
-
-	if err := m.saveUnlocked(); err != nil {
-		m.LastBleveIndexedVersion = old
+	if err := m.mutateAndSave(func() error {
+		m.LastBleveIndexedVersion = &v
+		return nil
+	}); err != nil {
 		return fmt.Errorf("sylkdir: failed to persist last bleve indexed version: %w", err)
 	}
 	return nil

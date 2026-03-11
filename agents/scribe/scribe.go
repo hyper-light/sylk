@@ -355,6 +355,14 @@ func (s *Scribe) AgentID() string { return s.id }
 // AgentType returns the Scribe's agent type.
 func (s *Scribe) AgentType() string { return "scribe-" + s.parentAgentType }
 
+// SetCanonicalID preserves the routing identity across handoff replacement.
+func (s *Scribe) SetCanonicalID(id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	s.id = id
+}
+
 // Descriptor returns the Scribe's agent descriptor for handoff.
 func (s *Scribe) Descriptor() handoff.AgentDescriptor {
 	modelID := s.model

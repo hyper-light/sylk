@@ -28,6 +28,9 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(shared.DetectMemoryLeaksSkill(pi.toolRunner))
 	faFunc := func() shared.FileAccess { return pi.fileAccess }
 	pi.skills.Register(shared.ReadFileSkill(faFunc))
+	pi.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return pi.fileAccess }))
+	pi.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return pi.fileAccess }))
+	pi.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return pi.fileAccess }))
 	pi.skills.Register(shared.GlobSkill(faFunc))
 	pi.skills.Register(shared.GrepSkill(faFunc))
 	pi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))

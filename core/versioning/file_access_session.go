@@ -33,6 +33,10 @@ func (s *SessionRoutingFileAccess) ReadFile(ctx context.Context, path string) ([
 	return s.resolve(ctx).ReadFile(ctx, path)
 }
 
+func (s *SessionRoutingFileAccess) MkdirAll(ctx context.Context, path string) error {
+	return s.resolve(ctx).MkdirAll(ctx, path)
+}
+
 func (s *SessionRoutingFileAccess) WriteFile(ctx context.Context, path string, content []byte) error {
 	return s.resolve(ctx).WriteFile(ctx, path, content)
 }

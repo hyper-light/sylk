@@ -33,10 +33,10 @@ const (
 
 // ColumnDef is the declarative definition of a single column.
 type ColumnDef struct {
-	ID       ColumnID
-	Label    string
-	Strategy WidthStrategy
-	Fixed    int  // only used when Strategy == WidthFixed
+	ID             ColumnID
+	Label          string
+	Strategy       WidthStrategy
+	Fixed          int  // only used when Strategy == WidthFixed
 	Hideable       bool // false = always visible
 	DefaultHidden  bool // true = not visible until user enables
 	DropdownHidden bool // true = excluded from gear dropdown
@@ -204,52 +204,52 @@ type elasticCol struct {
 // point where other columns would be pushed below their absolute minimum;
 // beyond that the user-resized column is capped.
 func (cl *ColumnLayout) ComputeWidths(entries []listEntry, totalWidth int) {
-	vis := cl.visibleCount()
-	if vis == 0 {
+	if cl.visibleCount() == 0 {
 		return
 	}
 
-	// Account for inter-column separators and gear icon.
-	seps := separatorCount(cl.VisibleColumns())
-	budget := totalWidth - seps*colSepWidth - gearIconWidth
+	budget := cl.widthBudget(totalWidth)
+	trueFixedTotal := cl.assignDeclaredFixedWidths()
+	cl.applyUserWidths(budget, trueFixedTotal)
 
-	// Phase 1: Assign fixed-width columns (strategy-declared).
-	trueFixedTotal := 0
+	elastic := budget - cl.assignedFixedWidthTotal()
+	if cl.assignElasticMinimumWidths(elastic) {
+		return
+	}
+
+	elCols, naturalSum, flexPos := cl.measureElasticColumns(entries, elastic)
+	if len(elCols) == 0 {
+		return
+	}
+	cl.distributeElasticWidths(elCols, naturalSum, elastic, flexPos)
+	cl.clampToTotal(budget)
+}
+
+func (cl *ColumnLayout) widthBudget(totalWidth int) int {
+	seps := separatorCount(cl.VisibleColumns())
+	return totalWidth - seps*colSepWidth - gearIconWidth
+}
+
+func (cl *ColumnLayout) assignDeclaredFixedWidths() int {
+	total := 0
 	for i := range cl.Columns {
 		c := &cl.Columns[i]
 		if !c.Visible {
 			c.Width = 0
 			continue
 		}
-		if c.Def.Strategy == WidthFixed && c.UserWidth == 0 {
-			c.Width = c.Def.Fixed
-			trueFixedTotal += c.Width
-		}
-	}
-
-	// Phase 2: Cap user-resized columns so other columns keep at least
-	// their absolute minimum width. This prevents resize from pushing
-	// any column outside the panel.
-	otherMinSum := trueFixedTotal
-	for i := range cl.Columns {
-		c := &cl.Columns[i]
-		if !c.Visible || c.UserWidth > 0 {
+		if c.Def.Strategy != WidthFixed || c.UserWidth > 0 {
 			continue
 		}
-		if c.Def.Strategy == WidthFixed {
-			continue // already counted in trueFixedTotal
-		}
-		otherMinSum += colMinWidth(c.Def)
+		c.Width = c.Def.Fixed
+		total += c.Width
 	}
+	return total
+}
 
-	maxUserBudget := max(budget-otherMinSum, 0)
-	userTotal := 0
-	for i := range cl.Columns {
-		c := &cl.Columns[i]
-		if c.Visible && c.UserWidth > 0 {
-			userTotal += c.UserWidth
-		}
-	}
+func (cl *ColumnLayout) applyUserWidths(budget, trueFixedTotal int) {
+	maxUserBudget := max(budget-cl.elasticMinWidthTotal(trueFixedTotal), 0)
+	userTotal := cl.userWidthTotal()
 
 	for i := range cl.Columns {
 		c := &cl.Columns[i]
@@ -257,108 +257,128 @@ func (cl *ColumnLayout) ComputeWidths(entries []listEntry, totalWidth int) {
 			continue
 		}
 		minW := colMinWidth(c.Def)
-		if userTotal <= maxUserBudget {
+		switch {
+		case userTotal <= maxUserBudget:
 			c.Width = max(c.UserWidth, minW)
-		} else if maxUserBudget <= 0 {
+		case maxUserBudget <= 0:
 			c.Width = minW
-		} else {
-			// Scale proportionally among user-resized columns.
-			scaled := c.UserWidth * maxUserBudget / userTotal
-			c.Width = max(scaled, minW)
+		default:
+			c.Width = max(c.UserWidth*maxUserBudget/userTotal, minW)
 		}
 	}
+}
 
-	// Recompute how much space fixed + user-resized columns consume.
-	fixedTotal := 0
+func (cl *ColumnLayout) elasticMinWidthTotal(trueFixedTotal int) int {
+	total := trueFixedTotal
+	for i := range cl.Columns {
+		c := &cl.Columns[i]
+		if !c.Visible || c.UserWidth > 0 || c.Def.Strategy == WidthFixed {
+			continue
+		}
+		total += colMinWidth(c.Def)
+	}
+	return total
+}
+
+func (cl *ColumnLayout) userWidthTotal() int {
+	total := 0
+	for i := range cl.Columns {
+		c := &cl.Columns[i]
+		if c.Visible && c.UserWidth > 0 {
+			total += c.UserWidth
+		}
+	}
+	return total
+}
+
+func (cl *ColumnLayout) assignedFixedWidthTotal() int {
+	total := 0
 	for i := range cl.Columns {
 		c := &cl.Columns[i]
 		if !c.Visible {
 			continue
 		}
 		if c.UserWidth > 0 || c.Def.Strategy == WidthFixed {
-			fixedTotal += c.Width
+			total += c.Width
 		}
 	}
+	return total
+}
 
-	elastic := budget - fixedTotal
-	if elastic <= 0 {
-		// Give every elastic column its absolute minimum.
-		for i := range cl.Columns {
-			c := &cl.Columns[i]
-			if c.Visible && c.Def.Strategy != WidthFixed && c.UserWidth == 0 {
-				c.Width = colMinWidth(c.Def)
-			}
-		}
-		return
+func (cl *ColumnLayout) assignElasticMinimumWidths(elastic int) bool {
+	if elastic > 0 {
+		return false
 	}
+	for i := range cl.Columns {
+		c := &cl.Columns[i]
+		if !c.Visible || c.Def.Strategy == WidthFixed || c.UserWidth > 0 {
+			continue
+		}
+		c.Width = colMinWidth(c.Def)
+	}
+	return true
+}
 
-	// Phase 3: Measure natural widths for elastic columns.
-	var elCols []elasticCol
-	naturalSum := 0
-	flexPos := -1
+func (cl *ColumnLayout) measureElasticColumns(entries []listEntry, elastic int) ([]elasticCol, int, int) {
+	var (
+		elCols     []elasticCol
+		naturalSum int
+		flexPos    = -1
+	)
 
 	for i := range cl.Columns {
 		c := &cl.Columns[i]
 		if !c.Visible || c.Def.Strategy == WidthFixed || c.UserWidth > 0 {
 			continue
 		}
-
-		headerW := c.Def.HeaderMinWidth()
-		minW := colMinWidth(c.Def)
-		w := max(headerW, minW)
-		if c.Def.Measure != nil {
-			for _, e := range entries {
-				if ew := c.Def.Measure(e); ew > w {
-					w = ew
-				}
-			}
-		}
-
-		isFlex := c.Def.Strategy == WidthFlex
-		if isFlex {
+		ec := cl.measureElasticColumn(i, c, entries, elastic)
+		if ec.isFlex {
 			flexPos = len(elCols)
-			// Cap Flex natural width so it doesn't dominate the budget.
-			halfBudget := elastic / 2
-			if halfBudget > 0 && w > halfBudget {
-				w = halfBudget
-			}
 		}
-		// Use colMinWidth as the absolute floor — headers truncate
-		// progressively down to 1 label char + sort toggle. This must
-		// match the floor used in the Phase 2 capping step so that the
-		// total never exceeds the budget.
-		elCols = append(elCols, elasticCol{
-			idx: i, natural: w, minW: minW, isFlex: isFlex,
-		})
-		naturalSum += w
+		elCols = append(elCols, ec)
+		naturalSum += ec.natural
 	}
 
-	if len(elCols) == 0 {
+	return elCols, naturalSum, flexPos
+}
+
+func (cl *ColumnLayout) measureElasticColumn(idx int, c *ColumnState, entries []listEntry, elastic int) elasticCol {
+	minW := colMinWidth(c.Def)
+	natural := max(c.Def.HeaderMinWidth(), minW)
+	if c.Def.Measure != nil {
+		for _, e := range entries {
+			natural = max(natural, c.Def.Measure(e))
+		}
+	}
+
+	isFlex := c.Def.Strategy == WidthFlex
+	if isFlex {
+		halfBudget := elastic / 2
+		if halfBudget > 0 && natural > halfBudget {
+			natural = halfBudget
+		}
+	}
+
+	return elasticCol{idx: idx, natural: natural, minW: minW, isFlex: isFlex}
+}
+
+func (cl *ColumnLayout) distributeElasticWidths(elCols []elasticCol, naturalSum, elastic, flexPos int) {
+	if naturalSum > elastic {
+		shrinkLongestFirst(cl, elCols, elastic)
 		return
 	}
 
-	// Phase 4: Distribute elastic space.
-	if naturalSum <= elastic {
-		// Plenty of room — MaxContent gets natural, Flex absorbs surplus.
-		remainder := elastic
-		for _, ec := range elCols {
-			if ec.isFlex {
-				continue
-			}
-			cl.Columns[ec.idx].Width = ec.natural
-			remainder -= ec.natural
+	remainder := elastic
+	for _, ec := range elCols {
+		if ec.isFlex {
+			continue
 		}
-		if flexPos >= 0 {
-			cl.Columns[elCols[flexPos].idx].Width = max(remainder, 0)
-		}
-	} else {
-		// Tight — shrink longest columns first (water-filling).
-		shrinkLongestFirst(cl, elCols, elastic)
+		cl.Columns[ec.idx].Width = ec.natural
+		remainder -= ec.natural
 	}
-
-	// Final clamp: absorb any rounding discrepancy into the widest
-	// column so the gear icon never jitters by even one pixel.
-	cl.clampToTotal(budget)
+	if flexPos >= 0 {
+		cl.Columns[elCols[flexPos].idx].Width = max(remainder, 0)
+	}
 }
 
 // clampToTotal adjusts the widest visible column so that the sum of all

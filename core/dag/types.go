@@ -377,6 +377,8 @@ const (
 	EventNodeCancelled
 	EventPipelineExpanded
 	EventStageTransition
+	EventExecutionRunStarted
+	EventExecutionRunFinished
 )
 
 // String returns the string representation of an event type
@@ -388,23 +390,25 @@ type eventTypeStringMap map[EventType]string
 
 func eventTypeStrings() eventTypeStringMap {
 	return eventTypeStringMap{
-		EventDAGStarted:       "dag_started",
-		EventDAGCompleted:     "dag_completed",
-		EventDAGFailed:        "dag_failed",
-		EventDAGCancelled:     "dag_cancelled",
-		EventLayerStarted:     "layer_started",
-		EventLayerCompleted:   "layer_completed",
-		EventNodeQueued:       "node_queued",
-		EventNodeDispatched:   "node_dispatched",
-		EventNodeAcked:        "node_acked",
-		EventNodeStarted:      "node_started",
-		EventNodeCompleted:    "node_completed",
-		EventNodeFailed:       "node_failed",
-		EventNodeRetrying:     "node_retrying",
-		EventNodeSkipped:      "node_skipped",
-		EventNodeCancelled:    "node_cancelled",
-		EventPipelineExpanded: "pipeline_expanded",
-		EventStageTransition:  "stage_transition",
+		EventDAGStarted:           "dag_started",
+		EventDAGCompleted:         "dag_completed",
+		EventDAGFailed:            "dag_failed",
+		EventDAGCancelled:         "dag_cancelled",
+		EventLayerStarted:         "layer_started",
+		EventLayerCompleted:       "layer_completed",
+		EventNodeQueued:           "node_queued",
+		EventNodeDispatched:       "node_dispatched",
+		EventNodeAcked:            "node_acked",
+		EventNodeStarted:          "node_started",
+		EventNodeCompleted:        "node_completed",
+		EventNodeFailed:           "node_failed",
+		EventNodeRetrying:         "node_retrying",
+		EventNodeSkipped:          "node_skipped",
+		EventNodeCancelled:        "node_cancelled",
+		EventPipelineExpanded:     "pipeline_expanded",
+		EventStageTransition:      "stage_transition",
+		EventExecutionRunStarted:  "execution_run_started",
+		EventExecutionRunFinished: "execution_run_finished",
 	}
 }
 

@@ -38,6 +38,10 @@ const (
 
 	// CleanupInterval is how often to clean up completed futures.
 	CleanupInterval = 30 * time.Second
+
+	// completedFutureRetention retains completed futures briefly so bursty
+	// concurrent callers can still deduplicate against a just-finished search.
+	completedFutureRetention = 5 * time.Millisecond
 )
 
 // =============================================================================
@@ -162,6 +166,11 @@ type SpeculativePrefetcher struct {
 	// inflight tracks in-flight prefetch futures by query hash
 	inflight sync.Map // map[string]*TrackedPrefetchFuture
 
+	// recent retains recently completed futures briefly so bursty concurrent
+	// callers can still deduplicate against a just-finished search without
+	// keeping completed futures in the inflight set.
+	recent sync.Map // map[string]*TrackedPrefetchFuture
+
 	// enabled controls whether new prefetches are allowed
 	enabled atomic.Bool
 
@@ -272,11 +281,17 @@ func (sp *SpeculativePrefetcher) GetOrStart(
 // GetInflight returns an existing in-flight future for the query, or nil.
 func (sp *SpeculativePrefetcher) GetInflight(query string) *TrackedPrefetchFuture {
 	hash := sp.hashQuery(query)
-	return sp.getExisting(hash)
+	if val, ok := sp.inflight.Load(hash); ok {
+		return val.(*TrackedPrefetchFuture)
+	}
+	return nil
 }
 
 func (sp *SpeculativePrefetcher) getExisting(hash string) *TrackedPrefetchFuture {
 	if val, ok := sp.inflight.Load(hash); ok {
+		return val.(*TrackedPrefetchFuture)
+	}
+	if val, ok := sp.recent.Load(hash); ok {
 		return val.(*TrackedPrefetchFuture)
 	}
 	return nil
@@ -324,7 +339,7 @@ func (sp *SpeculativePrefetcher) executePrefetch(
 	hash string,
 	future *TrackedPrefetchFuture,
 ) {
-	defer sp.cleanup(hash)
+	defer sp.finalizeFuture(hash, future)
 
 	if sp.searcher == nil {
 		future.complete(nil, fmt.Errorf("speculative prefetch failed for query hash %s: no searcher configured", hash))
@@ -334,6 +349,19 @@ func (sp *SpeculativePrefetcher) executePrefetch(
 	result := sp.searcher.SearchWithBudget(ctx, query, sp.searchBudget)
 	augmented := sp.resultsToAugmented(query, result)
 	future.complete(augmented, nil)
+}
+
+func (sp *SpeculativePrefetcher) finalizeFuture(hash string, future *TrackedPrefetchFuture) {
+	sp.cleanup(hash)
+
+	if completedFutureRetention <= 0 {
+		return
+	}
+
+	sp.recent.Store(hash, future)
+	time.AfterFunc(completedFutureRetention, func() {
+		sp.recent.Delete(hash)
+	})
 }
 
 func (sp *SpeculativePrefetcher) resultsToAugmented(

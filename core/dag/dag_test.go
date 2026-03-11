@@ -896,3 +896,39 @@ func TestScheduler_Submit_ReleasesSlotOnScopeError_Concurrent(t *testing.T) {
 	stats := scheduler.Stats()
 	assert.GreaterOrEqual(t, stats.MaxConcurrentDAGs, 0)
 }
+
+func TestExecutor_Execute_DoesNotHangOnNodeLaunchError(t *testing.T) {
+	ctx := context.Background()
+	budget := newTestBudget()
+	budget.RegisterAgent("test-agent", "engineer")
+	scope := newTestGoroutineScope(ctx, "test-agent", budget)
+	_ = scope.Shutdown(time.Millisecond, 10*time.Millisecond)
+
+	d, _ := dag.NewBuilder("test").
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		Build()
+
+	executor := dag.NewExecutor(dag.DefaultExecutionPolicy(), scope)
+	dispatcher := newMockDispatcher()
+
+	done := make(chan struct{})
+	var (
+		result *dag.DAGResult
+		err    error
+	)
+	go func() {
+		result, err = executor.Execute(context.Background(), d, dispatcher)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("executor hung after node launch rejection")
+	}
+
+	require.ErrorIs(t, err, concurrency.ErrScopeShutdown)
+	require.NotNil(t, result)
+	assert.Equal(t, dag.DAGStateFailed, result.State)
+	assert.Equal(t, 1, result.NodesFailed)
+}

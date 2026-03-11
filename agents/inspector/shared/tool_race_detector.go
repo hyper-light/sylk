@@ -12,7 +12,7 @@ const raceBlockMarker = "DATA RACE"
 // RunRaceDetector runs go test with race detection and parses DATA RACE blocks.
 func RunRaceDetector(ctx context.Context, runner *ToolRunner, paths []string) []ValidationIssue {
 	if !runner.Available("go") {
-		return nil
+		return unavailableToolIssues("go")
 	}
 
 	args := []string{"test", "-race", "-count=1", "-timeout=60s"}
@@ -20,7 +20,7 @@ func RunRaceDetector(ctx context.Context, runner *ToolRunner, paths []string) []
 
 	result, err := runner.Exec(ctx, "go", args...)
 	if err != nil {
-		return nil
+		return executionFailureIssues("race-detector", err)
 	}
 
 	return parseRaceOutput(string(result.Stderr))

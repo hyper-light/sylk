@@ -34,6 +34,7 @@ import (
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/boot"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/container/activation"
@@ -66,17 +67,9 @@ var (
 	tuiMock  bool
 )
 
-var tuiCmd = &cobra.Command{
-	Use:   "tui",
-	Short: "Launch the interactive terminal UI",
-	Long:  `Launch Sylk's terminal UI with multi-agent chat, session management, and code viewing.`,
-	RunE:  runTUI,
-}
-
 func init() {
-	rootCmd.AddCommand(tuiCmd)
-	tuiCmd.Flags().StringVar(&tuiTheme, "theme", "dark", "Color theme (dark or light)")
-	tuiCmd.Flags().BoolVar(&tuiMock, "mock", false, "Run with mock backend (no real agents)")
+	rootCmd.Flags().StringVar(&tuiTheme, "theme", "dark", "Color theme (dark or light)")
+	rootCmd.Flags().BoolVar(&tuiMock, "mock", false, "Run with mock backend (no real agents)")
 }
 
 func runTUI(_ *cobra.Command, _ []string) error {
@@ -165,6 +158,7 @@ type bootstrapPhase1 struct {
 	descriptors   *handoff.DescriptorRegistry
 	budget        *concurrency.GoroutineBudget
 	containerReg  *container.ContainerRegistry
+	creatorReg    *container.AgentCreatorRegistry
 	serviceReg    *network.ServiceRegistry
 	specReg       *container.AgentSpecRegistry
 	quota         *container.ResourceQuota
@@ -195,6 +189,7 @@ type bootstrapPhase1 struct {
 	guardianRef   atomic.Pointer[guardian.Guardian]
 	orchRef       atomic.Pointer[orchestrator.Orchestrator]
 	quarantineRef atomic.Pointer[fetch.QuarantineBuffer]
+	handoffRef    atomic.Pointer[handoff.HandoffSupervisor]
 }
 
 type bootstrapPhase2 struct {
@@ -384,6 +379,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	phase1.quota = container.NewResourceQuota(quotaFromSpecs(phase1.specReg))
 
 	creatorReg := container.NewAgentCreatorRegistry()
+	phase1.creatorReg = creatorReg
 	phase1.hookMut = &lifecycleHookMutator{serviceReg: phase1.serviceReg}
 	admission := container.NewAdmissionController(nil, []container.SpecMutator{phase1.hookMut})
 	phase1.probeFact = &probeFactoryHolder{}
@@ -829,6 +825,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		phase1.authRegistry,
 		phase1.guideBus,
 		phase1.scope,
+		&phase1.handoffRef,
 	)
 	if phase3.scribeFactory != nil {
 		orch.SetScribeFactory(phase3.scribeFactory)
@@ -856,6 +853,7 @@ func schedulePhase4Task(
 func schedulePhase4Activation(
 	phase1 *bootstrapPhase1,
 	phase3 bootstrapPhase3,
+	handoffReady <-chan struct{},
 	name string,
 	timeout time.Duration,
 	remaining *atomic.Int32,
@@ -872,6 +870,14 @@ func schedulePhase4Activation(
 				close(activationsDone)
 			}
 		}()
+
+		if handoffReady != nil {
+			select {
+			case <-handoffReady:
+			case <-bgCtx.Done():
+				return nil
+			}
+		}
 
 		start := time.Now()
 		if logTiming {
@@ -1007,17 +1013,10 @@ func startBootstrapPhase4(
 		activationsRemaining atomic.Int32
 	)
 	activationsDone := make(chan struct{})
+	handoffReady := make(chan struct{})
 	phase4Finish := func() {
 		if phase4Remaining.Add(-1) > 0 {
 			return
-		}
-		if sup := phase4.supervisorRef.Load(); sup != nil {
-			if arch, archErr := extractAgent[*architect.Architect](phase1.containerReg, "architect"); archErr == nil {
-				sup.Factory().RegisterCreator("architect", func(context.Context) (handoff.HandoffableAgent, error) {
-					return arch, nil
-				})
-				registerHandoffAgent(sup, arch)
-			}
 		}
 		slog.Info("bootstrap phase 4 background complete", "elapsed", time.Since(phase4Start))
 		close(phase4.phase4Done)
@@ -1025,31 +1024,46 @@ func startBootstrapPhase4(
 
 	const phase4ActivationTimeout = 45 * time.Second
 	if phase3.activationCtrl != nil {
-		schedulePhase4Activation(phase1, phase3, "architect", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, true, func(context.Context) error {
+		schedulePhase4Activation(phase1, phase3, handoffReady, "architect", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, true, func(context.Context) error {
 			return registerPhase4Architect(phase1, phase3)
 		})
-		schedulePhase4Activation(phase1, phase3, "inspector", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+		schedulePhase4Activation(phase1, phase3, handoffReady, "inspector", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
 			return registerPhase4Inspector(phase1, phase3)
 		})
-		schedulePhase4Activation(phase1, phase3, "tester", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+		schedulePhase4Activation(phase1, phase3, handoffReady, "tester", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
 			return registerPhase4Tester(phase1, phase3)
 		})
-		schedulePhase4Activation(phase1, phase3, "librarian", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+		schedulePhase4Activation(phase1, phase3, handoffReady, "librarian", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
 			return registerPhase4Librarian(phase1, phase3)
 		})
-		schedulePhase4Activation(phase1, phase3, "archivalist", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
+		schedulePhase4Activation(phase1, phase3, handoffReady, "archivalist", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, func(context.Context) error {
 			return registerPhase4Archivalist(phase1, phase3)
 		})
-		schedulePhase4Activation(phase1, phase3, "academic", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, nil)
+		schedulePhase4Activation(phase1, phase3, handoffReady, "academic", phase4ActivationTimeout, &phase4Remaining, &activationsRemaining, activationsDone, phase4Finish, false, nil)
 	} else {
 		close(activationsDone)
 	}
 
 	schedulePhase4Task(phase1.scope, "phase4-handoff-supervisor", 0, &phase4Remaining, phase4Finish, func(context.Context) error {
-		sup := bootstrapHandoffSupervisor(phase3.guide, nil, phase3.orch, phase1.serviceReg, phase1.containerReg, phase3.activationCtrl)
+		sup := bootstrapHandoffSupervisor(
+			phase3.guide,
+			phase1.guideBus,
+			phase1.serviceReg,
+			phase1.containerReg,
+			phase1.creatorReg,
+			phase3.activationCtrl,
+		)
 		if sup != nil {
 			phase4.supervisorRef.Store(sup)
+			phase1.handoffRef.Store(sup)
+			if phase3.activationCtrl != nil {
+				phase3.activationCtrl.SetLifecycleCallbacks(
+					func(c *container.Container) { registerHandoffContainer(sup, c) },
+					func(c *container.Container) { unregisterHandoffContainer(sup, c) },
+				)
+			}
 		}
+		close(handoffReady)
 		return nil
 	})
 	schedulePhase4Task(phase1.scope, "phase4-auth-probe", 0, &phase4Remaining, phase4Finish, func(context.Context) error {
@@ -1493,17 +1507,7 @@ func registerLibrarianAgentCreator(deps onDemandAgentCreatorDeps) {
 		l.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityExecution))
 		l.SetKnowledgeStore(deps.knowledgeStore)
 
-		svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
-			SessionID:  versioning.SessionID("librarian-" + librarianID),
-			WorkingDir: deps.projectRoot,
-		})
-		if err != nil {
-			return nil, err
-		}
-		l.SetSessionVFS(svfs)
-
 		if startErr := l.Start(deps.bus); startErr != nil {
-			svfs.Close()
 			return nil, startErr
 		}
 		return l, nil
@@ -1524,7 +1528,6 @@ func registerArchivalistAgentCreator(deps onDemandAgentCreatorDeps) {
 			ActivityPub:       deps.actPub,
 			EnableHybridQuery: true,
 			EnableACTR:        true,
-			WorkspaceViews:    deps.workspaceViews(versioning.WorkspaceViewGlobal),
 		}
 		if guard := deps.requestGuard("archivalist"); guard != nil {
 			archCfg.RequestGuard = guard
@@ -1551,10 +1554,9 @@ func registerAcademicAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, fmt.Errorf("academic provider: %w", err)
 		}
 		acaCfg := academic.Config{
-			ID:             academicID,
-			Model:          model,
-			ActivityPub:    deps.actPub,
-			WorkspaceViews: deps.workspaceViews(versioning.WorkspaceViewDisk),
+			ID:          academicID,
+			Model:       model,
+			ActivityPub: deps.actPub,
 		}
 		if guard := deps.requestGuard("academic"); guard != nil {
 			acaCfg.RequestGuard = guard
@@ -1592,9 +1594,9 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 			return nil, err
 		}
 		gi.SetFileAccess(versioning.NewSessionRoutingFileAccess(
-			true,
+			false,
 			deps.sessionLookup,
-			versioning.NewDiskFileAccess(deps.projectRoot, true),
+			versioning.NewDiskFileAccess(deps.projectRoot, false),
 		))
 		gi.SetWorkspaceViews(deps.workspaceViews(versioning.WorkspaceViewGlobal))
 		gi.SetProviderRefresher(buildProviderRefresher(deps.authRegistry, deps.googleGw, deps.anthropicGw, deps.openaiGw, gateway.PriorityValidation))
@@ -2016,19 +2018,8 @@ func bootstrapArchitect(ctx context.Context, canonicalID string, bus guide.Event
 		Model:             architect.DefaultArchitectModel,
 		AnthropicAuthMode: authMode,
 		AnthropicAPIKey:   apiKey,
-		FileAccess: versioning.NewSessionRoutingFileAccess(
-			true,
-			sessionVFSLookup,
-			versioning.NewDiskFileAccess(projectRoot, true),
-		),
-		WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
-			DefaultView:   versioning.WorkspaceViewGlobal,
-			WorkingDir:    projectRoot,
-			SessionLookup: sessionVFSLookup,
-			DiskFallback:  versioning.NewDiskFileAccess(projectRoot, true),
-		}),
-		ActivityPub: actPub,
-		PlanStore:   planStore,
+		ActivityPub:       actPub,
+		PlanStore:         planStore,
 		PlannerProviderWrapper: func(p *providers.AnthropicProvider) architect.PlannerStreamProvider {
 			return anthropicGw.WrapProvider(p, gateway.PriorityPlanning)
 		},
@@ -2107,6 +2098,7 @@ func bootstrapGuardian(
 	if err != nil {
 		return nil, err
 	}
+	g.SetCommandApprovalStore(commandapproval.NewRuleStore(filepath.Join(projectRoot, ".sylk", "local", "command_approvals.yaml")))
 	if wrapped != nil && model != guardian.DefaultGuardianModel {
 		if err := g.SwapModel(ctx, model, wrapped); err != nil {
 			return nil, err
@@ -2781,6 +2773,12 @@ func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventB
 	if err != nil {
 		return nil, err
 	}
+	orch.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		DefaultView:   versioning.WorkspaceViewGlobal,
+		WorkingDir:    projectRoot,
+		SessionLookup: orch.GetSessionVFS,
+		DiskFallback:  versioning.NewDiskFileAccess(projectRoot, true),
+	}))
 	if err := orch.Start(bus); err != nil {
 		return nil, err
 	}
@@ -2907,10 +2905,10 @@ func parseThemeMode(s string) ui.ThemeMode {
 // Returns nil if initialization fails (non-fatal — handoff is optional).
 func bootstrapHandoffSupervisor(
 	g *guide.Guide,
-	arch *architect.Architect,
-	orch *orchestrator.Orchestrator,
+	bus guide.EventBus,
 	serviceReg *network.ServiceRegistry,
 	containerReg *container.ContainerRegistry,
+	creatorReg *container.AgentCreatorRegistry,
 	activationCtrl *activation.ActivationController,
 ) *handoff.HandoffSupervisor {
 	walDir, err := handoffWALDir()
@@ -2921,19 +2919,13 @@ func bootstrapHandoffSupervisor(
 	supervisorCfg := handoff.DefaultSupervisorConfig()
 	supervisorCfg.WALDir = walDir
 	supervisor := handoff.NewHandoffSupervisor(supervisorCfg)
-
-	// Register agent creators so the supervisor can spawn replacements on handoff.
-	supervisor.Factory().RegisterCreator("guide", func(_ context.Context) (handoff.HandoffableAgent, error) {
-		return g, nil
-	})
-	if arch != nil {
-		supervisor.Factory().RegisterCreator("architect", func(_ context.Context) (handoff.HandoffableAgent, error) {
-			return arch, nil
-		})
+	if bus != nil {
+		supervisor.SetBriefSource(agentShared.NewArchivalistBriefSource(bus))
 	}
-	supervisor.Factory().RegisterCreator("orchestrator", func(_ context.Context) (handoff.HandoffableAgent, error) {
-		return orch, nil
-	})
+
+	// Register creators for every known agent type so any handoff-capable
+	// agent can spawn a fresh replacement instance.
+	registerHandoffCreators(supervisor, creatorReg)
 
 	// Wire agent replacement: atomic swap of canonical identity.
 	// New agent was invisible to Guide during the traffic shift.
@@ -2990,12 +2982,9 @@ func bootstrapHandoffSupervisor(
 		return nil
 	}
 
-	// Register live agents — each gets a per-agent bridge.
+	// Register all live handoff-capable agents — not just the bootstrap trio.
+	registerAllHandoffContainers(supervisor, containerReg)
 	registerHandoffAgent(supervisor, g)
-	if arch != nil {
-		registerHandoffAgent(supervisor, arch)
-	}
-	registerHandoffAgent(supervisor, orch)
 
 	return supervisor
 }
@@ -3042,6 +3031,9 @@ type handoffBridgeSetter interface {
 // registerHandoffAgent registers a single agent with the supervisor and
 // sets the bridge on the agent if it supports it.
 func registerHandoffAgent(supervisor *handoff.HandoffSupervisor, agent handoff.HandoffableAgent) {
+	if supervisor == nil || agent == nil {
+		return
+	}
 	bridge, err := supervisor.RegisterAgent(agent)
 	if err != nil {
 		return
@@ -3049,6 +3041,112 @@ func registerHandoffAgent(supervisor *handoff.HandoffSupervisor, agent handoff.H
 	if setter, ok := agent.(handoffBridgeSetter); ok {
 		setter.SetHandoffBridge(bridge)
 	}
+}
+
+func registerHandoffCreators(supervisor *handoff.HandoffSupervisor, creatorReg *container.AgentCreatorRegistry) {
+	if supervisor == nil || creatorReg == nil {
+		return
+	}
+	for _, agentType := range creatorReg.Types() {
+		agentType := agentType
+		supervisor.Factory().RegisterCreator(agentType, func(ctx context.Context) (handoff.HandoffableAgent, error) {
+			agent, err := creatorReg.Create(ctx, agentType)
+			if err != nil {
+				return nil, err
+			}
+			handoffable, ok := agent.(handoff.HandoffableAgent)
+			if !ok {
+				return nil, fmt.Errorf("agent %q does not implement handoff support", agentType)
+			}
+			return handoffable, nil
+		})
+	}
+}
+
+func registerAllHandoffContainers(supervisor *handoff.HandoffSupervisor, reg *container.ContainerRegistry) {
+	if supervisor == nil || reg == nil {
+		return
+	}
+	for _, c := range reg.All() {
+		registerHandoffContainer(supervisor, c)
+	}
+}
+
+func registerHandoffContainer(supervisor *handoff.HandoffSupervisor, c *container.Container) {
+	if supervisor == nil || c == nil || c.Agent() == nil {
+		return
+	}
+	handoffable, ok := c.Agent().(handoff.HandoffableAgent)
+	if !ok {
+		return
+	}
+	registerHandoffAgent(supervisor, handoffable)
+}
+
+func unregisterHandoffContainer(supervisor *handoff.HandoffSupervisor, c *container.Container) {
+	if supervisor == nil || c == nil || c.Agent() == nil {
+		return
+	}
+	handoffable, ok := c.Agent().(handoff.HandoffableAgent)
+	if !ok {
+		return
+	}
+	_ = supervisor.UnregisterAgent(handoffable.AgentID())
+	if setter, ok := handoffable.(handoffBridgeSetter); ok {
+		setter.SetHandoffBridge(nil)
+	}
+}
+
+type handoffManagedScribe struct {
+	inner         agentShared.Scribe
+	handoffable   handoff.HandoffableAgent
+	supervisorRef *atomic.Pointer[handoff.HandoffSupervisor]
+	logger        *slog.Logger
+
+	mu            sync.Mutex
+	registeredSup *handoff.HandoffSupervisor
+}
+
+func (s *handoffManagedScribe) Start() error {
+	if err := s.inner.Start(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.registeredSup != nil || s.supervisorRef == nil || s.handoffable == nil {
+		return nil
+	}
+
+	sup := s.supervisorRef.Load()
+	if sup == nil {
+		return nil
+	}
+
+	registerHandoffAgent(sup, s.handoffable)
+	s.registeredSup = sup
+	return nil
+}
+
+func (s *handoffManagedScribe) Stop() error {
+	s.mu.Lock()
+	sup := s.registeredSup
+	s.registeredSup = nil
+	s.mu.Unlock()
+
+	if sup != nil && s.handoffable != nil {
+		_ = sup.UnregisterAgent(s.handoffable.AgentID())
+		if setter, ok := s.handoffable.(handoffBridgeSetter); ok {
+			setter.SetHandoffBridge(nil)
+		}
+	}
+
+	return s.inner.Stop()
+}
+
+func (s *handoffManagedScribe) Feed(feed agentShared.ScribeFeed) {
+	s.inner.Feed(feed)
 }
 
 // buildScribeFactory creates a ScribeFactory that produces Gemini 3 Flash
@@ -3060,6 +3158,7 @@ func buildScribeFactory(
 	authRegistry *credentials.AuthRegistry,
 	bus guide.EventBus,
 	scope *concurrency.GoroutineScope,
+	supervisorRef *atomic.Pointer[handoff.HandoffSupervisor],
 ) agentShared.ScribeFactory {
 	scribeCfg := providers.DefaultGoogleConfig()
 	scribeCfg.Model = "gemini-3-flash-preview"
@@ -3082,7 +3181,12 @@ func buildScribeFactory(
 			Scope:           scope,
 			Logger:          logger,
 		})
-		return s, nil
+		return &handoffManagedScribe{
+			inner:         s,
+			handoffable:   s,
+			supervisorRef: supervisorRef,
+			logger:        logger,
+		}, nil
 	}
 }
 

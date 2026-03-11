@@ -48,12 +48,12 @@ func (h Hash) IsZero() bool {
 }
 
 type ChunkStoreStats struct {
-	Chunks          int
-	Bytes           int64
-	MemoryLimit     int64
-	Refs            int64
-	UniquePutCount  int64
-	DedupHitCount   int64
+	Chunks           int
+	Bytes            int64
+	MemoryLimit      int64
+	Refs             int64
+	UniquePutCount   int64
+	DedupHitCount    int64
 	RejectedPutCount int64
 }
 
@@ -256,6 +256,39 @@ func NewBlobFileBody(hash Hash, size int64) *FileBody {
 			BlobHash:     hash,
 		}},
 	}
+}
+
+func NewChunkedFileBody(content []byte, store *ChunkStore, chunkSize int) (*FileBody, error) {
+	if len(content) == 0 {
+		return NewEmptyFileBody(), nil
+	}
+	if store == nil {
+		return nil, ErrChunkNotFound
+	}
+	if chunkSize <= 0 {
+		chunkSize = 64 << 10
+	}
+	extents := make([]Extent, 0, (len(content)+chunkSize-1)/chunkSize)
+	for offset := 0; offset < len(content); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(content) {
+			end = len(content)
+		}
+		hash, _, err := store.Put(content[offset:end])
+		if err != nil {
+			return nil, err
+		}
+		extents = append(extents, Extent{
+			LogicalStart: int64(offset),
+			Length:       int64(end - offset),
+			Kind:         ExtentBlob,
+			BlobHash:     hash,
+		})
+	}
+	return &FileBody{
+		size:    int64(len(content)),
+		extents: extents,
+	}, nil
 }
 
 func NewRealFileBody(realPath string, size int64) *FileBody {

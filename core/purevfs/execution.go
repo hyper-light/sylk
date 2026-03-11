@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -114,16 +116,31 @@ type MaterializedWorkspace struct {
 	Roots         ExecRoots
 }
 
+type ExecutionFS interface {
+	ReadFile(ctx context.Context, path string) ([]byte, error)
+	MkdirAll(ctx context.Context, path string) error
+	WriteFile(ctx context.Context, path string, content []byte) error
+	DeleteFile(ctx context.Context, path string) error
+	Exists(ctx context.Context, path string) (bool, error)
+	ListDir(ctx context.Context, dir string) ([]fs.DirEntry, error)
+	Stat(ctx context.Context, path string) (fs.FileInfo, error)
+	WorkingDir() string
+	IsReadOnly() bool
+}
+
 type BrokerRunRequest struct {
-	Plan ExecutionPlan
-	Argv []string
-	Env  map[string]string
+	Plan      ExecutionPlan
+	Argv      []string
+	Env       map[string]string
+	Workspace ExecutionFS
 }
 
 type BrokerRunResult struct {
-	ExitCode int
-	Stdout   []byte
-	Stderr   []byte
+	ExitCode        int
+	Stdout          []byte
+	Stderr          []byte
+	StdoutTruncated bool
+	StderrTruncated bool
 }
 
 type Materializer interface {
@@ -196,6 +213,9 @@ func (p *ExecutionPlanner) Plan(req ExecutionRequest) (ExecutionPlan, error) {
 	}
 	if language == "" {
 		language = "generic"
+	}
+	if req.Overlay && mode != ExecutionModeStrictNoDisk {
+		return ExecutionPlan{}, ErrStrictExecutionUnavailable
 	}
 
 	roots := req.Roots
@@ -277,11 +297,14 @@ func (p *ExecutionPlanner) Plan(req ExecutionRequest) (ExecutionPlan, error) {
 		plan.Mounts = append(plan.Mounts, MountSpec{
 			Kind:        MountToolchain,
 			Access:      MountReadOnly,
-			VirtualPath: tool,
+			VirtualPath: executionToolchainPath(tool),
 			BackingPath: tool,
 			Mandatory:   false,
 			Description: "toolchain passthrough",
 		})
+	}
+	if len(cell.Toolchains) > 0 {
+		plan.Env["PATH"] = executionToolchainRoot
 	}
 
 	if mode == ExecutionModeStrictNoDisk {
@@ -373,6 +396,10 @@ func copyEnvMap(src map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func executionToolchainPath(tool string) string {
+	return path.Join(executionToolchainRoot, filepath.Base(strings.TrimSpace(tool)))
 }
 
 func MergeExecEnv(base []string, overrides map[string]string) []string {

@@ -37,7 +37,7 @@ type DocIDMap struct {
 func NewDocIDMap(path string) *DocIDMap {
 	return &DocIDMap{
 		forward: make(map[string]uint32),
-		reverse: []string{""},  // index 0 = sentinel (no document)
+		reverse: []string{""}, // index 0 = sentinel (no document)
 		next:    1,
 		path:    path,
 	}
@@ -147,7 +147,7 @@ func (m *DocIDMap) Save() error {
 		return fmt.Errorf("doc_id_map: close: %w", err)
 	}
 
-	return os.Rename(tmpPath, m.path)
+	return durableRename(tmpPath, m.path)
 }
 
 // Load reads the map from disk. Returns error if file is corrupt.

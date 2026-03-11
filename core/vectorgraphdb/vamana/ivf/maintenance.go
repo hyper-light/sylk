@@ -190,212 +190,35 @@ func (idx *Index) RefreshCentroids(iterations int) (*RefreshResult, error) {
 		return &RefreshResult{}, nil
 	}
 
-	result := &RefreshResult{
-		OldCentroids: make([][]float32, len(idx.centroids)),
-	}
-
-	for i, c := range idx.centroids {
-		result.OldCentroids[i] = make([]float32, len(c))
-		copy(result.OldCentroids[i], c)
-	}
-
 	k := len(idx.centroids)
-	dim := idx.dim
 	n := idx.numVectors
 	numWorkers := runtime.GOMAXPROCS(0)
 
-	centroidsFlat := make([]float32, k*dim)
-	centroidNormsSq := make([]float64, k)
-	for p := range k {
-		copy(centroidsFlat[p*dim:(p+1)*dim], idx.centroids[p])
-		centroidNormsSq[p] = idx.centroidNorms[p] * idx.centroidNorms[p]
-	}
+	result := &RefreshResult{OldCentroids: cloneCentroids(idx.centroids)}
+	centroidsFlat, centroidNormsSq := flattenCentroidsAndNorms(idx.centroids, idx.centroidNorms, idx.dim)
+	layout := newSuperCentroidLayout(k, idx.dim, centroidsFlat)
+	assignments := idx.assignStoredVectorsHierarchically(centroidsFlat, centroidNormsSq, layout, numWorkers)
 
-	sqrtK := 1
-	for sqrtK*sqrtK < k {
-		sqrtK++
-	}
-
-	superCentroids := make([]float32, sqrtK*dim)
-	superNormsSq := make([]float64, sqrtK)
-	groupStarts := make([]int, sqrtK)
-	groupEnds := make([]int, sqrtK)
-
-	for i := range sqrtK {
-		groupStarts[i] = i * (k / sqrtK)
-		groupEnds[i] = groupStarts[i] + k/sqrtK
-		if i == sqrtK-1 {
-			groupEnds[i] = k
-		}
-		for j := range dim {
-			var sum float32
-			for c := groupStarts[i]; c < groupEnds[i]; c++ {
-				sum += centroidsFlat[c*dim+j]
-			}
-			superCentroids[i*dim+j] = sum / float32(groupEnds[i]-groupStarts[i])
-		}
-		superNormsSq[i] = float64(vek32.Dot(superCentroids[i*dim:(i+1)*dim], superCentroids[i*dim:(i+1)*dim]))
-	}
-
-	assignFast := func(assignments []int) {
-		chunkSize := (n + numWorkers - 1) / numWorkers
-		var wg sync.WaitGroup
-
-		for w := range numWorkers {
-			start := w * chunkSize
-			end := min(start+chunkSize, n)
-			if start >= end {
-				continue
-			}
-
-			wg.Add(1)
-			go func(start, end int) {
-				defer wg.Done()
-				superDists := make([]float64, sqrtK)
-
-				for i := start; i < end; i++ {
-					vec := idx.getVector(uint32(i))
-					if vec == nil {
-						continue
-					}
-					vecNormSq := idx.vectorNorms[i] * idx.vectorNorms[i]
-
-					for s := range sqrtK {
-						dot := vek32.Dot(vec, superCentroids[s*dim:(s+1)*dim])
-						superDists[s] = vecNormSq + superNormsSq[s] - 2*float64(dot)
-					}
-
-					best1, best2 := 0, 1
-					if superDists[1] < superDists[0] {
-						best1, best2 = 1, 0
-					}
-					for s := 2; s < sqrtK; s++ {
-						if superDists[s] < superDists[best1] {
-							best2 = best1
-							best1 = s
-						} else if superDists[s] < superDists[best2] {
-							best2 = s
-						}
-					}
-
-					bestCentroid := groupStarts[best1]
-					bestDist := math.MaxFloat64
-
-					for c := groupStarts[best1]; c < groupEnds[best1]; c++ {
-						dot := vek32.Dot(vec, centroidsFlat[c*dim:(c+1)*dim])
-						d := vecNormSq + centroidNormsSq[c] - 2*float64(dot)
-						if d < bestDist {
-							bestDist = d
-							bestCentroid = c
-						}
-					}
-					for c := groupStarts[best2]; c < groupEnds[best2]; c++ {
-						dot := vek32.Dot(vec, centroidsFlat[c*dim:(c+1)*dim])
-						d := vecNormSq + centroidNormsSq[c] - 2*float64(dot)
-						if d < bestDist {
-							bestDist = d
-							bestCentroid = c
-						}
-					}
-					assignments[i] = bestCentroid
-				}
-			}(start, end)
-		}
-		wg.Wait()
-	}
-
-	rebuildSuperCentroids := func() {
-		for i := range sqrtK {
-			for j := range dim {
-				var sum float32
-				for c := groupStarts[i]; c < groupEnds[i]; c++ {
-					sum += centroidsFlat[c*dim+j]
-				}
-				superCentroids[i*dim+j] = sum / float32(groupEnds[i]-groupStarts[i])
-			}
-			superNormsSq[i] = float64(vek32.Dot(superCentroids[i*dim:(i+1)*dim], superCentroids[i*dim:(i+1)*dim]))
-		}
-	}
-
-	assignments := make([]int, n)
-	assignFast(assignments)
-
-	for iter := range iterations {
-		newCentroidsFlat := make([]float32, k*dim)
-		counts := make([]int, k)
-
-		for i := range n {
-			p := assignments[i]
-			vec := idx.getVector(uint32(i))
-			if vec == nil {
-				continue
-			}
-			for j, v := range vec {
-				newCentroidsFlat[p*dim+j] += v
-			}
-			counts[p]++
-		}
-
-		for p := range k {
-			if counts[p] > 0 {
-				invCount := 1.0 / float32(counts[p])
-				for j := range dim {
-					newCentroidsFlat[p*dim+j] *= invCount
-				}
-			} else {
-				copy(newCentroidsFlat[p*dim:(p+1)*dim], centroidsFlat[p*dim:(p+1)*dim])
-			}
-			centroidNormsSq[p] = float64(vek32.Dot(newCentroidsFlat[p*dim:(p+1)*dim], newCentroidsFlat[p*dim:(p+1)*dim]))
-		}
-
-		centroidsFlat = newCentroidsFlat
-		rebuildSuperCentroids()
-
+	for iter := 0; iter < iterations; iter++ {
+		centroidsFlat = idx.recomputeCentroidsFromAssignments(assignments, centroidsFlat, centroidNormsSq, k, idx.dim)
+		layout.rebuild(centroidsFlat)
 		if iter < iterations-1 {
-			assignFast(assignments)
+			assignments = idx.assignStoredVectorsHierarchically(centroidsFlat, centroidNormsSq, layout, numWorkers)
 		}
 	}
 
-	for p := range k {
-		idx.centroids[p] = make([]float32, dim)
-		copy(idx.centroids[p], centroidsFlat[p*dim:(p+1)*dim])
-		idx.centroidNorms[p] = math.Sqrt(centroidNormsSq[p])
-	}
-
+	idx.updateCentroidsFromFlat(centroidsFlat, centroidNormsSq)
 	result.NewCentroids = idx.centroids
 
-	originalPartitions := make([]int, n)
-	for p, ids := range idx.partitionIDs {
-		for _, id := range ids {
-			if int(id) < n {
-				originalPartitions[id] = p
-			}
-		}
-	}
-
-	finalAssignments := make([]int, n)
-	assignFast(finalAssignments)
-
-	newPartitionIDs := make([][]uint32, k)
-	for p := range k {
-		newPartitionIDs[p] = make([]uint32, 0)
-	}
-
-	for i := range n {
-		oldPartition := originalPartitions[i]
-		newPartition := finalAssignments[i]
-		newPartitionIDs[newPartition] = append(newPartitionIDs[newPartition], uint32(i))
-
-		if oldPartition != newPartition {
-			result.VectorsReassigned++
-		}
-
+	originalPartitions := originalPartitionsFromIDs(idx.partitionIDs, n)
+	finalAssignments := idx.assignStoredVectorsHierarchically(centroidsFlat, centroidNormsSq, layout, numWorkers)
+	result.VectorsReassigned = countPartitionReassignments(originalPartitions, finalAssignments)
+	for i, newPartition := range finalAssignments {
 		if idx.graph != nil && idx.graph.nodeToPartition != nil && i < len(idx.graph.nodeToPartition) {
 			idx.graph.nodeToPartition[i] = uint16(newPartition)
 		}
 	}
-
-	idx.partitionIDs = newPartitionIDs
+	idx.partitionIDs = buildPartitionIDsFromIntAssignments(k, n, finalAssignments)
 
 	return result, nil
 }

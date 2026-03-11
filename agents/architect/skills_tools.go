@@ -3,14 +3,15 @@ package architect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
+	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/skills"
 )
 
@@ -478,16 +479,18 @@ func astGrepSearchSkill(a *Architect) *skills.Skill {
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
-			binary, ok := findFirstBinary("ast-grep", "sg")
-			if !ok {
+			args := buildAstGrepArgs(params)
+			output, err := runCommandInDirWithBinary(ctx, a.config.WorkingDirectory, "ast-grep", args...)
+			if shared.CommandUnavailable(err) {
+				output, err = runCommandInDirWithBinary(ctx, a.config.WorkingDirectory, "sg", args...)
+			}
+			if shared.CommandUnavailable(err) {
 				return map[string]any{"status": "unavailable", "reason": "ast-grep not installed"}, nil
 			}
-			args := buildAstGrepArgs(params)
-			output, err := runCommandInDirWithBinary(ctx, a.config.WorkingDirectory, binary, args...)
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"status": "ok", "binary": binary, "output": output}, nil
+			return map[string]any{"status": "ok", "output": output}, nil
 		}).
 		Build()
 }
@@ -608,23 +611,14 @@ func lspLocation(file string, line, column int) string {
 }
 
 func runGoplsCommand(ctx context.Context, workDir string, subcommand string, arg string) (string, string) {
-	if _, ok := findFirstBinary("gopls"); !ok {
+	output, err := runCommandInDir(ctx, workDir, "gopls", subcommand, arg)
+	if shared.CommandUnavailable(err) {
 		return "gopls is not installed", "unavailable"
 	}
-	output, err := runCommandInDir(ctx, workDir, "gopls", subcommand, arg)
 	if err != nil {
 		return err.Error(), "error"
 	}
 	return output, "ok"
-}
-
-func findFirstBinary(candidates ...string) (string, bool) {
-	for _, candidate := range candidates {
-		if path, err := exec.LookPath(candidate); err == nil {
-			return path, true
-		}
-	}
-	return "", false
 }
 
 func runCommandInDir(ctx context.Context, workDir string, command string, args ...string) (string, error) {
@@ -632,13 +626,20 @@ func runCommandInDir(ctx context.Context, workDir string, command string, args .
 }
 
 func runCommandInDirWithBinary(ctx context.Context, workDir string, binary string, args ...string) (string, error) {
-	callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(callCtx, binary, args...)
-	cmd.Dir = workDir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%s %s failed: %w\n%s", binary, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	output, err := shared.RunStrictDiskCommand(ctx, shared.StrictDiskExecConfig{
+		AgentID:    "architect",
+		AgentType:  "architect",
+		WorkingDir: workDir,
+	}, binary, args, strictDiskExecEnv(binary))
+	if err != nil && errors.Is(err, commandapproval.ErrApprovalRequired) {
+		return "", err
 	}
-	return strings.TrimSpace(string(output)), nil
+	return output, err
+}
+
+func strictDiskExecEnv(binary string) map[string]string {
+	if strings.EqualFold(strings.TrimSpace(binary), "git") {
+		return map[string]string{"GIT_OPTIONAL_LOCKS": "0"}
+	}
+	return nil
 }

@@ -3,6 +3,7 @@ package msg
 import (
 	"time"
 
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/lsp"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -127,6 +128,17 @@ type GuideResponseMsg struct {
 	Content       string
 	Err           error
 }
+
+type CommandApprovalRequestMsg struct {
+	Proposal *commandapproval.Proposal
+}
+
+type CommandApprovalCommitMsg struct {
+	Proposal *commandapproval.Proposal
+	Decision string
+}
+
+type CommandApprovalResolvedMsg struct{}
 
 // StreamRerouteMsg signals that an agent-initiated reroute is occurring.
 // The Guide broadcasts this when an agent invokes the reroute_request skill
@@ -662,6 +674,7 @@ type PipelineStateMsg struct {
 	WorkerType        string // Agent type running the pipeline.
 	LoopCount         int
 	MaxLoops          int
+	Timestamp         time.Time
 }
 
 // VariantStateMsg carries a variant state update for the agent panel.
@@ -756,14 +769,6 @@ type ToolCallEventMsg struct {
 	StartedAt     time.Time
 	Duration      time.Duration
 	Success       bool
-}
-
-// ResizeSettleMsg fires after a debounce delay following vertical-only
-// resizes. When the generation matches the current resizeGen, a full
-// layout recalculation + cache invalidation is performed so that side
-// panels render at their final dimensions.
-type ResizeSettleMsg struct {
-	Gen uint64
 }
 
 // TimePressureMsg signals that an agent is approaching its operation deadline.

@@ -290,7 +290,7 @@ func (idx *OffsetIndex) Save() error {
 		os.Remove(tmpPath)
 		return err
 	}
-	return os.Rename(tmpPath, idx.path)
+	return durableRename(tmpPath, idx.path)
 }
 
 // Load reads the index from its configured path.
@@ -342,7 +342,7 @@ func writeIndexTo(path string, s *indexState, count uint32) error {
 		binary.LittleEndian.PutUint64(buf[offsetIndexHeaderSize+i*8:], uint64(offset))
 	}
 
-	return os.WriteFile(path, buf, 0644)
+	return writeFileSync(path, buf, 0o644)
 }
 
 // unmarshalIndexState decodes binary data into an indexState and count.

@@ -31,18 +31,7 @@ const (
 )
 
 func ValidDomains() []Domain {
-	return []Domain{
-		DomainCode,
-		DomainHistory,
-		DomainAcademic,
-		DomainArchitect,
-		DomainEngineer,
-		DomainDesigner,
-		DomainInspector,
-		DomainTester,
-		DomainOrchestrator,
-		DomainGuide,
-	}
+	return cloneEnumSlice(validDomains)
 }
 
 func (d Domain) IsValid() bool {
@@ -50,96 +39,36 @@ func (d Domain) IsValid() bool {
 }
 
 func (d Domain) String() string {
-	switch d {
-	case DomainCode:
-		return "code"
-	case DomainHistory:
-		return "history"
-	case DomainAcademic:
-		return "academic"
-	case DomainArchitect:
-		return "architect"
-	case DomainEngineer:
-		return "engineer"
-	case DomainDesigner:
-		return "designer"
-	case DomainInspector:
-		return "inspector"
-	case DomainTester:
-		return "tester"
-	case DomainOrchestrator:
-		return "orchestrator"
-	case DomainGuide:
-		return "guide"
-	default:
-		return fmt.Sprintf("domain(%d)", d)
-	}
+	return enumString(d, domainNames, "domain")
 }
 
 func ParseDomain(value string) (Domain, bool) {
-	switch value {
-	case "code":
-		return DomainCode, true
-	case "history":
-		return DomainHistory, true
-	case "academic":
-		return DomainAcademic, true
-	case "architect":
-		return DomainArchitect, true
-	case "engineer":
-		return DomainEngineer, true
-	case "designer":
-		return DomainDesigner, true
-	case "inspector":
-		return DomainInspector, true
-	case "tester":
-		return DomainTester, true
-	case "orchestrator":
-		return DomainOrchestrator, true
-	case "guide":
-		return DomainGuide, true
-	default:
-		return Domain(0), false
-	}
+	domain, ok := domainByName[value]
+	return domain, ok
 }
 
 func KnowledgeDomains() []Domain {
-	return []Domain{DomainCode, DomainHistory, DomainAcademic, DomainArchitect}
+	return cloneEnumSlice(knowledgeDomains)
 }
 
 func PipelineDomains() []Domain {
-	return []Domain{DomainEngineer, DomainDesigner, DomainInspector, DomainTester}
+	return cloneEnumSlice(pipelineDomains)
 }
 
 func ControlDomains() []Domain {
-	return []Domain{DomainOrchestrator, DomainGuide}
+	return cloneEnumSlice(controlDomains)
 }
 
 func (d Domain) IsKnowledge() bool {
-	switch d {
-	case DomainCode, DomainHistory, DomainAcademic, DomainArchitect:
-		return true
-	default:
-		return false
-	}
+	return containsEnum(knowledgeDomainSet, d)
 }
 
 func (d Domain) IsPipeline() bool {
-	switch d {
-	case DomainEngineer, DomainDesigner, DomainInspector, DomainTester:
-		return true
-	default:
-		return false
-	}
+	return containsEnum(pipelineDomainSet, d)
 }
 
 func (d Domain) IsControl() bool {
-	switch d {
-	case DomainOrchestrator, DomainGuide:
-		return true
-	default:
-		return false
-	}
+	return containsEnum(controlDomainSet, d)
 }
 
 func (d Domain) MarshalJSON() ([]byte, error) {
@@ -246,332 +175,38 @@ const (
 )
 
 func ValidNodeTypes() []NodeType {
-	return []NodeType{
-		NodeTypeFile,
-		NodeTypePackage,
-		NodeTypeFunction,
-		NodeTypeMethod,
-		NodeTypeStruct,
-		NodeTypeInterface,
-		NodeTypeVariable,
-		NodeTypeConstant,
-		NodeTypeImport,
-		NodeTypeHistoryEntry,
-		NodeTypeSession,
-		NodeTypeWorkflow,
-		NodeTypeOutcome,
-		NodeTypeDecision,
-		NodeTypePaper,
-		NodeTypeDocumentation,
-		NodeTypeBestPractice,
-		NodeTypeRFC,
-		NodeTypeStackOverflow,
-		NodeTypeBlogPost,
-		NodeTypeTutorial,
-		NodeTypeArchitectureDecision,
-		NodeTypeDesignPattern,
-		NodeTypeSystemDiagram,
-		NodeTypeTask,
-		NodeTypeImplementation,
-		NodeTypeCodeChange,
-		NodeTypeUIComponent,
-		NodeTypeStyleGuide,
-		NodeTypeDesignAsset,
-		NodeTypeInspection,
-		NodeTypeCodeReview,
-		NodeTypeQualityMetric,
-		NodeTypeTestCase,
-		NodeTypeTestSuite,
-		NodeTypeTestResult,
-		NodeTypeWorkflowDef,
-		NodeTypeAgentConfig,
-		NodeTypePipeline,
-		NodeTypeRoutingRule,
-		NodeTypeIntentPattern,
-		NodeTypeUserQuery,
-	}
+	return cloneEnumSlice(validNodeTypes)
 }
 
 func ValidNodeTypesForDomain(domain Domain) []NodeType {
-	switch domain {
-	case DomainCode:
-		return []NodeType{
-			NodeTypeFile,
-			NodeTypePackage,
-			NodeTypeFunction,
-			NodeTypeMethod,
-			NodeTypeStruct,
-			NodeTypeInterface,
-			NodeTypeVariable,
-			NodeTypeConstant,
-			NodeTypeImport,
-		}
-	case DomainHistory:
-		return []NodeType{
-			NodeTypeHistoryEntry,
-			NodeTypeSession,
-			NodeTypeWorkflow,
-			NodeTypeOutcome,
-			NodeTypeDecision,
-		}
-	case DomainAcademic:
-		return []NodeType{
-			NodeTypePaper,
-			NodeTypeDocumentation,
-			NodeTypeBestPractice,
-			NodeTypeRFC,
-			NodeTypeStackOverflow,
-			NodeTypeBlogPost,
-			NodeTypeTutorial,
-		}
-	case DomainArchitect:
-		return []NodeType{
-			NodeTypeArchitectureDecision,
-			NodeTypeDesignPattern,
-			NodeTypeSystemDiagram,
-		}
-	case DomainEngineer:
-		return []NodeType{
-			NodeTypeTask,
-			NodeTypeImplementation,
-			NodeTypeCodeChange,
-		}
-	case DomainDesigner:
-		return []NodeType{
-			NodeTypeUIComponent,
-			NodeTypeStyleGuide,
-			NodeTypeDesignAsset,
-		}
-	case DomainInspector:
-		return []NodeType{
-			NodeTypeInspection,
-			NodeTypeCodeReview,
-			NodeTypeQualityMetric,
-		}
-	case DomainTester:
-		return []NodeType{
-			NodeTypeTestCase,
-			NodeTypeTestSuite,
-			NodeTypeTestResult,
-		}
-	case DomainOrchestrator:
-		return []NodeType{
-			NodeTypeWorkflowDef,
-			NodeTypeAgentConfig,
-			NodeTypePipeline,
-		}
-	case DomainGuide:
-		return []NodeType{
-			NodeTypeRoutingRule,
-			NodeTypeIntentPattern,
-			NodeTypeUserQuery,
-		}
-	default:
+	nodeTypes, ok := nodeTypesByDomain[domain]
+	if !ok {
 		return nil
 	}
+	return cloneEnumSlice(nodeTypes)
 }
 
 // IsValid returns true if the node type is a recognized value.
 func (nt NodeType) IsValid() bool {
-	for _, valid := range ValidNodeTypes() {
-		if nt == valid {
-			return true
-		}
-	}
-	return false
+	return containsEnum(validNodeTypeSet, nt)
 }
 
 // IsValidForDomain returns true if the node type is valid for the given domain.
 func (nt NodeType) IsValidForDomain(domain Domain) bool {
-	validTypes := ValidNodeTypesForDomain(domain)
-	for _, valid := range validTypes {
-		if nt == valid {
-			return true
-		}
+	validTypes, ok := nodeTypeDomainSets[domain]
+	if !ok {
+		return false
 	}
-	return false
+	return containsEnum(validTypes, nt)
 }
 
 func (nt NodeType) String() string {
-	switch nt {
-	case NodeTypeFile:
-		return "file"
-	case NodeTypePackage:
-		return "package"
-	case NodeTypeFunction:
-		return "function"
-	case NodeTypeMethod:
-		return "method"
-	case NodeTypeStruct:
-		return "struct"
-	case NodeTypeInterface:
-		return "interface"
-	case NodeTypeVariable:
-		return "variable"
-	case NodeTypeConstant:
-		return "constant"
-	case NodeTypeImport:
-		return "import"
-	case NodeTypeHistoryEntry:
-		return "history_entry"
-	case NodeTypeSession:
-		return "session"
-	case NodeTypeWorkflow:
-		return "workflow"
-	case NodeTypeOutcome:
-		return "outcome"
-	case NodeTypeDecision:
-		return "decision"
-	case NodeTypePaper:
-		return "paper"
-	case NodeTypeDocumentation:
-		return "documentation"
-	case NodeTypeBestPractice:
-		return "best_practice"
-	case NodeTypeRFC:
-		return "rfc"
-	case NodeTypeStackOverflow:
-		return "stackoverflow"
-	case NodeTypeBlogPost:
-		return "blog_post"
-	case NodeTypeTutorial:
-		return "tutorial"
-	case NodeTypeArchitectureDecision:
-		return "architecture_decision"
-	case NodeTypeDesignPattern:
-		return "design_pattern"
-	case NodeTypeSystemDiagram:
-		return "system_diagram"
-	case NodeTypeTask:
-		return "task"
-	case NodeTypeImplementation:
-		return "implementation"
-	case NodeTypeCodeChange:
-		return "code_change"
-	case NodeTypeUIComponent:
-		return "ui_component"
-	case NodeTypeStyleGuide:
-		return "style_guide"
-	case NodeTypeDesignAsset:
-		return "design_asset"
-	case NodeTypeInspection:
-		return "inspection"
-	case NodeTypeCodeReview:
-		return "code_review"
-	case NodeTypeQualityMetric:
-		return "quality_metric"
-	case NodeTypeTestCase:
-		return "test_case"
-	case NodeTypeTestSuite:
-		return "test_suite"
-	case NodeTypeTestResult:
-		return "test_result"
-	case NodeTypeWorkflowDef:
-		return "workflow_def"
-	case NodeTypeAgentConfig:
-		return "agent_config"
-	case NodeTypePipeline:
-		return "pipeline"
-	case NodeTypeRoutingRule:
-		return "routing_rule"
-	case NodeTypeIntentPattern:
-		return "intent_pattern"
-	case NodeTypeUserQuery:
-		return "user_query"
-	default:
-		return fmt.Sprintf("node_type(%d)", nt)
-	}
+	return enumString(nt, nodeTypeNames, "node_type")
 }
 
 func ParseNodeType(value string) (NodeType, bool) {
-	switch value {
-	case "file":
-		return NodeTypeFile, true
-	case "package":
-		return NodeTypePackage, true
-	case "function":
-		return NodeTypeFunction, true
-	case "method":
-		return NodeTypeMethod, true
-	case "struct":
-		return NodeTypeStruct, true
-	case "interface":
-		return NodeTypeInterface, true
-	case "variable":
-		return NodeTypeVariable, true
-	case "constant":
-		return NodeTypeConstant, true
-	case "import":
-		return NodeTypeImport, true
-	case "history_entry":
-		return NodeTypeHistoryEntry, true
-	case "session":
-		return NodeTypeSession, true
-	case "workflow":
-		return NodeTypeWorkflow, true
-	case "outcome":
-		return NodeTypeOutcome, true
-	case "decision":
-		return NodeTypeDecision, true
-	case "paper":
-		return NodeTypePaper, true
-	case "documentation":
-		return NodeTypeDocumentation, true
-	case "best_practice":
-		return NodeTypeBestPractice, true
-	case "rfc":
-		return NodeTypeRFC, true
-	case "stackoverflow":
-		return NodeTypeStackOverflow, true
-	case "blog_post":
-		return NodeTypeBlogPost, true
-	case "tutorial":
-		return NodeTypeTutorial, true
-	case "architecture_decision":
-		return NodeTypeArchitectureDecision, true
-	case "design_pattern":
-		return NodeTypeDesignPattern, true
-	case "system_diagram":
-		return NodeTypeSystemDiagram, true
-	case "task":
-		return NodeTypeTask, true
-	case "implementation":
-		return NodeTypeImplementation, true
-	case "code_change":
-		return NodeTypeCodeChange, true
-	case "ui_component":
-		return NodeTypeUIComponent, true
-	case "style_guide":
-		return NodeTypeStyleGuide, true
-	case "design_asset":
-		return NodeTypeDesignAsset, true
-	case "inspection":
-		return NodeTypeInspection, true
-	case "code_review":
-		return NodeTypeCodeReview, true
-	case "quality_metric":
-		return NodeTypeQualityMetric, true
-	case "test_case":
-		return NodeTypeTestCase, true
-	case "test_suite":
-		return NodeTypeTestSuite, true
-	case "test_result":
-		return NodeTypeTestResult, true
-	case "workflow_def":
-		return NodeTypeWorkflowDef, true
-	case "agent_config":
-		return NodeTypeAgentConfig, true
-	case "pipeline":
-		return NodeTypePipeline, true
-	case "routing_rule":
-		return NodeTypeRoutingRule, true
-	case "intent_pattern":
-		return NodeTypeIntentPattern, true
-	case "user_query":
-		return NodeTypeUserQuery, true
-	default:
-		return NodeType(0), false
-	}
+	nodeType, ok := nodeTypeByName[value]
+	return nodeType, ok
 }
 
 func (nt NodeType) MarshalJSON() ([]byte, error) {
@@ -649,255 +284,52 @@ const (
 
 // ValidEdgeTypes returns all valid EdgeType values.
 func ValidEdgeTypes() []EdgeType {
-	return []EdgeType{
-		EdgeTypeCalls,
-		EdgeTypeCalledBy,
-		EdgeTypeImports,
-		EdgeTypeImportedBy,
-		EdgeTypeImplements,
-		EdgeTypeImplementedBy,
-		EdgeTypeEmbeds,
-		EdgeTypeHasField,
-		EdgeTypeHasMethod,
-		EdgeTypeDefines,
-		EdgeTypeDefinedIn,
-		EdgeTypeReturns,
-		EdgeTypeReceives,
-		EdgeTypeProducedBy,
-		EdgeTypeResultedIn,
-		EdgeTypeSimilarTo,
-		EdgeTypeFollowedBy,
-		EdgeTypeSupersedes,
-		EdgeTypeModified,
-		EdgeTypeCreated,
-		EdgeTypeDeleted,
-		EdgeTypeBasedOn,
-		EdgeTypeReferences,
-		EdgeTypeValidatedBy,
-		EdgeTypeDocuments,
-		EdgeTypeUsesLibrary,
-		EdgeTypeImplementsPattern,
-		EdgeTypeCites,
-		EdgeTypeRelatedTo,
-	}
+	return cloneEnumSlice(validEdgeTypes)
 }
 
 // StructuralEdgeTypes returns edge types that represent structural relationships.
 func StructuralEdgeTypes() []EdgeType {
-	return []EdgeType{
-		EdgeTypeCalls,
-		EdgeTypeCalledBy,
-		EdgeTypeImports,
-		EdgeTypeImportedBy,
-		EdgeTypeImplements,
-		EdgeTypeImplementedBy,
-		EdgeTypeEmbeds,
-		EdgeTypeHasField,
-		EdgeTypeHasMethod,
-		EdgeTypeDefines,
-		EdgeTypeDefinedIn,
-		EdgeTypeReturns,
-		EdgeTypeReceives,
-	}
+	return cloneEnumSlice(structuralEdgeTypes)
 }
 
 // TemporalEdgeTypes returns edge types that represent temporal relationships.
 func TemporalEdgeTypes() []EdgeType {
-	return []EdgeType{
-		EdgeTypeProducedBy,
-		EdgeTypeResultedIn,
-		EdgeTypeSimilarTo,
-		EdgeTypeFollowedBy,
-		EdgeTypeSupersedes,
-	}
+	return cloneEnumSlice(temporalEdgeTypes)
 }
 
 // CrossDomainEdgeTypes returns edge types that link different domains.
 func CrossDomainEdgeTypes() []EdgeType {
-	return []EdgeType{
-		EdgeTypeModified,
-		EdgeTypeCreated,
-		EdgeTypeDeleted,
-		EdgeTypeBasedOn,
-		EdgeTypeReferences,
-		EdgeTypeValidatedBy,
-		EdgeTypeDocuments,
-		EdgeTypeUsesLibrary,
-		EdgeTypeImplementsPattern,
-		EdgeTypeCites,
-		EdgeTypeRelatedTo,
-	}
+	return cloneEnumSlice(crossDomainEdgeTypes)
 }
 
 // IsValid returns true if the edge type is a recognized value.
 func (et EdgeType) IsValid() bool {
-	for _, valid := range ValidEdgeTypes() {
-		if et == valid {
-			return true
-		}
-	}
-	return false
+	return containsEnum(validEdgeTypeSet, et)
 }
 
 // IsStructural returns true if this is a structural edge type.
 func (et EdgeType) IsStructural() bool {
-	for _, structural := range StructuralEdgeTypes() {
-		if et == structural {
-			return true
-		}
-	}
-	return false
+	return containsEnum(structuralEdgeTypeSet, et)
 }
 
 // IsTemporal returns true if this is a temporal edge type.
 func (et EdgeType) IsTemporal() bool {
-	for _, temporal := range TemporalEdgeTypes() {
-		if et == temporal {
-			return true
-		}
-	}
-	return false
+	return containsEnum(temporalEdgeTypeSet, et)
 }
 
 // IsCrossDomain returns true if this is a cross-domain edge type.
 func (et EdgeType) IsCrossDomain() bool {
-	for _, crossDomain := range CrossDomainEdgeTypes() {
-		if et == crossDomain {
-			return true
-		}
-	}
-	return false
+	return containsEnum(crossDomainEdgeTypeSet, et)
 }
 
 // String returns the string representation of the edge type.
 func (et EdgeType) String() string {
-	switch et {
-	case EdgeTypeCalls:
-		return "calls"
-	case EdgeTypeCalledBy:
-		return "called_by"
-	case EdgeTypeImports:
-		return "imports"
-	case EdgeTypeImportedBy:
-		return "imported_by"
-	case EdgeTypeImplements:
-		return "implements"
-	case EdgeTypeImplementedBy:
-		return "implemented_by"
-	case EdgeTypeEmbeds:
-		return "embeds"
-	case EdgeTypeHasField:
-		return "has_field"
-	case EdgeTypeHasMethod:
-		return "has_method"
-	case EdgeTypeDefines:
-		return "defines"
-	case EdgeTypeDefinedIn:
-		return "defined_in"
-	case EdgeTypeReturns:
-		return "returns"
-	case EdgeTypeReceives:
-		return "receives"
-	case EdgeTypeProducedBy:
-		return "produced_by"
-	case EdgeTypeResultedIn:
-		return "resulted_in"
-	case EdgeTypeSimilarTo:
-		return "similar_to"
-	case EdgeTypeFollowedBy:
-		return "followed_by"
-	case EdgeTypeSupersedes:
-		return "supersedes"
-	case EdgeTypeModified:
-		return "modified"
-	case EdgeTypeCreated:
-		return "created"
-	case EdgeTypeDeleted:
-		return "deleted"
-	case EdgeTypeBasedOn:
-		return "based_on"
-	case EdgeTypeReferences:
-		return "references"
-	case EdgeTypeValidatedBy:
-		return "validated_by"
-	case EdgeTypeDocuments:
-		return "documents"
-	case EdgeTypeUsesLibrary:
-		return "uses_library"
-	case EdgeTypeImplementsPattern:
-		return "implements_pattern"
-	case EdgeTypeCites:
-		return "cites"
-	case EdgeTypeRelatedTo:
-		return "related_to"
-	default:
-		return fmt.Sprintf("edge_type(%d)", et)
-	}
+	return enumString(et, edgeTypeNames, "edge_type")
 }
 
 func ParseEdgeType(value string) (EdgeType, bool) {
-	switch value {
-	case "calls":
-		return EdgeTypeCalls, true
-	case "called_by":
-		return EdgeTypeCalledBy, true
-	case "imports":
-		return EdgeTypeImports, true
-	case "imported_by":
-		return EdgeTypeImportedBy, true
-	case "implements":
-		return EdgeTypeImplements, true
-	case "implemented_by":
-		return EdgeTypeImplementedBy, true
-	case "embeds":
-		return EdgeTypeEmbeds, true
-	case "has_field":
-		return EdgeTypeHasField, true
-	case "has_method":
-		return EdgeTypeHasMethod, true
-	case "defines":
-		return EdgeTypeDefines, true
-	case "defined_in":
-		return EdgeTypeDefinedIn, true
-	case "returns":
-		return EdgeTypeReturns, true
-	case "receives":
-		return EdgeTypeReceives, true
-	case "produced_by":
-		return EdgeTypeProducedBy, true
-	case "resulted_in":
-		return EdgeTypeResultedIn, true
-	case "similar_to":
-		return EdgeTypeSimilarTo, true
-	case "followed_by":
-		return EdgeTypeFollowedBy, true
-	case "supersedes":
-		return EdgeTypeSupersedes, true
-	case "modified":
-		return EdgeTypeModified, true
-	case "created":
-		return EdgeTypeCreated, true
-	case "deleted":
-		return EdgeTypeDeleted, true
-	case "based_on":
-		return EdgeTypeBasedOn, true
-	case "references":
-		return EdgeTypeReferences, true
-	case "validated_by":
-		return EdgeTypeValidatedBy, true
-	case "documents":
-		return EdgeTypeDocuments, true
-	case "uses_library":
-		return EdgeTypeUsesLibrary, true
-	case "implements_pattern":
-		return EdgeTypeImplementsPattern, true
-	case "cites":
-		return EdgeTypeCites, true
-	case "related_to":
-		return EdgeTypeRelatedTo, true
-	default:
-		return EdgeType(0), false
-	}
+	edgeType, ok := edgeTypeByName[value]
+	return edgeType, ok
 }
 
 func (et EdgeType) MarshalJSON() ([]byte, error) {
@@ -1106,37 +538,12 @@ const (
 )
 
 func (st SourceType) String() string {
-	switch st {
-	case SourceTypeCode:
-		return "code"
-	case SourceTypeHistory:
-		return "history"
-	case SourceTypeAcademic:
-		return "academic"
-	case SourceTypeLLMInference:
-		return "llm_inference"
-	case SourceTypeUserProvided:
-		return "user_provided"
-	default:
-		return fmt.Sprintf("source_type(%d)", st)
-	}
+	return enumString(st, sourceTypeNames, "source_type")
 }
 
 func ParseSourceType(value string) (SourceType, bool) {
-	switch value {
-	case "code":
-		return SourceTypeCode, true
-	case "history":
-		return SourceTypeHistory, true
-	case "academic":
-		return SourceTypeAcademic, true
-	case "llm_inference":
-		return SourceTypeLLMInference, true
-	case "user_provided":
-		return SourceTypeUserProvided, true
-	default:
-		return SourceType(0), false
-	}
+	sourceType, ok := sourceTypeByName[value]
+	return sourceType, ok
 }
 
 func (st SourceType) MarshalJSON() ([]byte, error) {
@@ -1163,29 +570,12 @@ func (st *SourceType) UnmarshalJSON(data []byte) error {
 }
 
 func (ct ConflictType) String() string {
-	switch ct {
-	case ConflictTypeTemporal:
-		return "temporal"
-	case ConflictTypeSourceMismatch:
-		return "source_mismatch"
-	case ConflictTypeSemantic:
-		return "semantic"
-	default:
-		return fmt.Sprintf("conflict_type(%d)", ct)
-	}
+	return enumString(ct, conflictTypeNames, "conflict_type")
 }
 
 func ParseConflictType(value string) (ConflictType, bool) {
-	switch value {
-	case "temporal":
-		return ConflictTypeTemporal, true
-	case "source_mismatch":
-		return ConflictTypeSourceMismatch, true
-	case "semantic":
-		return ConflictTypeSemantic, true
-	default:
-		return ConflictType(0), false
-	}
+	conflictType, ok := conflictTypeByName[value]
+	return conflictType, ok
 }
 
 func (ct ConflictType) MarshalJSON() ([]byte, error) {

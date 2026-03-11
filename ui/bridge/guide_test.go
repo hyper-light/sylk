@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	uimsg "github.com/adalundhe/sylk/ui/msg"
 )
 
@@ -38,6 +39,33 @@ func TestGuideBridgeDispatch_ForwardsErrorMessageAsStreamError(t *testing.T) {
 	}
 	if streamErr.Err == nil || streamErr.Err.Error() != "route failed" {
 		t.Fatalf("expected error \"route failed\", got %v", streamErr.Err)
+	}
+}
+
+func TestGuideBridgeDispatch_ForwardsCommandApprovalProposal(t *testing.T) {
+	b := NewGuideBridge(nil, nil, "session-1")
+	program := &recordingProgram{}
+
+	proposal := &commandapproval.Proposal{
+		CorrelationID: "approval-1",
+		Command:       "mkdir -p src/hello_cli",
+		PersistLabel:  "mkdir inside workspace",
+	}
+	b.dispatch(&guide.Message{
+		CorrelationID: "approval-1",
+		Type:          guide.MessageTypeProposal,
+		Payload:       proposal,
+	}, program)
+
+	if len(program.messages) != 1 {
+		t.Fatalf("expected 1 forwarded message, got %d", len(program.messages))
+	}
+	request, ok := program.messages[0].(uimsg.CommandApprovalRequestMsg)
+	if !ok {
+		t.Fatalf("expected CommandApprovalRequestMsg, got %T", program.messages[0])
+	}
+	if request.Proposal == nil || request.Proposal.Command != proposal.Command {
+		t.Fatalf("expected proposal command %q, got %#v", proposal.Command, request.Proposal)
 	}
 }
 

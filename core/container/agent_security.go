@@ -7,7 +7,8 @@ import (
 // agentSecurityProfile maps agent categories to their security properties.
 // Standalone agents (guide, orchestrator) act as supervisors with full
 // topic access and escalation rights. Knowledge agents are unrestricted
-// workers. Pipeline agents are read-only workers.
+// workers. Pipeline agents are VFS-scoped workers and must be allowed to
+// mutate their mounted draft workspace.
 type agentSecurityProfile struct {
 	role           string
 	pathRead       []string
@@ -21,7 +22,8 @@ type agentSecurityProfile struct {
 // securityProfileByCategory derives security posture from agent category.
 // Supervisors (Standalone) have the broadest permissions because they
 // coordinate all other agents. Knowledge agents read/write freely.
-// Pipeline agents are sandboxed to read-only filesystem access.
+// Pipeline agents read/write through VFS-backed pod volumes rather than
+// direct disk mutation, so the runtime must not force them read-only.
 var securityProfileByCategory = map[handoff.AgentCategory]agentSecurityProfile{
 	handoff.CategoryStandalone: {
 		role:          "supervisor",
@@ -39,22 +41,11 @@ var securityProfileByCategory = map[handoff.AgentCategory]agentSecurityProfile{
 	},
 	handoff.CategoryPipeline: {
 		role:          "worker",
-		pathRead:      []string{"/"},
-		pathWrite:     nil,
+		pathRead:      []string{"*"},
+		pathWrite:     []string{"*"},
 		canEscalate:   false,
-		runAsReadOnly: true,
+		runAsReadOnly: false,
 	},
-}
-
-// inspectorReadOnlyOverride forces both inspector variants to read-only
-// filesystem access. Inspectors must NEVER modify files — they observe and
-// report only.
-var inspectorReadOnlyOverride = agentSecurityProfile{
-	role:          "worker",
-	pathRead:      []string{"*"},
-	pathWrite:     nil,
-	canEscalate:   false,
-	runAsReadOnly: true,
 }
 
 // academicNetworkProfile grants the Academic agent outbound network access
@@ -79,13 +70,10 @@ var academicNetworkProfile = agentSecurityProfile{
 }
 
 // agentTypeOverrides maps specific agent types to security profiles that
-// deviate from their category default. The global inspector is registered
-// as CategoryStandalone for bus permissions but must be filesystem read-only.
-// The academic agent is granted network egress for external research.
+// deviate from their category default. The academic agent is granted network
+// egress for external research.
 var agentTypeOverrides = map[string]agentSecurityProfile{
-	"inspector":          inspectorReadOnlyOverride,
-	"inspector-pipeline": inspectorReadOnlyOverride,
-	"academic":           academicNetworkProfile,
+	"academic": academicNetworkProfile,
 }
 
 // BuildSecuritySpec constructs a SecurityContextSpec for an agent based on

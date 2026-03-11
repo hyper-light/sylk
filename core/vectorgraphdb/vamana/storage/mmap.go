@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Package storage provides mmap-based storage types for the Vamana index.
 package storage
 

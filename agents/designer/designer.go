@@ -11,6 +11,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
@@ -454,6 +455,12 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 	// Request-scoped cancellable context.
 	reqCtx, cancel := context.WithCancel(d.runCtx)
 	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return d.bus },
+		SourceAgentID:   func() string { return d.id },
+		SourceAgentType: "designer",
+		SourceAgentName: "Designer",
+	})
 	d.registerRequestCancel(fwd.CorrelationID, cancel)
 	d.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
 	defer d.clearRequestCancel(fwd.CorrelationID)
@@ -889,10 +896,14 @@ func (d *Designer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 }
 
 // SetFileAccess assigns the per-pipeline file access layer.
-func (d *Designer) SetFileAccess(fa versioning.FileAccess) { d.fileAccess = fa }
+func (d *Designer) SetFileAccess(fa versioning.FileAccess) {
+	d.fileAccess = authority.RestrictFileAccess("designer", fa)
+}
 
 // SetWorkspaceViews injects explicit disk/global/pipeline read access.
-func (d *Designer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) { d.workspaceViews = views }
+func (d *Designer) SetWorkspaceViews(views versioning.WorkspaceViewAccess) {
+	d.workspaceViews = authority.RestrictWorkspaceViews("designer", views)
+}
 
 // Terminate gracefully shuts down the designer agent.
 func (d *Designer) Terminate(_ context.Context) error {

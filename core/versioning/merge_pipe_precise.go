@@ -10,10 +10,16 @@ import (
 )
 
 func preciseOperationsForModification(m FileModification) []*Operation {
+	if m.Operation == FileOpMkdir {
+		return nil
+	}
 	return preciseOperationsForChange(m.OriginalPath, m.OldContent, m.NewContent, "")
 }
 
 func preciseOperationsForDelta(d WALFileDelta, pipelineID string) []*Operation {
+	if d.Op == WALDeltaOpMkdir {
+		return nil
+	}
 	return preciseOperationsForChange(d.Path, d.OldContent, d.NewContent, pipelineID)
 }
 
@@ -140,6 +146,14 @@ func (mp *MergePipe) applyTransformedModToGlobal(ctx context.Context, tm transfo
 	}
 
 	switch tm.mod.Operation {
+	case FileOpMkdir:
+		if err := mp.globalVFS.MkdirAll(ctx, tm.mod.OriginalPath); err != nil && !errors.Is(err, ErrFileExists) {
+			return nil, err
+		}
+		return &WALFileDelta{
+			Path: tm.mod.OriginalPath,
+			Op:   WALDeltaOpMkdir,
+		}, nil
 	case FileOpDelete:
 		if !exists {
 			return nil, nil

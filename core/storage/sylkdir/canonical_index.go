@@ -217,12 +217,12 @@ func (c *CanonicalKeyIndex) saveIndex() error {
 
 	// Write to temp file
 	tmpFile := indexFile + ".tmp"
-	if err := os.WriteFile(tmpFile, buf, 0644); err != nil {
+	if err := writeFileSync(tmpFile, buf, 0o644); err != nil {
 		return fmt.Errorf("sylkdir: failed to write index: %w", err)
 	}
 
 	// Atomic rename
-	if err := os.Rename(tmpFile, indexFile); err != nil {
+	if err := durableRename(tmpFile, indexFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("sylkdir: failed to rename index: %w", err)
 	}
@@ -319,6 +319,41 @@ func (c *CanonicalKeyIndex) Merge(other *CanonicalKeyIndex, override func(key st
 	}
 }
 
+// RebuildFromGlobalVersion rebuilds the canonical index from a committed global version.
+func (c *CanonicalKeyIndex) RebuildFromGlobalVersion(sd *SylkDir, version SemanticVersion) error {
+	keyToID := make(map[string]uint32)
+	pathIndex := make(map[string]map[string]uint32)
+	filePathToID := make(map[string]uint32)
+
+	if !version.IsZero() {
+		store, err := NewGlobalVersionNodeStore(sd, version)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+
+		nodes, err := store.ReadAllFromVersion(version)
+		if err != nil {
+			return err
+		}
+		for _, node := range nodes {
+			if node.CanonicalKey == "" {
+				continue
+			}
+			keyToID[node.CanonicalKey] = node.ID
+			addCanonicalKeyToIndexes(pathIndex, filePathToID, node.CanonicalKey, node.ID)
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.keyToID = keyToID
+	c.pathIndex = pathIndex
+	c.filePathToID = filePathToID
+	c.dirty = true
+	return c.saveIndex()
+}
+
 // LookupPrefix returns all keys that match the given prefix.
 // This is O(n) in the current implementation; could be optimized with a trie.
 func (c *CanonicalKeyIndex) LookupPrefix(prefix string) map[string]uint32 {
@@ -378,21 +413,25 @@ func extractSymbolPath(key string) string {
 	return rest[:idx]
 }
 
-// addToPathIndex adds a key to the path-based secondary indexes. Caller holds lock.
-func (c *CanonicalKeyIndex) addToPathIndex(key string, nodeID uint32) {
+func addCanonicalKeyToIndexes(pathIndex map[string]map[string]uint32, filePathToID map[string]uint32, key string, nodeID uint32) {
 	path := extractPathFromKey(key)
 	if path == "" {
 		return
 	}
-	bucket := c.pathIndex[path]
+	bucket := pathIndex[path]
 	if bucket == nil {
 		bucket = make(map[string]uint32)
-		c.pathIndex[path] = bucket
+		pathIndex[path] = bucket
 	}
 	bucket[key] = nodeID
 	if strings.HasPrefix(key, "file:") {
-		c.filePathToID[path] = nodeID
+		filePathToID[path] = nodeID
 	}
+}
+
+// addToPathIndex adds a key to the path-based secondary indexes. Caller holds lock.
+func (c *CanonicalKeyIndex) addToPathIndex(key string, nodeID uint32) {
+	addCanonicalKeyToIndexes(c.pathIndex, c.filePathToID, key, nodeID)
 }
 
 // removeFromPathIndex removes a key from the path-based secondary indexes. Caller holds lock.

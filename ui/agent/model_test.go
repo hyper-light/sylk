@@ -226,6 +226,88 @@ func TestModel_ActivityPipelinePlaceholderUsesCanonicalStatus(t *testing.T) {
 	}
 }
 
+func TestModel_ActivityPipelineStatusUpdatesExistingPipelineOnHandoff(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	initial := time.Now()
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		Status:     "defining_criteria",
+		LoopCount:  1,
+		MaxLoops:   5,
+		Timestamp:  initial,
+	})
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_tester_handoff",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: initial.Add(time.Second),
+			AgentID:   "task_auth_checkout:tester-pipeline",
+			Content:   "Pipeline agent registered: tester-pipeline",
+			Data: map[string]any{
+				"agent_name":      "Tester",
+				"agent_type":      "tester-pipeline",
+				"pipeline_id":     "task_auth_checkout",
+				"task_id":         "task_auth_checkout",
+				"task_slug":       "auth-checkout",
+				"pipeline_status": "creating_tests",
+			},
+		},
+	})
+
+	pl := model.pipelines["task_auth_checkout"]
+	if pl == nil {
+		t.Fatal("expected pipeline state")
+	}
+	if pl.Status != "creating_tests" {
+		t.Fatalf("pipeline Status = %q, want creating_tests", pl.Status)
+	}
+	if pl.LoopCount != 1 || pl.MaxLoops != 5 {
+		t.Fatalf("loop state = %d/%d, want 1/5", pl.LoopCount, pl.MaxLoops)
+	}
+}
+
+func TestModel_HandlePipelineStatePreservesLoopCounterAcrossStageHandoff(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	started := time.Now()
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		Status:     "defining_criteria",
+		WorkerType: "inspector-pipeline",
+		LoopCount:  2,
+		MaxLoops:   5,
+		Timestamp:  started,
+	})
+
+	model.Update(msg.PipelineStateMsg{
+		PipelineID: "task_auth_checkout",
+		TaskID:     "task_auth_checkout",
+		Status:     "creating_tests",
+		WorkerType: "tester-pipeline",
+		Timestamp:  started.Add(time.Second),
+	})
+
+	pl := model.pipelines["task_auth_checkout"]
+	if pl == nil {
+		t.Fatal("expected pipeline state")
+	}
+	if pl.Status != "creating_tests" {
+		t.Fatalf("pipeline Status = %q, want creating_tests", pl.Status)
+	}
+	if pl.WorkerType != "tester-pipeline" {
+		t.Fatalf("pipeline WorkerType = %q, want tester-pipeline", pl.WorkerType)
+	}
+	if pl.LoopCount != 2 || pl.MaxLoops != 5 {
+		t.Fatalf("loop state = %d/%d, want 2/5", pl.LoopCount, pl.MaxLoops)
+	}
+}
+
 func TestModel_HandleVariantState(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)

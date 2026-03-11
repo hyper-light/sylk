@@ -17,6 +17,10 @@ import (
 )
 
 func (d *Designer) registerCoreSkills() {
+	d.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
+	d.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
+	d.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
+	d.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return d.fileAccess }))
 	d.skills.Register(componentSearchSkill(d))
 	d.skills.Register(componentCreateSkill(d))
 	d.skills.Register(componentModifySkill(d))

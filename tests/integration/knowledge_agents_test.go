@@ -161,7 +161,8 @@ func TestArchivalistRoutingInfo(t *testing.T) {
 	routingInfo := arch.GetRoutingInfo()
 	require.NotNil(t, routingInfo)
 
-	assert.Equal(t, "archivalist", routingInfo.ID)
+	assert.NotEmpty(t, routingInfo.ID)
+	assert.Equal(t, "archivalist", routingInfo.Type)
 	assert.Equal(t, "archivalist", routingInfo.Name)
 	assert.Contains(t, routingInfo.Aliases, "arch")
 

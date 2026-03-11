@@ -12,6 +12,7 @@ func TestDescriptorRegistry_PrePopulated(t *testing.T) {
 		"librarian", "archivalist", "academic", "architect",
 		"guide", "orchestrator", "engineer", "designer",
 		"inspector", "inspector-pipeline", "tester", "tester-pipeline",
+		"guardian",
 	}
 
 	for _, agentType := range expectedTypes {
@@ -31,8 +32,8 @@ func TestDescriptorRegistry_PrePopulated(t *testing.T) {
 		}
 	}
 
-	if r.Len() != 12 {
-		t.Errorf("registry.Len() = %d, want 12", r.Len())
+	if r.Len() != 13 {
+		t.Errorf("registry.Len() = %d, want 13", r.Len())
 	}
 }
 
@@ -55,6 +56,7 @@ func TestDescriptorRegistry_Categories(t *testing.T) {
 		{"inspector-pipeline", CategoryPipeline},
 		{"tester", CategoryStandalone},
 		{"tester-pipeline", CategoryPipeline},
+		{"guardian", CategoryStandalone},
 	}
 
 	for _, tt := range tests {
@@ -103,8 +105,8 @@ func TestDescriptorRegistry_All(t *testing.T) {
 	r := NewDescriptorRegistry()
 	all := r.All()
 
-	if len(all) != 12 {
-		t.Errorf("All() returned %d descriptors, want 12", len(all))
+	if len(all) != 13 {
+		t.Errorf("All() returned %d descriptors, want 13", len(all))
 	}
 
 	// Verify all entries have non-empty fields.

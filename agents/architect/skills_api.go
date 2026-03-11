@@ -24,14 +24,12 @@ func architectAllSkillNames() []string {
 }
 
 func architectToolManifest() *toolruntime.PolicyManifest {
-	return toolruntime.NewManifest("architect", "architect.default",
+	return toolruntime.ApplyAuthorityProfile("architect", toolruntime.NewManifest("architect", "architect.default",
 		toolruntime.NewToolPolicy("plan", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("plan_workflow", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("start_planning", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("consult", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("plan_mode", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker),
-		toolruntime.NewToolPolicy("git", toolruntime.EffectReadOnly, toolruntime.DomainGit, toolruntime.ExecutionModeLocal),
-		toolruntime.NewToolPolicy("lsp", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("interrupt_handler", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("pre_delegation_declare", toolruntime.EffectMutating, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("validate_pre_delegation", toolruntime.EffectReadOnly, toolruntime.DomainPlanning, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
@@ -41,19 +39,10 @@ func architectToolManifest() *toolruntime.PolicyManifest {
 		toolruntime.NewToolPolicy("ask_user_question", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeGuardian, toolruntime.WithApprovalSensitive(), toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("route_requirements_research", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker, toolruntime.WithVisibleByDefault()),
 		toolruntime.NewToolPolicy("read_research_paper", toolruntime.EffectReadOnly, toolruntime.DomainKnowledge, toolruntime.ExecutionModeLocal),
-		toolruntime.NewToolPolicy("read_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
-		toolruntime.NewToolPolicy("glob", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
-		toolruntime.NewToolPolicy("grep", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
-		toolruntime.NewToolPolicy("read_workspace_file", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("workspace_glob", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("workspace_grep", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("inspect_workspace_state", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("summarize_workspace_state", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault()),
-		toolruntime.NewToolPolicy("ast_grep_search", toolruntime.EffectReadOnly, toolruntime.DomainFilesystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy("reroute_request", toolruntime.EffectMutating, toolruntime.DomainControl, toolruntime.ExecutionModeLocalWorker),
 		toolruntime.NewToolPolicy("self_diagnostic", toolruntime.EffectReadOnly, toolruntime.DomainSystem, toolruntime.ExecutionModeLocal),
 		toolruntime.NewToolPolicy(toolruntime.SearchToolName, toolruntime.EffectReadOnly, toolruntime.DomainDiscovery, toolruntime.ExecutionModeLocal, toolruntime.WithVisibleByDefault(), toolruntime.WithSearchable(false)),
-	)
+	))
 }
 
 func filterSyntheticRuntimeTools(names []string) []string {

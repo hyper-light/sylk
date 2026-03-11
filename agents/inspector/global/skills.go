@@ -29,6 +29,9 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(shared.DetectMemoryLeaksSkill(gi.toolRunner))
 	faFunc := func() shared.FileAccess { return gi.fileAccess }
 	gi.skills.Register(shared.ReadFileSkill(faFunc))
+	gi.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return gi.fileAccess }))
+	gi.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return gi.fileAccess }))
+	gi.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return gi.fileAccess }))
 	gi.skills.Register(shared.GlobSkill(faFunc))
 	gi.skills.Register(shared.GrepSkill(faFunc))
 	gi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))

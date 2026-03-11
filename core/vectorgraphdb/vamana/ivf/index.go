@@ -173,7 +173,6 @@ func (idx *Index) buildBBQ(vectors [][]float32, numWorkers int) {
 func (idx *Index) buildIVFPartitions(vectors [][]float32, numWorkers int) {
 	n := len(vectors)
 	k := idx.config.NumPartitions
-	dim := idx.dim
 
 	if k > n {
 		k = n
@@ -185,24 +184,8 @@ func (idx *Index) buildIVFPartitions(vectors [][]float32, numWorkers int) {
 	}
 
 	perm := rand.Perm(n)
-
-	idx.centroids = make([][]float32, k)
-	centroidsFlat := make([]float32, k*dim)
-	centroidNormsSq := make([]float64, k)
-
-	for i := range k {
-		idx.centroids[i] = make([]float32, dim)
-		copy(idx.centroids[i], vectors[perm[i%sampleSize]])
-		copy(centroidsFlat[i*dim:], idx.centroids[i])
-		centroidNormsSq[i] = float64(vek32.Dot(idx.centroids[i], idx.centroids[i]))
-	}
-
-	sample := make([][]float32, sampleSize)
-	sampleNormsSq := make([]float64, sampleSize)
-	for i := range sampleSize {
-		sample[i] = vectors[perm[i]]
-		sampleNormsSq[i] = float64(vek32.Dot(sample[i], sample[i]))
-	}
+	centroidsFlat, centroidNormsSq := idx.initializeCentroidsFromPermutation(vectors, perm, k, sampleSize)
+	sample, sampleNormsSq := buildPartitionSample(vectors, perm, sampleSize)
 
 	sampleAssign := make([]uint32, sampleSize)
 	prevAssign := make([]uint32, sampleSize)
@@ -213,168 +196,22 @@ func (idx *Index) buildIVFPartitions(vectors [][]float32, numWorkers int) {
 
 		reassignments := 0
 		if iter > 0 {
-			for i := range sampleAssign {
-				if sampleAssign[i] != prevAssign[i] {
-					reassignments++
-				}
-			}
+			reassignments = sampleReassignments(sampleAssign, prevAssign)
 			if reassignments == 0 {
 				break
 			}
 		}
 
-		counts := make([]int, k)
-		for _, p := range sampleAssign {
-			counts[p]++
-		}
-
-		for i := range k * dim {
-			centroidsFlat[i] = 0
-		}
-
-		for i, vec := range sample {
-			p := sampleAssign[i]
-			offset := int(p) * dim
-			for j, v := range vec {
-				centroidsFlat[offset+j] += v
-			}
-		}
-
-		emptyCount := 0
-		for i := range k {
-			if counts[i] == 0 {
-				emptyCount++
-				copy(centroidsFlat[i*dim:], vectors[perm[(iter*k+i)%sampleSize]])
-			} else {
-				invCount := 1.0 / float32(counts[i])
-				for j := range dim {
-					centroidsFlat[i*dim+j] *= invCount
-				}
-			}
-			centroidNormsSq[i] = float64(vek32.Dot(centroidsFlat[i*dim:(i+1)*dim], centroidsFlat[i*dim:(i+1)*dim]))
-		}
-
-		if emptyCount == 0 && reassignments == 0 && iter > 0 {
-			break
-		}
+		counts := samplePartitionCounts(sampleAssign, k)
+		resetFloat32Slice(centroidsFlat)
+		accumulateAssignedVectors(sample, sampleAssign, centroidsFlat, idx.dim)
+		_ = normalizeSampleCentroids(centroidsFlat, centroidNormsSq, counts, vectors, perm, iter, k, idx.dim, sampleSize)
 	}
 
-	for i := range k {
-		copy(idx.centroids[i], centroidsFlat[i*dim:(i+1)*dim])
-	}
-
-	idx.centroidNorms = make([]float64, k)
-	for i := range k {
-		idx.centroidNorms[i] = math.Sqrt(centroidNormsSq[i])
-	}
-
-	sqrtK := 1
-	for sqrtK*sqrtK < k {
-		sqrtK++
-	}
-
-	superCentroids := make([]float32, sqrtK*dim)
-	superNormsSq := make([]float64, sqrtK)
-	centroidToSuper := make([]int, k)
-
-	for i := range sqrtK {
-		groupStart := i * (k / sqrtK)
-		groupEnd := groupStart + k/sqrtK
-		if i == sqrtK-1 {
-			groupEnd = k
-		}
-		for j := range dim {
-			var sum float32
-			for c := groupStart; c < groupEnd; c++ {
-				sum += centroidsFlat[c*dim+j]
-			}
-			superCentroids[i*dim+j] = sum / float32(groupEnd-groupStart)
-		}
-		superNormsSq[i] = float64(vek32.Dot(superCentroids[i*dim:(i+1)*dim], superCentroids[i*dim:(i+1)*dim]))
-		for c := groupStart; c < groupEnd; c++ {
-			centroidToSuper[c] = i
-		}
-	}
-
-	groupStarts := make([]int, sqrtK)
-	groupEnds := make([]int, sqrtK)
-	for i := range sqrtK {
-		groupStarts[i] = i * (k / sqrtK)
-		groupEnds[i] = groupStarts[i] + k/sqrtK
-		if i == sqrtK-1 {
-			groupEnds[i] = k
-		}
-	}
-
-	assignments := make([]uint32, n)
-	chunkSize := (n + numWorkers - 1) / numWorkers
-	var wg sync.WaitGroup
-
-	for w := range numWorkers {
-		start := w * chunkSize
-		end := min(start+chunkSize, n)
-		if start >= end {
-			continue
-		}
-
-		wg.Add(1)
-		go func(start, end int) {
-			defer wg.Done()
-			superDists := make([]float64, sqrtK)
-			for i := start; i < end; i++ {
-				vec := vectors[i]
-				vecNormSq := float64(vek32.Dot(vec, vec))
-
-				for s := range sqrtK {
-					dot := vek32.Dot(vec, superCentroids[s*dim:(s+1)*dim])
-					superDists[s] = vecNormSq + superNormsSq[s] - 2*float64(dot)
-				}
-
-				best1, best2 := 0, 1
-				if superDists[1] < superDists[0] {
-					best1, best2 = 1, 0
-				}
-				for s := 2; s < sqrtK; s++ {
-					if superDists[s] < superDists[best1] {
-						best2 = best1
-						best1 = s
-					} else if superDists[s] < superDists[best2] {
-						best2 = s
-					}
-				}
-
-				bestCentroid := uint32(groupStarts[best1])
-				bestDist := math.MaxFloat64
-
-				for c := groupStarts[best1]; c < groupEnds[best1]; c++ {
-					dot := vek32.Dot(vec, centroidsFlat[c*dim:(c+1)*dim])
-					d := vecNormSq + centroidNormsSq[c] - 2*float64(dot)
-					if d < bestDist {
-						bestDist = d
-						bestCentroid = uint32(c)
-					}
-				}
-				for c := groupStarts[best2]; c < groupEnds[best2]; c++ {
-					dot := vek32.Dot(vec, centroidsFlat[c*dim:(c+1)*dim])
-					d := vecNormSq + centroidNormsSq[c] - 2*float64(dot)
-					if d < bestDist {
-						bestDist = d
-						bestCentroid = uint32(c)
-					}
-				}
-				assignments[i] = bestCentroid
-			}
-		}(start, end)
-	}
-	wg.Wait()
-
-	idx.partitionIDs = make([][]uint32, k)
-	for p := range k {
-		idx.partitionIDs[p] = make([]uint32, 0, n/k+1)
-	}
-	for i, p := range assignments {
-		idx.partitionIDs[p] = append(idx.partitionIDs[p], uint32(i))
-	}
+	idx.updateCentroidsFromFlat(centroidsFlat, centroidNormsSq)
+	layout := newSuperCentroidLayout(k, idx.dim, centroidsFlat)
+	assignments := idx.assignVectorsHierarchically(vectors, centroidsFlat, centroidNormsSq, layout, numWorkers)
+	idx.partitionIDs = buildPartitionIDsFromAssignments(k, n, assignments)
 }
 
 func (idx *Index) assignToCentroidsFast(vectors [][]float32, vectorNormsSq []float64, centroidsFlat []float32, centroidNormsSq []float64, assignments []uint32, numWorkers int) {

@@ -17,6 +17,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/events"
@@ -339,8 +340,8 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 		logger:            cfg.Logger,
 		logWAL:            cfg.logWAL,
 		activityPub:       cfg.ActivityPub,
-		fileAccess:        cfg.FileAccess,
-		workspaceViews:    cfg.WorkspaceViews,
+		fileAccess:        authority.RestrictFileAccess("architect", cfg.FileAccess),
+		workspaceViews:    authority.RestrictWorkspaceViews("architect", cfg.WorkspaceViews),
 		planStore:         cfg.PlanStore,
 		ownsPlanStore:     ownedPlanStore,
 		controlStore:      cfg.ControlStore,
@@ -403,9 +404,7 @@ func applyConfigDefaults(cfg Config) Config {
 	if cfg.SystemPrompt == "" {
 		cfg.SystemPrompt = DefaultSystemPrompt
 	}
-	cfg.SystemPrompt = shared.AppendWorkspaceViewContext(cfg.SystemPrompt, shared.WorkspacePromptOptions{
-		DefaultView: versioning.WorkspaceViewGlobal,
-	})
+	cfg.SystemPrompt = shared.AppendNoFilesystemContext(cfg.SystemPrompt)
 	if cfg.MaxOutputTokens == 0 {
 		cfg.MaxOutputTokens = DefaultMaxOutputTokens
 	}
@@ -807,6 +806,13 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 
 	startTime := time.Now()
 	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return a.bus },
+		SourceAgentID:   func() string { return a.id },
+		SourceAgentType: "architect",
+		SourceAgentName: "Architect",
+	})
 	reqCtx = withRouteHops(reqCtx, fwd.Hops)
 	reqCtx = withArchitectStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
 	reqCtx, usageAcc := withArchitectUsageAccumulator(reqCtx)

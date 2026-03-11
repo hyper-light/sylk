@@ -13,6 +13,7 @@ func engineerVisibleSkillNames() []string {
 		"lsp",
 		"edit_file",
 		"write_file",
+		"create_directory",
 		"glob",
 		"workspace_glob",
 		"grep",
@@ -42,6 +43,7 @@ func engineerMutatingSkillNames() []string {
 	return []string{
 		"write_file",
 		"edit_file",
+		"create_directory",
 		"run_command",
 		"format",
 		"consult",

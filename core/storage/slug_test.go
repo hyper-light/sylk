@@ -17,7 +17,7 @@ func TestSlug(t *testing.T) {
 		{"MixedCASE123", "mixedcase123"},
 		{"a---b___c...d", "a_b_c_d"},
 		// Truncation: 60 chars input → capped to 50.
-		{"abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij", "abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghi"},
+		{"abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij", "abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdef"},
 		// Trailing _ after truncation is trimmed.
 		{"a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t_u_v_w_x_y_z", "a_b_c_d_e_f_g_h_i_j_k_l_m_n_o_p_q_r_s_t_u_v_w_x_y"},
 		// Pure symbols.

@@ -25,6 +25,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/boot"
+	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/detect"
@@ -103,6 +104,10 @@ const idleFocusBorderPhaseStep = 200 * time.Millisecond
 // blinkHalfPeriod is the duration between cursor visibility toggles.
 // Derived from: standard terminal cursor blink rate (~530ms per phase).
 const blinkHalfPeriod = 530 * time.Millisecond
+
+// resizeAnimationQuiesce pauses purely cosmetic motion briefly after a resize
+// so animation ticks cannot repaint against stale geometry during drag-resize.
+const resizeAnimationQuiesce = 120 * time.Millisecond
 
 // tickRate classifies the current tick chain speed.
 type tickRate int
@@ -368,6 +373,26 @@ type editorPaneState struct {
 	tabOrder []string
 }
 
+type commandApprovalOption struct {
+	label    string
+	decision string
+}
+
+type commandApprovalState struct {
+	proposal    *commandapproval.Proposal
+	selected    int
+	activated   int
+	returnFocus component.FocusID
+	returnInput bool
+}
+
+var commandApprovalOptions = []commandApprovalOption{
+	{label: "Allow Once", decision: "allow_once"},
+	{label: "Allow Always", decision: "allow_always"},
+	{label: "Deny Once", decision: "deny_once"},
+	{label: "Deny Always", decision: "deny_always"},
+}
+
 // AppModel is the root Bubble Tea model that composes all TUI components.
 type AppModel struct {
 	// Lifecycle context — cancelled on Shutdown to abort in-flight Cmds.
@@ -567,6 +592,8 @@ type AppModel struct {
 	// pendingClosePrompt is true while the status bar shows a save-before-close
 	// prompt. While active, handleKey intercepts y/n/esc to resolve it.
 	pendingClosePrompt bool
+	commandApproval    *commandApprovalState
+	commandApprovalQ   []*commandapproval.Proposal
 	// pendingPaneClose is non-zero when the save prompt is for a pane close
 	// operation. The value is the PaneID being closed.
 	pendingPaneClose pane.PaneID
@@ -605,11 +632,9 @@ type AppModel struct {
 	height int
 	ready  bool
 
-	// Resize settle: vertical-only resizes schedule a delayed full invalidation
-	// so that rapid SIGWINCH bursts use the fast path while a final settle
-	// ensures pixel-perfect rendering.
-	resizeGen         uint64 // Resize settle generation counter.
-	resizeQuickActive bool   // True between vertical fast path and settle.
+	// Cosmetic animations are briefly quiesced after a resize so layout
+	// changes render against a stable visual state.
+	resizeFreezeUntil time.Time
 
 	// Font detection result cached from New() to avoid repeated fc-list calls.
 	nerdFontsDetected bool
@@ -664,8 +689,9 @@ type AppModel struct {
 	promptQueue   queue.Queue
 	queueGradient *theme.Gradient
 
-	// Cumulative token counters for the status bar display (guide-only,
-	// from StreamCompleteMsg — kept for streaming animation).
+	// Cumulative token counters from stream telemetry. These are the visible
+	// totals for the status bar because they continue accumulating across
+	// follow-on streams, retries, and architect consultation substreams.
 	totalPromptTokens     int
 	totalCompletionTokens int
 	totalCacheReadTokens  int
@@ -855,8 +881,29 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 
 	appCtx, appCancel := context.WithCancel(ctx)
 	th := cfg.Theme()
+	app := newAppModel(appCtx, appCancel, cfg, deps, th)
+	app.initializePromptQueue(th)
+	app.initializeWAL()
+	app.configureLoginClipboard()
+	app.configureAgentPanel(deps)
+	app.seedAgents(deps)
+	app.initializePaneState(th)
+	app.initializePlanAndInput(th, cfg, deps)
+	app.initializeNerdFonts(deps)
+	app.initializeAuthStatus(deps)
+	app.initializeGitState(th, cfg, deps)
+	app.initializePipelineBridge(deps)
+	return app
+}
 
-	app := &AppModel{
+func newAppModel(
+	appCtx context.Context,
+	appCancel context.CancelFunc,
+	cfg Config,
+	deps Deps,
+	th *theme.Theme,
+) *AppModel {
+	return &AppModel{
 		ctx:                appCtx,
 		cancel:             appCancel,
 		config:             cfg,
@@ -880,7 +927,7 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 				return resolveLoginPanelAPIKey(provider)
 			},
 			llm.ValidateKeyFormat,
-			nil, // clipboard — wired after construction (needs m.clipboard)
+			nil,
 		),
 		activityBridge:         bridge.NewActivityBridge("tui.activity", deps.GuideBus),
 		tokenUsageBridge:       bridge.NewTokenUsageBridge("tui.token_usage", deps.GuideBus),
@@ -912,102 +959,130 @@ func New(ctx context.Context, cfg Config, deps Deps) *AppModel {
 		focusRingStart:         time.Now(),
 		lastFocusBorderBucket:  -1,
 	}
+}
 
-	app.promptQueue = queue.New(queue.MaxCapacity)
-	app.queueGradient = th.Palette.QueueGradient()
+func (m *AppModel) initializePromptQueue(th *theme.Theme) {
+	m.promptQueue = queue.New(queue.MaxCapacity)
+	m.queueGradient = th.Palette.QueueGradient()
+}
 
-	app.walLogger, app.walCloser = newTUIWALLogger()
+func (m *AppModel) initializeWAL() {
+	m.walLogger, m.walCloser = newTUIWALLogger()
+}
 
-	// Wire login panel clipboard now that m.clipboard is available.
-	app.loginPanel.SetClipboard(app.clipboard.Get)
-	app.loginPanel.SetClipboardWrite(app.clipboard.Set)
+func (m *AppModel) configureLoginClipboard() {
+	m.loginPanel.SetClipboard(m.clipboard.Get)
+	m.loginPanel.SetClipboardWrite(m.clipboard.Set)
+}
 
-	// Inject model store so dynamically-created agents read persisted models.
+func (m *AppModel) configureAgentPanel(deps Deps) {
 	if deps.AgentModelStore != nil {
-		app.agentPanel.SetModelStore(deps.AgentModelStore)
+		m.agentPanel.SetModelStore(deps.AgentModelStore)
 	}
 	if deps.AuthRegistry != nil {
-		app.agentPanel.SetOpenAIAuthMethod(deps.AuthRegistry.ActiveMethod("openai"))
+		m.agentPanel.SetOpenAIAuthMethod(deps.AuthRegistry.ActiveMethod("openai"))
 	}
+}
 
-	// Pre-populate agent panel with known agents from bootstrap.
+func (m *AppModel) seedAgents(deps Deps) {
 	for _, seed := range deps.SeedAgents {
-		app.agentPanel.SeedAgent(seed.ID, seed.AgentType, seed.Name, seed.SupportedModels, seed.PersistedModelID, seed.PersistedProviderID)
+		m.agentPanel.SeedAgent(seed.ID, seed.AgentType, seed.Name, seed.SupportedModels, seed.PersistedModelID, seed.PersistedProviderID)
 	}
+}
 
-	app.comp = compositor.New()
-	app.previewPanel = preview.New(th)
-	app.mdPreviewPanel = markdownpkg.New(th)
-	app.paneCounter = 1
-	app.focusedPane = 1
-	app.paneTree = pane.NewLeaf(1)
-	app.paneEditors = map[pane.PaneID]*editorPaneState{
+func (m *AppModel) initializePaneState(th *theme.Theme) {
+	m.comp = compositor.New()
+	m.previewPanel = preview.New(th)
+	m.mdPreviewPanel = markdownpkg.New(th)
+	m.paneCounter = 1
+	m.focusedPane = 1
+	m.paneTree = pane.NewLeaf(1)
+	m.paneEditors = map[pane.PaneID]*editorPaneState{
 		1: {editor: editor.New(th)},
 	}
+}
 
-	app.planView = planview.New(&th.Palette)
-
-	app.lspBridge = bridge.NewLSPBridge(app.lspManager, deps.Scope)
-	app.input = inputpkg.New(th, cfg.InputHistoryCapacity,
-		&tabCompleter{tabOrderFn: app.focusedTabOrder},
+func (m *AppModel) initializePlanAndInput(th *theme.Theme, cfg Config, deps Deps) {
+	m.planView = planview.New(&th.Palette)
+	m.lspBridge = bridge.NewLSPBridge(m.lspManager, deps.Scope)
+	m.input = inputpkg.New(th, cfg.InputHistoryCapacity,
+		&tabCompleter{tabOrderFn: m.focusedTabOrder},
 		&slashCommandCompleter{},
 	)
-	app.input.SetSlashValidator(isKnownSlashCommand)
-	app.syncFocusState()
+	m.input.SetSlashValidator(isKnownSlashCommand)
+	m.syncFocusState()
+}
 
-	// Nerd Font detection: use pre-computed result from parallel bootstrap
-	// when available, falling back to blocking detection.
+func (m *AppModel) initializeNerdFonts(deps Deps) {
 	if deps.NerdFontsDetected {
-		app.nerdFontsDetected = true
+		m.nerdFontsDetected = true
 	} else if deps.GitClient == nil {
-		// Only run blocking detection if bootstrap didn't pre-compute it.
-		app.nerdFontsDetected = fonts.Detected()
+		m.nerdFontsDetected = fonts.Detected()
 	}
-	app.fileTree.SetNerdFonts(app.nerdFontsDetected)
-	app.statusBar.SetNerdFonts(app.nerdFontsDetected)
+	m.fileTree.SetNerdFonts(m.nerdFontsDetected)
+	m.statusBar.SetNerdFonts(m.nerdFontsDetected)
+}
 
-	// Probe initial auth state for provider status icons.
-	if deps.AuthRegistry != nil {
-		for _, provider := range []string{"google", "anthropic", "openai"} {
-			app.statusBar.SetAuthStatus(provider, deps.AuthRegistry.IsAvailable(provider))
-		}
+func (m *AppModel) initializeAuthStatus(deps Deps) {
+	if deps.AuthRegistry == nil {
+		return
 	}
-
-	// Git status watcher for file tree decorations. Use pre-created
-	// objects from parallel bootstrap when available.
-	if deps.GitClient != nil && deps.GitClient.IsGitRepo() {
-		app.gitClient = deps.GitClient
-		app.gitBus = deps.GitBus
-		app.gitBridge = bridge.NewGitBridge(app.gitBus, deps.Scope)
-		configPath := filepath.Join(cfg.ProjectRoot, ".sylk", "config.yaml")
-		app.gitPanel = gitpanel.New(th, app.gitBus, configPath)
-		app.commitTree = committree.New(th)
-		app.gitWatcher = deps.GitWatcher
-		app.safetyGuard = deps.SafetyGuard
-	} else if gc, err := git.NewGitClient(cfg.ProjectRoot); err == nil && gc.IsGitRepo() {
-		app.gitClient = gc
-		app.gitBus = git.NewGitBus(gc)
-		app.gitBridge = bridge.NewGitBridge(app.gitBus, deps.Scope)
-		configPath := filepath.Join(cfg.ProjectRoot, ".sylk", "config.yaml")
-		app.gitPanel = gitpanel.New(th, app.gitBus, configPath)
-		app.commitTree = committree.New(th)
-		if sw, err := git.NewStatusWatcher(gc); err == nil {
-			app.gitWatcher = sw
-		}
-		if sg, err := git.NewSafetyGuard(gc, app.gitBus, git.DefaultSafetyConfig(), app.gitWatcher); err == nil {
-			app.safetyGuard = sg
-		}
+	for _, provider := range []string{"google", "anthropic", "openai"} {
+		m.statusBar.SetAuthStatus(provider, deps.AuthRegistry.IsAvailable(provider))
 	}
+}
 
-	// Pipeline bridge — optional, only created when the pipeline subsystem is active.
-	if deps.PipelineManager != nil || deps.VariantRegistry != nil {
-		app.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.GuideBus, deps.VariantRegistry, deps.Scope)
-		if deps.PipelineManager != nil {
-			deps.PipelineManager.SetOnEvent(app.pipelineBridge.OnPipelineEvent)
-		}
+func (m *AppModel) initializeGitState(th *theme.Theme, cfg Config, deps Deps) {
+	if m.initializeSeededGitState(th, cfg, deps) {
+		return
 	}
+	m.initializeDetectedGitState(th, cfg, deps)
+}
 
-	return app
+func (m *AppModel) initializeSeededGitState(th *theme.Theme, cfg Config, deps Deps) bool {
+	if deps.GitClient == nil || !deps.GitClient.IsGitRepo() {
+		return false
+	}
+	m.gitClient = deps.GitClient
+	m.gitBus = deps.GitBus
+	m.gitBridge = bridge.NewGitBridge(m.gitBus, deps.Scope)
+	m.initializeGitPanels(th, cfg)
+	m.gitWatcher = deps.GitWatcher
+	m.safetyGuard = deps.SafetyGuard
+	return true
+}
+
+func (m *AppModel) initializeDetectedGitState(th *theme.Theme, cfg Config, deps Deps) {
+	gc, err := git.NewGitClient(cfg.ProjectRoot)
+	if err != nil || !gc.IsGitRepo() {
+		return
+	}
+	m.gitClient = gc
+	m.gitBus = git.NewGitBus(gc)
+	m.gitBridge = bridge.NewGitBridge(m.gitBus, deps.Scope)
+	m.initializeGitPanels(th, cfg)
+	if sw, err := git.NewStatusWatcher(gc); err == nil {
+		m.gitWatcher = sw
+	}
+	if sg, err := git.NewSafetyGuard(gc, m.gitBus, git.DefaultSafetyConfig(), m.gitWatcher); err == nil {
+		m.safetyGuard = sg
+	}
+}
+
+func (m *AppModel) initializeGitPanels(th *theme.Theme, cfg Config) {
+	configPath := filepath.Join(cfg.ProjectRoot, ".sylk", "config.yaml")
+	m.gitPanel = gitpanel.New(th, m.gitBus, configPath)
+	m.commitTree = committree.New(th)
+}
+
+func (m *AppModel) initializePipelineBridge(deps Deps) {
+	if deps.PipelineManager == nil && deps.VariantRegistry == nil {
+		return
+	}
+	m.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.GuideBus, deps.VariantRegistry, deps.Scope)
+	if deps.PipelineManager != nil {
+		deps.PipelineManager.SetOnEvent(m.pipelineBridge.OnPipelineEvent)
+	}
 }
 
 var (
@@ -1166,46 +1241,45 @@ func (m *AppModel) syncStagedFiles() {
 // chains are running at the appropriate speed for the current activity level.
 func (m *AppModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 	_, cmd := m.dispatch(raw)
+	return m.finishUpdate(raw, cmd)
+}
 
-	switch raw.(type) {
-	case msg.TickMsg:
-		// Tick chain self-manages via continueTickChain in handleTick.
-		// viewDirty set by handleTick when visual work occurred.
+func (m *AppModel) finishUpdate(raw tea.Msg, cmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.passiveUpdate(raw) {
 		return m, cmd
-	case msg.BlinkMsg:
-		// Blink chain self-manages via handleBlink. Phase sync and
-		// viewDirty are handled by centralized blink logic in View().
-		return m, cmd
-	case msg.LSPFlushMsg:
-		// One-shot timer; no view change.
-		return m, cmd
-	case tea.KeyMsg:
-		// Interactive events reset blink phase.
-		m.viewDirty = true
-		m.blinkGen++
-		m.blinkEpoch = time.Now()
-		return m, m.postDispatchCmds(cmd, true)
-	case tea.MouseMsg:
-		typed := raw.(tea.MouseMsg)
-		if typed.Action == tea.MouseActionMotion {
-			// Motion events: let components set their own dirty flags.
-			// Don't reset blink or schedule blink timers — mouse movement
-			// should not interfere with cursor blink cadence.
-			m.viewDirty = true
-			return m, m.postDispatchCmds(cmd, false)
-		}
-		m.viewDirty = true
-		m.blinkGen++
-		m.blinkEpoch = time.Now()
-		return m, m.postDispatchCmds(cmd, true)
-	default:
-		// Background messages (git, LSP, streaming, etc.) may change visual
-		// state but must NOT reset the blink cycle or schedule new blink
-		// timers — otherwise each background message creates a 530ms timer,
-		// causing duplicate blink chains and burning CPU at idle.
-		m.viewDirty = true
-		return m, m.postDispatchCmds(cmd, false)
 	}
+	if _, ok := raw.(tea.KeyMsg); ok {
+		return m, m.finishInteractiveUpdate(cmd, true)
+	}
+	if typed, ok := raw.(tea.MouseMsg); ok {
+		return m, m.finishMouseUpdate(typed, cmd)
+	}
+	m.viewDirty = true
+	return m, m.postDispatchCmds(cmd, false)
+}
+
+func (m *AppModel) passiveUpdate(raw tea.Msg) bool {
+	switch raw.(type) {
+	case tea.WindowSizeMsg, msg.TickMsg, msg.DecorTickMsg, msg.BlinkMsg, msg.LSPFlushMsg:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *AppModel) finishInteractiveUpdate(cmd tea.Cmd, scheduleBlink bool) tea.Cmd {
+	m.viewDirty = true
+	m.blinkGen++
+	m.blinkEpoch = time.Now()
+	return m.postDispatchCmds(cmd, scheduleBlink)
+}
+
+func (m *AppModel) finishMouseUpdate(typed tea.MouseMsg, cmd tea.Cmd) tea.Cmd {
+	if typed.Action == tea.MouseActionMotion {
+		m.viewDirty = true
+		return m.postDispatchCmds(cmd, false)
+	}
+	return m.finishInteractiveUpdate(cmd, true)
 }
 
 // postDispatchCmds collects tick, blink, and LSP-flush commands that may be
@@ -1302,19 +1376,11 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 			m.agentPanel.SetOpenAIAuthMethod(method)
 		}
 	}),
-	reflect.TypeFor[msg.InterruptMsg]():   appMsgCmdRoute(func(m *AppModel, _ msg.InterruptMsg) tea.Cmd { return m.handleInterrupt() }),
-	reflect.TypeFor[msg.QuitConfirmMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.QuitConfirmMsg) tea.Cmd { return m.handleQuit() }),
-	reflect.TypeFor[msg.TickMsg]():        appMsgCmdRoute((*AppModel).handleTick),
-	reflect.TypeFor[msg.DecorTickMsg]():   appMsgCmdRoute((*AppModel).handleDecorTick),
-	reflect.TypeFor[msg.BlinkMsg]():       appMsgCmdRoute((*AppModel).handleBlink),
-	reflect.TypeFor[msg.ResizeSettleMsg](): appMsgStateRoute(func(m *AppModel, typed msg.ResizeSettleMsg) {
-		if typed.Gen == m.resizeGen {
-			// Full recalc: recalcLayout() → SetStructure() clears all
-			// caches and marks every slot dirty — no separate InvalidateAll needed.
-			m.recalcLayout()
-			m.viewDirty = true
-		}
-	}),
+	reflect.TypeFor[msg.InterruptMsg]():    appMsgCmdRoute(func(m *AppModel, _ msg.InterruptMsg) tea.Cmd { return m.handleInterrupt() }),
+	reflect.TypeFor[msg.QuitConfirmMsg]():  appMsgCmdRoute(func(m *AppModel, _ msg.QuitConfirmMsg) tea.Cmd { return m.handleQuit() }),
+	reflect.TypeFor[msg.TickMsg]():         appMsgCmdRoute((*AppModel).handleTick),
+	reflect.TypeFor[msg.DecorTickMsg]():    appMsgCmdRoute((*AppModel).handleDecorTick),
+	reflect.TypeFor[msg.BlinkMsg]():        appMsgCmdRoute((*AppModel).handleBlink),
 	reflect.TypeFor[msg.LSPFlushMsg]():     appMsgCmdRoute((*AppModel).handleLSPFlush),
 	reflect.TypeFor[msg.QueueAdvanceMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.QueueAdvanceMsg) tea.Cmd { return m.dispatchQueueEntries(typed.EntryIDs) }),
 	reflect.TypeFor[msg.FocusPanelMsg]():   appMsgCmdRoute((*AppModel).handleFocusPanel),
@@ -2252,6 +2318,17 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 	reflect.TypeFor[msg.StreamErrorMsg]():          appMsgCmdRoute((*AppModel).handleStreamErrorTelemetry),
 	reflect.TypeFor[msg.StreamRerouteMsg]():        appMsgCmdRoute((*AppModel).handleStreamReroute),
 	reflect.TypeFor[msg.GuideResponseMsg]():        appMsgCmdRoute((*AppModel).handleGuideResponse),
+	reflect.TypeFor[msg.CommandApprovalRequestMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.CommandApprovalRequestMsg) tea.Cmd {
+		m.handleCommandApprovalRequest(typed)
+		return nil
+	}),
+	reflect.TypeFor[msg.CommandApprovalCommitMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.CommandApprovalCommitMsg) tea.Cmd {
+		return m.commitCommandApproval(typed)
+	}),
+	reflect.TypeFor[msg.CommandApprovalResolvedMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.CommandApprovalResolvedMsg) tea.Cmd {
+		m.resolveCommandApproval()
+		return nil
+	}),
 	reflect.TypeFor[msg.RetryStatusMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.RetryStatusMsg) tea.Cmd {
 		if typed.CorrelationID != "" {
 			if _, interrupted := m.interruptedCorrelations[typed.CorrelationID]; interrupted {
@@ -2417,18 +2494,7 @@ func (m *AppModel) View() string {
 	if !m.ready {
 		return ""
 	}
-
-	// Compute cursor visibility once per frame from wall clock.
-	if m.needsBlink() {
-		m.cursorVisible = m.blinkPhase()
-		if m.cursorVisible != m.lastRenderedPhase {
-			m.lastRenderedPhase = m.cursorVisible
-			m.viewDirty = true
-			m.blinkDirty = true
-		}
-	} else {
-		m.cursorVisible = true
-	}
+	m.syncCursorFrame()
 
 	// Full-screen overlays bypass the compositor entirely.
 	if m.overlay == overlayEditor {
@@ -2458,14 +2524,6 @@ func (m *AppModel) View() string {
 		return m.comp.CachedFrame()
 	}
 
-	// Vertical resize fast path: recompose from stale caches without
-	// detecting or rendering dirty slots. Blink, tick, and component
-	// updates are deferred until the settle message fires.
-	if m.resizeQuickActive {
-		m.viewDirty = false
-		return m.comp.Compose()
-	}
-
 	m.detectDirtySlots()
 	m.renderDirtySlots()
 	m.viewDirty = false
@@ -2490,6 +2548,31 @@ func (m *AppModel) FrameData() compositor.FrameSnapshot {
 	default:
 		return compositor.FrameSnapshot{}
 	}
+}
+
+func (m *AppModel) syncCursorFrame() {
+	m.blinkDirty = false
+	if !m.needsBlink() {
+		m.cursorVisible = true
+		m.lastRenderedPhase = true
+		return
+	}
+	if m.animationsSuspended(time.Now()) {
+		m.cursorVisible = true
+		m.lastRenderedPhase = true
+		return
+	}
+	m.applyCursorPhase(m.blinkPhase())
+}
+
+func (m *AppModel) applyCursorPhase(visible bool) {
+	m.cursorVisible = visible
+	if visible == m.lastRenderedPhase {
+		return
+	}
+	m.lastRenderedPhase = visible
+	m.viewDirty = true
+	m.blinkDirty = true
 }
 
 // Shutdown gracefully stops all bridges and waits for goroutine cleanup.
@@ -2539,52 +2622,17 @@ func (m *AppModel) PushModal(content modal.ModalContent) {
 // Message handlers
 // ---------------------------------------------------------------------------
 
-// resizeSettleDelay is the debounce delay after a vertical-only resize.
-// After this delay without further resizes, a full layout recalculation
-// is triggered so panels render at their final dimensions.
-const resizeSettleDelay = 150 * time.Millisecond
-
 func (m *AppModel) handleResize(sz tea.WindowSizeMsg) tea.Cmd {
-	oldWidth := m.width
+	if m.width == sz.Width && m.height == sz.Height && m.ready {
+		return nil
+	}
 	m.width = sz.Width
 	m.height = sz.Height
 	m.ready = true
-
-	// Fast path: width unchanged and all main-area slots cached.
-	// Skip all panel SetSize calls and re-rendering — just recompose the
-	// frame from truncated caches. A settle message fires a full recalcLayout
-	// once resizing stops.
-	if oldWidth == sz.Width && m.comp.AllMainSlotsCached() {
-		return m.handleResizeVertical()
-	}
-
+	m.viewDirty = true
+	m.beginResizeQuiesce(time.Now())
 	m.recalcLayout()
 	return nil
-}
-
-// handleResizeVertical is the fast path for height-only terminal resizes.
-// It recomputes section heights from the updated m.height, truncates all
-// compositor caches to fit, and schedules a deferred full recalcLayout.
-// No panel SetSize calls are made, so no component reports dirty and
-// renderDirtySlots is a no-op — the frame is recomposed from stale-but-
-// correctly-sized cached data in O(lines) string copies.
-func (m *AppModel) handleResizeVertical() tea.Cmd {
-	queueH := m.promptQueue.ViewHeight()
-	inputH := m.inputHeight()
-	mainH := m.height - queueH - inputH - statusBarHeight
-	mainH = max(mainH, 1)
-	queueH, inputH = correctOverflow(mainH, queueH, inputH, m.height)
-
-	m.comp.ResizeVerticalQuick(mainH, queueH, inputH, statusBarHeight)
-	m.resizeQuickActive = true
-	// Sync prevInputH so detectDirtySlots won't trigger handleInputGrowth.
-	m.prevInputH = inputH
-
-	m.resizeGen++
-	gen := m.resizeGen
-	return tea.Tick(resizeSettleDelay, func(_ time.Time) tea.Msg {
-		return msg.ResizeSettleMsg{Gen: gen}
-	})
 }
 
 // handleKey wraps dispatchKey with ESC/Alt disambiguation. Terminals encode
@@ -2719,6 +2767,12 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 				return m, func() tea.Msg { return result }
 			}
 			return m, nil
+		},
+	),
+	keyPredicateRoute(
+		func(m *AppModel, _ tea.KeyMsg, _ string) bool { return m.commandApproval != nil },
+		func(m *AppModel, key tea.KeyMsg, _ string) (tea.Model, tea.Cmd) {
+			return m.handleCommandApprovalKey(key)
 		},
 	),
 	keyPredicateRoute(
@@ -3799,64 +3853,93 @@ func formatOAuthStatus(provider string) string {
 
 // handleLoginResult processes the async LoginResultMsg from an auth flow.
 func (m *AppModel) handleLoginResult(result msg.LoginResultMsg) tea.Cmd {
-	if result.Method == "oauth" {
-		if m.oauthSessions == nil {
-			return nil
-		}
-		keepAnthropicPending := strings.EqualFold(result.Provider, "anthropic") &&
-			!result.Success &&
-			m.pendingAnthropicOAuth != nil &&
-			m.pendingAnthropicOAuth.flowID == result.FlowID
-		if !keepAnthropicPending {
-			if !m.oauthSessions.Complete(result.Provider, result.FlowID) {
-				return nil
-			}
-			if strings.EqualFold(result.Provider, "anthropic") {
-				if m.pendingAnthropicOAuth != nil && m.pendingAnthropicOAuth.cancel != nil {
-					m.pendingAnthropicOAuth.cancel()
-				}
-				m.pendingAnthropicOAuth = nil
-				m.loginPanel.SetOAuthCodeEntry(false, "")
-			}
-		}
+	if !m.acceptLoginResult(result) {
+		return nil
+	}
+	if result.Success {
+		m.handleSuccessfulLoginResult(result)
+		return nil
+	}
+	m.handleFailedLoginResult(result)
+	return nil
+}
+
+func (m *AppModel) acceptLoginResult(result msg.LoginResultMsg) bool {
+	if !m.completeOAuthLoginResult(result) {
+		return false
 	}
 	if m.suppressLoginResult && !result.Success {
 		m.suppressLoginResult = false
-		return nil
+		return false
 	}
 	m.suppressLoginResult = false
+	return true
+}
 
-	if result.Success {
-		// Close panel + flash success on the status bar.
-		if m.loginPanel.Active() {
-			m.deactivateLogin()
-		}
-		m.statusBar.SetFlash(fmt.Sprintf("Authenticated with %s via %s",
-			loginProviderLabel(result.Provider), loginMethodLabel(result.Method)))
-		// The AuthRegistry is the runtime auth source of truth. It persists
-		// the preferred provider auth mode and broadcasts the effective
-		// provider state to the rest of the system.
-		if m.deps.AuthRegistry != nil {
-			m.deps.AuthRegistry.NotifyCredentialChanged(result.Provider, result.Method)
-			m.agentPanel.SetOpenAIAuthMethod(m.deps.AuthRegistry.ActiveMethod("openai"))
-		} else {
-			_ = credentials.SaveAuthPref(result.Provider, result.Method)
-			if strings.EqualFold(result.Provider, "openai") {
-				m.agentPanel.SetOpenAIAuthMethod(result.Method)
-			}
-		}
-		m.statusBar.SetAuthStatus(result.Provider, true)
-		return nil
+func (m *AppModel) completeOAuthLoginResult(result msg.LoginResultMsg) bool {
+	if result.Method != "oauth" {
+		return true
 	}
+	if m.oauthSessions == nil {
+		return false
+	}
+	if m.keepAnthropicOAuthPending(result) {
+		return true
+	}
+	if !m.oauthSessions.Complete(result.Provider, result.FlowID) {
+		return false
+	}
+	m.finishAnthropicOAuthResult(result.Provider)
+	return true
+}
 
-	// Failure: keep the panel open and show the error inline so the
-	// user can correct input and retry.
+func (m *AppModel) keepAnthropicOAuthPending(result msg.LoginResultMsg) bool {
+	return strings.EqualFold(result.Provider, "anthropic") &&
+		!result.Success &&
+		m.pendingAnthropicOAuth != nil &&
+		m.pendingAnthropicOAuth.flowID == result.FlowID
+}
+
+func (m *AppModel) finishAnthropicOAuthResult(provider string) {
+	if !strings.EqualFold(provider, "anthropic") {
+		return
+	}
+	if m.pendingAnthropicOAuth != nil && m.pendingAnthropicOAuth.cancel != nil {
+		m.pendingAnthropicOAuth.cancel()
+	}
+	m.pendingAnthropicOAuth = nil
+	m.loginPanel.SetOAuthCodeEntry(false, "")
+}
+
+func (m *AppModel) handleSuccessfulLoginResult(result msg.LoginResultMsg) {
 	if m.loginPanel.Active() {
-		m.loginPanel.SetError(redactSecrets(result.Error))
-	} else {
-		m.statusBar.SetFlash(fmt.Sprintf("Login failed: %s", redactSecrets(result.Error)))
+		m.deactivateLogin()
 	}
-	return nil
+	m.statusBar.SetFlash(fmt.Sprintf("Authenticated with %s via %s",
+		loginProviderLabel(result.Provider), loginMethodLabel(result.Method)))
+	m.recordAuthPreference(result.Provider, result.Method)
+	m.statusBar.SetAuthStatus(result.Provider, true)
+}
+
+func (m *AppModel) recordAuthPreference(provider, method string) {
+	if m.deps.AuthRegistry != nil {
+		m.deps.AuthRegistry.NotifyCredentialChanged(provider, method)
+		m.agentPanel.SetOpenAIAuthMethod(m.deps.AuthRegistry.ActiveMethod("openai"))
+		return
+	}
+	_ = credentials.SaveAuthPref(provider, method)
+	if strings.EqualFold(provider, "openai") {
+		m.agentPanel.SetOpenAIAuthMethod(method)
+	}
+}
+
+func (m *AppModel) handleFailedLoginResult(result msg.LoginResultMsg) {
+	errText := redactSecrets(result.Error)
+	if m.loginPanel.Active() {
+		m.loginPanel.SetError(errText)
+		return
+	}
+	m.statusBar.SetFlash(fmt.Sprintf("Login failed: %s", errText))
 }
 
 // handleModelChange spawns a background command to swap the agent's LLM model.
@@ -4727,6 +4810,9 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 	if tick.Gen != m.tickGen {
 		return nil
 	}
+	if m.animationsSuspended(tick.Time) {
+		return m.continueTickChain()
+	}
 
 	// Scroll momentum and bounce.
 	if !m.scroll.settled() {
@@ -4754,6 +4840,9 @@ func (m *AppModel) handleTick(tick msg.TickMsg) tea.Cmd {
 func (m *AppModel) handleDecorTick(tick msg.DecorTickMsg) tea.Cmd {
 	if tick.Gen != m.decorGen {
 		return nil
+	}
+	if m.animationsSuspended(tick.Time) {
+		return m.continueDecorTickChain()
 	}
 
 	changed := false
@@ -5694,107 +5783,102 @@ func detectEditorLanguage(path string) string {
 // Always marks the file as active in the tree regardless of read success so
 // the explorer highlights it immediately.
 func (m *AppModel) handleFileOpen(o msg.FileOpenMsg) tea.Cmd {
+	content, ok := m.readOpenedFile(o)
+	if !ok {
+		return nil
+	}
+	lspContent := content
+	if m.viewMode == ViewEdit {
+		if m.focusedEditor().FilePath() == o.Path {
+			m.focusOpenedFile(o)
+			m.moveToFileOpenLocation(o)
+			return nil
+		}
+		if m.focusOpenFileInExistingPane(o) {
+			m.moveToFileOpenLocation(o)
+			return nil
+		}
+		lspContent = m.openFileInFocusedEditor(o, content)
+	}
+	m.moveToFileOpenLocation(o)
+	m.syncEditorWarpLines()
+	return m.lspDidOpenCmd(o.Path, detectEditorLanguage(o.Path), lspContent)
+}
+
+func (m *AppModel) readOpenedFile(o msg.FileOpenMsg) (string, bool) {
 	m.fileTree.SetActiveFile(o.Path)
 	m.fileTree.RevealPath(o.Path)
-
 	data, err := os.ReadFile(o.Path)
 	if err != nil {
 		m.statusBar.SetFlash("Cannot open: " + o.Name)
-		return nil
+		return "", false
 	}
 	content := string(data)
 	m.codePanel.SetContent(content, o.Path, o.Language)
+	return content, true
+}
 
-	// Track which content the LSP should analyze.
-	lspContent := content
+func (m *AppModel) focusOpenedFile(o msg.FileOpenMsg) {
+	m.appendTab(o.Path)
+	m.focusCodePanel()
+	m.syncFocusState()
+}
 
-	if m.viewMode == ViewEdit {
-		oldPath := m.focusedEditor().FilePath()
+func (m *AppModel) focusOpenFileInExistingPane(o msg.FileOpenMsg) bool {
+	pid, _ := m.findPaneWithTab(o.Path)
+	if pid == 0 || pid == m.focusedPane {
+		return false
+	}
+	m.focusedPane = pid
+	m.focusCodePanel()
+	m.syncFocusState()
+	m.switchPaneToOpenFile(pid, o.Path)
+	return true
+}
 
-		// Already on this file in the focused pane — just jump.
-		if oldPath == o.Path {
-			m.appendTab(o.Path)
-			m.focusCodePanel()
-			m.syncFocusState()
-			if o.Line > 0 {
-				targetLine := o.Line - 1
-				if o.CursorCol > 0 {
-					m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
-				} else {
-					m.focusedEditor().GoToLine(targetLine)
-				}
-				m.codePanel.ScrollToLine(targetLine)
-				m.setJumpMarker(targetLine, o.Col, o.EndCol)
-			}
-			return nil
+func (m *AppModel) switchPaneToOpenFile(pid pane.PaneID, path string) {
+	ps := m.paneEditors[pid]
+	for i, tabPath := range ps.tabOrder {
+		if tabPath == path {
+			m.switchToTab(i)
+			return
 		}
+	}
+}
 
-		// Check if the file is already open in another pane.
-		if pid, _ := m.findPaneWithTab(o.Path); pid != 0 && pid != m.focusedPane {
-			m.focusedPane = pid
-			m.focusCodePanel()
-			m.syncFocusState()
-			// Switch to the tab within that pane.
-			ps := m.paneEditors[pid]
-			for i, p := range ps.tabOrder {
-				if p == o.Path {
-					m.switchToTab(i)
-					break
-				}
-			}
-			if o.Line > 0 {
-				targetLine := o.Line - 1
-				if o.CursorCol > 0 {
-					m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
-				} else {
-					m.focusedEditor().GoToLine(targetLine)
-				}
-				m.codePanel.ScrollToLine(targetLine)
-				m.setJumpMarker(targetLine, o.Col, o.EndCol)
-			}
-			return nil
-		}
-
-		// Close the previous LSP document before switching.
-		if oldPath != "" {
-			m.lspDidCloseAsync(oldPath)
-		}
-
-		// Detach current editor state into the tiered cache.
-		m.detachCurrentEditor()
-
-		// Track the new file in the tab bar and resize the editor
-		// so the tab bar doesn't push content past the panel bottom.
-		m.appendTab(o.Path)
-		m.resizeInlineEditor()
-
-		// Restore from cache if available, otherwise load from disk.
-		if m.restoreFromCache(o.Path) {
-			lspContent = m.focusedEditor().Content()
-		} else {
-			m.focusedEditor().OpenFile(o.Path, content, o.Language)
-		}
-
-		// Transfer focus to the editor pane receiving the file.
+func (m *AppModel) openFileInFocusedEditor(o msg.FileOpenMsg, content string) string {
+	if oldPath := m.focusedEditor().FilePath(); oldPath != "" {
+		m.lspDidCloseAsync(oldPath)
+	}
+	m.detachCurrentEditor()
+	m.appendTab(o.Path)
+	m.resizeInlineEditor()
+	if m.restoreFromCache(o.Path) {
 		m.focusCodePanel()
 		m.syncFocusState()
+		return m.focusedEditor().Content()
 	}
+	m.focusedEditor().OpenFile(o.Path, content, o.Language)
+	m.focusCodePanel()
+	m.syncFocusState()
+	return content
+}
 
-	if o.Line > 0 {
-		targetLine := o.Line - 1
-		m.codePanel.ScrollToLine(targetLine)
-		if m.viewMode == ViewEdit {
-			if o.CursorCol > 0 {
-				m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
-			} else {
-				m.focusedEditor().GoToLine(targetLine)
-			}
-			m.setJumpMarker(targetLine, o.Col, o.EndCol)
-		}
+func (m *AppModel) moveToFileOpenLocation(o msg.FileOpenMsg) {
+	if o.Line <= 0 {
+		return
 	}
-
-	m.syncEditorWarpLines()
-	return m.lspDidOpenCmd(o.Path, detectEditorLanguage(o.Path), lspContent)
+	targetLine := o.Line - 1
+	m.codePanel.ScrollToLine(targetLine)
+	if m.viewMode != ViewEdit {
+		return
+	}
+	if o.CursorCol > 0 {
+		m.focusedEditor().GoToLineCol(targetLine, o.CursorCol)
+	} else {
+		m.focusedEditor().GoToLine(targetLine)
+	}
+	m.setJumpMarker(targetLine, o.Col, o.EndCol)
 }
 
 // setJumpMarker activates the visual jump marker on the inline editor when
@@ -6304,12 +6388,19 @@ func (m *AppModel) applyRealStreamUsage(done msg.StreamCompleteMsg) {
 }
 
 // updateTokenDisplay pushes cumulative token counts to the status bar.
-// Uses bus-sourced totals (all agents) rather than guide-only stream totals.
+// Prefer the live stream totals so usage keeps accumulating across follow-on
+// streams within the same request. Bus totals are retained as a fallback for
+// paths that report token usage outside the visible stream lifecycle.
 func (m *AppModel) updateTokenDisplay() {
 	if m.statusBar == nil {
 		return
 	}
-	m.statusBar.SetTokens(m.busInputTokens, m.busOutputTokens, m.busCacheReadTokens, m.busReasoningTokens)
+	m.statusBar.SetTokens(
+		max(m.totalPromptTokens, m.busInputTokens),
+		max(m.totalCompletionTokens, m.busOutputTokens),
+		max(m.totalCacheReadTokens, m.busCacheReadTokens),
+		max(m.totalReasoningTokens, m.busReasoningTokens),
+	)
 }
 
 func normalizeAgentID(raw string) string {
@@ -6954,78 +7045,116 @@ var chordKeyMap = map[string]chordState{
 }
 
 func (m *AppModel) handleChord(key tea.KeyMsg) (tea.Cmd, bool) {
-	// Blocked chord: any key dismisses the hint.
-	if m.chordBlocked {
-		m.chord = chordNone
-		m.chordBlocked = false
-		return nil, true
-	}
-
 	ks := key.String()
-
-	// Multi-cursor chord trigger: Alt+Shift+D (only in edit mode with editor focused).
-	if ks == "alt+D" {
-		if m.viewMode == ViewEdit && m.isEditorFocused() {
-			if m.chord == chordMultiCursor {
-				m.chord = chordNone
-			} else {
-				m.chord = chordMultiCursor
-			}
-			return nil, true
-		}
-		return nil, false
-	}
-
-	// Active multi-cursor chord: up/down add cursors, d adds at next word, esc/other cancels.
-	if m.chord == chordMultiCursor {
-		if m.viewMode != ViewEdit || !m.isEditorFocused() {
-			m.chord = chordNone
-			return nil, false
-		}
-		return m.handleMultiCursorChord(ks)
-	}
-
-	// Chord triggers: toggle on if idle or switching, toggle off if repeated.
-	if target, ok := chordKeyMap[ks]; ok {
-		// Mode guard: non-view chords are disabled in edit/git mode.
-		// chordView is allowed so the user can cycle between modes.
-		if m.viewMode != ViewChat && target != chordView {
-			m.chord = target
-			m.chordBlocked = true
-			cmd := tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
-				return msg.ChordBlockedExpireMsg{}
-			})
-			return cmd, true
-		}
-		// Focus guard: some chords only activate with a specific pane focused.
-		if required, guarded := chordFocusGuard[target]; guarded && m.focus.Current() != required {
-			return nil, false
-		}
-		// Debounce: absorb key-repeat to prevent rapid toggle cycling.
-		now := time.Now()
-		if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
-			return nil, true
-		}
-		m.lastToggleKey = ks
-		m.lastToggleAt = now
-
-		if m.chord == target {
-			m.chord = chordNone
-		} else {
-			m.chord = target
-		}
+	if m.dismissBlockedChord() {
 		return nil, true
 	}
-
+	if cmd, handled := m.handleMultiCursorChordTrigger(ks); handled {
+		return cmd, true
+	}
+	if cmd, handled := m.handleActiveMultiCursorChord(ks); handled {
+		return cmd, true
+	}
+	if cmd, handled := m.handleChordToggle(ks); handled {
+		return cmd, true
+	}
 	if m.chord == chordNone {
 		return nil, false
 	}
+	return m.handleActiveChordKey(ks)
+}
 
-	// Active chord: arrow keys cycle, anything else cancels.
+func (m *AppModel) dismissBlockedChord() bool {
+	if !m.chordBlocked {
+		return false
+	}
+	m.chord = chordNone
+	m.chordBlocked = false
+	return true
+}
+
+func (m *AppModel) handleMultiCursorChordTrigger(ks string) (tea.Cmd, bool) {
+	if ks != "alt+D" {
+		return nil, false
+	}
+	if m.viewMode != ViewEdit || !m.isEditorFocused() {
+		return nil, false
+	}
+	if m.chord == chordMultiCursor {
+		m.chord = chordNone
+	} else {
+		m.chord = chordMultiCursor
+	}
+	return nil, true
+}
+
+func (m *AppModel) handleActiveMultiCursorChord(ks string) (tea.Cmd, bool) {
+	if m.chord != chordMultiCursor {
+		return nil, false
+	}
+	if m.viewMode != ViewEdit || !m.isEditorFocused() {
+		m.chord = chordNone
+		return nil, false
+	}
+	return m.handleMultiCursorChord(ks)
+}
+
+func (m *AppModel) handleChordToggle(ks string) (tea.Cmd, bool) {
+	target, ok := chordKeyMap[ks]
+	if !ok {
+		return nil, false
+	}
+	if cmd, handled := m.handleBlockedChordToggle(target); handled {
+		return cmd, true
+	}
+	if !m.canFocusChord(target) {
+		return nil, false
+	}
+	if m.chordToggleDebounced(ks) {
+		return nil, true
+	}
+	m.toggleChord(target)
+	return nil, true
+}
+
+func (m *AppModel) handleBlockedChordToggle(target chordState) (tea.Cmd, bool) {
+	if m.viewMode == ViewChat || target == chordView {
+		return nil, false
+	}
+	m.chord = target
+	m.chordBlocked = true
+	return tea.Tick(2*time.Second, func(_ time.Time) tea.Msg {
+		return msg.ChordBlockedExpireMsg{}
+	}), true
+}
+
+func (m *AppModel) canFocusChord(target chordState) bool {
+	required, guarded := chordFocusGuard[target]
+	return !guarded || m.focus.Current() == required
+}
+
+func (m *AppModel) chordToggleDebounced(ks string) bool {
+	now := time.Now()
+	if ks == m.lastToggleKey && now.Sub(m.lastToggleAt) < overlayToggleDebounce {
+		return true
+	}
+	m.lastToggleKey = ks
+	m.lastToggleAt = now
+	return false
+}
+
+func (m *AppModel) toggleChord(target chordState) {
+	if m.chord == target {
+		m.chord = chordNone
+		return
+	}
+	m.chord = target
+}
+
+func (m *AppModel) handleActiveChordKey(ks string) (tea.Cmd, bool) {
 	if delta, ok := chordArrowDelta[ks]; ok {
 		return m.dispatchChordCycle(m.chord, delta), true
 	}
-
 	m.chord = chordNone
 	return nil, true
 }
@@ -7164,8 +7293,14 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 	}
 	old := m.viewMode
 	m.viewMode = target
+	m.saveOutgoingRingFocus(old, preFocus)
+	m.exitRingMode(old)
+	cmd := m.enterRingMode(target, old)
+	m.statusBar.SetMode(target.String())
+	return cmd
+}
 
-	// Save outgoing focus.
+func (m *AppModel) saveOutgoingRingFocus(old ViewMode, preFocus component.FocusID) {
 	switch old {
 	case ViewGit:
 		m.savedGitFocus = preFocus
@@ -7174,47 +7309,64 @@ func (m *AppModel) syncModeForRing(preFocus component.FocusID) tea.Cmd {
 	default:
 		m.savedChatFocus = preFocus
 	}
+}
 
-	// Exit old mode.
-	if old == ViewGit {
-		m.viewMode = ViewChat
-		m.input.SetPlaceholder("Type a message...")
+func (m *AppModel) exitRingMode(old ViewMode) {
+	if old != ViewGit {
+		return
 	}
+	m.viewMode = ViewChat
+	m.input.SetPlaceholder("Type a message...")
+}
 
-	// Enter new mode and restore incoming focus.
-	var cmd tea.Cmd
+func (m *AppModel) enterRingMode(target, old ViewMode) tea.Cmd {
 	switch target {
 	case ViewGit:
-		if m.viewMode == ViewEdit {
-			m.preGitEditMode = true
-			m.exitEditMode()
-		}
-		m.viewMode = ViewGit
-		m.resizeGitPanels()
-		m.input.SetPlaceholder("git>")
-		if m.savedGitFocus != 0 {
-			m.focus.SetFocus(m.savedGitFocus)
-		}
-		if !m.gitDataLoaded {
-			m.gitDataLoaded = true
-			cmd = tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
-		}
+		return m.enterGitRingMode()
 	case ViewEdit:
-		if old == ViewGit && m.preGitEditMode {
-			m.preGitEditMode = false
-		}
-		cmd = m.enterEditMode()
-	default: // CHAT
-		if old == ViewGit && m.preGitEditMode {
-			m.preGitEditMode = false
-		}
-		if m.savedChatFocus != 0 {
-			m.focus.SetFocus(m.savedChatFocus)
-		}
+		return m.enterEditRingMode(old)
+	default:
+		m.enterChatRingMode(old)
+		return nil
 	}
+}
 
-	m.statusBar.SetMode(target.String())
-	return cmd
+func (m *AppModel) enterGitRingMode() tea.Cmd {
+	m.viewMode = ViewGit
+	m.resizeGitPanels()
+	m.input.SetPlaceholder("git>")
+	m.restoreRingFocus(m.savedGitFocus)
+	return m.loadGitRingData()
+}
+
+func (m *AppModel) enterEditRingMode(old ViewMode) tea.Cmd {
+	m.clearPreGitEditMode(old)
+	return m.enterEditMode()
+}
+
+func (m *AppModel) enterChatRingMode(old ViewMode) {
+	m.clearPreGitEditMode(old)
+	m.restoreRingFocus(m.savedChatFocus)
+}
+
+func (m *AppModel) clearPreGitEditMode(old ViewMode) {
+	if old == ViewGit && m.preGitEditMode {
+		m.preGitEditMode = false
+	}
+}
+
+func (m *AppModel) restoreRingFocus(fid component.FocusID) {
+	if fid != 0 {
+		m.focus.SetFocus(fid)
+	}
+}
+
+func (m *AppModel) loadGitRingData() tea.Cmd {
+	if m.gitDataLoaded {
+		return nil
+	}
+	m.gitDataLoaded = true
+	return tea.Batch(m.gitPanel.LoadData(), m.loadGitBranchesCmd())
 }
 
 // ---------------------------------------------------------------------------
@@ -8560,61 +8712,93 @@ func (m *AppModel) cmdLineStyler() func(string) (string, string) {
 // during edit mode. Supported: :w (save), :q (quit), :wq (save+quit),
 // :q! (force quit).
 func (m *AppModel) handleExCommand(text string) tea.Cmd {
+	cmd := normalizeExCommand(text)
+	if handler, ok := exCommandHandlers[cmd]; ok {
+		return handler(m)
+	}
+	if nextCmd, handled := m.handleTabNextCommand(cmd); handled {
+		return nextCmd
+	}
+	if prefixedCmd, handled := m.handlePrefixedExCommand(cmd); handled {
+		return prefixedCmd
+	}
+	m.statusBar.SetFlash("Unknown command: :" + cmd)
+	return nil
+}
+
+var exCommandHandlers = map[string]func(*AppModel) tea.Cmd{
+	"w":        (*AppModel).executeExWrite,
+	"q":        func(m *AppModel) tea.Cmd { return m.closeCurrentTab(false) },
+	"wq":       (*AppModel).executeExWriteQuit,
+	"x":        (*AppModel).executeExWriteQuit,
+	"q!":       func(m *AppModel) tea.Cmd { return m.closeCurrentTab(true) },
+	"tabp":     func(m *AppModel) tea.Cmd { return m.prevTab() },
+	"tabclose": func(m *AppModel) tea.Cmd { return m.closeCurrentTab(false) },
+	"symbols":  (*AppModel).executeExSymbols,
+	"format":   (*AppModel).executeExFormat,
+	"fmt":      (*AppModel).executeExFormat,
+}
+
+func normalizeExCommand(text string) string {
 	cmd := strings.TrimSpace(text)
-
-	// Strip leading ':' if present.
 	cmd = strings.TrimPrefix(cmd, ":")
-	cmd = strings.TrimSpace(cmd)
+	return strings.TrimSpace(cmd)
+}
 
-	switch cmd {
-	case "w":
-		m.saveEditorBuffer()
-	case "q":
-		return m.closeCurrentTab(false)
-	case "wq", "x":
-		m.saveEditorBuffer()
-		return m.closeCurrentTab(false)
-	case "q!":
-		return m.closeCurrentTab(true)
-	case "tabp":
-		return m.prevTab()
-	case "tabclose":
-		return m.closeCurrentTab(false)
-	case "symbols":
-		if fp := m.focusedEditor().FilePath(); fp != "" {
-			return m.lspDocumentSymbolCmd(fp)
-		}
-	case "format", "fmt":
-		if fp := m.focusedEditor().FilePath(); fp != "" {
-			var flushContent string
-			if m.focusedEditor().LSPDirty() {
-				m.focusedEditor().ClearLSPDirty()
-				flushContent = m.focusedEditor().Content()
-			}
-			return m.lspFormatCmd(fp, flushContent, m.focusedEditor().EditGeneration())
-		}
-	default:
-		if cmd == "tabn" || strings.HasPrefix(cmd, "tabn ") {
-			rest := strings.TrimSpace(strings.TrimPrefix(cmd, "tabn"))
-			if rest == "" {
-				return m.nextTab()
-			}
-			n, err := strconv.Atoi(rest)
-			if err != nil || n < 1 {
-				m.statusBar.SetFlash("Usage: :tabn [N]")
-				return nil
-			}
-			return m.switchToTab(n - 1)
-		}
-		if name, ok := strings.CutPrefix(cmd, "tab "); ok {
-			return m.handleTabCommand(strings.TrimSpace(name))
-		}
-		if newName, ok := strings.CutPrefix(cmd, "rename "); ok {
-			return m.handleRenameCommand(strings.TrimSpace(newName))
-		}
-		m.statusBar.SetFlash("Unknown command: :" + cmd)
+func (m *AppModel) executeExWrite() tea.Cmd {
+	m.saveEditorBuffer()
+	return nil
+}
+
+func (m *AppModel) executeExWriteQuit() tea.Cmd {
+	m.saveEditorBuffer()
+	return m.closeCurrentTab(false)
+}
+
+func (m *AppModel) executeExSymbols() tea.Cmd {
+	if fp := m.focusedEditor().FilePath(); fp != "" {
+		return m.lspDocumentSymbolCmd(fp)
 	}
 	return nil
+}
+
+func (m *AppModel) executeExFormat() tea.Cmd {
+	fp := m.focusedEditor().FilePath()
+	if fp == "" {
+		return nil
+	}
+	var flushContent string
+	if m.focusedEditor().LSPDirty() {
+		m.focusedEditor().ClearLSPDirty()
+		flushContent = m.focusedEditor().Content()
+	}
+	return m.lspFormatCmd(fp, flushContent, m.focusedEditor().EditGeneration())
+}
+
+func (m *AppModel) handleTabNextCommand(cmd string) (tea.Cmd, bool) {
+	if cmd != "tabn" && !strings.HasPrefix(cmd, "tabn ") {
+		return nil, false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(cmd, "tabn"))
+	if rest == "" {
+		return m.nextTab(), true
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil || n < 1 {
+		m.statusBar.SetFlash("Usage: :tabn [N]")
+		return nil, true
+	}
+	return m.switchToTab(n - 1), true
+}
+
+func (m *AppModel) handlePrefixedExCommand(cmd string) (tea.Cmd, bool) {
+	if name, ok := strings.CutPrefix(cmd, "tab "); ok {
+		return m.handleTabCommand(strings.TrimSpace(name)), true
+	}
+	if newName, ok := strings.CutPrefix(cmd, "rename "); ok {
+		return m.handleRenameCommand(strings.TrimSpace(newName)), true
+	}
+	return nil, false
 }
 
 // handleRenameCommand initiates an LSP rename for the symbol under the cursor.
@@ -8866,73 +9050,132 @@ func (m *AppModel) composePanes(area pane.Rect) string {
 	rects := m.paneTree.ComputeLayout(area)
 	dividers := m.paneTree.Dividers(area)
 	leaves := m.paneTree.Leaves()
+	dropRect, hasDropTarget := m.composePaneDropTarget(rects)
+	leafLines := m.composePaneLeafLines(leaves, rects)
+	rows := m.composePaneRows(area.H, leaves, rects, dividers, leafLines, dropRect, hasDropTarget)
+	return strings.Join(rows, "\n")
+}
 
+type paneSegment struct {
+	x int
+	s string
+}
+
+func (m *AppModel) composePaneDropTarget(rects map[pane.PaneID]pane.Rect) (pane.Rect, bool) {
+	if m.tabDropTarget == 0 {
+		return pane.Rect{}, false
+	}
+	return rects[m.tabDropTarget], true
+}
+
+func (m *AppModel) composePaneLeafLines(leaves []pane.PaneID, rects map[pane.PaneID]pane.Rect) map[pane.PaneID][]string {
+	leafLines := make(map[pane.PaneID][]string, len(leaves))
+	for _, id := range leaves {
+		leafLines[id] = strings.Split(m.renderLeafPane(id, rects[id]), "\n")
+	}
+	return leafLines
+}
+
+func (m *AppModel) composePaneRows(
+	height int,
+	leaves []pane.PaneID,
+	rects map[pane.PaneID]pane.Rect,
+	dividers []pane.Divider,
+	leafLines map[pane.PaneID][]string,
+	dropRect pane.Rect,
+	hasDropTarget bool,
+) []string {
+	rows := make([]string, height)
+	for y := range height {
+		rows[y] = m.composePaneRow(y, leaves, rects, dividers, leafLines, dropRect, hasDropTarget)
+	}
+	return rows
+}
+
+func (m *AppModel) composePaneRow(
+	y int,
+	leaves []pane.PaneID,
+	rects map[pane.PaneID]pane.Rect,
+	dividers []pane.Divider,
+	leafLines map[pane.PaneID][]string,
+	dropRect pane.Rect,
+	hasDropTarget bool,
+) string {
+	segs := m.paneContentSegments(y, leaves, rects, leafLines)
+	segs = append(segs, m.paneDividerSegments(y, dividers, dropRect, hasDropTarget)...)
+	slices.SortFunc(segs, func(a, b paneSegment) int { return a.x - b.x })
+	return joinPaneSegments(segs)
+}
+
+func (m *AppModel) paneContentSegments(
+	y int,
+	leaves []pane.PaneID,
+	rects map[pane.PaneID]pane.Rect,
+	leafLines map[pane.PaneID][]string,
+) []paneSegment {
+	var segs []paneSegment
+	for _, id := range leaves {
+		rect := rects[id]
+		if y < rect.Y || y >= rect.Y+rect.H {
+			continue
+		}
+		segs = append(segs, paneSegment{
+			x: rect.X,
+			s: paneLineAt(leafLines[id], y-rect.Y),
+		})
+	}
+	return segs
+}
+
+func paneLineAt(lines []string, idx int) string {
+	if idx < 0 || idx >= len(lines) {
+		return ""
+	}
+	return lines[idx]
+}
+
+func (m *AppModel) paneDividerSegments(y int, dividers []pane.Divider, dropRect pane.Rect, hasDropTarget bool) []paneSegment {
 	th := m.config.Theme()
 	divStyle := lipgloss.NewStyle().Foreground(th.Palette.Border)
 	dropDivStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary)
-
-	// Determine drop-target rect for divider highlighting.
-	var dropRect pane.Rect
-	hasDropTarget := m.tabDropTarget != 0
-	if hasDropTarget {
-		dropRect = rects[m.tabDropTarget]
-	}
-
-	// Render each leaf pane into a block of lines.
-	leafLines := make(map[pane.PaneID][]string, len(leaves))
-	for _, id := range leaves {
-		r := rects[id]
-		leafLines[id] = strings.Split(m.renderLeafPane(id, r), "\n")
-	}
-
-	// Build output row by row.
-	type seg struct {
-		x int
-		s string
-	}
-	rows := make([]string, area.H)
-	for y := range area.H {
-		var segs []seg
-
-		// Pane content segments.
-		for _, id := range leaves {
-			r := rects[id]
-			if y < r.Y || y >= r.Y+r.H {
-				continue
-			}
-			lineIdx := y - r.Y
-			lines := leafLines[id]
-			line := ""
-			if lineIdx < len(lines) {
-				line = lines[lineIdx]
-			}
-			segs = append(segs, seg{r.X, line})
+	var segs []paneSegment
+	for _, divider := range dividers {
+		segment, ok := renderPaneDividerSegment(y, divider, dropRect, hasDropTarget, divStyle, dropDivStyle)
+		if ok {
+			segs = append(segs, segment)
 		}
-
-		// Divider segments (highlight dividers adjacent to the drop target).
-		for _, d := range dividers {
-			style := divStyle
-			if hasDropTarget && isDividerAdjacentToRect(d, dropRect) {
-				style = dropDivStyle
-			}
-			switch {
-			case d.Dir == pane.SplitVertical && y >= d.Y && y < d.Y+d.Len:
-				segs = append(segs, seg{d.X, style.Render("│")})
-			case d.Dir == pane.SplitHorizontal && y == d.Y:
-				segs = append(segs, seg{d.X, style.Render(strings.Repeat("─", d.Len))})
-			}
-		}
-
-		// Sort by X and concatenate.
-		slices.SortFunc(segs, func(a, b seg) int { return a.x - b.x })
-		var b strings.Builder
-		for _, s := range segs {
-			b.WriteString(s.s)
-		}
-		rows[y] = b.String()
 	}
+	return segs
+}
 
-	return strings.Join(rows, "\n")
+func renderPaneDividerSegment(
+	y int,
+	divider pane.Divider,
+	dropRect pane.Rect,
+	hasDropTarget bool,
+	divStyle lipgloss.Style,
+	dropDivStyle lipgloss.Style,
+) (paneSegment, bool) {
+	style := divStyle
+	if hasDropTarget && isDividerAdjacentToRect(divider, dropRect) {
+		style = dropDivStyle
+	}
+	switch {
+	case divider.Dir == pane.SplitVertical && y >= divider.Y && y < divider.Y+divider.Len:
+		return paneSegment{x: divider.X, s: style.Render("│")}, true
+	case divider.Dir == pane.SplitHorizontal && y == divider.Y:
+		return paneSegment{x: divider.X, s: style.Render(strings.Repeat("─", divider.Len))}, true
+	default:
+		return paneSegment{}, false
+	}
+}
+
+func joinPaneSegments(segs []paneSegment) string {
+	var b strings.Builder
+	for _, seg := range segs {
+		b.WriteString(seg.s)
+	}
+	return b.String()
 }
 
 // isDividerAdjacentToRect reports whether a divider segment borders the given rect.
@@ -9872,133 +10115,92 @@ func (m *AppModel) handleTabDragReorder(localX int) (bool, tea.Cmd) {
 	return true, nil
 }
 
+type mdTooltipHoverState struct {
+	tab  int
+	pane pane.PaneID
+	x    int
+}
+
 // updateTabHoverClose updates the tab close-icon hover state from a motion event.
 // Handles multi-pane, split preview, and full-preview modes.
 func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
-	// Save tooltip state — restored if the mouse is still inside the tooltip.
-	savedTooltipTab := m.mdTooltipTab
-	savedTooltipPane := m.mdTooltipPane
-	savedTooltipX := m.mdTooltipX
+	savedTooltip := m.captureMdTooltipHoverState()
+	m.resetTabHoverState()
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return
+	}
 
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		m.updateMultiPaneTabHover(mouse, savedTooltip)
+		return
+	}
+
+	m.updateSinglePaneTabHover(mouse, savedTooltip)
+}
+
+func (m *AppModel) captureMdTooltipHoverState() mdTooltipHoverState {
+	return mdTooltipHoverState{tab: m.mdTooltipTab, pane: m.mdTooltipPane, x: m.mdTooltipX}
+}
+
+func (m *AppModel) resetTabHoverState() {
 	m.tabHoverClose = -1
 	m.tabHoverPane = 0
 	m.previewTabHoverClose = -1
 	m.mdPreviewTabHoverClose = -1
 	m.mdTooltipTab = -1
 	m.mdTooltipPane = 0
+}
 
-	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+func (m *AppModel) restoreMdTooltipHover(saved mdTooltipHoverState, pid pane.PaneID, localX, localY, top int) bool {
+	if saved.tab < 0 || saved.pane != pid {
+		return false
+	}
+	if localY >= top+mdTooltipHeight || localX < saved.x || localX >= saved.x+mdTooltipWidth {
+		return false
+	}
+	m.mdTooltipTab = saved.tab
+	m.mdTooltipPane = saved.pane
+	m.mdTooltipX = saved.x
+	return true
+}
+
+func (m *AppModel) updateMultiPaneTabHover(mouse tea.MouseMsg, saved mdTooltipHoverState) {
+	pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
+	if !ok {
 		return
 	}
-
-	// Multi-pane mode: use tree-based hit testing.
-	if m.paneTree != nil && !m.paneTree.IsLeaf() {
-		pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
-		if !ok {
-			return
-		}
-		// Mouse is below the tab bar — check if it's inside the tooltip.
-		if localY >= tabbar.Height {
-			if savedTooltipTab >= 0 && savedTooltipPane == pid &&
-				localY < tabbar.Height+mdTooltipHeight &&
-				localX >= savedTooltipX && localX < savedTooltipX+mdTooltipWidth {
-				m.mdTooltipTab = savedTooltipTab
-				m.mdTooltipPane = savedTooltipPane
-				m.mdTooltipX = savedTooltipX
-			}
-			return
-		}
-		if pid == m.previewPane {
-			area := m.paneContentArea()
-			rects := m.paneTree.ComputeLayout(area)
-			r := rects[pid]
-			cfg := tabbar.Config{
-				Tabs: []tabbar.Tab{{
-					Path:        m.previewPanel.FilePath(),
-					Modified:    false,
-					LabelPrefix: "Preview: ",
-				}},
-				Active:    0,
-				Width:     r.W,
-				NerdFonts: m.nerdFontsDetected,
-				Theme:     m.config.Theme(),
-			}
-			hit := tabbar.HitTest(cfg, localX)
-			if hit.IsClose {
-				m.previewTabHoverClose = hit.TabIndex
-			}
-			return
-		}
-		if pid == m.mdPreviewPane {
-			area := m.paneContentArea()
-			rects := m.paneTree.ComputeLayout(area)
-			r := rects[pid]
-			cfg := tabbar.Config{
-				Tabs: []tabbar.Tab{{
-					Path:        m.mdPreviewPanel.FilePath(),
-					Modified:    false,
-					LabelPrefix: "Markdown: ",
-				}},
-				Active:    0,
-				Width:     r.W,
-				NerdFonts: m.nerdFontsDetected,
-				Theme:     m.config.Theme(),
-			}
-			hit := tabbar.HitTest(cfg, localX)
-			if hit.IsClose {
-				m.mdPreviewTabHoverClose = hit.TabIndex
-			}
-			return
-		}
-		ps, exists := m.paneEditors[pid]
-		if !exists || len(ps.tabOrder) == 0 {
-			return
-		}
-		area := m.paneContentArea()
-		rects := m.paneTree.ComputeLayout(area)
-		r := rects[pid]
-		cfg := m.paneTabBarConfig(pid, r.W)
-		hit := tabbar.HitTest(cfg, localX)
-		if hit.IsClose {
-			m.tabHoverPane = pid
-			m.tabHoverClose = hit.TabIndex
-		}
-		m.updateMdTooltip(pid, hit, cfg)
+	if localY >= tabbar.Height {
+		m.restoreMdTooltipHover(saved, pid, localX, localY, tabbar.Height)
 		return
 	}
+	if pid == m.previewPane {
+		m.updatePanePreviewTabHover(pid, localX, "Preview: ", m.previewPanel.FilePath(), &m.previewTabHoverClose)
+		return
+	}
+	if pid == m.mdPreviewPane {
+		m.updatePanePreviewTabHover(pid, localX, "Markdown: ", m.mdPreviewPanel.FilePath(), &m.mdPreviewTabHoverClose)
+		return
+	}
+	m.updatePaneEditorTabHover(pid, localX)
+}
 
+func (m *AppModel) updateSinglePaneTabHover(mouse tea.MouseMsg, saved mdTooltipHoverState) {
 	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
 	if viewY >= tabbar.Height {
-		// Preserve tooltip if mouse is inside its bounds.
-		if savedTooltipTab >= 0 && savedTooltipPane == m.focusedPane &&
-			viewY < m.tabBarHeight()+mdTooltipHeight &&
-			viewX >= savedTooltipX && viewX < savedTooltipX+mdTooltipWidth {
-			m.mdTooltipTab = savedTooltipTab
-			m.mdTooltipPane = savedTooltipPane
-			m.mdTooltipX = savedTooltipX
-		}
+		m.restoreMdTooltipHover(saved, m.focusedPane, viewX, viewY, m.tabBarHeight())
 		return
 	}
 
-	// Full preview mode: entire code panel is preview.
 	if m.hasPreview() && m.viewMode == ViewEdit && len(m.focusedTabOrder()) == 0 {
-		hit := tabbar.HitTest(m.previewTabBarConfig(), viewX)
-		if hit.IsClose {
-			m.previewTabHoverClose = hit.TabIndex
-		}
+		m.updatePreviewHoverFromConfig(m.previewTabBarConfig(), viewX, &m.previewTabHoverClose)
 		return
 	}
 
-	// Split mode: preview on left half.
 	if m.hasPreview() && m.isInsidePreviewHalf(mouse.X) {
-		hit := tabbar.HitTest(m.previewTabBarConfig(), viewX)
-		if hit.IsClose {
-			m.previewTabHoverClose = hit.TabIndex
-		}
+		m.updatePreviewHoverFromConfig(m.previewTabBarConfig(), viewX, &m.previewTabHoverClose)
 		return
 	}
 
-	// Editor tab bar (right half in split mode, or full panel without preview).
 	if m.tabBarHeight() == 0 {
 		return
 	}
@@ -10013,6 +10215,56 @@ func (m *AppModel) updateTabHoverClose(mouse tea.MouseMsg) {
 		m.tabHoverClose = hit.TabIndex
 	}
 	m.updateMdTooltip(m.focusedPane, hit, cfg)
+}
+
+func (m *AppModel) updatePanePreviewTabHover(
+	pid pane.PaneID,
+	localX int,
+	labelPrefix string,
+	path string,
+	target *int,
+) {
+	rect, ok := m.paneRect(pid)
+	if !ok {
+		return
+	}
+	cfg := tabbar.Config{
+		Tabs: []tabbar.Tab{{
+			Path:        path,
+			Modified:    false,
+			LabelPrefix: labelPrefix,
+		}},
+		Active:    0,
+		Width:     rect.W,
+		NerdFonts: m.nerdFontsDetected,
+		Theme:     m.config.Theme(),
+	}
+	m.updatePreviewHoverFromConfig(cfg, localX, target)
+}
+
+func (m *AppModel) updatePreviewHoverFromConfig(cfg tabbar.Config, viewX int, target *int) {
+	hit := tabbar.HitTest(cfg, viewX)
+	if hit.IsClose {
+		*target = hit.TabIndex
+	}
+}
+
+func (m *AppModel) updatePaneEditorTabHover(pid pane.PaneID, localX int) {
+	ps := m.paneEditors[pid]
+	if ps == nil || len(ps.tabOrder) == 0 {
+		return
+	}
+	rect, ok := m.paneRect(pid)
+	if !ok {
+		return
+	}
+	cfg := m.paneTabBarConfig(pid, rect.W)
+	hit := tabbar.HitTest(cfg, localX)
+	if hit.IsClose {
+		m.tabHoverPane = pid
+		m.tabHoverClose = hit.TabIndex
+	}
+	m.updateMdTooltip(pid, hit, cfg)
 }
 
 // updateMdTooltip sets the markdown tooltip state when hovering a markdown
@@ -10390,6 +10642,142 @@ func (m *AppModel) handleSavePromptKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (m *AppModel) handleCommandApprovalRequest(request msg.CommandApprovalRequestMsg) {
+	if request.Proposal == nil {
+		return
+	}
+	if m.commandApproval != nil {
+		m.commandApprovalQ = append(m.commandApprovalQ, request.Proposal)
+		return
+	}
+	m.commandApproval = &commandApprovalState{
+		proposal:    request.Proposal,
+		selected:    0,
+		activated:   -1,
+		returnFocus: m.focus.Current(),
+	}
+	m.focus.SetFocus(component.FocusInput)
+	m.syncFocusState()
+	m.recalcLayout()
+	m.markSlotDirty(compositor.SlotInput)
+	m.viewDirty = true
+}
+
+func (m *AppModel) resolveCommandApproval() {
+	if m.commandApproval == nil {
+		return
+	}
+	restore := m.commandApproval.returnFocus
+	m.commandApproval = nil
+	if len(m.commandApprovalQ) > 0 {
+		next := m.commandApprovalQ[0]
+		m.commandApprovalQ = m.commandApprovalQ[1:]
+		m.commandApproval = &commandApprovalState{
+			proposal:    next,
+			selected:    0,
+			activated:   -1,
+			returnFocus: restore,
+		}
+		m.focus.SetFocus(component.FocusInput)
+		m.syncFocusState()
+		m.recalcLayout()
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return
+	}
+	if restore != component.FocusID(0) {
+		m.focus.SetFocus(restore)
+		m.syncFocusState()
+	}
+	m.recalcLayout()
+	m.markSlotDirty(compositor.SlotInput)
+	m.viewDirty = true
+}
+
+func (m *AppModel) handleCommandApprovalKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.commandApproval == nil {
+		return m, nil
+	}
+	switch key.String() {
+	case "up", "shift+tab":
+		m.commandApproval.selected = wrappedIndex(m.commandApproval.selected-1, len(commandApprovalOptions))
+		m.commandApproval.activated = -1
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return m, nil
+	case "down", "tab":
+		m.commandApproval.selected = wrappedIndex(m.commandApproval.selected+1, len(commandApprovalOptions))
+		m.commandApproval.activated = -1
+		m.markSlotDirty(compositor.SlotInput)
+		m.viewDirty = true
+		return m, nil
+	case "enter", " ":
+		return m, m.activateCommandApprovalOption(m.commandApproval.selected)
+	case "esc":
+		return m, m.activateCommandApprovalOption(2)
+	default:
+		return m, nil
+	}
+}
+
+func wrappedIndex(index, size int) int {
+	if size <= 0 {
+		return 0
+	}
+	index %= size
+	if index < 0 {
+		index += size
+	}
+	return index
+}
+
+func (m *AppModel) activateCommandApprovalOption(index int) tea.Cmd {
+	if m.commandApproval == nil || index < 0 || index >= len(commandApprovalOptions) {
+		return nil
+	}
+	m.commandApproval.selected = index
+	m.commandApproval.activated = index
+	m.markSlotDirty(compositor.SlotInput)
+	m.viewDirty = true
+	option := commandApprovalOptions[index]
+	proposal := m.commandApproval.proposal
+	return tea.Tick(75*time.Millisecond, func(time.Time) tea.Msg {
+		return msg.CommandApprovalCommitMsg{
+			Proposal: proposal,
+			Decision: option.decision,
+		}
+	})
+}
+
+func (m *AppModel) commitCommandApproval(commit msg.CommandApprovalCommitMsg) tea.Cmd {
+	payload := map[string]any{
+		"decision": commit.Decision,
+		"approved": strings.HasPrefix(commit.Decision, "allow_"),
+	}
+	reason := "denied by user"
+	if payload["approved"].(bool) {
+		reason = "approved by user"
+	}
+	payload["reason"] = reason
+	if commit.Proposal == nil || strings.TrimSpace(commit.Proposal.TargetAgentID) == "" || m.deps.GuideBus == nil {
+		return func() tea.Msg {
+			return msg.CommandApprovalResolvedMsg{}
+		}
+	}
+	topic := guide.TopicResponses("guardian", commit.Proposal.TargetAgentID)
+	_ = m.deps.GuideBus.Publish(topic, &guide.Message{
+		ID:            uuid.New().String(),
+		CorrelationID: commit.Proposal.CorrelationID,
+		Type:          guide.MessageTypeResponse,
+		SourceAgentID: "tui",
+		Payload:       payload,
+		Timestamp:     time.Now(),
+	})
+	return func() tea.Msg {
+		return msg.CommandApprovalResolvedMsg{}
+	}
+}
+
 // closeCurrentTab closes the current tab and switches to an adjacent one.
 // If it was the last tab, clears the editor to show the placeholder.
 func (m *AppModel) closeCurrentTab(discard bool) tea.Cmd {
@@ -10626,6 +11014,7 @@ var appMouseHandlers = []appMouseHandler{
 	(*AppModel).handleConflictViewMotionMouse,
 	(*AppModel).handleCommitTreeHoverMouse,
 	(*AppModel).handleSelectorHoverMouse,
+	(*AppModel).handleCommandApprovalMouse,
 	(*AppModel).handleInputWheelMouse,
 	(*AppModel).handleMouseButtonMouse,
 }
@@ -10640,44 +11029,65 @@ func (m *AppModel) handleMouse(mouse tea.MouseMsg) tea.Cmd {
 }
 
 func (m *AppModel) handleOverlayMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
-	if m.overlay == overlaySearch && m.searchOverlay.Visible() {
-		switch mouse.Button {
-		case tea.MouseButtonWheelUp:
-			m.searchOverlay.ScrollUp()
-		case tea.MouseButtonWheelDown:
-			m.searchOverlay.ScrollDown()
-		}
-		return nil, true
-	}
-	if m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible() {
-		switch mouse.Button {
-		case tea.MouseButtonWheelUp:
-			m.fieldManualOverlay.ScrollUp()
-		case tea.MouseButtonWheelDown:
-			m.fieldManualOverlay.ScrollDown()
-		}
+	if m.handleSearchOverlayWheel(mouse) || m.handleFieldManualOverlayWheel(mouse) {
 		return nil, true
 	}
 	if m.overlay == overlayModal {
 		return nil, true
 	}
-	if m.overlay != overlayLogin || !m.loginPanel.Active() {
+	return m.handleLoginOverlayMouse(mouse)
+}
+
+func (m *AppModel) handleSearchOverlayWheel(mouse tea.MouseMsg) bool {
+	return m.handleScrollableOverlayWheel(mouse, m.overlay == overlaySearch && m.searchOverlay.Visible(), m.searchOverlay.ScrollUp, m.searchOverlay.ScrollDown)
+}
+
+func (m *AppModel) handleFieldManualOverlayWheel(mouse tea.MouseMsg) bool {
+	return m.handleScrollableOverlayWheel(mouse, m.overlay == overlayFieldManual && m.fieldManualOverlay.Visible(), m.fieldManualOverlay.ScrollUp, m.fieldManualOverlay.ScrollDown)
+}
+
+func (m *AppModel) handleScrollableOverlayWheel(mouse tea.MouseMsg, active bool, scrollUp, scrollDown func()) bool {
+	if !active {
+		return false
+	}
+	switch mouse.Button {
+	case tea.MouseButtonWheelUp:
+		scrollUp()
+	case tea.MouseButtonWheelDown:
+		scrollDown()
+	}
+	return true
+}
+
+func (m *AppModel) handleLoginOverlayMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	localX, localY, ok := m.loginOverlayMousePoint(mouse)
+	if !ok {
 		return nil, false
 	}
-	localX := mouse.X - 1
-	localY := mouse.Y - 1
-	if mouse.Action == tea.MouseActionMotion && localX >= 0 && localY >= 0 {
+	if mouse.Action == tea.MouseActionMotion {
 		m.loginPanel.HandleMouseMotion(localX, localY)
 		return nil, true
 	}
-	if mouse.Button == tea.MouseButtonLeft && mouse.Action == tea.MouseActionPress && localX >= 0 && localY >= 0 {
-		done, result, cmd := m.loginPanel.HandleClick(localX, localY)
-		if done {
-			return tea.Batch(cmd, m.handleLoginPanelResult(result)), true
-		}
-		return cmd, true
+	if mouse.Button != tea.MouseButtonLeft || mouse.Action != tea.MouseActionPress {
+		return nil, true
 	}
-	return nil, true
+	done, result, cmd := m.loginPanel.HandleClick(localX, localY)
+	if done {
+		return tea.Batch(cmd, m.handleLoginPanelResult(result)), true
+	}
+	return cmd, true
+}
+
+func (m *AppModel) loginOverlayMousePoint(mouse tea.MouseMsg) (int, int, bool) {
+	if m.overlay != overlayLogin || !m.loginPanel.Active() {
+		return 0, 0, false
+	}
+	localX := mouse.X - 1
+	localY := mouse.Y - 1
+	if localX < 0 || localY < 0 {
+		return 0, 0, false
+	}
+	return localX, localY, true
 }
 
 func (m *AppModel) handleHoverPopupWheelMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
@@ -10819,7 +11229,56 @@ func (m *AppModel) handleSelectorHoverMouse(mouse tea.MouseMsg) (tea.Cmd, bool) 
 	return nil, false
 }
 
+func (m *AppModel) handleCommandApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.commandApproval == nil {
+		return nil, false
+	}
+	inputTop := m.height - m.prevInputH - statusBarHeight
+	if mouse.Y < inputTop || mouse.Y >= inputTop+m.prevInputH {
+		return nil, false
+	}
+	contentY := mouse.Y - inputTop - 1
+	switch mouse.Action {
+	case tea.MouseActionMotion:
+		if idx, ok := m.commandApprovalOptionAt(contentY); ok {
+			m.commandApproval.selected = idx
+			m.commandApproval.activated = -1
+			m.markSlotDirty(compositor.SlotInput)
+			m.viewDirty = true
+		}
+		return nil, true
+	case tea.MouseActionPress:
+		if mouse.Button == tea.MouseButtonLeft {
+			if idx, ok := m.commandApprovalOptionAt(contentY); ok {
+				return m.activateCommandApprovalOption(idx), true
+			}
+		}
+		return nil, true
+	default:
+		return nil, true
+	}
+}
+
+func (m *AppModel) commandApprovalOptionAt(contentY int) (int, bool) {
+	if m.commandApproval == nil || contentY < 0 {
+		return 0, false
+	}
+	lines := m.commandApprovalBodyLines(max(m.width-2, 1))
+	start := len(lines) - len(commandApprovalOptions)
+	if contentY < start {
+		return 0, false
+	}
+	index := contentY - start
+	if index < 0 || index >= len(commandApprovalOptions) {
+		return 0, false
+	}
+	return index, true
+}
+
 func (m *AppModel) handleInputWheelMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
+	if m.commandApproval != nil {
+		return nil, false
+	}
 	if m.focus.Current() != component.FocusInput || !m.input.CanScroll() {
 		return nil, false
 	}
@@ -11023,6 +11482,14 @@ func (m *AppModel) handleGitModeLeftClick(mouse tea.MouseMsg) tea.Cmd {
 }
 
 func (m *AppModel) handleInputPanelPress(mouse tea.MouseMsg) bool {
+	if m.commandApproval != nil {
+		if idx, ok := m.commandApprovalOptionAt(mouse.Y - (m.height - m.prevInputH - statusBarHeight) - 1); ok {
+			m.commandApproval.selected = idx
+			m.markSlotDirty(compositor.SlotInput)
+			m.viewDirty = true
+		}
+		return true
+	}
 	inputTop := m.height - m.prevInputH - statusBarHeight
 	if mouse.Y < inputTop || mouse.Y >= inputTop+m.prevInputH {
 		return false
@@ -12032,6 +12499,15 @@ func (m *AppModel) paneViewCoords(screenX, screenY int) (pane.PaneID, int, int, 
 	return 0, 0, 0, false
 }
 
+func (m *AppModel) paneRect(id pane.PaneID) (pane.Rect, bool) {
+	if m.paneTree == nil {
+		return pane.Rect{}, false
+	}
+	rects := m.paneTree.ComputeLayout(m.paneContentArea())
+	rect, ok := rects[id]
+	return rect, ok
+}
+
 // handleEditorMouse handles all left-button mouse actions (press, drag,
 // release) inside the code panel during edit mode. Returns (consumed, cmd).
 func (m *AppModel) handleEditorMouse(mouse tea.MouseMsg) (bool, tea.Cmd) {
@@ -12233,236 +12709,224 @@ func (m *AppModel) handleMultiPanePress(mouse tea.MouseMsg) (bool, tea.Cmd) {
 		return false, nil
 	}
 
-	// Switch focus to the clicked pane.
-	m.focus.SetFocus(pane.PaneFocusID(pid))
-	m.syncFocusState()
+	m.focusPane(pid)
 
-	// Preview pane click.
 	if pid == m.previewPane {
-		if localY < tabbar.Height {
-			area := m.paneContentArea()
-			rects := m.paneTree.ComputeLayout(area)
-			r := rects[pid]
-			cfg := tabbar.Config{
-				Tabs: []tabbar.Tab{{
-					Path:        m.previewPanel.FilePath(),
-					Modified:    false,
-					LabelPrefix: "Preview: ",
-				}},
-				Active:    0,
-				Width:     r.W,
-				NerdFonts: m.nerdFontsDetected,
-				Theme:     m.config.Theme(),
-			}
-			hit := tabbar.HitTest(cfg, localX)
-			if hit.TabIndex >= 0 && hit.IsClose {
-				m.dismissPreview()
-				return true, nil
-			}
-			// Begin preview tab drag.
-			if hit.TabIndex >= 0 {
-				m.tabDragIdx = 0
-				m.tabDragSourcePane = m.previewPane
-			}
-		} else {
-			// Content click: position the cursor.
-			viewY := localY - tabbar.Height
-			m.previewPanel.SetCursorFromViewport(localX, viewY)
-		}
-		return true, nil
+		return m.handleSplitPreviewPanePress(pid, localX, localY)
 	}
 
-	// Markdown preview pane click.
 	if pid == m.mdPreviewPane {
-		if localY < tabbar.Height {
-			area := m.paneContentArea()
-			rects := m.paneTree.ComputeLayout(area)
-			r := rects[pid]
-			cfg := tabbar.Config{
-				Tabs: []tabbar.Tab{{
-					Path:        m.mdPreviewPanel.FilePath(),
-					Modified:    false,
-					LabelPrefix: "Markdown: ",
-				}},
-				Active:    0,
-				Width:     r.W,
-				NerdFonts: m.nerdFontsDetected,
-				Theme:     m.config.Theme(),
-			}
-			hit := tabbar.HitTest(cfg, localX)
-			if hit.TabIndex >= 0 && hit.IsClose {
-				m.dismissMarkdownPreview()
-			}
-		}
-		return true, nil
+		return m.handleSplitMarkdownPreviewPanePress(pid, localX, localY)
 	}
 
-	// Editor pane click.
 	ps, exists := m.paneEditors[pid]
 	if !exists {
 		return true, nil
 	}
+	return m.handleSplitEditorPanePress(pid, localX, localY, ps)
+}
 
-	// Check for markdown tooltip click (within the 3-row tooltip area).
-	if m.mdTooltipTab >= 0 && m.mdTooltipPane == pid && localY >= tabbar.Height && localY < tabbar.Height+mdTooltipHeight {
-		if localX >= m.mdTooltipX && localX < m.mdTooltipX+mdTooltipWidth {
-			if m.mdTooltipTab < len(ps.tabOrder) {
-				path := ps.tabOrder[m.mdTooltipTab]
-				m.openMarkdownPreview(path)
-				m.mdTooltipTab = -1
-				m.mdTooltipPane = 0
-			}
-			return true, nil
-		}
+func (m *AppModel) focusPane(pid pane.PaneID) {
+	m.focus.SetFocus(pane.PaneFocusID(pid))
+	m.syncFocusState()
+}
+
+func (m *AppModel) handleSplitPreviewPanePress(pid pane.PaneID, localX, localY int) (bool, tea.Cmd) {
+	if localY < tabbar.Height {
+		return m.handleSplitPreviewTabPress(pid, localX, "Preview: ", m.previewPanel.FilePath(), m.dismissPreview, true)
 	}
+	m.previewPanel.SetCursorFromViewport(localX, localY-tabbar.Height)
+	return true, nil
+}
 
-	// Tab bar click within pane.
+func (m *AppModel) handleSplitMarkdownPreviewPanePress(pid pane.PaneID, localX, localY int) (bool, tea.Cmd) {
+	if localY < tabbar.Height {
+		return m.handleSplitPreviewTabPress(pid, localX, "Markdown: ", m.mdPreviewPanel.FilePath(), m.dismissMarkdownPreview, false)
+	}
+	return true, nil
+}
+
+func (m *AppModel) handleSplitPreviewTabPress(
+	pid pane.PaneID,
+	localX int,
+	labelPrefix string,
+	path string,
+	dismiss func(),
+	allowDrag bool,
+) (bool, tea.Cmd) {
+	rect, ok := m.paneRect(pid)
+	if !ok {
+		return true, nil
+	}
+	cfg := tabbar.Config{
+		Tabs: []tabbar.Tab{{
+			Path:        path,
+			Modified:    false,
+			LabelPrefix: labelPrefix,
+		}},
+		Active:    0,
+		Width:     rect.W,
+		NerdFonts: m.nerdFontsDetected,
+		Theme:     m.config.Theme(),
+	}
+	hit := tabbar.HitTest(cfg, localX)
+	if hit.TabIndex >= 0 && hit.IsClose {
+		dismiss()
+		return true, nil
+	}
+	if allowDrag && hit.TabIndex >= 0 {
+		m.tabDragIdx = 0
+		m.tabDragSourcePane = m.previewPane
+	}
+	return true, nil
+}
+
+func (m *AppModel) handleSplitEditorPanePress(pid pane.PaneID, localX, localY int, ps *editorPaneState) (bool, tea.Cmd) {
+	if m.handleMarkdownTooltipPress(pid, localX, localY, ps.tabOrder) {
+		return true, nil
+	}
 	if len(ps.tabOrder) > 0 && localY < tabbar.Height {
-		area := m.paneContentArea()
-		rects := m.paneTree.ComputeLayout(area)
-		r := rects[pid]
-		cfg := m.paneTabBarConfig(pid, r.W)
-		hit := tabbar.HitTest(cfg, localX)
-		if hit.IsLeftNav {
-			m.tabArrowFlashLeftUntil = time.Now().Add(tabArrowFlashDuration)
-			return true, m.prevTab()
-		}
-		if hit.IsRightNav {
-			m.tabArrowFlashRightUntil = time.Now().Add(tabArrowFlashDuration)
-			return true, m.nextTab()
-		}
-		if hit.TabIndex < 0 || hit.TabIndex >= len(ps.tabOrder) {
-			return true, nil
-		}
-		if hit.IsClose {
-			return true, m.closeTab(hit.TabIndex)
-		}
-		m.tabDragIdx = hit.TabIndex
-		m.tabDragSourcePane = pid
-		return true, m.switchToTab(hit.TabIndex)
+		return m.handleSplitEditorTabPress(pid, localX, ps)
 	}
+	return m.handleSplitEditorContentPress(localX, localY, ps)
+}
 
-	// Content click below tab bar.
-	viewX := localX
+func (m *AppModel) handleSplitEditorTabPress(pid pane.PaneID, localX int, ps *editorPaneState) (bool, tea.Cmd) {
+	rect, ok := m.paneRect(pid)
+	if !ok {
+		return true, nil
+	}
+	hit := tabbar.HitTest(m.paneTabBarConfig(pid, rect.W), localX)
+	if hit.IsLeftNav {
+		m.tabArrowFlashLeftUntil = time.Now().Add(tabArrowFlashDuration)
+		return true, m.prevTab()
+	}
+	if hit.IsRightNav {
+		m.tabArrowFlashRightUntil = time.Now().Add(tabArrowFlashDuration)
+		return true, m.nextTab()
+	}
+	if hit.TabIndex < 0 || hit.TabIndex >= len(ps.tabOrder) {
+		return true, nil
+	}
+	if hit.IsClose {
+		return true, m.closeTab(hit.TabIndex)
+	}
+	m.tabDragIdx = hit.TabIndex
+	m.tabDragSourcePane = pid
+	return true, m.switchToTab(hit.TabIndex)
+}
+
+func (m *AppModel) handleSplitEditorContentPress(localX, localY int, ps *editorPaneState) (bool, tea.Cmd) {
 	viewY := localY
 	if len(ps.tabOrder) > 0 {
 		viewY -= tabbar.Height
 	}
-
-	barH := ps.editor.ReplaceBarHeight()
-	if barH > 0 && viewY < barH {
-		ps.editor.HandleReplaceBarClick(viewX, viewY)
-		return true, nil
-	}
-	if barH == 0 {
-		barH = ps.editor.FindBarHeight()
-		if barH > 0 && viewY < barH {
-			ps.editor.HandleFindBarClick(viewX, viewY)
-			return true, nil
-		}
-	}
-	viewY -= barH
-
-	if cmd, handled := ps.editor.HandleHoverClick(viewX, viewY); handled {
-		return true, cmd
-	}
-	if ps.editor.HandleCompletionClick(viewX, viewY) {
-		return true, nil
-	}
-
-	ps.editor.ClickAt(viewX, viewY)
-	m.editorMouseDown = true
-	m.editorDragging = false
-
-	line := ps.editor.CursorLine()
-	col := ps.editor.CursorCol()
-	if ps.editor.IsWordCharAtPos(line, col) {
-		m.highlightLine = line
-		m.highlightCol = col
-		ps.editor.ClearHighlightRanges()
-		return true, tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
-			return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
-		})
-	}
-	ps.editor.ClearHighlightRanges()
-	return true, nil
+	return m.handleEditorPaneBodyClick(ps.editor, localX, viewY)
 }
 
 // handleEditorPaneClick handles a click in the single editor pane (no splits).
 func (m *AppModel) handleEditorPaneClick(mouse tea.MouseMsg) (bool, tea.Cmd) {
-	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
-
-	// In split mode, offset viewX to be relative to the editor half.
-	if pw := m.previewSplitWidth(); pw > 0 {
-		dividerWidth := 1
-		viewX -= pw + dividerWidth
-	}
-
-	// Tab bar click: when the tab bar is visible, clicks within it switch tabs.
+	viewX, viewY := m.singlePaneEditorClickCoords(mouse)
 	if m.tabBarHeight() > 0 && viewY < m.tabBarHeight() {
 		return m.handleTabBarClick(viewX)
 	}
-
-	// Markdown tooltip click (within the 3-row tooltip area).
-	if m.mdTooltipTab >= 0 && m.mdTooltipPane == m.focusedPane && viewY >= m.tabBarHeight() && viewY < m.tabBarHeight()+mdTooltipHeight {
-		if viewX >= m.mdTooltipX && viewX < m.mdTooltipX+mdTooltipWidth {
-			tabOrder := m.focusedTabOrder()
-			if m.mdTooltipTab < len(tabOrder) {
-				m.openMarkdownPreview(tabOrder[m.mdTooltipTab])
-				m.mdTooltipTab = -1
-				m.mdTooltipPane = 0
-			}
-			return true, nil
-		}
-	}
-
-	// Offset for tab bar so editor coordinates remain correct.
-	viewY -= m.tabBarHeight()
-
-	// When a search bar (find or replace) is open, clicks in its area
-	// toggle badges/buttons; clicks below are offset to content-local coords.
-	barH := m.focusedEditor().ReplaceBarHeight()
-	if barH > 0 && viewY < barH {
-		m.focusedEditor().HandleReplaceBarClick(viewX, viewY)
+	if m.handleMarkdownTooltipPress(m.focusedPane, viewX, viewY, m.focusedTabOrder()) {
 		return true, nil
 	}
-	if barH == 0 {
-		barH = m.focusedEditor().FindBarHeight()
-		if barH > 0 && viewY < barH {
-			m.focusedEditor().HandleFindBarClick(viewX, viewY)
-			return true, nil
-		}
-	}
-	viewY -= barH
+	viewY -= m.tabBarHeight()
+	return m.handleEditorPaneBodyClick(m.focusedEditor(), viewX, viewY)
+}
 
-	// When the hover popup is visible, clicks on it trigger go-to-definition.
-	if cmd, ok := m.focusedEditor().HandleHoverClick(viewX, viewY); ok {
+func (m *AppModel) singlePaneEditorClickCoords(mouse tea.MouseMsg) (int, int) {
+	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+	if pw := m.previewSplitWidth(); pw > 0 {
+		viewX -= pw + 1
+	}
+	return viewX, viewY
+}
+
+func (m *AppModel) handleMarkdownTooltipPress(pid pane.PaneID, viewX, viewY int, tabs []string) bool {
+	if m.mdTooltipTab < 0 || m.mdTooltipPane != pid {
+		return false
+	}
+	if viewY < tabbar.Height || viewY >= tabbar.Height+mdTooltipHeight {
+		return false
+	}
+	if viewX < m.mdTooltipX || viewX >= m.mdTooltipX+mdTooltipWidth {
+		return false
+	}
+	if m.mdTooltipTab < len(tabs) {
+		m.openMarkdownPreview(tabs[m.mdTooltipTab])
+		m.mdTooltipTab = -1
+		m.mdTooltipPane = 0
+	}
+	return true
+}
+
+func (m *AppModel) handleEditorPaneBodyClick(ed *editor.Model, viewX, viewY int) (bool, tea.Cmd) {
+	if m.handleEditorBarClick(ed, viewX, viewY) {
+		return true, nil
+	}
+	viewY -= m.editorBarHeight(ed)
+	if handled, cmd := m.handleEditorOverlayClick(ed, viewX, viewY); handled {
 		return true, cmd
 	}
+	return m.handleEditorContentPress(ed, viewX, viewY)
+}
 
-	// When the completion popup is visible, clicks on it select an item
-	// instead of moving the cursor.
-	if m.focusedEditor().HandleCompletionClick(viewX, viewY) {
+func (m *AppModel) handleEditorBarClick(ed *editor.Model, viewX, viewY int) bool {
+	barH := ed.ReplaceBarHeight()
+	if barH > 0 && viewY < barH {
+		ed.HandleReplaceBarClick(viewX, viewY)
+		return true
+	}
+	if barH == 0 {
+		barH = ed.FindBarHeight()
+		if barH > 0 && viewY < barH {
+			ed.HandleFindBarClick(viewX, viewY)
+			return true
+		}
+	}
+	return false
+}
+
+func (m *AppModel) editorBarHeight(ed *editor.Model) int {
+	if barH := ed.ReplaceBarHeight(); barH > 0 {
+		return barH
+	}
+	return ed.FindBarHeight()
+}
+
+func (m *AppModel) handleEditorOverlayClick(ed *editor.Model, viewX, viewY int) (bool, tea.Cmd) {
+	if cmd, handled := ed.HandleHoverClick(viewX, viewY); handled {
+		return true, cmd
+	}
+	if ed.HandleCompletionClick(viewX, viewY) {
 		return true, nil
 	}
+	return false, nil
+}
 
-	m.focusedEditor().ClickAt(viewX, viewY)
+func (m *AppModel) handleEditorContentPress(ed *editor.Model, viewX, viewY int) (bool, tea.Cmd) {
+	ed.ClickAt(viewX, viewY)
 	m.editorMouseDown = true
 	m.editorDragging = false
+	return true, m.scheduleEditorHighlight(ed)
+}
 
-	// Schedule document highlight debounce after click places cursor on a word.
-	line := m.focusedEditor().CursorLine()
-	col := m.focusedEditor().CursorCol()
-	if m.focusedEditor().IsWordCharAtPos(line, col) {
-		m.highlightLine = line
-		m.highlightCol = col
-		m.focusedEditor().ClearHighlightRanges()
-		return true, tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
-			return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
-		})
+func (m *AppModel) scheduleEditorHighlight(ed *editor.Model) tea.Cmd {
+	line := ed.CursorLine()
+	col := ed.CursorCol()
+	if !ed.IsWordCharAtPos(line, col) {
+		ed.ClearHighlightRanges()
+		return nil
 	}
-	m.focusedEditor().ClearHighlightRanges()
-	return true, nil
+	m.highlightLine = line
+	m.highlightCol = col
+	ed.ClearHighlightRanges()
+	return tea.Tick(highlightDebounce, func(_ time.Time) tea.Msg {
+		return msg.LSPDocHighlightTickMsg{Line: line, Col: col}
+	})
 }
 
 // isInsideCodePanel reports whether screen coordinates (x, y) fall within
@@ -12565,86 +13029,15 @@ const highlightDebounce = 100 * time.Millisecond
 // mouse moves to a new word in edit mode. Only triggers on word characters;
 // moving within the same word does not reset the debounce.
 func (m *AppModel) handleEditorMouseHover(mouse tea.MouseMsg) tea.Cmd {
-	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
-		m.dismissAllHover()
-		return nil
-	}
-
-	// Determine whether the mouse is over the preview pane.
-	overPreview := false
-	var viewX, viewY int
-
-	if m.paneTree != nil && !m.paneTree.IsLeaf() {
-		pid, lx, ly, ok := m.paneViewCoords(mouse.X, mouse.Y)
-		if !ok {
-			m.dismissAllHover()
-			return nil
-		}
-		if m.hasPreview() && pid == m.previewPane {
-			overPreview = true
-			viewX, viewY = lx, ly
-			// Account for tab bar height in the preview pane.
-			viewY -= tabbar.Height
-		} else if pid != m.focusedPane {
-			m.dismissAllHover()
-			return nil
-		}
-	} else if m.isInsidePreviewHalf(mouse.X) {
-		overPreview = true
-	}
-
-	if overPreview {
-		return m.handlePreviewMouseHover(mouse, viewX, viewY)
-	}
-
-	// Editor pane hover (original path).
-	viewX, viewY = m.focusedPaneLocalCoords(mouse.X, mouse.Y)
-	if len(m.focusedTabOrder()) > 0 {
-		viewY -= tabbar.Height
-	}
-	viewY -= m.focusedEditor().FindBarHeight()
-
-	// Keep hover stable when the mouse is inside the popup.
-	if m.focusedEditor().HoverActive() && m.focusedEditor().IsInsideHoverPopup(viewX, viewY) {
-		return nil
-	}
-
-	// Keep hover stable when crossing a non-hover overlay (signature/completion).
-	if m.focusedEditor().HoverActive() && m.focusedEditor().IsInsideOverlayPopup(viewX, viewY) {
-		return nil
-	}
-
-	line, col, ok := m.focusedEditor().ViewportToBufferPos(viewX, viewY)
+	target, ok := m.mouseHoverTarget(mouse)
 	if !ok {
 		m.dismissAllHover()
 		return nil
 	}
-
-	if !m.focusedEditor().IsWordCharAtPos(line, col) {
-		m.dismissAllHover()
-		return nil
+	if target.preview {
+		return m.handlePreviewMouseHover(mouse, target.viewX, target.viewY)
 	}
-
-	wordStart, _ := m.focusedEditor().WordBoundsAt(line, col)
-	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart && !m.hoverForPreview {
-		return nil
-	}
-
-	debounce := hoverInitialDebounce
-	if m.focusedEditor().HoverActive() || m.previewPanel.HoverActive() {
-		m.dismissAllHover()
-		debounce = hoverRetriggerDebounce
-	}
-
-	m.hoverMouseLine = line
-	m.hoverMouseCol = col
-	m.hoverMouseWordStart = wordStart
-	m.hoverForPreview = false
-	m.pendingHoverSymbol = ""
-	m.pendingHoverPkgPath = ""
-	return tea.Tick(debounce, func(_ time.Time) tea.Msg {
-		return msg.LSPMouseHoverTickMsg{Line: line, Col: col}
-	})
+	return m.handleFocusedEditorMouseHover(target.viewX, target.viewY)
 }
 
 // handlePreviewMouseHover handles hover detection when the mouse is over
@@ -12656,15 +13049,10 @@ func (m *AppModel) handlePreviewMouseHover(mouse tea.MouseMsg, viewX, viewY int)
 		return nil
 	}
 
-	// In single-pane mode, compute local coords from the code panel.
 	if m.paneTree == nil || m.paneTree.IsLeaf() {
-		vx, vy := m.editorViewCoords(mouse.X, mouse.Y)
-		viewX, viewY = vx, vy
-		// Account for tab bar in single-pane preview.
-		viewY -= tabbar.Height
+		viewX, viewY = m.singlePanePreviewHoverCoords(mouse)
 	}
 
-	// Keep hover stable when the mouse is inside the preview's hover popup.
 	if m.previewPanel.HoverActive() && m.previewPanel.IsInsideHoverPopup(viewX, viewY) {
 		return nil
 	}
@@ -12674,32 +13062,121 @@ func (m *AppModel) handlePreviewMouseHover(mouse tea.MouseMsg, viewX, viewY int)
 		m.dismissAllHover()
 		return nil
 	}
+	return m.schedulePreviewMouseHover(line, col)
+}
 
+type mouseHoverTarget struct {
+	viewX   int
+	viewY   int
+	preview bool
+}
+
+func (m *AppModel) mouseHoverTarget(mouse tea.MouseMsg) (mouseHoverTarget, bool) {
+	if !m.isInsideCodePanel(mouse.X, mouse.Y) {
+		return mouseHoverTarget{}, false
+	}
+	if m.paneTree != nil && !m.paneTree.IsLeaf() {
+		return m.multiPaneMouseHoverTarget(mouse)
+	}
+	if m.isInsidePreviewHalf(mouse.X) {
+		viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+		return mouseHoverTarget{viewX: viewX, viewY: viewY, preview: true}, true
+	}
+	viewX, viewY := m.focusedPaneLocalCoords(mouse.X, mouse.Y)
+	return mouseHoverTarget{viewX: viewX, viewY: viewY}, true
+}
+
+func (m *AppModel) multiPaneMouseHoverTarget(mouse tea.MouseMsg) (mouseHoverTarget, bool) {
+	pid, localX, localY, ok := m.paneViewCoords(mouse.X, mouse.Y)
+	if !ok {
+		return mouseHoverTarget{}, false
+	}
+	if m.hasPreview() && pid == m.previewPane {
+		return mouseHoverTarget{
+			viewX:   localX,
+			viewY:   localY - tabbar.Height,
+			preview: true,
+		}, true
+	}
+	if pid != m.focusedPane {
+		return mouseHoverTarget{}, false
+	}
+	return mouseHoverTarget{viewX: localX, viewY: localY}, true
+}
+
+func (m *AppModel) handleFocusedEditorMouseHover(viewX, viewY int) tea.Cmd {
+	viewY = m.normalizedEditorHoverY(viewY)
+	if m.keepEditorHoverActive(viewX, viewY) {
+		return nil
+	}
+	line, col, ok := m.focusedEditor().ViewportToBufferPos(viewX, viewY)
+	if !ok {
+		m.dismissAllHover()
+		return nil
+	}
+	return m.scheduleEditorMouseHover(line, col)
+}
+
+func (m *AppModel) normalizedEditorHoverY(viewY int) int {
+	if len(m.focusedTabOrder()) > 0 {
+		viewY -= tabbar.Height
+	}
+	return viewY - m.focusedEditor().FindBarHeight()
+}
+
+func (m *AppModel) keepEditorHoverActive(viewX, viewY int) bool {
+	if !m.focusedEditor().HoverActive() {
+		return false
+	}
+	return m.focusedEditor().IsInsideHoverPopup(viewX, viewY) ||
+		m.focusedEditor().IsInsideOverlayPopup(viewX, viewY)
+}
+
+func (m *AppModel) singlePanePreviewHoverCoords(mouse tea.MouseMsg) (int, int) {
+	viewX, viewY := m.editorViewCoords(mouse.X, mouse.Y)
+	return viewX, viewY - tabbar.Height
+}
+
+func (m *AppModel) scheduleEditorMouseHover(line, col int) tea.Cmd {
+	if !m.focusedEditor().IsWordCharAtPos(line, col) {
+		m.dismissAllHover()
+		return nil
+	}
+	wordStart, _ := m.focusedEditor().WordBoundsAt(line, col)
+	return m.scheduleMouseHover(line, col, wordStart, false, m.focusedEditor().HoverActive() || m.previewPanel.HoverActive())
+}
+
+func (m *AppModel) schedulePreviewMouseHover(line, col int) tea.Cmd {
 	if !m.previewPanel.IsWordCharAtPos(line, col) {
 		m.dismissAllHover()
 		return nil
 	}
-
 	wordStart, _ := m.previewPanel.WordBoundsAt(line, col)
-	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart && m.hoverForPreview {
+	return m.scheduleMouseHover(line, col, wordStart, true, m.previewPanel.HoverActive() || m.focusedEditor().HoverActive())
+}
+
+func (m *AppModel) scheduleMouseHover(line, col, wordStart int, forPreview, hoverActive bool) tea.Cmd {
+	if line == m.hoverMouseLine && wordStart == m.hoverMouseWordStart && m.hoverForPreview == forPreview {
 		return nil
 	}
-
 	debounce := hoverInitialDebounce
-	if m.previewPanel.HoverActive() || m.focusedEditor().HoverActive() {
+	if hoverActive {
 		m.dismissAllHover()
 		debounce = hoverRetriggerDebounce
 	}
-
-	m.hoverMouseLine = line
-	m.hoverMouseCol = col
-	m.hoverMouseWordStart = wordStart
-	m.hoverForPreview = true
-	m.pendingHoverSymbol = ""
-	m.pendingHoverPkgPath = ""
+	m.recordMouseHover(line, col, wordStart, forPreview)
 	return tea.Tick(debounce, func(_ time.Time) tea.Msg {
 		return msg.LSPMouseHoverTickMsg{Line: line, Col: col}
 	})
+}
+
+func (m *AppModel) recordMouseHover(line, col, wordStart int, forPreview bool) {
+	m.hoverMouseLine = line
+	m.hoverMouseCol = col
+	m.hoverMouseWordStart = wordStart
+	m.hoverForPreview = forPreview
+	m.pendingHoverSymbol = ""
+	m.pendingHoverPkgPath = ""
 }
 
 // dismissAllHover dismisses both editor and preview hover tooltips and
@@ -13143,6 +13620,9 @@ func (m *AppModel) inputMaxVisualLines() int {
 // The result is further constrained to ensure the main area retains
 // at least 1 row — the input grows upward, never beyond available space.
 func (m *AppModel) inputHeight() int {
+	if m.commandApproval != nil {
+		return m.commandApprovalHeight()
+	}
 	visualLines := m.input.VisualLineCount()
 	maxLines := m.inputMaxVisualLines()
 	lines := clampInt(visualLines, inputMinContentLines, maxLines)
@@ -13152,6 +13632,103 @@ func (m *AppModel) inputHeight() int {
 		return inputMinContentLines + inputBorderSize
 	}
 	return min(h, maxH)
+}
+
+func (m *AppModel) commandApprovalHeight() int {
+	bodyLines := len(m.commandApprovalBodyLines(max(m.width-2, 1)))
+	if bodyLines < 1 {
+		bodyLines = 1
+	}
+	maxH := m.height - statusBarHeight - 1
+	return min(bodyLines+inputBorderSize, max(maxH, inputBorderSize))
+}
+
+func (m *AppModel) renderCommandApprovalView() string {
+	th := m.config.Theme()
+	contentWidth := max(m.width-2, 1)
+	body := strings.Join(m.commandApprovalBodyLines(contentWidth), "\n")
+	if m.focus.Current() == component.FocusInput && th.ActiveBorderRender != nil {
+		return enforceLineCountToHeight(th.ActiveBorderRender(body, contentWidth, max(m.commandApprovalHeight()-inputBorderSize, 1), m.commandApprovalHeight()), m.commandApprovalHeight())
+	}
+	style := th.InputBorder
+	if m.focus.Current() == component.FocusInput {
+		style = th.InputFocused
+	}
+	return enforceLineCountToHeight(style.Width(contentWidth).Render(body), m.commandApprovalHeight())
+}
+
+func (m *AppModel) commandApprovalBodyLines(width int) []string {
+	if m.commandApproval == nil || m.commandApproval.proposal == nil {
+		return []string{""}
+	}
+	proposal := m.commandApproval.proposal
+	pal := m.config.Theme().Palette
+	titleStyle := lipgloss.NewStyle().Foreground(pal.Secondary).Bold(true)
+	commandStyle := lipgloss.NewStyle().Foreground(pal.Foreground)
+	riskStyle := lipgloss.NewStyle().Foreground(pal.Warning)
+	labelStyle := lipgloss.NewStyle().Foreground(pal.Muted)
+
+	lines := []string{
+		titleStyle.Render("Command Approval"),
+		commandStyle.Render(truncatePlainText(proposal.Command, width)),
+		riskStyle.Render(truncatePlainText(proposal.Risk, width)),
+	}
+	if wd := strings.TrimSpace(proposal.WorkingDir); wd != "" {
+		lines = append(lines, labelStyle.Render(truncatePlainText("cwd: "+wd, width)))
+	}
+	if persist := strings.TrimSpace(proposal.PersistLabel); persist != "" {
+		lines = append(lines, labelStyle.Render(truncatePlainText("always applies to: "+persist, width)))
+	}
+	for idx, option := range commandApprovalOptions {
+		lines = append(lines, m.renderCommandApprovalOption(idx, option, width))
+	}
+	return lines
+}
+
+func (m *AppModel) renderCommandApprovalOption(index int, option commandApprovalOption, width int) string {
+	pal := m.config.Theme().Palette
+	style := lipgloss.NewStyle().Foreground(pal.Muted)
+	if m.commandApproval != nil && m.commandApproval.selected == index {
+		style = lipgloss.NewStyle().Foreground(pal.Secondary)
+	}
+	if m.commandApproval != nil && m.commandApproval.activated == index {
+		style = style.Bold(true)
+	}
+	prefix := "  "
+	if m.commandApproval != nil && m.commandApproval.selected == index {
+		prefix = "> "
+	}
+	return style.Render(truncatePlainText(prefix+option.label, width))
+}
+
+func truncatePlainText(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) <= width {
+		return string(runes)
+	}
+	if width == 1 {
+		return string(runes[:1])
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+func enforceLineCountToHeight(s string, n int) string {
+	lines := strings.Split(s, "\n")
+	if len(lines) == n {
+		return s
+	}
+	if len(lines) > n {
+		return strings.Join(lines[:n], "\n")
+	}
+	var b strings.Builder
+	b.WriteString(s)
+	for i := 0; i < n-len(lines); i++ {
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // correctOverflow reduces queueH and inputH so the total frame height
@@ -13173,7 +13750,6 @@ func correctOverflow(mainH, queueH, inputH, termH int) (int, int) {
 }
 
 func (m *AppModel) recalcLayout() {
-	m.resizeQuickActive = false
 	// Reserve space for queue strip, input (dynamic), and status bar.
 	queueH := m.promptQueue.ViewHeight()
 	inputH := m.inputHeight()
@@ -13184,9 +13760,6 @@ func (m *AppModel) recalcLayout() {
 	// exceed m.height. Reduce queue/input to compensate.
 	queueH, inputH = correctOverflow(mainHeight, queueH, inputH, m.height)
 
-	// Capture old chat viewport height before layout changes.
-	oldChatViewH := m.chat.ViewportHeight()
-
 	m.layout.SetSize(m.width, mainHeight)
 
 	// Sync tab order and focus to the current layout mode so collapsed
@@ -13196,12 +13769,6 @@ func (m *AppModel) recalcLayout() {
 	// Center panel: chat. Subtract border so content fits inside renderPanel().
 	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
 	newChatViewH := max(chatH-panelBorderSize, 1)
-
-	// Compensate viewport for input-induced height changes so the top
-	// of the chat stays stable (bottom line is dropped, not the top).
-	if inputH != m.prevInputH && oldChatViewH > 0 {
-		m.chat.CompensateInputGrowth(oldChatViewH, newChatViewH)
-	}
 
 	m.chat.SetSize(max(chatW-panelBorderSize, 1), newChatViewH)
 
@@ -13276,19 +13843,12 @@ func (m *AppModel) handleInputGrowth(newInputH int) {
 	mainHeight := m.height - queueH - newInputH - statusBarHeight
 	mainHeight = max(mainHeight, 1)
 
-	// Capture old chat viewport height.
-	oldChatViewH := m.chat.ViewportHeight()
-
 	// Update layout to get correct chat panel dimensions.
 	m.layout.SetSize(m.width, mainHeight)
 
 	chatW, chatH := m.layout.GetPanelSize(component.FocusChat)
 	newChatViewH := max(chatH-panelBorderSize, 1)
 
-	// Compensate viewport: keep top line stable, drop bottom.
-	if oldChatViewH > 0 {
-		m.chat.CompensateInputGrowth(oldChatViewH, newChatViewH)
-	}
 	m.chat.SetSize(max(chatW-panelBorderSize, 1), newChatViewH)
 
 	// Resize input to new height.
@@ -13393,134 +13953,176 @@ func (m *AppModel) resizeCodePanelForPreview(rightW, rightH int) {
 // syncViewState rebuilds the dual view cycling rings for the current layout
 // mode, updates the focus tab order to match visible panels, and pushes the
 // ring indicator to the status bar. Called on layout recompute and after cycling.
+type viewRingPlan struct {
+	left  []component.FocusID
+	right []component.FocusID
+}
+
+var viewRingPlans = map[layout.LayoutMode]viewRingPlan{
+	layout.FourColumn: {
+		left: []component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusFileTree,
+			component.FocusChat,
+			component.FocusCodeViewer,
+			component.FocusGitPanel,
+			component.FocusCommitTree,
+		},
+	},
+	layout.ThreeColumn: {
+		left: []component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusFileTree,
+			component.FocusGitPanel,
+		},
+		right: []component.FocusID{
+			component.FocusCodeViewer,
+			component.FocusCommitTree,
+		},
+	},
+	layout.TwoColumn: {
+		left: []component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusFileTree,
+			component.FocusGitPanel,
+		},
+		right: []component.FocusID{
+			component.FocusChat,
+			component.FocusCodeViewer,
+			component.FocusCommitTree,
+		},
+	},
+	layout.SingleColumn: {
+		left: []component.FocusID{
+			component.FocusSessionPanel,
+			component.FocusChat,
+			component.FocusFileTree,
+			component.FocusCodeViewer,
+			component.FocusGitPanel,
+			component.FocusCommitTree,
+		},
+	},
+}
+
 func (m *AppModel) syncViewState() {
 	mode := m.layout.Mode()
-	wasEmpty := m.leftRing.empty() && m.rightRing.empty()
+	wasEmpty := m.viewRingsEmpty()
+	m.resetViewRings(mode)
+	m.syncViewModeRingSelection()
+	m.applyViewRingOverrides()
+	m.showCollapseHintIfNeeded(wasEmpty)
+	m.updateViewFocusOrder(mode)
+}
 
-	// Rebuild rings per mode (see plan table).
-	// In git mode, FourColumn gets a ring so Alt+V can cycle between panels.
-	switch mode {
-	case layout.FourColumn:
-		m.leftRing.reset([]component.FocusID{
-			component.FocusSessionPanel,
-			component.FocusFileTree,
-			component.FocusChat,
-			component.FocusCodeViewer,
-			component.FocusGitPanel,
-			component.FocusCommitTree,
-		})
-		m.rightRing.reset(nil)
-	case layout.ThreeColumn:
-		m.leftRing.reset([]component.FocusID{
-			component.FocusSessionPanel,
-			component.FocusFileTree,
-			component.FocusGitPanel,
-		})
-		m.rightRing.reset([]component.FocusID{
-			component.FocusCodeViewer,
-			component.FocusCommitTree,
-		})
-	case layout.TwoColumn:
-		m.leftRing.reset([]component.FocusID{
-			component.FocusSessionPanel,
-			component.FocusFileTree,
-			component.FocusGitPanel,
-		})
-		m.rightRing.reset([]component.FocusID{
-			component.FocusChat,
-			component.FocusCodeViewer,
-			component.FocusCommitTree,
-		})
-	default:
-		m.leftRing.reset([]component.FocusID{
-			component.FocusSessionPanel,
-			component.FocusChat,
-			component.FocusFileTree,
-			component.FocusCodeViewer,
-			component.FocusGitPanel,
-			component.FocusCommitTree,
-		})
-		m.rightRing.reset(nil)
+func (m *AppModel) viewRingsEmpty() bool {
+	return m.leftRing.empty() && m.rightRing.empty()
+}
+
+func (m *AppModel) resetViewRings(mode layout.LayoutMode) {
+	plan := viewRingPlanFor(mode)
+	m.leftRing.reset(cloneFocusIDs(plan.left))
+	m.rightRing.reset(cloneFocusIDs(plan.right))
+}
+
+func viewRingPlanFor(mode layout.LayoutMode) viewRingPlan {
+	plan, ok := viewRingPlans[mode]
+	if ok {
+		return plan
 	}
+	return viewRingPlans[layout.SingleColumn]
+}
 
-	// When chat mode is active, ensure Chat is visible in the right
-	// ring. In ThreeColumn+ Chat has a dedicated column and is absent
-	// from the right ring, so setTo is a no-op. In TwoColumn, Chat
-	// shares the right ring and must be selected — otherwise a
-	// ThreeColumn→TwoColumn transition preserves the previous panel
-	// (CodeViewer) and the chat panel disappears.
-	if m.viewMode == ViewChat {
-		if !m.rightRing.empty() {
-			m.rightRing.setTo(component.FocusChat)
-		}
+func cloneFocusIDs(ids []component.FocusID) []component.FocusID {
+	return append([]component.FocusID(nil), ids...)
+}
+
+func (m *AppModel) syncViewModeRingSelection() {
+	switch m.viewMode {
+	case ViewChat:
+		m.syncChatRingSelection()
+	case ViewEdit:
+		m.syncEditRingSelection()
+	case ViewGit:
+		m.syncGitRingSelection()
 	}
+}
 
-	// When edit mode is active, ensure CodeViewer is visible in the
-	// ring that contains it. For the left ring, prefer CodeViewer
-	// (SingleColumn) or fall back to FileTree for navigation.
-	if m.viewMode == ViewEdit {
-		if !m.rightRing.empty() {
-			m.rightRing.setTo(component.FocusCodeViewer)
-		}
-		if !m.leftRing.empty() {
-			if !m.leftRing.setTo(component.FocusCodeViewer) {
-				m.leftRing.setTo(component.FocusFileTree)
-			}
-		}
+func (m *AppModel) syncChatRingSelection() {
+	m.positionRing(&m.rightRing, component.FocusChat)
+}
+
+func (m *AppModel) syncEditRingSelection() {
+	m.positionRing(&m.rightRing, component.FocusCodeViewer)
+	if m.positionRing(&m.leftRing, component.FocusCodeViewer) {
+		return
 	}
+	m.positionRing(&m.leftRing, component.FocusFileTree)
+}
 
-	// When git mode is active, position rings on git panels so the
-	// ring hint shows "Git" and "Tree" instead of chat-mode panels.
-	// Skip if the ring is already on a git panel — this allows
-	// single-column cycling between GitPanel and CommitTree.
-	if m.viewMode == ViewGit {
-		if !m.leftRing.empty() && !isGitPanel(m.leftRing.current()) {
-			m.leftRing.setTo(component.FocusGitPanel)
-		}
-		if !m.rightRing.empty() && !isGitPanel(m.rightRing.current()) {
-			m.rightRing.setTo(component.FocusCommitTree)
-		}
+func (m *AppModel) syncGitRingSelection() {
+	m.positionRingOnGit(&m.leftRing, component.FocusGitPanel)
+	m.positionRingOnGit(&m.rightRing, component.FocusCommitTree)
+}
+
+func (m *AppModel) positionRing(r *viewRing, id component.FocusID) bool {
+	if r.empty() {
+		return false
 	}
+	return r.setTo(id)
+}
 
-	// When the diff view is active, replace commit tree and git panel with
-	// diff-specific panels so Alt+V cycling and the ring hint show them.
-	if m.diffViewActive {
-		replaceInRing(&m.leftRing, component.FocusCommitTree, component.FocusDiffView)
-		replaceInRing(&m.rightRing, component.FocusCommitTree, component.FocusDiffView)
-		replaceInRing(&m.leftRing, component.FocusGitPanel, component.FocusDiffFileList)
-		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusDiffFileList)
+func (m *AppModel) positionRingOnGit(r *viewRing, id component.FocusID) {
+	if r.empty() || isGitPanel(r.current()) {
+		return
 	}
+	r.setTo(id)
+}
 
-	// When the merge diff view is active, replace commit tree and git panel
-	// with merge-diff-specific panels.
-	if m.mergeDiffViewActive {
-		replaceInRing(&m.leftRing, component.FocusCommitTree, component.FocusMergeDiffView)
-		replaceInRing(&m.rightRing, component.FocusCommitTree, component.FocusMergeDiffView)
-		replaceInRing(&m.leftRing, component.FocusGitPanel, component.FocusMergeDiffFileList)
-		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusMergeDiffFileList)
+func (m *AppModel) applyViewRingOverrides() {
+	m.applyDiffRingOverrides()
+	m.applyMergeDiffRingOverrides()
+	m.applyConflictRingOverrides()
+}
+
+func (m *AppModel) applyDiffRingOverrides() {
+	if !m.diffViewActive {
+		return
 	}
+	m.replaceCommitAndGitPanels(component.FocusDiffView, component.FocusDiffFileList)
+}
 
-	// When the conflict view is active, replace commit tree and git panel.
-	if m.conflictViewActive {
-		replaceInRing(&m.leftRing, component.FocusCommitTree, component.FocusConflictView)
-		replaceInRing(&m.rightRing, component.FocusCommitTree, component.FocusConflictView)
-		replaceInRing(&m.leftRing, component.FocusGitPanel, component.FocusConflictFileList)
-		replaceInRing(&m.rightRing, component.FocusGitPanel, component.FocusConflictFileList)
+func (m *AppModel) applyMergeDiffRingOverrides() {
+	if !m.mergeDiffViewActive {
+		return
 	}
+	m.replaceCommitAndGitPanels(component.FocusMergeDiffView, component.FocusMergeDiffFileList)
+}
 
-	// First-collapse flash: show once when panels first collapse.
-	nowActive := !m.leftRing.empty() || !m.rightRing.empty()
-	if wasEmpty && nowActive && !m.collapseHintShown {
-		m.statusBar.SetFlash("Panel collapsed \u2014 Alt+V \u2190/\u2192 to cycle views")
-		m.collapseHintShown = true
+func (m *AppModel) applyConflictRingOverrides() {
+	if !m.conflictViewActive {
+		return
 	}
+	m.replaceCommitAndGitPanels(component.FocusConflictView, component.FocusConflictFileList)
+}
 
-	// Update tab order based on mode + which panels the rings are showing.
-	order := m.tabOrderForView(mode)
-	m.focus.SetTabOrder(order)
+func (m *AppModel) replaceCommitAndGitPanels(commitID, fileListID component.FocusID) {
+	replaceInRing(&m.leftRing, component.FocusCommitTree, commitID)
+	replaceInRing(&m.rightRing, component.FocusCommitTree, commitID)
+	replaceInRing(&m.leftRing, component.FocusGitPanel, fileListID)
+	replaceInRing(&m.rightRing, component.FocusGitPanel, fileListID)
+}
+
+func (m *AppModel) showCollapseHintIfNeeded(wasEmpty bool) {
+	if !wasEmpty || m.viewRingsEmpty() || m.collapseHintShown {
+		return
+	}
+	m.statusBar.SetFlash("Panel collapsed — Alt+V ←/→ to cycle views")
+	m.collapseHintShown = true
+}
+
+func (m *AppModel) updateViewFocusOrder(mode layout.LayoutMode) {
+	m.focus.SetTabOrder(m.tabOrderForView(mode))
 	m.syncFocusState()
-
-	// Push ring indicator to the status bar.
 	m.statusBar.SetViewRingHint(m.buildRingHint())
 }
 
@@ -13577,85 +14179,89 @@ func (m *AppModel) tabOrderForView(mode layout.LayoutMode) []component.FocusID {
 // FocusCodeViewer. Preview-only mode (no editor tabs) skips the tab order
 // since Tab cannot meaningfully target a read-only preview.
 func (m *AppModel) appendCodePanelFocus(order []component.FocusID) []component.FocusID {
-	// Git mode: replace FileTree/CodeViewer with git-specific panels.
-	// When the diff view is active, use diff-specific IDs instead so
-	// that SetTabOrder preserves focus on diff sub-panes (matching the
-	// edit-mode pattern where the focused editor pane ID is in the order).
-	if m.viewMode == ViewGit {
-		for i, id := range order {
-			switch id {
-			case component.FocusFileTree:
-				if m.conflictViewActive {
-					order[i] = component.FocusConflictFileList
-				} else if m.mergeDiffViewActive {
-					order[i] = component.FocusMergeDiffFileList
-				} else if m.diffViewActive {
-					order[i] = component.FocusDiffFileList
-				} else {
-					order[i] = component.FocusGitPanel
-				}
-			case component.FocusCodeViewer, component.FocusDiffView, component.FocusMergeDiffView, component.FocusConflictView:
-				if m.conflictViewActive {
-					order[i] = component.FocusConflictView
-				} else if m.mergeDiffViewActive && m.mergeDiffView != nil {
-					order[i] = pane.PaneFocusID(m.mergeDiffView.FocusedPane())
-				} else if m.diffViewActive && m.diffView != nil {
-					order[i] = pane.PaneFocusID(m.diffView.FocusedPane())
-				} else {
-					order[i] = component.FocusCommitTree
-				}
-			}
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			fid := pane.PaneFocusID(m.mergeDiffView.FocusedPane())
-			if !slices.Contains(order, fid) {
-				order = append(order, fid)
-			}
-		} else if m.diffViewActive && m.diffView != nil {
-			fid := pane.PaneFocusID(m.diffView.FocusedPane())
-			if !slices.Contains(order, fid) {
-				order = append(order, fid)
-			}
-		} else {
-			if !slices.Contains(order, component.FocusCommitTree) {
-				order = append(order, component.FocusCommitTree)
-			}
-		}
+	switch m.viewMode {
+	case ViewGit:
+		return m.appendGitCodePanelFocus(order)
+	case ViewEdit:
+		return m.appendEditCodePanelFocus(order)
+	default:
+		return appendFocusIfMissing(order, component.FocusCodeViewer)
+	}
+}
+
+func (m *AppModel) appendGitCodePanelFocus(order []component.FocusID) []component.FocusID {
+	for i, id := range order {
+		order[i] = m.remapGitCodePanelFocus(id)
+	}
+	return appendFocusIfMissing(order, m.gitContentFocus())
+}
+
+func (m *AppModel) remapGitCodePanelFocus(id component.FocusID) component.FocusID {
+	switch id {
+	case component.FocusFileTree:
+		return m.gitFileListFocus()
+	case component.FocusCodeViewer, component.FocusDiffView, component.FocusMergeDiffView, component.FocusConflictView:
+		return m.gitContentFocus()
+	default:
+		return id
+	}
+}
+
+func (m *AppModel) gitFileListFocus() component.FocusID {
+	switch {
+	case m.conflictViewActive:
+		return component.FocusConflictFileList
+	case m.mergeDiffViewActive:
+		return component.FocusMergeDiffFileList
+	case m.diffViewActive:
+		return component.FocusDiffFileList
+	default:
+		return component.FocusGitPanel
+	}
+}
+
+func (m *AppModel) gitContentFocus() component.FocusID {
+	switch {
+	case m.conflictViewActive:
+		return component.FocusConflictView
+	case m.mergeDiffViewActive && m.mergeDiffView != nil:
+		return pane.PaneFocusID(m.mergeDiffView.FocusedPane())
+	case m.diffViewActive && m.diffView != nil:
+		return pane.PaneFocusID(m.diffView.FocusedPane())
+	default:
+		return component.FocusCommitTree
+	}
+}
+
+func (m *AppModel) appendEditCodePanelFocus(order []component.FocusID) []component.FocusID {
+	if m.hasPreview() && len(m.focusedTabOrder()) == 0 {
 		return order
 	}
-	if m.viewMode == ViewEdit {
-		// Full-preview mode: nothing to tab to in the code column.
-		if m.hasPreview() && len(m.focusedTabOrder()) == 0 {
-			return order
-		}
-		// Full markdown preview mode: tab to the mdPreview pane.
-		if m.isFullMdPreview() {
-			fid := pane.PaneFocusID(m.mdPreviewPane)
-			for i, id := range order {
-				if id == component.FocusCodeViewer {
-					order[i] = fid
-					return order
-				}
-			}
-			return append(order, fid)
-		}
-		fid := pane.PaneFocusID(m.focusedPane)
-		// Replace any FocusCodeViewer entry injected by the ring.
-		for i, id := range order {
-			if id == component.FocusCodeViewer {
-				order[i] = fid
-				return order
-			}
-		}
-		return append(order, fid)
+	return m.replaceOrAppendCodeFocus(order, m.editCodePanelFocus())
+}
+
+func (m *AppModel) editCodePanelFocus() component.FocusID {
+	if m.isFullMdPreview() {
+		return pane.PaneFocusID(m.mdPreviewPane)
 	}
-	// Non-edit mode: use FocusCodeViewer.
-	for _, id := range order {
+	return pane.PaneFocusID(m.focusedPane)
+}
+
+func (m *AppModel) replaceOrAppendCodeFocus(order []component.FocusID, fid component.FocusID) []component.FocusID {
+	for i, id := range order {
 		if id == component.FocusCodeViewer {
+			order[i] = fid
 			return order
 		}
 	}
-	return append(order, component.FocusCodeViewer)
+	return append(order, fid)
+}
+
+func appendFocusIfMissing(order []component.FocusID, fid component.FocusID) []component.FocusID {
+	if slices.Contains(order, fid) {
+		return order
+	}
+	return append(order, fid)
 }
 
 // panelDisplayNames maps panel IDs to short labels for the status bar ring.
@@ -14097,12 +14703,19 @@ func (m *AppModel) renderDirtySlots() {
 	}
 	if m.comp.IsDirty(compositor.SlotInput) {
 		m.comp.SetSlotLines(compositor.SlotInput,
-			compositor.SplitLines(m.input.View(m.cursorVisible)))
+			compositor.SplitLines(m.inputPanelView()))
 	}
 	if m.comp.IsDirty(compositor.SlotStatus) {
 		m.comp.SetSlotLines(compositor.SlotStatus,
 			compositor.SplitLines(m.statusBar.View()))
 	}
+}
+
+func (m *AppModel) inputPanelView() string {
+	if m.commandApproval == nil {
+		return m.input.View(m.cursorVisible)
+	}
+	return m.renderCommandApprovalView()
 }
 
 func (m *AppModel) renderCacheableSlot(id compositor.SlotID, th *theme.Theme) string {
@@ -14486,38 +15099,54 @@ func (m *AppModel) renderSingleColumnDefaultSlot(active component.FocusID, th *t
 // Session gets the composite left panel with border; FileTree and GitPanel
 // get their respective panel renderers.
 func (m *AppModel) renderLeftSlot(id component.FocusID, th *theme.Theme) string {
+	if renderer := m.activeLeftSlotRenderer(id); renderer != nil {
+		return renderer(th)
+	}
 	switch id {
 	case component.FocusFileTree:
-		if m.conflictViewActive && m.conflictView != nil {
-			return m.renderConflictFileListBordered(th)
-		}
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			return m.renderMergeDiffFileListBordered(th)
-		}
-		if m.diffViewActive && m.diffView != nil {
-			return m.renderDiffFileListBordered(th)
-		}
 		return m.renderPanel(m.fileTree.View(m.cursorVisible), component.FocusFileTree, th)
 	case component.FocusGitPanel:
 		return m.renderGitPanelBordered(th)
-	case component.FocusConflictFileList:
-		if m.conflictViewActive && m.conflictView != nil {
-			return m.renderConflictFileListBordered(th)
-		}
-		return m.renderLeftPanelBordered(th)
-	case component.FocusMergeDiffFileList:
-		if m.mergeDiffViewActive && m.mergeDiffView != nil {
-			return m.renderMergeDiffFileListBordered(th)
-		}
-		return m.renderLeftPanelBordered(th)
-	case component.FocusDiffFileList:
-		if m.diffViewActive && m.diffView != nil {
-			return m.renderDiffFileListBordered(th)
-		}
-		return m.renderLeftPanelBordered(th)
 	default:
 		return m.renderLeftPanelBordered(th)
 	}
+}
+
+type themeRenderer func(*theme.Theme) string
+
+func (m *AppModel) activeLeftSlotRenderer(id component.FocusID) themeRenderer {
+	switch id {
+	case component.FocusFileTree:
+		return m.activeSidebarRenderer()
+	case component.FocusConflictFileList:
+		return m.conditionalLeftSlotRenderer(m.conflictViewActive && m.conflictView != nil, m.renderConflictFileListBordered)
+	case component.FocusMergeDiffFileList:
+		return m.conditionalLeftSlotRenderer(m.mergeDiffViewActive && m.mergeDiffView != nil, m.renderMergeDiffFileListBordered)
+	case component.FocusDiffFileList:
+		return m.conditionalLeftSlotRenderer(m.diffViewActive && m.diffView != nil, m.renderDiffFileListBordered)
+	default:
+		return nil
+	}
+}
+
+func (m *AppModel) activeSidebarRenderer() themeRenderer {
+	switch {
+	case m.conflictViewActive && m.conflictView != nil:
+		return m.renderConflictFileListBordered
+	case m.mergeDiffViewActive && m.mergeDiffView != nil:
+		return m.renderMergeDiffFileListBordered
+	case m.diffViewActive && m.diffView != nil:
+		return m.renderDiffFileListBordered
+	default:
+		return nil
+	}
+}
+
+func (m *AppModel) conditionalLeftSlotRenderer(active bool, renderer themeRenderer) themeRenderer {
+	if active {
+		return renderer
+	}
+	return m.renderLeftPanelBordered
 }
 
 // panelContent returns the raw view content for a swappable panel.
@@ -14821,79 +15450,96 @@ func (m *AppModel) renderPanel(content string, id component.FocusID, th *theme.T
 
 func (m *AppModel) syncFocusState() {
 	current := m.focus.Current()
+	m.syncFocusedEditorPane(current)
+	m.syncCoreFocusState(current)
+	m.syncPaneEditorFocusState(current)
+	m.syncPreviewPanelFocus(current)
+	m.syncGitPanelFocus(current)
+	m.syncDiffViewFocus(current)
+	m.syncMergeDiffViewFocus(current)
+	m.syncConflictViewFocus(current)
+	m.syncPlanViewFocus(current)
+	m.syncEditorWarpLines()
+	m.syncPreviewModeDisplay()
+}
 
-	// Track which editor pane has focus. When focus moves to a different
-	// editor pane, update focusedPane so all helpers route correctly.
-	// Skip when diff view or merge diff view is active — their panes share
-	// the same PaneID namespace (starting from 1) and would falsely match
-	// editor entries.
-	if pane.IsPaneFocus(current) && !m.diffViewActive && !m.mergeDiffViewActive {
-		pid := pane.PaneIDFromFocus(current)
-		if _, ok := m.paneEditors[pid]; ok {
-			m.focusedPane = pid
-		}
+func (m *AppModel) syncFocusedEditorPane(current component.FocusID) {
+	if !pane.IsPaneFocus(current) || m.diffViewActive || m.mergeDiffViewActive {
+		return
 	}
+	pid := pane.PaneIDFromFocus(current)
+	if _, ok := m.paneEditors[pid]; ok {
+		m.focusedPane = pid
+	}
+}
 
+func (m *AppModel) syncCoreFocusState(current component.FocusID) {
 	m.chat.SetFocused(current == component.FocusChat)
 	m.input.SetFocused(current == component.FocusInput)
 	m.sessionPanel.SetFocused(current == component.FocusSessionPanel)
 	m.agentPanel.SetFocused(current == component.FocusAgentPanel)
 	m.codePanel.SetFocused(current == component.FocusCodeViewer && m.viewMode != ViewEdit && !m.hasPreview())
+	m.fileTree.SetFocused(current == component.FocusFileTree)
+}
+
+func (m *AppModel) syncPaneEditorFocusState(current component.FocusID) {
 	for id, ps := range m.paneEditors {
-		// When diff/merge diff view is active, pane IDs overlap with editor
-		// pane IDs (both start from 1). Force all editors unfocused to prevent
-		// false matches — focus is handled by the respective view block below.
 		focused := current == pane.PaneFocusID(id) && !m.diffViewActive && !m.mergeDiffViewActive
 		ps.editor.SetFocused(focused)
 		if !focused {
 			ps.editor.DismissAllOverlays()
 		}
 	}
+}
+
+func (m *AppModel) syncPreviewPanelFocus(current component.FocusID) {
 	m.previewPanel.SetFocused(m.isPreviewFocused())
 	m.mdPreviewPanel.SetFocused(m.mdPreviewPane != 0 && current == pane.PaneFocusID(m.mdPreviewPane))
-	m.fileTree.SetFocused(current == component.FocusFileTree)
+}
 
-	// Git mode panels.
-	if m.gitPanel != nil {
-		m.gitPanel.SetFocused(current == component.FocusGitPanel)
-		m.commitTree.SetFocused(current == component.FocusCommitTree)
+func (m *AppModel) syncGitPanelFocus(current component.FocusID) {
+	if m.gitPanel == nil {
+		return
 	}
+	m.gitPanel.SetFocused(current == component.FocusGitPanel)
+	m.commitTree.SetFocused(current == component.FocusCommitTree)
+}
 
-	// Diff view panels — mirrors the editor pane loop above: syncFocusState
-	// is the single source of truth for diff focus, just as it is for editors.
-	if m.diffViewActive && m.diffView != nil {
-		if pane.IsPaneFocus(current) {
-			m.diffView.SetFocusedPane(pane.PaneIDFromFocus(current))
-		}
-		m.diffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusDiffView)
-		m.diffView.SetFileListFocused(current == component.FocusDiffFileList)
+func (m *AppModel) syncDiffViewFocus(current component.FocusID) {
+	if !m.diffViewActive || m.diffView == nil {
+		return
 	}
-
-	// Merge diff view panels — same pattern as diff view above.
-	if m.mergeDiffViewActive && m.mergeDiffView != nil {
-		if pane.IsPaneFocus(current) {
-			m.mergeDiffView.SetFocusedPane(pane.PaneIDFromFocus(current))
-		}
-		m.mergeDiffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusMergeDiffView)
-		m.mergeDiffView.SetFileListFocused(current == component.FocusMergeDiffFileList)
+	if pane.IsPaneFocus(current) {
+		m.diffView.SetFocusedPane(pane.PaneIDFromFocus(current))
 	}
+	m.diffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusDiffView)
+	m.diffView.SetFileListFocused(current == component.FocusDiffFileList)
+}
 
-	// Conflict view panels.
-	if m.conflictViewActive && m.conflictView != nil {
-		m.conflictView.SetFocused(current == component.FocusConflictView)
-		m.conflictView.SetFileListFocused(current == component.FocusConflictFileList)
+func (m *AppModel) syncMergeDiffViewFocus(current component.FocusID) {
+	if !m.mergeDiffViewActive || m.mergeDiffView == nil {
+		return
 	}
-
-	// Plan viewer panel.
-	if m.planView != nil {
-		m.planView.SetFocused(current == component.FocusPlanView)
+	if pane.IsPaneFocus(current) {
+		m.mergeDiffView.SetFocusedPane(pane.PaneIDFromFocus(current))
 	}
+	m.mergeDiffView.SetFocused(pane.IsPaneFocus(current) || current == component.FocusMergeDiffView)
+	m.mergeDiffView.SetFileListFocused(current == component.FocusMergeDiffFileList)
+}
 
-	// Sync warp line display for the newly focused editor.
-	m.syncEditorWarpLines()
+func (m *AppModel) syncConflictViewFocus(current component.FocusID) {
+	if !m.conflictViewActive || m.conflictView == nil {
+		return
+	}
+	m.conflictView.SetFocused(current == component.FocusConflictView)
+	m.conflictView.SetFileListFocused(current == component.FocusConflictFileList)
+}
 
-	// Override the editor status line mode when preview is focused.
-	m.syncPreviewModeDisplay()
+func (m *AppModel) syncPlanViewFocus(current component.FocusID) {
+	if m.planView == nil {
+		return
+	}
+	m.planView.SetFocused(current == component.FocusPlanView)
 }
 
 // syncPreviewModeDisplay sets the editor status line to PREVIEW mode when
@@ -14945,82 +15591,119 @@ func keyToDirection(key string) (layout.Direction, bool) {
 // included. Sub-panels (e.g. Sessions+Agents, Preview+Editor) are encoded
 // within their parent PanelGroup's sub-grid.
 func (m *AppModel) buildPanelGrid() [][]layout.PanelGroup {
-	// gitResolve translates slot-based focus IDs to git-panel IDs when
-	// git mode is active, so spatial navigation finds the correct panels.
-	gitResolve := func(id component.FocusID) component.FocusID {
-		if m.viewMode != ViewGit {
-			return id
-		}
-		switch id {
-		case component.FocusFileTree:
-			if m.mergeDiffViewActive {
-				return component.FocusMergeDiffFileList
-			}
-			if m.diffViewActive {
-				return component.FocusDiffFileList
-			}
-			return component.FocusGitPanel
-		case component.FocusCodeViewer:
-			return component.FocusCommitTree
-		}
-		return id
+	return [][]layout.PanelGroup{
+		m.buildTopPanelGrid(),
+		{m.panelGroup(component.FocusInput)},
 	}
+}
 
-	pg := func(id component.FocusID) layout.PanelGroup {
-		return layout.PanelGroup{SubPanels: [][]component.FocusID{{gitResolve(id)}}}
-	}
-
-	leftSubs := func() layout.PanelGroup {
-		return layout.PanelGroup{SubPanels: [][]component.FocusID{
-			{component.FocusSessionPanel},
-			{component.FocusAgentPanel},
-		}}
-	}
-
-	var top []layout.PanelGroup
-
+func (m *AppModel) buildTopPanelGrid() []layout.PanelGroup {
 	switch m.layout.Mode() {
 	case layout.FourColumn:
-		top = []layout.PanelGroup{
-			leftSubs(),
-			pg(component.FocusFileTree),
-			pg(component.FocusChat),
-			m.codePanelGroup(),
-		}
+		return m.buildFourColumnPanelGrid()
 	case layout.ThreeColumn:
-		left := m.leftRing.current()
-		if left == component.FocusSessionPanel {
-			top = append(top, leftSubs())
-		} else {
-			top = append(top, pg(left))
-		}
-		top = append(top, pg(component.FocusChat), m.codePanelGroup())
+		return m.buildThreeColumnPanelGrid()
 	case layout.TwoColumn:
-		left := m.leftRing.current()
-		right := m.rightRing.current()
-		if left == component.FocusSessionPanel {
-			top = append(top, leftSubs())
-		} else {
-			top = append(top, pg(left))
-		}
-		if right == component.FocusCodeViewer || right == component.FocusDiffView || right == component.FocusMergeDiffView {
-			top = append(top, m.codePanelGroup())
-		} else {
-			top = append(top, pg(right))
-		}
-	default: // SingleColumn
-		active := m.leftRing.current()
-		switch {
-		case active == component.FocusSessionPanel:
-			top = append(top, leftSubs())
-		case active == component.FocusCodeViewer || active == component.FocusDiffView || active == component.FocusMergeDiffView:
-			top = append(top, m.codePanelGroup())
-		default:
-			top = append(top, pg(active))
-		}
+		return m.buildTwoColumnPanelGrid()
+	default:
+		return m.buildSingleColumnPanelGrid()
 	}
+}
 
-	return [][]layout.PanelGroup{top, {pg(component.FocusInput)}}
+func (m *AppModel) buildFourColumnPanelGrid() []layout.PanelGroup {
+	return []layout.PanelGroup{
+		m.leftSubPanelGroup(),
+		m.panelGroup(component.FocusFileTree),
+		m.panelGroup(component.FocusChat),
+		m.codePanelGroup(),
+	}
+}
+
+func (m *AppModel) buildThreeColumnPanelGrid() []layout.PanelGroup {
+	return []layout.PanelGroup{
+		m.leftColumnPanelGroup(m.leftRing.current()),
+		m.panelGroup(component.FocusChat),
+		m.codePanelGroup(),
+	}
+}
+
+func (m *AppModel) buildTwoColumnPanelGrid() []layout.PanelGroup {
+	return []layout.PanelGroup{
+		m.leftColumnPanelGroup(m.leftRing.current()),
+		m.rightColumnPanelGroup(m.rightRing.current()),
+	}
+}
+
+func (m *AppModel) buildSingleColumnPanelGrid() []layout.PanelGroup {
+	return []layout.PanelGroup{m.singleColumnPanelGroup(m.leftRing.current())}
+}
+
+func (m *AppModel) panelGroup(id component.FocusID) layout.PanelGroup {
+	return layout.PanelGroup{SubPanels: [][]component.FocusID{{m.spatialPanelID(id)}}}
+}
+
+func (m *AppModel) leftSubPanelGroup() layout.PanelGroup {
+	return layout.PanelGroup{SubPanels: [][]component.FocusID{
+		{component.FocusSessionPanel},
+		{component.FocusAgentPanel},
+	}}
+}
+
+func (m *AppModel) leftColumnPanelGroup(id component.FocusID) layout.PanelGroup {
+	if id == component.FocusSessionPanel {
+		return m.leftSubPanelGroup()
+	}
+	return m.panelGroup(id)
+}
+
+func (m *AppModel) rightColumnPanelGroup(id component.FocusID) layout.PanelGroup {
+	if m.isCodeColumnFocusID(id) {
+		return m.codePanelGroup()
+	}
+	return m.panelGroup(id)
+}
+
+func (m *AppModel) singleColumnPanelGroup(id component.FocusID) layout.PanelGroup {
+	if id == component.FocusSessionPanel {
+		return m.leftSubPanelGroup()
+	}
+	if m.isCodeColumnFocusID(id) {
+		return m.codePanelGroup()
+	}
+	return m.panelGroup(id)
+}
+
+func (m *AppModel) spatialPanelID(id component.FocusID) component.FocusID {
+	if m.viewMode != ViewGit {
+		return id
+	}
+	switch id {
+	case component.FocusFileTree:
+		return m.gitSpatialSidebarID()
+	case component.FocusCodeViewer:
+		return component.FocusCommitTree
+	default:
+		return id
+	}
+}
+
+func (m *AppModel) gitSpatialSidebarID() component.FocusID {
+	if m.mergeDiffViewActive {
+		return component.FocusMergeDiffFileList
+	}
+	if m.diffViewActive {
+		return component.FocusDiffFileList
+	}
+	return component.FocusGitPanel
+}
+
+func (m *AppModel) isCodeColumnFocusID(id component.FocusID) bool {
+	switch id {
+	case component.FocusCodeViewer, component.FocusDiffView, component.FocusMergeDiffView:
+		return true
+	default:
+		return false
+	}
 }
 
 // codePanelGroup returns the PanelGroup for the code column, with sub-panels
@@ -15336,20 +16019,81 @@ func (m *AppModel) needsFastTick() bool {
 
 // needsActiveDecorTick reports whether high-frequency decor effects are active.
 func (m *AppModel) needsActiveDecorTick() bool {
-	now := time.Now()
-	return (m.chat != nil && m.chat.HasActiveAnimation()) ||
-		(m.statusBar != nil && m.statusBar.IsAnimating()) ||
-		now.Before(m.tabArrowFlashLeftUntil) ||
-		now.Before(m.tabArrowFlashRightUntil) ||
-		(m.commitTree != nil && m.commitTree.NeedsDecorTick()) ||
-		(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick()) ||
-		(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick()) ||
-		(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick()) ||
-		(m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick()) ||
-		(m.planView != nil && m.planView.NeedsDecorTick()) ||
-		(!m.promptQueue.IsEmpty() && !m.promptQueue.IsPaused()) ||
-		(m.agentPanel != nil && m.agentPanel.NeedsHighFrequencyDecorTick()) ||
-		(m.currentFocusGradient() != nil && m.hasActiveAgent())
+	return m.activeDecorTickMask(time.Now()) != 0
+}
+
+func (m *AppModel) activeDecorTickMask(now time.Time) uint16 {
+	return m.chromeDecorTickMask() |
+		m.tabArrowDecorTickMask(now) |
+		m.commitTreeDecorTickMask() |
+		m.gitDecorTickMask() |
+		m.diffDecorTickMask() |
+		m.mergeDiffDecorTickMask() |
+		m.conflictDecorTickMask() |
+		m.planDecorTickMask() |
+		m.queueDecorTickMask() |
+		m.agentDecorTickMask() |
+		m.focusGradientDecorTickMask()
+}
+
+func (m *AppModel) chromeDecorTickMask() uint16 {
+	return boolMask(m.chatActiveAnimation()) | boolMask(m.statusBarAnimating())
+}
+
+func (m *AppModel) chatActiveAnimation() bool {
+	return m.chat != nil && m.chat.HasActiveAnimation()
+}
+
+func (m *AppModel) statusBarAnimating() bool {
+	return m.statusBar != nil && m.statusBar.IsAnimating()
+}
+
+func (m *AppModel) tabArrowDecorTickMask(now time.Time) uint16 {
+	return boolMask(now.Before(m.tabArrowFlashLeftUntil)) |
+		boolMask(now.Before(m.tabArrowFlashRightUntil))
+}
+
+func (m *AppModel) commitTreeDecorTickMask() uint16 {
+	return boolMask(m.commitTree != nil && m.commitTree.NeedsDecorTick())
+}
+
+func (m *AppModel) gitDecorTickMask() uint16 {
+	return boolMask(m.viewMode == ViewGit && m.gitPanel != nil && m.gitPanel.NeedsDecorTick())
+}
+
+func (m *AppModel) diffDecorTickMask() uint16 {
+	return boolMask(m.diffViewActive && m.diffView != nil && m.diffView.NeedsDecorTick())
+}
+
+func (m *AppModel) mergeDiffDecorTickMask() uint16 {
+	return boolMask(m.mergeDiffViewActive && m.mergeDiffView != nil && m.mergeDiffView.NeedsDecorTick())
+}
+
+func (m *AppModel) conflictDecorTickMask() uint16 {
+	return boolMask(m.conflictViewActive && m.conflictView != nil && m.conflictView.NeedsDecorTick())
+}
+
+func (m *AppModel) planDecorTickMask() uint16 {
+	return boolMask(m.planView != nil && m.planView.NeedsDecorTick())
+}
+
+func (m *AppModel) queueDecorTickMask() uint16 {
+	return boolMask(!m.promptQueue.IsEmpty() && !m.promptQueue.IsPaused())
+}
+
+func (m *AppModel) agentDecorTickMask() uint16 {
+	return boolMask(m.agentPanel != nil && m.agentPanel.NeedsHighFrequencyDecorTick())
+}
+
+func (m *AppModel) focusGradientDecorTickMask() uint16 {
+	return boolMask(m.currentFocusGradient() != nil && m.hasActiveAgent())
+}
+
+func boolMask(ok bool) uint16 {
+	if ok {
+		return 1
+	}
+	return 0
 }
 
 // needsIdleDecorTick reports whether any resting decor effects are active.
@@ -15638,10 +16382,21 @@ func (m *AppModel) handleBlink(blink msg.BlinkMsg) tea.Cmd {
 	if !m.needsBlink() {
 		return nil
 	}
+	if m.animationsSuspended(time.Now()) {
+		return m.blinkCmd()
+	}
 	if m.commitTree != nil {
 		m.commitTree.AdvanceSpinner()
 	}
 	return m.blinkCmd()
+}
+
+func (m *AppModel) beginResizeQuiesce(now time.Time) {
+	m.resizeFreezeUntil = now.Add(resizeAnimationQuiesce)
+}
+
+func (m *AppModel) animationsSuspended(now time.Time) bool {
+	return !m.resizeFreezeUntil.IsZero() && now.Before(m.resizeFreezeUntil)
 }
 
 // ensureBlinkAfterDispatch starts a blink chain if any component needs

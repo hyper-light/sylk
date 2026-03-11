@@ -445,7 +445,7 @@ func (s *NodeBlockStore) SaveIndex() error {
 	}
 
 	// Atomic rename
-	if err := os.Rename(tmpFile, indexFile); err != nil {
+	if err := durableRename(tmpFile, indexFile); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("sylkdir: failed to rename index: %w", err)
 	}

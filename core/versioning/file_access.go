@@ -12,6 +12,9 @@ type FileAccess interface {
 	// ReadFile reads the entire contents of a file.
 	ReadFile(ctx context.Context, path string) ([]byte, error)
 
+	// MkdirAll creates a directory path and any missing parents.
+	MkdirAll(ctx context.Context, path string) error
+
 	// WriteFile writes content to a file, creating it if it does not exist.
 	WriteFile(ctx context.Context, path string, content []byte) error
 

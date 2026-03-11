@@ -101,6 +101,26 @@ func TestSupervisor_RegisterAgent(t *testing.T) {
 	}
 }
 
+func TestSupervisor_RegisterAgent_Idempotent(t *testing.T) {
+	sup := newTestSupervisor(t)
+	agent := newTestSupervisorAgent("guide-1", "guide")
+
+	first, err := sup.RegisterAgent(agent)
+	if err != nil {
+		t.Fatalf("first RegisterAgent: %v", err)
+	}
+	second, err := sup.RegisterAgent(agent)
+	if err != nil {
+		t.Fatalf("second RegisterAgent: %v", err)
+	}
+	if first != second {
+		t.Fatal("expected repeated registration to return the existing bridge")
+	}
+	if sup.BridgeCount() != 1 {
+		t.Fatalf("BridgeCount = %d, want 1", sup.BridgeCount())
+	}
+}
+
 func TestSupervisor_RegisterAgentNotStarted(t *testing.T) {
 	sup := NewHandoffSupervisor(nil)
 	agent := newTestSupervisorAgent("guide-1", "guide")
@@ -281,6 +301,35 @@ func TestSupervisor_CustomDescriptor(t *testing.T) {
 	_, ok := sup.Descriptors().Get("custom-agent-type")
 	if !ok {
 		t.Error("custom agent type should be registered in descriptors")
+	}
+}
+
+func TestSupervisor_SetBriefSource_PropagatesToExistingAndFutureBridges(t *testing.T) {
+	sup := newTestSupervisor(t)
+	source := &stubBriefSource{brief: &ContextBrief{TaskSummary: "brief"}}
+
+	firstAgent := newTestSupervisorAgent("guide-1", "guide")
+	firstBridge, err := sup.RegisterAgent(firstAgent)
+	if err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	if firstBridge.briefGen != nil {
+		t.Fatal("expected no brief generator before SetBriefSource")
+	}
+
+	sup.SetBriefSource(source)
+
+	if firstBridge.briefGen == nil {
+		t.Fatal("expected existing bridge to receive brief generator")
+	}
+
+	secondAgent := newTestSupervisorAgent("arch-1", "architect")
+	secondBridge, err := sup.RegisterAgent(secondAgent)
+	if err != nil {
+		t.Fatalf("RegisterAgent(second): %v", err)
+	}
+	if secondBridge.briefGen == nil {
+		t.Fatal("expected future bridge to receive brief generator")
 	}
 }
 
