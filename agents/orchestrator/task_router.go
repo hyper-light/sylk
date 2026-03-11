@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/google/uuid"
@@ -37,6 +38,7 @@ type TaskRouterConfig struct {
 	SessionID                 string
 	Logger                    *slog.Logger
 	StreamMirrorTargetAgentID string
+	EventLogger               *agentlog.SessionEventLogger
 }
 
 // TaskRouter routes DAG-dispatched tasks to pipeline agents through
@@ -50,6 +52,7 @@ type TaskRouter struct {
 	sessionID            string
 	logger               *slog.Logger
 	streamMirrorTargetID string
+	eventLogger          *agentlog.SessionEventLogger
 
 	pendingMu sync.Mutex
 	pending   map[string]*pendingRoute // correlationID → pending
@@ -75,8 +78,13 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 		sessionID:            cfg.SessionID,
 		logger:               logger,
 		streamMirrorTargetID: defaultStreamMirrorTarget(cfg.StreamMirrorTargetAgentID),
+		eventLogger:          cfg.EventLogger,
 		pending:              make(map[string]*pendingRoute),
 	}
+}
+
+func (r *TaskRouter) SetEventLogger(el *agentlog.SessionEventLogger) {
+	r.eventLogger = el
 }
 
 // Route dispatches a pipeline task through the Guide's direct consultation
@@ -97,6 +105,7 @@ func (r *TaskRouter) Route(task *PipelineTask) error {
 func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}) error {
 	corrID := "pipe_" + uuid.NewString()[:12]
 	waitCh := r.registerPending(corrID, task)
+	r.logTrace("task_router_pending_registered", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
 
 	req := &guide.RouteRequest{
 		CorrelationID:   corrID,
@@ -118,22 +127,45 @@ func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}
 		"task_id":       task.TaskID,
 	}
 
+	r.logTrace("task_router_route_publish_begin", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
 	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
 		r.clearPending(corrID)
+		r.logTrace("task_router_route_publish_failed", "error", agentlog.EventError, corrID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"error": err.Error(),
+		}))
 		r.publishFailure(task, fmt.Errorf("publish route request: %w", err))
 		return err
 	}
+	r.logTrace("task_router_route_publish_ok", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
 
 	return r.scope.Go("route-"+task.NodeID, 0, func(ctx context.Context) error {
-		defer r.clearPending(corrID)
+		defer func() {
+			r.clearPending(corrID)
+			r.logTrace("task_router_pending_cleared", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
+		}()
+		r.logTrace("task_router_route_wait_begin", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
 
 		select {
 		case resp := <-waitCh:
+			responseType := ""
+			sourceAgentID := ""
+			if resp != nil {
+				responseType = string(resp.Type)
+				sourceAgentID = resp.SourceAgentID
+			}
+			r.logTrace("task_router_route_wait_response", "debug", agentlog.EventTaskDispatched, corrID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+				"response_type":   responseType,
+				"source_agent_id": sourceAgentID,
+			}))
 			r.handleRouteResponse(task, resp)
 		case <-ctx.Done():
+			r.logTrace("task_router_route_wait_context_done", "error", agentlog.EventError, corrID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+				"error": ctx.Err().Error(),
+			}))
 			r.publishFailure(task, ctx.Err())
 		case <-done:
 			// Dispatch returned (success or timeout) — stop waiting.
+			r.logTrace("task_router_route_wait_done_closed", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
 		}
 		return nil
 	})
@@ -160,6 +192,15 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 		r.pendingMu.Unlock()
 		if pr == nil {
 			r.logger.Warn("response has no pending route", "correlation_id", msg.CorrelationID)
+			r.logTrace("task_router_response_unmatched", "warn", agentlog.EventError, msg.CorrelationID, map[string]any{
+				"message_type":    string(msg.Type),
+				"source_agent_id": msg.SourceAgentID,
+				"target_agent_id": msg.TargetAgentID,
+			})
+		} else {
+			r.logTrace("task_router_response_closed", "warn", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(pr.task), map[string]any{
+				"message_type": string(msg.Type),
+			}))
 		}
 		return pr != nil
 	}
@@ -169,6 +210,11 @@ func (r *TaskRouter) DeliverResponse(msg *guide.Message) bool {
 	case pr.ch <- msg:
 	default:
 	}
+	r.logTrace("task_router_response_delivered", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, mergeRouteTraceData(routeTraceData(pr.task), map[string]any{
+		"message_type":    string(msg.Type),
+		"source_agent_id": msg.SourceAgentID,
+		"target_agent_id": msg.TargetAgentID,
+	}))
 	return true
 }
 
@@ -220,7 +266,17 @@ func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
 	}
 	if err := r.bus.Publish(guide.TopicResponses(r.streamMirrorTargetID, r.streamMirrorTargetID), mirroredMsg); err != nil {
 		r.logger.Warn("mirror pipeline stream to user", "correlation_id", msg.CorrelationID, "error", err)
+		r.logTrace("task_router_stream_mirror_failed", "warn", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(pr.task), map[string]any{
+			"mirror_target":   r.streamMirrorTargetID,
+			"source_agent_id": msg.SourceAgentID,
+			"error":           err.Error(),
+		}))
+		return true
 	}
+	r.logTrace("task_router_stream_mirrored", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, mergeRouteTraceData(routeTraceData(pr.task), map[string]any{
+		"mirror_target":   r.streamMirrorTargetID,
+		"source_agent_id": msg.SourceAgentID,
+	}))
 	return true
 }
 
@@ -294,6 +350,7 @@ func firstNonEmpty(values ...string) string {
 // Guide-correlated RouteResponse and publishes a PipelineUpdate.
 func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message) {
 	if msg == nil {
+		r.logTrace("task_router_terminal_nil", "error", agentlog.EventError, "", routeTraceData(task))
 		r.publishFailure(task, fmt.Errorf("route cancelled for node %s", task.NodeID))
 		return
 	}
@@ -302,19 +359,27 @@ func (r *TaskRouter) handleRouteResponse(task *PipelineTask, msg *guide.Message)
 		if !ok || errText == "" {
 			errText = fmt.Sprintf("route error for node %s", task.NodeID)
 		}
+		r.logTrace("task_router_terminal_error", "error", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"error": errText,
+		}))
 		r.publishFailure(task, fmt.Errorf("%s", errText))
 		return
 	}
 	resp, ok := msg.GetRouteResponse()
 	if !ok || resp == nil {
+		r.logTrace("task_router_terminal_invalid", "error", agentlog.EventError, msg.CorrelationID, routeTraceData(task))
 		r.publishFailure(task, fmt.Errorf("invalid route response for node %s", task.NodeID))
 		return
 	}
 	if !resp.Success {
+		r.logTrace("task_router_terminal_failed", "error", agentlog.EventError, msg.CorrelationID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"error": resp.Error,
+		}))
 		r.publishFailure(task, fmt.Errorf("%s", resp.Error))
 		return
 	}
 
+	r.logTrace("task_router_terminal_success", "debug", agentlog.EventTaskDispatched, msg.CorrelationID, routeTraceData(task))
 	r.publishSucceeded(task, resp.Data)
 }
 
@@ -433,7 +498,16 @@ func (r *TaskRouter) publishPipelineUpdate(task *PipelineTask, status string, ou
 	if err := r.bus.Publish(topic, msg); err != nil {
 		r.logger.Error("publish pipeline update",
 			"node_id", task.NodeID, "status", status, "error", err)
+		r.logTrace("task_router_pipeline_update_publish_failed", "error", agentlog.EventError, "", mergeRouteTraceData(routeTraceData(task), map[string]any{
+			"status": status,
+			"error":  err.Error(),
+		}))
+		return
 	}
+	r.logTrace("task_router_pipeline_update_published", "debug", agentlog.EventPipelineStateChange, "", mergeRouteTraceData(routeTraceData(task), map[string]any{
+		"status": status,
+		"error":  errMsg,
+	}))
 }
 
 // extractDispatchMetadata extracts dispatch-protocol keys (e.g. ack_topic)
@@ -481,6 +555,56 @@ func encodeTaskInput(task *PipelineTask) string {
 		return task.Prompt
 	}
 	return string(data)
+}
+
+func (r *TaskRouter) logTrace(event, level string, eventCode agentlog.EventType, corrID string, data map[string]any) {
+	if r == nil || r.eventLogger == nil {
+		return
+	}
+	r.eventLogger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     r.agentID,
+		SessionID: r.sessionID,
+		Event:     event,
+		EventCode: eventCode,
+		CorrID:    corrID,
+		Data:      data,
+	})
+}
+
+func routeTraceData(task *PipelineTask) map[string]any {
+	if task == nil {
+		return nil
+	}
+	data := map[string]any{
+		"dag_id":          task.DAGID,
+		"node_id":         task.NodeID,
+		"task_id":         task.TaskID,
+		"agent_type":      task.AgentType,
+		"target_agent_id": routeTargetAgentID(task),
+	}
+	if taskSlug := taskContextString(task.Context, "task_slug"); taskSlug != "" {
+		data["task_slug"] = taskSlug
+	}
+	if ackTopic := taskContextString(task.Context, "ack_topic"); ackTopic != "" {
+		data["ack_topic"] = ackTopic
+	}
+	return data
+}
+
+func mergeRouteTraceData(base map[string]any, extra map[string]any) map[string]any {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	merged := make(map[string]any, len(base)+len(extra))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range extra {
+		merged[key] = value
+	}
+	return merged
 }
 
 // CompoundPipelineTask extends PipelineTask with co-tenancy fields for

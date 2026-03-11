@@ -170,3 +170,53 @@ func TestHandlePlanUpdate_DoesNotDuplicateEmbeddedReadyPlan(t *testing.T) {
 		t.Fatalf("expected embedded plan to render once, got view %q", view)
 	}
 }
+
+func TestHandleToolCallEvent_AttachesToCompletedEntryByCorrelation(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("architect")
+	m.FinishThinking(&ChatEntry{
+		ID:            "resp-1",
+		Timestamp:     time.Now(),
+		CorrelationID: "corr-tool",
+		Source:        SourceAgent,
+		AgentType:     "architect",
+		Content:       "Done.",
+		Height:        -1,
+	})
+
+	comp, _ := m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-tool",
+		ToolName:      "read_file",
+		ArgsSummary:   "path=README.md",
+		Phase:         0,
+		StartedAt:     time.Now(),
+	})
+	m = comp.(*Model)
+	comp, _ = m.Update(msg.ToolCallEventMsg{
+		CorrelationID: "corr-tool",
+		ToolName:      "read_file",
+		Phase:         1,
+		Duration:      250 * time.Millisecond,
+		Success:       true,
+		Output:        "ok",
+	})
+	m = comp.(*Model)
+
+	last := m.history.Last()
+	if last == nil {
+		t.Fatal("expected completed entry")
+	}
+	if len(last.ToolCalls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(last.ToolCalls))
+	}
+	record := last.ToolCalls[0]
+	if record.ToolName != "read_file" {
+		t.Fatalf("tool name = %q, want read_file", record.ToolName)
+	}
+	if !record.Completed || !record.Success {
+		t.Fatalf("tool completion = %+v, want completed success", record)
+	}
+	if record.Output != "ok" {
+		t.Fatalf("tool output = %q, want ok", record.Output)
+	}
+}

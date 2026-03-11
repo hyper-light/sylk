@@ -59,6 +59,9 @@ func parseTaskDispatchMessage(msg *guide.Message) (*taskDispatchContext, bool) {
 		coAgents:      decodeDispatchAgentTypes(data["co_agents"]),
 		now:           time.Now(),
 	}
+	if dispatch.nodeID == "" || dispatch.agentType == "" || dispatch.dagID == "" {
+		return nil, false
+	}
 
 	dispatch.ensureRoutingContext()
 	dispatch.canonicalizePipelineIdentity()
@@ -280,10 +283,14 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 
 	done := o.dispatchDoneChannel(dispatch.dagID, dispatch.nodeID)
 	o.logTrace("task_dispatch_route_begin", agentlog.EventTaskDispatched, map[string]any{
-		"dag_id":     dispatch.dagID,
-		"node_id":    dispatch.nodeID,
-		"task_id":    dispatch.taskID,
-		"agent_type": dispatch.agentType,
+		"dag_id":          dispatch.dagID,
+		"node_id":         dispatch.nodeID,
+		"task_id":         dispatch.taskID,
+		"agent_type":      dispatch.agentType,
+		"task_slug":       dispatch.pipelineTaskSlug,
+		"co_agents":       append([]string(nil), dispatch.coAgents...),
+		"ack_topic":       stringValue(dispatch.nodeCtx["ack_topic"]),
+		"target_agent_id": TaskScopedAgentID(dispatch.pipelineTaskID, dispatch.agentType),
 	})
 	if err := o.routeDispatchedPipelineTask(router, dispatch, done); err != nil {
 		o.logTrace("task_dispatch_route_failed", agentlog.EventError, map[string]any{
@@ -302,10 +309,12 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 		return
 	}
 	o.logTrace("task_dispatch_route_ok", agentlog.EventTaskDispatched, map[string]any{
-		"dag_id":     dispatch.dagID,
-		"node_id":    dispatch.nodeID,
-		"task_id":    dispatch.taskID,
-		"agent_type": dispatch.agentType,
+		"dag_id":          dispatch.dagID,
+		"node_id":         dispatch.nodeID,
+		"task_id":         dispatch.taskID,
+		"agent_type":      dispatch.agentType,
+		"task_slug":       dispatch.pipelineTaskSlug,
+		"target_agent_id": TaskScopedAgentID(dispatch.pipelineTaskID, dispatch.agentType),
 	})
 
 	if o.dagBridge != nil {

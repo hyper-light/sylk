@@ -3,10 +3,12 @@ package architect
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/dag"
 )
 
 func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
@@ -287,6 +289,91 @@ func TestHandleExecute_RehydratesOrphanedPendingContinuationFromControlStore(t *
 	}
 	if stored.PendingWork.CorrelationID != "corr-1" {
 		t.Fatalf("correlation_id = %q, want corr-1", stored.PendingWork.CorrelationID)
+	}
+}
+
+func TestHandleExecute_RecoversExpiredPlanHandoffAndRedispatches(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-1",
+		SessionID: "sess1",
+		Query:     "build the feature",
+		Status:    PlanStatusOrchestrating,
+		Tasks: []*AtomicTask{
+			{ID: "task-1", Name: "Task", AgentType: "engineer", Description: "Ship it"},
+		},
+		Workflow:  &WorkflowDAG{TotalTasks: 1, Tasks: []*AtomicTask{{ID: "task-1"}}, DAG: &dag.DAG{}},
+		CreatedAt: now,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:          string(continuationKindPlanHandoff),
+			Status:        string(continuationStatusPending),
+			TargetAgentID: "orchestrator",
+			CorrelationID: "corr-expired",
+			Message:       "handoff queued",
+			CreatedAt:     now.Add(-2 * time.Minute),
+			ExpiresAt:     now.Add(-time.Minute),
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	a.running = true
+	a.bus = &testBus{}
+
+	record := &ArchitectContinuation{
+		ID:                    "cont-expired",
+		Kind:                  continuationKindPlanHandoff,
+		State:                 continuationStatusPending,
+		PlanID:                plan.ID,
+		SessionID:             plan.SessionID,
+		TargetAgentID:         "orchestrator",
+		ResponseCorrelationID: "corr-expired",
+		RequestJSON:           `{"plan_id":"plan-1"}`,
+		CreatedAt:             now.Add(-2 * time.Minute),
+		ExpiresAt:             now.Add(-time.Minute),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	result, err := a.handleExecute(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: plan.SessionID,
+	})
+	if err != nil {
+		t.Fatalf("handleExecute error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleExecute result type = %T, want *ConversationResult", result)
+	}
+	if !strings.Contains(conv.Response, "Plan handoff queued") {
+		t.Fatalf("response = %q, want redispatch acknowledgment", conv.Response)
+	}
+
+	stored := a.planStore.Get(plan.ID)
+	if stored == nil {
+		t.Fatal("expected plan to remain present")
+	}
+	if stored.SM().State() != PlanStatusOrchestrating {
+		t.Fatalf("plan state = %s, want orchestrating after redispatch", stored.SM().State())
+	}
+	if stored.PendingWork == nil || stored.PendingWork.CorrelationID == "corr-expired" {
+		t.Fatalf("expected new pending handoff continuation, got %+v", stored.PendingWork)
+	}
+
+	expiredRecord, err := a.controlStore.GetContinuationByResponseCorrelation("corr-expired")
+	if err != nil {
+		t.Fatalf("load expired continuation: %v", err)
+	}
+	if expiredRecord == nil || expiredRecord.State != continuationStatusFailed {
+		t.Fatalf("expired continuation = %+v, want failed", expiredRecord)
+	}
+
+	bus := a.bus.(*testBus)
+	if len(bus.published) != 1 {
+		t.Fatalf("expected one published route request, got %d", len(bus.published))
 	}
 }
 

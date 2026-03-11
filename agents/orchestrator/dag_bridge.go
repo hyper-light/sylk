@@ -271,7 +271,13 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	scribeFactory := b.scribeFactory
 	b.mu.RUnlock()
 
-	taskPods, err := b.buildTaskPods(ctx, d, sessionID, runtime, specReg, registrar, logger, scribeFactory, sessionVFS)
+	taskDefs := collectPipelineTaskPods(d)
+	b.logTrace("dag_execute_task_pods_build_begin", agentlog.EventRegistryEvent, map[string]any{
+		"dag_id":          d.ID(),
+		"task_pod_count":  len(taskDefs),
+		"task_pod_traces": tracePipelineTaskPodDefs(taskDefs),
+	})
+	taskPods, err := b.buildTaskPods(ctx, taskDefs, sessionID, runtime, specReg, registrar, logger, scribeFactory, sessionVFS)
 	if err != nil {
 		b.logTrace("dag_execute_task_pods_failed", agentlog.EventError, map[string]any{
 			"dag_id": d.ID(),
@@ -280,10 +286,11 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		return "", b.abortPreSubmitDAG(d.ID(), err)
 	}
 	b.logTrace("dag_execute_task_pods_built", agentlog.EventRegistryEvent, map[string]any{
-		"dag_id":         d.ID(),
-		"task_pod_count": len(taskPods),
+		"dag_id":          d.ID(),
+		"task_pod_count":  len(taskPods),
+		"task_pod_traces": tracePipelineTaskPodDefs(taskDefs),
 	})
-	if err := preActivateTaskPods(ctx, taskPods); err != nil {
+	if err := preActivateTaskPods(ctx, d.ID(), taskPods, indexPipelineTaskPodDefs(taskDefs), b.logTrace); err != nil {
 		b.logTrace("dag_execute_task_pods_preactivate_failed", agentlog.EventError, map[string]any{
 			"dag_id": d.ID(),
 			"error":  err.Error(),
@@ -295,7 +302,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		"dag_id":         d.ID(),
 		"task_pod_count": len(taskPods),
 	})
-	for _, taskDef := range collectPipelineTaskPods(d) {
+	for _, taskDef := range taskDefs {
 		publishTaskPipelineState(bus, b.agentID, taskDef.TaskID, taskDef.TaskSlug, taskstate.StatusPending, "")
 	}
 
@@ -437,7 +444,7 @@ func (b *DAGBridge) abortPreSubmitDAG(dagID string, err error) error {
 
 func (b *DAGBridge) buildTaskPods(
 	ctx context.Context,
-	d *dag.DAG,
+	taskDefs []pipelineTaskPodDef,
 	sessionID string,
 	runtime container.ContainerRuntime,
 	specReg *container.AgentSpecRegistry,
@@ -446,7 +453,6 @@ func (b *DAGBridge) buildTaskPods(
 	scribeFactory shared.ScribeFactory,
 	sessionVFSLookup func(sessionID string) *versioning.SessionVFS,
 ) (map[string]*shared.AgentPod, error) {
-	taskDefs := collectPipelineTaskPods(d)
 	if len(taskDefs) == 0 {
 		return nil, nil
 	}
@@ -461,8 +467,12 @@ func (b *DAGBridge) buildTaskPods(
 
 	taskPods := make(map[string]*shared.AgentPod, len(taskDefs))
 	for _, taskDef := range taskDefs {
-		managed, specs, err := buildTaskManagedPod(taskDef, sessionID, runtime, specReg, svfs, logger)
+		b.logTrace("task_pod_build_begin", agentlog.EventRegistryEvent, tracePipelineTaskPodDef(taskDef))
+		managed, specs, err := buildTaskManagedPod(taskDef, sessionID, runtime, specReg, svfs, logger, b.eventLogger, b.agentID)
 		if err != nil {
+			b.logTrace("task_pod_build_failed", agentlog.EventError, mergeTraceMaps(tracePipelineTaskPodDef(taskDef), map[string]any{
+				"error": err.Error(),
+			}))
 			releaseTaskPods(taskPods)
 			return nil, err
 		}
@@ -475,9 +485,13 @@ func (b *DAGBridge) buildTaskPods(
 			ActivityPub:   b.activityPub,
 			Logger:        logger,
 			ScribeFactory: scribeFactory,
+			EventLogger:   b.eventLogger,
 			Managed:       managed,
 		})
 		taskPods[taskDef.TaskID] = taskPod
+		b.logTrace("task_pod_build_ready", agentlog.EventRegistryEvent, mergeTraceMaps(tracePipelineTaskPodDef(taskDef), map[string]any{
+			"member_types": append([]string(nil), PipelineAgentTypes[:]...),
+		}))
 	}
 
 	return taskPods, nil
@@ -594,6 +608,8 @@ func buildTaskManagedPod(
 	specReg *container.AgentSpecRegistry,
 	svfs *versioning.SessionVFS,
 	logger *slog.Logger,
+	eventLogger *agentlog.SessionEventLogger,
+	agentID string,
 ) (*containerpod.ManagedPod, []container.ContainerSpec, error) {
 	policy := &containerpod.PodPolicy{
 		PodID:       task.TaskID,
@@ -608,12 +624,14 @@ func buildTaskManagedPod(
 	volumeManager := containerpod.NewVolumeManager(containerpod.VolumeManagerConfig{
 		Volumes: []containerpod.ManagedVolume{
 			containerpod.NewVFSVolume(containerpod.VFSVolumeConfig{
-				Name:       "workspace",
-				PipelineID: task.TaskID,
-				SessionID:  versioning.SessionID(sessionID),
-				WorkingDir: svfs.WorkingDir(),
-				SessionVFS: svfs,
-				Files:      task.Files,
+				Name:        "workspace",
+				PipelineID:  task.TaskID,
+				SessionID:   versioning.SessionID(sessionID),
+				WorkingDir:  svfs.WorkingDir(),
+				SessionVFS:  svfs,
+				Files:       task.Files,
+				EventLogger: eventLogger,
+				AgentID:     agentID,
 			}),
 		},
 		Mounts: map[string]string{
@@ -665,17 +683,92 @@ func releaseTaskPods(taskPods map[string]*shared.AgentPod) {
 	}
 }
 
-func preActivateTaskPods(ctx context.Context, taskPods map[string]*shared.AgentPod) error {
+func preActivateTaskPods(
+	ctx context.Context,
+	dagID string,
+	taskPods map[string]*shared.AgentPod,
+	taskDefs map[string]pipelineTaskPodDef,
+	trace func(string, agentlog.EventType, map[string]any),
+) error {
 	for _, taskID := range slices.Sorted(maps.Keys(taskPods)) {
 		pod := taskPods[taskID]
 		if pod == nil {
 			continue
 		}
+		def := taskDefs[taskID]
+		if trace != nil {
+			trace("task_pod_preactivate_begin", agentlog.EventRegistryEvent, mergeTraceMaps(tracePipelineTaskPodDef(def), map[string]any{
+				"dag_id": dagID,
+			}))
+		}
 		if err := pod.PreActivateStrict(ctx); err != nil {
+			if trace != nil {
+				trace("task_pod_preactivate_failed", agentlog.EventError, mergeTraceMaps(tracePipelineTaskPodDef(def), map[string]any{
+					"dag_id": dagID,
+					"error":  err.Error(),
+				}))
+			}
 			return fmt.Errorf("task pod %s: pre-activate: %w", taskID, err)
+		}
+		if trace != nil {
+			trace("task_pod_preactivate_done", agentlog.EventRegistryEvent, mergeTraceMaps(tracePipelineTaskPodDef(def), map[string]any{
+				"dag_id": dagID,
+			}))
 		}
 	}
 	return nil
+}
+
+func indexPipelineTaskPodDefs(defs []pipelineTaskPodDef) map[string]pipelineTaskPodDef {
+	index := make(map[string]pipelineTaskPodDef, len(defs))
+	for _, def := range defs {
+		index[def.TaskID] = def
+	}
+	return index
+}
+
+func tracePipelineTaskPodDefs(defs []pipelineTaskPodDef) []map[string]any {
+	if len(defs) == 0 {
+		return nil
+	}
+	result := make([]map[string]any, 0, len(defs))
+	for _, def := range defs {
+		result = append(result, tracePipelineTaskPodDef(def))
+	}
+	return result
+}
+
+func tracePipelineTaskPodDef(def pipelineTaskPodDef) map[string]any {
+	return map[string]any{
+		"task_id":       def.TaskID,
+		"task_slug":     def.TaskSlug,
+		"files_count":   len(def.Files),
+		"files_preview": previewPipelineTraceStrings(def.Files, 8),
+	}
+}
+
+func previewPipelineTraceStrings(values []string, limit int) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	if limit <= 0 || len(values) <= limit {
+		return append([]string(nil), values...)
+	}
+	return append([]string(nil), values[:limit]...)
+}
+
+func mergeTraceMaps(base map[string]any, extra map[string]any) map[string]any {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	merged := make(map[string]any, len(base)+len(extra))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range extra {
+		merged[key] = value
+	}
+	return merged
 }
 
 // Cancel cancels a running DAG.

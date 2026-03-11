@@ -100,18 +100,31 @@ func renderPipelineRow(pl *PipelineState, width int, elapsed time.Duration, grad
 		}
 		name = nameStyle.Render(taskLabel)
 	}
-	prefix := renderTreePrefix(pipelineHeaderPrefix(collapsed), activeColor, th)
+	statusText := truncate(pl.Status, 12)
+	prefixPlain := pipelineHeaderPrefix(collapsed)
+	prefix := renderTreePrefix(prefixPlain, activeColor, th)
 
 	// Status label.
 	statusStyle := lipgloss.NewStyle().Foreground(th.Palette.Subtext)
-	statusLabel := statusStyle.Render(truncate(pl.Status, 12))
+	statusLabel := statusStyle.Render(statusText)
 
 	// Progress bar.
 	bar := renderProgressBar(pl.Status, elapsed, grad, th)
 
 	// Counter: real loop progress when available, otherwise phase progress.
 	loopStyle := lipgloss.NewStyle().Foreground(th.Palette.Muted)
-	loopLabel := loopStyle.Render(formatPipelineCounterLabel(pl.Status, pl.LoopCount, pl.MaxLoops))
+	loopText := formatPipelineCounterLabel(pl.Status, pl.LoopCount, pl.MaxLoops)
+	loopLabel := loopStyle.Render(loopText)
+
+	if shouldWrapPipelineRow(width, prefixPlain, taskLabel, statusText, loopText) {
+		wrappedTask, wrappedStatus := fitWrappedPipelineHeader(taskLabel, statusText, max(width-lipgloss.Width(prefixPlain), 0))
+		lineOne := prefix + renderPipelineTaskLabel(wrappedTask, name, selected, activeColor, anim, th)
+		if wrappedStatus != "" {
+			lineOne += " " + statusStyle.Render(wrappedStatus)
+		}
+		lineTwo := renderTreePrefix(pipelineContinuationPrefix(), activeColor, th) + bar + " " + loopLabel
+		return lineOne + "\n" + lineTwo
+	}
 
 	return fmt.Sprintf("%s%s %s %s %s", prefix, name, statusLabel, bar, loopLabel)
 }
@@ -122,6 +135,77 @@ func pipelineHeaderPrefix(collapsed bool) string {
 		marker = "+"
 	}
 	return pipelineHeaderIndent + marker + " "
+}
+
+func pipelineContinuationPrefix() string {
+	return pipelineHeaderIndent + "  "
+}
+
+func shouldWrapPipelineRow(width int, prefixPlain, taskLabel, statusText, loopText string) bool {
+	if width <= 0 {
+		return false
+	}
+	plain := taskLabel + " " + statusText + " " + strings.Repeat(pipelineProgressGlyph, progressBarCells) + " " + loopText
+	return lipgloss.Width(prefixPlain)+lipgloss.Width(plain) > width
+}
+
+func fitWrappedPipelineHeader(taskLabel, statusText string, maxWidth int) (string, string) {
+	if maxWidth <= 0 {
+		return "", ""
+	}
+	if statusText == "" {
+		return truncate(taskLabel, maxWidth), ""
+	}
+	if lipgloss.Width(taskLabel+" "+statusText) <= maxWidth {
+		return taskLabel, statusText
+	}
+	if lipgloss.Width(taskLabel) >= maxWidth {
+		return truncate(taskLabel, maxWidth), ""
+	}
+	statusWidth := maxWidth - lipgloss.Width(taskLabel) - 1
+	if statusWidth <= 0 {
+		return taskLabel, ""
+	}
+	return taskLabel, truncate(statusText, statusWidth)
+}
+
+func renderPipelineTaskLabel(taskLabel, styledName string, selected bool, activeColor lipgloss.Color, anim AnimState, th *theme.Theme) string {
+	if taskLabel == "" {
+		return ""
+	}
+	if stripANSIForPipelineWidth(styledName) == taskLabel {
+		return styledName
+	}
+	if activeColor != "" && anim.Ripple {
+		hGrad := anim.RippleGrad
+		if selected && anim.HolographicGrad != nil {
+			hGrad = anim.HolographicGrad
+		}
+		if hGrad != nil {
+			return "\x1b[1m" + theme.RenderRippleText(taskLabel, anim.Elapsed, hGrad, 0)
+		}
+	}
+	nameStyle := lipgloss.NewStyle().Foreground(th.Palette.Primary).Bold(true)
+	if !selected {
+		nameStyle = lipgloss.NewStyle().Foreground(th.Palette.Muted).Bold(true)
+	}
+	return nameStyle.Render(taskLabel)
+}
+
+func stripANSIForPipelineWidth(s string) string {
+	var b strings.Builder
+	inEscape := false
+	for _, r := range s {
+		switch {
+		case r == '\x1b':
+			inEscape = true
+		case inEscape && r == 'm':
+			inEscape = false
+		case !inEscape:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // renderProgressBar renders a 4-cell shimmer progress bar.

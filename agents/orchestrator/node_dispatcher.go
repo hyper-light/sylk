@@ -205,7 +205,8 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 // dispatchAndWaitACK publishes the task dispatch and waits for ACK.
 func (d *BusNodeDispatcher) dispatchAndWaitACK(ctx context.Context, node *dag.Node, msg *guide.Message, ackTopic string, ackCh <-chan *ACKResult) (*ACKResult, error) {
 	d.logNodeTrace(node, "dispatch_ack_subscribe_begin", agentlog.EventTaskDispatched, map[string]any{
-		"ack_topic": ackTopic,
+		"ack_topic":      ackTopic,
+		"ack_timeout_ms": d.ackTimeout.Milliseconds(),
 	})
 	sub, err := d.bus.Subscribe(ackTopic, func(ackMsg *guide.Message) error {
 		if ackMsg.Type != guide.MessageTypeAck {
@@ -267,6 +268,18 @@ func (d *BusNodeDispatcher) logNodeTrace(node *dag.Node, event string, eventCode
 	if node != nil {
 		trace["node_id"] = node.ID()
 		trace["agent_type"] = node.AgentType()
+		taskID, taskSlug := dispatchTaskIdentity(node)
+		if taskID != "" {
+			trace["task_id"] = taskID
+		}
+		if taskSlug != "" {
+			trace["task_slug"] = taskSlug
+		}
+		if ctx := node.Context(); ctx != nil {
+			if ackTopic, ok := ctx["ack_topic"].(string); ok && strings.TrimSpace(ackTopic) != "" {
+				trace["ack_topic"] = strings.TrimSpace(ackTopic)
+			}
+		}
 	}
 	for key, value := range data {
 		trace[key] = value

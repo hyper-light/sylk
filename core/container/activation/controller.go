@@ -15,6 +15,7 @@ import (
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/logging"
 )
 
 var (
@@ -33,7 +34,7 @@ func activationFileLog() *slog.Logger {
 			activationDebugLog = slog.Default()
 			return
 		}
-		activationDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		activationDebugLog = slog.New(slog.NewTextHandler(f, logging.HandlerOptions(slog.LevelInfo)))
 	})
 	return activationDebugLog
 }

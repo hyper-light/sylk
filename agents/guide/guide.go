@@ -20,6 +20,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/llmruntime"
+	"github.com/adalundhe/sylk/core/logging"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
@@ -50,7 +51,7 @@ func guideFileLog() *slog.Logger {
 			guideDebugLog = slog.Default()
 			return
 		}
-		guideDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		guideDebugLog = slog.New(slog.NewTextHandler(f, logging.HandlerOptions(slog.LevelInfo)))
 	})
 	return guideDebugLog
 }

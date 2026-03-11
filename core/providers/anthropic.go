@@ -15,6 +15,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/credentials"
 	"github.com/adalundhe/sylk/core/llm"
+	"github.com/adalundhe/sylk/core/logging"
 	"github.com/adalundhe/sylk/core/oauth"
 	"github.com/adalundhe/sylk/core/storage"
 	"github.com/adalundhe/sylk/skills"
@@ -39,7 +40,7 @@ func providerFileLog() *slog.Logger {
 			providerDebugLog = slog.Default()
 			return
 		}
-		providerDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		providerDebugLog = slog.New(slog.NewTextHandler(f, logging.HandlerOptions(slog.LevelInfo)))
 	})
 	return providerDebugLog
 }

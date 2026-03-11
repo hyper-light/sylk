@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/adalundhe/sylk/core/logging"
 	"github.com/adalundhe/sylk/core/storage"
 )
 
@@ -49,7 +50,7 @@ func NewWALLogger(agentID string) (*slog.Logger, io.Closer, error) {
 			return nil, nil, fmt.Errorf("open fallback agent wal: %w", err)
 		}
 	}
-	handler := slog.NewJSONHandler(file, &slog.HandlerOptions{Level: slog.LevelInfo})
+	handler := slog.NewJSONHandler(file, logging.HandlerOptions(slog.LevelInfo))
 	logger := slog.New(newSequenceHandler(handler)).With("agent_id", normalizeAgentID(agentID))
 	return logger, file, nil
 }

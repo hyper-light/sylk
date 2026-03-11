@@ -58,6 +58,10 @@ func (a *Architect) latestActivePendingPlan(sessionID string) *DesignPlan {
 	if best == nil && a.controlStore != nil {
 		record, err := a.controlStore.LatestActiveContinuationForSession(trimmed, now)
 		if err == nil && record != nil {
+			if record.State == continuationStatusProcessing {
+				a.recoverStaleContinuationRecord(record, "processing continuation cannot be resumed after architect restart")
+				return nil
+			}
 			best = a.reconcileContinuationRecord(record)
 		}
 	}
@@ -126,6 +130,11 @@ func (a *Architect) dispatchPlanExecution(
 		"plan_state", plan.SM().State().String(),
 		"task_count", len(plan.Tasks),
 		"session_id", plan.SessionID)
+	a.logTrace("architect_plan_handoff_begin", "debug", plan.SessionID, "", agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":    plan.ID,
+		"plan_state": plan.SM().State().String(),
+		"task_count": len(plan.Tasks),
+	})
 
 	if !a.running || a.bus == nil {
 		a.logWarn("dispatchPlanExecution: bus unavailable",
@@ -181,10 +190,22 @@ func (a *Architect) dispatchPlanExecution(
 		ExpiresAt:               time.Now().UTC().Add(routeSyncTimeout),
 	}
 	if err := a.recordPendingContinuation(plan, record, userMessage); err != nil {
+		a.logTrace("architect_plan_handoff_record_failed", "error", plan.SessionID, orchCID, agentlog.EventError, map[string]any{
+			"plan_id": plan.ID,
+			"error":   err.Error(),
+		})
 		return &ConversationResult{
 			Response: "I couldn't persist the plan handoff state: " + err.Error(),
 			Intent:   IntentExecute,
 		}, true
+	}
+	a.logTrace("architect_plan_handoff_recorded", "debug", plan.SessionID, orchCID, agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":         plan.ID,
+		"continuation_id": record.ID,
+		"expires_at":      record.ExpiresAt,
+	})
+	if originalCID := originalCIDFromContext(ctx); originalCID != "" {
+		a.publishHandoffReroute(ctx, "orchestrator", "execution plan handoff", originalCID, orchCID)
 	}
 	if _, ok := architectStreamMetadataFromContext(ctx); ok {
 		a.publishPlanSnapshot(ctx, plan)
@@ -196,22 +217,36 @@ func (a *Architect) dispatchPlanExecution(
 		TargetAgentID:       "orchestrator",
 		SessionID:           plan.SessionID,
 	}
+	a.logTrace("architect_plan_handoff_publish_begin", "debug", plan.SessionID, orchCID, agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":               plan.ID,
+		"target_agent_id":       request.TargetAgentID,
+		"parent_correlation_id": request.ParentCorrelationID,
+	})
 	if err := a.publishRouteRequest(request); err != nil {
 		a.logWarn("dispatchPlanExecution: async publish failed", "plan_id", plan.ID, "error", err)
+		a.logTrace("architect_plan_handoff_publish_failed", "error", plan.SessionID, orchCID, agentlog.EventError, map[string]any{
+			"plan_id":         plan.ID,
+			"target_agent_id": request.TargetAgentID,
+			"error":           err.Error(),
+		})
 		if plan.SM().State() == PlanStatusOrchestrating {
 			if transitionErr := plan.SM().TransitionTo(PlanStatusReady, plan); transitionErr == nil {
 				plan.Status = plan.SM().State()
 				plan.Epoch = plan.SM().Epoch()
 			}
 		}
-		_ = a.clearPlanPendingContinuation(plan, orchCID)
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
-		_ = a.persistPlanState(plan)
+		a.clearPlanPendingContinuationBestEffort(plan, orchCID, "plan handoff publish failed")
+		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "plan handoff publish failed")
+		a.persistPlanStateBestEffort(plan, orchCID, "plan handoff publish failed; reverting plan state")
 		return &ConversationResult{
 			Response: "I tried to dispatch the plan but hit an error: " + err.Error() + "\nWant me to try again?",
 			Intent:   IntentExecute,
 		}, true
 	}
+	a.logTrace("architect_plan_handoff_publish_ok", "debug", plan.SessionID, orchCID, agentlog.EventTaskDispatched, map[string]any{
+		"plan_id":         plan.ID,
+		"target_agent_id": request.TargetAgentID,
+	})
 
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanLeased,
 		a.id, plan.SessionID, orchCID, "info",

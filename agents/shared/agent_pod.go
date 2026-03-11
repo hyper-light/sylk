@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/events"
@@ -79,6 +80,7 @@ type AgentPodConfig struct {
 	Scope                  *concurrency.GoroutineScope
 	MemberTypes            []string
 	DisplayNames           map[string]string
+	EventLogger            *agentlog.SessionEventLogger
 
 	// ScribeFactory creates Scribes for each member type. Nil = no Scribes.
 	ScribeFactory ScribeFactory
@@ -128,6 +130,7 @@ type AgentPod struct {
 	scope        *concurrency.GoroutineScope
 	memberTypes  []string
 	displayNames map[string]string
+	eventLogger  *agentlog.SessionEventLogger
 
 	// Demotion guards — per-node (pipeline) or per-request (global).
 	guardsMu   sync.Mutex
@@ -165,6 +168,7 @@ func NewAgentPod(cfg AgentPodConfig) *AgentPod {
 		scope:         cfg.Scope,
 		memberTypes:   cfg.MemberTypes,
 		displayNames:  cfg.DisplayNames,
+		eventLogger:   cfg.EventLogger,
 		nodeGuards:    make(map[string]*PodGuardEntry),
 		registered:    make(map[string]struct{}),
 		scribes:       make(map[string]Scribe),
@@ -204,6 +208,13 @@ func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
 		return nil
 	}
 
+	p.logTrace("agent_pod_preactivate_begin", "debug", agentlog.EventRegistryEvent, "", map[string]any{
+		"pod_id":       p.podID,
+		"strict":       strict,
+		"member_types": append([]string(nil), p.memberTypes...),
+		"managed":      p.managed != nil,
+	})
+
 	releases := make([]func(), 0, len(p.memberTypes))
 	activated := make([]string, 0, len(p.memberTypes))
 
@@ -212,6 +223,13 @@ func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
 		if err != nil {
 			if strict {
 				releaseAll(releases)
+				p.logTrace("agent_pod_preactivate_failed", "error", agentlog.EventError, "", map[string]any{
+					"pod_id":          p.podID,
+					"strict":          strict,
+					"activated_count": len(activated),
+					"activated":       append([]string(nil), activated...),
+					"error":           err.Error(),
+				})
 				return err
 			}
 			continue
@@ -224,20 +242,37 @@ func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
 
 	p.storePreActivationGuards(activated, releases)
 	p.startScribes()
+	p.logTrace("agent_pod_preactivate_done", "debug", agentlog.EventRegistryEvent, "", map[string]any{
+		"pod_id":          p.podID,
+		"strict":          strict,
+		"activated_count": len(activated),
+		"activated":       append([]string(nil), activated...),
+	})
 	return nil
 }
 
 func (p *AgentPod) preActivateMember(ctx context.Context, agentType string) (func(), error) {
+	memberData := p.memberTraceData(agentType)
+	p.logTrace("agent_pod_member_preactivate_begin", "debug", agentlog.EventRegistryEvent, "", memberData)
+
 	release, err := p.acquireGuard(ctx, agentType)
 	if err != nil {
 		p.logPreActivateFailure("pre-activate failed", agentType, err)
+		p.logTrace("agent_pod_member_guard_failed", "error", agentlog.EventError, "", mergeAgentPodTraceData(memberData, map[string]any{
+			"error": err.Error(),
+		}))
 		return nil, fmt.Errorf("agent pod %s: pre-activate %s: %w", p.podID, agentType, err)
 	}
+	p.logTrace("agent_pod_member_guard_acquired", "debug", agentlog.EventRegistryEvent, "", memberData)
 	if err := p.registerOnce(ctx, agentType); err != nil {
 		release()
 		p.logPreActivateFailure("pre-register failed", agentType, err)
+		p.logTrace("agent_pod_member_register_failed", "error", agentlog.EventError, "", mergeAgentPodTraceData(memberData, map[string]any{
+			"error": err.Error(),
+		}))
 		return nil, fmt.Errorf("agent pod %s: pre-register %s: %w", p.podID, agentType, err)
 	}
+	p.logTrace("agent_pod_member_ready", "debug", agentlog.EventRegistryEvent, "", memberData)
 	return release, nil
 }
 
@@ -446,10 +481,14 @@ func (p *AgentPod) registerOnce(ctx context.Context, agentType string) error {
 	p.guardsMu.Lock()
 	if _, already := p.registered[agentType]; already {
 		p.guardsMu.Unlock()
+		p.logTrace("agent_pod_member_register_skipped", "debug", agentlog.EventRegistryEvent, "", mergeAgentPodTraceData(p.memberTraceData(agentType), map[string]any{
+			"reason": "already_registered",
+		}))
 		return nil
 	}
 	p.guardsMu.Unlock()
 
+	p.logTrace("agent_pod_member_register_begin", "debug", agentlog.EventRegistryEvent, "", p.memberTraceData(agentType))
 	if err := p.registrar(ctx, agentType); err != nil {
 		return err
 	}
@@ -457,6 +496,7 @@ func (p *AgentPod) registerOnce(ctx context.Context, agentType string) error {
 	p.guardsMu.Lock()
 	p.registered[agentType] = struct{}{}
 	p.guardsMu.Unlock()
+	p.logTrace("agent_pod_member_register_done", "debug", agentlog.EventRegistryEvent, "", p.memberTraceData(agentType))
 	return nil
 }
 
@@ -508,6 +548,48 @@ func pipelineActivityScope(podID, agentType string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func (p *AgentPod) memberTraceData(agentType string) map[string]any {
+	data := map[string]any{
+		"pod_id":     p.podID,
+		"agent_type": agentType,
+		"managed":    p.managed != nil,
+	}
+	if p.managed != nil {
+		data["managed_tier"] = int32(p.managed.LoadTier())
+	}
+	return data
+}
+
+func (p *AgentPod) logTrace(event, level string, eventCode agentlog.EventType, corrID string, data map[string]any) {
+	if p == nil || p.eventLogger == nil {
+		return
+	}
+	p.eventLogger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     p.podID,
+		SessionID: p.sessionID,
+		Event:     event,
+		EventCode: eventCode,
+		CorrID:    corrID,
+		Data:      data,
+	})
+}
+
+func mergeAgentPodTraceData(base map[string]any, extra map[string]any) map[string]any {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	merged := make(map[string]any, len(base)+len(extra))
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range extra {
+		merged[key] = value
+	}
+	return merged
 }
 
 // --------------------------------------------------------------------------

@@ -2169,9 +2169,11 @@ func (m *Model) renderFlatListView(elapsed time.Duration, anim AnimState) string
 		if !ok {
 			continue
 		}
-		lines = append(lines, line)
-		m.recordRenderedRow(consumedLines, i)
-		consumedLines++
+		appended := m.appendRenderedRowLines(&lines, line, i, rowBudget-consumedLines)
+		if appended == 0 {
+			break
+		}
+		consumedLines += appended
 		if isContent {
 			lastContentIdx = i
 		}
@@ -2200,13 +2202,14 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 	lines := make([]string, 0, min(len(m.rows)+1, contentHeight))
 	lastContentIdx := -1
 
-	for lineIdx, rowIdx := range preVisible {
+	for _, rowIdx := range preVisible {
 		line, renderOK, isContent := m.renderListRow(m.rows[rowIdx], rowIdx, elapsed, anim)
 		if !renderOK {
 			continue
 		}
-		lines = append(lines, line)
-		m.recordRenderedRow(lineIdx, rowIdx)
+		if m.appendRenderedRowLines(&lines, line, rowIdx, contentHeight-len(lines)) == 0 {
+			break
+		}
 		if isContent {
 			lastContentIdx = rowIdx
 		}
@@ -2218,10 +2221,11 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 		if !renderOK {
 			continue
 		}
-		lineIdx := len(lines)
-		lines = append(lines, line)
-		m.recordRenderedRow(lineIdx, rowIdx)
-		remainingHeight--
+		appended := m.appendRenderedRowLines(&lines, line, rowIdx, remainingHeight)
+		if appended == 0 {
+			break
+		}
+		remainingHeight -= appended
 		if isContent {
 			lastContentIdx = rowIdx
 		}
@@ -2236,11 +2240,16 @@ func (m *Model) renderSectionedListView(elapsed time.Duration, anim AnimState) s
 			if !renderOK {
 				continue
 			}
-			lineIdx := len(lines)
-			lines = append(lines, line)
-			m.recordRenderedRow(lineIdx, rowIdx)
+			appended := m.appendRenderedRowLines(&lines, line, rowIdx, remainingHeight)
+			if appended == 0 {
+				break
+			}
+			remainingHeight -= appended
 			if isContent {
 				lastContentIdx = rowIdx
+			}
+			if remainingHeight <= 0 {
+				break
 			}
 		}
 	}
@@ -2304,6 +2313,22 @@ func (m *Model) recordRenderedRow(lineIdx, rowIdx int) {
 		return
 	}
 	m.lineRowMap[lineIdx] = rowIdx
+}
+
+func (m *Model) appendRenderedRowLines(lines *[]string, rendered string, rowIdx, budget int) int {
+	if budget <= 0 {
+		return 0
+	}
+	rowLines := strings.Split(rendered, "\n")
+	if len(rowLines) > budget {
+		return 0
+	}
+	for _, rowLine := range rowLines {
+		lineIdx := len(*lines)
+		*lines = append(*lines, rowLine)
+		m.recordRenderedRow(lineIdx, rowIdx)
+	}
+	return len(rowLines)
 }
 
 func (m *Model) finalizeListLines(lines []string, targetHeight, lastContentIdx int, elapsed time.Duration) []string {

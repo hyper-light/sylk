@@ -470,6 +470,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 			if start.AgentID != "" {
 				m.history.entries[physical].AgentType = start.AgentID
 			}
+			m.history.entries[physical].CorrelationID = cid
 			m.history.entries[physical].SessionID = start.SessionID
 			m.history.entries[physical].TaskID = strings.TrimSpace(start.TaskID)
 			m.history.entries[physical].TaskName = strings.TrimSpace(start.TaskName)
@@ -492,6 +493,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 	entry := &ChatEntry{
 		ID:             uuid.New().String(),
 		Timestamp:      now,
+		CorrelationID:  cid,
 		Source:         SourceAgent,
 		AgentType:      start.AgentID,
 		AgentID:        start.AgentID,
@@ -767,6 +769,25 @@ func (m *Model) streamingIndexForCorrelation(correlationID string) int {
 	}
 	if m.thinkingIdx >= 0 {
 		return m.thinkingIdx
+	}
+	if idx := m.historyIndexForCorrelation(correlationID); idx >= 0 {
+		return idx
+	}
+	return -1
+}
+
+func (m *Model) historyIndexForCorrelation(correlationID string) int {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return -1
+	}
+	m.history.mu.RLock()
+	defer m.history.mu.RUnlock()
+	for idx := m.history.count - 1; idx >= 0; idx-- {
+		physical := m.history.logicalToPhysical(idx)
+		if strings.TrimSpace(m.history.entries[physical].CorrelationID) == correlationID {
+			return idx
+		}
 	}
 	return -1
 }
@@ -1259,6 +1280,7 @@ func (m *Model) FinishThinking(entry *ChatEntry) {
 	if idx >= 0 && idx < m.history.count {
 		physical := m.history.logicalToPhysical(idx)
 		e := &m.history.entries[physical]
+		e.CorrelationID = entry.CorrelationID
 		e.Content = entry.Content
 		e.Source = entry.Source
 		e.AgentType = entry.AgentType

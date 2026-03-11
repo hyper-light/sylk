@@ -6,6 +6,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/events"
@@ -25,6 +26,7 @@ type PipelinePodConfig struct {
 	ActivityPub   events.ActivityPublisher
 	Logger        *slog.Logger
 	ScribeFactory shared.ScribeFactory
+	EventLogger   *agentlog.SessionEventLogger
 
 	// Managed is an optional ManagedPod for pod-level lifecycle.
 	// When set, guard operations delegate to ManagedPod.
@@ -81,6 +83,7 @@ func NewPipelinePod(cfg PipelinePodConfig) *shared.AgentPod {
 		Logger:                 cfg.Logger,
 		MemberTypes:            PipelineAgentTypes[:],
 		DisplayNames:           PipelineAgentDisplayNames,
+		EventLogger:            cfg.EventLogger,
 		ScribeFactory:          cfg.ScribeFactory,
 	})
 }

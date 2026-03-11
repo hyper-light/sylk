@@ -1059,7 +1059,7 @@ func askUserQuestionSkill(a *Architect) *skills.Skill {
 					}
 				}
 				plan.UpdatedAt = time.Now().UTC()
-				_ = a.persistPlanState(plan)
+				a.persistPlanStateBestEffort(plan, originalCIDFromContext(ctx), "clarification questions recorded")
 			}
 			userMessage := formatClarificationNotification(params.Questions)
 			return map[string]any{
@@ -1229,9 +1229,9 @@ func (a *Architect) submitRequirementsResearchHandoff(
 	}
 	if err := a.publishRouteRequest(req); err != nil {
 		if plan != nil {
-			_ = a.clearPlanPendingContinuation(plan, correlationID)
+			a.clearPlanPendingContinuationBestEffort(plan, correlationID, "academic handoff publish failed")
 		}
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "academic handoff publish failed")
 		return nil, fmt.Errorf("academic handoff failed: %w", err)
 	}
 
@@ -1279,7 +1279,7 @@ func (a *Architect) markPlanClarifyingForResearch(plan *DesignPlan, missing []st
 		}
 	}
 	plan.UpdatedAt = time.Now().UTC()
-	_ = a.persistPlanState(plan)
+	a.persistPlanStateBestEffort(plan, "", "plan clarification status refreshed")
 }
 
 func dedupeNonEmptyStrings(values []string) []string {
@@ -1480,7 +1480,7 @@ func (a *Architect) supersedeDuplicateRequestPlans(sessionID, requestCorrelation
 		candidate.Epoch = candidate.SM().Epoch()
 		candidate.UpdatedAt = time.Now().UTC()
 		candidate.Error = "superseded duplicate request plan"
-		_ = a.persistPlanState(candidate)
+		a.persistPlanStateBestEffort(candidate, "", "duplicate request plan superseded")
 	}
 }
 
@@ -1826,8 +1826,8 @@ func (a *Architect) submitPlanAcceptanceEvaluation(
 			"error", err.Error(),
 			"plan_id", payload.PlanID,
 			"session_id", sessionID)
-		_ = a.clearPlanPendingContinuation(plan, correlationID)
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		a.clearPlanPendingContinuationBestEffort(plan, correlationID, "acceptance evaluation publish failed")
+		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "acceptance evaluation publish failed")
 		return nil, fmt.Errorf("guide acceptance evaluation failed: %w", err)
 	}
 	return map[string]any{

@@ -3,30 +3,36 @@ package pod
 import (
 	"context"
 	"sync"
+	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // VFSVolumeConfig configures a VFS-backed volume for pipeline pods.
 type VFSVolumeConfig struct {
-	Name       string
-	PipelineID string
-	SessionID  versioning.SessionID
-	WorkingDir string
-	SessionVFS *versioning.SessionVFS
-	Files      []string
+	Name        string
+	PipelineID  string
+	SessionID   versioning.SessionID
+	WorkingDir  string
+	SessionVFS  *versioning.SessionVFS
+	Files       []string
+	EventLogger *agentlog.SessionEventLogger
+	AgentID     string
 }
 
 // VFSVolume wraps a PipelineVFS with pod-lifecycle-aware mount/unmount.
 // Mount creates a per-pipeline VFS via the CVS; Unmount closes it via
 // the VFSManager.
 type VFSVolume struct {
-	name       string
-	pipelineID string
-	sessionID  versioning.SessionID
-	workingDir string
-	sessionVFS *versioning.SessionVFS
-	files      []string
+	name        string
+	pipelineID  string
+	sessionID   versioning.SessionID
+	workingDir  string
+	sessionVFS  *versioning.SessionVFS
+	files       []string
+	eventLogger *agentlog.SessionEventLogger
+	agentID     string
 
 	mu          sync.Mutex
 	pipelineFA  versioning.FileAccess
@@ -38,12 +44,14 @@ type VFSVolume struct {
 // NewVFSVolume creates a VFS-backed volume for a pipeline pod.
 func NewVFSVolume(cfg VFSVolumeConfig) *VFSVolume {
 	return &VFSVolume{
-		name:       cfg.Name,
-		pipelineID: cfg.PipelineID,
-		sessionID:  cfg.SessionID,
-		workingDir: cfg.WorkingDir,
-		sessionVFS: cfg.SessionVFS,
-		files:      append([]string(nil), cfg.Files...),
+		name:        cfg.Name,
+		pipelineID:  cfg.PipelineID,
+		sessionID:   cfg.SessionID,
+		workingDir:  cfg.WorkingDir,
+		sessionVFS:  cfg.SessionVFS,
+		files:       append([]string(nil), cfg.Files...),
+		eventLogger: cfg.EventLogger,
+		agentID:     cfg.AgentID,
 	}
 }
 
@@ -54,9 +62,21 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 	defer v.mu.Unlock()
 
 	if v.mounted {
+		v.logTrace("vfs_volume_mount_skipped", "debug", agentlog.EventRegistryEvent, map[string]any{
+			"pipeline_id": v.pipelineID,
+			"reason":      "already_mounted",
+		})
 		return nil
 	}
 
+	v.logTrace("vfs_volume_mount_begin", "debug", agentlog.EventRegistryEvent, map[string]any{
+		"pipeline_id":   v.pipelineID,
+		"working_dir":   v.workingDir,
+		"files_count":   len(v.files),
+		"files_preview": previewStrings(v.files, 8),
+		"session_id":    string(v.sessionID),
+		"volume_name":   v.name,
+	})
 	pipelineVFS, err := v.sessionVFS.BeginPipeline(versioning.BeginPipelineConfig{
 		PipelineID: v.pipelineID,
 		SessionID:  v.sessionID,
@@ -64,6 +84,12 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 		Files:      append([]string(nil), v.files...),
 	})
 	if err != nil {
+		v.logTrace("vfs_volume_mount_failed", "error", agentlog.EventError, map[string]any{
+			"pipeline_id": v.pipelineID,
+			"working_dir": v.workingDir,
+			"files_count": len(v.files),
+			"error":       err.Error(),
+		})
 		return err
 	}
 	v.pipelineVFS = pipelineVFS
@@ -77,6 +103,14 @@ func (v *VFSVolume) Mount(_ context.Context) error {
 		DiskFallback:      versioning.NewDiskFileAccess(v.workingDir, true),
 	})
 	v.mounted = true
+	v.logTrace("vfs_volume_mount_done", "debug", agentlog.EventRegistryEvent, map[string]any{
+		"pipeline_id":   v.pipelineID,
+		"working_dir":   v.workingDir,
+		"files_count":   len(v.files),
+		"files_preview": previewStrings(v.files, 8),
+		"session_id":    string(v.sessionID),
+		"volume_name":   v.name,
+	})
 	return nil
 }
 
@@ -197,4 +231,33 @@ func (v *GlobalVFSVolume) SetWorkspaceViews(views versioning.WorkspaceViewAccess
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.views = views
+}
+
+func (v *VFSVolume) logTrace(event, level string, eventCode agentlog.EventType, data map[string]any) {
+	if v == nil || v.eventLogger == nil {
+		return
+	}
+	agentID := v.agentID
+	if agentID == "" {
+		agentID = v.pipelineID
+	}
+	v.eventLogger.LogEvent(agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     agentID,
+		SessionID: string(v.sessionID),
+		Event:     event,
+		EventCode: eventCode,
+		Data:      data,
+	})
+}
+
+func previewStrings(values []string, limit int) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	if limit <= 0 || len(values) <= limit {
+		return append([]string(nil), values...)
+	}
+	return append([]string(nil), values[:limit]...)
 }

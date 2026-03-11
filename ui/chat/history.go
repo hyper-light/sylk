@@ -54,6 +54,7 @@ type ToolCallRegion struct {
 type ChatEntry struct {
 	ID            string
 	Timestamp     time.Time
+	CorrelationID string
 	Source        ChatSource
 	AgentType     string
 	AgentID       string

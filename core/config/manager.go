@@ -24,6 +24,7 @@ type Manager struct {
 }
 
 type Config struct {
+	Logging   LoggingConfig   `yaml:"logging"`
 	LLM       LLMConfig       `yaml:"llm"`
 	Memory    MemoryConfig    `yaml:"memory"`
 	Resources ResourcesConfig `yaml:"resources"`
@@ -31,6 +32,10 @@ type Config struct {
 	Broker    BrokerConfig    `yaml:"broker"`
 	Session   SessionConfig   `yaml:"session"`
 	Agent     AgentConfig     `yaml:"agent"`
+}
+
+type LoggingConfig struct {
+	Level string `yaml:"level"`
 }
 
 type LLMConfig struct {
@@ -100,6 +105,7 @@ func NewManager(dirs *storage.Dirs) *Manager {
 
 func DefaultConfig() *Config {
 	return &Config{
+		Logging: LoggingConfig{},
 		LLM: LLMConfig{
 			Timeout:         2 * time.Minute,
 			DefaultProvider: "anthropic",
@@ -206,6 +212,9 @@ func (m *Manager) loadYAMLFile(path string, cfg *Config) error {
 }
 
 func (m *Manager) applyEnvironment(cfg *Config) {
+	if v := os.Getenv("SYLK_LOG_LEVEL"); v != "" {
+		cfg.Logging.Level = v
+	}
 	if v := os.Getenv("SYLK_LLM_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.LLM.Timeout = d

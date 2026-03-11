@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/messaging"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/toolruntime"
@@ -151,14 +152,23 @@ func (a *Architect) reconcilePendingContinuations() {
 	if a == nil || a.controlStore == nil {
 		return
 	}
-	records, err := a.controlStore.ListActiveContinuations(time.Now().UTC())
+	now := time.Now().UTC()
+	records, err := a.controlStore.ListActiveContinuations(now)
 	if err != nil {
 		a.logWarn("reconcilePendingContinuations: list failed", "error", err)
 		return
 	}
 	for _, record := range records {
+		if record == nil {
+			continue
+		}
+		if record.State == continuationStatusProcessing {
+			a.recoverStaleContinuationRecord(record, "architect restarted while continuation was processing")
+			continue
+		}
 		a.reconcileContinuationRecord(record)
 	}
+	a.recoverAllSessionPendingWork(now)
 }
 
 func (a *Architect) clearPlanPendingContinuation(plan *DesignPlan, correlationID string) error {
@@ -171,6 +181,145 @@ func (a *Architect) clearPlanPendingContinuation(plan *DesignPlan, correlationID
 	plan.PendingWork = nil
 	plan.UpdatedAt = time.Now().UTC()
 	return a.persistPlanState(plan)
+}
+
+func (a *Architect) recoverAllSessionPendingWork(now time.Time) {
+	if a == nil || a.planStore == nil {
+		return
+	}
+	for _, plan := range a.planStore.Snapshot() {
+		a.recoverStalePendingWork(plan, now)
+	}
+}
+
+func (a *Architect) recoverSessionPendingWork(sessionID string, now time.Time) {
+	if a == nil || a.planStore == nil {
+		return
+	}
+	for _, plan := range a.planStore.AllForSession(sessionID) {
+		a.recoverStalePendingWork(plan, now)
+	}
+}
+
+func (a *Architect) recoverStalePendingWork(plan *DesignPlan, now time.Time) {
+	if a == nil || plan == nil {
+		return
+	}
+
+	pending := plan.PendingWork
+	if pending != nil {
+		status := strings.ToLower(strings.TrimSpace(pending.Status))
+		switch {
+		case pending.Kind == string(continuationKindPlanHandoff) && status == string(continuationStatusProcessing):
+			a.recoverPlanHandoffForRetry(plan, pending.CorrelationID, "stale processing plan handoff continuation")
+			return
+		case pending.Kind == string(continuationKindPlanHandoff) && !planHasActivePendingWork(plan, now):
+			a.recoverPlanHandoffForRetry(plan, pending.CorrelationID, "expired plan handoff continuation")
+			return
+		case !planHasActivePendingWork(plan, now):
+			a.logTrace("architect_pending_work_expired", "warn", plan.SessionID, pending.CorrelationID, agentlog.EventError, map[string]any{
+				"plan_id":       plan.ID,
+				"plan_status":   plan.SM().State().String(),
+				"kind":          pending.Kind,
+				"pending_state": pending.Status,
+			})
+			a.failContinuationByCorrelationBestEffort(pending.CorrelationID, plan.SessionID, "pending continuation expired")
+			a.clearPlanPendingContinuationBestEffort(plan, pending.CorrelationID, "pending continuation expired")
+			return
+		}
+	}
+
+	if plan.SM().State() == PlanStatusOrchestrating {
+		a.recoverPlanHandoffForRetry(plan, correlationIDFromPending(pending), "plan stuck in orchestrating without active handoff continuation")
+	}
+}
+
+func (a *Architect) recoverStaleContinuationRecord(record *ArchitectContinuation, reason string) {
+	if a == nil || record == nil {
+		return
+	}
+
+	plan := a.planForContinuation(record)
+	if plan == nil {
+		plan = a.restorePlanForContinuation(record)
+	}
+
+	if record.Kind == continuationKindPlanHandoff {
+		a.recoverPlanHandoffForRetry(plan, record.ResponseCorrelationID, reason)
+		return
+	}
+
+	a.logTrace("architect_continuation_recovered", "warn", record.SessionID, record.ResponseCorrelationID, agentlog.EventError, map[string]any{
+		"continuation_id": record.ID,
+		"kind":            string(record.Kind),
+		"plan_id":         record.PlanID,
+		"reason":          reason,
+	})
+	if plan != nil {
+		a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, reason)
+	}
+	a.completeContinuationBestEffort(record, continuationStatusFailed, record.ResponseJSON, reason, reason)
+}
+
+func (a *Architect) recoverPlanHandoffForRetry(plan *DesignPlan, correlationID string, reason string) {
+	sessionID := ""
+	planID := ""
+	planStatus := ""
+	if plan != nil {
+		sessionID = plan.SessionID
+		planID = plan.ID
+		planStatus = plan.SM().State().String()
+	}
+	a.logTrace("architect_plan_handoff_recovered", "warn", sessionID, correlationID, agentlog.EventError, map[string]any{
+		"plan_id":     planID,
+		"plan_status": planStatus,
+		"reason":      reason,
+	})
+	a.failContinuationByCorrelationBestEffort(correlationID, sessionID, reason)
+	if plan == nil {
+		return
+	}
+	if plan.SM().State() == PlanStatusOrchestrating {
+		if err := plan.SM().TransitionTo(PlanStatusReady, plan); err != nil {
+			a.logTrace("architect_plan_handoff_recovery_transition_failed", "error", plan.SessionID, correlationID, agentlog.EventError, map[string]any{
+				"plan_id":     plan.ID,
+				"plan_status": plan.SM().State().String(),
+				"reason":      reason,
+				"error":       err.Error(),
+			})
+			return
+		}
+	}
+	plan.Status = plan.SM().State()
+	plan.Epoch = plan.SM().Epoch()
+	plan.UpdatedAt = time.Now().UTC()
+	plan.PendingWork = nil
+	a.persistPlanStateBestEffort(plan, correlationID, reason)
+}
+
+func (a *Architect) failContinuationByCorrelationBestEffort(correlationID, sessionID, reason string) {
+	if a == nil || a.controlStore == nil || strings.TrimSpace(correlationID) == "" {
+		return
+	}
+	record, err := a.controlStore.GetContinuationByResponseCorrelation(correlationID)
+	if err != nil {
+		a.logTrace("architect_continuation_lookup_failed", "error", sessionID, correlationID, agentlog.EventError, map[string]any{
+			"reason": reason,
+			"error":  err.Error(),
+		})
+		return
+	}
+	if record == nil {
+		return
+	}
+	a.completeContinuationBestEffort(record, continuationStatusFailed, record.ResponseJSON, reason, reason)
+}
+
+func correlationIDFromPending(pending *PendingContinuation) string {
+	if pending == nil {
+		return ""
+	}
+	return strings.TrimSpace(pending.CorrelationID)
 }
 
 func (a *Architect) publishNotificationPush(content string) {
@@ -207,7 +356,12 @@ func (a *Architect) publishNotificationPush(content string) {
 		Attempt:       1,
 		Priority:      messaging.PriorityNormal,
 	}
-	_ = a.bus.Publish(a.channels.Responses, msg)
+	if err := a.bus.Publish(a.channels.Responses, msg); err != nil {
+		a.logTrace("architect_notification_push_publish_failed", "error", "", pushID, agentlog.EventError, map[string]any{
+			"error":   err.Error(),
+			"content": content,
+		})
+	}
 }
 
 func (a *Architect) handleContinuationResponse(msg *guide.Message) error {
@@ -241,38 +395,38 @@ func (a *Architect) handleGuardianApprovalContinuation(
 ) error {
 	resp, respJSON, err := routeResponseFromMessage(msg)
 	if err != nil {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "guardian approval response decode failed")
 		return err
 	}
 	req, err := decodeGuardianControlRequest(record.RequestJSON)
 	if err != nil {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, err.Error(), "guardian control request decode failed")
 		return err
 	}
 	plan := a.planForContinuation(record)
 	if !resp.Success {
 		if plan != nil {
-			_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+			a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "guardian approval denied")
 		}
 		msgText := fmt.Sprintf("Guardian denied %s: %s", record.ToolName, resp.Error)
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, resp.Error)
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, resp.Error, "guardian approval denied")
 		a.publishNotificationPush(msgText)
 		return nil
 	}
 	grant, err := decodeGuardianControlGrant(resp.Data)
 	if err != nil {
 		if plan != nil {
-			_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+			a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "guardian grant decode failed")
 		}
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, err.Error(), "guardian grant decode failed")
 		a.publishNotificationPush("Guardian returned an invalid approval response.")
 		return err
 	}
 	if plan != nil {
-		_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+		a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "guardian approval completed")
 	}
 	if _, activateErr := a.toolRuntime().Activate(record.ToolName); activateErr != nil {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, activateErr.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, activateErr.Error(), "approved tool activation failed")
 		a.publishNotificationPush("I couldn't activate the approved tool: " + activateErr.Error())
 		return activateErr
 	}
@@ -287,7 +441,7 @@ func (a *Architect) handleGuardianApprovalContinuation(
 		CapabilityScope: req.CapabilityScope,
 	}, grant)
 	if execErr != nil {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, execErr.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, execErr.Error(), "approved tool execution failed")
 		a.publishNotificationPush("I couldn't complete the approved operation: " + execErr.Error())
 		return execErr
 	}
@@ -310,27 +464,27 @@ func (a *Architect) handleAcceptanceEvaluationContinuation(
 	plan := a.planForContinuation(record)
 	if err != nil {
 		if plan != nil {
-			_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+			a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "acceptance response decode failed")
 		}
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "acceptance response decode failed")
 		return err
 	}
 	if plan != nil {
-		_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+		a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "acceptance response received")
 	}
 	if !resp.Success {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, resp.Error)
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, resp.Error, "acceptance evaluation unsuccessful")
 		a.publishNotificationPush("I couldn't complete plan acceptance evaluation: " + strings.TrimSpace(resp.Error))
 		return nil
 	}
 	payload, err := decodePlanAcceptancePayload(record.RequestJSON)
 	if err != nil {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, err.Error(), "acceptance payload decode failed")
 		return err
 	}
 	result, err := extractAcceptanceResult(msg, payload)
 	if err != nil {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, err.Error(), "acceptance result extraction failed")
 		a.publishNotificationPush("I couldn't interpret the plan acceptance response.")
 		return err
 	}
@@ -377,16 +531,16 @@ func (a *Architect) handlePlanHandoffContinuation(
 	plan := a.planForContinuation(record)
 	if err != nil {
 		if plan != nil {
-			_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+			a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "plan handoff response decode failed")
 		}
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "plan handoff response decode failed")
 		return err
 	}
 	if plan == nil {
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, "plan not found")
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, "plan not found", "plan handoff continuation lost plan")
 		return nil
 	}
-	_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+	a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "plan handoff response received")
 	if !resp.Success || !isHandoffSuccess(msg) {
 		if plan.SM().State() == PlanStatusOrchestrating {
 			if transitionErr := plan.SM().TransitionTo(PlanStatusReady, plan); transitionErr == nil {
@@ -395,18 +549,18 @@ func (a *Architect) handlePlanHandoffContinuation(
 			}
 		}
 		plan.UpdatedAt = time.Now().UTC()
-		_ = a.persistPlanState(plan)
+		a.persistPlanStateBestEffort(plan, record.ResponseCorrelationID, "plan handoff failed; reverting to ready")
 		summary := strings.TrimSpace(resp.Error)
 		if summary == "" {
 			summary = summarizeAutoHandoffResponse(msg)
 		}
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, summary)
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, summary, "plan handoff unsuccessful")
 		a.publishNotificationPush("I couldn't dispatch the plan to the orchestrator: " + summary)
 		return nil
 	}
 	if plan.SM().State() == PlanStatusOrchestrating {
 		if transitionErr := plan.SM().TransitionTo(PlanStatusExecuting, plan); transitionErr != nil {
-			_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, transitionErr.Error())
+			a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, transitionErr.Error(), "plan transition to executing failed")
 			return transitionErr
 		}
 	}
@@ -442,20 +596,20 @@ func (a *Architect) handleAcademicRequirementsHandoffContinuation(
 	plan := a.planForContinuation(record)
 	if err != nil {
 		if plan != nil {
-			_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+			a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "academic handoff response decode failed")
 		}
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		a.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "academic handoff response decode failed")
 		return err
 	}
 	if plan != nil {
-		_ = a.clearPlanPendingContinuation(plan, record.ResponseCorrelationID)
+		a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "academic handoff response received")
 	}
 	if !resp.Success {
 		summary := strings.TrimSpace(resp.Error)
 		if summary == "" {
 			summary = "the Academic handoff did not complete successfully"
 		}
-		_ = a.controlStore.CompleteContinuation(record, continuationStatusFailed, respJSON, summary)
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, summary, "academic handoff unsuccessful")
 		a.publishNotificationPush("I couldn't complete the Academic handoff: " + summary)
 		return nil
 	}

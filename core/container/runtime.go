@@ -13,6 +13,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/concurrency"
 	csecurity "github.com/adalundhe/sylk/core/container/security"
+	"github.com/adalundhe/sylk/core/logging"
 	"github.com/google/uuid"
 )
 
@@ -32,7 +33,7 @@ func runtimeFileLog() *slog.Logger {
 			runtimeDebugLog = slog.Default()
 			return
 		}
-		runtimeDebugLog = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		runtimeDebugLog = slog.New(slog.NewTextHandler(f, logging.HandlerOptions(slog.LevelInfo)))
 	})
 	return runtimeDebugLog
 }
@@ -79,13 +80,13 @@ type ProbeFactory func(agent ContainerAgent, spec *ContainerSpec) []ProbeSpec
 
 // DefaultRuntimeConfig provides configuration for the default runtime.
 type DefaultRuntimeConfig struct {
-	Budget          *concurrency.GoroutineBudget
-	Registry        *ContainerRegistry
-	Quota           *ResourceQuota
-	Admission       *AdmissionController
-	CreateAgent     AgentCreator
-	ProbeFactory    ProbeFactory
-	ParentCtx       context.Context
+	Budget       *concurrency.GoroutineBudget
+	Registry     *ContainerRegistry
+	Quota        *ResourceQuota
+	Admission    *AdmissionController
+	CreateAgent  AgentCreator
+	ProbeFactory ProbeFactory
+	ParentCtx    context.Context
 }
 
 // DefaultRuntime is the container runtime that wires existing primitives.

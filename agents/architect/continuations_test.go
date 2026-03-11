@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,6 +135,73 @@ func TestDispatchPlanExecution_QueuesAsyncHandoff(t *testing.T) {
 	}
 	if req.TargetAgentID != "orchestrator" {
 		t.Fatalf("expected orchestrator target, got %q", req.TargetAgentID)
+	}
+}
+
+func TestDispatchPlanExecution_PublishesRerouteForOrchestratorHandoff(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-1",
+		SessionID: "sess-1",
+		Query:     "build the feature",
+		Status:    PlanStatusReady,
+		Tasks: []*AtomicTask{
+			{ID: "task-1", Name: "Task", AgentType: "engineer", Description: "Ship it"},
+		},
+		Workflow:  &WorkflowDAG{TotalTasks: 1, Tasks: []*AtomicTask{{ID: "task-1"}}, DAG: &dag.DAG{}},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	a := testArchitectWithControlStore(t, plan)
+	a.running = true
+	a.bus = &testBus{}
+	a.channels = guide.NewAgentChannels("architect", "architect")
+
+	ctx := withArchitectStreamContext(context.Background(), "corr-user", "tui")
+	_, handled := a.dispatchPlanExecution(ctx, &ArchitectRequest{
+		ID:        "req-1",
+		Intent:    IntentExecute,
+		SessionID: plan.SessionID,
+		Timestamp: now,
+	}, plan)
+	if !handled {
+		t.Fatal("expected dispatch to handle ready plan")
+	}
+
+	bus := a.bus.(*testBus)
+	if len(bus.published) < 2 {
+		t.Fatalf("expected reroute + route request publishes, got %d", len(bus.published))
+	}
+
+	var sawReroute bool
+	var sawRouteRequest bool
+	for _, published := range bus.published {
+		if published.topic == guide.TopicGuideRequests {
+			if req, ok := published.msg.GetRouteRequest(); ok && req != nil && req.TargetAgentID == "orchestrator" {
+				sawRouteRequest = true
+			}
+		}
+		stream, ok := published.msg.GetStreamResponse()
+		if !ok || stream == nil || stream.Event == nil || stream.Event.Type != guide.StreamEventReroute {
+			continue
+		}
+		data, ok := stream.Event.Data.(map[string]string)
+		if !ok {
+			t.Fatalf("reroute payload type = %T, want map[string]string", stream.Event.Data)
+		}
+		if data["to_agent"] != "orchestrator" || data["original_correlation_id"] != "corr-user" {
+			t.Fatalf("unexpected reroute payload: %+v", data)
+		}
+		if strings.TrimSpace(data["new_correlation_id"]) == "" {
+			t.Fatalf("expected new correlation id in reroute payload: %+v", data)
+		}
+		sawReroute = true
+	}
+	if !sawReroute {
+		t.Fatal("expected orchestrator handoff reroute to be published")
+	}
+	if !sawRouteRequest {
+		t.Fatal("expected orchestrator route request to be published")
 	}
 }
 
@@ -347,5 +415,69 @@ func TestHandleContinuationResponse_ErrorMessageFailsContinuation(t *testing.T) 
 	}
 	if stored.ErrorText != "route failed" {
 		t.Fatalf("error_text = %q, want route failed", stored.ErrorText)
+	}
+}
+
+func TestReconcilePendingContinuations_RecoversStaleProcessingPlanHandoff(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-processing",
+		SessionID: "sess-1",
+		Query:     "build the feature",
+		Status:    PlanStatusOrchestrating,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:          string(continuationKindPlanHandoff),
+			Status:        string(continuationStatusPending),
+			TargetAgentID: "orchestrator",
+			CorrelationID: "corr-processing",
+			CreatedAt:     now,
+			ExpiresAt:     now.Add(time.Minute),
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	record := &ArchitectContinuation{
+		ID:                    "cont-processing",
+		Kind:                  continuationKindPlanHandoff,
+		State:                 continuationStatusProcessing,
+		PlanID:                plan.ID,
+		SessionID:             plan.SessionID,
+		TargetAgentID:         "orchestrator",
+		ResponseCorrelationID: "corr-processing",
+		RequestJSON:           `{"plan_id":"plan-processing"}`,
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(time.Minute),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	a.reconcilePendingContinuations()
+
+	storedPlan := a.planStore.Get(plan.ID)
+	if storedPlan == nil {
+		t.Fatal("expected plan to remain in store")
+	}
+	if storedPlan.SM().State() != PlanStatusReady {
+		t.Fatalf("plan state = %s, want ready", storedPlan.SM().State())
+	}
+	if storedPlan.PendingWork != nil {
+		t.Fatalf("expected pending work to clear, got %+v", storedPlan.PendingWork)
+	}
+
+	storedRecord, err := a.controlStore.GetContinuationByResponseCorrelation("corr-processing")
+	if err != nil {
+		t.Fatalf("load continuation: %v", err)
+	}
+	if storedRecord == nil {
+		t.Fatal("expected continuation record to remain present")
+	}
+	if storedRecord.State != continuationStatusFailed {
+		t.Fatalf("record state = %s, want failed", storedRecord.State)
+	}
+	if !strings.Contains(storedRecord.ErrorText, "processing") {
+		t.Fatalf("error_text = %q, want processing recovery reason", storedRecord.ErrorText)
 	}
 }

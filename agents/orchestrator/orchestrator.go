@@ -387,6 +387,9 @@ func (o *Orchestrator) handleAuthChanged(msg *guide.Message) error {
 func (o *Orchestrator) SetTaskRouter(router *TaskRouter) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if router != nil && o.steering != nil {
+		router.SetEventLogger(o.steering.EventLogger())
+	}
 	o.taskRouter = router
 }
 
@@ -1024,7 +1027,21 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 }
 
 func (o *Orchestrator) handleBusResponse(msg *guide.Message) error {
+	if msg == nil {
+		o.logTrace("bus_response_nil", agentlog.EventError, nil)
+		return nil
+	}
+	o.logTrace("bus_response_received", agentlog.EventTaskDispatched, map[string]any{
+		"correlation_id":  msg.CorrelationID,
+		"message_type":    string(msg.Type),
+		"source_agent_id": msg.SourceAgentID,
+		"target_agent_id": msg.TargetAgentID,
+	})
 	if o.deliverPendingMessage(msg) {
+		o.logTrace("bus_response_sync_waiter_delivered", agentlog.EventTaskDispatched, map[string]any{
+			"correlation_id": msg.CorrelationID,
+			"message_type":   string(msg.Type),
+		})
 		return nil
 	}
 
@@ -1033,9 +1050,25 @@ func (o *Orchestrator) handleBusResponse(msg *guide.Message) error {
 	o.mu.RUnlock()
 
 	if router != nil {
-		router.DeliverResponse(msg)
+		if router.DeliverResponse(msg) {
+			o.logTrace("bus_response_task_router_delivered", agentlog.EventTaskDispatched, map[string]any{
+				"correlation_id": msg.CorrelationID,
+				"message_type":   string(msg.Type),
+			})
+		} else {
+			o.logTrace("bus_response_unhandled", agentlog.EventError, map[string]any{
+				"correlation_id":  msg.CorrelationID,
+				"message_type":    string(msg.Type),
+				"source_agent_id": msg.SourceAgentID,
+				"target_agent_id": msg.TargetAgentID,
+			})
+		}
 	} else {
 		slog.Warn("response dropped: task router not yet wired", "correlation_id", msg.CorrelationID)
+		o.logTrace("bus_response_task_router_missing", agentlog.EventError, map[string]any{
+			"correlation_id": msg.CorrelationID,
+			"message_type":   string(msg.Type),
+		})
 	}
 	return nil
 }
@@ -1210,16 +1243,28 @@ func pipelineWorkerTargetAgentID(taskID, agentType string) string {
 func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 	data, ok := msg.Payload.(map[string]any)
 	if !ok {
+		o.logTrace("task_complete_payload_invalid", agentlog.EventError, map[string]any{
+			"message_type": string(msg.Type),
+		})
 		return nil
 	}
 
 	taskID, _ := data["task_id"].(string)
+	if strings.TrimSpace(taskID) == "" {
+		o.logTrace("task_complete_missing_task_id", agentlog.EventError, map[string]any{
+			"node_id": data["node_id"],
+		})
+		return nil
+	}
 	result := data["result"]
 
 	o.mu.Lock()
 	task, ok := o.state.Tasks[taskID]
 	if !ok {
 		o.mu.Unlock()
+		o.logTrace("task_complete_unknown_task", agentlog.EventError, map[string]any{
+			"task_id": taskID,
+		})
 		return nil
 	}
 	o.mu.Unlock()
@@ -1297,16 +1342,29 @@ func (o *Orchestrator) handleTaskComplete(msg *guide.Message) error {
 func (o *Orchestrator) handleTaskFailed(msg *guide.Message) error {
 	data, ok := msg.Payload.(map[string]any)
 	if !ok {
+		o.logTrace("task_failed_payload_invalid", agentlog.EventError, map[string]any{
+			"message_type": string(msg.Type),
+		})
 		return nil
 	}
 
 	taskID, _ := data["task_id"].(string)
 	errorMsg, _ := data["error"].(string)
+	if strings.TrimSpace(taskID) == "" {
+		o.logTrace("task_failed_missing_task_id", agentlog.EventError, map[string]any{
+			"error": errorMsg,
+		})
+		return nil
+	}
 
 	o.mu.Lock()
 	task, ok := o.state.Tasks[taskID]
 	if !ok {
 		o.mu.Unlock()
+		o.logTrace("task_failed_unknown_task", agentlog.EventError, map[string]any{
+			"task_id": taskID,
+			"error":   errorMsg,
+		})
 		return nil
 	}
 	o.mu.Unlock()
@@ -1359,12 +1417,22 @@ func (o *Orchestrator) handleWorkflowStatus(msg *guide.Message) error {
 
 	data, ok := msg.Payload.(map[string]any)
 	if !ok {
+		o.logTrace("workflow_status_payload_invalid", agentlog.EventError, map[string]any{
+			"message_type": string(msg.Type),
+		})
 		return nil
 	}
 
 	workflowID, _ := data["workflow_id"].(string)
 	statusStr, _ := data["status"].(string)
 	phase, _ := data["phase"].(string)
+	if strings.TrimSpace(workflowID) == "" {
+		o.logTrace("workflow_status_missing_workflow_id", agentlog.EventError, map[string]any{
+			"status": statusStr,
+			"phase":  phase,
+		})
+		return nil
+	}
 
 	workflow, ok := o.state.Workflows[workflowID]
 	if !ok {

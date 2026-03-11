@@ -6635,16 +6635,17 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 		agentDisplay = r.AgentName
 	}
 	entry := &chat.ChatEntry{
-		ID:        uuid.New().String(),
-		Timestamp: time.Now(),
-		Source:    source,
-		AgentType: agentDisplay,
-		AgentID:   r.AgentID,
-		TaskID:    streamTaskID,
-		TaskName:  streamTaskName,
-		TaskSlug:  streamTaskSlug,
-		Content:   content,
-		Height:    -1,
+		ID:            uuid.New().String(),
+		Timestamp:     time.Now(),
+		CorrelationID: r.CorrelationID,
+		Source:        source,
+		AgentType:     agentDisplay,
+		AgentID:       r.AgentID,
+		TaskID:        streamTaskID,
+		TaskName:      streamTaskName,
+		TaskSlug:      streamTaskSlug,
+		Content:       content,
+		Height:        -1,
 	}
 	m.chat.FinishThinking(entry)
 	return nil

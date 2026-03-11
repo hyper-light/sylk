@@ -460,6 +460,49 @@ func TestOpenAIProviderBuildResponseParams_IncludesNativeWebSearchTool(t *testin
 	}
 }
 
+func TestIsStrictCompatible_RejectsNestedObjectMissingRequired(t *testing.T) {
+	params := sanitizeSchemaIterative(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path": map[string]any{"type": "string"},
+			"basis": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"scope": map[string]any{"type": "string"},
+					"path":  map[string]any{"type": "string"},
+				},
+			},
+		},
+		"required": []string{"path", "basis"},
+	})
+
+	if isStrictCompatible(params) {
+		t.Fatal("expected nested object without required list to be non-strict-compatible")
+	}
+}
+
+func TestIsStrictCompatible_AllowsNestedObjectWithRequired(t *testing.T) {
+	params := sanitizeSchemaIterative(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path": map[string]any{"type": "string"},
+			"basis": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"scope": map[string]any{"type": "string"},
+					"path":  map[string]any{"type": "string"},
+				},
+				"required": []any{"scope", "path"},
+			},
+		},
+		"required": []string{"path", "basis"},
+	})
+
+	if !isStrictCompatible(params) {
+		t.Fatal("expected nested object with complete required list to be strict-compatible")
+	}
+}
+
 func marshalResponseNewParams(t *testing.T, params responses.ResponseNewParams) map[string]any {
 	t.Helper()
 

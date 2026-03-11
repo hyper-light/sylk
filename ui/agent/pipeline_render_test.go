@@ -49,6 +49,36 @@ func TestFormatPipelineCounterLabel_UsesLoopsOrPhaseFallback(t *testing.T) {
 	}
 }
 
+func TestRenderPipelineRow_WrapsProgressWithContinuationPrefix(t *testing.T) {
+	th := theme.DefaultDark()
+	grad := th.Palette.PipelineGradient()
+	pl := &PipelineState{
+		ID:        "task_auth_checkout",
+		TaskLabel: "auth-checkout-extremely-long-title",
+		Status:    "executing",
+		LoopCount: 3,
+		MaxLoops:  12,
+	}
+
+	rendered := stripANSI(renderPipelineRow(pl, 26, 0, grad, th, false, "", AnimState{}, false))
+	lines := strings.Split(rendered, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected wrapped pipeline row to use 2 lines, got %d: %q", len(lines), rendered)
+	}
+	if !strings.HasPrefix(lines[0], pipelineHeaderPrefix(false)) {
+		t.Fatalf("first line = %q, want prefix %q", lines[0], pipelineHeaderPrefix(false))
+	}
+	if !strings.HasPrefix(lines[1], pipelineContinuationPrefix()) {
+		t.Fatalf("second line = %q, want continuation prefix %q", lines[1], pipelineContinuationPrefix())
+	}
+	if strings.Contains(lines[0], strings.Repeat(pipelineProgressGlyph, progressBarCells)) {
+		t.Fatalf("expected progress bar to move off the first line, got %q", lines[0])
+	}
+	if !strings.Contains(lines[1], strings.Repeat(pipelineProgressGlyph, progressBarCells)) || !strings.Contains(lines[1], "3/12") {
+		t.Fatalf("second line = %q, want progress bar and counter", lines[1])
+	}
+}
+
 func TestModel_HandlePipelineState_RehomesRuntimePipelinePlaceholder(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)

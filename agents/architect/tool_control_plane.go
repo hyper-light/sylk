@@ -75,9 +75,9 @@ func (c *architectGuardianControlPlane) RequestGrant(
 	if err := c.owner.publishRouteRequest(routeReq); err != nil {
 		plan := c.planForRequest(sessionID, record.PlanID, req)
 		if plan != nil {
-			_ = c.owner.clearPlanPendingContinuation(plan, correlationID)
+			c.owner.clearPlanPendingContinuationBestEffort(plan, correlationID, "guardian tool control publish failed")
 		}
-		_ = c.owner.controlStore.CompleteContinuation(record, continuationStatusFailed, "", err.Error())
+		c.owner.completeContinuationBestEffort(record, continuationStatusFailed, "", err.Error(), "guardian tool control publish failed")
 		return nil, fmt.Errorf("publish guardian tool control request: %w", err)
 	}
 

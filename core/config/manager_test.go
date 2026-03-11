@@ -12,6 +12,9 @@ import (
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
+	if cfg.Logging.Level != "" {
+		t.Errorf("Logging.Level: got %q, want empty default", cfg.Logging.Level)
+	}
 	if cfg.LLM.Timeout != 2*time.Minute {
 		t.Errorf("LLM.Timeout: got %v, want 2m", cfg.LLM.Timeout)
 	}
@@ -54,6 +57,8 @@ func TestManagerLoadFromFile(t *testing.T) {
 	}
 
 	configContent := `
+logging:
+  level: trace
 llm:
   default_provider: openai
   max_retries: 5
@@ -71,6 +76,9 @@ memory:
 	}
 
 	cfg := m.Get()
+	if cfg.Logging.Level != "trace" {
+		t.Errorf("Logging.Level: got %q, want trace", cfg.Logging.Level)
+	}
 	if cfg.LLM.DefaultProvider != "openai" {
 		t.Errorf("Provider: got %s, want openai", cfg.LLM.DefaultProvider)
 	}
@@ -93,6 +101,7 @@ func TestManagerEnvironmentOverride(t *testing.T) {
 	t.Setenv("SYLK_LLM_DEFAULT_PROVIDER", "google")
 	t.Setenv("SYLK_LLM_MAX_RETRIES", "10")
 	t.Setenv("SYLK_AGENT_DEFAULT_MODEL", "claude-opus-4-20250514")
+	t.Setenv("SYLK_LOG_LEVEL", "trace")
 
 	m := NewManager(dirs)
 	if err := m.Load(); err != nil {
@@ -100,6 +109,9 @@ func TestManagerEnvironmentOverride(t *testing.T) {
 	}
 
 	cfg := m.Get()
+	if cfg.Logging.Level != "trace" {
+		t.Errorf("Logging.Level: got %q, want trace", cfg.Logging.Level)
+	}
 	if cfg.LLM.DefaultProvider != "google" {
 		t.Errorf("Provider: got %s, want google", cfg.LLM.DefaultProvider)
 	}

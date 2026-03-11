@@ -2028,25 +2028,68 @@ func openAIWebSearchUserLocation(location *WebSearchUserLocation) *responses.Web
 }
 
 // isStrictCompatible returns true when the JSON schema is compatible with
-// OpenAI's strict function calling mode. Strict mode requires every property
-// to be listed in the required array and additionalProperties to be false.
-// Schemas with optional parameters (fewer required entries than properties)
-// must use non-strict mode.
+// OpenAI's strict function calling mode. Every object node in the schema tree
+// must list all of its properties in required and set
+// additionalProperties=false. Schemas with optional parameters anywhere in the
+// tree must use non-strict mode.
 func isStrictCompatible(params map[string]any) bool {
-	props, _ := params["properties"].(map[string]any)
-	if len(props) == 0 {
-		return true // No properties — trivially strict-compatible.
+	if params == nil {
+		return true
 	}
-	req, _ := params["required"].([]any)
-	if len(req) < len(props) {
-		return false
+	stack := []map[string]any{params}
+	for len(stack) > 0 {
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if props, _ := node["properties"].(map[string]any); props != nil {
+			ap, hasAP := node["additionalProperties"]
+			if !hasAP {
+				return false
+			}
+			apBool, ok := ap.(bool)
+			if !ok || apBool {
+				return false
+			}
+
+			required := requiredPropertySet(node["required"])
+			for name, child := range props {
+				if _, ok := required[name]; !ok {
+					return false
+				}
+				if childMap, ok := child.(map[string]any); ok {
+					stack = append(stack, childMap)
+				}
+			}
+		}
+
+		if items, ok := node["items"].(map[string]any); ok {
+			stack = append(stack, items)
+		}
 	}
-	ap, hasAP := params["additionalProperties"]
-	if !hasAP {
-		return false
+	return true
+}
+
+func requiredPropertySet(raw any) map[string]struct{} {
+	if raw == nil {
+		return nil
 	}
-	apBool, ok := ap.(bool)
-	return ok && !apBool
+	set := map[string]struct{}{}
+	switch values := raw.(type) {
+	case []any:
+		for _, value := range values {
+			name, ok := value.(string)
+			if ok && name != "" {
+				set[name] = struct{}{}
+			}
+		}
+	case []string:
+		for _, name := range values {
+			if name != "" {
+				set[name] = struct{}{}
+			}
+		}
+	}
+	return set
 }
 
 func (p *OpenAIProvider) convertResponse(result *responses.Response) *Response {

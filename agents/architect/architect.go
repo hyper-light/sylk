@@ -22,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/domain"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/logging"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/signal"
 	"github.com/adalundhe/sylk/core/skills"
@@ -233,7 +234,7 @@ func architectDebugLog() *slog.Logger {
 			architectDebugLogger = slog.Default()
 			return
 		}
-		architectDebugLogger = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		architectDebugLogger = slog.New(slog.NewTextHandler(f, logging.HandlerOptions(slog.LevelDebug)))
 	})
 	return architectDebugLogger
 }
@@ -966,7 +967,11 @@ func (a *Architect) publishInterruptResponse(fwd *guide.ForwardedRequest) {
 		Data:                &ConversationResult{Response: "(interrupted)", Intent: IntentConverse},
 	}
 	msg := guide.NewResponseMessage(a.generateMessageID(), resp)
-	_ = a.bus.Publish(a.channels.Responses, msg)
+	if err := a.bus.Publish(a.channels.Responses, msg); err != nil {
+		a.logTrace("architect_interrupt_response_publish_failed", "error", fwd.SessionID, fwd.CorrelationID, agentlog.EventError, map[string]any{
+			"error": err.Error(),
+		})
+	}
 }
 
 func (a *Architect) handleActionBusRequest(ctx context.Context, msg *guide.Message) error {
@@ -1291,7 +1296,7 @@ func (a *Architect) handleClarificationResponse(ctx context.Context, fwd *guide.
 	}
 	plan.Status = plan.SM().State()
 	plan.UpdatedAt = time.Now()
-	_ = a.persistPlanState(plan)
+	a.persistPlanStateBestEffort(plan, fwd.CorrelationID, "clarification response transitioned plan")
 
 	req := &ArchitectRequest{
 		ID:        uuid.New().String(),
@@ -1484,6 +1489,7 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 		"has_metadata", fwd.Metadata != nil)
 
 	now := time.Now().UTC()
+	a.recoverSessionPendingWork(sessionID, now)
 	plan := a.latestReadyPlan(sessionID)
 	if plan != nil && planHasActivePendingWork(plan, now) {
 		return &ConversationResult{
@@ -1615,19 +1621,70 @@ func forwardedRequestParams(fwd *guide.ForwardedRequest) map[string]any {
 
 // handleBusResponse processes responses to requests we made
 func (a *Architect) handleBusResponse(msg *guide.Message) error {
+	a.logTrace("architect_bus_response_received", "debug", sessionIDFromMessage(msg), messageCorrelationID(msg), agentlog.EventTaskDispatched, map[string]any{
+		"message_type":    messageTypeString(msg),
+		"source_agent_id": messageSourceAgentID(msg),
+		"target_agent_id": messageTargetAgentID(msg),
+	})
 	a.deliverPendingBusMessage(msg)
 	if a.hasPendingBusWait(msg.CorrelationID) {
 		a.logger.Debug("received response for synchronous waiter", "correlation_id", msg.CorrelationID, "type", msg.Type)
+		a.logTrace("architect_bus_response_sync_waiter", "debug", sessionIDFromMessage(msg), messageCorrelationID(msg), agentlog.EventTaskDispatched, map[string]any{
+			"message_type": messageTypeString(msg),
+		})
 		return nil
 	}
 	if err := a.handleContinuationResponse(msg); err != nil {
 		a.logWarn("handleBusResponse: continuation processing failed",
 			"correlation_id", msg.CorrelationID,
 			"error", err)
+		a.logTrace("architect_bus_response_continuation_failed", "error", sessionIDFromMessage(msg), messageCorrelationID(msg), agentlog.EventError, map[string]any{
+			"message_type": messageTypeString(msg),
+			"error":        err.Error(),
+		})
 		return err
 	}
 	a.logger.Debug("received response", "correlation_id", msg.CorrelationID, "type", msg.Type)
+	a.logTrace("architect_bus_response_continuation_ok", "debug", sessionIDFromMessage(msg), messageCorrelationID(msg), agentlog.EventTaskDispatched, map[string]any{
+		"message_type": messageTypeString(msg),
+	})
 	return nil
+}
+
+func sessionIDFromMessage(msg *guide.Message) string {
+	if msg == nil || msg.Metadata == nil {
+		return ""
+	}
+	sessionID, _ := msg.Metadata["session_id"].(string)
+	return sessionID
+}
+
+func messageCorrelationID(msg *guide.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return msg.CorrelationID
+}
+
+func messageTypeString(msg *guide.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return string(msg.Type)
+}
+
+func messageSourceAgentID(msg *guide.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return msg.SourceAgentID
+}
+
+func messageTargetAgentID(msg *guide.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return msg.TargetAgentID
 }
 
 // handleRegistryAnnouncement processes agent registration/unregistration events

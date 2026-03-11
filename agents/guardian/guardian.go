@@ -21,6 +21,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/handoff"
+	"github.com/adalundhe/sylk/core/logging"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/search/git"
 	"github.com/adalundhe/sylk/core/skills"
@@ -147,7 +148,7 @@ func guardianDebugLog() *slog.Logger {
 			guardianDebugLogger = slog.Default()
 			return
 		}
-		guardianDebugLogger = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		guardianDebugLogger = slog.New(slog.NewTextHandler(f, logging.HandlerOptions(slog.LevelDebug)))
 	})
 	return guardianDebugLogger
 }
