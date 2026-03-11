@@ -384,6 +384,105 @@ func TestTaskRouter_DeliverResponse_MirrorsPipelineStreamToTUI(t *testing.T) {
 	}
 }
 
+func TestTaskRouter_DeliverResponse_MirrorStreamAddsTaskMetadataWhenMissing(t *testing.T) {
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer bus.Close()
+
+	scope := testScope()
+	router := testRouter(bus, scope)
+	task := testTask()
+	task.AgentType = "tester-pipeline"
+	task.TargetAgentID = TaskScopedAgentID(task.TaskID, task.AgentType)
+	task.Context = map[string]any{
+		"task_slug": "hello-cli",
+		"task_name": "Hello CLI",
+	}
+
+	updateCh := make(chan *PipelineUpdate, 1)
+	sub, err := bus.SubscribeAsync("pipeline.update.tester-pipeline", func(msg *guide.Message) error {
+		if update, ok := msg.Payload.(*PipelineUpdate); ok {
+			updateCh <- update
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer sub.Unsubscribe()
+
+	guideCh := make(chan string, 1)
+	guideSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		if req, ok := msg.GetRouteRequest(); ok {
+			guideCh <- req.CorrelationID
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer guideSub.Unsubscribe()
+
+	tuiCh := make(chan *guide.StreamResponse, 1)
+	tuiSub, err := bus.SubscribeAsync(guide.TopicResponses("tui", "tui"), func(msg *guide.Message) error {
+		if stream, ok := msg.GetStreamResponse(); ok {
+			tuiCh <- stream
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	defer tuiSub.Unsubscribe()
+
+	err = router.Route(task)
+	require.NoError(t, err)
+
+	var corrID string
+	select {
+	case corrID = <-guideCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no guide request intercepted")
+	}
+
+	streamMsg := &guide.Message{
+		ID:            "stream-1",
+		CorrelationID: corrID,
+		Type:          guide.MessageTypeStream,
+		Payload: &guide.StreamResponse{
+			CorrelationID:     corrID,
+			RespondingAgentID: TaskScopedAgentID(task.TaskID, task.AgentType),
+			Event: &guide.StreamEvent{
+				Type: guide.StreamEventProgress,
+				Data: &guide.ProgressData{},
+			},
+		},
+	}
+	assert.True(t, router.DeliverResponse(streamMsg))
+
+	select {
+	case mirrored := <-tuiCh:
+		require.NotNil(t, mirrored)
+		assert.Equal(t, "tester-pipeline", mirrored.Metadata["agent_type"])
+		assert.Equal(t, "task-1", mirrored.Metadata["task_id"])
+		assert.Equal(t, "task-1", mirrored.Metadata["pipeline_id"])
+		assert.Equal(t, "hello-cli", mirrored.Metadata["task_slug"])
+		assert.Equal(t, "Hello CLI", mirrored.Metadata["task_name"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirrored stream was not published to the TUI response topic")
+	}
+
+	resp := &guide.RouteResponse{
+		CorrelationID:     corrID,
+		Success:           true,
+		Data:              "task output",
+		RespondingAgentID: TaskScopedAgentID(task.TaskID, task.AgentType),
+	}
+	respMsg := guide.NewResponseMessage("", resp)
+	respMsg.CorrelationID = corrID
+	assert.True(t, router.DeliverResponse(respMsg))
+
+	select {
+	case update := <-updateCh:
+		assert.Equal(t, "succeeded", update.Status)
+	case <-time.After(2 * time.Second):
+		t.Fatal("pipeline update was not published")
+	}
+}
+
 func TestTaskRouter_ErrorMessagePublishesFailure(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()

@@ -34,6 +34,7 @@ func (o *Orchestrator) registerCoreSkills() {
 	o.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
 	o.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
 	o.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil))
+	o.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return o.workspaceViews }, nil, nil))
 
 	// DAG execution skills (registered after store/bridge are wired)
 	o.skills.Register(executeDAGSkill(o))
@@ -63,7 +64,7 @@ func orchestratorPinnedSkillNames() []string {
 		"query_task", "query_workflow", "push_status",
 		"ingest_plan", "execute_dag",
 		"escalate_to_architect",
-		"read_workspace_file", "inspect_workspace_state",
+		"read_workspace_file", "inspect_workspace_state", "diff_workspace_file",
 	}
 }
 
@@ -79,7 +80,7 @@ func orchestratorCoreSkillNames() []string {
 		"query_health_history",
 		"read_workspace_file", "workspace_glob",
 		"workspace_grep", "inspect_workspace_state",
-		"summarize_workspace_state",
+		"summarize_workspace_state", "diff_workspace_file",
 		"execute_dag", "cancel_dag", "modify_dag",
 		"query_buffer", "query_pipeline_state",
 		"query_dag_status",
@@ -90,11 +91,15 @@ func orchestratorCoreSkillNames() []string {
 
 type orchestratorDiag struct{ o *Orchestrator }
 
-func (d *orchestratorDiag) AgentName() string  { return "orchestrator" }
-func (d *orchestratorDiag) SessionID() string  { return "" }
-func (d *orchestratorDiag) LogsDir() string    { return shared.LogsDirForAgent(d.o.steering.SessionDir(), "orchestrator") }
-func (d *orchestratorDiag) EventLogger() *agentlog.SessionEventLogger { return d.o.steering.EventLogger() }
-func (d *orchestratorDiag) RecoveryHints() []string                   { return nil }
+func (d *orchestratorDiag) AgentName() string { return "orchestrator" }
+func (d *orchestratorDiag) SessionID() string { return "" }
+func (d *orchestratorDiag) LogsDir() string {
+	return shared.LogsDirForAgent(d.o.steering.SessionDir(), "orchestrator")
+}
+func (d *orchestratorDiag) EventLogger() *agentlog.SessionEventLogger {
+	return d.o.steering.EventLogger()
+}
+func (d *orchestratorDiag) RecoveryHints() []string { return nil }
 
 func (d *orchestratorDiag) PeerLogsDirs() map[string]string {
 	sessionDir := d.o.steering.SessionDir()

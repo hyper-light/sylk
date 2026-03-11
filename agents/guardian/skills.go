@@ -26,6 +26,7 @@ func (g *Guardian) registerCoreSkills() {
 	g.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
 	g.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
 	g.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil))
+	g.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return g.workspaceViews }, nil, nil))
 	g.skills.Register(askUserQuestionSkill(g))
 	g.skills.Register(agentLogsSkill(g))
 	g.skills.Register(systemStatusSkill(g))

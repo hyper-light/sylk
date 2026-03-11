@@ -206,7 +206,7 @@ func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
 		RespondingAgentID:   firstNonEmpty(stream.RespondingAgentID, msg.SourceAgentID, routeTargetAgentID(pr.task)),
 		RespondingAgentName: firstNonEmpty(stream.RespondingAgentName, pr.task.AgentType),
 		TargetAgentID:       r.streamMirrorTargetID,
-		Metadata:            cloneMetadata(stream.Metadata),
+		Metadata:            enrichMirroredStreamMetadata(pr.task, cloneMetadata(stream.Metadata)),
 		Event:               cloneStreamEvent(stream.Event),
 	}
 	mirroredMsg := &guide.Message{
@@ -222,6 +222,43 @@ func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
 		r.logger.Warn("mirror pipeline stream to user", "correlation_id", msg.CorrelationID, "error", err)
 	}
 	return true
+}
+
+func enrichMirroredStreamMetadata(task *PipelineTask, metadata map[string]any) map[string]any {
+	if task == nil {
+		return metadata
+	}
+	if metadata == nil {
+		metadata = make(map[string]any, 5)
+	}
+	if _, ok := metadata["agent_type"]; !ok && strings.TrimSpace(task.AgentType) != "" {
+		metadata["agent_type"] = strings.TrimSpace(task.AgentType)
+	}
+	if _, ok := metadata["task_id"]; !ok && strings.TrimSpace(task.TaskID) != "" {
+		metadata["task_id"] = strings.TrimSpace(task.TaskID)
+	}
+	if _, ok := metadata["pipeline_id"]; !ok && strings.TrimSpace(task.TaskID) != "" {
+		metadata["pipeline_id"] = strings.TrimSpace(task.TaskID)
+	}
+	if _, ok := metadata["task_slug"]; !ok {
+		if taskSlug := taskContextString(task.Context, "task_slug"); taskSlug != "" {
+			metadata["task_slug"] = taskSlug
+		}
+	}
+	if _, ok := metadata["task_name"]; !ok {
+		if taskName := taskContextString(task.Context, "task_name"); taskName != "" {
+			metadata["task_name"] = taskName
+		}
+	}
+	return metadata
+}
+
+func taskContextString(ctx map[string]any, key string) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func cloneMetadata(metadata map[string]any) map[string]any {

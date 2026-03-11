@@ -25,11 +25,15 @@ import (
 )
 
 func (e *Engineer) registerCoreSkills() {
+	writeCfg := versioning.WorkspaceWriteSkillConfig{
+		GetFileAccess:      func() versioning.FileAccess { return e.fileAccess },
+		GetViews:           func() versioning.WorkspaceViewAccess { return e.workspaceViews },
+		DefaultPipelineID:  func() string { return e.pipelineID },
+		WritesEnabledCheck: func() bool { return e.config.EngineerConfig.EnableFileWrites },
+	}
+
 	// File operations
 	e.skills.Register(readFileSkill(e))
-	e.skills.Register(writeFileSkill(e))
-	e.skills.Register(editFileSkill(e))
-	e.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return e.fileAccess }))
 	e.skills.Register(runCommandSkill(e))
 	e.skills.Register(globSkill(e))
 	e.skills.Register(grepSkill(e))
@@ -38,6 +42,13 @@ func (e *Engineer) registerCoreSkills() {
 	e.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
 	e.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
 	e.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }))
+	e.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }, nil))
+	e.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return e.workspaceViews }, func() string { return e.pipelineID }, nil))
+	e.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return e.fileAccess }))
+	e.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
+	e.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
+	e.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
+	e.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
 
 	// Code analysis & quality
 	e.skills.Register(lspSkill(e))

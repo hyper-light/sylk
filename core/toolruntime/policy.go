@@ -186,6 +186,25 @@ func (m *PolicyManifest) Validate(registry *skills.Registry, controlPlaneConfigu
 			}
 		}
 	}
+	if registry != nil {
+		missing := make([]string, 0)
+		for _, skill := range registry.GetAll() {
+			if skill == nil {
+				continue
+			}
+			name := strings.TrimSpace(skill.Name)
+			if name == "" || isSyntheticTool(name) {
+				continue
+			}
+			if _, ok := m.Tools[name]; !ok {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return fmt.Errorf("tool policy manifest is missing registered tools: %s", strings.Join(missing, ", "))
+		}
+	}
 	return nil
 }
 

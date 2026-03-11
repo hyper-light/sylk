@@ -228,6 +228,49 @@ func canonicalPipelineAgentID(agentType, pipelineID string) string {
 	return pipelineID + ":" + agentType
 }
 
+func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, ok bool) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return "", "", false
+	}
+	parts := strings.SplitN(agentID, "__", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	taskID = strings.TrimSpace(parts[0])
+	agentType = strings.TrimSpace(parts[1])
+	if taskID == "" {
+		return "", "", false
+	}
+	switch agentType {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return taskID, agentType, true
+	default:
+		return "", "", false
+	}
+}
+
+func canonicalStreamAgentID(agentID, agentType, pipelineID, taskID string) string {
+	if trimmed := strings.TrimSpace(taskID); trimmed != "" {
+		pipelineID = trimmed
+	} else {
+		pipelineID = strings.TrimSpace(pipelineID)
+	}
+	agentType = strings.TrimSpace(agentType)
+	if scopedTaskID, scopedAgentType, ok := parseTaskScopedPipelineAgentID(agentID); ok {
+		if pipelineID == "" {
+			pipelineID = scopedTaskID
+		}
+		if agentType == "" {
+			agentType = scopedAgentType
+		}
+	}
+	if canonical := canonicalPipelineAgentID(agentType, pipelineID); canonical != "" {
+		return canonical
+	}
+	return strings.TrimSpace(agentID)
+}
+
 // maxAgents is the upper bound on tracked agents to prevent unbounded growth.
 // Derived from typical multi-agent systems: 32 concurrent agents covers
 // orchestrator + guide + architects + engineers + inspectors + specialists.
@@ -544,7 +587,7 @@ func (m *Model) handleActivity(ev msg.ActivityEventMsg) tea.Cmd {
 // messages (e.g. "Analyzing requirements...", "Dispatching task 1/3...") in
 // the agent panel cards alongside the chat panel's thinking placeholder.
 func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
-	agentID := m.resolveAgentID(strings.TrimSpace(progress.AgentID))
+	agentID := m.resolveAgentID(canonicalStreamAgentID(progress.AgentID, progress.AgentType, progress.PipelineID, progress.TaskID))
 	vis := progress.Visibility
 	eventDebugLog().Info("agent_panel: stream_progress",
 		"agent_id", progress.AgentID,
@@ -581,7 +624,7 @@ func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
 // when a stream finishes. This is the normal completion counterpart to
 // handleStreamProgress (which sets StatusThinking on progress events).
 func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
-	agentID := m.resolveAgentID(strings.TrimSpace(done.AgentID))
+	agentID := m.resolveAgentID(canonicalStreamAgentID(done.AgentID, done.AgentType, done.PipelineID, done.TaskID))
 	if agentID == "" {
 		return nil
 	}

@@ -176,10 +176,13 @@ func (pt *PipelineTester) initSkills() error {
 }
 
 func (pt *PipelineTester) registerCoreSkills() {
+	writeCfg := versioning.WorkspaceWriteSkillConfig{
+		GetFileAccess:     func() versioning.FileAccess { return pt.fileAccess },
+		GetViews:          func() versioning.WorkspaceViewAccess { return pt.workspaceViews },
+		DefaultPipelineID: func() string { return pt.pipelineID },
+	}
+
 	pt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
-	pt.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
-	pt.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
-	pt.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
 	pt.skills.Register(checkInspectorGateSkill(pt))
 	pt.skills.Register(detectTestHarnessSkill(pt))
 	pt.skills.Register(prepareTestHarnessSkill(pt))
@@ -193,6 +196,13 @@ func (pt *PipelineTester) registerCoreSkills() {
 	pt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
 	pt.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }))
+	pt.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }, nil))
+	pt.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return pt.workspaceViews }, func() string { return pt.pipelineID }, nil))
+	pt.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return pt.fileAccess }))
+	pt.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
+	pt.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
+	pt.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
+	pt.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
 	pt.skills.Register(reportToEngineerSkill(pt))
 	pt.skills.Register(reportToDesignerSkill(pt))
 	for _, skill := range agentshared.CoordinationSkills(agentshared.CoordinationSkillConfig{

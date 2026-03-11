@@ -8,7 +8,13 @@ import (
 
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/skills"
+	"github.com/adalundhe/sylk/core/versioning"
 )
+
+type pipelineWriteContextInput struct {
+	Path  string                         `json:"path"`
+	Basis versioning.WorkspaceWriteBasis `json:"basis"`
+}
 
 func checkInspectorGateSkill(pt *PipelineTester) *skills.Skill {
 	return skills.NewSkill("check_inspector_gate").
@@ -28,9 +34,10 @@ func checkInspectorGateSkill(pt *PipelineTester) *skills.Skill {
 
 func detectTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 	type params struct {
-		Files      []string `json:"files,omitempty"`
-		TaskSpec   string   `json:"task_spec,omitempty"`
-		WorkerType string   `json:"worker_type,omitempty"`
+		Files         []string                    `json:"files,omitempty"`
+		TaskSpec      string                      `json:"task_spec,omitempty"`
+		WorkerType    string                      `json:"worker_type,omitempty"`
+		WriteContexts []pipelineWriteContextInput `json:"write_contexts,omitempty"`
 	}
 
 	return skills.NewSkill("detect_test_harness").
@@ -57,19 +64,21 @@ func detectTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 
 func prepareTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 	type params struct {
-		Files      []string `json:"files,omitempty"`
-		TaskSpec   string   `json:"task_spec,omitempty"`
-		WorkerType string   `json:"worker_type,omitempty"`
+		Files         []string                    `json:"files,omitempty"`
+		TaskSpec      string                      `json:"task_spec,omitempty"`
+		WorkerType    string                      `json:"worker_type,omitempty"`
+		WriteContexts []pipelineWriteContextInput `json:"write_contexts,omitempty"`
 	}
 
 	return skills.NewSkill("prepare_test_harness").
-		Description("Create any missing framework config or boilerplate required before tests can be written and executed.").
+		Description("Create any missing framework config or boilerplate required before tests can be written and executed. Requires explicit pipeline write contexts for each file it will create.").
 		Domain("testing").
 		Keywords("prepare", "harness", "bootstrap", "config", "boilerplate").
 		Priority(96).
 		ArrayParam("files", "Source files that need tests", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		StringParam("worker_type", "Primary worker type such as engineer or designer", false).
+		ArrayObjectParam("write_contexts", "Pipeline write contexts returned by prepare_pipeline_write_context for each harness file that may be created.", pipelineWriteContextProperties(), []string{"path", "basis"}, false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
@@ -83,7 +92,15 @@ func prepareTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 					return nil, err
 				}
 			}
-			created, err := pt.prepareHarness(ctx, state)
+			planned := pt.harnessWritePlans(state)
+			contexts, err := indexPipelineWriteContexts(p.WriteContexts)
+			if err != nil {
+				return nil, err
+			}
+			if len(planned) > 0 && len(contexts) == 0 {
+				return nil, fmt.Errorf("prepare_pipeline_write_context is required for harness files: %s", joinPipelineWritePlanPaths(planned))
+			}
+			created, err := pt.prepareHarness(ctx, state, contexts)
 			if err != nil {
 				return nil, err
 			}
@@ -91,6 +108,7 @@ func prepareTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 				"prepared":       true,
 				"framework":      state.FrameworkID,
 				"created_files":  created,
+				"planned_files":  writePlanPaths(planned),
 				"setup_required": state.SetupRequired,
 				"setup_reason":   state.SetupReason,
 			}, nil
@@ -170,14 +188,15 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 	}
 
 	type params struct {
-		TestCase   testershared.PlannedTestCase `json:"test_case"`
-		TargetFile string                       `json:"target_file"`
-		OutputFile string                       `json:"output_file"`
-		Content    string                       `json:"content"`
+		TestCase   testershared.PlannedTestCase   `json:"test_case"`
+		TargetFile string                         `json:"target_file"`
+		OutputFile string                         `json:"output_file"`
+		Content    string                         `json:"content"`
+		Basis      versioning.WorkspaceWriteBasis `json:"basis"`
 	}
 
 	return skills.NewSkill("write_test").
-		Description("Write or append concrete executable test code into the task-local VFS. The content must be real test code, not TODOs or placeholders.").
+		Description("Write or append concrete executable test code into the task-local VFS. Requires a fresh pipeline write basis for the target output file.").
 		Domain("testing").
 		Keywords("write", "test", "file", "append", "concrete").
 		Priority(94).
@@ -185,6 +204,7 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 		StringParam("target_file", "Source file under test", true).
 		StringParam("output_file", "Destination test file path", false).
 		StringParam("content", "Concrete executable test code or test-function body", true).
+		ObjectParam("basis", "Pipeline write basis returned by prepare_pipeline_write_context for the output_file.", pipelineWriteBasisProperties(), true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
@@ -210,7 +230,7 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 					return nil, err
 				}
 			}
-			writtenPath, err := pt.writeTestArtifact(ctx, harness, p.TestCase, p.OutputFile, p.Content)
+			writtenPath, err := pt.writeTestArtifact(ctx, harness, p.TestCase, p.OutputFile, p.Content, &p.Basis)
 			if err != nil {
 				return nil, err
 			}
@@ -268,4 +288,50 @@ func joinTaskSpecAndDiff(taskSpec, diff string) string {
 		return diff
 	}
 	return taskSpec + "\n\nDiff:\n" + diff
+}
+
+func pipelineWriteContextProperties() map[string]*skills.Property {
+	return map[string]*skills.Property{
+		"path":  {Type: "string", Description: "Target file path this write context applies to."},
+		"basis": {Type: "object", Description: "Basis returned by prepare_pipeline_write_context for this path.", Properties: pipelineWriteBasisProperties()},
+	}
+}
+
+func pipelineWriteBasisProperties() map[string]*skills.Property {
+	return map[string]*skills.Property{
+		"scope":       {Type: "string", Description: "Must be pipeline."},
+		"path":        {Type: "string", Description: "Path prepared for mutation."},
+		"pipeline_id": {Type: "string", Description: "Active task pipeline ID."},
+		"target_view": {Type: "string", Description: "Must be pipeline."},
+	}
+}
+
+func indexPipelineWriteContexts(inputs []pipelineWriteContextInput) (map[string]versioning.WorkspaceWriteBasis, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	contexts := make(map[string]versioning.WorkspaceWriteBasis, len(inputs))
+	for i, input := range inputs {
+		path := normalizePipelineWritePath(input.Path)
+		if path == "" {
+			path = normalizePipelineWritePath(input.Basis.Path)
+		}
+		if path == "" {
+			return nil, fmt.Errorf("write_contexts[%d].path is required", i)
+		}
+		contexts[path] = input.Basis
+	}
+	return contexts, nil
+}
+
+func writePlanPaths(plans []pipelineWritePlan) []string {
+	paths := make([]string, 0, len(plans))
+	for _, plan := range plans {
+		paths = append(paths, plan.Path)
+	}
+	return paths
+}
+
+func joinPipelineWritePlanPaths(plans []pipelineWritePlan) string {
+	return strings.Join(writePlanPaths(plans), ", ")
 }

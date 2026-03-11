@@ -258,11 +258,13 @@ func (gt *GlobalTester) initSkills() error {
 }
 
 func (gt *GlobalTester) registerCoreSkills() {
+	writeCfg := versioning.WorkspaceWriteSkillConfig{
+		GetFileAccess: func() versioning.FileAccess { return gt.fileAccess },
+		GetViews:      func() versioning.WorkspaceViewAccess { return gt.workspaceViews },
+	}
+
 	// Shared skills.
 	gt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
-	gt.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
-	gt.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
-	gt.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
 	gt.skills.Register(shared.AnalyzeRiskSkill())
 	gt.skills.Register(shared.PlanTestsSkill())
 	gt.skills.Register(shared.WriteTestSkill())
@@ -273,6 +275,13 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 	gt.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
 	gt.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
+	gt.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil, nil))
+	gt.skills.Register(versioning.NewPrepareGlobalWriteContextSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
+	gt.skills.Register(versioning.NewListGlobalChangesSkill(func() versioning.FileAccess { return gt.fileAccess }))
+	gt.skills.Register(versioning.NewWriteGlobalFileSkill(writeCfg))
+	gt.skills.Register(versioning.NewEditGlobalFileSkill(writeCfg))
+	gt.skills.Register(versioning.NewDeleteGlobalFileSkill(writeCfg))
+	gt.skills.Register(versioning.NewCreateGlobalDirectorySkill(writeCfg))
 
 	// Global-tester-specific skills.
 	gt.skills.Register(analyzeBatchSkill(gt))

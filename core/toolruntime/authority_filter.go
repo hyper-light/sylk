@@ -3,11 +3,14 @@ package toolruntime
 import "github.com/adalundhe/sylk/core/authority"
 
 var workspaceViewToolNames = map[string]struct{}{
-	"read_workspace_file":       {},
-	"workspace_glob":            {},
-	"workspace_grep":            {},
-	"inspect_workspace_state":   {},
-	"summarize_workspace_state": {},
+	"read_workspace_file":            {},
+	"workspace_glob":                 {},
+	"workspace_grep":                 {},
+	"inspect_workspace_state":        {},
+	"summarize_workspace_state":      {},
+	"diff_workspace_file":            {},
+	"prepare_pipeline_write_context": {},
+	"prepare_global_write_context":   {},
 }
 
 var diskWriteToolNames = map[string]struct{}{

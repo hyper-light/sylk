@@ -47,6 +47,7 @@ func BuildWorkspaceViewContext(opts WorkspacePromptOptions) string {
 	}
 	b.WriteString(fmt.Sprintf("\nDefault read/write tools for this agent operate on the `%s` view unless a tool explicitly says otherwise.\n", defaultView))
 	b.WriteString("Use `read_workspace_file`, `workspace_glob`, `workspace_grep`, `inspect_workspace_state`, and `summarize_workspace_state` whenever you need to compare disk against merged or task-local in-progress work.\n")
+	b.WriteString("Before mutating VFS-backed files, use the matching `prepare_*_write_context` skill, inspect the returned diffs/basis, and then call the corresponding `write_*`, `edit_*`, `delete_*`, or `create_*_directory` skill with that basis.\n")
 	return strings.TrimSpace(b.String())
 }
 

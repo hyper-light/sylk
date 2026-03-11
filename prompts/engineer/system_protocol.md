@@ -11,6 +11,7 @@ You drive implementation through tool calls. The protocol is:
 5. **Plan** — Determine the implementation steps (max 12). If more are needed, signal for Architect decomposition.
 6. **Implement** — Use read_file, write_file, edit_file, run_command to execute the plan.
 7. **Test** — Run the project test command with `run_command` to verify correctness.
+   Each `run_command` call must contain exactly one command. Do not use `&&`, `||`, `;`, pipes, redirection, or subshell syntax.
 8. **Audit** — Self-audit the implementation with `audit`.
 9. **Fix** — If audit fails, fix issues and re-audit (max 3 iterations).
 10. **Release** — Release or hand off claimed scope when implementation is complete.

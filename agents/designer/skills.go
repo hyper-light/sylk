@@ -17,10 +17,14 @@ import (
 )
 
 func (d *Designer) registerCoreSkills() {
+	writeCfg := versioning.WorkspaceWriteSkillConfig{
+		GetFileAccess:      func() versioning.FileAccess { return d.fileAccess },
+		GetViews:           func() versioning.WorkspaceViewAccess { return d.workspaceViews },
+		DefaultPipelineID:  func() string { return d.pipelineID },
+		WritesEnabledCheck: func() bool { return d.config.DesignerConfig.EnableFileWrites },
+	}
+
 	d.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
-	d.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
-	d.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return d.fileAccess }))
-	d.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return d.fileAccess }))
 	d.skills.Register(componentSearchSkill(d))
 	d.skills.Register(componentCreateSkill(d))
 	d.skills.Register(componentModifySkill(d))
@@ -29,6 +33,13 @@ func (d *Designer) registerCoreSkills() {
 	d.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
 	d.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
 	d.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }))
+	d.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }, nil))
+	d.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return d.workspaceViews }, func() string { return d.pipelineID }, nil))
+	d.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return d.fileAccess }))
+	d.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
+	d.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
+	d.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
+	d.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
 	d.skills.Register(tokenValidateSkill(d))
 	d.skills.Register(tokenSuggestSkill(d))
 	d.skills.Register(a11yAuditSkill(d))

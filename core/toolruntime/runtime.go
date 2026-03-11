@@ -450,13 +450,13 @@ func (r *Runtime) executePolicy(ctx context.Context, name string, input map[stri
 	}
 	switch policy.Execution {
 	case ExecutionModeLocal:
-		value, err := run()
+		value, err := runWorkerFn(name, run)
 		if err != nil {
 			return nil, err
 		}
 		return value.(*skills.Result), nil
 	case ExecutionModeLocalWorker, ExecutionModeGuardian:
-		value, err := r.worker.Do(ctx, run)
+		value, err := r.worker.Do(ctx, name, run)
 		if err != nil {
 			return nil, err
 		}

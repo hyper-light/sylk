@@ -1230,6 +1230,61 @@ func TestModel_RenderCard_WithPrefix(t *testing.T) {
 	}
 }
 
+func TestModel_StreamProgressCanonicalizesTaskScopedPipelineRuntimeIDs(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	for _, tc := range []struct {
+		agentType string
+		message   string
+	}{
+		{agentType: "engineer", message: "Applying patch"},
+		{agentType: "designer", message: "Refining interaction flow"},
+		{agentType: "inspector-pipeline", message: "Evaluating acceptance criteria"},
+		{agentType: "tester-pipeline", message: "Running regression suite"},
+	} {
+		canonicalID := "task_auth_checkout:" + tc.agentType
+		runtimeID := "task_auth_checkout__" + tc.agentType
+
+		_, _ = model.Update(msg.ActivityEventMsg{
+			Event: &events.ActivityEvent{
+				ID:        "evt_" + tc.agentType,
+				EventType: events.EventTypeAgentRegistered,
+				Timestamp: time.Now(),
+				AgentID:   canonicalID,
+				Content:   "Pipeline agent registered",
+				Data: map[string]any{
+					"agent_name":  tc.agentType,
+					"agent_type":  tc.agentType,
+					"pipeline_id": "task_auth_checkout",
+					"task_id":     "task_auth_checkout",
+					"task_slug":   "auth-checkout",
+				},
+			},
+		})
+
+		_, _ = model.Update(msg.StreamProgressMsg{
+			AgentID:    runtimeID,
+			AgentType:  tc.agentType,
+			PipelineID: "task_auth_checkout",
+			TaskID:     "task_auth_checkout",
+			Message:    tc.message,
+			Visibility: events.VisibilityAgent,
+		})
+
+		agent := model.agents[canonicalID]
+		if agent == nil {
+			t.Fatalf("expected canonical pipeline row for %s", tc.agentType)
+		}
+		if agent.Status != StatusThinking {
+			t.Fatalf("%s status = %v, want StatusThinking", tc.agentType, agent.Status)
+		}
+		if agent.TaskSummary != tc.message {
+			t.Fatalf("%s task summary = %q, want %q", tc.agentType, agent.TaskSummary, tc.message)
+		}
+	}
+}
+
 func TestModel_HasActiveAgent(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)

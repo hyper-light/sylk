@@ -16,6 +16,12 @@ import (
 )
 
 func (pi *PipelineInspector) registerCoreSkills() {
+	writeCfg := versioning.WorkspaceWriteSkillConfig{
+		GetFileAccess:     func() versioning.FileAccess { return pi.fileAccess },
+		GetViews:          func() versioning.WorkspaceViewAccess { return pi.workspaceViews },
+		DefaultPipelineID: func() string { return pi.pipelineID },
+	}
+
 	// Shared analysis skills.
 	pi.skills.Register(shared.RunLinterSkill(pi.toolRunner))
 	pi.skills.Register(shared.RunTypeCheckerSkill(pi.toolRunner))
@@ -28,9 +34,6 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(shared.DetectMemoryLeaksSkill(pi.toolRunner))
 	faFunc := func() shared.FileAccess { return pi.fileAccess }
 	pi.skills.Register(shared.ReadFileSkill(faFunc))
-	pi.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return pi.fileAccess }))
-	pi.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return pi.fileAccess }))
-	pi.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return pi.fileAccess }))
 	pi.skills.Register(shared.GlobSkill(faFunc))
 	pi.skills.Register(shared.GrepSkill(faFunc))
 	pi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
@@ -38,6 +41,13 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
 	pi.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
 	pi.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }))
+	pi.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }, nil))
+	pi.skills.Register(versioning.NewPreparePipelineWriteContextSkill(func() versioning.WorkspaceViewAccess { return pi.workspaceViews }, func() string { return pi.pipelineID }, nil))
+	pi.skills.Register(versioning.NewListPipelineChangesSkill(func() versioning.FileAccess { return pi.fileAccess }))
+	pi.skills.Register(versioning.NewWritePipelineFileSkill(writeCfg))
+	pi.skills.Register(versioning.NewEditPipelineFileSkill(writeCfg))
+	pi.skills.Register(versioning.NewDeletePipelineFileSkill(writeCfg))
+	pi.skills.Register(versioning.NewCreatePipelineDirectorySkill(writeCfg))
 
 	// Design validation skills (always registered — LLM selects based on context).
 	pi.skills.Register(shared.ValidateTokenUsageSkill(pi.toolRunner))

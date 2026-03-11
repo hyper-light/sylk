@@ -2,9 +2,11 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
@@ -63,7 +65,7 @@ func TestPipelineTesterWriteTestArtifact_CreatesSiblingTestInSparseVFS(t *testin
 	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
 		Name:       "TestAdd",
 		TargetFile: "pkg/service/service.go",
-	}, "pkg/service/service_test.go", "func TestAdd(t *testing.T) {\n\tt.Helper()\n}\n")
+	}, "pkg/service/service_test.go", "func TestAdd(t *testing.T) {\n\tt.Helper()\n}\n", nil)
 	if err != nil {
 		t.Fatalf("writeTestArtifact: %v", err)
 	}
@@ -89,7 +91,7 @@ func TestPipelineTesterRunGoTestSuite_RequiresStrictBroker(t *testing.T) {
 	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
 		Name:       "TestAdd",
 		TargetFile: "pkg/service/service.go",
-	}, "pkg/service/service_test.go", "func TestAdd(t *testing.T) {\n\tif got := Add(2, 3); got != 5 {\n\t\tt.Fatalf(\"got %d, want 5\", got)\n\t}\n}\n")
+	}, "pkg/service/service_test.go", "func TestAdd(t *testing.T) {\n\tif got := Add(2, 3); got != 5 {\n\t\tt.Fatalf(\"got %d, want 5\", got)\n\t}\n}\n", nil)
 	if err != nil {
 		t.Fatalf("writeTestArtifact: %v", err)
 	}
@@ -120,7 +122,7 @@ func TestPipelineTesterRunGoTestSuite_UsesStrictBroker(t *testing.T) {
 	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
 		Name:       "TestAdd",
 		TargetFile: "pkg/service/service.go",
-	}, "pkg/service/service_test.go", "func TestAdd(t *testing.T) {\n\tif got := Add(2, 3); got != 5 {\n\t\tt.Fatalf(\"got %d, want 5\", got)\n\t}\n}\n")
+	}, "pkg/service/service_test.go", "func TestAdd(t *testing.T) {\n\tif got := Add(2, 3); got != 5 {\n\t\tt.Fatalf(\"got %d, want 5\", got)\n\t}\n}\n", nil)
 	if err != nil {
 		t.Fatalf("writeTestArtifact: %v", err)
 	}
@@ -142,6 +144,9 @@ func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.
 		"check_inspector_gate",
 		"detect_test_harness",
 		"prepare_test_harness",
+		"prepare_pipeline_write_context",
+		"write_pipeline_file",
+		"list_pipeline_changes",
 		"write_test",
 		"run_test_suite",
 		"report_to_engineer",
@@ -252,8 +257,94 @@ func newGoPipelineTesterWithVFS(t *testing.T) (*PipelineTester, context.Context,
 		t.Fatalf("New: %v", err)
 	}
 	pt.SetFileAccess(fa)
+	pt.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		DefaultView:       versioning.WorkspaceViewPipeline,
+		DefaultPipelineID: "task-1",
+		Session:           svfs,
+		WorkingDir:        root,
+		DiskFallback:      versioning.NewDiskFileAccess(root, true),
+	}))
+	pt.pipelineID = "task-1"
 
 	return pt, versioning.WithSessionID(context.Background(), "sess-1"), fa
+}
+
+func TestPipelineTesterWriteTestSkillRequiresBasis(t *testing.T) {
+	pt, ctx, _ := newGoPipelineTesterWithVFS(t)
+
+	harness, err := pt.detectHarness(ctx, []string{"pkg/service/service.go"}, "Write Add tests", "engineer")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+	pt.setHarnessState(harness)
+
+	skill := writeTestSkill(pt)
+	input, _ := json.Marshal(map[string]any{
+		"test_case": map[string]any{
+			"name":        "TestAdd",
+			"target_file": "pkg/service/service.go",
+		},
+		"target_file": "pkg/service/service.go",
+		"output_file": "pkg/service/service_test.go",
+		"content":     "func TestAdd(t *testing.T) {}\n",
+	})
+	_, err = skill.Handler(ctx, input)
+	if err == nil {
+		t.Fatal("expected basis validation error")
+	}
+	if !strings.Contains(err.Error(), "basis") {
+		t.Fatalf("error = %v, want basis error", err)
+	}
+}
+
+func TestPipelineTesterPrepareHarnessRequiresWriteContexts(t *testing.T) {
+	root := t.TempDir()
+	mustWriteTestFile(t, filepath.Join(root, "pyproject.toml"), "[project]\nname = \"tester\"\nversion = \"0.1.0\"\n")
+	mustWriteTestFile(t, filepath.Join(root, "app/service.py"), "def add(a, b):\n    return a + b\n")
+
+	svfs, err := versioning.NewSessionVFS(versioning.SessionVFSConfig{
+		SessionID:  "sess-1",
+		WorkingDir: root,
+	})
+	if err != nil {
+		t.Fatalf("NewSessionVFS: %v", err)
+	}
+	pipe, err := svfs.BeginPipeline(versioning.BeginPipelineConfig{
+		PipelineID: "task-1",
+		SessionID:  "sess-1",
+		WorkingDir: root,
+		Files:      []string{"app/service.py"},
+	})
+	if err != nil {
+		t.Fatalf("BeginPipeline: %v", err)
+	}
+
+	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	pt.SetFileAccess(svfs.NewPipelineFileAccess(pipe))
+	pt.SetWorkspaceViews(versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
+		DefaultView:       versioning.WorkspaceViewPipeline,
+		DefaultPipelineID: "task-1",
+		Session:           svfs,
+		WorkingDir:        root,
+		DiskFallback:      versioning.NewDiskFileAccess(root, true),
+	}))
+	pt.pipelineID = "task-1"
+
+	skill := prepareTestHarnessSkill(pt)
+	input, _ := json.Marshal(map[string]any{
+		"files":       []string{"app/service.py"},
+		"worker_type": "engineer",
+	})
+	_, err = skill.Handler(versioning.WithSessionID(context.Background(), "sess-1"), input)
+	if err == nil {
+		t.Fatal("expected write context error")
+	}
+	if !strings.Contains(err.Error(), "prepare_pipeline_write_context") {
+		t.Fatalf("error = %v, want prepare_pipeline_write_context guidance", err)
+	}
 }
 
 func mustWriteTestFile(t *testing.T, path, content string) {

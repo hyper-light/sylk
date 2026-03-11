@@ -4504,7 +4504,37 @@ func logicalStreamPipelineID(pipelineID, taskID string) string {
 	return strings.TrimSpace(pipelineID)
 }
 
+func parseTaskScopedPipelineAgentID(agentID string) (taskID, agentType string, ok bool) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return "", "", false
+	}
+	parts := strings.SplitN(agentID, "__", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	taskID = strings.TrimSpace(parts[0])
+	agentType = strings.TrimSpace(parts[1])
+	if taskID == "" {
+		return "", "", false
+	}
+	switch agentType {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return taskID, agentType, true
+	default:
+		return "", "", false
+	}
+}
+
 func streamPanelAgentID(agentID, agentType, pipelineID string) string {
+	if scopedTaskID, scopedAgentType, ok := parseTaskScopedPipelineAgentID(agentID); ok {
+		if strings.TrimSpace(pipelineID) == "" {
+			pipelineID = scopedTaskID
+		}
+		if strings.TrimSpace(agentType) == "" {
+			agentType = scopedAgentType
+		}
+	}
 	agentType = strings.TrimSpace(agentType)
 	pipelineID = strings.TrimSpace(pipelineID)
 	if pipelineID != "" {
@@ -4514,6 +4544,10 @@ func streamPanelAgentID(agentID, agentType, pipelineID string) string {
 		}
 	}
 	return normalizeAgentID(firstNonEmpty(agentID, agentType))
+}
+
+func canonicalStreamAgentID(agentID, agentType, pipelineID, taskID string) string {
+	return streamPanelAgentID(agentID, agentType, logicalStreamPipelineID(pipelineID, taskID))
 }
 
 func firstNonEmpty(values ...string) string {
@@ -4542,7 +4576,7 @@ func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
 		m.activeStreams = make(map[string]*activeStreamEntry)
 	}
 	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
-	canonicalAgentID := streamPanelAgentID(start.AgentID, start.AgentType, logicalPipelineID)
+	canonicalAgentID := canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
 	if existing, exists := m.activeStreams[correlationID]; exists {
 		existing.AgentID = firstNonEmpty(canonicalAgentID, existing.AgentID)
 		existing.AgentType = firstNonEmpty(start.AgentType, existing.AgentType)
@@ -5947,6 +5981,7 @@ func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd 
 	if !m.shouldRenderStreamEvent(start.CorrelationID) {
 		return nil
 	}
+	start.AgentID = canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
 	m.recordStreamStart(start.CorrelationID)
 	m.trackStreamStart(start)
 	m.registerStream(start)
@@ -5988,6 +6023,7 @@ func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd 
 }
 
 func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg) tea.Cmd {
+	progress.AgentID = canonicalStreamAgentID(progress.AgentID, progress.AgentType, progress.PipelineID, progress.TaskID)
 	start := msg.StreamStartMsg{
 		SessionID:     progress.SessionID,
 		CorrelationID: progress.CorrelationID,
@@ -6012,6 +6048,7 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 }
 
 func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea.Cmd {
+	done.AgentID = canonicalStreamAgentID(done.AgentID, done.AgentType, done.PipelineID, done.TaskID)
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_RECEIVED",
 		"correlation_id", done.CorrelationID,
 		"agent_id", done.AgentID,
@@ -6137,7 +6174,7 @@ func (m *AppModel) trackStreamStart(start msg.StreamStartMsg) {
 		entry = streamUsageEntry{StartedAt: time.Now()}
 	}
 	logicalPipelineID := logicalStreamPipelineID(start.PipelineID, start.TaskID)
-	entry.AgentID = streamPanelAgentID(start.AgentID, start.AgentType, logicalPipelineID)
+	entry.AgentID = canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
 	entry.AgentType = strings.TrimSpace(start.AgentType)
 	entry.AgentName = strings.TrimSpace(start.AgentName)
 	entry.PipelineID = logicalPipelineID

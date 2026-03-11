@@ -33,6 +33,7 @@ func orchestratorVisibleSkillNames() []string {
 		"workspace_grep",
 		"inspect_workspace_state",
 		"summarize_workspace_state",
+		"diff_workspace_file",
 	}
 }
 

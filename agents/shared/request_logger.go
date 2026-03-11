@@ -250,7 +250,7 @@ func ToolNameToEventType(name string) agentlog.EventType {
 	switch name {
 	case "read_file":
 		return agentlog.EventToolReadFile
-	case "write_file":
+	case "write_file", "write_pipeline_file", "write_global_file":
 		return agentlog.EventToolWriteFile
 	case "glob":
 		return agentlog.EventToolGlob
@@ -258,7 +258,7 @@ func ToolNameToEventType(name string) agentlog.EventType {
 		return agentlog.EventToolGrep
 	case "run_command":
 		return agentlog.EventToolExec
-	case "edit_file":
+	case "edit_file", "edit_pipeline_file", "edit_global_file", "delete_pipeline_file", "delete_global_file":
 		return agentlog.EventToolEditFile
 	case "ask_user_clarification":
 		return agentlog.EventToolAskUser

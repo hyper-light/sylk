@@ -22,7 +22,7 @@
 - `coord_watch_updates` — Wait for coordination changes from peers
 
 ### Execution & Reporting (Priority 80–70)
-- `run_command` — Execute shell commands, escalating unapproved ones through Guardian approval
+- `run_command` — Execute exactly one shell command per call, escalating unapproved ones through Guardian approval
 - `report_confidence` — Report confidence assessment for escalation
 - `discover_project_tools` — Scan for build tools and frameworks
 - `signal_orchestrator` — Signal progress, questions, or blocks
@@ -43,3 +43,4 @@
 7. **Audit before completion.** Self-audit code quality before reporting confidence.
 8. **One concern per tool call.** Keep tool calls focused and atomic.
 9. **Coordinate before overlap.** Claim shared scope before editing overlapping areas and watch for peer updates when blocked.
+10. **Keep `run_command` atomic.** Never chain commands with `&&`, `||`, `;`, pipes, redirection, or subshell syntax; use separate tool calls instead.

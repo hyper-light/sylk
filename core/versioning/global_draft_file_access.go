@@ -77,4 +77,11 @@ func (g *GlobalDraftFileAccess) Stat(ctx context.Context, path string) (fs.FileI
 func (g *GlobalDraftFileAccess) WorkingDir() string { return g.delegate.WorkingDir() }
 func (g *GlobalDraftFileAccess) IsReadOnly() bool   { return false }
 
+func (g *GlobalDraftFileAccess) Modifications() []FileModification {
+	if g == nil || g.session == nil || g.session.globalVFS == nil {
+		return nil
+	}
+	return g.session.globalVFS.GetModifications()
+}
+
 var _ FileAccess = (*GlobalDraftFileAccess)(nil)

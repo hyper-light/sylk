@@ -36,6 +36,23 @@ func TestNew_ValidatesManifestAndActivatesDefaults(t *testing.T) {
 	}
 }
 
+func TestNew_RejectsManifestMissingRegisteredTool(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("visible_tool", "Visible tool"))
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("missing_tool", "Missing tool"))
+
+	_, err := New(Config{
+		Registry: registry,
+		Manifest: NewManifest("architect", "architect.default",
+			NewToolPolicy("visible_tool", EffectReadOnly, DomainFilesystem, ExecutionModeLocal, WithVisibleByDefault()),
+			NewToolPolicy(SearchToolName, EffectReadOnly, DomainDiscovery, ExecutionModeLocal, WithVisibleByDefault(), WithSearchable(false)),
+		),
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing_tool") {
+		t.Fatalf("expected missing registered tool error, got %v", err)
+	}
+}
+
 func TestBuildToolDefinitions_UsesActiveSetNotRegistryLoading(t *testing.T) {
 	registry := skills.NewRegistry()
 	mustRegisterSkill(t, registry, newRuntimeTestSkill("visible_tool", "Visible tool"))
@@ -251,6 +268,42 @@ func TestExecute_SearchActivatesWithoutLoadingAndExecutionLoadsLater(t *testing.
 	assertJSONContains(t, execResult.Output, "pattern", "TODO")
 }
 
+func TestExecute_PanickingLocalToolReturnsError(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, newPanickingRuntimeTestSkill("panic_local"))
+	rt := mustNewRuntime(t, registry, manifestWithSearch("architect", "architect.default",
+		NewToolPolicy("panic_local", EffectReadOnly, DomainFilesystem, ExecutionModeLocal, WithVisibleByDefault()),
+	))
+
+	_, err := rt.Execute(context.Background(), Invocation{
+		ToolCall:        providers.ToolCall{ID: "panic-local-1", Name: "panic_local", Arguments: `{}`},
+		AgentID:         "architect",
+		CorrelationID:   "corr-panic-local",
+		CapabilityScope: "architect.default",
+	})
+	if err == nil || !strings.Contains(err.Error(), `tool runtime panic in "panic_local"`) {
+		t.Fatalf("expected named panic error, got %v", err)
+	}
+}
+
+func TestExecute_PanickingWorkerToolReturnsError(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, newPanickingRuntimeTestSkill("panic_worker"))
+	rt := mustNewRuntime(t, registry, manifestWithSearch("architect", "architect.default",
+		NewToolPolicy("panic_worker", EffectMutating, DomainFilesystem, ExecutionModeLocalWorker, WithVisibleByDefault()),
+	))
+
+	_, err := rt.Execute(context.Background(), Invocation{
+		ToolCall:        providers.ToolCall{ID: "panic-worker-1", Name: "panic_worker", Arguments: `{}`},
+		AgentID:         "architect",
+		CorrelationID:   "corr-panic-worker",
+		CapabilityScope: "architect.default",
+	})
+	if err == nil || !strings.Contains(err.Error(), `tool runtime panic in "panic_worker"`) {
+		t.Fatalf("expected named panic error, got %v", err)
+	}
+}
+
 func TestExecute_DisallowsInactiveToolEvenIfManifestAllowsIt(t *testing.T) {
 	registry := skills.NewRegistry()
 	mustRegisterSkill(t, registry, newRuntimeTestSkill("hidden_tool", "Hidden tool"))
@@ -435,6 +488,15 @@ func newRuntimeTestSkill(name, description string) *skills.Skill {
 		Description(description).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			return map[string]any{"name": name}, nil
+		}).
+		Build()
+}
+
+func newPanickingRuntimeTestSkill(name string) *skills.Skill {
+	return skills.NewSkill(name).
+		Description("Panics for runtime recovery tests.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			panic("boom")
 		}).
 		Build()
 }

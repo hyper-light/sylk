@@ -33,6 +33,11 @@ type overlayAwareFileAccess interface {
 	Modifications() []versioning.FileModification
 }
 
+type pipelineWritePlan struct {
+	Path    string
+	Content string
+}
+
 type testHarnessState struct {
 	FrameworkID        coretest.TestFrameworkID `json:"framework_id"`
 	FrameworkName      string                   `json:"framework_name"`
@@ -899,41 +904,33 @@ func dedupePlannedCases(cases []testershared.PlannedTestCase) []testershared.Pla
 	return result
 }
 
-func (pt *PipelineTester) prepareHarness(ctx context.Context, state *testHarnessState) ([]string, error) {
+func (pt *PipelineTester) prepareHarness(
+	ctx context.Context,
+	state *testHarnessState,
+	writeBasis map[string]versioning.WorkspaceWriteBasis,
+) ([]string, error) {
 	if state == nil {
 		return nil, fmt.Errorf("test harness has not been detected")
 	}
 	var created []string
-	writeDefault := func(path, content string) error {
-		exists, err := pt.fileExists(ctx, path)
+	writeDefault := func(plan pipelineWritePlan) error {
+		if err := pt.validatePipelineWritePlan(ctx, plan.Path, writeBasis); err != nil {
+			return err
+		}
+		exists, err := pt.fileExists(ctx, plan.Path)
 		if err == nil && exists {
 			return nil
 		}
-		if err := pt.writeRawFile(ctx, path, content); err != nil {
+		if err := pt.writeRawFile(ctx, plan.Path, plan.Content); err != nil {
 			return err
 		}
-		created = append(created, path)
+		created = append(created, plan.Path)
 		return nil
 	}
 
-	switch state.FrameworkID {
-	case coretest.FrameworkVitest:
-		if len(state.MissingConfigFiles) > 0 {
-			if err := writeDefault("vitest.config.ts", "import { defineConfig } from 'vitest/config'\n\nexport default defineConfig({\n  test: {\n    environment: 'node',\n  },\n})\n"); err != nil {
-				return nil, err
-			}
-		}
-	case coretest.FrameworkJest:
-		if len(state.MissingConfigFiles) > 0 {
-			if err := writeDefault("jest.config.cjs", "module.exports = {\n  testEnvironment: 'node',\n};\n"); err != nil {
-				return nil, err
-			}
-		}
-	case coretest.FrameworkPytest:
-		if len(state.MissingConfigFiles) > 0 {
-			if err := writeDefault("pytest.ini", "[pytest]\npython_files = test_*.py *_test.py\n"); err != nil {
-				return nil, err
-			}
+	for _, plan := range pt.harnessWritePlans(state) {
+		if err := writeDefault(plan); err != nil {
+			return nil, err
 		}
 	}
 
@@ -955,7 +952,13 @@ func frameworkDefinition(id coretest.TestFrameworkID) *coretest.TestFrameworkDef
 	return nil
 }
 
-func (pt *PipelineTester) writeTestArtifact(ctx context.Context, harness *testHarnessState, testCase testershared.PlannedTestCase, outputFile, content string) (string, error) {
+func (pt *PipelineTester) writeTestArtifact(
+	ctx context.Context,
+	harness *testHarnessState,
+	testCase testershared.PlannedTestCase,
+	outputFile, content string,
+	basis *versioning.WorkspaceWriteBasis,
+) (string, error) {
 	if harness == nil {
 		return "", fmt.Errorf("test harness has not been detected")
 	}
@@ -967,6 +970,9 @@ func (pt *PipelineTester) writeTestArtifact(ctx context.Context, harness *testHa
 	}
 	if strings.TrimSpace(content) == "" {
 		return "", fmt.Errorf("test content is required")
+	}
+	if err := pt.validatePipelineWriteBasis(ctx, outputFile, basis); err != nil {
+		return "", err
 	}
 
 	if err := pt.registerWritablePath(outputFile); err != nil {
@@ -989,6 +995,71 @@ func (pt *PipelineTester) writeTestArtifact(ctx context.Context, harness *testHa
 		pt.setHarnessState(harness)
 	}
 	return outputFile, nil
+}
+
+func (pt *PipelineTester) harnessWritePlans(state *testHarnessState) []pipelineWritePlan {
+	if state == nil || len(state.MissingConfigFiles) == 0 {
+		return nil
+	}
+	switch state.FrameworkID {
+	case coretest.FrameworkVitest:
+		return []pipelineWritePlan{{
+			Path:    "vitest.config.ts",
+			Content: "import { defineConfig } from 'vitest/config'\n\nexport default defineConfig({\n  test: {\n    environment: 'node',\n  },\n})\n",
+		}}
+	case coretest.FrameworkJest:
+		return []pipelineWritePlan{{
+			Path:    "jest.config.cjs",
+			Content: "module.exports = {\n  testEnvironment: 'node',\n};\n",
+		}}
+	case coretest.FrameworkPytest:
+		return []pipelineWritePlan{{
+			Path:    "pytest.ini",
+			Content: "[pytest]\npython_files = test_*.py *_test.py\n",
+		}}
+	default:
+		return nil
+	}
+}
+
+func (pt *PipelineTester) validatePipelineWritePlan(
+	ctx context.Context,
+	path string,
+	writeBasis map[string]versioning.WorkspaceWriteBasis,
+) error {
+	if len(writeBasis) == 0 {
+		return nil
+	}
+	basis, ok := writeBasis[normalizePipelineWritePath(path)]
+	if !ok {
+		return fmt.Errorf("prepare_pipeline_write_context is required for %s", path)
+	}
+	return pt.validatePipelineWriteBasis(ctx, path, &basis)
+}
+
+func (pt *PipelineTester) validatePipelineWriteBasis(
+	ctx context.Context,
+	path string,
+	basis *versioning.WorkspaceWriteBasis,
+) error {
+	if basis == nil {
+		return nil
+	}
+	return versioning.ValidateWorkspaceWriteBasis(
+		ctx,
+		pt.workspaceViews,
+		versioning.WorkspaceWriteScopePipeline,
+		path,
+		*basis,
+	)
+}
+
+func normalizePipelineWritePath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	return filepath.Clean(trimmed)
 }
 
 func mergeGenericTestContent(existing []byte, content string) string {
@@ -1314,9 +1385,9 @@ func buildCreateTestsUserPrompt(req *tester.TesterRequest, files []string) strin
 	b.WriteString("Protocol:\n")
 	b.WriteString("1. Call `check_inspector_gate` first.\n")
 	b.WriteString("2. Call `detect_test_harness` for the target files.\n")
-	b.WriteString("3. Call `prepare_test_harness` if any config or boilerplate is needed.\n")
+	b.WriteString("3. If harness files are needed, call `prepare_pipeline_write_context` for each planned config file and then call `prepare_test_harness` with those write contexts.\n")
 	b.WriteString("4. Call `analyze_risk` and `plan_tests`.\n")
-	b.WriteString("5. Call `write_test` with concrete code content for each planned case.\n")
+	b.WriteString("5. Before each `write_test`, call `prepare_pipeline_write_context` for the target test file and pass that basis into `write_test`.\n")
 	if len(files) > 0 {
 		b.WriteString("\nTarget files:\n")
 		for _, file := range files {
@@ -1341,14 +1412,14 @@ func (pt *PipelineTester) createTestsDeterministically(ctx context.Context, req 
 		pt.buildPlan(files, req.TaskPrompt, risks, harness)
 		return nil
 	}
-	if _, err := pt.prepareHarness(ctx, harness); err != nil {
+	if _, err := pt.prepareHarness(ctx, harness, nil); err != nil {
 		return err
 	}
 	risks := pt.analyzeRisks(ctx, files, req.TaskPrompt, req.WorkerType)
 	plan := pt.buildPlan(files, req.TaskPrompt, risks, harness)
 	for _, tc := range plan.PlannedCase {
 		content := deterministicTestContent(harness, tc)
-		if _, err := pt.writeTestArtifact(ctx, harness, tc, harness.RecommendedOutputs[tc.TargetFile], content); err != nil {
+		if _, err := pt.writeTestArtifact(ctx, harness, tc, harness.RecommendedOutputs[tc.TargetFile], content, nil); err != nil {
 			return err
 		}
 	}

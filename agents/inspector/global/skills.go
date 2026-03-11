@@ -17,6 +17,11 @@ import (
 )
 
 func (gi *GlobalInspector) registerCoreSkills() {
+	writeCfg := versioning.WorkspaceWriteSkillConfig{
+		GetFileAccess: func() versioning.FileAccess { return gi.fileAccess },
+		GetViews:      func() versioning.WorkspaceViewAccess { return gi.workspaceViews },
+	}
+
 	// Shared analysis skills.
 	gi.skills.Register(shared.RunLinterSkill(gi.toolRunner))
 	gi.skills.Register(shared.RunTypeCheckerSkill(gi.toolRunner))
@@ -29,9 +34,6 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(shared.DetectMemoryLeaksSkill(gi.toolRunner))
 	faFunc := func() shared.FileAccess { return gi.fileAccess }
 	gi.skills.Register(shared.ReadFileSkill(faFunc))
-	gi.skills.Register(versioning.NewWriteFileSkillFunc(func() versioning.FileAccess { return gi.fileAccess }))
-	gi.skills.Register(versioning.NewEditFileSkillFunc(func() versioning.FileAccess { return gi.fileAccess }))
-	gi.skills.Register(versioning.NewCreateDirectorySkillFunc(func() versioning.FileAccess { return gi.fileAccess }))
 	gi.skills.Register(shared.GlobSkill(faFunc))
 	gi.skills.Register(shared.GrepSkill(faFunc))
 	gi.skills.Register(versioning.NewReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
@@ -39,6 +41,13 @@ func (gi *GlobalInspector) registerCoreSkills() {
 	gi.skills.Register(versioning.NewWorkspaceGrepSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
 	gi.skills.Register(versioning.NewInspectWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
 	gi.skills.Register(versioning.NewSummarizeWorkspaceStateSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
+	gi.skills.Register(versioning.NewDiffWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil, nil))
+	gi.skills.Register(versioning.NewPrepareGlobalWriteContextSkill(func() versioning.WorkspaceViewAccess { return gi.workspaceViews }, nil))
+	gi.skills.Register(versioning.NewListGlobalChangesSkill(func() versioning.FileAccess { return gi.fileAccess }))
+	gi.skills.Register(versioning.NewWriteGlobalFileSkill(writeCfg))
+	gi.skills.Register(versioning.NewEditGlobalFileSkill(writeCfg))
+	gi.skills.Register(versioning.NewDeleteGlobalFileSkill(writeCfg))
+	gi.skills.Register(versioning.NewCreateGlobalDirectorySkill(writeCfg))
 
 	// Global-specific skills.
 	gi.skills.Register(auditLayerSkill(gi))

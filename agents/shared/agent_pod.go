@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -187,6 +188,15 @@ func (p *AgentPod) PreActivate(ctx context.Context) {
 // returning an error on the first activation/registration failure.
 func (p *AgentPod) PreActivateStrict(ctx context.Context) error {
 	return p.preActivate(ctx, true)
+}
+
+// AdvertiseMembers publishes waiting/registered activity for all member types
+// without activating containers or acquiring guards. This keeps pipeline rows
+// visible in the UI while preserving lazy runtime activation.
+func (p *AgentPod) AdvertiseMembers() {
+	for _, agentType := range p.memberTypes {
+		p.publishActivity(agentType)
+	}
 }
 
 func (p *AgentPod) preActivate(ctx context.Context, strict bool) error {
@@ -471,14 +481,33 @@ func (p *AgentPod) publishActivity(agentType string) {
 	if displayName == "" {
 		displayName = agentType
 	}
-	evt := events.NewActivityEvent(events.EventTypeAgentRegistered, p.sessionID,
-		fmt.Sprintf("Agent registered: %s", agentType))
+	content := fmt.Sprintf("Agent registered: %s", agentType)
+	evt := events.NewActivityEvent(events.EventTypeAgentRegistered, p.sessionID, content)
 	evt.AgentID = agentType
 	evt.Visibility = p.regVis
 	evt.Data["agent_type"] = agentType
 	evt.Data["agent_name"] = displayName
 	evt.Data["pod_id"] = p.podID
+	if pipelineID, ok := pipelineActivityScope(p.podID, agentType); ok {
+		evt.AgentID = pipelineID + ":" + agentType
+		evt.Content = fmt.Sprintf("Pipeline agent registered: %s", agentType)
+		evt.Data["pipeline_id"] = pipelineID
+		evt.Data["task_id"] = pipelineID
+	}
 	p.activityPub.PublishActivity(evt)
+}
+
+func pipelineActivityScope(podID, agentType string) (string, bool) {
+	podID = strings.TrimSpace(podID)
+	if podID == "" || podID == agentType {
+		return "", false
+	}
+	switch agentType {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return podID, true
+	default:
+		return "", false
+	}
 }
 
 // --------------------------------------------------------------------------
