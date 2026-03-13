@@ -33,5 +33,5 @@ func (r *Runtime) ExecuteApprovedRaw(
 	inv Invocation,
 	grant *GuardianControlGrant,
 ) (RawExecutionResult, error) {
-	return r.executeRaw(ctx, inv, grant, nil)
+	return r.executeRaw(ctx, inv, grant, nil, false)
 }

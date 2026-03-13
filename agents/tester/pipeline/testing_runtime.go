@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
+	"github.com/adalundhe/sylk/core/skills"
 	coretest "github.com/adalundhe/sylk/core/test"
 	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
@@ -37,6 +39,8 @@ type pipelineWritePlan struct {
 	Path    string
 	Content string
 }
+
+const maxPipelineWriteAttempts = 2
 
 type testHarnessState struct {
 	FrameworkID        coretest.TestFrameworkID `json:"framework_id"`
@@ -917,15 +921,30 @@ func (pt *PipelineTester) prepareHarness(
 		if err := pt.validatePipelineWritePlan(ctx, plan.Path, writeBasis); err != nil {
 			return err
 		}
-		exists, err := pt.fileExists(ctx, plan.Path)
-		if err == nil && exists {
-			return nil
-		}
-		if err := pt.writeRawFile(ctx, plan.Path, plan.Content); err != nil {
+		basis, store, err := pipelineWriteBasisRef(writeBasis, plan.Path)
+		if err != nil {
 			return err
 		}
-		created = append(created, plan.Path)
-		return nil
+		for attempt := 0; attempt < maxPipelineWriteAttempts; attempt++ {
+			exists, existsErr := pt.fileExists(ctx, plan.Path)
+			if existsErr == nil && exists {
+				store()
+				return nil
+			}
+			if err := pt.ensurePipelineWriteBasis(ctx, plan.Path, basis); err != nil {
+				return err
+			}
+			if err := pt.invokePipelineWriteSkill(ctx, plan.Path, plan.Content, basis); err != nil {
+				if !pt.refreshRetryablePipelineWriteBasis(ctx, plan.Path, basis, err) {
+					return err
+				}
+				continue
+			}
+			store()
+			created = append(created, plan.Path)
+			return nil
+		}
+		return fmt.Errorf("write_pipeline_file did not settle for %s after %d attempts", plan.Path, maxPipelineWriteAttempts)
 	}
 
 	for _, plan := range pt.harnessWritePlans(state) {
@@ -971,30 +990,39 @@ func (pt *PipelineTester) writeTestArtifact(
 	if strings.TrimSpace(content) == "" {
 		return "", fmt.Errorf("test content is required")
 	}
-	if err := pt.validatePipelineWriteBasis(ctx, outputFile, basis); err != nil {
-		return "", err
+	activeBasis := basis
+	if activeBasis == nil {
+		activeBasis = &versioning.WorkspaceWriteBasis{}
 	}
-
-	if err := pt.registerWritablePath(outputFile); err != nil {
-		return "", err
+	for attempt := 0; attempt < maxPipelineWriteAttempts; attempt++ {
+		if err := pt.ensurePipelineWriteBasis(ctx, outputFile, activeBasis); err != nil {
+			return "", err
+		}
+		existing, _ := pt.readExistingFile(ctx, outputFile)
+		var merged string
+		switch harness.FrameworkID {
+		case coretest.FrameworkGoTest:
+			packageName := pt.goPackageName(ctx, testCase.TargetFile, outputFile)
+			merged = mergeGoTestContent(existing, packageName, content)
+		default:
+			merged = mergeGenericTestContent(existing, content)
+		}
+		if err := pt.invokePipelineWriteSkill(ctx, outputFile, merged, activeBasis); err != nil {
+			if !pt.refreshRetryablePipelineWriteBasis(ctx, outputFile, activeBasis, err) {
+				return "", err
+			}
+			continue
+		}
+		if basis != nil {
+			*basis = *activeBasis
+		}
+		if harness != nil {
+			harness.CreatedFiles = appendIfMissing(harness.CreatedFiles, outputFile)
+			pt.setHarnessState(harness)
+		}
+		return outputFile, nil
 	}
-	existing, _ := pt.readExistingFile(ctx, outputFile)
-	var merged string
-	switch harness.FrameworkID {
-	case coretest.FrameworkGoTest:
-		packageName := pt.goPackageName(ctx, testCase.TargetFile, outputFile)
-		merged = mergeGoTestContent(existing, packageName, content)
-	default:
-		merged = mergeGenericTestContent(existing, content)
-	}
-	if err := pt.writeRawFile(ctx, outputFile, merged); err != nil {
-		return "", err
-	}
-	if harness != nil {
-		harness.CreatedFiles = appendIfMissing(harness.CreatedFiles, outputFile)
-		pt.setHarnessState(harness)
-	}
-	return outputFile, nil
+	return "", fmt.Errorf("write_pipeline_file did not settle for %s after %d attempts", outputFile, maxPipelineWriteAttempts)
 }
 
 func (pt *PipelineTester) harnessWritePlans(state *testHarnessState) []pipelineWritePlan {
@@ -1030,11 +1058,16 @@ func (pt *PipelineTester) validatePipelineWritePlan(
 	if len(writeBasis) == 0 {
 		return nil
 	}
-	basis, ok := writeBasis[normalizePipelineWritePath(path)]
+	key := normalizePipelineWritePath(path)
+	basis, ok := writeBasis[key]
 	if !ok {
 		return fmt.Errorf("prepare_pipeline_write_context is required for %s", path)
 	}
-	return pt.validatePipelineWriteBasis(ctx, path, &basis)
+	if err := pt.ensurePipelineWriteBasis(ctx, path, &basis); err != nil {
+		return err
+	}
+	writeBasis[key] = basis
+	return nil
 }
 
 func (pt *PipelineTester) validatePipelineWriteBasis(
@@ -1052,6 +1085,160 @@ func (pt *PipelineTester) validatePipelineWriteBasis(
 		path,
 		*basis,
 	)
+}
+
+func (pt *PipelineTester) ensurePipelineWriteBasis(
+	ctx context.Context,
+	path string,
+	basis *versioning.WorkspaceWriteBasis,
+) error {
+	if basis == nil {
+		return fmt.Errorf("basis is required")
+	}
+	if pipelineWriteBasisNeedsRefresh(*basis) {
+		return pt.refreshPipelineWriteBasis(ctx, path, basis)
+	}
+	if err := pt.validatePipelineWriteBasis(ctx, path, basis); err != nil {
+		if !pt.retryablePipelineWriteBasisError(err) {
+			return err
+		}
+		return pt.refreshPipelineWriteBasis(ctx, path, basis)
+	}
+	return nil
+}
+
+func (pt *PipelineTester) refreshPipelineWriteBasis(
+	ctx context.Context,
+	path string,
+	basis *versioning.WorkspaceWriteBasis,
+) error {
+	if basis == nil {
+		return nil
+	}
+	if err := pt.registerWritablePath(path); err != nil {
+		return err
+	}
+	pipelineID := strings.TrimSpace(basis.PipelineID)
+	if pipelineID == "" {
+		pipelineID = strings.TrimSpace(pt.pipelineID)
+	}
+	refreshed, err := versioning.RefreshWorkspaceWriteBasis(
+		ctx,
+		pt.workspaceViews,
+		versioning.WorkspaceWriteScopePipeline,
+		path,
+		pipelineID,
+	)
+	if err != nil {
+		return err
+	}
+	*basis = refreshed
+	return nil
+}
+
+func (pt *PipelineTester) retryablePipelineWriteBasisError(err error) bool {
+	if errors.Is(err, versioning.ErrWorkspaceWriteLeaseExpired) {
+		return true
+	}
+	_, ok := versioning.WorkspaceWriteStale(err)
+	return ok
+}
+
+func (pt *PipelineTester) refreshRetryablePipelineWriteBasis(
+	ctx context.Context,
+	path string,
+	basis *versioning.WorkspaceWriteBasis,
+	err error,
+) bool {
+	if !pt.retryablePipelineWriteBasisError(err) {
+		return false
+	}
+	if refreshErr := pt.refreshPipelineWriteBasis(ctx, path, basis); refreshErr != nil {
+		return false
+	}
+	return true
+}
+
+func (pt *PipelineTester) invokePipelineWriteSkill(
+	ctx context.Context,
+	path, content string,
+	basis *versioning.WorkspaceWriteBasis,
+) error {
+	if basis == nil {
+		return fmt.Errorf("basis is required")
+	}
+	payload, err := json.Marshal(map[string]any{
+		"path":    path,
+		"content": content,
+		"basis":   *basis,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal write_pipeline_file payload: %w", err)
+	}
+	result := pt.skills.Invoke(ctx, "write_pipeline_file", payload)
+	if err := pipelineWriteSkillError("write_pipeline_file", result); err != nil {
+		return err
+	}
+	if nextBasis, ok := pipelineNextBasis(result.Data); ok {
+		*basis = nextBasis
+	}
+	return nil
+}
+
+func pipelineWriteBasisNeedsRefresh(basis versioning.WorkspaceWriteBasis) bool {
+	return basis.Scope == "" &&
+		strings.TrimSpace(basis.Path) == "" &&
+		basis.TargetView == ""
+}
+
+func pipelineWriteBasisRef(
+	index map[string]versioning.WorkspaceWriteBasis,
+	path string,
+) (*versioning.WorkspaceWriteBasis, func(), error) {
+	if len(index) == 0 {
+		return &versioning.WorkspaceWriteBasis{}, func() {}, nil
+	}
+	key := normalizePipelineWritePath(path)
+	current, ok := index[key]
+	if !ok {
+		return nil, nil, fmt.Errorf("prepare_pipeline_write_context is required for %s", path)
+	}
+	basis := current
+	return &basis, func() { index[key] = basis }, nil
+}
+
+func pipelineWriteSkillError(name string, result *skills.Result) error {
+	if result == nil {
+		return fmt.Errorf("%s returned no result", name)
+	}
+	if result.Success {
+		return nil
+	}
+	if result.Err != nil {
+		return result.Err
+	}
+	if msg := strings.TrimSpace(result.Error); msg != "" {
+		return fmt.Errorf("%s: %s", name, msg)
+	}
+	return fmt.Errorf("%s failed", name)
+}
+
+func pipelineNextBasis(data any) (versioning.WorkspaceWriteBasis, bool) {
+	mapped, ok := data.(map[string]any)
+	if !ok {
+		return versioning.WorkspaceWriteBasis{}, false
+	}
+	switch typed := mapped["next_basis"].(type) {
+	case *versioning.WorkspaceWriteBasis:
+		if typed == nil {
+			return versioning.WorkspaceWriteBasis{}, false
+		}
+		return *typed, true
+	case versioning.WorkspaceWriteBasis:
+		return typed, true
+	default:
+		return versioning.WorkspaceWriteBasis{}, false
+	}
 }
 
 func normalizePipelineWritePath(path string) string {
@@ -1350,7 +1537,7 @@ func (pt *PipelineTester) createTestsWithProvider(ctx context.Context, req *test
 	pt.mu.RUnlock()
 
 	providerReq := &providers.Request{
-		SystemPrompt: testershared.PipelineTesterSystemPromptForWorker(req.WorkerType),
+		SystemPrompt: testershared.PipelineTesterSystemPromptForWorkerAndContract(req.WorkerType, nil),
 		Messages: []providers.Message{
 			{Role: providers.RoleUser, Content: userMessage},
 		},
@@ -1387,7 +1574,8 @@ func buildCreateTestsUserPrompt(req *tester.TesterRequest, files []string) strin
 	b.WriteString("2. Call `detect_test_harness` for the target files.\n")
 	b.WriteString("3. If harness files are needed, call `prepare_pipeline_write_context` for each planned config file and then call `prepare_test_harness` with those write contexts.\n")
 	b.WriteString("4. Call `analyze_risk` and `plan_tests`.\n")
-	b.WriteString("5. Before each `write_test`, call `prepare_pipeline_write_context` for the target test file and pass that basis into `write_test`.\n")
+	b.WriteString("5. Before the first `write_test` for a file, call `prepare_pipeline_write_context` and pass that basis into `write_test`.\n")
+	b.WriteString("6. Reuse the `next_basis` returned by `write_test` for subsequent writes to the same file while its lease remains active.\n")
 	if len(files) > 0 {
 		b.WriteString("\nTarget files:\n")
 		for _, file := range files {
@@ -1403,27 +1591,140 @@ func buildCreateTestsUserPrompt(req *tester.TesterRequest, files []string) strin
 }
 
 func (pt *PipelineTester) createTestsDeterministically(ctx context.Context, req *tester.TesterRequest, files []string) error {
-	harness, err := pt.detectHarness(ctx, files, req.TaskPrompt, req.WorkerType)
+	if err := pt.checkInspectorGateWithTools(ctx); err != nil {
+		return err
+	}
+	harness, err := pt.detectHarnessWithTools(ctx, files, req.TaskPrompt, req.WorkerType)
 	if err != nil {
 		return err
 	}
 	if pt.fileAccess == nil {
-		risks := pt.analyzeRisks(ctx, files, req.TaskPrompt, req.WorkerType)
-		pt.buildPlan(files, req.TaskPrompt, risks, harness)
+		risks, riskErr := pt.analyzeRisksWithTools(ctx, files, req.TaskPrompt, req.WorkerType)
+		if riskErr != nil {
+			return riskErr
+		}
+		if _, planErr := pt.buildPlanWithTools(ctx, files, req.TaskPrompt, risks); planErr != nil {
+			return planErr
+		}
 		return nil
 	}
-	if _, err := pt.prepareHarness(ctx, harness, nil); err != nil {
+	if err := pt.prepareHarnessWithTools(ctx, harness, files, req.TaskPrompt, req.WorkerType); err != nil {
 		return err
 	}
-	risks := pt.analyzeRisks(ctx, files, req.TaskPrompt, req.WorkerType)
-	plan := pt.buildPlan(files, req.TaskPrompt, risks, harness)
+	risks, err := pt.analyzeRisksWithTools(ctx, files, req.TaskPrompt, req.WorkerType)
+	if err != nil {
+		return err
+	}
+	plan, err := pt.buildPlanWithTools(ctx, files, req.TaskPrompt, risks)
+	if err != nil {
+		return err
+	}
+	writeBasis := make(map[string]versioning.WorkspaceWriteBasis)
 	for _, tc := range plan.PlannedCase {
 		content := deterministicTestContent(harness, tc)
-		if _, err := pt.writeTestArtifact(ctx, harness, tc, harness.RecommendedOutputs[tc.TargetFile], content, nil); err != nil {
-			return err
+		outputFile := harness.RecommendedOutputs[tc.TargetFile]
+		nextBasis, writeErr := pt.writeDeterministicTestWithTools(ctx, tc, outputFile, content, writeBasis)
+		if writeErr != nil {
+			return writeErr
+		}
+		if strings.TrimSpace(outputFile) != "" {
+			writeBasis[normalizePipelineWritePath(outputFile)] = nextBasis
 		}
 	}
 	return nil
+}
+
+func (pt *PipelineTester) checkInspectorGateWithTools(ctx context.Context) error {
+	result, err := pt.runDeterministicToolCall(ctx, "check_inspector_gate", nil)
+	if err != nil {
+		return err
+	}
+	var payload struct {
+		Passed bool   `json:"passed"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		return fmt.Errorf("decode check_inspector_gate result: %w", err)
+	}
+	if payload.Passed {
+		return nil
+	}
+	reason := strings.TrimSpace(payload.Reason)
+	if reason == "" {
+		reason = "inspector gate has not passed"
+	}
+	return fmt.Errorf("check_inspector_gate failed: %s", reason)
+}
+
+func (pt *PipelineTester) detectHarnessWithTools(
+	ctx context.Context,
+	files []string,
+	taskSpec string,
+	workerType string,
+) (*testHarnessState, error) {
+	result, err := pt.runDeterministicToolCall(ctx, "detect_test_harness", map[string]any{
+		"files":       files,
+		"task_spec":   taskSpec,
+		"worker_type": workerType,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var state testHarnessState
+	if err := json.Unmarshal([]byte(result), &state); err != nil {
+		return nil, fmt.Errorf("decode detect_test_harness result: %w", err)
+	}
+	pt.setHarnessState(&state)
+	return &state, nil
+}
+
+func (pt *PipelineTester) analyzeRisksWithTools(
+	ctx context.Context,
+	files []string,
+	taskSpec string,
+	workerType string,
+) ([]testershared.RiskArea, error) {
+	result, err := pt.runDeterministicToolCall(ctx, "analyze_risk", map[string]any{
+		"files":       files,
+		"task_spec":   taskSpec,
+		"worker_type": workerType,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		RiskAreas []testershared.RiskArea `json:"risk_areas"`
+	}
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		return nil, fmt.Errorf("decode analyze_risk result: %w", err)
+	}
+	return payload.RiskAreas, nil
+}
+
+func (pt *PipelineTester) buildPlanWithTools(
+	ctx context.Context,
+	files []string,
+	taskSpec string,
+	risks []testershared.RiskArea,
+) (*testershared.TestPlan, error) {
+	result, err := pt.runDeterministicToolCall(ctx, "plan_tests", map[string]any{
+		"files":      files,
+		"task_spec":  taskSpec,
+		"risk_areas": risks,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Plan *testershared.TestPlan `json:"plan"`
+	}
+	if err := json.Unmarshal([]byte(result), &payload); err != nil {
+		return nil, fmt.Errorf("decode plan_tests result: %w", err)
+	}
+	if payload.Plan == nil {
+		return nil, fmt.Errorf("plan_tests returned no plan")
+	}
+	return payload.Plan, nil
 }
 
 func deterministicTestContent(harness *testHarnessState, tc testershared.PlannedTestCase) string {
@@ -1439,6 +1740,117 @@ func deterministicTestContent(harness *testHarnessState, tc testershared.Planned
 	default:
 		return fmt.Sprintf("// %s\n", tc.ExpectedBehavior)
 	}
+}
+
+func (pt *PipelineTester) prepareHarnessWithTools(
+	ctx context.Context,
+	harness *testHarnessState,
+	files []string,
+	taskSpec string,
+	workerType string,
+) error {
+	if harness == nil {
+		return fmt.Errorf("test harness has not been detected")
+	}
+	plans := pt.harnessWritePlans(harness)
+	contexts := make([]map[string]any, 0, len(plans))
+	for _, plan := range plans {
+		if err := pt.registerWritablePath(plan.Path); err != nil {
+			return err
+		}
+		prepared, err := pt.runDeterministicToolCall(ctx, "prepare_pipeline_write_context", map[string]any{
+			"path": plan.Path,
+		})
+		if err != nil {
+			return err
+		}
+		var writeCtx versioning.PreparedWorkspaceWriteContext
+		if err := json.Unmarshal([]byte(prepared), &writeCtx); err != nil {
+			return fmt.Errorf("decode prepare_pipeline_write_context: %w", err)
+		}
+		contexts = append(contexts, map[string]any{
+			"path":  plan.Path,
+			"basis": writeCtx.Basis,
+		})
+	}
+	_, err := pt.runDeterministicToolCall(ctx, "prepare_test_harness", map[string]any{
+		"files":          files,
+		"task_spec":      taskSpec,
+		"worker_type":    workerType,
+		"write_contexts": contexts,
+	})
+	return err
+}
+
+func (pt *PipelineTester) writeDeterministicTestWithTools(
+	ctx context.Context,
+	tc testershared.PlannedTestCase,
+	outputFile string,
+	content string,
+	writeBasis map[string]versioning.WorkspaceWriteBasis,
+) (versioning.WorkspaceWriteBasis, error) {
+	outputFile = strings.TrimSpace(outputFile)
+	if outputFile == "" {
+		return versioning.WorkspaceWriteBasis{}, fmt.Errorf("output_file is required")
+	}
+	key := normalizePipelineWritePath(outputFile)
+	basis, ok := writeBasis[key]
+	if !ok {
+		if err := pt.registerWritablePath(outputFile); err != nil {
+			return versioning.WorkspaceWriteBasis{}, err
+		}
+		prepared, err := pt.runDeterministicToolCall(ctx, "prepare_pipeline_write_context", map[string]any{
+			"path": outputFile,
+		})
+		if err != nil {
+			return versioning.WorkspaceWriteBasis{}, err
+		}
+		var writeCtx versioning.PreparedWorkspaceWriteContext
+		if err := json.Unmarshal([]byte(prepared), &writeCtx); err != nil {
+			return versioning.WorkspaceWriteBasis{}, fmt.Errorf("decode prepare_pipeline_write_context: %w", err)
+		}
+		basis = writeCtx.Basis
+	}
+	written, err := pt.runDeterministicToolCall(ctx, "write_test", map[string]any{
+		"test_case":   tc,
+		"target_file": tc.TargetFile,
+		"output_file": outputFile,
+		"content":     content,
+		"basis":       basis,
+	})
+	if err != nil {
+		return versioning.WorkspaceWriteBasis{}, err
+	}
+	var payload struct {
+		NextBasis versioning.WorkspaceWriteBasis `json:"next_basis"`
+	}
+	if err := json.Unmarshal([]byte(written), &payload); err != nil {
+		return versioning.WorkspaceWriteBasis{}, fmt.Errorf("decode write_test result: %w", err)
+	}
+	return payload.NextBasis, nil
+}
+
+func (pt *PipelineTester) runDeterministicToolCall(
+	ctx context.Context,
+	name string,
+	payload map[string]any,
+) (string, error) {
+	arguments, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal %s arguments: %w", name, err)
+	}
+	call := providers.ToolCall{
+		ID:        "det_" + uuid.NewString()[:8],
+		Name:      name,
+		Arguments: string(arguments),
+	}
+	return agentshared.TimedToolCall(ctx, "tester-pipeline", call, func() (string, error) {
+		execResult, execErr := pt.executeToolCall(ctx, call)
+		if execErr != nil {
+			return "", execErr
+		}
+		return execResult.Output, nil
+	})
 }
 
 func (pt *PipelineTester) createdArtifacts() []string {

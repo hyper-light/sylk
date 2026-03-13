@@ -47,8 +47,11 @@ func (gi *GlobalInspector) AuditLayer(ctx context.Context, req *shared.LayerAudi
 
 	// Run LLM tool loop for analysis
 	gi.prepareSkillsForInput(auditPrompt)
+	contract := agentShared.BuildGlobalExecutionContract("inspector-global", "check", auditPrompt)
+	systemPrompt := shared.GlobalInspectorSystemPromptForContract(contract)
+	systemPrompt = agentShared.AppendGlobalExecutionGuidance(systemPrompt, contract, "inspector-global")
 	llmReq := &providers.Request{
-		SystemPrompt: shared.GlobalInspectorSystemPrompt(),
+		SystemPrompt: systemPrompt,
 		Messages: []providers.Message{
 			{Role: providers.RoleUser, Content: auditPrompt},
 		},

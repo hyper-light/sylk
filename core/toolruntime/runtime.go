@@ -152,10 +152,18 @@ func (r *Runtime) Activate(names ...string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.activateNames(allowed, nil), nil
+	return r.activateNames(allowed, nil, false), nil
 }
 
 func (r *Runtime) RequestView(names ...string) (*RequestView, error) {
+	return r.newRequestView(false, names...)
+}
+
+func (r *Runtime) ScopedView(names ...string) (*RequestView, error) {
+	return r.newRequestView(true, names...)
+}
+
+func (r *Runtime) newRequestView(restricted bool, names ...string) (*RequestView, error) {
 	if r == nil || r.manifest == nil {
 		return nil, fmt.Errorf("tool runtime is not configured")
 	}
@@ -166,6 +174,7 @@ func (r *Runtime) RequestView(names ...string) (*RequestView, error) {
 	view := &RequestView{
 		runtime:         r,
 		transientActive: make(map[string]struct{}, len(allowed)),
+		restricted:      restricted,
 	}
 	for _, name := range allowed {
 		view.transientActive[name] = struct{}{}
@@ -189,11 +198,14 @@ func (r *Runtime) allowedToolNames(names ...string) ([]string, error) {
 }
 
 func (r *Runtime) SyncActiveFromLoaded() []string {
-	return r.syncActiveFromLoaded(nil)
+	return r.syncActiveFromLoaded(nil, false)
 }
 
-func (r *Runtime) syncActiveFromLoaded(transientActive map[string]struct{}) []string {
+func (r *Runtime) syncActiveFromLoaded(transientActive map[string]struct{}, restricted bool) []string {
 	if r == nil || r.registry == nil || r.manifest == nil {
+		return nil
+	}
+	if restricted {
 		return nil
 	}
 	loaded := r.registry.GetLoaded()
@@ -207,19 +219,19 @@ func (r *Runtime) syncActiveFromLoaded(transientActive map[string]struct{}) []st
 		}
 		names = append(names, skill.Name)
 	}
-	return r.activateNames(names, transientActive)
+	return r.activateNames(names, transientActive, restricted)
 }
 
 func (r *Runtime) BuildToolDefinitions() []providers.Tool {
-	return r.buildToolDefinitions(nil)
+	return r.buildToolDefinitions(nil, false)
 }
 
-func (r *Runtime) buildToolDefinitions(transientActive map[string]struct{}) []providers.Tool {
+func (r *Runtime) buildToolDefinitions(transientActive map[string]struct{}, restricted bool) []providers.Tool {
 	if r == nil {
 		return nil
 	}
 	tools := make([]providers.Tool, 0)
-	for _, name := range r.activeSnapshot(transientActive) {
+	for _, name := range r.activeSnapshot(transientActive, restricted) {
 		policy, ok := r.manifest.Policy(name)
 		if !ok {
 			continue
@@ -276,7 +288,7 @@ func (r *Runtime) Execute(ctx context.Context, inv Invocation) (ExecutionResult,
 }
 
 func (r *Runtime) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecutionResult, error) {
-	return r.executeRaw(ctx, inv, nil, nil)
+	return r.executeRaw(ctx, inv, nil, nil, false)
 }
 
 func (r *Runtime) executeRaw(
@@ -284,6 +296,7 @@ func (r *Runtime) executeRaw(
 	inv Invocation,
 	approvedGrant *GuardianControlGrant,
 	transientActive map[string]struct{},
+	restricted bool,
 ) (RawExecutionResult, error) {
 	if r == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
@@ -292,7 +305,7 @@ func (r *Runtime) executeRaw(
 	if err != nil {
 		return RawExecutionResult{}, err
 	}
-	if !r.isActive(name, transientActive) {
+	if !r.isActive(name, transientActive, restricted) {
 		return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 	}
 
@@ -356,13 +369,13 @@ func (r *Runtime) executeRaw(
 			return RawExecutionResult{}, fmt.Errorf("SECURITY VIOLATION: agent %q is not permitted to execute tool %q", inv.AgentID, name)
 		}
 		policy = nextPolicy
-		if !r.isActive(name, transientActive) {
+		if !r.isActive(name, transientActive, restricted) {
 			return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 		}
 	}
 
 	if name == SearchToolName {
-		payload, activated, execErr := r.executeSearch(toolData.Input, transientActive)
+		payload, activated, execErr := r.executeSearch(toolData.Input, transientActive, restricted)
 		if postErr := r.runPostHooks(ctx, toolData, payload, execErr); postErr != nil {
 			return RawExecutionResult{}, postErr
 		}
@@ -535,7 +548,7 @@ func (r *Runtime) obtainGuardianGrant(
 	return grant.Validate(req)
 }
 
-func (r *Runtime) executeSearch(input map[string]any, transientActive map[string]struct{}) (map[string]any, []string, error) {
+func (r *Runtime) executeSearch(input map[string]any, transientActive map[string]struct{}, restricted bool) (map[string]any, []string, error) {
 	var req searchRequest
 	if input != nil {
 		payload, err := json.Marshal(input)
@@ -614,7 +627,7 @@ func (r *Runtime) executeSearch(input map[string]any, transientActive map[string
 			Description: compileToolDescription(entry.skill, entry.policy),
 			Domain:      string(entry.policy.Domain),
 			Keywords:    append([]string(nil), entry.skill.Keywords...),
-			Active:      r.isActive(entry.skill.Name, transientActive),
+			Active:      r.isActive(entry.skill.Name, transientActive, restricted),
 			Loaded:      entry.skill.Loaded,
 			Score:       entry.score,
 		})
@@ -622,18 +635,18 @@ func (r *Runtime) executeSearch(input map[string]any, transientActive map[string
 			activateNames = append(activateNames, entry.skill.Name)
 		}
 	}
-	activated := r.activateNames(activateNames, transientActive)
+	activated := r.activateNames(activateNames, transientActive, restricted)
 	payload := map[string]any{
 		"query":              query,
 		"matches":            matches,
 		"activated_skills":   activated,
 		"result_count":       len(matches),
-		"active_skill_count": len(r.activeSnapshot(transientActive)),
+		"active_skill_count": len(r.activeSnapshot(transientActive, restricted)),
 	}
 	return payload, activated, nil
 }
 
-func (r *Runtime) isActive(name string, transientActive map[string]struct{}) bool {
+func (r *Runtime) isActive(name string, transientActive map[string]struct{}, restricted bool) bool {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
 		return false
@@ -643,10 +656,13 @@ func (r *Runtime) isActive(name string, transientActive map[string]struct{}) boo
 			return true
 		}
 	}
+	if restricted {
+		return false
+	}
 	return r.state.IsActive(trimmed)
 }
 
-func (r *Runtime) activateNames(names []string, transientActive map[string]struct{}) []string {
+func (r *Runtime) activateNames(names []string, transientActive map[string]struct{}, restricted bool) []string {
 	if len(names) == 0 {
 		return nil
 	}
@@ -657,7 +673,7 @@ func (r *Runtime) activateNames(names []string, transientActive map[string]struc
 	activated := make([]string, 0, len(names))
 	for _, name := range names {
 		trimmed := strings.TrimSpace(name)
-		if trimmed == "" || r.isActive(trimmed, transientActive) {
+		if trimmed == "" || r.isActive(trimmed, transientActive, restricted) {
 			continue
 		}
 		transientActive[trimmed] = struct{}{}
@@ -666,7 +682,19 @@ func (r *Runtime) activateNames(names []string, transientActive map[string]struc
 	return activated
 }
 
-func (r *Runtime) activeSnapshot(transientActive map[string]struct{}) []string {
+func (r *Runtime) activeSnapshot(transientActive map[string]struct{}, restricted bool) []string {
+	if restricted {
+		names := make([]string, 0, len(transientActive))
+		for name := range transientActive {
+			trimmed := strings.TrimSpace(name)
+			if trimmed == "" {
+				continue
+			}
+			names = append(names, trimmed)
+		}
+		sort.Strings(names)
+		return names
+	}
 	base := r.state.Snapshot()
 	if len(transientActive) == 0 {
 		return base

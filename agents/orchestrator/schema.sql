@@ -41,6 +41,31 @@ CREATE TABLE IF NOT EXISTS dag_revisions (
     UNIQUE(dag_id, revision)
 );
 
+-- Durable architect->orchestrator handoff receipts
+CREATE TABLE IF NOT EXISTS plan_handoff_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 0,
+    correlation_id TEXT,
+    requester_agent_id TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL,
+    workflow_id TEXT,
+    dag_id TEXT,
+    task_count INTEGER DEFAULT 0,
+    layer_count INTEGER DEFAULT 0,
+    error_text TEXT,
+    accepted_at DATETIME,
+    dag_built_at DATETIME,
+    submitted_at DATETIME,
+    running_at DATETIME,
+    failed_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(session_id, plan_id, revision)
+);
+
 -- Task updates (cold storage for BufferRegistry evictions)
 CREATE TABLE IF NOT EXISTS task_updates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +158,8 @@ CREATE TABLE IF NOT EXISTS remediation_cases (
 CREATE INDEX IF NOT EXISTS idx_dag_exec_plan ON dag_executions(plan_id);
 CREATE INDEX IF NOT EXISTS idx_dag_exec_session ON dag_executions(session_id);
 CREATE INDEX IF NOT EXISTS idx_dag_exec_state ON dag_executions(state);
+CREATE INDEX IF NOT EXISTS idx_handoff_receipts_plan ON plan_handoff_receipts(session_id, plan_id, revision);
+CREATE INDEX IF NOT EXISTS idx_handoff_receipts_status ON plan_handoff_receipts(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_dag_revisions_dag ON dag_revisions(dag_id);
 CREATE INDEX IF NOT EXISTS idx_task_updates_dag ON task_updates(dag_id);
 CREATE INDEX IF NOT EXISTS idx_task_updates_task ON task_updates(task_id);

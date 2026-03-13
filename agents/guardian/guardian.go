@@ -1009,34 +1009,48 @@ func (g *Guardian) requestApprovalDetailed(ctx context.Context, proposal *GitMut
 		return ApprovalResult{}, fmt.Errorf("publish proposal: %w", err)
 	}
 
-	// Wait for approval with TTL.
-	timer := time.NewTimer(DefaultApprovalTTL)
-	defer timer.Stop()
-
-	select {
-	case result := <-ch:
-		action := "approved"
-		if !result.Approved {
-			action = "denied"
+	var approval ApprovalResult
+	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+		AttemptTimeout: DefaultApprovalTTL,
+		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
+		OnRefresh: func(info shared.ContextLeaseRefresh) {
+			if g.logger != nil {
+				g.logger.Info("approval wait lease refreshed",
+					"correlation_id", correlationID,
+					"refresh_count", info.RefreshCount,
+					"attempt_timeout", info.AttemptTimeout.String(),
+					"error", info.Error)
+			}
+		},
+	}, func(waitCtx context.Context) error {
+		select {
+		case approval = <-ch:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	})
+	if err != nil {
+		verdict := "timeout"
+		level := "warn"
+		if ctx.Err() != nil {
+			verdict = "cancelled"
 		}
 		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
-			g.id, "", correlationID, "info", &agentlog.DiffPayload{
-				Verdict: action, Reason: result.Reason,
+			g.id, "", correlationID, level, &agentlog.DiffPayload{
+				Verdict: verdict,
 			})
-		return result, nil
-	case <-timer.C:
-		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
-			g.id, "", correlationID, "warn", &agentlog.DiffPayload{
-				Verdict: "timeout",
-			})
-		return ApprovalResult{}, fmt.Errorf("approval timed out after %v", DefaultApprovalTTL)
-	case <-ctx.Done():
-		shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
-			g.id, "", correlationID, "warn", &agentlog.DiffPayload{
-				Verdict: "cancelled",
-			})
-		return ApprovalResult{}, ctx.Err()
+		return ApprovalResult{}, shared.WrapLeaseTimeoutError("approval", DefaultApprovalTTL, err)
 	}
+	action := "approved"
+	if !approval.Approved {
+		action = "denied"
+	}
+	shared.LogAgentEvent(g.steering.EventLogger(), agentlog.EventApprovalReceived,
+		g.id, "", correlationID, "info", &agentlog.DiffPayload{
+			Verdict: action, Reason: approval.Reason,
+		})
+	return approval, nil
 }
 
 // ---------------------------------------------------------------------------

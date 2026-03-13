@@ -309,6 +309,27 @@ func buildDeterministicIngestionAck(ingestionResult any) string {
 	dagID, _ := resultMap["dag_id"].(string)
 	taskCount, _ := resultMap["task_count"].(int)
 	layerCount, _ := resultMap["layer_count"].(int)
+	duplicate, _ := resultMap["duplicate"].(bool)
+	receiptStatus, _ := resultMap["receipt_status"].(string)
+
+	if duplicate {
+		if dagID != "" {
+			return fmt.Sprintf(
+				"Plan %s is already in handoff state %s on DAG %s.",
+				planID, firstNonEmpty(receiptStatus, "running"), dagID,
+			)
+		}
+		return fmt.Sprintf(
+			"Plan %s is already in handoff state %s.",
+			planID, firstNonEmpty(receiptStatus, "accepted"),
+		)
+	}
+	if dagID == "" {
+		return fmt.Sprintf(
+			"Plan %s handoff recorded with status %s.",
+			planID, firstNonEmpty(receiptStatus, "accepted"),
+		)
+	}
 
 	return fmt.Sprintf(
 		"Plan %s ingested. DAG %s started with %d tasks across %d layers.",

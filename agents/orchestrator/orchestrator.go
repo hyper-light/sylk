@@ -119,6 +119,10 @@ type Orchestrator struct {
 
 	mu sync.RWMutex
 
+	pipelinePanelMu         sync.Mutex
+	pipelinePanelState      map[string]pipelinePanelSnapshot
+	pipelinePanelRegistered map[string]struct{}
+
 	// Request lifecycle: runCtx is cancelled in Stop() and serves as parent
 	// for per-request contexts, enabling graceful cancellation.
 	runCtx    context.Context
@@ -130,6 +134,12 @@ type Orchestrator struct {
 	// Request serialization: ensures at most one forwarded request
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *shared.RequestSerializer
+}
+
+type pipelinePanelSnapshot struct {
+	EventType      events.EventType
+	NodeID         string
+	PipelineStatus string
 }
 
 // logInfo logs at Info level, safe to call when o.logger is nil.
@@ -168,19 +178,21 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 	hookRegistry := skills.NewHookRegistry()
 
 	o := &Orchestrator{
-		config:            cfg,
-		state:             NewState(cfg.SessionID),
-		skills:            skillsRegistry,
-		hooks:             hookRegistry,
-		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		activityPub:       activityPub,
-		sessionVFS:        make(map[string]*versioning.SessionVFS),
-		logger:            logger,
-		logWAL:            logCloser,
-		steering:          shared.NewSteeringManager(),
-		requestSerializer: shared.NewRequestSerializer(),
-		pendingBus:        make(map[string]chan *guide.Message),
-		dispatchGate:      newDispatchHoldGate(),
+		config:                  cfg,
+		state:                   NewState(cfg.SessionID),
+		skills:                  skillsRegistry,
+		hooks:                   hookRegistry,
+		knownAgents:             make(map[string]*guide.AgentAnnouncement),
+		activityPub:             activityPub,
+		sessionVFS:              make(map[string]*versioning.SessionVFS),
+		logger:                  logger,
+		logWAL:                  logCloser,
+		steering:                shared.NewSteeringManager(),
+		requestSerializer:       shared.NewRequestSerializer(),
+		pendingBus:              make(map[string]chan *guide.Message),
+		dispatchGate:            newDispatchHoldGate(),
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
 	}
 
 	if provider != nil {
@@ -285,13 +297,14 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 
 	// DAG Bridge
 	o.dagBridge = NewDAGBridge(cfg.DAGConfig, DAGBridgeDeps{
-		Store:       store,
-		Journal:     journal,
-		Buffers:     buffers,
-		Scope:       scope,
-		ActivityPub: activityPub,
-		SessionID:   cfg.SessionID,
-		AgentID:     cfg.AgentID,
+		Store:        store,
+		Journal:      journal,
+		Buffers:      buffers,
+		Scope:        scope,
+		Orchestrator: o,
+		ActivityPub:  activityPub,
+		SessionID:    cfg.SessionID,
+		AgentID:      cfg.AgentID,
 	})
 	o.dagBridge.SetDispatchPermitWaiter(func(ctx context.Context, sessionID, dagID string) error {
 		if o.dispatchGate == nil {
@@ -612,6 +625,7 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 		o.subscribePipelineTopics()
 		o.subscribeDAGTopics()
 		o.dagBridge.RecoverFromWAL(context.Background())
+		o.reconcilePlanHandoffReceipts()
 		o.bufferRegistry.StartGC(context.Background())
 		o.startWALGC()
 	}
@@ -1834,6 +1848,13 @@ func (o *Orchestrator) publishPipelineAgentActivity(agentType, pipelineID, nodeI
 		return
 	}
 	panelAgentID := pipelinePanelAgentID(pipelineID, agentType)
+	if !o.recordPipelinePanelActivity(panelAgentID, pipelinePanelSnapshot{
+		EventType:      events.EventTypeAgentAction,
+		NodeID:         nodeID,
+		PipelineStatus: pipelineStatus,
+	}) {
+		return
+	}
 	displayName := PipelineAgentDisplayNames[agentType]
 	if displayName == "" {
 		displayName = agentType
@@ -1864,6 +1885,9 @@ func (o *Orchestrator) publishPipelineAgentRegistration(agentType, pipelineID, t
 		return
 	}
 	panelAgentID := pipelinePanelAgentID(pipelineID, agentType)
+	if !o.recordPipelinePanelRegistration(panelAgentID, pipelineStatus) {
+		return
+	}
 	displayName := PipelineAgentDisplayNames[agentType]
 	if displayName == "" {
 		displayName = agentType
@@ -1890,6 +1914,36 @@ func pipelinePanelAgentID(pipelineID, agentType string) string {
 		return agentType
 	}
 	return pipelineID + ":" + agentType
+}
+
+func (o *Orchestrator) recordPipelinePanelActivity(agentID string, next pipelinePanelSnapshot) bool {
+	if agentID == "" {
+		return true
+	}
+	o.pipelinePanelMu.Lock()
+	defer o.pipelinePanelMu.Unlock()
+	if prev, ok := o.pipelinePanelState[agentID]; ok && prev == next {
+		return false
+	}
+	o.pipelinePanelState[agentID] = next
+	return true
+}
+
+func (o *Orchestrator) recordPipelinePanelRegistration(agentID, pipelineStatus string) bool {
+	if agentID == "" {
+		return true
+	}
+	o.pipelinePanelMu.Lock()
+	defer o.pipelinePanelMu.Unlock()
+	if _, registered := o.pipelinePanelRegistered[agentID]; registered {
+		return false
+	}
+	o.pipelinePanelRegistered[agentID] = struct{}{}
+	o.pipelinePanelState[agentID] = pipelinePanelSnapshot{
+		EventType:      events.EventTypeAgentRegistered,
+		PipelineStatus: pipelineStatus,
+	}
+	return true
 }
 
 // publishActivityWithVisibility sends an activity event with explicit visibility.

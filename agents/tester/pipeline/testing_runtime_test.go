@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/agents/tester"
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/purevfs"
 	coretest "github.com/adalundhe/sylk/core/test"
@@ -136,6 +138,135 @@ func TestPipelineTesterRunGoTestSuite_UsesStrictBroker(t *testing.T) {
 	}
 	if got := result["execution_strategy"]; got != purevfs.StrategyProcessBroker {
 		t.Fatalf("strategy = %v, want %v", got, purevfs.StrategyProcessBroker)
+	}
+}
+
+func TestPipelineTesterWriteTestArtifact_RefreshesStaleBasisViaSharedWriteSkill(t *testing.T) {
+	pt, ctx, fa := newGoPipelineTesterWithVFS(t)
+
+	harness, err := pt.detectHarness(ctx, []string{"pkg/service/service.go"}, "Write Add tests", "engineer")
+	if err != nil {
+		t.Fatalf("detectHarness: %v", err)
+	}
+
+	outputFile := "pkg/service/service_test.go"
+	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
+		Name:       "TestSeed",
+		TargetFile: "pkg/service/service.go",
+	}, outputFile, "func TestSeed(t *testing.T) {\n\tt.Helper()\n}\n", nil)
+	if err != nil {
+		t.Fatalf("seed writeTestArtifact: %v", err)
+	}
+
+	basis, err := versioning.RefreshWorkspaceWriteBasis(
+		ctx,
+		pt.workspaceViews,
+		versioning.WorkspaceWriteScopePipeline,
+		outputFile,
+		pt.pipelineID,
+	)
+	if err != nil {
+		t.Fatalf("RefreshWorkspaceWriteBasis: %v", err)
+	}
+
+	staleContent := "package service\n\nimport \"testing\"\n\nfunc TestExisting(t *testing.T) {\n\tt.Helper()\n}\n"
+	if err := fa.WriteFile(ctx, outputFile, []byte(staleContent)); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err = pt.writeTestArtifact(ctx, harness, testershared.PlannedTestCase{
+		Name:       "TestFresh",
+		TargetFile: "pkg/service/service.go",
+	}, outputFile, "func TestFresh(t *testing.T) {\n\tt.Helper()\n}\n", &basis)
+	if err != nil {
+		t.Fatalf("writeTestArtifact with stale basis: %v", err)
+	}
+
+	content, err := fa.ReadFile(ctx, outputFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	got := string(content)
+	if !strings.Contains(got, "func TestExisting") {
+		t.Fatalf("expected existing test to be preserved, got %q", got)
+	}
+	if !strings.Contains(got, "func TestFresh") {
+		t.Fatalf("expected fresh test to be written, got %q", got)
+	}
+}
+
+func TestPipelineTesterCreateTestsDeterministically_EmitsWriteToolCalls(t *testing.T) {
+	pt, baseCtx, _ := newGoPipelineTesterWithVFS(t)
+	pt.gatePassed = true
+
+	var toolNames []string
+	ctx := agentshared.WithToolCallEmitter(baseCtx, func(event agentshared.ToolCallEvent) {
+		if event.Phase != agentshared.ToolCallStart {
+			return
+		}
+		toolNames = append(toolNames, event.ToolName)
+	})
+
+	req := &tester.TesterRequest{
+		ID:         "req-1",
+		Files:      []string{"pkg/service/service.go"},
+		TaskPrompt: "Write specification-first tests for Add.",
+		WorkerType: "engineer",
+	}
+	if err := pt.createTestsDeterministically(ctx, req, req.Files); err != nil {
+		t.Fatalf("createTestsDeterministically: %v", err)
+	}
+	for _, want := range []string{"check_inspector_gate", "detect_test_harness", "analyze_risk", "plan_tests"} {
+		if !containsName(toolNames, want) {
+			t.Fatalf("expected %s tool call, got %v", want, toolNames)
+		}
+	}
+	if !containsName(toolNames, "prepare_pipeline_write_context") {
+		t.Fatalf("expected prepare_pipeline_write_context tool call, got %v", toolNames)
+	}
+	if !containsName(toolNames, "write_test") {
+		t.Fatalf("expected write_test tool call, got %v", toolNames)
+	}
+}
+
+func TestPipelineTesterTaskToolSurfaceIncludesWriteFlow(t *testing.T) {
+	pt, err := New(testershared.PipelineTesterConfig{}, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if pt.tools != nil {
+			pt.tools.Close()
+		}
+	})
+
+	contract := agentshared.BuildTaskExecutionContract(&agentshared.PipelineTaskInput{
+		TaskID:    "task-1",
+		AgentType: "tester-pipeline",
+		Prompt:    "Add tests for the CLI behavior.",
+		Context: map[string]any{
+			"pipeline_stage":    "test",
+			"test_requirements": []string{"Write failing tests for greet()."},
+		},
+	})
+	surface, err := agentshared.TaskToolSurface(pt.toolRuntime(), contract, "tester-pipeline")
+	if err != nil {
+		t.Fatalf("TaskToolSurface() error = %v", err)
+	}
+
+	toolNames := make([]string, 0)
+	for _, tool := range pt.buildToolDefinitionsWithSurface(surface) {
+		toolNames = append(toolNames, tool.Name)
+	}
+	for _, want := range []string{"prepare_pipeline_write_context", "write_test", "run_test_suite"} {
+		if !containsName(toolNames, want) {
+			t.Fatalf("task surface missing %q: %v", want, toolNames)
+		}
+	}
+	for _, blocked := range []string{"write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory"} {
+		if containsName(toolNames, blocked) {
+			t.Fatalf("task surface unexpectedly exposed %q: %v", blocked, toolNames)
+		}
 	}
 }
 

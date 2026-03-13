@@ -74,6 +74,8 @@ func BuildManifestFromRegistry(cfg ManifestBuildConfig) *PolicyManifest {
 		manifest.Tools[policy.Name] = policy
 	}
 
+	ensureConfiguredToolPolicies(manifest, visible, mutating)
+
 	if _, ok := manifest.Tools[SearchToolName]; !ok {
 		searchPolicy := NewToolPolicy(
 			SearchToolName,
@@ -88,6 +90,55 @@ func BuildManifestFromRegistry(cfg ManifestBuildConfig) *PolicyManifest {
 	}
 
 	return ApplyAuthorityProfile(manifest.AgentID, manifest)
+}
+
+func ensureConfiguredToolPolicies(
+	manifest *PolicyManifest,
+	visible map[string]struct{},
+	mutating map[string]struct{},
+) {
+	if manifest == nil {
+		return
+	}
+	ensureConfiguredPolicySet(manifest, visible, visible, mutating)
+	ensureConfiguredPolicySet(manifest, mutating, visible, mutating)
+}
+
+func ensureConfiguredPolicySet(
+	manifest *PolicyManifest,
+	configured map[string]struct{},
+	visible map[string]struct{},
+	mutating map[string]struct{},
+) {
+	for name := range configured {
+		if isSyntheticTool(name) {
+			continue
+		}
+		if _, ok := manifest.Tools[name]; ok {
+			continue
+		}
+		manifest.Tools[name] = inferredConfiguredToolPolicy(name, manifest.CapabilityScope, visible, mutating)
+	}
+}
+
+func inferredConfiguredToolPolicy(
+	name string,
+	capabilityScope string,
+	visible map[string]struct{},
+	mutating map[string]struct{},
+) ToolPolicy {
+	effect := EffectReadOnly
+	execution := ExecutionModeLocal
+	if _, ok := mutating[name]; ok {
+		effect = EffectMutating
+		execution = ExecutionModeLocalWorker
+	}
+	policy := NewToolPolicy(name, effect, DomainSystem, execution)
+	policy.CapabilityScope = capabilityScope
+	if _, ok := visible[name]; ok {
+		policy.VisibleByDefault = true
+	}
+	return policy
 }
 
 func InferEffectDomain(domain string) EffectDomain {

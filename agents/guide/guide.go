@@ -361,9 +361,9 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		streamReroutes:       make(map[string]string),
 	}
 
-	guide.registerCoreSkills()
-	guide.registerExtendedSkills()
-	guide.skillLoader = skills.NewLoader(guide.skills, loaderCfg)
+	if err := guide.initializeSkills(loaderCfg); err != nil {
+		return nil, err
+	}
 	if err := guide.initRuntimeExtensions(cfg); err != nil {
 		return nil, err
 	}
@@ -425,32 +425,11 @@ func resolveRouteCacheConfig(cfg Config) RouteCacheConfig {
 func buildSkills(cfg Config) (*skills.Registry, skills.LoaderConfig, *skills.HookRegistry) {
 	skillsRegistry := skills.NewRegistry()
 	skillsLoaderCfg := guideSkillsLoaderConfig(cfg)
-	skillsLoaderCfg.CoreSkills = []string{"route", "clarify", "guide_route", "help", "status", "agents", "self_diagnostic", "evaluate_plan_acceptance", "read_workspace_file", "workspace_glob", "workspace_grep", "inspect_workspace_state", "summarize_workspace_state"}
+	skillsLoaderCfg.CoreSkills = guideCoreSkillNames()
 	skillsLoaderCfg.AutoLoadDomains = nil
 
 	hooks := skills.NewHookRegistry()
-
-	// CRITICAL SAFETY CATCH
-	// The Guide must NEVER be able to execute generic state-mutating tools like write_file or run_shell_command
-	// even if they somehow leak into its context. We explicitly whitelist its approved tools.
-	allowedTools := map[string]bool{
-		"route": true, "clarify": true, "guide_route": true, "help": true, "status": true,
-		"agents": true, "conversation_context": true, "route_to": true, "reply_to": true, "broadcast": true,
-		"task_interact": true, "get_routing_history": true, "get_agent_capabilities": true,
-		"self_diagnostic": true, "evaluate_plan_acceptance": true,
-		"read_workspace_file": true, "workspace_glob": true, "workspace_grep": true, "inspect_workspace_state": true, "summarize_workspace_state": true,
-		"sessions": true, "metrics": true, "switch_session": true, "create_session": true, "close_session": true,
-	}
-
-	hooks.RegisterPreToolCallHook("guide_safety_catch", skills.HookPriorityHigh, func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
-		if !allowedTools[data.ToolName] {
-			return skills.HookResult{
-				Continue: false,
-				Error:    fmt.Errorf("SECURITY VIOLATION: Guide agent is not permitted to execute tool %q", data.ToolName),
-			}
-		}
-		return skills.HookResult{Continue: true}
-	})
+	registerGuideSafetyHook(hooks, skillsRegistry, guideAllSkillNames())
 
 	return skillsRegistry, skillsLoaderCfg, hooks
 }
@@ -463,6 +442,16 @@ func guideSkillsLoaderConfig(cfg Config) skills.LoaderConfig {
 	skillsLoaderCfg.MaxLoadedSkills = 10
 	skillsLoaderCfg.TokenBudget = 2600
 	return skillsLoaderCfg
+}
+
+func (g *Guide) initializeSkills(loaderCfg skills.LoaderConfig) error {
+	g.registerCoreSkills()
+	g.registerExtendedSkills()
+	if err := validateGuideSkillConfiguration(g.skills); err != nil {
+		return err
+	}
+	g.skillLoader = skills.NewLoader(g.skills, loaderCfg)
+	return nil
 }
 
 // NewWithClassifier creates a new Guide agent with a custom ClassifierClient.
@@ -539,9 +528,9 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		streamReroutes:       make(map[string]string),
 	}
 
-	guide.registerCoreSkills()
-	guide.registerExtendedSkills()
-	guide.skillLoader = skills.NewLoader(guide.skills, loaderCfg)
+	if err := guide.initializeSkills(loaderCfg); err != nil {
+		return nil, err
+	}
 	if err := guide.initRuntimeExtensions(cfg); err != nil {
 		return nil, err
 	}
@@ -643,9 +632,9 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		streamReroutes: make(map[string]string),
 	}
 
-	guide.registerCoreSkills()
-	guide.registerExtendedSkills()
-	guide.skillLoader = skills.NewLoader(guide.skills, loaderCfg)
+	if err := guide.initializeSkills(loaderCfg); err != nil {
+		return nil, err
+	}
 	if cfg.SelfResponder == nil {
 		guide.selfResponder = resolveGuideSelfResponder(cfg, provider, model, guide)
 	}
@@ -1341,6 +1330,32 @@ func (g *Guide) resolveAgentDisplayName(agentID string) string {
 	return agentID
 }
 
+// resolveReadyAgentID returns a registered, ready agent ID for the given
+// UUID/name/type reference. This prefers the direct ID when it is ready, and
+// otherwise falls back to the current ready registration for the same agent
+// type. It is used to avoid routing to stale UUIDs after cold reactivation.
+func (g *Guide) resolveReadyAgentID(idOrName string) string {
+	if g == nil {
+		return ""
+	}
+	trimmed := strings.TrimSpace(idOrName)
+	if trimmed == "" {
+		return ""
+	}
+	if g.resolveAgent(trimmed) != nil && g.IsAgentReady(trimmed) {
+		return g.resolveAgentID(trimmed)
+	}
+	agentType := g.resolveActivationType(trimmed)
+	if agentType == "" {
+		return ""
+	}
+	resolved := g.resolveAgentID(agentType)
+	if resolved == "" || g.resolveAgent(resolved) == nil || !g.IsAgentReady(resolved) {
+		return ""
+	}
+	return resolved
+}
+
 // resolveActivationType maps an agent ID (UUID or type name) to the agent type
 // name expected by the activation controller. Returns the input unchanged when
 // no mapping exists — the caller should assume it is already a type name.
@@ -1382,8 +1397,11 @@ func (g *Guide) resolvePodID(idOrName string) string {
 // re-activation creates a new agent with a fresh UUID) and an error when the
 // agent cannot be activated or remains unresolvable after activation.
 func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID string) (string, error) {
-	if g.resolveAgent(targetAgentID) != nil && g.IsAgentReady(targetAgentID) {
-		return targetAgentID, nil
+	if resolved := g.resolveReadyAgentID(targetAgentID); resolved != "" {
+		return resolved, nil
+	}
+	if g.activator == nil && g.agentRegistrar == nil && g.resolveAgent(targetAgentID) != nil {
+		return g.resolveAgentID(targetAgentID), nil
 	}
 
 	// Resolve UUID → pod ID for the activation controller, which indexes
@@ -1413,14 +1431,7 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 		g.agentRegistrar(g.resolveActivationType(targetAgentID))
 	}
 
-	// The original UUID still resolves — agent was just paused, not replaced.
-	if g.resolveAgent(targetAgentID) != nil {
-		return targetAgentID, nil
-	}
-	// Re-activation created a new agent with a fresh UUID. Resolve via
-	// the type name which is indexed by the registry's name lookup.
-	agentType := g.resolveActivationType(targetAgentID)
-	if resolved := g.resolveAgentID(agentType); g.resolveAgent(resolved) != nil {
+	if resolved := g.resolveReadyAgentID(targetAgentID); resolved != "" {
 		return resolved, nil
 	}
 	return "", fmt.Errorf("agent %q not available after activation", targetAgentID)
@@ -4124,7 +4135,10 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	// Resolve name/alias to the actual registration ID. Agents with UUID-based
 	// IDs (tester, inspector) register channels under the UUID but routing uses
 	// the type name ("tester", "inspector") as the target.
-	resolved := g.resolveAgentID(targetAgentID)
+	resolved := g.resolveReadyAgentID(targetAgentID)
+	if resolved == "" {
+		resolved = g.resolveAgentID(targetAgentID)
+	}
 
 	// The activation controller indexes by pod ID.
 	activationType := g.resolveActivationType(resolved)
@@ -4142,12 +4156,16 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	// Re-register routing info after activation (handles new UUIDs from cold start).
 	// Skip when the resolved agent already has active bus subscriptions —
 	// re-registration is only needed when activation created a fresh agent.
-	if g.agentRegistrar != nil && !g.hasActiveAgentSubs(resolved) {
+	if g.agentRegistrar != nil {
 		g.agentRegistrar(activationType)
 	}
 
-	// Re-resolve — cold start may create new agent with fresh UUID.
-	resolved = g.resolveAgentID(targetAgentID)
+	// Re-resolve — cold start may create a fresh registration ID.
+	if readyResolved := g.resolveReadyAgentID(targetAgentID); readyResolved != "" {
+		resolved = readyResolved
+	} else {
+		resolved = g.resolveAgentID(targetAgentID)
+	}
 
 	if g.activator != nil {
 		g.activator.TouchPodActivity(podID)

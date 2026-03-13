@@ -1,19 +1,24 @@
 package ui
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func newStreamTelemetryModel() *AppModel {
 	return &AppModel{
 		agentContextTokens: make(map[string]int),
+		agentContextModels: make(map[string]string),
 		streamUsage:        make(map[string]streamUsageEntry),
 		streamedResponses:  make(map[string]streamedResponseState),
 		activeStreams:      make(map[string]*activeStreamEntry),
+		reroutedStreamCIDs: make(map[string]time.Time),
 		agentPanel:         agentpkg.New(theme.DefaultDark()),
 	}
 }
@@ -30,6 +35,63 @@ func TestStreamTelemetry_FinalizeUpdatesAgentContext(t *testing.T) {
 	}
 	if m.agentContextTokens["architect"] <= 0 {
 		t.Fatalf("expected architect context tokens > 0, got %d", m.agentContextTokens["architect"])
+	}
+}
+
+func TestStreamTelemetry_UsesLatestPerTurnInputTokensForPipelineTester(t *testing.T) {
+	m := newStreamTelemetryModel()
+
+	start := msg.StreamStartMsg{
+		CorrelationID: "corr-tester",
+		AgentID:       "runtime-tester",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+	}
+	m.trackStreamStart(start)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		CorrelationID: "corr-tester",
+		AgentID:       "runtime-tester",
+		Model:         "gpt-5.4-pro",
+		InputTokens:   120000,
+	})
+	m = model.(*AppModel)
+	model, _ = m.Update(msg.TokenUsageMsg{
+		CorrelationID: "corr-tester",
+		AgentID:       "runtime-tester",
+		Model:         "gpt-5.4-pro",
+		InputTokens:   210000,
+	})
+	m = model.(*AppModel)
+
+	canonicalID := "task_auth_checkout:tester-pipeline"
+	if got := m.agentContextTokens[canonicalID]; got != 210000 {
+		t.Fatalf("agentContextTokens[%q] = %d, want 210000", canonicalID, got)
+	}
+	if got := m.streamUsage["corr-tester"].InputTokens; got != 210000 {
+		t.Fatalf("streamUsage input tokens = %d, want 210000", got)
+	}
+
+	m.applyRealStreamUsage(msg.StreamCompleteMsg{CorrelationID: "corr-tester", InputTokens: 330000})
+	if got := m.streamUsage["corr-tester"].InputTokens; got != 210000 {
+		t.Fatalf("streamUsage input tokens after complete = %d, want 210000", got)
+	}
+
+	m.finalizeStreamUsage("corr-tester", true, "")
+	if got := m.agentContextTokens[canonicalID]; got != 210000 {
+		t.Fatalf("finalized agentContextTokens[%q] = %d, want 210000", canonicalID, got)
+	}
+}
+
+func TestStreamTelemetry_UsesModelSpecificContextLimit(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("tester", "tester", "Tester", nil, "", "")
+
+	ratio := m.setAgentContextUsage("tester", 210000)
+	if ratio >= 1.0 {
+		t.Fatalf("ratio = %.4f, want < 1.0 for gpt-5.4-pro context window", ratio)
 	}
 }
 
@@ -157,5 +219,127 @@ func TestStreamTelemetry_TaskIDOverridesRuntimePipelineID(t *testing.T) {
 	}
 	if entry.PipelineID != "task_auth_checkout" {
 		t.Fatalf("entry.PipelineID = %q, want task_auth_checkout", entry.PipelineID)
+	}
+}
+
+func TestStreamProgressTelemetryBootstrapsChatEntry(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-progress",
+		AgentID:       "a1b2c3d4",
+		AgentType:     "inspector-pipeline",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+		Message:       "Reviewing carefully...",
+	})
+	app = model.(*AppModel)
+
+	if !app.chat.IsStreaming() {
+		t.Fatal("expected progress-first stream to bootstrap chat streaming state")
+	}
+	if view := app.chat.View(); !strings.Contains(view, "Reviewing carefully...") {
+		t.Fatalf("expected bootstrapped chat view to include progress status, got %q", view)
+	}
+}
+
+func TestStreamRerouteBootstrapsChatEntry(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamRerouteMsg{
+		SessionID:             "s1",
+		OriginalCorrelationID: "corr-guide",
+		CorrelationID:         "corr-inspector",
+		FromAgentID:           "guide",
+		ToAgentID:             "inspector",
+	})
+	app = model.(*AppModel)
+
+	if !app.chat.IsStreaming() {
+		t.Fatal("expected reroute to bootstrap chat streaming state")
+	}
+	if view := app.chat.View(); !strings.Contains(view, "Taking a thorough look...") {
+		t.Fatalf("expected rerouted chat view to include inspector placeholder, got %q", view)
+	}
+}
+
+func TestStreamReroute_AllowsOriginalCompletionToFinalizeChatSlot(t *testing.T) {
+	app := newResizeTestApp(t)
+	if cmd := app.handleResize(tea.WindowSizeMsg{Width: 100, Height: 32}); cmd != nil {
+		t.Fatalf("initial resize command = %v, want nil", cmd)
+	}
+
+	model, _ := app.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "corr-architect",
+		AgentID:       "architect",
+		AgentType:     "architect",
+		AgentName:     "Architect",
+	})
+	app = model.(*AppModel)
+
+	if view := app.chat.View(); !strings.Contains(view, "Sketching out the blueprint...") {
+		t.Fatalf("expected architect placeholder before reroute, got %q", view)
+	}
+
+	model, _ = app.Update(msg.StreamRerouteMsg{
+		SessionID:             "s1",
+		OriginalCorrelationID: "corr-architect",
+		CorrelationID:         "corr-orchestrator",
+		FromAgentID:           "architect",
+		ToAgentID:             "orchestrator",
+	})
+	app = model.(*AppModel)
+
+	if _, ok := app.activeStreams["corr-architect"]; ok {
+		t.Fatal("expected architect stream to be removed from active set after reroute")
+	}
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-architect",
+		AgentID:           "architect",
+		AgentType:         "architect",
+		AgentName:         "Architect",
+		AuthoritativeText: "Plan handoff queued to the orchestrator.",
+	})
+	app = model.(*AppModel)
+
+	if _, ok := app.reroutedStreamCIDs["corr-architect"]; ok {
+		t.Fatal("expected architect reroute completion allowance to be cleared after completion")
+	}
+
+	model, _ = app.Update(msg.StreamCompleteMsg{
+		SessionID:         "s1",
+		CorrelationID:     "corr-orchestrator",
+		AgentID:           "orchestrator",
+		AgentType:         "orchestrator",
+		AgentName:         "Orchestrator",
+		AuthoritativeText: "Orchestrator accepted the plan handoff.",
+	})
+	app = model.(*AppModel)
+
+	view := app.chat.View()
+	if strings.Contains(view, "Sketching out the blueprint...") {
+		t.Fatalf("expected architect thinking placeholder to be cleared after completion, got %q", view)
+	}
+	if strings.Contains(view, "Coordinating the team...") {
+		t.Fatalf("expected orchestrator thinking placeholder to be cleared after completion, got %q", view)
+	}
+	if !strings.Contains(view, "Plan handoff queued to the orchestrator.") {
+		t.Fatalf("expected architect completion text in chat view, got %q", view)
+	}
+	if !strings.Contains(view, "Orchestrator accepted the plan handoff.") {
+		t.Fatalf("expected orchestrator completion text in chat view, got %q", view)
+	}
+	if app.chat.IsStreaming() {
+		t.Fatal("expected all rerouted streams to be finalized")
 	}
 }

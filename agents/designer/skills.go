@@ -329,7 +329,7 @@ type componentCreateParams struct {
 
 func componentCreateSkill(d *Designer) *skills.Skill {
 	return skills.NewSkill("component_create").
-		Description("Create a new UI component with proper structure, design tokens, and accessibility support.").
+		Description("Plan a new UI component scaffold, file layout, and token usage. This skill does not write files; actual file creation must use prepare_pipeline_write_context followed by write_pipeline_file.").
 		Domain("ui").
 		Keywords("create", "component", "new", "ui", "build").
 		Priority(95).
@@ -338,6 +338,8 @@ func componentCreateSkill(d *Designer) *skills.Skill {
 		ArrayParam("design_tokens", "Design tokens to use in the component", "string", false).
 		StringParam("path", "Directory to create the component in", false).
 		StringParam("type", "Component type: react, react-typescript, vue, svelte (default: react-typescript)", false).
+		Usage("Use this to decide scaffold paths and structure, then call prepare_pipeline_write_context for each target file before materializing the component with write_pipeline_file.").
+		BestPractice("Treat the returned files as a plan only. Real workspace mutations must flow through the leased pipeline write-context tools so next_basis can be reused safely.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params componentCreateParams
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -368,7 +370,10 @@ func componentCreateSkill(d *Designer) *skills.Skill {
 				"path":          targetPath,
 				"props":         params.Props,
 				"design_tokens": params.DesignTokens,
-				"created":       true,
+				"created":       false,
+				"planned":       true,
+				"write_scope":   "pipeline",
+				"next_step":     "prepare_pipeline_write_context",
 				"files": []string{
 					filepath.Join(targetPath, params.Name+getExtension(componentType)),
 					filepath.Join(targetPath, params.Name+".module.css"),
@@ -402,12 +407,14 @@ type componentModifyParams struct {
 
 func componentModifySkill(d *Designer) *skills.Skill {
 	return skills.NewSkill("component_modify").
-		Description("Modify an existing UI component. Specify the component path and changes to make.").
+		Description("Plan a targeted UI component modification. This skill does not write files; actual edits must use prepare_pipeline_write_context followed by edit_pipeline_file.").
 		Domain("ui").
 		Keywords("modify", "update", "change", "component", "edit").
 		Priority(90).
 		StringParam("path", "Path to the component file to modify", true).
 		StringParam("changes", "Description of changes to make", true).
+		Usage("Use this to clarify the intended component change set, then call prepare_pipeline_write_context for the file before applying the edit with edit_pipeline_file or write_pipeline_file.").
+		BestPractice("Do not treat this as a file mutation. Reuse the next_basis returned by the actual write/edit tools for follow-up edits to the same file.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params componentModifyParams
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -438,9 +445,12 @@ func componentModifySkill(d *Designer) *skills.Skill {
 			}
 
 			return map[string]any{
-				"path":     params.Path,
-				"changes":  params.Changes,
-				"modified": true,
+				"path":        params.Path,
+				"changes":     params.Changes,
+				"modified":    false,
+				"planned":     true,
+				"write_scope": "pipeline",
+				"next_step":   "prepare_pipeline_write_context",
 			}, nil
 		}).
 		Build()

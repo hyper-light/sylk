@@ -841,20 +841,29 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	}
 
 	// Step 4: Compose system prompt + consultation context
-	systemPrompt := e.config.SystemPrompt
+	contract := shared.BuildTaskExecutionContract(req.PipelineTask)
+	systemPrompt := e.systemPromptForContract(contract)
 	if req.PipelineTask != nil {
 		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, req.PipelineTask)
 	}
+	systemPrompt = shared.AppendTaskExecutionGuidance(systemPrompt, contract, "engineer")
 	if consultContext != "" {
 		systemPrompt += "\n\n---\n\n# Consultation Context\n\n" + consultContext
 	}
 
 	// Step 5: Build LLM request with tools
 	e.prepareSkillsForInput(req.Prompt)
+	surface, err := shared.TaskToolSurface(e.toolRuntime(), contract, "engineer")
+	if err != nil {
+		e.logger.Warn("build task tool surface", "error", err)
+		surface = e.toolRuntime()
+	}
+	ctx = shared.WithTaskExecutionContract(ctx, contract)
+	ctx = shared.WithTaskExecutionState(ctx, shared.NewTaskExecutionState())
 	llmReq := &providers.Request{
 		SystemPrompt: systemPrompt,
 		Messages:     []providers.Message{{Role: providers.RoleUser, Content: req.Prompt}},
-		Tools:        e.buildToolDefinitions(),
+		Tools:        e.buildToolDefinitionsWithSurface(surface),
 		Model:        e.config.EngineerConfig.Model,
 		MaxTokens:    e.config.EngineerConfig.MaxTokens,
 	}
@@ -866,7 +875,7 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	// Step 6: Execute tool loop
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-		return e.executeToolLoop(ctx, llmReq, ledger)
+		return e.executeToolLoopWithSurface(ctx, llmReq, ledger, surface)
 	})
 	if err != nil {
 		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
@@ -894,7 +903,7 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 			providers.Message{Role: providers.RoleUser, Content: e.buildAuditFeedback(verdict)},
 		)
 		result, err = shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-			return e.executeToolLoop(ctx, llmReq, ledger)
+			return e.executeToolLoopWithSurface(ctx, llmReq, ledger, surface)
 		})
 		if err != nil {
 			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
@@ -923,6 +932,16 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 		},
 		Timestamp: time.Now(),
 	}, nil
+}
+
+func (e *Engineer) systemPromptForContract(contract *shared.TaskExecutionContract) string {
+	if contract == nil {
+		return e.config.SystemPrompt
+	}
+	if strings.TrimSpace(e.config.SystemPrompt) == "" || e.config.SystemPrompt == DefaultEngineerSystemPrompt {
+		return EngineerSystemPromptForContract(contract)
+	}
+	return e.config.SystemPrompt
 }
 
 func (e *Engineer) buildAuditFeedback(verdict *AuditVerdict) string {

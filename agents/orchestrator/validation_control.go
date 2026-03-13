@@ -29,6 +29,12 @@ func (o *Orchestrator) handleControlPlaneForward(ctx context.Context, fwd *guide
 	case agentshared.ControlPlaneKindValidationVerdict:
 		result, err := o.handleValidationVerdictForward(ctx, fwd)
 		return result, true, err
+	case agentshared.ControlPlaneKindPlanHandoffStatus:
+		result, err := o.handlePlanHandoffStatusForward(ctx, fwd)
+		return result, true, err
+	case agentshared.ControlPlaneKindPlanHandoffReceiptResync:
+		result, err := o.handlePlanHandoffReceiptResyncForward(ctx, fwd)
+		return result, true, err
 	default:
 		return nil, false, nil
 	}
@@ -366,7 +372,11 @@ func (o *Orchestrator) ensureExecutionHold(payload *agentshared.ValidationVerdic
 }
 
 func (o *Orchestrator) requestArchitectRemediation(ctx context.Context, req *agentshared.RemediationRequest) (*agentshared.RemediationResult, error) {
-	respMsg, err := o.requestRouteSync(ctx, "architect", req, map[string]any{
+	targetAgentID := o.resolveArchitectTargetAgentID(nil, "")
+	if targetAgentID == "" {
+		return nil, fmt.Errorf("no registered architect agent id is available")
+	}
+	respMsg, err := o.requestRouteSync(ctx, targetAgentID, req, map[string]any{
 		"control_plane_kind": agentshared.ControlPlaneKindRemediationRequest,
 		"remediation_case":   req.CaseID,
 		"epoch_id":           req.EpochID,

@@ -79,7 +79,7 @@ func (o *Orchestrator) executeToolLoop(ctx context.Context, req *providers.Reque
 			return "", err
 		}
 
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			return "", fmt.Errorf("orchestrator repeated tool call: %s", sig.Name)
 		}
 

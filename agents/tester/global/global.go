@@ -267,7 +267,7 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return gt.fileAccess }))
 	gt.skills.Register(shared.AnalyzeRiskSkill())
 	gt.skills.Register(shared.PlanTestsSkill())
-	gt.skills.Register(shared.WriteTestSkill())
+	gt.skills.Register(writeTestSkill(gt))
 	gt.skills.Register(shared.RunTestSuiteSkill())
 	gt.skills.Register(shared.DiagnoseFailureSkill(gt.diagEngine))
 	gt.skills.Register(shared.NewTesterReadWorkspaceFileSkill(func() versioning.WorkspaceViewAccess { return gt.workspaceViews }, nil))
@@ -289,8 +289,8 @@ func (gt *GlobalTester) registerCoreSkills() {
 	gt.skills.Register(planIntegrationTestsSkill())
 	gt.skills.Register(planE2ETestsSkill())
 	gt.skills.Register(buildHarnessSkill(gt))
-	gt.skills.Register(writeIntegrationTestSkill())
-	gt.skills.Register(writeE2ETestSkill())
+	gt.skills.Register(writeIntegrationTestSkill(gt))
+	gt.skills.Register(writeE2ETestSkill(gt))
 	gt.skills.Register(reportToOrchestratorSkill(gt))
 	gt.skills.Register(reportToArchitectSkill(gt))
 	gt.skills.Register(escalateFailureSkill(gt))
@@ -455,7 +455,9 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		return nil, fmt.Errorf("global tester: no LLM provider configured — authenticate with OpenAI to enable")
 	}
 
-	systemPrompt := shared.GlobalTesterSystemPrompt()
+	contract := agentshared.BuildGlobalExecutionContract("tester-global", fwd.Intent, fwd.Input)
+	systemPrompt := shared.GlobalTesterSystemPromptForContract(contract)
+	systemPrompt = agentshared.AppendGlobalExecutionGuidance(systemPrompt, contract, "tester-global")
 	gt.prepareSkillsForInput(fwd.Input)
 	tools := gt.buildToolDefinitions()
 

@@ -447,9 +447,14 @@ func (p *anthropicPlanner) requestTextOnce(
 	system string,
 	stage string,
 ) (*streamResult, error) {
-	reqCtx, cancel := p.propagateDeadline(ctx)
-	defer cancel()
-	return p.requestTextStreamingOnce(reqCtx, prompt, maxTokens, system, stage, nil)
+	lease := newPlannerRequestLease(ctx, p, stage)
+	var result *streamResult
+	err := lease.run(p.timeout, false, func(reqCtx context.Context) error {
+		var innerErr error
+		result, innerErr = p.requestTextStreamingOnce(reqCtx, prompt, maxTokens, system, stage, nil)
+		return innerErr
+	})
+	return result, err
 }
 
 // requestTextWithContinuation performs a request with automatic continuation
@@ -461,9 +466,7 @@ func (p *anthropicPlanner) requestTextWithContinuation(
 	system string,
 	stage string,
 ) (string, *providers.Usage, error) {
-	reqCtx, cancel := p.propagateDeadline(ctx)
-	defer cancel()
-	return p.requestTextStreamingWithContinuation(reqCtx, prompt, maxTokens, system, stage, nil)
+	return p.requestTextStreamingWithLease(ctx, prompt, maxTokens, system, stage, nil)
 }
 
 func (p *anthropicPlanner) requestTextStreamingWithMaxTokens(
@@ -474,9 +477,45 @@ func (p *anthropicPlanner) requestTextStreamingWithMaxTokens(
 	stage string,
 	onChunk func(string),
 ) (string, *providers.Usage, error) {
-	reqCtx, cancel := p.propagateDeadline(ctx)
-	defer cancel()
-	return p.requestTextStreamingWithContinuation(reqCtx, prompt, maxTokens, system, stage, onChunk)
+	return p.requestTextStreamingWithLease(ctx, prompt, maxTokens, system, stage, onChunk)
+}
+
+func (p *anthropicPlanner) requestTextStreamingWithLease(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+	onChunk func(string),
+) (string, *providers.Usage, error) {
+	lease := newPlannerRequestLease(ctx, p, stage)
+	initial, err := p.requestTextStreamingOnceWithLease(lease, prompt, maxTokens, system, stage, onChunk)
+	if err != nil {
+		return "", nil, err
+	}
+	if !isTruncatedResult(initial.StopReason) {
+		return initial.Text, initial.Usage, nil
+	}
+	mode := continuationModeFromOnChunk(onChunk)
+	cfg := deriveContinuationConfig(p.contextWindow, maxTokens, defaultCharsPerToken)
+	return p.runContinuationLoop(lease, prompt, initial, cfg, mode, system, stage, onChunk)
+}
+
+func (p *anthropicPlanner) requestTextStreamingOnceWithLease(
+	lease *plannerRequestLease,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+	onChunk func(string),
+) (*streamResult, error) {
+	var result *streamResult
+	err := lease.run(p.timeout, onChunk != nil, func(reqCtx context.Context) error {
+		var innerErr error
+		result, innerErr = p.requestTextStreamingOnce(reqCtx, prompt, maxTokens, system, stage, onChunk)
+		return innerErr
+	})
+	return result, err
 }
 
 func (p *anthropicPlanner) requestTextStreamingOnce(
@@ -705,9 +744,6 @@ func (p *anthropicPlanner) CompleteForToolLoop(
 	stage string,
 	onChunk func(string),
 ) (*providers.Response, error) {
-	reqCtx, cancel := p.propagateDeadline(ctx)
-	defer cancel()
-
 	architectDebugLog().Debug("complete_for_tool_loop: ENTRY",
 		"stage", stage,
 		"max_tokens", req.MaxTokens,
@@ -715,10 +751,16 @@ func (p *anthropicPlanner) CompleteForToolLoop(
 		"tools_count", len(req.Tools),
 		"messages_count", len(req.Messages),
 		"timeout", p.timeout.String(),
-		"ctx_deadline", contextDeadlineString(reqCtx))
+		"ctx_deadline", contextDeadlineString(ctx))
 
+	lease := newPlannerRequestLease(ctx, p, stage)
 	start := time.Now()
-	resp, err := p.streamRequestFull(reqCtx, req, stage, onChunk)
+	var resp *providers.Response
+	err := lease.run(p.timeout, onChunk != nil, func(reqCtx context.Context) error {
+		var innerErr error
+		resp, innerErr = p.streamRequestFull(reqCtx, req, stage, onChunk)
+		return innerErr
+	})
 
 	architectDebugLog().Debug("complete_for_tool_loop: DONE",
 		"stage", stage,
@@ -732,10 +774,32 @@ func (p *anthropicPlanner) CompleteForToolLoop(
 // propagateDeadline uses the stage-level propagator to create a child context
 // whose deadline is min(p.timeout, parent_remaining - cleanupBuffer).
 func (p *anthropicPlanner) propagateDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	return p.propagateDeadlineWithTimeout(ctx, p.timeout)
+}
+
+func (p *anthropicPlanner) propagateDeadlineWithTimeout(
+	ctx context.Context,
+	timeout time.Duration,
+) (context.Context, context.CancelFunc) {
 	if p.stagePropagator != nil {
-		return p.stagePropagator.Propagate(ctx, p.timeout)
+		return p.stagePropagator.Propagate(ctx, timeout)
 	}
-	return context.WithTimeout(ctx, p.timeout)
+	return context.WithTimeout(ctx, timeout)
+}
+
+func (p *anthropicPlanner) logRequestLeaseRefresh(
+	parent context.Context,
+	localTimeout time.Duration,
+	stage string,
+	refreshes int,
+	err error,
+) {
+	p.logger.Info("planner request lease refreshed",
+		"stage", stage,
+		"refresh_count", refreshes,
+		"local_timeout", localTimeout.String(),
+		"parent_deadline", contextDeadlineString(parent),
+		"error", err)
 }
 
 // ConversationSystemPrompt returns the conversation-mode system prompt.
@@ -766,16 +830,7 @@ func (p *anthropicPlanner) requestTextStreamingWithContinuation(
 	stage string,
 	onChunk func(string),
 ) (string, *providers.Usage, error) {
-	sr, err := p.requestTextStreamingOnce(ctx, prompt, maxTokens, system, stage, onChunk)
-	if err != nil {
-		return "", nil, err
-	}
-	if !isTruncatedResult(sr.StopReason) {
-		return sr.Text, sr.Usage, nil
-	}
-	mode := continuationModeFromOnChunk(onChunk)
-	cfg := deriveContinuationConfig(p.contextWindow, maxTokens, defaultCharsPerToken)
-	return p.runContinuationLoop(ctx, prompt, sr, cfg, mode, system, stage, onChunk)
+	return p.requestTextStreamingWithLease(ctx, prompt, maxTokens, system, stage, onChunk)
 }
 
 // mergeUsage sums two Usage values, handling nil inputs.

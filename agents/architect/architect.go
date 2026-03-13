@@ -274,12 +274,20 @@ func (a *Architect) publishActivityWithVisibility(eventType events.EventType, vi
 	a.activityPub.PublishActivity(evt)
 }
 
-// operationTimeout derives the planning operation budget from model parameters.
-// stages * budgetLevels * perRequestTimeout — no magic numbers.
+// operationTimeout derives the planning operation budget from the stricter of
+// two architect-owned bounds:
+//   - the staged JSON-planner budget (analyze/design/generate across budget levels)
+//   - the protocol tool-loop budget (max allowed LLM turns)
+//
+// The protocol path can consume significantly more turns than the legacy
+// staged estimate, so the operation deadline must never undercut the tool-loop
+// allowance or the architect will cancel its own Anthropic stream mid-plan.
 func (a *Architect) operationTimeout() time.Duration {
 	stages := 3 // analyze, design, generate
 	budgetLevels := len(requirementsBudgets(a.config.MaxOutputTokens))
-	return time.Duration(stages*budgetLevels) * a.config.LLMRequestTimeout
+	stagedBudget := time.Duration(stages*budgetLevels) * a.config.LLMRequestTimeout
+	protocolBudget := time.Duration(protocolMaxToolRuns) * a.config.LLMRequestTimeout
+	return max(stagedBudget, protocolBudget)
 }
 
 // resetPlannerOperationState resets per-operation state on the planner:
@@ -372,7 +380,7 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 			}
 		}
 	}
-	architect.reconcilePendingContinuations()
+	architect.reconcilePendingContinuations(nil)
 
 	guide.DebugFileLog().Info("DEBUG: architect_new_init_cross_domain")
 	architect.initCrossDomain(cfg)
@@ -622,6 +630,7 @@ func (a *Architect) Start(bus guide.EventBus) error {
 
 	// Subscribe to heartbeat topic for executing plan lease renewal.
 	a.heartbeatSub, _ = bus.SubscribeAsync("plan.heartbeat", a.handlePlanHeartbeat)
+	go a.requestOpenPlanHandoffReceiptResyncs("architect startup")
 
 	a.logger.Info("architect started", "channels", a.channels)
 	return nil
@@ -1193,12 +1202,18 @@ func (a *Architect) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 
 // handleConversation processes conversational requests from the event bus.
 // Both IntentPlan and IntentDesign route here so the architect converses
-// naturally before formalizing a plan.
+// naturally before formalizing a plan. Only explicit phase-gate continuations
+// auto-enter plan acceptance; loosely recovered ready plans stay in
+// conversation mode so the architect can suggest resuming them instead of
+// silently resurrecting them.
 func (a *Architect) handleConversation(ctx context.Context, fwd *guide.ForwardedRequest) (any, error) {
+	now := time.Now().UTC()
+	sessionID := sessionIDFromForwarded(fwd)
+	a.recoverSessionPendingWork(ctx, sessionID, now)
 	a.logInfo("handleConversation: entry",
 		"input", truncateString(fwd.Input, 120),
 		"intent", string(fwd.Intent),
-		"session_id", sessionIDFromForwarded(fwd),
+		"session_id", sessionID,
 		"history_len", len(fwd.ConversationHistory),
 		"ctx_deadline", contextDeadlineString(ctx),
 		"active_plans_count", a.activePlanCount())
@@ -1207,7 +1222,7 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 	// route their response back into the protocol — never to handleExecute
 	// or handlePlanFeedback. This prevents the bug where an affirmative
 	// clarification answer dispatches a stale Ready plan.
-	if plan := a.latestClarifyingPlan(sessionIDFromForwarded(fwd)); plan != nil {
+	if plan := a.latestClarifyingPlan(sessionID); plan != nil {
 		a.logInfo("handleConversation: ROUTE=clarification_response",
 			"plan_id", plan.ID,
 			"plan_query", truncateString(plan.Query, 80),
@@ -1215,11 +1230,12 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		return a.handleClarificationResponse(ctx, fwd, plan)
 	}
 
-	// When a ready plan exists, evaluate the user's response using the
-	// same Guardian-gated acceptance flow the tool loop uses. This keeps
-	// deterministic routing and LLM-driven routing on the same continuation
-	// path instead of maintaining separate sync-only logic.
-	if plan := a.latestReadyPlan(sessionIDFromForwarded(fwd)); plan != nil {
+	// Only explicit plan-approval phase metadata should auto-enter the
+	// acceptance loop. Ready plans recovered implicitly (same session or a
+	// unique recent restored plan) should remain conversational so the user can
+	// choose whether to resume, revise, or start fresh.
+	if plan := a.resolveReadyPlanFromMetadata(fwd.Metadata, now); hasPlanContinuationMetadata(fwd.Metadata) && plan != nil {
+		a.recoverStalePendingWork(ctx, plan, now)
 		architectDebugLog().Info("handoff: READY_PLAN_FOUND",
 			"plan_id", plan.ID,
 			"plan_state", plan.SM().State().String(),
@@ -1228,7 +1244,7 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 			"user_input", fwd.Input,
 			"is_approval_signal", isApprovalSignal(fwd.Input),
 			"current_model", a.config.Model)
-		if plan.PendingWork != nil {
+		if planHasActivePendingWork(plan, now) {
 			message := strings.TrimSpace(plan.PendingWork.Message)
 			if message == "" {
 				message = "I already have a pending operation on this plan and will update you shortly."
@@ -1253,12 +1269,39 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		}
 		return result, nil
 	}
+	if pending := a.resolveActivePendingPlanForExecute(sessionID, fwd.Metadata, now); pending != nil {
+		return &ConversationResult{
+			Response: pendingPlanUserMessage(pending),
+			Intent:   IntentConverse,
+		}, nil
+	}
+	if plan := a.resolveRecoverableReadyPlanForConversation(sessionID, now); plan != nil {
+		a.recoverStalePendingWork(ctx, plan, now)
+		if planHasActivePendingWork(plan, now) {
+			return &ConversationResult{
+				Response: pendingPlanUserMessage(plan),
+				Intent:   IntentConverse,
+			}, nil
+		}
+		if isExplicitResumeReadyPlanSignal(fwd.Input) {
+			a.logInfo("handleConversation: explicit resume signal for recovered ready plan",
+				"plan_id", plan.ID,
+				"input", truncateString(fwd.Input, 120))
+			return a.handleExecute(ctx, fwd)
+		}
+		if shouldOfferReadyPlanResumeSuggestion(fwd.Input) {
+			return &ConversationResult{
+				Response: readyPlanResumeSuggestion(plan),
+				Intent:   IntentConverse,
+			}, nil
+		}
+	}
 
 	req := &ArchitectRequest{
 		ID:                  uuid.New().String(),
 		Intent:              mapGuideIntentToArchitect(fwd.Intent),
 		Query:               fwd.Input,
-		SessionID:           sessionIDFromForwarded(fwd),
+		SessionID:           sessionID,
 		Timestamp:           time.Now(),
 		Params:              forwardedRequestParams(fwd),
 		ConversationHistory: fwd.ConversationHistory,
@@ -1267,6 +1310,130 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 	a.logInfo("handleConversation: ROUTE=conversation (no plan triggers matched)",
 		"mapped_intent", string(req.Intent))
 	return a.Handle(ctx, req)
+}
+
+var explicitResumeReadyPlanPhrases = []string{
+	"resume that plan",
+	"resume the plan",
+	"resume this plan",
+	"resume it",
+	"continue with that plan",
+	"continue with the plan",
+	"continue that plan",
+	"continue the plan",
+	"continue where we left off",
+	"pick up where we left off",
+	"execute that plan",
+	"execute the plan",
+	"run that plan",
+	"run the plan",
+	"use that plan",
+	"use the previous plan",
+	"use the old plan",
+	"go ahead with that plan",
+	"go ahead with the plan",
+	"proceed with that plan",
+	"proceed with the plan",
+}
+
+var readyPlanResumeSuggestionPhrases = []string{
+	"go ahead",
+	"proceed",
+	"run it",
+	"execute it",
+	"do it",
+	"ship it",
+	"looks good",
+	"lgtm",
+	"approved",
+	"what's next",
+	"what next",
+	"any updates",
+	"status",
+	"resume",
+	"continue",
+	"that plan",
+	"this plan",
+	"old plan",
+	"previous plan",
+}
+
+var readyPlanFreshStartPhrases = []string{
+	"start fresh",
+	"start over",
+	"new plan",
+	"different plan",
+	"forget that plan",
+	"ignore that plan",
+	"revise it",
+	"revise the plan",
+	"change the plan",
+	"modify the plan",
+	"update the plan",
+}
+
+func isExplicitResumeReadyPlanSignal(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	for _, phrase := range explicitResumeReadyPlanPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldOfferReadyPlanResumeSuggestion(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" || isExplicitResumeReadyPlanSignal(lower) {
+		return false
+	}
+	for _, phrase := range readyPlanFreshStartPhrases {
+		if strings.Contains(lower, phrase) {
+			return false
+		}
+	}
+	for _, phrase := range readyPlanResumeSuggestionPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	words := strings.Fields(lower)
+	if len(words) > 4 {
+		return false
+	}
+	for _, word := range words {
+		switch word {
+		case "it", "that", "this", "plan", "okay", "ok", "sure":
+			return true
+		}
+	}
+	return false
+}
+
+func readyPlanResumeSuggestion(plan *DesignPlan) string {
+	if plan == nil {
+		return "I still have a previous plan ready. If you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead."
+	}
+	subject := strings.TrimSpace(plan.Query)
+	if subject == "" {
+		return "I still have a previous plan ready. If you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead."
+	}
+	subject = normalizeReadyPlanSubject(subject)
+	if strings.Contains(subject, "\n") {
+		return fmt.Sprintf("I still have a previous plan ready for:\n\n%s\n\nIf you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead.", subject)
+	}
+	return fmt.Sprintf("I still have a previous plan ready for %q. If you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead.", subject)
+}
+
+func normalizeReadyPlanSubject(subject string) string {
+	trimmed := strings.TrimSpace(subject)
+	if trimmed == "" {
+		return ""
+	}
+	return strings.ReplaceAll(trimmed, "\r\n", "\n")
 }
 
 // latestClarifyingPlan returns the most recently updated plan in Clarifying
@@ -1489,15 +1656,15 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 		"has_metadata", fwd.Metadata != nil)
 
 	now := time.Now().UTC()
-	a.recoverSessionPendingWork(sessionID, now)
-	plan := a.latestReadyPlan(sessionID)
+	a.recoverSessionPendingWork(ctx, sessionID, now)
+	plan := a.resolveReadyPlanForContinuation(sessionID, fwd.Metadata, now)
 	if plan != nil && planHasActivePendingWork(plan, now) {
 		return &ConversationResult{
 			Response: pendingPlanUserMessage(plan),
 			Intent:   IntentExecute,
 		}, nil
 	}
-	if pending := a.latestActivePendingPlan(sessionID); pending != nil {
+	if pending := a.resolveActivePendingPlanForExecute(sessionID, fwd.Metadata, now); pending != nil {
 		if plan == nil || pending.ID == plan.ID || !plan.UpdatedAt.After(pending.UpdatedAt) {
 			return &ConversationResult{
 				Response: pendingPlanUserMessage(pending),
@@ -1506,7 +1673,13 @@ func (a *Architect) handleExecute(ctx context.Context, fwd *guide.ForwardedReque
 		}
 	}
 	if plan == nil {
-		if pending := a.planStore.LatestByStatus(sessionID, PlanStatusOrchestrating, ReadyPlanMaxAge); pending != nil {
+		if executing := a.resolvePlanByStatusForExecute(sessionID, fwd.Metadata, PlanStatusExecuting, now); executing != nil {
+			return &ConversationResult{
+				Response: "That plan is already executing in the orchestrator.",
+				Intent:   IntentExecute,
+			}, nil
+		}
+		if pending := a.resolvePlanByStatusForExecute(sessionID, fwd.Metadata, PlanStatusOrchestrating, now); pending != nil {
 			return &ConversationResult{
 				Response: "That plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
 				Intent:   IntentExecute,

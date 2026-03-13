@@ -121,6 +121,29 @@ func TestRequestView_TransientActivationDoesNotMutateSharedActiveSet(t *testing.
 	}
 }
 
+func TestScopedView_RestrictsToRequestedTools(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("visible_tool", "Visible tool"))
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("scoped_tool", "Scoped tool"))
+
+	rt := mustNewRuntime(t, registry, manifestWithSearch("tester", "tester.pipeline",
+		NewToolPolicy("visible_tool", EffectReadOnly, DomainFilesystem, ExecutionModeLocal, WithVisibleByDefault()),
+		NewToolPolicy("scoped_tool", EffectReadOnly, DomainFilesystem, ExecutionModeLocal),
+	))
+
+	view, err := rt.ScopedView("scoped_tool")
+	if err != nil {
+		t.Fatalf("scoped view: %v", err)
+	}
+	tools := view.BuildToolDefinitions()
+	if containsTool(tools, "visible_tool") {
+		t.Fatal("scoped view should not inherit shared default-visible tools")
+	}
+	if !containsTool(tools, "scoped_tool") {
+		t.Fatal("scoped view should include the requested scoped tool")
+	}
+}
+
 func TestRequestView_SyncActiveFromLoadedDoesNotMutateSharedActiveSet(t *testing.T) {
 	registry := skills.NewRegistry()
 	mustRegisterSkill(t, registry, newRuntimeTestSkill("loaded_tool", "Loaded tool"))

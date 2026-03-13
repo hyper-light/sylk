@@ -196,7 +196,7 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 	}
 
 	return skills.NewSkill("write_test").
-		Description("Write or append concrete executable test code into the task-local VFS. Requires a fresh pipeline write basis for the target output file.").
+		Description("Write or append concrete executable test code into the task-local VFS. Requires a fresh or still-leased pipeline write basis for the target output file, auto-renews on lease expiry, and returns a refreshed next_basis.").
 		Domain("testing").
 		Keywords("write", "test", "file", "append", "concrete").
 		Priority(94).
@@ -222,6 +222,9 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 			if strings.TrimSpace(p.Content) == "" {
 				return nil, fmt.Errorf("content is required and must contain executable test code")
 			}
+			if p.Basis.Scope == "" || strings.TrimSpace(p.Basis.Path) == "" {
+				return nil, fmt.Errorf("basis is required")
+			}
 			harness := pt.currentHarnessState()
 			if harness == nil {
 				var err error
@@ -239,6 +242,7 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 				"output_file": writtenPath,
 				"framework":   harness.FrameworkID,
 				"test_name":   p.TestCase.Name,
+				"next_basis":  p.Basis,
 			}, nil
 		}).
 		Build()
@@ -299,10 +303,12 @@ func pipelineWriteContextProperties() map[string]*skills.Property {
 
 func pipelineWriteBasisProperties() map[string]*skills.Property {
 	return map[string]*skills.Property{
-		"scope":       {Type: "string", Description: "Must be pipeline."},
-		"path":        {Type: "string", Description: "Path prepared for mutation."},
-		"pipeline_id": {Type: "string", Description: "Active task pipeline ID."},
-		"target_view": {Type: "string", Description: "Must be pipeline."},
+		"scope":            {Type: "string", Description: "Must be pipeline."},
+		"path":             {Type: "string", Description: "Path prepared for mutation."},
+		"pipeline_id":      {Type: "string", Description: "Active task pipeline ID."},
+		"target_view":      {Type: "string", Description: "Must be pipeline."},
+		"prepared_at":      {Type: "string", Description: "When the write basis snapshot was prepared."},
+		"lease_expires_at": {Type: "string", Description: "When the write lease expires unless renewed by the next write."},
 	}
 }
 

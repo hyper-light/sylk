@@ -157,23 +157,27 @@ func TestGradeTaskQualitySkill_AutoValidatesResolvedCurrentTask(t *testing.T) {
 	}
 }
 
-func TestStageInstructions_InspectIncludesValidateCriteriaBeforeGrade(t *testing.T) {
-	instructions := stageInstructions("inspect")
-	validateIdx := strings.Index(instructions, "validate_criteria")
-	gradeIdx := strings.Index(instructions, "grade_task_quality")
+func TestStageInstructions_InspectAvoidsValidationAndGradingTools(t *testing.T) {
+	instructions := stageInstructions(&agentShared.TaskExecutionContract{
+		Stage:             "inspect",
+		PreImplementation: true,
+		Deliverables: []agentShared.TaskExecutionDeliverable{
+			agentShared.TaskDeliverableCriteriaContract,
+		},
+	}, "inspect")
 
-	if validateIdx < 0 {
-		t.Fatal("expected inspect stage instructions to mention validate_criteria")
+	if strings.Contains(instructions, "validate_criteria") {
+		t.Fatalf("did not expect inspect stage instructions to mention validate_criteria: %q", instructions)
 	}
-	if gradeIdx < 0 {
-		t.Fatal("expected inspect stage instructions to mention grade_task_quality")
+	if strings.Contains(instructions, "grade_task_quality") {
+		t.Fatalf("did not expect inspect stage instructions to mention grade_task_quality: %q", instructions)
 	}
-	if validateIdx > gradeIdx {
-		t.Fatalf("expected validate_criteria to appear before grade_task_quality, got %q", instructions)
+	if !strings.Contains(instructions, "get_validation_status") {
+		t.Fatalf("expected inspect stage instructions to mention get_validation_status: %q", instructions)
 	}
 }
 
-func TestPipelineInspectorToolDefinitionsIncludeGradeAndStatus(t *testing.T) {
+func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t *testing.T) {
 	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -185,9 +189,92 @@ func TestPipelineInspectorToolDefinitionsIncludeGradeAndStatus(t *testing.T) {
 	})
 
 	names := toolDefinitionNames(pi.buildToolDefinitions())
-	for _, want := range []string{"search_skills", "validate_criteria", "grade_task_quality", "get_validation_status"} {
+	for _, want := range []string{"search_skills", "define_criteria", "get_validation_status"} {
 		if !containsName(names, want) {
 			t.Fatalf("tool definitions missing %q: %v", want, names)
+		}
+	}
+	for _, blocked := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan", "prepare_pipeline_write_context", "write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory"} {
+		if containsName(names, blocked) {
+			t.Fatalf("default tool definitions unexpectedly exposed %q: %v", blocked, names)
+		}
+	}
+}
+
+func TestPipelineInspectorPreImplementationSurfaceExcludesValidationAndGradeTools(t *testing.T) {
+	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if pi.tools != nil {
+			pi.tools.Close()
+		}
+	})
+
+	task := &agentShared.PipelineTaskInput{
+		AgentType: "inspector-pipeline",
+		Context: map[string]any{
+			"pipeline_stage": "inspect",
+		},
+	}
+	contract := agentShared.BuildTaskExecutionContract(task)
+	surface, err := agentShared.TaskToolSurface(pi.toolRuntime(), contract, "inspector-pipeline")
+	if err != nil {
+		t.Fatalf("TaskToolSurface() error = %v", err)
+	}
+
+	names := toolDefinitionNames(pi.buildToolDefinitionsWithSurface(surface))
+	for _, blocked := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan"} {
+		if containsName(names, blocked) {
+			t.Fatalf("pre-implementation surface unexpectedly exposed %q: %v", blocked, names)
+		}
+	}
+	for _, want := range []string{"define_criteria", "get_validation_status", "read_workspace_file", "inspect_workspace_state"} {
+		if !containsName(names, want) {
+			t.Fatalf("pre-implementation surface missing %q: %v", want, names)
+		}
+	}
+	for _, blocked := range []string{"prepare_pipeline_write_context", "write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory"} {
+		if containsName(names, blocked) {
+			t.Fatalf("pre-implementation surface unexpectedly exposed workspace mutation tool %q: %v", blocked, names)
+		}
+	}
+}
+
+func TestPipelineInspectorImplementationValidationSurfaceIncludesValidationTools(t *testing.T) {
+	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if pi.tools != nil {
+			pi.tools.Close()
+		}
+	})
+
+	task := &agentShared.PipelineTaskInput{
+		AgentType: "inspector-pipeline",
+		Context: map[string]any{
+			"pipeline_stage": "inspect",
+		},
+		ParentResults: map[string]any{
+			"engineer": map[string]any{
+				"state":  "succeeded",
+				"output": map[string]any{"summary": "implemented CLI entrypoint"},
+			},
+		},
+	}
+	contract := agentShared.BuildTaskExecutionContract(task)
+	surface, err := agentShared.TaskToolSurface(pi.toolRuntime(), contract, "inspector-pipeline")
+	if err != nil {
+		t.Fatalf("TaskToolSurface() error = %v", err)
+	}
+
+	names := toolDefinitionNames(pi.buildToolDefinitionsWithSurface(surface))
+	for _, want := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan"} {
+		if !containsName(names, want) {
+			t.Fatalf("implementation-validation surface missing %q: %v", want, names)
 		}
 	}
 }
@@ -264,6 +351,31 @@ func TestPipelineInspectorSafetyHookAllowsCoordinationTools(t *testing.T) {
 	}
 }
 
+func TestPipelineInspectorSafetyHookBlocksPreparePipelineWriteContext(t *testing.T) {
+	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if pi.tools != nil {
+			pi.tools.Close()
+		}
+	})
+
+	_, err = pi.executeToolCall(context.Background(), providers.ToolCall{
+		ID:        "tool_prepare_1",
+		Name:      "prepare_pipeline_write_context",
+		Arguments: `{"path":"audit/findings.md"}`,
+	})
+	if err == nil {
+		t.Fatal("expected prepare_pipeline_write_context to be blocked for pipeline inspector")
+	}
+	if !strings.Contains(err.Error(), "not permitted for pipeline inspector") &&
+		!strings.Contains(err.Error(), "outside the active tool set") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func newStubValidationPipelineInspector(t *testing.T, currentTaskID string) *PipelineInspector {
 	t.Helper()
 
@@ -286,14 +398,13 @@ func newStubValidationPipelineInspector(t *testing.T, currentTaskID string) *Pip
 		"run_security_scan",
 		"analyze_complexity",
 	} {
-		toolName := name
-		pi.skills.Register(coreskills.NewSkill(toolName).
-			Description("stub validation tool").
-			Domain("validation").
-			Handler(func(context.Context, json.RawMessage) (any, error) {
-				return map[string]any{"issues": []shared.ValidationIssue{}}, nil
-			}).
-			Build())
+		registerStubPipelineInspectorSkill(t, pi.skills, name, "validation")
+	}
+	for _, name := range pipelineInspectorVisibleSkillNames() {
+		registerStubPipelineInspectorSkill(t, pi.skills, name, "system")
+	}
+	for _, name := range pipelineInspectorMutatingSkillNames() {
+		registerStubPipelineInspectorSkill(t, pi.skills, name, "system")
 	}
 
 	runtime, err := toolruntime.New(toolruntime.Config{
@@ -315,6 +426,27 @@ func newStubValidationPipelineInspector(t *testing.T, currentTaskID string) *Pip
 	})
 
 	return pi
+}
+
+func registerStubPipelineInspectorSkill(
+	t *testing.T,
+	registry *coreskills.Registry,
+	name string,
+	domain string,
+) {
+	t.Helper()
+	if registry == nil || name == "" || registry.Get(name) != nil {
+		return
+	}
+	if err := registry.Register(coreskills.NewSkill(name).
+		Description("stub tool").
+		Domain(domain).
+		Handler(func(context.Context, json.RawMessage) (any, error) {
+			return map[string]any{"issues": []shared.ValidationIssue{}}, nil
+		}).
+		Build()); err != nil {
+		t.Fatalf("Register(%q) error = %v", name, err)
+	}
 }
 
 func toolDefinitionNames(tools []providers.Tool) []string {

@@ -171,6 +171,32 @@ func TestSessionWorkspaceViews_InspectPathReportsUnavailableGlobalLayer(t *testi
 	}
 }
 
+func TestSessionWorkspaceViews_InspectPathTreatsDirectoryAsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := NewDiskFileAccess(dir, false).MkdirAll(context.Background(), "src/hello_world"); err != nil {
+		t.Fatalf("seed directory: %v", err)
+	}
+	views := NewSessionWorkspaceViews(SessionWorkspaceViewsConfig{
+		DefaultView:  WorkspaceViewDisk,
+		WorkingDir:   dir,
+		DiskFallback: NewDiskFileAccess(dir, true),
+	})
+
+	state, err := views.InspectPath(context.Background(), "src/hello_world", "")
+	if err != nil {
+		t.Fatalf("inspect path: %v", err)
+	}
+	if !state.Disk.Exists {
+		t.Fatal("expected directory to exist on disk")
+	}
+	if !state.Disk.IsDir {
+		t.Fatal("expected inspect path to mark directory state")
+	}
+	if state.Disk.Error != "" {
+		t.Fatalf("unexpected directory inspect error: %v", state.Disk.Error)
+	}
+}
+
 func TestSessionWorkspaceViews_SummarizePathsCapturesChangedAndUnavailableViews(t *testing.T) {
 	dir := t.TempDir()
 	if err := NewDiskFileAccess(dir, false).WriteFile(context.Background(), "hello.txt", []byte("disk")); err != nil {

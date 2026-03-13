@@ -3,14 +3,14 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/google/uuid"
 )
 
 // routeSyncTimeout is the maximum wait time for a synchronous bus RPC.
-const routeSyncTimeout = 60 * time.Second
+const routeSyncTimeout = shared.DefaultConsultationTimeout
 
 // registerPendingWait creates a buffered channel for a correlation ID.
 func (pi *PipelineInspector) registerPendingWait(correlationID string) <-chan *guide.Message {
@@ -73,13 +73,30 @@ func (pi *PipelineInspector) requestRouteSync(ctx context.Context, target, paylo
 		return nil, fmt.Errorf("publish correction request: %w", err)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, routeSyncTimeout)
-	defer cancel()
-
-	select {
-	case resp := <-waitCh:
-		return resp, nil
-	case <-timeoutCtx.Done():
-		return nil, fmt.Errorf("correction request timed out after %v", routeSyncTimeout)
+	var response *guide.Message
+	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+		AttemptTimeout: routeSyncTimeout,
+		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
+		OnRefresh: func(info shared.ContextLeaseRefresh) {
+			if pi.logger != nil {
+				pi.logger.Info("correction wait lease refreshed",
+					"target", target,
+					"correlation_id", correlationID,
+					"refresh_count", info.RefreshCount,
+					"attempt_timeout", info.AttemptTimeout.String(),
+					"error", info.Error)
+			}
+		},
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case response = <-waitCh:
+			return nil
+		}
+	})
+	if err != nil {
+		return nil, shared.WrapLeaseTimeoutError("correction request", routeSyncTimeout, err)
 	}
+	return response, nil
 }

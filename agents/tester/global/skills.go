@@ -41,8 +41,8 @@ func analyzeBatchSkill(gt *GlobalTester) *skills.Skill {
 
 			return map[string]any{
 				"pipelines_analyzed": len(p.PipelineIDs),
-				"changed_files":     len(p.ChangedFiles),
-				"task_specs":        len(p.TaskSpecs),
+				"changed_files":      len(p.ChangedFiles),
+				"task_specs":         len(p.TaskSpecs),
 			}, nil
 		}).
 		Build()
@@ -71,7 +71,7 @@ func analyzeIntegrationRisksSkill() *skills.Skill {
 			}
 			return map[string]any{
 				"files_analyzed": len(p.ChangedFiles),
-				"risk_areas":    []shared.RiskArea{},
+				"risk_areas":     []shared.RiskArea{},
 			}, nil
 		}).
 		Build()
@@ -105,7 +105,7 @@ func planIntegrationTestsSkill() *skills.Skill {
 // planE2ETestsSkill creates a skill for planning end-to-end tests.
 func planE2ETestsSkill() *skills.Skill {
 	type params struct {
-		RiskAreas    []shared.RiskArea `json:"risk_areas"`
+		RiskAreas    []shared.RiskArea    `json:"risk_areas"`
 		HarnessNeeds []shared.HarnessNeed `json:"harness_needs,omitempty"`
 	}
 
@@ -137,7 +137,7 @@ func buildHarnessSkill(gt *GlobalTester) *skills.Skill {
 	}
 
 	return skills.NewSkill("build_harness").
-		Description("Build or adapt test fixtures, mock servers, and test databases for integration/e2e testing.").
+		Description("Plan or register test fixtures, mock servers, and test databases for integration/e2e testing. If harness files must be created, materialize them separately with prepare_global_write_context and the global test write skills.").
 		Domain("testing").
 		Keywords("harness", "fixture", "mock", "infrastructure", "setup").
 		Priority(88).
@@ -164,66 +164,10 @@ func buildHarnessSkill(gt *GlobalTester) *skills.Skill {
 			gt.mu.Unlock()
 
 			return map[string]any{
-				"built":   true,
-				"summary": summary,
-			}, nil
-		}).
-		Build()
-}
-
-// writeIntegrationTestSkill creates a skill for writing integration tests.
-func writeIntegrationTestSkill() *skills.Skill {
-	type params struct {
-		TestCase   shared.PlannedTestCase `json:"test_case"`
-		TargetFile string                 `json:"target_file"`
-		OutputFile string                 `json:"output_file"`
-	}
-
-	return skills.NewSkill("write_integration_test").
-		Description("Write an integration test file targeting cross-component interactions.").
-		Domain("testing").
-		Keywords("write", "integration", "test", "cross-component").
-		Priority(88).
-		StringParam("target_file", "Source file(s) under test", true).
-		StringParam("output_file", "Path for the generated test file", true).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			return map[string]any{
-				"output_file": p.OutputFile,
-				"written":     true,
-				"type":        "integration",
-			}, nil
-		}).
-		Build()
-}
-
-// writeE2ETestSkill creates a skill for writing end-to-end tests.
-func writeE2ETestSkill() *skills.Skill {
-	type params struct {
-		TestCase   shared.PlannedTestCase `json:"test_case"`
-		TargetFile string                 `json:"target_file"`
-		OutputFile string                 `json:"output_file"`
-	}
-
-	return skills.NewSkill("write_e2e_test").
-		Description("Write an end-to-end test file covering full system flows.").
-		Domain("testing").
-		Keywords("write", "e2e", "end-to-end", "test", "system flow").
-		Priority(88).
-		StringParam("target_file", "Source file(s) under test", true).
-		StringParam("output_file", "Path for the generated test file", true).
-		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			return map[string]any{
-				"output_file": p.OutputFile,
-				"written":     true,
-				"type":        "e2e",
+				"built":                  true,
+				"summary":                summary,
+				"requires_write_context": true,
+				"write_scope":            "global",
 			}, nil
 		}).
 		Build()
@@ -378,10 +322,10 @@ func escalateFailureSkill(gt *GlobalTester) *skills.Skill {
 			}
 
 			return map[string]any{
-				"escalated":       true,
-				"targets":         []string{"orchestrator", "architect"},
-				"test_name":       p.TestName,
-				"affected_tasks":  p.AffectedTasks,
+				"escalated":      true,
+				"targets":        []string{"orchestrator", "architect"},
+				"test_name":      p.TestName,
+				"affected_tasks": p.AffectedTasks,
 			}, nil
 		}).
 		Build()

@@ -69,7 +69,7 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 	responseTopic := guide.TopicResponses(sourceAgentType, sourceAgentID)
 	waitCh := make(chan *guide.Message, 1)
 	sub, err := bus.SubscribeAsync(responseTopic, func(msg *guide.Message) error {
-		if msg == nil || strings.TrimSpace(msg.CorrelationID) != correlationID {
+		if !isCommandApprovalTerminalMessage(msg, correlationID) {
 			return nil
 		}
 		select {
@@ -116,17 +116,33 @@ func (g *GuardianCommandGate) Authorize(ctx context.Context, req commandapproval
 	if timeout <= 0 {
 		timeout = defaultCommandApprovalTimeout
 	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	select {
-	case msg := <-waitCh:
-		return decodeCommandApprovalMessage(msg)
-	case <-timer.C:
-		return commandapproval.Evaluation{}, fmt.Errorf("command approval timed out after %v", timeout)
-	case <-ctx.Done():
-		return commandapproval.Evaluation{}, ctx.Err()
+	var msg *guide.Message
+	err = RunWithContextLease(ctx, ContextLeaseConfig{
+		AttemptTimeout: timeout,
+		MaxRefreshes:   DefaultConsultationLeaseRefreshes,
+	}, func(waitCtx context.Context) error {
+		select {
+		case msg = <-waitCh:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	})
+	if err != nil {
+		return commandapproval.Evaluation{}, WrapLeaseTimeoutError("command approval", timeout, err)
 	}
+	return decodeCommandApprovalMessage(msg)
+}
+
+func isCommandApprovalTerminalMessage(msg *guide.Message, correlationID string) bool {
+	if msg == nil || strings.TrimSpace(msg.CorrelationID) != correlationID {
+		return false
+	}
+	if _, ok := msg.GetRouteResponse(); ok {
+		return true
+	}
+	_, ok := msg.GetError()
+	return ok
 }
 
 func decodeCommandApprovalMessage(msg *guide.Message) (commandapproval.Evaluation, error) {

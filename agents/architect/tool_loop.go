@@ -251,7 +251,7 @@ func (a *Architect) executeToolLoop(
 			return "", err
 		}
 
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			a.logWarn("executeToolLoop: duplicate tool call detected",
 				"stage", stage, "tool", sig.Name)
 			a.logDebug("tool_loop: DUPLICATE_TOOL_CALL",

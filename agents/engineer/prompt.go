@@ -3,6 +3,7 @@ package engineer
 import (
 	"strings"
 
+	shared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/prompts"
 )
 
@@ -30,6 +31,24 @@ var (
 	// DefaultSystemPrompt is the composed system prompt (alias for backward compat).
 	DefaultSystemPrompt = DefaultEngineerSystemPrompt
 )
+
+// EngineerSystemPromptForContract composes the stock engineer prompt for
+// task-scoped execution. When a structured task contract is present, the
+// runtime-supplied contract guidance replaces the static implementation
+// protocol section so there is a single source of task workflow truth.
+func EngineerSystemPromptForContract(contract *shared.TaskExecutionContract) string {
+	if contract == nil {
+		return DefaultEngineerSystemPrompt
+	}
+	return strings.Join([]string{
+		EngineerSystemCorePrompt,
+		EngineerSystemConsultPrompt,
+		EngineerSystemSkillsPrompt,
+		EngineerSystemGuardrailsPrompt,
+		EngineerSystemAuditPrompt,
+		EngineerSystemCollabPrompt,
+	}, "\n\n---\n\n")
+}
 
 // Task-specific prompt templates (unchanged).
 var (

@@ -53,7 +53,11 @@ func (o *Orchestrator) handleCoordinationAction(ctx context.Context, req *guide.
 		var input coordination.RequestReviewInput
 		err = decodeCoordinationData(req.Data, &input)
 		if err == nil {
-			result, err = o.coordination.RequestReview(ctx, actor, input)
+			review, reviewErr := o.coordination.RequestReview(ctx, actor, input)
+			if reviewErr == nil {
+				o.publishReviewWakeBestEffort(ctx, review)
+			}
+			result, err = review, reviewErr
 		}
 	case coordination.ActionResolveArtifact:
 		var input coordination.ResolveArtifactInput

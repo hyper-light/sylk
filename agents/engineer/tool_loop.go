@@ -22,9 +22,21 @@ import (
 // execute → append results → repeat, bounded by config.EngineerConfig.MaxToolRuns.
 // Follows the pipeline tester tool loop pattern exactly.
 func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
+	return e.executeToolLoopWithSurface(ctx, req, ledger, e.toolRuntime())
+}
+
+func (e *Engineer) executeToolLoopWithSurface(
+	ctx context.Context,
+	req *providers.Request,
+	ledger *steering.SteeringLedger,
+	surface toolruntime.Surface,
+) (string, error) {
 	maxRuns := e.config.EngineerConfig.MaxToolRuns
 	seen := make(map[shared.ToolCallSignature]int, maxRuns)
 	consecutiveErrors := 0
+	if surface == nil {
+		surface = e.toolRuntime()
+	}
 
 	p := e.getProvider()
 	if p == nil {
@@ -44,7 +56,7 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 
 	for turn := 0; turn <= maxRuns; turn++ {
 		if e.toolDefsDirty {
-			req.Tools = e.buildToolDefinitions()
+			req.Tools = e.buildToolDefinitionsWithSurface(surface)
 			e.toolDefsDirty = false
 		}
 
@@ -104,6 +116,25 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 		shared.PublishIntermediateToolTurn(e.bus, e.channels, ctx, e.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if err := shared.ValidateTaskExecutionCompletion(ctx, "engineer"); err != nil {
+				e.recordTurn(req, resp, turn, 0, 1, turnStart)
+				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ErrorPayload{Error: err.Error()})
+				}
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nDo not conclude or release the scope yet. Continue the required task-scoped review or implementation work now.",
+				})
+				continue
+			}
 			e.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
@@ -113,11 +144,11 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if err := e.tools.ValidateBatch(e.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+		if err := surface.ValidateBatch(e.toolInvocationsWithSurface(ctx, resp.ToolCalls, surface)); err != nil {
 			return "", err
 		}
 
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -126,7 +157,7 @@ func (e *Engineer) executeToolLoop(ctx context.Context, req *providers.Request, 
 			return "", fmt.Errorf("engineer repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := e.applyToolCalls(ctx, req, resp)
+		errCount, rerouted := e.applyToolCalls(ctx, req, resp, surface)
 		e.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
@@ -155,6 +186,7 @@ func (e *Engineer) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
+	surface toolruntime.Surface,
 ) (int, bool) {
 	req.Messages = append(req.Messages, providers.Message{
 		Role:      providers.RoleAssistant,
@@ -172,7 +204,7 @@ func (e *Engineer) applyToolCalls(
 		var execResult toolruntime.ExecutionResult
 		var execErr error
 		result, err := shared.TimedToolCall(ctx, "engineer", call, func() (string, error) {
-			execResult, execErr = e.executeToolCall(ctx, call)
+			execResult, execErr = e.executeToolCallWithSurface(ctx, call, surface)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
@@ -219,9 +251,20 @@ func (e *Engineer) applyToolCalls(
 
 // executeToolCall invokes a skill by name with JSON arguments.
 func (e *Engineer) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	return e.executeToolCallWithSurface(ctx, call, e.toolRuntime())
+}
+
+func (e *Engineer) executeToolCallWithSurface(
+	ctx context.Context,
+	call providers.ToolCall,
+	surface toolruntime.Surface,
+) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
+	}
+	if surface == nil {
+		surface = e.toolRuntime()
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -231,16 +274,27 @@ func (e *Engineer) executeToolCall(ctx context.Context, call providers.ToolCall)
 	if !json.Valid([]byte(raw)) {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
+	}
+	if err := shared.ValidateTaskExecutionCall(ctx, "engineer", name, input); err != nil {
+		return toolruntime.ExecutionResult{}, err
+	}
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = e.id + "-local"
 	}
-	return e.toolRuntime().Execute(ctx, toolruntime.Invocation{
+	result, err := surface.Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         e.toolRuntime().AgentID(),
+		AgentID:         surface.AgentID(),
 		CorrelationID:   correlationID,
-		CapabilityScope: e.toolRuntime().CapabilityScope(),
+		CapabilityScope: surface.CapabilityScope(),
 	})
+	if err == nil {
+		shared.RecordTaskExecutionSuccess(ctx, name, input)
+	}
+	return result, err
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -255,8 +309,15 @@ func (e *Engineer) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (e *Engineer) buildToolDefinitions() []providers.Tool {
-	e.toolRuntime().SyncActiveFromLoaded()
-	return e.toolRuntime().BuildToolDefinitions()
+	return e.buildToolDefinitionsWithSurface(e.toolRuntime())
+}
+
+func (e *Engineer) buildToolDefinitionsWithSurface(surface toolruntime.Surface) []providers.Tool {
+	if surface == nil {
+		return nil
+	}
+	surface.SyncActiveFromLoaded()
+	return surface.BuildToolDefinitions()
 }
 
 func (e *Engineer) toolRuntime() *toolruntime.Runtime {
@@ -264,19 +325,30 @@ func (e *Engineer) toolRuntime() *toolruntime.Runtime {
 }
 
 func (e *Engineer) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	return e.toolInvocationsWithSurface(ctx, calls, e.toolRuntime())
+}
+
+func (e *Engineer) toolInvocationsWithSurface(
+	ctx context.Context,
+	calls []providers.ToolCall,
+	surface toolruntime.Surface,
+) []toolruntime.Invocation {
 	if len(calls) == 0 {
 		return nil
+	}
+	if surface == nil {
+		surface = e.toolRuntime()
 	}
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = e.id + "-local"
 	}
-	scope := e.toolRuntime().CapabilityScope()
+	scope := surface.CapabilityScope()
 	invocations := make([]toolruntime.Invocation, 0, len(calls))
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         e.toolRuntime().AgentID(),
+			AgentID:         surface.AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

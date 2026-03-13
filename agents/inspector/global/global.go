@@ -268,18 +268,7 @@ func (gi *GlobalInspector) initSkills() error {
 }
 
 func (gi *GlobalInspector) registerSafetyHook() {
-	allowed := map[string]bool{
-		"run_linter": true, "run_type_checker": true, "run_formatter_check": true,
-		"run_security_scan": true, "check_coverage": true, "analyze_complexity": true,
-		"detect_race_conditions": true, "detect_deadlocks": true, "detect_memory_leaks": true,
-		"read_file": true, "glob": true, "grep": true,
-		"read_workspace_file": true, "workspace_glob": true, "workspace_grep": true, "inspect_workspace_state": true, "summarize_workspace_state": true,
-		"audit_layer": true, "validate_plan_adherence": true,
-		"cross_reference_changes": true, "grade_layer_quality": true,
-		"request_architect_research": true, "request_user_clarification": true,
-		"escalate_findings": true, "reroute_request": true,
-		"self_diagnostic": true,
-	}
+	allowed := allowedInspectorGlobalTools(gi.skills)
 	gi.hooks.RegisterPreToolCallHook("inspector_global_safety", skills.HookPriorityHigh,
 		func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
 			if !allowed[data.ToolName] {
@@ -290,6 +279,14 @@ func (gi *GlobalInspector) registerSafetyHook() {
 			}
 			return skills.HookResult{Continue: true}
 		})
+}
+
+func allowedInspectorGlobalTools(registry *skills.Registry) map[string]bool {
+	allowed := make(map[string]bool)
+	for _, name := range globalInspectorToolManifest(registry).AllowedNames() {
+		allowed[name] = true
+	}
+	return allowed
 }
 
 // Close shuts down the global inspector.
@@ -415,7 +412,9 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 		return shared.ConversationFallback(gi.getState()), nil
 	}
 
-	systemPrompt := shared.GlobalInspectorSystemPrompt()
+	contract := agentShared.BuildGlobalExecutionContract("inspector-global", fwd.Intent, fwd.Input)
+	systemPrompt := shared.GlobalInspectorSystemPromptForContract(contract)
+	systemPrompt = agentShared.AppendGlobalExecutionGuidance(systemPrompt, contract, "inspector-global")
 	gi.prepareSkillsForInput(fwd.Input)
 	tools := gi.buildToolDefinitions()
 

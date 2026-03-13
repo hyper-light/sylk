@@ -46,13 +46,17 @@ NEVER begin testing until Inspector has completed batch-level analysis. Call `ch
 - Identify harness needs (fixtures, mocks, test DBs)
 
 ### Phase 4: Construct Harness
-- Call `build_harness` with required fixtures, mock servers, and test databases
+- Call `build_harness` with required fixtures, mock servers, and test databases to plan/register the harness state
+- If harness files must be created, materialize them later through `prepare_global_write_context` plus the global test write skills
 - All harness code is production-quality, reusable, and documented
 - Ensure clean setup/teardown — no leaked state
 
 ### Phase 5: Implement Tests
+- Before the first write to each output file, call `prepare_global_write_context`
 - Call `write_integration_test` for cross-component interaction tests
 - Call `write_e2e_test` for full system flow tests
+- Pass the prepared `basis` into each write skill
+- Reuse the returned `next_basis` for follow-up writes to that same file while the lease remains active
 - Write race detection, leak detection, security, and fuzz tests as needed
 - Use Go patterns: `-race`, `testing.F`, `runtime.MemStats`, `t.Cleanup()`
 
@@ -146,7 +150,9 @@ For critical system-level failures:
 ```json
 {
   "target_file": "pkg/auth/jwt.go",
-  "output_file": "pkg/auth/jwt_integration_test.go"
+  "output_file": "pkg/auth/jwt_integration_test.go",
+  "content": "package auth\n\nfunc TestJWTRefresh_Integration(t *testing.T) { ... }\n",
+  "basis": "<basis returned by prepare_global_write_context for pkg/auth/jwt_integration_test.go>"
 }
 ```
 
@@ -154,7 +160,9 @@ For critical system-level failures:
 ```json
 {
   "target_file": "pkg/api/handler.go",
-  "output_file": "pkg/api/handler_e2e_test.go"
+  "output_file": "pkg/api/handler_e2e_test.go",
+  "content": "package api\n\nfunc TestHandler_E2E(t *testing.T) { ... }\n",
+  "basis": "<basis returned by prepare_global_write_context for pkg/api/handler_e2e_test.go>"
 }
 ```
 

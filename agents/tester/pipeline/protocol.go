@@ -11,7 +11,7 @@ import (
 // Phase 1: gateOnInspector    — check_inspector_gate
 // Phase 2: analyzeRisks       — analyze_risk
 // Phase 3: formulateTestPlan  — plan_tests
-// Phase 4: implementTests     — write_test
+// Phase 4: implementTests     — prepare_pipeline_write_context + write_test
 // Phase 5: executeAndDiagnose — run_test_suite + diagnose_failure
 // Phase 6: dispatchFeedback   — report_to_engineer / report_to_designer
 

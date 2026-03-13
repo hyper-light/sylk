@@ -77,8 +77,9 @@ func (pi *PipelineInspector) runFeedbackLoop(
 		)
 
 		pi.prepareSkillsForInput(revalidatePrompt)
+		systemPrompt := shared.PipelineInspectorSystemPromptForContract(agentShared.TaskExecutionContractFromContext(ctx))
 		req := &providers.Request{
-			SystemPrompt: shared.PipelineInspectorSystemPrompt(),
+			SystemPrompt: systemPrompt,
 			Messages: []providers.Message{
 				{Role: providers.RoleUser, Content: revalidatePrompt},
 			},

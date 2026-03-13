@@ -1,7 +1,10 @@
 package shared
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -89,5 +92,82 @@ func TestConsultationEvidence_JSONRoundtrip_WithError(t *testing.T) {
 	}
 	if restored.Error != original.Error {
 		t.Fatalf("Error mismatch: got %q, want %q", restored.Error, original.Error)
+	}
+}
+
+func TestRunWithContextLease_RefreshesChildDeadline(t *testing.T) {
+	parent, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	responseReady := make(chan struct{})
+	var (
+		attempts  int
+		refreshes int
+	)
+	err := RunWithContextLease(parent, ContextLeaseConfig{
+		AttemptTimeout: 20 * time.Millisecond,
+		MaxRefreshes:   2,
+		DeadlineGuard:  10 * time.Millisecond,
+		OnRefresh: func(info ContextLeaseRefresh) {
+			refreshes = info.RefreshCount
+		},
+	}, func(ctx context.Context) error {
+		attempts++
+		if attempts == 2 {
+			close(responseReady)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-responseReady:
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("RunWithContextLease() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if refreshes != 1 {
+		t.Fatalf("refreshes = %d, want 1", refreshes)
+	}
+}
+
+func TestRunWithContextLease_ReturnsLeaseTimeoutAfterRefreshBudgetExhausted(t *testing.T) {
+	parent, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	err := RunWithContextLease(parent, ContextLeaseConfig{
+		AttemptTimeout: 20 * time.Millisecond,
+		MaxRefreshes:   1,
+		DeadlineGuard:  10 * time.Millisecond,
+	}, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	var leaseErr *ContextLeaseTimeoutError
+	if !errors.As(err, &leaseErr) {
+		t.Fatalf("error = %v, want ContextLeaseTimeoutError", err)
+	}
+	if leaseErr.Refreshes != 1 {
+		t.Fatalf("refreshes = %d, want 1", leaseErr.Refreshes)
+	}
+}
+
+func TestWrapLeaseTimeoutError_UsesLeaseElapsed(t *testing.T) {
+	err := WrapLeaseTimeoutError("consultation to \"librarian\"", time.Minute, &ContextLeaseTimeoutError{
+		AttemptTimeout: time.Minute,
+		Refreshes:      2,
+		Elapsed:        3 * time.Minute,
+		Err:            context.DeadlineExceeded,
+	})
+	if err == nil {
+		t.Fatal("expected wrapped error")
+	}
+	got := err.Error()
+	want := "consultation to \"librarian\" timed out after 3m0s"
+	if !strings.HasPrefix(got, want) {
+		t.Fatalf("error prefix = %q, want prefix %q", got, want)
 	}
 }

@@ -38,6 +38,174 @@ func (a *Architect) latestReadyPlan(sessionID string) *DesignPlan {
 	return best
 }
 
+func planIDFromMetadata(metadata map[string]any) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+	value, _ := metadata["plan_id"].(string)
+	return strings.TrimSpace(value)
+}
+
+func hasPlanContinuationMetadata(metadata map[string]any) bool {
+	return planIDFromMetadata(metadata) != ""
+}
+
+func planWithinMaxAge(plan *DesignPlan, maxAge time.Duration, now time.Time) bool {
+	if plan == nil {
+		return false
+	}
+	if maxAge <= 0 {
+		return true
+	}
+	if plan.UpdatedAt.IsZero() {
+		return false
+	}
+	return !plan.UpdatedAt.Before(now.Add(-maxAge))
+}
+
+func isRecoverableReadyPlan(plan *DesignPlan, now time.Time) bool {
+	return plan != nil &&
+		plan.SM().State() == PlanStatusReady &&
+		planWithinMaxAge(plan, ReadyPlanMaxAge, now)
+}
+
+func (a *Architect) resolveReadyPlanFromMetadata(metadata map[string]any, now time.Time) *DesignPlan {
+	if plan := a.planFromMetadata(metadata); isRecoverableReadyPlan(plan, now) {
+		architectDebugLog().Info("handoff: READY_PLAN_RECOVERED_FROM_METADATA",
+			"plan_id", plan.ID,
+			"plan_session", plan.SessionID)
+		return plan
+	}
+	return nil
+}
+
+func (a *Architect) planFromMetadata(metadata map[string]any) *DesignPlan {
+	if a == nil || a.planStore == nil {
+		return nil
+	}
+	planID := planIDFromMetadata(metadata)
+	if planID == "" {
+		return nil
+	}
+	plan := a.planStore.Get(planID)
+	if plan == nil {
+		architectDebugLog().Warn("handoff: PLAN_METADATA_LOOKUP_MISS",
+			"plan_id", planID)
+		return nil
+	}
+	return plan
+}
+
+func (a *Architect) latestUniqueRecentPlan(match func(*DesignPlan) bool) *DesignPlan {
+	if a == nil || a.planStore == nil {
+		return nil
+	}
+	var (
+		best  *DesignPlan
+		count int
+	)
+	for _, plan := range a.planStore.Snapshot() {
+		if !match(plan) {
+			continue
+		}
+		count++
+		if best == nil || plan.UpdatedAt.After(best.UpdatedAt) {
+			best = plan
+		}
+	}
+	if count != 1 {
+		if count > 1 {
+			architectDebugLog().Info("handoff: UNIQUE_PLAN_RECOVERY_AMBIGUOUS",
+				"candidate_count", count)
+		}
+		return nil
+	}
+	return best
+}
+
+func (a *Architect) resolveReadyPlanForContinuation(sessionID string, metadata map[string]any, now time.Time) *DesignPlan {
+	if plan := a.resolveReadyPlanFromMetadata(metadata, now); plan != nil {
+		return plan
+	}
+	if plan := a.latestReadyPlan(sessionID); plan != nil {
+		return plan
+	}
+	if plan := a.latestUniqueRecentPlan(func(candidate *DesignPlan) bool {
+		return isRecoverableReadyPlan(candidate, now)
+	}); plan != nil {
+		architectDebugLog().Info("handoff: READY_PLAN_RECOVERED_UNIQUELY",
+			"plan_id", plan.ID,
+			"plan_session", plan.SessionID)
+		return plan
+	}
+	return nil
+}
+
+func (a *Architect) resolveRecoverableReadyPlanForConversation(sessionID string, now time.Time) *DesignPlan {
+	if plan := a.latestReadyPlan(sessionID); plan != nil {
+		return plan
+	}
+	if plan := a.latestUniqueRecentPlan(func(candidate *DesignPlan) bool {
+		return isRecoverableReadyPlan(candidate, now)
+	}); plan != nil {
+		architectDebugLog().Info("handoff: READY_PLAN_CONVERSATION_RECOVERED_UNIQUELY",
+			"plan_id", plan.ID,
+			"plan_session", plan.SessionID)
+		return plan
+	}
+	return nil
+}
+
+func (a *Architect) resolveActivePendingPlanForExecute(sessionID string, metadata map[string]any, now time.Time) *DesignPlan {
+	if plan := a.planFromMetadata(metadata); planHasActivePendingWork(plan, now) {
+		architectDebugLog().Info("handoff: PENDING_PLAN_RECOVERED_FROM_METADATA",
+			"plan_id", plan.ID,
+			"plan_session", plan.SessionID)
+		return plan
+	}
+	if plan := a.latestActivePendingPlan(sessionID); plan != nil {
+		return plan
+	}
+	if plan := a.latestUniqueRecentPlan(func(candidate *DesignPlan) bool {
+		return planHasActivePendingWork(candidate, now)
+	}); plan != nil {
+		architectDebugLog().Info("handoff: PENDING_PLAN_RECOVERED_UNIQUELY",
+			"plan_id", plan.ID,
+			"plan_session", plan.SessionID)
+		return plan
+	}
+	return nil
+}
+
+func (a *Architect) resolvePlanByStatusForExecute(sessionID string, metadata map[string]any, status PlanStatus, now time.Time) *DesignPlan {
+	if plan := a.planFromMetadata(metadata); plan != nil &&
+		plan.SM().State() == status &&
+		planWithinMaxAge(plan, ReadyPlanMaxAge, now) {
+		architectDebugLog().Info("handoff: STATUS_PLAN_RECOVERED_FROM_METADATA",
+			"plan_id", plan.ID,
+			"plan_session", plan.SessionID,
+			"status", status.String())
+		return plan
+	}
+	if a != nil && a.planStore != nil {
+		if plan := a.planStore.LatestByStatus(sessionID, status, ReadyPlanMaxAge); plan != nil {
+			return plan
+		}
+	}
+	if plan := a.latestUniqueRecentPlan(func(candidate *DesignPlan) bool {
+		return candidate != nil &&
+			candidate.SM().State() == status &&
+			planWithinMaxAge(candidate, ReadyPlanMaxAge, now)
+	}); plan != nil {
+		architectDebugLog().Info("handoff: STATUS_PLAN_RECOVERED_UNIQUELY",
+			"plan_id", plan.ID,
+			"plan_session", plan.SessionID,
+			"status", status.String())
+		return plan
+	}
+	return nil
+}
+
 // latestActivePendingPlan returns the most recently updated plan for the
 // session that still has a live pending continuation attached.
 func (a *Architect) latestActivePendingPlan(sessionID string) *DesignPlan {
@@ -59,7 +227,6 @@ func (a *Architect) latestActivePendingPlan(sessionID string) *DesignPlan {
 		record, err := a.controlStore.LatestActiveContinuationForSession(trimmed, now)
 		if err == nil && record != nil {
 			if record.State == continuationStatusProcessing {
-				a.recoverStaleContinuationRecord(record, "processing continuation cannot be resumed after architect restart")
 				return nil
 			}
 			best = a.reconcileContinuationRecord(record)
@@ -145,6 +312,14 @@ func (a *Architect) dispatchPlanExecution(
 		}, true
 	}
 
+	targetAgentID, err := a.requirePlanHandoffTargetAgentID(plan, correlationIDFromPending(plan.PendingWork), "plan_handoff_dispatch")
+	if err != nil {
+		return &ConversationResult{
+			Response: "I have a plan ready, but no registered orchestrator instance is available to accept it right now.",
+			Intent:   IntentExecute,
+		}, true
+	}
+
 	if plan.PendingWork != nil && plan.PendingWork.Kind == string(continuationKindPlanHandoff) {
 		return &ConversationResult{
 			Response: "The plan is already being handed off to the orchestrator. I'll update you when it confirms ingestion.",
@@ -182,7 +357,7 @@ func (a *Architect) dispatchPlanExecution(
 		State:                   continuationStatusPending,
 		PlanID:                  plan.ID,
 		SessionID:               plan.SessionID,
-		TargetAgentID:           "orchestrator",
+		TargetAgentID:           targetAgentID,
 		ResponseCorrelationID:   orchCID,
 		InvocationCorrelationID: originalCIDFromContext(ctx),
 		RequestJSON:             payload,
@@ -214,7 +389,7 @@ func (a *Architect) dispatchPlanExecution(
 		Input:               payload,
 		CorrelationID:       orchCID,
 		ParentCorrelationID: originalCIDFromContext(ctx),
-		TargetAgentID:       "orchestrator",
+		TargetAgentID:       targetAgentID,
 		SessionID:           plan.SessionID,
 	}
 	a.logTrace("architect_plan_handoff_publish_begin", "debug", plan.SessionID, orchCID, agentlog.EventTaskDispatched, map[string]any{

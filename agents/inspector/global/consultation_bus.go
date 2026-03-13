@@ -3,13 +3,13 @@ package global
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/google/uuid"
 )
 
-const routeSyncTimeout = 60 * time.Second
+const routeSyncTimeout = shared.DefaultConsultationTimeout
 
 func (gi *GlobalInspector) registerPendingWait(correlationID string) <-chan *guide.Message {
 	ch := make(chan *guide.Message, 1)
@@ -67,13 +67,30 @@ func (gi *GlobalInspector) requestRouteSync(ctx context.Context, target, payload
 		return nil, fmt.Errorf("publish escalation request: %w", err)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, routeSyncTimeout)
-	defer cancel()
-
-	select {
-	case resp := <-waitCh:
-		return resp, nil
-	case <-timeoutCtx.Done():
-		return nil, fmt.Errorf("escalation request timed out after %v", routeSyncTimeout)
+	var response *guide.Message
+	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+		AttemptTimeout: routeSyncTimeout,
+		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
+		OnRefresh: func(info shared.ContextLeaseRefresh) {
+			if gi.logger != nil {
+				gi.logger.Info("escalation wait lease refreshed",
+					"target", target,
+					"correlation_id", correlationID,
+					"refresh_count", info.RefreshCount,
+					"attempt_timeout", info.AttemptTimeout.String(),
+					"error", info.Error)
+			}
+		},
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case response = <-waitCh:
+			return nil
+		}
+	})
+	if err != nil {
+		return nil, shared.WrapLeaseTimeoutError("escalation request", routeSyncTimeout, err)
 	}
+	return response, nil
 }

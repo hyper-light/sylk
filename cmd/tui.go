@@ -2247,6 +2247,7 @@ func registerArchitectWithGuide(g *guide.Guide, a *architect.Architect) error {
 	if g == nil || a == nil {
 		return nil
 	}
+	seedRouterKnownAgents(g, a)
 	if err := g.RegisterRouter(a); err != nil {
 		return err
 	}
@@ -2259,6 +2260,7 @@ func registerAgentWithGuide(g *guide.Guide, router guide.AgentRouter, _ string) 
 	if g == nil || router == nil {
 		return nil
 	}
+	seedRouterKnownAgents(g, router)
 	return registerRoutingInfoWithGuide(g, router.GetRoutingInfo())
 }
 
@@ -2273,6 +2275,21 @@ func registerRoutingInfoWithGuide(g *guide.Guide, info *guide.AgentRoutingInfo) 
 	// readyAgents keyed by info.ID, not by agentType.
 	g.MarkAgentReady(info.ID)
 	return nil
+}
+
+type guideKnownAgentSeeder interface {
+	SeedKnownAgents([]*guide.AgentAnnouncement)
+}
+
+func seedRouterKnownAgents(g *guide.Guide, router guide.AgentRouter) {
+	if g == nil || router == nil {
+		return
+	}
+	seeder, ok := router.(guideKnownAgentSeeder)
+	if !ok {
+		return
+	}
+	seeder.SeedKnownAgents(g.RegisteredAgentInfos())
 }
 
 func findRegisteredPodContainer(reg *container.ContainerRegistry, podID, agentType string) *container.Container {
@@ -2823,6 +2840,7 @@ func registerOrchestratorWithGuide(g *guide.Guide, orch *orchestrator.Orchestrat
 	if g == nil || orch == nil {
 		return nil
 	}
+	seedRouterKnownAgents(g, orch)
 	if err := g.RegisterRouter(orch); err != nil {
 		return err
 	}
@@ -2936,6 +2954,7 @@ func bootstrapHandoffSupervisor(
 		}
 		g.UnregisterAgent(oldID)
 		if router, ok := newAgent.(guide.AgentRouter); ok {
+			seedRouterKnownAgents(g, router)
 			_ = g.RegisterRouter(router)
 			g.MarkAgentReady(oldID)
 		}

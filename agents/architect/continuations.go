@@ -148,8 +148,8 @@ func (a *Architect) reconcileContinuationRecord(record *ArchitectContinuation) *
 	return reconciled
 }
 
-func (a *Architect) reconcilePendingContinuations() {
-	if a == nil || a.controlStore == nil {
+func (a *Architect) reconcilePendingContinuations(ctx context.Context) {
+	if !canReconcilePendingContinuations(a) {
 		return
 	}
 	now := time.Now().UTC()
@@ -159,16 +159,30 @@ func (a *Architect) reconcilePendingContinuations() {
 		return
 	}
 	for _, record := range records {
-		if record == nil {
-			continue
-		}
-		if record.State == continuationStatusProcessing {
-			a.recoverStaleContinuationRecord(record, "architect restarted while continuation was processing")
-			continue
-		}
-		a.reconcileContinuationRecord(record)
+		a.reconcilePendingContinuationRecord(record)
 	}
-	a.recoverAllSessionPendingWork(now)
+	a.recoverAllSessionPendingWork(ctx, now)
+}
+
+func canReconcilePendingContinuations(a *Architect) bool {
+	if a == nil {
+		return false
+	}
+	return a.controlStore != nil
+}
+
+func (a *Architect) reconcilePendingContinuationRecord(record *ArchitectContinuation) {
+	if record == nil {
+		return
+	}
+	if record.State != continuationStatusProcessing {
+		a.reconcileContinuationRecord(record)
+		return
+	}
+	if record.Kind == continuationKindPlanHandoff {
+		return
+	}
+	a.recoverStaleContinuationRecord(record, "architect restarted while continuation was processing")
 }
 
 func (a *Architect) clearPlanPendingContinuation(plan *DesignPlan, correlationID string) error {
@@ -183,55 +197,135 @@ func (a *Architect) clearPlanPendingContinuation(plan *DesignPlan, correlationID
 	return a.persistPlanState(plan)
 }
 
-func (a *Architect) recoverAllSessionPendingWork(now time.Time) {
+func (a *Architect) recoverAllSessionPendingWork(ctx context.Context, now time.Time) {
 	if a == nil || a.planStore == nil {
 		return
 	}
 	for _, plan := range a.planStore.Snapshot() {
-		a.recoverStalePendingWork(plan, now)
+		a.recoverStalePendingWork(ctx, plan, now)
 	}
 }
 
-func (a *Architect) recoverSessionPendingWork(sessionID string, now time.Time) {
+func (a *Architect) recoverSessionPendingWork(ctx context.Context, sessionID string, now time.Time) {
 	if a == nil || a.planStore == nil {
 		return
 	}
 	for _, plan := range a.planStore.AllForSession(sessionID) {
-		a.recoverStalePendingWork(plan, now)
+		a.recoverStalePendingWork(ctx, plan, now)
 	}
 }
 
-func (a *Architect) recoverStalePendingWork(plan *DesignPlan, now time.Time) {
-	if a == nil || plan == nil {
+func (a *Architect) recoverStalePendingWork(ctx context.Context, plan *DesignPlan, now time.Time) {
+	if !canRecoverStalePendingWork(a, plan) {
 		return
 	}
-
-	pending := plan.PendingWork
-	if pending != nil {
-		status := strings.ToLower(strings.TrimSpace(pending.Status))
-		switch {
-		case pending.Kind == string(continuationKindPlanHandoff) && status == string(continuationStatusProcessing):
-			a.recoverPlanHandoffForRetry(plan, pending.CorrelationID, "stale processing plan handoff continuation")
-			return
-		case pending.Kind == string(continuationKindPlanHandoff) && !planHasActivePendingWork(plan, now):
-			a.recoverPlanHandoffForRetry(plan, pending.CorrelationID, "expired plan handoff continuation")
-			return
-		case !planHasActivePendingWork(plan, now):
-			a.logTrace("architect_pending_work_expired", "warn", plan.SessionID, pending.CorrelationID, agentlog.EventError, map[string]any{
-				"plan_id":       plan.ID,
-				"plan_status":   plan.SM().State().String(),
-				"kind":          pending.Kind,
-				"pending_state": pending.Status,
-			})
-			a.failContinuationByCorrelationBestEffort(pending.CorrelationID, plan.SessionID, "pending continuation expired")
-			a.clearPlanPendingContinuationBestEffort(plan, pending.CorrelationID, "pending continuation expired")
-			return
-		}
+	if a.handlePlanPendingWork(ctx, plan, now) {
+		return
 	}
-
 	if plan.SM().State() == PlanStatusOrchestrating {
-		a.recoverPlanHandoffForRetry(plan, correlationIDFromPending(pending), "plan stuck in orchestrating without active handoff continuation")
+		a.reconcileOrRecoverPlanHandoff(ctx, plan, correlationIDFromPending(plan.PendingWork), "plan stuck in orchestrating without active handoff continuation")
 	}
+}
+
+func canRecoverStalePendingWork(a *Architect, plan *DesignPlan) bool {
+	if a == nil {
+		return false
+	}
+	return plan != nil
+}
+
+func (a *Architect) handlePlanPendingWork(ctx context.Context, plan *DesignPlan, now time.Time) bool {
+	pending := pendingWorkForPlan(plan)
+	if pending == nil {
+		return false
+	}
+	if a.handlePlanHandoffPendingWork(ctx, plan, pending, now) {
+		return true
+	}
+	return a.handleExpiredPendingWork(plan, pending, now)
+}
+
+func (a *Architect) handlePlanHandoffPendingWork(
+	ctx context.Context,
+	plan *DesignPlan,
+	pending *PendingContinuation,
+	now time.Time,
+) bool {
+	if isProcessingPlanHandoff(pending) {
+		a.reconcileOrRecoverPlanHandoff(ctx, plan, pending.CorrelationID, "stale processing plan handoff continuation")
+		return true
+	}
+	if isExpiredPlanHandoff(plan, pending, now) {
+		a.reconcileOrRecoverPlanHandoff(ctx, plan, pending.CorrelationID, "expired plan handoff continuation")
+		return true
+	}
+	return false
+}
+
+func (a *Architect) handleExpiredPendingWork(
+	plan *DesignPlan,
+	pending *PendingContinuation,
+	now time.Time,
+) bool {
+	if planHasActivePendingWork(plan, now) {
+		return false
+	}
+	a.expirePendingWork(plan, pending)
+	return true
+}
+
+func pendingWorkForPlan(plan *DesignPlan) *PendingContinuation {
+	if plan == nil {
+		return nil
+	}
+	return plan.PendingWork
+}
+
+func isProcessingPlanHandoff(pending *PendingContinuation) bool {
+	if pending == nil || pending.Kind != string(continuationKindPlanHandoff) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(pending.Status), string(continuationStatusProcessing))
+}
+
+func isExpiredPlanHandoff(plan *DesignPlan, pending *PendingContinuation, now time.Time) bool {
+	if pending == nil || pending.Kind != string(continuationKindPlanHandoff) {
+		return false
+	}
+	return !planHasActivePendingWork(plan, now)
+}
+
+func (a *Architect) expirePendingWork(plan *DesignPlan, pending *PendingContinuation) {
+	a.logTrace("architect_pending_work_expired", "warn", plan.SessionID, pending.CorrelationID, agentlog.EventError, map[string]any{
+		"plan_id":       plan.ID,
+		"plan_status":   plan.SM().State().String(),
+		"kind":          pending.Kind,
+		"pending_state": pending.Status,
+	})
+	a.failContinuationByCorrelationBestEffort(pending.CorrelationID, plan.SessionID, "pending continuation expired")
+	a.clearPlanPendingContinuationBestEffort(plan, pending.CorrelationID, "pending continuation expired")
+}
+
+func (a *Architect) reconcileOrRecoverPlanHandoff(
+	ctx context.Context,
+	plan *DesignPlan,
+	correlationID string,
+	reason string,
+) {
+	if ctx != nil {
+		a.requestPlanHandoffReceiptResync(plan, correlationID, reason)
+	}
+	if ctx != nil && a.reconcileDurablePlanHandoff(ctx, plan, correlationID, reason) {
+		return
+	}
+	if ctx == nil {
+		a.logTrace("architect_plan_handoff_recovery_deferred", "warn", plan.SessionID, correlationID, agentlog.EventError, map[string]any{
+			"plan_id": plan.ID,
+			"reason":  reason,
+		})
+		return
+	}
+	a.recoverPlanHandoffForRetry(plan, correlationID, reason)
 }
 
 func (a *Architect) recoverStaleContinuationRecord(record *ArchitectContinuation, reason string) {
@@ -262,14 +356,7 @@ func (a *Architect) recoverStaleContinuationRecord(record *ArchitectContinuation
 }
 
 func (a *Architect) recoverPlanHandoffForRetry(plan *DesignPlan, correlationID string, reason string) {
-	sessionID := ""
-	planID := ""
-	planStatus := ""
-	if plan != nil {
-		sessionID = plan.SessionID
-		planID = plan.ID
-		planStatus = plan.SM().State().String()
-	}
+	sessionID, planID, planStatus := planRecoverySnapshot(plan)
 	a.logTrace("architect_plan_handoff_recovered", "warn", sessionID, correlationID, agentlog.EventError, map[string]any{
 		"plan_id":     planID,
 		"plan_status": planStatus,
@@ -279,16 +366,9 @@ func (a *Architect) recoverPlanHandoffForRetry(plan *DesignPlan, correlationID s
 	if plan == nil {
 		return
 	}
-	if plan.SM().State() == PlanStatusOrchestrating {
-		if err := plan.SM().TransitionTo(PlanStatusReady, plan); err != nil {
-			a.logTrace("architect_plan_handoff_recovery_transition_failed", "error", plan.SessionID, correlationID, agentlog.EventError, map[string]any{
-				"plan_id":     plan.ID,
-				"plan_status": plan.SM().State().String(),
-				"reason":      reason,
-				"error":       err.Error(),
-			})
-			return
-		}
+	if err := a.transitionRecoveredPlanHandoffToReady(plan, correlationID, reason); err != nil {
+		a.logPlanHandoffRecoveryTransitionFailure(plan, correlationID, reason, err)
+		return
 	}
 	plan.Status = plan.SM().State()
 	plan.Epoch = plan.SM().Epoch()
@@ -297,22 +377,40 @@ func (a *Architect) recoverPlanHandoffForRetry(plan *DesignPlan, correlationID s
 	a.persistPlanStateBestEffort(plan, correlationID, reason)
 }
 
+func planRecoverySnapshot(plan *DesignPlan) (string, string, string) {
+	if plan == nil {
+		return "", "", ""
+	}
+	return plan.SessionID, plan.ID, plan.SM().State().String()
+}
+
+func (a *Architect) transitionRecoveredPlanHandoffToReady(
+	plan *DesignPlan,
+	_ string,
+	_ string,
+) error {
+	if plan.SM().State() != PlanStatusOrchestrating {
+		return nil
+	}
+	return plan.SM().TransitionTo(PlanStatusReady, plan)
+}
+
+func (a *Architect) logPlanHandoffRecoveryTransitionFailure(
+	plan *DesignPlan,
+	correlationID string,
+	reason string,
+	err error,
+) {
+	a.logTrace("architect_plan_handoff_recovery_transition_failed", "error", plan.SessionID, correlationID, agentlog.EventError, map[string]any{
+		"plan_id":     plan.ID,
+		"plan_status": plan.SM().State().String(),
+		"reason":      reason,
+		"error":       err.Error(),
+	})
+}
+
 func (a *Architect) failContinuationByCorrelationBestEffort(correlationID, sessionID, reason string) {
-	if a == nil || a.controlStore == nil || strings.TrimSpace(correlationID) == "" {
-		return
-	}
-	record, err := a.controlStore.GetContinuationByResponseCorrelation(correlationID)
-	if err != nil {
-		a.logTrace("architect_continuation_lookup_failed", "error", sessionID, correlationID, agentlog.EventError, map[string]any{
-			"reason": reason,
-			"error":  err.Error(),
-		})
-		return
-	}
-	if record == nil {
-		return
-	}
-	a.completeContinuationBestEffort(record, continuationStatusFailed, record.ResponseJSON, reason, reason)
+	a.completeContinuationByCorrelationBestEffort(correlationID, sessionID, continuationStatusFailed, "", reason, reason)
 }
 
 func correlationIDFromPending(pending *PendingContinuation) string {

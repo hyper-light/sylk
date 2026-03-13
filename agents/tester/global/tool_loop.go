@@ -109,7 +109,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 			return "", err
 		}
 
-		if dup, sig := agentshared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := agentshared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",

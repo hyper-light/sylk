@@ -454,6 +454,10 @@ func (o *Orchestrator) doEscalateToArchitect(reason, severity, context string) (
 	if o.bus == nil || !o.running {
 		return nil, fmt.Errorf("orchestrator not running")
 	}
+	targetAgentID := o.resolveArchitectTargetAgentID(nil, "")
+	if targetAgentID == "" {
+		return nil, fmt.Errorf("no registered architect agent id is available")
+	}
 
 	escalationInput := fmt.Sprintf("[ORCHESTRATOR ESCALATION - %s] %s", strings.ToUpper(severity), reason)
 	if context != "" {
@@ -464,7 +468,7 @@ func (o *Orchestrator) doEscalateToArchitect(reason, severity, context string) (
 		Input:           escalationInput,
 		SourceAgentID:   o.config.AgentID,
 		SourceAgentName: "orchestrator",
-		TargetAgentID:   "architect",
+		TargetAgentID:   targetAgentID,
 		FireAndForget:   true,
 		SessionID:       o.config.SessionID,
 		Timestamp:       time.Now(),

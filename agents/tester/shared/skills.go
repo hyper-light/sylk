@@ -123,34 +123,6 @@ func PlanTestsSkill() *skills.Skill {
 		Build()
 }
 
-// WriteTestSkill creates a skill for writing test code.
-func WriteTestSkill() *skills.Skill {
-	type params struct {
-		TestCase   PlannedTestCase `json:"test_case"`
-		TargetFile string          `json:"target_file"`
-		OutputFile string          `json:"output_file"`
-	}
-
-	return skills.NewSkill("write_test").
-		Description("Write a test file implementing a planned test case.").
-		Domain("testing").
-		Keywords("write", "implement", "test code", "test file").
-		Priority(90).
-		StringParam("target_file", "Source file under test", true).
-		StringParam("output_file", "Path for the generated test file", true).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var p params
-			if err := json.Unmarshal(input, &p); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			return map[string]any{
-				"output_file": p.OutputFile,
-				"written":     true,
-			}, nil
-		}).
-		Build()
-}
-
 // RunTestSuiteSkill creates a skill for executing test suites.
 func RunTestSuiteSkill() *skills.Skill {
 	type params struct {
@@ -198,4 +170,3 @@ func RunTestSuiteSkill() *skills.Skill {
 		}).
 		Build()
 }
-

@@ -630,6 +630,11 @@ func actionSelUp(m *Model) tea.Cmd {
 		m.clampCol()
 		m.skipHiddenDelimiters(-1)
 		m.scrollIntoView()
+	} else if vCol > 0 {
+		m.cursorRow, m.cursorCol = m.visualToCursor(vRow, 0)
+		m.clampCol()
+		m.skipHiddenDelimiters(-1)
+		m.scrollIntoView()
 	}
 	return nil
 }
@@ -710,6 +715,26 @@ func (m *Model) DragStart(x, y int) {
 func (m *Model) DragTo(x, y int) {
 	if !m.sel.active {
 		return
+	}
+	m.ensureWrap()
+	vRow := max(min(m.scrollOff+y, m.wrap.visualTotal-1), 0)
+	m.cursorRow, m.cursorCol = m.visualToCursor(vRow, m.clampInputX(x))
+	m.clampCol()
+	m.scrollIntoView()
+	m.viewDirty = true
+}
+
+// ExtendSelectionTo extends the active selection to the given content-relative
+// coordinates. If no selection is active, the current cursor becomes the
+// anchor and the clicked point becomes the moving end.
+func (m *Model) ExtendSelectionTo(x, y int) {
+	m.completer.Dismiss()
+	if !m.sel.active {
+		m.sel = selection{
+			anchorRow: m.cursorRow,
+			anchorCol: m.cursorCol,
+			active:    true,
+		}
 	}
 	m.ensureWrap()
 	vRow := max(min(m.scrollOff+y, m.wrap.visualTotal-1), 0)

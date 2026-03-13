@@ -55,6 +55,7 @@ type WorkspaceLayerState struct {
 	View        WorkspaceView `json:"view"`
 	Available   bool          `json:"available"`
 	Exists      bool          `json:"exists"`
+	IsDir       bool          `json:"is_dir,omitempty"`
 	SizeBytes   int           `json:"size_bytes,omitempty"`
 	ContentHash string        `json:"content_hash,omitempty"`
 	Error       string        `json:"error,omitempty"`
@@ -383,6 +384,15 @@ func inspectWorkspaceLayer(ctx context.Context, fa FileAccess, view WorkspaceVie
 	if !exists {
 		return state
 	}
+	info, err := fa.Stat(ctx, path)
+	if err != nil {
+		state.Error = err.Error()
+		return state
+	}
+	state.IsDir = info.IsDir()
+	if state.IsDir {
+		return state
+	}
 	content, err := fa.ReadFile(ctx, path)
 	if err != nil {
 		state.Error = err.Error()
@@ -410,6 +420,12 @@ func compareWorkspaceLayers(a, b WorkspaceLayerState) (bool, bool) {
 		return true, true
 	}
 	if !a.Exists && !b.Exists {
+		return false, true
+	}
+	if a.IsDir != b.IsDir {
+		return true, true
+	}
+	if a.IsDir && b.IsDir {
 		return false, true
 	}
 	return a.ContentHash != b.ContentHash, true

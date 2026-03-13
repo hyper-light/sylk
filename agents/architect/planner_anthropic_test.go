@@ -363,6 +363,20 @@ func (m *timeoutStreamProvider) StreamWithHandler(
 	return context.DeadlineExceeded
 }
 
+type waitForContextProvider struct {
+	invoked int
+}
+
+func (m *waitForContextProvider) StreamWithHandler(
+	ctx context.Context,
+	req *providers.Request,
+	handler providers.StreamHandler,
+) error {
+	m.invoked++
+	<-ctx.Done()
+	return ctx.Err()
+}
+
 // testContextWindow and testMaxOutputTokens define the model parameters used by
 // newTestPlanner. Continuation bounds are derived from these via
 // deriveContinuationConfig: maxRounds = 16384/4096 = 4.
@@ -682,6 +696,180 @@ func TestContinuation_RecoverFromTimeout(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Fatalf("callCount = %d, want 2 (timeout + continuation)", callCount)
+	}
+}
+
+func TestRequestTextOnce_RefreshesExpiredChildContext(t *testing.T) {
+	waiter := &waitForContextProvider{}
+	completionMock := &mockStreamProvider{
+		calls: []mockStreamCall{
+			{Text: "refreshed response", StopReason: providers.StopReasonEndTurn, Usage: &providers.Usage{OutputTokens: 32}},
+		},
+	}
+
+	callCount := 0
+	p := &anthropicPlanner{
+		provider: plannerStreamProviderFunc(func(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error {
+			callCount++
+			if callCount == 1 {
+				return waiter.StreamWithHandler(ctx, req, handler)
+			}
+			return completionMock.StreamWithHandler(ctx, req, handler)
+		}),
+		maxTokens:      testMaxOutputTokens,
+		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
+		system:         "test system",
+		timeout:        5 * time.Millisecond,
+		logger:         slog.Default(),
+	}
+
+	sr, err := p.requestTextOnce(context.Background(), "prompt", testMaxOutputTokens, "", "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sr.Text != "refreshed response" {
+		t.Fatalf("Text = %q, want refreshed response", sr.Text)
+	}
+	if callCount != 2 {
+		t.Fatalf("callCount = %d, want 2 (expired child + refresh)", callCount)
+	}
+}
+
+func TestContinuationRound_RefreshesExpiredChildContext(t *testing.T) {
+	waiter := &waitForContextProvider{}
+	completionMock := &mockStreamProvider{
+		calls: []mockStreamCall{
+			{Text: " second half", StopReason: providers.StopReasonEndTurn, Usage: &providers.Usage{OutputTokens: 48}},
+		},
+	}
+
+	callCount := 0
+	p := &anthropicPlanner{
+		provider: plannerStreamProviderFunc(func(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error {
+			callCount++
+			switch callCount {
+			case 1:
+				return (&mockStreamProvider{
+					calls: []mockStreamCall{
+						{Text: "first half", StopReason: providers.StopReasonMaxTokens, Usage: &providers.Usage{OutputTokens: 64}},
+					},
+				}).StreamWithHandler(ctx, req, handler)
+			case 2:
+				return waiter.StreamWithHandler(ctx, req, handler)
+			default:
+				return completionMock.StreamWithHandler(ctx, req, handler)
+			}
+		}),
+		maxTokens:      testMaxOutputTokens,
+		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
+		system:         "test system",
+		timeout:        5 * time.Millisecond,
+		logger:         slog.Default(),
+	}
+
+	text, _, err := p.requestTextStreamingWithContinuation(
+		context.Background(), "prompt", testMaxOutputTokens, "", "test", nil,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if text != "first halfsecond half" {
+		t.Fatalf("text = %q, want 'first halfsecond half'", text)
+	}
+	if callCount != 3 {
+		t.Fatalf("callCount = %d, want 3 (initial + expired continuation + refresh)", callCount)
+	}
+}
+
+func TestCompleteForToolLoop_RefreshesExpiredChildContext(t *testing.T) {
+	waiter := &waitForContextProvider{}
+	completionMock := &mockStreamProvider{
+		calls: []mockStreamCall{
+			{Text: "tool loop response", StopReason: providers.StopReasonEndTurn, Usage: &providers.Usage{OutputTokens: 21}},
+		},
+	}
+
+	callCount := 0
+	p := &anthropicPlanner{
+		provider: plannerStreamProviderFunc(func(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error {
+			callCount++
+			if callCount == 1 {
+				return waiter.StreamWithHandler(ctx, req, handler)
+			}
+			return completionMock.StreamWithHandler(ctx, req, handler)
+		}),
+		maxTokens:      testMaxOutputTokens,
+		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
+		system:         "test system",
+		timeout:        5 * time.Millisecond,
+		logger:         slog.Default(),
+	}
+
+	resp, err := p.CompleteForToolLoop(context.Background(), &providers.Request{
+		Messages:  []providers.Message{{Role: providers.RoleUser, Content: "plan it"}},
+		MaxTokens: 256,
+	}, "planning_protocol", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Content != "tool loop response" {
+		t.Fatalf("response = %#v, want content %q", resp, "tool loop response")
+	}
+	if callCount != 2 {
+		t.Fatalf("callCount = %d, want 2 (expired child + refresh)", callCount)
+	}
+}
+
+func TestCompleteForToolLoop_AllowsMultipleLeaseRefreshes(t *testing.T) {
+	completionMock := &mockStreamProvider{
+		calls: []mockStreamCall{
+			{Text: "tool loop response", StopReason: providers.StopReasonEndTurn, Usage: &providers.Usage{OutputTokens: 21}},
+		},
+	}
+
+	callCount := 0
+	p := &anthropicPlanner{
+		provider: plannerStreamProviderFunc(func(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error {
+			callCount++
+			if callCount < 4 {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return completionMock.StreamWithHandler(ctx, req, handler)
+		}),
+		maxTokens:      testMaxOutputTokens,
+		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
+		system:         "test system",
+		timeout:        5 * time.Millisecond,
+		logger:         slog.Default(),
+	}
+
+	resp, err := p.CompleteForToolLoop(context.Background(), &providers.Request{
+		Messages:  []providers.Message{{Role: providers.RoleUser, Content: "plan it"}},
+		MaxTokens: 256,
+	}, "planning_protocol", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Content != "tool loop response" {
+		t.Fatalf("response = %#v, want content %q", resp, "tool loop response")
+	}
+	if callCount != 4 {
+		t.Fatalf("callCount = %d, want 4 (3 expired children + final success)", callCount)
+	}
+}
+
+func TestPlannerRequestLease_MaxRefreshes_DerivesFromParentDeadline(t *testing.T) {
+	parent, cancel := context.WithDeadline(context.Background(), time.Now().Add(45*time.Second))
+	defer cancel()
+
+	lease := newPlannerRequestLease(parent, nil, "planning_protocol")
+	if got := lease.maxRefreshes(10 * time.Second); got != 2 {
+		t.Fatalf("maxRefreshes = %d, want 2", got)
 	}
 }
 

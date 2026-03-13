@@ -39,6 +39,9 @@ func routeHopsFromContext(ctx context.Context) int {
 func (a *Architect) registerPendingBusWait(correlationID string) <-chan *guide.Message {
 	ch := make(chan *guide.Message, 1)
 	a.pendingMu.Lock()
+	if a.pendingBus == nil {
+		a.pendingBus = make(map[string]chan *guide.Message)
+	}
 	pendingCount := len(a.pendingBus)
 	a.pendingBus[correlationID] = ch
 	a.pendingMu.Unlock()
@@ -149,30 +152,48 @@ func (a *Architect) requestRouteSync(ctx context.Context, req *guide.RouteReques
 		"correlation_id", req.CorrelationID,
 		"publish_elapsed", time.Since(publishStart).String())
 
-	ctx, cancel := context.WithTimeout(ctx, routeSyncTimeout)
-	defer cancel()
-
+	var response *guide.Message
 	blockStart := time.Now()
-	select {
-	case <-ctx.Done():
+	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+		AttemptTimeout: routeSyncTimeout,
+		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
+		OnRefresh: func(info shared.ContextLeaseRefresh) {
+			a.logInfo("requestRouteSync: lease refreshed",
+				"target", req.TargetAgentID,
+				"correlation_id", req.CorrelationID,
+				"refresh_count", info.RefreshCount,
+				"attempt_timeout", info.AttemptTimeout.String(),
+				"error", info.Error)
+		},
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case response = <-waitCh:
+			return nil
+		}
+	})
+	if err != nil {
 		elapsed := time.Since(blockStart)
 		a.logWarn("requestRouteSync: TIMED OUT",
 			"target", req.TargetAgentID,
 			"correlation_id", req.CorrelationID,
 			"blocked_for", elapsed.String(),
 			"timeout", routeSyncTimeout.String(),
-			"ctx_err", ctx.Err())
-		return nil, fmt.Errorf("route request to %q timed out after %s: %w",
-			req.TargetAgentID, routeSyncTimeout, ctx.Err())
-	case response := <-waitCh:
-		elapsed := time.Since(blockStart)
-		a.logInfo("requestRouteSync: RESPONSE RECEIVED",
-			"target", req.TargetAgentID,
-			"correlation_id", req.CorrelationID,
-			"blocked_for", elapsed.String(),
-			"response_type", string(response.Type))
-		return response, nil
+			"ctx_err", err)
+		return nil, shared.WrapLeaseTimeoutError(
+			fmt.Sprintf("route request to %q", req.TargetAgentID),
+			routeSyncTimeout,
+			err,
+		)
 	}
+	elapsed := time.Since(blockStart)
+	a.logInfo("requestRouteSync: RESPONSE RECEIVED",
+		"target", req.TargetAgentID,
+		"correlation_id", req.CorrelationID,
+		"blocked_for", elapsed.String(),
+		"response_type", string(response.Type))
+	return response, nil
 }
 
 func (a *Architect) publishRouteRequest(req *guide.RouteRequest) error {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -614,18 +615,31 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	systemPrompt := d.config.SystemPrompt
 	userMessage := fwd.Input
-	if task := shared.DecodePipelineTaskInput(fwd.Input); task != nil {
-		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, task)
+	task := shared.DecodePipelineTaskInput(fwd.Input)
+	contract := (*shared.TaskExecutionContract)(nil)
+	if task != nil {
+		contract = shared.BuildTaskExecutionContract(task)
 		userMessage = shared.ComposePipelineTaskUserPrompt(task)
 		if workspaceContext := shared.BuildTaskWorkspaceRuntimeContext(ctx, d.workspaceViews, task); workspaceContext != "" {
 			userMessage += "\n\n" + workspaceContext
 		}
 	}
+	systemPrompt := d.systemPromptForContract(contract)
+	if task != nil {
+		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, task)
+	}
+	systemPrompt = shared.AppendTaskExecutionGuidance(systemPrompt, contract, "designer")
 
 	d.prepareSkillsForInput(userMessage)
-	toolDefs := d.buildToolDefinitions()
+	surface, err := shared.TaskToolSurface(d.toolRuntime(), contract, "designer")
+	if err != nil {
+		d.logger.Warn("build task tool surface", "error", err)
+		surface = d.toolRuntime()
+	}
+	ctx = shared.WithTaskExecutionContract(ctx, contract)
+	ctx = shared.WithTaskExecutionState(ctx, shared.NewTaskExecutionState())
+	toolDefs := d.buildToolDefinitionsWithSurface(surface)
 
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
@@ -651,7 +665,7 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return d.executeToolLoop(ctx, req, ledger)
+		return d.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -671,6 +685,16 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		"input_tokens":  inTok,
 		"output_tokens": outTok,
 	}, nil
+}
+
+func (d *Designer) systemPromptForContract(contract *shared.TaskExecutionContract) string {
+	if contract == nil {
+		return d.config.SystemPrompt
+	}
+	if strings.TrimSpace(d.config.SystemPrompt) == "" || d.config.SystemPrompt == DesignerSystemPrompt() {
+		return DesignerSystemPromptForContract(contract)
+	}
+	return d.config.SystemPrompt
 }
 
 func (d *Designer) handleBusResponse(msg *guide.Message) error {

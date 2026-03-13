@@ -2,8 +2,10 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,5 +189,124 @@ func TestCoordinationService_ValidateWorkerCompletion(t *testing.T) {
 
 	if err := svc.ValidateWorkerCompletion(ctx, "task-4", "tester-pipeline", "tester-1"); err != nil {
 		t.Fatalf("ValidateWorkerCompletion(after coordination): %v", err)
+	}
+}
+
+func TestCoordinationService_PublishArtifactConcurrentVersionAllocation(t *testing.T) {
+	svc := newCoordinationTestService(t)
+	ctx := context.Background()
+	actor := coordination.Actor{AgentID: "tester-1", AgentType: "tester-pipeline"}
+	const publishCount = 12
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+	for i := 0; i < publishCount; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.PublishArtifact(ctx, actor, coordination.PublishArtifactInput{
+				TaskID:         "task-concurrent-publish",
+				TaskName:       "Concurrent Publish",
+				Kind:           "verification_result",
+				Summary:        fmt.Sprintf("artifact-%d", i),
+				ScopeKind:      coordination.ScopeKindTestSurface,
+				ScopeKey:       "tests/test_cli.py",
+				IdempotencyKey: fmt.Sprintf("publish-%d", i),
+			})
+			if err == nil {
+				return
+			}
+			mu.Lock()
+			errs = append(errs, err)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(errs) > 0 {
+		t.Fatalf("PublishArtifact concurrent errors = %v", errs)
+	}
+
+	artifacts, err := svc.listArtifacts(ctx, "task-concurrent-publish", true)
+	if err != nil {
+		t.Fatalf("listArtifacts: %v", err)
+	}
+	if len(artifacts) != publishCount {
+		t.Fatalf("artifact count = %d, want %d", len(artifacts), publishCount)
+	}
+
+	seenVersions := make(map[int]struct{}, publishCount)
+	for _, artifact := range artifacts {
+		if artifact.Version < 1 || artifact.Version > publishCount {
+			t.Fatalf("artifact version = %d, want within [1,%d]", artifact.Version, publishCount)
+		}
+		if _, exists := seenVersions[artifact.Version]; exists {
+			t.Fatalf("duplicate artifact version detected: %d", artifact.Version)
+		}
+		seenVersions[artifact.Version] = struct{}{}
+	}
+}
+
+func TestCoordinationService_PublishArtifactConcurrentIdempotentRetryCollapses(t *testing.T) {
+	svc := newCoordinationTestService(t)
+	ctx := context.Background()
+	actor := coordination.Actor{AgentID: "tester-1", AgentType: "tester-pipeline"}
+	const publishAttempts = 8
+
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		errs      []error
+		artifacts []*coordination.Artifact
+	)
+	for i := 0; i < publishAttempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			artifact, err := svc.PublishArtifact(ctx, actor, coordination.PublishArtifactInput{
+				TaskID:         "task-idempotent-publish",
+				TaskName:       "Idempotent Publish",
+				Kind:           "verification_result",
+				Summary:        "stable publish result",
+				ScopeKind:      coordination.ScopeKindTestSurface,
+				ScopeKey:       "tests/test_cli.py",
+				IdempotencyKey: "same-publish",
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			artifacts = append(artifacts, artifact)
+		}()
+	}
+	wg.Wait()
+	if len(errs) > 0 {
+		t.Fatalf("PublishArtifact idempotent errors = %v", errs)
+	}
+	if len(artifacts) != publishAttempts {
+		t.Fatalf("artifact results = %d, want %d", len(artifacts), publishAttempts)
+	}
+
+	first := artifacts[0]
+	for _, artifact := range artifacts[1:] {
+		if artifact.ID != first.ID {
+			t.Fatalf("artifact IDs = %q and %q, want same persisted artifact", first.ID, artifact.ID)
+		}
+		if artifact.Version != first.Version {
+			t.Fatalf("artifact versions = %d and %d, want same persisted artifact", first.Version, artifact.Version)
+		}
+	}
+
+	persisted, err := svc.listArtifacts(ctx, "task-idempotent-publish", true)
+	if err != nil {
+		t.Fatalf("listArtifacts: %v", err)
+	}
+	if len(persisted) != 1 {
+		t.Fatalf("persisted artifact count = %d, want 1", len(persisted))
 	}
 }

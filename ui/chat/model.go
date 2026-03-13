@@ -19,6 +19,9 @@ const highlightDuration = 2 * time.Second
 // thinkingRotateInterval is how often the fun thinking message rotates.
 const thinkingRotateInterval = 3 * time.Second
 
+// thinkingFrameInterval controls spinner frame advancement for all thinking rows.
+const thinkingFrameInterval = 100 * time.Millisecond
+
 // thinkingProgressMinInterval limits immediate UI updates from progress messages.
 // Decor ticks still animate every 100ms; this only dampens bursty progress input.
 const thinkingProgressMinInterval = 250 * time.Millisecond
@@ -162,14 +165,20 @@ var agentThinkingMessages = map[string][]string{
 
 // thinkingMessagesForAgent returns the agent-specific message list, falling
 // back to the generic list. Agent IDs like "architect_abc123" are matched by
-// prefix against the map keys.
+// prefix against the map keys. Pipeline agent IDs like "task_x:inspector" are
+// reduced to their agent suffix before lookup.
 func thinkingMessagesForAgent(agentID string) []string {
 	if agentID == "" {
 		return thinkingMessages[:]
 	}
 	// Exact match first, then prefix match (agent IDs often have suffixes).
-	if msgs, ok := agentThinkingMessages[agentID]; ok {
+	if msgs, ok := lookupThinkingMessages(agentID); ok {
 		return msgs
+	}
+	if _, agentPart, ok := splitPipelineBadgeIdentity(agentID); ok {
+		if msgs, ok := lookupThinkingMessages(agentPart); ok {
+			return msgs
+		}
 	}
 	for prefix, msgs := range agentThinkingMessages {
 		if strings.HasPrefix(agentID, prefix) {
@@ -179,17 +188,33 @@ func thinkingMessagesForAgent(agentID string) []string {
 	return thinkingMessages[:]
 }
 
+func lookupThinkingMessages(agentID string) ([]string, bool) {
+	if msgs, ok := agentThinkingMessages[agentID]; ok {
+		return msgs, true
+	}
+	trimmed := strings.TrimSuffix(agentID, "-pipeline")
+	if trimmed != agentID {
+		if msgs, ok := agentThinkingMessages[trimmed]; ok {
+			return msgs, true
+		}
+	}
+	return nil, false
+}
+
 // streamSlot tracks per-stream accumulation state. Multiple slots can be
 // active concurrently when several agents stream in parallel (e.g. architect
 // and orchestrator).
 type streamSlot struct {
-	accumulator  *StreamAccumulator
-	agentID      string
-	thinkingIdx  int                // History index of thinking placeholder for this stream.
-	renderState  *streamRenderState // Incremental render state for this stream.
-	planID       string             // Plan ID embedded in this stream, if any.
-	planMarkdown string             // Rendered plan markdown for this stream.
-	planOffset   int                // Accumulator content length when plan was injected.
+	accumulator     *StreamAccumulator
+	agentID         string
+	thinkingIdx     int                // History index of thinking placeholder for this stream.
+	thinkingStart   time.Time          // When this stream's thinking phase began.
+	retryText       string             // Progress override shown instead of fun messages.
+	lastProgressSet time.Time          // Last immediate progress text write time.
+	renderState     *streamRenderState // Incremental render state for this stream.
+	planID          string             // Plan ID embedded in this stream, if any.
+	planMarkdown    string             // Rendered plan markdown for this stream.
+	planOffset      int                // Accumulator content length when plan was injected.
 }
 
 // Model is the Bubble Tea model for the chat panel.
@@ -210,11 +235,8 @@ type Model struct {
 
 	// Thinking animation state (active between prompt submit and first content).
 	thinkingIdx      int             // History index of thinking placeholder (-1 = inactive).
-	thinkingFrame    int             // Current spinner frame index.
-	thinkingMsgIdx   int             // Current fun message index.
 	thinkingAgentID  string          // Agent currently thinking (for agent-specific messages).
 	thinkingStart    time.Time       // When current thinking phase began.
-	thinkingRotateAt time.Time       // Next message rotation time.
 	retryText        string          // Retry/model-fallback status (replaces fun messages when set).
 	thinkingGradient *theme.Gradient // Color gradient cycled during thinking animation.
 	lastProgressSet  time.Time       // Last immediate progress text write time.
@@ -444,52 +466,31 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		"agent_id", start.AgentID,
 		"active_streams", len(m.streams),
 		"thinking_idx", m.thinkingIdx)
+	now := time.Now()
 
-	// Retry path: provider retried an existing stream. Reset the slot's
-	// accumulator and render state instead of creating a new entry.
 	if slot, ok := m.streams[cid]; ok && slot.accumulator != nil {
-		slot.accumulator.Replace("")
-		slot.planOffset = 0
-		slot.renderState = &streamRenderState{}
-		m.streamRenderPending = false
-		m.syncSlotToEntry(slot)
-		m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
-		m.viewDirty = true
+		m.refreshExistingStreamSlot(slot, start)
 		return nil
 	}
 
 	// Reuse existing thinking placeholder for the first stream only.
 	if m.thinkingIdx >= 0 && len(m.streams) == 0 {
 		idx := m.thinkingIdx
-		if start.AgentID != "" {
-			m.thinkingAgentID = start.AgentID
-		}
-		m.history.mu.Lock()
-		if idx >= 0 && idx < m.history.count {
-			physical := m.history.logicalToPhysical(idx)
-			if start.AgentID != "" {
-				m.history.entries[physical].AgentType = start.AgentID
-			}
-			m.history.entries[physical].CorrelationID = cid
-			m.history.entries[physical].SessionID = start.SessionID
-			m.history.entries[physical].TaskID = strings.TrimSpace(start.TaskID)
-			m.history.entries[physical].TaskName = strings.TrimSpace(start.TaskName)
-			m.history.entries[physical].TaskSlug = strings.TrimSpace(start.TaskSlug)
-		}
-		m.history.mu.Unlock()
 		slot := &streamSlot{
 			accumulator: NewStreamAccumulator(idx),
 			agentID:     start.AgentID,
 			thinkingIdx: idx,
 			renderState: &streamRenderState{},
 		}
+		m.updateStreamEntryMetadata(idx, start)
+		m.adoptGlobalThinkingState(now, slot)
 		m.streams[cid] = slot
+		m.clearThinkingState()
 		m.viewDirty = true
 		return nil
 	}
 
 	// New concurrent stream or no thinking placeholder — create a new entry.
-	now := time.Now()
 	entry := &ChatEntry{
 		ID:             uuid.New().String(),
 		Timestamp:      now,
@@ -505,7 +506,7 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		Height:         -1,
 		Streaming:      true,
 		ThinkingText:   spinnerFrames[0] + "  0.0s",
-		ThinkingStatus: thinkingMessages[0],
+		ThinkingStatus: thinkingMessagesForAgent(start.AgentID)[0],
 	}
 	willEvict := m.history.Full()
 	m.history.Push(entry)
@@ -522,11 +523,8 @@ func (m *Model) handleStreamStart(start msg.StreamStartMsg) tea.Cmd {
 		thinkingIdx: idx,
 		renderState: &streamRenderState{},
 	}
+	m.startSlotThinkingAnimation(now, slot)
 	m.streams[cid] = slot
-	// Only start the global thinking animation for the first stream.
-	if len(m.streams) == 1 {
-		m.startThinkingAnimation(now, idx)
-	}
 	return nil
 }
 
@@ -555,8 +553,13 @@ func (m *Model) handleStreamChunk(chunk msg.StreamChunkMsg) tea.Cmd {
 }
 
 func (m *Model) handleStreamProgress(progress msg.StreamProgressMsg) tea.Cmd {
-	m.updateThinkingAgent(progress.AgentID)
 	message := sanitizeThinkingMessage(progress.Message)
+	if slot := m.streamSlot(progress.CorrelationID); slot != nil {
+		m.updateSlotThinkingAgent(slot, progress.AgentID)
+		m.applySlotProgress(slot, message)
+		return nil
+	}
+	m.updateThinkingAgent(progress.AgentID)
 	if message == "" {
 		return nil
 	}
@@ -596,13 +599,7 @@ func (m *Model) handleStreamComplete(done msg.StreamCompleteMsg) tea.Cmd {
 	// Remove this slot's stream state from the viewport.
 	m.viewport.RemoveStreamState(slot.accumulator.EntryIndex())
 
-	// Resolve thinking for this slot's entry if it holds the global thinking index.
-	if m.thinkingIdx >= 0 && slot.thinkingIdx == m.thinkingIdx {
-		chatDebugLog().Info("chat.handleStreamComplete: RESOLVING_THINKING",
-			"correlation_id", cid,
-			"thinking_idx", m.thinkingIdx)
-		m.resolveThinkingEntry()
-	}
+	m.resolveSlotThinkingEntry(slot)
 
 	if done.AuthoritativeText != "" {
 		slot.accumulator.Replace(done.AuthoritativeText)
@@ -634,6 +631,7 @@ func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 	// Clean up the specific slot if it exists.
 	if slot, ok := m.streams[errMsg.CorrelationID]; ok && slot.accumulator != nil {
 		m.viewport.RemoveStreamState(slot.accumulator.EntryIndex())
+		m.resolveSlotThinkingEntry(slot)
 		slot.accumulator.Complete()
 		m.finalizeSlotStream(slot)
 		delete(m.streams, errMsg.CorrelationID)
@@ -643,7 +641,7 @@ func (m *Model) handleStreamError(errMsg msg.StreamErrorMsg) tea.Cmd {
 		m.viewport.ClearAllStreamStates()
 	}
 	if m.thinkingIdx >= 0 && len(m.streams) == 0 {
-		m.clearThinkingState()
+		m.resolveThinkingEntry()
 	}
 
 	errEntry := &ChatEntry{
@@ -681,9 +679,14 @@ func (m *Model) handleRetryStatus(retry msg.RetryStatusMsg) tea.Cmd {
 	m.PushEntry(errEntry)
 
 	// Also update the thinking spinner so it reflects the retry state.
+	delayStr := formatRetryDelay(retry.Delay)
+	message := sanitizeThinkingMessage(fmt.Sprintf("retrying (%d/%d) in %s...", retry.Attempt, retry.MaxAttempts, delayStr))
+	if slot := m.streamSlot(retry.CorrelationID); slot != nil {
+		m.applySlotProgress(slot, message)
+		return nil
+	}
 	if m.thinkingIdx >= 0 {
-		delayStr := formatRetryDelay(retry.Delay)
-		m.retryText = sanitizeThinkingMessage(fmt.Sprintf("retrying (%d/%d) in %s...", retry.Attempt, retry.MaxAttempts, delayStr))
+		m.retryText = message
 	}
 	return nil
 }
@@ -792,18 +795,39 @@ func (m *Model) historyIndexForCorrelation(correlationID string) int {
 	return -1
 }
 
-// activeStreamingIndex returns the history index of the entry currently receiving
-// streaming content. Checks active stream slots first, then the thinking placeholder.
-func (m *Model) activeStreamingIndex() int {
+// activeStreamingIndices returns the history indices of entries currently
+// receiving streaming content or tool-call activity.
+func (m *Model) activeStreamingIndices() []int {
+	indices := make([]int, 0, len(m.streams)+1)
 	for _, slot := range m.streams {
 		if slot.accumulator != nil {
-			return slot.accumulator.EntryIndex()
+			indices = append(indices, slot.accumulator.EntryIndex())
 		}
 	}
-	if m.thinkingIdx >= 0 {
-		return m.thinkingIdx
+	if len(indices) == 0 && m.thinkingIdx >= 0 {
+		indices = append(indices, m.thinkingIdx)
 	}
-	return -1
+	return indices
+}
+
+func (m *Model) invalidateEntryToolCalls(idx int) bool {
+	hasActive := false
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		for i := range e.ToolCalls {
+			if !e.ToolCalls[i].Completed {
+				hasActive = true
+				break
+			}
+		}
+		if !hasActive {
+			return
+		}
+		e.RenderedLines = nil
+		e.CodeRegions = nil
+		e.ToolCallRegions = nil
+		e.Height = -1
+	})
+	return hasActive
 }
 
 // handleKey processes keyboard input when the chat panel is focused.
@@ -1121,25 +1145,12 @@ func (m *Model) handleDecorTick(now time.Time) {
 // tickActiveToolCalls invalidates the render cache for entries with in-progress
 // tool calls so the live elapsed timer updates on each DecorTick.
 func (m *Model) tickActiveToolCalls() {
-	idx := m.activeStreamingIndex()
-	if idx < 0 {
-		return
-	}
 	hasActive := false
-	m.history.UpdateAt(idx, func(e *ChatEntry) {
-		for i := range e.ToolCalls {
-			if !e.ToolCalls[i].Completed {
-				hasActive = true
-				break
-			}
+	for _, idx := range m.activeStreamingIndices() {
+		if m.invalidateEntryToolCalls(idx) {
+			hasActive = true
 		}
-		if hasActive {
-			e.RenderedLines = nil
-			e.CodeRegions = nil
-			e.ToolCallRegions = nil
-			e.Height = -1
-		}
-	})
+	}
 	if hasActive {
 		m.viewDirty = true
 	}
@@ -1167,48 +1178,21 @@ func (m *Model) flushStreamRender() {
 // tickThinking advances the thinking spinner and rotates the fun message.
 // Active whenever a thinking placeholder exists (streaming or non-streaming).
 func (m *Model) tickThinking(now time.Time) {
-	if m.thinkingIdx < 0 || m.thinkingStart.IsZero() {
-		return
+	updated := false
+	if m.renderThinkingEntry(m.thinkingIdx, m.thinkingAgentID, m.retryText, m.thinkingStart, now) {
+		updated = true
 	}
-
-	// Advance spinner frame.
-	m.thinkingFrame = (m.thinkingFrame + 1) % len(spinnerFrames)
-
-	// Rotate message every thinkingRotateInterval.
-	msgs := thinkingMessagesForAgent(m.thinkingAgentID)
-	if !now.Before(m.thinkingRotateAt) {
-		m.thinkingMsgIdx = (m.thinkingMsgIdx + 1) % len(msgs)
-		m.thinkingRotateAt = now.Add(thinkingRotateInterval)
+	for _, slot := range m.streams {
+		if slot == nil {
+			continue
+		}
+		if m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, now) {
+			updated = true
+		}
 	}
-
-	elapsed := now.Sub(m.thinkingStart).Seconds()
-	var status string
-	if m.retryText != "" {
-		status = m.retryText
-	} else {
-		status = msgs[m.thinkingMsgIdx%len(msgs)]
+	if updated {
+		m.viewDirty = true
 	}
-	text := fmt.Sprintf("%s  %.1fs",
-		spinnerFrames[m.thinkingFrame],
-		elapsed,
-	)
-
-	// Sample gradient color for this tick.
-	gradientColor := string(m.thinkingGradient.Sample(now.Sub(m.thinkingStart)))
-
-	idx := m.thinkingIdx
-	m.history.mu.Lock()
-	if idx >= 0 && idx < m.history.count {
-		physical := m.history.logicalToPhysical(idx)
-		m.history.entries[physical].ThinkingText = text
-		m.history.entries[physical].ThinkingStatus = status
-		m.history.entries[physical].ThinkingColor = gradientColor
-		m.history.entries[physical].RenderedLines = nil
-		m.history.entries[physical].CodeRegions = nil
-		m.history.entries[physical].Height = -1
-	}
-	m.history.mu.Unlock()
-	m.viewDirty = true
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,7 +1212,7 @@ func (m *Model) BeginThinking(agentType string) {
 		Height:         -1,
 		Streaming:      true,
 		ThinkingText:   spinnerFrames[0] + "  0.0s",
-		ThinkingStatus: thinkingMessages[0],
+		ThinkingStatus: thinkingMessagesForAgent(agentType)[0],
 	}
 	willEvict := m.history.Full()
 	m.history.Push(entry)
@@ -1308,16 +1292,14 @@ func (m *Model) FinishThinking(entry *ChatEntry) {
 func (m *Model) startThinkingAnimation(now time.Time, idx int) {
 	m.thinkingIdx = idx
 	m.thinkingStart = now
-	m.thinkingFrame = 0
-	m.thinkingMsgIdx = 0
-	m.thinkingRotateAt = now.Add(thinkingRotateInterval)
 	m.lastProgressSet = time.Time{}
+	m.retryText = ""
 }
 
 // resolveThinkingEntry transitions the thinking placeholder to content phase,
 // recording the elapsed thinking time.
 func (m *Model) resolveThinkingEntry() {
-	elapsed := time.Since(m.thinkingStart)
+	elapsed := thinkingElapsed(m.thinkingStart, time.Now())
 	idx := m.thinkingIdx
 	m.history.mu.Lock()
 	if idx >= 0 && idx < m.history.count {
@@ -1349,7 +1331,6 @@ func (m *Model) updateThinkingAgent(agentID string) {
 	// progress override so agent-specific rotating messages take over.
 	if agentID != m.thinkingAgentID {
 		m.retryText = ""
-		m.thinkingMsgIdx = 0
 	}
 	m.thinkingAgentID = agentID
 	idx := m.thinkingIdx
@@ -1374,28 +1355,9 @@ func (m *Model) setThinkingTextNow(message string) {
 	if message == "" {
 		return
 	}
-	elapsed := 0.0
-	if !m.thinkingStart.IsZero() {
-		elapsed = time.Since(m.thinkingStart).Seconds()
+	if m.setThinkingEntryNow(m.thinkingIdx, m.thinkingStart, message) {
+		m.viewDirty = true
 	}
-	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[m.thinkingFrame], elapsed)
-	color := string(m.theme.Palette.Info)
-	if m.thinkingGradient != nil {
-		color = string(m.thinkingGradient.Sample(time.Since(m.thinkingStart)))
-	}
-	idx := m.thinkingIdx
-	m.history.mu.Lock()
-	if idx >= 0 && idx < m.history.count {
-		physical := m.history.logicalToPhysical(idx)
-		m.history.entries[physical].ThinkingText = text
-		m.history.entries[physical].ThinkingStatus = message
-		m.history.entries[physical].ThinkingColor = color
-		m.history.entries[physical].RenderedLines = nil
-		m.history.entries[physical].CodeRegions = nil
-		m.history.entries[physical].Height = -1
-	}
-	m.history.mu.Unlock()
-	m.viewDirty = true
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1517,231 @@ func sanitizeThinkingMessage(message string) string {
 		}
 	}
 	return strings.Join(strings.Fields(cleaned.String()), " ")
+}
+
+func (m *Model) refreshExistingStreamSlot(slot *streamSlot, start msg.StreamStartMsg) {
+	if slot == nil || slot.accumulator == nil {
+		return
+	}
+	slot.agentID = start.AgentID
+	m.updateStreamEntryMetadata(slot.accumulator.EntryIndex(), start)
+	if !shouldResetStreamSlot(slot) {
+		m.viewDirty = true
+		return
+	}
+	slot.accumulator.Replace("")
+	slot.planID = ""
+	slot.planMarkdown = ""
+	slot.planOffset = 0
+	slot.renderState = &streamRenderState{}
+	m.startSlotThinkingAnimation(time.Now(), slot)
+	m.streamRenderPending = false
+	m.syncSlotToEntry(slot)
+	if slot.renderState != nil {
+		m.viewport.AddStreamState(slot.accumulator.EntryIndex(), slot.renderState)
+	}
+	m.renderThinkingEntry(slot.thinkingIdx, slot.agentID, slot.retryText, slot.thinkingStart, slot.thinkingStart)
+	m.viewDirty = true
+}
+
+func shouldResetStreamSlot(slot *streamSlot) bool {
+	if slot == nil || slot.accumulator == nil {
+		return false
+	}
+	return slot.accumulator.Content() != "" || slot.planMarkdown != ""
+}
+
+func (m *Model) adoptGlobalThinkingState(now time.Time, slot *streamSlot) {
+	if slot == nil {
+		return
+	}
+	if m.thinkingStart.IsZero() {
+		m.startSlotThinkingAnimation(now, slot)
+		return
+	}
+	slot.thinkingStart = m.thinkingStart
+	slot.retryText = m.retryText
+	slot.lastProgressSet = m.lastProgressSet
+}
+
+func (m *Model) startSlotThinkingAnimation(now time.Time, slot *streamSlot) {
+	if slot == nil {
+		return
+	}
+	slot.thinkingStart = now
+	slot.retryText = ""
+	slot.lastProgressSet = time.Time{}
+}
+
+func (m *Model) streamSlot(correlationID string) *streamSlot {
+	if correlationID == "" {
+		return nil
+	}
+	if slot, ok := m.streams[correlationID]; ok {
+		return slot
+	}
+	return nil
+}
+
+func (m *Model) applySlotProgress(slot *streamSlot, message string) {
+	if slot == nil || slot.thinkingIdx < 0 || message == "" {
+		return
+	}
+	if message == slot.retryText {
+		return
+	}
+	slot.retryText = message
+	now := time.Now()
+	if slot.lastProgressSet.IsZero() || now.Sub(slot.lastProgressSet) >= thinkingProgressMinInterval {
+		slot.lastProgressSet = now
+		if m.setSlotThinkingTextNow(slot, message) {
+			m.viewDirty = true
+		}
+	}
+}
+
+func (m *Model) updateSlotThinkingAgent(slot *streamSlot, agentID string) {
+	agentID = strings.TrimSpace(agentID)
+	if slot == nil || agentID == "" || slot.thinkingIdx < 0 {
+		return
+	}
+	if agentID != slot.agentID {
+		slot.retryText = ""
+	}
+	slot.agentID = agentID
+	m.history.UpdateAt(slot.thinkingIdx, func(entry *ChatEntry) {
+		entry.AgentType = agentID
+		entry.AgentID = agentID
+		entry.RenderedLines = nil
+		entry.CodeRegions = nil
+		entry.Height = -1
+	})
+	m.viewDirty = true
+}
+
+func (m *Model) setSlotThinkingTextNow(slot *streamSlot, message string) bool {
+	if slot == nil {
+		return false
+	}
+	return m.setThinkingEntryNow(slot.thinkingIdx, slot.thinkingStart, message)
+}
+
+func (m *Model) resolveSlotThinkingEntry(slot *streamSlot) {
+	if slot == nil {
+		return
+	}
+	elapsed := thinkingElapsed(slot.thinkingStart, time.Now())
+	idx := slot.thinkingIdx
+	m.history.mu.Lock()
+	if idx >= 0 && idx < m.history.count {
+		physical := m.history.logicalToPhysical(idx)
+		m.history.entries[physical].ThinkingElapsed = elapsed
+		m.history.entries[physical].ThinkingText = ""
+		m.history.entries[physical].ThinkingStatus = ""
+		m.history.entries[physical].ThinkingColor = ""
+	}
+	m.history.mu.Unlock()
+	slot.thinkingStart = time.Time{}
+	slot.retryText = ""
+	slot.lastProgressSet = time.Time{}
+}
+
+func (m *Model) renderThinkingEntry(idx int, agentID, retryText string, start, now time.Time) bool {
+	if idx < 0 || start.IsZero() {
+		return false
+	}
+	elapsed := thinkingElapsed(start, now)
+	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	return m.writeThinkingEntry(idx, text, thinkingStatusFor(agentID, retryText, elapsed), m.thinkingColorFor(elapsed))
+}
+
+func (m *Model) setThinkingEntryNow(idx int, start time.Time, message string) bool {
+	message = sanitizeThinkingMessage(message)
+	if idx < 0 || message == "" {
+		return false
+	}
+	now := time.Now()
+	elapsed := thinkingElapsed(start, now)
+	text := fmt.Sprintf("%s  %.1fs", spinnerFrames[thinkingFrameAt(elapsed)], elapsed.Seconds())
+	return m.writeThinkingEntry(idx, text, message, m.thinkingColorFor(elapsed))
+}
+
+func (m *Model) writeThinkingEntry(idx int, text, status, color string) bool {
+	wrote := false
+	m.history.mu.Lock()
+	if idx >= 0 && idx < m.history.count {
+		physical := m.history.logicalToPhysical(idx)
+		m.history.entries[physical].ThinkingText = text
+		m.history.entries[physical].ThinkingStatus = status
+		m.history.entries[physical].ThinkingColor = color
+		m.history.entries[physical].RenderedLines = nil
+		m.history.entries[physical].CodeRegions = nil
+		m.history.entries[physical].Height = -1
+		wrote = true
+	}
+	m.history.mu.Unlock()
+	return wrote
+}
+
+func (m *Model) thinkingColorFor(elapsed time.Duration) string {
+	if m.thinkingGradient == nil {
+		return string(m.theme.Palette.Info)
+	}
+	return string(m.thinkingGradient.Sample(elapsed))
+}
+
+func thinkingElapsed(start, now time.Time) time.Duration {
+	if start.IsZero() || now.Before(start) {
+		return 0
+	}
+	return now.Sub(start)
+}
+
+func thinkingFrameAt(elapsed time.Duration) int {
+	if len(spinnerFrames) == 0 {
+		return 0
+	}
+	steps := int(elapsed / thinkingFrameInterval)
+	if steps < 0 {
+		steps = 0
+	}
+	return steps % len(spinnerFrames)
+}
+
+func thinkingStatusFor(agentID, retryText string, elapsed time.Duration) string {
+	if retryText != "" {
+		return retryText
+	}
+	msgs := thinkingMessagesForAgent(agentID)
+	if len(msgs) == 0 {
+		return ""
+	}
+	idx := int(elapsed / thinkingRotateInterval)
+	if idx < 0 {
+		idx = 0
+	}
+	return msgs[idx%len(msgs)]
+}
+
+func (m *Model) updateStreamEntryMetadata(idx int, start msg.StreamStartMsg) {
+	m.history.mu.Lock()
+	if idx >= 0 && idx < m.history.count {
+		physical := m.history.logicalToPhysical(idx)
+		entry := &m.history.entries[physical]
+		if start.AgentID != "" {
+			entry.AgentType = start.AgentID
+			entry.AgentID = start.AgentID
+		}
+		entry.CorrelationID = start.CorrelationID
+		entry.SessionID = start.SessionID
+		entry.TaskID = strings.TrimSpace(start.TaskID)
+		entry.TaskName = strings.TrimSpace(start.TaskName)
+		entry.TaskSlug = strings.TrimSpace(start.TaskSlug)
+		entry.RenderedLines = nil
+		entry.CodeRegions = nil
+		entry.Height = -1
+	}
+	m.history.mu.Unlock()
 }
 
 // composeSlotContent returns the full entry content for a stream slot by

@@ -32,6 +32,7 @@ type SessionEventMsg struct {
 // TokenUsageMsg carries token deltas from an LLM response activity event.
 // Published by the TokenUsageBridge for every EventTypeLLMResponse on the bus.
 type TokenUsageMsg struct {
+	CorrelationID    string
 	InputTokens      int
 	OutputTokens     int
 	CacheReadTokens  int

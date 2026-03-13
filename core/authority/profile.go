@@ -187,6 +187,15 @@ type restrictedFileAccess struct {
 	delegate versioning.FileAccess
 }
 
+type visiblePathDelegate interface {
+	RegisterVisiblePath(path string)
+	VisiblePaths(root string) []string
+}
+
+type modificationDelegate interface {
+	Modifications() []versioning.FileModification
+}
+
 func (r restrictedFileAccess) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if !r.profile.AllowsFileReads() {
 		return nil, versioning.ErrPermissionDenied
@@ -263,6 +272,39 @@ func (r restrictedFileAccess) WorkingDir() string {
 
 func (r restrictedFileAccess) IsReadOnly() bool {
 	return !r.allowsWrites() || r.delegate.IsReadOnly()
+}
+
+func (r restrictedFileAccess) RegisterVisiblePath(path string) {
+	if !r.allowsWrites() {
+		return
+	}
+	delegate, ok := r.delegate.(visiblePathDelegate)
+	if !ok {
+		return
+	}
+	delegate.RegisterVisiblePath(path)
+}
+
+func (r restrictedFileAccess) VisiblePaths(root string) []string {
+	if !r.profile.AllowsFileReads() {
+		return nil
+	}
+	delegate, ok := r.delegate.(visiblePathDelegate)
+	if !ok {
+		return nil
+	}
+	return delegate.VisiblePaths(root)
+}
+
+func (r restrictedFileAccess) Modifications() []versioning.FileModification {
+	if !r.profile.AllowsFileReads() {
+		return nil
+	}
+	delegate, ok := r.delegate.(modificationDelegate)
+	if !ok {
+		return nil
+	}
+	return delegate.Modifications()
 }
 
 func (r restrictedFileAccess) allowsWrites() bool {

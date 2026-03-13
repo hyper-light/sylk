@@ -116,6 +116,90 @@ func TestStreamProgressSanitizesThinkingMessage(t *testing.T) {
 	}
 }
 
+func TestConcurrentStreamThinkingAnimatesSecondaryPipelineEntry(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+	m.BeginThinking("architect")
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "architect",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "c2",
+		AgentID:       "task_auth_checkout:inspector-pipeline",
+	})
+	m = comp.(*Model)
+
+	last := m.history.Last()
+	if last == nil {
+		t.Fatal("expected concurrent stream entry")
+	}
+	initialText := last.ThinkingText
+	wantStatus := agentThinkingMessages["inspector"][0]
+	if last.ThinkingStatus != wantStatus {
+		t.Fatalf("initial thinking status = %q, want %q", last.ThinkingStatus, wantStatus)
+	}
+
+	comp, _ = m.Update(msg.DecorTickMsg{Time: time.Now().Add(400 * time.Millisecond)})
+	m = comp.(*Model)
+
+	last = m.history.Last()
+	if last == nil {
+		t.Fatal("expected concurrent stream entry after tick")
+	}
+	if last.ThinkingText == initialText {
+		t.Fatalf("expected secondary stream thinking text to animate, got %q", last.ThinkingText)
+	}
+}
+
+func TestDuplicateStartDoesNotResetProgressOnlyStreamSlot(t *testing.T) {
+	m := New(theme.DefaultDark(), 16)
+
+	comp, _ := m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "inspector",
+	})
+	m = comp.(*Model)
+
+	comp, _ = m.Update(msg.StreamProgressMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "inspector",
+		Message:       "Reviewing carefully...",
+	})
+	m = comp.(*Model)
+
+	before := m.history.Last()
+	if before == nil {
+		t.Fatal("expected streaming entry")
+	}
+	beforeText := before.ThinkingText
+	beforeStatus := before.ThinkingStatus
+
+	comp, _ = m.Update(msg.StreamStartMsg{
+		SessionID:     "s1",
+		CorrelationID: "c1",
+		AgentID:       "inspector",
+	})
+	m = comp.(*Model)
+
+	after := m.history.Last()
+	if after == nil {
+		t.Fatal("expected streaming entry after duplicate start")
+	}
+	if after.ThinkingStatus != beforeStatus {
+		t.Fatalf("thinking status = %q, want %q", after.ThinkingStatus, beforeStatus)
+	}
+	if after.ThinkingText != beforeText {
+		t.Fatalf("thinking text = %q, want %q", after.ThinkingText, beforeText)
+	}
+}
+
 func TestFormatErrorForChat_BugReportError(t *testing.T) {
 	raw := `planning protocol: architect llm: anthropic stream: received error while streaming: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CYeT1GYt7Kg27RdtV9zeo"} (conversation unavailable: architect planner: anthropic stream: received error while streaming: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CYeSzHBJdCParu7tGNPhn"})`
 	got := formatErrorForChat(errors.New(raw))

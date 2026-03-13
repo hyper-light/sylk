@@ -603,8 +603,16 @@ func monitorExecutionSkill(a *Architect) *skills.Skill {
 			}
 			req := &guide.RouteRequest{
 				Input:         query,
-				TargetAgentID: "orchestrator",
+				TargetAgentID: a.planHandoffTargetAgentID(plan),
 				SessionID:     plan.SessionID,
+			}
+			if req.TargetAgentID == "" {
+				return map[string]any{
+					"status":      "local_fallback",
+					"plan_id":     plan.ID,
+					"plan_status": plan.Status.String(),
+					"error":       "no registered orchestrator agent id is available",
+				}, nil
 			}
 			msg, err := a.requestRouteSync(ctx, req)
 			if err != nil {
@@ -1877,15 +1885,19 @@ func extractAcceptanceResult(
 		UserResponse: payload.UserResponse,
 	}
 
-	data, ok := resp.Data.(map[string]any)
-	if !ok {
+	data := acceptanceResultDataMap(resp.Data)
+	if data == nil {
 		architectDebugLog().Warn("extractAcceptanceResult: DATA_NOT_MAP",
 			"data_type", fmt.Sprintf("%T", resp.Data))
+		out.Result = inferAcceptanceVerdict(payload.UserResponse, nil)
 		return out, nil
 	}
 
-	out.Result = acceptanceResultString(data)
 	out.Modifications = acceptanceModifications(data)
+	out.Result = acceptanceResultString(data)
+	if out.Result == "" {
+		out.Result = inferAcceptanceVerdict(payload.UserResponse, out.Modifications)
+	}
 	architectDebugLog().Info("extractAcceptanceResult: EXTRACTED",
 		"result", out.Result,
 		"modifications_count", len(out.Modifications),
@@ -1905,6 +1917,99 @@ func acceptanceResultString(data map[string]any) string {
 		return ""
 	}
 	return strings.TrimSpace(s)
+}
+
+func acceptanceResultDataMap(raw any) map[string]any {
+	switch value := raw.(type) {
+	case nil:
+		return nil
+	case map[string]any:
+		return value
+	case string:
+		return decodeAcceptanceResultMapString(value)
+	case []byte:
+		return decodeAcceptanceResultMapJSON(value)
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		return decodeAcceptanceResultMapJSON(encoded)
+	}
+}
+
+func decodeAcceptanceResultMapString(raw string) map[string]any {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	if verdict := normalizeAcceptanceVerdict(trimmed); verdict != "" {
+		return map[string]any{"result": verdict}
+	}
+	return decodeAcceptanceResultMapJSON([]byte(trimmed))
+}
+
+func decodeAcceptanceResultMapJSON(raw []byte) map[string]any {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &data); err != nil {
+		return nil
+	}
+	return data
+}
+
+func inferAcceptanceVerdict(userResponse string, modifications []string) string {
+	switch {
+	case isApprovalSignal(userResponse) && len(modifications) == 0:
+		return string(verdictAccept)
+	case isRejectSignal(userResponse):
+		return string(verdictReject)
+	case strings.TrimSpace(userResponse) != "":
+		return string(verdictModify)
+	default:
+		return ""
+	}
+}
+
+func normalizeAcceptanceVerdict(value string) string {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case string(verdictAccept):
+		return string(verdictAccept)
+	case string(verdictModify):
+		return string(verdictModify)
+	case string(verdictReject):
+		return string(verdictReject)
+	default:
+		return ""
+	}
+}
+
+func isRejectSignal(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	switch lower {
+	case "no", "nope", "nah", "reject", "decline", "cancel":
+		return true
+	}
+	for _, phrase := range rejectionPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+var rejectionPhrases = []string{
+	"do not proceed", "don't proceed", "dont proceed",
+	"do not do this", "don't do this", "dont do this",
+	"not approved", "not acceptable", "bad idea",
+	"wrong direction", "scrap this", "drop this plan",
+	"hold off", "not yet", "stop this", "cancel this",
 }
 
 // acceptanceModifications extracts the "modifications" list from the Guide's

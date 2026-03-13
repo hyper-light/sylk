@@ -104,7 +104,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 			return "", err
 		}
 
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",

@@ -3,7 +3,9 @@ package versioning
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -27,14 +29,60 @@ type WorkspaceWriteSkillConfig struct {
 }
 
 type WorkspaceWriteBasis struct {
-	Scope      WorkspaceWriteScope  `json:"scope"`
-	Path       string               `json:"path"`
-	PipelineID string               `json:"pipeline_id,omitempty"`
-	TargetView WorkspaceView        `json:"target_view"`
-	PreparedAt time.Time            `json:"prepared_at"`
-	Disk       WorkspaceLayerState  `json:"disk"`
-	Global     *WorkspaceLayerState `json:"global,omitempty"`
-	Pipeline   *WorkspaceLayerState `json:"pipeline,omitempty"`
+	Scope          WorkspaceWriteScope  `json:"scope"`
+	Path           string               `json:"path"`
+	PipelineID     string               `json:"pipeline_id,omitempty"`
+	TargetView     WorkspaceView        `json:"target_view"`
+	PreparedAt     time.Time            `json:"prepared_at"`
+	LeaseExpiresAt time.Time            `json:"lease_expires_at,omitempty"`
+	Disk           WorkspaceLayerState  `json:"disk"`
+	Global         *WorkspaceLayerState `json:"global,omitempty"`
+	Pipeline       *WorkspaceLayerState `json:"pipeline,omitempty"`
+}
+
+type WorkspaceWriteRepair struct {
+	Refreshed     bool     `json:"refreshed,omitempty"`
+	Rebound       bool     `json:"rebound,omitempty"`
+	OriginalPath  string   `json:"original_path,omitempty"`
+	EffectivePath string   `json:"effective_path,omitempty"`
+	Reasons       []string `json:"reasons,omitempty"`
+}
+
+const defaultWorkspaceWriteLease = 2 * time.Minute
+
+var ErrWorkspaceWriteLeaseExpired = errors.New("workspace write lease expired")
+
+type WorkspaceWriteStaleReason string
+
+const (
+	WorkspaceWriteStaleReasonLeaseExpired    WorkspaceWriteStaleReason = "lease_expired"
+	WorkspaceWriteStaleReasonTargetChanged   WorkspaceWriteStaleReason = "target_changed"
+	WorkspaceWriteStaleReasonReferenceChange WorkspaceWriteStaleReason = "reference_changed"
+)
+
+type WorkspaceWriteStaleError struct {
+	Scope  WorkspaceWriteScope
+	Path   string
+	Reason WorkspaceWriteStaleReason
+	Cause  error
+}
+
+func (e *WorkspaceWriteStaleError) Error() string {
+	if e == nil {
+		return "workspace write basis is stale"
+	}
+	cause := "state changed"
+	if e.Cause != nil {
+		cause = strings.TrimSpace(e.Cause.Error())
+	}
+	return fmt.Sprintf("%s write basis is stale: %s; rerun prepare_%s_write_context", e.Scope, cause, e.Scope)
+}
+
+func (e *WorkspaceWriteStaleError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
 }
 
 type PreparedWorkspaceWriteContext struct {
@@ -78,6 +126,19 @@ type WorkspaceChange struct {
 type overlayModificationReader interface {
 	Modifications() []FileModification
 }
+
+type visiblePathRegistrar interface {
+	RegisterVisiblePath(path string)
+}
+
+type workspaceWriteOperation string
+
+const (
+	workspaceWriteOperationWriteFile       workspaceWriteOperation = "write_file"
+	workspaceWriteOperationEditFile        workspaceWriteOperation = "edit_file"
+	workspaceWriteOperationDeleteFile      workspaceWriteOperation = "delete_file"
+	workspaceWriteOperationCreateDirectory workspaceWriteOperation = "create_directory"
+)
 
 type prepareWriteContextInput struct {
 	Path       string `json:"path"`
@@ -228,6 +289,14 @@ func ValidateWorkspaceWriteBasis(
 	return validateWorkspaceWriteBasis(ctx, views, scope, strings.TrimSpace(path), basis)
 }
 
+func WorkspaceWriteStale(err error) (*WorkspaceWriteStaleError, bool) {
+	var stale *WorkspaceWriteStaleError
+	if !errors.As(err, &stale) || stale == nil {
+		return nil, false
+	}
+	return stale, true
+}
+
 func newPrepareWriteContextSkill(
 	name string,
 	scope WorkspaceWriteScope,
@@ -304,21 +373,25 @@ func newWriteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrit
 			if err := ensureWorkspaceWritesEnabled(cfg, fa); err != nil {
 				return nil, err
 			}
-			if err := validateWorkspaceWriteBasis(ctx, views, scope, path, params.Basis); err != nil {
+			activeBasis, repair, err := resolveWorkspaceMutationBasis(ctx, fa, views, scope, path, params.Basis, workspaceWriteOperationWriteFile)
+			if err != nil {
 				return nil, err
 			}
 			exists, _ := fa.Exists(ctx, path)
 			if err := fa.WriteFile(ctx, path, []byte(params.Content)); err != nil {
 				return nil, fmt.Errorf("failed to write file: %w", err)
 			}
-			return map[string]any{
+			result := map[string]any{
 				"path":    path,
 				"scope":   scope,
 				"action":  fileWriteAction(exists),
 				"bytes":   len(params.Content),
 				"lines":   len(strings.Split(params.Content, "\n")),
 				"success": true,
-			}, nil
+			}
+			attachWorkspaceWriteRepair(result, repair)
+			attachRefreshedWorkspaceWriteBasis(ctx, result, views, scope, path, activeBasis.PipelineID)
+			return result, nil
 		}).
 		Build()
 }
@@ -352,18 +425,22 @@ func newEditFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrite
 			if err := ensureWorkspaceWritesEnabled(cfg, fa); err != nil {
 				return nil, err
 			}
-			if err := validateWorkspaceWriteBasis(ctx, views, scope, path, params.Basis); err != nil {
+			activeBasis, repair, err := resolveWorkspaceMutationBasis(ctx, fa, views, scope, path, params.Basis, workspaceWriteOperationEditFile)
+			if err != nil {
 				return nil, err
 			}
 			if err := fa.EditFile(ctx, path, edits); err != nil {
 				return nil, err
 			}
-			return map[string]any{
+			result := map[string]any{
 				"path":          path,
 				"scope":         scope,
 				"edits_applied": len(edits),
 				"success":       true,
-			}, nil
+			}
+			attachWorkspaceWriteRepair(result, repair)
+			attachRefreshedWorkspaceWriteBasis(ctx, result, views, scope, path, activeBasis.PipelineID)
+			return result, nil
 		}).
 		Build()
 }
@@ -392,17 +469,21 @@ func newDeleteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWri
 			if err := ensureWorkspaceWritesEnabled(cfg, fa); err != nil {
 				return nil, err
 			}
-			if err := validateWorkspaceWriteBasis(ctx, views, scope, path, params.Basis); err != nil {
+			activeBasis, repair, err := resolveWorkspaceMutationBasis(ctx, fa, views, scope, path, params.Basis, workspaceWriteOperationDeleteFile)
+			if err != nil {
 				return nil, err
 			}
 			if err := fa.DeleteFile(ctx, path); err != nil {
 				return nil, err
 			}
-			return map[string]any{
+			result := map[string]any{
 				"path":    path,
 				"scope":   scope,
 				"deleted": true,
-			}, nil
+			}
+			attachWorkspaceWriteRepair(result, repair)
+			attachRefreshedWorkspaceWriteBasis(ctx, result, views, scope, path, activeBasis.PipelineID)
+			return result, nil
 		}).
 		Build()
 }
@@ -431,17 +512,21 @@ func newCreateDirectorySkill(name string, scope WorkspaceWriteScope, cfg Workspa
 			if err := ensureWorkspaceWritesEnabled(cfg, fa); err != nil {
 				return nil, err
 			}
-			if err := validateWorkspaceWriteBasis(ctx, views, scope, path, params.Basis); err != nil {
+			activeBasis, repair, err := resolveWorkspaceMutationBasis(ctx, fa, views, scope, path, params.Basis, workspaceWriteOperationCreateDirectory)
+			if err != nil {
 				return nil, err
 			}
 			if err := fa.MkdirAll(ctx, path); err != nil {
 				return nil, fmt.Errorf("failed to create directory: %w", err)
 			}
-			return map[string]any{
+			result := map[string]any{
 				"path":    path,
 				"scope":   scope,
 				"created": true,
-			}, nil
+			}
+			attachWorkspaceWriteRepair(result, repair)
+			attachRefreshedWorkspaceWriteBasis(ctx, result, views, scope, path, activeBasis.PipelineID)
+			return result, nil
 		}).
 		Build()
 }
@@ -475,30 +560,30 @@ func prepareWriteContextDescription(scope WorkspaceWriteScope) string {
 
 func writeFileDescription(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Write full file content into the pipeline VFS only. Requires a fresh basis from prepare_pipeline_write_context."
+		return "Write full file content into the pipeline VFS only. Requires a fresh or still-leased basis from prepare_pipeline_write_context and returns a refreshed next_basis on success."
 	}
-	return "Write full file content into the global VFS only. Requires a fresh basis from prepare_global_write_context."
+	return "Write full file content into the global VFS only. Requires a fresh or still-leased basis from prepare_global_write_context and returns a refreshed next_basis on success."
 }
 
 func editFileDescription(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Apply search/replace edits inside the pipeline VFS only. Requires a fresh basis from prepare_pipeline_write_context."
+		return "Apply search/replace edits inside the pipeline VFS only. Requires a fresh or still-leased basis from prepare_pipeline_write_context and returns a refreshed next_basis on success."
 	}
-	return "Apply search/replace edits inside the global VFS only. Requires a fresh basis from prepare_global_write_context."
+	return "Apply search/replace edits inside the global VFS only. Requires a fresh or still-leased basis from prepare_global_write_context and returns a refreshed next_basis on success."
 }
 
 func deleteFileDescription(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Delete a file from the pipeline VFS only. Requires a fresh basis from prepare_pipeline_write_context."
+		return "Delete a file from the pipeline VFS only. Requires a fresh or still-leased basis from prepare_pipeline_write_context and returns a refreshed next_basis on success."
 	}
-	return "Delete a file from the global VFS only. Requires a fresh basis from prepare_global_write_context."
+	return "Delete a file from the global VFS only. Requires a fresh or still-leased basis from prepare_global_write_context and returns a refreshed next_basis on success."
 }
 
 func createDirectoryDescription(scope WorkspaceWriteScope) string {
 	if scope == WorkspaceWriteScopePipeline {
-		return "Create a directory inside the pipeline VFS only. Requires a fresh basis from prepare_pipeline_write_context for the target directory path."
+		return "Create a directory inside the pipeline VFS only. Requires a fresh or still-leased basis from prepare_pipeline_write_context for the target directory path and returns a refreshed next_basis when available."
 	}
-	return "Create a directory inside the global VFS only. Requires a fresh basis from prepare_global_write_context for the target directory path."
+	return "Create a directory inside the global VFS only. Requires a fresh or still-leased basis from prepare_global_write_context for the target directory path and returns a refreshed next_basis when available."
 }
 
 func listChangesDescription(scope WorkspaceWriteScope) string {
@@ -514,10 +599,12 @@ func workspaceViewEnumValues() []string {
 
 func workspaceWriteBasisProperties() map[string]*skills.Property {
 	return map[string]*skills.Property{
-		"scope":       {Type: "string", Description: "Scope returned by prepare_*_write_context."},
-		"path":        {Type: "string", Description: "Target path prepared for mutation."},
-		"pipeline_id": {Type: "string", Description: "Pipeline ID when the basis is for pipeline-local writes."},
-		"target_view": {Type: "string", Description: "Target workspace view this basis authorizes."},
+		"scope":            {Type: "string", Description: "Scope returned by prepare_*_write_context."},
+		"path":             {Type: "string", Description: "Target path prepared for mutation."},
+		"pipeline_id":      {Type: "string", Description: "Pipeline ID when the basis is for pipeline-local writes."},
+		"target_view":      {Type: "string", Description: "Target workspace view this basis authorizes."},
+		"prepared_at":      {Type: "string", Description: "When the basis snapshot was prepared."},
+		"lease_expires_at": {Type: "string", Description: "When the write lease expires and prepare_*_write_context must be rerun."},
 	}
 }
 
@@ -549,13 +636,247 @@ func ensureWorkspaceWritesEnabled(cfg WorkspaceWriteSkillConfig, fa FileAccess) 
 	return nil
 }
 
+func resolveWorkspaceMutationBasis(
+	ctx context.Context,
+	fa FileAccess,
+	views WorkspaceViewAccess,
+	scope WorkspaceWriteScope,
+	path string,
+	basis WorkspaceWriteBasis,
+	op workspaceWriteOperation,
+) (WorkspaceWriteBasis, *WorkspaceWriteRepair, error) {
+	activeBasis, repair, err := maybeRebindWorkspaceMutationBasis(ctx, fa, views, scope, path, basis, op)
+	if err != nil {
+		return WorkspaceWriteBasis{}, nil, err
+	}
+	if err := validateWorkspaceWriteBasis(ctx, views, scope, path, activeBasis); err != nil {
+		return refreshWorkspaceMutationBasis(ctx, fa, views, scope, path, activeBasis, repair, err)
+	}
+	return activeBasis, compactWorkspaceWriteRepair(repair), nil
+}
+
+func maybeRebindWorkspaceMutationBasis(
+	ctx context.Context,
+	fa FileAccess,
+	views WorkspaceViewAccess,
+	scope WorkspaceWriteScope,
+	path string,
+	basis WorkspaceWriteBasis,
+	op workspaceWriteOperation,
+) (WorkspaceWriteBasis, *WorkspaceWriteRepair, error) {
+	if !canRebindWorkspaceMutationBasis(op, path, basis.Path) {
+		return basis, nil, nil
+	}
+	refreshed, err := refreshWorkspaceWriteBasisWithAccess(ctx, views, fa, scope, path, basis.PipelineID)
+	if err != nil {
+		return WorkspaceWriteBasis{}, nil, err
+	}
+	return refreshed, &WorkspaceWriteRepair{
+		Refreshed:     true,
+		Rebound:       true,
+		OriginalPath:  strings.TrimSpace(basis.Path),
+		EffectivePath: strings.TrimSpace(path),
+		Reasons:       []string{"path_rebound"},
+	}, nil
+}
+
+func refreshWorkspaceMutationBasis(
+	ctx context.Context,
+	fa FileAccess,
+	views WorkspaceViewAccess,
+	scope WorkspaceWriteScope,
+	path string,
+	basis WorkspaceWriteBasis,
+	repair *WorkspaceWriteRepair,
+	cause error,
+) (WorkspaceWriteBasis, *WorkspaceWriteRepair, error) {
+	if !workspaceWriteAutoRefreshable(cause) {
+		return WorkspaceWriteBasis{}, nil, cause
+	}
+	refreshed, err := refreshWorkspaceWriteBasisWithAccess(ctx, views, fa, scope, path, basis.PipelineID)
+	if err != nil {
+		return WorkspaceWriteBasis{}, nil, err
+	}
+	if err := validateWorkspaceWriteBasis(ctx, views, scope, path, refreshed); err != nil {
+		return WorkspaceWriteBasis{}, nil, err
+	}
+	return refreshed, mergeWorkspaceWriteRepair(repair, &WorkspaceWriteRepair{
+		Refreshed:     true,
+		OriginalPath:  strings.TrimSpace(basis.Path),
+		EffectivePath: strings.TrimSpace(path),
+		Reasons:       []string{workspaceWriteRepairReason(cause)},
+	}), nil
+}
+
+func canRebindWorkspaceMutationBasis(op workspaceWriteOperation, targetPath, basisPath string) bool {
+	if op != workspaceWriteOperationCreateDirectory {
+		return false
+	}
+	return workspacePathIsDescendant(targetPath, basisPath)
+}
+
+func workspacePathIsDescendant(parentPath, childPath string) bool {
+	target := normalizeWorkspaceMutationPath(parentPath)
+	basis := normalizeWorkspaceMutationPath(childPath)
+	if !validWorkspaceDescendantPair(target, basis) {
+		return false
+	}
+	return workspaceRelativePathWithinTarget(target, basis)
+}
+
+func validWorkspaceDescendantPair(target, basis string) bool {
+	return target != "" && basis != "" && target != basis
+}
+
+func workspaceRelativePathWithinTarget(target, basis string) bool {
+	rel, err := filepath.Rel(target, basis)
+	if err != nil {
+		return false
+	}
+	return rel != "." && !strings.HasPrefix(rel, "..")
+}
+
+func workspaceWriteAutoRefreshable(err error) bool {
+	if errors.Is(err, ErrWorkspaceWriteLeaseExpired) {
+		return true
+	}
+	_, ok := WorkspaceWriteStale(err)
+	return ok
+}
+
+func workspaceWriteRepairReason(err error) string {
+	stale, ok := WorkspaceWriteStale(err)
+	if !ok || stale == nil || stale.Reason == "" {
+		return "state_refreshed"
+	}
+	return string(stale.Reason)
+}
+
+func refreshWorkspaceWriteBasisWithAccess(
+	ctx context.Context,
+	views WorkspaceViewAccess,
+	fa FileAccess,
+	scope WorkspaceWriteScope,
+	path string,
+	pipelineID string,
+) (WorkspaceWriteBasis, error) {
+	registerVisiblePathIfSupported(fa, path)
+	return RefreshWorkspaceWriteBasis(ctx, views, scope, path, pipelineID)
+}
+
+func registerVisiblePathIfSupported(fa FileAccess, path string) {
+	registrar, ok := fa.(visiblePathRegistrar)
+	if !ok {
+		return
+	}
+	registrar.RegisterVisiblePath(strings.TrimSpace(path))
+}
+
+func mergeWorkspaceWriteRepair(base, extra *WorkspaceWriteRepair) *WorkspaceWriteRepair {
+	base, extra = normalizeWorkspaceWriteRepairPair(base, extra)
+	single := firstWorkspaceWriteRepair(base, extra)
+	if base == nil || extra == nil {
+		return compactWorkspaceWriteRepair(single)
+	}
+	return compactWorkspaceWriteRepair(combineWorkspaceWriteRepairs(base, extra))
+}
+
+func combineWorkspaceWriteRepairs(base, extra *WorkspaceWriteRepair) *WorkspaceWriteRepair {
+	return &WorkspaceWriteRepair{
+		Refreshed:     base.Refreshed || extra.Refreshed,
+		Rebound:       base.Rebound || extra.Rebound,
+		OriginalPath:  firstNonEmpty(base.OriginalPath, extra.OriginalPath),
+		EffectivePath: firstNonEmpty(extra.EffectivePath, base.EffectivePath),
+		Reasons:       append(append([]string{}, base.Reasons...), extra.Reasons...),
+	}
+}
+
+func compactWorkspaceWriteRepair(repair *WorkspaceWriteRepair) *WorkspaceWriteRepair {
+	if repair == nil {
+		return nil
+	}
+	repair.Reasons = uniqueWorkspaceWriteReasons(repair.Reasons)
+	if workspaceWriteRepairEmpty(repair) {
+		return nil
+	}
+	return repair
+}
+
+func normalizeWorkspaceWriteRepairPair(base, extra *WorkspaceWriteRepair) (*WorkspaceWriteRepair, *WorkspaceWriteRepair) {
+	return compactWorkspaceWriteRepair(base), compactWorkspaceWriteRepair(extra)
+}
+
+func firstWorkspaceWriteRepair(values ...*WorkspaceWriteRepair) *WorkspaceWriteRepair {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func workspaceWriteRepairEmpty(repair *WorkspaceWriteRepair) bool {
+	if repair == nil {
+		return false
+	}
+	return !workspaceWriteRepairHasState(repair) &&
+		!workspaceWriteRepairHasPaths(repair) &&
+		len(repair.Reasons) == 0
+}
+
+func workspaceWriteRepairHasState(repair *WorkspaceWriteRepair) bool {
+	return repair != nil && (repair.Refreshed || repair.Rebound)
+}
+
+func workspaceWriteRepairHasPaths(repair *WorkspaceWriteRepair) bool {
+	return repair != nil && (repair.OriginalPath != "" || repair.EffectivePath != "")
+}
+
+func uniqueWorkspaceWriteReasons(reasons []string) []string {
+	if len(reasons) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(reasons))
+	ordered := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		trimmed := strings.TrimSpace(reason)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		ordered = append(ordered, trimmed)
+	}
+	return ordered
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func normalizeWorkspaceMutationPath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	return filepath.Clean(trimmed)
+}
+
 func buildWorkspaceWriteBasis(scope WorkspaceWriteScope, state *WorkspacePathState, preparedAt time.Time) WorkspaceWriteBasis {
 	basis := WorkspaceWriteBasis{
-		Scope:      scope,
-		Path:       workspaceStatePath(state),
-		PipelineID: workspaceStatePipelineID(state),
-		TargetView: writeScopeTargetView(scope),
-		PreparedAt: preparedAt,
+		Scope:          scope,
+		Path:           workspaceStatePath(state),
+		PipelineID:     workspaceStatePipelineID(state),
+		TargetView:     writeScopeTargetView(scope),
+		PreparedAt:     preparedAt,
+		LeaseExpiresAt: workspaceWriteLeaseExpiry(preparedAt),
 	}
 	if state != nil {
 		basis.Disk = state.Disk
@@ -563,6 +884,13 @@ func buildWorkspaceWriteBasis(scope WorkspaceWriteScope, state *WorkspacePathSta
 		basis.Pipeline = cloneWorkspaceLayerState(state.Pipeline)
 	}
 	return basis
+}
+
+func workspaceWriteLeaseExpiry(preparedAt time.Time) time.Time {
+	if preparedAt.IsZero() {
+		return time.Time{}
+	}
+	return preparedAt.Add(defaultWorkspaceWriteLease)
 }
 
 func workspaceStatePath(state *WorkspacePathState) string {
@@ -801,11 +1129,14 @@ func validateWorkspaceWriteBasis(
 	if err := ensureWriteTargetAvailable(scope, state); err != nil {
 		return err
 	}
-	if err := validateLayerSnapshot("disk", basis.Disk, state.Disk); err != nil {
-		return staleBasisError(scope, err)
+	if err := validateWriteLease(basis, time.Now().UTC()); err != nil {
+		return staleBasisError(scope, path, WorkspaceWriteStaleReasonLeaseExpired, err)
 	}
-	if err := validateScopedLayers(scope, basis, state); err != nil {
-		return staleBasisError(scope, err)
+	if err := validateTargetLayerSnapshot(scope, basis, state); err != nil {
+		return staleBasisError(scope, path, WorkspaceWriteStaleReasonTargetChanged, err)
+	}
+	if err := validateReferenceLayers(scope, basis, state); err != nil {
+		return staleBasisError(scope, path, WorkspaceWriteStaleReasonReferenceChange, err)
 	}
 	return nil
 }
@@ -814,7 +1145,7 @@ func validateBasisIdentity(scope WorkspaceWriteScope, path string, basis Workspa
 	if basis.Scope != scope {
 		return fmt.Errorf("basis scope %q does not match %q", basis.Scope, scope)
 	}
-	if strings.TrimSpace(basis.Path) != path {
+	if normalizeWorkspaceMutationPath(basis.Path) != normalizeWorkspaceMutationPath(path) {
 		return fmt.Errorf("basis path %q does not match %q", basis.Path, path)
 	}
 	if basis.TargetView != writeScopeTargetView(scope) {
@@ -823,24 +1154,68 @@ func validateBasisIdentity(scope WorkspaceWriteScope, path string, basis Workspa
 	return nil
 }
 
-func validateScopedLayers(scope WorkspaceWriteScope, basis WorkspaceWriteBasis, state *WorkspacePathState) error {
-	if scope == WorkspaceWriteScopeGlobal {
-		return validateOptionalLayerSnapshot("global", basis.Global, state.Global)
-	}
-	if err := validateOptionalLayerSnapshot("global", basis.Global, state.Global); err != nil {
-		return err
-	}
-	return validateOptionalLayerSnapshot("pipeline", basis.Pipeline, state.Pipeline)
-}
-
-func validateOptionalLayerSnapshot(name string, expected, actual *WorkspaceLayerState) error {
-	if expected == nil && actual == nil {
-		return nil
-	}
+func validateTargetLayerSnapshot(scope WorkspaceWriteScope, basis WorkspaceWriteBasis, state *WorkspacePathState) error {
+	name, expected, actual := scopedLayerSnapshots(scope, basis, state)
 	if expected == nil || actual == nil {
 		return fmt.Errorf("%s state changed", name)
 	}
 	return validateLayerSnapshot(name, *expected, *actual)
+}
+
+func validateReferenceLayers(scope WorkspaceWriteScope, basis WorkspaceWriteBasis, state *WorkspacePathState) error {
+	leaseActive := basisLeaseActive(time.Now().UTC(), basis)
+	if err := validateReferenceLayerSnapshot("disk", &basis.Disk, &state.Disk, leaseActive); err != nil {
+		return err
+	}
+	if scope == WorkspaceWriteScopeGlobal {
+		return nil
+	}
+	return validateReferenceLayerSnapshot("global", basis.Global, state.Global, leaseActive)
+}
+
+func validateReferenceLayerSnapshot(name string, expected, actual *WorkspaceLayerState, leaseActive bool) error {
+	if expected == nil && actual == nil {
+		return nil
+	}
+	if expected == nil || actual == nil {
+		if leaseActive {
+			return nil
+		}
+		return fmt.Errorf("%s state changed", name)
+	}
+	if layersComparableForReference(*expected, *actual) {
+		return validateComparableLayerSnapshot(name, *expected, *actual)
+	}
+	if leaseActive {
+		return nil
+	}
+	return validateLayerSnapshot(name, *expected, *actual)
+}
+
+func layersComparableForReference(expected, actual WorkspaceLayerState) bool {
+	return expected.Available &&
+		actual.Available &&
+		strings.TrimSpace(expected.Error) == "" &&
+		strings.TrimSpace(actual.Error) == ""
+}
+
+func validateComparableLayerSnapshot(name string, expected, actual WorkspaceLayerState) error {
+	if expected.Exists != actual.Exists {
+		return fmt.Errorf("%s existence changed", name)
+	}
+	if !expected.Exists && !actual.Exists {
+		return nil
+	}
+	if expected.IsDir != actual.IsDir {
+		return fmt.Errorf("%s path type changed", name)
+	}
+	if expected.IsDir && actual.IsDir {
+		return nil
+	}
+	if expected.ContentHash != actual.ContentHash {
+		return fmt.Errorf("%s content changed", name)
+	}
+	return nil
 }
 
 func validateLayerSnapshot(name string, expected, actual WorkspaceLayerState) error {
@@ -850,8 +1225,14 @@ func validateLayerSnapshot(name string, expected, actual WorkspaceLayerState) er
 	if expected.Exists != actual.Exists {
 		return fmt.Errorf("%s existence changed", name)
 	}
+	if expected.IsDir != actual.IsDir {
+		return fmt.Errorf("%s path type changed", name)
+	}
 	if strings.TrimSpace(expected.Error) != strings.TrimSpace(actual.Error) {
 		return fmt.Errorf("%s error state changed", name)
+	}
+	if expected.IsDir && actual.IsDir {
+		return nil
 	}
 	if expected.ContentHash != actual.ContentHash {
 		return fmt.Errorf("%s content changed", name)
@@ -859,8 +1240,49 @@ func validateLayerSnapshot(name string, expected, actual WorkspaceLayerState) er
 	return nil
 }
 
-func staleBasisError(scope WorkspaceWriteScope, cause error) error {
-	return fmt.Errorf("%s write basis is stale: %w; rerun prepare_%s_write_context", scope, cause, scope)
+func scopedLayerSnapshots(
+	scope WorkspaceWriteScope,
+	basis WorkspaceWriteBasis,
+	state *WorkspacePathState,
+) (string, *WorkspaceLayerState, *WorkspaceLayerState) {
+	if scope == WorkspaceWriteScopePipeline {
+		return "pipeline", basis.Pipeline, state.Pipeline
+	}
+	return "global", basis.Global, state.Global
+}
+
+func validateWriteLease(basis WorkspaceWriteBasis, now time.Time) error {
+	deadline := basisLeaseDeadline(basis)
+	if deadline.IsZero() || now.After(deadline) {
+		return ErrWorkspaceWriteLeaseExpired
+	}
+	return nil
+}
+
+func basisLeaseActive(now time.Time, basis WorkspaceWriteBasis) bool {
+	deadline := basisLeaseDeadline(basis)
+	return !deadline.IsZero() && !now.After(deadline)
+}
+
+func basisLeaseDeadline(basis WorkspaceWriteBasis) time.Time {
+	if !basis.LeaseExpiresAt.IsZero() {
+		return basis.LeaseExpiresAt
+	}
+	return workspaceWriteLeaseExpiry(basis.PreparedAt)
+}
+
+func staleBasisError(
+	scope WorkspaceWriteScope,
+	path string,
+	reason WorkspaceWriteStaleReason,
+	cause error,
+) error {
+	return &WorkspaceWriteStaleError{
+		Scope:  scope,
+		Path:   strings.TrimSpace(path),
+		Reason: reason,
+		Cause:  cause,
+	}
 }
 
 func normalizeFileEdits(inputs []FileEditInput) ([]FileEdit, error) {
@@ -913,6 +1335,65 @@ func summarizeWorkspaceChanges(scope WorkspaceWriteScope, mods []FileModificatio
 		Count:   len(changes),
 		Changes: changes,
 	}
+}
+
+func buildRefreshedWorkspaceWriteBasis(
+	ctx context.Context,
+	views WorkspaceViewAccess,
+	scope WorkspaceWriteScope,
+	path string,
+	pipelineID string,
+) *WorkspaceWriteBasis {
+	if views == nil {
+		return nil
+	}
+	state, err := views.InspectPath(ctx, path, pipelineID)
+	if err != nil {
+		return nil
+	}
+	if err := ensureWriteTargetAvailable(scope, state); err != nil {
+		return nil
+	}
+	preparedAt := time.Now().UTC()
+	basis := buildWorkspaceWriteBasis(scope, state, preparedAt)
+	return &basis
+}
+
+func RefreshWorkspaceWriteBasis(
+	ctx context.Context,
+	views WorkspaceViewAccess,
+	scope WorkspaceWriteScope,
+	path string,
+	pipelineID string,
+) (WorkspaceWriteBasis, error) {
+	basis := buildRefreshedWorkspaceWriteBasis(ctx, views, scope, path, pipelineID)
+	if basis == nil {
+		return WorkspaceWriteBasis{}, fmt.Errorf("unable to refresh %s write basis for %s", scope, strings.TrimSpace(path))
+	}
+	return *basis, nil
+}
+
+func attachRefreshedWorkspaceWriteBasis(
+	ctx context.Context,
+	result map[string]any,
+	views WorkspaceViewAccess,
+	scope WorkspaceWriteScope,
+	path string,
+	pipelineID string,
+) {
+	if result == nil {
+		return
+	}
+	if basis := buildRefreshedWorkspaceWriteBasis(ctx, views, scope, path, pipelineID); basis != nil {
+		result["next_basis"] = basis
+	}
+}
+
+func attachWorkspaceWriteRepair(result map[string]any, repair *WorkspaceWriteRepair) {
+	if result == nil || repair == nil {
+		return
+	}
+	result["basis_repair"] = repair
 }
 
 func changeContentHash(mod FileModification) string {

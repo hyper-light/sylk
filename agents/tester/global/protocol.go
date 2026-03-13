@@ -12,7 +12,8 @@ import (
 // Phase 2: analyzeIntegrationRisks — analyze_integration_risks
 // Phase 3: architectTestStrategy   — plan_integration_tests + plan_e2e_tests
 // Phase 4: constructHarness        — build_harness
-// Phase 5: implementTests          — write_integration_test + write_e2e_test
+// Phase 5: implementTests          — prepare_global_write_context +
+//                                     write_integration_test/write_e2e_test
 // Phase 6: executeTests            — run_test_suite
 // Phase 7: diagnoseAndEscalate     — diagnose_failure + escalate_failure
 

@@ -154,17 +154,33 @@ func TestDetectToolCallDuplicate_AllNew(t *testing.T) {
 	}
 }
 
-func TestDetectToolCallDuplicate_AllDup(t *testing.T) {
+func TestDetectToolCallDuplicate_OnlyBlocksThirdIdenticalBatch(t *testing.T) {
 	calls := []providers.ToolCall{
 		{ID: "1", Name: "readFile", Arguments: `{"path":"a.go"}`},
 	}
 	seen := make(map[ToolCallSignature]int)
-	// First pass: seeds the seen map.
 	DetectToolCallDuplicate(calls, seen)
-	// Second pass: same calls should be all duplicates.
-	allDup, firstDup := DetectToolCallDuplicate(calls, seen)
+
+	history := []providers.Message{
+		{
+			Role:      providers.RoleAssistant,
+			ToolCalls: calls,
+		},
+		{
+			Role:     providers.RoleTool,
+			ToolName: "readFile",
+			Content:  `{"path":"a.go","content":"package main"}`,
+		},
+	}
+
+	allDup, firstDup := DetectToolCallDuplicate(calls, seen, history)
+	if allDup {
+		t.Fatal("expected second identical batch to be tolerated")
+	}
+
+	allDup, firstDup = DetectToolCallDuplicate(calls, seen, history)
 	if !allDup {
-		t.Fatal("expected allDup=true for repeated batch")
+		t.Fatal("expected third identical batch to be rejected")
 	}
 	if firstDup.Name != "readFile" {
 		t.Fatalf("expected firstDup.Name=%q, got %q", "readFile", firstDup.Name)
@@ -188,6 +204,64 @@ func TestDetectToolCallDuplicate_PartialDup(t *testing.T) {
 	}
 }
 
+func TestDetectToolCallDuplicate_AllowsSameCallAfterInterveningBatch(t *testing.T) {
+	calls := []providers.ToolCall{
+		{ID: "1", Name: "read_workspace_file", Arguments: `{"path":"src/hello/greeter.py"}`},
+	}
+	seen := make(map[ToolCallSignature]int)
+	DetectToolCallDuplicate(calls, seen)
+
+	history := []providers.Message{
+		{
+			Role: providers.RoleAssistant,
+			ToolCalls: []providers.ToolCall{
+				{ID: "2", Name: "inspect_workspace_state", Arguments: `{"paths":["src/hello"]}`},
+			},
+		},
+		{
+			Role:     providers.RoleTool,
+			ToolName: "inspect_workspace_state",
+			Content:  `{"summary":"pipeline-only files exist"}`,
+		},
+	}
+
+	allDup, firstDup := DetectToolCallDuplicate(calls, seen, history)
+	if allDup {
+		t.Fatal("expected same read call after an intervening batch to be allowed")
+	}
+	if firstDup.Name != "" {
+		t.Fatalf("expected no duplicate signature, got %+v", firstDup)
+	}
+}
+
+func TestDetectToolCallDuplicate_AllowsSecondIdenticalWriteBatch(t *testing.T) {
+	calls := []providers.ToolCall{
+		{ID: "1", Name: "write_test", Arguments: `{"output_file":"tests/test_cli.py","content":"def test_cli():\\n    assert True\\n"}`},
+	}
+	seen := make(map[ToolCallSignature]int)
+	DetectToolCallDuplicate(calls, seen)
+
+	history := []providers.Message{
+		{
+			Role:      providers.RoleAssistant,
+			ToolCalls: calls,
+		},
+		{
+			Role:     providers.RoleTool,
+			ToolName: "write_test",
+			Content:  `{"output_file":"tests/test_cli.py","next_basis":"lease-2"}`,
+		},
+	}
+
+	allDup, firstDup := DetectToolCallDuplicate(calls, seen, history)
+	if allDup {
+		t.Fatal("expected second identical write batch to be allowed")
+	}
+	if firstDup.Name != "" {
+		t.Fatalf("expected no duplicate signature, got %+v", firstDup)
+	}
+}
+
 func TestDetectToolCallDuplicate_EmptyBatch(t *testing.T) {
 	seen := make(map[ToolCallSignature]int)
 	allDup, firstDup := DetectToolCallDuplicate(nil, seen)
@@ -197,6 +271,138 @@ func TestDetectToolCallDuplicate_EmptyBatch(t *testing.T) {
 	}
 	if firstDup.Name != "" {
 		t.Fatalf("expected zero-value firstDup for empty batch, got %+v", firstDup)
+	}
+}
+
+func TestDetectToolCallDuplicate_AllowsStaleWriteBasisPrepareRetry(t *testing.T) {
+	calls := []providers.ToolCall{
+		{ID: "1", Name: preparePipelineWriteContextTool, Arguments: `{"path":"main.go"}`},
+	}
+	seen := make(map[ToolCallSignature]int)
+	DetectToolCallDuplicate(calls, seen)
+
+	history := []providers.Message{
+		{
+			Role:    providers.RoleAssistant,
+			Content: "Trying the write.",
+			ToolCalls: []providers.ToolCall{
+				{ID: "write-1", Name: "write_pipeline_file", Arguments: `{"path":"main.go"}`},
+			},
+		},
+		{
+			Role:     providers.RoleTool,
+			ToolName: "write_pipeline_file",
+			IsError:  true,
+			Content:  `{"error":"tool \"write_pipeline_file\" failed: pipeline write basis is stale: disk availability changed; rerun prepare_pipeline_write_context"}`,
+		},
+	}
+
+	allDup, firstDup := DetectToolCallDuplicate(calls, seen, history)
+	if allDup {
+		t.Fatal("expected stale-basis retry to bypass duplicate rejection")
+	}
+	if firstDup.Name != "" {
+		t.Fatalf("expected no duplicate signature, got %+v", firstDup)
+	}
+	if got := seen[ToolCallSignature{Name: preparePipelineWriteContextTool, Arguments: `{"path":"main.go"}`}]; got != 1 {
+		t.Fatalf("seen count = %d, want 1 after authorized retry", got)
+	}
+}
+
+func TestDetectToolCallDuplicate_RejectsPrepareRetryWithoutFreshStaleBasisError(t *testing.T) {
+	calls := []providers.ToolCall{
+		{ID: "1", Name: preparePipelineWriteContextTool, Arguments: `{"path":"main.go"}`},
+	}
+	seen := make(map[ToolCallSignature]int)
+	DetectToolCallDuplicate(calls, seen)
+
+	history := []providers.Message{
+		{
+			Role:      providers.RoleAssistant,
+			Content:   "Prepared already.",
+			ToolCalls: calls,
+		},
+		{
+			Role:     providers.RoleTool,
+			ToolName: preparePipelineWriteContextTool,
+			Content:  `{"path":"main.go"}`,
+		},
+	}
+
+	allDup, _ := DetectToolCallDuplicate(calls, seen, history)
+	if allDup {
+		t.Fatal("expected second identical prepare batch to be tolerated")
+	}
+
+	allDup, firstDup := DetectToolCallDuplicate(calls, seen, history)
+	if !allDup {
+		t.Fatal("expected third identical prepare batch to be rejected without stale-basis guidance")
+	}
+	if firstDup.Name != preparePipelineWriteContextTool {
+		t.Fatalf("firstDup.Name = %q, want %q", firstDup.Name, preparePipelineWriteContextTool)
+	}
+}
+
+func TestDetectToolCallDuplicate_AllowsWriteRetryAfterInterveningPrerequisiteTool(t *testing.T) {
+	calls := []providers.ToolCall{
+		{ID: "1", Name: "write_test", Arguments: `{"output_file":"tests/test_greeter.py","content":"def test_greet():\\n    assert greet() == 'Hello, World!'\\n"}`},
+	}
+	seen := make(map[ToolCallSignature]int)
+	DetectToolCallDuplicate(calls, seen)
+
+	history := []providers.Message{
+		{
+			Role: providers.RoleAssistant,
+			ToolCalls: []providers.ToolCall{
+				{ID: "2", Name: "analyze_risk", Arguments: `{"files":["src/hello/greeter.py"]}`},
+			},
+		},
+		{
+			Role:     providers.RoleTool,
+			ToolName: "analyze_risk",
+			Content:  `{"risk_areas":[{"target":"src/hello/greeter.py","kind":"default-argument"}]}`,
+		},
+	}
+
+	allDup, firstDup := DetectToolCallDuplicate(calls, seen, history)
+	if allDup {
+		t.Fatal("expected write_test retry after analyze_risk to be allowed")
+	}
+	if firstDup.Name != "" {
+		t.Fatalf("expected no duplicate signature, got %+v", firstDup)
+	}
+}
+
+func TestDetectToolCallDuplicate_AllowsPrepareRetryAfterWriteSurfaceMutation(t *testing.T) {
+	calls := []providers.ToolCall{
+		{ID: "1", Name: preparePipelineWriteContextTool, Arguments: `{"path":"hello_cli/__init__.py"}`},
+	}
+	seen := make(map[ToolCallSignature]int)
+	DetectToolCallDuplicate(calls, seen)
+
+	history := []providers.Message{
+		{
+			Role: providers.RoleAssistant,
+			ToolCalls: []providers.ToolCall{
+				{ID: "mkdir-1", Name: "create_pipeline_directory", Arguments: `{"path":"hello_cli"}`},
+			},
+		},
+		{
+			Role:     providers.RoleTool,
+			ToolName: "create_pipeline_directory",
+			Content:  `{"path":"hello_cli","created":true}`,
+		},
+	}
+
+	allDup, firstDup := DetectToolCallDuplicate(calls, seen, history)
+	if allDup {
+		t.Fatal("expected prepare retry after directory mutation to bypass duplicate rejection")
+	}
+	if firstDup.Name != "" {
+		t.Fatalf("expected no duplicate signature, got %+v", firstDup)
+	}
+	if got := seen[ToolCallSignature{Name: preparePipelineWriteContextTool, Arguments: `{"path":"hello_cli/__init__.py"}`}]; got != 1 {
+		t.Fatalf("seen count = %d, want 1 after authorized refresh", got)
 	}
 }
 

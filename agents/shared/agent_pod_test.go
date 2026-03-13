@@ -270,6 +270,63 @@ func TestAgentPod_HoldForNode_RegistrarDedup(t *testing.T) {
 	pod.Release()
 }
 
+func TestAgentPod_HoldForNode_ConcurrentRegistrarDedup(t *testing.T) {
+	act := &podTrackingActivator{}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+
+	pod := NewAgentPod(AgentPodConfig{
+		PodID:     "pod-1",
+		Activator: act,
+		Registrar: func(_ context.Context, agentType string) error {
+			if agentType != "engineer" {
+				return errors.New("unexpected agent type: " + agentType)
+			}
+			if calls.Add(1) != 1 {
+				return errors.New("registrar called more than once")
+			}
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+	})
+
+	errCh := make(chan error, 2)
+	for _, id := range []string{"n1", "n2"} {
+		go func(nodeID string) {
+			errCh <- pod.HoldForNode(context.Background(), nodeID, []string{"engineer"})
+		}(id)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for registrar call")
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("registrar call count = %d, want 1", got)
+	}
+
+	close(release)
+
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("HoldForNode returned error: %v", err)
+		}
+	}
+
+	if got := act.holdCount(); got != 2 {
+		t.Errorf("expected 2 HoldPodActive calls, got %d", got)
+	}
+	if got := pod.ActiveGuardCount(); got != 2 {
+		t.Errorf("expected 2 active guards, got %d", got)
+	}
+
+	pod.Release()
+}
+
 func TestAgentPod_ReleaseForNode(t *testing.T) {
 	act := &podTrackingActivator{}
 

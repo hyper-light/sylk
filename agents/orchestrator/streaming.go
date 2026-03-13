@@ -81,6 +81,14 @@ func orchestratorStreamMetadataFromContext(ctx context.Context) (orchestratorStr
 	return metadata, true
 }
 
+func handoffRequesterAgentIDFromContext(ctx context.Context) string {
+	metadata, ok := orchestratorStreamMetadataFromContext(ctx)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(metadata.SourceAgentID)
+}
+
 func withOrchestratorUsageAccumulator(ctx context.Context) (context.Context, *orchestratorUsageAccumulator) {
 	acc := &orchestratorUsageAccumulator{}
 	return context.WithValue(ctx, orchestratorUsageAccumulatorKey{}, acc), acc

@@ -15,6 +15,7 @@ func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
 
 	evt := events.NewActivityEvent(events.EventTypeLLMResponse, "default", "ok")
 	evt.AgentID = "engineer"
+	evt.CorrelationID = "corr-1"
 	evt.Outcome = events.OutcomeSuccess
 	evt.Data["model"] = "gpt-5.4-pro"
 	evt.Data["input_tokens"] = int64(1500)
@@ -36,6 +37,9 @@ func TestTokenUsageBridgeForwardHandlerAcceptsNumericVariants(t *testing.T) {
 	}
 	if usage.AgentID != "engineer" {
 		t.Fatalf("AgentID = %q, want engineer", usage.AgentID)
+	}
+	if usage.CorrelationID != "corr-1" {
+		t.Fatalf("CorrelationID = %q, want corr-1", usage.CorrelationID)
 	}
 	if usage.Model != "gpt-5.4-pro" {
 		t.Fatalf("Model = %q, want gpt-5.4-pro", usage.Model)

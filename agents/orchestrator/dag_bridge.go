@@ -43,14 +43,15 @@ func DefaultDAGBridgeConfig() DAGBridgeConfig {
 
 // DAGBridgeDeps groups required dependencies for the DAG bridge.
 type DAGBridgeDeps struct {
-	Store       *Store
-	Journal     *OrchestratorJournal
-	Buffers     *BufferRegistry
-	Scope       *concurrency.GoroutineScope
-	ActivityPub events.ActivityPublisher
-	Activator   guide.PodActivator // optional on-demand pod activator
-	SessionID   string
-	AgentID     string
+	Store        *Store
+	Journal      *OrchestratorJournal
+	Buffers      *BufferRegistry
+	Scope        *concurrency.GoroutineScope
+	Orchestrator *Orchestrator
+	ActivityPub  events.ActivityPublisher
+	Activator    guide.PodActivator // optional on-demand pod activator
+	SessionID    string
+	AgentID      string
 }
 
 // ActiveDAGMeta is bridge-level metadata for a running DAG.
@@ -94,6 +95,7 @@ type DAGBridge struct {
 
 	activityPub   events.ActivityPublisher
 	eventLogger   *agentlog.SessionEventLogger
+	orchestrator  *Orchestrator
 	activeDAGs    map[string]*ActiveDAGMeta
 	gates         map[string]*dag.DecisionGate // per-DAG decision gates
 	scribeFactory shared.ScribeFactory         // optional Scribe factory for pipeline pods
@@ -114,18 +116,19 @@ func NewDAGBridge(cfg DAGBridgeConfig, deps DAGBridgeDeps) *DAGBridge {
 	}
 
 	b := &DAGBridge{
-		scheduler:   dag.NewScheduler(schedulerCfg, deps.Scope),
-		store:       deps.Store,
-		journal:     deps.Journal,
-		buffers:     deps.Buffers,
-		scope:       deps.Scope,
-		config:      cfg,
-		activator:   deps.Activator,
-		sessionID:   deps.SessionID,
-		agentID:     deps.AgentID,
-		activityPub: deps.ActivityPub,
-		activeDAGs:  make(map[string]*ActiveDAGMeta),
-		gates:       make(map[string]*dag.DecisionGate),
+		scheduler:    dag.NewScheduler(schedulerCfg, deps.Scope),
+		store:        deps.Store,
+		journal:      deps.Journal,
+		buffers:      deps.Buffers,
+		scope:        deps.Scope,
+		config:       cfg,
+		activator:    deps.Activator,
+		sessionID:    deps.SessionID,
+		agentID:      deps.AgentID,
+		activityPub:  deps.ActivityPub,
+		orchestrator: deps.Orchestrator,
+		activeDAGs:   make(map[string]*ActiveDAGMeta),
+		gates:        make(map[string]*dag.DecisionGate),
 	}
 
 	b.scheduler.SetDefaultLayerGate(b.compositeGate())
@@ -290,15 +293,8 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		"task_pod_count":  len(taskPods),
 		"task_pod_traces": tracePipelineTaskPodDefs(taskDefs),
 	})
-	if err := preActivateTaskPods(ctx, d.ID(), taskPods, indexPipelineTaskPodDefs(taskDefs), b.logTrace); err != nil {
-		b.logTrace("dag_execute_task_pods_preactivate_failed", agentlog.EventError, map[string]any{
-			"dag_id": d.ID(),
-			"error":  err.Error(),
-		})
-		releaseTaskPods(taskPods)
-		return "", b.abortPreSubmitDAG(d.ID(), err)
-	}
-	b.logTrace("dag_execute_task_pods_preactivated", agentlog.EventRegistryEvent, map[string]any{
+	advertiseTaskPods(taskPods, indexPipelineTaskPodDefs(taskDefs), d.ID(), b.logTrace)
+	b.logTrace("dag_execute_task_pods_advertised", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":         d.ID(),
 		"task_pod_count": len(taskPods),
 	})
@@ -719,6 +715,45 @@ func preActivateTaskPods(
 	return nil
 }
 
+func advertiseTaskPods(
+	taskPods map[string]*shared.AgentPod,
+	taskDefs map[string]pipelineTaskPodDef,
+	dagID string,
+	trace func(string, agentlog.EventType, map[string]any),
+) {
+	for _, taskID := range slices.Sorted(maps.Keys(taskPods)) {
+		advertiseTaskPod(taskPods[taskID], taskDefs[taskID], dagID, trace)
+	}
+}
+
+func advertiseTaskPod(
+	pod *shared.AgentPod,
+	def pipelineTaskPodDef,
+	dagID string,
+	trace func(string, agentlog.EventType, map[string]any),
+) {
+	if pod == nil {
+		return
+	}
+	logTaskPodAdvertise(trace, "task_pod_advertise_begin", def, dagID)
+	pod.AdvertiseMembers()
+	logTaskPodAdvertise(trace, "task_pod_advertise_done", def, dagID)
+}
+
+func logTaskPodAdvertise(
+	trace func(string, agentlog.EventType, map[string]any),
+	event string,
+	def pipelineTaskPodDef,
+	dagID string,
+) {
+	if trace == nil {
+		return
+	}
+	trace(event, agentlog.EventRegistryEvent, mergeTraceMaps(tracePipelineTaskPodDef(def), map[string]any{
+		"dag_id": dagID,
+	}))
+}
+
 func indexPipelineTaskPodDefs(defs []pipelineTaskPodDef) map[string]pipelineTaskPodDef {
 	index := make(map[string]pipelineTaskPodDef, len(defs))
 	for _, def := range defs {
@@ -952,6 +987,14 @@ func (b *DAGBridge) dagEventForwarder(dagID, planID string) dag.EventHandler {
 		el := b.eventLogger
 		switch event.Type {
 		case dag.EventExecutionRunStarted:
+			if receipt, err := b.store.MarkPlanHandoffReceiptRunningByDAGID(dagID); err != nil {
+				b.logTrace("plan_handoff_receipt_running_failed", agentlog.EventError, map[string]any{
+					"dag_id": dagID,
+					"error":  err.Error(),
+				})
+			} else if receipt != nil && b.orchestrator != nil {
+				b.orchestrator.publishPlanHandoffReceiptUpdate(receipt, "running")
+			}
 			b.logTrace("dag_execution_run_started", agentlog.EventRegistryEvent, map[string]any{
 				"dag_id": dagID,
 			})

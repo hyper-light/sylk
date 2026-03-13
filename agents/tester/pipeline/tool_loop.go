@@ -22,12 +22,24 @@ import (
 // execute → append results → repeat, bounded by config.MaxToolRuns.
 // Follows the orchestrator tool_loop.go pattern exactly.
 func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
+	return pt.executeToolLoopWithSurface(ctx, req, ledger, pt.toolRuntime())
+}
+
+func (pt *PipelineTester) executeToolLoopWithSurface(
+	ctx context.Context,
+	req *providers.Request,
+	ledger *steering.SteeringLedger,
+	surface toolruntime.Surface,
+) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, pt.config.MaxToolRuns)
 	consecutiveErrors := 0
+	if surface == nil {
+		surface = pt.toolRuntime()
+	}
 
 	for turn := 0; turn <= pt.config.MaxToolRuns; turn++ {
 		if pt.toolDefsDirty {
-			req.Tools = pt.buildToolDefinitions()
+			req.Tools = pt.buildToolDefinitionsWithSurface(surface)
 			pt.toolDefsDirty = false
 		}
 
@@ -87,6 +99,25 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 		shared.PublishIntermediateToolTurn(pt.bus, pt.channels, ctx, pt.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if err := shared.ValidateTaskExecutionCompletion(ctx, "tester-pipeline"); err != nil {
+				pt.recordTurn(req, resp, turn, 0, 1, turnStart)
+				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ErrorPayload{Error: err.Error()})
+				}
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nDo not conclude or release the scope yet. Continue the required testing protocol now.",
+				})
+				continue
+			}
 			pt.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
@@ -96,11 +127,11 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if err := pt.toolRuntime().ValidateBatch(pt.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+		if err := surface.ValidateBatch(pt.toolInvocationsWithSurface(ctx, resp.ToolCalls, surface)); err != nil {
 			return "", err
 		}
 
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -109,7 +140,7 @@ func (pt *PipelineTester) executeToolLoop(ctx context.Context, req *providers.Re
 			return "", fmt.Errorf("pipeline tester repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := pt.applyToolCalls(ctx, req, resp)
+		errCount, rerouted := pt.applyToolCalls(ctx, req, resp, surface)
 		pt.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
@@ -138,6 +169,7 @@ func (pt *PipelineTester) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
+	surface toolruntime.Surface,
 ) (int, bool) {
 	req.Messages = append(req.Messages, providers.Message{
 		Role:      providers.RoleAssistant,
@@ -152,7 +184,7 @@ func (pt *PipelineTester) applyToolCalls(
 		var execResult toolruntime.ExecutionResult
 		var execErr error
 		result, err := shared.TimedToolCall(ctx, "tester-pipeline", call, func() (string, error) {
-			execResult, execErr = pt.executeToolCall(ctx, call)
+			execResult, execErr = pt.executeToolCallWithSurface(ctx, call, surface)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
@@ -198,9 +230,20 @@ func (pt *PipelineTester) applyToolCalls(
 
 // executeToolCall invokes a skill by name with JSON arguments.
 func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	return pt.executeToolCallWithSurface(ctx, call, pt.toolRuntime())
+}
+
+func (pt *PipelineTester) executeToolCallWithSurface(
+	ctx context.Context,
+	call providers.ToolCall,
+	surface toolruntime.Surface,
+) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
+	}
+	if surface == nil {
+		surface = pt.toolRuntime()
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -210,16 +253,27 @@ func (pt *PipelineTester) executeToolCall(ctx context.Context, call providers.To
 	if !json.Valid([]byte(raw)) {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
+	}
+	if err := shared.ValidateTaskExecutionCall(ctx, "tester-pipeline", name, input); err != nil {
+		return toolruntime.ExecutionResult{}, err
+	}
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = pt.id + "-local"
 	}
-	return pt.toolRuntime().Execute(ctx, toolruntime.Invocation{
+	result, err := surface.Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         pt.toolRuntime().AgentID(),
+		AgentID:         surface.AgentID(),
 		CorrelationID:   correlationID,
-		CapabilityScope: pt.toolRuntime().CapabilityScope(),
+		CapabilityScope: surface.CapabilityScope(),
 	})
+	if err == nil {
+		shared.RecordTaskExecutionSuccess(ctx, name, input)
+	}
+	return result, err
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -234,8 +288,15 @@ func (pt *PipelineTester) prepareSkillsForInput(input string) {
 
 // buildToolDefinitions converts loaded skills to provider tool format.
 func (pt *PipelineTester) buildToolDefinitions() []providers.Tool {
-	pt.toolRuntime().SyncActiveFromLoaded()
-	return pt.toolRuntime().BuildToolDefinitions()
+	return pt.buildToolDefinitionsWithSurface(pt.toolRuntime())
+}
+
+func (pt *PipelineTester) buildToolDefinitionsWithSurface(surface toolruntime.Surface) []providers.Tool {
+	if surface == nil {
+		return nil
+	}
+	surface.SyncActiveFromLoaded()
+	return surface.BuildToolDefinitions()
 }
 
 func (pt *PipelineTester) toolRuntime() *toolruntime.Runtime {
@@ -243,19 +304,30 @@ func (pt *PipelineTester) toolRuntime() *toolruntime.Runtime {
 }
 
 func (pt *PipelineTester) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	return pt.toolInvocationsWithSurface(ctx, calls, pt.toolRuntime())
+}
+
+func (pt *PipelineTester) toolInvocationsWithSurface(
+	ctx context.Context,
+	calls []providers.ToolCall,
+	surface toolruntime.Surface,
+) []toolruntime.Invocation {
 	if len(calls) == 0 {
 		return nil
+	}
+	if surface == nil {
+		surface = pt.toolRuntime()
 	}
 	correlationID := shared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = pt.id + "-local"
 	}
-	scope := pt.toolRuntime().CapabilityScope()
+	scope := surface.CapabilityScope()
 	invocations := make([]toolruntime.Invocation, 0, len(calls))
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         pt.toolRuntime().AgentID(),
+			AgentID:         surface.AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

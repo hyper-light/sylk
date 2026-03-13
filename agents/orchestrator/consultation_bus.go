@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/google/uuid"
 )
 
@@ -85,15 +86,34 @@ func (o *Orchestrator) requestRouteSync(
 		return nil, fmt.Errorf("publish route request: %w", err)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, orchestratorRouteSyncTimeout)
-	defer cancel()
-
-	select {
-	case resp := <-waitCh:
-		return resp, nil
-	case <-timeoutCtx.Done():
-		return nil, fmt.Errorf("route request to %s timed out after %v", target, orchestratorRouteSyncTimeout)
+	var response *guide.Message
+	err = shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+		AttemptTimeout: orchestratorRouteSyncTimeout,
+		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
+		OnRefresh: func(info shared.ContextLeaseRefresh) {
+			o.logInfo("orchestrator route wait lease refreshed",
+				"target", target,
+				"correlation_id", correlationID,
+				"refresh_count", info.RefreshCount,
+				"attempt_timeout", info.AttemptTimeout.String(),
+				"error", info.Error)
+		},
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case response = <-waitCh:
+			return nil
+		}
+	})
+	if err != nil {
+		return nil, shared.WrapLeaseTimeoutError(
+			fmt.Sprintf("route request to %s", target),
+			orchestratorRouteSyncTimeout,
+			err,
+		)
 	}
+	return response, nil
 }
 
 func encodeRouteSyncInput(input any) (string, error) {

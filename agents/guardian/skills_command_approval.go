@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
@@ -130,17 +131,31 @@ func (g *Guardian) requestCommandApproval(ctx context.Context, proposal *command
 		return ApprovalResult{}, fmt.Errorf("publish command approval proposal: %w", err)
 	}
 
-	timer := time.NewTimer(DefaultApprovalTTL)
-	defer timer.Stop()
-
-	select {
-	case result := <-ch:
-		return result, nil
-	case <-timer.C:
-		return ApprovalResult{}, fmt.Errorf("command approval timed out after %v", DefaultApprovalTTL)
-	case <-ctx.Done():
-		return ApprovalResult{}, ctx.Err()
+	var result ApprovalResult
+	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+		AttemptTimeout: DefaultApprovalTTL,
+		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
+		OnRefresh: func(info shared.ContextLeaseRefresh) {
+			if g.logger != nil {
+				g.logger.Info("command approval wait lease refreshed",
+					"correlation_id", correlationID,
+					"refresh_count", info.RefreshCount,
+					"attempt_timeout", info.AttemptTimeout.String(),
+					"error", info.Error)
+			}
+		},
+	}, func(waitCtx context.Context) error {
+		select {
+		case result = <-ch:
+			return nil
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		}
+	})
+	if err != nil {
+		return ApprovalResult{}, shared.WrapLeaseTimeoutError("command approval", DefaultApprovalTTL, err)
 	}
+	return result, nil
 }
 
 func firstNonEmptyApprovalReason(values ...string) string {

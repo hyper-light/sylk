@@ -85,16 +85,36 @@ func (e *Engineer) requestConsultSync(ctx context.Context, req *guide.RouteReque
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, routeSyncTimeout)
-	defer cancel()
-
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("consultation to %q timed out after %s: %w",
-			req.TargetAgentID, routeSyncTimeout, ctx.Err())
-	case response := <-waitCh:
-		return response, nil
+	var response *guide.Message
+	err := shared.RunWithContextLease(ctx, shared.ContextLeaseConfig{
+		AttemptTimeout: routeSyncTimeout,
+		MaxRefreshes:   shared.DefaultConsultationLeaseRefreshes,
+		OnRefresh: func(info shared.ContextLeaseRefresh) {
+			if e.logger != nil {
+				e.logger.Info("consultation wait lease refreshed",
+					"target", req.TargetAgentID,
+					"correlation_id", req.CorrelationID,
+					"refresh_count", info.RefreshCount,
+					"attempt_timeout", info.AttemptTimeout.String(),
+					"error", info.Error)
+			}
+		},
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case response = <-waitCh:
+			return nil
+		}
+	})
+	if err != nil {
+		return nil, shared.WrapLeaseTimeoutError(
+			fmt.Sprintf("consultation to %q", req.TargetAgentID),
+			routeSyncTimeout,
+			err,
+		)
 	}
+	return response, nil
 }
 
 // requestConsultation is the high-level consultation helper that builds a

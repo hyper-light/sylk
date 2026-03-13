@@ -1,7 +1,7 @@
 // Package pipeline implements the Pipeline Tester agent — a per-task quality
 // engineer that validates individual task implementations within pipelines.
 // It gates on Inspector completion and uses GPT-5.4 Pro with xhigh reasoning
-// to drive a 6-phase testing protocol through an OpenAI tool loop.
+// to satisfy contract-driven testing obligations through an OpenAI tool loop.
 package pipeline
 
 import (
@@ -423,6 +423,7 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	prevRuntime := pt.swapTaskRuntime(task, gatePassedForTask(task))
 	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
+	contract := agentshared.BuildTaskExecutionContract(task)
 
 	pt.mu.RLock()
 	wt := pt.workerType
@@ -440,12 +441,20 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		}
 	}
 
-	systemPrompt := shared.PipelineTesterSystemPromptForWorker(wt)
+	systemPrompt := shared.PipelineTesterSystemPromptForWorkerAndContract(wt, contract)
 	if task != nil {
 		systemPrompt = agentshared.AppendPipelineSystemContext(systemPrompt, task)
 	}
+	systemPrompt = agentshared.AppendTaskExecutionGuidance(systemPrompt, contract, "tester-pipeline")
 	pt.prepareSkillsForInput(userMessage)
-	tools := pt.buildToolDefinitions()
+	surface, err := agentshared.TaskToolSurface(pt.toolRuntime(), contract, "tester-pipeline")
+	if err != nil {
+		pt.logger.Warn("build task tool surface", "error", err)
+		surface = pt.toolRuntime()
+	}
+	ctx = agentshared.WithTaskExecutionContract(ctx, contract)
+	ctx = agentshared.WithTaskExecutionState(ctx, agentshared.NewTaskExecutionState())
+	tools := pt.buildToolDefinitionsWithSurface(surface)
 
 	req := &providers.Request{
 		SystemPrompt: systemPrompt,
@@ -463,7 +472,7 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 
 	ledger := agentshared.SteeringLedgerFromContext(ctx)
 	result, err := agentshared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return pt.executeToolLoop(ctx, req, ledger)
+		return pt.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
 		if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {

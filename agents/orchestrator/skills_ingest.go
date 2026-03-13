@@ -10,6 +10,8 @@ import (
 
 	"github.com/adalundhe/sylk/agents/architect"
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
@@ -74,65 +76,267 @@ func analyzePlanSkill(o *Orchestrator) *skills.Skill {
 // ingestPlan parses a PlanHandoff, creates orchestrator state, builds a DAG,
 // and submits it for execution.
 func (o *Orchestrator) ingestPlan(ctx context.Context, planJSON string) (any, error) {
+	attempt, duplicate, err := o.preparePlanHandoffIngest(ctx, planJSON)
+	if err != nil {
+		return nil, err
+	}
+	if duplicate {
+		return o.handoffResultFromReceipt(attempt.receipt, true), nil
+	}
+	if err := attempt.ingest(ctx); err != nil {
+		return nil, err
+	}
+	return attempt.result(), nil
+}
+
+type planHandoffIngestAttempt struct {
+	orchestrator *Orchestrator
+	handoff      *architect.PlanHandoff
+	workflowID   string
+	receipt      *PlanHandoffReceiptRecord
+	preflight    *guardianPlanPreflight
+	dag          *dag.DAG
+	dagID        string
+}
+
+func (o *Orchestrator) preparePlanHandoffIngest(
+	ctx context.Context,
+	planJSON string,
+) (*planHandoffIngestAttempt, bool, error) {
+	handoff, err := parseValidatedPlanHandoff(planJSON)
+	if err != nil {
+		return nil, false, err
+	}
+	attempt := newPlanHandoffIngestAttempt(o, handoff)
+	receipt, duplicate, err := o.beginPlanHandoffReceiptForAttempt(ctx, attempt)
+	if err != nil {
+		return nil, false, err
+	}
+	attempt.receipt = receipt
+	return attempt, duplicate, nil
+}
+
+func parseValidatedPlanHandoff(planJSON string) (*architect.PlanHandoff, error) {
 	var handoff architect.PlanHandoff
 	if err := json.Unmarshal([]byte(planJSON), &handoff); err != nil {
 		return nil, fmt.Errorf("invalid plan handoff JSON: %w", err)
 	}
-
 	if err := validateHandoff(&handoff); err != nil {
 		return nil, fmt.Errorf("plan handoff validation failed: %w", err)
 	}
+	return &handoff, nil
+}
 
-	preflight, err := o.guardianPreflightPlan(ctx, &handoff)
+func newPlanHandoffIngestAttempt(
+	o *Orchestrator,
+	handoff *architect.PlanHandoff,
+) *planHandoffIngestAttempt {
+	return &planHandoffIngestAttempt{
+		orchestrator: o,
+		handoff:      handoff,
+		workflowID:   "wf_" + handoff.PlanID,
+	}
+}
+
+func (o *Orchestrator) beginPlanHandoffReceiptForAttempt(
+	ctx context.Context,
+	attempt *planHandoffIngestAttempt,
+) (*PlanHandoffReceiptRecord, bool, error) {
+	receipt, duplicate, err := o.store.BeginPlanHandoffReceipt(
+		attempt.handoff.SessionID,
+		attempt.handoff.PlanID,
+		attempt.handoff.Revision,
+		handoffCorrelationIDFromContext(ctx),
+		handoffRequesterAgentIDFromContext(ctx),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("guardian preflight failed: %w", err)
+		return nil, false, fmt.Errorf("begin handoff receipt: %w", err)
 	}
+	if !duplicate {
+		o.publishPlanHandoffReceiptUpdate(receipt, "accepted")
+		return receipt, false, nil
+	}
+	normalized, normErr := o.normalizePlanHandoffReceipt(receipt)
+	if normErr != nil {
+		return nil, false, fmt.Errorf("normalize duplicate handoff receipt: %w", normErr)
+	}
+	return normalized, true, nil
+}
 
-	// Build orchestrator state from the handoff.
-	wfID := "wf_" + handoff.PlanID
-	o.createWorkflowAndTasks(&handoff, wfID, preflight)
+func (a *planHandoffIngestAttempt) ingest(ctx context.Context) error {
+	if err := a.prepareExecution(ctx); err != nil {
+		return err
+	}
+	if err := a.submitExecution(ctx); err != nil {
+		return err
+	}
+	a.publishIngestedEvent()
+	return nil
+}
 
-	// Build DAG from task graph.
-	d, err := buildDAGFromHandoff(&handoff)
+func (a *planHandoffIngestAttempt) prepareExecution(ctx context.Context) error {
+	preflight, err := a.orchestrator.guardianPreflightPlan(ctx, a.handoff)
 	if err != nil {
-		return nil, fmt.Errorf("dag construction failed: %w", err)
+		return a.fail("guardian_preflight", "guardian preflight failed", err)
 	}
-
-	// Submit to DAG bridge for execution.
-	if o.dagBridge == nil {
-		return nil, fmt.Errorf("dag bridge unavailable (no project directory)")
-	}
-	dagID, err := o.dagBridge.Execute(ctx, d, handoff.PlanID, handoff.SessionID)
+	a.preflight = preflight
+	a.orchestrator.createWorkflowAndTasks(a.handoff, a.workflowID, preflight)
+	built, err := buildDAGFromHandoff(a.handoff)
 	if err != nil {
-		return nil, fmt.Errorf("dag execution failed: %w", err)
+		return a.fail("dag_build", "dag construction failed", err)
 	}
+	a.dag = built
+	a.recordDAGBuilt()
+	return nil
+}
 
-	// Notify the LLM loop about the plan ingestion so it can analyze the DAG.
-	o.pushEvent(&busEvent{
+func (a *planHandoffIngestAttempt) submitExecution(ctx context.Context) error {
+	if a.orchestrator.dagBridge == nil {
+		return a.fail("dag_bridge_unavailable", "dag bridge unavailable (no project directory)", fmt.Errorf("dag bridge unavailable"))
+	}
+	dagID, err := a.orchestrator.dagBridge.Execute(ctx, a.dag, a.handoff.PlanID, a.handoff.SessionID)
+	if err != nil {
+		return a.fail("dag_execute", "dag execution failed", err)
+	}
+	a.dagID = dagID
+	a.recordSubmitted()
+	return nil
+}
+
+func (a *planHandoffIngestAttempt) fail(stage, message string, cause error) error {
+	a.recordFailure(stage, cause)
+	return fmt.Errorf("%s: %w", message, cause)
+}
+
+func (a *planHandoffIngestAttempt) recordFailure(stage string, stageErr error) {
+	if stageErr == nil {
+		return
+	}
+	receipt, err := a.orchestrator.store.UpdatePlanHandoffReceiptStage(
+		a.handoff.SessionID,
+		a.handoff.PlanID,
+		a.handoff.Revision,
+		agentshared.PlanHandoffReceiptStatusFailed,
+		a.workflowID,
+		"",
+		len(a.handoff.Tasks),
+		len(a.handoff.ExecutionLayers),
+		fmt.Sprintf("%s: %s", stage, stageErr.Error()),
+	)
+	if err != nil {
+		a.orchestrator.logTrace("plan_handoff_receipt_fail_update_failed", agentlog.EventError, map[string]any{
+			"plan_id":     a.handoff.PlanID,
+			"revision":    a.handoff.Revision,
+			"stage":       stage,
+			"stage_error": stageErr.Error(),
+			"error":       err.Error(),
+		})
+		return
+	}
+	a.receipt = receipt
+	a.orchestrator.publishPlanHandoffReceiptUpdate(receipt, "failed")
+}
+
+func (a *planHandoffIngestAttempt) recordDAGBuilt() {
+	receipt, err := a.orchestrator.store.UpdatePlanHandoffReceiptStage(
+		a.handoff.SessionID,
+		a.handoff.PlanID,
+		a.handoff.Revision,
+		agentshared.PlanHandoffReceiptStatusDAGBuilt,
+		a.workflowID,
+		"",
+		len(a.handoff.Tasks),
+		len(a.handoff.ExecutionLayers),
+		"",
+	)
+	if err != nil {
+		a.orchestrator.logTrace("plan_handoff_receipt_dag_built_failed", agentlog.EventError, map[string]any{
+			"plan_id":  a.handoff.PlanID,
+			"revision": a.handoff.Revision,
+			"error":    err.Error(),
+		})
+		return
+	}
+	a.receipt = receipt
+	a.orchestrator.publishPlanHandoffReceiptUpdate(receipt, "dag_built")
+}
+
+func (a *planHandoffIngestAttempt) recordSubmitted() {
+	receipt, err := a.orchestrator.store.UpdatePlanHandoffReceiptStage(
+		a.handoff.SessionID,
+		a.handoff.PlanID,
+		a.handoff.Revision,
+		agentshared.PlanHandoffReceiptStatusSubmitted,
+		a.workflowID,
+		a.dagID,
+		len(a.handoff.Tasks),
+		len(a.handoff.ExecutionLayers),
+		"",
+	)
+	if err != nil {
+		a.orchestrator.logTrace("plan_handoff_receipt_submitted_failed", agentlog.EventError, map[string]any{
+			"plan_id":  a.handoff.PlanID,
+			"revision": a.handoff.Revision,
+			"dag_id":   a.dagID,
+			"error":    err.Error(),
+		})
+		return
+	}
+	a.receipt = receipt
+	a.orchestrator.publishPlanHandoffReceiptUpdate(receipt, "submitted")
+}
+
+func (a *planHandoffIngestAttempt) publishIngestedEvent() {
+	a.orchestrator.pushEvent(&busEvent{
 		Topic:     "plan.ingested",
 		Timestamp: time.Now(),
 		Severity:  severityInfo,
-		Summary:   fmt.Sprintf("Plan %s ingested: %d tasks, %d layers, DAG %s", handoff.PlanID, len(handoff.Tasks), len(handoff.ExecutionLayers), dagID),
+		Summary: fmt.Sprintf(
+			"Plan %s ingested: %d tasks, %d layers, DAG %s",
+			a.handoff.PlanID,
+			len(a.handoff.Tasks),
+			len(a.handoff.ExecutionLayers),
+			a.dagID,
+		),
 		Data: map[string]any{
-			"plan_id":     handoff.PlanID,
-			"dag_id":      dagID,
-			"task_count":  len(handoff.Tasks),
-			"layer_count": len(handoff.ExecutionLayers),
-			"trigger":     handoff.Trigger,
-			"guardian":    preflight.summaryPayload(),
+			"plan_id":     a.handoff.PlanID,
+			"dag_id":      a.dagID,
+			"task_count":  len(a.handoff.Tasks),
+			"layer_count": len(a.handoff.ExecutionLayers),
+			"trigger":     a.handoff.Trigger,
+			"guardian":    a.preflight.summaryPayload(),
 		},
 	})
+}
 
+func (a *planHandoffIngestAttempt) result() map[string]any {
 	return map[string]any{
 		"ingested":       true,
-		"plan_id":        handoff.PlanID,
-		"dag_id":         dagID,
-		"workflow_id":    wfID,
-		"task_count":     len(handoff.Tasks),
-		"layer_count":    len(handoff.ExecutionLayers),
-		"guardian_gate":  preflight.summaryPayload(),
-		"guardian_clean": preflight.Clean(),
-	}, nil
+		"duplicate":      false,
+		"receipt_id":     receiptIDOf(a.receipt),
+		"receipt_status": receiptStatusOf(a.receipt),
+		"plan_id":        a.handoff.PlanID,
+		"dag_id":         a.dagID,
+		"workflow_id":    a.workflowID,
+		"task_count":     len(a.handoff.Tasks),
+		"layer_count":    len(a.handoff.ExecutionLayers),
+		"guardian_gate":  a.preflight.summaryPayload(),
+		"guardian_clean": a.preflight.Clean(),
+	}
+}
+
+func receiptIDOf(receipt *PlanHandoffReceiptRecord) string {
+	if receipt == nil {
+		return ""
+	}
+	return receipt.ReceiptID
+}
+
+func receiptStatusOf(receipt *PlanHandoffReceiptRecord) string {
+	if receipt == nil {
+		return ""
+	}
+	return string(receipt.Status)
 }
 
 func validateHandoff(h *architect.PlanHandoff) error {

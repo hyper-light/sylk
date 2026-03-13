@@ -37,8 +37,6 @@ func designerVisibleSkillNames() []string {
 
 func designerMutatingSkillNames() []string {
 	return []string{
-		"component_create",
-		"component_modify",
 		"write_pipeline_file",
 		"edit_pipeline_file",
 		"delete_pipeline_file",

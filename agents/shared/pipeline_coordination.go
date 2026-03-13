@@ -117,38 +117,45 @@ func (c CoordinationClient) requestWithTimeout(ctx context.Context, action strin
 		return fmt.Errorf("publish coordination action %s: %w", action, err)
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	select {
-	case <-waitCtx.Done():
-		return fmt.Errorf("coordination action %s timed out after %s: %w", action, timeout, waitCtx.Err())
-	case msg := <-waitCh:
-		if msg == nil {
-			return fmt.Errorf("coordination action %s returned empty response", action)
-		}
-		resp, ok := msg.GetRouteResponse()
-		if !ok || resp == nil {
-			if errText, ok := msg.GetError(); ok && strings.TrimSpace(errText) != "" {
-				return fmt.Errorf("coordination action %s failed: %s", action, errText)
-			}
-			return fmt.Errorf("coordination action %s returned invalid response", action)
-		}
-		if !resp.Success {
-			return fmt.Errorf("coordination action %s failed: %s", action, resp.Error)
-		}
-		if out == nil {
+	var msg *guide.Message
+	err := RunWithContextLease(ctx, ContextLeaseConfig{
+		AttemptTimeout: timeout,
+		MaxRefreshes:   DefaultConsultationLeaseRefreshes,
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case msg = <-waitCh:
 			return nil
 		}
-		encoded, err := json.Marshal(resp.Data)
-		if err != nil {
-			return fmt.Errorf("encode coordination action %s result: %w", action, err)
+	})
+	if err != nil {
+		return WrapLeaseTimeoutError(fmt.Sprintf("coordination action %s", action), timeout, err)
+	}
+	if msg == nil {
+		return fmt.Errorf("coordination action %s returned empty response", action)
+	}
+	resp, ok := msg.GetRouteResponse()
+	if !ok || resp == nil {
+		if errText, ok := msg.GetError(); ok && strings.TrimSpace(errText) != "" {
+			return fmt.Errorf("coordination action %s failed: %s", action, errText)
 		}
-		if err := json.Unmarshal(encoded, out); err != nil {
-			return fmt.Errorf("decode coordination action %s result: %w", action, err)
-		}
+		return fmt.Errorf("coordination action %s returned invalid response", action)
+	}
+	if !resp.Success {
+		return fmt.Errorf("coordination action %s failed: %s", action, resp.Error)
+	}
+	if out == nil {
 		return nil
 	}
+	encoded, err := json.Marshal(resp.Data)
+	if err != nil {
+		return fmt.Errorf("encode coordination action %s result: %w", action, err)
+	}
+	if err := json.Unmarshal(encoded, out); err != nil {
+		return fmt.Errorf("decode coordination action %s result: %w", action, err)
+	}
+	return nil
 }
 
 func (c CoordinationClient) eventBus() guide.EventBus {

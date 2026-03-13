@@ -142,7 +142,7 @@ func prefillTail(accumulated string, limit int) string {
 // runContinuationLoop manages multi-round continuation of a truncated response.
 // Called only when the initial request hit max_tokens.
 func (p *anthropicPlanner) runContinuationLoop(
-	ctx context.Context,
+	lease *plannerRequestLease,
 	prompt string,
 	initial *streamResult,
 	cfg continuationConfig,
@@ -155,10 +155,10 @@ func (p *anthropicPlanner) runContinuationLoop(
 		"stage", stage,
 		"max_rounds", cfg.maxRounds,
 		"initial_len", len(initial.Text),
-		"ctx_deadline", contextDeadlineString(ctx))
+		"ctx_deadline", contextDeadlineString(lease.parent))
 	state := initContinuationState(initial, mode, cfg)
 	loopStart := time.Now()
-	p.executeRounds(ctx, prompt, &state, cfg, system, stage, onChunk)
+	p.executeRounds(lease, prompt, &state, cfg, system, stage, onChunk)
 	p.logger.Info("runContinuationLoop: done",
 		"stage", stage,
 		"rounds_used", state.metrics.roundsUsed,
@@ -174,7 +174,7 @@ func (p *anthropicPlanner) runContinuationLoop(
 // the model completes naturally, progress decays, structure completes,
 // the AIMD window is exhausted, or the context deadline approaches.
 func (p *anthropicPlanner) executeRounds(
-	ctx context.Context,
+	lease *plannerRequestLease,
 	prompt string,
 	state *continuationState,
 	cfg continuationConfig,
@@ -185,11 +185,7 @@ func (p *anthropicPlanner) executeRounds(
 	aimd := newContinuationAIMD(cfg.maxRounds)
 
 	for round := range cfg.maxRounds { // hard ceiling unchanged
-		if round >= aimd.AllowedRounds() {
-			p.logger.Info("executeRounds: AIMD window exhausted",
-				"stage", stage, "round", round,
-				"allowed", aimd.AllowedRounds())
-			state.metrics.abortReason = "aimd_window_exhausted"
+		if p.continuationWindowExhausted(state, stage, round, aimd) {
 			return
 		}
 		p.logger.Info("executeRounds: starting round",
@@ -199,9 +195,9 @@ func (p *anthropicPlanner) executeRounds(
 			"aimd_allowed", aimd.AllowedRounds(),
 			"progress_ema", state.progress.ema,
 			"accumulated_len", state.length,
-			"ctx_deadline", contextDeadlineString(ctx))
+			"ctx_deadline", contextDeadlineString(lease.parent))
 		roundStart := time.Now()
-		if !p.continuationRound(ctx, prompt, state, cfg, system, stage, onChunk) {
+		if !p.continuationRound(lease, prompt, state, cfg, system, stage, onChunk) {
 			p.logger.Info("executeRounds: round signaled stop",
 				"stage", stage, "round", round,
 				"elapsed", time.Since(roundStart).String(),
@@ -213,22 +209,45 @@ func (p *anthropicPlanner) executeRounds(
 			"elapsed", time.Since(roundStart).String(),
 			"net_new_total", state.metrics.netNewBytesTotal,
 			"progress_healthy", state.progress.isHealthy(cfg.progressThreshold))
-		// Feed progress signal back to AIMD.
-		if state.progress.isHealthy(cfg.progressThreshold) {
-			aimd.OnProgress()
-		} else {
-			aimd.OnStall()
-		}
+		p.advanceContinuationWindow(state, cfg, aimd)
 	}
 	p.logger.Info("executeRounds: max rounds exhausted",
 		"stage", stage, "max_rounds", cfg.maxRounds)
 	state.metrics.abortReason = "max_rounds_exhausted"
 }
 
+func (p *anthropicPlanner) continuationWindowExhausted(
+	state *continuationState,
+	stage string,
+	round int,
+	aimd *continuationAIMD,
+) bool {
+	if round < aimd.AllowedRounds() {
+		return false
+	}
+	p.logger.Info("executeRounds: AIMD window exhausted",
+		"stage", stage, "round", round,
+		"allowed", aimd.AllowedRounds())
+	state.metrics.abortReason = "aimd_window_exhausted"
+	return true
+}
+
+func (p *anthropicPlanner) advanceContinuationWindow(
+	state *continuationState,
+	cfg continuationConfig,
+	aimd *continuationAIMD,
+) {
+	if state.progress.isHealthy(cfg.progressThreshold) {
+		aimd.OnProgress()
+		return
+	}
+	aimd.OnStall()
+}
+
 // continuationRound executes a single continuation request. Returns true to
 // continue the loop, false to stop.
 func (p *anthropicPlanner) continuationRound(
-	ctx context.Context,
+	lease *plannerRequestLease,
 	prompt string,
 	state *continuationState,
 	cfg continuationConfig,
@@ -236,14 +255,14 @@ func (p *anthropicPlanner) continuationRound(
 	stage string,
 	onChunk func(string),
 ) bool {
-	if !hasTimeForContinuation(ctx) {
+	if !hasTimeForContinuation(lease.parent) {
 		p.logger.Info("continuationRound: insufficient time remaining",
 			"stage", stage,
-			"ctx_deadline", contextDeadlineString(ctx))
+			"ctx_deadline", contextDeadlineString(lease.parent))
 		state.metrics.abortReason = "context_deadline"
 		return false
 	}
-	return p.executeContinuationRound(ctx, prompt, state, cfg, system, stage, onChunk)
+	return p.executeContinuationRound(lease, prompt, state, cfg, system, stage, onChunk)
 }
 
 // perRoundTimeoutCap is the maximum time allowed for a single continuation
@@ -255,7 +274,7 @@ const perRoundTimeoutCap = 90 * time.Second
 // Each round is bounded by min(p.timeout, perRoundTimeoutCap) to prevent
 // a single round from consuming the entire operation budget.
 func (p *anthropicPlanner) executeContinuationRound(
-	ctx context.Context,
+	lease *plannerRequestLease,
 	prompt string,
 	state *continuationState,
 	cfg continuationConfig,
@@ -266,17 +285,29 @@ func (p *anthropicPlanner) executeContinuationRound(
 	state.metrics.roundsUsed++
 
 	roundTimeout := min(p.timeout, perRoundTimeoutCap)
-	roundCtx, roundCancel := context.WithTimeout(ctx, roundTimeout)
-	defer roundCancel()
-
 	p.logger.Info("executeContinuationRound: requesting continuation",
 		"stage", stage,
 		"round", state.metrics.roundsUsed,
 		"accumulated_len", state.length,
 		"round_timeout", roundTimeout.String(),
-		"ctx_deadline", contextDeadlineString(roundCtx))
+		"ctx_deadline", contextDeadlineString(lease.parent))
 	reqStart := time.Now()
-	result, err := p.requestContinuation(roundCtx, prompt, state.lastSnapshot, state.lastStructure, state.mode, cfg, system, stage, onChunk)
+	var result *streamResult
+	err := lease.run(roundTimeout, false, func(roundCtx context.Context) error {
+		var innerErr error
+		result, innerErr = p.requestContinuation(
+			roundCtx,
+			prompt,
+			state.lastSnapshot,
+			state.lastStructure,
+			state.mode,
+			cfg,
+			system,
+			stage,
+			nil,
+		)
+		return innerErr
+	})
 	if err != nil {
 		p.logger.Warn("executeContinuationRound: request failed",
 			"stage", stage,
@@ -291,7 +322,7 @@ func (p *anthropicPlanner) executeContinuationRound(
 		"round", state.metrics.roundsUsed,
 		"elapsed", time.Since(reqStart).String(),
 		"result_len", len(result.Text))
-	return applyContinuationResult(state, result, cfg)
+	return applyContinuationResult(state, result, cfg, onChunk)
 }
 
 // requestContinuation builds a multi-turn prefill request with structural
@@ -329,13 +360,22 @@ func applyContinuationResult(
 	state *continuationState,
 	result *streamResult,
 	cfg continuationConfig,
+	onChunk func(string),
 ) bool {
 	overlap := detectModeOverlap(state.mode, state.lastSnapshot, result.Text, cfg.overlapSearchLimit)
+	streamContinuationNetNew(onChunk, overlap.netNew)
 	stitchResult(state, &overlap, result)
 	// One .String() and one analyzeStructure per round — cached for next round.
 	state.lastSnapshot = state.accumulated.String()
 	state.lastStructure = analyzeStructure(state.mode, state.lastSnapshot)
 	return shouldContinue(state, result, overlap, cfg)
+}
+
+func streamContinuationNetNew(onChunk func(string), netNew string) {
+	if onChunk == nil || netNew == "" {
+		return
+	}
+	onChunk(netNew)
 }
 
 // stitchResult appends net-new content, updates metrics, and merges usage.

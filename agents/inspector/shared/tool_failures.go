@@ -1,11 +1,14 @@
 package shared
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 func unavailableToolIssues(tool string) []ValidationIssue {
 	return []ValidationIssue{{
 		ID:       tool + "_unavailable",
-		Severity: Critical,
+		Severity: Info,
 		Message:  fmt.Sprintf("%s is unavailable in the current execution environment", tool),
 		RuleID:   tool + "-unavailable",
 	}}
@@ -14,7 +17,7 @@ func unavailableToolIssues(tool string) []ValidationIssue {
 func executionFailureIssues(tool string, err error) []ValidationIssue {
 	return []ValidationIssue{{
 		ID:       tool + "_execution_failed",
-		Severity: Critical,
+		Severity: Medium,
 		Message:  fmt.Sprintf("%s execution failed: %v", tool, err),
 		RuleID:   tool + "-execution",
 	}}
@@ -23,8 +26,21 @@ func executionFailureIssues(tool string, err error) []ValidationIssue {
 func parseFailureIssues(tool string, err error) []ValidationIssue {
 	return []ValidationIssue{{
 		ID:       tool + "_parse_failed",
-		Severity: Critical,
+		Severity: Medium,
 		Message:  fmt.Sprintf("%s output could not be parsed: %v", tool, err),
 		RuleID:   tool + "-parse",
+	}}
+}
+
+func informationalToolIssues(tool, message string) []ValidationIssue {
+	id := strings.NewReplacer(" ", "_", "/", "_", "-", "_").Replace(strings.TrimSpace(tool))
+	if id == "" {
+		id = "tool"
+	}
+	return []ValidationIssue{{
+		ID:       id + "_info",
+		Severity: Info,
+		Message:  strings.TrimSpace(message),
+		RuleID:   id + "-info",
 	}}
 }

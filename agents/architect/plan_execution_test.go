@@ -2,12 +2,14 @@ package architect
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/dag"
 )
 
@@ -21,8 +23,10 @@ func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
 		_ = store.Upsert(p)
 	}
 	return &Architect{
-		planStore: store,
-		logger:    slog.Default(),
+		planStore:   store,
+		logger:      slog.Default(),
+		pendingBus:  make(map[string]chan *guide.Message),
+		knownAgents: make(map[string]*guide.AgentAnnouncement),
 	}
 }
 
@@ -245,6 +249,199 @@ func TestHandleExecute_ReturnsPendingMessageWhenPlanWorkIsInFlight(t *testing.T)
 	}
 }
 
+func TestHandleConversation_UsesMetadataPlanIDAcrossSessionDrift(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-convo",
+		SessionID: "sess-plan",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:      string(continuationKindGuardianApproval),
+			Status:    string(continuationStatusPending),
+			Message:   "Guardian is still reviewing the plan.",
+			ExpiresAt: now.Add(time.Minute),
+		},
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
+		Input:     "any updates?",
+		SessionID: "sess-drifted",
+		Metadata:  map[string]any{"plan_id": plan.ID},
+		Intent:    guide.IntentChat,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
+	}
+	if conv.Response != "Guardian is still reviewing the plan." {
+		t.Fatalf("response = %q, want pending message", conv.Response)
+	}
+}
+
+func TestHandleConversation_ClearsExpiredPendingWorkBeforeReturningPendingMessage(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-expired-pending",
+		SessionID: "sess-plan",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:      string(continuationKindAcceptanceEval),
+			Status:    string(continuationStatusPending),
+			Message:   "I'm reviewing your response against the current plan now. I'll update you shortly.",
+			ExpiresAt: now.Add(-time.Second),
+		},
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: plan.SessionID,
+		Intent:    guide.IntentChat,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
+	}
+	if strings.Contains(conv.Response, "reviewing your response against the current plan") {
+		t.Fatalf("response = %q, want stale pending message to be cleared", conv.Response)
+	}
+	if !strings.Contains(conv.Response, "I still have a previous plan ready") {
+		t.Fatalf("response = %q, want resume suggestion after clearing stale pending", conv.Response)
+	}
+	if plan.PendingWork != nil {
+		t.Fatalf("expected stale pending work to clear, got %+v", plan.PendingWork)
+	}
+}
+
+func TestHandleConversation_ClearsExpiredMetadataPendingWorkAcrossSessionDrift(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-expired-metadata",
+		SessionID: "sess-plan",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:      string(continuationKindAcceptanceEval),
+			Status:    string(continuationStatusPending),
+			Message:   "I'm reviewing your response against the current plan now. I'll update you shortly.",
+			ExpiresAt: now.Add(-time.Second),
+		},
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: "sess-drifted",
+		Metadata:  map[string]any{"plan_id": plan.ID},
+		Intent:    guide.IntentChat,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
+	}
+	if strings.Contains(conv.Response, "reviewing your response against the current plan") {
+		t.Fatalf("response = %q, want stale pending message to be cleared", conv.Response)
+	}
+	if !strings.Contains(conv.Response, "tool runtime is not configured") {
+		t.Fatalf("response = %q, want route_plan_acceptance fallback after clearing stale pending", conv.Response)
+	}
+	if plan.PendingWork != nil {
+		t.Fatalf("expected stale pending work to clear, got %+v", plan.PendingWork)
+	}
+}
+
+func TestHandleConversation_OffersResumeSuggestionForUniqueRecoveredReadyPlanAcrossSessionDrift(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-unique-recovered",
+		SessionID: "sess-original",
+		Query:     "build the feature",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
+		Input:     "what's next?",
+		SessionID: "sess-drifted",
+		Intent:    guide.IntentChat,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
+	}
+	if !strings.Contains(conv.Response, `I still have a previous plan ready for "build the feature".`) {
+		t.Fatalf("response = %q, want unique recovered resume suggestion", conv.Response)
+	}
+	if conv.Directive != nil {
+		t.Fatalf("directive = %+v, want nil so the old plan is not silently re-armed", conv.Directive)
+	}
+}
+
+func TestReadyPlanResumeSuggestion_RendersMultilineQueryAsMarkdown(t *testing.T) {
+	plan := &DesignPlan{
+		Query: "Create a toy Python \"Hello World\" CLI application with the following requirements:\n- Single Python file (hello.py)\n- Includes a basic test (pytest)",
+	}
+
+	got := readyPlanResumeSuggestion(plan)
+
+	if !strings.Contains(got, "I still have a previous plan ready for:\n\nCreate a toy Python") {
+		t.Fatalf("response = %q, want markdown lead-in", got)
+	}
+	if !strings.Contains(got, "\n- Single Python file (hello.py)\n- Includes a basic test (pytest)\n\nIf you want to use it") {
+		t.Fatalf("response = %q, want preserved markdown list", got)
+	}
+	if strings.Contains(got, `\n- Single Python file`) {
+		t.Fatalf("response = %q, want real newlines instead of escaped sequences", got)
+	}
+}
+
+func TestHandleConversation_ExplicitResumeSignalDispatchesRecoveredReadyPlan(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-resume",
+		SessionID: "sess-plan",
+		Query:     "build the feature",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
+		Input:     "resume that plan",
+		SessionID: "sess-plan",
+		Intent:    guide.IntentChat,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
+	}
+	if conv.Intent != IntentExecute {
+		t.Fatalf("intent = %s, want execute", conv.Intent)
+	}
+	if conv.Response != "I have a plan ready, but I can't dispatch it right now — the orchestration bus isn't available." {
+		t.Fatalf("response = %q, want execute fallback", conv.Response)
+	}
+}
+
 func TestHandleExecute_RehydratesOrphanedPendingContinuationFromControlStore(t *testing.T) {
 	now := time.Now().UTC()
 	plan := &DesignPlan{
@@ -292,6 +489,103 @@ func TestHandleExecute_RehydratesOrphanedPendingContinuationFromControlStore(t *
 	}
 }
 
+func TestHandleExecute_UsesMetadataPlanIDAcrossSessionDrift(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-metadata",
+		SessionID: "sess-plan",
+		Query:     "build the feature",
+		Status:    PlanStatusReady,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleExecute(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: "sess-drifted",
+		Metadata:  map[string]any{"plan_id": plan.ID},
+	})
+	if err != nil {
+		t.Fatalf("handleExecute error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleExecute result type = %T, want *ConversationResult", result)
+	}
+	if !strings.Contains(conv.Response, "can't dispatch it right now") {
+		t.Fatalf("response = %q, want dispatch fallback proving plan recovery", conv.Response)
+	}
+	if conv.Intent != IntentExecute {
+		t.Fatalf("intent = %s, want execute", conv.Intent)
+	}
+}
+
+func TestHandleExecute_RecoversUniqueRecentReadyPlanAcrossSessionDrift(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-unique",
+		SessionID: "sess-plan",
+		Query:     "build the feature",
+		Status:    PlanStatusReady,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+
+	result, err := a.handleExecute(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: "sess-drifted",
+	})
+	if err != nil {
+		t.Fatalf("handleExecute error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleExecute result type = %T, want *ConversationResult", result)
+	}
+	if !strings.Contains(conv.Response, "can't dispatch it right now") {
+		t.Fatalf("response = %q, want dispatch fallback proving unique-plan recovery", conv.Response)
+	}
+}
+
+func TestHandleExecute_DoesNotGuessAcrossSessionDriftWhenMultipleRecentPlansExist(t *testing.T) {
+	now := time.Now().UTC()
+	a := testArchitectWithStore(t,
+		&DesignPlan{
+			ID:        "plan-a",
+			SessionID: "sess-a",
+			Query:     "build feature a",
+			Status:    PlanStatusReady,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		&DesignPlan{
+			ID:        "plan-b",
+			SessionID: "sess-b",
+			Query:     "build feature b",
+			Status:    PlanStatusReady,
+			CreatedAt: now,
+			UpdatedAt: now.Add(time.Second),
+		},
+	)
+
+	result, err := a.handleExecute(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: "sess-drifted",
+	})
+	if err != nil {
+		t.Fatalf("handleExecute error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleExecute result type = %T, want *ConversationResult", result)
+	}
+	if conv.Response != "There's no ready plan to execute. Describe what you'd like to build and I'll create one." {
+		t.Fatalf("response = %q, want no-ready message when recovery is ambiguous", conv.Response)
+	}
+}
+
 func TestHandleExecute_RecoversExpiredPlanHandoffAndRedispatches(t *testing.T) {
 	now := time.Now().UTC()
 	plan := &DesignPlan{
@@ -308,7 +602,7 @@ func TestHandleExecute_RecoversExpiredPlanHandoffAndRedispatches(t *testing.T) {
 		PendingWork: &PendingContinuation{
 			Kind:          string(continuationKindPlanHandoff),
 			Status:        string(continuationStatusPending),
-			TargetAgentID: "orchestrator",
+			TargetAgentID: "orch-1234",
 			CorrelationID: "corr-expired",
 			Message:       "handoff queued",
 			CreatedAt:     now.Add(-2 * time.Minute),
@@ -319,7 +613,46 @@ func TestHandleExecute_RecoversExpiredPlanHandoffAndRedispatches(t *testing.T) {
 
 	a := testArchitectWithControlStore(t, plan)
 	a.running = true
-	a.bus = &testBus{}
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+	a.bus = bus
+	a.channels = guide.NewAgentChannels("architect", a.id)
+	a.knownAgents = map[string]*guide.AgentAnnouncement{
+		"orch-1234": {AgentID: "orch-1234", AgentType: "orchestrator"},
+	}
+
+	respSub, err := bus.SubscribeAsync(a.channels.Responses, a.handleBusResponse)
+	if err != nil {
+		t.Fatalf("subscribe architect responses: %v", err)
+	}
+	defer respSub.Unsubscribe()
+
+	requestKinds := make(chan string, 4)
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		if req.Metadata["control_plane_kind"] != agentshared.ControlPlaneKindPlanHandoffStatus {
+			requestKinds <- "dispatch"
+			return nil
+		}
+		requestKinds <- "lookup"
+		resp := &guide.RouteResponse{
+			CorrelationID:       req.CorrelationID,
+			Success:             true,
+			RespondingAgentID:   "orchestrator",
+			RespondingAgentName: "orchestrator",
+			Data: &agentshared.PlanHandoffStatusResponse{
+				Found: false,
+			},
+		}
+		return bus.Publish(a.channels.Responses, guide.NewResponseMessage("resp_lookup", resp))
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer reqSub.Unsubscribe()
 
 	record := &ArchitectContinuation{
 		ID:                    "cont-expired",
@@ -327,7 +660,7 @@ func TestHandleExecute_RecoversExpiredPlanHandoffAndRedispatches(t *testing.T) {
 		State:                 continuationStatusPending,
 		PlanID:                plan.ID,
 		SessionID:             plan.SessionID,
-		TargetAgentID:         "orchestrator",
+		TargetAgentID:         "orch-1234",
 		ResponseCorrelationID: "corr-expired",
 		RequestJSON:           `{"plan_id":"plan-1"}`,
 		CreatedAt:             now.Add(-2 * time.Minute),
@@ -371,9 +704,257 @@ func TestHandleExecute_RecoversExpiredPlanHandoffAndRedispatches(t *testing.T) {
 		t.Fatalf("expired continuation = %+v, want failed", expiredRecord)
 	}
 
+	seen := map[string]int{}
+	deadline := time.After(time.Second)
+	for len(seen) < 2 {
+		select {
+		case kind := <-requestKinds:
+			seen[kind]++
+		case <-deadline:
+			t.Fatalf("expected lookup + redispatch route requests, saw %+v", seen)
+		}
+	}
+}
+
+func TestHandleExecute_PromotesExecutingFromDurableHandoffReceipt(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-1",
+		SessionID: "sess1",
+		Query:     "build the feature",
+		Revision:  2,
+		Status:    PlanStatusOrchestrating,
+		CreatedAt: now,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:          string(continuationKindPlanHandoff),
+			Status:        string(continuationStatusPending),
+			TargetAgentID: "orch-1234",
+			CorrelationID: "corr-stale",
+			Message:       "handoff queued",
+			CreatedAt:     now.Add(-2 * time.Minute),
+			ExpiresAt:     now.Add(-time.Minute),
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	a.running = true
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+	a.bus = bus
+	a.channels = guide.NewAgentChannels("architect", a.id)
+	a.knownAgents = map[string]*guide.AgentAnnouncement{
+		"orch-1234": {AgentID: "orch-1234", AgentType: "orchestrator"},
+	}
+
+	respSub, err := bus.SubscribeAsync(a.channels.Responses, a.handleBusResponse)
+	if err != nil {
+		t.Fatalf("subscribe architect responses: %v", err)
+	}
+	defer respSub.Unsubscribe()
+
+	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
+		req, ok := msg.GetRouteRequest()
+		if !ok || req == nil {
+			return nil
+		}
+		if req.TargetAgentID != "orch-1234" {
+			return nil
+		}
+		resp := &guide.RouteResponse{
+			CorrelationID:       req.CorrelationID,
+			Success:             true,
+			RespondingAgentID:   "orchestrator",
+			RespondingAgentName: "orchestrator",
+			Data: &agentshared.PlanHandoffStatusResponse{
+				Found: true,
+				Receipt: &agentshared.PlanHandoffReceipt{
+					ReceiptID:   "handoff_1",
+					SessionID:   plan.SessionID,
+					PlanID:      plan.ID,
+					Revision:    plan.Revision,
+					Attempt:     1,
+					Status:      agentshared.PlanHandoffReceiptStatusRunning,
+					DAGID:       "dag-1",
+					WorkflowID:  "wf_plan-1",
+					SubmittedAt: now,
+					RunningAt:   now,
+				},
+			},
+		}
+		return bus.Publish(a.channels.Responses, guide.NewResponseMessage("resp_1", resp))
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	defer reqSub.Unsubscribe()
+
+	result, err := a.handleExecute(context.Background(), &guide.ForwardedRequest{
+		Input:     "go ahead",
+		SessionID: plan.SessionID,
+	})
+	if err != nil {
+		t.Fatalf("handleExecute error = %v", err)
+	}
+	conv, ok := result.(*ConversationResult)
+	if !ok {
+		t.Fatalf("handleExecute result type = %T, want *ConversationResult", result)
+	}
+	if conv.Response != "That plan is already executing in the orchestrator." {
+		t.Fatalf("response = %q, want executing message", conv.Response)
+	}
+
+	stored := a.planStore.Get(plan.ID)
+	if stored == nil {
+		t.Fatal("expected plan to remain present")
+	}
+	if stored.SM().State() != PlanStatusExecuting {
+		t.Fatalf("plan state = %s, want executing", stored.SM().State())
+	}
+	if stored.PendingWork != nil {
+		t.Fatalf("expected pending work to clear, got %+v", stored.PendingWork)
+	}
+}
+
+func TestHandlePlanHandoffReceiptUpdate_PromotesExecutingPlan(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-update",
+		SessionID: "sess1",
+		Query:     "build the feature",
+		Revision:  3,
+		Status:    PlanStatusReady,
+		CreatedAt: now,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:          string(continuationKindPlanHandoff),
+			Status:        string(continuationStatusPending),
+			TargetAgentID: "orch-1234",
+			CorrelationID: "corr-update",
+			Message:       "handoff queued",
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	record := &ArchitectContinuation{
+		ID:                    "cont-update",
+		Kind:                  continuationKindPlanHandoff,
+		State:                 continuationStatusPending,
+		PlanID:                plan.ID,
+		SessionID:             plan.SessionID,
+		TargetAgentID:         "orch-1234",
+		ResponseCorrelationID: "corr-update",
+		RequestJSON:           `{"plan_id":"plan-update"}`,
+		CreatedAt:             now,
+		ExpiresAt:             now.Add(time.Minute),
+	}
+	if err := a.controlStore.PutContinuation(record); err != nil {
+		t.Fatalf("put continuation: %v", err)
+	}
+
+	body, err := json.Marshal(&agentshared.PlanHandoffReceiptUpdate{
+		SessionID:     plan.SessionID,
+		PlanID:        plan.ID,
+		Revision:      plan.Revision,
+		CorrelationID: "corr-update",
+		Found:         true,
+		Receipt: &agentshared.PlanHandoffReceipt{
+			ReceiptID:   "handoff-1",
+			SessionID:   plan.SessionID,
+			PlanID:      plan.ID,
+			Revision:    plan.Revision,
+			Status:      agentshared.PlanHandoffReceiptStatusRunning,
+			DAGID:       "dag-1",
+			WorkflowID:  "wf_plan-update",
+			SubmittedAt: now,
+			RunningAt:   now,
+		},
+		Reason: "running",
+	})
+	if err != nil {
+		t.Fatalf("marshal update: %v", err)
+	}
+
+	resultAny, handled, err := a.handleControlPlaneForward(context.Background(), &guide.ForwardedRequest{
+		Input:     string(body),
+		SessionID: plan.SessionID,
+		Metadata: map[string]any{
+			"control_plane_kind": agentshared.ControlPlaneKindPlanHandoffReceiptUpdate,
+		},
+	})
+	if err != nil {
+		t.Fatalf("handle control plane: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected update to be handled")
+	}
+	result, ok := resultAny.(map[string]any)
+	if !ok || result["applied"] != true {
+		t.Fatalf("unexpected result: %#v", resultAny)
+	}
+
+	stored := a.planStore.Get(plan.ID)
+	if stored == nil {
+		t.Fatal("expected plan to remain present")
+	}
+	if stored.SM().State() != PlanStatusExecuting {
+		t.Fatalf("plan state = %s, want executing", stored.SM().State())
+	}
+	if stored.PendingWork != nil {
+		t.Fatalf("expected pending work to clear, got %+v", stored.PendingWork)
+	}
+
+	storedRecord, err := a.controlStore.GetContinuationByResponseCorrelation("corr-update")
+	if err != nil {
+		t.Fatalf("load continuation: %v", err)
+	}
+	if storedRecord == nil || storedRecord.State != continuationStatusCompleted {
+		t.Fatalf("continuation = %+v, want completed", storedRecord)
+	}
+}
+
+func TestRequestOpenPlanHandoffReceiptResyncs_PublishesRequests(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-resync",
+		SessionID: "sess1",
+		Revision:  1,
+		Status:    PlanStatusOrchestrating,
+		CreatedAt: now,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:          string(continuationKindPlanHandoff),
+			Status:        string(continuationStatusPending),
+			TargetAgentID: "orch-1234",
+			CorrelationID: "corr-resync",
+		},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, plan.Status)
+
+	a := testArchitectWithControlStore(t, plan)
+	a.running = true
+	a.bus = &testBus{}
+	a.knownAgents = map[string]*guide.AgentAnnouncement{
+		"orch-1234": {AgentID: "orch-1234", AgentType: "orchestrator"},
+	}
+
+	a.requestOpenPlanHandoffReceiptResyncs("architect startup")
+
 	bus := a.bus.(*testBus)
 	if len(bus.published) != 1 {
-		t.Fatalf("expected one published route request, got %d", len(bus.published))
+		t.Fatalf("expected one published resync request, got %d", len(bus.published))
+	}
+	req, ok := bus.published[0].msg.GetRouteRequest()
+	if !ok || req == nil {
+		t.Fatalf("expected route request payload, got %#v", bus.published[0].msg.Payload)
+	}
+	if req.TargetAgentID != "orch-1234" || !req.FireAndForget {
+		t.Fatalf("unexpected route request: %+v", req)
+	}
+	if req.Metadata["control_plane_kind"] != agentshared.ControlPlaneKindPlanHandoffReceiptResync {
+		t.Fatalf("unexpected control plane kind: %+v", req.Metadata)
 	}
 }
 

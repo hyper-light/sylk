@@ -62,7 +62,8 @@ func (b *TokenUsageBridge) forwardHandler(program TeaProgram) guide.MessageHandl
 		}
 
 		um := msg.TokenUsageMsg{
-			AgentID: evt.AgentID,
+			CorrelationID: evt.CorrelationID,
+			AgentID:       evt.AgentID,
 		}
 		if v, ok := evt.Data["model"].(string); ok {
 			um.Model = v

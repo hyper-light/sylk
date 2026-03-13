@@ -41,6 +41,18 @@ func PipelineInspectorSystemPrompt() string {
 		InspectorGuardrails
 }
 
+// PipelineInspectorSystemPromptForContract omits the implementation-validation
+// protocol block when the task is still in pre-implementation contract
+// synthesis mode.
+func PipelineInspectorSystemPromptForContract(contract *agentshared.TaskExecutionContract) string {
+	parts := []string{pipelineSystem}
+	if contract == nil || !contract.PreImplementation {
+		parts = append(parts, pipelineProtocol)
+	}
+	parts = append(parts, InspectorSkillsPolicy, InspectorGuardrails)
+	return joinNonEmpty(parts, promptSeparator)
+}
+
 // PipelineInspectorSystemPromptForDomain composes the pipeline inspector system
 // prompt, appending design validation context when domain is DomainDesign.
 func PipelineInspectorSystemPromptForDomain(domain ValidationDomain) string {
@@ -79,6 +91,25 @@ func GlobalInspectorSystemPrompt() string {
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
 			DefaultView: versioning.WorkspaceViewGlobal,
 		})
+}
+
+// GlobalInspectorSystemPromptForContract composes the global inspector system
+// prompt for structured global task requests. When a global execution contract
+// is present, the runtime guidance becomes the source of workflow obligations,
+// so the static audit protocol is omitted.
+func GlobalInspectorSystemPromptForContract(contract *agentshared.GlobalExecutionContract) string {
+	if contract == nil {
+		return GlobalInspectorSystemPrompt()
+	}
+	return joinNonEmpty([]string{
+		globalSystem,
+		globalAudit,
+		InspectorSkillsPolicy,
+		InspectorGuardrails,
+		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{
+			DefaultView: versioning.WorkspaceViewGlobal,
+		}),
+	}, promptSeparator)
 }
 
 // GlobalConversationPrompt returns the global conversation prompt.

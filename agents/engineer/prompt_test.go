@@ -3,6 +3,8 @@ package engineer
 import (
 	"strings"
 	"testing"
+
+	shared "github.com/adalundhe/sylk/agents/shared"
 )
 
 func TestDefaultEngineerSystemPrompt_ComposesModulesOnceInOrder(t *testing.T) {
@@ -71,6 +73,25 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 	for _, marker := range legacyAliases {
 		if strings.Contains(DefaultEngineerSystemPrompt, marker) {
 			t.Fatalf("default engineer prompt still contains legacy tool alias %q", marker)
+		}
+	}
+}
+
+func TestEngineerSystemPromptForContract_OmitsStaticImplementationProtocol(t *testing.T) {
+	prompt := EngineerSystemPromptForContract(&shared.TaskExecutionContract{TaskID: "task_1"})
+	if strings.Contains(prompt, "# Engineer Agent — Implementation Protocol") {
+		t.Fatal("task-scoped engineer prompt should not include the static implementation protocol")
+	}
+	for _, want := range []string{
+		"# Engineer Agent — System",
+		"# Engineer Agent — Consultation Policy",
+		"# Engineer Agent — Skill Usage Policy",
+		"# Engineer Agent — Guardrails",
+		"# Engineer Agent — Self-Audit Protocol",
+		"# Engineer Agent — Collaboration Protocol",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("task-scoped engineer prompt missing %q", want)
 		}
 	}
 }

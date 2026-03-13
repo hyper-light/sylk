@@ -26,6 +26,9 @@ func (a *Architect) handleControlPlaneForward(ctx context.Context, fwd *guide.Fo
 	case shared.ControlPlaneKindRemediationRequest:
 		result, err := a.handleRemediationRequest(ctx, fwd)
 		return result, true, err
+	case shared.ControlPlaneKindPlanHandoffReceiptUpdate:
+		result, err := a.handlePlanHandoffReceiptUpdate(ctx, fwd)
+		return result, true, err
 	default:
 		return nil, false, nil
 	}

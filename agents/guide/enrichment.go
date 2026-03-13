@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corecontext "github.com/adalundhe/sylk/core/context"
+	"github.com/adalundhe/sylk/core/deadlinelease"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
@@ -65,12 +66,9 @@ func (e *EnrichmentService) Enrich(ctx context.Context, req *RouteRequest, resul
 				dynamicTimeout = e.maxUXDelay
 			}
 
-			enrichCtx, cancel := context.WithTimeout(groupCtx, dynamicTimeout)
-			defer cancel()
-
 			// Here we would perform a direct RPC or await a correlation ID on the bus.
 			// This is a stub for the actual synchronous request implementation.
-			respData, err := e.requestEnrichmentSync(enrichCtx, providerID, req)
+			respData, err := e.requestEnrichmentSync(groupCtx, dynamicTimeout, providerID, req)
 			if err == nil && respData != nil {
 				payloads <- *respData
 			}
@@ -88,7 +86,12 @@ func (e *EnrichmentService) Enrich(ctx context.Context, req *RouteRequest, resul
 	return valid
 }
 
-func (e *EnrichmentService) requestEnrichmentSync(ctx context.Context, providerID string, req *RouteRequest) (*corecontext.PrefetchSharePayload, error) {
+func (e *EnrichmentService) requestEnrichmentSync(
+	ctx context.Context,
+	attemptTimeout time.Duration,
+	providerID string,
+	req *RouteRequest,
+) (*corecontext.PrefetchSharePayload, error) {
 	if e == nil || e.bus == nil || req == nil {
 		return nil, fmt.Errorf("enrichment service unavailable")
 	}
@@ -101,7 +104,7 @@ func (e *EnrichmentService) requestEnrichmentSync(ctx context.Context, providerI
 	if err := e.publishEnrichmentAction(providerID, req, correlationID); err != nil {
 		return nil, err
 	}
-	return e.awaitEnrichmentResponse(ctx, waitCh)
+	return e.awaitEnrichmentResponse(ctx, attemptTimeout, waitCh)
 }
 
 func (e *EnrichmentService) subscribeForEnrichmentResponse(correlationID string) (<-chan *Message, Subscription, error) {
@@ -140,14 +143,25 @@ func (e *EnrichmentService) publishEnrichmentAction(providerID string, req *Rout
 
 func (e *EnrichmentService) awaitEnrichmentResponse(
 	ctx context.Context,
+	attemptTimeout time.Duration,
 	waitCh <-chan *Message,
 ) (*corecontext.PrefetchSharePayload, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case msg := <-waitCh:
-		return parseEnrichmentPayload(msg)
+	var msg *Message
+	err := deadlinelease.Run(ctx, deadlinelease.Config{
+		AttemptTimeout: attemptTimeout,
+		MaxRefreshes:   1,
+	}, func(waitCtx context.Context) error {
+		select {
+		case <-waitCtx.Done():
+			return waitCtx.Err()
+		case msg = <-waitCh:
+			return nil
+		}
+	})
+	if err != nil {
+		return nil, deadlinelease.WrapTimeoutError("enrichment request", attemptTimeout, err)
 	}
+	return parseEnrichmentPayload(msg)
 }
 
 func parseEnrichmentPayload(msg *Message) (*corecontext.PrefetchSharePayload, error) {

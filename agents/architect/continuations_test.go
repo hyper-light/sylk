@@ -76,6 +76,23 @@ func testArchitectWithControlStore(t *testing.T, plan *DesignPlan) *Architect {
 		planStore:    store,
 		controlStore: controlStore,
 		steering:     shared.NewSteeringManager(),
+		pendingBus:   make(map[string]chan *guide.Message),
+		knownAgents:  make(map[string]*guide.AgentAnnouncement),
+	}
+}
+
+func TestArchitectSeedKnownAgents_PreservesSnapshot(t *testing.T) {
+	a := testArchitectWithControlStore(t, nil)
+	a.SeedKnownAgents([]*guide.AgentAnnouncement{
+		{AgentID: "orch-1234", AgentType: "orchestrator"},
+		{AgentID: "arch-1234", AgentType: "architect"},
+	})
+
+	if got := a.knownAgentIDByType("orchestrator", ""); got != "orch-1234" {
+		t.Fatalf("known orchestrator id = %q, want orch-1234", got)
+	}
+	if got := a.knownAgentIDByType("architect", ""); got != "arch-1234" {
+		t.Fatalf("known architect id = %q, want arch-1234", got)
 	}
 }
 
@@ -134,7 +151,7 @@ func TestDispatchPlanExecution_QueuesAsyncHandoff(t *testing.T) {
 		t.Fatalf("expected route request payload, got %#v", bus.published[0].msg.Payload)
 	}
 	if req.TargetAgentID != "orchestrator" {
-		t.Fatalf("expected orchestrator target, got %q", req.TargetAgentID)
+		t.Fatalf("expected orchestrator route target, got %q", req.TargetAgentID)
 	}
 }
 
@@ -156,6 +173,9 @@ func TestDispatchPlanExecution_PublishesRerouteForOrchestratorHandoff(t *testing
 	a.running = true
 	a.bus = &testBus{}
 	a.channels = guide.NewAgentChannels("architect", "architect")
+	a.knownAgents = map[string]*guide.AgentAnnouncement{
+		"orch-1234": {AgentID: "orch-1234", AgentType: "orchestrator"},
+	}
 
 	ctx := withArchitectStreamContext(context.Background(), "corr-user", "tui")
 	_, handled := a.dispatchPlanExecution(ctx, &ArchitectRequest{
@@ -177,7 +197,7 @@ func TestDispatchPlanExecution_PublishesRerouteForOrchestratorHandoff(t *testing
 	var sawRouteRequest bool
 	for _, published := range bus.published {
 		if published.topic == guide.TopicGuideRequests {
-			if req, ok := published.msg.GetRouteRequest(); ok && req != nil && req.TargetAgentID == "orchestrator" {
+			if req, ok := published.msg.GetRouteRequest(); ok && req != nil && req.TargetAgentID == "orch-1234" {
 				sawRouteRequest = true
 			}
 		}
@@ -418,7 +438,7 @@ func TestHandleContinuationResponse_ErrorMessageFailsContinuation(t *testing.T) 
 	}
 }
 
-func TestReconcilePendingContinuations_RecoversStaleProcessingPlanHandoff(t *testing.T) {
+func TestReconcilePendingContinuations_DefersProcessingPlanHandoffRecovery(t *testing.T) {
 	now := time.Now().UTC()
 	plan := &DesignPlan{
 		ID:        "plan-processing",
@@ -429,7 +449,7 @@ func TestReconcilePendingContinuations_RecoversStaleProcessingPlanHandoff(t *tes
 		PendingWork: &PendingContinuation{
 			Kind:          string(continuationKindPlanHandoff),
 			Status:        string(continuationStatusPending),
-			TargetAgentID: "orchestrator",
+			TargetAgentID: "orch-1234",
 			CorrelationID: "corr-processing",
 			CreatedAt:     now,
 			ExpiresAt:     now.Add(time.Minute),
@@ -444,7 +464,7 @@ func TestReconcilePendingContinuations_RecoversStaleProcessingPlanHandoff(t *tes
 		State:                 continuationStatusProcessing,
 		PlanID:                plan.ID,
 		SessionID:             plan.SessionID,
-		TargetAgentID:         "orchestrator",
+		TargetAgentID:         "orch-1234",
 		ResponseCorrelationID: "corr-processing",
 		RequestJSON:           `{"plan_id":"plan-processing"}`,
 		CreatedAt:             now,
@@ -454,17 +474,17 @@ func TestReconcilePendingContinuations_RecoversStaleProcessingPlanHandoff(t *tes
 		t.Fatalf("put continuation: %v", err)
 	}
 
-	a.reconcilePendingContinuations()
+	a.reconcilePendingContinuations(nil)
 
 	storedPlan := a.planStore.Get(plan.ID)
 	if storedPlan == nil {
 		t.Fatal("expected plan to remain in store")
 	}
-	if storedPlan.SM().State() != PlanStatusReady {
-		t.Fatalf("plan state = %s, want ready", storedPlan.SM().State())
+	if storedPlan.SM().State() != PlanStatusOrchestrating {
+		t.Fatalf("plan state = %s, want orchestrating", storedPlan.SM().State())
 	}
-	if storedPlan.PendingWork != nil {
-		t.Fatalf("expected pending work to clear, got %+v", storedPlan.PendingWork)
+	if storedPlan.PendingWork == nil || storedPlan.PendingWork.CorrelationID != "corr-processing" {
+		t.Fatalf("expected pending work to remain attached, got %+v", storedPlan.PendingWork)
 	}
 
 	storedRecord, err := a.controlStore.GetContinuationByResponseCorrelation("corr-processing")
@@ -474,10 +494,7 @@ func TestReconcilePendingContinuations_RecoversStaleProcessingPlanHandoff(t *tes
 	if storedRecord == nil {
 		t.Fatal("expected continuation record to remain present")
 	}
-	if storedRecord.State != continuationStatusFailed {
-		t.Fatalf("record state = %s, want failed", storedRecord.State)
-	}
-	if !strings.Contains(storedRecord.ErrorText, "processing") {
-		t.Fatalf("error_text = %q, want processing recovery reason", storedRecord.ErrorText)
+	if storedRecord.State != continuationStatusProcessing {
+		t.Fatalf("record state = %s, want processing", storedRecord.State)
 	}
 }

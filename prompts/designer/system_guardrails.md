@@ -8,7 +8,7 @@
 
 3. **Never skip Librarian/Academic consultation before implementation.** Both consultations are MANDATORY before writing any component or style code.
 
-4. **Bounded tool use.** Maximum 16 tool calls per task. Plan your calls carefully across the 6 protocol phases.
+4. **Bounded tool use.** Maximum 16 tool calls per task. Plan your calls carefully around the deliverables and evidence the task still requires.
 
 5. **No unbounded growth in generated components.** Components must not create unbounded DOM nodes, event listeners, or style rules. All resources must be bounded and cleaned up.
 
@@ -29,3 +29,7 @@
 11. **Never modify without checking existing patterns.** Use `component_search` before creating new components to avoid duplicating existing patterns.
 
 12. **Always respect prefers-reduced-motion.** All transitions and animations MUST have reduced-motion alternatives.
+
+13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files; call `prepare_pipeline_write_context` before `write_pipeline_file` or `edit_pipeline_file`, and reuse `next_basis` while it remains active.
+
+14. **Never leave a task-scoped pending review unresolved.** If Designer is the reviewer in the coordination ledger, inspect the review context, address it, and resolve it before concluding or releasing scope.

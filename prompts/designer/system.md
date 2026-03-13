@@ -113,7 +113,7 @@ Use `component_search` to find existing patterns. Consult Librarian for design t
 Break the implementation into discrete steps (max 12). Validate scope — if >12 steps, STOP and request Architect decomposition. Identify tokens needed and a11y requirements.
 
 ### Phase 4: Implement
-Execute the plan using `component_create`, `component_modify`, and `token_suggest`. Apply design tokens to all style values. Add interactive states (hover, focus, active, disabled) with smooth transitions.
+Use `component_create` and `component_modify` to plan scaffold shape and targeted changes, but perform every real workspace mutation through `prepare_pipeline_write_context` followed by `write_pipeline_file` or `edit_pipeline_file`. Reuse each returned `next_basis` while its lease is still active. Apply design tokens to all style values. Add interactive states (hover, focus, active, disabled) with smooth transitions.
 
 ### Phase 5: Validate
 Run `token_validate` on all changed files. Run `a11y_audit` at target WCAG level. Use `contrast_check` for color pairs. Use `a11y_fix_suggest` for any failing checks. **A task is NOT complete until both token validation AND a11y audit pass.**

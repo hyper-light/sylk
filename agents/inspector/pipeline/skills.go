@@ -477,15 +477,38 @@ func requestOverrideSkill(pi *PipelineInspector) *skills.Skill {
 
 func getValidationStatusSkill(pi *PipelineInspector) *skills.Skill {
 	return skills.NewSkill("get_validation_status").
-		Description("Return current validation state and status.").
+		Description("Return the current task validation status, including whether validation is still pending or implementation evidence is available.").
 		Domain("validation").
 		Keywords("status", "state", "result").
 		Priority(75).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			taskID, _ := pi.resolveTaskID("")
+			criteriaDefined := false
+			validationResultAvailable := false
+			if taskID != "" {
+				criteriaDefined = pi.hasCriteria(taskID)
+				validationResultAvailable = pi.hasValidationResult(taskID)
+			}
+			contract := agentShared.TaskExecutionContractFromContext(ctx)
+			pendingValidation := !validationResultAvailable
+			hasImplementationEvidence := false
+			if contract != nil {
+				pendingValidation = contract.PreImplementation
+				hasImplementationEvidence = contract.HasImplementationEvidence
+				if taskID == "" {
+					criteriaDefined = contract.CriteriaDefined
+					validationResultAvailable = contract.ValidationResultAvailable
+				}
+			}
 			state := pi.getState()
 			return map[string]any{
-				"state":   state,
-				"running": pi.running,
+				"task_id":                     taskID,
+				"state":                       state,
+				"running":                     pi.running,
+				"criteria_defined":            criteriaDefined,
+				"validation_result_available": validationResultAvailable,
+				"pending_validation":          pendingValidation,
+				"has_implementation_evidence": hasImplementationEvidence,
 			}, nil
 		}).
 		Build()

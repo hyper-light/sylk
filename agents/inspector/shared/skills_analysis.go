@@ -25,71 +25,68 @@ type FileAccess = versioning.FileAccess
 // returned value reflects whatever was injected via SetFileAccess().
 type FileAccessFunc func() FileAccess
 
-// RunLinterSkill returns a skill that runs golangci-lint.
+// RunLinterSkill returns a skill that runs a language-appropriate linter.
 func RunLinterSkill(runner *ToolRunner) *skills.Skill {
 	return skills.NewSkill("run_linter").
-		Description("Run golangci-lint to detect code issues, style violations, and bugs.").
+		Description("Run a language-appropriate linter to detect code issues, style violations, and likely bugs.").
 		Domain("analysis").
-		Keywords("lint", "golangci", "check", "style").
+		Keywords("lint", "check", "style", "analysis").
 		Priority(95).
 		ArrayParam("paths", "Paths to lint (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
-			issues := RunGolangCILint(ctx, runner, paths)
+			issues := runLinterAnalysis(ctx, runner, paths)
 			logAnalysisFindings(ctx, "run_linter", issues)
 			return analysisResult("run_linter", issues), nil
 		}).
 		Build()
 }
 
-// RunTypeCheckerSkill returns a skill that runs go vet and staticcheck.
+// RunTypeCheckerSkill returns a skill that runs a language-appropriate type checker.
 func RunTypeCheckerSkill(runner *ToolRunner) *skills.Skill {
 	return skills.NewSkill("run_type_checker").
-		Description("Run go vet and staticcheck for type checking and static analysis.").
+		Description("Run a language-appropriate type checker or static analyzer for the requested files.").
 		Domain("analysis").
-		Keywords("type", "check", "vet", "staticcheck").
+		Keywords("type", "check", "static", "analysis").
 		Priority(95).
 		ArrayParam("paths", "Paths to check (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
-			var issues []ValidationIssue
-			issues = append(issues, RunGoVet(ctx, runner, paths)...)
-			issues = append(issues, RunStaticcheck(ctx, runner, paths)...)
-			issues = DeduplicateIssues(issues)
+			issues := runTypeCheckerAnalysis(ctx, runner, paths)
 			logAnalysisFindings(ctx, "run_type_checker", issues)
 			return analysisResult("run_type_checker", issues), nil
 		}).
 		Build()
 }
 
-// RunFormatterCheckSkill returns a skill that checks gofmt/goimports formatting.
+// RunFormatterCheckSkill returns a skill that checks formatting using the target language rules.
 func RunFormatterCheckSkill(runner *ToolRunner) *skills.Skill {
 	return skills.NewSkill("run_formatter_check").
-		Description("Check code formatting with gofmt and goimports without modifying files.").
+		Description("Check code formatting without modifying files, using the requested language's formatting rules.").
 		Domain("analysis").
-		Keywords("format", "gofmt", "goimports").
+		Keywords("format", "style", "whitespace").
 		Priority(90).
 		ArrayParam("paths", "Paths to check (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
-			issues := RunGoFmt(ctx, runner, paths)
+			issues := runFormatterAnalysis(ctx, runner, paths)
 			logAnalysisFindings(ctx, "run_formatter_check", issues)
 			return analysisResult("run_formatter_check", issues), nil
 		}).
 		Build()
 }
 
-// RunSecurityScanSkill returns a skill that runs gosec security analysis.
+// RunSecurityScanSkill returns a skill that runs a language-appropriate security analysis pass.
 func RunSecurityScanSkill(runner *ToolRunner) *skills.Skill {
 	return skills.NewSkill("run_security_scan").
-		Description("Run gosec to detect security vulnerabilities in Go code.").
+		Description("Run a language-appropriate security analysis pass to detect likely vulnerabilities.").
 		Domain("analysis").
-		Keywords("security", "gosec", "vulnerability", "audit").
+		Keywords("security", "vulnerability", "audit").
 		Priority(95).
 		ArrayParam("paths", "Paths to scan (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
-			issues := RunGoSec(ctx, runner, paths)
+			issues := runSecurityAnalysis(ctx, runner, paths)
 			criticalCount := countBySeverity(issues, Critical)
 			highCount := countBySeverity(issues, High)
 			result := analysisResult("run_security_scan", issues)
@@ -104,7 +101,7 @@ func RunSecurityScanSkill(runner *ToolRunner) *skills.Skill {
 // CheckCoverageSkill returns a skill that analyzes test coverage.
 func CheckCoverageSkill(runner *ToolRunner) *skills.Skill {
 	return skills.NewSkill("check_coverage").
-		Description("Analyze test coverage and flag functions below the threshold.").
+		Description("Analyze test coverage and flag functions below the requested threshold when a compatible coverage runner exists.").
 		Domain("analysis").
 		Keywords("coverage", "test", "threshold").
 		Priority(85).
@@ -119,17 +116,17 @@ func CheckCoverageSkill(runner *ToolRunner) *skills.Skill {
 			if len(params.Paths) == 0 {
 				params.Paths = []string{"./..."}
 			}
-			issues := RunCoverage(ctx, runner, params.Paths, params.Threshold)
+			issues := runCoverageAnalysis(ctx, runner, params.Paths, params.Threshold)
 			logAnalysisFindings(ctx, "check_coverage", issues)
 			return analysisResult("check_coverage", issues), nil
 		}).
 		Build()
 }
 
-// AnalyzeComplexitySkill returns a skill that checks cyclomatic/cognitive complexity.
+// AnalyzeComplexitySkill returns a skill that checks language-appropriate complexity limits.
 func AnalyzeComplexitySkill(runner *ToolRunner) *skills.Skill {
 	return skills.NewSkill("analyze_complexity").
-		Description("Analyze cyclomatic and cognitive complexity of functions.").
+		Description("Analyze cyclomatic and cognitive complexity of functions using the requested language rules.").
 		Domain("analysis").
 		Keywords("complexity", "cyclomatic", "cognitive").
 		Priority(85).
@@ -146,7 +143,7 @@ func AnalyzeComplexitySkill(runner *ToolRunner) *skills.Skill {
 			if len(params.Paths) == 0 {
 				params.Paths = []string{"./..."}
 			}
-			issues := RunComplexity(ctx, runner, params.Paths, params.MaxCyclomatic, params.MaxCognitive)
+			issues := runComplexityAnalysis(ctx, runner, params.Paths, params.MaxCyclomatic, params.MaxCognitive)
 			logAnalysisFindings(ctx, "analyze_complexity", issues)
 			return analysisResult("analyze_complexity", issues), nil
 		}).

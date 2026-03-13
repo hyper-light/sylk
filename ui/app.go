@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/harmonica"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/google/uuid"
 
 	"github.com/adalundhe/sylk/agents/guide"
@@ -100,6 +101,8 @@ const decorTickIdleInterval = 300 * time.Millisecond
 // it slower than the active path cuts idle CPU, while the border renderer's
 // full-perimeter phase spread preserves continuous circulation.
 const idleFocusBorderPhaseStep = 200 * time.Millisecond
+
+var agentContextCounter = providers.NewProviderTokenCounter(providers.DefaultTokenCounterConfig())
 
 // blinkHalfPeriod is the duration between cursor visibility toggles.
 // Derived from: standard terminal cursor blink rate (~530ms per phase).
@@ -375,6 +378,7 @@ type editorPaneState struct {
 
 type commandApprovalOption struct {
 	label    string
+	hint     string
 	decision string
 }
 
@@ -386,11 +390,23 @@ type commandApprovalState struct {
 	returnInput bool
 }
 
+type commandApprovalHitbox struct {
+	option int
+	y      int
+	x0     int
+	x1     int
+}
+
+type commandApprovalViewLayout struct {
+	lines    []string
+	hitboxes []commandApprovalHitbox
+}
+
 var commandApprovalOptions = []commandApprovalOption{
-	{label: "Allow Once", decision: "allow_once"},
-	{label: "Allow Always", decision: "allow_always"},
-	{label: "Deny Once", decision: "deny_once"},
-	{label: "Deny Always", decision: "deny_always"},
+	{label: "Allow Once", hint: "this run", decision: "allow_once"},
+	{label: "Allow Always", hint: "save allow rule", decision: "allow_always"},
+	{label: "Deny Once", hint: "block this run", decision: "deny_once"},
+	{label: "Deny Always", hint: "save deny rule", decision: "deny_always"},
 }
 
 // AppModel is the root Bubble Tea model that composes all TUI components.
@@ -678,9 +694,11 @@ type AppModel struct {
 	guideContextTokens      int
 	guideContextUsage       float64
 	agentContextTokens      map[string]int
+	agentContextModels      map[string]string
 	streamUsage             map[string]streamUsageEntry
 	streamedResponses       map[string]streamedResponseState
 	activeStreams           map[string]*activeStreamEntry // key = correlationID
+	reroutedStreamCIDs      map[string]time.Time          // Recently rerouted source streams allowed to emit terminal cleanup events.
 	interruptedCorrelations map[string]struct{}           // Correlation IDs killed by interrupt.
 	engagedAgentID          string                        // Sticky agent the user is conversing with.
 	manualTargetAgent       string
@@ -746,6 +764,7 @@ type activeStreamEntry struct {
 }
 
 const streamedResponseStateTTL = 45 * time.Second
+const reroutedStreamCIDTTL = 2 * time.Minute
 
 // viewRing tracks a cycling list of panels for a swappable layout slot.
 // leftRing holds panels sharing a left column; rightRing holds panels sharing a right column.
@@ -952,12 +971,14 @@ func newAppModel(
 		streamUsage:            make(map[string]streamUsageEntry),
 		streamedResponses:      make(map[string]streamedResponseState),
 		activeStreams:          make(map[string]*activeStreamEntry),
+		reroutedStreamCIDs:     make(map[string]time.Time),
 		oauthSessions:          newOAuthSessionManager(),
 		focusGradient:          th.Palette.IdleFocusRingGradient(),
 		idleFocusGradient:      th.Palette.IdleFocusRingGradient(),
 		activeFocusGradient:    th.Palette.FocusRingGradient(),
 		focusRingStart:         time.Now(),
 		lastFocusBorderBucket:  -1,
+		agentContextModels:     make(map[string]string),
 	}
 }
 
@@ -2359,6 +2380,26 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		m.busCacheReadTokens += typed.CacheReadTokens
 		m.busCacheWriteTokens += typed.CacheWriteTokens
 		m.busReasoningTokens += typed.ReasoningTokens
+		canonicalID := normalizeAgentID(typed.AgentID)
+		if typed.CorrelationID != "" {
+			if resolvedID, _, _, _ := m.streamIdentityForCorrelation(typed.CorrelationID); resolvedID != "" {
+				canonicalID = resolvedID
+			}
+		}
+		if typed.Model != "" && canonicalID != "" {
+			m.agentContextModels[canonicalID] = typed.Model
+		}
+		if typed.InputTokens > 0 {
+			if typed.CorrelationID != "" {
+				if state, ok := m.streamUsage[typed.CorrelationID]; ok {
+					state.InputTokens = typed.InputTokens
+					m.streamUsage[typed.CorrelationID] = state
+				}
+			}
+			if canonicalID != "" {
+				m.setAgentContextUsage(canonicalID, typed.InputTokens)
+			}
+		}
 		m.updateTokenDisplay()
 	}),
 	reflect.TypeFor[modal.ModalClosedMsg](): appMsgCmdRoute(func(m *AppModel, typed modal.ModalClosedMsg) tea.Cmd {
@@ -4619,6 +4660,61 @@ func (m *AppModel) shouldRenderStreamEvent(correlationID string) bool {
 	return active
 }
 
+// shouldRenderTerminalStreamEvent returns true when a completion should reach
+// downstream UI components even if the stream was already rerouted away from
+// the active set. This lets the source agent finalize its existing chat slot
+// and clear thinking state after a handoff.
+func (m *AppModel) shouldRenderTerminalStreamEvent(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	if m.shouldRenderStreamEvent(correlationID) {
+		return true
+	}
+	if _, interrupted := m.interruptedCorrelations[correlationID]; interrupted {
+		return false
+	}
+	if m.reroutedStreamCIDs == nil {
+		return false
+	}
+	now := time.Now()
+	m.pruneReroutedStreamCIDs(now)
+	_, ok := m.reroutedStreamCIDs[correlationID]
+	return ok
+}
+
+func (m *AppModel) markReroutedStreamCID(correlationID string) {
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return
+	}
+	if m.reroutedStreamCIDs == nil {
+		m.reroutedStreamCIDs = make(map[string]time.Time)
+	}
+	now := time.Now()
+	m.pruneReroutedStreamCIDs(now)
+	m.reroutedStreamCIDs[correlationID] = now
+}
+
+func (m *AppModel) clearReroutedStreamCID(correlationID string) {
+	if m.reroutedStreamCIDs == nil {
+		return
+	}
+	delete(m.reroutedStreamCIDs, strings.TrimSpace(correlationID))
+}
+
+func (m *AppModel) pruneReroutedStreamCIDs(now time.Time) {
+	if m.reroutedStreamCIDs == nil {
+		return
+	}
+	for correlationID, seenAt := range m.reroutedStreamCIDs {
+		if now.Sub(seenAt) > reroutedStreamCIDTTL {
+			delete(m.reroutedStreamCIDs, correlationID)
+		}
+	}
+}
+
 // unregisterStream removes the given correlationID from the active set.
 func (m *AppModel) unregisterStream(correlationID string) {
 	delete(m.activeStreams, strings.TrimSpace(correlationID))
@@ -4741,6 +4837,7 @@ func (m *AppModel) clearEngagedAgent() {
 // It transitions the active stream from the original correlationID to the
 // rerouted one so that stream events from the new target agent are rendered.
 func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
+	var startCmd tea.Cmd
 	// Guard interrupted correlations — drop reroutes for dead requests.
 	if reroute.OriginalCorrelationID != "" {
 		if _, interrupted := m.interruptedCorrelations[reroute.OriginalCorrelationID]; interrupted {
@@ -4754,17 +4851,21 @@ func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 	}
 	// Remove the old stream to unblock new stream events.
 	if reroute.OriginalCorrelationID != "" {
+		m.markReroutedStreamCID(reroute.OriginalCorrelationID)
 		m.unregisterStream(reroute.OriginalCorrelationID)
 	}
 	// Register the new stream for the rerouted agent.
 	if reroute.CorrelationID != "" {
-		m.registerStream(msg.StreamStartMsg{
+		start, created := m.prepareStreamStart(msg.StreamStartMsg{
 			SessionID:     reroute.SessionID,
 			CorrelationID: reroute.CorrelationID,
 			AgentID:       normalizeAgentID(reroute.ToAgentID),
 			AgentType:     normalizeAgentID(reroute.ToAgentID),
 			AgentName:     reroute.ToAgentID,
 		})
+		if created {
+			startCmd = m.propagate(start)
+		}
 	}
 	// Demote the handing-off agent (e.g. guide) so it no longer shows as active.
 	if reroute.FromAgentID != "" && m.agentPanel != nil {
@@ -4777,7 +4878,7 @@ func (m *AppModel) handleStreamReroute(reroute msg.StreamRerouteMsg) tea.Cmd {
 	if reroute.FromAgentID != "" {
 		m.statusBar.SetFlash(reroute.FromAgentID + " -> " + reroute.ToAgentID)
 	}
-	return nil
+	return startCmd
 }
 
 func (m *AppModel) resolveInterruptTarget() (string, string) {
@@ -5981,26 +6082,29 @@ func (m *AppModel) handleStreamStartTelemetry(start msg.StreamStartMsg) tea.Cmd 
 	if !m.shouldRenderStreamEvent(start.CorrelationID) {
 		return nil
 	}
+	start, _ = m.prepareStreamStart(start)
+	return m.propagate(start)
+}
+
+func (m *AppModel) prepareStreamStart(start msg.StreamStartMsg) (msg.StreamStartMsg, bool) {
 	start.AgentID = canonicalStreamAgentID(start.AgentID, start.AgentType, start.PipelineID, start.TaskID)
 	m.recordStreamStart(start.CorrelationID)
 	m.trackStreamStart(start)
-	m.registerStream(start)
+	created := m.registerStream(start)
 	newAgent := normalizeAgentID(start.AgentID)
-	// When a non-guide agent starts streaming, the guide's routing work is done.
-	// Demote it so it no longer shows as active in the agent panel.
 	if newAgent != "" && newAgent != "guide" && m.agentPanel != nil {
 		m.agentPanel.DemoteAgent("guide")
 	}
-	// Engagement is NOT auto-tracked on stream start. It only changes on:
-	// - Explicit user target (@agent)
-	// - Reroute (handleStreamReroute sets it)
-	// This keeps the user's selected/engaged agent fully decoupled from activity.
-	if m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
+	if m.statusBar != nil && m.engagedAgentID != "" && newAgent != "" && newAgent != m.engagedAgentID && newAgent != "guide" {
 		m.statusBar.SetFlash(m.engagedAgentID + " -> " + newAgent)
 	}
-	m.publishStreamStartActivity(start)
-	m.statusBar.SetTokenPhase(status.PhaseOutput)
-	return m.propagate(start)
+	if created {
+		m.publishStreamStartActivity(start)
+	}
+	if m.statusBar != nil {
+		m.statusBar.SetTokenPhase(status.PhaseOutput)
+	}
+	return start, created
 }
 
 func (m *AppModel) handleStreamChunkTelemetry(chunk msg.StreamChunkMsg) tea.Cmd {
@@ -6035,14 +6139,13 @@ func (m *AppModel) handleStreamProgressTelemetry(progress msg.StreamProgressMsg)
 		TaskName:      progress.TaskName,
 		TaskSlug:      progress.TaskSlug,
 	}
-	m.trackStreamStart(start)
-	created := m.registerStream(start)
-	if created {
-		m.publishStreamStartActivity(start)
-	}
+	start, created := m.prepareStreamStart(start)
 	progress.Message = redactSecrets(progress.Message)
 	if !m.shouldRenderStreamEvent(progress.CorrelationID) {
 		return nil
+	}
+	if created {
+		return tea.Batch(m.propagate(start), m.propagate(progress))
 	}
 	return m.propagate(progress)
 }
@@ -6055,7 +6158,7 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 		"active_streams", len(m.activeStreams),
 		"authoritative_text_len", len(done.AuthoritativeText))
 	m.recordStreamComplete(done.CorrelationID)
-	shouldRender := m.shouldRenderStreamEvent(done.CorrelationID)
+	shouldRender := m.shouldRenderTerminalStreamEvent(done.CorrelationID)
 	uiDebugFileLog().Info("AppModel: STREAM_COMPLETE_SHOULD_RENDER",
 		"correlation_id", done.CorrelationID,
 		"should_render", shouldRender)
@@ -6064,6 +6167,7 @@ func (m *AppModel) handleStreamCompleteTelemetry(done msg.StreamCompleteMsg) tea
 	m.finalizeStreamUsage(done.CorrelationID, true, "")
 	m.markQueueEntryByCorrelation(done.CorrelationID, true)
 	m.unregisterStream(done.CorrelationID)
+	m.clearReroutedStreamCID(done.CorrelationID)
 	if !shouldRender {
 		uiDebugFileLog().Warn("AppModel: STREAM_COMPLETE_NOT_RENDERED",
 			"correlation_id", done.CorrelationID)
@@ -6145,6 +6249,7 @@ func (m *AppModel) handleStreamErrorTelemetry(streamErr msg.StreamErrorMsg) tea.
 	// removes the correlation→agent mapping).
 	errorAgentID := m.streamAgentID(streamErr.CorrelationID)
 	m.unregisterStream(streamErr.CorrelationID)
+	m.clearReroutedStreamCID(streamErr.CorrelationID)
 	// The stream is over — demote the responding agent so its panel card
 	// transitions from working (Thinking/Acting) back to Idle. For terminal
 	// errors demote all active agents and pause the queue.
@@ -6412,8 +6517,13 @@ func (m *AppModel) applyRealStreamUsage(done msg.StreamCompleteMsg) {
 		m.streamUsage[done.CorrelationID] = state
 	}
 	if done.InputTokens > 0 {
-		state.InputTokens = done.InputTokens
-		m.streamUsage[done.CorrelationID] = state
+		// StreamComplete carries request-wide accumulated input tokens for
+		// multi-turn loops. Preserve the last per-call occupancy when we've
+		// already observed it via TokenUsageMsg or early stream telemetry.
+		if state.InputTokens == 0 {
+			state.InputTokens = done.InputTokens
+			m.streamUsage[done.CorrelationID] = state
+		}
 		if !state.EarlyInputApplied {
 			m.totalPromptTokens += done.InputTokens
 		}
@@ -11275,10 +11385,14 @@ func (m *AppModel) handleCommandApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool
 	if mouse.Y < inputTop || mouse.Y >= inputTop+m.prevInputH {
 		return nil, false
 	}
+	contentX := mouse.X - 1
 	contentY := mouse.Y - inputTop - 1
+	if contentX < 0 {
+		return nil, true
+	}
 	switch mouse.Action {
 	case tea.MouseActionMotion:
-		if idx, ok := m.commandApprovalOptionAt(contentY); ok {
+		if idx, ok := m.commandApprovalOptionAt(contentX, contentY); ok {
 			m.commandApproval.selected = idx
 			m.commandApproval.activated = -1
 			m.markSlotDirty(compositor.SlotInput)
@@ -11287,7 +11401,7 @@ func (m *AppModel) handleCommandApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool
 		return nil, true
 	case tea.MouseActionPress:
 		if mouse.Button == tea.MouseButtonLeft {
-			if idx, ok := m.commandApprovalOptionAt(contentY); ok {
+			if idx, ok := m.commandApprovalOptionAt(contentX, contentY); ok {
 				return m.activateCommandApprovalOption(idx), true
 			}
 		}
@@ -11297,20 +11411,21 @@ func (m *AppModel) handleCommandApprovalMouse(mouse tea.MouseMsg) (tea.Cmd, bool
 	}
 }
 
-func (m *AppModel) commandApprovalOptionAt(contentY int) (int, bool) {
-	if m.commandApproval == nil || contentY < 0 {
+func (m *AppModel) commandApprovalOptionAt(contentX, contentY int) (int, bool) {
+	if m.commandApproval == nil || contentX < 0 || contentY < 0 {
 		return 0, false
 	}
-	lines := m.commandApprovalBodyLines(max(m.width-2, 1))
-	start := len(lines) - len(commandApprovalOptions)
-	if contentY < start {
-		return 0, false
+	layout := m.commandApprovalLayout(max(m.width-2, 1))
+	for _, hitbox := range layout.hitboxes {
+		if contentY != hitbox.y {
+			continue
+		}
+		if contentX < hitbox.x0 || contentX >= hitbox.x1 {
+			continue
+		}
+		return hitbox.option, true
 	}
-	index := contentY - start
-	if index < 0 || index >= len(commandApprovalOptions) {
-		return 0, false
-	}
-	return index, true
+	return 0, false
 }
 
 func (m *AppModel) handleInputWheelMouse(mouse tea.MouseMsg) (tea.Cmd, bool) {
@@ -11521,7 +11636,9 @@ func (m *AppModel) handleGitModeLeftClick(mouse tea.MouseMsg) tea.Cmd {
 
 func (m *AppModel) handleInputPanelPress(mouse tea.MouseMsg) bool {
 	if m.commandApproval != nil {
-		if idx, ok := m.commandApprovalOptionAt(mouse.Y - (m.height - m.prevInputH - statusBarHeight) - 1); ok {
+		contentX := mouse.X - 1
+		contentY := mouse.Y - (m.height - m.prevInputH - statusBarHeight) - 1
+		if idx, ok := m.commandApprovalOptionAt(contentX, contentY); ok {
 			m.commandApproval.selected = idx
 			m.markSlotDirty(compositor.SlotInput)
 			m.viewDirty = true
@@ -11537,7 +11654,11 @@ func (m *AppModel) handleInputPanelPress(mouse tea.MouseMsg) bool {
 	if contentX < 0 || contentY < 0 {
 		return false
 	}
-	m.input.DragStart(contentX, contentY)
+	if mouse.Shift {
+		m.input.ExtendSelectionTo(contentX, contentY)
+	} else {
+		m.input.DragStart(contentX, contentY)
+	}
 	m.inputMouseDown = true
 	m.focus.SetFocus(component.FocusInput)
 	m.syncFocusState()
@@ -13673,18 +13794,21 @@ func (m *AppModel) inputHeight() int {
 }
 
 func (m *AppModel) commandApprovalHeight() int {
-	bodyLines := len(m.commandApprovalBodyLines(max(m.width-2, 1)))
+	bodyLines := len(m.commandApprovalLayout(max(m.width-2, 1)).lines)
 	if bodyLines < 1 {
 		bodyLines = 1
 	}
-	maxH := m.height - statusBarHeight - 1
+	maxH := m.height - statusBarHeight - mainMinContentHeight
+	if maxH < inputBorderSize {
+		maxH = inputBorderSize
+	}
 	return min(bodyLines+inputBorderSize, max(maxH, inputBorderSize))
 }
 
 func (m *AppModel) renderCommandApprovalView() string {
 	th := m.config.Theme()
 	contentWidth := max(m.width-2, 1)
-	body := strings.Join(m.commandApprovalBodyLines(contentWidth), "\n")
+	body := strings.Join(m.commandApprovalLayout(contentWidth).lines, "\n")
 	if m.focus.Current() == component.FocusInput && th.ActiveBorderRender != nil {
 		return enforceLineCountToHeight(th.ActiveBorderRender(body, contentWidth, max(m.commandApprovalHeight()-inputBorderSize, 1), m.commandApprovalHeight()), m.commandApprovalHeight())
 	}
@@ -13695,62 +13819,114 @@ func (m *AppModel) renderCommandApprovalView() string {
 	return enforceLineCountToHeight(style.Width(contentWidth).Render(body), m.commandApprovalHeight())
 }
 
-func (m *AppModel) commandApprovalBodyLines(width int) []string {
+func (m *AppModel) commandApprovalLayout(width int) commandApprovalViewLayout {
+	if width <= 0 {
+		width = 1
+	}
 	if m.commandApproval == nil || m.commandApproval.proposal == nil {
-		return []string{""}
+		return commandApprovalViewLayout{lines: []string{""}}
 	}
 	proposal := m.commandApproval.proposal
-	pal := m.config.Theme().Palette
-	titleStyle := lipgloss.NewStyle().Foreground(pal.Secondary).Bold(true)
-	commandStyle := lipgloss.NewStyle().Foreground(pal.Foreground)
-	riskStyle := lipgloss.NewStyle().Foreground(pal.Warning)
-	labelStyle := lipgloss.NewStyle().Foreground(pal.Muted)
-
+	th := m.config.Theme()
+	promptStyle := lipgloss.NewStyle().Foreground(th.Palette.Secondary).Bold(true)
 	lines := []string{
-		titleStyle.Render("Command Approval"),
-		commandStyle.Render(truncatePlainText(proposal.Command, width)),
-		riskStyle.Render(truncatePlainText(proposal.Risk, width)),
+		promptStyle.Render(commandApprovalRequesterName(proposal) + " wants approval for:"),
+		"",
 	}
-	if wd := strings.TrimSpace(proposal.WorkingDir); wd != "" {
-		lines = append(lines, labelStyle.Render(truncatePlainText("cwd: "+wd, width)))
-	}
-	if persist := strings.TrimSpace(proposal.PersistLabel); persist != "" {
-		lines = append(lines, labelStyle.Render(truncatePlainText("always applies to: "+persist, width)))
-	}
+	lines = append(lines, renderCommandApprovalCodeBlock(strings.TrimSpace(proposal.Command), width, th)...)
+	lines = append(lines, "")
+	layout := commandApprovalViewLayout{lines: lines}
 	for idx, option := range commandApprovalOptions {
-		lines = append(lines, m.renderCommandApprovalOption(idx, option, width))
+		renderedLines, hitboxes := m.renderCommandApprovalOption(idx, option, width)
+		baseY := len(layout.lines)
+		layout.lines = append(layout.lines, renderedLines...)
+		for _, hitbox := range hitboxes {
+			hitbox.y += baseY
+			layout.hitboxes = append(layout.hitboxes, hitbox)
+		}
 	}
-	return lines
+	return layout
 }
 
-func (m *AppModel) renderCommandApprovalOption(index int, option commandApprovalOption, width int) string {
-	pal := m.config.Theme().Palette
-	style := lipgloss.NewStyle().Foreground(pal.Muted)
+func (m *AppModel) renderCommandApprovalOption(index int, option commandApprovalOption, width int) ([]string, []commandApprovalHitbox) {
+	th := m.config.Theme()
+	renderTheme := th
 	if m.commandApproval != nil && m.commandApproval.selected == index {
-		style = lipgloss.NewStyle().Foreground(pal.Secondary)
+		selectedTheme := *th
+		selectedPalette := th.Palette
+		selectedPalette.Foreground = th.Palette.Secondary
+		selectedTheme.Palette = selectedPalette
+		renderTheme = &selectedTheme
 	}
+	style := lipgloss.NewStyle()
 	if m.commandApproval != nil && m.commandApproval.activated == index {
 		style = style.Bold(true)
 	}
-	prefix := "  "
-	if m.commandApproval != nil && m.commandApproval.selected == index {
-		prefix = "> "
+	renderedLines := markdownpkg.RenderMarkdown(commandApprovalOptionMarkdown(option), width, renderTheme)
+	hitboxes := make([]commandApprovalHitbox, 0, len(renderedLines))
+	for i, line := range renderedLines {
+		stripped := ansi.Strip(line)
+		visibleW := lipgloss.Width(stripped)
+		renderedLines[i] = style.Render(line)
+		hitboxes = append(hitboxes, commandApprovalHitbox{
+			option: index,
+			y:      i,
+			x0:     0,
+			x1:     visibleW,
+		})
 	}
-	return style.Render(truncatePlainText(prefix+option.label, width))
+	return renderedLines, hitboxes
 }
 
-func truncatePlainText(value string, width int) string {
-	if width <= 0 {
-		return ""
+func renderCommandApprovalCodeBlock(command string, width int, th *theme.Theme) []string {
+	rendered := markdownpkg.RenderMarkdown("```sh\n"+command+"\n```", width, th)
+	if len(rendered) >= 2 && commandApprovalMarkdownLineEmpty(rendered[0]) {
+		rendered = rendered[1:]
 	}
-	runes := []rune(strings.TrimSpace(value))
-	if len(runes) <= width {
-		return string(runes)
+	if len(rendered) >= 2 && commandApprovalMarkdownLineEmpty(rendered[len(rendered)-1]) {
+		rendered = rendered[:len(rendered)-1]
 	}
-	if width == 1 {
-		return string(runes[:1])
+	return rendered
+}
+
+func commandApprovalMarkdownLineEmpty(line string) bool {
+	return strings.TrimSpace(ansi.Strip(line)) == ""
+}
+
+func commandApprovalOptionMarkdown(option commandApprovalOption) string {
+	hint := strings.TrimSpace(option.hint)
+	if hint == "" {
+		return "- " + option.label
 	}
-	return string(runes[:width-1]) + "…"
+	return "- " + option.label + " " + hint
+}
+
+func commandApprovalRequesterName(proposal *commandapproval.Proposal) string {
+	if proposal == nil {
+		return "Agent"
+	}
+	value := strings.TrimSpace(proposal.AgentType)
+	if value == "" {
+		value = strings.TrimSpace(proposal.AgentID)
+	}
+	if value == "" {
+		return "Agent"
+	}
+	value = strings.ReplaceAll(value, "-", " ")
+	value = strings.ReplaceAll(value, "_", " ")
+	words := strings.Fields(value)
+	for i, word := range words {
+		runes := []rune(strings.ToLower(word))
+		if len(runes) == 0 {
+			continue
+		}
+		runes[0] = []rune(strings.ToUpper(string(runes[0])))[0]
+		words[i] = string(runes)
+	}
+	if len(words) == 0 {
+		return "Agent"
+	}
+	return strings.Join(words, " ")
 }
 
 func enforceLineCountToHeight(s string, n int) string {
@@ -14540,7 +14716,9 @@ func (m *AppModel) handleInputHeightTransition() bool {
 	if newInputH == m.prevInputH {
 		return false
 	}
-	if newInputH > m.prevInputH && m.comp.AllMainSlotsCached() {
+	if m.commandApproval != nil {
+		m.recalcLayout()
+	} else if newInputH > m.prevInputH && m.comp.AllMainSlotsCached() {
 		m.handleInputGrowth(newInputH)
 	} else {
 		m.recalcLayout()
@@ -15964,7 +16142,7 @@ func (m *AppModel) setAgentContextUsage(agentID string, inputTokens int) float64
 	if normalized == "" {
 		return 0
 	}
-	limit := agentContextTokenLimit(normalized)
+	limit := m.agentContextTokenLimit(normalized)
 	tokens := min(max(inputTokens, 0), limit)
 	m.agentContextTokens[normalized] = tokens
 	ratio := float64(tokens) / float64(limit)
@@ -15985,17 +16163,35 @@ func (m *AppModel) bumpAgentContextUsage(agentID string, addedTokens int) float6
 	}
 	retained := int(float64(m.agentContextTokens[normalized]) * guideContextRetention)
 	tokens := retained + max(addedTokens, 0)
-	limit := agentContextTokenLimit(normalized)
+	limit := m.agentContextTokenLimit(normalized)
 	tokens = min(tokens, limit)
 	m.agentContextTokens[normalized] = tokens
 	return float64(tokens) / float64(limit)
 }
 
-func agentContextTokenLimit(agentID string) int {
-	if strings.EqualFold(agentID, "architect") {
+func (m *AppModel) agentContextTokenLimit(agentID string) int {
+	normalized := strings.ToLower(strings.TrimSpace(agentID))
+	if normalized == "" {
 		return defaultAgentMaxContextTokens
 	}
-	return defaultAgentMaxContextTokens
+	if normalized == guideAgentID {
+		return guideMaxContextTokens
+	}
+	modelID := ""
+	if m.agentPanel != nil {
+		modelID = strings.TrimSpace(m.agentPanel.ModelIDOf(normalized))
+	}
+	if modelID == "" {
+		modelID = strings.TrimSpace(m.agentContextModels[normalized])
+	}
+	if modelID == "" {
+		return defaultAgentMaxContextTokens
+	}
+	limit := agentContextCounter.MaxContextTokens(modelID)
+	if limit <= 0 {
+		return defaultAgentMaxContextTokens
+	}
+	return limit
 }
 
 func estimateGuideTokens(text string) int {

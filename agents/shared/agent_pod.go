@@ -138,7 +138,8 @@ type AgentPod struct {
 	released   bool
 
 	// Registration dedup.
-	registered map[string]struct{}
+	registered  map[string]struct{}
+	registering map[string]*registrationFuture
 
 	// Sub-node tracking (pipeline use).
 	subNodesMu sync.RWMutex
@@ -148,6 +149,11 @@ type AgentPod struct {
 	scribeFactory ScribeFactory
 	scribesMu     sync.RWMutex
 	scribes       map[string]Scribe
+}
+
+type registrationFuture struct {
+	done chan struct{}
+	err  error
 }
 
 // NewAgentPod creates a pod with the given configuration.
@@ -171,6 +177,7 @@ func NewAgentPod(cfg AgentPodConfig) *AgentPod {
 		eventLogger:   cfg.EventLogger,
 		nodeGuards:    make(map[string]*PodGuardEntry),
 		registered:    make(map[string]struct{}),
+		registering:   make(map[string]*registrationFuture),
 		scribes:       make(map[string]Scribe),
 		scribeFactory: cfg.ScribeFactory,
 	}
@@ -486,16 +493,36 @@ func (p *AgentPod) registerOnce(ctx context.Context, agentType string) error {
 		}))
 		return nil
 	}
+	if future, waiting := p.registering[agentType]; waiting {
+		p.guardsMu.Unlock()
+		p.logTrace("agent_pod_member_register_wait", "debug", agentlog.EventRegistryEvent, "", mergeAgentPodTraceData(p.memberTraceData(agentType), map[string]any{
+			"reason": "registration_inflight",
+		}))
+		select {
+		case <-future.done:
+			return future.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	future := &registrationFuture{done: make(chan struct{})}
+	p.registering[agentType] = future
 	p.guardsMu.Unlock()
 
 	p.logTrace("agent_pod_member_register_begin", "debug", agentlog.EventRegistryEvent, "", p.memberTraceData(agentType))
-	if err := p.registrar(ctx, agentType); err != nil {
-		return err
-	}
+	err := p.registrar(ctx, agentType)
 
 	p.guardsMu.Lock()
-	p.registered[agentType] = struct{}{}
+	if err == nil {
+		p.registered[agentType] = struct{}{}
+	}
+	delete(p.registering, agentType)
+	future.err = err
+	close(future.done)
 	p.guardsMu.Unlock()
+	if err != nil {
+		return err
+	}
 	p.logTrace("agent_pod_member_register_done", "debug", agentlog.EventRegistryEvent, "", p.memberTraceData(agentType))
 	return nil
 }

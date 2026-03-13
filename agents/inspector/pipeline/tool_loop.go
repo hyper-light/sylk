@@ -21,12 +21,24 @@ import (
 
 // executeToolLoop runs the LLM tool-call loop bounded by config.MaxToolRuns.
 func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers.Request, ledger *steering.SteeringLedger) (string, error) {
+	return pi.executeToolLoopWithSurface(ctx, req, ledger, pi.toolRuntime())
+}
+
+func (pi *PipelineInspector) executeToolLoopWithSurface(
+	ctx context.Context,
+	req *providers.Request,
+	ledger *steering.SteeringLedger,
+	surface toolruntime.Surface,
+) (string, error) {
 	seen := make(map[shared.ToolCallSignature]int, pi.config.MaxToolRuns)
 	consecutiveErrors := 0
+	if surface == nil {
+		surface = pi.toolRuntime()
+	}
 
 	for turn := 0; turn <= pi.config.MaxToolRuns; turn++ {
 		if pi.toolDefsDirty {
-			req.Tools = pi.buildToolDefinitions()
+			req.Tools = pi.buildToolDefinitionsWithSurface(surface)
 			pi.toolDefsDirty = false
 		}
 
@@ -87,6 +99,25 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 		agentShared.PublishIntermediateToolTurn(pi.bus, pi.channels, ctx, pi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if err := agentShared.ValidateTaskExecutionCompletion(ctx, "inspector-pipeline"); err != nil {
+				pi.recordTurn(req, resp, turn, 0, 1, turnStart)
+				if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
+					agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
+						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
+						&agentlog.ErrorPayload{Error: err.Error()})
+				}
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nDo not conclude or release the scope yet. Continue the required inspection contract now.",
+				})
+				continue
+			}
 			pi.recordTurn(req, resp, turn, 0, 0, turnStart)
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
@@ -96,11 +127,11 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 			return strings.TrimSpace(resp.Content), nil
 		}
 
-		if err := pi.toolRuntime().ValidateBatch(pi.toolInvocations(ctx, resp.ToolCalls)); err != nil {
+		if err := surface.ValidateBatch(pi.toolInvocationsWithSurface(ctx, resp.ToolCalls, surface)); err != nil {
 			return "", err
 		}
 
-		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen); dup {
+		if dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, seen, req.Messages); dup {
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 					lm.AgentID, lm.SessionID, lm.CorrID, "error",
@@ -109,7 +140,7 @@ func (pi *PipelineInspector) executeToolLoop(ctx context.Context, req *providers
 			return "", fmt.Errorf("pipeline inspector repeated tool call: %s", sig.Name)
 		}
 
-		errCount, rerouted := pi.applyToolCalls(ctx, req, resp)
+		errCount, rerouted := pi.applyToolCalls(ctx, req, resp, surface)
 		pi.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
@@ -137,6 +168,7 @@ func (pi *PipelineInspector) applyToolCalls(
 	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
+	surface toolruntime.Surface,
 ) (int, bool) {
 	req.Messages = append(req.Messages, providers.Message{
 		Role:      providers.RoleAssistant,
@@ -151,7 +183,7 @@ func (pi *PipelineInspector) applyToolCalls(
 		var execResult toolruntime.ExecutionResult
 		var execErr error
 		result, err := agentShared.TimedToolCall(ctx, "inspector-pipeline", call, func() (string, error) {
-			execResult, execErr = pi.executeToolCall(ctx, call)
+			execResult, execErr = pi.executeToolCallWithSurface(ctx, call, surface)
 			return execResult.Output, execErr
 		})
 		if execResult.ToolDefsDirty {
@@ -196,9 +228,20 @@ func (pi *PipelineInspector) applyToolCalls(
 }
 
 func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers.ToolCall) (toolruntime.ExecutionResult, error) {
+	return pi.executeToolCallWithSurface(ctx, call, pi.toolRuntime())
+}
+
+func (pi *PipelineInspector) executeToolCallWithSurface(
+	ctx context.Context,
+	call providers.ToolCall,
+	surface toolruntime.Surface,
+) (toolruntime.ExecutionResult, error) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool name is required")
+	}
+	if surface == nil {
+		surface = pi.toolRuntime()
 	}
 
 	raw := strings.TrimSpace(call.Arguments)
@@ -208,16 +251,27 @@ func (pi *PipelineInspector) executeToolCall(ctx context.Context, call providers
 	if !json.Valid([]byte(raw)) {
 		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
 	}
+	var input map[string]any
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return toolruntime.ExecutionResult{}, fmt.Errorf("tool arguments for %q are not valid JSON", name)
+	}
+	if err := agentShared.ValidateTaskExecutionCall(ctx, "inspector-pipeline", name, input); err != nil {
+		return toolruntime.ExecutionResult{}, err
+	}
 	correlationID := agentShared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = pi.id + "-local"
 	}
-	return pi.toolRuntime().Execute(ctx, toolruntime.Invocation{
+	result, err := surface.Execute(ctx, toolruntime.Invocation{
 		ToolCall:        call,
-		AgentID:         pi.toolRuntime().AgentID(),
+		AgentID:         surface.AgentID(),
 		CorrelationID:   correlationID,
-		CapabilityScope: pi.toolRuntime().CapabilityScope(),
+		CapabilityScope: surface.CapabilityScope(),
 	})
+	if err == nil {
+		agentShared.RecordTaskExecutionSuccess(ctx, name, input)
+	}
+	return result, err
 }
 
 // prepareSkillsForInput progressively loads skills relevant to the user's
@@ -231,8 +285,15 @@ func (pi *PipelineInspector) prepareSkillsForInput(input string) {
 }
 
 func (pi *PipelineInspector) buildToolDefinitions() []providers.Tool {
-	pi.toolRuntime().SyncActiveFromLoaded()
-	return pi.toolRuntime().BuildToolDefinitions()
+	return pi.buildToolDefinitionsWithSurface(pi.toolRuntime())
+}
+
+func (pi *PipelineInspector) buildToolDefinitionsWithSurface(surface toolruntime.Surface) []providers.Tool {
+	if surface == nil {
+		return nil
+	}
+	surface.SyncActiveFromLoaded()
+	return surface.BuildToolDefinitions()
 }
 
 func (pi *PipelineInspector) toolRuntime() *toolruntime.Runtime {
@@ -240,19 +301,30 @@ func (pi *PipelineInspector) toolRuntime() *toolruntime.Runtime {
 }
 
 func (pi *PipelineInspector) toolInvocations(ctx context.Context, calls []providers.ToolCall) []toolruntime.Invocation {
+	return pi.toolInvocationsWithSurface(ctx, calls, pi.toolRuntime())
+}
+
+func (pi *PipelineInspector) toolInvocationsWithSurface(
+	ctx context.Context,
+	calls []providers.ToolCall,
+	surface toolruntime.Surface,
+) []toolruntime.Invocation {
 	if len(calls) == 0 {
 		return nil
+	}
+	if surface == nil {
+		surface = pi.toolRuntime()
 	}
 	correlationID := agentShared.LogMetaFromContext(ctx).CorrID
 	if correlationID == "" {
 		correlationID = pi.id + "-local"
 	}
-	scope := pi.toolRuntime().CapabilityScope()
+	scope := surface.CapabilityScope()
 	invocations := make([]toolruntime.Invocation, 0, len(calls))
 	for _, call := range calls {
 		invocations = append(invocations, toolruntime.Invocation{
 			ToolCall:        call,
-			AgentID:         pi.toolRuntime().AgentID(),
+			AgentID:         surface.AgentID(),
 			CorrelationID:   correlationID,
 			CapabilityScope: scope,
 		})

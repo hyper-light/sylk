@@ -135,6 +135,22 @@ func TestPlanStore_RestorePlanFromFile_TerminalPlansSkipped(t *testing.T) {
 	}
 }
 
+func TestOperationTimeout_CoversProtocolToolLoopBudget(t *testing.T) {
+	a := &Architect{
+		config: Config{
+			MaxOutputTokens:    DefaultMaxOutputTokens,
+			LLMRequestTimeout:  DefaultLLMRequestTimeout,
+			ConsultationMaxAge: DefaultConsultationMaxAge,
+		},
+	}
+
+	got := a.operationTimeout()
+	want := time.Duration(protocolMaxToolRuns) * DefaultLLMRequestTimeout
+	if got != want {
+		t.Fatalf("operationTimeout() = %v, want %v", got, want)
+	}
+}
+
 func TestValidateTaskContract_RequiresWorkspaceAndWorkerPackets(t *testing.T) {
 	task := &AtomicTask{
 		ID:                  "task_checkout",

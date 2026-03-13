@@ -12,6 +12,7 @@ import (
 type RequestView struct {
 	runtime         *Runtime
 	transientActive map[string]struct{}
+	restricted      bool
 }
 
 func (v *RequestView) AgentID() string {
@@ -39,14 +40,14 @@ func (v *RequestView) SyncActiveFromLoaded() []string {
 	if v == nil || v.runtime == nil {
 		return nil
 	}
-	return v.runtime.syncActiveFromLoaded(v.transientActive)
+	return v.runtime.syncActiveFromLoaded(v.transientActive, v.restricted)
 }
 
 func (v *RequestView) BuildToolDefinitions() []providers.Tool {
 	if v == nil || v.runtime == nil {
 		return nil
 	}
-	return v.runtime.buildToolDefinitions(v.transientActive)
+	return v.runtime.buildToolDefinitions(v.transientActive, v.restricted)
 }
 
 func (v *RequestView) ValidateBatch(invocations []Invocation) error {
@@ -80,7 +81,7 @@ func (v *RequestView) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecut
 	if v == nil || v.runtime == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
 	}
-	return v.runtime.executeRaw(ctx, inv, nil, v.transientActive)
+	return v.runtime.executeRaw(ctx, inv, nil, v.transientActive, v.restricted)
 }
 
 func (v *RequestView) ExecuteApproved(
@@ -112,5 +113,5 @@ func (v *RequestView) ExecuteApprovedRaw(
 	if v == nil || v.runtime == nil {
 		return RawExecutionResult{}, fmt.Errorf("tool runtime is not configured")
 	}
-	return v.runtime.executeRaw(ctx, inv, grant, v.transientActive)
+	return v.runtime.executeRaw(ctx, inv, grant, v.transientActive, v.restricted)
 }

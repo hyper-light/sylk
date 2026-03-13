@@ -140,7 +140,7 @@ func (rl *RefactorLoop) reimplementWithFeedback(
 
 	rl.engineer.prepareSkillsForInput(feedbackPrompt)
 	req := &providers.Request{
-		SystemPrompt: rl.engineer.config.SystemPrompt,
+		SystemPrompt: rl.engineer.systemPromptForContract(shared.TaskExecutionContractFromContext(ctx)),
 		Messages: []providers.Message{
 			{Role: providers.RoleAssistant, Content: previousResult},
 			{Role: providers.RoleUser, Content: feedbackPrompt},

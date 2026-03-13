@@ -1,5 +1,8 @@
 # Pipeline Inspector Validation Protocol
 
+Use this protocol only when implementation evidence exists. Do not apply it
+during pre-implementation contract synthesis.
+
 When validating a task implementation, follow this protocol:
 
 ## Phase 1: Criteria Check

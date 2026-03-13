@@ -202,24 +202,7 @@ func (pi *PipelineInspector) initSkills() error {
 }
 
 func (pi *PipelineInspector) registerSafetyHook() {
-	allowed := map[string]bool{
-		"search_skills":    true,
-		"coord_query_view": true, "coord_watch_updates": true,
-		"coord_claim_scope": true, "coord_release_scope": true,
-		"coord_publish_artifact": true, "coord_request_review": true, "coord_resolve_artifact": true,
-		"run_linter": true, "run_type_checker": true, "run_formatter_check": true,
-		"run_security_scan": true, "check_coverage": true, "analyze_complexity": true,
-		"detect_race_conditions": true, "detect_deadlocks": true, "detect_memory_leaks": true,
-		"read_file": true, "glob": true, "grep": true,
-		"read_workspace_file": true, "workspace_glob": true, "workspace_grep": true, "inspect_workspace_state": true, "summarize_workspace_state": true,
-		"define_criteria": true, "validate_criteria": true,
-		"grade_task_quality": true, "request_correction": true,
-		"request_override": true, "get_validation_status": true,
-		"validate_token_usage": true, "validate_accessibility": true,
-		"validate_component_api": true, "validate_design_consistency": true,
-		"reroute_request": true,
-		"self_diagnostic": true,
-	}
+	allowed := allowedInspectorPipelineTools(pi.skills)
 	pi.hooks.RegisterPreToolCallHook("inspector_pipeline_safety", skills.HookPriorityHigh,
 		func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
 			if !allowed[data.ToolName] {
@@ -230,6 +213,14 @@ func (pi *PipelineInspector) registerSafetyHook() {
 			}
 			return skills.HookResult{Continue: true}
 		})
+}
+
+func allowedInspectorPipelineTools(registry *skills.Registry) map[string]bool {
+	allowed := make(map[string]bool)
+	for _, name := range pipelineInspectorToolManifest(registry).AllowedNames() {
+		allowed[name] = true
+	}
+	return allowed
 }
 
 // SetProvider sets or replaces the LLM provider at runtime. Thread-safe.
@@ -394,9 +385,9 @@ func decodePipelineTask(input string) *pipelineTaskFields {
 // composePipelineUserMessage builds a structured LLM user message from
 // decoded pipeline task fields. This replaces the raw JSON blob with a
 // clear, actionable instruction the LLM can act on.
-func composePipelineUserMessage(task *pipelineTaskFields) string {
+func composePipelineUserMessage(task *pipelineTaskFields, contract *agentShared.TaskExecutionContract) string {
 	base := agentShared.ComposePipelineTaskUserPrompt(task)
-	instructions := strings.TrimSpace(stageInstructions(extractPipelineStage(task.Context)))
+	instructions := strings.TrimSpace(stageInstructions(contract, extractPipelineStage(task.Context)))
 	if instructions == "" {
 		return base
 	}
@@ -418,18 +409,26 @@ func extractPipelineStage(ctx map[string]any) string {
 }
 
 // stageInstructions returns stage-specific instructions for the LLM.
-func stageInstructions(stage string) string {
-	if stage == "inspect" {
+func stageInstructions(contract *agentShared.TaskExecutionContract, stage string) string {
+	if inspectorContractSynthesisMode(contract, stage) {
 		return "### Instructions\n\n" +
-			"This is the **inspect** stage (pre-implementation). Execute the validation protocol:\n" +
+			"This inspection is in **contract synthesis** mode. Execute the pre-implementation inspection protocol:\n" +
 			"0. Inspect the workspace snapshot and use `summarize_workspace_state` or `inspect_workspace_state` if any layer mismatch or unavailable view needs clarification\n" +
 			"1. Define success criteria for this task using `define_criteria`\n" +
-			"2. If upstream results contain implementation files, run analysis tools and validate against criteria using `validate_criteria`\n" +
-			"3. Grade and report using `grade_task_quality` and `get_validation_status`\n"
+			"2. Inspect the declared scope and requested files; missing implementation is expected evidence at this stage\n" +
+			"3. Record pending validation state with `get_validation_status`\n" +
+			"4. Publish a handoff artifact with `coord_publish_artifact` so downstream workers can reuse the explicit criteria and constraints\n"
 	}
 	return "### Instructions\n\n" +
-		"Execute the full validation protocol: inspect the workspace snapshot first, define/retrieve criteria, run analysis tools, " +
-		"validate against criteria, grade the implementation, and report results.\n"
+		"Implementation evidence exists. Execute the validation protocol: inspect the workspace snapshot as needed, validate against criteria, run the necessary quality checks, grade the implementation, and publish reusable findings.\n"
+}
+
+func inspectorContractSynthesisMode(contract *agentShared.TaskExecutionContract, stage string) bool {
+	if contract == nil {
+		return stage == "inspect"
+	}
+	return contract.RequiresDeliverable(agentShared.TaskDeliverableCriteriaContract) &&
+		!contract.RequiresDeliverable(agentShared.TaskDeliverableCriteriaEvaluation)
 }
 
 // Handle processes a forwarded request through the LLM tool loop.
@@ -451,22 +450,37 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 	}
 
 	systemPrompt := shared.PipelineInspectorSystemPrompt()
+	contract := (*agentShared.TaskExecutionContract)(nil)
 
 	// Build user message: structured for pipeline tasks, raw for conversation.
 	userMessage := fwd.Input
 	if task != nil {
+		contract = agentShared.BuildTaskExecutionContract(task)
 		if workerType := agentShared.PipelineWorkerType(task); workerType != "" {
 			pi.SetWorkerType(workerType)
 		}
 		pi.seedCriteriaFromTask(task)
-		userMessage = composePipelineUserMessage(task)
+		contract = agentShared.EnrichTaskExecutionContractWithWorkspaceEvidence(ctx, contract, pi.workspaceViews, task)
+		contract.CriteriaDefined = pi.hasCriteria(task.TaskID)
+		contract.ValidationResultAvailable = pi.hasValidationResult(task.TaskID)
+		contract = agentShared.RebuildTaskExecutionContract(task, contract)
+		systemPrompt = shared.PipelineInspectorSystemPromptForContract(contract)
+		userMessage = composePipelineUserMessage(task, contract)
 		if workspaceContext := agentShared.BuildTaskWorkspaceRuntimeContext(ctx, pi.workspaceViews, task); workspaceContext != "" {
 			userMessage += "\n\n" + workspaceContext
 		}
 		systemPrompt = agentShared.AppendPipelineSystemContext(systemPrompt, task)
 	}
+	systemPrompt = agentShared.AppendTaskExecutionGuidance(systemPrompt, contract, "inspector-pipeline")
 	pi.prepareSkillsForInput(userMessage)
-	tools := pi.buildToolDefinitions()
+	surface, err := agentShared.TaskToolSurface(pi.toolRuntime(), contract, "inspector-pipeline")
+	if err != nil {
+		pi.logger.Warn("build task tool surface", "error", err)
+		surface = pi.toolRuntime()
+	}
+	ctx = agentShared.WithTaskExecutionContract(ctx, contract)
+	ctx = agentShared.WithTaskExecutionState(ctx, agentShared.NewTaskExecutionState())
+	tools := pi.buildToolDefinitionsWithSurface(surface)
 
 	pi.mu.RLock()
 	model := pi.config.Model
@@ -489,7 +503,7 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 
 	ledger := agentShared.SteeringLedgerFromContext(ctx)
 	result, err := agentShared.ExecuteTurnLoop(ledger, req, func() (string, error) {
-		return pi.executeToolLoop(ctx, req, ledger)
+		return pi.executeToolLoopWithSurface(ctx, req, ledger, surface)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("pipeline inspector tool loop: %w", err)
@@ -685,6 +699,18 @@ func (pi *PipelineInspector) getCurrentIssues() []shared.ValidationIssue {
 		return result.Issues
 	}
 	return nil
+}
+
+func (pi *PipelineInspector) hasCriteria(taskID string) bool {
+	pi.mu.RLock()
+	defer pi.mu.RUnlock()
+	return pi.criteria[strings.TrimSpace(taskID)] != nil
+}
+
+func (pi *PipelineInspector) hasValidationResult(taskID string) bool {
+	pi.mu.RLock()
+	defer pi.mu.RUnlock()
+	return pi.results[strings.TrimSpace(taskID)] != nil
 }
 
 func (pi *PipelineInspector) resolveTaskID(requested string) (string, bool) {

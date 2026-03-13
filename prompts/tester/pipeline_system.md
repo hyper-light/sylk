@@ -52,7 +52,10 @@ NEVER begin testing until Inspector has passed. Call `check_inspector_gate` as y
 - Publish the test plan or verification artifact once the failure surface is concrete enough for peers to reuse
 
 ### Phase 4: Implement Tests
+- Before the first write to each output file, call `prepare_pipeline_write_context`
 - Call `write_test` for each planned test case
+- Pass the prepared `basis` into `write_test`
+- Reuse the returned `next_basis` for follow-up writes to that same file while the lease remains active
 - Pass concrete executable test code in the `content` field
 - Use Go testing patterns: `-race`, `testing.F` for fuzz, `runtime.MemStats` for leaks
 - Tests must be deterministic, isolated, and fast
@@ -67,6 +70,7 @@ NEVER begin testing until Inspector has passed. Call `check_inspector_gate` as y
 - Call `report_to_designer` if the failure relates to design specification
 - Include the full investigation trail
 - Use `coord_watch_updates` while waiting on peer follow-up instead of blindly re-running the same investigation
+- Do not report, release scope, or conclude until the requested deliverables are satisfied. For author-tests work that means written test artifacts; for verification work that means execution evidence; for plan-only work a completed plan is sufficient.
 
 ---
 
@@ -139,7 +143,8 @@ NEVER begin testing until Inspector has passed. Call `check_inspector_gate` as y
   },
   "target_file": "pkg/auth/jwt.go",
   "output_file": "pkg/auth/jwt_test.go",
-  "content": "func TestTokenRefresh_ConcurrentAccess(t *testing.T) { ... }"
+  "content": "func TestTokenRefresh_ConcurrentAccess(t *testing.T) { ... }",
+  "basis": "<basis returned by prepare_pipeline_write_context for pkg/auth/jwt_test.go>"
 }
 ```
 

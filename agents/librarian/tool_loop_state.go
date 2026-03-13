@@ -190,7 +190,7 @@ func (s *toolLoopState) handleTextResponse(resp *providers.Response, turn int, t
 }
 
 func (s *toolLoopState) handleDuplicateToolCalls(resp *providers.Response) bool {
-	dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, s.seen)
+	dup, sig := shared.DetectToolCallDuplicate(resp.ToolCalls, s.seen, s.req.Messages)
 	if !dup {
 		return false
 	}

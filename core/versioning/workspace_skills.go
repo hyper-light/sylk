@@ -3,7 +3,9 @@ package versioning
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/adalundhe/sylk/core/skills"
@@ -48,6 +50,9 @@ func NewReadWorkspaceFileSkill(getViews WorkspaceViewAccessFunc, defaultPipeline
 			}
 			content, err := views.ReadFile(ctx, WorkspaceView(params.View), params.Path, resolveSkillPipelineID(params.PipelineID, defaultPipelineID))
 			if err != nil {
+				if errors.Is(err, ErrFileNotFound) || os.IsNotExist(err) {
+					return missingWorkspaceContent(params.Path, params.View, params.Offset, params.Limit), nil
+				}
 				return nil, err
 			}
 			return sliceWorkspaceContent(params.Path, params.View, content, params.Offset, params.Limit), nil
@@ -233,18 +238,21 @@ func resolveSkillPipelineID(pipelineID string, defaultPipelineID DefaultPipeline
 func sliceWorkspaceContent(path, view string, content []byte, offset, limit int) map[string]any {
 	lines := strings.Split(string(content), "\n")
 	start := max(0, offset)
+	if limit <= 0 {
+		limit = 1000
+	}
 	if start >= len(lines) {
 		return map[string]any{
 			"path":        path,
 			"view":        view,
+			"exists":      true,
+			"missing":     false,
 			"content":     "",
 			"total_lines": len(lines),
 			"offset":      start,
+			"limit":       limit,
 			"truncated":   false,
 		}
-	}
-	if limit <= 0 {
-		limit = 1000
 	}
 	end := start + limit
 	truncated := end < len(lines)
@@ -254,10 +262,31 @@ func sliceWorkspaceContent(path, view string, content []byte, offset, limit int)
 	return map[string]any{
 		"path":        path,
 		"view":        view,
+		"exists":      true,
+		"missing":     false,
 		"content":     strings.Join(lines[start:end], "\n"),
 		"total_lines": len(lines),
 		"offset":      start,
 		"limit":       limit,
 		"truncated":   truncated,
+	}
+}
+
+func missingWorkspaceContent(path, view string, offset, limit int) map[string]any {
+	start := max(0, offset)
+	if limit <= 0 {
+		limit = 1000
+	}
+	return map[string]any{
+		"path":        path,
+		"view":        view,
+		"exists":      false,
+		"missing":     true,
+		"content":     "",
+		"total_lines": 0,
+		"offset":      start,
+		"limit":       limit,
+		"truncated":   false,
+		"reason":      "file not found in requested workspace view",
 	}
 }

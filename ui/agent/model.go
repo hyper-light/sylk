@@ -1175,6 +1175,16 @@ func (m *Model) AgentTypeOf(agentID string) string {
 	return ""
 }
 
+// ModelIDOf returns the currently assigned model ID for a given agent.
+// Returns "" when the agent is not known to the panel.
+func (m *Model) ModelIDOf(agentID string) string {
+	agentID = m.resolveAgentID(agentID)
+	if a, ok := m.agents[agentID]; ok {
+		return a.ModelID
+	}
+	return ""
+}
+
 // updateAgentStatus applies the table-driven EventType->AgentStatus mapping.
 func (m *Model) updateAgentStatus(agentID string, ev msg.ActivityEventMsg) {
 	agent, ok := m.agents[agentID]

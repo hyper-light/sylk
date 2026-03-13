@@ -237,57 +237,28 @@ func (s *CoordinationService) PublishArtifact(
 	if input.Status == "" {
 		input.Status = coordination.ArtifactStatusPublished
 	}
-	if existing, err := s.findExistingArtifact(ctx, actor, input); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
-
 	now := time.Now().UTC()
-	artifact := &coordination.Artifact{
-		ID:                   uuid.NewString(),
-		TaskID:               strings.TrimSpace(input.TaskID),
-		TaskName:             strings.TrimSpace(input.TaskName),
-		Kind:                 strings.TrimSpace(input.Kind),
-		Title:                strings.TrimSpace(input.Title),
-		Summary:              strings.TrimSpace(input.Summary),
-		ScopeKind:            input.ScopeKind,
-		ScopeKey:             strings.TrimSpace(input.ScopeKey),
-		Status:               input.Status,
-		ProducerAgentID:      strings.TrimSpace(actor.AgentID),
-		ProducerType:         strings.TrimSpace(actor.AgentType),
-		IdempotencyKey:       strings.TrimSpace(input.IdempotencyKey),
-		Payload:              cloneMap(input.Payload),
-		Evidence:             cloneEvidence(input.Evidence),
-		UpstreamArtifactIDs:  append([]string(nil), input.UpstreamArtifactIDs...),
-		SupersedesArtifactID: strings.TrimSpace(input.SupersedesArtifactID),
-		Version:              1,
-		CreatedAt:            now,
-		UpdatedAt:            now,
-	}
-	version, err := s.nextArtifactVersion(ctx, artifact)
-	if err != nil {
-		return nil, err
-	}
-	artifact.Version = version
+	var (
+		artifact *coordination.Artifact
+		created  bool
+	)
 
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
-		if artifact.SupersedesArtifactID != "" {
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE coordination_artifacts SET status = ?, updated_at = ? WHERE id = ?`,
-				string(coordination.ArtifactStatusSuperseded),
-				now,
-				artifact.SupersedesArtifactID,
-			); err != nil {
-				return fmt.Errorf("supersede coordination artifact: %w", err)
-			}
-		}
-		if err := s.insertArtifact(ctx, tx, artifact); err != nil {
+		persisted, wasCreated, err := s.publishArtifactTx(ctx, tx, actor, input, now)
+		if err != nil {
 			return err
 		}
-		return s.insertAction(ctx, tx, coordination.ActionPublishArtifact, artifact.TaskID, artifact.TaskName, actor, artifact.IdempotencyKey, artifact)
+		artifact = persisted
+		created = wasCreated
+		return nil
 	}); err != nil {
 		return nil, err
+	}
+	if artifact == nil {
+		return nil, fmt.Errorf("publish coordination artifact: no artifact persisted")
+	}
+	if !created {
+		return artifact, nil
 	}
 	s.invalidateTask(artifact.TaskID)
 	s.emitArchival(ctx, &coordination.ArchivalEvent{
@@ -317,33 +288,27 @@ func (s *CoordinationService) RequestReview(
 	if strings.TrimSpace(input.TaskID) == "" || strings.TrimSpace(input.ArtifactID) == "" || strings.TrimSpace(input.ReviewerType) == "" {
 		return nil, fmt.Errorf("task_id, artifact_id, and reviewer_type are required")
 	}
-	if existing, err := s.findExistingReview(ctx, actor, input); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
 	now := time.Now().UTC()
-	review := &coordination.Review{
-		ID:               uuid.NewString(),
-		TaskID:           strings.TrimSpace(input.TaskID),
-		ArtifactID:       strings.TrimSpace(input.ArtifactID),
-		RequesterAgentID: strings.TrimSpace(actor.AgentID),
-		RequesterType:    strings.TrimSpace(actor.AgentType),
-		ReviewerType:     strings.TrimSpace(input.ReviewerType),
-		Summary:          strings.TrimSpace(input.Summary),
-		Criteria:         append([]string(nil), input.Criteria...),
-		Status:           coordination.ReviewStatusPending,
-		IdempotencyKey:   strings.TrimSpace(input.IdempotencyKey),
-		CreatedAt:        now,
-		UpdatedAt:        now,
-	}
+	var (
+		review  *coordination.Review
+		created bool
+	)
 	if err := s.store.db.RunInWriteTx(ctx, func(ctx context.Context, tx bun.Tx) error {
-		if err := s.insertReview(ctx, tx, review); err != nil {
+		persisted, wasCreated, err := s.requestReviewTx(ctx, tx, actor, input, now)
+		if err != nil {
 			return err
 		}
-		return s.insertAction(ctx, tx, coordination.ActionRequestReview, review.TaskID, "", actor, review.IdempotencyKey, review)
+		review = persisted
+		created = wasCreated
+		return nil
 	}); err != nil {
 		return nil, err
+	}
+	if review == nil {
+		return nil, fmt.Errorf("request coordination review: no review persisted")
+	}
+	if !created {
+		return review, nil
 	}
 	s.invalidateTask(review.TaskID)
 	return review, nil
@@ -794,15 +759,76 @@ func (s *CoordinationService) lookupReleaseTarget(
 	return claim, nil
 }
 
-func (s *CoordinationService) findExistingArtifact(
+func (s *CoordinationService) publishArtifactTx(
 	ctx context.Context,
+	tx bun.Tx,
+	actor coordination.Actor,
+	input coordination.PublishArtifactInput,
+	now time.Time,
+) (*coordination.Artifact, bool, error) {
+	existing, err := s.findExistingArtifactInTx(ctx, tx, actor, input)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing != nil {
+		return existing, false, nil
+	}
+	artifact := newCoordinationArtifact(actor, input, now)
+	version, err := s.nextArtifactVersionInTx(ctx, tx, artifact)
+	if err != nil {
+		return nil, false, err
+	}
+	artifact.Version = version
+	if err := s.supersedeArtifactTx(ctx, tx, artifact, now); err != nil {
+		return nil, false, err
+	}
+	if err := s.insertArtifact(ctx, tx, artifact); err != nil {
+		return nil, false, err
+	}
+	if err := s.insertAction(ctx, tx, coordination.ActionPublishArtifact, artifact.TaskID, artifact.TaskName, actor, artifact.IdempotencyKey, artifact); err != nil {
+		return nil, false, err
+	}
+	return artifact, true, nil
+}
+
+func newCoordinationArtifact(
+	actor coordination.Actor,
+	input coordination.PublishArtifactInput,
+	now time.Time,
+) *coordination.Artifact {
+	return &coordination.Artifact{
+		ID:                   uuid.NewString(),
+		TaskID:               strings.TrimSpace(input.TaskID),
+		TaskName:             strings.TrimSpace(input.TaskName),
+		Kind:                 strings.TrimSpace(input.Kind),
+		Title:                strings.TrimSpace(input.Title),
+		Summary:              strings.TrimSpace(input.Summary),
+		ScopeKind:            input.ScopeKind,
+		ScopeKey:             strings.TrimSpace(input.ScopeKey),
+		Status:               input.Status,
+		ProducerAgentID:      strings.TrimSpace(actor.AgentID),
+		ProducerType:         strings.TrimSpace(actor.AgentType),
+		IdempotencyKey:       strings.TrimSpace(input.IdempotencyKey),
+		Payload:              cloneMap(input.Payload),
+		Evidence:             cloneEvidence(input.Evidence),
+		UpstreamArtifactIDs:  append([]string(nil), input.UpstreamArtifactIDs...),
+		SupersedesArtifactID: strings.TrimSpace(input.SupersedesArtifactID),
+		Version:              1,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+	}
+}
+
+func (s *CoordinationService) findExistingArtifactInTx(
+	ctx context.Context,
+	tx bun.Tx,
 	actor coordination.Actor,
 	input coordination.PublishArtifactInput,
 ) (*coordination.Artifact, error) {
 	if strings.TrimSpace(input.IdempotencyKey) == "" {
 		return nil, nil
 	}
-	row := s.store.db.QueryRowContext(ctx,
+	row := tx.QueryRowContext(ctx,
 		`SELECT id, task_id, COALESCE(task_name, ''), kind, COALESCE(title, ''), summary, COALESCE(scope_kind, ''), COALESCE(scope_key, ''),
 		 status, producer_agent_id, producer_type, COALESCE(idempotency_key, ''), COALESCE(payload_json, '{}'),
 		 COALESCE(evidence_json, '[]'), COALESCE(upstream_artifact_ids_json, '[]'), COALESCE(supersedes_artifact_id, ''), version, created_at, updated_at
@@ -820,8 +846,12 @@ func (s *CoordinationService) findExistingArtifact(
 	return artifact, nil
 }
 
-func (s *CoordinationService) nextArtifactVersion(ctx context.Context, artifact *coordination.Artifact) (int, error) {
-	row := s.store.db.QueryRowContext(ctx,
+func (s *CoordinationService) nextArtifactVersionInTx(
+	ctx context.Context,
+	tx bun.Tx,
+	artifact *coordination.Artifact,
+) (int, error) {
+	row := tx.QueryRowContext(ctx,
 		`SELECT COALESCE(MAX(version), 0) FROM coordination_artifacts
 		 WHERE task_id = ? AND kind = ? AND producer_type = ? AND COALESCE(scope_key, '') = ?`,
 		artifact.TaskID, artifact.Kind, artifact.ProducerType, artifact.ScopeKey,
@@ -833,15 +863,81 @@ func (s *CoordinationService) nextArtifactVersion(ctx context.Context, artifact 
 	return current + 1, nil
 }
 
-func (s *CoordinationService) findExistingReview(
+func (s *CoordinationService) supersedeArtifactTx(
 	ctx context.Context,
+	tx bun.Tx,
+	artifact *coordination.Artifact,
+	now time.Time,
+) error {
+	if artifact == nil || strings.TrimSpace(artifact.SupersedesArtifactID) == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE coordination_artifacts SET status = ?, updated_at = ? WHERE id = ?`,
+		string(coordination.ArtifactStatusSuperseded),
+		now,
+		artifact.SupersedesArtifactID,
+	); err != nil {
+		return fmt.Errorf("supersede coordination artifact: %w", err)
+	}
+	return nil
+}
+
+func (s *CoordinationService) requestReviewTx(
+	ctx context.Context,
+	tx bun.Tx,
+	actor coordination.Actor,
+	input coordination.RequestReviewInput,
+	now time.Time,
+) (*coordination.Review, bool, error) {
+	existing, err := s.findExistingReviewInTx(ctx, tx, actor, input)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing != nil {
+		return existing, false, nil
+	}
+	review := newCoordinationReview(actor, input, now)
+	if err := s.insertReview(ctx, tx, review); err != nil {
+		return nil, false, err
+	}
+	if err := s.insertAction(ctx, tx, coordination.ActionRequestReview, review.TaskID, "", actor, review.IdempotencyKey, review); err != nil {
+		return nil, false, err
+	}
+	return review, true, nil
+}
+
+func newCoordinationReview(
+	actor coordination.Actor,
+	input coordination.RequestReviewInput,
+	now time.Time,
+) *coordination.Review {
+	return &coordination.Review{
+		ID:               uuid.NewString(),
+		TaskID:           strings.TrimSpace(input.TaskID),
+		ArtifactID:       strings.TrimSpace(input.ArtifactID),
+		RequesterAgentID: strings.TrimSpace(actor.AgentID),
+		RequesterType:    strings.TrimSpace(actor.AgentType),
+		ReviewerType:     strings.TrimSpace(input.ReviewerType),
+		Summary:          strings.TrimSpace(input.Summary),
+		Criteria:         append([]string(nil), input.Criteria...),
+		Status:           coordination.ReviewStatusPending,
+		IdempotencyKey:   strings.TrimSpace(input.IdempotencyKey),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+}
+
+func (s *CoordinationService) findExistingReviewInTx(
+	ctx context.Context,
+	tx bun.Tx,
 	actor coordination.Actor,
 	input coordination.RequestReviewInput,
 ) (*coordination.Review, error) {
 	if strings.TrimSpace(input.IdempotencyKey) == "" {
 		return nil, nil
 	}
-	row := s.store.db.QueryRowContext(ctx,
+	row := tx.QueryRowContext(ctx,
 		`SELECT id, task_id, artifact_id, requester_agent_id, requester_type, reviewer_type, summary,
 		 COALESCE(criteria_json, '[]'), status, COALESCE(idempotency_key, ''), COALESCE(result_json, '{}'),
 		 created_at, updated_at

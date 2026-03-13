@@ -135,7 +135,7 @@ func TestPublishIntermediateToolTurnPublishesToolTurnContent(t *testing.T) {
 }
 
 func TestIntermediateToolTurnText_FallsBackToThinking(t *testing.T) {
-	got := IntermediateToolTurnText(&providers.Response{
+	got := IntermediateToolTurnTextWithContext(context.Background(), &providers.Response{
 		Thinking: "Checking packaging guidance and reconciling it with current Python recommendations.",
 		ToolCalls: []providers.ToolCall{{
 			ID:        "tool-1",
@@ -151,15 +151,51 @@ func TestIntermediateToolTurnText_FallsBackToThinking(t *testing.T) {
 }
 
 func TestIntermediateToolTurnText_FallsBackToToolSummary(t *testing.T) {
-	got := IntermediateToolTurnText(&providers.Response{
+	got := IntermediateToolTurnTextWithContext(context.Background(), &providers.Response{
 		ToolCalls: []providers.ToolCall{
 			{ID: "tool-1", Name: "research_topic", Arguments: `{"topic":"python packaging"}`},
 			{ID: "tool-2", Name: "search_skills", Arguments: `{"query":"packaging"}`},
 		},
 	})
 
-	want := "Working through this with research topic and search skills.\n\n"
+	want := "Researching the topic and checking the available skills.\n\n"
 	if got != want {
 		t.Fatalf("IntermediateToolTurnText tool summary fallback = %q, want %q", got, want)
+	}
+}
+
+func TestIntermediateToolTurnText_UsesAgentAwareNarrationForTester(t *testing.T) {
+	ctx := WithStreamContext(context.Background(), "corr-3", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{"agent_type": "tester-pipeline"})
+
+	got := IntermediateToolTurnTextWithContext(ctx, &providers.Response{
+		ToolCalls: []providers.ToolCall{
+			{ID: "tool-1", Name: "check_inspector_gate", Arguments: `{}`},
+			{ID: "tool-2", Name: "coord_query_view", Arguments: `{}`},
+			{ID: "tool-3", Name: "coord_claim_scope", Arguments: `{}`},
+		},
+	})
+
+	want := "Checking the inspector gate before test work begins, reviewing coordination state and prior task artifacts, and claiming the test surface for this task.\n\n"
+	if got != want {
+		t.Fatalf("IntermediateToolTurnText tester narration = %q, want %q", got, want)
+	}
+}
+
+func TestIntermediateToolTurnText_UsesAgentAwareNarrationForInspector(t *testing.T) {
+	ctx := WithStreamContext(context.Background(), "corr-4", "tui")
+	ctx = WithStreamContextMetadata(ctx, map[string]any{"agent_type": "inspector-pipeline"})
+
+	got := IntermediateToolTurnTextWithContext(ctx, &providers.Response{
+		ToolCalls: []providers.ToolCall{
+			{ID: "tool-1", Name: "coord_query_view", Arguments: `{}`},
+			{ID: "tool-2", Name: "read_workspace_file", Arguments: `{"path":"src/hello/cli.py"}`},
+			{ID: "tool-3", Name: "coord_publish_artifact", Arguments: `{}`},
+		},
+	})
+
+	want := "Reviewing coordination state and prior task artifacts, reading the relevant workspace files to compare the requested contract with the current implementation, and publishing the handoff artifact for downstream implementation.\n\n"
+	if got != want {
+		t.Fatalf("IntermediateToolTurnText inspector narration = %q, want %q", got, want)
 	}
 }
