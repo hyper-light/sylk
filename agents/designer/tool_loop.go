@@ -10,8 +10,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -113,8 +111,22 @@ func (d *Designer) executeToolLoopWithSurface(
 		shared.PublishIntermediateToolTurn(d.bus, d.channels, ctx, d.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if err := shared.ValidatePipelineProtocolCompletion(ctx, "designer"); err != nil {
+				d.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nIf the design criteria or tests are unclear, challenge Inspector or Tester explicitly before ending the turn.",
+				})
+				continue
+			}
 			if err := shared.ValidateTaskExecutionCompletion(ctx, "designer"); err != nil {
-				d.recordTurn(req, resp, turn, 0, 1, turnStart)
+				d.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -132,7 +144,7 @@ func (d *Designer) executeToolLoopWithSurface(
 				})
 				continue
 			}
-			d.recordTurn(req, resp, turn, 0, 0, turnStart)
+			d.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignGenerated,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -156,7 +168,7 @@ func (d *Designer) executeToolLoopWithSurface(
 
 		errCount, rerouted := d.applyToolCalls(ctx, req, resp, surface)
 
-		d.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		d.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 			shared.LogAgentEvent(lm.EventLogger, agentlog.EventDesignIteration,
@@ -302,7 +314,7 @@ func (d *Designer) executeToolCallWithSurface(
 		CapabilityScope: surface.CapabilityScope(),
 	})
 	if err == nil {
-		shared.RecordTaskExecutionSuccess(ctx, name, input)
+		shared.RecordTaskExecutionSuccess(ctx, name, input, result.Output)
 	}
 	return result, err
 }
@@ -368,6 +380,7 @@ func (d *Designer) toolInvocationsWithSurface(
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
 func (d *Designer) recordTurn(
+	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	turn, toolCalls, errCount int,
@@ -377,21 +390,5 @@ func (d *Designer) recordTurn(
 		return
 	}
 
-	contextSize := shared.EstimateContextSize(req.Messages)
-
-	d.handoffBridge.RecordTurn(handoff.TurnRecord{
-		InputTokens:      resp.Usage.InputTokens,
-		OutputTokens:     resp.Usage.OutputTokens,
-		ContextSize:      contextSize,
-		ToolCalls:        toolCalls,
-		ToolSuccesses:    toolCalls - errCount,
-		TurnNumber:       turn + 1,
-		Duration:         time.Since(turnStart),
-		Timestamp:        time.Now(),
-		Stage:            llmruntime.StageFromRequest(req),
-		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
-		StopReason:       resp.StopReason,
-		CacheReadTokens:  resp.Usage.CacheReadTokens,
-		CacheWriteTokens: resp.Usage.CacheWriteTokens,
-	})
+	d.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

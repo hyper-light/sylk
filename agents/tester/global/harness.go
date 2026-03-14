@@ -5,9 +5,9 @@ import (
 	"sync"
 )
 
-// TestHarness manages test infrastructure for integration/e2e testing.
-// Built during Phase 4 (constructHarness) by the LLM through the
-// build_harness skill.
+// TestHarness manages reusable test infrastructure for integration/e2e testing.
+// It is populated through the build_harness skill and any leased global writes
+// needed to materialize harness files.
 type TestHarness struct {
 	Fixtures     []TestFixture   `json:"fixtures"`
 	MockServers  []MockServer    `json:"mock_servers"`

@@ -671,6 +671,7 @@ func validateTaskContract(task *AtomicTask) error {
 	if len(task.WorkerPackets) == 0 {
 		task.WorkerPackets = normalizeWorkerPackets(task)
 	}
+	task.ExecutionContracts = normalizeExecutionContracts(task)
 	if len(task.Workspace.ReadSet) == 0 || len(task.Workspace.WriteSet) == 0 {
 		task.Workspace = normalizeTaskWorkspace(task)
 	}
@@ -701,9 +702,13 @@ func validateTaskContract(task *AtomicTask) error {
 	if len(task.WorkerPackets) == 0 {
 		return fmt.Errorf("task %s worker packets are required", task.ID)
 	}
+	if len(task.ExecutionContracts) == 0 {
+		return fmt.Errorf("task %s execution contracts are required", task.ID)
+	}
 	workspaceRead := stringSet(task.Workspace.ReadSet...)
 	workspaceWrite := stringSet(task.Workspace.WriteSet...)
 	packetAgents := make(map[string]struct{}, len(task.WorkerPackets))
+	contractAgents := make(map[string]struct{}, len(task.ExecutionContracts))
 	hasPrimary := false
 	for _, packet := range task.WorkerPackets {
 		agentType := strings.TrimSpace(packet.AgentType)
@@ -728,12 +733,33 @@ func validateTaskContract(task *AtomicTask) error {
 			}
 		}
 	}
+	for _, contract := range task.ExecutionContracts {
+		agentType := strings.TrimSpace(contract.AgentType)
+		if agentType == "" {
+			return fmt.Errorf("task %s execution contract agent_type is required", task.ID)
+		}
+		if _, exists := contractAgents[agentType]; exists {
+			return fmt.Errorf("task %s has duplicate execution contract for %s", task.ID, agentType)
+		}
+		contractAgents[agentType] = struct{}{}
+		if len(contract.Intents) == 0 {
+			return fmt.Errorf("task %s execution contract %s intents are required", task.ID, agentType)
+		}
+		if len(contract.Deliverables) == 0 {
+			return fmt.Errorf("task %s execution contract %s deliverables are required", task.ID, agentType)
+		}
+	}
 	if !hasPrimary {
 		return fmt.Errorf("task %s is missing a primary worker packet for %s", task.ID, task.AgentType)
 	}
 	for _, coAgent := range task.CoAgents {
 		if _, ok := packetAgents[strings.TrimSpace(coAgent)]; !ok {
 			return fmt.Errorf("task %s is missing worker packet for co-agent %s", task.ID, coAgent)
+		}
+	}
+	for _, agentType := range requiredExecutionContractAgents(task) {
+		if _, ok := contractAgents[agentType]; !ok {
+			return fmt.Errorf("task %s is missing execution contract for %s", task.ID, agentType)
 		}
 	}
 	return nil

@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/llmruntime"
 )
 
@@ -109,15 +111,35 @@ type HandoffBridge struct {
 	// Context brief generator — produces LLM-generated handoff summaries.
 	briefGen *BriefGenerator
 
-	turnCount atomic.Int64
-	started   atomic.Bool
-	stopCh    chan struct{}
-	doneCh    chan struct{}
+	// Optional activity publisher for UI-facing handoff state updates.
+	activityPub events.ActivityPublisher
+
+	// Latest per-request trace metadata for async handoff recommendations.
+	lastTrace bridgeTraceMeta
+
+	turnCount         atomic.Int64
+	started           atomic.Bool
+	handoffInProgress atomic.Bool
+	stopCh            chan struct{}
+	doneCh            chan struct{}
+}
+
+type bridgeTraceMeta struct {
+	EventLogger   *agentlog.SessionEventLogger
+	CorrelationID string
+	SessionID     string
 }
 
 // NewHandoffBridge creates a bridge for the given agent, wired to the supervisor.
 func NewHandoffBridge(cfg BridgeConfig, agent HandoffableAgent, sup *HandoffSupervisor) *HandoffBridge {
 	desc := cfg.Descriptor
+	if cfg.ManagerConfig == nil {
+		cfg.ManagerConfig = DefaultHandoffManagerConfig()
+	}
+	cfg.ManagerConfig.AgentID = agent.AgentID()
+	if strings.TrimSpace(cfg.ManagerConfig.ModelName) == "" {
+		cfg.ManagerConfig.ModelName = desc.ModelID
+	}
 
 	gp := NewAgentGaussianProcess(nil)
 	profile := NewAgentHandoffProfile(desc.AgentType, desc.ModelID, agent.AgentID())
@@ -174,6 +196,8 @@ func NewHandoffBridge(cfg BridgeConfig, agent HandoffableAgent, sup *HandoffSupe
 		b.briefGen = NewBriefGenerator(cfg.BriefSource)
 	}
 
+	contextCheck.SetObserver(b.observeContextEvaluation)
+
 	return b
 }
 
@@ -227,6 +251,8 @@ func (b *HandoffBridge) Stop() error {
 // context, profile learner, and context check.
 func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 	turn := b.turnCount.Add(1)
+	b.captureTraceMeta(rec)
+	b.syncPreparedMetadata(rec)
 
 	// Inject provider/stream signals into fuser.
 	b.injectProviderSignals(rec)
@@ -267,14 +293,18 @@ func (b *HandoffBridge) RecordTurn(rec TurnRecord) {
 		},
 	)
 
-	// Notify context check (async, non-blocking).
-	b.contextCheck.OnContextUpdateAsync(&ContextState{
+	ctxState := &ContextState{
+		AgentID:        b.agent.AgentID(),
+		AgentType:      b.agent.AgentType(),
 		ContextSize:    rec.ContextSize,
 		MaxContextSize: b.config.Descriptor.ContextWindow,
 		TokenCount:     rec.OutputTokens,
 		ToolCallCount:  rec.ToolCalls,
 		TurnNumber:     rec.TurnNumber,
-	})
+	}
+	if recommendation := b.contextCheck.EvaluateContext(ctxState); recommendation != nil && recommendation.ShouldHandoff {
+		b.triggerHandoff(recommendation)
+	}
 
 	// Persist observation to WAL if available.
 	if b.supervisor.wal != nil {
@@ -517,6 +547,14 @@ func (b *HandoffBridge) SetQualityPublisher(fn func(agentID string, quality, std
 	b.qualityPublisher = fn
 }
 
+// SetActivityPublisher installs the UI-facing activity publisher used for
+// handoff lifecycle state updates.
+func (b *HandoffBridge) SetActivityPublisher(pub events.ActivityPublisher) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.activityPub = pub
+}
+
 // RecordQualitySignal records external quality feedback.
 func (b *HandoffBridge) RecordQualitySignal(sig QualitySignal) {
 	// Inject behavior signals into fuser so the next Flush incorporates them.
@@ -587,11 +625,36 @@ func (b *HandoffBridge) monitorLoop() {
 	}
 }
 
-// handleRecommendation processes a handoff recommendation from the context check.
+// handleRecommendation preserves the legacy async notification path, but the
+// bridge now triggers handoff synchronously from RecordTurn via triggerHandoff.
 func (b *HandoffBridge) handleRecommendation(rec *HandoffRecommendation) {
+	b.triggerHandoff(rec)
+}
+
+func (b *HandoffBridge) triggerHandoff(rec *HandoffRecommendation) {
 	if rec == nil || !rec.ShouldHandoff {
 		return
 	}
+	if !b.handoffInProgress.CompareAndSwap(false, true) {
+		b.emitHandoffTrace("handoff_trigger_ignored", "info", nil, map[string]any{
+			"trigger":             rec.Trigger.String(),
+			"reason":              rec.Reason,
+			"context_utilization": rec.Metrics.ContextUtilization,
+			"cause":               "handoff_already_in_progress",
+		})
+		return
+	}
+	defer b.handoffInProgress.Store(false)
+
+	b.emitHandoffTrace("handoff_triggered", "info", nil, map[string]any{
+		"trigger":             rec.Trigger.String(),
+		"reason":              rec.Reason,
+		"urgency":             rec.Urgency,
+		"context_utilization": rec.Metrics.ContextUtilization,
+		"predicted_quality":   rec.Metrics.PredictedQuality,
+		"quality_uncertainty": rec.Metrics.QualityUncertainty,
+	})
+	b.emitHandoffActivity(events.EventTypeAgentDecision, "Context handoff triggered", events.OutcomePending, "triggered", rec.Metrics.ContextUtilization)
 
 	b.mu.RLock()
 	category := b.config.Descriptor.Category
@@ -606,21 +669,23 @@ func (b *HandoffBridge) handleRecommendation(rec *HandoffRecommendation) {
 }
 
 // executeStandaloneHandoff performs a full handoff to a new agent instance.
-// If a parallel buffer is available, uses the overlap-based path where the
-// snapshot is already materialized. Falls back to synchronous handoff otherwise.
+// This path is intentionally single-owner: the current agent stays authoritative
+// until the replacement is fully created, hydrated, and applied. We do not
+// register a second visible active agent during this transition.
 func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
-	if b.parallelBuffer != nil && b.overlapCoord != nil {
-		b.executeOverlapHandoff(rec)
-		return
-	}
-
-	// Fallback: synchronous handoff (no parallel buffer).
 	if b.briefGen != nil {
 		b.briefGen.SetOnPreparedContext(b.prepared)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	b.emitHandoffTrace("handoff_execute_started", "info", nil, map[string]any{
+		"mode":                "direct",
+		"trigger":             rec.Trigger.String(),
+		"reason":              rec.Reason,
+		"context_utilization": rec.Metrics.ContextUtilization,
+	})
+	b.emitHandoffActivity(events.EventTypeAgentAction, "Executing context handoff", events.OutcomePending, "executing", rec.Metrics.ContextUtilization)
 
 	decision := &HandoffDecision{
 		ShouldHandoff: true,
@@ -632,15 +697,39 @@ func (b *HandoffBridge) executeStandaloneHandoff(rec *HandoffRecommendation) {
 
 	transfer, err := b.manager.GetExecutor().PrepareTransfer(decision, b.prepared)
 	if err != nil {
+		b.emitHandoffTrace("handoff_execute_failed", "error", err, map[string]any{
+			"mode": "direct",
+			"step": "prepare_transfer",
+		})
+		b.emitHandoffActivity(events.EventTypeAgentError, "Context handoff failed", events.OutcomeFailure, "failed", rec.Metrics.ContextUtilization)
 		return
 	}
 
 	result := b.manager.GetExecutor().ExecuteHandoff(ctx, transfer)
 	if result == nil || !result.Success {
+		var execErr error
+		if result != nil {
+			execErr = result.Error
+			if execErr == nil && strings.TrimSpace(result.ErrorMessage) != "" {
+				execErr = fmt.Errorf("%s", result.ErrorMessage)
+			}
+		}
+		b.emitHandoffTrace("handoff_execute_failed", "error", execErr, map[string]any{
+			"mode": "direct",
+			"step": "execute",
+		})
+		b.emitHandoffActivity(events.EventTypeAgentError, "Context handoff failed", events.OutcomeFailure, "failed", rec.Metrics.ContextUtilization)
 		return
 	}
 
-	_ = b.handleHandoffResult(result)
+	if err := b.handleHandoffResult(result); err != nil {
+		b.emitHandoffTrace("handoff_execute_failed", "error", err, map[string]any{
+			"mode": "direct",
+			"step": "apply_result",
+		})
+		b.emitHandoffActivity(events.EventTypeAgentError, "Context handoff failed", events.OutcomeFailure, "failed", rec.Metrics.ContextUtilization)
+		return
+	}
 }
 
 // executeOverlapHandoff uses the parallel buffer's pre-materialized snapshot
@@ -797,6 +886,7 @@ func (b *HandoffBridge) rollbackTrafficShift(handle *OverlapHandle, _, _ string)
 func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 	newAgent, ok := b.supervisor.factoryAdapter.TakeAgent(result.NewSessionID)
 	if !ok {
+		b.emitHandoffTrace("handoff_result_apply_failed", "error", fmt.Errorf("no agent found for session %q", result.NewSessionID), nil)
 		return fmt.Errorf("no agent found for session %q", result.NewSessionID)
 	}
 
@@ -812,6 +902,12 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 	}
 
 	b.ReplaceAgent(newAgent)
+	b.emitHandoffTrace("handoff_execute_completed", "info", nil, map[string]any{
+		"new_agent_id": newAgent.AgentID(),
+		"session_id":   result.NewSessionID,
+		"duration_ms":  result.Duration.Milliseconds(),
+	})
+	b.emitHandoffActivity(events.EventTypeSuccess, "Context handoff complete", events.OutcomeSuccess, "completed", 0)
 
 	// Persist outcome.
 	if b.supervisor.wal != nil {
@@ -826,6 +922,179 @@ func (b *HandoffBridge) handleHandoffResult(result *HandoffResult) error {
 	}
 
 	return nil
+}
+
+func (b *HandoffBridge) observeContextEvaluation(ctx *ContextState, recommendation *HandoffRecommendation) {
+	if ctx == nil {
+		return
+	}
+	data := map[string]any{
+		"agent_id":            ctx.GetAgentID(),
+		"agent_type":          ctx.GetAgentType(),
+		"context_size":        ctx.ContextSize,
+		"max_context_size":    ctx.MaxContextSize,
+		"context_utilization": ctx.Utilization(),
+		"token_count":         ctx.TokenCount,
+		"tool_call_count":     ctx.ToolCallCount,
+		"turn_number":         ctx.TurnNumber,
+		"should_handoff":      false,
+	}
+	if recommendation != nil {
+		data["should_handoff"] = recommendation.ShouldHandoff
+		data["urgency"] = recommendation.Urgency
+		if recommendation.Trigger != TriggerNone {
+			data["trigger"] = recommendation.Trigger.String()
+		}
+		if recommendation.Reason != "" {
+			data["reason"] = recommendation.Reason
+		}
+		if recommendation.Decision != nil {
+			data["predicted_quality"] = recommendation.Decision.Factors.PredictedQuality
+			data["quality_uncertainty"] = recommendation.Decision.Factors.QualityUncertainty
+		}
+	}
+	b.emitHandoffTrace("handoff_context_evaluated", "info", nil, data)
+}
+
+func (b *HandoffBridge) captureTraceMeta(rec TurnRecord) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if rec.EventLogger != nil {
+		b.lastTrace.EventLogger = rec.EventLogger
+	}
+	if strings.TrimSpace(rec.CorrelationID) != "" {
+		b.lastTrace.CorrelationID = strings.TrimSpace(rec.CorrelationID)
+	}
+	if strings.TrimSpace(rec.SessionID) != "" {
+		b.lastTrace.SessionID = strings.TrimSpace(rec.SessionID)
+	}
+}
+
+func (b *HandoffBridge) syncPreparedMetadata(rec TurnRecord) {
+	b.prepared.SetMetadata("agent_id", b.agent.AgentID())
+	b.prepared.SetMetadata("agent_type", b.agent.AgentType())
+	if trimmed := strings.TrimSpace(rec.SessionID); trimmed != "" {
+		b.prepared.SetMetadata("session_id", trimmed)
+	}
+	if state := b.agent.ExtractArchivableState(); state != nil {
+		for key, value := range state.State {
+			if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
+				continue
+			}
+			b.prepared.SetMetadata(key, value)
+		}
+	}
+}
+
+func (b *HandoffBridge) emitHandoffTrace(event, level string, err error, data map[string]any) {
+	b.mu.RLock()
+	meta := b.lastTrace
+	b.mu.RUnlock()
+	if meta.EventLogger == nil {
+		return
+	}
+	payload := b.decorateHandoffData(data)
+	entry := agentlog.JSONLEntry{
+		Timestamp: time.Now(),
+		Level:     level,
+		Agent:     b.agent.AgentID(),
+		SessionID: meta.SessionID,
+		Event:     event,
+		EventCode: agentlog.EventHandoffTriggered,
+		CorrID:    meta.CorrelationID,
+		Data:      payload,
+	}
+	if err != nil {
+		entry.Error = err.Error()
+	}
+	meta.EventLogger.LogEvent(entry)
+}
+
+func (b *HandoffBridge) emitHandoffActivity(
+	eventType events.EventType,
+	content string,
+	outcome events.EventOutcome,
+	handoffState string,
+	contextUsage float64,
+) {
+	b.mu.RLock()
+	pub := b.activityPub
+	meta := b.lastTrace
+	b.mu.RUnlock()
+	if pub == nil {
+		return
+	}
+	payload := b.decorateHandoffData(map[string]any{
+		"handoff_state": handoffState,
+		"context_usage": contextUsage,
+	})
+	if handoffState == "completed" {
+		payload["context_tokens"] = 0
+	}
+	evt := events.NewActivityEvent(eventType, meta.SessionID, content)
+	evt.CorrelationID = meta.CorrelationID
+	evt.AgentID = b.agent.AgentID()
+	evt.Outcome = outcome
+	evt.Visibility = events.VisibilityUser
+	evt.Data = payload
+	pub.PublishActivity(evt)
+}
+
+func (b *HandoffBridge) decorateHandoffData(data map[string]any) map[string]any {
+	payload := make(map[string]any, len(data)+8)
+	for key, value := range data {
+		payload[key] = value
+	}
+	payload["agent_type"] = b.agent.AgentType()
+	payload["agent_name"] = handoffAgentDisplayName(b.agent.AgentType())
+	if state := b.agent.ExtractArchivableState(); state != nil {
+		if pipelineID := strings.TrimSpace(state.State["pipeline_id"]); pipelineID != "" {
+			payload["pipeline_id"] = pipelineID
+			if _, exists := payload["task_id"]; !exists {
+				payload["task_id"] = pipelineID
+			}
+		}
+		if taskID := strings.TrimSpace(state.State["task_id"]); taskID != "" {
+			payload["task_id"] = taskID
+		}
+		if taskSlug := strings.TrimSpace(state.State["task_slug"]); taskSlug != "" {
+			payload["task_slug"] = taskSlug
+		}
+	}
+	return payload
+}
+
+func handoffAgentDisplayName(agentType string) string {
+	switch strings.TrimSpace(agentType) {
+	case "tester-pipeline":
+		return "Pipeline Tester"
+	case "inspector-pipeline":
+		return "Pipeline Inspector"
+	case "engineer":
+		return "Engineer"
+	case "designer":
+		return "Designer"
+	case "tester":
+		return "Tester"
+	case "inspector":
+		return "Inspector"
+	case "architect":
+		return "Architect"
+	case "orchestrator":
+		return "Orchestrator"
+	case "guardian":
+		return "Guardian"
+	case "academic":
+		return "Academic"
+	case "librarian":
+		return "Librarian"
+	case "archivalist":
+		return "Archivalist"
+	case "guide":
+		return "Guide"
+	default:
+		return strings.TrimSpace(agentType)
+	}
 }
 
 // executeKnowledgeEviction evicts low-value entries from a knowledge agent

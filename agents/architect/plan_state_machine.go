@@ -21,7 +21,7 @@ var (
 // outgoing edges.
 var planTransitions = map[PlanStatus][]PlanStatus{
 	PlanStatusPending:       {PlanStatusAnalyzing, PlanStatusFailed, PlanStatusSuperseded},
-	PlanStatusAnalyzing:     {PlanStatusConsulting, PlanStatusFailed, PlanStatusSuperseded},
+	PlanStatusAnalyzing:     {PlanStatusConsulting, PlanStatusDesigning, PlanStatusFailed, PlanStatusSuperseded},
 	PlanStatusConsulting:    {PlanStatusClarifying, PlanStatusDesigning, PlanStatusFailed, PlanStatusSuperseded},
 	PlanStatusClarifying:    {PlanStatusPending, PlanStatusFailed, PlanStatusSuperseded},
 	PlanStatusDesigning:     {PlanStatusGenerating, PlanStatusFailed, PlanStatusSuperseded},
@@ -195,6 +195,7 @@ func (sm *PlanStateMachine) fireCallbacks(event PlanStateChangeEvent) {
 func (sm *PlanStateMachine) registerDefaultGuards() {
 	sm.AddGuard(PlanStatusReady, PlanStatusExecuting, guardReadyToExecuting)
 	sm.AddGuard(PlanStatusConsulting, PlanStatusClarifying, guardConsultingToClarifying)
+	sm.AddGuard(PlanStatusAnalyzing, PlanStatusDesigning, guardDirectAnalyzeToDesigning)
 	sm.AddGuard(PlanStatusConsulting, PlanStatusDesigning, guardConsultingToDesigning)
 }
 
@@ -217,6 +218,13 @@ func guardConsultingToDesigning(plan *DesignPlan) error {
 		return fmt.Errorf("clarification questions must be resolved before designing")
 	}
 	return nil
+}
+
+// guardDirectAnalyzeToDesigning allows the planner to skip the optional
+// consulting stage when it already has enough evidence to design, while still
+// refusing to design if unresolved clarification questions were recorded.
+func guardDirectAnalyzeToDesigning(plan *DesignPlan) error {
+	return guardConsultingToDesigning(plan)
 }
 
 // readyPlanDirective builds the ResponseDirective for a plan in Ready state.

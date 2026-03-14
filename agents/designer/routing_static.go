@@ -100,7 +100,7 @@ func DesignerRoutingInfo(canonicalID string) *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.7,
 			},
-			Description:           "UI/UX design specialist powered by Gemini 3.1 Pro Preview. LLM-driven 6-phase protocol for accessible, performant UI implementation.",
+			Description:           "UI/UX design specialist powered by Gemini 3.1 Pro Preview for accessible, performant, design-token-aware UI implementation.",
 			Priority:              70,
 			RuntimeProfiles:       designerRuntimeProfiles(),
 			DefaultRuntimeProfile: designerDefaultRuntimeProfile(),

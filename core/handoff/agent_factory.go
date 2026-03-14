@@ -87,7 +87,12 @@ func (a *FactorySessionAdapter) CreateSession(ctx context.Context, cfg SessionCo
 		return "", fmt.Errorf("agent_type metadata must be a string")
 	}
 
-	agent, err := a.factory.CreateAgent(ctx, agentTypeStr)
+	agent, err := a.factory.CreateAgent(WithFactoryCreationMetadata(ctx, FactoryCreationMetadata{
+		AgentType: agentTypeStr,
+		AgentID:   factoryMetadataString(cfg.Metadata, "agent_id"),
+		TaskID:    factoryMetadataString(cfg.Metadata, "task_id"),
+		TaskSlug:  factoryMetadataString(cfg.Metadata, "task_slug"),
+	}), agentTypeStr)
 	if err != nil {
 		return "", fmt.Errorf("create agent %q: %w", agentTypeStr, err)
 	}
@@ -152,4 +157,16 @@ func (a *FactorySessionAdapter) TakeAgent(sessionID string) (HandoffableAgent, b
 		return nil, false
 	}
 	return val.(HandoffableAgent), true
+}
+
+func factoryMetadataString(metadata map[string]interface{}, key string) string {
+	value, ok := metadata[key]
+	if !ok {
+		return ""
+	}
+	typed, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return typed
 }

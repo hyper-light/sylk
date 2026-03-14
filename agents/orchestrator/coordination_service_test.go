@@ -160,38 +160,6 @@ func TestCoordinationService_WatchUpdatesNotifiesOnArtifactPublish(t *testing.T)
 	}
 }
 
-func TestCoordinationService_ValidateWorkerCompletion(t *testing.T) {
-	svc := newCoordinationTestService(t)
-	ctx := context.Background()
-
-	if err := svc.ValidateWorkerCompletion(ctx, "task-4", "tester-pipeline", "tester-1"); err == nil {
-		t.Fatal("ValidateWorkerCompletion without coordination data succeeded, want failure")
-	}
-
-	if _, err := svc.ClaimScope(ctx, coordination.Actor{AgentID: "tester-1", AgentType: "tester-pipeline"}, coordination.ClaimScopeInput{
-		TaskID:    "task-4",
-		TaskName:  "Checkout Error State",
-		ScopeKind: coordination.ScopeKindTestSurface,
-		ScopeKey:  "checkout-error-state",
-	}); err != nil {
-		t.Fatalf("ClaimScope: %v", err)
-	}
-	if _, err := svc.PublishArtifact(ctx, coordination.Actor{AgentID: "tester-1", AgentType: "tester-pipeline"}, coordination.PublishArtifactInput{
-		TaskID:    "task-4",
-		TaskName:  "Checkout Error State",
-		Kind:      "verification_result",
-		Summary:   "Visual regression found in checkout error banner",
-		ScopeKind: coordination.ScopeKindTestSurface,
-		ScopeKey:  "checkout-error-state",
-	}); err != nil {
-		t.Fatalf("PublishArtifact: %v", err)
-	}
-
-	if err := svc.ValidateWorkerCompletion(ctx, "task-4", "tester-pipeline", "tester-1"); err != nil {
-		t.Fatalf("ValidateWorkerCompletion(after coordination): %v", err)
-	}
-}
-
 func TestCoordinationService_PublishArtifactConcurrentVersionAllocation(t *testing.T) {
 	svc := newCoordinationTestService(t)
 	ctx := context.Background()

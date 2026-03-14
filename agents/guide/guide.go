@@ -140,6 +140,10 @@ type Guide struct {
 	// type names for the activation controller, which indexes by type.
 	typeIndex *ShardedMap[string, string]
 
+	// podIndex maps concrete agent IDs back to their owning pod ID when the
+	// worker lives in a task-scoped or otherwise non-singleton pod.
+	podIndex *ShardedMap[string, string]
+
 	// Resilience components
 	circuits       *CircuitBreakerRegistry
 	health         *HealthMonitor
@@ -173,7 +177,7 @@ type Guide struct {
 	// register the agent's routing info (capabilities, intents, channels)
 	// with the Guide. Bridges the container→guide registration gap for
 	// agents that weren't pre-activated during bootstrap.
-	agentRegistrar func(agentType string)
+	agentRegistrar func(ctx context.Context, targetAgentID, podID, agentType string)
 
 	// Service registry for health-aware routing. When set, isAgentHealthy
 	// uses healthy endpoints from the registry instead of the local
@@ -338,6 +342,7 @@ func New(client *anthropic.Client, cfg Config) (*Guide, error) {
 		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:          NewStringMap[bool](DefaultShardCount),
 		typeIndex:            NewStringMap[string](DefaultShardCount),
+		podIndex:             NewStringMap[string](DefaultShardCount),
 		registry:             registry,
 		routing:              routing,
 		triggers:             NewTriggerDetector(routing),
@@ -504,6 +509,7 @@ func NewWithClassifier(client ClassifierClient, cfg Config) (*Guide, error) {
 		agentChannels:        NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:          NewStringMap[bool](DefaultShardCount),
 		typeIndex:            NewStringMap[string](DefaultShardCount),
+		podIndex:             NewStringMap[string](DefaultShardCount),
 		registry:             registry,
 		routing:              routing,
 		triggers:             NewTriggerDetector(routing),
@@ -608,6 +614,7 @@ func NewWithProvider(provider providers.ProviderAdapter, model string, cfg Confi
 		agentChannels:  NewStringMap[*AgentChannels](DefaultShardCount),
 		readyAgents:    NewStringMap[bool](DefaultShardCount),
 		typeIndex:      NewStringMap[string](DefaultShardCount),
+		podIndex:       NewStringMap[string](DefaultShardCount),
 		registry:       registry,
 		routing:        routing,
 		triggers:       NewTriggerDetector(routing),
@@ -870,6 +877,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	}
 
 	if request.TargetAgentID != "" {
+		g.seedExplicitTargetActivationMapping(request)
 		resolvedTarget, err := g.ensureExplicitTargetReady(ctx, request.TargetAgentID)
 		if err != nil && request.ExplicitTarget {
 			return nil, "", fmt.Errorf("cannot route to @%s: %w", request.TargetAgentID, err)
@@ -1330,6 +1338,48 @@ func (g *Guide) resolveAgentDisplayName(agentID string) string {
 	return agentID
 }
 
+func (g *Guide) seedExplicitTargetActivationMapping(request *RouteRequest) {
+	if g == nil || request == nil {
+		return
+	}
+	targetAgentID := strings.TrimSpace(request.TargetAgentID)
+	if targetAgentID == "" || g.resolveAgent(targetAgentID) != nil {
+		return
+	}
+	taskID := strings.TrimSpace(stringMapString(request.Metadata, "task_id"))
+	agentType := strings.TrimSpace(stringMapString(request.Metadata, "agent_type"))
+	if !isTaskScopedPipelineWorkerType(agentType) || taskID == "" {
+		return
+	}
+	if g.typeIndex != nil {
+		g.typeIndex.Set(targetAgentID, agentType)
+	}
+	if g.podIndex != nil {
+		g.podIndex.Set(targetAgentID, taskID)
+	}
+}
+
+func isTaskScopedPipelineWorkerType(agentType string) bool {
+	switch strings.TrimSpace(agentType) {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return true
+	default:
+		return false
+	}
+}
+
+func stringMapString(values map[string]any, key string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	raw, ok := values[key]
+	if !ok {
+		return ""
+	}
+	text, _ := raw.(string)
+	return text
+}
+
 // resolveReadyAgentID returns a registered, ready agent ID for the given
 // UUID/name/type reference. This prefers the direct ID when it is ready, and
 // otherwise falls back to the current ready registration for the same agent
@@ -1376,6 +1426,16 @@ func (g *Guide) resolveActivationType(idOrName string) string {
 // to resolve the pod. Returns the agent type itself when no activator
 // is set or no mapping exists (singleton pods).
 func (g *Guide) resolvePodID(idOrName string) string {
+	if g != nil && g.podIndex != nil {
+		if podID, ok := g.podIndex.Get(idOrName); ok && strings.TrimSpace(podID) != "" {
+			return podID
+		}
+	}
+	if g != nil {
+		if info := g.routing.GetRoutingInfo(idOrName); info != nil && strings.TrimSpace(info.PodID) != "" {
+			return strings.TrimSpace(info.PodID)
+		}
+	}
 	agentType := g.resolveActivationType(idOrName)
 	if g.activator != nil {
 		return g.activator.PodForAgent(agentType)
@@ -1428,7 +1488,7 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 			"elapsed_ms", time.Since(activateStart).Milliseconds())
 	}
 	if g.agentRegistrar != nil {
-		g.agentRegistrar(g.resolveActivationType(targetAgentID))
+		g.agentRegistrar(ctx, targetAgentID, podID, g.resolveActivationType(targetAgentID))
 	}
 
 	if resolved := g.resolveReadyAgentID(targetAgentID); resolved != "" {
@@ -2265,6 +2325,9 @@ func (g *Guide) Register(info *AgentRoutingInfo) error {
 	if info.Type != "" {
 		g.typeIndex.Set(info.ID, info.Type)
 	}
+	if trimmedPodID := strings.TrimSpace(info.PodID); trimmedPodID != "" && g.podIndex != nil {
+		g.podIndex.Set(info.ID, trimmedPodID)
+	}
 
 	// Register capabilities/constraints with registry
 	if info.Registration != nil {
@@ -2365,6 +2428,9 @@ func (g *Guide) PreRegister(info *AgentRoutingInfo) error {
 	g.routing.RegisterAgent(info)
 	if info.Type != "" {
 		g.typeIndex.Set(info.ID, info.Type)
+	}
+	if trimmedPodID := strings.TrimSpace(info.PodID); trimmedPodID != "" && g.podIndex != nil {
+		g.podIndex.Set(info.ID, trimmedPodID)
 	}
 	if info.Registration != nil {
 		g.registry.Register(info.Registration)
@@ -4157,7 +4223,7 @@ func (g *Guide) publishForwardedRequest(targetAgentID string, forwarded *Forward
 	// Skip when the resolved agent already has active bus subscriptions —
 	// re-registration is only needed when activation created a fresh agent.
 	if g.agentRegistrar != nil {
-		g.agentRegistrar(activationType)
+		g.agentRegistrar(g.processingContext(), targetAgentID, podID, activationType)
 	}
 
 	// Re-resolve — cold start may create a fresh registration ID.
@@ -4569,6 +4635,9 @@ func (g *Guide) LoadSkillsForContext(ctx skills.LoadContext) skills.LoadResult {
 // SetHandoffBridge attaches a HandoffBridge to this Guide instance.
 func (g *Guide) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	g.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(g.activityPub)
+	}
 }
 
 // SetCanonicalID overwrites the Guide's internal ID so a replacement
@@ -4650,7 +4719,7 @@ func (g *Guide) SetActivator(a PodActivator) {
 // register the agent's routing info with the Guide. This bridges the gap
 // between container activation (which only marks readiness) and Guide
 // registration (which provides capabilities, intents, and channels).
-func (g *Guide) SetAgentRegistrar(registrar func(agentType string)) {
+func (g *Guide) SetAgentRegistrar(registrar func(ctx context.Context, targetAgentID, podID, agentType string)) {
 	g.agentRegistrar = registrar
 }
 

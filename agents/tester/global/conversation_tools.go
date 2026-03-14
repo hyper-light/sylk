@@ -6,9 +6,9 @@ import "github.com/adalundhe/sylk/core/providers"
 // permitted during conversation mode. These skills query state without
 // mutating test plans, harnesses, or diagnosis reports.
 //
-// check_inspector_gate is intentionally excluded — it is a pipeline
-// prerequisite, not a conversational tool. Including it causes the LLM
-// to gate direct chat on Inspector completion.
+// Pipeline-only routing and validation skills are intentionally excluded here.
+// Conversation mode should stay read-only and should not depend on pipeline
+// turn ownership or lifecycle rules.
 func conversationAllowedSkills() []string {
 	return []string{
 		"search_skills",

@@ -79,6 +79,12 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	}) {
 		pi.skills.Register(skill)
 	}
+	for _, skill := range agentShared.PipelineProtocolSkills(agentShared.PipelineProtocolSkillConfig{
+		AgentType:   func() string { return "inspector-pipeline" },
+		InspectorOT: true,
+	}) {
+		pi.skills.Register(skill)
+	}
 
 	// Diagnostics
 	pi.skills.Register(agentShared.NewSelfDiagnosticSkill(&pipelineInspectorDiag{pi: pi}))
@@ -123,9 +129,12 @@ func (d *pipelineInspectorDiag) AgentSpecificDiagnostics() map[string]any {
 
 func defineCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 	return skills.NewSkill("define_criteria").
-		Description("Define success criteria and quality gates for a task (TDD Phase 1).").
+		Description("Define success criteria and quality gates for a task before downstream implementation and validation work.").
 		Domain("validation").
 		Keywords("criteria", "define", "quality", "gate").
+		Usage("Use in contract-synthesis mode to turn the requested work into explicit success criteria, quality gates, and constraints before downstream implementation begins.").
+		Satisfies("Creates the criteria contract that downstream Engineer, Tester, and Designer work should follow.").
+		Avoid("Do not use to validate implementation quality after code exists; switch to validate_criteria for that.").
 		BestPractice("Provide numeric quality gate thresholds as numbers when possible; the runtime also accepts numeric strings for robustness.").
 		Example(`{"task_id":"task_1","success_criteria":[{"id":"criterion_1","description":"CLI prints Hello, world!","verifiable":true,"verification_method":"stdout_match"}],"quality_gates":[{"name":"coverage_min","metric":"coverage","threshold":80,"operator":">="}],"constraints":[{"type":"dependency","description":"Use argparse only","required":true}]}`).
 		Priority(100).
@@ -282,10 +291,14 @@ func normalizeQualityGateOperator(operator, metric string, threshold float64) st
 
 func validateCriteriaSkill(pi *PipelineInspector) *skills.Skill {
 	return skills.NewSkill("validate_criteria").
-		Description("Validate implementation against defined criteria (TDD Phase 4).").
+		Description("Validate implementation against the defined criteria and quality gates.").
 		Domain("validation").
 		Keywords("validate", "criteria", "check").
 		Priority(100).
+		Usage("Use in implementation-validation mode after criteria are defined and implementation evidence exists in the workspace or upstream results.").
+		Requirement("Requires an existing criteria contract and real implementation evidence for the requested task.").
+		Satisfies("Produces criteria evaluation evidence and concrete findings for validation reporting.").
+		Avoid("Do not use during pre-implementation contract synthesis.").
 		StringParam("task_id", "Task ID to validate against", true).
 		ArrayParam("files", "Files to validate", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -347,6 +360,10 @@ func gradeTaskQualitySkill(pi *PipelineInspector) *skills.Skill {
 		Domain("validation").
 		Keywords("grade", "quality", "score").
 		Priority(90).
+		Usage("Use after criteria validation and supporting checks when you need an overall quality judgment for the task.").
+		Requirement("Requires either an existing validation result or enough implementation evidence to run validation first.").
+		Satisfies("Produces the final quality grade used in validation artifacts and escalation decisions.").
+		Avoid("Do not grade work that has not been validated yet.").
 		StringParam("task_id", "Task to grade", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
@@ -404,6 +421,10 @@ func requestCorrectionSkill(pi *PipelineInspector) *skills.Skill {
 		Domain("validation").
 		Keywords("correction", "fix", "feedback").
 		Priority(95).
+		Usage("Use after you have concrete validation findings that require Engineer or Designer follow-up.").
+		Requirement("Requires specific corrections grounded in criteria failures or validation findings.").
+		Satisfies("Creates a downstream correction request for the responsible agent.").
+		Avoid("Do not use for vague concerns that have not been turned into explicit corrections.").
 		StringParam("target_agent", "Agent to send corrections to (engineer/designer)", true).
 		ArrayParam("corrections", "List of corrections to apply", "object", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -452,6 +473,10 @@ func requestOverrideSkill(pi *PipelineInspector) *skills.Skill {
 		Domain("validation").
 		Keywords("override", "downgrade", "exception").
 		Priority(80).
+		Usage("Use only when a concrete finding appears overstated and you need an explicit human-reviewed exception path.").
+		Requirement("Requires the exact issue identifier and a clear reason for the proposed override.").
+		Satisfies("Records a pending override request for human review.").
+		Avoid("Do not use to silently suppress or downgrade findings on your own.").
 		StringParam("issue_id", "ID of the issue to override", true).
 		StringParam("reason", "Reason for the override", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -481,6 +506,8 @@ func getValidationStatusSkill(pi *PipelineInspector) *skills.Skill {
 		Domain("validation").
 		Keywords("status", "state", "result").
 		Priority(75).
+		Usage("Use to make the current inspection mode explicit: pending contract synthesis versus implementation validation with real evidence.").
+		Satisfies("Provides reusable pending-validation or implementation-evidence state for coordination artifacts and final reporting.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			taskID, _ := pi.resolveTaskID("")
 			criteriaDefined := false

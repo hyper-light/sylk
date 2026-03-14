@@ -69,6 +69,7 @@ func TestTransitionTo_ValidTransitions(t *testing.T) {
 		to   PlanStatus
 	}{
 		{PlanStatusPending, PlanStatusAnalyzing},
+		{PlanStatusAnalyzing, PlanStatusDesigning},
 		{PlanStatusAnalyzing, PlanStatusConsulting},
 		{PlanStatusConsulting, PlanStatusDesigning},
 		{PlanStatusDesigning, PlanStatusGenerating},
@@ -126,7 +127,6 @@ func TestTransitionTo_IllegalTransition(t *testing.T) {
 	}{
 		{PlanStatusPending, PlanStatusReady},
 		{PlanStatusPending, PlanStatusExecuting},
-		{PlanStatusAnalyzing, PlanStatusDesigning},
 		{PlanStatusReady, PlanStatusAnalyzing},
 		{PlanStatusClarifying, PlanStatusExecuting},
 		{PlanStatusClarifying, PlanStatusDesigning},
@@ -186,6 +186,20 @@ func TestGuard_ConsultingToDesigningRejectsWithQuestions(t *testing.T) {
 	plan := validPlan()
 	plan.Status = PlanStatusConsulting
 	plan.ClarificationQuestions = []string{"What framework?"}
+	err := sm.TransitionTo(PlanStatusDesigning, plan)
+	if err == nil {
+		t.Fatal("expected guard rejection for unresolved clarification questions")
+	}
+	if !errors.Is(err, ErrTransitionGuardFailed) {
+		t.Fatalf("expected ErrTransitionGuardFailed, got: %v", err)
+	}
+}
+
+func TestGuard_AnalyzingToDesigningRejectsWithQuestions(t *testing.T) {
+	sm := NewPlanStateMachine("plan", PlanStatusAnalyzing)
+	plan := validPlan()
+	plan.Status = PlanStatusAnalyzing
+	plan.ClarificationQuestions = []string{"What package name should be used?"}
 	err := sm.TransitionTo(PlanStatusDesigning, plan)
 	if err == nil {
 		t.Fatal("expected guard rejection for unresolved clarification questions")

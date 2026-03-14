@@ -17,6 +17,16 @@ func (o *Orchestrator) publishReviewWakeBestEffort(ctx context.Context, review *
 	if o == nil || review == nil {
 		return
 	}
+	if skipPipelineReviewWake(review) {
+		o.logTrace("coordination_review_wakeup_skipped", agentlog.EventRegistryEvent, map[string]any{
+			"task_id":       strings.TrimSpace(review.TaskID),
+			"review_id":     strings.TrimSpace(review.ID),
+			"artifact_id":   strings.TrimSpace(review.ArtifactID),
+			"reviewer_type": strings.TrimSpace(review.ReviewerType),
+			"reason":        "pipeline dag execute stage owns implementation handoff",
+		})
+		return
+	}
 	if err := o.publishReviewWake(ctx, review); err != nil {
 		o.logTrace("coordination_review_wakeup_failed", agentlog.EventError, map[string]any{
 			"task_id":       strings.TrimSpace(review.TaskID),
@@ -34,6 +44,18 @@ func (o *Orchestrator) publishReviewWakeBestEffort(ctx context.Context, review *
 		"reviewer_type":   strings.TrimSpace(review.ReviewerType),
 		"target_agent_id": pipelineWorkerTargetAgentID(review.TaskID, review.ReviewerType),
 	})
+}
+
+func skipPipelineReviewWake(review *coordination.Review) bool {
+	if review == nil || strings.TrimSpace(review.TaskID) == "" {
+		return false
+	}
+	switch strings.TrimSpace(review.ReviewerType) {
+	case "engineer", "designer", "tester-pipeline", "inspector-pipeline":
+		return true
+	default:
+		return false
+	}
 }
 
 func (o *Orchestrator) publishReviewWake(ctx context.Context, review *coordination.Review) error {

@@ -92,6 +92,10 @@ func auditLayerSkill(gi *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("audit", "layer", "dag").
 		Priority(100).
+		Usage("Use when a completed DAG layer needs a cross-file quality audit against the expected architectural intent.").
+		Requirement("Provide the DAG, layer, and any plan snapshot needed to judge adherence and cross-file coherence.").
+		Satisfies("Produces the layer-audit evidence that drives global inspection, gating, and escalation.").
+		Avoid("Do not use for narrow single-file inspection when a scoped pipeline inspector pass is the correct tool.").
 		StringParam("dag_id", "DAG identifier", true).
 		IntParam("layer_idx", "Layer index to audit", true).
 		StringParam("plan_snapshot", "Architect plan snapshot", false).
@@ -139,6 +143,10 @@ func validatePlanAdherenceSkill(_ *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("plan", "adherence", "compliance").
 		Priority(100).
+		Usage("Use when the global audit needs to compare completed work against the architect's intended task set and sequencing.").
+		Requirement("Provide the plan snapshot and the concrete implemented task IDs so the comparison is fact-based.").
+		Satisfies("Produces plan-adherence evidence that can inform global grading and architect escalation.").
+		Avoid("Do not guess adherence from prose summaries when the actual plan snapshot is available.").
 		StringParam("plan_snapshot", "Serialized plan to validate against", true).
 		ArrayParam("implemented_tasks", "List of implemented task IDs", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -172,6 +180,10 @@ func crossReferenceChangesSkill(gi *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("cross-file", "interface", "import", "type", "race").
 		Priority(95).
+		Usage("Use when multiple changed files need coherence checks across interfaces, imports, shared state, or broader architecture boundaries.").
+		Requirement("Provide the concrete file set so the analysis is tied to the actual changed surface.").
+		Satisfies("Produces cross-file architectural findings for the global audit and final escalation/reporting.").
+		Avoid("Do not limit yourself to one file at a time when the risk is in interactions between files.").
 		ArrayParam("files", "Files to cross-reference", "string", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
@@ -203,6 +215,10 @@ func gradeLayerQualitySkill(_ *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("grade", "quality", "layer").
 		Priority(90).
+		Usage("Use after the relevant audit evidence exists and the layer is ready for a final global quality judgment.").
+		Requirement("Requires enough audit evidence to justify a grade across correctness, robustness, performance, security, and adherence.").
+		Satisfies("Produces the layer-grade result used in final audit summaries and escalation decisions.").
+		Avoid("Do not grade a layer before the core audit evidence has been gathered.").
 		StringParam("dag_id", "DAG identifier", true).
 		IntParam("layer_idx", "Layer index", true).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
@@ -342,6 +358,10 @@ func requestArchitectResearchSkill(gi *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("architect", "research", "escalate").
 		Priority(90).
+		Usage("Use when a global inspection finding requires deeper architectural research or plan-level clarification before a confident verdict.").
+		Requirement("Provide a concrete research question and the context that made the issue ambiguous or risky.").
+		Satisfies("Opens an architect-side research loop that can unblock the global audit with better architectural evidence.").
+		Avoid("Do not use for questions you can answer directly from the available plan, code, or audit evidence.").
 		StringParam("description", "What to research", true).
 		StringParam("context", "Relevant context for the research", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -379,6 +399,10 @@ func requestUserClarificationSkill(gi *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("clarification", "user", "question").
 		Priority(85).
+		Usage("Use when the audit is blocked on missing product intent or a user decision that cannot be responsibly inferred from the existing evidence.").
+		Requirement("Ask a concrete, decision-relevant question that explains what ambiguity is blocking the audit.").
+		Satisfies("Creates a user clarification request that can unblock the audit without guessing.").
+		Avoid("Do not use when the answer is already available in the plan, diffs, or existing task context.").
 		StringParam("question", "Question for the user", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params struct {
@@ -412,6 +436,10 @@ func escalateFindingsSkill(gi *GlobalInspector) *skills.Skill {
 		Domain("audit").
 		Keywords("escalate", "publish", "findings").
 		Priority(95).
+		Usage("Use when the global audit has reached a concrete verdict that needs orchestration-level validation handling or remediation routing.").
+		Requirement("Requires a real summary, blocking flag, DAG scope, and enough details for downstream remediation to act on the findings.").
+		Satisfies("Publishes the global inspection verdict into the orchestration validation control plane.").
+		Avoid("Do not escalate vague suspicions or unresolved research questions as final findings.").
 		StringParam("dag_id", "DAG identifier", true).
 		IntParam("layer_idx", "Layer index", true).
 		BoolParam("blocking", "Whether findings are blocking", true).

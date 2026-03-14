@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
-	inspPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
 	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester"
-	pipelinetester "github.com/adalundhe/sylk/agents/tester/pipeline"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/events"
 )
@@ -18,13 +18,38 @@ import (
 const (
 	phaseTDDLoop concurrency.PipelinePhase = "tdd_loop"
 
-	defaultPhaseTimeout  = 5 * time.Minute
-	defaultMaxLoops      = 5
-	validationGoroutines = 2
-	validationTimeout    = 10 * time.Minute
-	scopeShutdownGrace   = 10 * time.Second
-	scopeShutdownHard    = 30 * time.Second
+	defaultPhaseTimeout     = 5 * time.Minute
+	defaultMaxLoops         = 5
+	maxProtocolEventHistory = 8
 )
+
+const (
+	pipelineStageInspect = "inspect"
+	pipelineStageTest    = "test"
+	pipelineStageExecute = "execute"
+)
+
+type protocolTurn struct {
+	Stage            string
+	ActiveAgents     []string
+	RequestedBy      string
+	Mode             agentShared.PipelineTurnMode
+	Request          string
+	PendingChallenge *agentShared.PipelineProtocolChallenge
+}
+
+type turnOutcome struct {
+	Action    *agentShared.PipelineTurnAction
+	Processed []agentShared.PipelineValidationProcessing
+}
+
+type workerTurnResult struct {
+	agentType string
+	output    *WorkerResult
+	action    *agentShared.PipelineTurnAction
+	processed []agentShared.PipelineValidationProcessing
+	err       error
+}
 
 // domainFromWorkerType maps a WorkerType to its corresponding ValidationDomain.
 func domainFromWorkerType(wt WorkerType) inspShared.ValidationDomain {
@@ -34,13 +59,13 @@ func domainFromWorkerType(wt WorkerType) inspShared.ValidationDomain {
 	return inspShared.DomainCode
 }
 
-// TDDExecutor runs the TDD loop: define → test → implement → validate → loop.
+// TDDExecutor runs the pipeline runtime with a deterministic inspector entry
+// point and agent-directed handoffs inside the pipeline.
 type TDDExecutor struct {
 	pipeline     *Pipeline
-	bus          *PipelineBus
 	runner       *concurrency.PipelineRunner
-	inspector    *inspPipeline.PipelineInspector
-	tester       *pipelinetester.PipelineTester
+	inspector    InspectorAgent
+	tester       TesterAgent
 	worker       WorkerAgent
 	coWorkers    []WorkerAgent
 	activityPub  events.ActivityPublisher
@@ -49,14 +74,19 @@ type TDDExecutor struct {
 	onEvent      func(PipelineEvent)
 	logger       *slog.Logger
 	mu           sync.RWMutex
+
+	currentTurn       protocolTurn
+	pendingValidation *agentShared.PipelineValidationRecord
+	protocolHistory   []agentShared.PipelineProtocolEvent
+	lastTurnStage     string
+	challengeSeq      int
 }
 
 // TDDExecutorConfig holds parameters for creating a TDDExecutor.
 type TDDExecutorConfig struct {
 	Pipeline     *Pipeline
-	Bus          *PipelineBus
-	Inspector    *inspPipeline.PipelineInspector
-	Tester       *pipelinetester.PipelineTester
+	Inspector    InspectorAgent
+	Tester       TesterAgent
 	Worker       WorkerAgent
 	CoWorkers    []WorkerAgent
 	ActivityPub  events.ActivityPublisher
@@ -66,7 +96,7 @@ type TDDExecutorConfig struct {
 	Logger       *slog.Logger
 }
 
-// NewTDDExecutor creates a TDDExecutor that manages the TDD loop.
+// NewTDDExecutor creates a TDDExecutor that manages the pipeline runtime.
 func NewTDDExecutor(cfg TDDExecutorConfig) *TDDExecutor {
 	phaseTimeout := cfg.PhaseTimeout
 	if phaseTimeout == 0 {
@@ -88,7 +118,6 @@ func NewTDDExecutor(cfg TDDExecutorConfig) *TDDExecutor {
 
 	e := &TDDExecutor{
 		pipeline:     cfg.Pipeline,
-		bus:          cfg.Bus,
 		runner:       runner,
 		inspector:    cfg.Inspector,
 		tester:       cfg.Tester,
@@ -99,13 +128,20 @@ func NewTDDExecutor(cfg TDDExecutorConfig) *TDDExecutor {
 		maxLoops:     maxLoops,
 		onEvent:      cfg.OnEvent,
 		logger:       logger,
+		currentTurn: protocolTurn{
+			Stage:        pipelineStageInspect,
+			ActiveAgents: []string{agentShared.PipelineAgentInspector},
+			RequestedBy:  agentShared.PipelineAgentInspector,
+			Mode:         agentShared.PipelineTurnModeSingle,
+			Request:      "Inspect the task, define or refine the criteria, and decide who should act next.",
+		},
 	}
 
 	runner.RegisterPhase(phaseTDDLoop, e.tddLoop)
 	return e
 }
 
-// Start begins the TDD loop execution.
+// Start begins pipeline execution.
 func (e *TDDExecutor) Start(ctx context.Context) error {
 	e.mu.Lock()
 	e.pipeline.StartedAt = time.Now()
@@ -130,7 +166,6 @@ func (e *TDDExecutor) WaitDone(timeout time.Duration) error {
 	if r.err == nil {
 		return e.runner.Error()
 	}
-	// First wait failed (timeout), try the second.
 	r2 := <-ch
 	if r2.err == nil {
 		return e.runner.Error()
@@ -147,214 +182,527 @@ func (e *TDDExecutor) Pipeline() Pipeline {
 
 // tddLoop is the single phase registered with PipelineRunner.
 func (e *TDDExecutor) tddLoop(ctx context.Context) error {
-	for e.currentLoop() < e.maxLoops {
-		e.incrementLoop()
+	if err := e.setActiveTurn(e.currentTurn.Stage, e.currentTurn.ActiveAgents, "pipeline inspector bootstrapping task"); err != nil {
+		return e.fail(err)
+	}
 
-		if err := e.phaseDefineCriteria(ctx); err != nil {
-			return e.fail(err)
+	for {
+		if ctx.Err() != nil {
+			return e.fail(ctx.Err())
 		}
-		if err := e.phaseCreateTests(ctx); err != nil {
-			return e.fail(err)
-		}
-		if err := e.phaseWorkerExecute(ctx); err != nil {
-			return e.fail(err)
-		}
-		passed, err := e.phaseValidate(ctx)
-		if err != nil {
-			return e.fail(err)
-		}
-		if passed {
-			return e.complete()
-		}
-		// Loop back to DefiningCriteria.
-	}
 
-	return e.fail(ErrMaxLoopsExhausted)
-}
-
-func (e *TDDExecutor) phaseDefineCriteria(ctx context.Context) error {
-	if err := e.transitionStatus(StatusDefiningCriteria); err != nil {
-		return err
-	}
-	e.emitAgentActivity(events.EventTypeAgentAction, "inspector-pipeline", "Defining validation criteria")
-	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
-	defer cancel()
-
-	e.mu.RLock()
-	taskID := e.pipeline.TaskID
-	existing := e.pipeline.InspectorCriteria
-	e.mu.RUnlock()
-
-	if existing == nil {
-		return fmt.Errorf("no initial criteria provided for task %s", taskID)
-	}
-
-	if existing.Domain == "" {
-		existing.Domain = domainFromWorkerType(e.pipeline.WorkerType)
-	}
-
-	e.inspector.DefineCriteria(taskID, existing)
-	return nil
-}
-
-func (e *TDDExecutor) phaseCreateTests(ctx context.Context) error {
-	if err := e.transitionStatus(StatusCreatingTests); err != nil {
-		return err
-	}
-	e.emitAgentActivity(events.EventTypeAgentAction, "tester-pipeline", "Creating test suite")
-	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
-	defer cancel()
-
-	e.mu.RLock()
-	taskID := e.pipeline.TaskID
-	workerType := string(e.pipeline.WorkerType)
-	taskPrompt := e.pipeline.TaskPrompt
-	e.mu.RUnlock()
-
-	req := &tester.TesterRequest{
-		Intent:     tester.IntentCreateTests,
-		TaskID:     taskID,
-		TaskPrompt: taskPrompt,
-		WorkerType: workerType,
-	}
-	resp, err := e.tester.HandleRequest(ctx, req)
-	if err != nil {
-		return fmt.Errorf("tester create tests: %w", err)
-	}
-
-	e.mu.Lock()
-	e.pipeline.TesterTests = resp.SuiteResult
-	e.pipeline.TesterResult = resp
-	e.mu.Unlock()
-
-	return nil
-}
-
-func (e *TDDExecutor) phaseWorkerExecute(ctx context.Context) error {
-	if err := e.transitionStatus(StatusExecuting); err != nil {
-		return err
-	}
-	workerAgent := string(e.pipeline.WorkerType)
-	e.emitAgentActivity(events.EventTypeAgentAction, workerAgent, "Executing implementation")
-	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
-	defer cancel()
-
-	criteria, inspFb, testFb := e.workerInputs()
-
-	e.mu.RLock()
-	wt := e.pipeline.WorkerType
-	e.mu.RUnlock()
-
-	// Set task prompt on primary worker.
-	taskPrompt := e.resolveTaskPrompt(wt)
-	e.applyWorkerPrompt(e.worker, taskPrompt, nil)
-
-	// Execute primary worker.
-	result, err := e.worker.Execute(ctx, criteria, inspFb, testFb)
-	if err != nil {
-		return fmt.Errorf("worker execute: %w", err)
-	}
-	result.WorkerType = wt
-
-	// Execute co-workers sequentially.
-	coResults := e.executeCoWorkers(ctx, criteria, inspFb, testFb, result)
-
-	// Merge results.
-	merged := mergeWorkerResults(result, coResults)
-
-	e.mu.Lock()
-	e.pipeline.WorkerOutput = merged
-	e.pipeline.CoWorkerOutputs = coResults
-	e.mu.Unlock()
-
-	return nil
-}
-
-// workerInputs extracts criteria and feedback under RLock.
-func (e *TDDExecutor) workerInputs() (*inspShared.InspectorCriteria, *InspectorFeedback, *TesterFeedback) {
-	e.mu.RLock()
-	criteria := e.pipeline.InspectorCriteria
-	inspResult := e.pipeline.InspectorResult
-	testerResult := e.pipeline.TesterResult
-	loop := e.pipeline.LoopCount
-	wt := e.pipeline.WorkerType
-	e.mu.RUnlock()
-
-	var inspFb *InspectorFeedback
-	if inspResult != nil && loop > 1 {
-		inspFb = &InspectorFeedback{
-			Criteria:   criteria,
-			WorkerType: wt,
-			Feedback: &inspShared.InspectorFeedback{
-				Loop:   inspResult.LoopCount,
-				Passed: inspResult.Passed,
-				Issues: inspResult.Issues,
-			},
-		}
-	}
-
-	var testFb *TesterFeedback
-	if testerResult != nil && testerResult.SuiteResult != nil && loop > 1 {
-		failed := failedTestNames(testerResult.SuiteResult)
-		if len(failed) > 0 {
-			testFb = &TesterFeedback{
-				Response:    testerResult,
-				FailedTests: failed,
-				WorkerType:  wt,
+		turn := e.snapshotTurn()
+		if e.shouldIncrementLoop(turn.Stage) {
+			e.incrementLoop()
+			if e.currentLoop() > e.maxLoops {
+				return e.fail(ErrMaxLoopsExhausted)
 			}
 		}
-	}
 
-	return criteria, inspFb, testFb
+		var (
+			outcome *turnOutcome
+			err     error
+		)
+		switch turn.Stage {
+		case pipelineStageInspect:
+			outcome, err = e.runInspectorTurn(ctx, turn)
+		case pipelineStageTest:
+			outcome, err = e.runTesterTurn(ctx, turn)
+		case pipelineStageExecute:
+			outcome, err = e.runWorkerTurn(ctx, turn)
+		default:
+			err = fmt.Errorf("unknown pipeline stage %q", turn.Stage)
+		}
+		if err != nil {
+			return e.fail(err)
+		}
+		if outcome == nil || outcome.Action == nil {
+			return e.fail(fmt.Errorf("pipeline turn at stage %s completed without a protocol action", turn.Stage))
+		}
+		if err := e.applyTurnOutcome(outcome); err != nil {
+			return e.fail(err)
+		}
+		if outcome.Action.Type == agentShared.PipelineProtocolActionOT {
+			return e.complete()
+		}
+	}
 }
 
-// executeCoWorkers runs each co-worker sequentially, passing the primary
-// result as context. Co-worker failures are non-fatal.
-func (e *TDDExecutor) executeCoWorkers(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback, primaryResult *WorkerResult) []*WorkerResult {
-	if len(e.coWorkers) == 0 {
+func (e *TDDExecutor) runInspectorTurn(ctx context.Context, turn protocolTurn) (*turnOutcome, error) {
+	e.emitAgentActivity(events.EventTypeAgentAction, agentShared.PipelineAgentInspector, "Inspector is evaluating the task and deciding the next handoff")
+	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
+	defer cancel()
+
+	state := agentShared.NewPipelineProtocolState(e.protocolSnapshot(turn))
+	ctx = agentShared.WithPipelineProtocolState(ctx, state)
+	task := e.pipelineTaskInput(turn, agentShared.PipelineAgentInspector)
+	inspection, err := e.inspector.RunTask(ctx, task)
+	if err != nil {
+		return nil, fmt.Errorf("inspector turn: %w", err)
+	}
+
+	e.mu.Lock()
+	if inspection != nil {
+		if inspection.Criteria != nil {
+			e.pipeline.InspectorCriteria = inspection.Criteria
+		}
+		if inspection.Result != nil {
+			e.pipeline.InspectorResult = inspection.Result
+		}
+	}
+	e.mu.Unlock()
+
+	return &turnOutcome{
+		Action:    state.TerminalAction(),
+		Processed: state.ProcessedValidations(),
+	}, nil
+}
+
+func (e *TDDExecutor) runTesterTurn(ctx context.Context, turn protocolTurn) (*turnOutcome, error) {
+	e.emitAgentActivity(events.EventTypeAgentAction, agentShared.PipelineAgentTester, "Tester is responding to the current inspection challenge")
+	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
+	defer cancel()
+
+	state := agentShared.NewPipelineProtocolState(e.protocolSnapshot(turn))
+	ctx = agentShared.WithPipelineProtocolState(ctx, state)
+	task := e.pipelineTaskInput(turn, agentShared.PipelineAgentTester)
+	stage, err := e.tester.TestTask(ctx, task)
+	if err != nil {
+		return nil, fmt.Errorf("tester turn: %w", err)
+	}
+
+	e.mu.Lock()
+	if stage != nil {
+		e.pipeline.TesterTests = stage.SuiteResult
+		success := stage.SuiteResult != nil && stage.SuiteResult.Failed == 0 && stage.SuiteResult.Errors == 0
+		e.pipeline.TesterResult = &tester.TesterResponse{
+			Success:      success,
+			SuiteResult:  stage.SuiteResult,
+			CreatedFiles: append([]string(nil), stage.CreatedFiles...),
+			Timestamp:    time.Now(),
+		}
+	}
+	e.mu.Unlock()
+
+	return &turnOutcome{
+		Action:    state.TerminalAction(),
+		Processed: state.ProcessedValidations(),
+	}, nil
+}
+
+func (e *TDDExecutor) runWorkerTurn(ctx context.Context, turn protocolTurn) (*turnOutcome, error) {
+	criteria, inspFb, testFb := e.workerInputs()
+	activeWorkers, err := e.workerAgentsForTurn(turn.ActiveAgents)
+	if err != nil {
+		return nil, err
+	}
+
+	resultsCh := make(chan workerTurnResult, len(activeWorkers))
+	for _, entry := range activeWorkers {
+		go func(agentType string, worker WorkerAgent) {
+			turnCtx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
+			defer cancel()
+
+			state := agentShared.NewPipelineProtocolState(e.protocolSnapshot(turn))
+			turnCtx = agentShared.WithPipelineProtocolState(turnCtx, state)
+			task := e.pipelineTaskInput(turn, agentType)
+			e.applyWorkerPrompt(worker, e.resolveTaskPrompt(WorkerType(agentType)), e.primaryWorkerOutput())
+			e.applyWorkerTask(worker, task)
+
+			output, execErr := worker.Execute(turnCtx, criteria, inspFb, testFb)
+			resultsCh <- workerTurnResult{
+				agentType: agentType,
+				output:    output,
+				action:    state.TerminalAction(),
+				processed: state.ProcessedValidations(),
+				err:       execErr,
+			}
+		}(entry.agentType, entry.worker)
+	}
+
+	results := make([]workerTurnResult, 0, len(activeWorkers))
+	for range activeWorkers {
+		result := <-resultsCh
+		if result.err != nil {
+			return nil, fmt.Errorf("%s turn: %w", result.agentType, result.err)
+		}
+		if result.action == nil {
+			return nil, fmt.Errorf("%s ended its turn without a protocol action", result.agentType)
+		}
+		results = append(results, result)
+	}
+
+	e.storeWorkerOutputs(results)
+	return e.mergeWorkerTurnResults(results), nil
+}
+
+type workerBinding struct {
+	agentType string
+	worker    WorkerAgent
+}
+
+func (e *TDDExecutor) workerAgentsForTurn(activeAgents []string) ([]workerBinding, error) {
+	if len(activeAgents) == 0 {
+		return nil, fmt.Errorf("execute turn has no active workers")
+	}
+	coWorkerMap := make(map[WorkerType]WorkerAgent, len(e.pipeline.CoWorkerTypes))
+	for idx, wt := range e.pipeline.CoWorkerTypes {
+		if idx < len(e.coWorkers) {
+			coWorkerMap[wt] = e.coWorkers[idx]
+		}
+	}
+
+	bindings := make([]workerBinding, 0, len(activeAgents))
+	for _, agentType := range activeAgents {
+		switch WorkerType(agentType) {
+		case e.pipeline.WorkerType:
+			bindings = append(bindings, workerBinding{agentType: agentType, worker: e.worker})
+		case WorkerEngineer, WorkerDesigner:
+			worker := coWorkerMap[WorkerType(agentType)]
+			if worker == nil {
+				return nil, fmt.Errorf("worker %s is not registered in this pipeline", agentType)
+			}
+			bindings = append(bindings, workerBinding{agentType: agentType, worker: worker})
+		default:
+			return nil, fmt.Errorf("agent %s is not an execute-stage worker", agentType)
+		}
+	}
+	return bindings, nil
+}
+
+func (e *TDDExecutor) storeWorkerOutputs(results []workerTurnResult) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	var primary *WorkerResult
+	coOutputs := make([]*WorkerResult, 0, len(results))
+	for _, result := range results {
+		if result.output == nil {
+			continue
+		}
+		result.output.WorkerType = WorkerType(result.agentType)
+		if WorkerType(result.agentType) == e.pipeline.WorkerType {
+			primary = result.output
+			continue
+		}
+		coOutputs = append(coOutputs, result.output)
+	}
+	e.pipeline.WorkerOutput = primary
+	e.pipeline.CoWorkerOutputs = coOutputs
+}
+
+func (e *TDDExecutor) mergeWorkerTurnResults(results []workerTurnResult) *turnOutcome {
+	if len(results) == 1 {
+		return &turnOutcome{
+			Action:    results[0].action,
+			Processed: append([]agentShared.PipelineValidationProcessing(nil), results[0].processed...),
+		}
+	}
+
+	processed := make([]agentShared.PipelineValidationProcessing, 0, len(results))
+	handoffs := make([]*agentShared.PipelineTurnAction, 0, len(results))
+	validations := make([]*agentShared.PipelineTurnAction, 0, len(results))
+	for _, result := range results {
+		processed = append(processed, result.processed...)
+		switch result.action.Type {
+		case agentShared.PipelineProtocolActionHandoff:
+			handoffs = append(handoffs, result.action)
+		case agentShared.PipelineProtocolActionValidate:
+			validations = append(validations, result.action)
+		default:
+			handoffs = append(handoffs, result.action)
+		}
+	}
+
+	if len(validations) == 1 && len(handoffs) == 0 {
+		return &turnOutcome{Action: validations[0], Processed: processed}
+	}
+	if len(validations) == 0 && len(handoffs) == 1 {
+		return &turnOutcome{Action: handoffs[0], Processed: processed}
+	}
+	if len(validations) == 0 && len(handoffs) > 1 && equivalentHandoffs(handoffs) {
+		return &turnOutcome{Action: handoffs[0], Processed: processed}
+	}
+
+	summary := "execute cohort reported divergent next steps; inspector must reconcile the next handoff"
+	return &turnOutcome{
+		Action: &agentShared.PipelineTurnAction{
+			Type:         agentShared.PipelineProtocolActionHandoff,
+			AgentType:    "execute-cohort",
+			TargetAgents: []string{agentShared.PipelineAgentInspector},
+			Mode:         agentShared.PipelineTurnModeSingle,
+			Reason:       "execute cohort requires inspector arbitration",
+			Request:      summary,
+		},
+		Processed: processed,
+	}
+}
+
+func equivalentHandoffs(actions []*agentShared.PipelineTurnAction) bool {
+	if len(actions) < 2 {
+		return true
+	}
+	base := actions[0]
+	for _, action := range actions[1:] {
+		if action == nil || base == nil {
+			return false
+		}
+		if strings.TrimSpace(base.Request) != strings.TrimSpace(action.Request) ||
+			strings.TrimSpace(base.Reason) != strings.TrimSpace(action.Reason) ||
+			string(base.Mode) != string(action.Mode) ||
+			!equalStringSlices(base.TargetAgents, action.TargetAgents) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (e *TDDExecutor) applyTurnOutcome(outcome *turnOutcome) error {
+	if outcome == nil || outcome.Action == nil {
+		return fmt.Errorf("pipeline turn outcome is required")
+	}
+
+	e.mu.Lock()
+	e.lastTurnStage = e.currentTurn.Stage
+	e.mu.Unlock()
+	e.applyProcessedValidations(outcome.Processed)
+	action := outcome.Action
+	e.appendProtocolEvent(action)
+
+	switch action.Type {
+	case agentShared.PipelineProtocolActionHandoff:
+		challenge := &agentShared.PipelineProtocolChallenge{
+			ID:              e.nextChallengeID(),
+			RequestingAgent: action.AgentType,
+			TargetAgents:    append([]string(nil), action.TargetAgents...),
+			Mode:            string(action.Mode),
+			Reason:          action.Reason,
+			Request:         action.Request,
+			RequiredOutput:  append([]string(nil), action.RequiredOutput...),
+			References:      append([]string(nil), action.References...),
+		}
+		e.pendingValidation = nil
+		e.currentTurn = protocolTurn{
+			Stage:            stageForAgents(action.TargetAgents),
+			ActiveAgents:     append([]string(nil), action.TargetAgents...),
+			RequestedBy:      action.AgentType,
+			Mode:             action.Mode,
+			Request:          action.Request,
+			PendingChallenge: challenge,
+		}
+		return e.setActiveTurn(e.currentTurn.Stage, e.currentTurn.ActiveAgents, pipelineStageMessage(e.currentTurn.Stage, e.currentTurn.ActiveAgents))
+	case agentShared.PipelineProtocolActionValidate:
+		if action.Validation == nil {
+			return fmt.Errorf("validation action missing validation record")
+		}
+		e.currentTurn = protocolTurn{
+			Stage:        stageForAgents([]string{action.Validation.RequestingAgent}),
+			ActiveAgents: []string{action.Validation.RequestingAgent},
+			RequestedBy:  action.Validation.RespondingAgent,
+			Mode:         agentShared.PipelineTurnModeSingle,
+			Request:      fmt.Sprintf("Process validation response for challenge %s and decide the next handoff.", action.Validation.ChallengeID),
+		}
+		e.pendingValidation = cloneValidationRecord(action.Validation)
+		return e.setActiveTurn(e.currentTurn.Stage, e.currentTurn.ActiveAgents, pipelineStageMessage(e.currentTurn.Stage, e.currentTurn.ActiveAgents))
+	case agentShared.PipelineProtocolActionOT:
+		e.mu.Lock()
+		e.pipeline.LastMessage = strings.TrimSpace(action.Summary)
+		e.mu.Unlock()
+		return nil
+	default:
+		return fmt.Errorf("unknown protocol action %q", action.Type)
+	}
+}
+
+func (e *TDDExecutor) applyProcessedValidations(entries []agentShared.PipelineValidationProcessing) {
+	if len(entries) == 0 || e.pendingValidation == nil {
+		return
+	}
+	for _, entry := range entries {
+		e.protocolHistory = appendBoundedProtocolEvent(e.protocolHistory, agentShared.PipelineProtocolEvent{
+			Type:      "process_validation",
+			AgentType: entry.AgentType,
+			Targets:   append([]string(nil), entry.NextTargets...),
+			Summary:   strings.TrimSpace(entry.Summary),
+		})
+		if strings.TrimSpace(entry.ChallengeID) == strings.TrimSpace(e.pendingValidation.ChallengeID) {
+			e.pendingValidation = nil
+		}
+	}
+}
+
+func (e *TDDExecutor) appendProtocolEvent(action *agentShared.PipelineTurnAction) {
+	if action == nil {
+		return
+	}
+	summary := strings.TrimSpace(action.Request)
+	if summary == "" {
+		summary = strings.TrimSpace(action.Summary)
+	}
+	targets := append([]string(nil), action.TargetAgents...)
+	if action.Validation != nil {
+		targets = []string{action.Validation.RequestingAgent}
+		summary = strings.TrimSpace(action.Validation.Summary)
+	}
+	e.protocolHistory = appendBoundedProtocolEvent(e.protocolHistory, agentShared.PipelineProtocolEvent{
+		Type:      string(action.Type),
+		AgentType: action.AgentType,
+		Targets:   targets,
+		Summary:   summary,
+	})
+}
+
+func appendBoundedProtocolEvent(history []agentShared.PipelineProtocolEvent, evt agentShared.PipelineProtocolEvent) []agentShared.PipelineProtocolEvent {
+	history = append(history, evt)
+	if len(history) <= maxProtocolEventHistory {
+		return history
+	}
+	return append([]agentShared.PipelineProtocolEvent(nil), history[len(history)-maxProtocolEventHistory:]...)
+}
+
+func (e *TDDExecutor) shouldIncrementLoop(stage string) bool {
+	stage = strings.TrimSpace(stage)
+	if stage != pipelineStageInspect {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.pipeline.LoopCount == 0 || e.lastTurnStage == pipelineStageExecute
+}
+
+func (e *TDDExecutor) snapshotTurn() protocolTurn {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := e.currentTurn
+	out.ActiveAgents = append([]string(nil), e.currentTurn.ActiveAgents...)
+	if e.currentTurn.PendingChallenge != nil {
+		challenge := *e.currentTurn.PendingChallenge
+		challenge.TargetAgents = append([]string(nil), e.currentTurn.PendingChallenge.TargetAgents...)
+		challenge.RequiredOutput = append([]string(nil), e.currentTurn.PendingChallenge.RequiredOutput...)
+		challenge.References = append([]string(nil), e.currentTurn.PendingChallenge.References...)
+		out.PendingChallenge = &challenge
+	}
+	return out
+}
+
+func stageForAgents(agentTypes []string) string {
+	for _, agentType := range agentTypes {
+		switch strings.TrimSpace(agentType) {
+		case agentShared.PipelineAgentInspector:
+			return pipelineStageInspect
+		case agentShared.PipelineAgentTester:
+			return pipelineStageTest
+		case agentShared.PipelineAgentEngineer, agentShared.PipelineAgentDesigner:
+			return pipelineStageExecute
+		}
+	}
+	return pipelineStageInspect
+}
+
+func pipelineStageMessage(stage string, activeAgents []string) string {
+	switch strings.TrimSpace(stage) {
+	case pipelineStageInspect:
+		return "inspector evaluating the task"
+	case pipelineStageTest:
+		return "tester responding to the current challenge"
+	case pipelineStageExecute:
+		if len(activeAgents) > 1 {
+			return "execute cohort implementing the current request"
+		}
+		return "worker implementing the current request"
+	default:
+		return "pipeline running"
+	}
+}
+
+func (e *TDDExecutor) protocolSnapshot(turn protocolTurn) *agentShared.PipelineProtocolSnapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	roster := []agentShared.PipelineProtocolAgent{
+		{AgentType: agentShared.PipelineAgentInspector, Role: "entrypoint and final acceptance"},
+		{AgentType: agentShared.PipelineAgentTester, Role: "test authoring and execution"},
+		{AgentType: string(e.pipeline.WorkerType), Role: "implementation"},
+	}
+	for _, wt := range e.pipeline.CoWorkerTypes {
+		roster = append(roster, agentShared.PipelineProtocolAgent{
+			AgentType: string(wt),
+			Role:      "execute cohort peer",
+		})
+	}
+
+	snapshot := &agentShared.PipelineProtocolSnapshot{
+		Iteration:      e.pipeline.LoopCount,
+		Roster:         roster,
+		ActiveAgents:   append([]string(nil), turn.ActiveAgents...),
+		RequestedBy:    turn.RequestedBy,
+		Mode:           string(turn.Mode),
+		CurrentRequest: strings.TrimSpace(turn.Request),
+		RecentEvents:   append([]agentShared.PipelineProtocolEvent(nil), e.protocolHistory...),
+	}
+	if turn.PendingChallenge != nil {
+		challenge := *turn.PendingChallenge
+		challenge.TargetAgents = append([]string(nil), turn.PendingChallenge.TargetAgents...)
+		challenge.RequiredOutput = append([]string(nil), turn.PendingChallenge.RequiredOutput...)
+		challenge.References = append([]string(nil), turn.PendingChallenge.References...)
+		snapshot.PendingChallenge = &challenge
+	}
+	if e.pendingValidation != nil {
+		snapshot.PendingValidation = cloneValidationRecord(e.pendingValidation)
+	}
+	return snapshot
+}
+
+func cloneValidationRecord(record *agentShared.PipelineValidationRecord) *agentShared.PipelineValidationRecord {
+	if record == nil {
 		return nil
 	}
+	out := *record
+	out.EvidenceRefs = append([]string(nil), record.EvidenceRefs...)
+	out.MissingInputs = append([]string(nil), record.MissingInputs...)
+	out.RecommendedNextAgents = append([]string(nil), record.RecommendedNextAgents...)
+	return &out
+}
 
+func (e *TDDExecutor) workerInputs() (*inspShared.InspectorCriteria, *InspectorFeedback, *TesterFeedback) {
 	e.mu.RLock()
-	coTypes := e.pipeline.CoWorkerTypes
-	e.mu.RUnlock()
-
-	results := make([]*WorkerResult, 0, len(e.coWorkers))
-	for i, cw := range e.coWorkers {
-		var cwType WorkerType
-		if i < len(coTypes) {
-			cwType = coTypes[i]
+	defer e.mu.RUnlock()
+	return e.pipeline.InspectorCriteria, &InspectorFeedback{
+			Criteria:   e.pipeline.InspectorCriteria,
+			WorkerType: e.pipeline.WorkerType,
+		}, &TesterFeedback{
+			Response:    e.pipeline.TesterResult,
+			FailedTests: failedTestNames(e.pipeline.TesterTests),
+			WorkerType:  e.pipeline.WorkerType,
 		}
-
-		taskPrompt := e.resolveTaskPrompt(cwType)
-		e.applyWorkerPrompt(cw, taskPrompt, primaryResult)
-
-		r, err := cw.Execute(ctx, criteria, inspFb, testFb)
-		if err != nil {
-			e.logger.Warn("co-worker failed", "type", cwType, "error", err)
-			continue // Non-fatal: primary result is authoritative.
-		}
-		r.WorkerType = cwType
-		results = append(results, r)
-	}
-	return results
 }
 
 // resolveTaskPrompt returns the scoped prompt for a worker type,
-// falling back to the pipeline-level task prompt.
+// falling back to the pipeline task prompt.
 func (e *TDDExecutor) resolveTaskPrompt(wt WorkerType) string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if e.pipeline.AgentPrompts != nil {
-		if prompt, ok := e.pipeline.AgentPrompts[wt]; ok {
+		if prompt := strings.TrimSpace(e.pipeline.AgentPrompts[wt]); prompt != "" {
 			return prompt
 		}
 	}
-	return e.pipeline.TaskPrompt
+	return strings.TrimSpace(e.pipeline.TaskPrompt)
 }
 
-// applyWorkerPrompt sets the task prompt and optional prior output on a worker
-// via the TaskPromptSetter and PriorOutputSetter interfaces.
+// applyWorkerPrompt sets the task prompt and optional prior output on a worker.
 func (e *TDDExecutor) applyWorkerPrompt(w WorkerAgent, prompt string, priorOutput *WorkerResult) {
 	if setter, ok := w.(TaskPromptSetter); ok {
 		setter.SetTaskPrompt(prompt)
@@ -364,101 +712,105 @@ func (e *TDDExecutor) applyWorkerPrompt(w WorkerAgent, prompt string, priorOutpu
 	}
 }
 
-func (e *TDDExecutor) phaseValidate(ctx context.Context) (bool, error) {
-	if err := e.transitionStatus(StatusValidating); err != nil {
-		return false, err
+func (e *TDDExecutor) applyWorkerTask(w WorkerAgent, task *agentShared.PipelineTaskInput) {
+	if setter, ok := w.(PipelineTaskSetter); ok {
+		setter.SetPipelineTask(task)
 	}
-	e.emitAgentActivity(events.EventTypeAgentAction, "inspector-pipeline", "Validating results")
-	e.emitAgentActivity(events.EventTypeAgentAction, "tester-pipeline", "Running validation tests")
-	ctx, cancel := context.WithTimeout(ctx, e.phaseTimeout)
-	defer cancel()
-
-	e.mu.RLock()
-	taskID := e.pipeline.TaskID
-	workerOutput := e.pipeline.WorkerOutput
-	e.mu.RUnlock()
-
-	files := workerOutput.ChangedFiles
-
-	scope := concurrency.NewGoroutineScope(ctx, fmt.Sprintf("tdd-validate-%s", e.pipeline.ID), nil)
-
-	var (
-		inspResult   *inspShared.InspectorResult
-		testerResult *tester.TesterResponse
-		inspErr      error
-		testerErr    error
-		resultMu     sync.Mutex
-	)
-
-	workerType := string(e.pipeline.WorkerType)
-
-	// Inspector validation goroutine.
-	if err := scope.Go("inspector-validate", validationTimeout, func(ctx context.Context) error {
-		r, err := e.inspector.ValidateAgainstCriteria(ctx, taskID, files, workerType)
-		resultMu.Lock()
-		inspResult = r
-		inspErr = err
-		resultMu.Unlock()
-		return err
-	}); err != nil {
-		return false, fmt.Errorf("spawn inspector validation: %w", err)
-	}
-
-	// Tester validation goroutine.
-	if err := scope.Go("tester-validate", validationTimeout, func(ctx context.Context) error {
-		req := &tester.TesterRequest{
-			Intent:     tester.IntentRunTests,
-			Files:      files,
-			WorkerType: workerType,
-		}
-		r, err := e.tester.HandleRequest(ctx, req)
-		resultMu.Lock()
-		testerResult = r
-		testerErr = err
-		resultMu.Unlock()
-		return err
-	}); err != nil {
-		return false, fmt.Errorf("spawn tester validation: %w", err)
-	}
-
-	// Wait for both goroutines to complete.
-	if err := scope.Shutdown(scopeShutdownGrace, scopeShutdownHard); err != nil {
-		return false, fmt.Errorf("validation shutdown: %w", err)
-	}
-
-	resultMu.Lock()
-	defer resultMu.Unlock()
-
-	// Store results.
-	e.mu.Lock()
-	e.pipeline.InspectorResult = inspResult
-	e.pipeline.TesterResult = testerResult
-	e.mu.Unlock()
-
-	if inspErr != nil {
-		return false, fmt.Errorf("inspector validation: %w", inspErr)
-	}
-	if testerErr != nil {
-		return false, fmt.Errorf("tester validation: %w", testerErr)
-	}
-
-	inspPassed := inspResult != nil && inspResult.Passed
-	testerPassed := testerResult != nil && testerResult.Success
-	return inspPassed && testerPassed, nil
 }
 
-func (e *TDDExecutor) transitionStatus(to PipelineStatus) error {
+func (e *TDDExecutor) primaryWorkerOutput() *WorkerResult {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.pipeline.WorkerOutput
+}
+
+func (e *TDDExecutor) pipelineFiles() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return append([]string(nil), e.pipeline.Files...)
+}
+
+func (e *TDDExecutor) pipelineTaskInput(turn protocolTurn, agentType string) *agentShared.PipelineTaskInput {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	ctx := map[string]any{
+		"pipeline_stage":    turn.Stage,
+		"agent_type":        string(e.pipeline.WorkerType),
+		"pipeline_protocol": agentShared.PipelineProtocolSnapshotMap(e.protocolSnapshot(turn)),
+	}
+	if e.pipeline.TaskSlug != "" {
+		ctx["task_slug"] = e.pipeline.TaskSlug
+	}
+	if len(e.pipeline.Files) > 0 {
+		ctx["affected_files"] = append([]string(nil), e.pipeline.Files...)
+	}
+
+	return &agentShared.PipelineTaskInput{
+		NodeID:        e.pipeline.DAGNodeID,
+		DAGID:         e.pipeline.DAGID,
+		TaskID:        e.pipeline.TaskID,
+		AgentType:     agentType,
+		Prompt:        e.pipeline.TaskPrompt,
+		Context:       ctx,
+		ParentResults: pipelineParentResults(e.pipeline),
+		SessionID:     e.pipeline.SessionID,
+	}
+}
+
+func pipelineParentResults(p *Pipeline) map[string]any {
+	if p == nil {
+		return nil
+	}
+	results := map[string]any{}
+	if p.WorkerOutput != nil {
+		results["execute"] = map[string]any{
+			"state": "succeeded",
+			"output": map[string]any{
+				"changed_files": append([]string(nil), p.WorkerOutput.ChangedFiles...),
+			},
+		}
+	}
+	if p.InspectorResult != nil {
+		results["inspect"] = map[string]any{
+			"state": "succeeded",
+			"output": map[string]any{
+				"passed":          p.InspectorResult.Passed,
+				"criteria_failed": append([]string(nil), p.InspectorResult.CriteriaFailed...),
+			},
+		}
+	}
+	if p.TesterResult != nil {
+		results["test"] = map[string]any{
+			"state": "succeeded",
+			"output": map[string]any{
+				"passed": p.TesterResult.Success,
+			},
+		}
+	}
+	if len(results) == 0 {
+		return nil
+	}
+	return results
+}
+
+func (e *TDDExecutor) setActiveTurn(stage string, activeAgents []string, message string) error {
 	e.mu.Lock()
 	old := e.pipeline.Status
-	if err := ValidateTransition(old, to); err != nil {
-		e.mu.Unlock()
-		return err
+	if old == StatusPending {
+		if err := ValidateTransition(old, StatusActive); err != nil {
+			e.mu.Unlock()
+			return err
+		}
+		e.pipeline.Status = StatusActive
 	}
-	e.pipeline.Status = to
+	e.pipeline.CurrentStage = strings.TrimSpace(stage)
+	e.pipeline.ActiveAgents = append([]string(nil), activeAgents...)
+	e.pipeline.LastMessage = strings.TrimSpace(message)
 	loop := e.pipeline.LoopCount
 	e.mu.Unlock()
 
-	e.emitEvent(old, to, loop, "")
+	e.emitEvent(old, StatusActive, loop, "", stage, activeAgents, message)
 	return nil
 }
 
@@ -468,9 +820,12 @@ func (e *TDDExecutor) complete() error {
 	e.pipeline.Status = StatusCompleted
 	e.pipeline.CompletedAt = time.Now()
 	loop := e.pipeline.LoopCount
+	stage := e.pipeline.CurrentStage
+	activeAgents := append([]string(nil), e.pipeline.ActiveAgents...)
+	message := strings.TrimSpace(e.pipeline.LastMessage)
 	e.mu.Unlock()
 
-	e.emitEvent(old, StatusCompleted, loop, "")
+	e.emitEvent(old, StatusCompleted, loop, "", stage, activeAgents, message)
 	e.emitAgentActivity(events.EventTypeSuccess, string(e.pipeline.WorkerType), "Pipeline completed successfully")
 	return nil
 }
@@ -484,10 +839,13 @@ func (e *TDDExecutor) fail(err error) error {
 		e.pipeline.CompletedAt = time.Now()
 	}
 	loop := e.pipeline.LoopCount
+	stage := e.pipeline.CurrentStage
+	activeAgents := append([]string(nil), e.pipeline.ActiveAgents...)
+	message := strings.TrimSpace(e.pipeline.LastMessage)
 	e.mu.Unlock()
 
 	if !IsTerminalStatus(old) {
-		e.emitEvent(old, StatusFailed, loop, err.Error())
+		e.emitEvent(old, StatusFailed, loop, err.Error(), stage, activeAgents, message)
 		e.emitAgentActivity(events.EventTypeFailure, string(e.pipeline.WorkerType), fmt.Sprintf("Pipeline failed: %s", err.Error()))
 	}
 	return err
@@ -507,8 +865,22 @@ func (e *TDDExecutor) markCancelled() {
 // CloseCoWorkers closes all co-worker agents.
 func (e *TDDExecutor) CloseCoWorkers() {
 	for _, cw := range e.coWorkers {
-		cw.Close()
+		_ = cw.Close()
 	}
+}
+
+// CloseAgents closes all pipeline-scoped agents owned by this executor.
+func (e *TDDExecutor) CloseAgents() {
+	if e.inspector != nil {
+		_ = e.inspector.Close()
+	}
+	if e.tester != nil {
+		_ = e.tester.Close()
+	}
+	if e.worker != nil {
+		_ = e.worker.Close()
+	}
+	e.CloseCoWorkers()
 }
 
 func (e *TDDExecutor) currentLoop() int {
@@ -523,7 +895,14 @@ func (e *TDDExecutor) incrementLoop() {
 	e.mu.Unlock()
 }
 
-func (e *TDDExecutor) emitEvent(old, new PipelineStatus, loop int, errMsg string) {
+func (e *TDDExecutor) nextChallengeID() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.challengeSeq++
+	return fmt.Sprintf("%s-challenge-%d", strings.TrimSpace(e.pipeline.TaskID), e.challengeSeq)
+}
+
+func (e *TDDExecutor) emitEvent(old, new PipelineStatus, loop int, errMsg, stage string, activeAgents []string, message string) {
 	if e.onEvent == nil {
 		return
 	}
@@ -535,11 +914,16 @@ func (e *TDDExecutor) emitEvent(old, new PipelineStatus, loop int, errMsg string
 		TaskID:            e.pipeline.TaskID,
 		TaskSlug:          e.pipeline.TaskSlug,
 		SessionID:         e.pipeline.SessionID,
+		DAGID:             e.pipeline.DAGID,
+		DAGNodeID:         e.pipeline.DAGNodeID,
 		OldStatus:         old,
 		NewStatus:         new,
 		WorkerType:        e.pipeline.WorkerType,
 		LoopCount:         loop,
 		MaxLoops:          e.maxLoops,
+		Stage:             strings.TrimSpace(stage),
+		ActiveAgents:      append([]string(nil), activeAgents...),
+		Message:           strings.TrimSpace(message),
 		Timestamp:         time.Now(),
 		Error:             errMsg,
 	}

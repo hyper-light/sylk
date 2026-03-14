@@ -1,40 +1,35 @@
 ## SKILL INVOCATION POLICY
 
-### Execution Order
+Treat the tool definitions as the tester workflow contract. Their requirements, satisfied outcomes, and avoidance guidance explain when a tool belongs in the current path.
 
-Follow the protocol phases in order. Each phase uses specific skills:
+### Common Testing Concerns
 
-1. **Gate phase** — `check_inspector_gate` (ALWAYS first)
-2. **Harness phase** — `detect_test_harness` / `prepare_test_harness` or `build_harness` (Global Tester only)
-3. **Analysis phase** — `analyze_risk` or `analyze_integration_risks` / `analyze_batch`
-4. **Planning phase** — `plan_tests` or `plan_integration_tests` / `plan_e2e_tests`
-5. **Implementation phase** — `write_test` or `write_integration_test` / `write_e2e_test`
-6. **Execution phase** — `run_test_suite`
-7. **Diagnosis phase** — `diagnose_failure` (only on failure)
-8. **Coordination phase** — `coord_query_view`, `coord_claim_scope`, `coord_publish_artifact`, `coord_request_review`, `coord_watch_updates`
-9. **Reporting phase** — `report_to_engineer` / `report_to_designer` / `report_to_orchestrator` / `escalate_failure`
+- Coordination: `coord_query_view`, `coord_claim_scope`, `coord_publish_artifact`, `coord_request_review`, `coord_watch_updates`
+- Harness and environment: `detect_test_harness`, `prepare_test_harness`, `build_harness`
+- Analysis and planning: `analyze_risk`, `analyze_integration_risks`, `analyze_batch`, `plan_tests`, `plan_integration_tests`, `plan_e2e_tests`
+- Authoring and execution: `prepare_pipeline_write_context`, `prepare_global_write_context`, `write_test`, `write_integration_test`, `write_e2e_test`, `run_test_suite`
+- Diagnosis and reporting: `diagnose_failure`, `report_to_engineer`, `report_to_designer`, `report_to_orchestrator`, `report_to_architect`, `escalate_failure`
 
 ### When to Iterate vs Finalize
 
 **Iterate** when:
 - Risk analysis reveals new areas not yet covered
-- A test failure reveals a deeper defect requiring additional tests
-- Coverage gaps remain in critical code paths
+- A test failure reveals a deeper defect requiring additional tests or diagnosis
+- Coverage gaps remain in critical paths
 
 **Finalize** when:
-- All planned test cases have been implemented and executed
-- All failures have been diagnosed with high confidence
-- Reports have been dispatched to appropriate agents
+- The requested test artifacts or execution evidence actually exist
+- Failures have been diagnosed with defensible confidence
+- Reports or verification artifacts have been dispatched where needed
 
 ### Skill Call Best Practices
 
 - Pass complete, well-structured JSON parameters
-- Include context from previous skill results (risk areas inform test plans)
-- Chain results: risk analysis → test plan → implementation → execution → diagnosis
+- Include evidence from earlier calls so later work stays grounded in real signals
 - Before any test file mutation, call `prepare_pipeline_write_context` or `prepare_global_write_context` for that output path and feed the returned basis into the write skill
 - Reuse the `next_basis` returned by each successful test write while the lease remains active instead of repreparing immediately
 - Claim the concrete test surface before duplicating peer work
 - Publish verification artifacts so Engineer and Designer receive concrete findings
 - Use `coord_watch_updates` when waiting on peer follow-up
 - If `read_workspace_file` returns `missing: true`, continue with specification-driven test synthesis instead of aborting
-- Do not call skills speculatively — each call should advance the protocol
+- Do not call skills speculatively — each call should advance the requested deliverables

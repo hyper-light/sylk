@@ -55,7 +55,7 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 			expanded := renderToolCallExpanded(calls[i], width, th, grad)
 			lines = append(lines, expanded...)
 		} else {
-			lines = append(lines, renderToolCallCollapsed(calls[i], width, th, grad))
+			lines = append(lines, wrapRenderedToolLine(renderToolCallCollapsed(calls[i], width, th, grad), width)...)
 		}
 		regions = append(regions, ToolCallRegion{
 			Start:     start,
@@ -163,7 +163,7 @@ func renderToolCallExpanded(tc ToolCallRecord, width int, th *theme.Theme, grad 
 	}
 	header.WriteString(strings.Repeat(" ", gap))
 	header.WriteString(rightPart)
-	lines = append(lines, header.String())
+	lines = append(lines, wrapRenderedToolLine(header.String(), width)...)
 
 	// Detail lines with prefix.
 	prefix := mutedStyle.Render("│") + "   "
@@ -185,17 +185,27 @@ func renderToolCallExpanded(tc ToolCallRecord, width int, th *theme.Theme, grad 
 		if tc.ErrorMsg != "" {
 			errLines := wrapDetailText("Error: "+tc.ErrorMsg, width-6)
 			for _, line := range capDetailLines(errLines, maxExpandedOutputLines) {
-				lines = append(lines, prefix+errStyle.Render(line))
+				lines = append(lines, wrapRenderedToolLine(prefix+errStyle.Render(line), width)...)
 			}
 		} else if tc.Output != "" {
 			outLines := wrapDetailText(tc.Output, width-6)
 			for _, line := range capDetailLines(outLines, maxExpandedOutputLines) {
-				lines = append(lines, prefix+mutedStyle.Render(line))
+				lines = append(lines, wrapRenderedToolLine(prefix+mutedStyle.Render(line), width)...)
 			}
 		}
 	}
 
 	return lines
+}
+
+func wrapRenderedToolLine(line string, width int) []string {
+	if width <= 0 {
+		return nil
+	}
+	if lipgloss.Width(line) <= width {
+		return []string{line}
+	}
+	return wrapStyledCode(line, width)
 }
 
 // formatToolCallDuration formats the tool call's duration for display.

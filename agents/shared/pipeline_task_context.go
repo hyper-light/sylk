@@ -126,6 +126,23 @@ func BuildPipelineSystemContext(task *PipelineTaskInput) string {
 		b.WriteString("- Use coordination watch updates when waiting on peer movement instead of blind polling.\n")
 		b.WriteString("- Release or resolve claims when you finish or hand work off.\n")
 	}
+	if protocol := decodeMap(task.Context, "pipeline_protocol"); len(protocol) > 0 {
+		b.WriteString("\n## Pipeline Protocol\n")
+		writeListSection(&b, "Pipeline Members", summarizePipelineProtocolMembers(protocol["roster"]))
+		writeListSection(&b, "Active Agents", decodeAnyStringList(protocol["active_agents"]))
+		writeLabeledScalar(&b, "Requested By", protocol["requested_by"])
+		writeLabeledScalar(&b, "Turn Mode", protocol["mode"])
+		writeLabeledScalar(&b, "Current Request", protocol["current_request"])
+		writeListSection(&b, "Pending Challenge", summarizePipelineChallenge(protocol["pending_challenge"]))
+		writeListSection(&b, "Pending Validation", summarizePipelineValidation(protocol["pending_validation"]))
+		writeListSection(&b, "Recent Protocol Events", summarizePipelineProtocolEvents(protocol["recent_events"]))
+		b.WriteString("\nProtocol Rules:\n")
+		b.WriteString("- Inspector is the only pipeline entrypoint and the only agent allowed to hand off accepted work to OT.\n")
+		b.WriteString("- Any pipeline agent may challenge any other pipeline agent.\n")
+		b.WriteString("- End each turn with handoff_next, validate_work, or handoff_to_ot (inspector only).\n")
+		b.WriteString("- Process another agent's validation response before deciding the next handoff.\n")
+		b.WriteString("- Engineer and Designer should treat tests as executable specification and challenge unclear criteria or coverage.\n")
+	}
 	return strings.TrimSpace(b.String())
 }
 
@@ -166,6 +183,17 @@ func ComposePipelineTaskUserPrompt(task *PipelineTaskInput) string {
 	writeListSection(&b, "Guidelines", decodeStringList(task.Context, "guidelines"))
 	writeListSection(&b, "Risk Factors", decodeStringList(task.Context, "risk_factors"))
 	writeLabeledScalar(&b, "Implementation Guide", task.Context["implementation_guide"])
+	if protocol := decodeMap(task.Context, "pipeline_protocol"); len(protocol) > 0 {
+		b.WriteString("\n### Pipeline Protocol\n")
+		writeListSection(&b, "Pipeline Members", summarizePipelineProtocolMembers(protocol["roster"]))
+		writeListSection(&b, "Active Agents", decodeAnyStringList(protocol["active_agents"]))
+		writeLabeledScalar(&b, "Requested By", protocol["requested_by"])
+		writeLabeledScalar(&b, "Turn Mode", protocol["mode"])
+		writeLabeledScalar(&b, "Current Request", protocol["current_request"])
+		writeListSection(&b, "Pending Challenge", summarizePipelineChallenge(protocol["pending_challenge"]))
+		writeListSection(&b, "Pending Validation", summarizePipelineValidation(protocol["pending_validation"]))
+		writeListSection(&b, "Recent Protocol Events", summarizePipelineProtocolEvents(protocol["recent_events"]))
+	}
 
 	if len(task.ParentResults) > 0 {
 		b.WriteString("\n### Parent Results\n")
@@ -227,6 +255,116 @@ func decodeAnyStringList(value any) []string {
 	default:
 		return nil
 	}
+}
+
+func summarizePipelineProtocolMembers(value any) []string {
+	switch typed := value.(type) {
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, entry := range typed {
+			item, _ := entry.(map[string]any)
+			agentType, _ := item["agent_type"].(string)
+			role, _ := item["role"].(string)
+			agentType = strings.TrimSpace(agentType)
+			role = strings.TrimSpace(role)
+			if agentType == "" {
+				continue
+			}
+			if role != "" {
+				out = append(out, agentType+": "+role)
+				continue
+			}
+			out = append(out, agentType)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func summarizePipelineChallenge(value any) []string {
+	item, _ := value.(map[string]any)
+	if len(item) == 0 {
+		return nil
+	}
+	out := make([]string, 0, 6)
+	if challengeID, _ := item["id"].(string); strings.TrimSpace(challengeID) != "" {
+		out = append(out, "Challenge ID: "+strings.TrimSpace(challengeID))
+	}
+	if requestingAgent, _ := item["requesting_agent"].(string); strings.TrimSpace(requestingAgent) != "" {
+		out = append(out, "Requested By: "+strings.TrimSpace(requestingAgent))
+	}
+	if targets := decodeAnyStringList(item["target_agents"]); len(targets) > 0 {
+		out = append(out, "Targets: "+strings.Join(targets, ", "))
+	}
+	if reason, _ := item["reason"].(string); strings.TrimSpace(reason) != "" {
+		out = append(out, "Reason: "+strings.TrimSpace(reason))
+	}
+	if request, _ := item["request"].(string); strings.TrimSpace(request) != "" {
+		out = append(out, "Request: "+strings.TrimSpace(request))
+	}
+	if required := decodeAnyStringList(item["required_output"]); len(required) > 0 {
+		out = append(out, "Required Output: "+strings.Join(required, "; "))
+	}
+	return out
+}
+
+func summarizePipelineValidation(value any) []string {
+	item, _ := value.(map[string]any)
+	if len(item) == 0 {
+		return nil
+	}
+	out := make([]string, 0, 6)
+	if challengeID, _ := item["challenge_id"].(string); strings.TrimSpace(challengeID) != "" {
+		out = append(out, "Challenge ID: "+strings.TrimSpace(challengeID))
+	}
+	if requestingAgent, _ := item["requesting_agent"].(string); strings.TrimSpace(requestingAgent) != "" {
+		out = append(out, "Requester: "+strings.TrimSpace(requestingAgent))
+	}
+	if respondingAgent, _ := item["responding_agent"].(string); strings.TrimSpace(respondingAgent) != "" {
+		out = append(out, "Responder: "+strings.TrimSpace(respondingAgent))
+	}
+	if status, _ := item["status"].(string); strings.TrimSpace(status) != "" {
+		out = append(out, "Status: "+strings.TrimSpace(status))
+	}
+	if summary, _ := item["summary"].(string); strings.TrimSpace(summary) != "" {
+		out = append(out, "Summary: "+strings.TrimSpace(summary))
+	}
+	if evidence := decodeAnyStringList(item["evidence_refs"]); len(evidence) > 0 {
+		out = append(out, "Evidence: "+strings.Join(evidence, ", "))
+	}
+	return out
+}
+
+func summarizePipelineProtocolEvents(value any) []string {
+	entries, _ := value.([]any)
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		item, _ := entry.(map[string]any)
+		if len(item) == 0 {
+			continue
+		}
+		eventType, _ := item["type"].(string)
+		agentType, _ := item["agent_type"].(string)
+		summary, _ := item["summary"].(string)
+		parts := make([]string, 0, 3)
+		if strings.TrimSpace(eventType) != "" {
+			parts = append(parts, strings.TrimSpace(eventType))
+		}
+		if strings.TrimSpace(agentType) != "" {
+			parts = append(parts, strings.TrimSpace(agentType))
+		}
+		if strings.TrimSpace(summary) != "" {
+			parts = append(parts, strings.TrimSpace(summary))
+		}
+		if len(parts) > 0 {
+			out = append(out, strings.Join(parts, ": "))
+		}
+	}
+	return out
 }
 
 func extractAffectedPaths(ctx map[string]any) []string {

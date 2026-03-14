@@ -2709,6 +2709,9 @@ func (a *Archivalist) Terminate(ctx context.Context) error {
 // SetHandoffBridge assigns the handoff bridge for this agent.
 func (a *Archivalist) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	a.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(a.activityPub)
+	}
 }
 
 // ExtractArchivableState returns the agent's current state for handoff persistence.

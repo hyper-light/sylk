@@ -206,6 +206,47 @@ func TestPipelineManager_StartAndCancel(t *testing.T) {
 	}
 }
 
+func TestPipelineManager_ReleaseUnregistersManagedAgents(t *testing.T) {
+	factory := NewAgentFactory(AgentFactoryConfig{
+		InspectorConfig: inspShared.DefaultPipelineInspectorConfig(),
+		TesterConfig:    shared.PipelineTesterConfig{},
+		EngineerConfig:  engineer.Config{},
+		DesignerConfig:  designer.Config{},
+	})
+	var unregistered []string
+	mgr := NewPipelineManager(PipelineManagerConfig{
+		UnregisterAgent: func(agentID string) {
+			unregistered = append(unregistered, agentID)
+		},
+	}, factory, nil)
+
+	id, err := mgr.Create(context.Background(), newTestPipelineConfig("task-release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.Release(id)
+
+	want := map[string]bool{
+		"task-release-inspector-pipeline": false,
+		"task-release-tester-pipeline":    false,
+		"task-release-engineer":           false,
+	}
+	for _, agentID := range unregistered {
+		if _, ok := want[agentID]; ok {
+			want[agentID] = true
+		}
+	}
+	for agentID, seen := range want {
+		if !seen {
+			t.Fatalf("expected unregister for %s, got %v", agentID, unregistered)
+		}
+	}
+	if _, err := mgr.Get(id); err != ErrPipelineNotFound {
+		t.Fatalf("Get after Release error = %v, want %v", err, ErrPipelineNotFound)
+	}
+}
+
 func TestPipelineManager_GetResult(t *testing.T) {
 	mgr := newTestManager(t)
 	defer mgr.CloseAll()
@@ -240,23 +281,6 @@ func TestPipelineManager_CancelNotFound(t *testing.T) {
 	defer mgr.CloseAll()
 
 	err := mgr.Cancel(context.Background(), "nonexistent")
-	if err != ErrPipelineNotFound {
-		t.Errorf("expected ErrPipelineNotFound, got %v", err)
-	}
-}
-
-func TestPipelineManager_RouteUserMessage(t *testing.T) {
-	mgr := newTestManager(t)
-	defer mgr.CloseAll()
-
-	ctx := context.Background()
-	id, _ := mgr.Create(ctx, newTestPipelineConfig("task-msg"))
-
-	if err := mgr.RouteUserMessage(ctx, id, "test-message"); err != nil {
-		t.Fatal(err)
-	}
-
-	err := mgr.RouteUserMessage(ctx, "nonexistent", "msg")
 	if err != ErrPipelineNotFound {
 		t.Errorf("expected ErrPipelineNotFound, got %v", err)
 	}

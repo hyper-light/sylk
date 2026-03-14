@@ -37,13 +37,15 @@ func newPlannerRequestLease(parent context.Context, planner *anthropicPlanner, s
 func (l *plannerRequestLease) run(
 	localTimeout time.Duration,
 	emitRetryReset bool,
-	run func(context.Context) error,
+	run func(context.Context, time.Duration) error,
 ) error {
 	return shared.RunWithContextLease(l.parent, shared.ContextLeaseConfig{
 		AttemptTimeout: localTimeout,
 		MaxRefreshes:   l.maxRefreshes(localTimeout),
 		DeadlineGuard:  contextDeadlineGuard,
-		AttemptContext: l.planner.propagateDeadlineWithTimeout,
+		AttemptContext: func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+			return context.WithCancel(parent)
+		},
 		OnRefresh: func(info shared.ContextLeaseRefresh) {
 			l.refreshes = info.RefreshCount
 			l.planner.logRequestLeaseRefresh(l.parent, localTimeout, l.stage, l.refreshes, info.Error)
@@ -51,7 +53,9 @@ func (l *plannerRequestLease) run(
 				emitStreamRetryReset(l.parent)
 			}
 		},
-	}, run)
+	}, func(ctx context.Context) error {
+		return run(ctx, localTimeout)
+	})
 }
 
 func (l *plannerRequestLease) maxRefreshes(localTimeout time.Duration) int {

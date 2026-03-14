@@ -412,23 +412,18 @@ func extractPipelineStage(ctx map[string]any) string {
 func stageInstructions(contract *agentShared.TaskExecutionContract, stage string) string {
 	if inspectorContractSynthesisMode(contract, stage) {
 		return "### Instructions\n\n" +
-			"This inspection is in **contract synthesis** mode. Execute the pre-implementation inspection protocol:\n" +
-			"0. Inspect the workspace snapshot and use `summarize_workspace_state` or `inspect_workspace_state` if any layer mismatch or unavailable view needs clarification\n" +
-			"1. Define success criteria for this task using `define_criteria`\n" +
-			"2. Inspect the declared scope and requested files; missing implementation is expected evidence at this stage\n" +
-			"3. Record pending validation state with `get_validation_status`\n" +
-			"4. Publish a handoff artifact with `coord_publish_artifact` so downstream workers can reuse the explicit criteria and constraints\n"
+			"This inspection is in **contract synthesis** mode. The required deliverables are a criteria contract, scope inspection, pending-validation state, and a reusable handoff artifact.\n" +
+			"Use the task contract and the relevant tool definitions as the workflow source of truth. Missing implementation is expected evidence at this stage. Record pending validation with `get_validation_status` and publish the reusable handoff artifact once the criteria and scope are clear.\n"
 	}
 	return "### Instructions\n\n" +
-		"Implementation evidence exists. Execute the validation protocol: inspect the workspace snapshot as needed, validate against criteria, run the necessary quality checks, grade the implementation, and publish reusable findings.\n"
+		"Implementation evidence exists. Use the task contract and tool definitions to validate against criteria, gather the necessary quality evidence, grade the implementation, and publish reusable findings.\n"
 }
 
 func inspectorContractSynthesisMode(contract *agentShared.TaskExecutionContract, stage string) bool {
 	if contract == nil {
 		return stage == "inspect"
 	}
-	return contract.RequiresDeliverable(agentShared.TaskDeliverableCriteriaContract) &&
-		!contract.RequiresDeliverable(agentShared.TaskDeliverableCriteriaEvaluation)
+	return contract.PreImplementation
 }
 
 // Handle processes a forwarded request through the LLM tool loop.
@@ -471,13 +466,8 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 		}
 		systemPrompt = agentShared.AppendPipelineSystemContext(systemPrompt, task)
 	}
-	systemPrompt = agentShared.AppendTaskExecutionGuidance(systemPrompt, contract, "inspector-pipeline")
 	pi.prepareSkillsForInput(userMessage)
-	surface, err := agentShared.TaskToolSurface(pi.toolRuntime(), contract, "inspector-pipeline")
-	if err != nil {
-		pi.logger.Warn("build task tool surface", "error", err)
-		surface = pi.toolRuntime()
-	}
+	surface := pi.toolRuntime()
 	ctx = agentShared.WithTaskExecutionContract(ctx, contract)
 	ctx = agentShared.WithTaskExecutionState(ctx, agentShared.NewTaskExecutionState())
 	tools := pi.buildToolDefinitionsWithSurface(surface)
@@ -833,7 +823,7 @@ func (pi *PipelineInspector) PublishRequest(req *guide.RouteRequest) error {
 	return pi.bus.Publish(guide.TopicGuideRequests, msg)
 }
 
-// DefineCriteria stores success criteria for a task (TDD Phase 1).
+// DefineCriteria stores success criteria for a task.
 func (pi *PipelineInspector) DefineCriteria(taskID string, criteria *shared.InspectorCriteria) {
 	pi.mu.Lock()
 	defer pi.mu.Unlock()
@@ -865,7 +855,7 @@ func (pi *PipelineInspector) storeValidationResult(result *shared.InspectorResul
 	pi.mu.Unlock()
 }
 
-// ValidateAgainstCriteria validates files against stored criteria (TDD Phase 4).
+// ValidateAgainstCriteria validates files against stored criteria.
 // Uses the LLM tool loop when a provider is available; falls back to a basic
 // passing result otherwise.
 func (pi *PipelineInspector) ValidateAgainstCriteria(ctx context.Context, taskID string, files []string, workerType string) (*shared.InspectorResult, error) {
@@ -1004,8 +994,22 @@ func (pi *PipelineInspector) Descriptor() handoff.AgentDescriptor {
 	}
 }
 
-func (pi *PipelineInspector) InjectPreparedContext(_ *handoff.PreparedContext) error { return nil }
-func (pi *PipelineInspector) Terminate(_ context.Context) error                      { return pi.Stop() }
+func (pi *PipelineInspector) InjectPreparedContext(pc *handoff.PreparedContext) error {
+	if pc == nil {
+		return nil
+	}
+	if pipelineID, ok := pc.GetMetadata("pipeline_id"); ok && strings.TrimSpace(pipelineID) != "" {
+		pi.pipelineID = strings.TrimSpace(pipelineID)
+	}
+	if taskID, ok := pc.GetMetadata("task_id"); ok && strings.TrimSpace(taskID) != "" {
+		pi.pipelineID = strings.TrimSpace(taskID)
+	}
+	if taskSlug, ok := pc.GetMetadata("task_slug"); ok && strings.TrimSpace(taskSlug) != "" {
+		pi.pipelineSlug = strings.TrimSpace(taskSlug)
+	}
+	return nil
+}
+func (pi *PipelineInspector) Terminate(_ context.Context) error { return pi.Stop() }
 func (pi *PipelineInspector) SetFileAccess(fa versioning.FileAccess) {
 	pi.fileAccess = authority.RestrictFileAccess("inspector-pipeline", fa)
 }
@@ -1022,13 +1026,30 @@ func (pi *PipelineInspector) SetAgentPod(pod *agentShared.AgentPod) {
 	pi.agentPod = pod
 }
 
+// AgentPod returns the current task-scoped pod binding.
+func (pi *PipelineInspector) AgentPod() *agentShared.AgentPod {
+	return pi.agentPod
+}
+
 func (pi *PipelineInspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	pi.handoffBridge = bridge
+	if bridge != nil && pi.activityPub != nil {
+		bridge.SetActivityPublisher(pi.activityPub)
+	}
 }
 func (pi *PipelineInspector) ExtractArchivableState() *handoff.ArchivableState {
+	state := map[string]string{}
+	if trimmed := strings.TrimSpace(pi.pipelineID); trimmed != "" {
+		state["pipeline_id"] = trimmed
+		state["task_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(pi.pipelineSlug); trimmed != "" {
+		state["task_slug"] = trimmed
+	}
 	return &handoff.ArchivableState{
 		AgentID:   pi.AgentID(),
 		AgentType: pi.AgentType(),
+		State:     state,
 		Timestamp: time.Now(),
 	}
 }

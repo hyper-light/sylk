@@ -13,7 +13,8 @@ func TestToPipelineStateMsg_UsesTaskIdentityAndSlug(t *testing.T) {
 		RuntimePipelineID: "pipe_8f31ab9d12",
 		TaskID:            "task_auth_checkout",
 		TaskSlug:          "auth-checkout",
-		NewStatus:         tdd.StatusExecuting,
+		NewStatus:         tdd.StatusActive,
+		Stage:             "execute",
 		WorkerType:        tdd.WorkerEngineer,
 		LoopCount:         2,
 		MaxLoops:          5,
@@ -50,7 +51,8 @@ func TestToPipelineStateMsg_PrefersTaskIDOverMismatchedPipelineID(t *testing.T) 
 		RuntimePipelineID: "pipe_8f31ab9d12",
 		TaskID:            "task_1",
 		TaskSlug:          "hello-cli",
-		NewStatus:         tdd.StatusExecuting,
+		NewStatus:         tdd.StatusActive,
+		Stage:             "execute",
 	})
 
 	if msg.PipelineID != "task_1" {

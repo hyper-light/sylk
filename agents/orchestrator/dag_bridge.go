@@ -218,15 +218,7 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 		"layers_total": d.LayerCount(),
 	})
 
-	// 0. Expand pipeline-eligible nodes into sub-DAGs.
-	expanded, subNodeMap := ExpandDAG(d)
-	if len(subNodeMap) > 0 {
-		b.journal.LogPipelineExpanded(d.ID(), d.ID(), subNodeMapKeys(subNodeMap))
-		shared.LogAgentEvent(b.eventLogger, agentlog.EventPipelineExpanded,
-			b.agentID, sessionID, "", "info",
-			&agentlog.PipelinePayload{PipelineID: d.ID(), Stage: "expanded"})
-		d = expanded
-	}
+	subNodeMap := map[string]string{}
 	b.logTrace("dag_execute_expanded", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":            d.ID(),
 		"expanded_nodes":    d.NodeCount(),
@@ -275,12 +267,14 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.mu.RUnlock()
 
 	taskDefs := collectPipelineTaskPods(d)
+	managedTaskIDs := collectManagedPipelineTaskIDs(d)
+	taskPodDefs := filterPipelineTaskPodDefs(taskDefs, managedTaskIDs)
 	b.logTrace("dag_execute_task_pods_build_begin", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":          d.ID(),
-		"task_pod_count":  len(taskDefs),
-		"task_pod_traces": tracePipelineTaskPodDefs(taskDefs),
+		"task_pod_count":  len(taskPodDefs),
+		"task_pod_traces": tracePipelineTaskPodDefs(taskPodDefs),
 	})
-	taskPods, err := b.buildTaskPods(ctx, taskDefs, sessionID, runtime, specReg, registrar, logger, scribeFactory, sessionVFS)
+	taskPods, err := b.buildTaskPods(ctx, taskPodDefs, sessionID, runtime, specReg, registrar, logger, scribeFactory, sessionVFS)
 	if err != nil {
 		b.logTrace("dag_execute_task_pods_failed", agentlog.EventError, map[string]any{
 			"dag_id": d.ID(),
@@ -291,16 +285,13 @@ func (b *DAGBridge) Execute(ctx context.Context, d *dag.DAG, planID, sessionID s
 	b.logTrace("dag_execute_task_pods_built", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":          d.ID(),
 		"task_pod_count":  len(taskPods),
-		"task_pod_traces": tracePipelineTaskPodDefs(taskDefs),
+		"task_pod_traces": tracePipelineTaskPodDefs(taskPodDefs),
 	})
-	advertiseTaskPods(taskPods, indexPipelineTaskPodDefs(taskDefs), d.ID(), b.logTrace)
+	advertiseTaskPods(taskPods, indexPipelineTaskPodDefs(taskPodDefs), d.ID(), b.logTrace)
 	b.logTrace("dag_execute_task_pods_advertised", agentlog.EventRegistryEvent, map[string]any{
 		"dag_id":         d.ID(),
 		"task_pod_count": len(taskPods),
 	})
-	for _, taskDef := range taskDefs {
-		publishTaskPipelineState(bus, b.agentID, taskDef.TaskID, taskDef.TaskSlug, taskstate.StatusPending, "")
-	}
 
 	// 3b. Create BusNodeDispatcher with node-aware task-pod activation.
 	dispatcher := NewBusNodeDispatcher(bus, b.agentID, sessionID, d.ID(), b.buffers, activator, nil)
@@ -531,6 +522,41 @@ func collectPipelineTaskPods(d *dag.DAG) []pipelineTaskPodDef {
 	return result
 }
 
+func collectManagedPipelineTaskIDs(d *dag.DAG) map[string]struct{} {
+	if d == nil {
+		return nil
+	}
+	managed := make(map[string]struct{})
+	for _, node := range d.Nodes() {
+		if !isManagedPipelineTaskNode(node) {
+			continue
+		}
+		taskID, _ := dispatchTaskIdentity(node)
+		if taskID == "" {
+			continue
+		}
+		managed[taskID] = struct{}{}
+	}
+	if len(managed) == 0 {
+		return nil
+	}
+	return managed
+}
+
+func filterPipelineTaskPodDefs(defs []pipelineTaskPodDef, exclude map[string]struct{}) []pipelineTaskPodDef {
+	if len(defs) == 0 || len(exclude) == 0 {
+		return defs
+	}
+	filtered := make([]pipelineTaskPodDef, 0, len(defs))
+	for _, def := range defs {
+		if _, skip := exclude[def.TaskID]; skip {
+			continue
+		}
+		filtered = append(filtered, def)
+	}
+	return filtered
+}
+
 func isPipelineTaskNode(node *dag.Node) bool {
 	if node == nil {
 		return false
@@ -541,6 +567,24 @@ func isPipelineTaskNode(node *dag.Node) bool {
 	default:
 		return false
 	}
+}
+
+func isManagedPipelineTaskNode(node *dag.Node) bool {
+	if node == nil {
+		return false
+	}
+	switch strings.TrimSpace(node.AgentType()) {
+	case "engineer", "designer":
+	default:
+		return false
+	}
+	stage := ""
+	if ctx := node.Context(); ctx != nil {
+		if raw, ok := ctx["pipeline_stage"].(string); ok {
+			stage = strings.TrimSpace(raw)
+		}
+	}
+	return stage == "" || stage == string(StageExecute)
 }
 
 func extractAffectedFiles(ctx map[string]any) []string {
@@ -652,11 +696,13 @@ func buildTaskManagedPod(
 		if err != nil {
 			return nil, nil, fmt.Errorf("task pod %s: spec for %s: %w", task.TaskID, agentType, err)
 		}
-		spec.Name = TaskScopedAgentID(task.TaskID, agentType)
+		spec.Name = TaskScopedRoutingName(task.TaskSlug, task.TaskID, agentType)
+		workerAgentID := PipelineWorkerAgentID(task.TaskID, agentType)
 		if spec.Labels == nil {
-			spec.Labels = make(map[string]string, 3)
+			spec.Labels = make(map[string]string, 4)
 		}
 		spec.Labels["task_id"] = task.TaskID
+		spec.Labels["pipeline_worker_id"] = workerAgentID
 		if task.TaskSlug != "" {
 			spec.Labels["task_slug"] = task.TaskSlug
 		}
@@ -876,6 +922,15 @@ func (b *DAGBridge) GetDispatcherForDAG(dagID string) *BusNodeDispatcher {
 		return meta.Dispatcher
 	}
 	return nil
+}
+
+// RecordDispatchActivity refreshes the liveness lease for a dispatched node.
+func (b *DAGBridge) RecordDispatchActivity(dagID, nodeID string) {
+	dispatcher := b.GetDispatcherForDAG(strings.TrimSpace(dagID))
+	if dispatcher == nil {
+		return
+	}
+	dispatcher.RecordActivity(nodeID)
 }
 
 // NotifyNodeComplete resolves a pending node dispatch. For sub-nodes from

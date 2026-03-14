@@ -13,6 +13,7 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container/pod"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // PodRegistrar registers an activated agent with the Guide's routing layer.
@@ -186,6 +187,24 @@ func NewAgentPod(cfg AgentPodConfig) *AgentPod {
 // ManagedPod returns the underlying ManagedPod, or nil if not set.
 func (p *AgentPod) ManagedPod() *pod.ManagedPod {
 	return p.managed
+}
+
+// FileAccessFor returns the mounted file access for the given member type when
+// this pod is backed by a managed pod with mounted volumes.
+func (p *AgentPod) FileAccessFor(agentType string) versioning.FileAccess {
+	if p == nil || p.managed == nil {
+		return nil
+	}
+	return p.managed.FileAccessFor(agentType)
+}
+
+// WorkspaceViewsFor returns the layered workspace view access for the given
+// member type when this pod is backed by a managed pod with mounted volumes.
+func (p *AgentPod) WorkspaceViewsFor(agentType string) versioning.WorkspaceViewAccess {
+	if p == nil || p.managed == nil {
+		return nil
+	}
+	return p.managed.WorkspaceViewsFor(agentType)
 }
 
 // PreActivate activates and registers all member types upfront so they

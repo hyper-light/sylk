@@ -291,6 +291,61 @@ func TestArchitect_GenerateTasks_ReusesReadyPlanArtifacts(t *testing.T) {
 	}
 }
 
+func TestArchitect_PlanDesign_AllowsAnalyzeWithoutConsultHop(t *testing.T) {
+	a := newTestArchitect(t, Config{AllowPlanningWithoutConsultation: true})
+
+	startPayload, err := json.Marshal(map[string]any{
+		"query": "Create a minimal Python hello world CLI application.",
+	})
+	if err != nil {
+		t.Fatalf("marshal start payload: %v", err)
+	}
+	startResult := a.InvokeSkill(context.Background(), "start_planning", startPayload)
+	if startResult == nil || !startResult.Success {
+		t.Fatalf("start_planning failed: %+v", startResult)
+	}
+	startData, ok := startResult.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("start result data type = %T", startResult.Data)
+	}
+	planID, _ := startData["plan_id"].(string)
+	if planID == "" {
+		t.Fatal("expected plan_id from start_planning")
+	}
+
+	analyzePayload, err := json.Marshal(map[string]any{
+		"action":  "analyze",
+		"plan_id": planID,
+		"query":   "Create a minimal Python hello world CLI application using argparse.",
+	})
+	if err != nil {
+		t.Fatalf("marshal analyze payload: %v", err)
+	}
+	analyzeResult := a.InvokeSkill(context.Background(), "plan", analyzePayload)
+	if analyzeResult == nil || !analyzeResult.Success {
+		t.Fatalf("plan analyze failed: %+v", analyzeResult)
+	}
+
+	designPayload, err := json.Marshal(map[string]any{
+		"action":  "design",
+		"plan_id": planID,
+	})
+	if err != nil {
+		t.Fatalf("marshal design payload: %v", err)
+	}
+	designResult := a.InvokeSkill(context.Background(), "plan", designPayload)
+	if designResult == nil || !designResult.Success {
+		t.Fatalf("plan design failed: %+v", designResult)
+	}
+	designData, ok := designResult.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("design result data type = %T", designResult.Data)
+	}
+	if got, _ := designData["plan_status"].(string); got != "designing" {
+		t.Fatalf("plan_status = %q, want %q", got, "designing")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch coverage tests for consolidated skills
 // ---------------------------------------------------------------------------

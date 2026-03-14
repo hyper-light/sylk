@@ -2,6 +2,8 @@
 
 ## Available Skills
 
+Treat each skill description as part of the implementation protocol. The tool definitions tell you when a skill belongs in the flow, what it satisfies, and what it must not substitute for.
+
 ### Understanding (Priority 100–95)
 - `read_file` — Read file contents with optional offset/limit
 - `read_workspace_file` — Read the current pipeline workspace view, including overlay state
@@ -53,4 +55,4 @@
 10. **One concern per tool call.** Keep tool calls focused and atomic.
 11. **Coordinate before overlap.** Claim shared scope before editing overlapping areas and watch for peer updates when blocked.
 12. **Keep `run_command` atomic.** Never chain commands with `&&`, `||`, `;`, pipes, redirection, or subshell syntax; use separate tool calls instead.
-13. **Treat pending reviews as task-scoped obligations.** If the coordination ledger for this task shows pending reviews for Engineer, inspect the review context, address it with concrete change evidence or a published artifact, and resolve the review before concluding or releasing scope.
+13. **Treat pending reviews as iteration context.** If the coordination ledger for this task shows pending reviews for Engineer, inspect the review context, address what you can in this pass, and let Inspector/Tester determine whether another loop is required.

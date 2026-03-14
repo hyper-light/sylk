@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 )
@@ -108,6 +109,11 @@ type TurnRecord struct {
 
 	// Stream metrics snapshot (nil when not available).
 	StreamMetrics *providers.StreamMetrics `json:"stream_metrics,omitempty"`
+
+	// Per-turn logging metadata for bridge-side trace emission.
+	CorrelationID string                       `json:"correlation_id,omitempty"`
+	SessionID     string                       `json:"session_id,omitempty"`
+	EventLogger   *agentlog.SessionEventLogger `json:"-"`
 }
 
 // QualitySignal captures external quality feedback for an agent.

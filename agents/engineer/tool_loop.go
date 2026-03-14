@@ -10,8 +10,6 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -116,8 +114,22 @@ func (e *Engineer) executeToolLoopWithSurface(
 		shared.PublishIntermediateToolTurn(e.bus, e.channels, ctx, e.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if err := shared.ValidatePipelineProtocolCompletion(ctx, "engineer"); err != nil {
+				e.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nIf you need clarification from Inspector or Tester, hand off or challenge them explicitly instead of concluding silently.",
+				})
+				continue
+			}
 			if err := shared.ValidateTaskExecutionCompletion(ctx, "engineer"); err != nil {
-				e.recordTurn(req, resp, turn, 0, 1, turnStart)
+				e.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					shared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -135,7 +147,7 @@ func (e *Engineer) executeToolLoopWithSurface(
 				})
 				continue
 			}
-			e.recordTurn(req, resp, turn, 0, 0, turnStart)
+			e.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -158,7 +170,7 @@ func (e *Engineer) executeToolLoopWithSurface(
 		}
 
 		errCount, rerouted := e.applyToolCalls(ctx, req, resp, surface)
-		e.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		e.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -292,7 +304,7 @@ func (e *Engineer) executeToolCallWithSurface(
 		CapabilityScope: surface.CapabilityScope(),
 	})
 	if err == nil {
-		shared.RecordTaskExecutionSuccess(ctx, name, input)
+		shared.RecordTaskExecutionSuccess(ctx, name, input, result.Output)
 	}
 	return result, err
 }
@@ -358,6 +370,7 @@ func (e *Engineer) toolInvocationsWithSurface(
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
 func (e *Engineer) recordTurn(
+	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	turn, toolCalls, errCount int,
@@ -366,20 +379,5 @@ func (e *Engineer) recordTurn(
 	if e.handoffBridge == nil {
 		return
 	}
-
-	e.handoffBridge.RecordTurn(handoff.TurnRecord{
-		InputTokens:      resp.Usage.InputTokens,
-		OutputTokens:     resp.Usage.OutputTokens,
-		ContextSize:      shared.EstimateContextSize(req.Messages),
-		ToolCalls:        toolCalls,
-		ToolSuccesses:    toolCalls - errCount,
-		TurnNumber:       turn + 1,
-		Duration:         time.Since(turnStart),
-		Timestamp:        time.Now(),
-		Stage:            llmruntime.StageFromRequest(req),
-		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
-		StopReason:       resp.StopReason,
-		CacheReadTokens:  resp.Usage.CacheReadTokens,
-		CacheWriteTokens: resp.Usage.CacheWriteTokens,
-	})
+	e.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

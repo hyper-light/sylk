@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/adalundhe/sylk/agents/guide"
+	"github.com/adalundhe/sylk/core/pipeline/tdd"
 )
 
 func TestParseTaskDispatchMessageCanonicalizesPipelineContext(t *testing.T) {
@@ -63,5 +64,50 @@ func TestParseTaskDispatchMessageCanonicalizesPipelineContext(t *testing.T) {
 	}
 	if len(dispatch.coAgents) != 2 {
 		t.Fatalf("coAgents = %v, want 2 entries", dispatch.coAgents)
+	}
+}
+
+func TestPublishTaskDispatchAgents_SkipsManagedPipelineDispatch(t *testing.T) {
+	pub := &trackingActivityPub{}
+	o := &Orchestrator{
+		config:                  Config{SessionID: "session-1"},
+		activityPub:             pub,
+		pipelineMgr:             &tdd.PipelineManager{},
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
+	}
+
+	o.publishTaskDispatchAgents(&taskDispatchContext{
+		nodeID:           "task_1",
+		agentType:        "engineer",
+		pipelineTaskID:   "task_1",
+		pipelineTaskSlug: "implement-hello-cli",
+		pipelineStage:    string(StageExecute),
+	}, "executing")
+
+	if got := len(pub.collected()); got != 0 {
+		t.Fatalf("expected no published activity for managed pipeline dispatch, got %d events", got)
+	}
+}
+
+func TestPublishTaskDispatchAgents_PublishesForUnmanagedDispatch(t *testing.T) {
+	pub := &trackingActivityPub{}
+	o := &Orchestrator{
+		config:                  Config{SessionID: "session-1"},
+		activityPub:             pub,
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
+	}
+
+	o.publishTaskDispatchAgents(&taskDispatchContext{
+		nodeID:           "task_1",
+		agentType:        "engineer",
+		pipelineTaskID:   "task_1",
+		pipelineTaskSlug: "implement-hello-cli",
+		pipelineStage:    string(StageExecute),
+	}, "executing")
+
+	if got := len(pub.collected()); got == 0 {
+		t.Fatal("expected activity events for unmanaged dispatch")
 	}
 }

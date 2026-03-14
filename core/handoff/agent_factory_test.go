@@ -186,6 +186,45 @@ func TestFactorySessionAdapter_DeleteSession(t *testing.T) {
 	}
 }
 
+func TestFactorySessionAdapter_CreateSessionAppliesCreationContext(t *testing.T) {
+	registry := NewDescriptorRegistry()
+	factory := NewAgentFactory(registry)
+
+	factory.RegisterCreator("tester-pipeline", func(ctx context.Context) (HandoffableAgent, error) {
+		metadata, ok := FactoryCreationMetadataFromContext(ctx)
+		if !ok {
+			t.Fatal("expected factory creation metadata in context")
+		}
+		if metadata.AgentType != "tester-pipeline" {
+			t.Fatalf("metadata.AgentType = %q, want tester-pipeline", metadata.AgentType)
+		}
+		if metadata.AgentID != "4d6b407a" {
+			t.Fatalf("metadata.AgentID = %q, want 4d6b407a", metadata.AgentID)
+		}
+		if metadata.TaskID != "task_auth_checkout" {
+			t.Fatalf("metadata.TaskID = %q, want task_auth_checkout", metadata.TaskID)
+		}
+		if metadata.TaskSlug != "auth-checkout" {
+			t.Fatalf("metadata.TaskSlug = %q, want auth-checkout", metadata.TaskSlug)
+		}
+		return newMockAgent("4d6b407a", "tester-pipeline"), nil
+	})
+
+	adapter := NewFactorySessionAdapter(factory)
+	_, err := adapter.CreateSession(context.Background(), SessionConfig{
+		Name: "handoff-tester",
+		Metadata: map[string]interface{}{
+			"agent_type": "tester-pipeline",
+			"agent_id":   "4d6b407a",
+			"task_id":    "task_auth_checkout",
+			"task_slug":  "auth-checkout",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+}
+
 func TestFactorySessionAdapter_ActivateDeactivate(t *testing.T) {
 	registry := NewDescriptorRegistry()
 	factory := NewAgentFactory(registry)

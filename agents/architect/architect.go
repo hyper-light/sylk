@@ -1275,6 +1275,7 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 			Intent:   IntentConverse,
 		}, nil
 	}
+	var existingReadyPlan *DesignPlan
 	if plan := a.resolveRecoverableReadyPlanForConversation(sessionID, now); plan != nil {
 		a.recoverStalePendingWork(ctx, plan, now)
 		if planHasActivePendingWork(plan, now) {
@@ -1289,12 +1290,7 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 				"input", truncateString(fwd.Input, 120))
 			return a.handleExecute(ctx, fwd)
 		}
-		if shouldOfferReadyPlanResumeSuggestion(fwd.Input) {
-			return &ConversationResult{
-				Response: readyPlanResumeSuggestion(plan),
-				Intent:   IntentConverse,
-			}, nil
-		}
+		existingReadyPlan = plan
 	}
 
 	req := &ArchitectRequest{
@@ -1305,6 +1301,9 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		Timestamp:           time.Now(),
 		Params:              forwardedRequestParams(fwd),
 		ConversationHistory: fwd.ConversationHistory,
+	}
+	if existingReadyPlan != nil {
+		req.Params = withExistingReadyPlanContext(req.Params, existingReadyPlan)
 	}
 
 	a.logInfo("handleConversation: ROUTE=conversation (no plan triggers matched)",
@@ -1336,42 +1335,6 @@ var explicitResumeReadyPlanPhrases = []string{
 	"proceed with the plan",
 }
 
-var readyPlanResumeSuggestionPhrases = []string{
-	"go ahead",
-	"proceed",
-	"run it",
-	"execute it",
-	"do it",
-	"ship it",
-	"looks good",
-	"lgtm",
-	"approved",
-	"what's next",
-	"what next",
-	"any updates",
-	"status",
-	"resume",
-	"continue",
-	"that plan",
-	"this plan",
-	"old plan",
-	"previous plan",
-}
-
-var readyPlanFreshStartPhrases = []string{
-	"start fresh",
-	"start over",
-	"new plan",
-	"different plan",
-	"forget that plan",
-	"ignore that plan",
-	"revise it",
-	"revise the plan",
-	"change the plan",
-	"modify the plan",
-	"update the plan",
-}
-
 func isExplicitResumeReadyPlanSignal(input string) bool {
 	lower := strings.ToLower(strings.TrimSpace(input))
 	if lower == "" {
@@ -1383,57 +1346,6 @@ func isExplicitResumeReadyPlanSignal(input string) bool {
 		}
 	}
 	return false
-}
-
-func shouldOfferReadyPlanResumeSuggestion(input string) bool {
-	lower := strings.ToLower(strings.TrimSpace(input))
-	if lower == "" || isExplicitResumeReadyPlanSignal(lower) {
-		return false
-	}
-	for _, phrase := range readyPlanFreshStartPhrases {
-		if strings.Contains(lower, phrase) {
-			return false
-		}
-	}
-	for _, phrase := range readyPlanResumeSuggestionPhrases {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	words := strings.Fields(lower)
-	if len(words) > 4 {
-		return false
-	}
-	for _, word := range words {
-		switch word {
-		case "it", "that", "this", "plan", "okay", "ok", "sure":
-			return true
-		}
-	}
-	return false
-}
-
-func readyPlanResumeSuggestion(plan *DesignPlan) string {
-	if plan == nil {
-		return "I still have a previous plan ready. If you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead."
-	}
-	subject := strings.TrimSpace(plan.Query)
-	if subject == "" {
-		return "I still have a previous plan ready. If you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead."
-	}
-	subject = normalizeReadyPlanSubject(subject)
-	if strings.Contains(subject, "\n") {
-		return fmt.Sprintf("I still have a previous plan ready for:\n\n%s\n\nIf you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead.", subject)
-	}
-	return fmt.Sprintf("I still have a previous plan ready for %q. If you want to use it, tell me to resume that plan. If you'd rather revise it or start fresh, say that instead.", subject)
-}
-
-func normalizeReadyPlanSubject(subject string) string {
-	trimmed := strings.TrimSpace(subject)
-	if trimmed == "" {
-		return ""
-	}
-	return strings.ReplaceAll(trimmed, "\r\n", "\n")
 }
 
 // latestClarifyingPlan returns the most recently updated plan in Clarifying
@@ -1770,6 +1682,8 @@ func mapGuideIntentToArchitect(intent guide.Intent) ArchitectIntent {
 	}
 }
 
+const existingReadyPlanIDParam = "existing_ready_plan_id"
+
 func forwardedRequestParams(fwd *guide.ForwardedRequest) map[string]any {
 	if fwd == nil {
 		return nil
@@ -1789,6 +1703,17 @@ func forwardedRequestParams(fwd *guide.ForwardedRequest) map[string]any {
 	if len(params) == 0 {
 		return nil
 	}
+	return params
+}
+
+func withExistingReadyPlanContext(params map[string]any, plan *DesignPlan) map[string]any {
+	if plan == nil || strings.TrimSpace(plan.ID) == "" {
+		return params
+	}
+	if params == nil {
+		params = map[string]any{}
+	}
+	params[existingReadyPlanIDParam] = plan.ID
 	return params
 }
 
@@ -2511,6 +2436,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		Mode:                plannerConversationModeConverse,
 		UserQuery:           req.Query,
 		IntentHint:          string(req.Intent),
+		SessionID:           req.SessionID,
 		ConversationHistory: req.ConversationHistory,
 		OnChunk: func(text string) {
 			a.publishPlanStreamChunk(ctx, text)
@@ -2519,7 +2445,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	// Inject session plan context so the LLM has continuity even when
 	// conversation history is degraded (e.g. prior protocols hung and
 	// never delivered agent replies back to the Guide).
-	a.enrichConversationWithPlanContext(&request, req.SessionID)
+	a.enrichConversationWithPlanContext(&request, req)
 	a.logInfo("executeConversation: calling composeUserFacingResponse",
 		"has_plan_summary", request.PlanSummary != "",
 		"has_prior_query", request.PriorQuery != "")
@@ -2596,20 +2522,55 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	return a.conversationFallback(ctx, req, composeErr)
 }
 
-// enrichConversationWithPlanContext adds the latest plan summary and prior
-// query to a conversation request when an active plan exists for the session.
-// This prevents context loss when previous protocol runs hung before the
-// Guide could record the architect's response in conversation history.
-func (a *Architect) enrichConversationWithPlanContext(request *plannerConversationRequest, sessionID string) {
-	plan := a.latestHistoricalPlanForSession(sessionID)
+// enrichConversationWithPlanContext adds plan continuity to conversation-mode
+// planner requests. It prefers an explicitly recovered ready plan from request
+// params so conversations remain grounded even after architect cold-start or
+// session drift. Otherwise it falls back to the latest historical plan for the
+// current session.
+func (a *Architect) enrichConversationWithPlanContext(request *plannerConversationRequest, req *ArchitectRequest) {
+	if request == nil || req == nil {
+		return
+	}
+	if plan := a.existingReadyPlanForConversation(req.Params, time.Now().UTC()); plan != nil {
+		populatePlannerConversationRequestFromPlan(request, plan)
+		if request.normalizedMode() == plannerConversationModeConverse {
+			request.Mode = plannerConversationModeExistingReady
+		}
+		return
+	}
+	plan := a.latestHistoricalPlanForSession(req.SessionID)
 	if plan == nil {
 		return
 	}
+	populatePlannerConversationRequestFromPlan(request, plan)
+}
+
+func (a *Architect) existingReadyPlanForConversation(params map[string]any, now time.Time) *DesignPlan {
+	if a == nil || a.planStore == nil || len(params) == 0 {
+		return nil
+	}
+	raw, _ := params[existingReadyPlanIDParam].(string)
+	planID := strings.TrimSpace(raw)
+	if planID == "" {
+		return nil
+	}
+	plan := a.planStore.Get(planID)
+	if !isRecoverableReadyPlan(plan, now) {
+		return nil
+	}
+	return plan
+}
+
+func populatePlannerConversationRequestFromPlan(request *plannerConversationRequest, plan *DesignPlan) {
+	if request == nil || plan == nil {
+		return
+	}
+	request.PlanID = plan.ID
+	request.PriorQuery = plan.Query
 	if summary := formatPlanForChat(plan); summary != "" {
 		request.PlanSummary = summary
 	}
-	request.PriorQuery = plan.Query
-	if plan.Requirements != nil {
+	if plan.Requirements != nil && strings.TrimSpace(plan.Requirements.Scope) != "" {
 		request.Scope = plan.Requirements.Scope
 	}
 }
@@ -2859,6 +2820,9 @@ func (a *Architect) GetAllActivePlans() []*DesignPlan {
 // SetHandoffBridge sets the handoff bridge for the architect agent.
 func (a *Architect) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	a.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(a.activityPub)
+	}
 }
 
 // SetAgentPod assigns the agent pod for cross-agent coordination.

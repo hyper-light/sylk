@@ -20,6 +20,8 @@ func ValidateTokenUsageSkill(runner *ToolRunner) *skills.Skill {
 		Domain("design").
 		Keywords("token", "color", "palette", "theme", "design").
 		Priority(90).
+		Usage("Use during implementation-validation when a design task changed colors, tokens, or themed styling and you need evidence that token discipline was preserved.").
+		Satisfies("Produces design-token findings that support inspector validation or designer review.").
 		ArrayParam("paths", "Go files to validate", "string", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -37,6 +39,8 @@ func ValidateAccessibilitySkill(runner *ToolRunner) *skills.Skill {
 		Domain("design").
 		Keywords("accessibility", "wcag", "contrast", "a11y", "design").
 		Priority(90).
+		Usage("Use during implementation-validation when the task changed UI presentation and accessibility evidence is required.").
+		Satisfies("Produces accessibility findings that feed validation reports and design feedback.").
 		ArrayParam("paths", "Go files to validate", "string", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -54,6 +58,8 @@ func ValidateComponentAPISkill(runner *ToolRunner) *skills.Skill {
 		Domain("design").
 		Keywords("bubbletea", "component", "model", "update", "view", "design").
 		Priority(90).
+		Usage("Use during implementation-validation when component API correctness or framework conventions are part of the quality bar.").
+		Satisfies("Produces component-API findings for validation reports and downstream designer fixes.").
 		ArrayParam("paths", "Go files to validate", "string", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -71,6 +77,8 @@ func ValidateDesignConsistencySkill(runner *ToolRunner) *skills.Skill {
 		Domain("design").
 		Keywords("consistency", "spacing", "margin", "padding", "design").
 		Priority(90).
+		Usage("Use during implementation-validation when you need evidence that visual spacing and layout changes stayed aligned with the design system.").
+		Satisfies("Produces design-consistency findings for validation and review artifacts.").
 		ArrayParam("paths", "Go files to validate", "string", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)

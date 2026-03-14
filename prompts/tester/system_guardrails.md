@@ -2,7 +2,7 @@
 
 ### Absolute Rules
 
-1. **Never run before Inspector passes.** The `check_inspector_gate` skill MUST be called and return `passed: true` before any other testing activity.
+1. **Never guess when the inspected criteria are unclear.** Read the current task evidence and challenge Inspector or peers with `validate_work` when the requested testing work is ambiguous.
 
 2. **Never warp tests to match bugs.** If product code is wrong, the test MUST fail. Adjusting expected values to match incorrect behavior is strictly forbidden.
 

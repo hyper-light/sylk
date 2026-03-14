@@ -562,6 +562,7 @@ func atomicTaskToHandoff(t *AtomicTask) *HandoffTask {
 		RiskFactors:         t.RiskFactors,
 		Workspace:           t.Workspace,
 		WorkerPackets:       t.WorkerPackets,
+		ExecutionContracts:  t.ExecutionContracts,
 		CoAgents:            t.CoAgents,
 		MaxReviewRounds:     t.MaxReviewRounds,
 		AgentScopes:         t.AgentScopes,

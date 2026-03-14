@@ -2,7 +2,11 @@
 // tester and global tester agent variants.
 package shared
 
-import "time"
+import (
+	"time"
+
+	"github.com/adalundhe/sylk/core/events"
+)
 
 // Additional TestCategory values for advanced test classification.
 // These extend the base categories defined in agents/tester/types.go.
@@ -46,9 +50,9 @@ const (
 	RiskState       RiskCategory = "state"
 
 	// Design-specific risk categories.
-	RiskTokenMisuse       RiskCategory = "token_misuse"
-	RiskAccessibility     RiskCategory = "accessibility"
-	RiskComponentPattern  RiskCategory = "component_pattern"
+	RiskTokenMisuse        RiskCategory = "token_misuse"
+	RiskAccessibility      RiskCategory = "accessibility"
+	RiskComponentPattern   RiskCategory = "component_pattern"
 	RiskStyleInconsistency RiskCategory = "style_inconsistency"
 )
 
@@ -90,14 +94,14 @@ type HarnessNeed struct {
 
 // DiagnosisReport captures root cause analysis with investigation trail.
 type DiagnosisReport struct {
-	ID            string         `json:"id"`
-	TestName      string         `json:"test_name"`
-	RootCauses    []RootCause    `json:"root_causes"`
-	Trail         []InvestigStep `json:"trail"`
-	Confidence    float64        `json:"confidence"`
-	SuggestedFix  []SuggestedFix `json:"suggested_fixes"`
-	IsProductBug  bool           `json:"is_product_bug"`
-	CreatedAt     time.Time      `json:"created_at"`
+	ID           string         `json:"id"`
+	TestName     string         `json:"test_name"`
+	RootCauses   []RootCause    `json:"root_causes"`
+	Trail        []InvestigStep `json:"trail"`
+	Confidence   float64        `json:"confidence"`
+	SuggestedFix []SuggestedFix `json:"suggested_fixes"`
+	IsProductBug bool           `json:"is_product_bug"`
+	CreatedAt    time.Time      `json:"created_at"`
 }
 
 // RootCause describes the file, line, and nature of a defect.
@@ -171,6 +175,7 @@ type GlobalTesterConfig struct {
 	EnableFlakyDetection   bool          `json:"enable_flaky_detection"`
 	AgentID                string        `json:"agent_id"`
 	SessionID              string        `json:"session_id"`
+	ActivityPub            events.ActivityPublisher
 }
 
 // DefaultGlobalTesterConfig returns sensible defaults.
@@ -189,30 +194,6 @@ func DefaultGlobalTesterConfig() GlobalTesterConfig {
 		EnableMutationTesting:  true,
 		EnableFlakyDetection:   true,
 	}
-}
-
-// ProtocolPhase identifies a phase within a tester protocol.
-type ProtocolPhase string
-
-const (
-	PhaseAnalyzeRisks       ProtocolPhase = "analyze_risks"
-	PhasePlanTests          ProtocolPhase = "plan_tests"
-	PhaseImplementTests     ProtocolPhase = "implement_tests"
-	PhaseExecuteTests       ProtocolPhase = "execute_tests"
-	PhaseDiagnose           ProtocolPhase = "diagnose"
-	PhaseDispatchFeedback   ProtocolPhase = "dispatch_feedback"
-	PhaseAssembleBatch      ProtocolPhase = "assemble_batch"
-	PhaseIntegrationRisks   ProtocolPhase = "integration_risks"
-	PhaseArchitectStrategy  ProtocolPhase = "architect_strategy"
-	PhaseConstructHarness   ProtocolPhase = "construct_harness"
-	PhaseDiagnoseEscalate   ProtocolPhase = "diagnose_escalate"
-)
-
-// ProtocolState tracks progress through a testing protocol.
-type ProtocolState struct {
-	CurrentPhase ProtocolPhase `json:"current_phase"`
-	CompletedAt  time.Time     `json:"completed_at,omitempty"`
-	Error        string        `json:"error,omitempty"`
 }
 
 // BatchContext tracks which pipelines' work to validate (global tester).

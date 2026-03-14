@@ -2,21 +2,29 @@ package orchestrator
 
 import (
 	"strings"
+
+	"github.com/google/uuid"
 )
 
-// TaskScopedAgentID returns the stable per-task worker identity used for
-// pipeline agents. task_id is the canonical pipeline identity; agent type is
-// preserved as the worker role.
-func TaskScopedAgentID(taskID, agentType string) string {
+var pipelineWorkerIdentityNamespace = uuid.MustParse("7f5e9e9d-2b65-4ce3-9c8d-1d43d6d9b7a2")
+
+// PipelineWorkerAgentID returns the stable short worker ID used for a
+// task-scoped pipeline worker. The task identity and worker role remain
+// separate from the worker's actual agent ID.
+func PipelineWorkerAgentID(taskID, agentType string) string {
 	taskID = sanitizePipelineIdentityPart(taskID)
 	agentType = sanitizePipelineIdentityPart(agentType)
-	if taskID == "" {
-		return agentType
+	if taskID == "" || agentType == "" {
+		return ""
 	}
-	if agentType == "" {
-		return taskID
-	}
-	return taskID + "__" + agentType
+	sum := uuid.NewSHA1(pipelineWorkerIdentityNamespace, []byte(taskID+":"+agentType))
+	return sum.String()[:8]
+}
+
+// TaskScopedAgentID is the deprecated compatibility alias for the real
+// pipeline worker agent ID. New code should use PipelineWorkerAgentID.
+func TaskScopedAgentID(taskID, agentType string) string {
+	return PipelineWorkerAgentID(taskID, agentType)
 }
 
 // TaskScopedRoutingName returns a human-readable but unique routing name for a

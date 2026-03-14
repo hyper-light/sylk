@@ -54,12 +54,6 @@ func TestEnrichTaskExecutionContractWithWorkspaceEvidence_RebuildsInspectorValid
 	if contract.PreImplementation {
 		t.Fatal("did not expect enriched contract to stay pre-implementation")
 	}
-	if !hasDeliverable(contract.Deliverables, TaskDeliverableCriteriaEvaluation) {
-		t.Fatalf("expected criteria_evaluation deliverable after enrichment, got %v", contract.Deliverables)
-	}
-	if hasDeliverable(contract.Deliverables, TaskDeliverableCriteriaContract) {
-		t.Fatalf("did not expect criteria_contract deliverable after enrichment, got %v", contract.Deliverables)
-	}
 }
 
 type stubTaskExecutionWorkspaceViews struct {

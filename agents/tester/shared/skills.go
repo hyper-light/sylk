@@ -26,6 +26,10 @@ func DiagnoseFailureSkill(engine DiagnosisEngine) *skills.Skill {
 		Domain("testing").
 		Keywords("diagnose", "failure", "root cause", "investigate", "debug").
 		Priority(90).
+		Usage("Use after a concrete suite failure when you have real failing output to investigate. Read the implementation and test evidence, then explain the most likely product defect before blaming the test.").
+		Requirement("Requires failing suite evidence such as run_test_suite output, error message, and the most relevant source files when available.").
+		Satisfies("Produces root-cause evidence that supports failure reporting and follow-up fixes.").
+		Avoid("Do not use as a substitute for running the suite or for speculative debugging before there is an actual failing signal.").
 		StringParam("test_name", "Name of the failing test", true).
 		StringParam("package", "Package of the failing test", true).
 		StringParam("output", "Raw test output", true).
@@ -75,6 +79,10 @@ func AnalyzeRiskSkill() *skills.Skill {
 		Domain("testing").
 		Keywords("risk", "analyze", "concurrency", "security", "boundary").
 		Priority(95).
+		Usage("Use early in a testing pass to identify where defects are most likely and to shape the test plan around real failure hypotheses. Missing implementation can still be valid red-phase evidence.").
+		Requirement("Provide the most relevant implementation files and the task specification so the analysis stays specification-driven.").
+		Satisfies("Produces risk evidence that informs plan_tests, write_test, and downstream reporting.").
+		Avoid("Do not stop here when the requested deliverable is executable tests or execution evidence.").
 		ArrayParam("files", "Source files to analyze for risks", "string", true).
 		StringParam("task_spec", "Task specification for context", false).
 		StringParam("diff_patch", "Git diff patch for targeted analysis", false).
@@ -104,6 +112,10 @@ func PlanTestsSkill() *skills.Skill {
 		Domain("testing").
 		Keywords("plan", "test plan", "strategy", "hypothesis").
 		Priority(95).
+		Usage("Use after risk analysis to convert the defect surface into concrete, purposeful test cases. The plan should make the next write_test or run_test_suite call obvious.").
+		Requirement("Prefer to supply the risk areas or equivalent specification-driven failure hypotheses first.").
+		Satisfies("Produces deliberate test-case structure and satisfies the tester planning stage.").
+		Avoid("Do not treat the plan itself as completion when the requested deliverable still requires test artifacts or suite execution.").
 		StringParam("task_spec", "Task specification for context", false).
 		ArrayParam("files", "Source files under test", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -139,6 +151,9 @@ func RunTestSuiteSkill() *skills.Skill {
 		Domain("testing").
 		Keywords("run", "execute", "test suite", "race").
 		Priority(90).
+		Usage("Use when the requested deliverable includes execution evidence or when you need concrete failing output for diagnosis. Target the most relevant packages, files, or tests rather than running blindly.").
+		Satisfies("Produces suite execution evidence and, on failure, the raw signal needed for diagnose_failure.").
+		Avoid("Do not use as a substitute for test authoring when the task still requires new test artifacts.").
 		ArrayParam("packages", "Go packages to test (default: ./...)", "string", false).
 		ArrayParam("files", "Specific test files to run", "string", false).
 		ArrayParam("test_names", "Specific test names to run", "string", false).

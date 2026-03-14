@@ -2372,6 +2372,7 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 				return nil
 			}
 		}
+		m.applyActivityTelemetry(typed)
 		return m.propagate(typed)
 	}),
 	reflect.TypeFor[msg.TokenUsageMsg](): appMsgStateRoute(func(m *AppModel, typed msg.TokenUsageMsg) {
@@ -4178,8 +4179,27 @@ func normalizeExplicitTargetAgent(raw string) string {
 	return target
 }
 
+func (m *AppModel) resolveConcreteTargetAgent(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if target := normalizeExplicitTargetAgent(raw); target != "" {
+		return target
+	}
+	if m != nil && m.agentPanel != nil {
+		if resolved := strings.TrimSpace(m.agentPanel.ResolveTargetAgentID(raw)); resolved != "" {
+			return resolved
+		}
+	}
+	return ""
+}
+
 func (m *AppModel) resolveSubmitTarget(explicit string) string {
-	target := normalizeExplicitTargetAgent(explicit)
+	target := strings.TrimSpace(explicit)
+	if normalized := normalizeExplicitTargetAgent(target); normalized != "" {
+		target = normalized
+	}
 	if target != "" {
 		// Guide is the router — "@guide" means "let classifier decide",
 		// so clear the sticky target and return empty.
@@ -4194,7 +4214,10 @@ func (m *AppModel) resolveSubmitTarget(explicit string) string {
 		}
 		return target
 	}
-	target = normalizeExplicitTargetAgent(m.manualTargetAgent)
+	target = strings.TrimSpace(m.manualTargetAgent)
+	if normalized := normalizeExplicitTargetAgent(target); normalized != "" {
+		target = normalized
+	}
 	if target != "" {
 		// Guard against stale "guide" in manualTargetAgent.
 		if target == "guide" || target == "g" {
@@ -4221,7 +4244,7 @@ func (m *AppModel) syncManualTargetFromAgentSelection() {
 	if m == nil || m.agentPanel == nil {
 		return
 	}
-	selected := normalizeExplicitTargetAgent(m.agentPanel.SelectedAgentID())
+	selected := strings.TrimSpace(m.agentPanel.SelectedAgentID())
 	if selected == "" {
 		return
 	}
@@ -4600,6 +4623,73 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func activityDataString(data map[string]any, key string) string {
+	if data == nil {
+		return ""
+	}
+	value, ok := data[key]
+	if !ok {
+		return ""
+	}
+	typed, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(typed)
+}
+
+func activityDataInt(data map[string]any, key string) (int, bool) {
+	if data == nil {
+		return 0, false
+	}
+	value, ok := data[key]
+	if !ok {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	default:
+		return 0, false
+	}
+}
+
+func canonicalActivityAgentID(ev *events.ActivityEvent) string {
+	if ev == nil {
+		return ""
+	}
+	agentType := activityDataString(ev.Data, "agent_type")
+	pipelineID := logicalStreamPipelineID(
+		activityDataString(ev.Data, "pipeline_id"),
+		activityDataString(ev.Data, "task_id"),
+	)
+	if canonical := streamPanelAgentID(ev.AgentID, agentType, pipelineID); canonical != "" {
+		return canonical
+	}
+	return normalizeAgentID(firstNonEmpty(ev.AgentID, agentType))
+}
+
+func (m *AppModel) applyActivityTelemetry(activity msg.ActivityEventMsg) {
+	if activity.Event == nil {
+		return
+	}
+	canonicalID := canonicalActivityAgentID(activity.Event)
+	if canonicalID == "" {
+		return
+	}
+	if tokens, ok := activityDataInt(activity.Event.Data, "context_tokens"); ok {
+		m.setAgentContextUsage(canonicalID, tokens)
+		return
+	}
+	if activityDataString(activity.Event.Data, "handoff_state") == "completed" {
+		m.setAgentContextUsage(canonicalID, 0)
+	}
+}
+
 func cloneActiveStreamEntry(entry *activeStreamEntry) *activeStreamEntry {
 	if entry == nil {
 		return nil
@@ -4628,6 +4718,7 @@ func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
 		existing.TaskSlug = firstNonEmpty(start.TaskSlug, existing.TaskSlug)
 		return false
 	}
+	m.replaceActivePipelineWorkerStream(correlationID, canonicalAgentID)
 	m.activeStreams[correlationID] = &activeStreamEntry{
 		CorrelationID: correlationID,
 		AgentID:       canonicalAgentID,
@@ -4640,6 +4731,23 @@ func (m *AppModel) registerStream(start msg.StreamStartMsg) bool {
 		StartedAt:     time.Now(),
 	}
 	return true
+}
+
+func (m *AppModel) replaceActivePipelineWorkerStream(correlationID, canonicalAgentID string) {
+	canonicalAgentID = strings.TrimSpace(canonicalAgentID)
+	if canonicalAgentID == "" || !strings.Contains(canonicalAgentID, ":") {
+		return
+	}
+	for existingCID, entry := range m.activeStreams {
+		if existingCID == correlationID || entry == nil {
+			continue
+		}
+		if strings.TrimSpace(entry.AgentID) != canonicalAgentID {
+			continue
+		}
+		m.markReroutedStreamCID(existingCID)
+		delete(m.activeStreams, existingCID)
+	}
 }
 
 // shouldRenderStreamEvent returns true when the correlationID belongs to
@@ -4723,9 +4831,10 @@ func (m *AppModel) unregisterStream(correlationID string) {
 // activeStreamForAgent returns the active stream entry for the given agent,
 // or nil if the agent has no active stream.
 func (m *AppModel) activeStreamForAgent(agentID string) *activeStreamEntry {
-	normalized := normalizeAgentID(agentID)
+	original := normalizeAgentID(agentID)
+	resolved := normalizeAgentID(m.resolveConcreteTargetAgent(agentID))
 	for _, entry := range m.activeStreams {
-		if entry.AgentID == normalized {
+		if entry.AgentID == original || (resolved != "" && entry.AgentID == resolved) {
 			return entry
 		}
 	}
@@ -6457,13 +6566,12 @@ func (m *AppModel) finalizeStreamUsage(correlationID string, success bool, summa
 	// i.e. the actual context window occupancy. Use them directly when available
 	// (no decay — each call sends the full history). Fall back to output-based
 	// estimation when real input tokens are unavailable.
-	var contextUsage float64
 	if state.InputTokens > 0 {
-		contextUsage = m.setAgentContextUsage(state.AgentID, state.InputTokens)
+		m.setAgentContextUsage(state.AgentID, state.InputTokens)
 	} else {
-		contextUsage = m.bumpAgentContextUsage(state.AgentID, state.Tokens+guideResponseOverheadTokens)
+		m.bumpAgentContextUsage(state.AgentID, state.Tokens+guideResponseOverheadTokens)
 	}
-	m.publishStreamActivity(correlationID, success, summary, contextUsage)
+	m.publishStreamActivity(correlationID, success, summary)
 
 	if m.statusBar != nil && len(m.streamUsage) == 0 {
 		m.statusBar.SetTokenPhase(status.PhaseIdle)
@@ -6623,7 +6731,7 @@ func (m *AppModel) streamIdentityForCorrelation(correlationID string) (string, s
 	return canonicalID, agentName, agentType, data
 }
 
-func (m *AppModel) publishStreamActivity(correlationID string, success bool, summary string, contextUsage float64) {
+func (m *AppModel) publishStreamActivity(correlationID string, success bool, summary string) {
 	if m.deps.ActivityPub == nil {
 		return
 	}
@@ -6641,7 +6749,6 @@ func (m *AppModel) publishStreamActivity(correlationID string, success bool, sum
 	}
 	data["agent_name"] = name
 	data["agent_type"] = agentType
-	data["context_usage"] = contextUsage
 	m.deps.ActivityPub.PublishActivity(&events.ActivityEvent{
 		ID:        uuid.New().String(),
 		EventType: eventType,
@@ -6727,11 +6834,11 @@ func (m *AppModel) handleGuideResponse(r msg.GuideResponseMsg) tea.Cmd {
 	if streamEntry != nil {
 		contextAgentID = firstNonEmpty(streamEntry.AgentID, contextAgentID)
 	}
-	contextUsage := m.bumpAgentContextUsage(contextAgentID, added+guideResponseOverheadTokens)
+	m.bumpAgentContextUsage(contextAgentID, added+guideResponseOverheadTokens)
 	m.totalCompletionTokens += added
 	m.updateTokenDisplay()
 	m.statusBar.SetTokenPhase(status.PhaseIdle)
-	m.publishResponseActivity(r, source, content, contextUsage, streamEntry)
+	m.publishResponseActivity(r, source, content, streamEntry)
 	streamTaskID := ""
 	streamTaskName := ""
 	streamTaskSlug := ""
@@ -6765,7 +6872,6 @@ func (m *AppModel) publishResponseActivity(
 	r msg.GuideResponseMsg,
 	source chat.ChatSource,
 	content string,
-	contextUsage float64,
 	streamEntry *activeStreamEntry,
 ) {
 	if m.deps.ActivityPub == nil {
@@ -6805,9 +6911,8 @@ func (m *AppModel) publishResponseActivity(
 		eventType = events.EventTypeAgentError
 	}
 	data := map[string]any{
-		"agent_type":    agentType,
-		"agent_name":    firstNonEmpty(agentName, agentID),
-		"context_usage": contextUsage,
+		"agent_type": agentType,
+		"agent_name": firstNonEmpty(agentName, agentID),
 	}
 	if streamEntry != nil {
 		if pipelineID := strings.TrimSpace(streamPipelineID); pipelineID != "" {
@@ -16065,20 +16170,20 @@ func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 	sessionID := m.resolveRouteSessionID(submit.SessionID)
 	submit.SessionID = sessionID
-	targetAgent := normalizeExplicitTargetAgent(submit.TargetAgent)
+	targetAgent := strings.TrimSpace(submit.TargetAgent)
+	routeTarget := m.resolveConcreteTargetAgent(targetAgent)
 	promptEstimate := estimateGuideTokens(submit.Text) + guideRouteOverheadTokens
-	contextUsage := m.bumpAgentContextUsage(guideAgentID, promptEstimate)
+	m.bumpAgentContextUsage(guideAgentID, promptEstimate)
 	m.statusBar.SetTokenPhase(status.PhaseInput)
 	// Only attribute routing activity to the Guide when it will actually
 	// perform LLM classification. Explicit targets bypass the classifier —
 	// publishing Guide activity here falsely sets the Guide to
 	// StatusThinking in the agent panel.
-	if targetAgent == "" {
+	if routeTarget == "" {
 		m.publishGuideActivity(
 			events.EventTypeLLMRequest,
 			events.OutcomePending,
 			"Classifying and routing request",
-			contextUsage,
 		)
 	}
 
@@ -16086,8 +16191,8 @@ func (m *AppModel) publishRouteRequest(submit msg.SubmitPromptMsg) tea.Cmd {
 		CorrelationID:  uuid.New().String(),
 		Input:          submit.Text,
 		SourceAgentID:  sourceAgentTUI,
-		TargetAgentID:  targetAgent,
-		ExplicitTarget: targetAgent != "",
+		TargetAgentID:  routeTarget,
+		ExplicitTarget: routeTarget != "",
 		SessionID:      submit.SessionID,
 		Timestamp:      time.Now(),
 	}
@@ -16131,6 +16236,9 @@ func (m *AppModel) bumpGuideContextUsage(addedTokens int) float64 {
 	m.guideContextTokens = tokens
 	m.guideContextUsage = float64(tokens) / float64(guideMaxContextTokens)
 	m.agentContextTokens[guideAgentID] = tokens
+	if m.agentPanel != nil {
+		m.agentPanel.SyncContextUsage(guideAgentID, m.guideContextUsage)
+	}
 	return m.guideContextUsage
 }
 
@@ -16150,6 +16258,9 @@ func (m *AppModel) setAgentContextUsage(agentID string, inputTokens int) float64
 		m.guideContextTokens = tokens
 		m.guideContextUsage = ratio
 	}
+	if m.agentPanel != nil {
+		m.agentPanel.SyncContextUsage(normalized, ratio)
+	}
 	return ratio
 }
 
@@ -16166,7 +16277,11 @@ func (m *AppModel) bumpAgentContextUsage(agentID string, addedTokens int) float6
 	limit := m.agentContextTokenLimit(normalized)
 	tokens = min(tokens, limit)
 	m.agentContextTokens[normalized] = tokens
-	return float64(tokens) / float64(limit)
+	ratio := float64(tokens) / float64(limit)
+	if m.agentPanel != nil {
+		m.agentPanel.SyncContextUsage(normalized, ratio)
+	}
+	return ratio
 }
 
 func (m *AppModel) agentContextTokenLimit(agentID string) int {
@@ -16207,7 +16322,6 @@ func (m *AppModel) publishGuideActivity(
 	eventType events.EventType,
 	outcome events.EventOutcome,
 	content string,
-	contextUsage float64,
 ) {
 	if m.deps.ActivityPub == nil {
 		return
@@ -16220,9 +16334,8 @@ func (m *AppModel) publishGuideActivity(
 		Content:   content,
 		Outcome:   outcome,
 		Data: map[string]any{
-			"agent_type":    guideAgentType,
-			"agent_name":    guideAgentName,
-			"context_usage": contextUsage,
+			"agent_type": guideAgentType,
+			"agent_name": guideAgentName,
 		},
 	}
 	m.deps.ActivityPub.PublishActivity(event)

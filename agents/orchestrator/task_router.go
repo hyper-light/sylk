@@ -12,7 +12,6 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/concurrency"
-	"github.com/adalundhe/sylk/core/dag"
 	"github.com/google/uuid"
 )
 
@@ -39,6 +38,7 @@ type TaskRouterConfig struct {
 	Logger                    *slog.Logger
 	StreamMirrorTargetAgentID string
 	EventLogger               *agentlog.SessionEventLogger
+	OnNodeActivity            func(string, string)
 }
 
 // TaskRouter routes DAG-dispatched tasks to pipeline agents through
@@ -53,6 +53,7 @@ type TaskRouter struct {
 	logger               *slog.Logger
 	streamMirrorTargetID string
 	eventLogger          *agentlog.SessionEventLogger
+	onNodeActivity       func(string, string)
 
 	pendingMu sync.Mutex
 	pending   map[string]*pendingRoute // correlationID → pending
@@ -79,6 +80,7 @@ func NewTaskRouter(cfg TaskRouterConfig) *TaskRouter {
 		logger:               logger,
 		streamMirrorTargetID: defaultStreamMirrorTarget(cfg.StreamMirrorTargetAgentID),
 		eventLogger:          cfg.EventLogger,
+		onNodeActivity:       cfg.OnNodeActivity,
 		pending:              make(map[string]*pendingRoute),
 	}
 }
@@ -145,29 +147,35 @@ func (r *TaskRouter) RouteWithLifecycle(task *PipelineTask, done <-chan struct{}
 		}()
 		r.logTrace("task_router_route_wait_begin", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
 
-		select {
-		case resp := <-waitCh:
-			responseType := ""
-			sourceAgentID := ""
-			if resp != nil {
-				responseType = string(resp.Type)
-				sourceAgentID = resp.SourceAgentID
+		doneCh := done
+		for {
+			select {
+			case resp := <-waitCh:
+				responseType := ""
+				sourceAgentID := ""
+				if resp != nil {
+					responseType = string(resp.Type)
+					sourceAgentID = resp.SourceAgentID
+				}
+				r.logTrace("task_router_route_wait_response", "debug", agentlog.EventTaskDispatched, corrID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+					"response_type":   responseType,
+					"source_agent_id": sourceAgentID,
+				}))
+				r.handleRouteResponse(task, resp)
+				return nil
+			case <-ctx.Done():
+				r.logTrace("task_router_route_wait_context_done", "error", agentlog.EventError, corrID, mergeRouteTraceData(routeTraceData(task), map[string]any{
+					"error": ctx.Err().Error(),
+				}))
+				r.publishFailure(task, ctx.Err())
+				return nil
+			case <-doneCh:
+				// Dispatch returned early (usually timeout). Keep the route open so
+				// late terminal responses still reconcile the node instead of being dropped.
+				r.logTrace("task_router_route_wait_done_closed", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
+				doneCh = nil
 			}
-			r.logTrace("task_router_route_wait_response", "debug", agentlog.EventTaskDispatched, corrID, mergeRouteTraceData(routeTraceData(task), map[string]any{
-				"response_type":   responseType,
-				"source_agent_id": sourceAgentID,
-			}))
-			r.handleRouteResponse(task, resp)
-		case <-ctx.Done():
-			r.logTrace("task_router_route_wait_context_done", "error", agentlog.EventError, corrID, mergeRouteTraceData(routeTraceData(task), map[string]any{
-				"error": ctx.Err().Error(),
-			}))
-			r.publishFailure(task, ctx.Err())
-		case <-done:
-			// Dispatch returned (success or timeout) — stop waiting.
-			r.logTrace("task_router_route_wait_done_closed", "debug", agentlog.EventTaskDispatched, corrID, routeTraceData(task))
 		}
-		return nil
 	})
 }
 
@@ -242,6 +250,9 @@ func (r *TaskRouter) mirrorStreamToUser(msg *guide.Message) bool {
 		return false
 	}
 	r.pendingMu.Unlock()
+	if r.onNodeActivity != nil && pr != nil && pr.task != nil {
+		r.onNodeActivity(pr.task.DAGID, pr.task.NodeID)
+	}
 
 	if r.streamMirrorTargetID == "" || r.bus == nil {
 		return true
@@ -605,281 +616,6 @@ func mergeRouteTraceData(base map[string]any, extra map[string]any) map[string]a
 		merged[key] = value
 	}
 	return merged
-}
-
-// CompoundPipelineTask extends PipelineTask with co-tenancy fields for
-// compound node dispatch.
-type CompoundPipelineTask struct {
-	PipelineTask
-	CoAgents          []string              `json:"co_agents,omitempty"`
-	CollaborationMode dag.CollaborationMode `json:"collaboration_mode"`
-	MaxReviewRounds   int                   `json:"max_review_rounds"`
-	PrimaryResult     *dag.NodeResult       `json:"-"`
-}
-
-// RouteCompoundWithLifecycle executes a compound task in a tracked goroutine
-// and emits a single pipeline update for the parent node.
-func (r *TaskRouter) RouteCompoundWithLifecycle(ctx context.Context, task *CompoundPipelineTask, done <-chan struct{}) error {
-	if task == nil {
-		return fmt.Errorf("compound task cannot be nil")
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return r.scope.Go("route-compound-"+task.NodeID, 0, func(routeCtx context.Context) error {
-		select {
-		case <-done:
-			return nil
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		result, err := r.RouteCompound(routeCtx, task)
-		if err != nil {
-			r.publishFailure(&task.PipelineTask, err)
-			return nil
-		}
-		r.publishSucceeded(&task.PipelineTask, compoundResultOutput(result))
-		return nil
-	})
-}
-
-// RouteCompound dispatches a compound pipeline task: first to the primary
-// agent, then to each co-agent for review. In adversarial mode, co-agents
-// can push back for bounded revision rounds.
-func (r *TaskRouter) RouteCompound(ctx context.Context, task *CompoundPipelineTask) (*dag.CompoundNodeResult, error) {
-	primaryMsg, err := r.routeSingle(ctx, &task.PipelineTask)
-	if err != nil {
-		return nil, fmt.Errorf("route compound primary: %w", err)
-	}
-
-	if primaryMsg == nil {
-		return &dag.CompoundNodeResult{
-			PrimaryResult: &dag.NodeResult{
-				NodeID: task.NodeID,
-				State:  dag.NodeStateFailed,
-				Error:  fmt.Errorf("primary agent route cancelled"),
-			},
-		}, fmt.Errorf("compound primary: route cancelled")
-	}
-
-	resp, ok := primaryMsg.GetRouteResponse()
-	if !ok || resp == nil || !resp.Success {
-		errMsg := "primary agent failed"
-		if resp != nil {
-			errMsg = resp.Error
-		}
-		return &dag.CompoundNodeResult{
-			PrimaryResult: &dag.NodeResult{
-				NodeID: task.NodeID,
-				State:  dag.NodeStateFailed,
-				Error:  fmt.Errorf("%s", errMsg),
-			},
-		}, fmt.Errorf("compound primary: %s", errMsg)
-	}
-
-	result := &dag.CompoundNodeResult{
-		PrimaryResult: &dag.NodeResult{
-			NodeID: task.NodeID,
-			State:  dag.NodeStateSucceeded,
-			Output: resp.Data,
-		},
-		CoResults: make(map[string]*dag.NodeResult, len(task.CoAgents)),
-		Consensus: true,
-	}
-
-	if len(task.CoAgents) == 0 {
-		return result, nil
-	}
-
-	// Step 2: Route to co-agents for review
-	maxRounds := task.MaxReviewRounds
-	if maxRounds <= 0 {
-		// Fallback: sequential mode gets exactly 1 review, no pushback.
-		maxRounds = int(dag.CollaborationSequential) + 1
-	}
-
-	for round := range maxRounds {
-		allAccepted := true
-		for _, coAgent := range task.CoAgents {
-			coResult, err := r.routeCoAgent(ctx, task, coAgent, resp.Data, round)
-			if err != nil {
-				result.CoResults[coAgent] = &dag.NodeResult{
-					NodeID: task.NodeID,
-					State:  dag.NodeStateFailed,
-					Error:  err,
-				}
-				result.Consensus = false
-				continue
-			}
-			result.CoResults[coAgent] = coResult
-			if coResult.State != dag.NodeStateSucceeded {
-				allAccepted = false
-				result.Consensus = false
-			}
-		}
-
-		result.ReviewRoundsUsed = round + 1
-
-		if allAccepted || task.CollaborationMode == dag.CollaborationSequential {
-			break
-		}
-	}
-
-	return result, nil
-}
-
-// routeCoAgent sends the primary result to a co-agent for review.
-func (r *TaskRouter) routeCoAgent(
-	ctx context.Context,
-	task *CompoundPipelineTask,
-	coAgent string,
-	primaryOutput any,
-	round int,
-) (*dag.NodeResult, error) {
-	respMsg, err := r.routeSingle(ctx, r.buildCoAgentTask(task, coAgent, primaryOutput, round))
-	if err != nil {
-		return nil, fmt.Errorf("route co-agent %s: %w", coAgent, err)
-	}
-
-	switch {
-	case respMsg == nil:
-		return &dag.NodeResult{State: dag.NodeStateFailed, Error: fmt.Errorf("co-agent route cancelled")}, nil
-	default:
-		coResp, ok := respMsg.GetRouteResponse()
-		if !ok || coResp == nil {
-			return &dag.NodeResult{State: dag.NodeStateFailed, Error: fmt.Errorf("invalid co-agent response")}, nil
-		}
-		state := dag.NodeStateSucceeded
-		if !coResp.Success {
-			state = dag.NodeStateFailed
-		}
-		return &dag.NodeResult{
-			NodeID: task.NodeID,
-			State:  state,
-			Output: coResp.Data,
-			Error:  parseCoError(coResp),
-		}, nil
-	}
-}
-
-func (r *TaskRouter) routeSingle(ctx context.Context, task *PipelineTask) (*guide.Message, error) {
-	if task == nil {
-		return nil, fmt.Errorf("pipeline task cannot be nil")
-	}
-	corrID := "pipe_" + uuid.NewString()[:12]
-	waitCh := r.registerPending(corrID, task)
-	defer r.clearPending(corrID)
-
-	req := &guide.RouteRequest{
-		CorrelationID:   corrID,
-		Input:           encodeTaskInput(task),
-		TargetAgentID:   routeTargetAgentID(task),
-		ExplicitTarget:  true,
-		SourceAgentID:   r.agentID,
-		SourceAgentName: "orchestrator",
-		SessionID:       task.SessionID,
-		Timestamp:       time.Now(),
-		Metadata:        extractDispatchMetadata(task.Context),
-	}
-	msg := guide.NewRequestMessage(generateMessageID(), req)
-	if err := r.bus.Publish(guide.TopicGuideRequests, msg); err != nil {
-		return nil, err
-	}
-
-	select {
-	case resp := <-waitCh:
-		return resp, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (r *TaskRouter) buildCoAgentTask(task *CompoundPipelineTask, coAgent string, primaryOutput any, round int) *PipelineTask {
-	ctx := make(map[string]any, len(task.Context)+4)
-	for k, v := range task.Context {
-		ctx[k] = v
-	}
-	ctx["compound_role"] = "co_agent"
-	ctx["primary_agent_type"] = task.AgentType
-	ctx["review_round"] = round + 1
-	ctx["agent_type"] = coAgent
-
-	parentResults := make(map[string]any, len(task.ParentResults)+1)
-	for k, v := range task.ParentResults {
-		parentResults[k] = v
-	}
-	parentResults[task.NodeID] = map[string]any{
-		"state":  dag.NodeStateSucceeded.String(),
-		"output": primaryOutput,
-	}
-
-	return &PipelineTask{
-		NodeID:        task.NodeID,
-		DAGID:         task.DAGID,
-		TaskID:        task.TaskID,
-		AgentType:     coAgent,
-		TargetAgentID: pipelineWorkerTargetAgentID(task.TaskID, coAgent),
-		Prompt:        scopedCompoundPrompt(task.Context, coAgent, task.Prompt),
-		Context:       ctx,
-		ParentResults: parentResults,
-		SessionID:     task.SessionID,
-	}
-}
-
-func scopedCompoundPrompt(ctx map[string]any, agentType, fallback string) string {
-	if ctx != nil {
-		if scoped, ok := ctx["agent_prompts"].(map[string]string); ok {
-			if prompt := strings.TrimSpace(scoped[agentType]); prompt != "" {
-				return prompt
-			}
-		}
-		if scoped, ok := ctx["agent_prompts"].(map[string]any); ok {
-			if prompt, _ := scoped[agentType].(string); strings.TrimSpace(prompt) != "" {
-				return strings.TrimSpace(prompt)
-			}
-		}
-	}
-	return fallback
-}
-
-func compoundResultOutput(result *dag.CompoundNodeResult) map[string]any {
-	if result == nil {
-		return nil
-	}
-	output := map[string]any{
-		"consensus":          result.Consensus,
-		"review_rounds_used": result.ReviewRoundsUsed,
-	}
-	if result.PrimaryResult != nil {
-		output["primary_output"] = result.PrimaryResult.Output
-	}
-	if len(result.CoResults) > 0 {
-		coResults := make(map[string]any, len(result.CoResults))
-		for agentType, res := range result.CoResults {
-			if res == nil {
-				continue
-			}
-			entry := map[string]any{"state": res.State.String()}
-			if res.Output != nil {
-				entry["output"] = res.Output
-			}
-			if res.Error != nil {
-				entry["error"] = res.Error.Error()
-			}
-			coResults[agentType] = entry
-		}
-		output["co_results"] = coResults
-	}
-	return output
-}
-
-func parseCoError(resp *guide.RouteResponse) error {
-	if resp == nil || resp.Success {
-		return nil
-	}
-	return fmt.Errorf("%s", resp.Error)
 }
 
 func routeTargetAgentID(task *PipelineTask) string {

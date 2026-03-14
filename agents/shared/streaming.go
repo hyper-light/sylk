@@ -173,6 +173,21 @@ func PublishStreamChunk(bus guide.EventBus, channels *guide.AgentChannels, ctx c
 	})
 }
 
+// PublishStreamProgress emits a progress update tied to the current stream.
+func PublishStreamProgress(bus guide.EventBus, channels *guide.AgentChannels, ctx context.Context, agentID, message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	PublishStreamEvent(bus, channels, ctx, agentID, &guide.StreamEvent{
+		Type: guide.StreamEventProgress,
+		Data: &guide.ProgressData{
+			Message: message,
+		},
+		Timestamp: time.Now(),
+	})
+}
+
 // IntermediateToolTurnText returns assistant text worth surfacing immediately
 // for a tool-using turn. Final text-only turns continue to flow through the
 // normal complete event path.
@@ -353,7 +368,7 @@ func intermediateScopePhrase(agentType string) string {
 }
 
 func intermediateArtifactPhrase(agentType string, contract *TaskExecutionContract) string {
-	if contract != nil && contract.RequiresDeliverable(TaskDeliverableCriteriaEvaluation) {
+	if contract != nil && !contract.PreImplementation {
 		return "the validation findings artifact for downstream review"
 	}
 	switch strings.TrimSpace(agentType) {
@@ -401,10 +416,10 @@ func preparePipelineWriteContextAction(agentType string, contract *TaskExecution
 	case "tester-pipeline":
 		return "preparing a safe write context for the planned test artifacts"
 	case "inspector-pipeline":
-		if contract != nil && contract.RequiresDeliverable(TaskDeliverableHandoffContract) {
+		if contract != nil && contract.PreImplementation {
 			return "preparing a safe write context for the inspection handoff artifact"
 		}
-		if contract != nil && contract.RequiresDeliverable(TaskDeliverableValidationReport) {
+		if contract != nil && !contract.PreImplementation {
 			return "preparing a safe write context for the validation artifact"
 		}
 		return "preparing a safe write context for the inspection artifact"
@@ -449,8 +464,10 @@ func humanizeToolName(name string) string {
 	return strings.Join(strings.Fields(name), " ")
 }
 
-// PublishIntermediateToolTurn emits assistant text for tool-using turns so the
-// user sees progress before the loop reaches its final answer.
+// PublishIntermediateToolTurn emits progress narration for tool-using turns so
+// the user sees meaningful status before the loop reaches its final answer.
+// This uses progress events instead of data chunks so intermediate narration
+// does not suppress the final route response.
 func PublishIntermediateToolTurn(
 	bus guide.EventBus,
 	channels *guide.AgentChannels,
@@ -462,7 +479,7 @@ func PublishIntermediateToolTurn(
 		return
 	}
 	if text := IntermediateToolTurnTextWithContext(ctx, resp); text != "" {
-		PublishStreamChunk(bus, channels, ctx, agentID, text)
+		PublishStreamProgress(bus, channels, ctx, agentID, text)
 	}
 }
 

@@ -12,6 +12,9 @@ func TestNewSkill_Builder(t *testing.T) {
 		Description("A test skill").
 		Domain("testing").
 		Keywords("test", "verify").
+		Requirement("Run after the target file is identified.").
+		Satisfies("Produces validation evidence.").
+		Avoid("Do not use for speculative checks.").
 		Priority(10).
 		StringParam("input", "The input string", true).
 		IntParam("count", "Number of times", false).
@@ -28,6 +31,9 @@ func TestNewSkill_Builder(t *testing.T) {
 	assertSkillPriority(t, skill, 10)
 	assertInputSchemaPropertiesLen(t, skill, 3)
 	assertInputSchemaRequiredLen(t, skill, 1)
+	if len(skill.Requirements) != 1 || len(skill.Satisfies) != 1 || len(skill.Avoids) != 1 {
+		t.Fatalf("expected workflow metadata to be captured, got requirements=%v satisfies=%v avoids=%v", skill.Requirements, skill.Satisfies, skill.Avoids)
+	}
 }
 
 func assertSkillName(t *testing.T, skill *Skill, expected string) {

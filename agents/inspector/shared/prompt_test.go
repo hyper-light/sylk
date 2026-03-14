@@ -13,9 +13,8 @@ func TestPipelineInspectorSystemPromptForContract_OmitsValidationProtocolPreImpl
 	})
 
 	for _, blocked := range []string{
-		"Run `run_type_checker` on all task files",
-		"Use `validate_criteria` to check implementation against defined criteria",
-		"Use `grade_task_quality` to produce a multi-dimensional quality score",
+		"Default to TDD: challenge Tester before dispatching Engineer or Designer unless the task is strictly inspection-only.",
+		"Use `handoff_to_ot` only when you are satisfied that the testing and implementation evidence meet the criteria.",
 	} {
 		if strings.Contains(prompt, blocked) {
 			t.Fatalf("pre-implementation prompt unexpectedly contains %q", blocked)
@@ -29,9 +28,9 @@ func TestPipelineInspectorSystemPromptForContract_IncludesValidationProtocolWith
 	})
 
 	for _, want := range []string{
-		"Run `run_type_checker` on all task files",
-		"Use `validate_criteria` to check implementation against defined criteria",
-		"Use `grade_task_quality` to produce a multi-dimensional quality score",
+		"Default to TDD: challenge Tester before dispatching Engineer or Designer unless the task is strictly inspection-only.",
+		"Use `validate_criteria` and `grade_task_quality` to judge the current state, but keep the lifecycle agentic: decide whether to loop again or accept.",
+		"Use `handoff_to_ot` only when you are satisfied that the testing and implementation evidence meet the criteria.",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("implementation-validation prompt missing %q", want)

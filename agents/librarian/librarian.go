@@ -940,6 +940,9 @@ func (l *Librarian) SetAgentPod(pod *shared.AgentPod) {
 // SetHandoffBridge assigns the handoff bridge for this agent.
 func (l *Librarian) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	l.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(l.activityPub)
+	}
 }
 
 // ExtractArchivableState returns the agent's current state for handoff persistence.

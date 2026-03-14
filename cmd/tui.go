@@ -47,6 +47,7 @@ import (
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/oauth"
+	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/providers/gateway"
 	"github.com/adalundhe/sylk/core/search/git"
@@ -202,11 +203,12 @@ type bootstrapPhase2 struct {
 }
 
 type bootstrapPhase3 struct {
-	guide          *guide.Guide
-	orch           *orchestrator.Orchestrator
-	activationCtrl *activation.ActivationController
-	activator      guide.PodActivator
-	scribeFactory  agentShared.ScribeFactory
+	guide           *guide.Guide
+	orch            *orchestrator.Orchestrator
+	pipelineManager *tdd.PipelineManager
+	activationCtrl  *activation.ActivationController
+	activator       guide.PodActivator
+	scribeFactory   agentShared.ScribeFactory
 }
 
 type bootstrapPhase4 struct {
@@ -729,9 +731,10 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	}
 
 	phase3 := bootstrapPhase3{
-		guide:          g,
-		orch:           orch,
-		activationCtrl: phase2.actResult.ctrl,
+		guide:           g,
+		orch:            orch,
+		pipelineManager: buildPipelineManager(phase1, g),
+		activationCtrl:  phase2.actResult.ctrl,
 	}
 	if phase3.activationCtrl != nil {
 		phase1.actCtrlRef.Store(phase3.activationCtrl)
@@ -777,15 +780,8 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	}
 	g.SetServiceRegistry(phase1.serviceReg)
 	g.SetProviderWrapper(phase1.googleGateway.Wrapper(gateway.PriorityUserInteractive))
-	g.SetAgentRegistrar(func(agentType string) {
-		containers := phase1.containerReg.ListByType(agentType)
-		if len(containers) == 0 {
-			return
-		}
-		agent := containers[0].Agent()
-		if router, ok := agent.(guide.AgentRouter); ok {
-			_ = registerAgentWithGuide(g, router, agentType)
-		}
+	g.SetAgentRegistrar(func(ctx context.Context, targetAgentID, podID, agentType string) {
+		_ = registerActivatedAgentWithGuide(ctx, g, phase1.containerReg, targetAgentID, podID, agentType)
 	})
 
 	orch.SetProviderRefresher(func(refreshCtx context.Context, authMethod string) {
@@ -797,6 +793,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		AgentID:   orch.AgentID(),
 		SessionID: "default",
 	}))
+	orch.SetPipelineManager(phase3.pipelineManager)
 	if phase3.activator != nil {
 		orch.SetActivator(phase3.activator)
 	}
@@ -833,6 +830,121 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 	return phase3, nil
+}
+
+func buildPipelineManager(phase1 *bootstrapPhase1, g *guide.Guide) *tdd.PipelineManager {
+	if phase1 == nil || g == nil {
+		return nil
+	}
+
+	inspectorCfg := inspectorShared.DefaultPipelineInspectorConfig()
+	inspectorCfg.Model = "claude-opus-4-6"
+
+	testerCfg := shared.DefaultPipelineTesterConfig()
+	testerCfg.Model = effectiveModelForCurrentAuth(phase1.authRegistry, testerCfg.Model)
+
+	engineerCfg := engineer.Config{ActivityPub: phase1.activityPub}
+	engineerCfg.EngineerConfig.Model = effectiveModelForCurrentAuth(phase1.authRegistry, engineer.DefaultModel)
+
+	designerCfg := designer.Config{ActivityPub: phase1.activityPub}
+	designerCfg.DesignerConfig.Model = string(providers.Gemini31Pro)
+
+	registerManagedPipelineAgent := func(router guide.AgentRouter, start func(guide.EventBus) error) error {
+		if router == nil || start == nil {
+			return fmt.Errorf("managed pipeline agent is not routable")
+		}
+		if err := start(phase1.guideBus); err != nil {
+			return err
+		}
+		seedRouterKnownAgents(g, router)
+		return registerRoutingInfoWithGuide(g, managedPipelineRoutingInfo(router.GetRoutingInfo()))
+	}
+
+	factory := tdd.NewAgentFactory(tdd.AgentFactoryConfig{
+		InspectorConfig: inspectorCfg,
+		TesterConfig:    testerCfg,
+		EngineerConfig:  engineerCfg,
+		DesignerConfig:  designerCfg,
+		InspectorFactory: func(ctx context.Context, cfg inspectorShared.PipelineInspectorConfig) (*inspectorPipeline.PipelineInspector, error) {
+			wrapped, err := createSwapProvider(ctx, cfg.Model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityValidation)
+			if err != nil {
+				return nil, fmt.Errorf("pipeline inspector provider: %w", err)
+			}
+			pi, err := inspectorPipeline.New(cfg, wrapped)
+			if err != nil {
+				return nil, err
+			}
+			pi.SetActivityPublisher(phase1.activityPub)
+			if err := registerManagedPipelineAgent(pi, pi.Start); err != nil {
+				_ = pi.Close()
+				return nil, err
+			}
+			return pi, nil
+		},
+		TesterFactory: func(ctx context.Context, cfg shared.PipelineTesterConfig) (*pipelinetester.PipelineTester, error) {
+			wrapped, err := createSwapProvider(ctx, cfg.Model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityValidation)
+			if err != nil {
+				return nil, fmt.Errorf("pipeline tester provider: %w", err)
+			}
+			pt, err := pipelinetester.New(cfg, wrapped)
+			if err != nil {
+				return nil, err
+			}
+			pt.SetActivityPublisher(phase1.activityPub)
+			if err := registerManagedPipelineAgent(pt, pt.Start); err != nil {
+				_ = pt.Close()
+				return nil, err
+			}
+			return pt, nil
+		},
+		EngineerFactory: func(ctx context.Context, cfg engineer.Config) (*engineer.Engineer, error) {
+			model := cfg.EngineerConfig.Model
+			if model == "" {
+				model = effectiveModelForCurrentAuth(phase1.authRegistry, engineer.DefaultModel)
+				cfg.EngineerConfig.Model = model
+			}
+			wrapped, err := createSwapProvider(ctx, model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityExecution)
+			if err != nil {
+				return nil, fmt.Errorf("pipeline engineer provider: %w", err)
+			}
+			eng, err := engineer.New(cfg, wrapped)
+			if err != nil {
+				return nil, err
+			}
+			if err := registerManagedPipelineAgent(eng, eng.Start); err != nil {
+				_ = eng.Close()
+				return nil, err
+			}
+			return eng, nil
+		},
+		DesignerFactory: func(ctx context.Context, cfg designer.Config) (*designer.Designer, error) {
+			model := cfg.DesignerConfig.Model
+			if model == "" {
+				model = string(providers.Gemini31Pro)
+				cfg.DesignerConfig.Model = model
+			}
+			wrapped, err := createSwapProvider(ctx, model, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway, gateway.PriorityExecution)
+			if err != nil {
+				return nil, fmt.Errorf("pipeline designer provider: %w", err)
+			}
+			des, err := designer.New(cfg, wrapped)
+			if err != nil {
+				return nil, err
+			}
+			if err := registerManagedPipelineAgent(des, des.Start); err != nil {
+				_ = des.Close()
+				return nil, err
+			}
+			return des, nil
+		},
+		Logger: slog.Default(),
+	})
+
+	return tdd.NewPipelineManager(tdd.PipelineManagerConfig{
+		ActivityPub:     phase1.activityPub,
+		UnregisterAgent: g.Unregister,
+		Logger:          slog.Default(),
+	}, factory, nil)
 }
 
 func schedulePhase4Task(
@@ -1177,6 +1289,9 @@ func buildBootstrapCleanup(
 				errs = append(errs, stopErr)
 			}
 		}
+		if phase3.pipelineManager != nil {
+			phase3.pipelineManager.CloseAll()
+		}
 		if phase3.activationCtrl != nil {
 			if err := phase3.activationCtrl.Shutdown(shutdownCtx); err != nil {
 				errs = append(errs, err)
@@ -1232,6 +1347,7 @@ func buildBootstrapDeps(
 		GitWatcher:         phase2.gitRes.watcher,
 		GitBus:             phase2.gitRes.bus,
 		SafetyGuard:        phase2.gitRes.guard,
+		PipelineManager:    phase3.pipelineManager,
 		SeedAgents:         phase4.seeds,
 		ModelSwap:          phase4.modelSwapper,
 		ModelSave: func(agentType, provider, modelID string) {
@@ -1589,7 +1705,11 @@ func registerGlobalInspectorAgentCreator(deps onDemandAgentCreatorDeps) {
 		if err != nil {
 			return nil, fmt.Errorf("global inspector provider: %w", err)
 		}
-		gi, err := inspectorGlobal.New(inspectorShared.GlobalInspectorConfig{AgentID: inspectorID, Model: model}, wrapped)
+		gi, err := inspectorGlobal.New(inspectorShared.GlobalInspectorConfig{
+			AgentID:     inspectorID,
+			Model:       model,
+			ActivityPub: deps.actPub,
+		}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -1641,7 +1761,11 @@ func registerGlobalTesterAgentCreator(deps onDemandAgentCreatorDeps) {
 		} else {
 			wrapped = provider
 		}
-		gt, err := globaltester.New(shared.GlobalTesterConfig{AgentID: testerID, Model: model}, wrapped)
+		gt, err := globaltester.New(shared.GlobalTesterConfig{
+			AgentID:     testerID,
+			Model:       model,
+			ActivityPub: deps.actPub,
+		}, wrapped)
 		if err != nil {
 			return nil, err
 		}
@@ -2264,6 +2388,33 @@ func registerAgentWithGuide(g *guide.Guide, router guide.AgentRouter, _ string) 
 	return registerRoutingInfoWithGuide(g, router.GetRoutingInfo())
 }
 
+func registerActivatedAgentWithGuide(
+	_ context.Context,
+	g *guide.Guide,
+	reg *container.ContainerRegistry,
+	_ string,
+	podID string,
+	agentType string,
+) error {
+	if g == nil || reg == nil {
+		return nil
+	}
+	containerRef := findRegisteredPodContainer(reg, podID, agentType)
+	if containerRef == nil {
+		return nil
+	}
+	router, ok := containerRef.Agent().(guide.AgentRouter)
+	if !ok {
+		return nil
+	}
+	seedRouterKnownAgents(g, router)
+	info := router.GetRoutingInfo()
+	if isTaskScopedPipelineWorker(podID, agentType) {
+		info = taskScopedWorkerRoutingInfo(info, podID, agentType)
+	}
+	return registerRoutingInfoWithGuide(g, info)
+}
+
 func registerRoutingInfoWithGuide(g *guide.Guide, info *guide.AgentRoutingInfo) error {
 	if g == nil || info == nil {
 		return nil
@@ -2275,6 +2426,36 @@ func registerRoutingInfoWithGuide(g *guide.Guide, info *guide.AgentRoutingInfo) 
 	// readyAgents keyed by info.ID, not by agentType.
 	g.MarkAgentReady(info.ID)
 	return nil
+}
+
+func managedPipelineRoutingInfo(info *guide.AgentRoutingInfo) *guide.AgentRoutingInfo {
+	if info == nil || !isManagedPipelineRoutingType(info.Type) {
+		return info
+	}
+	cloned := *info
+	cloned.Name = strings.TrimSpace(info.ID)
+	if cloned.Name == "" {
+		cloned.Name = strings.TrimSpace(info.Name)
+	}
+	cloned.Aliases = nil
+	cloned.ActionShortcuts = nil
+	cloned.Triggers = guide.AgentTriggers{}
+	if info.Registration != nil {
+		reg := *info.Registration
+		reg.Name = cloned.Name
+		reg.Aliases = nil
+		cloned.Registration = &reg
+	}
+	return &cloned
+}
+
+func isManagedPipelineRoutingType(agentType string) bool {
+	switch strings.TrimSpace(agentType) {
+	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+		return true
+	default:
+		return false
+	}
 }
 
 type guideKnownAgentSeeder interface {
@@ -2330,6 +2511,7 @@ func taskScopedWorkerRoutingInfo(info *guide.AgentRoutingInfo, podID, agentType 
 		return nil
 	}
 	cloned := *info
+	cloned.PodID = podID
 	cloned.Name = orchestrator.TaskScopedRoutingName("", podID, agentType)
 	cloned.Aliases = nil
 	cloned.ActionShortcuts = nil
@@ -2344,11 +2526,16 @@ func taskScopedWorkerRoutingInfo(info *guide.AgentRoutingInfo, podID, agentType 
 }
 
 func pipelineWorkerAgentID(ctx context.Context, agentType string) string {
+	if spec, ok := container.CreationSpecFromContext(ctx); ok {
+		if specID := strings.TrimSpace(spec.Labels["pipeline_worker_id"]); specID != "" {
+			return specID
+		}
+	}
 	podID, ok := container.CreationPodIDFromContext(ctx)
 	if !ok || !isTaskScopedPipelineWorker(string(podID), agentType) {
 		return ""
 	}
-	return orchestrator.TaskScopedAgentID(string(podID), agentType)
+	return orchestrator.PipelineWorkerAgentID(string(podID), agentType)
 }
 
 // preRegisterAgentRouting pre-registers static routing metadata for all
@@ -2952,6 +3139,7 @@ func bootstrapHandoffSupervisor(
 		if setter, ok := newAgent.(interface{ SetCanonicalID(string) }); ok {
 			setter.SetCanonicalID(oldID)
 		}
+		inheritHandoffRuntimeBindings(containerReg, oldID, newAgent)
 		g.UnregisterAgent(oldID)
 		if router, ok := newAgent.(guide.AgentRouter); ok {
 			seedRouterKnownAgents(g, router)
@@ -3047,6 +3235,10 @@ type handoffBridgeSetter interface {
 	SetHandoffBridge(bridge *handoff.HandoffBridge)
 }
 
+type handoffPodGetter interface {
+	AgentPod() *agentShared.AgentPod
+}
+
 // registerHandoffAgent registers a single agent with the supervisor and
 // sets the bridge on the agent if it supports it.
 func registerHandoffAgent(supervisor *handoff.HandoffSupervisor, agent handoff.HandoffableAgent) {
@@ -3062,6 +3254,53 @@ func registerHandoffAgent(supervisor *handoff.HandoffSupervisor, agent handoff.H
 	}
 }
 
+func inheritHandoffRuntimeBindings(containerReg *container.ContainerRegistry, oldID string, newAgent handoff.HandoffableAgent) {
+	if containerReg == nil || strings.TrimSpace(oldID) == "" || newAgent == nil {
+		return
+	}
+
+	var oldAgent handoff.HandoffableAgent
+	for _, ctr := range containerReg.All() {
+		if ctr == nil || ctr.Agent() == nil {
+			continue
+		}
+		handoffable, ok := ctr.Agent().(handoff.HandoffableAgent)
+		if !ok {
+			continue
+		}
+		if handoffable.AgentID() == oldID {
+			oldAgent = handoffable
+			break
+		}
+	}
+	if oldAgent == nil {
+		return
+	}
+
+	podSource, ok := oldAgent.(handoffPodGetter)
+	if !ok {
+		return
+	}
+	pod := podSource.AgentPod()
+	if pod == nil {
+		return
+	}
+
+	if setter, ok := newAgent.(agentPodSetter); ok {
+		setter.SetAgentPod(pod)
+	}
+	if consumer, ok := newAgent.(versioning.FileAccessConsumer); ok {
+		if fa := pod.FileAccessFor(newAgent.AgentType()); fa != nil {
+			consumer.SetFileAccess(fa)
+		}
+	}
+	if viewsConsumer, ok := newAgent.(versioning.WorkspaceViewsConsumer); ok {
+		if views := pod.WorkspaceViewsFor(newAgent.AgentType()); views != nil {
+			viewsConsumer.SetWorkspaceViews(views)
+		}
+	}
+}
+
 func registerHandoffCreators(supervisor *handoff.HandoffSupervisor, creatorReg *container.AgentCreatorRegistry) {
 	if supervisor == nil || creatorReg == nil {
 		return
@@ -3069,7 +3308,7 @@ func registerHandoffCreators(supervisor *handoff.HandoffSupervisor, creatorReg *
 	for _, agentType := range creatorReg.Types() {
 		agentType := agentType
 		supervisor.Factory().RegisterCreator(agentType, func(ctx context.Context) (handoff.HandoffableAgent, error) {
-			agent, err := creatorReg.Create(ctx, agentType)
+			agent, err := creatorReg.Create(applyHandoffCreationContext(ctx, agentType), agentType)
 			if err != nil {
 				return nil, err
 			}
@@ -3080,6 +3319,32 @@ func registerHandoffCreators(supervisor *handoff.HandoffSupervisor, creatorReg *
 			return handoffable, nil
 		})
 	}
+}
+
+func applyHandoffCreationContext(ctx context.Context, agentType string) context.Context {
+	metadata, ok := handoff.FactoryCreationMetadataFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+
+	spec := container.ContainerSpec{
+		AgentType: agentType,
+		Labels:    make(map[string]string, 4),
+	}
+	if strings.TrimSpace(metadata.AgentID) != "" {
+		spec.Labels["pipeline_worker_id"] = metadata.AgentID
+	}
+	if strings.TrimSpace(metadata.TaskID) != "" {
+		spec.Labels["task_id"] = metadata.TaskID
+		if strings.TrimSpace(metadata.TaskSlug) != "" {
+			spec.Labels["task_slug"] = metadata.TaskSlug
+		}
+		return container.WithCreationContext(ctx, spec, container.PodID(metadata.TaskID))
+	}
+	if strings.TrimSpace(metadata.AgentType) != "" {
+		spec.AgentType = metadata.AgentType
+	}
+	return container.WithCreationContext(ctx, spec, "")
 }
 
 func registerAllHandoffContainers(supervisor *handoff.HandoffSupervisor, reg *container.ContainerRegistry) {

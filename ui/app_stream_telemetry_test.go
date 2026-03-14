@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/events"
 	agentpkg "github.com/adalundhe/sylk/ui/agent"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -40,6 +41,7 @@ func TestStreamTelemetry_FinalizeUpdatesAgentContext(t *testing.T) {
 
 func TestStreamTelemetry_UsesLatestPerTurnInputTokensForPipelineTester(t *testing.T) {
 	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("task_auth_checkout:tester-pipeline", "tester-pipeline", "Pipeline Tester", nil, "", "")
 
 	start := msg.StreamStartMsg{
 		CorrelationID: "corr-tester",
@@ -83,6 +85,71 @@ func TestStreamTelemetry_UsesLatestPerTurnInputTokensForPipelineTester(t *testin
 	if got := m.agentContextTokens[canonicalID]; got != 210000 {
 		t.Fatalf("finalized agentContextTokens[%q] = %d, want 210000", canonicalID, got)
 	}
+	if got := m.agentPanel.ContextUsageOf(canonicalID); got < 0.77 || got > 0.78 {
+		t.Fatalf("panel context usage = %.4f, want about 0.7721", got)
+	}
+}
+
+func TestStreamTelemetry_TokenUsageOverridesStalePanelContext(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("task_auth_checkout:tester-pipeline", "tester-pipeline", "Pipeline Tester", nil, "", "")
+	m.agentPanel.SyncContextUsage("task_auth_checkout:tester-pipeline", 1.0)
+
+	start := msg.StreamStartMsg{
+		CorrelationID: "corr-tester-stale",
+		AgentID:       "runtime-tester",
+		AgentType:     "tester-pipeline",
+		AgentName:     "Tester",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+	}
+	m.trackStreamStart(start)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		CorrelationID: "corr-tester-stale",
+		AgentID:       "runtime-tester",
+		Model:         "gpt-5.4-pro",
+		InputTokens:   27200,
+	})
+	m = model.(*AppModel)
+
+	if got := m.agentPanel.ContextUsageOf("task_auth_checkout:tester-pipeline"); got < 0.09 || got > 0.11 {
+		t.Fatalf("panel context usage = %.4f, want about 0.10 after real token sync", got)
+	}
+}
+
+func TestStreamTelemetry_TokenUsageOverridesStalePanelContextForStandaloneAgent(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("inspector", "inspector", "Inspector", nil, "", "")
+	m.agentPanel.SyncContextUsage("inspector", 1.0)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		AgentID:     "inspector",
+		Model:       "gpt-5.4-pro",
+		InputTokens: 27200,
+	})
+	m = model.(*AppModel)
+
+	if got := m.agentPanel.ContextUsageOf("inspector"); got < 0.09 || got > 0.11 {
+		t.Fatalf("panel context usage = %.4f, want about 0.10 after real token sync", got)
+	}
+}
+
+func TestStreamTelemetry_TokenUsageOverridesStalePanelContextForGuide(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("guide", "guide", "Guide", nil, "", "")
+	m.agentPanel.SyncContextUsage("guide", 1.0)
+
+	model, _ := m.Update(msg.TokenUsageMsg{
+		AgentID:     "guide",
+		Model:       "gpt-5.4-pro",
+		InputTokens: 50000,
+	})
+	m = model.(*AppModel)
+
+	if got := m.agentPanel.ContextUsageOf("guide"); got <= 0 || got >= 1.0 {
+		t.Fatalf("panel context usage = %.4f, want reset below 1.0 after real token sync", got)
+	}
 }
 
 func TestStreamTelemetry_UsesModelSpecificContextLimit(t *testing.T) {
@@ -92,6 +159,37 @@ func TestStreamTelemetry_UsesModelSpecificContextLimit(t *testing.T) {
 	ratio := m.setAgentContextUsage("tester", 210000)
 	if ratio >= 1.0 {
 		t.Fatalf("ratio = %.4f, want < 1.0 for gpt-5.4-pro context window", ratio)
+	}
+}
+
+func TestStreamTelemetry_HandoffCompletedResetsPipelineContextUsage(t *testing.T) {
+	m := newStreamTelemetryModel()
+	m.agentPanel.SeedAgent("task_auth_checkout:tester-pipeline", "tester-pipeline", "Pipeline Tester", nil, "", "")
+	m.agentContextModels["task_auth_checkout:tester-pipeline"] = "gpt-5.4-pro"
+	m.setAgentContextUsage("task_auth_checkout:tester-pipeline", 210000)
+
+	m.applyActivityTelemetry(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_handoff_complete",
+			EventType: events.EventTypeSuccess,
+			Timestamp: time.Now(),
+			AgentID:   "4d6b407a",
+			Content:   "Context handoff complete",
+			Data: map[string]any{
+				"agent_type":     "tester-pipeline",
+				"pipeline_id":    "task_auth_checkout",
+				"task_id":        "task_auth_checkout",
+				"handoff_state":  "completed",
+				"context_tokens": 0,
+			},
+		},
+	})
+
+	if got := m.agentContextTokens["task_auth_checkout:tester-pipeline"]; got != 0 {
+		t.Fatalf("agentContextTokens = %d, want 0 after handoff completion", got)
+	}
+	if got := m.agentPanel.ContextUsageOf("task_auth_checkout:tester-pipeline"); got != 0 {
+		t.Fatalf("panel context usage = %.4f, want 0 after handoff completion", got)
 	}
 }
 
@@ -219,6 +317,46 @@ func TestStreamTelemetry_TaskIDOverridesRuntimePipelineID(t *testing.T) {
 	}
 	if entry.PipelineID != "task_auth_checkout" {
 		t.Fatalf("entry.PipelineID = %q, want task_auth_checkout", entry.PipelineID)
+	}
+}
+
+func TestStreamTelemetry_RegisterStreamReplacesOlderPipelineWorkerStream(t *testing.T) {
+	m := newStreamTelemetryModel()
+
+	first := msg.StreamStartMsg{
+		CorrelationID: "corr-old",
+		AgentID:       "old-runtime-id",
+		AgentType:     "engineer",
+		AgentName:     "Engineer",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+	}
+	second := msg.StreamStartMsg{
+		CorrelationID: "corr-new",
+		AgentID:       "new-runtime-id",
+		AgentType:     "engineer",
+		AgentName:     "Engineer",
+		PipelineID:    "task_auth_checkout",
+		TaskID:        "task_auth_checkout",
+	}
+
+	m.trackStreamStart(first)
+	m.registerStream(first)
+	m.trackStreamStart(second)
+	m.registerStream(second)
+
+	if _, ok := m.activeStreams["corr-old"]; ok {
+		t.Fatal("expected older pipeline-worker stream to be evicted")
+	}
+	if _, ok := m.reroutedStreamCIDs["corr-old"]; !ok {
+		t.Fatal("expected older stream correlation to be marked for terminal cleanup")
+	}
+	entry := m.activeStreams["corr-new"]
+	if entry == nil {
+		t.Fatal("expected replacement active stream entry")
+	}
+	if entry.AgentID != "task_auth_checkout:engineer" {
+		t.Fatalf("entry.AgentID = %q, want task_auth_checkout:engineer", entry.AgentID)
 	}
 }
 

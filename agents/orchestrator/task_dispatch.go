@@ -19,6 +19,7 @@ type taskDispatchContext struct {
 	workflowID string
 	name       string
 	agentID    string
+	targetID   string
 
 	nodeID        string
 	agentType     string
@@ -50,6 +51,7 @@ func parseTaskDispatchMessage(msg *guide.Message) (*taskDispatchContext, bool) {
 		workflowID:    stringValue(data["workflow_id"]),
 		name:          stringValue(data["name"]),
 		agentID:       stringValue(data["agent_id"]),
+		targetID:      stringValue(data["target_agent_id"]),
 		nodeID:        stringValue(data["node_id"]),
 		agentType:     stringValue(data["agent_type"]),
 		prompt:        stringValue(data["prompt"]),
@@ -145,21 +147,11 @@ func (d *taskDispatchContext) pipelineTask(sessionID string) *PipelineTask {
 		DAGID:         d.dagID,
 		TaskID:        d.pipelineTaskID,
 		AgentType:     d.agentType,
-		TargetAgentID: pipelineWorkerTargetAgentID(d.pipelineTaskID, d.agentType),
+		TargetAgentID: firstNonEmpty(d.targetID, pipelineWorkerTargetAgentID(d.pipelineTaskID, d.agentType)),
 		Prompt:        d.prompt,
 		Context:       d.nodeCtx,
 		ParentResults: d.parentResults,
 		SessionID:     sessionID,
-	}
-}
-
-func (d *taskDispatchContext) compoundPipelineTask(sessionID string) *CompoundPipelineTask {
-	base := d.pipelineTask(sessionID)
-	return &CompoundPipelineTask{
-		PipelineTask:      *base,
-		CoAgents:          d.coAgents,
-		CollaborationMode: parseDispatchCollaborationMode(d.data["collaboration_mode"]),
-		MaxReviewRounds:   intValue(d.data["max_review_rounds"]),
 	}
 }
 
@@ -252,6 +244,9 @@ func (o *Orchestrator) publishTaskDispatchAgents(dispatch *taskDispatchContext, 
 	if dispatch.nodeID == "" || dispatch.agentType == "" {
 		return
 	}
+	if o.pipelineMgr != nil && managedPipelineEligible(dispatch) {
+		return
+	}
 
 	dispatched := make(map[string]struct{}, len(dispatch.coAgents)+1)
 	o.publishPipelineAgentActivity(dispatch.agentType, dispatch.pipelineTaskID, dispatch.nodeID, dispatch.pipelineTaskSlug, pipelineStatus)
@@ -290,7 +285,7 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 		"task_slug":       dispatch.pipelineTaskSlug,
 		"co_agents":       append([]string(nil), dispatch.coAgents...),
 		"ack_topic":       stringValue(dispatch.nodeCtx["ack_topic"]),
-		"target_agent_id": TaskScopedAgentID(dispatch.pipelineTaskID, dispatch.agentType),
+		"target_agent_id": firstNonEmpty(dispatch.targetID, pipelineWorkerTargetAgentID(dispatch.pipelineTaskID, dispatch.agentType)),
 	})
 	if err := o.routeDispatchedPipelineTask(router, dispatch, done); err != nil {
 		o.logTrace("task_dispatch_route_failed", agentlog.EventError, map[string]any{
@@ -314,7 +309,7 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 		"task_id":         dispatch.taskID,
 		"agent_type":      dispatch.agentType,
 		"task_slug":       dispatch.pipelineTaskSlug,
-		"target_agent_id": TaskScopedAgentID(dispatch.pipelineTaskID, dispatch.agentType),
+		"target_agent_id": firstNonEmpty(dispatch.targetID, pipelineWorkerTargetAgentID(dispatch.pipelineTaskID, dispatch.agentType)),
 	})
 
 	if o.dagBridge != nil {
@@ -323,8 +318,11 @@ func (o *Orchestrator) routeTaskDispatch(router *TaskRouter, dispatch *taskDispa
 }
 
 func (o *Orchestrator) routeDispatchedPipelineTask(router *TaskRouter, dispatch *taskDispatchContext, done <-chan struct{}) error {
-	if dispatch.pipelineStage == string(StageExecute) && len(dispatch.coAgents) > 0 {
-		return router.RouteCompoundWithLifecycle(context.Background(), dispatch.compoundPipelineTask(o.config.SessionID), done)
+	o.mu.RLock()
+	managerConfigured := o.pipelineMgr != nil
+	o.mu.RUnlock()
+	if managerConfigured && managedPipelineEligible(dispatch) {
+		return o.routeManagedPipelineDispatch(dispatch, done)
 	}
 	return router.RouteWithLifecycle(dispatch.pipelineTask(o.config.SessionID), done)
 }

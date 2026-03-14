@@ -32,6 +32,10 @@ func RunLinterSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("lint", "check", "style", "analysis").
 		Priority(95).
+		Usage("Use during implementation-validation mode after you understand the target files and criteria. Run it on the concrete scope under review, not the entire repo by default.").
+		Requirement("Requires implementation evidence and the relevant target paths.").
+		Satisfies("Produces code-quality findings that support criteria evaluation and final grading.").
+		Avoid("Do not use during pre-implementation contract synthesis when there is no implementation evidence to validate.").
 		ArrayParam("paths", "Paths to lint (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -49,6 +53,10 @@ func RunTypeCheckerSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("type", "check", "static", "analysis").
 		Priority(95).
+		Usage("Use early in implementation-validation mode to detect structural correctness issues in the actual changed scope.").
+		Requirement("Requires implementation evidence and the relevant target paths.").
+		Satisfies("Produces type/static-analysis evidence for criteria evaluation and validation reporting.").
+		Avoid("Do not use during pre-implementation contract synthesis.").
 		ArrayParam("paths", "Paths to check (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -66,6 +74,9 @@ func RunFormatterCheckSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("format", "style", "whitespace").
 		Priority(90).
+		Usage("Use in implementation-validation mode when formatting compliance is part of the quality bar or when findings need to distinguish formatting drift from real logic defects.").
+		Satisfies("Produces formatting findings that contribute to quality judgment without mutating the workspace.").
+		Avoid("Do not treat formatting-only findings as a substitute for type, security, or criteria validation.").
 		ArrayParam("paths", "Paths to check (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -83,6 +94,10 @@ func RunSecurityScanSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("security", "vulnerability", "audit").
 		Priority(95).
+		Usage("Use during implementation-validation mode when security-sensitive behavior exists or when the quality bar requires security validation.").
+		Requirement("Requires implementation evidence and the relevant target paths.").
+		Satisfies("Produces security findings that directly affect validation outcome and severity reporting.").
+		Avoid("Do not use during pre-implementation contract synthesis.").
 		ArrayParam("paths", "Paths to scan (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -105,6 +120,9 @@ func CheckCoverageSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("coverage", "test", "threshold").
 		Priority(85).
+		Usage("Use in implementation-validation mode when the task or quality gates require coverage evidence.").
+		Satisfies("Produces coverage evidence for quality gates and final grading.").
+		Avoid("Do not manufacture blocking findings when the project lacks a compatible coverage runner; report tool availability honestly.").
 		ArrayParam("paths", "Paths to check coverage for (default: ./...)", "string", false).
 		IntParam("threshold", "Minimum coverage percentage (default: 80)", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -130,6 +148,9 @@ func AnalyzeComplexitySkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("complexity", "cyclomatic", "cognitive").
 		Priority(85).
+		Usage("Use in implementation-validation mode when readability, maintainability, or explicit complexity gates matter for the requested scope.").
+		Satisfies("Produces complexity findings that contribute to quality judgment and review artifacts.").
+		Avoid("Do not use as the first validation step when correctness or security evidence is still missing.").
 		ArrayParam("paths", "Paths to analyze (default: ./...)", "string", false).
 		IntParam("max_cyclomatic", "Max cyclomatic complexity (default: 4 per CLAUDE.md)", false).
 		IntParam("max_cognitive", "Max cognitive complexity (default: 8)", false).
@@ -157,6 +178,10 @@ func DetectRaceConditionsSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("race", "concurrency", "data race").
 		Priority(95).
+		Usage("Use in implementation-validation mode when concurrency behavior is present or when a task explicitly risks races.").
+		Requirement("Requires runnable implementation/test evidence for the target scope.").
+		Satisfies("Produces concurrency-safety evidence for validation findings and severity reporting.").
+		Avoid("Do not use during pre-implementation inspection or on obviously non-runnable placeholder code.").
 		ArrayParam("paths", "Paths to test (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -174,6 +199,9 @@ func DetectDeadlocksSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("deadlock", "lock", "mutex").
 		Priority(90).
+		Usage("Use in implementation-validation mode when the target code includes locks, shared state, or orchestration paths that could block.").
+		Satisfies("Produces deadlock-risk findings for validation and grading.").
+		Avoid("Do not use during pre-implementation synthesis or as a replacement for broader criteria validation.").
 		ArrayParam("paths", "Paths to analyze (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)
@@ -191,6 +219,9 @@ func DetectMemoryLeaksSkill(runner *ToolRunner) *skills.Skill {
 		Domain("analysis").
 		Keywords("memory", "leak", "escape", "heap").
 		Priority(90).
+		Usage("Use in implementation-validation mode when the task risks unbounded growth, retention bugs, or performance regressions.").
+		Satisfies("Produces memory-behavior evidence for validation findings and quality grading.").
+		Avoid("Do not use during pre-implementation synthesis or as a stand-in for correctness validation.").
 		ArrayParam("paths", "Paths to analyze (default: ./...)", "string", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			paths := extractPaths(input)

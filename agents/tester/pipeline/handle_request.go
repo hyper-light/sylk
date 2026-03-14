@@ -16,6 +16,8 @@ func (pt *PipelineTester) HandleRequest(ctx context.Context, req *tester.TesterR
 	if req == nil {
 		return nil, nil
 	}
+	prevRuntime := pt.swapTaskRuntime(nil)
+	defer pt.restoreTaskRuntime(prevRuntime)
 
 	switch req.Intent {
 	case tester.IntentCreateTests:
@@ -39,6 +41,7 @@ func (pt *PipelineTester) runTests(ctx context.Context, req *tester.TesterReques
 		return nil, fmt.Errorf("run test suite: %w", err)
 	}
 	suiteResult := suiteResultFromExecution(execResult, startTime)
+	pt.setLastSuiteResult(suiteResult)
 
 	return &tester.TesterResponse{
 		ID:          uuid.New().String(),

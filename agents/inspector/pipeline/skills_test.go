@@ -161,9 +161,6 @@ func TestStageInstructions_InspectAvoidsValidationAndGradingTools(t *testing.T) 
 	instructions := stageInstructions(&agentShared.TaskExecutionContract{
 		Stage:             "inspect",
 		PreImplementation: true,
-		Deliverables: []agentShared.TaskExecutionDeliverable{
-			agentShared.TaskDeliverableCriteriaContract,
-		},
 	}, "inspect")
 
 	if strings.Contains(instructions, "validate_criteria") {
@@ -197,84 +194,6 @@ func TestPipelineInspectorDefaultToolDefinitionsExcludeValidationAndGradeTools(t
 	for _, blocked := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan", "prepare_pipeline_write_context", "write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory"} {
 		if containsName(names, blocked) {
 			t.Fatalf("default tool definitions unexpectedly exposed %q: %v", blocked, names)
-		}
-	}
-}
-
-func TestPipelineInspectorPreImplementationSurfaceExcludesValidationAndGradeTools(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() {
-		if pi.tools != nil {
-			pi.tools.Close()
-		}
-	})
-
-	task := &agentShared.PipelineTaskInput{
-		AgentType: "inspector-pipeline",
-		Context: map[string]any{
-			"pipeline_stage": "inspect",
-		},
-	}
-	contract := agentShared.BuildTaskExecutionContract(task)
-	surface, err := agentShared.TaskToolSurface(pi.toolRuntime(), contract, "inspector-pipeline")
-	if err != nil {
-		t.Fatalf("TaskToolSurface() error = %v", err)
-	}
-
-	names := toolDefinitionNames(pi.buildToolDefinitionsWithSurface(surface))
-	for _, blocked := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan"} {
-		if containsName(names, blocked) {
-			t.Fatalf("pre-implementation surface unexpectedly exposed %q: %v", blocked, names)
-		}
-	}
-	for _, want := range []string{"define_criteria", "get_validation_status", "read_workspace_file", "inspect_workspace_state"} {
-		if !containsName(names, want) {
-			t.Fatalf("pre-implementation surface missing %q: %v", want, names)
-		}
-	}
-	for _, blocked := range []string{"prepare_pipeline_write_context", "write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory"} {
-		if containsName(names, blocked) {
-			t.Fatalf("pre-implementation surface unexpectedly exposed workspace mutation tool %q: %v", blocked, names)
-		}
-	}
-}
-
-func TestPipelineInspectorImplementationValidationSurfaceIncludesValidationTools(t *testing.T) {
-	pi, err := New(shared.PipelineInspectorConfig{AgentID: "inspector-pipeline"}, nil)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() {
-		if pi.tools != nil {
-			pi.tools.Close()
-		}
-	})
-
-	task := &agentShared.PipelineTaskInput{
-		AgentType: "inspector-pipeline",
-		Context: map[string]any{
-			"pipeline_stage": "inspect",
-		},
-		ParentResults: map[string]any{
-			"engineer": map[string]any{
-				"state":  "succeeded",
-				"output": map[string]any{"summary": "implemented CLI entrypoint"},
-			},
-		},
-	}
-	contract := agentShared.BuildTaskExecutionContract(task)
-	surface, err := agentShared.TaskToolSurface(pi.toolRuntime(), contract, "inspector-pipeline")
-	if err != nil {
-		t.Fatalf("TaskToolSurface() error = %v", err)
-	}
-
-	names := toolDefinitionNames(pi.buildToolDefinitionsWithSurface(surface))
-	for _, want := range []string{"validate_criteria", "grade_task_quality", "run_linter", "run_type_checker", "run_security_scan"} {
-		if !containsName(names, want) {
-			t.Fatalf("implementation-validation surface missing %q: %v", want, names)
 		}
 	}
 }

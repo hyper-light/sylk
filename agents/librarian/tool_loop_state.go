@@ -180,7 +180,7 @@ func (s *toolLoopState) handleTextResponse(resp *providers.Response, turn int, t
 		return "", true, fmt.Errorf("librarian: LLM returned empty response after %d turns", turn)
 	}
 
-	s.librarian.recordTurn(s.req, resp, turn, 0, 0, turnStart)
+	s.librarian.recordTurn(s.ctx, s.req, resp, turn, 0, 0, turnStart)
 	if lm := shared.LogMetaFromContext(s.ctx); lm.EventLogger != nil {
 		shared.LogAgentEvent(lm.EventLogger, agentlog.EventGenerationCompleted,
 			lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -226,7 +226,7 @@ func (s *toolLoopState) handleToolLimit(resp *providers.Response, turn int, turn
 				lm.AgentID, lm.SessionID, lm.CorrID, "warn",
 				&agentlog.GenerationPayload{Phase: "completed_at_limit", ToolRuns: turn})
 		}
-		s.librarian.recordTurn(s.req, resp, turn, 0, 0, turnStart)
+		s.librarian.recordTurn(s.ctx, s.req, resp, turn, 0, 0, turnStart)
 		return content, true, nil
 	}
 
@@ -240,7 +240,7 @@ func (s *toolLoopState) handleToolLimit(resp *providers.Response, turn int, turn
 
 func (s *toolLoopState) executeToolCalls(resp *providers.Response, turn int, turnStart time.Time) (string, bool, error) {
 	errCount, rerouted := s.librarian.applyToolCalls(s.ctx, s.req, resp, turn, s.searchLedger)
-	s.librarian.recordTurn(s.req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+	s.librarian.recordTurn(s.ctx, s.req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 	if rerouted {
 		return "", true, skills.ErrRerouteRequested
 	}

@@ -72,6 +72,31 @@ func TestBuildToolDefinitions_UsesActiveSetNotRegistryLoading(t *testing.T) {
 	}
 }
 
+func TestCompileToolDescription_IncludesWorkflowMetadata(t *testing.T) {
+	skill := skills.NewSkill("write_test").
+		Description("Write a concrete test.").
+		Usage("Use after planning.").
+		Requirement("Prepare the output path first.").
+		Satisfies("Creates a test artifact.").
+		Avoid("Do not use for placeholders.").
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return nil, nil
+		}).
+		Build()
+
+	desc := compileToolDescription(skill, NewToolPolicy("write_test", EffectMutating, DomainFilesystem, ExecutionModeLocal))
+	for _, want := range []string{
+		"Use when: Use after planning.",
+		"Requirements: Prepare the output path first.",
+		"Satisfies: Creates a test artifact.",
+		"Avoid: Do not use for placeholders.",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("compiled description missing %q: %s", want, desc)
+		}
+	}
+}
+
 func TestRequestView_TransientActivationDoesNotMutateSharedActiveSet(t *testing.T) {
 	registry := skills.NewRegistry()
 	mustRegisterSkill(t, registry, newRuntimeTestSkill("visible_tool", "Visible tool"))

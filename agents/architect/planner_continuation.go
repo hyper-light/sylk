@@ -293,7 +293,7 @@ func (p *anthropicPlanner) executeContinuationRound(
 		"ctx_deadline", contextDeadlineString(lease.parent))
 	reqStart := time.Now()
 	var result *streamResult
-	err := lease.run(roundTimeout, false, func(roundCtx context.Context) error {
+	err := lease.run(roundTimeout, false, func(roundCtx context.Context, attemptTimeout time.Duration) error {
 		var innerErr error
 		result, innerErr = p.requestContinuation(
 			roundCtx,
@@ -351,7 +351,7 @@ func (p *anthropicPlanner) requestContinuation(
 		SystemPrompt: resolvedSystem,
 	}
 	p.applyStreamingRuntimeProfile(req, stage, 0, architectSessionIDFromContext(ctx))
-	return p.streamRequest(ctx, req, stage, onChunk)
+	return p.streamRequest(ctx, req, stage, p.timeout, onChunk)
 }
 
 // applyContinuationResult detects overlap, stitches net-new content, caches

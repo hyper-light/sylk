@@ -17,3 +17,18 @@ func TestLibrarianVisibleSkillsRemainDiskOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestNew_AllowsLLMModeWithoutSearchSystem(t *testing.T) {
+	agent, err := New(Config{
+		ID:               "lib-test",
+		EnableLLM:        true,
+		Model:            "test-model",
+		WorkingDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v, want nil", err)
+	}
+	if agent == nil {
+		t.Fatal("New() returned nil agent")
+	}
+}

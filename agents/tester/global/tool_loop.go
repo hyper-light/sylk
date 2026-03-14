@@ -10,8 +10,6 @@ import (
 
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -96,7 +94,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		gt.publishStreamChunk(ctx, agentshared.IntermediateToolTurnText(resp))
 
 		if len(resp.ToolCalls) == 0 {
-			gt.recordTurn(req, resp, turn, 0, 0, turnStart)
+			gt.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			if lm := agentshared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentshared.LogAgentEvent(lm.EventLogger, agentlog.EventSuiteCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -119,7 +117,7 @@ func (gt *GlobalTester) executeToolLoop(ctx context.Context, req *providers.Requ
 		}
 
 		errCount, rerouted := gt.applyToolCalls(ctx, req, resp)
-		gt.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		gt.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -251,6 +249,7 @@ func (gt *GlobalTester) buildToolDefinitions() []providers.Tool {
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
 func (gt *GlobalTester) recordTurn(
+	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	turn, toolCalls, errCount int,
@@ -259,22 +258,7 @@ func (gt *GlobalTester) recordTurn(
 	if gt.handoffBridge == nil {
 		return
 	}
-
-	gt.handoffBridge.RecordTurn(handoff.TurnRecord{
-		InputTokens:      resp.Usage.InputTokens,
-		OutputTokens:     resp.Usage.OutputTokens,
-		ContextSize:      agentshared.EstimateContextSize(req.Messages),
-		ToolCalls:        toolCalls,
-		ToolSuccesses:    toolCalls - errCount,
-		TurnNumber:       turn + 1,
-		Duration:         time.Since(turnStart),
-		Timestamp:        time.Now(),
-		Stage:            llmruntime.StageFromRequest(req),
-		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
-		StopReason:       resp.StopReason,
-		CacheReadTokens:  resp.Usage.CacheReadTokens,
-		CacheWriteTokens: resp.Usage.CacheWriteTokens,
-	})
+	gt.handoffBridge.RecordTurn(agentshared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }
 
 func (gt *GlobalTester) toolRuntime() *toolruntime.Runtime {

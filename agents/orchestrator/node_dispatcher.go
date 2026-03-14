@@ -52,6 +52,8 @@ type BusNodeDispatcher struct {
 	nodePods           sync.Map // nodeID → *shared.AgentPod
 	waitDispatchPermit func(context.Context, string, string) error
 	eventLogger        *agentlog.SessionEventLogger
+	lastActivity       sync.Map // nodeID → time.Time
+	activityGrace      time.Duration
 
 	// onACK is called when an agent ACKs a node dispatch. Optional.
 	onACK func(nodeID string, ack *ACKResult)
@@ -68,14 +70,15 @@ var _ dag.NodeDispatcher = (*BusNodeDispatcher)(nil)
 // no demotion guards). Both may be nil for test scenarios.
 func NewBusNodeDispatcher(bus guide.EventBus, agentID, sessionID, dagID string, buffers *BufferRegistry, activator guide.PodActivator, pod *shared.AgentPod) *BusNodeDispatcher {
 	return &BusNodeDispatcher{
-		bus:        bus,
-		agentID:    agentID,
-		sessionID:  sessionID,
-		dagID:      dagID,
-		buffers:    buffers,
-		activator:  activator,
-		pod:        pod,
-		ackTimeout: defaultACKTimeout,
+		bus:           bus,
+		agentID:       agentID,
+		sessionID:     sessionID,
+		dagID:         dagID,
+		buffers:       buffers,
+		activator:     activator,
+		pod:           pod,
+		ackTimeout:    defaultACKTimeout,
+		activityGrace: time.Minute,
 	}
 }
 
@@ -173,6 +176,8 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 
 	d.ackResults.Store(node.ID(), ack)
 	defer d.ackResults.Delete(node.ID())
+	d.RecordActivity(node.ID())
+	defer d.lastActivity.Delete(node.ID())
 
 	// Transition node to Acked — visible to health monitor and WAL.
 	node.SetState(dag.NodeStateAcked)
@@ -185,21 +190,79 @@ func (d *BusNodeDispatcher) Dispatch(ctx context.Context, node *dag.Node, parent
 		"ack_agent_type": ack.AgentType,
 	})
 
-	// Phase 2: Wait for result
-	select {
-	case result := <-ch:
-		if result != nil {
-			d.logNodeTrace(node, "dispatch_result_received", agentlog.EventNodeCompleted, map[string]any{
-				"result_state": result.State.String(),
+	// Phase 2: Wait for result. Once a node is acked, recent activity keeps the
+	// lease alive so an active worker is not duplicated solely due to the
+	// original dispatch deadline elapsing.
+	for {
+		select {
+		case result := <-ch:
+			if result != nil {
+				d.logNodeTrace(node, "dispatch_result_received", agentlog.EventNodeCompleted, map[string]any{
+					"result_state": result.State.String(),
+				})
+			}
+			return result, nil
+		case <-ctx.Done():
+			if !d.hasRecentActivity(node.ID()) {
+				d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
+					"error": ctx.Err().Error(),
+				})
+				return nil, ctx.Err()
+			}
+			d.logNodeTrace(node, "dispatch_context_lease_extended", agentlog.EventTaskDispatched, map[string]any{
+				"error":             ctx.Err().Error(),
+				"activity_grace_ms": d.activityGrace.Milliseconds(),
 			})
+			if result := d.waitForActivityOrResult(ch, node.ID(), node); result != nil {
+				return result, nil
+			}
+			d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
+				"error": ctx.Err().Error(),
+			})
+			return nil, ctx.Err()
 		}
-		return result, nil
-	case <-ctx.Done():
-		d.logNodeTrace(node, "dispatch_context_done", agentlog.EventError, map[string]any{
-			"error": ctx.Err().Error(),
-		})
-		return nil, ctx.Err()
 	}
+}
+
+func (d *BusNodeDispatcher) waitForActivityOrResult(ch <-chan *dag.NodeResult, nodeID string, node *dag.Node) *dag.NodeResult {
+	ticker := time.NewTicker(max(d.activityGrace/2, time.Second))
+	defer ticker.Stop()
+
+	for {
+		select {
+		case result := <-ch:
+			if result != nil {
+				d.logNodeTrace(node, "dispatch_result_received", agentlog.EventNodeCompleted, map[string]any{
+					"result_state": result.State.String(),
+				})
+			}
+			return result
+		case <-ticker.C:
+			if !d.hasRecentActivity(nodeID) {
+				return nil
+			}
+		}
+	}
+}
+
+func (d *BusNodeDispatcher) RecordActivity(nodeID string) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return
+	}
+	d.lastActivity.Store(nodeID, time.Now())
+}
+
+func (d *BusNodeDispatcher) hasRecentActivity(nodeID string) bool {
+	val, ok := d.lastActivity.Load(strings.TrimSpace(nodeID))
+	if !ok {
+		return false
+	}
+	ts, ok := val.(time.Time)
+	if !ok {
+		return false
+	}
+	return time.Since(ts) <= d.activityGrace
 }
 
 // dispatchAndWaitACK publishes the task dispatch and waits for ACK.
@@ -418,6 +481,9 @@ func (d *BusNodeDispatcher) buildDispatchMessage(node *dag.Node, parentResults m
 	}
 	if taskSlug != "" {
 		payload["task_slug"] = taskSlug
+	}
+	if targetAgentID := pipelineWorkerTargetAgentID(taskID, node.AgentType()); targetAgentID != "" && targetAgentID != node.AgentType() {
+		payload["target_agent_id"] = targetAgentID
 	}
 
 	if node.IsCompound() {

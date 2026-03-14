@@ -55,6 +55,9 @@ type Skill struct {
 	UsageDoc      string   `json:"usage_doc,omitempty"`
 	BestPractices []string `json:"best_practices,omitempty"`
 	Examples      []string `json:"examples,omitempty"`
+	Requirements  []string `json:"requirements,omitempty"`
+	Satisfies     []string `json:"satisfies,omitempty"`
+	Avoids        []string `json:"avoids,omitempty"`
 }
 
 // InputSchema defines the JSON Schema for skill inputs
@@ -207,6 +210,26 @@ func (b *Builder) Example(example string) *Builder {
 // BestPractice adds a best practice
 func (b *Builder) BestPractice(practice string) *Builder {
 	b.skill.BestPractices = append(b.skill.BestPractices, practice)
+	return b
+}
+
+// Requirement adds a workflow or input precondition the model should satisfy
+// before invoking the skill.
+func (b *Builder) Requirement(requirement string) *Builder {
+	b.skill.Requirements = append(b.skill.Requirements, requirement)
+	return b
+}
+
+// Satisfies adds a concise description of what invoking the skill proves or
+// advances in the surrounding workflow.
+func (b *Builder) Satisfies(outcome string) *Builder {
+	b.skill.Satisfies = append(b.skill.Satisfies, outcome)
+	return b
+}
+
+// Avoid adds guidance for situations where the skill should not be used.
+func (b *Builder) Avoid(advice string) *Builder {
+	b.skill.Avoids = append(b.skill.Avoids, advice)
 	return b
 }
 
@@ -427,6 +450,30 @@ func (s *Skill) ToMarkdown() string {
 		sb.WriteString("## Best Practices\n\n")
 		for i, bp := range s.BestPractices {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, bp))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(s.Requirements) > 0 {
+		sb.WriteString("## Requirements\n\n")
+		for i, requirement := range s.Requirements {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, requirement))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(s.Satisfies) > 0 {
+		sb.WriteString("## Satisfies\n\n")
+		for i, outcome := range s.Satisfies {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, outcome))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(s.Avoids) > 0 {
+		sb.WriteString("## Avoid\n\n")
+		for i, advice := range s.Avoids {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, advice))
 		}
 		sb.WriteString("\n")
 	}

@@ -363,6 +363,7 @@ type AtomicTask struct {
 	RiskFactors         []string
 	Workspace           TaskWorkspaceSpec
 	WorkerPackets       []WorkerPacket
+	ExecutionContracts  []AgentExecutionContract
 
 	// Co-tenancy fields for compound node dispatch.
 	CoAgents          []string
@@ -421,6 +422,15 @@ type WorkerPacket struct {
 	WriteSet            []string              `json:"write_set,omitempty"`
 	Guidelines          []string              `json:"guidelines,omitempty"`
 	TestRequirements    []string              `json:"test_requirements,omitempty"`
+}
+
+// AgentExecutionContract is the stage/worker contract the Architect emits for
+// each runtime agent participating in the task pipeline. It declares the
+// explicit intents and deliverables the downstream worker should satisfy.
+type AgentExecutionContract struct {
+	AgentType    string   `json:"agent_type"`
+	Intents      []string `json:"intents,omitempty"`
+	Deliverables []string `json:"deliverables,omitempty"`
 }
 
 // TaskExample provides a concrete code or pattern example for the task.
@@ -604,27 +614,28 @@ type PlanHandoff struct {
 // Mirrors AtomicTask but uses JSON tags for clean serialization and
 // includes all rich specification fields.
 type HandoffTask struct {
-	ID                  string                `json:"id"`
-	Slug                string                `json:"slug,omitempty"`
-	Name                string                `json:"name"`
-	Description         string                `json:"description"`
-	AgentType           string                `json:"agent_type"`
-	Dependencies        []string              `json:"dependencies"`
-	EstimatedTokens     int                   `json:"estimated_tokens"`
-	Complexity          string                `json:"complexity"`
-	Priority            int                   `json:"priority"`
-	SuccessCriteria     []string              `json:"success_criteria"`
-	AcceptanceCriteria  []AcceptanceCriterion `json:"acceptance_criteria,omitempty"`
-	Guidelines          []string              `json:"guidelines,omitempty"`
-	ImplementationGuide string                `json:"implementation_guide,omitempty"`
-	Examples            []TaskExample         `json:"examples,omitempty"`
-	AffectedFiles       []TaskFileTarget      `json:"affected_files,omitempty"`
-	TestRequirements    []string              `json:"test_requirements,omitempty"`
-	RiskFactors         []string              `json:"risk_factors,omitempty"`
-	Workspace           TaskWorkspaceSpec     `json:"workspace,omitempty"`
-	WorkerPackets       []WorkerPacket        `json:"worker_packets,omitempty"`
-	CoAgents            []string              `json:"co_agents,omitempty"`
-	CollaborationMode   string                `json:"collaboration_mode,omitempty"`
-	MaxReviewRounds     int                   `json:"max_review_rounds,omitempty"`
-	AgentScopes         []AgentScope          `json:"agent_scopes,omitempty"`
+	ID                  string                   `json:"id"`
+	Slug                string                   `json:"slug,omitempty"`
+	Name                string                   `json:"name"`
+	Description         string                   `json:"description"`
+	AgentType           string                   `json:"agent_type"`
+	Dependencies        []string                 `json:"dependencies"`
+	EstimatedTokens     int                      `json:"estimated_tokens"`
+	Complexity          string                   `json:"complexity"`
+	Priority            int                      `json:"priority"`
+	SuccessCriteria     []string                 `json:"success_criteria"`
+	AcceptanceCriteria  []AcceptanceCriterion    `json:"acceptance_criteria,omitempty"`
+	Guidelines          []string                 `json:"guidelines,omitempty"`
+	ImplementationGuide string                   `json:"implementation_guide,omitempty"`
+	Examples            []TaskExample            `json:"examples,omitempty"`
+	AffectedFiles       []TaskFileTarget         `json:"affected_files,omitempty"`
+	TestRequirements    []string                 `json:"test_requirements,omitempty"`
+	RiskFactors         []string                 `json:"risk_factors,omitempty"`
+	Workspace           TaskWorkspaceSpec        `json:"workspace,omitempty"`
+	WorkerPackets       []WorkerPacket           `json:"worker_packets,omitempty"`
+	ExecutionContracts  []AgentExecutionContract `json:"execution_contracts,omitempty"`
+	CoAgents            []string                 `json:"co_agents,omitempty"`
+	CollaborationMode   string                   `json:"collaboration_mode,omitempty"`
+	MaxReviewRounds     int                      `json:"max_review_rounds,omitempty"`
+	AgentScopes         []AgentScope             `json:"agent_scopes,omitempty"`
 }

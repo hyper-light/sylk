@@ -423,7 +423,7 @@ func TestExecutor_FailFast(t *testing.T) {
 	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
-	require.NoError(t, err)
+	require.Error(t, err)
 	// DAG should fail or be cancelled (fail fast cancels remaining)
 	assert.True(t, result.State == dag.DAGStateFailed || result.State == dag.DAGStateCancelled,
 		"Expected DAG to fail or be cancelled, got %s", result.State)
@@ -448,13 +448,60 @@ func TestExecutor_ContinueOnFailure(t *testing.T) {
 	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
-	require.NoError(t, err)
+	require.Error(t, err)
 	// DAG should fail (at least one node failed)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
-	// At least one node failed (node-1)
-	assert.GreaterOrEqual(t, result.NodesFailed, 1)
+	// The failed node and its blocked dependent should both count as failed.
+	assert.Equal(t, 2, result.NodesFailed)
+	assert.Equal(t, 0, result.NodesSkipped)
+	assert.Equal(t, dag.NodeStateFailed, result.NodeResults["node-1"].State)
+	assert.Equal(t, dag.NodeStateBlocked, result.NodeResults["node-3"].State)
 	// Total nodes processed should equal node count
 	assert.Equal(t, 3, result.NodesSucceeded+result.NodesFailed+result.NodesSkipped)
+}
+
+func TestExecutor_BlockedNodeEmitsFailedEvent(t *testing.T) {
+	d, _ := dag.NewBuilder("blocked-events").
+		WithPolicy(dag.ExecutionPolicy{
+			FailurePolicy:  dag.FailurePolicyContinue,
+			MaxConcurrency: 1,
+		}).
+		AddNode(dag.NodeConfig{ID: "node-1"}).
+		AddNode(dag.NodeConfig{ID: "node-2", Dependencies: []string{"node-1"}}).
+		Build()
+
+	dispatcher := newMockDispatcher()
+	dispatcher.setFail("node-1")
+
+	executor := dag.NewExecutor(d.Policy(), nil)
+
+	var eventTypes []dag.EventType
+	var mu sync.Mutex
+	executor.Subscribe(func(e *dag.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		if e.NodeID == "" {
+			return
+		}
+		eventTypes = append(eventTypes, e.Type)
+	})
+
+	result, err := executor.Execute(context.Background(), d, dispatcher)
+
+	require.Error(t, err)
+	assert.Equal(t, dag.DAGStateFailed, result.State)
+	assert.Equal(t, dag.NodeStateBlocked, result.NodeResults["node-2"].State)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	failedEvents := 0
+	for _, eventType := range eventTypes {
+		if eventType == dag.EventNodeFailed {
+			failedEvents++
+		}
+	}
+	assert.Equal(t, 2, failedEvents)
 }
 
 func TestExecutor_Cancel(t *testing.T) {
@@ -703,7 +750,7 @@ func TestExecutor_Timeout(t *testing.T) {
 	executor := dag.NewExecutor(d.Policy(), nil)
 	result, err := executor.Execute(context.Background(), d, dispatcher)
 
-	require.NoError(t, err)
+	require.Error(t, err)
 	assert.Equal(t, dag.DAGStateFailed, result.State)
 	assert.GreaterOrEqual(t, result.NodesFailed, 1)
 }

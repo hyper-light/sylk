@@ -23,6 +23,10 @@ func analyzeBatchSkill(gt *GlobalTester) *skills.Skill {
 		Domain("testing").
 		Keywords("batch", "context", "pipeline", "collect", "analyze").
 		Priority(95).
+		Usage("Use first when the global task depends on multiple completed pipelines or cross-pipeline context. It assembles the concrete surface the rest of the global testing work should reason over.").
+		Requirement("Provide the relevant pipeline IDs and any already-known changed files or task specs so later planning stays grounded in the actual batch.").
+		Satisfies("Produces the shared batch context needed for integration-risk analysis, harness planning, and global validation reporting.").
+		Avoid("Do not skip it and reason from memory when the request depends on multiple pipelines or accumulated task artifacts.").
 		ArrayParam("pipeline_ids", "IDs of completed pipelines to analyze", "string", true).
 		ArrayParam("changed_files", "Files changed across all pipelines", "string", false).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
@@ -61,6 +65,10 @@ func analyzeIntegrationRisksSkill() *skills.Skill {
 		Domain("testing").
 		Keywords("integration", "risk", "cross-pipeline", "shared state", "API contract").
 		Priority(95).
+		Usage("Use after assembling the relevant batch context or whenever a global task asks for integration, system, or cross-pipeline risk analysis.").
+		Requirement("Provide the concrete changed files and, when possible, the relevant pipeline IDs or focus areas so the analysis stays scoped to the actual request.").
+		Satisfies("Produces cross-pipeline risk evidence that should shape integration plans, harness work, execution, and escalation.").
+		Avoid("Do not stop here when the request still requires authored global tests, execution evidence, or an escalation report.").
 		ArrayParam("changed_files", "Files changed across pipelines", "string", true).
 		ArrayParam("pipeline_ids", "Relevant pipeline IDs", "string", false).
 		ArrayParam("focus_areas", "Specific risk areas to focus on", "string", false).
@@ -89,6 +97,10 @@ func planIntegrationTestsSkill() *skills.Skill {
 		Domain("testing").
 		Keywords("plan", "integration", "strategy", "test plan").
 		Priority(90).
+		Usage("Use when the task needs an integration-test plan grounded in identified system risks and shared behavior boundaries.").
+		Requirement("Prefer to supply concrete risk areas or an already assembled batch context so the resulting plan maps to real integration concerns.").
+		Satisfies("Produces an integration test plan that can guide global write tools, harness work, and downstream execution.").
+		Avoid("Do not treat the plan as completion when the requested deliverable still requires authored tests or suite execution.").
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
@@ -114,6 +126,10 @@ func planE2ETestsSkill() *skills.Skill {
 		Domain("testing").
 		Keywords("plan", "e2e", "end-to-end", "strategy", "test plan").
 		Priority(90).
+		Usage("Use when the request calls for user-flow, end-to-end, or full-system scenario planning rather than narrow integration edges alone.").
+		Requirement("Supply the known risk areas and harness needs so the E2E plan reflects realistic flows and environment constraints.").
+		Satisfies("Produces the end-to-end test plan that should drive harness preparation, authored scenarios, and global execution.").
+		Avoid("Do not substitute this plan for actually writing or running the requested global tests.").
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
@@ -141,6 +157,10 @@ func buildHarnessSkill(gt *GlobalTester) *skills.Skill {
 		Domain("testing").
 		Keywords("harness", "fixture", "mock", "infrastructure", "setup").
 		Priority(88).
+		Usage("Use when the global task requires reusable integration or end-to-end infrastructure before authored tests or execution can succeed.").
+		Requirement("Detect the harness needs first and prepare leased write contexts separately for any files this harness work will materialize.").
+		Satisfies("Produces reusable harness state and the concrete infrastructure plan needed for global test authoring and execution.").
+		Avoid("Do not treat it as a direct file mutation step; actual harness files still belong to the leased global write tools.").
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
 			var p params
 			if err := json.Unmarshal(input, &p); err != nil {
@@ -188,6 +208,10 @@ func reportToOrchestratorSkill(gt *GlobalTester) *skills.Skill {
 		Domain("testing").
 		Keywords("report", "orchestrator", "escalate", "pause").
 		Priority(85).
+		Usage("Use when a global testing result proves a systemic failure that should pause new work or trigger orchestration-level intervention.").
+		Requirement("Requires a real failure signal, concrete root cause, confidence level, and affected task scope.").
+		Satisfies("Publishes a durable orchestrator escalation that can pause further work and preserve the diagnosis context.").
+		Avoid("Do not use for speculative concerns or local issues that do not warrant orchestration-level intervention.").
 		StringParam("test_name", "Name of the failing test", true).
 		FloatParam("confidence", "Confidence in the diagnosis (0-1)", true).
 		BoolParam("is_product_bug", "Whether the failure is a product bug", true).
@@ -238,6 +262,10 @@ func reportToArchitectSkill(gt *GlobalTester) *skills.Skill {
 		Domain("testing").
 		Keywords("report", "architect", "plan", "modification").
 		Priority(85).
+		Usage("Use when a global testing result shows the current plan, architecture, or sequencing should be reconsidered.").
+		Requirement("Requires a real diagnosis with root cause, confidence, suggested fix, and affected task scope.").
+		Satisfies("Publishes a plan-level escalation the Architect can use to adjust workflow, dependencies, or design direction.").
+		Avoid("Do not use when the finding is purely local implementation debt that should go straight to an engineer or designer fix path.").
 		StringParam("test_name", "Name of the failing test", true).
 		FloatParam("confidence", "Confidence in the diagnosis (0-1)", true).
 		BoolParam("is_product_bug", "Whether the failure is a product bug", true).
@@ -292,6 +320,10 @@ func escalateFailureSkill(gt *GlobalTester) *skills.Skill {
 		Domain("testing").
 		Keywords("escalate", "failure", "critical", "orchestrator", "architect").
 		Priority(95).
+		Usage("Use only for critical global failures that require both orchestration control and plan-level correction.").
+		Requirement("Requires a high-confidence systemic diagnosis with a concrete root cause, suggested fix, and affected task scope.").
+		Satisfies("Creates the combined orchestrator-plus-architect escalation for severe global failures.").
+		Avoid("Do not use when a single-target report is sufficient or when the evidence is still tentative.").
 		StringParam("test_name", "Name of the failing test", true).
 		FloatParam("confidence", "Confidence in the diagnosis (0-1)", true).
 		BoolParam("is_product_bug", "Whether the failure is a product bug", true).

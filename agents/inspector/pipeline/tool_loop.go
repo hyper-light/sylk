@@ -11,8 +11,6 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -99,8 +97,22 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 		agentShared.PublishIntermediateToolTurn(pi.bus, pi.channels, ctx, pi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
+			if err := agentShared.ValidatePipelineProtocolCompletion(ctx, "inspector-pipeline"); err != nil {
+				pi.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
+				req.Messages = append(req.Messages, providers.Message{
+					Role:     providers.RoleAssistant,
+					Content:  strings.TrimSpace(resp.Content),
+					Metadata: resp.ProviderMetadata,
+				})
+				req.Messages = append(req.Messages, providers.Message{
+					Role: providers.RoleUser,
+					Content: err.Error() +
+						"\nUse the pipeline protocol now. If you are still evaluating a peer response, call process_validation first and then select the next handoff.",
+				})
+				continue
+			}
 			if err := agentShared.ValidateTaskExecutionCompletion(ctx, "inspector-pipeline"); err != nil {
-				pi.recordTurn(req, resp, turn, 0, 1, turnStart)
+				pi.recordTurn(ctx, req, resp, turn, 0, 1, turnStart)
 				if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 					agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventError,
 						lm.AgentID, lm.SessionID, lm.CorrID, "warn",
@@ -118,7 +130,7 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 				})
 				continue
 			}
-			pi.recordTurn(req, resp, turn, 0, 0, turnStart)
+			pi.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventValidationResult,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -141,7 +153,7 @@ func (pi *PipelineInspector) executeToolLoopWithSurface(
 		}
 
 		errCount, rerouted := pi.applyToolCalls(ctx, req, resp, surface)
-		pi.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		pi.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -269,7 +281,7 @@ func (pi *PipelineInspector) executeToolCallWithSurface(
 		CapabilityScope: surface.CapabilityScope(),
 	})
 	if err == nil {
-		agentShared.RecordTaskExecutionSuccess(ctx, name, input)
+		agentShared.RecordTaskExecutionSuccess(ctx, name, input, result.Output)
 	}
 	return result, err
 }
@@ -334,6 +346,7 @@ func (pi *PipelineInspector) toolInvocationsWithSurface(
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
 func (pi *PipelineInspector) recordTurn(
+	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	turn, toolCalls, errCount int,
@@ -342,20 +355,5 @@ func (pi *PipelineInspector) recordTurn(
 	if pi.handoffBridge == nil {
 		return
 	}
-
-	pi.handoffBridge.RecordTurn(handoff.TurnRecord{
-		InputTokens:      resp.Usage.InputTokens,
-		OutputTokens:     resp.Usage.OutputTokens,
-		ContextSize:      agentShared.EstimateContextSize(req.Messages),
-		ToolCalls:        toolCalls,
-		ToolSuccesses:    toolCalls - errCount,
-		TurnNumber:       turn + 1,
-		Duration:         time.Since(turnStart),
-		Timestamp:        time.Now(),
-		Stage:            llmruntime.StageFromRequest(req),
-		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
-		StopReason:       resp.StopReason,
-		CacheReadTokens:  resp.Usage.CacheReadTokens,
-		CacheWriteTokens: resp.Usage.CacheWriteTokens,
-	})
+	pi.handoffBridge.RecordTurn(agentShared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

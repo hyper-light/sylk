@@ -771,6 +771,7 @@ func (he *HandoffExecutor) attemptHandoff(
 			"handoff_time":    transfer.CreatedAt.Format(time.RFC3339),
 		},
 	}
+	applyPreparedContextSessionMetadata(transfer.PreparedContext, sessionConfig.Metadata)
 
 	// Create new session
 	creationStart := time.Now()
@@ -801,6 +802,24 @@ func (he *HandoffExecutor) attemptHandoff(
 	}
 
 	return newSessionID, nil
+}
+
+func applyPreparedContextSessionMetadata(preparedCtx *PreparedContext, metadata map[string]interface{}) {
+	if preparedCtx == nil || metadata == nil {
+		return
+	}
+	for _, key := range []string{
+		"agent_type",
+		"agent_id",
+		"session_id",
+		"pipeline_id",
+		"task_id",
+		"task_slug",
+	} {
+		if value, ok := preparedCtx.GetMetadata(key); ok && value != "" {
+			metadata[key] = value
+		}
+	}
 }
 
 // performRollback attempts to rollback a failed handoff.

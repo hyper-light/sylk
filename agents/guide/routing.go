@@ -35,6 +35,10 @@ type AgentRoutingInfo struct {
 	Type string `json:"type"`
 	Name string `json:"name"`
 
+	// Optional pod identity for task-scoped or multi-instance workers.
+	// This lets Guide reactivate a concrete worker by its real agent ID.
+	PodID string `json:"pod_id,omitempty"`
+
 	// DSL aliases (e.g., "arch" -> "archivalist")
 	// Maps short alias to full agent name
 	Aliases []string `json:"aliases,omitempty"`

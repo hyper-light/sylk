@@ -309,6 +309,11 @@ func newPrepareWriteContextSkill(
 		Domain("filesystem").
 		Keywords("workspace", "prepare", "write", "context", "disk", "global", "pipeline").
 		Priority(93).
+		Usage(prepareWriteContextUsage(scope)).
+		Requirement(prepareWriteContextRequirement(scope)).
+		Satisfies(prepareWriteContextOutcome(scope)).
+		Avoid(prepareWriteContextAvoid(scope)).
+		BestPractice(prepareWriteContextBestPractice(scope)).
 		StringParam("path", "Target file path to inspect before writing", true).
 		StringParam("pipeline_id", "Task pipeline ID when preparing pipeline-local writes", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -354,6 +359,11 @@ func newWriteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrit
 		Domain("filesystem").
 		Keywords("write", string(scope), "file", "workspace", "vfs", "basis").
 		Priority(94).
+		Usage(writeFileUsage(scope)).
+		Requirement(writeFileRequirement(scope)).
+		Satisfies(writeFileOutcome(scope)).
+		Avoid(writeFileAvoid(scope)).
+		BestPractice(sharedWriteToolBestPractice()).
 		StringParam("path", "File path to write inside the allowed workspace layer", true).
 		StringParam("content", "Full file content to write", true).
 		ObjectParam("basis", "Write basis returned by the matching prepare_*_write_context skill.", workspaceWriteBasisProperties(), true).
@@ -402,6 +412,11 @@ func newEditFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWrite
 		Domain("filesystem").
 		Keywords("edit", string(scope), "file", "workspace", "vfs", "basis").
 		Priority(93).
+		Usage(editFileUsage(scope)).
+		Requirement(editFileRequirement(scope)).
+		Satisfies(editFileOutcome(scope)).
+		Avoid(editFileAvoid(scope)).
+		BestPractice(sharedWriteToolBestPractice()).
 		StringParam("path", "File path to edit inside the allowed workspace layer", true).
 		ArrayParam("edits", "Search/replace edits to apply", "object", true).
 		ObjectParam("basis", "Write basis returned by the matching prepare_*_write_context skill.", workspaceWriteBasisProperties(), true).
@@ -451,6 +466,10 @@ func newDeleteFileSkill(name string, scope WorkspaceWriteScope, cfg WorkspaceWri
 		Domain("filesystem").
 		Keywords("delete", "remove", string(scope), "file", "workspace", "basis").
 		Priority(92).
+		Usage(deleteFileUsage(scope)).
+		Requirement(deleteFileRequirement(scope)).
+		Satisfies(deleteFileOutcome(scope)).
+		Avoid(deleteFileAvoid(scope)).
 		StringParam("path", "File path to delete inside the allowed workspace layer", true).
 		ObjectParam("basis", "Write basis returned by the matching prepare_*_write_context skill.", workspaceWriteBasisProperties(), true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -494,6 +513,10 @@ func newCreateDirectorySkill(name string, scope WorkspaceWriteScope, cfg Workspa
 		Domain("filesystem").
 		Keywords("mkdir", "directory", string(scope), "workspace", "basis").
 		Priority(92).
+		Usage(createDirectoryUsage(scope)).
+		Requirement(createDirectoryRequirement(scope)).
+		Satisfies(createDirectoryOutcome(scope)).
+		Avoid(createDirectoryAvoid(scope)).
 		StringParam("path", "Directory path to create inside the allowed workspace layer", true).
 		ObjectParam("basis", "Write basis returned by the matching prepare_*_write_context skill for the target directory path.", workspaceWriteBasisProperties(), true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -556,6 +579,157 @@ func prepareWriteContextDescription(scope WorkspaceWriteScope) string {
 		return "Read disk, global, and pipeline state for one target path before mutating the pipeline VFS. Returns a write basis plus diffs so the agent can reason about committed versus in-progress state explicitly."
 	}
 	return "Read disk and global state for one target path before mutating the global VFS. Returns a write basis plus diffs so the agent can reason about committed versus in-progress state explicitly."
+}
+
+func prepareWriteContextUsage(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Call before the first pipeline-local write, edit, delete, or directory creation for a path. Re-run only when the lease expires, the tool returns a refreshed next_basis, or you intentionally switch to a different target path."
+	}
+	return "Call before the first global write, edit, delete, or directory creation for a path. Re-run only when the lease expires, the tool returns a refreshed next_basis, or you intentionally switch to a different target path."
+}
+
+func prepareWriteContextRequirement(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Use the concrete target path you plan to mutate in the pipeline workspace. For new files, use the intended output path even if it does not exist yet."
+	}
+	return "Use the concrete target path you plan to mutate in the global workspace. For new files, use the intended output path even if it does not exist yet."
+}
+
+func prepareWriteContextOutcome(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Produces a leased pipeline write basis plus relevant diffs for the target path."
+	}
+	return "Produces a leased global write basis plus relevant diffs for the target path."
+}
+
+func prepareWriteContextAvoid(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Do not call speculatively for many paths you may never mutate. Prepare the concrete pipeline target when you are ready to write."
+	}
+	return "Do not call speculatively for many paths you may never mutate. Prepare the concrete global target when you are ready to write."
+}
+
+func prepareWriteContextBestPractice(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Carry the returned basis into the first mutation, then keep reusing next_basis for follow-up writes to the same pipeline path while the lease remains active."
+	}
+	return "Carry the returned basis into the first mutation, then keep reusing next_basis for follow-up writes to the same global path while the lease remains active."
+}
+
+func sharedWriteToolBestPractice() string {
+	return "When the tool returns next_basis, feed it into the next mutation on the same path instead of immediately repreparing."
+}
+
+func writeFileUsage(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Use for full-file creation or replacement after prepare_pipeline_write_context. This is the concrete mutation step after planning."
+	}
+	return "Use for full-file creation or replacement after prepare_global_write_context. This is the concrete mutation step after planning."
+}
+
+func writeFileRequirement(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Requires a fresh or still-leased basis from prepare_pipeline_write_context for the same target path."
+	}
+	return "Requires a fresh or still-leased basis from prepare_global_write_context for the same target path."
+}
+
+func writeFileOutcome(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Creates or overwrites the pipeline-local file and returns next_basis for the same path."
+	}
+	return "Creates or overwrites the global file and returns next_basis for the same path."
+}
+
+func writeFileAvoid(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Do not use for small targeted edits when edit_pipeline_file expresses the change more precisely."
+	}
+	return "Do not use for small targeted edits when edit_global_file expresses the change more precisely."
+}
+
+func editFileUsage(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Use when you know the specific search/replace edits needed for an existing pipeline file and want a narrower mutation than a full rewrite."
+	}
+	return "Use when you know the specific search/replace edits needed for an existing global file and want a narrower mutation than a full rewrite."
+}
+
+func editFileRequirement(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Requires a fresh or still-leased basis from prepare_pipeline_write_context for the same target path."
+	}
+	return "Requires a fresh or still-leased basis from prepare_global_write_context for the same target path."
+}
+
+func editFileOutcome(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Applies targeted edits to the pipeline-local file and returns next_basis for continued work."
+	}
+	return "Applies targeted edits to the global file and returns next_basis for continued work."
+}
+
+func editFileAvoid(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Do not use for brand-new files or when you cannot describe the desired edits precisely."
+	}
+	return "Do not use for brand-new files or when you cannot describe the desired edits precisely."
+}
+
+func deleteFileUsage(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Use to remove a pipeline-local file after inspecting the workspace state and confirming the deletion is in scope."
+	}
+	return "Use to remove a global file after inspecting the workspace state and confirming the deletion is in scope."
+}
+
+func deleteFileRequirement(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Requires a fresh or still-leased basis from prepare_pipeline_write_context for the same target path."
+	}
+	return "Requires a fresh or still-leased basis from prepare_global_write_context for the same target path."
+}
+
+func deleteFileOutcome(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Deletes the pipeline-local file and returns refreshed path state."
+	}
+	return "Deletes the global file and returns refreshed path state."
+}
+
+func deleteFileAvoid(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Do not use as a substitute for cleaning generated output unless the task explicitly requires deleting that pipeline path."
+	}
+	return "Do not use as a substitute for cleaning generated output unless the task explicitly requires deleting that global path."
+}
+
+func createDirectoryUsage(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Use to create the concrete pipeline directory structure needed before writing nested files."
+	}
+	return "Use to create the concrete global directory structure needed before writing nested files."
+}
+
+func createDirectoryRequirement(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Requires a fresh or still-leased basis for the target directory path or a child path that can be rebound safely."
+	}
+	return "Requires a fresh or still-leased basis for the target directory path or a child path that can be rebound safely."
+}
+
+func createDirectoryOutcome(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Creates the pipeline-local directory and returns refreshed basis metadata when available."
+	}
+	return "Creates the global directory and returns refreshed basis metadata when available."
+}
+
+func createDirectoryAvoid(scope WorkspaceWriteScope) string {
+	if scope == WorkspaceWriteScopePipeline {
+		return "Do not call repeatedly for the same directory if it already exists; proceed to the file writes instead."
+	}
+	return "Do not call repeatedly for the same directory if it already exists; proceed to the file writes instead."
 }
 
 func writeFileDescription(scope WorkspaceWriteScope) string {

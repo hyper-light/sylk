@@ -1471,6 +1471,9 @@ func (a *Academic) Terminate(ctx context.Context) error {
 // SetHandoffBridge assigns the handoff bridge for this agent.
 func (a *Academic) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	a.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(a.activityPub)
+	}
 }
 
 // SetFetchPipeline wires the external fetch pipeline for web research.

@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/purevfs"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -179,41 +178,5 @@ func TestRunCommandWrapsDiskWorkspaceReadOnly(t *testing.T) {
 	result := e.skills.Invoke(context.Background(), "run_command", input)
 	if !result.Success {
 		t.Fatalf("run_command error = %v", result.Error)
-	}
-}
-
-func TestEngineerTaskToolSurfaceIncludesPipelineWriteTools(t *testing.T) {
-	e, err := New(Config{}, nil)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() {
-		if e.tools != nil {
-			e.tools.Close()
-		}
-	})
-
-	contract := shared.BuildTaskExecutionContract(&shared.PipelineTaskInput{
-		TaskID:    "task-1",
-		AgentType: "engineer",
-		Context: map[string]any{
-			"affected_files": []map[string]any{
-				{"path": "src/hello_cli/cli.py", "operation": "create"},
-			},
-		},
-	})
-	surface, err := shared.TaskToolSurface(e.toolRuntime(), contract, "engineer")
-	if err != nil {
-		t.Fatalf("TaskToolSurface() error = %v", err)
-	}
-
-	names := map[string]struct{}{}
-	for _, tool := range e.buildToolDefinitionsWithSurface(surface) {
-		names[tool.Name] = struct{}{}
-	}
-	for _, want := range []string{"prepare_pipeline_write_context", "write_pipeline_file", "edit_pipeline_file"} {
-		if _, ok := names[want]; !ok {
-			t.Fatalf("task surface missing %q: %v", want, names)
-		}
 	}
 }

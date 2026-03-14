@@ -3,8 +3,7 @@ package dag
 import (
 	"context"
 	"errors"
-	"slices"
-	"strings"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,7 +78,17 @@ func (e *Executor) Execute(ctx context.Context, dag *DAG, dispatcher NodeDispatc
 
 	result := e.executeLayers()
 	e.emitCompletionEvent(dag, result)
-	return result, nil
+	return result, executionError(result)
+}
+
+func executionError(result *DAGResult) error {
+	if result == nil {
+		return nil
+	}
+	if result.Error == nil {
+		return nil
+	}
+	return result.Error
 }
 
 func (e *Executor) validateExecution(dag *DAG) error {
@@ -707,6 +716,7 @@ func (e *Executor) emitNodeResultEvent(node *Node, result *NodeResult) {
 var nodeStateToEventType = map[NodeState]EventType{
 	NodeStateSucceeded: EventNodeCompleted,
 	NodeStateFailed:    EventNodeFailed,
+	NodeStateBlocked:   EventNodeFailed,
 	NodeStateSkipped:   EventNodeSkipped,
 	NodeStateCancelled: EventNodeCancelled,
 }
@@ -785,9 +795,9 @@ func (e *Executor) tallyNodeResult(result *DAGResult, nodeResult *NodeResult) {
 	switch nodeResult.State {
 	case NodeStateSucceeded:
 		result.NodesSucceeded++
-	case NodeStateFailed:
+	case NodeStateFailed, NodeStateBlocked:
 		result.NodesFailed++
-	case NodeStateSkipped, NodeStateBlocked, NodeStateCancelled:
+	case NodeStateSkipped, NodeStateCancelled:
 		result.NodesSkipped++
 	}
 }
@@ -807,21 +817,23 @@ func (e *Executor) applyResultState(result *DAGResult) {
 }
 
 func buildNodeFailureError(nodeResults map[string]*NodeResult) error {
-	msgs := make([]string, 0, len(nodeResults))
+	errs := make([]error, 0, len(nodeResults))
 	for _, nr := range nodeResults {
 		if nr.State == NodeStateFailed {
-			msgs = append(msgs, nodeFailureMsg(nr))
+			errs = append(errs, wrapNodeFailure(nr))
 		}
 	}
-	slices.Sort(msgs)
-	return errors.New(strings.Join(msgs, "; "))
+	if len(errs) == 0 {
+		return errors.New("dag failed")
+	}
+	return errors.Join(errs...)
 }
 
-func nodeFailureMsg(nr *NodeResult) string {
+func wrapNodeFailure(nr *NodeResult) error {
 	if nr.Error != nil {
-		return nr.NodeID + ": " + nr.Error.Error()
+		return fmt.Errorf("%s: %w", nr.NodeID, nr.Error)
 	}
-	return nr.NodeID + ": unknown error"
+	return fmt.Errorf("%s: unknown error", nr.NodeID)
 }
 
 func (e *Executor) Cancel() error {

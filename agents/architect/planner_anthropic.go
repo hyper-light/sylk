@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -449,9 +450,9 @@ func (p *anthropicPlanner) requestTextOnce(
 ) (*streamResult, error) {
 	lease := newPlannerRequestLease(ctx, p, stage)
 	var result *streamResult
-	err := lease.run(p.timeout, false, func(reqCtx context.Context) error {
+	err := lease.run(p.timeout, false, func(reqCtx context.Context, attemptTimeout time.Duration) error {
 		var innerErr error
-		result, innerErr = p.requestTextStreamingOnce(reqCtx, prompt, maxTokens, system, stage, nil)
+		result, innerErr = p.requestTextStreamingOnceWithTimeout(reqCtx, prompt, maxTokens, system, stage, attemptTimeout, nil)
 		return innerErr
 	})
 	return result, err
@@ -510,9 +511,9 @@ func (p *anthropicPlanner) requestTextStreamingOnceWithLease(
 	onChunk func(string),
 ) (*streamResult, error) {
 	var result *streamResult
-	err := lease.run(p.timeout, onChunk != nil, func(reqCtx context.Context) error {
+	err := lease.run(p.timeout, onChunk != nil, func(reqCtx context.Context, attemptTimeout time.Duration) error {
 		var innerErr error
-		result, innerErr = p.requestTextStreamingOnce(reqCtx, prompt, maxTokens, system, stage, onChunk)
+		result, innerErr = p.requestTextStreamingOnceWithTimeout(reqCtx, prompt, maxTokens, system, stage, attemptTimeout, onChunk)
 		return innerErr
 	})
 	return result, err
@@ -526,6 +527,18 @@ func (p *anthropicPlanner) requestTextStreamingOnce(
 	stage string,
 	onChunk func(string),
 ) (*streamResult, error) {
+	return p.requestTextStreamingOnceWithTimeout(ctx, prompt, maxTokens, system, stage, p.timeout, onChunk)
+}
+
+func (p *anthropicPlanner) requestTextStreamingOnceWithTimeout(
+	ctx context.Context,
+	prompt string,
+	maxTokens int,
+	system string,
+	stage string,
+	timeout time.Duration,
+	onChunk func(string),
+) (*streamResult, error) {
 	resolvedSystem := p.resolveSystemPrompt(system)
 	req := &providers.Request{
 		Messages: []providers.Message{
@@ -535,7 +548,7 @@ func (p *anthropicPlanner) requestTextStreamingOnce(
 		SystemPrompt: resolvedSystem,
 	}
 	p.applyStreamingRuntimeProfile(req, stage, p.resolveThinkingBudget(maxTokens), architectSessionIDFromContext(ctx))
-	return p.streamRequest(ctx, req, stage, onChunk)
+	return p.streamRequest(ctx, req, stage, timeout, onChunk)
 }
 
 // streamRequest executes a single streaming request and returns the result.
@@ -545,13 +558,14 @@ func (p *anthropicPlanner) streamRequest(
 	ctx context.Context,
 	req *providers.Request,
 	stage string,
+	timeout time.Duration,
 	onChunk func(string),
 ) (*streamResult, error) {
 	var text strings.Builder
 	emitter := newThoughtEmitter(ctx)
 	var finalUsage *providers.Usage
 	var stopReason providers.StopReason
-	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
+	err := p.streamWithProgressTimeout(ctx, stage, req, timeout, func(chunk *providers.StreamChunk) error {
 		switch chunk.Type {
 		case providers.ChunkTypeStart:
 			// RetryReset is set by the provider's retryAwareHandler when a
@@ -627,6 +641,16 @@ func (p *anthropicPlanner) streamRequestFull(
 	stage string,
 	onChunk func(string),
 ) (*providers.Response, error) {
+	return p.streamRequestFullWithTimeout(ctx, req, stage, p.timeout, onChunk)
+}
+
+func (p *anthropicPlanner) streamRequestFullWithTimeout(
+	ctx context.Context,
+	req *providers.Request,
+	stage string,
+	timeout time.Duration,
+	onChunk func(string),
+) (*providers.Response, error) {
 	accumulator := providers.NewStreamAccumulator()
 	emitter := newThoughtEmitter(ctx)
 
@@ -652,7 +676,7 @@ func (p *anthropicPlanner) streamRequestFull(
 		"messages_count", len(req.Messages),
 		"messages_detail", strings.Join(streamMsgSummary, " | "))
 
-	err := p.provider.StreamWithHandler(ctx, req, func(chunk *providers.StreamChunk) error {
+	err := p.streamWithProgressTimeout(ctx, stage, req, timeout, func(chunk *providers.StreamChunk) error {
 		accumulator.Add(chunk)
 
 		switch chunk.Type {
@@ -735,6 +759,109 @@ func (p *anthropicPlanner) streamRequestFull(
 	return resp, nil
 }
 
+func (p *anthropicPlanner) streamWithProgressTimeout(
+	ctx context.Context,
+	stage string,
+	req *providers.Request,
+	timeout time.Duration,
+	handler providers.StreamHandler,
+) error {
+	if timeout <= 0 {
+		return p.provider.StreamWithHandler(ctx, req, handler)
+	}
+
+	streamCtx, cancel := context.WithCancel(ctx)
+	watchdog := newPlannerStreamWatchdog(streamCtx, cancel, timeout)
+	defer watchdog.Stop()
+
+	err := p.provider.StreamWithHandler(streamCtx, req, func(chunk *providers.StreamChunk) error {
+		watchdog.Progress()
+		return handler(chunk)
+	})
+
+	if watchdog.TimedOut() {
+		p.logger.Warn("planner stream progress timeout",
+			"stage", stage,
+			"timeout", timeout.String(),
+			"ctx_deadline", contextDeadlineString(ctx))
+		return context.DeadlineExceeded
+	}
+	return err
+}
+
+type plannerStreamWatchdog struct {
+	done     chan struct{}
+	progress chan struct{}
+	timedOut atomic.Bool
+}
+
+func newPlannerStreamWatchdog(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	timeout time.Duration,
+) *plannerStreamWatchdog {
+	w := &plannerStreamWatchdog{
+		done:     make(chan struct{}),
+		progress: make(chan struct{}, 1),
+	}
+	go w.run(ctx, cancel, timeout)
+	return w
+}
+
+func (w *plannerStreamWatchdog) run(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	timeout time.Duration,
+) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.done:
+			return
+		case <-timer.C:
+			w.timedOut.Store(true)
+			cancel()
+			return
+		case <-w.progress:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(timeout)
+		}
+	}
+}
+
+func (w *plannerStreamWatchdog) Progress() {
+	if w == nil {
+		return
+	}
+	select {
+	case w.progress <- struct{}{}:
+	default:
+	}
+}
+
+func (w *plannerStreamWatchdog) Stop() {
+	if w == nil {
+		return
+	}
+	close(w.done)
+}
+
+func (w *plannerStreamWatchdog) TimedOut() bool {
+	if w == nil {
+		return false
+	}
+	return w.timedOut.Load()
+}
+
 // CompleteForToolLoop performs a streaming request that accumulates the full
 // response including any tool calls. This bridges the streaming planner to the
 // synchronous tool loop pattern used by all other agents.
@@ -756,9 +883,9 @@ func (p *anthropicPlanner) CompleteForToolLoop(
 	lease := newPlannerRequestLease(ctx, p, stage)
 	start := time.Now()
 	var resp *providers.Response
-	err := lease.run(p.timeout, onChunk != nil, func(reqCtx context.Context) error {
+	err := lease.run(p.timeout, onChunk != nil, func(reqCtx context.Context, attemptTimeout time.Duration) error {
 		var innerErr error
-		resp, innerErr = p.streamRequestFull(reqCtx, req, stage, onChunk)
+		resp, innerErr = p.streamRequestFullWithTimeout(reqCtx, req, stage, attemptTimeout, onChunk)
 		return innerErr
 	})
 
@@ -1224,6 +1351,7 @@ type taskPayload struct {
 	RiskFactors         []string                     `json:"risk_factors"`
 	Workspace           taskWorkspacePayload         `json:"workspace,omitempty"`
 	WorkerPackets       []workerPacketPayload        `json:"worker_packets,omitempty"`
+	ExecutionContracts  []executionContractPayload   `json:"execution_contracts,omitempty"`
 }
 
 type acceptanceCriterionPayload struct {
@@ -1277,6 +1405,12 @@ type workerPacketPayload struct {
 	TestRequirements    []string                     `json:"test_requirements,omitempty"`
 }
 
+type executionContractPayload struct {
+	AgentType    string   `json:"agent_type"`
+	Intents      []string `json:"intents,omitempty"`
+	Deliverables []string `json:"deliverables,omitempty"`
+}
+
 func (p taskPayload) toTask(index int) *AtomicTask {
 	taskID := strings.TrimSpace(p.ID)
 	if taskID == "" {
@@ -1302,6 +1436,7 @@ func (p taskPayload) toTask(index int) *AtomicTask {
 		RiskFactors:         nonEmptySlice(p.RiskFactors),
 		Workspace:           toTaskWorkspaceSpec(p.Workspace),
 		WorkerPackets:       toWorkerPackets(p.WorkerPackets),
+		ExecutionContracts:  toExecutionContracts(p.ExecutionContracts),
 	}
 
 	// Populate co-tenancy fields when the LLM specifies them.
@@ -1378,6 +1513,22 @@ func toWorkerPackets(payloads []workerPacketPayload) []WorkerPacket {
 		packets = append(packets, packet)
 	}
 	return packets
+}
+
+func toExecutionContracts(payloads []executionContractPayload) []AgentExecutionContract {
+	if len(payloads) == 0 {
+		return nil
+	}
+	contracts := make([]AgentExecutionContract, 0, len(payloads))
+	for _, p := range payloads {
+		contract := AgentExecutionContract{
+			AgentType:    normalizeExecutionContractAgentType(p.AgentType),
+			Intents:      nonEmptySlice(p.Intents),
+			Deliverables: nonEmptySlice(p.Deliverables),
+		}
+		contracts = append(contracts, contract)
+	}
+	return contracts
 }
 
 func normalizeAgentRole(raw string) string {
@@ -1707,6 +1858,23 @@ Return JSON only, exactly:
           "test_requirements": ["Tests this worker must satisfy"]
         }
       ],
+      "execution_contracts": [
+        {
+          "agent_type": "inspector-pipeline",
+          "intents": ["synthesize_contract", "inspect_scope", "record_pending_validation", "publish_handoff_contract"],
+          "deliverables": ["criteria_contract", "scope_inspection", "pending_validation_state", "handoff_contract"]
+        },
+        {
+          "agent_type": "tester-pipeline",
+          "intents": ["plan_tests", "author_tests"],
+          "deliverables": ["test_plan", "test_artifact"]
+        },
+        {
+          "agent_type": "engineer",
+          "intents": ["produce_requested_change"],
+          "deliverables": ["requested_change"]
+        }
+      ],
       "test_requirements": [
         "Specific test case that must pass"
       ],
@@ -1731,6 +1899,7 @@ Hard limits:
 - Each task MUST have a unique slug in lowercase kebab-case suitable for the pipeline panel (examples: "auth-checkout", "payment-retry")
 - Each task MUST have workspace with at least 1 write_set entry and enough read_set coverage for the assigned work.
 - worker_packets are REQUIRED for every task. Include 1 packet for single-agent tasks, or 1 packet per participating worker for compound tasks.
+- execution_contracts are REQUIRED for every task. Include explicit contracts for inspector-pipeline, tester-pipeline, the primary implementation agent, and every co-agent.
 - guidelines: 1-4 items per task
 - test_requirements: 1-4 items per task
 - examples: 0-2 per task (include for non-trivial tasks)
@@ -1748,6 +1917,7 @@ Hard limits:
 - agent_scopes: REQUIRED when co_agents is non-empty. 1 scope per agent (primary + each co-agent). Each scope must have at least 1 acceptance_criteria with priority "must". Omit entirely for single-agent tasks.
 - workspace: REQUIRED. read_set should cover the code and docs needed to reason locally; write_set should be the narrowest safe mutation surface; test_surface should name the packages/files/commands the tester must exercise; prefetch_paths should preload especially relevant context in large repos.
 - worker_packets: REQUIRED. read_set/write_set inside each worker packet must stay within the task workspace. Use them to divide engineer/designer work cleanly and keep the task collision-free.
+- execution_contracts: REQUIRED. Use only these intent values: plan_tests, author_tests, run_tests, diagnose_failures, verify_spec, prepare_harness, report_findings, synthesize_contract, inspect_scope, record_pending_validation, publish_handoff_contract, validate_implementation, run_quality_checks, publish_validation_report, grade_quality, consume_reviews, inspect_review_context, address_review, resolve_reviews, produce_requested_change. Use only these deliverable values: test_plan, test_artifact, suite_execution, failure_diagnosis, failure_report, harness_prepared, criteria_contract, scope_inspection, pending_validation_state, handoff_contract, criteria_evaluation, quality_checks, validation_report, quality_grade, review_intake, review_context, review_addressed, review_resolution, requested_change.
 `
 }
 
@@ -1922,6 +2092,7 @@ func normalizeTask(task *AtomicTask, idSet map[string]struct{}, nameIndex map[st
 		task.SuccessCriteria = []string{"Task completed"}
 	}
 	task.WorkerPackets = normalizeWorkerPackets(task)
+	task.ExecutionContracts = normalizeExecutionContracts(task)
 	task.Workspace = normalizeTaskWorkspace(task)
 }
 
@@ -1982,6 +2153,91 @@ func normalizeWorkerPackets(task *AtomicTask) []WorkerPacket {
 	}
 
 	return packets
+}
+
+func normalizeExecutionContracts(task *AtomicTask) []AgentExecutionContract {
+	if task == nil {
+		return nil
+	}
+
+	contracts := make([]AgentExecutionContract, 0, max(len(task.ExecutionContracts), len(requiredExecutionContractAgents(task))))
+	seen := make(map[string]struct{})
+
+	appendContract := func(contract AgentExecutionContract) {
+		agentType := normalizeExecutionContractAgentType(contract.AgentType)
+		if agentType == "" {
+			return
+		}
+		if _, ok := seen[agentType]; ok {
+			return
+		}
+		seen[agentType] = struct{}{}
+		contracts = append(contracts, AgentExecutionContract{
+			AgentType:    agentType,
+			Intents:      nonEmptySlice(contract.Intents),
+			Deliverables: nonEmptySlice(contract.Deliverables),
+		})
+	}
+
+	for _, contract := range task.ExecutionContracts {
+		appendContract(contract)
+	}
+	for _, contract := range defaultExecutionContracts(task) {
+		appendContract(contract)
+	}
+	return contracts
+}
+
+func defaultExecutionContracts(task *AtomicTask) []AgentExecutionContract {
+	if task == nil {
+		return nil
+	}
+	contracts := []AgentExecutionContract{
+		{
+			AgentType:    "inspector-pipeline",
+			Intents:      []string{"synthesize_contract", "inspect_scope", "record_pending_validation", "publish_handoff_contract"},
+			Deliverables: []string{"criteria_contract", "scope_inspection", "pending_validation_state", "handoff_contract"},
+		},
+		{
+			AgentType:    "tester-pipeline",
+			Intents:      []string{"plan_tests", "author_tests"},
+			Deliverables: []string{"test_plan", "test_artifact"},
+		},
+	}
+	for _, agentType := range requiredExecutionContractAgents(task) {
+		if agentType == "inspector-pipeline" || agentType == "tester-pipeline" {
+			continue
+		}
+		contracts = append(contracts, AgentExecutionContract{
+			AgentType:    agentType,
+			Intents:      []string{"produce_requested_change"},
+			Deliverables: []string{"requested_change"},
+		})
+	}
+	return contracts
+}
+
+func requiredExecutionContractAgents(task *AtomicTask) []string {
+	if task == nil {
+		return nil
+	}
+	agents := []string{"inspector-pipeline", "tester-pipeline", normalizeTaskAgentType(task.AgentType)}
+	for _, coAgent := range task.CoAgents {
+		agents = append(agents, normalizeTaskAgentType(coAgent))
+	}
+	for _, scope := range task.AgentScopes {
+		agents = append(agents, normalizeTaskAgentType(scope.AgentType))
+	}
+	return nonEmptySlice(appendUniqueStrings(nil, agents...))
+}
+
+func normalizeExecutionContractAgentType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "inspector-pipeline", "tester-pipeline":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return normalizeTaskAgentType(raw)
+	}
 }
 
 func normalizeTaskWorkspace(task *AtomicTask) TaskWorkspaceSpec {

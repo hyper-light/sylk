@@ -187,6 +187,9 @@ func TestValidateTaskContract_RequiresWorkspaceAndWorkerPackets(t *testing.T) {
 	if err := validateTaskContract(task); err != nil {
 		t.Fatalf("validateTaskContract() unexpected error: %v", err)
 	}
+	if len(task.ExecutionContracts) != 4 {
+		t.Fatalf("execution contracts = %d, want 4", len(task.ExecutionContracts))
+	}
 
 	task.WorkerPackets[1].WriteSet = []string{"outside/scope.css"}
 	err := validateTaskContract(task)

@@ -78,11 +78,64 @@ func (c CoordinationClient) RequestReview(ctx context.Context, input coordinatio
 }
 
 func (c CoordinationClient) ResolveArtifact(ctx context.Context, input coordination.ResolveArtifactInput) (map[string]any, error) {
+	if strings.TrimSpace(input.ReviewID) == "" {
+		reviewID, err := c.resolvePendingReviewID(ctx, input.TaskID, input.ArtifactID)
+		if err != nil {
+			return nil, err
+		}
+		if reviewID != "" {
+			input.ReviewID = reviewID
+		}
+	}
 	var result map[string]any
 	if err := c.request(ctx, coordination.ActionResolveArtifact, input, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+func (c CoordinationClient) resolvePendingReviewID(ctx context.Context, taskID, artifactID string) (string, error) {
+	taskID = strings.TrimSpace(taskID)
+	artifactID = strings.TrimSpace(artifactID)
+	if taskID == "" || artifactID == "" {
+		return "", nil
+	}
+	view, err := c.QueryView(ctx, coordination.QueryViewInput{TaskID: taskID})
+	if err != nil {
+		return "", fmt.Errorf("query coordination view for pending review: %w", err)
+	}
+	if view == nil {
+		return "", nil
+	}
+	matches := pendingReviewIDsForArtifact(view.View.Reviews, artifactID)
+	switch len(matches) {
+	case 0:
+		return "", nil
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("multiple pending reviews exist for artifact %q; specify review_id explicitly", artifactID)
+	}
+}
+
+func pendingReviewIDsForArtifact(reviews []coordination.Review, artifactID string) []string {
+	artifactID = strings.TrimSpace(artifactID)
+	if artifactID == "" {
+		return nil
+	}
+	matches := make([]string, 0, 1)
+	for _, review := range reviews {
+		if strings.TrimSpace(review.ArtifactID) != artifactID {
+			continue
+		}
+		if review.Status != coordination.ReviewStatusPending {
+			continue
+		}
+		if reviewID := strings.TrimSpace(review.ID); reviewID != "" {
+			matches = append(matches, reviewID)
+		}
+	}
+	return matches
 }
 
 func (c CoordinationClient) request(ctx context.Context, action string, payload any, out any) error {

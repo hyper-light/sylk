@@ -197,7 +197,6 @@ func TestPipelineTesterWriteTestArtifact_RefreshesStaleBasisViaSharedWriteSkill(
 
 func TestPipelineTesterCreateTestsDeterministically_EmitsWriteToolCalls(t *testing.T) {
 	pt, baseCtx, _ := newGoPipelineTesterWithVFS(t)
-	pt.gatePassed = true
 
 	var toolNames []string
 	ctx := agentshared.WithToolCallEmitter(baseCtx, func(event agentshared.ToolCallEvent) {
@@ -216,7 +215,7 @@ func TestPipelineTesterCreateTestsDeterministically_EmitsWriteToolCalls(t *testi
 	if err := pt.createTestsDeterministically(ctx, req, req.Files); err != nil {
 		t.Fatalf("createTestsDeterministically: %v", err)
 	}
-	for _, want := range []string{"check_inspector_gate", "detect_test_harness", "analyze_risk", "plan_tests"} {
+	for _, want := range []string{"detect_test_harness", "analyze_risk", "plan_tests"} {
 		if !containsName(toolNames, want) {
 			t.Fatalf("expected %s tool call, got %v", want, toolNames)
 		}
@@ -229,50 +228,8 @@ func TestPipelineTesterCreateTestsDeterministically_EmitsWriteToolCalls(t *testi
 	}
 }
 
-func TestPipelineTesterTaskToolSurfaceIncludesWriteFlow(t *testing.T) {
-	pt, err := New(testershared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	t.Cleanup(func() {
-		if pt.tools != nil {
-			pt.tools.Close()
-		}
-	})
-
-	contract := agentshared.BuildTaskExecutionContract(&agentshared.PipelineTaskInput{
-		TaskID:    "task-1",
-		AgentType: "tester-pipeline",
-		Prompt:    "Add tests for the CLI behavior.",
-		Context: map[string]any{
-			"pipeline_stage":    "test",
-			"test_requirements": []string{"Write failing tests for greet()."},
-		},
-	})
-	surface, err := agentshared.TaskToolSurface(pt.toolRuntime(), contract, "tester-pipeline")
-	if err != nil {
-		t.Fatalf("TaskToolSurface() error = %v", err)
-	}
-
-	toolNames := make([]string, 0)
-	for _, tool := range pt.buildToolDefinitionsWithSurface(surface) {
-		toolNames = append(toolNames, tool.Name)
-	}
-	for _, want := range []string{"prepare_pipeline_write_context", "write_test", "run_test_suite"} {
-		if !containsName(toolNames, want) {
-			t.Fatalf("task surface missing %q: %v", want, toolNames)
-		}
-	}
-	for _, blocked := range []string{"write_pipeline_file", "edit_pipeline_file", "delete_pipeline_file", "create_pipeline_directory"} {
-		if containsName(toolNames, blocked) {
-			t.Fatalf("task surface unexpectedly exposed %q: %v", blocked, toolNames)
-		}
-	}
-}
-
 func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.T) {
 	for _, want := range []string{
-		"check_inspector_gate",
 		"detect_test_harness",
 		"prepare_test_harness",
 		"prepare_pipeline_write_context",
@@ -280,6 +237,9 @@ func TestPipelineTesterVisibleSkills_IncludeHarnessAndReportingTools(t *testing.
 		"list_pipeline_changes",
 		"write_test",
 		"run_test_suite",
+		"handoff_next",
+		"validate_work",
+		"process_validation",
 		"report_to_engineer",
 		"report_to_designer",
 	} {

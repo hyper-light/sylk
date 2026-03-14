@@ -16,6 +16,7 @@ type plannerConversationMode string
 const (
 	plannerConversationModeClarification plannerConversationMode = "clarification"
 	plannerConversationModeReady         plannerConversationMode = "ready"
+	plannerConversationModeExistingReady plannerConversationMode = "existing_ready"
 	plannerConversationModeConverse      plannerConversationMode = "converse"
 	plannerConversationModeFeedback      plannerConversationMode = "feedback"
 )
@@ -303,6 +304,7 @@ func normalizePlannerConversationRequest(request plannerConversationRequest) pla
 	}
 	request.FirstTask = strings.TrimSpace(request.FirstTask)
 	request.PlanSummary = strings.TrimSpace(request.PlanSummary)
+	request.SessionID = strings.TrimSpace(request.SessionID)
 	return request
 }
 
@@ -342,6 +344,27 @@ Requirements:
     the user.
   - If false: invoke route_plan_acceptance immediately with the plan details.
     Do not ask for approval.
+  - Do not use canned lead-ins or protocol labels.`
+	case plannerConversationModeExistingReady:
+		return `The user has a previously prepared ready plan available. The plan_id, prior_query, and plan summary are in the context JSON.
+
+If the user's message clearly accepts or resumes that ready plan (for example "go ahead", "resume it", "ship it", or "use the previous plan"):
+1. Invoke route_plan_acceptance with the plan_id from the context JSON and the user's verbatim response.
+2. After invoking route_plan_acceptance, STOP. Do not write a text reply first.
+
+If the user is asking what the earlier plan covered, why it was structured this way, or whether it is still a good idea:
+- Answer naturally using the recovered plan context.
+- Call out one meaningful risk or stale assumption if it matters.
+- Only suggest resume, revise, or start fresh when it is actually helpful.
+
+If the user wants changes or a fresh direction:
+- Explain whether the existing plan can be revised cleanly or whether a new plan is the better move.
+- If the new direction is concrete enough, you may start_planning.
+- If the request is still too underspecified to plan responsibly, ask focused questions or invoke route_requirements_research.
+
+General rules:
+- Treat the previous plan as available context, not as a commitment the user already made.
+- Sound like a principal engineer, not a workflow bot.
 - Do not use canned lead-ins or protocol labels.`
 	case plannerConversationModeConverse:
 		return `Write the next user-facing response.
@@ -460,6 +483,26 @@ Requirements:
   - If false: state that the plan is ready and will proceed.
 - Do not use canned lead-ins or protocol labels.
 - Do not reference any tools or tool invocations.`
+	case plannerConversationModeExistingReady:
+		return `The user has a previously prepared ready plan available. The plan_id, prior_query, and plan summary are in the context JSON.
+
+If the user's message clearly accepts or resumes that ready plan:
+- Acknowledge that you can continue from that existing plan.
+- Briefly state the next step.
+
+If the user is asking about the earlier plan:
+- Answer naturally using the recovered plan context.
+- Mention a meaningful risk or stale assumption if it matters.
+
+If the user wants changes or a fresh direction:
+- Explain whether the existing plan can be revised cleanly or whether a new plan is the better move.
+- If details are still missing, ask focused follow-up questions.
+
+General rules:
+- Treat the previous plan as available context, not as a commitment.
+- Sound like a principal engineer, not a workflow bot.
+- Do not use canned lead-ins or protocol labels.
+- Do not reference any tools or tool invocations.`
 	case plannerConversationModeConverse:
 		return `Write the next user-facing response.
 
@@ -524,7 +567,7 @@ func toolsForConversationMode(mode plannerConversationMode) []string {
 
 func plannerConversationMaxTokensForMode(mode plannerConversationMode, maxTokens int) int {
 	switch mode {
-	case plannerConversationModeConverse, plannerConversationModeReady, plannerConversationModeFeedback:
+	case plannerConversationModeConverse, plannerConversationModeExistingReady, plannerConversationModeReady, plannerConversationModeFeedback:
 		return converseMaxTokens(maxTokens)
 	default:
 		return plannerConversationMaxTokens(maxTokens)
@@ -566,6 +609,8 @@ func (r plannerConversationRequest) normalizedMode() plannerConversationMode {
 	switch r.Mode {
 	case plannerConversationModeReady:
 		return plannerConversationModeReady
+	case plannerConversationModeExistingReady:
+		return plannerConversationModeExistingReady
 	case plannerConversationModeConverse:
 		return plannerConversationModeConverse
 	case plannerConversationModeFeedback:

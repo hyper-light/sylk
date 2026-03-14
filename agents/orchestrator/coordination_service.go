@@ -511,47 +511,6 @@ func (s *CoordinationService) WatchUpdates(
 	}
 }
 
-func (s *CoordinationService) ValidateWorkerCompletion(
-	ctx context.Context,
-	taskID string,
-	workerType string,
-	agentID string,
-) error {
-	taskID = strings.TrimSpace(taskID)
-	workerType = strings.TrimSpace(workerType)
-	agentID = strings.TrimSpace(agentID)
-	if taskID == "" || workerType == "" || agentID == "" {
-		return fmt.Errorf("task_id, worker_type, and agent_id are required")
-	}
-
-	contract := coordinationContractForWorker(workerType)
-	if contract == nil {
-		return nil
-	}
-	stats, err := s.workerCoordinationStats(ctx, taskID, agentID)
-	if err != nil {
-		return err
-	}
-	if contract.MustClaimBeforeWork && stats.Claims < contract.MinimumClaims {
-		return fmt.Errorf("%s completed without satisfying coordination contract: need at least %d claim(s), found %d",
-			workerType, contract.MinimumClaims, stats.Claims)
-	}
-	if contract.MinimumArtifacts > 0 {
-		artifacts := stats.Artifacts
-		if len(contract.PreferredArtifactKinds) > 0 {
-			artifacts = 0
-			for _, kind := range contract.PreferredArtifactKinds {
-				artifacts += stats.ArtifactKinds[kind]
-			}
-		}
-		if artifacts < contract.MinimumArtifacts {
-			return fmt.Errorf("%s completed without satisfying coordination contract: need at least %d artifact(s), found %d",
-				workerType, contract.MinimumArtifacts, artifacts)
-		}
-	}
-	return nil
-}
-
 func (s *CoordinationService) GetCachedPrecedents(taskName, taskSlug, workerType string) ([]coordination.PrecedentSummary, bool) {
 	key := s.precedentCacheKey(taskName, taskSlug, workerType)
 	if key == "" {
@@ -1589,49 +1548,6 @@ func (s *CoordinationService) notifyTaskWatchers(taskID string) {
 		default:
 		}
 	}
-}
-
-type workerCoordinationStats struct {
-	Claims        int
-	Artifacts     int
-	ArtifactKinds map[string]int
-}
-
-func (s *CoordinationService) workerCoordinationStats(ctx context.Context, taskID, agentID string) (*workerCoordinationStats, error) {
-	stats := &workerCoordinationStats{ArtifactKinds: make(map[string]int)}
-	row := s.store.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM coordination_claims WHERE task_id = ? AND owner_agent_id = ? AND state IN (?, ?)`,
-		taskID,
-		agentID,
-		string(coordination.ClaimStateActive),
-		string(coordination.ClaimStateReleased),
-	)
-	if err := row.Scan(&stats.Claims); err != nil {
-		return nil, fmt.Errorf("count worker coordination claims: %w", err)
-	}
-	rows, err := s.store.db.QueryContext(ctx,
-		`SELECT kind FROM coordination_artifacts WHERE task_id = ? AND producer_agent_id = ? AND status <> ?`,
-		taskID,
-		agentID,
-		string(coordination.ArtifactStatusRejected),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list worker coordination artifacts: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var kind string
-		if err := rows.Scan(&kind); err != nil {
-			return nil, fmt.Errorf("scan worker coordination artifact: %w", err)
-		}
-		kind = strings.TrimSpace(kind)
-		stats.Artifacts++
-		stats.ArtifactKinds[kind]++
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate worker coordination artifacts: %w", err)
-	}
-	return stats, nil
 }
 
 func coordinationContractForWorker(workerType string) *coordination.CoordinationContract {

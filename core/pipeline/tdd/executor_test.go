@@ -2,22 +2,50 @@ package tdd
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/engineer"
 	inspPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
 	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
-	pipelinetester "github.com/adalundhe/sylk/agents/tester/pipeline"
-	"github.com/adalundhe/sylk/agents/tester/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/agents/tester"
+	testerpipeline "github.com/adalundhe/sylk/agents/tester/pipeline"
 )
 
-// mockWorker implements WorkerAgent for testing.
+type scriptedInspector struct {
+	turns int32
+	run   func(ctx context.Context, task *agentShared.PipelineTaskInput, turn int) (*inspPipeline.InspectionStageResult, error)
+}
+
+func (s *scriptedInspector) RunTask(ctx context.Context, task *agentShared.PipelineTaskInput) (*inspPipeline.InspectionStageResult, error) {
+	return s.run(ctx, task, int(atomic.AddInt32(&s.turns, 1)))
+}
+
+func (s *scriptedInspector) Close() error { return nil }
+
+type scriptedTester struct {
+	turns int32
+	run   func(ctx context.Context, task *agentShared.PipelineTaskInput, turn int) (*testerpipeline.TaskStageResult, error)
+}
+
+func (s *scriptedTester) TestTask(ctx context.Context, task *agentShared.PipelineTaskInput) (*testerpipeline.TaskStageResult, error) {
+	return s.run(ctx, task, int(atomic.AddInt32(&s.turns, 1)))
+}
+
+func (s *scriptedTester) Close() error { return nil }
+
 type mockWorker struct {
 	executeFn func(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error)
 	closed    atomic.Bool
+	task      *agentShared.PipelineTaskInput
+	prompt    string
+	prior     *WorkerResult
 }
 
 func (m *mockWorker) Execute(ctx context.Context, criteria *inspShared.InspectorCriteria, inspFb *InspectorFeedback, testFb *TesterFeedback) (*WorkerResult, error) {
@@ -32,623 +60,421 @@ func (m *mockWorker) Close() error {
 	return nil
 }
 
-// mockInspectorController provides controllable validation results for testing.
-type mockInspectorController struct {
-	validatePassed atomic.Bool
-	validateErr    atomic.Pointer[error]
-}
+func (m *mockWorker) SetPipelineTask(task *agentShared.PipelineTaskInput) { m.task = task }
+func (m *mockWorker) SetTaskPrompt(prompt string)                         { m.prompt = prompt }
+func (m *mockWorker) SetPriorOutput(result *WorkerResult)                 { m.prior = result }
 
 func newTestPipeline(taskID string) *Pipeline {
 	return &Pipeline{
-		ID:        "test-pipeline-1",
-		TaskID:    taskID,
-		TaskSlug:  "auth-checkout",
-		SessionID: "test-session",
-		DAGNodeID: "test-node",
-		Status:    StatusPending,
-		MaxLoops:  defaultMaxLoops,
+		ID:         "test-pipeline-1",
+		TaskID:     taskID,
+		TaskSlug:   "auth-checkout",
+		SessionID:  "test-session",
+		DAGNodeID:  "test-node",
+		Status:     StatusPending,
+		WorkerType: WorkerEngineer,
+		MaxLoops:   defaultMaxLoops,
 		InspectorCriteria: &inspShared.InspectorCriteria{
 			TaskID: taskID,
 			SuccessCriteria: []inspShared.SuccessCriterion{
-				{ID: "sc1", Description: "code compiles", Verifiable: true},
+				{ID: "sc1", Description: "criteria exist", Verifiable: true},
 			},
 		},
 		CreatedAt: time.Now(),
 	}
 }
 
-func newTestExecutor(t *testing.T, pipeline *Pipeline, worker WorkerAgent, inspPassed bool, testerPassed bool) *TDDExecutor {
+func invokeProtocolSkill(t *testing.T, ctx context.Context, cfg agentShared.PipelineProtocolSkillConfig, name string, payload any) {
 	t.Helper()
-
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
+	raw, err := json.Marshal(payload)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("marshal skill payload: %v", err)
 	}
-	t.Cleanup(func() { insp.Close() })
-
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
+	for _, skill := range agentShared.PipelineProtocolSkills(cfg) {
+		if skill.Name != name {
+			continue
+		}
+		if _, err := skill.Handler(ctx, raw); err != nil {
+			t.Fatalf("skill %s: %v", name, err)
+		}
+		return
 	}
-	t.Cleanup(func() { tst.Close() })
-
-	var events []PipelineEvent
-	var eventMu sync.Mutex
-
-	return NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
-		OnEvent: func(evt PipelineEvent) {
-			eventMu.Lock()
-			events = append(events, evt)
-			eventMu.Unlock()
-		},
-	})
+	t.Fatalf("skill %s not found", name)
 }
 
-func TestTDDExecutor_HappyPath(t *testing.T) {
-	pipeline := newTestPipeline("task-happy")
+func TestTDDExecutor_ProtocolLoopCompletes(t *testing.T) {
+	pipeline := newTestPipeline("task-protocol")
 
-	// Mock inspector that creates a passing inspection.
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
+	inspector := &scriptedInspector{
+		run: func(ctx context.Context, _ *agentShared.PipelineTaskInput, turn int) (*inspPipeline.InspectionStageResult, error) {
+			switch turn {
+			case 1:
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "handoff_next", map[string]any{
+					"target_agents":   []string{"tester"},
+					"reason":          "criteria are ready for testability review",
+					"request":         "Challenge the criteria and validate the required tests for this task.",
+					"required_output": []string{"testability verdict"},
+				})
+			case 2:
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "process_validation", map[string]any{
+					"challenge_id": "task-protocol-challenge-1",
+					"decision":     "accept",
+					"summary":      "Tester confirmed the task is ready for merge.",
+				})
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "handoff_to_ot", map[string]any{
+					"summary":       "Criteria and testing are satisfied.",
+					"evidence_refs": []string{"tests/auth_test.go"},
+				})
+			default:
+				t.Fatalf("unexpected inspector turn %d", turn)
+			}
+			return &inspPipeline.InspectionStageResult{
+				Criteria: &inspShared.InspectorCriteria{TaskID: pipeline.TaskID},
+				Result:   &inspShared.InspectorResult{Passed: turn > 1},
+			}, nil
+		},
 	}
-	defer insp.Close()
 
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
+	testerAgent := &scriptedTester{
+		run: func(ctx context.Context, _ *agentShared.PipelineTaskInput, turn int) (*testerpipeline.TaskStageResult, error) {
+			if turn != 1 {
+				t.Fatalf("unexpected tester turn %d", turn)
+			}
+			invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+				AgentType: func() string { return agentShared.PipelineAgentTester },
+			}, "validate_work", map[string]any{
+				"challenge_id":            "task-protocol-challenge-1",
+				"requesting_agent":        "inspector",
+				"status":                  "passed",
+				"summary":                 "The criteria are testable and the current tests cover them.",
+				"evidence_refs":           []string{"tests/auth_test.go"},
+				"recommended_next_agents": []string{"inspector"},
+			})
+			return &testerpipeline.TaskStageResult{
+				SuiteResult: &tester.TestSuiteResult{},
+			}, nil
+		},
 	}
-	defer tst.Close()
-
-	worker := &mockWorker{}
-	var events []PipelineEvent
-	var eventMu sync.Mutex
 
 	exec := NewTDDExecutor(TDDExecutorConfig{
 		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
-		OnEvent: func(evt PipelineEvent) {
-			eventMu.Lock()
-			events = append(events, evt)
-			eventMu.Unlock()
-		},
-	})
-
-	ctx := context.Background()
-	if err := exec.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Wait for completion — the executor should run through the TDD loop.
-	err = exec.WaitDone(10 * time.Second)
-	// Since we're using real Inspector/Tester that return defaults,
-	// the pipeline will proceed through phases. The exact outcome
-	// depends on whether mock agents return passing results.
-	// The key test: it should terminate (not hang).
-	_ = err
-
-	p := exec.Pipeline()
-	if !IsTerminalStatus(p.Status) {
-		t.Errorf("expected terminal status, got %s", p.Status)
-	}
-	if p.LoopCount < 1 {
-		t.Errorf("expected at least 1 loop, got %d", p.LoopCount)
-	}
-
-	eventMu.Lock()
-	if len(events) < 1 {
-		t.Error("expected at least 1 event")
-	}
-	eventMu.Unlock()
-}
-
-func TestTDDExecutor_MaxLoopsExhausted(t *testing.T) {
-	pipeline := newTestPipeline("task-maxloop")
-	pipeline.MaxLoops = 2
-
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer insp.Close()
-
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tst.Close()
-
-	worker := &mockWorker{}
-
-	exec := NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		PhaseTimeout: 30 * time.Second,
+		Inspector:    inspector,
+		Tester:       testerAgent,
+		Worker:       &mockWorker{},
+		PhaseTimeout: time.Second,
 		MaxLoops:     2,
 	})
 
-	ctx := context.Background()
-	if err := exec.Start(ctx); err != nil {
+	if err := exec.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-
-	_ = exec.WaitDone(15 * time.Second)
-
-	p := exec.Pipeline()
-	if !IsTerminalStatus(p.Status) {
-		t.Errorf("expected terminal status, got %s", p.Status)
+	if err := exec.WaitDone(3 * time.Second); err != nil {
+		t.Fatalf("wait done: %v", err)
 	}
-	// Should have attempted all loops.
-	if p.LoopCount < 1 {
-		t.Errorf("expected at least 1 loop, got %d", p.LoopCount)
+
+	snap := exec.Pipeline()
+	if snap.Status != StatusCompleted {
+		t.Fatalf("status = %s, want %s", snap.Status, StatusCompleted)
+	}
+	if snap.LoopCount != 1 {
+		t.Fatalf("loop_count = %d, want 1", snap.LoopCount)
 	}
 }
 
-func TestTDDExecutor_CancellationMidPhase(t *testing.T) {
-	pipeline := newTestPipeline("task-cancel")
+func TestTDDExecutor_ExecuteCohortReturnsToInspector(t *testing.T) {
+	pipeline := newTestPipeline("task-execute")
+	pipeline.WorkerType = WorkerEngineer
+	pipeline.CoWorkerTypes = []WorkerType{WorkerDesigner}
 
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
+	inspector := &scriptedInspector{
+		run: func(ctx context.Context, _ *agentShared.PipelineTaskInput, turn int) (*inspPipeline.InspectionStageResult, error) {
+			switch turn {
+			case 1:
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "handoff_next", map[string]any{
+					"target_agents": []string{"tester"},
+					"reason":        "Need tester to define and validate the red-phase work.",
+					"request":       "Author and validate the tests that should drive implementation.",
+				})
+			case 2:
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "process_validation", map[string]any{
+					"challenge_id": "task-execute-challenge-1",
+					"decision":     "accept",
+					"summary":      "Tester made the execute work concrete enough to implement.",
+				})
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "handoff_next", map[string]any{
+					"target_agents":   []string{"engineer", "designer"},
+					"mode":            "cohort",
+					"reason":          "Implementation and design should proceed together.",
+					"request":         "Implement the requested behavior and design changes against the tests.",
+					"required_output": []string{"code changes", "design changes"},
+				})
+			case 3:
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "handoff_to_ot", map[string]any{
+					"summary":       "Implementation cohort returned the work for merge.",
+					"evidence_refs": []string{"app/main.go", "ui/button.tsx"},
+				})
+			default:
+				t.Fatalf("unexpected inspector turn %d", turn)
+			}
+			return &inspPipeline.InspectionStageResult{
+				Criteria: &inspShared.InspectorCriteria{TaskID: pipeline.TaskID},
+				Result:   &inspShared.InspectorResult{Passed: turn > 2},
+			}, nil
+		},
 	}
-	defer insp.Close()
 
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
+	testerAgent := &scriptedTester{
+		run: func(ctx context.Context, _ *agentShared.PipelineTaskInput, turn int) (*testerpipeline.TaskStageResult, error) {
+			if turn != 1 {
+				t.Fatalf("unexpected tester turn %d", turn)
+			}
+			invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+				AgentType: func() string { return agentShared.PipelineAgentTester },
+			}, "validate_work", map[string]any{
+				"challenge_id":     "task-execute-challenge-1",
+				"requesting_agent": "inspector",
+				"status":           "passed",
+				"summary":          "Tests are in place and define the execute work clearly.",
+			})
+			return &testerpipeline.TaskStageResult{
+				SuiteResult: &tester.TestSuiteResult{},
+			}, nil
+		},
 	}
-	defer tst.Close()
 
-	// Worker that blocks until context is cancelled.
-	worker := &mockWorker{
+	engineerWorker := &mockWorker{
 		executeFn: func(ctx context.Context, _ *inspShared.InspectorCriteria, _ *InspectorFeedback, _ *TesterFeedback) (*WorkerResult, error) {
-			<-ctx.Done()
-			return nil, ctx.Err()
+			invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+				AgentType: func() string { return agentShared.PipelineAgentEngineer },
+			}, "handoff_next", map[string]any{
+				"target_agents": []string{"inspector"},
+				"reason":        "Implementation is complete for this iteration.",
+				"request":       "Re-inspect the combined execute output.",
+			})
+			return &WorkerResult{
+				ChangedFiles: []string{"app/main.go"},
+				TaskResult:   &engineer.TaskResult{TaskID: "task-execute", Success: true, Output: "engineer complete"},
+			}, nil
+		},
+	}
+	designerWorker := &mockWorker{
+		executeFn: func(ctx context.Context, _ *inspShared.InspectorCriteria, _ *InspectorFeedback, _ *TesterFeedback) (*WorkerResult, error) {
+			invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+				AgentType: func() string { return agentShared.PipelineAgentDesigner },
+			}, "handoff_next", map[string]any{
+				"target_agents": []string{"inspector"},
+				"reason":        "Design work is complete for this iteration.",
+				"request":       "Re-inspect the combined execute output.",
+			})
+			return &WorkerResult{
+				ChangedFiles: []string{"ui/button.tsx"},
+				WorkerType:   WorkerDesigner,
+				TaskResult:   &engineer.TaskResult{TaskID: "task-execute", Success: true, Output: "designer complete"},
+			}, nil
 		},
 	}
 
 	exec := NewTDDExecutor(TDDExecutorConfig{
 		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
+		Inspector:    inspector,
+		Tester:       testerAgent,
+		Worker:       engineerWorker,
+		CoWorkers:    []WorkerAgent{designerWorker},
+		PhaseTimeout: time.Second,
+		MaxLoops:     2,
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	if err := exec.Start(ctx); err != nil {
+	if err := exec.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := exec.WaitDone(3 * time.Second); err != nil {
+		t.Fatalf("wait done: %v", err)
+	}
 
-	// Give the executor time to reach the worker phase, then cancel.
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-
-	_ = exec.WaitDone(5 * time.Second)
-
-	p := exec.Pipeline()
-	if !IsTerminalStatus(p.Status) {
-		t.Errorf("expected terminal status after cancel, got %s", p.Status)
+	snap := exec.Pipeline()
+	if snap.Status != StatusCompleted {
+		t.Fatalf("status = %s, want completed", snap.Status)
+	}
+	if snap.WorkerOutput == nil || len(snap.WorkerOutput.ChangedFiles) != 1 {
+		t.Fatalf("primary worker output missing: %#v", snap.WorkerOutput)
+	}
+	if len(snap.CoWorkerOutputs) != 1 || snap.CoWorkerOutputs[0].WorkerType != WorkerDesigner {
+		t.Fatalf("co-worker outputs = %#v", snap.CoWorkerOutputs)
+	}
+	if engineerWorker.task == nil || designerWorker.task == nil {
+		t.Fatal("expected execute workers to receive structured pipeline task input")
+	}
+	if protocol := engineerWorker.task.Context["pipeline_protocol"]; protocol == nil {
+		t.Fatal("engineer task missing pipeline protocol context")
 	}
 }
 
-func TestTDDExecutor_WorkerError(t *testing.T) {
-	pipeline := newTestPipeline("task-worker-err")
+func TestTDDExecutor_MaxLoopsExhausted(t *testing.T) {
+	pipeline := newTestPipeline("task-loop")
 
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
+	inspector := &scriptedInspector{
+		run: func(ctx context.Context, _ *agentShared.PipelineTaskInput, turn int) (*inspPipeline.InspectionStageResult, error) {
+			invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+				AgentType:   func() string { return agentShared.PipelineAgentInspector },
+				InspectorOT: true,
+			}, "handoff_next", map[string]any{
+				"target_agents": []string{"engineer"},
+				"reason":        fmt.Sprintf("loop %d needs more implementation", turn),
+				"request":       "Implement the next requested change.",
+			})
+			return &inspPipeline.InspectionStageResult{
+				Criteria: &inspShared.InspectorCriteria{TaskID: pipeline.TaskID},
+			}, nil
+		},
 	}
-	defer insp.Close()
 
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tst.Close()
-
-	worker := &mockWorker{
+	engineerWorker := &mockWorker{
 		executeFn: func(ctx context.Context, _ *inspShared.InspectorCriteria, _ *InspectorFeedback, _ *TesterFeedback) (*WorkerResult, error) {
-			return nil, fmt.Errorf("compilation failed")
+			invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+				AgentType: func() string { return agentShared.PipelineAgentEngineer },
+			}, "handoff_next", map[string]any{
+				"target_agents": []string{"inspector"},
+				"reason":        "Need another inspection cycle.",
+				"request":       "Inspect the latest execute output and decide again.",
+			})
+			return &WorkerResult{ChangedFiles: []string{"app/main.go"}}, nil
 		},
 	}
 
 	exec := NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
+		Pipeline:  pipeline,
+		Inspector: inspector,
+		Tester: &scriptedTester{run: func(_ context.Context, _ *agentShared.PipelineTaskInput, _ int) (*testerpipeline.TaskStageResult, error) {
+			return nil, errors.New("unexpected tester turn")
+		}},
+		Worker:       engineerWorker,
+		PhaseTimeout: time.Second,
+		MaxLoops:     1,
 	})
 
-	ctx := context.Background()
-	if err := exec.Start(ctx); err != nil {
+	if err := exec.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-
-	_ = exec.WaitDone(10 * time.Second)
-
-	p := exec.Pipeline()
-	if p.Status != StatusFailed {
-		t.Errorf("expected StatusFailed, got %s", p.Status)
-	}
-	if p.LastError == "" {
-		t.Error("expected LastError to be set")
-	}
-}
-
-func TestTDDExecutor_NoCriteria(t *testing.T) {
-	pipeline := newTestPipeline("task-no-criteria")
-	pipeline.InspectorCriteria = nil // no criteria
-
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer insp.Close()
-
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tst.Close()
-
-	worker := &mockWorker{}
-
-	exec := NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
-	})
-
-	ctx := context.Background()
-	if err := exec.Start(ctx); err != nil {
-		t.Fatal(err)
+	err := exec.WaitDone(3 * time.Second)
+	if err == nil || !strings.Contains(err.Error(), ErrMaxLoopsExhausted.Error()) {
+		t.Fatalf("wait done err = %v, want max loops exhausted", err)
 	}
 
-	_ = exec.WaitDone(10 * time.Second)
-
-	p := exec.Pipeline()
-	if p.Status != StatusFailed {
-		t.Errorf("expected StatusFailed when no criteria, got %s", p.Status)
+	snap := exec.Pipeline()
+	if snap.Status != StatusFailed {
+		t.Fatalf("status = %s, want failed", snap.Status)
 	}
 }
 
 func TestTDDExecutor_EventsEmitted(t *testing.T) {
 	pipeline := newTestPipeline("task-events")
-
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer insp.Close()
-
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tst.Close()
-
-	worker := &mockWorker{}
-
 	var events []PipelineEvent
-	var eventMu sync.Mutex
+
+	inspector := &scriptedInspector{
+		run: func(ctx context.Context, _ *agentShared.PipelineTaskInput, turn int) (*inspPipeline.InspectionStageResult, error) {
+			if turn == 1 {
+				invokeProtocolSkill(t, ctx, agentShared.PipelineProtocolSkillConfig{
+					AgentType:   func() string { return agentShared.PipelineAgentInspector },
+					InspectorOT: true,
+				}, "handoff_to_ot", map[string]any{"summary": "done"})
+			}
+			return &inspPipeline.InspectionStageResult{
+				Criteria: &inspShared.InspectorCriteria{TaskID: pipeline.TaskID},
+			}, nil
+		},
+	}
 
 	exec := NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
+		Pipeline:  pipeline,
+		Inspector: inspector,
+		Tester: &scriptedTester{run: func(_ context.Context, _ *agentShared.PipelineTaskInput, _ int) (*testerpipeline.TaskStageResult, error) {
+			return nil, errors.New("unexpected tester turn")
+		}},
+		Worker:       &mockWorker{},
+		PhaseTimeout: time.Second,
+		MaxLoops:     1,
 		OnEvent: func(evt PipelineEvent) {
-			eventMu.Lock()
 			events = append(events, evt)
-			eventMu.Unlock()
 		},
 	})
 
-	ctx := context.Background()
-	if err := exec.Start(ctx); err != nil {
+	if err := exec.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-
-	_ = exec.WaitDone(10 * time.Second)
-
-	eventMu.Lock()
-	defer eventMu.Unlock()
-
-	// Should have at least DefiningCriteria + CreatingTests + Executing + Validating + terminal
-	if len(events) < 4 {
-		t.Errorf("expected at least 4 events, got %d", len(events))
+	if err := exec.WaitDone(3 * time.Second); err != nil {
+		t.Fatalf("wait done: %v", err)
 	}
-
-	// First event should transition from Pending to DefiningCriteria.
-	if len(events) > 0 {
-		first := events[0]
-		if first.OldStatus != StatusPending {
-			t.Errorf("first event OldStatus = %s, want %s", first.OldStatus, StatusPending)
-		}
-		if first.NewStatus != StatusDefiningCriteria {
-			t.Errorf("first event NewStatus = %s, want %s", first.NewStatus, StatusDefiningCriteria)
-		}
-		if first.PipelineID != pipeline.TaskID {
-			t.Errorf("event PipelineID = %s, want %s", first.PipelineID, pipeline.TaskID)
-		}
-		if first.RuntimePipelineID != pipeline.ID {
-			t.Errorf("event RuntimePipelineID = %s, want %s", first.RuntimePipelineID, pipeline.ID)
-		}
-		if first.TaskSlug != pipeline.TaskSlug {
-			t.Errorf("event TaskSlug = %s, want %s", first.TaskSlug, pipeline.TaskSlug)
-		}
+	if len(events) < 2 {
+		t.Fatalf("events = %d, want at least 2", len(events))
 	}
-}
-
-func TestTDDExecutor_CompoundPipeline(t *testing.T) {
-	pipeline := newTestPipeline("task-compound")
-	pipeline.CoWorkerTypes = []WorkerType{WorkerDesigner}
-	pipeline.TaskPrompt = "Build the feature"
-
-	primaryWorker := &mockWorker{
-		executeFn: func(ctx context.Context, _ *inspShared.InspectorCriteria, _ *InspectorFeedback, _ *TesterFeedback) (*WorkerResult, error) {
-			return &WorkerResult{ChangedFiles: []string{"a.go"}}, nil
-		},
+	if events[0].Stage != pipelineStageInspect {
+		t.Fatalf("first stage = %q, want %q", events[0].Stage, pipelineStageInspect)
 	}
-	coWorker := &mockWorker{
-		executeFn: func(ctx context.Context, _ *inspShared.InspectorCriteria, _ *InspectorFeedback, _ *TesterFeedback) (*WorkerResult, error) {
-			return &WorkerResult{ChangedFiles: []string{"b.css"}}, nil
-		},
-	}
-
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer insp.Close()
-
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tst.Close()
-
-	exec := NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       primaryWorker,
-		CoWorkers:    []WorkerAgent{coWorker},
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
-	})
-
-	ctx := context.Background()
-	if err := exec.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	_ = exec.WaitDone(15 * time.Second)
-
-	p := exec.Pipeline()
-	if !IsTerminalStatus(p.Status) {
-		t.Errorf("expected terminal status, got %s", p.Status)
-	}
-	if p.WorkerOutput == nil {
-		t.Fatal("expected non-nil WorkerOutput")
-	}
-	// Merged output should contain files from both workers.
-	fileSet := make(map[string]bool)
-	for _, f := range p.WorkerOutput.ChangedFiles {
-		fileSet[f] = true
-	}
-	if !fileSet["a.go"] {
-		t.Error("merged output missing a.go from primary worker")
-	}
-	if !fileSet["b.css"] {
-		t.Error("merged output missing b.css from co-worker")
-	}
-	// Co-worker outputs should be stored separately.
-	if len(p.CoWorkerOutputs) != 1 {
-		t.Errorf("expected 1 co-worker output, got %d", len(p.CoWorkerOutputs))
-	}
-}
-
-func TestTDDExecutor_CoWorkerFailureNonFatal(t *testing.T) {
-	pipeline := newTestPipeline("task-co-fail")
-	pipeline.CoWorkerTypes = []WorkerType{WorkerDesigner}
-
-	primaryWorker := &mockWorker{
-		executeFn: func(ctx context.Context, _ *inspShared.InspectorCriteria, _ *InspectorFeedback, _ *TesterFeedback) (*WorkerResult, error) {
-			return &WorkerResult{ChangedFiles: []string{"primary.go"}}, nil
-		},
-	}
-	failingCoWorker := &mockWorker{
-		executeFn: func(ctx context.Context, _ *inspShared.InspectorCriteria, _ *InspectorFeedback, _ *TesterFeedback) (*WorkerResult, error) {
-			return nil, fmt.Errorf("co-worker compilation error")
-		},
-	}
-
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer insp.Close()
-
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tst.Close()
-
-	exec := NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       primaryWorker,
-		CoWorkers:    []WorkerAgent{failingCoWorker},
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
-	})
-
-	ctx := context.Background()
-	if err := exec.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	_ = exec.WaitDone(15 * time.Second)
-
-	p := exec.Pipeline()
-	if !IsTerminalStatus(p.Status) {
-		t.Errorf("expected terminal status, got %s", p.Status)
-	}
-	// Pipeline should not have failed due to co-worker error.
-	// WorkerOutput should have primary's files only.
-	if p.WorkerOutput == nil {
-		t.Fatal("expected non-nil WorkerOutput")
-	}
-	if len(p.WorkerOutput.ChangedFiles) != 1 || p.WorkerOutput.ChangedFiles[0] != "primary.go" {
-		t.Errorf("expected [primary.go], got %v", p.WorkerOutput.ChangedFiles)
-	}
-	// Co-worker outputs should be empty since it failed.
-	if len(p.CoWorkerOutputs) != 0 {
-		t.Errorf("expected 0 co-worker outputs, got %d", len(p.CoWorkerOutputs))
+	if events[len(events)-1].NewStatus != StatusCompleted {
+		t.Fatalf("last status = %s, want %s", events[len(events)-1].NewStatus, StatusCompleted)
 	}
 }
 
 func TestTDDExecutor_ResolveTaskPrompt(t *testing.T) {
 	pipeline := newTestPipeline("task-prompt")
-	pipeline.TaskPrompt = "fallback prompt"
+	pipeline.TaskPrompt = "fallback"
 	pipeline.AgentPrompts = map[WorkerType]string{
-		WorkerEngineer: "engineer-specific prompt",
-		WorkerDesigner: "designer-specific prompt",
+		WorkerEngineer: "engineer prompt",
+		WorkerDesigner: "designer prompt",
 	}
+	exec := NewTDDExecutor(TDDExecutorConfig{
+		Pipeline:  pipeline,
+		Inspector: &scriptedInspector{},
+		Tester:    &scriptedTester{},
+		Worker:    &mockWorker{},
+	})
 
-	worker := &mockWorker{}
-	exec := newTestExecutor(t, pipeline, worker, true, true)
-
-	// Scoped prompt should be returned when available.
-	got := exec.resolveTaskPrompt(WorkerEngineer)
-	if got != "engineer-specific prompt" {
-		t.Errorf("got %q, want %q", got, "engineer-specific prompt")
+	if got := exec.resolveTaskPrompt(WorkerEngineer); got != "engineer prompt" {
+		t.Fatalf("engineer prompt = %q, want engineer prompt", got)
 	}
-
-	got = exec.resolveTaskPrompt(WorkerDesigner)
-	if got != "designer-specific prompt" {
-		t.Errorf("got %q, want %q", got, "designer-specific prompt")
+	if got := exec.resolveTaskPrompt(WorkerDesigner); got != "designer prompt" {
+		t.Fatalf("designer prompt = %q, want designer prompt", got)
 	}
-
-	// Unknown type falls back to pipeline-level prompt.
-	got = exec.resolveTaskPrompt("unknown")
-	if got != "fallback prompt" {
-		t.Errorf("got %q, want %q", got, "fallback prompt")
+	if got := exec.resolveTaskPrompt("unknown"); got != "fallback" {
+		t.Fatalf("fallback prompt = %q, want fallback", got)
 	}
 }
 
 func TestTDDExecutor_ApplyWorkerPrompt(t *testing.T) {
-	pipeline := newTestPipeline("task-apply")
-	worker := &mockWorker{}
-	exec := newTestExecutor(t, pipeline, worker, true, true)
-
-	// mockWorker does not implement TaskPromptSetter — should be a no-op.
-	exec.applyWorkerPrompt(worker, "test", nil) // should not panic
-
-	// Test with a real worker adapter that implements the interfaces.
-	ew := &engineerWorker{}
-	prior := &WorkerResult{ChangedFiles: []string{"x.go"}}
-	exec.applyWorkerPrompt(ew, "scoped prompt", prior)
-	if ew.taskPrompt != "scoped prompt" {
-		t.Errorf("got %q, want %q", ew.taskPrompt, "scoped prompt")
-	}
-	if ew.priorOutput == nil || len(ew.priorOutput.ChangedFiles) != 1 {
-		t.Error("expected priorOutput to be set")
-	}
-}
-
-func TestTDDExecutor_CloseCoWorkers(t *testing.T) {
-	pipeline := newTestPipeline("task-close-co")
-	cw1 := &mockWorker{}
-	cw2 := &mockWorker{}
-
-	worker := &mockWorker{}
-	inspCfg := inspShared.DefaultPipelineInspectorConfig()
-	insp, err := inspPipeline.New(inspCfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer insp.Close()
-
-	tst, err := pipelinetester.New(shared.PipelineTesterConfig{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tst.Close()
-
 	exec := NewTDDExecutor(TDDExecutorConfig{
-		Pipeline:     pipeline,
-		Bus:          NewPipelineBus(),
-		Inspector:    insp,
-		Tester:       tst,
-		Worker:       worker,
-		CoWorkers:    []WorkerAgent{cw1, cw2},
-		PhaseTimeout: 30 * time.Second,
-		MaxLoops:     pipeline.MaxLoops,
+		Pipeline:  newTestPipeline("task-prompt-apply"),
+		Inspector: &scriptedInspector{},
+		Tester:    &scriptedTester{},
+		Worker:    &mockWorker{},
 	})
-
-	exec.CloseCoWorkers()
-	if !cw1.closed.Load() {
-		t.Error("expected co-worker 1 to be closed")
+	worker := &mockWorker{}
+	prior := &WorkerResult{ChangedFiles: []string{"main.go"}}
+	exec.applyWorkerPrompt(worker, "scoped prompt", prior)
+	if worker.prompt != "scoped prompt" {
+		t.Fatalf("prompt = %q, want scoped prompt", worker.prompt)
 	}
-	if !cw2.closed.Load() {
-		t.Error("expected co-worker 2 to be closed")
-	}
-}
-
-func TestDomainFromWorkerType(t *testing.T) {
-	tests := []struct {
-		wt   WorkerType
-		want inspShared.ValidationDomain
-	}{
-		{WorkerEngineer, inspShared.DomainCode},
-		{WorkerDesigner, inspShared.DomainDesign},
-		{"unknown", inspShared.DomainCode},
-	}
-	for _, tt := range tests {
-		got := domainFromWorkerType(tt.wt)
-		if got != tt.want {
-			t.Errorf("domainFromWorkerType(%q) = %q, want %q", tt.wt, got, tt.want)
-		}
+	if worker.prior == nil || len(worker.prior.ChangedFiles) != 1 {
+		t.Fatalf("prior output not applied: %#v", worker.prior)
 	}
 }

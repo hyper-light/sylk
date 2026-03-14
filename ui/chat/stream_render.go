@@ -208,7 +208,7 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 
 	badge := renderBadge(entry, th)
 	timestamp := entry.Timestamp.Format(badgeTimestampFormat)
-	header := badge + " " + lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(timestamp)
+	header := truncateVisible(badge+" "+lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(timestamp), width)
 
 	var summaryLines []string
 	if entry.ThinkingElapsed > 0 {
@@ -235,13 +235,11 @@ func renderStreamingEntryFull(entry *ChatEntry, width int, th *theme.Theme, cach
 		}
 		statusStyle := lipgloss.NewStyle().Foreground(color).Italic(true)
 		statusText := normalizeThinkingLine(entry.ThinkingText)
-		if status := strings.TrimSpace(entry.ThinkingStatus); status != "" {
-			mdLines, _ := renderMarkdownContent(status, width, statusStyle, th, nil)
-			if len(mdLines) > 0 {
-				statusText += "  " + mdLines[0]
-			}
+		if status := normalizeThinkingLine(entry.ThinkingStatus); status != "" {
+			statusText += "  " + status
 		}
-		statusLines = []string{"", statusStyle.Render(truncateToWidth(statusText, width))}
+		statusLines = append(statusLines, "")
+		statusLines = append(statusLines, capLines(wrapLine(statusText, width, statusStyle), thinkingStatusMaxLines, width, statusStyle)...)
 	}
 
 	// Pre-allocate: 1 header + summary + tool calls + content + status + 1 trailing spacer.

@@ -74,6 +74,7 @@ func (s AgentStatus) String() string {
 // AgentState holds the current state of a single agent.
 type AgentState struct {
 	ID           string
+	RoutingID    string
 	Name         string
 	AgentType    string
 	Category     string // "standalone", "pipeline", "knowledge" — resolved from agentCategoryByType.
@@ -141,8 +142,8 @@ type VariantState struct {
 	Message    string
 }
 
-// maxPipelines is the upper bound on tracked pipelines.
-const maxPipelines = 8
+// initialPipelineCapacity is the initial allocation size for tracked pipelines.
+const initialPipelineCapacity = 8
 
 // maxVariantsPerPipeline is the upper bound on variants per pipeline.
 const maxVariantsPerPipeline = 4
@@ -271,13 +272,24 @@ func canonicalStreamAgentID(agentID, agentType, pipelineID, taskID string) strin
 	return strings.TrimSpace(agentID)
 }
 
-// maxAgents is the upper bound on tracked agents to prevent unbounded growth.
-// Derived from typical multi-agent systems: 32 concurrent agents covers
-// orchestrator + guide + architects + engineers + inspectors + specialists.
-const maxAgents = 32
+func defaultRoutingAgentID(agentID, agentType, pipelineID string) string {
+	agentID = strings.TrimSpace(agentID)
+	agentType = strings.TrimSpace(agentType)
+	pipelineID = strings.TrimSpace(pipelineID)
+	if resolveAgentCategory(agentType, pipelineID) == "pipeline" && pipelineID != "" {
+		switch agentType {
+		case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
+			return pipelineID + "-" + agentType
+		}
+	}
+	return agentID
+}
 
-// maxAgentOrder tracks insert-order for consistent display. Same bound as maxAgents.
-const maxAgentOrder = maxAgents
+// initialAgentCapacity is the initial allocation size for tracked agents.
+const initialAgentCapacity = 32
+
+// initialAgentOrderCapacity tracks insert-order for consistent display.
+const initialAgentOrderCapacity = initialAgentCapacity
 
 // eventTypeToStatus maps core EventType values to the AgentStatus they produce.
 // This table-driven dispatch replaces a switch cascade.
@@ -357,7 +369,7 @@ type Model struct {
 	agents    map[string]*AgentState
 	aliases   map[string]string // Runtime/ephemeral agent IDs → canonical panel row IDs.
 	streams   map[string]*AgentEventStream
-	order     []string  // Agent IDs in insertion order (bounded by maxAgentOrder).
+	order     []string  // Agent IDs in insertion order.
 	engagedID string    // Agent ID the user is conversing with (sticky until reroute/override).
 	selected  int       // Index into m.rows for list view navigation.
 	expanded  string    // Agent ID of the expanded detail view ("" if none).
@@ -405,14 +417,14 @@ var (
 func New(th *theme.Theme) *Model {
 	idleGroup := th.Palette.IdleGroupGradient()
 	return &Model{
-		agents:              make(map[string]*AgentState, maxAgents),
-		aliases:             make(map[string]string, maxAgents*2),
-		streams:             make(map[string]*AgentEventStream, maxAgents),
-		order:               make([]string, 0, maxAgentOrder),
-		pipelines:           make(map[string]*PipelineState, maxPipelines),
-		variants:            make(map[string]*VariantState, maxPipelines*maxVariantsPerPipeline),
-		pipelineOrder:       make([]string, 0, maxPipelines),
-		collapsedPipelines:  make(map[string]bool, maxPipelines),
+		agents:              make(map[string]*AgentState, initialAgentCapacity),
+		aliases:             make(map[string]string, initialAgentCapacity*2),
+		streams:             make(map[string]*AgentEventStream, initialAgentCapacity),
+		order:               make([]string, 0, initialAgentOrderCapacity),
+		pipelines:           make(map[string]*PipelineState, initialPipelineCapacity),
+		variants:            make(map[string]*VariantState, initialPipelineCapacity*maxVariantsPerPipeline),
+		pipelineOrder:       make([]string, 0, initialPipelineCapacity),
+		collapsedPipelines:  make(map[string]bool, initialPipelineCapacity),
 		theme:               th,
 		view:                viewList,
 		eventSel:            -1,
@@ -675,6 +687,15 @@ func (m *Model) rememberAgentAliases(canonicalID, rawAgentID string, ev msg.Acti
 		return
 	}
 	m.aliases[canonicalID] = canonicalID
+	if agent := m.agents[canonicalID]; agent != nil {
+		if runtimeID := strings.TrimSpace(extractString(ev.Event.Data, "runtime_agent_id")); runtimeID != "" {
+			agent.RoutingID = runtimeID
+		} else if rawAgentID != "" && rawAgentID != canonicalID {
+			agent.RoutingID = rawAgentID
+		} else if agent.RoutingID == "" {
+			agent.RoutingID = canonicalID
+		}
+	}
 	if rawAgentID != "" {
 		m.aliases[rawAgentID] = canonicalID
 	}
@@ -744,10 +765,6 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 		}
 	}
 
-	if len(m.agents) >= maxAgents {
-		return agentID
-	}
-
 	agentName := extractString(ev.Event.Data, "agent_name")
 	if agentName == "" {
 		agentName = agentID
@@ -772,6 +789,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 
 	agent := &AgentState{
 		ID:         agentID,
+		RoutingID:  defaultRoutingAgentID(agentID, agentType, pipelineID),
 		Name:       agentName,
 		AgentType:  agentType,
 		Category:   category,
@@ -789,7 +807,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 	// activity wins the race with the canonical pipeline-state message.
 	if pipelineID != "" {
 		pl, ok := m.pipelines[pipelineID]
-		if !ok && len(m.pipelines) < maxPipelines {
+		if !ok {
 			taskID := extractPipelineTaskID(ev.Event.Data)
 			taskLabel := extractString(ev.Event.Data, "task_slug")
 			if taskID == "" {
@@ -815,7 +833,7 @@ func (m *Model) ensureAgent(agentID string, ev msg.ActivityEventMsg) string {
 			m.pipelines[pipelineID] = pl
 			m.pipelineOrder = append(m.pipelineOrder, pipelineID)
 		}
-		if pl != nil && len(pl.Members) < maxAgents {
+		if pl != nil {
 			applyPipelineActivityState(pl, ev)
 			if pl.TaskID == "" {
 				pl.TaskID = extractPipelineTaskID(ev.Event.Data)
@@ -946,9 +964,6 @@ func (m *Model) ensurePipelineMembership(agentID, pipelineID string, ev msg.Acti
 	}
 	pl, ok := m.pipelines[pipelineID]
 	if !ok {
-		if len(m.pipelines) >= maxPipelines {
-			return
-		}
 		taskID := extractPipelineTaskID(ev.Event.Data)
 		taskLabel := extractString(ev.Event.Data, "task_slug")
 		if taskID == "" {
@@ -1146,7 +1161,6 @@ func (m *Model) absorbDuplicateAgent(srcID, dstID string) {
 
 // findAgentByType returns the first agent entry with the given type, or nil.
 // Used to locate existing standalone entries for re-keying on re-activation.
-// Bounded by maxAgents (≤32).
 func (m *Model) findAgentByType(agentType string) *AgentState {
 	for _, agent := range m.agents {
 		if agent.AgentType == agentType {
@@ -1185,6 +1199,37 @@ func (m *Model) ModelIDOf(agentID string) string {
 	return ""
 }
 
+// SyncContextUsage updates the displayed context usage for an existing agent row.
+// It intentionally does not create or re-key rows; callers should pass the
+// canonical panel agent ID they want to refresh from real token telemetry.
+func (m *Model) SyncContextUsage(agentID string, usage float64) {
+	agentID = m.resolveAgentID(agentID)
+	if agentID == "" {
+		return
+	}
+	agent, ok := m.agents[agentID]
+	if !ok || agent == nil {
+		return
+	}
+	switch {
+	case usage < 0:
+		usage = 0
+	case usage > 1:
+		usage = 1
+	}
+	agent.ContextUsage = usage
+	m.rowsDirty = true
+}
+
+// ContextUsageOf returns the current displayed context usage for the given row.
+func (m *Model) ContextUsageOf(agentID string) float64 {
+	agentID = m.resolveAgentID(agentID)
+	if a, ok := m.agents[agentID]; ok && a != nil {
+		return a.ContextUsage
+	}
+	return 0
+}
+
 // updateAgentStatus applies the table-driven EventType->AgentStatus mapping.
 func (m *Model) updateAgentStatus(agentID string, ev msg.ActivityEventMsg) {
 	agent, ok := m.agents[agentID]
@@ -1192,7 +1237,9 @@ func (m *Model) updateAgentStatus(agentID string, ev msg.ActivityEventMsg) {
 		return
 	}
 
-	if status, found := eventTypeToStatus[ev.Event.EventType]; found {
+	if status, found := handoffActivityStatus(ev); found {
+		agent.Status = status
+	} else if status, found := eventTypeToStatus[ev.Event.EventType]; found {
 		agent.Status = status
 	}
 
@@ -1205,8 +1252,30 @@ func (m *Model) updateAgentMetadata(agent *AgentState, ev msg.ActivityEventMsg) 
 		agent.TaskSummary = ev.Event.Content
 	}
 
-	if usage, ok := extractFloat(ev.Event.Data, "context_usage"); ok {
-		agent.ContextUsage = usage
+	handoffState := extractString(ev.Event.Data, "handoff_state")
+	if handoffState == "completed" {
+		agent.ContextUsage = 0
+	}
+	if tokens, ok := extractInt(ev.Event.Data, "context_tokens"); ok && tokens == 0 {
+		agent.ContextUsage = 0
+	}
+	if handoffState != "" {
+		if usage, ok := extractFloat(ev.Event.Data, "context_usage"); ok {
+			agent.ContextUsage = usage
+		}
+	}
+}
+
+func handoffActivityStatus(ev msg.ActivityEventMsg) (AgentStatus, bool) {
+	switch extractString(ev.Event.Data, "handoff_state") {
+	case "recommended", "triggered", "executing", "shifting":
+		return StatusHandoff, true
+	case "completed":
+		return StatusWaiting, true
+	case "failed":
+		return StatusError, true
+	default:
+		return 0, false
 	}
 }
 
@@ -1251,9 +1320,6 @@ func (m *Model) handlePipelineState(ps msg.PipelineStateMsg) tea.Cmd {
 
 	pl, exists := m.pipelines[canonicalID]
 	if !exists {
-		if len(m.pipelines) >= maxPipelines {
-			return nil
-		}
 		pl = &PipelineState{
 			ID:        canonicalID,
 			CreatedAt: time.Now(),
@@ -1914,12 +1980,9 @@ func (m *Model) SelectByID(agentID string) bool {
 // persistedModelID, when non-empty and present in the model list, overrides the
 // default model so the UI shows the user's persisted selection on boot.
 // persistedProviderID is stored alongside the model; when empty, derived from modelID.
-// No-op if the agent already exists or the panel is at capacity.
+// No-op if the agent already exists.
 func (m *Model) SeedAgent(id, agentType, name string, supportedModels []ModelEntry, persistedModelID, persistedProviderID string) {
 	if _, exists := m.agents[id]; exists {
-		return
-	}
-	if len(m.agents) >= maxAgents {
 		return
 	}
 	category := agentCategoryByType[agentType]
@@ -1989,6 +2052,34 @@ func (m *Model) SelectedAgentID() string {
 		return row.ID
 	}
 	return ""
+}
+
+// SelectedTargetAgentID returns the concrete routing target for the selected
+// agent row. Pipeline rows keep a stable panel ID, so this prefers the latest
+// runtime worker ID when one has been observed.
+func (m *Model) SelectedTargetAgentID() string {
+	agentID := m.SelectedAgentID()
+	if agentID == "" {
+		return ""
+	}
+	return m.ResolveTargetAgentID(agentID)
+}
+
+// ResolveTargetAgentID maps a panel-facing agent row ID to the concrete worker
+// ID Guide should route to. Standalone rows usually return their own ID;
+// pipeline rows prefer the latest runtime worker ID.
+func (m *Model) ResolveTargetAgentID(agentID string) string {
+	agentID = m.resolveAgentID(strings.TrimSpace(agentID))
+	if agentID == "" {
+		return ""
+	}
+	if agent := m.agents[agentID]; agent != nil {
+		if strings.TrimSpace(agent.RoutingID) != "" {
+			return strings.TrimSpace(agent.RoutingID)
+		}
+		return defaultRoutingAgentID(agent.ID, agent.AgentType, agent.PipelineID)
+	}
+	return agentID
 }
 
 // moveSelection moves the selection cursor by delta, skipping non-selectable rows.
@@ -3010,4 +3101,24 @@ func extractFloat(data map[string]any, key string) (float64, bool) {
 	}
 	f, ok := val.(float64)
 	return f, ok
+}
+
+func extractInt(data map[string]any, key string) (int, bool) {
+	if data == nil {
+		return 0, false
+	}
+	val, ok := data[key]
+	if !ok {
+		return 0, false
+	}
+	switch typed := val.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	default:
+		return 0, false
+	}
 }

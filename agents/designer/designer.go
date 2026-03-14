@@ -629,14 +629,9 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 	if task != nil {
 		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, task)
 	}
-	systemPrompt = shared.AppendTaskExecutionGuidance(systemPrompt, contract, "designer")
 
 	d.prepareSkillsForInput(userMessage)
-	surface, err := shared.TaskToolSurface(d.toolRuntime(), contract, "designer")
-	if err != nil {
-		d.logger.Warn("build task tool surface", "error", err)
-		surface = d.toolRuntime()
-	}
+	surface := d.toolRuntime()
 	ctx = shared.WithTaskExecutionContract(ctx, contract)
 	ctx = shared.WithTaskExecutionState(ctx, shared.NewTaskExecutionState())
 	toolDefs := d.buildToolDefinitionsWithSurface(surface)
@@ -740,13 +735,23 @@ func (d *Designer) GetKnownAgents() map[string]*guide.AgentAnnouncement {
 // HandleRequest is the public entry point for direct invocations (e.g. from
 // the TDD pipeline factory). It wraps the input into a ForwardedRequest and
 // delegates to the LLM tool loop.
-func (d *Designer) HandleRequest(ctx context.Context, input string) (any, error) {
+func (d *Designer) HandleRequest(ctx context.Context, input string) (_ any, retErr error) {
+	task := shared.DecodePipelineTaskInput(input)
+
 	fwd := &guide.ForwardedRequest{
 		Input:         input,
 		Intent:        guide.IntentDesign,
 		Domain:        guide.DomainCode,
 		SourceAgentID: d.id,
 		TargetAgentID: d.id,
+	}
+	if task != nil {
+		fwd.SessionID = strings.TrimSpace(task.SessionID)
+		taskSlug, _ := task.Context["task_slug"].(string)
+		fwd.Metadata = map[string]any{
+			"task_id":   strings.TrimSpace(task.TaskID),
+			"task_slug": strings.TrimSpace(taskSlug),
+		}
 	}
 	return d.handleDesign(ctx, fwd)
 }
@@ -896,15 +901,36 @@ func (d *Designer) Descriptor() handoff.AgentDescriptor {
 }
 
 // InjectPreparedContext accepts context from a handoff.
-func (d *Designer) InjectPreparedContext(_ *handoff.PreparedContext) error {
+func (d *Designer) InjectPreparedContext(pc *handoff.PreparedContext) error {
+	if pc == nil {
+		return nil
+	}
+	if pipelineID, ok := pc.GetMetadata("pipeline_id"); ok && strings.TrimSpace(pipelineID) != "" {
+		d.pipelineID = strings.TrimSpace(pipelineID)
+	}
+	if taskID, ok := pc.GetMetadata("task_id"); ok && strings.TrimSpace(taskID) != "" {
+		d.pipelineID = strings.TrimSpace(taskID)
+	}
+	if taskSlug, ok := pc.GetMetadata("task_slug"); ok && strings.TrimSpace(taskSlug) != "" {
+		d.pipelineSlug = strings.TrimSpace(taskSlug)
+	}
 	return nil
 }
 
 // ExtractArchivableState returns state for handoff persistence.
 func (d *Designer) ExtractArchivableState() *handoff.ArchivableState {
+	state := map[string]string{}
+	if trimmed := strings.TrimSpace(d.pipelineID); trimmed != "" {
+		state["pipeline_id"] = trimmed
+		state["task_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(d.pipelineSlug); trimmed != "" {
+		state["task_slug"] = trimmed
+	}
 	return &handoff.ArchivableState{
 		AgentID:   d.AgentID(),
 		AgentType: d.AgentType(),
+		State:     state,
 		Timestamp: time.Now(),
 	}
 }
@@ -914,9 +940,17 @@ func (d *Designer) SetAgentPod(pod *shared.AgentPod) {
 	d.agentPod = pod
 }
 
+// AgentPod returns the current task-scoped pod binding.
+func (d *Designer) AgentPod() *shared.AgentPod {
+	return d.agentPod
+}
+
 // SetHandoffBridge assigns the handoff bridge for turn recording.
 func (d *Designer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	d.handoffBridge = bridge
+	if bridge != nil && d.activityPub != nil {
+		bridge.SetActivityPublisher(d.activityPub)
+	}
 }
 
 // SetFileAccess assigns the per-pipeline file access layer.

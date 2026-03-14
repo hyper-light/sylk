@@ -150,6 +150,13 @@ func compileCriteriaFromTask(task *pipelineTaskFields) *shared.InspectorCriteria
 	return criteria
 }
 
+// CompileCriteriaFromTask exposes the pipeline inspector's task-contract
+// compiler so other runtimes can seed the same inspect/test/execute loop
+// without duplicating criteria logic.
+func CompileCriteriaFromTask(task *agentShared.PipelineTaskInput) *shared.InspectorCriteria {
+	return compileCriteriaFromTask(task)
+}
+
 func defaultQualityGates(workerType string, hasTests bool) []shared.QualityGate {
 	if workerType == "designer" {
 		return []shared.QualityGate{

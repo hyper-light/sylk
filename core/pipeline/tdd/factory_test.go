@@ -22,9 +22,17 @@ func newTestFactory() *AgentFactory {
 	})
 }
 
+func testPipelineConfig(workerType WorkerType) PipelineConfig {
+	return PipelineConfig{
+		TaskID:     "task-1",
+		SessionID:  "session-1",
+		WorkerType: workerType,
+	}
+}
+
 func TestAgentFactory_CreateInspector(t *testing.T) {
 	f := newTestFactory()
-	insp, err := f.CreateInspector(WorkerEngineer)
+	insp, err := f.CreateInspector(t.Context(), testPipelineConfig(WorkerEngineer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +45,7 @@ func TestAgentFactory_CreateInspector(t *testing.T) {
 
 func TestAgentFactory_CreateInspectorDesigner(t *testing.T) {
 	f := newTestFactory()
-	insp, err := f.CreateInspector(WorkerDesigner)
+	insp, err := f.CreateInspector(t.Context(), testPipelineConfig(WorkerDesigner))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +57,7 @@ func TestAgentFactory_CreateInspectorDesigner(t *testing.T) {
 
 func TestAgentFactory_CreateTester(t *testing.T) {
 	f := newTestFactory()
-	tst, err := f.CreateTester()
+	tst, err := f.CreateTester(t.Context(), testPipelineConfig(WorkerEngineer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +69,7 @@ func TestAgentFactory_CreateTester(t *testing.T) {
 
 func TestAgentFactory_CreateWorkerEngineer(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(t.Context(), WorkerEngineer)
+	w, err := f.CreateWorker(t.Context(), WorkerEngineer, testPipelineConfig(WorkerEngineer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +82,7 @@ func TestAgentFactory_CreateWorkerEngineer(t *testing.T) {
 
 func TestAgentFactory_CreateWorkerDesigner(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(t.Context(), WorkerDesigner)
+	w, err := f.CreateWorker(t.Context(), WorkerDesigner, testPipelineConfig(WorkerDesigner))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +95,7 @@ func TestAgentFactory_CreateWorkerDesigner(t *testing.T) {
 
 func TestAgentFactory_CreateWorkerUnknown(t *testing.T) {
 	f := newTestFactory()
-	_, err := f.CreateWorker(t.Context(), "unknown")
+	_, err := f.CreateWorker(t.Context(), "unknown", testPipelineConfig(WorkerEngineer))
 	if err == nil {
 		t.Error("expected error for unknown worker type")
 	}
@@ -95,7 +103,7 @@ func TestAgentFactory_CreateWorkerUnknown(t *testing.T) {
 
 func TestAgentFactory_CreateCoWorkers(t *testing.T) {
 	f := newTestFactory()
-	workers, err := f.CreateCoWorkers(t.Context(), []WorkerType{WorkerEngineer})
+	workers, err := f.CreateCoWorkers(t.Context(), []WorkerType{WorkerEngineer}, testPipelineConfig(WorkerEngineer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +118,7 @@ func TestAgentFactory_CreateCoWorkers(t *testing.T) {
 func TestAgentFactory_CreateCoWorkers_PartialFailure(t *testing.T) {
 	f := newTestFactory()
 	// Second type is invalid — first worker should be closed on failure.
-	_, err := f.CreateCoWorkers(t.Context(), []WorkerType{WorkerEngineer, "invalid"})
+	_, err := f.CreateCoWorkers(t.Context(), []WorkerType{WorkerEngineer, "invalid"}, testPipelineConfig(WorkerEngineer))
 	if err == nil {
 		t.Error("expected error for invalid co-worker type")
 	}
@@ -118,7 +126,7 @@ func TestAgentFactory_CreateCoWorkers_PartialFailure(t *testing.T) {
 
 func TestAgentFactory_CreateCoWorkers_Empty(t *testing.T) {
 	f := newTestFactory()
-	workers, err := f.CreateCoWorkers(t.Context(), nil)
+	workers, err := f.CreateCoWorkers(t.Context(), nil, testPipelineConfig(WorkerEngineer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +137,7 @@ func TestAgentFactory_CreateCoWorkers_Empty(t *testing.T) {
 
 func TestTaskPromptSetter(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(t.Context(), WorkerEngineer)
+	w, err := f.CreateWorker(t.Context(), WorkerEngineer, testPipelineConfig(WorkerEngineer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +157,7 @@ func TestTaskPromptSetter(t *testing.T) {
 
 func TestPriorOutputSetter(t *testing.T) {
 	f := newTestFactory()
-	w, err := f.CreateWorker(t.Context(), WorkerEngineer)
+	w, err := f.CreateWorker(t.Context(), WorkerEngineer, testPipelineConfig(WorkerEngineer))
 	if err != nil {
 		t.Fatal(err)
 	}

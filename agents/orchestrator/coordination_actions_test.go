@@ -55,15 +55,15 @@ func TestPublishCoordinationSuccess_PublishesToSourceAgentResponseTopic(t *testi
 	}
 }
 
-func TestHandleCoordinationAction_RequestReviewPublishesTaskScopedWakeup(t *testing.T) {
+func TestHandleCoordinationAction_RequestReviewSkipsRedundantPipelineWake(t *testing.T) {
 	ctx := context.Background()
 	svc := newCoordinationTestService(t)
 	bus := &coordinationActionTestBus{}
 	o := &Orchestrator{
-		bus:         bus,
+		bus:          bus,
 		coordination: svc,
-		knownAgents: map[string]*guide.AgentAnnouncement{},
-		config:      Config{AgentID: "orchestrator", SessionID: "sess-1"},
+		knownAgents:  map[string]*guide.AgentAnnouncement{},
+		config:       Config{AgentID: "orchestrator", SessionID: "sess-1"},
 	}
 
 	artifact, err := svc.PublishArtifact(ctx, coordination.Actor{AgentID: "tester-1", AgentType: "tester-pipeline"}, coordination.PublishArtifactInput{
@@ -100,23 +100,12 @@ func TestHandleCoordinationAction_RequestReviewPublishesTaskScopedWakeup(t *test
 	if !handled {
 		t.Fatal("expected action to be handled")
 	}
-	if len(bus.msgs) != 2 {
-		t.Fatalf("published messages = %d, want 2 (wake + response)", len(bus.msgs))
+	if len(bus.msgs) != 1 {
+		t.Fatalf("published messages = %d, want 1 (response only)", len(bus.msgs))
 	}
 
-	wakeReq, ok := bus.msgs[0].GetRouteRequest()
-	if !ok || wakeReq == nil {
-		t.Fatalf("first published message was not a route request: %#v", bus.msgs[0])
-	}
-	if wakeReq.TargetAgentID != TaskScopedAgentID("task-7", "engineer") {
-		t.Fatalf("wake target = %q, want %q", wakeReq.TargetAgentID, TaskScopedAgentID("task-7", "engineer"))
-	}
-	if !wakeReq.FireAndForget {
-		t.Fatal("expected wake request to be fire-and-forget")
-	}
-
-	response, ok := bus.msgs[1].GetRouteResponse()
+	response, ok := bus.msgs[0].GetRouteResponse()
 	if !ok || response == nil || !response.Success {
-		t.Fatalf("expected successful coordination response, got %#v", bus.msgs[1])
+		t.Fatalf("expected successful coordination response, got %#v", bus.msgs[0])
 	}
 }

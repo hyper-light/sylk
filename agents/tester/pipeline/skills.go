@@ -26,6 +26,10 @@ func reportToEngineerSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("report", "engineer", "feedback", "failure").
 		Priority(85).
+		Usage("Use after you have concrete test or diagnosis evidence that should trigger engineering follow-up. The report should be specific enough for Engineer to act on without rediscovering the issue from scratch.").
+		Requirement("Requires a real failure signal or verification finding with root cause and a concrete suggested fix.").
+		Satisfies("Publishes a reusable verification artifact and opens an engineer review obligation in the task ledger.").
+		Avoid("Do not use for speculative concerns that have not been validated by planning, writing, execution, or diagnosis evidence.").
 		StringParam("test_name", "Name of the failing test", true).
 		StringParam("error_message", "Error message from the failure", true).
 		StringParam("root_cause", "Root cause analysis", true).
@@ -93,6 +97,10 @@ func reportToDesignerSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("report", "designer", "feedback", "failure", "design").
 		Priority(85).
+		Usage("Use when the verification result points to a UX, accessibility, or design-spec problem that Designer needs to address.").
+		Requirement("Requires a real validation finding with enough detail for Designer to understand the design implication and proposed change.").
+		Satisfies("Publishes a reusable verification artifact and opens a designer review obligation in the task ledger.").
+		Avoid("Do not use for purely implementation-local defects that belong with Engineer.").
 		StringParam("test_name", "Name of the failing test", true).
 		StringParam("error_message", "Error message from the failure", true).
 		StringParam("root_cause", "Root cause analysis", true).

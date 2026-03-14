@@ -47,3 +47,20 @@ func TestCanonicalPipelineTaskIdentity_FallsBackThroughContextAndNodeID(t *testi
 		t.Fatalf("fallback taskSlug = %q, want empty", taskSlug)
 	}
 }
+
+func TestPipelineWorkerAgentID_IsStableShortID(t *testing.T) {
+	first := PipelineWorkerAgentID("task-7", "engineer")
+	second := PipelineWorkerAgentID("task-7", "engineer")
+	if first == "" {
+		t.Fatal("expected non-empty pipeline worker agent ID")
+	}
+	if len(first) != 8 {
+		t.Fatalf("len(PipelineWorkerAgentID()) = %d, want 8", len(first))
+	}
+	if first != second {
+		t.Fatalf("PipelineWorkerAgentID() = %q then %q, want stable value", first, second)
+	}
+	if other := PipelineWorkerAgentID("task-7", "designer"); other == first {
+		t.Fatalf("different worker roles should not share IDs: %q", first)
+	}
+}

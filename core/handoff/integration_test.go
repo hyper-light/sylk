@@ -469,6 +469,34 @@ func TestContextCheckHook_Throttling(t *testing.T) {
 	}
 }
 
+func TestContextCheckHook_ThresholdBypassesThrottle(t *testing.T) {
+	config := DefaultContextCheckConfig()
+	config.MinCheckInterval = 1 * time.Hour
+	config.ContextThreshold = 0.75
+	config.UseGPPrediction = false
+
+	hook := NewContextCheckHook(nil, config)
+	_ = hook.Start()
+	defer hook.Stop()
+
+	ctx := &ContextState{
+		AgentID:        "agent-threshold",
+		AgentType:      "tester-pipeline",
+		ContextSize:    76000,
+		MaxContextSize: 100000,
+	}
+
+	first := hook.EvaluateContext(ctx)
+	if first == nil || !first.ShouldHandoff {
+		t.Fatalf("expected first evaluation to trigger handoff, got %#v", first)
+	}
+
+	second := hook.EvaluateContext(ctx)
+	if second == nil || !second.ShouldHandoff {
+		t.Fatalf("expected threshold crossing to bypass throttling, got %#v", second)
+	}
+}
+
 func TestContextCheckHook_Notifications(t *testing.T) {
 	config := DefaultContextCheckConfig()
 	config.ContextThreshold = 0.5
@@ -1026,9 +1054,9 @@ func TestIntegration_FullPipelineFlow(t *testing.T) {
 
 		// Add GP observation
 		gp.AddObservationFromValues(
-			turn*10000,          // Context size grows
-			100+turn*10,         // Token count varies
-			turn%3,              // Tool calls
+			turn*10000,             // Context size grows
+			100+turn*10,            // Token count varies
+			turn%3,                 // Tool calls
 			1.0-float64(turn)*0.05, // Quality decreases
 		)
 	}

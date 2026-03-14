@@ -74,6 +74,11 @@ func (e *Engineer) registerCoreSkills() {
 	}) {
 		e.skills.Register(skill)
 	}
+	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
+		AgentType: func() string { return "engineer" },
+	}) {
+		e.skills.Register(skill)
+	}
 
 	// Discovery
 	e.skills.Register(discoverProjectToolsSkill(e))
@@ -362,6 +367,8 @@ func readFileSkill(e *Engineer) *skills.Skill {
 		Domain("filesystem").
 		Keywords("read", "file", "content", "view", "cat").
 		Priority(100).
+		Usage("Use to inspect the current implementation before mutating unfamiliar code or when disk-level context is needed beyond the workspace overlay views.").
+		Satisfies("Provides concrete file evidence for planning, implementation, and self-audit.").
 		StringParam("path", "Path to the file to read (relative to working directory)", true).
 		IntParam("offset", "Line offset to start reading from (0-based)", false).
 		IntParam("limit", "Maximum number of lines to read (default: 1000)", false).
@@ -444,6 +451,10 @@ func runCommandSkill(e *Engineer) *skills.Skill {
 		Domain("code").
 		Keywords("run", "execute", "command", "shell", "bash").
 		Priority(80).
+		Usage("Use to verify implementation behavior, run project tests, or invoke project tooling after you know the exact single command you need.").
+		Requirement("Each invocation must contain exactly one command. Do not use shell control operators, pipes, redirection, or subshell syntax.").
+		Satisfies("Produces concrete execution evidence for implementation validation and reporting.").
+		Avoid("Do not pack multiple logical steps into one call or use it as a substitute for reading the code and task contract first.").
 		StringParam("command", "Command to execute", true).
 		StringParam("working_dir", "Working directory for command execution", false).
 		IntParam("timeout_ms", "Command timeout in milliseconds (default: 30000)", false).
@@ -749,6 +760,9 @@ func lspSkill(e *Engineer) *skills.Skill {
 		Keywords("lsp", "symbol", "definition", "references", "hover",
 			"outline", "structure", "call hierarchy", "callers", "callees").
 		Priority(95).
+		Usage("Use to navigate unfamiliar code, confirm symbol relationships, and limit mutation scope before editing.").
+		Satisfies("Provides symbol-level evidence for implementation planning and safe code changes.").
+		Avoid("Do not guess symbol relationships when the language server can answer them directly.").
 		EnumParam("action", "LSP action to execute", []string{
 			"goto_definition", "find_references", "hover", "symbols", "call_hierarchy",
 		}, true).
@@ -920,6 +934,9 @@ func formatSkill(e *Engineer) *skills.Skill {
 		Domain("code_quality").
 		Keywords("format", "formatter", "gofmt", "goimports", "prettier", "style", "whitespace").
 		Priority(90).
+		Usage("Use after mutating code to verify or apply the project-appropriate formatter before final reporting.").
+		Satisfies("Provides formatting evidence or performs the formatting step for the changed files.").
+		Avoid("Do not rely on it to fix semantic or lint issues.").
 		EnumParam("action", "Format action to execute", []string{"check", "apply", "detect"}, true).
 		StringParam("file", "File path to format or check", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -1040,6 +1057,9 @@ func lintSkill(e *Engineer) *skills.Skill {
 		Domain("code_quality").
 		Keywords("lint", "linter", "golangci-lint", "eslint", "ruff", "clippy", "issues", "warnings").
 		Priority(90).
+		Usage("Use after implementation changes to gather code-quality evidence on the affected scope before auditing or reporting completion.").
+		Satisfies("Produces lint evidence for self-audit, confidence reporting, and review artifacts.").
+		Avoid("Do not use detect/run on the whole repo when the task only changed a narrow area unless the task explicitly requires global validation.").
 		EnumParam("action", "Lint action to execute", []string{"run", "detect"}, true).
 		ArrayParam("paths", "File or directory paths to lint", "string", false).
 		BoolParam("fix", "Attempt to auto-fix issues", false).

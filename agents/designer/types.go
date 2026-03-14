@@ -453,7 +453,7 @@ type DesignerConfig struct {
 }
 
 // DefaultDesignerToolLoopConfig returns the default LLM tool loop configuration.
-// MaxToolRuns=16: 6 protocol phases × ~2.5 avg skill invocations per phase.
+// MaxToolRuns=16: enough room for research, planning, mutation, validation, and coordination turns.
 // MaxTokens=16384: matches pipeline tester budget.
 // DefaultTimeout=90s: 1.5× pipeline tester's 60s, proportional to larger context.
 func DefaultDesignerToolLoopConfig() DesignerConfig {

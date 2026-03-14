@@ -3,6 +3,7 @@ package architect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/dag"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
@@ -28,6 +30,48 @@ func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
 		pendingBus:  make(map[string]chan *guide.Message),
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
 	}
+}
+
+type captureConversationPlanner struct {
+	lastRequest plannerConversationRequest
+	response    string
+}
+
+func (p *captureConversationPlanner) AnalyzeRequirements(context.Context, string, map[string]any) (*Requirements, error) {
+	return nil, errors.New("unexpected AnalyzeRequirements call")
+}
+
+func (p *captureConversationPlanner) DesignArchitecture(context.Context, *Requirements, *CodebasePatterns) (*SolutionArchitecture, error) {
+	return nil, errors.New("unexpected DesignArchitecture call")
+}
+
+func (p *captureConversationPlanner) GenerateTasks(context.Context, *SolutionArchitecture, *PlanConstraints) ([]*AtomicTask, error) {
+	return nil, errors.New("unexpected GenerateTasks call")
+}
+
+func (p *captureConversationPlanner) ComposeUserResponse(_ context.Context, request plannerConversationRequest) (string, error) {
+	p.lastRequest = request
+	if strings.TrimSpace(p.response) != "" {
+		return p.response, nil
+	}
+	return "planner response", nil
+}
+
+func (p *captureConversationPlanner) CompleteForToolLoop(context.Context, *providers.Request, string, func(string)) (*providers.Response, error) {
+	return nil, errors.New("unexpected CompleteForToolLoop call")
+}
+
+func (p *captureConversationPlanner) ConversationSystemPrompt() string {
+	return "test planner prompt"
+}
+
+func unwrapConversationResult(t *testing.T, result any) *ConversationResult {
+	t.Helper()
+	conv, ok := unwrapArchitectResult(result).(*ConversationResult)
+	if !ok {
+		t.Fatalf("conversation result type = %T, want *ConversationResult", unwrapArchitectResult(result))
+	}
+	return conv
 }
 
 func TestLatestReadyPlan_NoPlans(t *testing.T) {
@@ -283,13 +327,17 @@ func TestHandleConversation_UsesMetadataPlanIDAcrossSessionDrift(t *testing.T) {
 	}
 }
 
-func TestHandleConversation_ClearsExpiredPendingWorkBeforeReturningPendingMessage(t *testing.T) {
+func TestHandleConversation_ClearsExpiredPendingWorkAndCarriesReadyPlanIntoPlanner(t *testing.T) {
 	now := time.Now().UTC()
 	plan := &DesignPlan{
 		ID:        "plan-expired-pending",
 		SessionID: "sess-plan",
+		Query:     "build the feature",
 		Status:    PlanStatusReady,
 		UpdatedAt: now,
+		Tasks: []*AtomicTask{
+			{Name: "Wire the endpoint", AgentType: "engineer", Description: "Implement the initial HTTP surface."},
+		},
 		PendingWork: &PendingContinuation{
 			Kind:      string(continuationKindAcceptanceEval),
 			Status:    string(continuationStatusPending),
@@ -298,27 +346,36 @@ func TestHandleConversation_ClearsExpiredPendingWorkBeforeReturningPendingMessag
 		},
 	}
 	a := testArchitectWithStore(t, plan)
+	planner := &captureConversationPlanner{response: "planner saw the recovered plan"}
+	a.config.EnableLLM = true
+	a.planner = planner
 
 	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
-		Input:     "go ahead",
+		Input:     "can you remind me what we planned?",
 		SessionID: plan.SessionID,
 		Intent:    guide.IntentChat,
 	})
 	if err != nil {
 		t.Fatalf("handleConversation error = %v", err)
 	}
-	conv, ok := result.(*ConversationResult)
-	if !ok {
-		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
-	}
-	if strings.Contains(conv.Response, "reviewing your response against the current plan") {
-		t.Fatalf("response = %q, want stale pending message to be cleared", conv.Response)
-	}
-	if !strings.Contains(conv.Response, "I still have a previous plan ready") {
-		t.Fatalf("response = %q, want resume suggestion after clearing stale pending", conv.Response)
+	conv := unwrapConversationResult(t, result)
+	if conv.Response != "planner saw the recovered plan" {
+		t.Fatalf("response = %q, want planner response", conv.Response)
 	}
 	if plan.PendingWork != nil {
 		t.Fatalf("expected stale pending work to clear, got %+v", plan.PendingWork)
+	}
+	if planner.lastRequest.Mode != plannerConversationModeExistingReady {
+		t.Fatalf("mode = %q, want %q", planner.lastRequest.Mode, plannerConversationModeExistingReady)
+	}
+	if planner.lastRequest.PlanID != plan.ID {
+		t.Fatalf("plan_id = %q, want %q", planner.lastRequest.PlanID, plan.ID)
+	}
+	if planner.lastRequest.PriorQuery != plan.Query {
+		t.Fatalf("prior_query = %q, want %q", planner.lastRequest.PriorQuery, plan.Query)
+	}
+	if !strings.Contains(planner.lastRequest.PlanSummary, "Wire the endpoint") {
+		t.Fatalf("plan_summary = %q, want task summary from ready plan", planner.lastRequest.PlanSummary)
 	}
 }
 
@@ -347,10 +404,7 @@ func TestHandleConversation_ClearsExpiredMetadataPendingWorkAcrossSessionDrift(t
 	if err != nil {
 		t.Fatalf("handleConversation error = %v", err)
 	}
-	conv, ok := result.(*ConversationResult)
-	if !ok {
-		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
-	}
+	conv := unwrapConversationResult(t, result)
 	if strings.Contains(conv.Response, "reviewing your response against the current plan") {
 		t.Fatalf("response = %q, want stale pending message to be cleared", conv.Response)
 	}
@@ -362,7 +416,7 @@ func TestHandleConversation_ClearsExpiredMetadataPendingWorkAcrossSessionDrift(t
 	}
 }
 
-func TestHandleConversation_OffersResumeSuggestionForUniqueRecoveredReadyPlanAcrossSessionDrift(t *testing.T) {
+func TestHandleConversation_UsesPlannerForUniqueRecoveredReadyPlanAcrossSessionDrift(t *testing.T) {
 	now := time.Now().UTC()
 	plan := &DesignPlan{
 		ID:        "plan-unique-recovered",
@@ -370,44 +424,41 @@ func TestHandleConversation_OffersResumeSuggestionForUniqueRecoveredReadyPlanAcr
 		Query:     "build the feature",
 		Status:    PlanStatusReady,
 		UpdatedAt: now,
+		Tasks: []*AtomicTask{
+			{Name: "Add orchestration", AgentType: "orchestrator", Description: "Coordinate the build workflow."},
+		},
 	}
 	a := testArchitectWithStore(t, plan)
+	planner := &captureConversationPlanner{response: "planner kept continuity"}
+	a.config.EnableLLM = true
+	a.planner = planner
 
 	result, err := a.handleConversation(context.Background(), &guide.ForwardedRequest{
-		Input:     "what's next?",
+		Input:     "what changed since that plan?",
 		SessionID: "sess-drifted",
 		Intent:    guide.IntentChat,
 	})
 	if err != nil {
 		t.Fatalf("handleConversation error = %v", err)
 	}
-	conv, ok := result.(*ConversationResult)
-	if !ok {
-		t.Fatalf("handleConversation result type = %T, want *ConversationResult", result)
-	}
-	if !strings.Contains(conv.Response, `I still have a previous plan ready for "build the feature".`) {
-		t.Fatalf("response = %q, want unique recovered resume suggestion", conv.Response)
+	conv := unwrapConversationResult(t, result)
+	if conv.Response != "planner kept continuity" {
+		t.Fatalf("response = %q, want planner response", conv.Response)
 	}
 	if conv.Directive != nil {
 		t.Fatalf("directive = %+v, want nil so the old plan is not silently re-armed", conv.Directive)
 	}
-}
-
-func TestReadyPlanResumeSuggestion_RendersMultilineQueryAsMarkdown(t *testing.T) {
-	plan := &DesignPlan{
-		Query: "Create a toy Python \"Hello World\" CLI application with the following requirements:\n- Single Python file (hello.py)\n- Includes a basic test (pytest)",
+	if planner.lastRequest.Mode != plannerConversationModeExistingReady {
+		t.Fatalf("mode = %q, want %q", planner.lastRequest.Mode, plannerConversationModeExistingReady)
 	}
-
-	got := readyPlanResumeSuggestion(plan)
-
-	if !strings.Contains(got, "I still have a previous plan ready for:\n\nCreate a toy Python") {
-		t.Fatalf("response = %q, want markdown lead-in", got)
+	if planner.lastRequest.PlanID != plan.ID {
+		t.Fatalf("plan_id = %q, want %q", planner.lastRequest.PlanID, plan.ID)
 	}
-	if !strings.Contains(got, "\n- Single Python file (hello.py)\n- Includes a basic test (pytest)\n\nIf you want to use it") {
-		t.Fatalf("response = %q, want preserved markdown list", got)
+	if planner.lastRequest.PriorQuery != plan.Query {
+		t.Fatalf("prior_query = %q, want %q", planner.lastRequest.PriorQuery, plan.Query)
 	}
-	if strings.Contains(got, `\n- Single Python file`) {
-		t.Fatalf("response = %q, want real newlines instead of escaped sequences", got)
+	if !strings.Contains(planner.lastRequest.PlanSummary, "Add orchestration") {
+		t.Fatalf("plan_summary = %q, want recovered plan summary", planner.lastRequest.PlanSummary)
 	}
 }
 

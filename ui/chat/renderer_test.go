@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/ui/theme"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestRenderEntry_ThinkingPhaseWrapsLongText(t *testing.T) {
@@ -200,5 +201,84 @@ func TestStreamRenderHeightMatch(t *testing.T) {
 	if len(standardLines) != len(streamLines) {
 		t.Fatalf("height mismatch: standard path produced %d lines, streaming path produced %d lines",
 			len(standardLines), len(streamLines))
+	}
+}
+
+func TestRenderEntry_ToolCallLinesRespectViewportWidth(t *testing.T) {
+	entry := &ChatEntry{
+		ID:        "inspector-1",
+		Timestamp: time.Now(),
+		Source:    SourceAgent,
+		AgentType: "inspector-pipeline",
+		ToolCalls: []ToolCallRecord{
+			{
+				ToolName:    "inspect_workspace_state",
+				ArgsSummary: `path="src/hello_cli/cli.py" include_tool_output=true`,
+				Output:      strings.Repeat("tool output wrap ", 8),
+				StartedAt:   time.Now().Add(-1500 * time.Millisecond),
+				Duration:    1500 * time.Millisecond,
+				Success:     true,
+				Completed:   true,
+				Expanded:    true,
+			},
+		},
+	}
+
+	const width = 28
+	lines, _ := RenderEntry(entry, width, theme.DefaultDark(), nil)
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
+		}
+	}
+}
+
+func TestRenderEntry_LongPipelineHeaderRespectsViewportWidth(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "engineer-1",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "engineer",
+		TaskName:       "Very long pipeline task title that would otherwise wrap the engineer badge line",
+		TaskSlug:       "very_long_pipeline_task_title_that_would_otherwise_wrap_the_engineer_badge_line",
+		Streaming:      true,
+		ThinkingText:   "⠋  0.0s",
+		ThinkingStatus: "Reviewing task criteria, active test failures, and task-local workspace before implementing changes.",
+	}
+
+	const width = 32
+	lines, _ := RenderEntry(entry, width, theme.DefaultDark(), nil)
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
+		}
+	}
+}
+
+func TestRenderStreamingEntryFull_PipelineStatusFooterRespectsViewportWidth(t *testing.T) {
+	entry := &ChatEntry{
+		ID:             "pipeline-stream",
+		Timestamp:      time.Now(),
+		Source:         SourceAgent,
+		AgentType:      "inspector-pipeline",
+		AgentID:        "task_auth_checkout:inspector-pipeline",
+		TaskName:       "Auth checkout",
+		TaskSlug:       "auth-checkout",
+		Content:        "Reviewing acceptance criteria before applying the next patch.",
+		Streaming:      true,
+		ThinkingText:   "Analyzing current pipeline phase",
+		ThinkingStatus: "Reviewing task criteria, active test failures, and task-local workspace before implementing changes.",
+	}
+
+	const width = 28
+	lines, _ := renderStreamingEntryFull(entry, width, theme.DefaultDark(), nil, &streamRenderState{})
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "Analyzing current pipeline") || !strings.Contains(joined, "phase") {
+		t.Fatalf("stream footer missing thinking text: %q", joined)
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i, got, width, line)
+		}
 	}
 }

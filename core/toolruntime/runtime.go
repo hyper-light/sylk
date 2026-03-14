@@ -898,6 +898,15 @@ func compileToolDescription(skill *skills.Skill, policy ToolPolicy) string {
 	if len(skill.BestPractices) > 0 {
 		parts = append(parts, "Best practices: "+joinExamples(skill.BestPractices))
 	}
+	if len(skill.Requirements) > 0 {
+		parts = append(parts, "Requirements: "+joinExamples(skill.Requirements))
+	}
+	if len(skill.Satisfies) > 0 {
+		parts = append(parts, "Satisfies: "+joinExamples(skill.Satisfies))
+	}
+	if len(skill.Avoids) > 0 {
+		parts = append(parts, "Avoid: "+joinExamples(skill.Avoids))
+	}
 	if len(skill.Examples) > 0 {
 		parts = append(parts, "Examples: "+joinExamples(skill.Examples))
 	}

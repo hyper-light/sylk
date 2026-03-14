@@ -118,6 +118,24 @@ func (vm *VolumeManager) FileAccessFor(agentType string) versioning.FileAccess {
 	return vol.FileAccess()
 }
 
+// WorkspaceViewsFor returns the layered workspace view access for the given
+// agent type based on the configured mount mapping. Returns nil if no mapping
+// exists or the volume is not mounted.
+func (vm *VolumeManager) WorkspaceViewsFor(agentType string) versioning.WorkspaceViewAccess {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+
+	volName, ok := vm.mounts[agentType]
+	if !ok {
+		return nil
+	}
+	vol, ok := vm.volumes[volName]
+	if !ok {
+		return nil
+	}
+	return vol.WorkspaceViews()
+}
+
 // InjectFileAccess sets FileAccess on all container agents that implement
 // FileAccessConsumer. Uses the mount mapping to determine which volume
 // each agent receives.

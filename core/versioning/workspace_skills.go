@@ -25,6 +25,9 @@ func NewReadWorkspaceFileSkill(getViews WorkspaceViewAccessFunc, defaultPipeline
 		Domain("filesystem").
 		Keywords("workspace", "disk", "global", "pipeline", "read", "compare").
 		Priority(92).
+		Usage("Use to inspect the actual state of a path before reasoning about edits. If the file is absent, the skill returns structured missing metadata so create-new-file flows can continue without treating absence as a hard failure.").
+		Satisfies("Provides concrete workspace evidence for planning, inspection, implementation, or test synthesis.").
+		Avoid("Do not assume the disk view and pipeline view match; choose the view intentionally for the question you are answering.").
 		EnumParam("view", "Workspace view to read from", []string{string(WorkspaceViewDisk), string(WorkspaceViewGlobal), string(WorkspaceViewPipeline)}, true).
 		StringParam("path", "Path to the file to read", true).
 		StringParam("pipeline_id", "Task pipeline ID when reading pipeline-local state", false).
@@ -174,6 +177,8 @@ func NewInspectWorkspaceStateSkill(getViews WorkspaceViewAccessFunc, defaultPipe
 		Domain("filesystem").
 		Keywords("workspace", "state", "compare", "disk", "global", "pipeline", "diff").
 		Priority(90).
+		Usage("Use when you need to understand whether a path exists, differs, or is only present in a higher overlay before deciding what to validate or mutate.").
+		Satisfies("Produces multi-view state evidence for contract synthesis, implementation review, and leased-write decisions.").
 		StringParam("path", "Path to inspect across workspace views", true).
 		StringParam("pipeline_id", "Task pipeline ID when including pipeline-local state", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -203,6 +208,8 @@ func NewSummarizeWorkspaceStateSkill(getViews WorkspaceViewAccessFunc, defaultPi
 		Domain("filesystem").
 		Keywords("workspace", "summary", "compare", "disk", "global", "pipeline", "changed files", "delta").
 		Priority(91).
+		Usage("Use for a quick multi-path snapshot before deeper reads or validation. Prefer this over many scattered single-path checks when you are orienting on a task surface.").
+		Satisfies("Provides bounded workspace-surface evidence that can seed planning, review, or inspection without reading every file immediately.").
 		ArrayParam("paths", "Paths to summarize across workspace views", "string", true).
 		StringParam("pipeline_id", "Task pipeline ID when including pipeline-local state", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {

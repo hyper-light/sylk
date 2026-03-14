@@ -11,8 +11,6 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -91,7 +89,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		agentShared.PublishIntermediateToolTurn(gi.bus, gi.channels, ctx, gi.id, resp)
 
 		if len(resp.ToolCalls) == 0 {
-			gi.recordTurn(req, resp, turn, 0, 0, turnStart)
+			gi.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				agentShared.LogAgentEvent(lm.EventLogger, agentlog.EventAuditCompleted,
 					lm.AgentID, lm.SessionID, lm.CorrID, "info",
@@ -114,7 +112,7 @@ func (gi *GlobalInspector) executeToolLoop(ctx context.Context, req *providers.R
 		}
 
 		errCount, rerouted := gi.applyToolCalls(ctx, req, resp)
-		gi.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		gi.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}
@@ -266,6 +264,7 @@ func (gi *GlobalInspector) toolInvocations(ctx context.Context, calls []provider
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
 func (gi *GlobalInspector) recordTurn(
+	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	turn, toolCalls, errCount int,
@@ -274,20 +273,5 @@ func (gi *GlobalInspector) recordTurn(
 	if gi.handoffBridge == nil {
 		return
 	}
-
-	gi.handoffBridge.RecordTurn(handoff.TurnRecord{
-		InputTokens:      resp.Usage.InputTokens,
-		OutputTokens:     resp.Usage.OutputTokens,
-		ContextSize:      agentShared.EstimateContextSize(req.Messages),
-		ToolCalls:        toolCalls,
-		ToolSuccesses:    toolCalls - errCount,
-		TurnNumber:       turn + 1,
-		Duration:         time.Since(turnStart),
-		Timestamp:        time.Now(),
-		Stage:            llmruntime.StageFromRequest(req),
-		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
-		StopReason:       resp.StopReason,
-		CacheReadTokens:  resp.Usage.CacheReadTokens,
-		CacheWriteTokens: resp.Usage.CacheWriteTokens,
-	})
+	gi.handoffBridge.RecordTurn(agentShared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

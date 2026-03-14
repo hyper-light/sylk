@@ -288,6 +288,9 @@ func (g *Guardian) SetAgentPod(pod *shared.AgentPod) {
 // SetHandoffBridge stores the bridge for handoff context tracking.
 func (g *Guardian) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	g.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(g.activityPub)
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
@@ -221,7 +219,7 @@ func (a *Architect) executeToolLoop(
 				"thinking_preview", truncateString(resp.Thinking, 300),
 				"model", resp.Model,
 				"tools_were_available", len(req.Tools) > 0)
-			a.recordTurn(req, resp, turn, 0, 0, turnStart)
+			a.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			return strings.TrimSpace(resp.Content), nil
 		}
 
@@ -275,7 +273,7 @@ func (a *Architect) executeToolLoop(
 			"err_count", errCount,
 			"rerouted", rerouted,
 			"messages_after", len(req.Messages))
-		a.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		a.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			a.logInfo("executeToolLoop: REROUTED",
 				"stage", stage,
@@ -477,8 +475,12 @@ func filterToolsByNames(tools []providers.Tool, allowed []string) []providers.To
 
 // buildToolDefinitions converts loaded skills to provider Tool format.
 func (a *Architect) buildToolDefinitions() []providers.Tool {
-	a.toolRuntime().SyncActiveFromLoaded()
-	return a.toolRuntime().BuildToolDefinitions()
+	runtime := a.toolRuntime()
+	if runtime == nil {
+		return nil
+	}
+	runtime.SyncActiveFromLoaded()
+	return runtime.BuildToolDefinitions()
 }
 
 func (a *Architect) toolRuntime() *toolruntime.Runtime {
@@ -505,6 +507,7 @@ func (a *Architect) toolInvocations(ctx context.Context, calls []providers.ToolC
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
 func (a *Architect) recordTurn(
+	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	turn, toolCalls, errCount int,
@@ -514,19 +517,5 @@ func (a *Architect) recordTurn(
 		return
 	}
 
-	a.handoffBridge.RecordTurn(handoff.TurnRecord{
-		InputTokens:      resp.Usage.InputTokens,
-		OutputTokens:     resp.Usage.OutputTokens,
-		ContextSize:      shared.EstimateContextSize(req.Messages),
-		ToolCalls:        toolCalls,
-		ToolSuccesses:    toolCalls - errCount,
-		TurnNumber:       turn + 1,
-		Duration:         time.Since(turnStart),
-		Timestamp:        time.Now(),
-		Stage:            llmruntime.StageFromRequest(req),
-		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
-		StopReason:       resp.StopReason,
-		CacheReadTokens:  resp.Usage.CacheReadTokens,
-		CacheWriteTokens: resp.Usage.CacheWriteTokens,
-	})
+	a.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

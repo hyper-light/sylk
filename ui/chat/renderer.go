@@ -64,7 +64,7 @@ func RenderEntry(entry *ChatEntry, width int, th *theme.Theme, cache *codeBlockC
 
 	badge := renderBadge(entry, th)
 	timestamp := entry.Timestamp.Format(badgeTimestampFormat)
-	header := badge + " " + lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(timestamp)
+	header := truncateVisible(badge+" "+lipgloss.NewStyle().Foreground(th.Palette.Muted).Render(timestamp), width)
 
 	bodyStyle := messageStyle(entry.Source, th)
 
@@ -156,7 +156,9 @@ func capLines(lines []string, maxLines, _ int, style lipgloss.Style) []string {
 	}
 	capped := make([]string, maxLines)
 	copy(capped, lines[:maxLines])
-	capped[maxLines-1] += style.Render("…")
+	last := capped[maxLines-1]
+	last = truncateVisible(last, max(lipgloss.Width(last)-1, 0))
+	capped[maxLines-1] = last + style.Render("…")
 	return capped
 }
 

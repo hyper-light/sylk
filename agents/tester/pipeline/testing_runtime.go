@@ -61,8 +61,7 @@ type testHarnessState struct {
 }
 
 type taskRuntimeSnapshot struct {
-	task       *agentshared.PipelineTaskInput
-	gatePassed bool
+	task *agentshared.PipelineTaskInput
 }
 
 type goTestEvent struct {
@@ -79,15 +78,14 @@ type goSourceParts struct {
 	body        string
 }
 
-func (pt *PipelineTester) swapTaskRuntime(task *agentshared.PipelineTaskInput, gatePassed bool) taskRuntimeSnapshot {
+func (pt *PipelineTester) swapTaskRuntime(task *agentshared.PipelineTaskInput) taskRuntimeSnapshot {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 	prev := taskRuntimeSnapshot{
-		task:       pt.currentTask,
-		gatePassed: pt.gatePassed,
+		task: pt.currentTask,
 	}
 	pt.currentTask = task
-	pt.gatePassed = gatePassed
+	pt.lastSuiteResult = nil
 	return prev
 }
 
@@ -95,7 +93,6 @@ func (pt *PipelineTester) restoreTaskRuntime(prev taskRuntimeSnapshot) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 	pt.currentTask = prev.task
-	pt.gatePassed = prev.gatePassed
 }
 
 func (pt *PipelineTester) currentHarnessState() *testHarnessState {
@@ -138,71 +135,34 @@ func (pt *PipelineTester) planSnapshot() *testershared.TestPlan {
 	return &copyPlan
 }
 
+func (pt *PipelineTester) setLastSuiteResult(result *tester.TestSuiteResult) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	if result == nil {
+		pt.lastSuiteResult = nil
+		return
+	}
+	copyResult := *result
+	copyResult.Results = append([]tester.TestResult(nil), result.Results...)
+	pt.lastSuiteResult = &copyResult
+}
+
+func (pt *PipelineTester) lastSuiteSnapshot() *tester.TestSuiteResult {
+	pt.mu.RLock()
+	defer pt.mu.RUnlock()
+	if pt.lastSuiteResult == nil {
+		return nil
+	}
+	copyResult := *pt.lastSuiteResult
+	copyResult.Results = append([]tester.TestResult(nil), pt.lastSuiteResult.Results...)
+	return &copyResult
+}
+
 func (pt *PipelineTester) workingDir() string {
 	if pt.fileAccess != nil && strings.TrimSpace(pt.fileAccess.WorkingDir()) != "" {
 		return pt.fileAccess.WorkingDir()
 	}
 	return "."
-}
-
-func (pt *PipelineTester) inspectorGateStatus() (bool, string) {
-	pt.mu.RLock()
-	defer pt.mu.RUnlock()
-	if pt.gatePassed {
-		if pt.currentTask != nil && pt.currentTask.Context != nil {
-			if stage, _ := pt.currentTask.Context["pipeline_stage"].(string); strings.TrimSpace(stage) != "" {
-				return true, fmt.Sprintf("pipeline stage %s", strings.TrimSpace(stage))
-			}
-		}
-		return true, "tester invoked after inspector gate"
-	}
-	if pt.currentTask != nil && pt.currentTask.Context != nil {
-		if stage, _ := pt.currentTask.Context["pipeline_stage"].(string); strings.TrimSpace(stage) != "" {
-			return false, fmt.Sprintf("pipeline stage %s", strings.TrimSpace(stage))
-		}
-	}
-	return false, "no passing inspector result available"
-}
-
-func gatePassedForTask(task *agentshared.PipelineTaskInput) bool {
-	if task == nil {
-		return false
-	}
-	if task.Context != nil {
-		if stage, _ := task.Context["pipeline_stage"].(string); isTesterStage(stage) {
-			return true
-		}
-	}
-	if inspectorPassedInParentResults(task.ParentResults) {
-		return true
-	}
-	return false
-}
-
-func isTesterStage(stage string) bool {
-	switch strings.ToLower(strings.TrimSpace(stage)) {
-	case "test", "tester", "create_tests", "creating_tests", "execute", "validating", "validate":
-		return true
-	default:
-		return false
-	}
-}
-
-func inspectorPassedInParentResults(results map[string]any) bool {
-	for _, raw := range results {
-		switch typed := raw.(type) {
-		case map[string]any:
-			if passed, ok := typed["passed"].(bool); ok && passed {
-				return true
-			}
-			if result, ok := typed["result"].(map[string]any); ok {
-				if passed, ok := result["passed"].(bool); ok && passed {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 func (pt *PipelineTester) detectHarness(ctx context.Context, files []string, taskSpec, workerType string) (*testHarnessState, error) {
@@ -1524,9 +1484,6 @@ func (pt *PipelineTester) createTests(ctx context.Context, req *tester.TesterReq
 }
 
 func (pt *PipelineTester) createTestsWithProvider(ctx context.Context, req *tester.TesterRequest, files []string) error {
-	prev := pt.swapTaskRuntime(nil, true)
-	defer pt.restoreTaskRuntime(prev)
-
 	userMessage := buildCreateTestsUserPrompt(req, files)
 	pt.prepareSkillsForInput(userMessage)
 	tools := pt.buildToolDefinitions()
@@ -1569,13 +1526,9 @@ func buildCreateTestsUserPrompt(req *tester.TesterRequest, files []string) strin
 	b.WriteString("Synthesize executable tests from the task brief and write them into the task-local VFS.\n")
 	b.WriteString("Do not stop at analysis. You must write concrete runnable test code, not TODOs, skips, or placeholders.\n")
 	b.WriteString("If a target implementation file is missing, treat that as valid red-phase state: continue planning and writing specification-driven tests anyway.\n")
-	b.WriteString("Protocol:\n")
-	b.WriteString("1. Call `check_inspector_gate` first.\n")
-	b.WriteString("2. Call `detect_test_harness` for the target files.\n")
-	b.WriteString("3. If harness files are needed, call `prepare_pipeline_write_context` for each planned config file and then call `prepare_test_harness` with those write contexts.\n")
-	b.WriteString("4. Call `analyze_risk` and `plan_tests`.\n")
-	b.WriteString("5. Before the first `write_test` for a file, call `prepare_pipeline_write_context` and pass that basis into `write_test`.\n")
-	b.WriteString("6. Reuse the `next_basis` returned by `write_test` for subsequent writes to the same file while its lease remains active.\n")
+	b.WriteString("Use the tester tool definitions as the workflow contract for this stage.\n")
+	b.WriteString("That usually means understanding the current criteria and challenge, discovering and preparing the harness when needed, analyzing risks, forming a real test plan, and then writing concrete tests through leased pipeline write contexts.\n")
+	b.WriteString("Before the first `write_test` for a file, call `prepare_pipeline_write_context` and pass that basis into `write_test`. Reuse `next_basis` for subsequent writes to the same file while its lease remains active.\n")
 	if len(files) > 0 {
 		b.WriteString("\nTarget files:\n")
 		for _, file := range files {
@@ -1591,9 +1544,6 @@ func buildCreateTestsUserPrompt(req *tester.TesterRequest, files []string) strin
 }
 
 func (pt *PipelineTester) createTestsDeterministically(ctx context.Context, req *tester.TesterRequest, files []string) error {
-	if err := pt.checkInspectorGateWithTools(ctx); err != nil {
-		return err
-	}
 	harness, err := pt.detectHarnessWithTools(ctx, files, req.TaskPrompt, req.WorkerType)
 	if err != nil {
 		return err
@@ -1632,28 +1582,6 @@ func (pt *PipelineTester) createTestsDeterministically(ctx context.Context, req 
 		}
 	}
 	return nil
-}
-
-func (pt *PipelineTester) checkInspectorGateWithTools(ctx context.Context) error {
-	result, err := pt.runDeterministicToolCall(ctx, "check_inspector_gate", nil)
-	if err != nil {
-		return err
-	}
-	var payload struct {
-		Passed bool   `json:"passed"`
-		Reason string `json:"reason"`
-	}
-	if err := json.Unmarshal([]byte(result), &payload); err != nil {
-		return fmt.Errorf("decode check_inspector_gate result: %w", err)
-	}
-	if payload.Passed {
-		return nil
-	}
-	reason := strings.TrimSpace(payload.Reason)
-	if reason == "" {
-		reason = "inspector gate has not passed"
-	}
-	return fmt.Errorf("check_inspector_gate failed: %s", reason)
 }
 
 func (pt *PipelineTester) detectHarnessWithTools(

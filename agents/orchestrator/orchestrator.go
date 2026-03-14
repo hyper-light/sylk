@@ -22,7 +22,7 @@ import (
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/pipeline/coordination"
-	"github.com/adalundhe/sylk/core/pipeline/taskstate"
+	"github.com/adalundhe/sylk/core/pipeline/tdd"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
@@ -96,6 +96,7 @@ type Orchestrator struct {
 	// Task router for DAG→container dispatch
 	taskRouter   *TaskRouter
 	dispatchGate *dispatchHoldGate
+	pipelineMgr  *tdd.PipelineManager
 
 	// Per-session VFS infrastructure (maps sessionID → SessionVFS).
 	sessionVFS   map[string]*versioning.SessionVFS
@@ -270,6 +271,9 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 	budget := concurrency.NewGoroutineBudget(pressure)
 	budget.RegisterAgent("orchestrator", "orchestrator")
 	scope := concurrency.NewGoroutineScope(context.Background(), "orchestrator", budget)
+	// Orchestrator-owned DAG work is asynchronous and can legitimately outlive
+	// the request that submitted it by many minutes or hours.
+	scope.SetMaxLifetime(24 * time.Hour)
 	o.scope = scope
 
 	// BufferRegistry
@@ -404,6 +408,16 @@ func (o *Orchestrator) SetTaskRouter(router *TaskRouter) {
 		router.SetEventLogger(o.steering.EventLogger())
 	}
 	o.taskRouter = router
+}
+
+// SetPipelineManager wires the real pipeline loop runtime used for worker DAG nodes.
+func (o *Orchestrator) SetPipelineManager(pm *tdd.PipelineManager) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.pipelineMgr = pm
+	if pm != nil {
+		pm.SetOnEvent(o.handleManagedPipelineEvent)
+	}
 }
 
 // SetActivator installs the on-demand agent activator, threading it to the
@@ -1248,7 +1262,10 @@ func pipelineWorkerTargetAgentID(taskID, agentType string) string {
 	}
 	switch agentType {
 	case "engineer", "designer", "inspector-pipeline", "tester-pipeline":
-		return TaskScopedAgentID(taskID, agentType)
+		if workerAgentID := PipelineWorkerAgentID(taskID, agentType); workerAgentID != "" {
+			return workerAgentID
+		}
+		return agentType
 	default:
 		return agentType
 	}
@@ -2140,34 +2157,20 @@ func (o *Orchestrator) handlePipelineUpdate(msg *guide.Message) error {
 		Timestamp: update.Timestamp,
 	}
 	o.bufferRegistry.Push(entry)
+	o.recordPipelineDispatchActivity(update)
 
 	stage := strings.TrimSpace(update.Stage)
 	if stage == "" {
 		stage = strings.TrimSpace(string(StageFromSubNodeID(update.NodeID)))
 	}
 	if update.TaskID != "" {
-		switch update.Status {
-		case "failed", "timed_out":
-			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
-		case "cancelled":
-			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusCancelled, update.AgentType)
-		case "succeeded":
-			if stage == string(StageExecute) {
-				publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusValidating, update.AgentType)
-			}
-		}
-	}
-
-	if update.Status == "succeeded" && o.coordination != nil {
-		if err := o.coordination.ValidateWorkerCompletion(context.Background(), update.TaskID, update.AgentType, update.AgentID); err != nil {
-			update.Status = "failed"
-			update.Error = err.Error()
-			update.Message = firstNonEmpty(update.Message, "coordination contract violation")
-			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", taskstate.StatusFailed, update.AgentType)
+		if status := pipelineTaskStateForUpdate(update.Status, stage); status != "" {
+			publishTaskPipelineState(o.bus, o.config.AgentID, update.TaskID, "", status, update.AgentType)
 		}
 	}
 
 	if isTerminalStatus(update.Status) {
+		o.finalizePipelineUpdate(update)
 		result := convertPipelineToNodeResult(update)
 		o.dagBridge.NotifyNodeComplete(update.NodeID, result)
 	}
@@ -2376,6 +2379,9 @@ func (o *Orchestrator) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(o.activityPub)
+	}
 }
 
 // SetCanonicalID overwrites the orchestrator's internal ID so a replacement

@@ -10,7 +10,7 @@ import (
 func TestDefaultEngineerSystemPrompt_ComposesModulesOnceInOrder(t *testing.T) {
 	modules := []string{
 		"# Engineer Agent — System",
-		"# Engineer Agent — Implementation Protocol",
+		"# Engineer Agent — Implementation Guidance",
 		"# Engineer Agent — Consultation Policy",
 		"# Engineer Agent — Skill Usage Policy",
 		"# Engineer Agent — Guardrails",
@@ -34,7 +34,7 @@ func TestDefaultEngineerSystemPrompt_ComposesModulesOnceInOrder(t *testing.T) {
 
 func TestEngineerSystemCorePrompt_DoesNotDuplicateModuleHeadings(t *testing.T) {
 	disallowed := []string{
-		"# Engineer Agent — Implementation Protocol",
+		"# Engineer Agent — Implementation Guidance",
 		"# Engineer Agent — Consultation Policy",
 		"# Engineer Agent — Skill Usage Policy",
 		"# Engineer Agent — Guardrails",
@@ -79,7 +79,7 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 
 func TestEngineerSystemPromptForContract_OmitsStaticImplementationProtocol(t *testing.T) {
 	prompt := EngineerSystemPromptForContract(&shared.TaskExecutionContract{TaskID: "task_1"})
-	if strings.Contains(prompt, "# Engineer Agent — Implementation Protocol") {
+	if strings.Contains(prompt, "# Engineer Agent — Implementation Guidance") {
 		t.Fatal("task-scoped engineer prompt should not include the static implementation protocol")
 	}
 	for _, want := range []string{

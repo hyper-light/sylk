@@ -62,6 +62,11 @@ func (d *Designer) registerCoreSkills() {
 	}) {
 		d.skills.Register(skill)
 	}
+	for _, skill := range shared.PipelineProtocolSkills(shared.PipelineProtocolSkillConfig{
+		AgentType: func() string { return "designer" },
+	}) {
+		d.skills.Register(skill)
+	}
 
 	// Collaboration skills (feedback.go)
 	d.skills.Register(requestEngineerReviewSkill(d))
@@ -129,6 +134,8 @@ func componentSearchSkill(d *Designer) *skills.Skill {
 		Domain("ui").
 		Keywords("search", "component", "find", "ui", "existing").
 		Priority(100).
+		Usage("Use early to anchor new design work in existing component, pattern, and variant conventions before planning changes.").
+		Satisfies("Provides component and pattern evidence for design planning and scope selection.").
 		StringParam("query", "Component name or pattern to search for", true).
 		BoolParam("include_variants", "Include component variants in results", false).
 		StringParam("path", "Directory path to search in (default: working directory)", false).
@@ -339,6 +346,9 @@ func componentCreateSkill(d *Designer) *skills.Skill {
 		StringParam("path", "Directory to create the component in", false).
 		StringParam("type", "Component type: react, react-typescript, vue, svelte (default: react-typescript)", false).
 		Usage("Use this to decide scaffold paths and structure, then call prepare_pipeline_write_context for each target file before materializing the component with write_pipeline_file.").
+		Requirement("Requires enough task context to choose the correct component name, location, and design-token direction before any real file mutation begins.").
+		Satisfies("Produces the planned component scaffold and target files that downstream write tools should materialize.").
+		Avoid("Do not treat this as a real workspace mutation; it is a planning skill for the subsequent leased write flow.").
 		BestPractice("Treat the returned files as a plan only. Real workspace mutations must flow through the leased pipeline write-context tools so next_basis can be reused safely.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params componentCreateParams
@@ -414,6 +424,9 @@ func componentModifySkill(d *Designer) *skills.Skill {
 		StringParam("path", "Path to the component file to modify", true).
 		StringParam("changes", "Description of changes to make", true).
 		Usage("Use this to clarify the intended component change set, then call prepare_pipeline_write_context for the file before applying the edit with edit_pipeline_file or write_pipeline_file.").
+		Requirement("Requires a concrete target component path and a clear change description before mutation begins.").
+		Satisfies("Produces the scoped modification plan that the leased write tools should materialize.").
+		Avoid("Do not treat this as a file mutation.").
 		BestPractice("Do not treat this as a file mutation. Reuse the next_basis returned by the actual write/edit tools for follow-up edits to the same file.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params componentModifyParams
@@ -466,6 +479,8 @@ func tokenValidateSkill(d *Designer) *skills.Skill {
 		Domain("design").
 		Keywords("validate", "token", "design", "check", "lint").
 		Priority(85).
+		Usage("Use after visual or styling changes to confirm the implementation stayed aligned with the design-token system before signoff.").
+		Satisfies("Produces token-discipline evidence for design completion and review artifacts.").
 		StringParam("path", "Path to the file to validate", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params tokenValidateParams
@@ -582,6 +597,8 @@ func tokenSuggestSkill(d *Designer) *skills.Skill {
 		Domain("design").
 		Keywords("suggest", "token", "design", "recommend").
 		Priority(80).
+		Usage("Use when you have identified a hard-coded style value and need a token-oriented replacement before applying the real edit.").
+		Satisfies("Produces token suggestions that inform subsequent design edits.").
 		StringParam("value", "The hard-coded value to find a token for", true).
 		StringParam("property", "The CSS property the value is used for", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -660,6 +677,9 @@ func a11yAuditSkill(d *Designer) *skills.Skill {
 		Domain("accessibility").
 		Keywords("accessibility", "a11y", "audit", "wcag", "check").
 		Priority(85).
+		Usage("Use before design signoff to validate that the changed UI still meets the accessibility bar for the task.").
+		Satisfies("Produces accessibility evidence for completion, review, and downstream inspector/tester coordination.").
+		Avoid("Do not assume visual polish implies accessibility compliance; audit it explicitly.").
 		StringParam("path", "Path to the file or component to audit", true).
 		StringParam("level", "WCAG conformance level: A, AA, or AAA (default: AA)", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -784,6 +804,8 @@ func a11yFixSuggestSkill(d *Designer) *skills.Skill {
 		Domain("accessibility").
 		Keywords("fix", "accessibility", "a11y", "suggest", "repair").
 		Priority(80).
+		Usage("Use after a11y_audit reveals a concrete issue and you need a grounded remediation strategy before editing.").
+		Satisfies("Produces accessibility-fix guidance that can inform the next design mutation or review artifact.").
 		StringParam("issue_type", "Type of accessibility issue (e.g., color-contrast, keyboard-nav, aria)", true).
 		StringParam("element", "The element or selector with the issue", true).
 		StringParam("context", "Additional context about the issue", false).
@@ -890,6 +912,8 @@ func contrastCheckSkill(d *Designer) *skills.Skill {
 		Domain("accessibility").
 		Keywords("contrast", "color", "check", "wcag", "ratio").
 		Priority(75).
+		Usage("Use when you need a quick targeted contrast decision for a specific foreground/background pair during design refinement or audit follow-up.").
+		Satisfies("Produces concrete contrast evidence for accessibility decisions and fixes.").
 		StringParam("foreground", "Foreground color (hex, rgb, or token name)", true).
 		StringParam("background", "Background color (hex, rgb, or token name)", true).
 		StringParam("size", "Text size: 'normal' or 'large' (default: normal)", false).

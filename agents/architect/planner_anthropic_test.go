@@ -123,6 +123,27 @@ func TestNormalizeTaskGraph_DerivesWorkspaceAndWorkerPackets(t *testing.T) {
 	if task.WorkerPackets[0].AgentType != "engineer" || task.WorkerPackets[1].AgentType != "designer" {
 		t.Fatalf("worker packets = %+v, want engineer/designer packets", task.WorkerPackets)
 	}
+	if len(task.ExecutionContracts) != 4 {
+		t.Fatalf("execution contracts = %d, want 4", len(task.ExecutionContracts))
+	}
+	gotAgents := make([]string, 0, len(task.ExecutionContracts))
+	for _, contract := range task.ExecutionContracts {
+		gotAgents = append(gotAgents, contract.AgentType)
+	}
+	for _, want := range []string{"inspector-pipeline", "tester-pipeline", "engineer", "designer"} {
+		if !containsString(gotAgents, want) {
+			t.Fatalf("execution contracts missing %q: %v", want, gotAgents)
+		}
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestContainsIgnoreCase(t *testing.T) {
@@ -644,7 +665,7 @@ func TestStreamRequest_PartialTextOnTimeout(t *testing.T) {
 	sr, err := p.streamRequest(ctx, &providers.Request{
 		Messages:  []providers.Message{{Role: providers.RoleUser, Content: "test"}},
 		MaxTokens: 4096,
-	}, "test", nil)
+	}, "test", p.timeout, nil)
 
 	if err != nil {
 		t.Fatalf("expected partial result, got error: %v", err)
@@ -860,6 +881,48 @@ func TestCompleteForToolLoop_AllowsMultipleLeaseRefreshes(t *testing.T) {
 	}
 	if callCount != 4 {
 		t.Fatalf("callCount = %d, want 4 (3 expired children + final success)", callCount)
+	}
+}
+
+func TestCompleteForToolLoop_UsesProgressTimeoutNotWallClock(t *testing.T) {
+	p := &anthropicPlanner{
+		provider: plannerStreamProviderFunc(func(ctx context.Context, req *providers.Request, handler providers.StreamHandler) error {
+			if err := handler(&providers.StreamChunk{Type: providers.ChunkTypeStart, Usage: &providers.Usage{InputTokens: 12}}); err != nil {
+				return err
+			}
+			for _, part := range []string{"tool ", "loop ", "response"} {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(3 * time.Millisecond):
+				}
+				if err := handler(&providers.StreamChunk{Type: providers.ChunkTypeText, Text: part}); err != nil {
+					return err
+				}
+			}
+			return handler(&providers.StreamChunk{
+				Type:       providers.ChunkTypeEnd,
+				Usage:      &providers.Usage{InputTokens: 12, OutputTokens: 21},
+				StopReason: providers.StopReasonEndTurn,
+			})
+		}),
+		maxTokens:      testMaxOutputTokens,
+		thinkingBudget: 0,
+		contextWindow:  testContextWindow,
+		system:         "test system",
+		timeout:        5 * time.Millisecond,
+		logger:         slog.Default(),
+	}
+
+	resp, err := p.CompleteForToolLoop(context.Background(), &providers.Request{
+		Messages:  []providers.Message{{Role: providers.RoleUser, Content: "plan it"}},
+		MaxTokens: 256,
+	}, "planning_protocol", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp == nil || resp.Content != "tool loop response" {
+		t.Fatalf("response = %#v, want content %q", resp, "tool loop response")
 	}
 }
 

@@ -6,22 +6,12 @@ func TestValidateTransition_AllValid(t *testing.T) {
 	valid := []struct {
 		from, to PipelineStatus
 	}{
-		{StatusPending, StatusDefiningCriteria},
+		{StatusPending, StatusActive},
 		{StatusPending, StatusFailed},
 		{StatusPending, StatusCancelled},
-		{StatusDefiningCriteria, StatusCreatingTests},
-		{StatusDefiningCriteria, StatusFailed},
-		{StatusDefiningCriteria, StatusCancelled},
-		{StatusCreatingTests, StatusExecuting},
-		{StatusCreatingTests, StatusFailed},
-		{StatusCreatingTests, StatusCancelled},
-		{StatusExecuting, StatusValidating},
-		{StatusExecuting, StatusFailed},
-		{StatusExecuting, StatusCancelled},
-		{StatusValidating, StatusCompleted},
-		{StatusValidating, StatusDefiningCriteria},
-		{StatusValidating, StatusFailed},
-		{StatusValidating, StatusCancelled},
+		{StatusActive, StatusCompleted},
+		{StatusActive, StatusFailed},
+		{StatusActive, StatusCancelled},
 	}
 	for _, tc := range valid {
 		if err := ValidateTransition(tc.from, tc.to); err != nil {
@@ -34,12 +24,9 @@ func TestValidateTransition_InvalidRejected(t *testing.T) {
 	invalid := []struct {
 		from, to PipelineStatus
 	}{
-		{StatusPending, StatusValidating},
 		{StatusPending, StatusCompleted},
-		{StatusDefiningCriteria, StatusValidating},
-		{StatusCreatingTests, StatusDefiningCriteria},
-		{StatusExecuting, StatusCreatingTests},
-		{StatusValidating, StatusExecuting},
+		{StatusActive, StatusPending},
+		{StatusActive, StatusActive},
 		{StatusCompleted, StatusPending},
 		{StatusCompleted, StatusFailed},
 		{StatusFailed, StatusPending},
@@ -61,8 +48,7 @@ func TestIsTerminalStatus(t *testing.T) {
 	}
 
 	nonTerminal := []PipelineStatus{
-		StatusPending, StatusDefiningCriteria, StatusCreatingTests,
-		StatusExecuting, StatusValidating,
+		StatusPending, StatusActive,
 	}
 	for _, s := range nonTerminal {
 		if IsTerminalStatus(s) {

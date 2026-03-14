@@ -132,7 +132,7 @@ func New(cfg shared.GlobalInspectorConfig, provider providers.ProviderAdapter) (
 		RequireBroker: true,
 	})
 
-	gi.steering.InitLazy("inspector", nil)
+	gi.steering.InitLazy("inspector", cfg.ActivityPub)
 
 	if err := gi.initSkills(); err != nil {
 		return nil, err
@@ -671,6 +671,9 @@ func (gi *GlobalInspector) SetAgentPod(pod *agentShared.AgentPod) {
 // SetHandoffBridge sets the handoff bridge for this agent.
 func (gi *GlobalInspector) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	gi.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(gi.config.ActivityPub)
+	}
 }
 
 // SetFileAccess injects the per-session file access layer.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
@@ -65,6 +66,7 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 			return "", err
 		}
 
+		turnStart := time.Now()
 		resp, err := shared.CompleteWithWatchdog(ctx, p, req, shared.AgentDisplayName("archivalist"))
 		if err != nil {
 			if ctx.Err() != nil {
@@ -79,7 +81,12 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 		shared.AccumulateUsage(ctx, &resp.Usage)
 		shared.PublishIntermediateToolTurn(a.bus, a.channels, ctx, a.id, resp)
 
-		if len(resp.ToolCalls) == 0 {
+		toolCalls := len(resp.ToolCalls)
+		if toolCalls == 0 && a.handoffBridge != nil {
+			a.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, 0, 0, turnStart))
+		}
+
+		if toolCalls == 0 {
 			return strings.TrimSpace(resp.Content), nil
 		}
 
@@ -88,6 +95,9 @@ func (a *Archivalist) executeToolLoop(ctx context.Context, req *providers.Reques
 		}
 
 		errCount, rerouted := a.applyToolCalls(ctx, req, resp)
+		if a.handoffBridge != nil {
+			a.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
+		}
 		if rerouted {
 			return "", skills.ErrRerouteRequested
 		}

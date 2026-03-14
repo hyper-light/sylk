@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/container"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 var (
@@ -187,6 +188,23 @@ func (p *ManagedPod) ContainerCount() int {
 	p.containersMu.RLock()
 	defer p.containersMu.RUnlock()
 	return len(p.containers)
+}
+
+// FileAccessFor returns the mounted FileAccess for the given member agent type.
+func (p *ManagedPod) FileAccessFor(agentType string) versioning.FileAccess {
+	if p == nil || p.volumes == nil {
+		return nil
+	}
+	return p.volumes.FileAccessFor(agentType)
+}
+
+// WorkspaceViewsFor returns the mounted layered workspace view access for the
+// given member agent type.
+func (p *ManagedPod) WorkspaceViewsFor(agentType string) versioning.WorkspaceViewAccess {
+	if p == nil || p.volumes == nil {
+		return nil
+	}
+	return p.volumes.WorkspaceViewsFor(agentType)
 }
 
 // ---------- Tier transitions ----------

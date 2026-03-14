@@ -1,6 +1,7 @@
 # Inspector Skill Use Policy
 
 Choose tools from the requested inspection mode, not from habit.
+Treat the tool descriptions as part of the inspection protocol: they tell you when a skill belongs in contract synthesis versus implementation validation, what evidence it produces, and what it must not replace.
 
 ## Contract Synthesis Mode
 

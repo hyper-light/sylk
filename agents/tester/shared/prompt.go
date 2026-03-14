@@ -116,10 +116,9 @@ func GlobalTesterSystemPromptForContract(contract *agentshared.GlobalExecutionCo
 }
 
 // TesterConversationSystemPrompt returns the system prompt for conversation mode.
-// Uses only the conversation persona — the pipeline-specific GlobalSystemPrompt
-// (Inspector gate, 7-phase protocol, skill schemas) and TesterGuardrails
-// (gate prerequisite) are excluded so the LLM responds to direct user chat
-// without blocking on pipeline prerequisites.
+// Uses only the conversation persona. Task-mode workflow modules and gate
+// requirements are excluded so the LLM responds to direct user chat without
+// inheriting structured task obligations.
 func TesterConversationSystemPrompt() string {
 	return strings.TrimSpace(agentshared.AppendWorkspaceViewContext(
 		TesterConversationPrompt,

@@ -7,32 +7,31 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/engineer"
+	inspPipeline "github.com/adalundhe/sylk/agents/inspector/pipeline"
 	inspShared "github.com/adalundhe/sylk/agents/inspector/shared"
+	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/agents/tester"
+	testerpipeline "github.com/adalundhe/sylk/agents/tester/pipeline"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // PipelineStatus represents the current phase of a TDD pipeline.
 type PipelineStatus string
 
 const (
-	StatusPending          PipelineStatus = "pending"
-	StatusDefiningCriteria PipelineStatus = "defining_criteria"
-	StatusCreatingTests    PipelineStatus = "creating_tests"
-	StatusExecuting        PipelineStatus = "executing"
-	StatusValidating       PipelineStatus = "validating"
-	StatusCompleted        PipelineStatus = "completed"
-	StatusFailed           PipelineStatus = "failed"
-	StatusCancelled        PipelineStatus = "cancelled"
+	StatusPending   PipelineStatus = "pending"
+	StatusActive    PipelineStatus = "active"
+	StatusCompleted PipelineStatus = "completed"
+	StatusFailed    PipelineStatus = "failed"
+	StatusCancelled PipelineStatus = "cancelled"
 )
 
 // statusTransitions defines the valid state machine transitions.
 // Non-terminal states can always transition to Failed or Cancelled.
 var statusTransitions = map[PipelineStatus][]PipelineStatus{
-	StatusPending:          {StatusDefiningCriteria, StatusFailed, StatusCancelled},
-	StatusDefiningCriteria: {StatusCreatingTests, StatusFailed, StatusCancelled},
-	StatusCreatingTests:    {StatusExecuting, StatusFailed, StatusCancelled},
-	StatusExecuting:        {StatusValidating, StatusFailed, StatusCancelled},
-	StatusValidating:       {StatusCompleted, StatusDefiningCriteria, StatusFailed, StatusCancelled},
+	StatusPending: {StatusActive, StatusFailed, StatusCancelled},
+	StatusActive:  {StatusCompleted, StatusFailed, StatusCancelled},
 }
 
 var (
@@ -81,6 +80,7 @@ type PipelineConfig struct {
 	TaskID          string
 	TaskSlug        string
 	SessionID       string
+	DAGID           string
 	DAGNodeID       string
 	WorkerType      WorkerType
 	MaxLoops        int
@@ -89,8 +89,11 @@ type PipelineConfig struct {
 	Priority        int
 	InitialCriteria *inspShared.InspectorCriteria
 	TaskPrompt      string                // Full task prompt from buildNodePrompt
-	CoWorkerTypes   []WorkerType          // Co-tenant worker types (sequential order)
+	CoWorkerTypes   []WorkerType          // Execute-stage peer workers launched alongside the primary worker
 	AgentPrompts    map[WorkerType]string // Per-agent scoped prompts (compound only)
+	SessionVFS      *versioning.SessionVFS
+	WorkingDir      string
+	Files           []string
 }
 
 // Pipeline represents the state of a single TDD pipeline execution.
@@ -99,12 +102,16 @@ type Pipeline struct {
 	TaskID    string
 	TaskSlug  string
 	SessionID string
+	DAGID     string
 	DAGNodeID string
 
-	WorkerType WorkerType
-	Status     PipelineStatus
-	LoopCount  int
-	MaxLoops   int
+	WorkerType   WorkerType
+	Status       PipelineStatus
+	LoopCount    int
+	MaxLoops     int
+	CurrentStage string
+	ActiveAgents []string
+	LastMessage  string
 
 	// Phase results — populated as the pipeline progresses.
 	InspectorCriteria *inspShared.InspectorCriteria
@@ -115,6 +122,7 @@ type Pipeline struct {
 
 	// Compound pipeline fields.
 	TaskPrompt      string
+	Files           []string
 	CoWorkerTypes   []WorkerType
 	AgentPrompts    map[WorkerType]string
 	CoWorkerOutputs []*WorkerResult
@@ -134,10 +142,13 @@ func (p *Pipeline) IsCompound() bool {
 
 // PipelineResult is the final output of a completed TDD pipeline.
 type PipelineResult struct {
-	PipelineID string
-	TaskID     string
-	Status     PipelineStatus
-	LoopCount  int
+	PipelineID   string
+	TaskID       string
+	Status       PipelineStatus
+	LoopCount    int
+	CurrentStage string
+	ActiveAgents []string
+	LastMessage  string
 
 	InspectorCriteria *inspShared.InspectorCriteria
 	TesterTests       *tester.TestSuiteResult
@@ -157,13 +168,49 @@ type PipelineEvent struct {
 	TaskID            string
 	TaskSlug          string
 	SessionID         string
+	DAGID             string
+	DAGNodeID         string
 	OldStatus         PipelineStatus
 	NewStatus         PipelineStatus
 	WorkerType        WorkerType
 	LoopCount         int
 	MaxLoops          int
+	Stage             string
+	ActiveAgents      []string
+	Message           string
 	Timestamp         time.Time
 	Error             string
+}
+
+type InspectorAgent interface {
+	RunTask(ctx context.Context, task *agentShared.PipelineTaskInput) (*inspPipeline.InspectionStageResult, error)
+	Close() error
+}
+
+type TesterAgent interface {
+	TestTask(ctx context.Context, task *agentShared.PipelineTaskInput) (*testerpipeline.TaskStageResult, error)
+	Close() error
+}
+
+// InspectorFeedback wraps inspector feedback for the worker.
+type InspectorFeedback struct {
+	Criteria   *inspShared.InspectorCriteria
+	Feedback   *inspShared.InspectorFeedback
+	WorkerType WorkerType
+}
+
+// TesterFeedback wraps tester feedback for the worker.
+type TesterFeedback struct {
+	Response    *tester.TesterResponse
+	FailedTests []string
+	WorkerType  WorkerType
+}
+
+// WorkerResult wraps the worker output with changed file paths.
+type WorkerResult struct {
+	TaskResult   *engineer.TaskResult
+	ChangedFiles []string
+	WorkerType   WorkerType
 }
 
 // WorkerAgent is the interface that engineer and designer adapters implement.

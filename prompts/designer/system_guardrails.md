@@ -32,4 +32,4 @@
 
 13. **All file mutations must use leased pipeline write contexts.** `component_create` and `component_modify` do not materialize files; call `prepare_pipeline_write_context` before `write_pipeline_file` or `edit_pipeline_file`, and reuse `next_basis` while it remains active.
 
-14. **Never leave a task-scoped pending review unresolved.** If Designer is the reviewer in the coordination ledger, inspect the review context, address it, and resolve it before concluding or releasing scope.
+14. **Treat task-scoped pending reviews as feedback, not a runtime gate.** If Designer is the reviewer in the coordination ledger, inspect the review context, address it when appropriate, and allow Inspector/Tester to decide whether another loop is required.

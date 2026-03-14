@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/events"
 )
 
 // Severity represents the severity level of a validation issue.
@@ -99,7 +101,7 @@ type ValidationIssue struct {
 }
 
 // InspectorCriteria defines the success criteria and quality gates for a task.
-// Created during Phase 1 of the TDD pipeline and used for validation in Phase 4.
+// It is created during contract synthesis and reused during implementation validation.
 type InspectorCriteria struct {
 	// TaskID uniquely identifies the task these criteria apply to.
 	TaskID string `json:"task_id"`
@@ -477,6 +479,9 @@ type GlobalInspectorConfig struct {
 
 	// SessionID identifies the session this agent belongs to.
 	SessionID string `json:"session_id"`
+
+	// ActivityPub publishes UI-facing activity events.
+	ActivityPub events.ActivityPublisher
 
 	// AuditTimeout is the timeout for full audit operations.
 	AuditTimeout time.Duration `json:"audit_timeout"`

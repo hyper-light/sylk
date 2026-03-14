@@ -10,7 +10,6 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/skills"
@@ -121,7 +120,7 @@ func (g *Guardian) executeToolLoop(
 		}
 
 		if len(resp.ToolCalls) == 0 {
-			g.recordTurn(req, resp, turn, 0, 0, turnStart)
+			g.recordTurn(ctx, req, resp, turn, 0, 0, turnStart)
 			g.logDebug("tool_loop: COMPLETE",
 				"stage", stage, "turn", turn,
 				"content_len", len(resp.Content),
@@ -134,7 +133,7 @@ func (g *Guardian) executeToolLoop(
 		}
 
 		errCount, rerouted := g.applyToolCalls(ctx, req, resp)
-		g.recordTurn(req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
+		g.recordTurn(ctx, req, resp, turn, len(resp.ToolCalls), errCount, turnStart)
 		if rerouted {
 			return "", usageAcc.Total(), skills.ErrRerouteRequested
 		}
@@ -302,6 +301,7 @@ func (g *Guardian) toolInvocations(ctx context.Context, calls []providers.ToolCa
 
 // recordTurn feeds the handoff bridge with turn metrics from this LLM call.
 func (g *Guardian) recordTurn(
+	ctx context.Context,
 	req *providers.Request,
 	resp *providers.Response,
 	turn, toolCalls, errCount int,
@@ -311,19 +311,5 @@ func (g *Guardian) recordTurn(
 		return
 	}
 
-	g.handoffBridge.RecordTurn(handoff.TurnRecord{
-		InputTokens:      resp.Usage.InputTokens,
-		OutputTokens:     resp.Usage.OutputTokens,
-		ContextSize:      shared.EstimateContextSize(req.Messages),
-		ToolCalls:        toolCalls,
-		ToolSuccesses:    toolCalls - errCount,
-		TurnNumber:       turn + 1,
-		Duration:         time.Since(turnStart),
-		Timestamp:        time.Now(),
-		Stage:            llmruntime.StageFromRequest(req),
-		RuntimeProfile:   llmruntime.ProfileNameFromRequest(req),
-		StopReason:       resp.StopReason,
-		CacheReadTokens:  resp.Usage.CacheReadTokens,
-		CacheWriteTokens: resp.Usage.CacheWriteTokens,
-	})
+	g.handoffBridge.RecordTurn(shared.BuildHandoffTurnRecord(ctx, req, resp, turn, toolCalls, errCount, turnStart))
 }

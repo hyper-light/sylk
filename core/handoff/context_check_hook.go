@@ -180,6 +180,9 @@ type ContextCheckHook struct {
 	// notifications is the channel for async recommendations.
 	notifications chan *HandoffRecommendation
 
+	// observer receives completed evaluations for tracing/telemetry.
+	observer func(*ContextState, *HandoffRecommendation)
+
 	// statistics
 	stats hookStatsInternal
 
@@ -192,14 +195,14 @@ type ContextCheckHook struct {
 
 // hookStatsInternal holds internal statistics.
 type hookStatsInternal struct {
-	checksPerformed     atomic.Int64
+	checksPerformed      atomic.Int64
 	recommendationsGiven atomic.Int64
-	checksSkipped       atomic.Int64
-	checksThrottled     atomic.Int64
-	totalDurationNs     atomic.Int64
-	gpEvaluations       atomic.Int64
-	thresholdTriggers   atomic.Int64
-	qualityTriggers     atomic.Int64
+	checksSkipped        atomic.Int64
+	checksThrottled      atomic.Int64
+	totalDurationNs      atomic.Int64
+	gpEvaluations        atomic.Int64
+	thresholdTriggers    atomic.Int64
+	qualityTriggers      atomic.Int64
 }
 
 // NewContextCheckHook creates a new ContextCheckHook.
@@ -324,6 +327,18 @@ func (h *ContextCheckHook) ShouldRun(agentType string) bool {
 // OnContextUpdate evaluates the context state and returns a handoff recommendation.
 // This is the main entry point for context-based handoff triggering.
 func (h *ContextCheckHook) OnContextUpdate(ctx *ContextState) *HandoffRecommendation {
+	return h.evaluateUpdate(ctx, true)
+}
+
+// EvaluateContext evaluates the context state without publishing an async
+// notification. Bridges use this on the hot path so threshold crossings
+// deterministically trigger handoff in the same turn instead of waiting for a
+// separate recommendation loop.
+func (h *ContextCheckHook) EvaluateContext(ctx *ContextState) *HandoffRecommendation {
+	return h.evaluateUpdate(ctx, false)
+}
+
+func (h *ContextCheckHook) evaluateUpdate(ctx *ContextState, notify bool) *HandoffRecommendation {
 	startTime := time.Now()
 
 	// Check if enabled
@@ -341,9 +356,13 @@ func (h *ContextCheckHook) OnContextUpdate(ctx *ContextState) *HandoffRecommenda
 		return nil
 	}
 
-	// Check throttling
 	agentID := ctx.GetAgentID()
-	if !h.shouldCheckAgent(agentID, config.MinCheckInterval) {
+	utilization := ctx.Utilization()
+
+	// Check throttling only when we are still below the hard context threshold.
+	// Once the threshold is crossed, handoff evaluation must happen
+	// deterministically on that turn.
+	if utilization < config.ContextThreshold && !h.shouldCheckAgent(agentID, config.MinCheckInterval) {
 		h.stats.checksThrottled.Add(1)
 		return nil
 	}
@@ -352,6 +371,7 @@ func (h *ContextCheckHook) OnContextUpdate(ctx *ContextState) *HandoffRecommenda
 
 	// Perform evaluation
 	recommendation := h.evaluateContext(ctx, config, startTime)
+	h.notifyObserver(ctx, recommendation)
 
 	// Update last check time
 	h.updateLastCheck(agentID)
@@ -360,7 +380,7 @@ func (h *ContextCheckHook) OnContextUpdate(ctx *ContextState) *HandoffRecommenda
 	h.stats.totalDurationNs.Add(int64(time.Since(startTime)))
 
 	// Send async notification if configured and recommendation given
-	if recommendation != nil && recommendation.ShouldHandoff && config.NonBlocking {
+	if notify && recommendation != nil && recommendation.ShouldHandoff && config.NonBlocking {
 		h.sendNotification(recommendation)
 	}
 
@@ -375,10 +395,7 @@ func (h *ContextCheckHook) OnContextUpdate(ctx *ContextState) *HandoffRecommenda
 // Returns immediately and sends recommendation to notification channel.
 func (h *ContextCheckHook) OnContextUpdateAsync(ctx *ContextState) {
 	go func() {
-		recommendation := h.OnContextUpdate(ctx)
-		if recommendation != nil && recommendation.ShouldHandoff {
-			h.sendNotification(recommendation)
-		}
+		_ = h.OnContextUpdate(ctx)
 	}()
 }
 
@@ -520,6 +537,13 @@ func (h *ContextCheckHook) SetController(controller *HandoffController) {
 	h.controller = controller
 }
 
+// SetObserver installs a callback that receives every completed evaluation.
+func (h *ContextCheckHook) SetObserver(observer func(*ContextState, *HandoffRecommendation)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.observer = observer
+}
+
 // GetController returns the current HandoffController.
 func (h *ContextCheckHook) GetController() *HandoffController {
 	h.mu.RLock()
@@ -609,7 +633,7 @@ func (h *ContextCheckHook) Stats() ContextCheckHookStats {
 
 // hookJSON is used for JSON marshaling.
 type hookJSON struct {
-	Config *ContextCheckConfig    `json:"config"`
+	Config *ContextCheckConfig   `json:"config"`
 	Stats  ContextCheckHookStats `json:"stats"`
 }
 
@@ -634,17 +658,19 @@ func (h *ContextCheckHook) MarshalJSON() ([]byte, error) {
 // AgentID field accessor for ContextState.
 // Returns the agent ID from metadata or the struct field if available.
 func (cs *ContextState) GetAgentID() string {
-	// In the base ContextState, we don't have AgentID
-	// This is extended by callers who set it via embedding or wrapper
-	return ""
+	if cs == nil {
+		return ""
+	}
+	return cs.AgentID
 }
 
 // AgentType field accessor for ContextState.
 // Returns the agent type from metadata or the struct field if available.
 func (cs *ContextState) GetAgentType() string {
-	// In the base ContextState, we don't have AgentType
-	// This is extended by callers who set it via embedding or wrapper
-	return ""
+	if cs == nil {
+		return ""
+	}
+	return cs.AgentType
 }
 
 // ContextStateWithAgent extends ContextState with agent information.
@@ -676,4 +702,13 @@ func NewContextStateWithAgent(
 // ToContextState returns the base ContextState.
 func (cs *ContextStateWithAgent) ToContextState() *ContextState {
 	return cs.ContextState
+}
+
+func (h *ContextCheckHook) notifyObserver(ctx *ContextState, recommendation *HandoffRecommendation) {
+	h.mu.RLock()
+	observer := h.observer
+	h.mu.RUnlock()
+	if observer != nil {
+		observer(ctx, recommendation)
+	}
 }

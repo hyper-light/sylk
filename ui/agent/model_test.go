@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -28,6 +29,43 @@ func TestModel_SelectedAgentID(t *testing.T) {
 	model.CycleNext()
 	if got := model.SelectedAgentID(); got != "architect" {
 		t.Fatalf("SelectedAgentID() after cycle = %q, want architect", got)
+	}
+}
+
+func TestModel_SelectedTargetAgentID_PrefersRuntimeWorkerID(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetFocused(true)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_worker",
+			EventType: events.EventTypeLLMRequest,
+			Timestamp: time.Now(),
+			AgentID:   "worker-1234",
+			Content:   "active",
+			Data: map[string]any{
+				"agent_name":       "Inspector",
+				"agent_type":       "inspector-pipeline",
+				"pipeline_id":      "task_1",
+				"task_id":          "task_1",
+				"runtime_agent_id": "worker-1234",
+			},
+		},
+	})
+
+	model.ensureRows()
+	for i, row := range model.rows {
+		if row.Kind == rowAgent {
+			model.selected = i
+			break
+		}
+	}
+
+	if got := model.SelectedAgentID(); got != "task_1:inspector-pipeline" {
+		t.Fatalf("SelectedAgentID() = %q, want %q", got, "task_1:inspector-pipeline")
+	}
+	if got := model.SelectedTargetAgentID(); got != "worker-1234" {
+		t.Fatalf("SelectedTargetAgentID() = %q, want %q", got, "worker-1234")
 	}
 }
 
@@ -1480,6 +1518,84 @@ func TestModel_SeedAgent_PromotePlaceholder(t *testing.T) {
 	}
 }
 
+func TestModel_AllowsPipelineAgentsBeyondInitialAgentCapacity(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	for i := 0; i < initialAgentCapacity; i++ {
+		id := fmt.Sprintf("seed-%02d", i)
+		model.SeedAgent(id, id, id, nil, "", "")
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_pipeline_overflow_engineer",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "task_overflow:engineer",
+			Content:   "Pipeline agent registered: engineer",
+			Data: map[string]any{
+				"agent_name":      "Engineer",
+				"agent_type":      "engineer",
+				"pipeline_id":     "task_overflow",
+				"task_id":         "task_overflow",
+				"task_slug":       "overflow",
+				"pipeline_status": "executing",
+			},
+		},
+	})
+
+	agent := model.agents["task_overflow:engineer"]
+	if agent == nil {
+		t.Fatal("expected pipeline engineer to be added after initial agent capacity")
+	}
+	if agent.PipelineID != "task_overflow" {
+		t.Fatalf("agent PipelineID = %q, want task_overflow", agent.PipelineID)
+	}
+	if got := len(model.agents); got != initialAgentCapacity+1 {
+		t.Fatalf("agents count = %d, want %d", got, initialAgentCapacity+1)
+	}
+
+	pl := model.pipelines["task_overflow"]
+	if pl == nil {
+		t.Fatal("expected overflow pipeline state to be created")
+	}
+	found := false
+	for _, member := range pl.Members {
+		if member == "task_overflow:engineer" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected overflow pipeline members to include task_overflow:engineer, got %v", pl.Members)
+	}
+}
+
+func TestModel_AllowsPipelinesBeyondInitialPipelineCapacity(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+	model.SetFocused(true)
+
+	for i := 0; i < initialPipelineCapacity+1; i++ {
+		pipelineID := fmt.Sprintf("task_%02d", i)
+		model.Update(msg.PipelineStateMsg{
+			PipelineID: pipelineID,
+			TaskID:     pipelineID,
+			TaskLabel:  fmt.Sprintf("task-%02d", i),
+			Status:     "executing",
+		})
+	}
+
+	if got := len(model.pipelines); got != initialPipelineCapacity+1 {
+		t.Fatalf("pipeline count = %d, want %d", got, initialPipelineCapacity+1)
+	}
+	if model.pipelines["task_08"] == nil {
+		t.Fatal("expected pipeline beyond initial capacity to remain visible")
+	}
+}
+
 func TestModel_RegisteredTransition(t *testing.T) {
 	model := New(theme.DefaultDark())
 	model.SetSize(80, 40)
@@ -1546,6 +1662,130 @@ func TestModel_RegisteredTransition(t *testing.T) {
 
 	if agent.Status != StatusIdle {
 		t.Fatalf("status after LLMResponse = %v, want StatusIdle", agent.Status)
+	}
+}
+
+func TestModel_HandoffActivityUpdatesStatusAndContextUsage(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_reg_handoff",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "4d6b407a",
+			Content:   "Pipeline agent registered: tester-pipeline",
+			Data: map[string]any{
+				"agent_name":  "Pipeline Tester",
+				"agent_type":  "tester-pipeline",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+			},
+		},
+	})
+
+	agent := model.agents["task_auth_checkout:tester-pipeline"]
+	if agent == nil {
+		t.Fatal("expected pipeline tester row to be created")
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_handoff_triggered",
+			EventType: events.EventTypeAgentDecision,
+			Timestamp: time.Now(),
+			AgentID:   "4d6b407a",
+			Content:   "Context handoff triggered",
+			Data: map[string]any{
+				"agent_name":    "Pipeline Tester",
+				"agent_type":    "tester-pipeline",
+				"pipeline_id":   "task_auth_checkout",
+				"task_id":       "task_auth_checkout",
+				"handoff_state": "triggered",
+				"context_usage": 0.91,
+			},
+		},
+	})
+
+	if agent.Status != StatusHandoff {
+		t.Fatalf("status after handoff trigger = %v, want StatusHandoff", agent.Status)
+	}
+	if agent.ContextUsage != 0.91 {
+		t.Fatalf("context usage after handoff trigger = %.2f, want 0.91", agent.ContextUsage)
+	}
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_handoff_complete",
+			EventType: events.EventTypeSuccess,
+			Timestamp: time.Now(),
+			AgentID:   "4d6b407a",
+			Content:   "Context handoff complete",
+			Data: map[string]any{
+				"agent_name":     "Pipeline Tester",
+				"agent_type":     "tester-pipeline",
+				"pipeline_id":    "task_auth_checkout",
+				"task_id":        "task_auth_checkout",
+				"handoff_state":  "completed",
+				"context_tokens": 0,
+			},
+		},
+	})
+
+	if agent.Status != StatusWaiting {
+		t.Fatalf("status after handoff completion = %v, want StatusWaiting", agent.Status)
+	}
+	if agent.ContextUsage != 0 {
+		t.Fatalf("context usage after handoff completion = %.2f, want 0", agent.ContextUsage)
+	}
+}
+
+func TestModel_GenericActivityDoesNotOverrideContextUsage(t *testing.T) {
+	model := New(theme.DefaultDark())
+	model.SetSize(80, 40)
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_reg_generic_ctx",
+			EventType: events.EventTypeAgentRegistered,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "Engineer registered",
+			Data: map[string]any{
+				"agent_name":  "Engineer",
+				"agent_type":  "engineer",
+				"pipeline_id": "task_auth_checkout",
+				"task_id":     "task_auth_checkout",
+			},
+		},
+	})
+
+	agent := model.agents["task_auth_checkout:engineer"]
+	if agent == nil {
+		t.Fatal("expected pipeline engineer row to be created")
+	}
+	agent.ContextUsage = 0.18
+
+	_, _ = model.Update(msg.ActivityEventMsg{
+		Event: &events.ActivityEvent{
+			ID:        "evt_llm_generic_ctx",
+			EventType: events.EventTypeLLMResponse,
+			Timestamp: time.Now(),
+			AgentID:   "eng-1",
+			Content:   "done",
+			Data: map[string]any{
+				"agent_name":    "Engineer",
+				"agent_type":    "engineer",
+				"pipeline_id":   "task_auth_checkout",
+				"task_id":       "task_auth_checkout",
+				"context_usage": 0.91,
+			},
+		},
+	})
+
+	if agent.ContextUsage != 0.18 {
+		t.Fatalf("context usage after generic activity = %.2f, want unchanged 0.18", agent.ContextUsage)
 	}
 }
 

@@ -45,8 +45,8 @@ type Viewport struct {
 	edgeFlashUntil     time.Time // Expiry time for edge flash.
 	bounceOffset       int       // Visual line displacement from overscroll bounce.
 	codeCache          *codeBlockCache
-	hIdx               heightIndex        // Cached prefix-sum of entry heights.
-	streamStates map[int]*streamRenderState // Entry index → render state for active streams.
+	hIdx               heightIndex                // Cached prefix-sum of entry heights.
+	streamStates       map[int]*streamRenderState // Entry index → render state for active streams.
 }
 
 // NewViewport creates a Viewport bound to the given History.
@@ -77,16 +77,17 @@ func (vp *Viewport) Reset() {
 	clear(vp.streamStates)
 }
 
-// chatPadding is the horizontal padding (left + right) applied to chat content.
-// Derived from: 1 space on each side = 2 columns total.
-const chatPadding = 2
+// chatLeftPadding is the horizontal breathing room applied at the left edge of
+// the chat viewport. The rendered content should use the remaining width so the
+// panel consumes the full inner width without soft-wrapping the border.
+const chatLeftPadding = 1
 
 // SetSize updates the viewport dimensions. When viewWidth changes,
 // all entry render caches are invalidated (rendered at wrong width).
 func (vp *Viewport) SetSize(width, height int) {
 	oldHeight := vp.viewHeight
 	oldWidth := vp.viewWidth
-	newWidth := max(width-chatPadding, 0)
+	newWidth := max(width-chatLeftPadding, 0)
 	if newWidth != vp.viewWidth {
 		vp.invalidateAllEntryHeights()
 		vp.codeCache.Clear()
@@ -650,11 +651,6 @@ func (vp *Viewport) collectVisibleLines(total int) []string {
 		}
 	}
 
-	// Trim leading empty lines so messages align flush to the top.
-	for len(visible) > 0 && visible[0] == "" {
-		visible = visible[1:]
-	}
-
 	return visible
 }
 
@@ -915,9 +911,14 @@ func (vp *Viewport) formatOutput(lines []string) string {
 		lines = append(lines, "")
 	}
 
-	// Apply 1-space left padding to every line for visual breathing room.
+	// Apply a 1-space left padding and clamp the rendered content to the
+	// viewport budget so terminal soft-wrap never corrupts the panel border.
 	for i, line := range lines {
-		lines[i] = " " + line
+		line = truncateVisible(line, vp.viewWidth)
+		if pad := max(vp.viewWidth-lipgloss.Width(line), 0); pad > 0 {
+			line += strings.Repeat(" ", pad)
+		}
+		lines[i] = strings.Repeat(" ", chatLeftPadding) + line
 	}
 
 	return strings.Join(lines, "\n")

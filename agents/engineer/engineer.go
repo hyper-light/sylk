@@ -29,12 +29,6 @@ import (
 // stop and request Architect decomposition.
 const MaxTodosBeforeArchitect = 12
 
-// MaxAttemptsBeforeConsultation is the failure count threshold that triggers
-// Academic consultation for alternative approaches. Derived from the audit
-// config's MaxAuditIterations — if the agent can self-audit N times,
-// escalation to Academic occurs after N failures of the full cycle.
-var MaxAttemptsBeforeConsultation = DefaultAuditConfig().MaxAuditIterations
-
 // engineerProvider is the minimal interface the Engineer needs from its LLM.
 // Satisfied by *providers.OpenAIProvider and *gateway.GatewayProvider.
 type engineerProvider interface {
@@ -43,7 +37,7 @@ type engineerProvider interface {
 
 // Engineer is the code implementation specialist agent for the Sylk system.
 // It uses GPT-5.4 Pro with xhigh reasoning to execute individual coding
-// tasks via an LLM-driven tool loop with self-audit.
+// tasks via an LLM-driven tool loop.
 type Engineer struct {
 	id     string
 	config Config
@@ -101,9 +95,6 @@ type Engineer struct {
 	fileAccess      versioning.FileAccess
 	workspaceViews  versioning.WorkspaceViewAccess
 	executionBroker purevfs.ExecutionBroker
-
-	// Self-audit configuration
-	auditConfig AuditConfig
 
 	// Refactor loop configuration
 	refactorConfig shared.RefactorLoopConfig
@@ -179,7 +170,6 @@ func New(cfg Config, provider engineerProvider) (*Engineer, error) {
 		knownAgents:     make(map[string]*guide.AgentAnnouncement),
 		failures:        make(map[string]*FailureRecord),
 		pendingConsults: make(map[string]chan *guide.Message),
-		auditConfig:     DefaultAuditConfig(),
 		refactorConfig:  shared.DefaultRefactorLoopConfig(),
 		state: &EngineerState{
 			ID:        engineerID,
@@ -735,7 +725,7 @@ func (e *Engineer) handleImplement(ctx context.Context, fwd *guide.ForwardedRequ
 		Timestamp:           time.Now(),
 	}
 
-	// Handle the task using LLM-driven protocol
+	// Handle the task using the composed engineer prompt and tool loop.
 	return e.Handle(ctx, req)
 }
 
@@ -787,7 +777,7 @@ func (e *Engineer) GetKnownAgents() map[string]*guide.AgentAnnouncement {
 // =============================================================================
 
 // Handle processes an EngineerRequest using the LLM-driven implementation protocol.
-func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerResponse, error) {
+func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *EngineerResponse, retErr error) {
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
@@ -800,64 +790,20 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	if err := e.validateTaskScope(ctx, req); err != nil {
 		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
 			e.id, "", "", "error", &agentlog.ErrorPayload{Error: err.Error()})
+		retErr = err
 		return e.failureResponse(req, err, startTime)
 	}
 
-	// Step 2: Synchronous Librarian consultation
-	var consultContext string
-	if e.bus != nil && e.running {
-		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationSent,
-			e.id, "", "", "info", &agentlog.ConsultPayload{Target: "librarian"})
-		evidence, err := e.requestConsultation(ctx, "librarian",
-			fmt.Sprintf("Search for relevant patterns, similar implementations, and dependencies for: %s", req.Prompt),
-			"", e.config.SessionID)
-		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationRecv,
-			e.id, "", "", "info", &agentlog.ConsultPayload{Target: "librarian", Success: err == nil})
-		if err != nil {
-			e.logger.Warn("librarian consultation failed", "error", err)
-		} else if evidence.Success {
-			consultContext = fmt.Sprintf("Librarian consultation evidence:\n%v", evidence.Data)
-		}
-	}
-
-	// Step 3: Check previous failures → consult Academic if threshold exceeded
-	if failure := e.checkPreviousFailures(req.TaskID); failure != nil {
-		e.logger.Info("found previous failure", "task_id", req.TaskID, "attempts", failure.AttemptCount)
-		if failure.AttemptCount >= MaxAttemptsBeforeConsultation && e.bus != nil && e.running {
-			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationSent,
-				e.id, "", "", "info", &agentlog.ConsultPayload{Target: "academic"})
-			evidence, err := e.requestConsultation(ctx, "academic",
-				fmt.Sprintf("Task has failed %d times. Need alternative approach for: %s. Last error: %s",
-					failure.AttemptCount, req.Prompt, failure.LastError),
-				"", e.config.SessionID)
-			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventConsultationRecv,
-				e.id, "", "", "info", &agentlog.ConsultPayload{Target: "academic", Success: err == nil})
-			if err != nil {
-				e.logger.Warn("academic consultation failed", "error", err)
-			} else if evidence.Success {
-				consultContext += fmt.Sprintf("\n\nAcademic consultation evidence:\n%v", evidence.Data)
-			}
-		}
-	}
-
-	// Step 4: Compose system prompt + consultation context
+	// Step 2: Compose system prompt
 	contract := shared.BuildTaskExecutionContract(req.PipelineTask)
 	systemPrompt := e.systemPromptForContract(contract)
 	if req.PipelineTask != nil {
 		systemPrompt = shared.AppendPipelineSystemContext(systemPrompt, req.PipelineTask)
 	}
-	systemPrompt = shared.AppendTaskExecutionGuidance(systemPrompt, contract, "engineer")
-	if consultContext != "" {
-		systemPrompt += "\n\n---\n\n# Consultation Context\n\n" + consultContext
-	}
 
-	// Step 5: Build LLM request with tools
+	// Step 3: Build LLM request with tools
 	e.prepareSkillsForInput(req.Prompt)
-	surface, err := shared.TaskToolSurface(e.toolRuntime(), contract, "engineer")
-	if err != nil {
-		e.logger.Warn("build task tool surface", "error", err)
-		surface = e.toolRuntime()
-	}
+	surface := e.toolRuntime()
 	ctx = shared.WithTaskExecutionContract(ctx, contract)
 	ctx = shared.WithTaskExecutionState(ctx, shared.NewTaskExecutionState())
 	llmReq := &providers.Request{
@@ -872,7 +818,7 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(llmReq, req.ConversationHistory)
 
-	// Step 6: Execute tool loop
+	// Step 4: Execute tool loop
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	result, err := shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
 		return e.executeToolLoopWithSurface(ctx, llmReq, ledger, surface)
@@ -881,40 +827,9 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (*EngineerR
 		shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
 			e.id, "", "", "error", &agentlog.ErrorPayload{Error: err.Error()})
 		e.recordFailure(req.TaskID, err.Error(), req.Prompt)
+		retErr = err
 		return e.failureResponse(req, err, startTime)
 	}
-
-	// Step 7: Self-audit (bounded iterations)
-	shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventDiscoveryStarted,
-		e.id, "", "", "info", &agentlog.DiscoveryPayload{Phase: "started", Type: "self-audit"})
-	for iteration := range e.auditConfig.MaxAuditIterations {
-		verdict, auditErr := e.selfAudit(ctx, result, req.Prompt)
-		if auditErr != nil {
-			e.logger.Warn("self-audit failed", "error", auditErr, "iteration", iteration)
-			break
-		}
-		if !shouldReimplement(verdict, iteration, e.auditConfig) {
-			break
-		}
-		// Re-enter tool loop with audit feedback
-		e.logger.Info("re-implementing after audit", "iteration", iteration, "score", verdict.QualityScore)
-		llmReq.Messages = append(llmReq.Messages,
-			providers.Message{Role: providers.RoleAssistant, Content: result},
-			providers.Message{Role: providers.RoleUser, Content: e.buildAuditFeedback(verdict)},
-		)
-		result, err = shared.ExecuteTurnLoop(ledger, llmReq, func() (string, error) {
-			return e.executeToolLoopWithSurface(ctx, llmReq, ledger, surface)
-		})
-		if err != nil {
-			shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventError,
-				e.id, "", "", "error", &agentlog.ErrorPayload{Error: fmt.Sprintf("audit re-implement: %v", err)})
-			e.recordFailure(req.TaskID, err.Error(), req.Prompt)
-			return e.failureResponse(req, err, startTime)
-		}
-	}
-
-	shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventDiscoveryCompleted,
-		e.id, "", "", "info", &agentlog.DiscoveryPayload{Phase: "completed", Type: "self-audit"})
 
 	shared.LogAgentEvent(e.steering.EventLogger(), agentlog.EventGenerationCompleted,
 		e.id, "", "", "info", &agentlog.GenerationPayload{Phase: "completed"})
@@ -944,24 +859,6 @@ func (e *Engineer) systemPromptForContract(contract *shared.TaskExecutionContrac
 	return e.config.SystemPrompt
 }
 
-func (e *Engineer) buildAuditFeedback(verdict *AuditVerdict) string {
-	if verdict == nil || len(verdict.Issues) == 0 {
-		return "The self-audit found issues. Please review and fix your implementation."
-	}
-	msg := fmt.Sprintf("Self-audit failed (score: %.2f). Fix the following issues:\n", verdict.QualityScore)
-	for i, issue := range verdict.Issues {
-		msg += fmt.Sprintf("%d. [%s/%s] %s", i+1, issue.Category, issue.Severity, issue.Description)
-		if issue.File != "" {
-			msg += fmt.Sprintf(" (in %s)", issue.File)
-		}
-		if issue.Suggestion != "" {
-			msg += fmt.Sprintf(" — Suggestion: %s", issue.Suggestion)
-		}
-		msg += "\n"
-	}
-	return msg
-}
-
 // =============================================================================
 // Protocol Helpers
 // =============================================================================
@@ -971,12 +868,6 @@ func (e *Engineer) validateTaskScope(_ context.Context, req *EngineerRequest) er
 		return fmt.Errorf("task prompt is required")
 	}
 	return nil
-}
-
-func (e *Engineer) checkPreviousFailures(taskID string) *FailureRecord {
-	e.stateMu.RLock()
-	defer e.stateMu.RUnlock()
-	return e.failures[taskID]
 }
 
 func (e *Engineer) failureResponse(req *EngineerRequest, err error, _ time.Time) (*EngineerResponse, error) {
@@ -1145,8 +1036,20 @@ func (e *Engineer) Descriptor() handoff.AgentDescriptor {
 	}
 }
 
-// InjectPreparedContext accepts a handoff context (no-op for now).
-func (e *Engineer) InjectPreparedContext(_ *handoff.PreparedContext) error {
+// InjectPreparedContext accepts a handoff context.
+func (e *Engineer) InjectPreparedContext(pc *handoff.PreparedContext) error {
+	if pc == nil {
+		return nil
+	}
+	if pipelineID, ok := pc.GetMetadata("pipeline_id"); ok && strings.TrimSpace(pipelineID) != "" {
+		e.pipelineID = strings.TrimSpace(pipelineID)
+	}
+	if taskID, ok := pc.GetMetadata("task_id"); ok && strings.TrimSpace(taskID) != "" {
+		e.pipelineID = strings.TrimSpace(taskID)
+	}
+	if taskSlug, ok := pc.GetMetadata("task_slug"); ok && strings.TrimSpace(taskSlug) != "" {
+		e.pipelineSlug = strings.TrimSpace(taskSlug)
+	}
 	return nil
 }
 
@@ -1155,9 +1058,17 @@ func (e *Engineer) SetAgentPod(pod *shared.AgentPod) {
 	e.agentPod = pod
 }
 
+// AgentPod returns the current task-scoped pod binding.
+func (e *Engineer) AgentPod() *shared.AgentPod {
+	return e.agentPod
+}
+
 // SetHandoffBridge sets the handoff bridge for this engineer.
 func (e *Engineer) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	e.handoffBridge = bridge
+	if bridge != nil && e.activityPub != nil {
+		bridge.SetActivityPublisher(e.activityPub)
+	}
 }
 
 // SetFileAccess injects the FileAccess implementation for this pipeline.
@@ -1183,9 +1094,18 @@ func (e *Engineer) SetEscalator(esc *escalation.Escalator) {
 
 // ExtractArchivableState returns the engineer's archivable state.
 func (e *Engineer) ExtractArchivableState() *handoff.ArchivableState {
+	state := map[string]string{}
+	if trimmed := strings.TrimSpace(e.pipelineID); trimmed != "" {
+		state["pipeline_id"] = trimmed
+		state["task_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(e.pipelineSlug); trimmed != "" {
+		state["task_slug"] = trimmed
+	}
 	return &handoff.ArchivableState{
 		AgentID:   e.id,
 		AgentType: "engineer",
+		State:     state,
 		Timestamp: time.Now(),
 	}
 }

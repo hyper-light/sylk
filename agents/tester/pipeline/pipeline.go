@@ -1,7 +1,7 @@
 // Package pipeline implements the Pipeline Tester agent — a per-task quality
 // engineer that validates individual task implementations within pipelines.
-// It gates on Inspector completion and uses GPT-5.4 Pro with xhigh reasoning
-// to satisfy contract-driven testing obligations through an OpenAI tool loop.
+// It uses GPT-5.4 Pro with xhigh reasoning to satisfy contract-driven testing
+// obligations through an OpenAI tool loop.
 package pipeline
 
 import (
@@ -15,6 +15,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/agents/tester"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/authority"
@@ -51,12 +52,12 @@ type PipelineTester struct {
 	pipelineName string
 
 	// State.
-	currentPlan *shared.TestPlan
-	currentTask *agentshared.PipelineTaskInput
-	harness     *testHarnessState
-	diagnoses   map[string]*shared.DiagnosisReport
-	gatePassed  bool
-	mu          sync.RWMutex
+	currentPlan     *shared.TestPlan
+	currentTask     *agentshared.PipelineTaskInput
+	harness         *testHarnessState
+	lastSuiteResult *tester.TestSuiteResult
+	diagnoses       map[string]*shared.DiagnosisReport
+	mu              sync.RWMutex
 
 	// Diagnosis engine.
 	diagEngine shared.DiagnosisEngine
@@ -183,7 +184,6 @@ func (pt *PipelineTester) registerCoreSkills() {
 	}
 
 	pt.skills.Register(versioning.NewReadFileSkillFunc(func() versioning.FileAccess { return pt.fileAccess }))
-	pt.skills.Register(checkInspectorGateSkill(pt))
 	pt.skills.Register(detectTestHarnessSkill(pt))
 	pt.skills.Register(prepareTestHarnessSkill(pt))
 	pt.skills.Register(analyzeRiskSkill(pt))
@@ -218,6 +218,11 @@ func (pt *PipelineTester) registerCoreSkills() {
 		CurrentTaskID:   func() string { return pt.pipelineID },
 		CurrentTaskName: func() string { return firstNonEmptyCoordinationName(pt.pipelineName, pt.pipelineSlug) },
 		WorkerType:      func() string { return "tester-pipeline" },
+	}) {
+		pt.skills.Register(skill)
+	}
+	for _, skill := range agentshared.PipelineProtocolSkills(agentshared.PipelineProtocolSkillConfig{
+		AgentType: func() string { return "tester-pipeline" },
 	}) {
 		pt.skills.Register(skill)
 	}
@@ -420,7 +425,7 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	}
 
 	task := agentshared.DecodePipelineTaskInput(fwd.Input)
-	prevRuntime := pt.swapTaskRuntime(task, gatePassedForTask(task))
+	prevRuntime := pt.swapTaskRuntime(task)
 	defer pt.restoreTaskRuntime(prevRuntime)
 	userMessage := fwd.Input
 	contract := agentshared.BuildTaskExecutionContract(task)
@@ -445,13 +450,8 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 	if task != nil {
 		systemPrompt = agentshared.AppendPipelineSystemContext(systemPrompt, task)
 	}
-	systemPrompt = agentshared.AppendTaskExecutionGuidance(systemPrompt, contract, "tester-pipeline")
 	pt.prepareSkillsForInput(userMessage)
-	surface, err := agentshared.TaskToolSurface(pt.toolRuntime(), contract, "tester-pipeline")
-	if err != nil {
-		pt.logger.Warn("build task tool surface", "error", err)
-		surface = pt.toolRuntime()
-	}
+	surface := pt.toolRuntime()
 	ctx = agentshared.WithTaskExecutionContract(ctx, contract)
 	ctx = agentshared.WithTaskExecutionState(ctx, agentshared.NewTaskExecutionState())
 	tools := pt.buildToolDefinitionsWithSurface(surface)
@@ -703,7 +703,7 @@ func (pt *PipelineTester) GetRoutingInfo() *guide.AgentRoutingInfo {
 				TemporalFocus: guide.TemporalPresent,
 				MinConfidence: 0.6,
 			},
-			Description:           "Pipeline quality engineer. Validates individual task output with 6-phase LLM-driven testing protocol.",
+			Description:           "Pipeline quality engineer. Validates individual task output with specification-driven authored tests, execution evidence, and diagnosis.",
 			Priority:              65,
 			RuntimeProfiles:       pipelineTesterRuntimeProfiles(),
 			DefaultRuntimeProfile: pipelineTesterDefaultRuntimeProfile(),
@@ -794,7 +794,19 @@ func (pt *PipelineTester) Descriptor() handoff.AgentDescriptor {
 }
 
 // InjectPreparedContext accepts context from a handoff.
-func (pt *PipelineTester) InjectPreparedContext(_ *handoff.PreparedContext) error {
+func (pt *PipelineTester) InjectPreparedContext(pc *handoff.PreparedContext) error {
+	if pc == nil {
+		return nil
+	}
+	if pipelineID, ok := pc.GetMetadata("pipeline_id"); ok && strings.TrimSpace(pipelineID) != "" {
+		pt.pipelineID = strings.TrimSpace(pipelineID)
+	}
+	if taskID, ok := pc.GetMetadata("task_id"); ok && strings.TrimSpace(taskID) != "" {
+		pt.pipelineID = strings.TrimSpace(taskID)
+	}
+	if taskSlug, ok := pc.GetMetadata("task_slug"); ok && strings.TrimSpace(taskSlug) != "" {
+		pt.pipelineSlug = strings.TrimSpace(taskSlug)
+	}
 	return nil
 }
 
@@ -821,6 +833,9 @@ func (pt *PipelineTester) SetExecutionBroker(broker purevfs.ExecutionBroker) {
 // SetHandoffBridge assigns the handoff bridge.
 func (pt *PipelineTester) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	pt.handoffBridge = bridge
+	if bridge != nil && pt.activityPub != nil {
+		bridge.SetActivityPublisher(pt.activityPub)
+	}
 }
 
 // SetAgentPod assigns the agent pod for cross-agent coordination.
@@ -828,11 +843,25 @@ func (pt *PipelineTester) SetAgentPod(pod *agentshared.AgentPod) {
 	pt.agentPod = pod
 }
 
+// AgentPod returns the current task-scoped pod binding.
+func (pt *PipelineTester) AgentPod() *agentshared.AgentPod {
+	return pt.agentPod
+}
+
 // ExtractArchivableState returns state for handoff persistence.
 func (pt *PipelineTester) ExtractArchivableState() *handoff.ArchivableState {
+	state := map[string]string{}
+	if trimmed := strings.TrimSpace(pt.pipelineID); trimmed != "" {
+		state["pipeline_id"] = trimmed
+		state["task_id"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(pt.pipelineSlug); trimmed != "" {
+		state["task_slug"] = trimmed
+	}
 	return &handoff.ArchivableState{
 		AgentID:   pt.AgentID(),
 		AgentType: pt.AgentType(),
+		State:     state,
 		Timestamp: time.Now(),
 	}
 }

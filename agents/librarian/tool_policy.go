@@ -30,7 +30,20 @@ func librarianToolManifest(registry *skills.Registry) *toolruntime.PolicyManifes
 		AgentID:          "librarian",
 		CapabilityScope:  "librarian.default",
 		Registry:         registry,
-		VisibleByDefault: librarianVisibleSkillNames(),
-		Mutating:         librarianMutatingSkillNames(),
+		VisibleByDefault: registeredLibrarianSkillNames(registry, librarianVisibleSkillNames()),
+		Mutating:         registeredLibrarianSkillNames(registry, librarianMutatingSkillNames()),
 	})
+}
+
+func registeredLibrarianSkillNames(registry *skills.Registry, names []string) []string {
+	if registry == nil || len(names) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if registry.Get(name) != nil {
+			filtered = append(filtered, name)
+		}
+	}
+	return filtered
 }

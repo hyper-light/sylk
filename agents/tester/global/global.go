@@ -1,7 +1,7 @@
 // Package global implements the Global Tester agent — a cross-pipeline SDET
 // that architects and runs integration/e2e/cross-cutting tests after a batch
-// of concurrent pipelines completes. It gates on Inspector completion and uses
-// GPT-5.4 Pro with xhigh reasoning to drive a 7-phase testing protocol.
+// of concurrent pipelines completes. It uses GPT-5.4 Pro with xhigh reasoning
+// for global validation work.
 package global
 
 import (
@@ -111,7 +111,7 @@ func New(cfg shared.GlobalTesterConfig, provider providers.ProviderAdapter) (*Gl
 		requestSerializer: agentshared.NewRequestSerializer(),
 	}
 
-	gt.steering.InitLazy("tester", nil)
+	gt.steering.InitLazy("tester", cfg.ActivityPub)
 
 	if err := gt.initSkills(); err != nil {
 		return nil, err
@@ -726,6 +726,9 @@ func (gt *GlobalTester) Terminate(_ context.Context) error {
 // SetHandoffBridge assigns the handoff bridge.
 func (gt *GlobalTester) SetHandoffBridge(bridge *handoff.HandoffBridge) {
 	gt.handoffBridge = bridge
+	if bridge != nil {
+		bridge.SetActivityPublisher(gt.config.ActivityPub)
+	}
 }
 
 // SetAgentPod assigns the agent pod for cross-agent coordination.

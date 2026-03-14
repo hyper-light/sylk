@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	testershared "github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/skills"
@@ -14,22 +15,6 @@ import (
 type pipelineWriteContextInput struct {
 	Path  string                         `json:"path"`
 	Basis versioning.WorkspaceWriteBasis `json:"basis"`
-}
-
-func checkInspectorGateSkill(pt *PipelineTester) *skills.Skill {
-	return skills.NewSkill("check_inspector_gate").
-		Description("Verify that the inspector gate has passed before any test synthesis or execution begins.").
-		Domain("testing").
-		Keywords("gate", "inspector", "criteria", "validation").
-		Priority(100).
-		Handler(func(_ context.Context, _ json.RawMessage) (any, error) {
-			passed, reason := pt.inspectorGateStatus()
-			return map[string]any{
-				"passed": passed,
-				"reason": reason,
-			}, nil
-		}).
-		Build()
 }
 
 func detectTestHarnessSkill(pt *PipelineTester) *skills.Skill {
@@ -45,6 +30,10 @@ func detectTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("harness", "framework", "tooling", "test setup", "config").
 		Priority(98).
+		Usage("Use after understanding the current criteria and challenge to discover the real test surface, output paths, and execution commands for the requested work.").
+		Requirement("Provide the target files or task specification so the harness decision is scoped to the requested behavior.").
+		Satisfies("Identifies the harness and output-path context needed for planning, harness prep, writes, and execution.").
+		Avoid("Do not hardcode a framework or output path when this skill can derive it from the project and task context.").
 		ArrayParam("files", "Source files that need tests", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		StringParam("worker_type", "Primary worker type such as engineer or designer", false).
@@ -75,6 +64,10 @@ func prepareTestHarnessSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("prepare", "harness", "bootstrap", "config", "boilerplate").
 		Priority(96).
+		Usage("Use only when the harness is missing config or bootstrap files. Prepare each harness path with prepare_pipeline_write_context first and pass those write contexts in.").
+		Requirement("Run detect_test_harness first and gather explicit write contexts for every harness file this skill may create.").
+		Satisfies("Produces runnable harness/config state so subsequent write_test and run_test_suite calls operate on the right framework.").
+		Avoid("Do not call when the detected harness is already usable or when you have not prepared the needed write contexts.").
 		ArrayParam("files", "Source files that need tests", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		StringParam("worker_type", "Primary worker type such as engineer or designer", false).
@@ -129,6 +122,10 @@ func analyzeRiskSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("risk", "analyze", "boundary", "security", "concurrency").
 		Priority(95).
+		Usage("Use after the gate and harness discovery to map the requested behavior to likely defect surfaces. Missing implementation is valid red-phase evidence, not a blocker.").
+		Requirement("Provide the most relevant implementation files and task specification so the risk analysis stays tied to the requested work.").
+		Satisfies("Produces risk evidence that should shape plan_tests, write_test, and failure reporting.").
+		Avoid("Do not stop here when the task still requires executable tests or execution evidence.").
 		ArrayParam("files", "Source files to analyze", "string", true).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		StringParam("worker_type", "Primary worker type such as engineer or designer", false).
@@ -159,6 +156,10 @@ func planTestsSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("plan", "test plan", "failure hypothesis", "strategy").
 		Priority(95).
+		Usage("Use after risk analysis to turn the defect surface into concrete, purposeful test cases. The resulting plan should make the next write or execution step clear.").
+		Requirement("Prefer to run after analyze_risk or provide equivalent risk areas in the input.").
+		Satisfies("Produces the tester plan artifact and defines the concrete cases that write_test should materialize.").
+		Avoid("Do not substitute the plan for actual test writing when the requested deliverable still requires test artifacts.").
 		ArrayParam("files", "Source files that need test coverage", "string", false).
 		StringParam("task_spec", "Task brief and acceptance criteria", false).
 		Handler(func(_ context.Context, input json.RawMessage) (any, error) {
@@ -200,6 +201,10 @@ func writeTestSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("write", "test", "file", "append", "concrete").
 		Priority(94).
+		Usage("Use to materialize executable tests after you know the intended case. Prepare the output path with prepare_pipeline_write_context first, pass the basis in, and reuse next_basis for follow-up writes to the same file.").
+		Requirement("Provide a concrete test_case, executable content, and a matching pipeline write basis for the target output file.").
+		Satisfies("Creates real test artifacts and advances the authoring deliverable for the task.").
+		Avoid("Do not use for placeholders, TODOs, skipped tests, or speculative writes detached from the requested behavior.").
 		ObjectParam("test_case", "Structured planned test case metadata", testCaseProps, true).
 		StringParam("target_file", "Source file under test", true).
 		StringParam("output_file", "Destination test file path", false).
@@ -263,6 +268,9 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 		Domain("testing").
 		Keywords("run", "test", "suite", "race", "execute").
 		Priority(92).
+		Usage("Use when the task requires execution evidence or when you need a concrete failing signal to diagnose. Target the most relevant packages, files, or tests instead of running blindly.").
+		Satisfies("Produces suite execution evidence and the raw failure signal needed for diagnose_failure.").
+		Avoid("Do not use as a substitute for write_test when the task still requires new test artifacts.").
 		ArrayParam("packages", "Package patterns to test", "string", false).
 		ArrayParam("files", "Source or test files to focus on", "string", false).
 		ArrayParam("test_names", "Specific tests to run", "string", false).
@@ -275,10 +283,12 @@ func runTestSuiteSkill(pt *PipelineTester) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 			harness := pt.currentHarnessState()
+			start := time.Now()
 			result, err := pt.executeSuite(ctx, harness, p.Packages, p.Files, p.TestNames, p.Race, p.Verbose, p.Timeout)
 			if err != nil {
 				return nil, err
 			}
+			pt.setLastSuiteResult(suiteResultFromExecution(result, start))
 			return result, nil
 		}).
 		Build()

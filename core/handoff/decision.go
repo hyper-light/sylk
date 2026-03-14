@@ -184,6 +184,12 @@ func (hd *HandoffDecision) String() string {
 
 // ContextState represents the current state of context for handoff evaluation.
 type ContextState struct {
+	// AgentID is the identifier of the agent being evaluated.
+	AgentID string `json:"agent_id,omitempty"`
+
+	// AgentType is the type of the agent being evaluated.
+	AgentType string `json:"agent_type,omitempty"`
+
 	// ContextSize is the current context size in tokens.
 	ContextSize int `json:"context_size"`
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,7 @@ type PipelineManagerConfig struct {
 	DefaultMaxLoops        int
 	DefaultPhaseTimeout    time.Duration
 	DefaultPipelineTimeout time.Duration
+	UnregisterAgent        func(string)
 	Logger                 *slog.Logger
 }
 
@@ -38,9 +40,9 @@ type PipelineManager struct {
 }
 
 type managedPipeline struct {
-	executor *TDDExecutor
-	bus      *PipelineBus
-	cancel   context.CancelFunc
+	executor           *TDDExecutor
+	cancel             context.CancelFunc
+	registeredAgentIDs []string
 }
 
 // NewPipelineManager creates a new manager.
@@ -108,27 +110,29 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 		TaskID:            cfg.TaskID,
 		TaskSlug:          cfg.TaskSlug,
 		SessionID:         cfg.SessionID,
+		DAGID:             cfg.DAGID,
 		DAGNodeID:         cfg.DAGNodeID,
 		WorkerType:        cfg.WorkerType,
 		Status:            StatusPending,
 		MaxLoops:          maxLoops,
 		InspectorCriteria: cfg.InitialCriteria,
 		TaskPrompt:        cfg.TaskPrompt,
+		Files:             append([]string(nil), cfg.Files...),
 		CoWorkerTypes:     cfg.CoWorkerTypes,
 		AgentPrompts:      cfg.AgentPrompts,
 		CreatedAt:         time.Now(),
 	}
 
-	insp, err := m.factory.CreateInspector(cfg.WorkerType)
+	insp, err := m.factory.CreateInspector(ctx, cfg)
 	if err != nil {
 		return "", fmt.Errorf("create inspector: %w", err)
 	}
-	tst, err := m.factory.CreateTester()
+	tst, err := m.factory.CreateTester(ctx, cfg)
 	if err != nil {
 		insp.Close()
 		return "", fmt.Errorf("create tester: %w", err)
 	}
-	worker, err := m.factory.CreateWorker(ctx, cfg.WorkerType)
+	worker, err := m.factory.CreateWorker(ctx, cfg.WorkerType, cfg)
 	if err != nil {
 		insp.Close()
 		tst.Close()
@@ -137,7 +141,7 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 
 	var coWorkers []WorkerAgent
 	if len(cfg.CoWorkerTypes) > 0 {
-		coWorkers, err = m.factory.CreateCoWorkers(ctx, cfg.CoWorkerTypes)
+		coWorkers, err = m.factory.CreateCoWorkers(ctx, cfg.CoWorkerTypes, cfg)
 		if err != nil {
 			insp.Close()
 			tst.Close()
@@ -146,10 +150,8 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 		}
 	}
 
-	bus := NewPipelineBus()
 	exec := NewTDDExecutor(TDDExecutorConfig{
 		Pipeline:     pipeline,
-		Bus:          bus,
 		Inspector:    insp,
 		Tester:       tst,
 		Worker:       worker,
@@ -162,8 +164,8 @@ func (m *PipelineManager) Create(ctx context.Context, cfg PipelineConfig) (strin
 	})
 
 	mp := &managedPipeline{
-		executor: exec,
-		bus:      bus,
+		executor:           exec,
+		registeredAgentIDs: managedPipelineAgentIDs(cfg.TaskID, cfg.WorkerType, cfg.CoWorkerTypes),
 	}
 	m.pipelines[id] = mp
 	m.bySession[cfg.SessionID] = append(m.bySession[cfg.SessionID], id)
@@ -226,9 +228,44 @@ func (m *PipelineManager) Cancel(_ context.Context, id string) error {
 
 	// Mark cancelled via executor's lock.
 	mp.executor.markCancelled()
-	mp.executor.CloseCoWorkers()
-	mp.bus.Close()
 	return nil
+}
+
+// Release closes and unregisters a pipeline after it has reached a terminal
+// state or the caller no longer needs it.
+func (m *PipelineManager) Release(id string) {
+	m.mu.Lock()
+	mp, ok := m.pipelines[id]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.pipelines, id)
+	for sessionID, ids := range m.bySession {
+		m.bySession[sessionID] = removePipelineID(ids, id)
+		if len(m.bySession[sessionID]) == 0 {
+			delete(m.bySession, sessionID)
+		}
+	}
+	for dagNodeID, ids := range m.byDAG {
+		m.byDAG[dagNodeID] = removePipelineID(ids, id)
+		if len(m.byDAG[dagNodeID]) == 0 {
+			delete(m.byDAG, dagNodeID)
+		}
+	}
+	unregister := m.config.UnregisterAgent
+	m.mu.Unlock()
+
+	if mp.cancel != nil {
+		mp.cancel()
+	}
+	_ = mp.executor.Stop()
+	mp.executor.CloseAgents()
+	if unregister != nil {
+		for _, agentID := range mp.registeredAgentIDs {
+			unregister(agentID)
+		}
+	}
 }
 
 // Get returns a snapshot of a pipeline by ID.
@@ -278,17 +315,6 @@ func (m *PipelineManager) GetActive() []string {
 	return active
 }
 
-// RouteUserMessage sends a user override message to a specific pipeline.
-func (m *PipelineManager) RouteUserMessage(ctx context.Context, id string, msg any) error {
-	m.mu.RLock()
-	mp, ok := m.pipelines[id]
-	m.mu.RUnlock()
-	if !ok {
-		return ErrPipelineNotFound
-	}
-	return mp.bus.SendUserMessage(ctx, msg)
-}
-
 // GetResult builds a PipelineResult from the pipeline's current state.
 func (m *PipelineManager) GetResult(id string) (*PipelineResult, error) {
 	m.mu.RLock()
@@ -310,6 +336,9 @@ func (m *PipelineManager) GetResult(id string) (*PipelineResult, error) {
 		TaskID:            p.TaskID,
 		Status:            p.Status,
 		LoopCount:         p.LoopCount,
+		CurrentStage:      p.CurrentStage,
+		ActiveAgents:      append([]string(nil), p.ActiveAgents...),
+		LastMessage:       p.LastMessage,
 		InspectorCriteria: p.InspectorCriteria,
 		TesterTests:       p.TesterTests,
 		WorkerOutput:      p.WorkerOutput,
@@ -330,23 +359,28 @@ func (m *PipelineManager) CloseAll() {
 	}
 	m.closed = true
 
-	var toCancel []*managedPipeline
+	unregister := m.config.UnregisterAgent
+	toClose := make([]*managedPipeline, 0, len(m.pipelines))
 	for _, mp := range m.pipelines {
-		snap := mp.executor.Pipeline()
-		if !IsTerminalStatus(snap.Status) {
-			toCancel = append(toCancel, mp)
-		}
+		toClose = append(toClose, mp)
 	}
 	m.mu.Unlock()
 
-	for _, mp := range toCancel {
+	for _, mp := range toClose {
+		if mp == nil {
+			continue
+		}
 		if mp.cancel != nil {
 			mp.cancel()
 		}
 		_ = mp.executor.Stop()
 		mp.executor.markCancelled()
-		mp.executor.CloseCoWorkers()
-		mp.bus.Close()
+		mp.executor.CloseAgents()
+		if unregister != nil {
+			for _, agentID := range mp.registeredAgentIDs {
+				unregister(agentID)
+			}
+		}
 	}
 }
 
@@ -359,4 +393,56 @@ func (m *PipelineManager) activeCountLocked() int {
 		}
 	}
 	return count
+}
+
+func managedPipelineAgentIDs(taskID string, workerType WorkerType, coWorkers []WorkerType) []string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return nil
+	}
+	ids := []string{
+		pipelineAgentID(taskID, "inspector-pipeline"),
+		pipelineAgentID(taskID, "tester-pipeline"),
+	}
+	if primary := pipelineAgentID(taskID, string(workerType)); primary != "" {
+		ids = append(ids, primary)
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(ids)+len(coWorkers))
+	for _, id := range ids {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	for _, wt := range coWorkers {
+		id := pipelineAgentID(taskID, string(wt))
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func removePipelineID(ids []string, target string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	result := ids[:0]
+	for _, id := range ids {
+		if id == target {
+			continue
+		}
+		result = append(result, id)
+	}
+	return append([]string(nil), result...)
 }

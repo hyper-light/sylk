@@ -93,7 +93,7 @@ func TestPublishStreamLifecycleUsesContextMetadata(t *testing.T) {
 	}
 }
 
-func TestPublishIntermediateToolTurnPublishesToolTurnContent(t *testing.T) {
+func TestPublishIntermediateToolTurnPublishesToolTurnProgress(t *testing.T) {
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	defer bus.Close()
 
@@ -123,14 +123,18 @@ func TestPublishIntermediateToolTurnPublishesToolTurnContent(t *testing.T) {
 
 	select {
 	case stream := <-streamCh:
-		if stream.Event == nil || stream.Event.Type != guide.StreamEventData {
+		if stream.Event == nil || stream.Event.Type != guide.StreamEventProgress {
 			t.Fatalf("unexpected stream event: %+v", stream.Event)
 		}
-		if got := stream.Event.Text; got != "Inspecting the repository before I answer.\n\n" {
-			t.Fatalf("stream text = %q", got)
+		progress, ok := stream.Event.Data.(*guide.ProgressData)
+		if !ok || progress == nil {
+			t.Fatalf("expected progress payload, got %+v", stream.Event.Data)
+		}
+		if got := progress.Message; got != "Inspecting the repository before I answer." {
+			t.Fatalf("progress message = %q", got)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for intermediate tool turn chunk")
+		t.Fatal("timed out waiting for intermediate tool turn progress")
 	}
 }
 
